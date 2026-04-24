@@ -28,6 +28,17 @@ const TOOL_LABELS: Record<string, { verb: { zh: string; en: string }; icon: Reac
   Error:            { verb: { zh: "报告错误", en: "report error" }, icon: IconTool },
 };
 
+const COMPACT_DONE_TOOLS = new Set([
+  "list_directory",
+  "glob_search",
+  "grep_search",
+  "read_file",
+  "read_document",
+  "analyze_tabular_document",
+  "query_tabular_document",
+  "index_workspace_documents",
+]);
+
 interface ActionCardProps {
   blockId?: number;
   toolName: string;
@@ -106,6 +117,16 @@ export default function ActionCard({ blockId, toolName, target, toolStatus, mess
           >
             <IconChevronRight className="h-3.5 w-3.5" />
           </button>
+        </div>
+      );
+    }
+
+    if (isExecuted && COMPACT_DONE_TOOLS.has(toolName)) {
+      return (
+        <div className="w-full ml-9 mt-1 mb-1 flex items-center gap-2 font-mono text-[10.5px] text-[#71717a]">
+          <IconCheck className="h-3 w-3 text-[#10b981]" />
+          <span className="shrink-0">{language === "zh" ? localizedVerb : localizedVerb}</span>
+          <span className="min-w-0 truncate text-[#a1a1aa]">{displayTarget}</span>
         </div>
       );
     }

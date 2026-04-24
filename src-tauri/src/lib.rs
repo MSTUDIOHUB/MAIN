@@ -788,6 +788,7 @@ fn list_directory(state: State<WorkspaceState>, path: String) -> Result<Vec<File
 
 const SKELETON_WHITELIST_EXT: &[&str] = &[
     "cs", "asmdef", "asmref", "shader", "hlsl", "compute", "scene",
+    "xlsx", "xls", "csv", "tsv", "pdf", "docx", "doc", "txt", "md", "json",
 ];
 const SKELETON_BLACKLIST_EXT: &[&str] = &[
     "meta", "png", "fbx", "mat", "anim", "controller", "unitypackage", "asset",

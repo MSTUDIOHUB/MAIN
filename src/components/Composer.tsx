@@ -142,7 +142,8 @@ export default function Composer({
   isStreaming = false,
   onStopGeneration,
   autoApproveTools,
-  onToggleAutoApprove
+  onToggleAutoApprove,
+  onHeightChange,
 }) {
   // ── Mention (file search) state ──
   const [showMentionMenu, setShowMentionMenu] = useState(false);
@@ -166,6 +167,7 @@ export default function Composer({
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const mentionDropRef = useRef<HTMLDivElement>(null);
   const slashMenuRef = useRef<HTMLDivElement>(null);
+  const composerShellRef = useRef<HTMLDivElement>(null);
   const previousMainModeRef = useRef(selectedMainModeKey);
   const previousWorkspaceRef = useRef(currentWorkspace);
   const submitUnlockTimerRef = useRef<number | null>(null);
@@ -1048,9 +1050,32 @@ export default function Composer({
     ? "Try: Summarize this folder, analyze these tables and write a report, extract the key conclusions, or plan first before execution..."
     : "例如：总结这个文件夹里的内容、分析这些表格并生成报告、提炼这批资料的关键结论，或先给我一个计划再执行...";
 
+  // region: Composer 高度同步
+  useEffect(() => {
+    if (!onHeightChange) return undefined;
+    const node = composerShellRef.current;
+    if (!node) return undefined;
+
+    const reportHeight = () => {
+      onHeightChange(node.offsetHeight);
+    };
+
+    reportHeight();
+    const observer = new ResizeObserver(reportHeight);
+    observer.observe(node);
+    return () => {
+      observer.disconnect();
+    };
+  }, [onHeightChange]);
+  // endregion
+
   return (
-    <div className="absolute bottom-6 left-6 right-6 z-20 pointer-events-none flex justify-center">
+    <div
+      className="absolute left-6 right-6 z-20 pointer-events-none flex justify-center"
+      style={{ bottom: "calc(env(safe-area-inset-bottom, 0px) + 1.5rem)" }}
+    >
       <div
+        ref={composerShellRef}
         className={`w-full max-w-3xl flex flex-col relative pointer-events-auto transition-all ${isDragOver ? 'ring-2 ring-[var(--accent)] ring-offset-2 ring-offset-[#000000]' : ''}`}
         onDragOver={handleDragOver}
         onDragLeave={handleDragLeave}

@@ -105,7 +105,8 @@ const TITLE_INTENT_PREFIX_RE = /^(?:当前查看|viewing)\s*/i;
 const TITLE_MODE_PREFIX_RE =
   /^(?:讨论|discuss|计划|plan|直接执行|execute|总结|summarize|报告|report|Game Studio 工作流|Game Studio Workflow)\s*[:：-]\s*/i;
 const TITLE_REASONING_LEAK_RE =
-  /(?:thinking process|analy(?:s|z)e user input|step\s*1\b|let'?s think|思考过程|分析用户输入|先分析|先思考)/i;
+  /(?:thinking process|here'?s a thinking|chain of thought|reasoning process|analy(?:s|z)e user input|step\s*1\b|let'?s think|思考过程|分析用户输入|先分析|先思考)/i;
+const GENERIC_TURN_TITLE_RE = /^(?:新的任务|新任务|new task|turn decision|本轮决策|new conversation|新会话|new chat|新聊天)$/i;
 
 /**
  * 统一清理标题中的转录元信息、Markdown 噪音和误入的状态前缀，
@@ -131,8 +132,13 @@ export function normalizeConversationDisplayTitle(
     .replace(/^[\"'“”‘’]+|[\"'“”‘’]+$/g, "")
     .trim();
 
-  if (!stripped) return fallback;
+  if (!stripped || TITLE_REASONING_LEAK_RE.test(stripped) || GENERIC_TURN_TITLE_RE.test(stripped)) return fallback;
   return stripped.length <= maxLength ? stripped : `${stripped.slice(0, maxLength).trim()}...`;
+}
+
+export function isGenericConversationTitle(input: string): boolean {
+  const normalized = String(input || "").replace(/\s+/g, " ").trim();
+  return !normalized || GENERIC_TURN_TITLE_RE.test(normalized) || TITLE_REASONING_LEAK_RE.test(normalized);
 }
 
 /**
@@ -140,7 +146,9 @@ export function normalizeConversationDisplayTitle(
  * 这里单独做一次检测，便于 UI 退回到更稳定的 turn 标题。
  */
 export function looksLikeReasoningLeakTitle(input: string): boolean {
-  const normalized = normalizeConversationDisplayTitle(input, 120, "");
+  const raw = String(input || "");
+  if (TITLE_REASONING_LEAK_RE.test(raw)) return true;
+  const normalized = normalizeConversationDisplayTitle(raw, 120, "");
   if (!normalized) return false;
   return TITLE_REASONING_LEAK_RE.test(normalized);
 }

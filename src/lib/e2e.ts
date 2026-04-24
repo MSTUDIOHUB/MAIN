@@ -1,4 +1,4 @@
-import { useAppStore } from "../store/useAppStore";
+import { finalizeStreamingTaskBlocks, useAppStore } from "../store/useAppStore";
 import { syncPlanArtifactAfterToolSuccess } from "./planArtifactSync";
 import { getPlanArtifactTitle } from "./workflowModels";
 import type { NexusModeKey } from "./gameStudioCatalog";
@@ -11,6 +11,7 @@ const AWAITING_CHOICE_SCENARIO = "awaiting-choice";
 const GAME_STUDIO_ONBOARDING_SCENARIO = "game-studio-onboarding";
 const CLOUD_SETTINGS_MODEL_SELECT_SCENARIO = "cloud-settings-model-select";
 const STREAMING_TIMER_SCENARIO = "streaming-timer";
+const STREAM_ERROR_RECOVERY_SCENARIO = "stream-error-recovery";
 const E2E_SEED_COUNT_PREFIX = "__CODELY_E2E_SEED_COUNT__:";
 
 function getScenarioName(): string | null {
@@ -1206,6 +1207,124 @@ function seedStreamingTimerScenario() {
   return cleanup;
 }
 
+function seedStreamErrorRecoveryScenario() {
+  const bridge = getBridge();
+  if (!bridge) return undefined;
+
+  bridge.events = [{ type: "boot" }];
+  bridge.savedDocuments = [];
+  bridge.completed = false;
+
+  incrementSeedCount(STREAM_ERROR_RECOVERY_SCENARIO);
+
+  const now = Date.now();
+  const turnId = "e2e-stream-error-recovery-turn";
+  const userBlockId = useAppStore.getState()._nextTaskId();
+  const thoughtBlockId = useAppStore.getState()._nextTaskId();
+
+  useAppStore.setState((state) => ({
+    ...state,
+    config: {
+      ...state.config,
+      language: "zh",
+      workflowMode: "chat",
+    },
+    currentWorkspace: "/tmp/e2e-stream-error-recovery",
+    sessionsByWorkspace: {
+      "/tmp/e2e-stream-error-recovery": [
+        {
+          id: 999007,
+          title: "E2E Stream Error Recovery",
+          date: new Date(now).toISOString(),
+          active: true,
+          messages: [],
+        },
+      ],
+    },
+    currentSessionId: 999007,
+    taskFlow: [
+      { id: userBlockId, turnId, type: "user", content: "这个流式报错后不应该还显示思考中。" },
+      { id: thoughtBlockId, turnId, type: "thought", content: "先检查流状态，再整理恢复逻辑。", isStreaming: true },
+    ],
+    conversationTurns: [
+      {
+        id: turnId,
+        userPrompt: "这个流式报错后不应该还显示思考中。",
+        title: "流式错误恢复",
+        mode: "chat",
+        status: "executing",
+        summary: "",
+        blockIds: [userBlockId, thoughtBlockId],
+        collapsed: false,
+        createdAt: now,
+      },
+    ],
+    currentTurnId: turnId,
+    input: "",
+    attachedFiles: [],
+    contextMentions: [],
+    elapsedTime: 1,
+    isGenerating: true,
+    agentStatus: "running",
+    showDiff: false,
+    showPlanPanel: false,
+    showTerminal: false,
+    showFilePanel: false,
+    selectedDiffTaskId: null,
+  }));
+
+  const timerId = window.setTimeout(() => {
+    const state = useAppStore.getState();
+    const errorBlockId = state._nextTaskId();
+    useAppStore.setState((current) => ({
+      ...current,
+      taskFlow: [
+        ...finalizeStreamingTaskBlocks(current.taskFlow, turnId, 1),
+        {
+          id: errorBlockId,
+          turnId,
+          type: "tool",
+          toolName: "Error",
+          target: "",
+          status: "error",
+          toolStatus: "failed",
+          message: "模型服务在传输回复时中断或返回了无法解析的数据。原始错误：流读取错误: error decoding response body",
+        },
+      ],
+      conversationTurns: current.conversationTurns.map((turn) =>
+        turn.id === turnId
+          ? {
+              ...turn,
+              status: "error",
+              summary: "模型服务传输中断，已保留本轮已完成的操作记录。",
+              blockIds: turn.blockIds.includes(errorBlockId) ? turn.blockIds : [...turn.blockIds, errorBlockId],
+            }
+          : turn
+      ),
+      isGenerating: false,
+      agentStatus: "error",
+      elapsedTime: 1,
+    }));
+  }, 500);
+
+  bridge.getSnapshot = () => {
+    const state = useAppStore.getState();
+    return {
+      isGenerating: state.isGenerating,
+      agentStatus: state.agentStatus,
+      seedCount: readSeedCount(STREAM_ERROR_RECOVERY_SCENARIO),
+    };
+  };
+
+  const cleanup = () => {
+    window.clearTimeout(timerId);
+    bridge.initialized = false;
+  };
+
+  bridge.cleanup = cleanup;
+  return cleanup;
+}
+
 export function getE2ESavePlanDocumentHandler():
   | ((document: { title: string; suggestedFileName: string; content: string }) => Promise<boolean>)
   | null {
@@ -1368,6 +1487,10 @@ export function initializeE2EScenarios(): (() => void) | undefined {
 
   if (scenario === STREAMING_TIMER_SCENARIO) {
     return seedStreamingTimerScenario();
+  }
+
+  if (scenario === STREAM_ERROR_RECOVERY_SCENARIO) {
+    return seedStreamErrorRecoveryScenario();
   }
 
   bridge.initialized = false;

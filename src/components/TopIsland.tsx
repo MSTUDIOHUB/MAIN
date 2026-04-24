@@ -1,15 +1,17 @@
-import { memo, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { IconColumns, IconFileText, IconLock, IconUnlock } from "./Icons";
 import type { PlanStage, PlanTask, ReplyOption } from "../lib/workflowModels";
 import type { PendingRunDecision, ResolvedUserIntent } from "../lib/runIntent";
 import MarkdownRenderer from "./MarkdownRenderer";
 
+// region: TopIsland 属性定义
 interface TopIslandProps {
   title: string;
   status: string;
   statusToneClass: string;
   language: "zh" | "en";
   themeMode: "light" | "dark";
+  isVisible?: boolean;
   planTasks: PlanTask[];
   planStage: PlanStage;
   isAwaitingChoice?: boolean;
@@ -28,7 +30,9 @@ interface TopIslandProps {
   onApproveDiffSession?: () => void;
   onOpenPlan: () => void;
   onOpenDiff: () => void;
+  onHeightChange?: (height: number) => void;
 }
+// endregion
 
 function getStageLabel(stage: PlanStage, language: "zh" | "en"): string {
   const zh: Record<PlanStage, string> = {
@@ -60,6 +64,7 @@ const TopIsland = memo(function TopIsland({
   statusToneClass,
   language,
   themeMode,
+  isVisible = true,
   planTasks,
   planStage,
   isAwaitingChoice = false,
@@ -78,17 +83,29 @@ const TopIsland = memo(function TopIsland({
   onApproveDiffSession,
   onOpenPlan,
   onOpenDiff,
+  onHeightChange,
 }: TopIslandProps) {
   const [hovered, setHovered] = useState(false);
   const [pinnedOpen, setPinnedOpen] = useState(false);
+  const shellRef = useRef<HTMLDivElement | null>(null);
 
+  // region: TopIsland 展开时机
   const hasReplyOptions = replyOptions.length > 0;
   const hasPendingRunDecision = !!pendingRunDecision;
+  const hasActiveDiffPreview = !!activeDiffTask?.diff;
+  const hasExpandableContent =
+    hasReplyOptions ||
+    isAwaitingChoice ||
+    hasPendingRunDecision ||
+    !!activeDiffTask ||
+    canApprovePlan ||
+    planTasks.length > 0;
   const forceExpanded = hasReplyOptions || isAwaitingChoice || hasPendingRunDecision || !!activeDiffTask || canApprovePlan;
   const actionable = forceExpanded || hasPendingRunDecision || !!activeDiffTask || canApprovePlan;
   const hasTasks = planTasks.length > 0;
-  const shouldExpandWidth = hovered || pinnedOpen || forceExpanded;
-  const isExpanded = pinnedOpen || hovered || forceExpanded;
+  const shouldExpandWidth = forceExpanded || (hasExpandableContent && (hovered || pinnedOpen));
+  const isExpanded = forceExpanded || (hasExpandableContent && (hovered || pinnedOpen));
+  // endregion
   const completedCount = planTasks.filter((task) => task.status === "completed").length;
   const progress = planTasks.length > 0 ? Math.round((completedCount / planTasks.length) * 100) : 0;
   const currentPhaseKey = useMemo(() => {
@@ -147,22 +164,46 @@ const TopIsland = memo(function TopIsland({
   }), [completedCount, currentPhaseKey, language, planTasks.length]);
 
   const shellClass = themeMode === "light"
-    ? "bg-[rgba(255,255,255,0.86)] border-[rgba(15,23,42,0.08)] shadow-[0_18px_50px_rgba(15,23,42,0.12)]"
-    : "bg-[rgba(8,8,12,0.82)] border-[rgba(124,58,237,0.18)] shadow-[0_20px_60px_rgba(0,0,0,0.35)]";
+    ? "bg-[rgba(255,255,255,0.72)] border-[rgba(15,23,42,0.1)] shadow-[0_18px_50px_rgba(15,23,42,0.12)]"
+    : "bg-[rgba(10,10,16,0.68)] border-[rgba(255,255,255,0.08)] shadow-[0_20px_60px_rgba(0,0,0,0.28)]";
   const actionableOutline = actionable
     ? "ring-1 ring-[var(--accent)] ring-offset-1 ring-offset-transparent"
     : "";
   const primaryText = themeMode === "light" ? "text-[#111827]" : "text-[#f5f5f5]";
   const secondaryText = themeMode === "light" ? "text-[#4b5563]" : "text-[#71717a]";
-  const surface = themeMode === "light" ? "bg-[rgba(15,23,42,0.03)] border-[#e5e7eb]" : "bg-[rgba(255,255,255,0.03)] border-[#1f1f23]";
+  const surface = themeMode === "light" ? "bg-[rgba(255,255,255,0.36)] border-[rgba(15,23,42,0.08)]" : "bg-[rgba(255,255,255,0.04)] border-[#1f1f23]";
+
+  // region: TopIsland 高度同步
+  useEffect(() => {
+    if (!onHeightChange) return undefined;
+    const node = shellRef.current;
+    if (!node) return undefined;
+
+    const reportHeight = () => {
+      onHeightChange(node.offsetHeight);
+    };
+
+    reportHeight();
+    const observer = new ResizeObserver(reportHeight);
+    observer.observe(node);
+    return () => {
+      observer.disconnect();
+    };
+  }, [onHeightChange]);
+  // endregion
 
   return (
-    <div className="pointer-events-none absolute left-0 right-0 top-[58px] z-30 flex justify-center px-4">
+    <div
+      className={`pointer-events-none absolute left-0 right-0 top-[58px] z-30 flex justify-center px-4 transition-all duration-250 ease-out ${
+        isVisible ? "translate-y-0 opacity-100" : "-translate-y-2 opacity-0"
+      }`}
+    >
       <div
+        ref={shellRef}
         data-testid="top-island-shell"
         onMouseEnter={() => setHovered(true)}
         onMouseLeave={() => setHovered(false)}
-        className={`pointer-events-auto w-full overflow-hidden rounded-[28px] border backdrop-blur-xl transition-all duration-300 ${shouldExpandWidth ? "max-w-4xl" : "max-w-[580px]"} ${shellClass} ${actionableOutline}`}
+        className={`w-full overflow-hidden rounded-[28px] border backdrop-blur-2xl backdrop-saturate-150 transition-all duration-300 ease-out ${isVisible ? "pointer-events-auto" : "pointer-events-none"} ${shouldExpandWidth ? "max-w-4xl" : "max-w-[580px]"} ${shellClass} ${actionableOutline}`}
       >
         <div className="flex items-center justify-between gap-3 px-4 py-3">
           <div className="min-w-0 flex items-center gap-2">
@@ -189,7 +230,7 @@ const TopIsland = memo(function TopIsland({
                 {copy.pendingDecision}
               </span>
             )}
-            {activeDiffTask && (
+            {activeDiffTask && hasActiveDiffPreview && (
               <span className="shrink-0 rounded-full border border-[rgba(96,165,250,0.25)] bg-[rgba(96,165,250,0.12)] px-2 py-0.5 text-[10px] text-[#93c5fd]">
                 {copy.diffRequest}
               </span>
@@ -207,25 +248,32 @@ const TopIsland = memo(function TopIsland({
           </button>
         </div>
 
-        {isExpanded && (
-          <div className="border-t border-[rgba(255,255,255,0.06)] px-4 pb-4 pt-3">
+        <div
+          className={`grid transition-all duration-250 ease-out ${
+            isExpanded ? "grid-rows-[1fr] opacity-100" : "grid-rows-[0fr] opacity-0"
+          }`}
+        >
+          <div className="overflow-hidden">
+            <div className="border-t border-[rgba(255,255,255,0.06)] px-4 pb-4 pt-3">
             {pendingRunDecision && (
-              <div data-testid="top-island-pending-run-decision" className={`rounded-2xl border p-3 ${surface}`}>
-                <div className={`text-[12px] font-medium ${primaryText}`}>
-                  {pendingRunDecision.kind === "execution_consent"
-                    ? copy.executionConsentTitle
-                    : pendingRunDecision.title || copy.chooseToContinue}
-                </div>
-                <div className={`mt-1 text-[12px] leading-6 ${secondaryText}`}>
-                  {pendingRunDecision.reason}
-                </div>
-                {pendingRunDecision.kind === "execution_consent" && (
-                  <div className={`mt-1 text-[11px] leading-6 ${secondaryText}`}>
-                    {copy.executionConsentHint}
-                    {pendingRunDecision.target ? ` ${pendingRunDecision.target}` : ""}
+              <div>
+                <div data-testid="top-island-pending-run-decision" className={`rounded-2xl border p-3 ${surface}`}>
+                  <div className={`text-[12px] font-medium ${primaryText}`}>
+                    {pendingRunDecision.kind === "execution_consent"
+                      ? copy.executionConsentTitle
+                      : pendingRunDecision.title || copy.chooseToContinue}
                   </div>
-                )}
-                <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
+                  <div className={`mt-1 break-words text-[12px] leading-6 ${secondaryText}`}>
+                    {pendingRunDecision.reason}
+                  </div>
+                  {pendingRunDecision.kind === "execution_consent" && (
+                    <div className={`mt-1 break-words text-[11px] leading-6 ${secondaryText}`}>
+                      {copy.executionConsentHint}
+                      {pendingRunDecision.target ? ` ${pendingRunDecision.target}` : ""}
+                    </div>
+                  )}
+                </div>
+                <div className="mt-3 flex flex-wrap items-center justify-end gap-2 px-1">
                   {pendingRunDecision.kind === "execution_consent" ? (
                     <>
                       <button
@@ -378,24 +426,24 @@ const TopIsland = memo(function TopIsland({
             {(activeDiffTask || canApprovePlan) && (
               <div className={`mt-3 grid gap-3 ${activeDiffTask && canApprovePlan ? "md:grid-cols-2" : ""}`}>
                 {activeDiffTask && (
-                  <div className={`rounded-2xl border p-3 ${surface}`}>
-                    <div className="flex items-center justify-between gap-3">
-                      <div>
-                        <div className={`text-[12px] font-medium ${primaryText}`}>{copy.pendingReview}</div>
-                        <div className={`mt-1 text-[12px] ${secondaryText}`}>{activeDiffTask.target}</div>
-                        <div className={`mt-1 text-[11px] ${secondaryText}`}>{copy.chooseApproval}</div>
-                      </div>
-                      <button
-                        onClick={onOpenDiff}
-                        className="rounded-full border border-[rgba(96,165,250,0.25)] bg-[rgba(96,165,250,0.12)] px-3 py-1 text-[11px] text-[#bfdbfe] transition-colors hover:bg-[rgba(96,165,250,0.2)]"
-                      >
-                        <span className="inline-flex items-center gap-1.5">
-                          <IconColumns className="h-3.5 w-3.5" />
-                          {copy.openDiff}
-                        </span>
-                      </button>
+                  <div>
+                    <div className={`rounded-2xl border p-3 ${surface}`}>
+                      <div className={`text-[12px] font-medium ${primaryText}`}>{copy.pendingReview}</div>
+                      <div className={`mt-1 break-words text-[12px] leading-6 ${secondaryText}`}>{activeDiffTask.target}</div>
+                      <div className={`mt-1 text-[11px] ${secondaryText}`}>{copy.chooseApproval}</div>
                     </div>
-                    <div className="mt-3 flex items-center justify-end gap-2">
+                    <div className="mt-3 flex flex-wrap items-center justify-end gap-2 px-1">
+                      {hasActiveDiffPreview && (
+                        <button
+                          onClick={onOpenDiff}
+                          className="rounded-lg border border-[rgba(96,165,250,0.25)] bg-[rgba(96,165,250,0.12)] px-4 py-2 text-[12px] font-medium text-[#bfdbfe] transition-colors hover:bg-[rgba(96,165,250,0.2)]"
+                        >
+                          <span className="inline-flex items-center gap-1.5">
+                            <IconColumns className="h-3.5 w-3.5" />
+                            {copy.openDiff}
+                          </span>
+                        </button>
+                      )}
                       <button
                         onClick={() => onRejectDiff?.(activeDiffTask.id)}
                         className="rounded-lg border border-[#3f3f46] bg-[#09090b] px-4 py-2 text-[12px] font-medium text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#f5f5f5]"
@@ -424,14 +472,16 @@ const TopIsland = memo(function TopIsland({
                 )}
 
                 {canApprovePlan && (
-                  <div className={`rounded-2xl border p-3 ${surface}`}>
-                    <div className={`text-[12px] font-medium ${primaryText}`}>{copy.waitingPlan}</div>
-                    <div className={`mt-1 text-[12px] leading-6 ${secondaryText}`}>
+                  <div>
+                    <div className={`rounded-2xl border p-3 ${surface}`}>
+                      <div className={`text-[12px] font-medium ${primaryText}`}>{copy.waitingPlan}</div>
+                      <div className={`mt-1 text-[12px] leading-6 ${secondaryText}`}>
                       {language === "zh"
                         ? "当前计划已经准备就绪。确认后会先生成执行任务列表，再进入执行阶段。"
                         : "The current plan is ready. Approving it will generate the execution task list first and then start execution."}
+                      </div>
                     </div>
-                    <div className="mt-3 flex items-center justify-end gap-2">
+                    <div className="mt-3 flex items-center justify-end gap-2 px-1">
                       <button
                         onClick={onRejectPlan}
                         className="rounded-lg border border-[#3f3f46] bg-[#09090b] px-4 py-2 text-[12px] font-medium text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#f5f5f5]"
@@ -451,8 +501,9 @@ const TopIsland = memo(function TopIsland({
                 )}
               </div>
             )}
+            </div>
           </div>
-        )}
+        </div>
       </div>
     </div>
   );

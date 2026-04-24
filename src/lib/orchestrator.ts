@@ -23,7 +23,7 @@ import {
 } from "./streaming";
 import { buildToolDefinitions, skillNameToToolName, type ToolDefinition } from "./toolSchemas";
 import { executeTool, isReadOnlyTool } from "./toolExecutor";
-import { computeContextBudgets, manageContext } from "./contextTrim";
+import { computeContextBudgets, estimateTokens, manageContext } from "./contextTrim";
 import { generateId } from "./utils";
 import { buildSystemPrompt } from "./systemPrompt";
 import { discoverAllMcpTools, setMcpToolServerMap, type MCPServer, type MCPTool } from "./mcpClient";
@@ -105,6 +105,23 @@ function validateToolArgs(name: string, args: Record<string, unknown>, allTools:
   return `Tool '${name}' is missing required parameter(s): ${missing.join(", ")}. ` +
     `Required: ${required.join(", ")}. Please retry with the correct arguments.`;
 }
+
+// region: 上下文压缩预留
+
+function computeToolSchemaReserve(contextLimit: number, tools: ToolDefinition[], extraMargin: number = 0): number {
+  const toolTokens = tools.length > 0 ? estimateTokens(JSON.stringify(tools)) : 0;
+  const providerMargin = tools.length > 0 ? 768 : 384;
+  const reserve = Math.max(providerMargin, Math.round(toolTokens * 0.6) + extraMargin);
+  const maxReserve = Math.max(providerMargin, Math.floor(contextLimit * 0.4));
+  return Math.min(maxReserve, reserve);
+}
+
+function computeManagedContextLimit(contextLimit: number, tools: ToolDefinition[], extraMargin: number = 0): number {
+  const effectiveLimit = contextLimit - computeToolSchemaReserve(contextLimit, tools, extraMargin);
+  return Math.max(2048, effectiveLimit);
+}
+
+// endregion
 
 // ── Types ─────────────────────────────────────────────────────────
 
@@ -198,6 +215,7 @@ export interface OrchestratorCallbacks {
       tokenCountBefore: number;
       tokenCountAfter: number;
       tokenReduction: number;
+      compressedContext?: string;
     },
     reason: "proactive" | "reactive",
   ) => void;
@@ -952,12 +970,14 @@ export async function executeAgentLoop(
     // 1. Local-only context management. Cloud mode sends the full history
     // and lets the remote server enforce its own context policy.
     let managedAgentMessages = callbacks.getMessages() as AgentMessage[];
+    const llmTools = resolveLlmTools();
     if (snapshotContextLimit != null) {
       const contextLimit = snapshotContextLimit;
-      const { outputBudget } = computeContextBudgets(contextLimit);
+      const effectiveContextLimit = computeManagedContextLimit(contextLimit, llmTools);
+      const { outputBudget } = computeContextBudgets(effectiveContextLimit);
       const managedResult = manageContext(
         callbacks.getMessages(),
-        contextLimit,
+        effectiveContextLimit,
         outputBudget,
         1200, // maxToolResultTokens: aggressively truncate tool results
         800,  // maxAssistantTokens: aggressively truncate assistant prose
@@ -972,6 +992,7 @@ export async function executeAgentLoop(
           tokenCountBefore: managedResult.tokenCountBefore,
           tokenCountAfter: managedResult.tokenCountAfter,
           tokenReduction: managedResult.tokenReduction,
+          compressedContext: managedResult.compressedContext,
         }, "proactive");
       }
     }
@@ -987,7 +1008,7 @@ export async function executeAgentLoop(
         assistantMsgId,
         callbacks,
         abortController.signal,
-        resolveLlmTools(),
+        llmTools,
         currentMaxTokens,
       );
     } catch (err) {
@@ -1000,7 +1021,7 @@ export async function executeAgentLoop(
       // If the error is a context_length_exceeded, compact the messages
       // more aggressively and retry once.
       const errMsg = (err as Error).message || "";
-      const nativeToolsWereAttempted = resolveLlmTools().length > 0;
+      const nativeToolsWereAttempted = llmTools.length > 0;
       const isContextError =
         (err as Error & { isContextError?: boolean }).isContextError === true ||
         errMsg.includes("CONTEXT_LENGTH_EXCEEDED") ||
@@ -1021,14 +1042,15 @@ export async function executeAgentLoop(
         console.log("[orchestrator] Context length exceeded — reactive compact and retry");
 
         // More aggressive compaction: reduce tool result budget and output budget
-        const aggressiveOutputBudget = 1024;
+        const aggressiveContextLimit = computeManagedContextLimit(snapshotContextLimit, llmTools, 1024);
+        const aggressiveOutputBudget = 768;
         const maxToolResultTokens = 800;
         const aggressivelyManagedResult = manageContext(
           callbacks.getMessages(),
-          snapshotContextLimit,
+          aggressiveContextLimit,
           aggressiveOutputBudget,
           maxToolResultTokens,
-          600,
+          480,
         );
         const aggressivelyManaged = aggressivelyManagedResult.messages as AgentMessage[];
         if (aggressivelyManagedResult.changed) {
@@ -1040,6 +1062,7 @@ export async function executeAgentLoop(
             tokenCountBefore: aggressivelyManagedResult.tokenCountBefore,
             tokenCountAfter: aggressivelyManagedResult.tokenCountAfter,
             tokenReduction: aggressivelyManagedResult.tokenReduction,
+            compressedContext: aggressivelyManagedResult.compressedContext,
           }, "reactive");
         }
 
@@ -1051,8 +1074,8 @@ export async function executeAgentLoop(
             assistantMsgId,
             callbacks,
             abortController.signal,
-            resolveLlmTools(),
-            2048, // Lower max_tokens for the retry
+            llmTools,
+            1536,
           );
         } catch (retryErr) {
           if ((retryErr as Error).name === "AbortError") {
@@ -1065,16 +1088,36 @@ export async function executeAgentLoop(
           // plain text-only messages
           console.log("[orchestrator] Second retry: stripping tool_calls from messages");
           const strippedMessages = buildCompatibilityRetryMessages(aggressivelyManaged);
+          const emergencyContextLimit = computeManagedContextLimit(snapshotContextLimit, llmTools, 1536);
+          const emergencyManagedResult = manageContext(
+            strippedMessages,
+            emergencyContextLimit,
+            512,
+            320,
+            220,
+          );
+          const emergencyManaged = emergencyManagedResult.messages as AgentMessage[];
+
+          if (emergencyManagedResult.changed && emergencyManagedResult.tokenReduction > 0) {
+            callbacks.replaceMessages(emergencyManaged);
+            callbacks.onContextCompress({
+              droppedCount: emergencyManagedResult.droppedCount,
+              tokenCountBefore: emergencyManagedResult.tokenCountBefore,
+              tokenCountAfter: emergencyManagedResult.tokenCountAfter,
+              tokenReduction: emergencyManagedResult.tokenReduction,
+              compressedContext: emergencyManagedResult.compressedContext,
+            }, "reactive");
+          }
 
           try {
             streamResult = await fetchLLMStream(
-              strippedMessages,
+              emergencyManaged,
               settings,
               assistantMsgId,
               callbacks,
               abortController.signal,
-              resolveLlmTools(),
-              2048,
+              llmTools,
+              1024,
             );
           } catch (finalErr) {
             if ((finalErr as Error).name === "AbortError") {
@@ -1104,7 +1147,7 @@ export async function executeAgentLoop(
             assistantMsgId,
             callbacks,
             abortController.signal,
-            resolveLlmTools(),
+            llmTools,
             currentMaxTokens,
           );
         } catch (retryErr) {
@@ -1343,6 +1386,7 @@ export async function executeAgentLoop(
           missingToolCallRepromptKind !== "none";
 
         if (shouldRepromptForMissingToolCall) {
+          callbacks.onStatusChange("running");
           consecutiveNoToolCount++;
           if (consecutiveNoToolCount >= 5) {
             callbacks.onError("模型连续多次未能正确使用 <tool_use> 格式调用工具，陷入复读循环，已强制中止。你可以尝试更明确地指引它执行。");
@@ -1368,6 +1412,7 @@ export async function executeAgentLoop(
           callbacks.getPlanTasks().some((task) => task.status !== "completed");
 
         if (hasRemainingApprovedPlanTasks) {
+          callbacks.onStatusChange("running");
           consecutiveNoToolCount++;
           if (consecutiveNoToolCount >= 5) {
             callbacks.onError("计划执行过程中模型连续多次提前停下，但仍有未完成任务。已中止本轮，请重试或切换更稳定的模型。");
@@ -1402,6 +1447,7 @@ export async function executeAgentLoop(
         // have caught these cases, but if they didn't, re-prompt instead
         // of exiting so the model gets another chance to use tools.
         if (workflowMode === "plan" && !callbacks.getIsPlanApproved() && currentPlanStage !== "ready_to_execute") {
+          callbacks.onStatusChange("running");
           consecutiveNoToolCount++;
           if (consecutiveNoToolCount >= 5) {
             callbacks.onError("模型在计划模式下多次未能使用工具，已中止。你可以尝试更明确地指引它执行。");

@@ -33,6 +33,8 @@ import {
   extractPlanTasks,
   getPendingPlanTaskCommandFocus,
   getPlanArtifactTitle,
+  isGenericConversationTitle,
+  looksLikeReasoningLeakTitle,
   normalizeConversationDisplayTitle,
   summarizeAssistantText,
   summarizeUserPrompt,
@@ -337,7 +339,20 @@ export type TaskBlock =
   | (TaskBlockBase & { type: "agent"; content: string; options?: ReplyOption[]; streaming?: boolean; hiddenProcess?: boolean })
   | (TaskBlockBase & { type: "thought"; content: string; isStreaming?: boolean; duration?: number })
   | (TaskBlockBase & { type: "jobList"; jobs: JobItem[] })
-  | (TaskBlockBase & { type: "system"; content: string; icon?: string });
+  | (TaskBlockBase & {
+      type: "system";
+      content: string;
+      icon?: string;
+      variant?: "context_compression";
+      contextCompression?: {
+        reason: "proactive" | "reactive";
+        droppedCount: number;
+        tokenCountBefore: number;
+        tokenCountAfter: number;
+        tokenReduction: number;
+        compressedContext?: string;
+      };
+    });
 
 // ── Store State Interface ─────────────────────────────────────────────
 
@@ -911,6 +926,26 @@ function normalizeIntentSummary(summary: string): string {
   return summary.replace(/\s+/g, " ").trim();
 }
 
+function buildLocalTurnTitle(input: string, intent: ResolvedRunIntent, language: "zh" | "en"): string {
+  const cleanedInput = normalizeConversationDisplayTitle(
+    input,
+    language === "en" ? 52 : 44,
+    "",
+  );
+  if (cleanedInput) return cleanedInput;
+
+  const lowerInput = input.toLowerCase();
+  const dataKeywords = /表格|excel|xlsx|csv|数据|用户画像|ltv|rfm|k-means|聚类|付费|注册|评论/i;
+  if (dataKeywords.test(lowerInput)) {
+    return language === "en" ? "Analyze user data" : "分析用户行为数据";
+  }
+  if (intent === "plan") return language === "en" ? "Create analysis plan" : "制定分析计划";
+  if (intent === "report") return language === "en" ? "Generate report" : "生成分析报告";
+  if (intent === "summarize") return language === "en" ? "Summarize materials" : "总结资料内容";
+  if (intent === "analyze") return language === "en" ? "Analyze materials" : "分析资料内容";
+  return language === "en" ? "New task" : "新的任务";
+}
+
 function buildRunIntentSummary(params: {
   input: string;
   intent: ResolvedRunIntent;
@@ -1014,6 +1049,16 @@ function normalizeSemanticTurnMetadata(
 // Prevents Error 13 crashes when state contains non-serializable values
 // (e.g., React elements, functions, circular references).
 
+const MAX_PERSISTED_CONTEXT_COMPRESSION_CHARS = 2400;
+
+function trimPersistedContextCompression(value: unknown): string | undefined {
+  const text = String(value ?? "").trim();
+  if (!text) return undefined;
+  return text.length <= MAX_PERSISTED_CONTEXT_COMPRESSION_CHARS
+    ? text
+    : `${text.slice(0, MAX_PERSISTED_CONTEXT_COMPRESSION_CHARS).trim()}…`;
+}
+
 /** JSON.stringify wrapper that never throws — returns fallback on failure. */
 export function safeJsonStringify(value: unknown, fallback = "{}"): string {
   try {
@@ -1061,9 +1106,61 @@ export function sanitizeTaskBlocksForPersist(blocks: TaskBlock[]): TaskBlock[] {
           ...(b.message ? { message: String(b.message) } : {}),
           ...(b.diff ? { diff: { old: String(b.diff.old), new: String(b.diff.new), path: b.diff.path ? String(b.diff.path) : undefined } } : {}),
         };
+      case "system":
+        return {
+          id: b.id,
+          turnId: b.turnId,
+          type: "system" as const,
+          content: String(b.content),
+          ...(b.icon ? { icon: String(b.icon) } : {}),
+          ...(b.variant ? { variant: b.variant } : {}),
+          ...(b.contextCompression
+            ? (() => {
+                const compressedContext = trimPersistedContextCompression(b.contextCompression?.compressedContext);
+                return {
+                  contextCompression: {
+                    reason: b.contextCompression.reason,
+                    droppedCount: Number(b.contextCompression.droppedCount) || 0,
+                    tokenCountBefore: Number(b.contextCompression.tokenCountBefore) || 0,
+                    tokenCountAfter: Number(b.contextCompression.tokenCountAfter) || 0,
+                    tokenReduction: Number(b.contextCompression.tokenReduction) || 0,
+                    ...(compressedContext ? { compressedContext } : {}),
+                  },
+                };
+              })()
+            : {}),
+        };
       default:
         return b;
     }
+  });
+}
+
+export function finalizeStreamingTaskBlocks(
+  blocks: TaskBlock[],
+  turnId: string,
+  thoughtDuration?: number,
+): TaskBlock[] {
+  return blocks.map((block) => {
+    if (block.turnId !== turnId) return block;
+
+    if (block.type === "agent" && block.streaming) {
+      const cleaned = block.content
+        .replace(/<(?:analysis|thought|thinking|reasoning)(?:\s[^>]*)?>[\s\S]*?<\/(?:analysis|thought|thinking|reasoning)>/g, "")
+        .replace(/<\/?(?:analysis|thought|thinking|reasoning)(?:\s[^>]*)?>/g, "")
+        .trim();
+      return { ...block, content: cleaned, streaming: false };
+    }
+
+    if (block.type === "thought" && block.isStreaming) {
+      return {
+        ...block,
+        isStreaming: false,
+        ...(block.duration == null && thoughtDuration !== undefined ? { duration: thoughtDuration } : {}),
+      };
+    }
+
+    return block;
   });
 }
 
@@ -1760,9 +1857,18 @@ export const useAppStore = create<AppState>()(
         sessionHookCache: [],
       };
     });
-    // Register the workspace as a trusted root in the Rust backend
-    setWorkspaceRootIpc(normalizedPath)
-      .then(() => get().refreshInstructionAndHookState())
+    // Register the workspace as a trusted root in the Rust backend before tools run.
+    void setWorkspaceRootIpc(normalizedPath)
+      .then((canonicalPath) => {
+        const stablePath = canonicalPath || normalizedPath;
+        set((s) => ({
+          currentWorkspace: stablePath,
+          selectedWorkspace: stablePath,
+          config: { ...s.config, workspace: stablePath },
+        }));
+        invalidateWorkspaceTreeCache();
+        return get().refreshInstructionAndHookState();
+      })
       .catch(() => {});
   },
   setSelectedWorkspace: (path: string) => {
@@ -2130,8 +2236,28 @@ export const useAppStore = create<AppState>()(
 
     const resolve = state.pendingReviewResolve;
 
-    set({ pendingReviewResolve: null, pendingReviewTaskId: null, pendingToolCall: null });
-    set({ showDiff: false });
+    set((s) => ({
+      pendingReviewResolve: null,
+      pendingReviewTaskId: null,
+      pendingToolCall: null,
+      selectedDiffTaskId: s.selectedDiffTaskId === taskId ? null : s.selectedDiffTaskId,
+      showDiff: false,
+      agentStatus: "running",
+      isGenerating: true,
+      taskFlow: s.taskFlow.map((task) =>
+        task.id === taskId && task.type === "tool"
+          ? {
+              ...task,
+              status: "running",
+              toolStatus: "running",
+              message: "Executing...",
+            }
+          : task
+      ),
+    }));
+    if (state.currentTurnId) {
+      get().setConversationTurnStatus(state.currentTurnId, "executing");
+    }
     runAfterNextPaint(() => {
       resolve({ action: "accept" });
     });
@@ -2554,10 +2680,17 @@ export const useAppStore = create<AppState>()(
     const existingTurn = reuseCurrentTurn
       ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId) || null
       : null;
+    const existingTitle = existingTurn?.title && !isGenericConversationTitle(existingTurn.title)
+      ? existingTurn.title
+      : "";
+    const optionTitle = options?.turnTitle && !isGenericConversationTitle(options.turnTitle)
+      ? options.turnTitle
+      : "";
+    const localTurnTitle = buildLocalTurnTitle(text, effectiveRunIntent, preferredLanguage);
     const turnTitle = normalizeConversationDisplayTitle(
-      existingTurn?.title || options?.turnTitle || summarizeUserPrompt(text),
+      existingTitle || optionTitle || localTurnTitle,
       preferredLanguage === "en" ? 48 : 40,
-      preferredLanguage === "en" ? "New task" : "新的任务",
+      localTurnTitle,
     );
     const refreshedState = get();
     const activeSession = ensuredSessionId
@@ -2773,6 +2906,11 @@ export const useAppStore = create<AppState>()(
         const latestState = get();
         const targetTurn = latestState.conversationTurns.find((turn) => turn.id === turnId);
         if (!targetTurn) return;
+        if (
+          looksLikeReasoningLeakTitle(metadata.title) ||
+          looksLikeReasoningLeakTitle(metadata.summary) ||
+          isGenericConversationTitle(metadata.title)
+        ) return;
 
         latestState.updateConversationTurn(turnId, {
           title: metadata.title,
@@ -3113,6 +3251,45 @@ export const useAppStore = create<AppState>()(
         }
       };
 
+      // region: 流式块收尾
+      const finalizeStreamingUi = () => {
+        if (rafHandle !== null) {
+          cancelAnimationFrame(rafHandle);
+          rafHandle = null;
+        }
+        if (tokenBuffer) {
+          flushBuffer();
+        }
+
+        const { agent: remainingAgent } = thinkingInterceptor.flush();
+        if (remainingAgent) {
+          if (currentStreamingBlockId === null) {
+            const blockId = nextId();
+            currentStreamingBlockId = blockId;
+            appendTurnBlock({ id: blockId, turnId, type: "agent", content: remainingAgent, streaming: true });
+          } else {
+            const blockId = currentStreamingBlockId;
+            set((s) => ({
+              taskFlow: s.taskFlow.map((t) =>
+                t.id === blockId && t.type === "agent"
+                  ? { ...t, content: (t as Extract<TaskBlock, { type: "agent" }>).content + remainingAgent }
+                  : t
+              ),
+            }));
+          }
+        }
+
+        const duration = thoughtStartTime ? Math.round((Date.now() - thoughtStartTime) / 1000) : undefined;
+        set((s) => ({
+          taskFlow: finalizeStreamingTaskBlocks(s.taskFlow, turnId, duration),
+        }));
+
+        currentStreamingBlockId = null;
+        currentThoughtBlockId = null;
+        thoughtStartTime = null;
+      };
+      // endregion
+
       // Get workspace tree for system prompt
       const workspaceTree = await getWorkspaceTree(state.currentWorkspace);
 
@@ -3168,67 +3345,7 @@ export const useAppStore = create<AppState>()(
         },
 
         onStreamDone: (_fullText, _msgId, truncated) => {
-          // Flush any remaining buffered tokens
-          if (rafHandle !== null) {
-            cancelAnimationFrame(rafHandle);
-            rafHandle = null;
-          }
-          if (tokenBuffer) {
-            flushBuffer();
-          }
-
-          // Flush any remaining thinking interceptor state
-          const { agent: remainingAgent, thoughtEnded } = thinkingInterceptor.flush();
-          if (remainingAgent) {
-            if (currentStreamingBlockId === null) {
-              const blockId = nextId();
-              currentStreamingBlockId = blockId;
-              const block: TaskBlock = { id: blockId, turnId, type: "agent", content: remainingAgent, streaming: false };
-              appendTurnBlock(block);
-            } else {
-              const blockId = currentStreamingBlockId;
-              set((s) => ({
-                taskFlow: s.taskFlow.map((t) =>
-                  t.id === blockId && t.type === "agent"
-                    ? { ...t, content: (t as Extract<TaskBlock, { type: "agent" }>).content + remainingAgent }
-                    : t
-                ),
-              }));
-            }
-          }
-
-          if (thoughtEnded && currentThoughtBlockId !== null) {
-            const tid = currentThoughtBlockId;
-            const duration = thoughtStartTime ? Math.round((Date.now() - thoughtStartTime) / 1000) : undefined;
-            set((s) => ({
-              taskFlow: s.taskFlow.map((t) =>
-                t.id === tid && t.type === "thought"
-                  ? { ...t, isStreaming: false, duration }
-                  : t
-              ),
-            }));
-            currentThoughtBlockId = null;
-            thoughtStartTime = null;
-          }
-
-          if (currentStreamingBlockId !== null) {
-            const blockId = currentStreamingBlockId;
-            // Strip any residual thinking XML tags from the agent block
-            set((s) => ({
-              taskFlow: s.taskFlow.map((t) => {
-                if (t.id === blockId && t.type === "agent") {
-                  const content = (t as Extract<TaskBlock, { type: "agent" }>).content;
-                  const cleaned = content
-                    .replace(/<(?:analysis|thought|thinking|reasoning)(?:\s[^>]*)?>[\s\S]*?<\/(?:analysis|thought|thinking|reasoning)>/g, "")
-                    .replace(/<\/?(?:analysis|thought|thinking|reasoning)(?:\s[^>]*)?>/g, "")
-                    .trim();
-                  return { ...t, content: cleaned, streaming: false };
-                }
-                return t;
-              }),
-            }));
-            currentStreamingBlockId = null;
-          }
+          finalizeStreamingUi();
 
           // Show truncation warning if the model hit max_tokens
           if (truncated) {
@@ -3471,7 +3588,7 @@ export const useAppStore = create<AppState>()(
                 task.type === "tool" &&
                 task.toolName === toolName &&
                 task.target === target &&
-                task.toolStatus === "pending"
+                (task.toolStatus === "pending" || task.toolStatus === "running")
               )?.index;
             const lastInTurn = [...s.taskFlow].reverse().find((task) => task.turnId === turnId);
             const nextFlow = [...s.taskFlow];
@@ -3601,6 +3718,21 @@ export const useAppStore = create<AppState>()(
         },
 
         onStatusChange: (status) => {
+          const finalizeStaleRunningTools = (finalStatus: "executed" | "failed", message: string) => {
+            set((s) => ({
+              taskFlow: s.taskFlow.map((task) =>
+                task.turnId === turnId && task.type === "tool" && task.toolStatus === "running"
+                  ? {
+                      ...task,
+                      toolStatus: finalStatus,
+                      status: finalStatus === "executed" ? "done" : "error",
+                      message: task.message && task.message !== "Executing..." ? task.message : message,
+                    }
+                  : task
+              ),
+            }));
+          };
+
           set({
             agentStatus: status,
             // Timer only runs during active generation, NOT during plan review
@@ -3624,6 +3756,11 @@ export const useAppStore = create<AppState>()(
             get().setConversationTurnStatus(turnId, nextTurnStatus);
           }
           if (status === "idle" || status === "error") {
+            finalizeStreamingUi();
+            finalizeStaleRunningTools(
+              status === "idle" ? "executed" : "failed",
+              status === "idle" ? "已完成" : "请求已停止",
+            );
             set({ abortController: null });
             clearInterval(timerInterval);
           }
@@ -3631,6 +3768,20 @@ export const useAppStore = create<AppState>()(
 
         onError: (error) => {
           console.error('[sendMessage] onError callback:', error);
+          finalizeStreamingUi();
+          const isResponseBodyDecodeError = /error decoding response body/i.test(error);
+          const friendlyError = isResponseBodyDecodeError
+            ? "模型服务在传输回复时中断或返回了无法解析的数据。原始错误：" + error
+            : error;
+          const currentTurn = get().conversationTurns.find((turn) => turn.id === turnId);
+          if (!currentTurn?.summary?.trim()) {
+            get().setConversationTurnSummary(
+              turnId,
+              isResponseBodyDecodeError
+                ? "模型服务传输中断，已保留本轮已完成的操作记录。"
+                : summarizeAssistantText(error),
+            );
+          }
           const block: TaskBlock = {
             id: nextId(),
             turnId,
@@ -3639,7 +3790,7 @@ export const useAppStore = create<AppState>()(
             target: "",
             status: "error",
             toolStatus: "failed",
-            message: error,
+            message: friendlyError,
           };
           appendTurnBlock(block);
         },
@@ -3682,7 +3833,9 @@ export const useAppStore = create<AppState>()(
 
         onTurnSummaryReady: (summary) => {
           if (!summary.trim()) return;
-          get().setConversationTurnSummary(turnId, summarizeAssistantText(summary));
+          const summarized = summarizeAssistantText(summary);
+          if (looksLikeReasoningLeakTitle(summarized)) return;
+          get().setConversationTurnSummary(turnId, summarized);
         },
 
         appendMessage: (msg) => {
@@ -3694,20 +3847,26 @@ export const useAppStore = create<AppState>()(
         },
 
         onContextCompress: (stats, reason) => {
-          const saved = Math.max(0, Math.round(stats.tokenReduction)).toLocaleString();
-          const before = Math.max(0, Math.round(stats.tokenCountBefore)).toLocaleString();
-          const after = Math.max(0, Math.round(stats.tokenCountAfter)).toLocaleString();
-          const countLabel = stats.droppedCount > 0
-            ? `，折叠 ${stats.droppedCount} 条历史消息`
-            : "";
+          const saved = Math.max(0, Math.round(stats.tokenReduction));
+          const before = Math.max(0, Math.round(stats.tokenCountBefore));
+          const after = Math.max(0, Math.round(stats.tokenCountAfter));
           const label = reason === "reactive"
-            ? `⚠️ 上下文溢出，已压缩背景${countLabel}，约 ${before} → ${after} tokens（释放 ${saved}）`
-            : `📋 上下文已压缩背景${countLabel}，约 ${before} → ${after} tokens（释放 ${saved}，适配 KV Cache）`;
+            ? `上下文溢出，已压缩背景，约 ${before.toLocaleString()} → ${after.toLocaleString()} tokens（释放 ${saved.toLocaleString()}）`
+            : `上下文已压缩背景，约 ${before.toLocaleString()} → ${after.toLocaleString()} tokens（释放 ${saved.toLocaleString()}，适配 KV Cache）`;
           const block: TaskBlock = {
             id: nextId(),
             turnId,
             type: "system",
             content: label,
+            variant: "context_compression",
+            contextCompression: {
+              reason,
+              droppedCount: Math.max(0, Math.round(stats.droppedCount)),
+              tokenCountBefore: before,
+              tokenCountAfter: after,
+              tokenReduction: saved,
+              compressedContext: trimPersistedContextCompression(stats.compressedContext),
+            },
           };
           appendTurnBlock(block);
         },

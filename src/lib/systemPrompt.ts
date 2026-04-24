@@ -101,13 +101,12 @@ export function buildSystemPrompt(
     "4. 如果你已经有推荐方案，把推荐项放在第一个。",
     "5. 不需要用户决策时，不要滥用选项块。",
     "6. 一旦你输出了 `<user_options>`，本轮就应立即停止并等待用户点击；不要在同一条回复里继续规划、继续思考下一步，或补一句“我将继续执行”。",
-    "7. 在 Plan / Fast 等执行型模式下，如果确实因为目标分叉、口径冲突、关键前提不明确而无法继续推进，应该输出普通 Markdown 问题 + `<user_options>`，然后等待；不要假装提问后又自己继续往下执行。",
-    "8. 如果你正在等待用户做选择，却没有输出 `<user_options>`，TopIsland 就无法渲染按钮。因此任何需要暂停等待用户确认/分流的回复，都必须附带 `<user_options>`。",
+    "7. 如果确实因为目标分叉、口径冲突、关键前提不明确而无法继续推进，应该输出普通 Markdown 问题 + `<user_options>`，然后等待；不要假装提问后又自己继续往下执行。",
     "",
     "## ⚠️ 分析深度要求",
-    "`get_project_skeleton` 只返回目录结构，不包含任何代码内容。仅凭目录结构做出的分析毫无价值。",
+    "`get_project_skeleton` 只返回项目/资料目录结构，不包含任何文件内容。仅凭目录结构做出的分析毫无价值。",
     "在给出代码分析或架构总结之前，你必须：",
-    "1. 先用 `get_project_skeleton` 定位核心目录；",
+    "1. 源码/Unity 项目先用 `get_project_skeleton` 定位核心目录；表格/文档/资料分析任务先用 `list_directory` 或用户提供的 `path:` 找到文件，再直接使用文档/表格工具；",
     "2. 再用 `get_file_outline`、`read_file`、`read_document`、`analyze_tabular_document` 或 `query_tabular_document` 实际读取关键文件的内容；源码/纯文本优先用 `read_file`，PDF/DOCX 优先用 `read_document`，大型 CSV/TSV/XLSX 优先先用 `analyze_tabular_document` 看全表，再用 `query_tabular_document` 做筛选/聚合，最后才按需用 `read_document` 分段读取原始行窗口；",
     "3. 基于代码内容（而非目录名称）给出有价值的分析。",
     "4. 如果用户消息里包含附件预览，并出现 `truncatedPreview: true`、`attached_tabular_file` 或明确的 `path:` 字段，你必须把它视为“只给了预览，不是全量内容”，不能直接据此下完整结论，应继续对该路径调用工具。",
@@ -188,7 +187,7 @@ export function buildSystemPrompt(
         ? "直接按 MAIN GAME STUDIO 的协议、命令与专家体系继续执行，不要改回普通 MAIN 流程。"
         : "直接完成实现、修复、修改、落地与验证，不要强制回到计划流。",
       "如果任务中途暴露出真正的高风险分叉或关键前提冲突，应暂停并用 `<user_options>` 给出 2-3 个明确选项，而不是偷偷改走计划协议。",
-      "不要再提示用户去切换 Chat / Plan / Fast；这些已经不是用户需要手动选择的前台开关。",
+      "不要再提示用户切换旧的前台模式；这些已经不是用户需要手动选择的开关。",
     ].join("\n"));
   } else if (turnIntent === "analyze") {
     parts.push([

@@ -34,6 +34,19 @@ export interface ContextBudgets {
   proactiveTargetBudget: number;
 }
 
+export interface ContextTrimResult {
+  messages: TrimMessage[];
+  droppedMessages: TrimMessage[];
+  removedCount: number;
+  markerSummary?: string;
+  displaySummary?: string;
+}
+
+interface CompressionSummaryOptions {
+  maxItems: number;
+  maxCharsPerItem: number;
+}
+
 /**
  * Rough token estimate for mixed CJK/Latin text.
  * - English: ~4 chars per token
@@ -132,6 +145,137 @@ function messagesEqual(a: TrimMessage[], b: TrimMessage[]): boolean {
   });
 }
 
+// region: 压缩摘要辅助
+
+function isContextCompressionMarker(message: TrimMessage): boolean {
+  if (message.role !== "user" || typeof message.content !== "string") return false;
+  const text = message.content.trim();
+  return (
+    text.startsWith("[System: 较早对话已压缩。") ||
+    (text.startsWith("[System:") && text.includes("Earlier context has been summarized"))
+  );
+}
+
+function extractContextCompressionSummary(message: TrimMessage): string | undefined {
+  if (!isContextCompressionMarker(message) || typeof message.content !== "string") return undefined;
+  const lines = message.content
+    .replace(/^\[System:\s*/, "")
+    .replace(/\]$/, "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter((line) => line !== "较早对话已压缩。")
+    .filter((line) => line !== "Earlier context has been summarized — you have all essential information to continue.")
+    .filter((line) => line !== "请只把这些内容当作历史参考，优先依据当前最新消息继续。");
+
+  if (lines.length === 0) return undefined;
+  return lines.join(" ");
+}
+
+function messageContentToText(content: string | TrimContentPart[]): string {
+  if (typeof content === "string") return content;
+  return content
+    .map((part) => part.type === "text" ? part.text : "[image]")
+    .join("\n");
+}
+
+function compactTextLine(text: string, maxChars: number): string {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxChars) return normalized;
+  return `${normalized.slice(0, maxChars).trim()}…`;
+}
+
+function summarizeDroppedMessage(message: TrimMessage): string | null {
+  const text = compactTextLine(messageContentToText(message.content), 220);
+  if (!text) return null;
+
+  if (message.role === "tool") {
+    return `工具结果：${text}`;
+  }
+
+  if (message.role === "assistant") {
+    if (message.tool_calls && message.tool_calls.length > 0) {
+      const toolNames = message.tool_calls
+        .map((toolCall) => {
+          const candidate = toolCall as { function?: { name?: unknown } };
+          return typeof candidate.function?.name === "string" ? candidate.function.name : "tool_call";
+        })
+        .slice(0, 4)
+        .join("、");
+      return `助手调用工具：${toolNames || "tool_call"}`;
+    }
+    return `助手回复：${text}`;
+  }
+
+  return `用户请求：${text}`;
+}
+
+function buildCompactSummary(
+  droppedMessages: TrimMessage[],
+  carriedSummaries: string[],
+  options: CompressionSummaryOptions,
+): string | undefined {
+  const carriedItems = carriedSummaries.map((summary) => `更早历史摘要：${compactTextLine(summary, options.maxCharsPerItem)}`);
+
+  const summaries = droppedMessages
+    .map(summarizeDroppedMessage)
+    .filter((summary): summary is string => Boolean(summary));
+
+  const combined = [...carriedItems, ...summaries];
+  if (combined.length === 0) {
+    return `已移除 ${droppedMessages.length} 条较早消息，以保留最近上下文。`;
+  }
+
+  const selected = combined.slice(-options.maxItems);
+  const omitted = combined.length - selected.length;
+  return [
+    `已压缩 ${droppedMessages.length} 条较早消息，保留最近 ${selected.length} 条关键信息：`,
+    ...selected.map((summary) => `- ${summary}`),
+    ...(omitted > 0 ? [`- 另有 ${omitted} 条更早消息已省略。`] : []),
+  ].join("\n");
+}
+
+function buildMicroCompactSummary(before: TrimMessage[], after: TrimMessage[], maxItems = 6): string[] {
+  const summaries: string[] = [];
+
+  for (let index = 0; index < Math.min(before.length, after.length); index++) {
+    const original = before[index];
+    const compacted = after[index];
+    if (original.role !== compacted.role) continue;
+    if (typeof original.content !== "string" || typeof compacted.content !== "string") continue;
+    if (original.content === compacted.content) continue;
+
+    const omittedMatch = compacted.content.match(/\.\.\.\[compact: (\d+) chars omitted\]/);
+    const omittedChars = omittedMatch?.[1] ?? "部分";
+    const snippet = compactTextLine(original.content, 120);
+    if (original.role === "tool") {
+      summaries.push(`工具结果已截断：${snippet}（省略 ${omittedChars} 字符）`);
+    } else if (original.role === "assistant") {
+      summaries.push(`较长助手回复已截断：${snippet}（省略 ${omittedChars} 字符）`);
+    }
+  }
+
+  if (summaries.length <= maxItems) return summaries;
+  return [
+    ...summaries.slice(0, maxItems),
+    `另有 ${summaries.length - maxItems} 条长内容已截断。`,
+  ];
+}
+
+function joinCompressionSummaries(microSummaries: string[], trimSummary?: string): string | undefined {
+  const sections: string[] = [];
+  if (trimSummary) sections.push(trimSummary);
+  if (microSummaries.length > 0) {
+    sections.push([
+      "单条长内容压缩：",
+      ...microSummaries.map((summary) => `- ${summary}`),
+    ].join("\n"));
+  }
+  return sections.length > 0 ? sections.join("\n\n") : undefined;
+}
+
+// endregion
+
 /**
  * Trim messages to fit within the context window.
  *
@@ -149,19 +293,43 @@ export function trimMessagesToContext(
   contextLimit: number,
   reservedForOutput: number = 8192,
 ): TrimMessage[] {
-  if (messages.length === 0) return messages;
+  return trimMessagesToContextDetailed(messages, contextLimit, reservedForOutput).messages;
+}
+
+export function trimMessagesToContextDetailed(
+  messages: TrimMessage[],
+  contextLimit: number,
+  reservedForOutput: number = 8192,
+): ContextTrimResult {
+  if (messages.length === 0) {
+    return { messages, droppedMessages: [], removedCount: 0 };
+  }
 
   const inputBudget = contextLimit - reservedForOutput;
-  if (inputBudget <= 0) return messages;
+  if (inputBudget <= 0) {
+    return { messages, droppedMessages: [], removedCount: 0 };
+  }
 
   // Always keep the system message
   const systemMsg = messages[0];
   const systemTokens = systemMsg.role === "system" ? estimateMessageTokens(systemMsg) : 0;
   let remaining = inputBudget - systemTokens;
+  const originalRest = messages.slice(1);
+  const carriedSummaries = originalRest
+    .map(extractContextCompressionSummary)
+    .filter((summary): summary is string => Boolean(summary));
+  const rest = originalRest.filter((message) => !isContextCompressionMarker(message));
 
   if (remaining <= 0) {
     // Even the system message is too large — return just it
-    return [systemMsg];
+    const droppedMessages = rest;
+    return {
+      messages: [systemMsg],
+      droppedMessages,
+      removedCount: originalRest.length,
+      markerSummary: buildCompactSummary(droppedMessages, carriedSummaries, { maxItems: 4, maxCharsPerItem: 110 }),
+      displaySummary: buildCompactSummary(droppedMessages, carriedSummaries, { maxItems: 8, maxCharsPerItem: 220 }),
+    };
   }
 
   // Build result starting with system message
@@ -173,7 +341,6 @@ export function trimMessagesToContext(
   // assistant message (the one with tool_calls that triggered it). Splitting
   // them causes the AI to think a tool call was never answered, causing
   // it to retry indefinitely.
-  const rest = messages.slice(1);
   const kept: TrimMessage[] = [];
 
   for (let i = rest.length - 1; i >= 0; i--) {
@@ -209,33 +376,38 @@ export function trimMessagesToContext(
     kept.unshift(rest[i]);
   }
 
-  const droppedCount = rest.length - kept.length;
+  const keptSet = new Set(kept);
+  const droppedMessages = rest.filter((message) => !keptSet.has(message));
+  const removedCount = originalRest.length - kept.length;
+  const markerSummary = buildCompactSummary(droppedMessages, carriedSummaries, { maxItems: 4, maxCharsPerItem: 110 });
+  const displaySummary = buildCompactSummary(droppedMessages, carriedSummaries, { maxItems: 8, maxCharsPerItem: 220 });
 
-  // Insert a compact summary marker for dropped messages (claude-code-haha pattern)
-  if (droppedCount > 0) {
+  // Insert a compact summary marker for dropped messages.
+  if (markerSummary) {
     const compactMarker: TrimMessage = {
       role: "user",
-      content: `[System: ${droppedCount} earlier message(s) omitted to fit context window. Earlier context has been summarized — you have all essential information to continue.]`,
+      content: `[System: 较早对话已压缩。\n${markerSummary}\n请只把这些内容当作历史参考，优先依据当前最新消息继续。]`,
     };
     const markerTokens = estimateMessageTokens(compactMarker);
 
     if (markerTokens < remaining) {
       result.push(compactMarker);
+      remaining -= markerTokens;
     }
   }
 
   result.push(...kept);
 
   const totalInputTokens = inputBudget - remaining;
-  if (droppedCount > 0) {
+  if (removedCount > 0) {
     console.log(
-      `[contextTrim] Middle-out trim: dropped ${droppedCount} message(s). ` +
+      `[contextTrim] Middle-out trim: dropped ${removedCount} message(s). ` +
       `Input: ~${totalInputTokens} tokens, Output budget: ${reservedForOutput}, ` +
       `Context limit: ${contextLimit}`
     );
   }
 
-  return result;
+  return { messages: result, droppedMessages, removedCount, markerSummary, displaySummary };
 }
 
 /**
@@ -306,6 +478,7 @@ export interface ManageContextResult {
   tokenCountAfter: number;
   tokenReduction: number;
   budgets: ContextBudgets;
+  compressedContext?: string;
 }
 
 /**
@@ -330,6 +503,7 @@ export function manageContext(
 
   // Step 2: Compact verbose assistant messages
   const assistantCompacted = compactAssistantMessages(compacted, maxAssistantTokens);
+  const microSummaries = buildMicroCompactSummary(messages, assistantCompacted);
 
   // Step 3: Trim with hysteresis. When we cross the proactive trigger,
   // compact down to a lower target budget so we don't re-trigger every turn.
@@ -338,11 +512,12 @@ export function manageContext(
   const trimContextLimit = shouldTrim
     ? budgets.proactiveTargetBudget + budgets.outputBudget
     : budgets.contextLimit;
-  const trimmed = shouldTrim
-    ? trimMessagesToContext(assistantCompacted, trimContextLimit, budgets.outputBudget)
-    : assistantCompacted;
+  const trimResult = shouldTrim
+    ? trimMessagesToContextDetailed(assistantCompacted, trimContextLimit, budgets.outputBudget)
+    : { messages: assistantCompacted, droppedMessages: [], removedCount: 0 };
+  const trimmed = trimResult.messages;
 
-  const actualDropped = Math.max(0, messages.length - trimmed.length);
+  const actualDropped = trimResult.removedCount;
   const tokenCountAfter = estimateMessagesTokens(trimmed);
 
   return {
@@ -353,5 +528,6 @@ export function manageContext(
     tokenCountAfter,
     tokenReduction: Math.max(0, tokenCountBefore - tokenCountAfter),
     budgets,
+    compressedContext: joinCompressionSummaries(microSummaries, trimResult.displaySummary),
   };
 }

@@ -1,6 +1,7 @@
 // @ts-nocheck
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { IconChevronDown, IconChevronRight, IconCloud, IconCode, IconColumns, IconFileText, IconLogoM, IconStop, IconTerminal } from "./Icons";
+import { createPortal } from "react-dom";
+import { IconChevronDown, IconChevronRight, IconClose, IconCloud, IconCode, IconColumns, IconFileText, IconLogoM, IconStop, IconTerminal } from "./Icons";
 import ActionCard from "./ActionCard";
 import Composer from "./Composer";
 import JobListCard from "./JobListCard";
@@ -15,8 +16,10 @@ import { sanitizeAIOutput } from "../lib/sanitize";
 import { useAppStore } from "../store/useAppStore";
 import {
   deriveVisibleConversationTurnStatus,
+  isGenericConversationTitle,
   normalizeConversationDisplayTitle,
   isPlanConversationTurn,
+  looksLikeReasoningLeakTitle,
   resolveActiveConversationTurn,
   resolvePinnedConversationTurn,
   summarizePlanIntent,
@@ -57,12 +60,14 @@ function getTurnStatusTone(status: string): string {
 function TurnSummaryCard({
   turn,
   hiddenCount,
+  fallbackSummary,
   onOpenPlan,
   onExpand,
   copy,
 }: {
   turn: ConversationTurn;
   hiddenCount: number;
+  fallbackSummary?: string;
   onOpenPlan?: () => void;
   onExpand?: () => void;
   copy: {
@@ -72,7 +77,8 @@ function TurnSummaryCard({
     openPlan: string;
   };
 }) {
-  const summaryText = sanitizeAIOutput(turn.summary || "") || copy.collapsedSummary;
+  const cleanTurnSummary = sanitizeAIOutput(turn.summary || "");
+  const summaryText = (looksLikeReasoningLeakTitle(cleanTurnSummary) ? "" : cleanTurnSummary) || sanitizeAIOutput(fallbackSummary || "") || copy.collapsedSummary;
 
   return (
     <div data-testid="turn-summary-card" className="rounded-2xl border border-[#1f1f23] bg-[#09090b] px-4 py-3 shadow-sm">
@@ -104,6 +110,83 @@ function TurnSummaryCard({
   );
 }
 
+function formatTokenCount(value: number | undefined) {
+  return Math.max(0, Math.round(Number(value) || 0)).toLocaleString();
+}
+
+function ContextCompressionNotice({ block, language }: { block: any; language: "zh" | "en" }) {
+  const [isExpanded, setIsExpanded] = useState(false);
+  const stats = block.contextCompression || {};
+  const isReactive = stats.reason === "reactive";
+  const title = language === "zh"
+    ? isReactive ? "背景压缩 · 溢出保护" : "背景已压缩"
+    : isReactive ? "Context compressed · overflow guard" : "Context compressed";
+  const compactLabel = language === "zh" ? "查看" : "View";
+  const bodyText = String(stats.compressedContext || "").trim() || (language === "zh"
+    ? "当前只保存了压缩统计，暂无可展示的压缩摘要。"
+    : "Only compression stats are available for this event.");
+
+  useEffect(() => {
+    if (!isExpanded) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setIsExpanded(false);
+    };
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [isExpanded]);
+
+  return (
+    <div key={block.id} className="flex w-full justify-center">
+      <button
+        onClick={() => setIsExpanded(true)}
+        className="inline-flex max-w-[min(720px,90%)] items-center gap-2 rounded-full border border-[#34343b] bg-[#232327] px-4 py-1.5 text-[11px] text-[#a1a1aa] transition-colors hover:border-[#4b5563] hover:text-[#f4f4f5]"
+      >
+        <span className="font-medium text-[#d4d4d8]">{title}</span>
+        <span className="text-[#71717a]">{formatTokenCount(stats.tokenCountBefore)} → {formatTokenCount(stats.tokenCountAfter)} tokens</span>
+        <span className="text-[#93c5fd]">{compactLabel}</span>
+      </button>
+
+      {isExpanded && typeof document !== "undefined" && createPortal(
+        <div className="fixed inset-0 z-[140] flex items-center justify-center bg-[rgba(0,0,0,0.68)] p-6" onClick={() => setIsExpanded(false)}>
+          <div
+            className="flex h-[min(86vh,960px)] w-[min(96vw,1320px)] flex-col overflow-hidden rounded-[28px] border border-[#34343b] bg-[#1d1d20] shadow-[0_28px_80px_rgba(0,0,0,0.45)]"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-center justify-between border-b border-[#2c2c32] px-5 py-3" style={{ background: "linear-gradient(90deg, rgba(37,99,235,0.16), rgba(14,165,233,0.08))" }}>
+              <div className="min-w-0">
+                <div className="text-[13px] font-semibold text-[#e4e4e7]">{title}</div>
+                <div className="mt-1 text-[11px] text-[#a1a1aa]">
+                  {language === "zh"
+                    ? `约 ${formatTokenCount(stats.tokenCountBefore)} → ${formatTokenCount(stats.tokenCountAfter)} tokens，释放 ${formatTokenCount(stats.tokenReduction)}，折叠 ${formatTokenCount(stats.droppedCount)} 条历史消息`
+                    : `About ${formatTokenCount(stats.tokenCountBefore)} → ${formatTokenCount(stats.tokenCountAfter)} tokens, saved ${formatTokenCount(stats.tokenReduction)}, folded ${formatTokenCount(stats.droppedCount)} history message(s)`}
+                </div>
+              </div>
+              <button
+                onClick={() => setIsExpanded(false)}
+                className="rounded-full border border-[#34343b] bg-[#181818] p-2 text-[#c4c4cc] transition-colors hover:bg-[#232327] hover:text-[#fafafa]"
+                aria-label={language === "zh" ? "关闭压缩背景" : "Close compressed context"}
+              >
+                <IconClose className="h-4 w-4" />
+              </button>
+            </div>
+            <div className="min-h-0 flex-1 overflow-auto bg-[#181818] p-5">
+              <pre className="m-0 whitespace-pre-wrap break-words rounded-2xl border border-[#2c2c32] bg-[#111113] p-4 font-mono text-[12px] leading-6 text-[#d4d4d8]">
+                {bodyText}
+              </pre>
+            </div>
+          </div>
+        </div>,
+        document.body,
+      )}
+    </div>
+  );
+}
+
 function hasRenderableAgentContent(blocks: any[]) {
   return blocks.some((block) => hasRenderableAgentBlock(block));
 }
@@ -113,6 +196,19 @@ function hasRenderableAgentBlock(block: any) {
   if (Array.isArray(block.options) && block.options.length > 0) return true;
   const segments = parseMessageContent(block.content);
   return segments.some((seg) => seg.type === "text" && sanitizeAIOutput(seg.content).length > 0);
+}
+
+function getLastAgentSummaryText(blocks: any[]) {
+  const agentBlock = [...blocks]
+    .reverse()
+    .find((block) => block.type === "agent" && !block.hiddenProcess && hasRenderableAgentBlock(block));
+  if (!agentBlock) return "";
+  return parseMessageContent(agentBlock.content)
+    .filter((seg) => seg.type === "text")
+    .map((seg) => sanitizeAIOutput(seg.content))
+    .filter(Boolean)
+    .join("\n\n")
+    .trim();
 }
 
 function hasGeneratedPlanContent(blocks: any[]) {
@@ -235,6 +331,92 @@ function collectTurnChangeEntries(blocks: any[]) {
   };
 }
 
+const TOOL_SUMMARY_GROUPS = {
+  read: new Set(["read_file", "read_document", "list_directory", "glob_search", "grep_search", "index_workspace_documents"]),
+  table: new Set(["analyze_tabular_document", "query_tabular_document"]),
+  edit: new Set(["replace_in_file", "write_file"]),
+  command: new Set(["execute_command", "send_pty_input", "run_command", "read_pty_buffer", "read_pty_tail", "read_pty_since", "get_pty_status", "clear_pty_buffer"]),
+};
+
+function buildToolExecutionSummary(blocks: any[], language: "zh" | "en") {
+  const counts = { read: 0, table: 0, edit: 0, command: 0, failed: 0, other: 0 };
+
+  blocks.forEach((block) => {
+    if (block.type !== "tool") return;
+    if (block.toolStatus === "failed") {
+      counts.failed += 1;
+      return;
+    }
+    if (block.toolStatus !== "executed" && block.toolStatus !== "running") return;
+    const toolName = String(block.toolName || "");
+    if (TOOL_SUMMARY_GROUPS.read.has(toolName)) counts.read += 1;
+    else if (TOOL_SUMMARY_GROUPS.table.has(toolName)) counts.table += 1;
+    else if (TOOL_SUMMARY_GROUPS.edit.has(toolName)) counts.edit += 1;
+    else if (TOOL_SUMMARY_GROUPS.command.has(toolName)) counts.command += 1;
+    else counts.other += 1;
+  });
+
+  const parts: string[] = [];
+  if (language === "zh") {
+    if (counts.table) parts.push(`分析/查询 ${counts.table} 次表格`);
+    if (counts.read) parts.push(`读取/搜索 ${counts.read} 次资料`);
+    if (counts.edit) parts.push(`修改 ${counts.edit} 次文件`);
+    if (counts.command) parts.push(`执行 ${counts.command} 次命令`);
+    if (counts.other) parts.push(`调用 ${counts.other} 次工具`);
+    if (counts.failed) parts.push(`${counts.failed} 次请求失败`);
+    return parts.length > 0 ? `本轮已${parts.join("，")}。` : "本轮过程已折叠，结论会优先保留在这里。";
+  }
+
+  if (counts.table) parts.push(`${counts.table} table operation(s)`);
+  if (counts.read) parts.push(`${counts.read} read/search operation(s)`);
+  if (counts.edit) parts.push(`${counts.edit} file edit(s)`);
+  if (counts.command) parts.push(`${counts.command} command operation(s)`);
+  if (counts.other) parts.push(`${counts.other} tool call(s)`);
+  if (counts.failed) parts.push(`${counts.failed} failed request(s)`);
+  return parts.length > 0 ? `This turn completed ${parts.join(", ")}.` : "This turn is collapsed. The conclusion is kept here first.";
+}
+
+function getActiveTurnActivity(blocks: any[], turnStatus: string, language: "zh" | "en") {
+  const runningTool = [...blocks].reverse().find((block) => block.type === "tool" && block.toolStatus === "running");
+  if (runningTool) {
+    const target = String(runningTool.target || runningTool.toolName || "").split("/").pop() || runningTool.toolName;
+    const tableTools = new Set(["analyze_tabular_document", "query_tabular_document"]);
+    const readTools = new Set(["read_file", "read_document", "list_directory", "glob_search", "grep_search", "index_workspace_documents", "get_project_skeleton"]);
+    const commandTools = new Set(["execute_command", "run_command", "send_pty_input"]);
+    const toolName = String(runningTool.toolName || "");
+    if (language === "zh") {
+      if (tableTools.has(toolName)) return `正在分析表格：${target}`;
+      if (readTools.has(toolName)) return `正在读取资料：${target}`;
+      if (commandTools.has(toolName)) return `正在执行命令：${target}`;
+      return `正在调用工具：${target}`;
+    }
+    if (tableTools.has(toolName)) return `Analyzing table: ${target}`;
+    if (readTools.has(toolName)) return `Reading context: ${target}`;
+    if (commandTools.has(toolName)) return `Running command: ${target}`;
+    return `Using tool: ${target}`;
+  }
+
+  const hasStreamingThought = blocks.some((block) => block.type === "thought" && block.isStreaming);
+  if (hasStreamingThought) return language === "zh" ? "正在思考并整理下一步..." : "Thinking through the next step...";
+
+  const hasStreamingAgent = blocks.some((block) => block.type === "agent" && block.streaming);
+  if (hasStreamingAgent) return language === "zh" ? "正在生成回复..." : "Writing the response...";
+
+  if (turnStatus === "planning") return language === "zh" ? "正在整理计划..." : "Building the plan...";
+  if (turnStatus === "executing") return language === "zh" ? "正在处理任务，可能暂时没有文字输出..." : "Working on the task; output may pause briefly...";
+  return "";
+}
+
+function TurnActivityNotice({ text }: { text: string }) {
+  if (!text) return null;
+  return (
+    <div className="ml-9 flex items-center gap-2 rounded-2xl border border-[rgba(96,165,250,0.2)] bg-[rgba(37,99,235,0.08)] px-4 py-3 text-[12px] text-[#bfdbfe]">
+      <span className="h-2 w-2 rounded-full bg-[#60a5fa] shadow-[0_0_8px_rgba(96,165,250,0.8)] animate-pulse" />
+      <span>{text}</span>
+    </div>
+  );
+}
+
 function TurnChangesCard({
   entries,
   totalExecutedEdits,
@@ -350,7 +532,7 @@ export default function ChatArea({
     turnDetails: language === "zh" ? "回合详情" : "Turn Details",
     openPlan: language === "zh" ? "打开计划" : "Open Plan",
     viewPlan: language === "zh" ? "查看计划" : "View Plan",
-    summary: language === "zh" ? "摘要" : "Summary",
+    summary: language === "zh" ? "总结" : "Summary",
     collapsedSummary: language === "zh" ? "本轮过程已折叠，结论会优先保留在这里。" : "This turn is collapsed. The conclusion is kept here first.",
     expandHistory: (count: number) => language === "zh" ? `展开 ${count} 条过程记录` : `Expand ${count} process item(s)`,
     turnStatusLabels: language === "zh"
@@ -440,10 +622,16 @@ export default function ChatArea({
   const turnRefs = useRef<Record<string, HTMLDivElement | null>>({});
   const lastScrollTopRef = useRef(0);
   const historyPeekHideTimerRef = useRef<number | null>(null);
+  const topIslandHideTimerRef = useRef<number | null>(null);
   const [isAutoScroll, setIsAutoScroll] = useState(true);
   const [activeVisibleTurnId, setActiveVisibleTurnId] = useState<string | null>(null);
   const [showTopIslandDuringHistoryPeek, setShowTopIslandDuringHistoryPeek] = useState(false);
-
+  // region: 浮层占位同步
+  const [topIslandHeight, setTopIslandHeight] = useState(0);
+  const [composerHeight, setComposerHeight] = useState(220);
+  const [shouldRenderTopIsland, setShouldRenderTopIsland] = useState(false);
+  const [isTopIslandVisible, setIsTopIslandVisible] = useState(false);
+  // endregion
   useEffect(() => {
     elapsedBaseRef.current = Math.max(elapsedBaseRef.current, elapsedTime);
     setDisplayElapsedTime((current) => Math.max(current, elapsedTime));
@@ -541,7 +729,7 @@ export default function ChatArea({
   const shouldShowPinnedPlanTasks =
     !!pinnedPlanTurn &&
     (isPlanApproved || planStage === "executing" || planStage === "completed");
-  const composerPaddingBottom = 320;
+  const composerPaddingBottom = composerHeight + 32;
   const hasPlanPanelContent = useMemo(() => {
     if (planArtifacts.length > 0) return true;
 
@@ -599,6 +787,38 @@ export default function ChatArea({
         ? shouldShowTopIslandNormally
         : showTopIslandDuringHistoryPeek)
     );
+  const chatContainerPaddingTop = 20 + (shouldRenderTopIsland ? topIslandHeight : 0);
+
+  useEffect(() => {
+    if (topIslandHideTimerRef.current !== null) {
+      window.clearTimeout(topIslandHideTimerRef.current);
+      topIslandHideTimerRef.current = null;
+    }
+
+    if (shouldShowTopIsland) {
+      setShouldRenderTopIsland(true);
+      const rafId = window.requestAnimationFrame(() => {
+        setIsTopIslandVisible(true);
+      });
+      return () => {
+        window.cancelAnimationFrame(rafId);
+      };
+    }
+
+    setIsTopIslandVisible(false);
+    topIslandHideTimerRef.current = window.setTimeout(() => {
+      topIslandHideTimerRef.current = null;
+      setShouldRenderTopIsland(false);
+      setTopIslandHeight(0);
+    }, 240);
+
+    return () => {
+      if (topIslandHideTimerRef.current !== null) {
+        window.clearTimeout(topIslandHideTimerRef.current);
+        topIslandHideTimerRef.current = null;
+      }
+    };
+  }, [shouldShowTopIsland]);
 
   const handleScroll = useCallback(() => {
     const el = chatContainerRef.current;
@@ -715,6 +935,9 @@ export default function ChatArea({
     }
 
     if (block.type === "system") {
+      if (block.variant === "context_compression") {
+        return <ContextCompressionNotice key={`${block.id}-${index}`} block={block} language={language} />;
+      }
       return (
         <div key={`${block.id}-${index}`} className="flex w-full justify-center">
           <div className="rounded-full border border-[#27272a] bg-[#18181b] px-4 py-1.5 text-[11px] text-[#a1a1aa]">{block.content}</div>
@@ -817,11 +1040,11 @@ export default function ChatArea({
     const turn: ConversationTurn = entry.turn;
     const blocks = entry.blocks;
     const turnIntent = resolveConversationTurnIntent(turn);
+    const turnIntentLabel = copy.turnIntentLabels[turnIntent] || (language === "zh" ? "任务" : "Task");
     const isPlanTurn = turnIntent === "plan";
     const forceExpandedTurn =
       turn.status === "awaiting_input" ||
-      turn.status === "awaiting_approval" ||
-      turn.status === "error";
+      turn.status === "awaiting_approval";
     const isTurnExpanded = !turn.collapsed || forceExpandedTurn;
     const userBlock = blocks.find((block) => block.type === "user");
     const hiddenCount = blocks.filter((block) => block.type !== "user").length;
@@ -843,16 +1066,20 @@ export default function ChatArea({
     // so it must only appear once the model has finished working on this turn.
     const planTurnFinished = turn.status === "done" || turn.status === "awaiting_approval" || isPlanApproved;
     const hasCompletePlan = hasPlanContent && planTurnFinished;
-    const shouldKeepConclusionVisible =
-      !isTurnExpanded &&
-      turn.status === "done" &&
-      !isPlanTurn &&
-      !!finalVisibleAgentBlock;
-    const shouldShowCompletedSummary = turn.status === "done";
+    const finalAgentSummaryText = getLastAgentSummaryText(blocks);
+    const toolExecutionSummary = buildToolExecutionSummary(blocks, language);
+    const activeTurnActivity = getActiveTurnActivity(blocks, turn.status, language);
+    const displayTitleFallback = turn.userPrompt
+      ? normalizeConversationDisplayTitle(
+          turn.userPrompt,
+          language === "en" ? 48 : 40,
+          language === "en" ? "New task" : "新的任务",
+        )
+      : language === "en" ? "New task" : "新的任务";
     const displayTurnTitle = normalizeConversationDisplayTitle(
-      turn.title || turn.intentSummary || "",
+      !isGenericConversationTitle(turn.title) ? turn.title : turn.intentSummary || "",
       language === "en" ? 48 : 40,
-      language === "en" ? "New task" : "新的任务",
+      displayTitleFallback,
     );
 
     return (
@@ -873,9 +1100,11 @@ export default function ChatArea({
             ) : (
               <span className="text-[11px] uppercase tracking-[0.18em] text-[#71717a]">{copy.turnDetails}</span>
             )}
-            <span className={`rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-[0.16em] ${isPlanTurn ? "border-[rgba(124,58,237,0.25)] bg-[rgba(124,58,237,0.12)] text-[#c4b5fd]" : turnIntent === "execute" ? "border-[rgba(96,165,250,0.25)] bg-[rgba(96,165,250,0.12)] text-[#93c5fd]" : "border-[rgba(52,211,153,0.22)] bg-[rgba(52,211,153,0.1)] text-[#86efac]"}`}>
-              {copy.turnIntentLabels[turnIntent]}
-            </span>
+            {turnIntentLabel && (
+              <span className={`rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-[0.16em] ${isPlanTurn ? "border-[rgba(124,58,237,0.25)] bg-[rgba(124,58,237,0.12)] text-[#c4b5fd]" : turnIntent === "execute" ? "border-[rgba(96,165,250,0.25)] bg-[rgba(96,165,250,0.12)] text-[#93c5fd]" : "border-[rgba(52,211,153,0.22)] bg-[rgba(52,211,153,0.1)] text-[#86efac]"}`}>
+                {turnIntentLabel}
+              </span>
+            )}
             <span className={`rounded-full border px-2 py-0.5 text-[10px] ${getTurnStatusTone(turn.status)}`}>
               {copy.turnStatusLabels[turn.status] || turn.status}
             </span>
@@ -904,8 +1133,8 @@ export default function ChatArea({
         </button>
 
         <div className="mt-4 space-y-4">
-          {userBlock ? renderBlock(userBlock, 0) : null}
-          {!shouldKeepConclusionVisible && shouldShowTurnChanges && (
+          {isTurnExpanded && userBlock ? renderBlock(userBlock, 0) : null}
+          {isTurnExpanded && shouldShowTurnChanges && (
             <TurnChangesCard
               entries={turnChangeEntries}
               totalExecutedEdits={totalExecutedEdits}
@@ -914,55 +1143,31 @@ export default function ChatArea({
             />
           )}
 
-          {isPlanTurn && hasCompletePlan ? (
-            <>
-              {!isTurnExpanded && shouldShowCompletedSummary && (
-                <div className="ml-9">
-                  <TurnSummaryCard
-                    turn={turn}
-                    hiddenCount={hiddenCount}
-                    onOpenPlan={hasPlanPanelContent && hasPlanContent ? () => openRightPanelTab("plan") : undefined}
-                    onExpand={() => toggleConversationTurnCollapsed(turn.id)}
-                    copy={copy}
-                  />
-                </div>
-              )}
-              <PlanShortcutCard
-                turn={turn}
-                hasPlanContent={hasPlanContent}
-                canOpenPlan={hasPlanPanelContent && hasPlanContent}
-                onOpenPlan={() => openRightPanelTab("plan")}
-                copy={copy}
-              />
-            </>
-          ) : shouldKeepConclusionVisible ? (
-            <>
-              <div className="ml-9">
-                <TurnSummaryCard
-                  turn={turn}
-                  hiddenCount={collapsedProcessCount}
-                  onOpenPlan={undefined}
-                  onExpand={() => toggleConversationTurnCollapsed(turn.id)}
-                  copy={copy}
-                />
-              </div>
-              {renderBlock(finalVisibleAgentBlock, finalVisibleAgentIndex)}
-            </>
-          ) : !isTurnExpanded ? (
+          {!isTurnExpanded ? (
             <div className="ml-9">
               <TurnSummaryCard
                 turn={turn}
                 hiddenCount={turn.status === "done" ? collapsedProcessCount : hiddenCount}
-                onOpenPlan={undefined}
+                fallbackSummary={finalAgentSummaryText || toolExecutionSummary}
+                onOpenPlan={isPlanTurn && hasPlanPanelContent && hasPlanContent ? () => openRightPanelTab("plan") : undefined}
                 onExpand={() => toggleConversationTurnCollapsed(turn.id)}
                 copy={copy}
               />
             </div>
+          ) : isPlanTurn && hasCompletePlan ? (
+            <PlanShortcutCard
+              turn={turn}
+              hasPlanContent={hasPlanContent}
+              canOpenPlan={hasPlanPanelContent && hasPlanContent}
+              onOpenPlan={() => openRightPanelTab("plan")}
+              copy={copy}
+            />
           ) : (
             blocks
               .filter((block) => block.type !== "user")
               .map((block, blockIndex) => renderBlock(block, blockIndex + 1))
           )}
+          {activeTurnActivity && <TurnActivityNotice text={activeTurnActivity} />}
         </div>
       </section>
     );
@@ -1024,15 +1229,24 @@ export default function ChatArea({
         </div>
       </div>
 
-      {shouldShowTopIsland && (topIslandTurn || pendingRunDecision) && (
+      {shouldRenderTopIsland && (topIslandTurn || pendingRunDecision) && (
         <TopIsland
+          isVisible={isTopIslandVisible}
           title={
             pendingRunDecision?.kind === "intent_confirmation"
               ? pendingRunDecision.title || (language === "zh" ? "意图待确认" : "Intent Confirmation")
               : normalizeConversationDisplayTitle(
-                  topIslandTurn?.title || topIslandTurn?.intentSummary || "",
+                  topIslandTurn && !isGenericConversationTitle(topIslandTurn.title)
+                    ? topIslandTurn.title
+                    : topIslandTurn?.intentSummary || "",
                   language === "en" ? 52 : 42,
-                  language === "en" ? "Turn Decision" : "本轮决策",
+                  topIslandTurn?.userPrompt
+                    ? normalizeConversationDisplayTitle(
+                        topIslandTurn.userPrompt,
+                        language === "en" ? 52 : 42,
+                        language === "en" ? "Turn Decision" : "本轮决策",
+                      )
+                    : language === "en" ? "Turn Decision" : "本轮决策",
                 )
           }
           status={copy.turnStatusLabels[topIslandTurnStatusKey || "awaiting_input"] || topIslandTurnStatusKey || "Awaiting Choice"}
@@ -1057,14 +1271,15 @@ export default function ChatArea({
           onApproveDiffSession={() => approvePendingReviewForSession()}
           onOpenPlan={() => openRightPanelTab("plan")}
           onOpenDiff={() => openRightPanelTab("diff")}
+          onHeightChange={setTopIslandHeight}
         />
       )}
 
       <div
         ref={chatContainerRef}
         onScroll={handleScroll}
-        className="flex-1 overflow-y-auto px-5 pt-5"
-        style={{ paddingBottom: `${composerPaddingBottom}px` }}
+        className="flex-1 overflow-y-auto px-5 transition-[padding] duration-250 ease-out"
+        style={{ paddingTop: `${chatContainerPaddingTop}px`, paddingBottom: `${composerPaddingBottom}px` }}
       >
 
         {groupedTurns.length === 0 ? (
@@ -1147,6 +1362,7 @@ export default function ChatArea({
         onStopGeneration={onStopGeneration}
         autoApproveTools={autoApproveTools}
         onToggleAutoApprove={onToggleAutoApprove}
+        onHeightChange={setComposerHeight}
       />
     </div>
   );
