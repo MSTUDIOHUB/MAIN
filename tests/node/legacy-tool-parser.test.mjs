@@ -1,0 +1,44 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+
+import { parseTextForTools } from "../../src/lib/textToolParser.ts";
+import { sanitizeAIOutput } from "../../src/lib/sanitize.ts";
+
+test("parses legacy execute_command wrapper into a real read-only tool call", () => {
+  const parsed = parseTextForTools([
+    "我需要先查看 gdjrpg-prepare 目录。",
+    "",
+    "<execute_command>list_directory path=\"gdjrpg-prepare\"</execute_command>",
+  ].join("\n"));
+
+  assert.equal(parsed.toolCalls.length, 1);
+  assert.equal(parsed.toolCalls[0].name, "list_directory");
+  assert.deepEqual(parsed.toolCalls[0].arguments, { path: "gdjrpg-prepare" });
+  assert.match(parsed.cleanText, /我需要先查看/);
+  assert.doesNotMatch(parsed.cleanText, /execute_command|list_directory path=/);
+});
+
+test("parses direct legacy tool tags with inline attributes", () => {
+  const parsed = parseTextForTools("<list_directory path=\"gdjrpg-prepare\"></list_directory>");
+
+  assert.equal(parsed.toolCalls.length, 1);
+  assert.equal(parsed.toolCalls[0].name, "list_directory");
+  assert.deepEqual(parsed.toolCalls[0].arguments, { path: "gdjrpg-prepare" });
+  assert.equal(parsed.cleanText, "");
+});
+
+test("legacy tool tags are removed from visible text after parsing and sanitizing", () => {
+  const parsed = parseTextForTools([
+    "我先查看一下目录内容，然后再继续整理录制大纲。",
+    "",
+    "<execute_command>list_directory path=\"gdjrpg-prepare\"</execute_command>",
+  ].join("\n"));
+
+  const visibleText = sanitizeAIOutput(parsed.cleanText);
+
+  assert.equal(parsed.toolCalls.length, 1);
+  assert.equal(parsed.toolCalls[0].name, "list_directory");
+  assert.deepEqual(parsed.toolCalls[0].arguments, { path: "gdjrpg-prepare" });
+  assert.match(visibleText, /我先查看一下目录内容/);
+  assert.doesNotMatch(visibleText, /execute_command|list_directory path=/);
+});

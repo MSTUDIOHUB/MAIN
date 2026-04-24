@@ -1,0 +1,290 @@
+@import "tailwindcss";
+
+:root {
+  --surface-0: #181818;
+  --surface-1: #1d1d20;
+  --surface-2: #232327;
+  --surface-3: #2a2a2f;
+  --surface-4: #303036;
+  --surface-border: #34343b;
+  --surface-border-soft: #2c2c32;
+  --surface-text: #e4e4e7;
+  --surface-text-strong: #f5f5f5;
+  --surface-text-muted: #b0b0ba;
+  --surface-text-subtle: #8c8c97;
+  --surface-scrollbar: #565660;
+  --surface-scrollbar-hover: #70707c;
+}
+
+/* ── 核心重置与背景 (从纯黑抬到略亮的深灰) ────────────────────── */
+html,
+body,
+#root {
+  height: 100vh;
+  /* 强制占满全屏 */
+  width: 100vw;
+  margin: 0;
+  padding: 0;
+  background-color: var(--surface-0);
+  /* 整体保持深色，但避免纯黑压得太死 */
+  color: var(--surface-text);
+  font-family: ui-sans-serif, system-ui, sans-serif;
+  overflow: hidden;
+  /* 防止页面整体出现滚动条，滚动应在组件内部处理 */
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ── 动态主题色支持 (拯救那些错位的按钮和背景) ────────────────────── */
+/* 这些类必须存在，以便响应你在 React 中动态注入的 --accent 变量 */
+.theme-bg {
+  background-color: var(--accent, #9333ea) !important;
+  color: white !important;
+}
+
+.theme-bg-hover:hover {
+  background-color: var(--accent-hover, #7e22ce) !important;
+  color: white !important;
+}
+
+.theme-text {
+  color: var(--accent-light, #a855f7) !important;
+}
+
+.theme-border {
+  border-color: var(--accent, #9333ea) !important;
+}
+
+.theme-subtle-bg {
+  background-color: var(--accent-subtle, rgba(147, 51, 234, 0.15)) !important;
+  color: var(--accent-light, #a855f7) !important;
+}
+
+.theme-subtle-border {
+  border-color: var(--accent-subtle-border, rgba(147, 51, 234, 0.3)) !important;
+}
+
+.theme-glow {
+  box-shadow: 0 0 8px var(--accent-subtle, rgba(147, 51, 234, 0.15)) !important;
+}
+
+.theme-slider {
+  accent-color: var(--accent, #9333ea) !important;
+}
+
+/* ── VRAM Gradient Slider ────────────────────── */
+.vram-gradient-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 6px;
+  border-radius: 3px;
+  outline: none;
+  background: linear-gradient(90deg, #60a5fa 0%, #a78bfa 50%, #f97316 100%);
+  position: relative;
+}
+
+.vram-gradient-slider::-webkit-slider-runnable-track {
+  height: 6px;
+  border-radius: 3px;
+  background: linear-gradient(90deg, #60a5fa 0%, #a78bfa 50%, #f97316 100%);
+}
+
+.vram-gradient-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: white;
+  border: none;
+  cursor: pointer;
+  margin-top: -7px;
+  box-shadow: 0 0 12px rgba(255, 255, 255, 0.4), 0 2px 6px rgba(0, 0, 0, 0.3);
+  transition: box-shadow 0.2s;
+}
+
+.vram-gradient-slider::-webkit-slider-thumb:hover {
+  box-shadow: 0 0 18px rgba(255, 255, 255, 0.6), 0 2px 8px rgba(0, 0, 0, 0.4);
+}
+
+.vram-gradient-slider::-moz-range-track {
+  height: 6px;
+  border-radius: 3px;
+  background: linear-gradient(90deg, #60a5fa 0%, #a78bfa 50%, #f97316 100%);
+}
+
+.vram-gradient-slider::-moz-range-thumb {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: white;
+  border: none;
+  cursor: pointer;
+  box-shadow: 0 0 12px rgba(255, 255, 255, 0.4), 0 2px 6px rgba(0, 0, 0, 0.3);
+}
+
+.theme-ring:focus {
+  outline: 2px solid var(--accent, #9333ea);
+  outline-offset: -1px;
+}
+
+/* ── 优雅的暗黑模式滚动条 ────────────────────── */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--surface-scrollbar);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--surface-scrollbar-hover);
+}
+
+/* ── 抹平原生 Select 下拉菜单的 3D 样式，替换为极简扁平风格 ────────────────────── */
+select {
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  appearance: none;
+  /* 加上一个自定义的极简白色向下箭头 */
+  background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23a1a1aa' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  background-size: 16px;
+  padding-right: 40px !important;
+}
+
+select:focus {
+  outline: none;
+}
+
+/* ── Light Theme (CSS Data-Attribute Override) ────────────────────── */
+/* Non-invasive approach: re-maps Tailwind hex colors globally when
+   data-theme="light" is set on <html>. No React class changes needed. */
+
+html[data-theme="dark"],
+html[data-theme="dark"] body,
+html[data-theme="dark"] #root {
+  background-color: var(--surface-0);
+  color: var(--surface-text);
+}
+
+/* ── Dark Theme Neutral Remap ── */
+[data-theme="dark"] .bg-\[\#000000\] { background-color: var(--surface-0) !important; }
+[data-theme="dark"] .bg-\[\#050505\] { background-color: var(--surface-1) !important; }
+[data-theme="dark"] .bg-\[\#050507\] { background-color: var(--surface-1) !important; }
+[data-theme="dark"] .bg-\[\#07070a\] { background-color: #1f1f22 !important; }
+[data-theme="dark"] .bg-\[\#070709\] { background-color: #202024 !important; }
+[data-theme="dark"] .bg-\[\#09090b\] { background-color: var(--surface-2) !important; }
+[data-theme="dark"] .bg-\[\#09090b\]\/60 { background-color: rgba(35, 35, 39, 0.78) !important; }
+[data-theme="dark"] .bg-\[\#0d0d11\] { background-color: #28282d !important; }
+[data-theme="dark"] .bg-\[\#121216\] { background-color: var(--surface-3) !important; }
+[data-theme="dark"] .bg-\[\#18181b\] { background-color: var(--surface-3) !important; }
+[data-theme="dark"] .border-\[\#18181b\] { border-color: var(--surface-border-soft) !important; }
+[data-theme="dark"] .border-\[\#1f1f23\] { border-color: #313138 !important; }
+[data-theme="dark"] .border-\[\#27272a\] { border-color: var(--surface-border) !important; }
+[data-theme="dark"] .border-\[\#3f3f46\] { border-color: #4a4a54 !important; }
+[data-theme="dark"] .hover\:bg-\[\#18181b\]:hover { background-color: #313138 !important; }
+[data-theme="dark"] .hover\:bg-\[\#27272a\]:hover { background-color: #383840 !important; }
+[data-theme="dark"] .hover\:bg-\[\#3f3f46\]:hover { background-color: #4a4a54 !important; }
+[data-theme="dark"] .hover\:border-\[\#3f3f46\]:hover { border-color: #595964 !important; }
+[data-theme="dark"] .text-\[\#71717a\] { color: var(--surface-text-subtle) !important; }
+[data-theme="dark"] .text-\[\#a1a1aa\] { color: var(--surface-text-muted) !important; }
+[data-theme="dark"] .text-\[\#d4d4d8\] { color: #dddddf !important; }
+[data-theme="dark"] .text-\[\#e4e4e7\] { color: var(--surface-text) !important; }
+[data-theme="dark"] .text-\[\#f5f5f5\] { color: #fafafa !important; }
+[data-theme="dark"] .text-white { color: #fafafa !important; }
+[data-theme="dark"] .hover\:text-white:hover { color: #ffffff !important; }
+
+html[data-theme="light"],
+html[data-theme="light"] body,
+html[data-theme="light"] #root {
+  --surface-0: #f4f4f5;
+  --surface-1: #fafafa;
+  --surface-2: #ffffff;
+  --surface-3: #e4e4e7;
+  --surface-4: #d4d4d8;
+  --surface-border: #d4d4d8;
+  --surface-border-soft: #e4e4e7;
+  --surface-text: #18181b;
+  --surface-text-strong: #09090b;
+  --surface-text-muted: #52525b;
+  --surface-text-subtle: #71717a;
+  --surface-scrollbar: #a1a1aa;
+  --surface-scrollbar-hover: #71717a;
+  background-color: var(--surface-0);
+  color: var(--surface-text-strong);
+}
+
+/* ── Primary backgrounds ── */
+[data-theme="light"] .bg-\[\#000000\] { background-color: #f4f4f5 !important; }
+[data-theme="light"] .bg-\[\#09090b\] { background-color: #ffffff !important; }
+[data-theme="light"] .bg-\[\#18181b\] { background-color: #e4e4e7 !important; }
+[data-theme="light"] .bg-\[\#050505\] { background-color: #fafafa !important; }
+[data-theme="light"] .bg-\[\#050507\] { background-color: #fafafa !important; }
+[data-theme="light"] .bg-\[\#07070a\] { background-color: #ffffff !important; }
+[data-theme="light"] .bg-\[\#070709\] { background-color: #f8fafc !important; }
+[data-theme="light"] .bg-\[\#0d0d11\] { background-color: #f1f5f9 !important; }
+[data-theme="light"] .bg-\[\#0c0a1a\] { background-color: #f8fafc !important; }
+[data-theme="light"] .bg-\[\#0f0d1a\] { background-color: #f5f3ff !important; }
+[data-theme="light"] .bg-\[\#121216\] { background-color: #e4e4e7 !important; }
+[data-theme="light"] .bg-\[\#1e1b2e\] { background-color: #e9d5ff !important; }
+[data-theme="light"] .bg-\[\#09090b\]\/60 { background-color: rgba(255, 255, 255, 0.9) !important; }
+[data-theme="light"] .bg-\[\#3e1e1e\]\/60 { background-color: rgba(254, 226, 226, 0.9) !important; }
+[data-theme="light"] .bg-\[\#1e3a29\]\/60 { background-color: rgba(220, 252, 231, 0.9) !important; }
+[data-theme="light"] .bg-\[\#059669\]\/15 { background-color: rgba(5, 150, 105, 0.12) !important; }
+[data-theme="light"] .bg-\[\#e11d48\]\/15 { background-color: rgba(225, 29, 72, 0.12) !important; }
+
+/* ── Hover Backgrounds ── */
+[data-theme="light"] .hover\:bg-\[\#18181b\]:hover { background-color: #e4e4e7 !important; }
+[data-theme="light"] .hover\:bg-\[\#27272a\]:hover { background-color: #d4d4d8 !important; }
+[data-theme="light"] .hover\:bg-\[\#3f3f46\]:hover { background-color: #a1a1aa !important; }
+[data-theme="light"] .hover\:bg-\[\#e11d48\]\/20:hover { background-color: rgba(225, 29, 72, 0.16) !important; }
+
+/* ── Borders ── */
+[data-theme="light"] .border-\[\#27272a\] { border-color: #d4d4d8 !important; }
+[data-theme="light"] .border-\[\#3f3f46\] { border-color: #a1a1aa !important; }
+[data-theme="light"] .border-\[\#18181b\] { border-color: #e4e4e7 !important; }
+[data-theme="light"] .border-\[\#1f1f23\] { border-color: #d4d4d8 !important; }
+[data-theme="light"] .hover\:border-\[\#3f3f46\]:hover { border-color: #a1a1aa !important; }
+[data-theme="light"] .hover\:border-\[\#e11d48\]\/40:hover { border-color: rgba(225, 29, 72, 0.3) !important; }
+
+/* ── Text colors ── */
+[data-theme="light"] .text-\[\#ffffff\] { color: #000000 !important; }
+[data-theme="light"] .text-\[\#e4e4e7\] { color: #18181b !important; }
+[data-theme="light"] .text-\[\#f5f5f5\] { color: #09090b !important; }
+[data-theme="light"] .text-\[\#d4d4d8\] { color: #27272a !important; }
+[data-theme="light"] .text-\[\#a1a1aa\] { color: #52525b !important; }
+[data-theme="light"] .text-\[\#71717a\] { color: #71717a !important; }
+[data-theme="light"] .text-\[\#3f3f46\] { color: #a1a1aa !important; }
+[data-theme="light"] .text-\[\#52525b\] { color: #a1a1aa !important; }
+[data-theme="light"] .text-\[\#c4b5fd\] { color: #7c3aed !important; }
+[data-theme="light"] .text-\[\#ddd6fe\] { color: #6d28d9 !important; }
+[data-theme="light"] .text-\[\#e9d5ff\] { color: #5b21b6 !important; }
+[data-theme="light"] .text-\[\#f5f3ff\] { color: #4c1d95 !important; }
+[data-theme="light"] .text-\[\#93c5fd\] { color: #1d4ed8 !important; }
+[data-theme="light"] .text-\[\#86d9a3\] { color: #059669 !important; }
+[data-theme="light"] .text-\[\#f48771\] { color: #dc2626 !important; }
+[data-theme="light"] .text-\[\#fb7185\] { color: #e11d48 !important; }
+[data-theme="light"] .text-\[\#10b981\] { color: #059669 !important; }
+
+/* ── Hover Text Colors ── */
+[data-theme="light"] .hover\:text-\[\#ffffff\]:hover { color: #000000 !important; }
+[data-theme="light"] .hover\:text-\[\#e4e4e7\]:hover { color: #18181b !important; }
+[data-theme="light"] .hover\:text-\[\#a1a1aa\]:hover { color: #3f3f46 !important; }
+[data-theme="light"] .text-white { color: #000000 !important; }
+[data-theme="light"] .hover\:text-white:hover { color: #000000 !important; }
+
+/* ── Specific mode backgrounds ── */
+[data-theme="light"] .bg-\[\#0f2e0f\]\/60 { background-color: #dcfce7 !important; }
+[data-theme="light"] .bg-\[\#1e1b4b\]\/60 { background-color: #ede9fe !important; }
+
+/* ── Scrollbar ── */
+[data-theme="light"] ::-webkit-scrollbar-thumb { background: #a1a1aa; }
+[data-theme="light"] ::-webkit-scrollbar-thumb:hover { background: #71717a; }

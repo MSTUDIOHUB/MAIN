@@ -1,0 +1,12 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "id": "plan-completion-check",
+        "description": "When Plan mode is active, remind the model to respect tasks.md as the source of truth and only finish after verification.",
+        "command": "node scripts/plan_completion_check.mjs",
+        "timeoutMs": 4000
+      }
+    ]
+  }
+}

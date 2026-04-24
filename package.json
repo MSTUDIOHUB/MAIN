@@ -1,0 +1,54 @@
+{
+  "name": "tauri-app",
+  "private": true,
+  "version": "1.2.7",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "icon:app": "npx tauri icon public/LogoM_app.svg --output src-tauri/icons",
+    "build:desktop": "npm run tauri build",
+    "build:mac": "npm run tauri build -- --bundles app,dmg",
+    "build:mac:unsigned": "npm run tauri build -- --bundles app,dmg --no-sign",
+    "build:mac:share": "bash scripts/build-mac-share.sh",
+    "build:windows:portable": "powershell -ExecutionPolicy Bypass -File scripts/build-windows-portable.ps1",
+    "build:windows": "npm run tauri build -- --bundles nsis,msi",
+    "test:e2e": "playwright test",
+    "test:workflow-assets": "node --test tests/node/*.test.mjs",
+    "release:bump": "node scripts/release-bump.mjs",
+    "release:mac": "node scripts/release-mac.mjs",
+    "release:stage": "node scripts/prepare-public-release.mjs"
+  },
+  "dependencies": {
+    "@tailwindcss/vite": "^4.2.2",
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-dialog": "^2.7.0",
+    "@tauri-apps/plugin-opener": "^2",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
+    "mermaid": "^11.14.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "react-markdown": "^10.1.0",
+    "react-syntax-highlighter": "^16.1.1",
+    "remark-gfm": "^4.0.1",
+    "tailwindcss": "^4.2.2",
+    "zustand": "^5.0.12"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.55.0",
+    "@tauri-apps/cli": "^2.10.1",
+    "@types/react": "^19.1.8",
+    "@types/react-dom": "^19.1.6",
+    "@types/react-syntax-highlighter": "^15.5.13",
+    "@vitejs/plugin-react": "^4.7.0",
+    "react-refresh": "^0.18.0",
+    "typescript": "~5.8.3",
+    "vite": "^7.0.4"
+  },
+  "optionalDependencies": {
+    "@tauri-apps/cli-darwin-arm64": "^2.10.1"
+  }
+}

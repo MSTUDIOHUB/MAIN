@@ -1,0 +1,43 @@
+[package]
+name = "tauri-app"
+version = "1.2.7"
+description = "MAIN desktop app"
+authors = ["you"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "tauri_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+glob = "0.3"
+regex = "1"
+walkdir = "2"
+
+# ── Architecture Spec §1 Backend Requirements ──────────────────────────
+# Context-limit token counting
+tiktoken-rs = "0.6"
+# Embedded PTY for the Terminal panel
+portable-pty = "0.8"
+# HTTP client for cloud endpoint connectivity test, model discovery & streaming (bypasses CORS)
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
+futures-util = "0.3"
+tokio = { version = "1", features = ["sync"] }
+# System memory info for VRAM pressure estimation
+sysinfo = "0.34"
+# Protocol Package ZIP extraction
+zip = "2.3"
+tempfile = "3"
