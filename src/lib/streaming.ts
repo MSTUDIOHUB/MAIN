@@ -579,18 +579,19 @@ async function streamViaRustProxy(
       for (const line of lines) {
         const trimmed = line.trim();
         if (!trimmed || trimmed === "data: [DONE]") continue;
-        if (!trimmed.startsWith("data: ")) continue;
         try {
-          const json = JSON.parse(trimmed.slice(6));
-          const delta = json.choices?.[0]?.delta;
-          if (!delta) continue;
+          const jsonText = trimmed.startsWith("data: ")
+            ? trimmed.slice(6)
+            : trimmed.startsWith("data:")
+              ? trimmed.slice(5).trimStart()
+              : trimmed;
+          const json = JSON.parse(jsonText);
+          const extracted = extractOpenAiCompatibleDelta(json);
 
           // Handle reasoning_content from thinking models (Qwen3.5, DeepSeek-R1, etc.)
           // Buffer tokens until we can verify they're not garbled "?" output
           // from a llama.cpp server that can't decode the thinking tokens.
-          const reasoningDelta = extractTextLike(
-            delta.reasoning_content ?? delta.reasoning ?? delta.thinking ?? delta.thought,
-          );
+          const reasoningDelta = extracted.reasoning;
           if (reasoningDelta && !reasoningGarbled) {
             if (reasoningEmitted) {
               // Already verified as legitimate — emit directly
@@ -629,7 +630,7 @@ async function streamViaRustProxy(
           }
 
           // Handle regular content
-          const textDelta = extractTextLike(delta.content ?? delta.text);
+          const textDelta = extracted.content;
           if (textDelta) {
             // Close reasoning block if we were in one
             if (reasoningActive) {
@@ -640,10 +641,9 @@ async function streamViaRustProxy(
             onToken(textDelta);
           }
 
-          const choice = json.choices?.[0];
-          if (choice?.finish_reason) finishReason = choice.finish_reason;
-          if (delta.tool_calls && Array.isArray(delta.tool_calls)) {
-            for (const tc of delta.tool_calls) {
+          if (extracted.finishReason) finishReason = extracted.finishReason;
+          if (extracted.toolCalls.length > 0) {
+            for (const tc of extracted.toolCalls as Array<{ index?: number; id?: string; function?: { name?: string; arguments?: string } }>) {
               const idx: number = tc.index ?? 0;
               const existing = toolCallsMap.get(idx);
               if (existing) {
@@ -968,19 +968,19 @@ export async function streamChatCompletion(
         for (const line of lines) {
           const trimmed = line.trim();
           if (!trimmed || trimmed === "data: [DONE]") continue;
-          if (!trimmed.startsWith("data: ")) continue;
 
           try {
-            const json = JSON.parse(trimmed.slice(6));
-            const delta = json.choices?.[0]?.delta;
-
-            if (!delta) continue;
+            const jsonText = trimmed.startsWith("data: ")
+              ? trimmed.slice(6)
+              : trimmed.startsWith("data:")
+                ? trimmed.slice(5).trimStart()
+                : trimmed;
+            const json = JSON.parse(jsonText);
+            const extracted = extractOpenAiCompatibleDelta(json);
 
             // Handle reasoning_content from thinking models (Qwen3.5, DeepSeek-R1, etc.)
             // Buffer tokens until we can verify they're not garbled "?" output
-            const reasoningDelta = extractTextLike(
-              delta.reasoning_content ?? delta.reasoning ?? delta.thinking ?? delta.thought,
-            );
+            const reasoningDelta = extracted.reasoning;
             if (reasoningDelta && !reasoningGarbled) {
               if (reasoningEmitted) {
                 fullContent += reasoningDelta;
@@ -1010,7 +1010,7 @@ export async function streamChatCompletion(
             }
 
             // Handle text content deltas
-            const textDelta = extractTextLike(delta.content ?? delta.text);
+            const textDelta = extracted.content;
             if (textDelta) {
               // Close reasoning block if we were in one
               if (reasoningActive) {
@@ -1022,14 +1022,11 @@ export async function streamChatCompletion(
             }
 
             // Detect finish_reason for truncation awareness
-            const choice = json.choices?.[0];
-            if (choice?.finish_reason) {
-              finishReason = choice.finish_reason;
-            }
+            if (extracted.finishReason) finishReason = extracted.finishReason;
 
             // Handle tool_call deltas (native function calling)
-            if (delta.tool_calls && Array.isArray(delta.tool_calls)) {
-              for (const tc of delta.tool_calls) {
+            if (extracted.toolCalls.length > 0) {
+              for (const tc of extracted.toolCalls as Array<{ index?: number; id?: string; function?: { name?: string; arguments?: string } }>) {
                 const idx: number = tc.index ?? 0;
                 const existing = toolCallsMap.get(idx);
 
