@@ -38,4 +38,7 @@ export default defineConfig(async () => ({
       ],
     },
   },
+  build: {
+    chunkSizeWarningLimit: 5000,
+  },
 }));

@@ -1298,7 +1298,7 @@ export async function executeAgentLoop(
         // first iteration when planStage is still "idle" and no tool activity
         // has occurred. The model should never stop with a text-only response
         // while the plan hasn't reached a terminal state.
-        const shouldForcePlanContinuation = planningStillIncomplete;
+        const shouldForcePlanContinuation = planningStillIncomplete && (isCloudProfile || !hasMeaningfulVisibleText);
 
         if (shouldForcePlanContinuation) {
           consecutiveNoToolCount++;

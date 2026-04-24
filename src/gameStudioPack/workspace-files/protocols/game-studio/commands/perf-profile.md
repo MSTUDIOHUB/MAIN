@@ -79,7 +79,7 @@ Generated: [Date]
 
 ### Optimization Recommendations (Priority Order)
 1. **[Title]** — [Description]
-   - Location: [file:line]
+   - Location: `[file:line]`
    - Expected gain: [estimate]
    - Risk: [Low/Med/High]
    - Approach: [How to implement]

@@ -959,6 +959,27 @@ function extractJsonObject(text: string): string | null {
   return null;
 }
 
+function extractLooseSemanticTurnMetadata(text: string): Partial<SemanticTurnMetadata> | null {
+  const normalized = String(text || "")
+    .replace(/<think>[\s\S]*?<\/think>/gi, " ")
+    .replace(/<(?:analysis|thought|thinking|reasoning)(?:\s[^>]*)?>[\s\S]*?<\/(?:analysis|thought|thinking|reasoning)>/gi, " ")
+    .replace(/```[\s\S]*?```/g, " ")
+    .trim();
+  if (!normalized) return null;
+
+  const titleMatch = normalized.match(/(?:^|[\n,，])\s*(?:title|标题)\s*[:：]\s*["“”']?([^\n,"“”'}]+)["“”']?/i);
+  const summaryMatch = normalized.match(/(?:^|[\n,，])\s*(?:summary|摘要|总结)\s*[:：]\s*["“”']?([^\n"“”'}]+)["“”']?/i);
+  const title = titleMatch?.[1]?.trim();
+  const summary = summaryMatch?.[1]?.trim();
+  if (title || summary) return { title, summary };
+
+  const firstLine = normalized
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean);
+  return firstLine ? { title: firstLine } : null;
+}
+
 interface SemanticTurnMetadata {
   title: string;
   summary: string;
@@ -2734,11 +2755,12 @@ export const useAppStore = create<AppState>()(
 
     // 对首轮会话或噪音较重的输入，额外让模型生成一份稳定的人话标题，
     // 再同步回当前 turn 与 sidebar，避免用户名/时间戳/推理文本直接泄漏到 UI。
+    const shouldRequestSmartLocalTitle = get().config.activeProfile === "local";
     if (
       !isHidden &&
       !reuseCurrentTurn &&
       !options?.turnTitle &&
-      shouldRequestSemanticTurnMetadata(text, shouldSeedSessionTitle)
+      (shouldRequestSmartLocalTitle || shouldRequestSemanticTurnMetadata(text, shouldSeedSessionTitle))
     ) {
       void requestSemanticTurnMetadata({
         input: text,
@@ -4019,6 +4041,7 @@ async function requestSemanticTurnMetadata(params: {
         content: [
           "You are MAIN's hidden semantic title generator.",
           "Return strict JSON only. No markdown, no prose, no code fences.",
+          "This is a tiny background UI-label task, not the main conversation.",
           "Infer the user's actual task intent from the raw input.",
           "Ignore usernames, timestamps, transcript prefixes, copied meta text, and reasoning-style wording.",
           "Generate:",
@@ -4099,8 +4122,11 @@ async function requestSemanticTurnMetadata(params: {
         : extractOpenAiResponseText(j, cloudApiFormat).trim();
 
     const jsonText = extractJsonObject(rawText || "");
-    if (!jsonText) return null;
-    return normalizeSemanticTurnMetadata(JSON.parse(jsonText), {
+    const parsedMetadata = jsonText
+      ? JSON.parse(jsonText)
+      : extractLooseSemanticTurnMetadata(rawText || "");
+    if (!parsedMetadata) return null;
+    return normalizeSemanticTurnMetadata(parsedMetadata, {
       input: params.input,
       intent: params.intent,
       language: params.language,

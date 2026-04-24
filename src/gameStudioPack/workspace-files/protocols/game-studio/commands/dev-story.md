@@ -244,7 +244,7 @@ Present a concise implementation summary:
 - `tests/[path]` — test file ([N] test functions)
 
 **Acceptance criteria covered**:
-- [x] [criterion] — implemented in [file:function]
+- [x] [criterion] — implemented in `[file:function]`
 - [x] [criterion] — covered by test [test_name]
 - [ ] [criterion] — DEFERRED: requires playtest (Visual/Feel)
 
