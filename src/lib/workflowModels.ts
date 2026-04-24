@@ -99,13 +99,57 @@ export interface NormalizedStreamState {
 
 // region: 轻量摘要工具
 
+const TITLE_META_PREFIX_RE =
+  /^(?:@\S+\s+)?(?:[A-Za-z][\w.-]{0,31}\s*@?\s*[:：-]\s*)?(?:(?:\d{2,4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2})\s+)?\d{1,2}:\d{2}(?::\d{2})?\s*/;
+const TITLE_INTENT_PREFIX_RE = /^(?:当前查看|viewing)\s*/i;
+const TITLE_MODE_PREFIX_RE =
+  /^(?:讨论|discuss|计划|plan|直接执行|execute|总结|summarize|报告|report|Game Studio 工作流|Game Studio Workflow)\s*[:：-]\s*/i;
+const TITLE_REASONING_LEAK_RE =
+  /(?:thinking process|analy(?:s|z)e user input|step\s*1\b|let'?s think|思考过程|分析用户输入|先分析|先思考)/i;
+
+/**
+ * 统一清理标题中的转录元信息、Markdown 噪音和误入的状态前缀，
+ * 避免 sidebar / TopIsland 直接展示用户名、时间戳或推理泄漏文本。
+ */
+export function normalizeConversationDisplayTitle(
+  input: string,
+  maxLength = 44,
+  fallback = "新的任务",
+): string {
+  const base = String(input || "")
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/<(?:analysis|thought|thinking|reasoning)(?:\s[^>]*)?>[\s\S]*?<\/(?:analysis|thought|thinking|reasoning)>/gi, " ")
+    .replace(/<\/?(?:analysis|thought|thinking|reasoning)(?:\s[^>]*)?>/gi, " ")
+    .replace(/[#>*_`~[\]]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const stripped = base
+    .replace(TITLE_INTENT_PREFIX_RE, "")
+    .replace(TITLE_MODE_PREFIX_RE, "")
+    .replace(TITLE_META_PREFIX_RE, "")
+    .replace(/^[\"'“”‘’]+|[\"'“”‘’]+$/g, "")
+    .trim();
+
+  if (!stripped) return fallback;
+  return stripped.length <= maxLength ? stripped : `${stripped.slice(0, maxLength).trim()}...`;
+}
+
+/**
+ * 某些旧会话标题会被错误写成“思考过程”一类文本。
+ * 这里单独做一次检测，便于 UI 退回到更稳定的 turn 标题。
+ */
+export function looksLikeReasoningLeakTitle(input: string): boolean {
+  const normalized = normalizeConversationDisplayTitle(input, 120, "");
+  if (!normalized) return false;
+  return TITLE_REASONING_LEAK_RE.test(normalized);
+}
+
 /**
  * 将用户原始输入整理成适合回合标题展示的短标题。
  */
 export function summarizeUserPrompt(prompt: string, maxLength = 44): string {
-  const clean = prompt.replace(/\s+/g, " ").trim();
-  if (!clean) return "新的任务";
-  return clean.length <= maxLength ? clean : `${clean.slice(0, maxLength).trim()}...`;
+  return normalizeConversationDisplayTitle(prompt, maxLength, "新的任务");
 }
 
 /**

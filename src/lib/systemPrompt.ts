@@ -7,7 +7,10 @@ import type { Skill } from "../store/useAppStore";
 import type { Lang } from "../store/useAppStore";
 import type { ResolvedInstructionSet } from "./instructions";
 import type { PendingSlashCommand, StudioAgentKey } from "./gameStudioCatalog";
-import { getProtocolPackageEntryPath } from "./protocolPackages";
+import {
+  getApplicableProtocolPackagesForWorkspace,
+  getProtocolPackageEntryPath,
+} from "./protocolPackages";
 import { resolveRunIntentFromLegacyWorkflowMode, type ResolvedUserIntent } from "./runIntent";
 import { mapLegacyNexusModeToMainMode, type MainModeKey } from "./mainModes";
 
@@ -61,7 +64,7 @@ export function buildSystemPrompt(
   const normalizedMainModeKey = mapLegacyNexusModeToMainMode(mainModeKey);
   parts.push("当前工作区绝对路径为：" + workspace);
   parts.push("你执行任何文件操作或搜索时，都必须基于此路径。所有相对路径都相对于此根目录解析。");
-  parts.push(String.raw`对于 list_directory，path 参数传 "." 即可扫描工作区根目录。`);
+  parts.push("根目录探索优先使用 `get_project_skeleton`，不要把 `list_directory('.')` 当成默认第一步；只有明确需要根目录即时文件列表时才调用一次，拿到结果后必须复用，不能反复对 `.` 重复扫描。");
   parts.push("当 `list_directory`、`glob_search` 或其他工具返回文件/目录路径时，后续工具调用必须优先复用返回的完整相对路径，不要自行裁掉父目录。");
   if (workspaceTree) { parts.push("该目录的基础结构如下：\n" + workspaceTree); }
   
@@ -187,6 +190,15 @@ export function buildSystemPrompt(
       "如果任务中途暴露出真正的高风险分叉或关键前提冲突，应暂停并用 `<user_options>` 给出 2-3 个明确选项，而不是偷偷改走计划协议。",
       "不要再提示用户去切换 Chat / Plan / Fast；这些已经不是用户需要手动选择的前台开关。",
     ].join("\n"));
+  } else if (turnIntent === "analyze") {
+    parts.push([
+      "================================",
+      "[TURN INTENT: ANALYZE]",
+      "你当前这一轮的真实意图是：ANALYZE（只读分析/检查/验证）。",
+      "默认以只读方式分析现状、验证逻辑、定位风险、给出结论和建议；不要直接修改文件或进入执行流。",
+      "如果需要读取项目内容才能准确分析，可以使用只读工具；除非用户明确要求实现、修复或落地，否则不要调用写入类工具。",
+      "输出应优先包含：分析目标、检查范围、关键发现、风险/不确定点、建议下一步。",
+    ].join("\n"));
   } else if (turnIntent === "summarize") {
     parts.push([
       "================================",
@@ -218,11 +230,13 @@ export function buildSystemPrompt(
     ].join("\n"));
   }
 
-  if (turnIntent === "discuss" || turnIntent === "summarize" || turnIntent === "report") {
+  if (turnIntent === "discuss" || turnIntent === "analyze" || turnIntent === "summarize" || turnIntent === "report") {
     const chatInstructions: string[] = [];
     chatInstructions.push("## 工具调用格式");
     chatInstructions.push(turnIntent === "discuss"
       ? "讨论回合下，优先直接回答。只有在用户的问题必须读取项目内容才能准确回答时，才使用只读工具。"
+      : turnIntent === "analyze"
+      ? "分析回合下，优先直接给出检查结论。只有在必须读取项目或资料内容才能正确分析时，才使用只读工具。"
       : turnIntent === "summarize"
       ? "总结回合下，优先直接提炼结论。只有在必须读取项目或资料内容才能正确总结时，才使用只读工具。"
       : "报告回合下，优先直接整理结构化报告。只有在必须读取项目或资料内容才能正确成文时，才使用只读工具。");
@@ -352,15 +366,15 @@ export function buildSystemPrompt(
   }
 
   // Active Protocol Packages — on-disk multi-file workflows
-  const activePackages = skills.filter((s) => s.active && s.type === "package");
+  const activePackages = getApplicableProtocolPackagesForWorkspace(skills, workspace);
   if (activePackages.length > 0) {
-    parts.push("================================\n[ACTIVE PROFESSIONAL PROTOCOLS]\nThe following on-disk protocols are active. YOU MUST read their entry points immediately:\n");
+    parts.push("================================\n[ACTIVE PROFESSIONAL PROTOCOLS]\nThe following on-disk protocols are active for this workspace:\n");
     for (const pkg of activePackages) {
       const root = pkg.packagePath || "(unknown)";
       const entryPath = getProtocolPackageEntryPath(pkg) || (pkg.entryPoint || "SKILL.md");
       parts.push(`- Skill: ${pkg.name} | Root: ${root} | Entry: ${entryPath}`);
     }
-    parts.push("\n这些协议存储在磁盘上的隐藏目录中。你有权读取这些目录中的所有文件。在继续之前，你必须使用 read_file 工具按上面列出的 Entry 完整路径逐个读取，不要只传裸文件名（例如不要只写 `SKILL.md`），并严格遵守其中定义的工作流。");
+    parts.push("\n这些协议通常存储在磁盘上的隐藏目录中。只有当上面列出的 Entry 路径与当前任务直接相关时，才使用 `read_file` 读取它们的完整路径；不要只传裸文件名。如果某个 Entry 读取失败，不要为了寻找它而反复扫描工作区根目录，最多只在对应协议根目录做一次定向检查，然后继续主任务。");
   }
 
   return parts.join("\n\n");

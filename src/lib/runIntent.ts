@@ -6,6 +6,7 @@ export type ResolvedUserIntent =
   | "discuss"
   | "plan"
   | "execute"
+  | "analyze"
   | "summarize"
   | "report"
   | "studio_workflow";
@@ -36,12 +37,13 @@ export interface RunIntentResolution {
 export interface IntentPreflightResult {
   intent: ResolvedUserIntent;
   confidence: number;
+  title?: string;
   summary?: string;
   reason?: string;
   needsUserChoice?: boolean;
   question?: string;
   options?: PendingRunDecisionOption[];
-  outputFormat?: "answer" | "summary" | "report" | "plan" | "execution";
+  outputFormat?: "answer" | "summary" | "report" | "plan" | "analysis" | "execution";
   bypassMainRouter?: boolean;
   needsWorkspaceRead?: boolean;
 }
@@ -102,6 +104,14 @@ const STRONG_SUMMARIZE_PATTERNS = [
   /(?:帮我|请)?(?:总结|概括|归纳|梳理)(?:一下)?/i,
   /(?:给我|输出)(?:一个)?(?:摘要|总结)/i,
   /\b(?:summari[sz]e|sum up|give me a summary|overview)\b/i,
+];
+
+const STRONG_ANALYZE_PATTERNS = [
+  /(?:帮我|请)?(?:分析|检查|验证|诊断|审查|评估|排查)(?:一下)?/i,
+  /(?:仔细|全面|深入)(?:分析|检查|验证|诊断|审查|评估)/i,
+  /(?:代码|逻辑|流程|指令|链路|问题).*(?:分析|检查|验证|诊断|审查|评估)/i,
+  /(?:分析|检查|验证|诊断|审查|评估).*(?:代码|逻辑|流程|指令|链路|问题)/i,
+  /\b(?:analy[sz]e|inspect|review|diagnose|validate|verify|audit|investigate)\b/i,
 ];
 
 const STRONG_REPORT_PATTERNS = [
@@ -170,6 +180,92 @@ const HIGH_RISK_PATTERNS: Array<{ key: string; patterns: RegExp[] }> = [
 
 const CONTINUATION_INTENTS = new Set<RunIntentControlAction>(["approve_plan", "resume_plan_execution"]);
 
+export type MainIntentShortcut = Exclude<ResolvedUserIntent, "discuss" | "studio_workflow">;
+
+export interface MainIntentShortcutItem {
+  intent: MainIntentShortcut;
+  command: string;
+  label: string;
+  description: string;
+  aliases: string[];
+}
+
+const MAIN_INTENT_SHORTCUTS_ZH: MainIntentShortcutItem[] = [
+  {
+    intent: "plan",
+    command: "/计划",
+    label: "计划",
+    description: "先输出方案、步骤和关键决策，不直接动手执行。",
+    aliases: ["plan", "规划", "方案", "spec", "roadmap"],
+  },
+  {
+    intent: "report",
+    command: "/报告",
+    label: "报告",
+    description: "整理成结构化正式报告，适合复盘、汇报和交付。",
+    aliases: ["report", "汇报", "分析报告"],
+  },
+  {
+    intent: "analyze",
+    command: "/分析",
+    label: "分析",
+    description: "只读检查、验证和诊断，先给结论与建议。",
+    aliases: ["analyze", "检查", "验证", "诊断", "review", "inspect"],
+  },
+  {
+    intent: "summarize",
+    command: "/总结",
+    label: "总结",
+    description: "提炼重点、结论和下一步，不展开正式报告。",
+    aliases: ["summary", "summarize", "摘要", "概括", "归纳"],
+  },
+  {
+    intent: "execute",
+    command: "/执行",
+    label: "执行",
+    description: "直接进入处理和实现链路，不先输出完整计划。",
+    aliases: ["execute", "implement", "实现", "处理", "修复"],
+  },
+];
+
+const MAIN_INTENT_SHORTCUTS_EN: MainIntentShortcutItem[] = [
+  {
+    intent: "plan",
+    command: "/plan",
+    label: "Plan",
+    description: "Create a plan, steps, and decisions before execution.",
+    aliases: ["计划", "规划", "方案", "spec", "roadmap"],
+  },
+  {
+    intent: "report",
+    command: "/report",
+    label: "Report",
+    description: "Produce a structured report for review or handoff.",
+    aliases: ["报告", "汇报", "analysis report"],
+  },
+  {
+    intent: "analyze",
+    command: "/analyze",
+    label: "Analyze",
+    description: "Read-only inspection, validation, diagnosis, and recommendations.",
+    aliases: ["分析", "检查", "验证", "诊断", "review", "inspect"],
+  },
+  {
+    intent: "summarize",
+    command: "/summarize",
+    label: "Summary",
+    description: "Extract key points, conclusions, and next steps.",
+    aliases: ["总结", "摘要", "概括", "归纳", "summary"],
+  },
+  {
+    intent: "execute",
+    command: "/execute",
+    label: "Execute",
+    description: "Handle and implement directly without a full plan first.",
+    aliases: ["执行", "实现", "处理", "修复", "implement"],
+  },
+];
+
 function normalizeInput(input: string): string {
   return input.replace(/\s+/g, " ").trim();
 }
@@ -180,6 +276,46 @@ function matchesAny(input: string, patterns: RegExp[]): boolean {
 
 function localizeReason(language: "zh" | "en", zh: string, en: string): string {
   return language === "en" ? en : zh;
+}
+
+export function getMainIntentShortcuts(language: "zh" | "en" = "zh"): MainIntentShortcutItem[] {
+  return language === "en" ? MAIN_INTENT_SHORTCUTS_EN : MAIN_INTENT_SHORTCUTS_ZH;
+}
+
+export function getRunIntentLabel(intent: ResolvedUserIntent, language: "zh" | "en" = "zh"): string {
+  const labels: Record<ResolvedUserIntent, { zh: string; en: string }> = {
+    discuss: { zh: "讨论", en: "Discuss" },
+    plan: { zh: "计划", en: "Plan" },
+    execute: { zh: "执行", en: "Execute" },
+    analyze: { zh: "分析", en: "Analyze" },
+    summarize: { zh: "总结", en: "Summary" },
+    report: { zh: "报告", en: "Report" },
+    studio_workflow: { zh: "Game Studio", en: "Game Studio" },
+  };
+  return language === "en" ? labels[intent].en : labels[intent].zh;
+}
+
+export function parseMainIntentShortcut(input: string): { intent: MainIntentShortcut; command: string; rest: string } | null {
+  const trimmed = input.trimStart();
+  if (!trimmed.startsWith("/")) return null;
+  const match = trimmed.match(/^\/([^\s]+)(?:\s+([\s\S]*))?$/);
+  if (!match) return null;
+
+  const rawCommand = match[1].trim().toLowerCase();
+  const rest = match[2] ?? "";
+  for (const item of MAIN_INTENT_SHORTCUTS_ZH) {
+    const names = [item.command.slice(1), ...item.aliases].map((value) => value.toLowerCase());
+    if (names.includes(rawCommand)) {
+      return { intent: item.intent, command: item.command, rest };
+    }
+  }
+  for (const item of MAIN_INTENT_SHORTCUTS_EN) {
+    const names = [item.command.slice(1), ...item.aliases].map((value) => value.toLowerCase());
+    if (names.includes(rawCommand)) {
+      return { intent: item.intent, command: item.command, rest };
+    }
+  }
+  return null;
 }
 
 function createOption(intent: ResolvedUserIntent, language: "zh" | "en"): PendingRunDecisionOption {
@@ -201,6 +337,12 @@ function createOption(intent: ResolvedUserIntent, language: "zh" | "en"): Pendin
       en: "Execute Directly",
       valueZh: "直接开始处理并执行，不需要先出完整方案",
       valueEn: "Handle it directly without a separate planning phase.",
+    },
+    analyze: {
+      zh: "先做分析",
+      en: "Analyze First",
+      valueZh: "请先进行只读分析、检查和验证，给出结论与建议",
+      valueEn: "Please perform read-only analysis, inspection, and validation first.",
     },
     summarize: {
       zh: "先做总结",
@@ -287,6 +429,7 @@ export function mapResolvedRunIntentToWorkflowMode(intent: ResolvedUserIntent): 
     case "execute":
     case "studio_workflow":
       return "edit";
+    case "analyze":
     default:
       return "chat";
   }
@@ -310,6 +453,31 @@ export function resolveConversationTurnIntent(
 ): ResolvedUserIntent {
   if (turn?.intent) return turn.intent;
   return resolveRunIntentFromLegacyWorkflowMode(turn?.mode ?? "chat");
+}
+
+/**
+ * preflight 会额外触发一次模型请求。
+ * 普通低风险讨论如果在发送前被它阻塞，会让按钮/回车看起来像“卡住”。
+ * 因此这里只让真正可能改变后续流程的低置信度请求进入阻塞 preflight。
+ */
+export function shouldUseBlockingIntentPreflight(
+  resolution: RunIntentResolution,
+  mainModeKey: MainModeKey,
+): boolean {
+  if (mainModeKey !== "main_mode") return false;
+  if (resolution.bypassMainRouter) return false;
+  if (resolution.needsDecision) return false;
+  if (resolution.confidence >= 0.9) return false;
+
+  // region: 热路径保护
+  // 普通 discuss 已经会由主模型在系统提示里继续判断真实任务类型，
+  // 不值得为了一次额外 preflight 阻塞用户点击发送或回车。
+  if (resolution.intent === "discuss" && resolution.riskLevel === "low") {
+    return false;
+  }
+  // endregion
+
+  return true;
 }
 
 export function isPlanContinuationAction(
@@ -406,6 +574,20 @@ export function resolveTurnRunIntent(
         "Detected an explicit summary request, so this turn will use summary mode.",
       ),
       confidence: 0.94,
+      bypassMainRouter: false,
+      riskLevel: "low",
+    };
+  }
+
+  if (matchesAny(normalizedInput, STRONG_ANALYZE_PATTERNS)) {
+    return {
+      intent: "analyze",
+      reason: localizeReason(
+        language,
+        "检测到明确的分析/检查/验证请求，本轮会按只读分析模式处理。",
+        "Detected an explicit analysis/inspection/validation request, so this turn will use read-only analysis mode.",
+      ),
+      confidence: 0.95,
       bypassMainRouter: false,
       riskLevel: "low",
     };

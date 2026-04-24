@@ -3,6 +3,7 @@ import { streamChatCompletion, type StreamSettings } from "./streaming";
 import type { PendingRunDecisionOption, IntentPreflightResult, ResolvedUserIntent } from "./runIntent";
 import type { MainModeKey } from "./mainModes";
 import type { AppConfig } from "../store/useAppStore";
+import { normalizeConversationDisplayTitle } from "./workflowModels";
 
 type PreflightConfig = Pick<AppConfig, "activeProfile" | "local" | "cloud">;
 
@@ -10,6 +11,7 @@ const ALLOWED_INTENTS = new Set<ResolvedUserIntent>([
   "discuss",
   "plan",
   "execute",
+  "analyze",
   "summarize",
   "report",
   "studio_workflow",
@@ -17,7 +19,7 @@ const ALLOWED_INTENTS = new Set<ResolvedUserIntent>([
 
 function deriveStreamSettings(config: PreflightConfig): StreamSettings {
   if (config.activeProfile === "local") {
-    const isLocalhost = /127\.0\.0\.1|localhost|\[::1\]/.test(config.local.endpoint);
+    const isOllama = config.local.provider === "Ollama";
     return {
       baseUrl: config.local.endpoint,
       apiKey: config.local.apiKey || "not-needed",
@@ -25,7 +27,9 @@ function deriveStreamSettings(config: PreflightConfig): StreamSettings {
       temperature: 0.1,
       contextLimit: config.local.contextLimit,
       provider: config.local.provider,
-      useRustProxy: !isLocalhost,
+      // LM Studio / OMLX 的本地请求也走 Tauri 后端，避免 WebView 的
+      // “Load Failed” 网络错误；Ollama 继续使用原生前端流式接口。
+      useRustProxy: !isOllama,
     };
   }
 
@@ -112,6 +116,9 @@ function normalizePreflightResult(
   return {
     intent,
     confidence: typeof candidate.confidence === "number" ? Math.max(0, Math.min(1, candidate.confidence)) : 0.6,
+    title: typeof candidate.title === "string"
+      ? normalizeConversationDisplayTitle(candidate.title, language === "en" ? 48 : 32, language === "en" ? "New task" : "新的任务")
+      : undefined,
     summary: typeof candidate.summary === "string" ? candidate.summary.trim() : undefined,
     reason: typeof candidate.reason === "string" ? candidate.reason.trim() : undefined,
     needsUserChoice: candidate.needsUserChoice === true,
@@ -136,14 +143,15 @@ export async function runIntentPreflight(params: {
     "You are MAIN's hidden intent preflight router.",
     "Return JSON only. No markdown, no prose, no tools.",
     "Classify the user's next-turn intent for MAIN before execution.",
-    "Allowed intents: discuss, plan, execute, summarize, report, studio_workflow.",
+    "Allowed intents: discuss, plan, execute, analyze, summarize, report, studio_workflow.",
     "Only use studio_workflow if the text clearly belongs to MAIN GAME STUDIO.",
+    "Also provide title: a short clean UI title for sidebar / TopIsland. Ignore usernames, timestamps, and transcript noise.",
     "Also provide summary: a short user-facing intent summary of what MAIN is about to do. Do not copy the user's wording verbatim.",
     "Also provide reason: a brief routing reason for the chosen intent.",
     "If the request is ambiguous in a way that materially changes behavior, set needsUserChoice=true and provide a short user-facing question plus 2-3 clear options.",
     "Options must be plain user-facing choices, not reasoning.",
     "The JSON shape must be:",
-    "{\"intent\":\"discuss|plan|execute|summarize|report|studio_workflow\",\"confidence\":0.0,\"summary\":\"直接执行：调整 TopIsland 的等待交互展示\",\"reason\":\"The request asks for a concrete UI change.\",\"needsUserChoice\":false,\"question\":\"\",\"options\":[{\"id\":\"plan\",\"label\":\"进入计划模式\",\"value\":\"先给我一个方案和计划，再决定是否执行\"}],\"outputFormat\":\"answer|summary|report|plan|execution\",\"bypassMainRouter\":false,\"needsWorkspaceRead\":false}",
+    "{\"intent\":\"discuss|plan|execute|analyze|summarize|report|studio_workflow\",\"confidence\":0.0,\"title\":\"修正标题同步逻辑\",\"summary\":\"调整 sidebar 与 TopIsland 的标题同步逻辑\",\"reason\":\"The request asks for a concrete UI change.\",\"needsUserChoice\":false,\"question\":\"\",\"options\":[{\"id\":\"plan\",\"label\":\"进入计划模式\",\"value\":\"先给我一个方案和计划，再决定是否执行\"}],\"outputFormat\":\"answer|summary|report|plan|analysis|execution\",\"bypassMainRouter\":false,\"needsWorkspaceRead\":false}",
     `Current visible mode: ${params.mainModeKey}`,
     `Preferred user language: ${params.language}`,
   ].join("\n");

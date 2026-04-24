@@ -31,6 +31,8 @@ const {
   resolveProtocolPackageReadPath,
 } = await loadProtocolPackagesModule();
 
+const workspace = "/Users/michael/Documents/GitHub/MAIN";
+
 test("protocol packages expose a fully qualified entry path", () => {
   assert.equal(
     getProtocolPackageEntryPath({
@@ -48,8 +50,9 @@ test("protocol entry lookup resolves a bare SKILL.md to the active package entry
       type: "package",
       packagePath: ".protocols/Auto-Optimize-main-1776311699903/Auto-Optimize-main",
       entryPoint: "SKILL.md",
+      workspaceScope: workspace,
     },
-  ]);
+  ], workspace);
 
   assert.equal(
     resolved,
@@ -64,14 +67,16 @@ test("protocol entry lookup leaves ambiguous bare names unchanged", () => {
       type: "package",
       packagePath: ".protocols/one",
       entryPoint: "SKILL.md",
+      workspaceScope: workspace,
     },
     {
       active: true,
       type: "package",
       packagePath: ".protocols/two",
       entryPoint: "SKILL.md",
+      workspaceScope: workspace,
     },
-  ]);
+  ], workspace);
 
   assert.equal(resolved, "SKILL.md");
 });
@@ -83,8 +88,9 @@ test("protocol entry lookup resolves a nested entry by basename when unique", ()
       type: "package",
       packagePath: ".protocols/my-protocol",
       entryPoint: "docs/program.md",
+      workspaceScope: workspace,
     },
-  ]);
+  ], workspace);
 
   assert.equal(resolved, ".protocols/my-protocol/docs/program.md");
 });
@@ -96,8 +102,9 @@ test("protocol entry lookup does not rewrite normal workspace file paths", () =>
       type: "package",
       packagePath: ".protocols/Auto-Optimize-main-1776311699903/Auto-Optimize-main",
       entryPoint: "SKILL.md",
+      workspaceScope: workspace,
     },
-  ]);
+  ], workspace);
 
   assert.equal(resolved, "src/App.tsx");
 });

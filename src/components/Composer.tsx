@@ -8,7 +8,7 @@ import { useAppStore } from "../store/useAppStore";
 import type { AgentMessage, ContentPart } from "../lib/orchestrator";
 import { getGameStudioSlashCatalog } from "../lib/gameStudioPack";
 import { humanizeSlug } from "../lib/gameStudioCatalog";
-import { resolveTurnRunIntent } from "../lib/runIntent";
+import { getMainIntentShortcuts, getRunIntentLabel, parseMainIntentShortcut, resolveTurnRunIntent } from "../lib/runIntent";
 import {
   resolveGameStudioOnboardingAction,
   shouldShowGameStudioOnboarding,
@@ -159,6 +159,7 @@ export default function Composer({
   const [usedStudioOnboardingByWorkspace, setUsedStudioOnboardingByWorkspace] = useState<Record<string, boolean>>({});
   const [forceVisibleStudioOnboardingByWorkspace, setForceVisibleStudioOnboardingByWorkspace] = useState<Record<string, boolean>>({});
   const [isSubmitPending, setIsSubmitPending] = useState(false);
+  const [dismissedSuggestedIntentKey, setDismissedSuggestedIntentKey] = useState<string | null>(null);
 
   // Tracks the position of the @ that triggered the current mention session
   const mentionAnchorRef = useRef(-1);
@@ -185,12 +186,19 @@ export default function Composer({
   const planTasks = useAppStore((s) => s.planTasks);
   const planStage = useAppStore((s) => s.planStage);
   const conversationTurns = useAppStore((s) => s.conversationTurns);
+  const lockedComposerIntent = useAppStore((s) => s.lockedComposerIntent);
+  const setLockedComposerIntent = useAppStore((s) => s.setLockedComposerIntent);
   const [debouncedInput, setDebouncedInput] = useState(input);
   const slashCatalog = useMemo(
     () => getGameStudioSlashCatalog(language === "en" ? "en" : "zh"),
     [language],
   );
+  const mainIntentShortcuts = useMemo(
+    () => getMainIntentShortcuts(language === "en" ? "en" : "zh"),
+    [language],
+  );
   const isGameStudioMode = selectedMainModeKey === "game_studio";
+  const isMainMode = selectedMainModeKey === "main_mode";
   const isLightTheme = themeMode === "light";
   const isComposerSubmitting = isStreaming || isSubmitPending;
   const showExecutionProgress =
@@ -202,6 +210,11 @@ export default function Composer({
     : (language === "en" ? "Type / to search commands and agents" : "输入 / 搜索工作流命令和专业 Agent");
   const slashEmptyLabel = language === "en" ? "No matching commands or agents" : "没有匹配的命令或 Agent";
   const slashHint = language === "en" ? "Select to insert canonical command" : "选择后会插入标准命令";
+  const mainIntentSearchLabel = slashQuery
+    ? (language === "en" ? `Intent: ${slashQuery}` : `意图：${slashQuery}`)
+    : (language === "en" ? "Type / to choose Plan, Report, Analyze..." : "输入 / 选择计划、报告、分析等意图");
+  const mainIntentEmptyLabel = language === "en" ? "No matching intents" : "没有匹配的意图";
+  const mainIntentHint = language === "en" ? "Select to lock this turn intent" : "选择后锁定本轮意图";
   const studioWorkflowHeading = language === "en" ? "Workflow Commands" : "工作流命令";
   const studioAgentHeading = language === "en" ? "Specialist Agents" : "专业 Agent";
   const workflowKindLabel = language === "en" ? "workflow" : "工作流";
@@ -236,13 +249,14 @@ export default function Composer({
     [allFiles],
   );
   const currentWorkspaceOnboardingKey = currentWorkspace || "__no_workspace__";
-  const composerIntentBadge = useMemo(() => {
+  const suggestedComposerIntent = useMemo(() => {
     const normalizedInput = input.trim();
     if (!normalizedInput) return null;
+    if (!isMainMode || lockedComposerIntent) return null;
+    if (dismissedSuggestedIntentKey === normalizedInput) return null;
 
-    if (isGameStudioMode && normalizedInput.startsWith("/")) {
-      return language === "en" ? "Game Studio Command" : "Game Studio 指令";
-    }
+    const shortcut = parseMainIntentShortcut(normalizedInput);
+    if (shortcut) return shortcut.intent;
 
     const resolution = resolveTurnRunIntent(input, {
       language: language === "en" ? "en" : "zh",
@@ -254,19 +268,18 @@ export default function Composer({
     });
 
     if (resolution.needsDecision || resolution.confidence < 0.9) return null;
-
-    if (resolution.intent === "plan") {
-      return language === "en" ? "Planning" : "计划模式";
-    }
-    if (resolution.intent === "summarize") {
-      return language === "en" ? "Summary" : "总结模式";
-    }
-    if (resolution.intent === "report") {
-      return language === "en" ? "Report" : "报告模式";
+    if (["plan", "summarize", "report", "analyze", "execute"].includes(resolution.intent)) {
+      return resolution.intent;
     }
 
     return null;
-  }, [input, isGameStudioMode, isPlanApproved, language, planStage, planTasks.length, selectedMainModeKey]);
+  }, [dismissedSuggestedIntentKey, input, isMainMode, isPlanApproved, language, lockedComposerIntent, planStage, planTasks.length, selectedMainModeKey]);
+  const suggestedComposerIntentLabel = suggestedComposerIntent
+    ? getRunIntentLabel(suggestedComposerIntent, language === "en" ? "en" : "zh")
+    : null;
+  const lockedComposerIntentLabel = lockedComposerIntent
+    ? getRunIntentLabel(lockedComposerIntent, language === "en" ? "en" : "zh")
+    : null;
   const showStudioOnboarding = shouldShowGameStudioOnboarding({
     isGameStudioMode,
     hasWorkspace: Boolean(currentWorkspace),
@@ -534,8 +547,17 @@ export default function Composer({
   }, [mentionQuery, allFiles, showMentionMenu]);
 
   const filteredSlashItems = useMemo(() => {
-    if (!isGameStudioMode) return [];
     const normalizedQuery = slashQuery.trim().toLowerCase();
+    if (isMainMode) {
+      return mainIntentShortcuts.filter((item) => {
+        if (!normalizedQuery) return true;
+        const haystacks = [item.label, item.command, item.description, ...(item.aliases || [])]
+          .join(" ")
+          .toLowerCase();
+        return haystacks.includes(normalizedQuery);
+      });
+    }
+    if (!isGameStudioMode) return [];
     const ranked = slashCatalog.filter((item) => {
       if (!normalizedQuery) return true;
       const haystacks = [
@@ -550,10 +572,20 @@ export default function Composer({
       return haystacks.includes(normalizedQuery);
     });
     return ranked;
-  }, [isGameStudioMode, slashCatalog, slashQuery]);
+  }, [isGameStudioMode, isMainMode, mainIntentShortcuts, slashCatalog, slashQuery]);
 
   const groupedSlashItems = useMemo(() => {
     const groups = [];
+    if (isMainMode) {
+      if (filteredSlashItems.length > 0) {
+        groups.push({
+          kind: "main_intent",
+          heading: language === "en" ? "MAIN Intent Shortcuts" : "MAIN 意图快捷入口",
+          groups: [[language === "en" ? "Intent" : "意图", filteredSlashItems]],
+        });
+      }
+      return groups;
+    }
     const workflowGroups = new Map();
     const agentGroups = new Map();
     for (const item of filteredSlashItems) {
@@ -576,7 +608,7 @@ export default function Composer({
       });
     }
     return groups;
-  }, [filteredSlashItems, studioAgentHeading, studioWorkflowHeading]);
+  }, [filteredSlashItems, isMainMode, language, studioAgentHeading, studioWorkflowHeading]);
 
   // ── Close mention dropdown / slash menu on outside click ──
   useEffect(() => {
@@ -604,9 +636,9 @@ export default function Composer({
   }, []);
 
   useEffect(() => {
-    if (isGameStudioMode) return;
+    if (isGameStudioMode || isMainMode) return;
     closeSlashMenu();
-  }, [closeSlashMenu, isGameStudioMode]);
+  }, [closeSlashMenu, isGameStudioMode, isMainMode]);
 
   // ── Image paste handler ──
   const handlePaste = useCallback(async (e: React.ClipboardEvent) => {
@@ -770,6 +802,14 @@ export default function Composer({
     applyComposerDraft(value);
   };
 
+  const handleSelectMainIntentShortcut = (item) => {
+    closeSlashMenu();
+    const parsed = parseMainIntentShortcut(input);
+    setInput(parsed ? parsed.rest.trimStart() : input.replace(/^\s*\/[^\s]*\s*/, ""));
+    setLockedComposerIntent(item.intent);
+    requestAnimationFrame(() => textareaRef.current?.focus());
+  };
+
   const handleClearStudioAgent = async () => {
     await setActiveStudioAgentKey("studio_auto", { persistToWorkspace: gameStudioInitialized });
   };
@@ -840,6 +880,20 @@ export default function Composer({
   }, [attachedFiles.length, closeSlashMenu, contextMentions.length, input, isComposerSubmitting, isGameStudioMode, markStudioOnboardingUsed, onSendMessage, pendingImages]);
 
   // ── Handle textarea change (detect @ typing) ──
+  const resizeTextarea = useCallback(() => {
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+    textarea.style.height = "auto";
+    const maxHeight = Math.round(window.innerHeight * 0.36);
+    const nextHeight = Math.min(textarea.scrollHeight, maxHeight);
+    textarea.style.height = `${nextHeight}px`;
+    textarea.style.overflowY = textarea.scrollHeight > maxHeight ? "auto" : "hidden";
+  }, []);
+
+  useEffect(() => {
+    resizeTextarea();
+  }, [activeDiffTask, input, resizeTextarea]);
+
   const handleInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const value = e.target.value;
     setInput(value);
@@ -848,7 +902,7 @@ export default function Composer({
     const textBeforeCursor = value.slice(0, cursorPos);
     const trimmedValue = value.trimStart();
 
-    if (isGameStudioMode && trimmedValue.startsWith("/")) {
+    if ((isGameStudioMode || isMainMode) && trimmedValue.startsWith("/")) {
       setSlashQuery(trimmedValue.slice(1));
       setShowSlashMenu(true);
     } else if (showSlashMenu) {
@@ -956,7 +1010,11 @@ export default function Composer({
       if ((e.key === "Enter" && !e.altKey) || e.key === "Tab") {
         e.preventDefault();
         if (filteredSlashItems.length > 0 && highlightedSlashIndex < filteredSlashItems.length) {
-          handleSelectSlashItem(filteredSlashItems[highlightedSlashIndex]);
+          if (isMainMode) {
+            handleSelectMainIntentShortcut(filteredSlashItems[highlightedSlashIndex]);
+          } else {
+            handleSelectSlashItem(filteredSlashItems[highlightedSlashIndex]);
+          }
         } else if (e.key === "Enter" && !e.altKey && input.trim().startsWith("/")) {
           handleSubmitComposerMessage();
         }
@@ -1143,6 +1201,33 @@ export default function Composer({
           </div>
         )}
 
+        {suggestedComposerIntent && suggestedComposerIntentLabel && !activeDiffTask && !isStreaming && (
+          <div className="relative z-30 mb-2 flex justify-center px-3">
+            <div className="flex max-w-full items-center justify-between gap-3 rounded-full border border-[#27272a] bg-[#050507] px-3 py-2 text-[11px] text-[#d4d4d8] shadow-2xl">
+              <span className="truncate">
+                {language === "en" ? "Use" : "使用"} <span className="font-semibold" style={{ color: "var(--accent-light)" }}>{suggestedComposerIntentLabel}</span> {language === "en" ? "mode for this turn?" : "模式处理本轮请求？"}
+              </span>
+              <div className="flex shrink-0 items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setLockedComposerIntent(suggestedComposerIntent)}
+                  className="rounded-full border px-2.5 py-1 text-[10px] font-semibold transition-colors hover:bg-[#18181b]"
+                  style={{ borderColor: "var(--accent-subtle-border)", color: "var(--accent-light)" }}
+                >
+                  {language === "en" ? "Confirm" : "确认"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setDismissedSuggestedIntentKey(input.trim())}
+                  className="rounded-full border border-[#27272a] px-2.5 py-1 text-[10px] text-[#a1a1aa] transition-colors hover:bg-[#18181b]"
+                >
+                  {language === "en" ? "Ignore" : "忽略"}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
         <div className={`bg-[#09090b] border border-[#27272a] transition-all flex flex-col relative z-20 ${activeDiffTask ? 'rounded-b-xl border-t-0' : 'rounded-xl'} ${isStreaming ? 'border-[#3f3f46]' : 'focus-within:border-[#3f3f46]'}`}>
 
           {/* Attached files tags */}
@@ -1194,7 +1279,7 @@ export default function Composer({
             <textarea
               ref={textareaRef}
               data-testid="composer-textarea"
-              className="w-full bg-transparent border-none outline-none resize-none text-[#e4e4e7] p-4 text-[13px] leading-relaxed placeholder:text-[#a1a1aa]"
+              className="max-h-[36vh] min-h-[3.5rem] w-full bg-transparent border-none outline-none resize-none overflow-hidden text-[#e4e4e7] p-4 text-[13px] leading-relaxed placeholder:text-[#a1a1aa]"
               rows={activeDiffTask ? 1 : 2}
               placeholder={composerPlaceholder}
               value={input}
@@ -1255,6 +1340,59 @@ export default function Composer({
                   <span>{mentionHintUpDown}</span>
                   <span>{mentionHintEnter}</span>
                   <span>{mentionHintEsc}</span>
+                </div>
+              </div>
+            )}
+
+            {showSlashMenu && isMainMode && (
+              <div
+                ref={slashMenuRef}
+                className="absolute left-4 bottom-full mb-1 w-[min(30rem,calc(100%-2rem))] max-w-[30rem] bg-[#09090b] border border-[#27272a] rounded-lg shadow-2xl overflow-hidden z-50 flex flex-col"
+              >
+                <div className="p-2 border-b border-[#27272a] flex items-center gap-2 text-[#e4e4e7] bg-[#000000]">
+                  <IconCode className="w-3.5 h-3.5" style={{ color: "var(--accent)" }} />
+                  <span className="text-[11px] text-[#a1a1aa] truncate">{mainIntentSearchLabel}</span>
+                  <span className="ml-auto text-[10px] text-[#52525b]">{language === "en" ? "MAIN Intent" : "MAIN 意图"}</span>
+                </div>
+
+                <div className="max-h-64 overflow-y-auto px-2 py-2">
+                  {filteredSlashItems.length === 0 ? (
+                    <div className="px-3 py-4 text-[11px] text-[#a1a1aa] text-center">{mainIntentEmptyLabel}</div>
+                  ) : (
+                    filteredSlashItems.map((item, index) => {
+                      const isActive = index === highlightedSlashIndex;
+                      return (
+                        <button
+                          key={item.intent}
+                          onClick={() => handleSelectMainIntentShortcut(item)}
+                          className={`w-full rounded-md px-3 py-2 text-left transition-colors ${
+                            isActive ? "bg-[#18181b]" : "hover:bg-[#131316]"
+                          }`}
+                        >
+                          <div className="flex items-center justify-between gap-3">
+                            <div className="min-w-0">
+                              <div className="text-[12px] font-semibold text-[#f4f4f5] truncate">
+                                {item.command} · {item.label}
+                              </div>
+                              <div className="mt-0.5 text-[11px] leading-snug text-[#71717a]">
+                                {item.description}
+                              </div>
+                            </div>
+                            <div className="shrink-0 rounded-full border border-[#27272a] bg-[#050507] px-2 py-0.5 text-[10px] text-[#a1a1aa]">
+                              {language === "en" ? "intent" : "意图"}
+                            </div>
+                          </div>
+                        </button>
+                      );
+                    })
+                  )}
+                </div>
+
+                <div className="px-3 py-1.5 border-t border-[#27272a] flex items-center gap-3 text-[10px] text-[#52525b]">
+                  <span>{mentionHintUpDown}</span>
+                  <span>{mentionHintEnter}</span>
+                  <span>{mentionHintEsc}</span>
+                  <span className="ml-auto">{mainIntentHint}</span>
                 </div>
               </div>
             )}
@@ -1458,10 +1596,16 @@ export default function Composer({
             </div>
 
             <div className="flex items-center gap-2">
-              {composerIntentBadge && !activeDiffTask && !isStreaming && (
-                <div className="rounded-full border px-2.5 py-1 text-[10px] font-semibold tracking-[0.04em]" style={{ borderColor: "var(--accent-subtle-border)", backgroundColor: "var(--accent-subtle)", color: isLightTheme ? "var(--accent-hover)" : "var(--accent-light)" }}>
-                  {composerIntentBadge}
-                </div>
+              {lockedComposerIntentLabel && !activeDiffTask && !isStreaming && (
+                <button
+                  type="button"
+                  onClick={() => setLockedComposerIntent(null)}
+                  className="rounded-full border px-2.5 py-1 text-[10px] font-semibold tracking-[0.04em] transition-colors hover:bg-[#18181b]"
+                  style={{ borderColor: "var(--accent-subtle-border)", backgroundColor: "var(--accent-subtle)", color: isLightTheme ? "var(--accent-hover)" : "var(--accent-light)" }}
+                  title={language === "en" ? "Click to remove intent" : "点击取消意图胶囊"}
+                >
+                  {lockedComposerIntentLabel} <span className="ml-1">×</span>
+                </button>
               )}
 
               {/* Send / Stop button */}

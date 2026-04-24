@@ -33,6 +33,7 @@ import {
   extractPlanTasks,
   getPendingPlanTaskCommandFocus,
   getPlanArtifactTitle,
+  normalizeConversationDisplayTitle,
   summarizeAssistantText,
   summarizeUserPrompt,
 } from "../lib/workflowModels";
@@ -75,7 +76,10 @@ import {
   resolveConversationTurnIntent,
   resolveRunIntentFromLegacyWorkflowMode,
   resolveTurnRunIntent,
+  parseMainIntentShortcut,
+  shouldUseBlockingIntentPreflight,
   type ExecutionConsentPolicy,
+  type MainIntentShortcut,
   type PendingRunDecision,
   type ResolvedUserIntent,
   type ResolvedRunIntent,
@@ -231,6 +235,7 @@ export interface Skill {
   toolParameters?: string;            // JSON string: OpenAI-style parameters schema (for tool-type only)
   packagePath?: string;               // Relative path to extracted folder (e.g. ".protocols/auto-optimize-1713...")
   entryPoint?: string;                // Entry file within the package (e.g. "SKILL.md" or "program.md")
+  workspaceScope?: string | null;     // Absolute workspace root that owns this package skill
 }
 
 // ── MCP Types (re-exported from mcpClient for convenience) ──────────
@@ -408,6 +413,7 @@ interface AppState {
   activeStudioAgentKey: StudioAgentKey;
   gameStudioInitialized: boolean;
   pendingSlashCommand: PendingSlashCommand | null;
+  lockedComposerIntent: MainIntentShortcut | null;
   pendingRunDecision: PendingRunDecision | null;
   executionConsentPolicy: ExecutionConsentPolicy;
   setInput: (v: string) => void;
@@ -421,6 +427,7 @@ interface AppState {
   setActiveStudioAgentKey: (key: StudioAgentKey, options?: { persistToWorkspace?: boolean }) => Promise<void>;
   setGameStudioInitialized: (value: boolean) => void;
   setPendingSlashCommand: (command: PendingSlashCommand | null) => void;
+  setLockedComposerIntent: (intent: MainIntentShortcut | null) => void;
   dismissPendingRunDecision: () => void;
   resolvePendingRunDecision: (
     choice:
@@ -546,6 +553,7 @@ interface AppState {
       preservePlanState?: boolean;
       resolvedIntent?: ResolvedUserIntent;
       skipIntentResolution?: boolean;
+      turnTitle?: string;
       intentSummary?: string;
       contextMentionsSnapshot?: string[];
       attachedFilesSnapshot?: string[];
@@ -893,6 +901,7 @@ const RUN_INTENT_LABELS: Record<ResolvedRunIntent, { zh: string; en: string }> =
   discuss: { zh: "讨论", en: "Discuss" },
   plan: { zh: "计划", en: "Plan" },
   execute: { zh: "直接执行", en: "Execute" },
+  analyze: { zh: "分析", en: "Analyze" },
   summarize: { zh: "总结", en: "Summarize" },
   report: { zh: "报告", en: "Report" },
   studio_workflow: { zh: "Game Studio 工作流", en: "Game Studio Workflow" },
@@ -921,6 +930,64 @@ function buildRunIntentSummary(params: {
   const reason = normalizeIntentSummary(params.reason || "");
   return reason || (params.language === "zh" ? `${label}：新的任务` : `${label}: New task`);
 }
+
+// region: 回合标题语义同步
+
+const NOISY_TURN_INPUT_RE =
+  /(?:\n|(?:\d{2,4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2})\s+\d{1,2}:\d{2}(?::\d{2})?|^[A-Za-z][\w.-]{0,31}\s*[@:：-]\s*(?=\d{1,2}:\d{2}))/m;
+
+function shouldRequestSemanticTurnMetadata(input: string, shouldSeedSessionTitle: boolean): boolean {
+  const normalized = String(input || "").trim();
+  if (!normalized) return false;
+  if (shouldSeedSessionTitle) return true;
+  return normalized.length > 72 || NOISY_TURN_INPUT_RE.test(normalized);
+}
+
+function stripJsonFence(text: string): string {
+  const trimmed = text.trim();
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  return fenced?.[1]?.trim() || trimmed;
+}
+
+function extractJsonObject(text: string): string | null {
+  const cleaned = stripJsonFence(text);
+  const start = cleaned.indexOf("{");
+  const end = cleaned.lastIndexOf("}");
+  if (start >= 0 && end > start) {
+    return cleaned.slice(start, end + 1);
+  }
+  return null;
+}
+
+interface SemanticTurnMetadata {
+  title: string;
+  summary: string;
+}
+
+function normalizeSemanticTurnMetadata(
+  raw: unknown,
+  fallback: {
+    input: string;
+    intent: ResolvedRunIntent;
+    language: "zh" | "en";
+  },
+): SemanticTurnMetadata {
+  const candidate = raw && typeof raw === "object" ? raw as Partial<SemanticTurnMetadata> : {};
+  const title = normalizeConversationDisplayTitle(
+    typeof candidate.title === "string" ? candidate.title : fallback.input,
+    fallback.language === "en" ? 48 : 32,
+    fallback.language === "en" ? "New task" : "新的任务",
+  );
+  const summary = normalizeIntentSummary(typeof candidate.summary === "string" ? candidate.summary : "");
+  return {
+    title,
+    summary: summary
+      ? (summary.length <= 72 ? summary : `${summary.slice(0, 72).trim()}...`)
+      : buildRunIntentSummary(fallback),
+  };
+}
+
+// endregion
 
 // ── Safe JSON Serialization ──────────────────────────────────────────
 // Prevents Error 13 crashes when state contains non-serializable values
@@ -1315,9 +1382,13 @@ export const useAppStore = create<AppState>()(
   activeStudioAgentKey: "studio_auto",
   gameStudioInitialized: false,
   pendingSlashCommand: null,
+  lockedComposerIntent: null,
   pendingRunDecision: null,
   executionConsentPolicy: "ask_per_turn",
-  setInput: (v) => set({ input: v }),
+  setInput: (v) => set({
+    input: v,
+    ...(v.trim().length === 0 ? { lockedComposerIntent: null } : {}),
+  }),
   setPreferredResponseLanguage: (lang) => set({ preferredResponseLanguage: lang }),
   setContextMentions: (v) => set({ contextMentions: v }),
   addMention: (file) =>
@@ -1330,6 +1401,7 @@ export const useAppStore = create<AppState>()(
   setSelectedMainModeKey: (key) => set({
     selectedMainModeKey: key,
     selectedNexusModeKey: mapMainModeToLegacyNexusMode(key),
+    lockedComposerIntent: null,
   }),
   setSelectedNexusModeKey: (key) => {
     const resolved = resolveLegacyNexusModeKey(key);
@@ -1352,6 +1424,7 @@ export const useAppStore = create<AppState>()(
   },
   setGameStudioInitialized: (value) => set({ gameStudioInitialized: value }),
   setPendingSlashCommand: (command) => set({ pendingSlashCommand: command }),
+  setLockedComposerIntent: (intent) => set({ lockedComposerIntent: intent }),
   dismissPendingRunDecision: () =>
     set({
       pendingRunDecision: null,
@@ -2172,6 +2245,7 @@ export const useAppStore = create<AppState>()(
     preservePlanState?: boolean;
     resolvedIntent?: ResolvedRunIntent;
     skipIntentResolution?: boolean;
+    turnTitle?: string;
     intentSummary?: string;
     contextMentionsSnapshot?: string[];
     attachedFilesSnapshot?: string[];
@@ -2200,6 +2274,18 @@ export const useAppStore = create<AppState>()(
       ? state.preferredResponseLanguage
       : detectDominantLanguage(text, state.config.language);
     const currentMainModeKey = state.selectedMainModeKey;
+    const mainIntentShortcut = !isHidden && currentMainModeKey === "main_mode"
+      ? parseMainIntentShortcut(text)
+      : null;
+    if (mainIntentShortcut) {
+      text = mainIntentShortcut.rest.trimStart();
+    }
+    const lockedComposerIntent = !isHidden && currentMainModeKey === "main_mode"
+      ? state.lockedComposerIntent || mainIntentShortcut?.intent || null
+      : null;
+    if (!text.trim() && !hasSupplementalInput && !images?.length) {
+      return false;
+    }
     const parsedStudioCommand = currentMainModeKey === "game_studio"
       ? parseGameStudioSlashCommand(text)
       : null;
@@ -2207,12 +2293,24 @@ export const useAppStore = create<AppState>()(
       parsedStudioCommand?.type === "agent" || parsedStudioCommand?.type === "auto";
     let effectiveRunIntent =
       options?.resolvedIntent ||
+      lockedComposerIntent ||
       (preservePlanState
         ? currentTurnIntent
         : resolveRunIntentFromLegacyWorkflowMode(state.config.workflowMode));
     let effectiveIntentSummary = normalizeIntentSummary(options?.intentSummary || "");
 
-    if (!isHidden && !options?.skipIntentResolution && !options?.resolvedIntent) {
+    if (lockedComposerIntent && !effectiveIntentSummary) {
+      effectiveIntentSummary = buildRunIntentSummary({
+        input: text,
+        intent: lockedComposerIntent,
+        language: preferredLanguage,
+        reason: preferredLanguage === "en"
+          ? "The user confirmed this composer intent before sending."
+          : "用户已在发送前确认本轮胶囊意图。",
+      });
+    }
+
+    if (!isHidden && !lockedComposerIntent && !options?.skipIntentResolution && !options?.resolvedIntent) {
       const resolution = resolveTurnRunIntent(text, {
         language: preferredLanguage,
         mainModeKey: currentMainModeKey,
@@ -2233,6 +2331,7 @@ export const useAppStore = create<AppState>()(
           input: "",
           contextMentions: [],
           attachedFiles: [],
+          lockedComposerIntent: null,
           pendingRunDecision: null,
         });
         get().approvePlan();
@@ -2247,6 +2346,7 @@ export const useAppStore = create<AppState>()(
           input: "",
           contextMentions: [],
           attachedFiles: [],
+          lockedComposerIntent: null,
           pendingRunDecision: null,
         });
         get().sendMessage(
@@ -2286,11 +2386,9 @@ export const useAppStore = create<AppState>()(
         return true;
       }
 
-      if (
-        currentMainModeKey === "main_mode" &&
-        !resolution.bypassMainRouter &&
-        resolution.confidence < 0.9
-      ) {
+      // 普通消息不应该因为额外的意图 preflight 而阻塞发送热路径。
+      // 只有低置信度且真的可能改变流程的请求，才允许在这里等待 preflight。
+      if (shouldUseBlockingIntentPreflight(resolution, currentMainModeKey)) {
         void (async () => {
           const preflight = await runIntentPreflight({
             input: text,
@@ -2332,6 +2430,7 @@ export const useAppStore = create<AppState>()(
             ...(options || {}),
             resolvedIntent,
             skipIntentResolution: true,
+            turnTitle: preflight?.title,
             intentSummary: buildRunIntentSummary({
               input: text,
               intent: resolvedIntent,
@@ -2434,7 +2533,11 @@ export const useAppStore = create<AppState>()(
     const existingTurn = reuseCurrentTurn
       ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId) || null
       : null;
-    const turnTitle = existingTurn?.title || summarizeUserPrompt(text);
+    const turnTitle = normalizeConversationDisplayTitle(
+      existingTurn?.title || options?.turnTitle || summarizeUserPrompt(text),
+      preferredLanguage === "en" ? 48 : 40,
+      preferredLanguage === "en" ? "New task" : "新的任务",
+    );
     const refreshedState = get();
     const activeSession = ensuredSessionId
       ? (refreshedState.sessionsByWorkspace[sessionScopeKey] || []).find((session) => session.id === ensuredSessionId)
@@ -2497,6 +2600,7 @@ export const useAppStore = create<AppState>()(
         contextMentions: [],
         attachedFiles: [],
         pendingSlashCommand: null,
+        lockedComposerIntent: null,
         pendingRunDecision: null,
         preferredResponseLanguage: preferredLanguage,
         isGenerating: false,
@@ -2616,6 +2720,7 @@ export const useAppStore = create<AppState>()(
       input: isHidden ? s.input : "",
       preferredResponseLanguage: preferredLanguage,
       pendingSlashCommand: parsedStudioCommand?.type === "workflow" ? parsedStudioCommand : null,
+      lockedComposerIntent: null,
       pendingRunDecision: null,
       isGenerating: true,
       config: { ...s.config, workflowMode: effectiveWorkflowMode },
@@ -2625,6 +2730,42 @@ export const useAppStore = create<AppState>()(
 
     if (!isHidden && shouldSeedSessionTitle && ensuredSessionId) {
       get().updateSession(sessionScopeKey, ensuredSessionId, { title: turnTitle, active: true });
+    }
+
+    // 对首轮会话或噪音较重的输入，额外让模型生成一份稳定的人话标题，
+    // 再同步回当前 turn 与 sidebar，避免用户名/时间戳/推理文本直接泄漏到 UI。
+    if (
+      !isHidden &&
+      !reuseCurrentTurn &&
+      !options?.turnTitle &&
+      shouldRequestSemanticTurnMetadata(text, shouldSeedSessionTitle)
+    ) {
+      void requestSemanticTurnMetadata({
+        input: text,
+        intent: effectiveRunIntent,
+        language: preferredLanguage,
+        config: get().config,
+      }).then((metadata) => {
+        if (!metadata) return;
+
+        const latestState = get();
+        const targetTurn = latestState.conversationTurns.find((turn) => turn.id === turnId);
+        if (!targetTurn) return;
+
+        latestState.updateConversationTurn(turnId, {
+          title: metadata.title,
+          intentSummary: metadata.summary,
+        });
+
+        if (shouldSeedSessionTitle && ensuredSessionId) {
+          latestState.updateSession(sessionScopeKey, ensuredSessionId, {
+            title: metadata.title,
+            active: true,
+          });
+        }
+      }).catch(() => {
+        // 标题同步失败时保持当前回退标题即可，不影响主流程继续执行。
+      });
     }
 
     // 2. Start elapsed timer
@@ -2806,9 +2947,6 @@ export const useAppStore = create<AppState>()(
       let thoughtStartTime: number | null = null;
       // Current streaming thought block id (for live updates)
       let currentThoughtBlockId: number | null = null;
-
-      // Title generation guard — only generate once per conversation
-      let titleGenerated = false;
 
       // Thinking tag interceptor — catches <thinking>/<thought>/<analysis>/<reasoning>
       // tags during streaming and routes content to a ThoughtBlock instead of the
@@ -3082,26 +3220,6 @@ export const useAppStore = create<AppState>()(
               duration: 0,
             };
             appendTurnBlock(warnBlock);
-          }
-
-          // ── Auto-generate conversation title on first streaming turn ──
-          if (!titleGenerated && text.trim()) {
-            titleGenerated = true;
-            // Use thought blocks as fallback when agent block is empty (e.g. all content was in <analysis> tags)
-            const tf = get().taskFlow;
-            const lastAgent = [...tf].reverse().find(t => t.type === "agent");
-            const lastThought = [...tf].reverse().find(t => t.type === "thought");
-            const assistantContent = (lastAgent?.content?.trim()) || (lastThought?.content?.trim?.()) || "";
-            if (assistantContent || text.trim()) {
-              triggerAutoSummarize(
-                text,
-                assistantContent,
-                get().config,
-                resolveSessionWorkspaceKey(get().currentWorkspace),
-                get().currentSessionId,
-                get().updateSession,
-              );
-            }
           }
 
           set((s) => ({
@@ -3879,27 +3997,47 @@ export const useAppStore = create<AppState>()(
   )
 );
 
-async function triggerAutoSummarize(
-  userText: string,
-  assistantText: string,
-  config: AppConfig,
-  sessionScopeKey: string,
-  currentSessionId: number | null,
-  updateSession: (ws: string, id: number, patch: Partial<Session>) => void,
-) {
-  if (!sessionScopeKey || !currentSessionId) return;
+async function requestSemanticTurnMetadata(params: {
+  input: string;
+  intent: ResolvedRunIntent;
+  language: "zh" | "en";
+  config: AppConfig;
+}): Promise<SemanticTurnMetadata | null> {
   try {
-    const isCloud = config.activeProfile === "cloud";
-    const ac = isCloud ? config.cloud : config.local;
-    const endpoint = isCloud ? (config.cloud.endpoint || "") : config.local.endpoint;
+    const isCloud = params.config.activeProfile === "cloud";
+    const ac = isCloud ? params.config.cloud : params.config.local;
+    const endpoint = isCloud ? (params.config.cloud.endpoint || "") : params.config.local.endpoint;
     const model = ac.model;
-    const provider = isCloud ? config.cloud.provider : config.local.provider;
-    const cloudProtocol = normalizeCloudProtocol(isCloud ? config.cloud.protocol : "openai");
-    const cloudApiFormat = normalizeCloudApiFormat(isCloud ? config.cloud.apiFormat : "chat_completions");
-    if (!model || !endpoint) return;
+    const provider = isCloud ? params.config.cloud.provider : params.config.local.provider;
+    const cloudProtocol = normalizeCloudProtocol(isCloud ? params.config.cloud.protocol : "openai");
+    const cloudApiFormat = normalizeCloudApiFormat(isCloud ? params.config.cloud.apiFormat : "chat_completions");
+    if (!model || !endpoint) return null;
+
     const msgs: Array<{ role: "system" | "user"; content: string }> = [
-      { role: "system", content: "Summarize the following request into a 2-4 word short title. Return ONLY plain text, absolutely NO markdown formatting, NO asterisks, NO hashes." },
-      { role: "user", content: `User: ${userText.slice(0, 500)}\n\nAssistant: ${assistantText.slice(0, 500)}` },
+      {
+        role: "system",
+        content: [
+          "You are MAIN's hidden semantic title generator.",
+          "Return strict JSON only. No markdown, no prose, no code fences.",
+          "Infer the user's actual task intent from the raw input.",
+          "Ignore usernames, timestamps, transcript prefixes, copied meta text, and reasoning-style wording.",
+          "Generate:",
+          "- title: short clean UI title for sidebar / TopIsland, plain text only, no quotes, no markdown, no intent prefix.",
+          "- summary: one concise user-facing summary of the real intent, plain text only.",
+          "Keep the output in the user's language.",
+          "JSON shape:",
+          "{\"title\":\"修正标题同步逻辑\",\"summary\":\"调整 sidebar 与 TopIsland 的标题与摘要生成逻辑\"}",
+        ].join("\n"),
+      },
+      {
+        role: "user",
+        content: [
+          `Resolved intent: ${params.intent}`,
+          `Preferred language: ${params.language}`,
+          `Raw user input: ${params.input.slice(0, 800)}`,
+          "Return strict JSON now.",
+        ].join("\n"),
+      },
     ];
     const isAnthropicCloud = isCloud && cloudProtocol === "anthropic";
     let url: string;
@@ -3915,12 +4053,12 @@ async function triggerAutoSummarize(
       body = buildAnthropicRequestBody({
         messages: msgs,
         model,
-        maxTokens: 64,
+        maxTokens: 120,
         stream: false,
-        temperature: config.cloud.temperature ?? 0.2,
-        topP: config.cloud.topP ?? 0.95,
+        temperature: 0.1,
+        topP: 0.8,
       });
-      headers = buildCloudHeaders("anthropic", ac.apiKey, true, config.cloud.customHeaders);
+      headers = buildCloudHeaders("anthropic", ac.apiKey, true, params.config.cloud.customHeaders);
     } else {
       url = buildCloudMessagesApiUrl(endpoint, "openai", cloudApiFormat);
       body = cloudApiFormat === "responses"
@@ -3931,15 +4069,14 @@ async function triggerAutoSummarize(
             } : {}),
             input: buildOpenAiResponsesInputCandidates(msgs as Array<{ role: "system" | "user"; content: string }>)[0].input,
             ...buildOpenAiResponsesRequestExtras({
-              disableResponseStorage: config.cloud.disableResponseStorage,
-              reasoningEffort: config.cloud.reasoningEffort,
+              disableResponseStorage: params.config.cloud.disableResponseStorage,
+              reasoningEffort: "none",
             }),
           }
-        : { model, messages: msgs, stream: false, max_tokens: 64 };
-      headers = buildCloudHeaders("openai", ac.apiKey, true, config.cloud.customHeaders);
+        : { model, messages: msgs, stream: false, max_tokens: 120, temperature: 0.1, top_p: 0.8 };
+      headers = buildCloudHeaders("openai", ac.apiKey, true, params.config.cloud.customHeaders);
     }
 
-    // For cloud endpoints, route through Rust backend to bypass CORS
     let j: any;
     if (isCloud) {
       const result = await invoke<string>("proxy_request", {
@@ -3951,17 +4088,26 @@ async function triggerAutoSummarize(
       j = JSON.parse(result);
     } else {
       const r = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
-      if (!r.ok) return;
+      if (!r.ok) return null;
       j = await r.json();
     }
 
-    const s = provider === "Ollama"
+    const rawText = provider === "Ollama"
       ? j.message?.content?.trim()
       : isAnthropicCloud
         ? extractAnthropicResponseText(j).trim()
         : extractOpenAiResponseText(j, cloudApiFormat).trim();
-    if (s) updateSession(sessionScopeKey, currentSessionId, { title: s });
-  } catch { /* ignore */ }
+
+    const jsonText = extractJsonObject(rawText || "");
+    if (!jsonText) return null;
+    return normalizeSemanticTurnMetadata(JSON.parse(jsonText), {
+      input: params.input,
+      intent: params.intent,
+      language: params.language,
+    });
+  } catch {
+    return null;
+  }
 }
 
 // ── Selector Helpers ──────────────────────────────────────────────────

@@ -3,6 +3,7 @@ export interface ProtocolPackageLike {
   type?: string;
   packagePath?: string | null;
   entryPoint?: string | null;
+  workspaceScope?: string | null;
   name?: string;
 }
 
@@ -22,6 +23,33 @@ function isAbsoluteFilePath(value: string): boolean {
   return /^\/|^[a-zA-Z]:[\\/]/.test(value);
 }
 
+function normalizeWorkspaceScope(value: string | null | undefined): string {
+  return normalizeSlashPath(value || "").replace(/\/+$/, "");
+}
+
+export function isProtocolPackageApplicableToWorkspace(
+  pkg: Pick<ProtocolPackageLike, "active" | "type" | "packagePath" | "workspaceScope">,
+  workspace: string,
+): boolean {
+  if (!pkg.active || pkg.type !== "package" || !pkg.packagePath) return false;
+
+  const workspaceScope = normalizeWorkspaceScope(pkg.workspaceScope);
+  if (workspaceScope) {
+    return workspaceScope === normalizeWorkspaceScope(workspace);
+  }
+
+  // Legacy package skills stored before workspace scoping used relative
+  // paths under `.protocols/`, which are unsafe to auto-apply globally.
+  return isAbsoluteFilePath(trimPathEdges(pkg.packagePath || ""));
+}
+
+export function getApplicableProtocolPackagesForWorkspace<T extends ProtocolPackageLike>(
+  skills: T[],
+  workspace: string,
+): T[] {
+  return skills.filter((skill) => isProtocolPackageApplicableToWorkspace(skill, workspace));
+}
+
 export function getProtocolPackageEntryPath(pkg: Pick<ProtocolPackageLike, "packagePath" | "entryPoint">): string {
   const entry = trimPathEdges(pkg.entryPoint || "SKILL.md", true);
   const root = trimPathEdges(pkg.packagePath || "");
@@ -35,13 +63,13 @@ export function getProtocolPackageEntryPath(pkg: Pick<ProtocolPackageLike, "pack
 export function resolveProtocolPackageReadPath(
   requestedPath: string,
   skills: ProtocolPackageLike[],
+  workspace: string,
 ): string {
   const normalizedPath = normalizeSlashPath(requestedPath || "");
   if (!normalizedPath) return normalizedPath;
   if (isAbsoluteFilePath(normalizedPath)) return normalizedPath;
 
-  const matches = skills
-    .filter((skill) => skill.active && skill.type === "package" && skill.packagePath)
+  const matches = getApplicableProtocolPackagesForWorkspace(skills, workspace)
     .map((skill) => {
       const entry = trimPathEdges(skill.entryPoint || "SKILL.md", true);
       const entryPath = getProtocolPackageEntryPath(skill);

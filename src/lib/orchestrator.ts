@@ -219,7 +219,7 @@ export interface OrchestratorCallbacks {
 
 function deriveStreamSettings(config: AppConfig): StreamSettings {
   if (config.activeProfile === "local") {
-    const isLocalhost = /127\.0\.0\.1|localhost|\[::1\]/.test(config.local.endpoint);
+    const isOllama = config.local.provider === "Ollama";
     return {
       baseUrl: config.local.endpoint,
       apiKey: config.local.apiKey || "not-needed",
@@ -227,8 +227,10 @@ function deriveStreamSettings(config: AppConfig): StreamSettings {
       temperature: 0.2,
       contextLimit: config.local.contextLimit,
       provider: config.local.provider,
-      // Route through Rust proxy for LAN endpoints to bypass WebView CORS
-      useRustProxy: !isLocalhost,
+      // LM Studio / OMLX 的本地流式接口在桌面 WebView 中可能触发
+      // “Load Failed”，统一交给 Tauri 后端请求，避开 WebView 限制。
+      // Ollama 保留前端直连，因为它使用原生 /api/chat 流格式。
+      useRustProxy: !isOllama,
     };
   }
   return {
@@ -506,7 +508,7 @@ async function executeToolCallWithLifecycle(
     tc.name === "read_file" && typeof effectiveArgs.path === "string"
       ? {
           ...effectiveArgs,
-          path: resolveProtocolPackageReadPath(effectiveArgs.path, callbacks.getSkills()),
+          path: resolveProtocolPackageReadPath(effectiveArgs.path, callbacks.getSkills(), workspace),
         }
       : effectiveArgs;
   const target = getToolTarget(tc.name, resolvedArgs);

@@ -26,6 +26,7 @@ import { normalizeStudioAgentKey } from "./lib/gameStudioCatalog";
 import { MAIN_MODE_KEYS, mapLegacyNexusModeToMainMode, mapMainModeToLegacyNexusMode } from "./lib/mainModes";
 import { resolveConversationTurnIntent } from "./lib/runIntent";
 import { runAfterNextPaint } from "./lib/uiScheduling";
+import { normalizeConversationDisplayTitle } from "./lib/workflowModels";
 
 // ==========================================
 // MAIN APP COMPONENT
@@ -375,6 +376,11 @@ export default function App() {
     if (target?.messages?.length) {
       syncTaskIdCounterFromBlocks(target.messages);
       const turnId = `loaded-${id}-${Date.now()}`;
+      const restoredTitle = normalizeConversationDisplayTitle(
+        target.title || "",
+        48,
+        useAppStore.getState().config.language === "en" ? "New task" : "新的任务",
+      );
       useAppStore.setState({
         taskFlow: target.messages,
         selectedMainModeKey: "main_mode",
@@ -387,10 +393,10 @@ export default function App() {
         conversationTurns: [{
           id: turnId,
           userPrompt: target.title || '',
-          title: target.title || '',
+          title: restoredTitle,
           mode: 'chat' as const,
           status: 'done' as const,
-          summary: target.title || '',
+          summary: restoredTitle,
           blockIds: target.messages.map((m: any) => m.id),
           collapsed: true,
           createdAt: Date.now(),
@@ -574,12 +580,18 @@ export default function App() {
     const MIN_SIDEBAR_WIDTH = 220;
     const MIN_WORKSPACE_TREE_WIDTH = 220;
     const MIN_RIGHT_PANEL_WIDTH = 340;
+    const MIN_CHAT_INPUT_AREA_WIDTH = 368;
 
     const onMouseMove = (e: MouseEvent) => {
       if (isResizing) {
         let w = window.innerWidth - e.clientX;
+        const workspaceTreeWidth = showWorkspaceTreePanel ? workspaceTreePanelWidth : 0;
+        const maxRightPanelWidth = Math.max(
+          MIN_RIGHT_PANEL_WIDTH,
+          window.innerWidth - sidebarWidth - workspaceTreeWidth - MIN_CHAT_INPUT_AREA_WIDTH,
+        );
         if (w < MIN_RIGHT_PANEL_WIDTH) w = MIN_RIGHT_PANEL_WIDTH;
-        if (w > 800) w = 800;
+        if (w > maxRightPanelWidth) w = maxRightPanelWidth;
         setRightPanelWidth(w);
       } else if (isWorkspaceTreeResizing) {
         let w = e.clientX - sidebarWidth;
@@ -619,11 +631,13 @@ export default function App() {
     setRightPanelWidth,
     setSidebarWidth,
     setWorkspaceTreePanelWidth,
+    showWorkspaceTreePanel,
     sidebarWidth,
+    workspaceTreePanelWidth,
   ]);
 
   useEffect(() => {
-    const MIN_CENTER_WIDTH = 640;
+    const MIN_CENTER_WIDTH = 368;
     const MIN_SIDEBAR_WIDTH = 220;
     const MIN_WORKSPACE_TREE_WIDTH = 220;
     const MIN_RIGHT_PANEL_WIDTH = 340;
@@ -714,7 +728,7 @@ export default function App() {
       <ChatArea taskFlow={taskFlow} t={t} config={config} setSettingsTab={setSettingsTab} setIsSettingsOpen={setIsSettingsOpen} activeDiffTask={activeDiffTask} endOfFlowRef={endOfFlowRef} isStreaming={isStreaming} elapsedTime={elapsedTime} onStopGeneration={handleStopGeneration} allowToolAction={allowToolAction} rejectToolAction={rejectToolAction} autoApproveTools={autoApproveTools} onToggleAutoApprove={setAutoApproveTools} input={input} setInput={setInput} contextMentions={contextMentions} setContextMentions={setContextMentions} attachedFiles={attachedFiles} setAttachedFiles={setAttachedFiles} onAttachFile={handleAttachFile} showAgentPicker={showAgentPicker} setShowAgentPicker={setShowAgentPicker} selectedMainModeKey={selectedMainModeKey} setSelectedMainModeKey={setSelectedMainModeKey} mainModes={mainModes} activeStudioAgentKey={activeStudioAgentKey} setActiveStudioAgentKey={setActiveStudioAgentKey} gameStudioInitialized={gameStudioInitialized} initializeGameStudioWorkspace={initializeGameStudioWorkspace} removeGameStudioWorkspace={removeGameStudioWorkspace} currentWorkspace={currentWorkspace} handleAcceptInline={handleAcceptInline} handleRejectInline={handleRejectInline} onSendMessage={handleSendMessage} onQuickReply={handleQuickReply} />
       <RightPanel activeDiffTask={activeDiffTask} rightPanelWidth={rightPanelWidth} startResizing={startResizing} />
       <SettingsModal isOpen={isSettingsOpen} onClose={() => setIsSettingsOpen(false)} config={config} setConfig={setConfig} t={t} THEMES={THEMES} settingsTab={settingsTab} setSettingsTab={setSettingsTab} mcpServers={mcpServers} setMcpServers={setMcpServers} mcpDiscoveredTools={mcpDiscoveredTools} setMcpDiscoveredTools={setMcpDiscoveredTools} />
-      <SkillsModal isOpen={isSkillsOpen} onClose={() => setIsSkillsOpen(false)} t={t} skills={skills} toggleSkill={toggleSkill} deleteSkill={deleteSkill} addSkill={addSkill} updateSkill={updateSkill} isAddingSkill={isAddingSkill} setIsAddingSkill={setIsAddingSkill} />
+      <SkillsModal isOpen={isSkillsOpen} onClose={() => setIsSkillsOpen(false)} t={t} skills={skills} currentWorkspace={currentWorkspace} toggleSkill={toggleSkill} deleteSkill={deleteSkill} addSkill={addSkill} updateSkill={updateSkill} isAddingSkill={isAddingSkill} setIsAddingSkill={setIsAddingSkill} />
     </div>
   );
 }

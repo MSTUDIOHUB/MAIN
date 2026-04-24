@@ -466,9 +466,21 @@ export function extractOpenAiResponseText(
   if (!Array.isArray(choices) || choices.length === 0) return "";
   const message = (choices[0] as { message?: unknown }).message;
   if (!message || typeof message !== "object") return "";
-  const content = (message as { content?: unknown }).content;
+  const msg = message as {
+    content?: unknown;
+    reasoning_content?: unknown;
+    reasoning?: unknown;
+  };
+  const content = msg.content;
   if (typeof content === "string") return content;
-  return extractTextFromOpenAiContentArray(content);
+  const contentText = extractTextFromOpenAiContentArray(content);
+  if (contentText) return contentText;
+
+  // 部分 LM Studio / Qwen thinking 模型会把输出放在 reasoning 字段，
+  // content 则为空；这里保留为可提取文本，后续会折叠到思考块或生成摘要。
+  if (typeof msg.reasoning_content === "string") return `<thinking>${msg.reasoning_content}</thinking>`;
+  if (typeof msg.reasoning === "string") return `<thinking>${msg.reasoning}</thinking>`;
+  return "";
 }
 
 function mapMessageForResponsesLegacyInput(message: ProtocolChatMessage): Record<string, unknown> {

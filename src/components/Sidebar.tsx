@@ -11,6 +11,7 @@ import {
   IconTrash,
 } from "./Icons";
 import { GLOBAL_CHAT_KEY } from "../store/useAppStore";
+import { looksLikeReasoningLeakTitle, normalizeConversationDisplayTitle } from "../lib/workflowModels";
 
 const IconLogoM = ({ className, ...props }: { className?: string; [key: string]: any }) => (
   <svg
@@ -111,6 +112,26 @@ export default function Sidebar({
   const projectChatsLabel = config.language === "en" ? "Project Chats" : "项目会话";
   const chatLabel = config.language === "en" ? "Chat" : "聊天";
   const newLabel = config.language === "en" ? "New" : "新建";
+
+  // 旧数据里可能残留“思考过程”一类标题，这里优先回退到首个 turn 的标题，
+  // 让 sidebar 至少展示真实任务，而不是模型的过程文本。
+  const resolveSessionDisplayTitle = (session: any) => {
+    const fallback = config.language === "en" ? "New chat" : "新聊天";
+    const currentTitle = normalizeConversationDisplayTitle(session?.title || "", 48, "");
+    if (currentTitle && !looksLikeReasoningLeakTitle(currentTitle)) {
+      return currentTitle;
+    }
+
+    const turns = Array.isArray(session?.runtimeSnapshot?.conversationTurns)
+      ? session.runtimeSnapshot.conversationTurns
+      : [];
+    const seedTurn = turns[0] || turns[turns.length - 1] || null;
+    return normalizeConversationDisplayTitle(
+      seedTurn?.title || seedTurn?.intentSummary || session?.title || "",
+      48,
+      fallback,
+    );
+  };
 
   return (
     <div
@@ -230,7 +251,7 @@ export default function Sidebar({
                             }
                           />
                           <div className="flex min-w-0 flex-1 flex-col">
-                            <span className="sidebar-session-title truncate text-[13px]">{session.title}</span>
+                            <span className="sidebar-session-title truncate text-[13px]">{resolveSessionDisplayTitle(session)}</span>
                             <span className="mt-0.5 text-[10px] text-[#71717a]">{formatDate(session.date)}</span>
                           </div>
                           <button
@@ -315,7 +336,7 @@ export default function Sidebar({
                             }
                           />
                           <div className="flex min-w-0 flex-1 flex-col">
-                            <span className="sidebar-session-title truncate text-[13px]">{session.title}</span>
+                            <span className="sidebar-session-title truncate text-[13px]">{resolveSessionDisplayTitle(session)}</span>
                             <span className="mt-0.5 text-[10px] text-[#71717a]">{formatDate(session.date)}</span>
                           </div>
                           <button

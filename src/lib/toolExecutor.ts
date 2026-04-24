@@ -53,6 +53,20 @@ function shouldUseChatTempStorage(workspace: string, sessionKey?: string): boole
   return !workspace.trim() && !!sessionKey;
 }
 
+function normalizeSlashPath(value: string): string {
+  return value.replace(/\\/g, "/").replace(/\/+$/, "");
+}
+
+function shouldExposeHiddenEntriesForListDirectory(requestedPath: string, workspace: string): boolean {
+  const rawTarget = requestedPath === "." ? workspace : requestedPath;
+  const normalized = normalizeSlashPath(rawTarget);
+  if (!normalized) return false;
+  return normalized
+    .split("/")
+    .filter(Boolean)
+    .some((segment) => segment.startsWith(".") && segment !== "." && segment !== "..");
+}
+
 function buildChatTempSuccessMessage(
   action: "written" | "updated",
   requestedPath: string,
@@ -100,7 +114,10 @@ export async function executeTool(
       const rawPath = (args.path as string) || ".";
       const dirPath = rawPath === "." ? workspace : rawPath;
       const nodes = await invoke<Array<{ name: string; path: string; is_dir: boolean }>>("list_directory", { path: dirPath });
-      return formatDirectoryNodesForTool(nodes, workspace);
+      const filteredNodes = shouldExposeHiddenEntriesForListDirectory(rawPath, workspace)
+        ? nodes
+        : nodes.filter((node) => !node.name.startsWith("."));
+      return formatDirectoryNodesForTool(filteredNodes, workspace);
     }
 
     case "read_file": {

@@ -27,6 +27,7 @@ export default function SkillsModal({
   onClose,
   t,
   skills,
+  currentWorkspace,
   toggleSkill,
   deleteSkill,
   addSkill,
@@ -69,7 +70,13 @@ export default function SkillsModal({
       content: formContent,
       type: formType,
       ...(formType === "tool" ? { toolParameters: formToolParams } : {}),
-      ...(formType === "package" ? { packagePath: formPackagePath, entryPoint: formEntryPoint } : {}),
+      ...(formType === "package"
+        ? {
+            packagePath: formPackagePath,
+            entryPoint: formEntryPoint,
+            workspaceScope: currentWorkspace || null,
+          }
+        : {}),
     };
     if (isFormEditing) {
       updateSkill(editingId, patch);

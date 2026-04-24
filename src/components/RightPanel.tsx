@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { IconClose, IconCode, IconColumns, IconTerminal, IconFileText } from "./Icons";
+import { IconChevronDown, IconChevronRight, IconChevronUp, IconClose, IconColumns, IconTerminal, IconFileText } from "./Icons";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
@@ -11,7 +11,7 @@ import { buildLineDiff, getDiffStats } from "../lib/diff";
 import { getE2EResumeExecutionHandler, getE2ESavePlanDocumentHandler } from "../lib/e2e";
 import { extractPlanDraftPreview, extractStructuredPlanProposal, hasPlanDraftPreview, hasStructuredPlanProposal } from "../lib/planProposal";
 import MarkdownRenderer from "./MarkdownRenderer";
-import { resolveGlobalChatSessionKey, useAppStore } from "../store/useAppStore";
+import { resolveGlobalChatSessionKey, type TaskBlock, useAppStore } from "../store/useAppStore";
 import { deleteChatTempPath, exportTextFile, onPtyData, readPtyBuffer, resizePty, spawnPty, writePty } from "../lib/ipc";
 import { isPlanConversationTurn } from "../lib/workflowModels";
 
@@ -450,6 +450,235 @@ function FileViewerPanel({
   );
 }
 
+type ToolDiffBlock = Extract<TaskBlock, { type: "tool" }>;
+
+interface ReviewFileDiff {
+  key: string;
+  path: string;
+  displayPath: string;
+  oldText: string;
+  newText: string;
+  added: number;
+  removed: number;
+  taskIds: number[];
+  isBinaryLike: boolean;
+}
+
+type ReviewRow =
+  | { kind: "fold"; id: string; count: number }
+  | { kind: "line"; id: string; type: "unchanged" | "removed" | "added"; oldLine?: number; newLine?: number; text: string };
+
+function collectReviewFileDiffs(taskFlow: TaskBlock[], activeDiffTask?: ToolDiffBlock | null): ReviewFileDiff[] {
+  const diffBlocks = taskFlow.filter((block): block is ToolDiffBlock => block.type === "tool" && !!block.diff);
+  const activeBlock = activeDiffTask?.diff ? activeDiffTask : null;
+  const blocks = activeBlock && !diffBlocks.some((block) => block.id === activeBlock.id)
+    ? [...diffBlocks, activeBlock]
+    : diffBlocks;
+  const byPath = new Map<string, ToolDiffBlock[]>();
+
+  for (const block of blocks) {
+    const path = block.diff?.path || block.target || (block.toolName ? `${block.toolName}-${block.id}` : `change-${block.id}`);
+    byPath.set(path, [...(byPath.get(path) || []), block]);
+  }
+
+  return Array.from(byPath.entries()).map(([path, blocksForPath]) => {
+    const first = blocksForPath[0];
+    const last = blocksForPath[blocksForPath.length - 1];
+    const oldText = first.diff?.old || "";
+    const newText = last.diff?.new || "";
+    const stats = getDiffStats(oldText, newText);
+    const isBinaryLike = isBinaryFile(path) || looksBinary(oldText) || looksBinary(newText);
+
+    return {
+      key: path,
+      path,
+      displayPath: path,
+      oldText,
+      newText,
+      added: stats.added,
+      removed: stats.removed,
+      taskIds: blocksForPath.map((block) => block.id),
+      isBinaryLike,
+    };
+  });
+}
+
+function buildReviewRows(oldText: string, newText: string, contextSize = 3): ReviewRow[] {
+  const diffLines = buildLineDiff(oldText, newText);
+  const rows: ReviewRow[] = [];
+  let oldLine = 1;
+  let newLine = 1;
+  let unchangedBuffer: ReviewRow[] = [];
+  let foldIndex = 0;
+
+  const flushUnchanged = (atEdge: boolean) => {
+    if (unchangedBuffer.length === 0) return;
+    if (unchangedBuffer.length > contextSize * 2 + 2) {
+      const headCount = atEdge && rows.length === 0 ? 0 : contextSize;
+      const tailCount = atEdge ? 0 : contextSize;
+      rows.push(...unchangedBuffer.slice(0, headCount));
+      rows.push({
+        kind: "fold",
+        id: `fold-${foldIndex++}`,
+        count: unchangedBuffer.length - headCount - tailCount,
+      });
+      if (tailCount > 0) rows.push(...unchangedBuffer.slice(-tailCount));
+    } else {
+      rows.push(...unchangedBuffer);
+    }
+    unchangedBuffer = [];
+  };
+
+  for (const line of diffLines) {
+    if (line.type === "unchanged") {
+      unchangedBuffer.push({
+        kind: "line",
+        id: `u-${oldLine}-${newLine}`,
+        type: "unchanged",
+        oldLine,
+        newLine,
+        text: line.text,
+      });
+      oldLine += 1;
+      newLine += 1;
+      continue;
+    }
+
+    flushUnchanged(false);
+    if (line.type === "removed") {
+      rows.push({ kind: "line", id: `r-${oldLine}-${rows.length}`, type: "removed", oldLine, text: line.text });
+      oldLine += 1;
+    } else {
+      rows.push({ kind: "line", id: `a-${newLine}-${rows.length}`, type: "added", newLine, text: line.text });
+      newLine += 1;
+    }
+  }
+
+  flushUnchanged(true);
+  return rows;
+}
+
+function DiffReviewPanel({ taskFlow, activeDiffTask, language }: { taskFlow: TaskBlock[]; activeDiffTask?: ToolDiffBlock | null; language: "zh" | "en" }) {
+  const files = useMemo(() => collectReviewFileDiffs(taskFlow, activeDiffTask), [activeDiffTask, taskFlow]);
+  const [collapsedFiles, setCollapsedFiles] = useState<Set<string>>(() => new Set());
+
+  useEffect(() => {
+    setCollapsedFiles((prev) => {
+      const validKeys = new Set(files.map((file) => file.key));
+      const next = new Set(Array.from(prev).filter((key) => validKeys.has(key)));
+      return next.size === prev.size ? prev : next;
+    });
+  }, [files]);
+
+  const totals = useMemo(
+    () => files.reduce((sum, file) => ({ added: sum.added + file.added, removed: sum.removed + file.removed }), { added: 0, removed: 0 }),
+    [files],
+  );
+  const allCollapsed = files.length > 0 && files.every((file) => collapsedFiles.has(file.key));
+  const toggleAll = () => setCollapsedFiles(allCollapsed ? new Set() : new Set(files.map((file) => file.key)));
+
+  if (files.length === 0) {
+    return (
+      <div data-testid="diff-panel" className="flex h-full items-center justify-center bg-[#101010] px-6 text-center text-[13px] text-[#8f8f98]">
+        {language === "zh" ? "当前会话暂无可查看的文件修改。" : "No file changes are available in this session."}
+      </div>
+    );
+  }
+
+  return (
+    <div data-testid="diff-panel" className="flex h-full flex-col bg-[#101010] text-[#d4d4d8]">
+      <div data-testid="diff-panel-title" className="flex shrink-0 items-center justify-between border-b border-[#252525] px-4 py-3">
+        <div className="min-w-0 flex items-center gap-2">
+          <span className="text-[18px] font-bold text-[#f4f4f5]">{language === "zh" ? "未暂存" : "Changes"}</span>
+          <span className="rounded-full bg-[#2b2b2d] px-2.5 py-1 text-[12px] font-bold text-[#d4d4d8]">{files.length}</span>
+          <span className="truncate font-mono text-[12px] text-[#34d399]">+{totals.added}</span>
+          <span className="font-mono text-[12px] text-[#ff5c5c]">-{totals.removed}</span>
+        </div>
+        <button
+          type="button"
+          onClick={toggleAll}
+          className="rounded-md border border-[#2f2f32] bg-[#181818] px-2.5 py-1 text-[11px] text-[#a1a1aa] transition-colors hover:bg-[#242428] hover:text-[#f4f4f5]"
+        >
+          {allCollapsed ? (language === "zh" ? "展开全部" : "Expand all") : (language === "zh" ? "折叠全部" : "Collapse all")}
+        </button>
+      </div>
+
+      <div className="min-h-0 flex-1 overflow-y-auto pb-6">
+        {files.map((file) => {
+          const collapsed = collapsedFiles.has(file.key);
+          const rows = file.isBinaryLike ? [] : buildReviewRows(file.oldText, file.newText);
+          return (
+            <section key={file.key} className="border-b border-[#202020]">
+              <button
+                type="button"
+                onClick={() => setCollapsedFiles((prev) => {
+                  const next = new Set(prev);
+                  if (next.has(file.key)) next.delete(file.key);
+                  else next.add(file.key);
+                  return next;
+                })}
+                className="flex w-full items-center justify-between gap-3 bg-[#101010] px-4 py-3 text-left transition-colors hover:bg-[#181818]"
+              >
+                <span className="min-w-0 flex items-center gap-2">
+                  {collapsed ? <IconChevronRight className="h-4 w-4 text-[#a1a1aa]" /> : <IconChevronUp className="h-4 w-4 text-[#a1a1aa]" />}
+                  <span className="truncate font-mono text-[14px] font-bold text-[#f4f4f5]">{file.displayPath}</span>
+                </span>
+                <span className="shrink-0 font-mono text-[14px] font-bold">
+                  <span className="text-[#34d399]">+{file.added}</span>
+                  <span className="mx-1 text-[#52525b]"> </span>
+                  <span className="text-[#ff5c5c]">-{file.removed}</span>
+                </span>
+              </button>
+
+              {!collapsed && (
+                file.isBinaryLike ? (
+                  <div className="flex h-20 items-center justify-center border-t border-[#252525] bg-[#242424] text-[13px] font-semibold text-[#a1a1aa]">
+                    {language === "zh" ? "无内容" : "No content"}
+                  </div>
+                ) : (
+                  <div className="overflow-x-auto bg-[#121212] font-mono text-[13px] leading-[22px]" style={{ fontFamily: CODE_FONT_FAMILY }}>
+                    {rows.map((row) => (
+                      row.kind === "fold" ? (
+                        <div key={row.id} className="flex min-w-max border-y border-[#20242a] bg-[#1b1f26] text-[#a1a1aa]">
+                          <div className="flex w-[72px] shrink-0 items-center justify-center border-r border-[#252a31] text-[#a1a1aa]">
+                            <IconChevronDown className="h-3.5 w-3.5" />
+                          </div>
+                          <div className="px-4 py-1.5 text-[13px] font-semibold">
+                            {language === "zh" ? `${row.count} 行未修改` : `${row.count} unmodified lines`}
+                          </div>
+                        </div>
+                      ) : (
+                        <div
+                          key={row.id}
+                          className={`flex min-w-max ${
+                            row.type === "added"
+                              ? "bg-[#173522] text-[#86d9a3]"
+                              : row.type === "removed"
+                              ? "bg-[#3a1d1f] text-[#ff6464]"
+                              : "text-[#a6a6ad]"
+                          }`}
+                        >
+                          <div className={`w-[48px] shrink-0 select-none border-r border-[#252525] pr-2 text-right ${row.type === "added" ? "text-[#34d399]" : row.type === "removed" ? "text-[#ff4d4d]" : "text-[#8f8f98]"}`}>
+                            {row.type === "added" ? row.newLine : row.oldLine}
+                          </div>
+                          <div className={`w-[24px] shrink-0 select-none text-center ${row.type === "added" ? "text-[#34d399]" : row.type === "removed" ? "text-[#ff4d4d]" : "text-[#52525b]"}`}>
+                            {row.type === "added" ? "+" : row.type === "removed" ? "-" : ""}
+                          </div>
+                          <pre className="m-0 flex-1 whitespace-pre px-2 text-inherit">{row.text || " "}</pre>
+                        </div>
+                      )
+                    ))}
+                  </div>
+                )
+              )}
+            </section>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 interface RightPanelProps {
   activeDiffTask?: any;
   rightPanelWidth: number;
@@ -519,14 +748,6 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     return task?.type === "tool" ? task : null;
   }, [selectedDiffTaskId, taskFlow]);
   const viewedDiffTask = activeDiffTask ?? selectedDiffTask;
-  const diffLines = useMemo(
-    () => viewedDiffTask?.diff ? buildLineDiff(viewedDiffTask.diff.old, viewedDiffTask.diff.new) : [],
-    [viewedDiffTask?.diff?.new, viewedDiffTask?.diff?.old],
-  );
-  const diffStats = useMemo(
-    () => viewedDiffTask?.diff ? getDiffStats(viewedDiffTask.diff.old, viewedDiffTask.diff.new) : { added: 0, removed: 0 },
-    [viewedDiffTask?.diff?.new, viewedDiffTask?.diff?.old],
-  );
   const language = config.language === "en" ? "en" : "zh";
   const latestPlanEntry = useMemo(() => {
     const entries = conversationTurns.map((turn) => ({
@@ -756,48 +977,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
           )}
 
           {rightPanelTab === "diff" && (
-            <div data-testid="diff-panel" className="flex h-full flex-col bg-[#050505]">
-              <div data-testid="diff-panel-title" className="border-b border-[#18181b] px-4 py-3 text-[12px] text-[#a1a1aa]">
-                {viewedDiffTask?.target
-                  ? (language === "zh" ? `当前变更：${viewedDiffTask.target}` : `Current diff: ${viewedDiffTask.target}`)
-                  : (language === "zh" ? "暂无待查看的 Diff" : "No diff is available right now.")}
-              </div>
-              <div className="flex-1 overflow-y-auto p-4">
-                {viewedDiffTask?.diff ? (
-                  <div className="border border-[#27272a] rounded-md overflow-hidden shadow-lg bg-[#09090b]">
-                    <div className="bg-[#050505] px-3 py-2 text-xs font-mono border-b border-[#27272a] flex justify-between text-[#e4e4e7]">
-                      <span className="truncate pr-2 flex items-center gap-1.5"><IconCode className="w-3.5 h-3.5 text-[#a1a1aa]" /> {viewedDiffTask.target}</span>
-                      <span className="text-[#71717a]">
-                        {language === "zh"
-                          ? `${diffStats.removed} 行删除 · ${diffStats.added} 行新增`
-                          : `${diffStats.removed} removed · ${diffStats.added} added`}
-                      </span>
-                    </div>
-                    <div className="font-mono text-[11px] leading-[18px] overflow-x-auto">
-                      {diffLines.map((line, index) => (
-                        <div
-                          key={`${line.type}-${index}`}
-                          className={`flex ${
-                            line.type === "removed"
-                              ? "bg-[#3e1e1e]/60 text-[#f48771]"
-                              : line.type === "added"
-                              ? "bg-[#1e3a29]/60 text-[#86d9a3]"
-                              : "text-[#a1a1aa]"
-                          }`}
-                        >
-                          <span className="w-8 shrink-0 text-right pr-2 select-none opacity-40">{line.type === "removed" ? "-" : line.type === "added" ? "+" : " "}</span>
-                          <span className="whitespace-pre flex-1 px-2">{line.text}</span>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                ) : (
-                  <div className="flex h-full items-center justify-center text-[13px] text-[#71717a]">
-                    {language === "zh" ? "暂无待审批的文件变更。" : "No pending file changes."}
-                  </div>
-                )}
-              </div>
-            </div>
+            <DiffReviewPanel taskFlow={taskFlow} activeDiffTask={viewedDiffTask} language={language} />
           )}
 
           {rightPanelTab === "terminal" && (

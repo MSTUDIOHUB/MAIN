@@ -57,7 +57,7 @@ function loadTranspiledModuleSync(sourcePath) {
   return module.exports;
 }
 
-const { resolveTurnRunIntent } = loadTranspiledModuleSync(
+const { parseMainIntentShortcut, resolveTurnRunIntent, shouldUseBlockingIntentPreflight } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/runIntent.ts"),
 );
 
@@ -85,6 +85,17 @@ test("explicit English implementation request resolves to execute", () => {
   assert.equal(result.needsDecision, undefined);
 });
 
+test("explicit analysis requests resolve to analyze", () => {
+  const result = resolveTurnRunIntent("请仔细检查验证这段指令通信链路", createContext());
+  assert.equal(result.intent, "analyze");
+  assert.equal(result.needsDecision, undefined);
+});
+
+test("analysis report requests still resolve to report", () => {
+  const result = resolveTurnRunIntent("请整理成分析报告", createContext());
+  assert.equal(result.intent, "report");
+});
+
 test("weak plan keyword triggers a decision instead of forcing plan", () => {
   const result = resolveTurnRunIntent("maybe we need a plan for this", createContext());
   assert.equal(result.intent, "discuss");
@@ -96,6 +107,41 @@ test("ordinary analysis question defaults to discuss", () => {
   const result = resolveTurnRunIntent("帮我解释一下这个模块现在在做什么", createContext());
   assert.equal(result.intent, "discuss");
   assert.equal(result.needsDecision, undefined);
+});
+
+test("MAIN intent shortcuts parse slash command and remaining prompt", () => {
+  assert.deepEqual(parseMainIntentShortcut("/计划 帮我设计功能"), {
+    intent: "plan",
+    command: "/计划",
+    rest: "帮我设计功能",
+  });
+  assert.deepEqual(parseMainIntentShortcut("/分析 check this flow"), {
+    intent: "analyze",
+    command: "/分析",
+    rest: "check this flow",
+  });
+  assert.equal(parseMainIntentShortcut("/setup-engine unity"), null);
+});
+
+test("ordinary low-risk discuss requests should not block on preflight", () => {
+  const result = resolveTurnRunIntent("帮我解释一下这个模块现在在做什么", createContext());
+  assert.equal(shouldUseBlockingIntentPreflight(result, "main_mode"), false);
+});
+
+test("low-confidence non-discuss requests can still opt into blocking preflight", () => {
+  assert.equal(
+    shouldUseBlockingIntentPreflight(
+      {
+        intent: "execute",
+        reason: "synthetic",
+        confidence: 0.78,
+        bypassMainRouter: false,
+        riskLevel: "medium",
+      },
+      "main_mode",
+    ),
+    true,
+  );
 });
 
 test("high-risk multi-step implementation suggests planning first", () => {

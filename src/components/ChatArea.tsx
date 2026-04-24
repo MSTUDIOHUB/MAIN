@@ -15,6 +15,7 @@ import { sanitizeAIOutput } from "../lib/sanitize";
 import { useAppStore } from "../store/useAppStore";
 import {
   deriveVisibleConversationTurnStatus,
+  normalizeConversationDisplayTitle,
   isPlanConversationTurn,
   resolveActiveConversationTurn,
   resolvePinnedConversationTurn,
@@ -848,6 +849,11 @@ export default function ChatArea({
       !isPlanTurn &&
       !!finalVisibleAgentBlock;
     const shouldShowCompletedSummary = turn.status === "done";
+    const displayTurnTitle = normalizeConversationDisplayTitle(
+      turn.title || turn.intentSummary || "",
+      language === "en" ? 48 : 40,
+      language === "en" ? "New task" : "新的任务",
+    );
 
     return (
       <section
@@ -863,7 +869,7 @@ export default function ChatArea({
         >
           <div className="min-w-0 flex flex-wrap items-center gap-2">
             {!isTurnExpanded ? (
-              <span className="truncate text-[13px] font-semibold text-[#f5f5f5]">{turn.title}</span>
+              <span className="truncate text-[13px] font-semibold text-[#f5f5f5]">{displayTurnTitle}</span>
             ) : (
               <span className="text-[11px] uppercase tracking-[0.18em] text-[#71717a]">{copy.turnDetails}</span>
             )}
@@ -1023,7 +1029,11 @@ export default function ChatArea({
           title={
             pendingRunDecision?.kind === "intent_confirmation"
               ? pendingRunDecision.title || (language === "zh" ? "意图待确认" : "Intent Confirmation")
-              : topIslandTurn?.intentSummary || topIslandTurn?.title || (language === "zh" ? "本轮决策" : "Turn Decision")
+              : normalizeConversationDisplayTitle(
+                  topIslandTurn?.title || topIslandTurn?.intentSummary || "",
+                  language === "en" ? 52 : 42,
+                  language === "en" ? "Turn Decision" : "本轮决策",
+                )
           }
           status={copy.turnStatusLabels[topIslandTurnStatusKey || "awaiting_input"] || topIslandTurnStatusKey || "Awaiting Choice"}
           statusToneClass={getTurnStatusTone(topIslandTurnStatusKey || "awaiting_input")}

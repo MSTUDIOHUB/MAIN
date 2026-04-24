@@ -61,9 +61,23 @@ function loadTranspiledModuleSync(sourcePath) {
 
 const {
   deriveVisibleConversationTurnStatus,
+  looksLikeReasoningLeakTitle,
+  normalizeConversationDisplayTitle,
   resolveActiveConversationTurn,
   resolvePinnedConversationTurn,
 } = loadWorkflowModelsModule();
+
+test("normalizeConversationDisplayTitle strips speaker timestamps from transcript-style prompts", () => {
+  const title = normalizeConversationDisplayTitle("Michael@: 04-23 17:57:52 这个它要建模 是啥意思", 40, "新的任务");
+  assert.equal(title, "这个它要建模 是啥意思");
+});
+
+test("looksLikeReasoningLeakTitle detects leaked chain-of-thought style titles", () => {
+  assert.equal(
+    looksLikeReasoningLeakTitle("Here's a thinking process: 1. Analyze User Input: inspect the request"),
+    true,
+  );
+});
 
 test("resolveActiveConversationTurn prefers the latest turn while auto-following the bottom", () => {
   const turns = [

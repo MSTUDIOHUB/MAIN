@@ -143,6 +143,62 @@ function hasImageContent(content: string | ContentPart[]): boolean {
   return Array.isArray(content) && content.some((part) => part.type === "image_url");
 }
 
+/**
+ * 提取 OpenAI 兼容接口里可能出现的文本字段。
+ * LM Studio / MLX 的部分 Qwen thinking 模型会返回非标准字段，
+ * 比如 reasoning，而不是 reasoning_content。
+ */
+function extractTextLike(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (!Array.isArray(value)) return "";
+  return value
+    .map((part) => {
+      if (typeof part === "string") return part;
+      if (!part || typeof part !== "object") return "";
+      const item = part as { text?: unknown; content?: unknown };
+      return typeof item.text === "string"
+        ? item.text
+        : typeof item.content === "string"
+          ? item.content
+          : "";
+    })
+    .join("");
+}
+
+function extractOpenAiCompatibleDelta(payload: unknown): {
+  content: string;
+  reasoning: string;
+  finishReason: "stop" | "length" | "tool_calls" | null;
+  toolCalls: unknown[];
+} {
+  if (!payload || typeof payload !== "object") {
+    return { content: "", reasoning: "", finishReason: null, toolCalls: [] };
+  }
+
+  const root = payload as Record<string, unknown>;
+  const choice = Array.isArray(root.choices) ? root.choices[0] as Record<string, unknown> | undefined : undefined;
+  const delta = choice?.delta && typeof choice.delta === "object"
+    ? choice.delta as Record<string, unknown>
+    : undefined;
+  const message = choice?.message && typeof choice.message === "object"
+    ? choice.message as Record<string, unknown>
+    : undefined;
+  const source = delta ?? message ?? root;
+  const rawFinishReason = choice?.finish_reason ?? root.done_reason;
+  const normalizedFinishReason = rawFinishReason === "length" || rawFinishReason === "tool_calls" || rawFinishReason === "stop"
+    ? rawFinishReason
+    : root.done === true
+      ? "stop"
+      : null;
+
+  return {
+    content: extractTextLike(source.content ?? source.text ?? root.response),
+    reasoning: extractTextLike(source.reasoning_content ?? source.reasoning ?? source.thinking ?? source.thought),
+    finishReason: normalizedFinishReason,
+    toolCalls: Array.isArray(source.tool_calls) ? source.tool_calls : [],
+  };
+}
+
 /** Extract base64 images from multimodal content array (without data URL prefix). */
 function extractBase64Images(content: string | ContentPart[]): string[] {
   if (typeof content === "string") return [];
@@ -532,7 +588,9 @@ async function streamViaRustProxy(
           // Handle reasoning_content from thinking models (Qwen3.5, DeepSeek-R1, etc.)
           // Buffer tokens until we can verify they're not garbled "?" output
           // from a llama.cpp server that can't decode the thinking tokens.
-          const reasoningDelta: string = delta.reasoning_content ?? "";
+          const reasoningDelta = extractTextLike(
+            delta.reasoning_content ?? delta.reasoning ?? delta.thinking ?? delta.thought,
+          );
           if (reasoningDelta && !reasoningGarbled) {
             if (reasoningEmitted) {
               // Already verified as legitimate — emit directly
@@ -571,7 +629,7 @@ async function streamViaRustProxy(
           }
 
           // Handle regular content
-          const textDelta: string = delta.content ?? "";
+          const textDelta = extractTextLike(delta.content ?? delta.text);
           if (textDelta) {
             // Close reasoning block if we were in one
             if (reasoningActive) {
@@ -920,7 +978,9 @@ export async function streamChatCompletion(
 
             // Handle reasoning_content from thinking models (Qwen3.5, DeepSeek-R1, etc.)
             // Buffer tokens until we can verify they're not garbled "?" output
-            const reasoningDelta: string = delta.reasoning_content ?? "";
+            const reasoningDelta = extractTextLike(
+              delta.reasoning_content ?? delta.reasoning ?? delta.thinking ?? delta.thought,
+            );
             if (reasoningDelta && !reasoningGarbled) {
               if (reasoningEmitted) {
                 fullContent += reasoningDelta;
@@ -950,7 +1010,7 @@ export async function streamChatCompletion(
             }
 
             // Handle text content deltas
-            const textDelta: string = delta.content ?? "";
+            const textDelta = extractTextLike(delta.content ?? delta.text);
             if (textDelta) {
               // Close reasoning block if we were in one
               if (reasoningActive) {
@@ -1025,7 +1085,8 @@ export async function streamChatCompletion(
         if (!d) continue;
         try {
           const json = JSON.parse(d);
-          const contentDelta = json.choices?.[0]?.delta?.content ?? "";
+          const delta = json.choices?.[0]?.delta;
+          const contentDelta = extractTextLike(delta?.content ?? delta?.text);
           if (contentDelta) {
             fullContent += contentDelta;
             onToken(contentDelta);

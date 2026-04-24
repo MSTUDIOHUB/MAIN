@@ -235,6 +235,7 @@ test("active protocol packages advertise the exact entry path instead of a bare 
       type: "package",
       packagePath: ".protocols/Auto-Optimize-main-1776311699903/Auto-Optimize-main",
       entryPoint: "SKILL.md",
+      workspaceScope: "/tmp/workspace",
     }],
     "/tmp/workspace",
     "nexus_general",
