@@ -91,7 +91,7 @@ Plan Mode active + AI outputs <plan> tag
       5. Render remaining markdown via MarkdownRenderer
   → User clicks "Start Execution":
       - isPlanApproved = true
-      - deletePlanFiles() called
+      - plan files stay available for review
       - Continuation message sent (EXECUTION MODE)
       - Agent loop continues with write access
   → User clicks "Reject":

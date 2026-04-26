@@ -7,6 +7,7 @@ import { executeAgentLoop, type AgentMessage, type OrchestratorCallbacks, type R
 import { analyzeTabularDocument, deleteChatTempPath, deletePlanFiles, readDocument, readFile } from "../lib/ipc";
 import { invoke } from "@tauri-apps/api/core";
 import { setWorkspaceRoot as setWorkspaceRootIpc } from "../lib/ipc";
+import { appendDebugLog } from "../lib/debugLog";
 import { formatWorkspaceTree } from "../lib/systemPrompt";
 import { type MCPServer, type MCPTool } from "../lib/mcpClient";
 import { sanitizePlanArtifactContent } from "../lib/sanitize";
@@ -92,7 +93,7 @@ import { runAfterNextPaint } from "../lib/uiScheduling";
 
 function logStoreEvent(event: string, data: Record<string, unknown> = {}) {
   try {
-    console.info(`[store.${event}]`, data);
+    appendDebugLog("info", `store.${event}`, data);
   } catch {
     // Diagnostics must never affect user workflows.
   }
@@ -766,6 +767,166 @@ function normalizeSessionsByWorkspace(
 // appearing as plain text in the chat during streaming.
 
 const THINKING_TAG_NAMES = new Set(["thinking", "thought", "analysis", "reasoning"]);
+const MAX_VISIBLE_THOUGHT_CHARS = 36_000;
+
+function normalizeThoughtTextForCompare(text: string): string {
+  return String(text || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[，。！？；：,.!?;:、"'“”‘’`*_~\-\s]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function sameThoughtParagraphSequence(paragraphs: string[], a: number, b: number, length: number): boolean {
+  for (let offset = 0; offset < length; offset++) {
+    if (normalizeThoughtTextForCompare(paragraphs[a + offset] || "") !== normalizeThoughtTextForCompare(paragraphs[b + offset] || "")) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function collapseRepeatedThoughtParagraphs(text: string): string {
+  const paragraphs = String(text || "")
+    .split(/\n{2,}/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+
+  if (paragraphs.length < 4) return text;
+
+  const collapsed: string[] = [];
+  let index = 0;
+  const maxWindow = 8;
+
+  while (index < paragraphs.length) {
+    let matched = false;
+    const remaining = paragraphs.length - index;
+    const largestWindow = Math.min(maxWindow, Math.floor(remaining / 2));
+
+    for (let windowSize = largestWindow; windowSize >= 1; windowSize--) {
+      let repeats = 1;
+      while (
+        index + (repeats + 1) * windowSize <= paragraphs.length &&
+        sameThoughtParagraphSequence(paragraphs, index, index + repeats * windowSize, windowSize)
+      ) {
+        repeats++;
+      }
+
+      if (repeats >= 2) {
+        collapsed.push(...paragraphs.slice(index, index + windowSize));
+        index += repeats * windowSize;
+        matched = true;
+        break;
+      }
+    }
+
+    if (!matched) {
+      collapsed.push(paragraphs[index]);
+      index++;
+    }
+  }
+
+  return collapsed.join("\n\n");
+}
+
+function collapseRepeatedThoughtLines(text: string): string {
+  const lines = String(text || "")
+    .split(/\r?\n/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+
+  if (lines.length < 6) return text;
+
+  const collapsed: string[] = [];
+  let index = 0;
+  const maxWindow = 12;
+
+  while (index < lines.length) {
+    let matched = false;
+    const remaining = lines.length - index;
+    const largestWindow = Math.min(maxWindow, Math.floor(remaining / 2));
+
+    for (let windowSize = largestWindow; windowSize >= 1; windowSize--) {
+      let repeats = 1;
+      while (
+        index + (repeats + 1) * windowSize <= lines.length &&
+        sameThoughtParagraphSequence(lines, index, index + repeats * windowSize, windowSize)
+      ) {
+        repeats++;
+      }
+
+      if (repeats >= 2) {
+        collapsed.push(...lines.slice(index, index + windowSize));
+        index += repeats * windowSize;
+        matched = true;
+        break;
+      }
+    }
+
+    if (!matched) {
+      collapsed.push(lines[index]);
+      index++;
+    }
+  }
+
+  return collapsed.join("\n");
+}
+
+function compactThoughtNoise(text: string): string {
+  return String(text || "")
+    .replace(/(?:[，,。.\-_]\s*){32,}/g, " ... ")
+    .replace(/([，,。.!！？?;；:：])(?:\s*\1){6,}/g, "$1...")
+    .replace(/(?:\*\s*){16,}/g, "**")
+    .replace(/[^\S\r\n]{3,}/g, " ");
+}
+
+function findSuffixPrefixOverlap(existing: string, incoming: string): number {
+  const max = Math.min(existing.length, incoming.length, 4000);
+  for (let length = max; length > 20; length--) {
+    if (existing.endsWith(incoming.slice(0, length))) return length;
+  }
+  return 0;
+}
+
+function limitThoughtContent(text: string): string {
+  const content = String(text || "");
+  if (content.length <= MAX_VISIBLE_THOUGHT_CHARS) return content;
+  const head = content.slice(0, Math.floor(MAX_VISIBLE_THOUGHT_CHARS * 0.72)).trimEnd();
+  const tail = content.slice(-Math.floor(MAX_VISIBLE_THOUGHT_CHARS * 0.18)).trimStart();
+  const hidden = content.length - head.length - tail.length;
+  return `${head}\n\n[后台思考内容过长，已折叠中间 ${hidden.toLocaleString()} 个字符，避免界面卡死。]\n\n${tail}`;
+}
+
+function compactThoughtContent(text: string): string {
+  const collapsedParagraphs = collapseRepeatedThoughtParagraphs(String(text || ""));
+  const collapsedLines = collapseRepeatedThoughtLines(collapsedParagraphs);
+  return limitThoughtContent(compactThoughtNoise(collapsedLines));
+}
+
+function appendThoughtDelta(existing: string, incoming: string): string {
+  const current = String(existing || "");
+  const delta = String(incoming || "");
+  if (!delta) return compactThoughtContent(current);
+  if (!current) return compactThoughtContent(delta);
+
+  const normalizedCurrent = normalizeThoughtTextForCompare(current);
+  const normalizedDelta = normalizeThoughtTextForCompare(delta);
+  if (normalizedDelta && normalizedCurrent.includes(normalizedDelta)) {
+    return compactThoughtContent(current);
+  }
+
+  if (normalizedCurrent && normalizedDelta.startsWith(normalizedCurrent)) {
+    return compactThoughtContent(delta);
+  }
+
+  if (delta.startsWith(current)) {
+    return compactThoughtContent(delta);
+  }
+
+  const overlap = findSuffixPrefixOverlap(current, delta);
+  return compactThoughtContent(current + (overlap > 0 ? delta.slice(overlap) : delta));
+}
 
 class StreamingThinkingInterceptor {
   private buffer = "";          // raw token accumulation for tag detection
@@ -1126,7 +1287,7 @@ export function sanitizeTaskBlocksForPersist(blocks: TaskBlock[]): TaskBlock[] {
             : {}),
         };
       case "thought":
-        return { id: b.id, turnId: b.turnId, type: "thought" as const, content: String(b.content) };
+        return { id: b.id, turnId: b.turnId, type: "thought" as const, content: compactThoughtContent(String(b.content)) };
       case "tool":
         return {
           id: b.id, turnId: b.turnId, type: "tool" as const,
@@ -1185,6 +1346,7 @@ export function finalizeStreamingTaskBlocks(
     if (block.type === "thought" && block.isStreaming) {
       return {
         ...block,
+        content: compactThoughtContent(block.content),
         isStreaming: false,
         ...(block.duration == null && thoughtDuration !== undefined ? { duration: thoughtDuration } : {}),
       };
@@ -1359,6 +1521,58 @@ function isPlanExecutionEvidenceTool(toolName: string, target: string): boolean 
   return true;
 }
 
+function hasReviewablePlanState(artifacts: PlanArtifact[], stage: PlanStage): boolean {
+  if (stage === "ready_to_execute" || stage === "design" || stage === "bugfix") return true;
+  return artifacts.some((artifact) => artifact.kind === "design" || artifact.kind === "bugfix");
+}
+
+function blockHasVisibleAgentContent(block: TaskBlock): boolean {
+  if (block.type !== "agent" || block.hiddenProcess) return false;
+  if (Array.isArray(block.options) && block.options.length > 0) return true;
+  return String(block.content || "").trim().length > 0;
+}
+
+function deriveIdleConversationTurnStatus(input: {
+  turnId: string;
+  effectiveRunIntent: ResolvedRunIntent;
+  isPlanApproved: boolean;
+  planArtifacts: PlanArtifact[];
+  planStage: PlanStage;
+  planExecutionEvidenceCount: number;
+  replyOptionCount: number;
+  taskFlow: TaskBlock[];
+  override?: ConversationTurnStatus | null;
+}): ConversationTurnStatus {
+  if (input.replyOptionCount > 0) return "awaiting_input";
+  if (input.override) return input.override;
+
+  const turnBlocks = input.taskFlow.filter((block) => block.turnId === input.turnId);
+  const hasVisibleAgent = turnBlocks.some(blockHasVisibleAgentContent);
+  const hasAnyTool = turnBlocks.some((block) => block.type === "tool");
+  const hasExecutionEvidence =
+    input.planExecutionEvidenceCount > 0 ||
+    turnBlocks.some((block) =>
+      block.type === "tool" &&
+      block.toolStatus === "executed" &&
+      isPlanExecutionEvidenceTool(block.toolName, block.target),
+    );
+
+  if (input.effectiveRunIntent === "plan" && !input.isPlanApproved) {
+    if (hasReviewablePlanState(input.planArtifacts, input.planStage)) {
+      return "awaiting_approval";
+    }
+    return hasVisibleAgent || hasAnyTool ? "stopped_no_action" : "stopped_no_output";
+  }
+
+  if (input.effectiveRunIntent === "execute" || input.effectiveRunIntent === "studio_workflow") {
+    if (hasExecutionEvidence) return "completed_with_changes";
+    return hasVisibleAgent || hasAnyTool ? "stopped_no_action" : "stopped_no_output";
+  }
+
+  if (hasExecutionEvidence) return "completed_with_changes";
+  return "done";
+}
+
 /** Helper to ensure Skill content uses standard <analysis> tags for cross-model consistency. */
 function normalizeSkillContent(content: string): string {
   if (!content) return content;
@@ -1420,7 +1634,7 @@ export const useAppStore = create<AppState>()(
         pendingRunDecisionResolver: null,
       });
       if (currentTurnId) {
-        get().setConversationTurnStatus(currentTurnId, "done");
+        get().setConversationTurnStatus(currentTurnId, "stopped_no_action");
       }
     }
   },
@@ -1746,9 +1960,7 @@ export const useAppStore = create<AppState>()(
               ...turn,
               status,
               collapsed:
-                status === "done"
-                  ? true
-                  : status === "awaiting_approval" || status === "awaiting_input" || status === "error"
+                status === "awaiting_approval" || status === "awaiting_input" || status === "error"
                   ? false
                   : turn.collapsed,
             }
@@ -2214,26 +2426,17 @@ export const useAppStore = create<AppState>()(
   rejectPlan: () => {
     const state = get();
     state.abortController?.abort();
-    const sessionKey = !state.currentWorkspace.trim()
-      ? resolveGlobalChatSessionKey(state.currentSessionId)
-      : null;
-    if (sessionKey) {
-      deleteChatTempPath(sessionKey, ".MAIN/plans").catch(() => {});
-    } else {
-      deletePlanFiles().catch(() => {});
-    }
     set({
       isPlanApproved: false,
       planExecutionEvidenceCount: 0,
       agentStatus: "idle",
       isGenerating: false,
       abortController: null,
-      planArtifacts: [],
-      planTasks: [],
-      planStage: "idle",
+      showPlanPanel: state.planArtifacts.length > 0 || state.planStage !== "idle" ? true : state.showPlanPanel,
+      rightPanelTab: state.planArtifacts.length > 0 || state.planStage !== "idle" ? "plan" : state.rightPanelTab,
     });
     if (state.currentTurnId) {
-      get().setConversationTurnStatus(state.currentTurnId, "done");
+      get().setConversationTurnStatus(state.currentTurnId, "stopped_no_action");
     }
   },
   showWorkflowMenu: false,
@@ -2726,7 +2929,7 @@ export const useAppStore = create<AppState>()(
         if (state.currentTurnId) {
           get().setConversationTurnStatus(
             state.currentTurnId,
-            state.agentStatus === "pending_review" ? "awaiting_approval" : "done",
+            state.agentStatus === "pending_review" ? "awaiting_approval" : "stopped_no_action",
           );
         }
         // Re-check after state reset
@@ -3162,6 +3365,22 @@ export const useAppStore = create<AppState>()(
         userContent = parts.join("\n\n") + "\n\n" + text;
       }
 
+      if (effectiveRunIntent === "plan" && !preservePlanState) {
+        userContent = preferredLanguage === "en"
+          ? [
+              "This turn is in PLAN mode. If the request is a complex implementation, create concise reviewable plan drafts in `.MAIN/plans/requirements.md` and `.MAIN/plans/design.md` before asking for approval; do not write project source files or tasks.md before approval.",
+              "If it is only a discussion-style plan, keep the answer concise and use user options for real decisions.",
+              "",
+              userContent,
+            ].join("\n")
+          : [
+              "本轮处于 PLAN 模式。如果这是复杂实现请求，请先把可审批的精简计划草稿写入 `.MAIN/plans/requirements.md` 和 `.MAIN/plans/design.md`，等待用户批准后再改源码；批准前不要生成 tasks.md。",
+              "如果只是讨论式方案，请保持简洁，并在真实分叉点用可点击选项让用户选择。",
+              "",
+              userContent,
+            ].join("\n");
+      }
+
       if (shouldContinuePlanIntent) {
         const originalPlanPrompt = currentTurn?.userPrompt?.trim();
         userContent = preferredLanguage === "en"
@@ -3175,7 +3394,8 @@ export const useAppStore = create<AppState>()(
           : [
               "请继续上一轮 PLAN 回合。用户是在要求继续推进，不是开启新的普通讨论。",
               originalPlanPrompt ? `上一轮计划请求：${originalPlanPrompt}` : "上一轮计划请求：请依据当前对话上下文继续。",
-              "现在必须产生实际规划进展。如果仍有关键选择要用户拍板，就先简短归纳并使用 <user_options>；否则给出精简方案/Proposal。",
+              "现在必须产生实际规划进展。如果仍有关键选择需要用户确认，就先简短归纳并用面向用户的口吻给出 <user_options>；否则给出精简方案/Proposal。",
+              "每个 <option> 必须是用户点击后会发送的完整选择，不要写成“是否……”问题句。",
               "所有计划 Markdown 都要精简成审阅摘要风格，不要写教程式长文、完整代码清单或重复背景。",
               text.trim() ? `用户最新消息：${text.trim()}` : "用户最新消息：继续",
             ].join("\n");
@@ -3277,6 +3497,7 @@ export const useAppStore = create<AppState>()(
       let thoughtStartTime: number | null = null;
       // Current streaming thought block id (for live updates)
       let currentThoughtBlockId: number | null = null;
+      let terminalTurnStatusOverride: ConversationTurnStatus | null = null;
 
       // Thinking tag interceptor — catches <thinking>/<thought>/<analysis>/<reasoning>
       // tags during streaming and routes content to a ThoughtBlock instead of the
@@ -3309,6 +3530,9 @@ export const useAppStore = create<AppState>()(
       // flush them once per animation frame (~60 fps).
       let tokenBuffer = "";
       let rafHandle: number | null = null;
+      let firstStreamTokenAt: number | null = null;
+      let streamTokenCount = 0;
+      let streamTextChars = 0;
 
       const flushBuffer = () => {
         const chunk = tokenBuffer;
@@ -3329,7 +3553,7 @@ export const useAppStore = create<AppState>()(
             id: thoughtId,
             turnId,
             type: "thought",
-            content: thinking,
+            content: compactThoughtContent(thinking),
             isStreaming: true,
           };
           appendTurnBlock(thoughtBlock);
@@ -3337,7 +3561,7 @@ export const useAppStore = create<AppState>()(
             currentTurnState: {
               ...s.currentTurnState,
               interceptorHandled: true,
-              interceptorThought: thinking
+              interceptorThought: appendThoughtDelta(s.currentTurnState.interceptorThought, thinking),
             }
           }));
         } else if (currentThoughtBlockId !== null && thinking) {
@@ -3346,12 +3570,12 @@ export const useAppStore = create<AppState>()(
           set((s) => ({
             taskFlow: s.taskFlow.map((t) =>
               t.id === tid && t.type === "thought"
-                ? { ...t, content: (t as Extract<TaskBlock, { type: "thought" }>).content + thinking }
+                ? { ...t, content: appendThoughtDelta((t as Extract<TaskBlock, { type: "thought" }>).content, thinking) }
                 : t
             ),
             currentTurnState: {
               ...s.currentTurnState,
-              interceptorThought: s.currentTurnState.interceptorThought + thinking
+              interceptorThought: appendThoughtDelta(s.currentTurnState.interceptorThought, thinking),
             }
           }));
         }
@@ -3550,6 +3774,9 @@ export const useAppStore = create<AppState>()(
               taskFlowBlocks: get().taskFlow.length,
             });
             tokenBuffer = "";
+            firstStreamTokenAt = null;
+            streamTokenCount = 0;
+            streamTextChars = 0;
             // Reset the streaming block content for retry
             if (currentStreamingBlockId !== null) {
               const blockId = currentStreamingBlockId;
@@ -3567,6 +3794,16 @@ export const useAppStore = create<AppState>()(
           }
 
           if (thoughtStartTime === null) thoughtStartTime = Date.now();
+          if (firstStreamTokenAt === null) {
+            firstStreamTokenAt = nowMs();
+            logStoreEvent("stream_first_token", {
+              turnId,
+              elapsedMs: Math.round(firstStreamTokenAt - sendStartedAt),
+              tokenChars: token.length,
+            });
+          }
+          streamTokenCount++;
+          streamTextChars += token.length;
           tokenBuffer += token;
           scheduleFlush();
         },
@@ -3577,6 +3814,9 @@ export const useAppStore = create<AppState>()(
             turnId,
             fullTextChars: _fullText.length,
             truncated,
+            firstTokenElapsedMs: firstStreamTokenAt == null ? null : Math.round(firstStreamTokenAt - sendStartedAt),
+            streamTokenCount,
+            streamTextChars,
             taskFlowBlocks: get().taskFlow.length,
             agentBlocksCreatedThisRun: agentBlockIdsCreatedThisRun.size,
           });
@@ -3635,11 +3875,14 @@ export const useAppStore = create<AppState>()(
           set((s) => ({
             normalizedStreamState: {
               ...s.normalizedStreamState,
-              hiddenThought: `${s.normalizedStreamState.hiddenThought}\n\n${thought}`.trim(),
+              hiddenThought: appendThoughtDelta(
+                s.normalizedStreamState.hiddenThought,
+                s.normalizedStreamState.hiddenThought ? `\n\n${thought}` : thought,
+              ),
             },
             currentTurnState: {
               ...s.currentTurnState,
-              lastReportedThought: s.currentTurnState.lastReportedThought + " " + thought
+              lastReportedThought: appendThoughtDelta(s.currentTurnState.lastReportedThought, thought),
             }
           }));
 
@@ -3667,7 +3910,7 @@ export const useAppStore = create<AppState>()(
             set((s) => ({
               taskFlow: s.taskFlow.map((t) =>
                 t.id === tid && t.type === "thought"
-                  ? { ...t, content: (t as Extract<TaskBlock, { type: "thought" }>).content + "\n" + thought, isStreaming: true, duration }
+                  ? { ...t, content: appendThoughtDelta((t as Extract<TaskBlock, { type: "thought" }>).content, `\n\n${thought}`), isStreaming: true, duration }
                   : t
               ),
             }));
@@ -3689,7 +3932,7 @@ export const useAppStore = create<AppState>()(
               id: thoughtBlockId,
               turnId,
               type: "thought",
-              content: thought,
+              content: compactThoughtContent(thought),
               isStreaming: true,
               duration,
             };
@@ -3707,53 +3950,6 @@ export const useAppStore = create<AppState>()(
               thoughtStartTime = null;
             }, 1200);
           }
-        },
-
-        onAssistantText: (text: string) => {
-          if (!text.trim()) return;
-          
-          // Cross-type deduplication for non-streaming flushes
-          const currentTurn = get().currentTurnState;
-          let cleanText = text;
-          if (currentTurn.lastReportedThought) {
-            const normThought = currentTurn.lastReportedThought.trim().toLowerCase().replace(/\s+/g, ' ');
-            const normText = text.trim().toLowerCase().replace(/\s+/g, ' ');
-            if (normText.startsWith(normThought)) {
-              cleanText = text.trim().slice(currentTurn.lastReportedThought.trim().length).trim();
-              if (!cleanText) return;
-            }
-          }
-
-          const currentFlow = get().taskFlow;
-          const latestBlock = [...currentFlow].reverse().find((block) =>
-            block.turnId === turnId &&
-            block.type === "agent" &&
-            agentBlockIdsCreatedThisRun.has(block.id)
-          );
-          if (!latestBlock || latestBlock.type !== "agent" || latestBlock.turnId !== turnId) {
-            appendTurnBlock({ id: nextId(), turnId, type: "agent", content: cleanText, streaming: true });
-            set((s) => ({
-              normalizedStreamState: {
-                ...s.normalizedStreamState,
-                visibleText: cleanText,
-              },
-            }));
-            return;
-          }
-
-          set((s) => ({
-            normalizedStreamState: {
-              ...s.normalizedStreamState,
-              visibleText: s.normalizedStreamState.visibleText.trim().includes(cleanText.trim())
-                ? s.normalizedStreamState.visibleText
-                : `${s.normalizedStreamState.visibleText}\n${cleanText}`.trim(),
-            },
-            taskFlow: s.taskFlow.map((t) =>
-              t.id === latestBlock.id && t.type === "agent" && !t.content.trim().includes(cleanText)
-                ? { ...t, content: t.content + cleanText, streaming: true }
-                : t
-            ),
-          }));
         },
 
         onAssistantFinalText: (text, replyOptions = []) => {
@@ -4023,14 +4219,38 @@ export const useAppStore = create<AppState>()(
             // Timer only runs during active generation, NOT during plan review
             isGenerating: status === "running",
           });
+          if (status === "pending_review") {
+            const state = get();
+            const hasPlanContext =
+              effectiveRunIntent === "plan" ||
+              state.planArtifacts.length > 0 ||
+              state.planStage !== "idle";
+            if (hasPlanContext) {
+              logStoreEvent("plan_panel_open_for_review", {
+                turnId,
+                effectiveRunIntent,
+                planArtifacts: state.planArtifacts.length,
+                planStage: state.planStage,
+              });
+              state.openRightPanelTab("plan");
+            }
+          }
           if (turnId) {
             const nextTurnStatus: ConversationTurnStatus =
               status === "error"
                 ? "error"
                 : status === "idle"
-                ? get().normalizedStreamState.replyOptions.length > 0
-                  ? "awaiting_input"
-                  : "done"
+                ? deriveIdleConversationTurnStatus({
+                    turnId,
+                    effectiveRunIntent,
+                    isPlanApproved: get().isPlanApproved,
+                    planArtifacts: get().planArtifacts,
+                    planStage: get().planStage,
+                    planExecutionEvidenceCount: get().planExecutionEvidenceCount,
+                    replyOptionCount: get().normalizedStreamState.replyOptions.length,
+                    taskFlow: get().taskFlow,
+                    override: terminalTurnStatusOverride,
+                  })
                 : status === "pending_review"
                 ? "awaiting_approval"
                 : effectiveRunIntent === "plan" &&
@@ -4043,8 +4263,8 @@ export const useAppStore = create<AppState>()(
           if (status === "idle" || status === "error") {
             finalizeStreamingUi();
             finalizeStaleRunningTools(
-              status === "idle" ? "executed" : "failed",
-              status === "idle" ? "已完成" : "请求已停止",
+              "failed",
+              status === "idle" ? "请求已停止或未返回工具结果" : "请求已停止",
             );
             set({ abortController: null });
             clearInterval(timerInterval);
@@ -4087,7 +4307,34 @@ export const useAppStore = create<AppState>()(
           appendTurnBlock(block);
         },
 
+        onNonActionableStop: (message, reason) => {
+          terminalTurnStatusOverride = reason === "no_output"
+            ? "stopped_no_output"
+            : "stopped_no_action";
+          logStoreEvent("non_actionable_stop", {
+            turnId,
+            reason,
+            message,
+            taskFlowBlocks: get().taskFlow.length,
+            agentMessages: get().agentMessages.length,
+          });
+          const block: TaskBlock = {
+            id: nextId(),
+            turnId,
+            type: "system",
+            content: message,
+          };
+          appendTurnBlock(block);
+          get().setConversationTurnSummary(turnId, summarizeAssistantText(message));
+        },
+
         onPlanArtifactUpdated: (path, content, kind) => {
+          logStoreEvent("plan_artifact_updated", {
+            turnId,
+            path,
+            kind,
+            contentChars: content.length,
+          });
           get().upsertPlanArtifact({
             kind,
             path,

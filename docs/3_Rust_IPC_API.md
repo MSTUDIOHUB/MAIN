@@ -188,7 +188,7 @@ Set workspace root path. All file operations are validated against this path.
 #[tauri::command]
 fn delete_plan_files() -> Result<(), String>
 ```
-Delete spec files from `.MAIN/plans/` directory. Security-scoped: only deletes the 4 named spec files (`requirements.md`, `design.md`, `tasks.md`, `bugfix.md`). Called automatically after plan approval.
+Delete spec files from `.MAIN/plans/` directory. Security-scoped: only deletes the 4 named spec files (`requirements.md`, `design.md`, `tasks.md`, `bugfix.md`). This is a manual cleanup action from the Plan panel / file tree; approved plans are preserved after execution.
 
 ## 8. MCP / Protocol Packages
 

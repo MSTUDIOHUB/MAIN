@@ -100,6 +100,19 @@ const STRONG_EXECUTE_PATTERNS = [
   /\b(?:apply|patch|build it|go implement|implement it|fix it|ship it)\b/i,
 ];
 
+const COMPLEX_IMPLEMENTATION_PATTERNS = [
+  /生成一套/i,
+  /完整(?:的)?(?:系统|框架|项目|模块|流程|架构)/i,
+  /(?:代码)?框架/i,
+  /包括(?:文件夹|目录|多个文件|完整文件)/i,
+  /多文件/i,
+  /从零(?:搭建|实现|创建)/i,
+  /项目骨架/i,
+  /战斗(?:系统|逻辑|框架)/i,
+  /回合制(?:战斗|系统|逻辑)/i,
+  /\b(?:scaffold|full framework|whole system|multi-file|from scratch|project skeleton)\b/i,
+];
+
 const STRONG_SUMMARIZE_PATTERNS = [
   /(?:帮我|请)?(?:总结|概括|归纳|梳理)(?:一下)?/i,
   /(?:给我|输出)(?:一个)?(?:摘要|总结)/i,
@@ -272,6 +285,10 @@ function normalizeInput(input: string): string {
 
 function matchesAny(input: string, patterns: RegExp[]): boolean {
   return patterns.some((pattern) => pattern.test(input));
+}
+
+function countPatternMatches(input: string, patterns: RegExp[]): number {
+  return patterns.reduce((count, pattern) => count + (pattern.test(input) ? 1 : 0), 0);
 }
 
 function localizeReason(language: "zh" | "en", zh: string, en: string): string {
@@ -604,6 +621,21 @@ export function resolveTurnRunIntent(
       confidence: 0.96,
       bypassMainRouter: false,
       riskLevel: "medium",
+    };
+  }
+
+  const complexImplementationMatches = countPatternMatches(normalizedInput, COMPLEX_IMPLEMENTATION_PATTERNS);
+  if (complexImplementationMatches >= 2) {
+    return {
+      intent: "plan",
+      reason: localizeReason(
+        language,
+        "检测到这是多文件/架构级实现请求，本轮会先生成可审批计划，再由用户批准后执行。",
+        "Detected a multi-file or architecture-level implementation request, so this turn will create a reviewable plan before execution.",
+      ),
+      confidence: 0.93,
+      bypassMainRouter: false,
+      riskLevel: "high",
     };
   }
 

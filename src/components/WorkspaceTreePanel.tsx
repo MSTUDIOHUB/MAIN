@@ -1,6 +1,26 @@
 // @ts-nocheck
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { IconChevronDown, IconChevronRight, IconClose, IconFile, IconFolder } from "./Icons";
+import {
+  IconChevronDown,
+  IconChevronRight,
+  IconClose,
+  IconFile,
+  IconFileArchive,
+  IconFileAudio,
+  IconFileCode,
+  IconFileConfig,
+  IconFileJson,
+  IconFileMarkdown,
+  IconFileStyle,
+  IconFileTable,
+  IconFileText,
+  IconFileVideo,
+  IconFolder,
+  IconFolderOpen,
+  IconImageIcon,
+  IconPackage,
+  IconTerminal,
+} from "./Icons";
 import { listDirectory, type FileNode } from "../lib/ipc";
 import { useAppStore } from "../store/useAppStore";
 import { shouldHideWorkspaceEntry } from "../utils/fsUtils";
@@ -11,6 +31,137 @@ interface WorkspaceTreePanelProps {
   width: number;
   onClose: () => void;
   onStartResizing?: (e: React.MouseEvent) => void;
+}
+
+const treeIconClass = "h-3.5 w-3.5 shrink-0";
+const defaultFileIcon = { icon: IconFile, className: "text-[#71717a]" };
+
+const folderIconByName = {
+  assets: "text-[#f59e0b]",
+  components: "text-[#38bdf8]",
+  docs: "text-[#86d9a3]",
+  gamestudiopack: "text-[#a78bfa]",
+  lib: "text-[#38bdf8]",
+  public: "text-[#f59e0b]",
+  scripts: "text-[#38bdf8]",
+  src: "text-[#38bdf8]",
+  "src-tauri": "text-[#f97316]",
+  store: "text-[#38bdf8]",
+  tests: "text-[#fbbf24]",
+  utils: "text-[#38bdf8]",
+};
+
+const fileIconByName = {
+  ".gitignore": { icon: IconFileConfig, className: "text-[#a1a1aa]" },
+  "agent.md": { icon: IconFileMarkdown, className: "text-[#4ade80]" },
+  "agents.md": { icon: IconFileMarkdown, className: "text-[#4ade80]" },
+  "dockerfile": { icon: IconTerminal, className: "text-[#60a5fa]" },
+  "makefile": { icon: IconTerminal, className: "text-[#fbbf24]" },
+  "package-lock.json": { icon: IconPackage, className: "text-[#f59e0b]" },
+  "package.json": { icon: IconPackage, className: "text-[#f59e0b]" },
+  "playwright.config.ts": { icon: IconFileConfig, className: "text-[#22c55e]" },
+  "readme.md": { icon: IconFileMarkdown, className: "text-[#86d9a3]" },
+  "tsconfig.json": { icon: IconFileConfig, className: "text-[#3b82f6]" },
+  "tsconfig.node.json": { icon: IconFileConfig, className: "text-[#3b82f6]" },
+  "vite.config.ts": { icon: IconFileConfig, className: "text-[#a78bfa]" },
+  "yarn.lock": { icon: IconPackage, className: "text-[#f59e0b]" },
+};
+
+const fileIconByExtension = {
+  "7z": { icon: IconFileArchive, className: "text-[#a1a1aa]" },
+  avi: { icon: IconFileVideo, className: "text-[#fb7185]" },
+  bat: { icon: IconTerminal, className: "text-[#a1a1aa]" },
+  c: { icon: IconFileCode, className: "text-[#60a5fa]" },
+  cc: { icon: IconFileCode, className: "text-[#60a5fa]" },
+  cmd: { icon: IconTerminal, className: "text-[#a1a1aa]" },
+  compute: { icon: IconFileCode, className: "text-[#a78bfa]" },
+  cpp: { icon: IconFileCode, className: "text-[#60a5fa]" },
+  cs: { icon: IconFileCode, className: "text-[#a78bfa]" },
+  css: { icon: IconFileStyle, className: "text-[#38bdf8]" },
+  csv: { icon: IconFileTable, className: "text-[#22c55e]" },
+  cxx: { icon: IconFileCode, className: "text-[#60a5fa]" },
+  doc: { icon: IconFileText, className: "text-[#60a5fa]" },
+  docx: { icon: IconFileText, className: "text-[#60a5fa]" },
+  flac: { icon: IconFileAudio, className: "text-[#c084fc]" },
+  gd: { icon: IconFileCode, className: "text-[#60a5fa]" },
+  gif: { icon: IconImageIcon, className: "text-[#f472b6]" },
+  glsl: { icon: IconFileCode, className: "text-[#a78bfa]" },
+  go: { icon: IconFileCode, className: "text-[#38bdf8]" },
+  gz: { icon: IconFileArchive, className: "text-[#a1a1aa]" },
+  h: { icon: IconFileCode, className: "text-[#60a5fa]" },
+  hlsl: { icon: IconFileCode, className: "text-[#a78bfa]" },
+  hpp: { icon: IconFileCode, className: "text-[#60a5fa]" },
+  html: { icon: IconFileCode, className: "text-[#f97316]" },
+  ico: { icon: IconImageIcon, className: "text-[#f472b6]" },
+  jpeg: { icon: IconImageIcon, className: "text-[#f472b6]" },
+  jpg: { icon: IconImageIcon, className: "text-[#f472b6]" },
+  js: { icon: IconFileCode, className: "text-[#facc15]" },
+  json: { icon: IconFileJson, className: "text-[#f59e0b]" },
+  jsx: { icon: IconFileCode, className: "text-[#38bdf8]" },
+  lock: { icon: IconFileConfig, className: "text-[#a1a1aa]" },
+  lua: { icon: IconFileCode, className: "text-[#60a5fa]" },
+  m4a: { icon: IconFileAudio, className: "text-[#c084fc]" },
+  md: { icon: IconFileMarkdown, className: "text-[#86d9a3]" },
+  mdx: { icon: IconFileMarkdown, className: "text-[#86d9a3]" },
+  mjs: { icon: IconFileCode, className: "text-[#facc15]" },
+  mov: { icon: IconFileVideo, className: "text-[#fb7185]" },
+  mp3: { icon: IconFileAudio, className: "text-[#c084fc]" },
+  mp4: { icon: IconFileVideo, className: "text-[#fb7185]" },
+  ogg: { icon: IconFileAudio, className: "text-[#c084fc]" },
+  pdf: { icon: IconFileText, className: "text-[#f87171]" },
+  png: { icon: IconImageIcon, className: "text-[#f472b6]" },
+  ps1: { icon: IconTerminal, className: "text-[#60a5fa]" },
+  py: { icon: IconFileCode, className: "text-[#facc15]" },
+  rar: { icon: IconFileArchive, className: "text-[#a1a1aa]" },
+  rs: { icon: IconFileCode, className: "text-[#f97316]" },
+  sass: { icon: IconFileStyle, className: "text-[#f472b6]" },
+  scss: { icon: IconFileStyle, className: "text-[#f472b6]" },
+  sh: { icon: IconTerminal, className: "text-[#a1a1aa]" },
+  shader: { icon: IconFileCode, className: "text-[#a78bfa]" },
+  svg: { icon: IconImageIcon, className: "text-[#fb923c]" },
+  swift: { icon: IconFileCode, className: "text-[#fb923c]" },
+  tar: { icon: IconFileArchive, className: "text-[#a1a1aa]" },
+  tgz: { icon: IconFileArchive, className: "text-[#a1a1aa]" },
+  toml: { icon: IconFileConfig, className: "text-[#a78bfa]" },
+  ts: { icon: IconFileCode, className: "text-[#3b82f6]" },
+  tsx: { icon: IconFileCode, className: "text-[#38bdf8]" },
+  tsv: { icon: IconFileTable, className: "text-[#22c55e]" },
+  txt: { icon: IconFileText, className: "text-[#a1a1aa]" },
+  wav: { icon: IconFileAudio, className: "text-[#c084fc]" },
+  webm: { icon: IconFileVideo, className: "text-[#fb7185]" },
+  webp: { icon: IconImageIcon, className: "text-[#f472b6]" },
+  wgsl: { icon: IconFileCode, className: "text-[#a78bfa]" },
+  xls: { icon: IconFileTable, className: "text-[#22c55e]" },
+  xlsx: { icon: IconFileTable, className: "text-[#22c55e]" },
+  xml: { icon: IconFileCode, className: "text-[#f97316]" },
+  yaml: { icon: IconFileConfig, className: "text-[#a78bfa]" },
+  yml: { icon: IconFileConfig, className: "text-[#a78bfa]" },
+  zip: { icon: IconFileArchive, className: "text-[#a1a1aa]" },
+  zsh: { icon: IconTerminal, className: "text-[#a1a1aa]" },
+};
+
+function getFileExtension(name: string): string {
+  const dotIndex = name.lastIndexOf(".");
+  if (dotIndex <= 0 || dotIndex === name.length - 1) return "";
+  return name.slice(dotIndex + 1);
+}
+
+function getWorkspaceTreeIcon(node: FileNode, isExpanded: boolean) {
+  const lowerName = node.name.toLowerCase();
+
+  if (node.is_dir) {
+    return {
+      icon: isExpanded ? IconFolderOpen : IconFolder,
+      className: folderIconByName[lowerName] || "theme-text",
+    };
+  }
+
+  if (fileIconByName[lowerName]) return fileIconByName[lowerName];
+  if (lowerName.startsWith(".env") || lowerName.includes(".config.")) {
+    return { icon: IconFileConfig, className: "text-[#a78bfa]" };
+  }
+
+  return fileIconByExtension[getFileExtension(lowerName)] || defaultFileIcon;
 }
 
 export default function WorkspaceTreePanel({
@@ -143,6 +294,8 @@ export default function WorkspaceTreePanel({
     return nodes.map((node) => {
       const isExpanded = !!expandedPaths[node.path];
       const isLoading = !!loadingPaths[node.path];
+      const iconMeta = getWorkspaceTreeIcon(node, isExpanded);
+      const TreeIcon = iconMeta.icon;
 
       return (
         <div key={node.path}>
@@ -167,11 +320,7 @@ export default function WorkspaceTreePanel({
             ) : (
               <span className="h-3.5 w-3.5 shrink-0" />
             )}
-            {node.is_dir ? (
-              <IconFolder className="h-3.5 w-3.5 shrink-0 theme-text" />
-            ) : (
-              <IconFile className="h-3.5 w-3.5 shrink-0 text-[#71717a]" />
-            )}
+            <TreeIcon className={`${treeIconClass} ${iconMeta.className}`} />
             <span className="min-w-0 truncate font-mono">{node.name}</span>
             {isLoading && <span className="ml-auto text-[10px] text-[#71717a]">{copy.loading}</span>}
           </button>

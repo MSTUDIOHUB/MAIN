@@ -162,6 +162,121 @@ test("local Rust stream read errors fall back to a non-streaming request", async
   assert.deepEqual(invokeCalls.map((call) => call.command), ["start_chat_stream", "proxy_request"]);
 });
 
+test("local Rust streams convert cumulative text payloads into visible deltas", async () => {
+  const listeners = new Map();
+  const invokeCalls = [];
+  const listenMock = async (eventName, handler) => {
+    listeners.set(eventName, handler);
+    return () => listeners.delete(eventName);
+  };
+  const { streamChatCompletion } = await loadStreamingModule(async (command, args) => {
+    invokeCalls.push({ command, args });
+    assert.equal(command, "start_chat_stream");
+    const streamId = args.streamId;
+    queueMicrotask(() => {
+      for (const text of ["A", "AB", "ABC"]) {
+        listeners.get("chat-stream-chunk")?.({
+          payload: {
+            stream_id: streamId,
+            chunk: `data: ${JSON.stringify({ text })}\n\n`,
+          },
+        });
+      }
+      listeners.get("chat-stream-chunk")?.({
+        payload: {
+          stream_id: streamId,
+          chunk: "data: [DONE]\n\n",
+        },
+      });
+      listeners.get("chat-stream-done")?.({
+        payload: {
+          stream_id: streamId,
+          status: "success",
+        },
+      });
+    });
+    return undefined;
+  }, listenMock);
+
+  const tokens = [];
+  let doneCount = 0;
+  const result = await streamChatCompletion(
+    [{ role: "user", content: "继续" }],
+    {
+      baseUrl: "http://127.0.0.1:1234/v1",
+      apiKey: "not-needed",
+      model: "local-model",
+      provider: "LM Studio",
+      useRustProxy: true,
+    },
+    {
+      onToken: (token) => tokens.push(token),
+      onDone: () => { doneCount += 1; },
+      onError: (error) => { throw error; },
+    },
+  );
+
+  assert.equal(result.content, "ABC");
+  assert.deepEqual(tokens, ["A", "B", "C"]);
+  assert.equal(doneCount, 1);
+  assert.deepEqual(invokeCalls.map((call) => call.command), ["start_chat_stream"]);
+});
+
+test("local Rust streams convert cumulative reasoning payloads into thinking deltas", async () => {
+  const listeners = new Map();
+  const listenMock = async (eventName, handler) => {
+    listeners.set(eventName, handler);
+    return () => listeners.delete(eventName);
+  };
+  const { streamChatCompletion } = await loadStreamingModule(async (command, args) => {
+    assert.equal(command, "start_chat_stream");
+    const streamId = args.streamId;
+    queueMicrotask(() => {
+      for (const reasoning_content of ["A", "AB", "ABC"]) {
+        listeners.get("chat-stream-chunk")?.({
+          payload: {
+            stream_id: streamId,
+            chunk: `data: ${JSON.stringify({ choices: [{ message: { reasoning_content } }] })}\n\n`,
+          },
+        });
+      }
+      listeners.get("chat-stream-chunk")?.({
+        payload: {
+          stream_id: streamId,
+          chunk: `data: ${JSON.stringify({ choices: [{ delta: { content: "done" }, finish_reason: "stop" }] })}\n\n`,
+        },
+      });
+      listeners.get("chat-stream-done")?.({
+        payload: {
+          stream_id: streamId,
+          status: "success",
+        },
+      });
+    });
+    return undefined;
+  }, listenMock);
+
+  const tokens = [];
+  const result = await streamChatCompletion(
+    [{ role: "user", content: "继续" }],
+    {
+      baseUrl: "http://127.0.0.1:1234/v1",
+      apiKey: "not-needed",
+      model: "local-model",
+      provider: "LM Studio",
+      useRustProxy: true,
+    },
+    {
+      onToken: (token) => tokens.push(token),
+      onDone: () => {},
+      onError: (error) => { throw error; },
+    },
+  );
+
+  assert.equal(result.content, "<thinking>ABC</thinking>done");
+  assert.deepEqual(tokens, ["<thinking>", "A", "B", "C", "</thinking>", "done"]);
+});
+
 test("OpenAI Responses retries 524 failures with compact input while preserving reasoning effort", async () => {
   const requests = [];
   const { streamChatCompletion } = await loadStreamingModule(async (_command, args) => {

@@ -220,7 +220,7 @@ Plan Mode gates **writes**, not reads. It does NOT mean the AI must always produ
 **Plan Mode Rules:**
 1. Read-only tools → free to execute (no approval needed)
 2. Write operations → must wait for user "Start Execution" click
-3. Spec files in `.MAIN/plans/` → auto-created without approval, auto-deleted after execution
+3. Spec files in `.MAIN/plans/` → auto-created without approval when the workflow needs plan artifacts, preserved after execution, and deleted only by explicit user cleanup
 4. Source code must NEVER be written to `.MAIN/plans/`
 
 ## 7. Spec-Driven Three-Stage Protocol

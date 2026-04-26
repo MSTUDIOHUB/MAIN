@@ -32,23 +32,27 @@ const TURN_STATUS_LABELS: Record<string, string> = {
   awaiting_approval: "Awaiting Approval",
   awaiting_input: "Awaiting Choice",
   executing: "Executing",
+  completed_with_changes: "Changed",
+  stopped_no_action: "Stopped",
+  stopped_no_output: "No Output",
   paused: "Paused",
   done: "Done",
   error: "Error",
 };
 
-const AGENT_CONTENT_PREVIEW_CHARS = 180_000;
+const AGENT_CONTENT_PREVIEW_CHARS = 60_000;
+const STREAMING_AGENT_CONTENT_PREVIEW_CHARS = 16_000;
 
-function getDisplayAgentContent(content: string, showFull: boolean) {
+function getDisplayAgentContent(content: string, showFull: boolean, previewChars = AGENT_CONTENT_PREVIEW_CHARS) {
   const raw = String(content || "");
-  if (showFull || raw.length <= AGENT_CONTENT_PREVIEW_CHARS) {
+  if (showFull || raw.length <= previewChars) {
     return { content: raw, truncated: false, hiddenChars: 0 };
   }
 
   return {
-    content: raw.slice(0, AGENT_CONTENT_PREVIEW_CHARS),
+    content: raw.slice(0, previewChars),
     truncated: true,
-    hiddenChars: raw.length - AGENT_CONTENT_PREVIEW_CHARS,
+    hiddenChars: raw.length - previewChars,
   };
 }
 
@@ -71,6 +75,11 @@ function getTurnStatusTone(status: string): string {
       return "border-[rgba(251,191,36,0.25)] bg-[rgba(251,191,36,0.12)] text-[#fbbf24]";
     case "executing":
       return "border-[rgba(96,165,250,0.25)] bg-[rgba(96,165,250,0.12)] text-[#60a5fa]";
+    case "completed_with_changes":
+      return "border-[rgba(52,211,153,0.25)] bg-[rgba(52,211,153,0.12)] text-[#34d399]";
+    case "stopped_no_action":
+    case "stopped_no_output":
+      return "border-[rgba(251,191,36,0.25)] bg-[rgba(251,191,36,0.12)] text-[#fbbf24]";
     case "paused":
       return "border-[rgba(251,191,36,0.25)] bg-[rgba(251,191,36,0.12)] text-[#fbbf24]";
     case "done":
@@ -424,8 +433,16 @@ function getActiveTurnActivity(blocks: any[], turnStatus: string, language: "zh"
     return `Using tool: ${target}`;
   }
 
-  const hasStreamingThought = blocks.some((block) => block.type === "thought" && block.isStreaming);
-  if (hasStreamingThought) return language === "zh" ? "正在思考并整理下一步..." : "Thinking through the next step...";
+  const streamingThought = [...blocks].reverse().find((block) => block.type === "thought" && block.isStreaming);
+  if (streamingThought) {
+    const thoughtChars = String(streamingThought.content || "").length;
+    if (thoughtChars > 4_000) {
+      return language === "zh"
+        ? "后台思考内容较长，已折叠显示；正在等待可见回复或下一步动作..."
+        : "Long background thinking is folded while waiting for the visible reply or next action...";
+    }
+    return language === "zh" ? "正在整理下一步..." : "Thinking through the next step...";
+  }
 
   const hasStreamingAgent = blocks.some((block) => block.type === "agent" && block.streaming);
   if (hasStreamingAgent) return language === "zh" ? "正在生成回复..." : "Writing the response...";
@@ -441,6 +458,61 @@ function TurnActivityNotice({ text }: { text: string }) {
     <div className="ml-9 flex items-center gap-2 rounded-2xl border border-[rgba(96,165,250,0.2)] bg-[rgba(37,99,235,0.08)] px-4 py-3 text-[12px] text-[#bfdbfe]">
       <span className="h-2 w-2 rounded-full bg-[#60a5fa] shadow-[0_0_8px_rgba(96,165,250,0.8)] animate-pulse" />
       <span>{text}</span>
+    </div>
+  );
+}
+
+function ThoughtBlock({ block, language }: { block: any; language: "zh" | "en" }) {
+  const [isExpanded, setIsExpanded] = useState(false);
+  const rawContent = String(block.content || "").trim();
+  if (!rawContent) return null;
+
+  const preview = getDisplayAgentContent(rawContent, isExpanded, 20_000);
+  const title = block.isStreaming
+    ? language === "zh" ? "后台思考中" : "Background Thinking"
+    : language === "zh" ? "后台思考已折叠" : "Background Thinking Folded";
+  const metaParts: string[] = [];
+  metaParts.push(language === "zh" ? `${rawContent.length.toLocaleString()} 字符` : `${rawContent.length.toLocaleString()} chars`);
+  if (typeof block.duration === "number" && block.duration > 0) {
+    metaParts.push(language === "zh" ? `${block.duration}s` : `${block.duration}s`);
+  }
+
+  return (
+    <div className="ml-9 flex min-w-0 max-w-full">
+      <div className="min-w-0 flex-1 rounded-2xl border border-[#27272a] bg-[#07070a] px-4 py-3 text-left">
+        <button
+          type="button"
+          onClick={() => setIsExpanded((value) => !value)}
+          className="flex w-full min-w-0 items-center gap-3 text-left"
+        >
+          {isExpanded ? (
+            <IconChevronDown className="h-4 w-4 shrink-0 text-[#71717a]" />
+          ) : (
+            <IconChevronRight className="h-4 w-4 shrink-0 text-[#71717a]" />
+          )}
+          <span className="min-w-0 flex-1">
+            <span className="block text-[12px] font-medium text-[#d4d4d8]">{title}</span>
+            <span className="mt-0.5 block truncate text-[11px] text-[#71717a]">
+              {metaParts.join(" · ")}
+            </span>
+          </span>
+          {block.isStreaming && (
+            <span className="h-2 w-2 shrink-0 rounded-full bg-[#60a5fa] shadow-[0_0_8px_rgba(96,165,250,0.8)] animate-pulse" />
+          )}
+        </button>
+        {isExpanded && (
+          <div className="mt-3 max-h-[360px] min-w-0 overflow-auto rounded-xl border border-[#1f1f23] bg-[#050507] p-3">
+            <pre className="m-0 whitespace-pre-wrap break-words font-mono text-[11px] leading-5 text-[#a1a1aa]">
+              {preview.content}
+              {preview.truncated
+                ? language === "zh"
+                  ? `\n\n...已隐藏 ${preview.hiddenChars.toLocaleString()} 个字符`
+                  : `\n\n...${preview.hiddenChars.toLocaleString()} chars hidden`
+                : ""}
+            </pre>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -524,39 +596,47 @@ function AgentContentBlock({
   isStreaming: boolean;
 }) {
   const rawContent = String(block.content || "");
-  const isLongContent = rawContent.length > AGENT_CONTENT_PREVIEW_CHARS;
+  const previewLimit = block.streaming ? STREAMING_AGENT_CONTENT_PREVIEW_CHARS : AGENT_CONTENT_PREVIEW_CHARS;
+  const isLongContent = rawContent.length > previewLimit;
   const [showFullLongContent, setShowFullLongContent] = useState(false);
   const [isArchivedExpanded, setIsArchivedExpanded] = useState(false);
-  const displayContent = getDisplayAgentContent(rawContent, isLongContent && showFullLongContent && !block.streaming);
-  const segments = parseMessageContent(displayContent.content);
+  const displayContent = getDisplayAgentContent(rawContent, isLongContent && showFullLongContent && !block.streaming, previewLimit);
+  const streamingText = block.streaming ? sanitizeAIOutput(displayContent.content) : "";
+  const segments = useMemo(
+    () => block.streaming ? [] : parseMessageContent(displayContent.content),
+    [block.streaming, displayContent.content],
+  );
   const hasVisibleContent =
+    (block.streaming && streamingText.length > 0) ||
     segments.some((seg) => (seg.type === "text" ? sanitizeAIOutput(seg.content).length > 0 : true)) ||
     isLongContent ||
     (Array.isArray(block.options) && block.options.length > 0);
+  const archivedPreviewText = useMemo(() => segments
+      .filter((seg) => seg.type === "text")
+      .map((seg) => sanitizeAIOutput(seg.content))
+      .filter(Boolean)
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim(),
+    [segments],
+  );
 
   if (!hasVisibleContent) return null;
 
-  const previewCharCount = Math.min(rawContent.length, AGENT_CONTENT_PREVIEW_CHARS).toLocaleString();
+  const previewCharCount = Math.min(rawContent.length, previewLimit).toLocaleString();
   const totalCharCount = rawContent.length.toLocaleString();
   const isArchivedAfterChoice = block.archivedAfterChoice && !block.streaming;
   const archivedTitle = language === "zh" ? "已保留上一步反馈" : "Previous reply kept";
   const archivedAction = language === "zh" ? "展开回看" : "Expand";
   const archivedCollapse = language === "zh" ? "收起反馈" : "Collapse";
   const selectedOptionText = String(block.selectedOption || "").trim();
-  const archivedPreviewText = segments
-    .filter((seg) => seg.type === "text")
-    .map((seg) => sanitizeAIOutput(seg.content))
-    .filter(Boolean)
-    .join(" ")
-    .replace(/\s+/g, " ")
-    .trim();
   const archivedPreview = archivedPreviewText.length > 150
     ? `${archivedPreviewText.slice(0, 150).trim()}...`
     : archivedPreviewText;
 
   if (isArchivedAfterChoice && !isArchivedExpanded) {
     return (
-      <div className="mt-4 flex w-full justify-start">
+      <div className="mt-4 flex w-full min-w-0 items-start justify-start gap-3">
         <div className="mt-1 flex-shrink-0">
           <IconLogoM className="theme-text h-6 w-6 drop-shadow-[0_0_8px_var(--accent-subtle)]" />
         </div>
@@ -564,14 +644,14 @@ function AgentContentBlock({
           type="button"
           data-testid="archived-choice-feedback"
           onClick={() => setIsArchivedExpanded(true)}
-          className="my-2 flex w-full items-center gap-3 rounded-2xl border border-[#1f1f23] bg-[#07070a] px-4 py-3 text-left transition-colors hover:border-[#34343b] hover:bg-[#09090b]"
+          className="my-2 flex min-w-0 flex-1 items-center gap-3 rounded-2xl border border-[#1f1f23] bg-[#07070a] px-4 py-3 text-left transition-colors hover:border-[#34343b] hover:bg-[#09090b]"
         >
           <IconChevronRight className="h-4 w-4 shrink-0 text-[#71717a]" />
           <span className="min-w-0 flex-1">
             <span className="flex flex-wrap items-center gap-2">
               <span className="text-[12px] font-medium text-[#d4d4d8]">{archivedTitle}</span>
               {selectedOptionText && (
-                <span className="max-w-full truncate rounded-full border border-[rgba(52,211,153,0.22)] bg-[rgba(52,211,153,0.08)] px-2 py-0.5 text-[10px] text-[#86efac]">
+                <span className="max-w-full truncate rounded-full border border-[rgba(52,211,153,0.22)] bg-[rgba(52,211,153,0.08)] px-2 py-0.5 text-[10px] text-[#86efac] sm:max-w-[70%]">
                   {language === "zh" ? `已选择：${selectedOptionText}` : `Selected: ${selectedOptionText}`}
                 </span>
               )}
@@ -589,11 +669,11 @@ function AgentContentBlock({
   }
 
   return (
-    <div className="mt-4 flex w-full justify-start">
+    <div className="mt-4 flex w-full min-w-0 items-start justify-start gap-3">
       <div className="mt-1 flex-shrink-0">
         <IconLogoM className="theme-text h-6 w-6 drop-shadow-[0_0_8px_var(--accent-subtle)]" />
       </div>
-      <div className="chat-agent-content my-2 w-full bg-[#09090b]/60 px-5 py-4 text-[#e4e4e7] shadow-sm" style={{ fontSize: `${chatFontSize}px` }}>
+      <div className="chat-agent-content my-2 min-w-0 flex-1 bg-[#09090b]/60 px-5 py-4 text-[#e4e4e7] shadow-sm" style={{ fontSize: `${chatFontSize}px` }}>
         {isArchivedAfterChoice && (
           <div data-testid="archived-choice-feedback-expanded" className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-[#27272a] bg-[#050507] px-3 py-2">
             <div className="min-w-0 flex flex-wrap items-center gap-2">
@@ -614,17 +694,23 @@ function AgentContentBlock({
             </button>
           </div>
         )}
-        {segments.map((seg, segIdx) => {
-          if (seg.type === "thought") {
-            return null;
-          }
-          if (seg.type === "plan") {
-            return <JobListCard key={`${block.id}-plan-${segIdx}`} jobs={seg.jobs} />;
-          }
-          const cleanText = sanitizeAIOutput(seg.content);
-          if (!cleanText) return null;
-          return <MarkdownRenderer key={`${block.id}-text-${segIdx}`} content={cleanText} baseFontSize={chatFontSize} />;
-        })}
+        {block.streaming ? (
+          <div className="whitespace-pre-wrap break-words leading-relaxed text-[#e4e4e7]">
+            {streamingText}
+          </div>
+        ) : (
+          segments.map((seg, segIdx) => {
+            if (seg.type === "thought") {
+              return null;
+            }
+            if (seg.type === "plan") {
+              return <JobListCard key={`${block.id}-plan-${segIdx}`} jobs={seg.jobs} />;
+            }
+            const cleanText = sanitizeAIOutput(seg.content);
+            if (!cleanText) return null;
+            return <MarkdownRenderer key={`${block.id}-text-${segIdx}`} content={cleanText} baseFontSize={chatFontSize} />;
+          })
+        )}
         {isLongContent && (
           <div className="mt-4 rounded-md border border-[#27272a] bg-[#050507] px-3 py-2 text-[12px] leading-5 text-[#a1a1aa]">
             <div>
@@ -731,7 +817,7 @@ export default function ChatArea({
     collapsedSummary: language === "zh" ? "本轮过程已折叠，结论会优先保留在这里。" : "This turn is collapsed. The conclusion is kept here first.",
     expandHistory: (count: number) => language === "zh" ? `展开 ${count} 条过程记录` : `Expand ${count} process item(s)`,
     turnStatusLabels: language === "zh"
-      ? { planning: "规划中", awaiting_approval: "待审批", awaiting_input: "待选择", executing: "执行中", paused: "已暂停", done: "完成", error: "错误" }
+      ? { planning: "规划中", awaiting_approval: "待审批", awaiting_input: "待选择", executing: "执行中", completed_with_changes: "已写入", stopped_no_action: "已停止无变更", stopped_no_output: "无输出", paused: "已暂停", done: "完成", error: "错误" }
       : TURN_STATUS_LABELS,
     turnIntentLabels: language === "zh"
       ? { discuss: "讨论", execute: "执行", plan: "规划", summarize: "总结", report: "报告", studio_workflow: "工作流" }
@@ -978,6 +1064,7 @@ export default function ChatArea({
   const shouldShowTopIslandNormally =
     !!topIslandTurn &&
     topIslandTurnStatusKey !== "done" &&
+    topIslandTurnStatusKey !== "completed_with_changes" &&
     (hasTopIslandCommandContext || hasTopIslandTaskContext);
   const shouldShowTopIsland =
     (!!topIslandTurn || !!pendingRunDecision) &&
@@ -1147,7 +1234,7 @@ export default function ChatArea({
     }
 
     if (block.type === "thought") {
-      return null;
+      return <ThoughtBlock key={`${block.id}-${index}`} block={block} language={language} />;
     }
 
     if (block.type === "jobList") {
@@ -1233,7 +1320,11 @@ export default function ChatArea({
     // Only show the PlanShortcutCard when the plan is truly complete — not
     // while it's still being generated. The card replaces all detailed blocks,
     // so it must only appear once the model has finished working on this turn.
-    const planTurnFinished = turn.status === "done" || turn.status === "awaiting_approval" || isPlanApproved;
+    const planTurnFinished =
+      turn.status === "done" ||
+      turn.status === "completed_with_changes" ||
+      turn.status === "awaiting_approval" ||
+      isPlanApproved;
     const hasCompletePlan = hasPlanContent && planTurnFinished;
     const finalAgentSummaryText = getLastAgentSummaryText(blocks);
     const toolExecutionSummary = buildToolExecutionSummary(blocks, language);
@@ -1316,7 +1407,7 @@ export default function ChatArea({
             <div className="ml-9">
               <TurnSummaryCard
                 turn={turn}
-                hiddenCount={turn.status === "done" ? collapsedProcessCount : hiddenCount}
+                hiddenCount={(turn.status === "done" || turn.status === "completed_with_changes") ? collapsedProcessCount : hiddenCount}
                 fallbackSummary={finalAgentSummaryText || toolExecutionSummary}
                 onOpenPlan={isPlanTurn && hasPlanPanelContent && hasPlanContent ? () => openRightPanelTab("plan") : undefined}
                 onExpand={() => toggleConversationTurnCollapsed(turn.id)}

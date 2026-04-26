@@ -79,6 +79,18 @@ const READ_ONLY_TASK_CUE_PATTERNS = [
   /analy(?:s|z)e/i,
 ];
 
+function looksLikeGeneratedCodeDump(text: string): boolean {
+  if (text.length < 4_000) return false;
+  const fenceCount = (text.match(/```/g) ?? []).length;
+  const fileMarkerCount = (
+    text.match(/(?:^|\n)\s*(?:#{1,4}\s*)?(?:文件|File)\s*[:：]\s*[\w./ -]+\.(?:cs|ts|tsx|js|jsx|json|css|html|md)\b/gi) ?? []
+  ).length;
+  const codeKeywordCount = (
+    text.match(/\b(?:using|namespace|public|private|protected|internal|class|struct|interface|enum|function|const|let|var|import|export)\b/g) ?? []
+  ).length;
+  return fenceCount >= 4 || fileMarkerCount >= 2 || (text.length >= 12_000 && codeKeywordCount >= 20);
+}
+
 export function resolveMissingToolCallRepromptKind(input: {
   workflowMode: WorkflowModeLike;
   visibleText: string;
@@ -90,6 +102,7 @@ export function resolveMissingToolCallRepromptKind(input: {
 
   const hasGenericIntent = GENERIC_INTENT_PATTERNS.some((pattern) => pattern.test(text));
   if (!isChatLike) {
+    if (looksLikeGeneratedCodeDump(text)) return "generic";
     return hasGenericIntent ? "generic" : "none";
   }
 

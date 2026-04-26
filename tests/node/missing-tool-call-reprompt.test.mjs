@@ -97,6 +97,36 @@ test("execute mode still reprompts generic text-only intent stubs", () => {
   assert.equal(kind, "generic");
 });
 
+test("execute mode reprompts when model dumps code in chat instead of tools", () => {
+  const codeBlock = `
+文件：Assets/Scripts/Battle/BattleUnit.cs
+\`\`\`csharp
+using UnityEngine;
+namespace Battle {
+public class BattleUnit : MonoBehaviour {
+${Array.from({ length: 120 }, (_, index) => `  public int Field${index};`).join("\n")}
+}
+}
+\`\`\`
+
+文件：Assets/Scripts/Battle/Commands/BattleCommand.cs
+\`\`\`csharp
+namespace Battle.Commands {
+public class BattleCommand {
+${Array.from({ length: 120 }, (_, index) => `  public void Execute${index}() { }`).join("\n")}
+}
+}
+\`\`\`
+`;
+  const kind = resolveMissingToolCallRepromptKind({
+    workflowMode: "edit",
+    nexusModeKey: "nexus_build",
+    visibleText: codeBlock,
+  });
+
+  assert.equal(kind, "generic");
+});
+
 test("read-only continuation prompt tells the model to start tools immediately", () => {
   const prompt = buildMissingToolCallContinuationPrompt("read_only", "zh");
 

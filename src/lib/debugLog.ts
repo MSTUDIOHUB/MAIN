@@ -28,6 +28,7 @@ interface DebugLogWindow extends Window {
   __MAIN_DEBUG_LOG_CAPTURE_INSTALLED__?: boolean;
   __MAIN_NATIVE_CONSOLE__?: {
     debug: (...args: unknown[]) => void;
+    info: (...args: unknown[]) => void;
     log: (...args: unknown[]) => void;
     warn: (...args: unknown[]) => void;
     error: (...args: unknown[]) => void;
@@ -37,6 +38,7 @@ interface DebugLogWindow extends Window {
 const debugWindow = typeof window !== "undefined" ? (window as DebugLogWindow) : null;
 const nativeConsole = debugWindow?.__MAIN_NATIVE_CONSOLE__ ?? {
   debug: console.debug.bind(console) as (...args: unknown[]) => void,
+  info: console.info.bind(console) as (...args: unknown[]) => void,
   log: console.log.bind(console) as (...args: unknown[]) => void,
   warn: console.warn.bind(console) as (...args: unknown[]) => void,
   error: console.error.bind(console) as (...args: unknown[]) => void,
@@ -283,6 +285,7 @@ export function installDebugLogCapture() {
   };
 
   console.debug = wrapConsole("debug", nativeConsole.debug);
+  console.info = wrapConsole("info", nativeConsole.info);
   console.log = wrapConsole("info", nativeConsole.log);
   console.warn = wrapConsole("warn", nativeConsole.warn);
   console.error = wrapConsole("error", nativeConsole.error);

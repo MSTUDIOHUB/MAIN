@@ -85,6 +85,16 @@ test("explicit English implementation request resolves to execute", () => {
   assert.equal(result.needsDecision, undefined);
 });
 
+test("complex multi-file generation routes to plan before execution", () => {
+  const result = resolveTurnRunIntent(
+    "生成一套游戏框架代码包括文件夹，实现《歧路旅人》CTB回合制战斗逻辑。",
+    createContext(),
+  );
+  assert.equal(result.intent, "plan");
+  assert.equal(result.needsDecision, undefined);
+  assert.equal(result.riskLevel, "high");
+});
+
 test("explicit analysis requests resolve to analyze", () => {
   const result = resolveTurnRunIntent("请仔细检查验证这段指令通信链路", createContext());
   assert.equal(result.intent, "analyze");

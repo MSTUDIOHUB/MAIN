@@ -1410,7 +1410,6 @@ export function getE2EQuickReplyHandler(): ((text: string, sourceTurnId?: string
                 ...turn,
                 status: "done",
                 summary: "用户完成选择后，当前回合已继续并保留上下文。",
-                collapsed: true,
                 blockIds: turn.blockIds.includes(assistantBlockId)
                   ? turn.blockIds
                   : [...turn.blockIds, assistantBlockId],

@@ -5,6 +5,7 @@ const OPTION_RE = /<option(?:\s+label="([^"]*)")?>([\s\S]*?)<\/option>/gi;
 const DECISION_CUE_RE = /(?:请选择|请确认|请告诉我|请说明|你可以选择|可选方案|下一步可以|选一个|选一项|任选其一|从下面.*选|would you like|do you want|please choose|please confirm|choose one|pick one|select one)/i;
 const ENUM_OPTION_RE = /^\s*(?:[-*]|(?:\d+|[A-Za-z])[\.\)、:：])\s+(.+?)\s*$/;
 const BINARY_SEPARATOR_RE = /\s*(?:，|,)?\s*(或者|还是|或是|\bor\b)\s*/i;
+const ENUMERATED_LINE_RE = /^\s*(?:[-*]|(?:\d+|[A-Za-z])[\.\)、:：])\s+/;
 
 function normalizeOptionText(text: string): string {
   return text.replace(/\s+/g, " ").trim();
@@ -63,7 +64,9 @@ function convertAssistantClauseToUserChoice(clause: string): string {
   }
 
   normalized = normalized
+    .replace(/^(?:您|你)?(?:想|希望|要)?(?:让我|要我|叫我)/, "")
     .replace(/^(?:您|你)?是否希望我/, "")
+    .replace(/^(?:是否需要|是否要|要不要|是否)/, "")
     .replace(/^(?:Would you like me to|Do you want me to)\s+/i, "")
     .replace(/^(?:Please let me know whether you want me to)\s+/i, "")
     .replace(/^根据我的经验/, "根据你的经验")
@@ -80,6 +83,13 @@ function convertAssistantClauseToUserChoice(clause: string): string {
   }
 
   return normalized;
+}
+
+function hasMultipleEnumeratedLines(text: string): boolean {
+  return text
+    .split(/\r?\n/)
+    .filter((line) => ENUMERATED_LINE_RE.test(line))
+    .length > 1;
 }
 
 function inferReplyOptionsFromEnumeratedChoices(
@@ -127,6 +137,7 @@ function inferReplyOptionsFromBinaryChoice(
   for (let i = paragraphs.length - 1; i >= 0; i--) {
     const paragraph = paragraphs[i];
     if (!BINARY_SEPARATOR_RE.test(paragraph)) continue;
+    if (hasMultipleEnumeratedLines(paragraph)) continue;
     if (!/[？?]$/.test(paragraph) && !DECISION_CUE_RE.test(paragraph)) continue;
 
     BINARY_SEPARATOR_RE.lastIndex = 0;

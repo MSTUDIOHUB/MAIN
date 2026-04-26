@@ -143,3 +143,27 @@ test("extractReplyOptions infers binary choices from plain-language clarificatio
   assert.equal(result.replyOptions[0].value, "我来确认数据ID映射和特征集定义");
   assert.match(result.replyOptions[1].value, /^请根据你的经验/);
 });
+
+test("extractReplyOptions avoids malformed buttons from numbered binary question lists", () => {
+  const result = extractReplyOptions(`
+需要用户拍板的选项：
+
+1. 是否使用现有的事件系统架构，还是改用更简洁的委托方式？
+2. 是否需要在UI层使用MVVM模式，还是直接使用事件驱动？
+3. 是否需要支持多人联机战斗，还是仅本地单人战斗？
+  `);
+
+  assert.equal(result.replyOptions.length, 0);
+  assert.match(result.cleanText, /是否使用现有的事件系统架构/);
+});
+
+test("extractReplyOptions normalizes single binary choices to user-clickable actions", () => {
+  const result = extractReplyOptions(`
+你想让我使用现有事件系统，还是改用更简洁的委托方式？
+  `);
+
+  assert.deepEqual(
+    result.replyOptions.map((option) => option.value),
+    ["使用现有事件系统", "改用更简洁的委托方式"],
+  );
+});

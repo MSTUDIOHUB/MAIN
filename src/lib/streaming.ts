@@ -168,14 +168,18 @@ function extractTextLike(value: unknown): string {
     .join("");
 }
 
+type OpenAiCompatibleContentMode = "delta" | "cumulative" | "none";
+
 function extractOpenAiCompatibleDelta(payload: unknown): {
   content: string;
+  contentMode: OpenAiCompatibleContentMode;
   reasoning: string;
+  reasoningMode: OpenAiCompatibleContentMode;
   finishReason: "stop" | "length" | "tool_calls" | null;
   toolCalls: unknown[];
 } {
   if (!payload || typeof payload !== "object") {
-    return { content: "", reasoning: "", finishReason: null, toolCalls: [] };
+    return { content: "", contentMode: "none", reasoning: "", reasoningMode: "none", finishReason: null, toolCalls: [] };
   }
 
   const root = payload as Record<string, unknown>;
@@ -187,6 +191,14 @@ function extractOpenAiCompatibleDelta(payload: unknown): {
     ? choice.message as Record<string, unknown>
     : undefined;
   const source = delta ?? message ?? root;
+  const deltaContent = extractTextLike(delta?.content ?? delta?.text);
+  const messageContent = extractTextLike(message?.content ?? message?.text);
+  const rootContent = extractTextLike(root.content ?? root.text ?? root.response);
+  const content = deltaContent || messageContent || rootContent;
+  const deltaReasoning = extractTextLike(delta?.reasoning_content ?? delta?.reasoning ?? delta?.thinking ?? delta?.thought);
+  const messageReasoning = extractTextLike(message?.reasoning_content ?? message?.reasoning ?? message?.thinking ?? message?.thought);
+  const rootReasoning = extractTextLike(root.reasoning_content ?? root.reasoning ?? root.thinking ?? root.thought);
+  const reasoning = deltaReasoning || messageReasoning || rootReasoning;
   const rawFinishReason = choice?.finish_reason ?? root.done_reason;
   const normalizedFinishReason = rawFinishReason === "length" || rawFinishReason === "tool_calls" || rawFinishReason === "stop"
     ? rawFinishReason
@@ -195,11 +207,43 @@ function extractOpenAiCompatibleDelta(payload: unknown): {
       : null;
 
   return {
-    content: extractTextLike(source.content ?? source.text ?? root.response),
-    reasoning: extractTextLike(source.reasoning_content ?? source.reasoning ?? source.thinking ?? source.thought),
+    content,
+    contentMode: deltaContent ? "delta" : content ? "cumulative" : "none",
+    reasoning,
+    reasoningMode: deltaReasoning ? "delta" : reasoning ? "cumulative" : "none",
     finishReason: normalizedFinishReason,
     toolCalls: Array.isArray(source.tool_calls) ? source.tool_calls : [],
   };
+}
+
+function resolveOpenAiCompatibleDeltaText(
+  content: string,
+  contentMode: OpenAiCompatibleContentMode,
+  emittedText: string,
+): { delta: string; emittedText: string } {
+  if (!content) return { delta: "", emittedText };
+  if (contentMode !== "cumulative") {
+    return { delta: content, emittedText: emittedText + content };
+  }
+  if (content === emittedText) return { delta: "", emittedText };
+  if (content.startsWith(emittedText)) {
+    return { delta: content.slice(emittedText.length), emittedText: content };
+  }
+  return { delta: content, emittedText: emittedText + content };
+}
+
+function resolveOpenAiCompatibleTextDelta(
+  extracted: ReturnType<typeof extractOpenAiCompatibleDelta>,
+  emittedText: string,
+): { delta: string; emittedText: string } {
+  return resolveOpenAiCompatibleDeltaText(extracted.content, extracted.contentMode, emittedText);
+}
+
+function resolveOpenAiCompatibleReasoningDelta(
+  extracted: ReturnType<typeof extractOpenAiCompatibleDelta>,
+  emittedReasoning: string,
+): { delta: string; emittedText: string } {
+  return resolveOpenAiCompatibleDeltaText(extracted.reasoning, extracted.reasoningMode, emittedReasoning);
 }
 
 /** Extract base64 images from multimodal content array (without data URL prefix). */
@@ -638,6 +682,8 @@ async function streamViaRustProxy(
 
   // Accumulate results
   let fullContent = "";
+  let emittedOpenAiCompatibleText = "";
+  let emittedOpenAiCompatibleReasoning = "";
   let finishReason: "stop" | "length" | "tool_calls" | null = null;
   const toolCallsMap = new Map<number, StreamedToolCall>();
 
@@ -660,6 +706,20 @@ async function streamViaRustProxy(
 
   /** Check whether a string consists entirely of '?' (garbled reasoning) */
   const isGarbled = (s: string) => /^[?]+$/.test(s);
+
+  const openReasoningBlock = () => {
+    if (reasoningActive) return;
+    reasoningActive = true;
+    fullContent += "<thinking>";
+    onToken("<thinking>");
+  };
+
+  const closeReasoningBlock = () => {
+    if (!reasoningActive) return;
+    reasoningActive = false;
+    fullContent += "</thinking>";
+    onToken("</thinking>");
+  };
 
   const processSseChunk = (rawChunk: string) => {
     if (anthropicProcessor) {
@@ -700,10 +760,15 @@ async function streamViaRustProxy(
           // Handle reasoning_content from thinking models (Qwen3.5, DeepSeek-R1, etc.)
           // Buffer tokens until we can verify they're not garbled "?" output
           // from a llama.cpp server that can't decode the thinking tokens.
-          const reasoningDelta = extracted.reasoning;
+          const resolvedReasoning = resolveOpenAiCompatibleReasoningDelta(extracted, emittedOpenAiCompatibleReasoning);
+          emittedOpenAiCompatibleReasoning = resolvedReasoning.emittedText;
+          const reasoningDelta = resolvedReasoning.delta;
           if (reasoningDelta && !reasoningGarbled) {
             if (reasoningEmitted) {
-              // Already verified as legitimate — emit directly
+              // Already verified as legitimate — emit directly into the
+              // hidden reasoning block. Keep the final StreamResult tagged so
+              // normalization does not promote reasoning into visible text.
+              openReasoningBlock();
               fullContent += reasoningDelta;
               onToken(reasoningDelta);
             } else {
@@ -712,8 +777,7 @@ async function streamViaRustProxy(
               if (!isGarbled(reasoningBuffer)) {
                 // Content contains real characters — flush buffer + emit
                 reasoningEmitted = true;
-                reasoningActive = true;
-                onToken("<thinking>");
+                openReasoningBlock();
                 fullContent += reasoningBuffer;
                 onToken(reasoningBuffer);
                 reasoningBuffer = "";
@@ -739,13 +803,12 @@ async function streamViaRustProxy(
           }
 
           // Handle regular content
-          const textDelta = extracted.content;
+          const resolvedText = resolveOpenAiCompatibleTextDelta(extracted, emittedOpenAiCompatibleText);
+          emittedOpenAiCompatibleText = resolvedText.emittedText;
+          const textDelta = resolvedText.delta;
           if (textDelta) {
             // Close reasoning block if we were in one
-            if (reasoningActive) {
-              reasoningActive = false;
-              onToken("</thinking>");
-            }
+            closeReasoningBlock();
             fullContent += textDelta;
             onToken(textDelta);
           }
@@ -850,10 +913,7 @@ async function streamViaRustProxy(
         rejectResult?.(err);
       } else {
         // Close any unclosed reasoning block before finalizing
-        if (reasoningActive) {
-          reasoningActive = false;
-          onToken("</thinking>");
-        }
+        closeReasoningBlock();
         // If reasoning was still buffered (never emitted, never garbled-detected),
         // it was too short to decide — discard it silently.
         reasoningBuffer = "";
@@ -1036,6 +1096,8 @@ export async function streamChatCompletion(
 
   // Accumulate text content
   let fullContent = "";
+  let emittedOpenAiCompatibleText = "";
+  let emittedOpenAiCompatibleReasoning = "";
 
   // Track finish_reason from the stream
   let finishReason: "stop" | "length" | "tool_calls" | null = null;
@@ -1047,6 +1109,20 @@ export async function streamChatCompletion(
   let reasoningEmitted = false;
   let reasoningGarbled = false;
   const isGarbled = (s: string) => /^[?]+$/.test(s);
+
+  const openReasoningBlock = () => {
+    if (reasoningActive) return;
+    reasoningActive = true;
+    fullContent += "<thinking>";
+    onToken("<thinking>");
+  };
+
+  const closeReasoningBlock = () => {
+    if (!reasoningActive) return;
+    reasoningActive = false;
+    fullContent += "</thinking>";
+    onToken("</thinking>");
+  };
 
   // Accumulate tool calls across deltas, keyed by index
   const toolCallsMap = new Map<number, StreamedToolCall>();
@@ -1110,17 +1186,19 @@ export async function streamChatCompletion(
 
             // Handle reasoning_content from thinking models (Qwen3.5, DeepSeek-R1, etc.)
             // Buffer tokens until we can verify they're not garbled "?" output
-            const reasoningDelta = extracted.reasoning;
+            const resolvedReasoning = resolveOpenAiCompatibleReasoningDelta(extracted, emittedOpenAiCompatibleReasoning);
+            emittedOpenAiCompatibleReasoning = resolvedReasoning.emittedText;
+            const reasoningDelta = resolvedReasoning.delta;
             if (reasoningDelta && !reasoningGarbled) {
               if (reasoningEmitted) {
+                openReasoningBlock();
                 fullContent += reasoningDelta;
                 onToken(reasoningDelta);
               } else {
                 reasoningBuffer += reasoningDelta;
                 if (!isGarbled(reasoningBuffer)) {
                   reasoningEmitted = true;
-                  reasoningActive = true;
-                  onToken("<thinking>");
+                  openReasoningBlock();
                   fullContent += reasoningBuffer;
                   onToken(reasoningBuffer);
                   reasoningBuffer = "";
@@ -1140,13 +1218,12 @@ export async function streamChatCompletion(
             }
 
             // Handle text content deltas
-            const textDelta = extracted.content;
+            const resolvedText = resolveOpenAiCompatibleTextDelta(extracted, emittedOpenAiCompatibleText);
+            emittedOpenAiCompatibleText = resolvedText.emittedText;
+            const textDelta = resolvedText.delta;
             if (textDelta) {
               // Close reasoning block if we were in one
-              if (reasoningActive) {
-                reasoningActive = false;
-                onToken("</thinking>");
-              }
+              closeReasoningBlock();
               fullContent += textDelta;
               onToken(textDelta);
             }
@@ -1212,8 +1289,10 @@ export async function streamChatCompletion(
         if (!d) continue;
         try {
           const json = JSON.parse(d);
-          const delta = json.choices?.[0]?.delta;
-          const contentDelta = extractTextLike(delta?.content ?? delta?.text);
+          const extracted = extractOpenAiCompatibleDelta(json);
+          const resolvedText = resolveOpenAiCompatibleTextDelta(extracted, emittedOpenAiCompatibleText);
+          emittedOpenAiCompatibleText = resolvedText.emittedText;
+          const contentDelta = resolvedText.delta;
           if (contentDelta) {
             fullContent += contentDelta;
             onToken(contentDelta);
@@ -1224,10 +1303,7 @@ export async function streamChatCompletion(
   }
 
   // Close any unclosed reasoning block
-  if (reasoningActive) {
-    reasoningActive = false;
-    onToken("</thinking>");
-  }
+  closeReasoningBlock();
   // Discard any buffered (never-verified) reasoning content
   reasoningBuffer = "";
 

@@ -90,7 +90,7 @@ MAIN/
 │   ├── Cargo.toml
 │   └── tauri.conf.json
 ├── .MAIN/                      # Project metadata (hidden)
-│   ├── plans/                  # Spec files (auto-created, auto-deleted)
+│   ├── plans/                  # Spec files (auto-created, user-deleted)
 │   └── steering/               # Project conventions (optional)
 └── dist/                       # Build output
 ```
@@ -130,7 +130,7 @@ User Input → Composer → useAppStore.sendMessage()
    Auto-execute    requestReview()  waitForPlanApproval  → idle
    (concurrent)    (ActionCard)     (PlanReviewBlock)
         ↓                ↓           ↓ (approved)
-   tool result     user decision   deletePlanFiles()
+   tool result     user decision   preserved plan files
         ↓                ↓           ↓
         └────── appendMessage() ──────┘
                       ↓

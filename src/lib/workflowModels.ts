@@ -61,6 +61,9 @@ export type ConversationTurnStatus =
   | "awaiting_approval"
   | "awaiting_input"
   | "executing"
+  | "completed_with_changes"
+  | "stopped_no_action"
+  | "stopped_no_output"
   | "done"
   | "error";
 
