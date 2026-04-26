@@ -15,7 +15,6 @@ import {
   GLOBAL_CHAT_KEY,
   type TaskBlock,
   resolveSessionWorkspaceKey,
-  safeJsonStringify,
   sanitizeAgentMessagesForPersist,
   sanitizeTaskBlocksForPersist,
   syncTaskIdCounterFromBlocks,
@@ -27,6 +26,7 @@ import { MAIN_MODE_KEYS, mapLegacyNexusModeToMainMode, mapMainModeToLegacyNexusM
 import { resolveConversationTurnIntent } from "./lib/runIntent";
 import { runAfterNextPaint } from "./lib/uiScheduling";
 import { normalizeConversationDisplayTitle } from "./lib/workflowModels";
+import { appendDebugLog } from "./lib/debugLog";
 
 // ==========================================
 // MAIN APP COMPONENT
@@ -127,44 +127,39 @@ export default function App() {
   const addSkill = useAppStore((s) => s.addSkill);
   const updateSkill = useAppStore((s) => s.updateSkill);
 
-  // ── Persist Config ────────────────────────────────────────────────────
-  useEffect(() => {
-    try { localStorage.setItem('codely-config', safeJsonStringify(config)); } catch {}
-  }, [config]);
-  useEffect(() => {
-    try {
-      // Sanitize sessions before persisting — strip runtime-only fields
-      const sanitized = Object.fromEntries(
-        Object.entries(sessionsByWorkspace).map(([ws, sessions]) => [
-          ws,
-          sessions.map((s: any) => ({
-            ...s,
-            messages: s.messages ? sanitizeTaskBlocksForPersist(s.messages) : [],
-            runtimeSnapshot: s.runtimeSnapshot
-              ? {
-                  ...s.runtimeSnapshot,
-                  taskFlow: sanitizeTaskBlocksForPersist(s.runtimeSnapshot.taskFlow || []),
-                  agentMessages: sanitizeAgentMessagesForPersist(s.runtimeSnapshot.agentMessages || []),
-                }
-              : undefined,
-          })),
-        ])
-      );
-      localStorage.setItem('codely-sessions-by-workspace', safeJsonStringify(sanitized));
-    } catch {}
-  }, [sessionsByWorkspace]);
-  useEffect(() => {
-    try {
-      const saved = localStorage.getItem('codely-sessions-by-workspace');
-      if (saved) { useAppStore.setState({ sessionsByWorkspace: JSON.parse(saved) }); }
-    } catch {}
-  }, []);
   useEffect(() => initializeE2EScenarios(), []);
   useEffect(() => {
+    appendDebugLog("info", "app.lifecycle", {
+      phase: "app_mounted",
+      currentWorkspace: currentWorkspace || "global",
+      currentSessionId,
+      taskFlowBlocks: taskFlow.length,
+      agentMessages: agentMessages.length,
+      conversationTurns: conversationTurns.length,
+    });
+  // Log only the initial mount snapshot.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  useEffect(() => {
     if (!currentWorkspace) return;
+    const startedAt = performance.now();
+    appendDebugLog("info", "workspace.root", { phase: "set_start", currentWorkspace });
     void setWorkspaceRootIpc(currentWorkspace)
-      .catch(() => {})
-      .then(() => refreshGameStudioWorkspaceState());
+      .catch((error) => {
+        appendDebugLog("warn", "workspace.root", {
+          phase: "set_failed",
+          currentWorkspace,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      })
+      .then(() => refreshGameStudioWorkspaceState())
+      .finally(() => {
+        appendDebugLog("info", "workspace.root", {
+          phase: "set_done",
+          currentWorkspace,
+          elapsedMs: Math.round(performance.now() - startedAt),
+        });
+      });
   }, [currentWorkspace, refreshGameStudioWorkspaceState]);
 
   useEffect(() => {
@@ -269,8 +264,24 @@ export default function App() {
     }
 
     if (state.isGenerating || state.agentStatus === "running" || state.agentStatus === "pending_review") {
+      appendDebugLog("warn", "ui.sendMessage", {
+        phase: "blocked_busy",
+        agentStatus: state.agentStatus,
+        isGenerating: state.isGenerating,
+      });
       return false;
     }
+
+    appendDebugLog("info", "ui.sendMessage", {
+      phase: "accepted",
+      textChars: text.length,
+      images: images?.length ?? 0,
+      contextMentions: contextMentionsSnapshot.length,
+      attachedFiles: attachedFilesSnapshot.length,
+      currentTurnId: state.currentTurnId,
+      taskFlowBlocks: state.taskFlow.length,
+      agentMessages: state.agentMessages.length,
+    });
 
     runAfterNextPaint(() => {
       useAppStore.getState().sendMessage(text, images, {
@@ -290,6 +301,17 @@ export default function App() {
 
     const state = useAppStore.getState();
     const reuseCurrentTurn = !!sourceTurnId && sourceTurnId === state.currentTurnId;
+    appendDebugLog("info", "ui.quickReply", {
+      text,
+      sourceTurnId,
+      currentTurnId: state.currentTurnId,
+      reuseCurrentTurn,
+      currentTurnStatus: state.currentTurnId
+        ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId)?.status
+        : null,
+      taskFlowBlocks: state.taskFlow.length,
+      agentMessages: state.agentMessages.length,
+    });
     const sendOptions = reuseCurrentTurn
       ? {
           reuseCurrentTurn: true,
@@ -319,6 +341,7 @@ export default function App() {
 
   // --- Workspace & Session Management ---
   const restoreSessionState = (target: any, id: number) => {
+    const startedAt = performance.now();
     if (target?.runtimeSnapshot) {
       const snapshot = target.runtimeSnapshot;
       const restoredTaskFlow = sanitizeTaskBlocksForPersist(snapshot.taskFlow || target.messages || []);
@@ -370,6 +393,14 @@ export default function App() {
         rightPanelTab: snapshot.rightPanelTab ?? 'plan',
         elapsedTime: 0,
       });
+      appendDebugLog("info", "session.restore", {
+        sessionId: id,
+        mode: "runtimeSnapshot",
+        elapsedMs: Math.round(performance.now() - startedAt),
+        taskFlowBlocks: restoredTaskFlow.length,
+        agentMessages: (snapshot.agentMessages || []).length,
+        conversationTurns: (snapshot.conversationTurns || []).length,
+      });
       return;
     }
 
@@ -415,6 +446,12 @@ export default function App() {
         showFilePanel: false,
         rightPanelTab: 'plan',
       });
+      appendDebugLog("info", "session.restore", {
+        sessionId: id,
+        mode: "messages",
+        elapsedMs: Math.round(performance.now() - startedAt),
+        taskFlowBlocks: target.messages.length,
+      });
       return;
     }
 
@@ -453,6 +490,11 @@ export default function App() {
       planExecutionEvidenceCount: 0,
       planStage: 'idle',
       isPlanApproved: false,
+    });
+    appendDebugLog("info", "session.restore", {
+      sessionId: id,
+      mode: "empty",
+      elapsedMs: Math.round(performance.now() - startedAt),
     });
   };
 

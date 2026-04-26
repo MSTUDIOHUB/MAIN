@@ -27,7 +27,7 @@ import { computeContextBudgets, estimateTokens, manageContext } from "./contextT
 import { generateId } from "./utils";
 import { buildSystemPrompt } from "./systemPrompt";
 import { discoverAllMcpTools, setMcpToolServerMap, type MCPServer, type MCPTool } from "./mcpClient";
-import { deletePlanFiles } from "./ipc";
+import { deletePlanFiles, getFileMetadata } from "./ipc";
 import { ensureVisibleConclusion, isAssistantTurnEmpty, normalizeAssistantTurn } from "./normalizedTurn";
 import { hasStructuredPlanProposal } from "./planProposal";
 import { serializeAssistantReplyForHistory, shouldPauseForReplyOptions } from "./replyOptions";
@@ -50,6 +50,8 @@ import {
 } from "./hooks";
 import type { PendingSlashCommand, StudioAgentKey } from "./gameStudioCatalog";
 import {
+  buildRepeatLoopArgsKey,
+  buildRepeatLoopSignature,
   formatRepeatLoopFatalMessage,
   formatRepeatLoopRecoveryMessage,
   registerToolCallForRepeatGuard,
@@ -64,7 +66,7 @@ import {
 } from "./providerCompatibility";
 import { getErrorMessage } from "./errorUtils";
 import { resolveProtocolPackageReadPath } from "./protocolPackages";
-import { isRetryableCloudErrorMessage } from "./cloudRetry";
+import { isCloudGatewayTimeoutMessage, isRetryableCloudErrorMessage } from "./cloudRetry";
 import {
   buildMissingToolCallContinuationPrompt,
   resolveMissingToolCallRepromptKind,
@@ -343,7 +345,7 @@ function shouldTreatCloudGatewayErrorAsCompatibility(
   messages: AgentMessage[],
   nativeToolsWereAttempted: boolean,
 ): boolean {
-  if (!isCloudProfile || !isRetryableCloudErrorMessage(errMsg)) return false;
+  if (!isCloudProfile || isCloudGatewayTimeoutMessage(errMsg) || !isRetryableCloudErrorMessage(errMsg)) return false;
   return nativeToolsWereAttempted || hasToolRoundHistory(messages);
 }
 
@@ -384,13 +386,14 @@ async function fetchLLMStream(
   signal: AbortSignal,
   allTools: ToolDefinition[],
   maxTokensOverride?: number,
+  maxEscalationsOverride?: number,
 ): Promise<StreamResult> {
   let fullText = "";
   let currentMaxTokens = maxTokensOverride ?? computeInitialMaxTokens(settings.contextLimit);
   let transientRetryCount = 0;
 
   // Max output tokens escalation loop (from claude-code-haha)
-  const MAX_ESCALATIONS = 3;
+  const MAX_ESCALATIONS = maxEscalationsOverride ?? 3;
   const MAX_TRANSIENT_RETRIES = 2;
   let escalationCount = 0;
 
@@ -434,6 +437,7 @@ async function fetchLLMStream(
       if (
         !signal.aborted &&
         transientRetryCount < MAX_TRANSIENT_RETRIES &&
+        !isCloudGatewayTimeoutMessage(retryMessage) &&
         isRetryableCloudErrorMessage(retryMessage)
       ) {
         transientRetryCount++;
@@ -479,9 +483,147 @@ interface ToolExecutionResult {
   toolCallId: string;
   name: string;
   target: string;
-  content: string; // result or error message
+  content: string; // model-facing result or error message
+  displayContent?: string; // UI-facing result, can differ from model-facing content
   isError: boolean;
   additionalContexts?: string[];
+}
+
+interface CachedReadOnlyToolResult {
+  name: string;
+  target: string;
+  content: string;
+}
+
+interface FileReadState {
+  signature: string;
+  path: string;
+  argsKey: string;
+  contentHash: string;
+  contentLength: number;
+  sizeBytes: number;
+  modifiedMs: number;
+  modelContent: string;
+  updatedAt: number;
+}
+
+const FILE_UNCHANGED_STUB = "FILE_UNCHANGED_STUB";
+const MAX_FILE_READ_STATES_PER_SESSION = 240;
+const sessionFileReadStates = new Map<string, Map<string, FileReadState>>();
+
+function getSessionFileReadStates(sessionKey: string): Map<string, FileReadState> {
+  const key = sessionKey || "default";
+  let states = sessionFileReadStates.get(key);
+  if (!states) {
+    states = new Map<string, FileReadState>();
+    sessionFileReadStates.set(key, states);
+  }
+  return states;
+}
+
+function pruneFileReadStates(states: Map<string, FileReadState>): void {
+  if (states.size <= MAX_FILE_READ_STATES_PER_SESSION) return;
+  const staleKeys = [...states.entries()]
+    .sort((a, b) => a[1].updatedAt - b[1].updatedAt)
+    .slice(0, states.size - MAX_FILE_READ_STATES_PER_SESSION)
+    .map(([key]) => key);
+  staleKeys.forEach((key) => states.delete(key));
+}
+
+function parseToolCallArguments(tc: ToolCallToExecute): Record<string, unknown> {
+  try {
+    return JSON.parse(tc.arguments);
+  } catch {
+    return {};
+  }
+}
+
+function buildReadOnlyCacheSignature(name: string, args: Record<string, unknown>): string {
+  return buildRepeatLoopSignature(name, buildRepeatLoopArgsKey(args));
+}
+
+function formatCachedReadOnlyToolResult(
+  name: string,
+  target: string,
+  cached: CachedReadOnlyToolResult | undefined,
+  duplicateCount: number,
+): string {
+  const suffix = target ? ` (target: "${target}")` : "";
+  const preview = cached?.content
+    ? `\n\nEarlier result preview:\n${cached.content.slice(0, 1600)}${cached.content.length > 1600 ? "\n...[preview truncated]" : ""}`
+    : "";
+
+  return [
+    `Repeated read-only tool call skipped: "${name}" was already called with identical arguments${suffix}.`,
+    `Duplicate skip count in this run: ${duplicateCount}.`,
+    "Reuse the earlier tool result already in context. Do not call the same tool with the same arguments again; continue with a different file, a more specific outline/search tool, or produce the next visible answer.",
+    preview,
+  ].filter(Boolean).join("\n");
+}
+
+function truncateToolContent(content: string, maxChars: number): string {
+  if (content.length <= maxChars) return content;
+  return content.slice(0, maxChars) + `\n...[truncated, ${content.length - maxChars} chars omitted]`;
+}
+
+function hashString(input: string): string {
+  let hash = 2166136261;
+  for (let index = 0; index < input.length; index++) {
+    hash ^= input.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16);
+}
+
+function buildFileReadSignature(path: string, args: Record<string, unknown>): string {
+  const argsKey = buildRepeatLoopArgsKey(
+    Object.fromEntries(
+      Object.entries(args)
+        .filter(([key]) => key !== "path")
+        .filter(([_, value]) => value !== undefined && value !== null && value !== ""),
+    ),
+  );
+  return `read_file::${path}::${argsKey}`;
+}
+
+function buildFileUnchangedStub(state: FileReadState): string {
+  return [
+    `${FILE_UNCHANGED_STUB}: "${state.path}" has already been read with the same range/options, and the content is unchanged.`,
+    `Previous read: ${state.contentLength.toLocaleString()} chars, file size ${state.sizeBytes.toLocaleString()} bytes, modified ${state.modifiedMs}, hash ${state.contentHash}.`,
+    "Reuse the earlier file content already in context. Do not call read_file for this same file/range again unless you have reason to believe it changed.",
+    "Next: inspect a different file, use get_file_outline/grep_search for a narrower question, or continue the implementation/answer from the cached content.",
+  ].join("\n");
+}
+
+async function readFileMetadataIfAvailable(path: string): Promise<{ path: string; sizeBytes: number; modifiedMs: number } | null> {
+  try {
+    const metadata = await getFileMetadata(path);
+    return {
+      path: String(metadata.path || path),
+      sizeBytes: Number(metadata.sizeBytes) || 0,
+      modifiedMs: Number(metadata.modifiedMs) || 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function getToolResultBudgets(name: string, cloudProfile: boolean): { modelChars: number; displayChars: number } {
+  if (cloudProfile) {
+    if (name === "read_file") return { modelChars: 8000, displayChars: 8000 };
+    if (name === "read_document" || name === "analyze_tabular_document" || name === "query_tabular_document") {
+      return { modelChars: 7000, displayChars: 8000 };
+    }
+    if (name === "run_command" || name === "execute_command") return { modelChars: 6000, displayChars: 8000 };
+    return { modelChars: 6000, displayChars: 8000 };
+  }
+
+  if (name === "read_file") return { modelChars: 24000, displayChars: 10000 };
+  if (name === "read_document" || name === "analyze_tabular_document" || name === "query_tabular_document") {
+    return { modelChars: 16000, displayChars: 10000 };
+  }
+  if (name === "run_command" || name === "execute_command") return { modelChars: 12000, displayChars: 10000 };
+  return { modelChars: 12000, displayChars: 10000 };
 }
 
 async function executeToolCallWithLifecycle(
@@ -552,9 +694,10 @@ async function executeToolCallWithLifecycle(
   try {
     const rawResult = await executeTool(tc.name, resolvedArgs, workspace, sessionKey);
     const resultStr = typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult);
-    const truncated = resultStr.length > 8000
-      ? resultStr.slice(0, 8000) + `\n...[truncated, ${resultStr.length - 8000} chars omitted]`
-      : resultStr;
+    const cloudProfile = callbacks.getConfig().activeProfile === "cloud";
+    const budgets = getToolResultBudgets(tc.name, cloudProfile);
+    const modelContent = truncateToolContent(resultStr, budgets.modelChars);
+    const displayContent = truncateToolContent(resultStr, budgets.displayChars);
 
     // 计划文件会在 Plan 面板中单独展示，不再依赖聊天区自己拼装。
     await syncPlanArtifactAfterToolSuccess(
@@ -584,12 +727,13 @@ async function executeToolCallWithLifecycle(
       associatedPaths: callbacks.getAssociatedPaths(),
     });
 
-    callbacks.onToolDone(tc.name, target, truncated);
+    callbacks.onToolDone(tc.name, target, displayContent);
     return {
       toolCallId: tc.id,
       name: tc.name,
       target,
-      content: truncated,
+      content: modelContent,
+      displayContent,
       isError: false,
       additionalContexts: [
         ...preHookResult.additionalContexts,
@@ -718,6 +862,18 @@ async function executeWriteToolWithReview(
 
 const MAX_ITERATIONS = 25;
 const MAX_ITERATIONS_PLAN_EXECUTION = 50;
+const CONCISE_PLAN_ARTIFACT_HINT_ZH =
+  "计划文档必须精简：requirements.md 40-80 行、design.md 60-120 行、bugfix.md 40-80 行、tasks.md 8-20 个 checkbox；不要写教程式长文、完整代码清单或重复背景。Proposal 只做一页审阅摘要。";
+const CONCISE_PLAN_ARTIFACT_HINT_EN =
+  "Keep plan artifacts concise: requirements.md 40-80 lines, design.md 60-120 lines, bugfix.md 40-80 lines, tasks.md 8-20 checkboxes. Do not write tutorial-style prose, full code listings, or repeated background. The Proposal should be a one-page review summary.";
+
+function logAgentEvent(event: string, data: Record<string, unknown> = {}) {
+  try {
+    console.info(`[agent.${event}]`, data);
+  } catch {
+    // Logging must never affect the agent loop.
+  }
+}
 
 /**
  * Execute the Agent loop.
@@ -914,6 +1070,10 @@ export async function executeAgentLoop(
   let consecutiveNoToolCount = 0;
   let consecutiveEmptyResponseCount = 0;
   let currentMaxTokens: number | undefined; // undefined = use default
+  const maxOutputEscalations =
+    workflowMode === "plan" || turnIntent === "execute" || turnIntent === "studio_workflow"
+      ? 0
+      : 2;
   let sawPlanModeToolActivity = false;
 
   // ── Strict Repeat Guard ──────────────────────────────────────────
@@ -922,6 +1082,9 @@ export async function executeAgentLoop(
   // the pattern as fatal, so the model gets a chance to pivot tools.
   const recentToolCalls: Array<{ name: string; argsKey: string }> = [];
   const repeatGuardRecoveredSignatures = new Set<string>();
+  const readOnlyResultCache = new Map<string, CachedReadOnlyToolResult>();
+  const readOnlyDuplicateSkipCounts = new Map<string, number>();
+  const fileReadStates = getSessionFileReadStates(callbacks.getSessionKey());
 
   // ── Plan Mode Gate ──────────────────────────────────────────────
   // In Plan mode, the agent should pause after presenting a plan and
@@ -956,6 +1119,15 @@ export async function executeAgentLoop(
     ? MAX_ITERATIONS_PLAN_EXECUTION
     : MAX_ITERATIONS;
 
+  logAgentEvent("loop_start", {
+    workflowMode,
+    turnIntent,
+    messagesLen: callbacks.getMessages().length,
+    allTools: allTools.length,
+    mcpTools: mcpTools.length,
+    maxOutputEscalations,
+  });
+
   while (iteration < effectiveMaxIterations) {
     iteration++;
 
@@ -967,20 +1139,21 @@ export async function executeAgentLoop(
     // ── Pre-LLM Turn Preparation ──
     callbacks.startNewTurn();
 
-    // 1. Local-only context management. Cloud mode sends the full history
-    // and lets the remote server enforce its own context policy.
+    // 1. Context management. Cloud mode uses a lightweight pass so tool-heavy
+    // histories do not trigger slow Responses requests or gateway 524s.
     let managedAgentMessages = callbacks.getMessages() as AgentMessage[];
     const llmTools = resolveLlmTools();
-    if (snapshotContextLimit != null) {
-      const contextLimit = snapshotContextLimit;
+    const cloudResponsesCompact = isCloudProfile && config.cloud.apiFormat === "responses";
+    if (snapshotContextLimit != null || cloudResponsesCompact) {
+      const contextLimit = snapshotContextLimit ?? 32768;
       const effectiveContextLimit = computeManagedContextLimit(contextLimit, llmTools);
-      const { outputBudget } = computeContextBudgets(effectiveContextLimit);
+      const { inputBudget, outputBudget } = computeContextBudgets(effectiveContextLimit);
       const managedResult = manageContext(
         callbacks.getMessages(),
         effectiveContextLimit,
-        outputBudget,
-        1200, // maxToolResultTokens: aggressively truncate tool results
-        800,  // maxAssistantTokens: aggressively truncate assistant prose
+        cloudResponsesCompact ? Math.min(outputBudget, 2048) : outputBudget,
+        cloudResponsesCompact ? 700 : Math.max(4000, Math.floor(inputBudget * 0.45)),
+        cloudResponsesCompact ? 500 : Math.max(2000, Math.floor(inputBudget * 0.25)),
       );
       managedAgentMessages = managedResult.messages as AgentMessage[];
       if (managedResult.changed) {
@@ -1001,6 +1174,15 @@ export async function executeAgentLoop(
     const assistantMsgId = generateId();
     let streamResult: StreamResult;
 
+    logAgentEvent("iteration_start", {
+      iteration,
+      workflowMode,
+      turnIntent,
+      messagesLen: managedAgentMessages.length,
+      llmTools: llmTools.length,
+      currentMaxTokens: currentMaxTokens ?? "default",
+    });
+
     try {
       streamResult = await fetchLLMStream(
         managedAgentMessages,
@@ -1010,6 +1192,7 @@ export async function executeAgentLoop(
         abortController.signal,
         llmTools,
         currentMaxTokens,
+        maxOutputEscalations,
       );
     } catch (err) {
       if ((err as Error).name === "AbortError") {
@@ -1051,6 +1234,7 @@ export async function executeAgentLoop(
           aggressiveOutputBudget,
           maxToolResultTokens,
           480,
+          true,
         );
         const aggressivelyManaged = aggressivelyManagedResult.messages as AgentMessage[];
         if (aggressivelyManagedResult.changed) {
@@ -1076,6 +1260,7 @@ export async function executeAgentLoop(
             abortController.signal,
             llmTools,
             1536,
+            0,
           );
         } catch (retryErr) {
           if ((retryErr as Error).name === "AbortError") {
@@ -1095,6 +1280,7 @@ export async function executeAgentLoop(
             512,
             320,
             220,
+            true,
           );
           const emergencyManaged = emergencyManagedResult.messages as AgentMessage[];
 
@@ -1118,6 +1304,7 @@ export async function executeAgentLoop(
               abortController.signal,
               llmTools,
               1024,
+              0,
             );
           } catch (finalErr) {
             if ((finalErr as Error).name === "AbortError") {
@@ -1149,6 +1336,7 @@ export async function executeAgentLoop(
             abortController.signal,
             llmTools,
             currentMaxTokens,
+            maxOutputEscalations,
           );
         } catch (retryErr) {
           if ((retryErr as Error).name === "AbortError") {
@@ -1159,7 +1347,7 @@ export async function executeAgentLoop(
           const retryMsg = (retryErr as Error).message || "";
           const retryLooksLikeCompatibility =
             isProviderCompatibilityErrorMessage(retryMsg) ||
-            (isCloudProfile && isRetryableCloudErrorMessage(retryMsg));
+            (isCloudProfile && !isCloudGatewayTimeoutMessage(retryMsg) && isRetryableCloudErrorMessage(retryMsg));
 
           if (retryLooksLikeCompatibility) {
             const providerCompatibilityMessages = ensureProviderCompatibilityMode(
@@ -1176,6 +1364,7 @@ export async function executeAgentLoop(
                 abortController.signal,
                 [],
                 currentMaxTokens,
+                maxOutputEscalations,
               );
             } catch (finalErr) {
               if ((finalErr as Error).name === "AbortError") {
@@ -1196,6 +1385,7 @@ export async function executeAgentLoop(
                   abortController.signal,
                   [],
                   currentMaxTokens,
+                  maxOutputEscalations,
                 );
               } catch (lastErr) {
                 if ((lastErr as Error).name === "AbortError") {
@@ -1224,6 +1414,12 @@ export async function executeAgentLoop(
     }
 
     const streamText = streamResult.content;
+    logAgentEvent("stream_done", {
+      iteration,
+      finishReason: streamResult.finishReason || "unknown",
+      contentChars: streamText.length,
+      toolCalls: streamResult.toolCalls.length,
+    });
 
     // 3. 将不同模型输出统一整理成标准结构，避免 UI 继续靠多处分支猜测。
     const normalized = ensureVisibleConclusion(normalizeAssistantTurn(streamResult));
@@ -1286,13 +1482,25 @@ export async function executeAgentLoop(
       isPlanApproved: callbacks.getIsPlanApproved(),
     });
     const assistantHistoryText = serializeAssistantReplyForHistory(historyAssistantText, normalized.replyOptions);
+    const hasMeaningfulVisibleText = normalized.visibleText.trim().length > 0;
+    const wasTruncated = normalized.finishReason === "length";
+
+    logAgentEvent("normalized_turn", {
+      iteration,
+      visibleChars: normalized.visibleText.length,
+      hiddenThoughtChars: normalized.hiddenThought.length,
+      replyOptions: normalized.replyOptions.length,
+      toolCalls: effectiveToolCalls.length,
+      finishReason: normalized.finishReason || "unknown",
+      hasStructuredProposal,
+      planStage: callbacks.getPlanStage(),
+      isPlanApproved: callbacks.getIsPlanApproved(),
+    });
 
     // 4. Handle turn termination or continuation
     if (effectiveToolCalls.length === 0) {
-        // No tool calls found in this response.
-        callbacks.appendMessage({ role: "assistant", content: assistantHistoryText });
-
         if (shouldPauseForUserChoice) {
+          callbacks.appendMessage({ role: "assistant", content: assistantHistoryText });
           callbacks.onStatusChange("idle");
           return;
         }
@@ -1303,6 +1511,7 @@ export async function executeAgentLoop(
         // 2. finished writing spec artifacts up to a legacy ready_to_execute stage.
         // Ordinary summaries / progress notes stay in ChatArea only.
         if (workflowMode === "plan" && !callbacks.getIsPlanApproved() && (hasStructuredProposal || hasReadyPlanArtifacts)) {
+          callbacks.appendMessage({ role: "assistant", content: assistantHistoryText });
           const approved = await waitForPlanApprovalIfNeeded();
           if (!approved) {
             // Aborted during plan review — preserve pending_review status
@@ -1321,8 +1530,8 @@ export async function executeAgentLoop(
             role: "user",
             content:
               (language === "zh"
-                ? "计划已批准，现在进入执行阶段（EXECUTION MODE）。请按以下顺序继续：\n1. 先基于已批准的 requirements/design 或 bugfix 生成 `.MAIN/plans/tasks.md`，把执行任务拆清楚；在 tasks.md 生成前，不要直接跳到源码改动。\n2. 生成 tasks.md 后，TopIsland 会显示任务进度；之后再按 tasks.md 逐个执行，使用 <tool_use> 格式调用工具。\n3. 任何需要 shell 的任务都必须在 tasks.md checkbox 中写出精确命令，并用反引号包裹；进入执行后，一次性命令优先用 run_command 并检查 exitCode/stdout/stderr；长驻或交互式命令用 execute_command 后再用 read_pty_since/read_pty_tail/get_pty_status 验证结果。\n4. 你可以正常修改项目源码文件，写入路径必须是项目中的正确位置，绝对不要将源码写入 `.MAIN/plans/` 或任何隐藏目录。\n5. 每完成一个任务后，先同步更新 `.MAIN/plans/tasks.md` 中对应的 checkbox 状态；只有全部任务都标记为 `[x]` 后，才能结束执行。\n\n"
-                : "The plan is approved. You are now in EXECUTION MODE. Continue in this order:\n1. First generate `.MAIN/plans/tasks.md` from the approved requirements/design or bugfix so the execution steps are explicit. Do not jump straight to source edits before tasks.md exists.\n2. After tasks.md is generated, follow it task by task using tool calls.\n3. Any task that needs shell work must include the exact command inside the tasks.md checkbox text using backticks. During execution, prefer run_command for finite commands and inspect exitCode/stdout/stderr; use execute_command for long-running or interactive commands, then verify with read_pty_since/read_pty_tail/get_pty_status.\n4. You may now edit project source files, but write them to the proper project paths and never into `.MAIN/plans/` or hidden folders.\n5. After each task, update the matching checkbox in `.MAIN/plans/tasks.md` before moving on; only stop when all tasks are `[x]`.\n\n") +
+                ? "计划已批准，现在进入执行阶段（EXECUTION MODE）。请按以下顺序继续：\n1. 先基于已批准的 requirements/design 或 bugfix 生成 `.MAIN/plans/tasks.md`，把执行任务拆清楚；tasks.md 必须精简为 8-20 个 checkbox，每项一句话。\n2. 生成 tasks.md 后，TopIsland 会显示任务进度；之后再按 tasks.md 逐个执行，使用 <tool_use> 格式调用工具。\n3. 任何需要 shell 的任务都必须在 tasks.md checkbox 中写出精确命令，并用反引号包裹；进入执行后，一次性命令优先用 run_command 并检查 exitCode/stdout/stderr；长驻或交互式命令用 execute_command 后再用 read_pty_since/read_pty_tail/get_pty_status 验证结果。\n4. 你可以正常修改项目源码文件，写入路径必须是项目中的正确位置，绝对不要将源码写入 `.MAIN/plans/` 或任何隐藏目录。\n5. 每完成一个任务后，先同步更新 `.MAIN/plans/tasks.md` 中对应的 checkbox 状态；只有全部任务都标记为 `[x]` 后，才能结束执行。\n\n"
+                : "The plan is approved. You are now in EXECUTION MODE. Continue in this order:\n1. First generate `.MAIN/plans/tasks.md` from the approved requirements/design or bugfix so the execution steps are explicit. Keep tasks.md concise: 8-20 checkboxes, one sentence each.\n2. After tasks.md is generated, follow it task by task using tool calls.\n3. Any task that needs shell work must include the exact command inside the tasks.md checkbox text using backticks. During execution, prefer run_command for finite commands and inspect exitCode/stdout/stderr; use execute_command for long-running or interactive commands, then verify with read_pty_since/read_pty_tail/get_pty_status.\n4. You may now edit project source files, but write them to the proper project paths and never into `.MAIN/plans/` or hidden folders.\n5. After each task, update the matching checkbox in `.MAIN/plans/tasks.md` before moving on; only stop when all tasks are `[x]`.\n\n") +
               buildPlanCommandExecutionHint(callbacks.getPlanTasks(), language),
           };
           callbacks.appendMessage(continuationMsg);
@@ -1335,42 +1544,93 @@ export async function executeAgentLoop(
           !callbacks.getIsPlanApproved() &&
           !hasStructuredProposal &&
           currentPlanStage !== "ready_to_execute";
-        const hasMeaningfulVisibleText = normalized.visibleText.trim().length > 0;
-        const wasTruncated = normalized.finishReason === "length";
-        // If the plan is incomplete, always force continuation — even on the
-        // first iteration when planStage is still "idle" and no tool activity
-        // has occurred. The model should never stop with a text-only response
-        // while the plan hasn't reached a terminal state.
-        const shouldForcePlanContinuation = planningStillIncomplete && (isCloudProfile || !hasMeaningfulVisibleText);
+        const shouldRefineLongPlanIntoChoice = planningStillIncomplete && hasMeaningfulVisibleText && wasTruncated;
+        const shouldForcePlanContinuation = planningStillIncomplete && !hasMeaningfulVisibleText;
+
+        if (shouldRefineLongPlanIntoChoice) {
+          callbacks.onStatusChange("running");
+          consecutiveNoToolCount++;
+          logAgentEvent("plan_refine_long_output", {
+            iteration,
+            consecutiveNoToolCount,
+            visibleChars: normalized.visibleText.length,
+            finishReason: normalized.finishReason || "unknown",
+          });
+          if (consecutiveNoToolCount >= 3) {
+            logAgentEvent("loop_stop", {
+              reason: "plan_refine_long_output_limit",
+              iteration,
+              consecutiveNoToolCount,
+            });
+            callbacks.appendMessage({ role: "assistant", content: assistantHistoryText });
+            callbacks.onStatusChange("idle");
+            return;
+          }
+          const language = callbacks.getPreferredLanguage();
+          callbacks.appendMessage({
+            role: "user",
+            content:
+              language === "zh"
+                ? "上一条规划内容过长并发生截断。不要继续输出长篇计划，也不要写入 `.MAIN/plans/`。请把刚才内容收束成不超过 8 条要点，然后提出 2-4 个需要用户拍板的选项，使用 `<user_options>` 后立刻停止等待。"
+                : "The previous planning reply was too long and was truncated. Do not continue with a long plan and do not write `.MAIN/plans/` files. Condense it into no more than 8 bullets, then offer 2-4 decision options with `<user_options>` and stop immediately.",
+          });
+          continue;
+        }
 
         if (shouldForcePlanContinuation) {
           consecutiveNoToolCount++;
           if (consecutiveNoToolCount >= 5) {
+            logAgentEvent("loop_stop", {
+              reason: "force_plan_continuation_limit",
+              iteration,
+              consecutiveNoToolCount,
+            });
             callbacks.onStatusChange("idle");
             return;
           }
+          const language = callbacks.getPreferredLanguage();
 
           const missingStepHint =
-            currentPlanStage === "requirements"
-              ? "你已经有 requirements.md，下一步必须继续生成 design.md（或 bugfix.md），再提交正式 Proposal 让用户确认。"
+            language === "zh"
+              ? currentPlanStage === "requirements"
+                ? "你已经有 requirements.md，下一步应先让用户确认设计方向，或在信息足够时提交正式 Proposal。"
+                : currentPlanStage === "design"
+                ? "你已经有 design.md，下一步应输出正式 Proposal 或给用户关键选择；不要在批准前提前生成 tasks.md。"
+                : currentPlanStage === "bugfix"
+                ? "你已经有 bugfix.md，下一步应输出正式 Proposal 或给用户关键选择；不要在批准前提前生成 tasks.md。"
+                : sawPlanModeToolActivity
+                ? "你已经开始做项目探索了，但还没有给出可让用户决策的规划结果。下一步应先收束分歧并询问用户。"
+                : "请先给出可让用户决策的规划问题。"
+              : currentPlanStage === "requirements"
+              ? "requirements.md exists. Next ask the user to confirm the design direction, or submit the formal Proposal if enough information is available."
               : currentPlanStage === "design"
-              ? "你已经有 design.md，下一步必须输出正式 Proposal，让用户先确认方案；不要在批准前提前生成 tasks.md。"
+              ? "design.md exists. Next submit the formal Proposal or offer the key choices; do not generate tasks.md before approval."
               : currentPlanStage === "bugfix"
-              ? "你已经有 bugfix.md，下一步必须输出正式 Proposal，让用户先确认修复方案；不要在批准前提前生成 tasks.md。"
+              ? "bugfix.md exists. Next submit the formal Proposal or offer the key choices; do not generate tasks.md before approval."
               : sawPlanModeToolActivity
-              ? "你已经开始做项目探索了，但还没有真正落盘完整的规划结果。下一步必须继续输出 requirements.md / design.md（或 bugfix.md）并提交正式 Proposal。"
-              : "请继续把计划补全到可执行阶段。";
+              ? "You have started project exploration but have not produced a planning result the user can decide on. Next condense the tradeoffs and ask the user."
+              : "First present a planning question the user can decide on.";
 
           const continuationMsg: AgentMessage = {
             role: "user",
             content:
-              `当前规划还没有进入可执行阶段。${missingStepHint}\n` +
-              "请继续规划，并在本轮结束前至少完成以下其一：\n" +
-              "1. 使用 <tool_use> 调用 write_file，将缺失的 requirements/design 或 bugfix 规格写入 `.MAIN/plans/`。\n" +
-              "2. 输出正式 Proposal：`[PROPOSAL START]` + `# Proposed Plan` + 结构化 Markdown 正文 + 合法 `<plan>` JSON。\n" +
-              "3. 在用户批准之前，不要提前生成执行用的 `tasks.md`。\n" +
-              `${wasTruncated ? "你上一条回复已经发生截断，请从中断处继续，不要重头重复。\n" : ""}` +
-              `不要只输出一句总结、结束语，或空结束符。\n${hasMeaningfulVisibleText ? "你刚才的说明可以保留，但现在必须继续完成剩余计划。" : ""}`,
+              language === "zh"
+                ? `当前规划还没有进入可执行阶段。${missingStepHint}\n` +
+                  `${CONCISE_PLAN_ARTIFACT_HINT_ZH}\n` +
+                  "请继续规划，并在本轮结束前完成以下其一：\n" +
+                  "1. 用普通 Markdown 输出 3-8 条关键判断，然后给出 2-4 个 `<user_options>` 让用户选择。\n" +
+                  "2. 如果信息已经足够，输出正式 Proposal：`[PROPOSAL START]` + `# Proposed Plan` + 一页审阅摘要 + 合法 `<plan>` JSON。\n" +
+                  "3. 只有用户明确要求保存、导出或批准进入执行时，才写入 `.MAIN/plans/`；在用户批准之前不要生成 `tasks.md`。\n" +
+                  `${wasTruncated ? "你上一条回复已经发生截断，请从中断处继续，不要重头重复。\n" : ""}` +
+                  "不要只输出一句总结、结束语，或空结束符。"
+                : `The current plan has not reached an executable stage. ${missingStepHint}\n` +
+                  `${CONCISE_PLAN_ARTIFACT_HINT_EN}\n` +
+                  "Continue planning and complete one of these before ending this turn:\n" +
+                  "1. Output 3-8 key judgments in Markdown, then offer 2-4 `<user_options>` for the user to choose from.\n" +
+                  "2. If there is enough information, output the formal Proposal: `[PROPOSAL START]` + `# Proposed Plan` + one-page review summary + valid `<plan>` JSON.\n" +
+                  "3. Only write `.MAIN/plans/` when the user explicitly asks to save/export or approves execution; do not generate `tasks.md` before approval.\n" +
+                  `${wasTruncated ? "Your previous reply was truncated; continue from the interruption point without restarting.\n" : ""}` +
+                  "Do not output only a summary, sign-off, or empty stop.",
           };
           callbacks.appendMessage(continuationMsg);
           continue;
@@ -1388,6 +1648,16 @@ export async function executeAgentLoop(
         if (shouldRepromptForMissingToolCall) {
           callbacks.onStatusChange("running");
           consecutiveNoToolCount++;
+          if (!hasMeaningfulVisibleText) {
+            callbacks.onStreamToken("__ESCALATION_RESET__:", assistantMsgId);
+          }
+          logAgentEvent("missing_tool_reprompt", {
+            iteration,
+            kind: missingToolCallRepromptKind === "none" ? "generic" : missingToolCallRepromptKind,
+            consecutiveNoToolCount,
+            visibleChars: normalized.visibleText.length,
+            preservedVisibleText: hasMeaningfulVisibleText,
+          });
           if (consecutiveNoToolCount >= 5) {
             callbacks.onError("模型连续多次未能正确使用 <tool_use> 格式调用工具，陷入复读循环，已强制中止。你可以尝试更明确地指引它执行。");
             callbacks.onStatusChange("error");
@@ -1399,6 +1669,7 @@ export async function executeAgentLoop(
             content: buildMissingToolCallContinuationPrompt(
               missingToolCallRepromptKind === "none" ? "generic" : missingToolCallRepromptKind,
               callbacks.getPreferredLanguage(),
+              consecutiveNoToolCount,
             ),
           };
           callbacks.appendMessage(continuationMsg);
@@ -1415,6 +1686,11 @@ export async function executeAgentLoop(
           callbacks.onStatusChange("running");
           consecutiveNoToolCount++;
           if (consecutiveNoToolCount >= 5) {
+            logAgentEvent("loop_stop", {
+              reason: "remaining_plan_tasks_limit",
+              iteration,
+              consecutiveNoToolCount,
+            });
             callbacks.onError("计划执行过程中模型连续多次提前停下，但仍有未完成任务。已中止本轮，请重试或切换更稳定的模型。");
             callbacks.onStatusChange("error");
             return;
@@ -1441,37 +1717,37 @@ export async function executeAgentLoop(
           try { await deletePlanFiles(); } catch (e) { console.warn("[orchestrator] Failed to delete plan files:", e); }
         }
 
-        // ── Plan-mode safety net ──────────────────────────────────────
-        // In plan mode, the loop must NEVER exit via text-only response
-        // while the plan is incomplete. All specific checks above should
-        // have caught these cases, but if they didn't, re-prompt instead
-        // of exiting so the model gets another chance to use tools.
         if (workflowMode === "plan" && !callbacks.getIsPlanApproved() && currentPlanStage !== "ready_to_execute") {
-          callbacks.onStatusChange("running");
-          consecutiveNoToolCount++;
-          if (consecutiveNoToolCount >= 5) {
-            callbacks.onError("模型在计划模式下多次未能使用工具，已中止。你可以尝试更明确地指引它执行。");
-            callbacks.onStatusChange("error");
-            return;
-          }
-          callbacks.appendMessage({
-            role: "user",
-            content: "你必须使用 <tool_use> 格式调用工具来继续操作。规则：\n" +
-              "1. 不要询问用户，自己做决定并执行。\n" +
-              "2. 如果不确定，选择最合理的方案直接执行。\n" +
-              "3. 格式示例：\n" +
-              "<tool_use>\n<tool>write_file</tool>\n<parameter name=\"path\">输出文件路径</parameter>\n<parameter name=\"content\">文件内容</parameter>\n</tool_use>\n" +
-              "请立即用上述格式调用工具继续。",
+          logAgentEvent("loop_stop", {
+            reason: "plan_waiting_for_user_or_summary",
+            iteration,
+            visibleChars: normalized.visibleText.length,
+            replyOptions: normalized.replyOptions.length,
+            planStage: currentPlanStage,
           });
-          continue;
+          callbacks.appendMessage({ role: "assistant", content: assistantHistoryText });
+          callbacks.onStatusChange("idle");
+          return;
         }
 
+        logAgentEvent("loop_stop", {
+          reason: "assistant_text_done",
+          iteration,
+          visibleChars: normalized.visibleText.length,
+          replyOptions: normalized.replyOptions.length,
+        });
+        callbacks.appendMessage({ role: "assistant", content: assistantHistoryText });
         callbacks.onStatusChange("idle");
         return;
       }
 
     // Tools have been found, reset the no-tool streak
     consecutiveNoToolCount = 0;
+    logAgentEvent("tool_calls_detected", {
+      iteration,
+      count: effectiveToolCalls.length,
+      names: effectiveToolCalls.map((call) => call.name).slice(0, 12),
+    });
 
     // 4. Process tool calls
     // Append the assistant message with tool_calls
@@ -1495,12 +1771,67 @@ export async function executeAgentLoop(
     const readOnlyCalls: ToolCallToExecute[] = [];
     const specFileCalls: ToolCallToExecute[] = [];
     const writeCalls: ToolCallToExecute[] = [];
+    const readOnlyCallSignatures = new Map<string, string>();
+    const queuedReadOnlySignatures = new Set<string>();
+    let allResults: ToolExecutionResult[] = [];
 
     for (const tc of effectiveToolCalls) {
-      let toolArgs: Record<string, unknown>;
-      try { toolArgs = JSON.parse(tc.arguments); } catch { toolArgs = {}; }
+      const toolArgs = parseToolCallArguments(tc);
 
       if (isReadOnlyTool(tc.name)) {
+        const signature = buildReadOnlyCacheSignature(tc.name, toolArgs);
+        const target = getToolTarget(tc.name, toolArgs);
+        const cached = readOnlyResultCache.get(signature);
+        const fileReadMetadata =
+          tc.name === "read_file" && typeof toolArgs.path === "string"
+            ? await readFileMetadataIfAvailable(toolArgs.path)
+            : null;
+        const fileReadSignature =
+          tc.name === "read_file" && typeof toolArgs.path === "string"
+            ? buildFileReadSignature(fileReadMetadata?.path ?? toolArgs.path, toolArgs)
+            : "";
+        const fileReadState = fileReadSignature ? fileReadStates.get(fileReadSignature) : undefined;
+
+        if (fileReadState) {
+          const metadata = fileReadMetadata ?? await readFileMetadataIfAvailable(fileReadState.path);
+          const unchanged =
+            metadata != null &&
+            metadata.sizeBytes === fileReadState.sizeBytes &&
+            metadata.modifiedMs === fileReadState.modifiedMs;
+
+          if (!unchanged) {
+            fileReadStates.delete(fileReadSignature);
+          } else {
+          const duplicateCount = (readOnlyDuplicateSkipCounts.get(fileReadSignature) ?? 0) + 1;
+          readOnlyDuplicateSkipCounts.set(fileReadSignature, duplicateCount);
+          allResults.push({
+            toolCallId: tc.id,
+            name: tc.name,
+            target,
+            content: buildFileUnchangedStub(fileReadState),
+            displayContent: `${FILE_UNCHANGED_STUB}: ${target || fileReadState.path}`,
+            isError: false,
+          });
+          continue;
+          }
+        }
+
+        if (cached || queuedReadOnlySignatures.has(signature)) {
+          const duplicateCount = (readOnlyDuplicateSkipCounts.get(signature) ?? 0) + 1;
+          readOnlyDuplicateSkipCounts.set(signature, duplicateCount);
+          allResults.push({
+            toolCallId: tc.id,
+            name: tc.name,
+            target,
+            content: formatCachedReadOnlyToolResult(tc.name, target, cached, duplicateCount),
+            isError: false,
+          });
+          continue;
+        }
+
+        queuedReadOnlySignatures.add(signature);
+        readOnlyCallSignatures.set(tc.id, signature);
+        if (fileReadSignature) readOnlyCallSignatures.set(`${tc.id}:file_read`, fileReadSignature);
         readOnlyCalls.push({ id: tc.id, name: tc.name, arguments: tc.arguments });
       } else if (workflowMode === "plan" && isSpecFileWrite(tc.name, toolArgs)) {
         specFileCalls.push({ id: tc.id, name: tc.name, arguments: tc.arguments });
@@ -1510,8 +1841,6 @@ export async function executeAgentLoop(
     }
 
     // Execute read-only tools concurrently (claude-code-haha pattern)
-    let allResults: ToolExecutionResult[] = [];
-
     if (readOnlyCalls.length > 0) {
       const readResults = await executeReadOnlyToolsConcurrently(
         readOnlyCalls,
@@ -1520,6 +1849,43 @@ export async function executeAgentLoop(
         allTools,
         hooksConfig,
       );
+      for (const result of readResults) {
+        const signature = readOnlyCallSignatures.get(result.toolCallId);
+        if (signature && !result.isError) {
+          readOnlyResultCache.set(signature, {
+            name: result.name,
+            target: result.target,
+            content: result.content,
+          });
+          readOnlyDuplicateSkipCounts.delete(signature);
+        }
+        const fileReadSignature = readOnlyCallSignatures.get(`${result.toolCallId}:file_read`);
+        if (fileReadSignature && result.name === "read_file" && !result.isError) {
+          const parsedCall = readOnlyCalls.find((call) => call.id === result.toolCallId);
+          const args = parsedCall ? parseToolCallArguments(parsedCall) : {};
+          const path = typeof args.path === "string" ? args.path : result.target;
+          const metadata = await readFileMetadataIfAvailable(path);
+          const contentHash = hashString(result.content);
+          const previous = fileReadStates.get(fileReadSignature);
+          if (metadata && (!previous || previous.contentHash !== contentHash || previous.modifiedMs !== metadata.modifiedMs || previous.sizeBytes !== metadata.sizeBytes)) {
+            fileReadStates.set(fileReadSignature, {
+              signature: fileReadSignature,
+              path: metadata.path,
+              argsKey: buildRepeatLoopArgsKey(
+                Object.fromEntries(Object.entries(args).filter(([key]) => key !== "path")),
+              ),
+              contentHash,
+              contentLength: result.content.length,
+              sizeBytes: metadata.sizeBytes,
+              modifiedMs: metadata.modifiedMs,
+              modelContent: result.content,
+              updatedAt: Date.now(),
+            });
+            pruneFileReadStates(fileReadStates);
+          }
+          readOnlyDuplicateSkipCounts.delete(fileReadSignature);
+        }
+      }
       allResults.push(...readResults);
     }
 
@@ -1574,8 +1940,7 @@ export async function executeAgentLoop(
     // After each batch of tool calls, check for repetition loops
     let recoveredReadOnlyRepeat = false;
     for (const tc of effectiveToolCalls) {
-      let toolArgs: Record<string, unknown>;
-      try { toolArgs = JSON.parse(tc.arguments); } catch { toolArgs = {}; }
+      const toolArgs = parseToolCallArguments(tc);
       const readOnly = isReadOnlyTool(tc.name);
       const repeatCheck = registerToolCallForRepeatGuard(recentToolCalls, tc.name, toolArgs, readOnly);
       if (!repeatCheck.repeated) continue;

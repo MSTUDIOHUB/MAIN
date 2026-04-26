@@ -1,6 +1,7 @@
 // @ts-nocheck
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { save } from "@tauri-apps/plugin-dialog";
 import { IconSettings, IconClose } from "./Icons";
 import { type MCPServer, type MCPTool, discoverAllMcpTools, setMcpToolServerMap } from "../lib/mcpClient";
 import {
@@ -20,6 +21,8 @@ import {
 } from "../lib/cloudProtocol";
 import { isRetryableCloudErrorMessage } from "../lib/cloudRetry";
 import { isProviderCompatibilityErrorMessage } from "../lib/providerCompatibility";
+import { clearDebugLog, copyDebugLogToClipboard, readDebugLogSnapshot } from "../lib/debugLog";
+import { exportTextFile } from "../lib/ipc";
 import { useAppStore } from "../store/useAppStore";
 
 // ── MCP Server Management Panel ──────────────────────────────────────────
@@ -300,6 +303,90 @@ function DataManagerPanel({ t }: { t: any }) {
   );
 }
 
+function DebugLogPanel({ t }: { t: any }) {
+  const [snapshot, setSnapshot] = useState({ path: "", content: "", truncated: false });
+  const [status, setStatus] = useState("");
+
+  const refresh = useCallback(async () => {
+    const next = await readDebugLogSnapshot(1024 * 1024);
+    setSnapshot(next);
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  const logText = snapshot.content || "";
+
+  const handleCopy = async () => {
+    await copyDebugLogToClipboard(logText || "暂无调试日志");
+    setStatus("已复制调试日志");
+    window.setTimeout(() => setStatus(""), 1800);
+  };
+
+  const handleExport = async () => {
+    const filePath = await save({
+      defaultPath: `main-debug-${new Date().toISOString().replace(/[:.]/g, "-")}.log`,
+      filters: [{ name: "Log", extensions: ["log", "txt"] }],
+    });
+    if (!filePath) return;
+    await exportTextFile(filePath, logText || "暂无调试日志");
+    setStatus("调试日志已导出");
+    window.setTimeout(() => setStatus(""), 1800);
+  };
+
+  const handleClear = async () => {
+    await clearDebugLog();
+    await refresh();
+    setStatus("调试日志已清空");
+    window.setTimeout(() => setStatus(""), 1800);
+  };
+
+  return (
+    <div className="space-y-5">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <h3 className="text-[13px] font-bold text-[#a1a1aa] uppercase tracking-wider">{t.debugLog}</h3>
+          <p className="mt-1 text-[11.5px] text-[#71717a] leading-relaxed">
+            记录前端 console、界面崩溃、Rust 代理请求和流式读取错误。日志会自动隐藏常见密钥字段。
+          </p>
+        </div>
+        <button
+          onClick={refresh}
+          className="shrink-0 rounded-md border border-[#27272a] bg-[#18181b] px-3 py-1.5 text-[12px] font-bold text-[#a1a1aa] transition-colors hover:text-white"
+        >
+          刷新
+        </button>
+      </div>
+
+      <div className="rounded-lg border border-[#27272a] bg-[#000000] p-3">
+        <div className="mb-2 text-[11px] font-bold text-[#a1a1aa]">日志文件</div>
+        <div className="break-all font-mono text-[11px] text-[#71717a]">{snapshot.path || "localStorage:main.debugLog.v1"}</div>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-2">
+        <button onClick={handleCopy} className="rounded-md border border-[#27272a] bg-[#18181b] px-3 py-2 text-[12px] font-bold text-[#e4e4e7] transition-colors hover:border-[#3f3f46]">
+          复制日志
+        </button>
+        <button onClick={handleExport} className="rounded-md border border-[#27272a] bg-[#18181b] px-3 py-2 text-[12px] font-bold text-[#e4e4e7] transition-colors hover:border-[#3f3f46]">
+          导出日志
+        </button>
+        <button onClick={handleClear} className="rounded-md border border-[#3f1f1f] bg-[#181111] px-3 py-2 text-[12px] font-bold text-[#fca5a5] transition-colors hover:border-[#7f1d1d]">
+          清空日志
+        </button>
+        {status && <span className="text-[12px] text-[#86d9a3]">{status}</span>}
+        {snapshot.truncated && <span className="text-[12px] text-[#fbbf24]">当前只显示日志尾部</span>}
+      </div>
+
+      <textarea
+        readOnly
+        value={logText || "暂无调试日志"}
+        className="h-[320px] w-full resize-none rounded-lg border border-[#27272a] bg-[#000000] p-3 font-mono text-[11px] leading-5 text-[#a1a1aa] outline-none"
+      />
+    </div>
+  );
+}
+
 export default function SettingsModal({
   isOpen,
   onClose,
@@ -336,7 +423,7 @@ export default function SettingsModal({
   const [cloudFetchMsg, setCloudFetchMsg] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
   const [cloudProbeMsg, setCloudProbeMsg] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
   const [localFetchMsg, setLocalFetchMsg] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
-  const [systemMemory, setSystemMemory] = useState<{ total_gb: number; available_gb: number } | null>(null);
+  const [systemMemory, setSystemMemory] = useState<{ total_gb: number; available_gb: number; total_bytes?: number; available_bytes?: number } | null>(null);
   const hasAutoFetched = useRef(false);
   const hasAutoFetchedCloud = useRef(false);
 
@@ -360,12 +447,13 @@ export default function SettingsModal({
     return () => clearTimeout(timer);
   }, [localFetchMsg]);
 
-  // Fetch system memory on mount
+  // Fetch system memory whenever settings opens, so the slider reflects memory left after the model loads.
   useEffect(() => {
-    invoke<{ total_gb: number; available_gb: number }>("get_system_memory")
+    if (!isOpen) return;
+    invoke<{ total_gb: number; available_gb: number; total_bytes?: number; available_bytes?: number }>("get_system_memory")
       .then(setSystemMemory)
       .catch(() => { });
-  }, []);
+  }, [isOpen]);
 
   const handleProviderChange = (e) => {
     const provider = e.target.value;
@@ -381,6 +469,8 @@ export default function SettingsModal({
     if (mb >= 1024) return { text: `~${(mb / 1024).toFixed(1)} GB`, value: mb };
     return { text: `~${Math.round(mb)} MB`, value: mb };
   };
+
+  const getTokensForKvCacheGb = (gb: number) => Math.max(4096, Math.floor((gb * 1024 / 130) * 1000 / 4096) * 4096);
 
   // Get pressure color based on slider position (0 = blue/safe, 1 = red/danger)
   const getPressureColor = (ratio: number) => {
@@ -722,8 +812,8 @@ export default function SettingsModal({
 
       setCloudProbeMsg({
         text: reply
-          ? `连通成功，${testModel} 返回：${reply.slice(0, 120)}${cloudProtocol === "openai" && effectiveApiFormat !== cloudApiFormat ? `（已自动切换到 ${effectiveApiFormat === "responses" ? "Responses API" : "Chat Completions"}）` : ""}`
-          : `连通成功，${testModel} 已返回有效响应${cloudProtocol === "openai" && effectiveApiFormat !== cloudApiFormat ? `，并已自动切换到 ${effectiveApiFormat === "responses" ? "Responses API" : "Chat Completions"}` : ""}`,
+          ? `连通成功，${testModel} 返回：${reply.slice(0, 120)}${cloudProtocol === "openai" && effectiveApiFormat !== cloudApiFormat ? `（已自动切换到 ${effectiveApiFormat === "responses" ? "Responses API" : "Chat Completions"}）` : ""}。此测试是短文本非流式请求，真实任务会发送更长上下文。`
+          : `连通成功，${testModel} 已返回有效响应${cloudProtocol === "openai" && effectiveApiFormat !== cloudApiFormat ? `，并已自动切换到 ${effectiveApiFormat === "responses" ? "Responses API" : "Chat Completions"}` : ""}。此测试是短文本非流式请求，真实任务会发送更长上下文。`,
         type: "success",
       });
     } catch (err) {
@@ -793,14 +883,38 @@ export default function SettingsModal({
 
   // ── VRAM slider calculations ──
   const contextMin = 4096;
-  const contextMax = 131072;
-  const contextRatio = (config.local.contextLimit - contextMin) / (contextMax - contextMin);
+  const defaultContextMax = 131072;
+  const absoluteContextMax = 262144;
+  const availableGb = systemMemory?.available_bytes
+    ? systemMemory.available_bytes / 1024 ** 3
+    : systemMemory?.available_gb;
+  const safeKvCacheGb = availableGb
+    ? Math.max(0.5, Math.min(Math.max(availableGb - 1, 0.5), availableGb * 0.9))
+    : null;
+  const memoryBasedContextMax = safeKvCacheGb
+    ? getTokensForKvCacheGb(safeKvCacheGb)
+    : defaultContextMax;
+  const contextMax = Math.max(contextMin, Math.min(absoluteContextMax, memoryBasedContextMax));
+  const displayedContextLimit = Math.min(config.local.contextLimit, contextMax);
+  const contextRatio = (displayedContextLimit - contextMin) / Math.max(1, contextMax - contextMin);
   const pressure = getPressureColor(contextRatio);
-  const vramInfo = getVramEstimate(config.local.contextLimit);
-  const maxTokensAtMax = 131072;
-  const tokenReduction = Math.round((1 - config.local.contextLimit / maxTokensAtMax) * 100);
+  const vramInfo = getVramEstimate(displayedContextLimit);
+  const maxTokensAtMax = contextMax;
+  const tokenReduction = Math.max(0, Math.round((1 - displayedContextLimit / maxTokensAtMax) * 100));
+  const maxVramInfo = getVramEstimate(contextMax);
+  const compressionLabel = contextRatio < 0.3 ? "省显存" : contextRatio < 0.7 ? "均衡" : "长上下文";
+  const compressionHint = contextRatio < 0.3
+    ? "更早压缩，适合显存紧张"
+    : contextRatio < 0.7
+      ? "上下文与显存占用折中"
+      : "更晚压缩，保留更多历史";
   const vramGb = vramInfo.value / 1024;
-  const vramRatio = systemMemory ? Math.min(vramGb / systemMemory.total_gb, 1) : Math.min(vramGb / 32, 1);
+  const vramRatio = safeKvCacheGb ? Math.min(vramGb / safeKvCacheGb, 1) : Math.min(vramGb / 32, 1);
+
+  useEffect(() => {
+    if (!systemMemory || config.local.contextLimit <= contextMax) return;
+    setConfig({ ...config, local: { ...config.local, contextLimit: contextMax } });
+  }, [config, contextMax, setConfig, systemMemory]);
 
   // ── Context tab content (shared component) ──
   const contextTabContent = (
@@ -817,9 +931,11 @@ export default function SettingsModal({
           <p className="text-[11px] text-[#a1a1aa] leading-relaxed max-w-[420px]">{t.contextLimitDesc}</p>
         </div>
         <div className="text-right">
+          <span className="block text-[11px] font-bold text-[#a1a1aa] mb-0.5">{compressionLabel}</span>
           <span className="font-mono text-[22px] font-bold" style={{ color: pressure.main }}>
             {Math.round(contextRatio * 100)}%
           </span>
+          <p className="text-[10px] text-[#71717a]">{compressionHint}</p>
         </div>
       </div>
 
@@ -827,7 +943,7 @@ export default function SettingsModal({
       <div className="relative mb-2">
         <input
           type="range" min={contextMin} max={contextMax} step="4096"
-          value={config.local.contextLimit}
+          value={displayedContextLimit}
           onChange={(e) => setConfig({ ...config, local: { ...config.local, contextLimit: parseInt(e.target.value) } })}
           className="w-full cursor-pointer vram-gradient-slider"
           style={{ '--slider-pct': `${contextRatio * 100}%` } as React.CSSProperties}
@@ -836,9 +952,9 @@ export default function SettingsModal({
 
       {/* Zone labels */}
       <div className="flex justify-between text-[10px] font-bold uppercase tracking-wider mb-4">
-        <span style={{ color: contextRatio < 0.3 ? '#60a5fa' : '#3f3f46' }}>MAX QUALITY</span>
-        <span style={{ color: contextRatio >= 0.3 && contextRatio < 0.7 ? '#a78bfa' : '#3f3f46' }}>BALANCED</span>
-        <span style={{ color: contextRatio >= 0.7 ? '#f97316' : '#3f3f46' }}>LOW VRAM</span>
+        <span style={{ color: contextRatio < 0.3 ? '#60a5fa' : '#3f3f46' }}>省显存 / 更早压缩</span>
+        <span style={{ color: contextRatio >= 0.3 && contextRatio < 0.7 ? '#a78bfa' : '#3f3f46' }}>均衡</span>
+        <span style={{ color: contextRatio >= 0.7 ? '#f97316' : '#3f3f46' }}>长上下文 / 更晚压缩</span>
       </div>
 
       {/* Stats panel */}
@@ -846,10 +962,10 @@ export default function SettingsModal({
         <div className="flex items-center justify-between gap-4">
           {/* Left: Max Tokens */}
           <div className="flex-1">
-            <p className="text-[10px] text-[#71717a] uppercase tracking-wider mb-1">Max Tokens (Estimated)</p>
+            <p className="text-[10px] text-[#71717a] uppercase tracking-wider mb-1">压缩触发阈值 (Token)</p>
             <div className="flex items-center gap-2">
               <span className="font-mono text-[16px] font-bold text-[#86d9a3]">
-                ~ {config.local.contextLimit.toLocaleString()}
+                ~ {displayedContextLimit.toLocaleString()}
               </span>
               {tokenReduction > 0 && (
                 <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-[#0f2e0f] text-[#86d9a3] border border-[#1a3e1a]">
@@ -864,7 +980,7 @@ export default function SettingsModal({
 
           {/* Right: Est. VRAM */}
           <div className="flex-1">
-            <p className="text-[10px] text-[#71717a] uppercase tracking-wider mb-1">Est. KV Cache (VRAM)</p>
+            <p className="text-[10px] text-[#71717a] uppercase tracking-wider mb-1">预估上下文显存</p>
             <div className="flex items-center gap-2.5">
               <span className="font-mono text-[16px] font-bold" style={{ color: pressure.main }}>
                 {vramInfo.text}
@@ -879,6 +995,9 @@ export default function SettingsModal({
                 />
               </div>
             </div>
+            <p className="mt-1 text-[10px] text-[#71717a]">
+              当前上限约 {contextMax.toLocaleString()} Token
+            </p>
           </div>
         </div>
 
@@ -901,9 +1020,12 @@ export default function SettingsModal({
                     background: `linear-gradient(90deg, #22c55e 0%, ${pressure.main} 100%)`,
                   }}
                 />
-              </div>
             </div>
+            <p className="mt-1 text-[10px] text-[#71717a]">
+              满格约 {maxVramInfo.text}{safeKvCacheGb ? "，已按当前可用内存预留安全余量" : ""}
+            </p>
           </div>
+        </div>
         )}
       </div>
 
@@ -912,7 +1034,7 @@ export default function SettingsModal({
       {/* Tip */}
       <div className="p-3 bg-[#000000] border border-[#27272a] rounded-md">
         <p className="text-[11px] text-[#71717a] leading-relaxed">
-          💡 <span className="text-[#a1a1aa]">提示</span>：此设置同时适用于本地和云端模型。增大上下文窗口可保留更多对话历史，但会增加显存/内存占用。
+          💡 <span className="text-[#a1a1aa]">提示</span>：此设置用于本地模型的背景压缩与上下文窗口。满格会参考当前可用内存动态计算，并预留约 1GB / 10% 安全余量。
         </p>
       </div>
     </div>
@@ -934,6 +1056,7 @@ export default function SettingsModal({
             <button onClick={() => setSettingsTab('context')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'context' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.contextSetup}</button>
             <button onClick={() => setSettingsTab('mcp')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'mcp' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>MCP 服务器</button>
             <button onClick={() => setSettingsTab('data')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'data' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.dataManagement}</button>
+            <button onClick={() => setSettingsTab('debug')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'debug' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.debugLog}</button>
           </div>
           <div className="flex-1 p-6 overflow-y-auto bg-[#09090b]">
 
@@ -1101,6 +1224,9 @@ export default function SettingsModal({
             {/* DATA MANAGEMENT */}
             {settingsTab === 'data' && <DataManagerPanel t={t} />}
 
+            {/* DEBUG LOG */}
+            {settingsTab === 'debug' && <DebugLogPanel t={t} />}
+
             {/* CLOUDED API SETTINGS */}
             {settingsTab === 'cloud' && (
               <div className="space-y-6">
@@ -1247,7 +1373,7 @@ export default function SettingsModal({
                       <>
                         <div>
                           <label className="block text-[12px] text-[#a1a1aa] mb-1.5">Reasoning Effort</label>
-                          <p className="text-[11px] text-[#71717a] mb-2">对应 Codex `model_reasoning_effort`。对 `gpt-5.4` 这类推理模型可选 `xhigh`</p>
+                          <p className="text-[11px] text-[#71717a] mb-2">建议保持 None，响应最快且不容易触发云端 524；只有复杂推理任务再手动切到 High / XHigh。</p>
                           <select
                             value={normalizeOpenAiReasoningEffort(config.cloud.reasoningEffort)}
                             onChange={(e) => setConfig({ ...config, cloud: { ...config.cloud, reasoningEffort: normalizeOpenAiReasoningEffort(e.target.value) } })}

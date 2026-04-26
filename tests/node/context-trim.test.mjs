@@ -41,10 +41,25 @@ test("computeContextBudgets reserves a smaller, capped output budget for long co
   assert.equal(budgets128k.inputBudget, 126976);
 });
 
-test("manageContext persists token savings even when no messages are dropped", () => {
+test("manageContext leaves long tool output untouched while under the proactive trigger", () => {
   const messages = [
     { role: "system", content: "system prompt" },
     { role: "tool", content: "A".repeat(12000) },
+  ];
+
+  const result = manageContext(messages, 32768, undefined, 100, 2000);
+
+  assert.equal(result.droppedCount, 0);
+  assert.equal(result.changed, false);
+  assert.equal(result.tokenReduction, 0);
+  assert.equal(result.messages.length, messages.length);
+  assert.equal(result.messages[1].content, messages[1].content);
+});
+
+test("manageContext can persist token savings once the proactive trigger is crossed", () => {
+  const messages = [
+    { role: "system", content: "system prompt" },
+    { role: "tool", content: "A".repeat(80000) },
   ];
 
   const result = manageContext(messages, 32768, undefined, 100, 2000);

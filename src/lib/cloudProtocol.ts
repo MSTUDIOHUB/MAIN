@@ -530,6 +530,105 @@ export function buildOpenAiResponsesTranscript(messages: ProtocolChatMessage[]):
     .join("\n\n");
 }
 
+const CLOUD_RESPONSES_INSTRUCTION_MAX_CHARS = 8000;
+const CLOUD_RESPONSES_MESSAGE_KEEP_TAIL = 8;
+
+function truncateTextForCloud(value: string, maxChars: number): string {
+  if (value.length <= maxChars) return value;
+  return `${value.slice(0, maxChars)}\n...[truncated ${value.length - maxChars} chars for faster cloud response]`;
+}
+
+function compactProtocolMessageForCloud(message: ProtocolChatMessage): ProtocolChatMessage {
+  const text = extractTextContent(message.content);
+  const maxChars = message.role === "tool"
+    ? 700
+    : message.role === "assistant"
+      ? 1200
+      : 2200;
+
+  return {
+    ...message,
+    content: truncateTextForCloud(text, maxChars),
+    ...(message.tool_calls ? { tool_calls: message.tool_calls.slice(-3) } : {}),
+  };
+}
+
+export function compactCloudResponsesMessages(messages: ProtocolChatMessage[]): ProtocolChatMessage[] {
+  const systemMessages = messages.filter((message) => message.role === "system");
+  const conversationMessages = messages.filter((message) => message.role !== "system");
+
+  if (conversationMessages.length <= CLOUD_RESPONSES_MESSAGE_KEEP_TAIL + 2) {
+    return [...systemMessages, ...conversationMessages.map(compactProtocolMessageForCloud)];
+  }
+
+  const omitted = conversationMessages.slice(0, -CLOUD_RESPONSES_MESSAGE_KEEP_TAIL);
+  const recent = conversationMessages.slice(-CLOUD_RESPONSES_MESSAGE_KEEP_TAIL);
+  const summary = omitted
+    .slice(-6)
+    .map((message, index) => {
+      const text = truncateTextForCloud(extractTextContent(message.content).replace(/\s+/g, " ").trim(), 260);
+      return `${index + 1}. ${labelForResponsesTranscript(message.role)}: ${text}`;
+    })
+    .join("\n");
+
+  return [
+    ...systemMessages,
+    {
+      role: "user",
+      content: [
+        `[Cloud history summary: ${omitted.length} older messages compacted for faster response]`,
+        summary,
+      ].filter(Boolean).join("\n"),
+    },
+    ...recent.map(compactProtocolMessageForCloud),
+  ];
+}
+
+export function compactCloudResponsesInstructions(instructions: string | undefined): string | undefined {
+  if (!instructions) return undefined;
+  if (instructions.length <= CLOUD_RESPONSES_INSTRUCTION_MAX_CHARS) return instructions;
+
+  const lines = instructions.split(/\r?\n/);
+  const keepPatterns = [
+    /当前工作区|相对路径|workspace|工作区/i,
+    /M Studio|Unity|游戏开发|教程|中文|Region|注释/i,
+    /工具调用格式|tool_use|<tool>|parameter|XML/i,
+    /write_file|replace_in_file|run_command|read_file|list_directory|get_project_skeleton|glob_search|grep_search/i,
+    /不要声称.*没有写入|写入工具可用|文件访问|工作区权限/i,
+    /TURN INTENT|USER INTENT|执行|修复|实现|计划|报告/i,
+    /AGENTS|WORKSPACE INSTRUCTIONS|rules|instructions/i,
+  ];
+  const requiredToolReminder = [
+    "[Cloud Compact Instructions]",
+    "Use concise responses and prefer small tool-driven steps to avoid cloud gateway timeouts.",
+    "Tool access is available through XML <tool_use> calls. Workspace read/write tools are available when the user asks for implementation.",
+    "Available key tools: get_project_skeleton, list_directory, read_file, glob_search, grep_search, write_file, replace_in_file, run_command.",
+    "Never claim write tools or folder access are unavailable; emit XML tool calls instead.",
+  ];
+
+  const keptLines: string[] = [];
+  const seen = new Set<string>();
+  for (const line of lines) {
+    const trimmed = line.trimEnd();
+    if (!trimmed) continue;
+    if (!keepPatterns.some((pattern) => pattern.test(trimmed))) continue;
+    const normalized = trimmed.trim();
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    keptLines.push(trimmed);
+  }
+
+  const compact = [
+    ...requiredToolReminder,
+    "",
+    ...keptLines,
+    "",
+    `[Cloud compacted ${instructions.length} chars of system instructions to reduce 524 timeout risk.]`,
+  ].join("\n");
+
+  return truncateTextForCloud(compact, CLOUD_RESPONSES_INSTRUCTION_MAX_CHARS);
+}
+
 export function buildOpenAiResponsesInputCandidates(
   messages: ProtocolChatMessage[],
 ): OpenAiResponsesInputCandidate[] {

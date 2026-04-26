@@ -555,11 +555,14 @@ export function buildGameStudioUserEnvelope(params: {
   command: PendingSlashCommand | null;
   commandPath?: string | null;
   agentPath?: string | null;
+  responseLanguage?: "zh" | "en";
 }): string {
+  const responseLanguage = params.responseLanguage === "en" ? "English" : "简体中文";
   const lines = [
     "[GAME_STUDIO_CONTEXT]",
     "mode: nexus_game_studio",
     `activeStudioAgent: ${params.activeStudioAgent}`,
+    `responseLanguage: ${responseLanguage}`,
     "protocolRoot: .protocols/game-studio",
     "protocolEntry: .protocols/game-studio/SKILL.md",
     params.command ? `slashCommand: ${params.command.canonicalCommand}` : "slashCommand: none",
@@ -574,6 +577,7 @@ export function buildGameStudioUserEnvelope(params: {
 
   lines.push(
     "instructions: Read the protocol entry first. Then read the referenced command and active agent files before deciding how to respond.",
+    `languageInstruction: Reply to the user in ${responseLanguage}.`,
     "[/GAME_STUDIO_CONTEXT]",
     "",
     "User request:",

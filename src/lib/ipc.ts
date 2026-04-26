@@ -13,6 +13,12 @@ export interface FileNode {
   is_dir: boolean;
 }
 
+export interface FileMetadata {
+  path: string;
+  sizeBytes: number;
+  modifiedMs: number;
+}
+
 export interface HookCommandOutput {
   stdout: string;
   stderr: string;
@@ -138,6 +144,10 @@ export interface QueryTabularDocumentResult {
 
 export function readFile(path: string): Promise<string> {
   return invoke<string>("read_file", { path });
+}
+
+export function getFileMetadata(path: string): Promise<FileMetadata> {
+  return invoke<FileMetadata>("get_file_metadata", { path });
 }
 
 export function getWorkspaceRoot(): Promise<string> {

@@ -76,7 +76,7 @@ export function extractHiddenThought(text: string): string {
   return parts.join("\n\n").trim();
 }
 
-function extractLeakedReasoningPrelude(text: string, hasToolCalls: boolean): { leakedThought: string; visibleText: string } {
+function extractLeakedReasoningPrelude(text: string): { leakedThought: string; visibleText: string } {
   const paragraphs = text
     .split(/\n{2,}/)
     .map((part) => part.trim())
@@ -100,7 +100,7 @@ function extractLeakedReasoningPrelude(text: string, hasToolCalls: boolean): { l
     firstVisibleIdx = i + 1;
   }
 
-  if (leaked.length === 0 || (!hasToolCalls && leaked.length < 2)) {
+  if (leaked.length < 2) {
     return { leakedThought: "", visibleText: text };
   }
 
@@ -108,6 +108,67 @@ function extractLeakedReasoningPrelude(text: string, hasToolCalls: boolean): { l
     leakedThought: leaked.join("\n\n").trim(),
     visibleText: paragraphs.slice(firstVisibleIdx).join("\n\n").trim(),
   };
+}
+
+function normalizeParagraphForLoopDetection(text: string): string {
+  return text
+    .trim()
+    .toLowerCase()
+    .replace(/[，。！？；：,.!?;:、"'“”‘’`*_~\-\s]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function sameParagraphSequence(paragraphs: string[], a: number, b: number, length: number): boolean {
+  for (let offset = 0; offset < length; offset++) {
+    if (normalizeParagraphForLoopDetection(paragraphs[a + offset] || "") !== normalizeParagraphForLoopDetection(paragraphs[b + offset] || "")) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function collapseRepeatedParagraphLoops(text: string): string {
+  const paragraphs = text
+    .split(/\n{2,}/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+
+  if (paragraphs.length < 4) return text;
+
+  const collapsed: string[] = [];
+  let index = 0;
+  const maxWindow = 6;
+
+  while (index < paragraphs.length) {
+    let matched = false;
+    const remaining = paragraphs.length - index;
+    const largestWindow = Math.min(maxWindow, Math.floor(remaining / 2));
+
+    for (let windowSize = largestWindow; windowSize >= 1; windowSize--) {
+      let repeats = 1;
+      while (
+        index + (repeats + 1) * windowSize <= paragraphs.length &&
+        sameParagraphSequence(paragraphs, index, index + repeats * windowSize, windowSize)
+      ) {
+        repeats++;
+      }
+
+      if (repeats >= 2) {
+        collapsed.push(...paragraphs.slice(index, index + windowSize));
+        index += repeats * windowSize;
+        matched = true;
+        break;
+      }
+    }
+
+    if (!matched) {
+      collapsed.push(paragraphs[index]);
+      index++;
+    }
+  }
+
+  return collapsed.join("\n\n");
 }
 
 // endregion
@@ -148,10 +209,10 @@ export function normalizeAssistantTurn(result: StreamResult): NormalizedStreamSt
   const nativeToolCalls = normalizeNativeToolCalls(result);
   const toolCalls = nativeToolCalls.length > 0 ? nativeToolCalls : normalizeTextToolCalls(result.content);
   const { cleanText: textWithoutOptions, replyOptions } = extractReplyOptions(parsed.cleanText || "");
-  const preSanitizedVisible = sanitizeAIOutput(textWithoutOptions)
+  const preSanitizedVisible = collapseRepeatedParagraphLoops(sanitizeAIOutput(textWithoutOptions))
     .replace(/\n{3,}/g, "\n\n")
     .trim();
-  const leakedPrelude = extractLeakedReasoningPrelude(preSanitizedVisible, toolCalls.length > 0);
+  const leakedPrelude = extractLeakedReasoningPrelude(preSanitizedVisible);
 
   const visibleText = leakedPrelude.visibleText;
   const hiddenThought = [taggedHiddenThought, leakedPrelude.leakedThought].filter(Boolean).join("\n\n").trim();

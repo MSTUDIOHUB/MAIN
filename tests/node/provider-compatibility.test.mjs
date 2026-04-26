@@ -27,6 +27,7 @@ async function loadProviderCompatibilityModule() {
 }
 
 const {
+  buildProviderCompatibilitySystemMessage,
   buildCompatibilityRetryMessages,
   buildTranscriptCompatibilityRetryMessages,
   isProviderCompatibilityErrorMessage,
@@ -45,6 +46,18 @@ test("provider compatibility error helper matches weak OpenAI-compatible gateway
     isProviderCompatibilityErrorMessage('HTTP 502 Bad Gateway: {"error":{"message":"Upstream request failed","type":"upstream_error"}}'),
     false,
   );
+});
+
+test("provider compatibility prompt exposes XML write tools for implementation mode", () => {
+  const message = buildProviderCompatibilitySystemMessage("edit");
+
+  assert.equal(message.role, "system");
+  assert.match(message.content, /Tool access is available through XML tool calls/);
+  assert.match(message.content, /write_file: create or overwrite a workspace file/);
+  assert.match(message.content, /replace_in_file: edit an existing workspace file/);
+  assert.match(message.content, /run_command: run workspace commands/);
+  assert.match(message.content, /Never claim that write tools or folder access are unavailable/);
+  assert.match(message.content, /<tool>write_file<\/tool>/);
 });
 
 test("compatibility retry flattens multimodal and tool history into plain text", () => {

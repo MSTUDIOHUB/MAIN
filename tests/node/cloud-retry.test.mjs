@@ -26,7 +26,7 @@ async function loadCloudRetryModule() {
   return module.exports;
 }
 
-const { isRetryableCloudErrorMessage } = await loadCloudRetryModule();
+const { isCloudGatewayTimeoutMessage, isRetryableCloudErrorMessage } = await loadCloudRetryModule();
 
 test("cloud retry helper matches transient upstream gateway failures", () => {
   assert.equal(
@@ -41,4 +41,10 @@ test("cloud retry helper ignores non-retryable validation failures", () => {
     isRetryableCloudErrorMessage('HTTP 400 Bad Request: {"error":{"message":"Unsupported content type","type":"invalid_request_error"}}'),
     false,
   );
+});
+
+test("cloud retry helper exposes 524 as a terminal gateway timeout category", () => {
+  assert.equal(isRetryableCloudErrorMessage("HTTP 524: error code: 524"), true);
+  assert.equal(isCloudGatewayTimeoutMessage("HTTP 524: error code: 524"), true);
+  assert.equal(isCloudGatewayTimeoutMessage("HTTP 504 Gateway Timeout"), false);
 });

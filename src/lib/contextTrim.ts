@@ -494,9 +494,23 @@ export function manageContext(
   reservedForOutput?: number,
   maxToolResultTokens: number = 4000,
   maxAssistantTokens: number = 1500,
+  forceManage: boolean = false,
 ): ManageContextResult {
   const budgets = computeContextBudgets(contextLimit, reservedForOutput);
   const tokenCountBefore = estimateMessagesTokens(messages);
+  const shouldManage = forceManage || tokenCountBefore > budgets.proactiveTriggerBudget;
+
+  if (!shouldManage) {
+    return {
+      messages,
+      droppedCount: 0,
+      changed: false,
+      tokenCountBefore,
+      tokenCountAfter: tokenCountBefore,
+      tokenReduction: 0,
+      budgets,
+    };
+  }
 
   // Step 1: Compact oversized tool results
   const compacted = compactToolResults(messages, maxToolResultTokens);

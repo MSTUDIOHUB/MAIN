@@ -1086,7 +1086,7 @@ function seedCloudSettingsModelSelectScenario() {
         endpoint: "https://demo-gateway.example/v1",
         apiKey: "demo-key",
         model: "",
-        reasoningEffort: "xhigh",
+        reasoningEffort: "none",
         disableResponseStorage: true,
       },
     },
@@ -1357,7 +1357,19 @@ export function getE2EQuickReplyHandler(): ((text: string, sourceTurnId?: string
     useAppStore.setState((current) => ({
       ...current,
       taskFlow: [
-        ...current.taskFlow,
+        ...current.taskFlow.map((block) =>
+          block.turnId === turnId &&
+          block.type === "agent" &&
+          Array.isArray(block.options) &&
+          block.options.length > 0
+            ? {
+                ...block,
+                options: undefined,
+                archivedAfterChoice: true,
+                selectedOption: replyText,
+              }
+            : block,
+        ),
         { id: userBlockId, turnId, type: "user", content: replyText },
       ],
       conversationTurns: current.conversationTurns.map((turn) =>

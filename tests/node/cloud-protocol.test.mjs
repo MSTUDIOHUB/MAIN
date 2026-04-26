@@ -68,6 +68,8 @@ const {
   buildCloudHeaders,
   buildCloudMessagesApiUrl,
   buildCloudModelListCandidates,
+  compactCloudResponsesInstructions,
+  compactCloudResponsesMessages,
   createAnthropicStreamProcessor,
   extractAnthropicResponseText,
   extractOpenAiResponseText,
@@ -296,6 +298,42 @@ test("responses helpers build Codex-style store and reasoning options", () => {
       stream: false,
     },
   );
+});
+
+test("cloud responses compact instructions preserve workspace write tools", () => {
+  const longInstructions = [
+    "当前工作区绝对路径为：/tmp/workspace",
+    "可用的工具：read_file, write_file, replace_in_file, run_command",
+    "M Studio Unity 教程代码必须保留中文注释和 Region 分类。",
+    "不要声称当前环境没有写入能力。",
+    "low priority filler ".repeat(1200),
+  ].join("\n");
+
+  const compacted = compactCloudResponsesInstructions(longInstructions);
+
+  assert.ok(compacted.length <= 8000);
+  assert.match(compacted, /write_file/);
+  assert.match(compacted, /replace_in_file/);
+  assert.match(compacted, /run_command/);
+  assert.match(compacted, /M Studio Unity/);
+  assert.match(compacted, /Never claim write tools or folder access are unavailable/);
+});
+
+test("cloud responses compact messages keep recent context and summarize old history", () => {
+  const messages = [
+    { role: "system", content: "system" },
+    ...Array.from({ length: 12 }, (_, index) => ({
+      role: index % 2 === 0 ? "user" : "assistant",
+      content: `message ${index} ${"x".repeat(1500)}`,
+    })),
+  ];
+
+  const compacted = compactCloudResponsesMessages(messages);
+
+  assert.equal(compacted[0].role, "system");
+  assert.match(compacted[1].content, /older messages compacted/);
+  assert.ok(compacted.length < messages.length);
+  assert.match(compacted[compacted.length - 1].content, /message 11/);
 });
 
 test("anthropic response text extractor joins text content blocks", () => {

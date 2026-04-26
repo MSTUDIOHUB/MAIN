@@ -90,6 +90,18 @@ import { mapLegacyNexusModeToMainMode, mapMainModeToLegacyNexusMode, type MainMo
 import { runIntentPreflight } from "../lib/intentPreflight";
 import { runAfterNextPaint } from "../lib/uiScheduling";
 
+function logStoreEvent(event: string, data: Record<string, unknown> = {}) {
+  try {
+    console.info(`[store.${event}]`, data);
+  } catch {
+    // Diagnostics must never affect user workflows.
+  }
+}
+
+function nowMs() {
+  return typeof performance !== "undefined" ? performance.now() : Date.now();
+}
+
 // ── i18n ────────────────────────────────────────────────────────────
 
 export const translations = {
@@ -98,14 +110,14 @@ export const translations = {
     chatSpace: "Chat", globalChat: "Chat", noChats: "No chats yet",
     skills: "Skills", diff: "Diff Viewer", terminal: "Terminal", settings: "Settings",
     openProject: "Open Folder", noWorkspace: "No project selected", noConversations: "No conversations yet",
-    localSetup: "Local AI Engine", cloudSetup: "Cloud API", general: "General", contextSetup: "Compression",
+    localSetup: "Local AI Engine", cloudSetup: "Cloud API", general: "General", contextSetup: "Background Compression",
     instruction: "Instruction", reject: "Reject all", accept: "Accept all",
     askPlaceholder: "Ask me about your project... (Type @ to attach files)",
     askPlaceholderGlobal: "Talk through ideas, plans, or questions... (Type @ to attach files)",
-    contextLimit: "Context Token Limit",
-    contextLimitDesc: "Auto-compress history when exceeding this limit to prevent OOM.",
+    contextLimit: "Background Compression Threshold",
+    contextLimitDesc: "Lower values compress earlier and use less VRAM. Higher values keep more context but use more VRAM.",
     vramEst: "Est. KV Cache (VRAM):",
-    vramNote: "Note: This is overhead memory, base model weight VRAM not included.",
+    vramNote: "Note: This is context overhead only; base model weight VRAM is not included.",
     themeColor: "Theme Accent Color",
     themeDesc: "Choose your preferred editor highlight color.",
     chatFontSize: "Chat Font Size",
@@ -132,6 +144,7 @@ export const translations = {
     hookConfig: "Loaded hook definitions",
     hookRecords: "Recent hook records",
     dataManagement: "Data Management",
+    debugLog: "Debug Log",
     clearHistory: "Clear History",
     clearHistoryDesc: "Delete all chat history and session data for the current workspace.",
     resetSettings: "Reset All Settings",
@@ -144,14 +157,14 @@ export const translations = {
     chatSpace: "聊天", globalChat: "聊天", noChats: "暂无聊天",
     skills: "技能与提示词", diff: "变更比对", terminal: "集成终端", settings: "系统设置",
     openProject: "打开文件夹", noWorkspace: "尚未选择项目", noConversations: "暂无会话记录",
-    localSetup: "本地引擎配置", cloudSetup: "云端接口配置", general: "通用设置", contextSetup: "背景压缩阈值",
+    localSetup: "本地引擎配置", cloudSetup: "云端接口配置", general: "通用设置", contextSetup: "背景压缩",
     instruction: "用户指令", reject: "全部拒绝", accept: "全部接受",
     askPlaceholder: "询问关于你的项目... (输入 @ 引用本地文件)",
     askPlaceholderGlobal: "先和 MAIN 聊聊想法、方案或问题... (输入 @ 引用本地文件)",
-    contextLimit: "上下文压缩阈值 (Token Limit)",
-    contextLimitDesc: "对话历史超过此数值时，系统将在后台压缩早期对话以防止显存溢出 (OOM)。",
+    contextLimit: "背景压缩阈值",
+    contextLimitDesc: "数值越低越早压缩，占用显存更少；数值越高保留上下文更多，但显存占用更高。",
     vramEst: "预估上下文显存占用 (KV Cache):",
-    vramNote: "注意：这仅仅是上下文占用的显存，不包含模型本身的权重显存。",
+    vramNote: "注意：这里只估算上下文额外占用，不包含模型本身的权重显存。",
     themeColor: "全局主题配色 (Accent Color)",
     themeDesc: "选择你偏好的代码编辑器高亮色彩风格。",
     chatFontSize: "聊天区域文字大小",
@@ -178,6 +191,7 @@ export const translations = {
     hookConfig: "已加载 Hook 定义",
     hookRecords: "最近的 Hook 记录",
     dataManagement: "数据管理",
+    debugLog: "调试日志",
     clearHistory: "清空聊天记录",
     clearHistoryDesc: "删除当前工作区的所有聊天记录和会话数据。",
     resetSettings: "重置所有设置",
@@ -336,7 +350,7 @@ interface TaskBlockBase {
 export type TaskBlock =
   | (TaskBlockBase & { type: "user"; content: string; images?: string[] })
   | (TaskBlockBase & { type: "tool"; toolName: string; target: string; status: string; toolStatus: "pending" | "executed" | "rejected" | "running" | "failed"; message?: string; diff?: { old: string; new: string; path?: string } })
-  | (TaskBlockBase & { type: "agent"; content: string; options?: ReplyOption[]; streaming?: boolean; hiddenProcess?: boolean })
+  | (TaskBlockBase & { type: "agent"; content: string; options?: ReplyOption[]; streaming?: boolean; hiddenProcess?: boolean; archivedAfterChoice?: boolean; selectedOption?: string })
   | (TaskBlockBase & { type: "thought"; content: string; isStreaming?: boolean; duration?: number })
   | (TaskBlockBase & { type: "jobList"; jobs: JobItem[] })
   | (TaskBlockBase & {
@@ -926,6 +940,20 @@ function normalizeIntentSummary(summary: string): string {
   return summary.replace(/\s+/g, " ").trim();
 }
 
+function normalizeAgentContentForDedupe(content: string): string {
+  return String(content || "")
+    .replace(/<(?:analysis|thought|thinking|reasoning)(?:\s[^>]*)?>[\s\S]*?<\/(?:analysis|thought|thinking|reasoning)>/gi, " ")
+    .replace(/<\/?(?:analysis|thought|thinking|reasoning)(?:\s[^>]*)?>/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isContinuationPrompt(input: string): boolean {
+  return /^(?:继续|继续生成|继续输出|接着来|接着写|继续吧|go on|continue|keep going|proceed)[。.!！\s]*$/i.test(
+    normalizeIntentSummary(input),
+  );
+}
+
 function buildLocalTurnTitle(input: string, intent: ResolvedRunIntent, language: "zh" | "en"): string {
   const cleanedInput = normalizeConversationDisplayTitle(
     input,
@@ -1086,6 +1114,8 @@ export function sanitizeTaskBlocksForPersist(blocks: TaskBlock[]): TaskBlock[] {
           turnId: b.turnId,
           type: "agent" as const,
           content: String(b.content),
+          ...(b.archivedAfterChoice ? { archivedAfterChoice: true } : {}),
+          ...(b.selectedOption ? { selectedOption: String(b.selectedOption) } : {}),
           ...(b.options && b.options.length > 0
             ? {
                 options: b.options.map((option) => ({
@@ -1361,7 +1391,19 @@ export const useAppStore = create<AppState>()(
   stopGeneration: () => {
     const currentTurnId = get().currentTurnId;
     get().abortController?.abort();
+    invoke("cancel_proxy_request").catch(() => {});
+    invoke("cancel_chat_stream").catch(() => {});
     const currentStatus = get().agentStatus;
+    const clearCurrentTurnOptions = () => {
+      if (!currentTurnId) return;
+      set((s) => ({
+        taskFlow: s.taskFlow.map((block) =>
+          block.turnId === currentTurnId && block.type === "agent" && block.options?.length
+            ? { ...block, options: undefined }
+            : block,
+        ),
+      }));
+    };
     // Preserve pending_review so the plan panel stays visible
     if (currentStatus === "pending_review") {
       set({ isGenerating: false, abortController: null });
@@ -1369,7 +1411,14 @@ export const useAppStore = create<AppState>()(
         get().setConversationTurnStatus(currentTurnId, "awaiting_approval");
       }
     } else {
-      set({ isGenerating: false, abortController: null, agentStatus: "idle" });
+      clearCurrentTurnOptions();
+      set({
+        isGenerating: false,
+        abortController: null,
+        agentStatus: "idle",
+        pendingRunDecision: null,
+        pendingRunDecisionResolver: null,
+      });
       if (currentTurnId) {
         get().setConversationTurnStatus(currentTurnId, "done");
       }
@@ -2150,12 +2199,12 @@ export const useAppStore = create<AppState>()(
             if (state.config.language === "en") {
               return hasTasksArtifact
                 ? "The plan is approved. Continue directly from the current tasks.md and execute the remaining items without repeating the plan.\n\n" + buildPlanCommandExecutionHint(state.planTasks, "en")
-                : "The plan is approved. First generate `.MAIN/plans/tasks.md` from the approved requirements/design or bugfix, then execute the remaining work from that task list without repeating the plan. When a task needs shell work, include the exact command in backticks inside tasks.md; use run_command for finite commands, or execute_command plus PTY read/status tools for long-running or interactive commands.";
+                : "The plan is approved. First generate `.MAIN/plans/tasks.md` from the approved requirements/design or bugfix, then execute the remaining work from that task list without repeating the plan. Keep tasks.md concise: 8-20 checkboxes, one sentence each. When a task needs shell work, include the exact command in backticks inside tasks.md; use run_command for finite commands, or execute_command plus PTY read/status tools for long-running or interactive commands.";
             }
 
             return hasTasksArtifact
               ? "计划已批准。请直接基于当前 tasks.md 继续执行剩余任务，不要重复计划内容。\n\n" + buildPlanCommandExecutionHint(state.planTasks, "zh")
-              : "计划已批准。请先基于已批准的 requirements/design 或 bugfix 生成 `.MAIN/plans/tasks.md`，然后再按照任务清单继续执行，不要重复计划内容。对于需要 shell 的任务，请把精确命令写进 tasks.md 的 checkbox 并用反引号包裹；一次性命令用 run_command，长驻或交互式命令用 execute_command 后再读取 PTY 日志/状态。";
+              : "计划已批准。请先基于已批准的 requirements/design 或 bugfix 生成 `.MAIN/plans/tasks.md`，然后再按照任务清单继续执行，不要重复计划内容。tasks.md 必须精简为 8-20 个 checkbox，每项一句话。对于需要 shell 的任务，请把精确命令写进 tasks.md 的 checkbox 并用反引号包裹；一次性命令用 run_command，长驻或交互式命令用 execute_command 后再读取 PTY 日志/状态。";
           })(),
           undefined,
           { hidden: true, reuseCurrentTurn: true, preservePlanState: true },
@@ -2398,6 +2447,7 @@ export const useAppStore = create<AppState>()(
     attachedFilesSnapshot?: string[];
   }) => {
     const state = get();
+    const sendStartedAt = nowMs();
     console.log('[sendMessage] called, text:', text?.slice(0, 50), 'agentStatus:', state.agentStatus, 'workspace:', state.currentWorkspace, 'activeProfile:', state.config.activeProfile);
     const isHidden = options?.hidden === true;
     const mentionSnapshot = options?.contextMentionsSnapshot ?? state.contextMentions;
@@ -2407,6 +2457,13 @@ export const useAppStore = create<AppState>()(
       ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId) || null
       : null;
     const currentTurnIntent = resolveConversationTurnIntent(currentTurn);
+    const currentMainModeKey = state.selectedMainModeKey;
+    const shouldContinuePlanIntent =
+      !isHidden &&
+      currentMainModeKey === "main_mode" &&
+      currentTurnIntent === "plan" &&
+      isContinuationPrompt(text) &&
+      (state.planStage !== "completed" || state.planArtifacts.length === 0);
     const shouldAutoResumeChoiceTurn =
       !isHidden &&
       options?.reuseCurrentTurn !== true &&
@@ -2416,11 +2473,16 @@ export const useAppStore = create<AppState>()(
       !!state.currentTurnId;
     const preservePlanState =
       options?.preservePlanState === true ||
+      shouldContinuePlanIntent ||
       (shouldAutoResumeChoiceTurn && currentTurnIntent === "plan");
+    const parsedStudioCommand = currentMainModeKey === "game_studio"
+      ? parseGameStudioSlashCommand(text)
+      : null;
     const preferredLanguage = isHidden
       ? state.preferredResponseLanguage
+      : parsedStudioCommand
+      ? state.config.language
       : detectDominantLanguage(text, state.config.language);
-    const currentMainModeKey = state.selectedMainModeKey;
     const mainIntentShortcut = !isHidden && currentMainModeKey === "main_mode"
       ? parseMainIntentShortcut(text)
       : null;
@@ -2433,18 +2495,44 @@ export const useAppStore = create<AppState>()(
     if (!text.trim() && !hasSupplementalInput && !images?.length) {
       return false;
     }
-    const parsedStudioCommand = currentMainModeKey === "game_studio"
-      ? parseGameStudioSlashCommand(text)
-      : null;
+    logStoreEvent("send_start", {
+      textChars: text.length,
+      isHidden,
+      reuseCurrentTurn,
+      shouldAutoResumeChoiceTurn,
+      preservePlanState,
+      currentTurnId: state.currentTurnId,
+      currentTurnStatus: currentTurn?.status ?? null,
+      currentTurnIntent,
+      selectedMainModeKey: currentMainModeKey,
+      taskFlowBlocks: state.taskFlow.length,
+      agentMessages: state.agentMessages.length,
+      conversationTurns: state.conversationTurns.length,
+      contextMentions: mentionSnapshot.length,
+      attachedFiles: attachedFilesSnapshot.length,
+      images: images?.length ?? 0,
+    });
     const isLocalStudioCommand =
       parsedStudioCommand?.type === "agent" || parsedStudioCommand?.type === "auto";
     let effectiveRunIntent =
       options?.resolvedIntent ||
       lockedComposerIntent ||
+      (shouldContinuePlanIntent ? "plan" : null) ||
       (preservePlanState
         ? currentTurnIntent
         : resolveRunIntentFromLegacyWorkflowMode(state.config.workflowMode));
     let effectiveIntentSummary = normalizeIntentSummary(options?.intentSummary || "");
+
+    if (shouldContinuePlanIntent && !effectiveIntentSummary) {
+      effectiveIntentSummary = buildRunIntentSummary({
+        input: currentTurn?.userPrompt || text,
+        intent: "plan",
+        language: preferredLanguage,
+        reason: preferredLanguage === "en"
+          ? "Continue the previous planning turn until the plan is produced."
+          : "继续上一轮计划目标，直到生成计划结果。",
+      });
+    }
 
     if (lockedComposerIntent && !effectiveIntentSummary) {
       effectiveIntentSummary = buildRunIntentSummary({
@@ -2457,7 +2545,7 @@ export const useAppStore = create<AppState>()(
       });
     }
 
-    if (!isHidden && !lockedComposerIntent && !options?.skipIntentResolution && !options?.resolvedIntent) {
+    if (!isHidden && !lockedComposerIntent && !shouldContinuePlanIntent && !options?.skipIntentResolution && !options?.resolvedIntent) {
       const resolution = resolveTurnRunIntent(text, {
         language: preferredLanguage,
         mainModeKey: currentMainModeKey,
@@ -2812,6 +2900,11 @@ export const useAppStore = create<AppState>()(
 
     // 1. Push user message to visible taskFlow
     const currentImages = images || [];
+    const shouldArchiveChoiceFeedback =
+      reuseCurrentTurn &&
+      !isHidden &&
+      currentTurn?.status === "awaiting_input";
+    const selectedChoiceText = shouldArchiveChoiceFeedback ? text.trim() : "";
     const userBlock: TaskBlock | null = isHidden
       ? null
       : {
@@ -2823,40 +2916,73 @@ export const useAppStore = create<AppState>()(
         };
     set((s) => ({
       ...(userBlock
-        ? {
-            taskFlow: [...s.taskFlow, userBlock],
-            conversationTurns: reuseCurrentTurn
-              ? s.conversationTurns.map((turn) =>
-                  turn.id === turnId
-                ? {
-                    ...turn,
-                    status: initialTurnStatus,
-                    intent: effectiveRunIntent,
-                    intentSummary: turn.intentSummary || effectiveIntentSummary,
-                    mode: effectiveWorkflowMode,
-                    blockIds: turn.blockIds.includes(userBlock.id) ? turn.blockIds : [...turn.blockIds, userBlock.id],
-                  }
-                    : turn
+        ? (() => {
+            const archivedTaskFlow = shouldArchiveChoiceFeedback
+              ? s.taskFlow.map((block) =>
+                  block.turnId === turnId &&
+                  block.type === "agent" &&
+                  Array.isArray(block.options) &&
+                  block.options.length > 0
+                    ? {
+                        ...block,
+                        options: undefined,
+                        archivedAfterChoice: true,
+                        ...(selectedChoiceText ? { selectedOption: selectedChoiceText } : {}),
+                      }
+                    : block,
                 )
-              : [
-                  ...s.conversationTurns,
-                  {
-                    id: turnId,
-                    userPrompt: text,
-                    title: turnTitle,
-                    intentSummary: effectiveIntentSummary,
-                    mode: effectiveWorkflowMode,
-                    intent: effectiveRunIntent,
-                    status: initialTurnStatus,
-                    summary: "",
-                    blockIds: [userBlock.id],
-                    collapsed: false,
-                    createdAt: Date.now(),
-                  },
-                ],
-          }
+              : s.taskFlow;
+
+            return {
+              taskFlow: [...archivedTaskFlow, userBlock],
+              conversationTurns: reuseCurrentTurn
+                ? s.conversationTurns.map((turn) =>
+                    turn.id === turnId
+                      ? {
+                          ...turn,
+                          status: initialTurnStatus,
+                          intent: effectiveRunIntent,
+                          intentSummary: turn.intentSummary || effectiveIntentSummary,
+                          mode: effectiveWorkflowMode,
+                          blockIds: turn.blockIds.includes(userBlock.id) ? turn.blockIds : [...turn.blockIds, userBlock.id],
+                        }
+                      : turn
+                  )
+                : [
+                    ...s.conversationTurns,
+                    {
+                      id: turnId,
+                      userPrompt: text,
+                      title: turnTitle,
+                      intentSummary: effectiveIntentSummary,
+                      mode: effectiveWorkflowMode,
+                      intent: effectiveRunIntent,
+                      status: initialTurnStatus,
+                      summary: "",
+                      blockIds: [userBlock.id],
+                      collapsed: false,
+                      createdAt: Date.now(),
+                    },
+                  ],
+            };
+        })()
         : reuseCurrentTurn
         ? {
+            taskFlow: shouldArchiveChoiceFeedback
+              ? s.taskFlow.map((block) =>
+                  block.turnId === turnId &&
+                  block.type === "agent" &&
+                  Array.isArray(block.options) &&
+                  block.options.length > 0
+                    ? {
+                        ...block,
+                        options: undefined,
+                        archivedAfterChoice: true,
+                        ...(selectedChoiceText ? { selectedOption: selectedChoiceText } : {}),
+                      }
+                    : block,
+                )
+              : s.taskFlow,
             conversationTurns: s.conversationTurns.map((turn) =>
               turn.id === turnId
                 ? {
@@ -2873,6 +2999,15 @@ export const useAppStore = create<AppState>()(
       currentTurnId: turnId,
       input: isHidden ? s.input : "",
       preferredResponseLanguage: preferredLanguage,
+      ...(shouldArchiveChoiceFeedback
+        ? {
+            normalizedStreamState: {
+              ...s.normalizedStreamState,
+              replyOptions: [],
+              finishReason: null,
+            },
+          }
+        : {}),
       pendingSlashCommand: parsedStudioCommand?.type === "workflow" ? parsedStudioCommand : null,
       lockedComposerIntent: null,
       pendingRunDecision: null,
@@ -2881,6 +3016,20 @@ export const useAppStore = create<AppState>()(
       ...(preservePlanState ? {} : { isPlanApproved: false }),
       elapsedTime: 0,
     }));
+
+    logStoreEvent("visible_turn_appended", {
+      turnId,
+      reuseCurrentTurn,
+      shouldArchiveChoiceFeedback,
+      selectedChoiceChars: selectedChoiceText.length,
+      userBlockId: userBlock?.id ?? null,
+      effectiveRunIntent,
+      effectiveWorkflowMode,
+      initialTurnStatus,
+      elapsedMs: Math.round(nowMs() - sendStartedAt),
+      taskFlowBlocks: get().taskFlow.length,
+      conversationTurns: get().conversationTurns.length,
+    });
 
     if (!isHidden && shouldSeedSessionTitle && ensuredSessionId) {
       get().updateSession(sessionScopeKey, ensuredSessionId, { title: turnTitle, active: true });
@@ -3013,6 +3162,25 @@ export const useAppStore = create<AppState>()(
         userContent = parts.join("\n\n") + "\n\n" + text;
       }
 
+      if (shouldContinuePlanIntent) {
+        const originalPlanPrompt = currentTurn?.userPrompt?.trim();
+        userContent = preferredLanguage === "en"
+          ? [
+              "Continue the previous PLAN turn. The user is asking to keep going, not to start a new discussion.",
+              originalPlanPrompt ? `Original plan request: ${originalPlanPrompt}` : "Original plan request: use the current conversation context.",
+              "Produce real planning progress now. If key choices remain, summarize them briefly and use <user_options>; otherwise provide the concise plan/proposal.",
+              "Keep any plan Markdown concise: review-summary style, no tutorial prose, no full code listings, no repeated background.",
+              text.trim() ? `Latest user message: ${text.trim()}` : "Latest user message: continue",
+            ].join("\n")
+          : [
+              "请继续上一轮 PLAN 回合。用户是在要求继续推进，不是开启新的普通讨论。",
+              originalPlanPrompt ? `上一轮计划请求：${originalPlanPrompt}` : "上一轮计划请求：请依据当前对话上下文继续。",
+              "现在必须产生实际规划进展。如果仍有关键选择要用户拍板，就先简短归纳并使用 <user_options>；否则给出精简方案/Proposal。",
+              "所有计划 Markdown 都要精简成审阅摘要风格，不要写教程式长文、完整代码清单或重复背景。",
+              text.trim() ? `用户最新消息：${text.trim()}` : "用户最新消息：继续",
+            ].join("\n");
+      }
+
       const shouldUseGameStudioEnvelope =
         currentMainModeKey === "game_studio" &&
         (
@@ -3073,6 +3241,7 @@ export const useAppStore = create<AppState>()(
           nexusMode: mapMainModeToLegacyNexusMode(currentMainModeKey),
           activeStudioAgent: activeStudioAgentKey,
           command: parsedStudioCommand?.type === "workflow" ? parsedStudioCommand : null,
+          responseLanguage: preferredLanguage,
         });
       }
 
@@ -3103,6 +3272,7 @@ export const useAppStore = create<AppState>()(
 
       // Track the current streaming assistant block
       let currentStreamingBlockId: number | null = null;
+      const agentBlockIdsCreatedThisRun = new Set<number>();
       // Track thought timing for duration display
       let thoughtStartTime: number | null = null;
       // Current streaming thought block id (for live updates)
@@ -3120,6 +3290,9 @@ export const useAppStore = create<AppState>()(
       // 将新产生的可视块自动挂到当前回合，避免聊天区之后再靠扫描推断归属。
       const appendTurnBlock = (block: TaskBlock) => {
         const blockWithTurn: TaskBlock = { ...block, turnId: block.turnId ?? turnId };
+        if (blockWithTurn.type === "agent") {
+          agentBlockIdsCreatedThisRun.add(blockWithTurn.id);
+        }
         set((s) => ({
           taskFlow: [...s.taskFlow, blockWithTurn],
           conversationTurns: s.conversationTurns.map((turn) =>
@@ -3290,8 +3463,52 @@ export const useAppStore = create<AppState>()(
       };
       // endregion
 
+      const removeLatestAgentBlockForTurn = () => {
+        set((s) => {
+          const latestAgent = [...s.taskFlow]
+            .reverse()
+            .find((block): block is Extract<TaskBlock, { type: "agent" }> =>
+              block.turnId === turnId &&
+              block.type === "agent" &&
+              agentBlockIdsCreatedThisRun.has(block.id)
+            );
+          if (!latestAgent) {
+            return {
+              normalizedStreamState: {
+                ...s.normalizedStreamState,
+                visibleText: "",
+                replyOptions: [],
+              },
+            };
+          }
+
+          agentBlockIdsCreatedThisRun.delete(latestAgent.id);
+
+          return {
+            normalizedStreamState: {
+              ...s.normalizedStreamState,
+              visibleText: "",
+              replyOptions: [],
+            },
+            taskFlow: s.taskFlow.filter((block) => block.id !== latestAgent.id),
+            conversationTurns: s.conversationTurns.map((turn) =>
+              turn.id === turnId
+                ? { ...turn, blockIds: turn.blockIds.filter((blockId) => blockId !== latestAgent.id) }
+                : turn
+            ),
+          };
+        });
+      };
+
       // Get workspace tree for system prompt
+      const workspaceTreeStartedAt = nowMs();
       const workspaceTree = await getWorkspaceTree(state.currentWorkspace);
+      logStoreEvent("workspace_tree_ready", {
+        turnId,
+        workspace: state.currentWorkspace || "global",
+        chars: workspaceTree.length,
+        elapsedMs: Math.round(nowMs() - workspaceTreeStartedAt),
+      });
 
       const callbacks: OrchestratorCallbacks = {
         getMessages: () => get().agentMessages,
@@ -3325,6 +3542,14 @@ export const useAppStore = create<AppState>()(
         onStreamToken: (token, _msgId) => {
           // Handle escalation reset signal
           if (token.startsWith("__ESCALATION_RESET__:")) {
+            logStoreEvent("stream_reset", {
+              turnId,
+              currentStreamingBlockId,
+              tokenBufferChars: tokenBuffer.length,
+              agentBlocksCreatedThisRun: agentBlockIdsCreatedThisRun.size,
+              taskFlowBlocks: get().taskFlow.length,
+            });
+            tokenBuffer = "";
             // Reset the streaming block content for retry
             if (currentStreamingBlockId !== null) {
               const blockId = currentStreamingBlockId;
@@ -3333,8 +3558,10 @@ export const useAppStore = create<AppState>()(
                   t.id === blockId && t.type === "agent"
                     ? { ...t, content: "" }
                     : t
-                ),
+                  ),
               }));
+            } else {
+              removeLatestAgentBlockForTurn();
             }
             return;
           }
@@ -3346,6 +3573,13 @@ export const useAppStore = create<AppState>()(
 
         onStreamDone: (_fullText, _msgId, truncated) => {
           finalizeStreamingUi();
+          logStoreEvent("stream_done", {
+            turnId,
+            fullTextChars: _fullText.length,
+            truncated,
+            taskFlowBlocks: get().taskFlow.length,
+            agentBlocksCreatedThisRun: agentBlockIdsCreatedThisRun.size,
+          });
 
           // Show truncation warning if the model hit max_tokens
           if (truncated) {
@@ -3490,7 +3724,12 @@ export const useAppStore = create<AppState>()(
             }
           }
 
-          const latestBlock = get().taskFlow[get().taskFlow.length - 1];
+          const currentFlow = get().taskFlow;
+          const latestBlock = [...currentFlow].reverse().find((block) =>
+            block.turnId === turnId &&
+            block.type === "agent" &&
+            agentBlockIdsCreatedThisRun.has(block.id)
+          );
           if (!latestBlock || latestBlock.type !== "agent" || latestBlock.turnId !== turnId) {
             appendTurnBlock({ id: nextId(), turnId, type: "agent", content: cleanText, streaming: true });
             set((s) => ({
@@ -3505,10 +3744,12 @@ export const useAppStore = create<AppState>()(
           set((s) => ({
             normalizedStreamState: {
               ...s.normalizedStreamState,
-              visibleText: `${s.normalizedStreamState.visibleText}\n${cleanText}`.trim(),
+              visibleText: s.normalizedStreamState.visibleText.trim().includes(cleanText.trim())
+                ? s.normalizedStreamState.visibleText
+                : `${s.normalizedStreamState.visibleText}\n${cleanText}`.trim(),
             },
-            taskFlow: s.taskFlow.map((t, idx) =>
-              idx === s.taskFlow.length - 1 && t.type === "agent" && !t.content.trim().includes(cleanText)
+            taskFlow: s.taskFlow.map((t) =>
+              t.id === latestBlock.id && t.type === "agent" && !t.content.trim().includes(cleanText)
                 ? { ...t, content: t.content + cleanText, streaming: true }
                 : t
             ),
@@ -3522,7 +3763,22 @@ export const useAppStore = create<AppState>()(
               : "请选择你希望我如何继续。"
             : "";
           const cleanText = text.trim() || fallbackText;
-          const latestBlock = get().taskFlow[get().taskFlow.length - 1];
+          const currentFlow = get().taskFlow;
+          const latestBlock = [...currentFlow].reverse().find((block) =>
+            block.turnId === turnId &&
+            block.type === "agent" &&
+            agentBlockIdsCreatedThisRun.has(block.id)
+          );
+          const cleanTextKey = normalizeAgentContentForDedupe(cleanText);
+          logStoreEvent("assistant_final_text", {
+            turnId,
+            textChars: text.length,
+            cleanTextChars: cleanText.length,
+            replyOptions: replyOptions.length,
+            latestBlockId: latestBlock?.id ?? null,
+            agentBlocksCreatedThisRun: agentBlockIdsCreatedThisRun.size,
+            taskFlowBlocks: currentFlow.length,
+          });
 
           if (!cleanText) {
             if (latestBlock && latestBlock.type === "agent" && latestBlock.turnId === turnId) {
@@ -3535,6 +3791,35 @@ export const useAppStore = create<AppState>()(
               }));
             }
             return;
+          }
+
+          if (latestBlock && replyOptions.length === 0 && cleanTextKey) {
+            const duplicatedEarlierBlock = [...currentFlow]
+              .reverse()
+              .find((block): block is Extract<TaskBlock, { type: "agent" }> =>
+                block.turnId === turnId &&
+                block.type === "agent" &&
+                block.id !== latestBlock.id &&
+                normalizeAgentContentForDedupe(block.content) === cleanTextKey
+              );
+
+            if (duplicatedEarlierBlock) {
+              set((s) => ({
+                normalizedStreamState: {
+                  ...s.normalizedStreamState,
+                  visibleText: String(duplicatedEarlierBlock.content || ""),
+                  replyOptions,
+                },
+                taskFlow: s.taskFlow.filter((block) => block.id !== latestBlock.id),
+                conversationTurns: s.conversationTurns.map((turn) =>
+                  turn.id === turnId
+                    ? { ...turn, blockIds: turn.blockIds.filter((blockId) => blockId !== latestBlock.id) }
+                    : turn
+                ),
+              }));
+              agentBlockIdsCreatedThisRun.delete(latestBlock.id);
+              return;
+            }
           }
 
           if (!latestBlock || latestBlock.type !== "agent" || latestBlock.turnId !== turnId) {
@@ -3590,7 +3875,6 @@ export const useAppStore = create<AppState>()(
                 task.target === target &&
                 (task.toolStatus === "pending" || task.toolStatus === "running")
               )?.index;
-            const lastInTurn = [...s.taskFlow].reverse().find((task) => task.turnId === turnId);
             const nextFlow = [...s.taskFlow];
             let appendedBlockId: number | null = null;
             if (pendingIdx != null && pendingIdx >= 0) {
@@ -3621,14 +3905,7 @@ export const useAppStore = create<AppState>()(
               });
             }
             return {
-              taskFlow: nextFlow.map((task) =>
-                lastInTurn &&
-                task.id === lastInTurn.id &&
-                task.type === "agent" &&
-                !task.streaming
-                  ? { ...task, hiddenProcess: true }
-                  : task
-              ),
+              taskFlow: nextFlow,
               conversationTurns: appendedBlockId == null
                 ? s.conversationTurns
                 : s.conversationTurns.map((turn) =>
@@ -3718,6 +3995,14 @@ export const useAppStore = create<AppState>()(
         },
 
         onStatusChange: (status) => {
+          logStoreEvent("status_change", {
+            turnId,
+            status,
+            replyOptions: get().normalizedStreamState.replyOptions.length,
+            taskFlowBlocks: get().taskFlow.length,
+            agentMessages: get().agentMessages.length,
+            elapsedMs: Math.round(nowMs() - sendStartedAt),
+          });
           const finalizeStaleRunningTools = (finalStatus: "executed" | "failed", message: string) => {
             set((s) => ({
               taskFlow: s.taskFlow.map((task) =>
@@ -3768,18 +4053,25 @@ export const useAppStore = create<AppState>()(
 
         onError: (error) => {
           console.error('[sendMessage] onError callback:', error);
+          logStoreEvent("agent_error", {
+            turnId,
+            error: typeof error === "string" ? error : String(error),
+            taskFlowBlocks: get().taskFlow.length,
+            agentMessages: get().agentMessages.length,
+          });
           finalizeStreamingUi();
-          const isResponseBodyDecodeError = /error decoding response body/i.test(error);
+          const errorMessage = typeof error === "string" ? error : String(error);
+          const isResponseBodyDecodeError = /error decoding response body/i.test(errorMessage);
           const friendlyError = isResponseBodyDecodeError
-            ? "模型服务在传输回复时中断或返回了无法解析的数据。原始错误：" + error
-            : error;
+            ? "模型服务在传输回复时中断或返回了无法解析的数据。原始错误：" + errorMessage
+            : errorMessage;
           const currentTurn = get().conversationTurns.find((turn) => turn.id === turnId);
           if (!currentTurn?.summary?.trim()) {
             get().setConversationTurnSummary(
               turnId,
               isResponseBodyDecodeError
                 ? "模型服务传输中断，已保留本轮已完成的操作记录。"
-                : summarizeAssistantText(error),
+                : summarizeAssistantText(errorMessage),
             );
           }
           const block: TaskBlock = {
@@ -3839,10 +4131,21 @@ export const useAppStore = create<AppState>()(
         },
 
         appendMessage: (msg) => {
+          logStoreEvent("append_agent_message", {
+            turnId,
+            role: msg.role,
+            contentChars: typeof msg.content === "string" ? msg.content.length : JSON.stringify(msg.content).length,
+            hasToolCalls: !!msg.tool_calls?.length,
+            beforeMessages: get().agentMessages.length,
+          });
           set((s) => ({ agentMessages: [...s.agentMessages, msg] }));
         },
 
         replaceMessages: (msgs) => {
+          logStoreEvent("replace_agent_messages", {
+            turnId,
+            nextMessages: msgs.length,
+          });
           set({ agentMessages: msgs });
         },
 
@@ -4097,8 +4400,18 @@ export const useAppStore = create<AppState>()(
         workspaceTreePanelWidth: state.workspaceTreePanelWidth,
         rightPanelWidth: state.rightPanelWidth,
       }),
-      onRehydrateStorage: () => (state, error) => {
-        if (error || !state) return;
+      onRehydrateStorage: () => {
+        const startedAt = nowMs();
+        logStoreEvent("rehydrate_start", {});
+        return (state, error) => {
+        if (error || !state) {
+          logStoreEvent("rehydrate_done", {
+            ok: false,
+            elapsedMs: Math.round(nowMs() - startedAt),
+            error: error instanceof Error ? error.message : error ? String(error) : "missing_state",
+          });
+          return;
+        }
 
         const hydratedTaskFlow = sanitizeTaskBlocksForPersist(state.taskFlow || []);
         syncTaskIdCounterFromBlocks(hydratedTaskFlow);
@@ -4136,6 +4449,17 @@ export const useAppStore = create<AppState>()(
           messages: [],
           elapsedTime: 0,
         });
+        logStoreEvent("rehydrate_done", {
+          ok: true,
+          elapsedMs: Math.round(nowMs() - startedAt),
+          taskFlowBlocks: hydratedTaskFlow.length,
+          agentMessages: (state.agentMessages || []).length,
+          conversationTurns: (state.conversationTurns || []).length,
+          sessions: Object.values(state.sessionsByWorkspace || {}).reduce((count, sessions) => count + (Array.isArray(sessions) ? sessions.length : 0), 0),
+          currentWorkspace: state.currentWorkspace || "global",
+          currentSessionId: state.currentSessionId ?? null,
+        });
+        };
       },
     // Merge persisted data back into the default state on hydration,
     // so newly-added fields get their defaults instead of being undefined.

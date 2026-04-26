@@ -57,7 +57,7 @@ function loadTranspiledModuleSync(sourcePath) {
   return module.exports;
 }
 
-const { isAssistantTurnEmpty } = loadTranspiledModuleSync(
+const { isAssistantTurnEmpty, normalizeAssistantTurn } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/normalizedTurn.ts"),
 );
 
@@ -93,4 +93,39 @@ test("assistant turn empty guard ignores tool-only and text responses", () => {
     }),
     false,
   );
+});
+
+test("normalization collapses repeated local-model preamble loops", () => {
+  const repeated = [
+    "让我开始实现。",
+    "首先，我需要创建BattleUnit.cs - 战斗单位类",
+    "然后，我需要修复现有代码中的问题。",
+    "让我开始实现。",
+    "首先，我需要创建BattleUnit.cs - 战斗单位类",
+    "然后，我需要修复现有代码中的问题。",
+    "让我开始实现。",
+    "首先，我需要创建BattleUnit.cs - 战斗单位类",
+    "然后，我需要修复现有代码中的问题。",
+    "<tool_use>",
+    "<tool>get_project_skeleton</tool>",
+    "<parameter name=\"depth\">3</parameter>",
+    "</tool_use>",
+  ].join("\n\n");
+
+  const normalized = normalizeAssistantTurn({
+    content: repeated,
+    toolCalls: [],
+    finishReason: "tool_calls",
+  });
+
+  assert.equal(
+    normalized.visibleText,
+    [
+      "让我开始实现。",
+      "首先，我需要创建BattleUnit.cs - 战斗单位类",
+      "然后，我需要修复现有代码中的问题。",
+    ].join("\n\n"),
+  );
+  assert.equal(normalized.toolCalls.length, 1);
+  assert.equal(normalized.toolCalls[0].name, "get_project_skeleton");
 });

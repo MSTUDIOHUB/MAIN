@@ -65,7 +65,7 @@ test("cloud settings auto-fetches models and renders a selectable dropdown", asy
   await expect(page.getByTestId("cloud-model-fetched-count")).toContainText("已拉取 12 个模型");
   await expect(page.getByTestId("cloud-model-select")).toHaveValue("gpt-4.1");
   await expect(page.getByTestId("cloud-model-select").locator("option")).toHaveCount(12);
-  await expect(reasoningEffortSelect).toHaveValue("xhigh");
+  await expect(reasoningEffortSelect).toHaveValue("none");
   await expect(page.getByText("Disable Response Storage")).toBeVisible();
 
   await page.getByTestId("cloud-model-select").selectOption("qwen-max");

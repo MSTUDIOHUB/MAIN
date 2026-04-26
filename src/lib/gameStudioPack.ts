@@ -355,6 +355,7 @@ export function buildGameStudioEnvelopeForTurn(params: {
   nexusMode: NexusModeKey;
   activeStudioAgent: StudioAgentKey;
   command: PendingSlashCommand | null;
+  responseLanguage?: "zh" | "en";
 }): string {
   if (params.nexusMode !== "nexus_game_studio") {
     return params.originalText;
@@ -375,5 +376,6 @@ export function buildGameStudioEnvelopeForTurn(params: {
     command: params.command,
     commandPath,
     agentPath,
+    responseLanguage: params.responseLanguage,
   });
 }

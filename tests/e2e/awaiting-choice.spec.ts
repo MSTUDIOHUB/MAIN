@@ -44,4 +44,12 @@ test("reply options pause the turn and continue within the same turn after selec
     .toBe(true);
 
   await expect(page.getByTestId("turn-summary-card").filter({ hasText: "用户完成选择后，当前回合已继续并保留上下文。" })).toBeVisible();
+
+  await page.getByTestId("turn-summary-card").getByRole("button", { name: /展开/ }).click();
+  await expect(page.getByTestId("archived-choice-feedback")).toContainText("已保留上一步反馈");
+  await expect(page.getByTestId("archived-choice-feedback")).toContainText("先修暂停等待选择");
+
+  await page.getByTestId("archived-choice-feedback").click();
+  await expect(page.getByTestId("archived-choice-feedback-expanded")).toContainText("已选择：先修暂停等待选择");
+  await expect(page.getByText("我发现这里有一个关键分叉，需要你先确认优先级")).toBeVisible();
 });

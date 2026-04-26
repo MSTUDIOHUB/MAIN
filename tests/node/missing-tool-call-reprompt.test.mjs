@@ -104,3 +104,11 @@ test("read-only continuation prompt tells the model to start tools immediately",
   assert.match(prompt, /analyze_tabular_document/);
   assert.match(prompt, /不要再输出“请稍候”/);
 });
+
+test("second missing-tool retry uses strict single-tool-call wording", () => {
+  const prompt = buildMissingToolCallContinuationPrompt("generic", "zh", 2);
+
+  assert.match(prompt, /只输出一个 `<tool_use>` 工具调用块/);
+  assert.match(prompt, /不要输出任何普通正文/);
+  assert.match(prompt, /write_file/);
+});

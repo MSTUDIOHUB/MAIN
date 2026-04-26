@@ -37,6 +37,31 @@ const TURN_STATUS_LABELS: Record<string, string> = {
   error: "Error",
 };
 
+const AGENT_CONTENT_PREVIEW_CHARS = 180_000;
+
+function getDisplayAgentContent(content: string, showFull: boolean) {
+  const raw = String(content || "");
+  if (showFull || raw.length <= AGENT_CONTENT_PREVIEW_CHARS) {
+    return { content: raw, truncated: false, hiddenChars: 0 };
+  }
+
+  return {
+    content: raw.slice(0, AGENT_CONTENT_PREVIEW_CHARS),
+    truncated: true,
+    hiddenChars: raw.length - AGENT_CONTENT_PREVIEW_CHARS,
+  };
+}
+
+function getAgentPreviewContent(content: string) {
+  return getDisplayAgentContent(content, false).content;
+}
+
+function getAgentInspectableContent(content: string) {
+  const raw = String(content || "");
+  if (raw.length <= AGENT_CONTENT_PREVIEW_CHARS) return raw;
+  return `${raw.slice(0, AGENT_CONTENT_PREVIEW_CHARS)}\n\n${raw.slice(-20_000)}`;
+}
+
 function getTurnStatusTone(status: string): string {
   switch (status) {
     case "planning":
@@ -118,9 +143,10 @@ function ContextCompressionNotice({ block, language }: { block: any; language: "
   const [isExpanded, setIsExpanded] = useState(false);
   const stats = block.contextCompression || {};
   const isReactive = stats.reason === "reactive";
+  const isMicroOnly = !isReactive && Number(stats.droppedCount || 0) === 0;
   const title = language === "zh"
-    ? isReactive ? "背景压缩 · 溢出保护" : "背景已压缩"
-    : isReactive ? "Context compressed · overflow guard" : "Context compressed";
+    ? isReactive ? "背景压缩 · 溢出保护" : isMicroOnly ? "长内容已整理" : "背景已压缩"
+    : isReactive ? "Context compressed · overflow guard" : isMicroOnly ? "Long content compacted" : "Context compressed";
   const compactLabel = language === "zh" ? "查看" : "View";
   const bodyText = String(stats.compressedContext || "").trim() || (language === "zh"
     ? "当前只保存了压缩统计，暂无可展示的压缩摘要。"
@@ -194,7 +220,7 @@ function hasRenderableAgentContent(blocks: any[]) {
 function hasRenderableAgentBlock(block: any) {
   if (block.type !== "agent") return false;
   if (Array.isArray(block.options) && block.options.length > 0) return true;
-  const segments = parseMessageContent(block.content);
+  const segments = parseMessageContent(getAgentPreviewContent(block.content));
   return segments.some((seg) => seg.type === "text" && sanitizeAIOutput(seg.content).length > 0);
 }
 
@@ -203,12 +229,14 @@ function getLastAgentSummaryText(blocks: any[]) {
     .reverse()
     .find((block) => block.type === "agent" && !block.hiddenProcess && hasRenderableAgentBlock(block));
   if (!agentBlock) return "";
-  return parseMessageContent(agentBlock.content)
+  const summaryText = parseMessageContent(getAgentPreviewContent(agentBlock.content))
     .filter((seg) => seg.type === "text")
     .map((seg) => sanitizeAIOutput(seg.content))
     .filter(Boolean)
     .join("\n\n")
     .trim();
+
+  return summaryText.length > 700 ? `${summaryText.slice(0, 700).trim()}...` : summaryText;
 }
 
 function hasGeneratedPlanContent(blocks: any[]) {
@@ -218,7 +246,7 @@ function hasGeneratedPlanContent(blocks: any[]) {
     }
 
     if (block.type !== "agent") return false;
-    const raw = String(block.content || "");
+    const raw = getAgentInspectableContent(block.content);
     return hasStructuredPlanProposal(raw) || hasPlanDraftPreview(raw);
   });
 }
@@ -477,6 +505,173 @@ function TurnChangesCard({
             <span className="shrink-0 text-[11px] font-medium text-[#f87171]">-{entry.removed}</span>
           </button>
         ))}
+      </div>
+    </div>
+  );
+}
+
+function AgentContentBlock({
+  block,
+  language,
+  chatFontSize,
+  onQuickReply,
+  isStreaming,
+}: {
+  block: any;
+  language: "zh" | "en";
+  chatFontSize: number;
+  onQuickReply?: (value: string, turnId?: string) => void;
+  isStreaming: boolean;
+}) {
+  const rawContent = String(block.content || "");
+  const isLongContent = rawContent.length > AGENT_CONTENT_PREVIEW_CHARS;
+  const [showFullLongContent, setShowFullLongContent] = useState(false);
+  const [isArchivedExpanded, setIsArchivedExpanded] = useState(false);
+  const displayContent = getDisplayAgentContent(rawContent, isLongContent && showFullLongContent && !block.streaming);
+  const segments = parseMessageContent(displayContent.content);
+  const hasVisibleContent =
+    segments.some((seg) => (seg.type === "text" ? sanitizeAIOutput(seg.content).length > 0 : true)) ||
+    isLongContent ||
+    (Array.isArray(block.options) && block.options.length > 0);
+
+  if (!hasVisibleContent) return null;
+
+  const previewCharCount = Math.min(rawContent.length, AGENT_CONTENT_PREVIEW_CHARS).toLocaleString();
+  const totalCharCount = rawContent.length.toLocaleString();
+  const isArchivedAfterChoice = block.archivedAfterChoice && !block.streaming;
+  const archivedTitle = language === "zh" ? "已保留上一步反馈" : "Previous reply kept";
+  const archivedAction = language === "zh" ? "展开回看" : "Expand";
+  const archivedCollapse = language === "zh" ? "收起反馈" : "Collapse";
+  const selectedOptionText = String(block.selectedOption || "").trim();
+  const archivedPreviewText = segments
+    .filter((seg) => seg.type === "text")
+    .map((seg) => sanitizeAIOutput(seg.content))
+    .filter(Boolean)
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const archivedPreview = archivedPreviewText.length > 150
+    ? `${archivedPreviewText.slice(0, 150).trim()}...`
+    : archivedPreviewText;
+
+  if (isArchivedAfterChoice && !isArchivedExpanded) {
+    return (
+      <div className="mt-4 flex w-full justify-start">
+        <div className="mt-1 flex-shrink-0">
+          <IconLogoM className="theme-text h-6 w-6 drop-shadow-[0_0_8px_var(--accent-subtle)]" />
+        </div>
+        <button
+          type="button"
+          data-testid="archived-choice-feedback"
+          onClick={() => setIsArchivedExpanded(true)}
+          className="my-2 flex w-full items-center gap-3 rounded-2xl border border-[#1f1f23] bg-[#07070a] px-4 py-3 text-left transition-colors hover:border-[#34343b] hover:bg-[#09090b]"
+        >
+          <IconChevronRight className="h-4 w-4 shrink-0 text-[#71717a]" />
+          <span className="min-w-0 flex-1">
+            <span className="flex flex-wrap items-center gap-2">
+              <span className="text-[12px] font-medium text-[#d4d4d8]">{archivedTitle}</span>
+              {selectedOptionText && (
+                <span className="max-w-full truncate rounded-full border border-[rgba(52,211,153,0.22)] bg-[rgba(52,211,153,0.08)] px-2 py-0.5 text-[10px] text-[#86efac]">
+                  {language === "zh" ? `已选择：${selectedOptionText}` : `Selected: ${selectedOptionText}`}
+                </span>
+              )}
+            </span>
+            {archivedPreview && (
+              <span className="mt-1 block truncate text-[12px] leading-5 text-[#71717a]">{archivedPreview}</span>
+            )}
+          </span>
+          <span data-testid="archived-choice-feedback-toggle" className="shrink-0 rounded-full border border-[#27272a] px-3 py-1 text-[11px] text-[#a1a1aa]">
+            {archivedAction}
+          </span>
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mt-4 flex w-full justify-start">
+      <div className="mt-1 flex-shrink-0">
+        <IconLogoM className="theme-text h-6 w-6 drop-shadow-[0_0_8px_var(--accent-subtle)]" />
+      </div>
+      <div className="chat-agent-content my-2 w-full bg-[#09090b]/60 px-5 py-4 text-[#e4e4e7] shadow-sm" style={{ fontSize: `${chatFontSize}px` }}>
+        {isArchivedAfterChoice && (
+          <div data-testid="archived-choice-feedback-expanded" className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-[#27272a] bg-[#050507] px-3 py-2">
+            <div className="min-w-0 flex flex-wrap items-center gap-2">
+              <span className="text-[11px] font-medium text-[#d4d4d8]">{archivedTitle}</span>
+              {selectedOptionText && (
+                <span className="max-w-full truncate rounded-full border border-[rgba(52,211,153,0.22)] bg-[rgba(52,211,153,0.08)] px-2 py-0.5 text-[10px] text-[#86efac]">
+                  {language === "zh" ? `已选择：${selectedOptionText}` : `Selected: ${selectedOptionText}`}
+                </span>
+              )}
+            </div>
+            <button
+              type="button"
+              data-testid="archived-choice-feedback-toggle"
+              onClick={() => setIsArchivedExpanded(false)}
+              className="rounded-full border border-[#34343b] bg-[#09090b] px-3 py-1 text-[11px] text-[#d4d4d8] transition-colors hover:border-[var(--accent)] hover:text-white"
+            >
+              {archivedCollapse}
+            </button>
+          </div>
+        )}
+        {segments.map((seg, segIdx) => {
+          if (seg.type === "thought") {
+            return null;
+          }
+          if (seg.type === "plan") {
+            return <JobListCard key={`${block.id}-plan-${segIdx}`} jobs={seg.jobs} />;
+          }
+          const cleanText = sanitizeAIOutput(seg.content);
+          if (!cleanText) return null;
+          return <MarkdownRenderer key={`${block.id}-text-${segIdx}`} content={cleanText} baseFontSize={chatFontSize} />;
+        })}
+        {isLongContent && (
+          <div className="mt-4 rounded-md border border-[#27272a] bg-[#050507] px-3 py-2 text-[12px] leading-5 text-[#a1a1aa]">
+            <div>
+              {language === "zh"
+                ? showFullLongContent && !block.streaming
+                  ? `已展开完整长内容，约 ${totalCharCount} 个字符。`
+                  : `这条回复很长，聊天区先显示前 ${previewCharCount} 个字符；完整内容已保留，可在输出结束后展开查看，整轮也可以从标题处折叠收起。`
+                : showFullLongContent && !block.streaming
+                ? `Showing the full long reply, about ${totalCharCount} characters.`
+                : `This reply is long, so the chat view is showing the first ${previewCharCount} characters. The full content is kept and can be expanded after streaming finishes; the whole turn can also be collapsed from its header.`}
+            </div>
+            <button
+              type="button"
+              onClick={() => setShowFullLongContent((value) => !value)}
+              disabled={block.streaming}
+              className="mt-2 rounded-full border border-[#34343b] bg-[#09090b] px-3 py-1 text-[11px] text-[#d4d4d8] transition-colors hover:border-[var(--accent)] hover:text-white disabled:cursor-not-allowed disabled:opacity-55"
+            >
+              {language === "zh"
+                ? block.streaming
+                  ? "输出结束后可展开"
+                  : showFullLongContent
+                  ? "收起为预览"
+                  : "展开完整内容"
+                : block.streaming
+                ? "Available after streaming"
+                : showFullLongContent
+                ? "Collapse to preview"
+                : "Expand full content"}
+            </button>
+          </div>
+        )}
+        {Array.isArray(block.options) && block.options.length > 0 && (
+          <div className="mt-4 flex flex-wrap gap-2 border-t border-[#18181b] pt-4">
+            {block.options.map((option: { label: string; value: string }, optionIdx: number) => (
+              <button
+                key={`${block.id}-option-${optionIdx}`}
+                data-testid={`reply-option-${optionIdx}`}
+                onClick={() => onQuickReply?.(option.value, block.turnId)}
+                disabled={isStreaming}
+                className="rounded-full border border-[#27272a] bg-[#050507] px-3 py-1.5 text-[12px] text-[#e4e4e7] transition-colors hover:border-[var(--accent)] hover:text-white disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+        )}
+        {block.streaming && <StreamingCursor />}
       </div>
     </div>
   );
@@ -756,6 +951,12 @@ export default function ChatArea({
     return latestOptionBlock?.options || [];
   }, [topIslandTurnBlocks]);
   const topIslandTurnStatusKey = topIslandTurnVisibleStatus || topIslandTurn?.status || null;
+  const isAwaitingInteractiveChoice =
+    topIslandTurnStatusKey === "awaiting_input" && topIslandReplyOptions.length > 0;
+  const shouldShowRunStatus = isStreaming || isAwaitingInteractiveChoice;
+  const runStatusLabel = isStreaming
+    ? copy.processingLabel
+    : language === "zh" ? "等待选择..." : "Awaiting choice...";
   const topIslandHasBlockingPrompt =
     !!pendingRunDecision ||
     topIslandTurnStatusKey === "awaiting_input" ||
@@ -981,47 +1182,15 @@ export default function ChatArea({
 
     if (block.type === "agent") {
       if (block.hiddenProcess && !block.streaming) return null;
-      const segments = parseMessageContent(block.content);
-      const hasVisibleContent =
-        segments.some((seg) => (seg.type === "text" ? sanitizeAIOutput(seg.content).length > 0 : true)) ||
-        (Array.isArray(block.options) && block.options.length > 0);
-      if (!hasVisibleContent) return null;
-
       return (
-        <div key={`${block.id}-${index}`} className="mt-4 flex w-full justify-start">
-          <div className="mt-1 flex-shrink-0">
-            <IconLogoM className="theme-text h-6 w-6 drop-shadow-[0_0_8px_var(--accent-subtle)]" />
-          </div>
-          <div className="chat-agent-content my-2 w-full bg-[#09090b]/60 px-5 py-4 text-[#e4e4e7] shadow-sm" style={{ fontSize: `${config.chatFontSize ?? 13}px` }}>
-            {segments.map((seg, segIdx) => {
-              if (seg.type === "thought") {
-                return null;
-              }
-              if (seg.type === "plan") {
-                return <JobListCard key={`${block.id}-plan-${segIdx}`} jobs={seg.jobs} />;
-              }
-              const cleanText = sanitizeAIOutput(seg.content);
-              if (!cleanText) return null;
-              return <MarkdownRenderer key={`${block.id}-text-${segIdx}`} content={cleanText} baseFontSize={config.chatFontSize ?? 13} />;
-            })}
-            {Array.isArray(block.options) && block.options.length > 0 && (
-              <div className="mt-4 flex flex-wrap gap-2 border-t border-[#18181b] pt-4">
-                {block.options.map((option: { label: string; value: string }, optionIdx: number) => (
-                  <button
-                    key={`${block.id}-option-${optionIdx}`}
-                    data-testid={`reply-option-${optionIdx}`}
-                    onClick={() => onQuickReply?.(option.value, block.turnId)}
-                    disabled={isStreaming}
-                    className="rounded-full border border-[#27272a] bg-[#050507] px-3 py-1.5 text-[12px] text-[#e4e4e7] transition-colors hover:border-[var(--accent)] hover:text-white disabled:cursor-not-allowed disabled:opacity-60"
-                  >
-                    {option.label}
-                  </button>
-                ))}
-              </div>
-            )}
-            {block.streaming && <StreamingCursor />}
-          </div>
-        </div>
+        <AgentContentBlock
+          key={`${block.id}-${index}`}
+          block={block}
+          language={language}
+          chatFontSize={config.chatFontSize ?? 13}
+          onQuickReply={onQuickReply}
+          isStreaming={isStreaming}
+        />
       );
     }
 
@@ -1190,14 +1359,14 @@ export default function ChatArea({
         </button>
 
         <div className="flex min-w-0 items-center gap-2 overflow-x-auto">
-          {isStreaming && (
+          {shouldShowRunStatus && (
             <div className="pointer-events-none flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-[4px] border border-[#27272a] bg-[#09090b] px-2.5 py-1 text-[10px] font-medium text-[#a1a1aa]" style={{ height: 28 }}>
               <span className="h-1.5 w-1.5 rounded-full bg-amber-400 shadow-[0_0_5px_#fbbf24] animate-pulse" />
-              {copy.processingLabel} {Math.floor(displayElapsedTime / 60)}m{displayElapsedTime % 60}s
+              {runStatusLabel} {Math.floor(displayElapsedTime / 60)}m{displayElapsedTime % 60}s
             </div>
           )}
 
-          {isStreaming && (
+          {shouldShowRunStatus && (
             <button onClick={onStopGeneration} className="flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-[4px] border border-[#27272a] bg-[#09090b] px-3 py-1 text-[10px] font-medium text-[#f48771] transition-colors hover:bg-[#18181b] hover:text-red-400" style={{ height: 28 }}>
               <IconStop className="h-3.5 w-3.5" />
               {copy.stopLabel}
@@ -1262,6 +1431,7 @@ export default function ChatArea({
           canApprovePlan={canApprovePlan}
           autoApproveTools={autoApproveTools}
           onSelectReplyOption={(value) => topIslandTurn && onQuickReply?.(value, topIslandTurn.id)}
+          onCancelTurn={onStopGeneration}
           onResolvePendingRunDecision={resolvePendingRunDecision}
           onDismissPendingRunDecision={dismissPendingRunDecision}
           onApprovePlan={approvePlan}

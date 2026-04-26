@@ -19,6 +19,8 @@ import {
   buildAnthropicRequestBody,
   buildCloudHeaders,
   buildCloudMessagesApiUrl,
+  compactCloudResponsesInstructions,
+  compactCloudResponsesMessages,
   createAnthropicStreamProcessor,
   extractOpenAiResponseText,
   finalizeStreamedToolCalls,
@@ -30,6 +32,7 @@ import {
   type ProtocolChatMessage,
 } from "./cloudProtocol";
 import { computeContextBudgets } from "./contextTrim";
+import { isCloudGatewayTimeoutMessage, isRetryableCloudErrorMessage } from "./cloudRetry";
 import { toError } from "./errorUtils";
 import { isProviderCompatibilityErrorMessage, PROVIDER_COMPATIBILITY_TAG } from "./providerCompatibility";
 
@@ -298,6 +301,66 @@ function buildHttpErrorMessage(status: number, statusText: string, errorBody: st
   return detail ? `HTTP ${status}: ${detail}` : `HTTP ${status}: Request failed`;
 }
 
+function isRecoverableRustStreamReadError(message: string): boolean {
+  const normalized = String(message || "").toLowerCase();
+  return (
+    normalized.includes("流读取错误") ||
+    normalized.includes("error decoding response body") ||
+    normalized.includes("error reading a body from connection") ||
+    normalized.includes("error reading response body") ||
+    normalized.includes("connection closed before message completed") ||
+    normalized.includes("unexpected eof")
+  );
+}
+
+function shouldRetryRustStreamAsNonStreaming(settings: StreamSettings, errorMessage: string): boolean {
+  return (
+    settings.useRustProxy === true &&
+    !settings.apiProtocol &&
+    !isOllamaProvider(settings) &&
+    !isAnthropicProvider(settings) &&
+    !isOpenAiResponsesApi(settings) &&
+    isRecoverableRustStreamReadError(errorMessage)
+  );
+}
+
+function extractOpenAiChatCompletionToolCalls(payload: unknown): StreamedToolCall[] {
+  if (!payload || typeof payload !== "object") return [];
+  const choices = (payload as { choices?: unknown }).choices;
+  const choice = Array.isArray(choices) ? choices[0] as { message?: unknown } | undefined : undefined;
+  const message = choice?.message && typeof choice.message === "object"
+    ? choice.message as { tool_calls?: unknown }
+    : undefined;
+  const toolCalls = Array.isArray(message?.tool_calls) ? message.tool_calls : [];
+
+  return toolCalls.map((toolCall, index) => {
+    const call = toolCall && typeof toolCall === "object"
+      ? toolCall as { id?: unknown; function?: { name?: unknown; arguments?: unknown } }
+      : {};
+    const rawArguments = call.function?.arguments;
+    return {
+      index,
+      id: typeof call.id === "string" && call.id.trim() ? call.id : `nonstream_call_${index + 1}`,
+      name: typeof call.function?.name === "string" && call.function.name.trim()
+        ? call.function.name
+        : `unknown_tool_${index + 1}`,
+      arguments: typeof rawArguments === "string"
+        ? rawArguments
+        : JSON.stringify(rawArguments ?? {}),
+    };
+  });
+}
+
+function extractOpenAiChatCompletionFinishReason(payload: unknown): StreamResult["finishReason"] {
+  if (!payload || typeof payload !== "object") return "stop";
+  const choices = (payload as { choices?: unknown }).choices;
+  const choice = Array.isArray(choices) ? choices[0] as { finish_reason?: unknown } | undefined : undefined;
+  const raw = choice?.finish_reason;
+  if (raw === "length" || raw === "tool_calls" || raw === "stop") return raw;
+  if (raw === "function_call") return "tool_calls";
+  return "stop";
+}
+
 async function postJsonRequest(
   url: string,
   headers: Record<string, string>,
@@ -309,6 +372,14 @@ async function postJsonRequest(
 
   if (settings.useRustProxy) {
     let result: string;
+    const cancelProxyRequest = () => {
+      invoke("cancel_proxy_request").catch(() => {});
+    };
+    if (signal?.aborted) {
+      cancelProxyRequest();
+      throw createAbortError();
+    }
+    signal?.addEventListener("abort", cancelProxyRequest, { once: true });
     try {
       result = await invoke<string>("proxy_request", {
         url,
@@ -317,7 +388,10 @@ async function postJsonRequest(
         body: JSON.stringify(body),
       });
     } catch (err) {
+      if (signal?.aborted) throw createAbortError();
       throw toError(err, "Cloud request failed.");
+    } finally {
+      signal?.removeEventListener("abort", cancelProxyRequest);
     }
     if (signal?.aborted) throw createAbortError();
     return JSON.parse(result);
@@ -349,6 +423,7 @@ async function requestOpenAiNonStreaming(
   callbacks: StreamCallbacks,
   signal?: AbortSignal,
   maxTokensOverride?: number,
+  tools?: ToolDefinition[],
 ): Promise<StreamResult> {
   const { onToken, onDone, onError } = callbacks;
 
@@ -361,13 +436,30 @@ async function requestOpenAiNonStreaming(
     let payload: unknown;
 
     if (apiFormat === "responses") {
-      const protocolMessages = messages as ProtocolChatMessage[];
+      const protocolMessages = compactCloudResponsesMessages(messages as ProtocolChatMessage[]);
       const inputCandidates = buildOpenAiResponsesInputCandidates(protocolMessages);
-      const instructions = extractOpenAiResponsesInstructions(protocolMessages);
+      const rawInstructions = extractOpenAiResponsesInstructions(protocolMessages);
+      const instructions = compactCloudResponsesInstructions(rawInstructions);
       let lastCompatibilityError: Error | null = null;
+      let sawRetryableGatewayTimeout = false;
+      let gatewayTimeoutRetryUsed = false;
 
       for (const candidate of inputCandidates) {
+        if (signal?.aborted) throw createAbortError();
+        if (sawRetryableGatewayTimeout && candidate.mode === "input_text_array") {
+          continue;
+        }
         try {
+          console.log("[streaming] OpenAI responses request", JSON.stringify({
+            url: apiUrl,
+            model: settings.model,
+            mode: candidate.mode,
+            inputType: Array.isArray(candidate.input) ? "array" : typeof candidate.input,
+            inputLen: Array.isArray(candidate.input) ? candidate.input.length : String(candidate.input ?? "").length,
+            instructionsLen: instructions?.length ?? 0,
+            rawInstructionsLen: rawInstructions?.length ?? 0,
+            reasoningEffort: settings.reasoningEffort ?? "none",
+          }));
           payload = await postJsonRequest(
             apiUrl,
             headers,
@@ -390,10 +482,21 @@ async function requestOpenAiNonStreaming(
         } catch (err) {
           const errMsg = err instanceof Error ? err.message : String(err);
           lastCompatibilityError = err instanceof Error ? err : new Error(errMsg);
+          const isRetryableGatewayError = isRetryableCloudErrorMessage(errMsg);
+          if (isRetryableGatewayError) {
+            sawRetryableGatewayTimeout = true;
+          }
+          if (isCloudGatewayTimeoutMessage(errMsg) && candidate.mode !== "transcript_text" && !gatewayTimeoutRetryUsed) {
+            if (signal?.aborted) throw createAbortError();
+            gatewayTimeoutRetryUsed = true;
+            console.warn(`[streaming] OpenAI responses retryable failure with ${candidate.mode}; retrying same reasoning effort with compact transcript input`, errMsg);
+            continue;
+          }
           if (!isProviderCompatibilityErrorMessage(errMsg)) {
             throw lastCompatibilityError;
           }
         }
+        if (payload != null) break;
       }
 
       if (payload == null) {
@@ -410,6 +513,7 @@ async function requestOpenAiNonStreaming(
             content: extractTextContent(message.content),
           })),
           stream: false,
+          ...(!minimalCompatibilityMode && tools && tools.length > 0 ? { tools: normalizeToolDefinitions(tools) } : {}),
           ...(!minimalCompatibilityMode ? { max_tokens: maxTokens } : {}),
           ...(!minimalCompatibilityMode && settings.temperature != null ? { temperature: settings.temperature } : {}),
           ...(!minimalCompatibilityMode && settings.topP != null ? { top_p: settings.topP } : {}),
@@ -420,10 +524,15 @@ async function requestOpenAiNonStreaming(
     }
 
     const content = extractOpenAiResponseText(payload, apiFormat);
+    const toolCalls = apiFormat === "chat_completions"
+      ? extractOpenAiChatCompletionToolCalls(payload)
+      : [];
     const result: StreamResult = {
       content,
-      toolCalls: [],
-      finishReason: "stop",
+      toolCalls,
+      finishReason: apiFormat === "chat_completions"
+        ? extractOpenAiChatCompletionFinishReason(payload)
+        : "stop",
     };
 
     if (content) onToken(content);
@@ -708,9 +817,30 @@ async function streamViaRustProxy(
       }
 
       if (event.payload.status === "error") {
-        const err = new Error(
-          event.payload.error?.trim() || "The cloud stream ended with an error but did not include details.",
-        );
+        const errorMessage = event.payload.error?.trim() || "The cloud stream ended with an error but did not include details.";
+        if (shouldRetryRustStreamAsNonStreaming(settings, errorMessage)) {
+          console.warn("[streaming] Rust stream read failed; retrying once with non-streaming local request", errorMessage);
+          cleanup();
+          onToken("__ESCALATION_RESET__:");
+          void (async () => {
+            try {
+              const fallbackResult = await requestOpenAiNonStreaming(
+                messages,
+                settings,
+                callbacks,
+                signal,
+                maxTokens,
+                tools,
+              );
+              resolveResult?.(fallbackResult);
+            } catch (fallbackErr) {
+              rejectResult?.(toError(fallbackErr, "Local non-streaming fallback failed."));
+            }
+          })();
+          return;
+        }
+
+        const err = new Error(errorMessage);
         onError(err);
         rejectResult?.(err);
       } else if (event.payload.status === "cancelled") {
@@ -763,7 +893,7 @@ async function streamViaRustProxy(
   unlistenDone = doneUnlisten;
 
   // Now safe to start the stream — listeners are fully registered
-  console.log('[streamViaRustProxy] invoking start_chat_stream, url:', apiUrl, 'model:', settings.model, 'headers:', JSON.stringify(headers));
+  console.log('[streamViaRustProxy] invoking start_chat_stream, url:', apiUrl, 'model:', settings.model, 'header_keys:', Object.keys(headers).join(","));
   invoke("start_chat_stream", {
     streamId,
     url: apiUrl,
@@ -806,7 +936,7 @@ export async function streamChatCompletion(
     && (isOpenAiResponsesApi(settings) || isTranscriptCompatibilityRequest(messages));
 
   if (shouldUseNonStreamingOpenAi) {
-    return requestOpenAiNonStreaming(messages, settings, callbacks, signal, maxTokensOverride);
+    return requestOpenAiNonStreaming(messages, settings, callbacks, signal, maxTokensOverride, tools);
   }
 
   // Route through Rust proxy for cloud endpoints (bypasses CORS)

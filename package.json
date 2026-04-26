@@ -19,7 +19,9 @@
     "test:workflow-assets": "node --test tests/node/*.test.mjs",
     "release:bump": "node scripts/release-bump.mjs",
     "release:mac": "node scripts/release-mac.mjs",
-    "release:stage": "node scripts/prepare-public-release.mjs"
+    "release:stage": "node scripts/prepare-public-release.mjs",
+    "aimax:gateway": "node cloud-gateway/aimax/server.mjs",
+    "test:aimax-gateway": "node --test tests/node/aimax-gateway.test.mjs"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.2.2",

@@ -21,6 +21,7 @@ interface TopIslandProps {
   canApprovePlan: boolean;
   autoApproveTools?: boolean;
   onSelectReplyOption?: (value: string) => void;
+  onCancelTurn?: () => void;
   onResolvePendingRunDecision?: (choice: ResolvedUserIntent | "approve_once" | "approve_thread" | "cancel") => void;
   onDismissPendingRunDecision?: () => void;
   onApprovePlan: () => void;
@@ -74,6 +75,7 @@ const TopIsland = memo(function TopIsland({
   canApprovePlan,
   autoApproveTools,
   onSelectReplyOption,
+  onCancelTurn,
   onResolvePendingRunDecision,
   onDismissPendingRunDecision,
   onApprovePlan,
@@ -153,6 +155,7 @@ const TopIsland = memo(function TopIsland({
     approveExecuteOnce: language === "zh" ? "仅本轮执行" : "Allow This Turn",
     approveThread: language === "zh" ? "本对话自动执行" : "Auto-Run In Thread",
     dismiss: language === "zh" ? "取消" : "Cancel",
+    cancelTurn: language === "zh" ? "结束本轮" : "End This Turn",
     taskSummary: language === "zh"
       ? `共 ${planTasks.length} 个任务，已完成 ${completedCount} 个`
       : `${completedCount}/${planTasks.length} tasks completed`,
@@ -418,6 +421,12 @@ const TopIsland = memo(function TopIsland({
                         {option.label}
                       </button>
                     ))}
+                    <button
+                      onClick={onCancelTurn}
+                      className="w-full rounded-xl border border-[#3f3f46] bg-[#09090b] px-3 py-2.5 text-left text-[12px] leading-6 text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#f5f5f5]"
+                    >
+                      {copy.cancelTurn}
+                    </button>
                   </div>
                 )}
               </div>

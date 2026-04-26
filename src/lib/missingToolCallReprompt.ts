@@ -111,7 +111,24 @@ export function resolveMissingToolCallRepromptKind(input: {
 export function buildMissingToolCallContinuationPrompt(
   kind: Exclude<MissingToolCallRepromptKind, "none">,
   language: "zh" | "en",
+  attempt = 1,
 ): string {
+  if (attempt >= 2) {
+    return language === "zh"
+      ? "上一条回复仍然只是重复说明，没有真正调用工具。下一条回复必须严格满足：\n" +
+          "1. 只输出一个 `<tool_use>` 工具调用块，不要输出任何普通正文、解释、计划或寒暄。\n" +
+          "2. 如果要创建文件，用 `write_file`；如果要改已有文件，用 `replace_in_file`；如果还缺上下文，用 `read_file` 或 `get_file_outline`。路径必须是当前任务的真实相对路径，不能写占位符。\n" +
+          "3. 如果文件很大，先写最小可编译/可运行骨架，后续再补齐；不要在聊天正文输出完整项目代码。\n" +
+          "4. `<tool_use>` 外面不要写字。格式必须是：\n" +
+          "<tool_use>\n<tool>write_file</tool>\n<parameter name=\"path\">当前任务的真实相对路径</parameter>\n<parameter name=\"content\">完整文件内容</parameter>\n</tool_use>"
+      : "Your previous reply only repeated prose and did not call a tool. The next reply must strictly follow this:\n" +
+          "1. Output exactly one `<tool_use>` block and no prose, explanation, plan, or greeting outside it.\n" +
+          "2. Use `write_file` to create a file, `replace_in_file` to edit an existing file, or `read_file` / `get_file_outline` if more context is required. The path must be the real relative path for the current task, not a placeholder.\n" +
+          "3. If the file is large, write the smallest compilable/runnable skeleton first and fill it in later. Do not output full project code in chat prose.\n" +
+          "4. Nothing outside `<tool_use>`. Required shape:\n" +
+          "<tool_use>\n<tool>write_file</tool>\n<parameter name=\"path\">real/relative/path</parameter>\n<parameter name=\"content\">full file content</parameter>\n</tool_use>";
+  }
+
   if (kind === "read_only") {
     return language === "zh"
       ? "不要只描述接下来要做什么。现在请立即开始真实分析：\n" +
@@ -130,7 +147,8 @@ export function buildMissingToolCallContinuationPrompt(
         "2. 必须使用 <tool_use> 格式调用工具，不要只用文字描述。例如：\n" +
         "<tool_use>\n<tool>read_file</tool>\n<parameter name=\"path\">src/foo.ts</parameter>\n</tool_use>\n" +
         "或：\n<tool_use>\n<tool>write_file</tool>\n<parameter name=\"path\">report.md</parameter>\n<parameter name=\"content\"># 分析报告\n...</parameter>\n</tool_use>\n" +
-        "3. 如果不确定，选择最合理的方案直接执行，不要等待确认。\n" +
+        "3. 不要在聊天区输出完整项目代码或大段 Markdown；如果要生成多个文件，只先写第一个最小核心文件。\n" +
+        "4. 如果不确定，选择最合理的方案直接执行，不要等待确认。\n" +
         "现在请立即用工具继续执行。"
     : "Please continue executing your plan. Follow these rules:\n" +
         "1. Do not ask the user what to do next. Make the best reasonable decision and proceed.\n" +
@@ -138,6 +156,7 @@ export function buildMissingToolCallContinuationPrompt(
         "<tool_use>\n<tool>read_file</tool>\n<parameter name=\"path\">src/foo.ts</parameter>\n</tool_use>\n" +
         "or:\n" +
         "<tool_use>\n<tool>write_file</tool>\n<parameter name=\"path\">report.md</parameter>\n<parameter name=\"content\"># Analysis Report\n...</parameter>\n</tool_use>\n" +
-        "3. If uncertain, choose the most reasonable path and execute it instead of waiting for confirmation.\n" +
+        "3. Do not output full project code or large Markdown blocks in the chat. If generating multiple files, write only the first minimal core file now.\n" +
+        "4. If uncertain, choose the most reasonable path and execute it instead of waiting for confirmation.\n" +
         "Now immediately continue using tools.";
 }

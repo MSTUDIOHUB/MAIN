@@ -4,14 +4,14 @@ use regex::Regex;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::cmp::Ordering;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter, State};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tiktoken_rs::{cl100k_base, CoreBPE};
 use walkdir::WalkDir;
 
@@ -22,8 +22,162 @@ const GREP_MATCH_LIMIT: usize = 2000;
 const GREP_OUTPUT_LIMIT_BYTES: usize = 512 * 1024;
 const COMMAND_OUTPUT_LIMIT_BYTES: usize = 1024 * 1024;
 const DOCUMENT_READER_SCRIPT: &str = include_str!("../Scripts/document_reader.py");
+const HTTP_CONNECT_TIMEOUT_SECS: u64 = 15;
+const HTTP_SHORT_TIMEOUT_SECS: u64 = 15;
+const MODEL_REQUEST_TIMEOUT_SECS: u64 = 30 * 60;
+const STREAM_READ_TIMEOUT_SECS: u64 = 15 * 60;
 
 static TOKENIZER: OnceLock<CoreBPE> = OnceLock::new();
+
+// region: 调试日志
+
+const DEBUG_LOG_FILE_NAME: &str = "main-debug.log";
+const DEBUG_LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
+const DEBUG_LOG_TRIM_KEEP_BYTES: usize = 3 * 1024 * 1024;
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DebugLogPayload {
+    timestamp: String,
+    level: String,
+    source: String,
+    message: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DebugLogSnapshot {
+    path: String,
+    content: String,
+    truncated: bool,
+}
+
+fn debug_timestamp() -> String {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0));
+    format!("{}.{:03}", elapsed.as_secs(), elapsed.subsec_millis())
+}
+
+fn sanitize_log_part(value: &str) -> String {
+    let mut result = value
+        .replace('\r', "\\r")
+        .replace('\n', "\\n")
+        .replace('\t', "\\t");
+    if result.len() > 8_000 {
+        result.truncate(8_000);
+        result.push_str("...<truncated>");
+    }
+    result
+}
+
+fn debug_log_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_log_dir()
+        .map_err(|e| format!("解析调试日志目录失败: {e}"))?;
+    fs::create_dir_all(&dir).map_err(|e| format!("创建调试日志目录失败: {e}"))?;
+    Ok(dir.join(DEBUG_LOG_FILE_NAME))
+}
+
+fn trim_debug_log_file(path: &Path) {
+    let Ok(metadata) = fs::metadata(path) else {
+        return;
+    };
+    if metadata.len() <= DEBUG_LOG_MAX_BYTES {
+        return;
+    }
+    let Ok(bytes) = fs::read(path) else {
+        return;
+    };
+    if bytes.len() <= DEBUG_LOG_TRIM_KEEP_BYTES {
+        return;
+    }
+    let raw_start = bytes.len().saturating_sub(DEBUG_LOG_TRIM_KEEP_BYTES);
+    let start = bytes[raw_start..]
+        .iter()
+        .position(|b| *b == b'\n')
+        .map(|offset| raw_start + offset + 1)
+        .unwrap_or(raw_start);
+    let _ = fs::write(path, &bytes[start..]);
+}
+
+fn append_debug_log_line(app: &AppHandle, payload: &DebugLogPayload) -> Result<(), String> {
+    let path = debug_log_path(app)?;
+    let line = format!(
+        "[{}] [{}] [{}] {}\n",
+        sanitize_log_part(&payload.timestamp),
+        sanitize_log_part(&payload.level),
+        sanitize_log_part(&payload.source),
+        sanitize_log_part(&payload.message),
+    );
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| format!("打开调试日志失败: {e}"))?;
+    file.write_all(line.as_bytes())
+        .map_err(|e| format!("写入调试日志失败: {e}"))?;
+    trim_debug_log_file(&path);
+    Ok(())
+}
+
+fn record_debug_log(app: &AppHandle, level: &str, source: &str, message: impl AsRef<str>) {
+    let payload = DebugLogPayload {
+        timestamp: debug_timestamp(),
+        level: level.to_string(),
+        source: source.to_string(),
+        message: message.as_ref().to_string(),
+    };
+    println!("[{}] {}", payload.source, payload.message);
+    let _ = append_debug_log_line(app, &payload);
+    let _ = app.emit("main-debug-log", payload);
+}
+
+#[tauri::command]
+fn append_debug_log(app: AppHandle, level: String, source: String, message: String) -> Result<(), String> {
+    let payload = DebugLogPayload {
+        timestamp: debug_timestamp(),
+        level,
+        source,
+        message,
+    };
+    append_debug_log_line(&app, &payload)
+}
+
+#[tauri::command]
+fn read_debug_log(app: AppHandle, max_bytes: Option<usize>) -> Result<DebugLogSnapshot, String> {
+    let path = debug_log_path(&app)?;
+    if !path.exists() {
+        return Ok(DebugLogSnapshot {
+            path: path.to_string_lossy().to_string(),
+            content: String::new(),
+            truncated: false,
+        });
+    }
+
+    let bytes = fs::read(&path).map_err(|e| format!("读取调试日志失败: {e}"))?;
+    let max = max_bytes.unwrap_or(256 * 1024).clamp(1_024, 1024 * 1024);
+    let truncated = bytes.len() > max;
+    let slice = if truncated {
+        &bytes[bytes.len() - max..]
+    } else {
+        &bytes[..]
+    };
+    Ok(DebugLogSnapshot {
+        path: path.to_string_lossy().to_string(),
+        content: String::from_utf8_lossy(slice).to_string(),
+        truncated,
+    })
+}
+
+#[tauri::command]
+fn clear_debug_log(app: AppHandle) -> Result<(), String> {
+    let path = debug_log_path(&app)?;
+    fs::write(path, "").map_err(|e| format!("清空调试日志失败: {e}"))
+}
+
+// endregion
 
 #[derive(Default)]
 struct PtyManager {
@@ -343,7 +497,35 @@ fn should_use_curl_fallback(
         return false;
     }
 
+    if status.as_u16() == 524 || error_body.to_ascii_lowercase().contains("error code: 524") {
+        return false;
+    }
+
     status.is_server_error() || error_body.to_ascii_lowercase().contains("upstream_error")
+}
+
+fn should_try_curl_transport_fallback(url: &str, method: &str, error_message: &str) -> bool {
+    if !method.eq_ignore_ascii_case("POST") {
+        return false;
+    }
+
+    if !(url.contains("/v1/responses") || url.contains("/v1/chat/completions") || url.contains("/v1/messages")) {
+        return false;
+    }
+
+    let normalized = error_message.to_ascii_lowercase();
+    normalized.contains("error sending request")
+        || normalized.contains("connection closed")
+        || normalized.contains("connection reset")
+        || normalized.contains("error decoding response body")
+        || normalized.contains("error reading a body")
+        || normalized.contains("error reading response body")
+        || normalized.contains("unexpected eof")
+        || normalized.contains("operation timed out")
+        || normalized.contains("timed out")
+        || normalized.contains("timeout")
+        || normalized.contains("tls")
+        || normalized.contains("certificate")
 }
 
 fn proxy_request_via_curl(
@@ -357,7 +539,23 @@ fn proxy_request_via_curl(
     command.arg("-L");
     command.arg("-X").arg(method);
     command.arg(url);
+    command.arg("--connect-timeout").arg(HTTP_CONNECT_TIMEOUT_SECS.to_string());
+    let max_time_secs = if method.eq_ignore_ascii_case("POST")
+        && (url.contains("/v1/responses") || url.contains("/v1/chat/completions") || url.contains("/v1/messages"))
+    {
+        MODEL_REQUEST_TIMEOUT_SECS
+    } else {
+        HTTP_SHORT_TIMEOUT_SECS
+    };
+    command.arg("--max-time").arg(max_time_secs.to_string());
     command.arg("-w").arg("\n__HTTP_STATUS__:%{http_code}");
+
+    let has_accept_encoding = headers
+        .map(|hdrs| hdrs.keys().any(|key| key.eq_ignore_ascii_case("accept-encoding")))
+        .unwrap_or(false);
+    if !has_accept_encoding {
+        command.arg("-H").arg("Accept-Encoding: identity");
+    }
 
     if let Some(hdrs) = headers {
         for (key, value) in hdrs {
@@ -684,6 +882,36 @@ fn read_file(state: State<WorkspaceState>, path: String) -> Result<String, Strin
     fs::read_to_string(real_path).map_err(|e| e.to_string())
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FileMetadata {
+    path: String,
+    size_bytes: u64,
+    modified_ms: u128,
+}
+
+#[tauri::command]
+fn get_file_metadata(state: State<WorkspaceState>, path: String) -> Result<FileMetadata, String> {
+    let workspace = state.get_root()?;
+    let real_path = resolve_existing_path(&path, &workspace)?;
+    if !real_path.is_file() {
+        return Err("get_file_metadata 目标不是文件".to_string());
+    }
+    let metadata = fs::metadata(&real_path).map_err(|e| e.to_string())?;
+    let modified_ms = metadata
+        .modified()
+        .map_err(|e| format!("读取文件修改时间失败: {e}"))?
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| format!("文件修改时间早于 UNIX_EPOCH: {e}"))?
+        .as_millis();
+
+    Ok(FileMetadata {
+        path: real_path.to_string_lossy().to_string(),
+        size_bytes: metadata.len(),
+        modified_ms,
+    })
+}
+
 #[tauri::command]
 fn write_file(state: State<WorkspaceState>, path: String, content: String) -> Result<(), String> {
     let workspace = state.get_root()?;
@@ -795,7 +1023,7 @@ const SKELETON_BLACKLIST_EXT: &[&str] = &[
 ];
 const SKELETON_IGNORED_DIRS: &[&str] = &[
     "Library", "Logs", "obj", "bin", ".git", "node_modules",
-    "Temp", "UserSettings", ".vs", "Build", "dist", ".protocols",
+    "Temp", "UserSettings", ".vs", "Build", "dist",
 ];
 const CS_COLLAPSE_THRESHOLD: usize = 12;
 
@@ -1351,14 +1579,33 @@ fn count_tokens(text: String) -> Result<usize, String> {
 
 /// Proxy an HTTP request through the Rust backend (bypasses WebView CORS).
 /// Uses async reqwest with a timeout — prevents UI freeze during model discovery.
+static PROXY_REQUEST_CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static PROXY_REQUEST_ABORT: std::sync::Mutex<Option<futures_util::future::AbortHandle>> = std::sync::Mutex::new(None);
+
+fn set_proxy_abort_handle(handle: Option<futures_util::future::AbortHandle>) {
+    if let Ok(mut slot) = PROXY_REQUEST_ABORT.lock() {
+        *slot = handle;
+    }
+}
+
 #[tauri::command]
-async fn proxy_request(url: String, method: String, headers: Option<std::collections::HashMap<String, String>>, body: Option<String>) -> Result<String, String> {
+async fn proxy_request(app: AppHandle, url: String, method: String, headers: Option<std::collections::HashMap<String, String>>, body: Option<String>) -> Result<String, String> {
+    PROXY_REQUEST_CANCEL.store(false, std::sync::atomic::Ordering::Relaxed);
     let meth = method.to_uppercase();
     let body_for_debug = body.clone();
+    let request_started_at = std::time::Instant::now();
+
+    let is_model_request = url.contains("/v1/chat/completions") || url.contains("/v1/responses") || url.contains("/v1/messages");
+    let request_timeout_secs = if meth == "POST" && is_model_request {
+        MODEL_REQUEST_TIMEOUT_SECS
+    } else {
+        HTTP_SHORT_TIMEOUT_SECS
+    };
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(Duration::from_secs(request_timeout_secs))
+        .read_timeout(Duration::from_secs(STREAM_READ_TIMEOUT_SECS))
+        .connect_timeout(Duration::from_secs(HTTP_CONNECT_TIMEOUT_SECS))
         .build()
         .map_err(|e| format!("创建 HTTP 客户端失败: {e}"))?;
 
@@ -1369,6 +1616,9 @@ async fn proxy_request(url: String, method: String, headers: Option<std::collect
     };
 
     req = req.header("Content-Type", "application/json");
+    if is_model_request {
+        req = req.header("Accept-Encoding", "identity");
+    }
 
     if let Some(hdrs) = &headers {
         for (key, value) in hdrs {
@@ -1432,7 +1682,7 @@ async fn proxy_request(url: String, method: String, headers: Option<std::collect
             debug_parts.push("body=<none>".to_string());
         }
 
-        println!("[proxy_request] {}", debug_parts.join(" "));
+        record_debug_log(&app, "info", "proxy_request", debug_parts.join(" "));
     }
 
     let req = if let Some(body_str) = body {
@@ -1441,52 +1691,98 @@ async fn proxy_request(url: String, method: String, headers: Option<std::collect
         req
     };
 
-    let response = req.send().await.map_err(|e| {
-        let msg = e.to_string();
-        if msg.contains("dns") || msg.contains("resolve") {
-            format!("DNS 解析失败，请检查地址是否正确: {msg}")
-        } else if msg.contains("Connection refused") || msg.contains("connect") {
-            format!("连接被拒绝，请确认服务正在运行: {msg}")
-        } else if msg.contains("timed out") || msg.contains("timeout") {
-            format!("连接超时，请检查网络或服务状态: {msg}")
-        } else if msg.contains("tls") || msg.contains("certificate") {
-            format!("TLS/SSL 错误: {msg}")
-        } else {
-            format!("请求失败: {msg}")
+    let (abort_handle, abort_registration) = futures_util::future::AbortHandle::new_pair();
+    set_proxy_abort_handle(Some(abort_handle));
+
+    let response = match futures_util::future::Abortable::new(req.send(), abort_registration).await {
+        Err(_) => {
+            set_proxy_abort_handle(None);
+            return Err("Aborted".to_string());
         }
-    })?;
+        Ok(response) => response,
+    };
+    set_proxy_abort_handle(None);
+
+    let response = match response {
+        Ok(response) => response,
+        Err(e) => {
+            set_proxy_abort_handle(None);
+            if PROXY_REQUEST_CANCEL.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err("Aborted".to_string());
+            }
+            let msg = e.to_string();
+            if is_model_request {
+                record_debug_log(&app, "error", "proxy_request", format!("request_failed url={} err={}", url, msg));
+            }
+
+            if should_try_curl_transport_fallback(&url, &meth, &msg) {
+                record_debug_log(&app, "warn", "proxy_request", format!("transport failed, retrying via curl fallback: {}", url));
+                match proxy_request_via_curl(&url, &meth, headers.as_ref(), body_for_debug.as_deref()) {
+                    Ok(result) => {
+                        record_debug_log(&app, "info", "proxy_request", format!("curl fallback succeeded url={} elapsed_ms={}", url, request_started_at.elapsed().as_millis()));
+                        return Ok(result);
+                    }
+                    Err(curl_err) => {
+                        record_debug_log(&app, "error", "proxy_request", format!("curl fallback failed url={} err={}", url, curl_err));
+                    }
+                }
+            }
+
+            return Err(if msg.contains("dns") || msg.contains("resolve") {
+                format!("DNS 解析失败，请检查地址是否正确: {msg}")
+            } else if msg.contains("Connection refused") || msg.contains("connect") {
+                format!("连接被拒绝，请确认服务正在运行: {msg}")
+            } else if msg.contains("timed out") || msg.contains("timeout") {
+                format!("连接超时，请检查网络或服务状态: {msg}")
+            } else if msg.contains("tls") || msg.contains("certificate") {
+                format!("TLS/SSL 错误: {msg}")
+            } else {
+                format!("请求失败: {msg}")
+            });
+        }
+    };
 
     let status = response.status();
     if !status.is_success() {
         let error_body = response.text().await.unwrap_or_default();
         if url.contains("/v1/chat/completions") || url.contains("/v1/responses") || url.contains("/v1/messages") {
-            println!(
-                "[proxy_request] error status={} url={} body={}",
-                status,
-                url,
-                error_body.chars().take(240).collect::<String>(),
+            record_debug_log(
+                &app,
+                "error",
+                "proxy_request",
+                format!(
+                    "error status={} url={} body={}",
+                    status,
+                    url,
+                    error_body.chars().take(240).collect::<String>(),
+                ),
             );
         }
 
         let should_retry_via_curl = should_use_curl_fallback(&url, &meth, status, &error_body);
         if url.contains("/v1/chat/completions") || url.contains("/v1/responses") || url.contains("/v1/messages") {
-            println!(
-                "[proxy_request] fallback_decision status={} url={} use_curl={}",
-                status,
-                url,
-                should_retry_via_curl,
+            record_debug_log(
+                &app,
+                "info",
+                "proxy_request",
+                format!(
+                    "fallback_decision status={} url={} use_curl={}",
+                    status,
+                    url,
+                    should_retry_via_curl,
+                ),
             );
         }
 
         if should_retry_via_curl {
-            println!("[proxy_request] reqwest failed, retrying via curl fallback: {}", url);
+            record_debug_log(&app, "warn", "proxy_request", format!("reqwest failed, retrying via curl fallback: {}", url));
             match proxy_request_via_curl(&url, &meth, headers.as_ref(), body_for_debug.as_deref()) {
                 Ok(result) => {
-                    println!("[proxy_request] curl fallback succeeded url={}", url);
+                    record_debug_log(&app, "info", "proxy_request", format!("curl fallback succeeded url={} elapsed_ms={}", url, request_started_at.elapsed().as_millis()));
                     return Ok(result);
                 }
                 Err(curl_err) => {
-                    println!("[proxy_request] curl fallback failed url={} err={}", url, curl_err);
+                    record_debug_log(&app, "error", "proxy_request", format!("curl fallback failed url={} err={}", url, curl_err));
                 }
             }
         }
@@ -1494,11 +1790,60 @@ async fn proxy_request(url: String, method: String, headers: Option<std::collect
         return Err(format!("HTTP {}: {}", status, error_body.chars().take(500).collect::<String>()));
     }
 
-    let text = response.text().await.map_err(|e| format!("读取响应失败: {e}"))?;
+    if PROXY_REQUEST_CANCEL.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err("Aborted".to_string());
+    }
+    let (text_abort_handle, text_abort_registration) = futures_util::future::AbortHandle::new_pair();
+    set_proxy_abort_handle(Some(text_abort_handle));
+    let text_result = match futures_util::future::Abortable::new(response.text(), text_abort_registration).await {
+        Err(_) => {
+            set_proxy_abort_handle(None);
+            return Err("Aborted".to_string());
+        }
+        Ok(result) => result,
+    };
+    set_proxy_abort_handle(None);
+
+    let text = match text_result {
+        Ok(text) => text,
+        Err(e) => {
+            if PROXY_REQUEST_CANCEL.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err("Aborted".to_string());
+            }
+            let msg = e.to_string();
+            if is_model_request {
+                record_debug_log(&app, "error", "proxy_request", format!("read_failed url={} err={}", url, msg));
+            }
+            if should_try_curl_transport_fallback(&url, &meth, &msg) {
+                record_debug_log(&app, "warn", "proxy_request", format!("response read failed, retrying via curl fallback: {}", url));
+                match proxy_request_via_curl(&url, &meth, headers.as_ref(), body_for_debug.as_deref()) {
+                    Ok(result) => {
+                        record_debug_log(&app, "info", "proxy_request", format!("curl fallback succeeded url={} elapsed_ms={}", url, request_started_at.elapsed().as_millis()));
+                        return Ok(result);
+                    }
+                    Err(curl_err) => {
+                        record_debug_log(&app, "error", "proxy_request", format!("curl fallback failed url={} err={}", url, curl_err));
+                    }
+                }
+            }
+            return Err(format!("读取响应失败: {msg}"));
+        }
+    };
     if url.contains("/v1/chat/completions") || url.contains("/v1/responses") || url.contains("/v1/messages") {
-        println!("[proxy_request] success status={} url={}", status, url);
+        record_debug_log(&app, "info", "proxy_request", format!("success status={} url={} elapsed_ms={}", status, url, request_started_at.elapsed().as_millis()));
     }
     Ok(text)
+}
+
+#[tauri::command]
+fn cancel_proxy_request() -> Result<(), String> {
+    PROXY_REQUEST_CANCEL.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Ok(mut slot) = PROXY_REQUEST_ABORT.lock() {
+        if let Some(handle) = slot.take() {
+            handle.abort();
+        }
+    }
+    Ok(())
 }
 
 // endregion
@@ -1533,8 +1878,11 @@ async fn start_chat_stream(
     body: String,
 ) -> Result<(), String> {
     STREAM_CANCEL.store(false, std::sync::atomic::Ordering::Relaxed);
+    let stream_started_at = Instant::now();
 
-    if url.contains("/v1/chat/completions") || url.contains("/v1/responses") || url.contains("/v1/messages") {
+    let is_model_request = url.contains("/v1/chat/completions") || url.contains("/v1/responses") || url.contains("/v1/messages");
+
+    if is_model_request {
         let mut debug_parts = vec![format!("method=POST"), format!("url={}", url)];
         if let Ok(body_json) = serde_json::from_str::<Value>(&body) {
             if let Some(model) = body_json.get("model").and_then(|v| v.as_str()) {
@@ -1554,17 +1902,22 @@ async fn start_chat_stream(
                 debug_parts.push(format!("stream={}", stream));
             }
         }
-        println!("[start_chat_stream] {}", debug_parts.join(" "));
+        record_debug_log(&app, "info", "start_chat_stream", debug_parts.join(" "));
     }
 
     let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(15))
-        .timeout(std::time::Duration::from_secs(300)) // 5 min overall timeout for long streams
+        .connect_timeout(Duration::from_secs(HTTP_CONNECT_TIMEOUT_SECS))
+        // Do not set a total timeout for streaming model output: large code
+        // generations can legitimately run for more than five minutes.
+        .read_timeout(Duration::from_secs(STREAM_READ_TIMEOUT_SECS))
         .build()
         .map_err(|e| format!("创建 HTTP 客户端失败: {e}"))?;
     let mut req_builder = client
         .post(&url)
         .header("Content-Type", "application/json");
+    if is_model_request {
+        req_builder = req_builder.header("Accept-Encoding", "identity");
+    }
 
     for (key, value) in &headers {
         req_builder = req_builder.header(key.as_str(), value.as_str());
@@ -1576,19 +1929,24 @@ async fn start_chat_stream(
         .send()
         .await
         .map_err(|e| {
-            println!("[start_chat_stream] request_failed url={} err={}", url, e);
+            record_debug_log(&app, "error", "start_chat_stream", format!("request_failed url={} err={}", url, e));
             format!("请求失败: {e}")
         })?;
 
     if !response.status().is_success() {
         let status = response.status();
         let error_body = response.text().await.unwrap_or_default();
-        if url.contains("/v1/chat/completions") || url.contains("/v1/responses") || url.contains("/v1/messages") {
-            println!(
-                "[start_chat_stream] error status={} url={} body={}",
-                status,
-                url,
-                error_body.chars().take(240).collect::<String>(),
+        if is_model_request {
+            record_debug_log(
+                &app,
+                "error",
+                "start_chat_stream",
+                format!(
+                    "error status={} url={} body={}",
+                    status,
+                    url,
+                    error_body.chars().take(240).collect::<String>(),
+                ),
             );
         }
         return Err(format!("HTTP {}: {}", status, error_body.chars().take(500).collect::<String>()));
@@ -1600,9 +1958,17 @@ async fn start_chat_stream(
     // Buffer for incomplete UTF-8 tail bytes that straddle chunk boundaries.
     // Without this, multi-byte CJK characters get mangled by from_utf8_lossy.
     let mut utf8_tail: Vec<u8> = Vec::new();
+    let mut chunk_count: usize = 0;
+    let mut byte_count: usize = 0;
 
     while let Some(chunk_result) = stream.next().await {
         if STREAM_CANCEL.load(std::sync::atomic::Ordering::Relaxed) {
+            record_debug_log(
+                &app,
+                "info",
+                "start_chat_stream",
+                format!("cancelled url={} chunks={} bytes={} elapsed_ms={}", url, chunk_count, byte_count, stream_started_at.elapsed().as_millis()),
+            );
             let _ = app.emit(
                 "chat-stream-done",
                 StreamDonePayload {
@@ -1616,6 +1982,9 @@ async fn start_chat_stream(
 
         match chunk_result {
             Ok(bytes) => {
+                chunk_count += 1;
+                byte_count += bytes.len();
+
                 // Prepend any leftover bytes from the previous chunk
                 let mut combined = Vec::with_capacity(utf8_tail.len() + bytes.len());
                 combined.extend_from_slice(&utf8_tail);
@@ -1652,7 +2021,12 @@ async fn start_chat_stream(
                 }
             }
             Err(e) => {
-                println!("[start_chat_stream] read_error url={} err={}", url, e);
+                record_debug_log(
+                    &app,
+                    "error",
+                    "start_chat_stream",
+                    format!("read_error url={} chunks={} bytes={} elapsed_ms={} err={}", url, chunk_count, byte_count, stream_started_at.elapsed().as_millis(), e),
+                );
                 let _ = app.emit(
                     "chat-stream-done",
                     StreamDonePayload {
@@ -1675,8 +2049,13 @@ async fn start_chat_stream(
         },
     );
 
-    if url.contains("/v1/chat/completions") || url.contains("/v1/responses") || url.contains("/v1/messages") {
-        println!("[start_chat_stream] success url={}", url);
+    if is_model_request {
+        record_debug_log(
+            &app,
+            "info",
+            "start_chat_stream",
+            format!("success url={} chunks={} bytes={} elapsed_ms={}", url, chunk_count, byte_count, stream_started_at.elapsed().as_millis()),
+        );
     }
 
     Ok(())
@@ -2460,6 +2839,7 @@ pub fn run() {
             get_project_skeleton,
             get_file_outline,
             read_file,
+            get_file_metadata,
             write_file,
             export_text_file,
             glob_search,
@@ -2475,7 +2855,11 @@ pub fn run() {
             run_command,
             count_tokens,
             get_system_memory,
+            append_debug_log,
+            read_debug_log,
+            clear_debug_log,
             proxy_request,
+            cancel_proxy_request,
             start_chat_stream,
             cancel_chat_stream,
             read_document,
@@ -2564,12 +2948,15 @@ mod tests {
         assert!(should_hide_list_directory_entry(".DS_Store", false));
         assert!(!should_hide_list_directory_entry("Scripts", true));
         assert!(!should_hide_list_directory_entry(".MAIN", true));
+        assert!(!should_hide_list_directory_entry(".protocols", true));
     }
 
     #[test]
     fn recursive_search_skips_build_directories() {
         assert!(should_skip_recursive_search_dir("target"));
         assert!(should_skip_recursive_search_dir("PackageCache"));
+        assert!(!should_skip_recursive_search_dir(".MAIN"));
+        assert!(!should_skip_recursive_search_dir(".protocols"));
         assert!(!should_skip_recursive_search_dir("Scripts"));
     }
 

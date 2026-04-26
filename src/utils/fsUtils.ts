@@ -21,12 +21,13 @@ const SKIP_DIRS = new Set([
   "Pods", ".gradle", ".swiftpm",
 ]);
 
-export function isHiddenWorkspaceEntryName(name: string): boolean {
-  return name.startsWith(".");
-}
+const SKIP_ENTRY_NAMES = new Set([
+  ".DS_Store",
+]);
 
 export function shouldHideWorkspaceEntry(name: string, isDir: boolean): boolean {
-  if (isHiddenWorkspaceEntryName(name)) return true;
+  // 隐藏目录（例如 .MAIN / .protocols）需要保留给 Game Studio 访问。
+  if (SKIP_ENTRY_NAMES.has(name)) return true;
   return isDir && SKIP_DIRS.has(name);
 }
 

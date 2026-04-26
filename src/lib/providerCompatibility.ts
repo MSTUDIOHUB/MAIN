@@ -57,12 +57,23 @@ function hasImageContent(content: CompatibilityMessage["content"]): boolean {
 function buildProviderCompatibilityInstructionText(
   workflowMode: "chat" | "edit" | "plan",
 ): string {
+  const sharedToolAccess = [
+    "Tool access is available through XML tool calls even though native JSON tool calls are disabled for this provider.",
+    "You may access the current workspace folder through these XML tools:",
+    "- read_file: read a file under the workspace.",
+    "- list_directory, glob_search, grep_search: inspect folders and search files under the workspace.",
+    "- write_file: create or overwrite a workspace file. This is allowed when the user asks for implementation or file changes.",
+    "- replace_in_file: edit an existing workspace file by exact text replacement. This is allowed when the user asks for implementation or file changes.",
+    "- run_command: run workspace commands when needed for implementation or verification.",
+    "Never claim that write tools or folder access are unavailable. If you need to modify files, emit XML tool calls instead of describing an imaginary patch.",
+  ];
+
   if (workflowMode === "chat") {
     return [
       PROVIDER_COMPATIBILITY_TAG,
       "native_tools_disabled=true",
-      "The current cloud provider rejects native tools / tool_calls payloads.",
-      "Do not rely on the request `tools` parameter or native JSON tool calls.",
+      "The current cloud provider rejects native tools / tool_calls payloads, so MAIN exposes tools through XML tool calls instead.",
+      ...sharedToolAccess,
       "When tool use is necessary, you MUST emit XML tool calls in this exact format:",
       "<tool_use>",
       "<tool>read_file</tool>",
@@ -75,12 +86,13 @@ function buildProviderCompatibilityInstructionText(
   return [
     PROVIDER_COMPATIBILITY_TAG,
     "native_tools_disabled=true",
-    "The current cloud provider rejects native tools / tool_calls payloads.",
-    "Do not rely on the request `tools` parameter or native JSON tool calls.",
+    "The current cloud provider rejects native tools / tool_calls payloads, so MAIN exposes tools through XML tool calls instead.",
+    ...sharedToolAccess,
     "When tool use is necessary, you MUST emit XML tool calls in this exact format:",
     "<tool_use>",
-    "<tool>工具名称</tool>",
-    "<parameter name=\"参数名\">参数值</parameter>",
+    "<tool>write_file</tool>",
+    "<parameter name=\"path\">Assets/Readme.md</parameter>",
+    "<parameter name=\"content\">完整文件内容</parameter>",
     "</tool_use>",
   ].join("\n");
 }
