@@ -22,7 +22,7 @@ import {
 import { isRetryableCloudErrorMessage } from "../lib/cloudRetry";
 import { isProviderCompatibilityErrorMessage } from "../lib/providerCompatibility";
 import { clearDebugLog, copyDebugLogToClipboard, readDebugLogSnapshot } from "../lib/debugLog";
-import { exportTextFile, spawnPty, writePty } from "../lib/ipc";
+import { clearProjectSessions, exportTextFile, spawnPty, writePty } from "../lib/ipc";
 import { useAppStore } from "../store/useAppStore";
 import {
   createFeishuPairingCode,
@@ -219,7 +219,7 @@ function DataManagerPanel({ t }: { t: any }) {
       <h3 className="text-[13px] font-bold text-[#a1a1aa] uppercase tracking-wider">{t.dataManagement}</h3>
 
       <p className="text-[11.5px] text-[#71717a] leading-relaxed">
-        管理本地存储的数据。所有设置和会话记录保存在浏览器 localStorage 中，页面刷新后自动恢复。
+        管理本地数据。设置与会话索引保存在 localStorage，完整会话记录保存在 MAIN 应用数据目录，不写入项目的 .MAIN 目录。
       </p>
 
       {/* Clear Chat History */}
@@ -242,7 +242,8 @@ function DataManagerPanel({ t }: { t: any }) {
           <div className="flex items-center gap-3">
             <p className="text-[12px] text-[#f87171] font-bold">{t.clearHistoryConfirm}</p>
             <button
-              onClick={() => {
+              onClick={async () => {
+                await clearProjectSessions(useAppStore.getState().currentWorkspace).catch(() => {});
                 clearChatHistory();
                 setConfirmClear(false);
               }}
@@ -1479,15 +1480,18 @@ export default function SettingsModal({
   );
 
   return isOpen ? (
-    <div className="absolute inset-0 bg-black/80 flex items-center justify-center z-50 backdrop-blur-sm">
-      <div className="bg-[#09090b] border border-[#27272a] rounded-xl shadow-2xl w-[min(1170px,94vw)] max-h-[92vh] flex flex-col overflow-hidden">
-        <div className="px-5 py-4 border-b border-[#27272a] flex items-center justify-between bg-[#000000]">
+    <div className="absolute inset-0 bg-black/80 flex items-center justify-center z-50 p-4 backdrop-blur-sm">
+      <div
+        className="bg-[#09090b] border border-[#27272a] rounded-xl shadow-2xl w-[min(1170px,94vw)] flex flex-col overflow-hidden"
+        style={{ height: "min(920px, calc(100vh - 32px))", maxHeight: "calc(100vh - 32px)" }}
+      >
+        <div className="shrink-0 px-5 py-4 border-b border-[#27272a] flex items-center justify-between bg-[#000000]">
           <h2 className="text-base font-bold text-white flex items-center gap-2"><IconSettings className="w-5 h-5" /> {t.settings}</h2>
           <button onClick={onClose} className="text-[#a1a1aa] hover:text-white transition-colors"><IconClose className="w-4 h-4" /></button>
         </div>
 
-        <div className="flex" style={{ height: "min(840px, 82vh)" }}>
-          <div className="w-52 border-r border-[#27272a] bg-[#000000] p-2 flex flex-col gap-1">
+        <div className="flex min-h-0 flex-1">
+          <div className="w-52 shrink-0 overflow-y-auto border-r border-[#27272a] bg-[#000000] p-2 flex flex-col gap-1">
             <button onClick={() => setSettingsTab('general')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'general' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.general}</button>
             <button onClick={() => setSettingsTab('local')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'local' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.localSetup}</button>
             <button onClick={() => setSettingsTab('cloud')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'cloud' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.cloudSetup}</button>
@@ -1497,7 +1501,7 @@ export default function SettingsModal({
             <button onClick={() => setSettingsTab('data')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'data' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.dataManagement}</button>
             <button onClick={() => setSettingsTab('debug')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'debug' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.debugLog}</button>
           </div>
-          <div className="flex-1 p-6 overflow-y-auto bg-[#09090b]">
+          <div className="min-h-0 flex-1 overflow-y-auto bg-[#09090b] p-6 pb-8">
 
             {/* GENERAL SETTINGS + THEME */}
             {settingsTab === 'general' && (
@@ -1577,6 +1581,22 @@ export default function SettingsModal({
                   <div className="flex justify-between text-[11px] text-[#3f3f46] font-mono mt-1">
                     <span>10</span><span>13</span><span>16</span><span>20</span>
                   </div>
+                </div>
+
+                {/* SESSION RECORDING */}
+                <div className="pt-4 border-t border-[#27272a]">
+                  <label className="flex cursor-pointer items-start gap-3">
+                    <input
+                      type="checkbox"
+                      checked={config.sessionRecordingEnabled !== false}
+                      onChange={(e) => setConfig({ ...config, sessionRecordingEnabled: e.target.checked })}
+                      className="mt-1"
+                    />
+                    <span>
+                      <span className="block text-[13px] font-bold text-[#e4e4e7]">{t.sessionRecording}</span>
+                      <span className="mt-1 block text-[12px] leading-relaxed text-[#a1a1aa]">{t.sessionRecordingDesc}</span>
+                    </span>
+                  </label>
                 </div>
               </div>
             )}
@@ -1884,7 +1904,7 @@ export default function SettingsModal({
             )}
           </div>
         </div>
-        <div className="px-6 py-4 border-t border-[#27272a] bg-[#000000] flex justify-end gap-3">
+        <div className="shrink-0 px-6 py-4 border-t border-[#27272a] bg-[#000000] flex justify-end gap-3">
           <button onClick={onClose} className="px-5 py-1.5 text-[13px] text-[#a1a1aa] hover:text-white transition-colors">Cancel</button>
           <button onClick={onClose} className="px-6 py-1.5 theme-bg theme-bg-hover text-[13px] font-bold rounded-md transition-colors shadow-sm">Done</button>
         </div>

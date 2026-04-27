@@ -178,6 +178,30 @@ export function deleteChatTempPath(sessionKey: string, path: string): Promise<vo
   return invoke<void>("delete_chat_temp_path", { sessionKey, path });
 }
 
+export function listProjectSessions(workspace: string): Promise<any[]> {
+  return invoke<any[]>("list_project_sessions", { workspace });
+}
+
+export function rebuildProjectSessionsIndex(workspace: string): Promise<any[]> {
+  return invoke<any[]>("rebuild_project_sessions_index", { workspace });
+}
+
+export function saveProjectSession(workspace: string, session: any): Promise<any> {
+  return invoke<any>("save_project_session", { workspace, session });
+}
+
+export function loadProjectSession(workspace: string, sessionId: number | string): Promise<any> {
+  return invoke<any>("load_project_session", { workspace, sessionId });
+}
+
+export function deleteProjectSession(workspace: string, sessionId: number | string): Promise<any[]> {
+  return invoke<any[]>("delete_project_session", { workspace, sessionId });
+}
+
+export function clearProjectSessions(workspace: string): Promise<void> {
+  return invoke<void>("clear_project_sessions", { workspace });
+}
+
 export function exportTextFile(path: string, content: string): Promise<void> {
   return invoke<void>("export_text_file", { path, content });
 }

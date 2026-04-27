@@ -482,6 +482,189 @@ fn ensure_chat_temp_root(session_key: &str) -> Result<PathBuf, String> {
         .map_err(|e| format!("无法解析聊天临时目录: {e}"))
 }
 
+fn stable_project_hash(input: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in input.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn normalize_workspace_for_sessions(workspace: &str) -> String {
+    let trimmed = workspace.trim();
+    if trimmed.is_empty() {
+        return "__MAIN_GLOBAL_CHAT__".to_string();
+    }
+    let path = PathBuf::from(trimmed);
+    path.canonicalize()
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn session_project_id(workspace_root: &str) -> String {
+    let scope = if workspace_root == "__MAIN_GLOBAL_CHAT__" {
+        "global".to_string()
+    } else {
+        workspace_root.to_string()
+    };
+    format!("p_{}", stable_project_hash(&scope))
+}
+
+fn sessions_project_root(app: &AppHandle, workspace: &str) -> Result<(PathBuf, String, String), String> {
+    let workspace_root = normalize_workspace_for_sessions(workspace);
+    let project_id = session_project_id(&workspace_root);
+    let data_root = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("解析应用数据目录失败: {e}"))?
+        .join("sessions")
+        .join("projects")
+        .join(&project_id);
+    fs::create_dir_all(data_root.join("sessions"))
+        .map_err(|e| format!("创建项目会话目录失败: {e}"))?;
+    Ok((data_root, project_id, workspace_root))
+}
+
+fn session_id_from_value(value: &Value) -> Result<String, String> {
+    let raw = match value {
+        Value::Number(number) => number.to_string(),
+        Value::String(text) => text.trim().to_string(),
+        _ => String::new(),
+    };
+    let session_id = sanitize_session_key(&raw);
+    if session_id.is_empty() || session_id == "session" {
+        Err("会话 id 缺失，无法保存记录".to_string())
+    } else {
+        Ok(session_id)
+    }
+}
+
+fn session_id_from_object(value: &Value) -> Result<String, String> {
+    session_id_from_value(value.get("id").unwrap_or(&Value::Null))
+}
+
+fn session_dir(project_root: &Path, session_id: &str) -> PathBuf {
+    project_root.join("sessions").join(sanitize_session_key(session_id))
+}
+
+fn session_index_path(project_root: &Path) -> PathBuf {
+    project_root.join("sessions.index.json")
+}
+
+fn write_text_atomic(path: &Path, content: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("创建会话记录父目录失败: {e}"))?;
+    }
+    let temp_path = path.with_extension("tmp");
+    fs::write(&temp_path, content).map_err(|e| format!("写入会话记录临时文件失败: {e}"))?;
+    fs::rename(&temp_path, path).map_err(|e| format!("替换会话记录失败: {e}"))
+}
+
+fn write_json_atomic(path: &Path, value: &Value) -> Result<(), String> {
+    let content = serde_json::to_string_pretty(value)
+        .map_err(|e| format!("序列化会话记录失败: {e}"))?;
+    write_text_atomic(path, &(content + "\n"))
+}
+
+fn read_json_file(path: &Path) -> Result<Value, String> {
+    let content = fs::read_to_string(path).map_err(|e| format!("读取会话记录失败: {e}"))?;
+    serde_json::from_str(&content).map_err(|e| format!("解析会话记录失败: {e}"))
+}
+
+fn read_jsonl_file(path: &Path) -> Result<Vec<Value>, String> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let file = File::open(path).map_err(|e| format!("打开会话消息记录失败: {e}"))?;
+    let reader = BufReader::new(file);
+    let mut rows = Vec::new();
+    for (index, line) in reader.lines().enumerate() {
+        let line = line.map_err(|e| format!("读取会话消息记录失败: {e}"))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value = serde_json::from_str::<Value>(&line)
+            .map_err(|e| format!("解析会话消息第 {} 行失败: {e}", index + 1))?;
+        rows.push(value);
+    }
+    Ok(rows)
+}
+
+fn session_detail_status(dir: &Path) -> &'static str {
+    let has_messages = dir.join("messages.jsonl").exists();
+    let has_runtime = dir.join("runtime.json").exists();
+    if has_messages || has_runtime {
+        "ok"
+    } else {
+        "missing"
+    }
+}
+
+fn annotate_session_meta(mut meta: Value, project_id: &str, workspace_root: &str, dir: &Path) -> Value {
+    if let Some(object) = meta.as_object_mut() {
+        object.insert("projectId".to_string(), Value::String(project_id.to_string()));
+        object.insert("workspaceRoot".to_string(), Value::String(workspace_root.to_string()));
+        object.insert(
+            "storageStatus".to_string(),
+            Value::String(session_detail_status(dir).to_string()),
+        );
+    }
+    meta
+}
+
+fn rebuild_sessions_index_for_project(
+    project_root: &Path,
+    project_id: &str,
+    workspace_root: &str,
+) -> Result<Vec<Value>, String> {
+    let sessions_root = project_root.join("sessions");
+    fs::create_dir_all(&sessions_root).map_err(|e| format!("创建会话目录失败: {e}"))?;
+
+    let mut sessions = Vec::new();
+    for entry in fs::read_dir(&sessions_root).map_err(|e| format!("读取会话目录失败: {e}"))? {
+        let entry = entry.map_err(|e| format!("读取会话目录项失败: {e}"))?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let meta_path = path.join("session.json");
+        if !meta_path.exists() {
+            continue;
+        }
+        let meta = read_json_file(&meta_path)?;
+        sessions.push(annotate_session_meta(meta, project_id, workspace_root, &path));
+    }
+
+    sessions.sort_by(|a, b| {
+        let a_date = a
+            .get("updatedAt")
+            .or_else(|| a.get("date"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let b_date = b
+            .get("updatedAt")
+            .or_else(|| b.get("date"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        b_date.cmp(a_date)
+    });
+
+    let index = json!({
+        "projectId": project_id,
+        "workspaceRoot": workspace_root,
+        "updatedAt": now_millis(),
+        "sessions": sessions,
+    });
+    write_json_atomic(&session_index_path(project_root), &index)?;
+    Ok(index
+        .get("sessions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default())
+}
+
 fn ensure_in_workspace(path: &Path, workspace: &Path) -> Result<(), String> {
     if path.starts_with(workspace) {
         Ok(())
@@ -1023,6 +1206,138 @@ fn read_chat_temp_file(session_key: String, path: String) -> Result<String, Stri
     let workspace = ensure_chat_temp_root(&session_key)?;
     let real_path = resolve_existing_path(&path, &workspace)?;
     fs::read_to_string(real_path).map_err(|e| format!("读取聊天临时文件失败: {e}"))
+}
+
+#[tauri::command]
+fn list_project_sessions(app: AppHandle, workspace: String) -> Result<Vec<Value>, String> {
+    let (project_root, project_id, workspace_root) = sessions_project_root(&app, &workspace)?;
+    let index_path = session_index_path(&project_root);
+    if index_path.exists() {
+        let index = read_json_file(&index_path)?;
+        if let Some(sessions) = index.get("sessions").and_then(Value::as_array) {
+            return Ok(sessions
+                .iter()
+                .map(|session| {
+                    let session_id = session_id_from_object(session).unwrap_or_else(|_| "session".to_string());
+                    annotate_session_meta(
+                        session.clone(),
+                        &project_id,
+                        &workspace_root,
+                        &session_dir(&project_root, &session_id),
+                    )
+                })
+                .collect());
+        }
+    }
+    rebuild_sessions_index_for_project(&project_root, &project_id, &workspace_root)
+}
+
+#[tauri::command]
+fn rebuild_project_sessions_index(app: AppHandle, workspace: String) -> Result<Vec<Value>, String> {
+    let (project_root, project_id, workspace_root) = sessions_project_root(&app, &workspace)?;
+    rebuild_sessions_index_for_project(&project_root, &project_id, &workspace_root)
+}
+
+#[tauri::command]
+fn save_project_session(app: AppHandle, workspace: String, session: Value) -> Result<Value, String> {
+    let (project_root, project_id, workspace_root) = sessions_project_root(&app, &workspace)?;
+    let session_id = session_id_from_object(&session)?;
+    let dir = session_dir(&project_root, &session_id);
+    fs::create_dir_all(&dir).map_err(|e| format!("创建会话记录目录失败: {e}"))?;
+
+    let mut meta = session
+        .as_object()
+        .cloned()
+        .ok_or_else(|| "会话记录必须是对象".to_string())?;
+    let messages = meta.remove("messages").unwrap_or_else(|| Value::Array(Vec::new()));
+    let runtime = meta.remove("runtimeSnapshot");
+    meta.insert("projectId".to_string(), Value::String(project_id.clone()));
+    meta.insert("workspaceRoot".to_string(), Value::String(workspace_root.clone()));
+    meta.insert("updatedAtMs".to_string(), Value::Number(now_millis().into()));
+    meta.insert("storageStatus".to_string(), Value::String("ok".to_string()));
+
+    let meta_value = Value::Object(meta);
+    write_json_atomic(&dir.join("session.json"), &meta_value)?;
+
+    let mut message_lines = String::new();
+    if let Some(rows) = messages.as_array() {
+        for row in rows {
+            let line = serde_json::to_string(row)
+                .map_err(|e| format!("序列化会话消息失败: {e}"))?;
+            message_lines.push_str(&line);
+            message_lines.push('\n');
+        }
+    }
+    write_text_atomic(&dir.join("messages.jsonl"), &message_lines)?;
+
+    if let Some(runtime_value) = runtime {
+        write_json_atomic(&dir.join("runtime.json"), &runtime_value)?;
+    }
+
+    let sessions = rebuild_sessions_index_for_project(&project_root, &project_id, &workspace_root)?;
+    Ok(sessions
+        .into_iter()
+        .find(|item| item.get("id") == meta_value.get("id"))
+        .unwrap_or_else(|| annotate_session_meta(meta_value, &project_id, &workspace_root, &dir)))
+}
+
+#[tauri::command]
+fn load_project_session(app: AppHandle, workspace: String, session_id: Value) -> Result<Value, String> {
+    let (project_root, project_id, workspace_root) = sessions_project_root(&app, &workspace)?;
+    let session_id = session_id_from_value(&session_id)?;
+    let dir = session_dir(&project_root, &session_id);
+    let meta_path = dir.join("session.json");
+
+    let mut session = if meta_path.exists() {
+        read_json_file(&meta_path)?
+    } else {
+        json!({
+            "id": session_id,
+            "title": "Missing Session",
+            "date": "",
+            "active": false,
+        })
+    };
+
+    let messages_path = dir.join("messages.jsonl");
+    let runtime_path = dir.join("runtime.json");
+    let messages_missing = !messages_path.exists();
+    let runtime_missing = !runtime_path.exists();
+
+    if let Some(object) = session.as_object_mut() {
+        object.insert("projectId".to_string(), Value::String(project_id));
+        object.insert("workspaceRoot".to_string(), Value::String(workspace_root));
+        object.insert(
+            "storageStatus".to_string(),
+            Value::String(if messages_missing && runtime_missing { "missing" } else { "ok" }.to_string()),
+        );
+        object.insert("messages".to_string(), Value::Array(read_jsonl_file(&messages_path)?));
+        if runtime_path.exists() {
+            object.insert("runtimeSnapshot".to_string(), read_json_file(&runtime_path)?);
+        }
+    }
+
+    Ok(session)
+}
+
+#[tauri::command]
+fn delete_project_session(app: AppHandle, workspace: String, session_id: Value) -> Result<Vec<Value>, String> {
+    let (project_root, project_id, workspace_root) = sessions_project_root(&app, &workspace)?;
+    let session_id = session_id_from_value(&session_id)?;
+    let dir = session_dir(&project_root, &session_id);
+    if dir.exists() {
+        fs::remove_dir_all(&dir).map_err(|e| format!("删除会话记录失败: {e}"))?;
+    }
+    rebuild_sessions_index_for_project(&project_root, &project_id, &workspace_root)
+}
+
+#[tauri::command]
+fn clear_project_sessions(app: AppHandle, workspace: String) -> Result<(), String> {
+    let (project_root, _project_id, _workspace_root) = sessions_project_root(&app, &workspace)?;
+    if project_root.exists() {
+        fs::remove_dir_all(&project_root).map_err(|e| format!("清空项目会话记录失败: {e}"))?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -3587,6 +3902,12 @@ pub fn run() {
             delete_protocol_package,
             write_chat_temp_file,
             read_chat_temp_file,
+            list_project_sessions,
+            rebuild_project_sessions_index,
+            save_project_session,
+            load_project_session,
+            delete_project_session,
+            clear_project_sessions,
             delete_workspace_path,
             delete_chat_temp_path,
             run_hook_command,

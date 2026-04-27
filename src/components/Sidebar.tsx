@@ -41,6 +41,7 @@ interface SidebarProps {
   onCreateSession: (scopeKey: string) => void;
   onSelectSession: (scopeKey: string, id: number) => void;
   onDeleteSession: (scopeKey: string, id: number) => void;
+  onRebuildSessions?: (scopeKey: string) => void;
   onToggleWorkspaceTree: () => void;
   onStartResizing?: (e: React.MouseEvent) => void;
 }
@@ -60,6 +61,7 @@ export default function Sidebar({
   onCreateSession,
   onSelectSession,
   onDeleteSession,
+  onRebuildSessions,
   onToggleWorkspaceTree,
   onStartResizing,
 }: SidebarProps) {
@@ -112,6 +114,8 @@ export default function Sidebar({
   const projectChatsLabel = config.language === "en" ? "Project Chats" : "项目会话";
   const chatLabel = config.language === "en" ? "Chat" : "聊天";
   const newLabel = config.language === "en" ? "New" : "新建";
+  const rebuildLabel = config.language === "en" ? "Rebuild" : "重建";
+  const missingLabel = config.language === "en" ? "Missing details" : "详情缺失";
 
   // 旧数据里可能残留“思考过程”一类标题，这里优先回退到首个 turn 的标题，
   // 让 sidebar 至少展示真实任务，而不是模型的过程文本。
@@ -193,15 +197,26 @@ export default function Sidebar({
           <div className="space-y-2">
             <div className="flex items-center justify-between gap-2 px-1">
               <div className="text-[11px] font-bold uppercase tracking-wider text-[#71717a]">{projectChatsLabel}</div>
-              <button
-                onClick={() => workspacePath && onCreateSession?.(workspacePath)}
-                disabled={!workspacePath}
-                className="flex items-center gap-1 rounded px-2 py-1 text-[11px] font-medium text-[#e4e4e7] transition-colors hover:bg-[#18181b] hover:text-white disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-[#e4e4e7]"
-                title={config.language === "en" ? "New project conversation" : "新建项目会话"}
-              >
-                <IconPlus className="h-3.5 w-3.5" />
-                {newLabel}
-              </button>
+              <div className="flex items-center gap-1">
+                <button
+                  onClick={() => workspacePath && onRebuildSessions?.(workspacePath)}
+                  disabled={!workspacePath}
+                  className="flex items-center gap-1 rounded px-2 py-1 text-[11px] font-medium text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-white disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-[#a1a1aa]"
+                  title={config.language === "en" ? "Rebuild conversation index" : "重建会话索引"}
+                >
+                  <IconBook className="h-3.5 w-3.5" />
+                  {rebuildLabel}
+                </button>
+                <button
+                  onClick={() => workspacePath && onCreateSession?.(workspacePath)}
+                  disabled={!workspacePath}
+                  className="flex items-center gap-1 rounded px-2 py-1 text-[11px] font-medium text-[#e4e4e7] transition-colors hover:bg-[#18181b] hover:text-white disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-[#e4e4e7]"
+                  title={config.language === "en" ? "New project conversation" : "新建项目会话"}
+                >
+                  <IconPlus className="h-3.5 w-3.5" />
+                  {newLabel}
+                </button>
+              </div>
             </div>
 
             {!workspacePath ? (
@@ -252,7 +267,17 @@ export default function Sidebar({
                           />
                           <div className="flex min-w-0 flex-1 flex-col">
                             <span className="sidebar-session-title truncate text-[13px]">{resolveSessionDisplayTitle(session)}</span>
-                            <span className="mt-0.5 text-[10px] text-[#71717a]">{formatDate(session.date)}</span>
+                            <span className="mt-0.5 flex items-center gap-1 text-[10px] text-[#71717a]">
+                              <span>{formatDate(session.date)}</span>
+                              {session.storageStatus === "missing" && (
+                                <span className="rounded border border-[#7f1d1d] bg-[#2a1010] px-1 text-[#fca5a5]">{missingLabel}</span>
+                              )}
+                              {session.recordingDisabled && (
+                                <span className="rounded border border-[#3f3f46] bg-[#18181b] px-1 text-[#a1a1aa]">
+                                  {config.language === "en" ? "Temporary" : "临时"}
+                                </span>
+                              )}
+                            </span>
                           </div>
                           <button
                             onClick={(e) => {
@@ -337,7 +362,17 @@ export default function Sidebar({
                           />
                           <div className="flex min-w-0 flex-1 flex-col">
                             <span className="sidebar-session-title truncate text-[13px]">{resolveSessionDisplayTitle(session)}</span>
-                            <span className="mt-0.5 text-[10px] text-[#71717a]">{formatDate(session.date)}</span>
+                            <span className="mt-0.5 flex items-center gap-1 text-[10px] text-[#71717a]">
+                              <span>{formatDate(session.date)}</span>
+                              {session.storageStatus === "missing" && (
+                                <span className="rounded border border-[#7f1d1d] bg-[#2a1010] px-1 text-[#fca5a5]">{missingLabel}</span>
+                              )}
+                              {session.recordingDisabled && (
+                                <span className="rounded border border-[#3f3f46] bg-[#18181b] px-1 text-[#a1a1aa]">
+                                  {config.language === "en" ? "Temporary" : "临时"}
+                                </span>
+                              )}
+                            </span>
                           </div>
                           <button
                             onClick={(e) => {

@@ -22,7 +22,14 @@ import {
   syncTaskIdCounterFromBlocks,
 } from "./store/useAppStore";
 import { getE2EQuickReplyHandler, initializeE2EScenarios } from "./lib/e2e";
-import { setWorkspaceRoot as setWorkspaceRootIpc } from "./lib/ipc";
+import {
+  deleteProjectSession,
+  listProjectSessions,
+  loadProjectSession,
+  rebuildProjectSessionsIndex,
+  saveProjectSession,
+  setWorkspaceRoot as setWorkspaceRootIpc,
+} from "./lib/ipc";
 import { normalizeStudioAgentKey } from "./lib/gameStudioCatalog";
 import { MAIN_MODE_KEYS, mapLegacyNexusModeToMainMode, mapMainModeToLegacyNexusMode } from "./lib/mainModes";
 import { resolveConversationTurnIntent } from "./lib/runIntent";
@@ -41,6 +48,41 @@ import {
   type FeishuAdapterEvent,
   type FeishuInboundMessage,
 } from "./lib/imAdapters";
+
+function buildSessionRuntimeSnapshotFromState(state: any) {
+  return {
+    taskFlow: sanitizeTaskBlocksForPersist(state.taskFlow || []),
+    agentMessages: sanitizeAgentMessagesForPersist(state.agentMessages || []),
+    conversationTurns: state.conversationTurns || [],
+    currentTurnId: state.currentTurnId ?? null,
+    selectedMainModeKey: state.selectedMainModeKey,
+    selectedNexusModeKey: state.selectedNexusModeKey,
+    activeStudioAgentKey: state.activeStudioAgentKey,
+    gameStudioInitialized: state.gameStudioInitialized,
+    pendingSlashCommand: state.pendingSlashCommand ?? null,
+    planArtifacts: state.planArtifacts || [],
+    planTasks: state.planTasks || [],
+    planExecutionEvidenceCount: state.planExecutionEvidenceCount ?? 0,
+    planStage: state.planStage ?? "idle",
+    isPlanApproved: state.isPlanApproved === true,
+    showPlanPanel: state.showPlanPanel === true,
+    showDiff: state.showDiff === true,
+    showTerminal: state.showTerminal === true,
+    showFilePanel: state.showFilePanel === true,
+    rightPanelTab: state.rightPanelTab ?? "plan",
+    selectedDiffTaskId: state.selectedDiffTaskId ?? null,
+  };
+}
+
+function buildStoredSessionSnapshot(state: any, scopeKey: string, sessionId: number) {
+  const session = (state.sessionsByWorkspace[scopeKey] || []).find((item: any) => item.id === sessionId);
+  if (!session) return null;
+  return {
+    ...session,
+    messages: sanitizeTaskBlocksForPersist(state.taskFlow || []),
+    runtimeSnapshot: buildSessionRuntimeSnapshotFromState(state),
+  };
+}
 
 // ==========================================
 // MAIN APP COMPONENT
@@ -64,6 +106,8 @@ export default function App() {
   const currentTheme = THEMES[config.theme] || THEMES.purple;
   const remoteFeishuQueueRef = useRef<FeishuInboundMessage[]>([]);
   const feishuStartingRef = useRef(false);
+  const sessionSaveTimerRef = useRef<number | null>(null);
+  const [sessionMigrationReady, setSessionMigrationReady] = useState(false);
 
   // ── Agent State (from store, replaces all inline implementations) ─────
   const taskFlow = useAppStore((s) => s.taskFlow);
@@ -139,6 +183,57 @@ export default function App() {
   const setIsAddingSkill = useAppStore((s) => s.setIsAddingSkill);
   const setShowAgentPicker = useAppStore((s) => s.setShowAgentPicker);
 
+  const refreshSessionsForScope = useCallback(async (scopeKey: string) => {
+    try {
+      const diskSessions = await listProjectSessions(scopeKey);
+      useAppStore.setState((state: any) => {
+        const existing = state.sessionsByWorkspace[scopeKey] || [];
+        const localOnlySessions = existing.filter((session: any) =>
+          session.recordingDisabled || session.storageStatus === "missing"
+        );
+        return {
+          sessionsByWorkspace: {
+            ...state.sessionsByWorkspace,
+            [scopeKey]: [...localOnlySessions, ...diskSessions],
+          },
+        };
+      });
+      return diskSessions;
+    } catch (error) {
+      appendDebugLog("warn", "session.storage", {
+        phase: "list_failed",
+        scopeKey,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return useAppStore.getState().sessionsByWorkspace[scopeKey] || [];
+    }
+  }, []);
+
+  const persistCurrentSessionNow = useCallback(async () => {
+    const state = useAppStore.getState();
+    if (!state.currentSessionId) return;
+    const scopeKey = resolveSessionWorkspaceKey(state.currentWorkspace);
+    const snapshot = buildStoredSessionSnapshot(state, scopeKey, state.currentSessionId);
+    if (!snapshot) return;
+
+    state.updateSession(scopeKey, state.currentSessionId, {
+      messages: snapshot.messages,
+      runtimeSnapshot: snapshot.runtimeSnapshot,
+    });
+
+    if (!state.config.sessionRecordingEnabled || snapshot.recordingDisabled) return;
+    try {
+      await saveProjectSession(scopeKey, snapshot);
+    } catch (error) {
+      appendDebugLog("warn", "session.storage", {
+        phase: "save_failed",
+        scopeKey,
+        sessionId: state.currentSessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }, []);
+
   // ── Skills ────────────────────────────────────────────────────────────
   const skills = useAppStore((s) => s.skills);
   const toggleSkill = useAppStore((s) => s.toggleSkill);
@@ -147,6 +242,12 @@ export default function App() {
   const updateSkill = useAppStore((s) => s.updateSkill);
 
   useEffect(() => initializeE2EScenarios(), []);
+  useEffect(() => () => {
+    if (sessionSaveTimerRef.current !== null) {
+      window.clearTimeout(sessionSaveTimerRef.current);
+      sessionSaveTimerRef.current = null;
+    }
+  }, []);
   useEffect(() => {
     appendDebugLog("info", "app.lifecycle", {
       phase: "app_mounted",
@@ -159,6 +260,60 @@ export default function App() {
   // Log only the initial mount snapshot.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+  useEffect(() => {
+    let cancelled = false;
+    const migrateLegacySessions = async () => {
+      const markerKey = "main.sessions.appDataMigrated.v1";
+      const state = useAppStore.getState();
+      const nextSessionsByWorkspace: Record<string, any[]> = {};
+      let touched = false;
+
+      for (const [scopeKey, sessions] of Object.entries(state.sessionsByWorkspace || {})) {
+        nextSessionsByWorkspace[scopeKey] = await Promise.all((sessions as any[]).map(async (session) => {
+          const hasRuntime = Boolean(session.runtimeSnapshot);
+          const hasMessages = Array.isArray(session.messages) && session.messages.length > 0;
+          if (session.recordingDisabled) return session;
+          if (hasRuntime || hasMessages) {
+            try {
+              const saved = await saveProjectSession(scopeKey, session);
+              touched = true;
+              return { ...session, ...saved };
+            } catch (error) {
+              appendDebugLog("warn", "session.storage", {
+                phase: "legacy_migration_save_failed",
+                scopeKey,
+                sessionId: session.id,
+                error: error instanceof Error ? error.message : String(error),
+              });
+              return session;
+            }
+          }
+          if (!session.storageStatus) {
+            touched = true;
+            return { ...session, storageStatus: "missing" };
+          }
+          return session;
+        }));
+      }
+
+      if (!cancelled && touched) {
+        useAppStore.setState({ sessionsByWorkspace: nextSessionsByWorkspace });
+      }
+      try {
+        window.localStorage.setItem(markerKey, "1");
+      } catch {}
+      if (!cancelled) setSessionMigrationReady(true);
+    };
+
+    void migrateLegacySessions();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  useEffect(() => {
+    if (!sessionMigrationReady) return;
+    void refreshSessionsForScope(activeSessionScope);
+  }, [activeSessionScope, refreshSessionsForScope, sessionMigrationReady]);
   useEffect(() => {
     if (!currentWorkspace) return;
     const startedAt = performance.now();
@@ -184,35 +339,65 @@ export default function App() {
   useEffect(() => {
     if (!currentSessionId) return;
 
+    const messages = sanitizeTaskBlocksForPersist(taskFlow);
+    const runtimeSnapshot = {
+      taskFlow: messages,
+      agentMessages: sanitizeAgentMessagesForPersist(agentMessages),
+      conversationTurns,
+      currentTurnId,
+      selectedMainModeKey,
+      selectedNexusModeKey,
+      activeStudioAgentKey,
+      gameStudioInitialized,
+      pendingSlashCommand,
+      planArtifacts,
+      planTasks,
+      planExecutionEvidenceCount,
+      planStage,
+      isPlanApproved,
+      showPlanPanel,
+      showDiff,
+      showTerminal,
+      showFilePanel,
+      rightPanelTab,
+      selectedDiffTaskId,
+    };
+
     updateSession(activeSessionScope, currentSessionId, {
-      messages: sanitizeTaskBlocksForPersist(taskFlow),
-      runtimeSnapshot: {
-        taskFlow: sanitizeTaskBlocksForPersist(taskFlow),
-        agentMessages: sanitizeAgentMessagesForPersist(agentMessages),
-        conversationTurns,
-        currentTurnId,
-        selectedMainModeKey,
-        selectedNexusModeKey,
-        activeStudioAgentKey,
-        gameStudioInitialized,
-        pendingSlashCommand,
-        planArtifacts,
-        planTasks,
-        planExecutionEvidenceCount,
-        planStage,
-        isPlanApproved,
-        showPlanPanel,
-        showDiff,
-        showTerminal,
-        showFilePanel,
-        rightPanelTab,
-        selectedDiffTaskId,
-      },
+      messages,
+      runtimeSnapshot,
     });
+
+    if (sessionSaveTimerRef.current !== null) {
+      window.clearTimeout(sessionSaveTimerRef.current);
+      sessionSaveTimerRef.current = null;
+    }
+
+    if (config.sessionRecordingEnabled) {
+      sessionSaveTimerRef.current = window.setTimeout(() => {
+        sessionSaveTimerRef.current = null;
+        const state = useAppStore.getState();
+        const session = (state.sessionsByWorkspace[activeSessionScope] || []).find((item: any) => item.id === currentSessionId);
+        if (!session || session.recordingDisabled) return;
+        void saveProjectSession(activeSessionScope, {
+          ...session,
+          messages,
+          runtimeSnapshot,
+        }).catch((error) => {
+          appendDebugLog("warn", "session.storage", {
+            phase: "debounced_save_failed",
+            scopeKey: activeSessionScope,
+            sessionId: currentSessionId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+      }, 350);
+    }
   }, [
     agentMessages,
     activeSessionScope,
     conversationTurns,
+    config.sessionRecordingEnabled,
     currentSessionId,
     currentTurnId,
     gameStudioInitialized,
@@ -360,8 +545,77 @@ export default function App() {
   }, []);
 
   // --- Workspace & Session Management ---
-  const restoreSessionState = (target: any, id: number) => {
+  const restoreSessionState = async (target: any, id: number, scopeKey = activeSessionScope) => {
     const startedAt = performance.now();
+    let hydratedTarget = target;
+
+    if (
+      hydratedTarget?.storageStatus === "ok" &&
+      !hydratedTarget?.runtimeSnapshot &&
+      !(Array.isArray(hydratedTarget?.messages) && hydratedTarget.messages.length > 0) &&
+      !hydratedTarget?.recordingDisabled
+    ) {
+      try {
+        hydratedTarget = await loadProjectSession(scopeKey, id);
+        updateSession(scopeKey, id, hydratedTarget);
+      } catch (error) {
+        appendDebugLog("warn", "session.restore", {
+          sessionId: id,
+          scopeKey,
+          mode: "load_failed",
+          error: error instanceof Error ? error.message : String(error),
+        });
+        hydratedTarget = { ...hydratedTarget, storageStatus: "missing" };
+      }
+    }
+
+    if (
+      hydratedTarget?.storageStatus === "missing" &&
+      !hydratedTarget?.runtimeSnapshot &&
+      !(Array.isArray(hydratedTarget?.messages) && hydratedTarget.messages.length > 0)
+    ) {
+      const blockId = Date.now();
+      const title = normalizeConversationDisplayTitle(
+        hydratedTarget?.title || "",
+        48,
+        useAppStore.getState().config.language === "en" ? "Missing session" : "记录详情缺失",
+      );
+      const content = useAppStore.getState().config.language === "en"
+        ? "This session title still exists, but its transcript/runtime files are missing. Rebuild the session index or delete this orphan record."
+        : "这个会话标题还在，但完整对话与运行快照文件已经缺失。可以重建会话索引，或删除这条孤立记录。";
+      useAppStore.setState({
+        taskFlow: [{ id: blockId, type: "system" as const, content }],
+        agentMessages: [],
+        selectedMainModeKey: "main_mode",
+        selectedNexusModeKey: "nexus_general",
+        selectedDiffTaskId: null,
+        conversationTurns: [{
+          id: `missing-${id}-${Date.now()}`,
+          userPrompt: title,
+          title,
+          mode: 'chat' as const,
+          status: 'error' as const,
+          summary: content,
+          blockIds: [blockId],
+          collapsed: false,
+          createdAt: Date.now(),
+        }],
+        currentTurnId: null,
+        showPlanPanel: false,
+        showDiff: false,
+        showTerminal: false,
+        showFilePanel: false,
+        rightPanelTab: 'plan',
+      });
+      appendDebugLog("warn", "session.restore", {
+        sessionId: id,
+        mode: "missing",
+        elapsedMs: Math.round(performance.now() - startedAt),
+      });
+      return;
+    }
+
+    target = hydratedTarget;
     if (target?.runtimeSnapshot) {
       const snapshot = target.runtimeSnapshot;
       const restoredTaskFlow = sanitizeTaskBlocksForPersist(snapshot.taskFlow || target.messages || []);
@@ -539,37 +793,29 @@ export default function App() {
     try {
       const selected = await open({ directory: true, multiple: false, title: 'Select Project Workspace' });
       if (selected) {
-        const state = useAppStore.getState();
-        const liveScope = resolveSessionWorkspaceKey(state.currentWorkspace);
-        if (state.currentSessionId) {
-          state.updateSession(liveScope, state.currentSessionId, { messages: sanitizeTaskBlocksForPersist(taskFlow) });
-        }
+        await persistCurrentSessionNow();
+        const selectedPath = Array.isArray(selected) ? selected[0] : selected;
         // Register workspace root in Rust backend BEFORE updating frontend state
         // to avoid race condition with file listing in Composer
-        try { await setWorkspaceRootIpc(selected); } catch {}
-        setCurrentWorkspace(selected);
+        let stablePath = selectedPath;
+        try { stablePath = await setWorkspaceRootIpc(selectedPath); } catch {}
+        setCurrentWorkspace(stablePath);
         setCurrentSessionId(null);
-        state.resetForWorkspace();
-        const existing = useAppStore.getState().sessionsByWorkspace[selected] || [];
-        if (existing.length === 0) handleCreateSessionForScope(selected);
-        else handleSelectSession(selected, existing[0].id);
+        useAppStore.getState().resetForWorkspace();
+        const existing = await refreshSessionsForScope(stablePath);
+        if (existing.length === 0) await handleCreateSessionForScope(stablePath);
+        else await handleSelectSession(stablePath, existing[0].id);
       }
     } catch (error) { console.error('Failed to select workspace:', error); }
   };
 
-  const handleOpenGlobalChat = () => {
+  const handleOpenGlobalChat = async () => {
     const state = useAppStore.getState();
     if (!state.currentWorkspace && state.currentSessionId) return;
-    const liveScope = resolveSessionWorkspaceKey(state.currentWorkspace);
-    if (state.currentSessionId) {
-      updateSession(liveScope, state.currentSessionId, {
-        messages: sanitizeTaskBlocksForPersist(taskFlow),
-        active: false,
-      });
-    }
+    await persistCurrentSessionNow();
 
     openSessionScope(GLOBAL_CHAT_KEY);
-    const existing = useAppStore.getState().sessionsByWorkspace[GLOBAL_CHAT_KEY] || [];
+    const existing = await refreshSessionsForScope(GLOBAL_CHAT_KEY);
     if (existing.length === 0) {
       setCurrentSessionId(null);
       return;
@@ -578,15 +824,16 @@ export default function App() {
     const targetSession = existing.find((session: any) => session.active) || existing[0];
     updateSession(GLOBAL_CHAT_KEY, targetSession.id, { active: true });
     setCurrentSessionId(targetSession.id);
-    restoreSessionState(targetSession, targetSession.id);
+    await restoreSessionState(targetSession, targetSession.id, GLOBAL_CHAT_KEY);
   };
 
-  const handleCreateSessionForScope = (scopeKey: string) => {
+  const handleCreateSessionForScope = async (scopeKey: string) => {
     if (!scopeKey) return;
 
     const state = useAppStore.getState();
     const liveScope = resolveSessionWorkspaceKey(state.currentWorkspace);
     if (state.currentSessionId) {
+      await persistCurrentSessionNow();
       updateSession(liveScope, state.currentSessionId, {
         messages: sanitizeTaskBlocksForPersist(taskFlow),
         active: false,
@@ -594,6 +841,7 @@ export default function App() {
     }
 
     const isGlobalChat = scopeKey === GLOBAL_CHAT_KEY;
+    const storageStatus: "ok" | "temporary" = config.sessionRecordingEnabled ? "ok" : "temporary";
     const ns = {
       id: Date.now(),
       title: isGlobalChat
@@ -601,6 +849,8 @@ export default function App() {
         : (config.language === "en" ? "New Conversation" : "新会话"),
       date: new Date().toISOString(),
       active: true,
+      storageStatus,
+      recordingDisabled: !config.sessionRecordingEnabled,
       messages: [] as TaskBlock[],
     };
     const existing = useAppStore.getState().sessionsByWorkspace[scopeKey] || [];
@@ -610,27 +860,41 @@ export default function App() {
     setCurrentSessionId(ns.id);
   };
 
-  const handleSelectSession = (scopeKey: string, id: number) => {
+  const handleSelectSession = async (scopeKey: string, id: number) => {
     const state = useAppStore.getState();
-    const liveScope = resolveSessionWorkspaceKey(state.currentWorkspace);
-    if (state.currentSessionId) {
-      updateSession(liveScope, state.currentSessionId, {
-        messages: sanitizeTaskBlocksForPersist(taskFlow),
-        active: false,
-      });
-    }
+    if (state.currentSessionId) await persistCurrentSessionNow();
 
     openSessionScope(scopeKey);
     updateSession(scopeKey, id, { active: true });
     setCurrentSessionId(id);
     const target = (useAppStore.getState().sessionsByWorkspace[scopeKey] || []).find((s: any) => s.id === id);
-    restoreSessionState(target, id);
+    await restoreSessionState(target, id, scopeKey);
   };
 
   const handleDeleteSession = (scopeKey: string, id: number) => {
     const state = useAppStore.getState();
     const wasCurrent = scopeKey === resolveSessionWorkspaceKey(state.currentWorkspace) && id === state.currentSessionId;
     removeSession(scopeKey, id);
+    void deleteProjectSession(scopeKey, id).then((sessions) => {
+      useAppStore.setState((latest: any) => ({
+        sessionsByWorkspace: {
+          ...latest.sessionsByWorkspace,
+          [scopeKey]: [
+            ...(latest.sessionsByWorkspace[scopeKey] || []).filter((session: any) =>
+              session.id !== id && (session.recordingDisabled || session.storageStatus === "missing")
+            ),
+            ...sessions,
+          ],
+        },
+      }));
+    }).catch((error) => {
+      appendDebugLog("warn", "session.storage", {
+        phase: "delete_failed",
+        scopeKey,
+        sessionId: id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
     if (wasCurrent) {
       useAppStore.setState({
         taskFlow: [],
@@ -642,6 +906,24 @@ export default function App() {
         selectedNexusModeKey: "nexus_general",
         pendingSlashCommand: null,
         planExecutionEvidenceCount: 0,
+      });
+    }
+  };
+
+  const handleRebuildSessionIndex = async (scopeKey: string) => {
+    try {
+      const sessions = await rebuildProjectSessionsIndex(scopeKey);
+      useAppStore.setState((state: any) => ({
+        sessionsByWorkspace: {
+          ...state.sessionsByWorkspace,
+          [scopeKey]: sessions,
+        },
+      }));
+    } catch (error) {
+      appendDebugLog("warn", "session.storage", {
+        phase: "rebuild_failed",
+        scopeKey,
+        error: error instanceof Error ? error.message : String(error),
       });
     }
   };
@@ -719,6 +1001,8 @@ export default function App() {
         title,
         date: new Date().toISOString(),
         active: true,
+        storageStatus: state.config.sessionRecordingEnabled ? "ok" : "temporary",
+        recordingDisabled: !state.config.sessionRecordingEnabled,
         messages: [] as TaskBlock[],
       };
       state.addSession(scopeKey, target);
@@ -727,7 +1011,7 @@ export default function App() {
     }
 
     state.setCurrentSessionId(target.id);
-    restoreSessionState(target, target.id);
+    void restoreSessionState(target, target.id, scopeKey);
     return target.id;
   }, []);
 
@@ -1117,8 +1401,8 @@ export default function App() {
     if (!currentSessionId || taskFlow.length > 0) return;
     const target = (useAppStore.getState().sessionsByWorkspace[activeSessionScope] || []).find((s: any) => s.id === currentSessionId);
     if (!target) return;
-    if (target.runtimeSnapshot || target.messages?.length) {
-      restoreSessionState(target, currentSessionId);
+    if (target.runtimeSnapshot || target.messages?.length || target.storageStatus === "ok" || target.storageStatus === "missing") {
+      void restoreSessionState(target, currentSessionId, activeSessionScope);
     }
   }, [activeSessionScope, currentSessionId, taskFlow.length]);
 
@@ -1126,7 +1410,7 @@ export default function App() {
     <div className="flex h-screen w-full bg-[#000000] text-[#e4e4e7] font-sans text-sm overflow-hidden md:flex-row flex-col relative"
       style={{ '--accent': currentTheme.accent, '--accent-hover': currentTheme.hover, '--accent-light': currentTheme.light, '--accent-subtle': currentTheme.subtle, '--accent-subtle-border': currentTheme.subtleBorder } as React.CSSProperties}>
       <ThemeStyles />
-      <Sidebar config={{ ...config, onOpenSettings: () => { setSettingsTab('general'); setIsSettingsOpen(true); }, onOpenSkills: () => setIsSkillsOpen(true) }} t={t} currentWorkspace={currentWorkspace} selectedWorkspace={sidebarWorkspace} sessionsByWorkspace={sessionsByWorkspace} globalSessions={globalSessions} currentSessionId={currentSessionId} sidebarWidth={sidebarWidth} showWorkspaceTreePanel={showWorkspaceTreePanel} onSetSidebarWidth={setSidebarWidth} onStartResizing={startSidebarResizing} onOpenGlobalChat={handleOpenGlobalChat} onSelectWorkspace={handleSelectWorkspace} onCreateSession={handleCreateSessionForScope} onSelectSession={handleSelectSession} onDeleteSession={handleDeleteSession} onToggleWorkspaceTree={toggleWorkspaceTreePanel} />
+      <Sidebar config={{ ...config, onOpenSettings: () => { setSettingsTab('general'); setIsSettingsOpen(true); }, onOpenSkills: () => setIsSkillsOpen(true) }} t={t} currentWorkspace={currentWorkspace} selectedWorkspace={sidebarWorkspace} sessionsByWorkspace={sessionsByWorkspace} globalSessions={globalSessions} currentSessionId={currentSessionId} sidebarWidth={sidebarWidth} showWorkspaceTreePanel={showWorkspaceTreePanel} onSetSidebarWidth={setSidebarWidth} onStartResizing={startSidebarResizing} onOpenGlobalChat={handleOpenGlobalChat} onSelectWorkspace={handleSelectWorkspace} onCreateSession={handleCreateSessionForScope} onSelectSession={handleSelectSession} onDeleteSession={handleDeleteSession} onRebuildSessions={handleRebuildSessionIndex} onToggleWorkspaceTree={toggleWorkspaceTreePanel} />
       {showWorkspaceTreePanel && sidebarWorkspace && (
         <WorkspaceTreePanel
           currentWorkspace={sidebarWorkspace}

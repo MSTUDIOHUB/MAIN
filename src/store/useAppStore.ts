@@ -152,6 +152,8 @@ export const translations = {
     instructionsHooks: "Instructions & Hooks",
     instructionsEnabled: "Enable workspace instructions",
     hooksEnabled: "Enable lifecycle hooks",
+    sessionRecording: "Record project sessions",
+    sessionRecordingDesc: "Save full conversations in MAIN app data so project history can be restored without writing chat logs into .MAIN.",
     refreshRules: "Refresh rules",
     instructionSources: "Resolved instruction sources",
     hookConfig: "Loaded hook definitions",
@@ -233,6 +235,8 @@ export const translations = {
     instructionsHooks: "指令与 Hooks",
     instructionsEnabled: "启用工作区指令",
     hooksEnabled: "启用生命周期 Hooks",
+    sessionRecording: "记录项目会话",
+    sessionRecordingDesc: "将完整对话保存到 MAIN 应用数据目录，方便恢复项目历史，但不会把聊天流水写进 .MAIN。",
     refreshRules: "刷新规则",
     instructionSources: "已解析的指令来源",
     hookConfig: "已加载 Hook 定义",
@@ -377,6 +381,10 @@ export interface Session {
   modelConfig?: SessionModelConfig;
   activeSkills?: string[];
   runtimeSnapshot?: SessionRuntimeSnapshot;
+  storageStatus?: "ok" | "missing" | "temporary";
+  recordingDisabled?: boolean;
+  workspaceRoot?: string;
+  projectId?: string;
 }
 
 export interface LocalConfig {
@@ -410,6 +418,7 @@ export interface AppConfig {
   hooksEnabled: boolean;
   activeProfile: "local" | "cloud";
   chatFontSize: number;  // px, default 13
+  sessionRecordingEnabled: boolean;
   local: LocalConfig;
   cloud: CloudConfig;
   imAdapters: ImAdaptersConfig;
@@ -746,6 +755,7 @@ const defaultConfig: AppConfig = {
   hooksEnabled: true,
   activeProfile: "local",
   chatFontSize: 13,
+  sessionRecordingEnabled: true,
   local: { provider: "OMLX", endpoint: "http://127.0.0.1:8080/v1", model: "", contextLimit: 16384, apiKey: "" },
   cloud: {
     protocol: "openai",
@@ -871,6 +881,31 @@ function normalizeSessionsByWorkspace(
   });
 
   return Object.fromEntries(normalizedEntries.entries());
+}
+
+function stripSessionDetailsForLocalPersist(session: Session): Session | null {
+  if (session.recordingDisabled) return null;
+  const { messages: _messages, runtimeSnapshot: _runtimeSnapshot, ...meta } = session;
+  return {
+    ...meta,
+    storageStatus: session.storageStatus === "temporary" ? "temporary" : session.storageStatus,
+  };
+}
+
+function stripSessionsByWorkspaceForLocalPersist(
+  sessionsByWorkspace: Record<string, Session[]> | undefined,
+): Record<string, Session[]> {
+  if (!sessionsByWorkspace) return {};
+  return Object.fromEntries(
+    Object.entries(sessionsByWorkspace)
+      .map(([workspace, sessions]) => [
+        workspace,
+        (sessions || [])
+          .map(stripSessionDetailsForLocalPersist)
+          .filter((session): session is Session => Boolean(session)),
+      ])
+      .filter(([, sessions]) => sessions.length > 0),
+  );
 }
 
 // ── Streaming Thinking Interceptor ────────────────────────────────────
@@ -5033,7 +5068,7 @@ export const useAppStore = create<AppState>()(
       partialize: (state) => ({
         config: state.config,
         skills: state.skills,
-        sessionsByWorkspace: state.sessionsByWorkspace,
+        sessionsByWorkspace: stripSessionsByWorkspaceForLocalPersist(state.sessionsByWorkspace),
         currentWorkspace: state.currentWorkspace,
         selectedWorkspace: state.selectedWorkspace,
         currentSessionId: state.currentSessionId,
@@ -5152,6 +5187,7 @@ export const useAppStore = create<AppState>()(
             reasoningEffort: normalizeOpenAiReasoningEffort(persistedState.config?.cloud?.reasoningEffort),
             disableResponseStorage: persistedState.config?.cloud?.disableResponseStorage ?? current.config.cloud.disableResponseStorage,
           },
+          sessionRecordingEnabled: persistedState.config?.sessionRecordingEnabled ?? current.config.sessionRecordingEnabled,
           imAdapters: normalizeImAdaptersConfig(persistedState.config?.imAdapters),
         },
         sessionsByWorkspace: normalizeSessionsByWorkspace(persistedState.sessionsByWorkspace),

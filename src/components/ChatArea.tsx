@@ -1108,8 +1108,7 @@ export default function ChatArea({
   const [isAutoScroll, setIsAutoScroll] = useState(true);
   const [activeVisibleTurnId, setActiveVisibleTurnId] = useState<string | null>(null);
   const [showTopIslandDuringHistoryPeek, setShowTopIslandDuringHistoryPeek] = useState(false);
-  // region: 浮层占位同步
-  const [topIslandHeight, setTopIslandHeight] = useState(0);
+  // region: 浮层显隐状态
   const [composerHeight, setComposerHeight] = useState(220);
   const [shouldRenderTopIsland, setShouldRenderTopIsland] = useState(false);
   const [isTopIslandVisible, setIsTopIslandVisible] = useState(false);
@@ -1276,7 +1275,7 @@ export default function ChatArea({
         ? shouldShowTopIslandNormally
         : showTopIslandDuringHistoryPeek)
     );
-  const chatContainerPaddingTop = 20 + (shouldRenderTopIsland ? topIslandHeight : 0);
+  const chatContainerPaddingTop = 20;
 
   useEffect(() => {
     if (topIslandHideTimerRef.current !== null) {
@@ -1298,7 +1297,6 @@ export default function ChatArea({
     topIslandHideTimerRef.current = window.setTimeout(() => {
       topIslandHideTimerRef.current = null;
       setShouldRenderTopIsland(false);
-      setTopIslandHeight(0);
     }, 240);
 
     return () => {
@@ -1755,7 +1753,6 @@ export default function ChatArea({
           onApproveDiffSession={() => approvePendingReviewForSession()}
           onOpenPlan={() => openRightPanelTab("plan")}
           onOpenDiff={() => openRightPanelTab("diff")}
-          onHeightChange={setTopIslandHeight}
         />
       )}
 
