@@ -1,7 +1,7 @@
 // @ts-nocheck
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { IconChevronDown, IconChevronRight, IconClose, IconCloud, IconCode, IconColumns, IconFileText, IconLogoM, IconStop, IconTerminal } from "./Icons";
+import { IconCheck, IconChevronDown, IconChevronRight, IconClose, IconCloud, IconCode, IconColumns, IconFileText, IconLogoM, IconStop, IconTerminal } from "./Icons";
 import ActionCard from "./ActionCard";
 import Composer from "./Composer";
 import JobListCard from "./JobListCard";
@@ -15,6 +15,7 @@ import { hasPlanDraftPreview, hasStructuredPlanProposal } from "../lib/planPropo
 import { sanitizeAIOutput } from "../lib/sanitize";
 import { useAppStore } from "../store/useAppStore";
 import {
+  collectChangeEntries,
   deriveVisibleConversationTurnStatus,
   isGenericConversationTitle,
   normalizeConversationDisplayTitle,
@@ -150,6 +151,8 @@ function formatTokenCount(value: number | undefined) {
 
 function ContextCompressionNotice({ block, language }: { block: any; language: "zh" | "en" }) {
   const [isExpanded, setIsExpanded] = useState(false);
+  const themeMode = useAppStore((s) => s.config.themeMode);
+  const isLightTheme = themeMode === "light";
   const stats = block.contextCompression || {};
   const isReactive = stats.reason === "reactive";
   const isMicroOnly = !isReactive && Number(stats.droppedCount || 0) === 0;
@@ -160,6 +163,49 @@ function ContextCompressionNotice({ block, language }: { block: any; language: "
   const bodyText = String(stats.compressedContext || "").trim() || (language === "zh"
     ? "当前只保存了压缩统计，暂无可展示的压缩摘要。"
     : "Only compression stats are available for this event.");
+  const tone = isLightTheme
+    ? {
+        pillBorder: "#cbd5e1",
+        pillBackground: "#f8fafc",
+        pillShadow: "0 10px 28px rgba(15,23,42,0.10)",
+        titleText: "#1e293b",
+        mutedText: "#64748b",
+        actionText: "#1d4ed8",
+        overlay: "rgba(15,23,42,0.24)",
+        modalBorder: "#cbd5e1",
+        modalBackground: "#ffffff",
+        modalShadow: "0 28px 80px rgba(15,23,42,0.18)",
+        headerBorder: "#e2e8f0",
+        headerBackground: "linear-gradient(90deg, rgba(219,234,254,0.9), rgba(240,249,255,0.72))",
+        closeBorder: "#cbd5e1",
+        closeBackground: "#f8fafc",
+        closeText: "#475569",
+        bodyBackground: "#f8fafc",
+        preBorder: "#cbd5e1",
+        preBackground: "#ffffff",
+        preText: "#334155",
+      }
+    : {
+        pillBorder: "#34343b",
+        pillBackground: "#232327",
+        pillShadow: "none",
+        titleText: "#d4d4d8",
+        mutedText: "#71717a",
+        actionText: "#93c5fd",
+        overlay: "rgba(0,0,0,0.68)",
+        modalBorder: "#34343b",
+        modalBackground: "#1d1d20",
+        modalShadow: "0 28px 80px rgba(0,0,0,0.45)",
+        headerBorder: "#2c2c32",
+        headerBackground: "linear-gradient(90deg, rgba(37,99,235,0.16), rgba(14,165,233,0.08))",
+        closeBorder: "#34343b",
+        closeBackground: "#181818",
+        closeText: "#c4c4cc",
+        bodyBackground: "#181818",
+        preBorder: "#2c2c32",
+        preBackground: "#111113",
+        preText: "#d4d4d8",
+      };
 
   useEffect(() => {
     if (!isExpanded) return;
@@ -180,22 +226,33 @@ function ContextCompressionNotice({ block, language }: { block: any; language: "
       <button
         onClick={() => setIsExpanded(true)}
         className="inline-flex max-w-[min(720px,90%)] items-center gap-2 rounded-full border border-[#34343b] bg-[#232327] px-4 py-1.5 text-[11px] text-[#a1a1aa] transition-colors hover:border-[#4b5563] hover:text-[#f4f4f5]"
+        style={{
+          borderColor: tone.pillBorder,
+          backgroundColor: tone.pillBackground,
+          boxShadow: tone.pillShadow,
+          color: tone.mutedText,
+        }}
       >
-        <span className="font-medium text-[#d4d4d8]">{title}</span>
-        <span className="text-[#71717a]">{formatTokenCount(stats.tokenCountBefore)} → {formatTokenCount(stats.tokenCountAfter)} tokens</span>
-        <span className="text-[#93c5fd]">{compactLabel}</span>
+        <span className="font-medium text-[#d4d4d8]" style={{ color: tone.titleText }}>{title}</span>
+        <span className="text-[#71717a]" style={{ color: tone.mutedText }}>{formatTokenCount(stats.tokenCountBefore)} → {formatTokenCount(stats.tokenCountAfter)} tokens</span>
+        <span className="text-[#93c5fd]" style={{ color: tone.actionText }}>{compactLabel}</span>
       </button>
 
       {isExpanded && typeof document !== "undefined" && createPortal(
-        <div className="fixed inset-0 z-[140] flex items-center justify-center bg-[rgba(0,0,0,0.68)] p-6" onClick={() => setIsExpanded(false)}>
+        <div className="fixed inset-0 z-[140] flex items-center justify-center bg-[rgba(0,0,0,0.68)] p-6" style={{ backgroundColor: tone.overlay }} onClick={() => setIsExpanded(false)}>
           <div
             className="flex h-[min(86vh,960px)] w-[min(96vw,1320px)] flex-col overflow-hidden rounded-[28px] border border-[#34343b] bg-[#1d1d20] shadow-[0_28px_80px_rgba(0,0,0,0.45)]"
+            style={{
+              borderColor: tone.modalBorder,
+              backgroundColor: tone.modalBackground,
+              boxShadow: tone.modalShadow,
+            }}
             onClick={(event) => event.stopPropagation()}
           >
-            <div className="flex items-center justify-between border-b border-[#2c2c32] px-5 py-3" style={{ background: "linear-gradient(90deg, rgba(37,99,235,0.16), rgba(14,165,233,0.08))" }}>
+            <div className="flex items-center justify-between border-b border-[#2c2c32] px-5 py-3" style={{ borderColor: tone.headerBorder, background: tone.headerBackground }}>
               <div className="min-w-0">
-                <div className="text-[13px] font-semibold text-[#e4e4e7]">{title}</div>
-                <div className="mt-1 text-[11px] text-[#a1a1aa]">
+                <div className="text-[13px] font-semibold text-[#e4e4e7]" style={{ color: tone.titleText }}>{title}</div>
+                <div className="mt-1 text-[11px] text-[#a1a1aa]" style={{ color: tone.mutedText }}>
                   {language === "zh"
                     ? `约 ${formatTokenCount(stats.tokenCountBefore)} → ${formatTokenCount(stats.tokenCountAfter)} tokens，释放 ${formatTokenCount(stats.tokenReduction)}，折叠 ${formatTokenCount(stats.droppedCount)} 条历史消息`
                     : `About ${formatTokenCount(stats.tokenCountBefore)} → ${formatTokenCount(stats.tokenCountAfter)} tokens, saved ${formatTokenCount(stats.tokenReduction)}, folded ${formatTokenCount(stats.droppedCount)} history message(s)`}
@@ -204,13 +261,25 @@ function ContextCompressionNotice({ block, language }: { block: any; language: "
               <button
                 onClick={() => setIsExpanded(false)}
                 className="rounded-full border border-[#34343b] bg-[#181818] p-2 text-[#c4c4cc] transition-colors hover:bg-[#232327] hover:text-[#fafafa]"
+                style={{
+                  borderColor: tone.closeBorder,
+                  backgroundColor: tone.closeBackground,
+                  color: tone.closeText,
+                }}
                 aria-label={language === "zh" ? "关闭压缩背景" : "Close compressed context"}
               >
                 <IconClose className="h-4 w-4" />
               </button>
             </div>
-            <div className="min-h-0 flex-1 overflow-auto bg-[#181818] p-5">
-              <pre className="m-0 whitespace-pre-wrap break-words rounded-2xl border border-[#2c2c32] bg-[#111113] p-4 font-mono text-[12px] leading-6 text-[#d4d4d8]">
+            <div className="min-h-0 flex-1 overflow-auto bg-[#181818] p-5" style={{ backgroundColor: tone.bodyBackground }}>
+              <pre
+                className="m-0 whitespace-pre-wrap break-words rounded-2xl border border-[#2c2c32] bg-[#111113] p-4 font-mono text-[12px] leading-6 text-[#d4d4d8]"
+                style={{
+                  borderColor: tone.preBorder,
+                  backgroundColor: tone.preBackground,
+                  color: tone.preText,
+                }}
+              >
                 {bodyText}
               </pre>
             </div>
@@ -317,63 +386,105 @@ function PlanShortcutCard({
 }
 
 function collectTurnChangeEntries(blocks: any[]) {
-  const entries: Array<{
-    taskId: number;
-    target: string;
-    displayTarget: string;
-    added: number;
-    removed: number;
-    editCount: number;
-    order: number;
-  }> = [];
-  const indexByTarget = new Map<string, number>();
-  let totalExecutedEdits = 0;
-
-  blocks.forEach((block, order) => {
-    if (block.type !== "tool" || block.toolStatus !== "executed" || !block.diff) return;
-
-    totalExecutedEdits++;
-    const target = String(block.target || block.diff.path || block.toolName || "");
-    const displayTarget = target.split("/").pop() || target;
-    const stats = getDiffStats(block.diff.old, block.diff.new);
-    const existingIndex = indexByTarget.get(target);
-
-    if (existingIndex == null) {
-      indexByTarget.set(target, entries.length);
-      entries.push({
-        taskId: block.id,
-        target,
-        displayTarget,
-        added: stats.added,
-        removed: stats.removed,
-        editCount: 1,
-        order,
-      });
-      return;
-    }
-
-    entries[existingIndex] = {
-      ...entries[existingIndex],
-      taskId: block.id,
-      added: stats.added,
-      removed: stats.removed,
-      editCount: entries[existingIndex].editCount + 1,
-      order,
-    };
-  });
-
-  return {
-    entries: entries.sort((a, b) => a.order - b.order),
-    totalExecutedEdits,
-  };
+  return collectChangeEntries(blocks, getDiffStats);
 }
 
 const TOOL_SUMMARY_GROUPS = {
-  read: new Set(["read_file", "read_document", "list_directory", "glob_search", "grep_search", "index_workspace_documents"]),
+  read: new Set(["get_project_skeleton", "get_file_outline", "read_file", "read_document", "list_directory", "glob_search", "grep_search", "index_workspace_documents"]),
   table: new Set(["analyze_tabular_document", "query_tabular_document"]),
   edit: new Set(["replace_in_file", "write_file"]),
   command: new Set(["execute_command", "send_pty_input", "run_command", "read_pty_buffer", "read_pty_tail", "read_pty_since", "get_pty_status", "clear_pty_buffer"]),
 };
+
+const READ_CONTEXT_TOOL_NAMES = new Set([
+  "get_project_skeleton",
+  "get_file_outline",
+  "read_file",
+  "read_document",
+  "list_directory",
+  "glob_search",
+  "grep_search",
+  "index_workspace_documents",
+]);
+
+const READ_CONTEXT_TOOL_LABELS: Record<string, { zh: string; en: string }> = {
+  get_project_skeleton: { zh: "扫描项目", en: "Scan project" },
+  get_file_outline: { zh: "读取结构", en: "Read outline" },
+  read_file: { zh: "读取文件", en: "Read file" },
+  read_document: { zh: "读取文档", en: "Read document" },
+  list_directory: { zh: "扫描目录", en: "Scan directory" },
+  glob_search: { zh: "搜索文件", en: "Search files" },
+  grep_search: { zh: "搜索内容", en: "Search content" },
+  index_workspace_documents: { zh: "索引文档", en: "Index documents" },
+};
+
+function isCompletedReadContextTool(block: any) {
+  return (
+    block?.type === "tool" &&
+    block.toolStatus === "executed" &&
+    !block.diff &&
+    READ_CONTEXT_TOOL_NAMES.has(String(block.toolName || ""))
+  );
+}
+
+function compactToolTarget(rawTarget: string, toolName: string, language: "zh" | "en") {
+  const target = String(rawTarget || "").trim();
+  if (!target) {
+    if (toolName === "get_project_skeleton") return language === "zh" ? "项目骨架" : "Project skeleton";
+    if (toolName === "index_workspace_documents") return language === "zh" ? "工作区文档" : "Workspace documents";
+    return language === "zh" ? "当前工作区" : "Current workspace";
+  }
+
+  if (target === "." || target === "./") return language === "zh" ? "项目根目录" : "Project root";
+  const normalized = target.replace(/[\\/]+$/g, "");
+  return normalized.split(/[\\/]/).pop() || target;
+}
+
+function fullToolTarget(rawTarget: string, toolName: string, language: "zh" | "en") {
+  const target = String(rawTarget || "").trim();
+  if (target) return target;
+  if (toolName === "get_project_skeleton") return language === "zh" ? "项目骨架" : "Project skeleton";
+  return language === "zh" ? "当前工作区" : "Current workspace";
+}
+
+function getReadContextToolLabel(toolName: string, language: "zh" | "en") {
+  const labels = READ_CONTEXT_TOOL_LABELS[toolName];
+  if (!labels) return language === "zh" ? "读取上下文" : "Read context";
+  return labels[language === "zh" ? "zh" : "en"];
+}
+
+function buildBlockRenderItems(blocks: any[], includeUser = true) {
+  const items: Array<
+    | { kind: "block"; block: any; index: number }
+    | { kind: "readContextGroup"; blocks: any[]; index: number }
+  > = [];
+
+  for (let index = 0; index < blocks.length; index += 1) {
+    const block = blocks[index];
+    if (!includeUser && block?.type === "user") continue;
+
+    if (isCompletedReadContextTool(block)) {
+      const groupStart = index;
+      const group: any[] = [];
+      while (index < blocks.length && isCompletedReadContextTool(blocks[index])) {
+        group.push(blocks[index]);
+        index += 1;
+      }
+      index -= 1;
+
+      if (group.length > 1) {
+        items.push({ kind: "readContextGroup", blocks: group, index: groupStart });
+      } else {
+        items.push({ kind: "block", block: group[0], index: groupStart });
+      }
+      continue;
+    }
+
+    items.push({ kind: "block", block, index });
+  }
+
+  return items;
+}
 
 function buildToolExecutionSummary(blocks: any[], language: "zh" | "en") {
   const counts = { read: 0, table: 0, edit: 0, command: 0, failed: 0, other: 0 };
@@ -438,8 +549,8 @@ function getActiveTurnActivity(blocks: any[], turnStatus: string, language: "zh"
     const thoughtChars = String(streamingThought.content || "").length;
     if (thoughtChars > 4_000) {
       return language === "zh"
-        ? "后台思考内容较长，已折叠显示；正在等待可见回复或下一步动作..."
-        : "Long background thinking is folded while waiting for the visible reply or next action...";
+        ? "正在整理较长上下文，等待可见回复或下一步动作..."
+        : "Working through a longer context while waiting for the visible reply or next action...";
     }
     return language === "zh" ? "正在整理下一步..." : "Thinking through the next step...";
   }
@@ -578,6 +689,96 @@ function TurnChangesCard({
           </button>
         ))}
       </div>
+    </div>
+  );
+}
+
+function ReadContextGroupCard({
+  blocks,
+  language,
+}: {
+  blocks: any[];
+  language: "zh" | "en";
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const targets = blocks.map((block) =>
+    compactToolTarget(block.target, String(block.toolName || ""), language),
+  );
+  const previewTargets = targets.slice(0, 3).filter(Boolean);
+  const hiddenCount = Math.max(0, targets.length - previewTargets.length);
+  const previewText = previewTargets.join(language === "zh" ? "、" : ", ");
+  const title = language === "zh"
+    ? `已读取 ${blocks.length} 项上下文`
+    : `Read ${blocks.length} context item${blocks.length > 1 ? "s" : ""}`;
+  const toggleText = expanded
+    ? language === "zh" ? "收起" : "Collapse"
+    : language === "zh" ? "展开" : "Expand";
+
+  return (
+    <div className="ml-9 max-w-[calc(100%-2.25rem)] min-w-0">
+      <button
+        type="button"
+        data-testid="read-context-group"
+        aria-expanded={expanded}
+        onClick={() => setExpanded((value) => !value)}
+        className="flex w-full min-w-0 items-center gap-2 rounded-xl border border-[#1f2937] bg-[#07070a] px-3 py-2 text-left shadow-sm transition-colors hover:border-[#374151] hover:bg-[#09090b]"
+      >
+        {expanded ? (
+          <IconChevronDown className="h-3.5 w-3.5 shrink-0 text-[#71717a]" />
+        ) : (
+          <IconChevronRight className="h-3.5 w-3.5 shrink-0 text-[#71717a]" />
+        )}
+        <IconCheck className="h-3.5 w-3.5 shrink-0 text-[#10b981]" />
+        <span className="shrink-0 text-[12px] font-medium text-[#d4d4d8]">{title}</span>
+        {previewText && (
+          <span className="min-w-0 flex-1 truncate text-[11px] text-[#71717a]">
+            · {previewText}{hiddenCount > 0 ? ` +${hiddenCount}` : ""}
+          </span>
+        )}
+        <span className="shrink-0 rounded-full border border-[#27272a] bg-[#050507] px-2 py-0.5 text-[10px] text-[#a1a1aa]">
+          {toggleText}
+        </span>
+      </button>
+
+      {expanded && (
+        <div
+          data-testid="read-context-group-details"
+          className="mt-2 space-y-1 rounded-xl border border-[#1f1f23] bg-[#050507] p-2"
+        >
+          {blocks.map((block) => {
+            const toolName = String(block.toolName || "");
+            const label = getReadContextToolLabel(toolName, language);
+            const displayTarget = compactToolTarget(block.target, toolName, language);
+            const target = fullToolTarget(block.target, toolName, language);
+
+            return (
+              <div
+                key={block.id}
+                data-testid="read-context-item"
+                className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2 rounded-lg px-2 py-1.5 text-[11px] text-[#a1a1aa]"
+              >
+                <IconCheck className="h-3 w-3 text-[#10b981]" />
+                <div className="min-w-0">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <span className="shrink-0 text-[#71717a]">{label}</span>
+                    <span className="min-w-0 truncate font-mono text-[#d4d4d8]" title={target}>
+                      {displayTarget}
+                    </span>
+                  </div>
+                  {target !== displayTarget && (
+                    <div className="truncate font-mono text-[10px] text-[#52525b]" title={target}>
+                      {target}
+                    </div>
+                  )}
+                </div>
+                <span className="shrink-0 rounded-full border border-[rgba(52,211,153,0.18)] bg-[rgba(52,211,153,0.08)] px-1.5 py-0.5 text-[9px] text-[#86efac]">
+                  {language === "zh" ? "完成" : "Done"}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
@@ -817,7 +1018,7 @@ export default function ChatArea({
     collapsedSummary: language === "zh" ? "本轮过程已折叠，结论会优先保留在这里。" : "This turn is collapsed. The conclusion is kept here first.",
     expandHistory: (count: number) => language === "zh" ? `展开 ${count} 条过程记录` : `Expand ${count} process item(s)`,
     turnStatusLabels: language === "zh"
-      ? { planning: "规划中", awaiting_approval: "待审批", awaiting_input: "待选择", executing: "执行中", completed_with_changes: "已写入", stopped_no_action: "已停止无变更", stopped_no_output: "无输出", paused: "已暂停", done: "完成", error: "错误" }
+      ? { planning: "规划中", awaiting_approval: "待审批", awaiting_input: "待选择", executing: "执行中", completed_with_changes: "已完成并写入", stopped_no_action: "已停止无产物", stopped_no_output: "无输出", paused: "已暂停", done: "完成", error: "错误" }
       : TURN_STATUS_LABELS,
     turnIntentLabels: language === "zh"
       ? { discuss: "讨论", execute: "执行", plan: "规划", summarize: "总结", report: "报告", studio_workflow: "工作流" }
@@ -1234,7 +1435,7 @@ export default function ChatArea({
     }
 
     if (block.type === "thought") {
-      return <ThoughtBlock key={`${block.id}-${index}`} block={block} language={language} />;
+      return null;
     }
 
     if (block.type === "jobList") {
@@ -1284,11 +1485,27 @@ export default function ChatArea({
     return null;
   };
 
+  const renderBlockItem = (item) => {
+    if (item.kind === "readContextGroup") {
+      const firstId = item.blocks[0]?.id ?? item.index;
+      const lastId = item.blocks[item.blocks.length - 1]?.id ?? item.index;
+      return (
+        <ReadContextGroupCard
+          key={`read-context-${firstId}-${lastId}`}
+          blocks={item.blocks}
+          language={language}
+        />
+      );
+    }
+
+    return renderBlock(item.block, item.index);
+  };
+
   const renderTurn = (entry, index: number) => {
     if (!entry.turn) {
       return (
         <div key={`legacy-${index}`} className="space-y-4">
-          {entry.blocks.map((block, blockIndex) => renderBlock(block, blockIndex))}
+          {buildBlockRenderItems(entry.blocks).map(renderBlockItem)}
         </div>
       );
     }
@@ -1350,8 +1567,16 @@ export default function ChatArea({
         }}
         className="rounded-[24px] border border-[#18181b] bg-[#050507] p-4 shadow-[0_12px_48px_rgba(0,0,0,0.18)]"
       >
-        <button
+        <div
+          role="button"
+          tabIndex={0}
           onClick={() => toggleConversationTurnCollapsed(turn.id)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              toggleConversationTurnCollapsed(turn.id);
+            }
+          }}
           className="flex w-full items-center justify-between gap-4 rounded-2xl border border-[#18181b] bg-[#09090b] px-4 py-3 text-left transition-colors hover:border-[#27272a]"
         >
           <div className="min-w-0 flex flex-wrap items-center gap-2">
@@ -1390,7 +1615,7 @@ export default function ChatArea({
             </div>
             <div className="shrink-0 text-[#71717a]">{isTurnExpanded ? <IconChevronDown className="h-4 w-4" /> : <IconChevronRight className="h-4 w-4" />}</div>
           </div>
-        </button>
+        </div>
 
         <div className="mt-4 space-y-4">
           {isTurnExpanded && userBlock ? renderBlock(userBlock, 0) : null}
@@ -1423,9 +1648,7 @@ export default function ChatArea({
               copy={copy}
             />
           ) : (
-            blocks
-              .filter((block) => block.type !== "user")
-              .map((block, blockIndex) => renderBlock(block, blockIndex + 1))
+            buildBlockRenderItems(blocks, false).map(renderBlockItem)
           )}
           {activeTurnActivity && <TurnActivityNotice text={activeTurnActivity} />}
         </div>

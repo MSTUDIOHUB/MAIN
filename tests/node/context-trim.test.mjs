@@ -87,3 +87,19 @@ test("manageContext trims down to a lower hysteresis target once the trigger is 
   assert.ok(result.tokenReduction > 0);
   assert.ok(result.tokenCountAfter <= result.budgets.proactiveTargetBudget);
 });
+
+test("manageContext force mode trims even after microcompaction leaves context over provider window", () => {
+  const messages = [
+    { role: "system", content: "system prompt" },
+    ...Array.from({ length: 24 }, (_, index) => ({
+      role: index % 2 === 0 ? "user" : "assistant",
+      content: `message-${index}-` + "C".repeat(3200),
+    })),
+  ];
+
+  const result = manageContext(messages, 32768, 2048, 4000, 4000, true);
+
+  assert.equal(result.changed, true);
+  assert.ok(result.droppedCount > 0);
+  assert.ok(result.tokenCountAfter <= result.budgets.proactiveTargetBudget);
+});

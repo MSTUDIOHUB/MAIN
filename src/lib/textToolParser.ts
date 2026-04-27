@@ -105,7 +105,7 @@ function parseJsonToolCall(jsonStr: string): ParsedToolCall | null {
 }
 
 function normalizeInlineArgValue(value: string): unknown {
-  const trimmed = value.trim();
+  const trimmed = value.trim().replace(/,$/, "");
   if (/^-?\d+(?:\.\d+)?$/.test(trimmed)) return Number(trimmed);
   if (/^(?:true|false)$/i.test(trimmed)) return trimmed.toLowerCase() === "true";
   return trimmed;
@@ -125,9 +125,71 @@ function parseNamedArguments(text: string): Record<string, unknown> {
   return args;
 }
 
+function parseFunctionStyleInvocation(text: string): ParsedToolCall | null {
+  const match = text.trim().match(/^([a-z_][a-z0-9_]*)\s*\(([\s\S]*)\)$/i);
+  if (!match) return null;
+
+  const toolName = match[1];
+  if (!BARE_TOOL_NAMES.has(toolName)) return null;
+
+  const body = match[2].trim();
+  if (!body) {
+    return {
+      id: nextCallId(),
+      name: toolName,
+      arguments: {},
+    };
+  }
+
+  if (body.startsWith("{") && body.endsWith("}")) {
+    try {
+      const parsed = JSON.parse(body);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return {
+          id: nextCallId(),
+          name: toolName,
+          arguments: parsed,
+        };
+      }
+    } catch {
+      // Fall through to the named-argument parser.
+    }
+  }
+
+  const args = parseNamedArguments(body);
+  if (Object.keys(args).length > 0) {
+    return {
+      id: nextCallId(),
+      name: toolName,
+      arguments: args,
+    };
+  }
+
+  if (toolName === "get_project_skeleton" && /^\d+$/.test(body)) {
+    return {
+      id: nextCallId(),
+      name: toolName,
+      arguments: { depth: Number(body) },
+    };
+  }
+
+  if (toolName === "execute_command" || toolName === "run_command") {
+    return {
+      id: nextCallId(),
+      name: toolName,
+      arguments: { command: body },
+    };
+  }
+
+  return null;
+}
+
 function parseInlineToolInvocation(text: string): ParsedToolCall | null {
   const trimmed = text.trim();
   if (!trimmed) return null;
+
+  const functionStyleCall = parseFunctionStyleInvocation(trimmed);
+  if (functionStyleCall) return functionStyleCall;
 
   const match = trimmed.match(/^([a-z_][a-z0-9_]*)(?:\s+([\s\S]*))?$/i);
   if (!match) return null;

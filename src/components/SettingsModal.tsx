@@ -22,8 +22,13 @@ import {
 import { isRetryableCloudErrorMessage } from "../lib/cloudRetry";
 import { isProviderCompatibilityErrorMessage } from "../lib/providerCompatibility";
 import { clearDebugLog, copyDebugLogToClipboard, readDebugLogSnapshot } from "../lib/debugLog";
-import { exportTextFile } from "../lib/ipc";
+import { exportTextFile, spawnPty, writePty } from "../lib/ipc";
 import { useAppStore } from "../store/useAppStore";
+import {
+  createFeishuPairingCode,
+  normalizeImAdaptersConfig,
+  upsertFeishuPairedUser,
+} from "../lib/imAdapters";
 
 // ── MCP Server Management Panel ──────────────────────────────────────────
 
@@ -383,6 +388,439 @@ function DebugLogPanel({ t }: { t: any }) {
         value={logText || "暂无调试日志"}
         className="h-[320px] w-full resize-none rounded-lg border border-[#27272a] bg-[#000000] p-3 font-mono text-[11px] leading-5 text-[#a1a1aa] outline-none"
       />
+    </div>
+  );
+}
+
+function FeishuGuideModal({ t, language, onClose }: { t: any; language: "zh" | "en"; onClose: () => void }) {
+  const isEn = language === "en";
+  const feishuSteps = isEn
+    ? [
+        "Open Feishu Developer Console and create an enterprise self-built app.",
+        "Enable bot capability, then add the bot to your Feishu account.",
+        "Enable event subscription by long connection and subscribe to im.message.receive_v1.",
+        "Grant message receive and bot message send permissions, then publish or install the app in the tenant.",
+        "Copy the App ID and App Secret from the app credentials page.",
+      ]
+    : [
+        "打开飞书开放平台控制台，创建一个企业自建应用。",
+        "启用机器人能力，并把机器人添加到你的飞书账号。",
+        "开启事件订阅的长连接模式，订阅 im.message.receive_v1 事件。",
+        "授予接收消息、机器人发送消息相关权限，然后在企业内发布或安装应用。",
+        "在应用凭证页面复制 App ID 和 App Secret。",
+      ];
+  const mainSteps = isEn
+    ? [
+        "Open MAIN Settings > IM Adapters.",
+        "Confirm Node.js Runtime is found, or click Quick Configure Node.js and follow the integrated terminal output.",
+        "Fill App ID, App Secret and keep the Feishu domain as https://open.feishu.cn unless your tenant uses Lark.",
+        "Click Test Connection to verify credentials.",
+        "Enable the Feishu adapter and keep MAIN running with a workspace open.",
+        "In Feishu private chat, send /pair plus the pairing code shown in MAIN, or approve the pairing request in this panel.",
+      ]
+    : [
+        "打开 MAIN 的「系统设置 > 即时通讯适配器」。",
+        "确认 Node.js 运行环境已找到；如果没有，点击「快速配置 Node.js」并按集成终端提示操作。",
+        "填写 App ID、App Secret；国内飞书通常保持域名 https://open.feishu.cn。",
+        "点击「测试连接」确认凭据有效。",
+        "启用飞书适配器，并保持 MAIN 打开且已经选择工作区。",
+        "在飞书私聊机器人发送 /pair 加 MAIN 面板里的配对码，或在本面板中通过配对请求。",
+      ];
+  const commands = isEn
+    ? [
+        "Plain text: run read-only analysis in the current MAIN workspace by default.",
+        "Use /execute or /plan before a task when you want MAIN to modify files or create a reviewed plan.",
+        "/status: show adapter, MAIN and workspace status.",
+        "/stop: stop current generation and clear queued remote messages.",
+        "/approve CODE or /reject CODE: allow or reject a tool action requested by a remote task.",
+        "If replies fail with 400, check the bot message-send permission and whether the bot can send private messages to you.",
+      ]
+    : [
+        "普通文本：默认在 MAIN 当前工作区执行只读分析。",
+        "需要修改文件或先出方案时，在任务前加 /execute 或 /plan。",
+        "/status：查看飞书适配器、MAIN 和工作区状态。",
+        "/stop：停止当前生成，并清空远程队列。",
+        "/approve CODE 或 /reject CODE：远程允许或拒绝工具执行。",
+        "如果回消息出现 400，请检查机器人发送消息权限，以及机器人是否允许给你发送私聊。",
+      ];
+
+  const renderList = (items: string[]) => (
+    <ol className="space-y-2 text-[13px] leading-relaxed text-[#d4d4d8]">
+      {items.map((item, index) => (
+        <li key={item} className="flex gap-3">
+          <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-[#3f3f46] bg-[#18181b] text-[11px] font-bold text-[#a1a1aa]">{index + 1}</span>
+          <span>{item}</span>
+        </li>
+      ))}
+    </ol>
+  );
+
+  return (
+    <div className="absolute inset-0 z-[70] flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm">
+      <div className="flex max-h-[86vh] w-[min(920px,94vw)] flex-col overflow-hidden rounded-xl border border-[#27272a] bg-[#09090b] shadow-2xl">
+        <div className="flex items-center justify-between border-b border-[#27272a] bg-[#000000] px-5 py-4">
+          <h3 className="text-[16px] font-bold text-white">{t.feishuGuideTitle}</h3>
+          <button onClick={onClose} className="text-[#a1a1aa] transition-colors hover:text-white"><IconClose className="h-4 w-4" /></button>
+        </div>
+        <div className="grid gap-5 overflow-y-auto p-5 md:grid-cols-2">
+          <section className="rounded-lg border border-[#27272a] bg-[#000000] p-4">
+            <h4 className="mb-3 text-[13px] font-bold uppercase tracking-wider text-[#a1a1aa]">{t.feishuGuideFeishuSteps}</h4>
+            {renderList(feishuSteps)}
+          </section>
+          <section className="rounded-lg border border-[#27272a] bg-[#000000] p-4">
+            <h4 className="mb-3 text-[13px] font-bold uppercase tracking-wider text-[#a1a1aa]">{t.feishuGuideMainSteps}</h4>
+            {renderList(mainSteps)}
+          </section>
+          <section className="rounded-lg border border-[#27272a] bg-[#000000] p-4 md:col-span-2">
+            <h4 className="mb-3 text-[13px] font-bold uppercase tracking-wider text-[#a1a1aa]">{t.feishuGuideCommands}</h4>
+            <div className="grid gap-2 md:grid-cols-2">
+              {commands.map((item) => (
+                <div key={item} className="rounded-md border border-[#18181b] bg-[#09090b] px-3 py-2 text-[13px] leading-relaxed text-[#d4d4d8]">{item}</div>
+              ))}
+            </div>
+          </section>
+        </div>
+        <div className="flex justify-end border-t border-[#27272a] bg-[#000000] px-5 py-4">
+          <button onClick={onClose} className="rounded-md border border-[#27272a] bg-[#18181b] px-4 py-2 text-[12px] font-bold text-[#e4e4e7] transition-colors hover:border-[#3f3f46]">
+            {t.feishuGuideClose}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function buildNodeSetupCommand(language: "zh" | "en"): string {
+  const platform = typeof navigator !== "undefined" ? navigator.platform.toLowerCase() : "";
+  if (platform.includes("win")) {
+    return [
+      "echo [MAIN] Checking Node.js runtime...",
+      "where node && node -v || winget install -e --id OpenJS.NodeJS.LTS",
+      "echo [MAIN] If Node.js was installed just now, restart MAIN before starting the Feishu adapter.",
+    ].join("\n");
+  }
+
+  if (platform.includes("linux")) {
+    return [
+      "echo \"[MAIN] Checking Node.js runtime...\"",
+      "if command -v node >/dev/null 2>&1; then",
+      "  echo \"[MAIN] Node.js found: $(node -v) ($(command -v node))\"",
+      "elif command -v apt-get >/dev/null 2>&1; then",
+      "  echo \"[MAIN] Installing Node.js with apt. You may be asked for your password.\"",
+      "  sudo apt-get update && sudo apt-get install -y nodejs npm",
+      "elif command -v dnf >/dev/null 2>&1; then",
+      "  sudo dnf install -y nodejs npm",
+      "elif command -v pacman >/dev/null 2>&1; then",
+      "  sudo pacman -S --needed nodejs npm",
+      "else",
+      `  echo "${language === "en" ? "Please install Node.js LTS from https://nodejs.org, then restart MAIN." : "请从 https://nodejs.org 安装 Node.js LTS，然后重启 MAIN。"}"`,
+      "fi",
+      "if command -v node >/dev/null 2>&1; then echo \"[MAIN] Done: $(node -v)\"; fi",
+    ].join("\n");
+  }
+
+  return [
+    "echo \"[MAIN] Checking Node.js runtime...\"",
+    "if [ -x /opt/homebrew/bin/brew ]; then eval \"$(/opt/homebrew/bin/brew shellenv)\"; fi",
+    "if [ -x /usr/local/bin/brew ]; then eval \"$(/usr/local/bin/brew shellenv)\"; fi",
+    "if command -v node >/dev/null 2>&1; then",
+    "  echo \"[MAIN] Node.js found: $(node -v) ($(command -v node))\"",
+    "elif command -v brew >/dev/null 2>&1; then",
+    "  echo \"[MAIN] Installing Node.js LTS with Homebrew...\"",
+    "  brew install node",
+    "else",
+    `  echo "${language === "en" ? "Homebrew was not found. Install Homebrew first, then click this button again:" : "未找到 Homebrew。请先安装 Homebrew，然后再次点击这个按钮："}"`,
+    "  echo '/bin/bash -c \"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"'",
+    "fi",
+    "if [ -x /opt/homebrew/bin/brew ]; then eval \"$(/opt/homebrew/bin/brew shellenv)\"; fi",
+    "if [ -x /usr/local/bin/brew ]; then eval \"$(/usr/local/bin/brew shellenv)\"; fi",
+    "if command -v node >/dev/null 2>&1; then",
+    "  echo \"[MAIN] Done: $(node -v)\"",
+    "else",
+    `  echo "${language === "en" ? "Node.js is still unavailable. Install Node.js LTS from https://nodejs.org, then restart MAIN." : "Node.js 仍不可用。请从 https://nodejs.org 安装 Node.js LTS，然后重启 MAIN。"}"`,
+    "fi",
+  ].join("\n");
+}
+
+function FeishuAdapterPanel({ config, setConfig, t }: { config: any; setConfig: (patch: any) => void; t: any }) {
+  const [testMsg, setTestMsg] = useState<{ text: string; type: "success" | "error" } | null>(null);
+  const [isTesting, setIsTesting] = useState(false);
+  const [nodeRuntime, setNodeRuntime] = useState<any | null>(null);
+  const [nodeSetupMsg, setNodeSetupMsg] = useState<{ text: string; type: "success" | "error" } | null>(null);
+  const [showGuide, setShowGuide] = useState(false);
+  const status = useAppStore((s) => s.feishuAdapterStatus);
+  const pairingRequests = useAppStore((s) => s.feishuPairingRequests);
+  const removePairingRequest = useAppStore((s) => s.removeFeishuPairingRequest);
+  const imAdapters = normalizeImAdaptersConfig(config.imAdapters);
+  const feishu = imAdapters.feishu;
+  const language = config.language === "en" ? "en" : "zh";
+
+  useEffect(() => {
+    if (!testMsg) return;
+    const timer = setTimeout(() => setTestMsg(null), 5000);
+    return () => clearTimeout(timer);
+  }, [testMsg]);
+
+  const refreshNodeRuntime = useCallback(async () => {
+    try {
+      const status = await invoke<any>("get_feishu_node_runtime_status");
+      setNodeRuntime(status);
+    } catch (error) {
+      setNodeRuntime({
+        found: false,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshNodeRuntime();
+  }, [refreshNodeRuntime]);
+
+  useEffect(() => {
+    if (!nodeSetupMsg) return;
+    const timer = setTimeout(() => setNodeSetupMsg(null), 7000);
+    return () => clearTimeout(timer);
+  }, [nodeSetupMsg]);
+
+  const updateFeishu = (patch: any) => {
+    setConfig((prev: any) => {
+      const nextAdapters = normalizeImAdaptersConfig(prev.imAdapters);
+      return {
+        ...prev,
+        imAdapters: {
+          ...nextAdapters,
+          feishu: {
+            ...nextAdapters.feishu,
+            ...patch,
+          },
+        },
+      };
+    });
+  };
+
+  const handleTest = async () => {
+    setIsTesting(true);
+    setTestMsg(null);
+    try {
+      const result = await invoke<string>("test_feishu_adapter_connection", {
+        appId: feishu.appId,
+        appSecret: feishu.appSecret,
+        domain: feishu.domain,
+      });
+      setTestMsg({ text: result, type: "success" });
+    } catch (error) {
+      setTestMsg({ text: error instanceof Error ? error.message : String(error), type: "error" });
+    } finally {
+      setIsTesting(false);
+    }
+  };
+
+  const handleSetupNodeRuntime = async () => {
+    setNodeSetupMsg(null);
+    try {
+      useAppStore.getState().setShowTerminal(true);
+      await spawnPty(140, 40);
+      await writePty(buildNodeSetupCommand(language) + "\n");
+      setNodeSetupMsg({
+        type: "success",
+        text: language === "en"
+          ? "The setup command is running in the integrated terminal."
+          : "已在集成终端中执行配置命令。",
+      });
+      setTimeout(() => {
+        void refreshNodeRuntime();
+      }, 1500);
+    } catch (error) {
+      setNodeSetupMsg({
+        type: "error",
+        text: error instanceof Error ? error.message : String(error),
+      });
+    }
+  };
+
+  const handleApprovePairing = (request: any) => {
+    updateFeishu({
+      pairedUsers: upsertFeishuPairedUser(feishu.pairedUsers, {
+        openId: request.openId,
+        name: request.name || request.openId,
+        chatId: request.chatId,
+        pairedAt: Date.now(),
+        lastSeenAt: Date.now(),
+      }),
+    });
+    removePairingRequest(request.openId);
+    invoke("send_feishu_message", {
+      chatId: request.chatId,
+      userId: request.openId,
+      openId: request.openId,
+      messageId: request.messageId,
+      text: language === "en"
+        ? "Pairing approved in MAIN. You can now send remote tasks."
+        : "已在 MAIN 中通过配对。现在可以发送远程任务了。",
+    }).catch(() => {});
+  };
+
+  const handleRejectPairing = (request: any) => {
+    removePairingRequest(request.openId);
+    invoke("send_feishu_message", {
+      chatId: request.chatId,
+      userId: request.openId,
+      openId: request.openId,
+      messageId: request.messageId,
+      text: language === "en" ? "Pairing rejected in MAIN." : "已在 MAIN 中拒绝配对。",
+    }).catch(() => {});
+  };
+
+  const handleRemoveUser = (openId: string) => {
+    updateFeishu({
+      pairedUsers: feishu.pairedUsers.filter((user: any) => user.openId !== openId),
+    });
+  };
+
+  const statusColor = status.status === "connected"
+    ? "bg-[#14532d] text-[#86d9a3] border-[#166534]"
+    : status.status === "error"
+    ? "bg-[#3f1111] text-[#fca5a5] border-[#7f1d1d]"
+    : "bg-[#18181b] text-[#a1a1aa] border-[#27272a]";
+
+  return (
+    <div className="space-y-6">
+      {showGuide && <FeishuGuideModal t={t} language={language} onClose={() => setShowGuide(false)} />}
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h3 className="text-[13px] font-bold uppercase tracking-wider text-[#a1a1aa]">{t.feishuAdapter}</h3>
+          <p className="mt-1 text-[11.5px] leading-relaxed text-[#71717a]">{t.feishuAdapterDesc}</p>
+        </div>
+        <button onClick={() => setShowGuide(true)} className="rounded-md border border-[#27272a] bg-[#18181b] px-3 py-2 text-[12px] font-bold text-[#e4e4e7] transition-colors hover:border-[#3f3f46]">
+          {t.feishuOpenGuide}
+        </button>
+      </div>
+
+      <div className="rounded-lg border border-[#27272a] bg-[#000000] p-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <label className="flex items-center gap-3">
+            <input
+              type="checkbox"
+              checked={feishu.enabled}
+              onChange={(e) => updateFeishu({ enabled: e.target.checked })}
+            />
+            <span className="text-[13px] font-bold text-[#e4e4e7]">{t.feishuEnable}</span>
+          </label>
+          <span className={`rounded-full border px-3 py-1 text-[11px] font-bold uppercase tracking-wider ${statusColor}`}>
+            {t.feishuStatus}: {status.status}
+          </span>
+        </div>
+        {status.message && <p className="mt-3 text-[11.5px] leading-relaxed text-[#71717a]">{status.message}</p>}
+      </div>
+
+      <div className="rounded-lg border border-[#27272a] bg-[#000000] p-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <div className="text-[12px] font-bold uppercase tracking-wider text-[#a1a1aa]">{t.feishuNodeRuntime}</div>
+            <p className={`mt-1 text-[11.5px] leading-relaxed ${nodeRuntime?.found ? "text-[#86d9a3]" : "text-[#fca5a5]"}`}>
+              {nodeRuntime?.message || t.feishuNodeRuntimeChecking}
+              {nodeRuntime?.executable ? ` (${nodeRuntime.executable})` : ""}
+            </p>
+            <p className="mt-1 text-[11px] leading-relaxed text-[#71717a]">{t.feishuNodeRuntimeDesc}</p>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <button onClick={refreshNodeRuntime} className="rounded-md border border-[#27272a] bg-[#18181b] px-3 py-2 text-[12px] font-bold text-[#e4e4e7] transition-colors hover:border-[#3f3f46]">
+              {t.feishuRefreshNodeRuntime}
+            </button>
+            <button onClick={handleSetupNodeRuntime} className="rounded-md border border-[#14532d] bg-[#052e16] px-3 py-2 text-[12px] font-bold text-[#86d9a3] transition-colors hover:border-[#166534]">
+              {t.feishuSetupNodeRuntime}
+            </button>
+          </div>
+        </div>
+        {nodeSetupMsg && <p className={`mt-3 text-[12px] ${nodeSetupMsg.type === "error" ? "text-[#fca5a5]" : "text-[#86d9a3]"}`}>{nodeSetupMsg.text}</p>}
+      </div>
+
+      <div className="grid gap-4 md:grid-cols-2">
+        <div>
+          <label className="mb-2 block text-[13px] font-bold text-[#e4e4e7]">{t.feishuAppId}</label>
+          <input value={feishu.appId} onChange={(e) => updateFeishu({ appId: e.target.value })} className="w-full rounded-md border border-[#27272a] bg-[#000000] p-2.5 font-mono text-[14px] text-white outline-none theme-ring" />
+        </div>
+        <div>
+          <label className="mb-2 block text-[13px] font-bold text-[#e4e4e7]">{t.feishuAppSecret}</label>
+          <input type="password" value={feishu.appSecret} onChange={(e) => updateFeishu({ appSecret: e.target.value })} className="w-full rounded-md border border-[#27272a] bg-[#000000] p-2.5 font-mono text-[14px] text-white outline-none theme-ring" />
+        </div>
+        <div className="md:col-span-2">
+          <label className="mb-2 block text-[13px] font-bold text-[#e4e4e7]">{t.feishuDomain}</label>
+          <input value={feishu.domain} onChange={(e) => updateFeishu({ domain: e.target.value })} className="w-full rounded-md border border-[#27272a] bg-[#000000] p-2.5 font-mono text-[14px] text-white outline-none theme-ring" />
+        </div>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-2">
+        <button onClick={handleTest} disabled={isTesting || !feishu.appId.trim() || !feishu.appSecret.trim()} className="rounded-md border border-[#27272a] bg-[#18181b] px-3 py-2 text-[12px] font-bold text-[#e4e4e7] transition-colors hover:border-[#3f3f46] disabled:opacity-40">
+          {isTesting ? t.feishuTestingConnection : t.feishuTestConnection}
+        </button>
+        <button onClick={() => updateFeishu({ enabled: true })} disabled={feishu.enabled} className="rounded-md border border-[#27272a] bg-[#18181b] px-3 py-2 text-[12px] font-bold text-[#e4e4e7] transition-colors hover:border-[#3f3f46] disabled:opacity-40">
+          {t.feishuStart}
+        </button>
+        <button onClick={() => updateFeishu({ enabled: false })} disabled={!feishu.enabled} className="rounded-md border border-[#3f1f1f] bg-[#181111] px-3 py-2 text-[12px] font-bold text-[#fca5a5] transition-colors hover:border-[#7f1d1d] disabled:opacity-40">
+          {t.feishuStop}
+        </button>
+        {testMsg && <span className={`text-[12px] ${testMsg.type === "error" ? "text-[#fca5a5]" : "text-[#86d9a3]"}`}>{testMsg.text}</span>}
+      </div>
+
+      <div className="rounded-lg border border-[#27272a] bg-[#000000] p-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <div className="text-[12px] font-bold uppercase tracking-wider text-[#a1a1aa]">{t.feishuPairingCode}</div>
+            <div className="mt-1 font-mono text-[28px] font-bold text-[#e4e4e7]">{feishu.pairingCode}</div>
+            <p className="mt-1 text-[11.5px] text-[#71717a]">{t.feishuPairingCodeDesc}</p>
+          </div>
+          <button onClick={() => updateFeishu({ pairingCode: createFeishuPairingCode() })} className="rounded-md border border-[#27272a] bg-[#18181b] px-3 py-2 text-[12px] font-bold text-[#e4e4e7] transition-colors hover:border-[#3f3f46]">
+            {t.feishuRegenerateCode}
+          </button>
+        </div>
+      </div>
+
+      <div className="grid gap-4 lg:grid-cols-2">
+        <div className="rounded-lg border border-[#27272a] bg-[#000000] p-4">
+          <h4 className="mb-3 text-[12px] font-bold uppercase tracking-wider text-[#a1a1aa]">{t.feishuPendingPairings}</h4>
+          {pairingRequests.length === 0 ? (
+            <p className="text-[12px] text-[#71717a]">{t.feishuNoPendingPairings}</p>
+          ) : (
+            <div className="space-y-2">
+              {pairingRequests.map((request: any) => (
+                <div key={request.openId} className="rounded-md border border-[#18181b] bg-[#09090b] p-3">
+                  <div className="font-mono text-[12px] text-[#e4e4e7]">{request.name}</div>
+                  <div className="mt-1 truncate font-mono text-[10px] text-[#71717a]">{request.openId}</div>
+                  <div className="mt-3 flex gap-2">
+                    <button onClick={() => handleApprovePairing(request)} className="rounded-md border border-[#14532d] bg-[#052e16] px-2.5 py-1.5 text-[11px] font-bold text-[#86d9a3]">{t.feishuApprovePairing}</button>
+                    <button onClick={() => handleRejectPairing(request)} className="rounded-md border border-[#3f1f1f] bg-[#181111] px-2.5 py-1.5 text-[11px] font-bold text-[#fca5a5]">{t.feishuRejectPairing}</button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div className="rounded-lg border border-[#27272a] bg-[#000000] p-4">
+          <h4 className="mb-3 text-[12px] font-bold uppercase tracking-wider text-[#a1a1aa]">{t.feishuPairedUsers}</h4>
+          {feishu.pairedUsers.length === 0 ? (
+            <p className="text-[12px] text-[#71717a]">{t.feishuNoPairedUsers}</p>
+          ) : (
+            <div className="space-y-2">
+              {feishu.pairedUsers.map((user: any) => (
+                <div key={user.openId} className="flex items-center justify-between gap-3 rounded-md border border-[#18181b] bg-[#09090b] p-3">
+                  <div className="min-w-0">
+                    <div className="truncate font-mono text-[12px] text-[#e4e4e7]">{user.name}</div>
+                    <div className="mt-1 truncate font-mono text-[10px] text-[#71717a]">{user.openId}</div>
+                  </div>
+                  <button onClick={() => handleRemoveUser(user.openId)} className="shrink-0 rounded-md border border-[#3f1f1f] bg-[#181111] px-2.5 py-1.5 text-[11px] font-bold text-[#fca5a5]">{t.feishuRemovePairing}</button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="rounded-md border border-[#27272a] bg-[#000000] p-3">
+        <p className="text-[11px] leading-relaxed text-[#71717a]">{t.feishuRoutingCurrentWorkspace}</p>
+      </div>
     </div>
   );
 }
@@ -1042,19 +1480,20 @@ export default function SettingsModal({
 
   return isOpen ? (
     <div className="absolute inset-0 bg-black/80 flex items-center justify-center z-50 backdrop-blur-sm">
-      <div className="bg-[#09090b] border border-[#27272a] rounded-xl shadow-2xl w-[780px] flex flex-col overflow-hidden">
+      <div className="bg-[#09090b] border border-[#27272a] rounded-xl shadow-2xl w-[min(1170px,94vw)] max-h-[92vh] flex flex-col overflow-hidden">
         <div className="px-5 py-4 border-b border-[#27272a] flex items-center justify-between bg-[#000000]">
           <h2 className="text-base font-bold text-white flex items-center gap-2"><IconSettings className="w-5 h-5" /> {t.settings}</h2>
           <button onClick={onClose} className="text-[#a1a1aa] hover:text-white transition-colors"><IconClose className="w-4 h-4" /></button>
         </div>
 
-        <div className="flex h-[560px]">
-          <div className="w-40 border-r border-[#27272a] bg-[#000000] p-2 flex flex-col gap-1">
+        <div className="flex" style={{ height: "min(840px, 82vh)" }}>
+          <div className="w-52 border-r border-[#27272a] bg-[#000000] p-2 flex flex-col gap-1">
             <button onClick={() => setSettingsTab('general')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'general' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.general}</button>
             <button onClick={() => setSettingsTab('local')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'local' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.localSetup}</button>
             <button onClick={() => setSettingsTab('cloud')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'cloud' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.cloudSetup}</button>
             <button onClick={() => setSettingsTab('context')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'context' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.contextSetup}</button>
             <button onClick={() => setSettingsTab('mcp')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'mcp' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>MCP 服务器</button>
+            <button onClick={() => setSettingsTab('im')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'im' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.imAdapters}</button>
             <button onClick={() => setSettingsTab('data')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'data' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.dataManagement}</button>
             <button onClick={() => setSettingsTab('debug')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'debug' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.debugLog}</button>
           </div>
@@ -1226,6 +1665,9 @@ export default function SettingsModal({
 
             {/* DEBUG LOG */}
             {settingsTab === 'debug' && <DebugLogPanel t={t} />}
+
+            {/* IM ADAPTER SETTINGS */}
+            {settingsTab === 'im' && <FeishuAdapterPanel config={config} setConfig={setConfig} t={t} />}
 
             {/* CLOUDED API SETTINGS */}
             {settingsTab === 'cloud' && (

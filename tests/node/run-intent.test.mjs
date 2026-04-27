@@ -57,7 +57,13 @@ function loadTranspiledModuleSync(sourcePath) {
   return module.exports;
 }
 
-const { parseMainIntentShortcut, resolveTurnRunIntent, shouldUseBlockingIntentPreflight } = loadTranspiledModuleSync(
+const {
+  getIntentPolicy,
+  mapResolvedRunIntentToWorkflowMode,
+  parseMainIntentShortcut,
+  resolveTurnRunIntent,
+  shouldUseBlockingIntentPreflight,
+} = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/runIntent.ts"),
 );
 
@@ -106,8 +112,34 @@ test("analysis report requests still resolve to report", () => {
   assert.equal(result.intent, "report");
 });
 
+test("output-style intents stay inside the chat workflow", () => {
+  for (const intent of ["analyze", "summarize", "report"]) {
+    const policy = getIntentPolicy(intent);
+    assert.equal(policy.workflowMode, "chat");
+    assert.equal(policy.uiCategory, "output_style");
+    assert.equal(policy.toolPolicy, "read_only");
+    assert.equal(mapResolvedRunIntentToWorkflowMode(intent), "chat");
+  }
+});
+
+test("plan and execute remain real workflow modes", () => {
+  assert.equal(getIntentPolicy("plan").uiCategory, "workflow_mode");
+  assert.equal(getIntentPolicy("plan").workflowMode, "plan");
+  assert.equal(getIntentPolicy("plan").requiresPlanApproval, true);
+  assert.equal(getIntentPolicy("execute").uiCategory, "workflow_mode");
+  assert.equal(getIntentPolicy("execute").workflowMode, "edit");
+  assert.equal(getIntentPolicy("execute").requiresPlanApproval, false);
+});
+
 test("weak plan keyword triggers a decision instead of forcing plan", () => {
   const result = resolveTurnRunIntent("maybe we need a plan for this", createContext());
+  assert.equal(result.intent, "discuss");
+  assert.equal(result.needsDecision, true);
+  assert.equal(result.suggestedIntent, "plan");
+});
+
+test("Chinese weak plan phrasing does not force plan mode", () => {
+  const result = resolveTurnRunIntent("这个方案怎么样？", createContext());
   assert.equal(result.intent, "discuss");
   assert.equal(result.needsDecision, true);
   assert.equal(result.suggestedIntent, "plan");
@@ -151,6 +183,22 @@ test("low-confidence non-discuss requests can still opt into blocking preflight"
       "main_mode",
     ),
     true,
+  );
+});
+
+test("output-style intents do not block on preflight", () => {
+  assert.equal(
+    shouldUseBlockingIntentPreflight(
+      {
+        intent: "report",
+        reason: "synthetic",
+        confidence: 0.78,
+        bypassMainRouter: false,
+        riskLevel: "medium",
+      },
+      "main_mode",
+    ),
+    false,
   );
 });
 

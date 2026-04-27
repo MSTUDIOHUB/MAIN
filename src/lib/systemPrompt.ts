@@ -11,14 +11,15 @@ import {
   getApplicableProtocolPackagesForWorkspace,
   getProtocolPackageEntryPath,
 } from "./protocolPackages";
-import { resolveRunIntentFromLegacyWorkflowMode, type ResolvedUserIntent } from "./runIntent";
+import { getIntentPolicy, resolveRunIntentFromLegacyWorkflowMode, type ResolvedUserIntent } from "./runIntent";
 import { mapLegacyNexusModeToMainMode, type MainModeKey } from "./mainModes";
 
 export const MAIN_MODE_PROMPTS: Record<MainModeKey, string> = {
   main_mode: [
     "你当前处于 MAIN 模式（MAIN Mode）。",
     "MAIN 模式统一承接原来的通用协作、创意共创、工程实现与研究分析能力，不再要求用户先切细分场景。",
-    "你必须先判断本轮更适合：讨论、计划、直接执行、做总结，还是输出正式报告，再按照对应 intent 继续。",
+    "你必须先判断本轮是流程模式（计划/直接执行）还是输出方式（分析/总结/报告），再按照对应 intent 继续。",
+    "分析、总结、报告只是 chat 流中的输出方式，不是独立执行工作流；只有计划和执行会改变工具/审批边界。",
     "当用户需要资料总结、表格分析、结论提炼、Markdown 报告或计划草案时，可以直接处理，不要把这类请求误导成代码实现问题。",
     "如果目标不确定，应先给用户清晰选项；如果目标明确，就直接按 intent 执行，不要再要求用户切换模式。",
   ].join("\n"),
@@ -61,6 +62,7 @@ export function buildSystemPrompt(
   const parts: string[] = [];
   const fallbackLanguageName = uiLanguage === "zh" ? "中文" : "English";
   const turnIntent = turnIntentOverride ?? resolveRunIntentFromLegacyWorkflowMode(workflowMode ?? "chat");
+  const turnIntentPolicy = getIntentPolicy(turnIntent);
   const normalizedMainModeKey = mapLegacyNexusModeToMainMode(mainModeKey);
   parts.push("当前工作区绝对路径为：" + workspace);
   parts.push("你执行任何文件操作或搜索时，都必须基于此路径。所有相对路径都相对于此根目录解析。");
@@ -163,10 +165,10 @@ export function buildSystemPrompt(
       "",
       "### 计划文档精简规则",
       "计划产物必须像给人审阅的执行摘要，不要写成教程、长篇背景说明或实现手册。",
-      "- `requirements.md`：建议 40-80 行，只保留目标、范围、用户故事/需求条目、验收标准、待确认问题。",
-      "- `design.md`：建议 60-120 行，只保留关键决策、模块/文件分工、数据流/交互、风险、验证方式。",
+      "- `requirements.md`：建议 40-80 行，必须像需求规格而不是日志摘要：总结用户意图、目标、范围、当前发现、需求条目、交付物、验收标准、待确认问题。",
+      "- `design.md`：建议 60-120 行，必须是可执行方案：影响文件/模块、执行顺序、关键数据流/控制流、修改策略、验证方式；方向不明确时先给 `<user_options>`，不要编造最终设计。",
       "- `bugfix.md`：建议 40-80 行，只保留现象、根因假设、修复方案、影响范围、验证方式。",
-      "- `tasks.md`：建议 8-20 个 checkbox，每项一句话；需要命令时把精确命令放进同一行反引号里。",
+      "- `tasks.md`：建议 8-20 个 checkbox，每项一句话；需要命令时把精确命令放进同一行反引号里。执行中 tasks.md 是审计记录，不能删除已完成或旧任务，只能勾选、追加或保留“已完成任务”区块。",
       "- Proposal：只做一页审阅摘要，优先使用短段落、表格和 bullet；不要复制 requirements/design 的全文。",
       "- 禁止写大段教学解释、代码清单、完整 API 文档、过度铺陈的背景和重复结论；细节留到执行阶段按需展开。",
       "",
@@ -179,6 +181,8 @@ export function buildSystemPrompt(
       "2. 如果当前只需要继续共创方案，就继续讨论，不要把用户往执行阶段推。",
       "3. 如果你已经输出了 `<user_options>`，本轮必须立刻停止等待用户，不要再自顾自补完下一步。",
       "4. 如果你认为任务高风险、范围过大或存在关键前提冲突，优先通过 `<user_options>` 缩小分歧，而不是替用户拍板。",
+      "5. 如果用户要求最终在项目根目录生成 Readme.md 或其他 Markdown 文档，这属于执行阶段交付物：规划阶段写进 requirements/design，批准后写进 tasks.md 并真实落盘。",
+      "6. 计划文件不能包含工具日志、重复调用提示、后台思考、截断提示或原始源码片段；如果只拿到了这些材料，应重新归纳真实需求和执行方案，或向用户确认关键方向。",
       "",
       "### 探索范式",
       "1. 优先使用 `get_project_skeleton` 获取整个项目的宏观骨架（深度限制 3-4 层）。",
@@ -207,7 +211,7 @@ export function buildSystemPrompt(
     parts.push([
       "================================",
       "[TURN INTENT: ANALYZE]",
-      "你当前这一轮的真实意图是：ANALYZE（只读分析/检查/验证）。",
+      "你当前这一轮的真实意图是：ANALYZE（chat 流中的输出方式：只读分析/检查/验证）。",
       "默认以只读方式分析现状、验证逻辑、定位风险、给出结论和建议；不要直接修改文件或进入执行流。",
       "如果需要读取项目内容才能准确分析，可以使用只读工具；除非用户明确要求实现、修复或落地，否则不要调用写入类工具。",
       "输出应优先包含：分析目标、检查范围、关键发现、风险/不确定点、建议下一步。",
@@ -216,7 +220,7 @@ export function buildSystemPrompt(
     parts.push([
       "================================",
       "[TURN INTENT: SUMMARIZE]",
-      "你当前这一轮的真实意图是：SUMMARIZE（总结输出）。",
+      "你当前这一轮的真实意图是：SUMMARIZE（chat 流中的输出方式：总结输出）。",
       "优先产出简洁清晰的结论摘要、重点归纳、异常提示和下一步建议。",
       "如需读取文件才能准确总结，可以使用只读工具；不要误入计划流，也不要默认开始写代码。",
       "总结应短于正式报告，重点是快速提炼信息，而不是铺成长篇说明。",
@@ -225,7 +229,7 @@ export function buildSystemPrompt(
     parts.push([
       "================================",
       "[TURN INTENT: REPORT]",
-      "你当前这一轮的真实意图是：REPORT（正式报告输出）。",
+      "你当前这一轮的真实意图是：REPORT（chat 流中的输出方式：正式报告输出）。",
       "默认输出结构化 Markdown 报告，优先包含目标、范围、关键发现、风险、限制和建议。",
       "如需读取文件或表格才能形成报告，可以使用只读工具；不要把正式报告误导成普通聊天回复或计划协议。",
       "除非用户明确要求写入文件，否则先把报告正文直接呈现给用户。",
@@ -243,7 +247,7 @@ export function buildSystemPrompt(
     ].join("\n"));
   }
 
-  if (turnIntent === "discuss" || turnIntent === "analyze" || turnIntent === "summarize" || turnIntent === "report") {
+  if (turnIntentPolicy.workflowMode === "chat") {
     const chatInstructions: string[] = [];
     chatInstructions.push("## 工具调用格式");
     chatInstructions.push(turnIntent === "discuss"
@@ -313,7 +317,8 @@ export function buildSystemPrompt(
       tfl.push("5. Bug 修复类复杂请求用 `.MAIN/plans/bugfix.md` 表达；批准执行前仍然不能写源码或生成 tasks.md。");
       tfl.push("6. `.MAIN/plans/tasks.md` 只属于执行阶段；未经明确批准，不要提前生成。");
       tfl.push("7. 如果任务更像报告、总结或研究分析，规划产物应表达分析目标、数据范围、指标口径、方法与验证方案，而不是默认套用代码工程计划。");
-      tfl.push("8. 计划 Markdown 必须精简：requirements.md 40-80 行、design.md 60-120 行、bugfix.md 40-80 行、tasks.md 8-20 个 checkbox；不要写教程式长文、完整代码清单或重复背景。");
+      tfl.push("8. 如果用户要求根目录 Readme.md 或其他 Markdown 文档，把它作为批准后的最终交付物写入 tasks.md；规划阶段只记录这个验收要求。");
+      tfl.push("9. 计划 Markdown 必须精简：requirements.md 40-80 行、design.md 60-120 行、bugfix.md 40-80 行、tasks.md 8-20 个 checkbox；不要写教程式长文、完整代码清单或重复背景。");
     } else {
       tfl.push("当前回合是直接实现回合：");
       tfl.push("1. Atomic 任务直接实现，不要为了完成小改动而强行转去计划流。");

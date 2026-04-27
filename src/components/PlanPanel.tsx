@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import MarkdownRenderer from "./MarkdownRenderer";
 import { IconCheck, IconSave } from "./Icons";
-import { extractPlanTasks, isPlanConversationTurn, type ConversationTurn, type PlanArtifact, type PlanStage, type PlanTask } from "../lib/workflowModels";
+import { extractPlanTasks, isPlanConversationTurn, type ChangeEntry, type ConversationTurn, type PlanArtifact, type PlanStage, type PlanTask } from "../lib/workflowModels";
 
 interface PlanPanelProps {
   artifacts: PlanArtifact[];
@@ -20,9 +20,11 @@ interface PlanPanelProps {
   fallbackPreview?: string;
   fallbackTitle?: string;
   fallbackUpdatedAt?: number;
+  changeEntries?: ChangeEntry[];
   onDeletePlanFiles?: () => void;
   onContinuePlanning?: () => void;
   onResumeExecution?: () => void;
+  onOpenChangeDiff?: (taskId: number) => void;
   onSaveDocument?: (document: { title: string; suggestedFileName: string; content: string; sourcePath?: string }) => Promise<boolean> | boolean;
   onApprove: () => void;
   onReject: () => void;
@@ -38,6 +40,9 @@ const COPY = {
     awaitingChoice: "待选择",
     previewReady: "已生成预览",
     taskProgress: "任务进度",
+    turnChanges: "本轮改动",
+    changedFiles: "个文件",
+    retained: "保留记录",
     completed: "完成",
     inProgress: "进行中",
     pending: "待办",
@@ -85,6 +90,9 @@ const COPY = {
     awaitingChoice: "Awaiting Choice",
     previewReady: "Preview Ready",
     taskProgress: "Task Progress",
+    turnChanges: "Turn Changes",
+    changedFiles: "files",
+    retained: "Retained",
     completed: "Done",
     inProgress: "In Progress",
     pending: "Pending",
@@ -157,9 +165,11 @@ export default function PlanPanel({
   fallbackPreview = "",
   fallbackTitle,
   fallbackUpdatedAt,
+  changeEntries = [],
   onDeletePlanFiles,
   onContinuePlanning,
   onResumeExecution,
+  onOpenChangeDiff,
   onSaveDocument,
   onApprove,
   onReject,
@@ -190,6 +200,7 @@ export default function PlanPanel({
   );
   const doneCount = displayTasks.filter((task) => task.status === "completed").length;
   const progressPct = displayTasks.length > 0 ? Math.round((doneCount / displayTasks.length) * 100) : 0;
+  const compactChangeEntries = changeEntries.slice(0, 6);
   const activeTurn = [...turns].reverse().find((turn) => isPlanConversationTurn(turn)) || turns[turns.length - 1];
   const showTaskProgress = !hideIslandOwnedSections && (isApproved || stage === "executing" || stage === "completed") && displayTasks.length > 0;
   const stageLabel = isAwaitingApproval
@@ -328,8 +339,17 @@ export default function PlanPanel({
                   </span>
                   <div className="min-w-0 flex-1">
                     <div className="text-[12px] leading-relaxed text-[#e4e4e7]">{task.text}</div>
-                    {task.requirementRef && (
-                      <div className="mt-1 text-[10px] tracking-wide text-[#71717a]">{task.requirementRef}</div>
+                    {(task.requirementRef || task.retained) && (
+                      <div className="mt-1 flex flex-wrap items-center gap-2">
+                        {task.requirementRef && (
+                          <span className="text-[10px] tracking-wide text-[#71717a]">{task.requirementRef}</span>
+                        )}
+                        {task.retained && (
+                          <span className="rounded-full border border-[rgba(251,191,36,0.24)] bg-[rgba(251,191,36,0.1)] px-2 py-0.5 text-[10px] text-[#fcd34d]">
+                            {copy.retained}
+                          </span>
+                        )}
+                      </div>
                     )}
                   </div>
                   <div data-testid="plan-task-status" className="text-[10px] text-[#71717a] whitespace-nowrap">
@@ -337,6 +357,49 @@ export default function PlanPanel({
                   </div>
                 </div>
               ))}
+            </div>
+          </div>
+        )}
+
+        {compactChangeEntries.length > 0 && (
+          <div data-testid="plan-change-summary" className="mt-4 rounded-xl border border-[#1f2937] bg-[#060b14] p-3">
+            <div className="flex items-center justify-between gap-3 text-[11px] text-[#93c5fd]">
+              <span>{copy.turnChanges}</span>
+              <span>{changeEntries.length} {copy.changedFiles}</span>
+            </div>
+            <div className="mt-3 space-y-2">
+              {compactChangeEntries.map((entry) => {
+                const content = (
+                  <>
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate text-[12px] font-medium text-[#dbeafe]">{entry.displayTarget}</span>
+                      <span className="block truncate text-[10px] text-[#64748b]">{entry.target}</span>
+                    </span>
+                    {entry.editCount > 1 && (
+                      <span className="shrink-0 rounded-full border border-[#334155] bg-[#0f172a] px-2 py-0.5 text-[10px] text-[#cbd5e1]">
+                        {language === "zh" ? `${entry.editCount} 次` : `${entry.editCount}x`}
+                      </span>
+                    )}
+                    <span className="shrink-0 text-[10px] font-medium text-[#10b981]">+{entry.added}</span>
+                    <span className="shrink-0 text-[10px] font-medium text-[#f87171]">-{entry.removed}</span>
+                  </>
+                );
+
+                return onOpenChangeDiff ? (
+                  <button
+                    key={`${entry.target}-${entry.taskId}`}
+                    type="button"
+                    onClick={() => onOpenChangeDiff(entry.taskId)}
+                    className="flex w-full min-w-0 items-center gap-2 rounded-lg border border-[#1e293b] bg-[#05070d] px-3 py-2 text-left transition-colors hover:border-[#2563eb]/35 hover:bg-[#09111f]"
+                  >
+                    {content}
+                  </button>
+                ) : (
+                  <div key={`${entry.target}-${entry.taskId}`} className="flex w-full min-w-0 items-center gap-2 rounded-lg border border-[#1e293b] bg-[#05070d] px-3 py-2">
+                    {content}
+                  </div>
+                );
+              })}
             </div>
           </div>
         )}

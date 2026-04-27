@@ -22,6 +22,8 @@ export default function ThemeStyles() {
       .theme-glow { box-shadow: 0 0 8px var(--accent-subtle) !important; }
       .theme-slider { accent-color: var(--accent) !important; }
       .theme-ring:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+      html[data-theme="light"] .theme-text { color: color-mix(in srgb, var(--accent-hover), #111827 28%) !important; }
+      html[data-theme="light"] .theme-subtle-bg { color: color-mix(in srgb, var(--accent-hover), #111827 28%) !important; }
     `}</style>
   );
 }

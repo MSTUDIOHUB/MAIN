@@ -8,6 +8,8 @@ import { useAppStore } from "../store/useAppStore";
 // Map tool names to human-readable action labels
 const TOOL_LABELS: Record<string, { verb: { zh: string; en: string }; icon: React.FC<{ className?: string }> }> = {
   list_directory:   { verb: { zh: "扫描目录", en: "scan directory" }, icon: IconFolder },
+  get_project_skeleton: { verb: { zh: "扫描项目", en: "scan project" }, icon: IconFolder },
+  get_file_outline: { verb: { zh: "读取结构", en: "read outline" }, icon: IconFile },
   glob_search:      { verb: { zh: "搜索文件", en: "search files" }, icon: IconSearch },
   grep_search:      { verb: { zh: "搜索内容", en: "search content" }, icon: IconSearch },
   read_file:        { verb: { zh: "读取文件", en: "read file" }, icon: IconFile },
@@ -30,6 +32,8 @@ const TOOL_LABELS: Record<string, { verb: { zh: string; en: string }; icon: Reac
 
 const COMPACT_DONE_TOOLS = new Set([
   "list_directory",
+  "get_project_skeleton",
+  "get_file_outline",
   "glob_search",
   "grep_search",
   "read_file",

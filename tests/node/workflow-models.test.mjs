@@ -60,16 +60,30 @@ function loadTranspiledModuleSync(sourcePath) {
 }
 
 const {
+  collectChangeEntries,
   deriveVisibleConversationTurnStatus,
+  extractPlanTasks,
+  findDroppedPlanTasks,
   looksLikeReasoningLeakTitle,
+  mergePlanTasks,
   normalizeConversationDisplayTitle,
   resolveActiveConversationTurn,
   resolvePinnedConversationTurn,
+  summarizeUserPrompt,
+  validatePlanArtifactContent,
 } = loadWorkflowModelsModule();
 
 test("normalizeConversationDisplayTitle strips speaker timestamps from transcript-style prompts", () => {
   const title = normalizeConversationDisplayTitle("Michael@: 04-23 17:57:52 这个它要建模 是啥意思", 40, "新的任务");
   assert.equal(title, "这个它要建模 是啥意思");
+});
+
+test("summarizeUserPrompt turns slash plan CTB request into a stable intent title", () => {
+  const title = summarizeUserPrompt(
+    "/计划 你是Unity游戏开发工程师，生成一套游戏框架代码包括文件夹，实现《歧路旅人》 CTB回合制战斗逻辑。",
+    40,
+  );
+  assert.equal(title, "实现 CTB 战斗框架");
 });
 
 test("looksLikeReasoningLeakTitle detects leaked chain-of-thought style titles", () => {
@@ -213,4 +227,102 @@ test("deriveVisibleConversationTurnStatus leaves non-pinned historical turns unc
   });
 
   assert.equal(visibleStatus, "done");
+});
+
+test("extractPlanTasks uses stable ids across task reordering", () => {
+  const first = extractPlanTasks("- [ ] 任务1：完善 BattleUnit.cs\n- [ ] 任务2：更新 BattleManager.cs");
+  const reordered = extractPlanTasks("- [ ] 任务2：更新 BattleManager.cs\n- [ ] 任务1：完善 BattleUnit.cs");
+
+  assert.equal(first.find((task) => task.text.includes("BattleUnit"))?.id, reordered.find((task) => task.text.includes("BattleUnit"))?.id);
+  assert.equal(first.find((task) => task.text.includes("BattleManager"))?.id, reordered.find((task) => task.text.includes("BattleManager"))?.id);
+});
+
+test("mergePlanTasks preserves completed task history when the latest tasks.md only lists remaining work", () => {
+  const previous = extractPlanTasks("- [x] 任务1：完善 BattleUnit.cs\n- [ ] 任务2：更新 BattleManager.cs");
+  const latest = extractPlanTasks("- [ ] 任务2：更新 BattleManager.cs");
+  const merged = mergePlanTasks(previous, latest, true);
+
+  assert.equal(merged.length, 2);
+  assert.equal(merged.find((task) => task.text.includes("BattleUnit"))?.status, "completed");
+  assert.equal(merged.find((task) => task.text.includes("BattleUnit"))?.retained, true);
+  assert.equal(merged.find((task) => task.text.includes("BattleManager"))?.retained, false);
+});
+
+test("findDroppedPlanTasks detects task deletion from rewritten tasks.md", () => {
+  const previous = extractPlanTasks("- [x] 任务1：完善 BattleUnit.cs\n- [ ] 任务2：更新 BattleManager.cs");
+  const latest = extractPlanTasks("- [ ] 任务2：更新 BattleManager.cs");
+  const dropped = findDroppedPlanTasks(previous, latest);
+
+  assert.equal(dropped.length, 1);
+  assert.match(dropped[0].text, /BattleUnit/);
+});
+
+test("validatePlanArtifactContent rejects fallback/log/thought/code fragments", () => {
+  assert.equal(validatePlanArtifactContent("自动生成的兜底草稿：模型已经读取上下文。", "requirements").ok, false);
+  assert.equal(validatePlanArtifactContent("Repeated read-only tool call skipped: get project skeleton", "design").ok, false);
+  assert.equal(validatePlanArtifactContent("后台思考已折叠\n让我先分析用户需求。", "design").ok, false);
+  assert.equal(validatePlanArtifactContent("using System;\nnamespace Battle.Core { public class BattleUnit {} }", "requirements").ok, false);
+});
+
+test("validatePlanArtifactContent accepts real requirements and design artifacts", () => {
+  const requirements = [
+    "# 需求规格",
+    "## 用户目标",
+    "实现 Unity CTB 回合制战斗框架，并保持代码适合教程录制。",
+    "## 范围",
+    "- 统一战斗单位、行动队列、技能与事件数据。",
+    "## 交付物",
+    "- 源码文件更新。",
+    "- 根目录 Readme.md 总结架构。",
+    "## 验收标准",
+    "- 生成的代码必须写入真实工作区文件。",
+    "- 每个完成步骤都有可见工具调用或文件写入证据。",
+  ].join("\n");
+  const design = [
+    "# 设计方案",
+    "## 影响文件",
+    "- Scripts/Battle/Core/BattleUnit.cs",
+    "- Scripts/Battle/Systems/BattleActionQueue.cs",
+    "## 执行顺序",
+    "1. 先补齐核心数据结构。",
+    "2. 再实现 CT 累积、排序和回合推进。",
+    "## 关键数据流",
+    "BattleUnit 产生行动状态，BattleActionQueue 负责推进，BattleManager 驱动回合。",
+    "## 验证方式",
+    "- 编译 Unity 脚本。",
+    "- 检查示例场景是否可以进入战斗流程。",
+  ].join("\n");
+
+  assert.equal(validatePlanArtifactContent(requirements, "requirements").ok, true);
+  assert.equal(validatePlanArtifactContent(design, "design").ok, true);
+});
+
+test("collectChangeEntries collects source and plan diffs with source files first", () => {
+  const stats = (oldText, newText) => ({
+    added: newText.split("\n").length,
+    removed: oldText.split("\n").length,
+  });
+  const result = collectChangeEntries([
+    {
+      id: 1,
+      type: "tool",
+      toolName: "write_file",
+      toolStatus: "executed",
+      target: ".MAIN/plans/tasks.md",
+      diff: { old: "", new: "- [ ] Task", path: ".MAIN/plans/tasks.md" },
+    },
+    {
+      id: 2,
+      type: "tool",
+      toolName: "replace_in_file",
+      toolStatus: "executed",
+      target: "Scripts/Battle/Core/BattleUnit.cs",
+      diff: { old: "old", new: "new\nline", path: "Scripts/Battle/Core/BattleUnit.cs" },
+    },
+  ], stats);
+
+  assert.equal(result.totalExecutedEdits, 2);
+  assert.equal(result.entries[0].target, "Scripts/Battle/Core/BattleUnit.cs");
+  assert.equal(result.entries[0].isPlanFile, false);
+  assert.equal(result.entries[1].isPlanFile, true);
 });

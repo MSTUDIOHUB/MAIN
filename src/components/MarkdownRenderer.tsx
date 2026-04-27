@@ -6,6 +6,7 @@ import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { vscDarkPlus } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { IconClose, IconExpand } from "./Icons";
 import MermaidBlock from "./MermaidBlock";
+import { useAppStore } from "../store/useAppStore";
 
 const LANG_MAP: Record<string, string> = {
   js: "javascript",
@@ -37,16 +38,24 @@ function normalizeMarkdownForDisplay(content: string): string {
     .replace(/\n{4,}/g, "\n\n\n");
 }
 
-function getLanguageTone(language: string, isDiagram: boolean) {
+function getLanguageTone(language: string, isDiagram: boolean, themeMode: "light" | "dark" = "dark") {
   const normalized = language.toLowerCase();
+  const isLightTheme = themeMode === "light";
 
   if (isDiagram || normalized === "mermaid") {
-    return {
-      badgeBorder: "rgba(96,165,250,0.28)",
-      badgeBackground: "rgba(96,165,250,0.12)",
-      badgeText: "#93c5fd",
-      headerBackground: "linear-gradient(90deg, rgba(37,99,235,0.16), rgba(14,165,233,0.08))",
-    };
+    return isLightTheme
+      ? {
+          badgeBorder: "rgba(37,99,235,0.28)",
+          badgeBackground: "rgba(219,234,254,0.82)",
+          badgeText: "#1d4ed8",
+          headerBackground: "linear-gradient(90deg, rgba(219,234,254,0.9), rgba(240,249,255,0.72))",
+        }
+      : {
+          badgeBorder: "rgba(96,165,250,0.28)",
+          badgeBackground: "rgba(96,165,250,0.12)",
+          badgeText: "#93c5fd",
+          headerBackground: "linear-gradient(90deg, rgba(37,99,235,0.16), rgba(14,165,233,0.08))",
+        };
   }
 
   switch (normalized) {
@@ -132,6 +141,8 @@ function getLanguageTone(language: string, isDiagram: boolean) {
 function CodeBlock({ inline, className, children, baseFontSize = 13, ...rest }: any) {
   const [copied, setCopied] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
+  const themeMode = useAppStore((s) => s.config.themeMode);
+  const isLightTheme = themeMode === "light";
   const match = /language-(\w+)/.exec(className || "");
   const language = match ? match[1].toLowerCase() : "";
   const codeStr = String(children).replace(/\n$/, "");
@@ -141,7 +152,32 @@ function CodeBlock({ inline, className, children, baseFontSize = 13, ...rest }: 
   const isPlainText = !language || resolvedLang === "text" || resolvedLang === "plaintext";
   const plainTextDisplay = codeStr.trim().replace(/\s+/g, " ");
   const isCompactPlainText = isPlainText && !codeStr.includes("\n") && plainTextDisplay.length <= 80;
-  const tone = getLanguageTone(resolvedLang || "text", isDiagram);
+  const tone = getLanguageTone(resolvedLang || "text", isDiagram, themeMode);
+  const expandedTone = isLightTheme
+    ? {
+        overlay: "rgba(15,23,42,0.24)",
+        modalBorder: "#cbd5e1",
+        modalBackground: "#ffffff",
+        modalShadow: "0 28px 80px rgba(15,23,42,0.18)",
+        headerBorder: "#e2e8f0",
+        titleText: "#1e293b",
+        buttonBorder: "#cbd5e1",
+        buttonBackground: "#f8fafc",
+        buttonText: "#475569",
+        bodyBackground: "#f8fafc",
+      }
+    : {
+        overlay: "rgba(0,0,0,0.68)",
+        modalBorder: "#34343b",
+        modalBackground: "#1d1d20",
+        modalShadow: "0 28px 80px rgba(0,0,0,0.45)",
+        headerBorder: "#2c2c32",
+        titleText: "#d4d4d8",
+        buttonBorder: "#34343b",
+        buttonBackground: "#181818",
+        buttonText: "#c4c4cc",
+        bodyBackground: "#181818",
+      };
 
   useEffect(() => {
     if (!isExpanded) return;
@@ -288,12 +324,17 @@ function CodeBlock({ inline, className, children, baseFontSize = 13, ...rest }: 
       </div>
 
       {isMermaid && isExpanded && typeof document !== "undefined" && createPortal(
-        <div className="fixed inset-0 z-[140] flex items-center justify-center bg-[rgba(0,0,0,0.68)] p-6" onClick={() => setIsExpanded(false)}>
+        <div className="fixed inset-0 z-[140] flex items-center justify-center bg-[rgba(0,0,0,0.68)] p-6" style={{ backgroundColor: expandedTone.overlay }} onClick={() => setIsExpanded(false)}>
           <div
             className="flex h-[min(86vh,960px)] w-[min(96vw,1320px)] flex-col overflow-hidden rounded-[28px] border border-[#34343b] bg-[#1d1d20] shadow-[0_28px_80px_rgba(0,0,0,0.45)]"
+            style={{
+              borderColor: expandedTone.modalBorder,
+              backgroundColor: expandedTone.modalBackground,
+              boxShadow: expandedTone.modalShadow,
+            }}
             onClick={(event) => event.stopPropagation()}
           >
-            <div className="flex items-center justify-between border-b border-[#2c2c32] px-5 py-3" style={{ background: tone.headerBackground }}>
+            <div className="flex items-center justify-between border-b border-[#2c2c32] px-5 py-3" style={{ borderColor: expandedTone.headerBorder, background: tone.headerBackground }}>
               <div className="flex items-center gap-3">
                 <span
                   className="rounded-full border px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.16em]"
@@ -305,25 +346,35 @@ function CodeBlock({ inline, className, children, baseFontSize = 13, ...rest }: 
                 >
                   {resolvedLang || "text"}
                 </span>
-                <span className="text-[12px] text-[#d4d4d8]">Expanded Diagram View</span>
+                <span className="text-[12px] text-[#d4d4d8]" style={{ color: expandedTone.titleText }}>Expanded Diagram View</span>
               </div>
               <div className="flex items-center gap-2">
                 <button
                   onClick={handleCopy}
                   className="rounded-full border border-[#34343b] bg-[#181818] px-3 py-1 text-[10px] text-[#c4c4cc] transition-colors hover:bg-[#232327] hover:text-[#fafafa]"
+                  style={{
+                    borderColor: expandedTone.buttonBorder,
+                    backgroundColor: expandedTone.buttonBackground,
+                    color: expandedTone.buttonText,
+                  }}
                 >
                   {copied ? "Copied" : "Copy Source"}
                 </button>
                 <button
                   onClick={() => setIsExpanded(false)}
                   className="rounded-full border border-[#34343b] bg-[#181818] p-2 text-[#c4c4cc] transition-colors hover:bg-[#232327] hover:text-[#fafafa]"
+                  style={{
+                    borderColor: expandedTone.buttonBorder,
+                    backgroundColor: expandedTone.buttonBackground,
+                    color: expandedTone.buttonText,
+                  }}
                   aria-label="Close expanded diagram"
                 >
                   <IconClose className="h-4 w-4" />
                 </button>
               </div>
             </div>
-            <div className="min-h-0 flex-1 overflow-hidden bg-[#181818]">
+            <div className="min-h-0 flex-1 overflow-hidden bg-[#181818]" style={{ backgroundColor: expandedTone.bodyBackground }}>
               <MermaidBlock code={codeStr} expanded />
             </div>
           </div>

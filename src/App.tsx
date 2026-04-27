@@ -1,5 +1,7 @@
 import { useRef, useEffect, useCallback, useState } from "react";
 import { open } from '@tauri-apps/plugin-dialog';
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 import Sidebar from "./components/Sidebar";
 import WorkspaceTreePanel from "./components/WorkspaceTreePanel";
@@ -27,6 +29,18 @@ import { resolveConversationTurnIntent } from "./lib/runIntent";
 import { runAfterNextPaint } from "./lib/uiScheduling";
 import { normalizeConversationDisplayTitle } from "./lib/workflowModels";
 import { appendDebugLog } from "./lib/debugLog";
+import {
+  createFeishuPairedUserFromMessage,
+  createFeishuPairingRequest,
+  createFeishuRemoteSessionTitle,
+  findFeishuPairedUser,
+  normalizeImAdaptersConfig,
+  parseFeishuTextCommand,
+  resolveFeishuRemoteIntentOverride,
+  upsertFeishuPairedUser,
+  type FeishuAdapterEvent,
+  type FeishuInboundMessage,
+} from "./lib/imAdapters";
 
 // ==========================================
 // MAIN APP COMPONENT
@@ -48,6 +62,8 @@ export default function App() {
 
   const t = translations[config.language] || translations.en;
   const currentTheme = THEMES[config.theme] || THEMES.purple;
+  const remoteFeishuQueueRef = useRef<FeishuInboundMessage[]>([]);
+  const feishuStartingRef = useRef(false);
 
   // ── Agent State (from store, replaces all inline implementations) ─────
   const taskFlow = useAppStore((s) => s.taskFlow);
@@ -67,6 +83,7 @@ export default function App() {
   const selectedDiffTaskId = useAppStore((s) => s.selectedDiffTaskId);
   const pendingSlashCommand = useAppStore((s) => s.pendingSlashCommand);
   const isStreaming = useAppStore((s) => s.isGenerating);
+  const agentStatus = useAppStore((s) => s.agentStatus);
   const elapsedTime = useAppStore((s) => s.elapsedTime);
 
   // ── Composer State ────────────────────────────────────────────────────
@@ -107,6 +124,8 @@ export default function App() {
   const [isResizing, setIsResizing] = useState(false);
   const [isSidebarResizing, setIsSidebarResizing] = useState(false);
   const [isWorkspaceTreeResizing, setIsWorkspaceTreeResizing] = useState(false);
+  const pendingRightPanelWidthRef = useRef<number | null>(null);
+  const rightPanelResizeFrameRef = useRef<number | null>(null);
 
   // ── Modal State ───────────────────────────────────────────────────────
   const isSettingsOpen = useAppStore((s) => s.isSettingsOpen);
@@ -312,15 +331,16 @@ export default function App() {
       taskFlowBlocks: state.taskFlow.length,
       agentMessages: state.agentMessages.length,
     });
+    const sourceTurn = state.currentTurnId
+      ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId) || null
+      : null;
+    const sourceIntent = resolveConversationTurnIntent(sourceTurn);
     const sendOptions = reuseCurrentTurn
       ? {
           reuseCurrentTurn: true,
-          preservePlanState:
-            resolveConversationTurnIntent(
-              state.currentTurnId
-                ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId) || null
-                : null,
-            ) === "plan",
+          preservePlanState: sourceIntent === "plan",
+          resolvedIntent: sourceIntent,
+          skipIntentResolution: true,
         }
       : undefined;
 
@@ -389,8 +409,12 @@ export default function App() {
         showPlanPanel: snapshot.showPlanPanel ?? false,
         showDiff: snapshot.showDiff ?? false,
         showTerminal: snapshot.showTerminal ?? false,
-        showFilePanel: snapshot.showFilePanel ?? false,
-        rightPanelTab: snapshot.rightPanelTab ?? 'plan',
+        showFilePanel: false,
+        fileViewerPath: "",
+        fileViewerContent: "",
+        fileViewerError: "",
+        fileViewerLoading: false,
+        rightPanelTab: snapshot.rightPanelTab === "file" ? "plan" : (snapshot.rightPanelTab ?? 'plan'),
         elapsedTime: 0,
       });
       appendDebugLog("info", "session.restore", {
@@ -444,6 +468,10 @@ export default function App() {
         showDiff: false,
         showTerminal: false,
         showFilePanel: false,
+        fileViewerPath: "",
+        fileViewerContent: "",
+        fileViewerError: "",
+        fileViewerLoading: false,
         rightPanelTab: 'plan',
       });
       appendDebugLog("info", "session.restore", {
@@ -484,6 +512,10 @@ export default function App() {
       showDiff: false,
       showTerminal: false,
       showFilePanel: false,
+      fileViewerPath: "",
+      fileViewerContent: "",
+      fileViewerError: "",
+      fileViewerLoading: false,
       rightPanelTab: 'plan',
       planArtifacts: [],
       planTasks: [],
@@ -614,6 +646,312 @@ export default function App() {
     }
   };
 
+  const sendFeishuText = useCallback(async (
+    target: string | Pick<FeishuInboundMessage, "chatId" | "userId" | "messageId">,
+    text: string,
+  ) => {
+    const payload = typeof target === "string"
+      ? { chatId: target }
+      : {
+          chatId: target.chatId,
+          userId: target.userId,
+          openId: target.userId,
+          messageId: target.messageId,
+        };
+    const chatId = payload.chatId;
+    if (!chatId || !text.trim()) return;
+    try {
+      await invoke("send_feishu_message", { ...payload, text });
+    } catch (error) {
+      appendDebugLog("warn", "feishu.remote", {
+        phase: "send_failed",
+        chatId,
+        hasUserId: typeof target !== "string" && !!target.userId,
+        hasMessageId: typeof target !== "string" && !!target.messageId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }, []);
+
+  const updateFeishuPairingConfig = useCallback((message: FeishuInboundMessage) => {
+    const pairedUser = createFeishuPairedUserFromMessage(message);
+    setConfig((prev: any) => {
+      const imAdapters = normalizeImAdaptersConfig(prev.imAdapters);
+      return {
+        ...prev,
+        imAdapters: {
+          ...imAdapters,
+          feishu: {
+            ...imAdapters.feishu,
+            pairedUsers: upsertFeishuPairedUser(imAdapters.feishu.pairedUsers, pairedUser),
+          },
+        },
+      };
+    });
+    useAppStore.getState().removeFeishuPairingRequest(message.userId);
+    return pairedUser;
+  }, [setConfig]);
+
+  const ensureFeishuRemoteSession = useCallback((message: FeishuInboundMessage) => {
+    const state = useAppStore.getState();
+    const workspace = state.currentWorkspace;
+    if (!workspace) return null;
+
+    const scopeKey = resolveSessionWorkspaceKey(workspace);
+    const title = createFeishuRemoteSessionTitle(message);
+    const sessions = state.sessionsByWorkspace[scopeKey] || [];
+    let target = sessions.find((session: any) => session.title === title) || null;
+
+    if (state.currentSessionId) {
+      state.updateSession(resolveSessionWorkspaceKey(state.currentWorkspace), state.currentSessionId, {
+        messages: sanitizeTaskBlocksForPersist(state.taskFlow),
+        active: false,
+      });
+    }
+
+    for (const session of sessions) {
+      if (session.active) state.updateSession(scopeKey, session.id, { active: false });
+    }
+
+    if (!target) {
+      target = {
+        id: Date.now(),
+        title,
+        date: new Date().toISOString(),
+        active: true,
+        messages: [] as TaskBlock[],
+      };
+      state.addSession(scopeKey, target);
+    } else {
+      state.updateSession(scopeKey, target.id, { active: true });
+    }
+
+    state.setCurrentSessionId(target.id);
+    restoreSessionState(target, target.id);
+    return target.id;
+  }, []);
+
+  const runFeishuRemoteMessage = useCallback((message: FeishuInboundMessage, fromQueue = false) => {
+    const state = useAppStore.getState();
+    const feishuConfig = normalizeImAdaptersConfig(state.config.imAdapters).feishu;
+    const pairedUser = findFeishuPairedUser(feishuConfig, message.userId);
+    if (!pairedUser) {
+      state.upsertFeishuPairingRequest(createFeishuPairingRequest(message));
+      const pairText = state.config.language === "en"
+        ? `This Feishu user is not paired yet. Open MAIN Settings > IM Adapters, or reply /pair ${feishuConfig.pairingCode} in this private chat.`
+        : `当前飞书用户尚未配对。请在 MAIN 的「系统设置 > 即时通讯适配器」中通过配对请求，或在飞书私聊里回复 /pair ${feishuConfig.pairingCode}。`;
+      void sendFeishuText(message, pairText);
+      return false;
+    }
+
+    if (!state.currentWorkspace) {
+      void sendFeishuText(
+        message,
+        state.config.language === "en"
+          ? "MAIN has no workspace open. Please open a project folder in the desktop app first."
+          : "MAIN 当前没有打开工作区。请先在桌面端打开项目文件夹。",
+      );
+      return false;
+    }
+
+    const busy = state.isGenerating || state.agentStatus === "running" || state.agentStatus === "pending_review";
+    if (busy) {
+      if (!fromQueue) {
+        remoteFeishuQueueRef.current.push(message);
+        void sendFeishuText(
+          message,
+          state.config.language === "en"
+            ? `MAIN is busy. Your message has been queued at position ${remoteFeishuQueueRef.current.length}.`
+            : `MAIN 正在处理上一条任务，已将这条消息加入队列（第 ${remoteFeishuQueueRef.current.length} 位）。`,
+        );
+      }
+      return false;
+    }
+
+    ensureFeishuRemoteSession(message);
+    void sendFeishuText(
+      message,
+      state.config.language === "en" ? "MAIN received the remote task and started processing." : "MAIN 已收到远程任务，开始处理。",
+    );
+    runAfterNextPaint(() => {
+      const intentOverride = resolveFeishuRemoteIntentOverride(message.text);
+      useAppStore.getState().sendMessage(message.text, undefined, {
+        ...intentOverride,
+        ...(intentOverride.resolvedIntent === "analyze"
+          ? {
+              turnTitle: state.config.language === "en" ? "Feishu remote analysis" : "飞书远程分析",
+              intentSummary: state.config.language === "en"
+                ? "Feishu remote private-chat message defaults to read-only analysis in the current workspace."
+                : "飞书私聊远程消息默认按当前工作区的只读分析处理。",
+            }
+          : {}),
+        remoteFeishu: {
+          adapter: "feishu",
+          chatId: message.chatId,
+          userId: message.userId,
+          userName: message.userName,
+          messageId: message.messageId,
+        },
+      });
+    });
+    return true;
+  }, [ensureFeishuRemoteSession, sendFeishuText]);
+
+  const handleFeishuInboundMessage = useCallback((message: FeishuInboundMessage) => {
+    const state = useAppStore.getState();
+    const command = parseFeishuTextCommand(message.text);
+    const feishuConfig = normalizeImAdaptersConfig(state.config.imAdapters).feishu;
+
+    if (command.kind === "pair") {
+      if (command.code === feishuConfig.pairingCode) {
+        updateFeishuPairingConfig(message);
+        void sendFeishuText(
+          message,
+          state.config.language === "en"
+            ? "Pairing complete. You can now send MAIN tasks from this private chat."
+            : "配对完成。现在可以在这个飞书私聊里向 MAIN 发送任务了。",
+        );
+      } else {
+        void sendFeishuText(
+          message,
+          state.config.language === "en" ? "Pairing code is incorrect." : "配对码不正确。",
+        );
+      }
+      return;
+    }
+
+    if (command.kind === "approve" || command.kind === "reject") {
+      const approval = state.resolvePendingFeishuApproval(message.userId, command.code);
+      if (!approval) {
+        void sendFeishuText(
+          message,
+          state.config.language === "en" ? "No matching pending approval was found." : "没有找到匹配的待审批操作。",
+        );
+        return;
+      }
+      if (command.kind === "approve") {
+        state.allowToolAction(approval.taskId);
+        void sendFeishuText(message, state.config.language === "en" ? "Approved." : "已允许执行。");
+      } else {
+        state.rejectToolAction(approval.taskId);
+        void sendFeishuText(message, state.config.language === "en" ? "Rejected." : "已拒绝执行。");
+      }
+      return;
+    }
+
+    if (command.kind === "status") {
+      const status = state.feishuAdapterStatus;
+      const workspaceLabel = state.currentWorkspace || (state.config.language === "en" ? "No workspace" : "未打开工作区");
+      const text = state.config.language === "en"
+        ? `Feishu adapter: ${status.status}\nMAIN: ${state.agentStatus}\nWorkspace: ${workspaceLabel}\nQueue: ${remoteFeishuQueueRef.current.length}`
+        : `飞书适配器：${status.status}\nMAIN 状态：${state.agentStatus}\n工作区：${workspaceLabel}\n队列：${remoteFeishuQueueRef.current.length}`;
+      void sendFeishuText(message, text);
+      return;
+    }
+
+    if (command.kind === "stop") {
+      state.stopGeneration();
+      remoteFeishuQueueRef.current = [];
+      void sendFeishuText(message, state.config.language === "en" ? "Stopped current generation and cleared the remote queue." : "已停止当前生成，并清空远程队列。");
+      return;
+    }
+
+    if (!findFeishuPairedUser(feishuConfig, message.userId)) {
+      state.upsertFeishuPairingRequest(createFeishuPairingRequest(message));
+      void sendFeishuText(
+        message,
+        state.config.language === "en"
+          ? `This Feishu user is not paired yet. Reply /pair ${feishuConfig.pairingCode} to pair.`
+          : `当前飞书用户尚未配对。请回复 /pair ${feishuConfig.pairingCode} 完成配对。`,
+      );
+      return;
+    }
+
+    runFeishuRemoteMessage({ ...message, text: command.text });
+  }, [runFeishuRemoteMessage, sendFeishuText, updateFeishuPairingConfig]);
+
+  useEffect(() => {
+    const feishuConfig = normalizeImAdaptersConfig(config.imAdapters).feishu;
+    if (!feishuConfig.enabled) {
+      void invoke("stop_feishu_adapter").catch(() => {});
+      useAppStore.getState().setFeishuAdapterStatus({
+        status: "stopped",
+        running: false,
+        message: config.language === "en" ? "Feishu adapter is disabled." : "飞书适配器未启用。",
+      });
+      return;
+    }
+    if (!feishuConfig.appId.trim() || !feishuConfig.appSecret.trim()) {
+      useAppStore.getState().setFeishuAdapterStatus({
+        status: "idle",
+        running: false,
+        message: config.language === "en" ? "Waiting for Feishu App ID and App Secret." : "等待填写飞书 App ID 和 App Secret。",
+      });
+      return;
+    }
+    if (feishuStartingRef.current) return;
+    feishuStartingRef.current = true;
+    void invoke("start_feishu_adapter", {
+      config: {
+        appId: feishuConfig.appId,
+        appSecret: feishuConfig.appSecret,
+        domain: feishuConfig.domain,
+      },
+    })
+      .then((status: any) => {
+        useAppStore.getState().setFeishuAdapterStatus(status);
+      })
+      .catch((error) => {
+        useAppStore.getState().setFeishuAdapterStatus({
+          status: "error",
+          running: false,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      })
+      .finally(() => {
+        feishuStartingRef.current = false;
+      });
+  }, [
+    config.imAdapters?.feishu?.appId,
+    config.imAdapters?.feishu?.appSecret,
+    config.imAdapters?.feishu?.domain,
+    config.imAdapters?.feishu?.enabled,
+    config.language,
+  ]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    void listen<FeishuAdapterEvent>("feishu-adapter-event", (event) => {
+      const payload = event.payload;
+      if (payload.type === "status" || payload.type === "error") {
+        useAppStore.getState().setFeishuAdapterStatus({
+          status: payload.status || (payload.type === "error" ? "error" : "idle"),
+          running: payload.running === true,
+          message: payload.message || "",
+          pid: payload.pid ?? null,
+          updatedAt: payload.timestamp || Date.now(),
+        });
+        return;
+      }
+      if (payload.type === "message") {
+        handleFeishuInboundMessage(payload);
+      }
+    }).then((dispose) => {
+      unlisten = dispose;
+    });
+    return () => {
+      unlisten?.();
+    };
+  }, [handleFeishuInboundMessage]);
+
+  useEffect(() => {
+    const state = useAppStore.getState();
+    const busy = state.isGenerating || state.agentStatus === "running" || state.agentStatus === "pending_review";
+    if (busy || remoteFeishuQueueRef.current.length === 0) return;
+    const next = remoteFeishuQueueRef.current.shift();
+    if (next) runFeishuRemoteMessage(next, true);
+  }, [agentStatus, isStreaming, runFeishuRemoteMessage]);
+
   const startResizing = (e: React.MouseEvent) => { e.preventDefault(); setIsResizing(true); };
   const startSidebarResizing = (e: React.MouseEvent) => { e.preventDefault(); setIsSidebarResizing(true); };
   const startWorkspaceTreeResizing = (e: React.MouseEvent) => { e.preventDefault(); setIsWorkspaceTreeResizing(true); };
@@ -623,6 +961,31 @@ export default function App() {
     const MIN_WORKSPACE_TREE_WIDTH = 220;
     const MIN_RIGHT_PANEL_WIDTH = 340;
     const MIN_CHAT_INPUT_AREA_WIDTH = 368;
+
+    const flushRightPanelWidth = () => {
+      if (rightPanelResizeFrameRef.current !== null) {
+        window.cancelAnimationFrame(rightPanelResizeFrameRef.current);
+        rightPanelResizeFrameRef.current = null;
+      }
+      const nextWidth = pendingRightPanelWidthRef.current;
+      pendingRightPanelWidthRef.current = null;
+      if (typeof nextWidth === "number") {
+        setRightPanelWidth(nextWidth);
+      }
+    };
+
+    const scheduleRightPanelWidth = (nextWidth: number) => {
+      pendingRightPanelWidthRef.current = nextWidth;
+      if (rightPanelResizeFrameRef.current !== null) return;
+      rightPanelResizeFrameRef.current = window.requestAnimationFrame(() => {
+        rightPanelResizeFrameRef.current = null;
+        const width = pendingRightPanelWidthRef.current;
+        pendingRightPanelWidthRef.current = null;
+        if (typeof width === "number") {
+          setRightPanelWidth(width);
+        }
+      });
+    };
 
     const onMouseMove = (e: MouseEvent) => {
       if (isResizing) {
@@ -634,7 +997,7 @@ export default function App() {
         );
         if (w < MIN_RIGHT_PANEL_WIDTH) w = MIN_RIGHT_PANEL_WIDTH;
         if (w > maxRightPanelWidth) w = maxRightPanelWidth;
-        setRightPanelWidth(w);
+        scheduleRightPanelWidth(w);
       } else if (isWorkspaceTreeResizing) {
         let w = e.clientX - sidebarWidth;
         if (w < MIN_WORKSPACE_TREE_WIDTH) w = MIN_WORKSPACE_TREE_WIDTH;
@@ -648,6 +1011,7 @@ export default function App() {
       }
     };
     const onMouseUp = () => {
+      flushRightPanelWidth();
       setIsResizing(false);
       setIsSidebarResizing(false);
       setIsWorkspaceTreeResizing(false);
@@ -663,6 +1027,11 @@ export default function App() {
     return () => {
       window.removeEventListener("mousemove", onMouseMove);
       window.removeEventListener("mouseup", onMouseUp);
+      if (rightPanelResizeFrameRef.current !== null && !isResizing) {
+        window.cancelAnimationFrame(rightPanelResizeFrameRef.current);
+        rightPanelResizeFrameRef.current = null;
+        pendingRightPanelWidthRef.current = null;
+      }
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
     };

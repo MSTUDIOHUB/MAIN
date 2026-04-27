@@ -1,13 +1,13 @@
 use glob::glob;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use regex::Regex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::cmp::Ordering;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command as ProcessCommand, Stdio};
+use std::process::{Child as ProcessChild, ChildStdin, Command as ProcessCommand, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -26,6 +26,8 @@ const HTTP_CONNECT_TIMEOUT_SECS: u64 = 15;
 const HTTP_SHORT_TIMEOUT_SECS: u64 = 15;
 const MODEL_REQUEST_TIMEOUT_SECS: u64 = 30 * 60;
 const STREAM_READ_TIMEOUT_SECS: u64 = 15 * 60;
+const STREAM_FIRST_RESPONSE_TIMEOUT_SECS: u64 = 180;
+const STREAM_FIRST_CHUNK_TIMEOUT_SECS: u64 = 180;
 
 static TOKENIZER: OnceLock<CoreBPE> = OnceLock::new();
 
@@ -57,6 +59,13 @@ fn debug_timestamp() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_else(|_| Duration::from_secs(0));
     format!("{}.{:03}", elapsed.as_secs(), elapsed.subsec_millis())
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_millis() as u64
 }
 
 fn sanitize_log_part(value: &str) -> String {
@@ -184,8 +193,18 @@ struct PtyManager {
     session: Mutex<Option<PtySession>>,
 }
 
+struct FeishuAdapterManager {
+    process: Mutex<Option<FeishuAdapterProcess>>,
+    status: Arc<Mutex<FeishuAdapterStatus>>,
+}
+
 struct WorkspaceState {
     root: Mutex<PathBuf>,
+}
+
+struct FeishuAdapterProcess {
+    child: ProcessChild,
+    writer: Arc<Mutex<ChildStdin>>,
 }
 
 struct PtySession {
@@ -244,9 +263,69 @@ struct TerminalCommandOutput {
     stderr_truncated: bool,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FeishuAdapterStatus {
+    status: String,
+    running: bool,
+    message: String,
+    updated_at: u64,
+    pid: Option<u32>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FeishuAdapterConfigPayload {
+    app_id: String,
+    app_secret: String,
+    domain: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NodeRuntimeStatus {
+    found: bool,
+    executable: Option<String>,
+    version: Option<String>,
+    message: String,
+}
+
 #[derive(Clone, Serialize)]
 struct PtyDataPayload {
     chunk: String,
+}
+
+impl Default for FeishuAdapterManager {
+    fn default() -> Self {
+        Self {
+            process: Mutex::new(None),
+            status: Arc::new(Mutex::new(FeishuAdapterStatus::default())),
+        }
+    }
+}
+
+impl Default for FeishuAdapterStatus {
+    fn default() -> Self {
+        Self {
+            status: "idle".to_string(),
+            running: false,
+            message: "Feishu adapter is idle.".to_string(),
+            updated_at: now_millis(),
+            pid: None,
+        }
+    }
+}
+
+impl FeishuAdapterProcess {
+    fn shutdown(&mut self) {
+        if let Ok(mut writer) = self.writer.lock() {
+            let _ = writeln!(writer, "{}", json!({ "type": "stop" }));
+            let _ = writer.flush();
+        }
+        thread::sleep(Duration::from_millis(120));
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 impl PtySession {
@@ -1852,6 +1931,32 @@ fn cancel_proxy_request() -> Result<(), String> {
 
 /// Global cancellation token for the active chat stream.
 static STREAM_CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static STREAM_ABORT: std::sync::Mutex<Option<futures_util::future::AbortHandle>> = std::sync::Mutex::new(None);
+
+fn set_stream_abort_handle(handle: Option<futures_util::future::AbortHandle>) {
+    if let Ok(mut slot) = STREAM_ABORT.lock() {
+        *slot = handle;
+    }
+}
+
+fn abort_active_stream_request() {
+    if let Ok(mut slot) = STREAM_ABORT.lock() {
+        if let Some(handle) = slot.take() {
+            handle.abort();
+        }
+    }
+}
+
+fn emit_chat_stream_done(app: &AppHandle, stream_id: &str, status: &str, error: Option<String>) {
+    let _ = app.emit(
+        "chat-stream-done",
+        StreamDonePayload {
+            stream_id: stream_id.to_string(),
+            status: status.to_string(),
+            error,
+        },
+    );
+}
 
 #[derive(Clone, Serialize)]
 struct StreamChunkPayload {
@@ -1878,6 +1983,7 @@ async fn start_chat_stream(
     body: String,
 ) -> Result<(), String> {
     STREAM_CANCEL.store(false, std::sync::atomic::Ordering::Relaxed);
+    set_stream_abort_handle(None);
     let stream_started_at = Instant::now();
 
     let is_model_request = url.contains("/v1/chat/completions") || url.contains("/v1/responses") || url.contains("/v1/messages");
@@ -1925,10 +2031,67 @@ async fn start_chat_stream(
 
     req_builder = req_builder.body(body);
 
-    let response = req_builder
-        .send()
-        .await
-        .map_err(|e| {
+    let (send_abort_handle, send_abort_registration) = futures_util::future::AbortHandle::new_pair();
+    set_stream_abort_handle(Some(send_abort_handle));
+    let response_result = match tokio::time::timeout(
+        Duration::from_secs(STREAM_FIRST_RESPONSE_TIMEOUT_SECS),
+        futures_util::future::Abortable::new(req_builder.send(), send_abort_registration),
+    )
+    .await
+    {
+        Err(_) => {
+            abort_active_stream_request();
+            STREAM_CANCEL.store(true, std::sync::atomic::Ordering::Relaxed);
+            record_debug_log(
+                &app,
+                "warn",
+                "stream_first_chunk_timeout",
+                format!(
+                    "phase=response_headers url={} timeout_secs={} elapsed_ms={}",
+                    url,
+                    STREAM_FIRST_RESPONSE_TIMEOUT_SECS,
+                    stream_started_at.elapsed().as_millis(),
+                ),
+            );
+            record_debug_log(
+                &app,
+                "info",
+                "stream_cancelled_by_watchdog",
+                format!("phase=response_headers url={}", url),
+            );
+            emit_chat_stream_done(
+                &app,
+                &stream_id,
+                "error",
+                Some(format!(
+                    "STREAM_FIRST_CHUNK_TIMEOUT: 模型在 {} 秒内没有返回响应头，本轮已暂停。",
+                    STREAM_FIRST_RESPONSE_TIMEOUT_SECS,
+                )),
+            );
+            return Ok(());
+        }
+        Ok(Err(_)) => {
+            set_stream_abort_handle(None);
+            record_debug_log(
+                &app,
+                "info",
+                "start_chat_stream",
+                format!(
+                    "cancelled_before_response url={} elapsed_ms={}",
+                    url,
+                    stream_started_at.elapsed().as_millis(),
+                ),
+            );
+            emit_chat_stream_done(&app, &stream_id, "cancelled", None);
+            return Ok(());
+        }
+        Ok(Ok(result)) => {
+            set_stream_abort_handle(None);
+            result
+        }
+    };
+
+    let response = response_result.map_err(|e| {
             record_debug_log(&app, "error", "start_chat_stream", format!("request_failed url={} err={}", url, e));
             format!("请求失败: {e}")
         })?;
@@ -1961,7 +2124,97 @@ async fn start_chat_stream(
     let mut chunk_count: usize = 0;
     let mut byte_count: usize = 0;
 
-    while let Some(chunk_result) = stream.next().await {
+    loop {
+        let (chunk_abort_handle, chunk_abort_registration) = futures_util::future::AbortHandle::new_pair();
+        set_stream_abort_handle(Some(chunk_abort_handle));
+        let next_chunk = if chunk_count == 0 {
+            match tokio::time::timeout(
+                Duration::from_secs(STREAM_FIRST_CHUNK_TIMEOUT_SECS),
+                futures_util::future::Abortable::new(stream.next(), chunk_abort_registration),
+            )
+            .await
+            {
+                Err(_) => {
+                    abort_active_stream_request();
+                    STREAM_CANCEL.store(true, std::sync::atomic::Ordering::Relaxed);
+                    record_debug_log(
+                        &app,
+                        "warn",
+                        "stream_first_chunk_timeout",
+                        format!(
+                            "phase=first_chunk url={} timeout_secs={} elapsed_ms={}",
+                            url,
+                            STREAM_FIRST_CHUNK_TIMEOUT_SECS,
+                            stream_started_at.elapsed().as_millis(),
+                        ),
+                    );
+                    record_debug_log(
+                        &app,
+                        "info",
+                        "stream_cancelled_by_watchdog",
+                        format!("phase=first_chunk url={}", url),
+                    );
+                    emit_chat_stream_done(
+                        &app,
+                        &stream_id,
+                        "error",
+                        Some(format!(
+                            "STREAM_FIRST_CHUNK_TIMEOUT: 模型在 {} 秒内没有返回首个流式 chunk，本轮已暂停。",
+                            STREAM_FIRST_CHUNK_TIMEOUT_SECS,
+                        )),
+                    );
+                    return Ok(());
+                }
+                Ok(Err(_)) => {
+                    set_stream_abort_handle(None);
+                    record_debug_log(
+                        &app,
+                        "info",
+                        "start_chat_stream",
+                        format!(
+                            "cancelled_waiting_for_first_chunk url={} elapsed_ms={}",
+                            url,
+                            stream_started_at.elapsed().as_millis(),
+                        ),
+                    );
+                    emit_chat_stream_done(&app, &stream_id, "cancelled", None);
+                    return Ok(());
+                }
+                Ok(Ok(item)) => {
+                    set_stream_abort_handle(None);
+                    item
+                }
+            }
+        } else {
+            match futures_util::future::Abortable::new(stream.next(), chunk_abort_registration).await {
+                Err(_) => {
+                    set_stream_abort_handle(None);
+                    record_debug_log(
+                        &app,
+                        "info",
+                        "start_chat_stream",
+                        format!(
+                            "cancelled url={} chunks={} bytes={} elapsed_ms={}",
+                            url,
+                            chunk_count,
+                            byte_count,
+                            stream_started_at.elapsed().as_millis(),
+                        ),
+                    );
+                    emit_chat_stream_done(&app, &stream_id, "cancelled", None);
+                    return Ok(());
+                }
+                Ok(item) => {
+                    set_stream_abort_handle(None);
+                    item
+                }
+            }
+        };
+
+        let Some(chunk_result) = next_chunk else {
+            break;
+        };
+
         if STREAM_CANCEL.load(std::sync::atomic::Ordering::Relaxed) {
             record_debug_log(
                 &app,
@@ -1969,19 +2222,25 @@ async fn start_chat_stream(
                 "start_chat_stream",
                 format!("cancelled url={} chunks={} bytes={} elapsed_ms={}", url, chunk_count, byte_count, stream_started_at.elapsed().as_millis()),
             );
-            let _ = app.emit(
-                "chat-stream-done",
-                StreamDonePayload {
-                    stream_id: stream_id.clone(),
-                    status: "cancelled".to_string(),
-                    error: None,
-                },
-            );
+            emit_chat_stream_done(&app, &stream_id, "cancelled", None);
             return Ok(());
         }
 
         match chunk_result {
             Ok(bytes) => {
+                if chunk_count == 0 {
+                    record_debug_log(
+                        &app,
+                        "info",
+                        "start_chat_stream",
+                        format!(
+                            "first_chunk url={} bytes={} elapsed_ms={}",
+                            url,
+                            bytes.len(),
+                            stream_started_at.elapsed().as_millis(),
+                        ),
+                    );
+                }
                 chunk_count += 1;
                 byte_count += bytes.len();
 
@@ -2027,27 +2286,14 @@ async fn start_chat_stream(
                     "start_chat_stream",
                     format!("read_error url={} chunks={} bytes={} elapsed_ms={} err={}", url, chunk_count, byte_count, stream_started_at.elapsed().as_millis(), e),
                 );
-                let _ = app.emit(
-                    "chat-stream-done",
-                    StreamDonePayload {
-                        stream_id: stream_id.clone(),
-                        status: "error".to_string(),
-                        error: Some(format!("流读取错误: {e}")),
-                    },
-                );
+                emit_chat_stream_done(&app, &stream_id, "error", Some(format!("流读取错误: {e}")));
                 return Ok(());
             }
         }
     }
 
-    let _ = app.emit(
-        "chat-stream-done",
-        StreamDonePayload {
-            stream_id: stream_id.clone(),
-            status: "ok".to_string(),
-            error: None,
-        },
-    );
+    set_stream_abort_handle(None);
+    emit_chat_stream_done(&app, &stream_id, "ok", None);
 
     if is_model_request {
         record_debug_log(
@@ -2065,6 +2311,7 @@ async fn start_chat_stream(
 #[tauri::command]
 fn cancel_chat_stream() -> Result<(), String> {
     STREAM_CANCEL.store(true, std::sync::atomic::Ordering::Relaxed);
+    abort_active_stream_request();
     Ok(())
 }
 
@@ -2819,6 +3066,475 @@ fn delete_plan_files(state: State<WorkspaceState>) -> Result<(), String> {
 
 // endregion
 
+// region: 飞书 IM Adapter
+
+fn sanitize_feishu_domain(domain: Option<String>) -> String {
+    let trimmed = domain
+        .unwrap_or_else(|| "https://open.feishu.cn".to_string())
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+    if trimmed.is_empty() {
+        "https://open.feishu.cn".to_string()
+    } else {
+        trimmed
+    }
+}
+
+fn feishu_project_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn feishu_sidecar_script_path() -> PathBuf {
+    feishu_project_root()
+        .join("scripts")
+        .join("feishu_adapter_sidecar.mjs")
+}
+
+fn node_executable_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "node.exe"
+    } else {
+        "node"
+    }
+}
+
+fn push_node_candidate(candidates: &mut Vec<PathBuf>, path: impl Into<PathBuf>) {
+    let path = path.into();
+    if !candidates.iter().any(|candidate| candidate == &path) {
+        candidates.push(path);
+    }
+}
+
+fn collect_glob_node_candidates(candidates: &mut Vec<PathBuf>, pattern: String) {
+    if let Ok(paths) = glob(&pattern) {
+        for entry in paths.flatten() {
+            push_node_candidate(candidates, entry);
+        }
+    }
+}
+
+fn candidate_node_paths() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let executable = node_executable_name();
+
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            push_node_candidate(&mut candidates, dir.join(executable));
+        }
+    }
+
+    if cfg!(target_os = "macos") {
+        push_node_candidate(&mut candidates, "/opt/homebrew/bin/node");
+        push_node_candidate(&mut candidates, "/usr/local/bin/node");
+        push_node_candidate(&mut candidates, "/usr/bin/node");
+        push_node_candidate(&mut candidates, "/usr/local/opt/node/bin/node");
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = PathBuf::from(home);
+            push_node_candidate(&mut candidates, home.join(".volta/bin/node"));
+            push_node_candidate(&mut candidates, home.join(".asdf/shims/node"));
+            collect_glob_node_candidates(
+                &mut candidates,
+                home.join(".nvm/versions/node/*/bin/node").to_string_lossy().to_string(),
+            );
+            collect_glob_node_candidates(
+                &mut candidates,
+                home.join(".fnm/node-versions/*/installation/bin/node").to_string_lossy().to_string(),
+            );
+        }
+    } else if cfg!(target_os = "windows") {
+        if let Some(program_files) = std::env::var_os("ProgramFiles") {
+            push_node_candidate(&mut candidates, PathBuf::from(program_files).join("nodejs/node.exe"));
+        }
+        if let Some(program_files_x86) = std::env::var_os("ProgramFiles(x86)") {
+            push_node_candidate(&mut candidates, PathBuf::from(program_files_x86).join("nodejs/node.exe"));
+        }
+        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+            push_node_candidate(&mut candidates, PathBuf::from(local_app_data).join("Programs/nodejs/node.exe"));
+        }
+    } else {
+        push_node_candidate(&mut candidates, "/usr/bin/node");
+        push_node_candidate(&mut candidates, "/usr/local/bin/node");
+        push_node_candidate(&mut candidates, "/snap/bin/node");
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = PathBuf::from(home);
+            push_node_candidate(&mut candidates, home.join(".volta/bin/node"));
+            push_node_candidate(&mut candidates, home.join(".asdf/shims/node"));
+            collect_glob_node_candidates(
+                &mut candidates,
+                home.join(".nvm/versions/node/*/bin/node").to_string_lossy().to_string(),
+            );
+            collect_glob_node_candidates(
+                &mut candidates,
+                home.join(".fnm/node-versions/*/installation/bin/node").to_string_lossy().to_string(),
+            );
+        }
+    }
+
+    candidates
+}
+
+fn resolve_node_executable() -> Option<PathBuf> {
+    candidate_node_paths()
+        .into_iter()
+        .find(|path| path.is_file())
+}
+
+fn get_node_version(path: &Path) -> Option<String> {
+    let output = ProcessCommand::new(path).arg("-v").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if version.is_empty() {
+        None
+    } else {
+        Some(version)
+    }
+}
+
+#[tauri::command]
+fn get_feishu_node_runtime_status() -> Result<NodeRuntimeStatus, String> {
+    let Some(path) = resolve_node_executable() else {
+        return Ok(NodeRuntimeStatus {
+            found: false,
+            executable: None,
+            version: None,
+            message: "未找到 Node.js。请在飞书设置中使用快速配置，或手动安装 Node.js LTS。".to_string(),
+        });
+    };
+    let version = get_node_version(&path);
+    Ok(NodeRuntimeStatus {
+        found: true,
+        executable: Some(path.to_string_lossy().to_string()),
+        version: version.clone(),
+        message: match version {
+            Some(version) => format!("已找到 Node.js {version}"),
+            None => "已找到 Node.js，但无法读取版本号。".to_string(),
+        },
+    })
+}
+
+fn set_feishu_status(
+    status_slot: &Arc<Mutex<FeishuAdapterStatus>>,
+    status: &str,
+    running: bool,
+    message: impl Into<String>,
+    pid: Option<u32>,
+) -> FeishuAdapterStatus {
+    let next = FeishuAdapterStatus {
+        status: status.to_string(),
+        running,
+        message: message.into(),
+        updated_at: now_millis(),
+        pid,
+    };
+    if let Ok(mut guard) = status_slot.lock() {
+        *guard = next.clone();
+    }
+    next
+}
+
+fn update_feishu_status_from_event(
+    status_slot: &Arc<Mutex<FeishuAdapterStatus>>,
+    value: &Value,
+    fallback_pid: Option<u32>,
+) {
+    let event_type = value.get("type").and_then(Value::as_str).unwrap_or("");
+    if event_type != "status" && event_type != "error" {
+        return;
+    }
+
+    let status = value
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or(if event_type == "error" { "error" } else { "idle" });
+    let running = value
+        .get("running")
+        .and_then(Value::as_bool)
+        .unwrap_or(matches!(status, "starting" | "connected"));
+    let message = value
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or(if event_type == "error" { "Feishu adapter error." } else { "" });
+    let pid = value
+        .get("pid")
+        .and_then(Value::as_u64)
+        .and_then(|raw| u32::try_from(raw).ok())
+        .or(fallback_pid);
+
+    let _ = set_feishu_status(status_slot, status, running, message, pid);
+}
+
+fn write_feishu_sidecar_command(
+    writer: &Arc<Mutex<ChildStdin>>,
+    command: Value,
+) -> Result<(), String> {
+    let mut guard = writer
+        .lock()
+        .map_err(|_| "无法写入飞书适配器：状态锁已损坏".to_string())?;
+    writeln!(guard, "{command}").map_err(|e| format!("写入飞书适配器失败: {e}"))?;
+    guard.flush().map_err(|e| format!("刷新飞书适配器命令失败: {e}"))
+}
+
+#[tauri::command]
+fn get_feishu_adapter_status(state: State<FeishuAdapterManager>) -> Result<FeishuAdapterStatus, String> {
+    state
+        .status
+        .lock()
+        .map(|guard| guard.clone())
+        .map_err(|_| "无法读取飞书适配器状态：状态锁已损坏".to_string())
+}
+
+#[tauri::command]
+fn start_feishu_adapter(
+    app: AppHandle,
+    state: State<FeishuAdapterManager>,
+    config: FeishuAdapterConfigPayload,
+) -> Result<FeishuAdapterStatus, String> {
+    let app_id = config.app_id.trim().to_string();
+    let app_secret = config.app_secret;
+    if app_id.is_empty() || app_secret.trim().is_empty() {
+        return Err("请先填写飞书 App ID 和 App Secret".to_string());
+    }
+
+    let script_path = feishu_sidecar_script_path();
+    if !script_path.exists() {
+        return Err(format!("未找到飞书适配器脚本: {}", script_path.display()));
+    }
+
+    {
+        let mut process_guard = state
+            .process
+            .lock()
+            .map_err(|_| "无法启动飞书适配器：状态锁已损坏".to_string())?;
+        if let Some(mut existing) = process_guard.take() {
+            existing.shutdown();
+        }
+    }
+
+    let starting = set_feishu_status(&state.status, "starting", true, "正在启动飞书长连接...", None);
+    let _ = app.emit("feishu-adapter-event", json!({
+        "type": "status",
+        "adapter": "feishu",
+        "status": starting.status,
+        "running": starting.running,
+        "message": starting.message,
+        "timestamp": starting.updated_at,
+    }));
+
+    let node_path = resolve_node_executable().ok_or_else(|| {
+        "启动飞书适配器失败：未找到 Node.js。请在「系统设置 > 即时通讯适配器」点击「快速配置 Node.js」，或手动安装 Node.js LTS 后重启 MAIN。".to_string()
+    })?;
+    record_debug_log(
+        &app,
+        "info",
+        "feishu.adapter",
+        format!("using node runtime: {}", node_path.display()),
+    );
+
+    let mut command = ProcessCommand::new(&node_path);
+    command
+        .arg(script_path)
+        .current_dir(feishu_project_root())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("启动飞书适配器失败，请确认已安装 Node.js: {e}"))?;
+    let pid = child.id();
+    let stdin = child.stdin.take().ok_or_else(|| "无法打开飞书适配器输入管道".to_string())?;
+    let stdout = child.stdout.take().ok_or_else(|| "无法打开飞书适配器输出管道".to_string())?;
+    let stderr = child.stderr.take().ok_or_else(|| "无法打开飞书适配器日志管道".to_string())?;
+    let writer = Arc::new(Mutex::new(stdin));
+    let status_slot = state.status.clone();
+    let app_for_stdout = app.clone();
+
+    thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line_result in reader.lines() {
+            let Ok(line) = line_result else {
+                break;
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<Value>(&line) {
+                Ok(value) => {
+                    update_feishu_status_from_event(&status_slot, &value, Some(pid));
+                    let _ = app_for_stdout.emit("feishu-adapter-event", value);
+                }
+                Err(err) => {
+                    record_debug_log(
+                        &app_for_stdout,
+                        "warn",
+                        "feishu.adapter",
+                        format!("忽略无法解析的飞书适配器输出: {err}"),
+                    );
+                }
+            }
+        }
+        let stopped = set_feishu_status(
+            &status_slot,
+            "stopped",
+            false,
+            "飞书适配器进程已退出。",
+            Some(pid),
+        );
+        let _ = app_for_stdout.emit("feishu-adapter-event", json!({
+            "type": "status",
+            "adapter": "feishu",
+            "status": stopped.status,
+            "running": stopped.running,
+            "message": stopped.message,
+            "pid": stopped.pid,
+            "timestamp": stopped.updated_at,
+        }));
+    });
+
+    let app_for_stderr = app.clone();
+    thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines().flatten() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            record_debug_log(&app_for_stderr, "info", "feishu.adapter", line);
+        }
+    });
+
+    write_feishu_sidecar_command(&writer, json!({
+        "type": "start",
+        "config": {
+            "appId": app_id,
+            "appSecret": app_secret,
+            "domain": sanitize_feishu_domain(config.domain),
+        },
+    }))?;
+
+    let status = set_feishu_status(
+        &state.status,
+        "starting",
+        true,
+        "飞书适配器已启动，正在等待长连接就绪...",
+        Some(pid),
+    );
+
+    let mut process_guard = state
+        .process
+        .lock()
+        .map_err(|_| "无法保存飞书适配器进程：状态锁已损坏".to_string())?;
+    *process_guard = Some(FeishuAdapterProcess { child, writer });
+
+    Ok(status)
+}
+
+#[tauri::command]
+fn stop_feishu_adapter(
+    app: AppHandle,
+    state: State<FeishuAdapterManager>,
+) -> Result<FeishuAdapterStatus, String> {
+    let mut process_guard = state
+        .process
+        .lock()
+        .map_err(|_| "无法停止飞书适配器：状态锁已损坏".to_string())?;
+    if let Some(mut process) = process_guard.take() {
+        process.shutdown();
+    }
+    let status = set_feishu_status(&state.status, "stopped", false, "飞书适配器已停止。", None);
+    let _ = app.emit("feishu-adapter-event", json!({
+        "type": "status",
+        "adapter": "feishu",
+        "status": status.status,
+        "running": status.running,
+        "message": status.message,
+        "timestamp": status.updated_at,
+    }));
+    Ok(status)
+}
+
+#[tauri::command]
+fn send_feishu_message(
+    state: State<FeishuAdapterManager>,
+    chat_id: String,
+    text: String,
+    user_id: Option<String>,
+    open_id: Option<String>,
+    message_id: Option<String>,
+) -> Result<(), String> {
+    let process_guard = state
+        .process
+        .lock()
+        .map_err(|_| "无法发送飞书消息：状态锁已损坏".to_string())?;
+    let process = process_guard
+        .as_ref()
+        .ok_or_else(|| "飞书适配器尚未启动".to_string())?;
+    write_feishu_sidecar_command(&process.writer, json!({
+        "type": "send_text",
+        "chatId": chat_id,
+        "userId": user_id,
+        "openId": open_id,
+        "messageId": message_id,
+        "text": text,
+    }))
+}
+
+#[tauri::command]
+async fn test_feishu_adapter_connection(
+    app_id: String,
+    app_secret: String,
+    domain: Option<String>,
+) -> Result<String, String> {
+    let app_id = app_id.trim().to_string();
+    if app_id.is_empty() || app_secret.trim().is_empty() {
+        return Err("请先填写飞书 App ID 和 App Secret".to_string());
+    }
+    let url = format!(
+        "{}/open-apis/auth/v3/tenant_access_token/internal",
+        sanitize_feishu_domain(domain),
+    );
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(HTTP_SHORT_TIMEOUT_SECS))
+        .connect_timeout(Duration::from_secs(HTTP_CONNECT_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| format!("创建飞书测试客户端失败: {e}"))?;
+    let body = json!({
+        "app_id": app_id,
+        "app_secret": app_secret,
+    })
+    .to_string();
+    let response = client
+        .post(url)
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| format!("飞书连接测试失败: {e}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("读取飞书连接测试响应失败: {e}"))?;
+    let parsed = serde_json::from_str::<Value>(&body).unwrap_or_else(|_| json!({}));
+    let code = parsed.get("code").and_then(Value::as_i64).unwrap_or(-1);
+    if status.is_success() && code == 0 {
+        Ok("飞书凭据验证成功，长连接可在开启后建立。".to_string())
+    } else {
+        let message = parsed
+            .get("msg")
+            .and_then(Value::as_str)
+            .unwrap_or("飞书返回非成功状态");
+        Err(format!("飞书凭据验证失败: {message}"))
+    }
+}
+
+// endregion
+
 // region: 应用启动
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -2830,6 +3546,7 @@ pub fn run() {
     tauri::Builder::default()
         .manage(WorkspaceState::new(workspace_root))
         .manage(PtyManager::default())
+        .manage(FeishuAdapterManager::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
@@ -2873,7 +3590,13 @@ pub fn run() {
             delete_workspace_path,
             delete_chat_temp_path,
             run_hook_command,
-            delete_plan_files
+            delete_plan_files,
+            start_feishu_adapter,
+            stop_feishu_adapter,
+            get_feishu_adapter_status,
+            get_feishu_node_runtime_status,
+            send_feishu_message,
+            test_feishu_adapter_connection
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

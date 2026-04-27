@@ -49,6 +49,23 @@ export interface PlanTask {
   status: PlanTaskStatus;
   requirementRef?: string;
   commands?: string[];
+  retained?: boolean;
+}
+
+export interface PlanArtifactValidationResult {
+  ok: boolean;
+  reason?: string;
+}
+
+export interface ChangeEntry {
+  taskId: number;
+  target: string;
+  displayTarget: string;
+  added: number;
+  removed: number;
+  editCount: number;
+  order: number;
+  isPlanFile: boolean;
 }
 
 export interface ReplyOption {
@@ -160,7 +177,24 @@ export function looksLikeReasoningLeakTitle(input: string): boolean {
  * 将用户原始输入整理成适合回合标题展示的短标题。
  */
 export function summarizeUserPrompt(prompt: string, maxLength = 44): string {
-  return normalizeConversationDisplayTitle(prompt, maxLength, "新的任务");
+  const stripped = String(prompt || "")
+    .replace(/^\/[^\s]+\s*/u, "")
+    .replace(/^(?:请|帮我|麻烦|please)\s*/i, "")
+    .replace(/^你是[^，。.!?]{2,80}[，,]\s*/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (/(?:CTB|回合制).*(?:战斗|Battle)|(?:战斗|Battle).*(?:CTB|回合制)/i.test(stripped)) {
+    return maxLength <= 18 ? "CTB 战斗框架" : "实现 CTB 战斗框架";
+  }
+  if (/(?:sidebar|侧边栏|会话).*(?:标题|title)|(?:标题|title).*(?:sidebar|侧边栏|会话)/i.test(stripped)) {
+    return maxLength <= 18 ? "会话标题优化" : "优化会话标题";
+  }
+  if (/(?:计划|plan).*(?:审批|批准|approval)|(?:审批|批准|approval).*(?:计划|plan)/i.test(stripped)) {
+    return maxLength <= 18 ? "计划审批流程" : "修复计划审批流程";
+  }
+
+  return normalizeConversationDisplayTitle(stripped || prompt, maxLength, "新的任务");
 }
 
 /**
@@ -334,6 +368,34 @@ export function extractShellCommandsFromText(text: string): string[] {
   return commands;
 }
 
+function hashStringStable(input: string): string {
+  let hash = 2166136261;
+  for (let index = 0; index < input.length; index += 1) {
+    hash ^= input.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function normalizePlanTaskText(text: string): string {
+  return String(text || "")
+    .replace(/\s*→\s*对应需求[:：]?\s*REQ-[A-Za-z0-9_-]+/i, "")
+    .replace(/^\s*(?:任务\s*)?\d+\s*[.、):：-]\s*/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function getPlanTaskIdentity(task: Pick<PlanTask, "text" | "requirementRef">): string {
+  const normalizedText = normalizePlanTaskText(task.text).toLowerCase();
+  return task.requirementRef
+    ? `req:${task.requirementRef.toLowerCase()}:${hashStringStable(normalizedText).slice(0, 8)}`
+    : `text:${hashStringStable(normalizedText)}`;
+}
+
+export function createPlanTaskId(text: string, requirementRef?: string): string {
+  return `plan-task-${getPlanTaskIdentity({ text, requirementRef }).replace(/[^a-z0-9_-]+/gi, "-")}`;
+}
+
 export function getPendingPlanTaskCommandFocus(
   tasks: PlanTask[],
   maxTasks = 3,
@@ -369,7 +431,7 @@ export function extractPlanTasks(markdown: string): PlanTask[] {
     const commands = extractShellCommandsFromText(rawText);
 
     tasks.push({
-      id: `plan-task-${tasks.length + 1}`,
+      id: createPlanTaskId(text, requirementMatched?.[0]),
       text,
       status: matched[1].toLowerCase() === "x" ? "completed" : "pending",
       ...(requirementMatched ? { requirementRef: requirementMatched[0] } : {}),
@@ -378,6 +440,162 @@ export function extractPlanTasks(markdown: string): PlanTask[] {
   }
 
   return tasks;
+}
+
+function mergePlanTaskStatus(previous: PlanTask | undefined, next: PlanTask): PlanTaskStatus {
+  if (!previous) return next.status;
+  if (previous.status === "completed") return "completed";
+  if (next.status === "completed") return "completed";
+  if (previous.status === "in_progress" && next.status === "pending") return "in_progress";
+  return next.status;
+}
+
+export function mergePlanTasks(
+  previousTasks: PlanTask[],
+  parsedTasks: PlanTask[],
+  preserveMissing = true,
+): PlanTask[] {
+  if (!previousTasks.length) return parsedTasks;
+  if (!parsedTasks.length) return preserveMissing ? previousTasks.map((task) => ({ ...task, retained: true })) : [];
+
+  const previousById = new Map(previousTasks.map((task) => [task.id, task]));
+  const previousByIdentity = new Map(previousTasks.map((task) => [getPlanTaskIdentity(task), task]));
+  const usedPreviousIds = new Set<string>();
+
+  const merged = parsedTasks.map((task) => {
+    const previous = previousById.get(task.id) || previousByIdentity.get(getPlanTaskIdentity(task));
+    if (previous) usedPreviousIds.add(previous.id);
+    return {
+      ...task,
+      id: previous?.id || task.id,
+      status: mergePlanTaskStatus(previous, task),
+      retained: false,
+    };
+  });
+
+  if (!preserveMissing) return merged;
+
+  for (const previous of previousTasks) {
+    if (usedPreviousIds.has(previous.id)) continue;
+    merged.push({
+      ...previous,
+      retained: true,
+    });
+  }
+
+  return merged;
+}
+
+export function findDroppedPlanTasks(previousTasks: PlanTask[], parsedTasks: PlanTask[]): PlanTask[] {
+  if (!previousTasks.length) return [];
+  if (!parsedTasks.length) return previousTasks;
+  const parsedIds = new Set(parsedTasks.map((task) => task.id));
+  const parsedIdentities = new Set(parsedTasks.map((task) => getPlanTaskIdentity(task)));
+  return previousTasks.filter((task) => !parsedIds.has(task.id) && !parsedIdentities.has(getPlanTaskIdentity(task)));
+}
+
+const PLAN_ARTIFACT_NOISE_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
+  { pattern: /自动生成的兜底草稿|Auto-generated fallback draft|MAIN\s+将可用输出收束|condensed the usable output/i, reason: "fallback_notice" },
+  { pattern: /Repeated read-only tool call skipped|Duplicate skip count|FILE_UNCHANGED_STUB|already called with identical arguments/i, reason: "tool_log" },
+  { pattern: /后台思考已折叠|thinking process|chain of thought|<\/thinking>|<\/analysis>|让我(?:先|再)|但是等等|我认为/i, reason: "reasoning_leak" },
+  { pattern: /回复被截断|maximum token|max token|finish_reason.*length/i, reason: "truncation_log" },
+  { pattern: /\busing\s+System\s*;|namespace\s+[A-Za-z0-9_.]+\s*\{|public\s+(?:class|enum|struct|interface)\s+[A-Za-z0-9_]+/i, reason: "raw_source_code" },
+];
+
+function hasMeaningfulPlanSections(content: string, kind: PlanArtifactKind): boolean {
+  const normalized = content.replace(/\s+/g, " ").trim();
+  if (normalized.length < 120) return false;
+  if (kind === "requirements") {
+    return /(用户目标|目标|需求|范围|交付|验收|User Goal|Requirements|Scope|Deliverables|Acceptance)/i.test(content);
+  }
+  if (kind === "design") {
+    return /(设计|方案|执行|影响文件|数据流|验证|Approach|Design|Execution|Files|Validation)/i.test(content);
+  }
+  if (kind === "bugfix") {
+    return /(现象|根因|修复|影响范围|验证|Symptom|Root Cause|Fix|Validation)/i.test(content);
+  }
+  return true;
+}
+
+export function validatePlanArtifactContent(
+  content: string,
+  kind: PlanArtifactKind,
+): PlanArtifactValidationResult {
+  if (kind === "tasks" || kind === "summary") return { ok: true };
+
+  const raw = String(content || "").trim();
+  if (!raw) return { ok: false, reason: "empty" };
+
+  for (const entry of PLAN_ARTIFACT_NOISE_PATTERNS) {
+    if (entry.pattern.test(raw)) {
+      return { ok: false, reason: entry.reason };
+    }
+  }
+
+  if (!hasMeaningfulPlanSections(raw, kind)) {
+    return { ok: false, reason: "missing_plan_sections" };
+  }
+
+  return { ok: true };
+}
+
+export function collectChangeEntries(
+  blocks: Array<{
+    id: number;
+    type: string;
+    toolName?: string;
+    toolStatus?: string;
+    target?: string;
+    diff?: { old: string; new: string; path?: string };
+  }>,
+  getStats: (oldText: string, newText: string) => { added: number; removed: number },
+): { entries: ChangeEntry[]; totalExecutedEdits: number } {
+  const entries: ChangeEntry[] = [];
+  const indexByTarget = new Map<string, number>();
+  let totalExecutedEdits = 0;
+
+  blocks.forEach((block, order) => {
+    if (block.type !== "tool" || block.toolStatus !== "executed" || !block.diff) return;
+    if (block.toolName !== "write_file" && block.toolName !== "replace_in_file") return;
+
+    totalExecutedEdits++;
+    const target = String(block.target || block.diff.path || block.toolName || "");
+    const displayTarget = target.split("/").pop() || target;
+    const stats = getStats(block.diff.old, block.diff.new);
+    const existingIndex = indexByTarget.get(target);
+
+    if (existingIndex == null) {
+      indexByTarget.set(target, entries.length);
+      entries.push({
+        taskId: block.id,
+        target,
+        displayTarget,
+        added: stats.added,
+        removed: stats.removed,
+        editCount: 1,
+        order,
+        isPlanFile: target.replace(/\\/g, "/").toLowerCase().includes(".main/plans/"),
+      });
+      return;
+    }
+
+    entries[existingIndex] = {
+      ...entries[existingIndex],
+      taskId: block.id,
+      added: stats.added,
+      removed: stats.removed,
+      editCount: entries[existingIndex].editCount + 1,
+      order,
+    };
+  });
+
+  return {
+    entries: entries.sort((a, b) => {
+      if (a.isPlanFile !== b.isPlanFile) return a.isPlanFile ? 1 : -1;
+      return a.order - b.order;
+    }),
+    totalExecutedEdits,
+  };
 }
 
 /**

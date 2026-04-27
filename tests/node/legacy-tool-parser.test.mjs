@@ -42,3 +42,20 @@ test("legacy tool tags are removed from visible text after parsing and sanitizin
   assert.match(visibleText, /我先查看一下目录内容/);
   assert.doesNotMatch(visibleText, /execute_command|list_directory path=/);
 });
+
+test("parses local-model function-style tool calls", () => {
+  const skeleton = parseTextForTools("get_project_skeleton()");
+  assert.equal(skeleton.toolCalls.length, 1);
+  assert.equal(skeleton.toolCalls[0].name, "get_project_skeleton");
+  assert.deepEqual(skeleton.toolCalls[0].arguments, {});
+  assert.equal(skeleton.cleanText, "");
+
+  const readFile = parseTextForTools('read_file(path="Assets/Scripts/BattleManager.cs", maxBytes=4096)');
+  assert.equal(readFile.toolCalls.length, 1);
+  assert.equal(readFile.toolCalls[0].name, "read_file");
+  assert.deepEqual(readFile.toolCalls[0].arguments, {
+    path: "Assets/Scripts/BattleManager.cs",
+    maxBytes: 4096,
+  });
+  assert.equal(readFile.cleanText, "");
+});

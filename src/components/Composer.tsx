@@ -8,7 +8,7 @@ import { useAppStore } from "../store/useAppStore";
 import type { AgentMessage, ContentPart } from "../lib/orchestrator";
 import { getGameStudioSlashCatalog } from "../lib/gameStudioPack";
 import { humanizeSlug } from "../lib/gameStudioCatalog";
-import { getMainIntentShortcuts, getRunIntentLabel, parseMainIntentShortcut, resolveTurnRunIntent } from "../lib/runIntent";
+import { getIntentPolicy, getMainIntentShortcuts, getRunIntentCategoryLabel, getRunIntentLabel, parseMainIntentShortcut, resolveTurnRunIntent } from "../lib/runIntent";
 import {
   resolveGameStudioOnboardingAction,
   shouldShowGameStudioOnboarding,
@@ -16,18 +16,20 @@ import {
 
 // ── ContextRing SVG Component ──────────────────────────────────────────
 
-function ContextRing({ percentage }: { percentage: number }) {
+function ContextRing({ percentage, themeMode }: { percentage: number; themeMode: "light" | "dark" }) {
   const r = 6;
   const circumference = 2 * Math.PI * r;
   const offset = circumference * (1 - Math.min(percentage, 100) / 100);
+  const isLightTheme = themeMode === "light";
+  const track = isLightTheme ? "#d4d4d8" : "#27272a";
 
-  let stroke = "#71717a";
-  if (percentage > 90) stroke = "#ef4444";
-  else if (percentage >= 75) stroke = "#eab308";
+  let stroke = isLightTheme ? "#2563eb" : "#a1a1aa";
+  if (percentage > 90) stroke = isLightTheme ? "#dc2626" : "#ef4444";
+  else if (percentage >= 75) stroke = isLightTheme ? "#b45309" : "#eab308";
 
   return (
     <svg viewBox="0 0 16 16" className="w-3.5 h-3.5">
-      <circle cx="8" cy="8" r={r} stroke="#27272a" strokeWidth="2" fill="none" />
+      <circle cx="8" cy="8" r={r} stroke={track} strokeWidth="2" fill="none" />
       <circle
         cx="8" cy="8" r={r}
         stroke={stroke}
@@ -213,10 +215,12 @@ export default function Composer({
   const slashEmptyLabel = language === "en" ? "No matching commands or agents" : "没有匹配的命令或 Agent";
   const slashHint = language === "en" ? "Select to insert canonical command" : "选择后会插入标准命令";
   const mainIntentSearchLabel = slashQuery
-    ? (language === "en" ? `Intent: ${slashQuery}` : `意图：${slashQuery}`)
-    : (language === "en" ? "Type / to choose Plan, Report, Analyze..." : "输入 / 选择计划、报告、分析等意图");
-  const mainIntentEmptyLabel = language === "en" ? "No matching intents" : "没有匹配的意图";
-  const mainIntentHint = language === "en" ? "Select to lock this turn intent" : "选择后锁定本轮意图";
+    ? (language === "en" ? `Shortcut: ${slashQuery}` : `快捷入口：${slashQuery}`)
+    : (language === "en" ? "Type / to choose workflow modes or output styles" : "输入 / 选择流程模式或输出方式");
+  const mainIntentEmptyLabel = language === "en" ? "No matching shortcuts" : "没有匹配的快捷入口";
+  const mainIntentHint = language === "en"
+    ? "Workflow modes change execution; output styles only shape the answer"
+    : "流程模式会改变执行边界；输出方式只改变回答格式";
   const studioWorkflowHeading = language === "en" ? "Workflow Commands" : "工作流命令";
   const studioAgentHeading = language === "en" ? "Specialist Agents" : "专业 Agent";
   const workflowKindLabel = language === "en" ? "workflow" : "工作流";
@@ -279,8 +283,14 @@ export default function Composer({
   const suggestedComposerIntentLabel = suggestedComposerIntent
     ? getRunIntentLabel(suggestedComposerIntent, language === "en" ? "en" : "zh")
     : null;
+  const suggestedComposerIntentIsOutputStyle = suggestedComposerIntent
+    ? getIntentPolicy(suggestedComposerIntent).uiCategory === "output_style"
+    : false;
   const lockedComposerIntentLabel = lockedComposerIntent
     ? getRunIntentLabel(lockedComposerIntent, language === "en" ? "en" : "zh")
+    : null;
+  const lockedComposerIntentCategoryLabel = lockedComposerIntent
+    ? getRunIntentCategoryLabel(lockedComposerIntent, language === "en" ? "en" : "zh")
     : null;
   const showStudioOnboarding = shouldShowGameStudioOnboarding({
     isGameStudioMode,
@@ -553,7 +563,8 @@ export default function Composer({
     if (isMainMode) {
       return mainIntentShortcuts.filter((item) => {
         if (!normalizedQuery) return true;
-        const haystacks = [item.label, item.command, item.description, ...(item.aliases || [])]
+        const categoryLabel = getRunIntentCategoryLabel(item.intent, language === "en" ? "en" : "zh");
+        const haystacks = [item.label, item.command, item.description, categoryLabel, ...(item.aliases || [])]
           .join(" ")
           .toLowerCase();
         return haystacks.includes(normalizedQuery);
@@ -580,10 +591,21 @@ export default function Composer({
     const groups = [];
     if (isMainMode) {
       if (filteredSlashItems.length > 0) {
+        const workflowItems = filteredSlashItems.filter((item) => getIntentPolicy(item.intent).uiCategory === "workflow_mode");
+        const outputItems = filteredSlashItems.filter((item) => getIntentPolicy(item.intent).uiCategory === "output_style");
+        const otherItems = filteredSlashItems.filter((item) => {
+          const category = getIntentPolicy(item.intent).uiCategory;
+          return category !== "workflow_mode" && category !== "output_style";
+        });
+        const mainGroups = [
+          workflowItems.length > 0 ? [language === "en" ? "Workflow Modes" : "流程模式", workflowItems] : null,
+          outputItems.length > 0 ? [language === "en" ? "Output Styles" : "输出方式", outputItems] : null,
+          otherItems.length > 0 ? [language === "en" ? "Other" : "其他", otherItems] : null,
+        ].filter(Boolean);
         groups.push({
           kind: "main_intent",
-          heading: language === "en" ? "MAIN Intent Shortcuts" : "MAIN 意图快捷入口",
-          groups: [[language === "en" ? "Intent" : "意图", filteredSlashItems]],
+          heading: language === "en" ? "MAIN Shortcuts" : "MAIN 快捷入口",
+          groups: mainGroups,
         });
       }
       return groups;
@@ -1230,7 +1252,11 @@ export default function Composer({
           <div className="relative z-30 mb-2 flex justify-center px-3">
             <div className="flex max-w-full items-center justify-between gap-3 rounded-full border border-[#27272a] bg-[#050507] px-3 py-2 text-[11px] text-[#d4d4d8] shadow-2xl">
               <span className="truncate">
-                {language === "en" ? "Use" : "使用"} <span className="font-semibold" style={{ color: "var(--accent-light)" }}>{suggestedComposerIntentLabel}</span> {language === "en" ? "mode for this turn?" : "模式处理本轮请求？"}
+                {language === "en" ? "Use" : "使用"} <span className="font-semibold" style={{ color: "var(--accent-light)" }}>{suggestedComposerIntentLabel}</span>
+                {" "}
+                {suggestedComposerIntentIsOutputStyle
+                  ? (language === "en" ? "output style for this turn?" : "输出方式处理本轮请求？")
+                  : (language === "en" ? "workflow mode for this turn?" : "流程模式处理本轮请求？")}
               </span>
               <div className="flex shrink-0 items-center gap-2">
                 <button
@@ -1377,39 +1403,48 @@ export default function Composer({
                 <div className="p-2 border-b border-[#27272a] flex items-center gap-2 text-[#e4e4e7] bg-[#000000]">
                   <IconCode className="w-3.5 h-3.5" style={{ color: "var(--accent)" }} />
                   <span className="text-[11px] text-[#a1a1aa] truncate">{mainIntentSearchLabel}</span>
-                  <span className="ml-auto text-[10px] text-[#52525b]">{language === "en" ? "MAIN Intent" : "MAIN 意图"}</span>
+                  <span className="ml-auto text-[10px] text-[#52525b]">{language === "en" ? "MAIN Shortcut" : "MAIN 快捷入口"}</span>
                 </div>
 
                 <div className="max-h-64 overflow-y-auto px-2 py-2">
                   {filteredSlashItems.length === 0 ? (
                     <div className="px-3 py-4 text-[11px] text-[#a1a1aa] text-center">{mainIntentEmptyLabel}</div>
                   ) : (
-                    filteredSlashItems.map((item, index) => {
-                      const isActive = index === highlightedSlashIndex;
-                      return (
-                        <button
-                          key={item.intent}
-                          onClick={() => handleSelectMainIntentShortcut(item)}
-                          className={`w-full rounded-md px-3 py-2 text-left transition-colors ${
-                            isActive ? "bg-[#18181b]" : "hover:bg-[#131316]"
-                          }`}
-                        >
-                          <div className="flex items-center justify-between gap-3">
-                            <div className="min-w-0">
-                              <div className="text-[12px] font-semibold text-[#f4f4f5] truncate">
-                                {item.command} · {item.label}
+                    (groupedSlashItems[0]?.groups || []).map(([groupName, items]) => (
+                      <div key={groupName} className="py-1">
+                        <div className="px-3 pb-1 pt-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-[#52525b]">
+                          {groupName}
+                        </div>
+                        {items.map((item) => {
+                          const index = filteredSlashItems.findIndex((candidate) => candidate.intent === item.intent);
+                          const isActive = index === highlightedSlashIndex;
+                          const categoryLabel = getRunIntentCategoryLabel(item.intent, language === "en" ? "en" : "zh");
+                          return (
+                            <button
+                              key={item.intent}
+                              onClick={() => handleSelectMainIntentShortcut(item)}
+                              className={`w-full rounded-md px-3 py-2 text-left transition-colors ${
+                                isActive ? "bg-[#18181b]" : "hover:bg-[#131316]"
+                              }`}
+                            >
+                              <div className="flex items-center justify-between gap-3">
+                                <div className="min-w-0">
+                                  <div className="text-[12px] font-semibold text-[#f4f4f5] truncate">
+                                    {item.command} · {item.label}
+                                  </div>
+                                  <div className="mt-0.5 text-[11px] leading-snug text-[#71717a]">
+                                    {item.description}
+                                  </div>
+                                </div>
+                                <div className="shrink-0 rounded-full border border-[#27272a] bg-[#050507] px-2 py-0.5 text-[10px] text-[#a1a1aa]">
+                                  {categoryLabel}
+                                </div>
                               </div>
-                              <div className="mt-0.5 text-[11px] leading-snug text-[#71717a]">
-                                {item.description}
-                              </div>
-                            </div>
-                            <div className="shrink-0 rounded-full border border-[#27272a] bg-[#050507] px-2 py-0.5 text-[10px] text-[#a1a1aa]">
-                              {language === "en" ? "intent" : "意图"}
-                            </div>
-                          </div>
-                        </button>
-                      );
-                    })
+                            </button>
+                          );
+                        })}
+                      </div>
+                    ))
                   )}
                 </div>
 
@@ -1504,7 +1539,7 @@ export default function Composer({
                   </div>
                 ) : (
                   <div className="flex items-center gap-1.5 ml-0.5" title={`${currentTokens} / ${contextLimit} Tokens`}>
-                    <ContextRing percentage={usagePercent} />
+                    <ContextRing percentage={usagePercent} themeMode={themeMode} />
                     <span>{usagePercent.toFixed(1)}%</span>
                   </div>
                 )}
@@ -1629,7 +1664,9 @@ export default function Composer({
                   style={{ borderColor: "var(--accent-subtle-border)", backgroundColor: "var(--accent-subtle)", color: isLightTheme ? "var(--accent-hover)" : "var(--accent-light)" }}
                   title={language === "en" ? "Click to remove intent" : "点击取消意图胶囊"}
                 >
-                  {lockedComposerIntentLabel} <span className="ml-1">×</span>
+                  {lockedComposerIntentLabel}
+                  {lockedComposerIntentCategoryLabel ? <span className="ml-1 opacity-70">· {lockedComposerIntentCategoryLabel}</span> : null}
+                  <span className="ml-1">×</span>
                 </button>
               )}
 

@@ -24,6 +24,7 @@ import {
 import { buildToolDefinitions, skillNameToToolName, type ToolDefinition } from "./toolSchemas";
 import { executeTool, isReadOnlyTool } from "./toolExecutor";
 import { computeContextBudgets, estimateTokens, manageContext } from "./contextTrim";
+import { clampContextLimitToReported } from "./contextWindow";
 import { generateId } from "./utils";
 import { buildSystemPrompt } from "./systemPrompt";
 import { discoverAllMcpTools, setMcpToolServerMap, type MCPServer, type MCPTool } from "./mcpClient";
@@ -34,7 +35,15 @@ import { serializeAssistantReplyForHistory, shouldPauseForReplyOptions } from ".
 import { buildToolDiffPreview, type ToolDiffPreview } from "./toolDiff";
 import { syncPlanArtifactAfterToolSuccess } from "./planArtifactSync";
 import type { AppConfig, Skill } from "../store/useAppStore";
-import { getPendingPlanTaskCommandFocus, type PlanArtifactKind, type PlanTask, type ReplyOption } from "./workflowModels";
+import {
+  detectPlanArtifactKind,
+  extractPlanTasks,
+  findDroppedPlanTasks,
+  getPendingPlanTaskCommandFocus,
+  validatePlanArtifactContent,
+  type PlanTask,
+  type ReplyOption,
+} from "./workflowModels";
 import type { MainModeKey } from "./mainModes";
 import type { ResolvedUserIntent } from "./runIntent";
 import {
@@ -74,22 +83,38 @@ import {
 
 // ── Spec file auto-approval helpers ────────────────────────────────
 
-const SPEC_FILE_NAMES = new Set(["requirements.md", "design.md", "tasks.md", "bugfix.md"]);
+const PRE_APPROVAL_PLAN_FILE_NAMES = new Set(["requirements.md", "design.md", "bugfix.md"]);
+const EXECUTION_PLAN_FILE_NAMES = new Set(["requirements.md", "design.md", "tasks.md", "bugfix.md"]);
+const PLAN_ARTIFACT_MUTATION_TOOLS = new Set(["write_file", "replace_in_file"]);
+const PLAN_REPEAT_READ_LIMIT = 3;
 
 /**
- * Returns true if a write_file call targets a spec file inside `.MAIN/plans/`.
- * These are auto-approved in Plan Mode — no user review required.
+ * Returns true if a mutation targets a spec file inside `.MAIN/plans/`.
+ * These are auto-executed in Plan Mode, but the allowed file set depends
+ * on the current plan stage.
  */
-function isSpecFileWrite(name: string, args: Record<string, unknown>): boolean {
-  if (name !== "write_file") return false;
+function getPlanArtifactMutationTarget(name: string, args: Record<string, unknown>): { path: string; fileName: string } | null {
+  if (!PLAN_ARTIFACT_MUTATION_TOOLS.has(name)) return null;
   const path = (args.path as string) || "";
   const normalized = path.replace(/\\/g, "/");
-  // Match both `.MAIN/plans/requirements.md` and absolute paths containing it
-  if (normalized.includes(".MAIN/plans/")) {
-    const fileName = normalized.split("/").pop() || "";
-    return SPEC_FILE_NAMES.has(fileName);
-  }
-  return false;
+  if (!normalized.toLowerCase().includes(".main/plans/")) return null;
+  const fileName = normalized.split("/").pop() || "";
+  return fileName ? { path, fileName } : null;
+}
+
+function isPreApprovalPlanDraftWrite(name: string, args: Record<string, unknown>): boolean {
+  const target = getPlanArtifactMutationTarget(name, args);
+  return !!target && PRE_APPROVAL_PLAN_FILE_NAMES.has(target.fileName);
+}
+
+function isExecutionPlanArtifactWrite(name: string, args: Record<string, unknown>): boolean {
+  const target = getPlanArtifactMutationTarget(name, args);
+  return !!target && EXECUTION_PLAN_FILE_NAMES.has(target.fileName);
+}
+
+function isTasksPlanWrite(name: string, args: Record<string, unknown>): boolean {
+  const target = getPlanArtifactMutationTarget(name, args);
+  return !!target && target.fileName === "tasks.md";
 }
 
 // ── Tool argument validation ────────────────────────────────────────
@@ -291,6 +316,7 @@ function getToolTarget(name: string, args: Record<string, unknown>): string {
     case "get_pty_status":  return "terminal status";
     case "clear_pty_buffer": return "terminal buffer";
     case "replace_in_file": return (args.path as string) || "";
+    case "write_file":      return (args.path as string) || "";
     default:                return (args.input as string) || name;
   }
 }
@@ -368,8 +394,8 @@ function buildNonActionableStopMessage(language: "zh" | "en", reason: "no_output
 function buildPlanFallbackNotice(language: "zh" | "en", sourceChars: number): string {
   const formatted = sourceChars.toLocaleString();
   return language === "zh"
-    ? `模型刚才输出了约 ${formatted} 个字符的规划正文，但没有生成可审批的计划文件。MAIN 已把可用内容收束为右侧计划草稿，并写入 \`.MAIN/plans/requirements.md\` 与 \`.MAIN/plans/design.md\`，请在计划面板审阅后再批准执行。`
-    : `The model produced about ${formatted} characters of planning text but did not create reviewable plan files. MAIN condensed the usable content into the Plan panel and wrote \`.MAIN/plans/requirements.md\` plus \`.MAIN/plans/design.md\`; review them before approving execution.`;
+    ? `模型刚才输出了约 ${formatted} 个字符的规划正文，但没有生成可审批的计划文件。MAIN 会要求模型重新收敛为真实需求规格和执行方案，或先用可点击选项向你确认关键分叉；不会把工具日志或截断内容强行写成计划。`
+    : `The model produced about ${formatted} characters of planning text but did not create reviewable plan files. MAIN will ask it to regenerate real requirements/design or ask you for the key decision first; tool logs and truncated text will not be forced into plan files.`;
 }
 
 function stripControlPromptForPlanFallback(text: string): string {
@@ -396,6 +422,62 @@ function getOriginalUserPromptForPlanFallback(callbacks: OrchestratorCallbacks):
     .map((message) => stripControlPromptForPlanFallback(extractCompatibilityTextContent(message.content)))
     .filter(Boolean);
   return userMessages.find((text) => !isPlanControlUserPrompt(text)) || userMessages[0] || "";
+}
+
+function detectRequestedRootMarkdownDeliverables(text: string): string[] {
+  const source = String(text || "");
+  const hasRootHint = /(?:根目录|项目根目录|当前项目|workspace root|project root|root directory)/i.test(source);
+  const matches = Array.from(source.matchAll(/(?:^|[^\w./-])([A-Za-z][\w.-]*\.md|README\.md|Readme\.md|readme\.md)(?=$|[^\w./-])/g))
+    .map((match) => match[1])
+    .filter(Boolean);
+  const normalized = matches
+    .map((name) => name.replace(/^readme\.md$/i, "Readme.md"))
+    .filter((name) => !/^(?:requirements|design|tasks|bugfix)\.md$/i.test(name));
+
+  if (normalized.length === 0 && hasRootHint && /(?:md\s*文档|markdown|说明文档|总结.*文档|Readme|README)/i.test(source)) {
+    normalized.push("Readme.md");
+  }
+
+  return [...new Set(normalized)];
+}
+
+function collectFallbackToolHighlights(callbacks: OrchestratorCallbacks, attemptedTargets: string[] = []): string[] {
+  const highlights: string[] = [];
+  const seen = new Set<string>();
+  const add = (value: string) => {
+    const clean = stripControlPromptForPlanFallback(value)
+      .replace(/[#>*_`~]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!clean) return;
+    const shortened = clean.length > 180 ? `${clean.slice(0, 180).trim()}...` : clean;
+    const key = shortened.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    highlights.push(shortened);
+  };
+
+  attemptedTargets.forEach((target) => add(`模型曾尝试修改：${target}`));
+
+  for (const message of callbacks.getMessages()) {
+    if (message.role === "assistant" && Array.isArray(message.tool_calls)) {
+      for (const call of message.tool_calls) {
+        try {
+          const parsed = JSON.parse(call.function.arguments || "{}");
+          const target = getToolTarget(call.function.name, parsed);
+          if (target) add(`已规划/尝试工具：${call.function.name} -> ${target}`);
+        } catch {
+          // Ignore malformed historical calls; they are not useful for fallback planning.
+        }
+      }
+    }
+    if (message.role === "tool") {
+      add(extractCompatibilityTextContent(message.content));
+    }
+    if (highlights.length >= 10) break;
+  }
+
+  return highlights.slice(0, 10);
 }
 
 function collectFallbackPlanBullets(sourceText: string, fallbackPrompt: string, maxBullets = 8): string[] {
@@ -430,139 +512,50 @@ function collectFallbackPlanBullets(sourceText: string, fallbackPrompt: string, 
     : [];
 }
 
-function buildFallbackPlanArtifacts(language: "zh" | "en", userPrompt: string, sourceText: string): Array<{
-  kind: Exclude<PlanArtifactKind, "summary" | "tasks">;
-  path: string;
-  content: string;
-}> {
-  const bullets = collectFallbackPlanBullets(sourceText, userPrompt);
-  const bulletText = bullets.length > 0
-    ? bullets.map((item) => `- ${item}`).join("\n")
-    : language === "zh"
-      ? "- 需要先根据用户目标收束范围，再进入分步执行。"
-      : "- First narrow the scope from the user's goal, then execute in small steps.";
-  const promptLine = stripControlPromptForPlanFallback(userPrompt);
+function buildPlanRecoveryPrompt(callbacks: OrchestratorCallbacks, sourceText: string, attemptedTargets: string[] = []): string {
+  const language = callbacks.getPreferredLanguage();
+  const userPrompt = getOriginalUserPromptForPlanFallback(callbacks);
+  const toolHighlights = collectFallbackToolHighlights(callbacks, attemptedTargets)
+    .filter((item) => !/Repeated read-only tool call skipped|Duplicate skip count|already called with identical arguments/i.test(item))
+    .slice(0, 6);
+  const bullets = collectFallbackPlanBullets(sourceText, userPrompt, 6);
+  const contextSummary = [
+    userPrompt ? (language === "zh" ? `用户原始目标：${userPrompt}` : `Original user goal: ${userPrompt}`) : "",
+    bullets.length > 0
+      ? (language === "zh" ? `可用规划要点：\n${bullets.map((item) => `- ${item}`).join("\n")}` : `Useful planning points:\n${bullets.map((item) => `- ${item}`).join("\n")}`)
+      : "",
+    toolHighlights.length > 0
+      ? (language === "zh" ? `已读取/尝试的上下文：\n${toolHighlights.map((item) => `- ${item}`).join("\n")}` : `Context already read/tried:\n${toolHighlights.map((item) => `- ${item}`).join("\n")}`)
+      : "",
+  ].filter(Boolean).join("\n\n");
 
   if (language === "en") {
     return [
-      {
-        kind: "requirements",
-        path: ".MAIN/plans/requirements.md",
-        content: [
-          "# Requirements",
-          "",
-          "> Auto-generated fallback draft: the model inspected context but did not create plan files, so MAIN condensed the usable output for review.",
-          "",
-          "## User Goal",
-          promptLine ? `- ${promptLine}` : "- Continue from the current user request.",
-          "",
-          "## Scope",
-          bulletText,
-          "",
-          "## Acceptance Criteria",
-          "- [ ] The approved plan is split into small execution tasks before source files are changed.",
-          "- [ ] Generated code is written to real workspace files, not only shown in chat.",
-          "- [ ] Each completed step has visible tool/file evidence.",
-        ].join("\n"),
-      },
-      {
-        kind: "design",
-        path: ".MAIN/plans/design.md",
-        content: [
-          "# Design",
-          "",
-          "> Auto-generated fallback draft for review. Edit or regenerate before approving if the scope is wrong.",
-          "",
-          "## Proposed Approach",
-          bulletText,
-          "",
-          "## Execution Strategy",
-          "- After approval, create `.MAIN/plans/tasks.md` with 8-20 concise checkboxes.",
-          "- Execute one small batch at a time and write real files with `write_file` / `replace_in_file`.",
-          "- Keep generated source files out of `.MAIN/plans/` and other hidden folders.",
-          "",
-          "## Validation",
-          "- Run the relevant build/tests when available.",
-          "- Report changed files, verification, and residual risk before ending.",
-        ].join("\n"),
-      },
-    ];
+      "The previous planning output did not produce valid reviewable plan files. Regenerate the plan correctly now.",
+      "",
+      contextSummary,
+      "",
+      "Rules:",
+      "- Do not copy tool logs, duplicate-call warnings, hidden thinking, raw source code, or truncation messages into plan files.",
+      "- `requirements.md` must summarize the user's intent into real requirements: goal, scope, findings, deliverables, acceptance criteria, and open questions.",
+      "- `design.md` must be executable: affected files/modules, ordered implementation strategy, data/control flow, validation, and risks.",
+      "- If a design direction is unclear, ask the user with `<user_options>` and stop. Do not invent a final design.",
+      "- If the direction is clear, write concise `.MAIN/plans/requirements.md` and `.MAIN/plans/design.md`, then submit the normal Proposal for approval. Do not generate `tasks.md` before approval.",
+    ].filter(Boolean).join("\n");
   }
 
   return [
-    {
-      kind: "requirements",
-      path: ".MAIN/plans/requirements.md",
-      content: [
-        "# 需求规格",
-        "",
-        "> 自动生成的兜底草稿：模型已经读取了上下文，但没有生成计划文件，所以 MAIN 将可用输出收束为可审批草稿。",
-        "",
-        "## 用户目标",
-        promptLine ? `- ${promptLine}` : "- 继续处理当前用户请求。",
-        "",
-        "## 范围",
-        bulletText,
-        "",
-        "## 验收标准",
-        "- [ ] 批准后先拆成小粒度执行任务，再修改源码文件。",
-        "- [ ] 生成的代码必须写入真实工作区文件，不能只显示在聊天正文中。",
-        "- [ ] 每个完成步骤都要留下可见的工具调用或文件写入证据。",
-      ].join("\n"),
-    },
-    {
-      kind: "design",
-      path: ".MAIN/plans/design.md",
-      content: [
-        "# 设计方案",
-        "",
-        "> 自动生成的可审批兜底草稿。如果范围不对，请先修改或重新生成，再批准执行。",
-        "",
-        "## 建议方案",
-        bulletText,
-        "",
-        "## 执行策略",
-        "- 批准后先生成 `.MAIN/plans/tasks.md`，控制在 8-20 个精简 checkbox。",
-        "- 每次只执行小批量任务，通过 `write_file` / `replace_in_file` 写入真实文件。",
-        "- 源码文件必须写到项目正确目录，不能写入 `.MAIN/plans/` 或隐藏目录。",
-        "",
-        "## 验证方式",
-        "- 有可用构建或测试命令时必须运行并记录结果。",
-        "- 结束前汇报变更文件、验证结果和剩余风险。",
-      ].join("\n"),
-    },
-  ];
-}
-
-async function materializeFallbackPlanArtifacts(
-  callbacks: OrchestratorCallbacks,
-  workspace: string,
-  sourceText: string,
-): Promise<boolean> {
-  const language = callbacks.getPreferredLanguage();
-  const userPrompt = getOriginalUserPromptForPlanFallback(callbacks);
-  const artifacts = buildFallbackPlanArtifacts(language, userPrompt, sourceText);
-  let wroteAny = false;
-
-  for (const artifact of artifacts) {
-    callbacks.onToolExecuting("write_file", artifact.path);
-    try {
-      const rawResult = await executeTool(
-        "write_file",
-        { path: artifact.path, content: artifact.content },
-        workspace,
-        callbacks.getSessionKey(),
-      );
-      const resultText = typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult);
-      callbacks.onToolDone("write_file", artifact.path, truncateToolContent(resultText, 1200));
-      callbacks.onPlanArtifactUpdated(artifact.path, artifact.content, artifact.kind);
-      wroteAny = true;
-    } catch (error) {
-      callbacks.onToolError("write_file", artifact.path, getErrorMessage(error, "Failed to write fallback plan artifact."));
-    }
-  }
-
-  return wroteAny;
+    "上一轮规划没有产出有效的可审批计划文件。现在请重新生成真正的计划。",
+    "",
+    contextSummary,
+    "",
+    "规则：",
+    "- 不要把工具日志、重复调用提示、后台思考、原始源码或截断提示写进计划文件。",
+    "- `requirements.md` 必须总结用户真实意图并形成需求规格：目标、范围、当前发现、交付物、验收标准、待确认问题。",
+    "- `design.md` 必须是可执行方案：影响文件/模块、执行顺序、数据流/控制流、验证方式和风险。",
+    "- 如果设计方向不明确，使用 `<user_options>` 让用户选择并立刻停止；不要编造最终方案。",
+    "- 如果方向已经明确，写入精简的 `.MAIN/plans/requirements.md` 与 `.MAIN/plans/design.md`，然后提交正常 Proposal 等待审批。批准前不要生成 `tasks.md`。",
+  ].filter(Boolean).join("\n");
 }
 
 function isReviewablePlanStage(stage: ReturnType<OrchestratorCallbacks["getPlanStage"]>): boolean {
@@ -613,6 +606,25 @@ function buildPlanCommandExecutionHint(
     : "The remaining tasks include shell commands that must be run for real. Prefer run_command for finite commands; for long-running or interactive commands call execute_command and verify with read_pty_since/read_pty_tail/get_pty_status. Do not just repeat them in prose:\n\n" + detail;
 }
 
+function buildApprovedPlanContinuationPrompt(callbacks: OrchestratorCallbacks): string {
+  const language = callbacks.getPreferredLanguage();
+  const requestedDocs = detectRequestedRootMarkdownDeliverables(getOriginalUserPromptForPlanFallback(callbacks));
+  const deliverableHint = requestedDocs.length > 0
+    ? language === "zh"
+      ? `6. 用户明确要求最终文档：${requestedDocs.map((name) => `项目根目录 \`${name}\``).join("、")}。必须把它写进 tasks.md 的最后交付步骤，并在计划完成前真实写入。\n`
+      : `6. The user explicitly requested final document(s): ${requestedDocs.map((name) => `project-root \`${name}\``).join(", ")}. Add them as final tasks.md deliverables and write them before marking the plan complete.\n`
+    : "";
+
+  return (
+    (language === "zh"
+      ? "计划已批准，现在进入执行阶段（EXECUTION MODE）。请按以下顺序继续：\n1. 先基于已批准的 requirements/design 或 bugfix 生成 `.MAIN/plans/tasks.md`，把执行任务拆清楚；tasks.md 必须精简为 8-20 个 checkbox，每项一句话。\n2. 生成 tasks.md 后，TopIsland 会显示任务进度；之后再按 tasks.md 逐个执行，使用 <tool_use> 格式调用工具。\n3. 任何需要 shell 的任务都必须在 tasks.md checkbox 中写出精确命令，并用反引号包裹；进入执行后，一次性命令优先用 run_command 并检查 exitCode/stdout/stderr；长驻或交互式命令用 execute_command 后再用 read_pty_since/read_pty_tail/get_pty_status 验证结果。\n4. 你可以正常修改项目源码文件，写入路径必须是项目中的正确位置，绝对不要将源码写入 `.MAIN/plans/` 或任何隐藏目录。\n5. 每完成一个任务后，先同步更新 `.MAIN/plans/tasks.md` 中对应的 checkbox 状态；tasks.md 是审计记录，不能删除已完成或旧任务，只能勾选、追加或保留“已完成任务”区块。只有全部任务都标记为 `[x]` 后，才能结束执行。\n"
+      : "The plan is approved. You are now in EXECUTION MODE. Continue in this order:\n1. First generate `.MAIN/plans/tasks.md` from the approved requirements/design or bugfix so the execution steps are explicit. Keep tasks.md concise: 8-20 checkboxes, one sentence each.\n2. After tasks.md is generated, follow it task by task using tool calls.\n3. Any task that needs shell work must include the exact command inside the tasks.md checkbox text using backticks. During execution, prefer run_command for finite commands and inspect exitCode/stdout/stderr; use execute_command for long-running or interactive commands, then verify with read_pty_since/read_pty_tail/get_pty_status.\n4. You may now edit project source files, but write them to the proper project paths and never into `.MAIN/plans/` or hidden folders.\n5. After each task, update the matching checkbox in `.MAIN/plans/tasks.md` before moving on; tasks.md is an audit record, so never delete completed or previous tasks. Only check items off, append tasks, or keep a completed-tasks section. Only stop when all tasks are `[x]`.\n") +
+    deliverableHint +
+    "\n" +
+    buildPlanCommandExecutionHint(callbacks.getPlanTasks(), language)
+  );
+}
+
 function shouldTreatCloudGatewayErrorAsCompatibility(
   errMsg: string,
   isCloudProfile: boolean,
@@ -621,6 +633,31 @@ function shouldTreatCloudGatewayErrorAsCompatibility(
 ): boolean {
   if (!isCloudProfile || isCloudGatewayTimeoutMessage(errMsg) || !isRetryableCloudErrorMessage(errMsg)) return false;
   return nativeToolsWereAttempted || hasToolRoundHistory(messages);
+}
+
+function isStreamWatchdogTimeoutMessage(message: string): boolean {
+  const normalized = String(message || "").toLowerCase();
+  return (
+    normalized.includes("stream_first_chunk_timeout") ||
+    normalized.includes("first chunk timeout") ||
+    normalized.includes("first response timeout") ||
+    normalized.includes("没有返回首个流式 chunk") ||
+    normalized.includes("没有返回响应头")
+  );
+}
+
+function buildPlanStreamTimeoutPauseMessage(
+  language: "zh" | "en",
+  stage: ReturnType<OrchestratorCallbacks["getPlanStage"]>,
+): string {
+  if (language === "en") {
+    return stage === "requirements"
+      ? "requirements.md has been generated, but the model did not return the next design step in time. This planning turn is paused; continue with design.md when ready."
+      : "The model did not return the next planning step in time. This planning turn is paused and can be continued.";
+  }
+  return stage === "requirements"
+    ? "已生成 requirements.md，但模型长时间没有返回下一步设计方案。本轮已暂停，你可以继续生成 design.md。"
+    : "模型长时间没有返回下一步规划内容，本轮已暂停，可以继续当前计划阶段。";
 }
 
 async function runLifecycleHooks(
@@ -835,6 +872,21 @@ function formatCachedReadOnlyToolResult(
   ].filter(Boolean).join("\n");
 }
 
+function appendPlanRepeatReadLimitGuidance(
+  content: string,
+  language: "zh" | "en",
+  stage: ReturnType<OrchestratorCallbacks["getPlanStage"]>,
+): string {
+  const guidance = language === "zh"
+    ? stage === "requirements"
+      ? "PLAN_REPEAT_READ_LIMIT: 你正在计划阶段重复读取已经缓存且未变化的上下文。请停止重复读取，直接基于 requirements.md 和已有文件上下文生成 `.MAIN/plans/design.md`；如果设计方向不明确，用 `<user_options>` 提供用户可点击选择并立刻停止。"
+      : "PLAN_REPEAT_READ_LIMIT: 你正在重复读取已经缓存且未变化的上下文。请停止重复读取，转向生成下一份计划文件、正式 Proposal，或用 `<user_options>` 询问关键分叉。"
+    : stage === "requirements"
+    ? "PLAN_REPEAT_READ_LIMIT: You are repeating cached unchanged reads during planning. Stop rereading files and generate `.MAIN/plans/design.md` from requirements.md and existing context; if the design direction is unclear, offer `<user_options>` and stop."
+    : "PLAN_REPEAT_READ_LIMIT: You are repeating cached unchanged reads. Stop rereading and produce the next plan artifact, a formal Proposal, or `<user_options>` for the key decision.";
+  return `${content}\n\n${guidance}`;
+}
+
 function truncateToolContent(content: string, maxChars: number): string {
   if (content.length <= maxChars) return content;
   return content.slice(0, maxChars) + `\n...[truncated, ${content.length - maxChars} chars omitted]`;
@@ -962,6 +1014,16 @@ async function executeToolCallWithLifecycle(
     };
   }
 
+  const planArtifactValidationError = await buildPlanArtifactMutationValidationError(
+    tc,
+    resolvedArgs,
+    workspace,
+    callbacks,
+  );
+  if (planArtifactValidationError) {
+    return planArtifactValidationError;
+  }
+
   const diffPreview = await buildToolDiffPreview(tc.name, effectiveArgs, { workspace, sessionKey });
   callbacks.onToolExecuting(tc.name, target, diffPreview);
 
@@ -1059,6 +1121,117 @@ async function executeReadOnlyToolsConcurrently(
     executeToolCallWithLifecycle(tc, workspace, callbacks, allTools, hooksConfig),
   );
   return Promise.all(promises);
+}
+
+function buildPlanGateBlockedResult(
+  tc: ToolCallToExecute,
+  toolArgs: Record<string, unknown>,
+  callbacks: OrchestratorCallbacks,
+  reason: "pre_approval_source_write" | "pre_approval_tasks" | "missing_tasks_before_source",
+): ToolExecutionResult {
+  const target = getToolTarget(tc.name, toolArgs);
+  const language = callbacks.getPreferredLanguage();
+  const message = language === "zh"
+    ? reason === "pre_approval_tasks"
+      ? "PLAN 阶段尚未批准，不能提前生成 `.MAIN/plans/tasks.md`。请先完成 requirements/design 或 bugfix 草稿并等待用户批准。"
+      : reason === "missing_tasks_before_source"
+      ? "计划已批准，但还没有可执行的 `.MAIN/plans/tasks.md` 任务清单。请先生成 tasks.md，再按任务修改源码或交付文档。"
+      : "PLAN 阶段尚未批准，不能修改源码或项目交付文件。请先生成 `.MAIN/plans/requirements.md` 与 `.MAIN/plans/design.md`（或 bugfix.md）供用户审批。"
+    : reason === "pre_approval_tasks"
+    ? "PLAN mode is not approved yet, so `.MAIN/plans/tasks.md` must not be generated. Create requirements/design or bugfix drafts and wait for approval first."
+    : reason === "missing_tasks_before_source"
+    ? "The plan is approved, but there is no executable `.MAIN/plans/tasks.md` task list yet. Generate tasks.md before editing source or final deliverables."
+    : "PLAN mode is not approved yet, so source or deliverable files cannot be modified. Create `.MAIN/plans/requirements.md` plus `.MAIN/plans/design.md` (or bugfix.md) for review first.";
+
+  callbacks.onToolExecuting(tc.name, target);
+  callbacks.onToolError(tc.name, target, message);
+  return {
+    toolCallId: tc.id,
+    name: tc.name,
+    target,
+    content: `Error: PLAN_STAGE_BLOCKED: ${message}`,
+    isError: true,
+  };
+}
+
+async function buildPlanArtifactMutationValidationError(
+  tc: ToolCallToExecute,
+  args: Record<string, unknown>,
+  workspace: string,
+  callbacks: OrchestratorCallbacks,
+): Promise<ToolExecutionResult | null> {
+  if (tc.name !== "write_file" && tc.name !== "replace_in_file") return null;
+
+  const path = typeof args.path === "string" ? args.path : "";
+  const kind = path ? detectPlanArtifactKind(path) : null;
+  if (!kind) return null;
+
+  let nextContent: string | null = null;
+  if (tc.name === "write_file") {
+    nextContent = typeof args.content === "string" ? args.content : "";
+  } else if (tc.name === "replace_in_file") {
+    const searchText = typeof args.search_text === "string" ? args.search_text : "";
+    const replaceText = typeof args.replace_text === "string" ? args.replace_text : "";
+    if (searchText) {
+      try {
+        const currentContent = String(await executeTool("read_file", { path }, workspace, callbacks.getSessionKey()) ?? "");
+        nextContent = currentContent.includes(searchText)
+          ? currentContent.replace(searchText, replaceText)
+          : null;
+      } catch {
+        nextContent = null;
+      }
+    }
+  }
+
+  if (nextContent == null) return null;
+
+  const language = callbacks.getPreferredLanguage();
+  const target = getToolTarget(tc.name, args);
+
+  if (kind !== "tasks") {
+    const validation = validatePlanArtifactContent(nextContent, kind);
+    if (!validation.ok) {
+      const message = language === "zh"
+        ? `PLAN_QUALITY_GATE: ${path} 被拦截，内容不像可审批的正式计划（${validation.reason || "质量不足"}）。请基于用户目标和已读源码重新生成 requirements/design，或用 <user_options> 询问关键分叉；不要写入工具日志、后台思考、截断提示或原始代码片段。`
+        : `PLAN_QUALITY_GATE: ${path} was rejected because it does not look like a reviewable plan artifact (${validation.reason || "quality gate"}). Regenerate requirements/design from the user goal and inspected source, or ask the user with <user_options>; do not write tool logs, hidden thinking, truncation notices, or raw source snippets.`;
+      callbacks.onToolExecuting(tc.name, target);
+      callbacks.onToolError(tc.name, target, message);
+      return {
+        toolCallId: tc.id,
+        name: tc.name,
+        target,
+        content: `Error: ${message}`,
+        isError: true,
+      };
+    }
+  }
+
+  if (kind === "tasks") {
+    const previousTasks = callbacks.getPlanTasks();
+    const parsedTasks = extractPlanTasks(nextContent);
+    const droppedTasks =
+      previousTasks.length > 0 && parsedTasks.length === 0
+        ? previousTasks
+        : findDroppedPlanTasks(previousTasks, parsedTasks);
+
+    if (droppedTasks.length > 0) {
+      const message = language === "zh"
+        ? `PLAN_TASK_HISTORY_BLOCKED: tasks.md 不能删除已有任务记录。本次写入会移除 ${droppedTasks.length} 个任务（例如：${droppedTasks.slice(0, 3).map((task) => task.text).join("；")}）。请只把完成项的 checkbox 改成 [x]、追加新任务，或保留“已完成任务”区块。`
+        : `PLAN_TASK_HISTORY_BLOCKED: tasks.md must not delete existing task history. This write would remove ${droppedTasks.length} task(s) (for example: ${droppedTasks.slice(0, 3).map((task) => task.text).join("; ")}). Only mark completed checkboxes as [x], append tasks, or keep a completed-tasks section.`;
+      callbacks.onToolExecuting(tc.name, target);
+      callbacks.onToolError(tc.name, target, message);
+      return {
+        toolCallId: tc.id,
+        name: tc.name,
+        target,
+        content: `Error: ${message}`,
+        isError: true,
+      };
+    }
+  }
+
+  return null;
 }
 
 /**
@@ -1349,6 +1522,8 @@ export async function executeAgentLoop(
       ? 0
       : 2;
   let sawPlanModeToolActivity = false;
+  let usedPlanRecoveryPrompt = false;
+  const attemptedPlanWriteTargets: string[] = [];
 
   // ── Strict Repeat Guard ──────────────────────────────────────────
   // Track recent tool calls to detect repetition loops. For read-only
@@ -1478,6 +1653,21 @@ export async function executeAgentLoop(
       // If the error is a context_length_exceeded, compact the messages
       // more aggressively and retry once.
       const errMsg = (err as Error).message || "";
+      if (workflowMode === "plan" && !callbacks.getIsPlanApproved() && isStreamWatchdogTimeoutMessage(errMsg)) {
+        const planStage = callbacks.getPlanStage();
+        logAgentEvent("plan_stage_waiting_for_design", {
+          iteration,
+          planStage,
+          reason: "stream_first_chunk_timeout",
+          message: errMsg.slice(0, 240),
+        });
+        callbacks.onNonActionableStop(
+          buildPlanStreamTimeoutPauseMessage(callbacks.getPreferredLanguage(), planStage),
+          "incomplete_plan",
+        );
+        callbacks.onStatusChange("idle");
+        return;
+      }
       const nativeToolsWereAttempted = llmTools.length > 0;
       const isContextError =
         (err as Error & { isContextError?: boolean }).isContextError === true ||
@@ -1498,9 +1688,23 @@ export async function executeAgentLoop(
       if (isContextError && snapshotContextLimit != null) {
         console.log("[orchestrator] Context length exceeded — reactive compact and retry");
 
-        // More aggressive compaction: reduce tool result budget and output budget
-        const aggressiveContextLimit = computeManagedContextLimit(snapshotContextLimit, llmTools, 1024);
-        const aggressiveOutputBudget = 768;
+        const { contextLimit: reactiveContextLimit, reportedContextLimit } =
+          clampContextLimitToReported(snapshotContextLimit, errMsg);
+        if (reportedContextLimit != null && reportedContextLimit < snapshotContextLimit) {
+          console.log(
+            `[orchestrator] Provider reported context window ${reportedContextLimit}; ` +
+            `clamping configured limit ${snapshotContextLimit} for reactive retry`,
+          );
+        }
+
+        // More aggressive compaction: reduce tool result budget while keeping
+        // enough response room for a tool call instead of a length stop.
+        const aggressiveOutputBudget = Math.min(3072, Math.max(1536, Math.floor(reactiveContextLimit * 0.08)));
+        const aggressiveContextLimit = computeManagedContextLimit(
+          reactiveContextLimit,
+          llmTools,
+          aggressiveOutputBudget,
+        );
         const maxToolResultTokens = 800;
         const aggressivelyManagedResult = manageContext(
           callbacks.getMessages(),
@@ -1533,11 +1737,27 @@ export async function executeAgentLoop(
             callbacks,
             abortController.signal,
             llmTools,
-            1536,
-            0,
+            aggressiveOutputBudget,
+            1,
           );
         } catch (retryErr) {
           if ((retryErr as Error).name === "AbortError") {
+            callbacks.onStatusChange("idle");
+            return;
+          }
+          const retryErrMsg = (retryErr as Error).message || "";
+          if (workflowMode === "plan" && !callbacks.getIsPlanApproved() && isStreamWatchdogTimeoutMessage(retryErrMsg)) {
+            const planStage = callbacks.getPlanStage();
+            logAgentEvent("plan_stage_waiting_for_design", {
+              iteration,
+              planStage,
+              reason: "stream_first_chunk_timeout_after_compaction",
+              message: retryErrMsg.slice(0, 240),
+            });
+            callbacks.onNonActionableStop(
+              buildPlanStreamTimeoutPauseMessage(callbacks.getPreferredLanguage(), planStage),
+              "incomplete_plan",
+            );
             callbacks.onStatusChange("idle");
             return;
           }
@@ -1547,11 +1767,12 @@ export async function executeAgentLoop(
           // plain text-only messages
           console.log("[orchestrator] Second retry: stripping tool_calls from messages");
           const strippedMessages = buildCompatibilityRetryMessages(aggressivelyManaged);
-          const emergencyContextLimit = computeManagedContextLimit(snapshotContextLimit, llmTools, 1536);
+          const emergencyOutputBudget = Math.min(2048, Math.max(1024, Math.floor(reactiveContextLimit * 0.06)));
+          const emergencyContextLimit = computeManagedContextLimit(reactiveContextLimit, llmTools, emergencyOutputBudget);
           const emergencyManagedResult = manageContext(
             strippedMessages,
             emergencyContextLimit,
-            512,
+            emergencyOutputBudget,
             320,
             220,
             true,
@@ -1577,11 +1798,27 @@ export async function executeAgentLoop(
               callbacks,
               abortController.signal,
               llmTools,
-              1024,
+              emergencyOutputBudget,
               0,
             );
           } catch (finalErr) {
             if ((finalErr as Error).name === "AbortError") {
+              callbacks.onStatusChange("idle");
+              return;
+            }
+            const finalErrMsg = (finalErr as Error).message || "";
+            if (workflowMode === "plan" && !callbacks.getIsPlanApproved() && isStreamWatchdogTimeoutMessage(finalErrMsg)) {
+              const planStage = callbacks.getPlanStage();
+              logAgentEvent("plan_stage_waiting_for_design", {
+                iteration,
+                planStage,
+                reason: "stream_first_chunk_timeout_after_emergency_compaction",
+                message: finalErrMsg.slice(0, 240),
+              });
+              callbacks.onNonActionableStop(
+                buildPlanStreamTimeoutPauseMessage(callbacks.getPreferredLanguage(), planStage),
+                "incomplete_plan",
+              );
               callbacks.onStatusChange("idle");
               return;
             }
@@ -1619,6 +1856,21 @@ export async function executeAgentLoop(
           }
 
           const retryMsg = (retryErr as Error).message || "";
+          if (workflowMode === "plan" && !callbacks.getIsPlanApproved() && isStreamWatchdogTimeoutMessage(retryMsg)) {
+            const planStage = callbacks.getPlanStage();
+            logAgentEvent("plan_stage_waiting_for_design", {
+              iteration,
+              planStage,
+              reason: "stream_first_chunk_timeout_after_compatibility_retry",
+              message: retryMsg.slice(0, 240),
+            });
+            callbacks.onNonActionableStop(
+              buildPlanStreamTimeoutPauseMessage(callbacks.getPreferredLanguage(), planStage),
+              "incomplete_plan",
+            );
+            callbacks.onStatusChange("idle");
+            return;
+          }
           const retryLooksLikeCompatibility =
             isProviderCompatibilityErrorMessage(retryMsg) ||
             (isCloudProfile && !isCloudGatewayTimeoutMessage(retryMsg) && isRetryableCloudErrorMessage(retryMsg));
@@ -1645,6 +1897,22 @@ export async function executeAgentLoop(
                 callbacks.onStatusChange("idle");
                 return;
               }
+              const finalErrMsg = (finalErr as Error).message || "";
+              if (workflowMode === "plan" && !callbacks.getIsPlanApproved() && isStreamWatchdogTimeoutMessage(finalErrMsg)) {
+                const planStage = callbacks.getPlanStage();
+                logAgentEvent("plan_stage_waiting_for_design", {
+                  iteration,
+                  planStage,
+                  reason: "stream_first_chunk_timeout_after_provider_compatibility_retry",
+                  message: finalErrMsg.slice(0, 240),
+                });
+                callbacks.onNonActionableStop(
+                  buildPlanStreamTimeoutPauseMessage(callbacks.getPreferredLanguage(), planStage),
+                  "incomplete_plan",
+                );
+                callbacks.onStatusChange("idle");
+                return;
+              }
               const transcriptMessages = buildTranscriptCompatibilityRetryMessages(
                 managedAgentMessages,
                 workflowMode,
@@ -1667,6 +1935,21 @@ export async function executeAgentLoop(
                   return;
                 }
                 const lastErrorMessage = getErrorMessage(lastErr, "未知错误");
+                if (workflowMode === "plan" && !callbacks.getIsPlanApproved() && isStreamWatchdogTimeoutMessage(lastErrorMessage)) {
+                  const planStage = callbacks.getPlanStage();
+                  logAgentEvent("plan_stage_waiting_for_design", {
+                    iteration,
+                    planStage,
+                    reason: "stream_first_chunk_timeout_after_transcript_retry",
+                    message: lastErrorMessage.slice(0, 240),
+                  });
+                  callbacks.onNonActionableStop(
+                    buildPlanStreamTimeoutPauseMessage(callbacks.getPreferredLanguage(), planStage),
+                    "incomplete_plan",
+                  );
+                  callbacks.onStatusChange("idle");
+                  return;
+                }
                 callbacks.onError(
                   "当前云端服务对会话内容格式兼容性较弱。我已经自动尝试过精简历史、关闭原生 tools，并回退到单条纯文本 transcript，但仍被服务端拒绝。请先新建一个纯文本新会话再试，或换一个兼容性更好的 OpenAI 协议网关。\n\n上游返回：" + lastErrorMessage,
                 );
@@ -1831,14 +2114,9 @@ export async function executeAgentLoop(
           }
           // Approved — 保留计划文件给右侧 Plan 面板继续展示，由用户在文件树或计划面板中手动删除。
           callbacks.onPlanStageChanged("executing");
-          const language = callbacks.getPreferredLanguage();
           const continuationMsg: AgentMessage = {
             role: "user",
-            content:
-              (language === "zh"
-                ? "计划已批准，现在进入执行阶段（EXECUTION MODE）。请按以下顺序继续：\n1. 先基于已批准的 requirements/design 或 bugfix 生成 `.MAIN/plans/tasks.md`，把执行任务拆清楚；tasks.md 必须精简为 8-20 个 checkbox，每项一句话。\n2. 生成 tasks.md 后，TopIsland 会显示任务进度；之后再按 tasks.md 逐个执行，使用 <tool_use> 格式调用工具。\n3. 任何需要 shell 的任务都必须在 tasks.md checkbox 中写出精确命令，并用反引号包裹；进入执行后，一次性命令优先用 run_command 并检查 exitCode/stdout/stderr；长驻或交互式命令用 execute_command 后再用 read_pty_since/read_pty_tail/get_pty_status 验证结果。\n4. 你可以正常修改项目源码文件，写入路径必须是项目中的正确位置，绝对不要将源码写入 `.MAIN/plans/` 或任何隐藏目录。\n5. 每完成一个任务后，先同步更新 `.MAIN/plans/tasks.md` 中对应的 checkbox 状态；只有全部任务都标记为 `[x]` 后，才能结束执行。\n\n"
-                : "The plan is approved. You are now in EXECUTION MODE. Continue in this order:\n1. First generate `.MAIN/plans/tasks.md` from the approved requirements/design or bugfix so the execution steps are explicit. Keep tasks.md concise: 8-20 checkboxes, one sentence each.\n2. After tasks.md is generated, follow it task by task using tool calls.\n3. Any task that needs shell work must include the exact command inside the tasks.md checkbox text using backticks. During execution, prefer run_command for finite commands and inspect exitCode/stdout/stderr; use execute_command for long-running or interactive commands, then verify with read_pty_since/read_pty_tail/get_pty_status.\n4. You may now edit project source files, but write them to the proper project paths and never into `.MAIN/plans/` or hidden folders.\n5. After each task, update the matching checkbox in `.MAIN/plans/tasks.md` before moving on; only stop when all tasks are `[x]`.\n\n") +
-              buildPlanCommandExecutionHint(callbacks.getPlanTasks(), language),
+            content: buildApprovedPlanContinuationPrompt(callbacks),
           };
           callbacks.appendMessage(continuationMsg);
           continue;
@@ -1864,47 +2142,36 @@ export async function executeAgentLoop(
         const shouldForcePlanContinuation = planningStillIncomplete && !hasMeaningfulVisibleText;
 
         if (shouldMaterializeFallbackPlan) {
-          logAgentEvent("plan_fallback_materialize_start", {
+          callbacks.appendMessage({ role: "assistant", content: assistantHistoryText });
+
+          if (usedPlanRecoveryPrompt) {
+            logAgentEvent("loop_stop", {
+              reason: "plan_recovery_prompt_limit",
+              iteration,
+              visibleChars: sourceVisibleText.length,
+              finishReason: normalized.finishReason || "unknown",
+            });
+            callbacks.onNonActionableStop(
+              buildNonActionableStopMessage(callbacks.getPreferredLanguage(), "incomplete_plan"),
+              "incomplete_plan",
+            );
+            callbacks.onStatusChange("idle");
+            return;
+          }
+
+          usedPlanRecoveryPrompt = true;
+          logAgentEvent("plan_recovery_prompt_start", {
             iteration,
             visibleChars: sourceVisibleText.length,
             finishReason: normalized.finishReason || "unknown",
             sawPlanModeToolActivity,
           });
-          const wroteFallbackPlan = await materializeFallbackPlanArtifacts(callbacks, workspace, sourceVisibleText);
-          callbacks.appendMessage({ role: "assistant", content: assistantHistoryText });
-
-          if (wroteFallbackPlan) {
-            logAgentEvent("plan_fallback_materialize_done", {
-              iteration,
-              planStage: callbacks.getPlanStage(),
-            });
-            const approved = await waitForPlanApprovalIfNeeded();
-            if (!approved) {
-              if (callbacks.getStatus() !== "pending_review") {
-                callbacks.onStatusChange("idle");
-              }
-              return;
-            }
-
-            callbacks.onPlanStageChanged("executing");
-            const language = callbacks.getPreferredLanguage();
-            callbacks.appendMessage({
-              role: "user",
-              content:
-                (language === "zh"
-                  ? "计划已批准，现在进入执行阶段（EXECUTION MODE）。请按以下顺序继续：\n1. 先基于已批准的 requirements/design 或 bugfix 生成 `.MAIN/plans/tasks.md`，把执行任务拆清楚；tasks.md 必须精简为 8-20 个 checkbox，每项一句话。\n2. 生成 tasks.md 后，TopIsland 会显示任务进度；之后再按 tasks.md 逐个执行，使用 <tool_use> 格式调用工具。\n3. 任何需要 shell 的任务都必须在 tasks.md checkbox 中写出精确命令，并用反引号包裹；进入执行后，一次性命令优先用 run_command 并检查 exitCode/stdout/stderr；长驻或交互式命令用 execute_command 后再用 read_pty_since/read_pty_tail/get_pty_status 验证结果。\n4. 你可以正常修改项目源码文件，写入路径必须是项目中的正确位置，绝对不要将源码写入 `.MAIN/plans/` 或任何隐藏目录。\n5. 每完成一个任务后，先同步更新 `.MAIN/plans/tasks.md` 中对应的 checkbox 状态；只有全部任务都标记为 `[x]` 后，才能结束执行。\n\n"
-                  : "The plan is approved. You are now in EXECUTION MODE. Continue in this order:\n1. First generate `.MAIN/plans/tasks.md` from the approved requirements/design or bugfix so the execution steps are explicit. Keep tasks.md concise: 8-20 checkboxes, one sentence each.\n2. After tasks.md is generated, follow it task by task using tool calls.\n3. Any task that needs shell work must include the exact command inside the tasks.md checkbox text using backticks. During execution, prefer run_command for finite commands and inspect exitCode/stdout/stderr; use execute_command for long-running or interactive commands, then verify with read_pty_since/read_pty_tail/get_pty_status.\n4. You may now edit project source files, but write them to the proper project paths and never into `.MAIN/plans/` or hidden folders.\n5. After each task, update the matching checkbox in `.MAIN/plans/tasks.md` before moving on; only stop when all tasks are `[x]`.\n\n") +
-                buildPlanCommandExecutionHint(callbacks.getPlanTasks(), language),
-            });
-            continue;
-          }
-
-          callbacks.onNonActionableStop(
-            buildNonActionableStopMessage(callbacks.getPreferredLanguage(), "incomplete_plan"),
-            "incomplete_plan",
-          );
-          callbacks.onStatusChange("idle");
-          return;
+          callbacks.onStatusChange("running");
+          callbacks.appendMessage({
+            role: "user",
+            content: buildPlanRecoveryPrompt(callbacks, sourceVisibleText, attemptedPlanWriteTargets),
+          });
+          continue;
         }
 
         if (shouldRefineLongPlanIntoChoice) {
@@ -1961,7 +2228,7 @@ export async function executeAgentLoop(
           const missingStepHint =
             language === "zh"
               ? currentPlanStage === "requirements"
-                ? "你已经有 requirements.md，下一步应先让用户确认设计方向，或在信息足够时提交正式 Proposal。"
+                ? "你已经有 requirements.md，下一步必须基于现有需求规格生成 `.MAIN/plans/design.md`；如果设计方向仍不明确，只能用 `<user_options>` 给出面向用户的选择并停止。不要重复读取已读文件。"
                 : currentPlanStage === "design"
                 ? "你已经有 design.md，下一步应输出正式 Proposal 或给用户关键选择；不要在批准前提前生成 tasks.md。"
                 : currentPlanStage === "bugfix"
@@ -1970,7 +2237,7 @@ export async function executeAgentLoop(
                 ? "你已经开始做项目探索了，但还没有给出可让用户决策的规划结果。下一步应先收束分歧并询问用户。"
                 : "请先给出可让用户决策的规划问题。"
               : currentPlanStage === "requirements"
-              ? "requirements.md exists. Next ask the user to confirm the design direction, or submit the formal Proposal if enough information is available."
+              ? "requirements.md exists. Next generate `.MAIN/plans/design.md` from the existing requirements; if the design direction is still unclear, offer `<user_options>` and stop. Do not repeat reads of files already in context."
               : currentPlanStage === "design"
               ? "design.md exists. Next submit the formal Proposal or offer the key choices; do not generate tasks.md before approval."
               : currentPlanStage === "bugfix"
@@ -1989,6 +2256,7 @@ export async function executeAgentLoop(
                   "1. 用普通 Markdown 输出 3-8 条关键判断，然后用面向用户的口吻给出 2-4 个 `<user_options>` 让用户选择；每个选项必须是用户可直接点击发送的完整选择，不要写成“是否……”问题句。\n" +
                   "2. 如果信息已经足够，输出正式 Proposal：`[PROPOSAL START]` + `# Proposed Plan` + 一页审阅摘要 + 合法 `<plan>` JSON。\n" +
                   "3. 如果这是复杂实现计划，必须生成 `.MAIN/plans/requirements.md` 与 `.MAIN/plans/design.md` 供审批；在用户批准之前不要生成 `tasks.md` 或修改源码。\n" +
+                  `${currentPlanStage === "requirements" ? "当前已经有 requirements.md，本轮不要重复读文件；请直接写 design.md，或用 user_options 询问设计分叉。\n" : ""}` +
                   `${wasTruncated ? "你上一条回复已经发生截断，请从中断处继续，不要重头重复。\n" : ""}` +
                   "不要只输出一句总结、结束语，或空结束符。"
                 : `The current plan has not reached an executable stage. ${missingStepHint}\n` +
@@ -1997,6 +2265,7 @@ export async function executeAgentLoop(
                   "1. Output 3-8 key judgments in Markdown, then offer 2-4 `<user_options>` for the user to choose from.\n" +
                   "2. If there is enough information, output the formal Proposal: `[PROPOSAL START]` + `# Proposed Plan` + one-page review summary + valid `<plan>` JSON.\n" +
                   "3. For complex implementation planning, create `.MAIN/plans/requirements.md` and `.MAIN/plans/design.md` for review; do not generate `tasks.md` or edit source files before approval.\n" +
+                  `${currentPlanStage === "requirements" ? "requirements.md already exists. Do not repeat file reads in this turn; write design.md directly, or ask for design choices with user_options.\n" : ""}` +
                   `${wasTruncated ? "Your previous reply was truncated; continue from the interruption point without restarting.\n" : ""}` +
                   "Do not output only a summary, sign-off, or empty stop.",
           };
@@ -2004,7 +2273,8 @@ export async function executeAgentLoop(
           continue;
         }
 
-        const missingToolCallRepromptKind = compactedProseCodeDump
+        const truncatedWithoutToolCall = wasTruncated && workflowMode !== "chat";
+        const missingToolCallRepromptKind = compactedProseCodeDump || truncatedWithoutToolCall
           ? "generic"
           : resolveMissingToolCallRepromptKind({
               workflowMode,
@@ -2056,12 +2326,19 @@ export async function executeAgentLoop(
         }
 
         // No intent detected — genuinely done
+        const approvedPlanTasks = workflowMode === "plan" && callbacks.getIsPlanApproved()
+          ? callbacks.getPlanTasks()
+          : [];
+        const approvedPlanMissingTasks =
+          workflowMode === "plan" &&
+          callbacks.getIsPlanApproved() &&
+          approvedPlanTasks.length === 0;
         const hasRemainingApprovedPlanTasks =
           workflowMode === "plan" &&
           callbacks.getIsPlanApproved() &&
-          callbacks.getPlanTasks().some((task) => task.status !== "completed");
+          approvedPlanTasks.some((task) => task.status !== "completed");
 
-        if (hasRemainingApprovedPlanTasks) {
+        if (approvedPlanMissingTasks || hasRemainingApprovedPlanTasks) {
           callbacks.onStatusChange("running");
           consecutiveNoToolCount++;
           if (consecutiveNoToolCount >= MAX_NO_ACTION_RETRIES) {
@@ -2075,18 +2352,24 @@ export async function executeAgentLoop(
             return;
           }
 
-          const remainingTasks = callbacks.getPlanTasks().filter((task) => task.status !== "completed").slice(0, 3);
-          const remainingText = remainingTasks.map((task) => `- ${task.text}`).join("\n");
+          const remainingTasks = approvedPlanTasks.filter((task) => task.status !== "completed").slice(0, 3);
+          const remainingText = remainingTasks.length > 0
+            ? remainingTasks.map((task) => `- ${task.text}`).join("\n")
+            : callbacks.getPreferredLanguage() === "zh"
+            ? "- 先生成 `.MAIN/plans/tasks.md`，再执行源码或交付物写入。"
+            : "- First generate `.MAIN/plans/tasks.md`, then execute source or deliverable writes.";
           const language = callbacks.getPreferredLanguage();
           callbacks.appendMessage({
             role: "user",
             content:
-              (language === "zh"
-                ? "继续执行 tasks.md 中剩余的未完成任务。不要重复计划说明，直接根据当前进度继续实现下一个任务；如果需要修改文件，继续使用工具调用。凡是任务里带有 shell 命令的，一次性命令优先用 run_command 并检查 exitCode/stdout/stderr；长驻或交互式命令用 execute_command 后再用 read_pty_since/read_pty_tail/get_pty_status 检查结果。完成当前任务后，先把 `.MAIN/plans/tasks.md` 中对应的 checkbox 更新为 `[x]`，再继续下一项；只有 tasks.md 全部勾选后才能结束。\n下一批优先任务：\n"
-                : "Continue executing the remaining incomplete tasks from tasks.md. Do not restate the plan; just move to the next task based on the current progress. If a task includes shell commands, prefer run_command for finite commands and inspect exitCode/stdout/stderr; use execute_command for long-running or interactive commands, then verify with read_pty_since/read_pty_tail/get_pty_status. After each task, update the matching checkbox in `.MAIN/plans/tasks.md` before moving on; only stop when all tasks are complete.\nNext priority tasks:\n") +
+              (approvedPlanMissingTasks
+                ? buildApprovedPlanContinuationPrompt(callbacks) + "\n\n"
+                : language === "zh"
+                ? "继续执行 tasks.md 中剩余的未完成任务。不要重复计划说明，直接根据当前进度继续实现下一个任务；如果需要修改文件，继续使用工具调用。凡是任务里带有 shell 命令的，一次性命令优先用 run_command 并检查 exitCode/stdout/stderr；长驻或交互式命令用 execute_command 后再用 read_pty_since/read_pty_tail/get_pty_status 检查结果。完成当前任务后，先把 `.MAIN/plans/tasks.md` 中对应的 checkbox 更新为 `[x]`，再继续下一项；不要删除已完成或旧任务记录，只有 tasks.md 全部勾选后才能结束。\n下一批优先任务：\n"
+                : "Continue executing the remaining incomplete tasks from tasks.md. Do not restate the plan; just move to the next task based on the current progress. If a task includes shell commands, prefer run_command for finite commands and inspect exitCode/stdout/stderr; use execute_command for long-running or interactive commands, then verify with read_pty_since/read_pty_tail/get_pty_status. After each task, update the matching checkbox in `.MAIN/plans/tasks.md` before moving on; do not delete completed or previous task records. Only stop when all tasks are complete.\nNext priority tasks:\n") +
               remainingText +
               "\n\n" +
-              buildPlanCommandExecutionHint(callbacks.getPlanTasks(), language),
+              buildPlanCommandExecutionHint(approvedPlanTasks, language),
           });
           continue;
         }
@@ -2184,28 +2467,68 @@ export async function executeAgentLoop(
           if (!unchanged) {
             fileReadStates.delete(fileReadSignature);
           } else {
-          const duplicateCount = (readOnlyDuplicateSkipCounts.get(fileReadSignature) ?? 0) + 1;
-          readOnlyDuplicateSkipCounts.set(fileReadSignature, duplicateCount);
-          allResults.push({
-            toolCallId: tc.id,
-            name: tc.name,
-            target,
-            content: buildFileUnchangedStub(fileReadState),
-            displayContent: `${FILE_UNCHANGED_STUB}: ${target || fileReadState.path}`,
-            isError: false,
-          });
-          continue;
+            const duplicateCount = (readOnlyDuplicateSkipCounts.get(fileReadSignature) ?? 0) + 1;
+            readOnlyDuplicateSkipCounts.set(fileReadSignature, duplicateCount);
+            const shouldPushPlanReadLimit =
+              workflowMode === "plan" &&
+              !callbacks.getIsPlanApproved() &&
+              duplicateCount >= PLAN_REPEAT_READ_LIMIT;
+            if (shouldPushPlanReadLimit) {
+              logAgentEvent("plan_repeat_read_limit", {
+                iteration,
+                stage: callbacks.getPlanStage(),
+                tool: tc.name,
+                target: target || fileReadState.path,
+                duplicateCount,
+              });
+            }
+            const content = shouldPushPlanReadLimit
+              ? appendPlanRepeatReadLimitGuidance(
+                  buildFileUnchangedStub(fileReadState),
+                  callbacks.getPreferredLanguage(),
+                  callbacks.getPlanStage(),
+                )
+              : buildFileUnchangedStub(fileReadState);
+            allResults.push({
+              toolCallId: tc.id,
+              name: tc.name,
+              target,
+              content,
+              displayContent: `${FILE_UNCHANGED_STUB}: ${target || fileReadState.path}`,
+              isError: false,
+            });
+            continue;
           }
         }
 
         if (cached || queuedReadOnlySignatures.has(signature)) {
           const duplicateCount = (readOnlyDuplicateSkipCounts.get(signature) ?? 0) + 1;
           readOnlyDuplicateSkipCounts.set(signature, duplicateCount);
+          const shouldPushPlanReadLimit =
+            workflowMode === "plan" &&
+            !callbacks.getIsPlanApproved() &&
+            duplicateCount >= PLAN_REPEAT_READ_LIMIT;
+          if (shouldPushPlanReadLimit) {
+            logAgentEvent("plan_repeat_read_limit", {
+              iteration,
+              stage: callbacks.getPlanStage(),
+              tool: tc.name,
+              target,
+              duplicateCount,
+            });
+          }
+          const duplicateContent = formatCachedReadOnlyToolResult(tc.name, target, cached, duplicateCount);
           allResults.push({
             toolCallId: tc.id,
             name: tc.name,
             target,
-            content: formatCachedReadOnlyToolResult(tc.name, target, cached, duplicateCount),
+            content: shouldPushPlanReadLimit
+              ? appendPlanRepeatReadLimitGuidance(
+                  duplicateContent,
+                  callbacks.getPreferredLanguage(),
+                  callbacks.getPlanStage(),
+                )
+              : duplicateContent,
             isError: false,
           });
           continue;
@@ -2215,8 +2538,24 @@ export async function executeAgentLoop(
         readOnlyCallSignatures.set(tc.id, signature);
         if (fileReadSignature) readOnlyCallSignatures.set(`${tc.id}:file_read`, fileReadSignature);
         readOnlyCalls.push({ id: tc.id, name: tc.name, arguments: tc.arguments });
-      } else if (workflowMode === "plan" && isSpecFileWrite(tc.name, toolArgs)) {
-        specFileCalls.push({ id: tc.id, name: tc.name, arguments: tc.arguments });
+      } else if (workflowMode === "plan") {
+        const approved = callbacks.getIsPlanApproved();
+        const hasExecutableTasks = callbacks.getPlanTasks().length > 0;
+        const target = getToolTarget(tc.name, toolArgs);
+
+        if (!approved && isPreApprovalPlanDraftWrite(tc.name, toolArgs)) {
+          specFileCalls.push({ id: tc.id, name: tc.name, arguments: tc.arguments });
+        } else if (approved && isExecutionPlanArtifactWrite(tc.name, toolArgs)) {
+          specFileCalls.push({ id: tc.id, name: tc.name, arguments: tc.arguments });
+        } else {
+          if (target) attemptedPlanWriteTargets.push(target);
+          const reason = !approved && isTasksPlanWrite(tc.name, toolArgs)
+            ? "pre_approval_tasks"
+            : approved && !hasExecutableTasks
+            ? "missing_tasks_before_source"
+            : "pre_approval_source_write";
+          allResults.push(buildPlanGateBlockedResult(tc, toolArgs, callbacks, reason));
+        }
       } else {
         writeCalls.push({ id: tc.id, name: tc.name, arguments: tc.arguments });
       }

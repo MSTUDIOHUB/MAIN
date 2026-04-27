@@ -522,7 +522,7 @@ export function manageContext(
   // Step 3: Trim with hysteresis. When we cross the proactive trigger,
   // compact down to a lower target budget so we don't re-trigger every turn.
   const compactedTokenCount = estimateMessagesTokens(assistantCompacted);
-  const shouldTrim = compactedTokenCount > budgets.proactiveTriggerBudget;
+  const shouldTrim = forceManage || compactedTokenCount > budgets.proactiveTriggerBudget;
   const trimContextLimit = shouldTrim
     ? budgets.proactiveTargetBudget + budgets.outputBudget
     : budgets.contextLimit;

@@ -8,6 +8,7 @@ const PLAN_RELOAD_RESUME_SCENARIO = "plan-reload-resume";
 const DIFF_RELOAD_SUMMARY_SCENARIO = "diff-reload-summary";
 const PLAN_REPLACE_REFRESH_SCENARIO = "plan-replace-refresh";
 const AWAITING_CHOICE_SCENARIO = "awaiting-choice";
+const READ_CONTEXT_COLLAPSE_SCENARIO = "read-context-collapse";
 const GAME_STUDIO_ONBOARDING_SCENARIO = "game-studio-onboarding";
 const CLOUD_SETTINGS_MODEL_SELECT_SCENARIO = "cloud-settings-model-select";
 const STREAMING_TIMER_SCENARIO = "streaming-timer";
@@ -545,6 +546,134 @@ function seedAwaitingChoiceScenario() {
 
   bindBridgeSnapshot(AWAITING_CHOICE_SCENARIO);
   appendBridgeEvent("choice-requested");
+
+  const cleanup = () => {
+    bridge.initialized = false;
+  };
+
+  bridge.cleanup = cleanup;
+  return cleanup;
+}
+
+function seedReadContextCollapseScenario() {
+  const bridge = getBridge();
+  if (!bridge) return undefined;
+
+  bridge.events = [{ type: "boot" }];
+  bridge.savedDocuments = [];
+  bridge.completed = true;
+
+  const turnId = "e2e-read-context-collapse-turn";
+  const sessionId = 999007;
+  const now = Date.now();
+  const userBlockId = useAppStore.getState()._nextTaskId();
+  const readTargets = [
+    { toolName: "get_project_skeleton", target: "" },
+    { toolName: "read_file", target: "Assets/Scripts/Battle/Config/BattleSceneConfigSO.cs" },
+    { toolName: "read_file", target: "Assets/Scripts/Battle/Runtime/BattleUnit.cs" },
+    { toolName: "read_file", target: "Assets/Scripts/Battle/Data/SkillDataSO.cs" },
+    { toolName: "read_file", target: "Assets/Scripts/Battle/Data/StatusEffectDataSO.cs" },
+    { toolName: "read_file", target: "Assets/Scripts/Battle/Data/UnitDataSO.cs" },
+    { toolName: "read_file", target: "Assets/Scripts/Battle/Events/BattleEventCenter.cs" },
+    { toolName: "read_file", target: "Assets/Scripts/Battle/Events/BattleEventData.cs" },
+    { toolName: "read_file", target: "Assets/Scripts/Battle/Events/BattleEvents.cs" },
+    { toolName: "read_file", target: "Assets/Scripts/Battle/Runtime/BattleActionQueue.cs" },
+  ];
+  const readBlocks = readTargets.map((item) => ({
+    id: useAppStore.getState()._nextTaskId(),
+    turnId,
+    type: "tool" as const,
+    toolName: item.toolName,
+    target: item.target,
+    status: "done",
+    toolStatus: "executed" as const,
+    message: "OK",
+  }));
+  const failedReadBlock = {
+    id: useAppStore.getState()._nextTaskId(),
+    turnId,
+    type: "tool" as const,
+    toolName: "read_file",
+    target: "Assets/Scripts/Battle/Data/MissingConfig.cs",
+    status: "error",
+    toolStatus: "failed" as const,
+    message: "文件不存在",
+  };
+  const writeBlock = {
+    id: useAppStore.getState()._nextTaskId(),
+    turnId,
+    type: "tool" as const,
+    toolName: "write_file",
+    target: "Assets/Scripts/Battle/Runtime/GeneratedBattleUnit.cs",
+    status: "done",
+    toolStatus: "executed" as const,
+    message: "Wrote file",
+    diff: {
+      old: "",
+      new: "public class GeneratedBattleUnit {}\n",
+      path: "Assets/Scripts/Battle/Runtime/GeneratedBattleUnit.cs",
+    },
+  };
+  const agentBlockId = useAppStore.getState()._nextTaskId();
+  const taskFlow = [
+    { id: userBlockId, turnId, type: "user" as const, content: "请读取战斗系统上下文并继续分析。" },
+    ...readBlocks,
+    failedReadBlock,
+    writeBlock,
+    {
+      id: agentBlockId,
+      turnId,
+      type: "agent" as const,
+      content: "已读取核心战斗上下文，失败项和写入项需要保持单独展示。",
+      streaming: false,
+    },
+  ];
+
+  useAppStore.setState((state) => ({
+    ...state,
+    config: {
+      ...state.config,
+      language: "zh",
+      workflowMode: "edit",
+    },
+    currentWorkspace: "/tmp/e2e-read-context-collapse",
+    sessionsByWorkspace: {
+      "/tmp/e2e-read-context-collapse": [
+        {
+          id: sessionId,
+          title: "E2E Read Context Collapse",
+          date: new Date(now).toISOString(),
+          active: true,
+          messages: [],
+        },
+      ],
+    },
+    currentSessionId: sessionId,
+    taskFlow,
+    conversationTurns: [
+      {
+        id: turnId,
+        userPrompt: "请读取战斗系统上下文并继续分析。",
+        title: "读取上下文折叠回归",
+        mode: "edit" as const,
+        status: "completed_with_changes" as const,
+        summary: "已读取核心战斗上下文。",
+        blockIds: taskFlow.map((block) => block.id),
+        collapsed: false,
+        createdAt: now,
+      },
+    ],
+    currentTurnId: turnId,
+    agentStatus: "idle",
+    isGenerating: false,
+    showPlanPanel: false,
+    showDiff: false,
+    showTerminal: false,
+    showFilePanel: false,
+  }));
+
+  bindBridgeSnapshot(READ_CONTEXT_COLLAPSE_SCENARIO);
+  appendBridgeEvent("seeded", { seedCount: readSeedCount(READ_CONTEXT_COLLAPSE_SCENARIO) });
 
   const cleanup = () => {
     bridge.initialized = false;
@@ -1486,6 +1615,10 @@ export function initializeE2EScenarios(): (() => void) | undefined {
 
   if (scenario === AWAITING_CHOICE_SCENARIO) {
     return seedAwaitingChoiceScenario();
+  }
+
+  if (scenario === READ_CONTEXT_COLLAPSE_SCENARIO) {
+    return seedReadContextCollapseScenario();
   }
 
   if (scenario === GAME_STUDIO_ONBOARDING_SCENARIO) {

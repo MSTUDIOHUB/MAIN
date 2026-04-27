@@ -32,13 +32,16 @@ import {
   type RightPanelTab,
   detectDominantLanguage,
   extractPlanTasks,
+  findDroppedPlanTasks,
   getPendingPlanTaskCommandFocus,
   getPlanArtifactTitle,
   isGenericConversationTitle,
   looksLikeReasoningLeakTitle,
+  mergePlanTasks,
   normalizeConversationDisplayTitle,
   summarizeAssistantText,
   summarizeUserPrompt,
+  validatePlanArtifactContent,
 } from "../lib/workflowModels";
 import {
   buildAnthropicRequestBody,
@@ -75,7 +78,7 @@ import {
 } from "../lib/gameStudioCatalog";
 import {
   createPendingDecisionCopy,
-  mapResolvedRunIntentToWorkflowMode,
+  getIntentPolicy,
   resolveConversationTurnIntent,
   resolveRunIntentFromLegacyWorkflowMode,
   resolveTurnRunIntent,
@@ -90,6 +93,15 @@ import {
 import { mapLegacyNexusModeToMainMode, mapMainModeToLegacyNexusMode, type MainModeKey } from "../lib/mainModes";
 import { runIntentPreflight } from "../lib/intentPreflight";
 import { runAfterNextPaint } from "../lib/uiScheduling";
+import {
+  createDefaultFeishuAdapterRuntimeStatus,
+  createDefaultImAdaptersConfig,
+  normalizeImAdaptersConfig,
+  upsertFeishuPairingRequest,
+  type FeishuAdapterRuntimeStatus,
+  type FeishuPendingPairing,
+  type ImAdaptersConfig,
+} from "../lib/imAdapters";
 
 function logStoreEvent(event: string, data: Record<string, unknown> = {}) {
   try {
@@ -152,6 +164,40 @@ export const translations = {
     resetSettingsDesc: "Restore all settings, skills, and configurations to their default values.",
     clearHistoryConfirm: "Are you sure? This will delete all conversation history for the current workspace.",
     resetSettingsConfirm: "Are you sure? This will reset ALL settings, skills, and sessions to their defaults.",
+    imAdapters: "IM Adapters",
+    feishuAdapter: "Feishu Remote Control",
+    feishuAdapterDesc: "Use a Feishu bot long connection to send tasks to MAIN from private chat.",
+    feishuEnable: "Enable Feishu Adapter",
+    feishuAppId: "App ID",
+    feishuAppSecret: "App Secret",
+    feishuDomain: "Open Platform Domain",
+    feishuPairingCode: "Pairing Code",
+    feishuPairingCodeDesc: "Send this code to the bot in a private chat with /pair.",
+    feishuPairedUsers: "Paired Users",
+    feishuPendingPairings: "Pairing Requests",
+    feishuNoPairedUsers: "No paired Feishu users yet.",
+    feishuNoPendingPairings: "No pending pairing requests.",
+    feishuApprovePairing: "Approve",
+    feishuRejectPairing: "Reject",
+    feishuRemovePairing: "Remove",
+    feishuRegenerateCode: "Regenerate Code",
+    feishuTestConnection: "Test Connection",
+    feishuTestingConnection: "Testing...",
+    feishuStart: "Start",
+    feishuStop: "Stop",
+    feishuStatus: "Status",
+    feishuNodeRuntime: "Node.js Runtime",
+    feishuNodeRuntimeChecking: "Checking Node.js runtime...",
+    feishuNodeRuntimeDesc: "The Feishu adapter sidecar needs Node.js. MAIN also searches common install paths when launched from Finder.",
+    feishuSetupNodeRuntime: "Quick Configure Node.js",
+    feishuRefreshNodeRuntime: "Refresh",
+    feishuRoutingCurrentWorkspace: "Messages are routed to the current workspace, one session per paired user.",
+    feishuOpenGuide: "How to Use",
+    feishuGuideTitle: "Feishu Remote Control Guide",
+    feishuGuideFeishuSteps: "Feishu Setup",
+    feishuGuideMainSteps: "MAIN Setup",
+    feishuGuideCommands: "Remote Commands",
+    feishuGuideClose: "Close",
   },
   zh: {
     workspace: "工作区", conversations: "历史会话", new: "新建会话",
@@ -199,6 +245,40 @@ export const translations = {
     resetSettingsDesc: "将所有设置、技能和配置恢复为默认值。",
     clearHistoryConfirm: "确定要清空吗？此操作将删除当前工作区的所有对话记录。",
     resetSettingsConfirm: "确定要重置吗？此操作将恢复所有设置、技能和会话为默认值。",
+    imAdapters: "即时通讯适配器",
+    feishuAdapter: "飞书远程控制",
+    feishuAdapterDesc: "通过飞书机器人长连接，在私聊里远程向 MAIN 发送任务。",
+    feishuEnable: "启用飞书适配器",
+    feishuAppId: "App ID",
+    feishuAppSecret: "App Secret",
+    feishuDomain: "开放平台域名",
+    feishuPairingCode: "配对码",
+    feishuPairingCodeDesc: "在飞书私聊机器人发送 /pair 加配对码完成绑定。",
+    feishuPairedUsers: "已配对用户",
+    feishuPendingPairings: "配对请求",
+    feishuNoPairedUsers: "还没有已配对的飞书用户。",
+    feishuNoPendingPairings: "暂无待处理配对请求。",
+    feishuApprovePairing: "通过",
+    feishuRejectPairing: "拒绝",
+    feishuRemovePairing: "移除",
+    feishuRegenerateCode: "重新生成配对码",
+    feishuTestConnection: "测试连接",
+    feishuTestingConnection: "测试中...",
+    feishuStart: "启动",
+    feishuStop: "停止",
+    feishuStatus: "状态",
+    feishuNodeRuntime: "Node.js 运行环境",
+    feishuNodeRuntimeChecking: "正在检查 Node.js 运行环境...",
+    feishuNodeRuntimeDesc: "飞书适配器 sidecar 需要 Node.js。打包版从访达启动时，MAIN 也会自动搜索常见安装路径。",
+    feishuSetupNodeRuntime: "快速配置 Node.js",
+    feishuRefreshNodeRuntime: "刷新",
+    feishuRoutingCurrentWorkspace: "消息会进入当前工作区，并按飞书用户分别维护独立会话。",
+    feishuOpenGuide: "使用说明",
+    feishuGuideTitle: "飞书远程控制使用说明",
+    feishuGuideFeishuSteps: "飞书中要做什么",
+    feishuGuideMainSteps: "MAIN 中要做什么",
+    feishuGuideCommands: "远程命令",
+    feishuGuideClose: "关闭",
   },
 } as const;
 
@@ -332,10 +412,30 @@ export interface AppConfig {
   chatFontSize: number;  // px, default 13
   local: LocalConfig;
   cloud: CloudConfig;
+  imAdapters: ImAdaptersConfig;
   workspace: string;
 }
 
 export type AgentStatus = "idle" | "running" | "pending_review" | "error";
+
+export interface FeishuRemoteContext {
+  adapter: "feishu";
+  chatId: string;
+  userId: string;
+  userName: string;
+  messageId?: string;
+}
+
+export interface FeishuPendingApproval {
+  code: string;
+  taskId: number;
+  chatId: string;
+  userId: string;
+  messageId?: string;
+  toolName: string;
+  target: string;
+  createdAt: number;
+}
 
 export interface JobItem {
   id: string;
@@ -358,7 +458,7 @@ export type TaskBlock =
       type: "system";
       content: string;
       icon?: string;
-      variant?: "context_compression";
+      variant?: "context_compression" | "plan_quality_gate";
       contextCompression?: {
         reason: "proactive" | "reactive";
         droppedCount: number;
@@ -479,6 +579,17 @@ interface AppState {
   removeMcpServer: (name: string) => void;
   setMcpDiscoveredTools: (tools: MCPTool[], toolServerMap: Record<string, string>) => void;
 
+  // IM Adapters
+  feishuAdapterStatus: FeishuAdapterRuntimeStatus;
+  feishuPairingRequests: FeishuPendingPairing[];
+  pendingFeishuApprovals: FeishuPendingApproval[];
+  setFeishuAdapterStatus: (status: Partial<FeishuAdapterRuntimeStatus>) => void;
+  upsertFeishuPairingRequest: (request: FeishuPendingPairing) => void;
+  removeFeishuPairingRequest: (openId: string) => void;
+  clearFeishuPairingRequests: () => void;
+  addPendingFeishuApproval: (approval: FeishuPendingApproval) => void;
+  resolvePendingFeishuApproval: (userId: string, code: string) => FeishuPendingApproval | null;
+
   // Skills CRUD
   skills: Skill[];
   setSkills: (v: Skill[]) => void;
@@ -587,6 +698,7 @@ interface AppState {
       intentSummary?: string;
       contextMentionsSnapshot?: string[];
       attachedFilesSnapshot?: string[];
+      remoteFeishu?: FeishuRemoteContext;
     },
   ) => void;
   // Resume loop after human review
@@ -648,6 +760,7 @@ const defaultConfig: AppConfig = {
     disableResponseStorage: true,
     reasoningEffort: "none",
   },
+  imAdapters: createDefaultImAdaptersConfig(),
   workspace: "",
 };
 
@@ -1116,11 +1229,7 @@ function isContinuationPrompt(input: string): boolean {
 }
 
 function buildLocalTurnTitle(input: string, intent: ResolvedRunIntent, language: "zh" | "en"): string {
-  const cleanedInput = normalizeConversationDisplayTitle(
-    input,
-    language === "en" ? 52 : 44,
-    "",
-  );
+  const cleanedInput = summarizeUserPrompt(input, language === "en" ? 52 : 40);
   if (cleanedInput) return cleanedInput;
 
   const lowerInput = input.toLowerCase();
@@ -1409,6 +1518,37 @@ function isPlanArtifactPath(path: string): boolean {
   return path.replace(/\\/g, "/").toLowerCase().includes(".main/plans/");
 }
 
+function detectRequestedRootMarkdownDeliverables(text: string): string[] {
+  const source = String(text || "");
+  const hasRootHint = /(?:根目录|项目根目录|当前项目|workspace root|project root|root directory)/i.test(source);
+  const names = Array.from(source.matchAll(/(?:^|[^\w./-])([A-Za-z][\w.-]*\.md|README\.md|Readme\.md|readme\.md)(?=$|[^\w./-])/g))
+    .map((match) => match[1])
+    .filter(Boolean)
+    .map((name) => name.replace(/^readme\.md$/i, "Readme.md"))
+    .filter((name) => !/^(?:requirements|design|tasks|bugfix)\.md$/i.test(name));
+
+  if (names.length === 0 && hasRootHint && /(?:md\s*文档|markdown|说明文档|总结.*文档|Readme|README)/i.test(source)) {
+    names.push("Readme.md");
+  }
+
+  return [...new Set(names)];
+}
+
+function hasRootMarkdownDeliverableEvidence(blocks: TaskBlock[], requestedDocs: string[]): boolean {
+  if (requestedDocs.length === 0) return true;
+
+  return requestedDocs.every((docName) => {
+    const lowerName = docName.toLowerCase();
+    return blocks.some((block) => {
+      if (block.type !== "tool" || block.toolStatus !== "executed") return false;
+      if (block.toolName !== "write_file" && block.toolName !== "replace_in_file") return false;
+      const normalizedTarget = String(block.target || "").replace(/\\/g, "/").toLowerCase();
+      if (!normalizedTarget || normalizedTarget.includes(".main/plans/")) return false;
+      return normalizedTarget === lowerName || normalizedTarget.endsWith(`/${lowerName}`);
+    });
+  });
+}
+
 function derivePlanStageFromArtifacts(
   artifacts: PlanArtifact[],
   tasks: PlanTask[],
@@ -1493,12 +1633,29 @@ const TABULAR_ATTACHMENT_EXTENSIONS = new Set([
   ".tsv",
 ]);
 
+const FILE_VIEWER_BINARY_EXTENSIONS = new Set([
+  ".exe", ".dll", ".so", ".dylib", ".bin", ".dat",
+  ".zip", ".tar", ".gz", ".rar", ".7z", ".bz2", ".xz", ".zst",
+  ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+  ".mp3", ".mp4", ".avi", ".mov", ".mkv", ".wav", ".flac", ".ogg", ".webm",
+  ".woff", ".woff2", ".ttf", ".otf", ".eot",
+  ".class", ".jar", ".war", ".pyc", ".o", ".a",
+]);
+
 function shouldUseDocumentReader(path: string): boolean {
   const lower = path.toLowerCase();
   for (const ext of STRUCTURED_ATTACHMENT_EXTENSIONS) {
     if (lower.endsWith(ext)) return true;
   }
   return false;
+}
+
+function isBinaryFileViewerPath(path: string): boolean {
+  const fileName = path.split(/[\\/]/).pop()?.toLowerCase() || path.toLowerCase();
+  if (fileName === "dockerfile" || fileName === "makefile") return false;
+  const dotIdx = fileName.lastIndexOf(".");
+  if (dotIdx === -1) return false;
+  return FILE_VIEWER_BINARY_EXTENSIONS.has(fileName.slice(dotIdx));
 }
 
 function shouldUseTabularAnalyzer(path: string): boolean {
@@ -1538,6 +1695,7 @@ function deriveIdleConversationTurnStatus(input: {
   isPlanApproved: boolean;
   planArtifacts: PlanArtifact[];
   planStage: PlanStage;
+  planTasks: PlanTask[];
   planExecutionEvidenceCount: number;
   replyOptionCount: number;
   taskFlow: TaskBlock[];
@@ -1547,8 +1705,16 @@ function deriveIdleConversationTurnStatus(input: {
   if (input.override) return input.override;
 
   const turnBlocks = input.taskFlow.filter((block) => block.turnId === input.turnId);
+  const userPrompt = String(turnBlocks.find((block) => block.type === "user")?.content || "");
+  const requestedDocs = detectRequestedRootMarkdownDeliverables(userPrompt);
   const hasVisibleAgent = turnBlocks.some(blockHasVisibleAgentContent);
   const hasAnyTool = turnBlocks.some((block) => block.type === "tool");
+  const hasTasksArtifact =
+    input.planTasks.length > 0 ||
+    input.planArtifacts.some((artifact) => artifact.kind === "tasks");
+  const allTasksComplete =
+    input.planTasks.length > 0 &&
+    input.planTasks.every((task) => task.status === "completed");
   const hasExecutionEvidence =
     input.planExecutionEvidenceCount > 0 ||
     turnBlocks.some((block) =>
@@ -1556,12 +1722,20 @@ function deriveIdleConversationTurnStatus(input: {
       block.toolStatus === "executed" &&
       isPlanExecutionEvidenceTool(block.toolName, block.target),
     );
+  const hasRequestedDeliverables = hasRootMarkdownDeliverableEvidence(turnBlocks, requestedDocs);
 
   if (input.effectiveRunIntent === "plan" && !input.isPlanApproved) {
     if (hasReviewablePlanState(input.planArtifacts, input.planStage)) {
       return "awaiting_approval";
     }
     return hasVisibleAgent || hasAnyTool ? "stopped_no_action" : "stopped_no_output";
+  }
+
+  if (input.effectiveRunIntent === "plan" && input.isPlanApproved) {
+    if (hasExecutionEvidence && hasTasksArtifact && allTasksComplete && hasRequestedDeliverables) {
+      return "completed_with_changes";
+    }
+    return hasVisibleAgent || hasAnyTool || hasTasksArtifact ? "stopped_no_action" : "stopped_no_output";
   }
 
   if (input.effectiveRunIntent === "execute" || input.effectiveRunIntent === "studio_workflow") {
@@ -1684,6 +1858,10 @@ export const useAppStore = create<AppState>()(
       fileViewerError: "",
       fileViewerLoading: true,
     });
+    if (isBinaryFileViewerPath(path)) {
+      set({ fileViewerContent: "", fileViewerError: "", fileViewerLoading: false });
+      return;
+    }
     try {
       const content = await readFile(path);
       set({ fileViewerContent: content, fileViewerError: "", fileViewerLoading: false });
@@ -2006,6 +2184,47 @@ export const useAppStore = create<AppState>()(
   removeMcpServer: (name) => set((s) => ({ mcpServers: s.mcpServers.filter((sv) => sv.name !== name) })),
   setMcpDiscoveredTools: (tools, toolServerMap) => set({ mcpDiscoveredTools: tools, mcpToolServerMap: toolServerMap }),
 
+  // IM adapters
+  feishuAdapterStatus: createDefaultFeishuAdapterRuntimeStatus(),
+  feishuPairingRequests: [],
+  pendingFeishuApprovals: [],
+  setFeishuAdapterStatus: (status) =>
+    set((s) => ({
+      feishuAdapterStatus: {
+        ...s.feishuAdapterStatus,
+        ...status,
+        updatedAt: status.updatedAt ?? Date.now(),
+      },
+    })),
+  upsertFeishuPairingRequest: (request) =>
+    set((s) => ({
+      feishuPairingRequests: upsertFeishuPairingRequest(s.feishuPairingRequests, request),
+    })),
+  removeFeishuPairingRequest: (openId) =>
+    set((s) => ({
+      feishuPairingRequests: s.feishuPairingRequests.filter((request) => request.openId !== openId),
+    })),
+  clearFeishuPairingRequests: () => set({ feishuPairingRequests: [] }),
+  addPendingFeishuApproval: (approval) =>
+    set((s) => ({
+      pendingFeishuApprovals: [
+        approval,
+        ...s.pendingFeishuApprovals.filter((item) => item.code !== approval.code),
+      ].slice(0, 20),
+    })),
+  resolvePendingFeishuApproval: (userId, code) => {
+    const normalizedCode = code.trim().toLowerCase();
+    const state = get();
+    const approval = state.pendingFeishuApprovals.find((item) =>
+      item.userId === userId && item.code.toLowerCase() === normalizedCode,
+    ) || null;
+    if (!approval) return null;
+    set((s) => ({
+      pendingFeishuApprovals: s.pendingFeishuApprovals.filter((item) => item.code !== approval.code),
+    }));
+    return approval;
+  },
+
   skills: defaultSkills,
   setSkills: (v) => set({ skills: v }),
   toggleSkill: (id) =>
@@ -2267,6 +2486,9 @@ export const useAppStore = create<AppState>()(
       taskFlow: [],
       agentMessages: [],
       messages: [],
+      feishuAdapterStatus: createDefaultFeishuAdapterRuntimeStatus(),
+      feishuPairingRequests: [],
+      pendingFeishuApprovals: [],
       selectedDiffTaskId: null,
       conversationTurns: [],
       currentTurnId: null,
@@ -2306,6 +2528,17 @@ export const useAppStore = create<AppState>()(
   upsertPlanArtifact: (artifact) =>
     set((s) => {
       const sanitizedContent = sanitizePlanArtifactContent(artifact.content);
+      const validation = validatePlanArtifactContent(sanitizedContent, artifact.kind);
+      if (!validation.ok) {
+        logStoreEvent("plan_artifact_rejected_by_quality_gate", {
+          path: artifact.path,
+          kind: artifact.kind,
+          reason: validation.reason,
+          contentChars: sanitizedContent.length,
+        });
+        return {};
+      }
+
       const nextArtifacts = [...s.planArtifacts];
       const existingIndex = nextArtifacts.findIndex((item) => item.path === artifact.path);
       if (existingIndex >= 0) {
@@ -2314,8 +2547,26 @@ export const useAppStore = create<AppState>()(
         nextArtifacts.push({ ...artifact, content: sanitizedContent });
       }
 
-      const nextTasks = artifact.kind === "tasks" || artifact.kind === "bugfix"
+      const parsedTasks = artifact.kind === "tasks" || artifact.kind === "bugfix"
         ? extractPlanTasks(sanitizedContent)
+        : s.planTasks;
+      const preserveTaskHistory =
+        s.isPlanApproved ||
+        s.planStage === "executing" ||
+        s.planStage === "completed" ||
+        s.planTasks.length > 0;
+      const droppedTasks = artifact.kind === "tasks" || artifact.kind === "bugfix"
+        ? findDroppedPlanTasks(s.planTasks, parsedTasks)
+        : [];
+      if (droppedTasks.length > 0) {
+        logStoreEvent("plan_tasks_preserved_missing_history", {
+          path: artifact.path,
+          droppedTasks: droppedTasks.map((task) => task.text).slice(0, 8),
+          droppedCount: droppedTasks.length,
+        });
+      }
+      const nextTasks = artifact.kind === "tasks" || artifact.kind === "bugfix"
+        ? mergePlanTasks(s.planTasks, parsedTasks, preserveTaskHistory)
         : s.planTasks;
       const normalizedTasks = normalizePlanTaskStatuses(
         nextTasks.length > 0 ? nextTasks : s.planTasks,
@@ -2327,15 +2578,22 @@ export const useAppStore = create<AppState>()(
         s.isPlanApproved,
         s.planStage,
       );
+      logStoreEvent("plan_artifact_stage_transition", {
+        path: artifact.path,
+        kind: artifact.kind,
+        previousStage: s.planStage,
+        nextStage,
+        artifacts: nextArtifacts.length,
+        tasks: normalizedTasks.length,
+        approved: s.isPlanApproved,
+      });
 
       return {
         planArtifacts: nextArtifacts.sort((a, b) => a.updatedAt - b.updatedAt),
         planStage: nextStage,
         planTasks: normalizedTasks,
         showPlanPanel: true,
-        showDiff: false,
-        showTerminal: false,
-        rightPanelTab: "plan" as const,
+        rightPanelTab: s.showDiff && s.rightPanelTab === "diff" ? "diff" as const : "plan" as const,
       };
     }),
   clearPlanArtifacts: () =>
@@ -2366,7 +2624,14 @@ export const useAppStore = create<AppState>()(
     }
   },
   setPlanTasks: (tasks) => set((s) => ({
-    planTasks: normalizePlanTaskStatuses(tasks, s.isPlanApproved && s.planExecutionEvidenceCount > 0),
+    planTasks: normalizePlanTaskStatuses(
+      mergePlanTasks(
+        s.planTasks,
+        tasks,
+        s.isPlanApproved || s.planStage === "executing" || s.planStage === "completed" || s.planTasks.length > 0,
+      ),
+      s.isPlanApproved && s.planExecutionEvidenceCount > 0,
+    ),
   })),
   setNormalizedStreamState: (state) => set({ normalizedStreamState: state }),
   approvePlan: () =>
@@ -2407,16 +2672,25 @@ export const useAppStore = create<AppState>()(
             const hasTasksArtifact =
               state.planArtifacts.some((artifact) => artifact.kind === "tasks") ||
               state.planTasks.length > 0;
+            const currentPlanTurn = state.currentTurnId
+              ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId)
+              : null;
+            const requestedDocs = detectRequestedRootMarkdownDeliverables(currentPlanTurn?.userPrompt || "");
+            const deliverableHint = requestedDocs.length > 0
+              ? state.config.language === "en"
+                ? ` The final tasks must include writing ${requestedDocs.map((name) => `project-root \`${name}\``).join(", ")} before completion.`
+                : ` 最终 tasks 必须包含写入${requestedDocs.map((name) => `项目根目录 \`${name}\``).join("、")}，完成前必须真实落盘。`
+              : "";
 
             if (state.config.language === "en") {
               return hasTasksArtifact
-                ? "The plan is approved. Continue directly from the current tasks.md and execute the remaining items without repeating the plan.\n\n" + buildPlanCommandExecutionHint(state.planTasks, "en")
-                : "The plan is approved. First generate `.MAIN/plans/tasks.md` from the approved requirements/design or bugfix, then execute the remaining work from that task list without repeating the plan. Keep tasks.md concise: 8-20 checkboxes, one sentence each. When a task needs shell work, include the exact command in backticks inside tasks.md; use run_command for finite commands, or execute_command plus PTY read/status tools for long-running or interactive commands.";
+              ? "The plan is approved. Continue directly from the current tasks.md and execute the remaining items without repeating the plan. Do not delete completed or previous task records; only check items off or append new tasks." + deliverableHint + "\n\n" + buildPlanCommandExecutionHint(state.planTasks, "en")
+                : "The plan is approved. First generate `.MAIN/plans/tasks.md` from the approved requirements/design or bugfix, then execute the remaining work from that task list without repeating the plan. Keep tasks.md concise: 8-20 checkboxes, one sentence each. When a task needs shell work, include the exact command in backticks inside tasks.md; use run_command for finite commands, or execute_command plus PTY read/status tools for long-running or interactive commands. During execution tasks.md is an audit record; never delete completed or previous tasks." + deliverableHint;
             }
 
             return hasTasksArtifact
-              ? "计划已批准。请直接基于当前 tasks.md 继续执行剩余任务，不要重复计划内容。\n\n" + buildPlanCommandExecutionHint(state.planTasks, "zh")
-              : "计划已批准。请先基于已批准的 requirements/design 或 bugfix 生成 `.MAIN/plans/tasks.md`，然后再按照任务清单继续执行，不要重复计划内容。tasks.md 必须精简为 8-20 个 checkbox，每项一句话。对于需要 shell 的任务，请把精确命令写进 tasks.md 的 checkbox 并用反引号包裹；一次性命令用 run_command，长驻或交互式命令用 execute_command 后再读取 PTY 日志/状态。";
+              ? "计划已批准。请直接基于当前 tasks.md 继续执行剩余任务，不要重复计划内容。不要删除已完成或旧任务记录，只能勾选或追加任务。" + deliverableHint + "\n\n" + buildPlanCommandExecutionHint(state.planTasks, "zh")
+              : "计划已批准。请先基于已批准的 requirements/design 或 bugfix 生成 `.MAIN/plans/tasks.md`，然后再按照任务清单继续执行，不要重复计划内容。tasks.md 必须精简为 8-20 个 checkbox，每项一句话。对于需要 shell 的任务，请把精确命令写进 tasks.md 的 checkbox 并用反引号包裹；一次性命令用 run_command，长驻或交互式命令用 execute_command 后再读取 PTY 日志/状态。执行中 tasks.md 是审计记录，不能删除已完成或旧任务。" + deliverableHint;
           })(),
           undefined,
           { hidden: true, reuseCurrentTurn: true, preservePlanState: true },
@@ -2572,6 +2846,7 @@ export const useAppStore = create<AppState>()(
       pendingReviewResolve: null,
       pendingReviewTaskId: null,
       pendingToolCall: null,
+      pendingFeishuApprovals: [],
       autoApproveTools: false,
       currentTurnExecutionConsent: { turnId: null, granted: false },
       planArtifacts: [],
@@ -2648,6 +2923,7 @@ export const useAppStore = create<AppState>()(
     intentSummary?: string;
     contextMentionsSnapshot?: string[];
     attachedFilesSnapshot?: string[];
+    remoteFeishu?: FeishuRemoteContext;
   }) => {
     const state = get();
     const sendStartedAt = nowMs();
@@ -2655,6 +2931,7 @@ export const useAppStore = create<AppState>()(
     const isHidden = options?.hidden === true;
     const mentionSnapshot = options?.contextMentionsSnapshot ?? state.contextMentions;
     const attachedFilesSnapshot = options?.attachedFilesSnapshot ?? state.attachedFiles;
+    const remoteFeishu = options?.remoteFeishu;
     const hasSupplementalInput = mentionSnapshot.length > 0 || attachedFilesSnapshot.length > 0;
     const currentTurn = state.currentTurnId
       ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId) || null
@@ -2674,9 +2951,13 @@ export const useAppStore = create<AppState>()(
     const reuseCurrentTurn =
       (options?.reuseCurrentTurn === true || shouldAutoResumeChoiceTurn) &&
       !!state.currentTurnId;
+    const shouldReuseExistingTurnIntent =
+      reuseCurrentTurn &&
+      currentTurn?.status === "awaiting_input";
     const preservePlanState =
       options?.preservePlanState === true ||
       shouldContinuePlanIntent ||
+      (shouldReuseExistingTurnIntent && currentTurnIntent === "plan") ||
       (shouldAutoResumeChoiceTurn && currentTurnIntent === "plan");
     const parsedStudioCommand = currentMainModeKey === "game_studio"
       ? parseGameStudioSlashCommand(text)
@@ -2703,6 +2984,8 @@ export const useAppStore = create<AppState>()(
       isHidden,
       reuseCurrentTurn,
       shouldAutoResumeChoiceTurn,
+      shouldReuseExistingTurnIntent,
+      skipIntentResolution: options?.skipIntentResolution === true,
       preservePlanState,
       currentTurnId: state.currentTurnId,
       currentTurnStatus: currentTurn?.status ?? null,
@@ -2721,7 +3004,7 @@ export const useAppStore = create<AppState>()(
       options?.resolvedIntent ||
       lockedComposerIntent ||
       (shouldContinuePlanIntent ? "plan" : null) ||
-      (preservePlanState
+      ((preservePlanState || shouldReuseExistingTurnIntent)
         ? currentTurnIntent
         : resolveRunIntentFromLegacyWorkflowMode(state.config.workflowMode));
     let effectiveIntentSummary = normalizeIntentSummary(options?.intentSummary || "");
@@ -2748,7 +3031,7 @@ export const useAppStore = create<AppState>()(
       });
     }
 
-    if (!isHidden && !lockedComposerIntent && !shouldContinuePlanIntent && !options?.skipIntentResolution && !options?.resolvedIntent) {
+    if (!isHidden && !lockedComposerIntent && !shouldContinuePlanIntent && !shouldReuseExistingTurnIntent && !options?.skipIntentResolution && !options?.resolvedIntent) {
       const resolution = resolveTurnRunIntent(text, {
         language: preferredLanguage,
         mainModeKey: currentMainModeKey,
@@ -2790,10 +3073,10 @@ export const useAppStore = create<AppState>()(
         get().sendMessage(
           preferredLanguage === "en"
             ? hasTasksArtifact
-              ? "Continue the remaining unfinished items in `.MAIN/plans/tasks.md` without repeating the plan. Start from the first unchecked task and update tasks.md as each item is completed."
+              ? "Continue the remaining unfinished items in `.MAIN/plans/tasks.md` without repeating the plan. Start from the first unchecked task and update tasks.md as each item is completed. Do not delete completed or previous task records."
               : "First regenerate `.MAIN/plans/tasks.md` from the approved requirements/design or bugfix, then continue the remaining execution without repeating the plan."
             : hasTasksArtifact
-            ? "请继续执行 `.MAIN/plans/tasks.md` 中剩余未完成的任务，不要重复计划说明。先从第一个未完成 checkbox 对应的任务开始，完成后及时更新 tasks.md。"
+            ? "请继续执行 `.MAIN/plans/tasks.md` 中剩余未完成的任务，不要重复计划说明。先从第一个未完成 checkbox 对应的任务开始，完成后及时更新 tasks.md。不要删除已完成或旧任务记录。"
             : "请先基于已批准的 requirements/design 或 bugfix 重新生成 `.MAIN/plans/tasks.md`，然后继续执行剩余任务，不要重复计划说明。",
           undefined,
           {
@@ -2892,7 +3175,8 @@ export const useAppStore = create<AppState>()(
       });
     }
 
-    const effectiveWorkflowMode = mapResolvedRunIntentToWorkflowMode(effectiveRunIntent);
+    const effectiveIntentPolicy = getIntentPolicy(effectiveRunIntent);
+    const effectiveWorkflowMode = effectiveIntentPolicy.workflowMode;
     const initialTurnStatus: ConversationTurnStatus = effectiveRunIntent === "plan" ? "planning" : "executing";
 
     // Reset plan approval state at the start of each new request
@@ -3533,6 +3817,35 @@ export const useAppStore = create<AppState>()(
       let firstStreamTokenAt: number | null = null;
       let streamTokenCount = 0;
       let streamTextChars = 0;
+      let noFirstTokenNoticeTimer: ReturnType<typeof setTimeout> | null = null;
+
+      const clearNoFirstTokenNoticeTimer = () => {
+        if (noFirstTokenNoticeTimer !== null) {
+          clearTimeout(noFirstTokenNoticeTimer);
+          noFirstTokenNoticeTimer = null;
+        }
+      };
+
+      noFirstTokenNoticeTimer = setTimeout(() => {
+        noFirstTokenNoticeTimer = null;
+        if (firstStreamTokenAt !== null) return;
+        const latest = get();
+        if (latest.agentStatus !== "running" || latest.currentTurnId !== turnId) return;
+        appendTurnBlock({
+          id: nextId(),
+          turnId,
+          type: "system",
+          content: latest.config.language === "en"
+            ? "The model has not returned visible streaming content for a while. You can stop this run and continue the current plan stage."
+            : "模型已经较长时间没有返回可见流式内容。你可以停止本轮，然后继续当前计划阶段。",
+        });
+        logStoreEvent("stream_no_visible_token_notice", {
+          turnId,
+          elapsedMs: Math.round(nowMs() - sendStartedAt),
+          agentMessages: latest.agentMessages.length,
+          planStage: latest.planStage,
+        });
+      }, 120_000);
 
       const flushBuffer = () => {
         const chunk = tokenBuffer;
@@ -3654,6 +3967,7 @@ export const useAppStore = create<AppState>()(
           cancelAnimationFrame(rafHandle);
           rafHandle = null;
         }
+        clearNoFirstTokenNoticeTimer();
         if (tokenBuffer) {
           flushBuffer();
         }
@@ -3756,7 +4070,7 @@ export const useAppStore = create<AppState>()(
         onHookResult: (record) => get().appendHookExecutionRecords([record]),
         onHookBlocked: (_event, _reason, _record) => { /* UI feedback placeholder */ },
         getCurrentRunIntent: () => get().getCurrentRunIntent(),
-        getWorkflowMode: () => mapResolvedRunIntentToWorkflowMode(get().getCurrentRunIntent()),
+        getWorkflowMode: () => getIntentPolicy(get().getCurrentRunIntent()).workflowMode,
         getIsPlanApproved: () => get().isPlanApproved,
         getPlanStage: () => get().planStage,
         getPlanTasks: () => get().planTasks,
@@ -3796,6 +4110,7 @@ export const useAppStore = create<AppState>()(
           if (thoughtStartTime === null) thoughtStartTime = Date.now();
           if (firstStreamTokenAt === null) {
             firstStreamTokenAt = nowMs();
+            clearNoFirstTokenNoticeTimer();
             logStoreEvent("stream_first_token", {
               turnId,
               elapsedMs: Math.round(firstStreamTokenAt - sendStartedAt),
@@ -3827,10 +4142,8 @@ export const useAppStore = create<AppState>()(
             const warnBlock: TaskBlock = {
               id: warnId,
               turnId,
-              type: "thought",
+              type: "system",
               content: "⚠️ 回复被截断 — 模型达到了最大 token 限制。回复可能不完整。",
-              isStreaming: false,
-              duration: 0,
             };
             appendTurnBlock(warnBlock);
           }
@@ -4109,7 +4422,7 @@ export const useAppStore = create<AppState>()(
                       ? { ...turn, blockIds: [...turn.blockIds, appendedBlockId!] }
                       : turn
                   ),
-              showDiff: false,
+              showDiff: s.showDiff && s.rightPanelTab === "diff",
             };
           });
 
@@ -4246,6 +4559,7 @@ export const useAppStore = create<AppState>()(
                     isPlanApproved: get().isPlanApproved,
                     planArtifacts: get().planArtifacts,
                     planStage: get().planStage,
+                    planTasks: get().planTasks,
                     planExecutionEvidenceCount: get().planExecutionEvidenceCount,
                     replyOptionCount: get().normalizedStreamState.replyOptions.length,
                     taskFlow: get().taskFlow,
@@ -4261,11 +4575,31 @@ export const useAppStore = create<AppState>()(
             get().setConversationTurnStatus(turnId, nextTurnStatus);
           }
           if (status === "idle" || status === "error") {
+            clearNoFirstTokenNoticeTimer();
             finalizeStreamingUi();
             finalizeStaleRunningTools(
               "failed",
               status === "idle" ? "请求已停止或未返回工具结果" : "请求已停止",
             );
+            if (remoteFeishu) {
+              const language = get().config.language === "en" ? "en" : "zh";
+              const fallback = status === "error"
+                ? (language === "en" ? "MAIN stopped with an error." : "MAIN 执行时遇到错误。")
+                : (language === "en" ? "MAIN finished this remote task." : "MAIN 已完成这次远程任务。");
+              const reply = extractFeishuTurnReply(get().taskFlow, turnId, fallback);
+              void invoke("send_feishu_message", {
+                chatId: remoteFeishu.chatId,
+                userId: remoteFeishu.userId,
+                openId: remoteFeishu.userId,
+                messageId: remoteFeishu.messageId,
+                text: reply,
+              }).catch((error) => {
+                logStoreEvent("feishu_final_reply_failed", {
+                  error: error instanceof Error ? error.message : String(error),
+                  turnId,
+                });
+              });
+            }
             set({ abortController: null });
             clearInterval(timerInterval);
           }
@@ -4335,21 +4669,56 @@ export const useAppStore = create<AppState>()(
             kind,
             contentChars: content.length,
           });
+          const sanitized = sanitizePlanArtifactContent(content);
+          const validation = validatePlanArtifactContent(sanitized, kind);
+          if (!validation.ok) {
+            logStoreEvent("plan_artifact_quality_blocked", {
+              turnId,
+              path,
+              kind,
+              reason: validation.reason,
+            });
+            appendTurnBlock({
+              id: nextId(),
+              turnId,
+              type: "system",
+              content: get().config.language === "en"
+                ? `Plan artifact rejected: ${path} does not look like a reviewable ${kind} document (${validation.reason || "quality gate"}). MAIN will ask the model to regenerate a real plan or request your decision.`
+                : `计划文件已被拦截：${path} 不像可审批的${getPlanArtifactTitle(kind, "zh")}（${validation.reason || "质量门禁"}）。MAIN 会要求模型重新生成真实方案，或先向你确认关键分叉。`,
+              variant: "plan_quality_gate",
+            });
+            return;
+          }
           get().upsertPlanArtifact({
             kind,
             path,
             title: getPlanArtifactTitle(kind, get().config.language === "en" ? "en" : "zh"),
-            content,
+            content: sanitized,
             updatedAt: Date.now(),
           });
-          get().openRightPanelTab("plan");
+          const latest = get();
+          if (!(latest.showDiff && latest.rightPanelTab === "diff")) {
+            latest.openRightPanelTab("plan");
+          }
         },
 
         onPlanStageChanged: (stage) => {
           const current = get();
+          const turnBlocks = current.taskFlow.filter((block) => block.turnId === turnId);
+          const currentTurn = current.conversationTurns.find((turn) => turn.id === turnId);
+          const requestedDocs = detectRequestedRootMarkdownDeliverables(currentTurn?.userPrompt || "");
+          const canMarkPlanCompleted =
+            stage === "completed" &&
+            current.isPlanApproved &&
+            current.planExecutionEvidenceCount > 0 &&
+            current.planTasks.length > 0 &&
+            current.planTasks.every((task) => task.status === "completed") &&
+            hasRootMarkdownDeliverableEvidence(turnBlocks, requestedDocs);
           const nextStage =
-            stage === "idle" || stage === "completed"
+            stage === "idle"
               ? stage
+              : stage === "completed"
+              ? canMarkPlanCompleted ? "completed" : "executing"
               : derivePlanStageFromArtifacts(
                   current.planArtifacts,
                   current.planTasks,
@@ -4359,7 +4728,10 @@ export const useAppStore = create<AppState>()(
 
           get().setPlanStage(nextStage);
           if (nextStage !== "idle") {
-            get().openRightPanelTab("plan");
+            const latest = get();
+            if (!(latest.showDiff && latest.rightPanelTab === "diff")) {
+              latest.openRightPanelTab("plan");
+            }
           }
         },
 
@@ -4437,6 +4809,7 @@ export const useAppStore = create<AppState>()(
           }
 
           const latestState = get();
+          const isRemoteFeishuTurn = !!remoteFeishu;
           const latestIntent = latestState.getCurrentRunIntent();
           const alreadyApprovedForTurn =
             latestState.currentTurnExecutionConsent.granted &&
@@ -4445,6 +4818,7 @@ export const useAppStore = create<AppState>()(
             latestIntent === "plan" && latestState.isPlanApproved;
 
           if (
+            !isRemoteFeishuTurn &&
             (latestIntent === "execute" || latestIntent === "studio_workflow") &&
             latestState.executionConsentPolicy === "ask_per_turn" &&
             !alreadyApprovedForTurn &&
@@ -4562,6 +4936,37 @@ export const useAppStore = create<AppState>()(
                 pendingReviewTaskId: reviewTaskId,
                 pendingToolCall: { name: toolName, arguments: toolArgs },
               }));
+              if (remoteFeishu) {
+                const code = createFeishuApprovalCode();
+                get().addPendingFeishuApproval({
+                  code,
+                  taskId: reviewTaskId,
+                  chatId: remoteFeishu.chatId,
+                  userId: remoteFeishu.userId,
+                  messageId: remoteFeishu.messageId,
+                  toolName,
+                  target,
+                  createdAt: Date.now(),
+                });
+                void invoke("send_feishu_message", {
+                  chatId: remoteFeishu.chatId,
+                  userId: remoteFeishu.userId,
+                  openId: remoteFeishu.userId,
+                  messageId: remoteFeishu.messageId,
+                  text: buildFeishuApprovalMessage(
+                    get().config.language === "en" ? "en" : "zh",
+                    code,
+                    toolName,
+                    target,
+                  ),
+                }).catch((error) => {
+                  logStoreEvent("feishu_approval_send_failed", {
+                    error: error instanceof Error ? error.message : String(error),
+                    toolName,
+                    target,
+                  });
+                });
+              }
             })();
           });
         },
@@ -4581,6 +4986,18 @@ export const useAppStore = create<AppState>()(
         clearInterval(timerInterval);
         set({ pendingSlashCommand: null });
         console.error("Agent loop crashed:", err);
+        if (remoteFeishu) {
+          const language = get().config.language === "en" ? "en" : "zh";
+          void invoke("send_feishu_message", {
+            chatId: remoteFeishu.chatId,
+            userId: remoteFeishu.userId,
+            openId: remoteFeishu.userId,
+            messageId: remoteFeishu.messageId,
+            text: language === "en"
+              ? `MAIN crashed while handling the remote task: ${err instanceof Error ? err.message : String(err)}`
+              : `MAIN 处理远程任务时崩溃：${err instanceof Error ? err.message : String(err)}`,
+          }).catch(() => {});
+        }
         // Show crash as visible system block
         const crashId = nextId();
         set((s) => ({
@@ -4735,6 +5152,7 @@ export const useAppStore = create<AppState>()(
             reasoningEffort: normalizeOpenAiReasoningEffort(persistedState.config?.cloud?.reasoningEffort),
             disableResponseStorage: persistedState.config?.cloud?.disableResponseStorage ?? current.config.cloud.disableResponseStorage,
           },
+          imAdapters: normalizeImAdaptersConfig(persistedState.config?.imAdapters),
         },
         sessionsByWorkspace: normalizeSessionsByWorkspace(persistedState.sessionsByWorkspace),
         selectedWorkspace: persistedState.selectedWorkspace || persistedState.currentWorkspace || current.selectedWorkspace,
@@ -4867,6 +5285,52 @@ async function requestSemanticTurnMetadata(params: {
 }
 
 // ── Selector Helpers ──────────────────────────────────────────────────
+
+function createFeishuApprovalCode(): string {
+  return Math.random().toString(36).slice(2, 8).toUpperCase();
+}
+
+function buildFeishuApprovalMessage(
+  language: "zh" | "en",
+  code: string,
+  toolName: string,
+  target: string,
+): string {
+  if (language === "en") {
+    return [
+      "MAIN is waiting for remote approval.",
+      `Tool: ${toolName}`,
+      target ? `Target: ${target}` : "",
+      `Reply /approve ${code} to allow, or /reject ${code} to reject.`,
+    ].filter(Boolean).join("\n");
+  }
+  return [
+    "MAIN 正在等待飞书远程审批。",
+    `工具：${toolName}`,
+    target ? `目标：${target}` : "",
+    `回复 /approve ${code} 允许执行，或 /reject ${code} 拒绝。`,
+  ].filter(Boolean).join("\n");
+}
+
+function extractFeishuTurnReply(blocks: TaskBlock[], turnId: string, fallback: string): string {
+  const turnBlocks = blocks.filter((block) => block.turnId === turnId);
+  const latestAgent = [...turnBlocks]
+    .reverse()
+    .find((block): block is Extract<TaskBlock, { type: "agent" }> => block.type === "agent" && !!block.content?.trim());
+  if (latestAgent?.content?.trim()) return summarizeAssistantText(latestAgent.content).slice(0, 1800);
+
+  const latestSystem = [...turnBlocks]
+    .reverse()
+    .find((block): block is Extract<TaskBlock, { type: "system" }> => block.type === "system" && !!block.content?.trim());
+  if (latestSystem?.content?.trim()) return summarizeAssistantText(latestSystem.content).slice(0, 1800);
+
+  const latestToolError = [...turnBlocks]
+    .reverse()
+    .find((block): block is Extract<TaskBlock, { type: "tool" }> => block.type === "tool" && block.toolStatus === "failed" && !!block.message?.trim());
+  if (latestToolError?.message?.trim()) return latestToolError.message.slice(0, 1800);
+
+  return fallback;
+}
 
 /** Derive a human-readable target from tool arguments (for Action Card display). */
 function getToolTarget(name: string, args: Record<string, unknown>): string {

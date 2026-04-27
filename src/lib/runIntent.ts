@@ -12,6 +12,8 @@ export type ResolvedUserIntent =
   | "studio_workflow";
 export type ResolvedRunIntent = ResolvedUserIntent;
 export type RunIntentRiskLevel = "low" | "medium" | "high";
+export type RunIntentUiCategory = "workflow_mode" | "output_style" | "discussion" | "studio_workflow";
+export type RunIntentToolPolicy = "none" | "read_only" | "write" | "plan_gated" | "studio_workflow";
 export type PendingRunDecisionKind = "intent_confirmation" | "execution_consent";
 export type PendingRunDecisionSource = "pre_submit" | "preflight" | "model" | "tool_gate";
 export type RunIntentControlAction = "approve_plan" | "resume_plan_execution";
@@ -80,6 +82,127 @@ export interface ResolveTurnRunIntentContext {
     | "completed";
   isPlanApproved: boolean;
 }
+
+export interface RunIntentPolicy {
+  intent: ResolvedUserIntent;
+  workflowMode: LegacyWorkflowMode;
+  uiCategory: RunIntentUiCategory;
+  toolPolicy: RunIntentToolPolicy;
+  requiresPlanApproval: boolean;
+  generatesPlanArtifacts: boolean;
+  allowsSourceWritesBeforePlanApproval: boolean;
+  label: { zh: string; en: string };
+  categoryLabel: { zh: string; en: string };
+  description: { zh: string; en: string };
+}
+
+const RUN_INTENT_POLICIES: Record<ResolvedUserIntent, RunIntentPolicy> = {
+  discuss: {
+    intent: "discuss",
+    workflowMode: "chat",
+    uiCategory: "discussion",
+    toolPolicy: "none",
+    requiresPlanApproval: false,
+    generatesPlanArtifacts: false,
+    allowsSourceWritesBeforePlanApproval: false,
+    label: { zh: "讨论", en: "Discuss" },
+    categoryLabel: { zh: "普通对话", en: "Conversation" },
+    description: {
+      zh: "正常问答、解释、头脑风暴和轻量需求澄清。",
+      en: "Normal Q&A, explanations, brainstorming, and lightweight clarification.",
+    },
+  },
+  plan: {
+    intent: "plan",
+    workflowMode: "plan",
+    uiCategory: "workflow_mode",
+    toolPolicy: "plan_gated",
+    requiresPlanApproval: true,
+    generatesPlanArtifacts: true,
+    allowsSourceWritesBeforePlanApproval: false,
+    label: { zh: "计划", en: "Plan" },
+    categoryLabel: { zh: "流程模式", en: "Workflow Mode" },
+    description: {
+      zh: "先生成可审阅方案和关键决策，批准后再执行。",
+      en: "Create a reviewable plan and decisions before execution.",
+    },
+  },
+  execute: {
+    intent: "execute",
+    workflowMode: "edit",
+    uiCategory: "workflow_mode",
+    toolPolicy: "write",
+    requiresPlanApproval: false,
+    generatesPlanArtifacts: false,
+    allowsSourceWritesBeforePlanApproval: true,
+    label: { zh: "执行", en: "Execute" },
+    categoryLabel: { zh: "流程模式", en: "Workflow Mode" },
+    description: {
+      zh: "直接进入处理、实现和验证链路。",
+      en: "Go directly into implementation, fixes, and verification.",
+    },
+  },
+  analyze: {
+    intent: "analyze",
+    workflowMode: "chat",
+    uiCategory: "output_style",
+    toolPolicy: "read_only",
+    requiresPlanApproval: false,
+    generatesPlanArtifacts: false,
+    allowsSourceWritesBeforePlanApproval: false,
+    label: { zh: "分析", en: "Analyze" },
+    categoryLabel: { zh: "输出方式", en: "Output Style" },
+    description: {
+      zh: "在普通聊天流中做只读检查、验证和诊断。",
+      en: "Use the chat flow for read-only inspection, validation, and diagnosis.",
+    },
+  },
+  summarize: {
+    intent: "summarize",
+    workflowMode: "chat",
+    uiCategory: "output_style",
+    toolPolicy: "read_only",
+    requiresPlanApproval: false,
+    generatesPlanArtifacts: false,
+    allowsSourceWritesBeforePlanApproval: false,
+    label: { zh: "总结", en: "Summary" },
+    categoryLabel: { zh: "输出方式", en: "Output Style" },
+    description: {
+      zh: "在普通聊天流中提炼重点、结论和下一步。",
+      en: "Use the chat flow to extract key points, conclusions, and next steps.",
+    },
+  },
+  report: {
+    intent: "report",
+    workflowMode: "chat",
+    uiCategory: "output_style",
+    toolPolicy: "read_only",
+    requiresPlanApproval: false,
+    generatesPlanArtifacts: false,
+    allowsSourceWritesBeforePlanApproval: false,
+    label: { zh: "报告", en: "Report" },
+    categoryLabel: { zh: "输出方式", en: "Output Style" },
+    description: {
+      zh: "在普通聊天流中整理结构化 Markdown 报告。",
+      en: "Use the chat flow to produce a structured Markdown report.",
+    },
+  },
+  studio_workflow: {
+    intent: "studio_workflow",
+    workflowMode: "edit",
+    uiCategory: "studio_workflow",
+    toolPolicy: "studio_workflow",
+    requiresPlanApproval: false,
+    generatesPlanArtifacts: false,
+    allowsSourceWritesBeforePlanApproval: true,
+    label: { zh: "Game Studio", en: "Game Studio" },
+    categoryLabel: { zh: "工作室流程", en: "Studio Workflow" },
+    description: {
+      zh: "绕过 MAIN 通用路由，按 Game Studio 协议执行。",
+      en: "Bypass the MAIN router and execute through the Game Studio protocol.",
+    },
+  },
+};
 
 const STRONG_PLAN_PATTERNS = [
   /先(?:给我|帮我)?(?:一个)?(?:方案|计划|规划|spec|roadmap)/i,
@@ -200,6 +323,7 @@ export interface MainIntentShortcutItem {
   command: string;
   label: string;
   description: string;
+  category: RunIntentUiCategory;
   aliases: string[];
 }
 
@@ -208,35 +332,40 @@ const MAIN_INTENT_SHORTCUTS_ZH: MainIntentShortcutItem[] = [
     intent: "plan",
     command: "/计划",
     label: "计划",
-    description: "先输出方案、步骤和关键决策，不直接动手执行。",
+    description: RUN_INTENT_POLICIES.plan.description.zh,
+    category: RUN_INTENT_POLICIES.plan.uiCategory,
     aliases: ["plan", "规划", "方案", "spec", "roadmap"],
   },
   {
     intent: "report",
     command: "/报告",
     label: "报告",
-    description: "整理成结构化正式报告，适合复盘、汇报和交付。",
+    description: RUN_INTENT_POLICIES.report.description.zh,
+    category: RUN_INTENT_POLICIES.report.uiCategory,
     aliases: ["report", "汇报", "分析报告"],
   },
   {
     intent: "analyze",
     command: "/分析",
     label: "分析",
-    description: "只读检查、验证和诊断，先给结论与建议。",
+    description: RUN_INTENT_POLICIES.analyze.description.zh,
+    category: RUN_INTENT_POLICIES.analyze.uiCategory,
     aliases: ["analyze", "检查", "验证", "诊断", "review", "inspect"],
   },
   {
     intent: "summarize",
     command: "/总结",
     label: "总结",
-    description: "提炼重点、结论和下一步，不展开正式报告。",
+    description: RUN_INTENT_POLICIES.summarize.description.zh,
+    category: RUN_INTENT_POLICIES.summarize.uiCategory,
     aliases: ["summary", "summarize", "摘要", "概括", "归纳"],
   },
   {
     intent: "execute",
     command: "/执行",
     label: "执行",
-    description: "直接进入处理和实现链路，不先输出完整计划。",
+    description: RUN_INTENT_POLICIES.execute.description.zh,
+    category: RUN_INTENT_POLICIES.execute.uiCategory,
     aliases: ["execute", "implement", "实现", "处理", "修复"],
   },
 ];
@@ -246,35 +375,40 @@ const MAIN_INTENT_SHORTCUTS_EN: MainIntentShortcutItem[] = [
     intent: "plan",
     command: "/plan",
     label: "Plan",
-    description: "Create a plan, steps, and decisions before execution.",
+    description: RUN_INTENT_POLICIES.plan.description.en,
+    category: RUN_INTENT_POLICIES.plan.uiCategory,
     aliases: ["计划", "规划", "方案", "spec", "roadmap"],
   },
   {
     intent: "report",
     command: "/report",
     label: "Report",
-    description: "Produce a structured report for review or handoff.",
+    description: RUN_INTENT_POLICIES.report.description.en,
+    category: RUN_INTENT_POLICIES.report.uiCategory,
     aliases: ["报告", "汇报", "analysis report"],
   },
   {
     intent: "analyze",
     command: "/analyze",
     label: "Analyze",
-    description: "Read-only inspection, validation, diagnosis, and recommendations.",
+    description: RUN_INTENT_POLICIES.analyze.description.en,
+    category: RUN_INTENT_POLICIES.analyze.uiCategory,
     aliases: ["分析", "检查", "验证", "诊断", "review", "inspect"],
   },
   {
     intent: "summarize",
     command: "/summarize",
     label: "Summary",
-    description: "Extract key points, conclusions, and next steps.",
+    description: RUN_INTENT_POLICIES.summarize.description.en,
+    category: RUN_INTENT_POLICIES.summarize.uiCategory,
     aliases: ["总结", "摘要", "概括", "归纳", "summary"],
   },
   {
     intent: "execute",
     command: "/execute",
     label: "Execute",
-    description: "Handle and implement directly without a full plan first.",
+    description: RUN_INTENT_POLICIES.execute.description.en,
+    category: RUN_INTENT_POLICIES.execute.uiCategory,
     aliases: ["执行", "实现", "处理", "修复", "implement"],
   },
 ];
@@ -299,17 +433,18 @@ export function getMainIntentShortcuts(language: "zh" | "en" = "zh"): MainIntent
   return language === "en" ? MAIN_INTENT_SHORTCUTS_EN : MAIN_INTENT_SHORTCUTS_ZH;
 }
 
+export function getIntentPolicy(intent: ResolvedUserIntent): RunIntentPolicy {
+  return RUN_INTENT_POLICIES[intent] ?? RUN_INTENT_POLICIES.discuss;
+}
+
 export function getRunIntentLabel(intent: ResolvedUserIntent, language: "zh" | "en" = "zh"): string {
-  const labels: Record<ResolvedUserIntent, { zh: string; en: string }> = {
-    discuss: { zh: "讨论", en: "Discuss" },
-    plan: { zh: "计划", en: "Plan" },
-    execute: { zh: "执行", en: "Execute" },
-    analyze: { zh: "分析", en: "Analyze" },
-    summarize: { zh: "总结", en: "Summary" },
-    report: { zh: "报告", en: "Report" },
-    studio_workflow: { zh: "Game Studio", en: "Game Studio" },
-  };
-  return language === "en" ? labels[intent].en : labels[intent].zh;
+  const label = getIntentPolicy(intent).label;
+  return language === "en" ? label.en : label.zh;
+}
+
+export function getRunIntentCategoryLabel(intent: ResolvedUserIntent, language: "zh" | "en" = "zh"): string {
+  const label = getIntentPolicy(intent).categoryLabel;
+  return language === "en" ? label.en : label.zh;
 }
 
 export function parseMainIntentShortcut(input: string): { intent: MainIntentShortcut; command: string; rest: string } | null {
@@ -440,16 +575,7 @@ export function createPendingDecisionCopy(
 }
 
 export function mapResolvedRunIntentToWorkflowMode(intent: ResolvedUserIntent): LegacyWorkflowMode {
-  switch (intent) {
-    case "plan":
-      return "plan";
-    case "execute":
-    case "studio_workflow":
-      return "edit";
-    case "analyze":
-    default:
-      return "chat";
-  }
+  return getIntentPolicy(intent).workflowMode;
 }
 
 export function resolveRunIntentFromLegacyWorkflowMode(
@@ -485,6 +611,7 @@ export function shouldUseBlockingIntentPreflight(
   if (resolution.bypassMainRouter) return false;
   if (resolution.needsDecision) return false;
   if (resolution.confidence >= 0.9) return false;
+  if (getIntentPolicy(resolution.intent).uiCategory === "output_style") return false;
 
   // region: 热路径保护
   // 普通 discuss 已经会由主模型在系统提示里继续判断真实任务类型，
