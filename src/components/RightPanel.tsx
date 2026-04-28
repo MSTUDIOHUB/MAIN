@@ -31,6 +31,22 @@ import { deleteChatTempPath, exportTextFile, onPtyData, readPtyBuffer, resizePty
 import { collectChangeEntries, isPlanConversationTurn } from "../lib/workflowModels";
 
 const CODE_FONT_FAMILY = "'JetBrains Mono', 'Fira Code', Menlo, Monaco, 'Courier New', monospace";
+const TERMINAL_FONT_FAMILY = [
+  "'JetBrains Mono'",
+  "'Fira Code'",
+  "'SF Mono'",
+  "Menlo",
+  "Monaco",
+  "Consolas",
+  "'Liberation Mono'",
+  "'Noto Sans Mono CJK SC'",
+  "'Noto Sans CJK SC'",
+  "'PingFang SC'",
+  "'Microsoft YaHei UI'",
+  "'Microsoft YaHei'",
+  "'WenQuanYi Micro Hei'",
+  "monospace",
+].join(", ");
 const MAX_TABLE_PREVIEW_ROWS = 80;
 const MAX_TABLE_PREVIEW_COLUMNS = 24;
 
@@ -479,7 +495,9 @@ function IntegratedTerminal({ themeMode }: { themeMode: "light" | "dark" }) {
       cursorBlink: true,
       cursorStyle: "block",
       fontSize: 13,
-      fontFamily: "'JetBrains Mono', 'Fira Code', Menlo, Monaco, 'Courier New', monospace",
+      fontFamily: TERMINAL_FONT_FAMILY,
+      lineHeight: 1.25,
+      letterSpacing: 0,
       scrollback: 5000,
       theme: themeMode === "light"
         ? {

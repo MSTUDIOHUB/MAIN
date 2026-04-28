@@ -20,7 +20,7 @@ interface TopIslandProps {
   activeDiffTask?: any;
   canApprovePlan: boolean;
   autoApproveTools?: boolean;
-  onSelectReplyOption?: (value: string) => void;
+  onSelectReplyOption?: (option: ReplyOption) => void;
   onCancelTurn?: () => void;
   onResolvePendingRunDecision?: (choice: ResolvedUserIntent | "approve_once" | "approve_thread" | "cancel") => void;
   onDismissPendingRunDecision?: () => void;
@@ -415,7 +415,7 @@ const TopIsland = memo(function TopIsland({
                       <button
                         key={`${option.value}-${index}`}
                         data-testid={`top-island-reply-option-${index}`}
-                        onClick={() => onSelectReplyOption?.(option.value)}
+                        onClick={() => onSelectReplyOption?.(option)}
                         className="w-full rounded-xl border border-[rgba(124,58,237,0.24)] bg-[rgba(124,58,237,0.08)] px-3 py-2.5 text-left text-[12px] leading-6 text-[#f5f3ff] transition-colors hover:bg-[rgba(124,58,237,0.16)]"
                       >
                         {option.label}

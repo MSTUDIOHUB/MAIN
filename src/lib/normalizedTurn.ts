@@ -371,7 +371,7 @@ function mergeReplyOptions(...groups: ReplyOption[][]): ReplyOption[] {
       const label = normalizeReplyOptionText(option.label || option.value);
       if (!value || seen.has(value)) continue;
       seen.add(value);
-      merged.push({ label, value });
+      merged.push({ label, value, ...(option.action ? { action: option.action } : {}) });
     }
   }
   return merged;

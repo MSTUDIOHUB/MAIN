@@ -71,6 +71,7 @@ export interface ChangeEntry {
 export interface ReplyOption {
   label: string;
   value: string;
+  action?: "continue_readonly_once" | "allow_readonly_session";
 }
 
 export type ConversationTurnStatus =

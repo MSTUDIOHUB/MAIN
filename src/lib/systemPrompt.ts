@@ -259,6 +259,7 @@ export function buildSystemPrompt(
       : "报告回合下，优先直接整理结构化报告。只有在必须读取项目或资料内容才能正确成文时，才使用只读工具。");
     chatInstructions.push("数据分析、文档解读、报表总结属于 MAIN 模式内允许的只读工作，不需要为了继续分析切换到 Plan 模式。");
     chatInstructions.push("不要为了这种只读降级向用户申请批准；如果某个只读工具不兼容，就直接换另一条只读路径继续。");
+    chatInstructions.push("只读读取、搜索、查看、查询、分析本身不需要逐步征求用户同意；除非存在业务口径冲突或真实分叉，否则不要问“是否同意我读取下一个文件”。");
     chatInstructions.push("如果 `analyze_tabular_document`、`query_tabular_document`、`read_document` 中某个只读工具失败，不要停下来征求用户是否允许降级；应在同一轮自动改用其他只读工具继续。");
     chatInstructions.push("推荐回退顺序：`analyze_tabular_document` 全表概览 → `query_tabular_document` 结构化筛选/聚合 → `read_document` 原始行窗口/分页读取；可按问题类型调整，但必须继续推进。");
     chatInstructions.push("只有在文件不存在、指标定义或业务口径冲突、或所有只读路径都无法支持当前问题时，才向用户解释 blocker。");

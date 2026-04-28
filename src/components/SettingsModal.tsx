@@ -1,8 +1,8 @@
 // @ts-nocheck
-import React, { useState, useEffect, useRef, useCallback } from "react";
+import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
-import { IconSettings, IconClose } from "./Icons";
+import { IconSettings, IconClose, IconPlus, IconTrash, IconCloud, IconSave } from "./Icons";
 import { type MCPServer, type MCPTool, discoverAllMcpTools, setMcpToolServerMap } from "../lib/mcpClient";
 import {
   buildOpenAiResponsesInputCandidates,
@@ -29,6 +29,11 @@ import {
   normalizeImAdaptersConfig,
   upsertFeishuPairedUser,
 } from "../lib/imAdapters";
+import {
+  createDefaultCloudConfig,
+  createCloudServerConfig,
+  normalizeCloudServerState,
+} from "../lib/cloudServers";
 
 // ── MCP Server Management Panel ──────────────────────────────────────────
 
@@ -854,17 +859,21 @@ export default function SettingsModal({
   setMcpDiscoveredTools: (tools: MCPTool[], toolServerMap: Record<string, string>) => void;
 }) {
   const [availableModels, setAvailableModels] = useState([]);
-  const [cloudAvailableModels, setCloudAvailableModels] = useState<string[]>([]);
+  const [cloudModelsByServer, setCloudModelsByServer] = useState<Record<string, string[]>>({});
+  const [cloudServerSearch, setCloudServerSearch] = useState("");
+  const [cloudDraftServer, setCloudDraftServer] = useState<any | null>(null);
+  const [cloudDraftMode, setCloudDraftMode] = useState<"saved" | "new" | null>(null);
   const [isFetchingModels, setIsFetchingModels] = useState(false);
   const [isFetchingCloudModels, setIsFetchingCloudModels] = useState(false);
   const [isTestingCloudConnection, setIsTestingCloudConnection] = useState(false);
   const [cloudModelInputMode, setCloudModelInputMode] = useState<"select" | "manual">("manual");
   const [cloudFetchMsg, setCloudFetchMsg] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
   const [cloudProbeMsg, setCloudProbeMsg] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
+  const [cloudSaveMsg, setCloudSaveMsg] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
   const [localFetchMsg, setLocalFetchMsg] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
   const [systemMemory, setSystemMemory] = useState<{ total_gb: number; available_gb: number; total_bytes?: number; available_bytes?: number } | null>(null);
   const hasAutoFetched = useRef(false);
-  const hasAutoFetchedCloud = useRef(false);
+  const cloudDraftServerRef = useRef<any | null>(null);
 
   // Auto-clear cloud fetch message after 5 seconds
   useEffect(() => {
@@ -878,6 +887,12 @@ export default function SettingsModal({
     const timer = setTimeout(() => setCloudProbeMsg(null), 5000);
     return () => clearTimeout(timer);
   }, [cloudProbeMsg]);
+
+  useEffect(() => {
+    if (!cloudSaveMsg) return;
+    const timer = setTimeout(() => setCloudSaveMsg(null), 2500);
+    return () => clearTimeout(timer);
+  }, [cloudSaveMsg]);
 
   // Auto-clear local fetch message after 5 seconds
   useEffect(() => {
@@ -1000,9 +1015,35 @@ export default function SettingsModal({
     }
   }, [config.local.provider, config.local.endpoint]);
 
-  const cloudProtocol = normalizeCloudProtocol(config.cloud.protocol);
-  const cloudApiFormat = normalizeCloudApiFormat(config.cloud.apiFormat);
-  const parsedCloudCustomHeaders = parseCloudCustomHeaders(config.cloud.customHeaders || "");
+  const cloudServerState = useMemo(() => normalizeCloudServerState({
+    cloud: config.cloud,
+    cloudServers: config.cloudServers,
+    activeCloudServerId: config.activeCloudServerId,
+  }), [config.activeCloudServerId, config.cloud, config.cloudServers]);
+  const cloudServers = cloudServerState.cloudServers;
+  const activeCloudServerId = cloudServerState.activeCloudServerId;
+  const savedActiveCloudServer = cloudServers.find((server) => server.id === activeCloudServerId) || null;
+  const draftCloudConfig = cloudDraftServer
+    ? { ...createDefaultCloudConfig(), ...cloudDraftServer }
+    : createDefaultCloudConfig();
+  const cloudAvailableModels = cloudDraftServer ? (cloudModelsByServer[cloudDraftServer.id] || []) : [];
+  const cloudProtocol = normalizeCloudProtocol(draftCloudConfig.protocol);
+  const cloudApiFormat = normalizeCloudApiFormat(draftCloudConfig.apiFormat);
+  const parsedCloudCustomHeaders = parseCloudCustomHeaders(draftCloudConfig.customHeaders || "");
+  const filteredCloudServers = cloudServers.filter((server) => {
+    const query = cloudServerSearch.trim().toLowerCase();
+    if (!query) return true;
+    return `${server.name} ${server.endpoint} ${server.provider} ${server.model}`.toLowerCase().includes(query);
+  });
+  const unsavedDraftMatchesSearch = (() => {
+    if (cloudDraftMode !== "new" || !cloudDraftServer) return false;
+    const query = cloudServerSearch.trim().toLowerCase();
+    if (!query) return true;
+    return `${cloudDraftServer.name} ${cloudDraftServer.endpoint} ${cloudDraftServer.provider} ${cloudDraftServer.model}`.toLowerCase().includes(query);
+  })();
+  const visibleCloudServers = unsavedDraftMatchesSearch
+    ? [...filteredCloudServers, cloudDraftServer]
+    : filteredCloudServers;
   const cloudEndpointPlaceholder = cloudProtocol === "anthropic"
     ? "https://api.anthropic.com"
     : cloudApiFormat === "responses"
@@ -1016,57 +1057,267 @@ export default function SettingsModal({
       ? "Responses API 可填写 API 根地址（如 https://api.openai.com/v1），也支持直接粘贴完整的 /responses 请求地址"
       : "OpenAI Chat Completions 通常填写 API 根地址（常见以 /v1 结尾），也支持直接粘贴完整的 /chat/completions 地址";
 
-  const handleCloudProtocolChange = (e) => {
-    const nextProtocol = normalizeCloudProtocol(e.target.value);
-    const nextEndpoint = nextProtocol === "anthropic" ? "https://api.anthropic.com" : "https://api.openai.com/v1";
+  useEffect(() => {
+    cloudDraftServerRef.current = cloudDraftServer;
+  }, [cloudDraftServer]);
+
+  useEffect(() => {
+    if (!isOpen || settingsTab !== "cloud") return;
+    if (cloudDraftMode === "new") return;
+    const nextDraft = savedActiveCloudServer ? { ...savedActiveCloudServer } : null;
+    setCloudDraftServer(nextDraft);
+    setCloudDraftMode(nextDraft ? "saved" : null);
+    setCloudModelInputMode(nextDraft && (cloudModelsByServer[nextDraft.id] || []).length > 0 ? "select" : "manual");
+    setCloudFetchMsg(null);
+    setCloudProbeMsg(null);
+  }, [activeCloudServerId, cloudDraftMode, isOpen, savedActiveCloudServer, settingsTab]);
+
+  const makeBlankCloudServerDraft = useCallback(() => ({
+    id: `cloud-server-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    name: "",
+    ...createDefaultCloudConfig(),
+    endpoint: "",
+    model: "",
+    apiKey: "",
+    customHeaders: "",
+  }), []);
+
+  const commitCloudServers = useCallback((servers, activeId, prevConfig) => {
+    const nextState = normalizeCloudServerState({
+      cloud: prevConfig.cloud,
+      cloudServers: servers,
+      activeCloudServerId: activeId,
+    });
+    return {
+      ...prevConfig,
+      cloud: nextState.cloud,
+      cloudServers: nextState.cloudServers,
+      activeCloudServerId: nextState.activeCloudServerId,
+    };
+  }, []);
+
+  const clearDraftCloudModelCache = useCallback((serverId = cloudDraftServer?.id) => {
+    if (!serverId) return;
+    setCloudModelsByServer((prev) => ({ ...prev, [serverId]: [] }));
+    setCloudModelInputMode("manual");
+  }, [cloudDraftServer?.id]);
+
+  const updateCloudDraftServer = useCallback((patch, options = {}) => {
+    setCloudDraftServer((prev) => prev ? { ...prev, ...patch } : prev);
+    setCloudSaveMsg(null);
+    if (options.clearModels) {
+      clearDraftCloudModelCache();
+      setCloudFetchMsg(null);
+    }
+  }, [clearDraftCloudModelCache]);
+
+  const persistCloudServer = useCallback((server) => {
+    if (!server) return null;
+    const name = String(server.name || "").trim();
+    const endpoint = String(server.endpoint || "").trim();
+    if (!name || !endpoint) return null;
+
+    const savedServer = createCloudServerConfig({
+      ...server,
+      name,
+      endpoint,
+      id: server.id,
+    }, name);
 
     setConfig((prev) => {
-      const previousProtocol = normalizeCloudProtocol(prev.cloud.protocol);
-      const previousDefaultEndpoint = previousProtocol === "anthropic" ? "https://api.anthropic.com" : "https://api.openai.com/v1";
-      const currentEndpoint = prev.cloud.endpoint || "";
-      const shouldReplaceEndpoint = !currentEndpoint.trim() || currentEndpoint === previousDefaultEndpoint;
-
-      return {
-        ...prev,
-        cloud: {
-          ...prev.cloud,
-          protocol: nextProtocol,
-          apiFormat: nextProtocol === "anthropic" ? "chat_completions" : normalizeCloudApiFormat(prev.cloud.apiFormat),
-          provider: nextProtocol === "anthropic" ? "Anthropic" : "OpenAI",
-          endpoint: shouldReplaceEndpoint ? nextEndpoint : currentEndpoint,
-        },
-      };
+      const state = normalizeCloudServerState({
+        cloud: prev.cloud,
+        cloudServers: prev.cloudServers,
+        activeCloudServerId: prev.activeCloudServerId,
+      });
+      const exists = state.cloudServers.some((item) => item.id === savedServer.id);
+      const nextServers = exists
+        ? state.cloudServers.map((item) => item.id === savedServer.id ? savedServer : item)
+        : [...state.cloudServers, savedServer];
+      return commitCloudServers(nextServers, savedServer.id, prev);
     });
+    setCloudDraftServer({ ...savedServer });
+    setCloudDraftMode("saved");
+    return savedServer;
+  }, [commitCloudServers, setConfig]);
+
+  const confirmCloudModelSelection = useCallback((model, serverOverride = null) => {
+    const sourceServer = serverOverride || cloudDraftServer;
+    if (!sourceServer) return;
+    const nextModel = String(model || "").trim();
+    const nextServer = { ...sourceServer, model: nextModel };
+
+    setCloudDraftServer((prev) => prev && prev.id === sourceServer.id ? { ...prev, model: nextModel } : prev);
+    setCloudSaveMsg(null);
+
+    const isSavedServer = cloudServers.some((server) => server.id === sourceServer.id);
+    const canPersistServer = isSavedServer || (String(sourceServer.name || "").trim() && String(sourceServer.endpoint || "").trim());
+    if (canPersistServer) {
+      persistCloudServer(nextServer);
+    }
+  }, [cloudDraftServer, cloudServers, persistCloudServer]);
+
+  const serializeCloudServerForCompare = useCallback((server) => {
+    if (!server) return "";
+    return JSON.stringify({
+      name: String(server.name ?? ""),
+      protocol: normalizeCloudProtocol(server.protocol),
+      apiFormat: normalizeCloudApiFormat(server.apiFormat),
+      provider: String(server.provider ?? ""),
+      endpoint: String(server.endpoint ?? ""),
+      model: String(server.model ?? ""),
+      apiKey: String(server.apiKey ?? ""),
+      customHeaders: String(server.customHeaders ?? ""),
+      temperature: Number(server.temperature ?? 0.6),
+      topP: Number(server.topP ?? 0.95),
+      disableResponseStorage: server.disableResponseStorage !== false,
+      reasoningEffort: normalizeOpenAiReasoningEffort(server.reasoningEffort),
+    });
+  }, []);
+
+  const savedDraftSource = cloudDraftServer
+    ? cloudServers.find((server) => server.id === cloudDraftServer.id)
+    : null;
+  const hasCloudDraftChanges = cloudDraftMode === "new"
+    ? Boolean(cloudDraftServer)
+    : serializeCloudServerForCompare(cloudDraftServer) !== serializeCloudServerForCompare(savedDraftSource);
+  const canSaveCloudServer = Boolean(
+    cloudDraftServer &&
+    String(cloudDraftServer.name || "").trim() &&
+    String(cloudDraftServer.endpoint || "").trim(),
+  );
+
+  const selectCloudServer = useCallback((serverId) => {
+    const targetServer = cloudServers.find((server) => server.id === serverId);
+    if (!targetServer) return;
+    setConfig((prev) => {
+      const state = normalizeCloudServerState({
+        cloud: prev.cloud,
+        cloudServers: prev.cloudServers,
+        activeCloudServerId: prev.activeCloudServerId,
+      });
+      return commitCloudServers(state.cloudServers, serverId, prev);
+    });
+    setCloudDraftServer({ ...targetServer });
+    setCloudDraftMode("saved");
+    setCloudFetchMsg(null);
+    setCloudProbeMsg(null);
+    setCloudSaveMsg(null);
+    setCloudModelInputMode((cloudModelsByServer[serverId] || []).length > 0 ? "select" : "manual");
+  }, [cloudModelsByServer, cloudServers, commitCloudServers, setConfig]);
+
+  const addCloudServer = useCallback(() => {
+    const nextDraft = makeBlankCloudServerDraft();
+    setCloudDraftServer(nextDraft);
+    setCloudDraftMode("new");
+    setCloudFetchMsg(null);
+    setCloudProbeMsg(null);
+    setCloudSaveMsg(null);
+    setCloudModelInputMode("manual");
+  }, [makeBlankCloudServerDraft]);
+
+  const saveCloudServer = useCallback(() => {
+    if (!cloudDraftServer) return;
+    const name = String(cloudDraftServer.name || "").trim();
+    const endpoint = String(cloudDraftServer.endpoint || "").trim();
+    if (!name || !endpoint) {
+      setCloudSaveMsg({ text: "请先填写 Server Name 和 API Endpoint", type: "error" });
+      return;
+    }
+    persistCloudServer({ ...cloudDraftServer, name, endpoint });
+    setCloudFetchMsg(null);
+    setCloudProbeMsg(null);
+    setCloudSaveMsg({ text: "已保存服务器配置", type: "success" });
+  }, [cloudDraftServer, persistCloudServer]);
+
+  const removeCloudServer = useCallback((serverId) => {
+    if (cloudDraftMode === "new" && cloudDraftServer?.id === serverId) {
+      setCloudDraftServer(savedActiveCloudServer ? { ...savedActiveCloudServer } : null);
+      setCloudDraftMode(savedActiveCloudServer ? "saved" : null);
+      setCloudFetchMsg(null);
+      setCloudProbeMsg(null);
+      setCloudSaveMsg(null);
+      return;
+    }
+    setConfig((prev) => {
+      const state = normalizeCloudServerState({
+        cloud: prev.cloud,
+        cloudServers: prev.cloudServers,
+        activeCloudServerId: prev.activeCloudServerId,
+      });
+      const removedIndex = state.cloudServers.findIndex((server) => server.id === serverId);
+      const nextServers = state.cloudServers.filter((server) => server.id !== serverId);
+      const nextActiveId = state.activeCloudServerId === serverId
+        ? nextServers[Math.min(Math.max(removedIndex, 0), nextServers.length - 1)]?.id
+        : state.activeCloudServerId;
+      return commitCloudServers(nextServers, nextActiveId, prev);
+    });
+    setCloudModelsByServer((prev) => {
+      const next = { ...prev };
+      delete next[serverId];
+      return next;
+    });
+    if (cloudDraftServer?.id === serverId) {
+      const removedIndex = cloudServers.findIndex((server) => server.id === serverId);
+      const remainingServers = cloudServers.filter((server) => server.id !== serverId);
+      const nextDraftSource = remainingServers[Math.min(Math.max(removedIndex, 0), remainingServers.length - 1)];
+      const nextDraft = nextDraftSource ? { ...nextDraftSource } : null;
+      setCloudDraftServer(nextDraft);
+      setCloudDraftMode(nextDraft ? "saved" : null);
+      setCloudModelInputMode(nextDraft && (cloudModelsByServer[nextDraft.id] || []).length > 0 ? "select" : "manual");
+    }
+    setCloudFetchMsg(null);
+    setCloudProbeMsg(null);
+    setCloudSaveMsg(null);
+  }, [cloudDraftMode, cloudDraftServer, cloudModelsByServer, cloudServers, commitCloudServers, savedActiveCloudServer, setConfig]);
+
+  const handleCloudProtocolChange = (e) => {
+    if (!cloudDraftServer) return;
+    const nextProtocol = normalizeCloudProtocol(e.target.value);
+    const nextEndpoint = nextProtocol === "anthropic" ? "https://api.anthropic.com" : "https://api.openai.com/v1";
+    const previousProtocol = normalizeCloudProtocol(draftCloudConfig.protocol);
+    const previousDefaultEndpoint = previousProtocol === "anthropic" ? "https://api.anthropic.com" : "https://api.openai.com/v1";
+    const currentEndpoint = draftCloudConfig.endpoint || "";
+    const shouldReplaceEndpoint = !currentEndpoint.trim() || currentEndpoint === previousDefaultEndpoint;
+
+    updateCloudDraftServer({
+      protocol: nextProtocol,
+      apiFormat: nextProtocol === "anthropic" ? "chat_completions" : normalizeCloudApiFormat(draftCloudConfig.apiFormat),
+      provider: nextProtocol === "anthropic" ? "Anthropic" : "OpenAI",
+      endpoint: shouldReplaceEndpoint ? nextEndpoint : currentEndpoint,
+      model: "",
+    }, { clearModels: true });
     setCloudFetchMsg(null);
     setCloudProbeMsg(null);
   };
 
   const handleCloudApiFormatChange = (e) => {
     const nextApiFormat = normalizeCloudApiFormat(e.target.value);
-    setConfig((prev) => ({
-      ...prev,
-      cloud: {
-        ...prev.cloud,
-        apiFormat: nextApiFormat,
-      },
-    }));
+    updateCloudDraftServer({ apiFormat: nextApiFormat });
     setCloudProbeMsg(null);
   };
 
-  const refreshCloudModels = useCallback(async () => {
+  const refreshCloudModels = useCallback(async (serverOverride = null) => {
     if (isFetchingCloudModels) return;
+    const targetServer = serverOverride || cloudDraftServer;
+    if (!targetServer) {
+      setCloudFetchMsg({ text: "请先新建或选择一个服务器", type: "error" });
+      return;
+    }
+    const targetServerId = targetServer.id;
+    const targetProtocol = normalizeCloudProtocol(targetServer.protocol);
     setIsFetchingCloudModels(true);
     setCloudFetchMsg(null);
 
     try {
-      const endpoint = config.cloud.endpoint?.trim();
+      const endpoint = targetServer.endpoint?.trim();
       if (!endpoint) {
         setCloudFetchMsg({ text: "请先填写 API Endpoint", type: "error" });
         return;
       }
 
-      const candidates = buildCloudModelListCandidates(endpoint, cloudProtocol);
-      const headers = buildCloudHeaders(cloudProtocol, config.cloud.apiKey || "", false, config.cloud.customHeaders);
+      const candidates = buildCloudModelListCandidates(endpoint, targetProtocol);
+      const headers = buildCloudHeaders(targetProtocol, targetServer.apiKey || "", false, targetServer.customHeaders);
 
       for (const url of candidates) {
         try {
@@ -1079,13 +1330,19 @@ export default function SettingsModal({
           const models = extractCloudModelIds(JSON.parse(body));
           if (models.length === 0) continue;
 
-          const selectedModel = models.includes(config.cloud.model) ? config.cloud.model : models[0];
-          setCloudAvailableModels(models);
+          const latestServer = cloudDraftServerRef.current;
+          const isStaleResult = !latestServer
+            || latestServer.id !== targetServerId
+            || normalizeCloudProtocol(latestServer.protocol) !== targetProtocol
+            || latestServer.endpoint !== targetServer.endpoint
+            || latestServer.apiKey !== targetServer.apiKey
+            || latestServer.customHeaders !== targetServer.customHeaders;
+          if (isStaleResult) return;
+
+          const selectedModel = models.includes(targetServer.model) ? targetServer.model : models[0];
+          setCloudModelsByServer((prev) => ({ ...prev, [targetServerId]: models }));
           setCloudModelInputMode("select");
-          setConfig((prev) => ({
-            ...prev,
-            cloud: { ...prev.cloud, model: selectedModel },
-          }));
+          confirmCloudModelSelection(selectedModel, targetServer);
           setCloudFetchMsg({ text: `已拉取 ${models.length} 个模型，当前选择 ${selectedModel}`, type: "success" });
           return;
         } catch {
@@ -1093,21 +1350,21 @@ export default function SettingsModal({
         }
       }
 
-      setCloudAvailableModels([]);
+      setCloudModelsByServer((prev) => ({ ...prev, [targetServerId]: [] }));
       setCloudFetchMsg({ text: "未发现可用模型，请检查 Endpoint、协议和 API Key", type: "error" });
     } catch (err) {
-      setCloudAvailableModels([]);
+      setCloudModelsByServer((prev) => ({ ...prev, [targetServerId]: [] }));
       setCloudFetchMsg({ text: "连接失败: " + (err instanceof Error ? err.message : String(err)), type: "error" });
     } finally {
       setIsFetchingCloudModels(false);
     }
-  }, [cloudProtocol, config.cloud.apiKey, config.cloud.customHeaders, config.cloud.endpoint, isFetchingCloudModels, setConfig]);
+  }, [cloudDraftServer, confirmCloudModelSelection, isFetchingCloudModels]);
 
   const testCloudConnection = useCallback(async () => {
     if (isTestingCloudConnection) return;
 
-    const endpoint = config.cloud.endpoint?.trim();
-    const testModel = config.cloud.model?.trim() || cloudAvailableModels[0] || "";
+    const endpoint = draftCloudConfig.endpoint?.trim();
+    const testModel = draftCloudConfig.model?.trim() || cloudAvailableModels[0] || "";
     if (!endpoint) {
       setCloudProbeMsg({ text: "请先填写 API Endpoint", type: "error" });
       return;
@@ -1121,7 +1378,7 @@ export default function SettingsModal({
     setCloudProbeMsg(null);
 
     try {
-      const headers = buildCloudHeaders(cloudProtocol, config.cloud.apiKey || "", true, config.cloud.customHeaders);
+      const headers = buildCloudHeaders(cloudProtocol, draftCloudConfig.apiKey || "", true, draftCloudConfig.customHeaders);
       let effectiveApiFormat = cloudApiFormat;
       let payload: unknown = null;
 
@@ -1173,8 +1430,8 @@ export default function SettingsModal({
           model: testModel,
           maxTokens: 32,
           stream: false,
-          temperature: config.cloud.temperature ?? 0.2,
-          topP: config.cloud.topP ?? 0.95,
+          temperature: draftCloudConfig.temperature ?? 0.2,
+          topP: draftCloudConfig.topP ?? 0.95,
         }));
       } else {
         const openAiProbeFormats = [cloudApiFormat, cloudApiFormat === "responses" ? "chat_completions" : "responses"];
@@ -1195,8 +1452,8 @@ export default function SettingsModal({
                     model: testModel,
                     input: candidate.input,
                     ...buildOpenAiResponsesRequestExtras({
-                      disableResponseStorage: config.cloud.disableResponseStorage,
-                      reasoningEffort: config.cloud.reasoningEffort,
+                      disableResponseStorage: draftCloudConfig.disableResponseStorage,
+                      reasoningEffort: draftCloudConfig.reasoningEffort,
                     }),
                   });
                   effectiveApiFormat = probeFormat;
@@ -1236,13 +1493,14 @@ export default function SettingsModal({
       }
 
       if (cloudProtocol === "openai" && effectiveApiFormat !== cloudApiFormat) {
-        setConfig((prev) => ({
-          ...prev,
-          cloud: {
-            ...prev.cloud,
-            apiFormat: effectiveApiFormat,
-          },
-        }));
+        updateCloudDraftServer({ apiFormat: effectiveApiFormat });
+      }
+      if (cloudDraftServer) {
+        confirmCloudModelSelection(testModel, {
+          ...cloudDraftServer,
+          apiFormat: effectiveApiFormat,
+          model: testModel,
+        });
       }
 
       const reply = cloudProtocol === "anthropic"
@@ -1270,55 +1528,20 @@ export default function SettingsModal({
   }, [
     cloudApiFormat,
     cloudAvailableModels,
+    cloudDraftServer,
     cloudProtocol,
-    config.cloud.apiKey,
-    config.cloud.customHeaders,
-    config.cloud.disableResponseStorage,
-    config.cloud.endpoint,
-    config.cloud.model,
-    config.cloud.reasoningEffort,
-    config.cloud.temperature,
-    config.cloud.topP,
+    confirmCloudModelSelection,
+    draftCloudConfig.apiKey,
+    draftCloudConfig.customHeaders,
+    draftCloudConfig.disableResponseStorage,
+    draftCloudConfig.endpoint,
+    draftCloudConfig.model,
+    draftCloudConfig.reasoningEffort,
+    draftCloudConfig.temperature,
+    draftCloudConfig.topP,
     isTestingCloudConnection,
+    updateCloudDraftServer,
   ]);
-
-  useEffect(() => {
-    if (isOpen && settingsTab === "cloud" && !hasAutoFetchedCloud.current) {
-      hasAutoFetchedCloud.current = true;
-      if (config.cloud.endpoint?.trim()) {
-        refreshCloudModels();
-      }
-    }
-    if (!isOpen) hasAutoFetchedCloud.current = false;
-  }, [config.cloud.endpoint, isOpen, refreshCloudModels, settingsTab]);
-
-  const prevCloudProtocol = useRef(cloudProtocol);
-  const prevCloudEndpoint = useRef(config.cloud.endpoint);
-  const prevCloudApiKey = useRef(config.cloud.apiKey);
-  const prevCloudCustomHeaders = useRef(config.cloud.customHeaders);
-  useEffect(() => {
-    const protocolChanged = prevCloudProtocol.current !== cloudProtocol;
-    const endpointChanged = prevCloudEndpoint.current !== config.cloud.endpoint;
-    const apiKeyChanged = prevCloudApiKey.current !== config.cloud.apiKey;
-    const customHeadersChanged = prevCloudCustomHeaders.current !== config.cloud.customHeaders;
-
-    if (!protocolChanged && !endpointChanged && !apiKeyChanged && !customHeadersChanged) return;
-
-    prevCloudProtocol.current = cloudProtocol;
-    prevCloudEndpoint.current = config.cloud.endpoint;
-    prevCloudApiKey.current = config.cloud.apiKey;
-    prevCloudCustomHeaders.current = config.cloud.customHeaders;
-
-    if (!config.cloud.endpoint?.trim()) {
-      setCloudAvailableModels([]);
-      setCloudModelInputMode("manual");
-      return;
-    }
-
-    if (hasAutoFetchedCloud.current && settingsTab === "cloud") {
-      refreshCloudModels();
-    }
-  }, [cloudProtocol, config.cloud.apiKey, config.cloud.customHeaders, config.cloud.endpoint, refreshCloudModels, settingsTab]);
 
   // ── VRAM slider calculations ──
   const contextMin = 4096;
@@ -1691,213 +1914,401 @@ export default function SettingsModal({
 
             {/* CLOUDED API SETTINGS */}
             {settingsTab === 'cloud' && (
-              <div className="space-y-6">
-                <div className="flex items-center justify-between">
-                  <h3 className="text-[13px] font-bold text-[#a1a1aa] uppercase tracking-wider">{t.cloudSetup}</h3>
+              <div className="space-y-5">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <h3 className="text-[13px] font-bold text-[#a1a1aa] uppercase tracking-wider">{t.cloudSetup}</h3>
+                    <p className="mt-1 text-[11.5px] text-[#71717a]">管理多个云端服务器配置。新建或编辑后点击保存，模型列表只会在点击刷新时获取。</p>
+                  </div>
                   <button onClick={() => setConfig({ ...config, activeProfile: 'cloud' })} className={`text-[11px] px-2.5 py-1.5 rounded border uppercase font-bold tracking-wider transition-colors ${config.activeProfile === 'cloud' ? 'theme-subtle-bg theme-subtle-border theme-text' : 'bg-[#18181b] text-[#a1a1aa] border-transparent hover:text-white'}`}>
                     {config.activeProfile === 'cloud' ? 'Active Profile' : 'Set as Active'}
                   </button>
                 </div>
 
-                <div>
-                  <label className="block text-[13px] font-bold text-[#e4e4e7] mb-2">API Protocol</label>
-                  <p className="text-[11.5px] text-[#71717a] mb-2">选择云端服务遵循的协议格式。聚合平台通常走 OpenAI Compatible，Claude 原生接口走 Anthropic</p>
-                  <select
-                    value={cloudProtocol}
-                    onChange={handleCloudProtocolChange}
-                    className="w-full bg-[#000000] border border-[#27272a] rounded-md p-2.5 text-[14px] text-white focus:outline-none theme-ring"
-                  >
-                    <option value="openai">OpenAI Compatible</option>
-                    <option value="anthropic">Anthropic</option>
-                  </select>
-                </div>
-
-                {cloudProtocol === "openai" && (
-                  <div>
-                    <label className="block text-[13px] font-bold text-[#e4e4e7] mb-2">API Format</label>
-                    <p className="text-[11.5px] text-[#71717a] mb-2">弱兼容网关可先尝试 Chat Completions；如果服务像 Codex 一样使用 `wire_api = responses`，请切换到 Responses API</p>
-                    <select
-                      value={cloudApiFormat}
-                      onChange={handleCloudApiFormatChange}
-                      className="w-full bg-[#000000] border border-[#27272a] rounded-md p-2.5 text-[14px] text-white focus:outline-none theme-ring"
-                    >
-                      <option value="chat_completions">OpenAI Chat Completions</option>
-                      <option value="responses">OpenAI Responses API</option>
-                    </select>
-                  </div>
-                )}
-
-                <div>
-                  <label className="block text-[13px] font-bold text-[#e4e4e7] mb-2">API Endpoint</label>
-                  <p className="text-[11.5px] text-[#71717a] mb-2">{cloudEndpointHint}</p>
-                  <input type="text" value={config.cloud.endpoint || ""} onChange={(e) => setConfig({ ...config, cloud: { ...config.cloud, endpoint: e.target.value } })} placeholder={cloudEndpointPlaceholder} className="w-full bg-[#000000] border border-[#27272a] rounded-md p-2.5 text-[14px] text-white focus:outline-none theme-ring font-mono placeholder:text-[#3f3f46]" />
-                </div>
-
-                <div>
-                  <label className="block text-[13px] font-bold text-[#e4e4e7] mb-2">API Key <span className="text-[#71717a] font-normal">(如服务不需要可留空)</span></label>
-                  <p className="text-[11.5px] text-[#71717a] mb-2">{cloudProtocol === "anthropic" ? "Anthropic 协议会使用 x-api-key 请求头" : "OpenAI 兼容协议会默认同时发送 Authorization: Bearer 和 x-api-key 请求头，以兼容更多聚合网关"}</p>
-                  <input type="password" value={config.cloud.apiKey || ""} onChange={(e) => setConfig({ ...config, cloud: { ...config.cloud, apiKey: e.target.value } })} placeholder={cloudApiKeyPlaceholder} className="w-full bg-[#000000] border border-[#27272a] rounded-md p-2.5 text-[14px] text-white focus:outline-none theme-ring font-mono placeholder:text-[#3f3f46]" />
-                </div>
-
-                <div>
-                  <label className="block text-[13px] font-bold text-[#e4e4e7] mb-2">Additional Headers (JSON) <span className="text-[#71717a] font-normal">(可选)</span></label>
-                  <p className="text-[11.5px] text-[#71717a] mb-2">需要厂商专用请求头时可填写 JSON 对象，或 [{'{'}"header","value"{'}'}] 数组，例如 {`{"HTTP-Referer":"https://example.com","X-Title":"MAIN"}`}</p>
-                  <textarea
-                    value={config.cloud.customHeaders || ""}
-                    onChange={(e) => setConfig({ ...config, cloud: { ...config.cloud, customHeaders: e.target.value } })}
-                    placeholder='{"HTTP-Referer":"https://example.com","X-Title":"MAIN"}'
-                    className="w-full min-h-[92px] bg-[#000000] border border-[#27272a] rounded-md p-2.5 text-[13px] text-white focus:outline-none theme-ring font-mono placeholder:text-[#3f3f46] resize-y"
-                  />
-                  {parsedCloudCustomHeaders.error ? (
-                    <p className="mt-2 text-[12px] text-[#f48771]">{parsedCloudCustomHeaders.error}</p>
-                  ) : (
-                    <p className="mt-2 text-[11px] text-[#71717a]">
-                      当前将附加 {Object.keys(parsedCloudCustomHeaders.headers).length} 个自定义请求头
-                    </p>
-                  )}
-                </div>
-
-                <div>
-                  <label className="block text-[13px] font-bold text-[#e4e4e7] mb-2">Model Name</label>
-                  <div className="flex items-center justify-between gap-3 mb-2">
-                    <p className="text-[11.5px] text-[#71717a]">远端服务上的模型标识，刷新成功后可直接下拉选择</p>
-                    {cloudAvailableModels.length > 0 && (
-                      <button
-                        data-testid="cloud-model-mode-toggle"
-                        onClick={() => {
-                          if (cloudModelInputMode === "manual") {
-                            const nextModel = cloudAvailableModels.includes(config.cloud.model)
-                              ? config.cloud.model
-                              : cloudAvailableModels[0];
-                            setConfig({ ...config, cloud: { ...config.cloud, model: nextModel } });
-                            setCloudModelInputMode("select");
-                            return;
-                          }
-                          setCloudModelInputMode("manual");
-                        }}
-                        className="text-[11px] font-bold text-[#a1a1aa] hover:text-white transition-colors shrink-0"
-                      >
-                        {cloudModelInputMode === "select" ? "手动输入" : "下拉选择"}
-                      </button>
-                    )}
-                  </div>
-                  <div className="flex gap-2">
-                    {cloudAvailableModels.length > 0 && cloudModelInputMode === "select" ? (
-                      <select
-                        data-testid="cloud-model-select"
-                        value={config.cloud.model || ""}
-                        onChange={(e) => setConfig({ ...config, cloud: { ...config.cloud, model: e.target.value } })}
-                        disabled={isFetchingCloudModels}
-                        className="flex-1 bg-[#000000] border border-[#27272a] rounded-md p-2.5 text-[14px] text-white focus:outline-none theme-ring transition-colors cursor-pointer"
-                      >
-                        {cloudAvailableModels.map((model) => (
-                          <option key={model} value={model}>{model}</option>
-                        ))}
-                      </select>
-                    ) : (
-                      <input data-testid="cloud-model-input" type="text" value={config.cloud.model || ""} onChange={(e) => setConfig({ ...config, cloud: { ...config.cloud, model: e.target.value } })} placeholder={cloudModelPlaceholder} className="flex-1 bg-[#000000] border border-[#27272a] rounded-md p-2.5 text-[14px] text-white focus:outline-none theme-ring font-mono placeholder:text-[#3f3f46]" />
-                    )}
-                    <button
-                      data-testid="cloud-model-refresh"
-                      onClick={refreshCloudModels}
-                      disabled={isFetchingCloudModels}
-                      className="px-3 py-2 text-[12px] font-bold bg-[#18181b] text-[#a1a1aa] hover:text-white border border-[#27272a] rounded-md transition-colors shrink-0 disabled:opacity-50"
-                    >{isFetchingCloudModels ? '刷新中...' : '刷新'}</button>
-                    <button
-                      data-testid="cloud-model-test"
-                      onClick={testCloudConnection}
-                      disabled={isTestingCloudConnection}
-                      className="px-3 py-2 text-[12px] font-bold bg-[#18181b] text-[#a1a1aa] hover:text-white border border-[#27272a] rounded-md transition-colors shrink-0 disabled:opacity-50"
-                    >{isTestingCloudConnection ? '测试中...' : '测试'}</button>
-                  </div>
-                  {cloudAvailableModels.length > 0 && (
-                    <p data-testid="cloud-model-fetched-count" className="mt-2 text-[11px] text-[#71717a]">
-                      已拉取 {cloudAvailableModels.length} 个模型
-                    </p>
-                  )}
-                  {cloudFetchMsg && (
-                    <p className={`mt-2 text-[12px] ${cloudFetchMsg.type === 'error' ? 'text-[#f48771]' : 'text-[#86d9a3]'}`}>
-                      {cloudFetchMsg.text}
-                    </p>
-                  )}
-                  {cloudProbeMsg && (
-                    <p className={`mt-2 text-[12px] ${cloudProbeMsg.type === 'error' ? 'text-[#f48771]' : 'text-[#86d9a3]'}`}>
-                      {cloudProbeMsg.text}
-                    </p>
-                  )}
-                </div>
-
-                <div className="pt-5 border-t border-[#27272a]">
-                  <label className="block text-xs font-bold text-[#e4e4e7] mb-3">模型参数</label>
-
-                  <div className="space-y-4">
-                    {cloudProtocol === "openai" && cloudApiFormat === "responses" && (
-                      <>
-                        <div>
-                          <label className="block text-[12px] text-[#a1a1aa] mb-1.5">Reasoning Effort</label>
-                          <p className="text-[11px] text-[#71717a] mb-2">建议保持 None，响应最快且不容易触发云端 524；只有复杂推理任务再手动切到 High / XHigh。</p>
-                          <select
-                            value={normalizeOpenAiReasoningEffort(config.cloud.reasoningEffort)}
-                            onChange={(e) => setConfig({ ...config, cloud: { ...config.cloud, reasoningEffort: normalizeOpenAiReasoningEffort(e.target.value) } })}
-                            className="w-full bg-[#000000] border border-[#27272a] rounded-md p-2.5 text-[14px] text-white focus:outline-none theme-ring"
+                <section data-testid="cloud-model-panel" className="rounded-lg border border-[#27272a] bg-[#000000] p-4">
+                  {cloudDraftServer ? (
+                    <>
+                      <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <label className="block text-[13px] font-bold text-[#e4e4e7]">Model Name</label>
+                          <p className="mt-1 text-[11.5px] text-[#71717a]">
+                            当前服务器：<span className="text-[#a1a1aa]">{cloudDraftServer.name || "未命名服务器"}</span>
+                            {cloudDraftMode === "new" && <span className="ml-2 rounded border border-[#3f3f46] px-1.5 py-0.5 text-[9px] font-bold uppercase text-[#a1a1aa]">未保存</span>}
+                          </p>
+                        </div>
+                        {cloudAvailableModels.length > 0 && (
+                          <button
+                            data-testid="cloud-model-mode-toggle"
+                            onClick={() => {
+                              if (cloudModelInputMode === "manual") {
+                                const nextModel = cloudAvailableModels.includes(draftCloudConfig.model)
+                                  ? draftCloudConfig.model
+                                  : cloudAvailableModels[0];
+                                confirmCloudModelSelection(nextModel);
+                                setCloudModelInputMode("select");
+                                return;
+                              }
+                              setCloudModelInputMode("manual");
+                            }}
+                            className="text-[11px] font-bold text-[#a1a1aa] transition-colors hover:text-white"
                           >
-                            <option value="none">None</option>
-                            <option value="minimal">Minimal</option>
-                            <option value="low">Low</option>
-                            <option value="medium">Medium</option>
-                            <option value="high">High</option>
-                            <option value="xhigh">XHigh</option>
+                            {cloudModelInputMode === "select" ? "手动输入" : "下拉选择"}
+                          </button>
+                        )}
+                      </div>
+                      <div className="flex flex-col gap-2 sm:flex-row">
+                        {cloudAvailableModels.length > 0 && cloudModelInputMode === "select" ? (
+                          <select
+                            data-testid="cloud-model-select"
+                            value={draftCloudConfig.model || ""}
+                            onChange={(e) => confirmCloudModelSelection(e.target.value)}
+                            disabled={isFetchingCloudModels}
+                            className="min-w-0 flex-1 rounded-md border border-[#27272a] bg-[#000000] p-2.5 text-[14px] text-white outline-none theme-ring transition-colors"
+                          >
+                            {cloudAvailableModels.map((model) => (
+                              <option key={model} value={model}>{model}</option>
+                            ))}
+                          </select>
+                        ) : (
+                          <input
+                            data-testid="cloud-model-input"
+                            type="text"
+                            value={draftCloudConfig.model || ""}
+                            onChange={(e) => confirmCloudModelSelection(e.target.value)}
+                            placeholder={cloudModelPlaceholder}
+                            className="min-w-0 flex-1 rounded-md border border-[#27272a] bg-[#000000] p-2.5 font-mono text-[14px] text-white outline-none theme-ring placeholder:text-[#3f3f46]"
+                          />
+                        )}
+                        <button
+                          data-testid="cloud-model-refresh"
+                          onClick={() => refreshCloudModels()}
+                          disabled={isFetchingCloudModels}
+                          className="shrink-0 rounded-md border border-[#27272a] bg-[#18181b] px-3 py-2 text-[12px] font-bold text-[#a1a1aa] transition-colors hover:text-white disabled:opacity-50"
+                        >{isFetchingCloudModels ? '刷新中...' : '刷新'}</button>
+                        <button
+                          data-testid="cloud-model-test"
+                          onClick={testCloudConnection}
+                          disabled={isTestingCloudConnection}
+                          className="shrink-0 rounded-md border border-[#27272a] bg-[#18181b] px-3 py-2 text-[12px] font-bold text-[#a1a1aa] transition-colors hover:text-white disabled:opacity-50"
+                        >{isTestingCloudConnection ? '测试中...' : '测试'}</button>
+                      </div>
+                      {cloudAvailableModels.length > 0 && (
+                        <p data-testid="cloud-model-fetched-count" className="mt-2 text-[11px] text-[#71717a]">已拉取 {cloudAvailableModels.length} 个模型</p>
+                      )}
+                      {cloudFetchMsg && <p className={`mt-2 text-[12px] ${cloudFetchMsg.type === 'error' ? 'text-[#f48771]' : 'text-[#86d9a3]'}`}>{cloudFetchMsg.text}</p>}
+                      {cloudProbeMsg && <p className={`mt-2 text-[12px] ${cloudProbeMsg.type === 'error' ? 'text-[#f48771]' : 'text-[#86d9a3]'}`}>{cloudProbeMsg.text}</p>}
+                    </>
+                  ) : (
+                    <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                      <div className="flex min-w-0 items-start gap-3">
+                        <div className="flex h-9 w-9 items-center justify-center rounded-md border border-[#27272a] bg-[#09090b] text-[#71717a]">
+                          <IconCloud className="h-4 w-4" />
+                        </div>
+                        <div className="min-w-0">
+                          <p className="text-[13px] font-bold text-[#e4e4e7]">还没有云端服务器</p>
+                          <p className="mt-1 text-[11.5px] text-[#71717a]">从左侧新增服务器后，再在这里手动刷新模型列表。</p>
+                        </div>
+                      </div>
+                      <button
+                        onClick={addCloudServer}
+                        className="inline-flex items-center justify-center gap-2 rounded-md theme-bg theme-bg-hover px-3 py-2 text-[12px] font-bold text-white transition-colors"
+                      >
+                        <IconPlus className="h-3.5 w-3.5" /> 新增服务器
+                      </button>
+                    </div>
+                  )}
+                </section>
+
+                <div className="grid gap-4 lg:grid-cols-[280px_minmax(0,1fr)]">
+                  <aside className="min-w-0 rounded-lg border border-[#27272a] bg-[#000000] p-3">
+                    <div className="mb-3 flex items-center justify-between gap-2">
+                      <div className="min-w-0">
+                        <div className="text-[12px] font-bold uppercase tracking-wider text-[#a1a1aa]">服务器</div>
+                        <div className="text-[11px] text-[#71717a]">{cloudServers.length} 个配置</div>
+                      </div>
+                      <button
+                        data-testid="cloud-server-add"
+                        onClick={addCloudServer}
+                        className="flex h-8 w-8 items-center justify-center rounded-md border border-[#27272a] bg-[#18181b] text-[#e4e4e7] transition-colors hover:border-[#3f3f46]"
+                        title="新增服务器"
+                      >
+                        <IconPlus className="h-4 w-4" />
+                      </button>
+                    </div>
+                    <input
+                      data-testid="cloud-server-search"
+                      value={cloudServerSearch}
+                      onChange={(e) => setCloudServerSearch(e.target.value)}
+                      placeholder="搜索名称、Endpoint、模型"
+                      className="mb-3 w-full rounded-md border border-[#27272a] bg-[#09090b] p-2 text-[12px] text-white outline-none theme-ring placeholder:text-[#3f3f46]"
+                    />
+                    <div data-testid="cloud-server-list" className="max-h-[420px] space-y-2 overflow-y-auto pr-1">
+                      {visibleCloudServers.length === 0 ? (
+                        <div className="rounded-md border border-dashed border-[#27272a] p-4 text-center text-[12px] text-[#71717a]">
+                          {cloudServers.length === 0 && !cloudDraftServer ? "暂无服务器配置" : "没有匹配的服务器"}
+                        </div>
+                      ) : (
+                        visibleCloudServers.map((server) => {
+                          const isSelectedServer = cloudDraftServer?.id === server.id;
+                          const isActiveServer = server.id === activeCloudServerId;
+                          const isUnsavedServer = cloudDraftMode === "new" && cloudDraftServer?.id === server.id && !cloudServers.some((saved) => saved.id === server.id);
+                          return (
+                            <div
+                              key={server.id}
+                              data-testid="cloud-server-item"
+                              role="button"
+                              tabIndex={0}
+                              onClick={() => selectCloudServer(server.id)}
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter" || e.key === " ") {
+                                  e.preventDefault();
+                                  selectCloudServer(server.id);
+                                }
+                              }}
+                              className={`group w-full rounded-md border p-3 text-left transition-colors ${isSelectedServer ? "theme-subtle-bg theme-subtle-border" : "border-[#27272a] bg-[#09090b] hover:border-[#3f3f46]"}`}
+                            >
+                              <div className="flex items-start gap-2">
+                                <IconCloud className={`mt-0.5 h-4 w-4 ${isSelectedServer ? "theme-text" : "text-[#71717a]"}`} />
+                                <div className="min-w-0 flex-1">
+                                  <div className="flex items-center gap-2">
+                                    <span className="truncate text-[13px] font-bold text-[#e4e4e7]">{server.name || (isUnsavedServer ? "未保存服务器" : "未命名服务器")}</span>
+                                    {isActiveServer && <span className="shrink-0 rounded border theme-subtle-border px-1.5 py-0.5 text-[9px] font-bold uppercase theme-text">Active</span>}
+                                    {isUnsavedServer && <span className="shrink-0 rounded border border-[#3f3f46] px-1.5 py-0.5 text-[9px] font-bold uppercase text-[#a1a1aa]">未保存</span>}
+                                  </div>
+                                  <div className="mt-1 flex items-center gap-1.5">
+                                    <span className="rounded bg-[#18181b] px-1.5 py-0.5 text-[9px] font-bold uppercase text-[#a1a1aa]">{normalizeCloudProtocol(server.protocol) === "anthropic" ? "Anthropic" : "OpenAI"}</span>
+                                    {server.model && <span className="truncate text-[10px] text-[#71717a]">{server.model}</span>}
+                                  </div>
+                                  <div className="mt-1 truncate font-mono text-[10px] text-[#71717a]">{server.endpoint || "未填写 Endpoint"}</div>
+                                </div>
+                                <span
+                                  role="button"
+                                  tabIndex={0}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    removeCloudServer(server.id);
+                                  }}
+                                  onKeyDown={(e) => {
+                                    if (e.key === "Enter" || e.key === " ") {
+                                      e.preventDefault();
+                                      e.stopPropagation();
+                                      removeCloudServer(server.id);
+                                    }
+                                  }}
+                                  className="mt-0.5 rounded p-1 text-[#71717a] opacity-0 transition-colors hover:bg-[#181111] hover:text-[#fca5a5] group-hover:opacity-100"
+                                  title="删除服务器"
+                                >
+                                  <IconTrash className="h-3.5 w-3.5" />
+                                </span>
+                              </div>
+                            </div>
+                          );
+                        })
+                      )}
+                    </div>
+                  </aside>
+
+                  <div className="min-w-0 space-y-5">
+                    {cloudDraftServer ? (
+                      <>
+                    <section className="rounded-lg border border-[#27272a] bg-[#000000] p-4">
+                      <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+                        <div>
+                          <div className="text-[12px] font-bold uppercase tracking-wider text-[#a1a1aa]">服务器配置</div>
+                          {cloudSaveMsg ? (
+                            <p className={`mt-1 text-[11.5px] ${cloudSaveMsg.type === 'error' ? 'text-[#f48771]' : 'text-[#86d9a3]'}`}>{cloudSaveMsg.text}</p>
+                          ) : hasCloudDraftChanges ? (
+                            <p className="mt-1 text-[11.5px] text-[#facc15]">有未保存更改</p>
+                          ) : (
+                            <p className="mt-1 text-[11.5px] text-[#71717a]">当前服务器配置已保存</p>
+                          )}
+                        </div>
+                        <button
+                          data-testid="cloud-server-save"
+                          onClick={saveCloudServer}
+                          disabled={!canSaveCloudServer}
+                          className="inline-flex items-center justify-center gap-2 rounded-md theme-bg theme-bg-hover px-3 py-2 text-[12px] font-bold text-white transition-colors disabled:cursor-not-allowed disabled:opacity-40"
+                        >
+                          <IconSave className="h-3.5 w-3.5" /> 保存
+                        </button>
+                      </div>
+                      <div className="space-y-4">
+                        <div>
+                          <label className="mb-2 block text-[13px] font-bold text-[#e4e4e7]">Server Name</label>
+                          <input
+                            data-testid="cloud-server-name-input"
+                            type="text"
+                            value={cloudDraftServer.name ?? ""}
+                            onChange={(e) => updateCloudDraftServer({ name: e.target.value })}
+                            placeholder="例如 OpenAI / OpenRouter / 公司网关"
+                            className="w-full rounded-md border border-[#27272a] bg-[#000000] p-2.5 text-[14px] text-white outline-none theme-ring placeholder:text-[#3f3f46]"
+                          />
+                        </div>
+
+                        <div>
+                          <label className="mb-2 block text-[13px] font-bold text-[#e4e4e7]">API Protocol</label>
+                          <p className="mb-2 text-[11.5px] text-[#71717a]">选择云端服务遵循的协议格式。聚合平台通常走 OpenAI Compatible，Claude 原生接口走 Anthropic</p>
+                          <select
+                            value={cloudProtocol}
+                            onChange={handleCloudProtocolChange}
+                            className="w-full rounded-md border border-[#27272a] bg-[#000000] p-2.5 text-[14px] text-white outline-none theme-ring"
+                          >
+                            <option value="openai">OpenAI Compatible</option>
+                            <option value="anthropic">Anthropic</option>
                           </select>
                         </div>
 
-                        <label className="flex items-start gap-3 p-3 bg-[#000000] border border-[#27272a] rounded-md">
+                        {cloudProtocol === "openai" && (
+                          <div>
+                            <label className="mb-2 block text-[13px] font-bold text-[#e4e4e7]">API Format</label>
+                            <p className="mb-2 text-[11.5px] text-[#71717a]">弱兼容网关可先尝试 Chat Completions；如果服务像 Codex 一样使用 `wire_api = responses`，请切换到 Responses API</p>
+                            <select
+                              value={cloudApiFormat}
+                              onChange={handleCloudApiFormatChange}
+                              className="w-full rounded-md border border-[#27272a] bg-[#000000] p-2.5 text-[14px] text-white outline-none theme-ring"
+                            >
+                              <option value="chat_completions">OpenAI Chat Completions</option>
+                              <option value="responses">OpenAI Responses API</option>
+                            </select>
+                          </div>
+                        )}
+
+                        <div>
+                          <label className="mb-2 block text-[13px] font-bold text-[#e4e4e7]">API Endpoint</label>
+                          <p className="mb-2 text-[11.5px] text-[#71717a]">{cloudEndpointHint}</p>
                           <input
-                            type="checkbox"
-                            checked={config.cloud.disableResponseStorage !== false}
-                            onChange={(e) => setConfig({ ...config, cloud: { ...config.cloud, disableResponseStorage: e.target.checked } })}
-                            className="mt-0.5"
+                            data-testid="cloud-server-endpoint-input"
+                            type="text"
+                            value={draftCloudConfig.endpoint || ""}
+                            onChange={(e) => {
+                              updateCloudDraftServer({ endpoint: e.target.value }, { clearModels: true });
+                            }}
+                            placeholder={cloudEndpointPlaceholder}
+                            className="w-full rounded-md border border-[#27272a] bg-[#000000] p-2.5 font-mono text-[14px] text-white outline-none theme-ring placeholder:text-[#3f3f46]"
                           />
-                          <span className="min-w-0">
-                            <span className="block text-[12px] text-[#e4e4e7] font-medium">Disable Response Storage</span>
-                            <span className="block text-[11px] text-[#71717a] mt-1">对应 Codex `disable_response_storage = true`，会发送 `store: false`</span>
-                          </span>
-                        </label>
+                        </div>
 
-                        <p className="text-[11px] text-[#71717a] leading-relaxed">
-                          `Responses + gpt-5.4` 现在会尽量贴近 Codex 请求形态：使用顶层 `instructions`、发送 `store: false` / `reasoning.effort`，并让采样参数走服务端默认值。
-                        </p>
+                        <div>
+                          <label className="mb-2 block text-[13px] font-bold text-[#e4e4e7]">API Key <span className="font-normal text-[#71717a]">(如服务不需要可留空)</span></label>
+                          <p className="mb-2 text-[11.5px] text-[#71717a]">{cloudProtocol === "anthropic" ? "Anthropic 协议会使用 x-api-key 请求头" : "OpenAI 兼容协议会默认同时发送 Authorization: Bearer 和 x-api-key 请求头，以兼容更多聚合网关"}</p>
+                          <input
+                            data-testid="cloud-server-api-key-input"
+                            type="password"
+                            value={draftCloudConfig.apiKey || ""}
+                            onChange={(e) => {
+                              updateCloudDraftServer({ apiKey: e.target.value }, { clearModels: true });
+                            }}
+                            placeholder={cloudApiKeyPlaceholder}
+                            className="w-full rounded-md border border-[#27272a] bg-[#000000] p-2.5 font-mono text-[14px] text-white outline-none theme-ring placeholder:text-[#3f3f46]"
+                          />
+                        </div>
+
+                        <div>
+                          <label className="mb-2 block text-[13px] font-bold text-[#e4e4e7]">Additional Headers (JSON) <span className="font-normal text-[#71717a]">(可选)</span></label>
+                          <p className="mb-2 text-[11.5px] text-[#71717a]">需要厂商专用请求头时可填写 JSON 对象，或 [{'{'}"header","value"{'}'}] 数组，例如 {`{"HTTP-Referer":"https://example.com","X-Title":"MAIN"}`}</p>
+                          <textarea
+                            value={draftCloudConfig.customHeaders || ""}
+                            onChange={(e) => {
+                              updateCloudDraftServer({ customHeaders: e.target.value }, { clearModels: true });
+                            }}
+                            placeholder='{"HTTP-Referer":"https://example.com","X-Title":"MAIN"}'
+                            className="min-h-[92px] w-full resize-y rounded-md border border-[#27272a] bg-[#000000] p-2.5 font-mono text-[13px] text-white outline-none theme-ring placeholder:text-[#3f3f46]"
+                          />
+                          {parsedCloudCustomHeaders.error ? (
+                            <p className="mt-2 text-[12px] text-[#f48771]">{parsedCloudCustomHeaders.error}</p>
+                          ) : (
+                            <p className="mt-2 text-[11px] text-[#71717a]">当前将附加 {Object.keys(parsedCloudCustomHeaders.headers).length} 个自定义请求头</p>
+                          )}
+                        </div>
+                      </div>
+                    </section>
+
+                    <section className="rounded-lg border border-[#27272a] bg-[#000000] p-4">
+                      <div className="mb-4 text-[12px] font-bold uppercase tracking-wider text-[#a1a1aa]">模型参数</div>
+                      <div className="space-y-4">
+                        {cloudProtocol === "openai" && cloudApiFormat === "responses" && (
+                          <>
+                            <div>
+                              <label className="mb-1.5 block text-[12px] text-[#a1a1aa]">Reasoning Effort</label>
+                              <p className="mb-2 text-[11px] text-[#71717a]">建议保持 None，响应最快且不容易触发云端 524；只有复杂推理任务再手动切到 High / XHigh。</p>
+                              <select
+                                value={normalizeOpenAiReasoningEffort(draftCloudConfig.reasoningEffort)}
+                                onChange={(e) => updateCloudDraftServer({ reasoningEffort: normalizeOpenAiReasoningEffort(e.target.value) })}
+                                className="w-full rounded-md border border-[#27272a] bg-[#000000] p-2.5 text-[14px] text-white outline-none theme-ring"
+                              >
+                                <option value="none">None</option>
+                                <option value="minimal">Minimal</option>
+                                <option value="low">Low</option>
+                                <option value="medium">Medium</option>
+                                <option value="high">High</option>
+                                <option value="xhigh">XHigh</option>
+                              </select>
+                            </div>
+
+                            <label className="flex items-start gap-3 rounded-md border border-[#27272a] bg-[#000000] p-3">
+                              <input
+                                type="checkbox"
+                                checked={draftCloudConfig.disableResponseStorage !== false}
+                                onChange={(e) => updateCloudDraftServer({ disableResponseStorage: e.target.checked })}
+                                className="mt-0.5"
+                              />
+                              <span className="min-w-0">
+                                <span className="block text-[12px] font-medium text-[#e4e4e7]">Disable Response Storage</span>
+                                <span className="mt-1 block text-[11px] text-[#71717a]">对应 Codex `disable_response_storage = true`，会发送 `store: false`</span>
+                              </span>
+                            </label>
+
+                            <p className="text-[11px] leading-relaxed text-[#71717a]">`Responses + gpt-5.4` 现在会尽量贴近 Codex 请求形态：使用顶层 `instructions`、发送 `store: false` / `reasoning.effort`，并让采样参数走服务端默认值。</p>
+                          </>
+                        )}
+
+                        <div>
+                          <div className="mb-1.5 flex items-center justify-between">
+                            <span className="text-[12px] text-[#a1a1aa]">Temperature</span>
+                            <span className="rounded border theme-subtle-border px-2 py-0.5 font-mono text-[12px] theme-subtle-bg">{(draftCloudConfig.temperature ?? 0.6).toFixed(2)}</span>
+                          </div>
+                          <p className="mb-2 text-[11px] text-[#71717a]">控制输出的随机性。值越低越确定，值越高越多样</p>
+                          <input type="range" min="0" max="2" step="0.05" value={draftCloudConfig.temperature ?? 0.6} onChange={(e) => updateCloudDraftServer({ temperature: parseFloat(e.target.value) })} className="w-full cursor-pointer theme-slider" />
+                          <div className="mt-1 flex justify-between font-mono text-[11px] text-[#3f3f46]">
+                            <span>0 (精确)</span><span>1</span><span>2 (创意)</span>
+                          </div>
+                        </div>
+
+                        <div>
+                          <div className="mb-1.5 flex items-center justify-between">
+                            <span className="text-[12px] text-[#a1a1aa]">Top P</span>
+                            <span className="rounded border theme-subtle-border px-2 py-0.5 font-mono text-[12px] theme-subtle-bg">{(draftCloudConfig.topP ?? 0.95).toFixed(2)}</span>
+                          </div>
+                          <p className="mb-2 text-[11px] text-[#71717a]">核采样阈值，与 Temperature 共同影响生成质量</p>
+                          <input type="range" min="0" max="1" step="0.05" value={draftCloudConfig.topP ?? 0.95} onChange={(e) => updateCloudDraftServer({ topP: parseFloat(e.target.value) })} className="w-full cursor-pointer theme-slider" />
+                          <div className="mt-1 flex justify-between font-mono text-[11px] text-[#3f3f46]">
+                            <span>0 (窄)</span><span>0.5</span><span>1 (宽)</span>
+                          </div>
+                        </div>
+                      </div>
+                    </section>
                       </>
+                    ) : (
+                      <section className="rounded-lg border border-dashed border-[#27272a] bg-[#000000] p-8 text-center">
+                        <div className="mx-auto mb-3 flex h-10 w-10 items-center justify-center rounded-md border border-[#27272a] bg-[#09090b] text-[#71717a]">
+                          <IconCloud className="h-4 w-4" />
+                        </div>
+                        <p className="text-[13px] font-bold text-[#e4e4e7]">从 0 开始添加云端服务器</p>
+                        <p className="mt-1 text-[11.5px] text-[#71717a]">当前没有任何云端接口配置。点击新增后填写名称、协议、Endpoint 和 API Key。</p>
+                        <button
+                          onClick={addCloudServer}
+                          className="mt-4 inline-flex items-center justify-center gap-2 rounded-md theme-bg theme-bg-hover px-3 py-2 text-[12px] font-bold text-white transition-colors"
+                        >
+                          <IconPlus className="h-3.5 w-3.5" /> 新增服务器
+                        </button>
+                      </section>
                     )}
-
-                    <div>
-                      <div className="flex justify-between items-center mb-1.5">
-                        <span className="text-[12px] text-[#a1a1aa]">Temperature</span>
-                        <span className="text-[12px] font-mono theme-subtle-bg px-2 py-0.5 rounded border theme-subtle-border">{(config.cloud.temperature ?? 0.6).toFixed(2)}</span>
-                      </div>
-                      <p className="text-[11px] text-[#71717a] mb-2">控制输出的随机性。值越低越确定，值越高越多样</p>
-                      <input type="range" min="0" max="2" step="0.05" value={config.cloud.temperature ?? 0.6} onChange={(e) => setConfig({ ...config, cloud: { ...config.cloud, temperature: parseFloat(e.target.value) } })} className="w-full theme-slider cursor-pointer" />
-                      <div className="flex justify-between text-[11px] text-[#3f3f46] font-mono mt-1">
-                        <span>0 (精确)</span><span>1</span><span>2 (创意)</span>
-                      </div>
-                    </div>
-
-                    <div>
-                      <div className="flex justify-between items-center mb-1.5">
-                        <span className="text-[12px] text-[#a1a1aa]">Top P</span>
-                        <span className="text-[12px] font-mono theme-subtle-bg px-2 py-0.5 rounded border theme-subtle-border">{(config.cloud.topP ?? 0.95).toFixed(2)}</span>
-                      </div>
-                      <p className="text-[11px] text-[#71717a] mb-2">核采样阈值，与 Temperature 共同影响生成质量</p>
-                      <input type="range" min="0" max="1" step="0.05" value={config.cloud.topP ?? 0.95} onChange={(e) => setConfig({ ...config, cloud: { ...config.cloud, topP: parseFloat(e.target.value) } })} className="w-full theme-slider cursor-pointer" />
-                      <div className="flex justify-between text-[11px] text-[#3f3f46] font-mono mt-1">
-                        <span>0 (窄)</span><span>0.5</span><span>1 (宽)</span>
-                      </div>
-                    </div>
                   </div>
                 </div>
 
                 <div className="p-3 bg-[#000000] border border-[#27272a] rounded-md">
                   <p className="text-[11px] text-[#71717a] leading-relaxed">
-                    💡 <span className="text-[#a1a1aa]">提示</span>：推荐优先让用户直接在这里填写协议、Endpoint、API Key、额外请求头与模型名，不额外依赖外部配置文件。点击“刷新”会按当前协议尝试发现可用模型。
+                    <span className="text-[#a1a1aa]">提示</span>：推荐优先让用户直接在这里填写协议、Endpoint、API Key、额外请求头与模型名，不额外依赖外部配置文件。点击“刷新”会按当前选中的服务器尝试发现可用模型。
                   </p>
                 </div>
               </div>

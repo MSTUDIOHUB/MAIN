@@ -25,6 +25,7 @@ import {
   resolvePinnedConversationTurn,
   summarizePlanIntent,
   type ConversationTurn,
+  type ReplyOption,
 } from "../lib/workflowModels";
 import { resolveConversationTurnIntent } from "../lib/runIntent";
 
@@ -793,7 +794,7 @@ function AgentContentBlock({
   block: any;
   language: "zh" | "en";
   chatFontSize: number;
-  onQuickReply?: (value: string, turnId?: string) => void;
+  onQuickReply?: (value: string | ReplyOption, turnId?: string) => void;
   isStreaming: boolean;
 }) {
   const rawContent = String(block.content || "");
@@ -949,7 +950,7 @@ function AgentContentBlock({
               <button
                 key={`${block.id}-option-${optionIdx}`}
                 data-testid={`reply-option-${optionIdx}`}
-                onClick={() => onQuickReply?.(option.value, block.turnId)}
+                onClick={() => onQuickReply?.(option, block.turnId)}
                 disabled={isStreaming}
                 className="rounded-full border border-[#27272a] bg-[#050507] px-3 py-1.5 text-[12px] text-[#e4e4e7] transition-colors hover:border-[var(--accent)] hover:text-white disabled:cursor-not-allowed disabled:opacity-60"
               >
@@ -1034,6 +1035,16 @@ export default function ChatArea({
     modelUnselected: language === "zh" ? "未选择模型" : "No model selected",
     cloudLabel: language === "zh" ? "云端" : "Cloud",
   }), [language]);
+  const activeCloudServer = useMemo(() => {
+    const servers = Array.isArray(config.cloudServers) ? config.cloudServers : [];
+    return servers.find((server: any) => server.id === config.activeCloudServerId) || servers[0] || null;
+  }, [config.activeCloudServerId, config.cloudServers]);
+  const activeCloudServerName = typeof activeCloudServer?.name === "string" ? activeCloudServer.name.trim() : "";
+  const activeCloudModel = (
+    typeof activeCloudServer?.model === "string" && activeCloudServer.model.trim()
+      ? activeCloudServer.model
+      : config.cloud.model
+  ) || "";
   const {
     showDiff,
     showPlanPanel,
@@ -1112,6 +1123,7 @@ export default function ChatArea({
   const [composerHeight, setComposerHeight] = useState(220);
   const [shouldRenderTopIsland, setShouldRenderTopIsland] = useState(false);
   const [isTopIslandVisible, setIsTopIslandVisible] = useState(false);
+  const [topIslandHeight, setTopIslandHeight] = useState(0);
   // endregion
   useEffect(() => {
     elapsedBaseRef.current = Math.max(elapsedBaseRef.current, elapsedTime);
@@ -1266,6 +1278,8 @@ export default function ChatArea({
     topIslandTurnStatusKey !== "done" &&
     topIslandTurnStatusKey !== "completed_with_changes" &&
     (hasTopIslandCommandContext || hasTopIslandTaskContext);
+  const shouldShowTopIslandForHistoryPeek =
+    showTopIslandDuringHistoryPeek && shouldShowTopIslandNormally;
   const shouldShowTopIsland =
     (!!topIslandTurn || !!pendingRunDecision) &&
     (
@@ -1273,9 +1287,12 @@ export default function ChatArea({
       shouldKeepTopIslandResident ||
       (isAutoScroll
         ? shouldShowTopIslandNormally
-        : showTopIslandDuringHistoryPeek)
+        : shouldShowTopIslandForHistoryPeek)
     );
-  const chatContainerPaddingTop = 20;
+  const chatContainerPaddingTop =
+    shouldRenderTopIsland && isTopIslandVisible
+      ? Math.max(20, topIslandHeight + 84)
+      : 20;
 
   useEffect(() => {
     if (topIslandHideTimerRef.current !== null) {
@@ -1657,7 +1674,7 @@ export default function ChatArea({
   return (
     <div className="relative flex min-w-0 flex-1 flex-col bg-[#000000]">
       <div className="h-[48px] shrink-0 border-b border-[#27272a] bg-[#000000] px-4 flex items-center justify-between select-none" data-tauri-drag-region>
-        <button onClick={() => { setSettingsTab("local"); setIsSettingsOpen(true); }} className="flex min-w-0 items-center gap-2 rounded-md border border-[#27272a] bg-[#09090b] px-2.5 py-1.5 text-xs font-medium text-[#e4e4e7] transition-colors hover:bg-[#18181b]" style={{ height: 28 }}>
+        <button onClick={() => { setSettingsTab(config.activeProfile === "cloud" ? "cloud" : "local"); setIsSettingsOpen(true); }} className="flex min-w-0 items-center gap-2 rounded-md border border-[#27272a] bg-[#09090b] px-2.5 py-1.5 text-xs font-medium text-[#e4e4e7] transition-colors hover:bg-[#18181b]" style={{ height: 28 }}>
           {config.activeProfile === "local" ? (
             <>
               <span className={`h-1.5 w-1.5 rounded-full ${isStreaming ? "bg-amber-400 shadow-[0_0_5px_#fbbf24] animate-pulse" : "bg-green-500 shadow-[0_0_5px_#22c55e]"}`} />
@@ -1665,7 +1682,7 @@ export default function ChatArea({
             </>
           ) : (
             <>
-              <IconCloud className="h-3 w-3 text-[#a855f7]" />{copy.cloudLabel}: <span className="max-w-[150px] truncate font-normal text-[#a1a1aa]">{config.cloud.model || copy.modelUnselected}</span>
+              <IconCloud className="h-3 w-3 text-[#a855f7]" />{activeCloudServerName ? `${copy.cloudLabel} · ${activeCloudServerName}` : copy.cloudLabel}: <span className="max-w-[150px] truncate font-normal text-[#a1a1aa]">{activeCloudModel || copy.modelUnselected}</span>
             </>
           )}
         </button>
@@ -1742,7 +1759,7 @@ export default function ChatArea({
           activeDiffTask={activeDiffTask}
           canApprovePlan={canApprovePlan}
           autoApproveTools={autoApproveTools}
-          onSelectReplyOption={(value) => topIslandTurn && onQuickReply?.(value, topIslandTurn.id)}
+          onSelectReplyOption={(option) => topIslandTurn && onQuickReply?.(option, topIslandTurn.id)}
           onCancelTurn={onStopGeneration}
           onResolvePendingRunDecision={resolvePendingRunDecision}
           onDismissPendingRunDecision={dismissPendingRunDecision}
@@ -1753,6 +1770,7 @@ export default function ChatArea({
           onApproveDiffSession={() => approvePendingReviewForSession()}
           onOpenPlan={() => openRightPanelTab("plan")}
           onOpenDiff={() => openRightPanelTab("diff")}
+          onHeightChange={setTopIslandHeight}
         />
       )}
 

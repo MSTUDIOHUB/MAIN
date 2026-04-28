@@ -57,9 +57,12 @@ function loadTranspiledModuleSync(sourcePath) {
 }
 
 const {
+  buildReadOnlyPermissionContinuationPrompt,
   extractReplyOptions,
   serializeAssistantReplyForHistory,
+  shouldAutoContinueReadOnlyPermission,
   shouldPauseForReplyOptions,
+  stripReadOnlyPermissionPrompt,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/replyOptions.ts"));
 
 test("shouldPauseForReplyOptions pauses when the model asks the user to choose", () => {
@@ -166,4 +169,43 @@ test("extractReplyOptions normalizes single binary choices to user-clickable act
     result.replyOptions.map((option) => option.value),
     ["使用现有事件系统", "改用更简洁的委托方式"],
   );
+});
+
+test("extractReplyOptions converts Gemma-style read-only permission prompts into action options", () => {
+  const result = extractReplyOptions(`
+下一步我建议读取 BaseCombatCommand.cs 来确认命令实现。
+
+请问您是否同意我读取 \`BaseCombatCommand.cs\` 的内容？
+  `);
+
+  assert.equal(result.replyOptions.length, 2);
+  assert.equal(result.replyOptions[0].action, "continue_readonly_once");
+  assert.equal(result.replyOptions[1].action, "allow_readonly_session");
+  assert.match(result.replyOptions[0].label, /继续读取 BaseCombatCommand\.cs/);
+  assert.match(result.replyOptions[1].value, /本会话只读读取、搜索和分析步骤全部允许/);
+});
+
+test("read-only auto approval strips repeated permission prompts and builds continuation", () => {
+  const result = extractReplyOptions("请问是否同意我下一步分析 `CombatUnit.cs` 的内容？");
+
+  assert.equal(
+    shouldAutoContinueReadOnlyPermission({
+      replyOptions: result.replyOptions,
+      readOnlyAutoApproveForSession: true,
+    }),
+    true,
+  );
+  assert.equal(
+    shouldAutoContinueReadOnlyPermission({
+      replyOptions: result.replyOptions,
+      readOnlyAutoApproveForSession: false,
+    }),
+    false,
+  );
+  assert.equal(
+    stripReadOnlyPermissionPrompt("我已经完成上一段分析。\n\n请问是否同意我下一步分析 `CombatUnit.cs` 的内容？"),
+    "我已经完成上一段分析。",
+  );
+  assert.match(buildReadOnlyPermissionContinuationPrompt("zh"), /不要再询问是否同意/);
+  assert.match(buildReadOnlyPermissionContinuationPrompt("zh"), /read_file/);
 });

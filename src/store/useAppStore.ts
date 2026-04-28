@@ -54,11 +54,13 @@ import {
   extractAnthropicResponseText,
   normalizeCloudApiFormat,
   normalizeCloudProtocol,
-  normalizeOpenAiReasoningEffort,
-  type CloudApiProtocol,
-  type OpenAiApiFormat,
-  type OpenAiReasoningEffort,
 } from "../lib/cloudProtocol";
+import {
+  createDefaultCloudConfig,
+  normalizeCloudServerState,
+  type CloudProfileConfig,
+  type CloudServerConfig,
+} from "../lib/cloudServers";
 import { buildToolDiffPreview, supportsToolDiffPreview } from "../lib/toolDiff";
 import {
   buildGameStudioEnvelopeForTurn,
@@ -395,19 +397,8 @@ export interface LocalConfig {
   apiKey: string;
 }
 
-export interface CloudConfig {
-  protocol: CloudApiProtocol;
-  apiFormat: OpenAiApiFormat;
-  provider: string;
-  endpoint: string;
-  model: string;
-  apiKey: string;
-  customHeaders: string;
-  temperature: number;
-  topP: number;
-  disableResponseStorage: boolean;
-  reasoningEffort: OpenAiReasoningEffort;
-}
+export type CloudConfig = CloudProfileConfig;
+export type { CloudServerConfig } from "../lib/cloudServers";
 
 export interface AppConfig {
   language: Lang;
@@ -421,6 +412,8 @@ export interface AppConfig {
   sessionRecordingEnabled: boolean;
   local: LocalConfig;
   cloud: CloudConfig;
+  cloudServers: CloudServerConfig[];
+  activeCloudServerId: string;
   imAdapters: ImAdaptersConfig;
   workspace: string;
 }
@@ -675,11 +668,13 @@ interface AppState {
   pendingReviewTaskId: number | null;
   pendingToolCall: { name: string; arguments: Record<string, unknown> } | null;
   autoApproveTools: boolean;
+  readOnlyAutoApproveForSession: boolean;
   currentTurnExecutionConsent: { turnId: string | null; granted: boolean };
   pendingRunDecisionResolver:
     | ((choice: "approve_once" | "approve_thread" | "cancel") => void)
     | null;
   setAutoApproveTools: (v: boolean) => void;
+  setReadOnlyAutoApproveForSession: (v: boolean) => void;
   setAgentStatus: (s: AgentStatus) => void;
   resolveReview: (action: "accept" | "reject") => void;
   allowToolAction: (taskId: number) => void;
@@ -746,6 +741,8 @@ export const MOCK_LOCAL_MODELS: Record<string, string[]> = {
 
 // ── Default Values ────────────────────────────────────────────────────
 
+const defaultCloudState = normalizeCloudServerState({ cloud: createDefaultCloudConfig() });
+
 const defaultConfig: AppConfig = {
   language: "zh",
   theme: "purple",
@@ -757,19 +754,9 @@ const defaultConfig: AppConfig = {
   chatFontSize: 13,
   sessionRecordingEnabled: true,
   local: { provider: "OMLX", endpoint: "http://127.0.0.1:8080/v1", model: "", contextLimit: 16384, apiKey: "" },
-  cloud: {
-    protocol: "openai",
-    apiFormat: "chat_completions",
-    provider: "OpenAI",
-    endpoint: "https://api.openai.com/v1",
-    model: "",
-    apiKey: "",
-    customHeaders: "",
-    temperature: 0.6,
-    topP: 0.95,
-    disableResponseStorage: true,
-    reasoningEffort: "none",
-  },
+  cloud: defaultCloudState.cloud,
+  cloudServers: defaultCloudState.cloudServers,
+  activeCloudServerId: defaultCloudState.activeCloudServerId,
   imAdapters: createDefaultImAdaptersConfig(),
   workspace: "",
 };
@@ -2354,6 +2341,7 @@ export const useAppStore = create<AppState>()(
         currentWorkspace: "",
         config: { ...s.config, workspace: "" },
         sessionHookCache: [],
+        readOnlyAutoApproveForSession: false,
         showWorkspaceTreePanel: false,
       }));
       void get().refreshInstructionAndHookState();
@@ -2370,6 +2358,7 @@ export const useAppStore = create<AppState>()(
         sessionsByWorkspace: updated,
         config: { ...s.config, workspace: normalizedPath },
         sessionHookCache: [],
+        readOnlyAutoApproveForSession: false,
       };
     });
     // Register the workspace as a trusted root in the Rust backend before tools run.
@@ -2418,6 +2407,7 @@ export const useAppStore = create<AppState>()(
           s.currentSessionId === sessionId
             ? filtered[0]?.id ?? null
             : s.currentSessionId,
+        ...(s.currentSessionId === sessionId ? { readOnlyAutoApproveForSession: false } : {}),
       };
     });
   },
@@ -2437,7 +2427,11 @@ export const useAppStore = create<AppState>()(
     });
   },
 
-  setCurrentSessionId: (id: number | null) => set({ currentSessionId: id }),
+  setCurrentSessionId: (id: number | null) =>
+    set((s) => ({
+      currentSessionId: id,
+      ...(s.currentSessionId !== id ? { readOnlyAutoApproveForSession: false } : {}),
+    })),
 
   // Task Flow — now starts empty (no more mock data)
   taskFlow: [],
@@ -2490,6 +2484,7 @@ export const useAppStore = create<AppState>()(
         pendingRunDecisionResolver: null,
         executionConsentPolicy: "ask_per_turn",
         currentTurnExecutionConsent: { turnId: null, granted: false },
+        readOnlyAutoApproveForSession: false,
         planArtifacts: [],
         planTasks: [],
         planExecutionEvidenceCount: 0,
@@ -2531,6 +2526,7 @@ export const useAppStore = create<AppState>()(
       pendingRunDecisionResolver: null,
       executionConsentPolicy: "ask_per_turn",
       currentTurnExecutionConsent: { turnId: null, granted: false },
+      readOnlyAutoApproveForSession: false,
       resolvedInstructionSet: null,
       instructionSources: [],
       loadedHookDefinitions: defaultHookDefinitions,
@@ -2759,9 +2755,11 @@ export const useAppStore = create<AppState>()(
   pendingReviewTaskId: null,
   pendingToolCall: null,
   autoApproveTools: false,
+  readOnlyAutoApproveForSession: false,
   currentTurnExecutionConsent: { turnId: null, granted: false },
   pendingRunDecisionResolver: null,
   setAutoApproveTools: (v) => set({ autoApproveTools: v }),
+  setReadOnlyAutoApproveForSession: (v) => set({ readOnlyAutoApproveForSession: v }),
   setAgentStatus: (s) => set({ agentStatus: s }),
   resolveReview: (action) => {
     const state = get();
@@ -2883,6 +2881,7 @@ export const useAppStore = create<AppState>()(
       pendingToolCall: null,
       pendingFeishuApprovals: [],
       autoApproveTools: false,
+      readOnlyAutoApproveForSession: false,
       currentTurnExecutionConsent: { turnId: null, granted: false },
       planArtifacts: [],
       planTasks: [],
@@ -3261,25 +3260,38 @@ export const useAppStore = create<AppState>()(
     const sessionScopeKey = resolveSessionWorkspaceKey(state.currentWorkspace);
     let ensuredSessionId = state.currentSessionId;
     const workspaceSessions = state.sessionsByWorkspace[sessionScopeKey] || [];
-    if (!ensuredSessionId && workspaceSessions.length === 0) {
+    const hasValidCurrentSession =
+      ensuredSessionId != null &&
+      workspaceSessions.some((session) => session.id === ensuredSessionId);
+    if (!hasValidCurrentSession) {
       const autoSessionId = Date.now();
       const autoSessionTitle = state.currentWorkspace.trim()
         ? (state.config.language === "en" ? "New Conversation" : "新会话")
         : (state.config.language === "en" ? "New Chat" : "新聊天");
+      const storageStatus: "ok" | "temporary" = state.config.sessionRecordingEnabled ? "ok" : "temporary";
       const autoSession: Session = {
         id: autoSessionId,
         title: autoSessionTitle,
         date: new Date().toISOString(),
         active: true,
+        storageStatus,
+        recordingDisabled: !state.config.sessionRecordingEnabled,
         messages: [],
       };
 
       set((s) => ({
         sessionsByWorkspace: {
           ...s.sessionsByWorkspace,
-          [sessionScopeKey]: [autoSession, ...(s.sessionsByWorkspace[sessionScopeKey] || [])],
+          [sessionScopeKey]: [
+            autoSession,
+            ...(s.sessionsByWorkspace[sessionScopeKey] || []).map((session) => ({
+              ...session,
+              active: false,
+            })),
+          ],
         },
         currentSessionId: autoSessionId,
+        readOnlyAutoApproveForSession: false,
       }));
 
       ensuredSessionId = autoSessionId;
@@ -4107,6 +4119,7 @@ export const useAppStore = create<AppState>()(
         getCurrentRunIntent: () => get().getCurrentRunIntent(),
         getWorkflowMode: () => getIntentPolicy(get().getCurrentRunIntent()).workflowMode,
         getIsPlanApproved: () => get().isPlanApproved,
+        getReadOnlyAutoApproveForSession: () => get().readOnlyAutoApproveForSession,
         getPlanStage: () => get().planStage,
         getPlanTasks: () => get().planTasks,
         getStatus: () => get().agentStatus,
@@ -5114,40 +5127,6 @@ export const useAppStore = create<AppState>()(
 
         const hydratedTaskFlow = sanitizeTaskBlocksForPersist(state.taskFlow || []);
         syncTaskIdCounterFromBlocks(hydratedTaskFlow);
-
-        useAppStore.setState({
-          taskFlow: hydratedTaskFlow,
-          agentMessages: sanitizeAgentMessagesForPersist(state.agentMessages || []),
-          selectedMainModeKey: mapLegacyNexusModeToMainMode(
-            (state as Partial<AppState> & { selectedAgentKey?: string }).selectedMainModeKey ||
-              (state as Partial<AppState> & { selectedAgentKey?: string }).selectedNexusModeKey ||
-              (state as Partial<AppState> & { selectedAgentKey?: string }).selectedAgentKey,
-          ),
-          selectedNexusModeKey: mapMainModeToLegacyNexusMode(
-            mapLegacyNexusModeToMainMode(
-              (state as Partial<AppState> & { selectedAgentKey?: string }).selectedMainModeKey ||
-                (state as Partial<AppState> & { selectedAgentKey?: string }).selectedNexusModeKey ||
-                (state as Partial<AppState> & { selectedAgentKey?: string }).selectedAgentKey,
-            ),
-          ),
-          activeStudioAgentKey: normalizeStudioAgentKey(state.activeStudioAgentKey),
-          gameStudioInitialized: state.gameStudioInitialized === true,
-          pendingSlashCommand: normalizePendingSlashCommand(state.pendingSlashCommand),
-          currentTurnState: createDefaultCurrentTurnState(),
-          agentStatus: "idle",
-          isGenerating: false,
-          abortController: null,
-          pendingReviewResolve: null,
-          pendingReviewTaskId: null,
-          pendingToolCall: null,
-          autoApproveTools: false,
-          pendingRunDecision: null,
-          pendingRunDecisionResolver: null,
-          executionConsentPolicy: "ask_per_turn",
-          currentTurnExecutionConsent: { turnId: null, granted: false },
-          messages: [],
-          elapsedTime: 0,
-        });
         logStoreEvent("rehydrate_done", {
           ok: true,
           elapsedMs: Math.round(nowMs() - startedAt),
@@ -5169,6 +5148,14 @@ export const useAppStore = create<AppState>()(
           persistedState.selectedNexusModeKey ||
           persistedState.selectedAgentKey,
       );
+      const cloudState = normalizeCloudServerState({
+        cloud: {
+          ...current.config.cloud,
+          ...(persistedState.config?.cloud ?? {}),
+        },
+        cloudServers: persistedState.config?.cloudServers,
+        activeCloudServerId: persistedState.config?.activeCloudServerId,
+      });
       return {
         ...current,
         ...persistedState,
@@ -5179,24 +5166,36 @@ export const useAppStore = create<AppState>()(
             ...current.config.local,
             ...(persistedState.config?.local ?? {}),
           },
-          cloud: {
-            ...current.config.cloud,
-            ...(persistedState.config?.cloud ?? {}),
-            protocol: normalizeCloudProtocol(persistedState.config?.cloud?.protocol),
-            apiFormat: normalizeCloudApiFormat(persistedState.config?.cloud?.apiFormat),
-            reasoningEffort: normalizeOpenAiReasoningEffort(persistedState.config?.cloud?.reasoningEffort),
-            disableResponseStorage: persistedState.config?.cloud?.disableResponseStorage ?? current.config.cloud.disableResponseStorage,
-          },
+          cloud: cloudState.cloud,
+          cloudServers: cloudState.cloudServers,
+          activeCloudServerId: cloudState.activeCloudServerId,
           sessionRecordingEnabled: persistedState.config?.sessionRecordingEnabled ?? current.config.sessionRecordingEnabled,
           imAdapters: normalizeImAdaptersConfig(persistedState.config?.imAdapters),
         },
         sessionsByWorkspace: normalizeSessionsByWorkspace(persistedState.sessionsByWorkspace),
+        taskFlow: sanitizeTaskBlocksForPersist(persistedState.taskFlow || []),
+        agentMessages: sanitizeAgentMessagesForPersist(persistedState.agentMessages || []),
         selectedWorkspace: persistedState.selectedWorkspace || persistedState.currentWorkspace || current.selectedWorkspace,
         selectedMainModeKey,
         selectedNexusModeKey: mapMainModeToLegacyNexusMode(selectedMainModeKey),
         activeStudioAgentKey: normalizeStudioAgentKey(persistedState.activeStudioAgentKey),
         gameStudioInitialized: persistedState.gameStudioInitialized === true,
         pendingSlashCommand: normalizePendingSlashCommand(persistedState.pendingSlashCommand),
+        currentTurnState: createDefaultCurrentTurnState(),
+        agentStatus: "idle",
+        isGenerating: false,
+        abortController: null,
+        pendingReviewResolve: null,
+        pendingReviewTaskId: null,
+        pendingToolCall: null,
+        autoApproveTools: false,
+        readOnlyAutoApproveForSession: false,
+        pendingRunDecision: null,
+        pendingRunDecisionResolver: null,
+        executionConsentPolicy: "ask_per_turn",
+        currentTurnExecutionConsent: { turnId: null, granted: false },
+        messages: [],
+        elapsedTime: 0,
       };
     },
   }

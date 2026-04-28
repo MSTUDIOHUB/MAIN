@@ -34,7 +34,7 @@ import { normalizeStudioAgentKey } from "./lib/gameStudioCatalog";
 import { MAIN_MODE_KEYS, mapLegacyNexusModeToMainMode, mapMainModeToLegacyNexusMode } from "./lib/mainModes";
 import { resolveConversationTurnIntent } from "./lib/runIntent";
 import { runAfterNextPaint } from "./lib/uiScheduling";
-import { normalizeConversationDisplayTitle } from "./lib/workflowModels";
+import { normalizeConversationDisplayTitle, type ReplyOption } from "./lib/workflowModels";
 import { appendDebugLog } from "./lib/debugLog";
 import {
   createFeishuPairedUserFromMessage,
@@ -186,19 +186,34 @@ export default function App() {
   const refreshSessionsForScope = useCallback(async (scopeKey: string) => {
     try {
       const diskSessions = await listProjectSessions(scopeKey);
+      let mergedSessions = diskSessions;
       useAppStore.setState((state: any) => {
         const existing = state.sessionsByWorkspace[scopeKey] || [];
+        const diskIds = new Set(diskSessions.map((session: any) => String(session.id)));
         const localOnlySessions = existing.filter((session: any) =>
-          session.recordingDisabled || session.storageStatus === "missing"
+          !diskIds.has(String(session.id)) &&
+          (
+            session.active ||
+            session.recordingDisabled ||
+            session.storageStatus === "missing" ||
+            session.storageStatus === "temporary" ||
+            (Array.isArray(session.messages) && session.messages.length > 0) ||
+            !!session.runtimeSnapshot
+          )
         );
+        const shouldPreferLocalActive = localOnlySessions.some((session: any) => session.active);
+        const normalizedDiskSessions = shouldPreferLocalActive
+          ? diskSessions.map((session: any) => ({ ...session, active: false }))
+          : diskSessions;
+        mergedSessions = [...localOnlySessions, ...normalizedDiskSessions];
         return {
           sessionsByWorkspace: {
             ...state.sessionsByWorkspace,
-            [scopeKey]: [...localOnlySessions, ...diskSessions],
+            [scopeKey]: mergedSessions,
           },
         };
       });
-      return diskSessions;
+      return mergedSessions;
     } catch (error) {
       appendDebugLog("warn", "session.storage", {
         phase: "list_failed",
@@ -497,7 +512,9 @@ export default function App() {
     return true;
   }, [input]);
 
-  const handleQuickReply = useCallback((text: string, sourceTurnId?: string) => {
+  const handleQuickReply = useCallback((choice: string | ReplyOption, sourceTurnId?: string) => {
+    const text = typeof choice === "string" ? choice : choice.value;
+    const optionAction = typeof choice === "string" ? undefined : choice.action;
     const e2eQuickReplyHandler = getE2EQuickReplyHandler();
     if (e2eQuickReplyHandler?.(text, sourceTurnId)) {
       return;
@@ -515,6 +532,7 @@ export default function App() {
         : null,
       taskFlowBlocks: state.taskFlow.length,
       agentMessages: state.agentMessages.length,
+      optionAction: optionAction ?? null,
     });
     const sourceTurn = state.currentTurnId
       ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId) || null
@@ -533,6 +551,7 @@ export default function App() {
       input: "",
       contextMentions: [],
       attachedFiles: [],
+      ...(optionAction === "allow_readonly_session" ? { readOnlyAutoApproveForSession: true } : {}),
     });
 
     runAfterNextPaint(() => {
@@ -655,6 +674,7 @@ export default function App() {
         pendingReviewTaskId: null,
         pendingToolCall: null,
         autoApproveTools: false,
+        readOnlyAutoApproveForSession: false,
         planArtifacts: snapshot.planArtifacts || [],
         planTasks: snapshot.planTasks || [],
         planExecutionEvidenceCount: snapshot.planExecutionEvidenceCount ?? 0,
@@ -762,6 +782,7 @@ export default function App() {
       pendingReviewTaskId: null,
       pendingToolCall: null,
       autoApproveTools: false,
+      readOnlyAutoApproveForSession: false,
       showPlanPanel: false,
       showDiff: false,
       showTerminal: false,
@@ -803,8 +824,12 @@ export default function App() {
         setCurrentSessionId(null);
         useAppStore.getState().resetForWorkspace();
         const existing = await refreshSessionsForScope(stablePath);
-        if (existing.length === 0) await handleCreateSessionForScope(stablePath);
-        else await handleSelectSession(stablePath, existing[0].id);
+        if (existing.length > 0) {
+          const targetSession = existing.find((session: any) => session.active) || existing[0];
+          await handleSelectSession(stablePath, targetSession.id);
+        } else {
+          setCurrentSessionId(null);
+        }
       }
     } catch (error) { console.error('Failed to select workspace:', error); }
   };

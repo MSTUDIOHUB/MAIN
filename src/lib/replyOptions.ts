@@ -6,6 +6,10 @@ const DECISION_CUE_RE = /(?:请选择|请确认|请告诉我|请说明|你可以
 const ENUM_OPTION_RE = /^\s*(?:[-*]|(?:\d+|[A-Za-z])[\.\)、:：])\s+(.+?)\s*$/;
 const BINARY_SEPARATOR_RE = /\s*(?:，|,)?\s*(或者|还是|或是|\bor\b)\s*/i;
 const ENUMERATED_LINE_RE = /^\s*(?:[-*]|(?:\d+|[A-Za-z])[\.\)、:：])\s+/;
+const READONLY_PERMISSION_CUE_RE = /(?:是否|能否|可否|要不要|是否同意|是否允许|是否批准|请问|would you like|do you want|may i|shall i|should i|allow|permission|do you approve)/i;
+const READONLY_ACTION_RE = /(?:读取|查看|分析|检查|扫描|搜索|查询|浏览|梳理|提取|汇总|read|open|view|inspect|analy[sz]e|scan|search|query|review|summari[sz]e)/i;
+const READONLY_WRITE_EXCLUSION_RE = /(?:写入|修改|删除|创建|执行命令|运行命令|改动|更改|write|modify|delete|create|edit|run command|execute command)/i;
+const READONLY_TARGET_RE = /[`"“']([^`"“”']{2,160})[`"”']|([A-Za-z0-9_.\-\/\\]+\.[A-Za-z0-9]{1,12})/;
 
 function normalizeOptionText(text: string): string {
   return text.replace(/\s+/g, " ").trim();
@@ -37,12 +41,13 @@ function addReplyOption(
   seenValues: Set<string>,
   rawLabel: string,
   rawValue?: string,
+  action?: ReplyOption["action"],
 ) {
   const label = normalizeReplyOptionLabel(rawLabel || rawValue || "");
   const value = normalizeReplyOptionValue(rawValue || rawLabel);
   if (!label || !value || seenValues.has(value)) return;
   seenValues.add(value);
-  replyOptions.push({ label, value });
+  replyOptions.push({ label, value, ...(action ? { action } : {}) });
 }
 
 function convertAssistantClauseToUserChoice(clause: string): string {
@@ -154,6 +159,95 @@ function inferReplyOptionsFromBinaryChoice(
   }
 }
 
+function looksLikeReadOnlyPermissionPrompt(text: string): boolean {
+  const normalized = normalizeOptionText(text);
+  if (!normalized) return false;
+  if (READONLY_WRITE_EXCLUSION_RE.test(normalized)) return false;
+  return READONLY_PERMISSION_CUE_RE.test(normalized) && READONLY_ACTION_RE.test(normalized);
+}
+
+function extractReadOnlyActionLabel(text: string): string {
+  const normalized = normalizeOptionText(text);
+  const targetMatch = normalized.match(READONLY_TARGET_RE);
+  const target = normalizeOptionText(targetMatch?.[1] || targetMatch?.[2] || "");
+  const isAnalysis = /(?:分析|检查|扫描|搜索|查询|梳理|提取|汇总|inspect|analy[sz]e|scan|search|query|review|summari[sz]e)/i.test(normalized);
+  const verb = isAnalysis ? "分析" : "读取";
+  return target ? `继续${verb} ${target}` : `继续当前只读${verb}`;
+}
+
+function inferReadOnlyPermissionOptions(
+  text: string,
+  replyOptions: ReplyOption[],
+  seenValues: Set<string>,
+) {
+  const paragraphs = text
+    .split(/\n{2,}/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+  const candidate = [...paragraphs].reverse().find(looksLikeReadOnlyPermissionPrompt) || "";
+  if (!candidate) return;
+
+  const actionLabel = extractReadOnlyActionLabel(candidate);
+  addReplyOption(
+    replyOptions,
+    seenValues,
+    actionLabel,
+    `请${actionLabel}。`,
+    "continue_readonly_once",
+  );
+  addReplyOption(
+    replyOptions,
+    seenValues,
+    "当前会话只读步骤全部批准",
+    `本会话只读读取、搜索和分析步骤全部允许，请${actionLabel}。`,
+    "allow_readonly_session",
+  );
+}
+
+export function hasReadOnlyPermissionReplyOptions(replyOptions: ReplyOption[]): boolean {
+  return Array.isArray(replyOptions) && replyOptions.some((option) =>
+    option.action === "continue_readonly_once" || option.action === "allow_readonly_session"
+  );
+}
+
+export function shouldAutoContinueReadOnlyPermission(params: {
+  replyOptions: ReplyOption[];
+  readOnlyAutoApproveForSession: boolean;
+}): boolean {
+  return params.readOnlyAutoApproveForSession && hasReadOnlyPermissionReplyOptions(params.replyOptions);
+}
+
+export function stripReadOnlyPermissionPrompt(text: string): string {
+  const original = String(text || "");
+  if (!original.trim()) return "";
+
+  const paragraphs = original.split(/\n{2,}/);
+  const trimmedParagraphs = paragraphs.map((part) => part.trim()).filter(Boolean);
+  if (trimmedParagraphs.length === 0) return original.trim();
+
+  const lastParagraph = trimmedParagraphs[trimmedParagraphs.length - 1];
+  const lines = lastParagraph.split(/\r?\n/);
+  const lastLine = lines[lines.length - 1]?.trim() || "";
+  if (lastLine && looksLikeReadOnlyPermissionPrompt(lastLine)) {
+    const remainingLastParagraph = lines.slice(0, -1).join("\n").trim();
+    const remaining = trimmedParagraphs.slice(0, -1);
+    if (remainingLastParagraph) remaining.push(remainingLastParagraph);
+    return remaining.join("\n\n").trim();
+  }
+
+  if (looksLikeReadOnlyPermissionPrompt(lastParagraph)) {
+    return trimmedParagraphs.slice(0, -1).join("\n\n").trim();
+  }
+
+  return original.trim();
+}
+
+export function buildReadOnlyPermissionContinuationPrompt(language: "zh" | "en"): string {
+  return language === "zh"
+    ? "用户已允许本会话内后续只读读取、搜索、查看、查询和分析步骤。不要再询问是否同意，也不要输出过渡台词；请立即调用合适的只读工具继续当前任务，例如 `read_file`、`get_file_outline`、`grep_search`、`glob_search`、`read_document`、`analyze_tabular_document` 或 `query_tabular_document`。"
+    : "The user has allowed read-only reading, searching, inspecting, querying, and analysis steps for this session. Do not ask for permission again or output process filler; immediately call the appropriate read-only tool such as `read_file`, `get_file_outline`, `grep_search`, `glob_search`, `read_document`, `analyze_tabular_document`, or `query_tabular_document`.";
+}
+
 export function extractReplyOptions(text: string): {
   cleanText: string;
   replyOptions: ReplyOption[];
@@ -193,6 +287,10 @@ export function extractReplyOptions(text: string): {
 
   if (replyOptions.length === 0) {
     inferReplyOptionsFromBinaryChoice(cleanText, replyOptions, seenValues);
+  }
+
+  if (replyOptions.length === 0) {
+    inferReadOnlyPermissionOptions(cleanText, replyOptions, seenValues);
   }
 
   return {

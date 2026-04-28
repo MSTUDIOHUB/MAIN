@@ -11,8 +11,11 @@ const AWAITING_CHOICE_SCENARIO = "awaiting-choice";
 const READ_CONTEXT_COLLAPSE_SCENARIO = "read-context-collapse";
 const GAME_STUDIO_ONBOARDING_SCENARIO = "game-studio-onboarding";
 const CLOUD_SETTINGS_MODEL_SELECT_SCENARIO = "cloud-settings-model-select";
+const CLOUD_SETTINGS_EMPTY_SCENARIO = "cloud-settings-empty";
+const CLOUD_STATUS_ACTIVE_SERVER_MODEL_SCENARIO = "cloud-status-active-server-model";
 const STREAMING_TIMER_SCENARIO = "streaming-timer";
 const STREAM_ERROR_RECOVERY_SCENARIO = "stream-error-recovery";
+const SESSION_AUTO_CREATE_SCENARIO = "session-auto-create";
 const E2E_SEED_COUNT_PREFIX = "__CODELY_E2E_SEED_COUNT__:";
 
 function getScenarioName(): string | null {
@@ -1207,6 +1210,22 @@ function seedCloudSettingsModelSelectScenario() {
       ...state.config,
       language: "zh",
       activeProfile: "cloud",
+      activeCloudServerId: "demo-openai",
+      cloudServers: [{
+        id: "demo-openai",
+        name: "Demo Gateway",
+        protocol: "openai",
+        provider: "OpenAI",
+        apiFormat: "responses",
+        endpoint: "https://demo-gateway.example/v1",
+        apiKey: "demo-key",
+        model: "",
+        customHeaders: "",
+        temperature: 0.6,
+        topP: 0.95,
+        reasoningEffort: "none",
+        disableResponseStorage: true,
+      }],
       cloud: {
         ...state.config.cloud,
         protocol: "openai",
@@ -1243,7 +1262,152 @@ function seedCloudSettingsModelSelectScenario() {
       isSettingsOpen: state.isSettingsOpen,
       settingsTab: state.settingsTab,
       selectedCloudModel: state.config.cloud.model,
+      activeCloudServerId: state.config.activeCloudServerId,
+      activeCloudServerModel: state.config.cloudServers.find((server: any) => server.id === state.config.activeCloudServerId)?.model ?? null,
+      cloudServerCount: state.config.cloudServers.length,
       seedCount: readSeedCount(CLOUD_SETTINGS_MODEL_SELECT_SCENARIO),
+    };
+  };
+
+  const cleanup = () => {
+    bridge.initialized = false;
+  };
+
+  bridge.cleanup = cleanup;
+  return cleanup;
+}
+
+function seedCloudSettingsEmptyScenario() {
+  const bridge = getBridge();
+  if (!bridge) return undefined;
+
+  bridge.events = [{ type: "boot" }];
+  bridge.savedDocuments = [];
+  bridge.completed = false;
+
+  incrementSeedCount(CLOUD_SETTINGS_EMPTY_SCENARIO);
+
+  useAppStore.setState((state) => ({
+    ...state,
+    config: {
+      ...state.config,
+      language: "zh",
+      activeProfile: "cloud",
+      activeCloudServerId: "",
+      cloudServers: [],
+      cloud: {
+        ...state.config.cloud,
+        model: "",
+        apiKey: "",
+        customHeaders: "",
+      },
+    },
+    currentWorkspace: "",
+    currentSessionId: null,
+    sessionsByWorkspace: {},
+    taskFlow: [],
+    conversationTurns: [],
+    currentTurnId: null,
+    input: "",
+    attachedFiles: [],
+    contextMentions: [],
+    isSettingsOpen: true,
+    settingsTab: "cloud",
+    showDiff: false,
+    showPlanPanel: false,
+    showTerminal: false,
+    showFilePanel: false,
+    selectedDiffTaskId: null,
+  }));
+
+  bridge.getSnapshot = () => {
+    const state = useAppStore.getState();
+    return {
+      isSettingsOpen: state.isSettingsOpen,
+      settingsTab: state.settingsTab,
+      selectedCloudModel: state.config.cloud.model,
+      activeCloudServerId: state.config.activeCloudServerId,
+      cloudServerCount: state.config.cloudServers.length,
+      seedCount: readSeedCount(CLOUD_SETTINGS_EMPTY_SCENARIO),
+    };
+  };
+
+  const cleanup = () => {
+    bridge.initialized = false;
+  };
+
+  bridge.cleanup = cleanup;
+  return cleanup;
+}
+
+function seedCloudStatusActiveServerModelScenario() {
+  const bridge = getBridge();
+  if (!bridge) return undefined;
+
+  bridge.events = [{ type: "boot" }];
+  bridge.savedDocuments = [];
+  bridge.completed = false;
+
+  incrementSeedCount(CLOUD_STATUS_ACTIVE_SERVER_MODEL_SCENARIO);
+
+  useAppStore.setState((state) => ({
+    ...state,
+    config: {
+      ...state.config,
+      language: "zh",
+      activeProfile: "cloud",
+      activeCloudServerId: "qwen-gateway",
+      cloudServers: [{
+        id: "qwen-gateway",
+        name: "Qwen3.6",
+        protocol: "openai",
+        provider: "OpenAI",
+        apiFormat: "chat_completions",
+        endpoint: "https://qwen-gateway.example/v1",
+        apiKey: "qwen-key",
+        model: "qwen3.6-coder",
+        customHeaders: "",
+        temperature: 0.6,
+        topP: 0.95,
+        reasoningEffort: "none",
+        disableResponseStorage: true,
+      }],
+      cloud: {
+        ...state.config.cloud,
+        protocol: "openai",
+        provider: "OpenAI",
+        apiFormat: "chat_completions",
+        endpoint: "https://qwen-gateway.example/v1",
+        apiKey: "qwen-key",
+        model: "",
+      },
+    },
+    currentWorkspace: "",
+    currentSessionId: null,
+    sessionsByWorkspace: {},
+    taskFlow: [],
+    conversationTurns: [],
+    currentTurnId: null,
+    input: "",
+    attachedFiles: [],
+    contextMentions: [],
+    isSettingsOpen: false,
+    settingsTab: "cloud",
+    showDiff: false,
+    showPlanPanel: false,
+    showTerminal: false,
+    showFilePanel: false,
+    selectedDiffTaskId: null,
+  }));
+
+  bridge.getSnapshot = () => {
+    const state = useAppStore.getState();
+    const activeServer = state.config.cloudServers.find((server: any) => server.id === state.config.activeCloudServerId);
+    return {
+      selectedCloudModel: state.config.cloud.model,
+      activeCloudServerModel: activeServer?.model ?? null,
+      activeCloudServerName: activeServer?.name ?? null,
+      seedCount: readSeedCount(CLOUD_STATUS_ACTIVE_SERVER_MODEL_SCENARIO),
     };
   };
 
@@ -1454,6 +1618,124 @@ function seedStreamErrorRecoveryScenario() {
   return cleanup;
 }
 
+function seedSessionAutoCreateScenario() {
+  const bridge = getBridge();
+  if (!bridge) return undefined;
+
+  bridge.events = [{ type: "boot" }];
+  bridge.savedDocuments = [];
+  bridge.completed = false;
+
+  incrementSeedCount(SESSION_AUTO_CREATE_SCENARIO);
+
+  const workspace = "/tmp/e2e-session-auto-create";
+  const staleSessionId = 999401;
+
+  const resetRuntime = (sessions: any[], currentSessionId: number | null) => {
+    useAppStore.setState((state) => ({
+      ...state,
+      config: {
+        ...state.config,
+        language: "zh",
+        workflowMode: "chat",
+        sessionRecordingEnabled: false,
+      },
+      currentWorkspace: workspace,
+      selectedWorkspace: workspace,
+      sessionsByWorkspace: {
+        [workspace]: sessions,
+      },
+      currentSessionId,
+      selectedMainModeKey: "game_studio",
+      selectedNexusModeKey: "nexus_game_studio",
+      activeStudioAgentKey: "studio_auto",
+      gameStudioInitialized: false,
+      pendingSlashCommand: null,
+      taskFlow: [],
+      agentMessages: [],
+      conversationTurns: [],
+      currentTurnId: null,
+      input: "",
+      attachedFiles: [],
+      contextMentions: [],
+      readOnlyAutoApproveForSession: false,
+      showAgentPicker: false,
+      showWorkflowMenu: false,
+      isGenerating: false,
+      agentStatus: "idle",
+      elapsedTime: 0,
+      showDiff: false,
+      showPlanPanel: false,
+      showTerminal: false,
+      showFilePanel: false,
+      selectedDiffTaskId: null,
+    }));
+  };
+
+  resetRuntime([], null);
+
+  bridge.prepareEmptyWorkspace = () => {
+    resetRuntime([], null);
+  };
+
+  bridge.prepareStaleCurrentSession = () => {
+    resetRuntime([
+      {
+        id: staleSessionId,
+        title: "旧项目会话",
+        date: new Date(Date.now() - 60_000).toISOString(),
+        active: false,
+        storageStatus: "ok",
+        messages: [],
+      },
+    ], null);
+  };
+
+  bridge.sendFirstMessage = () => {
+    return useAppStore.getState().sendMessage("/agent writer", undefined, {
+      resolvedIntent: "discuss",
+      skipIntentResolution: true,
+    });
+  };
+
+  bridge.getSnapshot = () => {
+    const state = useAppStore.getState();
+    const sessions = state.sessionsByWorkspace[workspace] || [];
+    const currentSession = sessions.find((session) => session.id === state.currentSessionId) || null;
+    const staleSession = sessions.find((session) => session.id === staleSessionId) || null;
+
+    return {
+      workspace,
+      staleSessionId,
+      sessionCount: sessions.length,
+      currentSessionId: state.currentSessionId,
+      activeSessionIds: sessions.filter((session) => session.active).map((session) => session.id),
+      currentSessionActive: currentSession?.active === true,
+      currentSessionStorageStatus: currentSession?.storageStatus ?? null,
+      currentSessionRecordingDisabled: currentSession?.recordingDisabled === true,
+      currentSessionRuntimeTurns: currentSession?.runtimeSnapshot?.conversationTurns?.length ?? 0,
+      currentSessionRuntimeBlocks: currentSession?.runtimeSnapshot?.taskFlow?.length ?? 0,
+      currentSessionMessages: currentSession?.messages?.length ?? 0,
+      staleSessionMessages: staleSession?.messages?.length ?? 0,
+      taskFlowBlocks: state.taskFlow.length,
+      taskFlowUserCount: state.taskFlow.filter((block) => block.type === "user").length,
+      conversationTurns: state.conversationTurns.length,
+      currentTurnStatus: state.currentTurnId
+        ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId)?.status ?? null
+        : null,
+      activeStudioAgentKey: state.activeStudioAgentKey,
+      seedCount: readSeedCount(SESSION_AUTO_CREATE_SCENARIO),
+    };
+  };
+
+  const cleanup = () => {
+    bridge.initialized = false;
+  };
+
+  bridge.cleanup = cleanup;
+  return cleanup;
+}
+
 export function getE2ESavePlanDocumentHandler():
   | ((document: { title: string; suggestedFileName: string; content: string }) => Promise<boolean>)
   | null {
@@ -1629,12 +1911,24 @@ export function initializeE2EScenarios(): (() => void) | undefined {
     return seedCloudSettingsModelSelectScenario();
   }
 
+  if (scenario === CLOUD_SETTINGS_EMPTY_SCENARIO) {
+    return seedCloudSettingsEmptyScenario();
+  }
+
+  if (scenario === CLOUD_STATUS_ACTIVE_SERVER_MODEL_SCENARIO) {
+    return seedCloudStatusActiveServerModelScenario();
+  }
+
   if (scenario === STREAMING_TIMER_SCENARIO) {
     return seedStreamingTimerScenario();
   }
 
   if (scenario === STREAM_ERROR_RECOVERY_SCENARIO) {
     return seedStreamErrorRecoveryScenario();
+  }
+
+  if (scenario === SESSION_AUTO_CREATE_SCENARIO) {
+    return seedSessionAutoCreateScenario();
   }
 
   bridge.initialized = false;

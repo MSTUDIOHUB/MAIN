@@ -31,7 +31,13 @@ import { discoverAllMcpTools, setMcpToolServerMap, type MCPServer, type MCPTool 
 import { getFileMetadata } from "./ipc";
 import { ensureVisibleConclusion, isAssistantTurnEmpty, normalizeAssistantTurn } from "./normalizedTurn";
 import { hasStructuredPlanProposal } from "./planProposal";
-import { serializeAssistantReplyForHistory, shouldPauseForReplyOptions } from "./replyOptions";
+import {
+  buildReadOnlyPermissionContinuationPrompt,
+  serializeAssistantReplyForHistory,
+  shouldAutoContinueReadOnlyPermission as shouldAutoContinueReadOnlyPermissionState,
+  shouldPauseForReplyOptions,
+  stripReadOnlyPermissionPrompt,
+} from "./replyOptions";
 import { buildToolDiffPreview, type ToolDiffPreview } from "./toolDiff";
 import { syncPlanArtifactAfterToolSuccess } from "./planArtifactSync";
 import type { AppConfig, Skill } from "../store/useAppStore";
@@ -210,6 +216,7 @@ export interface OrchestratorCallbacks {
   getCurrentRunIntent: () => ResolvedUserIntent;
   getWorkflowMode: () => "chat" | "edit" | "plan";
   getIsPlanApproved: () => boolean;
+  getReadOnlyAutoApproveForSession: () => boolean;
   getPlanStage: () => "idle" | "requirements" | "design" | "tasks" | "bugfix" | "ready_to_execute" | "executing" | "completed";
   getPlanTasks: () => PlanTask[];
   getStatus: () => "idle" | "running" | "pending_review" | "error";
@@ -2025,13 +2032,23 @@ export async function executeAgentLoop(
       effectiveToolCalls.length === 0 &&
       normalized.finishReason === "length" &&
       (normalizedBase.visibleText || normalized.visibleText).trim().length > 1200;
+    const autoContinueReadOnlyPermission =
+      effectiveToolCalls.length === 0 &&
+      !compactedProseCodeDump &&
+      shouldAutoContinueReadOnlyPermissionState({
+        replyOptions: normalized.replyOptions,
+        readOnlyAutoApproveForSession: callbacks.getReadOnlyAutoApproveForSession(),
+      });
     const sourceVisibleText = normalizedBase.visibleText || normalized.visibleText;
+    const normalizedVisibleTextForUser = autoContinueReadOnlyPermission
+      ? stripReadOnlyPermissionPrompt(normalized.visibleText)
+      : normalized.visibleText;
     const finalVisibleText = compactedProseCodeDump
       ? buildProseCodeDumpNotice(callbacks.getPreferredLanguage(), normalized.visibleText.length)
       : compactedIncompletePlanText
       ? buildPlanFallbackNotice(callbacks.getPreferredLanguage(), sourceVisibleText.length)
-      : normalized.visibleText;
-    const finalReplyOptions = compactedProseCodeDump ? [] : normalized.replyOptions;
+      : normalizedVisibleTextForUser;
+    const finalReplyOptions = compactedProseCodeDump || autoContinueReadOnlyPermission ? [] : normalized.replyOptions;
     const historyAssistantText = finalVisibleText || "";
 
     if (compactedProseCodeDump) {
@@ -2052,6 +2069,31 @@ export async function executeAgentLoop(
 
     if (finalVisibleText || finalReplyOptions.length > 0) {
       callbacks.onAssistantFinalText(finalVisibleText, finalReplyOptions);
+    }
+
+    if (autoContinueReadOnlyPermission) {
+      consecutiveNoToolCount++;
+      logAgentEvent("readonly_permission_auto_continue", {
+        iteration,
+        consecutiveNoToolCount,
+        visibleChars: normalized.visibleText.length,
+        strippedVisibleChars: finalVisibleText.length,
+      });
+      if (consecutiveNoToolCount >= MAX_NO_ACTION_RETRIES) {
+        callbacks.onError("模型连续要求确认只读步骤，没有继续调用只读工具。已中止本轮，请重试或切换更稳定的模型。");
+        callbacks.onStatusChange("error");
+        return;
+      }
+
+      if (historyAssistantText.trim()) {
+        callbacks.appendMessage({ role: "assistant", content: historyAssistantText });
+      }
+      callbacks.onStatusChange("running");
+      callbacks.appendMessage({
+        role: "user",
+        content: buildReadOnlyPermissionContinuationPrompt(callbacks.getPreferredLanguage()),
+      });
+      continue;
     }
 
     if (workflowMode === "plan" && effectiveToolCalls.length > 0) {

@@ -360,7 +360,7 @@ impl PtyBuffer {
 
     fn read_tail(&self, max_chars: Option<usize>) -> PtyReadResult {
         let end_offset = self.end_offset();
-        let text = String::from_utf8_lossy(&self.bytes).to_string();
+        let text = decode_utf8_lossy_for_display(&self.bytes);
         let max = max_chars.unwrap_or(8_000).clamp(1, 200_000);
         let (tail, truncated_by_chars) = take_tail_chars(&text, max);
         let start_offset = if truncated_by_chars {
@@ -389,7 +389,7 @@ impl PtyBuffer {
             requested_offset.min(buffer_end)
         };
         let start_idx = (start_offset - self.start_offset) as usize;
-        let text = String::from_utf8_lossy(&self.bytes[start_idx..]).to_string();
+        let text = decode_utf8_lossy_for_display(&self.bytes[start_idx..]);
 
         let (text, truncated_by_chars) = match max_chars {
             Some(max) => take_tail_chars(&text, max.clamp(1, 200_000)),
@@ -924,6 +924,127 @@ fn default_shell() -> String {
     }
 }
 
+fn preferred_utf8_locale() -> String {
+    for key in ["LC_ALL", "LC_CTYPE", "LANG"] {
+        if let Ok(value) = std::env::var(key) {
+            let upper = value.to_ascii_uppercase();
+            if upper.contains("UTF-8") || upper.contains("UTF8") {
+                return value;
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        "en_US.UTF-8".to_string()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        "en_US.UTF-8".to_string()
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        "C.UTF-8".to_string()
+    }
+}
+
+fn apply_pty_terminal_env(cmd: &mut CommandBuilder) {
+    let locale = preferred_utf8_locale();
+    cmd.env("LANG", &locale);
+    cmd.env("LC_ALL", &locale);
+    cmd.env("LC_CTYPE", &locale);
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
+    cmd.env("PYTHONIOENCODING", "utf-8");
+    cmd.env("PYTHONUTF8", "1");
+}
+
+fn apply_process_terminal_env(cmd: &mut ProcessCommand) {
+    let locale = preferred_utf8_locale();
+    cmd.env("LANG", &locale)
+        .env("LC_ALL", &locale)
+        .env("LC_CTYPE", &locale)
+        .env("TERM", "xterm-256color")
+        .env("COLORTERM", "truecolor")
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("PYTHONUTF8", "1");
+}
+
+fn decode_utf8_stream_chunk(pending: &mut Vec<u8>, data: &[u8]) -> String {
+    let mut bytes = Vec::with_capacity(pending.len() + data.len());
+    bytes.extend_from_slice(pending);
+    bytes.extend_from_slice(data);
+    pending.clear();
+
+    let mut output = String::new();
+    let mut start = 0;
+
+    while start < bytes.len() {
+        match std::str::from_utf8(&bytes[start..]) {
+            Ok(valid) => {
+                output.push_str(valid);
+                break;
+            }
+            Err(error) => {
+                let valid_up_to = error.valid_up_to();
+                if valid_up_to > 0 {
+                    output.push_str(
+                        std::str::from_utf8(&bytes[start..start + valid_up_to])
+                            .unwrap_or_default(),
+                    );
+                }
+
+                let invalid_start = start + valid_up_to;
+                match error.error_len() {
+                    Some(error_len) => {
+                        output.push('\u{FFFD}');
+                        start = invalid_start + error_len;
+                    }
+                    None => {
+                        pending.extend_from_slice(&bytes[invalid_start..]);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    output
+}
+
+fn decode_utf8_lossy_for_display(bytes: &[u8]) -> String {
+    let first_boundary = bytes
+        .iter()
+        .position(|byte| (*byte & 0b1100_0000) != 0b1000_0000)
+        .unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[first_boundary..]).to_string()
+}
+
+#[cfg(test)]
+mod terminal_utf8_tests {
+    use super::*;
+
+    #[test]
+    fn stream_decoder_preserves_split_cjk_bytes() {
+        let mut pending = Vec::new();
+        let bytes = "中文输出".as_bytes();
+
+        let first = decode_utf8_stream_chunk(&mut pending, &bytes[..2]);
+        let second = decode_utf8_stream_chunk(&mut pending, &bytes[2..7]);
+        let third = decode_utf8_stream_chunk(&mut pending, &bytes[7..]);
+
+        assert_eq!(format!("{first}{second}{third}"), "中文输出");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn display_decoder_skips_leading_continuation_bytes() {
+        let bytes = "中文".as_bytes();
+
+        assert_eq!(decode_utf8_lossy_for_display(&bytes[1..]), "文");
+    }
+}
+
 fn take_tail_chars(text: &str, max_chars: usize) -> (String, bool) {
     let char_count = text.chars().count();
     if char_count <= max_chars {
@@ -987,11 +1108,14 @@ fn join_captured_pipe(
 fn build_workspace_shell_command(command: &str) -> ProcessCommand {
     if cfg!(target_os = "windows") {
         let mut cmd = ProcessCommand::new("cmd");
-        cmd.args(["/C", command]);
+        let utf8_command = format!("chcp 65001>nul && {command}");
+        cmd.args(["/C", &utf8_command]);
+        apply_process_terminal_env(&mut cmd);
         cmd
     } else {
         let mut cmd = ProcessCommand::new("/bin/sh");
         cmd.args(["-lc", command]);
+        apply_process_terminal_env(&mut cmd);
         cmd
     }
 }
@@ -1077,6 +1201,7 @@ fn start_pty_reader_thread(
 ) {
     std::thread::spawn(move || {
         let mut chunk = [0_u8; 4096];
+        let mut pending_utf8 = Vec::new();
         loop {
             match reader.read(&mut chunk) {
                 Ok(0) => break,
@@ -1088,7 +1213,7 @@ fn start_pty_reader_thread(
                         break;
                     }
 
-                    let text = String::from_utf8_lossy(data).to_string();
+                    let text = decode_utf8_stream_chunk(&mut pending_utf8, data);
                     if !text.is_empty() {
                         let _ = app.emit("pty-data", PtyDataPayload { chunk: text });
                     }
@@ -1739,6 +1864,10 @@ fn spawn_pty(
 
     let shell = default_shell();
     let mut cmd = CommandBuilder::new(&shell);
+    if cfg!(target_os = "windows") {
+        cmd.args(["/K", "chcp 65001>nul"]);
+    }
+    apply_pty_terminal_env(&mut cmd);
     if let Ok(root) = workspace_state.get_root() {
         cmd.cwd(root);
     }
