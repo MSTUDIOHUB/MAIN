@@ -7,6 +7,7 @@
 
 import {
   analyzeTabularDocument,
+  deleteWorkspacePath,
   deleteChatTempPath,
   globSearch,
   grepSearch,
@@ -99,7 +100,7 @@ export async function executeTool(
     case "list_directory": {
       const rawPath = (args.path as string) || ".";
       const dirPath = rawPath === "." ? workspace : rawPath;
-      const nodes = await invoke<Array<{ name: string; path: string; is_dir: boolean }>>("list_directory", { path: dirPath });
+      const nodes = await invoke<Array<{ name: string; path: string; is_dir: boolean }>>("list_directory", { path: dirPath, workspace });
       return formatDirectoryNodesForTool(nodes, workspace);
     }
 
@@ -108,7 +109,7 @@ export async function executeTool(
       if (shouldUseChatTempStorage(workspace, sessionKey)) {
         return await readChatTempFile(sessionKey!, rawPath);
       }
-      return await invoke<string>("read_file", { path: rawPath });
+      return await readFile(rawPath, workspace);
     }
 
     case "read_document": {
@@ -121,6 +122,7 @@ export async function executeTool(
         parseOptionalNumber(args.row_offset),
         parseOptionalNumber(args.max_rows),
         parseOptionalString(args.sheet),
+        workspace,
       );
     }
 
@@ -133,6 +135,7 @@ export async function executeTool(
         parseOptionalNumber(args.max_columns),
         parseOptionalNumber(args.sample_rows),
         parseOptionalString(args.focus_columns),
+        workspace,
       );
     }
 
@@ -150,18 +153,19 @@ export async function executeTool(
         parseOptionalString(args.sort_by),
         parseOptionalNumber(args.row_offset),
         parseOptionalNumber(args.limit),
+        workspace,
       );
     }
 
     // ── Custom Tauri IPC commands ─────────────────────────────
 
     case "glob_search":
-      return await globSearch(args.pattern as string);
+      return await globSearch(args.pattern as string, workspace);
 
     case "grep_search": {
       const query = args.query as string;
       const path = (args.path as string) || ".";
-      return await grepSearch(query, path);
+      return await grepSearch(query, path, workspace);
     }
 
     case "execute_command": {
@@ -170,15 +174,15 @@ export async function executeTool(
       const maxChars = Math.min(Math.max(parseOptionalNumber(args.max_chars) ?? 8000, 100), 200_000);
       let beforeOffset = 0;
       try {
-        beforeOffset = (await getPtyStatus()).bufferEndOffset;
-        await writePty(command + "\n");
+        beforeOffset = (await getPtyStatus(sessionKey)).bufferEndOffset;
+        await writePty(command + "\n", sessionKey);
       } catch {
-        await spawnPty(140, 40);
-        beforeOffset = (await getPtyStatus()).bufferEndOffset;
-        await writePty(command + "\n");
+        await spawnPty(140, 40, sessionKey, workspace);
+        beforeOffset = (await getPtyStatus(sessionKey)).bufferEndOffset;
+        await writePty(command + "\n", sessionKey);
       }
       await sleep(waitMs);
-      const output = await readPtySince(beforeOffset, maxChars);
+      const output = await readPtySince(beforeOffset, maxChars, sessionKey);
       return JSON.stringify({
         command,
         output: output.text,
@@ -190,22 +194,22 @@ export async function executeTool(
     }
 
     case "read_pty_buffer":
-      return await readPtyBuffer(parseOptionalNumber(args.max_chars));
+      return await readPtyBuffer(parseOptionalNumber(args.max_chars), sessionKey);
 
     case "read_pty_tail":
-      return await readPtyTail(parseOptionalNumber(args.max_chars));
+      return await readPtyTail(parseOptionalNumber(args.max_chars), sessionKey);
 
     case "read_pty_since": {
       const offset = parseOptionalNumber(args.offset);
       if (offset === undefined) throw new Error("Missing required parameter 'offset'.");
-      return await readPtySince(offset, parseOptionalNumber(args.max_chars));
+      return await readPtySince(offset, parseOptionalNumber(args.max_chars), sessionKey);
     }
 
     case "get_pty_status":
-      return await getPtyStatus();
+      return await getPtyStatus(sessionKey);
 
     case "clear_pty_buffer":
-      return await clearPtyBuffer();
+      return await clearPtyBuffer(sessionKey);
 
     case "send_pty_input": {
       const input = (args.input as string) || "";
@@ -215,15 +219,15 @@ export async function executeTool(
       const maxChars = Math.min(Math.max(parseOptionalNumber(args.max_chars) ?? 8000, 100), 200_000);
       let beforeOffset = 0;
       try {
-        beforeOffset = (await getPtyStatus()).bufferEndOffset;
-        await writePty(input + (appendNewline ? "\n" : ""));
+        beforeOffset = (await getPtyStatus(sessionKey)).bufferEndOffset;
+        await writePty(input + (appendNewline ? "\n" : ""), sessionKey);
       } catch {
-        await spawnPty(140, 40);
-        beforeOffset = (await getPtyStatus()).bufferEndOffset;
-        await writePty(input + (appendNewline ? "\n" : ""));
+        await spawnPty(140, 40, sessionKey, workspace);
+        beforeOffset = (await getPtyStatus(sessionKey)).bufferEndOffset;
+        await writePty(input + (appendNewline ? "\n" : ""), sessionKey);
       }
       await sleep(waitMs);
-      const output = await readPtySince(beforeOffset, maxChars);
+      const output = await readPtySince(beforeOffset, maxChars, sessionKey);
       return JSON.stringify({
         input,
         output: output.text,
@@ -240,17 +244,18 @@ export async function executeTool(
         command,
         parseOptionalString(args.input),
         parseOptionalNumber(args.timeout_ms),
+        workspace,
       );
     }
 
     case "get_project_skeleton": {
       const depth = typeof args.depth === "string" ? parseInt(args.depth, 10) : args.depth;
-      return await invoke<string>("get_project_skeleton", { depth });
+      return await invoke<string>("get_project_skeleton", { depth, workspace });
     }
 
     case "get_file_outline": {
       const outlinePath = (args.path as string) || "";
-      return await getFileOutline(outlinePath);
+      return await getFileOutline(outlinePath, workspace);
     }
 
     case "index_workspace_documents": {
@@ -260,6 +265,7 @@ export async function executeTool(
         parseOptionalNumber(args.max_files),
         parseOptionalNumber(args.max_chars_per_file),
         typeof args.extensions === "string" ? args.extensions : undefined,
+        workspace,
       );
     }
 
@@ -271,7 +277,7 @@ export async function executeTool(
       if (!searchText) throw new Error("Missing required parameter 'search_text'.");
       const original = shouldUseChatTempStorage(workspace, sessionKey)
         ? await readChatTempFile(sessionKey!, replacePath)
-        : await readFile(replacePath);
+        : await readFile(replacePath, workspace);
       if (!original.includes(searchText)) {
         throw new Error("search_text 与文件内容不一致，未执行写入。");
       }
@@ -283,7 +289,7 @@ export async function executeTool(
         const temporaryPath = await writeChatTempFile(sessionKey!, replacePath, updated);
         return buildChatTempSuccessMessage("updated", replacePath, temporaryPath);
       }
-      await writeFile(replacePath, updated);
+      await writeFile(replacePath, updated, workspace);
       return JSON.stringify({
         success: true,
         message: `File ${replacePath} updated successfully.`,
@@ -298,7 +304,7 @@ export async function executeTool(
         const temporaryPath = await writeChatTempFile(sessionKey!, writePath, writeContent);
         return buildChatTempSuccessMessage("written", writePath, temporaryPath);
       }
-      await writeFile(writePath, writeContent);
+      await writeFile(writePath, writeContent, workspace);
       return JSON.stringify({ success: true, message: `File ${writePath} written successfully.` });
     }
 
@@ -312,7 +318,7 @@ export async function executeTool(
           message: `Temporary chat path ${targetPath} deleted successfully.`,
         });
       }
-      await invoke<void>("delete_workspace_path", { path: targetPath });
+      await deleteWorkspacePath(targetPath, workspace);
       return JSON.stringify({
         success: true,
         message: `Path ${targetPath} deleted successfully.`,

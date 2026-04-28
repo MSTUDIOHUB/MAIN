@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 export interface PtyDataPayload {
+  sessionKey?: string;
   chunk: string;
 }
 
@@ -142,12 +143,12 @@ export interface QueryTabularDocumentResult {
 
 // region: 文件与搜索命令
 
-export function readFile(path: string): Promise<string> {
-  return invoke<string>("read_file", { path });
+export function readFile(path: string, workspace?: string): Promise<string> {
+  return invoke<string>("read_file", { path, workspace });
 }
 
-export function getFileMetadata(path: string): Promise<FileMetadata> {
-  return invoke<FileMetadata>("get_file_metadata", { path });
+export function getFileMetadata(path: string, workspace?: string): Promise<FileMetadata> {
+  return invoke<FileMetadata>("get_file_metadata", { path, workspace });
 }
 
 export function getWorkspaceRoot(): Promise<string> {
@@ -158,8 +159,12 @@ export function setWorkspaceRoot(path: string): Promise<string> {
   return invoke<string>("set_workspace_root", { path });
 }
 
-export function writeFile(path: string, content: string): Promise<void> {
-  return invoke<void>("write_file", { path, content });
+export function canonicalizeWorkspacePath(path: string): Promise<string> {
+  return invoke<string>("canonicalize_workspace_path", { path });
+}
+
+export function writeFile(path: string, content: string, workspace?: string): Promise<void> {
+  return invoke<void>("write_file", { path, content, workspace });
 }
 
 export function writeChatTempFile(sessionKey: string, path: string, content: string): Promise<string> {
@@ -170,8 +175,8 @@ export function readChatTempFile(sessionKey: string, path: string): Promise<stri
   return invoke<string>("read_chat_temp_file", { sessionKey, path });
 }
 
-export function deleteWorkspacePath(path: string): Promise<void> {
-  return invoke<void>("delete_workspace_path", { path });
+export function deleteWorkspacePath(path: string, workspace?: string): Promise<void> {
+  return invoke<void>("delete_workspace_path", { path, workspace });
 }
 
 export function deleteChatTempPath(sessionKey: string, path: string): Promise<void> {
@@ -206,24 +211,24 @@ export function exportTextFile(path: string, content: string): Promise<void> {
   return invoke<void>("export_text_file", { path, content });
 }
 
-export function listDirectory(path: string): Promise<FileNode[]> {
-  return invoke<FileNode[]>("list_directory", { path });
+export function listDirectory(path: string, workspace?: string): Promise<FileNode[]> {
+  return invoke<FileNode[]>("list_directory", { path, workspace });
 }
 
-export function globSearch(pattern: string): Promise<string[]> {
-  return invoke<string[]>("glob_search", { pattern });
+export function globSearch(pattern: string, workspace?: string): Promise<string[]> {
+  return invoke<string[]>("glob_search", { pattern, workspace });
 }
 
-export function grepSearch(query: string, path: string): Promise<string> {
-  return invoke<string>("grep_search", { query, path });
+export function grepSearch(query: string, path: string, workspace?: string): Promise<string> {
+  return invoke<string>("grep_search", { query, path, workspace });
 }
 
-export function getProjectSkeleton(depth?: number): Promise<string> {
-  return invoke<string>("get_project_skeleton", { depth });
+export function getProjectSkeleton(depth?: number, workspace?: string): Promise<string> {
+  return invoke<string>("get_project_skeleton", { depth, workspace });
 }
 
-export function getFileOutline(path: string): Promise<string> {
-  return invoke<string>("get_file_outline", { path });
+export function getFileOutline(path: string, workspace?: string): Promise<string> {
+  return invoke<string>("get_file_outline", { path, workspace });
 }
 
 export function readDocument(
@@ -233,6 +238,7 @@ export function readDocument(
   rowOffset?: number,
   maxRows?: number,
   sheet?: string,
+  workspace?: string,
 ): Promise<ReadDocumentResult> {
   return invoke<ReadDocumentResult>("read_document", {
     path,
@@ -241,6 +247,7 @@ export function readDocument(
     rowOffset,
     maxRows,
     sheet,
+    workspace,
   });
 }
 
@@ -250,6 +257,7 @@ export function analyzeTabularDocument(
   maxColumns?: number,
   sampleRows?: number,
   focusColumns?: string,
+  workspace?: string,
 ): Promise<AnalyzeTabularDocumentResult> {
   return invoke<AnalyzeTabularDocumentResult>("analyze_tabular_document", {
     path,
@@ -257,6 +265,7 @@ export function analyzeTabularDocument(
     maxColumns,
     sampleRows,
     focusColumns,
+    workspace,
   });
 }
 
@@ -271,6 +280,7 @@ export function queryTabularDocument(
   sortBy?: string,
   rowOffset?: number,
   limit?: number,
+  workspace?: string,
 ): Promise<QueryTabularDocumentResult> {
   return invoke<QueryTabularDocumentResult>("query_tabular_document", {
     path,
@@ -283,6 +293,7 @@ export function queryTabularDocument(
     sortBy,
     rowOffset,
     limit,
+    workspace,
   });
 }
 
@@ -291,12 +302,14 @@ export function indexWorkspaceDocuments(
   maxFiles?: number,
   maxCharsPerFile?: number,
   extensions?: string,
+  workspace?: string,
 ): Promise<IndexWorkspaceDocumentsResult> {
   return invoke<IndexWorkspaceDocumentsResult>("index_workspace_documents", {
     path,
     maxFiles,
     maxCharsPerFile,
     extensions,
+    workspace,
   });
 }
 
@@ -320,11 +333,13 @@ export function runCommand(
   command: string,
   input?: string,
   timeoutMs?: number,
+  workspace?: string,
 ): Promise<TerminalCommandOutput> {
   return invoke<TerminalCommandOutput>("run_command", {
     command,
     input,
     timeoutMs,
+    workspace,
   });
 }
 
@@ -332,40 +347,41 @@ export function runCommand(
 
 // region: PTY 命令与事件
 
-export function spawnPty(cols: number, rows: number): Promise<void> {
-  return invoke<void>("spawn_pty", { cols, rows });
+export function spawnPty(cols: number, rows: number, sessionKey?: string, workspace?: string): Promise<void> {
+  return invoke<void>("spawn_pty", { cols, rows, sessionKey, workspace });
 }
 
-export function resizePty(cols: number, rows: number): Promise<void> {
-  return invoke<void>("resize_pty", { cols, rows });
+export function resizePty(cols: number, rows: number, sessionKey?: string): Promise<void> {
+  return invoke<void>("resize_pty", { cols, rows, sessionKey });
 }
 
-export function writePty(input: string): Promise<void> {
-  return invoke<void>("write_pty", { input });
+export function writePty(input: string, sessionKey?: string): Promise<void> {
+  return invoke<void>("write_pty", { input, sessionKey });
 }
 
-export function readPtyBuffer(maxChars?: number): Promise<string> {
-  return invoke<string>("read_pty_buffer", { maxChars });
+export function readPtyBuffer(maxChars?: number, sessionKey?: string): Promise<string> {
+  return invoke<string>("read_pty_buffer", { maxChars, sessionKey });
 }
 
-export function readPtyTail(maxChars?: number): Promise<PtyReadResult> {
-  return invoke<PtyReadResult>("read_pty_tail", { maxChars });
+export function readPtyTail(maxChars?: number, sessionKey?: string): Promise<PtyReadResult> {
+  return invoke<PtyReadResult>("read_pty_tail", { maxChars, sessionKey });
 }
 
-export function readPtySince(offset: number, maxChars?: number): Promise<PtyReadResult> {
-  return invoke<PtyReadResult>("read_pty_since", { offset, maxChars });
+export function readPtySince(offset: number, maxChars?: number, sessionKey?: string): Promise<PtyReadResult> {
+  return invoke<PtyReadResult>("read_pty_since", { offset, maxChars, sessionKey });
 }
 
-export function clearPtyBuffer(): Promise<PtyReadResult> {
-  return invoke<PtyReadResult>("clear_pty_buffer");
+export function clearPtyBuffer(sessionKey?: string): Promise<PtyReadResult> {
+  return invoke<PtyReadResult>("clear_pty_buffer", { sessionKey });
 }
 
-export function getPtyStatus(): Promise<PtyStatus> {
-  return invoke<PtyStatus>("get_pty_status");
+export function getPtyStatus(sessionKey?: string): Promise<PtyStatus> {
+  return invoke<PtyStatus>("get_pty_status", { sessionKey });
 }
 
-export function onPtyData(handler: (chunk: string) => void): Promise<UnlistenFn> {
+export function onPtyData(handler: (chunk: string) => void, sessionKey?: string): Promise<UnlistenFn> {
   return listen<PtyDataPayload>("pty-data", (event) => {
+    if (sessionKey && event.payload.sessionKey !== sessionKey) return;
     handler(event.payload.chunk);
   });
 }

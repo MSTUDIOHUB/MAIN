@@ -26,7 +26,7 @@ import { buildLineDiff, getDiffStats } from "../lib/diff";
 import { getE2EResumeExecutionHandler, getE2ESavePlanDocumentHandler } from "../lib/e2e";
 import { extractPlanDraftPreview, extractStructuredPlanProposal, hasPlanDraftPreview, hasStructuredPlanProposal } from "../lib/planProposal";
 import MarkdownRenderer from "./MarkdownRenderer";
-import { resolveGlobalChatSessionKey, type TaskBlock, useAppStore } from "../store/useAppStore";
+import { resolveGlobalChatSessionKey, resolveSessionRuntimeKey, resolveSessionWorkspaceKey, type TaskBlock, useAppStore } from "../store/useAppStore";
 import { deleteChatTempPath, exportTextFile, onPtyData, readPtyBuffer, resizePty, spawnPty, writePty } from "../lib/ipc";
 import { collectChangeEntries, isPlanConversationTurn } from "../lib/workflowModels";
 
@@ -482,7 +482,15 @@ function turnHasGeneratedPlan(blocks: any[]) {
 }
 
 /** Integrated Terminal sub-component with xterm.js */
-function IntegratedTerminal({ themeMode }: { themeMode: "light" | "dark" }) {
+function IntegratedTerminal({
+  themeMode,
+  workspace,
+  sessionKey,
+}: {
+  themeMode: "light" | "dark";
+  workspace: string;
+  sessionKey?: string;
+}) {
   const termRef = useRef<HTMLDivElement>(null);
   const xtermRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
@@ -570,10 +578,10 @@ function IntegratedTerminal({ themeMode }: { themeMode: "light" | "dark" }) {
       ptyReadyRef.current = (async () => {
         let existingBuffer = "";
         try {
-          existingBuffer = await readPtyBuffer();
+          existingBuffer = await readPtyBuffer(undefined, sessionKey);
         } catch {
-          await spawnPty(Math.max(term.cols, 120), Math.max(term.rows, 32));
-          existingBuffer = await readPtyBuffer().catch(() => "");
+          await spawnPty(Math.max(term.cols, 120), Math.max(term.rows, 32), sessionKey, workspace);
+          existingBuffer = await readPtyBuffer(undefined, sessionKey).catch(() => "");
         }
 
         if (disposed) return;
@@ -582,7 +590,7 @@ function IntegratedTerminal({ themeMode }: { themeMode: "light" | "dark" }) {
           if (!disposed) {
             term.write(chunk);
           }
-        });
+        }, sessionKey);
 
         if (disposed) {
           unlisten?.();
@@ -596,7 +604,7 @@ function IntegratedTerminal({ themeMode }: { themeMode: "light" | "dark" }) {
           writeSystemLine("PTY connected");
         }
 
-        await resizePty(Math.max(term.cols, 20), Math.max(term.rows, 5)).catch(() => {});
+        await resizePty(Math.max(term.cols, 20), Math.max(term.rows, 5), sessionKey).catch(() => {});
       })().catch((error) => {
         ptyReadyRef.current = null;
         if (!disposed) {
@@ -617,7 +625,7 @@ function IntegratedTerminal({ themeMode }: { themeMode: "light" | "dark" }) {
       }
 
       void ensurePtyReady()
-        .then(() => resizePty(Math.max(term.cols, 20), Math.max(term.rows, 5)))
+        .then(() => resizePty(Math.max(term.cols, 20), Math.max(term.rows, 5), sessionKey))
         .catch(() => {});
     };
 
@@ -625,7 +633,7 @@ function IntegratedTerminal({ themeMode }: { themeMode: "light" | "dark" }) {
 
     const disposable = term.onData((data) => {
       void ensurePtyReady()
-        .then(() => writePty(data))
+        .then(() => writePty(data, sessionKey))
         .catch((error) => {
           if (disposed) return;
           const message = error instanceof Error ? error.message : String(error);
@@ -648,7 +656,7 @@ function IntegratedTerminal({ themeMode }: { themeMode: "light" | "dark" }) {
       fitAddonRef.current = null;
       ptyReadyRef.current = null;
     };
-  }, [themeMode]);
+  }, [sessionKey, themeMode, workspace]);
 
   return <div ref={termRef} className="h-full w-full" />;
 }
@@ -1464,6 +1472,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
   }, [changeSummary.entries.length, fileViewerPath, language, latestPlanTurn?.title, rightPanelTab, viewedDiffTask?.target]);
 
   const isVisible = (showPlanPanel && hasPlanPanelContent) || showDiff || showTerminal || showFilePanel;
+  const terminalSessionKey = resolveSessionRuntimeKey(resolveSessionWorkspaceKey(currentWorkspace), currentSessionId) || undefined;
 
   const fileCategory = useMemo(() => getFileCategory(fileViewerPath), [fileViewerPath]);
   const fileLang = useMemo(() => getLanguageFromPath(fileViewerPath), [fileViewerPath]);
@@ -1551,7 +1560,11 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
             <div className="flex h-full flex-col bg-[#050505]">
               <div className="border-b border-[#18181b] px-4 py-3 text-[12px] text-[#a1a1aa]">{language === "zh" ? "终端输出" : "Terminal Output"}</div>
               <div className="flex-1 overflow-hidden bg-[#000000] p-1">
-                <IntegratedTerminal themeMode={config.themeMode} />
+                <IntegratedTerminal
+                  themeMode={config.themeMode}
+                  workspace={currentWorkspace}
+                  sessionKey={terminalSessionKey}
+                />
               </div>
             </div>
           )}

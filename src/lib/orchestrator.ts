@@ -724,7 +724,7 @@ async function fetchLLMStream(
         const safeResolve = (r: StreamResult) => { if (!settled) { settled = true; resolve(r); } };
         const safeReject = (err: Error) => { if (!settled) { settled = true; reject(err); } };
 
-        streamChatCompletion(
+        void streamChatCompletion(
           messages,
           settings,
           {
@@ -748,7 +748,9 @@ async function fetchLLMStream(
           signal,
           allTools,
           currentMaxTokens,
-        );
+        ).catch((err) => {
+          safeReject(err instanceof Error ? err : new Error(getErrorMessage(err, "LLM stream failed")));
+        });
       });
     } catch (err) {
       const retryMessage = getErrorMessage(err, "LLM stream failed");
@@ -928,9 +930,9 @@ function buildFileUnchangedStub(state: FileReadState): string {
   ].join("\n");
 }
 
-async function readFileMetadataIfAvailable(path: string): Promise<{ path: string; sizeBytes: number; modifiedMs: number } | null> {
+async function readFileMetadataIfAvailable(path: string, workspace?: string): Promise<{ path: string; sizeBytes: number; modifiedMs: number } | null> {
   try {
-    const metadata = await getFileMetadata(path);
+    const metadata = await getFileMetadata(path, workspace);
     return {
       path: String(metadata.path || path),
       sizeBytes: Number(metadata.sizeBytes) || 0,
@@ -2491,7 +2493,7 @@ export async function executeAgentLoop(
         const cached = readOnlyResultCache.get(signature);
         const fileReadMetadata =
           tc.name === "read_file" && typeof toolArgs.path === "string"
-            ? await readFileMetadataIfAvailable(toolArgs.path)
+            ? await readFileMetadataIfAvailable(toolArgs.path, workspace)
             : null;
         const fileReadSignature =
           tc.name === "read_file" && typeof toolArgs.path === "string"
@@ -2500,7 +2502,7 @@ export async function executeAgentLoop(
         const fileReadState = fileReadSignature ? fileReadStates.get(fileReadSignature) : undefined;
 
         if (fileReadState) {
-          const metadata = fileReadMetadata ?? await readFileMetadataIfAvailable(fileReadState.path);
+          const metadata = fileReadMetadata ?? await readFileMetadataIfAvailable(fileReadState.path, workspace);
           const unchanged =
             metadata != null &&
             metadata.sizeBytes === fileReadState.sizeBytes &&
@@ -2627,7 +2629,7 @@ export async function executeAgentLoop(
           const parsedCall = readOnlyCalls.find((call) => call.id === result.toolCallId);
           const args = parsedCall ? parseToolCallArguments(parsedCall) : {};
           const path = typeof args.path === "string" ? args.path : result.target;
-          const metadata = await readFileMetadataIfAvailable(path);
+          const metadata = await readFileMetadataIfAvailable(path, workspace);
           const contentHash = hashString(result.content);
           const previous = fileReadStates.get(fileReadSignature);
           if (metadata && (!previous || previous.contentHash !== contentHash || previous.modifiedMs !== metadata.modifiedMs || previous.sizeBytes !== metadata.sizeBytes)) {

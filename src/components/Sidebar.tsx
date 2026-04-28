@@ -1,5 +1,5 @@
 // @ts-nocheck
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   IconBook,
   IconChat,
@@ -10,7 +10,7 @@ import {
   IconSettings,
   IconTrash,
 } from "./Icons";
-import { GLOBAL_CHAT_KEY } from "../store/useAppStore";
+import { GLOBAL_CHAT_KEY, type WorkspaceEntry } from "../store/useAppStore";
 import { looksLikeReasoningLeakTitle, normalizeConversationDisplayTitle } from "../lib/workflowModels";
 
 const IconLogoM = ({ className, ...props }: { className?: string; [key: string]: any }) => (
@@ -30,14 +30,22 @@ interface SidebarProps {
   t: Record<string, string>;
   currentWorkspace: string;
   selectedWorkspace: string;
+  workspaces?: WorkspaceEntry[];
   sessionsByWorkspace: Record<string, any[]>;
   globalSessions: any[];
   currentSessionId: number | null;
+  activeSessionByWorkspace?: Record<string, number | null>;
   sidebarWidth: number;
   showWorkspaceTreePanel: boolean;
+  workspaceStatuses?: Record<string, string>;
+  sessionStatuses?: Record<string, string>;
+  isWorkspaceDropActive?: boolean;
   onSetSidebarWidth: (w: number) => void;
   onOpenGlobalChat: () => void;
+  onAddWorkspace: () => void;
   onSelectWorkspace: () => void;
+  onSelectWorkspaceRoot?: (path: string) => void;
+  onRemoveWorkspaceEntry?: (path: string) => void;
   onCreateSession: (scopeKey: string) => void;
   onSelectSession: (scopeKey: string, id: number) => void;
   onDeleteSession: (scopeKey: string, id: number) => void;
@@ -46,45 +54,65 @@ interface SidebarProps {
   onStartResizing?: (e: React.MouseEvent) => void;
 }
 
+function getWorkspaceName(path: string) {
+  return path.split(/[\\/]/).filter(Boolean).pop() || path;
+}
+
+function sortSessions(sessions: any[]) {
+  return [...(sessions || [])].sort((a, b) => {
+    const dateA = a.date ? new Date(a.date).getTime() : 0;
+    const dateB = b.date ? new Date(b.date).getTime() : 0;
+    return dateB - dateA;
+  });
+}
+
 export default function Sidebar({
   config,
   t,
   currentWorkspace = "",
   selectedWorkspace = "",
+  workspaces = [],
   sessionsByWorkspace = {},
   globalSessions = [],
   currentSessionId = null,
+  activeSessionByWorkspace = {},
   sidebarWidth = 260,
   showWorkspaceTreePanel = false,
+  workspaceStatuses = {},
+  sessionStatuses = {},
+  isWorkspaceDropActive = false,
   onOpenGlobalChat,
+  onAddWorkspace,
   onSelectWorkspace,
+  onSelectWorkspaceRoot,
   onCreateSession,
   onSelectSession,
   onDeleteSession,
   onRebuildSessions,
+  onRemoveWorkspaceEntry,
   onToggleWorkspaceTree,
   onStartResizing,
 }: SidebarProps) {
   const [chatExpanded, setChatExpanded] = useState(true);
-  const [workspaceExpanded, setWorkspaceExpanded] = useState(true);
-  const workspacePath = selectedWorkspace || currentWorkspace;
+  const [expandedWorkspaces, setExpandedWorkspaces] = useState<Record<string, boolean>>({});
+  const activeWorkspace = selectedWorkspace || currentWorkspace;
 
-  const workspaceName = useMemo(() => {
-    if (!workspacePath) return "";
-    return workspacePath.split("/").filter(Boolean).pop() || workspacePath;
-  }, [workspacePath]);
+  const workspaceEntries = useMemo(() => {
+    const seen = new Set<string>();
+    const entries = [...workspaces];
+    return entries.filter((entry) => {
+      if (!entry?.path || seen.has(entry.path)) return false;
+      seen.add(entry.path);
+      return true;
+    });
+  }, [workspaces]);
 
-  const currentSessions = workspacePath ? sessionsByWorkspace[workspacePath] || [] : [];
-  const sortedGlobalSessions = [...globalSessions].sort((a, b) => {
-    const dateA = a.date ? new Date(a.date).getTime() : 0;
-    const dateB = b.date ? new Date(b.date).getTime() : 0;
-    return dateB - dateA;
-  });
-  const sortedSessions = [...currentSessions].sort((a, b) => {
-    const dateA = a.date ? new Date(a.date).getTime() : 0;
-    const dateB = b.date ? new Date(b.date).getTime() : 0;
-    return dateB - dateA;
-  });
+  useEffect(() => {
+    if (!activeWorkspace) return;
+    setExpandedWorkspaces((prev) => (
+      activeWorkspace in prev ? prev : { ...prev, [activeWorkspace]: true }
+    ));
+  }, [activeWorkspace]);
 
   const formatDate = (dateStr: string) => {
     if (!dateStr) return "";
@@ -95,15 +123,6 @@ export default function Sidebar({
     }
   };
 
-  const workspaceButtonLabel =
-    workspaceName || (config.language === "en" ? "Click to select workspace" : "点击选择工作区");
-  const workspaceButtonHint = workspacePath
-    ? config.language === "en"
-      ? "Change workspace"
-      : "切换工作区"
-    : config.language === "en"
-    ? "Select workspace"
-    : "选择工作区";
   const workspaceTreeTitle = showWorkspaceTreePanel
     ? config.language === "en"
       ? "Hide file tree"
@@ -111,14 +130,14 @@ export default function Sidebar({
     : config.language === "en"
     ? "Show file tree"
     : "显示文件树";
-  const projectChatsLabel = config.language === "en" ? "Project Chats" : "项目会话";
+  const projectChatsLabel = config.language === "en" ? "Projects" : "项目";
   const chatLabel = config.language === "en" ? "Chat" : "聊天";
   const newLabel = config.language === "en" ? "New" : "新建";
+  const addWorkspaceLabel = config.language === "en" ? "Add folder" : "添加文件夹";
   const rebuildLabel = config.language === "en" ? "Rebuild" : "重建";
   const missingLabel = config.language === "en" ? "Missing details" : "详情缺失";
+  const dropHint = config.language === "en" ? "Drop folders here to add workspaces" : "拖拽文件夹到这里加入工作区";
 
-  // 旧数据里可能残留“思考过程”一类标题，这里优先回退到首个 turn 的标题，
-  // 让 sidebar 至少展示真实任务，而不是模型的过程文本。
   const resolveSessionDisplayTitle = (session: any) => {
     const fallback = config.language === "en" ? "New chat" : "新聊天";
     const currentTitle = normalizeConversationDisplayTitle(session?.title || "", 48, "");
@@ -137,10 +156,64 @@ export default function Sidebar({
     );
   };
 
+  const renderSession = (workspacePath: string, session: any, activeSessionId: number | null) => {
+    const isActive = activeWorkspace === workspacePath && session.id === activeSessionId;
+    const sessionStatus = sessionStatuses[`${workspacePath}:${session.id}`] || "idle";
+    const showSessionStatus = sessionStatus && sessionStatus !== "idle";
+    return (
+      <div
+        key={session.id}
+        onClick={() => onSelectSession?.(workspacePath, session.id)}
+        className={`group flex cursor-pointer items-center gap-2.5 rounded-md px-2 py-1.5 transition-colors ${
+          isActive ? "bg-[#18181b] text-[#ffffff] shadow-sm" : "text-[#e4e4e7] hover:bg-[#18181b]"
+        }`}
+      >
+        <IconChat className={isActive ? "h-3.5 w-3.5 shrink-0 theme-text" : "h-3.5 w-3.5 shrink-0 text-[#71717a]"} />
+        {showSessionStatus && (
+          <span
+            className={`h-1.5 w-1.5 shrink-0 rounded-full ${
+              sessionStatus === "error" ? "bg-[#f87171]" : sessionStatus === "pending_review" ? "bg-[#facc15]" : "bg-[var(--accent)]"
+            }`}
+            title={sessionStatus}
+          />
+        )}
+        <div className="flex min-w-0 flex-1 flex-col">
+          <span className="sidebar-session-title truncate text-[13px]">{resolveSessionDisplayTitle(session)}</span>
+          <span className="mt-0.5 flex items-center gap-1 text-[10px] text-[#71717a]">
+            <span>{formatDate(session.date)}</span>
+            {session.storageStatus === "missing" && (
+              <span className="rounded border border-[#7f1d1d] bg-[#2a1010] px-1 text-[#fca5a5]">{missingLabel}</span>
+            )}
+            {session.recordingDisabled && (
+              <span className="rounded border border-[#3f3f46] bg-[#18181b] px-1 text-[#a1a1aa]">
+                {config.language === "en" ? "Temporary" : "临时"}
+              </span>
+            )}
+          </span>
+        </div>
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            onDeleteSession?.(workspacePath, session.id);
+          }}
+          className="rounded p-1 text-[#71717a] opacity-0 transition-opacity hover:bg-[#27272a] hover:text-[#f48771] group-hover:opacity-100"
+          title={config.language === "en" ? "Delete session" : "删除会话"}
+        >
+          <IconTrash className="h-3 w-3" />
+        </button>
+      </div>
+    );
+  };
+
+  const sortedGlobalSessions = sortSessions(globalSessions);
+
   return (
     <div
-      className="relative z-10 flex shrink-0 flex-col overflow-hidden border-r border-[#27272a] bg-[#09090b] shadow-sm"
+      className={`relative z-10 flex shrink-0 flex-col overflow-hidden border-r bg-[#09090b] shadow-sm ${
+        isWorkspaceDropActive ? "border-[var(--accent)]" : "border-[#27272a]"
+      }`}
       style={{ width: `${sidebarWidth}px` }}
+      data-testid="workspace-sidebar"
     >
       <div
         className="flex shrink-0 flex-col justify-center border-b border-[#27272a] bg-[#09090b] px-4 pb-4 pt-10 select-none"
@@ -160,7 +233,7 @@ export default function Sidebar({
           <span className="pointer-events-none">{t.workspace || "WORKSPACE"}</span>
           <button
             onClick={onToggleWorkspaceTree}
-            disabled={!workspacePath}
+            disabled={!activeWorkspace}
             className={`pointer-events-auto flex h-7 items-center justify-center gap-1 rounded-md border px-2 text-[10px] font-medium normal-case tracking-normal transition-colors disabled:cursor-not-allowed disabled:opacity-30 ${
               showWorkspaceTreePanel
                 ? "theme-subtle-border theme-subtle-bg"
@@ -174,13 +247,18 @@ export default function Sidebar({
         </div>
 
         <button
-          onClick={onSelectWorkspace}
-          className="flex w-full items-center gap-2 rounded-md border border-[#27272a] bg-[#000000] px-2.5 py-1.5 text-left shadow-sm transition-colors hover:border-[#3f3f46] hover:text-white"
-          title={workspacePath || (config.language === "en" ? "Click to select workspace" : "点击选择工作区")}
+          onClick={onAddWorkspace || onSelectWorkspace}
+          data-testid="sidebar-add-workspace"
+          className={`flex w-full items-center gap-2 rounded-md border px-2.5 py-2 text-left shadow-sm transition-colors ${
+            isWorkspaceDropActive
+              ? "border-[var(--accent)] bg-[var(--accent-subtle)] text-white"
+              : "border-dashed border-[#3f3f46] bg-[#000000] text-[#a1a1aa] hover:border-[#52525b] hover:text-white"
+          }`}
+          title={dropHint}
         >
-          <span className="min-w-0 flex-1 truncate font-mono text-[12px] text-[#a1a1aa]">{workspaceButtonLabel}</span>
-          <span className="shrink-0 text-[10px] text-[#71717a]">{workspaceButtonHint}</span>
-          <IconChevronRight className="h-3.5 w-3.5 shrink-0 text-[#71717a]" />
+          <IconPlus className="h-3.5 w-3.5 shrink-0" />
+          <span className="min-w-0 flex-1 truncate text-[12px] font-semibold">{addWorkspaceLabel}</span>
+          <span className="shrink-0 text-[10px] text-[#71717a]">{config.language === "en" ? "or drop" : "或拖拽"}</span>
         </button>
       </div>
 
@@ -197,103 +275,111 @@ export default function Sidebar({
           <div className="space-y-2">
             <div className="flex items-center justify-between gap-2 px-1">
               <div className="text-[11px] font-bold uppercase tracking-wider text-[#71717a]">{projectChatsLabel}</div>
-              <div className="flex items-center gap-1">
-                <button
-                  onClick={() => workspacePath && onRebuildSessions?.(workspacePath)}
-                  disabled={!workspacePath}
-                  className="flex items-center gap-1 rounded px-2 py-1 text-[11px] font-medium text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-white disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-[#a1a1aa]"
-                  title={config.language === "en" ? "Rebuild conversation index" : "重建会话索引"}
-                >
-                  <IconBook className="h-3.5 w-3.5" />
-                  {rebuildLabel}
-                </button>
-                <button
-                  onClick={() => workspacePath && onCreateSession?.(workspacePath)}
-                  disabled={!workspacePath}
-                  className="flex items-center gap-1 rounded px-2 py-1 text-[11px] font-medium text-[#e4e4e7] transition-colors hover:bg-[#18181b] hover:text-white disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-[#e4e4e7]"
-                  title={config.language === "en" ? "New project conversation" : "新建项目会话"}
-                >
-                  <IconPlus className="h-3.5 w-3.5" />
-                  {newLabel}
-                </button>
-              </div>
             </div>
 
-            {!workspacePath ? (
-              <div className="mx-1 rounded-lg border border-dashed border-[#27272a] py-6 text-center text-[11px] text-[#71717a]">
-                {t.noWorkspace || "No project selected"}
+            {workspaceEntries.length === 0 ? (
+              <div className="mx-1 rounded-lg border border-dashed border-[#27272a] px-3 py-6 text-center text-[11px] leading-relaxed text-[#71717a]">
+                {dropHint}
               </div>
             ) : (
-              <div className="space-y-0.5">
-                <button
-                  onClick={() => setWorkspaceExpanded((value) => !value)}
-                  className="group flex w-full items-center gap-2 rounded-md px-2 py-2 transition-colors hover:bg-[#18181b]"
-                >
-                  {workspaceExpanded ? (
-                    <IconChevronDown className="h-3.5 w-3.5 shrink-0 text-[#71717a]" />
-                  ) : (
-                    <IconChevronRight className="h-3.5 w-3.5 shrink-0 text-[#71717a]" />
-                  )}
-                  <IconFolder className="h-4 w-4 shrink-0 theme-text" />
-                  <span className="sidebar-label truncate text-[13px] font-medium text-[#e4e4e7]">
-                    {workspaceName}
-                  </span>
-                  <span className="ml-auto text-[10px] text-[#71717a]">{sortedSessions.length}</span>
-                </button>
+              <div className="space-y-1">
+                {workspaceEntries.map((workspace) => {
+                  const workspacePath = workspace.path;
+                  const sessions = sortSessions(sessionsByWorkspace[workspacePath] || []);
+                  const workspaceName = workspace.name || getWorkspaceName(workspacePath);
+                  const isExpanded = expandedWorkspaces[workspacePath] !== false;
+                  const isActiveWorkspace = activeWorkspace === workspacePath;
+                  const activeSessionId = isActiveWorkspace
+                    ? currentSessionId
+                    : activeSessionByWorkspace[workspacePath] ?? null;
+                  const status = workspaceStatuses[workspacePath] || "idle";
+                  const showStatus = status && status !== "idle";
 
-                {workspaceExpanded && (
-                  <div className="ml-3 space-y-0.5 border-l border-[#27272a] pl-2">
-                    {sortedSessions.length === 0 ? (
-                      <div className="py-4 text-center text-[11px] text-[#71717a]">
-                        {t.noConversations || "No conversations yet"}
-                      </div>
-                    ) : (
-                      sortedSessions.map((session) => (
-                        <div
-                          key={session.id}
-                          onClick={() => onSelectSession && onSelectSession(workspacePath, session.id)}
-                          className={`group flex cursor-pointer items-center gap-2.5 rounded-md px-2 py-1.5 transition-colors ${
-                            currentWorkspace && session.id === currentSessionId
-                              ? "bg-[#18181b] text-[#ffffff] shadow-sm"
-                              : "text-[#e4e4e7] hover:bg-[#18181b]"
-                          }`}
+                  return (
+                    <div key={workspacePath} className="space-y-0.5">
+                      <div
+                        className={`group flex w-full items-center gap-2 rounded-md px-2 py-2 transition-colors ${
+                          isActiveWorkspace ? "bg-[#18181b]" : "hover:bg-[#18181b]"
+                        }`}
+                      >
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setExpandedWorkspaces((prev) => ({ ...prev, [workspacePath]: !isExpanded }))
+                          }
+                          className="shrink-0 rounded p-0.5 text-[#71717a] hover:text-[#e4e4e7]"
+                          title={isExpanded ? (config.language === "en" ? "Collapse" : "折叠") : (config.language === "en" ? "Expand" : "展开")}
                         >
-                          <IconChat
-                            className={
-                              currentWorkspace && session.id === currentSessionId
-                                ? "h-3.5 w-3.5 shrink-0 theme-text"
-                                : "h-3.5 w-3.5 shrink-0 text-[#71717a]"
-                            }
-                          />
-                          <div className="flex min-w-0 flex-1 flex-col">
-                            <span className="sidebar-session-title truncate text-[13px]">{resolveSessionDisplayTitle(session)}</span>
-                            <span className="mt-0.5 flex items-center gap-1 text-[10px] text-[#71717a]">
-                              <span>{formatDate(session.date)}</span>
-                              {session.storageStatus === "missing" && (
-                                <span className="rounded border border-[#7f1d1d] bg-[#2a1010] px-1 text-[#fca5a5]">{missingLabel}</span>
-                              )}
-                              {session.recordingDisabled && (
-                                <span className="rounded border border-[#3f3f46] bg-[#18181b] px-1 text-[#a1a1aa]">
-                                  {config.language === "en" ? "Temporary" : "临时"}
-                                </span>
-                              )}
-                            </span>
-                          </div>
-                          <button
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              onDeleteSession?.(workspacePath, session.id);
-                            }}
-                            className="rounded p-1 text-[#71717a] opacity-0 transition-opacity hover:bg-[#27272a] hover:text-[#f48771] group-hover:opacity-100"
-                            title={config.language === "en" ? "Delete session" : "删除会话"}
-                          >
-                            <IconTrash className="h-3 w-3" />
-                          </button>
+                          {isExpanded ? (
+                            <IconChevronDown className="h-3.5 w-3.5" />
+                          ) : (
+                            <IconChevronRight className="h-3.5 w-3.5" />
+                          )}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => onSelectWorkspaceRoot?.(workspacePath)}
+                          className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                          title={workspacePath}
+                        >
+                          <IconFolder className={`h-4 w-4 shrink-0 ${isActiveWorkspace ? "theme-text" : "text-[#71717a]"}`} />
+                          <span className="sidebar-label truncate text-[13px] font-medium text-[#e4e4e7]">
+                            {workspaceName}
+                          </span>
+                        </button>
+                        {showStatus && (
+                          <span className="h-1.5 w-1.5 rounded-full bg-[var(--accent)]" title={status} />
+                        )}
+                        <span className="text-[10px] text-[#71717a]">{sessions.length}</span>
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            workspacePath && onRebuildSessions?.(workspacePath);
+                          }}
+                          className="rounded p-1 text-[#71717a] opacity-60 transition-opacity hover:bg-[#27272a] hover:text-[#e4e4e7] group-hover:opacity-100"
+                          title={config.language === "en" ? "Rebuild conversation index" : "重建会话索引"}
+                        >
+                          <IconBook className="h-3 w-3" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            workspacePath && onCreateSession?.(workspacePath);
+                          }}
+                          className="rounded p-1 text-[#71717a] opacity-60 transition-opacity hover:bg-[#27272a] hover:text-[#e4e4e7] group-hover:opacity-100"
+                          title={config.language === "en" ? "New project conversation" : "新建项目会话"}
+                        >
+                          <IconPlus className="h-3 w-3" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onRemoveWorkspaceEntry?.(workspacePath);
+                          }}
+                          className="rounded p-1 text-[#71717a] opacity-70 transition-opacity hover:bg-[#27272a] hover:text-[#f48771] group-hover:opacity-100"
+                          title={config.language === "en" ? "Remove from sidebar" : "从侧边栏移除"}
+                        >
+                          <IconTrash className="h-3 w-3" />
+                        </button>
+                      </div>
+
+                      {isExpanded && (
+                        <div className="ml-3 space-y-0.5 border-l border-[#27272a] pl-2">
+                          {sessions.length === 0 ? (
+                            <div className="py-3 text-center text-[11px] text-[#71717a]">
+                              {t.noConversations || "No conversations yet"}
+                            </div>
+                          ) : (
+                            sessions.map((session) => renderSession(workspacePath, session, activeSessionId))
+                          )}
                         </div>
-                      ))
-                    )}
-                  </div>
-                )}
+                      )}
+                    </div>
+                  );
+                })}
               </div>
             )}
           </div>
@@ -343,49 +429,7 @@ export default function Sidebar({
                         {t.noChats || "No chats yet"}
                       </div>
                     ) : (
-                      sortedGlobalSessions.map((session) => (
-                        <div
-                          key={session.id}
-                          onClick={() => onSelectSession && onSelectSession(GLOBAL_CHAT_KEY, session.id)}
-                          className={`group flex cursor-pointer items-center gap-2.5 rounded-md px-2 py-1.5 transition-colors ${
-                            !currentWorkspace && session.id === currentSessionId
-                              ? "bg-[#18181b] text-[#ffffff] shadow-sm"
-                              : "text-[#e4e4e7] hover:bg-[#18181b]"
-                          }`}
-                        >
-                          <IconChat
-                            className={
-                              !currentWorkspace && session.id === currentSessionId
-                                ? "h-3.5 w-3.5 shrink-0 theme-text"
-                                : "h-3.5 w-3.5 shrink-0 text-[#71717a]"
-                            }
-                          />
-                          <div className="flex min-w-0 flex-1 flex-col">
-                            <span className="sidebar-session-title truncate text-[13px]">{resolveSessionDisplayTitle(session)}</span>
-                            <span className="mt-0.5 flex items-center gap-1 text-[10px] text-[#71717a]">
-                              <span>{formatDate(session.date)}</span>
-                              {session.storageStatus === "missing" && (
-                                <span className="rounded border border-[#7f1d1d] bg-[#2a1010] px-1 text-[#fca5a5]">{missingLabel}</span>
-                              )}
-                              {session.recordingDisabled && (
-                                <span className="rounded border border-[#3f3f46] bg-[#18181b] px-1 text-[#a1a1aa]">
-                                  {config.language === "en" ? "Temporary" : "临时"}
-                                </span>
-                              )}
-                            </span>
-                          </div>
-                          <button
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              onDeleteSession?.(GLOBAL_CHAT_KEY, session.id);
-                            }}
-                            className="rounded p-1 text-[#71717a] opacity-0 transition-opacity hover:bg-[#27272a] hover:text-[#f48771] group-hover:opacity-100"
-                            title={config.language === "en" ? "Delete session" : "删除会话"}
-                          >
-                            <IconTrash className="h-3 w-3" />
-                          </button>
-                        </div>
-                      ))
+                      sortedGlobalSessions.map((session) => renderSession(GLOBAL_CHAT_KEY, session, !currentWorkspace ? currentSessionId : null))
                     )}
                   </div>
                 )}

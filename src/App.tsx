@@ -1,7 +1,8 @@
-import { useRef, useEffect, useCallback, useState } from "react";
+import { useRef, useEffect, useCallback, useMemo, useState } from "react";
 import { open } from '@tauri-apps/plugin-dialog';
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 
 import Sidebar from "./components/Sidebar";
 import WorkspaceTreePanel from "./components/WorkspaceTreePanel";
@@ -17,9 +18,11 @@ import {
   GLOBAL_CHAT_KEY,
   type TaskBlock,
   resolveSessionWorkspaceKey,
+  resolveSessionRuntimeKey,
   sanitizeAgentMessagesForPersist,
   sanitizeTaskBlocksForPersist,
   syncTaskIdCounterFromBlocks,
+  normalizeInterruptedConversationTurnsForRestore,
 } from "./store/useAppStore";
 import { getE2EQuickReplyHandler, initializeE2EScenarios } from "./lib/e2e";
 import {
@@ -29,6 +32,7 @@ import {
   rebuildProjectSessionsIndex,
   saveProjectSession,
   setWorkspaceRoot as setWorkspaceRootIpc,
+  canonicalizeWorkspacePath,
 } from "./lib/ipc";
 import { normalizeStudioAgentKey } from "./lib/gameStudioCatalog";
 import { MAIN_MODE_KEYS, mapLegacyNexusModeToMainMode, mapMainModeToLegacyNexusMode } from "./lib/mainModes";
@@ -50,10 +54,11 @@ import {
 } from "./lib/imAdapters";
 
 function buildSessionRuntimeSnapshotFromState(state: any) {
+  const taskFlow = sanitizeTaskBlocksForPersist(state.taskFlow || []);
   return {
-    taskFlow: sanitizeTaskBlocksForPersist(state.taskFlow || []),
+    taskFlow,
     agentMessages: sanitizeAgentMessagesForPersist(state.agentMessages || []),
-    conversationTurns: state.conversationTurns || [],
+    conversationTurns: normalizeInterruptedConversationTurnsForRestore(state.conversationTurns, taskFlow),
     currentTurnId: state.currentTurnId ?? null,
     selectedMainModeKey: state.selectedMainModeKey,
     selectedNexusModeKey: state.selectedNexusModeKey,
@@ -91,8 +96,8 @@ export default function App() {
   const endOfFlowRef = useRef<HTMLDivElement>(null);
 
   const {
-    sessionsByWorkspace, currentWorkspace, currentSessionId,
-    setCurrentWorkspace, addSession, removeSession, updateSession, setCurrentSessionId,
+    sessionsByWorkspace, workspaces, activeSessionByWorkspace, currentWorkspace, currentSessionId,
+    setCurrentWorkspace, addWorkspaceEntry, removeWorkspaceEntry, addSession, removeSession, updateSession, setCurrentSessionId,
     allowToolAction, rejectToolAction,
     autoApproveTools, setAutoApproveTools,
     mcpServers, setMcpServers, mcpDiscoveredTools, setMcpDiscoveredTools,
@@ -129,6 +134,7 @@ export default function App() {
   const isStreaming = useAppStore((s) => s.isGenerating);
   const agentStatus = useAppStore((s) => s.agentStatus);
   const elapsedTime = useAppStore((s) => s.elapsedTime);
+  const runtimeBySessionKey = useAppStore((s) => s.runtimeBySessionKey);
 
   // ── Composer State ────────────────────────────────────────────────────
   const input = useAppStore((s) => s.input);
@@ -149,8 +155,47 @@ export default function App() {
   const selectedWorkspace = useAppStore((s) => s.selectedWorkspace);
   const mainModes = [...MAIN_MODE_KEYS];
   const activeSessionScope = resolveSessionWorkspaceKey(currentWorkspace);
+  const activeSessionKey = useMemo(
+    () => resolveSessionRuntimeKey(activeSessionScope, currentSessionId),
+    [activeSessionScope, currentSessionId],
+  );
   const globalSessions = sessionsByWorkspace[GLOBAL_CHAT_KEY] || [];
   const sidebarWorkspace = selectedWorkspace || currentWorkspace;
+  const sessionStatuses = useMemo(() => {
+    const statuses: Record<string, string> = {};
+    Object.entries(runtimeBySessionKey || {}).forEach(([sessionKey, runtime]: any) => {
+      const status = runtime?.agentStatus || (runtime?.isGenerating ? "running" : "idle");
+      if (status && status !== "idle") statuses[sessionKey] = status;
+    });
+    if (activeSessionKey && (agentStatus !== "idle" || isStreaming)) {
+      statuses[activeSessionKey] = agentStatus || (isStreaming ? "running" : "idle");
+    }
+    return statuses;
+  }, [activeSessionKey, agentStatus, isStreaming, runtimeBySessionKey]);
+  const workspaceStatuses = useMemo(() => {
+    const rank: Record<string, number> = { error: 4, pending_review: 3, running: 2, idle: 1 };
+    const next: Record<string, string> = {};
+    const promote = (workspacePath: string, status: string) => {
+      if (!workspacePath || status === "idle") return;
+      const current = next[workspacePath] || "idle";
+      if ((rank[status] || 0) > (rank[current] || 0)) next[workspacePath] = status;
+    };
+    workspaces.forEach((workspace) => {
+      const activeSessionId = activeSessionByWorkspace[workspace.path] ?? null;
+      const activeKey = resolveSessionRuntimeKey(workspace.path, activeSessionId);
+      if (activeKey && sessionStatuses[activeKey]) {
+        promote(workspace.path, sessionStatuses[activeKey]);
+      }
+      const prefix = `${workspace.path}:`;
+      Object.entries(sessionStatuses).forEach(([sessionKey, status]) => {
+        if (sessionKey.startsWith(prefix)) promote(workspace.path, status);
+      });
+    });
+    if (currentWorkspace && (agentStatus !== "idle" || isStreaming)) {
+      promote(currentWorkspace, agentStatus || "running");
+    }
+    return next;
+  }, [activeSessionByWorkspace, agentStatus, currentWorkspace, isStreaming, sessionStatuses, workspaces]);
 
   // ── Layout State ──────────────────────────────────────────────────────
   const rightPanelWidth = useAppStore((s) => s.rightPanelWidth);
@@ -168,6 +213,7 @@ export default function App() {
   const [isResizing, setIsResizing] = useState(false);
   const [isSidebarResizing, setIsSidebarResizing] = useState(false);
   const [isWorkspaceTreeResizing, setIsWorkspaceTreeResizing] = useState(false);
+  const [isWorkspaceDropActive, setIsWorkspaceDropActive] = useState(false);
   const pendingRightPanelWidthRef = useRef<number | null>(null);
   const rightPanelResizeFrameRef = useRef<number | null>(null);
 
@@ -248,6 +294,12 @@ export default function App() {
       });
     }
   }, []);
+
+  const settleCurrentSessionBeforeNavigation = useCallback(async () => {
+    const state = useAppStore.getState();
+    state.saveCurrentRuntimeToSession();
+    await persistCurrentSessionNow();
+  }, [persistCurrentSessionNow]);
 
   // ── Skills ────────────────────────────────────────────────────────────
   const skills = useAppStore((s) => s.skills);
@@ -566,6 +618,16 @@ export default function App() {
   // --- Workspace & Session Management ---
   const restoreSessionState = async (target: any, id: number, scopeKey = activeSessionScope) => {
     const startedAt = performance.now();
+    const liveSessionKey = resolveSessionRuntimeKey(scopeKey, id);
+    if (useAppStore.getState().restoreRuntimeForSession(liveSessionKey)) {
+      appendDebugLog("info", "session.restore", {
+        sessionId: id,
+        scopeKey,
+        mode: "live_runtime",
+        elapsedMs: Math.round(performance.now() - startedAt),
+      });
+      return;
+    }
     let hydratedTarget = target;
 
     if (
@@ -631,6 +693,7 @@ export default function App() {
         mode: "missing",
         elapsedMs: Math.round(performance.now() - startedAt),
       });
+      useAppStore.getState().saveCurrentRuntimeToSession();
       return;
     }
 
@@ -638,6 +701,10 @@ export default function App() {
     if (target?.runtimeSnapshot) {
       const snapshot = target.runtimeSnapshot;
       const restoredTaskFlow = sanitizeTaskBlocksForPersist(snapshot.taskFlow || target.messages || []);
+      const restoredConversationTurns = normalizeInterruptedConversationTurnsForRestore(
+        snapshot.conversationTurns || [],
+        restoredTaskFlow,
+      );
       syncTaskIdCounterFromBlocks(restoredTaskFlow);
       useAppStore.setState({
         taskFlow: restoredTaskFlow,
@@ -658,7 +725,7 @@ export default function App() {
         gameStudioInitialized: snapshot.gameStudioInitialized === true || useAppStore.getState().gameStudioInitialized,
         pendingSlashCommand: snapshot.pendingSlashCommand ?? null,
         selectedDiffTaskId: snapshot.selectedDiffTaskId ?? null,
-        conversationTurns: snapshot.conversationTurns || [],
+        conversationTurns: restoredConversationTurns,
         currentTurnId: snapshot.currentTurnId ?? null,
         currentTurnState: {
           interceptorHandled: false,
@@ -697,8 +764,9 @@ export default function App() {
         elapsedMs: Math.round(performance.now() - startedAt),
         taskFlowBlocks: restoredTaskFlow.length,
         agentMessages: (snapshot.agentMessages || []).length,
-        conversationTurns: (snapshot.conversationTurns || []).length,
+        conversationTurns: restoredConversationTurns.length,
       });
+      useAppStore.getState().saveCurrentRuntimeToSession();
       return;
     }
 
@@ -754,6 +822,7 @@ export default function App() {
         elapsedMs: Math.round(performance.now() - startedAt),
         taskFlowBlocks: target.messages.length,
       });
+      useAppStore.getState().saveCurrentRuntimeToSession();
       return;
     }
 
@@ -803,33 +872,72 @@ export default function App() {
       mode: "empty",
       elapsedMs: Math.round(performance.now() - startedAt),
     });
+    useAppStore.getState().saveCurrentRuntimeToSession();
   };
 
   const openSessionScope = (scopeKey: string) => {
     setCurrentWorkspace(scopeKey === GLOBAL_CHAT_KEY ? "" : scopeKey);
-    useAppStore.getState().resetForWorkspace();
+  };
+
+  const handleOpenWorkspacePath = async (path: string, options: { selectFirstSession?: boolean } = {}) => {
+    const rawPath = String(path || "").trim();
+    if (!rawPath) return;
+    try {
+      await settleCurrentSessionBeforeNavigation();
+      let stablePath = rawPath;
+      try {
+        stablePath = await canonicalizeWorkspacePath(rawPath);
+      } catch {
+        stablePath = await setWorkspaceRootIpc(rawPath);
+      }
+      addWorkspaceEntry(stablePath);
+      const rememberedSessionId = useAppStore.getState().activeSessionByWorkspace[stablePath] ?? null;
+      const existing = await refreshSessionsForScope(stablePath);
+      const targetSession =
+        existing.find((session: any) => rememberedSessionId != null && session.id === rememberedSessionId) ||
+        existing.find((session: any) => session.active) ||
+        (options.selectFirstSession ? existing[0] : null);
+      if (targetSession) {
+        await handleSelectSession(stablePath, targetSession.id);
+      } else {
+        setCurrentWorkspace(stablePath);
+        setCurrentSessionId(null);
+        useAppStore.setState({
+          taskFlow: [],
+          agentMessages: [],
+          conversationTurns: [],
+          currentTurnId: null,
+          selectedDiffTaskId: null,
+          pendingSlashCommand: null,
+          planArtifacts: [],
+          planTasks: [],
+          planExecutionEvidenceCount: 0,
+          planStage: "idle",
+          isPlanApproved: false,
+          agentStatus: "idle",
+          isGenerating: false,
+          abortController: null,
+          pendingReviewResolve: null,
+          pendingReviewTaskId: null,
+          pendingToolCall: null,
+          showPlanPanel: false,
+          showDiff: false,
+          showTerminal: false,
+          showFilePanel: false,
+          rightPanelTab: "plan",
+        });
+      }
+    } catch (error) {
+      console.error("Failed to open workspace path:", error);
+    }
   };
 
   const handleSelectWorkspace = async () => {
     try {
       const selected = await open({ directory: true, multiple: false, title: 'Select Project Workspace' });
       if (selected) {
-        await persistCurrentSessionNow();
         const selectedPath = Array.isArray(selected) ? selected[0] : selected;
-        // Register workspace root in Rust backend BEFORE updating frontend state
-        // to avoid race condition with file listing in Composer
-        let stablePath = selectedPath;
-        try { stablePath = await setWorkspaceRootIpc(selectedPath); } catch {}
-        setCurrentWorkspace(stablePath);
-        setCurrentSessionId(null);
-        useAppStore.getState().resetForWorkspace();
-        const existing = await refreshSessionsForScope(stablePath);
-        if (existing.length > 0) {
-          const targetSession = existing.find((session: any) => session.active) || existing[0];
-          await handleSelectSession(stablePath, targetSession.id);
-        } else {
-          setCurrentSessionId(null);
-        }
+        await handleOpenWorkspacePath(selectedPath, { selectFirstSession: true });
       }
     } catch (error) { console.error('Failed to select workspace:', error); }
   };
@@ -837,7 +945,7 @@ export default function App() {
   const handleOpenGlobalChat = async () => {
     const state = useAppStore.getState();
     if (!state.currentWorkspace && state.currentSessionId) return;
-    await persistCurrentSessionNow();
+    await settleCurrentSessionBeforeNavigation();
 
     openSessionScope(GLOBAL_CHAT_KEY);
     const existing = await refreshSessionsForScope(GLOBAL_CHAT_KEY);
@@ -852,21 +960,64 @@ export default function App() {
     await restoreSessionState(targetSession, targetSession.id, GLOBAL_CHAT_KEY);
   };
 
+  const handleRemoveWorkspaceEntry = async (path: string) => {
+    const normalizedPath = String(path || "").trim();
+    if (!normalizedPath) return;
+
+    const state = useAppStore.getState();
+    const wasActive = resolveSessionWorkspaceKey(state.currentWorkspace) === normalizedPath;
+    const remainingWorkspaces = state.workspaces.filter((entry: any) => entry.path !== normalizedPath);
+
+    state.saveCurrentRuntimeToSession();
+    removeWorkspaceEntry(normalizedPath);
+
+    if (!wasActive) return;
+
+    const nextWorkspace = remainingWorkspaces[0]?.path;
+    if (nextWorkspace) {
+      await handleOpenWorkspacePath(nextWorkspace, { selectFirstSession: true });
+    } else {
+      await handleOpenGlobalChat();
+    }
+  };
+
   const handleCreateSessionForScope = async (scopeKey: string) => {
     if (!scopeKey) return;
 
     const state = useAppStore.getState();
     const liveScope = resolveSessionWorkspaceKey(state.currentWorkspace);
     if (state.currentSessionId) {
-      await persistCurrentSessionNow();
+      await settleCurrentSessionBeforeNavigation();
       updateSession(liveScope, state.currentSessionId, {
-        messages: sanitizeTaskBlocksForPersist(taskFlow),
+        messages: sanitizeTaskBlocksForPersist(useAppStore.getState().taskFlow),
         active: false,
       });
     }
 
     const isGlobalChat = scopeKey === GLOBAL_CHAT_KEY;
     const storageStatus: "ok" | "temporary" = config.sessionRecordingEnabled ? "ok" : "temporary";
+    const emptyRuntimeSnapshot = buildSessionRuntimeSnapshotFromState({
+      taskFlow: [],
+      agentMessages: [],
+      conversationTurns: [],
+      currentTurnId: null,
+      selectedMainModeKey: "main_mode",
+      selectedNexusModeKey: "nexus_general",
+      activeStudioAgentKey: useAppStore.getState().activeStudioAgentKey,
+      gameStudioInitialized: useAppStore.getState().gameStudioInitialized,
+      pendingSlashCommand: null,
+      planArtifacts: [],
+      planTasks: [],
+      planExecutionEvidenceCount: 0,
+      planStage: "idle",
+      isPlanApproved: false,
+      showPlanPanel: false,
+      showDiff: false,
+      showTerminal: false,
+      showFilePanel: false,
+      rightPanelTab: "plan",
+      selectedDiffTaskId: null,
+    });
     const ns = {
       id: Date.now(),
       title: isGlobalChat
@@ -877,21 +1028,31 @@ export default function App() {
       storageStatus,
       recordingDisabled: !config.sessionRecordingEnabled,
       messages: [] as TaskBlock[],
+      runtimeSnapshot: emptyRuntimeSnapshot,
     };
     const existing = useAppStore.getState().sessionsByWorkspace[scopeKey] || [];
     existing.forEach((ses: any) => { if (ses.active) updateSession(scopeKey, ses.id, { active: false }); });
+    if (!isGlobalChat) addWorkspaceEntry(scopeKey);
     openSessionScope(scopeKey);
     addSession(scopeKey, { ...ns, active: true });
     setCurrentSessionId(ns.id);
+    await restoreSessionState(ns, ns.id, scopeKey);
   };
 
   const handleSelectSession = async (scopeKey: string, id: number) => {
     const state = useAppStore.getState();
-    if (state.currentSessionId) await persistCurrentSessionNow();
+    const currentScopeKey = resolveSessionWorkspaceKey(state.currentWorkspace);
+    if (state.currentSessionId && (currentScopeKey !== scopeKey || state.currentSessionId !== id)) {
+      await settleCurrentSessionBeforeNavigation();
+    }
 
+    if (scopeKey !== GLOBAL_CHAT_KEY) addWorkspaceEntry(scopeKey);
     openSessionScope(scopeKey);
     updateSession(scopeKey, id, { active: true });
     setCurrentSessionId(id);
+    if (useAppStore.getState().restoreRuntimeForSession(resolveSessionRuntimeKey(scopeKey, id))) {
+      return;
+    }
     const target = (useAppStore.getState().sessionsByWorkspace[scopeKey] || []).find((s: any) => s.id === id);
     await restoreSessionState(target, id, scopeKey);
   };
@@ -1265,6 +1426,22 @@ export default function App() {
   const startSidebarResizing = (e: React.MouseEvent) => { e.preventDefault(); setIsSidebarResizing(true); };
   const startWorkspaceTreeResizing = (e: React.MouseEvent) => { e.preventDefault(); setIsWorkspaceTreeResizing(true); };
 
+  const sidebarWidthRef = useRef(sidebarWidth);
+  const languageRef = useRef(config.language);
+  const handleOpenWorkspacePathRef = useRef(handleOpenWorkspacePath);
+
+  useEffect(() => {
+    sidebarWidthRef.current = sidebarWidth;
+  }, [sidebarWidth]);
+
+  useEffect(() => {
+    languageRef.current = config.language;
+  }, [config.language]);
+
+  useEffect(() => {
+    handleOpenWorkspacePathRef.current = handleOpenWorkspacePath;
+  }, [handleOpenWorkspacePath]);
+
   useEffect(() => {
     const MIN_SIDEBAR_WIDTH = 220;
     const MIN_WORKSPACE_TREE_WIDTH = 220;
@@ -1293,8 +1470,8 @@ export default function App() {
         if (typeof width === "number") {
           setRightPanelWidth(width);
         }
-      });
-    };
+    });
+  };
 
     const onMouseMove = (e: MouseEvent) => {
       if (isResizing) {
@@ -1431,11 +1608,104 @@ export default function App() {
     }
   }, [activeSessionScope, currentSessionId, taskFlow.length]);
 
+  useEffect(() => {
+    let unlisten: (() => void | Promise<void>) | null = null;
+    let disposed = false;
+    const safelyDispose = (dispose: (() => void | Promise<void>) | null) => {
+      if (!dispose) return;
+      try {
+        const result = dispose();
+        if (result && typeof (result as Promise<void>).catch === "function") {
+          void (result as Promise<void>).catch(() => {});
+        }
+      } catch {
+        // Listener cleanup can race during hot reload or rapid webview navigation.
+      }
+    };
+
+    void getCurrentWebview().onDragDropEvent((event) => {
+      const payload = event.payload;
+      if (payload.type === "enter" || payload.type === "over") {
+        setIsWorkspaceDropActive(payload.position.x <= sidebarWidthRef.current);
+        return;
+      }
+      if (payload.type === "leave") {
+        setIsWorkspaceDropActive(false);
+        return;
+      }
+      if (payload.type !== "drop") return;
+
+      const isSidebarDrop = payload.position.x <= sidebarWidthRef.current;
+      setIsWorkspaceDropActive(false);
+      if (!isSidebarDrop) return;
+
+      void (async () => {
+        const added: string[] = [];
+        let ignoredFiles = 0;
+        for (const path of payload.paths || []) {
+          try {
+            const stablePath = await canonicalizeWorkspacePath(path);
+            addWorkspaceEntry(stablePath);
+            added.push(stablePath);
+          } catch {
+            ignoredFiles += 1;
+            // Dragging files is intentionally ignored here; only folders become workspaces.
+          }
+        }
+        if (added.length > 0) {
+          await handleOpenWorkspacePathRef.current(added[0], { selectFirstSession: true });
+        } else if (ignoredFiles > 0) {
+          window.alert(languageRef.current === "en" ? "Drop folders to add workspaces." : "请拖拽文件夹来加入工作区。");
+        }
+      })();
+    }).then((dispose) => {
+      if (disposed) {
+        safelyDispose(dispose);
+        return;
+      }
+      unlisten = dispose;
+    }).catch(() => {
+      // Browser/e2e environments without Tauri simply skip native folder drop.
+    });
+
+    return () => {
+      disposed = true;
+      safelyDispose(unlisten);
+    };
+  }, [addWorkspaceEntry]);
+
   return (
     <div className="flex h-screen w-full bg-[#000000] text-[#e4e4e7] font-sans text-sm overflow-hidden md:flex-row flex-col relative"
       style={{ '--accent': currentTheme.accent, '--accent-hover': currentTheme.hover, '--accent-light': currentTheme.light, '--accent-subtle': currentTheme.subtle, '--accent-subtle-border': currentTheme.subtleBorder } as React.CSSProperties}>
       <ThemeStyles />
-      <Sidebar config={{ ...config, onOpenSettings: () => { setSettingsTab('general'); setIsSettingsOpen(true); }, onOpenSkills: () => setIsSkillsOpen(true) }} t={t} currentWorkspace={currentWorkspace} selectedWorkspace={sidebarWorkspace} sessionsByWorkspace={sessionsByWorkspace} globalSessions={globalSessions} currentSessionId={currentSessionId} sidebarWidth={sidebarWidth} showWorkspaceTreePanel={showWorkspaceTreePanel} onSetSidebarWidth={setSidebarWidth} onStartResizing={startSidebarResizing} onOpenGlobalChat={handleOpenGlobalChat} onSelectWorkspace={handleSelectWorkspace} onCreateSession={handleCreateSessionForScope} onSelectSession={handleSelectSession} onDeleteSession={handleDeleteSession} onRebuildSessions={handleRebuildSessionIndex} onToggleWorkspaceTree={toggleWorkspaceTreePanel} />
+      <Sidebar
+        config={{ ...config, onOpenSettings: () => { setSettingsTab('general'); setIsSettingsOpen(true); }, onOpenSkills: () => setIsSkillsOpen(true) }}
+        t={t}
+        currentWorkspace={currentWorkspace}
+        selectedWorkspace={sidebarWorkspace}
+        workspaces={workspaces}
+        sessionsByWorkspace={sessionsByWorkspace}
+        globalSessions={globalSessions}
+        currentSessionId={currentSessionId}
+        activeSessionByWorkspace={activeSessionByWorkspace}
+        sidebarWidth={sidebarWidth}
+        showWorkspaceTreePanel={showWorkspaceTreePanel}
+        workspaceStatuses={workspaceStatuses}
+        sessionStatuses={sessionStatuses}
+        isWorkspaceDropActive={isWorkspaceDropActive}
+        onSetSidebarWidth={setSidebarWidth}
+        onStartResizing={startSidebarResizing}
+        onOpenGlobalChat={handleOpenGlobalChat}
+        onAddWorkspace={handleSelectWorkspace}
+        onSelectWorkspace={handleSelectWorkspace}
+        onSelectWorkspaceRoot={(path) => void handleOpenWorkspacePath(path, { selectFirstSession: true })}
+        onRemoveWorkspaceEntry={handleRemoveWorkspaceEntry}
+        onCreateSession={handleCreateSessionForScope}
+        onSelectSession={handleSelectSession}
+        onDeleteSession={handleDeleteSession}
+        onRebuildSessions={handleRebuildSessionIndex}
+        onToggleWorkspaceTree={toggleWorkspaceTreePanel}
+      />
       {showWorkspaceTreePanel && sidebarWorkspace && (
         <WorkspaceTreePanel
           currentWorkspace={sidebarWorkspace}
@@ -1445,7 +1715,7 @@ export default function App() {
           onStartResizing={startWorkspaceTreeResizing}
         />
       )}
-      <ChatArea taskFlow={taskFlow} t={t} config={config} setSettingsTab={setSettingsTab} setIsSettingsOpen={setIsSettingsOpen} activeDiffTask={activeDiffTask} endOfFlowRef={endOfFlowRef} isStreaming={isStreaming} elapsedTime={elapsedTime} onStopGeneration={handleStopGeneration} allowToolAction={allowToolAction} rejectToolAction={rejectToolAction} autoApproveTools={autoApproveTools} onToggleAutoApprove={setAutoApproveTools} input={input} setInput={setInput} contextMentions={contextMentions} setContextMentions={setContextMentions} attachedFiles={attachedFiles} setAttachedFiles={setAttachedFiles} onAttachFile={handleAttachFile} showAgentPicker={showAgentPicker} setShowAgentPicker={setShowAgentPicker} selectedMainModeKey={selectedMainModeKey} setSelectedMainModeKey={setSelectedMainModeKey} mainModes={mainModes} activeStudioAgentKey={activeStudioAgentKey} setActiveStudioAgentKey={setActiveStudioAgentKey} gameStudioInitialized={gameStudioInitialized} initializeGameStudioWorkspace={initializeGameStudioWorkspace} removeGameStudioWorkspace={removeGameStudioWorkspace} currentWorkspace={currentWorkspace} handleAcceptInline={handleAcceptInline} handleRejectInline={handleRejectInline} onSendMessage={handleSendMessage} onQuickReply={handleQuickReply} />
+      <ChatArea taskFlow={taskFlow} t={t} config={config} setSettingsTab={setSettingsTab} setIsSettingsOpen={setIsSettingsOpen} activeDiffTask={activeDiffTask} endOfFlowRef={endOfFlowRef} isStreaming={isStreaming} elapsedTime={elapsedTime} activeSessionKey={activeSessionKey} onStopGeneration={handleStopGeneration} allowToolAction={allowToolAction} rejectToolAction={rejectToolAction} autoApproveTools={autoApproveTools} onToggleAutoApprove={setAutoApproveTools} input={input} setInput={setInput} contextMentions={contextMentions} setContextMentions={setContextMentions} attachedFiles={attachedFiles} setAttachedFiles={setAttachedFiles} onAttachFile={handleAttachFile} showAgentPicker={showAgentPicker} setShowAgentPicker={setShowAgentPicker} selectedMainModeKey={selectedMainModeKey} setSelectedMainModeKey={setSelectedMainModeKey} mainModes={mainModes} activeStudioAgentKey={activeStudioAgentKey} setActiveStudioAgentKey={setActiveStudioAgentKey} gameStudioInitialized={gameStudioInitialized} initializeGameStudioWorkspace={initializeGameStudioWorkspace} removeGameStudioWorkspace={removeGameStudioWorkspace} currentWorkspace={currentWorkspace} handleAcceptInline={handleAcceptInline} handleRejectInline={handleRejectInline} onSendMessage={handleSendMessage} onQuickReply={handleQuickReply} />
       <RightPanel activeDiffTask={activeDiffTask} rightPanelWidth={rightPanelWidth} startResizing={startResizing} />
       <SettingsModal isOpen={isSettingsOpen} onClose={() => setIsSettingsOpen(false)} config={config} setConfig={setConfig} t={t} THEMES={THEMES} settingsTab={settingsTab} setSettingsTab={setSettingsTab} mcpServers={mcpServers} setMcpServers={setMcpServers} mcpDiscoveredTools={mcpDiscoveredTools} setMcpDiscoveredTools={setMcpDiscoveredTools} />
       <SkillsModal isOpen={isSkillsOpen} onClose={() => setIsSkillsOpen(false)} t={t} skills={skills} currentWorkspace={currentWorkspace} toggleSkill={toggleSkill} deleteSkill={deleteSkill} addSkill={addSkill} updateSkill={updateSkill} isAddingSkill={isAddingSkill} setIsAddingSkill={setIsAddingSkill} />

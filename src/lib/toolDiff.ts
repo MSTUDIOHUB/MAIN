@@ -37,7 +37,7 @@ export async function buildToolDiffPreview(
         originalContent =
           !String(context.workspace || "").trim() && context.sessionKey
             ? await readChatTempFile(context.sessionKey, path)
-            : await readFile(path);
+            : await readFile(path, context.workspace);
       } catch {
         originalContent = "";
       }

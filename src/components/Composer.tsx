@@ -174,6 +174,9 @@ export default function Composer({
   const previousWorkspaceRef = useRef(currentWorkspace);
   const submitUnlockTimerRef = useRef<number | null>(null);
   const submitPendingRef = useRef(false);
+  const isComposingRef = useRef(false);
+  const compositionEndedAtRef = useRef(0);
+  const mentionRefreshTimerRef = useRef<number | null>(null);
 
   // ── Image paste/drop state (local to avoid large base64 in global store) ──
   const [pendingImages, setPendingImages] = useState<string[]>([]);
@@ -736,6 +739,7 @@ export default function Composer({
     mentionAnchorRef.current = anchorPos;
     setMentionQuery("");
     setShowMentionMenu(true);
+    void refreshWorkspaceFiles();
 
     requestAnimationFrame(() => {
       ta.selectionStart = ta.selectionEnd = anchorPos + 1;
@@ -767,6 +771,23 @@ export default function Composer({
       setIsFilesLoading(false);
     }
   }, [currentWorkspace]);
+
+  useEffect(() => {
+    if (!showMentionMenu) return;
+    if (mentionRefreshTimerRef.current !== null) {
+      window.clearTimeout(mentionRefreshTimerRef.current);
+    }
+    mentionRefreshTimerRef.current = window.setTimeout(() => {
+      mentionRefreshTimerRef.current = null;
+      void refreshWorkspaceFiles();
+    }, 120);
+    return () => {
+      if (mentionRefreshTimerRef.current !== null) {
+        window.clearTimeout(mentionRefreshTimerRef.current);
+        mentionRefreshTimerRef.current = null;
+      }
+    };
+  }, [mentionQuery, refreshWorkspaceFiles, showMentionMenu, workspaceContentVersion]);
 
   const reopenStudioOnboarding = useCallback((options?: { resetUsed?: boolean }) => {
     setForceVisibleStudioOnboardingByWorkspace((prev) => ({
@@ -945,6 +966,7 @@ export default function Composer({
         mentionAnchorRef.current = lastAtIndex;
         setMentionQuery(textAfterAt);
         setShowMentionMenu(true);
+        void refreshWorkspaceFiles();
         if (showSlashMenu) closeSlashMenu();
         return;
       }
@@ -995,6 +1017,15 @@ export default function Composer({
 
   // ── Keyboard navigation inside textarea + mention menu ──
   const handleKeyDown = (e: React.KeyboardEvent) => {
+    const nativeEvent = e.nativeEvent as KeyboardEvent & { isComposing?: boolean };
+    const justFinishedComposition = Date.now() - compositionEndedAtRef.current < 140;
+    if (
+      e.key === "Enter" &&
+      (isComposingRef.current || nativeEvent.isComposing || e.keyCode === 229 || justFinishedComposition)
+    ) {
+      return;
+    }
+
     if (showMentionMenu) {
       if (e.key === "ArrowDown") {
         e.preventDefault();
@@ -1006,7 +1037,7 @@ export default function Composer({
         setHighlightedIndex(prev => Math.max(prev - 1, 0));
         return;
       }
-      if ((e.key === "Enter" && !e.altKey) || e.key === "Tab") {
+      if ((e.key === "Enter" && !e.altKey && !e.shiftKey) || e.key === "Tab") {
         e.preventDefault();
         if (mentionResults.length > 0 && highlightedIndex < mentionResults.length) {
           handleSelectMention(mentionResults[highlightedIndex]);
@@ -1031,7 +1062,7 @@ export default function Composer({
         setHighlightedSlashIndex((prev) => Math.max(prev - 1, 0));
         return;
       }
-      if ((e.key === "Enter" && !e.altKey) || e.key === "Tab") {
+      if ((e.key === "Enter" && !e.altKey && !e.shiftKey) || e.key === "Tab") {
         e.preventDefault();
         if (filteredSlashItems.length > 0 && highlightedSlashIndex < filteredSlashItems.length) {
           if (isMainMode) {
@@ -1336,6 +1367,13 @@ export default function Composer({
               value={input}
               onChange={handleInputChange}
               onKeyDown={handleKeyDown}
+              onCompositionStart={() => {
+                isComposingRef.current = true;
+              }}
+              onCompositionEnd={() => {
+                isComposingRef.current = false;
+                compositionEndedAtRef.current = Date.now();
+              }}
               onPaste={handlePaste}
               disabled={isComposerSubmitting}
             />
@@ -1639,10 +1677,10 @@ export default function Composer({
               {/* @ Mention button — inserts @ and opens the same menu */}
               <button
                 onClick={handleAtButtonClick}
-                className="bg-[#000000] border border-[#27272a] text-[#e4e4e7] text-[11px] font-bold px-2 py-1.5 rounded-md flex shrink-0 items-center justify-center hover:bg-[#18181b] transition-colors"
+                className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-[#27272a] bg-[#000000] p-0 text-[#e4e4e7] transition-colors hover:bg-[#18181b]"
                 title={language === "en" ? "Reference file" : "引用文件"}
               >
-                <IconAt className="w-4 h-4" />
+                <IconAt className="w-3.5 h-3.5" />
               </button>
 
               {/* + Attach file button */}

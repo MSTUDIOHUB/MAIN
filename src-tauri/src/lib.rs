@@ -3,6 +3,7 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::cmp::Ordering;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -190,7 +191,7 @@ fn clear_debug_log(app: AppHandle) -> Result<(), String> {
 
 #[derive(Default)]
 struct PtyManager {
-    session: Mutex<Option<PtySession>>,
+    sessions: Mutex<HashMap<String, PtySession>>,
 }
 
 struct FeishuAdapterManager {
@@ -291,7 +292,9 @@ struct NodeRuntimeStatus {
 }
 
 #[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct PtyDataPayload {
+    session_key: String,
     chunk: String,
 }
 
@@ -449,6 +452,34 @@ fn default_workspace_root() -> Result<PathBuf, String> {
     };
     base.canonicalize()
         .map_err(|e| format!("无法解析工作区路径: {e}"))
+}
+
+fn canonicalize_workspace_dir(path: &str) -> Result<PathBuf, String> {
+    let raw = PathBuf::from(path);
+    if !raw.exists() {
+        return Err("工作区路径不存在".to_string());
+    }
+    if !raw.is_dir() {
+        return Err("工作区路径必须是目录".to_string());
+    }
+    raw.canonicalize()
+        .map_err(|e| format!("无法解析工作区路径: {e}"))
+}
+
+fn resolve_workspace_root(state: &WorkspaceState, workspace: Option<String>) -> Result<PathBuf, String> {
+    match workspace {
+        Some(path) if !path.trim().is_empty() => canonicalize_workspace_dir(path.trim()),
+        _ => state.get_root(),
+    }
+}
+
+fn normalize_pty_session_key(session_key: Option<String>) -> String {
+    let raw = session_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("__MAIN_DEFAULT_PTY__");
+    sanitize_session_key(raw)
 }
 
 fn sanitize_session_key(session_key: &str) -> String {
@@ -1198,6 +1229,7 @@ fn start_pty_reader_thread(
     mut reader: Box<dyn Read + Send>,
     buffer: Arc<Mutex<PtyBuffer>>,
     app: AppHandle,
+    session_key: String,
 ) {
     std::thread::spawn(move || {
         let mut chunk = [0_u8; 4096];
@@ -1215,7 +1247,10 @@ fn start_pty_reader_thread(
 
                     let text = decode_utf8_stream_chunk(&mut pending_utf8, data);
                     if !text.is_empty() {
-                        let _ = app.emit("pty-data", PtyDataPayload { chunk: text });
+                        let _ = app.emit("pty-data", PtyDataPayload {
+                            session_key: session_key.clone(),
+                            chunk: text,
+                        });
                     }
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -1248,23 +1283,19 @@ fn get_workspace_root(state: State<WorkspaceState>) -> Result<String, String> {
 
 #[tauri::command]
 fn set_workspace_root(state: State<WorkspaceState>, path: String) -> Result<String, String> {
-    let raw = PathBuf::from(path);
-    if !raw.exists() {
-        return Err("工作区路径不存在".to_string());
-    }
-    if !raw.is_dir() {
-        return Err("工作区路径必须是目录".to_string());
-    }
-    let canonical = raw
-        .canonicalize()
-        .map_err(|e| format!("无法解析工作区路径: {e}"))?;
+    let canonical = canonicalize_workspace_dir(&path)?;
     state.set_root(canonical.clone())?;
     Ok(canonical.to_string_lossy().to_string())
 }
 
 #[tauri::command]
-fn read_file(state: State<WorkspaceState>, path: String) -> Result<String, String> {
-    let workspace = state.get_root()?;
+fn canonicalize_workspace_path(path: String) -> Result<String, String> {
+    Ok(canonicalize_workspace_dir(&path)?.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn read_file(state: State<WorkspaceState>, path: String, workspace: Option<String>) -> Result<String, String> {
+    let workspace = resolve_workspace_root(&state, workspace)?;
     let real_path = resolve_existing_path(&path, &workspace)?;
     fs::read_to_string(real_path).map_err(|e| e.to_string())
 }
@@ -1278,8 +1309,8 @@ struct FileMetadata {
 }
 
 #[tauri::command]
-fn get_file_metadata(state: State<WorkspaceState>, path: String) -> Result<FileMetadata, String> {
-    let workspace = state.get_root()?;
+fn get_file_metadata(state: State<WorkspaceState>, path: String, workspace: Option<String>) -> Result<FileMetadata, String> {
+    let workspace = resolve_workspace_root(&state, workspace)?;
     let real_path = resolve_existing_path(&path, &workspace)?;
     if !real_path.is_file() {
         return Err("get_file_metadata 目标不是文件".to_string());
@@ -1300,8 +1331,8 @@ fn get_file_metadata(state: State<WorkspaceState>, path: String) -> Result<FileM
 }
 
 #[tauri::command]
-fn write_file(state: State<WorkspaceState>, path: String, content: String) -> Result<(), String> {
-    let workspace = state.get_root()?;
+fn write_file(state: State<WorkspaceState>, path: String, content: String, workspace: Option<String>) -> Result<(), String> {
+    let workspace = resolve_workspace_root(&state, workspace)?;
     let real_path = resolve_write_path(&path, &workspace)?;
     if real_path.exists() && real_path.is_dir() {
         return Err("write_file 目标是目录，无法写入".to_string());
@@ -1506,8 +1537,12 @@ fn compare_file_nodes(a: &FileNode, b: &FileNode) -> Ordering {
 }
 
 #[tauri::command]
-fn list_directory(state: State<WorkspaceState>, path: String) -> Result<Vec<FileNode>, String> {
-    let workspace = state.get_root()?;
+fn list_directory(
+    state: State<WorkspaceState>,
+    path: String,
+    workspace: Option<String>,
+) -> Result<Vec<FileNode>, String> {
+    let workspace = resolve_workspace_root(&state, workspace)?;
     let real_path = resolve_existing_path(&path, &workspace)?;
     if !real_path.is_dir() {
         return Err("list_directory 目标不是目录".to_string());
@@ -1733,8 +1768,12 @@ fn directory_contains_asmdef(dir: &Path, current: usize, probe_depth: usize) -> 
 }
 
 #[tauri::command]
-fn get_project_skeleton(state: State<WorkspaceState>, depth: Option<serde_json::Value>) -> Result<String, String> {
-    let workspace = state.get_root()?;
+fn get_project_skeleton(
+    state: State<WorkspaceState>,
+    depth: Option<serde_json::Value>,
+    workspace: Option<String>,
+) -> Result<String, String> {
+    let workspace = resolve_workspace_root(&state, workspace)?;
     let max_depth = match depth {
         Some(serde_json::Value::Number(n)) => n.as_u64().map(|v| v as usize).unwrap_or(4),
         Some(serde_json::Value::String(s)) => s.parse::<usize>().unwrap_or(4),
@@ -1758,9 +1797,13 @@ fn get_project_skeleton(state: State<WorkspaceState>, depth: Option<serde_json::
 }
 
 #[tauri::command]
-fn glob_search(state: State<WorkspaceState>, pattern: String) -> Result<Vec<String>, String> {
+fn glob_search(
+    state: State<WorkspaceState>,
+    pattern: String,
+    workspace: Option<String>,
+) -> Result<Vec<String>, String> {
     validate_glob_pattern(&pattern)?;
-    let workspace = state.get_root()?;
+    let workspace = resolve_workspace_root(&state, workspace)?;
     let full_pattern = workspace.join(pattern).to_string_lossy().to_string();
     let mut hits = Vec::new();
 
@@ -1788,9 +1831,14 @@ fn glob_search(state: State<WorkspaceState>, pattern: String) -> Result<Vec<Stri
 }
 
 #[tauri::command]
-fn grep_search(state: State<WorkspaceState>, query: String, path: String) -> Result<String, String> {
+fn grep_search(
+    state: State<WorkspaceState>,
+    query: String,
+    path: String,
+    workspace: Option<String>,
+) -> Result<String, String> {
     let regex = Regex::new(&query).map_err(|e| format!("无效正则表达式: {e}"))?;
-    let workspace = state.get_root()?;
+    let workspace = resolve_workspace_root(&state, workspace)?;
     let target = resolve_existing_path(&path, &workspace)?;
 
     let mut output = String::new();
@@ -1842,13 +1890,16 @@ fn spawn_pty(
     workspace_state: State<WorkspaceState>,
     cols: u16,
     rows: u16,
+    session_key: Option<String>,
+    workspace: Option<String>,
 ) -> Result<(), String> {
     let mut guard = state
-        .session
+        .sessions
         .lock()
         .map_err(|_| "无法获取 PTY 会话锁".to_string())?;
+    let key = normalize_pty_session_key(session_key);
 
-    if let Some(mut existing) = guard.take() {
+    if let Some(mut existing) = guard.remove(&key) {
         existing.shutdown();
     }
 
@@ -1868,9 +1919,8 @@ fn spawn_pty(
         cmd.args(["/K", "chcp 65001>nul"]);
     }
     apply_pty_terminal_env(&mut cmd);
-    if let Ok(root) = workspace_state.get_root() {
-        cmd.cwd(root);
-    }
+    let root = resolve_workspace_root(&workspace_state, workspace)?;
+    cmd.cwd(root);
     let child = pair
         .slave
         .spawn_command(cmd)
@@ -1888,9 +1938,9 @@ fn spawn_pty(
 
     let shared_buffer = Arc::new(Mutex::new(PtyBuffer::default()));
     let shared_writer = Arc::new(Mutex::new(writer));
-    start_pty_reader_thread(reader, Arc::clone(&shared_buffer), app);
+    start_pty_reader_thread(reader, Arc::clone(&shared_buffer), app, key.clone());
 
-    *guard = Some(PtySession {
+    guard.insert(key, PtySession {
         master: pair.master,
         writer: shared_writer,
         buffer: shared_buffer,
@@ -1901,13 +1951,14 @@ fn spawn_pty(
 }
 
 #[tauri::command]
-fn resize_pty(state: State<PtyManager>, cols: u16, rows: u16) -> Result<(), String> {
+fn resize_pty(state: State<PtyManager>, cols: u16, rows: u16, session_key: Option<String>) -> Result<(), String> {
     let guard = state
-        .session
+        .sessions
         .lock()
         .map_err(|_| "无法获取 PTY 会话锁".to_string())?;
+    let key = normalize_pty_session_key(session_key);
     let session = guard
-        .as_ref()
+        .get(&key)
         .ok_or_else(|| "PTY 尚未启动，请先调用 spawn_pty".to_string())?;
     session
         .master
@@ -1921,13 +1972,14 @@ fn resize_pty(state: State<PtyManager>, cols: u16, rows: u16) -> Result<(), Stri
 }
 
 #[tauri::command]
-fn write_pty(state: State<PtyManager>, input: String) -> Result<(), String> {
+fn write_pty(state: State<PtyManager>, input: String, session_key: Option<String>) -> Result<(), String> {
     let guard = state
-        .session
+        .sessions
         .lock()
         .map_err(|_| "无法获取 PTY 会话锁".to_string())?;
+    let key = normalize_pty_session_key(session_key);
     let session = guard
-        .as_ref()
+        .get(&key)
         .ok_or_else(|| "PTY 尚未启动，请先调用 spawn_pty".to_string())?;
     let mut writer = session
         .writer
@@ -1940,13 +1992,18 @@ fn write_pty(state: State<PtyManager>, input: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn read_pty_buffer(state: State<PtyManager>, max_chars: Option<usize>) -> Result<String, String> {
+fn read_pty_buffer(
+    state: State<PtyManager>,
+    max_chars: Option<usize>,
+    session_key: Option<String>,
+) -> Result<String, String> {
     let guard = state
-        .session
+        .sessions
         .lock()
         .map_err(|_| "无法获取 PTY 会话锁".to_string())?;
+    let key = normalize_pty_session_key(session_key);
     let session = guard
-        .as_ref()
+        .get(&key)
         .ok_or_else(|| "PTY 尚未启动，请先调用 spawn_pty".to_string())?;
     let buffer = session
         .buffer
@@ -1964,13 +2021,18 @@ fn read_pty_buffer(state: State<PtyManager>, max_chars: Option<usize>) -> Result
 }
 
 #[tauri::command]
-fn read_pty_tail(state: State<PtyManager>, max_chars: Option<usize>) -> Result<PtyReadResult, String> {
+fn read_pty_tail(
+    state: State<PtyManager>,
+    max_chars: Option<usize>,
+    session_key: Option<String>,
+) -> Result<PtyReadResult, String> {
     let guard = state
-        .session
+        .sessions
         .lock()
         .map_err(|_| "无法获取 PTY 会话锁".to_string())?;
+    let key = normalize_pty_session_key(session_key);
     let session = guard
-        .as_ref()
+        .get(&key)
         .ok_or_else(|| "PTY 尚未启动，请先调用 spawn_pty".to_string())?;
     let buffer = session
         .buffer
@@ -1984,13 +2046,15 @@ fn read_pty_since(
     state: State<PtyManager>,
     offset: u64,
     max_chars: Option<usize>,
+    session_key: Option<String>,
 ) -> Result<PtyReadResult, String> {
     let guard = state
-        .session
+        .sessions
         .lock()
         .map_err(|_| "无法获取 PTY 会话锁".to_string())?;
+    let key = normalize_pty_session_key(session_key);
     let session = guard
-        .as_ref()
+        .get(&key)
         .ok_or_else(|| "PTY 尚未启动，请先调用 spawn_pty".to_string())?;
     let buffer = session
         .buffer
@@ -2000,13 +2064,14 @@ fn read_pty_since(
 }
 
 #[tauri::command]
-fn clear_pty_buffer(state: State<PtyManager>) -> Result<PtyReadResult, String> {
+fn clear_pty_buffer(state: State<PtyManager>, session_key: Option<String>) -> Result<PtyReadResult, String> {
     let guard = state
-        .session
+        .sessions
         .lock()
         .map_err(|_| "无法获取 PTY 会话锁".to_string())?;
+    let key = normalize_pty_session_key(session_key);
     let session = guard
-        .as_ref()
+        .get(&key)
         .ok_or_else(|| "PTY 尚未启动，请先调用 spawn_pty".to_string())?;
     let mut buffer = session
         .buffer
@@ -2025,13 +2090,14 @@ fn clear_pty_buffer(state: State<PtyManager>) -> Result<PtyReadResult, String> {
 }
 
 #[tauri::command]
-fn get_pty_status(state: State<PtyManager>) -> Result<PtyStatus, String> {
+fn get_pty_status(state: State<PtyManager>, session_key: Option<String>) -> Result<PtyStatus, String> {
     let mut guard = state
-        .session
+        .sessions
         .lock()
         .map_err(|_| "无法获取 PTY 会话锁".to_string())?;
+    let key = normalize_pty_session_key(session_key);
 
-    let Some(session) = guard.as_mut() else {
+    let Some(session) = guard.get_mut(&key) else {
         return Ok(PtyStatus {
             active: false,
             running: false,
@@ -2075,8 +2141,9 @@ fn run_command(
     command: String,
     input: Option<String>,
     timeout_ms: Option<u64>,
+    workspace: Option<String>,
 ) -> Result<TerminalCommandOutput, String> {
-    let workspace = state.get_root()?;
+    let workspace = resolve_workspace_root(&state, workspace)?;
     let timeout = Duration::from_millis(timeout_ms.unwrap_or(60_000).clamp(100, 600_000));
     run_workspace_shell_command(&workspace, command, input, timeout)
 }
@@ -2767,8 +2834,12 @@ fn cancel_chat_stream() -> Result<(), String> {
 /// Produces an "interface-first" outline: type declarations + public/protected
 /// members, with method bodies stripped.
 #[tauri::command]
-fn get_file_outline(state: State<WorkspaceState>, path: String) -> Result<String, String> {
-    let workspace = state.get_root()?;
+fn get_file_outline(
+    state: State<WorkspaceState>,
+    path: String,
+    workspace: Option<String>,
+) -> Result<String, String> {
+    let workspace = resolve_workspace_root(&state, workspace)?;
     let real_path = resolve_existing_path(&path, &workspace)?;
 
     let ext = real_path
@@ -3285,8 +3356,9 @@ fn read_document(
     row_offset: Option<usize>,
     max_rows: Option<usize>,
     sheet: Option<String>,
+    workspace: Option<String>,
 ) -> Result<Value, String> {
-    let workspace = state.get_root()?;
+    let workspace = resolve_workspace_root(&state, workspace)?;
     let real_path = resolve_existing_path(&path, &workspace)?;
     if !real_path.is_file() {
         return Err("read_document 目标不是文件".to_string());
@@ -3314,8 +3386,9 @@ fn analyze_tabular_document(
     max_columns: Option<usize>,
     sample_rows: Option<usize>,
     focus_columns: Option<String>,
+    workspace: Option<String>,
 ) -> Result<Value, String> {
-    let workspace = state.get_root()?;
+    let workspace = resolve_workspace_root(&state, workspace)?;
     let real_path = resolve_existing_path(&path, &workspace)?;
     if !real_path.is_file() {
         return Err("analyze_tabular_document 目标不是文件".to_string());
@@ -3347,8 +3420,9 @@ fn query_tabular_document(
     sort_by: Option<String>,
     row_offset: Option<usize>,
     limit: Option<usize>,
+    workspace: Option<String>,
 ) -> Result<Value, String> {
-    let workspace = state.get_root()?;
+    let workspace = resolve_workspace_root(&state, workspace)?;
     let real_path = resolve_existing_path(&path, &workspace)?;
     if !real_path.is_file() {
         return Err("query_tabular_document 目标不是文件".to_string());
@@ -3379,8 +3453,9 @@ fn index_workspace_documents(
     max_files: Option<usize>,
     max_chars_per_file: Option<usize>,
     extensions: Option<String>,
+    workspace: Option<String>,
 ) -> Result<Value, String> {
-    let workspace = state.get_root()?;
+    let workspace = resolve_workspace_root(&state, workspace)?;
     let requested_path = path.unwrap_or_else(|| ".".to_string());
     let real_path = resolve_existing_path(&requested_path, &workspace)?;
     if !real_path.is_dir() {
@@ -3425,8 +3500,12 @@ fn delete_protocol_package(
 }
 
 #[tauri::command]
-fn delete_workspace_path(state: State<WorkspaceState>, path: String) -> Result<(), String> {
-    let workspace = state.get_root()?;
+fn delete_workspace_path(
+    state: State<WorkspaceState>,
+    path: String,
+    workspace: Option<String>,
+) -> Result<(), String> {
+    let workspace = resolve_workspace_root(&state, workspace)?;
     let raw_path = if Path::new(&path).is_absolute() {
         PathBuf::from(&path)
     } else {
@@ -3996,6 +4075,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_workspace_root,
             set_workspace_root,
+            canonicalize_workspace_path,
             list_directory,
             get_project_skeleton,
             get_file_outline,

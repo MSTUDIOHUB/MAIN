@@ -975,6 +975,7 @@ export default function ChatArea({
   endOfFlowRef,
   isStreaming,
   elapsedTime = 0,
+  activeSessionKey,
   onStopGeneration,
   allowToolAction,
   rejectToolAction,
@@ -1006,6 +1007,7 @@ export default function ChatArea({
   const language = config.language === "en" ? "en" : "zh";
   const [displayElapsedTime, setDisplayElapsedTime] = useState(elapsedTime);
   const elapsedBaseRef = useRef(elapsedTime);
+  const elapsedSessionKeyRef = useRef(activeSessionKey ?? null);
   const wasStreamingRef = useRef(false);
   const copy = useMemo(() => ({
     planLabel: language === "zh" ? "计划" : "Plan",
@@ -1126,6 +1128,15 @@ export default function ChatArea({
   const [topIslandHeight, setTopIslandHeight] = useState(0);
   // endregion
   useEffect(() => {
+    const nextSessionKey = activeSessionKey ?? null;
+    if (elapsedSessionKeyRef.current === nextSessionKey) return;
+    elapsedSessionKeyRef.current = nextSessionKey;
+    elapsedBaseRef.current = elapsedTime;
+    wasStreamingRef.current = false;
+    setDisplayElapsedTime(elapsedTime);
+  }, [activeSessionKey, elapsedTime]);
+
+  useEffect(() => {
     elapsedBaseRef.current = Math.max(elapsedBaseRef.current, elapsedTime);
     setDisplayElapsedTime((current) => Math.max(current, elapsedTime));
   }, [elapsedTime]);
@@ -1157,7 +1168,7 @@ export default function ChatArea({
       window.clearInterval(timerId);
       tick();
     };
-  }, [elapsedTime, isStreaming]);
+  }, [activeSessionKey, elapsedTime, isStreaming]);
 
   useEffect(() => {
     return () => {

@@ -216,7 +216,7 @@ export default function WorkspaceTreePanel({
     setFileTreeError("");
 
     try {
-      const nodes = await listDirectory(path);
+      const nodes = await listDirectory(path, currentWorkspace);
       const visibleNodes = nodes.filter((node) => !shouldHideWorkspaceEntry(node.name, node.is_dir));
       const sorted = [...visibleNodes].sort((a, b) => {
         if (a.is_dir && !b.is_dir) return -1;

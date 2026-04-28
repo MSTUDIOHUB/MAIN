@@ -49,7 +49,7 @@ export async function getAllWorkspaceFiles(
 
     let entries;
     try {
-      entries = await invoke<Array<{ name: string; is_dir: boolean }>>("list_directory", { path: dir });
+      entries = await invoke<Array<{ name: string; is_dir: boolean }>>("list_directory", { path: dir, workspace: workspacePath });
     } catch {
       // Permission denied or path gone — skip silently
       return;

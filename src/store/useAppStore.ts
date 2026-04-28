@@ -315,6 +315,14 @@ export function resolveGlobalChatSessionKey(sessionId: number | null | undefined
   return sessionId ? `${GLOBAL_CHAT_KEY}:${sessionId}` : null;
 }
 
+export function resolveSessionRuntimeKey(
+  workspaceOrScope: string | null | undefined,
+  sessionId: number | null | undefined,
+): string | null {
+  if (!sessionId) return null;
+  return `${resolveSessionWorkspaceKey(workspaceOrScope)}:${sessionId}`;
+}
+
 // ── Domain Types ─────────────────────────────────────────────────────
 
 export type Role = "user" | "assistant" | "system";
@@ -374,6 +382,34 @@ export interface SessionRuntimeSnapshot {
   selectedDiffTaskId: number | null;
 }
 
+export interface SessionRuntimeState extends SessionRuntimeSnapshot {
+  input: string;
+  contextMentions: string[];
+  attachedFiles: string[];
+  preferredResponseLanguage: Lang;
+  lockedComposerIntent: MainIntentShortcut | null;
+  pendingRunDecision: PendingRunDecision | null;
+  pendingRunDecisionResolver:
+    | ((choice: "approve_once" | "approve_thread" | "cancel") => void)
+    | null;
+  currentTurnExecutionConsent: { turnId: string | null; granted: boolean };
+  readOnlyAutoApproveForSession: boolean;
+  normalizedStreamState: NormalizedStreamState;
+  currentTurnState: AppState["currentTurnState"];
+  isGenerating: boolean;
+  agentStatus: AgentStatus;
+  abortController: AbortController | null;
+  elapsedTime: number;
+  pendingReviewResolve: ((decision: ReviewDecision) => void) | null;
+  pendingReviewTaskId: number | null;
+  pendingToolCall: { name: string; arguments: Record<string, unknown> } | null;
+  showFilePanel: boolean;
+  fileViewerPath: string;
+  fileViewerContent: string;
+  fileViewerError: string;
+  fileViewerLoading: boolean;
+}
+
 export interface Session {
   id: number;
   title: string;
@@ -387,6 +423,13 @@ export interface Session {
   recordingDisabled?: boolean;
   workspaceRoot?: string;
   projectId?: string;
+}
+
+export interface WorkspaceEntry {
+  path: string;
+  name: string;
+  addedAt: number;
+  lastActiveAt: number;
 }
 
 export interface LocalConfig {
@@ -618,9 +661,23 @@ interface AppState {
 
   // Sessions — nested by workspace path
   sessionsByWorkspace: Record<string, Session[]>;
+  workspaces: WorkspaceEntry[];
+  activeSessionByWorkspace: Record<string, number | null>;
+  runtimeBySessionKey: Record<string, SessionRuntimeState>;
   currentWorkspace: string;
   selectedWorkspace: string;
   currentSessionId: number | null;
+  addWorkspaceEntry: (path: string) => void;
+  removeWorkspaceEntry: (path: string) => void;
+  getCurrentSessionKey: () => string | null;
+  saveCurrentRuntimeToSession: () => void;
+  restoreRuntimeForSession: (sessionKey: string | null) => boolean;
+  updateRuntimeForSession: (
+    sessionKey: string,
+    patch:
+      | Partial<SessionRuntimeState>
+      | ((runtime: SessionRuntimeState) => Partial<SessionRuntimeState>),
+  ) => void;
   setCurrentWorkspace: (path: string) => void;
   setSelectedWorkspace: (path: string) => void;
   addSession: (workspacePath: string, session: Session) => void;
@@ -765,6 +822,52 @@ const defaultSkills: Skill[] = [];
 
 const defaultSessionsByWorkspace: Record<string, Session[]> = {};
 
+function getWorkspaceDisplayName(path: string): string {
+  const normalized = String(path || "").replace(/\\/g, "/").replace(/\/+$/, "");
+  return normalized.split("/").filter(Boolean).pop() || normalized || "Workspace";
+}
+
+function normalizeWorkspaceEntries(
+  entries: WorkspaceEntry[] | undefined,
+  sessionsByWorkspace: Record<string, Session[]> = {},
+  currentWorkspace = "",
+): WorkspaceEntry[] {
+  const now = Date.now();
+  const byPath = new Map<string, WorkspaceEntry>();
+  const shouldInferFromSessions = entries === undefined;
+  for (const entry of entries || []) {
+    const path = String(entry?.path || "").trim();
+    if (!path || path === GLOBAL_CHAT_KEY) continue;
+    byPath.set(path, {
+      path,
+      name: String(entry.name || "").trim() || getWorkspaceDisplayName(path),
+      addedAt: Number(entry.addedAt) || now,
+      lastActiveAt: Number(entry.lastActiveAt) || Number(entry.addedAt) || now,
+    });
+  }
+  if (shouldInferFromSessions) {
+    Object.keys(sessionsByWorkspace || {}).forEach((path) => {
+      if (!path || path === GLOBAL_CHAT_KEY || byPath.has(path)) return;
+      byPath.set(path, {
+        path,
+        name: getWorkspaceDisplayName(path),
+        addedAt: now,
+        lastActiveAt: now,
+      });
+    });
+  }
+  const active = String(currentWorkspace || "").trim();
+  if (shouldInferFromSessions && active && active !== GLOBAL_CHAT_KEY && !byPath.has(active)) {
+    byPath.set(active, {
+      path: active,
+      name: getWorkspaceDisplayName(active),
+      addedAt: now,
+      lastActiveAt: now,
+    });
+  }
+  return Array.from(byPath.values());
+}
+
 const defaultNormalizedStreamState: NormalizedStreamState = {
   visibleText: "",
   hiddenThought: "",
@@ -817,6 +920,34 @@ function normalizePendingSlashCommand(
   return null;
 }
 
+function deriveInterruptedRestoreStatus(turn: ConversationTurn, taskFlow: TaskBlock[]): ConversationTurnStatus {
+  const turnBlocks = taskFlow.filter((block) => block.turnId === turn.id);
+  const hasVisibleAgent = turnBlocks.some(blockHasVisibleAgentContent);
+  const hasAnyTool = turnBlocks.some((block) => block.type === "tool");
+  const hasExecutionEvidence = turnBlocks.some((block) =>
+    block.type === "tool" &&
+    block.toolStatus === "executed" &&
+    isPlanExecutionEvidenceTool(block.toolName, block.target)
+  );
+
+  if (hasExecutionEvidence) return "completed_with_changes";
+  if (hasVisibleAgent || hasAnyTool) return "stopped_no_action";
+  return "stopped_no_output";
+}
+
+export function normalizeInterruptedConversationTurnsForRestore(
+  turns: ConversationTurn[] | undefined,
+  taskFlow: TaskBlock[],
+): ConversationTurn[] {
+  return (turns || []).map((turn) => {
+    if (turn.status !== "executing" && turn.status !== "planning") return turn;
+    return {
+      ...turn,
+      status: deriveInterruptedRestoreStatus(turn, taskFlow),
+    };
+  });
+}
+
 function normalizeSessionRuntimeSnapshot(
   snapshot: Partial<SessionRuntimeSnapshot> | null | undefined,
 ): SessionRuntimeSnapshot | undefined {
@@ -826,10 +957,11 @@ function normalizeSessionRuntimeSnapshot(
       (snapshot as Partial<SessionRuntimeSnapshot> & { selectedAgentKey?: string }).selectedNexusModeKey ||
       (snapshot as Partial<SessionRuntimeSnapshot> & { selectedAgentKey?: string }).selectedAgentKey,
   );
+  const taskFlow = sanitizeTaskBlocksForPersist(snapshot.taskFlow || []);
   return {
-    taskFlow: sanitizeTaskBlocksForPersist(snapshot.taskFlow || []),
+    taskFlow,
     agentMessages: sanitizeAgentMessagesForPersist(snapshot.agentMessages || []),
-    conversationTurns: snapshot.conversationTurns || [],
+    conversationTurns: normalizeInterruptedConversationTurnsForRestore(snapshot.conversationTurns, taskFlow),
     currentTurnId: snapshot.currentTurnId ?? null,
     selectedMainModeKey,
     selectedNexusModeKey: mapMainModeToLegacyNexusMode(selectedMainModeKey),
@@ -848,6 +980,125 @@ function normalizeSessionRuntimeSnapshot(
     rightPanelTab: snapshot.rightPanelTab ?? "plan",
     selectedDiffTaskId: snapshot.selectedDiffTaskId ?? null,
   };
+}
+
+const sessionRuntimeKeys = [
+  "taskFlow",
+  "agentMessages",
+  "conversationTurns",
+  "currentTurnId",
+  "selectedMainModeKey",
+  "selectedNexusModeKey",
+  "activeStudioAgentKey",
+  "gameStudioInitialized",
+  "pendingSlashCommand",
+  "planArtifacts",
+  "planTasks",
+  "planExecutionEvidenceCount",
+  "planStage",
+  "isPlanApproved",
+  "showPlanPanel",
+  "showDiff",
+  "showTerminal",
+  "showFilePanel",
+  "rightPanelTab",
+  "selectedDiffTaskId",
+  "input",
+  "contextMentions",
+  "attachedFiles",
+  "preferredResponseLanguage",
+  "lockedComposerIntent",
+  "pendingRunDecision",
+  "pendingRunDecisionResolver",
+  "currentTurnExecutionConsent",
+  "readOnlyAutoApproveForSession",
+  "normalizedStreamState",
+  "currentTurnState",
+  "isGenerating",
+  "agentStatus",
+  "abortController",
+  "elapsedTime",
+  "pendingReviewResolve",
+  "pendingReviewTaskId",
+  "pendingToolCall",
+  "fileViewerPath",
+  "fileViewerContent",
+  "fileViewerError",
+  "fileViewerLoading",
+] as const;
+
+function pickSessionRuntimePatch(source: Partial<SessionRuntimeState> | Record<string, unknown>) {
+  const patch: Partial<SessionRuntimeState> = {};
+  for (const key of sessionRuntimeKeys) {
+    if (Object.prototype.hasOwnProperty.call(source, key)) {
+      (patch as Record<string, unknown>)[key] = (source as Record<string, unknown>)[key];
+    }
+  }
+  return patch;
+}
+
+function omitSessionRuntimePatch(source: Record<string, unknown>) {
+  const patch: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(source)) {
+    if (!(sessionRuntimeKeys as readonly string[]).includes(key)) {
+      patch[key] = value;
+    }
+  }
+  return patch;
+}
+
+function createSessionRuntimeFromState(state: Partial<AppState>): SessionRuntimeState {
+  const selectedMainModeKey = mapLegacyNexusModeToMainMode(
+    state.selectedMainModeKey || state.selectedNexusModeKey,
+  );
+  return {
+    taskFlow: Array.isArray(state.taskFlow) ? state.taskFlow : [],
+    agentMessages: Array.isArray(state.agentMessages) ? state.agentMessages : [],
+    conversationTurns: Array.isArray(state.conversationTurns) ? state.conversationTurns : [],
+    currentTurnId: state.currentTurnId ?? null,
+    selectedMainModeKey,
+    selectedNexusModeKey: mapMainModeToLegacyNexusMode(selectedMainModeKey),
+    activeStudioAgentKey: normalizeStudioAgentKey(state.activeStudioAgentKey),
+    gameStudioInitialized: state.gameStudioInitialized === true,
+    pendingSlashCommand: normalizePendingSlashCommand(state.pendingSlashCommand),
+    planArtifacts: state.planArtifacts || [],
+    planTasks: state.planTasks || [],
+    planExecutionEvidenceCount: state.planExecutionEvidenceCount ?? 0,
+    planStage: state.planStage ?? "idle",
+    isPlanApproved: state.isPlanApproved === true,
+    showPlanPanel: state.showPlanPanel === true,
+    showDiff: state.showDiff === true,
+    showTerminal: state.showTerminal === true,
+    showFilePanel: state.showFilePanel === true,
+    rightPanelTab: state.rightPanelTab ?? "plan",
+    selectedDiffTaskId: state.selectedDiffTaskId ?? null,
+    input: state.input ?? "",
+    contextMentions: state.contextMentions || [],
+    attachedFiles: state.attachedFiles || [],
+    preferredResponseLanguage: state.preferredResponseLanguage || "zh",
+    lockedComposerIntent: state.lockedComposerIntent ?? null,
+    pendingRunDecision: state.pendingRunDecision ?? null,
+    pendingRunDecisionResolver: state.pendingRunDecisionResolver ?? null,
+    currentTurnExecutionConsent: state.currentTurnExecutionConsent || { turnId: null, granted: false },
+    readOnlyAutoApproveForSession: state.readOnlyAutoApproveForSession === true,
+    normalizedStreamState: state.normalizedStreamState || defaultNormalizedStreamState,
+    currentTurnState: state.currentTurnState || createDefaultCurrentTurnState(),
+    isGenerating: state.isGenerating === true,
+    agentStatus: state.agentStatus || "idle",
+    abortController: state.abortController || null,
+    elapsedTime: state.elapsedTime ?? 0,
+    pendingReviewResolve: state.pendingReviewResolve || null,
+    pendingReviewTaskId: state.pendingReviewTaskId ?? null,
+    pendingToolCall: state.pendingToolCall ?? null,
+    fileViewerPath: state.fileViewerPath || "",
+    fileViewerContent: state.fileViewerContent || "",
+    fileViewerError: state.fileViewerError || "",
+    fileViewerLoading: state.fileViewerLoading === true,
+  };
+}
+
+function getSessionRuntimeUiPatch(runtime: SessionRuntimeState): Partial<AppState> {
+  return { ...runtime };
 }
 
 function normalizeSessionsByWorkspace(
@@ -1212,7 +1463,7 @@ async function getWorkspaceTree(workspace: string): Promise<string> {
   }
 
   try {
-    const entries = await invoke<Array<{ name: string; is_dir: boolean }>>("list_directory", { path: workspace });
+    const entries = await invoke<Array<{ name: string; is_dir: boolean }>>("list_directory", { path: workspace, workspace });
     workspaceTreeCache = formatWorkspaceTree(entries.map((entry) => ({ name: entry.name, isDirectory: entry.is_dir })));
     workspaceTreeCacheKey = workspace;
     workspaceTreeCacheVersion = workspaceContentVersion;
@@ -1885,7 +2136,7 @@ export const useAppStore = create<AppState>()(
       return;
     }
     try {
-      const content = await readFile(path);
+      const content = await readFile(path, get().currentWorkspace);
       set({ fileViewerContent: content, fileViewerError: "", fileViewerLoading: false });
     } catch (error) {
       set({
@@ -2329,10 +2580,87 @@ export const useAppStore = create<AppState>()(
 
   // Sessions — nested by workspace
   sessionsByWorkspace: defaultSessionsByWorkspace,
+  workspaces: [],
+  activeSessionByWorkspace: {},
+  runtimeBySessionKey: {},
   currentWorkspace: "",
   selectedWorkspace: "",
   currentSessionId: null,
 
+  addWorkspaceEntry: (path: string) => {
+    const normalizedPath = path.trim();
+    if (!normalizedPath || normalizedPath === GLOBAL_CHAT_KEY) return;
+    set((s) => {
+      const now = Date.now();
+      const existing = s.workspaces.find((entry) => entry.path === normalizedPath);
+      const nextEntry: WorkspaceEntry = {
+        path: normalizedPath,
+        name: existing?.name || getWorkspaceDisplayName(normalizedPath),
+        addedAt: existing?.addedAt || now,
+        lastActiveAt: now,
+      };
+      return {
+        workspaces: existing
+          ? s.workspaces.map((entry) => entry.path === normalizedPath ? nextEntry : entry)
+          : [...s.workspaces, nextEntry],
+        sessionsByWorkspace: {
+          ...s.sessionsByWorkspace,
+          [normalizedPath]: s.sessionsByWorkspace[normalizedPath] || [],
+        },
+      };
+    });
+  },
+  removeWorkspaceEntry: (path: string) => {
+    const normalizedPath = path.trim();
+    if (!normalizedPath) return;
+    set((s) => ({
+      workspaces: s.workspaces.filter((entry) => entry.path !== normalizedPath),
+      activeSessionByWorkspace: Object.fromEntries(
+        Object.entries(s.activeSessionByWorkspace).filter(([key]) => key !== normalizedPath),
+      ),
+    }));
+  },
+  getCurrentSessionKey: () => {
+    const state = get();
+    return resolveSessionRuntimeKey(resolveSessionWorkspaceKey(state.currentWorkspace), state.currentSessionId);
+  },
+  saveCurrentRuntimeToSession: () => {
+    const state = get();
+    const sessionKey = resolveSessionRuntimeKey(resolveSessionWorkspaceKey(state.currentWorkspace), state.currentSessionId);
+    if (!sessionKey) return;
+    set((s) => ({
+      runtimeBySessionKey: {
+        ...s.runtimeBySessionKey,
+        [sessionKey]: createSessionRuntimeFromState(s),
+      },
+    }));
+  },
+  restoreRuntimeForSession: (sessionKey: string | null) => {
+    if (!sessionKey) return false;
+    const runtime = get().runtimeBySessionKey[sessionKey];
+    if (!runtime) return false;
+    set(getSessionRuntimeUiPatch(runtime));
+    return true;
+  },
+  updateRuntimeForSession: (sessionKey, patchOrUpdater) => {
+    if (!sessionKey) return;
+    set((s) => {
+      const existing = s.runtimeBySessionKey[sessionKey] || createSessionRuntimeFromState(s);
+      const patch =
+        typeof patchOrUpdater === "function"
+          ? patchOrUpdater(existing)
+          : patchOrUpdater;
+      return {
+        runtimeBySessionKey: {
+          ...s.runtimeBySessionKey,
+          [sessionKey]: {
+            ...existing,
+            ...pickSessionRuntimePatch(patch),
+          },
+        },
+      };
+    });
+  },
   setCurrentWorkspace: (path: string) => {
     invalidateWorkspaceTreeCache();
     const normalizedPath = path.trim();
@@ -2352,10 +2680,25 @@ export const useAppStore = create<AppState>()(
       if (!updated[normalizedPath]) {
         updated[normalizedPath] = [];
       }
+      const activeSessionByWorkspace = { ...s.activeSessionByWorkspace };
+      if (s.currentWorkspace) {
+        activeSessionByWorkspace[resolveSessionWorkspaceKey(s.currentWorkspace)] = s.currentSessionId;
+      }
+      const now = Date.now();
+      const nextWorkspaceEntry: WorkspaceEntry = {
+        path: normalizedPath,
+        name: getWorkspaceDisplayName(normalizedPath),
+        addedAt: s.workspaces.find((entry) => entry.path === normalizedPath)?.addedAt || now,
+        lastActiveAt: now,
+      };
       return {
         currentWorkspace: normalizedPath,
         selectedWorkspace: normalizedPath,
         sessionsByWorkspace: updated,
+        workspaces: s.workspaces.some((entry) => entry.path === normalizedPath)
+          ? s.workspaces.map((entry) => entry.path === normalizedPath ? nextWorkspaceEntry : entry)
+          : [...s.workspaces, nextWorkspaceEntry],
+        activeSessionByWorkspace,
         config: { ...s.config, workspace: normalizedPath },
         sessionHookCache: [],
         readOnlyAutoApproveForSession: false,
@@ -2368,6 +2711,27 @@ export const useAppStore = create<AppState>()(
         set((s) => ({
           currentWorkspace: stablePath,
           selectedWorkspace: stablePath,
+          sessionsByWorkspace: {
+            ...s.sessionsByWorkspace,
+            [stablePath]: s.sessionsByWorkspace[stablePath] || s.sessionsByWorkspace[normalizedPath] || [],
+          },
+          activeSessionByWorkspace: {
+            ...s.activeSessionByWorkspace,
+            [stablePath]: s.activeSessionByWorkspace[stablePath] ?? s.activeSessionByWorkspace[normalizedPath] ?? s.currentSessionId,
+          },
+          workspaces: (() => {
+            const existing = s.workspaces.find((entry) => entry.path === stablePath || entry.path === normalizedPath);
+            const nextEntry = {
+              path: stablePath,
+              name: getWorkspaceDisplayName(stablePath),
+              addedAt: existing?.addedAt || Date.now(),
+              lastActiveAt: Date.now(),
+            };
+            if (!existing) return [...s.workspaces, nextEntry];
+            return s.workspaces.map((entry) =>
+              entry.path === stablePath || entry.path === normalizedPath ? nextEntry : entry
+            );
+          })(),
           config: { ...s.config, workspace: stablePath },
         }));
         invalidateWorkspaceTreeCache();
@@ -2398,11 +2762,15 @@ export const useAppStore = create<AppState>()(
       const wsSessions = s.sessionsByWorkspace[workspacePath];
       if (!wsSessions) return {};
       const filtered = wsSessions.filter((sess) => sess.id !== sessionId);
+      const sessionKey = resolveSessionRuntimeKey(workspacePath, sessionId);
+      const runtimeBySessionKey = { ...s.runtimeBySessionKey };
+      if (sessionKey) delete runtimeBySessionKey[sessionKey];
       return {
         sessionsByWorkspace: {
           ...s.sessionsByWorkspace,
           [workspacePath]: filtered,
         },
+        runtimeBySessionKey,
         currentSessionId:
           s.currentSessionId === sessionId
             ? filtered[0]?.id ?? null
@@ -2430,6 +2798,10 @@ export const useAppStore = create<AppState>()(
   setCurrentSessionId: (id: number | null) =>
     set((s) => ({
       currentSessionId: id,
+      activeSessionByWorkspace: {
+        ...s.activeSessionByWorkspace,
+        [resolveSessionWorkspaceKey(s.currentWorkspace)]: id,
+      },
       ...(s.currentSessionId !== id ? { readOnlyAutoApproveForSession: false } : {}),
     })),
 
@@ -2468,8 +2840,12 @@ export const useAppStore = create<AppState>()(
     set((s) => {
       const ws = resolveSessionWorkspaceKey(s.currentWorkspace);
       const sessionsByWorkspace = { ...s.sessionsByWorkspace };
+      const runtimeBySessionKey = { ...s.runtimeBySessionKey };
       if (ws) {
         delete sessionsByWorkspace[ws];
+        Object.keys(runtimeBySessionKey).forEach((key) => {
+          if (key.startsWith(`${ws}:`)) delete runtimeBySessionKey[key];
+        });
       }
       return {
         taskFlow: [],
@@ -2499,6 +2875,7 @@ export const useAppStore = create<AppState>()(
         sessionHookCache: [],
         currentSessionId: null,
         sessionsByWorkspace,
+        runtimeBySessionKey,
       };
     });
   },
@@ -2509,6 +2886,9 @@ export const useAppStore = create<AppState>()(
       skills: defaultSkills,
       mcpServers: [{ name: "unityMCP", type: "http", url: "http://localhost:8080/mcp" }],
       sessionsByWorkspace: {},
+      workspaces: [],
+      activeSessionByWorkspace: {},
+      runtimeBySessionKey: {},
       selectedWorkspace: "",
       currentSessionId: null,
       selectedMainModeKey: "main_mode",
@@ -3297,7 +3677,176 @@ export const useAppStore = create<AppState>()(
       ensuredSessionId = autoSessionId;
     }
 
-    const nextId = get()._nextTaskId;
+    const runWorkspace = state.currentWorkspace;
+    const runScopeKey = sessionScopeKey;
+    const runSessionId = ensuredSessionId;
+    const runSessionKey = resolveSessionRuntimeKey(runScopeKey, runSessionId)!;
+    set((s) => ({
+      runtimeBySessionKey: {
+        ...s.runtimeBySessionKey,
+        [runSessionKey]: createSessionRuntimeFromState(s),
+      },
+    }));
+    const isRunSessionActive = (candidate = get()) =>
+      resolveSessionRuntimeKey(resolveSessionWorkspaceKey(candidate.currentWorkspace), candidate.currentSessionId) === runSessionKey;
+    const sessionSet = (
+      patchOrUpdater:
+        | Record<string, unknown>
+        | Partial<AppState>
+        | ((state: AppState) => Record<string, unknown> | Partial<AppState>),
+    ) => {
+      set((s) => {
+        const active = isRunSessionActive(s);
+        const existing = s.runtimeBySessionKey[runSessionKey] || createSessionRuntimeFromState(s);
+        const baseState = active ? s : ({ ...s, ...existing } as AppState);
+        const patch =
+          typeof patchOrUpdater === "function"
+            ? patchOrUpdater(baseState)
+            : patchOrUpdater;
+        if (!patch || typeof patch !== "object") return {};
+        const runtimePatch = pickSessionRuntimePatch(patch);
+        const globalPatch = active
+          ? patch
+          : omitSessionRuntimePatch(patch as Record<string, unknown>);
+        return {
+          ...globalPatch,
+          runtimeBySessionKey: {
+            ...s.runtimeBySessionKey,
+            [runSessionKey]: {
+              ...existing,
+              ...runtimePatch,
+            },
+          },
+        };
+      });
+    };
+    const sessionSetConversationTurnStatus = (targetTurnId: string, status: ConversationTurnStatus) =>
+      sessionSet((s) => ({
+        conversationTurns: s.conversationTurns.map((turn) =>
+          turn.id === targetTurnId
+            ? {
+                ...turn,
+                status,
+                collapsed:
+                  status === "awaiting_approval" || status === "awaiting_input" || status === "error"
+                    ? false
+                    : turn.collapsed,
+              }
+            : turn,
+        ),
+      }));
+    const sessionUpdateConversationTurn = (targetTurnId: string, patch: Partial<ConversationTurn>) =>
+      sessionSet((s) => ({
+        conversationTurns: s.conversationTurns.map((turn) =>
+          turn.id === targetTurnId ? { ...turn, ...patch } : turn
+        ),
+      }));
+    const sessionSetConversationTurnSummary = (targetTurnId: string, summary: string) =>
+      sessionUpdateConversationTurn(targetTurnId, { summary });
+    const sessionSetPlanTasks = (tasks: PlanTask[]) =>
+      sessionSet((s) => ({
+        planTasks: normalizePlanTaskStatuses(
+          mergePlanTasks(
+            s.planTasks,
+            tasks,
+            s.isPlanApproved || s.planStage === "executing" || s.planStage === "completed" || s.planTasks.length > 0,
+          ),
+          s.isPlanApproved && s.planExecutionEvidenceCount > 0,
+        ),
+      }));
+    const sessionUpsertPlanArtifact = (artifact: PlanArtifact) =>
+      sessionSet((s) => {
+        const sanitizedContent = sanitizePlanArtifactContent(artifact.content);
+        const validation = validatePlanArtifactContent(sanitizedContent, artifact.kind);
+        if (!validation.ok) {
+          logStoreEvent("plan_artifact_rejected_by_quality_gate", {
+            path: artifact.path,
+            kind: artifact.kind,
+            reason: validation.reason,
+            contentChars: sanitizedContent.length,
+          });
+          return {};
+        }
+
+        const nextArtifacts = [...s.planArtifacts];
+        const existingIndex = nextArtifacts.findIndex((item) => item.path === artifact.path);
+        if (existingIndex >= 0) {
+          nextArtifacts[existingIndex] = { ...artifact, content: sanitizedContent };
+        } else {
+          nextArtifacts.push({ ...artifact, content: sanitizedContent });
+        }
+
+        const parsedTasks = artifact.kind === "tasks" || artifact.kind === "bugfix"
+          ? extractPlanTasks(sanitizedContent)
+          : s.planTasks;
+        const preserveTaskHistory =
+          s.isPlanApproved ||
+          s.planStage === "executing" ||
+          s.planStage === "completed" ||
+          s.planTasks.length > 0;
+        const nextTasks = artifact.kind === "tasks" || artifact.kind === "bugfix"
+          ? mergePlanTasks(s.planTasks, parsedTasks, preserveTaskHistory)
+          : s.planTasks;
+        const normalizedTasks = normalizePlanTaskStatuses(
+          nextTasks.length > 0 ? nextTasks : s.planTasks,
+          s.isPlanApproved && s.planExecutionEvidenceCount > 0,
+        );
+        return {
+          planArtifacts: nextArtifacts.sort((a, b) => a.updatedAt - b.updatedAt),
+          planStage: derivePlanStageFromArtifacts(
+            nextArtifacts,
+            normalizedTasks,
+            s.isPlanApproved,
+            s.planStage,
+          ),
+          planTasks: normalizedTasks,
+          showPlanPanel: true,
+          rightPanelTab: s.showDiff && s.rightPanelTab === "diff" ? "diff" : "plan",
+        };
+      });
+    const sessionOpenRightPanelTab = (tab: RightPanelTab) =>
+      sessionSet({
+        rightPanelTab: tab,
+        showPlanPanel: tab === "plan",
+        showDiff: tab === "diff",
+        showTerminal: tab === "terminal",
+        showFilePanel: tab === "file",
+      });
+    const sessionGet = (): AppState => {
+      const live = get();
+      const runtime = live.runtimeBySessionKey[runSessionKey] || createSessionRuntimeFromState(live);
+      const scoped = (isRunSessionActive(live) ? live : { ...live, ...runtime }) as AppState;
+      return {
+        ...scoped,
+        setConversationTurnStatus: sessionSetConversationTurnStatus,
+        updateConversationTurn: sessionUpdateConversationTurn,
+        setConversationTurnSummary: sessionSetConversationTurnSummary,
+        setPlanStage: (stage: PlanStage) => sessionSet({ planStage: stage }),
+        setPlanTasks: sessionSetPlanTasks,
+        upsertPlanArtifact: sessionUpsertPlanArtifact,
+        setNormalizedStreamState: (streamState: NormalizedStreamState) => sessionSet({ normalizedStreamState: streamState }),
+        openRightPanelTab: sessionOpenRightPanelTab,
+        setRightPanelTab: sessionOpenRightPanelTab,
+        closeRightPanel: () => sessionSet({ showPlanPanel: false, showDiff: false, showTerminal: false, showFilePanel: false }),
+        startNewTurn: () =>
+          sessionSet({
+            currentTurnState: {
+              ...createDefaultCurrentTurnState(),
+              turnId: Date.now().toString(),
+            },
+          }),
+        getCurrentRunIntent: () => {
+          const current = scoped.currentTurnId
+            ? scoped.conversationTurns.find((turn) => turn.id === scoped.currentTurnId) || null
+            : null;
+          return current
+            ? resolveConversationTurnIntent(current)
+            : resolveRunIntentFromLegacyWorkflowMode(scoped.config.workflowMode);
+        },
+      };
+    };
+
+    const nextId = sessionGet()._nextTaskId;
     const turnId = reuseCurrentTurn ? state.currentTurnId! : `turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const existingTurn = reuseCurrentTurn
       ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId) || null
@@ -3314,7 +3863,7 @@ export const useAppStore = create<AppState>()(
       preferredLanguage === "en" ? 48 : 40,
       localTurnTitle,
     );
-    const refreshedState = get();
+    const refreshedState = sessionGet();
     const activeSession = ensuredSessionId
       ? (refreshedState.sessionsByWorkspace[sessionScopeKey] || []).find((session) => session.id === ensuredSessionId)
       : null;
@@ -3340,7 +3889,7 @@ export const useAppStore = create<AppState>()(
         content: systemContent,
       };
 
-      set((s) => ({
+      sessionSet((s) => ({
         taskFlow: [...s.taskFlow, ...(userBlock ? [userBlock] : []), systemBlock],
         conversationTurns: reuseCurrentTurn
           ? s.conversationTurns.map((turn) =>
@@ -3385,38 +3934,38 @@ export const useAppStore = create<AppState>()(
       }));
 
       if (!isHidden && shouldSeedSessionTitle && ensuredSessionId) {
-        get().updateSession(sessionScopeKey, ensuredSessionId, {
+        sessionGet().updateSession(sessionScopeKey, ensuredSessionId, {
           title: turnTitle,
           active: true,
           runtimeSnapshot: normalizeSessionRuntimeSnapshot({
-            taskFlow: get().taskFlow,
-            agentMessages: get().agentMessages,
-            conversationTurns: get().conversationTurns,
-            currentTurnId: get().currentTurnId,
-            selectedMainModeKey: get().selectedMainModeKey,
-            selectedNexusModeKey: get().selectedNexusModeKey,
-            activeStudioAgentKey: get().activeStudioAgentKey,
-            gameStudioInitialized: get().gameStudioInitialized,
-            pendingSlashCommand: get().pendingSlashCommand,
-            planArtifacts: get().planArtifacts,
-            planTasks: get().planTasks,
-            planExecutionEvidenceCount: get().planExecutionEvidenceCount,
-            planStage: get().planStage,
-            isPlanApproved: get().isPlanApproved,
-            showPlanPanel: get().showPlanPanel,
-            showDiff: get().showDiff,
-            showTerminal: get().showTerminal,
-            showFilePanel: get().showFilePanel,
-            rightPanelTab: get().rightPanelTab,
-            selectedDiffTaskId: get().selectedDiffTaskId,
+            taskFlow: sessionGet().taskFlow,
+            agentMessages: sessionGet().agentMessages,
+            conversationTurns: sessionGet().conversationTurns,
+            currentTurnId: sessionGet().currentTurnId,
+            selectedMainModeKey: sessionGet().selectedMainModeKey,
+            selectedNexusModeKey: sessionGet().selectedNexusModeKey,
+            activeStudioAgentKey: sessionGet().activeStudioAgentKey,
+            gameStudioInitialized: sessionGet().gameStudioInitialized,
+            pendingSlashCommand: sessionGet().pendingSlashCommand,
+            planArtifacts: sessionGet().planArtifacts,
+            planTasks: sessionGet().planTasks,
+            planExecutionEvidenceCount: sessionGet().planExecutionEvidenceCount,
+            planStage: sessionGet().planStage,
+            isPlanApproved: sessionGet().isPlanApproved,
+            showPlanPanel: sessionGet().showPlanPanel,
+            showDiff: sessionGet().showDiff,
+            showTerminal: sessionGet().showTerminal,
+            showFilePanel: sessionGet().showFilePanel,
+            rightPanelTab: sessionGet().rightPanelTab,
+            selectedDiffTaskId: sessionGet().selectedDiffTaskId,
           }),
         });
       }
     };
 
     if (parsedStudioCommand?.type === "agent") {
-      void get().setActiveStudioAgentKey(parsedStudioCommand.slug, {
-        persistToWorkspace: get().gameStudioInitialized,
+      void sessionGet().setActiveStudioAgentKey(parsedStudioCommand.slug, {
+        persistToWorkspace: sessionGet().gameStudioInitialized,
       });
       void appendLocalStudioTurn(
         `Game Studio 当前专家已切换为 \`${parsedStudioCommand.slug}\`。后续普通消息会默认按该专家视角继续；发送 \`/auto\` 可恢复自动编排。`,
@@ -3425,8 +3974,8 @@ export const useAppStore = create<AppState>()(
     }
 
     if (parsedStudioCommand?.type === "auto") {
-      void get().setActiveStudioAgentKey("studio_auto", {
-        persistToWorkspace: get().gameStudioInitialized,
+      void sessionGet().setActiveStudioAgentKey("studio_auto", {
+        persistToWorkspace: sessionGet().gameStudioInitialized,
       });
       void appendLocalStudioTurn("Game Studio 已恢复自动编排。后续消息将不再固定绑定某个专家。");
       return true;
@@ -3448,7 +3997,7 @@ export const useAppStore = create<AppState>()(
           content: text,
           ...(currentImages.length > 0 ? { images: currentImages } : {}),
         };
-    set((s) => ({
+    sessionSet((s) => ({
       ...(userBlock
         ? (() => {
             const archivedTaskFlow = shouldArchiveChoiceFeedback
@@ -3553,6 +4102,8 @@ export const useAppStore = create<AppState>()(
 
     logStoreEvent("visible_turn_appended", {
       turnId,
+      sessionKey: runSessionKey,
+      workspace: runWorkspace || null,
       reuseCurrentTurn,
       shouldArchiveChoiceFeedback,
       selectedChoiceChars: selectedChoiceText.length,
@@ -3561,17 +4112,17 @@ export const useAppStore = create<AppState>()(
       effectiveWorkflowMode,
       initialTurnStatus,
       elapsedMs: Math.round(nowMs() - sendStartedAt),
-      taskFlowBlocks: get().taskFlow.length,
-      conversationTurns: get().conversationTurns.length,
+      taskFlowBlocks: sessionGet().taskFlow.length,
+      conversationTurns: sessionGet().conversationTurns.length,
     });
 
     if (!isHidden && shouldSeedSessionTitle && ensuredSessionId) {
-      get().updateSession(sessionScopeKey, ensuredSessionId, { title: turnTitle, active: true });
+      sessionGet().updateSession(sessionScopeKey, ensuredSessionId, { title: turnTitle, active: true });
     }
 
     // 对首轮会话或噪音较重的输入，额外让模型生成一份稳定的人话标题，
     // 再同步回当前 turn 与 sidebar，避免用户名/时间戳/推理文本直接泄漏到 UI。
-    const shouldRequestSmartLocalTitle = get().config.activeProfile === "local";
+    const shouldRequestSmartLocalTitle = sessionGet().config.activeProfile === "local";
     if (
       !isHidden &&
       !reuseCurrentTurn &&
@@ -3582,11 +4133,11 @@ export const useAppStore = create<AppState>()(
         input: text,
         intent: effectiveRunIntent,
         language: preferredLanguage,
-        config: get().config,
+        config: sessionGet().config,
       }).then((metadata) => {
         if (!metadata) return;
 
-        const latestState = get();
+        const latestState = sessionGet();
         const targetTurn = latestState.conversationTurns.find((turn) => turn.id === turnId);
         if (!targetTurn) return;
         if (
@@ -3614,20 +4165,20 @@ export const useAppStore = create<AppState>()(
     // 2. Start elapsed timer
     const startTime = Date.now();
     const timerInterval = setInterval(() => {
-      const state = get();
+      const state = sessionGet();
       if (state.agentStatus === "idle" || state.agentStatus === "error") {
         clearInterval(timerInterval);
         return;
       }
-      set({ elapsedTime: Math.round((Date.now() - startTime) / 1000) });
+      sessionSet({ elapsedTime: Math.round((Date.now() - startTime) / 1000) });
     }, 200);
 
     // 3. Build context from @-mentions and attached files
     // Read actual file contents for attached files (from old App.tsx)
     (async () => {
       let userContent = text;
-      let activeStudioAgentKey = get().activeStudioAgentKey;
-      let gameStudioInitialized = get().gameStudioInitialized;
+      let activeStudioAgentKey = sessionGet().activeStudioAgentKey;
+      let gameStudioInitialized = sessionGet().gameStudioInitialized;
       const mentions = mentionSnapshot;
       const files = attachedFilesSnapshot;
       const allFilePaths = [...new Set([...files, ...mentions])];
@@ -3638,8 +4189,8 @@ export const useAppStore = create<AppState>()(
           try {
             let c: string;
             if (shouldUseTabularAnalyzer(fp)) {
-              const summary = await analyzeTabularDocument(fp);
-              const preview = await readDocument(fp, 3000, 12, 0, 40);
+              const summary = await analyzeTabularDocument(fp, undefined, undefined, undefined, undefined, runWorkspace);
+              const preview = await readDocument(fp, 3000, 12, 0, 40, undefined, runWorkspace);
               const compactSummary = {
                 rowCount: summary.metadata.rowCount,
                 columnCount: summary.metadata.columnCount,
@@ -3671,7 +4222,7 @@ export const useAppStore = create<AppState>()(
                 preview.content || JSON.stringify(preview.metadata),
               ].join("\n");
             } else if (shouldUseDocumentReader(fp)) {
-              const doc = await readDocument(fp);
+              const doc = await readDocument(fp, undefined, undefined, undefined, undefined, undefined, runWorkspace);
               const header = [
                 "[attached_document]",
                 `path: ${fp}`,
@@ -3683,7 +4234,7 @@ export const useAppStore = create<AppState>()(
               const body = doc.content || JSON.stringify(doc.metadata);
               c = `${header.join("\n")}\n${body}`;
             } else {
-              const raw = await invoke<string>("read_file", { path: fp });
+              const raw = await readFile(fp, runWorkspace);
               c = `[attached_file]\npath: ${fp}\n${raw}`;
             }
             const n = fp.split("/").pop() || fp;
@@ -3750,15 +4301,15 @@ export const useAppStore = create<AppState>()(
           activeStudioAgentKey = normalizeStudioAgentKey(studioConfig.activeStudioAgent);
           gameStudioInitialized = true;
           invalidateWorkspaceTreeCache();
-          set({
+          sessionSet({
             gameStudioInitialized: true,
             activeStudioAgentKey,
           });
-          get().bumpWorkspaceContentVersion();
+          sessionGet().bumpWorkspaceContentVersion();
         } catch (error) {
           clearInterval(timerInterval);
           const failureId = nextId();
-          set((s) => ({
+          sessionSet((s) => ({
             taskFlow: [
               ...s.taskFlow,
               {
@@ -3797,7 +4348,7 @@ export const useAppStore = create<AppState>()(
       }
 
       // Clear mentions and attached files after reading
-      set({ contextMentions: [], attachedFiles: [] });
+      sessionSet({ contextMentions: [], attachedFiles: [] });
 
       // 4. Append to LLM conversation history
       // Build multimodal content if images are present
@@ -3815,11 +4366,11 @@ export const useAppStore = create<AppState>()(
       } else {
         agentUserMsg = { role: "user", content: userContent };
       }
-      set((s) => ({ agentMessages: [...s.agentMessages, agentUserMsg] }));
+      sessionSet((s) => ({ agentMessages: [...s.agentMessages, agentUserMsg] }));
 
       // 5. Create AbortController and launch the loop
       const abortCtrl = new AbortController();
-      set({ abortController: abortCtrl });
+      sessionSet({ abortController: abortCtrl });
 
       // Track the current streaming assistant block
       let currentStreamingBlockId: number | null = null;
@@ -3845,7 +4396,7 @@ export const useAppStore = create<AppState>()(
         if (blockWithTurn.type === "agent") {
           agentBlockIdsCreatedThisRun.add(blockWithTurn.id);
         }
-        set((s) => ({
+        sessionSet((s) => ({
           taskFlow: [...s.taskFlow, blockWithTurn],
           conversationTurns: s.conversationTurns.map((turn) =>
             turn.id === turnId && !turn.blockIds.includes(blockWithTurn.id)
@@ -3856,7 +4407,7 @@ export const useAppStore = create<AppState>()(
       };
 
       // ── RAF-batched streaming update ──────────────────────────────────
-      // Instead of calling set() for every character (which causes
+      // Instead of calling sessionSet() for every character (which causes
       // thousands of React re-renders), we buffer incoming tokens and
       // flush them once per animation frame (~60 fps).
       let tokenBuffer = "";
@@ -3876,7 +4427,7 @@ export const useAppStore = create<AppState>()(
       noFirstTokenNoticeTimer = setTimeout(() => {
         noFirstTokenNoticeTimer = null;
         if (firstStreamTokenAt !== null) return;
-        const latest = get();
+        const latest = sessionGet();
         if (latest.agentStatus !== "running" || latest.currentTurnId !== turnId) return;
         appendTurnBlock({
           id: nextId(),
@@ -3917,7 +4468,7 @@ export const useAppStore = create<AppState>()(
             isStreaming: true,
           };
           appendTurnBlock(thoughtBlock);
-          set((s) => ({
+          sessionSet((s) => ({
             currentTurnState: {
               ...s.currentTurnState,
               interceptorHandled: true,
@@ -3927,7 +4478,7 @@ export const useAppStore = create<AppState>()(
         } else if (currentThoughtBlockId !== null && thinking) {
           // Append to existing thought block
           const tid = currentThoughtBlockId;
-          set((s) => ({
+          sessionSet((s) => ({
             taskFlow: s.taskFlow.map((t) =>
               t.id === tid && t.type === "thought"
                 ? { ...t, content: appendThoughtDelta((t as Extract<TaskBlock, { type: "thought" }>).content, thinking) }
@@ -3944,7 +4495,7 @@ export const useAppStore = create<AppState>()(
           // Finalize the thought block
           const tid = currentThoughtBlockId;
           const duration = thoughtStartTime ? Math.round((Date.now() - thoughtStartTime) / 1000) : undefined;
-          set((s) => ({
+          sessionSet((s) => ({
             taskFlow: s.taskFlow.map((t) =>
               t.id === tid && t.type === "thought"
                 ? { ...t, isStreaming: false, duration }
@@ -3953,7 +4504,7 @@ export const useAppStore = create<AppState>()(
           }));
           // Auto-collapse after a brief display
           setTimeout(() => {
-            set((s) => ({
+            sessionSet((s) => ({
               taskFlow: s.taskFlow.map((t) =>
                 t.id === tid && t.type === "thought"
                   ? { ...t, isStreaming: false }
@@ -3970,7 +4521,7 @@ export const useAppStore = create<AppState>()(
         if (!agentContent) return;
 
         // Cross-type deduplication: If this is the start of the agent reply and it repeats thought content, strip it.
-        const currentTurn = get().currentTurnState;
+        const currentTurn = sessionGet().currentTurnState;
         if (currentTurn.interceptorThought && currentStreamingBlockId === null) {
           const normThought = currentTurn.interceptorThought.trim().toLowerCase().replace(/\s+/g, ' ');
           const normAgent = agentContent.trim().toLowerCase().replace(/\s+/g, ' ');
@@ -3992,7 +4543,7 @@ export const useAppStore = create<AppState>()(
           appendTurnBlock(block);
         } else {
           const blockId = currentStreamingBlockId;
-          set((s) => ({
+          sessionSet((s) => ({
             taskFlow: s.taskFlow.map((t) =>
               t.id === blockId && t.type === "agent"
                 ? { ...t, content: (t as Extract<TaskBlock, { type: "agent" }>).content + agentContent }
@@ -4027,7 +4578,7 @@ export const useAppStore = create<AppState>()(
             appendTurnBlock({ id: blockId, turnId, type: "agent", content: remainingAgent, streaming: true });
           } else {
             const blockId = currentStreamingBlockId;
-            set((s) => ({
+            sessionSet((s) => ({
               taskFlow: s.taskFlow.map((t) =>
                 t.id === blockId && t.type === "agent"
                   ? { ...t, content: (t as Extract<TaskBlock, { type: "agent" }>).content + remainingAgent }
@@ -4038,7 +4589,7 @@ export const useAppStore = create<AppState>()(
         }
 
         const duration = thoughtStartTime ? Math.round((Date.now() - thoughtStartTime) / 1000) : undefined;
-        set((s) => ({
+        sessionSet((s) => ({
           taskFlow: finalizeStreamingTaskBlocks(s.taskFlow, turnId, duration),
         }));
 
@@ -4049,7 +4600,7 @@ export const useAppStore = create<AppState>()(
       // endregion
 
       const removeLatestAgentBlockForTurn = () => {
-        set((s) => {
+        sessionSet((s) => {
           const latestAgent = [...s.taskFlow]
             .reverse()
             .find((block): block is Extract<TaskBlock, { type: "agent" }> =>
@@ -4087,43 +4638,43 @@ export const useAppStore = create<AppState>()(
 
       // Get workspace tree for system prompt
       const workspaceTreeStartedAt = nowMs();
-      const workspaceTree = await getWorkspaceTree(state.currentWorkspace);
+      const workspaceTree = await getWorkspaceTree(runWorkspace);
       logStoreEvent("workspace_tree_ready", {
         turnId,
-        workspace: state.currentWorkspace || "global",
+        workspace: runWorkspace || "global",
         chars: workspaceTree.length,
         elapsedMs: Math.round(nowMs() - workspaceTreeStartedAt),
       });
 
       const callbacks: OrchestratorCallbacks = {
-        getMessages: () => get().agentMessages,
-        getConfig: () => get().config,
-        getPreferredLanguage: () => get().preferredResponseLanguage || get().config.language,
-        getSkills: () => get().skills,
-        getMainModeKey: () => get().selectedMainModeKey,
-        getActiveStudioAgentKey: () => get().activeStudioAgentKey,
-        getGameStudioInitialized: () => get().gameStudioInitialized,
-        getPendingSlashCommand: () => get().pendingSlashCommand,
+        getMessages: () => sessionGet().agentMessages,
+        getConfig: () => ({ ...sessionGet().config, workspace: runWorkspace }),
+        getPreferredLanguage: () => sessionGet().preferredResponseLanguage || sessionGet().config.language,
+        getSkills: () => sessionGet().skills,
+        getMainModeKey: () => sessionGet().selectedMainModeKey,
+        getActiveStudioAgentKey: () => sessionGet().activeStudioAgentKey,
+        getGameStudioInitialized: () => sessionGet().gameStudioInitialized,
+        getPendingSlashCommand: () => sessionGet().pendingSlashCommand,
         getWorkspaceTree: () => workspaceTree,
-        getMcpServers: () => get().mcpServers,
-        getMcpDiscoveredTools: () => get().mcpDiscoveredTools,
-        getAssociatedPaths: () => get().resolvedInstructionSet?.associatedPaths ?? [],
-        getSessionKey: () => `${resolveSessionWorkspaceKey(get().currentWorkspace)}:${get().currentSessionId}`,
-        hasSessionHookInitialized: (key) => get().hasSessionHookInitialized(key),
-        markSessionHookInitialized: (key) => get().markSessionHookInitialized(key),
-        onInstructionsResolved: (resolved) => get().setResolvedInstructionSet(resolved),
-        onHooksLoaded: (hooks, loadedAt) => get().setLoadedHookDefinitions(hooks, loadedAt),
+        getMcpServers: () => sessionGet().mcpServers,
+        getMcpDiscoveredTools: () => sessionGet().mcpDiscoveredTools,
+        getAssociatedPaths: () => sessionGet().resolvedInstructionSet?.associatedPaths ?? [],
+        getSessionKey: () => runSessionKey,
+        hasSessionHookInitialized: (key) => sessionGet().hasSessionHookInitialized(key),
+        markSessionHookInitialized: (key) => sessionGet().markSessionHookInitialized(key),
+        onInstructionsResolved: (resolved) => sessionGet().setResolvedInstructionSet(resolved),
+        onHooksLoaded: (hooks, loadedAt) => sessionGet().setLoadedHookDefinitions(hooks, loadedAt),
         onHookStart: (_event, _hook) => { /* UI feedback placeholder */ },
-        onHookResult: (record) => get().appendHookExecutionRecords([record]),
+        onHookResult: (record) => sessionGet().appendHookExecutionRecords([record]),
         onHookBlocked: (_event, _reason, _record) => { /* UI feedback placeholder */ },
-        getCurrentRunIntent: () => get().getCurrentRunIntent(),
-        getWorkflowMode: () => getIntentPolicy(get().getCurrentRunIntent()).workflowMode,
-        getIsPlanApproved: () => get().isPlanApproved,
-        getReadOnlyAutoApproveForSession: () => get().readOnlyAutoApproveForSession,
-        getPlanStage: () => get().planStage,
-        getPlanTasks: () => get().planTasks,
-        getStatus: () => get().agentStatus,
-        startNewTurn: () => get().startNewTurn(),
+        getCurrentRunIntent: () => sessionGet().getCurrentRunIntent(),
+        getWorkflowMode: () => getIntentPolicy(sessionGet().getCurrentRunIntent()).workflowMode,
+        getIsPlanApproved: () => sessionGet().isPlanApproved,
+        getReadOnlyAutoApproveForSession: () => sessionGet().readOnlyAutoApproveForSession,
+        getPlanStage: () => sessionGet().planStage,
+        getPlanTasks: () => sessionGet().planTasks,
+        getStatus: () => sessionGet().agentStatus,
+        startNewTurn: () => sessionGet().startNewTurn(),
 
         onStreamToken: (token, _msgId) => {
           // Handle escalation reset signal
@@ -4133,7 +4684,7 @@ export const useAppStore = create<AppState>()(
               currentStreamingBlockId,
               tokenBufferChars: tokenBuffer.length,
               agentBlocksCreatedThisRun: agentBlockIdsCreatedThisRun.size,
-              taskFlowBlocks: get().taskFlow.length,
+              taskFlowBlocks: sessionGet().taskFlow.length,
             });
             tokenBuffer = "";
             firstStreamTokenAt = null;
@@ -4142,7 +4693,7 @@ export const useAppStore = create<AppState>()(
             // Reset the streaming block content for retry
             if (currentStreamingBlockId !== null) {
               const blockId = currentStreamingBlockId;
-              set((s) => ({
+              sessionSet((s) => ({
                 taskFlow: s.taskFlow.map((t) =>
                   t.id === blockId && t.type === "agent"
                     ? { ...t, content: "" }
@@ -4161,6 +4712,8 @@ export const useAppStore = create<AppState>()(
             clearNoFirstTokenNoticeTimer();
             logStoreEvent("stream_first_token", {
               turnId,
+              sessionKey: runSessionKey,
+              workspace: runWorkspace || null,
               elapsedMs: Math.round(firstStreamTokenAt - sendStartedAt),
               tokenChars: token.length,
             });
@@ -4175,12 +4728,14 @@ export const useAppStore = create<AppState>()(
           finalizeStreamingUi();
           logStoreEvent("stream_done", {
             turnId,
+            sessionKey: runSessionKey,
+            workspace: runWorkspace || null,
             fullTextChars: _fullText.length,
             truncated,
             firstTokenElapsedMs: firstStreamTokenAt == null ? null : Math.round(firstStreamTokenAt - sendStartedAt),
             streamTokenCount,
             streamTextChars,
-            taskFlowBlocks: get().taskFlow.length,
+            taskFlowBlocks: sessionGet().taskFlow.length,
             agentBlocksCreatedThisRun: agentBlockIdsCreatedThisRun.size,
           });
 
@@ -4196,7 +4751,7 @@ export const useAppStore = create<AppState>()(
             appendTurnBlock(warnBlock);
           }
 
-          set((s) => ({
+          sessionSet((s) => ({
             normalizedStreamState: {
               ...s.normalizedStreamState,
               finishReason: truncated ? "length" : "stop",
@@ -4213,7 +4768,7 @@ export const useAppStore = create<AppState>()(
           const normalizeForComp = (s: string) => s.trim().replace(/\s+/g, ' ');
           const incoming = normalizeForComp(thought);
           
-          const currentTurn = get().currentTurnState;
+          const currentTurn = sessionGet().currentTurnState;
 
           // ── Interceptor dedup: if StreamingThinkingInterceptor already
           // captured and rendered this exact content, skip it entirely.
@@ -4233,7 +4788,7 @@ export const useAppStore = create<AppState>()(
           }
 
           // Update turn state
-          set((s) => ({
+          sessionSet((s) => ({
             normalizedStreamState: {
               ...s.normalizedStreamState,
               hiddenThought: appendThoughtDelta(
@@ -4247,7 +4802,7 @@ export const useAppStore = create<AppState>()(
             }
           }));
 
-          const currentFlow = get().taskFlow;
+          const currentFlow = sessionGet().taskFlow;
           const lastBlock = currentFlow[currentFlow.length - 1];
 
           if (lastBlock && lastBlock.type === "thought") {
@@ -4257,7 +4812,7 @@ export const useAppStore = create<AppState>()(
             if (existing.includes(incoming)) {
               if (duration !== undefined) {
                 const tid = lastBlock.id;
-                set((s) => ({
+                sessionSet((s) => ({
                   taskFlow: s.taskFlow.map((t) =>
                     t.id === tid && t.type === "thought"
                       ? { ...t, duration, isStreaming: false, content: incoming.length > existing.length ? thought : t.content }
@@ -4268,7 +4823,7 @@ export const useAppStore = create<AppState>()(
               return;
             }
             const tid = lastBlock.id;
-            set((s) => ({
+            sessionSet((s) => ({
               taskFlow: s.taskFlow.map((t) =>
                 t.id === tid && t.type === "thought"
                   ? { ...t, content: appendThoughtDelta((t as Extract<TaskBlock, { type: "thought" }>).content, `\n\n${thought}`), isStreaming: true, duration }
@@ -4277,7 +4832,7 @@ export const useAppStore = create<AppState>()(
             }));
             // Auto-collapse after a brief display period
             setTimeout(() => {
-              set((s) => ({
+              sessionSet((s) => ({
                 taskFlow: s.taskFlow.map((t) =>
                   t.id === tid && t.type === "thought"
                     ? { ...t, isStreaming: false }
@@ -4301,7 +4856,7 @@ export const useAppStore = create<AppState>()(
 
             // Auto-collapse after a brief display period
             setTimeout(() => {
-              set((s) => ({
+              sessionSet((s) => ({
                 taskFlow: s.taskFlow.map((t) =>
                   t.id === thoughtBlockId && t.type === "thought"
                     ? { ...t, isStreaming: false }
@@ -4315,12 +4870,12 @@ export const useAppStore = create<AppState>()(
 
         onAssistantFinalText: (text, replyOptions = []) => {
           const fallbackText = replyOptions.length > 0
-            ? get().config.language === "en"
+            ? sessionGet().config.language === "en"
               ? "Choose how you'd like to continue."
               : "请选择你希望我如何继续。"
             : "";
           const cleanText = text.trim() || fallbackText;
-          const currentFlow = get().taskFlow;
+          const currentFlow = sessionGet().taskFlow;
           const latestBlock = [...currentFlow].reverse().find((block) =>
             block.turnId === turnId &&
             block.type === "agent" &&
@@ -4329,6 +4884,8 @@ export const useAppStore = create<AppState>()(
           const cleanTextKey = normalizeAgentContentForDedupe(cleanText);
           logStoreEvent("assistant_final_text", {
             turnId,
+            sessionKey: runSessionKey,
+            workspace: runWorkspace || null,
             textChars: text.length,
             cleanTextChars: cleanText.length,
             replyOptions: replyOptions.length,
@@ -4339,7 +4896,7 @@ export const useAppStore = create<AppState>()(
 
           if (!cleanText) {
             if (latestBlock && latestBlock.type === "agent" && latestBlock.turnId === turnId) {
-              set((s) => ({
+              sessionSet((s) => ({
                 taskFlow: s.taskFlow.map((t) =>
                   t.id === latestBlock.id && t.type === "agent"
                     ? { ...t, content: "", streaming: false }
@@ -4361,7 +4918,7 @@ export const useAppStore = create<AppState>()(
               );
 
             if (duplicatedEarlierBlock) {
-              set((s) => ({
+              sessionSet((s) => ({
                 normalizedStreamState: {
                   ...s.normalizedStreamState,
                   visibleText: String(duplicatedEarlierBlock.content || ""),
@@ -4380,7 +4937,7 @@ export const useAppStore = create<AppState>()(
           }
 
           if (!latestBlock || latestBlock.type !== "agent" || latestBlock.turnId !== turnId) {
-            set((s) => ({
+            sessionSet((s) => ({
               normalizedStreamState: {
                 ...s.normalizedStreamState,
                 visibleText: cleanText,
@@ -4398,7 +4955,7 @@ export const useAppStore = create<AppState>()(
             return;
           }
 
-          set((s) => ({
+          sessionSet((s) => ({
             normalizedStreamState: {
               ...s.normalizedStreamState,
               visibleText: cleanText,
@@ -4421,7 +4978,7 @@ export const useAppStore = create<AppState>()(
           let runningTaskId: number | null = null;
           let shouldAttachDiff = false;
 
-          set((s) => {
+          sessionSet((s) => {
             const pendingIdx = [...s.taskFlow]
               .map((task, index) => ({ task, index }))
               .reverse()
@@ -4475,7 +5032,7 @@ export const useAppStore = create<AppState>()(
           });
 
           if (runningTaskId != null && shouldAttachDiff && diffPreview) {
-            set((s) => ({
+            sessionSet((s) => ({
               taskFlow: s.taskFlow.map((task) =>
                 task.id === runningTaskId && task.type === "tool"
                   ? { ...task, diff: diffPreview }
@@ -4486,7 +5043,7 @@ export const useAppStore = create<AppState>()(
         },
 
         onToolDone: (toolName, target, result) => {
-          set((s) => {
+          sessionSet((s) => {
             let idx = -1;
             for (let i = s.taskFlow.length - 1; i >= 0; i--) {
               const t = s.taskFlow[i];
@@ -4526,12 +5083,12 @@ export const useAppStore = create<AppState>()(
             toolName === "delete_workspace_path"
           ) {
             invalidateWorkspaceTreeCache();
-            get().bumpWorkspaceContentVersion();
+            sessionGet().bumpWorkspaceContentVersion();
           }
         },
 
         onToolError: (toolName, target, error) => {
-          set((s) => {
+          sessionSet((s) => {
             let idx = -1;
             for (let i = s.taskFlow.length - 1; i >= 0; i--) {
               const t = s.taskFlow[i];
@@ -4547,21 +5104,23 @@ export const useAppStore = create<AppState>()(
           });
           if (toolName === "execute_command") {
             invalidateWorkspaceTreeCache();
-            get().bumpWorkspaceContentVersion();
+            sessionGet().bumpWorkspaceContentVersion();
           }
         },
 
         onStatusChange: (status) => {
           logStoreEvent("status_change", {
             turnId,
+            sessionKey: runSessionKey,
+            workspace: runWorkspace || null,
             status,
-            replyOptions: get().normalizedStreamState.replyOptions.length,
-            taskFlowBlocks: get().taskFlow.length,
-            agentMessages: get().agentMessages.length,
+            replyOptions: sessionGet().normalizedStreamState.replyOptions.length,
+            taskFlowBlocks: sessionGet().taskFlow.length,
+            agentMessages: sessionGet().agentMessages.length,
             elapsedMs: Math.round(nowMs() - sendStartedAt),
           });
           const finalizeStaleRunningTools = (finalStatus: "executed" | "failed", message: string) => {
-            set((s) => ({
+            sessionSet((s) => ({
               taskFlow: s.taskFlow.map((task) =>
                 task.turnId === turnId && task.type === "tool" && task.toolStatus === "running"
                   ? {
@@ -4575,13 +5134,13 @@ export const useAppStore = create<AppState>()(
             }));
           };
 
-          set({
+          sessionSet({
             agentStatus: status,
             // Timer only runs during active generation, NOT during plan review
             isGenerating: status === "running",
           });
           if (status === "pending_review") {
-            const state = get();
+            const state = sessionGet();
             const hasPlanContext =
               effectiveRunIntent === "plan" ||
               state.planArtifacts.length > 0 ||
@@ -4604,23 +5163,23 @@ export const useAppStore = create<AppState>()(
                 ? deriveIdleConversationTurnStatus({
                     turnId,
                     effectiveRunIntent,
-                    isPlanApproved: get().isPlanApproved,
-                    planArtifacts: get().planArtifacts,
-                    planStage: get().planStage,
-                    planTasks: get().planTasks,
-                    planExecutionEvidenceCount: get().planExecutionEvidenceCount,
-                    replyOptionCount: get().normalizedStreamState.replyOptions.length,
-                    taskFlow: get().taskFlow,
+                    isPlanApproved: sessionGet().isPlanApproved,
+                    planArtifacts: sessionGet().planArtifacts,
+                    planStage: sessionGet().planStage,
+                    planTasks: sessionGet().planTasks,
+                    planExecutionEvidenceCount: sessionGet().planExecutionEvidenceCount,
+                    replyOptionCount: sessionGet().normalizedStreamState.replyOptions.length,
+                    taskFlow: sessionGet().taskFlow,
                     override: terminalTurnStatusOverride,
                   })
                 : status === "pending_review"
                 ? "awaiting_approval"
                 : effectiveRunIntent === "plan" &&
-                  !get().isPlanApproved &&
-                  (get().planArtifacts.length > 0 || get().planStage !== "idle")
+                  !sessionGet().isPlanApproved &&
+                  (sessionGet().planArtifacts.length > 0 || sessionGet().planStage !== "idle")
                 ? "planning"
                 : "executing";
-            get().setConversationTurnStatus(turnId, nextTurnStatus);
+            sessionGet().setConversationTurnStatus(turnId, nextTurnStatus);
           }
           if (status === "idle" || status === "error") {
             clearNoFirstTokenNoticeTimer();
@@ -4630,11 +5189,11 @@ export const useAppStore = create<AppState>()(
               status === "idle" ? "请求已停止或未返回工具结果" : "请求已停止",
             );
             if (remoteFeishu) {
-              const language = get().config.language === "en" ? "en" : "zh";
+              const language = sessionGet().config.language === "en" ? "en" : "zh";
               const fallback = status === "error"
                 ? (language === "en" ? "MAIN stopped with an error." : "MAIN 执行时遇到错误。")
                 : (language === "en" ? "MAIN finished this remote task." : "MAIN 已完成这次远程任务。");
-              const reply = extractFeishuTurnReply(get().taskFlow, turnId, fallback);
+              const reply = extractFeishuTurnReply(sessionGet().taskFlow, turnId, fallback);
               void invoke("send_feishu_message", {
                 chatId: remoteFeishu.chatId,
                 userId: remoteFeishu.userId,
@@ -4648,7 +5207,7 @@ export const useAppStore = create<AppState>()(
                 });
               });
             }
-            set({ abortController: null });
+            sessionSet({ abortController: null });
             clearInterval(timerInterval);
           }
         },
@@ -4658,8 +5217,8 @@ export const useAppStore = create<AppState>()(
           logStoreEvent("agent_error", {
             turnId,
             error: typeof error === "string" ? error : String(error),
-            taskFlowBlocks: get().taskFlow.length,
-            agentMessages: get().agentMessages.length,
+            taskFlowBlocks: sessionGet().taskFlow.length,
+            agentMessages: sessionGet().agentMessages.length,
           });
           finalizeStreamingUi();
           const errorMessage = typeof error === "string" ? error : String(error);
@@ -4667,9 +5226,9 @@ export const useAppStore = create<AppState>()(
           const friendlyError = isResponseBodyDecodeError
             ? "模型服务在传输回复时中断或返回了无法解析的数据。原始错误：" + errorMessage
             : errorMessage;
-          const currentTurn = get().conversationTurns.find((turn) => turn.id === turnId);
+          const currentTurn = sessionGet().conversationTurns.find((turn) => turn.id === turnId);
           if (!currentTurn?.summary?.trim()) {
-            get().setConversationTurnSummary(
+            sessionGet().setConversationTurnSummary(
               turnId,
               isResponseBodyDecodeError
                 ? "模型服务传输中断，已保留本轮已完成的操作记录。"
@@ -4697,8 +5256,8 @@ export const useAppStore = create<AppState>()(
             turnId,
             reason,
             message,
-            taskFlowBlocks: get().taskFlow.length,
-            agentMessages: get().agentMessages.length,
+            taskFlowBlocks: sessionGet().taskFlow.length,
+            agentMessages: sessionGet().agentMessages.length,
           });
           const block: TaskBlock = {
             id: nextId(),
@@ -4707,7 +5266,7 @@ export const useAppStore = create<AppState>()(
             content: message,
           };
           appendTurnBlock(block);
-          get().setConversationTurnSummary(turnId, summarizeAssistantText(message));
+          sessionGet().setConversationTurnSummary(turnId, summarizeAssistantText(message));
         },
 
         onPlanArtifactUpdated: (path, content, kind) => {
@@ -4730,28 +5289,28 @@ export const useAppStore = create<AppState>()(
               id: nextId(),
               turnId,
               type: "system",
-              content: get().config.language === "en"
+              content: sessionGet().config.language === "en"
                 ? `Plan artifact rejected: ${path} does not look like a reviewable ${kind} document (${validation.reason || "quality gate"}). MAIN will ask the model to regenerate a real plan or request your decision.`
                 : `计划文件已被拦截：${path} 不像可审批的${getPlanArtifactTitle(kind, "zh")}（${validation.reason || "质量门禁"}）。MAIN 会要求模型重新生成真实方案，或先向你确认关键分叉。`,
               variant: "plan_quality_gate",
             });
             return;
           }
-          get().upsertPlanArtifact({
+          sessionGet().upsertPlanArtifact({
             kind,
             path,
-            title: getPlanArtifactTitle(kind, get().config.language === "en" ? "en" : "zh"),
+            title: getPlanArtifactTitle(kind, sessionGet().config.language === "en" ? "en" : "zh"),
             content: sanitized,
             updatedAt: Date.now(),
           });
-          const latest = get();
+          const latest = sessionGet();
           if (!(latest.showDiff && latest.rightPanelTab === "diff")) {
             latest.openRightPanelTab("plan");
           }
         },
 
         onPlanStageChanged: (stage) => {
-          const current = get();
+          const current = sessionGet();
           const turnBlocks = current.taskFlow.filter((block) => block.turnId === turnId);
           const currentTurn = current.conversationTurns.find((turn) => turn.id === turnId);
           const requestedDocs = detectRequestedRootMarkdownDeliverables(currentTurn?.userPrompt || "");
@@ -4774,9 +5333,9 @@ export const useAppStore = create<AppState>()(
                   stage === "executing" ? "executing" : current.planStage,
                 );
 
-          get().setPlanStage(nextStage);
+          sessionGet().setPlanStage(nextStage);
           if (nextStage !== "idle") {
-            const latest = get();
+            const latest = sessionGet();
             if (!(latest.showDiff && latest.rightPanelTab === "diff")) {
               latest.openRightPanelTab("plan");
             }
@@ -4786,7 +5345,7 @@ export const useAppStore = create<AppState>()(
         onPlanTasksUpdated: (content) => {
           const sanitized = sanitizePlanArtifactContent(content);
           if (sanitized.trim()) {
-            get().setPlanTasks(extractPlanTasks(sanitized));
+            sessionGet().setPlanTasks(extractPlanTasks(sanitized));
           }
         },
 
@@ -4794,26 +5353,30 @@ export const useAppStore = create<AppState>()(
           if (!summary.trim()) return;
           const summarized = summarizeAssistantText(summary);
           if (looksLikeReasoningLeakTitle(summarized)) return;
-          get().setConversationTurnSummary(turnId, summarized);
+          sessionGet().setConversationTurnSummary(turnId, summarized);
         },
 
         appendMessage: (msg) => {
           logStoreEvent("append_agent_message", {
             turnId,
+            sessionKey: runSessionKey,
+            workspace: runWorkspace || null,
             role: msg.role,
             contentChars: typeof msg.content === "string" ? msg.content.length : JSON.stringify(msg.content).length,
             hasToolCalls: !!msg.tool_calls?.length,
-            beforeMessages: get().agentMessages.length,
+            beforeMessages: sessionGet().agentMessages.length,
           });
-          set((s) => ({ agentMessages: [...s.agentMessages, msg] }));
+          sessionSet((s) => ({ agentMessages: [...s.agentMessages, msg] }));
         },
 
         replaceMessages: (msgs) => {
           logStoreEvent("replace_agent_messages", {
             turnId,
+            sessionKey: runSessionKey,
+            workspace: runWorkspace || null,
             nextMessages: msgs.length,
           });
-          set({ agentMessages: msgs });
+          sessionSet({ agentMessages: msgs });
         },
 
         onContextCompress: (stats, reason) => {
@@ -4852,11 +5415,11 @@ export const useAppStore = create<AppState>()(
          */
         requestReview: (toolCall) => {
           // ── Auto-approve path ──
-          if (get().autoApproveTools) {
+          if (sessionGet().autoApproveTools) {
             return Promise.resolve({ action: "accept" });
           }
 
-          const latestState = get();
+          const latestState = sessionGet();
           const isRemoteFeishuTurn = !!remoteFeishu;
           const latestIntent = latestState.getCurrentRunIntent();
           const alreadyApprovedForTurn =
@@ -4873,7 +5436,7 @@ export const useAppStore = create<AppState>()(
             !planExecutionAlreadyApproved
           ) {
             return new Promise<ReviewDecision>((resolve) => {
-              set({
+              sessionSet({
                 pendingRunDecision: {
                   kind: "execution_consent",
                   source: "tool_gate",
@@ -4900,7 +5463,7 @@ export const useAppStore = create<AppState>()(
                 return decision;
               }
 
-              if (get().autoApproveTools) {
+              if (sessionGet().autoApproveTools) {
                 return { action: "accept" } as ReviewDecision;
               }
 
@@ -4910,10 +5473,9 @@ export const useAppStore = create<AppState>()(
                 const toolArgs = toolCall.arguments;
                 const target = getToolTarget(toolName, toolArgs);
                 void (async () => {
-                  const reviewState = get();
                   const diff = await buildToolDiffPreview(toolName, toolArgs, {
-                    workspace: reviewState.currentWorkspace,
-                    sessionKey: resolveGlobalChatSessionKey(reviewState.currentSessionId) ?? undefined,
+                    workspace: runWorkspace,
+                    sessionKey: runSessionKey,
                   });
                   const block: TaskBlock = {
                     id: reviewTaskId,
@@ -4926,7 +5488,7 @@ export const useAppStore = create<AppState>()(
                     ...(diff ? { diff } : {}),
                   };
 
-                  set((s) => ({
+                  sessionSet((s) => ({
                     taskFlow: [...s.taskFlow, block],
                     conversationTurns: s.conversationTurns.map((turn) =>
                       turn.id === turnId && !turn.blockIds.includes(block.id)
@@ -4953,10 +5515,9 @@ export const useAppStore = create<AppState>()(
             const toolArgs = toolCall.arguments;
             const target = getToolTarget(toolName, toolArgs);
             void (async () => {
-              const reviewState = get();
               const diff = await buildToolDiffPreview(toolName, toolArgs, {
-                workspace: reviewState.currentWorkspace,
-                sessionKey: resolveGlobalChatSessionKey(reviewState.currentSessionId) ?? undefined,
+                workspace: runWorkspace,
+                sessionKey: runSessionKey,
               });
               const block: TaskBlock = {
                 id: reviewTaskId,
@@ -4969,7 +5530,7 @@ export const useAppStore = create<AppState>()(
                 ...(diff ? { diff } : {}),
               };
 
-              set((s) => ({
+              sessionSet((s) => ({
                 taskFlow: [...s.taskFlow, block],
                 conversationTurns: s.conversationTurns.map((turn) =>
                   turn.id === turnId && !turn.blockIds.includes(block.id)
@@ -4986,7 +5547,7 @@ export const useAppStore = create<AppState>()(
               }));
               if (remoteFeishu) {
                 const code = createFeishuApprovalCode();
-                get().addPendingFeishuApproval({
+                sessionGet().addPendingFeishuApproval({
                   code,
                   taskId: reviewTaskId,
                   chatId: remoteFeishu.chatId,
@@ -5002,7 +5563,7 @@ export const useAppStore = create<AppState>()(
                   openId: remoteFeishu.userId,
                   messageId: remoteFeishu.messageId,
                   text: buildFeishuApprovalMessage(
-                    get().config.language === "en" ? "en" : "zh",
+                    sessionGet().config.language === "en" ? "en" : "zh",
                     code,
                     toolName,
                     target,
@@ -5023,19 +5584,44 @@ export const useAppStore = create<AppState>()(
       // Fire and forget — the loop manages its own lifecycle
       executeAgentLoop(callbacks, abortCtrl).then(() => {
         clearInterval(timerInterval);
-        set({ pendingSlashCommand: null });
+        sessionSet({ pendingSlashCommand: null });
 
         // Save session messages (sanitized for serialization safety)
-        const s = get();
-        if (s.currentSessionId) {
-          s.updateSession(resolveSessionWorkspaceKey(s.currentWorkspace), s.currentSessionId, { messages: sanitizeTaskBlocksForPersist(s.taskFlow) });
+        const s = sessionGet();
+        if (runSessionId) {
+          const messages = sanitizeTaskBlocksForPersist(s.taskFlow);
+          s.updateSession(runScopeKey, runSessionId, {
+            messages,
+            runtimeSnapshot: normalizeSessionRuntimeSnapshot({
+              taskFlow: messages,
+              agentMessages: sanitizeAgentMessagesForPersist(s.agentMessages),
+              conversationTurns: s.conversationTurns,
+              currentTurnId: s.currentTurnId,
+              selectedMainModeKey: s.selectedMainModeKey,
+              selectedNexusModeKey: s.selectedNexusModeKey,
+              activeStudioAgentKey: s.activeStudioAgentKey,
+              gameStudioInitialized: s.gameStudioInitialized,
+              pendingSlashCommand: s.pendingSlashCommand,
+              planArtifacts: s.planArtifacts,
+              planTasks: s.planTasks,
+              planExecutionEvidenceCount: s.planExecutionEvidenceCount,
+              planStage: s.planStage,
+              isPlanApproved: s.isPlanApproved,
+              showPlanPanel: s.showPlanPanel,
+              showDiff: s.showDiff,
+              showTerminal: s.showTerminal,
+              showFilePanel: s.showFilePanel,
+              rightPanelTab: s.rightPanelTab,
+              selectedDiffTaskId: s.selectedDiffTaskId,
+            }),
+          });
         }
       }).catch((err) => {
         clearInterval(timerInterval);
-        set({ pendingSlashCommand: null });
+        sessionSet({ pendingSlashCommand: null });
         console.error("Agent loop crashed:", err);
         if (remoteFeishu) {
-          const language = get().config.language === "en" ? "en" : "zh";
+          const language = sessionGet().config.language === "en" ? "en" : "zh";
           void invoke("send_feishu_message", {
             chatId: remoteFeishu.chatId,
             userId: remoteFeishu.userId,
@@ -5048,7 +5634,7 @@ export const useAppStore = create<AppState>()(
         }
         // Show crash as visible system block
         const crashId = nextId();
-        set((s) => ({
+        sessionSet((s) => ({
           taskFlow: [...s.taskFlow, {
             id: crashId,
             turnId,
@@ -5082,6 +5668,8 @@ export const useAppStore = create<AppState>()(
         config: state.config,
         skills: state.skills,
         sessionsByWorkspace: stripSessionsByWorkspaceForLocalPersist(state.sessionsByWorkspace),
+        workspaces: state.workspaces,
+        activeSessionByWorkspace: state.activeSessionByWorkspace,
         currentWorkspace: state.currentWorkspace,
         selectedWorkspace: state.selectedWorkspace,
         currentSessionId: state.currentSessionId,
@@ -5156,6 +5744,7 @@ export const useAppStore = create<AppState>()(
         cloudServers: persistedState.config?.cloudServers,
         activeCloudServerId: persistedState.config?.activeCloudServerId,
       });
+      const hydratedTaskFlow = sanitizeTaskBlocksForPersist(persistedState.taskFlow || []);
       return {
         ...current,
         ...persistedState,
@@ -5173,8 +5762,19 @@ export const useAppStore = create<AppState>()(
           imAdapters: normalizeImAdaptersConfig(persistedState.config?.imAdapters),
         },
         sessionsByWorkspace: normalizeSessionsByWorkspace(persistedState.sessionsByWorkspace),
-        taskFlow: sanitizeTaskBlocksForPersist(persistedState.taskFlow || []),
+        runtimeBySessionKey: {},
+        workspaces: normalizeWorkspaceEntries(
+          (persistedState as Partial<AppState>).workspaces,
+          normalizeSessionsByWorkspace(persistedState.sessionsByWorkspace),
+          persistedState.currentWorkspace || current.currentWorkspace,
+        ),
+        activeSessionByWorkspace: persistedState.activeSessionByWorkspace || {},
+        taskFlow: hydratedTaskFlow,
         agentMessages: sanitizeAgentMessagesForPersist(persistedState.agentMessages || []),
+        conversationTurns: normalizeInterruptedConversationTurnsForRestore(
+          persistedState.conversationTurns,
+          hydratedTaskFlow,
+        ),
         selectedWorkspace: persistedState.selectedWorkspace || persistedState.currentWorkspace || current.selectedWorkspace,
         selectedMainModeKey,
         selectedNexusModeKey: mapMainModeToLegacyNexusMode(selectedMainModeKey),
