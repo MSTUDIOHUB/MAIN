@@ -4043,6 +4043,20 @@ export const useAppStore = create<AppState>()(
       !isHidden &&
       currentTurn?.status === "awaiting_input";
     const selectedChoiceText = shouldArchiveChoiceFeedback ? text.trim() : "";
+    if (shouldArchiveChoiceFeedback) {
+      logStoreEvent("reply_options_archived", {
+        turnId,
+        sessionKey: runSessionKey,
+        workspace: runWorkspace || null,
+        selectedChoiceChars: selectedChoiceText.length,
+        optionBlocks: sessionGet().taskFlow.filter((block) =>
+          block.turnId === turnId &&
+          block.type === "agent" &&
+          Array.isArray(block.options) &&
+          block.options.length > 0
+        ).length,
+      });
+    }
     const userBlock: TaskBlock | null = isHidden
       ? null
       : {

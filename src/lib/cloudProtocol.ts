@@ -687,6 +687,16 @@ export function buildOpenAiResponsesRequestExtras(options?: {
   return extras;
 }
 
+export function convertOpenAiToolsToResponses(tools: ToolDefinition[] | undefined): Record<string, unknown>[] {
+  if (!tools || tools.length === 0) return [];
+  return normalizeToolDefinitions(tools).map((tool) => ({
+    type: "function",
+    name: tool.function.name,
+    description: tool.function.description,
+    parameters: normalizeToolParametersSchema(tool.function.parameters),
+  }));
+}
+
 export function convertOpenAiToolsToAnthropic(tools: ToolDefinition[] | undefined): AnthropicToolDefinition[] {
   if (!tools || tools.length === 0) return [];
   return normalizeToolDefinitions(tools).map((tool) => ({

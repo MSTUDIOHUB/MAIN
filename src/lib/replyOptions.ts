@@ -1,8 +1,9 @@
 import type { ReplyOption } from "./workflowModels";
 
 const USER_OPTIONS_BLOCK_RE = /<user_options>([\s\S]*?)<\/user_options>/gi;
-const OPTION_RE = /<option(?:\s+label="([^"]*)")?>([\s\S]*?)<\/option>/gi;
-const DECISION_CUE_RE = /(?:请选择|请确认|请告诉我|请说明|你可以选择|可选方案|下一步可以|选一个|选一项|任选其一|从下面.*选|would you like|do you want|please choose|please confirm|choose one|pick one|select one)/i;
+const OPTION_RE = /<option\b([^>]*)>([\s\S]*?)<\/option>/gi;
+const OPTION_ATTR_RE = /\b(label|value|text|title)\s*=\s*"([^"]*)"/gi;
+const DECISION_CUE_RE = /(?:请选择|请确认|请告诉我|请说明|你可以选择|可选方案|选项|方案|下一步可以|选一个|选一项|任选其一|从下面.*选|options?|choices?|would you like|do you want|please choose|please confirm|choose one|pick one|select one)/i;
 const ENUM_OPTION_RE = /^\s*(?:[-*]|(?:\d+|[A-Za-z])[\.\)、:：])\s+(.+?)\s*$/;
 const BINARY_SEPARATOR_RE = /\s*(?:，|,)?\s*(或者|还是|或是|\bor\b)\s*/i;
 const ENUMERATED_LINE_RE = /^\s*(?:[-*]|(?:\d+|[A-Za-z])[\.\)、:：])\s+/;
@@ -48,6 +49,18 @@ function addReplyOption(
   if (!label || !value || seenValues.has(value)) return;
   seenValues.add(value);
   replyOptions.push({ label, value, ...(action ? { action } : {}) });
+}
+
+function parseOptionAttributes(rawAttributes: string): Record<string, string> {
+  const attrs: Record<string, string> = {};
+  OPTION_ATTR_RE.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = OPTION_ATTR_RE.exec(rawAttributes || "")) !== null) {
+    const key = String(match[1] || "").toLowerCase();
+    const value = normalizeOptionText(match[2] || "");
+    if (key && value) attrs[key] = value;
+  }
+  return attrs;
 }
 
 function convertAssistantClauseToUserChoice(clause: string): string {
@@ -268,10 +281,12 @@ export function extractReplyOptions(text: string): {
 
       let optionMatch: RegExpExecArray | null;
       while ((optionMatch = OPTION_RE.exec(blockContent)) !== null) {
-        const attrLabel = normalizeOptionText(optionMatch[1] || "");
+        const attrs = parseOptionAttributes(optionMatch[1] || "");
+        const attrLabel = attrs.label || attrs.title || "";
+        const attrValue = attrs.value || attrs.text || "";
         const bodyValue = normalizeOptionText(optionMatch[2] || "");
-        const value = bodyValue || attrLabel;
-        const label = attrLabel || bodyValue;
+        const value = attrValue || bodyValue || attrLabel;
+        const label = attrLabel || bodyValue || attrValue;
 
         addReplyOption(replyOptions, seenValues, label, value);
       }
@@ -309,7 +324,6 @@ export function shouldPauseForReplyOptions(params: {
 }): boolean {
   const {
     replyOptions,
-    toolCallCount,
     workflowMode,
     hasStructuredProposal = false,
     hasReadyPlanArtifacts = false,
@@ -317,7 +331,6 @@ export function shouldPauseForReplyOptions(params: {
   } = params;
 
   if (!Array.isArray(replyOptions) || replyOptions.length === 0) return false;
-  if (toolCallCount > 0) return false;
 
   if (workflowMode === "plan" && !isPlanApproved && (hasStructuredProposal || hasReadyPlanArtifacts)) {
     return false;

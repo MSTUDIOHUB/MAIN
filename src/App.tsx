@@ -222,9 +222,14 @@ export default function App() {
   const setIsAddingSkill = useAppStore((s) => s.setIsAddingSkill);
   const setShowAgentPicker = useAppStore((s) => s.setShowAgentPicker);
 
-  const refreshSessionsForScope = useCallback(async (scopeKey: string) => {
+  const refreshSessionsForScope = useCallback(async (
+    scopeKey: string,
+    options: { rebuildIndex?: boolean } = {},
+  ) => {
     try {
-      const diskSessions = await listProjectSessions(scopeKey);
+      const diskSessions = options.rebuildIndex
+        ? await rebuildProjectSessionsIndex(scopeKey)
+        : await listProjectSessions(scopeKey);
       let mergedSessions = diskSessions;
       useAppStore.setState((state: any) => {
         const existing = state.sessionsByWorkspace[scopeKey] || [];
@@ -255,7 +260,7 @@ export default function App() {
       return mergedSessions;
     } catch (error) {
       appendDebugLog("warn", "session.storage", {
-        phase: "list_failed",
+        phase: options.rebuildIndex ? "rebuild_failed" : "list_failed",
         scopeKey,
         error: error instanceof Error ? error.message : String(error),
       });
@@ -567,11 +572,15 @@ export default function App() {
 
     const state = useAppStore.getState();
     const reuseCurrentTurn = !!sourceTurnId && sourceTurnId === state.currentTurnId;
+    const sourceTurnForLog = sourceTurnId
+      ? state.conversationTurns.find((turn) => turn.id === sourceTurnId) || null
+      : null;
     appendDebugLog("info", "ui.quickReply", {
       text,
       sourceTurnId,
       currentTurnId: state.currentTurnId,
       reuseCurrentTurn,
+      sourceTurnFound: !!sourceTurnForLog,
       currentTurnStatus: state.currentTurnId
         ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId)?.status
         : null,
@@ -579,11 +588,14 @@ export default function App() {
       agentMessages: state.agentMessages.length,
       optionAction: optionAction ?? null,
     });
-    const sourceTurn = state.currentTurnId
+    const sourceTurn = sourceTurnId
+      ? state.conversationTurns.find((turn) => turn.id === sourceTurnId) || null
+      : state.currentTurnId
       ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId) || null
       : null;
     const sourceIntent = resolveConversationTurnIntent(sourceTurn);
-    const sendOptions = reuseCurrentTurn
+    const shouldReuseSourceTurn = !!sourceTurnId && !!sourceTurn;
+    const sendOptions = shouldReuseSourceTurn
       ? {
           reuseCurrentTurn: true,
           preservePlanState: sourceIntent === "plan",
@@ -593,6 +605,7 @@ export default function App() {
       : undefined;
 
     useAppStore.setState({
+      ...(shouldReuseSourceTurn ? { currentTurnId: sourceTurnId } : {}),
       input: "",
       contextMentions: [],
       attachedFiles: [],
@@ -655,8 +668,8 @@ export default function App() {
         useAppStore.getState().config.language === "en" ? "Missing session" : "记录详情缺失",
       );
       const content = useAppStore.getState().config.language === "en"
-        ? "This session title still exists, but its transcript/runtime files are missing. Rebuild the session index or delete this orphan record."
-        : "这个会话标题还在，但完整对话与运行快照文件已经缺失。可以重建会话索引，或删除这条孤立记录。";
+        ? "This session title still exists, but its transcript/runtime files are missing. Re-adding the workspace refreshes the index, or you can delete this orphan record."
+        : "这个会话标题还在，但完整对话与运行快照文件已经缺失。重新添加工作区会刷新索引，也可以删除这条孤立记录。";
       useAppStore.setState({
         taskFlow: [{ id: blockId, type: "system" as const, content }],
         agentMessages: [],
@@ -872,7 +885,10 @@ export default function App() {
     setCurrentWorkspace(scopeKey === GLOBAL_CHAT_KEY ? "" : scopeKey);
   };
 
-  const handleOpenWorkspacePath = async (path: string, options: { selectFirstSession?: boolean } = {}) => {
+  const handleOpenWorkspacePath = async (
+    path: string,
+    options: { selectFirstSession?: boolean; rebuildIndex?: boolean } = {},
+  ) => {
     const rawPath = String(path || "").trim();
     if (!rawPath) return;
     try {
@@ -883,9 +899,11 @@ export default function App() {
       } catch {
         stablePath = await setWorkspaceRootIpc(rawPath);
       }
+      const wasKnownWorkspace = useAppStore.getState().workspaces.some((entry: any) => entry.path === stablePath);
+      const shouldRebuildIndex = options.rebuildIndex ?? !wasKnownWorkspace;
       addWorkspaceEntry(stablePath);
       const rememberedSessionId = useAppStore.getState().activeSessionByWorkspace[stablePath] ?? null;
-      const existing = await refreshSessionsForScope(stablePath);
+      const existing = await refreshSessionsForScope(stablePath, { rebuildIndex: shouldRebuildIndex });
       const targetSession =
         existing.find((session: any) => rememberedSessionId != null && session.id === rememberedSessionId) ||
         existing.find((session: any) => session.active) ||
@@ -1085,24 +1103,6 @@ export default function App() {
         selectedNexusModeKey: "nexus_general",
         pendingSlashCommand: null,
         planExecutionEvidenceCount: 0,
-      });
-    }
-  };
-
-  const handleRebuildSessionIndex = async (scopeKey: string) => {
-    try {
-      const sessions = await rebuildProjectSessionsIndex(scopeKey);
-      useAppStore.setState((state: any) => ({
-        sessionsByWorkspace: {
-          ...state.sessionsByWorkspace,
-          [scopeKey]: sessions,
-        },
-      }));
-    } catch (error) {
-      appendDebugLog("warn", "session.storage", {
-        phase: "rebuild_failed",
-        scopeKey,
-        error: error instanceof Error ? error.message : String(error),
       });
     }
   };
@@ -1608,20 +1608,28 @@ export default function App() {
           if (!isSidebarDrop) return;
 
           void (async () => {
-            const added: string[] = [];
+            const added: Array<{ path: string; rebuildIndex: boolean }> = [];
             let ignoredFiles = 0;
             for (const path of payload.paths || []) {
               try {
                 const stablePath = await canonicalizeWorkspacePath(path);
+                const wasKnownWorkspace = useAppStore.getState().workspaces.some((entry: any) => entry.path === stablePath);
                 addWorkspaceEntry(stablePath);
-                added.push(stablePath);
+                added.push({ path: stablePath, rebuildIndex: !wasKnownWorkspace });
               } catch {
                 ignoredFiles += 1;
                 // Dragging files is intentionally ignored here; only folders become workspaces.
               }
             }
             if (added.length > 0) {
-              await handleOpenWorkspacePathRef.current(added[0], { selectFirstSession: true });
+              const [firstWorkspace, ...backgroundWorkspaces] = added;
+              await handleOpenWorkspacePathRef.current(firstWorkspace.path, {
+                selectFirstSession: true,
+                rebuildIndex: firstWorkspace.rebuildIndex,
+              });
+              backgroundWorkspaces.forEach(({ path, rebuildIndex }) => {
+                if (rebuildIndex) void refreshSessionsForScope(path, { rebuildIndex: true });
+              });
             } else if (ignoredFiles > 0) {
               window.alert(languageRef.current === "en" ? "Drop folders to add workspaces." : "请拖拽文件夹来加入工作区。");
             }
@@ -1642,7 +1650,7 @@ export default function App() {
       disposed = true;
       safelyDispose(unlisten);
     };
-  }, [addWorkspaceEntry]);
+  }, [addWorkspaceEntry, refreshSessionsForScope]);
 
   return (
     <div className="flex h-screen w-full bg-[#000000] text-[#e4e4e7] font-sans text-sm overflow-hidden md:flex-row flex-col relative"
@@ -1672,7 +1680,6 @@ export default function App() {
         onCreateSession={handleCreateSessionForScope}
         onSelectSession={handleSelectSession}
         onDeleteSession={handleDeleteSession}
-        onRebuildSessions={handleRebuildSessionIndex}
       />
       <ChatArea taskFlow={taskFlow} t={t} config={config} setSettingsTab={setSettingsTab} setIsSettingsOpen={setIsSettingsOpen} activeDiffTask={activeDiffTask} endOfFlowRef={endOfFlowRef} isStreaming={isStreaming} elapsedTime={elapsedTime} activeSessionKey={activeSessionKey} onStopGeneration={handleStopGeneration} allowToolAction={allowToolAction} rejectToolAction={rejectToolAction} autoApproveTools={autoApproveTools} onToggleAutoApprove={setAutoApproveTools} input={input} setInput={setInput} contextMentions={contextMentions} setContextMentions={setContextMentions} attachedFiles={attachedFiles} setAttachedFiles={setAttachedFiles} onAttachFile={handleAttachFile} showAgentPicker={showAgentPicker} setShowAgentPicker={setShowAgentPicker} selectedMainModeKey={selectedMainModeKey} setSelectedMainModeKey={setSelectedMainModeKey} mainModes={mainModes} activeStudioAgentKey={activeStudioAgentKey} setActiveStudioAgentKey={setActiveStudioAgentKey} gameStudioInitialized={gameStudioInitialized} initializeGameStudioWorkspace={initializeGameStudioWorkspace} removeGameStudioWorkspace={removeGameStudioWorkspace} currentWorkspace={currentWorkspace} handleAcceptInline={handleAcceptInline} handleRejectInline={handleRejectInline} onSendMessage={handleSendMessage} onQuickReply={handleQuickReply} />
       <RightPanel activeDiffTask={activeDiffTask} rightPanelWidth={rightPanelWidth} startResizing={startResizing} />

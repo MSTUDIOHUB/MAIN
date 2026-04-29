@@ -5,6 +5,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 export interface PtyDataPayload {
   sessionKey?: string;
+  session_key?: string;
   chunk: string;
 }
 
@@ -379,10 +380,22 @@ export function getPtyStatus(sessionKey?: string): Promise<PtyStatus> {
   return invoke<PtyStatus>("get_pty_status", { sessionKey });
 }
 
+function normalizePtySessionKeyForEvent(sessionKey?: string): string {
+  const raw = String(sessionKey || "").trim() || "__MAIN_DEFAULT_PTY__";
+  const sanitized = Array.from(raw)
+    .map((ch) => /[A-Za-z0-9_.-]/.test(ch) ? ch : "_")
+    .join("");
+  const trimmed = sanitized.replace(/^_+|_+$/g, "");
+  return trimmed || "session";
+}
+
 export function onPtyData(handler: (chunk: string) => void, sessionKey?: string): Promise<UnlistenFn> {
+  const expectedSessionKey = sessionKey ? normalizePtySessionKeyForEvent(sessionKey) : null;
   return listen<PtyDataPayload>("pty-data", (event) => {
-    if (sessionKey && event.payload.sessionKey !== sessionKey) return;
-    handler(event.payload.chunk);
+    const payload = event.payload || { chunk: "" };
+    const payloadSessionKey = payload.sessionKey || payload.session_key;
+    if (expectedSessionKey && normalizePtySessionKeyForEvent(payloadSessionKey) !== expectedSessionKey) return;
+    handler(payload.chunk);
   });
 }
 

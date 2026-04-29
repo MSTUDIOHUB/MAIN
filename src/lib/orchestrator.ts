@@ -405,6 +405,50 @@ function buildPlanFallbackNotice(language: "zh" | "en", sourceChars: number): st
     : `The model produced about ${formatted} characters of planning text but did not create reviewable plan files. MAIN will ask it to write real \`.MAIN/plans/requirements.md\` and \`.MAIN/plans/design.md\` artifacts through tools, or ask you for the key decision first; tool logs and truncated text will not be forced into plan files.`;
 }
 
+function looksLikeToolUnavailableClaim(text: string): boolean {
+  const normalized = String(text || "").replace(/\s+/g, " ").trim().toLowerCase();
+  if (!normalized) return false;
+  const toolClaim =
+    /没有(?:可用|可以调用|能调用|任何)?(?:的)?工具/.test(normalized) ||
+    /无法(?:访问|读取|查看|打开|调用|使用).*(?:文件|目录|工作区|工具|本地)/.test(normalized) ||
+    /不能(?:访问|读取|查看|打开|调用|使用).*(?:文件|目录|工作区|工具|本地)/.test(normalized) ||
+    /(?:no|without|lack|lacks|do not have|don't have|cannot|can't|unable to).{0,80}(?:tool|function|file|folder|filesystem|workspace|local)/i.test(normalized) ||
+    /(?:tool|function|file|folder|filesystem|workspace|local).{0,80}(?:unavailable|not available|not accessible|unsupported|disabled)/i.test(normalized);
+  return toolClaim;
+}
+
+function buildToolUnavailableRecoveryPrompt(language: "zh" | "en", workflowMode: "chat" | "edit" | "plan"): string {
+  const writeAllowed = workflowMode === "chat"
+    ? language === "zh"
+      ? "当前是聊天回合，除非用户明确要求实现或修改，先只使用只读工具。"
+      : "This is a chat turn, so use read-only tools unless the user explicitly asked for implementation or edits."
+    : language === "zh"
+    ? "如果用户要求实现、修复或计划落盘，可以使用写入/执行工具。"
+    : "If the user asked for implementation, fixes, or plan artifacts, write/execute tools are available.";
+
+  return language === "zh"
+    ? [
+        "上一条回复把云端原生 function tools 不可用误解成 MAIN 没有工具。请纠正：MAIN 内置工具可通过 XML `<tool_use>` 调用。",
+        "不要再声称无法访问工作区、文件或工具；如果需要上下文，请立即调用合适的 XML 工具。",
+        writeAllowed,
+        "可用示例：",
+        "<tool_use>",
+        "<tool>read_file</tool>",
+        "<parameter name=\"path\">README.md</parameter>",
+        "</tool_use>",
+      ].join("\n")
+    : [
+        "The previous reply confused native function-tools support with MAIN tool availability. Correct this: MAIN built-in tools are available through XML `<tool_use>` calls.",
+        "Do not claim that workspace files or tools are unavailable; if context is needed, immediately call the appropriate XML tool.",
+        writeAllowed,
+        "Example:",
+        "<tool_use>",
+        "<tool>read_file</tool>",
+        "<parameter name=\"path\">README.md</parameter>",
+        "</tool_use>",
+      ].join("\n");
+}
+
 function stripControlPromptForPlanFallback(text: string): string {
   return String(text || "")
     .replace(/^本轮处于 PLAN 模式。[\s\S]*?\n\n/i, "")
@@ -1353,8 +1397,7 @@ export async function executeAgentLoop(
   const isCloudProfile = config.activeProfile === "cloud";
   const skills = callbacks.getSkills();
   const initialMessages = callbacks.getMessages();
-  const supportsNativeTools = !(isCloudProfile && config.cloud.apiFormat === "responses");
-  const nativeToolsEnabled = supportsNativeTools && !hasProviderNativeToolsDisabled(initialMessages);
+  const nativeToolsEnabled = !hasProviderNativeToolsDisabled(initialMessages);
   const settings = deriveStreamSettings(config);
   const workspace = config.workspace;
   const mainModeKey = callbacks.getMainModeKey();
@@ -1369,6 +1412,7 @@ export async function executeAgentLoop(
     hasApiKey: !!settings.apiKey,
     provider: settings.provider,
     nativeToolsEnabled,
+    xmlToolsEnabled: true,
   }));
 
   // ── Config Snapshot ──────────────────────────────────────────────
@@ -1396,7 +1440,7 @@ export async function executeAgentLoop(
   // Build merged tool definitions: built-in tools + active skill-based tools + MCP tools
   const allTools = buildToolDefinitions(skills, mcpTools);
   const resolveLlmTools = () =>
-    supportsNativeTools && !hasProviderNativeToolsDisabled(callbacks.getMessages()) ? allTools : [];
+    !hasProviderNativeToolsDisabled(callbacks.getMessages()) ? allTools : [];
   const turnIntent = callbacks.getCurrentRunIntent();
   const workflowMode = callbacks.getWorkflowMode();
   const associatedPaths = callbacks.getAssociatedPaths();
@@ -1532,6 +1576,7 @@ export async function executeAgentLoop(
       : 2;
   let sawPlanModeToolActivity = false;
   let usedPlanRecoveryPrompt = false;
+  let usedToolUnavailableRecoveryPrompt = false;
   const attemptedPlanWriteTargets: string[] = [];
 
   // ── Strict Repeat Guard ──────────────────────────────────────────
@@ -1583,6 +1628,9 @@ export async function executeAgentLoop(
     messagesLen: callbacks.getMessages().length,
     allTools: allTools.length,
     mcpTools: mcpTools.length,
+    builtinAndSkillTools: Math.max(0, allTools.length - mcpTools.length),
+    nativeToolsEnabled: !hasProviderNativeToolsDisabled(callbacks.getMessages()),
+    xmlToolsEnabled: true,
     maxOutputEscalations,
   });
 
@@ -1637,7 +1685,10 @@ export async function executeAgentLoop(
       workflowMode,
       turnIntent,
       messagesLen: managedAgentMessages.length,
+      allTools: allTools.length,
       llmTools: llmTools.length,
+      xmlToolsEnabled: true,
+      mcpTools: mcpTools.length,
       currentMaxTokens: currentMaxTokens ?? "default",
     });
 
@@ -1841,11 +1892,21 @@ export async function executeAgentLoop(
         callbacks.onStatusChange("error");
         return;
       } else if (isCompatibilityError) {
-        console.log("[orchestrator] Provider compatibility retry: flattening history for cloud request");
+        console.log("[orchestrator] Provider compatibility retry: disabling native tools and enabling XML tool_use");
         const compatibilityMessages = ensureProviderCompatibilityMode(
           buildCompatibilityRetryMessages(managedAgentMessages),
           workflowMode,
         );
+        callbacks.replaceMessages(compatibilityMessages);
+        logAgentEvent("native_tool_fallback", {
+          iteration,
+          nativeToolsAttempted: nativeToolsWereAttempted,
+          allTools: allTools.length,
+          llmToolsBeforeFallback: llmTools.length,
+          llmToolsAfterFallback: 0,
+          xmlToolsEnabled: true,
+          reason: errMsg.slice(0, 240),
+        });
 
         try {
           streamResult = await fetchLLMStream(
@@ -1854,7 +1915,7 @@ export async function executeAgentLoop(
             assistantMsgId,
             callbacks,
             abortController.signal,
-            llmTools,
+            [],
             currentMaxTokens,
             maxOutputEscalations,
           );
@@ -2053,6 +2114,41 @@ export async function executeAgentLoop(
     const finalReplyOptions = compactedProseCodeDump || autoContinueReadOnlyPermission ? [] : normalized.replyOptions;
     const historyAssistantText = finalVisibleText || "";
 
+    if (finalReplyOptions.length > 0) {
+      logAgentEvent("reply_options_detected", {
+        iteration,
+        replyOptions: finalReplyOptions.length,
+        toolCalls: effectiveToolCalls.length,
+        workflowMode,
+        turnIntent,
+      });
+    }
+
+    const shouldRecoverToolUnavailableClaim =
+      isCloudProfile &&
+      allTools.length > 0 &&
+      effectiveToolCalls.length === 0 &&
+      finalReplyOptions.length === 0 &&
+      !compactedProseCodeDump &&
+      looksLikeToolUnavailableClaim(finalVisibleText);
+
+    if (shouldRecoverToolUnavailableClaim && !usedToolUnavailableRecoveryPrompt) {
+      usedToolUnavailableRecoveryPrompt = true;
+      logAgentEvent("tool_unavailable_claim_reprompt", {
+        iteration,
+        allTools: allTools.length,
+        llmTools: llmTools.length,
+        xmlToolsEnabled: true,
+        visibleChars: finalVisibleText.length,
+      });
+      callbacks.onStatusChange("running");
+      callbacks.appendMessage({
+        role: "user",
+        content: buildToolUnavailableRecoveryPrompt(callbacks.getPreferredLanguage(), workflowMode),
+      });
+      continue;
+    }
+
     if (compactedProseCodeDump) {
       logAgentEvent("prose_code_dump_compacted", {
         iteration,
@@ -2107,7 +2203,7 @@ export async function executeAgentLoop(
     const hasReadyPlanArtifacts = currentPlanStageForReview === "ready_to_execute";
     const hasReviewablePlanArtifacts = isReviewablePlanStage(currentPlanStageForReview);
     const shouldPauseForUserChoice = shouldPauseForReplyOptions({
-      replyOptions: normalized.replyOptions,
+      replyOptions: finalReplyOptions,
       toolCallCount: effectiveToolCalls.length,
       workflowMode,
       hasStructuredProposal,
@@ -2131,13 +2227,20 @@ export async function executeAgentLoop(
     });
 
     // 4. Handle turn termination or continuation
-    if (effectiveToolCalls.length === 0) {
-        if (shouldPauseForUserChoice) {
-          callbacks.appendMessage({ role: "assistant", content: assistantHistoryText });
-          callbacks.onStatusChange("idle");
-          return;
-        }
+    if (shouldPauseForUserChoice) {
+      logAgentEvent("reply_options_pause", {
+        iteration,
+        replyOptions: finalReplyOptions.length,
+        droppedToolCalls: effectiveToolCalls.length,
+        workflowMode,
+        turnIntent,
+      });
+      callbacks.appendMessage({ role: "assistant", content: assistantHistoryText });
+      callbacks.onStatusChange("idle");
+      return;
+    }
 
+    if (effectiveToolCalls.length === 0) {
         // ── Plan Mode Interception ────────────────────────────────
         // In Plan mode, only enter review when the model has either:
         // 1. submitted a valid top-level proposal payload, or

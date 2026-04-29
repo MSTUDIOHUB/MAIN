@@ -21,6 +21,7 @@ import {
   buildCloudMessagesApiUrl,
   compactCloudResponsesInstructions,
   compactCloudResponsesMessages,
+  convertOpenAiToolsToResponses,
   createAnthropicStreamProcessor,
   extractOpenAiResponseText,
   finalizeStreamedToolCalls,
@@ -34,7 +35,7 @@ import {
 import { computeContextBudgets } from "./contextTrim";
 import { isCloudGatewayTimeoutMessage, isRetryableCloudErrorMessage } from "./cloudRetry";
 import { toError } from "./errorUtils";
-import { isProviderCompatibilityErrorMessage, PROVIDER_COMPATIBILITY_TAG } from "./providerCompatibility";
+import { isNativeToolCompatibilityErrorMessage, isProviderCompatibilityErrorMessage, PROVIDER_COMPATIBILITY_TAG } from "./providerCompatibility";
 
 /** Multimodal content parts (OpenAI-compatible). */
 interface TextContentPart {
@@ -395,6 +396,54 @@ function extractOpenAiChatCompletionToolCalls(payload: unknown): StreamedToolCal
   });
 }
 
+function extractOpenAiResponsesToolCalls(payload: unknown): StreamedToolCall[] {
+  const calls: StreamedToolCall[] = [];
+  const visited = new Set<unknown>();
+
+  const visit = (value: unknown) => {
+    if (!value || typeof value !== "object" || visited.has(value)) return;
+    visited.add(value);
+
+    if (Array.isArray(value)) {
+      value.forEach(visit);
+      return;
+    }
+
+    const item = value as Record<string, unknown>;
+    const type = typeof item.type === "string" ? item.type : "";
+    const name = typeof item.name === "string" ? item.name.trim() : "";
+    const rawArguments = item.arguments ?? item.input;
+    const looksLikeFunctionCall =
+      type === "function_call" ||
+      type === "tool_call" ||
+      (name && Object.prototype.hasOwnProperty.call(item, "arguments"));
+
+    if (looksLikeFunctionCall && name) {
+      const index = calls.length;
+      const callId =
+        typeof item.call_id === "string" && item.call_id.trim()
+          ? item.call_id
+          : typeof item.id === "string" && item.id.trim()
+          ? item.id
+          : `responses_call_${index + 1}`;
+      calls.push({
+        index,
+        id: callId,
+        name,
+        arguments: typeof rawArguments === "string"
+          ? rawArguments
+          : JSON.stringify(rawArguments ?? {}),
+      });
+      return;
+    }
+
+    Object.values(item).forEach(visit);
+  };
+
+  visit(payload);
+  return calls;
+}
+
 function extractOpenAiChatCompletionFinishReason(payload: unknown): StreamResult["finishReason"] {
   if (!payload || typeof payload !== "object") return "stop";
   const choices = (payload as { choices?: unknown }).choices;
@@ -484,6 +533,9 @@ async function requestOpenAiNonStreaming(
       const inputCandidates = buildOpenAiResponsesInputCandidates(protocolMessages);
       const rawInstructions = extractOpenAiResponsesInstructions(protocolMessages);
       const instructions = compactCloudResponsesInstructions(rawInstructions);
+      const responseTools = !minimalCompatibilityMode && tools && tools.length > 0
+        ? convertOpenAiToolsToResponses(tools)
+        : [];
       let lastCompatibilityError: Error | null = null;
       let sawRetryableGatewayTimeout = false;
       let gatewayTimeoutRetryUsed = false;
@@ -503,7 +555,9 @@ async function requestOpenAiNonStreaming(
             instructionsLen: instructions?.length ?? 0,
             rawInstructionsLen: rawInstructions?.length ?? 0,
             reasoningEffort: settings.reasoningEffort ?? "none",
+            nativeTools: candidate.mode !== "transcript_text" ? responseTools.length : 0,
           }));
+          const candidateTools = candidate.mode !== "transcript_text" ? responseTools : [];
           payload = await postJsonRequest(
             apiUrl,
             headers,
@@ -511,6 +565,7 @@ async function requestOpenAiNonStreaming(
               model: settings.model,
               input: candidate.input,
               ...(instructions ? { instructions } : {}),
+              ...(candidateTools.length > 0 ? { tools: candidateTools } : {}),
               ...buildOpenAiResponsesRequestExtras({
                 disableResponseStorage: settings.disableResponseStorage,
                 reasoningEffort: settings.reasoningEffort,
@@ -526,6 +581,9 @@ async function requestOpenAiNonStreaming(
         } catch (err) {
           const errMsg = err instanceof Error ? err.message : String(err);
           lastCompatibilityError = err instanceof Error ? err : new Error(errMsg);
+          if (responseTools.length > 0 && candidate.mode !== "transcript_text" && isNativeToolCompatibilityErrorMessage(errMsg)) {
+            throw lastCompatibilityError;
+          }
           const isRetryableGatewayError = isRetryableCloudErrorMessage(errMsg);
           if (isRetryableGatewayError) {
             sawRetryableGatewayTimeout = true;
@@ -570,13 +628,15 @@ async function requestOpenAiNonStreaming(
     const content = extractOpenAiResponseText(payload, apiFormat);
     const toolCalls = apiFormat === "chat_completions"
       ? extractOpenAiChatCompletionToolCalls(payload)
-      : [];
+      : extractOpenAiResponsesToolCalls(payload);
     const result: StreamResult = {
       content,
       toolCalls,
-      finishReason: apiFormat === "chat_completions"
-        ? extractOpenAiChatCompletionFinishReason(payload)
-        : "stop",
+      finishReason: toolCalls.length > 0
+        ? "tool_calls"
+        : apiFormat === "chat_completions"
+          ? extractOpenAiChatCompletionFinishReason(payload)
+          : "stop",
     };
 
     if (content) onToken(content);

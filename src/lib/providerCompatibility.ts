@@ -36,8 +36,28 @@ export function isProviderCompatibilityErrorMessage(message: string): boolean {
     normalized.includes("unsupported content type") ||
     normalized.includes("invalid_request_error") ||
     normalized.includes("invalid type for") ||
+    normalized.includes("unsupported parameter") ||
+    normalized.includes("unknown parameter") ||
+    normalized.includes("unrecognized request argument") ||
+    normalized.includes("unrecognized field") ||
     normalized.includes("messages[") ||
-    normalized.includes("tool_calls")
+    normalized.includes("tool_calls") ||
+    normalized.includes("\"tools\"") ||
+    normalized.includes("'tools'") ||
+    normalized.includes(" tools ")
+  );
+}
+
+export function isNativeToolCompatibilityErrorMessage(message: string): boolean {
+  const normalized = String(message || "").toLowerCase();
+  if (!isProviderCompatibilityErrorMessage(normalized)) return false;
+  return (
+    normalized.includes("tool_calls") ||
+    normalized.includes("\"tools\"") ||
+    normalized.includes("'tools'") ||
+    normalized.includes(" tools ") ||
+    normalized.includes("function_call") ||
+    normalized.includes("function tools")
   );
 }
 
@@ -58,8 +78,9 @@ function buildProviderCompatibilityInstructionText(
   workflowMode: "chat" | "edit" | "plan",
 ): string {
   const sharedToolAccess = [
-    "Tool access is available through XML tool calls even though native JSON tool calls are disabled for this provider.",
-    "You may access the current workspace folder through these XML tools:",
+    "MAIN tools are still available through XML tool calls even when this cloud endpoint does not support native function/tools payloads.",
+    "Use XML tools for workspace access; do not say tools, files, or folder access are unavailable.",
+    "Available XML tools include:",
     "- read_file: read a file under the workspace.",
     "- list_directory, glob_search, grep_search: inspect folders and search files under the workspace.",
     "- write_file: create or overwrite a workspace file. This is allowed when the user asks for implementation or file changes.",
@@ -72,7 +93,7 @@ function buildProviderCompatibilityInstructionText(
     return [
       PROVIDER_COMPATIBILITY_TAG,
       "native_tools_disabled=true",
-      "The current cloud provider rejects native tools / tool_calls payloads, so MAIN exposes tools through XML tool calls instead.",
+      "Native function/tools payloads are disabled for this endpoint; XML <tool_use> is enabled.",
       ...sharedToolAccess,
       "When tool use is necessary, you MUST emit XML tool calls in this exact format:",
       "<tool_use>",
@@ -86,7 +107,7 @@ function buildProviderCompatibilityInstructionText(
   return [
     PROVIDER_COMPATIBILITY_TAG,
     "native_tools_disabled=true",
-    "The current cloud provider rejects native tools / tool_calls payloads, so MAIN exposes tools through XML tool calls instead.",
+    "Native function/tools payloads are disabled for this endpoint; XML <tool_use> is enabled.",
     ...sharedToolAccess,
     "When tool use is necessary, you MUST emit XML tool calls in this exact format:",
     "<tool_use>",

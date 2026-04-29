@@ -48,7 +48,6 @@ interface SidebarProps {
   onCreateSession: (scopeKey: string) => void;
   onSelectSession: (scopeKey: string, id: number) => void;
   onDeleteSession: (scopeKey: string, id: number) => void;
-  onRebuildSessions?: (scopeKey: string) => void;
   onStartResizing?: (e: React.MouseEvent) => void;
 }
 
@@ -85,7 +84,6 @@ export default function Sidebar({
   onCreateSession,
   onSelectSession,
   onDeleteSession,
-  onRebuildSessions,
   onRemoveWorkspaceEntry,
   onStartResizing,
 }: SidebarProps) {
@@ -301,17 +299,6 @@ export default function Sidebar({
                           <span className="h-1.5 w-1.5 rounded-full bg-[var(--accent)]" title={status} />
                         )}
                         <span className="text-[10px] text-[#71717a]">{sessions.length}</span>
-                        <button
-                          type="button"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            workspacePath && onRebuildSessions?.(workspacePath);
-                          }}
-                          className="rounded p-1 text-[#71717a] opacity-60 transition-opacity hover:bg-[#27272a] hover:text-[#e4e4e7] group-hover:opacity-100"
-                          title={config.language === "en" ? "Rebuild conversation index" : "重建会话索引"}
-                        >
-                          <IconBook className="h-3 w-3" />
-                        </button>
                         <button
                           type="button"
                           onClick={(e) => {

@@ -16,6 +16,8 @@ const CLOUD_STATUS_ACTIVE_SERVER_MODEL_SCENARIO = "cloud-status-active-server-mo
 const STREAMING_TIMER_SCENARIO = "streaming-timer";
 const STREAM_ERROR_RECOVERY_SCENARIO = "stream-error-recovery";
 const SESSION_AUTO_CREATE_SCENARIO = "session-auto-create";
+const CLOUD_TOOL_FALLBACK_SCENARIO = "cloud-tool-fallback";
+const REPLY_OPTIONS_TOOL_PAUSE_SCENARIO = "reply-options-tool-pause";
 const E2E_SEED_COUNT_PREFIX = "__CODELY_E2E_SEED_COUNT__:";
 
 function getScenarioName(): string | null {
@@ -1618,6 +1620,133 @@ function seedStreamErrorRecoveryScenario() {
   return cleanup;
 }
 
+function seedCloudToolProtocolScenario(scenario: string) {
+  const bridge = getBridge();
+  if (!bridge) return undefined;
+
+  bridge.events = [{ type: "boot" }];
+  bridge.savedDocuments = [];
+  bridge.completed = false;
+
+  incrementSeedCount(scenario);
+
+  const now = Date.now();
+  const workspace = `/tmp/e2e-${scenario}`;
+  const sessionId = scenario === CLOUD_TOOL_FALLBACK_SCENARIO ? 999501 : 999502;
+  const server = {
+    id: `e2e-${scenario}-server`,
+    name: "E2E Cloud",
+    protocol: "openai" as const,
+    apiFormat: "responses" as const,
+    provider: "OpenAI",
+    endpoint: "https://e2e-cloud.example/v1",
+    model: "e2e-cloud-model",
+    apiKey: "e2e-key",
+    customHeaders: "",
+    temperature: 0.2,
+    topP: 0.95,
+    disableResponseStorage: true,
+    reasoningEffort: "none" as const,
+  };
+
+  useAppStore.setState((state) => ({
+    ...state,
+    config: {
+      ...state.config,
+      language: "zh",
+      workflowMode: "chat",
+      activeProfile: "cloud",
+      workspace,
+      cloud: server,
+      cloudServers: [server],
+      activeCloudServerId: server.id,
+      instructionsEnabled: true,
+      hooksEnabled: false,
+      sessionRecordingEnabled: false,
+    },
+    currentWorkspace: workspace,
+    selectedWorkspace: workspace,
+    sessionsByWorkspace: {
+      [workspace]: [
+        {
+          id: sessionId,
+          title: scenario === CLOUD_TOOL_FALLBACK_SCENARIO ? "E2E Cloud Tool Fallback" : "E2E Reply Options Tool Pause",
+          date: new Date(now).toISOString(),
+          active: true,
+          storageStatus: "temporary",
+          recordingDisabled: true,
+          messages: [],
+        },
+      ],
+    },
+    currentSessionId: sessionId,
+    selectedMainModeKey: "main_mode",
+    selectedNexusModeKey: "nexus_general",
+    taskFlow: [],
+    agentMessages: [],
+    conversationTurns: [],
+    currentTurnId: null,
+    input: "",
+    attachedFiles: [],
+    contextMentions: [],
+    readOnlyAutoApproveForSession: false,
+    isGenerating: false,
+    agentStatus: "idle",
+    elapsedTime: 0,
+    showDiff: false,
+    showPlanPanel: false,
+    showTerminal: false,
+    showFilePanel: false,
+    selectedDiffTaskId: null,
+  }));
+
+  bridge.sendCloudMessage = (text?: string) => {
+    return useAppStore.getState().sendMessage(
+      text || "请读取 README.md 并告诉我是否包含 fallback-ok。",
+      undefined,
+      {
+        resolvedIntent: "discuss",
+        skipIntentResolution: true,
+      },
+    );
+  };
+
+  bridge.getSnapshot = () => {
+    const state = useAppStore.getState();
+    const currentTurn = state.currentTurnId
+      ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId) || null
+      : null;
+    const agentBlocks = state.taskFlow.filter((block) => block.type === "agent") as any[];
+    const optionBlocks = agentBlocks.filter((block) => Array.isArray(block.options) && block.options.length > 0);
+    const archivedOptionBlocks = agentBlocks.filter((block) => block.archivedAfterChoice);
+    const toolBlocks = state.taskFlow.filter((block) => block.type === "tool") as any[];
+
+    return {
+      agentStatus: state.agentStatus,
+      isGenerating: state.isGenerating,
+      currentTurnStatus: currentTurn?.status ?? null,
+      conversationTurns: state.conversationTurns.length,
+      taskFlowBlocks: state.taskFlow.length,
+      taskFlowUserCount: state.taskFlow.filter((block) => block.type === "user").length,
+      agentTexts: agentBlocks.map((block) => block.content),
+      optionBlockCount: optionBlocks.length,
+      optionLabels: optionBlocks.flatMap((block) => (block.options || []).map((option: any) => option.label)),
+      archivedOptionCount: archivedOptionBlocks.length,
+      selectedOptions: archivedOptionBlocks.map((block) => block.selectedOption).filter(Boolean),
+      toolNames: toolBlocks.map((block) => block.toolName),
+      toolTargets: toolBlocks.map((block) => block.target),
+      seedCount: readSeedCount(scenario),
+    };
+  };
+
+  const cleanup = () => {
+    bridge.initialized = false;
+  };
+
+  bridge.cleanup = cleanup;
+  return cleanup;
+}
+
 function seedSessionAutoCreateScenario() {
   const bridge = getBridge();
   if (!bridge) return undefined;
@@ -1925,6 +2054,14 @@ export function initializeE2EScenarios(): (() => void) | undefined {
 
   if (scenario === STREAM_ERROR_RECOVERY_SCENARIO) {
     return seedStreamErrorRecoveryScenario();
+  }
+
+  if (scenario === CLOUD_TOOL_FALLBACK_SCENARIO) {
+    return seedCloudToolProtocolScenario(CLOUD_TOOL_FALLBACK_SCENARIO);
+  }
+
+  if (scenario === REPLY_OPTIONS_TOOL_PAUSE_SCENARIO) {
+    return seedCloudToolProtocolScenario(REPLY_OPTIONS_TOOL_PAUSE_SCENARIO);
   }
 
   if (scenario === SESSION_AUTO_CREATE_SCENARIO) {
