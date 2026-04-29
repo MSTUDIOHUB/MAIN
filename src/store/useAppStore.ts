@@ -81,10 +81,13 @@ import {
 import {
   createPendingDecisionCopy,
   getIntentPolicy,
+  looksLikePlanContinuationOrApprovalInput,
+  looksLikePreviousTurnContinuationInput,
   resolveConversationTurnIntent,
   resolveRunIntentFromLegacyWorkflowMode,
   resolveTurnRunIntent,
   parseMainIntentShortcut,
+  shouldContinuePreviousTurnFromInput,
   shouldUseBlockingIntentPreflight,
   type ExecutionConsentPolicy,
   type MainIntentShortcut,
@@ -104,6 +107,19 @@ import {
   type FeishuPendingPairing,
   type ImAdaptersConfig,
 } from "../lib/imAdapters";
+import {
+  appendTaskCenterRunLog,
+  createDefaultTaskCenterState,
+  createTaskCenterTask,
+  finishTaskCenterRun,
+  normalizeTaskCenterState,
+  pickNextTaskCenterTask,
+  startTaskCenterRun,
+  type TaskCenterIntent,
+  type TaskCenterState,
+  type TaskCenterTask,
+  type TaskCenterTaskStatus,
+} from "../lib/taskCenter";
 
 function logStoreEvent(event: string, data: Record<string, unknown> = {}) {
   try {
@@ -144,6 +160,7 @@ export const translations = {
     switchMainMode: "MAIN Mode",
     runMode: "Run Mode",
     main_mode: "MAIN Mode",
+    task_center: "Task Center",
     game_studio: "Game Studio",
     nexus_general: "General Collaboration",
     nexus_create: "Creative Co-Creation",
@@ -227,6 +244,7 @@ export const translations = {
     switchMainMode: "MAIN 模式",
     runMode: "工作方式",
     main_mode: "MAIN 模式",
+    task_center: "任务中枢",
     game_studio: "游戏工作室",
     nexus_general: "通用协作",
     nexus_create: "创意共创",
@@ -378,8 +396,10 @@ export interface SessionRuntimeSnapshot {
   showDiff: boolean;
   showTerminal: boolean;
   showFilePanel: boolean;
+  showTaskCenterPanel: boolean;
   rightPanelTab: RightPanelTab;
   selectedDiffTaskId: number | null;
+  taskCenter: TaskCenterState;
 }
 
 export interface SessionRuntimeState extends SessionRuntimeSnapshot {
@@ -403,6 +423,7 @@ export interface SessionRuntimeState extends SessionRuntimeSnapshot {
   pendingReviewResolve: ((decision: ReviewDecision) => void) | null;
   pendingReviewTaskId: number | null;
   pendingToolCall: { name: string; arguments: Record<string, unknown> } | null;
+  taskCenterActiveTaskId: string | null;
   showFilePanel: boolean;
   fileViewerPath: string;
   fileViewerContent: string;
@@ -535,6 +556,7 @@ interface AppState {
   showDiff: boolean;
   showPlanPanel: boolean;
   showTerminal: boolean;
+  showTaskCenterPanel: boolean;
   rightPanelTab: RightPanelTab;
   rightPanelWidth: number;
   sidebarWidth: number;
@@ -544,6 +566,7 @@ interface AppState {
   setShowDiff: (v: boolean) => void;
   setShowPlanPanel: (v: boolean) => void;
   setShowTerminal: (v: boolean) => void;
+  setShowTaskCenterPanel: (v: boolean) => void;
   showFilePanel: boolean;
   fileViewerPath: string;
   fileViewerContent: string;
@@ -716,6 +739,27 @@ interface AppState {
   showWorkflowMenu: boolean;
   setShowWorkflowMenu: (v: boolean) => void;
 
+  // Task Center
+  taskCenter: TaskCenterState;
+  taskCenterActiveTaskId: string | null;
+  setTaskCenterState: (updater: TaskCenterState | ((prev: TaskCenterState) => TaskCenterState)) => void;
+  createTaskCenterTask: (input: {
+    prompt: string;
+    title?: string;
+    source?: TaskCenterTask["source"];
+    contextMentions?: string[];
+    attachedFiles?: string[];
+    imageCount?: number;
+    workspace?: string | null;
+  }) => string;
+  selectTaskCenterTask: (taskId: string | null) => void;
+  updateTaskCenterTaskStatus: (taskId: string, status: TaskCenterTaskStatus, message?: string) => void;
+  cancelTaskCenterTask: (taskId: string) => void;
+  retryTaskCenterTask: (taskId: string) => void;
+  runTaskCenterTask: (taskId: string, intent?: TaskCenterIntent) => void;
+  runNextTaskCenterTask: () => void;
+  appendTaskCenterLog: (taskId: string, message: string, level?: "info" | "warning" | "error") => void;
+
   // Elapsed time tracking
   elapsedTime: number;
 
@@ -762,7 +806,7 @@ interface AppState {
       attachedFilesSnapshot?: string[];
       remoteFeishu?: FeishuRemoteContext;
     },
-  ) => void;
+  ) => boolean;
   // Resume loop after human review
   _nextTaskId: () => number;
 
@@ -978,8 +1022,10 @@ function normalizeSessionRuntimeSnapshot(
     showDiff: snapshot.showDiff ?? false,
     showTerminal: snapshot.showTerminal ?? false,
     showFilePanel: snapshot.showFilePanel ?? false,
+    showTaskCenterPanel: snapshot.showTaskCenterPanel ?? false,
     rightPanelTab: snapshot.rightPanelTab ?? "plan",
     selectedDiffTaskId: snapshot.selectedDiffTaskId ?? null,
+    taskCenter: normalizeTaskCenterState(snapshot.taskCenter),
   };
 }
 
@@ -1002,8 +1048,11 @@ const sessionRuntimeKeys = [
   "showDiff",
   "showTerminal",
   "showFilePanel",
+  "showTaskCenterPanel",
   "rightPanelTab",
   "selectedDiffTaskId",
+  "taskCenter",
+  "taskCenterActiveTaskId",
   "input",
   "contextMentions",
   "attachedFiles",
@@ -1071,8 +1120,10 @@ function createSessionRuntimeFromState(state: Partial<AppState>): SessionRuntime
     showDiff: state.showDiff === true,
     showTerminal: state.showTerminal === true,
     showFilePanel: state.showFilePanel === true,
+    showTaskCenterPanel: state.showTaskCenterPanel === true,
     rightPanelTab: state.rightPanelTab ?? "plan",
     selectedDiffTaskId: state.selectedDiffTaskId ?? null,
+    taskCenter: normalizeTaskCenterState(state.taskCenter),
     input: state.input ?? "",
     contextMentions: state.contextMentions || [],
     attachedFiles: state.attachedFiles || [],
@@ -1091,6 +1142,7 @@ function createSessionRuntimeFromState(state: Partial<AppState>): SessionRuntime
     pendingReviewResolve: state.pendingReviewResolve || null,
     pendingReviewTaskId: state.pendingReviewTaskId ?? null,
     pendingToolCall: state.pendingToolCall ?? null,
+    taskCenterActiveTaskId: state.taskCenterActiveTaskId ?? null,
     fileViewerPath: state.fileViewerPath || "",
     fileViewerContent: state.fileViewerContent || "",
     fileViewerError: state.fileViewerError || "",
@@ -1497,9 +1549,73 @@ function normalizeAgentContentForDedupe(content: string): string {
 }
 
 function isContinuationPrompt(input: string): boolean {
-  return /^(?:继续|继续生成|继续输出|接着来|接着写|继续吧|go on|continue|keep going|proceed)[。.!！\s]*$/i.test(
-    normalizeIntentSummary(input),
-  );
+  return looksLikePreviousTurnContinuationInput(input);
+}
+
+function turnHasActivity(turn: ConversationTurn | null, taskFlow: TaskBlock[]): boolean {
+  if (!turn) return false;
+  if (Array.isArray(turn.blockIds) && turn.blockIds.length > 0) return true;
+  return taskFlow.some((block) => block.turnId === turn.id);
+}
+
+function turnHasToolBlocks(turnId: string, taskFlow: TaskBlock[]): boolean {
+  return taskFlow.some((block) => block.turnId === turnId && block.type === "tool");
+}
+
+function isContinuationEchoTurn(turn: ConversationTurn | null, taskFlow: TaskBlock[]): boolean {
+  if (!turn) return false;
+  if (turn.status !== "done") return false;
+  if (resolveConversationTurnIntent(turn) !== "discuss") return false;
+  if (!looksLikePreviousTurnContinuationInput(turn.userPrompt || "")) return false;
+  return !turnHasToolBlocks(turn.id, taskFlow);
+}
+
+function findPreviousTurnContinuationTarget(
+  input: string,
+  currentTurn: ConversationTurn | null,
+  conversationTurns: ConversationTurn[],
+  taskFlow: TaskBlock[],
+): ConversationTurn | null {
+  const canResume = (turn: ConversationTurn | null): boolean =>
+    shouldContinuePreviousTurnFromInput(input, {
+      currentTurnIntent: resolveConversationTurnIntent(turn),
+      currentTurnStatus: turn?.status ?? null,
+      hasCurrentTurn: !!turn,
+      hasTurnActivity: turnHasActivity(turn, taskFlow),
+    });
+
+  if (currentTurn && canResume(currentTurn)) return currentTurn;
+
+  // If a previous generic "continue" was misrouted into a completed discuss turn,
+  // allow the next continuation to recover the latest genuinely unfinished turn.
+  if (!isContinuationEchoTurn(currentTurn, taskFlow)) return null;
+
+  for (let index = conversationTurns.length - 1; index >= 0; index--) {
+    const turn = conversationTurns[index];
+    if (turn.id === currentTurn?.id) continue;
+    if (canResume(turn)) return turn;
+  }
+
+  return null;
+}
+
+function getLastTurnToolSummary(turnId: string, taskFlow: TaskBlock[]): string {
+  for (let index = taskFlow.length - 1; index >= 0; index--) {
+    const block = taskFlow[index];
+    if (block.turnId !== turnId || block.type !== "tool") continue;
+    return `${block.toolName}${block.target ? ` ${block.target}` : ""} (${block.toolStatus})`;
+  }
+  return "";
+}
+
+function getLastVisibleTurnAgentSummary(turnId: string, taskFlow: TaskBlock[]): string {
+  for (let index = taskFlow.length - 1; index >= 0; index--) {
+    const block = taskFlow[index];
+    if (block.turnId !== turnId || block.type !== "agent" || block.hiddenProcess) continue;
+    const summary = summarizeAssistantText(block.content || "");
+    if (summary) return summary;
+  }
+  return "";
 }
 
 function buildLocalTurnTitle(input: string, intent: ResolvedRunIntent, language: "zh" | "en"): string {
@@ -2029,6 +2145,17 @@ function normalizeSkillContent(content: string): string {
     .replace(/<\/(thought|thinking|reasoning|analysis)>/gi, "<\/analysis>");
 }
 
+function queueTaskCenterAutoStart(get: () => AppState) {
+  runAfterNextPaint(() => {
+    const state = get();
+    if (!state.taskCenter.scheduler.autoStart || state.taskCenter.scheduler.paused) return;
+    if (state.isGenerating || state.agentStatus !== "idle") return;
+    const task = pickNextTaskCenterTask(state.taskCenter, "execute", ["ready"]);
+    if (!task) return;
+    state.runTaskCenterTask(task.id, "execute");
+  });
+}
+
 // ── The Store ─────────────────────────────────────────────────────────
 
 export const useAppStore = create<AppState>()(
@@ -2092,6 +2219,7 @@ export const useAppStore = create<AppState>()(
   showPlanPanel: false,
   showTerminal: false,
   showFilePanel: false,
+  showTaskCenterPanel: false,
   fileViewerPath: "",
   fileViewerContent: "",
   fileViewerError: "",
@@ -2104,6 +2232,7 @@ export const useAppStore = create<AppState>()(
     showPlanPanel: v ? false : get().showPlanPanel,
     showTerminal: v ? false : get().showTerminal,
     showFilePanel: v ? false : get().showFilePanel,
+    showTaskCenterPanel: v ? false : get().showTaskCenterPanel,
     rightPanelTab: v ? "diff" : get().rightPanelTab,
   }),
   setShowPlanPanel: (v) => set({
@@ -2111,6 +2240,7 @@ export const useAppStore = create<AppState>()(
     showDiff: v ? false : get().showDiff,
     showTerminal: v ? false : get().showTerminal,
     showFilePanel: v ? false : get().showFilePanel,
+    showTaskCenterPanel: v ? false : get().showTaskCenterPanel,
     rightPanelTab: v ? "plan" : get().rightPanelTab,
   }),
   setShowTerminal: (v) => set({
@@ -2118,13 +2248,23 @@ export const useAppStore = create<AppState>()(
     showPlanPanel: v ? false : get().showPlanPanel,
     showDiff: v ? false : get().showDiff,
     showFilePanel: v ? false : get().showFilePanel,
+    showTaskCenterPanel: v ? false : get().showTaskCenterPanel,
     rightPanelTab: v ? "terminal" : get().rightPanelTab,
+  }),
+  setShowTaskCenterPanel: (v) => set({
+    showTaskCenterPanel: v,
+    showPlanPanel: v ? false : get().showPlanPanel,
+    showDiff: v ? false : get().showDiff,
+    showTerminal: v ? false : get().showTerminal,
+    showFilePanel: v ? false : get().showFilePanel,
+    rightPanelTab: v ? "tasks" : get().rightPanelTab,
   }),
   openFileTreePanel: () => set({
     showFilePanel: true,
     showPlanPanel: false,
     showDiff: false,
     showTerminal: false,
+    showTaskCenterPanel: false,
     rightPanelTab: "file",
     fileViewerPath: "",
     fileViewerContent: "",
@@ -2138,6 +2278,7 @@ export const useAppStore = create<AppState>()(
       showPlanPanel: false,
       showDiff: false,
       showTerminal: false,
+      showTaskCenterPanel: false,
       rightPanelTab: "file",
       fileViewerPath: path,
       fileViewerContent: "",
@@ -2170,6 +2311,7 @@ export const useAppStore = create<AppState>()(
     showPlanPanel: false,
     showDiff: false,
     showTerminal: false,
+    showTaskCenterPanel: false,
     rightPanelTab: "file",
   }),
   setSelectedDiffTaskId: (id) => set({ selectedDiffTaskId: id }),
@@ -2183,6 +2325,7 @@ export const useAppStore = create<AppState>()(
       showPlanPanel: false,
       showTerminal: false,
       showFilePanel: false,
+      showTaskCenterPanel: false,
       rightPanelTab: "diff",
     });
   },
@@ -2192,6 +2335,7 @@ export const useAppStore = create<AppState>()(
     showDiff: tab === "diff",
     showTerminal: tab === "terminal",
     showFilePanel: tab === "file",
+    showTaskCenterPanel: tab === "tasks",
     ...(tab === "file"
       ? {
           fileViewerPath: "",
@@ -2202,7 +2346,7 @@ export const useAppStore = create<AppState>()(
       : {}),
   }),
   openRightPanelTab: (tab) => get().setRightPanelTab(tab),
-  closeRightPanel: () => set({ showPlanPanel: false, showDiff: false, showTerminal: false, showFilePanel: false }),
+  closeRightPanel: () => set({ showPlanPanel: false, showDiff: false, showTerminal: false, showFilePanel: false, showTaskCenterPanel: false }),
   setRightPanelWidth: (w) => set({ rightPanelWidth: w }),
   sidebarWidth: 260,
   setSidebarWidth: (w) => set({ sidebarWidth: Math.max(180, Math.min(450, w)) }),
@@ -2257,11 +2401,26 @@ export const useAppStore = create<AppState>()(
   removeMention: (file) =>
     set((s) => ({ contextMentions: s.contextMentions.filter((f) => f !== file) })),
   setAttachedFiles: (v) => set({ attachedFiles: v }),
-  setSelectedMainModeKey: (key) => set({
+  setSelectedMainModeKey: (key) => set((s) => ({
     selectedMainModeKey: key,
     selectedNexusModeKey: mapMainModeToLegacyNexusMode(key),
     lockedComposerIntent: null,
-  }),
+    ...(key === "task_center"
+      ? {
+          showTaskCenterPanel: true,
+          showPlanPanel: false,
+          showDiff: false,
+          showTerminal: false,
+          showFilePanel: false,
+          rightPanelTab: "tasks" as const,
+        }
+      : s.rightPanelTab === "tasks"
+      ? {
+          showTaskCenterPanel: false,
+          rightPanelTab: "plan" as const,
+        }
+      : {}),
+  })),
   setSelectedNexusModeKey: (key) => {
     const resolved = resolveLegacyNexusModeKey(key);
     const selectedMainModeKey = mapLegacyNexusModeToMainMode(resolved);
@@ -2893,6 +3052,9 @@ export const useAppStore = create<AppState>()(
         planExecutionEvidenceCount: 0,
         planStage: "idle",
         normalizedStreamState: defaultNormalizedStreamState,
+        taskCenter: createDefaultTaskCenterState(),
+        taskCenterActiveTaskId: null,
+        showTaskCenterPanel: false,
         resolvedInstructionSet: null,
         instructionSources: [],
         loadedHookDefinitions: defaultHookDefinitions,
@@ -2946,6 +3108,9 @@ export const useAppStore = create<AppState>()(
       planExecutionEvidenceCount: 0,
       planStage: "idle",
       normalizedStreamState: defaultNormalizedStreamState,
+      taskCenter: createDefaultTaskCenterState(),
+      taskCenterActiveTaskId: null,
+      showTaskCenterPanel: false,
     });
   },
 
@@ -3153,6 +3318,185 @@ export const useAppStore = create<AppState>()(
   },
   showWorkflowMenu: false,
   setShowWorkflowMenu: (v) => set({ showWorkflowMenu: v }),
+
+  // ── Task Center ─────────────────────────────────────────────────────
+
+  taskCenter: createDefaultTaskCenterState(),
+  taskCenterActiveTaskId: null,
+  setTaskCenterState: (updater) =>
+    set((s) => ({
+      taskCenter: normalizeTaskCenterState(
+        typeof updater === "function" ? updater(s.taskCenter) : updater,
+      ),
+    })),
+  createTaskCenterTask: (input) => {
+    const task = createTaskCenterTask({
+      ...input,
+      workspace: input.workspace ?? get().currentWorkspace ?? null,
+    });
+    set((s) => ({
+      taskCenter: normalizeTaskCenterState({
+        ...s.taskCenter,
+        tasks: [task, ...s.taskCenter.tasks],
+        selectedTaskId: task.id,
+      }),
+      input: "",
+      contextMentions: [],
+      attachedFiles: [],
+      showTaskCenterPanel: true,
+      showPlanPanel: false,
+      showDiff: false,
+      showTerminal: false,
+      showFilePanel: false,
+      rightPanelTab: "tasks",
+    }));
+    return task.id;
+  },
+  selectTaskCenterTask: (taskId) =>
+    set((s) => ({
+      taskCenter: {
+        ...s.taskCenter,
+        selectedTaskId: taskId && s.taskCenter.tasks.some((task) => task.id === taskId)
+          ? taskId
+          : null,
+      },
+      showTaskCenterPanel: true,
+      showPlanPanel: false,
+      showDiff: false,
+      showTerminal: false,
+      showFilePanel: false,
+      rightPanelTab: "tasks",
+    })),
+  updateTaskCenterTaskStatus: (taskId, status, message) =>
+    {
+      set((s) => {
+        const now = Date.now();
+        const taskCenter = status === "ready" || status === "inbox"
+          ? normalizeTaskCenterState({
+              ...s.taskCenter,
+              selectedTaskId: taskId,
+              activeTaskId: s.taskCenter.activeTaskId === taskId ? null : s.taskCenter.activeTaskId,
+              scheduler: {
+                ...s.taskCenter.scheduler,
+                writeLockTaskId: s.taskCenter.scheduler.writeLockTaskId === taskId
+                  ? null
+                  : s.taskCenter.scheduler.writeLockTaskId,
+              },
+              tasks: s.taskCenter.tasks.map((task) =>
+                task.id === taskId
+                  ? {
+                      ...task,
+                      status,
+                      lastError: status === "ready" ? null : task.lastError,
+                      updatedAt: now,
+                    }
+                  : task,
+              ),
+            })
+          : finishTaskCenterRun(s.taskCenter, taskId, status, message, now);
+        return {
+          taskCenter,
+          taskCenterActiveTaskId:
+            status === "running" || status === "needs_review"
+              ? taskId
+              : s.taskCenterActiveTaskId === taskId
+              ? null
+              : s.taskCenterActiveTaskId,
+        };
+      });
+      if (status === "ready") {
+        queueTaskCenterAutoStart(get);
+      }
+    },
+  cancelTaskCenterTask: (taskId) => {
+    const state = get();
+    if (state.taskCenterActiveTaskId === taskId) {
+      if (state.pendingReviewTaskId != null) {
+        state.rejectToolAction(state.pendingReviewTaskId);
+      } else {
+        state.stopGeneration();
+      }
+    }
+    set((s) => ({
+      taskCenter: finishTaskCenterRun(s.taskCenter, taskId, "canceled", "Canceled by user."),
+      taskCenterActiveTaskId: s.taskCenterActiveTaskId === taskId ? null : s.taskCenterActiveTaskId,
+    }));
+    queueTaskCenterAutoStart(get);
+  },
+  retryTaskCenterTask: (taskId) => {
+    set((s) => ({
+      taskCenter: normalizeTaskCenterState({
+        ...s.taskCenter,
+        selectedTaskId: taskId,
+        tasks: s.taskCenter.tasks.map((task) =>
+          task.id === taskId
+            ? { ...task, status: "ready", lastError: null, updatedAt: Date.now() }
+            : task,
+        ),
+      }),
+      showTaskCenterPanel: true,
+      rightPanelTab: "tasks",
+    }));
+    queueTaskCenterAutoStart(get);
+  },
+  runTaskCenterTask: (taskId, intent = "execute") => {
+    const state = get();
+    const task = state.taskCenter.tasks.find((item) => item.id === taskId);
+    if (!task) return;
+
+    const started = startTaskCenterRun(state.taskCenter, taskId, intent);
+    if (!started.run) return;
+
+    set({
+      taskCenter: started.state,
+      taskCenterActiveTaskId: taskId,
+      showTaskCenterPanel: true,
+      showPlanPanel: false,
+      showDiff: false,
+      showTerminal: false,
+      showFilePanel: false,
+      rightPanelTab: "tasks",
+    });
+
+    const language = state.config.language === "en" ? "en" : "zh";
+    const runPrompt = [
+      language === "en"
+        ? `[TASK_CENTER]\nTask: ${task.title}\nSource: ${task.source.provider}\nInstruction: run this queued task and keep Task Center progress auditable.`
+        : `[TASK_CENTER]\n任务：${task.title}\n来源：${task.source.provider}\n指令：请执行这个已排队任务，并保持任务中枢进度可审计。`,
+      "",
+      task.prompt,
+    ].join("\n");
+
+    const sent = get().sendMessage(runPrompt, undefined, {
+      reuseCurrentTurn: false,
+      preservePlanState: false,
+      resolvedIntent: intent,
+      skipIntentResolution: true,
+      turnTitle: task.title,
+      intentSummary: language === "en"
+        ? `Task Center run: ${task.title}`
+        : `任务中枢执行：${task.title}`,
+      contextMentionsSnapshot: task.contextMentions,
+      attachedFilesSnapshot: task.attachedFiles,
+    });
+
+    if (sent === false) {
+      set((s) => ({
+        taskCenter: finishTaskCenterRun(s.taskCenter, taskId, "failed", "Task Center could not start because another run is active."),
+        taskCenterActiveTaskId: null,
+      }));
+    }
+  },
+  runNextTaskCenterTask: () => {
+    const state = get();
+    const task = pickNextTaskCenterTask(state.taskCenter, "execute");
+    if (!task) return;
+    get().runTaskCenterTask(task.id, "execute");
+  },
+  appendTaskCenterLog: (taskId, message, level = "info") =>
+    set((s) => ({
+      taskCenter: appendTaskCenterRunLog(s.taskCenter, taskId, message, level),
+    })),
 
   // ── Agent Orchestrator ──────────────────────────────────────────────
 
@@ -3379,27 +3723,45 @@ export const useAppStore = create<AppState>()(
       : null;
     const currentTurnIntent = resolveConversationTurnIntent(currentTurn);
     const currentMainModeKey = state.selectedMainModeKey;
+    const hasPlanArtifacts = state.planArtifacts.length > 0 || state.planStage !== "idle";
     const shouldContinuePlanIntent =
       !isHidden &&
       currentMainModeKey === "main_mode" &&
       currentTurnIntent === "plan" &&
       isContinuationPrompt(text) &&
       (state.planStage !== "completed" || state.planArtifacts.length === 0);
+    const previousTurnContinuationTarget =
+      !isHidden && currentMainModeKey === "main_mode" && !shouldContinuePlanIntent
+        ? findPreviousTurnContinuationTarget(text, currentTurn, state.conversationTurns, state.taskFlow)
+        : null;
+    const shouldContinuePreviousTurnIntent = !!previousTurnContinuationTarget;
+    const previousTurnContinuationIntent = previousTurnContinuationTarget
+      ? resolveConversationTurnIntent(previousTurnContinuationTarget)
+      : null;
     const shouldAutoResumeChoiceTurn =
       !isHidden &&
       options?.reuseCurrentTurn !== true &&
       currentTurn?.status === "awaiting_input";
+    const reusableTurnId = shouldContinuePreviousTurnIntent
+      ? previousTurnContinuationTarget?.id ?? null
+      : state.currentTurnId;
     const reuseCurrentTurn =
-      (options?.reuseCurrentTurn === true || shouldAutoResumeChoiceTurn) &&
-      !!state.currentTurnId;
+      (options?.reuseCurrentTurn === true || shouldAutoResumeChoiceTurn || shouldContinuePreviousTurnIntent) &&
+      !!reusableTurnId;
     const shouldReuseExistingTurnIntent =
       reuseCurrentTurn &&
       currentTurn?.status === "awaiting_input";
     const preservePlanState =
       options?.preservePlanState === true ||
       shouldContinuePlanIntent ||
+      shouldContinuePreviousTurnIntent ||
       (shouldReuseExistingTurnIntent && currentTurnIntent === "plan") ||
-      (shouldAutoResumeChoiceTurn && currentTurnIntent === "plan");
+      (shouldAutoResumeChoiceTurn && currentTurnIntent === "plan") ||
+      looksLikePlanContinuationOrApprovalInput(text, {
+        hasPlanArtifacts,
+        planStage: state.planStage,
+        isPlanApproved: state.isPlanApproved,
+      });
     const parsedStudioCommand = currentMainModeKey === "game_studio"
       ? parseGameStudioSlashCommand(text)
       : null;
@@ -3420,6 +3782,30 @@ export const useAppStore = create<AppState>()(
     if (!text.trim() && !hasSupplementalInput && !images?.length) {
       return false;
     }
+    if (
+      !isHidden &&
+      currentMainModeKey === "task_center" &&
+      !options?.resolvedIntent &&
+      options?.skipIntentResolution !== true
+    ) {
+      const prompt = text.trim();
+      if (!prompt && !hasSupplementalInput && !images?.length) return false;
+      const taskId = get().createTaskCenterTask({
+        prompt: prompt || (preferredLanguage === "en" ? "Review the attached context." : "请处理随附上下文。"),
+        contextMentions: mentionSnapshot,
+        attachedFiles: attachedFilesSnapshot,
+        imageCount: images?.length ?? 0,
+        workspace: state.currentWorkspace || null,
+      });
+      logStoreEvent("task_center_task_created", {
+        taskId,
+        promptChars: prompt.length,
+        contextMentions: mentionSnapshot.length,
+        attachedFiles: attachedFilesSnapshot.length,
+        images: images?.length ?? 0,
+      });
+      return true;
+    }
     logStoreEvent("send_start", {
       textChars: text.length,
       isHidden,
@@ -3431,6 +3817,9 @@ export const useAppStore = create<AppState>()(
       currentTurnId: state.currentTurnId,
       currentTurnStatus: currentTurn?.status ?? null,
       currentTurnIntent,
+      previousTurnContinuationTargetId: previousTurnContinuationTarget?.id ?? null,
+      previousTurnContinuationIntent,
+      shouldContinuePreviousTurnIntent,
       selectedMainModeKey: currentMainModeKey,
       taskFlowBlocks: state.taskFlow.length,
       agentMessages: state.agentMessages.length,
@@ -3445,6 +3834,7 @@ export const useAppStore = create<AppState>()(
       options?.resolvedIntent ||
       lockedComposerIntent ||
       (shouldContinuePlanIntent ? "plan" : null) ||
+      (shouldContinuePreviousTurnIntent && previousTurnContinuationIntent ? previousTurnContinuationIntent : null) ||
       ((preservePlanState || shouldReuseExistingTurnIntent)
         ? currentTurnIntent
         : resolveRunIntentFromLegacyWorkflowMode(state.config.workflowMode));
@@ -3461,6 +3851,17 @@ export const useAppStore = create<AppState>()(
       });
     }
 
+    if (shouldContinuePreviousTurnIntent && previousTurnContinuationTarget && !effectiveIntentSummary) {
+      effectiveIntentSummary = buildRunIntentSummary({
+        input: previousTurnContinuationTarget.userPrompt || text,
+        intent: previousTurnContinuationIntent || effectiveRunIntent,
+        language: preferredLanguage,
+        reason: preferredLanguage === "en"
+          ? "Continue the previous unfinished turn and complete the remaining work."
+          : "继续上一轮未完成内容并完成剩余操作。",
+      });
+    }
+
     if (lockedComposerIntent && !effectiveIntentSummary) {
       effectiveIntentSummary = buildRunIntentSummary({
         input: text,
@@ -3472,12 +3873,12 @@ export const useAppStore = create<AppState>()(
       });
     }
 
-    if (!isHidden && !lockedComposerIntent && !shouldContinuePlanIntent && !shouldReuseExistingTurnIntent && !options?.skipIntentResolution && !options?.resolvedIntent) {
+    if (!isHidden && !lockedComposerIntent && !shouldContinuePlanIntent && !shouldContinuePreviousTurnIntent && !shouldReuseExistingTurnIntent && !options?.skipIntentResolution && !options?.resolvedIntent) {
       const resolution = resolveTurnRunIntent(text, {
         language: preferredLanguage,
         mainModeKey: currentMainModeKey,
         parsedStudioCommand,
-        hasPlanArtifacts: state.planArtifacts.length > 0 || state.planStage !== "idle",
+        hasPlanArtifacts,
         planStage: state.planStage,
         isPlanApproved: state.isPlanApproved,
       });
@@ -3858,6 +4259,7 @@ export const useAppStore = create<AppState>()(
         showDiff: tab === "diff",
         showTerminal: tab === "terminal",
         showFilePanel: tab === "file",
+        showTaskCenterPanel: tab === "tasks",
         ...(tab === "file"
           ? {
               fileViewerPath: "",
@@ -3882,7 +4284,7 @@ export const useAppStore = create<AppState>()(
         setNormalizedStreamState: (streamState: NormalizedStreamState) => sessionSet({ normalizedStreamState: streamState }),
         openRightPanelTab: sessionOpenRightPanelTab,
         setRightPanelTab: sessionOpenRightPanelTab,
-        closeRightPanel: () => sessionSet({ showPlanPanel: false, showDiff: false, showTerminal: false, showFilePanel: false }),
+        closeRightPanel: () => sessionSet({ showPlanPanel: false, showDiff: false, showTerminal: false, showFilePanel: false, showTaskCenterPanel: false }),
         startNewTurn: () =>
           sessionSet({
             currentTurnState: {
@@ -3902,9 +4304,9 @@ export const useAppStore = create<AppState>()(
     };
 
     const nextId = sessionGet()._nextTaskId;
-    const turnId = reuseCurrentTurn ? state.currentTurnId! : `turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const turnId = reuseCurrentTurn ? reusableTurnId! : `turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const existingTurn = reuseCurrentTurn
-      ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId) || null
+      ? state.conversationTurns.find((turn) => turn.id === turnId) || null
       : null;
     const existingTitle = existingTurn?.title && !isGenericConversationTitle(existingTurn.title)
       ? existingTurn.title
@@ -4011,8 +4413,10 @@ export const useAppStore = create<AppState>()(
             showDiff: sessionGet().showDiff,
             showTerminal: sessionGet().showTerminal,
             showFilePanel: sessionGet().showFilePanel,
+            showTaskCenterPanel: sessionGet().showTaskCenterPanel,
             rightPanelTab: sessionGet().rightPanelTab,
             selectedDiffTaskId: sessionGet().selectedDiffTaskId,
+            taskCenter: sessionGet().taskCenter,
           }),
         });
       }
@@ -4350,6 +4754,47 @@ export const useAppStore = create<AppState>()(
               "所有计划 Markdown 都要精简成审阅摘要风格，不要写教程式长文、完整代码清单或重复背景。",
               text.trim() ? `用户最新消息：${text.trim()}` : "用户最新消息：继续",
             ].join("\n");
+      }
+
+      if (shouldContinuePreviousTurnIntent && previousTurnContinuationTarget) {
+        const originalPrompt = previousTurnContinuationTarget.userPrompt?.trim();
+        const lastTool = getLastTurnToolSummary(previousTurnContinuationTarget.id, sessionGet().taskFlow);
+        const lastAssistant = getLastVisibleTurnAgentSummary(previousTurnContinuationTarget.id, sessionGet().taskFlow);
+        const executionHint =
+          effectiveRunIntent === "execute" || effectiveRunIntent === "studio_workflow"
+            ? preferredLanguage === "en"
+              ? "If the unfinished next step is running, testing, verifying, or executing a command, issue the real tool call now: prefer `run_command` for finite checks/tests, and use `execute_command` only for long-running or interactive validation."
+              : "如果未完成的下一步是运行、测试、验证或执行命令，现在必须发起真实工具调用：一次性检查/测试优先用 `run_command`，长驻或交互式验证才用 `execute_command`。"
+            : preferredLanguage === "en"
+            ? "If the remaining work requires workspace context, use the appropriate read-only tool immediately instead of announcing a future step."
+            : "如果剩余工作需要工作区上下文，请立即调用合适的只读工具，不要只宣布下一步。";
+        userContent = preferredLanguage === "en"
+          ? [
+              "Continue the previous unfinished turn. The user's message is a semantic continuation request, not a new discussion.",
+              originalPrompt ? `Original request: ${originalPrompt}` : "Original request: use the current conversation context.",
+              `Previous turn status: ${previousTurnContinuationTarget.status}.`,
+              lastTool ? `Last tool activity: ${lastTool}.` : "",
+              lastAssistant ? `Last visible assistant message: ${lastAssistant}` : "",
+              "Resume from the unfinished point and complete the remaining work.",
+              executionHint,
+              "Do not stop after saying what you will do next.",
+              text.trim() ? `Latest user message: ${text.trim()}` : "Latest user message: continue",
+              "",
+              userContent,
+            ].filter(Boolean).join("\n")
+          : [
+              "请继续上一轮未完成回合。用户这句是语义续跑，不是开启新的普通讨论。",
+              originalPrompt ? `上一轮原始请求：${originalPrompt}` : "上一轮原始请求：请依据当前对话上下文继续。",
+              `上一轮状态：${previousTurnContinuationTarget.status}。`,
+              lastTool ? `上一轮最后工具活动：${lastTool}。` : "",
+              lastAssistant ? `上一轮最后可见回复：${lastAssistant}` : "",
+              "请从未完成的位置恢复，并完成剩余内容。",
+              executionHint,
+              "不要只说接下来要做什么后停止。",
+              text.trim() ? `用户最新消息：${text.trim()}` : "用户最新消息：继续",
+              "",
+              userContent,
+            ].filter(Boolean).join("\n");
       }
 
       const shouldUseGameStudioEnvelope =
@@ -5109,6 +5554,12 @@ export const useAppStore = create<AppState>()(
               ),
             }));
           }
+          const activeTaskCenterTaskId = sessionGet().taskCenterActiveTaskId;
+          if (activeTaskCenterTaskId) {
+            sessionSet((s) => ({
+              taskCenter: appendTaskCenterRunLog(s.taskCenter, activeTaskCenterTaskId, `Tool running: ${toolName} ${target}`.trim()),
+            }));
+          }
         },
 
         onToolDone: (toolName, target, result) => {
@@ -5154,6 +5605,12 @@ export const useAppStore = create<AppState>()(
             invalidateWorkspaceTreeCache();
             sessionGet().bumpWorkspaceContentVersion();
           }
+          const activeTaskCenterTaskId = sessionGet().taskCenterActiveTaskId;
+          if (activeTaskCenterTaskId) {
+            sessionSet((s) => ({
+              taskCenter: appendTaskCenterRunLog(s.taskCenter, activeTaskCenterTaskId, `Tool completed: ${toolName} ${target}`.trim()),
+            }));
+          }
         },
 
         onToolError: (toolName, target, error) => {
@@ -5174,6 +5631,12 @@ export const useAppStore = create<AppState>()(
           if (toolName === "execute_command") {
             invalidateWorkspaceTreeCache();
             sessionGet().bumpWorkspaceContentVersion();
+          }
+          const activeTaskCenterTaskId = sessionGet().taskCenterActiveTaskId;
+          if (activeTaskCenterTaskId) {
+            sessionSet((s) => ({
+              taskCenter: appendTaskCenterRunLog(s.taskCenter, activeTaskCenterTaskId, `Tool failed: ${toolName} ${target} — ${error}`.trim(), "error"),
+            }));
           }
         },
 
@@ -5208,6 +5671,24 @@ export const useAppStore = create<AppState>()(
             // Timer only runs during active generation, NOT during plan review
             isGenerating: status === "running",
           });
+          const activeTaskCenterTaskId = sessionGet().taskCenterActiveTaskId;
+          if (activeTaskCenterTaskId) {
+            if (status === "running") {
+              sessionSet((s) => ({
+                taskCenter: appendTaskCenterRunLog(s.taskCenter, activeTaskCenterTaskId, "Agent loop is running."),
+              }));
+            } else if (status === "pending_review") {
+              sessionSet((s) => ({
+                taskCenter: finishTaskCenterRun(s.taskCenter, activeTaskCenterTaskId, "needs_review", "Waiting for human review."),
+              }));
+            } else if (status === "error") {
+              sessionSet((s) => ({
+                taskCenter: finishTaskCenterRun(s.taskCenter, activeTaskCenterTaskId, "failed", "Agent loop ended with an error."),
+                taskCenterActiveTaskId: null,
+              }));
+              queueTaskCenterAutoStart(sessionGet);
+            }
+          }
           if (status === "pending_review") {
             const state = sessionGet();
             const hasPlanContext =
@@ -5277,6 +5758,14 @@ export const useAppStore = create<AppState>()(
               });
             }
             sessionSet({ abortController: null });
+            const activeTaskCenterTaskId = sessionGet().taskCenterActiveTaskId;
+            if (activeTaskCenterTaskId && status === "idle") {
+              sessionSet((s) => ({
+                taskCenter: finishTaskCenterRun(s.taskCenter, activeTaskCenterTaskId, "done", "Task run completed."),
+                taskCenterActiveTaskId: null,
+              }));
+              queueTaskCenterAutoStart(sessionGet);
+            }
             clearInterval(timerInterval);
           }
         },
@@ -5291,6 +5780,14 @@ export const useAppStore = create<AppState>()(
           });
           finalizeStreamingUi();
           const errorMessage = typeof error === "string" ? error : String(error);
+          const activeTaskCenterTaskId = sessionGet().taskCenterActiveTaskId;
+          if (activeTaskCenterTaskId) {
+            sessionSet((s) => ({
+              taskCenter: finishTaskCenterRun(s.taskCenter, activeTaskCenterTaskId, "failed", errorMessage),
+              taskCenterActiveTaskId: null,
+            }));
+            queueTaskCenterAutoStart(sessionGet);
+          }
           const isResponseBodyDecodeError = /error decoding response body/i.test(errorMessage);
           const friendlyError = isResponseBodyDecodeError
             ? "模型服务在传输回复时中断或返回了无法解析的数据。原始错误：" + errorMessage
@@ -5336,6 +5833,13 @@ export const useAppStore = create<AppState>()(
           };
           appendTurnBlock(block);
           sessionGet().setConversationTurnSummary(turnId, summarizeAssistantText(message));
+          const activeTaskCenterTaskId = sessionGet().taskCenterActiveTaskId;
+          if (activeTaskCenterTaskId) {
+            sessionSet((s) => ({
+              taskCenter: finishTaskCenterRun(s.taskCenter, activeTaskCenterTaskId, "blocked", message),
+              taskCenterActiveTaskId: null,
+            }));
+          }
         },
 
         onPlanArtifactUpdated: (path, content, kind) => {
@@ -5680,8 +6184,10 @@ export const useAppStore = create<AppState>()(
               showDiff: s.showDiff,
               showTerminal: s.showTerminal,
               showFilePanel: s.showFilePanel,
+              showTaskCenterPanel: s.showTaskCenterPanel,
               rightPanelTab: s.rightPanelTab,
               selectedDiffTaskId: s.selectedDiffTaskId,
+              taskCenter: s.taskCenter,
             }),
           });
         }
@@ -5760,8 +6266,10 @@ export const useAppStore = create<AppState>()(
         showDiff: state.showDiff,
         showTerminal: state.showTerminal,
         showFilePanel: state.showFilePanel,
+        showTaskCenterPanel: state.showTaskCenterPanel,
         rightPanelTab: state.rightPanelTab,
         selectedDiffTaskId: state.selectedDiffTaskId,
+        taskCenter: state.taskCenter,
         preferredResponseLanguage: state.preferredResponseLanguage,
         mcpServers: state.mcpServers,
         sidebarWidth: state.sidebarWidth,
@@ -5850,6 +6358,9 @@ export const useAppStore = create<AppState>()(
         activeStudioAgentKey: normalizeStudioAgentKey(persistedState.activeStudioAgentKey),
         gameStudioInitialized: persistedState.gameStudioInitialized === true,
         pendingSlashCommand: normalizePendingSlashCommand(persistedState.pendingSlashCommand),
+        taskCenter: normalizeTaskCenterState(persistedState.taskCenter),
+        taskCenterActiveTaskId: null,
+        showTaskCenterPanel: persistedState.showTaskCenterPanel === true && persistedState.rightPanelTab === "tasks",
         currentTurnState: createDefaultCurrentTurnState(),
         agentStatus: "idle",
         isGenerating: false,

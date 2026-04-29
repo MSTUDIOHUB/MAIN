@@ -45,5 +45,5 @@ test("plan panel refreshes when tasks.md is updated through replace_in_file", as
     });
 
   await expect(page.getByText("任务 2/3")).toBeVisible();
-  await expect(page.getByText("保存方案供用户留档（已完成）")).toBeVisible();
+  await expect(page.getByText("保存方案供用户留档（已完成）").first()).toBeVisible();
 });

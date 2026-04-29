@@ -34,6 +34,9 @@ export function isProviderCompatibilityErrorMessage(message: string): boolean {
   const normalized = String(message || "").toLowerCase();
   return (
     normalized.includes("unsupported content type") ||
+    normalized.includes("unsupported responses") ||
+    normalized.includes("responses api is not supported") ||
+    normalized.includes("responses api not supported") ||
     normalized.includes("invalid_request_error") ||
     normalized.includes("invalid type for") ||
     normalized.includes("unsupported parameter") ||
@@ -78,6 +81,7 @@ function buildProviderCompatibilityInstructionText(
   workflowMode: "chat" | "edit" | "plan",
 ): string {
   const sharedToolAccess = [
+    "Tool access is available through XML tool calls.",
     "MAIN tools are still available through XML tool calls even when this cloud endpoint does not support native function/tools payloads.",
     "Use XML tools for workspace access; do not say tools, files, or folder access are unavailable.",
     "Available XML tools include:",

@@ -2192,10 +2192,14 @@ async fn proxy_request(app: AppHandle, url: String, method: String, headers: Opt
         HTTP_SHORT_TIMEOUT_SECS
     };
 
-    let client = reqwest::Client::builder()
+    let mut client_builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(request_timeout_secs))
         .read_timeout(Duration::from_secs(STREAM_READ_TIMEOUT_SECS))
-        .connect_timeout(Duration::from_secs(HTTP_CONNECT_TIMEOUT_SECS))
+        .connect_timeout(Duration::from_secs(HTTP_CONNECT_TIMEOUT_SECS));
+    if is_model_request {
+        client_builder = client_builder.http1_only();
+    }
+    let client = client_builder
         .build()
         .map_err(|e| format!("创建 HTTP 客户端失败: {e}"))?;
 
@@ -2301,19 +2305,29 @@ async fn proxy_request(app: AppHandle, url: String, method: String, headers: Opt
                 return Err("Aborted".to_string());
             }
             let msg = e.to_string();
+            let should_retry_transport = should_try_curl_transport_fallback(&url, &meth, &msg);
             if is_model_request {
-                record_debug_log(&app, "error", "proxy_request", format!("request_failed url={} err={}", url, msg));
+                record_debug_log(
+                    &app,
+                    if should_retry_transport { "warn" } else { "error" },
+                    "proxy_request",
+                    if should_retry_transport {
+                        format!("primary_transport_failed url={} err={} trying_curl_fallback=true", url, msg)
+                    } else {
+                        format!("request_failed url={} err={}", url, msg)
+                    },
+                );
             }
 
-            if should_try_curl_transport_fallback(&url, &meth, &msg) {
-                record_debug_log(&app, "warn", "proxy_request", format!("transport failed, retrying via curl fallback: {}", url));
+            if should_retry_transport {
+                record_debug_log(&app, "warn", "proxy_request", format!("primary failed, trying curl fallback: {}", url));
                 match proxy_request_via_curl(&url, &meth, headers.as_ref(), body_for_debug.as_deref()) {
                     Ok(result) => {
-                        record_debug_log(&app, "info", "proxy_request", format!("curl fallback succeeded url={} elapsed_ms={}", url, request_started_at.elapsed().as_millis()));
+                        record_debug_log(&app, "info", "proxy_request", format!("recovered_by=curl url={} elapsed_ms={}", url, request_started_at.elapsed().as_millis()));
                         return Ok(result);
                     }
                     Err(curl_err) => {
-                        record_debug_log(&app, "error", "proxy_request", format!("curl fallback failed url={} err={}", url, curl_err));
+                        record_debug_log(&app, "error", "proxy_request", format!("curl fallback failed after transport error url={} primary_err={} curl_err={}", url, msg, curl_err));
                     }
                 }
             }
@@ -2335,22 +2349,32 @@ async fn proxy_request(app: AppHandle, url: String, method: String, headers: Opt
     let status = response.status();
     if !status.is_success() {
         let error_body = response.text().await.unwrap_or_default();
-        if url.contains("/v1/chat/completions") || url.contains("/v1/responses") || url.contains("/v1/messages") {
+        let should_retry_via_curl = should_use_curl_fallback(&url, &meth, status, &error_body);
+        if is_model_request {
+            let error_excerpt = error_body.chars().take(240).collect::<String>();
             record_debug_log(
                 &app,
-                "error",
+                if should_retry_via_curl { "warn" } else { "error" },
                 "proxy_request",
-                format!(
-                    "error status={} url={} body={}",
-                    status,
-                    url,
-                    error_body.chars().take(240).collect::<String>(),
-                ),
+                if should_retry_via_curl {
+                    format!(
+                        "primary_status_failed status={} url={} body={} trying_curl_fallback=true",
+                        status,
+                        url,
+                        error_excerpt,
+                    )
+                } else {
+                    format!(
+                        "error status={} url={} body={}",
+                        status,
+                        url,
+                        error_excerpt,
+                    )
+                },
             );
         }
 
-        let should_retry_via_curl = should_use_curl_fallback(&url, &meth, status, &error_body);
-        if url.contains("/v1/chat/completions") || url.contains("/v1/responses") || url.contains("/v1/messages") {
+        if is_model_request {
             record_debug_log(
                 &app,
                 "info",
@@ -2365,14 +2389,25 @@ async fn proxy_request(app: AppHandle, url: String, method: String, headers: Opt
         }
 
         if should_retry_via_curl {
-            record_debug_log(&app, "warn", "proxy_request", format!("reqwest failed, retrying via curl fallback: {}", url));
+            record_debug_log(&app, "warn", "proxy_request", format!("primary failed, trying curl fallback: {}", url));
             match proxy_request_via_curl(&url, &meth, headers.as_ref(), body_for_debug.as_deref()) {
                 Ok(result) => {
-                    record_debug_log(&app, "info", "proxy_request", format!("curl fallback succeeded url={} elapsed_ms={}", url, request_started_at.elapsed().as_millis()));
+                    record_debug_log(&app, "info", "proxy_request", format!("recovered_by=curl status={} url={} elapsed_ms={}", status, url, request_started_at.elapsed().as_millis()));
                     return Ok(result);
                 }
                 Err(curl_err) => {
-                    record_debug_log(&app, "error", "proxy_request", format!("curl fallback failed url={} err={}", url, curl_err));
+                    record_debug_log(
+                        &app,
+                        "error",
+                        "proxy_request",
+                        format!(
+                            "curl fallback failed after status error status={} url={} body={} curl_err={}",
+                            status,
+                            url,
+                            error_body.chars().take(240).collect::<String>(),
+                            curl_err,
+                        ),
+                    );
                 }
             }
         }
@@ -2401,18 +2436,28 @@ async fn proxy_request(app: AppHandle, url: String, method: String, headers: Opt
                 return Err("Aborted".to_string());
             }
             let msg = e.to_string();
+            let should_retry_read = should_try_curl_transport_fallback(&url, &meth, &msg);
             if is_model_request {
-                record_debug_log(&app, "error", "proxy_request", format!("read_failed url={} err={}", url, msg));
+                record_debug_log(
+                    &app,
+                    if should_retry_read { "warn" } else { "error" },
+                    "proxy_request",
+                    if should_retry_read {
+                        format!("primary_read_failed url={} err={} trying_curl_fallback=true", url, msg)
+                    } else {
+                        format!("read_failed url={} err={}", url, msg)
+                    },
+                );
             }
-            if should_try_curl_transport_fallback(&url, &meth, &msg) {
-                record_debug_log(&app, "warn", "proxy_request", format!("response read failed, retrying via curl fallback: {}", url));
+            if should_retry_read {
+                record_debug_log(&app, "warn", "proxy_request", format!("primary failed, trying curl fallback: {}", url));
                 match proxy_request_via_curl(&url, &meth, headers.as_ref(), body_for_debug.as_deref()) {
                     Ok(result) => {
-                        record_debug_log(&app, "info", "proxy_request", format!("curl fallback succeeded url={} elapsed_ms={}", url, request_started_at.elapsed().as_millis()));
+                        record_debug_log(&app, "info", "proxy_request", format!("recovered_by=curl url={} elapsed_ms={}", url, request_started_at.elapsed().as_millis()));
                         return Ok(result);
                     }
                     Err(curl_err) => {
-                        record_debug_log(&app, "error", "proxy_request", format!("curl fallback failed url={} err={}", url, curl_err));
+                        record_debug_log(&app, "error", "proxy_request", format!("curl fallback failed after read error url={} primary_err={} curl_err={}", url, msg, curl_err));
                     }
                 }
             }

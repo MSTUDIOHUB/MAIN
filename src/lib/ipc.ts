@@ -184,6 +184,10 @@ export function deleteChatTempPath(sessionKey: string, path: string): Promise<vo
   return invoke<void>("delete_chat_temp_path", { sessionKey, path });
 }
 
+export function deleteChatSessionTempFiles(sessionKey: string): Promise<void> {
+  return deleteChatTempPath(sessionKey, ".");
+}
+
 export function listProjectSessions(workspace: string): Promise<any[]> {
   return invoke<any[]>("list_project_sessions", { workspace });
 }

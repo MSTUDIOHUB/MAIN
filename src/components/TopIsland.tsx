@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useMemo, useState } from "react";
 import { IconColumns, IconFileText, IconLock, IconUnlock } from "./Icons";
 import type { PlanStage, PlanTask, ReplyOption } from "../lib/workflowModels";
 import type { PendingRunDecision, ResolvedUserIntent } from "../lib/runIntent";
@@ -31,7 +31,6 @@ interface TopIslandProps {
   onApproveDiffSession?: () => void;
   onOpenPlan: () => void;
   onOpenDiff: () => void;
-  onHeightChange?: (height: number) => void;
 }
 // endregion
 
@@ -85,11 +84,9 @@ const TopIsland = memo(function TopIsland({
   onApproveDiffSession,
   onOpenPlan,
   onOpenDiff,
-  onHeightChange,
 }: TopIslandProps) {
   const [hovered, setHovered] = useState(false);
   const [pinnedOpen, setPinnedOpen] = useState(false);
-  const shellRef = useRef<HTMLDivElement | null>(null);
 
   // region: TopIsland 展开时机
   const hasReplyOptions = replyOptions.length > 0;
@@ -176,25 +173,6 @@ const TopIsland = memo(function TopIsland({
   const secondaryText = themeMode === "light" ? "text-[#4b5563]" : "text-[#71717a]";
   const surface = themeMode === "light" ? "bg-[rgba(255,255,255,0.36)] border-[rgba(15,23,42,0.08)]" : "bg-[rgba(255,255,255,0.04)] border-[#1f1f23]";
 
-  // region: TopIsland 高度同步
-  useEffect(() => {
-    if (!onHeightChange) return undefined;
-    const node = shellRef.current;
-    if (!node) return undefined;
-
-    const reportHeight = () => {
-      onHeightChange(node.offsetHeight);
-    };
-
-    reportHeight();
-    const observer = new ResizeObserver(reportHeight);
-    observer.observe(node);
-    return () => {
-      observer.disconnect();
-    };
-  }, [onHeightChange]);
-  // endregion
-
   return (
     <div
       className={`pointer-events-none absolute left-0 right-0 top-[58px] z-30 flex justify-center px-4 transition-all duration-250 ease-out ${
@@ -202,7 +180,6 @@ const TopIsland = memo(function TopIsland({
       }`}
     >
       <div
-        ref={shellRef}
         data-testid="top-island-shell"
         onMouseEnter={() => setHovered(true)}
         onMouseLeave={() => setHovered(false)}

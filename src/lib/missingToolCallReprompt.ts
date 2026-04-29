@@ -1,7 +1,14 @@
 import type { MainModeKey } from "./mainModes";
 
 export type WorkflowModeLike = "chat" | "edit" | "plan";
-export type MissingToolCallRepromptKind = "none" | "generic" | "read_only";
+export type MissingToolCallRepromptKind = "none" | "generic" | "read_only" | "post_write_verify";
+
+export interface MissingToolCallRecentWriteContext {
+  lastSuccessfulToolName?: string | null;
+  lastSuccessfulTargetPath?: string | null;
+  lastSuccessfulTargetOutsidePlan?: boolean;
+  recoveringFromEmptyAssistantReply?: boolean;
+}
 
 const GENERIC_INTENT_PATTERNS = [
   /现在我来?(创建|执行|生成|写入|修改|删除|添加|运行|实现|获取|查看|扫描|读取|分析|检查|搜索|访问|浏览|查找|探索)/,
@@ -79,6 +86,29 @@ const READ_ONLY_TASK_CUE_PATTERNS = [
   /analy(?:s|z)e/i,
 ];
 
+const POST_WRITE_VERIFY_PATTERNS = [
+  /我(?:将|会|现在要|接下来要)?(?:立即|马上|先)?(?:运行|测试|验证|执行)(?:一下|这个|该)?(?:程序|项目|脚本|游戏|命令|文件)?/i,
+  /(?:下一步|接下来).*(?:运行|测试|验证|执行)/i,
+  /(?:run_command|execute_command)\b/i,
+  /\bpython\s+\S+/i,
+  /\bnpm\s+(?:run\s+)?(?:test|build|start|dev)\b/i,
+  /\bpnpm\s+(?:run\s+)?(?:test|build|start|dev)\b/i,
+  /\byarn\s+(?:test|build|start|dev)\b/i,
+  /\bpytest\b/i,
+  /\bplaywright\b/i,
+  /\bcargo\s+(?:test|run|build)\b/i,
+  /I(?: will|'ll)?(?: now| next)? (?:run|test|verify|execute)\b/i,
+  /let me (?:run|test|verify|execute)\b/i,
+  /next(?:,? I(?: will|'ll)?)?.*(?:run|test|verify|execute)\b/i,
+];
+
+function hasRecentProjectWrite(context?: MissingToolCallRecentWriteContext): boolean {
+  return !!context &&
+    (context.lastSuccessfulToolName === "write_file" || context.lastSuccessfulToolName === "replace_in_file") &&
+    !!context.lastSuccessfulTargetPath &&
+    context.lastSuccessfulTargetOutsidePlan === true;
+}
+
 function looksLikeGeneratedCodeDump(text: string): boolean {
   if (text.length < 4_000) return false;
   const fenceCount = (text.match(/```/g) ?? []).length;
@@ -95,9 +125,23 @@ export function resolveMissingToolCallRepromptKind(input: {
   workflowMode: WorkflowModeLike;
   visibleText: string;
   mainModeKey?: MainModeKey;
+  recentWrite?: MissingToolCallRecentWriteContext;
 }): MissingToolCallRepromptKind {
   const text = input.visibleText.trim();
   const isChatLike = input.workflowMode === "chat";
+  const recentProjectWrite = hasRecentProjectWrite(input.recentWrite);
+  const recoveringFromEmptyAssistantReply = input.recentWrite?.recoveringFromEmptyAssistantReply === true;
+  const promisesPostWriteVerification = POST_WRITE_VERIFY_PATTERNS.some((pattern) => pattern.test(text));
+
+  if (input.workflowMode === "edit" && recentProjectWrite) {
+    if (!text && recoveringFromEmptyAssistantReply) {
+      return "post_write_verify";
+    }
+    if (promisesPostWriteVerification) {
+      return "post_write_verify";
+    }
+  }
+
   if (!text) return isChatLike ? "none" : "generic";
 
   const hasGenericIntent = GENERIC_INTENT_PATTERNS.some((pattern) => pattern.test(text));
@@ -126,6 +170,22 @@ export function buildMissingToolCallContinuationPrompt(
   language: "zh" | "en",
   attempt = 1,
 ): string {
+  if (kind === "post_write_verify" && attempt >= 2) {
+    return language === "zh"
+      ? "上一条回复仍然只是说明接下来要怎么验证，没有真正执行工具。下一条回复必须严格满足：\n" +
+          "1. 只输出一个 `<tool_use>` 工具调用块，不要输出任何普通正文、解释、总结或寒暄。\n" +
+          "2. 立即调用真实验证工具：优先使用 `run_command` 执行一次性运行/测试命令；只有在需要长驻或交互式进程时才使用 `execute_command`。\n" +
+          "3. 直接给出可执行命令，不要只说“我将运行/测试/验证”。\n" +
+          "4. `<tool_use>` 外面不要写字。格式必须是：\n" +
+          "<tool_use>\n<tool>run_command</tool>\n<parameter name=\"command\">真实可执行的验证命令</parameter>\n</tool_use>"
+      : "Your previous reply still only described the validation step instead of executing a tool. The next reply must strictly follow this:\n" +
+          "1. Output exactly one `<tool_use>` block and no prose, explanation, summary, or greeting outside it.\n" +
+          "2. Call a real validation tool immediately: prefer `run_command` for one-shot run/test commands, and use `execute_command` only when validation truly needs a long-running or interactive process.\n" +
+          "3. Provide the actual executable command instead of saying you will run or test it.\n" +
+          "4. Nothing outside `<tool_use>`. Required shape:\n" +
+          "<tool_use>\n<tool>run_command</tool>\n<parameter name=\"command\">real validation command</parameter>\n</tool_use>";
+  }
+
   if (attempt >= 2) {
     return language === "zh"
       ? "上一条回复仍然只是重复说明，没有真正调用工具。下一条回复必须严格满足：\n" +
@@ -152,6 +212,18 @@ export function buildMissingToolCallContinuationPrompt(
           "1. If the task depends on workspace files, documents, spreadsheets, or data, immediately call the appropriate read-only tools such as `list_directory`, `read_file`, `read_document`, `analyze_tabular_document`, or `query_tabular_document`.\n" +
           "2. Do not output process filler like “please wait”, “I will start”, or “next action plan”.\n" +
           "3. Only summarize findings, draft the report structure, or recommend next steps after you have actually read the relevant file contents.";
+  }
+
+  if (kind === "post_write_verify") {
+    return language === "zh"
+      ? "不要只描述接下来要怎么验证。刚刚已经写入了项目文件，现在请立即执行真实验证：\n" +
+          "1. 优先使用 `run_command` 运行一次性验证或测试命令。\n" +
+          "2. 只有在验证需要长驻或交互式进程时才使用 `execute_command`。\n" +
+          "3. 不要再输出“我将运行/测试/验证”，直接调用工具。"
+      : "Do not only describe how you will validate the change. A project file was just written, so run the real verification now:\n" +
+          "1. Prefer `run_command` for one-shot validation or test commands.\n" +
+          "2. Use `execute_command` only when validation needs a long-running or interactive process.\n" +
+          "3. Do not say you will run, test, or verify it. Call the tool directly.";
   }
 
   return language === "zh"

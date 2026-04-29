@@ -1,7 +1,7 @@
 // @ts-nocheck
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { IconCheck, IconChevronDown, IconChevronRight, IconClose, IconCloud, IconCode, IconColumns, IconFileText, IconFolder, IconLogoM, IconStop, IconTerminal } from "./Icons";
+import { IconCheck, IconChevronDown, IconChevronRight, IconClose, IconCloud, IconCode, IconColumns, IconFileText, IconFolder, IconLogoM, IconPackage, IconStop, IconTerminal } from "./Icons";
 import ActionCard from "./ActionCard";
 import Composer from "./Composer";
 import JobListCard from "./JobListCard";
@@ -1055,6 +1055,7 @@ export default function ChatArea({
     showPlanPanel,
     showTerminal,
     showFilePanel,
+    showTaskCenterPanel,
     rightPanelTab,
     openRightPanelTab,
     openFileTreePanel,
@@ -1082,6 +1083,7 @@ export default function ChatArea({
     showPlanPanel: useAppStore((s) => s.showPlanPanel),
     showTerminal: useAppStore((s) => s.showTerminal),
     showFilePanel: useAppStore((s) => s.showFilePanel),
+    showTaskCenterPanel: useAppStore((s) => s.showTaskCenterPanel),
     rightPanelTab: useAppStore((s) => s.rightPanelTab),
     openRightPanelTab: useAppStore((s) => s.openRightPanelTab),
     openFileTreePanel: useAppStore((s) => s.openFileTreePanel),
@@ -1132,7 +1134,6 @@ export default function ChatArea({
   const [composerHeight, setComposerHeight] = useState(220);
   const [shouldRenderTopIsland, setShouldRenderTopIsland] = useState(false);
   const [isTopIslandVisible, setIsTopIslandVisible] = useState(false);
-  const [topIslandHeight, setTopIslandHeight] = useState(0);
   // endregion
   useEffect(() => {
     const nextSessionKey = activeSessionKey ?? null;
@@ -1307,11 +1308,6 @@ export default function ChatArea({
         ? shouldShowTopIslandNormally
         : shouldShowTopIslandForHistoryPeek)
     );
-  const chatContainerPaddingTop =
-    shouldRenderTopIsland && isTopIslandVisible
-      ? Math.max(20, topIslandHeight + 84)
-      : 20;
-
   useEffect(() => {
     if (topIslandHideTimerRef.current !== null) {
       window.clearTimeout(topIslandHideTimerRef.current);
@@ -1408,12 +1404,13 @@ export default function ChatArea({
     };
   }, [taskFlow, isAutoScroll, isStreaming]);
 
-  const togglePanelTab = useCallback((tab: "plan" | "diff" | "terminal" | "file") => {
+  const togglePanelTab = useCallback((tab: "plan" | "diff" | "terminal" | "file" | "tasks") => {
     const isCurrentlyOpen =
       (tab === "plan" && showPlanPanel && rightPanelTab === "plan") ||
       (tab === "diff" && showDiff && rightPanelTab === "diff") ||
       (tab === "terminal" && showTerminal && rightPanelTab === "terminal") ||
-      (tab === "file" && showFilePanel && rightPanelTab === "file");
+      (tab === "file" && showFilePanel && rightPanelTab === "file") ||
+      (tab === "tasks" && showTaskCenterPanel && rightPanelTab === "tasks");
 
     if (isCurrentlyOpen) {
       closeRightPanel();
@@ -1427,7 +1424,7 @@ export default function ChatArea({
       return;
     }
     openRightPanelTab(tab);
-  }, [closeRightPanel, currentWorkspace, hasPlanPanelContent, openFileTreePanel, openRightPanelTab, rightPanelTab, showDiff, showFilePanel, showPlanPanel, showTerminal]);
+  }, [closeRightPanel, currentWorkspace, hasPlanPanelContent, openFileTreePanel, openRightPanelTab, rightPanelTab, showDiff, showFilePanel, showPlanPanel, showTaskCenterPanel, showTerminal]);
 
   const renderBlock = (block, index) => {
     if (block.type === "user") {
@@ -1741,6 +1738,14 @@ export default function ChatArea({
 
           <div className="flex shrink-0 items-center gap-1">
             <button
+              onClick={() => togglePanelTab("tasks")}
+              className={`panel-tab-icon-button flex h-7 w-7 shrink-0 items-center justify-center rounded-[7px] transition-all duration-150 ${showTaskCenterPanel && rightPanelTab === "tasks" ? "is-active" : ""}`}
+              title={language === "zh" ? "任务中枢" : "Task Center"}
+              aria-label={language === "zh" ? "任务中枢" : "Task Center"}
+            >
+              <IconPackage className="h-3.5 w-3.5" />
+            </button>
+            <button
               onClick={() => togglePanelTab("terminal")}
               className={`panel-tab-icon-button flex h-7 w-7 shrink-0 items-center justify-center rounded-[7px] transition-all duration-150 ${showTerminal && rightPanelTab === "terminal" ? "is-active" : ""}`}
               title={t.terminal}
@@ -1813,15 +1818,14 @@ export default function ChatArea({
           onApproveDiffSession={() => approvePendingReviewForSession()}
           onOpenPlan={() => openRightPanelTab("plan")}
           onOpenDiff={() => openRightPanelTab("diff")}
-          onHeightChange={setTopIslandHeight}
         />
       )}
 
       <div
         ref={chatContainerRef}
         onScroll={handleScroll}
-        className="flex-1 overflow-y-auto px-5 transition-[padding] duration-250 ease-out"
-        style={{ paddingTop: `${chatContainerPaddingTop}px`, paddingBottom: `${composerPaddingBottom}px` }}
+        className="flex-1 overflow-y-auto px-5 pt-5 transition-[padding-bottom] duration-250 ease-out"
+        style={{ paddingBottom: `${composerPaddingBottom}px` }}
       >
 
         {groupedTurns.length === 0 ? (

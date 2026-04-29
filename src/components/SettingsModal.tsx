@@ -2,11 +2,10 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
-import { IconSettings, IconClose, IconPlus, IconTrash, IconCloud, IconSave } from "./Icons";
+import { IconSettings, IconClose, IconPlus, IconTrash, IconCloud, IconSave, IconCheck } from "./Icons";
 import { type MCPServer, type MCPTool, discoverAllMcpTools, setMcpToolServerMap } from "../lib/mcpClient";
 import {
-  buildOpenAiResponsesInputCandidates,
-  buildOpenAiResponsesRequestExtras,
+  buildOpenAiResponsesProbeRequestCandidates,
   buildAnthropicRequestBody,
   buildCloudHeaders,
   buildCloudMessagesApiUrl,
@@ -34,6 +33,28 @@ import {
   createCloudServerConfig,
   normalizeCloudServerState,
 } from "../lib/cloudServers";
+
+function buildCloudConnectionFingerprint(server: any, apiFormatOverride?: unknown, modelOverride?: unknown): string {
+  if (!server) return "";
+  return JSON.stringify({
+    endpoint: String(server.endpoint || "").trim(),
+    protocol: normalizeCloudProtocol(server.protocol),
+    apiFormat: normalizeCloudApiFormat(apiFormatOverride ?? server.apiFormat),
+    apiKey: String(server.apiKey || ""),
+    customHeaders: String(server.customHeaders || ""),
+    model: String(modelOverride ?? server.model ?? "").trim(),
+  });
+}
+
+function isSameCloudConnectionTarget(current: any, target: any): boolean {
+  if (!current || !target) return false;
+  return current.id === target.id
+    && String(current.endpoint || "") === String(target.endpoint || "")
+    && normalizeCloudProtocol(current.protocol) === normalizeCloudProtocol(target.protocol)
+    && normalizeCloudApiFormat(current.apiFormat) === normalizeCloudApiFormat(target.apiFormat)
+    && String(current.apiKey || "") === String(target.apiKey || "")
+    && String(current.customHeaders || "") === String(target.customHeaders || "");
+}
 
 // ── MCP Server Management Panel ──────────────────────────────────────────
 
@@ -394,6 +415,118 @@ function DebugLogPanel({ t }: { t: any }) {
         value={logText || "暂无调试日志"}
         className="h-[320px] w-full resize-none rounded-lg border border-[#27272a] bg-[#000000] p-3 font-mono text-[11px] leading-5 text-[#a1a1aa] outline-none"
       />
+    </div>
+  );
+}
+
+function TaskCenterSettingsPanel({ t }: { t: any }) {
+  const language = useAppStore((s) => s.config.language === "en" ? "en" : "zh");
+  const taskCenter = useAppStore((s) => s.taskCenter);
+  const setTaskCenterState = useAppStore((s) => s.setTaskCenterState);
+  const [testMessage, setTestMessage] = useState("");
+
+  const labels = {
+    title: language === "zh" ? "任务中枢集成" : "Task Center Integrations",
+    desc: language === "zh"
+      ? "外部来源默认关闭；未配置 token 时不会导入、回写或访问外部服务。"
+      : "External sources are disabled by default; without tokens MAIN will not import, write back, or call external services.",
+    scheduler: language === "zh" ? "调度器" : "Scheduler",
+    autoStart: language === "zh" ? "自动领取待执行任务" : "Auto-claim ready tasks",
+    maxReadOnly: language === "zh" ? "只读并发" : "Read-only concurrency",
+    maxWrite: language === "zh" ? "写入并发" : "Write concurrency",
+    integrations: language === "zh" ? "外部来源" : "External Sources",
+    enabled: language === "zh" ? "启用" : "Enable",
+    token: "Token",
+    query: language === "zh" ? "默认导入范围" : "Default import query",
+    test: language === "zh" ? "连接测试" : "Test Connection",
+    saved: language === "zh" ? "设置已保存到本地。" : "Settings are saved locally.",
+    disabled: language === "zh" ? "未启用或缺少 token，当前不会访问外部服务。" : "Disabled or missing token; no external service will be called.",
+  };
+
+  const updateScheduler = (patch: any) => {
+    setTaskCenterState((prev) => ({ ...prev, scheduler: { ...prev.scheduler, ...patch } }));
+  };
+
+  const updateIntegration = (key: "linear" | "github" | "feishu", patch: any) => {
+    setTaskCenterState((prev) => ({
+      ...prev,
+      integrations: {
+        ...prev.integrations,
+        [key]: { ...prev.integrations[key], ...patch },
+      },
+    }));
+  };
+
+  const testIntegration = (key: "linear" | "github" | "feishu") => {
+    const integration = taskCenter.integrations[key];
+    setTestMessage(
+      integration.enabled && String(integration.token || "").trim()
+        ? `${key}: ${labels.saved}`
+        : `${key}: ${labels.disabled}`,
+    );
+  };
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h3 className="text-[13px] font-bold text-[#a1a1aa] uppercase tracking-wider">{labels.title}</h3>
+        <p className="mt-2 text-[12px] leading-6 text-[#a1a1aa]">{labels.desc}</p>
+      </div>
+
+      <section className="rounded-lg border border-[#27272a] bg-[#050505] p-4">
+        <div className="text-[13px] font-bold text-[#e4e4e7]">{labels.scheduler}</div>
+        <label className="mt-4 flex items-center gap-3 text-[12px] text-[#d4d4d8]">
+          <input type="checkbox" checked={taskCenter.scheduler.autoStart} onChange={(event) => updateScheduler({ autoStart: event.target.checked })} />
+          {labels.autoStart}
+        </label>
+        <div className="mt-4 grid grid-cols-2 gap-3">
+          <label className="text-[12px] text-[#a1a1aa]">
+            {labels.maxReadOnly}
+            <input type="number" min={1} max={8} value={taskCenter.scheduler.maxReadOnlyConcurrency} onChange={(event) => updateScheduler({ maxReadOnlyConcurrency: Number(event.target.value || 1) })} className="mt-2 w-full rounded-md border border-[#27272a] bg-[#000000] p-2 text-white" />
+          </label>
+          <label className="text-[12px] text-[#a1a1aa]">
+            {labels.maxWrite}
+            <input type="number" min={1} max={2} value={taskCenter.scheduler.maxWriteConcurrency} onChange={(event) => updateScheduler({ maxWriteConcurrency: Number(event.target.value || 1) })} className="mt-2 w-full rounded-md border border-[#27272a] bg-[#000000] p-2 text-white" />
+          </label>
+        </div>
+      </section>
+
+      <section className="space-y-3">
+        <div className="text-[13px] font-bold text-[#e4e4e7]">{labels.integrations}</div>
+        {(["linear", "github", "feishu"] as const).map((key) => {
+          const integration = taskCenter.integrations[key];
+          return (
+            <div key={key} className="rounded-lg border border-[#27272a] bg-[#050505] p-4">
+              <div className="flex items-center justify-between gap-3">
+                <div className="text-[13px] font-bold capitalize text-[#e4e4e7]">{key}</div>
+                <label className="flex items-center gap-2 text-[12px] text-[#d4d4d8]">
+                  <input type="checkbox" checked={integration.enabled} onChange={(event) => updateIntegration(key, { enabled: event.target.checked })} />
+                  {labels.enabled}
+                </label>
+              </div>
+              <div className="mt-3 grid gap-3 md:grid-cols-2">
+                <label className="text-[12px] text-[#a1a1aa]">
+                  {labels.token}
+                  <input type="password" value={integration.token || ""} onChange={(event) => updateIntegration(key, { token: event.target.value })} className="mt-2 w-full rounded-md border border-[#27272a] bg-[#000000] p-2 font-mono text-white" />
+                </label>
+                <label className="text-[12px] text-[#a1a1aa]">
+                  {labels.query}
+                  <input type="text" value={integration.defaultImportQuery || ""} onChange={(event) => updateIntegration(key, { defaultImportQuery: event.target.value })} className="mt-2 w-full rounded-md border border-[#27272a] bg-[#000000] p-2 text-white" />
+                </label>
+              </div>
+              <div className="mt-3 flex justify-end">
+                <button onClick={() => testIntegration(key)} className="rounded-md border border-[#27272a] bg-[#09090b] px-3 py-2 text-[12px] text-[#d4d4d8] transition-colors hover:bg-[#18181b] hover:text-white">
+                  {labels.test}
+                </button>
+              </div>
+            </div>
+          );
+        })}
+      </section>
+
+      {testMessage && (
+        <div className="rounded-md border border-[#27272a] bg-[#000000] px-3 py-2 text-[12px] text-[#a1a1aa]">{testMessage}</div>
+      )}
     </div>
   );
 }
@@ -868,7 +1001,12 @@ export default function SettingsModal({
   const [isTestingCloudConnection, setIsTestingCloudConnection] = useState(false);
   const [cloudModelInputMode, setCloudModelInputMode] = useState<"select" | "manual">("manual");
   const [cloudFetchMsg, setCloudFetchMsg] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
-  const [cloudProbeMsg, setCloudProbeMsg] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
+  const [cloudProbeMsg, setCloudProbeMsg] = useState<{ text: string; type: 'success' | 'warning' | 'error' } | null>(null);
+  const [cloudConnectionStatus, setCloudConnectionStatus] = useState<{
+    fingerprint: string;
+    model: string;
+    text: string;
+  } | null>(null);
   const [cloudSaveMsg, setCloudSaveMsg] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
   const [localFetchMsg, setLocalFetchMsg] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
   const [systemMemory, setSystemMemory] = useState<{ total_gb: number; available_gb: number; total_bytes?: number; available_bytes?: number } | null>(null);
@@ -1056,10 +1194,27 @@ export default function SettingsModal({
     : cloudApiFormat === "responses"
       ? "Responses API 可填写 API 根地址（如 https://api.openai.com/v1），也支持直接粘贴完整的 /responses 请求地址"
       : "OpenAI Chat Completions 通常填写 API 根地址（常见以 /v1 结尾），也支持直接粘贴完整的 /chat/completions 地址";
+  const cloudConnectionFingerprint = useMemo(() => buildCloudConnectionFingerprint(draftCloudConfig), [
+    draftCloudConfig.apiFormat,
+    draftCloudConfig.apiKey,
+    draftCloudConfig.customHeaders,
+    draftCloudConfig.endpoint,
+    draftCloudConfig.model,
+    draftCloudConfig.protocol,
+  ]);
+  const activeCloudConnectionStatus = cloudConnectionStatus?.fingerprint === cloudConnectionFingerprint
+    ? cloudConnectionStatus
+    : null;
 
   useEffect(() => {
     cloudDraftServerRef.current = cloudDraftServer;
   }, [cloudDraftServer]);
+
+  useEffect(() => {
+    if (cloudConnectionStatus && cloudConnectionStatus.fingerprint !== cloudConnectionFingerprint) {
+      setCloudConnectionStatus(null);
+    }
+  }, [cloudConnectionFingerprint, cloudConnectionStatus]);
 
   useEffect(() => {
     if (!isOpen || settingsTab !== "cloud") return;
@@ -1203,6 +1358,7 @@ export default function SettingsModal({
     setCloudFetchMsg(null);
     setCloudProbeMsg(null);
     setCloudSaveMsg(null);
+    setCloudConnectionStatus(null);
     setCloudModelInputMode((cloudModelsByServer[serverId] || []).length > 0 ? "select" : "manual");
   }, [cloudModelsByServer, cloudServers, commitCloudServers, setConfig]);
 
@@ -1213,6 +1369,7 @@ export default function SettingsModal({
     setCloudFetchMsg(null);
     setCloudProbeMsg(null);
     setCloudSaveMsg(null);
+    setCloudConnectionStatus(null);
     setCloudModelInputMode("manual");
   }, [makeBlankCloudServerDraft]);
 
@@ -1227,6 +1384,7 @@ export default function SettingsModal({
     persistCloudServer({ ...cloudDraftServer, name, endpoint });
     setCloudFetchMsg(null);
     setCloudProbeMsg(null);
+    setCloudConnectionStatus(null);
     setCloudSaveMsg({ text: "已保存服务器配置", type: "success" });
   }, [cloudDraftServer, persistCloudServer]);
 
@@ -1237,6 +1395,7 @@ export default function SettingsModal({
       setCloudFetchMsg(null);
       setCloudProbeMsg(null);
       setCloudSaveMsg(null);
+      setCloudConnectionStatus(null);
       return;
     }
     setConfig((prev) => {
@@ -1268,6 +1427,7 @@ export default function SettingsModal({
     }
     setCloudFetchMsg(null);
     setCloudProbeMsg(null);
+    setCloudConnectionStatus(null);
     setCloudSaveMsg(null);
   }, [cloudDraftMode, cloudDraftServer, cloudModelsByServer, cloudServers, commitCloudServers, savedActiveCloudServer, setConfig]);
 
@@ -1289,12 +1449,14 @@ export default function SettingsModal({
     }, { clearModels: true });
     setCloudFetchMsg(null);
     setCloudProbeMsg(null);
+    setCloudConnectionStatus(null);
   };
 
   const handleCloudApiFormatChange = (e) => {
     const nextApiFormat = normalizeCloudApiFormat(e.target.value);
     updateCloudDraftServer({ apiFormat: nextApiFormat });
     setCloudProbeMsg(null);
+    setCloudConnectionStatus(null);
   };
 
   const refreshCloudModels = useCallback(async (serverOverride = null) => {
@@ -1365,6 +1527,13 @@ export default function SettingsModal({
 
     const endpoint = draftCloudConfig.endpoint?.trim();
     const testModel = draftCloudConfig.model?.trim() || cloudAvailableModels[0] || "";
+    const targetServer = cloudDraftServer ? {
+      ...cloudDraftServer,
+      apiFormat: cloudApiFormat,
+      endpoint,
+      model: testModel,
+      protocol: cloudProtocol,
+    } : null;
     if (!endpoint) {
       setCloudProbeMsg({ text: "请先填写 API Endpoint", type: "error" });
       return;
@@ -1376,17 +1545,22 @@ export default function SettingsModal({
 
     setIsTestingCloudConnection(true);
     setCloudProbeMsg(null);
+    setCloudConnectionStatus(null);
 
     try {
       const headers = buildCloudHeaders(cloudProtocol, draftCloudConfig.apiKey || "", true, draftCloudConfig.customHeaders);
       let effectiveApiFormat = cloudApiFormat;
       let payload: unknown = null;
+      let successfulResponsesMode: string | null = null;
+      const probeMessages = [{ role: "user", content: "你好，请只回复 ok" }];
 
-      const sendJsonProbe = async (url: string, body: Record<string, unknown>) => {
+      const sendJsonProbe = async (url: string, body: Record<string, unknown>, stage: "base" | "advanced", mode?: string | null) => {
         let lastError: Error | null = null;
         console.log("[cloud-test] probe request", JSON.stringify({
+          stage,
           url,
           model: body.model,
+          mode: mode ?? null,
           hasInstructions: typeof body.instructions === "string" && body.instructions.length > 0,
           inputType: Array.isArray(body.input)
             ? body.input[0] && typeof body.input[0] === "object" && Array.isArray(body.input[0].content)
@@ -1423,63 +1597,65 @@ export default function SettingsModal({
         throw lastError ?? new Error("Cloud probe failed without a concrete error.");
       };
 
-      if (cloudProtocol === "anthropic") {
-        const url = buildCloudMessagesApiUrl(endpoint, cloudProtocol, cloudApiFormat);
-        payload = await sendJsonProbe(url, buildAnthropicRequestBody({
-          messages: [{ role: "user", content: "你好，请只回复 ok" }],
+      const runResponsesProbe = async (includeAdvanced: boolean, preferredMode?: string | null) => {
+        const url = buildCloudMessagesApiUrl(endpoint, cloudProtocol, "responses");
+        let candidates = buildOpenAiResponsesProbeRequestCandidates({
+          messages: probeMessages,
           model: testModel,
-          maxTokens: 32,
-          stream: false,
-          temperature: draftCloudConfig.temperature ?? 0.2,
-          topP: draftCloudConfig.topP ?? 0.95,
-        }));
-      } else {
+          includeAdvanced,
+          disableResponseStorage: draftCloudConfig.disableResponseStorage,
+          reasoningEffort: draftCloudConfig.reasoningEffort,
+        });
+        if (preferredMode) {
+          candidates = [
+            ...candidates.filter((candidate) => candidate.mode === preferredMode),
+            ...candidates.filter((candidate) => candidate.mode !== preferredMode),
+          ];
+        }
+
+        let lastCandidateError = null;
+        for (const candidate of candidates) {
+          try {
+            return {
+              payload: await sendJsonProbe(url, candidate.body, includeAdvanced ? "advanced" : "base", candidate.mode),
+              mode: candidate.mode,
+            };
+          } catch (candidateErr) {
+            lastCandidateError = candidateErr;
+            const errMsg = candidateErr instanceof Error ? candidateErr.message : String(candidateErr);
+            if (!isProviderCompatibilityErrorMessage(errMsg) && !isRetryableCloudErrorMessage(errMsg)) throw candidateErr;
+          }
+        }
+
+        throw lastCandidateError ?? new Error("Responses probe failed without a compatibility fallback result.");
+      };
+
+      const runOpenAiBaseProbe = async () => {
         const openAiProbeFormats = [cloudApiFormat, cloudApiFormat === "responses" ? "chat_completions" : "responses"];
         let lastError = null;
 
         for (const probeFormat of openAiProbeFormats) {
-          const url = buildCloudMessagesApiUrl(endpoint, cloudProtocol, probeFormat);
           try {
             if (probeFormat === "responses") {
-              const inputCandidates = buildOpenAiResponsesInputCandidates([
-                { role: "user", content: "你好，请只回复 ok" },
-              ]);
-              let lastCandidateError = null;
-
-              for (const candidate of inputCandidates) {
-                try {
-                  payload = await sendJsonProbe(url, {
-                    model: testModel,
-                    input: candidate.input,
-                    ...buildOpenAiResponsesRequestExtras({
-                      disableResponseStorage: draftCloudConfig.disableResponseStorage,
-                      reasoningEffort: draftCloudConfig.reasoningEffort,
-                    }),
-                  });
-                  effectiveApiFormat = probeFormat;
-                  lastError = null;
-                  lastCandidateError = null;
-                  break;
-                } catch (candidateErr) {
-                  lastCandidateError = candidateErr;
-                  const errMsg = candidateErr instanceof Error ? candidateErr.message : String(candidateErr);
-                  if (!isProviderCompatibilityErrorMessage(errMsg) && !isRetryableCloudErrorMessage(errMsg)) throw candidateErr;
-                }
-              }
-
-              if (payload != null) break;
-              throw lastCandidateError ?? new Error("Responses probe failed without a compatibility fallback result.");
+              const result = await runResponsesProbe(false);
+              return {
+                payload: result.payload,
+                effectiveApiFormat: probeFormat,
+                responsesMode: result.mode,
+              };
             }
 
-            payload = await sendJsonProbe(url, {
-              model: testModel,
-              messages: [{ role: "user", content: "你好，请只回复 ok" }],
-              stream: false,
-              max_tokens: 32,
-            });
-            effectiveApiFormat = probeFormat;
-            lastError = null;
-            break;
+            const url = buildCloudMessagesApiUrl(endpoint, cloudProtocol, probeFormat);
+            return {
+              payload: await sendJsonProbe(url, {
+                model: testModel,
+                messages: probeMessages,
+                stream: false,
+                max_tokens: 32,
+              }, "base", "chat_completions"),
+              effectiveApiFormat: probeFormat,
+              responsesMode: null,
+            };
           } catch (probeErr) {
             lastError = probeErr;
             const errMsg = probeErr instanceof Error ? probeErr.message : String(probeErr);
@@ -1487,10 +1663,27 @@ export default function SettingsModal({
           }
         }
 
-        if (payload == null) {
-          throw lastError ?? new Error("OpenAI probe failed without a compatibility fallback result.");
-        }
+        throw lastError ?? new Error("OpenAI probe failed without a compatibility fallback result.");
+      };
+
+      if (cloudProtocol === "anthropic") {
+        const url = buildCloudMessagesApiUrl(endpoint, cloudProtocol, cloudApiFormat);
+        payload = await sendJsonProbe(url, buildAnthropicRequestBody({
+          messages: probeMessages,
+          model: testModel,
+          maxTokens: 32,
+          stream: false,
+          temperature: draftCloudConfig.temperature ?? 0.2,
+          topP: draftCloudConfig.topP ?? 0.95,
+        }), "base", "anthropic");
+      } else {
+        const result = await runOpenAiBaseProbe();
+        payload = result.payload;
+        effectiveApiFormat = result.effectiveApiFormat;
+        successfulResponsesMode = result.responsesMode;
       }
+
+      if (cloudDraftServer && !isSameCloudConnectionTarget(cloudDraftServerRef.current, targetServer)) return;
 
       if (cloudProtocol === "openai" && effectiveApiFormat !== cloudApiFormat) {
         updateCloudDraftServer({ apiFormat: effectiveApiFormat });
@@ -1506,13 +1699,57 @@ export default function SettingsModal({
       const reply = cloudProtocol === "anthropic"
         ? extractAnthropicResponseText(payload).trim()
         : extractOpenAiResponseText(payload, effectiveApiFormat).trim();
+      const switchedText = cloudProtocol === "openai" && effectiveApiFormat !== cloudApiFormat
+        ? `，已自动切换到 ${effectiveApiFormat === "responses" ? "Responses API" : "Chat Completions"}`
+        : "";
+      const statusFingerprint = buildCloudConnectionFingerprint({
+        ...(targetServer || draftCloudConfig),
+        apiFormat: effectiveApiFormat,
+        model: testModel,
+      }, effectiveApiFormat, testModel);
+
+      setCloudConnectionStatus({
+        fingerprint: statusFingerprint,
+        model: testModel,
+        text: `已连通 ${testModel}${switchedText}`,
+      });
 
       setCloudProbeMsg({
         text: reply
-          ? `连通成功，${testModel} 返回：${reply.slice(0, 120)}${cloudProtocol === "openai" && effectiveApiFormat !== cloudApiFormat ? `（已自动切换到 ${effectiveApiFormat === "responses" ? "Responses API" : "Chat Completions"}）` : ""}。此测试是短文本非流式请求，真实任务会发送更长上下文。`
-          : `连通成功，${testModel} 已返回有效响应${cloudProtocol === "openai" && effectiveApiFormat !== cloudApiFormat ? `，并已自动切换到 ${effectiveApiFormat === "responses" ? "Responses API" : "Chat Completions"}` : ""}。此测试是短文本非流式请求，真实任务会发送更长上下文。`,
+          ? `基础连通成功，${testModel} 返回：${reply.slice(0, 120)}${switchedText}。`
+          : `基础连通成功，${testModel} 已返回有效响应${switchedText}。`,
         type: "success",
       });
+
+      const shouldRunAdvancedProbe = cloudProtocol === "openai"
+        && effectiveApiFormat === "responses"
+        && (
+          draftCloudConfig.disableResponseStorage !== false
+          || normalizeOpenAiReasoningEffort(draftCloudConfig.reasoningEffort) !== "none"
+        );
+
+      if (shouldRunAdvancedProbe) {
+        try {
+          await runResponsesProbe(true, successfulResponsesMode);
+          if (!cloudDraftServer || isSameCloudConnectionTarget(cloudDraftServerRef.current, {
+            ...targetServer,
+            apiFormat: effectiveApiFormat,
+          })) {
+            setCloudProbeMsg({ text: `高级参数也已通过：store/reasoning 与当前配置兼容。`, type: "success" });
+          }
+        } catch (advancedErr) {
+          if (!cloudDraftServer || isSameCloudConnectionTarget(cloudDraftServerRef.current, {
+            ...targetServer,
+            apiFormat: effectiveApiFormat,
+          })) {
+            const errMsg = advancedErr instanceof Error ? advancedErr.message : String(advancedErr);
+            setCloudProbeMsg({
+              text: `基础连接可用，但 store/reasoning 高级参数未通过：${errMsg}。真实任务仍会按当前配置发送；如频繁波动，可把 Reasoning Effort 调低或设为 None。`,
+              type: "warning",
+            });
+          }
+        }
+      }
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       const protocolHint = cloudProtocol === "anthropic" && errMsg.includes("/v1/messages")
@@ -1720,6 +1957,7 @@ export default function SettingsModal({
             <button onClick={() => setSettingsTab('cloud')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'cloud' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.cloudSetup}</button>
             <button onClick={() => setSettingsTab('context')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'context' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.contextSetup}</button>
             <button onClick={() => setSettingsTab('mcp')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'mcp' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>MCP 服务器</button>
+            <button onClick={() => setSettingsTab('task-center')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'task-center' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{config.language === "en" ? "Task Center" : "任务中枢"}</button>
             <button onClick={() => setSettingsTab('im')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'im' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.imAdapters}</button>
             <button onClick={() => setSettingsTab('data')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'data' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.dataManagement}</button>
             <button onClick={() => setSettingsTab('debug')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'debug' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.debugLog}</button>
@@ -1903,6 +2141,9 @@ export default function SettingsModal({
               setMcpDiscoveredTools={setMcpDiscoveredTools}
             />}
 
+            {/* TASK CENTER SETTINGS */}
+            {settingsTab === 'task-center' && <TaskCenterSettingsPanel t={t} />}
+
             {/* DATA MANAGEMENT */}
             {settingsTab === 'data' && <DataManagerPanel t={t} />}
 
@@ -1995,8 +2236,14 @@ export default function SettingsModal({
                       {cloudAvailableModels.length > 0 && (
                         <p data-testid="cloud-model-fetched-count" className="mt-2 text-[11px] text-[#71717a]">已拉取 {cloudAvailableModels.length} 个模型</p>
                       )}
+                      {activeCloudConnectionStatus && (
+                        <p data-testid="cloud-model-connected-status" className="mt-2 flex items-center gap-1.5 text-[12px] font-medium text-[#86d9a3]">
+                          <IconCheck className="h-3.5 w-3.5" />
+                          <span>{activeCloudConnectionStatus.text}</span>
+                        </p>
+                      )}
                       {cloudFetchMsg && <p className={`mt-2 text-[12px] ${cloudFetchMsg.type === 'error' ? 'text-[#f48771]' : 'text-[#86d9a3]'}`}>{cloudFetchMsg.text}</p>}
-                      {cloudProbeMsg && <p className={`mt-2 text-[12px] ${cloudProbeMsg.type === 'error' ? 'text-[#f48771]' : 'text-[#86d9a3]'}`}>{cloudProbeMsg.text}</p>}
+                      {cloudProbeMsg && <p className={`mt-2 text-[12px] ${cloudProbeMsg.type === 'error' ? 'text-[#f48771]' : cloudProbeMsg.type === 'warning' ? 'text-[#fbbf24]' : 'text-[#86d9a3]'}`}>{cloudProbeMsg.text}</p>}
                     </>
                   ) : (
                     <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">

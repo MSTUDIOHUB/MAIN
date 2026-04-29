@@ -36,9 +36,33 @@ test.beforeEach(async ({ page }) => {
       if (cmd === "proxy_request") {
         ((window as any).__CLOUD_REQUESTS__ ??= []).push({
           url: String(args?.url ?? ""),
+          method: String(args?.method ?? ""),
           headers: args?.headers ?? null,
+          body: args?.body ? JSON.parse(String(args.body)) : null,
         });
         const requestUrl = String(args?.url ?? "");
+        const method = String(args?.method ?? "GET").toUpperCase();
+        if (method === "POST") {
+          const body = args?.body ? JSON.parse(String(args.body)) : {};
+          const behavior = (window as any).__CLOUD_TEST_BEHAVIOR__ ?? "success";
+          if (behavior === "responses-fail-chat-succeeds" && requestUrl.includes("/responses")) {
+            throw new Error("HTTP 400: unsupported Responses API");
+          }
+          if (behavior === "advanced-fails" && (body.store === false || body.reasoning)) {
+            throw new Error("HTTP 400: unsupported parameter: store");
+          }
+          if (requestUrl.includes("/responses")) {
+            return JSON.stringify({ output_text: "ok" });
+          }
+          return JSON.stringify({
+            choices: [
+              {
+                message: { content: "ok" },
+                finish_reason: "stop",
+              },
+            ],
+          });
+        }
         const responseModels = requestUrl.includes("second-gateway.example")
           ? ["second-alpha", "second-beta"]
           : seededModels;
@@ -160,6 +184,62 @@ test("cloud settings refreshes models only on request and saves the selected mod
   await expect(page.getByTestId("cloud-server-name-input")).toHaveValue("Renamed Gateway");
   await page.getByTestId("cloud-server-save").click();
   await expect(page.getByTestId("cloud-server-item")).toContainText("Renamed Gateway");
+});
+
+test("cloud model test shows a persistent connected check and keeps the base probe minimal", async ({ page }) => {
+  await page.goto("/?e2eScenario=cloud-settings-model-select");
+
+  await page.getByTestId("cloud-model-refresh").click();
+  await expect(page.getByTestId("cloud-model-select")).toHaveValue("gpt-4.1");
+
+  await page.getByTestId("cloud-model-test").click();
+  await expect(page.getByTestId("cloud-model-connected-status")).toContainText("已连通 gpt-4.1");
+  await expect(page.getByTestId("cloud-model-connected-status")).toBeVisible();
+
+  const postRequests = await page.evaluate(() =>
+    ((window as any).__CLOUD_REQUESTS__ ?? []).filter((request: any) => request.method === "POST"),
+  );
+  expect(postRequests[0].url).toContain("/responses");
+  expect(postRequests[0].body.store).toBeUndefined();
+  expect(postRequests[0].body.reasoning).toBeUndefined();
+  expect(typeof postRequests[0].body.input).toBe("string");
+  expect(postRequests.some((request: any) => request.body?.store === false)).toBeTruthy();
+
+  await page.waitForTimeout(5200);
+  await expect(page.getByTestId("cloud-model-connected-status")).toBeVisible();
+
+  await page.getByTestId("cloud-model-select").selectOption("qwen-max");
+  await expect(page.getByTestId("cloud-model-connected-status")).toHaveCount(0);
+});
+
+test("cloud model test keeps the connected check when advanced Responses params fail", async ({ page }) => {
+  await page.goto("/?e2eScenario=cloud-settings-model-select");
+  await page.evaluate(() => {
+    (window as any).__CLOUD_TEST_BEHAVIOR__ = "advanced-fails";
+  });
+
+  await page.getByTestId("cloud-model-refresh").click();
+  await page.getByTestId("cloud-model-test").click();
+
+  await expect(page.getByTestId("cloud-model-connected-status")).toContainText("已连通 gpt-4.1");
+  await expect(page.getByText(/基础连接可用，但 store\/reasoning 高级参数未通过/)).toBeVisible();
+});
+
+test("cloud model test falls back from Responses to Chat Completions and records the switch", async ({ page }) => {
+  await page.goto("/?e2eScenario=cloud-settings-model-select");
+  await page.evaluate(() => {
+    (window as any).__CLOUD_TEST_BEHAVIOR__ = "responses-fail-chat-succeeds";
+  });
+
+  const apiFormatSelect = page.locator("select").filter({
+    has: page.locator("option[value='responses']"),
+  });
+
+  await page.getByTestId("cloud-model-refresh").click();
+  await page.getByTestId("cloud-model-test").click();
+
+  await expect(page.getByTestId("cloud-model-connected-status")).toContainText("已连通 gpt-4.1，已自动切换到 Chat Completions");
+  await expect(apiFormatSelect).toHaveValue("chat_completions");
 });
 
 test("cloud settings can add, switch, refresh, and delete server configs", async ({ page }) => {

@@ -14,6 +14,7 @@ import {
   IconFileTable,
   IconFileText,
   IconImageIcon,
+  IconPackage,
   IconTerminal,
 } from "./Icons";
 import { Terminal } from "@xterm/xterm";
@@ -23,6 +24,7 @@ import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneLight, vscDarkPlus } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { save } from "@tauri-apps/plugin-dialog";
 import PlanPanel from "./PlanPanel";
+import TaskCenterPanel from "./TaskCenterPanel";
 import WorkspaceTreePanel from "./WorkspaceTreePanel";
 import { buildLineDiff, getDiffStats } from "../lib/diff";
 import { getE2EResumeExecutionHandler, getE2ESavePlanDocumentHandler } from "../lib/e2e";
@@ -1327,6 +1329,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     showDiff,
     showPlanPanel,
     showTerminal,
+    showTaskCenterPanel,
     rightPanelTab,
     closeRightPanel,
     clearFileViewer,
@@ -1356,6 +1359,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     showDiff: useAppStore((s) => s.showDiff),
     showPlanPanel: useAppStore((s) => s.showPlanPanel),
     showTerminal: useAppStore((s) => s.showTerminal),
+    showTaskCenterPanel: useAppStore((s) => s.showTaskCenterPanel),
     rightPanelTab: useAppStore((s) => s.rightPanelTab),
     closeRightPanel: useAppStore((s) => s.closeRightPanel),
     clearFileViewer: useAppStore((s) => s.clearFileViewer),
@@ -1525,6 +1529,15 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
   };
   const hasPlanPanelContent = planArtifacts.length > 0 || fallbackPlanPreview.length > 0;
   const panelMeta = useMemo(() => {
+    if (rightPanelTab === "tasks") {
+      return {
+        icon: IconPackage,
+        title: language === "zh" ? "任务中枢" : "Task Center",
+        description: language === "zh"
+          ? "查看 AI 指令队列、执行状态、审批和运行日志。"
+          : "Track queued AI tasks, execution state, approvals, and run logs.",
+      };
+    }
     if (rightPanelTab === "diff") {
       return {
         icon: IconColumns,
@@ -1559,7 +1572,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     };
   }, [changeSummary.entries.length, currentWorkspace, fileViewerPath, language, latestPlanTurn?.title, rightPanelTab, viewedDiffTask?.target]);
 
-  const isVisible = (showPlanPanel && hasPlanPanelContent) || showDiff || showTerminal || showFilePanel;
+  const isVisible = (showPlanPanel && hasPlanPanelContent) || showDiff || showTerminal || showFilePanel || showTaskCenterPanel;
   const terminalSessionKey = resolveSessionRuntimeKey(resolveSessionWorkspaceKey(currentWorkspace), currentSessionId) || undefined;
 
   const fileCategory = useMemo(() => getFileCategory(fileViewerPath), [fileViewerPath]);
@@ -1648,6 +1661,10 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
               onApprove={approvePlan}
               onReject={rejectPlan}
             />
+          )}
+
+          {rightPanelTab === "tasks" && showTaskCenterPanel && (
+            <TaskCenterPanel />
           )}
 
           {rightPanelTab === "diff" && (

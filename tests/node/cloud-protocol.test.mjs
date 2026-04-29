@@ -61,6 +61,7 @@ async function loadCloudProtocolModule() {
 
 const {
   buildOpenAiResponsesInputCandidates,
+  buildOpenAiResponsesProbeRequestCandidates,
   buildOpenAiResponsesRequestExtras,
   buildOpenAiResponsesTranscript,
   extractOpenAiResponsesInstructions,
@@ -298,6 +299,37 @@ test("responses helpers build Codex-style store and reasoning options", () => {
       stream: false,
     },
   );
+});
+
+test("responses probe helpers keep base probes minimal and advanced probes explicit", () => {
+  const messages = [{ role: "user", content: "Ping" }];
+
+  const baseCandidates = buildOpenAiResponsesProbeRequestCandidates({
+    messages,
+    model: "gpt-5.4",
+    includeAdvanced: false,
+    disableResponseStorage: true,
+    reasoningEffort: "xhigh",
+  });
+
+  assert.equal(baseCandidates[0].mode, "transcript_text");
+  assert.equal(baseCandidates[0].body.model, "gpt-5.4");
+  assert.equal(baseCandidates[0].body.stream, false);
+  assert.equal(baseCandidates[0].body.store, undefined);
+  assert.equal(baseCandidates[0].body.reasoning, undefined);
+  assert.equal(typeof baseCandidates[0].body.input, "string");
+
+  const advancedCandidates = buildOpenAiResponsesProbeRequestCandidates({
+    messages,
+    model: "gpt-5.4",
+    includeAdvanced: true,
+    disableResponseStorage: true,
+    reasoningEffort: "xhigh",
+  });
+
+  assert.equal(advancedCandidates[0].mode, "transcript_text");
+  assert.equal(advancedCandidates[0].body.store, false);
+  assert.deepEqual(advancedCandidates[0].body.reasoning, { effort: "xhigh" });
 });
 
 test("cloud responses compact instructions preserve workspace write tools", () => {

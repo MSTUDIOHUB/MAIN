@@ -324,6 +324,7 @@ export function shouldPauseForReplyOptions(params: {
 }): boolean {
   const {
     replyOptions,
+    toolCallCount,
     workflowMode,
     hasStructuredProposal = false,
     hasReadyPlanArtifacts = false,
@@ -331,6 +332,7 @@ export function shouldPauseForReplyOptions(params: {
   } = params;
 
   if (!Array.isArray(replyOptions) || replyOptions.length === 0) return false;
+  if (toolCallCount > 0 && workflowMode === "edit") return false;
 
   if (workflowMode === "plan" && !isPlanApproved && (hasStructuredProposal || hasReadyPlanArtifacts)) {
     return false;

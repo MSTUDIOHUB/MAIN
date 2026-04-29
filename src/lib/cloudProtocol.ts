@@ -56,6 +56,11 @@ export interface OpenAiResponsesInputCandidate {
   input: string | Record<string, unknown>[];
 }
 
+export interface OpenAiResponsesProbeRequestCandidate {
+  mode: OpenAiResponsesInputCandidate["mode"];
+  body: Record<string, unknown>;
+}
+
 interface AnthropicTextBlock {
   type: "text";
   text: string;
@@ -685,6 +690,35 @@ export function buildOpenAiResponsesRequestExtras(options?: {
   }
 
   return extras;
+}
+
+export function buildOpenAiResponsesProbeRequestCandidates(options: {
+  messages: ProtocolChatMessage[];
+  model: string;
+  includeAdvanced?: boolean;
+  disableResponseStorage?: boolean;
+  reasoningEffort?: unknown;
+}): OpenAiResponsesProbeRequestCandidate[] {
+  const inputCandidates = buildOpenAiResponsesInputCandidates(options.messages);
+  const orderedCandidates = [
+    ...inputCandidates.filter((candidate) => candidate.mode === "transcript_text"),
+    ...inputCandidates.filter((candidate) => candidate.mode !== "transcript_text"),
+  ];
+  const extras = options.includeAdvanced
+    ? buildOpenAiResponsesRequestExtras({
+        disableResponseStorage: options.disableResponseStorage,
+        reasoningEffort: options.reasoningEffort,
+      })
+    : buildOpenAiResponsesRequestExtras();
+
+  return orderedCandidates.map((candidate) => ({
+    mode: candidate.mode,
+    body: {
+      model: options.model,
+      input: candidate.input,
+      ...extras,
+    },
+  }));
 }
 
 export function convertOpenAiToolsToResponses(tools: ToolDefinition[] | undefined): Record<string, unknown>[] {

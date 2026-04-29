@@ -33,7 +33,7 @@ import {
   type ProtocolChatMessage,
 } from "./cloudProtocol";
 import { computeContextBudgets } from "./contextTrim";
-import { isCloudGatewayTimeoutMessage, isRetryableCloudErrorMessage } from "./cloudRetry";
+import { isRetryableCloudErrorMessage } from "./cloudRetry";
 import { toError } from "./errorUtils";
 import { isNativeToolCompatibilityErrorMessage, isProviderCompatibilityErrorMessage, PROVIDER_COMPATIBILITY_TAG } from "./providerCompatibility";
 
@@ -537,12 +537,12 @@ async function requestOpenAiNonStreaming(
         ? convertOpenAiToolsToResponses(tools)
         : [];
       let lastCompatibilityError: Error | null = null;
-      let sawRetryableGatewayTimeout = false;
-      let gatewayTimeoutRetryUsed = false;
+      let sawRetryableGatewayError = false;
+      let gatewayRetryUsed = false;
 
       for (const candidate of inputCandidates) {
         if (signal?.aborted) throw createAbortError();
-        if (sawRetryableGatewayTimeout && candidate.mode === "input_text_array") {
+        if (sawRetryableGatewayError && candidate.mode === "input_text_array") {
           continue;
         }
         try {
@@ -586,13 +586,13 @@ async function requestOpenAiNonStreaming(
           }
           const isRetryableGatewayError = isRetryableCloudErrorMessage(errMsg);
           if (isRetryableGatewayError) {
-            sawRetryableGatewayTimeout = true;
-          }
-          if (isCloudGatewayTimeoutMessage(errMsg) && candidate.mode !== "transcript_text" && !gatewayTimeoutRetryUsed) {
-            if (signal?.aborted) throw createAbortError();
-            gatewayTimeoutRetryUsed = true;
-            console.warn(`[streaming] OpenAI responses retryable failure with ${candidate.mode}; retrying same reasoning effort with compact transcript input`, errMsg);
-            continue;
+            sawRetryableGatewayError = true;
+            if (candidate.mode !== "transcript_text" && !gatewayRetryUsed) {
+              if (signal?.aborted) throw createAbortError();
+              gatewayRetryUsed = true;
+              console.warn(`[streaming] OpenAI responses retryable gateway failure with ${candidate.mode}; retrying same reasoning effort with compact transcript input`, errMsg);
+              continue;
+            }
           }
           if (!isProviderCompatibilityErrorMessage(errMsg)) {
             throw lastCompatibilityError;

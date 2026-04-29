@@ -93,6 +93,15 @@ const PRE_APPROVAL_PLAN_FILE_NAMES = new Set(["requirements.md", "design.md", "b
 const EXECUTION_PLAN_FILE_NAMES = new Set(["requirements.md", "design.md", "tasks.md", "bugfix.md"]);
 const PLAN_ARTIFACT_MUTATION_TOOLS = new Set(["write_file", "replace_in_file"]);
 const PLAN_REPEAT_READ_LIMIT = 3;
+const EXECUTION_VERIFICATION_TOOL_NAMES = new Set([
+  "run_command",
+  "execute_command",
+  "send_pty_input",
+  "read_pty_buffer",
+  "read_pty_tail",
+  "read_pty_since",
+  "get_pty_status",
+]);
 
 /**
  * Returns true if a mutation targets a spec file inside `.MAIN/plans/`.
@@ -121,6 +130,19 @@ function isExecutionPlanArtifactWrite(name: string, args: Record<string, unknown
 function isTasksPlanWrite(name: string, args: Record<string, unknown>): boolean {
   const target = getPlanArtifactMutationTarget(name, args);
   return !!target && target.fileName === "tasks.md";
+}
+
+function isPlanArtifactPath(path: string): boolean {
+  return path.replace(/\\/g, "/").toLowerCase().includes(".main/plans/");
+}
+
+function isProjectSourceWriteResult(result: ToolExecutionResult): boolean {
+  return (
+    !result.isError &&
+    PLAN_ARTIFACT_MUTATION_TOOLS.has(result.name) &&
+    !!result.target &&
+    !isPlanArtifactPath(result.target)
+  );
 }
 
 // ── Tool argument validation ────────────────────────────────────────
@@ -1578,6 +1600,8 @@ export async function executeAgentLoop(
   let usedPlanRecoveryPrompt = false;
   let usedToolUnavailableRecoveryPrompt = false;
   const attemptedPlanWriteTargets: string[] = [];
+  let recentSuccessfulProjectWrite: { name: string; target: string } | null = null;
+  let recoveringFromEmptyAssistantReplyAfterWrite = false;
 
   // ── Strict Repeat Guard ──────────────────────────────────────────
   // Track recent tool calls to detect repetition loops. For read-only
@@ -2063,13 +2087,26 @@ export async function executeAgentLoop(
         return;
       }
 
+      const shouldForcePostWriteVerification =
+        workflowMode === "edit" &&
+        !!recentSuccessfulProjectWrite;
+
       callbacks.appendMessage({
         role: "user",
         content:
-          workflowMode === "chat"
+          shouldForcePostWriteVerification
+            ? buildMissingToolCallContinuationPrompt(
+                "post_write_verify",
+                callbacks.getPreferredLanguage(),
+                consecutiveEmptyResponseCount,
+              )
+            : workflowMode === "chat"
             ? "上一条回复是空的。请直接输出对用户可见的 Markdown 正文来回答用户；如果确实需要工具，请使用正式工具调用。不要只返回空消息，也不要只输出不可见的 thinking/analysis 标签。现在继续。"
             : "上一条回复是空的。请继续执行，并确保这次返回可见正文或正式工具调用；不要只返回空消息，也不要只输出不可见的 thinking/analysis 标签。现在继续。",
       });
+      if (shouldForcePostWriteVerification) {
+        recoveringFromEmptyAssistantReplyAfterWrite = true;
+      }
       continue;
     }
     consecutiveEmptyResponseCount = 0;
@@ -2427,6 +2464,16 @@ export async function executeAgentLoop(
               workflowMode,
               visibleText: normalized.visibleText,
               mainModeKey,
+              recentWrite: recentSuccessfulProjectWrite
+                ? {
+                    lastSuccessfulToolName: recentSuccessfulProjectWrite.name,
+                    lastSuccessfulTargetPath: recentSuccessfulProjectWrite.target,
+                    lastSuccessfulTargetOutsidePlan: !isPlanArtifactPath(recentSuccessfulProjectWrite.target),
+                    recoveringFromEmptyAssistantReply: recoveringFromEmptyAssistantReplyAfterWrite,
+                  }
+                : {
+                    recoveringFromEmptyAssistantReply: recoveringFromEmptyAssistantReplyAfterWrite,
+                  },
             });
         const shouldRepromptForMissingToolCall =
           (!hasMeaningfulVisibleText && workflowMode !== "chat") ||
@@ -2468,6 +2515,9 @@ export async function executeAgentLoop(
               consecutiveNoToolCount,
             ),
           };
+          if (missingToolCallRepromptKind === "post_write_verify") {
+            recoveringFromEmptyAssistantReplyAfterWrite = true;
+          }
           callbacks.appendMessage(continuationMsg);
           continue;
         }
@@ -2784,6 +2834,22 @@ export async function executeAgentLoop(
       if (abortController.signal.aborted) {
         callbacks.onStatusChange("idle");
         return;
+      }
+    }
+
+    for (const result of allResults) {
+      if (result.isError) continue;
+      if (isProjectSourceWriteResult(result)) {
+        recentSuccessfulProjectWrite = {
+          name: result.name,
+          target: result.target,
+        };
+        recoveringFromEmptyAssistantReplyAfterWrite = false;
+        continue;
+      }
+      if (EXECUTION_VERIFICATION_TOOL_NAMES.has(result.name)) {
+        recentSuccessfulProjectWrite = null;
+        recoveringFromEmptyAssistantReplyAfterWrite = false;
       }
     }
 

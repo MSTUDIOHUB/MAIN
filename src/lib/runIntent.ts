@@ -267,6 +267,10 @@ const WEAK_PLAN_PATTERNS = [
 
 const APPROVE_PLAN_PATTERNS = [
   /^开始执行[。.! ]*$/i,
+  /^(?:好|好的|那就|请)?[，,\s]*(?:可以[，,\s]*)?开始执行(?:设计方案|方案|计划)?了?[。.! ]*$/i,
+  /^(?:好|好的|那就|请)?[，,\s]*开始按(?:设计)?方案执行[。.! ]*$/i,
+  /^(?:好|好的|那就|请)?[，,\s]*按设计方案开始做[。.! ]*$/i,
+  /^(?:好|好的|那就|请)?[，,\s]*批准并开始执行[。.! ]*$/i,
   /^批准(?:执行|计划)?[。.! ]*$/i,
   /^批准进入执行[。.! ]*$/i,
   /^同意(?:执行|这个方案)?[。.! ]*$/i,
@@ -282,6 +286,22 @@ const RESUME_PLAN_PATTERNS = [
   /resume execution/i,
   /继续把(?:剩余)?任务做完/i,
 ];
+
+const PREVIOUS_TURN_CONTINUATION_PATTERNS = [
+  /^(?:继续|继续吧|接着来|接着写|接着做|继续做|继续处理|继续执行|继续推进|往下继续|接着上面|接着刚才)[。.!！\s]*$/i,
+  /^(?:继续|接着)(?:上次|上一轮|之前|刚才|前面|上面)(?:的)?(?:任务|操作|内容|步骤|流程)?[。.!！\s]*$/i,
+  /^(?:把|将)?(?:剩下|剩余|未完成|没完成)(?:的)?(?:任务|内容|步骤|操作)?(?:继续)?(?:做完|完成|跑完|执行完)[。.!！\s]*$/i,
+  /^(?:继续|接着)(?:运行|测试|验证|执行)(?:一下|它|这个程序|这个文件|前面的内容)?[。.!！\s]*$/i,
+  /^(?:go on|continue|keep going|proceed|resume)[.!！\s]*$/i,
+  /^(?:continue|resume|finish)(?: the)?(?: previous| last| remaining| unfinished)?(?: task| work| operation| step| execution| validation)?[.!！\s]*$/i,
+  /^(?:keep|carry) on(?: with)?(?: the)?(?: previous| last| remaining| unfinished)?(?: task| work| operation| step)?[.!！\s]*$/i,
+];
+
+const RESUMABLE_PREVIOUS_TURN_STATUSES = new Set([
+  "stopped_no_action",
+  "stopped_no_output",
+  "error",
+]);
 
 const HIGH_RISK_PATTERNS: Array<{ key: string; patterns: RegExp[] }> = [
   {
@@ -628,6 +648,52 @@ export function isPlanContinuationAction(
   action: RunIntentControlAction | undefined,
 ): action is RunIntentControlAction {
   return !!action && CONTINUATION_INTENTS.has(action);
+}
+
+export function looksLikePlanContinuationOrApprovalInput(
+  input: string,
+  context: Pick<ResolveTurnRunIntentContext, "hasPlanArtifacts" | "planStage" | "isPlanApproved">,
+): boolean {
+  if (!context.hasPlanArtifacts) return false;
+
+  const normalizedInput = normalizeInput(input);
+  if (!normalizedInput) return false;
+
+  if (!context.isPlanApproved && matchesAny(normalizedInput, APPROVE_PLAN_PATTERNS)) {
+    return true;
+  }
+
+  return (
+    (context.isPlanApproved || context.planStage === "executing") &&
+    matchesAny(normalizedInput, RESUME_PLAN_PATTERNS)
+  );
+}
+
+export function looksLikePreviousTurnContinuationInput(input: string): boolean {
+  const normalizedInput = normalizeInput(input);
+  if (!normalizedInput) return false;
+  return matchesAny(normalizedInput, PREVIOUS_TURN_CONTINUATION_PATTERNS);
+}
+
+export function isResumablePreviousTurnStatus(status?: string | null): boolean {
+  return !!status && RESUMABLE_PREVIOUS_TURN_STATUSES.has(status);
+}
+
+export function shouldContinuePreviousTurnFromInput(
+  input: string,
+  context: {
+    currentTurnIntent?: ResolvedUserIntent | null;
+    currentTurnStatus?: string | null;
+    hasCurrentTurn?: boolean;
+    hasTurnActivity?: boolean;
+  },
+): boolean {
+  if (!looksLikePreviousTurnContinuationInput(input)) return false;
+  if (!context.hasCurrentTurn) return false;
+  if (!context.currentTurnIntent) return false;
+  if (!isResumablePreviousTurnStatus(context.currentTurnStatus)) return false;
+  if (context.hasTurnActivity === false) return false;
+  return true;
 }
 
 export function resolveTurnRunIntent(

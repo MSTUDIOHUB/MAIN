@@ -313,6 +313,42 @@ test("OpenAI Responses retries 524 failures with compact input while preserving 
   assert.equal(typeof requests[1].input, "string");
 });
 
+test("OpenAI Responses retries 502 upstream failures with compact input", async () => {
+  const requests = [];
+  const { streamChatCompletion } = await loadStreamingModule(async (_command, args) => {
+    const body = JSON.parse(args.body);
+    requests.push(body);
+    if (requests.length === 1) {
+      throw new Error('HTTP 502: {"error":{"type":"upstream_error"}}');
+    }
+    return JSON.stringify({ output_text: "ok after upstream fallback" });
+  });
+
+  const result = await streamChatCompletion(
+    [{ role: "user", content: "生成长回答" }],
+    {
+      baseUrl: "https://www.aiwanwu.cc/v1",
+      apiKey: "test-key",
+      model: "gpt-5.5",
+      apiProtocol: "openai",
+      apiFormat: "responses",
+      useRustProxy: true,
+      reasoningEffort: "xhigh",
+    },
+    {
+      onToken: () => {},
+      onDone: () => {},
+      onError: (error) => { throw error; },
+    },
+  );
+
+  assert.equal(result.content, "ok after upstream fallback");
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0].reasoning.effort, "xhigh");
+  assert.equal(requests[1].reasoning.effort, "xhigh");
+  assert.equal(typeof requests[1].input, "string");
+});
+
 test("OpenAI Responses sends compacted system instructions for cloud requests", async () => {
   const requests = [];
   const { streamChatCompletion } = await loadStreamingModule(async (_command, args) => {

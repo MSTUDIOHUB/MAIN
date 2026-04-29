@@ -142,3 +142,52 @@ test("second missing-tool retry uses strict single-tool-call wording", () => {
   assert.match(prompt, /不要输出任何普通正文/);
   assert.match(prompt, /write_file/);
 });
+
+test("edit mode uses post-write verification reprompt after a recent project write", () => {
+  const kind = resolveMissingToolCallRepromptKind({
+    workflowMode: "edit",
+    mainModeKey: "main_mode",
+    visibleText: "我将运行 python snake.py 来验证这个游戏是否正常启动。",
+    recentWrite: {
+      lastSuccessfulToolName: "write_file",
+      lastSuccessfulTargetPath: "snake.py",
+      lastSuccessfulTargetOutsidePlan: true,
+      recoveringFromEmptyAssistantReply: true,
+    },
+  });
+
+  assert.equal(kind, "post_write_verify");
+});
+
+test("plan artifact writes do not trigger post-write verification reprompts", () => {
+  const kind = resolveMissingToolCallRepromptKind({
+    workflowMode: "edit",
+    mainModeKey: "main_mode",
+    visibleText: "我将运行 python snake.py 来验证这个游戏是否正常启动。",
+    recentWrite: {
+      lastSuccessfulToolName: "write_file",
+      lastSuccessfulTargetPath: ".MAIN/plans/requirements.md",
+      lastSuccessfulTargetOutsidePlan: false,
+      recoveringFromEmptyAssistantReply: true,
+    },
+  });
+
+  assert.notEqual(kind, "post_write_verify");
+});
+
+test("post-write verification prompt prefers immediate run_command validation", () => {
+  const prompt = buildMissingToolCallContinuationPrompt("post_write_verify", "zh");
+
+  assert.match(prompt, /立即执行真实验证/);
+  assert.match(prompt, /run_command/);
+  assert.match(prompt, /execute_command/);
+  assert.match(prompt, /不要再输出“我将运行\/测试\/验证”/);
+});
+
+test("second post-write verification retry requires a single tool call with no prose", () => {
+  const prompt = buildMissingToolCallContinuationPrompt("post_write_verify", "zh", 2);
+
+  assert.match(prompt, /只输出一个 `<tool_use>` 工具调用块/);
+  assert.match(prompt, /不要输出任何普通正文/);
+  assert.match(prompt, /run_command/);
+});

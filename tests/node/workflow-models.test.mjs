@@ -248,6 +248,17 @@ test("mergePlanTasks preserves completed task history when the latest tasks.md o
   assert.equal(merged.find((task) => task.text.includes("BattleManager"))?.retained, false);
 });
 
+test("mergePlanTasks treats completion suffixes as the same task identity", () => {
+  const previous = extractPlanTasks("- [ ] 保存方案供用户留档\n- [ ] 批准执行并完成最终收尾");
+  const latest = extractPlanTasks("- [x] 保存方案供用户留档（已完成）\n- [ ] 批准执行并完成最终收尾");
+  const merged = mergePlanTasks(previous, latest, true);
+
+  assert.equal(merged.length, 2);
+  assert.equal(merged[0].text, "保存方案供用户留档（已完成）");
+  assert.equal(merged[0].status, "completed");
+  assert.equal(merged[0].retained, false);
+});
+
 test("findDroppedPlanTasks detects task deletion from rewritten tasks.md", () => {
   const previous = extractPlanTasks("- [x] 任务1：完善 BattleUnit.cs\n- [ ] 任务2：更新 BattleManager.cs");
   const latest = extractPlanTasks("- [ ] 任务2：更新 BattleManager.cs");

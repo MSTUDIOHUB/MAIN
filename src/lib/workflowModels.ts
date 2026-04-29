@@ -11,7 +11,7 @@ import {
 
 // region: 共享类型
 
-export type RightPanelTab = "plan" | "diff" | "terminal" | "file";
+export type RightPanelTab = "plan" | "diff" | "terminal" | "file" | "tasks";
 
 export function detectDominantLanguage(text: string, fallback: "zh" | "en" = "zh"): "zh" | "en" {
   const hanCount = (text.match(/[\u3400-\u9fff]/g) || []).length;
@@ -382,6 +382,7 @@ function normalizePlanTaskText(text: string): string {
   return String(text || "")
     .replace(/\s*→\s*对应需求[:：]?\s*REQ-[A-Za-z0-9_-]+/i, "")
     .replace(/^\s*(?:任务\s*)?\d+\s*[.、):：-]\s*/i, "")
+    .replace(/\s*[（(]\s*(?:已完成|完成|done|completed)\s*[）)]\s*$/i, "")
     .replace(/\s+/g, " ")
     .trim();
 }

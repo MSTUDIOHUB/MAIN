@@ -206,6 +206,7 @@ export default function Composer({
   );
   const isGameStudioMode = selectedMainModeKey === "game_studio";
   const isMainMode = selectedMainModeKey === "main_mode";
+  const isTaskCenterMode = selectedMainModeKey === "task_center";
   const isLightTheme = themeMode === "light";
   const isComposerSubmitting = isStreaming || isSubmitPending;
   const showExecutionProgress =
@@ -240,6 +241,9 @@ export default function Composer({
     game_studio: language === "en"
       ? "Run MAIN GAME STUDIO workflows, slash commands, and specialist studio agents."
       : "运行 MAIN GAME STUDIO 工作流、slash 命令和专业工作室 Agent。",
+    task_center: language === "en"
+      ? "Turn AI instructions into queued, reviewable, resumable task runs."
+      : "把 AI 指令变成可排队、可审批、可恢复的任务流。",
   };
   const mentionSearchLabel = mentionQuery
     ? (language === "en" ? `Search: ${mentionQuery}` : `搜索：${mentionQuery}`)
@@ -1099,6 +1103,8 @@ export default function Composer({
     ? "..."
     : isGameStudioMode
     ? (language === "en" ? "Ask the studio, or type / for workflows and specialists..." : "询问工作室中枢，或输入 / 打开工作流和专家面板...")
+    : isTaskCenterMode
+    ? (language === "en" ? "Create a queued task for MAIN to plan, run, review, and resume..." : "创建一个可排队、可执行、可审批、可恢复的任务...")
     : language === "en"
     ? "Try: Summarize this folder, analyze these tables and write a report, extract the key conclusions, or plan first before execution..."
     : "例如：总结这个文件夹里的内容、分析这些表格并生成报告、提炼这批资料的关键结论，或先给我一个计划再执行...";

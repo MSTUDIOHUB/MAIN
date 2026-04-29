@@ -43,6 +43,10 @@ test("provider compatibility error helper matches weak OpenAI-compatible gateway
     true,
   );
   assert.equal(
+    isProviderCompatibilityErrorMessage("HTTP 400: Responses API is not supported"),
+    true,
+  );
+  assert.equal(
     isProviderCompatibilityErrorMessage('HTTP 502 Bad Gateway: {"error":{"message":"Upstream request failed","type":"upstream_error"}}'),
     false,
   );

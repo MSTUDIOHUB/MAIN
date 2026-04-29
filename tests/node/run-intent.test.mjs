@@ -59,9 +59,11 @@ function loadTranspiledModuleSync(sourcePath) {
 
 const {
   getIntentPolicy,
+  looksLikePreviousTurnContinuationInput,
   mapResolvedRunIntentToWorkflowMode,
   parseMainIntentShortcut,
   resolveTurnRunIntent,
+  shouldContinuePreviousTurnFromInput,
   shouldUseBlockingIntentPreflight,
 } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/runIntent.ts"),
@@ -228,4 +230,95 @@ test("game studio workflow slash bypasses MAIN plan interception", () => {
   );
   assert.equal(result.intent, "studio_workflow");
   assert.equal(result.bypassMainRouter, true);
+});
+
+test("natural Chinese approval phrases advance an existing plan into execution", () => {
+  const result = resolveTurnRunIntent(
+    "可以开始执行设计方案了",
+    createContext({
+      hasPlanArtifacts: true,
+      planStage: "design",
+      isPlanApproved: false,
+    }),
+  );
+
+  assert.equal(result.intent, "plan");
+  assert.equal(result.controlAction, "approve_plan");
+});
+
+test("approval phrasing does not trigger plan approval without plan artifacts", () => {
+  const result = resolveTurnRunIntent(
+    "可以开始执行设计方案了",
+    createContext({
+      hasPlanArtifacts: false,
+      planStage: "idle",
+      isPlanApproved: false,
+    }),
+  );
+
+  assert.notEqual(result.controlAction, "approve_plan");
+});
+
+test("ordinary direct execution without plan artifacts still resolves to execute", () => {
+  const result = resolveTurnRunIntent(
+    "现在就直接实现这个功能",
+    createContext({
+      hasPlanArtifacts: false,
+      planStage: "idle",
+      isPlanApproved: false,
+    }),
+  );
+
+  assert.equal(result.intent, "execute");
+});
+
+test("generic continuation phrases are recognized as previous-turn continuation", () => {
+  assert.equal(looksLikePreviousTurnContinuationInput("继续"), true);
+  assert.equal(looksLikePreviousTurnContinuationInput("把没完成的做完"), true);
+  assert.equal(looksLikePreviousTurnContinuationInput("continue previous task"), true);
+});
+
+test("continuation resumes an unfinished execute turn", () => {
+  assert.equal(
+    shouldContinuePreviousTurnFromInput("继续", {
+      currentTurnIntent: "execute",
+      currentTurnStatus: "stopped_no_action",
+      hasCurrentTurn: true,
+      hasTurnActivity: true,
+    }),
+    true,
+  );
+});
+
+test("continuation does not hijack completed or missing turns", () => {
+  assert.equal(
+    shouldContinuePreviousTurnFromInput("继续", {
+      currentTurnIntent: "execute",
+      currentTurnStatus: "completed_with_changes",
+      hasCurrentTurn: true,
+      hasTurnActivity: true,
+    }),
+    false,
+  );
+  assert.equal(
+    shouldContinuePreviousTurnFromInput("继续", {
+      currentTurnIntent: "execute",
+      currentTurnStatus: "stopped_no_action",
+      hasCurrentTurn: false,
+      hasTurnActivity: false,
+    }),
+    false,
+  );
+});
+
+test("non-continuation text still follows normal intent recognition", () => {
+  assert.equal(
+    shouldContinuePreviousTurnFromInput("请解释一下这段代码", {
+      currentTurnIntent: "execute",
+      currentTurnStatus: "stopped_no_action",
+      hasCurrentTurn: true,
+      hasTurnActivity: true,
+    }),
+    false,
+  );
 });

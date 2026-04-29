@@ -1,5 +1,6 @@
 import { finalizeStreamingTaskBlocks, useAppStore } from "../store/useAppStore";
 import { syncPlanArtifactAfterToolSuccess } from "./planArtifactSync";
+import { createDefaultTaskCenterState } from "./taskCenter";
 import { getPlanArtifactTitle } from "./workflowModels";
 import type { NexusModeKey } from "./gameStudioCatalog";
 
@@ -1135,8 +1136,10 @@ function seedGameStudioOnboardingScenario() {
             showDiff: false,
             showTerminal: false,
             showFilePanel: false,
+            showTaskCenterPanel: false,
             rightPanelTab: "plan",
             selectedDiffTaskId: null,
+            taskCenter: createDefaultTaskCenterState(),
           },
         },
       ],
