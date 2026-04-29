@@ -1009,7 +1009,7 @@ function seedPlanReplaceRefreshScenario() {
         artifactContent: current.planArtifacts.find((artifact) => artifact.kind === "tasks")?.content ?? "",
       });
     })();
-  }, 500);
+  }, 1500);
 
   const cleanup = () => {
     if (replaceTimer != null) window.clearTimeout(replaceTimer);
@@ -1598,7 +1598,7 @@ function seedStreamErrorRecoveryScenario() {
       agentStatus: "error",
       elapsedTime: 1,
     }));
-  }, 500);
+  }, 1500);
 
   bridge.getSnapshot = () => {
     const state = useAppStore.getState();

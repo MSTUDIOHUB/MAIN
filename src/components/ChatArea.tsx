@@ -1,7 +1,7 @@
 // @ts-nocheck
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { IconCheck, IconChevronDown, IconChevronRight, IconClose, IconCloud, IconCode, IconColumns, IconFileText, IconLogoM, IconStop, IconTerminal } from "./Icons";
+import { IconCheck, IconChevronDown, IconChevronRight, IconClose, IconCloud, IconCode, IconColumns, IconFileText, IconFolder, IconLogoM, IconStop, IconTerminal } from "./Icons";
 import ActionCard from "./ActionCard";
 import Composer from "./Composer";
 import JobListCard from "./JobListCard";
@@ -567,7 +567,10 @@ function getActiveTurnActivity(blocks: any[], turnStatus: string, language: "zh"
 function TurnActivityNotice({ text }: { text: string }) {
   if (!text) return null;
   return (
-    <div className="ml-9 flex items-center gap-2 rounded-2xl border border-[rgba(96,165,250,0.2)] bg-[rgba(37,99,235,0.08)] px-4 py-3 text-[12px] text-[#bfdbfe]">
+    <div
+      data-testid="turn-activity-notice"
+      className="ml-9 flex items-center gap-2 rounded-2xl border border-[rgba(96,165,250,0.2)] bg-[rgba(37,99,235,0.08)] px-4 py-3 text-[12px] text-[#bfdbfe]"
+    >
       <span className="h-2 w-2 rounded-full bg-[#60a5fa] shadow-[0_0_8px_rgba(96,165,250,0.8)] animate-pulse" />
       <span>{text}</span>
     </div>
@@ -1051,8 +1054,10 @@ export default function ChatArea({
     showDiff,
     showPlanPanel,
     showTerminal,
+    showFilePanel,
     rightPanelTab,
     openRightPanelTab,
+    openFileTreePanel,
     openDiffForTask,
     closeRightPanel,
     setShowDiff,
@@ -1076,8 +1081,10 @@ export default function ChatArea({
     showDiff: useAppStore((s) => s.showDiff),
     showPlanPanel: useAppStore((s) => s.showPlanPanel),
     showTerminal: useAppStore((s) => s.showTerminal),
+    showFilePanel: useAppStore((s) => s.showFilePanel),
     rightPanelTab: useAppStore((s) => s.rightPanelTab),
     openRightPanelTab: useAppStore((s) => s.openRightPanelTab),
+    openFileTreePanel: useAppStore((s) => s.openFileTreePanel),
     openDiffForTask: useAppStore((s) => s.openDiffForTask),
     closeRightPanel: useAppStore((s) => s.closeRightPanel),
     setShowDiff: useAppStore((s) => s.setShowDiff),
@@ -1401,11 +1408,12 @@ export default function ChatArea({
     };
   }, [taskFlow, isAutoScroll, isStreaming]);
 
-  const togglePanelTab = useCallback((tab: "plan" | "diff" | "terminal") => {
+  const togglePanelTab = useCallback((tab: "plan" | "diff" | "terminal" | "file") => {
     const isCurrentlyOpen =
       (tab === "plan" && showPlanPanel && rightPanelTab === "plan") ||
       (tab === "diff" && showDiff && rightPanelTab === "diff") ||
-      (tab === "terminal" && showTerminal && rightPanelTab === "terminal");
+      (tab === "terminal" && showTerminal && rightPanelTab === "terminal") ||
+      (tab === "file" && showFilePanel && rightPanelTab === "file");
 
     if (isCurrentlyOpen) {
       closeRightPanel();
@@ -1413,8 +1421,13 @@ export default function ChatArea({
     }
 
     if (tab === "plan" && !hasPlanPanelContent) return;
+    if (tab === "file") {
+      if (!currentWorkspace) return;
+      openFileTreePanel();
+      return;
+    }
     openRightPanelTab(tab);
-  }, [closeRightPanel, hasPlanPanelContent, openRightPanelTab, rightPanelTab, showDiff, showPlanPanel, showTerminal]);
+  }, [closeRightPanel, currentWorkspace, hasPlanPanelContent, openFileTreePanel, openRightPanelTab, rightPanelTab, showDiff, showFilePanel, showPlanPanel, showTerminal]);
 
   const renderBlock = (block, index) => {
     if (block.type === "user") {
@@ -1713,26 +1726,45 @@ export default function ChatArea({
             </button>
           )}
 
-          <div className="flex shrink-0 items-center rounded-[6px] border border-[#27272a] bg-[#09090b] p-[3px] shadow-sm" style={{ height: 28 }}>
-            {hasPlanPanelContent && (
-              <>
-                <button onClick={() => togglePanelTab("plan")} className={`flex shrink-0 items-center justify-center gap-1.5 whitespace-nowrap rounded-[4px] px-3 py-1 text-[10px] font-medium transition-colors ${showPlanPanel && rightPanelTab === "plan" ? "theme-subtle-bg" : "text-[#d4d4d8] hover:bg-[#18181b] hover:text-white"}`}>
-                  <IconFileText className="h-3.5 w-3.5" />
-                  {copy.planLabel}
-                  {!showPlanPanel && <span className="theme-bg theme-glow ml-0.5 h-1.5 w-1.5 rounded-full" />}
-                </button>
-                <div className="mx-[2px] h-3.5 w-[1px] bg-[#27272a]" />
-              </>
-            )}
-            <button onClick={() => togglePanelTab("diff")} className={`flex shrink-0 items-center justify-center gap-1.5 whitespace-nowrap rounded-[4px] px-3 py-1 text-[10px] font-medium transition-colors ${showDiff && rightPanelTab === "diff" ? "theme-subtle-bg" : "text-[#d4d4d8] hover:bg-[#18181b] hover:text-white"}`}>
-              <IconColumns className="h-3.5 w-3.5" />
-              {t.diff}
-              {activeDiffTask && !showDiff && <span className="theme-bg theme-glow ml-0.5 h-1.5 w-1.5 rounded-full" />}
+          {hasPlanPanelContent && (
+            <button
+              onClick={() => togglePanelTab("plan")}
+              className={`flex h-8 shrink-0 items-center justify-center gap-1.5 whitespace-nowrap rounded-[6px] border border-[#27272a] bg-[#09090b] px-3 text-[10px] font-medium transition-colors ${showPlanPanel && rightPanelTab === "plan" ? "theme-subtle-bg" : "text-[#d4d4d8] hover:bg-[#18181b] hover:text-white"}`}
+              title={copy.planLabel}
+              aria-label={copy.planLabel}
+            >
+              <IconFileText className="h-3.5 w-3.5" />
+              {copy.planLabel}
+              {!showPlanPanel && <span className="theme-bg theme-glow ml-0.5 h-1.5 w-1.5 rounded-full" />}
             </button>
-            <div className="mx-[2px] h-3.5 w-[1px] bg-[#27272a]" />
-            <button onClick={() => togglePanelTab("terminal")} className={`flex shrink-0 items-center justify-center gap-1.5 whitespace-nowrap rounded-[4px] px-3 py-1 text-[11px] font-medium transition-colors ${showTerminal && rightPanelTab === "terminal" ? "theme-subtle-bg" : "text-[#d4d4d8] hover:bg-[#18181b] hover:text-white"}`}>
+          )}
+
+          <div className="flex shrink-0 items-center gap-1">
+            <button
+              onClick={() => togglePanelTab("terminal")}
+              className={`panel-tab-icon-button flex h-7 w-7 shrink-0 items-center justify-center rounded-[7px] transition-all duration-150 ${showTerminal && rightPanelTab === "terminal" ? "is-active" : ""}`}
+              title={t.terminal}
+              aria-label={t.terminal}
+            >
               <IconTerminal className="h-3.5 w-3.5" />
-              {t.terminal}
+            </button>
+            <button
+              onClick={() => togglePanelTab("file")}
+              disabled={!currentWorkspace}
+              className={`panel-tab-icon-button flex h-7 w-7 shrink-0 items-center justify-center rounded-[7px] transition-all duration-150 disabled:cursor-not-allowed disabled:opacity-40 ${showFilePanel && rightPanelTab === "file" ? "is-active" : ""}`}
+              title={language === "zh" ? "文件" : "Files"}
+              aria-label={language === "zh" ? "文件" : "Files"}
+            >
+              <IconFolder className="h-3.5 w-3.5" />
+            </button>
+            <button
+              onClick={() => togglePanelTab("diff")}
+              className={`panel-tab-icon-button relative flex h-7 w-7 shrink-0 items-center justify-center rounded-[7px] transition-all duration-150 ${showDiff && rightPanelTab === "diff" ? "is-active" : ""}`}
+              title={t.diff}
+              aria-label={t.diff}
+            >
+              <IconColumns className="h-3.5 w-3.5" />
+              {activeDiffTask && !showDiff && <span className="theme-bg absolute right-1 top-1 h-1.5 w-1.5 rounded-full" />}
             </button>
           </div>
         </div>

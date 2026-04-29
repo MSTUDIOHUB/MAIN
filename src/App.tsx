@@ -5,7 +5,6 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 
 import Sidebar from "./components/Sidebar";
-import WorkspaceTreePanel from "./components/WorkspaceTreePanel";
 import ChatArea from "./components/ChatArea";
 import RightPanel from "./components/RightPanel";
 import SettingsModal from "./components/SettingsModal";
@@ -200,19 +199,13 @@ export default function App() {
   // ── Layout State ──────────────────────────────────────────────────────
   const rightPanelWidth = useAppStore((s) => s.rightPanelWidth);
   const sidebarWidth = useAppStore((s) => s.sidebarWidth);
-  const showWorkspaceTreePanel = useAppStore((s) => s.showWorkspaceTreePanel);
-  const workspaceTreePanelWidth = useAppStore((s) => s.workspaceTreePanelWidth);
   const setRightPanelWidth = useAppStore((s) => s.setRightPanelWidth);
   const setSidebarWidth = useAppStore((s) => s.setSidebarWidth);
-  const setShowWorkspaceTreePanel = useAppStore((s) => s.setShowWorkspaceTreePanel);
-  const toggleWorkspaceTreePanel = useAppStore((s) => s.toggleWorkspaceTreePanel);
-  const setWorkspaceTreePanelWidth = useAppStore((s) => s.setWorkspaceTreePanelWidth);
   const closeRightPanel = useAppStore((s) => s.closeRightPanel);
   const isRightPanelVisible = showPlanPanel || showDiff || showTerminal || showFilePanel;
   // isResizing is local UI state (mouse drag), not in the store
   const [isResizing, setIsResizing] = useState(false);
   const [isSidebarResizing, setIsSidebarResizing] = useState(false);
-  const [isWorkspaceTreeResizing, setIsWorkspaceTreeResizing] = useState(false);
   const [isWorkspaceDropActive, setIsWorkspaceDropActive] = useState(false);
   const pendingRightPanelWidthRef = useRef<number | null>(null);
   const rightPanelResizeFrameRef = useRef<number | null>(null);
@@ -1424,7 +1417,6 @@ export default function App() {
 
   const startResizing = (e: React.MouseEvent) => { e.preventDefault(); setIsResizing(true); };
   const startSidebarResizing = (e: React.MouseEvent) => { e.preventDefault(); setIsSidebarResizing(true); };
-  const startWorkspaceTreeResizing = (e: React.MouseEvent) => { e.preventDefault(); setIsWorkspaceTreeResizing(true); };
 
   const sidebarWidthRef = useRef(sidebarWidth);
   const languageRef = useRef(config.language);
@@ -1444,7 +1436,6 @@ export default function App() {
 
   useEffect(() => {
     const MIN_SIDEBAR_WIDTH = 220;
-    const MIN_WORKSPACE_TREE_WIDTH = 220;
     const MIN_RIGHT_PANEL_WIDTH = 340;
     const MIN_CHAT_INPUT_AREA_WIDTH = 368;
 
@@ -1476,19 +1467,13 @@ export default function App() {
     const onMouseMove = (e: MouseEvent) => {
       if (isResizing) {
         let w = window.innerWidth - e.clientX;
-        const workspaceTreeWidth = showWorkspaceTreePanel ? workspaceTreePanelWidth : 0;
         const maxRightPanelWidth = Math.max(
           MIN_RIGHT_PANEL_WIDTH,
-          window.innerWidth - sidebarWidth - workspaceTreeWidth - MIN_CHAT_INPUT_AREA_WIDTH,
+          window.innerWidth - sidebarWidth - MIN_CHAT_INPUT_AREA_WIDTH,
         );
         if (w < MIN_RIGHT_PANEL_WIDTH) w = MIN_RIGHT_PANEL_WIDTH;
         if (w > maxRightPanelWidth) w = maxRightPanelWidth;
         scheduleRightPanelWidth(w);
-      } else if (isWorkspaceTreeResizing) {
-        let w = e.clientX - sidebarWidth;
-        if (w < MIN_WORKSPACE_TREE_WIDTH) w = MIN_WORKSPACE_TREE_WIDTH;
-        if (w > 520) w = 520;
-        setWorkspaceTreePanelWidth(w);
       } else if (isSidebarResizing) {
         let w = e.clientX;
         if (w < MIN_SIDEBAR_WIDTH) w = MIN_SIDEBAR_WIDTH;
@@ -1500,10 +1485,9 @@ export default function App() {
       flushRightPanelWidth();
       setIsResizing(false);
       setIsSidebarResizing(false);
-      setIsWorkspaceTreeResizing(false);
     };
 
-    if (isResizing || isSidebarResizing || isWorkspaceTreeResizing) {
+    if (isResizing || isSidebarResizing) {
       window.addEventListener("mousemove", onMouseMove);
       window.addEventListener("mouseup", onMouseUp);
       document.body.style.cursor = "col-resize";
@@ -1524,60 +1508,36 @@ export default function App() {
   }, [
     isResizing,
     isSidebarResizing,
-    isWorkspaceTreeResizing,
     setRightPanelWidth,
     setSidebarWidth,
-    setWorkspaceTreePanelWidth,
-    showWorkspaceTreePanel,
     sidebarWidth,
-    workspaceTreePanelWidth,
   ]);
 
   useEffect(() => {
     const MIN_CENTER_WIDTH = 368;
     const MIN_SIDEBAR_WIDTH = 220;
-    const MIN_WORKSPACE_TREE_WIDTH = 220;
     const MIN_RIGHT_PANEL_WIDTH = 340;
 
     const clampLayout = () => {
       const totalWidth = window.innerWidth;
-      let nextShowWorkspaceTreePanel = showWorkspaceTreePanel;
-      const workspaceTreeWidth = nextShowWorkspaceTreePanel ? workspaceTreePanelWidth : 0;
       let rightWidth = isRightPanelVisible ? rightPanelWidth : 0;
 
       if (isRightPanelVisible) {
-        const minWithRightAndTree = MIN_CENTER_WIDTH + MIN_SIDEBAR_WIDTH + workspaceTreeWidth + MIN_RIGHT_PANEL_WIDTH;
         const minWithRightOnly = MIN_CENTER_WIDTH + MIN_SIDEBAR_WIDTH + MIN_RIGHT_PANEL_WIDTH;
 
-        if (nextShowWorkspaceTreePanel && totalWidth < minWithRightAndTree && totalWidth >= minWithRightOnly) {
-          nextShowWorkspaceTreePanel = false;
-          setShowWorkspaceTreePanel(false);
-        } else if (totalWidth < minWithRightOnly) {
+        if (totalWidth < minWithRightOnly) {
           closeRightPanel();
           rightWidth = 0;
         }
       }
 
-      const availableForTree = totalWidth - MIN_CENTER_WIDTH - sidebarWidth - rightWidth;
-      if (nextShowWorkspaceTreePanel) {
-        if (availableForTree < MIN_WORKSPACE_TREE_WIDTH) {
-          nextShowWorkspaceTreePanel = false;
-          setShowWorkspaceTreePanel(false);
-        } else if (workspaceTreePanelWidth > availableForTree) {
-          setWorkspaceTreePanelWidth(availableForTree);
-        }
-      }
-
-      const effectiveTreeWidth = nextShowWorkspaceTreePanel
-        ? Math.min(workspaceTreePanelWidth, Math.max(MIN_WORKSPACE_TREE_WIDTH, availableForTree))
-        : 0;
-      const nextSidebarMax = Math.max(MIN_SIDEBAR_WIDTH, totalWidth - rightWidth - effectiveTreeWidth - MIN_CENTER_WIDTH);
+      const nextSidebarMax = Math.max(MIN_SIDEBAR_WIDTH, totalWidth - rightWidth - MIN_CENTER_WIDTH);
       const nextSidebar = Math.min(sidebarWidth, nextSidebarMax);
       if (nextSidebar !== sidebarWidth) {
         setSidebarWidth(nextSidebar);
       }
 
-      const nextRightMax = Math.max(MIN_RIGHT_PANEL_WIDTH, totalWidth - nextSidebar - effectiveTreeWidth - MIN_CENTER_WIDTH);
+      const nextRightMax = Math.max(MIN_RIGHT_PANEL_WIDTH, totalWidth - nextSidebar - MIN_CENTER_WIDTH);
       if (isRightPanelVisible && rightPanelWidth > nextRightMax) {
         setRightPanelWidth(nextRightMax);
       }
@@ -1591,13 +1551,19 @@ export default function App() {
     isRightPanelVisible,
     rightPanelWidth,
     setRightPanelWidth,
-    setShowWorkspaceTreePanel,
     setSidebarWidth,
-    setWorkspaceTreePanelWidth,
-    showWorkspaceTreePanel,
     sidebarWidth,
-    workspaceTreePanelWidth,
   ]);
+
+  useEffect(() => {
+    const preventNativeContextMenu = (event: MouseEvent) => {
+      event.preventDefault();
+    };
+    window.addEventListener("contextmenu", preventNativeContextMenu, true);
+    return () => {
+      window.removeEventListener("contextmenu", preventNativeContextMenu, true);
+    };
+  }, []);
 
   useEffect(() => {
     if (!currentSessionId || taskFlow.length > 0) return;
@@ -1623,50 +1589,54 @@ export default function App() {
       }
     };
 
-    void getCurrentWebview().onDragDropEvent((event) => {
-      const payload = event.payload;
-      if (payload.type === "enter" || payload.type === "over") {
-        setIsWorkspaceDropActive(payload.position.x <= sidebarWidthRef.current);
-        return;
-      }
-      if (payload.type === "leave") {
-        setIsWorkspaceDropActive(false);
-        return;
-      }
-      if (payload.type !== "drop") return;
-
-      const isSidebarDrop = payload.position.x <= sidebarWidthRef.current;
-      setIsWorkspaceDropActive(false);
-      if (!isSidebarDrop) return;
-
-      void (async () => {
-        const added: string[] = [];
-        let ignoredFiles = 0;
-        for (const path of payload.paths || []) {
-          try {
-            const stablePath = await canonicalizeWorkspacePath(path);
-            addWorkspaceEntry(stablePath);
-            added.push(stablePath);
-          } catch {
-            ignoredFiles += 1;
-            // Dragging files is intentionally ignored here; only folders become workspaces.
+    void (async () => {
+      try {
+        const dispose = await getCurrentWebview().onDragDropEvent((event) => {
+          const payload = event.payload;
+          if (payload.type === "enter" || payload.type === "over") {
+            setIsWorkspaceDropActive(payload.position.x <= sidebarWidthRef.current);
+            return;
           }
+          if (payload.type === "leave") {
+            setIsWorkspaceDropActive(false);
+            return;
+          }
+          if (payload.type !== "drop") return;
+
+          const isSidebarDrop = payload.position.x <= sidebarWidthRef.current;
+          setIsWorkspaceDropActive(false);
+          if (!isSidebarDrop) return;
+
+          void (async () => {
+            const added: string[] = [];
+            let ignoredFiles = 0;
+            for (const path of payload.paths || []) {
+              try {
+                const stablePath = await canonicalizeWorkspacePath(path);
+                addWorkspaceEntry(stablePath);
+                added.push(stablePath);
+              } catch {
+                ignoredFiles += 1;
+                // Dragging files is intentionally ignored here; only folders become workspaces.
+              }
+            }
+            if (added.length > 0) {
+              await handleOpenWorkspacePathRef.current(added[0], { selectFirstSession: true });
+            } else if (ignoredFiles > 0) {
+              window.alert(languageRef.current === "en" ? "Drop folders to add workspaces." : "请拖拽文件夹来加入工作区。");
+            }
+          })();
+        });
+
+        if (disposed) {
+          safelyDispose(dispose);
+          return;
         }
-        if (added.length > 0) {
-          await handleOpenWorkspacePathRef.current(added[0], { selectFirstSession: true });
-        } else if (ignoredFiles > 0) {
-          window.alert(languageRef.current === "en" ? "Drop folders to add workspaces." : "请拖拽文件夹来加入工作区。");
-        }
-      })();
-    }).then((dispose) => {
-      if (disposed) {
-        safelyDispose(dispose);
-        return;
+        unlisten = dispose;
+      } catch {
+        // Browser/e2e environments without Tauri simply skip native folder drop.
       }
-      unlisten = dispose;
-    }).catch(() => {
-      // Browser/e2e environments without Tauri simply skip native folder drop.
-    });
+    })();
 
     return () => {
       disposed = true;
@@ -1689,7 +1659,6 @@ export default function App() {
         currentSessionId={currentSessionId}
         activeSessionByWorkspace={activeSessionByWorkspace}
         sidebarWidth={sidebarWidth}
-        showWorkspaceTreePanel={showWorkspaceTreePanel}
         workspaceStatuses={workspaceStatuses}
         sessionStatuses={sessionStatuses}
         isWorkspaceDropActive={isWorkspaceDropActive}
@@ -1704,17 +1673,7 @@ export default function App() {
         onSelectSession={handleSelectSession}
         onDeleteSession={handleDeleteSession}
         onRebuildSessions={handleRebuildSessionIndex}
-        onToggleWorkspaceTree={toggleWorkspaceTreePanel}
       />
-      {showWorkspaceTreePanel && sidebarWorkspace && (
-        <WorkspaceTreePanel
-          currentWorkspace={sidebarWorkspace}
-          language={config.language}
-          width={workspaceTreePanelWidth}
-          onClose={() => setShowWorkspaceTreePanel(false)}
-          onStartResizing={startWorkspaceTreeResizing}
-        />
-      )}
       <ChatArea taskFlow={taskFlow} t={t} config={config} setSettingsTab={setSettingsTab} setIsSettingsOpen={setIsSettingsOpen} activeDiffTask={activeDiffTask} endOfFlowRef={endOfFlowRef} isStreaming={isStreaming} elapsedTime={elapsedTime} activeSessionKey={activeSessionKey} onStopGeneration={handleStopGeneration} allowToolAction={allowToolAction} rejectToolAction={rejectToolAction} autoApproveTools={autoApproveTools} onToggleAutoApprove={setAutoApproveTools} input={input} setInput={setInput} contextMentions={contextMentions} setContextMentions={setContextMentions} attachedFiles={attachedFiles} setAttachedFiles={setAttachedFiles} onAttachFile={handleAttachFile} showAgentPicker={showAgentPicker} setShowAgentPicker={setShowAgentPicker} selectedMainModeKey={selectedMainModeKey} setSelectedMainModeKey={setSelectedMainModeKey} mainModes={mainModes} activeStudioAgentKey={activeStudioAgentKey} setActiveStudioAgentKey={setActiveStudioAgentKey} gameStudioInitialized={gameStudioInitialized} initializeGameStudioWorkspace={initializeGameStudioWorkspace} removeGameStudioWorkspace={removeGameStudioWorkspace} currentWorkspace={currentWorkspace} handleAcceptInline={handleAcceptInline} handleRejectInline={handleRejectInline} onSendMessage={handleSendMessage} onQuickReply={handleQuickReply} />
       <RightPanel activeDiffTask={activeDiffTask} rightPanelWidth={rightPanelWidth} startResizing={startResizing} />
       <SettingsModal isOpen={isSettingsOpen} onClose={() => setIsSettingsOpen(false)} config={config} setConfig={setConfig} t={t} THEMES={THEMES} settingsTab={settingsTab} setSettingsTab={setSettingsTab} mcpServers={mcpServers} setMcpServers={setMcpServers} mcpDiscoveredTools={mcpDiscoveredTools} setMcpDiscoveredTools={setMcpDiscoveredTools} />

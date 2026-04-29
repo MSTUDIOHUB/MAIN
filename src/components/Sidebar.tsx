@@ -36,7 +36,6 @@ interface SidebarProps {
   currentSessionId: number | null;
   activeSessionByWorkspace?: Record<string, number | null>;
   sidebarWidth: number;
-  showWorkspaceTreePanel: boolean;
   workspaceStatuses?: Record<string, string>;
   sessionStatuses?: Record<string, string>;
   isWorkspaceDropActive?: boolean;
@@ -50,7 +49,6 @@ interface SidebarProps {
   onSelectSession: (scopeKey: string, id: number) => void;
   onDeleteSession: (scopeKey: string, id: number) => void;
   onRebuildSessions?: (scopeKey: string) => void;
-  onToggleWorkspaceTree: () => void;
   onStartResizing?: (e: React.MouseEvent) => void;
 }
 
@@ -77,7 +75,6 @@ export default function Sidebar({
   currentSessionId = null,
   activeSessionByWorkspace = {},
   sidebarWidth = 260,
-  showWorkspaceTreePanel = false,
   workspaceStatuses = {},
   sessionStatuses = {},
   isWorkspaceDropActive = false,
@@ -90,7 +87,6 @@ export default function Sidebar({
   onDeleteSession,
   onRebuildSessions,
   onRemoveWorkspaceEntry,
-  onToggleWorkspaceTree,
   onStartResizing,
 }: SidebarProps) {
   const [chatExpanded, setChatExpanded] = useState(true);
@@ -123,18 +119,10 @@ export default function Sidebar({
     }
   };
 
-  const workspaceTreeTitle = showWorkspaceTreePanel
-    ? config.language === "en"
-      ? "Hide file tree"
-      : "隐藏文件树"
-    : config.language === "en"
-    ? "Show file tree"
-    : "显示文件树";
   const projectChatsLabel = config.language === "en" ? "Projects" : "项目";
   const chatLabel = config.language === "en" ? "Chat" : "聊天";
   const newLabel = config.language === "en" ? "New" : "新建";
-  const addWorkspaceLabel = config.language === "en" ? "Add folder" : "添加文件夹";
-  const rebuildLabel = config.language === "en" ? "Rebuild" : "重建";
+  const addWorkspaceLabel = config.language === "en" ? "New Project" : "新项目";
   const missingLabel = config.language === "en" ? "Missing details" : "详情缺失";
   const dropHint = config.language === "en" ? "Drop folders here to add workspaces" : "拖拽文件夹到这里加入工作区";
 
@@ -229,48 +217,30 @@ export default function Sidebar({
           </span>
         </div>
 
-        <div className="mb-1.5 flex items-center justify-between text-[10px] font-bold uppercase tracking-widest text-[#71717a]">
+        <div className="flex items-center justify-between gap-3 text-[10px] font-bold uppercase tracking-widest text-[#71717a]">
           <span className="pointer-events-none">{t.workspace || "WORKSPACE"}</span>
           <button
-            onClick={onToggleWorkspaceTree}
-            disabled={!activeWorkspace}
-            className={`pointer-events-auto flex h-7 items-center justify-center gap-1 rounded-md border px-2 text-[10px] font-medium normal-case tracking-normal transition-colors disabled:cursor-not-allowed disabled:opacity-30 ${
-              showWorkspaceTreePanel
-                ? "theme-subtle-border theme-subtle-bg"
-                : "border-[#27272a] bg-[#000000] text-[#a1a1aa] hover:bg-[#18181b] hover:text-[#e4e4e7]"
+            onClick={onAddWorkspace || onSelectWorkspace}
+            data-testid="sidebar-add-workspace"
+            className={`pointer-events-auto flex h-8 shrink-0 items-center gap-1.5 rounded-md border px-2.5 text-[11px] font-semibold normal-case tracking-normal transition-colors ${
+              isWorkspaceDropActive
+                ? "border-[var(--accent)] bg-[var(--accent-subtle)] text-white"
+                : "border-[#27272a] bg-[#000000] text-[#e4e4e7] hover:bg-[#18181b] hover:text-white"
             }`}
-            title={workspaceTreeTitle}
+            title={dropHint}
           >
-            <IconFolder className="h-3.5 w-3.5" />
-            <span>{config.language === "en" ? "Files" : "文件"}</span>
+            <IconPlus className="h-3.5 w-3.5" />
+            <span>{addWorkspaceLabel}</span>
           </button>
         </div>
-
-        <button
-          onClick={onAddWorkspace || onSelectWorkspace}
-          data-testid="sidebar-add-workspace"
-          className={`flex w-full items-center gap-2 rounded-md border px-2.5 py-2 text-left shadow-sm transition-colors ${
-            isWorkspaceDropActive
-              ? "border-[var(--accent)] bg-[var(--accent-subtle)] text-white"
-              : "border-dashed border-[#3f3f46] bg-[#000000] text-[#a1a1aa] hover:border-[#52525b] hover:text-white"
-          }`}
-          title={dropHint}
-        >
-          <IconPlus className="h-3.5 w-3.5 shrink-0" />
-          <span className="min-w-0 flex-1 truncate text-[12px] font-semibold">{addWorkspaceLabel}</span>
-          <span className="shrink-0 text-[10px] text-[#71717a]">{config.language === "en" ? "or drop" : "或拖拽"}</span>
-        </button>
+        {isWorkspaceDropActive && (
+          <div className="mt-3 rounded-md border border-[var(--accent)] bg-[var(--accent-subtle)] px-3 py-2 text-[11px] text-[#e4e4e7]">
+            {dropHint}
+          </div>
+        )}
       </div>
 
-      <div className="shrink-0 px-3 pb-1 pt-3">
-        <div className="mb-2 mt-1 px-1">
-          <h2 className="sidebar-section-header text-[11px] font-bold uppercase tracking-wider text-[#a1a1aa]">
-            {t.conversations || "CONVERSATIONS"}
-          </h2>
-        </div>
-      </div>
-
-      <div className="flex min-h-0 flex-1 flex-col px-3 pb-4">
+      <div className="flex min-h-0 flex-1 flex-col px-3 pb-4 pt-3">
         <div className="min-h-0 flex-1 overflow-y-auto pr-1">
           <div className="space-y-2">
             <div className="flex items-center justify-between gap-2 px-1">

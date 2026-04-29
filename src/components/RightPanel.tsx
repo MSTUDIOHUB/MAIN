@@ -5,6 +5,7 @@ import {
   IconChevronUp,
   IconClose,
   IconColumns,
+  IconFolder,
   IconFileArchive,
   IconFileCode,
   IconFileConfig,
@@ -22,12 +23,13 @@ import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneLight, vscDarkPlus } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { save } from "@tauri-apps/plugin-dialog";
 import PlanPanel from "./PlanPanel";
+import WorkspaceTreePanel from "./WorkspaceTreePanel";
 import { buildLineDiff, getDiffStats } from "../lib/diff";
 import { getE2EResumeExecutionHandler, getE2ESavePlanDocumentHandler } from "../lib/e2e";
 import { extractPlanDraftPreview, extractStructuredPlanProposal, hasPlanDraftPreview, hasStructuredPlanProposal } from "../lib/planProposal";
 import MarkdownRenderer from "./MarkdownRenderer";
 import { resolveGlobalChatSessionKey, resolveSessionRuntimeKey, resolveSessionWorkspaceKey, type TaskBlock, useAppStore } from "../store/useAppStore";
-import { deleteChatTempPath, exportTextFile, onPtyData, readPtyBuffer, resizePty, spawnPty, writePty } from "../lib/ipc";
+import { deleteChatTempPath, exportTextFile, getPtyStatus, onPtyData, readPtyBuffer, resizePty, spawnPty, writePty } from "../lib/ipc";
 import { collectChangeEntries, isPlanConversationTurn } from "../lib/workflowModels";
 
 const CODE_FONT_FAMILY = "'JetBrains Mono', 'Fira Code', Menlo, Monaco, 'Courier New', monospace";
@@ -567,30 +569,70 @@ function IntegratedTerminal({
 
     let disposed = false;
     let unlisten: (() => void) | null = null;
+    let ptyKnownRunning = false;
+    let statusCheckedAt = 0;
+    let hasRenderedInitialBuffer = false;
 
     const writeSystemLine = (message: string, color = "90") => {
       term.writeln(`\x1b[${color}m# ${message}\x1b[0m`);
     };
 
-    const ensurePtyReady = (): Promise<void> => {
+    const terminalHasFocus = () => {
+      const container = termRef.current;
+      const active = document.activeElement;
+      return !!container && !!active && container.contains(active);
+    };
+
+    const focusTerminalSoon = (force = false) => {
+      if (disposed) return;
+      if (!force && !terminalHasFocus()) return;
+      requestAnimationFrame(() => {
+        if (!disposed) term.focus();
+      });
+    };
+
+    const subscribePtyData = async () => {
+      if (unlisten) return;
+      unlisten = await onPtyData((chunk) => {
+        if (disposed) return;
+        const shouldRefocus = terminalHasFocus();
+        term.write(chunk);
+        if (shouldRefocus) focusTerminalSoon();
+      }, sessionKey);
+    };
+
+    const ensurePtyReady = (forceStatusCheck = false): Promise<void> => {
       if (ptyReadyRef.current) return ptyReadyRef.current;
 
+      const checkedRecently = Date.now() - statusCheckedAt < 1_000;
+      if (ptyKnownRunning && checkedRecently && !forceStatusCheck) {
+        return Promise.resolve();
+      }
+
       ptyReadyRef.current = (async () => {
-        let existingBuffer = "";
+        let shouldSpawn = false;
+        let shouldReplayBuffer = !hasRenderedInitialBuffer;
+
         try {
-          existingBuffer = await readPtyBuffer(undefined, sessionKey);
+          const status = await getPtyStatus(sessionKey);
+          statusCheckedAt = Date.now();
+          shouldSpawn = !status.active || !status.running;
         } catch {
+          shouldSpawn = true;
+        }
+
+        if (shouldSpawn) {
           await spawnPty(Math.max(term.cols, 120), Math.max(term.rows, 32), sessionKey, workspace);
-          existingBuffer = await readPtyBuffer(undefined, sessionKey).catch(() => "");
+          ptyKnownRunning = true;
+          statusCheckedAt = Date.now();
+          shouldReplayBuffer = true;
+        } else {
+          ptyKnownRunning = true;
         }
 
         if (disposed) return;
 
-        unlisten = await onPtyData((chunk) => {
-          if (!disposed) {
-            term.write(chunk);
-          }
-        }, sessionKey);
+        await subscribePtyData();
 
         if (disposed) {
           unlisten?.();
@@ -598,23 +640,42 @@ function IntegratedTerminal({
           return;
         }
 
-        if (existingBuffer) {
-          term.write(existingBuffer);
-        } else {
-          writeSystemLine("PTY connected");
+        if (shouldReplayBuffer) {
+          const existingBuffer = await readPtyBuffer(undefined, sessionKey).catch(() => "");
+          if (existingBuffer) {
+            term.write(existingBuffer);
+          } else {
+            writeSystemLine("PTY connected");
+          }
+          hasRenderedInitialBuffer = true;
         }
 
         await resizePty(Math.max(term.cols, 20), Math.max(term.rows, 5), sessionKey).catch(() => {});
       })().catch((error) => {
-        ptyReadyRef.current = null;
+        ptyKnownRunning = false;
+        statusCheckedAt = 0;
         if (!disposed) {
           const message = error instanceof Error ? error.message : String(error);
           writeSystemLine(`PTY error: ${message}`, "31");
         }
         throw error;
+      }).finally(() => {
+        ptyReadyRef.current = null;
       });
 
       return ptyReadyRef.current;
+    };
+
+    const writeInputToPty = async (data: string) => {
+      await ensurePtyReady();
+      try {
+        await writePty(data, sessionKey);
+      } catch {
+        ptyKnownRunning = false;
+        statusCheckedAt = 0;
+        await ensurePtyReady(true);
+        await writePty(data, sessionKey);
+      }
     };
 
     const syncTerminalSize = () => {
@@ -630,11 +691,10 @@ function IntegratedTerminal({
     };
 
     void ensurePtyReady();
+    focusTerminalSoon(true);
 
     const disposable = term.onData((data) => {
-      void ensurePtyReady()
-        .then(() => writePty(data, sessionKey))
-        .catch((error) => {
+      void writeInputToPty(data).catch((error) => {
           if (disposed) return;
           const message = error instanceof Error ? error.message : String(error);
           writeSystemLine(`write failed: ${message}`, "31");
@@ -658,7 +718,29 @@ function IntegratedTerminal({
     };
   }, [sessionKey, themeMode, workspace]);
 
-  return <div ref={termRef} className="h-full w-full" />;
+  const focusTerminal = () => {
+    xtermRef.current?.focus();
+  };
+
+  const focusTerminalWhenSafe = () => {
+    const container = termRef.current;
+    const active = document.activeElement;
+    if (!active || active === document.body || (container && container.contains(active))) {
+      xtermRef.current?.focus();
+    }
+  };
+
+  return (
+    <div
+      ref={termRef}
+      data-testid="integrated-terminal"
+      tabIndex={0}
+      className="h-full w-full outline-none"
+      onFocus={focusTerminal}
+      onPointerDown={focusTerminal}
+      onPointerEnter={focusTerminalWhenSafe}
+    />
+  );
 }
 
 /** File Viewer Panel with syntax highlighting */
@@ -947,7 +1029,7 @@ function FileViewerPanel({
           className="shrink-0 rounded-md border px-2 py-1 text-[11px] transition-opacity hover:opacity-75"
           style={buttonBaseStyle}
         >
-          {uiLanguage === "zh" ? "关闭" : "Close"}
+          {uiLanguage === "zh" ? "返回" : "Back"}
         </button>
       </div>
       <div className="flex-1 overflow-y-auto p-4">
@@ -1125,6 +1207,7 @@ function DiffReviewPanel({ taskFlow, activeDiffTask, language }: { taskFlow: Tas
     () => files.reduce((sum, file) => ({ added: sum.added + file.added, removed: sum.removed + file.removed }), { added: 0, removed: 0 }),
     [files],
   );
+  const activeDiffTarget = activeDiffTask?.diff?.path || activeDiffTask?.target || "";
   const allCollapsed = files.length > 0 && files.every((file) => collapsedFiles.has(file.key));
   const toggleAll = () => setCollapsedFiles(allCollapsed ? new Set() : new Set(files.map((file) => file.key)));
 
@@ -1144,6 +1227,9 @@ function DiffReviewPanel({ taskFlow, activeDiffTask, language }: { taskFlow: Tas
           <span className="rounded-full bg-[#2b2b2d] px-2.5 py-1 text-[12px] font-bold text-[#d4d4d8]">{files.length}</span>
           <span className="truncate font-mono text-[12px] text-[#34d399]">+{totals.added}</span>
           <span className="font-mono text-[12px] text-[#ff5c5c]">-{totals.removed}</span>
+          {activeDiffTarget && (
+            <span className="truncate font-mono text-[12px] text-[#a1a1aa]" title={activeDiffTarget}>{activeDiffTarget}</span>
+          )}
         </div>
         <button
           type="button"
@@ -1244,6 +1330,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     rightPanelTab,
     closeRightPanel,
     clearFileViewer,
+    openFileViewer,
     planArtifacts,
     planTasks,
     planStage,
@@ -1272,6 +1359,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     rightPanelTab: useAppStore((s) => s.rightPanelTab),
     closeRightPanel: useAppStore((s) => s.closeRightPanel),
     clearFileViewer: useAppStore((s) => s.clearFileViewer),
+    openFileViewer: useAppStore((s) => s.openFileViewer),
     planArtifacts: useAppStore((s) => s.planArtifacts),
     planTasks: useAppStore((s) => s.planTasks),
     planStage: useAppStore((s) => s.planStage),
@@ -1459,9 +1547,9 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     }
     if (rightPanelTab === "file") {
       return {
-        icon: IconFileText,
-        title: language === "zh" ? "文件查看" : "File Viewer",
-        description: fileViewerPath || (language === "zh" ? "在这里查看文件内容。" : "View file contents here."),
+        icon: IconFolder,
+        title: fileViewerPath ? (language === "zh" ? "文件查看" : "File Viewer") : (language === "zh" ? "文件" : "Files"),
+        description: fileViewerPath || currentWorkspace || (language === "zh" ? "查看当前工作区文件。" : "Browse the current workspace files."),
       };
     }
     return {
@@ -1469,7 +1557,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
       title: language === "zh" ? "计划工作区" : "Plan Workspace",
       description: latestPlanTurn?.title || (language === "zh" ? "在这里查看计划预览、审批状态和执行进度。" : "Review plan previews, approval state, and execution progress here."),
     };
-  }, [changeSummary.entries.length, fileViewerPath, language, latestPlanTurn?.title, rightPanelTab, viewedDiffTask?.target]);
+  }, [changeSummary.entries.length, currentWorkspace, fileViewerPath, language, latestPlanTurn?.title, rightPanelTab, viewedDiffTask?.target]);
 
   const isVisible = (showPlanPanel && hasPlanPanelContent) || showDiff || showTerminal || showFilePanel;
   const terminalSessionKey = resolveSessionRuntimeKey(resolveSessionWorkspaceKey(currentWorkspace), currentSessionId) || undefined;
@@ -1482,6 +1570,16 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     [fileCategory, fileViewerContent],
   );
   const effectiveCategory = contentLooksBinary ? "binary" : fileCategory;
+  const filePanelScopeRef = useRef({ workspace: currentWorkspace, sessionId: currentSessionId });
+
+  useEffect(() => {
+    const previous = filePanelScopeRef.current;
+    const changed = previous.workspace !== currentWorkspace || previous.sessionId !== currentSessionId;
+    filePanelScopeRef.current = { workspace: currentWorkspace, sessionId: currentSessionId };
+    if (changed && showFilePanel && rightPanelTab === "file") {
+      clearFileViewer();
+    }
+  }, [clearFileViewer, currentSessionId, currentWorkspace, rightPanelTab, showFilePanel]);
 
   if (!isVisible) return null;
 
@@ -1570,18 +1668,27 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
           )}
 
           {rightPanelTab === "file" && showFilePanel && (
-            <MemoizedFileViewerPanel
-              filePath={fileViewerPath}
-              fileContent={fileViewerContent}
-              fileError={fileViewerError}
-              fileLoading={fileViewerLoading}
-              fileCategory={effectiveCategory}
-              fileLang={fileLang}
-              fileName={fileName}
-              themeMode={config.themeMode}
-              uiLanguage={language}
-              onClose={clearFileViewer}
-            />
+            fileViewerPath ? (
+              <MemoizedFileViewerPanel
+                filePath={fileViewerPath}
+                fileContent={fileViewerContent}
+                fileError={fileViewerError}
+                fileLoading={fileViewerLoading}
+                fileCategory={effectiveCategory}
+                fileLang={fileLang}
+                fileName={fileName}
+                themeMode={config.themeMode}
+                uiLanguage={language}
+                onClose={clearFileViewer}
+              />
+            ) : (
+              <WorkspaceTreePanel
+                currentWorkspace={currentWorkspace}
+                language={language}
+                embedded
+                onOpenFile={(path) => openFileViewer(path, currentWorkspace)}
+              />
+            )
           )}
         </div>
       </div>

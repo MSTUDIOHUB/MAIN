@@ -380,7 +380,7 @@ function buildNonActionableStopMessage(language: "zh" | "en", reason: "no_output
       case "missing_tool_loop":
         return "模型连续输出说明或代码正文，但没有使用写入/读取工具，本轮已停止。聊天内容不会被当作已写入文件。";
       case "incomplete_plan":
-        return "模型没有生成可审批的计划草稿或计划文件，本轮已停止。请重新发送更明确的计划请求，或切换到直接执行。";
+        return "模型没有生成可审批的计划草稿或计划文件，本轮已停止。请重新发送明确要求写入 `.MAIN/plans/requirements.md` 和 `.MAIN/plans/design.md` 的计划请求，或切换到直接执行。";
       default:
         return "模型只输出了文字说明，没有产生真实工具调用或文件变更，本轮已停止。";
     }
@@ -392,7 +392,7 @@ function buildNonActionableStopMessage(language: "zh" | "en", reason: "no_output
     case "missing_tool_loop":
       return "The model kept producing prose or code in chat without using read/write tools, so this turn stopped. Chat text is not treated as written files.";
     case "incomplete_plan":
-      return "The model did not produce a reviewable plan draft or plan files, so this turn stopped. Try a clearer planning request or switch to direct execution.";
+      return "The model did not produce a reviewable plan draft or plan files, so this turn stopped. Send a clearer planning request that explicitly writes `.MAIN/plans/requirements.md` and `.MAIN/plans/design.md`, or switch to direct execution.";
     default:
       return "The model only produced prose and did not create real tool calls or file changes, so this turn stopped.";
   }
@@ -401,8 +401,8 @@ function buildNonActionableStopMessage(language: "zh" | "en", reason: "no_output
 function buildPlanFallbackNotice(language: "zh" | "en", sourceChars: number): string {
   const formatted = sourceChars.toLocaleString();
   return language === "zh"
-    ? `模型刚才输出了约 ${formatted} 个字符的规划正文，但没有生成可审批的计划文件。MAIN 会要求模型重新收敛为真实需求规格和执行方案，或先用可点击选项向你确认关键分叉；不会把工具日志或截断内容强行写成计划。`
-    : `The model produced about ${formatted} characters of planning text but did not create reviewable plan files. MAIN will ask it to regenerate real requirements/design or ask you for the key decision first; tool logs and truncated text will not be forced into plan files.`;
+    ? `模型刚才输出了约 ${formatted} 个字符的规划正文，但没有生成可审批的计划文件。MAIN 会要求模型通过工具写入真实的 \`.MAIN/plans/requirements.md\` 与 \`.MAIN/plans/design.md\`，或先用可点击选项向你确认关键分叉；不会把工具日志或截断内容强行写成计划。`
+    : `The model produced about ${formatted} characters of planning text but did not create reviewable plan files. MAIN will ask it to write real \`.MAIN/plans/requirements.md\` and \`.MAIN/plans/design.md\` artifacts through tools, or ask you for the key decision first; tool logs and truncated text will not be forced into plan files.`;
 }
 
 function stripControlPromptForPlanFallback(text: string): string {
@@ -547,7 +547,7 @@ function buildPlanRecoveryPrompt(callbacks: OrchestratorCallbacks, sourceText: s
       "- `requirements.md` must summarize the user's intent into real requirements: goal, scope, findings, deliverables, acceptance criteria, and open questions.",
       "- `design.md` must be executable: affected files/modules, ordered implementation strategy, data/control flow, validation, and risks.",
       "- If a design direction is unclear, ask the user with `<user_options>` and stop. Do not invent a final design.",
-      "- If the direction is clear, write concise `.MAIN/plans/requirements.md` and `.MAIN/plans/design.md`, then submit the normal Proposal for approval. Do not generate `tasks.md` before approval.",
+      "- If the direction is clear, call `write_file` or `replace_in_file` to create/update concise `.MAIN/plans/requirements.md` and `.MAIN/plans/design.md`, then submit the normal Proposal for approval. Do not generate `tasks.md` before approval.",
     ].filter(Boolean).join("\n");
   }
 
@@ -561,7 +561,7 @@ function buildPlanRecoveryPrompt(callbacks: OrchestratorCallbacks, sourceText: s
     "- `requirements.md` 必须总结用户真实意图并形成需求规格：目标、范围、当前发现、交付物、验收标准、待确认问题。",
     "- `design.md` 必须是可执行方案：影响文件/模块、执行顺序、数据流/控制流、验证方式和风险。",
     "- 如果设计方向不明确，使用 `<user_options>` 让用户选择并立刻停止；不要编造最终方案。",
-    "- 如果方向已经明确，写入精简的 `.MAIN/plans/requirements.md` 与 `.MAIN/plans/design.md`，然后提交正常 Proposal 等待审批。批准前不要生成 `tasks.md`。",
+    "- 如果方向已经明确，必须调用 `write_file` 或 `replace_in_file` 创建/更新精简的 `.MAIN/plans/requirements.md` 与 `.MAIN/plans/design.md`，然后提交正常 Proposal 等待审批。批准前不要生成 `tasks.md`。",
   ].filter(Boolean).join("\n");
 }
 

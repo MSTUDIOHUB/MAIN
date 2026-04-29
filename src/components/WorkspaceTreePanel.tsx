@@ -28,8 +28,10 @@ import { shouldHideWorkspaceEntry } from "../utils/fsUtils";
 interface WorkspaceTreePanelProps {
   currentWorkspace: string;
   language: "zh" | "en";
-  width: number;
-  onClose: () => void;
+  width?: number;
+  embedded?: boolean;
+  onClose?: () => void;
+  onOpenFile?: (path: string) => void | Promise<void>;
   onStartResizing?: (e: React.MouseEvent) => void;
 }
 
@@ -167,11 +169,13 @@ function getWorkspaceTreeIcon(node: FileNode, isExpanded: boolean) {
 export default function WorkspaceTreePanel({
   currentWorkspace,
   language,
-  width,
+  width = 320,
+  embedded = false,
   onClose,
+  onOpenFile,
   onStartResizing,
 }: WorkspaceTreePanelProps) {
-  const openFileViewer = useAppStore((s) => s.openFileViewer);
+  const storeOpenFileViewer = useAppStore((s) => s.openFileViewer);
   const deletePersistedPlanFiles = useAppStore((s) => s.deletePersistedPlanFiles);
   const workspaceContentVersion = useAppStore((s) => s.workspaceContentVersion);
   const [treeNodesByPath, setTreeNodesByPath] = useState<Record<string, FileNode[]>>({});
@@ -289,6 +293,14 @@ export default function WorkspaceTreePanel({
     }
   }, [expandedPaths, loadDirectoryNodes]);
 
+  const openWorkspaceFile = useCallback(async (path: string) => {
+    if (onOpenFile) {
+      await onOpenFile(path);
+      return;
+    }
+    await storeOpenFileViewer(path, currentWorkspace);
+  }, [currentWorkspace, onOpenFile, storeOpenFileViewer]);
+
   const renderTree = useCallback((path: string, depth = 0) => {
     const nodes = treeNodesByPath[path] || [];
     return nodes.map((node) => {
@@ -305,7 +317,7 @@ export default function WorkspaceTreePanel({
                 void handleTogglePath(node);
                 return;
               }
-              void openFileViewer(node.path);
+              void openWorkspaceFile(node.path);
             }}
             className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[12px] text-[#d4d4d8] transition-colors hover:bg-[#18181b]"
             style={{ paddingLeft: `${10 + depth * 14}px` }}
@@ -328,13 +340,17 @@ export default function WorkspaceTreePanel({
         </div>
       );
     });
-  }, [copy.loading, expandedPaths, handleTogglePath, loadingPaths, openFileViewer, treeNodesByPath]);
+  }, [copy.loading, expandedPaths, handleTogglePath, loadingPaths, openWorkspaceFile, treeNodesByPath]);
 
   return (
     <div
-      className="relative z-10 flex shrink-0 flex-col border-r border-[#27272a] bg-[#09090b]"
-      style={{ width: `${width}px` }}
+      className={embedded
+        ? "relative flex h-full min-w-0 flex-col bg-[#050505]"
+        : "relative z-10 flex shrink-0 flex-col border-r border-[#27272a] bg-[#09090b]"
+      }
+      style={embedded ? undefined : { width: `${width}px` }}
     >
+      {!embedded && (
       <div className="min-h-[72px] shrink-0 border-b border-[#27272a] bg-[#09090b] px-3 py-3">
         <div className="flex items-start justify-between gap-3">
           <div className="min-w-0 flex items-center gap-3">
@@ -348,15 +364,18 @@ export default function WorkspaceTreePanel({
               </div>
             </div>
           </div>
-          <button
-            onClick={onClose}
-            className="rounded-md border border-[#27272a] bg-[#000000] p-1.5 text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#e4e4e7]"
-            title={copy.close}
-          >
-            <IconClose className="h-4 w-4" />
-          </button>
+          {onClose && (
+            <button
+              onClick={onClose}
+              className="rounded-md border border-[#27272a] bg-[#000000] p-1.5 text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#e4e4e7]"
+              title={copy.close}
+            >
+              <IconClose className="h-4 w-4" />
+            </button>
+          )}
         </div>
       </div>
+      )}
 
       <div className="flex shrink-0 items-center gap-2 border-b border-[#27272a] px-3 py-2">
         <button
@@ -385,13 +404,15 @@ export default function WorkspaceTreePanel({
         )}
       </div>
 
-      <div
-        onMouseDown={onStartResizing}
-        className="absolute right-0 top-0 z-20 h-full w-1 cursor-col-resize group"
-        style={{ marginRight: "-0.5px" }}
-      >
-        <div className="h-full w-full bg-transparent transition-colors group-hover:bg-[#3f3f46]" />
-      </div>
+      {!embedded && onStartResizing && (
+        <div
+          onMouseDown={onStartResizing}
+          className="absolute right-0 top-0 z-20 h-full w-1 cursor-col-resize group"
+          style={{ marginRight: "-0.5px" }}
+        >
+          <div className="h-full w-full bg-transparent transition-colors group-hover:bg-[#3f3f46]" />
+        </div>
+      )}
     </div>
   );
 }

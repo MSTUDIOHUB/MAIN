@@ -12,7 +12,12 @@ test.beforeEach(async ({ page }) => {
 test("stream error clears the lingering thinking notice", async ({ page }) => {
   await page.goto("/?e2eScenario=stream-error-recovery");
 
-  await expect(page.getByText("正在思考并整理下一步...")).toBeVisible();
+  const activityNotice = page.getByTestId("turn-activity-notice");
+  await expect(activityNotice).toBeVisible();
+
+  const errorCard = page.getByRole("button", { name: "系统请求失败" });
+  await expect(errorCard).toBeVisible();
+  await errorCard.click();
   await expect(page.getByText("模型服务在传输回复时中断或返回了无法解析的数据。")).toBeVisible();
-  await expect(page.getByText("正在思考并整理下一步...")).toHaveCount(0);
+  await expect(activityNotice).toHaveCount(0);
 });

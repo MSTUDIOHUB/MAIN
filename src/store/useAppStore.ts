@@ -550,7 +550,8 @@ interface AppState {
   fileViewerError: string;
   fileViewerLoading: boolean;
   selectedDiffTaskId: number | null;
-  openFileViewer: (path: string) => Promise<void>;
+  openFileTreePanel: () => void;
+  openFileViewer: (path: string, workspace?: string) => Promise<void>;
   clearFileViewer: () => void;
   setSelectedDiffTaskId: (id: number | null) => void;
   openDiffForTask: (taskId: number) => void;
@@ -2119,7 +2120,19 @@ export const useAppStore = create<AppState>()(
     showFilePanel: v ? false : get().showFilePanel,
     rightPanelTab: v ? "terminal" : get().rightPanelTab,
   }),
-  openFileViewer: async (path) => {
+  openFileTreePanel: () => set({
+    showFilePanel: true,
+    showPlanPanel: false,
+    showDiff: false,
+    showTerminal: false,
+    rightPanelTab: "file",
+    fileViewerPath: "",
+    fileViewerContent: "",
+    fileViewerError: "",
+    fileViewerLoading: false,
+  }),
+  openFileViewer: async (path, workspace) => {
+    const targetWorkspace = workspace ?? get().currentWorkspace;
     set({
       showFilePanel: true,
       showPlanPanel: false,
@@ -2136,9 +2149,11 @@ export const useAppStore = create<AppState>()(
       return;
     }
     try {
-      const content = await readFile(path, get().currentWorkspace);
+      const content = await readFile(path, targetWorkspace);
+      if (get().fileViewerPath !== path || get().currentWorkspace !== targetWorkspace) return;
       set({ fileViewerContent: content, fileViewerError: "", fileViewerLoading: false });
     } catch (error) {
+      if (get().fileViewerPath !== path || get().currentWorkspace !== targetWorkspace) return;
       set({
         fileViewerContent: "",
         fileViewerError: error instanceof Error ? error.message : String(error),
@@ -2147,11 +2162,15 @@ export const useAppStore = create<AppState>()(
     }
   },
   clearFileViewer: () => set({
-    showFilePanel: false,
     fileViewerPath: "",
     fileViewerContent: "",
     fileViewerError: "",
     fileViewerLoading: false,
+    showFilePanel: true,
+    showPlanPanel: false,
+    showDiff: false,
+    showTerminal: false,
+    rightPanelTab: "file",
   }),
   setSelectedDiffTaskId: (id) => set({ selectedDiffTaskId: id }),
   openDiffForTask: (taskId) => {
@@ -2173,6 +2192,14 @@ export const useAppStore = create<AppState>()(
     showDiff: tab === "diff",
     showTerminal: tab === "terminal",
     showFilePanel: tab === "file",
+    ...(tab === "file"
+      ? {
+          fileViewerPath: "",
+          fileViewerContent: "",
+          fileViewerError: "",
+          fileViewerLoading: false,
+        }
+      : {}),
   }),
   openRightPanelTab: (tab) => get().setRightPanelTab(tab),
   closeRightPanel: () => set({ showPlanPanel: false, showDiff: false, showTerminal: false, showFilePanel: false }),
@@ -3681,6 +3708,26 @@ export const useAppStore = create<AppState>()(
     const runScopeKey = sessionScopeKey;
     const runSessionId = ensuredSessionId;
     const runSessionKey = resolveSessionRuntimeKey(runScopeKey, runSessionId)!;
+    const backgroundRunningSessions = Object.entries(state.runtimeBySessionKey)
+      .filter(([sessionKey, runtime]) =>
+        sessionKey !== runSessionKey &&
+        (runtime.isGenerating || runtime.agentStatus === "running" || runtime.agentStatus === "pending_review")
+      )
+      .map(([sessionKey, runtime]) => ({
+        sessionKey,
+        turnId: runtime.currentTurnId,
+        agentStatus: runtime.agentStatus,
+        isGenerating: runtime.isGenerating,
+      }));
+    logStoreEvent("session_run_start", {
+      sessionKey: runSessionKey,
+      workspace: runWorkspace || null,
+      sessionId: runSessionId,
+      intent: effectiveRunIntent,
+      initialTurnStatus,
+      backgroundRunningCount: backgroundRunningSessions.length,
+      backgroundRunningSessions: backgroundRunningSessions.slice(0, 8),
+    });
     set((s) => ({
       runtimeBySessionKey: {
         ...s.runtimeBySessionKey,
@@ -3811,6 +3858,14 @@ export const useAppStore = create<AppState>()(
         showDiff: tab === "diff",
         showTerminal: tab === "terminal",
         showFilePanel: tab === "file",
+        ...(tab === "file"
+          ? {
+              fileViewerPath: "",
+              fileViewerContent: "",
+              fileViewerError: "",
+              fileViewerLoading: false,
+            }
+          : {}),
       });
     const sessionGet = (): AppState => {
       const live = get();
@@ -4250,13 +4305,13 @@ export const useAppStore = create<AppState>()(
       if (effectiveRunIntent === "plan" && !preservePlanState) {
         userContent = preferredLanguage === "en"
           ? [
-              "This turn is in PLAN mode. If the request is a complex implementation, create concise reviewable plan drafts in `.MAIN/plans/requirements.md` and `.MAIN/plans/design.md` before asking for approval; do not write project source files or tasks.md before approval.",
+              "This turn is in PLAN mode. If the request is a complex implementation, call `write_file` or `replace_in_file` to create concise reviewable plan drafts in `.MAIN/plans/requirements.md` and `.MAIN/plans/design.md` before asking for approval; do not write project source files or tasks.md before approval.",
               "If it is only a discussion-style plan, keep the answer concise and use user options for real decisions.",
               "",
               userContent,
             ].join("\n")
           : [
-              "本轮处于 PLAN 模式。如果这是复杂实现请求，请先把可审批的精简计划草稿写入 `.MAIN/plans/requirements.md` 和 `.MAIN/plans/design.md`，等待用户批准后再改源码；批准前不要生成 tasks.md。",
+              "本轮处于 PLAN 模式。如果这是复杂实现请求，请调用 `write_file` 或 `replace_in_file` 先把可审批的精简计划草稿写入 `.MAIN/plans/requirements.md` 和 `.MAIN/plans/design.md`，等待用户批准后再改源码；批准前不要生成 tasks.md。",
               "如果只是讨论式方案，请保持简洁，并在真实分叉点用可点击选项让用户选择。",
               "",
               userContent,
@@ -4269,14 +4324,14 @@ export const useAppStore = create<AppState>()(
           ? [
               "Continue the previous PLAN turn. The user is asking to keep going, not to start a new discussion.",
               originalPlanPrompt ? `Original plan request: ${originalPlanPrompt}` : "Original plan request: use the current conversation context.",
-              "Produce real planning progress now. If key choices remain, summarize them briefly and use <user_options>; otherwise provide the concise plan/proposal.",
+              "Produce real planning progress now. If key choices remain, summarize them briefly and use <user_options>; otherwise call `write_file` or `replace_in_file` to update `.MAIN/plans/requirements.md` and `.MAIN/plans/design.md`, then provide the concise Proposal.",
               "Keep any plan Markdown concise: review-summary style, no tutorial prose, no full code listings, no repeated background.",
               text.trim() ? `Latest user message: ${text.trim()}` : "Latest user message: continue",
             ].join("\n")
           : [
               "请继续上一轮 PLAN 回合。用户是在要求继续推进，不是开启新的普通讨论。",
               originalPlanPrompt ? `上一轮计划请求：${originalPlanPrompt}` : "上一轮计划请求：请依据当前对话上下文继续。",
-              "现在必须产生实际规划进展。如果仍有关键选择需要用户确认，就先简短归纳并用面向用户的口吻给出 <user_options>；否则给出精简方案/Proposal。",
+              "现在必须产生实际规划进展。如果仍有关键选择需要用户确认，就先简短归纳并用面向用户的口吻给出 <user_options>；否则调用 `write_file` 或 `replace_in_file` 更新 `.MAIN/plans/requirements.md` 与 `.MAIN/plans/design.md`，再给出精简 Proposal。",
               "每个 <option> 必须是用户点击后会发送的完整选择，不要写成“是否……”问题句。",
               "所有计划 Markdown 都要精简成审阅摘要风格，不要写教程式长文、完整代码清单或重复背景。",
               text.trim() ? `用户最新消息：${text.trim()}` : "用户最新消息：继续",
@@ -5290,8 +5345,8 @@ export const useAppStore = create<AppState>()(
               turnId,
               type: "system",
               content: sessionGet().config.language === "en"
-                ? `Plan artifact rejected: ${path} does not look like a reviewable ${kind} document (${validation.reason || "quality gate"}). MAIN will ask the model to regenerate a real plan or request your decision.`
-                : `计划文件已被拦截：${path} 不像可审批的${getPlanArtifactTitle(kind, "zh")}（${validation.reason || "质量门禁"}）。MAIN 会要求模型重新生成真实方案，或先向你确认关键分叉。`,
+                ? `Plan artifact rejected: ${path} does not look like a reviewable ${kind} document (${validation.reason || "quality gate"}). MAIN will ask the model to regenerate real \`.MAIN/plans/requirements.md\` and \`.MAIN/plans/design.md\` artifacts or request your decision.`
+                : `计划文件已被拦截：${path} 不像可审批的${getPlanArtifactTitle(kind, "zh")}（${validation.reason || "质量门禁"}）。MAIN 会要求模型重新生成真实的 \`.MAIN/plans/requirements.md\` 与 \`.MAIN/plans/design.md\`，或先向你确认关键分叉。`,
               variant: "plan_quality_gate",
             });
             return;
