@@ -198,6 +198,8 @@ test("data analyst plan prompt uses interactive planning and analysis semantics"
   assert.match(prompt, /\[TURN INTENT: PLAN\]/);
   assert.match(prompt, /交互式规划回合/);
   assert.match(prompt, /关键决策点用可点击选项引导用户/);
+  assert.match(prompt, /选项必须通用真实/);
+  assert.match(prompt, /用户能真实拍板的选择/);
   assert.match(prompt, /数据分析\/报表类请求：规划阶段优先输出分析目标、数据范围、指标口径、报表结构、验证方式/);
   assert.match(prompt, /复杂实现请求必须生成精简的 `\.MAIN\/plans\/requirements\.md` 与 `\.MAIN\/plans\/design\.md` 草稿供审批/);
   assert.match(prompt, /批准执行前仍然不能写源码或生成 tasks\.md/);

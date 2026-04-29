@@ -67,6 +67,8 @@ function bindBridgeSnapshot(scenario: string) {
   if (!bridge) return;
   bridge.getSnapshot = () => {
     const state = useAppStore.getState();
+    const agentBlocks = state.taskFlow.filter((block) => block.type === "agent") as any[];
+    const archivedOptionBlocks = agentBlocks.filter((block) => block.archivedAfterChoice);
     return {
       planStage: state.planStage,
       isPlanApproved: state.isPlanApproved,
@@ -81,6 +83,7 @@ function bindBridgeSnapshot(scenario: string) {
         : null,
       conversationTurns: state.conversationTurns.length,
       taskFlowUserCount: state.taskFlow.filter((block) => block.type === "user").length,
+      selectedOptions: archivedOptionBlocks.map((block) => block.selectedOption).filter(Boolean),
       seedCount: readSeedCount(scenario),
     };
   };

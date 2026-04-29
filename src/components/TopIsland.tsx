@@ -1,4 +1,4 @@
-import { memo, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { IconColumns, IconFileText, IconLock, IconUnlock } from "./Icons";
 import type { PlanStage, PlanTask, ReplyOption } from "../lib/workflowModels";
 import type { PendingRunDecision, ResolvedUserIntent } from "../lib/runIntent";
@@ -31,6 +31,7 @@ interface TopIslandProps {
   onApproveDiffSession?: () => void;
   onOpenPlan: () => void;
   onOpenDiff: () => void;
+  onHeightChange?: (height: number) => void;
 }
 // endregion
 
@@ -84,9 +85,12 @@ const TopIsland = memo(function TopIsland({
   onApproveDiffSession,
   onOpenPlan,
   onOpenDiff,
+  onHeightChange,
 }: TopIslandProps) {
   const [hovered, setHovered] = useState(false);
   const [pinnedOpen, setPinnedOpen] = useState(false);
+  const [customReplyText, setCustomReplyText] = useState("");
+  const shellRef = useRef<HTMLDivElement | null>(null);
 
   // region: TopIsland 展开时机
   const hasReplyOptions = replyOptions.length > 0;
@@ -151,6 +155,8 @@ const TopIsland = memo(function TopIsland({
     choicePrompt: language === "zh"
       ? "直接在这里点选即可继续当前回合。"
       : "Choose an option here to continue the current turn.",
+    customChoicePlaceholder: language === "zh" ? "输入你的想法作为选项" : "Type your own choice",
+    customChoiceSubmit: language === "zh" ? "确认" : "Confirm",
     executionConsentTitle: language === "zh" ? "允许开始执行本轮改动？" : "Allow this turn to start making changes?",
     executionConsentHint: language === "zh"
       ? "这是本轮第一次真实写入/执行动作。确认后 MAIN 才会继续推进。"
@@ -178,6 +184,36 @@ const TopIsland = memo(function TopIsland({
   const primaryText = themeMode === "light" ? "text-[#111827]" : "text-[#f5f5f5]";
   const secondaryText = themeMode === "light" ? "text-[#4b5563]" : "text-[#71717a]";
   const surface = themeMode === "light" ? "bg-[rgba(255,255,255,0.36)] border-[rgba(15,23,42,0.08)]" : "bg-[rgba(255,255,255,0.04)] border-[#1f1f23]";
+  const normalizedCustomReply = customReplyText.replace(/\s+/g, " ").trim();
+
+  const submitCustomReply = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!normalizedCustomReply) return;
+    onSelectReplyOption?.({
+      label: normalizedCustomReply,
+      value: normalizedCustomReply,
+    });
+    setCustomReplyText("");
+  };
+
+  // region: TopIsland 高度同步
+  useEffect(() => {
+    if (!onHeightChange) return undefined;
+    const node = shellRef.current;
+    if (!node) return undefined;
+
+    const reportHeight = () => {
+      onHeightChange(node.offsetHeight);
+    };
+
+    reportHeight();
+    const observer = new ResizeObserver(reportHeight);
+    observer.observe(node);
+    return () => {
+      observer.disconnect();
+    };
+  }, [onHeightChange]);
+  // endregion
 
   return (
     <div
@@ -186,6 +222,7 @@ const TopIsland = memo(function TopIsland({
       }`}
     >
       <div
+        ref={shellRef}
         data-testid="top-island-shell"
         onMouseEnter={() => setHovered(true)}
         onMouseLeave={() => setHovered(false)}
@@ -404,6 +441,30 @@ const TopIsland = memo(function TopIsland({
                         {option.label}
                       </button>
                     ))}
+                    <form onSubmit={submitCustomReply} className="flex min-w-0 items-center gap-2">
+                      <input
+                        data-testid="top-island-custom-reply-input"
+                        value={customReplyText}
+                        onChange={(event) => setCustomReplyText(event.target.value)}
+                        placeholder={copy.customChoicePlaceholder}
+                        className={`min-w-0 flex-1 rounded-xl border px-3 py-2.5 text-[12px] leading-6 outline-none transition-colors ${
+                          themeMode === "light"
+                            ? "border-[rgba(15,23,42,0.12)] bg-[rgba(255,255,255,0.62)] text-[#111827] placeholder:text-[#6b7280] focus:border-[rgba(124,58,237,0.45)]"
+                            : "border-[#3f3f46] bg-[#09090b] text-[#f5f5f5] placeholder:text-[#71717a] focus:border-[rgba(124,58,237,0.5)]"
+                        }`}
+                      />
+                      <button
+                        type="submit"
+                        data-testid="top-island-custom-reply-submit"
+                        disabled={!normalizedCustomReply || !onSelectReplyOption}
+                        className={`shrink-0 rounded-xl px-3 py-2.5 text-[12px] font-semibold transition-opacity ${
+                          normalizedCustomReply && onSelectReplyOption ? "text-white opacity-100" : "cursor-not-allowed text-white opacity-40"
+                        }`}
+                        style={{ background: "linear-gradient(135deg, var(--accent, #7c3aed), #2563eb)" }}
+                      >
+                        {copy.customChoiceSubmit}
+                      </button>
+                    </form>
                     <button
                       onClick={onCancelTurn}
                       className="w-full rounded-xl border border-[#3f3f46] bg-[#09090b] px-3 py-2.5 text-left text-[12px] leading-6 text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#f5f5f5]"

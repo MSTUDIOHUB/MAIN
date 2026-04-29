@@ -3679,6 +3679,24 @@ export const useAppStore = create<AppState>()(
             config: get().config,
           });
 
+          const latestState = get();
+          const latestInput = latestState.input.trim();
+          const stalePreflight =
+            latestInput !== text.trim() ||
+            latestState.selectedMainModeKey !== currentMainModeKey ||
+            !!latestState.lockedComposerIntent ||
+            !!parseMainIntentShortcut(latestInput);
+          if (stalePreflight) {
+            logStoreEvent("intent_preflight_stale_discarded", {
+              originalChars: text.trim().length,
+              latestChars: latestInput.length,
+              selectedMainModeKey: latestState.selectedMainModeKey,
+              hasLockedComposerIntent: !!latestState.lockedComposerIntent,
+              hasExplicitShortcut: !!parseMainIntentShortcut(latestInput),
+            });
+            return;
+          }
+
           if (preflight?.needsUserChoice) {
             const fallbackCopy = createPendingDecisionCopy(
               {
@@ -4436,16 +4454,23 @@ export const useAppStore = create<AppState>()(
         userContent = parts.join("\n\n") + "\n\n" + text;
       }
 
-      if (effectiveRunIntent === "plan" && !preservePlanState) {
+      if (effectiveRunIntent === "plan" && !sessionGet().isPlanApproved && !shouldContinuePlanIntent) {
+        const planModeLead = preservePlanState
+          ? preferredLanguage === "en"
+            ? "This is still an unapproved PLAN turn. Treat the latest user message as a planning choice or clarification, not approval to edit source files."
+            : "当前仍是未批准的 PLAN 回合。请把用户最新消息视为计划选项/澄清，不要当作已批准修改源码。"
+          : preferredLanguage === "en"
+          ? "This turn is in PLAN mode."
+          : "本轮处于 PLAN 模式。";
         userContent = preferredLanguage === "en"
           ? [
-              "This turn is in PLAN mode. If the request is a complex implementation, call `write_file` or `replace_in_file` to create concise reviewable plan drafts in `.MAIN/plans/requirements.md` and `.MAIN/plans/design.md` before asking for approval; do not write project source files or tasks.md before approval.",
+              `${planModeLead} If the request is a complex implementation, call \`write_file\` or \`replace_in_file\` to create or update concise reviewable plan drafts in \`.MAIN/plans/requirements.md\` and \`.MAIN/plans/design.md\` before asking for approval; do not write project source files or tasks.md before approval.`,
               "If it is only a discussion-style plan, keep the answer concise and use user options for real decisions.",
               "",
               userContent,
             ].join("\n")
           : [
-              "本轮处于 PLAN 模式。如果这是复杂实现请求，请调用 `write_file` 或 `replace_in_file` 先把可审批的精简计划草稿写入 `.MAIN/plans/requirements.md` 和 `.MAIN/plans/design.md`，等待用户批准后再改源码；批准前不要生成 tasks.md。",
+              `${planModeLead}如果这是复杂实现请求，请调用 \`write_file\` 或 \`replace_in_file\` 创建或更新可审批的精简计划草稿：\`.MAIN/plans/requirements.md\` 与 \`.MAIN/plans/design.md\`，等待用户批准后再改源码；批准前不要生成 tasks.md。`,
               "如果只是讨论式方案，请保持简洁，并在真实分叉点用可点击选项让用户选择。",
               "",
               userContent,

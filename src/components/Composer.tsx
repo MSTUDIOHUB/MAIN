@@ -8,7 +8,7 @@ import { useAppStore } from "../store/useAppStore";
 import type { AgentMessage, ContentPart } from "../lib/orchestrator";
 import { getGameStudioSlashCatalog } from "../lib/gameStudioPack";
 import { humanizeSlug } from "../lib/gameStudioCatalog";
-import { getIntentPolicy, getMainIntentShortcuts, getRunIntentCategoryLabel, getRunIntentLabel, parseMainIntentShortcut, resolveTurnRunIntent } from "../lib/runIntent";
+import { getIntentPolicy, getMainIntentShortcuts, getRunIntentCategoryLabel, getRunIntentLabel, parseMainIntentShortcut, resolveComposerIntentSuggestion } from "../lib/runIntent";
 import {
   resolveGameStudioOnboardingAction,
   shouldShowGameStudioOnboarding,
@@ -258,33 +258,26 @@ export default function Composer({
     [allFiles],
   );
   const currentWorkspaceOnboardingKey = currentWorkspace || "__no_workspace__";
-  const suggestedComposerIntent = useMemo(() => {
-    const normalizedInput = input.trim();
-    if (!normalizedInput) return null;
-    if (!isMainMode || lockedComposerIntent) return null;
-    if (dismissedSuggestedIntentKey === normalizedInput) return null;
-
-    const shortcut = parseMainIntentShortcut(normalizedInput);
-    if (shortcut) return shortcut.intent;
-
-    const resolution = resolveTurnRunIntent(input, {
+  const composerIntentSuggestion = useMemo(() => {
+    return resolveComposerIntentSuggestion({
+      input,
       language: language === "en" ? "en" : "zh",
       mainModeKey: selectedMainModeKey,
-      parsedStudioCommand: null,
+      lockedComposerIntent,
+      dismissedSuggestedIntentKey,
       hasPlanArtifacts: planTasks.length > 0 || planStage !== "idle",
       planStage,
       isPlanApproved,
     });
-
-    if (resolution.needsDecision || resolution.confidence < 0.9) return null;
-    if (["plan", "summarize", "report", "analyze", "execute"].includes(resolution.intent)) {
-      return resolution.intent;
-    }
-
-    return null;
-  }, [dismissedSuggestedIntentKey, input, isMainMode, isPlanApproved, language, lockedComposerIntent, planStage, planTasks.length, selectedMainModeKey]);
+  }, [dismissedSuggestedIntentKey, input, isPlanApproved, language, lockedComposerIntent, planStage, planTasks.length, selectedMainModeKey]);
+  const suggestedComposerIntent = composerIntentSuggestion?.intent ?? null;
+  const explicitComposerIntent = composerIntentSuggestion?.explicitIntent ?? null;
+  const composerIntentSuggestionKind = composerIntentSuggestion?.kind ?? null;
   const suggestedComposerIntentLabel = suggestedComposerIntent
     ? getRunIntentLabel(suggestedComposerIntent, language === "en" ? "en" : "zh")
+    : null;
+  const explicitComposerIntentLabel = explicitComposerIntent
+    ? getRunIntentLabel(explicitComposerIntent, language === "en" ? "en" : "zh")
     : null;
   const suggestedComposerIntentIsOutputStyle = suggestedComposerIntent
     ? getIntentPolicy(suggestedComposerIntent).uiCategory === "output_style"
@@ -1283,11 +1276,25 @@ export default function Composer({
           <div className="relative z-30 mb-2 flex justify-center px-3">
             <div className="flex max-w-full items-center justify-between gap-3 rounded-full border border-[#27272a] bg-[#050507] px-3 py-2 text-[11px] text-[#d4d4d8] shadow-2xl">
               <span className="truncate">
-                {language === "en" ? "Use" : "使用"} <span className="font-semibold" style={{ color: "var(--accent-light)" }}>{suggestedComposerIntentLabel}</span>
-                {" "}
-                {suggestedComposerIntentIsOutputStyle
-                  ? (language === "en" ? "output style for this turn?" : "输出方式处理本轮请求？")
-                  : (language === "en" ? "workflow mode for this turn?" : "流程模式处理本轮请求？")}
+                {composerIntentSuggestionKind === "explicit_conflict" && explicitComposerIntentLabel
+                  ? (
+                    <>
+                      {language === "en" ? "Explicit " : "已选择 "}
+                      <span className="font-semibold" style={{ color: "var(--accent-light)" }}>{explicitComposerIntentLabel}</span>
+                      {language === "en" ? "; switch to " : "；内容也像 "}
+                      <span className="font-semibold" style={{ color: "var(--accent-light)" }}>{suggestedComposerIntentLabel}</span>
+                      {language === "en" ? " instead?" : "，要改用它吗？"}
+                    </>
+                  )
+                  : (
+                    <>
+                      {language === "en" ? "Use" : "使用"} <span className="font-semibold" style={{ color: "var(--accent-light)" }}>{suggestedComposerIntentLabel}</span>
+                      {" "}
+                      {suggestedComposerIntentIsOutputStyle
+                        ? (language === "en" ? "output style for this turn?" : "输出方式处理本轮请求？")
+                        : (language === "en" ? "workflow mode for this turn?" : "流程模式处理本轮请求？")}
+                    </>
+                  )}
               </span>
               <div className="flex shrink-0 items-center gap-2">
                 <button
@@ -1296,11 +1303,13 @@ export default function Composer({
                   className="rounded-full border px-2.5 py-1 text-[10px] font-semibold transition-colors hover:bg-[#18181b]"
                   style={{ borderColor: "var(--accent-subtle-border)", color: "var(--accent-light)" }}
                 >
-                  {language === "en" ? "Confirm" : "确认"}
+                  {composerIntentSuggestionKind === "explicit_conflict"
+                    ? language === "en" ? "Switch" : "改用"
+                    : language === "en" ? "Confirm" : "确认"}
                 </button>
                 <button
                   type="button"
-                  onClick={() => setDismissedSuggestedIntentKey(input.trim())}
+                  onClick={() => setDismissedSuggestedIntentKey(composerIntentSuggestion?.inputKey || input.trim())}
                   className="rounded-full border border-[#27272a] px-2.5 py-1 text-[10px] text-[#a1a1aa] transition-colors hover:bg-[#18181b]"
                 >
                   {language === "en" ? "Ignore" : "忽略"}

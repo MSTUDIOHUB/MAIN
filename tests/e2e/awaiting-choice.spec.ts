@@ -51,3 +51,25 @@ test("reply options pause the turn and continue within the same turn after selec
   await expect(page.getByText("我发现这里有一个关键分叉，需要你先确认优先级")).toBeVisible();
   await expect(page.getByText(/已按你的选择继续/)).toBeVisible();
 });
+
+test("custom reply option continues within the same turn", async ({ page }) => {
+  await page.goto("/?e2eScenario=awaiting-choice");
+
+  await expect(page.getByTestId("top-island-awaiting-choice")).toBeVisible();
+  await page.getByTestId("top-island-custom-reply-input").fill("我想先补一个轻量方案再继续");
+  await page.getByTestId("top-island-custom-reply-submit").click();
+
+  await expect
+    .poll(async () =>
+      page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().conversationTurns ?? -1),
+    )
+    .toBe(1);
+
+  await expect
+    .poll(async () =>
+      page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().selectedOptions ?? []),
+    )
+    .toEqual(["我想先补一个轻量方案再继续"]);
+
+  await expect(page.getByText(/已按你的选择继续/)).toBeVisible();
+});

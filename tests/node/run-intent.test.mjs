@@ -62,6 +62,7 @@ const {
   looksLikePreviousTurnContinuationInput,
   mapResolvedRunIntentToWorkflowMode,
   parseMainIntentShortcut,
+  resolveComposerIntentSuggestion,
   resolveTurnRunIntent,
   shouldContinuePreviousTurnFromInput,
   shouldUseBlockingIntentPreflight,
@@ -102,6 +103,26 @@ test("explicit Chinese planning request resolves to plan", () => {
 test("explicit English implementation request resolves to execute", () => {
   const result = resolveTurnRunIntent("Please implement it directly and fix the bug", createContext());
   assert.equal(result.intent, "execute");
+  assert.equal(result.needsDecision, undefined);
+});
+
+test("Chinese design based implementation request resolves to execute", () => {
+  const result = resolveTurnRunIntent("请根据设计方案 design.md 来完成修改", createContext());
+  assert.equal(result.intent, "execute");
+  assert.equal(result.needsDecision, undefined);
+});
+
+test("design based implementation request approves an existing plan", () => {
+  const result = resolveTurnRunIntent(
+    "请根据设计方案 design.md 来完成修改",
+    createContext({
+      hasPlanArtifacts: true,
+      planStage: "ready_to_execute",
+      isPlanApproved: false,
+    }),
+  );
+  assert.equal(result.intent, "plan");
+  assert.equal(result.controlAction, "approve_plan");
   assert.equal(result.needsDecision, undefined);
 });
 
@@ -177,6 +198,54 @@ test("MAIN intent shortcuts parse slash command and remaining prompt", () => {
     rest: "check this flow",
   });
   assert.equal(parseMainIntentShortcut("/setup-engine unity"), null);
+});
+
+test("composer suggestion keeps explicit slash intent as the default", () => {
+  const suggestion = resolveComposerIntentSuggestion({
+    input: "/计划 帮我总结这段内容",
+    language: "zh",
+    mainModeKey: "main_mode",
+    lockedComposerIntent: null,
+    dismissedSuggestedIntentKey: null,
+    hasPlanArtifacts: false,
+    planStage: "idle",
+    isPlanApproved: false,
+  });
+
+  assert.equal(parseMainIntentShortcut("/计划 帮我总结这段内容").intent, "plan");
+  assert.equal(suggestion.kind, "explicit_conflict");
+  assert.equal(suggestion.explicitIntent, "plan");
+  assert.equal(suggestion.intent, "summarize");
+});
+
+test("composer suggestion ignore and locked intent do not override explicit user choice", () => {
+  assert.equal(
+    resolveComposerIntentSuggestion({
+      input: "/计划 帮我总结这段内容",
+      language: "zh",
+      mainModeKey: "main_mode",
+      lockedComposerIntent: null,
+      dismissedSuggestedIntentKey: "/计划 帮我总结这段内容",
+      hasPlanArtifacts: false,
+      planStage: "idle",
+      isPlanApproved: false,
+    }),
+    null,
+  );
+
+  assert.equal(
+    resolveComposerIntentSuggestion({
+      input: "/计划 帮我总结这段内容",
+      language: "zh",
+      mainModeKey: "main_mode",
+      lockedComposerIntent: "summarize",
+      dismissedSuggestedIntentKey: null,
+      hasPlanArtifacts: false,
+      planStage: "idle",
+      isPlanApproved: false,
+    }),
+    null,
+  );
 });
 
 test("ordinary low-risk discuss requests should not block on preflight", () => {

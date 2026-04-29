@@ -81,14 +81,14 @@ test("shouldPauseForReplyOptions pauses when the model asks the user to choose",
   assert.equal(shouldPause, true);
 });
 
-test("shouldPauseForReplyOptions does not override plan approval or tool execution", () => {
+test("shouldPauseForReplyOptions pauses before tool execution and does not override plan approval", () => {
   assert.equal(
     shouldPauseForReplyOptions({
       replyOptions: [{ label: "方案 A", value: "方案 A" }],
       toolCallCount: 1,
       workflowMode: "edit",
     }),
-    false,
+    true,
   );
 
   assert.equal(

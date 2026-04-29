@@ -220,6 +220,8 @@ const STRONG_EXECUTE_PATTERNS = [
   /直接(?:改|做|实现|修|写|上手|处理)/i,
   /帮我(?:实现|修复|改掉|补上|落地)/i,
   /现在就(?:做|改|实现|修复)/i,
+  /(?:完成|继续)(?:修改|实现|执行|处理)/i,
+  /(?:根据|按照|按).{0,24}(?:design\.md|设计方案|方案).{0,48}(?:完成修改|开始执行|继续执行|执行|实现|落地|修改)/i,
   /\b(?:apply|patch|build it|go implement|implement it|fix it|ship it)\b/i,
 ];
 
@@ -274,6 +276,7 @@ const APPROVE_PLAN_PATTERNS = [
   /^批准(?:执行|计划)?[。.! ]*$/i,
   /^批准进入执行[。.! ]*$/i,
   /^同意(?:执行|这个方案)?[。.! ]*$/i,
+  /^(?:请)?(?:根据|按照|按).{0,24}(?:design\.md|设计方案|方案).{0,48}(?:完成修改|开始执行|继续执行|执行|实现|落地|修改)[。.! ]*$/i,
   /^go ahead[.! ]*$/i,
   /^approve(?: the plan)?[.! ]*$/i,
   /^start execution[.! ]*$/i,
@@ -345,6 +348,15 @@ export interface MainIntentShortcutItem {
   description: string;
   category: RunIntentUiCategory;
   aliases: string[];
+}
+
+export type ComposerIntentSuggestionKind = "suggestion" | "explicit_conflict";
+
+export interface ComposerIntentSuggestion {
+  kind: ComposerIntentSuggestionKind;
+  intent: MainIntentShortcut;
+  explicitIntent?: MainIntentShortcut;
+  inputKey: string;
 }
 
 const MAIN_INTENT_SHORTCUTS_ZH: MainIntentShortcutItem[] = [
@@ -592,6 +604,82 @@ export function createPendingDecisionCopy(
     options: createDecisionOptions(intents, language),
     reason: resolution.reason,
   };
+}
+
+function isComposerSuggestibleIntent(intent: ResolvedUserIntent): intent is MainIntentShortcut {
+  return ["plan", "summarize", "report", "analyze", "execute"].includes(intent);
+}
+
+export function resolveComposerIntentSuggestion(params: {
+  input: string;
+  language?: "zh" | "en";
+  mainModeKey: MainModeKey;
+  lockedComposerIntent?: MainIntentShortcut | null;
+  dismissedSuggestedIntentKey?: string | null;
+  hasPlanArtifacts: boolean;
+  planStage: ResolveTurnRunIntentContext["planStage"];
+  isPlanApproved: boolean;
+}): ComposerIntentSuggestion | null {
+  const language = params.language === "en" ? "en" : "zh";
+  const normalizedInput = params.input.trim();
+  if (!normalizedInput) return null;
+  if (params.mainModeKey !== "main_mode") return null;
+  if (params.lockedComposerIntent) return null;
+  if (params.dismissedSuggestedIntentKey === normalizedInput) return null;
+
+  const shortcut = parseMainIntentShortcut(normalizedInput);
+  if (shortcut) {
+    const rest = shortcut.rest.trim();
+    if (!rest) return null;
+
+    const resolution = resolveTurnRunIntent(rest, {
+      language,
+      mainModeKey: params.mainModeKey,
+      parsedStudioCommand: null,
+      hasPlanArtifacts: params.hasPlanArtifacts,
+      planStage: params.planStage,
+      isPlanApproved: params.isPlanApproved,
+    });
+
+    if (
+      !resolution.needsDecision &&
+      resolution.confidence >= 0.9 &&
+      isComposerSuggestibleIntent(resolution.intent) &&
+      resolution.intent !== shortcut.intent
+    ) {
+      return {
+        kind: "explicit_conflict",
+        intent: resolution.intent,
+        explicitIntent: shortcut.intent,
+        inputKey: normalizedInput,
+      };
+    }
+
+    return null;
+  }
+
+  const resolution = resolveTurnRunIntent(normalizedInput, {
+    language,
+    mainModeKey: params.mainModeKey,
+    parsedStudioCommand: null,
+    hasPlanArtifacts: params.hasPlanArtifacts,
+    planStage: params.planStage,
+    isPlanApproved: params.isPlanApproved,
+  });
+
+  if (
+    !resolution.needsDecision &&
+    resolution.confidence >= 0.9 &&
+    isComposerSuggestibleIntent(resolution.intent)
+  ) {
+    return {
+      kind: "suggestion",
+      intent: resolution.intent,
+      inputKey: normalizedInput,
+    };
+  }
+
+  return null;
 }
 
 export function mapResolvedRunIntentToWorkflowMode(intent: ResolvedUserIntent): LegacyWorkflowMode {
