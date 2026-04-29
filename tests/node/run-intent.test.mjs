@@ -69,6 +69,13 @@ const {
   path.join(workspaceRoot, "src/lib/runIntent.ts"),
 );
 
+const {
+  MAIN_MODE_KEYS,
+  mapLegacyNexusModeToMainMode,
+} = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/lib/mainModes.ts"),
+);
+
 function createContext(overrides = {}) {
   return {
     language: "zh",
@@ -80,6 +87,11 @@ function createContext(overrides = {}) {
     ...overrides,
   };
 }
+
+test("MAIN mode keys exclude legacy Task Center and migrate old value", () => {
+  assert.deepEqual([...MAIN_MODE_KEYS], ["main_mode", "game_studio"]);
+  assert.equal(mapLegacyNexusModeToMainMode("task_center"), "main_mode");
+});
 
 test("explicit Chinese planning request resolves to plan", () => {
   const result = resolveTurnRunIntent("先给我一个方案再实现", createContext());

@@ -101,6 +101,12 @@ const TopIsland = memo(function TopIsland({
     planTasks.length > 0;
   const forceExpanded = hasReplyOptions || isAwaitingChoice || hasPendingRunDecision || !!activeDiffTask || canApprovePlan;
   const actionable = forceExpanded || hasPendingRunDecision || !!activeDiffTask || canApprovePlan;
+  const isPlanApprovalOnly =
+    canApprovePlan &&
+    !hasReplyOptions &&
+    !isAwaitingChoice &&
+    !hasPendingRunDecision &&
+    !activeDiffTask;
   const hasTasks = planTasks.length > 0;
   const shouldExpandWidth = forceExpanded || (hasExpandableContent && (hovered || pinnedOpen));
   const isExpanded = forceExpanded || (hasExpandableContent && (hovered || pinnedOpen));
@@ -183,7 +189,7 @@ const TopIsland = memo(function TopIsland({
         data-testid="top-island-shell"
         onMouseEnter={() => setHovered(true)}
         onMouseLeave={() => setHovered(false)}
-        className={`w-full overflow-hidden rounded-[28px] border backdrop-blur-2xl backdrop-saturate-150 transition-all duration-300 ease-out ${isVisible ? "pointer-events-auto" : "pointer-events-none"} ${shouldExpandWidth ? "max-w-4xl" : "max-w-[580px]"} ${shellClass} ${actionableOutline}`}
+        className={`w-full overflow-hidden rounded-[28px] border backdrop-blur-2xl backdrop-saturate-150 transition-all duration-300 ease-out [&_button]:pointer-events-auto ${isVisible && !isPlanApprovalOnly ? "pointer-events-auto" : "pointer-events-none"} ${shouldExpandWidth ? "max-w-4xl" : "max-w-[580px]"} ${shellClass} ${actionableOutline}`}
       >
         <div className="flex items-center justify-between gap-3 px-4 py-3">
           <div className="min-w-0 flex items-center gap-2">

@@ -38,7 +38,7 @@ import { normalizeStudioAgentKey } from "./lib/gameStudioCatalog";
 import { MAIN_MODE_KEYS, mapLegacyNexusModeToMainMode, mapMainModeToLegacyNexusMode } from "./lib/mainModes";
 import { resolveConversationTurnIntent } from "./lib/runIntent";
 import { runAfterNextPaint } from "./lib/uiScheduling";
-import { normalizeConversationDisplayTitle, type ReplyOption } from "./lib/workflowModels";
+import { normalizeConversationDisplayTitle, type ReplyOption, type RightPanelTab } from "./lib/workflowModels";
 import { appendDebugLog } from "./lib/debugLog";
 import {
   createFeishuPairedUserFromMessage,
@@ -52,6 +52,12 @@ import {
   type FeishuAdapterEvent,
   type FeishuInboundMessage,
 } from "./lib/imAdapters";
+
+function normalizeStoredRightPanelTab(value: unknown): RightPanelTab {
+  return value === "diff" || value === "terminal" || value === "file" || value === "plan"
+    ? value
+    : "plan";
+}
 
 function buildSessionRuntimeSnapshotFromState(state: any) {
   const taskFlow = sanitizeTaskBlocksForPersist(state.taskFlow || []);
@@ -74,10 +80,8 @@ function buildSessionRuntimeSnapshotFromState(state: any) {
     showDiff: state.showDiff === true,
     showTerminal: state.showTerminal === true,
     showFilePanel: state.showFilePanel === true,
-    showTaskCenterPanel: state.showTaskCenterPanel === true,
-    rightPanelTab: state.rightPanelTab ?? "plan",
+    rightPanelTab: normalizeStoredRightPanelTab(state.rightPanelTab),
     selectedDiffTaskId: state.selectedDiffTaskId ?? null,
-    taskCenter: state.taskCenter,
   };
 }
 
@@ -130,10 +134,8 @@ export default function App() {
   const showDiff = useAppStore((s) => s.showDiff);
   const showTerminal = useAppStore((s) => s.showTerminal);
   const showFilePanel = useAppStore((s) => s.showFilePanel);
-  const showTaskCenterPanel = useAppStore((s) => s.showTaskCenterPanel);
   const rightPanelTab = useAppStore((s) => s.rightPanelTab);
   const selectedDiffTaskId = useAppStore((s) => s.selectedDiffTaskId);
-  const taskCenter = useAppStore((s) => s.taskCenter);
   const pendingSlashCommand = useAppStore((s) => s.pendingSlashCommand);
   const isStreaming = useAppStore((s) => s.isGenerating);
   const agentStatus = useAppStore((s) => s.agentStatus);
@@ -207,7 +209,7 @@ export default function App() {
   const setRightPanelWidth = useAppStore((s) => s.setRightPanelWidth);
   const setSidebarWidth = useAppStore((s) => s.setSidebarWidth);
   const closeRightPanel = useAppStore((s) => s.closeRightPanel);
-  const isRightPanelVisible = showPlanPanel || showDiff || showTerminal || showFilePanel || showTaskCenterPanel;
+  const isRightPanelVisible = showPlanPanel || showDiff || showTerminal || showFilePanel;
   // isResizing is local UI state (mouse drag), not in the store
   const [isResizing, setIsResizing] = useState(false);
   const [isSidebarResizing, setIsSidebarResizing] = useState(false);
@@ -429,10 +431,8 @@ export default function App() {
       showDiff,
       showTerminal,
       showFilePanel,
-      showTaskCenterPanel,
-      rightPanelTab,
+      rightPanelTab: normalizeStoredRightPanelTab(rightPanelTab),
       selectedDiffTaskId,
-      taskCenter,
     };
 
     updateSession(activeSessionScope, currentSessionId, {
@@ -487,9 +487,7 @@ export default function App() {
     showDiff,
     showFilePanel,
     showPlanPanel,
-    showTaskCenterPanel,
     showTerminal,
-    taskCenter,
     taskFlow,
     updateSession,
   ]);
@@ -701,7 +699,6 @@ export default function App() {
         showDiff: false,
         showTerminal: false,
         showFilePanel: false,
-        showTaskCenterPanel: false,
         rightPanelTab: 'plan',
       });
       appendDebugLog("warn", "session.restore", {
@@ -767,14 +764,11 @@ export default function App() {
         showDiff: snapshot.showDiff ?? false,
         showTerminal: snapshot.showTerminal ?? false,
         showFilePanel: false,
-        showTaskCenterPanel: snapshot.showTaskCenterPanel === true && snapshot.rightPanelTab === "tasks",
         fileViewerPath: "",
         fileViewerContent: "",
         fileViewerError: "",
         fileViewerLoading: false,
-        rightPanelTab: snapshot.rightPanelTab === "file" ? "plan" : (snapshot.rightPanelTab ?? 'plan'),
-        taskCenter: snapshot.taskCenter || useAppStore.getState().taskCenter,
-        taskCenterActiveTaskId: null,
+        rightPanelTab: snapshot.rightPanelTab === "file" ? "plan" : normalizeStoredRightPanelTab(snapshot.rightPanelTab),
         elapsedTime: 0,
       });
       appendDebugLog("info", "session.restore", {
@@ -1039,10 +1033,8 @@ export default function App() {
       showDiff: false,
       showTerminal: false,
       showFilePanel: false,
-      showTaskCenterPanel: false,
       rightPanelTab: "plan",
       selectedDiffTaskId: null,
-      taskCenter: useAppStore.getState().taskCenter,
     });
     const ns = {
       id: Date.now(),
@@ -1145,7 +1137,6 @@ export default function App() {
         showDiff: false,
         showTerminal: false,
         showFilePanel: false,
-        showTaskCenterPanel: false,
         rightPanelTab: "plan",
         fileViewerPath: "",
         fileViewerContent: "",

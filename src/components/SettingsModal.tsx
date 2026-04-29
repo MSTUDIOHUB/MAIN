@@ -419,118 +419,6 @@ function DebugLogPanel({ t }: { t: any }) {
   );
 }
 
-function TaskCenterSettingsPanel({ t }: { t: any }) {
-  const language = useAppStore((s) => s.config.language === "en" ? "en" : "zh");
-  const taskCenter = useAppStore((s) => s.taskCenter);
-  const setTaskCenterState = useAppStore((s) => s.setTaskCenterState);
-  const [testMessage, setTestMessage] = useState("");
-
-  const labels = {
-    title: language === "zh" ? "任务中枢集成" : "Task Center Integrations",
-    desc: language === "zh"
-      ? "外部来源默认关闭；未配置 token 时不会导入、回写或访问外部服务。"
-      : "External sources are disabled by default; without tokens MAIN will not import, write back, or call external services.",
-    scheduler: language === "zh" ? "调度器" : "Scheduler",
-    autoStart: language === "zh" ? "自动领取待执行任务" : "Auto-claim ready tasks",
-    maxReadOnly: language === "zh" ? "只读并发" : "Read-only concurrency",
-    maxWrite: language === "zh" ? "写入并发" : "Write concurrency",
-    integrations: language === "zh" ? "外部来源" : "External Sources",
-    enabled: language === "zh" ? "启用" : "Enable",
-    token: "Token",
-    query: language === "zh" ? "默认导入范围" : "Default import query",
-    test: language === "zh" ? "连接测试" : "Test Connection",
-    saved: language === "zh" ? "设置已保存到本地。" : "Settings are saved locally.",
-    disabled: language === "zh" ? "未启用或缺少 token，当前不会访问外部服务。" : "Disabled or missing token; no external service will be called.",
-  };
-
-  const updateScheduler = (patch: any) => {
-    setTaskCenterState((prev) => ({ ...prev, scheduler: { ...prev.scheduler, ...patch } }));
-  };
-
-  const updateIntegration = (key: "linear" | "github" | "feishu", patch: any) => {
-    setTaskCenterState((prev) => ({
-      ...prev,
-      integrations: {
-        ...prev.integrations,
-        [key]: { ...prev.integrations[key], ...patch },
-      },
-    }));
-  };
-
-  const testIntegration = (key: "linear" | "github" | "feishu") => {
-    const integration = taskCenter.integrations[key];
-    setTestMessage(
-      integration.enabled && String(integration.token || "").trim()
-        ? `${key}: ${labels.saved}`
-        : `${key}: ${labels.disabled}`,
-    );
-  };
-
-  return (
-    <div className="space-y-6">
-      <div>
-        <h3 className="text-[13px] font-bold text-[#a1a1aa] uppercase tracking-wider">{labels.title}</h3>
-        <p className="mt-2 text-[12px] leading-6 text-[#a1a1aa]">{labels.desc}</p>
-      </div>
-
-      <section className="rounded-lg border border-[#27272a] bg-[#050505] p-4">
-        <div className="text-[13px] font-bold text-[#e4e4e7]">{labels.scheduler}</div>
-        <label className="mt-4 flex items-center gap-3 text-[12px] text-[#d4d4d8]">
-          <input type="checkbox" checked={taskCenter.scheduler.autoStart} onChange={(event) => updateScheduler({ autoStart: event.target.checked })} />
-          {labels.autoStart}
-        </label>
-        <div className="mt-4 grid grid-cols-2 gap-3">
-          <label className="text-[12px] text-[#a1a1aa]">
-            {labels.maxReadOnly}
-            <input type="number" min={1} max={8} value={taskCenter.scheduler.maxReadOnlyConcurrency} onChange={(event) => updateScheduler({ maxReadOnlyConcurrency: Number(event.target.value || 1) })} className="mt-2 w-full rounded-md border border-[#27272a] bg-[#000000] p-2 text-white" />
-          </label>
-          <label className="text-[12px] text-[#a1a1aa]">
-            {labels.maxWrite}
-            <input type="number" min={1} max={2} value={taskCenter.scheduler.maxWriteConcurrency} onChange={(event) => updateScheduler({ maxWriteConcurrency: Number(event.target.value || 1) })} className="mt-2 w-full rounded-md border border-[#27272a] bg-[#000000] p-2 text-white" />
-          </label>
-        </div>
-      </section>
-
-      <section className="space-y-3">
-        <div className="text-[13px] font-bold text-[#e4e4e7]">{labels.integrations}</div>
-        {(["linear", "github", "feishu"] as const).map((key) => {
-          const integration = taskCenter.integrations[key];
-          return (
-            <div key={key} className="rounded-lg border border-[#27272a] bg-[#050505] p-4">
-              <div className="flex items-center justify-between gap-3">
-                <div className="text-[13px] font-bold capitalize text-[#e4e4e7]">{key}</div>
-                <label className="flex items-center gap-2 text-[12px] text-[#d4d4d8]">
-                  <input type="checkbox" checked={integration.enabled} onChange={(event) => updateIntegration(key, { enabled: event.target.checked })} />
-                  {labels.enabled}
-                </label>
-              </div>
-              <div className="mt-3 grid gap-3 md:grid-cols-2">
-                <label className="text-[12px] text-[#a1a1aa]">
-                  {labels.token}
-                  <input type="password" value={integration.token || ""} onChange={(event) => updateIntegration(key, { token: event.target.value })} className="mt-2 w-full rounded-md border border-[#27272a] bg-[#000000] p-2 font-mono text-white" />
-                </label>
-                <label className="text-[12px] text-[#a1a1aa]">
-                  {labels.query}
-                  <input type="text" value={integration.defaultImportQuery || ""} onChange={(event) => updateIntegration(key, { defaultImportQuery: event.target.value })} className="mt-2 w-full rounded-md border border-[#27272a] bg-[#000000] p-2 text-white" />
-                </label>
-              </div>
-              <div className="mt-3 flex justify-end">
-                <button onClick={() => testIntegration(key)} className="rounded-md border border-[#27272a] bg-[#09090b] px-3 py-2 text-[12px] text-[#d4d4d8] transition-colors hover:bg-[#18181b] hover:text-white">
-                  {labels.test}
-                </button>
-              </div>
-            </div>
-          );
-        })}
-      </section>
-
-      {testMessage && (
-        <div className="rounded-md border border-[#27272a] bg-[#000000] px-3 py-2 text-[12px] text-[#a1a1aa]">{testMessage}</div>
-      )}
-    </div>
-  );
-}
-
 function FeishuGuideModal({ t, language, onClose }: { t: any; language: "zh" | "en"; onClose: () => void }) {
   const isEn = language === "en";
   const feishuSteps = isEn
@@ -1957,7 +1845,6 @@ export default function SettingsModal({
             <button onClick={() => setSettingsTab('cloud')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'cloud' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.cloudSetup}</button>
             <button onClick={() => setSettingsTab('context')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'context' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.contextSetup}</button>
             <button onClick={() => setSettingsTab('mcp')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'mcp' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>MCP 服务器</button>
-            <button onClick={() => setSettingsTab('task-center')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'task-center' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{config.language === "en" ? "Task Center" : "任务中枢"}</button>
             <button onClick={() => setSettingsTab('im')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'im' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.imAdapters}</button>
             <button onClick={() => setSettingsTab('data')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'data' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.dataManagement}</button>
             <button onClick={() => setSettingsTab('debug')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'debug' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.debugLog}</button>
@@ -2140,9 +2027,6 @@ export default function SettingsModal({
               mcpDiscoveredTools={mcpDiscoveredTools}
               setMcpDiscoveredTools={setMcpDiscoveredTools}
             />}
-
-            {/* TASK CENTER SETTINGS */}
-            {settingsTab === 'task-center' && <TaskCenterSettingsPanel t={t} />}
 
             {/* DATA MANAGEMENT */}
             {settingsTab === 'data' && <DataManagerPanel t={t} />}

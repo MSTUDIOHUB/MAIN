@@ -11,7 +11,7 @@ import {
 
 // region: 共享类型
 
-export type RightPanelTab = "plan" | "diff" | "terminal" | "file" | "tasks";
+export type RightPanelTab = "plan" | "diff" | "terminal" | "file";
 
 export function detectDominantLanguage(text: string, fallback: "zh" | "en" = "zh"): "zh" | "en" {
   const hanCount = (text.match(/[\u3400-\u9fff]/g) || []).length;
