@@ -217,6 +217,20 @@ export interface AgentMessage {
   tool_call_id?: string;
 }
 
+function truncateForLog(value: string, maxLength = 96): string {
+  const normalized = String(value || "").replace(/\s+/g, " ").trim();
+  return normalized.length <= maxLength ? normalized : `${normalized.slice(0, maxLength).trim()}...`;
+}
+
+function summarizeReplyOptionsForLog(replyOptions: ReplyOption[], limit = 4) {
+  return replyOptions.slice(0, limit).map((option, index) => ({
+    index,
+    label: truncateForLog(option.label || ""),
+    value: truncateForLog(option.value || ""),
+    ...(option.action ? { action: option.action } : {}),
+  }));
+}
+
 /** Result returned when the user acts on a pending Action Card. */
 export type ReviewDecision =
   | { action: "accept" }
@@ -617,7 +631,7 @@ function buildPlanRecoveryPrompt(callbacks: OrchestratorCallbacks, sourceText: s
       "Rules:",
       "- Do not copy tool logs, duplicate-call warnings, hidden thinking, raw source code, or truncation messages into plan files.",
       "- `requirements.md` must summarize the user's intent into real requirements: goal, scope, findings, deliverables, acceptance criteria, and open questions.",
-      "- `design.md` must be executable: affected files/modules, ordered implementation strategy, data/control flow, validation, and risks.",
+      "- `design.md` must be executable: affected files/modules, ordered implementation strategy, data/control flow, validation, and risks. For complex implementations, include one concise Mermaid diagram by default; skip diagrams for simple structures unless the user explicitly asks for one.",
       "- If a design direction is unclear, ask the user with `<user_options>` and stop. Do not invent a final design.",
       "- If the direction is clear, call `write_file` or `replace_in_file` to create/update concise `.MAIN/plans/requirements.md` and `.MAIN/plans/design.md`, then submit the normal Proposal for approval. Do not generate `tasks.md` before approval.",
     ].filter(Boolean).join("\n");
@@ -631,7 +645,7 @@ function buildPlanRecoveryPrompt(callbacks: OrchestratorCallbacks, sourceText: s
     "规则：",
     "- 不要把工具日志、重复调用提示、后台思考、原始源码或截断提示写进计划文件。",
     "- `requirements.md` 必须总结用户真实意图并形成需求规格：目标、范围、当前发现、交付物、验收标准、待确认问题。",
-    "- `design.md` 必须是可执行方案：影响文件/模块、执行顺序、数据流/控制流、验证方式和风险。",
+    "- `design.md` 必须是可执行方案：影响文件/模块、执行顺序、数据流/控制流、验证方式和风险。复杂实现默认包含 1 个简短 Mermaid 图；简单结构不需要，除非用户明确要求生成图。",
     "- 如果设计方向不明确，使用 `<user_options>` 让用户选择并立刻停止；不要编造最终方案。",
     "- 如果方向已经明确，必须调用 `write_file` 或 `replace_in_file` 创建/更新精简的 `.MAIN/plans/requirements.md` 与 `.MAIN/plans/design.md`，然后提交正常 Proposal 等待审批。批准前不要生成 `tasks.md`。",
   ].filter(Boolean).join("\n");
@@ -2195,6 +2209,7 @@ export async function executeAgentLoop(
       logAgentEvent("reply_options_detected", {
         iteration,
         replyOptions: finalReplyOptions.length,
+        optionPreview: summarizeReplyOptionsForLog(finalReplyOptions),
         toolCalls: effectiveToolCalls.length,
         workflowMode,
         turnIntent,
@@ -2308,6 +2323,7 @@ export async function executeAgentLoop(
       logAgentEvent("reply_options_pause", {
         iteration,
         replyOptions: finalReplyOptions.length,
+        optionPreview: summarizeReplyOptionsForLog(finalReplyOptions),
         droppedToolCalls: effectiveToolCalls.length,
         workflowMode,
         turnIntent,

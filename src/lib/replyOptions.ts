@@ -11,6 +11,10 @@ const READONLY_PERMISSION_CUE_RE = /(?:是否|能否|可否|要不要|是否同�
 const READONLY_ACTION_RE = /(?:读取|查看|分析|检查|扫描|搜索|查询|浏览|梳理|提取|汇总|read|open|view|inspect|analy[sz]e|scan|search|query|review|summari[sz]e)/i;
 const READONLY_WRITE_EXCLUSION_RE = /(?:写入|修改|删除|创建|执行命令|运行命令|改动|更改|write|modify|delete|create|edit|run command|execute command)/i;
 const READONLY_TARGET_RE = /[`"“']([^`"“”']{2,160})[`"”']|([A-Za-z0-9_.\-\/\\]+\.[A-Za-z0-9]{1,12})/;
+const PLAN_ARTIFACT_PATH_RE = /\.MAIN[\/\\]plans[\/\\](?:requirements|design|bugfix|tasks)\.md/i;
+const PLAN_ARTIFACT_FILE_RE = /\b(?:requirements|design|bugfix|tasks)\.md\b/i;
+const PLAN_ARTIFACT_DOC_RE = /(?:计划文档|计划文件|规划文档|规划文件|plan documents?|plan files?|planning documents?|planning files?)/i;
+const INTERNAL_PLAN_ARTIFACT_STEP_RE = /(?:创建|生成|写入|更新|保存|落盘|create|generate|write|update|save)/i;
 
 function normalizeOptionText(text: string): string {
   return text.replace(/\s+/g, " ").trim();
@@ -37,6 +41,16 @@ function normalizeReplyOptionValue(text: string): string {
   return converted;
 }
 
+function looksLikeInternalPlanArtifactStep(text: string): boolean {
+  const normalized = normalizeOptionText(text);
+  if (!INTERNAL_PLAN_ARTIFACT_STEP_RE.test(normalized)) return false;
+  return (
+    PLAN_ARTIFACT_PATH_RE.test(normalized) ||
+    PLAN_ARTIFACT_FILE_RE.test(normalized) ||
+    PLAN_ARTIFACT_DOC_RE.test(normalized)
+  );
+}
+
 function addReplyOption(
   replyOptions: ReplyOption[],
   seenValues: Set<string>,
@@ -47,6 +61,7 @@ function addReplyOption(
   const label = normalizeReplyOptionLabel(rawLabel || rawValue || "");
   const value = normalizeReplyOptionValue(rawValue || rawLabel);
   if (!label || !value || seenValues.has(value)) return;
+  if (looksLikeInternalPlanArtifactStep(label) || looksLikeInternalPlanArtifactStep(value)) return;
   seenValues.add(value);
   replyOptions.push({ label, value, ...(action ? { action } : {}) });
 }

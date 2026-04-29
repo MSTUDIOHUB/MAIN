@@ -132,6 +132,76 @@ test("extractReplyOptions infers enumerated markdown choices after a decision cu
   );
 });
 
+test("extractReplyOptions filters internal plan artifact creation pseudo choices", () => {
+  const explicitPathResult = extractReplyOptions(`
+选择下一步：
+
+<user_options>
+<option>创建 \`.MAIN/plans/requirements.md\` - 精简的需求规格</option>
+<option>创建 \`.MAIN/plans/design.md\` - 精简的设计方案</option>
+</user_options>
+  `);
+
+  assert.equal(explicitPathResult.replyOptions.length, 0);
+
+  const bareFileResult = extractReplyOptions(`
+选择下一步：
+
+<user_options>
+<option>基于方案C更新计划文档（requirements.md + design.md）</option>
+<option>创建 requirements.md</option>
+<option>更新 design.md</option>
+<option>生成计划文档</option>
+</user_options>
+  `);
+
+  assert.equal(bareFileResult.replyOptions.length, 0);
+
+  const inferredMarkdownResult = extractReplyOptions(`
+下一步可以：
+1. 基于方案C更新计划文档（requirements.md + design.md）
+2. 创建 requirements.md
+3. 更新 design.md
+  `);
+
+  assert.equal(inferredMarkdownResult.replyOptions.length, 0);
+});
+
+test("extractReplyOptions keeps real plan choices and execution approval", () => {
+  const routeResult = extractReplyOptions(`
+请选择方案：
+
+<user_options>
+<option>方案A：完整框架优先，先搭好全部模块边界</option>
+<option>方案B：战斗系统优先，先验证 CTB 核心循环</option>
+<option>方案C：最小可运行版本，验证后再扩展</option>
+</user_options>
+  `);
+
+  assert.deepEqual(
+    routeResult.replyOptions.map((option) => option.value),
+    [
+      "方案A：完整框架优先，先搭好全部模块边界",
+      "方案B：战斗系统优先，先验证 CTB 核心循环",
+      "方案C：最小可运行版本，验证后再扩展",
+    ],
+  );
+
+  const approvalResult = extractReplyOptions(`
+计划已准备好，请选择下一步：
+
+<user_options>
+<option>批准进入执行</option>
+<option>继续讨论范围</option>
+</user_options>
+  `);
+
+  assert.deepEqual(
+    approvalResult.replyOptions.map((option) => option.value),
+    ["批准进入执行", "继续讨论范围"],
+  );
+});
+
 test("extractReplyOptions infers binary choices from plain-language clarification prompts", () => {
   const result = extractReplyOptions(`
 请您确认以下关键点，以便我能进入下一步的执行阶段：

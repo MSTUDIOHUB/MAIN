@@ -4465,12 +4465,14 @@ export const useAppStore = create<AppState>()(
         userContent = preferredLanguage === "en"
           ? [
               `${planModeLead} If the request is a complex implementation, call \`write_file\` or \`replace_in_file\` to create or update concise reviewable plan drafts in \`.MAIN/plans/requirements.md\` and \`.MAIN/plans/design.md\` before asking for approval; do not write project source files or tasks.md before approval.`,
+              "Creating or updating requirements/design drafts and plan documents is an automatic internal planning step, not a user choice. After the user picks a route, update the plan drafts directly instead of asking whether to update them.",
               "If it is only a discussion-style plan, keep the answer concise and use user options for real decisions.",
               "",
               userContent,
             ].join("\n")
           : [
               `${planModeLead}如果这是复杂实现请求，请调用 \`write_file\` 或 \`replace_in_file\` 创建或更新可审批的精简计划草稿：\`.MAIN/plans/requirements.md\` 与 \`.MAIN/plans/design.md\`，等待用户批准后再改源码；批准前不要生成 tasks.md。`,
+              "创建或更新 requirements/design 草稿和计划文档是自动的内部规划步骤，不是用户需要选择的下一步；用户选定方案后应直接更新计划草稿，不要再询问是否更新计划文档。",
               "如果只是讨论式方案，请保持简洁，并在真实分叉点用可点击选项让用户选择。",
               "",
               userContent,
