@@ -117,7 +117,7 @@ function TurnSummaryCard({
   const summaryText = (looksLikeReasoningLeakTitle(cleanTurnSummary) ? "" : cleanTurnSummary) || sanitizeAIOutput(fallbackSummary || "") || copy.collapsedSummary;
 
   return (
-    <div data-testid="turn-summary-card" className="rounded-2xl border border-[#1f1f23] bg-[#09090b] px-4 py-3 shadow-sm">
+    <div data-testid="turn-summary-card" className="rounded-2xl border border-[#1f1f23] bg-[#09090b] px-4 py-3">
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0 flex-1">
           <div className="text-[11px] uppercase tracking-[0.18em] text-[#71717a]">{copy.summary}</div>
@@ -168,14 +168,12 @@ function ContextCompressionNotice({ block, language }: { block: any; language: "
     ? {
         pillBorder: "#cbd5e1",
         pillBackground: "#f8fafc",
-        pillShadow: "0 10px 28px rgba(15,23,42,0.10)",
         titleText: "#1e293b",
         mutedText: "#64748b",
         actionText: "#1d4ed8",
         overlay: "rgba(15,23,42,0.24)",
         modalBorder: "#cbd5e1",
         modalBackground: "#ffffff",
-        modalShadow: "0 28px 80px rgba(15,23,42,0.18)",
         headerBorder: "#e2e8f0",
         headerBackground: "linear-gradient(90deg, rgba(219,234,254,0.9), rgba(240,249,255,0.72))",
         closeBorder: "#cbd5e1",
@@ -189,14 +187,12 @@ function ContextCompressionNotice({ block, language }: { block: any; language: "
     : {
         pillBorder: "#34343b",
         pillBackground: "#232327",
-        pillShadow: "none",
         titleText: "#d4d4d8",
         mutedText: "#71717a",
         actionText: "#93c5fd",
         overlay: "rgba(0,0,0,0.68)",
         modalBorder: "#34343b",
         modalBackground: "#1d1d20",
-        modalShadow: "0 28px 80px rgba(0,0,0,0.45)",
         headerBorder: "#2c2c32",
         headerBackground: "linear-gradient(90deg, rgba(37,99,235,0.16), rgba(14,165,233,0.08))",
         closeBorder: "#34343b",
@@ -230,7 +226,6 @@ function ContextCompressionNotice({ block, language }: { block: any; language: "
         style={{
           borderColor: tone.pillBorder,
           backgroundColor: tone.pillBackground,
-          boxShadow: tone.pillShadow,
           color: tone.mutedText,
         }}
       >
@@ -242,11 +237,10 @@ function ContextCompressionNotice({ block, language }: { block: any; language: "
       {isExpanded && typeof document !== "undefined" && createPortal(
         <div className="fixed inset-0 z-[140] flex items-center justify-center bg-[rgba(0,0,0,0.68)] p-6" style={{ backgroundColor: tone.overlay }} onClick={() => setIsExpanded(false)}>
           <div
-            className="flex h-[min(86vh,960px)] w-[min(96vw,1320px)] flex-col overflow-hidden rounded-[28px] border border-[#34343b] bg-[#1d1d20] shadow-[0_28px_80px_rgba(0,0,0,0.45)]"
+            className="flex h-[min(86vh,960px)] w-[min(96vw,1320px)] flex-col overflow-hidden rounded-[28px] border border-[#34343b] bg-[#1d1d20]"
             style={{
               borderColor: tone.modalBorder,
               backgroundColor: tone.modalBackground,
-              boxShadow: tone.modalShadow,
             }}
             onClick={(event) => event.stopPropagation()}
           >
@@ -356,7 +350,7 @@ function PlanShortcutCard({
     : copy.planReady;
 
   return (
-    <div className="ml-9 rounded-2xl border border-[rgba(124,58,237,0.22)] bg-[rgba(124,58,237,0.08)] px-4 py-3 shadow-sm">
+    <div className="ml-9 rounded-2xl border border-[rgba(124,58,237,0.22)] bg-[rgba(124,58,237,0.08)] px-4 py-3">
       <div className="flex items-center justify-between gap-3">
         <div className="min-w-0">
           <div className="flex items-center gap-2">
@@ -660,7 +654,7 @@ function TurnChangesCard({
     : `${totalExecutedEdits} executed edit${totalExecutedEdits > 1 ? "s" : ""}`;
 
   return (
-    <div className="ml-9 rounded-2xl border border-[#1d4ed8]/18 bg-[#060b14] px-4 py-3 shadow-sm">
+    <div className="ml-9 rounded-2xl border border-[#1d4ed8]/18 bg-[#060b14] px-4 py-3">
       <div className="flex items-center justify-between gap-3">
         <div className="min-w-0">
           <div className="flex items-center gap-2 text-[11px] uppercase tracking-[0.16em] text-[#93c5fd]">
@@ -725,7 +719,7 @@ function ReadContextGroupCard({
         data-testid="read-context-group"
         aria-expanded={expanded}
         onClick={() => setExpanded((value) => !value)}
-        className="flex w-full min-w-0 items-center gap-2 rounded-xl border border-[#1f2937] bg-[#07070a] px-3 py-2 text-left shadow-sm transition-colors hover:border-[#374151] hover:bg-[#09090b]"
+        className="flex w-full min-w-0 items-center gap-2 rounded-xl border border-[#1f2937] bg-[#07070a] px-3 py-2 text-left transition-colors hover:border-[#374151] hover:bg-[#09090b]"
       >
         {expanded ? (
           <IconChevronDown className="h-3.5 w-3.5 shrink-0 text-[#71717a]" />
@@ -878,7 +872,7 @@ function AgentContentBlock({
       <div className="mt-1 flex-shrink-0">
         <IconLogoM className="theme-text h-6 w-6 drop-shadow-[0_0_8px_var(--accent-subtle)]" />
       </div>
-      <div className="chat-agent-content my-2 min-w-0 flex-1 bg-[#09090b]/60 px-5 py-4 text-[#e4e4e7] shadow-sm" style={{ fontSize: `${chatFontSize}px` }}>
+      <div className="chat-agent-content my-2 min-w-0 flex-1 bg-[#09090b]/60 px-5 py-4 text-[#e4e4e7]" style={{ fontSize: `${chatFontSize}px` }}>
         {isArchivedAfterChoice && (
           <div data-testid="archived-choice-feedback-expanded" className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-[#27272a] bg-[#050507] px-3 py-2">
             <div className="min-w-0 flex flex-wrap items-center gap-2">
@@ -1427,7 +1421,7 @@ export default function ChatArea({
     if (block.type === "user") {
       return (
         <div key={`${block.id}-${index}`} className="flex w-full justify-end">
-          <div className="theme-subtle-bg theme-subtle-border max-w-[85%] rounded-2xl rounded-tr-sm border p-4 shadow-sm">
+          <div className="theme-subtle-bg theme-subtle-border max-w-[85%] rounded-2xl rounded-tr-sm border p-4">
             {block.images && block.images.length > 0 && (
               <div className="mb-2 flex flex-wrap gap-2">
                 {block.images.map((dataUrl: string, imgIdx: number) => (
@@ -1598,7 +1592,7 @@ export default function ChatArea({
         ref={(node) => {
           turnRefs.current[turn.id] = node;
         }}
-        className="rounded-[24px] border border-[#18181b] bg-[#050507] p-4 shadow-[0_12px_48px_rgba(0,0,0,0.18)]"
+        className="rounded-[24px] border border-[#18181b] bg-[#050507] p-4"
       >
         <div
           role="button"
@@ -1820,14 +1814,14 @@ export default function ChatArea({
         {groupedTurns.length === 0 ? (
           isGlobalChat ? (
             <div className="flex h-full items-center justify-center">
-              <div className="w-full max-w-3xl rounded-[32px] border border-[#18181b] bg-[#050507] px-8 py-10 shadow-[0_18px_64px_rgba(0,0,0,0.22)]">
+              <div className="w-full max-w-3xl rounded-[32px] border border-[#18181b] bg-[#050507] px-8 py-10">
                 <div className="flex items-center gap-3">
                   <IconLogoM className="h-10 w-10 theme-text drop-shadow-[0_0_18px_var(--accent-subtle)]" />
                     <div>
                       <div className="text-[11px] font-semibold uppercase tracking-[0.22em] text-[#71717a]">
                       {language === "zh" ? "聊天" : "Chat"}
                       </div>
-                    <div className="mt-1 text-[28px] font-semibold text-[#f4f4f5]">
+                    <div className="mt-1 text-[28px] font-semibold text-[#f5f5f5]">
                       {language === "zh" ? "先用 MAIN 模式做总结、分析、报告或计划" : "Use MAIN mode for summaries, analysis, reports, or planning"}
                     </div>
                   </div>

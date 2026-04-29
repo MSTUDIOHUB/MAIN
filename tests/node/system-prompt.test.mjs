@@ -138,6 +138,50 @@ test("data analyst chat prompt tells the model to auto-fallback on read-only fai
   assert.match(prompt, /一旦你判断需要读取本地文件才能回答，就在同一轮直接调用只读工具/);
 });
 
+test("system prompt uses English core tool protocol with localized output strategy", () => {
+  const prompt = buildSystemPrompt(
+    [],
+    "/tmp/workspace",
+    "main_mode",
+    "",
+    [],
+    [],
+    "chat",
+    "zh",
+    null,
+  );
+
+  assert.match(prompt, /\[CORE TOOL PROTOCOL\]/);
+  assert.match(prompt, /Prompt language strategy: english_core_localized_output/);
+  assert.match(prompt, /Tool availability is intent-scoped/);
+  assert.match(prompt, /\[LOCALIZED USER OUTPUT\]/);
+  assert.match(prompt, /用户当前这条请求所用的语言/);
+  assert.doesNotMatch(prompt, /在执行文件读取、搜索、修改、构建、测试等操作前，必须先用普通 Markdown 输出一句/);
+  assert.doesNotMatch(prompt, /调用工具前，先用普通 Markdown 写一句用户可见的操作说明/);
+});
+
+test("system prompt lists only intent-filtered tools when available names are provided", () => {
+  const prompt = buildSystemPrompt(
+    [],
+    "/tmp/workspace",
+    "main_mode",
+    "",
+    [],
+    [],
+    "plan",
+    "zh",
+    null,
+    undefined,
+    undefined,
+    "english_core_localized_output",
+    ["read_file", "write_file", "replace_in_file"],
+  );
+
+  assert.match(prompt, /可用的工具：read_file, replace_in_file, write_file|可用的工具：read_file, write_file, replace_in_file/);
+  assert.doesNotMatch(prompt, /run_command/);
+  assert.doesNotMatch(prompt, /execute_command/);
+});
+
 test("data analyst plan prompt uses interactive planning and analysis semantics", () => {
   const prompt = buildSystemPrompt(
     [],

@@ -107,6 +107,15 @@ import {
   type FeishuPendingPairing,
   type ImAdaptersConfig,
 } from "../lib/imAdapters";
+import {
+  createDefaultMcpRoutingConfig,
+  createDefaultToolPermissionPolicy,
+  normalizeMcpRoutingConfig,
+  normalizeToolPermissionPolicy,
+  type McpRoutingConfig,
+  type PromptLanguageStrategy,
+  type ToolPermissionPolicy,
+} from "../lib/toolCapabilities";
 
 function logStoreEvent(event: string, data: Record<string, unknown> = {}) {
   try {
@@ -451,6 +460,9 @@ export interface AppConfig {
   theme: ThemeKey;
   themeMode: "light" | "dark";
   workflowMode: "chat" | "edit" | "plan";  // Legacy mirror of the active turn intent.
+  promptLanguageStrategy: PromptLanguageStrategy;
+  toolPermissionPolicy: ToolPermissionPolicy;
+  mcpRouting: McpRoutingConfig;
   instructionsEnabled: boolean;
   hooksEnabled: boolean;
   activeProfile: "local" | "cloud";
@@ -809,6 +821,9 @@ const defaultConfig: AppConfig = {
   theme: "purple",
   themeMode: "dark",
   workflowMode: "chat",
+  promptLanguageStrategy: "english_core_localized_output",
+  toolPermissionPolicy: createDefaultToolPermissionPolicy(),
+  mcpRouting: createDefaultMcpRoutingConfig(),
   instructionsEnabled: true,
   hooksEnabled: true,
   activeProfile: "local",
@@ -5986,6 +6001,12 @@ export const useAppStore = create<AppState>()(
           cloud: cloudState.cloud,
           cloudServers: cloudState.cloudServers,
           activeCloudServerId: cloudState.activeCloudServerId,
+          promptLanguageStrategy:
+            persistedState.config?.promptLanguageStrategy === "english_core_localized_output"
+              ? persistedState.config.promptLanguageStrategy
+              : current.config.promptLanguageStrategy,
+          toolPermissionPolicy: normalizeToolPermissionPolicy(persistedState.config?.toolPermissionPolicy),
+          mcpRouting: normalizeMcpRoutingConfig(persistedState.config?.mcpRouting),
           sessionRecordingEnabled: persistedState.config?.sessionRecordingEnabled ?? current.config.sessionRecordingEnabled,
           imAdapters: normalizeImAdaptersConfig(persistedState.config?.imAdapters),
         },

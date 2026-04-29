@@ -30,6 +30,11 @@ import {
 } from "./ipc";
 import { invoke } from "@tauri-apps/api/core";
 import { isMcpTool, executeMcpTool, getMcpServerUrl } from "./mcpClient";
+import {
+  classifyBuiltInTool,
+  classifyMcpToolName,
+  isRiskAutoExecutable,
+} from "./toolCapabilities";
 import { formatDirectoryNodesForTool } from "./workspacePaths";
 
 /** Delay helper for waiting on PTY output after a command. */
@@ -345,29 +350,11 @@ export async function executeTool(
 }
 
 /**
- * Returns true if a tool is read-only and can be auto-executed
- * without user review.
- *
- * MCP tools are NOT considered read-only — they control external
- * engines (like Unity) and must go through the human review gate.
+ * Legacy helper for callers that only have a tool name. The orchestrator uses
+ * the richer ToolCapabilityRegistry so MCP descriptions and per-call SQL risk
+ * can refine this default classification.
  */
 export function isReadOnlyTool(name: string): boolean {
-  if (isMcpTool(name)) return false;
-  return [
-    "list_directory",
-    "read_file",
-    "read_document",
-    "analyze_tabular_document",
-    "query_tabular_document",
-    "index_workspace_documents",
-    "glob_search",
-    "grep_search",
-    "read_pty_buffer",
-    "read_pty_tail",
-    "read_pty_since",
-    "get_pty_status",
-    "clear_pty_buffer",
-    "get_project_skeleton",
-    "get_file_outline",
-  ].includes(name);
+  const risk = isMcpTool(name) ? classifyMcpToolName(name) : classifyBuiltInTool(name);
+  return isRiskAutoExecutable(risk);
 }

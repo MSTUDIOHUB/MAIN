@@ -22,12 +22,12 @@ import {
   type StreamResult,
 } from "./streaming";
 import { buildToolDefinitions, skillNameToToolName, type ToolDefinition } from "./toolSchemas";
-import { executeTool, isReadOnlyTool } from "./toolExecutor";
+import { executeTool } from "./toolExecutor";
 import { computeContextBudgets, estimateTokens, manageContext } from "./contextTrim";
 import { clampContextLimitToReported } from "./contextWindow";
 import { generateId } from "./utils";
 import { buildSystemPrompt } from "./systemPrompt";
-import { discoverAllMcpTools, setMcpToolServerMap, type MCPServer, type MCPTool } from "./mcpClient";
+import { discoverAllMcpTools, getMcpToolServerMap, setMcpToolServerMap, type MCPServer, type MCPTool } from "./mcpClient";
 import { getFileMetadata } from "./ipc";
 import { ensureVisibleConclusion, isAssistantTurnEmpty, normalizeAssistantTurn } from "./normalizedTurn";
 import { hasStructuredPlanProposal } from "./planProposal";
@@ -71,6 +71,12 @@ import {
   formatRepeatLoopRecoveryMessage,
   registerToolCallForRepeatGuard,
 } from "./repetitionGuard";
+import {
+  buildToolCapabilityRegistry,
+  filterToolDefinitionsForIntent,
+  isToolAutoExecutableForCall,
+  routeMcpToolsForPrompt,
+} from "./toolCapabilities";
 import {
   buildCompatibilityRetryMessages,
   buildTranscriptCompatibilityRetryMessages,
@@ -1424,6 +1430,8 @@ export async function executeAgentLoop(
   const workspace = config.workspace;
   const mainModeKey = callbacks.getMainModeKey();
   const workspaceTree = callbacks.getWorkspaceTree();
+  const turnIntent = callbacks.getCurrentRunIntent();
+  const workflowMode = callbacks.getWorkflowMode();
 
   console.log('[orchestrator] executeAgentLoop');
   console.log('[orchestrator] activeProfile:', config.activeProfile);
@@ -1445,26 +1453,53 @@ export async function executeAgentLoop(
   // Discover MCP tools from configured servers
   const mcpServers = callbacks.getMcpServers();
   let mcpTools = callbacks.getMcpDiscoveredTools();
+  let mcpToolServerMap = getMcpToolServerMap();
 
   if (mcpServers.length > 0) {
     console.log(`[orchestrator] Discovering tools from ${mcpServers.length} MCP server(s)...`);
     const { tools: discovered, toolServerMap } = await discoverAllMcpTools(mcpServers);
+    mcpToolServerMap = toolServerMap;
+    setMcpToolServerMap(toolServerMap);
     if (discovered.length > 0) {
       console.log(`[orchestrator] Discovered ${discovered.length} MCP tool(s):`, discovered.map(t => t.name).join(", "));
       mcpTools = discovered;
-      // Update the module-level routing map so toolExecutor can look up MCP tools
-      setMcpToolServerMap(toolServerMap);
     } else {
       console.log(`[orchestrator] No MCP tools discovered (servers may be offline).`);
+      mcpTools = [];
     }
   }
 
-  // Build merged tool definitions: built-in tools + active skill-based tools + MCP tools
-  const allTools = buildToolDefinitions(skills, mcpTools);
+  const latestUserPrompt = [...initialMessages]
+    .reverse()
+    .find((message) => message.role === "user");
+  const mcpRoutingResult = routeMcpToolsForPrompt({
+    tools: mcpTools,
+    servers: mcpServers,
+    toolServerMap: mcpToolServerMap,
+    userPrompt: latestUserPrompt ? extractCompatibilityTextContent(latestUserPrompt.content) : "",
+    config: config.mcpRouting,
+  });
+  mcpTools = mcpRoutingResult.tools;
+  logAgentEvent("mcp_routing", { ...mcpRoutingResult.telemetry });
+
+  // Build intent-scoped tool definitions: built-ins + active skills + routed MCP tools.
+  const routedToolDefinitions = buildToolDefinitions(skills, mcpTools);
+  const toolCapabilityRegistry = buildToolCapabilityRegistry({
+    toolDefinitions: routedToolDefinitions,
+    skills,
+    mcpTools,
+    mcpServers,
+    mcpToolServerMap,
+    policy: config.toolPermissionPolicy,
+  });
+  const allTools = filterToolDefinitionsForIntent(
+    routedToolDefinitions,
+    turnIntent,
+    toolCapabilityRegistry,
+  );
+  const availableToolNames = new Set(allTools.map((tool) => tool.function.name));
   const resolveLlmTools = () =>
     !hasProviderNativeToolsDisabled(callbacks.getMessages()) ? allTools : [];
-  const turnIntent = callbacks.getCurrentRunIntent();
-  const workflowMode = callbacks.getWorkflowMode();
   const associatedPaths = callbacks.getAssociatedPaths();
   const resolvedInstructions = config.instructionsEnabled
     ? await loadResolvedInstructions(workspace, skills, associatedPaths)
@@ -1501,11 +1536,14 @@ export async function executeAgentLoop(
   // that any changes in active skills or model configuration are
   // immediately reflected in the LLM's context.
   const messages = callbacks.getMessages();
-  const mcpToolNames = mcpTools.map(t => t.name);
-  const customToolNames = skills
+  const mcpToolNameSet = new Set(mcpTools.map(t => t.name));
+  const skillToolNameSet = new Set(skills
     .filter(s => s.active && s.type === "tool")
     .map(s => skillNameToToolName(s.name))
-    .filter(Boolean);
+    .filter(Boolean));
+  const availableToolNameList = allTools.map((tool) => tool.function.name);
+  const mcpToolNames = availableToolNameList.filter((name) => mcpToolNameSet.has(name));
+  const customToolNames = availableToolNameList.filter((name) => skillToolNameSet.has(name));
 
   const systemPrompt = buildSystemPrompt(
     skills,
@@ -1523,6 +1561,8 @@ export async function executeAgentLoop(
       pendingSlashCommand: callbacks.getPendingSlashCommand(),
     },
     turnIntent,
+    config.promptLanguageStrategy,
+    availableToolNameList,
   );
 
   if (messages.length === 0) {
@@ -2628,8 +2668,8 @@ export async function executeAgentLoop(
       tool_calls: toolCallsForMsg,
     });
 
-    // Partition tool calls into read-only (auto-execute), spec file writes
-    // (auto-approved in Plan Mode), and write (review-gated)
+    // Partition tool calls into auto-executable, spec file writes
+    // (auto-approved in Plan Mode), and review-gated tools.
     const readOnlyCalls: ToolCallToExecute[] = [];
     const specFileCalls: ToolCallToExecute[] = [];
     const writeCalls: ToolCallToExecute[] = [];
@@ -2639,10 +2679,25 @@ export async function executeAgentLoop(
 
     for (const tc of effectiveToolCalls) {
       const toolArgs = parseToolCallArguments(tc);
+      const target = getToolTarget(tc.name, toolArgs);
 
-      if (isReadOnlyTool(tc.name)) {
+      if (!availableToolNames.has(tc.name)) {
+        const message = callbacks.getPreferredLanguage() === "zh"
+          ? `工具 "${tc.name}" 当前没有暴露给 ${turnIntent} 意图。请使用本轮可用工具，或在需要写入/执行时切换到计划或执行流程。`
+          : `Tool "${tc.name}" is not exposed for the current ${turnIntent} intent. Use an available tool, or switch to plan/execute when write or execution access is needed.`;
+        callbacks.onToolError(tc.name, target, message);
+        allResults.push({
+          toolCallId: tc.id,
+          name: tc.name,
+          target,
+          content: `Error: ${message}`,
+          isError: true,
+        });
+        continue;
+      }
+
+      if (isToolAutoExecutableForCall(tc.name, toolArgs, toolCapabilityRegistry, config.toolPermissionPolicy)) {
         const signature = buildReadOnlyCacheSignature(tc.name, toolArgs);
-        const target = getToolTarget(tc.name, toolArgs);
         const cached = readOnlyResultCache.get(signature);
         const fileReadMetadata =
           tc.name === "read_file" && typeof toolArgs.path === "string"
@@ -2738,7 +2793,6 @@ export async function executeAgentLoop(
       } else if (workflowMode === "plan") {
         const approved = callbacks.getIsPlanApproved();
         const hasExecutableTasks = callbacks.getPlanTasks().length > 0;
-        const target = getToolTarget(tc.name, toolArgs);
 
         if (!approved && isPreApprovalPlanDraftWrite(tc.name, toolArgs)) {
           specFileCalls.push({ id: tc.id, name: tc.name, arguments: tc.arguments });
@@ -2875,12 +2929,17 @@ export async function executeAgentLoop(
     let recoveredReadOnlyRepeat = false;
     for (const tc of effectiveToolCalls) {
       const toolArgs = parseToolCallArguments(tc);
-      const readOnly = isReadOnlyTool(tc.name);
-      const repeatCheck = registerToolCallForRepeatGuard(recentToolCalls, tc.name, toolArgs, readOnly);
+      const autoExecutable = isToolAutoExecutableForCall(
+        tc.name,
+        toolArgs,
+        toolCapabilityRegistry,
+        config.toolPermissionPolicy,
+      );
+      const repeatCheck = registerToolCallForRepeatGuard(recentToolCalls, tc.name, toolArgs, autoExecutable);
       if (!repeatCheck.repeated) continue;
 
       const target = getToolTarget(tc.name, toolArgs);
-      if (readOnly && !repeatGuardRecoveredSignatures.has(repeatCheck.signature)) {
+      if (autoExecutable && !repeatGuardRecoveredSignatures.has(repeatCheck.signature)) {
         const recoveryMessage = formatRepeatLoopRecoveryMessage(tc.name, target, repeatCheck.threshold);
         repeatGuardRecoveredSignatures.add(repeatCheck.signature);
         recentToolCalls.length = 0;

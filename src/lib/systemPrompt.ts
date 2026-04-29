@@ -13,6 +13,7 @@ import {
 } from "./protocolPackages";
 import { getIntentPolicy, resolveRunIntentFromLegacyWorkflowMode, type ResolvedUserIntent } from "./runIntent";
 import { mapLegacyNexusModeToMainMode, type MainModeKey } from "./mainModes";
+import type { PromptLanguageStrategy } from "./toolCapabilities";
 
 export const MAIN_MODE_PROMPTS: Record<MainModeKey, string> = {
   main_mode: [
@@ -41,6 +42,56 @@ export type GameStudioPromptContext = {
 
 const WORKSPACE_IGNORE_DIRS = new Set(["node_modules", ".git", ".svn", ".hg", ".idea", ".vscode", ".vs", "dist", "build", "out", "bin", "obj", "target", "vendor", "__pycache__", ".next", ".nuxt", ".cache", ".turbo", "coverage", ".gradle", ".dart_tool", ".fvm", ".DS_Store"]);
 
+const READ_ONLY_BUILT_IN_TOOL_NAMES = [
+  "get_project_skeleton",
+  "get_file_outline",
+  "list_directory",
+  "read_file",
+  "read_document",
+  "analyze_tabular_document",
+  "query_tabular_document",
+  "index_workspace_documents",
+  "glob_search",
+  "grep_search",
+  "read_pty_buffer",
+  "read_pty_tail",
+  "read_pty_since",
+  "get_pty_status",
+  "clear_pty_buffer",
+];
+
+const WORKFLOW_BUILT_IN_TOOL_NAMES = [
+  ...READ_ONLY_BUILT_IN_TOOL_NAMES,
+  "replace_in_file",
+  "write_file",
+  "run_command",
+  "execute_command",
+  "send_pty_input",
+];
+
+function filterAvailableToolNames(names: string[], availableToolNames?: string[]): string[] {
+  if (!availableToolNames || availableToolNames.length === 0) return names;
+  const available = new Set(availableToolNames);
+  return names.filter((name) => available.has(name));
+}
+
+function isToolNameAvailable(name: string, availableToolNames?: string[]): boolean {
+  return !availableToolNames || availableToolNames.length === 0 || availableToolNames.includes(name);
+}
+
+function formatToolNameList(
+  customToolNames: string[] | undefined,
+  mcpToolNames: string[] | undefined,
+  builtInToolNames: string[],
+  availableToolNames?: string[],
+): string {
+  return [
+    ...filterAvailableToolNames(customToolNames || [], availableToolNames),
+    ...filterAvailableToolNames(mcpToolNames || [], availableToolNames),
+    ...filterAvailableToolNames(builtInToolNames, availableToolNames),
+  ].join(", ");
+}
+
 export function formatWorkspaceTree(entries: Array<{ name: string; isDirectory: boolean }>): string {
   const filtered = entries.filter(e => !WORKSPACE_IGNORE_DIRS.has(e.name) && !e.name.startsWith(".")).sort((a, b) => { if (a.isDirectory && !b.isDirectory) return -1; if (!a.isDirectory && b.isDirectory) return 1; return a.name.localeCompare(b.name); });
   return filtered.map(e => e.isDirectory ? "[D] " + e.name : "[F] " + e.name).join("\n");
@@ -58,17 +109,42 @@ export function buildSystemPrompt(
   resolvedInstructions?: ResolvedInstructionSet | null,
   gameStudioContext?: GameStudioPromptContext,
   turnIntentOverride?: ResolvedUserIntent,
+  promptLanguageStrategy: PromptLanguageStrategy = "english_core_localized_output",
+  availableToolNames?: string[],
 ): string {
   const parts: string[] = [];
   const fallbackLanguageName = uiLanguage === "zh" ? "中文" : "English";
   const turnIntent = turnIntentOverride ?? resolveRunIntentFromLegacyWorkflowMode(workflowMode ?? "chat");
   const turnIntentPolicy = getIntentPolicy(turnIntent);
   const normalizedMainModeKey = mapLegacyNexusModeToMainMode(mainModeKey);
+  const shellToolsAvailable =
+    isToolNameAvailable("run_command", availableToolNames) ||
+    isToolNameAvailable("execute_command", availableToolNames);
   parts.push("当前工作区绝对路径为：" + workspace);
   parts.push("你执行任何文件操作或搜索时，都必须基于此路径。所有相对路径都相对于此根目录解析。");
   parts.push("根目录探索优先使用 `get_project_skeleton`，不要把 `list_directory('.')` 当成默认第一步；只有明确需要根目录即时文件列表时才调用一次，拿到结果后必须复用，不能反复对 `.` 重复扫描。");
   parts.push("当 `list_directory`、`glob_search` 或其他工具返回文件/目录路径时，后续工具调用必须优先复用返回的完整相对路径，不要自行裁掉父目录。");
   if (workspaceTree) { parts.push("该目录的基础结构如下：\n" + workspaceTree); }
+
+  parts.push([
+    "================================",
+    "[CORE TOOL PROTOCOL]",
+    `Prompt language strategy: ${promptLanguageStrategy}.`,
+    "Tool availability is intent-scoped. Only call tools that are actually exposed in this turn's tool list.",
+    "Native tool calls may be emitted directly; the UI will display tool progress, approvals, diffs, terminal output, and failures.",
+    "Do not add placeholder prose solely to announce a native tool call, and do not claim tools are unavailable when they are listed.",
+    "",
+    "[SAFETY AND PERMISSION BOUNDARY]",
+    "Read-only and external-read tools may be used without asking for step-by-step consent.",
+    "Workspace writes, shell execution, browser control, external writes, and destructive operations are approval-gated by the runtime.",
+    "Plan turns may draft `.MAIN/plans/requirements.md`, `.MAIN/plans/design.md`, or `.MAIN/plans/bugfix.md`; source edits and final deliverables wait for plan approval.",
+    "If a needed tool is absent because of the current intent, continue with available safe tools or explain the blocker and ask for plan/execute consent.",
+    "",
+    "[LOCALIZED USER OUTPUT]",
+    "All user-visible explanations, summaries, plans, task titles, and approval text must follow the user's current message language.",
+    `If the current message language is unclear, use the UI fallback language: ${fallbackLanguageName}.`,
+    "Keep protocol labels, code identifiers, file names, and machine-readable markers unchanged when needed.",
+  ].join("\n"));
   
   parts.push([
     "你是一个拥有本地机器访问权限的高级 AI IDE 助手。",
@@ -77,7 +153,9 @@ export function buildSystemPrompt(
     "1. 绝对主动性 — 必须主动调用工具获取信息，不要要求用户手动操作或粘贴代码。",
     "2. 严禁凭空捏造 — 修改代码前必须先获取上下文，禁止猜测文件内容或路径。",
     "3. 直接行动 — 立即调查并执行。不要问「我是否应该...」，直接做并用事实回复。",
-    "4. 执行验证 — 一次性命令优先用 `run_command` 获取 stdout/stderr/exitCode；交互式或长驻命令用 `execute_command` 后必须跟随 `read_pty_since`、`read_pty_tail` 或 `get_pty_status` 验证结果。",
+    shellToolsAvailable
+      ? "4. 执行验证 — 命令工具在本轮可用时，一次性命令优先用 `run_command` 获取 stdout/stderr/exitCode；交互式或长驻命令用 `execute_command` 后必须跟随 `read_pty_since`、`read_pty_tail` 或 `get_pty_status` 验证结果。"
+      : "4. 执行验证 — 本轮未暴露命令工具时，不要尝试 shell 执行；需要验证时先记录为计划、检查项或后续执行步骤。",
     "5. 流程优先级 — 若下方启用了特定 Workflow Skills（工作流协议），必须优先且严格遵守该协议规则。",
     `6. 语言跟随 — 所有对用户可见的正文、总结、Plan 文档（.MAIN/plans/*.md）、任务标题、审批说明，必须优先使用**用户当前这条请求所用的语言**。如果当前请求语言不明确，则默认使用界面语言：${fallbackLanguageName}。文件名、固定协议标记（如 \`[PROPOSAL START]\`、\`# Proposed Plan\`）和代码标识符可以保留英文，但解释性正文必须跟随用户语言。`,
     "7. 目标先行 — 在进入规划或执行前，先判断用户本轮真正想要的是：只要解释、只要方案、先方案后执行、还是直接执行。优先对齐终极目标，而不是机械重复用户字面步骤。",
@@ -88,7 +166,7 @@ export function buildSystemPrompt(
     "- `<analysis>`、`<thought>`、`<thinking>`、`<reasoning>` 标签内的内容会被 **隐藏** 在折叠的思考块中，用户默认看不到。",
     "- 因此：你的分析、总结、结论、方案等所有需要用户看到的内容，**必须以普通 Markdown 文本的形式输出，绝不能放在任何 XML 标签内部**。",
     "- `<analysis>` 仅用于调用工具前的 1-2 句极简内心备注（如「我需要先检查 Scripts 目录」），**禁止将任何分析正文、方案内容或最终结论写在 `<analysis>` 内**。",
-    "- 在执行文件读取、搜索、修改、构建、测试等操作前，必须先用普通 Markdown 输出一句面向用户的说明，说明你接下来要做什么、为什么做；这句说明不能放进任何 XML 标签。",
+    "- 调用 native tools 时可以直接发出工具调用；界面会展示执行状态。只有在真正需要向用户说明判断、结果或阻塞时，才输出普通 Markdown。",
     "",
     "## 用户提问交互规则",
     "当你需要用户做选择、确认方向、补充信息或决定下一步时，不要只抛出开放式问题让用户自己打字。",
@@ -266,13 +344,18 @@ export function buildSystemPrompt(
     chatInstructions.push("不要先输出“下一步行动计划”“请稍候，我将开始分析”之类的过渡台词后停住。");
     chatInstructions.push("避免输出“我将再次执行”“请稍候确认是否同意降级”这类过程化台词；直接执行，最后统一汇报结果或剩余阻塞。");
     chatInstructions.push("一旦你判断需要读取本地文件才能回答，就在同一轮直接调用只读工具，不要先发一段“我将开始分析/读取”的文字后停住。");
-    chatInstructions.push("可用只读工具：" + (customToolNames || []).concat(mcpToolNames || []).concat(["get_project_skeleton, get_file_outline, list_directory, read_file, read_document, analyze_tabular_document, query_tabular_document, index_workspace_documents, glob_search, grep_search, read_pty_buffer, read_pty_tail, read_pty_since, get_pty_status"]).join(", "));
+    chatInstructions.push("可用只读工具：" + formatToolNameList(
+      customToolNames,
+      mcpToolNames,
+      READ_ONLY_BUILT_IN_TOOL_NAMES,
+      availableToolNames,
+    ));
     chatInstructions.push("不要调用 replace_in_file、write_file、execute_command 等写入或执行工具。");
     parts.push(chatInstructions.join("\n"));
   } else {
     const tfl: string[] = [];
     tfl.push("## 工具调用格式");
-    tfl.push("使用 XML 格式调用工具：");
+    tfl.push("优先使用 native tool calling；如果当前模型只支持文本工具协议，则使用 XML 格式调用工具：");
     tfl.push("");
     tfl.push("如果需要在调用工具前做一个简短的内心备注（1-2 句话），可以用 `<analysis>` 包裹：");
     tfl.push("<analysis>我需要先检查 Scripts 目录的结构</analysis>");
@@ -284,26 +367,34 @@ export function buildSystemPrompt(
     tfl.push("");
     tfl.push("⚠️ `<analysis>` 中的内容用户看不到！你的分析、总结、方案必须以普通 Markdown 文本输出，不能放在 `<analysis>` 内。");
     tfl.push("");
-    tfl.push("可用的工具：" + (customToolNames || []).concat(mcpToolNames || []).concat(["get_project_skeleton, get_file_outline, list_directory, read_file, read_document, analyze_tabular_document, query_tabular_document, index_workspace_documents, glob_search, grep_search, replace_in_file, write_file, run_command, execute_command, send_pty_input, read_pty_buffer, read_pty_tail, read_pty_since, get_pty_status, clear_pty_buffer"]).join(", "));
+    tfl.push("可用的工具：" + formatToolNameList(
+      customToolNames,
+      mcpToolNames,
+      WORKFLOW_BUILT_IN_TOOL_NAMES,
+      availableToolNames,
+    ));
     tfl.push("当用户要求实现、修复、生成文件或修改项目时，写入工具可用：必须直接用 XML 调用 `write_file` 或 `replace_in_file`，不要声称当前环境没有写入能力。所有文件访问都以当前工作区为根目录。目录检查优先用 `get_project_skeleton`、`list_directory`、`glob_search`。");
     tfl.push("实现/生成类任务禁止在聊天区输出完整项目代码或大段 Markdown 代码清单；必须把代码通过 `write_file` / `replace_in_file` 落到真实文件。多文件任务每轮优先只写/改 1-3 个文件，先建立最小可运行骨架，再逐步补齐。");
     tfl.push("");
     tfl.push("### 工具说明：");
-    tfl.push("- get_project_skeleton: (depth?: number) 极速获取项目宏观骨架。Unity 感知：自动识别 .asmdef 模块边界、折叠大目录、弹性穿透无关键文件的层级。始终作为第一步使用。");
-    tfl.push("- get_file_outline: (path: string) 提取 C# 文件的类型定义和 public/protected 成员签名，剔除函数体。用于理解类的接口和耦合关系，无需读取完整源码。");
-    tfl.push("- list_directory: 列出特定目录内容。在你通过 skeleton 锁定目标后使用。");
-    tfl.push("- read_file: 读取源码、Markdown、JSON、纯文本等可直接按文本处理的文件。");
-    tfl.push("- read_document: 读取 PDF、DOCX、XLSX、CSV、TSV 等文档内容，返回提取文本和来源元数据（页码、sheet、单元格范围等）；对表格文件可结合 `row_offset` / `max_rows` 做分段读取。");
-    tfl.push("- analyze_tabular_document: 对 CSV、TSV、XLSX 等大表格做全表统计分析，返回总行数、列概况、缺失值、数值统计和样本行。处理大型表格时优先用它，而不是盲目把整张表塞进上下文。");
-    tfl.push("- query_tabular_document: 对 CSV、TSV、XLSX 做结构化查询，支持筛选、选列、排序、分页、分组聚合。要回答计数、汇总、Top N、条件过滤等问题时优先用它。");
-    tfl.push("- index_workspace_documents: 扫描某个目录中的文档文件并生成索引摘要。适合先了解资料库，再决定进一步读取哪些文件。");
-    tfl.push("- run_command: 同步执行一次性 shell 命令并等待完成，返回 stdout、stderr、exitCode、timedOut、durationMs。运行测试、构建、Python 脚本时优先使用它，并基于返回结果总结成功/失败。");
-    tfl.push("- execute_command: 向集成 PTY 发送命令，适合开发服务器、watch 模式、交互式程序或需要保留终端上下文的命令。它返回本次发送后的新增输出和 offset；后续用 read_pty_since/read_pty_tail/get_pty_status 继续检查。");
-    tfl.push("- send_pty_input: 向当前 PTY 前台进程发送原始输入，适合回答交互提示、发送 y/n 或 Ctrl+C（input 使用 \\u0003）。");
-    tfl.push("- read_pty_tail: 读取终端最近日志，适合快速查看错误栈或长任务尾部输出。");
-    tfl.push("- read_pty_since: 按 offset 读取新增终端输出，适合检查某次命令之后发生了什么。");
-    tfl.push("- get_pty_status: 检查 PTY 是否运行、当前 buffer offset、最近输出。");
-    tfl.push("- clear_pty_buffer: 清空 AI 侧 PTY 捕获缓冲，适合在启动长日志任务前建立干净读取起点。");
+    const addToolDescription = (name: string, description: string) => {
+      if (isToolNameAvailable(name, availableToolNames)) tfl.push(description);
+    };
+    addToolDescription("get_project_skeleton", "- get_project_skeleton: (depth?: number) 极速获取项目宏观骨架。Unity 感知：自动识别 .asmdef 模块边界、折叠大目录、弹性穿透无关键文件的层级。始终作为第一步使用。");
+    addToolDescription("get_file_outline", "- get_file_outline: (path: string) 提取 C# 文件的类型定义和 public/protected 成员签名，剔除函数体。用于理解类的接口和耦合关系，无需读取完整源码。");
+    addToolDescription("list_directory", "- list_directory: 列出特定目录内容。在你通过 skeleton 锁定目标后使用。");
+    addToolDescription("read_file", "- read_file: 读取源码、Markdown、JSON、纯文本等可直接按文本处理的文件。");
+    addToolDescription("read_document", "- read_document: 读取 PDF、DOCX、XLSX、CSV、TSV 等文档内容，返回提取文本和来源元数据（页码、sheet、单元格范围等）；对表格文件可结合 `row_offset` / `max_rows` 做分段读取。");
+    addToolDescription("analyze_tabular_document", "- analyze_tabular_document: 对 CSV、TSV、XLSX 等大表格做全表统计分析，返回总行数、列概况、缺失值、数值统计和样本行。处理大型表格时优先用它，而不是盲目把整张表塞进上下文。");
+    addToolDescription("query_tabular_document", "- query_tabular_document: 对 CSV、TSV、XLSX 做结构化查询，支持筛选、选列、排序、分页、分组聚合。要回答计数、汇总、Top N、条件过滤等问题时优先用它。");
+    addToolDescription("index_workspace_documents", "- index_workspace_documents: 扫描某个目录中的文档文件并生成索引摘要。适合先了解资料库，再决定进一步读取哪些文件。");
+    addToolDescription("run_command", "- run_command: 同步执行一次性 shell 命令并等待完成，返回 stdout、stderr、exitCode、timedOut、durationMs。运行测试、构建、Python 脚本时优先使用它，并基于返回结果总结成功/失败。");
+    addToolDescription("execute_command", "- execute_command: 向集成 PTY 发送命令，适合开发服务器、watch 模式、交互式程序或需要保留终端上下文的命令。它返回本次发送后的新增输出和 offset；后续用 read_pty_since/read_pty_tail/get_pty_status 继续检查。");
+    addToolDescription("send_pty_input", "- send_pty_input: 向当前 PTY 前台进程发送原始输入，适合回答交互提示、输入 y/n、发送 Ctrl+C（input 使用 \\u0003）。");
+    addToolDescription("read_pty_tail", "- read_pty_tail: 读取终端最近日志，适合快速查看错误栈或长任务尾部输出。");
+    addToolDescription("read_pty_since", "- read_pty_since: 按 offset 读取新增终端输出，适合检查某次命令之后发生了什么。");
+    addToolDescription("get_pty_status", "- get_pty_status: 检查 PTY 是否运行、当前 buffer offset、最近输出。");
+    addToolDescription("clear_pty_buffer", "- clear_pty_buffer: 清空 AI 侧 PTY 捕获缓冲，适合在启动长日志任务前建立干净读取起点。");
     tfl.push("");
     tfl.push("### 意图分类与执行边界");
     tfl.push("收到任务后，先判断它是 Atomic（小范围直接落地）还是 Architectural（多阶段、多模块、需要收敛分叉）。");
@@ -338,7 +429,7 @@ export function buildSystemPrompt(
     tfl.push("### 🚫 强制响应格式");
     tfl.push("1. 所有用户需要看到的分析、方案、结论，都必须写在普通 Markdown 中。");
     tfl.push("2. `<analysis>` 仅用于极简内心备注；不要把真正的方案正文藏进去。");
-    tfl.push("3. 调用工具前，先用普通 Markdown 写一句用户可见的操作说明，例如“我先检查设置面板和压缩逻辑的实现位置。”");
+    tfl.push("3. native tool calling 可以直接发出工具调用；如果需要解释判断、结果或阻塞，再用普通 Markdown 面向用户说明。");
     tfl.push("4. 工具调用只能通过正式工具格式表达；不要在普通正文中泄露裸工具名、JSON 参数或命令调用痕迹。");
     tfl.push("5. 如果本轮只是解释、总结、继续讨论或提出选择，不要伪装成正式 Proposal。");
     tfl.push("");

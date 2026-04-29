@@ -1,0 +1,599 @@
+import type { MCPServer, MCPTool } from "./mcpClient";
+import type { ResolvedUserIntent } from "./runIntent";
+import type { ToolDefinition } from "./toolSchemas";
+
+export type PromptLanguageStrategy = "english_core_localized_output";
+
+export type ToolRiskLevel =
+  | "read_only"
+  | "workspace_write"
+  | "shell"
+  | "external_read"
+  | "external_write"
+  | "browser_control"
+  | "destructive";
+
+export interface ToolPermissionPolicy {
+  autoExecuteRiskLevels: ToolRiskLevel[];
+  approvalRequiredRiskLevels: ToolRiskLevel[];
+  disabledRiskLevels: ToolRiskLevel[];
+}
+
+export type ToolSourceKind = "built_in" | "skill" | "mcp";
+
+export interface ToolCapability {
+  key: string;
+  name: string;
+  source: ToolSourceKind;
+  category: string;
+  risk: ToolRiskLevel;
+  enabled: boolean;
+  autoExecutable: boolean;
+  description?: string;
+  serverName?: string;
+  serverUrl?: string;
+}
+
+export interface ToolCapabilityRegistry {
+  tools: Record<string, ToolCapability>;
+  policy: ToolPermissionPolicy;
+}
+
+export interface McpRoutingConfig {
+  enabled: boolean;
+  threshold: number;
+  routerModel: string;
+  timeoutMs: number;
+  fallbackToFullList: boolean;
+  disabledToolKeys: string[];
+}
+
+export interface McpRoutingTelemetry {
+  routingRan: boolean;
+  selectedServerCount: number;
+  selectedToolCount: number;
+  totalToolCount: number;
+  pickSource: "disabled" | "full_list" | "heuristic" | "fallback_full_list" | "safe_empty";
+  fallbackReason?: string;
+  latencyMs: number;
+  estimatedTokenCost?: number;
+}
+
+type SkillLike = {
+  name: string;
+  desc?: string;
+  type?: string;
+  active?: boolean;
+};
+
+const READ_ONLY_BUILT_INS = new Set([
+  "list_directory",
+  "read_file",
+  "read_document",
+  "analyze_tabular_document",
+  "query_tabular_document",
+  "index_workspace_documents",
+  "glob_search",
+  "grep_search",
+  "read_pty_buffer",
+  "read_pty_tail",
+  "read_pty_since",
+  "get_pty_status",
+  "clear_pty_buffer",
+  "get_project_skeleton",
+  "get_file_outline",
+]);
+
+const WORKSPACE_WRITE_BUILT_INS = new Set(["replace_in_file", "write_file"]);
+const SHELL_BUILT_INS = new Set(["run_command", "execute_command", "send_pty_input"]);
+const DESTRUCTIVE_BUILT_INS = new Set(["delete_workspace_path"]);
+
+const READ_VERBS = [
+  "read",
+  "get",
+  "list",
+  "search",
+  "find",
+  "fetch",
+  "query",
+  "select",
+  "inspect",
+  "analyze",
+  "summarize",
+  "lookup",
+  "retrieve",
+  "status",
+  "diagnostics",
+  "symbols",
+  "references",
+];
+
+const WRITE_VERBS = [
+  "write",
+  "create",
+  "update",
+  "patch",
+  "replace",
+  "insert",
+  "post",
+  "comment",
+  "send",
+  "publish",
+  "close",
+  "merge",
+  "approve",
+  "assign",
+  "label",
+  "edit",
+  "set",
+  "run",
+  "execute",
+  "call",
+];
+
+const DESTRUCTIVE_TERMS = [
+  "delete",
+  "remove",
+  "drop",
+  "truncate",
+  "reset",
+  "destroy",
+  "erase",
+  "purge",
+  "kill",
+  "terminate",
+  "format",
+  "rm ",
+];
+
+const BROWSER_TERMS = [
+  "browser",
+  "devtools",
+  "playwright",
+  "puppeteer",
+  "chromium",
+  "chrome",
+  "page",
+  "dom",
+  "screenshot",
+  "click",
+  "type",
+  "fill",
+  "navigate",
+  "press",
+  "hover",
+  "viewport",
+  "localhost",
+];
+
+const WEB_RESEARCH_TERMS = [
+  "web",
+  "search",
+  "research",
+  "exa",
+  "tavily",
+  "searx",
+  "serp",
+  "crawl",
+  "fetch",
+  "url",
+  "http",
+];
+
+const GITHUB_TERMS = ["github", "git hub", "issue", "pull request", " pr ", "repo", "repository"];
+const DATABASE_TERMS = ["sql", "sqlite", "postgres", "postgresql", "mysql", "database", "db", "table"];
+
+export function createDefaultToolPermissionPolicy(): ToolPermissionPolicy {
+  return {
+    autoExecuteRiskLevels: ["read_only", "external_read"],
+    approvalRequiredRiskLevels: [
+      "workspace_write",
+      "shell",
+      "external_write",
+      "browser_control",
+      "destructive",
+    ],
+    disabledRiskLevels: [],
+  };
+}
+
+export function normalizeToolPermissionPolicy(policy?: Partial<ToolPermissionPolicy> | null): ToolPermissionPolicy {
+  const defaults = createDefaultToolPermissionPolicy();
+  const valid = new Set<ToolRiskLevel>([
+    "read_only",
+    "workspace_write",
+    "shell",
+    "external_read",
+    "external_write",
+    "browser_control",
+    "destructive",
+  ]);
+  const normalizeRiskList = (value: unknown, fallback: ToolRiskLevel[]) =>
+    Array.isArray(value)
+      ? value.filter((item): item is ToolRiskLevel => valid.has(item as ToolRiskLevel))
+      : fallback;
+
+  return {
+    autoExecuteRiskLevels: normalizeRiskList(policy?.autoExecuteRiskLevels, defaults.autoExecuteRiskLevels),
+    approvalRequiredRiskLevels: normalizeRiskList(
+      policy?.approvalRequiredRiskLevels,
+      defaults.approvalRequiredRiskLevels,
+    ),
+    disabledRiskLevels: normalizeRiskList(policy?.disabledRiskLevels, defaults.disabledRiskLevels),
+  };
+}
+
+export function createDefaultMcpRoutingConfig(): McpRoutingConfig {
+  return {
+    enabled: true,
+    threshold: 24,
+    routerModel: "",
+    timeoutMs: 800,
+    fallbackToFullList: true,
+    disabledToolKeys: [],
+  };
+}
+
+export function normalizeMcpRoutingConfig(config?: Partial<McpRoutingConfig> | null): McpRoutingConfig {
+  const defaults = createDefaultMcpRoutingConfig();
+  const threshold = Number(config?.threshold);
+  const timeoutMs = Number(config?.timeoutMs);
+  return {
+    enabled: typeof config?.enabled === "boolean" ? config.enabled : defaults.enabled,
+    threshold: Number.isFinite(threshold) && threshold > 0 ? Math.floor(threshold) : defaults.threshold,
+    routerModel: typeof config?.routerModel === "string" ? config.routerModel : defaults.routerModel,
+    timeoutMs: Number.isFinite(timeoutMs) && timeoutMs > 0 ? Math.floor(timeoutMs) : defaults.timeoutMs,
+    fallbackToFullList:
+      typeof config?.fallbackToFullList === "boolean"
+        ? config.fallbackToFullList
+        : defaults.fallbackToFullList,
+    disabledToolKeys: Array.isArray(config?.disabledToolKeys)
+      ? config.disabledToolKeys.filter((key): key is string => typeof key === "string" && key.trim().length > 0)
+      : defaults.disabledToolKeys,
+  };
+}
+
+function normalizeText(value: string | undefined): string {
+  return (value || "").toLowerCase().replace(/[_/-]+/g, " ");
+}
+
+function containsAny(text: string, terms: string[]): boolean {
+  return terms.some((term) => text.includes(term));
+}
+
+function containsWriteIntent(text: string): boolean {
+  return containsAny(text, WRITE_VERBS) || containsAny(text, DESTRUCTIVE_TERMS);
+}
+
+function containsReadIntent(text: string): boolean {
+  return containsAny(text, READ_VERBS);
+}
+
+function isSqlReadOnly(args: Record<string, unknown>): boolean | null {
+  const sqlValue = args.sql ?? args.query ?? args.statement ?? args.input;
+  if (typeof sqlValue !== "string") return null;
+  const normalized = sqlValue.trim().toLowerCase().replace(/^\s*--.*$/gm, "").trim();
+  if (!normalized) return null;
+  if (/^(select|with|explain|describe|show|pragma)\b/.test(normalized)) return true;
+  if (/\b(insert|update|delete|drop|alter|truncate|create|replace|vacuum|grant|revoke)\b/.test(normalized)) {
+    return false;
+  }
+  return null;
+}
+
+export function classifyBuiltInTool(name: string): ToolRiskLevel {
+  if (READ_ONLY_BUILT_INS.has(name)) return "read_only";
+  if (WORKSPACE_WRITE_BUILT_INS.has(name)) return "workspace_write";
+  if (SHELL_BUILT_INS.has(name)) return "shell";
+  if (DESTRUCTIVE_BUILT_INS.has(name)) return "destructive";
+  return "external_write";
+}
+
+export function classifySkillTool(skillOrTool: SkillLike | ToolDefinition): ToolRiskLevel {
+  const name = "function" in skillOrTool ? skillOrTool.function.name : skillOrTool.name;
+  const description = "function" in skillOrTool ? skillOrTool.function.description : skillOrTool.desc;
+  const text = normalizeText(`${name} ${description || ""}`);
+
+  if (containsAny(text, DESTRUCTIVE_TERMS)) return "destructive";
+  if (containsAny(text, BROWSER_TERMS)) return "browser_control";
+  if (containsWriteIntent(text)) return "external_write";
+  if (containsReadIntent(text)) return "external_read";
+  return "external_write";
+}
+
+export function classifyMcpTool(tool: MCPTool, server?: MCPServer): ToolRiskLevel {
+  const text = normalizeText(`${server?.name || ""} ${server?.url || ""} ${tool.name} ${tool.description || ""}`);
+
+  if (containsAny(text, DESTRUCTIVE_TERMS)) return "destructive";
+
+  if (containsAny(text, DATABASE_TERMS)) {
+    if (containsAny(text, ["drop", "truncate", "delete", "alter"])) return "destructive";
+    if (containsAny(text, ["select", "read", "list", "schema", "explain", "describe"])) return "external_read";
+    return "external_write";
+  }
+
+  if (containsAny(text, BROWSER_TERMS)) return "browser_control";
+
+  if (containsAny(text, GITHUB_TERMS)) {
+    if (containsWriteIntent(text) && !/(\bget\b|\blist\b|\bsearch\b|\bread\b)/.test(text)) {
+      return "external_write";
+    }
+    if (containsAny(text, ["comment", "create", "update", "close", "merge", "label", "assign"])) {
+      return "external_write";
+    }
+    return "external_read";
+  }
+
+  if (containsAny(text, WEB_RESEARCH_TERMS)) {
+    if (containsWriteIntent(text) && !containsReadIntent(text)) return "external_write";
+    return "external_read";
+  }
+
+  if (containsWriteIntent(text)) return "external_write";
+  if (containsReadIntent(text)) return "external_read";
+  return "external_write";
+}
+
+export function classifyMcpToolName(name: string): ToolRiskLevel {
+  return classifyMcpTool({ name, description: "", inputSchema: null });
+}
+
+function buildServerLookup(servers: MCPServer[]): Record<string, MCPServer> {
+  const lookup: Record<string, MCPServer> = {};
+  for (const server of servers) {
+    lookup[server.url] = server;
+  }
+  return lookup;
+}
+
+export function isRiskAutoExecutable(risk: ToolRiskLevel, policy?: ToolPermissionPolicy): boolean {
+  const normalized = normalizeToolPermissionPolicy(policy);
+  return normalized.autoExecuteRiskLevels.includes(risk) && !normalized.disabledRiskLevels.includes(risk);
+}
+
+export function buildToolCapabilityRegistry(params: {
+  toolDefinitions: ToolDefinition[];
+  skills?: SkillLike[];
+  mcpTools?: MCPTool[];
+  mcpServers?: MCPServer[];
+  mcpToolServerMap?: Record<string, string>;
+  policy?: ToolPermissionPolicy;
+}): ToolCapabilityRegistry {
+  const policy = normalizeToolPermissionPolicy(params.policy);
+  const tools: Record<string, ToolCapability> = {};
+  const skillToolNames = new Set(
+    (params.skills ?? [])
+      .filter((skill) => skill.active !== false && skill.type === "tool")
+      .map((skill) =>
+        skill.name
+          .toLowerCase()
+          .replace(/[^a-z0-9_]+/g, "_")
+          .replace(/^_+|_+$/g, "")
+          .replace(/_+/g, "_"),
+      )
+      .filter(Boolean),
+  );
+  const mcpToolByName = new Map((params.mcpTools ?? []).map((tool) => [tool.name, tool]));
+  const serverByUrl = buildServerLookup(params.mcpServers ?? []);
+
+  for (const definition of params.toolDefinitions) {
+    const name = definition.function.name;
+    const serverUrl = params.mcpToolServerMap?.[name];
+    const mcpTool = mcpToolByName.get(name);
+    const server = serverUrl ? serverByUrl[serverUrl] : undefined;
+    const source: ToolSourceKind = mcpTool ? "mcp" : skillToolNames.has(name) ? "skill" : "built_in";
+    const risk =
+      source === "mcp" && mcpTool
+        ? classifyMcpTool(mcpTool, server)
+        : source === "skill"
+        ? classifySkillTool(definition)
+        : classifyBuiltInTool(name);
+
+    tools[name] = {
+      key: source === "mcp" && server?.name ? `${server.name}:${name}` : name,
+      name,
+      source,
+      category: deriveToolCategory(name, definition.function.description, risk, source),
+      risk,
+      enabled: !policy.disabledRiskLevels.includes(risk),
+      autoExecutable: isRiskAutoExecutable(risk, policy),
+      description: definition.function.description,
+      serverName: server?.name,
+      serverUrl,
+    };
+  }
+
+  return { tools, policy };
+}
+
+function deriveToolCategory(
+  name: string,
+  description: string | undefined,
+  risk: ToolRiskLevel,
+  source: ToolSourceKind,
+): string {
+  const text = normalizeText(`${name} ${description || ""}`);
+  if (source === "mcp" && containsAny(text, BROWSER_TERMS)) return "browser";
+  if (source === "mcp" && containsAny(text, GITHUB_TERMS)) return "github";
+  if (source === "mcp" && containsAny(text, DATABASE_TERMS)) return "database";
+  if (source === "mcp" && containsAny(text, WEB_RESEARCH_TERMS)) return "research";
+  if (risk === "shell") return "shell";
+  if (risk === "workspace_write") return "workspace";
+  if (risk === "read_only") return "workspace_read";
+  return source;
+}
+
+export function getToolRiskLevelForCall(
+  name: string,
+  args: Record<string, unknown>,
+  registry?: ToolCapabilityRegistry,
+): ToolRiskLevel {
+  const capability = registry?.tools[name];
+  if (capability?.category === "database" || containsAny(normalizeText(name), DATABASE_TERMS)) {
+    const readOnlySql = isSqlReadOnly(args);
+    if (readOnlySql === true) return "external_read";
+    if (readOnlySql === false) {
+      const sqlValue = String(args.sql ?? args.query ?? args.statement ?? args.input ?? "").toLowerCase();
+      return /\b(drop|truncate|delete|alter)\b/.test(sqlValue) ? "destructive" : "external_write";
+    }
+  }
+  if (capability) return capability.risk;
+  return classifyBuiltInTool(name);
+}
+
+export function isToolAutoExecutableForCall(
+  name: string,
+  args: Record<string, unknown>,
+  registry?: ToolCapabilityRegistry,
+  policy?: ToolPermissionPolicy,
+): boolean {
+  const effectivePolicy = normalizeToolPermissionPolicy(policy ?? registry?.policy);
+  const risk = getToolRiskLevelForCall(name, args, registry);
+  return effectivePolicy.autoExecuteRiskLevels.includes(risk) && !effectivePolicy.disabledRiskLevels.includes(risk);
+}
+
+export function filterToolDefinitionsForIntent(
+  tools: ToolDefinition[],
+  intent: ResolvedUserIntent,
+  registry: ToolCapabilityRegistry,
+): ToolDefinition[] {
+  return tools.filter((tool) => {
+    const name = tool.function.name;
+    const capability = registry.tools[name];
+    if (capability && !capability.enabled) return false;
+    const risk = capability?.risk ?? classifyBuiltInTool(name);
+
+    if (intent === "execute" || intent === "studio_workflow") {
+      return !registry.policy.disabledRiskLevels.includes(risk);
+    }
+
+    if (intent === "plan") {
+      if (risk === "read_only" || risk === "external_read") return true;
+      return name === "write_file" || name === "replace_in_file";
+    }
+
+    return risk === "read_only" || risk === "external_read";
+  });
+}
+
+function extractQueryTerms(userPrompt: string): string[] {
+  const normalized = normalizeText(userPrompt);
+  const latinTerms = normalized.match(/[a-z0-9]{3,}/g) ?? [];
+  const cjkTerms = [
+    "浏览器",
+    "截图",
+    "点击",
+    "页面",
+    "前端",
+    "搜索",
+    "最新",
+    "资料",
+    "研究",
+    "竞品",
+    "github",
+    "issue",
+    "pr",
+    "数据库",
+    "表",
+    "sql",
+    "诊断",
+    "符号",
+    "引用",
+  ].filter((term) => userPrompt.toLowerCase().includes(term));
+  return Array.from(new Set([...latinTerms, ...cjkTerms])).slice(0, 48);
+}
+
+function scoreMcpToolForPrompt(tool: MCPTool, server: MCPServer | undefined, userPrompt: string): number {
+  const prompt = normalizeText(userPrompt);
+  const text = normalizeText(`${server?.name || ""} ${server?.url || ""} ${tool.name} ${tool.description || ""}`);
+  let score = 0;
+
+  for (const term of extractQueryTerms(userPrompt)) {
+    if (text.includes(term.toLowerCase())) score += 3;
+  }
+
+  if (containsAny(prompt, ["browser", "localhost", "screenshot", "dom", "click", "网页", "页面", "截图", "点击", "前端"]) && containsAny(text, BROWSER_TERMS)) {
+    score += 14;
+  }
+  if (containsAny(prompt, ["search", "latest", "research", "docs", "资料", "最新", "搜索", "研究", "竞品"]) && containsAny(text, WEB_RESEARCH_TERMS)) {
+    score += 12;
+  }
+  if (containsAny(prompt, ["github", "issue", "pull request", " pr ", "代码搜索"]) && containsAny(text, GITHUB_TERMS)) {
+    score += 12;
+  }
+  if (containsAny(prompt, ["database", "sqlite", "postgres", "mysql", "sql", "数据库"]) && containsAny(text, DATABASE_TERMS)) {
+    score += 10;
+  }
+  if (containsAny(prompt, ["diagnostic", "symbol", "reference", "rename", "诊断", "符号", "引用"]) && containsAny(text, ["lsp", "diagnostic", "symbol", "reference", "rename"])) {
+    score += 10;
+  }
+
+  if (score === 0 && classifyMcpTool(tool, server) === "external_read" && containsReadIntent(text)) {
+    score += 1;
+  }
+
+  return score;
+}
+
+export function routeMcpToolsForPrompt(params: {
+  tools: MCPTool[];
+  servers: MCPServer[];
+  toolServerMap: Record<string, string>;
+  userPrompt: string;
+  config?: McpRoutingConfig;
+}): { tools: MCPTool[]; telemetry: McpRoutingTelemetry } {
+  const startedAt = Date.now();
+  const config = normalizeMcpRoutingConfig(params.config);
+  const disabledKeys = new Set(config.disabledToolKeys);
+  const enabledTools = params.tools.filter((tool) => !disabledKeys.has(tool.name));
+  const baseTelemetry = {
+    selectedServerCount: 0,
+    selectedToolCount: enabledTools.length,
+    totalToolCount: params.tools.length,
+    latencyMs: 0,
+    estimatedTokenCost: 0,
+  };
+
+  const finish = (
+    selectedTools: MCPTool[],
+    pickSource: McpRoutingTelemetry["pickSource"],
+    fallbackReason?: string,
+  ) => {
+    const serverUrls = new Set(
+      selectedTools
+        .map((tool) => params.toolServerMap[tool.name])
+        .filter((url): url is string => typeof url === "string" && url.length > 0),
+    );
+    const latencyMs = Date.now() - startedAt;
+    return {
+      tools: selectedTools,
+      telemetry: {
+        ...baseTelemetry,
+        routingRan: pickSource === "heuristic",
+        selectedServerCount: serverUrls.size,
+        selectedToolCount: selectedTools.length,
+        pickSource,
+        fallbackReason,
+        latencyMs,
+        estimatedTokenCost: Math.ceil(JSON.stringify(selectedTools).length / 4),
+      },
+    };
+  };
+
+  if (!config.enabled) return finish(enabledTools, "disabled");
+  if (enabledTools.length <= config.threshold) return finish(enabledTools, "full_list");
+
+  const serverByUrl = buildServerLookup(params.servers);
+  const scored = enabledTools
+    .map((tool) => {
+      const server = serverByUrl[params.toolServerMap[tool.name]];
+      return { tool, score: scoreMcpToolForPrompt(tool, server, params.userPrompt) };
+    })
+    .filter((item) => item.score > 0)
+    .sort((a, b) => b.score - a.score || a.tool.name.localeCompare(b.tool.name));
+
+  const selectedTools = scored.slice(0, config.threshold).map((item) => item.tool);
+  if (selectedTools.length > 0) return finish(selectedTools, "heuristic");
+  if (config.fallbackToFullList) return finish(enabledTools, "fallback_full_list", "no_relevant_mcp_tools_matched");
+  return finish([], "safe_empty", "no_relevant_mcp_tools_matched");
+}
