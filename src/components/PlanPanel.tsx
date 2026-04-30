@@ -428,7 +428,7 @@ export default function PlanPanel({
 
           <div className="flex-1 overflow-y-auto px-5 py-4">
             {activeArtifact ? (
-              <div className="rounded-2xl border border-[#18181b] bg-[#09090b] p-5 shadow-[0_20px_40px_rgba(0,0,0,0.2)]">
+              <div className="rounded-2xl border border-[#18181b] bg-[#09090b] p-5">
                 <div className="mb-4 flex items-center justify-between gap-3 border-b border-[#18181b] pb-3">
                   <div>
                     <div className="text-[14px] font-semibold text-[#f5f5f5]">{activeArtifact.title}</div>
@@ -458,7 +458,7 @@ export default function PlanPanel({
         </>
       ) : previewMarkdown ? (
         <div className="flex-1 overflow-y-auto px-5 py-4">
-          <div className="rounded-2xl border border-[#18181b] bg-[#09090b] p-5 shadow-[0_20px_40px_rgba(0,0,0,0.2)]">
+          <div className="rounded-2xl border border-[#18181b] bg-[#09090b] p-5">
             <div className="mb-4 flex items-center justify-between gap-3 border-b border-[#18181b] pb-3">
               <div>
                 <div className="text-[14px] font-semibold text-[#f5f5f5]">{fallbackTitle || activeTurn?.title || copy.previewTitle}</div>
@@ -522,7 +522,7 @@ export default function PlanPanel({
                 <button
                   data-testid="plan-approve-button"
                   onClick={onApprove}
-                  className="rounded-lg px-4 py-2 text-[12px] font-semibold text-white shadow-[0_0_24px_rgba(124,58,237,0.28)]"
+                  className="rounded-lg px-4 py-2 text-[12px] font-semibold text-white"
                   style={{ background: "linear-gradient(135deg, #7c3aed, #2563eb)" }}
                 >
                   {copy.approvePlan}
@@ -561,7 +561,7 @@ export default function PlanPanel({
               </button>
               <button
                 onClick={onContinuePlanning}
-                className="rounded-lg px-4 py-2 text-[12px] font-semibold text-white shadow-[0_0_24px_rgba(124,58,237,0.28)]"
+                className="rounded-lg px-4 py-2 text-[12px] font-semibold text-white"
                 style={{ background: "linear-gradient(135deg, #7c3aed, #2563eb)" }}
               >
                 {copy.continuePlanning}
@@ -575,7 +575,7 @@ export default function PlanPanel({
               <button
                 data-testid="plan-resume-button"
                 onClick={onResumeExecution}
-                className="shrink-0 rounded-lg px-4 py-2 text-[12px] font-semibold text-white shadow-[0_0_24px_rgba(124,58,237,0.28)]"
+                className="shrink-0 rounded-lg px-4 py-2 text-[12px] font-semibold text-white"
                 style={{ background: "linear-gradient(135deg, #7c3aed, #2563eb)" }}
               >
                 {copy.resumeExecution}

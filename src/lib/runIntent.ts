@@ -369,6 +369,14 @@ const MAIN_INTENT_SHORTCUTS_ZH: MainIntentShortcutItem[] = [
     aliases: ["plan", "规划", "方案", "spec", "roadmap"],
   },
   {
+    intent: "execute",
+    command: "/执行",
+    label: "执行",
+    description: RUN_INTENT_POLICIES.execute.description.zh,
+    category: RUN_INTENT_POLICIES.execute.uiCategory,
+    aliases: ["execute", "implement", "实现", "处理", "修复"],
+  },
+  {
     intent: "report",
     command: "/报告",
     label: "报告",
@@ -392,14 +400,6 @@ const MAIN_INTENT_SHORTCUTS_ZH: MainIntentShortcutItem[] = [
     category: RUN_INTENT_POLICIES.summarize.uiCategory,
     aliases: ["summary", "summarize", "摘要", "概括", "归纳"],
   },
-  {
-    intent: "execute",
-    command: "/执行",
-    label: "执行",
-    description: RUN_INTENT_POLICIES.execute.description.zh,
-    category: RUN_INTENT_POLICIES.execute.uiCategory,
-    aliases: ["execute", "implement", "实现", "处理", "修复"],
-  },
 ];
 
 const MAIN_INTENT_SHORTCUTS_EN: MainIntentShortcutItem[] = [
@@ -410,6 +410,14 @@ const MAIN_INTENT_SHORTCUTS_EN: MainIntentShortcutItem[] = [
     description: RUN_INTENT_POLICIES.plan.description.en,
     category: RUN_INTENT_POLICIES.plan.uiCategory,
     aliases: ["计划", "规划", "方案", "spec", "roadmap"],
+  },
+  {
+    intent: "execute",
+    command: "/execute",
+    label: "Execute",
+    description: RUN_INTENT_POLICIES.execute.description.en,
+    category: RUN_INTENT_POLICIES.execute.uiCategory,
+    aliases: ["执行", "实现", "处理", "修复", "implement"],
   },
   {
     intent: "report",
@@ -434,14 +442,6 @@ const MAIN_INTENT_SHORTCUTS_EN: MainIntentShortcutItem[] = [
     description: RUN_INTENT_POLICIES.summarize.description.en,
     category: RUN_INTENT_POLICIES.summarize.uiCategory,
     aliases: ["总结", "摘要", "概括", "归纳", "summary"],
-  },
-  {
-    intent: "execute",
-    command: "/execute",
-    label: "Execute",
-    description: RUN_INTENT_POLICIES.execute.description.en,
-    category: RUN_INTENT_POLICIES.execute.uiCategory,
-    aliases: ["执行", "实现", "处理", "修复", "implement"],
   },
 ];
 

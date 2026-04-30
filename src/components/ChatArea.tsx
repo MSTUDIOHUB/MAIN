@@ -785,14 +785,10 @@ function AgentContentBlock({
   block,
   language,
   chatFontSize,
-  onQuickReply,
-  isStreaming,
 }: {
   block: any;
   language: "zh" | "en";
   chatFontSize: number;
-  onQuickReply?: (value: string | ReplyOption, turnId?: string) => void;
-  isStreaming: boolean;
 }) {
   const rawContent = String(block.content || "");
   const previewLimit = block.streaming ? STREAMING_AGENT_CONTENT_PREVIEW_CHARS : AGENT_CONTENT_PREVIEW_CHARS;
@@ -808,8 +804,7 @@ function AgentContentBlock({
   const hasVisibleContent =
     (block.streaming && streamingText.length > 0) ||
     segments.some((seg) => (seg.type === "text" ? sanitizeAIOutput(seg.content).length > 0 : true)) ||
-    isLongContent ||
-    (Array.isArray(block.options) && block.options.length > 0);
+    isLongContent;
   const archivedPreviewText = useMemo(() => segments
       .filter((seg) => seg.type === "text")
       .map((seg) => sanitizeAIOutput(seg.content))
@@ -939,21 +934,6 @@ function AgentContentBlock({
                 ? "Collapse to preview"
                 : "Expand full content"}
             </button>
-          </div>
-        )}
-        {Array.isArray(block.options) && block.options.length > 0 && (
-          <div className="mt-4 flex flex-wrap gap-2 border-t border-[#18181b] pt-4">
-            {block.options.map((option: { label: string; value: string }, optionIdx: number) => (
-              <button
-                key={`${block.id}-option-${optionIdx}`}
-                data-testid={`reply-option-${optionIdx}`}
-                onClick={() => onQuickReply?.(option, block.turnId)}
-                disabled={isStreaming}
-                className="rounded-full border border-[#27272a] bg-[#050507] px-3 py-1.5 text-[12px] text-[#e4e4e7] transition-colors hover:border-[var(--accent)] hover:text-white disabled:cursor-not-allowed disabled:opacity-60"
-              >
-                {option.label}
-              </button>
-            ))}
           </div>
         )}
         {block.streaming && <StreamingCursor />}
@@ -1503,8 +1483,6 @@ export default function ChatArea({
           block={block}
           language={language}
           chatFontSize={config.chatFontSize ?? 13}
-          onQuickReply={onQuickReply}
-          isStreaming={isStreaming}
         />
       );
     }

@@ -81,14 +81,14 @@ test("shouldPauseForReplyOptions pauses when the model asks the user to choose",
   assert.equal(shouldPause, true);
 });
 
-test("shouldPauseForReplyOptions pauses before tool execution and does not override plan approval", () => {
+test("shouldPauseForReplyOptions does not override plan approval or edit tool execution", () => {
   assert.equal(
     shouldPauseForReplyOptions({
       replyOptions: [{ label: "方案 A", value: "方案 A" }],
       toolCallCount: 1,
       workflowMode: "edit",
     }),
-    true,
+    false,
   );
 
   assert.equal(
@@ -132,6 +132,30 @@ test("extractReplyOptions infers enumerated markdown choices after a decision cu
   );
 });
 
+test("extractReplyOptions ignores plan summary bullets after proposal headings", () => {
+  const result = extractReplyOptions(`
+计划文档已创建完成。
+
+方案总结
+
+需求规格（requirements.md）
+
+- **技术栈**：单文件 HTML + CSS + JavaScript，Canvas 2D 渲染
+- **核心玩法**：方向键控制蛇移动，吃食物变长，撞墙/自身则游戏结束
+- **交互控制**：方向键移动，空格暂停，回车/按钮重新开始
+- **交付物**：\`snake.html\` 单文件
+
+设计方案（design.md）
+
+1. 架构：单文件包含HTML/CSS/JS，Canvas渲染
+2. 游戏循环：\`setInterval\` 每150ms更新
+3. 渲染：网格背景、绿色渐变蛇身、红色圆形食物
+4. 碰撞检测：墙壁边界 + 自身重叠 + 食物重合
+  `);
+
+  assert.equal(result.replyOptions.length, 0);
+});
+
 test("extractReplyOptions filters internal plan artifact creation pseudo choices", () => {
   const explicitPathResult = extractReplyOptions(`
 选择下一步：
@@ -156,6 +180,17 @@ test("extractReplyOptions filters internal plan artifact creation pseudo choices
   `);
 
   assert.equal(bareFileResult.replyOptions.length, 0);
+
+  const explicitSummaryResult = extractReplyOptions(`
+选择下一步：
+
+<user_options>
+<option>**技术栈**：单文件 HTML + CSS + JavaScript，Canvas 2D 渲染</option>
+<option>**核心玩法**：方向键控制蛇移动，吃食物变长</option>
+</user_options>
+  `);
+
+  assert.equal(explicitSummaryResult.replyOptions.length, 0);
 
   const inferredMarkdownResult = extractReplyOptions(`
 下一步可以：

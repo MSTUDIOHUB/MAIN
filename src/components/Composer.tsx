@@ -64,6 +64,28 @@ function estimateAgentMessagesTokens(messages: AgentMessage[]): number {
   return total;
 }
 
+function getSlashSession(value: string, cursorPos: number): { anchor: number; query: string } | null {
+  const beforeCursor = value.slice(0, cursorPos);
+  const slashIndex = beforeCursor.lastIndexOf("/");
+  if (slashIndex < 0) return null;
+
+  const charBefore = slashIndex > 0 ? beforeCursor[slashIndex - 1] : " ";
+  if (!/[\s\n]/.test(charBefore)) return null;
+
+  const query = beforeCursor.slice(slashIndex + 1);
+  if (/[\s\n]/.test(query)) return { anchor: slashIndex, query: "" };
+  return { anchor: slashIndex, query };
+}
+
+function removeSlashSessionToken(value: string, anchor: number): string {
+  if (anchor < 0 || anchor >= value.length || value[anchor] !== "/") return value;
+  const afterSlash = value.slice(anchor + 1);
+  const whitespaceIndex = afterSlash.search(/\s/);
+  const tokenEnd = whitespaceIndex < 0 ? value.length : anchor + 1 + whitespaceIndex;
+  const trailingWhitespaceLength = value.slice(tokenEnd).match(/^\s*/)?.[0]?.length ?? 0;
+  return value.slice(0, anchor) + value.slice(tokenEnd + trailingWhitespaceLength);
+}
+
 function ExecutionProgressCard({
   tasks,
   stage,
@@ -170,6 +192,7 @@ export default function Composer({
   const mentionDropRef = useRef<HTMLDivElement>(null);
   const slashMenuRef = useRef<HTMLDivElement>(null);
   const composerShellRef = useRef<HTMLDivElement>(null);
+  const slashAnchorRef = useRef(-1);
   const previousMainModeRef = useRef(selectedMainModeKey);
   const previousWorkspaceRef = useRef(currentWorkspace);
   const submitUnlockTimerRef = useRef<number | null>(null);
@@ -300,7 +323,7 @@ export default function Composer({
     used: Boolean(usedStudioOnboardingByWorkspace[currentWorkspaceOnboardingKey]),
     forceVisible: Boolean(forceVisibleStudioOnboardingByWorkspace[currentWorkspaceOnboardingKey]),
   });
-  const studioOnboardingShellClass = "border shadow-[0_18px_50px_rgba(0,0,0,0.14)]";
+  const studioOnboardingShellClass = "border";
   const studioOnboardingShellStyle = isLightTheme
     ? {
         borderColor: "var(--accent-subtle-border)",
@@ -371,8 +394,8 @@ export default function Composer({
     color: isLightTheme ? "var(--accent-hover)" : "var(--accent-light)",
   };
   const mainFocusMenuPanelClass = isLightTheme
-    ? "absolute bottom-full left-0 mb-2 w-72 overflow-hidden rounded-xl border bg-white shadow-[0_24px_64px_rgba(15,23,42,0.16)] z-[60]"
-    : "absolute bottom-full left-0 mb-2 w-72 overflow-hidden rounded-xl border bg-[#09090b] shadow-2xl z-[60]";
+    ? "absolute bottom-full left-0 mb-2 w-72 overflow-hidden rounded-xl border bg-white z-[60]"
+    : "absolute bottom-full left-0 mb-2 w-72 overflow-hidden rounded-xl border bg-[#09090b] z-[60]";
   const mainFocusMenuHeaderClass = isLightTheme
     ? "border-b border-[#e4e4e7] text-[#52525b]"
     : "border-b border-[#27272a] text-[#a1a1aa]";
@@ -400,11 +423,9 @@ export default function Composer({
   };
   const mainFocusSelectedStyle = {
     backgroundColor: "var(--accent-subtle)",
-    boxShadow: "inset 3px 0 0 var(--accent), inset 0 0 0 1px var(--accent-subtle-border)",
   };
   const mainFocusHoverStyle = {
     backgroundColor: "var(--accent-subtle)",
-    boxShadow: "inset 0 0 0 1px var(--accent-subtle-border)",
   };
   const studioOnboardingCards = [
     {
@@ -583,25 +604,36 @@ export default function Composer({
     return ranked;
   }, [isGameStudioMode, isMainMode, mainIntentShortcuts, slashCatalog, slashQuery]);
 
+  const mainIntentSlashGroups = useMemo(() => {
+    if (!isMainMode || filteredSlashItems.length === 0) return [];
+    const workflowItems = filteredSlashItems.filter((item) => getIntentPolicy(item.intent).uiCategory === "workflow_mode");
+    const outputItems = filteredSlashItems.filter((item) => getIntentPolicy(item.intent).uiCategory === "output_style");
+    const otherItems = filteredSlashItems.filter((item) => {
+      const category = getIntentPolicy(item.intent).uiCategory;
+      return category !== "workflow_mode" && category !== "output_style";
+    });
+    return [
+      workflowItems.length > 0 ? [language === "en" ? "Workflow Modes" : "流程模式", workflowItems] : null,
+      outputItems.length > 0 ? [language === "en" ? "Output Styles" : "输出方式", outputItems] : null,
+      otherItems.length > 0 ? [language === "en" ? "Other" : "其他", otherItems] : null,
+    ].filter(Boolean);
+  }, [filteredSlashItems, isMainMode, language]);
+
+  const visibleMainIntentSlashItems = useMemo(() => {
+    if (!isMainMode) return [];
+    return mainIntentSlashGroups.flatMap(([, items]) => items);
+  }, [isMainMode, mainIntentSlashGroups]);
+
+  const visibleSlashItems = isMainMode ? visibleMainIntentSlashItems : filteredSlashItems;
+
   const groupedSlashItems = useMemo(() => {
     const groups = [];
     if (isMainMode) {
-      if (filteredSlashItems.length > 0) {
-        const workflowItems = filteredSlashItems.filter((item) => getIntentPolicy(item.intent).uiCategory === "workflow_mode");
-        const outputItems = filteredSlashItems.filter((item) => getIntentPolicy(item.intent).uiCategory === "output_style");
-        const otherItems = filteredSlashItems.filter((item) => {
-          const category = getIntentPolicy(item.intent).uiCategory;
-          return category !== "workflow_mode" && category !== "output_style";
-        });
-        const mainGroups = [
-          workflowItems.length > 0 ? [language === "en" ? "Workflow Modes" : "流程模式", workflowItems] : null,
-          outputItems.length > 0 ? [language === "en" ? "Output Styles" : "输出方式", outputItems] : null,
-          otherItems.length > 0 ? [language === "en" ? "Other" : "其他", otherItems] : null,
-        ].filter(Boolean);
+      if (mainIntentSlashGroups.length > 0) {
         groups.push({
           kind: "main_intent",
           heading: language === "en" ? "MAIN Shortcuts" : "MAIN 快捷入口",
-          groups: mainGroups,
+          groups: mainIntentSlashGroups,
         });
       }
       return groups;
@@ -628,7 +660,7 @@ export default function Composer({
       });
     }
     return groups;
-  }, [filteredSlashItems, isMainMode, language, studioAgentHeading, studioWorkflowHeading]);
+  }, [filteredSlashItems, isMainMode, language, mainIntentSlashGroups, studioAgentHeading, studioWorkflowHeading]);
 
   // ── Close mention dropdown / slash menu on outside click ──
   useEffect(() => {
@@ -637,7 +669,7 @@ export default function Composer({
         closeMentionMenu();
       }
       if (slashMenuRef.current && !slashMenuRef.current.contains(e.target as Node)) {
-        setShowSlashMenu(false);
+        closeSlashMenu();
       }
     };
     document.addEventListener("mousedown", handleClick);
@@ -653,6 +685,7 @@ export default function Composer({
   const closeSlashMenu = useCallback(() => {
     setShowSlashMenu(false);
     setHighlightedSlashIndex(0);
+    slashAnchorRef.current = -1;
   }, []);
 
   useEffect(() => {
@@ -743,8 +776,11 @@ export default function Composer({
     if (!isGameStudioMode) return;
     markStudioOnboardingUsed();
     setShowSlashMenu(true);
-    const normalized = input.trim().startsWith("/") ? input.trim().slice(1) : "";
-    setSlashQuery(normalized);
+    const textarea = textareaRef.current;
+    const cursorPos = textarea?.selectionStart ?? input.length;
+    const slashSession = getSlashSession(input, cursorPos);
+    slashAnchorRef.current = slashSession?.anchor ?? -1;
+    setSlashQuery(slashSession?.query ?? "");
     textareaRef.current?.focus();
   };
 
@@ -841,9 +877,15 @@ export default function Composer({
   };
 
   const handleSelectMainIntentShortcut = (item) => {
-    closeSlashMenu();
     const parsed = parseMainIntentShortcut(input);
-    setInput(parsed ? parsed.rest.trimStart() : input.replace(/^\s*\/[^\s]*\s*/, ""));
+    const slashAnchor = slashAnchorRef.current;
+    const nextInput = slashAnchor >= 0
+      ? removeSlashSessionToken(input, slashAnchor)
+      : parsed
+      ? parsed.rest.trimStart()
+      : input.replace(/^\s*\/[^\s]*\s*/, "");
+    closeSlashMenu();
+    setInput(nextInput);
     setLockedComposerIntent(item.intent);
     requestAnimationFrame(() => textareaRef.current?.focus());
   };
@@ -921,12 +963,24 @@ export default function Composer({
   const resizeTextarea = useCallback(() => {
     const textarea = textareaRef.current;
     if (!textarea) return;
+    const minHeight = textarea.dataset.minComposerHeight
+      ? Number(textarea.dataset.minComposerHeight)
+      : textarea.getBoundingClientRect().height;
     textarea.style.height = "auto";
     const maxHeight = Math.round(window.innerHeight * 0.36);
-    const nextHeight = Math.min(textarea.scrollHeight, maxHeight);
+    const nextHeight = Math.min(Math.max(textarea.scrollHeight, minHeight), maxHeight);
     textarea.style.height = `${nextHeight}px`;
     textarea.style.overflowY = textarea.scrollHeight > maxHeight ? "auto" : "hidden";
   }, []);
+
+  const handleTextareaRef = useCallback((node: HTMLTextAreaElement | null) => {
+    textareaRef.current = node;
+    if (!node) return;
+    requestAnimationFrame(() => {
+      node.dataset.minComposerHeight = String(node.getBoundingClientRect().height);
+      resizeTextarea();
+    });
+  }, [resizeTextarea]);
 
   useEffect(() => {
     resizeTextarea();
@@ -938,10 +992,11 @@ export default function Composer({
 
     const cursorPos = e.target.selectionStart ?? value.length;
     const textBeforeCursor = value.slice(0, cursorPos);
-    const trimmedValue = value.trimStart();
+    const slashSession = getSlashSession(value, cursorPos);
 
-    if ((isGameStudioMode || isMainMode) && trimmedValue.startsWith("/")) {
-      setSlashQuery(trimmedValue.slice(1));
+    if ((isGameStudioMode || isMainMode) && slashSession) {
+      slashAnchorRef.current = slashSession.anchor;
+      setSlashQuery(slashSession.query);
       setShowSlashMenu(true);
     } else if (showSlashMenu) {
       closeSlashMenu();
@@ -1047,7 +1102,7 @@ export default function Composer({
     if (showSlashMenu) {
       if (e.key === "ArrowDown") {
         e.preventDefault();
-        setHighlightedSlashIndex((prev) => Math.min(prev + 1, filteredSlashItems.length - 1));
+        setHighlightedSlashIndex((prev) => Math.min(prev + 1, Math.max(0, visibleSlashItems.length - 1)));
         return;
       }
       if (e.key === "ArrowUp") {
@@ -1057,11 +1112,11 @@ export default function Composer({
       }
       if ((e.key === "Enter" && !e.altKey && !e.shiftKey) || e.key === "Tab") {
         e.preventDefault();
-        if (filteredSlashItems.length > 0 && highlightedSlashIndex < filteredSlashItems.length) {
+        if (visibleSlashItems.length > 0 && highlightedSlashIndex < visibleSlashItems.length) {
           if (isMainMode) {
-            handleSelectMainIntentShortcut(filteredSlashItems[highlightedSlashIndex]);
+            handleSelectMainIntentShortcut(visibleSlashItems[highlightedSlashIndex]);
           } else {
-            handleSelectSlashItem(filteredSlashItems[highlightedSlashIndex]);
+            handleSelectSlashItem(visibleSlashItems[highlightedSlashIndex]);
           }
         } else if (e.key === "Enter" && !e.altKey && input.trim().startsWith("/")) {
           handleSubmitComposerMessage();
@@ -1093,8 +1148,8 @@ export default function Composer({
     : isGameStudioMode
     ? (language === "en" ? "Ask the studio, or type / for workflows and specialists..." : "询问工作室中枢，或输入 / 打开工作流和专家面板...")
     : language === "en"
-    ? "Try: Summarize this folder, analyze these tables and write a report, extract the key conclusions, or plan first before execution..."
-    : "例如：总结这个文件夹里的内容、分析这些表格并生成报告、提炼这批资料的关键结论，或先给我一个计划再执行...";
+    ? "Describe what you need, or type / for plan, execute, analyze, summary, and report..."
+    : "输入需求，或输入 / 选择计划、执行、分析、总结、报告...";
 
   // region: Composer 高度同步
   useEffect(() => {
@@ -1274,7 +1329,7 @@ export default function Composer({
 
         {suggestedComposerIntent && suggestedComposerIntentLabel && !activeDiffTask && !isStreaming && (
           <div className="relative z-30 mb-2 flex justify-center px-3">
-            <div className="flex max-w-full items-center justify-between gap-3 rounded-full border border-[#27272a] bg-[#050507] px-3 py-2 text-[11px] text-[#d4d4d8] shadow-2xl">
+            <div className="flex max-w-full items-center justify-between gap-3 rounded-full border border-[#27272a] bg-[#050507] px-3 py-2 text-[11px] text-[#d4d4d8]">
               <span className="truncate">
                 {composerIntentSuggestionKind === "explicit_conflict" && explicitComposerIntentLabel
                   ? (
@@ -1368,7 +1423,7 @@ export default function Composer({
 
           <div className="relative">
             <textarea
-              ref={textareaRef}
+              ref={handleTextareaRef}
               data-testid="composer-textarea"
               className="max-h-[36vh] min-h-[3.5rem] w-full bg-transparent border-none outline-none resize-none overflow-hidden text-[#e4e4e7] p-4 text-[13px] leading-relaxed placeholder:text-[#a1a1aa]"
               rows={activeDiffTask ? 1 : 2}
@@ -1391,7 +1446,7 @@ export default function Composer({
             {showMentionMenu && (
               <div
                 ref={mentionDropRef}
-                className="absolute left-4 bottom-full mb-1 w-80 bg-[#09090b] border border-[#27272a] rounded-lg shadow-2xl overflow-hidden z-50 flex flex-col"
+                className="absolute left-4 bottom-full mb-1 w-80 bg-[#09090b] border border-[#27272a] rounded-lg overflow-hidden z-50 flex flex-col"
               >
                 {/* Search header */}
                 <div className="p-2 border-b border-[#27272a] flex items-center gap-2 text-[#e4e4e7] bg-[#000000]">
@@ -1445,45 +1500,79 @@ export default function Composer({
             {showSlashMenu && isMainMode && (
               <div
                 ref={slashMenuRef}
-                className="absolute left-4 bottom-full mb-1 w-[min(30rem,calc(100%-2rem))] max-w-[30rem] bg-[#09090b] border border-[#27272a] rounded-lg shadow-2xl overflow-hidden z-50 flex flex-col"
+                className={`absolute left-4 bottom-full mb-1 w-[min(34rem,calc(100%-2rem))] max-w-[34rem] rounded-lg border overflow-hidden z-50 flex flex-col ${
+                  isLightTheme
+                    ? "border-[#d4d4d8] bg-white text-[#111827]"
+                    : "border-[#27272a] bg-[#09090b] text-[#e4e4e7]"
+                }`}
               >
-                <div className="p-2 border-b border-[#27272a] flex items-center gap-2 text-[#e4e4e7] bg-[#000000]">
-                  <IconCode className="w-3.5 h-3.5" style={{ color: "var(--accent)" }} />
-                  <span className="text-[11px] text-[#a1a1aa] truncate">{mainIntentSearchLabel}</span>
-                  <span className="ml-auto text-[10px] text-[#52525b]">{language === "en" ? "MAIN Shortcut" : "MAIN 快捷入口"}</span>
+                <div className={`flex items-center gap-2 border-b p-2 ${
+                  isLightTheme ? "border-[#d4d4d8] bg-[#f8fafc]" : "border-[#27272a] bg-[#000000]"
+                }`}>
+                  <IconCode className="w-3.5 h-3.5" style={{ color: isLightTheme ? "var(--accent-hover)" : "var(--accent-light)" }} />
+                  <span className={`truncate text-[11px] ${isLightTheme ? "text-[#52525b]" : "text-[#a1a1aa]"}`}>{mainIntentSearchLabel}</span>
+                  <span
+                    className="ml-auto shrink-0 text-[10px] font-semibold"
+                    style={{ color: isLightTheme ? "var(--accent-hover)" : "var(--accent-light)" }}
+                  >
+                    {language === "en" ? "MAIN Shortcut" : "MAIN 快捷入口"}
+                  </span>
                 </div>
 
-                <div className="max-h-64 overflow-y-auto px-2 py-2">
+                <div className="overflow-visible px-2 py-2">
                   {filteredSlashItems.length === 0 ? (
-                    <div className="px-3 py-4 text-[11px] text-[#a1a1aa] text-center">{mainIntentEmptyLabel}</div>
+                    <div className={`px-3 py-4 text-center text-[11px] ${isLightTheme ? "text-[#71717a]" : "text-[#a1a1aa]"}`}>{mainIntentEmptyLabel}</div>
                   ) : (
                     (groupedSlashItems[0]?.groups || []).map(([groupName, items]) => (
                       <div key={groupName} className="py-1">
-                        <div className="px-3 pb-1 pt-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-[#52525b]">
+                        <div
+                          className="px-3 pb-1 pt-1 text-[10px] font-semibold uppercase tracking-[0.16em]"
+                          style={{ color: isLightTheme ? "var(--accent-hover)" : "var(--accent-light)" }}
+                        >
                           {groupName}
                         </div>
                         {items.map((item) => {
-                          const index = filteredSlashItems.findIndex((candidate) => candidate.intent === item.intent);
+                          const index = visibleMainIntentSlashItems.findIndex((candidate) => candidate.intent === item.intent);
                           const isActive = index === highlightedSlashIndex;
                           const categoryLabel = getRunIntentCategoryLabel(item.intent, language === "en" ? "en" : "zh");
                           return (
                             <button
                               key={item.intent}
+                              data-testid={`main-shortcut-item-${item.intent}`}
                               onClick={() => handleSelectMainIntentShortcut(item)}
-                              className={`w-full rounded-md px-3 py-2 text-left transition-colors ${
-                                isActive ? "bg-[#18181b]" : "hover:bg-[#131316]"
-                              }`}
+                              className="w-full rounded-md px-3 py-2 text-left transition-colors"
+                              style={{
+                                backgroundColor: isActive
+                                  ? "var(--accent-subtle)"
+                                  : "transparent",
+                              }}
+                              onMouseEnter={(event) => {
+                                if (!isActive) event.currentTarget.style.backgroundColor = "var(--accent-subtle)";
+                              }}
+                              onMouseLeave={(event) => {
+                                if (!isActive) event.currentTarget.style.backgroundColor = "transparent";
+                              }}
                             >
                               <div className="flex items-center justify-between gap-3">
                                 <div className="min-w-0">
-                                  <div className="text-[12px] font-semibold text-[#f4f4f5] truncate">
-                                    {item.command} · {item.label}
+                                  <div
+                                    className="truncate text-[12px] font-semibold"
+                                    style={{ color: isLightTheme ? "var(--accent-hover)" : "var(--accent-light)" }}
+                                  >
+                                    {item.command}
                                   </div>
-                                  <div className="mt-0.5 text-[11px] leading-snug text-[#71717a]">
+                                  <div className={`mt-0.5 text-[11px] leading-snug ${isLightTheme ? "text-[#52525b]" : "text-[#a1a1aa]"}`}>
                                     {item.description}
                                   </div>
                                 </div>
-                                <div className="shrink-0 rounded-full border border-[#27272a] bg-[#050507] px-2 py-0.5 text-[10px] text-[#a1a1aa]">
+                                <div
+                                  className="shrink-0 rounded-full border px-2 py-0.5 text-[10px] font-medium"
+                                  style={{
+                                    borderColor: "var(--accent-subtle-border)",
+                                    backgroundColor: "var(--accent-subtle)",
+                                    color: isLightTheme ? "var(--accent-hover)" : "var(--accent-light)",
+                                  }}
+                                >
                                   {categoryLabel}
                                 </div>
                               </div>
@@ -1495,11 +1584,13 @@ export default function Composer({
                   )}
                 </div>
 
-                <div className="px-3 py-1.5 border-t border-[#27272a] flex items-center gap-3 text-[10px] text-[#52525b]">
+                <div className={`flex items-center gap-3 border-t px-3 py-1.5 text-[10px] ${
+                  isLightTheme ? "border-[#d4d4d8] text-[#71717a]" : "border-[#27272a] text-[#52525b]"
+                }`}>
                   <span>{mentionHintUpDown}</span>
                   <span>{mentionHintEnter}</span>
                   <span>{mentionHintEsc}</span>
-                  <span className="ml-auto">{mainIntentHint}</span>
+                  <span className="ml-auto" style={{ color: isLightTheme ? "var(--accent-hover)" : "var(--accent-light)" }}>{mainIntentHint}</span>
                 </div>
               </div>
             )}
@@ -1507,7 +1598,7 @@ export default function Composer({
             {showSlashMenu && isGameStudioMode && (
               <div
                 ref={slashMenuRef}
-                className="absolute left-4 bottom-full mb-1 w-[min(36rem,calc(100%-2rem))] max-w-[36rem] bg-[#09090b] border border-[#27272a] rounded-lg shadow-2xl overflow-hidden z-50 flex flex-col"
+                className="absolute left-4 bottom-full mb-1 w-[min(36rem,calc(100%-2rem))] max-w-[36rem] bg-[#09090b] border border-[#27272a] rounded-lg overflow-hidden z-50 flex flex-col"
               >
                 <div className="p-2 border-b border-[#27272a] flex items-center gap-2 text-[#e4e4e7] bg-[#000000]">
                   <IconCode className="w-3.5 h-3.5 text-[#86efac]" />

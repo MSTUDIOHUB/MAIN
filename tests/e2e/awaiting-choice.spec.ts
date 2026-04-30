@@ -13,7 +13,7 @@ test("reply options pause the turn and continue within the same turn after selec
   await page.goto("/?e2eScenario=awaiting-choice");
 
   await expect(page.getByTestId("plan-stage-badge")).toContainText("待选择");
-  await expect(page.getByTestId("reply-option-0")).toBeVisible();
+  await expect(page.getByTestId("reply-option-0")).toHaveCount(0);
   await expect(page.getByTestId("top-island-awaiting-choice")).toBeVisible();
   await expect(page.getByTestId("top-island-reply-option-0")).toBeVisible();
 

@@ -3,7 +3,7 @@ import type { ReplyOption } from "./workflowModels";
 const USER_OPTIONS_BLOCK_RE = /<user_options>([\s\S]*?)<\/user_options>/gi;
 const OPTION_RE = /<option\b([^>]*)>([\s\S]*?)<\/option>/gi;
 const OPTION_ATTR_RE = /\b(label|value|text|title)\s*=\s*"([^"]*)"/gi;
-const DECISION_CUE_RE = /(?:请选择|请确认|请告诉我|请说明|你可以选择|可选方案|选项|方案|下一步可以|选一个|选一项|任选其一|从下面.*选|options?|choices?|would you like|do you want|please choose|please confirm|choose one|pick one|select one)/i;
+const DECISION_CUE_RE = /(?:请选择|请确认|请告诉我|请说明|你可以选择|可选方案|备选方案|选项|选择下一步|下一步可以|选一个|选一项|任选其一|从下面.*选|options?|choices?|would you like|do you want|please choose|please confirm|choose one|pick one|select one)/i;
 const ENUM_OPTION_RE = /^\s*(?:[-*]|(?:\d+|[A-Za-z])[\.\)、:：])\s+(.+?)\s*$/;
 const BINARY_SEPARATOR_RE = /\s*(?:，|,)?\s*(或者|还是|或是|\bor\b)\s*/i;
 const ENUMERATED_LINE_RE = /^\s*(?:[-*]|(?:\d+|[A-Za-z])[\.\)、:：])\s+/;
@@ -15,6 +15,8 @@ const PLAN_ARTIFACT_PATH_RE = /\.MAIN[\/\\]plans[\/\\](?:requirements|design|bug
 const PLAN_ARTIFACT_FILE_RE = /\b(?:requirements|design|bugfix|tasks)\.md\b/i;
 const PLAN_ARTIFACT_DOC_RE = /(?:计划文档|计划文件|规划文档|规划文件|plan documents?|plan files?|planning documents?|planning files?)/i;
 const INTERNAL_PLAN_ARTIFACT_STEP_RE = /(?:创建|生成|写入|更新|保存|落盘|create|generate|write|update|save)/i;
+const PLAN_SUMMARY_HEADING_RE = /(?:方案总结|需求规格|设计方案|关键设计决策|设计决策|方案正文|计划摘要|方案摘要|requirements?|design|proposal|plan summary|design decisions?)/i;
+const PLAN_SUMMARY_ITEM_RE = /^(?:\*\*)?(?:技术栈|核心玩法|交互控制|交付物|架构|游戏循环|渲染|碰撞检测|执行顺序|关键设计决策|需求规格|设计方案|文件|模块|验证方式|测试方案|范围|目标|验收标准)(?:\*\*)?\s*[:：]/i;
 
 function normalizeOptionText(text: string): string {
   return text.replace(/\s+/g, " ").trim();
@@ -51,6 +53,10 @@ function looksLikeInternalPlanArtifactStep(text: string): boolean {
   );
 }
 
+function looksLikePlanSummaryItem(text: string): boolean {
+  return PLAN_SUMMARY_ITEM_RE.test(normalizeOptionText(text));
+}
+
 function addReplyOption(
   replyOptions: ReplyOption[],
   seenValues: Set<string>,
@@ -62,6 +68,7 @@ function addReplyOption(
   const value = normalizeReplyOptionValue(rawValue || rawLabel);
   if (!label || !value || seenValues.has(value)) return;
   if (looksLikeInternalPlanArtifactStep(label) || looksLikeInternalPlanArtifactStep(value)) return;
+  if (looksLikePlanSummaryItem(label) || looksLikePlanSummaryItem(value)) return;
   seenValues.add(value);
   replyOptions.push({ label, value, ...(action ? { action } : {}) });
 }
@@ -132,7 +139,11 @@ function inferReplyOptionsFromEnumeratedChoices(
 ) {
   const lines = text.split(/\r?\n/);
   for (let i = 0; i < lines.length; i++) {
-    if (!DECISION_CUE_RE.test(lines[i] || "")) continue;
+    const cueLine = lines[i] || "";
+    if (!DECISION_CUE_RE.test(cueLine)) continue;
+    if (PLAN_SUMMARY_HEADING_RE.test(cueLine) && !/(?:请选择|请确认|请告诉我|选一个|选一项|任选其一|从下面.*选|please choose|choose one|pick one|select one)/i.test(cueLine)) {
+      continue;
+    }
 
     const inferred: string[] = [];
     for (let j = i + 1; j < lines.length; j++) {
@@ -143,6 +154,10 @@ function inferReplyOptionsFromEnumeratedChoices(
       }
       const body = normalizeOptionText(matched[1] || "");
       if (!body || /[？?]$/.test(body) || /是否/.test(body)) {
+        inferred.length = 0;
+        break;
+      }
+      if (looksLikeInternalPlanArtifactStep(body) || looksLikePlanSummaryItem(body)) {
         inferred.length = 0;
         break;
       }

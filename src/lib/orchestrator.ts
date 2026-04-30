@@ -1646,8 +1646,8 @@ export async function executeAgentLoop(
   let consecutiveNoToolCount = 0;
   let consecutiveEmptyResponseCount = 0;
   let currentMaxTokens: number | undefined; // undefined = use default
-  const maxOutputEscalations =
-    workflowMode === "plan" || turnIntent === "execute" || turnIntent === "studio_workflow"
+  const getMaxOutputEscalations = () =>
+    workflowMode === "plan" && !callbacks.getIsPlanApproved()
       ? 0
       : 2;
   let sawPlanModeToolActivity = false;
@@ -1709,7 +1709,7 @@ export async function executeAgentLoop(
     builtinAndSkillTools: Math.max(0, allTools.length - mcpTools.length),
     nativeToolsEnabled: !hasProviderNativeToolsDisabled(callbacks.getMessages()),
     xmlToolsEnabled: true,
-    maxOutputEscalations,
+    maxOutputEscalations: getMaxOutputEscalations(),
   });
 
   while (iteration < effectiveMaxIterations) {
@@ -1757,6 +1757,7 @@ export async function executeAgentLoop(
     // 2. Stream LLM response
     const assistantMsgId = generateId();
     let streamResult: StreamResult;
+    const maxOutputEscalations = getMaxOutputEscalations();
 
     logAgentEvent("iteration_start", {
       iteration,

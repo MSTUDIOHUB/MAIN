@@ -10,6 +10,7 @@ const PLAN_REPLACE_REFRESH_SCENARIO = "plan-replace-refresh";
 const AWAITING_CHOICE_SCENARIO = "awaiting-choice";
 const READ_CONTEXT_COLLAPSE_SCENARIO = "read-context-collapse";
 const GAME_STUDIO_ONBOARDING_SCENARIO = "game-studio-onboarding";
+const COMPOSER_MAIN_SHORTCUTS_SCENARIO = "composer-main-shortcuts";
 const CLOUD_SETTINGS_MODEL_SELECT_SCENARIO = "cloud-settings-model-select";
 const CLOUD_SETTINGS_EMPTY_SCENARIO = "cloud-settings-empty";
 const CLOUD_STATUS_ACTIVE_SERVER_MODEL_SCENARIO = "cloud-status-active-server-model";
@@ -1199,6 +1200,76 @@ function seedGameStudioOnboardingScenario() {
   return cleanup;
 }
 
+function seedComposerMainShortcutsScenario() {
+  const bridge = getBridge();
+  if (!bridge) return undefined;
+
+  bridge.events = [{ type: "boot" }];
+  bridge.savedDocuments = [];
+  bridge.completed = false;
+
+  incrementSeedCount(COMPOSER_MAIN_SHORTCUTS_SCENARIO);
+
+  useAppStore.setState((state) => ({
+    ...state,
+    config: {
+      ...state.config,
+      language: "zh",
+      workflowMode: "chat",
+    },
+    currentWorkspace: "/tmp/e2e-composer-main-shortcuts",
+    selectedWorkspace: "/tmp/e2e-composer-main-shortcuts",
+    sessionsByWorkspace: {},
+    currentSessionId: null,
+    selectedMainModeKey: "main_mode",
+    selectedNexusModeKey: "nexus_general",
+    activeStudioAgentKey: "studio_auto",
+    gameStudioInitialized: false,
+    pendingSlashCommand: null,
+    taskFlow: [],
+    agentMessages: [],
+    conversationTurns: [],
+    currentTurnId: null,
+    input: "",
+    attachedFiles: [],
+    contextMentions: [],
+    showAgentPicker: false,
+    showWorkflowMenu: false,
+    isGenerating: false,
+    agentStatus: "idle",
+    elapsedTime: 0,
+    planArtifacts: [],
+    planTasks: [],
+    planExecutionEvidenceCount: 0,
+    planStage: "idle",
+    isPlanApproved: false,
+    showPlanPanel: false,
+    showDiff: false,
+    showTerminal: false,
+    showFilePanel: false,
+    rightPanelTab: "plan",
+    selectedDiffTaskId: null,
+    lockedComposerIntent: null,
+  }));
+
+  bridge.getSnapshot = () => {
+    const state = useAppStore.getState();
+    return {
+      input: state.input,
+      selectedMainModeKey: state.selectedMainModeKey,
+      lockedComposerIntent: state.lockedComposerIntent,
+      seedCount: readSeedCount(COMPOSER_MAIN_SHORTCUTS_SCENARIO),
+    };
+  };
+
+  const cleanup = () => {
+    bridge.initialized = false;
+  };
+
+  bridge.cleanup = cleanup;
+  return cleanup;
+}
+
 function seedCloudSettingsModelSelectScenario() {
   const bridge = getBridge();
   if (!bridge) return undefined;
@@ -2037,6 +2108,10 @@ export function initializeE2EScenarios(): (() => void) | undefined {
 
   if (scenario === GAME_STUDIO_ONBOARDING_SCENARIO) {
     return seedGameStudioOnboardingScenario();
+  }
+
+  if (scenario === COMPOSER_MAIN_SHORTCUTS_SCENARIO) {
+    return seedComposerMainShortcutsScenario();
   }
 
   if (scenario === CLOUD_SETTINGS_MODEL_SELECT_SCENARIO) {

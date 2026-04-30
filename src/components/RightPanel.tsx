@@ -982,7 +982,7 @@ function FileViewerPanel({
 
     return (
       <div
-        className="overflow-hidden rounded-2xl border shadow-[0_20px_40px_rgba(0,0,0,0.08)]"
+        className="overflow-hidden rounded-2xl border"
         style={{ borderColor: palette.surfaceBorder, backgroundColor: palette.surfaceBg }}
       >
         {renderToolbar(title)}
@@ -1050,7 +1050,7 @@ function FileViewerPanel({
           </div>
         ) : fileCategory === "markdown" ? (
           <div
-            className="overflow-hidden rounded-2xl border shadow-[0_20px_40px_rgba(0,0,0,0.08)]"
+            className="overflow-hidden rounded-2xl border"
             style={{ borderColor: palette.surfaceBorder, backgroundColor: palette.surfaceBg }}
           >
             {renderToolbar("Markdown")}
@@ -1063,7 +1063,7 @@ function FileViewerPanel({
             <img
               src={toAssetUrl(filePath)}
               alt={fileName}
-              className="max-h-[70vh] max-w-full rounded-lg border object-contain shadow-lg"
+              className="max-h-[70vh] max-w-full rounded-lg border object-contain"
               style={{ borderColor: palette.surfaceBorder, backgroundColor: palette.surfaceBg }}
               onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = "none"; }}
             />
