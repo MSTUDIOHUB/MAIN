@@ -1351,7 +1351,6 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     fileViewerError,
     fileViewerLoading,
     selectedDiffTaskId,
-    openDiffForTask,
   } = {
     showDiff: useAppStore((s) => s.showDiff),
     showPlanPanel: useAppStore((s) => s.showPlanPanel),
@@ -1380,7 +1379,6 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     fileViewerError: useAppStore((s) => s.fileViewerError),
     fileViewerLoading: useAppStore((s) => s.fileViewerLoading),
     selectedDiffTaskId: useAppStore((s) => s.selectedDiffTaskId),
-    openDiffForTask: useAppStore((s) => s.openDiffForTask),
   };
 
   const selectedDiffTask = useMemo(() => {
@@ -1639,11 +1637,9 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
               fallbackPreview={fallbackPlanPreview}
               fallbackTitle={latestPlanTurn?.title}
               fallbackUpdatedAt={latestPlanTurn?.createdAt}
-              changeEntries={changeSummary.entries}
               onDeletePlanFiles={deletePersistedPlanFiles}
               onContinuePlanning={handleContinuePlanning}
               onResumeExecution={handleResumeExecution}
-              onOpenChangeDiff={openDiffForTask}
               onSaveDocument={handleSavePlanDocument}
               onApprove={approvePlan}
               onReject={rejectPlan}

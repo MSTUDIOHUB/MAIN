@@ -8,7 +8,7 @@ import { useAppStore } from "../store/useAppStore";
 import type { AgentMessage, ContentPart } from "../lib/orchestrator";
 import { getGameStudioSlashCatalog } from "../lib/gameStudioPack";
 import { humanizeSlug } from "../lib/gameStudioCatalog";
-import { getIntentPolicy, getMainIntentShortcuts, getRunIntentCategoryLabel, getRunIntentLabel, parseMainIntentShortcut, resolveComposerIntentSuggestion } from "../lib/runIntent";
+import { getIntentPolicy, getMainIntentShortcuts, getRunIntentCategoryLabel, getRunIntentLabel, parseMainDebugShortcut, parseMainIntentShortcut, resolveComposerIntentSuggestion } from "../lib/runIntent";
 import {
   resolveGameStudioOnboardingAction,
   shouldShowGameStudioOnboarding,
@@ -191,6 +191,7 @@ export default function Composer({
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const mentionDropRef = useRef<HTMLDivElement>(null);
   const slashMenuRef = useRef<HTMLDivElement>(null);
+  const mainFocusPickerRef = useRef<HTMLDivElement>(null);
   const composerShellRef = useRef<HTMLDivElement>(null);
   const slashAnchorRef = useRef(-1);
   const previousMainModeRef = useRef(selectedMainModeKey);
@@ -662,20 +663,6 @@ export default function Composer({
     return groups;
   }, [filteredSlashItems, isMainMode, language, mainIntentSlashGroups, studioAgentHeading, studioWorkflowHeading]);
 
-  // ── Close mention dropdown / slash menu on outside click ──
-  useEffect(() => {
-    const handleClick = (e: MouseEvent) => {
-      if (mentionDropRef.current && !mentionDropRef.current.contains(e.target as Node)) {
-        closeMentionMenu();
-      }
-      if (slashMenuRef.current && !slashMenuRef.current.contains(e.target as Node)) {
-        closeSlashMenu();
-      }
-    };
-    document.addEventListener("mousedown", handleClick);
-    return () => document.removeEventListener("mousedown", handleClick);
-  }, []);
-
   const closeMentionMenu = useCallback(() => {
     setShowMentionMenu(false);
     setMentionQuery("");
@@ -687,6 +674,30 @@ export default function Composer({
     setHighlightedSlashIndex(0);
     slashAnchorRef.current = -1;
   }, []);
+
+  // ── Close mention dropdown / slash menu on outside click ──
+  useEffect(() => {
+    const handleClick = (e: MouseEvent) => {
+      const target = e.target as Node;
+      if (mentionDropRef.current && !mentionDropRef.current.contains(target)) {
+        closeMentionMenu();
+      }
+      const clickedSlashMenu = !!slashMenuRef.current?.contains(target);
+      const clickedComposerShell = !!composerShellRef.current?.contains(target);
+      if (slashMenuRef.current && !clickedSlashMenu) {
+        closeSlashMenu();
+        if (clickedComposerShell) {
+          slashAnchorRef.current = -1;
+        }
+      }
+      if (showAgentPicker && mainFocusPickerRef.current && !mainFocusPickerRef.current.contains(target)) {
+        setShowAgentPicker(false);
+        setHoveredMainFocusModeKey(null);
+      }
+    };
+    document.addEventListener("mousedown", handleClick);
+    return () => document.removeEventListener("mousedown", handleClick);
+  }, [closeMentionMenu, closeSlashMenu, setShowAgentPicker, showAgentPicker]);
 
   useEffect(() => {
     if (isGameStudioMode || isMainMode) return;
@@ -994,7 +1005,10 @@ export default function Composer({
     const textBeforeCursor = value.slice(0, cursorPos);
     const slashSession = getSlashSession(value, cursorPos);
 
-    if ((isGameStudioMode || isMainMode) && slashSession) {
+    if (isMainMode && parseMainDebugShortcut(value)) {
+      slashAnchorRef.current = -1;
+      closeSlashMenu();
+    } else if ((isGameStudioMode || isMainMode) && slashSession) {
       slashAnchorRef.current = slashSession.anchor;
       setSlashQuery(slashSession.query);
       setShowSlashMenu(true);
@@ -1534,7 +1548,6 @@ export default function Composer({
                         {items.map((item) => {
                           const index = visibleMainIntentSlashItems.findIndex((candidate) => candidate.intent === item.intent);
                           const isActive = index === highlightedSlashIndex;
-                          const categoryLabel = getRunIntentCategoryLabel(item.intent, language === "en" ? "en" : "zh");
                           return (
                             <button
                               key={item.intent}
@@ -1553,27 +1566,15 @@ export default function Composer({
                                 if (!isActive) event.currentTarget.style.backgroundColor = "transparent";
                               }}
                             >
-                              <div className="flex items-center justify-between gap-3">
-                                <div className="min-w-0">
-                                  <div
-                                    className="truncate text-[12px] font-semibold"
-                                    style={{ color: isLightTheme ? "var(--accent-hover)" : "var(--accent-light)" }}
-                                  >
-                                    {item.command}
-                                  </div>
-                                  <div className={`mt-0.5 text-[11px] leading-snug ${isLightTheme ? "text-[#52525b]" : "text-[#a1a1aa]"}`}>
-                                    {item.description}
-                                  </div>
-                                </div>
+                              <div className="min-w-0">
                                 <div
-                                  className="shrink-0 rounded-full border px-2 py-0.5 text-[10px] font-medium"
-                                  style={{
-                                    borderColor: "var(--accent-subtle-border)",
-                                    backgroundColor: "var(--accent-subtle)",
-                                    color: isLightTheme ? "var(--accent-hover)" : "var(--accent-light)",
-                                  }}
+                                  className="truncate text-[12px] font-semibold"
+                                  style={{ color: isLightTheme ? "var(--accent-hover)" : "var(--accent-light)" }}
                                 >
-                                  {categoryLabel}
+                                  {item.command}
+                                </div>
+                                <div className={`mt-0.5 text-[11px] leading-snug ${isLightTheme ? "text-[#52525b]" : "text-[#a1a1aa]"}`}>
+                                  {item.description}
                                 </div>
                               </div>
                             </button>
@@ -1683,17 +1684,17 @@ export default function Composer({
                 )}
               </div>
 
-              <div className="w-[1px] h-4 bg-[#27272a] mx-1"></div>
+              <div className="composer-toolbar-divider h-4 w-px mx-1"></div>
 
               {/* MAIN mode switcher */}
-              <div className="relative">
+              <div className="relative" ref={mainFocusPickerRef}>
                 <button
                   data-testid="main-focus-picker-button"
                   onClick={() => {
                     setShowAgentPicker(!showAgentPicker);
                     setHoveredMainFocusModeKey(null);
                   }}
-                  className="bg-[#000000] border border-[#27272a] text-[#e4e4e7] text-[11px] font-bold px-3 py-1.5 rounded-md flex shrink-0 items-center gap-1.5 whitespace-nowrap hover:bg-[#18181b] transition-colors"
+                  className={`composer-toolbar-pill-button flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md px-3 py-1.5 text-[11px] font-bold transition-all duration-150 ${showAgentPicker ? "is-active" : ""}`}
                 >
                   <span className="max-w-[112px] truncate">{t[selectedMainModeKey]}</span>
                   <IconChevronUp className="w-3.5 h-3.5" />
@@ -1743,7 +1744,7 @@ export default function Composer({
                 )}
               </div>
 
-              <div className="w-[1px] h-4 bg-[#27272a] mx-1"></div>
+              <div className="composer-toolbar-divider h-4 w-px mx-1"></div>
 
               {isGameStudioMode && (
                 <>
@@ -1770,14 +1771,14 @@ export default function Composer({
                       {studioAutoLabel}
                     </div>
                   )}
-                  <div className="w-[1px] h-4 bg-[#27272a] mx-1"></div>
+                  <div className="composer-toolbar-divider h-4 w-px mx-1"></div>
                 </>
               )}
 
               {/* @ Mention button — inserts @ and opens the same menu */}
               <button
                 onClick={handleAtButtonClick}
-                className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-[#27272a] bg-[#000000] p-0 text-[#e4e4e7] transition-colors hover:bg-[#18181b]"
+                className={`panel-tab-icon-button flex h-7 w-7 shrink-0 items-center justify-center rounded-[7px] p-0 transition-all duration-150 ${showMentionMenu ? "is-active" : ""}`}
                 title={language === "en" ? "Reference file" : "引用文件"}
               >
                 <IconAt className="w-3.5 h-3.5" />
@@ -1786,7 +1787,7 @@ export default function Composer({
               {/* + Attach file button */}
               <button
                 onClick={onAttachFile}
-                className="text-[#a1a1aa] hover:text-[#e4e4e7] p-1.5 rounded hover:bg-[#18181b] transition-colors"
+                className="panel-tab-icon-button flex h-7 w-7 shrink-0 items-center justify-center rounded-[7px] p-0 transition-all duration-150"
                 title={language === "en" ? "Attach file" : "附加文件"}
               >
                 <IconPlus className="w-4 h-4" />

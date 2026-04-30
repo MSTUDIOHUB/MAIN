@@ -86,6 +86,7 @@ import {
   resolveConversationTurnIntent,
   resolveRunIntentFromLegacyWorkflowMode,
   resolveTurnRunIntent,
+  parseMainDebugShortcut,
   parseMainIntentShortcut,
   shouldContinuePreviousTurnFromInput,
   shouldUseBlockingIntentPreflight,
@@ -1622,6 +1623,24 @@ function buildRunIntentSummary(params: {
 
   const reason = normalizeIntentSummary(params.reason || "");
   return reason || (params.language === "zh" ? `${label}：新的任务` : `${label}: New task`);
+}
+
+function buildMainDebugPrompt(feedback: string): string {
+  const trimmedFeedback = feedback.trim();
+  const feedbackBlock = trimmedFeedback || "未提供反馈正文。请先向用户索取完整反馈内容，再生成 bugfix 计划。";
+  return [
+    "[MDEBUG: USER FEEDBACK SELF-REPAIR]",
+    "以下是来自 MAIN Beta 用户反馈的修复请求。请在当前 MAIN 源码工作区中处理。",
+    "",
+    "工作流程：",
+    "1. 先只读定位相关源码、日志入口、复现路径和可能根因。",
+    "2. 基于反馈生成精简的 `.MAIN/plans/bugfix.md`，内容包含：现象、根因假设、影响范围、修复方案、验证方式。",
+    "3. 输出审批 Proposal，等待用户批准。",
+    "4. 批准前不要修改源码，不要生成 `.MAIN/plans/tasks.md`，不要绕过计划审批。",
+    "",
+    "用户反馈：",
+    feedbackBlock,
+  ].join("\n");
 }
 
 // region: 回合标题语义同步
@@ -3513,13 +3532,19 @@ export const useAppStore = create<AppState>()(
       : parsedStudioCommand
       ? state.config.language
       : detectDominantLanguage(text, state.config.language);
-    const mainIntentShortcut = !isHidden && currentMainModeKey === "main_mode"
+    const mainDebugShortcut = !isHidden && currentMainModeKey === "main_mode"
+      ? parseMainDebugShortcut(text)
+      : null;
+    if (mainDebugShortcut) {
+      text = buildMainDebugPrompt(mainDebugShortcut.rest);
+    }
+    const mainIntentShortcut = !isHidden && currentMainModeKey === "main_mode" && !mainDebugShortcut
       ? parseMainIntentShortcut(text)
       : null;
     if (mainIntentShortcut) {
       text = mainIntentShortcut.rest.trimStart();
     }
-    const lockedComposerIntent = !isHidden && currentMainModeKey === "main_mode"
+    const lockedComposerIntent = !isHidden && currentMainModeKey === "main_mode" && !mainDebugShortcut
       ? state.lockedComposerIntent || mainIntentShortcut?.intent || null
       : null;
     if (!text.trim() && !hasSupplementalInput && !images?.length) {
@@ -3546,10 +3571,12 @@ export const useAppStore = create<AppState>()(
       contextMentions: mentionSnapshot.length,
       attachedFiles: attachedFilesSnapshot.length,
       images: images?.length ?? 0,
+      mainDebugShortcut: !!mainDebugShortcut,
     });
     const isLocalStudioCommand =
       parsedStudioCommand?.type === "agent" || parsedStudioCommand?.type === "auto";
     let effectiveRunIntent =
+      mainDebugShortcut ? "plan" :
       options?.resolvedIntent ||
       lockedComposerIntent ||
       (shouldContinuePlanIntent ? "plan" : null) ||
@@ -3558,6 +3585,10 @@ export const useAppStore = create<AppState>()(
         ? currentTurnIntent
         : resolveRunIntentFromLegacyWorkflowMode(state.config.workflowMode));
     let effectiveIntentSummary = normalizeIntentSummary(options?.intentSummary || "");
+
+    if (mainDebugShortcut && !effectiveIntentSummary) {
+      effectiveIntentSummary = "MDEBUG：用户反馈自修复";
+    }
 
     if (shouldContinuePlanIntent && !effectiveIntentSummary) {
       effectiveIntentSummary = buildRunIntentSummary({
@@ -3592,7 +3623,7 @@ export const useAppStore = create<AppState>()(
       });
     }
 
-    if (!isHidden && !lockedComposerIntent && !shouldContinuePlanIntent && !shouldContinuePreviousTurnIntent && !shouldReuseExistingTurnIntent && !options?.skipIntentResolution && !options?.resolvedIntent) {
+    if (!isHidden && !mainDebugShortcut && !lockedComposerIntent && !shouldContinuePlanIntent && !shouldContinuePreviousTurnIntent && !shouldReuseExistingTurnIntent && !options?.skipIntentResolution && !options?.resolvedIntent) {
       const resolution = resolveTurnRunIntent(text, {
         language: preferredLanguage,
         mainModeKey: currentMainModeKey,
@@ -3685,14 +3716,15 @@ export const useAppStore = create<AppState>()(
             latestInput !== text.trim() ||
             latestState.selectedMainModeKey !== currentMainModeKey ||
             !!latestState.lockedComposerIntent ||
-            !!parseMainIntentShortcut(latestInput);
+            !!parseMainIntentShortcut(latestInput) ||
+            !!parseMainDebugShortcut(latestInput);
           if (stalePreflight) {
             logStoreEvent("intent_preflight_stale_discarded", {
               originalChars: text.trim().length,
               latestChars: latestInput.length,
               selectedMainModeKey: latestState.selectedMainModeKey,
               hasLockedComposerIntent: !!latestState.lockedComposerIntent,
-              hasExplicitShortcut: !!parseMainIntentShortcut(latestInput),
+              hasExplicitShortcut: !!parseMainIntentShortcut(latestInput) || !!parseMainDebugShortcut(latestInput),
             });
             return;
           }
@@ -4050,7 +4082,9 @@ export const useAppStore = create<AppState>()(
     const optionTitle = options?.turnTitle && !isGenericConversationTitle(options.turnTitle)
       ? options.turnTitle
       : "";
-    const localTurnTitle = buildLocalTurnTitle(text, effectiveRunIntent, preferredLanguage);
+    const localTurnTitle = mainDebugShortcut
+      ? "MDEBUG：用户反馈自修复"
+      : buildLocalTurnTitle(text, effectiveRunIntent, preferredLanguage);
     const turnTitle = normalizeConversationDisplayTitle(
       existingTitle || optionTitle || localTurnTitle,
       preferredLanguage === "en" ? 48 : 40,

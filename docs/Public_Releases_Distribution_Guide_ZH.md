@@ -47,6 +47,116 @@
 - 官网下载按钮可以固定指向 `releases/latest`
 - 每次发新版本时，首页通常不需要再改链接
 
+## GitHub Actions 自动发布 zip
+
+当前仓库已经配置了：
+
+- `.github/workflows/build-desktop.yml`
+
+它会在私有 `MAIN` 仓库里构建，然后只把下面这些公开附件发布到 `MAIN-Releases`：
+
+- `MAIN_<version>_macOS_universal.zip`
+- `MAIN_<version>_windows_x64.zip`
+- `SHA256SUMS.txt`
+
+不会上传 `src/`、`src-tauri/`、`dist/`、`target/` 这类源码或构建目录。
+
+### 一次性配置
+
+#### 1. 创建公开下载仓库
+
+在 GitHub 创建一个 public 仓库：
+
+```text
+MSTUDIOHUB/MAIN-Releases
+```
+
+这个仓库只用来放 Releases 附件，不放源码。
+
+创建时建议勾选 `Add a README file`，让公开仓库拥有默认分支。GitHub Release 的 tag 会挂在这个公开仓库自己的默认分支上，不会指向私有 `MAIN` 的源码提交。
+
+#### 2. 创建发布 Token
+
+在 GitHub 创建一个 fine-grained personal access token：
+
+1. 打开 `GitHub > Settings > Developer settings > Personal access tokens > Fine-grained tokens`
+2. 选择 `Generate new token`
+3. Repository access 只选择 `MSTUDIOHUB/MAIN-Releases`
+4. Repository permissions 至少给：
+   - `Contents: Read and write`
+   - `Metadata: Read-only`
+5. 生成 token 后复制。这个值只会显示一次。
+
+#### 3. 把 Token 放进私有 MAIN 仓库 Secrets
+
+在私有 `MAIN` 仓库打开：
+
+```text
+Settings > Secrets and variables > Actions > New repository secret
+```
+
+新增：
+
+```text
+Name: PUBLIC_RELEASES_TOKEN
+Value: 上一步复制的 GitHub token
+```
+
+不要把这个 token 写进代码、README、workflow 明文里。
+
+### 每次发布
+
+1. 打开私有 `MAIN` 仓库的 `Actions`
+2. 左侧选择 `Build and Publish Desktop Zips`
+3. 点击 `Run workflow`
+4. 填：
+   - `version`: 例如 `1.4.1`
+   - `release_repo`: 默认 `MSTUDIOHUB/MAIN-Releases`
+   - `draft`: 第一次建议选 `true`，确认附件无误后再公开
+   - `prerelease`: 测试版才选 `true`
+5. 点击绿色 `Run workflow`
+
+构建成功后，公开仓库会出现：
+
+```text
+https://github.com/MSTUDIOHUB/MAIN-Releases/releases/tag/v1.4.1
+```
+
+如果 `draft = true`，需要到 `MAIN-Releases > Releases` 页面手动点 `Publish release`。
+
+### 用户下载入口
+
+官网按钮建议固定指向：
+
+```text
+https://github.com/MSTUDIOHUB/MAIN-Releases/releases/latest
+```
+
+以后每次发布新版本，官网通常不需要改链接。
+
+### macOS 未签名提示
+
+如果没有配置 Apple Developer 证书，workflow 会生成 ad-hoc signed 的 macOS zip。它可以下载和解压，但首次打开时 macOS 仍可能拦截。
+
+用户可以：
+
+1. 解压 `MAIN_<version>_macOS_universal.zip`
+2. 把 `MAIN.app` 拖进 `Applications`
+3. 右键 `Open`
+4. 如仍被拦截，到 `System Settings > Privacy & Security` 点 `Open Anyway`
+
+正式对外分发时，建议后续补 Apple Developer ID 签名与 notarization。
+
+### Windows SmartScreen 提示
+
+Windows zip 内是 portable `.exe`。如果没有代码签名证书，SmartScreen 或杀毒软件可能提示未知发布者。
+
+不签也能发布，但正式商用分发建议后续添加 Windows 代码签名证书。
+
+## 手动发布备用流程
+
+如果 GitHub Actions 暂时没有配置好，也可以使用下面的本地手动流程。
+
 ## 一次性配置
 
 ### 1. 创建公开仓库

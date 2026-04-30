@@ -27,4 +27,6 @@ npm run build:windows
 
 ## 发布说明
 
-详细的 macOS 签名、公证和 Windows 打包说明见 [docs/Release_Guide_ZH.md](/Users/mstudio/Documents/MAIN/docs/Release_Guide_ZH.md)。
+详细的 macOS 签名、公证和 Windows 打包说明见 `docs/Release_Guide_ZH.md`。
+
+闭源主仓库构建、公开 Releases 仓库只发布 `.zip` 的 GitHub Actions 流程见 `docs/Public_Releases_Distribution_Guide_ZH.md`。

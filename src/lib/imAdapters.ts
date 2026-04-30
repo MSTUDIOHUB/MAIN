@@ -1,4 +1,4 @@
-import { parseMainIntentShortcut, type ResolvedRunIntent } from "./runIntent";
+import { parseMainDebugShortcut, parseMainIntentShortcut, type ResolvedRunIntent } from "./runIntent";
 
 // region: 飞书 IM Adapter 类型
 
@@ -216,7 +216,7 @@ export function parseFeishuTextCommand(input: string): FeishuTextCommand {
 }
 
 export function resolveFeishuRemoteIntentOverride(input: string): FeishuRemoteIntentOverride {
-  return parseMainIntentShortcut(input)
+  return parseMainIntentShortcut(input) || parseMainDebugShortcut(input)
     ? {}
     : {
         resolvedIntent: "analyze",

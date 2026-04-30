@@ -101,6 +101,7 @@ test("Feishu plain text defaults to read-only analysis unless an intent shortcut
   });
   assert.deepEqual(resolveFeishuRemoteIntentOverride("/execute 修复编译错误"), {});
   assert.deepEqual(resolveFeishuRemoteIntentOverride("/计划 先给我实现方案"), {});
+  assert.deepEqual(resolveFeishuRemoteIntentOverride("/MDEBUG\n# MAIN 用户反馈修复请求"), {});
 });
 
 test("upserts pairing requests and paired users by open id", () => {

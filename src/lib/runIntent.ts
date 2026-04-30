@@ -359,6 +359,11 @@ export interface ComposerIntentSuggestion {
   inputKey: string;
 }
 
+export interface MainDebugShortcut {
+  command: "/MDEBUG";
+  rest: string;
+}
+
 const MAIN_INTENT_SHORTCUTS_ZH: MainIntentShortcutItem[] = [
   {
     intent: "plan",
@@ -500,6 +505,17 @@ export function parseMainIntentShortcut(input: string): { intent: MainIntentShor
     }
   }
   return null;
+}
+
+export function parseMainDebugShortcut(input: string): MainDebugShortcut | null {
+  const trimmed = input.trimStart();
+  if (!trimmed.startsWith("/")) return null;
+  const match = trimmed.match(/^\/(mdebug)(?:\s+([\s\S]*))?$/i);
+  if (!match) return null;
+  return {
+    command: "/MDEBUG",
+    rest: match[2] ?? "",
+  };
 }
 
 function createOption(intent: ResolvedUserIntent, language: "zh" | "en"): PendingRunDecisionOption {

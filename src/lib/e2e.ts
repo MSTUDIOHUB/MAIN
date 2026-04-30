@@ -1258,6 +1258,19 @@ function seedComposerMainShortcutsScenario() {
       input: state.input,
       selectedMainModeKey: state.selectedMainModeKey,
       lockedComposerIntent: state.lockedComposerIntent,
+      currentTurnIntent: state.currentTurnId
+        ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId)?.intent ?? null
+        : null,
+      currentTurnTitle: state.currentTurnId
+        ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId)?.title ?? null
+        : null,
+      currentTurnPrompt: state.currentTurnId
+        ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId)?.userPrompt ?? null
+        : null,
+      currentTurnStatus: state.currentTurnId
+        ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId)?.status ?? null
+        : null,
+      planStage: state.planStage,
       seedCount: readSeedCount(COMPOSER_MAIN_SHORTCUTS_SCENARIO),
     };
   };

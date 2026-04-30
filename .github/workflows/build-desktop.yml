@@ -1,12 +1,40 @@
-name: Build Desktop Packages
+name: Build and Publish Desktop Zips
 
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version without leading v, for example 1.4.1"
+        required: true
+        type: string
+      release_repo:
+        description: "Public GitHub repo for release downloads"
+        required: true
+        default: "MSTUDIOHUB/MAIN-Releases"
+        type: string
+      draft:
+        description: "Create the public GitHub Release as a draft"
+        required: true
+        default: false
+        type: boolean
+      prerelease:
+        description: "Mark the public GitHub Release as a pre-release"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  APP_NAME: MAIN
 
 jobs:
   macos:
+    name: Build macOS zip
     runs-on: macos-14
     env:
+      VERSION: ${{ inputs.version }}
       APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
       APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
       APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -28,28 +56,52 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Sync release version
+        run: npm run release:bump -- "$VERSION"
+
       - name: Generate app icons
         run: npm run icon:app
 
-      - name: Build macOS package
+      - name: Build macOS app bundle
         shell: bash
         run: |
           if [[ -n "${APPLE_CERTIFICATE}" || -n "${APPLE_SIGNING_IDENTITY}" ]]; then
-            npm run tauri build -- --target universal-apple-darwin --bundles app,dmg
+            npm run tauri build -- --target universal-apple-darwin --bundles app
           else
-            npm run tauri build -- --target universal-apple-darwin --bundles app,dmg --no-sign
+            npm run tauri build -- --target universal-apple-darwin --bundles app --no-sign
           fi
 
-      - name: Upload macOS artifacts
+      - name: Zip macOS app bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          app_path="src-tauri/target/universal-apple-darwin/release/bundle/macos/${APP_NAME}.app"
+          zip_name="${APP_NAME}_${VERSION}_macOS_universal.zip"
+
+          test -d "$app_path"
+
+          if [[ -z "${APPLE_CERTIFICATE}" && -z "${APPLE_SIGNING_IDENTITY}" ]]; then
+            codesign --force --deep --sign - "$app_path"
+            codesign --verify --deep --strict --verbose=2 "$app_path"
+          fi
+
+          mkdir -p release-assets
+          ditto -c -k --sequesterRsrc --keepParent "$app_path" "release-assets/$zip_name"
+
+      - name: Upload macOS zip
         uses: actions/upload-artifact@v4
         with:
-          name: MAIN-macos
-          path: |
-            src-tauri/target/universal-apple-darwin/release/bundle/macos/MAIN.app
-            src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+          name: main-macos-zip
+          path: release-assets/*.zip
+          if-no-files-found: error
+          retention-days: 7
 
   windows:
+    name: Build Windows zip
     runs-on: windows-latest
+    env:
+      VERSION: ${{ inputs.version }}
     steps:
       - uses: actions/checkout@v4
 
@@ -63,20 +115,118 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Generate app icons
-        run: npm run icon:app
+      - name: Sync release version
+        run: npm run release:bump -- $env:VERSION
 
       - name: Build Windows portable package
         run: npm run build:windows:portable
 
-      - name: Build Windows package
-        run: npm run build:windows
+      - name: Zip Windows portable package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
 
-      - name: Upload Windows artifacts
+          $exePath = "src-tauri\target\release\portable\${env:APP_NAME}-${env:VERSION}-windows-portable.exe"
+          $zipPath = "release-assets\${env:APP_NAME}_${env:VERSION}_windows_x64.zip"
+
+          if (!(Test-Path $exePath)) {
+            throw "Missing Windows portable exe: $exePath"
+          }
+
+          New-Item -ItemType Directory -Force -Path "release-assets" | Out-Null
+          Compress-Archive -Path $exePath -DestinationPath $zipPath -Force
+
+      - name: Upload Windows zip
         uses: actions/upload-artifact@v4
         with:
-          name: MAIN-windows
-          path: |
-            src-tauri/target/release/portable/*.exe
-            src-tauri/target/release/bundle/nsis/*.exe
-            src-tauri/target/release/bundle/msi/*.msi
+          name: main-windows-zip
+          path: release-assets/*.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish public release
+    runs-on: ubuntu-latest
+    needs:
+      - macos
+      - windows
+    env:
+      VERSION: ${{ inputs.version }}
+      RELEASE_REPO: ${{ inputs.release_repo }}
+      GH_TOKEN: ${{ secrets.PUBLIC_RELEASES_TOKEN }}
+    steps:
+      - name: Download release zips
+        uses: actions/download-artifact@v4
+        with:
+          pattern: main-*-zip
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate SHA256 checksums and release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd release-assets
+          sha256sum *.zip > SHA256SUMS.txt
+
+          cat > release-notes.md <<EOF
+          # MAIN ${VERSION}
+
+          ## Downloads
+
+          - macOS: download \`${APP_NAME}_${VERSION}_macOS_universal.zip\`
+          - Windows: download \`${APP_NAME}_${VERSION}_windows_x64.zip\`
+          - Checksums: verify downloads with \`SHA256SUMS.txt\`
+
+          ## Privacy boundary
+
+          This public release contains only packaged desktop binaries. Source code remains in the private MAIN repository.
+          EOF
+
+          ls -lah
+          cat SHA256SUMS.txt
+
+      - name: Publish to public GitHub Releases repo
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${GH_TOKEN}" ]]; then
+            echo "::error::Missing PUBLIC_RELEASES_TOKEN secret. Add a GitHub token that can write releases to ${RELEASE_REPO}."
+            exit 1
+          fi
+
+          tag="v${VERSION}"
+          create_flags=()
+
+          if [[ "${{ inputs.draft }}" == "true" ]]; then
+            create_flags+=(--draft)
+          fi
+
+          if [[ "${{ inputs.prerelease }}" == "true" ]]; then
+            create_flags+=(--prerelease)
+          fi
+
+          if gh release view "$tag" --repo "$RELEASE_REPO" >/dev/null 2>&1; then
+            gh release edit "$tag" \
+              --repo "$RELEASE_REPO" \
+              --title "${APP_NAME} ${VERSION}" \
+              --notes-file release-assets/release-notes.md \
+              --draft="${{ inputs.draft }}" \
+              --prerelease="${{ inputs.prerelease }}"
+
+            gh release upload "$tag" \
+              release-assets/*.zip \
+              release-assets/SHA256SUMS.txt \
+              --repo "$RELEASE_REPO" \
+              --clobber
+          else
+            gh release create "$tag" \
+              release-assets/*.zip \
+              release-assets/SHA256SUMS.txt \
+              --repo "$RELEASE_REPO" \
+              --title "${APP_NAME} ${VERSION}" \
+              --notes-file release-assets/release-notes.md \
+              "${create_flags[@]}"
+          fi

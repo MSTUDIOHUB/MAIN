@@ -83,3 +83,33 @@ test("MAIN shortcut order, keyboard selection, and labels stay aligned", async (
     .toBe("execute");
   await expect(textarea).toHaveValue("");
 });
+
+test("MDEBUG stays hidden from shortcut menu but submits as a plan turn", async ({ page }) => {
+  await page.goto("/?e2eScenario=composer-main-shortcuts");
+
+  const textarea = page.getByTestId("composer-textarea");
+  await textarea.fill("/M");
+
+  await expect(page.getByText("MAIN 快捷入口").first()).toBeVisible();
+  await expect(page.getByText("/MDEBUG")).toHaveCount(0);
+
+  await textarea.fill("/MDEBUG\n# MAIN 用户反馈修复请求\n\n## 问题描述与复现步骤\n点击 Terminal 后没有显示输出。");
+  await expect(page.getByText("MAIN 快捷入口")).toHaveCount(0);
+  await page.getByTestId("composer-send-button").click();
+
+  await expect
+    .poll(async () =>
+      page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().lockedComposerIntent),
+    )
+    .toBe(null);
+  await expect
+    .poll(async () =>
+      page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().currentTurnIntent ?? null),
+    )
+    .toBe("plan");
+
+  const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
+  expect(snapshot?.currentTurnTitle).toBe("MDEBUG：用户反馈自修复");
+  expect(snapshot?.currentTurnPrompt).toContain("[MDEBUG: USER FEEDBACK SELF-REPAIR]");
+  expect(snapshot?.currentTurnPrompt).toContain(".MAIN/plans/bugfix.md");
+});

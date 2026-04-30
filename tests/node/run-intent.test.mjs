@@ -61,6 +61,7 @@ const {
   getIntentPolicy,
   looksLikePreviousTurnContinuationInput,
   mapResolvedRunIntentToWorkflowMode,
+  parseMainDebugShortcut,
   parseMainIntentShortcut,
   resolveComposerIntentSuggestion,
   resolveTurnRunIntent,
@@ -198,6 +199,24 @@ test("MAIN intent shortcuts parse slash command and remaining prompt", () => {
     rest: "check this flow",
   });
   assert.equal(parseMainIntentShortcut("/setup-engine unity"), null);
+});
+
+test("hidden MDEBUG shortcut parses without entering visible intent shortcuts", () => {
+  assert.deepEqual(parseMainDebugShortcut("/MDEBUG 反馈内容"), {
+    command: "/MDEBUG",
+    rest: "反馈内容",
+  });
+  assert.deepEqual(parseMainDebugShortcut("   /mdebug\n# MAIN 用户反馈修复请求"), {
+    command: "/MDEBUG",
+    rest: "# MAIN 用户反馈修复请求",
+  });
+  assert.deepEqual(parseMainDebugShortcut("/MDEBUG"), {
+    command: "/MDEBUG",
+    rest: "",
+  });
+  assert.equal(parseMainIntentShortcut("/MDEBUG 反馈内容"), null);
+  assert.equal(parseMainDebugShortcut("/计划 帮我设计功能"), null);
+  assert.equal(parseMainDebugShortcut("/MDEBUGGER 反馈内容"), null);
 });
 
 test("composer suggestion keeps explicit slash intent as the default", () => {
