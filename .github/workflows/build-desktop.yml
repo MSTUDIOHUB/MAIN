@@ -42,9 +42,9 @@ jobs:
       APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
       APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 20
           cache: npm
@@ -90,7 +90,7 @@ jobs:
           ditto -c -k --sequesterRsrc --keepParent "$app_path" "release-assets/$zip_name"
 
       - name: Upload macOS zip
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: main-macos-zip
           path: release-assets/*.zip
@@ -103,9 +103,9 @@ jobs:
     env:
       VERSION: ${{ inputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 20
           cache: npm
@@ -137,7 +137,7 @@ jobs:
           Compress-Archive -Path $exePath -DestinationPath $zipPath -Force
 
       - name: Upload Windows zip
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: main-windows-zip
           path: release-assets/*.zip
@@ -156,7 +156,7 @@ jobs:
       GH_TOKEN: ${{ secrets.PUBLIC_RELEASES_TOKEN }}
     steps:
       - name: Download release zips
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: main-*-zip
           path: release-assets
