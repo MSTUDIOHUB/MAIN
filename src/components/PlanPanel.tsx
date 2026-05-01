@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import MarkdownRenderer from "./MarkdownRenderer";
 import { IconCheck, IconSave } from "./Icons";
-import { extractPlanTasks, isPlanConversationTurn, type ConversationTurn, type PlanArtifact, type PlanStage, type PlanTask } from "../lib/workflowModels";
+import { extractPlanTasks, isPlanConversationTurn, isPlanTaskTrustedComplete, type ConversationTurn, type PlanArtifact, type PlanStage, type PlanTask } from "../lib/workflowModels";
 
 interface PlanPanelProps {
   artifacts: PlanArtifact[];
@@ -41,6 +41,7 @@ const COPY = {
     retained: "保留记录",
     completed: "完成",
     inProgress: "进行中",
+    missingEvidence: "待验证",
     pending: "待办",
     cancelPlan: "取消计划",
     deletePlanFiles: "删除计划文件",
@@ -89,6 +90,7 @@ const COPY = {
     retained: "Retained",
     completed: "Done",
     inProgress: "In Progress",
+    missingEvidence: "Needs Evidence",
     pending: "Pending",
     cancelPlan: "Cancel Plan",
     deletePlanFiles: "Delete Plan Files",
@@ -190,7 +192,7 @@ export default function PlanPanel({
     () => (tasks.length > 0 ? tasks : previewMarkdown ? extractPlanTasks(previewMarkdown) : []),
     [tasks, previewMarkdown],
   );
-  const doneCount = displayTasks.filter((task) => task.status === "completed").length;
+  const doneCount = displayTasks.filter(isPlanTaskTrustedComplete).length;
   const progressPct = displayTasks.length > 0 ? Math.round((doneCount / displayTasks.length) * 100) : 0;
   const activeTurn = [...turns].reverse().find((turn) => isPlanConversationTurn(turn)) || turns[turns.length - 1];
   const showTaskProgress = !hideIslandOwnedSections && (isApproved || stage === "executing" || stage === "completed") && displayTasks.length > 0;
@@ -315,14 +317,14 @@ export default function PlanPanel({
                 <div key={task.id} className="flex items-start gap-2 rounded-lg border border-[#18181b] bg-[#09090b] px-3 py-2">
                   <span
                     className={`mt-[2px] h-4 w-4 shrink-0 rounded-full border flex items-center justify-center ${
-                      task.status === "completed"
+                      isPlanTaskTrustedComplete(task)
                         ? "border-[#34d399] bg-[#34d399] text-[#050507]"
                         : task.status === "in_progress"
                         ? "border-[#60a5fa] bg-[#60a5fa]"
                         : "border-[#3f3f46] bg-transparent"
                     }`}
                   >
-                    {task.status === "completed" && (
+                    {isPlanTaskTrustedComplete(task) && (
                       <svg className="h-2.5 w-2.5" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
                         <path d="M2.5 6L5 8.5L9.5 3.5" />
                       </svg>
@@ -342,9 +344,16 @@ export default function PlanPanel({
                         )}
                       </div>
                     )}
+                    {task.blockedReason && task.evidenceStatus !== "satisfied" && (
+                      <div className="mt-1 text-[10px] leading-4 text-[#fbbf24]">{task.blockedReason}</div>
+                    )}
                   </div>
                   <div data-testid="plan-task-status" className="text-[10px] text-[#71717a] whitespace-nowrap">
-                    {task.status === "completed" ? copy.completed : task.status === "in_progress" ? copy.inProgress : copy.pending}
+                    {isPlanTaskTrustedComplete(task)
+                      ? copy.completed
+                      : task.claimedStatus === "completed" && task.evidenceStatus !== "satisfied"
+                      ? copy.missingEvidence
+                      : task.status === "in_progress" ? copy.inProgress : copy.pending}
                   </div>
                 </div>
               ))}

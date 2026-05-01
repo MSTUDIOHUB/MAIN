@@ -121,7 +121,12 @@ function finishPlanExecution(finalMessage: string, summary: string) {
         : turn
     ),
     planStage: "completed",
-    planTasks: current.planTasks.map((task) => ({ ...task, status: "completed" as const })),
+    planTasks: current.planTasks.map((task) => ({
+      ...task,
+      status: "completed" as const,
+      evidenceStatus: "satisfied" as const,
+      blockedReason: undefined,
+    })),
     agentStatus: "idle",
     isGenerating: false,
     showPlanPanel: true,
@@ -236,6 +241,8 @@ function seedPlanFlowScenario() {
     currentTurnId: turnId,
     planArtifacts: artifacts,
     planTasks: [],
+    planExecutionEvidenceLedger: [],
+    planExecutionEvidenceCount: 0,
     planStage: "design",
     isPlanApproved: false,
     showPlanPanel: true,
@@ -272,6 +279,20 @@ function seedPlanFlowScenario() {
       appendBridgeEvent("approved");
       rewriteTimer = window.setTimeout(() => {
         const current = useAppStore.getState();
+        useAppStore.setState((state) => ({
+          planExecutionEvidenceLedger: [
+            ...state.planExecutionEvidenceLedger,
+            {
+              id: "e2e-plan-flow-evidence-1",
+              kind: "file",
+              value: "plan-output.md",
+              target: "plan-output.md",
+              sourceTool: "write_file",
+              createdAt: Date.now(),
+            },
+          ],
+          planExecutionEvidenceCount: state.planExecutionEvidenceCount + 1,
+        }));
         current.upsertPlanArtifact({
           kind: "tasks",
           path: ".MAIN/plans/tasks.md",
@@ -280,9 +301,9 @@ function seedPlanFlowScenario() {
           content: [
             "# Tasks",
             "",
-            "- [x] 补齐计划文档与需求说明",
-            "- [ ] 保存方案供用户留档",
-            "- [ ] 批准执行并完成最终收尾",
+            "- [x] 补齐计划文档与需求说明 — 证据: file:plan-output.md",
+            "- [ ] 保存方案供用户留档 — 证据: file:saved-plan.md",
+            "- [ ] 批准执行并完成最终收尾 — 证据: file:final-summary.md",
           ].join("\n"),
         });
 
@@ -416,10 +437,18 @@ function seedPlanReloadResumeScenario() {
         },
       ],
       planTasks: [
-        { id: "reload-task-1", text: "恢复计划工作区状态", status: "completed" },
+        { id: "reload-task-1", text: "恢复计划工作区状态", status: "completed", evidenceStatus: "satisfied" },
         { id: "reload-task-2", text: "恢复对话与执行任务进度", status: "in_progress" },
         { id: "reload-task-3", text: "继续执行并完成收尾", status: "pending" },
       ],
+      planExecutionEvidenceLedger: [{
+        id: "e2e-reload-evidence-1",
+        kind: "file",
+        value: "reload-plan.md",
+        target: "reload-plan.md",
+        sourceTool: "write_file",
+        createdAt: now,
+      }],
       planExecutionEvidenceCount: 1,
       planStage: "executing",
       isPlanApproved: true,
@@ -534,6 +563,7 @@ function seedAwaitingChoiceScenario() {
       },
     ],
     planTasks: [],
+    planExecutionEvidenceLedger: [],
     planStage: "design",
     isPlanApproved: false,
     showPlanPanel: true,
@@ -819,6 +849,7 @@ function seedDiffReloadSummaryScenario() {
       currentTurnId: turnId,
       planArtifacts: [],
       planTasks: [],
+      planExecutionEvidenceLedger: [],
       planExecutionEvidenceCount: 0,
       planStage: "idle",
       isPlanApproved: false,
@@ -871,9 +902,9 @@ function seedPlanReplaceRefreshScenario() {
   const initialTasksContent = [
     "# Tasks",
     "",
-    "- [x] 补齐计划文档与需求说明",
-    "- [ ] 保存方案供用户留档",
-    "- [ ] 批准执行并完成最终收尾",
+    "- [x] 补齐计划文档与需求说明 — 证据: file:plan-output.md",
+    "- [ ] 保存方案供用户留档 — 证据: file:saved-plan.md",
+    "- [ ] 批准执行并完成最终收尾 — 证据: file:final-summary.md",
   ].join("\n");
 
   incrementSeedCount(PLAN_REPLACE_REFRESH_SCENARIO);
@@ -946,10 +977,18 @@ function seedPlanReplaceRefreshScenario() {
       },
     ],
     planTasks: [
-      { id: "replace-task-1", text: "补齐计划文档与需求说明", status: "completed" },
+      { id: "replace-task-1", text: "补齐计划文档与需求说明", status: "completed", evidenceStatus: "satisfied" },
       { id: "replace-task-2", text: "保存方案供用户留档", status: "in_progress" },
       { id: "replace-task-3", text: "批准执行并完成最终收尾", status: "pending" },
     ],
+    planExecutionEvidenceLedger: [{
+      id: "e2e-replace-evidence-1",
+      kind: "file",
+      value: "plan-output.md",
+      target: "plan-output.md",
+      sourceTool: "write_file",
+      createdAt: now,
+    }],
     planExecutionEvidenceCount: 1,
     planStage: "executing",
     isPlanApproved: true,
@@ -978,17 +1017,32 @@ function seedPlanReplaceRefreshScenario() {
       const updatedTasksContent = [
         "# Tasks",
         "",
-        "- [x] 补齐计划文档与需求说明",
-        "- [x] 保存方案供用户留档（已完成）",
-        "- [ ] 批准执行并完成最终收尾",
+        "- [x] 补齐计划文档与需求说明 — 证据: file:plan-output.md",
+        "- [x] 保存方案供用户留档（已完成） — 证据: file:saved-plan.md",
+        "- [ ] 批准执行并完成最终收尾 — 证据: file:final-summary.md",
       ].join("\n");
+
+      useAppStore.setState((state) => ({
+        planExecutionEvidenceLedger: [
+          ...state.planExecutionEvidenceLedger,
+          {
+            id: "e2e-replace-evidence-2",
+            kind: "file",
+            value: "saved-plan.md",
+            target: "saved-plan.md",
+            sourceTool: "write_file",
+            createdAt: Date.now(),
+          },
+        ],
+        planExecutionEvidenceCount: state.planExecutionEvidenceCount + 1,
+      }));
 
       await syncPlanArtifactAfterToolSuccess(
         "replace_in_file",
         {
           path: ".MAIN/plans/tasks.md",
-          search_text: "- [ ] 保存方案供用户留档",
-          replace_text: "- [x] 保存方案供用户留档（已完成）",
+          search_text: "- [ ] 保存方案供用户留档 — 证据: file:saved-plan.md",
+          replace_text: "- [x] 保存方案供用户留档（已完成） — 证据: file:saved-plan.md",
         },
         {
           onPlanArtifactUpdated: (path, content, kind) => {
@@ -1132,6 +1186,7 @@ function seedGameStudioOnboardingScenario() {
             pendingSlashCommand: null,
             planArtifacts: [],
             planTasks: [],
+            planExecutionEvidenceLedger: [],
             planExecutionEvidenceCount: 0,
             planStage: "idle",
             isPlanApproved: false,
@@ -1240,6 +1295,7 @@ function seedComposerMainShortcutsScenario() {
     elapsedTime: 0,
     planArtifacts: [],
     planTasks: [],
+    planExecutionEvidenceLedger: [],
     planExecutionEvidenceCount: 0,
     planStage: "idle",
     isPlanApproved: false,

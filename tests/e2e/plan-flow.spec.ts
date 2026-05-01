@@ -47,7 +47,7 @@ test("plan flow supports save then approve and finish", async ({ page }) => {
     )
     .toEqual({
       stage: "executing",
-      statuses: ["completed", "pending", "pending"],
+      statuses: ["completed", "in_progress", "pending"],
     });
 
   await expect(page.getByTestId("plan-stage-badge")).toContainText("已完成");

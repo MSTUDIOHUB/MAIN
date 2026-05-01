@@ -11,7 +11,7 @@ import {
 
 // region: 共享类型
 
-export type RightPanelTab = "plan" | "diff" | "terminal" | "file";
+export type RightPanelTab = "plan" | "diff" | "terminal";
 
 export function detectDominantLanguage(text: string, fallback: "zh" | "en" = "zh"): "zh" | "en" {
   const hanCount = (text.match(/[\u3400-\u9fff]/g) || []).length;
@@ -34,6 +34,23 @@ export type PlanStage =
   | "completed";
 
 export type PlanTaskStatus = "pending" | "in_progress" | "completed";
+export type PlanTaskEvidenceKind = "file" | "cmd" | "deliverable" | "tool" | "text";
+export type PlanTaskEvidenceStatus = "missing" | "partial" | "satisfied";
+
+export interface PlanTaskEvidence {
+  kind: PlanTaskEvidenceKind;
+  value: string;
+  inferred?: boolean;
+}
+
+export interface PlanExecutionEvidenceEntry {
+  id: string;
+  kind: PlanTaskEvidenceKind;
+  value: string;
+  sourceTool: string;
+  target?: string;
+  createdAt: number;
+}
 
 export interface PlanArtifact {
   kind: PlanArtifactKind;
@@ -47,8 +64,12 @@ export interface PlanTask {
   id: string;
   text: string;
   status: PlanTaskStatus;
+  claimedStatus?: PlanTaskStatus;
   requirementRef?: string;
   commands?: string[];
+  evidence?: PlanTaskEvidence[];
+  evidenceStatus?: PlanTaskEvidenceStatus;
+  blockedReason?: string;
   retained?: boolean;
 }
 
@@ -398,6 +419,192 @@ export function createPlanTaskId(text: string, requirementRef?: string): string 
   return `plan-task-${getPlanTaskIdentity({ text, requirementRef }).replace(/[^a-z0-9_-]+/gi, "-")}`;
 }
 
+const PLAN_TASK_EVIDENCE_LABEL_RE = /(?:^|\s)[（(]?\s*(?:证据|evidence)\s*[:：]\s*([\s\S]+?)\s*[）)]?\s*$/i;
+const PLAN_TASK_EVIDENCE_ITEM_RE =
+  /\b(file|cmd|command|deliverable|tool|text)\s*[:：]\s*([^,，;；]+(?:\s+(?!\b(?:file|cmd|command|deliverable|tool|text)\s*[:：])[^,，;；]+)*)/gi;
+const PLAN_TASK_FILE_REF_RE =
+  /(?:^|[\s`"'(（])((?:\.{1,2}\/|[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,10})(?=$|[\s`"',，。；;:)）])/g;
+
+function normalizeEvidenceKind(kind: string): PlanTaskEvidenceKind {
+  const normalized = String(kind || "").trim().toLowerCase();
+  if (normalized === "command") return "cmd";
+  if (normalized === "file" || normalized === "cmd" || normalized === "deliverable" || normalized === "tool" || normalized === "text") {
+    return normalized;
+  }
+  return "text";
+}
+
+export function normalizePlanEvidenceValue(value: string): string {
+  return String(value || "")
+    .replace(/\\/g, "/")
+    .replace(/^['"`]+|['"`]+$/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function makePlanTaskEvidence(
+  kind: PlanTaskEvidenceKind,
+  value: string,
+  inferred = false,
+): PlanTaskEvidence | null {
+  const clean = String(value || "").replace(/^['"`]+|['"`]+$/g, "").trim();
+  if (!clean) return null;
+  return { kind, value: clean, ...(inferred ? { inferred: true } : {}) };
+}
+
+function dedupePlanTaskEvidence(evidence: PlanTaskEvidence[]): PlanTaskEvidence[] {
+  const seen = new Set<string>();
+  const deduped: PlanTaskEvidence[] = [];
+  for (const item of evidence) {
+    const key = `${item.kind}:${normalizePlanEvidenceValue(item.value)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(item);
+  }
+  return deduped;
+}
+
+function parsePlanTaskEvidenceLabel(rawText: string): { text: string; evidence: PlanTaskEvidence[] } {
+  const matched = rawText.match(PLAN_TASK_EVIDENCE_LABEL_RE);
+  if (!matched) return { text: rawText.trim(), evidence: [] };
+
+  const evidenceText = matched[1] || "";
+  const evidence: PlanTaskEvidence[] = [];
+  for (const item of evidenceText.matchAll(PLAN_TASK_EVIDENCE_ITEM_RE)) {
+    const kind = normalizeEvidenceKind(item[1] || "");
+    const parsed = makePlanTaskEvidence(kind, item[2] || "");
+    if (parsed) evidence.push(parsed);
+  }
+
+  if (evidence.length === 0) return { text: rawText.trim(), evidence: [] };
+  return {
+    text: rawText.slice(0, matched.index).replace(/\s*[—-]\s*$/, "").trim(),
+    evidence: dedupePlanTaskEvidence(evidence),
+  };
+}
+
+export function inferPlanTaskEvidence(text: string, commands: string[] = []): PlanTaskEvidence[] {
+  const evidence: PlanTaskEvidence[] = [];
+  for (const command of commands) {
+    const parsed = makePlanTaskEvidence("cmd", command, true);
+    if (parsed) evidence.push(parsed);
+  }
+
+  for (const matched of String(text || "").matchAll(PLAN_TASK_FILE_REF_RE)) {
+    const parsed = makePlanTaskEvidence("file", matched[1] || "", true);
+    if (parsed) evidence.push(parsed);
+  }
+
+  return dedupePlanTaskEvidence(evidence);
+}
+
+function evidenceMatchesRecord(
+  evidence: PlanTaskEvidence,
+  record: PlanExecutionEvidenceEntry,
+): boolean {
+  const expected = normalizePlanEvidenceValue(evidence.value);
+  const actual = normalizePlanEvidenceValue(record.value || record.target || "");
+  if (!expected || !actual) return false;
+
+  if (evidence.kind === "cmd") {
+    return record.kind === "cmd" && expected === actual;
+  }
+
+  if (evidence.kind === "tool") {
+    return normalizePlanEvidenceValue(record.sourceTool) === expected || actual === expected;
+  }
+
+  if (evidence.kind === "text") {
+    return actual.includes(expected) || expected.includes(actual);
+  }
+
+  if (evidence.kind === "file" || evidence.kind === "deliverable") {
+    if (record.kind !== "file" && record.kind !== "deliverable") return false;
+    return actual === expected || actual.endsWith(`/${expected}`) || expected.endsWith(`/${actual}`);
+  }
+
+  return false;
+}
+
+function resolvePlanTaskEvidenceStatus(
+  task: PlanTask,
+  evidenceLedger: PlanExecutionEvidenceEntry[],
+): { status: PlanTaskEvidenceStatus; matched: number; total: number; blockedReason?: string } {
+  const evidence = task.evidence && task.evidence.length > 0
+    ? task.evidence
+    : inferPlanTaskEvidence(task.text, task.commands || []);
+  if (evidence.length === 0) {
+    return {
+      status: "missing",
+      matched: 0,
+      total: 0,
+      blockedReason: "缺少可验证证据标签或可推断的文件/命令引用",
+    };
+  }
+
+  const matched = evidence.filter((item) =>
+    evidenceLedger.some((record) => evidenceMatchesRecord(item, record))
+  ).length;
+
+  if (matched === evidence.length) {
+    return { status: "satisfied", matched, total: evidence.length };
+  }
+
+  return {
+    status: matched > 0 ? "partial" : "missing",
+    matched,
+    total: evidence.length,
+    blockedReason: matched > 0
+      ? `仅满足 ${matched}/${evidence.length} 条证据`
+      : "缺少真实执行证据，暂不能标记完成",
+  };
+}
+
+export function isPlanTaskTrustedComplete(task: PlanTask): boolean {
+  return task.status === "completed" && task.evidenceStatus === "satisfied";
+}
+
+export function reconcilePlanTaskCompletion(
+  previousTasks: PlanTask[],
+  parsedTasks: PlanTask[],
+  evidenceLedger: PlanExecutionEvidenceEntry[],
+  options: { preserveMissing?: boolean; highlightNext?: boolean } = {},
+): PlanTask[] {
+  const merged = mergePlanTasks(previousTasks, parsedTasks, options.preserveMissing ?? true);
+  const reconciled = merged.map((task) => {
+    const evidence = task.evidence && task.evidence.length > 0
+      ? task.evidence
+      : inferPlanTaskEvidence(task.text, task.commands || []);
+    const evidenceResult = resolvePlanTaskEvidenceStatus({ ...task, evidence }, evidenceLedger);
+    const claimedStatus = task.claimedStatus || task.status;
+    const status: PlanTaskStatus =
+      evidenceResult.status === "satisfied"
+        ? "completed"
+        : task.status === "in_progress" || claimedStatus === "completed" || evidenceResult.status === "partial"
+        ? "in_progress"
+        : "pending";
+
+    return {
+      ...task,
+      claimedStatus,
+      status,
+      evidence,
+      evidenceStatus: evidenceResult.status,
+      blockedReason: evidenceResult.status === "satisfied" ? undefined : evidenceResult.blockedReason,
+    };
+  });
+
+  if (!options.highlightNext) return reconciled;
+  const hasInProgress = reconciled.some((task) => task.status === "in_progress");
+  if (hasInProgress) return reconciled;
+  const firstPendingIndex = reconciled.findIndex((task) => task.status === "pending");
+  if (firstPendingIndex === -1) return reconciled;
+  return reconciled.map((task, index) =>
+    index === firstPendingIndex ? { ...task, status: "in_progress" as const } : task
+  );
+}
+
 export function getPendingPlanTaskCommandFocus(
   tasks: PlanTask[],
   maxTasks = 3,
@@ -429,15 +636,28 @@ export function extractPlanTasks(markdown: string): PlanTask[] {
 
     const rawText = matched[2].trim();
     const requirementMatched = rawText.match(/REQ-[A-Za-z0-9_-]+/);
-    const text = rawText.replace(/\s*→\s*对应需求[:：]?\s*REQ-[A-Za-z0-9_-]+/i, "").trim();
+    const withoutRequirement = rawText.replace(/\s*→\s*对应需求[:：]?\s*REQ-[A-Za-z0-9_-]+/i, "").trim();
+    const parsedEvidence = parsePlanTaskEvidenceLabel(withoutRequirement);
+    const text = parsedEvidence.text;
     const commands = extractShellCommandsFromText(rawText);
+    const inferredEvidence = parsedEvidence.evidence.length > 0
+      ? []
+      : inferPlanTaskEvidence(text, commands);
+    const evidence = dedupePlanTaskEvidence([...parsedEvidence.evidence, ...inferredEvidence]);
+    const claimedStatus: PlanTaskStatus = matched[1].toLowerCase() === "x" ? "completed" : "pending";
 
     tasks.push({
       id: createPlanTaskId(text, requirementMatched?.[0]),
       text,
-      status: matched[1].toLowerCase() === "x" ? "completed" : "pending",
+      // Checkbox state is model-authored and therefore only a claim. The
+      // trusted status is reconciled later against the evidence ledger.
+      status: "pending",
+      claimedStatus,
       ...(requirementMatched ? { requirementRef: requirementMatched[0] } : {}),
       ...(commands.length > 0 ? { commands } : {}),
+      ...(evidence.length > 0 ? { evidence } : {}),
+      evidenceStatus: "missing",
+      ...(claimedStatus === "completed" ? { blockedReason: "等待真实执行证据确认完成" } : {}),
     });
   }
 
@@ -446,8 +666,8 @@ export function extractPlanTasks(markdown: string): PlanTask[] {
 
 function mergePlanTaskStatus(previous: PlanTask | undefined, next: PlanTask): PlanTaskStatus {
   if (!previous) return next.status;
-  if (previous.status === "completed") return "completed";
-  if (next.status === "completed") return "completed";
+  if (isPlanTaskTrustedComplete(previous)) return "completed";
+  if (isPlanTaskTrustedComplete(next)) return "completed";
   if (previous.status === "in_progress" && next.status === "pending") return "in_progress";
   return next.status;
 }
@@ -464,13 +684,17 @@ export function mergePlanTasks(
   const previousByIdentity = new Map(previousTasks.map((task) => [getPlanTaskIdentity(task), task]));
   const usedPreviousIds = new Set<string>();
 
-  const merged = parsedTasks.map((task) => {
+  const merged: PlanTask[] = parsedTasks.map((task) => {
     const previous = previousById.get(task.id) || previousByIdentity.get(getPlanTaskIdentity(task));
     if (previous) usedPreviousIds.add(previous.id);
     return {
       ...task,
       id: previous?.id || task.id,
       status: mergePlanTaskStatus(previous, task),
+      claimedStatus: task.claimedStatus || previous?.claimedStatus || task.status,
+      evidence: task.evidence && task.evidence.length > 0 ? task.evidence : previous?.evidence,
+      evidenceStatus: previous?.evidenceStatus || task.evidenceStatus,
+      blockedReason: previous?.blockedReason || task.blockedReason,
       retained: false,
     };
   });
@@ -481,6 +705,7 @@ export function mergePlanTasks(
     if (usedPreviousIds.has(previous.id)) continue;
     merged.push({
       ...previous,
+      claimedStatus: previous.claimedStatus || previous.status,
       retained: true,
     });
   }

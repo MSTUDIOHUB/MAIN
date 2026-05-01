@@ -1,6 +1,6 @@
 import { memo, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { IconColumns, IconFileText, IconLock, IconUnlock } from "./Icons";
-import type { PlanStage, PlanTask, ReplyOption } from "../lib/workflowModels";
+import { isPlanTaskTrustedComplete, type PlanStage, type PlanTask, type ReplyOption } from "../lib/workflowModels";
 import type { PendingRunDecision, ResolvedUserIntent } from "../lib/runIntent";
 import MarkdownRenderer from "./MarkdownRenderer";
 
@@ -115,10 +115,10 @@ const TopIsland = memo(function TopIsland({
   const shouldExpandWidth = forceExpanded || (hasExpandableContent && (hovered || pinnedOpen));
   const isExpanded = forceExpanded || (hasExpandableContent && (hovered || pinnedOpen));
   // endregion
-  const completedCount = planTasks.filter((task) => task.status === "completed").length;
+  const completedCount = planTasks.filter(isPlanTaskTrustedComplete).length;
   const progress = planTasks.length > 0 ? Math.round((completedCount / planTasks.length) * 100) : 0;
   const currentPhaseKey = useMemo(() => {
-    const firstIncomplete = planTasks.find((task) => task.status !== "completed") || planTasks[planTasks.length - 1];
+    const firstIncomplete = planTasks.find((task) => !isPlanTaskTrustedComplete(task)) || planTasks[planTasks.length - 1];
     if (!firstIncomplete) return null;
     const matched = firstIncomplete.text.match(/(?:Task|T)\s*([0-9]+)(?:[.\-][0-9]+)?/i);
     return matched?.[1] || null;
@@ -396,14 +396,14 @@ const TopIsland = memo(function TopIsland({
                     <div key={task.id} className="flex items-start gap-3 rounded-xl bg-[rgba(0,0,0,0.18)] px-3 py-2">
                       <span
                         className={`mt-1 h-3.5 w-3.5 shrink-0 rounded-full border flex items-center justify-center ${
-                          task.status === "completed"
+                          isPlanTaskTrustedComplete(task)
                             ? "border-[#34d399] bg-[#34d399] text-[#050507]"
                             : task.status === "in_progress"
                             ? "border-[#60a5fa] bg-[#60a5fa]"
                             : "border-[#3f3f46] bg-transparent"
                         }`}
                       >
-                        {task.status === "completed" && (
+                        {isPlanTaskTrustedComplete(task) && (
                           <svg className="h-2 w-2" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
                             <path d="M2.5 6L5 8.5L9.5 3.5" />
                           </svg>

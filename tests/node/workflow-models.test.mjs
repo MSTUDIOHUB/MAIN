@@ -14,6 +14,10 @@ function loadWorkflowModelsModule() {
   return loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/workflowModels.ts"));
 }
 
+function loadPlanEvidenceModule() {
+  return loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planEvidence.ts"));
+}
+
 function loadTranspiledModuleSync(sourcePath) {
   const normalizedPath = path.resolve(sourcePath);
   if (transpiledModuleCache.has(normalizedPath)) {
@@ -64,14 +68,23 @@ const {
   deriveVisibleConversationTurnStatus,
   extractPlanTasks,
   findDroppedPlanTasks,
+  isPlanTaskTrustedComplete,
   looksLikeReasoningLeakTitle,
   mergePlanTasks,
   normalizeConversationDisplayTitle,
+  reconcilePlanTaskCompletion,
   resolveActiveConversationTurn,
   resolvePinnedConversationTurn,
   summarizeUserPrompt,
   validatePlanArtifactContent,
 } = loadWorkflowModelsModule();
+
+const {
+  appendPlanEvidenceEntry,
+  createPlanExecutionEvidenceEntry,
+  isPlanEvidenceLedgerTool,
+  isPlanExecutionEvidenceTool,
+} = loadPlanEvidenceModule();
 
 test("normalizeConversationDisplayTitle strips speaker timestamps from transcript-style prompts", () => {
   const title = normalizeConversationDisplayTitle("Michael@: 04-23 17:57:52 这个它要建模 是啥意思", 40, "新的任务");
@@ -237,26 +250,126 @@ test("extractPlanTasks uses stable ids across task reordering", () => {
   assert.equal(first.find((task) => task.text.includes("BattleManager"))?.id, reordered.find((task) => task.text.includes("BattleManager"))?.id);
 });
 
-test("mergePlanTasks preserves completed task history when the latest tasks.md only lists remaining work", () => {
+test("extractPlanTasks parses checkbox completion as a claim and extracts evidence tags", () => {
+  const [task] = extractPlanTasks("- [x] 实现 snake.py — 食物生成与碰撞检测 — 证据: file:snake.py, cmd:python3 -m py_compile snake.py");
+
+  assert.equal(task.status, "pending");
+  assert.equal(task.claimedStatus, "completed");
+  assert.deepEqual(task.evidence.map((item) => `${item.kind}:${item.value}`), [
+    "file:snake.py",
+    "cmd:python3 -m py_compile snake.py",
+  ]);
+});
+
+test("mergePlanTasks preserves claimed task history without trusting unchecked evidence", () => {
   const previous = extractPlanTasks("- [x] 任务1：完善 BattleUnit.cs\n- [ ] 任务2：更新 BattleManager.cs");
   const latest = extractPlanTasks("- [ ] 任务2：更新 BattleManager.cs");
   const merged = mergePlanTasks(previous, latest, true);
 
   assert.equal(merged.length, 2);
-  assert.equal(merged.find((task) => task.text.includes("BattleUnit"))?.status, "completed");
+  assert.equal(merged.find((task) => task.text.includes("BattleUnit"))?.status, "pending");
+  assert.equal(merged.find((task) => task.text.includes("BattleUnit"))?.claimedStatus, "completed");
   assert.equal(merged.find((task) => task.text.includes("BattleUnit"))?.retained, true);
   assert.equal(merged.find((task) => task.text.includes("BattleManager"))?.retained, false);
 });
 
-test("mergePlanTasks treats completion suffixes as the same task identity", () => {
+test("mergePlanTasks treats completion suffixes as the same claimed task identity", () => {
   const previous = extractPlanTasks("- [ ] 保存方案供用户留档\n- [ ] 批准执行并完成最终收尾");
   const latest = extractPlanTasks("- [x] 保存方案供用户留档（已完成）\n- [ ] 批准执行并完成最终收尾");
   const merged = mergePlanTasks(previous, latest, true);
 
   assert.equal(merged.length, 2);
   assert.equal(merged[0].text, "保存方案供用户留档（已完成）");
-  assert.equal(merged[0].status, "completed");
+  assert.equal(merged[0].status, "pending");
+  assert.equal(merged[0].claimedStatus, "completed");
   assert.equal(merged[0].retained, false);
+});
+
+test("reconcilePlanTaskCompletion only completes tasks with matching execution evidence", () => {
+  const parsed = extractPlanTasks("- [x] 实现 snake.py — 食物生成与碰撞检测 — 证据: file:snake.py\n- [x] 创建 README.md — 证据: file:README.md");
+  const reconciled = reconcilePlanTaskCompletion([], parsed, [{
+    id: "evidence-1",
+    kind: "file",
+    value: "snake.py",
+    target: "snake.py",
+    sourceTool: "write_file",
+    createdAt: 1,
+  }]);
+
+  const snakeTask = reconciled.find((task) => task.text.includes("snake.py"));
+  const readmeTask = reconciled.find((task) => task.text.includes("README"));
+  assert.ok(snakeTask);
+  assert.ok(readmeTask);
+  assert.equal(isPlanTaskTrustedComplete(snakeTask), true);
+  assert.equal(snakeTask.status, "completed");
+  assert.equal(readmeTask.status, "in_progress");
+  assert.equal(readmeTask.evidenceStatus, "missing");
+});
+
+test("plan evidence ignores plan-file writes and identical write_file no-ops", () => {
+  const parsed = extractPlanTasks("- [x] 创建 README.md — 证据: file:README.md");
+  const planWrite = createPlanExecutionEvidenceEntry({
+    toolName: "write_file",
+    target: ".MAIN/plans/tasks.md",
+    result: JSON.stringify({ success: true }),
+  });
+  const noOpWrite = createPlanExecutionEvidenceEntry({
+    toolName: "write_file",
+    target: "README.md",
+    result: JSON.stringify({ success: true, noOp: true }),
+    noOp: true,
+  });
+  const reconciled = reconcilePlanTaskCompletion([], parsed, [planWrite, noOpWrite].filter(Boolean));
+
+  assert.equal(planWrite, null);
+  assert.equal(noOpWrite, null);
+  assert.equal(isPlanTaskTrustedComplete(reconciled[0]), false);
+  assert.equal(reconciled[0].evidenceStatus, "missing");
+});
+
+test("plan evidence records successful commands and deduplicates repeated records", () => {
+  const failedCommand = createPlanExecutionEvidenceEntry({
+    toolName: "run_command",
+    target: "python3 -m py_compile snake.py",
+    result: JSON.stringify({ exitCode: 1, stderr: "SyntaxError" }),
+  });
+  const successfulCommand = createPlanExecutionEvidenceEntry({
+    toolName: "run_command",
+    target: "python3 -m py_compile snake.py",
+    result: JSON.stringify({ exitCode: 0, stdout: "" }),
+  });
+  const firstLedger = appendPlanEvidenceEntry([], successfulCommand);
+  const secondLedger = appendPlanEvidenceEntry(firstLedger, successfulCommand);
+
+  assert.equal(isPlanExecutionEvidenceTool("read_file", "snake.py"), false);
+  assert.equal(isPlanExecutionEvidenceTool("write_file", ".MAIN/plans/tasks.md"), false);
+  assert.equal(failedCommand, null);
+  assert.equal(firstLedger.length, 1);
+  assert.equal(secondLedger, firstLedger);
+});
+
+test("plan verification reads enter the ledger without satisfying file evidence", () => {
+  const verification = createPlanExecutionEvidenceEntry({
+    toolName: "read_file",
+    target: "README.md",
+    result: "# README",
+  });
+  const fileTask = reconcilePlanTaskCompletion(
+    [],
+    extractPlanTasks("- [x] 创建 README.md — 证据: file:README.md"),
+    verification ? [verification] : [],
+  );
+  const toolTask = reconcilePlanTaskCompletion(
+    [],
+    extractPlanTasks("- [x] 验证 README.md 已可读取 — 证据: tool:read_file"),
+    verification ? [verification] : [],
+  );
+
+  assert.equal(isPlanExecutionEvidenceTool("read_file", "README.md"), false);
+  assert.equal(isPlanEvidenceLedgerTool("read_file", "README.md"), true);
+  assert.equal(verification?.kind, "tool");
+  assert.equal(isPlanTaskTrustedComplete(fileTask[0]), false);
+  assert.equal(isPlanTaskTrustedComplete(toolTask[0]), true);
 });
 
 test("findDroppedPlanTasks detects task deletion from rewritten tasks.md", () => {

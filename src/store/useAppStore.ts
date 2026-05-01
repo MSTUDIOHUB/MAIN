@@ -26,6 +26,7 @@ import {
   type ConversationTurnStatus,
   type NormalizedStreamState,
   type PlanArtifact,
+  type PlanExecutionEvidenceEntry,
   type PlanStage,
   type PlanTask,
   type ReplyOption,
@@ -36,13 +37,20 @@ import {
   getPendingPlanTaskCommandFocus,
   getPlanArtifactTitle,
   isGenericConversationTitle,
+  isPlanTaskTrustedComplete,
   looksLikeReasoningLeakTitle,
-  mergePlanTasks,
   normalizeConversationDisplayTitle,
+  reconcilePlanTaskCompletion,
   summarizeAssistantText,
   summarizeUserPrompt,
   validatePlanArtifactContent,
 } from "../lib/workflowModels";
+import {
+  appendPlanEvidenceEntry,
+  createPlanExecutionEvidenceEntry,
+  isPlanEvidenceLedgerTool,
+  isPlanExecutionEvidenceTool,
+} from "../lib/planEvidence";
 import {
   buildAnthropicRequestBody,
   buildOpenAiResponsesInputCandidates,
@@ -384,6 +392,7 @@ export interface SessionRuntimeSnapshot {
   pendingSlashCommand: PendingSlashCommand | null;
   planArtifacts: PlanArtifact[];
   planTasks: PlanTask[];
+  planExecutionEvidenceLedger: PlanExecutionEvidenceEntry[];
   planExecutionEvidenceCount: number;
   planStage: PlanStage;
   isPlanApproved: boolean;
@@ -569,6 +578,7 @@ interface AppState {
   openFileTreePanel: () => void;
   openFileViewer: (path: string, workspace?: string) => Promise<void>;
   clearFileViewer: () => void;
+  closeFilePanel: () => void;
   setSelectedDiffTaskId: (id: number | null) => void;
   openDiffForTask: (taskId: number) => void;
   setRightPanelTab: (tab: RightPanelTab) => void;
@@ -717,6 +727,7 @@ interface AppState {
   planArtifacts: PlanArtifact[];
   planStage: PlanStage;
   planTasks: PlanTask[];
+  planExecutionEvidenceLedger: PlanExecutionEvidenceEntry[];
   planExecutionEvidenceCount: number;
   normalizedStreamState: NormalizedStreamState;
   setWorkflowMode: (mode: "chat" | "edit" | "plan") => void;
@@ -969,7 +980,7 @@ export function normalizeInterruptedConversationTurnsForRestore(
 }
 
 function normalizeStoredRightPanelTab(value: unknown): RightPanelTab {
-  return value === "diff" || value === "terminal" || value === "file" ? value : "plan";
+  return value === "diff" || value === "terminal" ? value : "plan";
 }
 
 function normalizeSessionRuntimeSnapshot(
@@ -994,6 +1005,7 @@ function normalizeSessionRuntimeSnapshot(
     pendingSlashCommand: normalizePendingSlashCommand(snapshot.pendingSlashCommand),
     planArtifacts: snapshot.planArtifacts || [],
     planTasks: snapshot.planTasks || [],
+    planExecutionEvidenceLedger: snapshot.planExecutionEvidenceLedger || [],
     planExecutionEvidenceCount: snapshot.planExecutionEvidenceCount ?? 0,
     planStage: snapshot.planStage ?? "idle",
     isPlanApproved: snapshot.isPlanApproved ?? false,
@@ -1018,6 +1030,7 @@ const sessionRuntimeKeys = [
   "pendingSlashCommand",
   "planArtifacts",
   "planTasks",
+  "planExecutionEvidenceLedger",
   "planExecutionEvidenceCount",
   "planStage",
   "isPlanApproved",
@@ -1087,6 +1100,7 @@ function createSessionRuntimeFromState(state: Partial<AppState>): SessionRuntime
     pendingSlashCommand: normalizePendingSlashCommand(state.pendingSlashCommand),
     planArtifacts: state.planArtifacts || [],
     planTasks: state.planTasks || [],
+    planExecutionEvidenceLedger: state.planExecutionEvidenceLedger || [],
     planExecutionEvidenceCount: state.planExecutionEvidenceCount ?? 0,
     planStage: state.planStage ?? "idle",
     isPlanApproved: state.isPlanApproved === true,
@@ -1865,36 +1879,16 @@ export function sanitizeAgentMessagesForPersist(messages: AgentMessage[]): Agent
   });
 }
 
-function normalizePlanTaskStatuses(tasks: PlanTask[], shouldHighlightNextTask = false): PlanTask[] {
+function normalizePlanTaskStatuses(
+  tasks: PlanTask[],
+  evidenceLedger: PlanExecutionEvidenceEntry[] = [],
+  shouldHighlightNextTask = false,
+): PlanTask[] {
   if (!tasks.length) return tasks;
-
-  const canonicalTasks = tasks.map((task) =>
-    task.status === "in_progress"
-      ? { ...task, status: "pending" as const }
-      : task
-  );
-
-  const hasInProgress = canonicalTasks.some((task) => task.status === "in_progress");
-  if (!shouldHighlightNextTask || hasInProgress) {
-    return canonicalTasks;
-  }
-
-  const firstPendingIndex = canonicalTasks.findIndex((task) => task.status === "pending");
-  if (firstPendingIndex === -1) {
-    return canonicalTasks;
-  }
-
-  return canonicalTasks.map((task, index) =>
-    index === firstPendingIndex
-      ? { ...task, status: "in_progress" as const }
-      : task.status === "in_progress"
-      ? { ...task, status: "pending" as const }
-      : task
-  );
-}
-
-function isPlanArtifactPath(path: string): boolean {
-  return path.replace(/\\/g, "/").toLowerCase().includes(".main/plans/");
+  return reconcilePlanTaskCompletion([], tasks, evidenceLedger, {
+    preserveMissing: false,
+    highlightNext: shouldHighlightNextTask,
+  });
 }
 
 function detectRequestedRootMarkdownDeliverables(text: string): string[] {
@@ -1980,21 +1974,66 @@ function buildPlanCommandExecutionHint(
     : "The remaining tasks already include concrete shell commands. After resuming, run them for real: use run_command for finite commands; use execute_command and then read PTY logs for long-running or interactive commands. Do not only describe them:\n\n" + lines;
 }
 
-const NON_EXECUTION_EVIDENCE_TOOLS = new Set([
-  "list_directory",
-  "glob_search",
-  "grep_search",
-  "read_file",
-  "read_document",
-  "analyze_tabular_document",
-  "query_tabular_document",
-  "index_workspace_documents",
-  "read_pty_buffer",
-  "read_pty_tail",
-  "read_pty_since",
-  "get_pty_status",
-  "clear_pty_buffer",
-]);
+function buildTrustedPlanResumePrompt(input: {
+  language: "zh" | "en";
+  hasTasksArtifact: boolean;
+  tasks: PlanTask[];
+  artifacts: PlanArtifact[];
+  evidenceLedger: PlanExecutionEvidenceEntry[];
+}): string {
+  const remaining = input.tasks.filter((task) => !isPlanTaskTrustedComplete(task)).slice(0, 8);
+  const remainingText = remaining.length > 0
+    ? remaining.map((task, index) => {
+        const evidence = task.evidence?.map((item) => `${item.kind}:${item.value}`).join(", ") ||
+          (input.language === "zh" ? "无证据标签" : "no evidence tags");
+        return `${index + 1}. ${task.text} [${task.evidenceStatus || "missing"}; ${evidence}]`;
+      }).join("\n")
+    : input.language === "zh"
+    ? "无剩余未满足证据的任务；请核查 tasks.md 是否缺失或需要生成。"
+    : "No remaining task with unsatisfied evidence; verify whether tasks.md is missing or needs to be generated.";
+  const evidenceText = input.evidenceLedger.slice(-8).map((entry) =>
+    `- ${entry.kind}:${entry.target || entry.value} (${entry.sourceTool})`
+  ).join("\n") || (input.language === "zh" ? "- 暂无可信执行证据" : "- No trusted execution evidence yet");
+  const artifactText = input.artifacts.map((artifact) =>
+    `- ${artifact.path} (${artifact.kind}, ${artifact.content.length} chars)`
+  ).join("\n") || (input.language === "zh" ? "- 暂无计划文件摘要" : "- No plan artifact summary");
+
+  if (input.language === "zh") {
+    return [
+      "请在新的恢复上下文中继续执行计划，不要复用上一轮错误链路。",
+      input.hasTasksArtifact
+        ? "从 `.MAIN/plans/tasks.md` 中第一个证据未满足的任务开始。只有真实写入/命令成功/验证证据满足后，才可以把任务视为完成。"
+        : "请先基于已批准的 requirements/design 或 bugfix 重新生成 `.MAIN/plans/tasks.md`，然后执行真实任务。",
+      "不要重写已经满足证据的任务；不要只修改 checkbox；不要重复计划说明。",
+      "",
+      "计划文件摘要：",
+      artifactText,
+      "",
+      "最近可信执行证据：",
+      evidenceText,
+      "",
+      "优先恢复任务：",
+      remainingText,
+    ].join("\n");
+  }
+
+  return [
+    "Continue plan execution in a fresh recovery context; do not reuse the previous errored loop.",
+    input.hasTasksArtifact
+      ? "Start from the first task whose evidence is not satisfied. Treat a task as complete only after real file-write, successful command, or verification evidence exists."
+      : "First regenerate `.MAIN/plans/tasks.md` from the approved requirements/design or bugfix, then execute real tasks.",
+    "Do not redo tasks whose evidence is already satisfied. Do not only edit checkboxes. Do not restate the plan.",
+    "",
+    "Plan artifact summary:",
+    artifactText,
+    "",
+    "Recent trusted execution evidence:",
+    evidenceText,
+    "",
+    "Priority recovery tasks:",
+    remainingText,
+  ].join("\n");
+}
 
 const STRUCTURED_ATTACHMENT_EXTENSIONS = new Set([
   ".pdf",
@@ -2045,18 +2084,6 @@ function shouldUseTabularAnalyzer(path: string): boolean {
   return false;
 }
 
-function isPlanExecutionEvidenceTool(toolName: string, target: string): boolean {
-  if (NON_EXECUTION_EVIDENCE_TOOLS.has(toolName)) {
-    return false;
-  }
-
-  if (target && isPlanArtifactPath(target)) {
-    return false;
-  }
-
-  return true;
-}
-
 function hasReviewablePlanState(artifacts: PlanArtifact[], stage: PlanStage): boolean {
   if (stage === "ready_to_execute" || stage === "design" || stage === "bugfix") return true;
   return artifacts.some((artifact) => artifact.kind === "design" || artifact.kind === "bugfix");
@@ -2093,7 +2120,7 @@ function deriveIdleConversationTurnStatus(input: {
     input.planArtifacts.some((artifact) => artifact.kind === "tasks");
   const allTasksComplete =
     input.planTasks.length > 0 &&
-    input.planTasks.every((task) => task.status === "completed");
+    input.planTasks.every((task) => isPlanTaskTrustedComplete(task));
   const hasExecutionEvidence =
     input.planExecutionEvidenceCount > 0 ||
     turnBlocks.some((block) =>
@@ -2208,29 +2235,22 @@ export const useAppStore = create<AppState>()(
     showDiff: v,
     showPlanPanel: v ? false : get().showPlanPanel,
     showTerminal: v ? false : get().showTerminal,
-    showFilePanel: v ? false : get().showFilePanel,
     rightPanelTab: v ? "diff" : get().rightPanelTab,
   }),
   setShowPlanPanel: (v) => set({
     showPlanPanel: v,
     showDiff: v ? false : get().showDiff,
     showTerminal: v ? false : get().showTerminal,
-    showFilePanel: v ? false : get().showFilePanel,
     rightPanelTab: v ? "plan" : get().rightPanelTab,
   }),
   setShowTerminal: (v) => set({
     showTerminal: v,
     showPlanPanel: v ? false : get().showPlanPanel,
     showDiff: v ? false : get().showDiff,
-    showFilePanel: v ? false : get().showFilePanel,
     rightPanelTab: v ? "terminal" : get().rightPanelTab,
   }),
   openFileTreePanel: () => set({
     showFilePanel: true,
-    showPlanPanel: false,
-    showDiff: false,
-    showTerminal: false,
-    rightPanelTab: "file",
     fileViewerPath: "",
     fileViewerContent: "",
     fileViewerError: "",
@@ -2240,10 +2260,6 @@ export const useAppStore = create<AppState>()(
     const targetWorkspace = workspace ?? get().currentWorkspace;
     set({
       showFilePanel: true,
-      showPlanPanel: false,
-      showDiff: false,
-      showTerminal: false,
-      rightPanelTab: "file",
       fileViewerPath: path,
       fileViewerContent: "",
       fileViewerError: "",
@@ -2272,10 +2288,13 @@ export const useAppStore = create<AppState>()(
     fileViewerError: "",
     fileViewerLoading: false,
     showFilePanel: true,
-    showPlanPanel: false,
-    showDiff: false,
-    showTerminal: false,
-    rightPanelTab: "file",
+  }),
+  closeFilePanel: () => set({
+    showFilePanel: false,
+    fileViewerPath: "",
+    fileViewerContent: "",
+    fileViewerError: "",
+    fileViewerLoading: false,
   }),
   setSelectedDiffTaskId: (id) => set({ selectedDiffTaskId: id }),
   openDiffForTask: (taskId) => {
@@ -2287,7 +2306,6 @@ export const useAppStore = create<AppState>()(
       showDiff: true,
       showPlanPanel: false,
       showTerminal: false,
-      showFilePanel: false,
       rightPanelTab: "diff",
     });
   },
@@ -2296,18 +2314,9 @@ export const useAppStore = create<AppState>()(
     showPlanPanel: tab === "plan",
     showDiff: tab === "diff",
     showTerminal: tab === "terminal",
-    showFilePanel: tab === "file",
-    ...(tab === "file"
-      ? {
-          fileViewerPath: "",
-          fileViewerContent: "",
-          fileViewerError: "",
-          fileViewerLoading: false,
-        }
-      : {}),
   }),
   openRightPanelTab: (tab) => get().setRightPanelTab(tab),
-  closeRightPanel: () => set({ showPlanPanel: false, showDiff: false, showTerminal: false, showFilePanel: false }),
+  closeRightPanel: () => set({ showPlanPanel: false, showDiff: false, showTerminal: false }),
   setRightPanelWidth: (w) => set({ rightPanelWidth: w }),
   sidebarWidth: 260,
   setSidebarWidth: (w) => set({ sidebarWidth: Math.max(180, Math.min(450, w)) }),
@@ -2996,6 +3005,7 @@ export const useAppStore = create<AppState>()(
         readOnlyAutoApproveForSession: false,
         planArtifacts: [],
         planTasks: [],
+        planExecutionEvidenceLedger: [],
         planExecutionEvidenceCount: 0,
         planStage: "idle",
         normalizedStreamState: defaultNormalizedStreamState,
@@ -3049,6 +3059,7 @@ export const useAppStore = create<AppState>()(
       sessionHookCache: [],
       planArtifacts: [],
       planTasks: [],
+      planExecutionEvidenceLedger: [],
       planExecutionEvidenceCount: 0,
       planStage: "idle",
       normalizedStreamState: defaultNormalizedStreamState,
@@ -3061,6 +3072,7 @@ export const useAppStore = create<AppState>()(
   planArtifacts: [],
   planStage: "idle",
   planTasks: [],
+  planExecutionEvidenceLedger: [],
   planExecutionEvidenceCount: 0,
   normalizedStreamState: defaultNormalizedStreamState,
   setWorkflowMode: (mode) => set((s) => ({
@@ -3109,13 +3121,16 @@ export const useAppStore = create<AppState>()(
           droppedCount: droppedTasks.length,
         });
       }
-      const nextTasks = artifact.kind === "tasks" || artifact.kind === "bugfix"
-        ? mergePlanTasks(s.planTasks, parsedTasks, preserveTaskHistory)
-        : s.planTasks;
-      const normalizedTasks = normalizePlanTaskStatuses(
-        nextTasks.length > 0 ? nextTasks : s.planTasks,
-        s.isPlanApproved && s.planExecutionEvidenceCount > 0,
-      );
+      const normalizedTasks = artifact.kind === "tasks" || artifact.kind === "bugfix"
+        ? reconcilePlanTaskCompletion(s.planTasks, parsedTasks, s.planExecutionEvidenceLedger, {
+            preserveMissing: preserveTaskHistory,
+            highlightNext: s.isPlanApproved && s.planExecutionEvidenceLedger.length > 0,
+          })
+        : normalizePlanTaskStatuses(
+            s.planTasks,
+            s.planExecutionEvidenceLedger,
+            s.isPlanApproved && s.planExecutionEvidenceLedger.length > 0,
+          );
       const nextStage = derivePlanStageFromArtifacts(
         nextArtifacts,
         normalizedTasks,
@@ -3145,6 +3160,7 @@ export const useAppStore = create<AppState>()(
       planArtifacts: [],
       planStage: "idle",
       planTasks: [],
+      planExecutionEvidenceLedger: [],
       planExecutionEvidenceCount: 0,
       normalizedStreamState: defaultNormalizedStreamState,
       showPlanPanel: false,
@@ -3163,18 +3179,19 @@ export const useAppStore = create<AppState>()(
     } finally {
       invalidateWorkspaceTreeCache();
       get().clearPlanArtifacts();
-      set({ isPlanApproved: false, planExecutionEvidenceCount: 0 });
+      set({ isPlanApproved: false, planExecutionEvidenceLedger: [], planExecutionEvidenceCount: 0 });
       get().bumpWorkspaceContentVersion();
     }
   },
   setPlanTasks: (tasks) => set((s) => ({
-    planTasks: normalizePlanTaskStatuses(
-      mergePlanTasks(
-        s.planTasks,
-        tasks,
-        s.isPlanApproved || s.planStage === "executing" || s.planStage === "completed" || s.planTasks.length > 0,
-      ),
-      s.isPlanApproved && s.planExecutionEvidenceCount > 0,
+    planTasks: reconcilePlanTaskCompletion(
+      s.planTasks,
+      tasks,
+      s.planExecutionEvidenceLedger,
+      {
+        preserveMissing: s.isPlanApproved || s.planStage === "executing" || s.planStage === "completed" || s.planTasks.length > 0,
+        highlightNext: s.isPlanApproved && s.planExecutionEvidenceLedger.length > 0,
+      },
     ),
   })),
   setNormalizedStreamState: (state) => set({ normalizedStreamState: state }),
@@ -3185,6 +3202,7 @@ export const useAppStore = create<AppState>()(
       if (state.agentStatus === "pending_review") {
         set({
           isPlanApproved: true,
+          planExecutionEvidenceLedger: [],
           planExecutionEvidenceCount: 0,
           agentStatus: "running",
           isGenerating: true,
@@ -3202,6 +3220,7 @@ export const useAppStore = create<AppState>()(
 
       set({
         isPlanApproved: true,
+        planExecutionEvidenceLedger: [],
         planExecutionEvidenceCount: 0,
         planStage: "executing",
         showPlanPanel: true,
@@ -3228,13 +3247,13 @@ export const useAppStore = create<AppState>()(
 
             if (state.config.language === "en") {
               return hasTasksArtifact
-              ? "The plan is approved. Continue directly from the current tasks.md and execute the remaining items without repeating the plan. Do not delete completed or previous task records; only check items off or append new tasks." + deliverableHint + "\n\n" + buildPlanCommandExecutionHint(state.planTasks, "en")
-                : "The plan is approved. First generate `.MAIN/plans/tasks.md` from the approved requirements/design or bugfix, then execute the remaining work from that task list without repeating the plan. Keep tasks.md concise: 8-20 checkboxes, one sentence each. When a task needs shell work, include the exact command in backticks inside tasks.md; use run_command for finite commands, or execute_command plus PTY read/status tools for long-running or interactive commands. During execution tasks.md is an audit record; never delete completed or previous tasks." + deliverableHint;
+              ? "The plan is approved. Continue directly from the current tasks.md and execute the remaining items without repeating the plan. Do not delete completed or previous task records; only check an item off after real evidence exists for its file/command/deliverable." + deliverableHint + "\n\n" + buildPlanCommandExecutionHint(state.planTasks, "en")
+                : "The plan is approved. First generate `.MAIN/plans/tasks.md` from the approved requirements/design or bugfix, then execute the remaining work from that task list without repeating the plan. Keep tasks.md concise: 8-20 checkboxes, one sentence each, and add lightweight evidence tags such as `evidence: file:src/app.ts` or `evidence: cmd:npm test` when a task has a concrete deliverable. During execution tasks.md is an audit record; never delete completed or previous tasks, and only check an item off after trusted evidence exists." + deliverableHint;
             }
 
             return hasTasksArtifact
-              ? "计划已批准。请直接基于当前 tasks.md 继续执行剩余任务，不要重复计划内容。不要删除已完成或旧任务记录，只能勾选或追加任务。" + deliverableHint + "\n\n" + buildPlanCommandExecutionHint(state.planTasks, "zh")
-              : "计划已批准。请先基于已批准的 requirements/design 或 bugfix 生成 `.MAIN/plans/tasks.md`，然后再按照任务清单继续执行，不要重复计划内容。tasks.md 必须精简为 8-20 个 checkbox，每项一句话。对于需要 shell 的任务，请把精确命令写进 tasks.md 的 checkbox 并用反引号包裹；一次性命令用 run_command，长驻或交互式命令用 execute_command 后再读取 PTY 日志/状态。执行中 tasks.md 是审计记录，不能删除已完成或旧任务。" + deliverableHint;
+              ? "计划已批准。请直接基于当前 tasks.md 继续执行剩余任务，不要重复计划内容。不要删除已完成或旧任务记录；只有文件/命令/交付物的真实证据满足后，才能勾选对应任务。" + deliverableHint + "\n\n" + buildPlanCommandExecutionHint(state.planTasks, "zh")
+              : "计划已批准。请先基于已批准的 requirements/design 或 bugfix 生成 `.MAIN/plans/tasks.md`，然后再按照任务清单继续执行，不要重复计划内容。tasks.md 必须精简为 8-20 个 checkbox，每项一句话；有明确交付物的任务请追加轻量证据标签，例如 `证据: file:src/app.ts` 或 `证据: cmd:npm test`。执行中 tasks.md 是审计记录，不能删除已完成或旧任务；只有可信证据满足后才能勾选任务。" + deliverableHint;
           })(),
           undefined,
           { hidden: true, reuseCurrentTurn: true, preservePlanState: true },
@@ -3246,6 +3265,7 @@ export const useAppStore = create<AppState>()(
     state.abortController?.abort();
     set({
       isPlanApproved: false,
+      planExecutionEvidenceLedger: [],
       planExecutionEvidenceCount: 0,
       agentStatus: "idle",
       isGenerating: false,
@@ -3398,6 +3418,7 @@ export const useAppStore = create<AppState>()(
       currentTurnExecutionConsent: { turnId: null, granted: false },
       planArtifacts: [],
       planTasks: [],
+      planExecutionEvidenceLedger: [],
       planExecutionEvidenceCount: 0,
       planStage: "idle",
       normalizedStreamState: defaultNormalizedStreamState,
@@ -3663,17 +3684,17 @@ export const useAppStore = create<AppState>()(
           pendingRunDecision: null,
         });
         get().sendMessage(
-          preferredLanguage === "en"
-            ? hasTasksArtifact
-              ? "Continue the remaining unfinished items in `.MAIN/plans/tasks.md` without repeating the plan. Start from the first unchecked task and update tasks.md as each item is completed. Do not delete completed or previous task records."
-              : "First regenerate `.MAIN/plans/tasks.md` from the approved requirements/design or bugfix, then continue the remaining execution without repeating the plan."
-            : hasTasksArtifact
-            ? "请继续执行 `.MAIN/plans/tasks.md` 中剩余未完成的任务，不要重复计划说明。先从第一个未完成 checkbox 对应的任务开始，完成后及时更新 tasks.md。不要删除已完成或旧任务记录。"
-            : "请先基于已批准的 requirements/design 或 bugfix 重新生成 `.MAIN/plans/tasks.md`，然后继续执行剩余任务，不要重复计划说明。",
+          buildTrustedPlanResumePrompt({
+            language: preferredLanguage,
+            hasTasksArtifact,
+            tasks: state.planTasks,
+            artifacts: state.planArtifacts,
+            evidenceLedger: state.planExecutionEvidenceLedger,
+          }),
           undefined,
           {
             hidden: true,
-            reuseCurrentTurn: true,
+            reuseCurrentTurn: false,
             preservePlanState: true,
             resolvedIntent: "plan",
             skipIntentResolution: true,
@@ -3794,6 +3815,7 @@ export const useAppStore = create<AppState>()(
     if (!preservePlanState && !isLocalStudioCommand) {
       set({
         isPlanApproved: false,
+        planExecutionEvidenceLedger: [],
         planExecutionEvidenceCount: 0,
         normalizedStreamState: defaultNormalizedStreamState,
         planArtifacts: [],
@@ -3962,13 +3984,14 @@ export const useAppStore = create<AppState>()(
       sessionUpdateConversationTurn(targetTurnId, { summary });
     const sessionSetPlanTasks = (tasks: PlanTask[]) =>
       sessionSet((s) => ({
-        planTasks: normalizePlanTaskStatuses(
-          mergePlanTasks(
-            s.planTasks,
-            tasks,
-            s.isPlanApproved || s.planStage === "executing" || s.planStage === "completed" || s.planTasks.length > 0,
-          ),
-          s.isPlanApproved && s.planExecutionEvidenceCount > 0,
+        planTasks: reconcilePlanTaskCompletion(
+          s.planTasks,
+          tasks,
+          s.planExecutionEvidenceLedger,
+          {
+            preserveMissing: s.isPlanApproved || s.planStage === "executing" || s.planStage === "completed" || s.planTasks.length > 0,
+            highlightNext: s.isPlanApproved && s.planExecutionEvidenceLedger.length > 0,
+          },
         ),
       }));
     const sessionUpsertPlanArtifact = (artifact: PlanArtifact) =>
@@ -4001,13 +4024,16 @@ export const useAppStore = create<AppState>()(
           s.planStage === "executing" ||
           s.planStage === "completed" ||
           s.planTasks.length > 0;
-        const nextTasks = artifact.kind === "tasks" || artifact.kind === "bugfix"
-          ? mergePlanTasks(s.planTasks, parsedTasks, preserveTaskHistory)
-          : s.planTasks;
-        const normalizedTasks = normalizePlanTaskStatuses(
-          nextTasks.length > 0 ? nextTasks : s.planTasks,
-          s.isPlanApproved && s.planExecutionEvidenceCount > 0,
-        );
+        const normalizedTasks = artifact.kind === "tasks" || artifact.kind === "bugfix"
+          ? reconcilePlanTaskCompletion(s.planTasks, parsedTasks, s.planExecutionEvidenceLedger, {
+              preserveMissing: preserveTaskHistory,
+              highlightNext: s.isPlanApproved && s.planExecutionEvidenceLedger.length > 0,
+            })
+          : normalizePlanTaskStatuses(
+              s.planTasks,
+              s.planExecutionEvidenceLedger,
+              s.isPlanApproved && s.planExecutionEvidenceLedger.length > 0,
+            );
         return {
           planArtifacts: nextArtifacts.sort((a, b) => a.updatedAt - b.updatedAt),
           planStage: derivePlanStageFromArtifacts(
@@ -4027,15 +4053,6 @@ export const useAppStore = create<AppState>()(
         showPlanPanel: tab === "plan",
         showDiff: tab === "diff",
         showTerminal: tab === "terminal",
-        showFilePanel: tab === "file",
-        ...(tab === "file"
-          ? {
-              fileViewerPath: "",
-              fileViewerContent: "",
-              fileViewerError: "",
-              fileViewerLoading: false,
-            }
-          : {}),
       });
     const sessionGet = (): AppState => {
       const live = get();
@@ -4052,7 +4069,7 @@ export const useAppStore = create<AppState>()(
         setNormalizedStreamState: (streamState: NormalizedStreamState) => sessionSet({ normalizedStreamState: streamState }),
         openRightPanelTab: sessionOpenRightPanelTab,
         setRightPanelTab: sessionOpenRightPanelTab,
-        closeRightPanel: () => sessionSet({ showPlanPanel: false, showDiff: false, showTerminal: false, showFilePanel: false }),
+        closeRightPanel: () => sessionSet({ showPlanPanel: false, showDiff: false, showTerminal: false }),
         startNewTurn: () =>
           sessionSet({
             currentTurnState: {
@@ -4176,6 +4193,7 @@ export const useAppStore = create<AppState>()(
             pendingSlashCommand: sessionGet().pendingSlashCommand,
             planArtifacts: sessionGet().planArtifacts,
             planTasks: sessionGet().planTasks,
+            planExecutionEvidenceLedger: sessionGet().planExecutionEvidenceLedger,
             planExecutionEvidenceCount: sessionGet().planExecutionEvidenceCount,
             planStage: sessionGet().planStage,
             isPlanApproved: sessionGet().isPlanApproved,
@@ -4964,6 +4982,7 @@ export const useAppStore = create<AppState>()(
         getReadOnlyAutoApproveForSession: () => sessionGet().readOnlyAutoApproveForSession,
         getPlanStage: () => sessionGet().planStage,
         getPlanTasks: () => sessionGet().planTasks,
+        getPlanExecutionEvidenceLedger: () => sessionGet().planExecutionEvidenceLedger,
         getStatus: () => sessionGet().agentStatus,
         startNewTurn: () => sessionGet().startNewTurn(),
 
@@ -5345,23 +5364,48 @@ export const useAppStore = create<AppState>()(
             }
             if (idx === -1) return {};
             const updated = [...s.taskFlow];
-            updated[idx] = { ...updated[idx], toolStatus: "executed" as const, status: "done" as const, message: result.length > 500 ? result.slice(0, 500) + "..." : result } as TaskBlock;
+            const previousBlock = updated[idx];
+            const resultNoOp = /"noOp"\s*:\s*true/.test(result);
+            const noOpWrite =
+              toolName === "write_file" &&
+              (
+                resultNoOp ||
+                (
+                  previousBlock?.type === "tool" &&
+                  !!previousBlock.diff &&
+                  previousBlock.diff.old === previousBlock.diff.new
+                )
+              );
+            updated[idx] = {
+              ...updated[idx],
+              toolStatus: "executed" as const,
+              status: "done" as const,
+              message: noOpWrite
+                ? "No file change: requested content matched the current file, so this did not advance plan evidence."
+                : result.length > 500 ? result.slice(0, 500) + "..." : result,
+            } as TaskBlock;
             const shouldRecordPlanEvidence =
               effectiveRunIntent === "plan" &&
               s.isPlanApproved &&
-              isPlanExecutionEvidenceTool(toolName, target);
-            const nextPlanExecutionEvidenceCount = shouldRecordPlanEvidence
-              ? s.planExecutionEvidenceCount + 1
-              : s.planExecutionEvidenceCount;
+              isPlanEvidenceLedgerTool(toolName, target);
+            const nextEvidenceLedger = shouldRecordPlanEvidence
+              ? appendPlanEvidenceEntry(
+                  s.planExecutionEvidenceLedger,
+                  createPlanExecutionEvidenceEntry({ toolName, target, result, noOp: noOpWrite }),
+                )
+              : s.planExecutionEvidenceLedger;
+            const evidenceChanged = nextEvidenceLedger !== s.planExecutionEvidenceLedger;
 
             return {
               taskFlow: updated,
-              ...(nextPlanExecutionEvidenceCount !== s.planExecutionEvidenceCount
+              ...(evidenceChanged
                 ? {
-                    planExecutionEvidenceCount: nextPlanExecutionEvidenceCount,
+                    planExecutionEvidenceLedger: nextEvidenceLedger,
+                    planExecutionEvidenceCount: nextEvidenceLedger.length,
                     planTasks: normalizePlanTaskStatuses(
                       s.planTasks,
-                      nextPlanExecutionEvidenceCount > 0,
+                      nextEvidenceLedger,
+                      true,
                     ),
                   }
                 : {}),
@@ -5610,7 +5654,7 @@ export const useAppStore = create<AppState>()(
             current.isPlanApproved &&
             current.planExecutionEvidenceCount > 0 &&
             current.planTasks.length > 0 &&
-            current.planTasks.every((task) => task.status === "completed") &&
+            current.planTasks.every((task) => isPlanTaskTrustedComplete(task)) &&
             hasRootMarkdownDeliverableEvidence(turnBlocks, requestedDocs);
           const nextStage =
             stage === "idle"
@@ -5895,6 +5939,7 @@ export const useAppStore = create<AppState>()(
               pendingSlashCommand: s.pendingSlashCommand,
               planArtifacts: s.planArtifacts,
               planTasks: s.planTasks,
+              planExecutionEvidenceLedger: s.planExecutionEvidenceLedger,
               planExecutionEvidenceCount: s.planExecutionEvidenceCount,
               planStage: s.planStage,
               isPlanApproved: s.isPlanApproved,
@@ -5975,6 +6020,7 @@ export const useAppStore = create<AppState>()(
         pendingSlashCommand: state.pendingSlashCommand,
         planArtifacts: state.planArtifacts,
         planTasks: state.planTasks,
+        planExecutionEvidenceLedger: state.planExecutionEvidenceLedger,
         planExecutionEvidenceCount: state.planExecutionEvidenceCount,
         planStage: state.planStage,
         isPlanApproved: state.isPlanApproved,

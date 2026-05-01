@@ -13,6 +13,7 @@ import {
   resolveGameStudioOnboardingAction,
   shouldShowGameStudioOnboarding,
 } from "../lib/gameStudioOnboarding";
+import { isPlanTaskTrustedComplete } from "../lib/workflowModels";
 
 // ── ContextRing SVG Component ──────────────────────────────────────────
 
@@ -93,7 +94,7 @@ function ExecutionProgressCard({
   tasks: Array<{ id: string; text: string; status: "pending" | "in_progress" | "completed" }>;
   stage: "ready" | "executing" | "completed";
 }) {
-  const completedCount = tasks.filter((task) => task.status === "completed").length;
+  const completedCount = tasks.filter(isPlanTaskTrustedComplete).length;
 
   return (
     <div className="mb-3 overflow-hidden rounded-[28px] border border-[#3a3a3d] bg-[#262625] shadow-[0_14px_40px_rgba(0,0,0,0.28)]">
@@ -110,14 +111,14 @@ function ExecutionProgressCard({
         <div className="space-y-3">
           {tasks.map((task, index) => {
             const tone =
-              task.status === "completed"
+              isPlanTaskTrustedComplete(task)
                 ? "text-[#f5f5f5]"
                 : task.status === "in_progress"
                 ? "text-[#facc15]"
                 : "text-[#e4e4e7]";
 
             const marker =
-              task.status === "completed"
+              isPlanTaskTrustedComplete(task)
                 ? "◉"
                 : task.status === "in_progress"
                 ? "◎"

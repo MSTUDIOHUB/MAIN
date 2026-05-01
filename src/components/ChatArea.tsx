@@ -20,6 +20,7 @@ import {
   isGenericConversationTitle,
   normalizeConversationDisplayTitle,
   isPlanConversationTurn,
+  isPlanTaskTrustedComplete,
   looksLikeReasoningLeakTitle,
   resolveActiveConversationTurn,
   resolvePinnedConversationTurn,
@@ -1034,6 +1035,7 @@ export default function ChatArea({
     openFileTreePanel,
     openDiffForTask,
     closeRightPanel,
+    closeFilePanel,
     setShowDiff,
     setShowTerminal,
     conversationTurns,
@@ -1061,6 +1063,7 @@ export default function ChatArea({
     openFileTreePanel: useAppStore((s) => s.openFileTreePanel),
     openDiffForTask: useAppStore((s) => s.openDiffForTask),
     closeRightPanel: useAppStore((s) => s.closeRightPanel),
+    closeFilePanel: useAppStore((s) => s.closeFilePanel),
     setShowDiff: useAppStore((s) => s.setShowDiff),
     setShowTerminal: useAppStore((s) => s.setShowTerminal),
     conversationTurns: useAppStore((s) => s.conversationTurns),
@@ -1204,7 +1207,7 @@ export default function ChatArea({
       isPlanApproved,
       planStage,
       agentStatus,
-      hasIncompletePlanTasks: planTasks.some((task) => task.status !== "completed"),
+      hasIncompletePlanTasks: planTasks.some((task) => !isPlanTaskTrustedComplete(task)),
       hasTasksArtifact:
         planArtifacts.some((artifact) => artifact.kind === "tasks") ||
         planTasks.length > 0,
@@ -1381,9 +1384,13 @@ export default function ChatArea({
       (tab === "plan" && showPlanPanel && rightPanelTab === "plan") ||
       (tab === "diff" && showDiff && rightPanelTab === "diff") ||
       (tab === "terminal" && showTerminal && rightPanelTab === "terminal") ||
-      (tab === "file" && showFilePanel && rightPanelTab === "file");
+      (tab === "file" && showFilePanel);
 
     if (isCurrentlyOpen) {
+      if (tab === "file") {
+        closeFilePanel();
+        return;
+      }
       closeRightPanel();
       return;
     }
@@ -1395,7 +1402,7 @@ export default function ChatArea({
       return;
     }
     openRightPanelTab(tab);
-  }, [closeRightPanel, currentWorkspace, hasPlanPanelContent, openFileTreePanel, openRightPanelTab, rightPanelTab, showDiff, showFilePanel, showPlanPanel, showTerminal]);
+  }, [closeFilePanel, closeRightPanel, currentWorkspace, hasPlanPanelContent, openFileTreePanel, openRightPanelTab, rightPanelTab, showDiff, showFilePanel, showPlanPanel, showTerminal]);
 
   const renderBlock = (block, index) => {
     if (block.type === "user") {
@@ -1717,7 +1724,7 @@ export default function ChatArea({
             <button
               onClick={() => togglePanelTab("file")}
               disabled={!currentWorkspace}
-              className={`panel-tab-icon-button flex h-7 w-7 shrink-0 items-center justify-center rounded-[7px] transition-all duration-150 disabled:cursor-not-allowed disabled:opacity-40 ${showFilePanel && rightPanelTab === "file" ? "is-active" : ""}`}
+              className={`panel-tab-icon-button flex h-7 w-7 shrink-0 items-center justify-center rounded-[7px] transition-all duration-150 disabled:cursor-not-allowed disabled:opacity-40 ${showFilePanel ? "is-active" : ""}`}
               title={language === "zh" ? "文件" : "Files"}
               aria-label={language === "zh" ? "文件" : "Files"}
             >

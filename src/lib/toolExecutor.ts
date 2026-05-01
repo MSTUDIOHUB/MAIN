@@ -306,8 +306,24 @@ export async function executeTool(
       const writeContent = (args.content as string) || "";
       if (!writePath) throw new Error("Missing required parameter 'path'.");
       if (shouldUseChatTempStorage(workspace, sessionKey)) {
+        try {
+          const original = await readChatTempFile(sessionKey!, writePath);
+          if (original === writeContent) {
+            return JSON.stringify({ success: true, noOp: true, message: `File ${writePath} already matched requested content.` });
+          }
+        } catch {
+          // Missing temp file is fine; the write below will create it.
+        }
         const temporaryPath = await writeChatTempFile(sessionKey!, writePath, writeContent);
         return buildChatTempSuccessMessage("written", writePath, temporaryPath);
+      }
+      try {
+        const original = await readFile(writePath, workspace);
+        if (original === writeContent) {
+          return JSON.stringify({ success: true, noOp: true, message: `File ${writePath} already matched requested content.` });
+        }
+      } catch {
+        // Missing file is fine; the write below will create it.
       }
       await writeFile(writePath, writeContent, workspace);
       return JSON.stringify({ success: true, message: `File ${writePath} written successfully.` });

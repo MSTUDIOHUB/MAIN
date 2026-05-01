@@ -46,7 +46,9 @@ import {
   extractPlanTasks,
   findDroppedPlanTasks,
   getPendingPlanTaskCommandFocus,
+  isPlanTaskTrustedComplete,
   validatePlanArtifactContent,
+  type PlanExecutionEvidenceEntry,
   type PlanTask,
   type ReplyOption,
 } from "./workflowModels";
@@ -261,6 +263,7 @@ export interface OrchestratorCallbacks {
   getReadOnlyAutoApproveForSession: () => boolean;
   getPlanStage: () => "idle" | "requirements" | "design" | "tasks" | "bugfix" | "ready_to_execute" | "executing" | "completed";
   getPlanTasks: () => PlanTask[];
+  getPlanExecutionEvidenceLedger: () => PlanExecutionEvidenceEntry[];
   getStatus: () => "idle" | "running" | "pending_review" | "error";
   startNewTurn: () => void;
 
@@ -1323,6 +1326,30 @@ async function buildPlanArtifactMutationValidationError(
         content: `Error: ${message}`,
         isError: true,
       };
+    }
+
+    if (callbacks.getIsPlanApproved()) {
+      const previousById = new Map(previousTasks.map((task) => [task.id, task]));
+      const unsupportedCompletions = parsedTasks.filter((task) => {
+        if (task.claimedStatus !== "completed") return false;
+        const previous = previousById.get(task.id);
+        return !previous || !isPlanTaskTrustedComplete(previous);
+      });
+
+      if (unsupportedCompletions.length > 0) {
+        const message = language === "zh"
+          ? `PLAN_TASK_EVIDENCE_BLOCKED: tasks.md 不能把缺少真实执行证据的任务直接勾选完成。请先真实执行并验证这些任务，再更新 checkbox：${unsupportedCompletions.slice(0, 3).map((task) => task.text).join("；")}`
+          : `PLAN_TASK_EVIDENCE_BLOCKED: tasks.md cannot mark tasks complete before trusted execution evidence exists. Execute and verify these tasks first, then update their checkboxes: ${unsupportedCompletions.slice(0, 3).map((task) => task.text).join("; ")}`;
+        callbacks.onToolExecuting(tc.name, target);
+        callbacks.onToolError(tc.name, target, message);
+        return {
+          toolCallId: tc.id,
+          name: tc.name,
+          target,
+          content: `Error: ${message}`,
+          isError: true,
+        };
+      }
     }
   }
 
@@ -2590,7 +2617,7 @@ export async function executeAgentLoop(
         const hasRemainingApprovedPlanTasks =
           workflowMode === "plan" &&
           callbacks.getIsPlanApproved() &&
-          approvedPlanTasks.some((task) => task.status !== "completed");
+          approvedPlanTasks.some((task) => !isPlanTaskTrustedComplete(task));
 
         if (approvedPlanMissingTasks || hasRemainingApprovedPlanTasks) {
           callbacks.onStatusChange("running");
@@ -2606,7 +2633,7 @@ export async function executeAgentLoop(
             return;
           }
 
-          const remainingTasks = approvedPlanTasks.filter((task) => task.status !== "completed").slice(0, 3);
+          const remainingTasks = approvedPlanTasks.filter((task) => !isPlanTaskTrustedComplete(task)).slice(0, 3);
           const remainingText = remainingTasks.length > 0
             ? remainingTasks.map((task) => `- ${task.text}`).join("\n")
             : callbacks.getPreferredLanguage() === "zh"
@@ -2619,8 +2646,8 @@ export async function executeAgentLoop(
               (approvedPlanMissingTasks
                 ? buildApprovedPlanContinuationPrompt(callbacks) + "\n\n"
                 : language === "zh"
-                ? "继续执行 tasks.md 中剩余的未完成任务。不要重复计划说明，直接根据当前进度继续实现下一个任务；如果需要修改文件，继续使用工具调用。凡是任务里带有 shell 命令的，一次性命令优先用 run_command 并检查 exitCode/stdout/stderr；长驻或交互式命令用 execute_command 后再用 read_pty_since/read_pty_tail/get_pty_status 检查结果。完成当前任务后，先把 `.MAIN/plans/tasks.md` 中对应的 checkbox 更新为 `[x]`，再继续下一项；不要删除已完成或旧任务记录，只有 tasks.md 全部勾选后才能结束。\n下一批优先任务：\n"
-                : "Continue executing the remaining incomplete tasks from tasks.md. Do not restate the plan; just move to the next task based on the current progress. If a task includes shell commands, prefer run_command for finite commands and inspect exitCode/stdout/stderr; use execute_command for long-running or interactive commands, then verify with read_pty_since/read_pty_tail/get_pty_status. After each task, update the matching checkbox in `.MAIN/plans/tasks.md` before moving on; do not delete completed or previous task records. Only stop when all tasks are complete.\nNext priority tasks:\n") +
+                ? "继续执行 tasks.md 中证据未满足的任务。不要重复计划说明，直接根据当前进度继续实现下一个任务；如果需要修改文件，继续使用工具调用。凡是任务里带有 shell 命令的，一次性命令优先用 run_command 并检查 exitCode/stdout/stderr；长驻或交互式命令用 execute_command 后再用 read_pty_since/read_pty_tail/get_pty_status 检查结果。完成当前任务后，必须先产生真实文件/命令/验证证据，再把 `.MAIN/plans/tasks.md` 中对应 checkbox 更新为 `[x]`；不要删除已完成或旧任务记录，只有所有任务证据满足后才能结束。\n下一批优先任务：\n"
+                : "Continue executing tasks whose evidence is not satisfied. Do not restate the plan; just move to the next task based on the current progress. If a task includes shell commands, prefer run_command for finite commands and inspect exitCode/stdout/stderr; use execute_command for long-running or interactive commands, then verify with read_pty_since/read_pty_tail/get_pty_status. After each task, produce real file/command/verification evidence before updating the matching checkbox in `.MAIN/plans/tasks.md`; do not delete completed or previous task records. Only stop when every task has satisfied evidence.\nNext priority tasks:\n") +
               remainingText +
               "\n\n" +
               buildPlanCommandExecutionHint(approvedPlanTasks, language),
@@ -2969,7 +2996,37 @@ export async function executeAgentLoop(
         break;
       }
 
-      callbacks.onError(formatRepeatLoopFatalMessage(tc.name, target, repeatCheck.threshold));
+      const fatalMessage = formatRepeatLoopFatalMessage(tc.name, target, repeatCheck.threshold);
+      const remainingTask = callbacks.getPlanTasks().find((task) => !isPlanTaskTrustedComplete(task));
+      const recentEvidence = callbacks.getPlanExecutionEvidenceLedger().slice(-5);
+      const recentEvidenceText = recentEvidence.length > 0
+        ? recentEvidence.map((entry) => `${entry.kind}:${entry.target || entry.value} via ${entry.sourceTool}`).join(" | ")
+        : callbacks.getPreferredLanguage() === "zh" ? "无" : "none";
+      const structuredRecovery = callbacks.getPreferredLanguage() === "zh"
+        ? [
+            "RecoveryDetails:",
+            `- duplicateTool: ${tc.name}`,
+            `- target: ${target || "unknown"}`,
+            `- duplicateCount: ${repeatCheck.threshold}+`,
+            `- recentSuccessfulEvidence: ${recentEvidenceText}`,
+            `- suggestedNextTask: ${remainingTask?.text || "重新读取 tasks.md 与证据摘要后继续"}`,
+          ].join("\n")
+        : [
+            "RecoveryDetails:",
+            `- duplicateTool: ${tc.name}`,
+            `- target: ${target || "unknown"}`,
+            `- duplicateCount: ${repeatCheck.threshold}+`,
+            `- recentSuccessfulEvidence: ${recentEvidenceText}`,
+            `- suggestedNextTask: ${remainingTask?.text || "reread tasks.md plus the evidence summary, then continue"}`,
+          ].join("\n");
+      const recoveryHint = remainingTask
+        ? callbacks.getPreferredLanguage() === "zh"
+          ? `\nRecovery: 请开启新的恢复上下文，从证据未满足的任务继续：${remainingTask.text}`
+          : `\nRecovery: start a fresh recovery context and continue from the first task with unsatisfied evidence: ${remainingTask.text}`
+        : callbacks.getPreferredLanguage() === "zh"
+        ? "\nRecovery: 请开启新的恢复上下文，重新读取 tasks.md 与证据摘要后继续。"
+        : "\nRecovery: start a fresh recovery context, reread tasks.md plus the evidence summary, then continue.";
+      callbacks.onError(`${fatalMessage}\n${structuredRecovery}${recoveryHint}`);
       callbacks.onStatusChange("error");
       return;
     }
