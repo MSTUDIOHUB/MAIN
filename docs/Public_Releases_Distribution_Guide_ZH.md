@@ -61,6 +61,27 @@
 
 不会上传 `src/`、`src-tauri/`、`dist/`、`target/` 这类源码或构建目录。
 
+### 最快发布命令
+
+本机已经封装了一键触发命令：
+
+```bash
+npm run release:desktop -- 1.4.2
+```
+
+这条命令会检查 GitHub CLI 登录、公开下载仓库、`PUBLIC_RELEASES_TOKEN`、当前工作区是否干净、当前 `HEAD` 是否已经推送到 `origin/main`，然后触发 GitHub Actions 构建 macOS + Windows zip，并直接公开发布到 `MAIN-Releases`。
+
+常用参数：
+
+```bash
+npm run release:desktop -- 1.4.2 --draft
+npm run release:desktop -- 1.4.2 --prerelease
+npm run release:desktop -- 1.4.2 --no-watch
+npm run release:desktop -- 1.4.2 --dry-run
+```
+
+版本号必须写成 `1.4.2`，不要写成 `v1.4.2`；脚本会自动给 Release tag 加 `v` 前缀。
+
 ### 一次性配置
 
 #### 1. 创建公开下载仓库

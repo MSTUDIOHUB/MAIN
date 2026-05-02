@@ -142,6 +142,10 @@ function CodeBlock({ inline, className, children, baseFontSize = 13, ...rest }: 
   const [copied, setCopied] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
   const themeMode = useAppStore((s) => s.config.themeMode);
+  const uiLanguage = useAppStore((s) => s.config.language) === "en" ? "en" : "zh";
+  const copy = uiLanguage === "zh"
+    ? { diagram: "图表", expand: "展开", copied: "已复制", copy: "复制", expandedDiagram: "展开图表视图", copySource: "复制源码", closeExpanded: "关闭展开图表" }
+    : { diagram: "Diagram", expand: "Expand", copied: "Copied", copy: "Copy", expandedDiagram: "Expanded Diagram View", copySource: "Copy Source", closeExpanded: "Close expanded diagram" };
   const isLightTheme = themeMode === "light";
   const match = /language-(\w+)/.exec(className || "");
   const language = match ? match[1].toLowerCase() : "";
@@ -274,7 +278,7 @@ function CodeBlock({ inline, className, children, baseFontSize = 13, ...rest }: 
               {resolvedLang || "text"}
             </span>
             {isMermaid && (
-              <span className="text-[10px] uppercase tracking-[0.18em] text-[#cbd5e1]">Diagram</span>
+              <span className="text-[10px] uppercase tracking-[0.18em] text-[#cbd5e1]">{copy.diagram}</span>
             )}
           </div>
           <div className="flex items-center gap-2">
@@ -285,12 +289,12 @@ function CodeBlock({ inline, className, children, baseFontSize = 13, ...rest }: 
               >
                 <span className="inline-flex items-center gap-1.5">
                   <IconExpand className="h-3.5 w-3.5" />
-                  Expand
+                  {copy.expand}
                 </span>
               </button>
             )}
             <button onClick={handleCopy} className="rounded-full border border-[#27272a] bg-[#09090b] px-3 py-1 text-[10px] text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#f5f5f5]">
-              {copied ? "Copied" : "Copy"}
+              {copied ? copy.copied : copy.copy}
             </button>
           </div>
         </div>
@@ -346,7 +350,7 @@ function CodeBlock({ inline, className, children, baseFontSize = 13, ...rest }: 
                 >
                   {resolvedLang || "text"}
                 </span>
-                <span className="text-[12px] text-[#d4d4d8]" style={{ color: expandedTone.titleText }}>Expanded Diagram View</span>
+                <span className="text-[12px] text-[#d4d4d8]" style={{ color: expandedTone.titleText }}>{copy.expandedDiagram}</span>
               </div>
               <div className="flex items-center gap-2">
                 <button
@@ -358,7 +362,7 @@ function CodeBlock({ inline, className, children, baseFontSize = 13, ...rest }: 
                     color: expandedTone.buttonText,
                   }}
                 >
-                  {copied ? "Copied" : "Copy Source"}
+                  {copied ? copy.copied : copy.copySource}
                 </button>
                 <button
                   onClick={() => setIsExpanded(false)}
@@ -368,7 +372,7 @@ function CodeBlock({ inline, className, children, baseFontSize = 13, ...rest }: 
                     backgroundColor: expandedTone.buttonBackground,
                     color: expandedTone.buttonText,
                   }}
-                  aria-label="Close expanded diagram"
+                  aria-label={copy.closeExpanded}
                 >
                   <IconClose className="h-4 w-4" />
                 </button>

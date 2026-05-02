@@ -337,11 +337,13 @@ function PlanShortcutCard({
   canOpenPlan: boolean;
   onOpenPlan: () => void;
   copy: {
+    planLabel: string;
     describePlan: (prompt: string, maxLength?: number) => string;
     planGenerating: (prompt: string) => string;
     planReady: string;
     openPlan: string;
     generating: string;
+    turnStatusLabels: Record<string, string>;
   };
 }) {
   const description = hasPlanContent
@@ -356,10 +358,10 @@ function PlanShortcutCard({
         <div className="min-w-0">
           <div className="flex items-center gap-2">
             <span className="rounded-full border border-[rgba(124,58,237,0.25)] bg-[rgba(124,58,237,0.14)] px-2 py-0.5 text-[10px] uppercase tracking-[0.16em] text-[#c4b5fd]">
-              Plan
+              {copy.planLabel}
             </span>
             <span className={`rounded-full border px-2 py-0.5 text-[10px] ${getTurnStatusTone(turn.status)}`}>
-              {TURN_STATUS_LABELS[turn.status] || turn.status}
+              {copy.turnStatusLabels[turn.status] || turn.status}
             </span>
           </div>
           <div className="mt-2 text-[13px] leading-relaxed text-[#e9d5ff]">{description}</div>

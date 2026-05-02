@@ -56,24 +56,371 @@ function isSameCloudConnectionTarget(current: any, target: any): boolean {
     && String(current.customHeaders || "") === String(target.customHeaders || "");
 }
 
+const SETTINGS_COPY = {
+  zh: {
+    activeProfile: "当前配置",
+    setAsActive: "设为当前",
+    cancel: "取消",
+    done: "完成",
+    confirmClear: "确认清空",
+    confirmReset: "确认重置",
+    tipLabel: "提示",
+    refresh: "刷新",
+    scan: "扫描",
+    save: "保存",
+    testing: "测试中...",
+    test: "测试",
+    displayLanguage: "显示语言",
+
+    mcpServerTitle: "MCP 服务器",
+    mcpScanTools: "扫描工具",
+    mcpScanning: "扫描中...",
+    mcpDescription: "配置 MCP (Model Context Protocol) 服务器，使 AI 能够操控外部引擎（如 Unity）。支持 HTTP 传输协议。",
+    mcpNoServersConfigured: "暂无 MCP 服务器配置",
+    mcpNoServersHint: "点击下方「添加服务器」连接外部引擎",
+    remove: "移除",
+    addServer: "添加服务器",
+    serverNamePlaceholder: "名称 (如 unityMCP)",
+    add: "添加",
+    discoveredTools: "已发现的工具",
+    mcpDiscovered: (toolCount: number, serverCount: number) => `已发现 ${toolCount} 个工具（来自 ${serverCount} 个服务器）`,
+    mcpNoServers: "尚未配置 MCP 服务器",
+    mcpNoTools: "未发现任何工具，请检查服务器是否在线",
+    mcpDiscoveryFailed: (message: string) => `发现失败: ${message}`,
+    mcpTip: "MCP 服务器需先启动并监听指定端口，然后点击「扫描工具」发现可用工具。发现后的工具会在对话中自动供 AI 调用。Unity MCP 服务器默认地址为",
+
+    dataPanelDesc: "管理本地数据。设置与会话索引保存在 localStorage，完整会话记录保存在 MAIN 应用数据目录，不写入项目的 .MAIN 目录。",
+    dataTip: "所有数据保存在浏览器本地存储中。重置设置不会删除已解压到 .protocols/ 目录的协议包文件，如需彻底清理请手动删除该目录。",
+
+    debugDesc: "记录前端 console、界面崩溃、Rust 代理请求和流式读取错误。日志会自动隐藏常见密钥字段。",
+    debugFile: "日志文件",
+    noDebugLog: "暂无调试日志",
+    copiedDebugLog: "已复制调试日志",
+    exportedDebugLog: "调试日志已导出",
+    clearedDebugLog: "调试日志已清空",
+    copyLog: "复制日志",
+    exportLog: "导出日志",
+    clearLog: "清空日志",
+    logTailOnly: "当前只显示日志尾部",
+
+    compressionLow: "省显存",
+    compressionBalanced: "均衡",
+    compressionLong: "长上下文",
+    compressionLowHint: "更早压缩，适合显存紧张",
+    compressionBalancedHint: "上下文与显存占用折中",
+    compressionLongHint: "更晚压缩，保留更多历史",
+    zoneLow: "省显存 / 更早压缩",
+    zoneBalanced: "均衡",
+    zoneLong: "长上下文 / 更晚压缩",
+    contextTriggerThreshold: "压缩触发阈值 (Token)",
+    estimatedContextVram: "预估上下文显存",
+    currentLimit: (tokens: string) => `当前上限约 ${tokens} Token`,
+    deviceMemory: "设备内存",
+    available: "可用",
+    maxBar: (value: string, hasSafety: boolean) => `满格约 ${value}${hasSafety ? "，已按当前可用内存预留安全余量" : ""}`,
+    contextTip: "此设置用于本地模型的背景压缩与上下文窗口。满格会参考当前可用内存动态计算，并预留约 1GB / 10% 安全余量。",
+
+    providerEngine: "Provider Engine",
+    apiEndpoint: "API Endpoint",
+    apiKeyOptionalOmlx: "API Key",
+    optionalOmlxAuth: "可选，OMLX 服务鉴权用",
+    noAuthPlaceholder: "留空则不发送鉴权头",
+    localModel: "Local Model",
+    scanningModels: "正在扫描模型...",
+    noModels: "未发现模型 — 请先启动本地推理服务",
+    scanModels: "扫描",
+    discoveredModels: (count: number) => `已发现 ${count} 个模型`,
+    localFetchError: "无法获取模型列表，请检查服务地址和网络连接",
+
+    cloudDesc: "管理多个云端服务器配置。新建或编辑后点击保存，模型列表只会在点击刷新时获取。",
+    modelName: "Model Name",
+    currentServer: "当前服务器：",
+    unnamedServer: "未命名服务器",
+    unsaved: "未保存",
+    manualInput: "手动输入",
+    dropdownSelect: "下拉选择",
+    refreshing: "刷新中...",
+    fetchedModels: (count: number) => `已拉取 ${count} 个模型`,
+    noCloudServerTitle: "还没有云端服务器",
+    noCloudServerDesc: "从左侧新增服务器后，再在这里手动刷新模型列表。",
+    servers: "服务器",
+    configs: (count: number) => `${count} 个配置`,
+    addServerTitle: "新增服务器",
+    serverSearchPlaceholder: "搜索名称、Endpoint、模型",
+    noServerConfigs: "暂无服务器配置",
+    noMatchingServers: "没有匹配的服务器",
+    unsavedServer: "未保存服务器",
+    noEndpoint: "未填写 Endpoint",
+    serverConfig: "服务器配置",
+    unsavedChanges: "有未保存更改",
+    savedConfig: "当前服务器配置已保存",
+    cloudServerName: "Server Name",
+    cloudServerNamePlaceholder: "例如 OpenAI / OpenRouter / 公司网关",
+    apiProtocol: "API Protocol",
+    apiProtocolDesc: "选择云端服务遵循的协议格式。聚合平台通常走 OpenAI Compatible，Claude 原生接口走 Anthropic。",
+    apiFormat: "API Format",
+    apiFormatDesc: "弱兼容网关可先尝试 Chat Completions；如果服务像 Codex 一样使用 `wire_api = responses`，请切换到 Responses API。",
+    responsesEndpointPlaceholder: "https://api.openai.com/v1 或完整 /v1/responses 地址",
+    chatEndpointPlaceholder: "https://api.openai.com/v1 或完整 /v1/chat/completions 地址",
+    anthropicEndpointHint: "Anthropic 协议通常填写根地址，例如 https://api.anthropic.com",
+    responsesEndpointHint: "Responses API 可填写 API 根地址（如 https://api.openai.com/v1），也支持直接粘贴完整的 /responses 请求地址。",
+    chatEndpointHint: "OpenAI Chat Completions 通常填写 API 根地址（常见以 /v1 结尾），也支持直接粘贴完整的 /chat/completions 地址。",
+    apiKeyOptional: "如服务不需要可留空",
+    apiKeyDescAnthropic: "Anthropic 协议会使用 x-api-key 请求头。",
+    apiKeyDescOpenAi: "OpenAI 兼容协议会默认同时发送 Authorization: Bearer 和 x-api-key 请求头，以兼容更多聚合网关。",
+    additionalHeaders: "Additional Headers (JSON)",
+    optional: "可选",
+    additionalHeadersDesc: "需要厂商专用请求头时可填写 JSON 对象，或 {\"header\",\"value\"} 数组。",
+    customHeadersCount: (count: number) => `当前将附加 ${count} 个自定义请求头`,
+    modelParams: "模型参数",
+    reasoningEffort: "Reasoning Effort",
+    reasoningEffortDesc: "建议保持 None，响应最快且不容易触发云端 524；只有复杂推理任务再手动切到 High / XHigh。",
+    disableResponseStorage: "Disable Response Storage",
+    disableResponseStorageDesc: "对应 Codex `disable_response_storage = true`，会发送 `store: false`。",
+    responsesCodexDesc: "`Responses + gpt-5.4` 现在会尽量贴近 Codex 请求形态：使用顶层 `instructions`、发送 `store: false` / `reasoning.effort`，并让采样参数走服务端默认值。",
+    temperatureDesc: "控制输出的随机性。值越低越确定，值越高越多样。",
+    topPDesc: "核采样阈值，与 Temperature 共同影响生成质量。",
+    tempPrecise: "0 (精确)",
+    tempCreative: "2 (创意)",
+    topPNarrow: "0 (窄)",
+    topPWide: "1 (宽)",
+    cloudStartTitle: "从 0 开始添加云端服务器",
+    cloudStartDesc: "当前没有任何云端接口配置。点击新增后填写名称、协议、Endpoint 和 API Key。",
+    cloudTip: "推荐优先让用户直接在这里填写协议、Endpoint、API Key、额外请求头与模型名，不额外依赖外部配置文件。点击“刷新”会按当前选中的服务器尝试发现可用模型。",
+    cloudSaveRequired: "请先填写 Server Name 和 API Endpoint",
+    cloudSaved: "已保存服务器配置",
+    cloudSelectServerFirst: "请先新建或选择一个服务器",
+    cloudEndpointRequired: "请先填写 API Endpoint",
+    cloudModelsPulled: (count: number, model: string) => `已拉取 ${count} 个模型，当前选择 ${model}`,
+    cloudNoModels: "未发现可用模型，请检查 Endpoint、协议和 API Key",
+    cloudConnectionFailed: (message: string) => `连接失败: ${message}`,
+    cloudModelRequired: "请先选择或填写一个模型名称",
+    cloudAutoSwitch: (format: string) => `，已自动切换到 ${format}`,
+    cloudConnected: (model: string, switched: string) => `已连通 ${model}${switched}`,
+    cloudBasicSuccessWithReply: (model: string, reply: string, switched: string) => `基础连通成功，${model} 返回：${reply}${switched}。`,
+    cloudBasicSuccess: (model: string, switched: string) => `基础连通成功，${model} 已返回有效响应${switched}。`,
+    cloudAdvancedSuccess: "高级参数也已通过：store/reasoning 与当前配置兼容。",
+    cloudAdvancedWarning: (message: string) => `基础连接可用，但 store/reasoning 高级参数未通过：${message}。真实任务仍会按当前配置发送；如频繁波动，可把 Reasoning Effort 调低或设为 None。`,
+    cloudProtocolHint: " 当前这个云端服务看起来不支持 Anthropic /v1/messages，请切换到 OpenAI Compatible 再试。",
+    cloudRetryHint: " 这通常是云端网关到上游模型的临时波动，应用已经自动重试过；稍后再试一次通常会恢复。",
+    cloudTestFailed: (message: string, protocolHint: string, retryHint: string) => `测试失败: ${message}${protocolHint}${retryHint}`,
+  },
+  en: {
+    activeProfile: "Active Profile",
+    setAsActive: "Set as Active",
+    cancel: "Cancel",
+    done: "Done",
+    confirmClear: "Confirm Clear",
+    confirmReset: "Confirm Reset",
+    tipLabel: "Tip",
+    refresh: "Refresh",
+    scan: "Scan",
+    save: "Save",
+    testing: "Testing...",
+    test: "Test",
+    displayLanguage: "Display Language",
+
+    mcpServerTitle: "MCP Servers",
+    mcpScanTools: "Scan Tools",
+    mcpScanning: "Scanning...",
+    mcpDescription: "Configure MCP (Model Context Protocol) servers so the AI can control external engines such as Unity. HTTP transport is supported.",
+    mcpNoServersConfigured: "No MCP servers configured",
+    mcpNoServersHint: "Use Add Server below to connect an external engine",
+    remove: "Remove",
+    addServer: "Add Server",
+    serverNamePlaceholder: "Name (for example unityMCP)",
+    add: "Add",
+    discoveredTools: "Discovered Tools",
+    mcpDiscovered: (toolCount: number, serverCount: number) => `Discovered ${toolCount} tool(s) from ${serverCount} server(s)`,
+    mcpNoServers: "No MCP servers configured",
+    mcpNoTools: "No tools found. Check whether the servers are online.",
+    mcpDiscoveryFailed: (message: string) => `Discovery failed: ${message}`,
+    mcpTip: "Start the MCP server and make sure it is listening on the configured port, then click Scan Tools. Discovered tools become available to the AI automatically. Unity MCP defaults to",
+
+    dataPanelDesc: "Manage local data. Settings and session indexes are stored in localStorage; full conversations are stored in MAIN app data and are not written into the project's .MAIN folder.",
+    dataTip: "All data is stored locally in the browser. Resetting settings will not delete protocol packages extracted into .protocols/. Delete that folder manually for a full cleanup.",
+
+    debugDesc: "Records frontend console output, UI crashes, Rust agent requests, and streaming errors. Common secret fields are redacted automatically.",
+    debugFile: "Log File",
+    noDebugLog: "No debug logs yet",
+    copiedDebugLog: "Debug log copied",
+    exportedDebugLog: "Debug log exported",
+    clearedDebugLog: "Debug log cleared",
+    copyLog: "Copy Log",
+    exportLog: "Export Log",
+    clearLog: "Clear Log",
+    logTailOnly: "Only the tail of the log is shown",
+
+    compressionLow: "Memory Saver",
+    compressionBalanced: "Balanced",
+    compressionLong: "Long Context",
+    compressionLowHint: "Compress earlier for tighter VRAM budgets",
+    compressionBalancedHint: "Balance context retention and VRAM use",
+    compressionLongHint: "Compress later and keep more history",
+    zoneLow: "Memory saver / earlier compression",
+    zoneBalanced: "Balanced",
+    zoneLong: "Long context / later compression",
+    contextTriggerThreshold: "Compression Trigger (Tokens)",
+    estimatedContextVram: "Estimated Context VRAM",
+    currentLimit: (tokens: string) => `Current limit is about ${tokens} tokens`,
+    deviceMemory: "Device Memory",
+    available: "available",
+    maxBar: (value: string, hasSafety: boolean) => `Full scale is about ${value}${hasSafety ? ", with a safety margin reserved from current available memory" : ""}`,
+    contextTip: "This setting controls local-model background compression and context window size. Full scale is calculated from current available memory with about 1 GB / 10% reserved as a safety margin.",
+
+    providerEngine: "Provider Engine",
+    apiEndpoint: "API Endpoint",
+    apiKeyOptionalOmlx: "API Key",
+    optionalOmlxAuth: "optional, for OMLX service auth",
+    noAuthPlaceholder: "Leave blank to skip the auth header",
+    localModel: "Local Model",
+    scanningModels: "Scanning models...",
+    noModels: "No models found - start the local inference service first",
+    scanModels: "Scan",
+    discoveredModels: (count: number) => `Found ${count} model(s)`,
+    localFetchError: "Unable to fetch models. Check the service address and network connection.",
+
+    cloudDesc: "Manage multiple cloud server configurations. Save after creating or editing; model lists are fetched only when you refresh.",
+    modelName: "Model Name",
+    currentServer: "Current server: ",
+    unnamedServer: "Unnamed server",
+    unsaved: "Unsaved",
+    manualInput: "Manual Input",
+    dropdownSelect: "Use Dropdown",
+    refreshing: "Refreshing...",
+    fetchedModels: (count: number) => `Fetched ${count} model(s)`,
+    noCloudServerTitle: "No cloud servers yet",
+    noCloudServerDesc: "Add a server from the left, then refresh the model list here.",
+    servers: "Servers",
+    configs: (count: number) => `${count} config(s)`,
+    addServerTitle: "Add Server",
+    serverSearchPlaceholder: "Search name, endpoint, or model",
+    noServerConfigs: "No server configurations",
+    noMatchingServers: "No matching servers",
+    unsavedServer: "Unsaved server",
+    noEndpoint: "Endpoint missing",
+    serverConfig: "Server Configuration",
+    unsavedChanges: "Unsaved changes",
+    savedConfig: "Current server configuration is saved",
+    cloudServerName: "Server Name",
+    cloudServerNamePlaceholder: "For example OpenAI / OpenRouter / company gateway",
+    apiProtocol: "API Protocol",
+    apiProtocolDesc: "Choose the cloud service protocol. Aggregators usually use OpenAI Compatible; native Claude endpoints use Anthropic.",
+    apiFormat: "API Format",
+    apiFormatDesc: "Try Chat Completions for loosely compatible gateways. If the service uses `wire_api = responses`, switch to Responses API.",
+    responsesEndpointPlaceholder: "https://api.openai.com/v1 or a full /v1/responses URL",
+    chatEndpointPlaceholder: "https://api.openai.com/v1 or a full /v1/chat/completions URL",
+    anthropicEndpointHint: "Anthropic usually uses the root URL, for example https://api.anthropic.com.",
+    responsesEndpointHint: "Responses API accepts an API root URL such as https://api.openai.com/v1, or a full /responses request URL.",
+    chatEndpointHint: "OpenAI Chat Completions usually uses an API root URL ending in /v1, or a full /chat/completions URL.",
+    apiKeyOptional: "leave blank if the service does not require one",
+    apiKeyDescAnthropic: "Anthropic protocol sends the x-api-key header.",
+    apiKeyDescOpenAi: "OpenAI-compatible protocol sends both Authorization: Bearer and x-api-key by default for broader gateway compatibility.",
+    additionalHeaders: "Additional Headers (JSON)",
+    optional: "optional",
+    additionalHeadersDesc: "Use a JSON object, or a {\"header\",\"value\"} array, when a vendor requires custom request headers.",
+    customHeadersCount: (count: number) => `${count} custom header(s) will be attached`,
+    modelParams: "Model Parameters",
+    reasoningEffort: "Reasoning Effort",
+    reasoningEffortDesc: "Keep this at None for the fastest responses and fewer cloud 524s. Switch to High / XHigh only for complex reasoning tasks.",
+    disableResponseStorage: "Disable Response Storage",
+    disableResponseStorageDesc: "Maps to Codex `disable_response_storage = true` and sends `store: false`.",
+    responsesCodexDesc: "`Responses + gpt-5.4` now mirrors Codex request shape where possible: top-level `instructions`, `store: false` / `reasoning.effort`, and server defaults for sampling.",
+    temperatureDesc: "Controls randomness. Lower values are more deterministic; higher values are more varied.",
+    topPDesc: "Nucleus sampling threshold. It works together with Temperature to influence generation quality.",
+    tempPrecise: "0 (Precise)",
+    tempCreative: "2 (Creative)",
+    topPNarrow: "0 (Narrow)",
+    topPWide: "1 (Wide)",
+    cloudStartTitle: "Add a cloud server from scratch",
+    cloudStartDesc: "No cloud API configuration exists yet. Add a server, then fill in name, protocol, endpoint, and API key.",
+    cloudTip: "Prefer entering protocol, endpoint, API key, extra headers, and model name here directly, without relying on external config files. Refresh tries to discover available models for the selected server.",
+    cloudSaveRequired: "Fill Server Name and API Endpoint first",
+    cloudSaved: "Server configuration saved",
+    cloudSelectServerFirst: "Create or select a server first",
+    cloudEndpointRequired: "Fill API Endpoint first",
+    cloudModelsPulled: (count: number, model: string) => `Fetched ${count} model(s); selected ${model}`,
+    cloudNoModels: "No available models found. Check endpoint, protocol, and API key.",
+    cloudConnectionFailed: (message: string) => `Connection failed: ${message}`,
+    cloudModelRequired: "Select or enter a model name first",
+    cloudAutoSwitch: (format: string) => `, automatically switched to ${format}`,
+    cloudConnected: (model: string, switched: string) => `Connected to ${model}${switched}`,
+    cloudBasicSuccessWithReply: (model: string, reply: string, switched: string) => `Basic connection succeeded; ${model} replied: ${reply}${switched}.`,
+    cloudBasicSuccess: (model: string, switched: string) => `Basic connection succeeded; ${model} returned a valid response${switched}.`,
+    cloudAdvancedSuccess: "Advanced parameters passed too: store/reasoning are compatible with the current configuration.",
+    cloudAdvancedWarning: (message: string) => `The basic connection works, but store/reasoning advanced parameters failed: ${message}. Real tasks will still use the current configuration; if this is flaky, lower Reasoning Effort or set it to None.`,
+    cloudProtocolHint: " This cloud service appears not to support Anthropic /v1/messages. Switch to OpenAI Compatible and try again.",
+    cloudRetryHint: " This is usually a temporary cloud-gateway or upstream-model issue. MAIN already retried automatically; trying again later often fixes it.",
+    cloudTestFailed: (message: string, protocolHint: string, retryHint: string) => `Test failed: ${message}${protocolHint}${retryHint}`,
+  },
+} as const;
+
 // ── MCP Server Management Panel ──────────────────────────────────────────
+
+function formatMcpTemplate(template: string | undefined, values: Record<string, string | number>) {
+  if (!template) return "";
+  return template.replace(/\{(\w+)\}/g, (_match, key) => String(values[key] ?? `{${key}}`));
+}
 
 function McpServerPanel({
   mcpServers,
   setMcpServers,
   mcpDiscoveredTools,
   setMcpDiscoveredTools,
+  language,
+  t,
 }: {
   mcpServers: MCPServer[];
   setMcpServers: (servers: MCPServer[]) => void;
   mcpDiscoveredTools: MCPTool[];
   setMcpDiscoveredTools: (tools: MCPTool[], toolServerMap: Record<string, string>) => void;
+  language: "zh" | "en";
+  t: any;
 }) {
+  const copy = {
+    ...SETTINGS_COPY[language],
+    mcpServerTitle: t.mcpServers || SETTINGS_COPY[language].mcpServerTitle,
+    mcpScanTools: t.mcpScanTools || SETTINGS_COPY[language].mcpScanTools,
+    mcpScanning: t.mcpScanning || SETTINGS_COPY[language].mcpScanning,
+    mcpDescription: t.mcpDescription || SETTINGS_COPY[language].mcpDescription,
+    mcpNoServersConfigured: t.mcpNoServersConfigured || SETTINGS_COPY[language].mcpNoServersConfigured,
+    mcpNoServersHint: t.mcpNoServersHint || SETTINGS_COPY[language].mcpNoServersHint,
+    remove: t.mcpRemoveServer || SETTINGS_COPY[language].remove,
+    addServer: t.mcpAddServer || SETTINGS_COPY[language].addServer,
+    serverNamePlaceholder: t.mcpServerNamePlaceholder || SETTINGS_COPY[language].serverNamePlaceholder,
+    add: t.mcpAdd || SETTINGS_COPY[language].add,
+    discoveredTools: t.mcpDiscoveredTools || SETTINGS_COPY[language].discoveredTools,
+    mcpDiscovered: (toolCount: number, serverCount: number) =>
+      t.mcpDiscoveredMessage
+        ? formatMcpTemplate(t.mcpDiscoveredMessage, { toolCount, serverCount })
+        : SETTINGS_COPY[language].mcpDiscovered(toolCount, serverCount),
+    mcpNoServers: t.mcpNoServers || SETTINGS_COPY[language].mcpNoServers,
+    mcpNoTools: t.mcpNoTools || SETTINGS_COPY[language].mcpNoTools,
+    mcpDiscoveryFailed: (message: string) =>
+      t.mcpDiscoveryFailedMessage
+        ? formatMcpTemplate(t.mcpDiscoveryFailedMessage, { message })
+        : SETTINGS_COPY[language].mcpDiscoveryFailed(message),
+    mcpTip: t.mcpTip || SETTINGS_COPY[language].mcpTip,
+  };
   const [isDiscovering, setIsDiscovering] = useState(false);
-  const [discoverMsg, setDiscoverMsg] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
+  const [discoverMsg, setDiscoverMsg] = useState<(
+    | { kind: "discovered"; type: "success"; toolCount: number; serverCount: number }
+    | { kind: "noServers" | "noTools"; type: "error" }
+    | { kind: "failed"; type: "error"; message: string }
+  ) | null>(null);
   // Form state for adding a new server
   const [newName, setNewName] = useState("");
   const [newUrl, setNewUrl] = useState("http://localhost:8000/mcp");
+  const tipSeparator = language === "zh" ? "：" : ": ";
+  const tipEnd = language === "zh" ? "。" : ".";
+
+  const getDiscoverMsgText = () => {
+    if (!discoverMsg) return "";
+    if (discoverMsg.kind === "discovered") return copy.mcpDiscovered(discoverMsg.toolCount, discoverMsg.serverCount);
+    if (discoverMsg.kind === "noServers") return copy.mcpNoServers;
+    if (discoverMsg.kind === "noTools") return copy.mcpNoTools;
+    return copy.mcpDiscoveryFailed(discoverMsg.message);
+  };
 
   // Auto-clear discovery message after 5 seconds
   useEffect(() => {
@@ -90,14 +437,14 @@ function McpServerPanel({
       setMcpDiscoveredTools(tools, toolServerMap);
       setMcpToolServerMap(toolServerMap);
       if (tools.length > 0) {
-        setDiscoverMsg({ text: `已发现 ${tools.length} 个工具（来自 ${mcpServers.length} 个服务器）`, type: 'success' });
+        setDiscoverMsg({ kind: "discovered", type: "success", toolCount: tools.length, serverCount: mcpServers.length });
       } else if (mcpServers.length === 0) {
-        setDiscoverMsg({ text: '尚未配置 MCP 服务器', type: 'error' });
+        setDiscoverMsg({ kind: "noServers", type: "error" });
       } else {
-        setDiscoverMsg({ text: '未发现任何工具，请检查服务器是否在线', type: 'error' });
+        setDiscoverMsg({ kind: "noTools", type: "error" });
       }
     } catch (err) {
-      setDiscoverMsg({ text: '发现失败: ' + (err instanceof Error ? err.message : String(err)), type: 'error' });
+      setDiscoverMsg({ kind: "failed", type: "error", message: err instanceof Error ? err.message : String(err) });
     } finally {
       setIsDiscovering(false);
     }
@@ -121,26 +468,26 @@ function McpServerPanel({
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
-        <h3 className="text-[13px] font-bold text-[#a1a1aa] uppercase tracking-wider">MCP 服务器</h3>
+        <h3 className="text-[13px] font-bold text-[#a1a1aa] uppercase tracking-wider">{copy.mcpServerTitle}</h3>
         <button
           onClick={handleDiscover}
           disabled={isDiscovering}
           className="px-3 py-1.5 text-[12px] font-bold bg-[#18181b] text-[#a1a1aa] hover:text-white border border-[#27272a] rounded-md transition-colors shrink-0 disabled:opacity-50"
         >
-          {isDiscovering ? '扫描中...' : '扫描工具'}
+          {isDiscovering ? copy.mcpScanning : copy.mcpScanTools}
         </button>
       </div>
 
       <p className="text-[11.5px] text-[#71717a] leading-relaxed">
-        配置 MCP (Model Context Protocol) 服务器，使 AI 能够操控外部引擎（如 Unity）。支持 HTTP 传输协议。
+        {copy.mcpDescription}
       </p>
 
       {/* ── Server list ────────────────────────────────────── */}
       <div className="space-y-2">
         {mcpServers.length === 0 ? (
           <div className="bg-[#000000] border border-[#27272a] border-dashed rounded-lg p-6 text-center">
-            <p className="text-[12px] text-[#71717a]">暂无 MCP 服务器配置</p>
-            <p className="text-[11px] text-[#3f3f46] mt-1">点击下方「添加服务器」连接外部引擎</p>
+            <p className="text-[12px] text-[#71717a]">{copy.mcpNoServersConfigured}</p>
+            <p className="text-[11px] text-[#3f3f46] mt-1">{copy.mcpNoServersHint}</p>
           </div>
         ) : (
           mcpServers.map((server) => (
@@ -159,7 +506,7 @@ function McpServerPanel({
               <button
                 onClick={() => handleRemoveServer(server.name)}
                 className="text-[#71717a] hover:text-[#f87171] transition-colors ml-3 opacity-0 group-hover:opacity-100 shrink-0"
-                title="移除"
+                title={copy.remove}
               >
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
               </button>
@@ -170,13 +517,13 @@ function McpServerPanel({
 
       {/* ── Add server form ────────────────────────────────── */}
       <div className="bg-[#000000] border border-[#27272a] rounded-lg p-4 space-y-3">
-        <p className="text-[12px] font-bold text-[#a1a1aa]">添加服务器</p>
+        <p className="text-[12px] font-bold text-[#a1a1aa]">{copy.addServer}</p>
         <div className="flex gap-2">
           <input
             type="text"
             value={newName}
             onChange={(e) => setNewName(e.target.value)}
-            placeholder="名称 (如 unityMCP)"
+            placeholder={copy.serverNamePlaceholder}
             className="w-32 bg-[#09090b] border border-[#27272a] rounded-md p-2 text-[13px] text-white focus:outline-none theme-ring font-mono placeholder:text-[#3f3f46]"
           />
           <input
@@ -191,7 +538,7 @@ function McpServerPanel({
             disabled={!newName.trim() || !newUrl.trim()}
             className="px-3 py-2 text-[12px] font-bold theme-bg theme-bg-hover text-white rounded-md transition-colors shrink-0 disabled:opacity-30 disabled:cursor-not-allowed"
           >
-            添加
+            {copy.add}
           </button>
         </div>
       </div>
@@ -199,14 +546,14 @@ function McpServerPanel({
       {/* ── Discovery result ───────────────────────────────── */}
       {discoverMsg && (
         <p className={`text-[12px] ${discoverMsg.type === 'error' ? 'text-[#f48771]' : 'text-[#86d9a3]'}`}>
-          {discoverMsg.text}
+          {getDiscoverMsgText()}
         </p>
       )}
 
       {/* ── Discovered tools ───────────────────────────────── */}
       {mcpDiscoveredTools.length > 0 && (
         <div className="space-y-2">
-          <p className="text-[12px] font-bold text-[#a1a1aa] uppercase tracking-wider">已发现的工具 ({mcpDiscoveredTools.length})</p>
+          <p className="text-[12px] font-bold text-[#a1a1aa] uppercase tracking-wider">{copy.discoveredTools} ({mcpDiscoveredTools.length})</p>
           <div className="bg-[#000000] border border-[#27272a] rounded-lg divide-y divide-[#18181b] max-h-[200px] overflow-y-auto">
             {mcpDiscoveredTools.map((tool) => (
               <div key={tool.name} className="px-4 py-2.5">
@@ -225,7 +572,7 @@ function McpServerPanel({
       {/* ── Tip ────────────────────────────────────────────── */}
       <div className="p-3 bg-[#000000] border border-[#27272a] rounded-md">
         <p className="text-[11px] text-[#71717a] leading-relaxed">
-          💡 <span className="text-[#a1a1aa]">提示</span>：MCP 服务器需先启动并监听指定端口，然后点击「扫描工具」发现可用工具。发现后的工具会在对话中自动供 AI 调用。Unity MCP 服务器默认地址为 <span className="font-mono text-[#a1a1aa]">http://localhost:8080/mcp</span>。
+          <span className="text-[#a1a1aa]">{copy.tipLabel}</span>{tipSeparator}{copy.mcpTip} <span className="font-mono text-[#a1a1aa]">http://localhost:8080/mcp</span>{tipEnd}
         </p>
       </div>
     </div>
@@ -234,7 +581,8 @@ function McpServerPanel({
 
 // ── Data Management Panel ────────────────────────────────────────────
 
-function DataManagerPanel({ t }: { t: any }) {
+function DataManagerPanel({ t, language }: { t: any; language: "zh" | "en" }) {
+  const copy = SETTINGS_COPY[language];
   const clearChatHistory = useAppStore((s) => s.clearChatHistory);
   const resetAllSettings = useAppStore((s) => s.resetAllSettings);
   const [confirmClear, setConfirmClear] = useState(false);
@@ -245,7 +593,7 @@ function DataManagerPanel({ t }: { t: any }) {
       <h3 className="text-[13px] font-bold text-[#a1a1aa] uppercase tracking-wider">{t.dataManagement}</h3>
 
       <p className="text-[11.5px] text-[#71717a] leading-relaxed">
-        管理本地数据。设置与会话索引保存在 localStorage，完整会话记录保存在 MAIN 应用数据目录，不写入项目的 .MAIN 目录。
+        {copy.dataPanelDesc}
       </p>
 
       {/* Clear Chat History */}
@@ -275,13 +623,13 @@ function DataManagerPanel({ t }: { t: any }) {
               }}
               className="px-4 py-2 text-[12px] font-bold bg-[#7f1d1d] text-white border border-[#991b1b] rounded-md hover:bg-[#991b1b] transition-colors"
             >
-              确认清空
+              {copy.confirmClear}
             </button>
             <button
               onClick={() => setConfirmClear(false)}
               className="px-4 py-2 text-[12px] font-bold bg-[#18181b] text-[#a1a1aa] border border-[#27272a] rounded-md hover:text-white transition-colors"
             >
-              取消
+              {copy.cancel}
             </button>
           </div>
         )}
@@ -313,13 +661,13 @@ function DataManagerPanel({ t }: { t: any }) {
               }}
               className="px-4 py-2 text-[12px] font-bold bg-[#7f1d1d] text-white border border-[#991b1b] rounded-md hover:bg-[#991b1b] transition-colors"
             >
-              确认重置
+              {copy.confirmReset}
             </button>
             <button
               onClick={() => setConfirmReset(false)}
               className="px-4 py-2 text-[12px] font-bold bg-[#18181b] text-[#a1a1aa] border border-[#27272a] rounded-md hover:text-white transition-colors"
             >
-              取消
+              {copy.cancel}
             </button>
           </div>
         )}
@@ -328,14 +676,15 @@ function DataManagerPanel({ t }: { t: any }) {
       {/* Tip */}
       <div className="p-3 bg-[#000000] border border-[#27272a] rounded-md">
         <p className="text-[11px] text-[#71717a] leading-relaxed">
-          💡 <span className="text-[#a1a1aa]">提示</span>：所有数据保存在浏览器本地存储中。重置设置不会删除已解压到 .protocols/ 目录的协议包文件，如需彻底清理请手动删除该目录。
+          <span className="text-[#a1a1aa]">{copy.tipLabel}</span>：{copy.dataTip}
         </p>
       </div>
     </div>
   );
 }
 
-function DebugLogPanel({ t }: { t: any }) {
+function DebugLogPanel({ t, language }: { t: any; language: "zh" | "en" }) {
+  const copy = SETTINGS_COPY[language];
   const [snapshot, setSnapshot] = useState({ path: "", content: "", truncated: false });
   const [status, setStatus] = useState("");
 
@@ -351,8 +700,8 @@ function DebugLogPanel({ t }: { t: any }) {
   const logText = snapshot.content || "";
 
   const handleCopy = async () => {
-    await copyDebugLogToClipboard(logText || "暂无调试日志");
-    setStatus("已复制调试日志");
+    await copyDebugLogToClipboard(logText || copy.noDebugLog);
+    setStatus(copy.copiedDebugLog);
     window.setTimeout(() => setStatus(""), 1800);
   };
 
@@ -362,15 +711,15 @@ function DebugLogPanel({ t }: { t: any }) {
       filters: [{ name: "Log", extensions: ["log", "txt"] }],
     });
     if (!filePath) return;
-    await exportTextFile(filePath, logText || "暂无调试日志");
-    setStatus("调试日志已导出");
+    await exportTextFile(filePath, logText || copy.noDebugLog);
+    setStatus(copy.exportedDebugLog);
     window.setTimeout(() => setStatus(""), 1800);
   };
 
   const handleClear = async () => {
     await clearDebugLog();
     await refresh();
-    setStatus("调试日志已清空");
+    setStatus(copy.clearedDebugLog);
     window.setTimeout(() => setStatus(""), 1800);
   };
 
@@ -380,39 +729,39 @@ function DebugLogPanel({ t }: { t: any }) {
         <div>
           <h3 className="text-[13px] font-bold text-[#a1a1aa] uppercase tracking-wider">{t.debugLog}</h3>
           <p className="mt-1 text-[11.5px] text-[#71717a] leading-relaxed">
-            记录前端 console、界面崩溃、Rust 代理请求和流式读取错误。日志会自动隐藏常见密钥字段。
+            {copy.debugDesc}
           </p>
         </div>
         <button
           onClick={refresh}
           className="shrink-0 rounded-md border border-[#27272a] bg-[#18181b] px-3 py-1.5 text-[12px] font-bold text-[#a1a1aa] transition-colors hover:text-white"
         >
-          刷新
+          {copy.refresh}
         </button>
       </div>
 
       <div className="rounded-lg border border-[#27272a] bg-[#000000] p-3">
-        <div className="mb-2 text-[11px] font-bold text-[#a1a1aa]">日志文件</div>
+        <div className="mb-2 text-[11px] font-bold text-[#a1a1aa]">{copy.debugFile}</div>
         <div className="break-all font-mono text-[11px] text-[#71717a]">{snapshot.path || "localStorage:main.debugLog.v1"}</div>
       </div>
 
       <div className="flex flex-wrap items-center gap-2">
         <button onClick={handleCopy} className="rounded-md border border-[#27272a] bg-[#18181b] px-3 py-2 text-[12px] font-bold text-[#e4e4e7] transition-colors hover:border-[#3f3f46]">
-          复制日志
+          {copy.copyLog}
         </button>
         <button onClick={handleExport} className="rounded-md border border-[#27272a] bg-[#18181b] px-3 py-2 text-[12px] font-bold text-[#e4e4e7] transition-colors hover:border-[#3f3f46]">
-          导出日志
+          {copy.exportLog}
         </button>
         <button onClick={handleClear} className="rounded-md border border-[#3f1f1f] bg-[#181111] px-3 py-2 text-[12px] font-bold text-[#fca5a5] transition-colors hover:border-[#7f1d1d]">
-          清空日志
+          {copy.clearLog}
         </button>
         {status && <span className="text-[12px] text-[#86d9a3]">{status}</span>}
-        {snapshot.truncated && <span className="text-[12px] text-[#fbbf24]">当前只显示日志尾部</span>}
+        {snapshot.truncated && <span className="text-[12px] text-[#fbbf24]">{copy.logTailOnly}</span>}
       </div>
 
       <textarea
         readOnly
-        value={logText || "暂无调试日志"}
+        value={logText || copy.noDebugLog}
         className="h-[320px] w-full resize-none rounded-lg border border-[#27272a] bg-[#000000] p-3 font-mono text-[11px] leading-5 text-[#a1a1aa] outline-none"
       />
     </div>
@@ -900,6 +1249,12 @@ export default function SettingsModal({
   const [systemMemory, setSystemMemory] = useState<{ total_gb: number; available_gb: number; total_bytes?: number; available_bytes?: number } | null>(null);
   const hasAutoFetched = useRef(false);
   const cloudDraftServerRef = useRef<any | null>(null);
+  const language = config.language === "en" ? "en" : "zh";
+  const copy = {
+    ...SETTINGS_COPY[language],
+    mcpServerTitle: t.mcpServers || SETTINGS_COPY[language].mcpServerTitle,
+    mcpScanning: t.mcpScanning || SETTINGS_COPY[language].mcpScanning,
+  };
 
   // Auto-clear cloud fetch message after 5 seconds
   useEffect(() => {
@@ -1005,7 +1360,7 @@ export default function SettingsModal({
           if (!models.includes(config.local.model)) {
             setConfig(prev => ({ ...prev, local: { ...prev.local, model: models[0] } }));
           }
-          setLocalFetchMsg({ text: `已发现 ${models.length} 个模型`, type: 'success' });
+          setLocalFetchMsg({ text: copy.discoveredModels(models.length), type: 'success' });
           setIsFetchingModels(false);
           return;
         }
@@ -1015,9 +1370,9 @@ export default function SettingsModal({
     }
 
     setAvailableModels([]);
-    setLocalFetchMsg({ text: '无法获取模型列表，请检查服务地址和网络连接', type: 'error' });
+    setLocalFetchMsg({ text: copy.localFetchError, type: 'error' });
     setIsFetchingModels(false);
-  }, [config]);
+  }, [config, copy]);
 
   // Auto-fetch models when local tab opens
   useEffect(() => {
@@ -1073,15 +1428,15 @@ export default function SettingsModal({
   const cloudEndpointPlaceholder = cloudProtocol === "anthropic"
     ? "https://api.anthropic.com"
     : cloudApiFormat === "responses"
-      ? "https://api.openai.com/v1 或完整 /v1/responses 地址"
-      : "https://api.openai.com/v1 或完整 /v1/chat/completions 地址";
+      ? copy.responsesEndpointPlaceholder
+      : copy.chatEndpointPlaceholder;
   const cloudApiKeyPlaceholder = cloudProtocol === "anthropic" ? "sk-ant-..." : "sk-...";
   const cloudModelPlaceholder = cloudProtocol === "anthropic" ? "claude-sonnet-4-5" : "gpt-4.1 / qwen-max / openrouter-model";
   const cloudEndpointHint = cloudProtocol === "anthropic"
-    ? "Anthropic 协议通常填写根地址，例如 https://api.anthropic.com"
+    ? copy.anthropicEndpointHint
     : cloudApiFormat === "responses"
-      ? "Responses API 可填写 API 根地址（如 https://api.openai.com/v1），也支持直接粘贴完整的 /responses 请求地址"
-      : "OpenAI Chat Completions 通常填写 API 根地址（常见以 /v1 结尾），也支持直接粘贴完整的 /chat/completions 地址";
+      ? copy.responsesEndpointHint
+      : copy.chatEndpointHint;
   const cloudConnectionFingerprint = useMemo(() => buildCloudConnectionFingerprint(draftCloudConfig), [
     draftCloudConfig.apiFormat,
     draftCloudConfig.apiKey,
@@ -1266,15 +1621,15 @@ export default function SettingsModal({
     const name = String(cloudDraftServer.name || "").trim();
     const endpoint = String(cloudDraftServer.endpoint || "").trim();
     if (!name || !endpoint) {
-      setCloudSaveMsg({ text: "请先填写 Server Name 和 API Endpoint", type: "error" });
+      setCloudSaveMsg({ text: copy.cloudSaveRequired, type: "error" });
       return;
     }
     persistCloudServer({ ...cloudDraftServer, name, endpoint });
     setCloudFetchMsg(null);
     setCloudProbeMsg(null);
     setCloudConnectionStatus(null);
-    setCloudSaveMsg({ text: "已保存服务器配置", type: "success" });
-  }, [cloudDraftServer, persistCloudServer]);
+    setCloudSaveMsg({ text: copy.cloudSaved, type: "success" });
+  }, [cloudDraftServer, copy, persistCloudServer]);
 
   const removeCloudServer = useCallback((serverId) => {
     if (cloudDraftMode === "new" && cloudDraftServer?.id === serverId) {
@@ -1351,7 +1706,7 @@ export default function SettingsModal({
     if (isFetchingCloudModels) return;
     const targetServer = serverOverride || cloudDraftServer;
     if (!targetServer) {
-      setCloudFetchMsg({ text: "请先新建或选择一个服务器", type: "error" });
+      setCloudFetchMsg({ text: copy.cloudSelectServerFirst, type: "error" });
       return;
     }
     const targetServerId = targetServer.id;
@@ -1362,7 +1717,7 @@ export default function SettingsModal({
     try {
       const endpoint = targetServer.endpoint?.trim();
       if (!endpoint) {
-        setCloudFetchMsg({ text: "请先填写 API Endpoint", type: "error" });
+        setCloudFetchMsg({ text: copy.cloudEndpointRequired, type: "error" });
         return;
       }
 
@@ -1393,7 +1748,7 @@ export default function SettingsModal({
           setCloudModelsByServer((prev) => ({ ...prev, [targetServerId]: models }));
           setCloudModelInputMode("select");
           confirmCloudModelSelection(selectedModel, targetServer);
-          setCloudFetchMsg({ text: `已拉取 ${models.length} 个模型，当前选择 ${selectedModel}`, type: "success" });
+          setCloudFetchMsg({ text: copy.cloudModelsPulled(models.length, selectedModel), type: "success" });
           return;
         } catch {
           // Try next candidate URL
@@ -1401,14 +1756,14 @@ export default function SettingsModal({
       }
 
       setCloudModelsByServer((prev) => ({ ...prev, [targetServerId]: [] }));
-      setCloudFetchMsg({ text: "未发现可用模型，请检查 Endpoint、协议和 API Key", type: "error" });
+      setCloudFetchMsg({ text: copy.cloudNoModels, type: "error" });
     } catch (err) {
       setCloudModelsByServer((prev) => ({ ...prev, [targetServerId]: [] }));
-      setCloudFetchMsg({ text: "连接失败: " + (err instanceof Error ? err.message : String(err)), type: "error" });
+      setCloudFetchMsg({ text: copy.cloudConnectionFailed(err instanceof Error ? err.message : String(err)), type: "error" });
     } finally {
       setIsFetchingCloudModels(false);
     }
-  }, [cloudDraftServer, confirmCloudModelSelection, isFetchingCloudModels]);
+  }, [cloudDraftServer, confirmCloudModelSelection, copy, isFetchingCloudModels]);
 
   const testCloudConnection = useCallback(async () => {
     if (isTestingCloudConnection) return;
@@ -1423,11 +1778,11 @@ export default function SettingsModal({
       protocol: cloudProtocol,
     } : null;
     if (!endpoint) {
-      setCloudProbeMsg({ text: "请先填写 API Endpoint", type: "error" });
+      setCloudProbeMsg({ text: copy.cloudEndpointRequired, type: "error" });
       return;
     }
     if (!testModel) {
-      setCloudProbeMsg({ text: "请先选择或填写一个模型名称", type: "error" });
+      setCloudProbeMsg({ text: copy.cloudModelRequired, type: "error" });
       return;
     }
 
@@ -1440,7 +1795,7 @@ export default function SettingsModal({
       let effectiveApiFormat = cloudApiFormat;
       let payload: unknown = null;
       let successfulResponsesMode: string | null = null;
-      const probeMessages = [{ role: "user", content: "你好，请只回复 ok" }];
+      const probeMessages = [{ role: "user", content: language === "en" ? "Hello, please reply with only ok" : "你好，请只回复 ok" }];
 
       const sendJsonProbe = async (url: string, body: Record<string, unknown>, stage: "base" | "advanced", mode?: string | null) => {
         let lastError: Error | null = null;
@@ -1588,7 +1943,7 @@ export default function SettingsModal({
         ? extractAnthropicResponseText(payload).trim()
         : extractOpenAiResponseText(payload, effectiveApiFormat).trim();
       const switchedText = cloudProtocol === "openai" && effectiveApiFormat !== cloudApiFormat
-        ? `，已自动切换到 ${effectiveApiFormat === "responses" ? "Responses API" : "Chat Completions"}`
+        ? copy.cloudAutoSwitch(effectiveApiFormat === "responses" ? "Responses API" : "Chat Completions")
         : "";
       const statusFingerprint = buildCloudConnectionFingerprint({
         ...(targetServer || draftCloudConfig),
@@ -1599,13 +1954,13 @@ export default function SettingsModal({
       setCloudConnectionStatus({
         fingerprint: statusFingerprint,
         model: testModel,
-        text: `已连通 ${testModel}${switchedText}`,
+        text: copy.cloudConnected(testModel, switchedText),
       });
 
       setCloudProbeMsg({
         text: reply
-          ? `基础连通成功，${testModel} 返回：${reply.slice(0, 120)}${switchedText}。`
-          : `基础连通成功，${testModel} 已返回有效响应${switchedText}。`,
+          ? copy.cloudBasicSuccessWithReply(testModel, reply.slice(0, 120), switchedText)
+          : copy.cloudBasicSuccess(testModel, switchedText),
         type: "success",
       });
 
@@ -1623,7 +1978,7 @@ export default function SettingsModal({
             ...targetServer,
             apiFormat: effectiveApiFormat,
           })) {
-            setCloudProbeMsg({ text: `高级参数也已通过：store/reasoning 与当前配置兼容。`, type: "success" });
+            setCloudProbeMsg({ text: copy.cloudAdvancedSuccess, type: "success" });
           }
         } catch (advancedErr) {
           if (!cloudDraftServer || isSameCloudConnectionTarget(cloudDraftServerRef.current, {
@@ -1632,7 +1987,7 @@ export default function SettingsModal({
           })) {
             const errMsg = advancedErr instanceof Error ? advancedErr.message : String(advancedErr);
             setCloudProbeMsg({
-              text: `基础连接可用，但 store/reasoning 高级参数未通过：${errMsg}。真实任务仍会按当前配置发送；如频繁波动，可把 Reasoning Effort 调低或设为 None。`,
+              text: copy.cloudAdvancedWarning(errMsg),
               type: "warning",
             });
           }
@@ -1641,12 +1996,12 @@ export default function SettingsModal({
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       const protocolHint = cloudProtocol === "anthropic" && errMsg.includes("/v1/messages")
-        ? " 当前这个云端服务看起来不支持 Anthropic /v1/messages，请切换到 OpenAI Compatible 再试。"
+        ? copy.cloudProtocolHint
         : "";
       const retryHint = isRetryableCloudErrorMessage(errMsg)
-        ? " 这通常是云端网关到上游模型的临时波动，应用已经自动重试过；稍后再试一次通常会恢复。"
+        ? copy.cloudRetryHint
         : "";
-      setCloudProbeMsg({ text: "测试失败: " + errMsg + protocolHint + retryHint, type: "error" });
+      setCloudProbeMsg({ text: copy.cloudTestFailed(errMsg, protocolHint, retryHint), type: "error" });
     } finally {
       setIsTestingCloudConnection(false);
     }
@@ -1656,6 +2011,7 @@ export default function SettingsModal({
     cloudDraftServer,
     cloudProtocol,
     confirmCloudModelSelection,
+    copy,
     draftCloudConfig.apiKey,
     draftCloudConfig.customHeaders,
     draftCloudConfig.disableResponseStorage,
@@ -1665,6 +2021,7 @@ export default function SettingsModal({
     draftCloudConfig.temperature,
     draftCloudConfig.topP,
     isTestingCloudConnection,
+    language,
     updateCloudDraftServer,
   ]);
 
@@ -1689,12 +2046,12 @@ export default function SettingsModal({
   const maxTokensAtMax = contextMax;
   const tokenReduction = Math.max(0, Math.round((1 - displayedContextLimit / maxTokensAtMax) * 100));
   const maxVramInfo = getVramEstimate(contextMax);
-  const compressionLabel = contextRatio < 0.3 ? "省显存" : contextRatio < 0.7 ? "均衡" : "长上下文";
+  const compressionLabel = contextRatio < 0.3 ? copy.compressionLow : contextRatio < 0.7 ? copy.compressionBalanced : copy.compressionLong;
   const compressionHint = contextRatio < 0.3
-    ? "更早压缩，适合显存紧张"
+    ? copy.compressionLowHint
     : contextRatio < 0.7
-      ? "上下文与显存占用折中"
-      : "更晚压缩，保留更多历史";
+      ? copy.compressionBalancedHint
+      : copy.compressionLongHint;
   const vramGb = vramInfo.value / 1024;
   const vramRatio = safeKvCacheGb ? Math.min(vramGb / safeKvCacheGb, 1) : Math.min(vramGb / 32, 1);
 
@@ -1739,9 +2096,9 @@ export default function SettingsModal({
 
       {/* Zone labels */}
       <div className="flex justify-between text-[10px] font-bold uppercase tracking-wider mb-4">
-        <span style={{ color: contextRatio < 0.3 ? '#60a5fa' : '#3f3f46' }}>省显存 / 更早压缩</span>
-        <span style={{ color: contextRatio >= 0.3 && contextRatio < 0.7 ? '#a78bfa' : '#3f3f46' }}>均衡</span>
-        <span style={{ color: contextRatio >= 0.7 ? '#f97316' : '#3f3f46' }}>长上下文 / 更晚压缩</span>
+        <span style={{ color: contextRatio < 0.3 ? '#60a5fa' : '#3f3f46' }}>{copy.zoneLow}</span>
+        <span style={{ color: contextRatio >= 0.3 && contextRatio < 0.7 ? '#a78bfa' : '#3f3f46' }}>{copy.zoneBalanced}</span>
+        <span style={{ color: contextRatio >= 0.7 ? '#f97316' : '#3f3f46' }}>{copy.zoneLong}</span>
       </div>
 
       {/* Stats panel */}
@@ -1749,7 +2106,7 @@ export default function SettingsModal({
         <div className="flex items-center justify-between gap-4">
           {/* Left: Max Tokens */}
           <div className="flex-1">
-            <p className="text-[10px] text-[#71717a] uppercase tracking-wider mb-1">压缩触发阈值 (Token)</p>
+            <p className="text-[10px] text-[#71717a] uppercase tracking-wider mb-1">{copy.contextTriggerThreshold}</p>
             <div className="flex items-center gap-2">
               <span className="font-mono text-[16px] font-bold text-[#86d9a3]">
                 ~ {displayedContextLimit.toLocaleString()}
@@ -1767,7 +2124,7 @@ export default function SettingsModal({
 
           {/* Right: Est. VRAM */}
           <div className="flex-1">
-            <p className="text-[10px] text-[#71717a] uppercase tracking-wider mb-1">预估上下文显存</p>
+            <p className="text-[10px] text-[#71717a] uppercase tracking-wider mb-1">{copy.estimatedContextVram}</p>
             <div className="flex items-center gap-2.5">
               <span className="font-mono text-[16px] font-bold" style={{ color: pressure.main }}>
                 {vramInfo.text}
@@ -1783,7 +2140,7 @@ export default function SettingsModal({
               </div>
             </div>
             <p className="mt-1 text-[10px] text-[#71717a]">
-              当前上限约 {contextMax.toLocaleString()} Token
+              {copy.currentLimit(contextMax.toLocaleString())}
             </p>
           </div>
         </div>
@@ -1794,9 +2151,9 @@ export default function SettingsModal({
             <span className="text-[10px] text-[#3f3f46]">🖥</span>
             <div className="flex-1">
               <div className="flex items-center justify-between mb-1">
-                <span className="text-[10px] text-[#71717a]">设备内存</span>
+                <span className="text-[10px] text-[#71717a]">{copy.deviceMemory}</span>
                 <span className="text-[10px] font-mono text-[#a1a1aa]">
-                  {systemMemory.available_gb} / {systemMemory.total_gb} GB 可用
+                  {systemMemory.available_gb} / {systemMemory.total_gb} GB {copy.available}
                 </span>
               </div>
               <div className="h-1.5 bg-[#18181b] rounded-full overflow-hidden border border-[#27272a]">
@@ -1809,7 +2166,7 @@ export default function SettingsModal({
                 />
             </div>
             <p className="mt-1 text-[10px] text-[#71717a]">
-              满格约 {maxVramInfo.text}{safeKvCacheGb ? "，已按当前可用内存预留安全余量" : ""}
+              {copy.maxBar(maxVramInfo.text, !!safeKvCacheGb)}
             </p>
           </div>
         </div>
@@ -1821,7 +2178,7 @@ export default function SettingsModal({
       {/* Tip */}
       <div className="p-3 bg-[#000000] border border-[#27272a] rounded-md">
         <p className="text-[11px] text-[#71717a] leading-relaxed">
-          💡 <span className="text-[#a1a1aa]">提示</span>：此设置用于本地模型的背景压缩与上下文窗口。满格会参考当前可用内存动态计算，并预留约 1GB / 10% 安全余量。
+          <span className="text-[#a1a1aa]">{copy.tipLabel}</span>：{copy.contextTip}
         </p>
       </div>
     </div>
@@ -1844,7 +2201,7 @@ export default function SettingsModal({
             <button onClick={() => setSettingsTab('local')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'local' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.localSetup}</button>
             <button onClick={() => setSettingsTab('cloud')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'cloud' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.cloudSetup}</button>
             <button onClick={() => setSettingsTab('context')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'context' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.contextSetup}</button>
-            <button onClick={() => setSettingsTab('mcp')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'mcp' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>MCP 服务器</button>
+            <button onClick={() => setSettingsTab('mcp')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'mcp' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{copy.mcpServerTitle}</button>
             <button onClick={() => setSettingsTab('im')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'im' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.imAdapters}</button>
             <button onClick={() => setSettingsTab('data')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'data' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.dataManagement}</button>
             <button onClick={() => setSettingsTab('debug')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'debug' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.debugLog}</button>
@@ -1856,7 +2213,7 @@ export default function SettingsModal({
               <div className="space-y-6">
                 <div className="flex items-center justify-between"><h3 className="text-[13px] font-bold text-[#a1a1aa] uppercase tracking-wider">{t.general}</h3></div>
                 <div>
-                  <label className="block text-[13px] font-bold text-[#e4e4e7] mb-2">Display Language</label>
+                  <label className="block text-[13px] font-bold text-[#e4e4e7] mb-2">{copy.displayLanguage}</label>
                   <select value={config.language} onChange={(e) => setConfig({ ...config, language: e.target.value })} className="w-full bg-[#000000] border border-[#27272a] rounded-md p-2.5 text-[14px] text-white focus:outline-none theme-ring transition-all cursor-pointer">
                     <option value="en">English</option><option value="zh">简体中文</option>
                   </select>
@@ -1915,19 +2272,24 @@ export default function SettingsModal({
 
                 {/* CHAT FONT SIZE */}
                 <div className="pt-4 border-t border-[#27272a]">
-                  <div className="flex items-center justify-between mb-1.5">
-                    <label className="text-[13px] font-bold text-[#e4e4e7]">{t.chatFontSize}</label>
-                    <span className="text-[12px] font-mono theme-subtle-bg px-2 py-0.5 rounded border theme-subtle-border">{config.chatFontSize ?? 13} px</span>
-                  </div>
-                  <p className="text-[12px] text-[#a1a1aa] mb-3">{t.chatFontSizeDesc}</p>
-                  <input
-                    type="range" min={10} max={20} step={1}
-                    value={config.chatFontSize ?? 13}
-                    onChange={(e) => setConfig({ ...config, chatFontSize: parseInt(e.target.value) })}
-                    className="w-full theme-slider cursor-pointer"
-                  />
-                  <div className="flex justify-between text-[11px] text-[#3f3f46] font-mono mt-1">
-                    <span>10</span><span>13</span><span>16</span><span>20</span>
+                  <div className="max-w-[520px]">
+                    <div className="flex items-center justify-between mb-1.5">
+                      <label className="text-[13px] font-bold text-[#e4e4e7]">{t.chatFontSize}</label>
+                      <span className="text-[12px] font-mono theme-subtle-bg px-2 py-0.5 rounded border theme-subtle-border">{config.chatFontSize ?? 13} px</span>
+                    </div>
+                    <p className="text-[12px] text-[#a1a1aa] mb-3">{t.chatFontSizeDesc}</p>
+                    <input
+                      type="range" min={10} max={20} step={1}
+                      value={config.chatFontSize ?? 13}
+                      onChange={(e) => setConfig({ ...config, chatFontSize: parseInt(e.target.value) })}
+                      className="w-full theme-slider cursor-pointer"
+                    />
+                    <div className="relative mt-1 h-4 text-[11px] text-[#3f3f46] font-mono">
+                      <span className="absolute left-0">10</span>
+                      <span className="absolute -translate-x-1/2" style={{ left: "30%" }}>13</span>
+                      <span className="absolute -translate-x-1/2" style={{ left: "60%" }}>16</span>
+                      <span className="absolute right-0">20</span>
+                    </div>
                   </div>
                 </div>
 
@@ -1955,11 +2317,11 @@ export default function SettingsModal({
                 <div className="flex items-center justify-between">
                   <h3 className="text-[13px] font-bold text-[#a1a1aa] uppercase tracking-wider">{t.localSetup}</h3>
                   <button onClick={() => setConfig({ ...config, activeProfile: 'local' })} className={`text-[11px] px-2.5 py-1.5 rounded border uppercase font-bold tracking-wider transition-colors ${config.activeProfile === 'local' ? 'theme-subtle-bg theme-subtle-border theme-text' : 'bg-[#18181b] text-[#a1a1aa] border-transparent hover:text-white'}`}>
-                    {config.activeProfile === 'local' ? 'Active Profile' : 'Set as Active'}
+                    {config.activeProfile === 'local' ? copy.activeProfile : copy.setAsActive}
                   </button>
                 </div>
                 <div>
-                  <label className="block text-[13px] font-bold text-[#e4e4e7] mb-2">Provider Engine</label>
+                  <label className="block text-[13px] font-bold text-[#e4e4e7] mb-2">{copy.providerEngine}</label>
                   <select value={config.local.provider} onChange={handleProviderChange} className="w-full bg-[#000000] border border-[#27272a] rounded-md p-2.5 text-[14px] text-white focus:outline-none theme-ring cursor-pointer">
                     <option value="LM Studio">LM Studio</option>
                     <option value="Ollama">Ollama</option>
@@ -1967,24 +2329,24 @@ export default function SettingsModal({
                   </select>
                 </div>
                 <div>
-                  <label className="block text-[13px] font-bold text-[#e4e4e7] mb-2">API Endpoint</label>
+                  <label className="block text-[13px] font-bold text-[#e4e4e7] mb-2">{copy.apiEndpoint}</label>
                   <input type="text" value={config.local.endpoint} onChange={(e) => setConfig({ ...config, local: { ...config.local, endpoint: e.target.value } })} className="w-full bg-[#000000] border border-[#27272a] rounded-md p-2.5 text-[14px] text-white focus:outline-none theme-ring font-mono" />
                 </div>
                 {config.local.provider === "OMLX" && (
                   <div>
-                    <label className="block text-[13px] font-bold text-[#e4e4e7] mb-2">API Key <span className="text-[#71717a] font-normal">(可选，OMLX 服务鉴权用)</span></label>
+                    <label className="block text-[13px] font-bold text-[#e4e4e7] mb-2">{copy.apiKeyOptionalOmlx} <span className="text-[#71717a] font-normal">({copy.optionalOmlxAuth})</span></label>
                     <input
                       type="password"
                       value={config.local.apiKey || ""}
                       onChange={(e) => setConfig({ ...config, local: { ...config.local, apiKey: e.target.value } })}
-                      placeholder="留空则不发送鉴权头"
+                      placeholder={copy.noAuthPlaceholder}
                       className="w-full bg-[#000000] border border-[#27272a] rounded-md p-2.5 text-[14px] text-white focus:outline-none theme-ring font-mono placeholder:text-[#3f3f46]"
                     />
                   </div>
                 )}
                 {/* Auto-detected model selector */}
                 <div>
-                  <label className="block text-[13px] font-bold text-[#e4e4e7] mb-2">Local Model</label>
+                  <label className="block text-[13px] font-bold text-[#e4e4e7] mb-2">{copy.localModel}</label>
                   <div className="flex gap-2">
                     <select
                       value={config.local.model || ""}
@@ -1993,9 +2355,9 @@ export default function SettingsModal({
                       className="flex-1 bg-[#000000] border border-[#27272a] rounded-md p-2.5 text-[14px] text-white focus:outline-none theme-ring transition-colors cursor-pointer"
                     >
                       {isFetchingModels ? (
-                        <option value="">正在扫描模型...</option>
+                        <option value="">{copy.scanningModels}</option>
                       ) : availableModels.length === 0 ? (
-                        <option value="">未发现模型 — 请先启动本地推理服务</option>
+                        <option value="">{copy.noModels}</option>
                       ) : (
                         availableModels.map(m => (<option key={m} value={m}>{m}</option>))
                       )}
@@ -2005,7 +2367,7 @@ export default function SettingsModal({
                       disabled={isFetchingModels}
                       className="px-3 py-2 text-[12px] font-bold bg-[#18181b] text-[#a1a1aa] hover:text-white border border-[#27272a] rounded-md transition-colors shrink-0 disabled:opacity-50"
                     >
-                      {isFetchingModels ? '扫描中...' : '扫描'}
+                      {isFetchingModels ? copy.mcpScanning : copy.scanModels}
                     </button>
                   </div>
                   {localFetchMsg && (
@@ -2026,13 +2388,15 @@ export default function SettingsModal({
               setMcpServers={setMcpServers}
               mcpDiscoveredTools={mcpDiscoveredTools}
               setMcpDiscoveredTools={setMcpDiscoveredTools}
+              language={language}
+              t={t}
             />}
 
             {/* DATA MANAGEMENT */}
-            {settingsTab === 'data' && <DataManagerPanel t={t} />}
+            {settingsTab === 'data' && <DataManagerPanel t={t} language={language} />}
 
             {/* DEBUG LOG */}
-            {settingsTab === 'debug' && <DebugLogPanel t={t} />}
+            {settingsTab === 'debug' && <DebugLogPanel t={t} language={language} />}
 
             {/* IM ADAPTER SETTINGS */}
             {settingsTab === 'im' && <FeishuAdapterPanel config={config} setConfig={setConfig} t={t} />}
@@ -2043,10 +2407,10 @@ export default function SettingsModal({
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div>
                     <h3 className="text-[13px] font-bold text-[#a1a1aa] uppercase tracking-wider">{t.cloudSetup}</h3>
-                    <p className="mt-1 text-[11.5px] text-[#71717a]">管理多个云端服务器配置。新建或编辑后点击保存，模型列表只会在点击刷新时获取。</p>
+                    <p className="mt-1 text-[11.5px] text-[#71717a]">{copy.cloudDesc}</p>
                   </div>
                   <button onClick={() => setConfig({ ...config, activeProfile: 'cloud' })} className={`text-[11px] px-2.5 py-1.5 rounded border uppercase font-bold tracking-wider transition-colors ${config.activeProfile === 'cloud' ? 'theme-subtle-bg theme-subtle-border theme-text' : 'bg-[#18181b] text-[#a1a1aa] border-transparent hover:text-white'}`}>
-                    {config.activeProfile === 'cloud' ? 'Active Profile' : 'Set as Active'}
+                    {config.activeProfile === 'cloud' ? copy.activeProfile : copy.setAsActive}
                   </button>
                 </div>
 
@@ -2055,10 +2419,10 @@ export default function SettingsModal({
                     <>
                       <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
                         <div className="min-w-0">
-                          <label className="block text-[13px] font-bold text-[#e4e4e7]">Model Name</label>
+                          <label className="block text-[13px] font-bold text-[#e4e4e7]">{copy.modelName}</label>
                           <p className="mt-1 text-[11.5px] text-[#71717a]">
-                            当前服务器：<span className="text-[#a1a1aa]">{cloudDraftServer.name || "未命名服务器"}</span>
-                            {cloudDraftMode === "new" && <span className="ml-2 rounded border border-[#3f3f46] px-1.5 py-0.5 text-[9px] font-bold uppercase text-[#a1a1aa]">未保存</span>}
+                            {copy.currentServer}<span className="text-[#a1a1aa]">{cloudDraftServer.name || copy.unnamedServer}</span>
+                            {cloudDraftMode === "new" && <span className="ml-2 rounded border border-[#3f3f46] px-1.5 py-0.5 text-[9px] font-bold uppercase text-[#a1a1aa]">{copy.unsaved}</span>}
                           </p>
                         </div>
                         {cloudAvailableModels.length > 0 && (
@@ -2077,7 +2441,7 @@ export default function SettingsModal({
                             }}
                             className="text-[11px] font-bold text-[#a1a1aa] transition-colors hover:text-white"
                           >
-                            {cloudModelInputMode === "select" ? "手动输入" : "下拉选择"}
+                            {cloudModelInputMode === "select" ? copy.manualInput : copy.dropdownSelect}
                           </button>
                         )}
                       </div>
@@ -2109,16 +2473,16 @@ export default function SettingsModal({
                           onClick={() => refreshCloudModels()}
                           disabled={isFetchingCloudModels}
                           className="shrink-0 rounded-md border border-[#27272a] bg-[#18181b] px-3 py-2 text-[12px] font-bold text-[#a1a1aa] transition-colors hover:text-white disabled:opacity-50"
-                        >{isFetchingCloudModels ? '刷新中...' : '刷新'}</button>
+                        >{isFetchingCloudModels ? copy.refreshing : copy.refresh}</button>
                         <button
                           data-testid="cloud-model-test"
                           onClick={testCloudConnection}
                           disabled={isTestingCloudConnection}
                           className="shrink-0 rounded-md border border-[#27272a] bg-[#18181b] px-3 py-2 text-[12px] font-bold text-[#a1a1aa] transition-colors hover:text-white disabled:opacity-50"
-                        >{isTestingCloudConnection ? '测试中...' : '测试'}</button>
+                        >{isTestingCloudConnection ? copy.testing : copy.test}</button>
                       </div>
                       {cloudAvailableModels.length > 0 && (
-                        <p data-testid="cloud-model-fetched-count" className="mt-2 text-[11px] text-[#71717a]">已拉取 {cloudAvailableModels.length} 个模型</p>
+                        <p data-testid="cloud-model-fetched-count" className="mt-2 text-[11px] text-[#71717a]">{copy.fetchedModels(cloudAvailableModels.length)}</p>
                       )}
                       {activeCloudConnectionStatus && (
                         <p data-testid="cloud-model-connected-status" className="mt-2 flex items-center gap-1.5 text-[12px] font-medium text-[#86d9a3]">
@@ -2136,15 +2500,15 @@ export default function SettingsModal({
                           <IconCloud className="h-4 w-4" />
                         </div>
                         <div className="min-w-0">
-                          <p className="text-[13px] font-bold text-[#e4e4e7]">还没有云端服务器</p>
-                          <p className="mt-1 text-[11.5px] text-[#71717a]">从左侧新增服务器后，再在这里手动刷新模型列表。</p>
+                          <p className="text-[13px] font-bold text-[#e4e4e7]">{copy.noCloudServerTitle}</p>
+                          <p className="mt-1 text-[11.5px] text-[#71717a]">{copy.noCloudServerDesc}</p>
                         </div>
                       </div>
                       <button
                         onClick={addCloudServer}
                         className="inline-flex items-center justify-center gap-2 rounded-md theme-bg theme-bg-hover px-3 py-2 text-[12px] font-bold text-white transition-colors"
                       >
-                        <IconPlus className="h-3.5 w-3.5" /> 新增服务器
+                        <IconPlus className="h-3.5 w-3.5" /> {copy.addServerTitle}
                       </button>
                     </div>
                   )}
@@ -2154,14 +2518,14 @@ export default function SettingsModal({
                   <aside className="min-w-0 rounded-lg border border-[#27272a] bg-[#000000] p-3">
                     <div className="mb-3 flex items-center justify-between gap-2">
                       <div className="min-w-0">
-                        <div className="text-[12px] font-bold uppercase tracking-wider text-[#a1a1aa]">服务器</div>
-                        <div className="text-[11px] text-[#71717a]">{cloudServers.length} 个配置</div>
+                        <div className="text-[12px] font-bold uppercase tracking-wider text-[#a1a1aa]">{copy.servers}</div>
+                        <div className="text-[11px] text-[#71717a]">{copy.configs(cloudServers.length)}</div>
                       </div>
                       <button
                         data-testid="cloud-server-add"
                         onClick={addCloudServer}
                         className="flex h-8 w-8 items-center justify-center rounded-md border border-[#27272a] bg-[#18181b] text-[#e4e4e7] transition-colors hover:border-[#3f3f46]"
-                        title="新增服务器"
+                        title={copy.addServerTitle}
                       >
                         <IconPlus className="h-4 w-4" />
                       </button>
@@ -2170,13 +2534,13 @@ export default function SettingsModal({
                       data-testid="cloud-server-search"
                       value={cloudServerSearch}
                       onChange={(e) => setCloudServerSearch(e.target.value)}
-                      placeholder="搜索名称、Endpoint、模型"
+                      placeholder={copy.serverSearchPlaceholder}
                       className="mb-3 w-full rounded-md border border-[#27272a] bg-[#09090b] p-2 text-[12px] text-white outline-none theme-ring placeholder:text-[#3f3f46]"
                     />
                     <div data-testid="cloud-server-list" className="max-h-[420px] space-y-2 overflow-y-auto pr-1">
                       {visibleCloudServers.length === 0 ? (
                         <div className="rounded-md border border-dashed border-[#27272a] p-4 text-center text-[12px] text-[#71717a]">
-                          {cloudServers.length === 0 && !cloudDraftServer ? "暂无服务器配置" : "没有匹配的服务器"}
+                          {cloudServers.length === 0 && !cloudDraftServer ? copy.noServerConfigs : copy.noMatchingServers}
                         </div>
                       ) : (
                         visibleCloudServers.map((server) => {
@@ -2202,15 +2566,15 @@ export default function SettingsModal({
                                 <IconCloud className={`mt-0.5 h-4 w-4 ${isSelectedServer ? "theme-text" : "text-[#71717a]"}`} />
                                 <div className="min-w-0 flex-1">
                                   <div className="flex items-center gap-2">
-                                    <span className="truncate text-[13px] font-bold text-[#e4e4e7]">{server.name || (isUnsavedServer ? "未保存服务器" : "未命名服务器")}</span>
-                                    {isActiveServer && <span className="shrink-0 rounded border theme-subtle-border px-1.5 py-0.5 text-[9px] font-bold uppercase theme-text">Active</span>}
-                                    {isUnsavedServer && <span className="shrink-0 rounded border border-[#3f3f46] px-1.5 py-0.5 text-[9px] font-bold uppercase text-[#a1a1aa]">未保存</span>}
+                                    <span className="truncate text-[13px] font-bold text-[#e4e4e7]">{server.name || (isUnsavedServer ? copy.unsavedServer : copy.unnamedServer)}</span>
+                                    {isActiveServer && <span className="shrink-0 rounded border theme-subtle-border px-1.5 py-0.5 text-[9px] font-bold uppercase theme-text">{copy.activeProfile}</span>}
+                                    {isUnsavedServer && <span className="shrink-0 rounded border border-[#3f3f46] px-1.5 py-0.5 text-[9px] font-bold uppercase text-[#a1a1aa]">{copy.unsaved}</span>}
                                   </div>
                                   <div className="mt-1 flex items-center gap-1.5">
                                     <span className="rounded bg-[#18181b] px-1.5 py-0.5 text-[9px] font-bold uppercase text-[#a1a1aa]">{normalizeCloudProtocol(server.protocol) === "anthropic" ? "Anthropic" : "OpenAI"}</span>
                                     {server.model && <span className="truncate text-[10px] text-[#71717a]">{server.model}</span>}
                                   </div>
-                                  <div className="mt-1 truncate font-mono text-[10px] text-[#71717a]">{server.endpoint || "未填写 Endpoint"}</div>
+                                  <div className="mt-1 truncate font-mono text-[10px] text-[#71717a]">{server.endpoint || copy.noEndpoint}</div>
                                 </div>
                                 <span
                                   role="button"
@@ -2227,7 +2591,7 @@ export default function SettingsModal({
                                     }
                                   }}
                                   className="mt-0.5 rounded p-1 text-[#71717a] opacity-0 transition-colors hover:bg-[#181111] hover:text-[#fca5a5] group-hover:opacity-100"
-                                  title="删除服务器"
+                                  title={copy.remove}
                                 >
                                   <IconTrash className="h-3.5 w-3.5" />
                                 </span>
@@ -2245,13 +2609,13 @@ export default function SettingsModal({
                     <section className="rounded-lg border border-[#27272a] bg-[#000000] p-4">
                       <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
                         <div>
-                          <div className="text-[12px] font-bold uppercase tracking-wider text-[#a1a1aa]">服务器配置</div>
+                          <div className="text-[12px] font-bold uppercase tracking-wider text-[#a1a1aa]">{copy.serverConfig}</div>
                           {cloudSaveMsg ? (
                             <p className={`mt-1 text-[11.5px] ${cloudSaveMsg.type === 'error' ? 'text-[#f48771]' : 'text-[#86d9a3]'}`}>{cloudSaveMsg.text}</p>
                           ) : hasCloudDraftChanges ? (
-                            <p className="mt-1 text-[11.5px] text-[#facc15]">有未保存更改</p>
+                            <p className="mt-1 text-[11.5px] text-[#facc15]">{copy.unsavedChanges}</p>
                           ) : (
-                            <p className="mt-1 text-[11.5px] text-[#71717a]">当前服务器配置已保存</p>
+                            <p className="mt-1 text-[11.5px] text-[#71717a]">{copy.savedConfig}</p>
                           )}
                         </div>
                         <button
@@ -2260,25 +2624,25 @@ export default function SettingsModal({
                           disabled={!canSaveCloudServer}
                           className="inline-flex items-center justify-center gap-2 rounded-md theme-bg theme-bg-hover px-3 py-2 text-[12px] font-bold text-white transition-colors disabled:cursor-not-allowed disabled:opacity-40"
                         >
-                          <IconSave className="h-3.5 w-3.5" /> 保存
+                          <IconSave className="h-3.5 w-3.5" /> {copy.save}
                         </button>
                       </div>
                       <div className="space-y-4">
                         <div>
-                          <label className="mb-2 block text-[13px] font-bold text-[#e4e4e7]">Server Name</label>
+                          <label className="mb-2 block text-[13px] font-bold text-[#e4e4e7]">{copy.cloudServerName}</label>
                           <input
                             data-testid="cloud-server-name-input"
                             type="text"
                             value={cloudDraftServer.name ?? ""}
                             onChange={(e) => updateCloudDraftServer({ name: e.target.value })}
-                            placeholder="例如 OpenAI / OpenRouter / 公司网关"
+                            placeholder={copy.cloudServerNamePlaceholder}
                             className="w-full rounded-md border border-[#27272a] bg-[#000000] p-2.5 text-[14px] text-white outline-none theme-ring placeholder:text-[#3f3f46]"
                           />
                         </div>
 
                         <div>
-                          <label className="mb-2 block text-[13px] font-bold text-[#e4e4e7]">API Protocol</label>
-                          <p className="mb-2 text-[11.5px] text-[#71717a]">选择云端服务遵循的协议格式。聚合平台通常走 OpenAI Compatible，Claude 原生接口走 Anthropic</p>
+                          <label className="mb-2 block text-[13px] font-bold text-[#e4e4e7]">{copy.apiProtocol}</label>
+                          <p className="mb-2 text-[11.5px] text-[#71717a]">{copy.apiProtocolDesc}</p>
                           <select
                             value={cloudProtocol}
                             onChange={handleCloudProtocolChange}
@@ -2291,8 +2655,8 @@ export default function SettingsModal({
 
                         {cloudProtocol === "openai" && (
                           <div>
-                            <label className="mb-2 block text-[13px] font-bold text-[#e4e4e7]">API Format</label>
-                            <p className="mb-2 text-[11.5px] text-[#71717a]">弱兼容网关可先尝试 Chat Completions；如果服务像 Codex 一样使用 `wire_api = responses`，请切换到 Responses API</p>
+                            <label className="mb-2 block text-[13px] font-bold text-[#e4e4e7]">{copy.apiFormat}</label>
+                            <p className="mb-2 text-[11.5px] text-[#71717a]">{copy.apiFormatDesc}</p>
                             <select
                               value={cloudApiFormat}
                               onChange={handleCloudApiFormatChange}
@@ -2305,7 +2669,7 @@ export default function SettingsModal({
                         )}
 
                         <div>
-                          <label className="mb-2 block text-[13px] font-bold text-[#e4e4e7]">API Endpoint</label>
+                          <label className="mb-2 block text-[13px] font-bold text-[#e4e4e7]">{copy.apiEndpoint}</label>
                           <p className="mb-2 text-[11.5px] text-[#71717a]">{cloudEndpointHint}</p>
                           <input
                             data-testid="cloud-server-endpoint-input"
@@ -2320,8 +2684,8 @@ export default function SettingsModal({
                         </div>
 
                         <div>
-                          <label className="mb-2 block text-[13px] font-bold text-[#e4e4e7]">API Key <span className="font-normal text-[#71717a]">(如服务不需要可留空)</span></label>
-                          <p className="mb-2 text-[11.5px] text-[#71717a]">{cloudProtocol === "anthropic" ? "Anthropic 协议会使用 x-api-key 请求头" : "OpenAI 兼容协议会默认同时发送 Authorization: Bearer 和 x-api-key 请求头，以兼容更多聚合网关"}</p>
+                          <label className="mb-2 block text-[13px] font-bold text-[#e4e4e7]">API Key <span className="font-normal text-[#71717a]">({copy.apiKeyOptional})</span></label>
+                          <p className="mb-2 text-[11.5px] text-[#71717a]">{cloudProtocol === "anthropic" ? copy.apiKeyDescAnthropic : copy.apiKeyDescOpenAi}</p>
                           <input
                             data-testid="cloud-server-api-key-input"
                             type="password"
@@ -2335,8 +2699,8 @@ export default function SettingsModal({
                         </div>
 
                         <div>
-                          <label className="mb-2 block text-[13px] font-bold text-[#e4e4e7]">Additional Headers (JSON) <span className="font-normal text-[#71717a]">(可选)</span></label>
-                          <p className="mb-2 text-[11.5px] text-[#71717a]">需要厂商专用请求头时可填写 JSON 对象，或 [{'{'}"header","value"{'}'}] 数组，例如 {`{"HTTP-Referer":"https://example.com","X-Title":"MAIN"}`}</p>
+                          <label className="mb-2 block text-[13px] font-bold text-[#e4e4e7]">{copy.additionalHeaders} <span className="font-normal text-[#71717a]">({copy.optional})</span></label>
+                          <p className="mb-2 text-[11.5px] text-[#71717a]">{copy.additionalHeadersDesc} {language === "zh" ? "例如" : "For example"} {`{"HTTP-Referer":"https://example.com","X-Title":"MAIN"}`}</p>
                           <textarea
                             value={draftCloudConfig.customHeaders || ""}
                             onChange={(e) => {
@@ -2348,20 +2712,20 @@ export default function SettingsModal({
                           {parsedCloudCustomHeaders.error ? (
                             <p className="mt-2 text-[12px] text-[#f48771]">{parsedCloudCustomHeaders.error}</p>
                           ) : (
-                            <p className="mt-2 text-[11px] text-[#71717a]">当前将附加 {Object.keys(parsedCloudCustomHeaders.headers).length} 个自定义请求头</p>
+                            <p className="mt-2 text-[11px] text-[#71717a]">{copy.customHeadersCount(Object.keys(parsedCloudCustomHeaders.headers).length)}</p>
                           )}
                         </div>
                       </div>
                     </section>
 
                     <section className="rounded-lg border border-[#27272a] bg-[#000000] p-4">
-                      <div className="mb-4 text-[12px] font-bold uppercase tracking-wider text-[#a1a1aa]">模型参数</div>
+                      <div className="mb-4 text-[12px] font-bold uppercase tracking-wider text-[#a1a1aa]">{copy.modelParams}</div>
                       <div className="space-y-4">
                         {cloudProtocol === "openai" && cloudApiFormat === "responses" && (
                           <>
                             <div>
-                              <label className="mb-1.5 block text-[12px] text-[#a1a1aa]">Reasoning Effort</label>
-                              <p className="mb-2 text-[11px] text-[#71717a]">建议保持 None，响应最快且不容易触发云端 524；只有复杂推理任务再手动切到 High / XHigh。</p>
+                              <label className="mb-1.5 block text-[12px] text-[#a1a1aa]">{copy.reasoningEffort}</label>
+                              <p className="mb-2 text-[11px] text-[#71717a]">{copy.reasoningEffortDesc}</p>
                               <select
                                 value={normalizeOpenAiReasoningEffort(draftCloudConfig.reasoningEffort)}
                                 onChange={(e) => updateCloudDraftServer({ reasoningEffort: normalizeOpenAiReasoningEffort(e.target.value) })}
@@ -2384,12 +2748,12 @@ export default function SettingsModal({
                                 className="mt-0.5"
                               />
                               <span className="min-w-0">
-                                <span className="block text-[12px] font-medium text-[#e4e4e7]">Disable Response Storage</span>
-                                <span className="mt-1 block text-[11px] text-[#71717a]">对应 Codex `disable_response_storage = true`，会发送 `store: false`</span>
+                                <span className="block text-[12px] font-medium text-[#e4e4e7]">{copy.disableResponseStorage}</span>
+                                <span className="mt-1 block text-[11px] text-[#71717a]">{copy.disableResponseStorageDesc}</span>
                               </span>
                             </label>
 
-                            <p className="text-[11px] leading-relaxed text-[#71717a]">`Responses + gpt-5.4` 现在会尽量贴近 Codex 请求形态：使用顶层 `instructions`、发送 `store: false` / `reasoning.effort`，并让采样参数走服务端默认值。</p>
+                            <p className="text-[11px] leading-relaxed text-[#71717a]">{copy.responsesCodexDesc}</p>
                           </>
                         )}
 
@@ -2398,10 +2762,10 @@ export default function SettingsModal({
                             <span className="text-[12px] text-[#a1a1aa]">Temperature</span>
                             <span className="rounded border theme-subtle-border px-2 py-0.5 font-mono text-[12px] theme-subtle-bg">{(draftCloudConfig.temperature ?? 0.6).toFixed(2)}</span>
                           </div>
-                          <p className="mb-2 text-[11px] text-[#71717a]">控制输出的随机性。值越低越确定，值越高越多样</p>
+                          <p className="mb-2 text-[11px] text-[#71717a]">{copy.temperatureDesc}</p>
                           <input type="range" min="0" max="2" step="0.05" value={draftCloudConfig.temperature ?? 0.6} onChange={(e) => updateCloudDraftServer({ temperature: parseFloat(e.target.value) })} className="w-full cursor-pointer theme-slider" />
                           <div className="mt-1 flex justify-between font-mono text-[11px] text-[#3f3f46]">
-                            <span>0 (精确)</span><span>1</span><span>2 (创意)</span>
+                            <span>{copy.tempPrecise}</span><span>1</span><span>{copy.tempCreative}</span>
                           </div>
                         </div>
 
@@ -2410,10 +2774,10 @@ export default function SettingsModal({
                             <span className="text-[12px] text-[#a1a1aa]">Top P</span>
                             <span className="rounded border theme-subtle-border px-2 py-0.5 font-mono text-[12px] theme-subtle-bg">{(draftCloudConfig.topP ?? 0.95).toFixed(2)}</span>
                           </div>
-                          <p className="mb-2 text-[11px] text-[#71717a]">核采样阈值，与 Temperature 共同影响生成质量</p>
+                          <p className="mb-2 text-[11px] text-[#71717a]">{copy.topPDesc}</p>
                           <input type="range" min="0" max="1" step="0.05" value={draftCloudConfig.topP ?? 0.95} onChange={(e) => updateCloudDraftServer({ topP: parseFloat(e.target.value) })} className="w-full cursor-pointer theme-slider" />
                           <div className="mt-1 flex justify-between font-mono text-[11px] text-[#3f3f46]">
-                            <span>0 (窄)</span><span>0.5</span><span>1 (宽)</span>
+                            <span>{copy.topPNarrow}</span><span>0.5</span><span>{copy.topPWide}</span>
                           </div>
                         </div>
                       </div>
@@ -2424,13 +2788,13 @@ export default function SettingsModal({
                         <div className="mx-auto mb-3 flex h-10 w-10 items-center justify-center rounded-md border border-[#27272a] bg-[#09090b] text-[#71717a]">
                           <IconCloud className="h-4 w-4" />
                         </div>
-                        <p className="text-[13px] font-bold text-[#e4e4e7]">从 0 开始添加云端服务器</p>
-                        <p className="mt-1 text-[11.5px] text-[#71717a]">当前没有任何云端接口配置。点击新增后填写名称、协议、Endpoint 和 API Key。</p>
+                        <p className="text-[13px] font-bold text-[#e4e4e7]">{copy.cloudStartTitle}</p>
+                        <p className="mt-1 text-[11.5px] text-[#71717a]">{copy.cloudStartDesc}</p>
                         <button
                           onClick={addCloudServer}
                           className="mt-4 inline-flex items-center justify-center gap-2 rounded-md theme-bg theme-bg-hover px-3 py-2 text-[12px] font-bold text-white transition-colors"
                         >
-                          <IconPlus className="h-3.5 w-3.5" /> 新增服务器
+                          <IconPlus className="h-3.5 w-3.5" /> {copy.addServerTitle}
                         </button>
                       </section>
                     )}
@@ -2439,7 +2803,7 @@ export default function SettingsModal({
 
                 <div className="p-3 bg-[#000000] border border-[#27272a] rounded-md">
                   <p className="text-[11px] text-[#71717a] leading-relaxed">
-                    <span className="text-[#a1a1aa]">提示</span>：推荐优先让用户直接在这里填写协议、Endpoint、API Key、额外请求头与模型名，不额外依赖外部配置文件。点击“刷新”会按当前选中的服务器尝试发现可用模型。
+                    <span className="text-[#a1a1aa]">{copy.tipLabel}</span>：{copy.cloudTip}
                   </p>
                 </div>
               </div>
@@ -2447,8 +2811,8 @@ export default function SettingsModal({
           </div>
         </div>
         <div className="shrink-0 px-6 py-4 border-t border-[#27272a] bg-[#000000] flex justify-end gap-3">
-          <button onClick={onClose} className="px-5 py-1.5 text-[13px] text-[#a1a1aa] hover:text-white transition-colors">Cancel</button>
-          <button onClick={onClose} className="px-6 py-1.5 theme-bg theme-bg-hover text-[13px] font-bold rounded-md transition-colors shadow-sm">Done</button>
+          <button onClick={onClose} className="px-5 py-1.5 text-[13px] text-[#a1a1aa] hover:text-white transition-colors">{copy.cancel}</button>
+          <button onClick={onClose} className="px-6 py-1.5 theme-bg theme-bg-hover text-[13px] font-bold rounded-md transition-colors shadow-sm">{copy.done}</button>
         </div>
       </div>
     </div>

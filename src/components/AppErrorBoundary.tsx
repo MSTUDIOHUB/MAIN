@@ -14,6 +14,16 @@ interface AppErrorBoundaryState {
   copied: boolean;
 }
 
+function getPersistedUiLanguage(): "zh" | "en" {
+  try {
+    const raw = window.localStorage.getItem("local-agent-ide");
+    const parsed = raw ? JSON.parse(raw) : null;
+    return parsed?.state?.config?.language === "en" ? "en" : "zh";
+  } catch {
+    return "zh";
+  }
+}
+
 export default class AppErrorBoundary extends React.Component<React.PropsWithChildren, AppErrorBoundaryState> {
   state: AppErrorBoundaryState = {
     hasError: false,
@@ -68,20 +78,42 @@ export default class AppErrorBoundary extends React.Component<React.PropsWithChi
     if (!this.state.hasError) {
       return this.props.children;
     }
+    const language = getPersistedUiLanguage();
+    const copy = language === "en"
+      ? {
+          debug: "Debug",
+          title: "MAIN UI ran into an error",
+          desc: "Debug logs for this crash were preserved. Copy the log, then reload the UI to continue troubleshooting.",
+          unknownError: "Unknown render error",
+          reload: "Reload UI",
+          copied: "Copied",
+          copyLog: "Copy Debug Log",
+          noLog: "No log content yet",
+        }
+      : {
+          debug: "调试",
+          title: "MAIN 界面遇到了错误",
+          desc: "已保留这次崩溃的调试日志。你可以复制日志后重载界面，后续排查会更稳。",
+          unknownError: "未知渲染错误",
+          reload: "重载界面",
+          copied: "已复制",
+          copyLog: "复制调试日志",
+          noLog: "暂无日志内容",
+        };
 
     return (
       <div className="flex h-screen w-full items-center justify-center bg-[#050505] px-6 text-[#e4e4e7]">
         <div className="w-full max-w-3xl rounded-lg border border-[#27272a] bg-[#09090b] p-6 shadow-2xl">
           <div className="text-[11px] font-semibold uppercase tracking-[0.22em] text-[#71717a]">
-            Debug
+            {copy.debug}
           </div>
-          <h1 className="mt-2 text-xl font-semibold text-white">MAIN 界面遇到了错误</h1>
+          <h1 className="mt-2 text-xl font-semibold text-white">{copy.title}</h1>
           <p className="mt-2 text-[13px] leading-6 text-[#a1a1aa]">
-            已保留这次崩溃的调试日志。你可以复制日志后重载界面，后续排查会更稳。
+            {copy.desc}
           </p>
 
           <div className="mt-4 rounded-md border border-[#3f3f46] bg-[#000000] p-3 font-mono text-[12px] text-[#fca5a5]">
-            {this.state.message || "Unknown render error"}
+            {this.state.message || copy.unknownError}
           </div>
 
           <div className="mt-4 flex gap-2">
@@ -89,18 +121,18 @@ export default class AppErrorBoundary extends React.Component<React.PropsWithChi
               onClick={() => window.location.reload()}
               className="rounded-md border border-[#27272a] bg-[#18181b] px-3 py-2 text-[12px] font-semibold text-[#e4e4e7] transition-colors hover:border-[#3f3f46]"
             >
-              重载界面
+              {copy.reload}
             </button>
             <button
               onClick={this.handleCopy}
               className="rounded-md border border-[#3f3f46] bg-[#27272a] px-3 py-2 text-[12px] font-semibold text-white transition-colors hover:bg-[#3f3f46]"
             >
-              {this.state.copied ? "已复制" : "复制调试日志"}
+              {this.state.copied ? copy.copied : copy.copyLog}
             </button>
           </div>
 
           <pre className="mt-4 max-h-[280px] overflow-auto whitespace-pre-wrap rounded-md border border-[#18181b] bg-[#000000] p-3 font-mono text-[11px] leading-5 text-[#a1a1aa]">
-            {this.state.logText || this.state.stack || "暂无日志内容"}
+            {this.state.logText || this.state.stack || copy.noLog}
           </pre>
         </div>
       </div>

@@ -4,6 +4,7 @@ import MarkdownRenderer from "./MarkdownRenderer";
 import JobListCard from "./JobListCard";
 import { MessageSegment } from "../lib/messageParser";
 import { sanitizeAIOutput } from "../lib/sanitize";
+import { useAppStore } from "../store/useAppStore";
 
 interface TaskItem {
   text: string;
@@ -15,6 +16,23 @@ interface PlanReviewBlockProps {
   onApprove: () => void;
   onReject: () => void;
 }
+
+const COPY = {
+  zh: {
+    proposedPlan: "方案预览",
+    pendingReview: "待确认",
+    waitingPlan: "等待 Agent 完成方案生成...",
+    cancel: "取消",
+    confirmStart: "确认并开始执行",
+  },
+  en: {
+    proposedPlan: "Proposed Plan",
+    pendingReview: "Pending Review",
+    waitingPlan: "Waiting for the agent to finish the plan...",
+    cancel: "Cancel",
+    confirmStart: "Confirm & Start Execution",
+  },
+} as const;
 
 /** Extract checkbox task items from the combined plan text. */
 function extractTasks(segments: MessageSegment[]): TaskItem[] {
@@ -45,6 +63,8 @@ function stripCheckboxLines(text: string): string {
 }
 
 export default function PlanReviewBlock({ segments, onApprove, onReject }: PlanReviewBlockProps) {
+  const language = useAppStore((s) => s.config.language) === "en" ? "en" : "zh";
+  const copy = COPY[language];
   const tasks = useMemo(() => extractTasks(segments), [segments]);
   const doneCount = tasks.filter(t => t.done).length;
   const totalCount = tasks.length;
@@ -68,11 +88,11 @@ export default function PlanReviewBlock({ segments, onApprove, onReject }: PlanR
             <line x1="16" y1="13" x2="8" y2="13" />
             <line x1="16" y1="17" x2="8" y2="17" />
           </svg>
-          <span className="text-[13px] font-semibold text-[#e4e4e7] tracking-wide">Proposed Plan</span>
+          <span className="text-[13px] font-semibold text-[#e4e4e7] tracking-wide">{copy.proposedPlan}</span>
         </div>
         <span className="flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider bg-[rgba(234,179,8,0.12)] text-[#eab308] border border-[rgba(234,179,8,0.25)]">
           <span className="w-1.5 h-1.5 rounded-full bg-[#eab308] animate-pulse" />
-          Pending Review
+          {copy.pendingReview}
         </span>
       </div>
 
@@ -155,7 +175,7 @@ export default function PlanReviewBlock({ segments, onApprove, onReject }: PlanR
               <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
               <polyline points="14 2 14 8 20 8" />
             </svg>
-            等待 Agent 完成方案生成...
+            {copy.waitingPlan}
           </div>
         )}
       </div>
@@ -166,7 +186,7 @@ export default function PlanReviewBlock({ segments, onApprove, onReject }: PlanR
           onClick={onReject}
           className="px-4 py-2 text-[12px] font-semibold rounded-lg border border-[#3f3f46] bg-[#09090b] text-[#a1a1aa] hover:bg-[#18181b] hover:text-[#e4e4e7] transition-colors"
         >
-          Cancel
+          {copy.cancel}
         </button>
         <button
           onClick={onApprove}
@@ -178,7 +198,7 @@ export default function PlanReviewBlock({ segments, onApprove, onReject }: PlanR
           <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
             <polygon points="5 3 19 12 5 21 5 3" />
           </svg>
-          Confirm & Start Execution
+          {copy.confirmStart}
         </button>
       </div>
     </div>
