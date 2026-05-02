@@ -4,6 +4,7 @@ import { getPlanArtifactTitle } from "./workflowModels";
 import type { NexusModeKey } from "./gameStudioCatalog";
 
 const PLAN_FLOW_SCENARIO = "plan-flow";
+const PLAN_QUICK_REPLY_APPROVAL_SCENARIO = "plan-quick-reply-approval";
 const PLAN_RELOAD_RESUME_SCENARIO = "plan-reload-resume";
 const DIFF_RELOAD_SUMMARY_SCENARIO = "diff-reload-summary";
 const PLAN_REPLACE_REFRESH_SCENARIO = "plan-replace-refresh";
@@ -19,6 +20,7 @@ const STREAM_ERROR_RECOVERY_SCENARIO = "stream-error-recovery";
 const SESSION_AUTO_CREATE_SCENARIO = "session-auto-create";
 const CLOUD_TOOL_FALLBACK_SCENARIO = "cloud-tool-fallback";
 const REPLY_OPTIONS_TOOL_PAUSE_SCENARIO = "reply-options-tool-pause";
+const TOP_ISLAND_EXECUTION_PROGRESS_SCENARIO = "top-island-execution-progress";
 const E2E_SEED_COUNT_PREFIX = "__CODELY_E2E_SEED_COUNT__:";
 
 function getScenarioName(): string | null {
@@ -330,6 +332,108 @@ function seedPlanFlowScenario() {
 
   bridge.cleanup = cleanup;
   return cleanup;
+}
+
+function seedPlanQuickReplyApprovalScenario() {
+  const bridge = getBridge();
+  if (!bridge) return undefined;
+
+  bridge.events = [{ type: "boot" }];
+  bridge.savedDocuments = [];
+  bridge.completed = false;
+
+  const turnId = "e2e-plan-quick-reply-approval-turn";
+  const now = Date.now();
+  const userBlockId = useAppStore.getState()._nextTaskId();
+  const agentBlockId = useAppStore.getState()._nextTaskId();
+
+  useAppStore.setState((state) => ({
+    ...state,
+    config: {
+      ...state.config,
+      language: "zh",
+      workflowMode: "plan",
+    },
+    currentWorkspace: "/tmp/e2e-plan-quick-reply-approval",
+    taskFlow: [
+      { id: userBlockId, turnId, type: "user", content: "请先规划字体修复流程，我确认后再执行。" },
+      {
+        id: agentBlockId,
+        turnId,
+        type: "agent",
+        content: "诊断路径已经收敛，请选择下一步。",
+        options: [
+          {
+            label: "批准执行：先运行诊断脚本，再根据结果修复字体加载",
+            value: "批准执行：先运行诊断脚本，再根据结果修复字体加载",
+          },
+          {
+            label: "继续讨论，不进入执行",
+            value: "继续讨论，不进入执行",
+          },
+        ],
+        streaming: false,
+      },
+    ],
+    conversationTurns: [
+      {
+        id: turnId,
+        userPrompt: "请先规划字体修复流程，我确认后再执行。",
+        title: "计划 Quick Reply 审批",
+        mode: "plan",
+        intent: "plan",
+        status: "awaiting_input",
+        summary: "等待用户选择是否批准执行。",
+        blockIds: [userBlockId, agentBlockId],
+        collapsed: false,
+        createdAt: now,
+      },
+    ],
+    currentTurnId: turnId,
+    planArtifacts: [
+      {
+        kind: "requirements" as const,
+        path: ".MAIN/plans/requirements.md",
+        title: "Requirements",
+        updatedAt: now - 2_000,
+        content: "# Requirements\n\n- 修复字体加载诊断流程。\n",
+      },
+      {
+        kind: "design" as const,
+        path: ".MAIN/plans/design.md",
+        title: "Design",
+        updatedAt: now - 1_000,
+        content: "# Design\n\n- 批准后先运行诊断，再根据结果修复字体加载。\n",
+      },
+    ],
+    planTasks: [],
+    planExecutionEvidenceLedger: [],
+    planExecutionEvidenceCount: 0,
+    planStage: "design",
+    isPlanApproved: false,
+    planApprovalChoice: null,
+    showPlanPanel: true,
+    showDiff: false,
+    showTerminal: false,
+    showFilePanel: false,
+    rightPanelTab: "plan",
+    agentStatus: "idle",
+    isGenerating: false,
+    abortController: null,
+    pendingReviewResolve: null,
+    pendingReviewTaskId: null,
+    pendingToolCall: null,
+    selectedDiffTaskId: null,
+    input: "",
+    attachedFiles: [],
+    contextMentions: [],
+  }));
+
+  bindBridgeSnapshot(PLAN_QUICK_REPLY_APPROVAL_SCENARIO);
+
+  return () => {
+    bridge.initialized = false;
+  };
 }
 
 function hasReloadResumeState(workspace: string, sessionId: number): boolean {
@@ -749,6 +853,7 @@ function seedDiffReloadSummaryScenario() {
     const userBlockId = useAppStore.getState()._nextTaskId();
     const toolBlockIdA = useAppStore.getState()._nextTaskId();
     const toolBlockIdB = useAppStore.getState()._nextTaskId();
+    const toolBlockIdC = useAppStore.getState()._nextTaskId();
     const agentBlockId = useAppStore.getState()._nextTaskId();
 
     incrementSeedCount(DIFF_RELOAD_SUMMARY_SCENARIO);
@@ -778,7 +883,7 @@ function seedDiffReloadSummaryScenario() {
           id: userBlockId,
           turnId,
           type: "user",
-          content: "请直接修改两个文件，并给我一个可点击查看的变更摘要。",
+          content: "请直接修改三个文件，并给我一个可点击查看的变更摘要。",
         },
         {
           id: toolBlockIdA,
@@ -802,6 +907,8 @@ function seedDiffReloadSummaryScenario() {
               "  return title;",
               "}",
             ].join("\n"),
+            existed: true,
+            fullFile: true,
           },
         },
         {
@@ -823,25 +930,47 @@ function seedDiffReloadSummaryScenario() {
               "export const helper = () => 'after';",
               "export const status = 'ready';",
             ].join("\n"),
+            existed: true,
+            fullFile: true,
+          },
+        },
+        {
+          id: toolBlockIdC,
+          turnId,
+          type: "tool",
+          toolName: "write_file",
+          target: "src/generated.ts",
+          status: "executed",
+          toolStatus: "executed",
+          message: "Created src/generated.ts",
+          diff: {
+            path: "src/generated.ts",
+            old: "",
+            new: [
+              "export const generated = true;",
+              "",
+            ].join("\n"),
+            existed: false,
+            fullFile: true,
           },
         },
         {
           id: agentBlockId,
           turnId,
           type: "agent",
-          content: "已完成两个文件的修改，你可以在摘要卡中查看每个文件的 Diff。",
+          content: "已完成三个文件的修改，你可以在摘要卡中查看每个文件的 Diff。",
           streaming: false,
         },
       ],
       conversationTurns: [
         {
           id: turnId,
-          userPrompt: "请直接修改两个文件，并给我一个可点击查看的变更摘要。",
+          userPrompt: "请直接修改三个文件，并给我一个可点击查看的变更摘要。",
           title: "Diff 摘要重载回归流",
           mode: "edit",
           status: "done",
-          summary: "两个文件已修改，可点击查看 Diff。",
-          blockIds: [userBlockId, toolBlockIdA, toolBlockIdB, agentBlockId],
+          summary: "三个文件已修改，可点击查看 Diff。",
+          blockIds: [userBlockId, toolBlockIdA, toolBlockIdB, toolBlockIdC, agentBlockId],
           collapsed: false,
           createdAt: now,
         },
@@ -1074,6 +1203,130 @@ function seedPlanReplaceRefreshScenario() {
   const cleanup = () => {
     if (replaceTimer != null) window.clearTimeout(replaceTimer);
     replaceTimer = null;
+    bridge.initialized = false;
+  };
+
+  bridge.cleanup = cleanup;
+  return cleanup;
+}
+
+function seedTopIslandExecutionProgressScenario() {
+  const bridge = getBridge();
+  if (!bridge) return undefined;
+
+  bridge.events = [{ type: "boot" }];
+  bridge.savedDocuments = [];
+  bridge.completed = false;
+
+  const workspace = "/tmp/e2e-top-island-execution-progress";
+  const sessionId = 999601;
+  const now = Date.now();
+  const turnId = "e2e-top-island-execution-progress-turn";
+  const userBlockId = useAppStore.getState()._nextTaskId();
+  const readBlockId = useAppStore.getState()._nextTaskId();
+  const editBlockId = useAppStore.getState()._nextTaskId();
+  const commandBlockId = useAppStore.getState()._nextTaskId();
+
+  incrementSeedCount(TOP_ISLAND_EXECUTION_PROGRESS_SCENARIO);
+
+  useAppStore.setState((state) => ({
+    ...state,
+    config: {
+      ...state.config,
+      language: "zh",
+      workflowMode: "edit",
+    },
+    currentWorkspace: workspace,
+    sessionsByWorkspace: {
+      [workspace]: [
+        {
+          id: sessionId,
+          title: "E2E TopIsland Execution Progress",
+          date: new Date(now).toISOString(),
+          active: true,
+          messages: [],
+        },
+      ],
+    },
+    currentSessionId: sessionId,
+    taskFlow: [
+      { id: userBlockId, turnId, type: "user", content: "/执行 修改 TopIsland 执行步骤进度。" },
+      {
+        id: readBlockId,
+        turnId,
+        type: "tool",
+        toolName: "read_file",
+        target: "src/components/TopIsland.tsx",
+        status: "done",
+        toolStatus: "executed",
+        message: "File read.",
+      },
+      {
+        id: editBlockId,
+        turnId,
+        type: "tool",
+        toolName: "replace_in_file",
+        target: "src/components/TopIsland.tsx",
+        status: "running",
+        toolStatus: "running",
+        message: "Executing...",
+      },
+      {
+        id: commandBlockId,
+        turnId,
+        type: "tool",
+        toolName: "run_command",
+        target: "npm test",
+        status: "pending",
+        toolStatus: "pending",
+        message: "Waiting...",
+      },
+    ],
+    conversationTurns: [
+      {
+        id: turnId,
+        userPrompt: "/执行 修改 TopIsland 执行步骤进度。",
+        title: "执行步骤进度回归",
+        mode: "edit",
+        intent: "execute",
+        status: "executing",
+        summary: "执行模式下 TopIsland 应展示工具步骤进度。",
+        blockIds: [userBlockId, readBlockId, editBlockId, commandBlockId],
+        collapsed: false,
+        createdAt: now,
+      },
+    ],
+    currentTurnId: turnId,
+    planArtifacts: [],
+    planTasks: [],
+    planExecutionEvidenceLedger: [],
+    planExecutionEvidenceCount: 0,
+    planStage: "idle",
+    isPlanApproved: false,
+    showPlanPanel: false,
+    showDiff: false,
+    showTerminal: false,
+    showFilePanel: false,
+    rightPanelTab: "plan",
+    agentStatus: "running",
+    isGenerating: true,
+    abortController: new AbortController(),
+    pendingReviewResolve: null,
+    pendingReviewTaskId: null,
+    pendingToolCall: null,
+    selectedDiffTaskId: null,
+    input: "",
+    attachedFiles: [],
+    contextMentions: [],
+  }));
+
+  appendBridgeEvent("seeded", { seedCount: readSeedCount(TOP_ISLAND_EXECUTION_PROGRESS_SCENARIO) });
+  bindBridgeSnapshot(TOP_ISLAND_EXECUTION_PROGRESS_SCENARIO);
+
+  const cleanup = () => {
+    const latest = useAppStore.getState();
+    latest.abortController?.abort();
+    useAppStore.setState({ abortController: null, agentStatus: "idle", isGenerating: false });
     bridge.initialized = false;
   };
 
@@ -2155,6 +2408,10 @@ export function initializeE2EScenarios(): (() => void) | undefined {
     return seedPlanFlowScenario();
   }
 
+  if (scenario === PLAN_QUICK_REPLY_APPROVAL_SCENARIO) {
+    return seedPlanQuickReplyApprovalScenario();
+  }
+
   if (scenario === PLAN_RELOAD_RESUME_SCENARIO) {
     return seedPlanReloadResumeScenario();
   }
@@ -2213,6 +2470,10 @@ export function initializeE2EScenarios(): (() => void) | undefined {
 
   if (scenario === SESSION_AUTO_CREATE_SCENARIO) {
     return seedSessionAutoCreateScenario();
+  }
+
+  if (scenario === TOP_ISLAND_EXECUTION_PROGRESS_SCENARIO) {
+    return seedTopIslandExecutionProgressScenario();
   }
 
   bridge.initialized = false;

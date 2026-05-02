@@ -84,6 +84,103 @@ test("MAIN shortcut order, keyboard selection, and labels stay aligned", async (
   await expect(textarea).toHaveValue("");
 });
 
+test("user message bubble preserves multiline composer input", async ({ page }) => {
+  await page.goto("/?e2eScenario=composer-main-shortcuts");
+
+  const multilinePrompt = "第一行需求\n第二行补充\n\n第四行结尾";
+  const textarea = page.getByTestId("composer-textarea");
+  await textarea.fill(multilinePrompt);
+  await page.getByTestId("composer-send-button").click();
+
+  await expect
+    .poll(async () =>
+      page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().currentTurnPrompt ?? null),
+    )
+    .toBe(multilinePrompt);
+
+  const userMessage = page.getByTestId("user-message-content").last();
+  await expect(userMessage).toBeVisible();
+
+  const rendered = await userMessage.evaluate((node) => ({
+    text: node.textContent,
+    whiteSpace: window.getComputedStyle(node).whiteSpace,
+  }));
+  expect(rendered.text).toBe(multilinePrompt);
+  expect(rendered.whiteSpace).toBe("pre-wrap");
+});
+
+test("MAIN shortcut intent survives transient empty Chinese IME composition", async ({ page }) => {
+  await page.goto("/?e2eScenario=composer-main-shortcuts");
+
+  const textarea = page.getByTestId("composer-textarea");
+  await textarea.fill("/");
+  await page.keyboard.press("Enter");
+
+  await expect
+    .poll(async () =>
+      page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().lockedComposerIntent ?? null),
+    )
+    .toBe("plan");
+  await expect(textarea).toHaveValue("");
+
+  await textarea.evaluate((node: HTMLTextAreaElement) => {
+    const setNativeValue = (value: string) => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+      setter?.call(node, value);
+    };
+    node.focus();
+    node.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true, data: "j" }));
+    setNativeValue("j");
+    node.dispatchEvent(new InputEvent("input", {
+      bubbles: true,
+      data: "j",
+      inputType: "insertCompositionText",
+    }));
+    setNativeValue("");
+    node.dispatchEvent(new InputEvent("input", {
+      bubbles: true,
+      data: "",
+      inputType: "insertCompositionText",
+    }));
+  });
+
+  await expect
+    .poll(async () =>
+      page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().lockedComposerIntent ?? null),
+    )
+    .toBe("plan");
+
+  await textarea.evaluate((node: HTMLTextAreaElement) => {
+    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+    setter?.call(node, "计划一下中文输入");
+    node.dispatchEvent(new InputEvent("input", {
+      bubbles: true,
+      data: "计划一下中文输入",
+      inputType: "insertCompositionText",
+    }));
+    node.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true, data: "计划一下中文输入" }));
+  });
+
+  await expect(textarea).toHaveValue("计划一下中文输入");
+  await expect
+    .poll(async () =>
+      page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().lockedComposerIntent ?? null),
+    )
+    .toBe("plan");
+
+  await page.getByTestId("composer-send-button").click();
+
+  await expect
+    .poll(async () =>
+      page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().currentTurnIntent ?? null),
+    )
+    .toBe("plan");
+
+  const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
+  expect(snapshot?.currentTurnPrompt).toBe("计划一下中文输入");
+  expect(snapshot?.currentTurnPrompt).not.toContain("/计划");
+});
+
 test("MDEBUG stays hidden from shortcut menu but submits as a plan turn", async ({ page }) => {
   await page.goto("/?e2eScenario=composer-main-shortcuts");
 

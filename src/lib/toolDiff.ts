@@ -4,6 +4,8 @@ export interface ToolDiffPreview {
   old: string;
   new: string;
   path?: string;
+  existed?: boolean;
+  fullFile?: boolean;
 }
 
 export function supportsToolDiffPreview(toolName: string): boolean {
@@ -23,21 +25,46 @@ export async function buildToolDiffPreview(
   const path = typeof toolArgs.path === "string" ? toolArgs.path : undefined;
 
   if (toolName === "replace_in_file") {
+    const searchText = typeof toolArgs.search_text === "string" ? toolArgs.search_text : "";
+    const replaceText = typeof toolArgs.replace_text === "string" ? toolArgs.replace_text : "";
+    if (path && searchText) {
+      try {
+        const originalContent =
+          !String(context.workspace || "").trim() && context.sessionKey
+            ? await readChatTempFile(context.sessionKey, path)
+            : await readFile(path, context.workspace);
+        if (originalContent.includes(searchText)) {
+          return {
+            old: originalContent,
+            new: originalContent.replace(searchText, replaceText),
+            path,
+            existed: true,
+            fullFile: true,
+          };
+        }
+      } catch {
+        // Fall through to the legacy fragment preview below.
+      }
+    }
+
     return {
-      old: typeof toolArgs.search_text === "string" ? toolArgs.search_text : "",
-      new: typeof toolArgs.replace_text === "string" ? toolArgs.replace_text : "",
+      old: searchText,
+      new: replaceText,
       ...(path ? { path } : {}),
+      fullFile: false,
     };
   }
 
   if (toolName === "write_file") {
     let originalContent = "";
+    let existed = false;
     if (path) {
       try {
         originalContent =
           !String(context.workspace || "").trim() && context.sessionKey
             ? await readChatTempFile(context.sessionKey, path)
             : await readFile(path, context.workspace);
+        existed = true;
       } catch {
         originalContent = "";
       }
@@ -47,6 +74,8 @@ export async function buildToolDiffPreview(
       old: originalContent,
       new: typeof toolArgs.content === "string" ? toolArgs.content : "",
       ...(path ? { path } : {}),
+      existed,
+      fullFile: true,
     };
   }
 

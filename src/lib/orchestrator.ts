@@ -94,6 +94,7 @@ import {
   buildMissingToolCallContinuationPrompt,
   resolveMissingToolCallRepromptKind,
 } from "./missingToolCallReprompt";
+import { buildPlanApprovalChoiceHint } from "./planControl";
 
 // ── Spec file auto-approval helpers ────────────────────────────────
 
@@ -260,6 +261,7 @@ export interface OrchestratorCallbacks {
   getCurrentRunIntent: () => ResolvedUserIntent;
   getWorkflowMode: () => "chat" | "edit" | "plan";
   getIsPlanApproved: () => boolean;
+  getPlanApprovalChoice: () => string | null;
   getReadOnlyAutoApproveForSession: () => boolean;
   getPlanStage: () => "idle" | "requirements" | "design" | "tasks" | "bugfix" | "ready_to_execute" | "executing" | "completed";
   getPlanTasks: () => PlanTask[];
@@ -704,6 +706,7 @@ function buildPlanCommandExecutionHint(
 
 function buildApprovedPlanContinuationPrompt(callbacks: OrchestratorCallbacks): string {
   const language = callbacks.getPreferredLanguage();
+  const approvalChoiceHint = buildPlanApprovalChoiceHint(callbacks.getPlanApprovalChoice(), language);
   const requestedDocs = detectRequestedRootMarkdownDeliverables(getOriginalUserPromptForPlanFallback(callbacks));
   const deliverableHint = requestedDocs.length > 0
     ? language === "zh"
@@ -712,6 +715,7 @@ function buildApprovedPlanContinuationPrompt(callbacks: OrchestratorCallbacks): 
     : "";
 
   return (
+    approvalChoiceHint +
     (language === "zh"
       ? "计划已批准，现在进入执行阶段（EXECUTION MODE）。请按以下顺序继续：\n1. 先基于已批准的 requirements/design 或 bugfix 生成 `.MAIN/plans/tasks.md`，把执行任务拆清楚；tasks.md 必须精简为 8-20 个 checkbox，每项一句话。\n2. 生成 tasks.md 后，TopIsland 会显示任务进度；之后再按 tasks.md 逐个执行，使用 <tool_use> 格式调用工具。\n3. 任何需要 shell 的任务都必须在 tasks.md checkbox 中写出精确命令，并用反引号包裹；进入执行后，一次性命令优先用 run_command 并检查 exitCode/stdout/stderr；长驻或交互式命令用 execute_command 后再用 read_pty_since/read_pty_tail/get_pty_status 验证结果。\n4. 你可以正常修改项目源码文件，写入路径必须是项目中的正确位置，绝对不要将源码写入 `.MAIN/plans/` 或任何隐藏目录。\n5. 每完成一个任务后，先同步更新 `.MAIN/plans/tasks.md` 中对应的 checkbox 状态；tasks.md 是审计记录，不能删除已完成或旧任务，只能勾选、追加或保留“已完成任务”区块。只有全部任务都标记为 `[x]` 后，才能结束执行。\n"
       : "The plan is approved. You are now in EXECUTION MODE. Continue in this order:\n1. First generate `.MAIN/plans/tasks.md` from the approved requirements/design or bugfix so the execution steps are explicit. Keep tasks.md concise: 8-20 checkboxes, one sentence each.\n2. After tasks.md is generated, follow it task by task using tool calls.\n3. Any task that needs shell work must include the exact command inside the tasks.md checkbox text using backticks. During execution, prefer run_command for finite commands and inspect exitCode/stdout/stderr; use execute_command for long-running or interactive commands, then verify with read_pty_since/read_pty_tail/get_pty_status.\n4. You may now edit project source files, but write them to the proper project paths and never into `.MAIN/plans/` or hidden folders.\n5. After each task, update the matching checkbox in `.MAIN/plans/tasks.md` before moving on; tasks.md is an audit record, so never delete completed or previous tasks. Only check items off, append tasks, or keep a completed-tasks section. Only stop when all tasks are `[x]`.\n") +

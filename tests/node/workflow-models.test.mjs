@@ -18,6 +18,18 @@ function loadPlanEvidenceModule() {
   return loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planEvidence.ts"));
 }
 
+function loadPlanControlModule() {
+  return loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planControl.ts"));
+}
+
+function loadPlanLifecycleModule() {
+  return loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planLifecycle.ts"));
+}
+
+function loadTurnProgressModule() {
+  return loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/turnProgress.ts"));
+}
+
 function loadTranspiledModuleSync(sourcePath) {
   const normalizedPath = path.resolve(sourcePath);
   if (transpiledModuleCache.has(normalizedPath)) {
@@ -86,6 +98,19 @@ const {
   isPlanExecutionEvidenceTool,
 } = loadPlanEvidenceModule();
 
+const {
+  buildPlanApprovalChoiceHint,
+  shouldRouteQuickReplyToPlanApproval,
+} = loadPlanControlModule();
+
+const {
+  buildClosedActivePlanRuntimePatch,
+} = loadPlanLifecycleModule();
+
+const {
+  deriveTurnProgressItems,
+} = loadTurnProgressModule();
+
 test("normalizeConversationDisplayTitle strips speaker timestamps from transcript-style prompts", () => {
   const title = normalizeConversationDisplayTitle("Michael@: 04-23 17:57:52 这个它要建模 是啥意思", 40, "新的任务");
   assert.equal(title, "这个它要建模 是啥意思");
@@ -97,6 +122,137 @@ test("summarizeUserPrompt turns slash plan CTB request into a stable intent titl
     40,
   );
   assert.equal(title, "实现 CTB 战斗框架");
+});
+
+test("plan approval quick reply routes through approvePlan control path", () => {
+  assert.equal(
+    shouldRouteQuickReplyToPlanApproval({
+      text: "批准执行：先运行诊断脚本，再根据结果修复字体加载",
+      sourceIntent: "plan",
+      isPlanApproved: false,
+      planStage: "design",
+      planArtifacts: [{ kind: "design", path: ".MAIN/plans/design.md", title: "Design", content: "# Design", updatedAt: 1 }],
+    }),
+    true,
+  );
+
+  assert.equal(
+    shouldRouteQuickReplyToPlanApproval({
+      text: "先运行诊断脚本，再根据结果修复字体加载",
+      sourceIntent: "plan",
+      isPlanApproved: false,
+      planStage: "design",
+      planArtifacts: [{ kind: "design", path: ".MAIN/plans/design.md", title: "Design", content: "# Design", updatedAt: 1 }],
+    }),
+    false,
+  );
+
+  assert.equal(
+    shouldRouteQuickReplyToPlanApproval({
+      text: "批准执行：先运行诊断脚本，再根据结果修复字体加载",
+      optionAction: "allow_readonly_session",
+      sourceIntent: "plan",
+      isPlanApproved: false,
+      planStage: "design",
+      planArtifacts: [{ kind: "design", path: ".MAIN/plans/design.md", title: "Design", content: "# Design", updatedAt: 1 }],
+    }),
+    false,
+  );
+
+  assert.equal(
+    shouldRouteQuickReplyToPlanApproval({
+      text: "批准执行：先运行诊断脚本，再根据结果修复字体加载",
+      sourceIntent: "execute",
+      isPlanApproved: false,
+      planStage: "design",
+      planArtifacts: [{ kind: "design", path: ".MAIN/plans/design.md", title: "Design", content: "# Design", updatedAt: 1 }],
+    }),
+    false,
+  );
+
+  assert.equal(
+    shouldRouteQuickReplyToPlanApproval({
+      text: "批准执行：先运行诊断脚本，再根据结果修复字体加载",
+      sourceIntent: "plan",
+      isPlanApproved: true,
+      planStage: "design",
+      planArtifacts: [{ kind: "design", path: ".MAIN/plans/design.md", title: "Design", content: "# Design", updatedAt: 1 }],
+    }),
+    false,
+  );
+
+  assert.equal(
+    shouldRouteQuickReplyToPlanApproval({
+      text: "批准执行：先运行诊断脚本，再根据结果修复字体加载",
+      sourceIntent: "plan",
+      isPlanApproved: false,
+      planStage: "idle",
+      planArtifacts: [],
+    }),
+    false,
+  );
+});
+
+test("plan approval choice hint preserves the selected execution branch", () => {
+  assert.equal(
+    buildPlanApprovalChoiceHint("批准执行：先运行诊断脚本，再根据结果修复字体加载", "zh"),
+    "用户批准并选择：批准执行：先运行诊断脚本，再根据结果修复字体加载\n",
+  );
+});
+
+test("completed plan lifecycle patch clears active runtime without deleting history inputs", () => {
+  assert.deepEqual(buildClosedActivePlanRuntimePatch(), {
+    isPlanApproved: false,
+    planArtifacts: [],
+    planTasks: [],
+    planExecutionEvidenceLedger: [],
+    planExecutionEvidenceCount: 0,
+    planStage: "idle",
+    showPlanPanel: false,
+  });
+});
+
+test("deriveTurnProgressItems prefers explicit jobs and ignores plain numbered prose", () => {
+  const explicit = deriveTurnProgressItems([
+    {
+      id: 1,
+      type: "agent",
+      content: "<plan>[{\"id\":\"1\",\"subject\":\"准备文件\",\"status\":\"completed\"},{\"id\":\"2\",\"subject\":\"运行验证\",\"status\":\"in_progress\"}]</plan>",
+    },
+    {
+      id: 2,
+      type: "tool",
+      toolName: "read_file",
+      target: "src/App.tsx",
+      toolStatus: "executed",
+    },
+  ], "zh");
+
+  assert.deepEqual(explicit, [
+    { id: "1", text: "准备文件", status: "completed" },
+    { id: "2", text: "运行验证", status: "in_progress" },
+  ]);
+
+  assert.deepEqual(
+    deriveTurnProgressItems([
+      { id: 3, type: "agent", content: "1. 先分析\n2. 再修改\n3. 最后验证" },
+    ], "zh"),
+    [],
+  );
+});
+
+test("deriveTurnProgressItems falls back to tool activity progress", () => {
+  const steps = deriveTurnProgressItems([
+    { id: 1, type: "tool", toolName: "read_file", target: "src/App.tsx", toolStatus: "executed" },
+    { id: 2, type: "tool", toolName: "replace_in_file", target: "src/App.tsx", toolStatus: "running" },
+    { id: 3, type: "tool", toolName: "run_command", target: "npm test", toolStatus: "failed" },
+  ], "zh");
+
+  assert.deepEqual(steps, [
+    { id: "1", text: "读取文件: App.tsx", status: "completed" },
+    { id: "2", text: "修改文件: App.tsx", status: "in_progress" },
+    { id: "3", text: "执行命令: npm test", status: "failed" },
+  ]);
 });
 
 test("looksLikeReasoningLeakTitle detects leaked chain-of-thought style titles", () => {

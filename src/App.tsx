@@ -38,6 +38,7 @@ import {
 import { normalizeStudioAgentKey } from "./lib/gameStudioCatalog";
 import { MAIN_MODE_KEYS, mapLegacyNexusModeToMainMode, mapMainModeToLegacyNexusMode } from "./lib/mainModes";
 import { resolveConversationTurnIntent } from "./lib/runIntent";
+import { shouldRouteQuickReplyToPlanApproval } from "./lib/planControl";
 import { runAfterNextPaint } from "./lib/uiScheduling";
 import { normalizeConversationDisplayTitle, type ReplyOption, type RightPanelTab } from "./lib/workflowModels";
 import { appendDebugLog } from "./lib/debugLog";
@@ -78,6 +79,7 @@ function buildSessionRuntimeSnapshotFromState(state: any) {
     planExecutionEvidenceCount: state.planExecutionEvidenceCount ?? 0,
     planStage: state.planStage ?? "idle",
     isPlanApproved: state.isPlanApproved === true,
+    planApprovalChoice: state.planApprovalChoice ?? null,
     showPlanPanel: state.showPlanPanel === true,
     showDiff: state.showDiff === true,
     showTerminal: state.showTerminal === true,
@@ -611,6 +613,35 @@ export default function App() {
       ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId) || null
       : null;
     const sourceIntent = resolveConversationTurnIntent(sourceTurn);
+    const shouldApprovePlanFromQuickReply = shouldRouteQuickReplyToPlanApproval({
+      text,
+      optionAction,
+      sourceIntent,
+      isPlanApproved: state.isPlanApproved,
+      planArtifacts: state.planArtifacts,
+      planStage: state.planStage,
+    });
+
+    if (shouldApprovePlanFromQuickReply) {
+      appendDebugLog("info", "ui.quickReply_plan_approval", {
+        text,
+        sourceTurnId,
+        currentTurnId: state.currentTurnId,
+        planStage: state.planStage,
+        planArtifacts: state.planArtifacts.length,
+      });
+      useAppStore.setState({
+        ...(sourceTurnId ? { currentTurnId: sourceTurnId } : {}),
+        input: "",
+        contextMentions: [],
+        attachedFiles: [],
+      });
+      runAfterNextPaint(() => {
+        useAppStore.getState().approvePlan(text);
+      });
+      return;
+    }
+
     const shouldReuseSourceTurn = !!sourceTurnId && !!sourceTurn;
     const sendOptions = shouldReuseSourceTurn
       ? {
@@ -771,6 +802,7 @@ export default function App() {
         planExecutionEvidenceCount: snapshot.planExecutionEvidenceCount ?? 0,
         planStage: snapshot.planStage ?? 'idle',
         isPlanApproved: snapshot.isPlanApproved ?? false,
+        planApprovalChoice: snapshot.planApprovalChoice ?? null,
         showPlanPanel: snapshot.showPlanPanel ?? false,
         showDiff: snapshot.showDiff ?? false,
         showTerminal: snapshot.showTerminal ?? false,
@@ -892,6 +924,7 @@ export default function App() {
       planExecutionEvidenceCount: 0,
       planStage: 'idle',
       isPlanApproved: false,
+      planApprovalChoice: null,
     });
     appendDebugLog("info", "session.restore", {
       sessionId: id,
@@ -946,6 +979,7 @@ export default function App() {
           planExecutionEvidenceCount: 0,
           planStage: "idle",
           isPlanApproved: false,
+          planApprovalChoice: null,
           agentStatus: "idle",
           isGenerating: false,
           abortController: null,
@@ -1044,6 +1078,7 @@ export default function App() {
       planExecutionEvidenceCount: 0,
       planStage: "idle",
       isPlanApproved: false,
+      planApprovalChoice: null,
       showPlanPanel: false,
       showDiff: false,
       showTerminal: false,
@@ -1147,6 +1182,7 @@ export default function App() {
         planTasks: [],
         planStage: "idle",
         isPlanApproved: false,
+        planApprovalChoice: null,
         planExecutionEvidenceLedger: [],
         planExecutionEvidenceCount: 0,
         showPlanPanel: false,

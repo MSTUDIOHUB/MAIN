@@ -4,7 +4,7 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import { executeAgentLoop, type AgentMessage, type OrchestratorCallbacks, type ReviewDecision, type ContentPart } from "../lib/orchestrator";
-import { analyzeTabularDocument, deleteChatTempPath, deletePlanFiles, readDocument, readFile } from "../lib/ipc";
+import { analyzeTabularDocument, deleteChatTempPath, deletePlanFiles, deleteWorkspacePath, readChatTempFile, readDocument, readFile, writeChatTempFile, writeFile } from "../lib/ipc";
 import { invoke } from "@tauri-apps/api/core";
 import { setWorkspaceRoot as setWorkspaceRootIpc } from "../lib/ipc";
 import { appendDebugLog } from "../lib/debugLog";
@@ -31,6 +31,7 @@ import {
   type PlanTask,
   type ReplyOption,
   type RightPanelTab,
+  detectPlanArtifactKind,
   detectDominantLanguage,
   extractPlanTasks,
   findDroppedPlanTasks,
@@ -51,6 +52,7 @@ import {
   isPlanEvidenceLedgerTool,
   isPlanExecutionEvidenceTool,
 } from "../lib/planEvidence";
+import { buildClosedActivePlanRuntimePatch } from "../lib/planLifecycle";
 import {
   buildAnthropicRequestBody,
   buildOpenAiResponsesInputCandidates,
@@ -70,6 +72,7 @@ import {
   type CloudServerConfig,
 } from "../lib/cloudServers";
 import { buildToolDiffPreview, supportsToolDiffPreview } from "../lib/toolDiff";
+import { buildPlanApprovalChoiceHint, normalizePlanApprovalChoice } from "../lib/planControl";
 import {
   buildGameStudioEnvelopeForTurn,
   ensureGameStudioWorkspaceInitialized,
@@ -426,6 +429,7 @@ export interface SessionRuntimeSnapshot {
   planExecutionEvidenceCount: number;
   planStage: PlanStage;
   isPlanApproved: boolean;
+  planApprovalChoice?: string | null;
   showPlanPanel: boolean;
   showDiff: boolean;
   showTerminal: boolean;
@@ -446,6 +450,7 @@ export interface SessionRuntimeState extends SessionRuntimeSnapshot {
     | null;
   currentTurnExecutionConsent: { turnId: string | null; granted: boolean };
   readOnlyAutoApproveForSession: boolean;
+  planApprovalChoice: string | null;
   normalizedStreamState: NormalizedStreamState;
   currentTurnState: AppState["currentTurnState"];
   isGenerating: boolean;
@@ -548,9 +553,35 @@ interface TaskBlockBase {
   turnId?: string;
 }
 
+export interface ToolDiffSnapshot {
+  old: string;
+  new: string;
+  path?: string;
+  existed?: boolean;
+  fullFile?: boolean;
+}
+
+export type DiffRevertStatus = "reverting" | "reverted" | "failed";
+
+export interface DiffRevertRequest {
+  path: string;
+  taskIds: number[];
+  oldText: string;
+  newText: string;
+  existed?: boolean;
+  fullFile?: boolean;
+}
+
+export interface DiffRevertResult {
+  path: string;
+  taskIds: number[];
+  ok: boolean;
+  message: string;
+}
+
 export type TaskBlock =
   | (TaskBlockBase & { type: "user"; content: string; images?: string[] })
-  | (TaskBlockBase & { type: "tool"; toolName: string; target: string; status: string; toolStatus: "pending" | "executed" | "rejected" | "running" | "failed"; message?: string; diff?: { old: string; new: string; path?: string } })
+  | (TaskBlockBase & { type: "tool"; toolName: string; target: string; status: string; toolStatus: "pending" | "executed" | "rejected" | "running" | "failed"; message?: string; diff?: ToolDiffSnapshot; revertStatus?: DiffRevertStatus; revertMessage?: string })
   | (TaskBlockBase & { type: "agent"; content: string; options?: ReplyOption[]; streaming?: boolean; hiddenProcess?: boolean; archivedAfterChoice?: boolean; selectedOption?: string })
   | (TaskBlockBase & { type: "thought"; content: string; isStreaming?: boolean; duration?: number })
   | (TaskBlockBase & { type: "jobList"; jobs: JobItem[] })
@@ -648,7 +679,7 @@ interface AppState {
   lockedComposerIntent: MainIntentShortcut | null;
   pendingRunDecision: PendingRunDecision | null;
   executionConsentPolicy: ExecutionConsentPolicy;
-  setInput: (v: string) => void;
+  setInput: (v: string, options?: { preserveLockedComposerIntent?: boolean }) => void;
   setPreferredResponseLanguage: (lang: Lang) => void;
   setContextMentions: (v: string[]) => void;
   addMention: (file: string) => void;
@@ -747,6 +778,7 @@ interface AppState {
   setTaskFlow: (updater: (prev: TaskBlock[]) => TaskBlock[]) => void;
   acceptDiff: (id: number) => void;
   rejectDiff: (id: number) => void;
+  revertDiffGroups: (groups: DiffRevertRequest[]) => Promise<DiffRevertResult[]>;
 
   // Data management
   clearChatHistory: () => void;
@@ -754,6 +786,7 @@ interface AppState {
 
   // Workflow mode
   isPlanApproved: boolean;
+  planApprovalChoice: string | null;
   planArtifacts: PlanArtifact[];
   planStage: PlanStage;
   planTasks: PlanTask[];
@@ -768,7 +801,7 @@ interface AppState {
   deletePersistedPlanFiles: () => Promise<void>;
   setPlanTasks: (tasks: PlanTask[]) => void;
   setNormalizedStreamState: (state: NormalizedStreamState) => void;
-  approvePlan: () => void;
+  approvePlan: (approvalChoice?: string) => void;
   rejectPlan: () => void;
   showWorkflowMenu: boolean;
   setShowWorkflowMenu: (v: boolean) => void;
@@ -1039,6 +1072,7 @@ function normalizeSessionRuntimeSnapshot(
     planExecutionEvidenceCount: snapshot.planExecutionEvidenceCount ?? 0,
     planStage: snapshot.planStage ?? "idle",
     isPlanApproved: snapshot.isPlanApproved ?? false,
+    planApprovalChoice: normalizePlanApprovalChoice(snapshot.planApprovalChoice),
     showPlanPanel: snapshot.showPlanPanel ?? false,
     showDiff: snapshot.showDiff ?? false,
     showTerminal: snapshot.showTerminal ?? false,
@@ -1064,6 +1098,7 @@ const sessionRuntimeKeys = [
   "planExecutionEvidenceCount",
   "planStage",
   "isPlanApproved",
+  "planApprovalChoice",
   "showPlanPanel",
   "showDiff",
   "showTerminal",
@@ -1134,6 +1169,7 @@ function createSessionRuntimeFromState(state: Partial<AppState>): SessionRuntime
     planExecutionEvidenceCount: state.planExecutionEvidenceCount ?? 0,
     planStage: state.planStage ?? "idle",
     isPlanApproved: state.isPlanApproved === true,
+    planApprovalChoice: normalizePlanApprovalChoice(state.planApprovalChoice),
     showPlanPanel: state.showPlanPanel === true,
     showDiff: state.showDiff === true,
     showTerminal: state.showTerminal === true,
@@ -1827,7 +1863,19 @@ export function sanitizeTaskBlocksForPersist(blocks: TaskBlock[]): TaskBlock[] {
           status: String(b.status),
           toolStatus: b.toolStatus,
           ...(b.message ? { message: String(b.message) } : {}),
-          ...(b.diff ? { diff: { old: String(b.diff.old), new: String(b.diff.new), path: b.diff.path ? String(b.diff.path) : undefined } } : {}),
+          ...(b.diff
+            ? {
+                diff: {
+                  old: String(b.diff.old),
+                  new: String(b.diff.new),
+                  path: b.diff.path ? String(b.diff.path) : undefined,
+                  ...(typeof b.diff.existed === "boolean" ? { existed: b.diff.existed } : {}),
+                  ...(typeof b.diff.fullFile === "boolean" ? { fullFile: b.diff.fullFile } : {}),
+                },
+              }
+            : {}),
+          ...(b.revertStatus ? { revertStatus: b.revertStatus } : {}),
+          ...(b.revertMessage ? { revertMessage: String(b.revertMessage) } : {}),
         };
       case "system":
         return {
@@ -1978,6 +2026,69 @@ function derivePlanStageFromArtifacts(
   }
 
   return "idle";
+}
+
+function supportsFullFileDiffRevert(block: Extract<TaskBlock, { type: "tool" }>): boolean {
+  if (!block.diff) return false;
+  if (block.diff.fullFile === true) return true;
+  if (block.diff.fullFile === false) return false;
+  return block.toolName === "write_file";
+}
+
+function buildPlanArtifactRevertPatch(
+  state: AppState,
+  path: string,
+  oldText: string,
+  existed: boolean,
+): Partial<AppState> {
+  const kind = detectPlanArtifactKind(path);
+  if (!kind || kind === "summary") return {};
+
+  const sanitized = sanitizePlanArtifactContent(oldText);
+  const shouldKeepArtifact = existed && sanitized.trim().length > 0;
+  const nextArtifacts = shouldKeepArtifact
+    ? [
+        ...state.planArtifacts.filter((artifact) => artifact.kind !== kind),
+        {
+          kind,
+          path,
+          title: getPlanArtifactTitle(kind, state.config.language === "en" ? "en" : "zh"),
+          content: sanitized,
+          updatedAt: Date.now(),
+        },
+      ]
+    : state.planArtifacts.filter((artifact) => artifact.kind !== kind);
+
+  let nextTasks = state.planTasks;
+  if (kind === "tasks" || kind === "bugfix") {
+    const taskArtifact =
+      nextArtifacts.find((artifact) => artifact.kind === "tasks") ||
+      nextArtifacts.find((artifact) => artifact.kind === "bugfix");
+    const parsedTasks = taskArtifact ? extractPlanTasks(taskArtifact.content) : [];
+    nextTasks = parsedTasks.length > 0
+      ? reconcilePlanTaskCompletion(state.planTasks, parsedTasks, state.planExecutionEvidenceLedger, {
+          preserveMissing: state.isPlanApproved || state.planStage === "executing" || state.planStage === "completed",
+          highlightNext: state.isPlanApproved && state.planExecutionEvidenceLedger.length > 0,
+        })
+      : [];
+  } else {
+    nextTasks = normalizePlanTaskStatuses(
+      state.planTasks,
+      state.planExecutionEvidenceLedger,
+      state.isPlanApproved && state.planExecutionEvidenceLedger.length > 0,
+    );
+  }
+
+  return {
+    planArtifacts: nextArtifacts.sort((a, b) => a.updatedAt - b.updatedAt),
+    planTasks: nextTasks,
+    planStage: derivePlanStageFromArtifacts(
+      nextArtifacts,
+      nextTasks,
+      state.isPlanApproved,
+      state.planStage,
+    ),
+  };
 }
 
 function buildPlanCommandExecutionHint(
@@ -2388,9 +2499,9 @@ export const useAppStore = create<AppState>()(
   lockedComposerIntent: null,
   pendingRunDecision: null,
   executionConsentPolicy: "ask_per_turn",
-  setInput: (v) => set({
+  setInput: (v, options) => set({
     input: v,
-    ...(v.trim().length === 0 ? { lockedComposerIntent: null } : {}),
+    ...(v.trim().length === 0 && !options?.preserveLockedComposerIntent ? { lockedComposerIntent: null } : {}),
   }),
   setPreferredResponseLanguage: (lang) => set({ preferredResponseLanguage: lang }),
   setContextMentions: (v) => set({ contextMentions: v }),
@@ -3005,6 +3116,130 @@ export const useAppStore = create<AppState>()(
       get().rejectToolAction(id);
     }
   },
+  revertDiffGroups: async (groups) => {
+    const language = get().config.language === "en" ? "en" : "zh";
+    const copy = {
+      noPath: language === "zh" ? "缺少文件路径，无法撤销。" : "Missing file path; cannot revert.",
+      noExecuted: language === "zh" ? "没有已执行的修改可撤销。" : "No executed change is available to revert.",
+      unsafeLegacy: language === "zh" ? "这条历史 Diff 不是完整文件快照，无法安全撤销。" : "This historical diff is not a full-file snapshot, so it cannot be safely reverted.",
+      conflict: language === "zh" ? "文件内容已经变化，未覆盖后续改动。" : "The file has changed since this diff was recorded; later edits were not overwritten.",
+      missingExisting: language === "zh" ? "原文件不存在，无法恢复旧内容。" : "The file no longer exists, so the old content cannot be restored.",
+      rejected: language === "zh" ? "待审批修改已拒绝。" : "Pending change rejected.",
+      restored: language === "zh" ? "已恢复到修改前内容。" : "Restored to the content before this change.",
+      deleted: language === "zh" ? "已删除 AI 新建的文件。" : "Deleted the file created by the AI.",
+    };
+    const results: DiffRevertResult[] = [];
+
+    for (const group of groups) {
+      const path = String(group.path || "").trim();
+      const taskIds = group.taskIds.filter((id) => Number.isFinite(id));
+      if (!path) {
+        results.push({ path, taskIds, ok: false, message: copy.noPath });
+        continue;
+      }
+
+      const state = get();
+      const taskIdSet = new Set(taskIds);
+      const relatedBlocks = state.taskFlow.filter(
+        (block): block is Extract<TaskBlock, { type: "tool" }> =>
+          block.type === "tool" && taskIdSet.has(block.id) && !!block.diff,
+      );
+      const pendingBlock = relatedBlocks.find((block) => block.toolStatus === "pending");
+      if (pendingBlock) {
+        get().rejectDiff(pendingBlock.id);
+        results.push({ path, taskIds, ok: true, message: copy.rejected });
+        continue;
+      }
+
+      const executedBlocks = relatedBlocks.filter((block) => block.toolStatus === "executed");
+      if (executedBlocks.length === 0) {
+        results.push({ path, taskIds, ok: false, message: copy.noExecuted });
+        continue;
+      }
+
+      const canRevert = executedBlocks.every(supportsFullFileDiffRevert);
+      if (!canRevert) {
+        const message = copy.unsafeLegacy;
+        set((s) => ({
+          taskFlow: s.taskFlow.map((block) =>
+            block.type === "tool" && taskIdSet.has(block.id)
+              ? { ...block, revertStatus: "failed" as const, revertMessage: message }
+              : block
+          ),
+        }));
+        results.push({ path, taskIds, ok: false, message });
+        continue;
+      }
+
+      const existed = group.existed ?? executedBlocks[0]?.diff?.existed ?? true;
+      const workspace = state.currentWorkspace.trim();
+      const sessionKey = !workspace ? resolveGlobalChatSessionKey(state.currentSessionId) : null;
+      const useChatTempStorage = !!sessionKey && !workspace;
+
+      set((s) => ({
+        taskFlow: s.taskFlow.map((block) =>
+          block.type === "tool" && taskIdSet.has(block.id) && block.toolStatus === "executed"
+            ? { ...block, revertStatus: "reverting" as const, revertMessage: "" }
+            : block
+        ),
+      }));
+
+      try {
+        let currentContent = "";
+        let missingCurrentFile = false;
+        try {
+          currentContent = useChatTempStorage
+            ? await readChatTempFile(sessionKey!, path)
+            : await readFile(path, workspace || undefined);
+        } catch {
+          missingCurrentFile = true;
+        }
+
+        if (missingCurrentFile) {
+          if (existed) throw new Error(copy.missingExisting);
+        } else if (currentContent !== group.newText) {
+          throw new Error(copy.conflict);
+        }
+
+        if (!existed) {
+          if (useChatTempStorage) {
+            await deleteChatTempPath(sessionKey!, path);
+          } else {
+            await deleteWorkspacePath(path, workspace || undefined);
+          }
+        } else if (useChatTempStorage) {
+          await writeChatTempFile(sessionKey!, path, group.oldText);
+        } else {
+          await writeFile(path, group.oldText, workspace || undefined);
+        }
+
+        const message = existed ? copy.restored : copy.deleted;
+        set((s) => ({
+          taskFlow: s.taskFlow.map((block) =>
+            block.type === "tool" && taskIdSet.has(block.id) && block.toolStatus === "executed"
+              ? { ...block, revertStatus: "reverted" as const, revertMessage: message }
+              : block
+          ),
+          ...buildPlanArtifactRevertPatch(s, path, group.oldText, existed),
+        }));
+        invalidateWorkspaceTreeCache();
+        get().bumpWorkspaceContentVersion();
+        results.push({ path, taskIds, ok: true, message });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        set((s) => ({
+          taskFlow: s.taskFlow.map((block) =>
+            block.type === "tool" && taskIdSet.has(block.id) && block.toolStatus === "executed"
+              ? { ...block, revertStatus: "failed" as const, revertMessage: message }
+              : block
+          ),
+        }));
+        results.push({ path, taskIds, ok: false, message });
+      }
+    }
+
+    return results;
+  },
 
   // ── Data Management ──────────────────────────────────────────────────
 
@@ -3038,6 +3273,7 @@ export const useAppStore = create<AppState>()(
         planExecutionEvidenceLedger: [],
         planExecutionEvidenceCount: 0,
         planStage: "idle",
+        planApprovalChoice: null,
         normalizedStreamState: defaultNormalizedStreamState,
         resolvedInstructionSet: null,
         instructionSources: [],
@@ -3092,6 +3328,7 @@ export const useAppStore = create<AppState>()(
       planExecutionEvidenceLedger: [],
       planExecutionEvidenceCount: 0,
       planStage: "idle",
+      planApprovalChoice: null,
       normalizedStreamState: defaultNormalizedStreamState,
     });
   },
@@ -3099,6 +3336,7 @@ export const useAppStore = create<AppState>()(
   // ── Workflow Mode ──────────────────────────────────────────────────
 
   isPlanApproved: false,
+  planApprovalChoice: null,
   planArtifacts: [],
   planStage: "idle",
   planTasks: [],
@@ -3109,7 +3347,7 @@ export const useAppStore = create<AppState>()(
     config: { ...s.config, workflowMode: mode },
     ...(mode === "chat" ? { showPlanPanel: false, showDiff: false } : {}),
   })),
-  setIsPlanApproved: (v) => set({ isPlanApproved: v }),
+  setIsPlanApproved: (v) => set({ isPlanApproved: v, ...(v ? {} : { planApprovalChoice: null }) }),
   setPlanStage: (stage) => set({ planStage: stage }),
   upsertPlanArtifact: (artifact) =>
     set((s) => {
@@ -3193,6 +3431,7 @@ export const useAppStore = create<AppState>()(
       planExecutionEvidenceLedger: [],
       planExecutionEvidenceCount: 0,
       normalizedStreamState: defaultNormalizedStreamState,
+      planApprovalChoice: null,
       showPlanPanel: false,
     }),
   deletePersistedPlanFiles: async () => {
@@ -3209,7 +3448,7 @@ export const useAppStore = create<AppState>()(
     } finally {
       invalidateWorkspaceTreeCache();
       get().clearPlanArtifacts();
-      set({ isPlanApproved: false, planExecutionEvidenceLedger: [], planExecutionEvidenceCount: 0 });
+      set({ isPlanApproved: false, planApprovalChoice: null, planExecutionEvidenceLedger: [], planExecutionEvidenceCount: 0 });
       get().bumpWorkspaceContentVersion();
     }
   },
@@ -3225,13 +3464,16 @@ export const useAppStore = create<AppState>()(
     ),
   })),
   setNormalizedStreamState: (state) => set({ normalizedStreamState: state }),
-  approvePlan: () =>
+  approvePlan: (approvalChoice) =>
     (() => {
       const state = get();
+      const normalizedApprovalChoice = normalizePlanApprovalChoice(approvalChoice);
+      const approvalChoicePatch = { planApprovalChoice: normalizedApprovalChoice || null };
 
       if (state.agentStatus === "pending_review") {
         set({
           isPlanApproved: true,
+          ...approvalChoicePatch,
           planExecutionEvidenceLedger: [],
           planExecutionEvidenceCount: 0,
           agentStatus: "running",
@@ -3250,6 +3492,7 @@ export const useAppStore = create<AppState>()(
 
       set({
         isPlanApproved: true,
+        ...approvalChoicePatch,
         planExecutionEvidenceLedger: [],
         planExecutionEvidenceCount: 0,
         planStage: "executing",
@@ -3274,16 +3517,18 @@ export const useAppStore = create<AppState>()(
                 ? ` The final tasks must include writing ${requestedDocs.map((name) => `project-root \`${name}\``).join(", ")} before completion.`
                 : ` 最终 tasks 必须包含写入${requestedDocs.map((name) => `项目根目录 \`${name}\``).join("、")}，完成前必须真实落盘。`
               : "";
+            const language = state.config.language === "en" ? "en" : "zh";
+            const approvalChoiceHint = buildPlanApprovalChoiceHint(normalizedApprovalChoice, language);
 
-            if (state.config.language === "en") {
+            if (language === "en") {
               return hasTasksArtifact
-              ? "The plan is approved. Continue directly from the current tasks.md and execute the remaining items without repeating the plan. Do not delete completed or previous task records; only check an item off after real evidence exists for its file/command/deliverable." + deliverableHint + "\n\n" + buildPlanCommandExecutionHint(state.planTasks, "en")
-                : "The plan is approved. First generate `.MAIN/plans/tasks.md` from the approved requirements/design or bugfix, then execute the remaining work from that task list without repeating the plan. Keep tasks.md concise: 8-20 checkboxes, one sentence each, and add lightweight evidence tags such as `evidence: file:src/app.ts` or `evidence: cmd:npm test` when a task has a concrete deliverable. During execution tasks.md is an audit record; never delete completed or previous tasks, and only check an item off after trusted evidence exists." + deliverableHint;
+              ? approvalChoiceHint + "The plan is approved. Continue directly from the current tasks.md and execute the remaining items without repeating the plan. Do not delete completed or previous task records; only check an item off after real evidence exists for its file/command/deliverable." + deliverableHint + "\n\n" + buildPlanCommandExecutionHint(state.planTasks, "en")
+                : approvalChoiceHint + "The plan is approved. First generate `.MAIN/plans/tasks.md` from the approved requirements/design or bugfix, then execute the remaining work from that task list without repeating the plan. Keep tasks.md concise: 8-20 checkboxes, one sentence each, and add lightweight evidence tags such as `evidence: file:src/app.ts` or `evidence: cmd:npm test` when a task has a concrete deliverable. During execution tasks.md is an audit record; never delete completed or previous tasks, and only check an item off after trusted evidence exists." + deliverableHint;
             }
 
             return hasTasksArtifact
-              ? "计划已批准。请直接基于当前 tasks.md 继续执行剩余任务，不要重复计划内容。不要删除已完成或旧任务记录；只有文件/命令/交付物的真实证据满足后，才能勾选对应任务。" + deliverableHint + "\n\n" + buildPlanCommandExecutionHint(state.planTasks, "zh")
-              : "计划已批准。请先基于已批准的 requirements/design 或 bugfix 生成 `.MAIN/plans/tasks.md`，然后再按照任务清单继续执行，不要重复计划内容。tasks.md 必须精简为 8-20 个 checkbox，每项一句话；有明确交付物的任务请追加轻量证据标签，例如 `证据: file:src/app.ts` 或 `证据: cmd:npm test`。执行中 tasks.md 是审计记录，不能删除已完成或旧任务；只有可信证据满足后才能勾选任务。" + deliverableHint;
+              ? approvalChoiceHint + "计划已批准。请直接基于当前 tasks.md 继续执行剩余任务，不要重复计划内容。不要删除已完成或旧任务记录；只有文件/命令/交付物的真实证据满足后，才能勾选对应任务。" + deliverableHint + "\n\n" + buildPlanCommandExecutionHint(state.planTasks, "zh")
+              : approvalChoiceHint + "计划已批准。请先基于已批准的 requirements/design 或 bugfix 生成 `.MAIN/plans/tasks.md`，然后再按照任务清单继续执行，不要重复计划内容。tasks.md 必须精简为 8-20 个 checkbox，每项一句话；有明确交付物的任务请追加轻量证据标签，例如 `证据: file:src/app.ts` 或 `证据: cmd:npm test`。执行中 tasks.md 是审计记录，不能删除已完成或旧任务；只有可信证据满足后才能勾选任务。" + deliverableHint;
           })(),
           undefined,
           { hidden: true, reuseCurrentTurn: true, preservePlanState: true },
@@ -3295,6 +3540,7 @@ export const useAppStore = create<AppState>()(
     state.abortController?.abort();
     set({
       isPlanApproved: false,
+      planApprovalChoice: null,
       planExecutionEvidenceLedger: [],
       planExecutionEvidenceCount: 0,
       agentStatus: "idle",
@@ -3845,6 +4091,7 @@ export const useAppStore = create<AppState>()(
     if (!preservePlanState && !isLocalStudioCommand) {
       set({
         isPlanApproved: false,
+        planApprovalChoice: null,
         planExecutionEvidenceLedger: [],
         planExecutionEvidenceCount: 0,
         normalizedStreamState: defaultNormalizedStreamState,
@@ -4385,7 +4632,7 @@ export const useAppStore = create<AppState>()(
       pendingRunDecision: null,
       isGenerating: true,
       config: { ...s.config, workflowMode: effectiveWorkflowMode },
-      ...(preservePlanState ? {} : { isPlanApproved: false }),
+      ...(preservePlanState ? {} : { isPlanApproved: false, planApprovalChoice: null }),
       elapsedTime: 0,
     }));
 
@@ -5009,6 +5256,7 @@ export const useAppStore = create<AppState>()(
         getCurrentRunIntent: () => sessionGet().getCurrentRunIntent(),
         getWorkflowMode: () => getIntentPolicy(sessionGet().getCurrentRunIntent()).workflowMode,
         getIsPlanApproved: () => sessionGet().isPlanApproved,
+        getPlanApprovalChoice: () => sessionGet().planApprovalChoice,
         getReadOnlyAutoApproveForSession: () => sessionGet().readOnlyAutoApproveForSession,
         getPlanStage: () => sessionGet().planStage,
         getPlanTasks: () => sessionGet().planTasks,
@@ -5545,6 +5793,24 @@ export const useAppStore = create<AppState>()(
                 ? "planning"
                 : "executing";
             sessionGet().setConversationTurnStatus(turnId, nextTurnStatus);
+          }
+          if (
+            status === "idle" &&
+            effectiveRunIntent === "plan" &&
+            sessionGet().isPlanApproved &&
+            sessionGet().planStage === "completed"
+          ) {
+            logStoreEvent("plan_runtime_closed_after_completion", {
+              turnId,
+              sessionKey: runSessionKey,
+              workspace: runWorkspace || null,
+              planTasks: sessionGet().planTasks.length,
+              evidenceCount: sessionGet().planExecutionEvidenceCount,
+            });
+            sessionSet({
+              ...buildClosedActivePlanRuntimePatch(),
+              currentTurnExecutionConsent: { turnId: null, granted: false },
+            });
           }
           if (status === "idle" || status === "error") {
             clearNoFirstTokenNoticeTimer();

@@ -13,6 +13,7 @@ import { getDiffStats } from "../lib/diff";
 import { parseMessageContent } from "../lib/messageParser";
 import { hasPlanDraftPreview, hasStructuredPlanProposal } from "../lib/planProposal";
 import { sanitizeAIOutput } from "../lib/sanitize";
+import { deriveTurnProgressItems } from "../lib/turnProgress";
 import { useAppStore } from "../store/useAppStore";
 import {
   collectChangeEntries,
@@ -1218,6 +1219,11 @@ export default function ChatArea({
   const shouldShowPinnedPlanTasks =
     !!pinnedPlanTurn &&
     (isPlanApproved || planStage === "executing" || planStage === "completed");
+  const topIslandExecutionSteps = useMemo(() => {
+    if (!topIslandTurn) return [];
+    if (isPlanConversationTurn(topIslandTurn)) return [];
+    return deriveTurnProgressItems(topIslandTurnBlocks, language);
+  }, [language, topIslandTurn, topIslandTurnBlocks]);
   const composerPaddingBottom = composerHeight + 32;
   const hasPlanPanelContent = useMemo(() => {
     if (planArtifacts.length > 0) return true;
@@ -1266,6 +1272,7 @@ export default function ChatArea({
   const hasTopIslandTaskContext =
     !!pendingRunDecision ||
     planTasks.length > 0 ||
+    topIslandExecutionSteps.length > 0 ||
     !!activeDiffTask ||
     canApprovePlan ||
     topIslandTurnStatusKey === "awaiting_input";
@@ -1425,7 +1432,8 @@ export default function ChatArea({
             )}
             {block.content && (
               <div
-                className="leading-relaxed text-[#e4e4e7]"
+                data-testid="user-message-content"
+                className="whitespace-pre-wrap break-words leading-relaxed text-[#e4e4e7]"
                 style={{
                   fontSize: `${config.chatFontSize ?? 13}px`,
                   lineHeight: `${Math.max(22, Math.round((config.chatFontSize ?? 13) * 1.7))}px`,
@@ -1771,6 +1779,8 @@ export default function ChatArea({
           themeMode={config.themeMode}
           planTasks={shouldShowPinnedPlanTasks ? planTasks : []}
           planStage={pinnedPlanTurn ? planStage : "idle"}
+          executionSteps={shouldShowPinnedPlanTasks ? [] : topIslandExecutionSteps}
+          progressMode={shouldShowPinnedPlanTasks ? "plan" : "execution"}
           isAwaitingChoice={topIslandTurnStatusKey === "awaiting_input"}
           replyOptions={topIslandReplyOptions}
           pendingRunDecision={pendingRunDecision}

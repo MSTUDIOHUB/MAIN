@@ -69,3 +69,41 @@ test("plan flow supports save then approve and finish", async ({ page }) => {
     )
     .toBe(true);
 });
+
+test("plan approval quick reply approves instead of re-sending an unapproved plan turn", async ({ page }) => {
+  await page.goto("/?e2eScenario=plan-quick-reply-approval");
+
+  await expect(page.getByTestId("top-island-awaiting-choice")).toBeVisible();
+  await expect(page.getByTestId("top-island-reply-option-0")).toContainText("批准执行");
+
+  await page.getByTestId("top-island-reply-option-0").click();
+
+  await expect
+    .poll(async () =>
+      page.evaluate(() => {
+        const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+        return {
+          isPlanApproved: snapshot?.isPlanApproved,
+          planStage: snapshot?.planStage,
+          taskFlowUserCount: snapshot?.taskFlowUserCount,
+        };
+      }),
+    )
+    .toEqual({
+      isPlanApproved: true,
+      planStage: "executing",
+      taskFlowUserCount: 1,
+    });
+
+  await expect
+    .poll(async () =>
+      page.evaluate(() => {
+        const entries = JSON.parse(window.localStorage.getItem("main.debugLog.v1") || "[]");
+        return entries.some((entry: { source?: string; message?: string }) =>
+          entry.source === "ui.quickReply_plan_approval" &&
+          String(entry.message || "").includes("先运行诊断脚本"),
+        );
+      }),
+    )
+    .toBe(true);
+});

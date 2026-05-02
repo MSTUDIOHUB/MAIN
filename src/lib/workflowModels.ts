@@ -773,7 +773,8 @@ export function collectChangeEntries(
     toolName?: string;
     toolStatus?: string;
     target?: string;
-    diff?: { old: string; new: string; path?: string };
+    diff?: { old: string; new: string; path?: string; existed?: boolean; fullFile?: boolean };
+    revertStatus?: string;
   }>,
   getStats: (oldText: string, newText: string) => { added: number; removed: number },
 ): { entries: ChangeEntry[]; totalExecutedEdits: number } {
@@ -784,6 +785,7 @@ export function collectChangeEntries(
   blocks.forEach((block, order) => {
     if (block.type !== "tool" || block.toolStatus !== "executed" || !block.diff) return;
     if (block.toolName !== "write_file" && block.toolName !== "replace_in_file") return;
+    if (block.revertStatus === "reverted") return;
 
     totalExecutedEdits++;
     const target = String(block.target || block.diff.path || block.toolName || "");

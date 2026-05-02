@@ -62,7 +62,7 @@ jobs:
       - name: Generate app icons
         run: npm run icon:app
 
-      - name: Build macOS app bundle
+      - name: Build macOS universal app bundle
         shell: bash
         run: |
           if [[ -n "${APPLE_CERTIFICATE}" || -n "${APPLE_SIGNING_IDENTITY}" ]]; then
@@ -71,23 +71,43 @@ jobs:
             npm run tauri build -- --target universal-apple-darwin --bundles app --no-sign
           fi
 
-      - name: Zip macOS app bundle
+      - name: Build macOS Apple Silicon app bundle
+        shell: bash
+        run: |
+          if [[ -n "${APPLE_CERTIFICATE}" || -n "${APPLE_SIGNING_IDENTITY}" ]]; then
+            npm run tauri build -- --target aarch64-apple-darwin --bundles app
+          else
+            npm run tauri build -- --target aarch64-apple-darwin --bundles app --no-sign
+          fi
+
+      - name: Zip macOS app bundles
         shell: bash
         run: |
           set -euo pipefail
 
-          app_path="src-tauri/target/universal-apple-darwin/release/bundle/macos/${APP_NAME}.app"
-          zip_name="${APP_NAME}_${VERSION}_macOS_universal.zip"
-
-          test -d "$app_path"
-
-          if [[ -z "${APPLE_CERTIFICATE}" && -z "${APPLE_SIGNING_IDENTITY}" ]]; then
-            codesign --force --deep --sign - "$app_path"
-            codesign --verify --deep --strict --verbose=2 "$app_path"
-          fi
-
           mkdir -p release-assets
-          ditto -c -k --sequesterRsrc --keepParent "$app_path" "release-assets/$zip_name"
+
+          zip_app() {
+            local app_path="$1"
+            local zip_name="$2"
+
+            test -d "$app_path"
+
+            if [[ -z "${APPLE_CERTIFICATE}" && -z "${APPLE_SIGNING_IDENTITY}" ]]; then
+              codesign --force --deep --sign - "$app_path"
+              codesign --verify --deep --strict --verbose=2 "$app_path"
+            fi
+
+            ditto -c -k --sequesterRsrc --keepParent "$app_path" "release-assets/$zip_name"
+          }
+
+          zip_app \
+            "src-tauri/target/universal-apple-darwin/release/bundle/macos/${APP_NAME}.app" \
+            "${APP_NAME}_${VERSION}_macOS_universal.zip"
+
+          zip_app \
+            "src-tauri/target/aarch64-apple-darwin/release/bundle/macos/${APP_NAME}.app" \
+            "${APP_NAME}_${VERSION}_macOS_apple_silicon.zip"
 
       - name: Upload macOS zip
         uses: actions/upload-artifact@v7
@@ -175,7 +195,8 @@ jobs:
 
           ## Downloads
 
-          - macOS: download \`${APP_NAME}_${VERSION}_macOS_universal.zip\`
+          - macOS Universal: download \`${APP_NAME}_${VERSION}_macOS_universal.zip\`
+          - macOS Apple Silicon: download \`${APP_NAME}_${VERSION}_macOS_apple_silicon.zip\`
           - Windows: download \`${APP_NAME}_${VERSION}_windows_x64.zip\`
           - Checksums: verify downloads with \`SHA256SUMS.txt\`
 

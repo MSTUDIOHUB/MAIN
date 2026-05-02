@@ -1,5 +1,6 @@
 import { memo, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { IconColumns, IconFileText, IconLock, IconUnlock } from "./Icons";
+import type { TurnProgressItem } from "../lib/turnProgress";
 import { isPlanTaskTrustedComplete, type PlanStage, type PlanTask, type ReplyOption } from "../lib/workflowModels";
 import type { PendingRunDecision, ResolvedUserIntent } from "../lib/runIntent";
 import MarkdownRenderer from "./MarkdownRenderer";
@@ -14,6 +15,8 @@ interface TopIslandProps {
   isVisible?: boolean;
   planTasks: PlanTask[];
   planStage: PlanStage;
+  executionSteps?: TurnProgressItem[];
+  progressMode?: "plan" | "execution";
   isAwaitingChoice?: boolean;
   replyOptions?: ReplyOption[];
   pendingRunDecision?: PendingRunDecision | null;
@@ -68,6 +71,8 @@ const TopIsland = memo(function TopIsland({
   isVisible = true,
   planTasks,
   planStage,
+  executionSteps = [],
+  progressMode,
   isAwaitingChoice = false,
   replyOptions = [],
   pendingRunDecision = null,
@@ -102,7 +107,8 @@ const TopIsland = memo(function TopIsland({
     hasPendingRunDecision ||
     !!activeDiffTask ||
     canApprovePlan ||
-    planTasks.length > 0;
+    planTasks.length > 0 ||
+    executionSteps.length > 0;
   const forceExpanded = hasReplyOptions || isAwaitingChoice || hasPendingRunDecision || !!activeDiffTask || canApprovePlan;
   const actionable = forceExpanded || hasPendingRunDecision || !!activeDiffTask || canApprovePlan;
   const isPlanApprovalOnly =
@@ -111,30 +117,50 @@ const TopIsland = memo(function TopIsland({
     !isAwaitingChoice &&
     !hasPendingRunDecision &&
     !activeDiffTask;
-  const hasTasks = planTasks.length > 0;
+  const activeProgressMode = planTasks.length > 0 ? "plan" : progressMode === "execution" ? "execution" : executionSteps.length > 0 ? "execution" : "plan";
+  const progressItems = useMemo(() => {
+    if (activeProgressMode === "plan") {
+      return planTasks.map((task) => ({
+        id: task.id,
+        text: task.text,
+        status: task.status,
+        complete: isPlanTaskTrustedComplete(task),
+      }));
+    }
+
+    return executionSteps.map((step) => ({
+      id: step.id,
+      text: step.text,
+      status: step.status,
+      complete: step.status === "completed",
+    }));
+  }, [activeProgressMode, executionSteps, planTasks]);
+  const hasTasks = progressItems.length > 0;
   const shouldExpandWidth = forceExpanded || (hasExpandableContent && (hovered || pinnedOpen));
   const isExpanded = forceExpanded || (hasExpandableContent && (hovered || pinnedOpen));
   // endregion
-  const completedCount = planTasks.filter(isPlanTaskTrustedComplete).length;
-  const progress = planTasks.length > 0 ? Math.round((completedCount / planTasks.length) * 100) : 0;
+  const completedCount = progressItems.filter((item) => item.complete).length;
+  const progress = progressItems.length > 0 ? Math.round((completedCount / progressItems.length) * 100) : 0;
   const currentPhaseKey = useMemo(() => {
+    if (activeProgressMode !== "plan") return null;
     const firstIncomplete = planTasks.find((task) => !isPlanTaskTrustedComplete(task)) || planTasks[planTasks.length - 1];
     if (!firstIncomplete) return null;
     const matched = firstIncomplete.text.match(/(?:Task|T)\s*([0-9]+)(?:[.\-][0-9]+)?/i);
     return matched?.[1] || null;
-  }, [planTasks]);
+  }, [activeProgressMode, planTasks]);
   const visibleTasks = useMemo(() => {
-    if (!currentPhaseKey) return planTasks;
-    const grouped = planTasks.filter((task) => {
+    if (activeProgressMode !== "plan" || !currentPhaseKey) return progressItems;
+    const grouped = progressItems.filter((task) => {
       const matched = task.text.match(/(?:Task|T)\s*([0-9]+)(?:[.\-][0-9]+)?/i);
       return (matched?.[1] || null) === currentPhaseKey;
     });
-    return grouped.length > 0 ? grouped : planTasks;
-  }, [currentPhaseKey, planTasks]);
+    return grouped.length > 0 ? grouped : progressItems;
+  }, [activeProgressMode, currentPhaseKey, progressItems]);
 
   const copy = useMemo(() => ({
     viewing: language === "zh" ? "当前查看" : "Viewing",
     tasks: language === "zh" ? "任务" : "Tasks",
+    steps: language === "zh" ? "步骤" : "Steps",
     pendingReview: language === "zh" ? "待审批" : "Pending Review",
     openPlan: language === "zh" ? "查看计划" : "Open Plan",
     openDiff: language === "zh" ? "查看变更" : "Open Diff",
@@ -165,15 +191,20 @@ const TopIsland = memo(function TopIsland({
     approveThread: language === "zh" ? "本对话自动执行" : "Auto-Run In Thread",
     dismiss: language === "zh" ? "取消" : "Cancel",
     cancelTurn: language === "zh" ? "结束本轮" : "End This Turn",
-    taskSummary: language === "zh"
-      ? `共 ${planTasks.length} 个任务，已完成 ${completedCount} 个`
-      : `${completedCount}/${planTasks.length} tasks completed`,
+    taskSummary: activeProgressMode === "execution"
+      ? language === "zh"
+        ? `共 ${progressItems.length} 个步骤，已完成 ${completedCount} 个`
+        : `${completedCount}/${progressItems.length} steps completed`
+      : language === "zh"
+      ? `共 ${progressItems.length} 个任务，已完成 ${completedCount} 个`
+      : `${completedCount}/${progressItems.length} tasks completed`,
+    executionStage: language === "zh" ? "执行步骤" : "Execution",
     phaseLabel: currentPhaseKey
       ? language === "zh"
         ? `阶段 ${currentPhaseKey}`
         : `Phase ${currentPhaseKey}`
       : "",
-  }), [completedCount, currentPhaseKey, language, planTasks.length]);
+  }), [activeProgressMode, completedCount, currentPhaseKey, language, progressItems.length]);
 
   const shellClass = themeMode === "light"
     ? "bg-[rgba(255,255,255,0.72)] border-[rgba(15,23,42,0.1)] shadow-[0_18px_50px_rgba(15,23,42,0.12)]"
@@ -234,8 +265,8 @@ const TopIsland = memo(function TopIsland({
             <span className={`truncate text-[13px] font-semibold ${primaryText}`}>{title}</span>
             <span className={`shrink-0 rounded-full border px-2 py-0.5 text-[10px] ${statusToneClass}`}>{status}</span>
             {hasTasks && (
-              <span className="shrink-0 rounded-full border border-[rgba(124,58,237,0.2)] bg-[rgba(124,58,237,0.1)] px-2 py-0.5 text-[10px] text-[#c4b5fd]">
-                {copy.tasks} {completedCount}/{planTasks.length}
+              <span data-testid={activeProgressMode === "execution" ? "top-island-execution-badge" : "top-island-plan-badge"} className="shrink-0 rounded-full border border-[rgba(124,58,237,0.2)] bg-[rgba(124,58,237,0.1)] px-2 py-0.5 text-[10px] text-[#c4b5fd]">
+                {activeProgressMode === "execution" ? copy.steps : copy.tasks} {completedCount}/{progressItems.length}
               </span>
             )}
             {canApprovePlan && (
@@ -368,21 +399,25 @@ const TopIsland = memo(function TopIsland({
             )}
 
             {hasTasks && (
-              <div className={`${pendingRunDecision ? "mt-3 " : ""}rounded-2xl border p-3 ${surface}`}>
+              <div data-testid={activeProgressMode === "execution" ? "top-island-execution-progress" : "top-island-plan-progress"} className={`${pendingRunDecision ? "mt-3 " : ""}rounded-2xl border p-3 ${surface}`}>
                 <div className="flex items-center justify-between gap-3">
                   <div className={`text-[12px] font-medium ${primaryText}`}>{copy.taskSummary}</div>
                   <div className="flex items-center gap-2">
                     {copy.phaseLabel && <span className={`text-[11px] ${secondaryText}`}>{copy.phaseLabel}</span>}
-                    <span className={`text-[11px] ${secondaryText}`}>{getStageLabel(planStage, language)}</span>
-                    <button
-                      onClick={onOpenPlan}
-                      className="rounded-full border border-[rgba(124,58,237,0.25)] bg-[rgba(124,58,237,0.14)] px-3 py-1 text-[11px] text-[#ddd6fe] transition-colors hover:bg-[rgba(124,58,237,0.22)]"
-                    >
-                      <span className="inline-flex items-center gap-1.5">
-                        <IconFileText className="h-3.5 w-3.5" />
-                        {copy.openPlan}
-                      </span>
-                    </button>
+                    <span className={`text-[11px] ${secondaryText}`}>
+                      {activeProgressMode === "execution" ? copy.executionStage : getStageLabel(planStage, language)}
+                    </span>
+                    {activeProgressMode === "plan" && (
+                      <button
+                        onClick={onOpenPlan}
+                        className="rounded-full border border-[rgba(124,58,237,0.25)] bg-[rgba(124,58,237,0.14)] px-3 py-1 text-[11px] text-[#ddd6fe] transition-colors hover:bg-[rgba(124,58,237,0.22)]"
+                      >
+                        <span className="inline-flex items-center gap-1.5">
+                          <IconFileText className="h-3.5 w-3.5" />
+                          {copy.openPlan}
+                        </span>
+                      </button>
+                    )}
                   </div>
                 </div>
                 <div className="mt-3 h-2 overflow-hidden rounded-full bg-[#18181b]">
@@ -396,14 +431,16 @@ const TopIsland = memo(function TopIsland({
                     <div key={task.id} className="flex items-start gap-3 rounded-xl bg-[rgba(0,0,0,0.18)] px-3 py-2">
                       <span
                         className={`mt-1 h-3.5 w-3.5 shrink-0 rounded-full border flex items-center justify-center ${
-                          isPlanTaskTrustedComplete(task)
+                          task.complete
                             ? "border-[#34d399] bg-[#34d399] text-[#050507]"
-                            : task.status === "in_progress"
-                            ? "border-[#60a5fa] bg-[#60a5fa]"
-                            : "border-[#3f3f46] bg-transparent"
+                          : task.status === "in_progress"
+                          ? "border-[#60a5fa] bg-[#60a5fa]"
+                          : task.status === "failed"
+                          ? "border-[#f87171] bg-[#f87171]"
+                          : "border-[#3f3f46] bg-transparent"
                         }`}
                       >
-                        {isPlanTaskTrustedComplete(task) && (
+                        {task.complete && (
                           <svg className="h-2 w-2" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
                             <path d="M2.5 6L5 8.5L9.5 3.5" />
                           </svg>

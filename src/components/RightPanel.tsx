@@ -6,6 +6,7 @@ import {
   IconClose,
   IconColumns,
   IconFileText,
+  IconRefresh,
   IconTerminal,
 } from "./Icons";
 import { Terminal } from "@xterm/xterm";
@@ -16,7 +17,7 @@ import PlanPanel from "./PlanPanel";
 import { buildLineDiff, getDiffStats } from "../lib/diff";
 import { getE2EResumeExecutionHandler, getE2ESavePlanDocumentHandler } from "../lib/e2e";
 import { extractPlanDraftPreview, extractStructuredPlanProposal, hasPlanDraftPreview, hasStructuredPlanProposal } from "../lib/planProposal";
-import { resolveGlobalChatSessionKey, resolveSessionRuntimeKey, resolveSessionWorkspaceKey, type TaskBlock, useAppStore } from "../store/useAppStore";
+import { resolveGlobalChatSessionKey, resolveSessionRuntimeKey, resolveSessionWorkspaceKey, type DiffRevertRequest, type TaskBlock, useAppStore } from "../store/useAppStore";
 import { deleteChatTempPath, exportTextFile, getPtyStatus, onPtyData, readPtyBuffer, resizePty, spawnPty, writePty } from "../lib/ipc";
 import { collectChangeEntries, isPlanConversationTurn, isPlanTaskTrustedComplete, type PlanArtifact, type PlanExecutionEvidenceEntry, type PlanTask } from "../lib/workflowModels";
 
@@ -418,6 +419,13 @@ interface ReviewFileDiff {
   displayPath: string;
   oldText: string;
   newText: string;
+  existed?: boolean;
+  fullFile: boolean;
+  canRevert: boolean;
+  hasPendingReview: boolean;
+  hasExecuted: boolean;
+  revertStatus?: "reverting" | "reverted" | "failed";
+  revertMessage?: string;
   added: number;
   removed: number;
   taskIds: number[];
@@ -428,6 +436,21 @@ interface ReviewFileDiff {
 type ReviewRow =
   | { kind: "fold"; id: string; count: number }
   | { kind: "line"; id: string; type: "unchanged" | "removed" | "added"; oldLine?: number; newLine?: number; text: string };
+
+function supportsFullFileRevert(block: ToolDiffBlock): boolean {
+  if (!block.diff) return false;
+  if (block.diff.fullFile === true) return true;
+  if (block.diff.fullFile === false) return false;
+  return block.toolName === "write_file";
+}
+
+function getReviewFileRevertStatus(blocks: ToolDiffBlock[]): ReviewFileDiff["revertStatus"] {
+  const executedBlocks = blocks.filter((block) => block.toolStatus === "executed");
+  if (executedBlocks.some((block) => block.revertStatus === "reverting")) return "reverting";
+  if (executedBlocks.some((block) => block.revertStatus === "failed")) return "failed";
+  if (executedBlocks.length > 0 && executedBlocks.every((block) => block.revertStatus === "reverted")) return "reverted";
+  return undefined;
+}
 
 function collectReviewFileDiffs(taskFlow: TaskBlock[], activeDiffTask?: ToolDiffBlock | null): ReviewFileDiff[] {
   const diffBlocks = taskFlow.filter((block): block is ToolDiffBlock => block.type === "tool" && !!block.diff);
@@ -449,6 +472,15 @@ function collectReviewFileDiffs(taskFlow: TaskBlock[], activeDiffTask?: ToolDiff
     const newText = last.diff?.new || "";
     const stats = getDiffStats(oldText, newText);
     const isBinaryLike = isBinaryFile(path) || looksBinary(oldText) || looksBinary(newText);
+    const executedBlocks = blocksForPath.filter((block) => block.toolStatus === "executed");
+    const hasPendingReview = blocksForPath.some((block) => block.toolStatus === "pending");
+    const fullFile = executedBlocks.length > 0
+      ? executedBlocks.every(supportsFullFileRevert)
+      : blocksForPath.every(supportsFullFileRevert);
+    const revertStatus = getReviewFileRevertStatus(blocksForPath);
+    const revertMessage = [...blocksForPath]
+      .reverse()
+      .find((block) => block.revertMessage)?.revertMessage;
 
     return {
       key: path,
@@ -456,6 +488,13 @@ function collectReviewFileDiffs(taskFlow: TaskBlock[], activeDiffTask?: ToolDiff
       displayPath: path,
       oldText,
       newText,
+      existed: first.diff?.existed,
+      fullFile,
+      canRevert: hasPendingReview || (executedBlocks.length > 0 && fullFile && revertStatus !== "reverted"),
+      hasPendingReview,
+      hasExecuted: executedBlocks.length > 0,
+      ...(revertStatus ? { revertStatus } : {}),
+      ...(revertMessage ? { revertMessage } : {}),
       added: stats.added,
       removed: stats.removed,
       taskIds: blocksForPath.map((block) => block.id),
@@ -525,7 +564,9 @@ function buildReviewRows(oldText: string, newText: string, contextSize = 3): Rev
 
 function DiffReviewPanel({ taskFlow, activeDiffTask, language }: { taskFlow: TaskBlock[]; activeDiffTask?: ToolDiffBlock | null; language: "zh" | "en" }) {
   const files = useMemo(() => collectReviewFileDiffs(taskFlow, activeDiffTask), [activeDiffTask, taskFlow]);
+  const revertDiffGroups = useAppStore((s) => s.revertDiffGroups);
   const [collapsedFiles, setCollapsedFiles] = useState<Set<string>>(() => new Set());
+  const [revertingKeys, setRevertingKeys] = useState<Set<string>>(() => new Set());
 
   useEffect(() => {
     setCollapsedFiles((prev) => {
@@ -542,6 +583,41 @@ function DiffReviewPanel({ taskFlow, activeDiffTask, language }: { taskFlow: Tas
   const activeDiffTarget = activeDiffTask?.diff?.path || activeDiffTask?.target || "";
   const allCollapsed = files.length > 0 && files.every((file) => collapsedFiles.has(file.key));
   const toggleAll = () => setCollapsedFiles(allCollapsed ? new Set() : new Set(files.map((file) => file.key)));
+  const revertableFiles = files.filter((file) => file.canRevert);
+  const hasRevertingFile = files.some((file) => revertingKeys.has(file.key) || file.revertStatus === "reverting");
+  const buildRevertRequest = (file: ReviewFileDiff): DiffRevertRequest => ({
+    path: file.path,
+    taskIds: file.taskIds,
+    oldText: file.oldText,
+    newText: file.newText,
+    ...(typeof file.existed === "boolean" ? { existed: file.existed } : {}),
+    fullFile: file.fullFile,
+  });
+  const handleRevertFiles = async (targets: ReviewFileDiff[]) => {
+    const actionableTargets = targets.filter((file) => file.canRevert);
+    if (actionableTargets.length === 0) return;
+    const hasPending = actionableTargets.some((file) => file.hasPendingReview);
+    const confirmMessage = language === "zh"
+      ? actionableTargets.length === 1
+        ? `${hasPending ? "拒绝" : "撤销"} ${actionableTargets[0].displayPath} 的修改？此操作会更新工作区文件。`
+        : `撤销 ${actionableTargets.length} 个文件的修改？此操作会更新工作区文件。`
+      : actionableTargets.length === 1
+        ? `${hasPending ? "Reject" : "Revert"} changes to ${actionableTargets[0].displayPath}? This will update workspace files.`
+        : `Revert changes to ${actionableTargets.length} files? This will update workspace files.`;
+    if (!window.confirm(confirmMessage)) return;
+
+    const keys = actionableTargets.map((file) => file.key);
+    setRevertingKeys((prev) => new Set([...prev, ...keys]));
+    try {
+      await revertDiffGroups(actionableTargets.map(buildRevertRequest));
+    } finally {
+      setRevertingKeys((prev) => {
+        const next = new Set(prev);
+        keys.forEach((key) => next.delete(key));
+        return next;
+      });
+    }
+  };
 
   if (files.length === 0) {
     return (
@@ -563,41 +639,104 @@ function DiffReviewPanel({ taskFlow, activeDiffTask, language }: { taskFlow: Tas
             <span className="truncate font-mono text-[12px] text-[#a1a1aa]" title={activeDiffTarget}>{activeDiffTarget}</span>
           )}
         </div>
-        <button
-          type="button"
-          onClick={toggleAll}
-          className="rounded-md border border-[#2f2f32] bg-[#181818] px-2.5 py-1 text-[11px] text-[#a1a1aa] transition-colors hover:bg-[#242428] hover:text-[#f4f4f5]"
-        >
-          {allCollapsed ? (language === "zh" ? "展开全部" : "Expand all") : (language === "zh" ? "折叠全部" : "Collapse all")}
-        </button>
+        <div className="flex shrink-0 items-center gap-2">
+          {revertableFiles.length > 0 && (
+            <button
+              type="button"
+              data-testid="diff-revert-all"
+              disabled={hasRevertingFile}
+              onClick={() => void handleRevertFiles(revertableFiles)}
+              className="flex items-center gap-1.5 rounded-md border border-[#7f1d1d]/40 bg-[#1a0b0d] px-2.5 py-1 text-[11px] font-semibold text-[#fca5a5] transition-colors hover:border-[#ef4444]/45 hover:bg-[#2a1013] disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <IconRefresh className="h-3.5 w-3.5" />
+              {language === "zh" ? "撤销全部" : "Revert all"}
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={toggleAll}
+            className="rounded-md border border-[#2f2f32] bg-[#181818] px-2.5 py-1 text-[11px] text-[#a1a1aa] transition-colors hover:bg-[#242428] hover:text-[#f4f4f5]"
+          >
+            {allCollapsed ? (language === "zh" ? "展开全部" : "Expand all") : (language === "zh" ? "折叠全部" : "Collapse all")}
+          </button>
+        </div>
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto pb-6">
         {files.map((file) => {
           const collapsed = collapsedFiles.has(file.key);
           const rows = file.isBinaryLike ? [] : buildReviewRows(file.oldText, file.newText);
+          const isReverting = revertingKeys.has(file.key) || file.revertStatus === "reverting";
+          const showRevertButton = file.canRevert || isReverting;
+          const statusLabel =
+            file.revertStatus === "reverted"
+              ? language === "zh" ? "已撤销" : "Reverted"
+              : file.revertStatus === "failed"
+              ? language === "zh" ? "撤销失败" : "Revert failed"
+              : isReverting
+              ? language === "zh" ? "撤销中" : "Reverting"
+              : "";
           return (
             <section key={file.key} className="border-b border-[#202020]">
-              <button
-                type="button"
-                onClick={() => setCollapsedFiles((prev) => {
-                  const next = new Set(prev);
-                  if (next.has(file.key)) next.delete(file.key);
-                  else next.add(file.key);
-                  return next;
-                })}
-                className="flex w-full items-center justify-between gap-3 bg-[#101010] px-4 py-3 text-left transition-colors hover:bg-[#181818]"
-              >
-                <span className="min-w-0 flex items-center gap-2">
+              <div className="flex items-center justify-between gap-3 bg-[#101010] px-4 py-3 transition-colors hover:bg-[#181818]">
+                <button
+                  type="button"
+                  onClick={() => setCollapsedFiles((prev) => {
+                    const next = new Set(prev);
+                    if (next.has(file.key)) next.delete(file.key);
+                    else next.add(file.key);
+                    return next;
+                  })}
+                  className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                >
                   {collapsed ? <IconChevronRight className="h-4 w-4 text-[#a1a1aa]" /> : <IconChevronUp className="h-4 w-4 text-[#a1a1aa]" />}
                   <span className="truncate font-mono text-[14px] font-bold text-[#f4f4f5]">{file.displayPath}</span>
-                </span>
-                <span className="shrink-0 font-mono text-[14px] font-bold">
-                  <span className="text-[#34d399]">+{file.added}</span>
-                  <span className="mx-1 text-[#52525b]"> </span>
-                  <span className="text-[#ff5c5c]">-{file.removed}</span>
-                </span>
-              </button>
+                </button>
+                <div className="flex shrink-0 items-center gap-2">
+                  {statusLabel && (
+                    <span
+                      data-testid="diff-revert-status"
+                      className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold ${
+                        file.revertStatus === "failed"
+                          ? "border-[#7f1d1d]/60 bg-[#2a1013] text-[#fca5a5]"
+                          : "border-[#14532d]/60 bg-[#0d1f16] text-[#86efac]"
+                      }`}
+                    >
+                      {statusLabel}
+                    </span>
+                  )}
+                  <span className="font-mono text-[14px] font-bold">
+                    <span className="text-[#34d399]">+{file.added}</span>
+                    <span className="mx-1 text-[#52525b]"> </span>
+                    <span className="text-[#ff5c5c]">-{file.removed}</span>
+                  </span>
+                  {showRevertButton && (
+                    <button
+                      type="button"
+                      data-testid="diff-revert-file"
+                      data-diff-path={file.path}
+                      disabled={isReverting || file.revertStatus === "reverted"}
+                      onClick={() => void handleRevertFiles([file])}
+                      className="flex items-center gap-1.5 rounded-md border border-[#7f1d1d]/40 bg-[#1a0b0d] px-2.5 py-1 text-[11px] font-semibold text-[#fca5a5] transition-colors hover:border-[#ef4444]/45 hover:bg-[#2a1013] disabled:cursor-not-allowed disabled:opacity-50"
+                      title={file.hasPendingReview
+                        ? language === "zh" ? "拒绝这次待审批修改" : "Reject this pending change"
+                        : language === "zh" ? "撤销这个文件的修改" : "Revert this file change"}
+                    >
+                      <IconRefresh className="h-3.5 w-3.5" />
+                      {isReverting
+                        ? language === "zh" ? "处理中" : "Working"
+                        : file.hasPendingReview
+                        ? language === "zh" ? "拒绝" : "Reject"
+                        : language === "zh" ? "撤销" : "Revert"}
+                    </button>
+                  )}
+                </div>
+              </div>
+              {file.revertStatus === "failed" && file.revertMessage && (
+                <div className="border-t border-[#2a1416] bg-[#18090b] px-4 py-2 text-[12px] text-[#fca5a5]">
+                  {file.revertMessage}
+                </div>
+              )}
 
               {!collapsed && (
                 file.isBinaryLike ? (

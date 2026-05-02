@@ -56,6 +56,7 @@
 它会在私有 `MAIN` 仓库里构建，然后只把下面这些公开附件发布到 `MAIN-Releases`：
 
 - `MAIN_<version>_macOS_universal.zip`
+- `MAIN_<version>_macOS_apple_silicon.zip`
 - `MAIN_<version>_windows_x64.zip`
 - `SHA256SUMS.txt`
 
@@ -161,7 +162,7 @@ https://github.com/MSTUDIOHUB/MAIN-Releases/releases/latest
 
 用户可以：
 
-1. 解压 `MAIN_<version>_macOS_universal.zip`
+1. Apple Silicon 机型优先解压 `MAIN_<version>_macOS_apple_silicon.zip`；不确定机型时解压 `MAIN_<version>_macOS_universal.zip`
 2. 把 `MAIN.app` 拖进 `Applications`
 3. 右键 `Open`
 4. 如仍被拦截，到 `System Settings > Privacy & Security` 点 `Open Anyway`

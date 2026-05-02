@@ -1000,7 +1000,17 @@ export default function Composer({
 
   const handleInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const value = e.target.value;
-    setInput(value);
+    const nativeEvent = e.nativeEvent as InputEvent & { isComposing?: boolean };
+    const inputType = typeof nativeEvent.inputType === "string" ? nativeEvent.inputType.toLowerCase() : "";
+    const justFinishedComposition = Date.now() - compositionEndedAtRef.current < 140;
+    const isImeCompositionInput =
+      isComposingRef.current ||
+      nativeEvent.isComposing === true ||
+      inputType.includes("composition") ||
+      justFinishedComposition;
+    setInput(value, {
+      preserveLockedComposerIntent: Boolean(lockedComposerIntent && value.trim().length === 0 && isImeCompositionInput),
+    });
 
     const cursorPos = e.target.selectionStart ?? value.length;
     const textBeforeCursor = value.slice(0, cursorPos);
