@@ -52,9 +52,13 @@ function loadTranspiledModuleSync(sourcePath) {
 }
 
 const {
+  FEISHU_APPROVAL_TTL_MS,
+  buildFeishuApprovalCard,
   createFeishuPairingRequest,
   normalizeImAdaptersConfig,
+  parseFeishuApprovalCardActionValue,
   parseFeishuTextCommand,
+  resolveFeishuApprovalAction,
   resolveFeishuRemoteIntentOverride,
   upsertFeishuPairedUser,
   upsertFeishuPairingRequest,
@@ -128,4 +132,79 @@ test("upserts pairing requests and paired users by open id", () => {
   assert.equal(users.length, 1);
   assert.equal(users[0].name, "Michael");
   assert.equal(users[0].chatId, "oc_1");
+});
+
+test("builds Feishu approval card without leaking command into button values", () => {
+  const card = buildFeishuApprovalCard({
+    language: "zh",
+    approvalId: "apv_123",
+    nonce: "nonce_secret",
+    code: "ABC123",
+    toolName: "run_command",
+    target: "npm test",
+    workspace: "/tmp/project",
+    preview: "npm test -- --runInBand",
+    requestedAt: 1_700_000_000_000,
+    expiresAt: 1_700_000_000_000 + FEISHU_APPROVAL_TTL_MS,
+    status: "pending",
+  });
+
+  const serialized = JSON.stringify(card);
+  assert.match(serialized, /npm test -- --runInBand/);
+  const actionBlock = card.elements.find((element) => element.tag === "action");
+  assert.ok(actionBlock);
+  const buttonValues = JSON.stringify(actionBlock.actions.map((action) => action.value));
+  assert.match(buttonValues, /apv_123/);
+  assert.match(buttonValues, /nonce_secret/);
+  assert.doesNotMatch(buttonValues, /npm test/);
+  assert.doesNotMatch(buttonValues, /runInBand/);
+});
+
+test("parses Feishu approval card action payloads", () => {
+  const payload = {
+    mainAction: "feishu_approval",
+    action: "approve",
+    approvalId: "apv_1",
+    nonce: "nonce_1",
+  };
+  assert.deepEqual(parseFeishuApprovalCardActionValue(payload), {
+    action: "approve",
+    approvalId: "apv_1",
+    nonce: "nonce_1",
+  });
+  assert.deepEqual(parseFeishuApprovalCardActionValue(JSON.stringify({ ...payload, action: "reject" })), {
+    action: "reject",
+    approvalId: "apv_1",
+    nonce: "nonce_1",
+  });
+  assert.equal(parseFeishuApprovalCardActionValue({ ...payload, action: "delete" }), null);
+  assert.equal(parseFeishuApprovalCardActionValue({ action: "approve" }), null);
+});
+
+test("validates Feishu approval action identity, nonce, expiry and single-use state", () => {
+  const pending = {
+    approvalId: "apv_1",
+    nonce: "nonce_1",
+    chatId: "oc_1",
+    userId: "ou_1",
+    expiresAt: 2000,
+    status: "pending",
+  };
+  const baseRequest = {
+    approvalId: "apv_1",
+    nonce: "nonce_1",
+    chatId: "oc_1",
+    userId: "ou_1",
+    action: "approve",
+  };
+
+  assert.deepEqual(resolveFeishuApprovalAction([pending], baseRequest, 1000), {
+    ok: true,
+    approval: pending,
+  });
+  assert.equal(resolveFeishuApprovalAction([pending], { ...baseRequest, userId: "ou_2" }, 1000).reason, "wrong_user");
+  assert.equal(resolveFeishuApprovalAction([pending], { ...baseRequest, chatId: "oc_2" }, 1000).reason, "wrong_chat");
+  assert.equal(resolveFeishuApprovalAction([pending], { ...baseRequest, nonce: "bad" }, 1000).reason, "nonce_mismatch");
+  assert.equal(resolveFeishuApprovalAction([pending], baseRequest, 3000).reason, "expired");
+  assert.equal(resolveFeishuApprovalAction([{ ...pending, status: "approved" }], baseRequest, 1000).reason, "already_resolved");
 });

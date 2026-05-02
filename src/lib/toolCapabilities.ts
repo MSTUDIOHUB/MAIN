@@ -39,6 +39,11 @@ export interface ToolCapabilityRegistry {
   policy: ToolPermissionPolicy;
 }
 
+export interface ToolIntentFilterOptions {
+  runtimeIntent?: ResolvedUserIntent;
+  planApproved?: boolean;
+}
+
 export interface McpRoutingConfig {
   enabled: boolean;
   threshold: number;
@@ -456,18 +461,23 @@ export function filterToolDefinitionsForIntent(
   tools: ToolDefinition[],
   intent: ResolvedUserIntent,
   registry: ToolCapabilityRegistry,
+  options: ToolIntentFilterOptions = {},
 ): ToolDefinition[] {
+  const effectiveIntent =
+    options.runtimeIntent ??
+    (intent === "plan" && options.planApproved ? "execute" : intent);
+
   return tools.filter((tool) => {
     const name = tool.function.name;
     const capability = registry.tools[name];
     if (capability && !capability.enabled) return false;
     const risk = capability?.risk ?? classifyBuiltInTool(name);
 
-    if (intent === "execute" || intent === "studio_workflow") {
+    if (effectiveIntent === "execute" || effectiveIntent === "studio_workflow") {
       return !registry.policy.disabledRiskLevels.includes(risk);
     }
 
-    if (intent === "plan") {
+    if (effectiveIntent === "plan") {
       if (risk === "read_only" || risk === "external_read") return true;
       return name === "write_file" || name === "replace_in_file";
     }

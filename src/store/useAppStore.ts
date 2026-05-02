@@ -111,11 +111,20 @@ import { mapLegacyNexusModeToMainMode, mapMainModeToLegacyNexusMode, type MainMo
 import { runIntentPreflight } from "../lib/intentPreflight";
 import { runAfterNextPaint } from "../lib/uiScheduling";
 import {
+  FEISHU_APPROVAL_TTL_MS,
+  buildFeishuApprovalCard,
+  createFeishuApprovalId,
+  createFeishuApprovalNonce,
   createDefaultFeishuAdapterRuntimeStatus,
   createDefaultImAdaptersConfig,
   normalizeImAdaptersConfig,
+  resolveFeishuApprovalAction,
   upsertFeishuPairingRequest,
+  type FeishuApprovalAction,
+  type FeishuApprovalRecord,
+  type FeishuApprovalStatus,
   type FeishuAdapterRuntimeStatus,
+  type FeishuInteractiveCard,
   type FeishuPendingPairing,
   type ImAdaptersConfig,
 } from "../lib/imAdapters";
@@ -531,16 +540,31 @@ export interface FeishuRemoteContext {
   messageId?: string;
 }
 
-export interface FeishuPendingApproval {
+export interface FeishuPendingApproval extends FeishuApprovalRecord {
   code: string;
+  approvalId: string;
+  nonce: string;
   taskId: number;
   chatId: string;
   userId: string;
   messageId?: string;
+  cardMessageId?: string;
   toolName: string;
   target: string;
+  workspace?: string;
+  preview?: string;
   createdAt: number;
+  expiresAt: number;
+  status: FeishuApprovalStatus;
 }
+
+export type FeishuApprovalProcessResult =
+  | { ok: true; approval: FeishuPendingApproval }
+  | {
+      ok: false;
+      reason: "not_found" | "wrong_user" | "wrong_chat" | "nonce_mismatch" | "expired" | "already_resolved";
+      approval?: FeishuPendingApproval;
+    };
 
 export interface JobItem {
   id: string;
@@ -721,7 +745,19 @@ interface AppState {
   removeFeishuPairingRequest: (openId: string) => void;
   clearFeishuPairingRequests: () => void;
   addPendingFeishuApproval: (approval: FeishuPendingApproval) => void;
-  resolvePendingFeishuApproval: (userId: string, code: string) => FeishuPendingApproval | null;
+  resolvePendingFeishuApproval: (
+    userId: string,
+    code: string,
+    action?: FeishuApprovalAction,
+  ) => FeishuPendingApproval | null;
+  resolvePendingFeishuApprovalAction: (request: {
+    userId: string;
+    chatId: string;
+    approvalId: string;
+    nonce: string;
+    action: FeishuApprovalAction;
+  }) => FeishuApprovalProcessResult;
+  setFeishuApprovalCardMessageId: (approvalId: string, messageId: string) => void;
 
   // Skills CRUD
   skills: Skill[];
@@ -845,6 +881,7 @@ interface AppState {
       reuseCurrentTurn?: boolean;
       preservePlanState?: boolean;
       resolvedIntent?: ResolvedUserIntent;
+      runtimeIntentOverride?: ResolvedUserIntent;
       skipIntentResolution?: boolean;
       turnTitle?: string;
       intentSummary?: string;
@@ -2765,20 +2802,67 @@ export const useAppStore = create<AppState>()(
     set((s) => ({
       pendingFeishuApprovals: [
         approval,
-        ...s.pendingFeishuApprovals.filter((item) => item.code !== approval.code),
+        ...s.pendingFeishuApprovals.filter((item) =>
+          item.code !== approval.code && item.approvalId !== approval.approvalId
+        ),
       ].slice(0, 20),
     })),
-  resolvePendingFeishuApproval: (userId, code) => {
+  resolvePendingFeishuApproval: (userId, code, action = "approve") => {
     const normalizedCode = code.trim().toLowerCase();
     const state = get();
     const approval = state.pendingFeishuApprovals.find((item) =>
-      item.userId === userId && item.code.toLowerCase() === normalizedCode,
+      item.userId === userId &&
+      item.code.toLowerCase() === normalizedCode &&
+      item.status === "pending",
     ) || null;
     if (!approval) return null;
+    const now = Date.now();
+    if (approval.expiresAt <= now) {
+      set((s) => ({
+        pendingFeishuApprovals: s.pendingFeishuApprovals.map((item) =>
+          item.approvalId === approval.approvalId ? { ...item, status: "expired" } : item
+        ),
+      }));
+      return null;
+    }
+    const status: FeishuApprovalStatus = action === "reject" ? "rejected" : "approved";
     set((s) => ({
-      pendingFeishuApprovals: s.pendingFeishuApprovals.filter((item) => item.code !== approval.code),
+      pendingFeishuApprovals: s.pendingFeishuApprovals.map((item) =>
+        item.approvalId === approval.approvalId ? { ...item, status } : item
+      ),
     }));
-    return approval;
+    return { ...approval, status };
+  },
+  resolvePendingFeishuApprovalAction: (request) => {
+    const state = get();
+    const result = resolveFeishuApprovalAction(state.pendingFeishuApprovals, request);
+    if (!result.ok) {
+      if (result.reason === "expired" && result.approval) {
+        set((s) => ({
+          pendingFeishuApprovals: s.pendingFeishuApprovals.map((item) =>
+            item.approvalId === result.approval!.approvalId ? { ...item, status: "expired" } : item
+          ),
+        }));
+      }
+      return result;
+    }
+    const status: FeishuApprovalStatus = request.action === "approve" ? "approved" : "rejected";
+    const resolvedApproval = { ...result.approval, status };
+    set((s) => ({
+      pendingFeishuApprovals: s.pendingFeishuApprovals.map((item) =>
+        item.approvalId === result.approval.approvalId ? resolvedApproval : item
+      ),
+    }));
+    return { ok: true, approval: resolvedApproval };
+  },
+  setFeishuApprovalCardMessageId: (approvalId, messageId) => {
+    const cleanMessageId = String(messageId || "").trim();
+    if (!approvalId || !cleanMessageId) return;
+    set((s) => ({
+      pendingFeishuApprovals: s.pendingFeishuApprovals.map((item) =>
+        item.approvalId === approvalId ? { ...item, cardMessageId: cleanMessageId } : item
+      ),
+    }));
   },
 
   skills: defaultSkills,
@@ -3469,11 +3553,19 @@ export const useAppStore = create<AppState>()(
       const state = get();
       const normalizedApprovalChoice = normalizePlanApprovalChoice(approvalChoice);
       const approvalChoicePatch = { planApprovalChoice: normalizedApprovalChoice || null };
+      const approvedTurnId = state.currentTurnId;
+      const executionConsentPatch = {
+        currentTurnExecutionConsent: {
+          turnId: approvedTurnId,
+          granted: true,
+        },
+      };
 
       if (state.agentStatus === "pending_review") {
         set({
           isPlanApproved: true,
           ...approvalChoicePatch,
+          ...executionConsentPatch,
           planExecutionEvidenceLedger: [],
           planExecutionEvidenceCount: 0,
           agentStatus: "running",
@@ -3484,8 +3576,8 @@ export const useAppStore = create<AppState>()(
           showTerminal: false,
           rightPanelTab: "plan",
         });
-        if (state.currentTurnId) {
-          get().setConversationTurnStatus(state.currentTurnId, "executing");
+        if (approvedTurnId) {
+          get().setConversationTurnStatus(approvedTurnId, "executing");
         }
         return;
       }
@@ -3493,6 +3585,7 @@ export const useAppStore = create<AppState>()(
       set({
         isPlanApproved: true,
         ...approvalChoicePatch,
+        ...executionConsentPatch,
         planExecutionEvidenceLedger: [],
         planExecutionEvidenceCount: 0,
         planStage: "executing",
@@ -3531,7 +3624,13 @@ export const useAppStore = create<AppState>()(
               : approvalChoiceHint + "计划已批准。请先基于已批准的 requirements/design 或 bugfix 生成 `.MAIN/plans/tasks.md`，然后再按照任务清单继续执行，不要重复计划内容。tasks.md 必须精简为 8-20 个 checkbox，每项一句话；有明确交付物的任务请追加轻量证据标签，例如 `证据: file:src/app.ts` 或 `证据: cmd:npm test`。执行中 tasks.md 是审计记录，不能删除已完成或旧任务；只有可信证据满足后才能勾选任务。" + deliverableHint;
           })(),
           undefined,
-          { hidden: true, reuseCurrentTurn: true, preservePlanState: true },
+          {
+            hidden: true,
+            reuseCurrentTurn: true,
+            preservePlanState: true,
+            resolvedIntent: "plan",
+            runtimeIntentOverride: "execute",
+          },
         );
       });
     })(),
@@ -3762,6 +3861,7 @@ export const useAppStore = create<AppState>()(
     reuseCurrentTurn?: boolean;
     preservePlanState?: boolean;
     resolvedIntent?: ResolvedRunIntent;
+    runtimeIntentOverride?: ResolvedRunIntent;
     skipIntentResolution?: boolean;
     turnTitle?: string;
     intentSummary?: string;
@@ -4085,6 +4185,7 @@ export const useAppStore = create<AppState>()(
 
     const effectiveIntentPolicy = getIntentPolicy(effectiveRunIntent);
     const effectiveWorkflowMode = effectiveIntentPolicy.workflowMode;
+    const runtimeRunIntent = options?.runtimeIntentOverride || effectiveRunIntent;
     const initialTurnStatus: ConversationTurnStatus = effectiveRunIntent === "plan" ? "planning" : "executing";
 
     // Reset plan approval state at the start of each new request
@@ -5254,6 +5355,7 @@ export const useAppStore = create<AppState>()(
         onHookResult: (record) => sessionGet().appendHookExecutionRecords([record]),
         onHookBlocked: (_event, _reason, _record) => { /* UI feedback placeholder */ },
         getCurrentRunIntent: () => sessionGet().getCurrentRunIntent(),
+        getRuntimeRunIntent: () => runtimeRunIntent,
         getWorkflowMode: () => getIntentPolicy(sessionGet().getCurrentRunIntent()).workflowMode,
         getIsPlanApproved: () => sessionGet().isPlanApproved,
         getPlanApprovalChoice: () => sessionGet().planApprovalChoice,
@@ -6053,6 +6155,7 @@ export const useAppStore = create<AppState>()(
           const latestState = sessionGet();
           const isRemoteFeishuTurn = !!remoteFeishu;
           const latestIntent = latestState.getCurrentRunIntent();
+          const latestRuntimeIntent = runtimeRunIntent;
           const alreadyApprovedForTurn =
             latestState.currentTurnExecutionConsent.granted &&
             latestState.currentTurnExecutionConsent.turnId === turnId;
@@ -6061,7 +6164,7 @@ export const useAppStore = create<AppState>()(
 
           if (
             !isRemoteFeishuTurn &&
-            (latestIntent === "execute" || latestIntent === "studio_workflow") &&
+            (latestRuntimeIntent === "execute" || latestRuntimeIntent === "studio_workflow") &&
             latestState.executionConsentPolicy === "ask_per_turn" &&
             !alreadyApprovedForTurn &&
             !planExecutionAlreadyApproved
@@ -6178,33 +6281,62 @@ export const useAppStore = create<AppState>()(
               }));
               if (remoteFeishu) {
                 const code = createFeishuApprovalCode();
-                sessionGet().addPendingFeishuApproval({
+                const approvalId = createFeishuApprovalId();
+                const nonce = createFeishuApprovalNonce();
+                const createdAt = Date.now();
+                const expiresAt = createdAt + FEISHU_APPROVAL_TTL_MS;
+                const language = sessionGet().config.language === "en" ? "en" : "zh";
+                const approval: FeishuPendingApproval = {
                   code,
+                  approvalId,
+                  nonce,
                   taskId: reviewTaskId,
                   chatId: remoteFeishu.chatId,
                   userId: remoteFeishu.userId,
                   messageId: remoteFeishu.messageId,
+                  cardMessageId: undefined,
                   toolName,
                   target,
-                  createdAt: Date.now(),
+                  workspace: runWorkspace || sessionGet().currentWorkspace,
+                  preview: buildFeishuToolPreview(toolName, toolArgs),
+                  createdAt,
+                  expiresAt,
+                  status: "pending",
+                };
+                sessionGet().addPendingFeishuApproval(approval);
+                const card = buildFeishuApprovalCard({
+                  language,
+                  approvalId,
+                  nonce,
+                  code,
+                  toolName,
+                  target,
+                  workspace: approval.workspace,
+                  preview: approval.preview,
+                  requestedAt: createdAt,
+                  expiresAt,
+                  status: "pending",
                 });
-                void invoke("send_feishu_message", {
+                void invoke("send_feishu_card", {
                   chatId: remoteFeishu.chatId,
                   userId: remoteFeishu.userId,
                   openId: remoteFeishu.userId,
                   messageId: remoteFeishu.messageId,
-                  text: buildFeishuApprovalMessage(
-                    sessionGet().config.language === "en" ? "en" : "zh",
-                    code,
-                    toolName,
-                    target,
-                  ),
+                  approvalId,
+                  card,
                 }).catch((error) => {
                   logStoreEvent("feishu_approval_send_failed", {
                     error: error instanceof Error ? error.message : String(error),
                     toolName,
                     target,
                   });
+                  void invoke("send_feishu_message", {
+                    chatId: remoteFeishu.chatId,
+                    userId: remoteFeishu.userId,
+                    openId: remoteFeishu.userId,
+                    messageId: remoteFeishu.messageId,
+                    text: buildFeishuApprovalMessage(language, code, toolName, target),
+                  }).catch(() => {});
                 });
               }
             })();
@@ -6576,6 +6708,68 @@ async function requestSemanticTurnMetadata(params: {
 
 function createFeishuApprovalCode(): string {
   return Math.random().toString(36).slice(2, 8).toUpperCase();
+}
+
+function stringifyFeishuPreviewValue(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value == null) return "";
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function buildFeishuToolPreview(toolName: string, args: Record<string, unknown>): string {
+  if (toolName === "run_command" || toolName === "execute_command") {
+    return stringifyFeishuPreviewValue(args.command);
+  }
+  if (toolName === "send_pty_input") {
+    return stringifyFeishuPreviewValue(args.input);
+  }
+  if (toolName === "write_file") {
+    return [
+      `path: ${stringifyFeishuPreviewValue(args.path)}`,
+      "",
+      stringifyFeishuPreviewValue(args.content),
+    ].join("\n");
+  }
+  if (toolName === "replace_in_file") {
+    return [
+      `path: ${stringifyFeishuPreviewValue(args.path)}`,
+      "",
+      "old:",
+      stringifyFeishuPreviewValue(args.oldText ?? args.old_text),
+      "",
+      "new:",
+      stringifyFeishuPreviewValue(args.newText ?? args.new_text),
+    ].join("\n");
+  }
+  const serialized = stringifyFeishuPreviewValue(args);
+  return serialized && serialized !== "{}" ? serialized : getToolTarget(toolName, args);
+}
+
+export function buildFeishuApprovalStatusCard(
+  language: "zh" | "en",
+  approval: FeishuPendingApproval,
+  status: "approved" | "rejected" | "expired",
+  resolvedBy?: string,
+): FeishuInteractiveCard {
+  return buildFeishuApprovalCard({
+    language,
+    approvalId: approval.approvalId,
+    nonce: approval.nonce,
+    code: approval.code,
+    toolName: approval.toolName,
+    target: approval.target,
+    workspace: approval.workspace,
+    preview: approval.preview,
+    requestedAt: approval.createdAt,
+    expiresAt: approval.expiresAt,
+    status,
+    resolvedBy,
+    resolvedAt: Date.now(),
+  });
 }
 
 function buildFeishuApprovalMessage(

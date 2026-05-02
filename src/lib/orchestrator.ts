@@ -259,6 +259,7 @@ export interface OrchestratorCallbacks {
   markSessionHookInitialized: (sessionKey: string) => void;
   // Planning & Management
   getCurrentRunIntent: () => ResolvedUserIntent;
+  getRuntimeRunIntent?: () => ResolvedUserIntent;
   getWorkflowMode: () => "chat" | "edit" | "plan";
   getIsPlanApproved: () => boolean;
   getPlanApprovalChoice: () => string | null;
@@ -1477,6 +1478,18 @@ export async function executeAgentLoop(
   const workspaceTree = callbacks.getWorkspaceTree();
   const turnIntent = callbacks.getCurrentRunIntent();
   const workflowMode = callbacks.getWorkflowMode();
+  const resolveRuntimeIntent = (): ResolvedUserIntent => {
+    const currentConversationIntent = callbacks.getCurrentRunIntent();
+    const requestedRuntimeIntent = callbacks.getRuntimeRunIntent?.() ?? currentConversationIntent;
+    if (
+      currentConversationIntent === "plan" &&
+      callbacks.getIsPlanApproved() &&
+      requestedRuntimeIntent === "plan"
+    ) {
+      return "execute";
+    }
+    return requestedRuntimeIntent;
+  };
 
   console.log('[orchestrator] executeAgentLoop');
   console.log('[orchestrator] activeProfile:', config.activeProfile);
@@ -1537,14 +1550,16 @@ export async function executeAgentLoop(
     mcpToolServerMap,
     policy: config.toolPermissionPolicy,
   });
-  const allTools = filterToolDefinitionsForIntent(
-    routedToolDefinitions,
-    turnIntent,
-    toolCapabilityRegistry,
-  );
-  const availableToolNames = new Set(allTools.map((tool) => tool.function.name));
-  const resolveLlmTools = () =>
-    !hasProviderNativeToolsDisabled(callbacks.getMessages()) ? allTools : [];
+  const resolveAllToolsForRuntime = (runtimeIntent: ResolvedUserIntent): ToolDefinition[] =>
+    filterToolDefinitionsForIntent(
+      routedToolDefinitions,
+      callbacks.getCurrentRunIntent(),
+      toolCapabilityRegistry,
+      {
+        runtimeIntent,
+        planApproved: callbacks.getIsPlanApproved(),
+      },
+    );
   const associatedPaths = callbacks.getAssociatedPaths();
   const resolvedInstructions = config.instructionsEnabled
     ? await loadResolvedInstructions(workspace, skills, associatedPaths)
@@ -1580,48 +1595,58 @@ export async function executeAgentLoop(
   // Rebuild the system prompt on every agent loop invocation to ensure
   // that any changes in active skills or model configuration are
   // immediately reflected in the LLM's context.
-  const messages = callbacks.getMessages();
   const mcpToolNameSet = new Set(mcpTools.map(t => t.name));
   const skillToolNameSet = new Set(skills
     .filter(s => s.active && s.type === "tool")
     .map(s => skillNameToToolName(s.name))
     .filter(Boolean));
-  const availableToolNameList = allTools.map((tool) => tool.function.name);
-  const mcpToolNames = availableToolNameList.filter((name) => mcpToolNameSet.has(name));
-  const customToolNames = availableToolNameList.filter((name) => skillToolNameSet.has(name));
+  let appliedSystemPromptKey = "";
+  const applySystemPromptForRuntime = (runtimeIntent: ResolvedUserIntent, tools: ToolDefinition[]) => {
+    const availableToolNameList = tools.map((tool) => tool.function.name);
+    const systemPromptKey = [
+      runtimeIntent,
+      workflowMode,
+      callbacks.getPreferredLanguage(),
+      availableToolNameList.join(","),
+    ].join("|");
+    if (systemPromptKey === appliedSystemPromptKey) return;
 
-  const systemPrompt = buildSystemPrompt(
-    skills,
-    workspace,
-    mainModeKey,
-    workspaceTree,
-    customToolNames,
-    mcpToolNames,
-    workflowMode,
-    callbacks.getPreferredLanguage(),
-    resolvedInstructions,
-    {
-      initialized: callbacks.getGameStudioInitialized(),
-      activeStudioAgentKey: callbacks.getActiveStudioAgentKey(),
-      pendingSlashCommand: callbacks.getPendingSlashCommand(),
-    },
-    turnIntent,
-    config.promptLanguageStrategy,
-    availableToolNameList,
-  );
+    const mcpToolNames = availableToolNameList.filter((name) => mcpToolNameSet.has(name));
+    const customToolNames = availableToolNameList.filter((name) => skillToolNameSet.has(name));
+    const systemPrompt = buildSystemPrompt(
+      skills,
+      workspace,
+      mainModeKey,
+      workspaceTree,
+      customToolNames,
+      mcpToolNames,
+      workflowMode,
+      callbacks.getPreferredLanguage(),
+      resolvedInstructions,
+      {
+        initialized: callbacks.getGameStudioInitialized(),
+        activeStudioAgentKey: callbacks.getActiveStudioAgentKey(),
+        pendingSlashCommand: callbacks.getPendingSlashCommand(),
+      },
+      runtimeIntent,
+      config.promptLanguageStrategy,
+      availableToolNameList,
+    );
+    const currentMessages = callbacks.getMessages();
+    if (currentMessages.length === 0) {
+      callbacks.appendMessage({ role: "system", content: systemPrompt });
+    } else if (currentMessages[0].role === "system") {
+      const refreshed = [...currentMessages];
+      refreshed[0] = { ...refreshed[0], content: systemPrompt };
+      callbacks.replaceMessages(refreshed);
+    } else {
+      callbacks.replaceMessages([{ role: "system", content: systemPrompt }, ...currentMessages]);
+    }
+    appliedSystemPromptKey = systemPromptKey;
+  };
 
-  if (messages.length === 0) {
-    // Initial message
-    callbacks.appendMessage({ role: "system", content: systemPrompt });
-  } else if (messages[0].role === "system") {
-    // Refresh existing system prompt with current state
-    const refreshed = [...messages];
-    refreshed[0] = { ...refreshed[0], content: systemPrompt };
-    callbacks.replaceMessages(refreshed);
-  } else {
-    // Prepend system prompt if missing (e.g. from an imported session)
-    callbacks.replaceMessages([{ role: "system", content: systemPrompt }, ...messages]);
-  }
+  const initialRuntimeIntent = resolveRuntimeIntent();
+  applySystemPromptForRuntime(initialRuntimeIntent, resolveAllToolsForRuntime(initialRuntimeIntent));
 
   if (config.hooksEnabled) {
     const sessionKey = callbacks.getSessionKey();
@@ -1730,14 +1755,17 @@ export async function executeAgentLoop(
   const effectiveMaxIterations = workflowMode === "plan"
     ? MAX_ITERATIONS_PLAN_EXECUTION
     : MAX_ITERATIONS;
+  const loopStartRuntimeIntent = resolveRuntimeIntent();
+  const loopStartTools = resolveAllToolsForRuntime(loopStartRuntimeIntent);
 
   logAgentEvent("loop_start", {
     workflowMode,
     turnIntent,
+    runtimeIntent: loopStartRuntimeIntent,
     messagesLen: callbacks.getMessages().length,
-    allTools: allTools.length,
+    allTools: loopStartTools.length,
     mcpTools: mcpTools.length,
-    builtinAndSkillTools: Math.max(0, allTools.length - mcpTools.length),
+    builtinAndSkillTools: Math.max(0, loopStartTools.length - mcpTools.length),
     nativeToolsEnabled: !hasProviderNativeToolsDisabled(callbacks.getMessages()),
     xmlToolsEnabled: true,
     maxOutputEscalations: getMaxOutputEscalations(),
@@ -1753,11 +1781,15 @@ export async function executeAgentLoop(
 
     // ── Pre-LLM Turn Preparation ──
     callbacks.startNewTurn();
+    const runtimeIntent = resolveRuntimeIntent();
+    const iterationAllTools = resolveAllToolsForRuntime(runtimeIntent);
+    const availableToolNames = new Set(iterationAllTools.map((tool) => tool.function.name));
+    applySystemPromptForRuntime(runtimeIntent, iterationAllTools);
 
     // 1. Context management. Cloud mode uses a lightweight pass so tool-heavy
     // histories do not trigger slow Responses requests or gateway 524s.
     let managedAgentMessages = callbacks.getMessages() as AgentMessage[];
-    const llmTools = resolveLlmTools();
+    const llmTools = !hasProviderNativeToolsDisabled(callbacks.getMessages()) ? iterationAllTools : [];
     const cloudResponsesCompact = isCloudProfile && config.cloud.apiFormat === "responses";
     if (snapshotContextLimit != null || cloudResponsesCompact) {
       const contextLimit = snapshotContextLimit ?? 32768;
@@ -1794,8 +1826,9 @@ export async function executeAgentLoop(
       iteration,
       workflowMode,
       turnIntent,
+      runtimeIntent,
       messagesLen: managedAgentMessages.length,
-      allTools: allTools.length,
+      allTools: iterationAllTools.length,
       llmTools: llmTools.length,
       xmlToolsEnabled: true,
       mcpTools: mcpTools.length,
@@ -2011,7 +2044,7 @@ export async function executeAgentLoop(
         logAgentEvent("native_tool_fallback", {
           iteration,
           nativeToolsAttempted: nativeToolsWereAttempted,
-          allTools: allTools.length,
+          allTools: iterationAllTools.length,
           llmToolsBeforeFallback: llmTools.length,
           llmToolsAfterFallback: 0,
           xmlToolsEnabled: true,
@@ -2250,7 +2283,7 @@ export async function executeAgentLoop(
 
     const shouldRecoverToolUnavailableClaim =
       isCloudProfile &&
-      allTools.length > 0 &&
+      iterationAllTools.length > 0 &&
       effectiveToolCalls.length === 0 &&
       finalReplyOptions.length === 0 &&
       !compactedProseCodeDump &&
@@ -2260,7 +2293,7 @@ export async function executeAgentLoop(
       usedToolUnavailableRecoveryPrompt = true;
       logAgentEvent("tool_unavailable_claim_reprompt", {
         iteration,
-        allTools: allTools.length,
+        allTools: iterationAllTools.length,
         llmTools: llmTools.length,
         xmlToolsEnabled: true,
         visibleChars: finalVisibleText.length,
@@ -2731,8 +2764,8 @@ export async function executeAgentLoop(
 
       if (!availableToolNames.has(tc.name)) {
         const message = callbacks.getPreferredLanguage() === "zh"
-          ? `工具 "${tc.name}" 当前没有暴露给 ${turnIntent} 意图。请使用本轮可用工具，或在需要写入/执行时切换到计划或执行流程。`
-          : `Tool "${tc.name}" is not exposed for the current ${turnIntent} intent. Use an available tool, or switch to plan/execute when write or execution access is needed.`;
+          ? `工具 "${tc.name}" 当前没有暴露给 ${runtimeIntent} 运行意图。请使用本轮可用工具；如果这是已批准计划的执行步骤，请继续按执行阶段恢复。`
+          : `Tool "${tc.name}" is not exposed for the current ${runtimeIntent} runtime intent. Use an available tool; if this is approved plan execution, continue from the execution stage.`;
         callbacks.onToolError(tc.name, target, message);
         allResults.push({
           toolCallId: tc.id,
@@ -2838,7 +2871,7 @@ export async function executeAgentLoop(
         readOnlyCallSignatures.set(tc.id, signature);
         if (fileReadSignature) readOnlyCallSignatures.set(`${tc.id}:file_read`, fileReadSignature);
         readOnlyCalls.push({ id: tc.id, name: tc.name, arguments: tc.arguments });
-      } else if (workflowMode === "plan") {
+      } else if (workflowMode === "plan" && runtimeIntent !== "execute" && runtimeIntent !== "studio_workflow") {
         const approved = callbacks.getIsPlanApproved();
         const hasExecutableTasks = callbacks.getPlanTasks().length > 0;
 
@@ -2866,7 +2899,7 @@ export async function executeAgentLoop(
         readOnlyCalls,
         workspace,
         callbacks,
-        allTools,
+        iterationAllTools,
         hooksConfig,
       );
       for (const result of readResults) {
@@ -2915,7 +2948,7 @@ export async function executeAgentLoop(
         specFileCalls,
         workspace,
         callbacks,
-        allTools,
+        iterationAllTools,
         hooksConfig,
       );
       allResults.push(...specResults);
@@ -2927,7 +2960,7 @@ export async function executeAgentLoop(
         tc,
         workspace,
         callbacks,
-        allTools,
+        iterationAllTools,
         hooksConfig,
       );
       allResults.push(result);

@@ -1,4 +1,3 @@
-import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 
@@ -207,12 +206,7 @@ export async function collectPublicReleaseArtifacts({ rootDir, version, appName 
   return artifacts;
 }
 
-async function sha256ForFile(filePath) {
-  const content = await fs.readFile(filePath);
-  return crypto.createHash("sha256").update(content).digest("hex");
-}
-
-function buildReleaseNotes({ version, channel, publicRepo, repositoryUrl, latestUrl, tagUrl, assets, checksumsFile }) {
+function buildReleaseNotes({ version, channel, publicRepo, repositoryUrl, latestUrl, tagUrl, assets }) {
   const assetLines = assets
     .map((asset) => `- ${asset.fileName} (${asset.label}, ${(asset.size / (1024 * 1024)).toFixed(2)} MB)`)
     .join("\n");
@@ -227,9 +221,6 @@ function buildReleaseNotes({ version, channel, publicRepo, repositoryUrl, latest
     "",
     "## Assets",
     assetLines,
-    "",
-    "## Checksums",
-    `- SHA256 list: ${checksumsFile}`,
     "",
     "## What's New",
     "- TODO: summarize the main changes for this release.",
@@ -279,24 +270,14 @@ export async function preparePublicRelease({
     const destinationPath = path.join(assetsDir, artifact.fileName);
     await fs.copyFile(artifact.sourcePath, destinationPath);
     const stats = await fs.stat(destinationPath);
-    const sha256 = await sha256ForFile(destinationPath);
 
     copiedAssets.push({
       ...artifact,
       destinationPath,
       relativePath: path.relative(stageDir, destinationPath),
       size: stats.size,
-      sha256,
     });
   }
-
-  const checksumsFile = "SHA256SUMS.txt";
-  const checksumsPath = path.join(stageDir, checksumsFile);
-  await fs.writeFile(
-    checksumsPath,
-    `${copiedAssets.map((asset) => `${asset.sha256}  ${asset.fileName}`).join("\n")}\n`,
-    "utf8",
-  );
 
   const metadata = {
     appName: APP_NAME,
@@ -313,7 +294,6 @@ export async function preparePublicRelease({
       fileName: asset.fileName,
       relativePath: asset.relativePath,
       size: asset.size,
-      sha256: asset.sha256,
     })),
   };
 
@@ -338,7 +318,6 @@ export async function preparePublicRelease({
       latestUrl,
       tagUrl,
       assets: copiedAssets,
-      checksumsFile,
     })}\n`,
     "utf8",
   );
@@ -352,7 +331,6 @@ export async function preparePublicRelease({
     tagUrl,
     repositoryUrl,
     assets: copiedAssets,
-    checksumsPath,
     metadataPath,
     notesPath,
     websiteLinksPath,

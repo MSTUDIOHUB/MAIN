@@ -74,6 +74,47 @@ function parseTextContent(content) {
   }
 }
 
+function parseCardActionValue(value) {
+  let record = value;
+  if (typeof value === "string") {
+    try {
+      record = JSON.parse(value);
+    } catch {
+      return null;
+    }
+  }
+  if (!record || typeof record !== "object" || Array.isArray(record)) return null;
+  if (record.mainAction !== "feishu_approval") return null;
+  const action = safeText(record.action);
+  const approvalId = safeText(record.approvalId);
+  const nonce = safeText(record.nonce);
+  if (action !== "approve" && action !== "reject") return null;
+  if (!approvalId || !nonce) return null;
+  return { action, approvalId, nonce };
+}
+
+export function normalizeFeishuCardActionEvent(data) {
+  const context = data?.context || {};
+  const operator = data?.operator || {};
+  const actionValue = parseCardActionValue(data?.action?.value);
+  const messageId = safeText(context.open_message_id || data?.open_message_id || data?.message_id);
+  const chatId = safeText(context.open_chat_id || data?.open_chat_id || data?.chat_id);
+  const userId = safeText(operator.open_id || operator.user_id || operator.union_id);
+  if (!actionValue || !messageId || !chatId || !userId) return null;
+  return {
+    type: "card_action",
+    adapter: "feishu",
+    messageId,
+    chatId,
+    userId,
+    userName: safeText(operator.name || userId) || userId,
+    action: actionValue.action,
+    approvalId: actionValue.approvalId,
+    nonce: actionValue.nonce,
+    timestamp: Date.now(),
+  };
+}
+
 function resolveDomain(domain) {
   const value = safeText(domain) || "https://open.feishu.cn";
   if (value.includes("open.larksuite.com")) return Lark.Domain.Lark;
@@ -156,6 +197,10 @@ async function startAdapter(config) {
         timestamp: Number(message.create_time) || Date.now(),
       });
     },
+    "card.action.trigger": async (data) => {
+      const event = normalizeFeishuCardActionEvent(data);
+      if (event) emit(event);
+    },
   });
 
   started = true;
@@ -212,39 +257,48 @@ export function formatFeishuError(error) {
   return sanitizeSecretText(pieces.join(" ") || String(error));
 }
 
-export async function sendText(target, text, sdkClient = client, emitFn = emit) {
+async function sendMessagePayload(target, message, sdkClient = client, emitFn = emit) {
   if (!sdkClient) throw new Error("Feishu adapter is not connected.");
-  const content = safeText(text);
-  if (!content) return;
+  if (!message?.content || !message?.msgType) return null;
 
   const attempts = buildFeishuSendAttempts(target);
   if (attempts.length === 0) throw new Error("Missing Feishu send target.");
 
-  const messageContent = JSON.stringify({ text: content.slice(0, 3500) });
   const failures = [];
 
   for (const attempt of attempts) {
     try {
+      let response = null;
       if (attempt.method === "reply") {
-        await sdkClient.im.v1.message.reply({
+        response = await sdkClient.im.v1.message.reply({
           path: { message_id: attempt.messageId },
           data: {
-            msg_type: "text",
-            content: messageContent,
+            msg_type: message.msgType,
+            content: message.content,
           },
         });
       } else {
-        await sdkClient.im.v1.message.create({
+        response = await sdkClient.im.v1.message.create({
           params: {
             receive_id_type: attempt.receiveIdType,
           },
           data: {
             receive_id: attempt.receiveId,
-            msg_type: "text",
-            content: messageContent,
+            msg_type: message.msgType,
+            content: message.content,
           },
         });
       }
+      const messageId = safeText(response?.data?.message_id);
+      emitFn({
+        type: "message_sent",
+        adapter: "feishu",
+        messageKind: message.messageKind,
+        approvalId: message.approvalId,
+        messageId,
+        chatId: safeText(target?.chatId),
+        timestamp: Date.now(),
+      });
       emitFn({
         type: "log",
         adapter: "feishu",
@@ -252,7 +306,7 @@ export async function sendText(target, text, sdkClient = client, emitFn = emit) 
         message: `Feishu message sent via ${attempt.label}.`,
         timestamp: Date.now(),
       });
-      return;
+      return messageId;
     } catch (error) {
       failures.push(`${attempt.label}: ${formatFeishuError(error)}`);
     }
@@ -269,6 +323,56 @@ export async function sendText(target, text, sdkClient = client, emitFn = emit) 
     sendError: true,
   });
   throw new Error(failureMessage);
+}
+
+export async function sendText(target, text, sdkClient = client, emitFn = emit) {
+  const content = safeText(text);
+  if (!content) return null;
+  return sendMessagePayload(
+    target,
+    {
+      msgType: "text",
+      content: JSON.stringify({ text: content.slice(0, 3500) }),
+      messageKind: "text",
+    },
+    sdkClient,
+    emitFn,
+  );
+}
+
+export async function sendCard(target, card, sdkClient = client, emitFn = emit) {
+  if (!card || typeof card !== "object") throw new Error("Missing Feishu interactive card content.");
+  return sendMessagePayload(
+    target,
+    {
+      msgType: "interactive",
+      content: JSON.stringify(card),
+      messageKind: target?.messageKind || "interactive_card",
+      approvalId: safeText(target?.approvalId),
+    },
+    sdkClient,
+    emitFn,
+  );
+}
+
+export async function patchCard(messageId, card, sdkClient = client, emitFn = emit) {
+  if (!sdkClient) throw new Error("Feishu adapter is not connected.");
+  const id = safeText(messageId);
+  if (!id) throw new Error("Missing Feishu message id for card update.");
+  if (!card || typeof card !== "object") throw new Error("Missing Feishu interactive card content.");
+  await sdkClient.im.v1.message.patch({
+    path: { message_id: id },
+    data: {
+      content: JSON.stringify(card),
+    },
+  });
+  emitFn({
+    type: "log",
+    adapter: "feishu",
+    level: "info",
+    message: `Feishu card patched: ${id}.`,
+    timestamp: Date.now(),
+  });
 }
 
 async function stopAdapter() {
@@ -296,6 +400,38 @@ async function handleCommandLine(line) {
         await sendText(command, command.text);
       } catch {
         // sendText emits a non-fatal status update; keep the long connection alive.
+      }
+      return;
+    }
+    if (command.type === "send_card") {
+      try {
+        await sendCard(command, command.card);
+      } catch (error) {
+        emit({
+          type: "status",
+          adapter: "feishu",
+          status: started ? "connected" : "idle",
+          running: started,
+          message: `Feishu card send failed. ${formatFeishuError(error)}`,
+          timestamp: Date.now(),
+          sendError: true,
+        });
+      }
+      return;
+    }
+    if (command.type === "patch_card") {
+      try {
+        await patchCard(command.messageId, command.card);
+      } catch (error) {
+        emit({
+          type: "status",
+          adapter: "feishu",
+          status: started ? "connected" : "idle",
+          running: started,
+          message: `Feishu card update failed. ${formatFeishuError(error)}`,
+          timestamp: Date.now(),
+          sendError: true,
+        });
       }
       return;
     }

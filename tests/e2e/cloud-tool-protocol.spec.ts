@@ -116,6 +116,19 @@ test.beforeEach(async ({ page }) => {
           });
         }
 
+        if (scenario === "plan-approval-execute-tools") {
+          return JSON.stringify({
+            output_text: [
+              "我会先写入执行任务清单。",
+              "<tool_use>",
+              "<tool>write_file</tool>",
+              "<parameter name=\"path\">.MAIN/plans/tasks.md</parameter>",
+              "<parameter name=\"content\"># Tasks\n\n- [ ] 验证批准后执行工具可用</parameter>",
+              "</tool_use>",
+            ].join("\n"),
+          });
+        }
+
         return JSON.stringify({ output_text: "ok" });
       }
 
@@ -207,5 +220,52 @@ test("reply options pause before mixed XML tool calls and continue from the sour
       archivedOptionCount: 1,
       selectedOptions: ["请采用保守方案继续"],
       readFileCalls: 0,
+    });
+});
+
+test("approved plan resumes with execute runtime tools while preserving plan turn identity", async ({ page }) => {
+  await page.goto("/?e2eScenario=plan-approval-execute-tools");
+
+  await expect(page.getByTestId("top-island-plan-approve")).toBeVisible();
+  await page.getByTestId("top-island-plan-approve").click();
+
+  await expect
+    .poll(async () =>
+      page.evaluate(() => {
+        const probe = (window as any).__CLOUD_TOOL_PROTOCOL_TEST__;
+        const requests = probe?.requests || [];
+        const latestWithTools = [...requests].reverse().find((request: any) => request.hasTools);
+        if (!latestWithTools) return null;
+        const parsed = JSON.parse(latestWithTools.body || "{}");
+        const names = (parsed.tools || []).map((tool: any) => tool?.name || tool?.function?.name).filter(Boolean);
+        const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+        return {
+          hasWrite: names.includes("write_file") && names.includes("replace_in_file"),
+          hasShell: names.includes("run_command") && names.includes("execute_command"),
+          currentTurnIntent: snapshot?.currentTurnIntent,
+          isPlanApproved: snapshot?.isPlanApproved,
+        };
+      }),
+    )
+    .toEqual({
+      hasWrite: true,
+      hasShell: true,
+      currentTurnIntent: "plan",
+      isPlanApproved: true,
+    });
+
+  await expect
+    .poll(async () =>
+      page.evaluate(() => {
+        const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+        return {
+          hasWriteToolBlock: (snapshot?.toolNames || []).includes("write_file"),
+          hasExecutionAgentText: (snapshot?.agentTexts || []).includes("我会先写入执行任务清单。"),
+        };
+      }),
+    )
+    .toEqual({
+      hasWriteToolBlock: true,
+      hasExecutionAgentText: true,
     });
 });

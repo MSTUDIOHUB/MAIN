@@ -5,6 +5,9 @@ const shouldUseExternalServer =
   process.env.PLAYWRIGHT_SKIP_WEB_SERVER === "1" ||
   process.env.PLAYWRIGHT_SKIP_WEBSERVER === "1" ||
   process.env.PLAYWRIGHT_BASE_URL !== undefined;
+const browserChannel =
+  process.env.PLAYWRIGHT_BROWSER_CHANNEL ||
+  (process.env.PLAYWRIGHT_USE_CHROME_FOR_TESTING === "1" ? "chromium" : undefined);
 
 export default defineConfig({
   testDir: "./tests/e2e",
@@ -15,6 +18,7 @@ export default defineConfig({
     baseURL,
     headless: true,
     viewport: { width: 1440, height: 960 },
+    ...(browserChannel ? { channel: browserChannel } : {}),
   },
   webServer: shouldUseExternalServer
     ? undefined

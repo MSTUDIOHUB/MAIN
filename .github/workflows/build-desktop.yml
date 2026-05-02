@@ -175,6 +175,10 @@ jobs:
       RELEASE_REPO: ${{ inputs.release_repo }}
       GH_TOKEN: ${{ secrets.PUBLIC_RELEASES_TOKEN }}
     steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
+
       - name: Download release zips
         uses: actions/download-artifact@v8
         with:
@@ -182,31 +186,59 @@ jobs:
           path: release-assets
           merge-multiple: true
 
-      - name: Generate SHA256 checksums and release notes
+      - name: Generate release notes
         shell: bash
         run: |
           set -euo pipefail
 
-          cd release-assets
-          sha256sum *.zip > SHA256SUMS.txt
+          commit_sha="$(git rev-parse --short HEAD)"
+          commit_subject="$(git log -1 --pretty=%s)"
+          commit_body="$(git log -1 --pretty=%b)"
+          commit_author="$(git log -1 --pretty='%an')"
+          commit_date="$(git log -1 --date=iso-strict --pretty='%cd')"
+          changed_files="$(git show --name-status --format= --find-renames HEAD)"
 
-          cat > release-notes.md <<EOF
-          # MAIN ${VERSION}
+          {
+            echo "# MAIN ${VERSION}"
+            echo ""
+            echo "## Downloads"
+            echo ""
+            echo "- macOS Universal: download \`${APP_NAME}_${VERSION}_macOS_universal.zip\`"
+            echo "- macOS Apple Silicon: download \`${APP_NAME}_${VERSION}_macOS_apple_silicon.zip\`"
+            echo "- Windows: download \`${APP_NAME}_${VERSION}_windows_x64.zip\`"
+            echo ""
+            echo "## Changelog"
+            echo ""
+            echo "- Commit: \`${commit_sha}\`"
+            echo "- Author: ${commit_author}"
+            echo "- Date: ${commit_date}"
+            echo "- Summary: ${commit_subject}"
 
-          ## Downloads
+            if [[ -n "${commit_body}" ]]; then
+              echo ""
+              echo "### Commit details"
+              echo ""
+              echo '```text'
+              printf '%s\n' "${commit_body}"
+              echo '```'
+            fi
 
-          - macOS Universal: download \`${APP_NAME}_${VERSION}_macOS_universal.zip\`
-          - macOS Apple Silicon: download \`${APP_NAME}_${VERSION}_macOS_apple_silicon.zip\`
-          - Windows: download \`${APP_NAME}_${VERSION}_windows_x64.zip\`
-          - Checksums: verify downloads with \`SHA256SUMS.txt\`
+            if [[ -n "${changed_files}" ]]; then
+              echo ""
+              echo "### Changed files"
+              echo ""
+              echo '```text'
+              printf '%s\n' "${changed_files}"
+              echo '```'
+            fi
 
-          ## Privacy boundary
+            echo ""
+            echo "## Privacy boundary"
+            echo ""
+            echo "This public release contains only packaged desktop binaries and a commit summary. Source code remains in the private MAIN repository."
+          } > release-assets/release-notes.md
 
-          This public release contains only packaged desktop binaries. Source code remains in the private MAIN repository.
-          EOF
-
-          ls -lah
-          cat SHA256SUMS.txt
+          ls -lah release-assets
 
       - name: Publish to public GitHub Releases repo
         shell: bash
@@ -237,15 +269,17 @@ jobs:
               --draft="${{ inputs.draft }}" \
               --prerelease="${{ inputs.prerelease }}"
 
+            gh release delete-asset "$tag" SHA256SUMS.txt \
+              --repo "$RELEASE_REPO" \
+              --yes >/dev/null 2>&1 || true
+
             gh release upload "$tag" \
               release-assets/*.zip \
-              release-assets/SHA256SUMS.txt \
               --repo "$RELEASE_REPO" \
               --clobber
           else
             gh release create "$tag" \
               release-assets/*.zip \
-              release-assets/SHA256SUMS.txt \
               --repo "$RELEASE_REPO" \
               --title "${APP_NAME} ${VERSION}" \
               --notes-file release-assets/release-notes.md \

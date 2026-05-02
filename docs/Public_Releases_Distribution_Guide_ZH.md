@@ -29,7 +29,7 @@
 - GitHub Releases
 - 二进制安装包
 - README（说明 MAIN 是闭源桌面应用）
-- 可选截图、版本说明、SHA256
+- 可选截图、版本说明
 
 最关键的是：
 
@@ -58,9 +58,9 @@
 - `MAIN_<version>_macOS_universal.zip`
 - `MAIN_<version>_macOS_apple_silicon.zip`
 - `MAIN_<version>_windows_x64.zip`
-- `SHA256SUMS.txt`
 
 不会上传 `src/`、`src-tauri/`、`dist/`、`target/` 这类源码或构建目录。
+Release Changelog 会自动写入私有 `MAIN` 仓库触发构建时的最后一次提交摘要、提交正文和变更文件列表，但不会公开源码 diff。
 
 ### 最快发布命令
 
@@ -283,7 +283,6 @@ release-output/public/v1.1.2/
 生成这些文件：
 
 - `assets/`：准备上传的安装包
-- `SHA256SUMS.txt`
 - `release-notes.md`
 - `release-metadata.json`
 - `website-links.json`
@@ -395,7 +394,7 @@ npm run release:bump -- <version>
 1. `npm run release:bump -- <version>` 已执行
 2. macOS / Windows 构建都成功
 3. `npm run release:stage -- --repo <owner>/MAIN-Releases` 已生成发布目录
-4. `SHA256SUMS.txt` 已生成
+4. `release-notes.md` 已包含本次发布的提交摘要
 5. 官网主下载按钮仍然指向 `/releases/latest`
 6. GitHub Release 的 tag 使用 `v<version>` 形式
 

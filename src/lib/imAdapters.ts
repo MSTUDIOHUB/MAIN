@@ -59,8 +59,36 @@ export interface FeishuInboundMessage {
   timestamp?: number;
 }
 
+export type FeishuApprovalAction = "approve" | "reject";
+export type FeishuApprovalStatus = "pending" | "approved" | "rejected" | "expired";
+
+export interface FeishuCardActionEvent {
+  type: "card_action";
+  adapter: "feishu";
+  messageId: string;
+  chatId: string;
+  userId: string;
+  userName: string;
+  action: FeishuApprovalAction;
+  approvalId: string;
+  nonce: string;
+  timestamp?: number;
+}
+
+export interface FeishuMessageSentEvent {
+  type: "message_sent";
+  adapter: "feishu";
+  messageKind?: string;
+  approvalId?: string;
+  messageId?: string;
+  chatId?: string;
+  timestamp?: number;
+}
+
 export type FeishuAdapterEvent =
   | FeishuInboundMessage
+  | FeishuCardActionEvent
+  | FeishuMessageSentEvent
   | {
       type: "status" | "error" | "log";
       adapter: "feishu";
@@ -84,12 +112,79 @@ export interface FeishuRemoteIntentOverride {
   skipIntentResolution?: boolean;
 }
 
+export interface FeishuApprovalRecord {
+  approvalId: string;
+  nonce: string;
+  chatId: string;
+  userId: string;
+  expiresAt: number;
+  status: FeishuApprovalStatus;
+}
+
+export interface FeishuApprovalActionRequest {
+  approvalId: string;
+  nonce: string;
+  chatId: string;
+  userId: string;
+  action: FeishuApprovalAction;
+}
+
+export type FeishuApprovalResolution<T extends FeishuApprovalRecord> =
+  | { ok: true; approval: T }
+  | {
+      ok: false;
+      reason: "not_found" | "wrong_user" | "wrong_chat" | "nonce_mismatch" | "expired" | "already_resolved";
+      approval?: T;
+    };
+
+export interface BuildFeishuApprovalCardInput {
+  language: "zh" | "en";
+  approvalId: string;
+  nonce: string;
+  code?: string;
+  toolName: string;
+  target?: string;
+  workspace?: string;
+  preview?: string;
+  requestedAt: number;
+  expiresAt: number;
+  status?: FeishuApprovalStatus;
+  resolvedBy?: string;
+  resolvedAt?: number;
+}
+
+export type FeishuInteractiveCard = Record<string, unknown>;
+
 // endregion
 
 // region: 默认配置与归一化
 
 export function createFeishuPairingCode(): string {
   return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+function createRandomToken(length: number): string {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  const values = new Uint32Array(length);
+  const cryptoSource = globalThis.crypto;
+  if (cryptoSource?.getRandomValues) {
+    cryptoSource.getRandomValues(values);
+  } else {
+    for (let index = 0; index < values.length; index += 1) {
+      values[index] = Math.floor(Math.random() * alphabet.length);
+    }
+  }
+  return Array.from(values, (value) => alphabet[value % alphabet.length]).join("");
+}
+
+export const FEISHU_APPROVAL_TTL_MS = 10 * 60 * 1000;
+
+export function createFeishuApprovalId(): string {
+  return `apv_${createRandomToken(12).toLowerCase()}`;
+}
+
+export function createFeishuApprovalNonce(): string {
+  return createRandomToken(24);
 }
 
 export function createDefaultFeishuAdapterConfig(): FeishuAdapterConfig {
@@ -213,6 +308,175 @@ export function parseFeishuTextCommand(input: string): FeishuTextCommand {
   if (/^\/status$/i.test(text)) return { kind: "status" };
   if (/^\/stop$/i.test(text)) return { kind: "stop" };
   return { kind: "message", text };
+}
+
+function normalizeActionValue(value: unknown): Record<string, unknown> | null {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  if (typeof value !== "string") return null;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+export function parseFeishuApprovalCardActionValue(value: unknown):
+  | { action: FeishuApprovalAction; approvalId: string; nonce: string }
+  | null {
+  const record = normalizeActionValue(value);
+  if (!record || record.mainAction !== "feishu_approval") return null;
+  const action = String(record.action || "").trim();
+  const approvalId = String(record.approvalId || "").trim();
+  const nonce = String(record.nonce || "").trim();
+  if (action !== "approve" && action !== "reject") return null;
+  if (!approvalId || !nonce) return null;
+  return { action, approvalId, nonce };
+}
+
+export function resolveFeishuApprovalAction<T extends FeishuApprovalRecord>(
+  approvals: T[],
+  request: FeishuApprovalActionRequest,
+  now = Date.now(),
+): FeishuApprovalResolution<T> {
+  const approval = approvals.find((item) => item.approvalId === request.approvalId) || null;
+  if (!approval) return { ok: false, reason: "not_found" };
+  if (approval.status !== "pending") return { ok: false, reason: "already_resolved", approval };
+  if (approval.userId !== request.userId) return { ok: false, reason: "wrong_user", approval };
+  if (approval.chatId !== request.chatId) return { ok: false, reason: "wrong_chat", approval };
+  if (approval.nonce !== request.nonce) return { ok: false, reason: "nonce_mismatch", approval };
+  if (approval.expiresAt <= now) return { ok: false, reason: "expired", approval };
+  return { ok: true, approval };
+}
+
+function formatCardDate(timestamp: number, language: "zh" | "en"): string {
+  try {
+    return new Intl.DateTimeFormat(language === "zh" ? "zh-CN" : "en-US", {
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    }).format(new Date(timestamp));
+  } catch {
+    return new Date(timestamp).toISOString();
+  }
+}
+
+function escapeMarkdown(value: string): string {
+  return String(value || "").replace(/```/g, "'''");
+}
+
+function truncateCardText(value: string, maxChars: number): string {
+  const text = String(value || "").trim();
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, maxChars - 18).trimEnd()}\n... <truncated>`;
+}
+
+function statusTemplate(status: FeishuApprovalStatus): string {
+  if (status === "approved") return "green";
+  if (status === "rejected") return "red";
+  if (status === "expired") return "yellow";
+  return "blue";
+}
+
+export function buildFeishuApprovalCard(input: BuildFeishuApprovalCardInput): FeishuInteractiveCard {
+  const status = input.status || "pending";
+  const isEn = input.language === "en";
+  const statusLabel = status === "pending"
+    ? isEn ? "Waiting for approval" : "等待审批"
+    : status === "approved"
+    ? isEn ? "Approved" : "已允许"
+    : status === "rejected"
+    ? isEn ? "Rejected" : "已拒绝"
+    : isEn ? "Expired" : "已过期";
+  const title = isEn ? `MAIN Tool Approval - ${statusLabel}` : `MAIN 工具审批 - ${statusLabel}`;
+  const requestedAt = formatCardDate(input.requestedAt, input.language);
+  const expiresAt = formatCardDate(input.expiresAt, input.language);
+  const resolvedAt = input.resolvedAt ? formatCardDate(input.resolvedAt, input.language) : "";
+  const target = truncateCardText(input.target || (isEn ? "No target" : "无目标"), 600);
+  const workspace = truncateCardText(input.workspace || (isEn ? "Current workspace" : "当前工作区"), 260);
+  const preview = truncateCardText(input.preview || target, 1100);
+  const lines = [
+    `**${isEn ? "Tool" : "工具"}**: ${escapeMarkdown(input.toolName)}`,
+    `**${isEn ? "Target" : "目标"}**: ${escapeMarkdown(target)}`,
+    `**${isEn ? "Workspace" : "工作区"}**: ${escapeMarkdown(workspace)}`,
+    `**${isEn ? "Request ID" : "审批编号"}**: \`${escapeMarkdown(input.approvalId)}\``,
+    `**${isEn ? "Requested" : "请求时间"}**: ${requestedAt}`,
+    status === "pending"
+      ? `**${isEn ? "Expires" : "过期时间"}**: ${expiresAt}`
+      : `**${isEn ? "Handled" : "处理时间"}**: ${resolvedAt || requestedAt}`,
+    status !== "pending" && input.resolvedBy
+      ? `**${isEn ? "Operator" : "操作者"}**: ${escapeMarkdown(input.resolvedBy)}`
+      : "",
+    "",
+    `**${isEn ? "Preview" : "预览"}**`,
+    "```",
+    escapeMarkdown(preview),
+    "```",
+  ].filter(Boolean);
+
+  const elements: unknown[] = [
+    {
+      tag: "markdown",
+      content: lines.join("\n"),
+    },
+  ];
+
+  if (status === "pending") {
+    elements.push({
+      tag: "action",
+      actions: [
+        {
+          tag: "button",
+          text: {
+            tag: "plain_text",
+            content: isEn ? "Allow once" : "允许本次",
+          },
+          type: "primary",
+          value: {
+            mainAction: "feishu_approval",
+            action: "approve",
+            approvalId: input.approvalId,
+            nonce: input.nonce,
+          },
+        },
+        {
+          tag: "button",
+          text: {
+            tag: "plain_text",
+            content: isEn ? "Reject" : "拒绝执行",
+          },
+          type: "danger",
+          value: {
+            mainAction: "feishu_approval",
+            action: "reject",
+            approvalId: input.approvalId,
+            nonce: input.nonce,
+          },
+        },
+      ],
+    });
+  }
+
+  return {
+    config: {
+      wide_screen_mode: true,
+      update_multi: true,
+    },
+    header: {
+      template: statusTemplate(status),
+      title: {
+        tag: "plain_text",
+        content: title,
+      },
+    },
+    elements,
+  };
 }
 
 export function resolveFeishuRemoteIntentOverride(input: string): FeishuRemoteIntentOverride {

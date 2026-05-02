@@ -774,14 +774,14 @@ function FeishuGuideModal({ t, language, onClose }: { t: any; language: "zh" | "
     ? [
         "Open Feishu Developer Console and create an enterprise self-built app.",
         "Enable bot capability, then add the bot to your Feishu account.",
-        "Enable event subscription by long connection and subscribe to im.message.receive_v1.",
+        "Enable event subscription by long connection and subscribe to im.message.receive_v1 plus card.action.trigger.",
         "Grant message receive and bot message send permissions, then publish or install the app in the tenant.",
         "Copy the App ID and App Secret from the app credentials page.",
       ]
     : [
         "打开飞书开放平台控制台，创建一个企业自建应用。",
         "启用机器人能力，并把机器人添加到你的飞书账号。",
-        "开启事件订阅的长连接模式，订阅 im.message.receive_v1 事件。",
+        "开启事件订阅的长连接模式，订阅 im.message.receive_v1 和 card.action.trigger 事件。",
         "授予接收消息、机器人发送消息相关权限，然后在企业内发布或安装应用。",
         "在应用凭证页面复制 App ID 和 App Secret。",
       ];
@@ -808,7 +808,8 @@ function FeishuGuideModal({ t, language, onClose }: { t: any; language: "zh" | "
         "Use /execute or /plan before a task when you want MAIN to modify files or create a reviewed plan.",
         "/status: show adapter, MAIN and workspace status.",
         "/stop: stop current generation and clear queued remote messages.",
-        "/approve CODE or /reject CODE: allow or reject a tool action requested by a remote task.",
+        "Remote approvals appear as interactive cards. Use the card buttons to allow or reject tool actions.",
+        "/approve CODE or /reject CODE remains available only as a fallback if cards cannot be delivered.",
         "If replies fail with 400, check the bot message-send permission and whether the bot can send private messages to you.",
       ]
     : [
@@ -816,7 +817,8 @@ function FeishuGuideModal({ t, language, onClose }: { t: any; language: "zh" | "
         "需要修改文件或先出方案时，在任务前加 /execute 或 /plan。",
         "/status：查看飞书适配器、MAIN 和工作区状态。",
         "/stop：停止当前生成，并清空远程队列。",
-        "/approve CODE 或 /reject CODE：远程允许或拒绝工具执行。",
+        "远程审批会以交互式卡片出现，请直接点击卡片按钮允许或拒绝工具执行。",
+        "/approve CODE 或 /reject CODE 仅作为卡片无法送达时的备用方式。",
         "如果回消息出现 400，请检查机器人发送消息权限，以及机器人是否允许给你发送私聊。",
       ];
 

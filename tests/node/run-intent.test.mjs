@@ -127,6 +127,20 @@ test("design based implementation request approves an existing plan", () => {
   assert.equal(result.needsDecision, undefined);
 });
 
+test("approved plan resume keeps the conversation intent as plan", () => {
+  const result = resolveTurnRunIntent(
+    "继续执行剩余任务",
+    createContext({
+      hasPlanArtifacts: true,
+      planStage: "executing",
+      isPlanApproved: true,
+    }),
+  );
+
+  assert.equal(result.intent, "plan");
+  assert.equal(result.controlAction, "resume_plan_execution");
+});
+
 test("complex multi-file generation routes to plan before execution", () => {
   const result = resolveTurnRunIntent(
     "生成一套游戏框架代码包括文件夹，实现《歧路旅人》CTB回合制战斗逻辑。",

@@ -4053,6 +4053,55 @@ fn send_feishu_message(
 }
 
 #[tauri::command]
+fn send_feishu_card(
+    state: State<FeishuAdapterManager>,
+    chat_id: String,
+    card: Value,
+    user_id: Option<String>,
+    open_id: Option<String>,
+    message_id: Option<String>,
+    approval_id: Option<String>,
+) -> Result<(), String> {
+    let process_guard = state
+        .process
+        .lock()
+        .map_err(|_| "无法发送飞书卡片：状态锁已损坏".to_string())?;
+    let process = process_guard
+        .as_ref()
+        .ok_or_else(|| "飞书适配器尚未启动".to_string())?;
+    write_feishu_sidecar_command(&process.writer, json!({
+        "type": "send_card",
+        "chatId": chat_id,
+        "userId": user_id,
+        "openId": open_id,
+        "messageId": message_id,
+        "approvalId": approval_id,
+        "messageKind": "approval_card",
+        "card": card,
+    }))
+}
+
+#[tauri::command]
+fn patch_feishu_card(
+    state: State<FeishuAdapterManager>,
+    message_id: String,
+    card: Value,
+) -> Result<(), String> {
+    let process_guard = state
+        .process
+        .lock()
+        .map_err(|_| "无法更新飞书卡片：状态锁已损坏".to_string())?;
+    let process = process_guard
+        .as_ref()
+        .ok_or_else(|| "飞书适配器尚未启动".to_string())?;
+    write_feishu_sidecar_command(&process.writer, json!({
+        "type": "patch_card",
+        "messageId": message_id,
+        "card": card,
+    }))
+}
+
+#[tauri::command]
 async fn test_feishu_adapter_connection(
     app_id: String,
     app_secret: String,
@@ -4171,6 +4220,8 @@ pub fn run() {
             get_feishu_adapter_status,
             get_feishu_node_runtime_status,
             send_feishu_message,
+            send_feishu_card,
+            patch_feishu_card,
             test_feishu_adapter_connection
         ])
         .run(tauri::generate_context!())

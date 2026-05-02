@@ -116,9 +116,9 @@ test("preparePublicRelease copies assets and writes metadata", async () => {
   });
 
   const metadata = JSON.parse(await fs.readFile(result.metadataPath, "utf8"));
-  const checksums = await fs.readFile(result.checksumsPath, "utf8");
   const notes = await fs.readFile(result.notesPath, "utf8");
   const copiedAssetNames = (await fs.readdir(result.assetsDir)).sort();
+  const stageFileNames = (await fs.readdir(result.stageDir)).sort();
 
   assert.equal(metadata.latestUrl, "https://github.com/mstudiohub/MAIN-Releases/releases/latest");
   assert.equal(metadata.assets.length, 2);
@@ -126,6 +126,7 @@ test("preparePublicRelease copies assets and writes metadata", async () => {
     `MAIN-${version}-macOS-unsigned-share.zip`,
     `MAIN-${version}-windows-portable.exe`,
   ]);
-  assert.match(checksums, /MAIN-1\.1\.1-macOS-unsigned-share\.zip/);
+  assert.deepEqual(stageFileNames, ["assets", "release-metadata.json", "release-notes.md", "website-links.json"]);
+  assert.doesNotMatch(notes, /SHA256SUMS/);
   assert.match(notes, /gh release create v1\.1\.1/);
 });

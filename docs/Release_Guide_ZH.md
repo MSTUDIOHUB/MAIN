@@ -197,7 +197,6 @@ npm run release:stage -- --repo <你的 GitHub 用户名>/MAIN-Releases
 脚本会生成：
 
 - `release-output/public/v<version>/assets/`
-- `release-output/public/v<version>/SHA256SUMS.txt`
 - `release-output/public/v<version>/release-notes.md`
 - `release-output/public/v<version>/release-metadata.json`
 - `release-output/public/v<version>/website-links.json`
@@ -208,7 +207,7 @@ npm run release:stage -- --repo <你的 GitHub 用户名>/MAIN-Releases
 2. 确认图标已经是你要公开分发的正式图标。
 3. 确认 macOS 分享包或正式签名包已经生成。
 4. 确认 Windows 便携版 / 安装版已生成。
-5. 确认 `npm run release:stage -- --repo <owner>/MAIN-Releases` 已生成校验与说明文件。
+5. 确认 `npm run release:stage -- --repo <owner>/MAIN-Releases` 已生成发布附件与说明文件。
 6. 确认 `identifier` 在正式公开发布前替换成你自己长期持有的反向域名标识。
 
 最后一项尤其重要。当前项目仍使用 `com.localagent.ide`，功能上可以打包，但如果要长期对外发布，建议改成你自己控制的正式 bundle identifier，例如基于品牌域名来命名。

@@ -567,8 +567,8 @@ const TopIsland = memo(function TopIsland({
                       <div className={`text-[12px] font-medium ${primaryText}`}>{copy.waitingPlan}</div>
                       <div className={`mt-1 text-[12px] leading-6 ${secondaryText}`}>
                       {language === "zh"
-                        ? "当前计划已经准备就绪。确认后会先生成执行任务列表，再进入执行阶段。"
-                        : "The current plan is ready. Approving it will generate the execution task list first and then start execution."}
+                        ? "当前计划已经准备就绪。确认后会进入执行能力，写入与命令仍会逐项审查。"
+                        : "The current plan is ready. Approving it enables execution tools while keeping write and command steps review-gated."}
                       </div>
                     </div>
                     <div className="mt-3 flex items-center justify-end gap-2 px-1">

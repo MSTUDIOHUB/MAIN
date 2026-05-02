@@ -20,6 +20,7 @@ const STREAM_ERROR_RECOVERY_SCENARIO = "stream-error-recovery";
 const SESSION_AUTO_CREATE_SCENARIO = "session-auto-create";
 const CLOUD_TOOL_FALLBACK_SCENARIO = "cloud-tool-fallback";
 const REPLY_OPTIONS_TOOL_PAUSE_SCENARIO = "reply-options-tool-pause";
+const PLAN_APPROVAL_EXECUTE_TOOLS_SCENARIO = "plan-approval-execute-tools";
 const TOP_ISLAND_EXECUTION_PROGRESS_SCENARIO = "top-island-execution-progress";
 const E2E_SEED_COUNT_PREFIX = "__CODELY_E2E_SEED_COUNT__:";
 
@@ -71,6 +72,7 @@ function bindBridgeSnapshot(scenario: string) {
   bridge.getSnapshot = () => {
     const state = useAppStore.getState();
     const agentBlocks = state.taskFlow.filter((block) => block.type === "agent") as any[];
+    const toolBlocks = state.taskFlow.filter((block) => block.type === "tool") as any[];
     const archivedOptionBlocks = agentBlocks.filter((block) => block.archivedAfterChoice);
     return {
       planStage: state.planStage,
@@ -84,8 +86,14 @@ function bindBridgeSnapshot(scenario: string) {
       currentTurnStatus: state.currentTurnId
         ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId)?.status ?? null
         : null,
+      currentTurnIntent: state.currentTurnId
+        ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId)?.intent ?? null
+        : null,
       conversationTurns: state.conversationTurns.length,
       taskFlowUserCount: state.taskFlow.filter((block) => block.type === "user").length,
+      agentTexts: agentBlocks.map((block) => block.content),
+      toolNames: toolBlocks.map((block) => block.toolName),
+      toolTargets: toolBlocks.map((block) => block.target),
       selectedOptions: archivedOptionBlocks.map((block) => block.selectedOption).filter(Boolean),
       seedCount: readSeedCount(scenario),
     };
@@ -233,6 +241,7 @@ function seedPlanFlowScenario() {
         userPrompt: "请先生成方案，我确认后再执行。",
         title: "计划审批回归流",
         mode: "plan",
+        intent: "plan",
         status: "awaiting_approval",
         summary: "已生成方案，等待保存与执行审批。",
         blockIds: [userBlockId, agentBlockId],
@@ -2143,6 +2152,149 @@ function seedCloudToolProtocolScenario(scenario: string) {
   return cleanup;
 }
 
+function seedPlanApprovalExecuteToolsScenario() {
+  const bridge = getBridge();
+  if (!bridge) return undefined;
+
+  bridge.events = [{ type: "boot" }];
+  bridge.savedDocuments = [];
+  bridge.completed = false;
+
+  incrementSeedCount(PLAN_APPROVAL_EXECUTE_TOOLS_SCENARIO);
+
+  const now = Date.now();
+  const workspace = "/tmp/e2e-plan-approval-execute-tools";
+  const sessionId = 999503;
+  const turnId = "e2e-plan-approval-execute-tools-turn";
+  const userBlockId = useAppStore.getState()._nextTaskId();
+  const agentBlockId = useAppStore.getState()._nextTaskId();
+  const server = {
+    id: "e2e-plan-approval-execute-tools-server",
+    name: "E2E Cloud",
+    protocol: "openai" as const,
+    apiFormat: "responses" as const,
+    provider: "OpenAI",
+    endpoint: "https://e2e-cloud.example/v1",
+    model: "e2e-cloud-model",
+    apiKey: "e2e-key",
+    customHeaders: "",
+    temperature: 0.2,
+    topP: 0.95,
+    disableResponseStorage: true,
+    reasoningEffort: "none" as const,
+  };
+
+  useAppStore.setState((state) => ({
+    ...state,
+    config: {
+      ...state.config,
+      language: "zh",
+      workflowMode: "plan",
+      activeProfile: "cloud",
+      workspace,
+      cloud: server,
+      cloudServers: [server],
+      activeCloudServerId: server.id,
+      instructionsEnabled: false,
+      hooksEnabled: false,
+      sessionRecordingEnabled: false,
+    },
+    currentWorkspace: workspace,
+    selectedWorkspace: workspace,
+    sessionsByWorkspace: {
+      [workspace]: [
+        {
+          id: sessionId,
+          title: "E2E Plan Approval Execute Tools",
+          date: new Date(now).toISOString(),
+          active: true,
+          storageStatus: "temporary",
+          recordingDisabled: true,
+          messages: [],
+        },
+      ],
+    },
+    currentSessionId: sessionId,
+    selectedMainModeKey: "main_mode",
+    selectedNexusModeKey: "nexus_general",
+    taskFlow: [
+      { id: userBlockId, turnId, type: "user", content: "/计划 修复审批后执行工具不可用的问题。" },
+      {
+        id: agentBlockId,
+        turnId,
+        type: "agent",
+        content: "计划已经收敛，可以批准执行。",
+        streaming: false,
+      },
+    ],
+    agentMessages: [],
+    conversationTurns: [
+      {
+        id: turnId,
+        userPrompt: "/计划 修复审批后执行工具不可用的问题。",
+        title: "审批后执行工具回归",
+        mode: "plan",
+        intent: "plan",
+        status: "awaiting_approval",
+        summary: "等待用户批准执行。",
+        blockIds: [userBlockId, agentBlockId],
+        collapsed: false,
+        createdAt: now,
+      },
+    ],
+    currentTurnId: turnId,
+    input: "",
+    attachedFiles: [],
+    contextMentions: [],
+    planArtifacts: [
+      {
+        kind: "requirements" as const,
+        path: ".MAIN/plans/requirements.md",
+        title: "Requirements",
+        updatedAt: now - 2_000,
+        content: "# Requirements\n\n- 批准后应允许执行工具出现在运行时工具列表中。\n",
+      },
+      {
+        kind: "design" as const,
+        path: ".MAIN/plans/design.md",
+        title: "Design",
+        updatedAt: now - 1_000,
+        content: "# Design\n\n- Plan 回合保持 plan 身份，但批准后的 runtime intent 使用 execute。\n",
+      },
+    ],
+    planTasks: [],
+    planExecutionEvidenceLedger: [],
+    planExecutionEvidenceCount: 0,
+    planStage: "design",
+    isPlanApproved: false,
+    planApprovalChoice: null,
+    currentTurnExecutionConsent: { turnId: null, granted: false },
+    autoApproveTools: false,
+    readOnlyAutoApproveForSession: false,
+    showPlanPanel: true,
+    showDiff: false,
+    showTerminal: false,
+    showFilePanel: false,
+    rightPanelTab: "plan",
+    selectedDiffTaskId: null,
+    agentStatus: "idle",
+    isGenerating: false,
+    abortController: null,
+    pendingReviewResolve: null,
+    pendingReviewTaskId: null,
+    pendingToolCall: null,
+  }));
+
+  bindBridgeSnapshot(PLAN_APPROVAL_EXECUTE_TOOLS_SCENARIO);
+
+  const cleanup = () => {
+    bridge.initialized = false;
+  };
+
+  bridge.cleanup = cleanup;
+  return cleanup;
+}
+
 function seedSessionAutoCreateScenario() {
   const bridge = getBridge();
   if (!bridge) return undefined;
@@ -2466,6 +2618,10 @@ export function initializeE2EScenarios(): (() => void) | undefined {
 
   if (scenario === REPLY_OPTIONS_TOOL_PAUSE_SCENARIO) {
     return seedCloudToolProtocolScenario(REPLY_OPTIONS_TOOL_PAUSE_SCENARIO);
+  }
+
+  if (scenario === PLAN_APPROVAL_EXECUTE_TOOLS_SCENARIO) {
+    return seedPlanApprovalExecuteToolsScenario();
   }
 
   if (scenario === SESSION_AUTO_CREATE_SCENARIO) {

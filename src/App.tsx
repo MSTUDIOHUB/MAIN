@@ -16,7 +16,9 @@ import {
   translations,
   THEMES,
   GLOBAL_CHAT_KEY,
+  buildFeishuApprovalStatusCard,
   type TaskBlock,
+  type FeishuPendingApproval,
   resolveSessionWorkspaceKey,
   resolveSessionRuntimeKey,
   sanitizeAgentMessagesForPersist,
@@ -52,6 +54,7 @@ import {
   resolveFeishuRemoteIntentOverride,
   upsertFeishuPairedUser,
   type FeishuAdapterEvent,
+  type FeishuCardActionEvent,
   type FeishuInboundMessage,
 } from "./lib/imAdapters";
 
@@ -1225,6 +1228,29 @@ export default function App() {
     }
   }, []);
 
+  const patchFeishuApprovalCard = useCallback((
+    messageId: string | undefined,
+    approval: FeishuPendingApproval,
+    status: "approved" | "rejected" | "expired",
+    resolvedBy?: string,
+  ) => {
+    const cardMessageId = String(messageId || approval.cardMessageId || "").trim();
+    if (!cardMessageId) return;
+    const language = useAppStore.getState().config.language === "en" ? "en" : "zh";
+    const card = buildFeishuApprovalStatusCard(language, approval, status, resolvedBy);
+    void invoke("patch_feishu_card", {
+      messageId: cardMessageId,
+      card,
+    }).catch((error) => {
+      appendDebugLog("warn", "feishu.remote", {
+        phase: "patch_approval_card_failed",
+        approvalId: approval.approvalId,
+        messageId: cardMessageId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
+  }, []);
+
   const updateFeishuPairingConfig = useCallback((message: FeishuInboundMessage) => {
     const pairedUser = createFeishuPairedUserFromMessage(message);
     setConfig((prev: any) => {
@@ -1351,6 +1377,56 @@ export default function App() {
     return true;
   }, [ensureFeishuRemoteSession, sendFeishuText]);
 
+  const handleFeishuCardAction = useCallback((event: FeishuCardActionEvent) => {
+    const state = useAppStore.getState();
+    const feishuConfig = normalizeImAdaptersConfig(state.config.imAdapters).feishu;
+    if (!findFeishuPairedUser(feishuConfig, event.userId)) {
+      void sendFeishuText(
+        event,
+        state.config.language === "en"
+          ? "This Feishu user is not paired with MAIN, so the approval was ignored."
+          : "当前飞书用户尚未与 MAIN 配对，本次审批已忽略。",
+      );
+      return;
+    }
+
+    const result = state.resolvePendingFeishuApprovalAction({
+      userId: event.userId,
+      chatId: event.chatId,
+      approvalId: event.approvalId,
+      nonce: event.nonce,
+      action: event.action,
+    });
+
+    if (!result.ok) {
+      if (result.reason === "expired" && result.approval) {
+        patchFeishuApprovalCard(event.messageId, result.approval, "expired", event.userName);
+      }
+      const message = state.config.language === "en"
+        ? result.reason === "expired"
+          ? "This approval has expired. Please ask MAIN to request approval again."
+          : result.reason === "already_resolved"
+          ? "This approval has already been handled."
+          : "This approval button is no longer valid."
+        : result.reason === "expired"
+        ? "这条审批已过期。请让 MAIN 重新发起审批。"
+        : result.reason === "already_resolved"
+        ? "这条审批已经处理过。"
+        : "这个审批按钮已经失效。";
+      void sendFeishuText(event, message);
+      return;
+    }
+
+    useAppStore.getState().setFeishuApprovalCardMessageId(event.approvalId, event.messageId);
+    if (event.action === "approve") {
+      state.allowToolAction(result.approval.taskId);
+      patchFeishuApprovalCard(event.messageId, result.approval, "approved", event.userName);
+    } else {
+      state.rejectToolAction(result.approval.taskId);
+      patchFeishuApprovalCard(event.messageId, result.approval, "rejected", event.userName);
+    }
+  }, [patchFeishuApprovalCard, sendFeishuText]);
+
   const handleFeishuInboundMessage = useCallback((message: FeishuInboundMessage) => {
     const state = useAppStore.getState();
     const command = parseFeishuTextCommand(message.text);
@@ -1375,7 +1451,7 @@ export default function App() {
     }
 
     if (command.kind === "approve" || command.kind === "reject") {
-      const approval = state.resolvePendingFeishuApproval(message.userId, command.code);
+      const approval = state.resolvePendingFeishuApproval(message.userId, command.code, command.kind);
       if (!approval) {
         void sendFeishuText(
           message,
@@ -1385,9 +1461,11 @@ export default function App() {
       }
       if (command.kind === "approve") {
         state.allowToolAction(approval.taskId);
+        patchFeishuApprovalCard(approval.cardMessageId, approval, "approved", message.userName);
         void sendFeishuText(message, state.config.language === "en" ? "Approved." : "已允许执行。");
       } else {
         state.rejectToolAction(approval.taskId);
+        patchFeishuApprovalCard(approval.cardMessageId, approval, "rejected", message.userName);
         void sendFeishuText(message, state.config.language === "en" ? "Rejected." : "已拒绝执行。");
       }
       return;
@@ -1422,7 +1500,7 @@ export default function App() {
     }
 
     runFeishuRemoteMessage({ ...message, text: command.text });
-  }, [runFeishuRemoteMessage, sendFeishuText, updateFeishuPairingConfig]);
+  }, [patchFeishuApprovalCard, runFeishuRemoteMessage, sendFeishuText, updateFeishuPairingConfig]);
 
   useEffect(() => {
     const feishuConfig = normalizeImAdaptersConfig(config.imAdapters).feishu;
@@ -1487,6 +1565,16 @@ export default function App() {
         });
         return;
       }
+      if (payload.type === "message_sent") {
+        if (payload.approvalId && payload.messageId) {
+          useAppStore.getState().setFeishuApprovalCardMessageId(payload.approvalId, payload.messageId);
+        }
+        return;
+      }
+      if (payload.type === "card_action") {
+        handleFeishuCardAction(payload);
+        return;
+      }
       if (payload.type === "message") {
         handleFeishuInboundMessage(payload);
       }
@@ -1496,7 +1584,7 @@ export default function App() {
     return () => {
       unlisten?.();
     };
-  }, [handleFeishuInboundMessage]);
+  }, [handleFeishuCardAction, handleFeishuInboundMessage]);
 
   useEffect(() => {
     const state = useAppStore.getState();
