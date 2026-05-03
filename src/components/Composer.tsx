@@ -2,8 +2,9 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { IconAt, IconFile, IconClose, IconChevronUp, IconArrowUp, IconPlus, IconCode, IconChevronUp as IconChevronUpIcon, IconSearch, IconStop } from "./Icons";
 import { getAllWorkspaceFiles, fuzzyFilterFiles } from "../utils/fsUtils";
-import { getImageFilesFromClipboard, getImageFilesFromDrop, processImageFile } from "../utils/imageUtils";
+import { compressImage, getImageFilesFromClipboard, processImageFile } from "../utils/imageUtils";
 import { estimateTokens } from "../lib/contextTrim";
+import { ingestAttachmentBytes } from "../lib/ipc";
 import { useAppStore } from "../store/useAppStore";
 import type { AgentMessage, ContentPart } from "../lib/orchestrator";
 import { getGameStudioSlashCatalog } from "../lib/gameStudioPack";
@@ -14,6 +15,14 @@ import {
   shouldShowGameStudioOnboarding,
 } from "../lib/gameStudioOnboarding";
 import { isPlanTaskTrustedComplete } from "../lib/workflowModels";
+import {
+  classifyAttachment,
+  createAttachedFileDescriptor,
+  attachmentIdentity,
+  getNativeFilePath,
+  mergeAttachedFiles,
+  normalizeAttachedFile,
+} from "../lib/attachments";
 
 // ── ContextRing SVG Component ──────────────────────────────────────────
 
@@ -169,6 +178,7 @@ export default function Composer({
   autoApproveTools,
   onToggleAutoApprove,
   onHeightChange,
+  activeSessionKey,
 }) {
   // ── Mention (file search) state ──
   const [showMentionMenu, setShowMentionMenu] = useState(false);
@@ -206,6 +216,7 @@ export default function Composer({
   // ── Image paste/drop state (local to avoid large base64 in global store) ──
   const [pendingImages, setPendingImages] = useState<string[]>([]);
   const [isDragOver, setIsDragOver] = useState(false);
+  const [attachmentNotice, setAttachmentNotice] = useState<string | null>(null);
 
   // ── Context usage estimation ──
   const agentMessages = useAppStore((s) => s.agentMessages);
@@ -722,7 +733,55 @@ export default function Composer({
     }
   }, []);
 
-  // ── Image drag-and-drop handlers ──
+  const buildAttachmentNotice = useCallback((skipped: Array<{ name: string; reason: string }> = []) => {
+    if (!skipped.length) return null;
+    const reasonLabel = (reason: string) => {
+      if (language === "en") {
+        if (reason === "directory") return "folders are not supported";
+        if (reason === "missing_path") return "the app could not read the local path";
+        if (reason === "read_error") return "the file could not be read";
+        return "unsupported format";
+      }
+      if (reason === "directory") return "不支持文件夹";
+      if (reason === "missing_path") return "无法获取本地路径";
+      if (reason === "read_error") return "文件读取失败";
+      return "格式不支持";
+    };
+    const names = skipped.slice(0, 3).map((item) => `${item.name} (${reasonLabel(item.reason)})`).join(", ");
+    const suffix = skipped.length > 3
+      ? language === "en" ? ` and ${skipped.length - 3} more` : ` 等 ${skipped.length} 个`
+      : "";
+    return language === "en"
+      ? `Skipped ${skipped.length} item${skipped.length === 1 ? "" : "s"}: ${names}${suffix}`
+      : `已跳过 ${skipped.length} 个项目：${names}${suffix}`;
+  }, [language]);
+
+  const addAttachmentDescriptors = useCallback((files: any[]) => {
+    if (!files.length) return;
+    setAttachedFiles(mergeAttachedFiles(attachedFiles, files));
+  }, [attachedFiles, setAttachedFiles]);
+
+  const handleAttachButtonClick = useCallback(async () => {
+    if (!onAttachFile) return;
+    const result = await onAttachFile();
+    if (!result) return;
+
+    addAttachmentDescriptors(result.attachments || []);
+    if (result.imageDataUrls?.length) {
+      for (const dataUrl of result.imageDataUrls) {
+        try {
+          const compressed = await compressImage(dataUrl);
+          setPendingImages((prev) => [...prev, compressed]);
+        } catch {
+          setPendingImages((prev) => [...prev, dataUrl]);
+        }
+      }
+    }
+
+    setAttachmentNotice(buildAttachmentNotice(result.skipped || []));
+  }, [addAttachmentDescriptors, buildAttachmentNotice, onAttachFile]);
+
+  // ── File drag-and-drop handlers ──
   const handleDragOver = useCallback((e: React.DragEvent) => {
     if (e.dataTransfer.types.includes("Files")) {
       e.preventDefault();
@@ -742,16 +801,72 @@ export default function Composer({
     e.stopPropagation();
     setIsDragOver(false);
 
-    const imageFiles = getImageFilesFromDrop(e.nativeEvent);
-    for (const file of imageFiles) {
-      try {
-        const dataUrl = await processImageFile(file);
-        setPendingImages(prev => [...prev, dataUrl]);
-      } catch (err) {
-        console.error("Failed to process dropped image:", err);
+    const skipped: Array<{ name: string; reason: string }> = [];
+    const directoryNames = new Set<string>();
+    if (e.dataTransfer.items) {
+      for (const item of Array.from(e.dataTransfer.items)) {
+        const entry = typeof item.webkitGetAsEntry === "function" ? item.webkitGetAsEntry() : null;
+        if (entry?.isDirectory) {
+          directoryNames.add(entry.name);
+          skipped.push({ name: entry.name || "folder", reason: "directory" });
+        }
       }
     }
-  }, []);
+
+    const droppedAttachments = [];
+    for (const file of Array.from(e.dataTransfer.files || [])) {
+      if (directoryNames.has(file.name)) continue;
+      const kind = classifyAttachment(file.name);
+      if (kind === "unsupported") {
+        skipped.push({ name: file.name || "attachment", reason: "unsupported" });
+        continue;
+      }
+      if (kind === "image") {
+        try {
+          const dataUrl = await processImageFile(file);
+          setPendingImages(prev => [...prev, dataUrl]);
+        } catch (err) {
+          console.error("Failed to process dropped image:", err);
+          skipped.push({ name: file.name || "image", reason: "read_error" });
+        }
+        continue;
+      }
+
+      const nativePath = getNativeFilePath(file);
+      if (!nativePath) {
+        if (!activeSessionKey) {
+          skipped.push({ name: file.name || "attachment", reason: "missing_path" });
+          continue;
+        }
+        try {
+          const bytes = Array.from(new Uint8Array(await file.arrayBuffer()));
+          const ingested = await ingestAttachmentBytes(activeSessionKey, file.name || "attachment", bytes);
+          droppedAttachments.push({
+            id: `${ingested.workspace}:${ingested.path}`,
+            path: ingested.path,
+            sourcePath: ingested.originalPath || file.name,
+            displayName: ingested.displayName || file.name,
+            kind,
+            workspace: ingested.workspace,
+            readable: true,
+          });
+        } catch (err) {
+          console.error("Failed to ingest dropped attachment:", err);
+          skipped.push({ name: file.name || "attachment", reason: "read_error" });
+        }
+        continue;
+      }
+      const descriptor = createAttachedFileDescriptor(nativePath);
+      if (descriptor) {
+        droppedAttachments.push(descriptor);
+      } else {
+        skipped.push({ name: file.name || "attachment", reason: "unsupported" });
+      }
+    }
+
+    addAttachmentDescriptors(droppedAttachments);
+    setAttachmentNotice(buildAttachmentNotice(skipped));
+  }, [activeSessionKey, addAttachmentDescriptors, buildAttachmentNotice]);
 
   // ── Insert @ from the @ button click ──
   const handleAtButtonClick = () => {
@@ -1084,8 +1199,9 @@ export default function Composer({
     setContextMentions(contextMentions.filter((f: string) => f !== filePath));
   };
 
-  const handleRemoveAttachedFile = (filePath: string) => {
-    setAttachedFiles(attachedFiles.filter((f: string) => f !== filePath));
+  const handleRemoveAttachedFile = (filePath: any) => {
+    const targetKey = attachmentIdentity(filePath);
+    setAttachedFiles(attachedFiles.filter((f: any) => attachmentIdentity(f) !== targetKey));
   };
 
   // ── Keyboard navigation inside textarea + mention menu ──
@@ -1167,7 +1283,7 @@ export default function Composer({
   };
 
   // ── Helper: extract display name from path ──
-  const displayName = (path: string) => path.split("/").pop() || path;
+  const displayName = (path: any) => normalizeAttachedFile(path).displayName || String(path).split("/").pop() || String(path);
   const composerPlaceholder = activeDiffTask
     ? "..."
     : isGameStudioMode
@@ -1401,11 +1517,25 @@ export default function Composer({
 
         <div className={`bg-[#09090b] border border-[#27272a] transition-all flex flex-col relative z-20 ${activeDiffTask ? 'rounded-b-xl border-t-0' : 'rounded-xl'} ${isStreaming ? 'border-[#3f3f46]' : 'focus-within:border-[#3f3f46]'}`}>
 
+          {attachmentNotice && (
+            <div className="flex items-center justify-between gap-3 px-4 pt-3 text-[11px] text-[#fbbf24]">
+              <span className="min-w-0 truncate">{attachmentNotice}</span>
+              <button
+                type="button"
+                onClick={() => setAttachmentNotice(null)}
+                className="shrink-0 text-[#a1a1aa] hover:text-white"
+                title={language === "en" ? "Dismiss" : "关闭"}
+              >
+                <IconClose className="w-3 h-3" />
+              </button>
+            </div>
+          )}
+
           {/* Attached files tags */}
           {attachedFiles.length > 0 && (
             <div className="flex flex-wrap gap-2 px-4 pt-3">
-              {attachedFiles.map((filePath: string) => (
-                <div key={filePath} className="flex items-center gap-1.5 bg-[#000000] border border-[var(--accent-subtle-border,#27272a)] text-[var(--accent-light,#a855f7)] text-[11px] font-mono px-2 py-1 rounded-md">
+              {attachedFiles.map((filePath: any) => (
+                <div key={attachmentIdentity(filePath)} className="flex items-center gap-1.5 bg-[#000000] border border-[var(--accent-subtle-border,#27272a)] text-[var(--accent-light,#a855f7)] text-[11px] font-mono px-2 py-1 rounded-md">
                   <IconFile className="w-3.5 h-3.5" /> {displayName(filePath)}
                   <button onClick={() => handleRemoveAttachedFile(filePath)} className="text-[#a1a1aa] hover:text-white ml-1"><IconClose className="w-3 h-3" /></button>
                 </div>
@@ -1797,7 +1927,7 @@ export default function Composer({
 
               {/* + Attach file button */}
               <button
-                onClick={onAttachFile}
+                onClick={handleAttachButtonClick}
                 className="panel-tab-icon-button flex h-7 w-7 shrink-0 items-center justify-center rounded-[7px] p-0 transition-all duration-150"
                 title={language === "en" ? "Attach file" : "附加文件"}
               >

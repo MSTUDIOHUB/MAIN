@@ -29,7 +29,7 @@ import {
   type ConversationTurn,
   type ReplyOption,
 } from "../lib/workflowModels";
-import { resolveConversationTurnIntent } from "../lib/runIntent";
+import { getIntentPolicy, resolveConversationTurnIntent } from "../lib/runIntent";
 
 const TURN_STATUS_LABELS: Record<string, string> = {
   planning: "Planning",
@@ -1004,9 +1004,6 @@ export default function ChatArea({
     turnStatusLabels: language === "zh"
       ? { planning: "规划中", awaiting_approval: "待审批", awaiting_input: "待选择", executing: "执行中", completed_with_changes: "已完成并写入", stopped_no_action: "已停止无产物", stopped_no_output: "无输出", paused: "已暂停", done: "完成", error: "错误" }
       : TURN_STATUS_LABELS,
-    turnIntentLabels: language === "zh"
-      ? { discuss: "讨论", execute: "执行", plan: "规划", summarize: "总结", report: "报告", studio_workflow: "工作流" }
-      : { discuss: "Discuss", execute: "Execute", plan: "Plan", summarize: "Summary", report: "Report", studio_workflow: "Studio Workflow" },
     describePlan: (prompt: string, maxLength = 40) =>
       summarizePlanIntent(prompt, maxLength, language),
     planGenerating: (prompt: string) =>
@@ -1535,7 +1532,10 @@ export default function ChatArea({
     const turn: ConversationTurn = entry.turn;
     const blocks = entry.blocks;
     const turnIntent = resolveConversationTurnIntent(turn);
-    const turnIntentLabel = copy.turnIntentLabels[turnIntent] || (language === "zh" ? "任务" : "Task");
+    const turnIntentPolicy = getIntentPolicy(turnIntent);
+    const turnIntentLabel = turnIntentPolicy.intent === turnIntent
+      ? (language === "en" ? turnIntentPolicy.label.en : turnIntentPolicy.label.zh)
+      : (language === "zh" ? "任务" : "Task");
     const isPlanTurn = turnIntent === "plan";
     const forceExpandedTurn =
       turn.status === "awaiting_input" ||
@@ -1608,7 +1608,7 @@ export default function ChatArea({
               <span className="text-[11px] uppercase tracking-[0.18em] text-[#71717a]">{copy.turnDetails}</span>
             )}
             {turnIntentLabel && (
-              <span className={`rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-[0.16em] ${isPlanTurn ? "border-[rgba(124,58,237,0.25)] bg-[rgba(124,58,237,0.12)] text-[#c4b5fd]" : turnIntent === "execute" ? "border-[rgba(96,165,250,0.25)] bg-[rgba(96,165,250,0.12)] text-[#93c5fd]" : "border-[rgba(52,211,153,0.22)] bg-[rgba(52,211,153,0.1)] text-[#86efac]"}`}>
+              <span data-testid={`turn-intent-badge-${turnIntent}`} className={`rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-[0.16em] ${isPlanTurn ? "border-[rgba(124,58,237,0.25)] bg-[rgba(124,58,237,0.12)] text-[#c4b5fd]" : turnIntent === "execute" ? "border-[rgba(96,165,250,0.25)] bg-[rgba(96,165,250,0.12)] text-[#93c5fd]" : "border-[rgba(52,211,153,0.22)] bg-[rgba(52,211,153,0.1)] text-[#86efac]"}`}>
                 {turnIntentLabel}
               </span>
             )}
@@ -1888,6 +1888,7 @@ export default function ChatArea({
         onStopGeneration={onStopGeneration}
         autoApproveTools={autoApproveTools}
         onToggleAutoApprove={onToggleAutoApprove}
+        activeSessionKey={activeSessionKey}
         onHeightChange={setComposerHeight}
       />
     </div>

@@ -172,6 +172,12 @@ test("output-style intents stay inside the chat workflow", () => {
   }
 });
 
+test("analyze intent exposes a localized badge label", () => {
+  const policy = getIntentPolicy("analyze");
+  assert.equal(policy.label.zh, "分析");
+  assert.equal(policy.label.en, "Analyze");
+});
+
 test("plan and execute remain real workflow modes", () => {
   assert.equal(getIntentPolicy("plan").uiCategory, "workflow_mode");
   assert.equal(getIntentPolicy("plan").workflowMode, "plan");

@@ -132,6 +132,22 @@ test("extractReplyOptions infers enumerated markdown choices after a decision cu
   );
 });
 
+test("extractReplyOptions does not infer buttons from analysis comparison lists", () => {
+  const result = extractReplyOptions(`
+HTML 版本和 Pygame 版本的差异选项如下：
+
+1. High score loaded from \`highscore.json\` file
+2. Game over overlay drawn on canvas with text prompt
+3. No restart button - uses keyboard input
+4. Particle effects rendered on canvas
+
+总结：这些是界面差异，不是需要用户拍板的下一步。
+  `);
+
+  assert.equal(result.replyOptions.length, 0);
+  assert.match(result.cleanText, /High score loaded/);
+});
+
 test("extractReplyOptions ignores plan summary bullets after proposal headings", () => {
   const result = extractReplyOptions(`
 计划文档已创建完成。

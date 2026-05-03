@@ -1,4 +1,5 @@
-import { readChatTempFile, readFile } from "./ipc";
+import { getChatTempRoot, readChatTempFile, readFile } from "./ipc";
+import { isChatAttachmentPath } from "./attachments";
 
 export interface ToolDiffPreview {
   old: string;
@@ -17,6 +18,15 @@ interface ToolDiffPreviewContext {
   sessionKey?: string;
 }
 
+async function readPreviewFile(path: string, context: ToolDiffPreviewContext): Promise<string> {
+  if (context.sessionKey && isChatAttachmentPath(path)) {
+    return await readFile(path, await getChatTempRoot(context.sessionKey));
+  }
+  return !String(context.workspace || "").trim() && context.sessionKey
+    ? await readChatTempFile(context.sessionKey, path)
+    : await readFile(path, context.workspace);
+}
+
 export async function buildToolDiffPreview(
   toolName: string,
   toolArgs: Record<string, unknown>,
@@ -29,10 +39,7 @@ export async function buildToolDiffPreview(
     const replaceText = typeof toolArgs.replace_text === "string" ? toolArgs.replace_text : "";
     if (path && searchText) {
       try {
-        const originalContent =
-          !String(context.workspace || "").trim() && context.sessionKey
-            ? await readChatTempFile(context.sessionKey, path)
-            : await readFile(path, context.workspace);
+        const originalContent = await readPreviewFile(path, context);
         if (originalContent.includes(searchText)) {
           return {
             old: originalContent,
@@ -60,10 +67,7 @@ export async function buildToolDiffPreview(
     let existed = false;
     if (path) {
       try {
-        originalContent =
-          !String(context.workspace || "").trim() && context.sessionKey
-            ? await readChatTempFile(context.sessionKey, path)
-            : await readFile(path, context.workspace);
+        originalContent = await readPreviewFile(path, context);
         existed = true;
       } catch {
         originalContent = "";

@@ -4,7 +4,7 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import { executeAgentLoop, type AgentMessage, type OrchestratorCallbacks, type ReviewDecision, type ContentPart } from "../lib/orchestrator";
-import { analyzeTabularDocument, deleteChatTempPath, deletePlanFiles, deleteWorkspacePath, readChatTempFile, readDocument, readFile, writeChatTempFile, writeFile } from "../lib/ipc";
+import { analyzeTabularDocument, deleteChatTempPath, deletePlanFiles, deleteWorkspacePath, ingestAttachmentFile, readChatTempFile, readDocument, readFile, writeChatTempFile, writeFile } from "../lib/ipc";
 import { invoke } from "@tauri-apps/api/core";
 import { setWorkspaceRoot as setWorkspaceRootIpc } from "../lib/ipc";
 import { appendDebugLog } from "../lib/debugLog";
@@ -73,6 +73,13 @@ import {
 } from "../lib/cloudServers";
 import { buildToolDiffPreview, supportsToolDiffPreview } from "../lib/toolDiff";
 import { buildPlanApprovalChoiceHint, normalizePlanApprovalChoice } from "../lib/planControl";
+import {
+  type AttachedFile,
+  type AttachmentKind,
+  classifyAttachment,
+  getAttachmentDisplayName,
+  normalizeAttachedFile,
+} from "../lib/attachments";
 import {
   buildGameStudioEnvelopeForTurn,
   ensureGameStudioWorkspaceInitialized,
@@ -450,7 +457,7 @@ export interface SessionRuntimeSnapshot {
 export interface SessionRuntimeState extends SessionRuntimeSnapshot {
   input: string;
   contextMentions: string[];
-  attachedFiles: string[];
+  attachedFiles: AttachedFile[];
   preferredResponseLanguage: Lang;
   lockedComposerIntent: MainIntentShortcut | null;
   pendingRunDecision: PendingRunDecision | null;
@@ -694,7 +701,7 @@ interface AppState {
   input: string;
   preferredResponseLanguage: Lang;
   contextMentions: string[];
-  attachedFiles: string[];
+  attachedFiles: AttachedFile[];
   selectedMainModeKey: MainModeKey;
   selectedNexusModeKey: NexusModeKey;
   activeStudioAgentKey: StudioAgentKey;
@@ -708,7 +715,7 @@ interface AppState {
   setContextMentions: (v: string[]) => void;
   addMention: (file: string) => void;
   removeMention: (file: string) => void;
-  setAttachedFiles: (v: string[]) => void;
+  setAttachedFiles: (v: Array<AttachedFile | string>) => void;
   setSelectedMainModeKey: (key: MainModeKey) => void;
   setSelectedNexusModeKey: (key: NexusModeKey) => void;
   setActiveStudioAgentKey: (key: StudioAgentKey, options?: { persistToWorkspace?: boolean }) => Promise<void>;
@@ -886,7 +893,7 @@ interface AppState {
       turnTitle?: string;
       intentSummary?: string;
       contextMentionsSnapshot?: string[];
-      attachedFilesSnapshot?: string[];
+      attachedFilesSnapshot?: Array<AttachedFile | string>;
       remoteFeishu?: FeishuRemoteContext;
     },
   ) => boolean;
@@ -1215,7 +1222,9 @@ function createSessionRuntimeFromState(state: Partial<AppState>): SessionRuntime
     selectedDiffTaskId: state.selectedDiffTaskId ?? null,
     input: state.input ?? "",
     contextMentions: state.contextMentions || [],
-    attachedFiles: state.attachedFiles || [],
+    attachedFiles: Array.isArray(state.attachedFiles)
+      ? state.attachedFiles.map((file) => normalizeAttachedFile(file))
+      : [],
     preferredResponseLanguage: state.preferredResponseLanguage || "zh",
     lockedComposerIntent: state.lockedComposerIntent ?? null,
     pendingRunDecision: state.pendingRunDecision ?? null,
@@ -2262,6 +2271,42 @@ function shouldUseTabularAnalyzer(path: string): boolean {
   return false;
 }
 
+interface AttachmentReadRef {
+  path: string;
+  displayName: string;
+  kind: AttachmentKind;
+  workspace?: string;
+  sourcePath?: string;
+}
+
+async function prepareAttachedFileForRead(
+  entry: AttachedFile | string,
+  sessionKey: string,
+): Promise<AttachmentReadRef> {
+  const attachment = normalizeAttachedFile(entry);
+  const sourcePath = attachment.sourcePath || attachment.path;
+
+  if (attachment.readable && attachment.workspace) {
+    return {
+      path: attachment.path,
+      displayName: attachment.displayName || getAttachmentDisplayName(attachment.path),
+      kind: attachment.kind,
+      workspace: attachment.workspace,
+      sourcePath,
+    };
+  }
+
+  const ingested = await ingestAttachmentFile(sessionKey, sourcePath);
+  const kind = classifyAttachment(ingested.path);
+  return {
+    path: ingested.path,
+    workspace: ingested.workspace,
+    displayName: attachment.displayName || ingested.displayName || getAttachmentDisplayName(sourcePath),
+    kind: kind === "tabular" || kind === "document" ? kind : "text",
+    sourcePath: ingested.originalPath || sourcePath,
+  };
+}
+
 function hasReviewablePlanState(artifacts: PlanArtifact[], stage: PlanStage): boolean {
   if (stage === "ready_to_execute" || stage === "design" || stage === "bugfix") return true;
   return artifacts.some((artifact) => artifact.kind === "design" || artifact.kind === "bugfix");
@@ -2548,7 +2593,7 @@ export const useAppStore = create<AppState>()(
     ),
   removeMention: (file) =>
     set((s) => ({ contextMentions: s.contextMentions.filter((f) => f !== file) })),
-  setAttachedFiles: (v) => set({ attachedFiles: v }),
+  setAttachedFiles: (v) => set({ attachedFiles: v.map((file) => normalizeAttachedFile(file)) }),
   setSelectedMainModeKey: (key) => set((s) => ({
     selectedMainModeKey: key,
     selectedNexusModeKey: mapMainModeToLegacyNexusMode(key),
@@ -3866,7 +3911,7 @@ export const useAppStore = create<AppState>()(
     turnTitle?: string;
     intentSummary?: string;
     contextMentionsSnapshot?: string[];
-    attachedFilesSnapshot?: string[];
+    attachedFilesSnapshot?: Array<AttachedFile | string>;
     remoteFeishu?: FeishuRemoteContext;
   }) => {
     const state = get();
@@ -4818,16 +4863,44 @@ export const useAppStore = create<AppState>()(
       let gameStudioInitialized = sessionGet().gameStudioInitialized;
       const mentions = mentionSnapshot;
       const files = attachedFilesSnapshot;
-      const allFilePaths = [...new Set([...files, ...mentions])];
+      const attachmentRefs: AttachmentReadRef[] = [];
+      const failedAttachmentParts: string[] = [];
+      for (const file of files) {
+        try {
+          attachmentRefs.push(await prepareAttachedFileForRead(file, runSessionKey));
+        } catch {
+          const attachment = normalizeAttachedFile(file);
+          failedAttachmentParts.push(`[无法读取文件：${attachment.displayName || getAttachmentDisplayName(attachment.path)}]`);
+        }
+      }
+      for (const mentionPath of mentions) {
+        const kind = classifyAttachment(mentionPath);
+        attachmentRefs.push({
+          path: mentionPath,
+          displayName: getAttachmentDisplayName(mentionPath),
+          kind: kind === "tabular" || kind === "document" ? kind : "text",
+        });
+      }
 
-      if (allFilePaths.length > 0) {
+      const seenAttachmentRefs = new Set<string>();
+      const allFileRefs = attachmentRefs.filter((ref) => {
+        const key = `${ref.workspace || runWorkspace || ""}::${ref.path}`;
+        if (seenAttachmentRefs.has(key)) return false;
+        seenAttachmentRefs.add(key);
+        return true;
+      });
+
+      if (allFileRefs.length > 0 || failedAttachmentParts.length > 0) {
         const parts: string[] = [];
-        for (const fp of allFilePaths) {
+        parts.push(...failedAttachmentParts);
+        for (const ref of allFileRefs) {
+          const fp = ref.path;
+          const readWorkspace = ref.workspace ?? runWorkspace;
           try {
             let c: string;
             if (shouldUseTabularAnalyzer(fp)) {
-              const summary = await analyzeTabularDocument(fp, undefined, undefined, undefined, undefined, runWorkspace);
-              const preview = await readDocument(fp, 3000, 12, 0, 40, undefined, runWorkspace);
+              const summary = await analyzeTabularDocument(fp, undefined, undefined, undefined, undefined, readWorkspace);
+              const preview = await readDocument(fp, 3000, 12, 0, 40, undefined, readWorkspace);
               const compactSummary = {
                 rowCount: summary.metadata.rowCount,
                 columnCount: summary.metadata.columnCount,
@@ -4849,6 +4922,7 @@ export const useAppStore = create<AppState>()(
               c = [
                 "[attached_tabular_file]",
                 `path: ${fp}`,
+                ...(ref.sourcePath && ref.sourcePath !== fp ? [`originalPath: ${ref.sourcePath}`] : []),
                 `documentType: ${preview.documentType}`,
                 `sourceName: ${summary.sourceName}`,
                 `truncatedPreview: ${preview.truncated ? "true" : "false"}`,
@@ -4859,10 +4933,11 @@ export const useAppStore = create<AppState>()(
                 preview.content || JSON.stringify(preview.metadata),
               ].join("\n");
             } else if (shouldUseDocumentReader(fp)) {
-              const doc = await readDocument(fp, undefined, undefined, undefined, undefined, undefined, runWorkspace);
+              const doc = await readDocument(fp, undefined, undefined, undefined, undefined, undefined, readWorkspace);
               const header = [
                 "[attached_document]",
                 `path: ${fp}`,
+                ...(ref.sourcePath && ref.sourcePath !== fp ? [`originalPath: ${ref.sourcePath}`] : []),
                 `documentType: ${doc.documentType}`,
                 `truncatedPreview: ${doc.truncated ? "true" : "false"}`,
               ];
@@ -4871,13 +4946,18 @@ export const useAppStore = create<AppState>()(
               const body = doc.content || JSON.stringify(doc.metadata);
               c = `${header.join("\n")}\n${body}`;
             } else {
-              const raw = await readFile(fp, runWorkspace);
-              c = `[attached_file]\npath: ${fp}\n${raw}`;
+              const raw = await readFile(fp, readWorkspace);
+              c = [
+                "[attached_file]",
+                `path: ${fp}`,
+                ...(ref.sourcePath && ref.sourcePath !== fp ? [`originalPath: ${ref.sourcePath}`] : []),
+                raw,
+              ].join("\n");
             }
-            const n = fp.split("/").pop() || fp;
+            const n = ref.displayName || fp.split("/").pop() || fp;
             parts.push("```" + n + "\n" + c + "\n```");
           } catch {
-            const n = fp.split("/").pop() || fp;
+            const n = ref.displayName || fp.split("/").pop() || fp;
             parts.push(`[无法读取文件：${n}]`);
           }
         }

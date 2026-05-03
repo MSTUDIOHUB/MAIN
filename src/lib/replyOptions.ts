@@ -4,6 +4,7 @@ const USER_OPTIONS_BLOCK_RE = /<user_options>([\s\S]*?)<\/user_options>/gi;
 const OPTION_RE = /<option\b([^>]*)>([\s\S]*?)<\/option>/gi;
 const OPTION_ATTR_RE = /\b(label|value|text|title)\s*=\s*"([^"]*)"/gi;
 const DECISION_CUE_RE = /(?:请选择|请确认|请告诉我|请说明|你可以选择|可选方案|备选方案|选项|选择下一步|下一步可以|选一个|选一项|任选其一|从下面.*选|options?|choices?|would you like|do you want|please choose|please confirm|choose one|pick one|select one)/i;
+const ENUMERATED_DECISION_CUE_RE = /(?:请选择|请确认|选一个|选一项|任选其一|从下面.*选|please choose|please confirm|choose one|pick one|select one)/i;
 const ENUM_OPTION_RE = /^\s*(?:[-*]|(?:\d+|[A-Za-z])[\.\)、:：])\s+(.+?)\s*$/;
 const BINARY_SEPARATOR_RE = /\s*(?:，|,)?\s*(或者|还是|或是|\bor\b)\s*/i;
 const ENUMERATED_LINE_RE = /^\s*(?:[-*]|(?:\d+|[A-Za-z])[\.\)、:：])\s+/;
@@ -140,7 +141,7 @@ function inferReplyOptionsFromEnumeratedChoices(
   const lines = text.split(/\r?\n/);
   for (let i = 0; i < lines.length; i++) {
     const cueLine = lines[i] || "";
-    if (!DECISION_CUE_RE.test(cueLine)) continue;
+    if (!ENUMERATED_DECISION_CUE_RE.test(cueLine)) continue;
     if (PLAN_SUMMARY_HEADING_RE.test(cueLine) && !/(?:请选择|请确认|请告诉我|选一个|选一项|任选其一|从下面.*选|please choose|choose one|pick one|select one)/i.test(cueLine)) {
       continue;
     }

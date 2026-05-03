@@ -32,11 +32,19 @@ import {
   deleteProjectSession,
   listProjectSessions,
   loadProjectSession,
+  readAttachmentImageDataUrl,
   rebuildProjectSessionsIndex,
   saveProjectSession,
   setWorkspaceRoot as setWorkspaceRootIpc,
   canonicalizeWorkspacePath,
 } from "./lib/ipc";
+import {
+  type AttachmentPickerResult,
+  classifyAttachment,
+  createAttachedFileDescriptor,
+  getAttachmentDisplayName,
+  SUPPORTED_ATTACHMENT_EXTENSIONS,
+} from "./lib/attachments";
 import { normalizeStudioAgentKey } from "./lib/gameStudioCatalog";
 import { MAIN_MODE_KEYS, mapLegacyNexusModeToMainMode, mapMainModeToLegacyNexusMode } from "./lib/mainModes";
 import { resolveConversationTurnIntent } from "./lib/runIntent";
@@ -509,23 +517,41 @@ export default function App() {
 
   const activeDiffTask = taskFlow.find(task => task.type === "tool" && task.status === "pending_review");
 
-  const handleAttachFile = async () => {
+  const handleAttachFile = async (): Promise<AttachmentPickerResult> => {
+    const result: AttachmentPickerResult = { attachments: [], imageDataUrls: [], skipped: [] };
     try {
       const selected = await open({
         multiple: true, title: 'Attach files',
-        filters: [{ name: 'Text & Code & Images', extensions: [
-          'txt', 'md', 'js', 'ts', 'tsx', 'jsx', 'py', 'cs', 'java', 'c', 'cpp', 'h', 'hpp',
-          'json', 'yaml', 'yml', 'toml', 'xml', 'html', 'css', 'scss', 'less',
-          'sh', 'bash', 'zsh', 'fish', 'rs', 'go', 'rb', 'php', 'swift', 'kt', 'dart', 'lua',
-          'sql', 'graphql', 'png', 'jpg', 'jpeg',
-        ]}],
+        filters: [{ name: 'Supported attachments', extensions: SUPPORTED_ATTACHMENT_EXTENSIONS }],
       });
-      if (selected) {
-        const paths = Array.isArray(selected) ? selected : [selected];
-        const current = useAppStore.getState().attachedFiles;
-        useAppStore.setState({ attachedFiles: [...new Set([...current, ...paths])] });
+      if (!selected) return result;
+
+      const paths = Array.isArray(selected) ? selected : [selected];
+      for (const path of paths) {
+        const kind = classifyAttachment(path);
+        if (kind === "unsupported") {
+          result.skipped.push({ name: getAttachmentDisplayName(path), reason: "unsupported" });
+          continue;
+        }
+        if (kind === "image") {
+          try {
+            result.imageDataUrls.push(await readAttachmentImageDataUrl(path));
+          } catch {
+            result.skipped.push({ name: getAttachmentDisplayName(path), reason: "read_error" });
+          }
+          continue;
+        }
+        const attachment = createAttachedFileDescriptor(path);
+        if (attachment) {
+          result.attachments.push(attachment);
+        } else {
+          result.skipped.push({ name: getAttachmentDisplayName(path), reason: "unsupported" });
+        }
       }
-    } catch (error) { console.error('Failed to attach file:', error); }
+    } catch (error) {
+      console.error('Failed to attach file:', error);
+    }
+    return result;
   };
 
   const handleAcceptInline = (id: number) => {

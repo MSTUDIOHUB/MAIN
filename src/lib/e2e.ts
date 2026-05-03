@@ -9,6 +9,7 @@ const PLAN_RELOAD_RESUME_SCENARIO = "plan-reload-resume";
 const DIFF_RELOAD_SUMMARY_SCENARIO = "diff-reload-summary";
 const PLAN_REPLACE_REFRESH_SCENARIO = "plan-replace-refresh";
 const AWAITING_CHOICE_SCENARIO = "awaiting-choice";
+const FEISHU_REMOTE_ANALYSIS_SCENARIO = "feishu-remote-analysis";
 const READ_CONTEXT_COLLAPSE_SCENARIO = "read-context-collapse";
 const GAME_STUDIO_ONBOARDING_SCENARIO = "game-studio-onboarding";
 const COMPOSER_MAIN_SHORTCUTS_SCENARIO = "composer-main-shortcuts";
@@ -698,6 +699,103 @@ function seedAwaitingChoiceScenario() {
 
   bindBridgeSnapshot(AWAITING_CHOICE_SCENARIO);
   appendBridgeEvent("choice-requested");
+
+  const cleanup = () => {
+    bridge.initialized = false;
+  };
+
+  bridge.cleanup = cleanup;
+  return cleanup;
+}
+
+function seedFeishuRemoteAnalysisScenario() {
+  const bridge = getBridge();
+  if (!bridge) return undefined;
+
+  bridge.events = [{ type: "boot" }];
+  bridge.savedDocuments = [];
+  bridge.completed = true;
+
+  const turnId = "e2e-feishu-remote-analysis-turn";
+  const sessionId = 999016;
+  const now = Date.now();
+  const userBlockId = useAppStore.getState()._nextTaskId();
+  const agentBlockId = useAppStore.getState()._nextTaskId();
+
+  useAppStore.setState((state) => ({
+    ...state,
+    config: {
+      ...state.config,
+      language: "zh",
+      workflowMode: "chat",
+    },
+    currentWorkspace: "/tmp/e2e-feishu-remote-analysis",
+    sessionsByWorkspace: {
+      "/tmp/e2e-feishu-remote-analysis": [
+        {
+          id: sessionId,
+          title: "E2E Feishu Remote Analysis",
+          date: new Date(now).toISOString(),
+          active: true,
+          messages: [],
+        },
+      ],
+    },
+    currentSessionId: sessionId,
+    selectedMainModeKey: "main_mode",
+    selectedNexusModeKey: "nexus_general",
+    taskFlow: [
+      { id: userBlockId, turnId, type: "user", content: "检查html版本和pygame版本的界面差别" },
+      {
+        id: agentBlockId,
+        turnId,
+        type: "agent",
+        content: [
+          "已完成 HTML 版本和 Pygame 版本的界面差别分析。",
+          "",
+          "差异选项如下：",
+          "",
+          "1. High score loaded from `highscore.json` file",
+          "2. Game over overlay drawn on canvas with text prompt",
+          "3. No restart button - uses keyboard input",
+          "4. Particle effects rendered on canvas",
+        ].join("\n"),
+        streaming: false,
+      },
+    ],
+    conversationTurns: [
+      {
+        id: turnId,
+        userPrompt: "检查html版本和pygame版本的界面差别",
+        title: "飞书远程分析",
+        intent: "analyze",
+        mode: "chat",
+        status: "done",
+        summary: "已完成飞书远程只读分析。",
+        blockIds: [userBlockId, agentBlockId],
+        collapsed: false,
+        createdAt: now,
+      },
+    ],
+    currentTurnId: turnId,
+    input: "",
+    attachedFiles: [],
+    contextMentions: [],
+    readOnlyAutoApproveForSession: false,
+    planArtifacts: [],
+    planTasks: [],
+    planExecutionEvidenceLedger: [],
+    planStage: "idle",
+    isPlanApproved: false,
+    showPlanPanel: false,
+    showDiff: false,
+    showTerminal: false,
+    showFilePanel: false,
+    agentStatus: "idle",
+    isGenerating: false,
+  }));
+
+  bindBridgeSnapshot(FEISHU_REMOTE_ANALYSIS_SCENARIO);
 
   const cleanup = () => {
     bridge.initialized = false;
@@ -2578,6 +2676,10 @@ export function initializeE2EScenarios(): (() => void) | undefined {
 
   if (scenario === AWAITING_CHOICE_SCENARIO) {
     return seedAwaitingChoiceScenario();
+  }
+
+  if (scenario === FEISHU_REMOTE_ANALYSIS_SCENARIO) {
+    return seedFeishuRemoteAnalysisScenario();
   }
 
   if (scenario === READ_CONTEXT_COLLAPSE_SCENARIO) {

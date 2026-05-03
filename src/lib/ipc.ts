@@ -140,6 +140,14 @@ export interface QueryTabularDocumentResult {
   rows: Array<Record<string, unknown>>;
 }
 
+export interface AttachmentIngestResult {
+  path: string;
+  workspace: string;
+  originalPath: string;
+  displayName: string;
+  sizeBytes: number;
+}
+
 // endregion
 
 // region: 文件与搜索命令
@@ -174,6 +182,22 @@ export function writeChatTempFile(sessionKey: string, path: string, content: str
 
 export function readChatTempFile(sessionKey: string, path: string): Promise<string> {
   return invoke<string>("read_chat_temp_file", { sessionKey, path });
+}
+
+export function getChatTempRoot(sessionKey: string): Promise<string> {
+  return invoke<string>("get_chat_temp_root", { sessionKey });
+}
+
+export function ingestAttachmentFile(sessionKey: string, sourcePath: string): Promise<AttachmentIngestResult> {
+  return invoke<AttachmentIngestResult>("ingest_attachment_file", { sessionKey, sourcePath });
+}
+
+export function ingestAttachmentBytes(sessionKey: string, fileName: string, bytes: number[]): Promise<AttachmentIngestResult> {
+  return invoke<AttachmentIngestResult>("ingest_attachment_bytes", { sessionKey, fileName, bytes });
+}
+
+export function readAttachmentImageDataUrl(sourcePath: string): Promise<string> {
+  return invoke<string>("read_attachment_image_data_url", { sourcePath });
 }
 
 export function deleteWorkspacePath(path: string, workspace?: string): Promise<void> {

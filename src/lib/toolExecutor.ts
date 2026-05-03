@@ -9,6 +9,7 @@ import {
   analyzeTabularDocument,
   deleteWorkspacePath,
   deleteChatTempPath,
+  getChatTempRoot,
   globSearch,
   grepSearch,
   indexWorkspaceDocuments,
@@ -28,6 +29,7 @@ import {
   writeChatTempFile,
   writeFile,
 } from "./ipc";
+import { isChatAttachmentPath } from "./attachments";
 import { invoke } from "@tauri-apps/api/core";
 import { isMcpTool, executeMcpTool, getMcpServerUrl } from "./mcpClient";
 import {
@@ -57,6 +59,17 @@ function parseOptionalString(value: unknown): string | undefined {
 
 function shouldUseChatTempStorage(workspace: string, sessionKey?: string): boolean {
   return !workspace.trim() && !!sessionKey;
+}
+
+async function resolveWorkspaceForReadPath(
+  rawPath: string,
+  workspace: string,
+  sessionKey?: string,
+): Promise<string> {
+  if (sessionKey && isChatAttachmentPath(rawPath)) {
+    return await getChatTempRoot(sessionKey);
+  }
+  return workspace;
 }
 
 function buildChatTempSuccessMessage(
@@ -111,6 +124,10 @@ export async function executeTool(
 
     case "read_file": {
       const rawPath = (args.path as string) || "";
+      const readWorkspace = await resolveWorkspaceForReadPath(rawPath, workspace, sessionKey);
+      if (readWorkspace !== workspace) {
+        return await readFile(rawPath, readWorkspace);
+      }
       if (shouldUseChatTempStorage(workspace, sessionKey)) {
         return await readChatTempFile(sessionKey!, rawPath);
       }
@@ -120,6 +137,7 @@ export async function executeTool(
     case "read_document": {
       const rawPath = (args.path as string) || "";
       if (!rawPath) throw new Error("Missing required parameter 'path'.");
+      const readWorkspace = await resolveWorkspaceForReadPath(rawPath, workspace, sessionKey);
       return await readDocument(
         rawPath,
         parseOptionalNumber(args.max_chars),
@@ -127,26 +145,28 @@ export async function executeTool(
         parseOptionalNumber(args.row_offset),
         parseOptionalNumber(args.max_rows),
         parseOptionalString(args.sheet),
-        workspace,
+        readWorkspace,
       );
     }
 
     case "analyze_tabular_document": {
       const rawPath = (args.path as string) || "";
       if (!rawPath) throw new Error("Missing required parameter 'path'.");
+      const readWorkspace = await resolveWorkspaceForReadPath(rawPath, workspace, sessionKey);
       return await analyzeTabularDocument(
         rawPath,
         parseOptionalString(args.sheet),
         parseOptionalNumber(args.max_columns),
         parseOptionalNumber(args.sample_rows),
         parseOptionalString(args.focus_columns),
-        workspace,
+        readWorkspace,
       );
     }
 
     case "query_tabular_document": {
       const rawPath = (args.path as string) || "";
       if (!rawPath) throw new Error("Missing required parameter 'path'.");
+      const readWorkspace = await resolveWorkspaceForReadPath(rawPath, workspace, sessionKey);
       return await queryTabularDocument(
         rawPath,
         parseOptionalString(args.sheet),
@@ -158,7 +178,7 @@ export async function executeTool(
         parseOptionalString(args.sort_by),
         parseOptionalNumber(args.row_offset),
         parseOptionalNumber(args.limit),
-        workspace,
+        readWorkspace,
       );
     }
 

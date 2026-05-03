@@ -513,6 +513,87 @@ fn ensure_chat_temp_root(session_key: &str) -> Result<PathBuf, String> {
         .map_err(|e| format!("无法解析聊天临时目录: {e}"))
 }
 
+const CHAT_ATTACHMENT_PREFIX: &str = ".MAIN-chat-attachments";
+
+const SUPPORTED_ATTACHMENT_EXTENSIONS: &[&str] = &[
+    "txt", "md", "markdown",
+    "js", "ts", "tsx", "jsx",
+    "py", "cs", "java", "c", "cpp", "h", "hpp",
+    "json", "yaml", "yml", "toml", "xml", "html", "css", "scss", "less",
+    "sh", "bash", "zsh", "fish", "rs", "go", "rb", "php", "swift", "kt", "dart", "lua",
+    "sql", "graphql", "env", "gitignore", "ignore",
+    "pdf", "docx", "xlsx", "xls", "csv", "tsv",
+];
+
+const SUPPORTED_IMAGE_ATTACHMENT_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg"];
+
+fn attachment_extension(path: &Path) -> String {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+fn is_supported_attachment_path(path: &Path) -> bool {
+    let ext = attachment_extension(path);
+    SUPPORTED_ATTACHMENT_EXTENSIONS.contains(&ext.as_str())
+}
+
+fn is_supported_image_attachment_path(path: &Path) -> bool {
+    let ext = attachment_extension(path);
+    SUPPORTED_IMAGE_ATTACHMENT_EXTENSIONS.contains(&ext.as_str())
+}
+
+fn image_attachment_mime(path: &Path) -> &'static str {
+    match attachment_extension(path).as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        _ => "application/octet-stream",
+    }
+}
+
+fn sanitize_attachment_filename(name: &str) -> String {
+    let sanitized = name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let trimmed = sanitized.trim_matches('_');
+    if trimmed.is_empty() {
+        "attachment".to_string()
+    } else {
+        trimmed.chars().take(120).collect()
+    }
+}
+
+fn encode_base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(((bytes.len() + 2) / 3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+        output.push(TABLE[(b0 >> 2) as usize] as char);
+        output.push(TABLE[(((b0 & 0b0000_0011) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            output.push(TABLE[(((b1 & 0b0000_1111) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            output.push('=');
+        }
+        if chunk.len() > 2 {
+            output.push(TABLE[(b2 & 0b0011_1111) as usize] as char);
+        } else {
+            output.push('=');
+        }
+    }
+    output
+}
+
 fn stable_project_hash(input: &str) -> String {
     let mut hash: u64 = 0xcbf29ce484222325;
     for byte in input.as_bytes() {
@@ -1362,6 +1443,126 @@ fn read_chat_temp_file(session_key: String, path: String) -> Result<String, Stri
     let workspace = ensure_chat_temp_root(&session_key)?;
     let real_path = resolve_existing_path(&path, &workspace)?;
     fs::read_to_string(real_path).map_err(|e| format!("读取聊天临时文件失败: {e}"))
+}
+
+#[tauri::command]
+fn get_chat_temp_root(session_key: String) -> Result<String, String> {
+    Ok(ensure_chat_temp_root(&session_key)?.to_string_lossy().to_string())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AttachmentIngestResult {
+    path: String,
+    workspace: String,
+    original_path: String,
+    display_name: String,
+    size_bytes: u64,
+}
+
+#[tauri::command]
+fn ingest_attachment_file(session_key: String, source_path: String) -> Result<AttachmentIngestResult, String> {
+    let raw = PathBuf::from(source_path.trim());
+    let source = raw
+        .canonicalize()
+        .map_err(|e| format!("附件路径不存在或无法访问: {e}"))?;
+    if !source.is_file() {
+        return Err("只能添加文件，不能添加文件夹".to_string());
+    }
+    if !is_supported_attachment_path(&source) {
+        return Err("不支持的附件格式".to_string());
+    }
+
+    let workspace = ensure_chat_temp_root(&session_key)?;
+    let display_name = source
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| "attachment".to_string());
+    let safe_name = sanitize_attachment_filename(&display_name);
+    let source_key = source.to_string_lossy().to_string();
+    let relative_path = format!(
+        "{}/{}-{}",
+        CHAT_ATTACHMENT_PREFIX,
+        stable_project_hash(&source_key),
+        safe_name,
+    );
+    let real_path = resolve_write_path(&relative_path, &workspace)?;
+    if let Some(parent) = real_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("创建附件临时目录失败: {e}"))?;
+    }
+    fs::copy(&source, &real_path).map_err(|e| format!("复制附件失败: {e}"))?;
+    let metadata = fs::metadata(&real_path).map_err(|e| format!("读取附件元数据失败: {e}"))?;
+
+    Ok(AttachmentIngestResult {
+        path: relative_path,
+        workspace: workspace.to_string_lossy().to_string(),
+        original_path: source.to_string_lossy().to_string(),
+        display_name,
+        size_bytes: metadata.len(),
+    })
+}
+
+#[tauri::command]
+fn ingest_attachment_bytes(
+    session_key: String,
+    file_name: String,
+    bytes: Vec<u8>,
+) -> Result<AttachmentIngestResult, String> {
+    if bytes.is_empty() {
+        return Err("附件内容为空".to_string());
+    }
+    let display_name = if file_name.trim().is_empty() {
+        "attachment".to_string()
+    } else {
+        file_name.trim().to_string()
+    };
+    let safe_name = sanitize_attachment_filename(&display_name);
+    let probe_path = PathBuf::from(&safe_name);
+    if !is_supported_attachment_path(&probe_path) {
+        return Err("不支持的附件格式".to_string());
+    }
+
+    let workspace = ensure_chat_temp_root(&session_key)?;
+    let relative_path = format!(
+        "{}/{}-{}",
+        CHAT_ATTACHMENT_PREFIX,
+        stable_project_hash(&format!("{}:{}:{}", display_name, bytes.len(), now_millis())),
+        safe_name,
+    );
+    let real_path = resolve_write_path(&relative_path, &workspace)?;
+    if let Some(parent) = real_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("创建附件临时目录失败: {e}"))?;
+    }
+    fs::write(&real_path, &bytes).map_err(|e| format!("写入附件失败: {e}"))?;
+
+    Ok(AttachmentIngestResult {
+        path: relative_path,
+        workspace: workspace.to_string_lossy().to_string(),
+        original_path: display_name.clone(),
+        display_name,
+        size_bytes: bytes.len() as u64,
+    })
+}
+
+#[tauri::command]
+fn read_attachment_image_data_url(source_path: String) -> Result<String, String> {
+    let raw = PathBuf::from(source_path.trim());
+    let source = raw
+        .canonicalize()
+        .map_err(|e| format!("图片路径不存在或无法访问: {e}"))?;
+    if !source.is_file() {
+        return Err("只能添加图片文件，不能添加文件夹".to_string());
+    }
+    if !is_supported_image_attachment_path(&source) {
+        return Err("不支持的图片格式".to_string());
+    }
+    let bytes = fs::read(&source).map_err(|e| format!("读取图片失败: {e}"))?;
+    Ok(format!(
+        "data:{};base64,{}",
+        image_attachment_mime(&source),
+        encode_base64(&bytes),
+    ))
 }
 
 #[tauri::command]
@@ -4205,6 +4406,10 @@ pub fn run() {
             delete_protocol_package,
             write_chat_temp_file,
             read_chat_temp_file,
+            get_chat_temp_root,
+            ingest_attachment_file,
+            ingest_attachment_bytes,
+            read_attachment_image_data_url,
             list_project_sessions,
             rebuild_project_sessions_index,
             save_project_session,
