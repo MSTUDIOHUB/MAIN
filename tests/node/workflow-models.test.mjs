@@ -87,6 +87,7 @@ const {
   reconcilePlanTaskCompletion,
   resolveActiveConversationTurn,
   resolvePinnedConversationTurn,
+  shouldPlanShortcutReplaceTurn,
   summarizeUserPrompt,
   validatePlanArtifactContent,
 } = loadWorkflowModelsModule();
@@ -207,9 +208,31 @@ test("completed plan lifecycle patch clears active runtime without deleting hist
     planTasks: [],
     planExecutionEvidenceLedger: [],
     planExecutionEvidenceCount: 0,
+    planAutoResumeCount: 0,
+    planExecutionProgressSnapshot: null,
     planStage: "idle",
     showPlanPanel: false,
   });
+});
+
+test("plan shortcut does not replace visible execution progress", () => {
+  assert.equal(
+    shouldPlanShortcutReplaceTurn({
+      isPlanTurn: true,
+      hasCompletePlan: true,
+      isPlanExecutionVisible: true,
+    }),
+    false,
+  );
+
+  assert.equal(
+    shouldPlanShortcutReplaceTurn({
+      isPlanTurn: true,
+      hasCompletePlan: true,
+      isPlanExecutionVisible: false,
+    }),
+    true,
+  );
 });
 
 test("deriveTurnProgressItems prefers explicit jobs and ignores plain numbered prose", () => {

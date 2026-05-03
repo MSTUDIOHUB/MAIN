@@ -25,11 +25,14 @@ import {
   looksLikeReasoningLeakTitle,
   resolveActiveConversationTurn,
   resolvePinnedConversationTurn,
+  shouldPlanShortcutReplaceTurn,
   summarizePlanIntent,
   type ConversationTurn,
+  type PlanExecutionProgressSnapshot,
   type ReplyOption,
 } from "../lib/workflowModels";
 import { getIntentPolicy, resolveConversationTurnIntent } from "../lib/runIntent";
+import { summarizePlanExecutionProgressSnapshot } from "../lib/planExecutionRecovery";
 
 const TURN_STATUS_LABELS: Record<string, string> = {
   planning: "Planning",
@@ -284,6 +287,103 @@ function ContextCompressionNotice({ block, language }: { block: any; language: "
         </div>,
         document.body,
       )}
+    </div>
+  );
+}
+
+function PlanExecutionSystemNotice({ block, language }: { block: any; language: "zh" | "en" }) {
+  const isCheckpoint = block.variant === "plan_execution_checkpoint";
+  const title = isCheckpoint
+    ? language === "zh" ? "计划执行检查点" : "Plan Execution Checkpoint"
+    : language === "zh" ? "计划执行进度" : "Plan Execution Progress";
+  const tone = isCheckpoint
+    ? "border-[rgba(251,191,36,0.28)] bg-[rgba(251,191,36,0.08)] text-[#fde68a]"
+    : "border-[rgba(96,165,250,0.25)] bg-[rgba(96,165,250,0.08)] text-[#bfdbfe]";
+
+  return (
+    <div className="flex w-full justify-center">
+      <div data-testid={block.variant} className={`max-w-[min(760px,92%)] rounded-lg border px-3 py-2 text-left ${tone}`}>
+        <div className="text-[11px] font-medium uppercase tracking-[0.14em] text-[#a1a1aa]">{title}</div>
+        <div className="mt-1 whitespace-pre-wrap break-words text-[12px] leading-5 text-[#e4e4e7]">{String(block.content || "")}</div>
+      </div>
+    </div>
+  );
+}
+
+function getPlanProgressPhaseLabel(phase: string, language: "zh" | "en") {
+  if (language === "zh") {
+    switch (phase) {
+      case "starting": return "准备执行";
+      case "tool_start": return "工具执行中";
+      case "tool_done": return "工具已完成";
+      case "tool_error": return "工具出错";
+      case "waiting_review": return "等待审批";
+      case "context_compression": return "背景已压缩";
+      case "checkpoint": return "检查点";
+      case "auto_resume": return "自动续跑";
+      case "paused": return "已暂停";
+      case "completed": return "已完成";
+      default: return "执行中";
+    }
+  }
+
+  switch (phase) {
+    case "starting": return "Starting";
+    case "tool_start": return "Tool running";
+    case "tool_done": return "Tool done";
+    case "tool_error": return "Tool error";
+    case "waiting_review": return "Waiting for approval";
+    case "context_compression": return "Context compressed";
+    case "checkpoint": return "Checkpoint";
+    case "auto_resume": return "Auto-resuming";
+    case "paused": return "Paused";
+    case "completed": return "Completed";
+    default: return "Running";
+  }
+}
+
+function PlanExecutionLiveCard({
+  snapshot,
+  language,
+  compact = false,
+}: {
+  snapshot: PlanExecutionProgressSnapshot;
+  language: "zh" | "en";
+  compact?: boolean;
+}) {
+  if (!snapshot) return null;
+  const title = language === "zh" ? "计划执行" : "Plan Execution";
+  const phaseLabel = getPlanProgressPhaseLabel(snapshot.phase, language);
+  const iterationText = snapshot.maxIterations > 0
+    ? `${snapshot.iteration}/${snapshot.maxIterations}`
+    : String(snapshot.iteration || 0);
+  const labels = language === "zh"
+    ? { task: "当前任务", evidence: "最近证据", next: "下一步", tool: "当前工具", turn: "轮次", auto: "自动恢复" }
+    : { task: "Current task", evidence: "Latest evidence", next: "Next", tool: "Current tool", turn: "Turn", auto: "Auto-resume" };
+  const sep = language === "zh" ? "：" : ": ";
+  const rowClass = compact
+    ? "grid gap-1 text-[12px] leading-5 text-[#d4d4d8]"
+    : "grid gap-2 text-[12px] leading-5 text-[#d4d4d8] sm:grid-cols-2";
+
+  return (
+    <div data-testid="plan-execution-live-card" className="ml-9 rounded-2xl border border-[rgba(96,165,250,0.24)] bg-[rgba(37,99,235,0.08)] px-4 py-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="rounded-full border border-[rgba(96,165,250,0.25)] bg-[rgba(96,165,250,0.12)] px-2 py-0.5 text-[10px] uppercase tracking-[0.16em] text-[#bfdbfe]">
+          {title}
+        </span>
+        <span className="rounded-full border border-[rgba(52,211,153,0.22)] bg-[rgba(52,211,153,0.1)] px-2 py-0.5 text-[10px] text-[#86efac]">
+          {phaseLabel}
+        </span>
+        <span className="text-[11px] text-[#93c5fd]">
+          {labels.turn} {iterationText} · {labels.auto} {snapshot.autoResumeCount}/1
+        </span>
+      </div>
+      <div className={`mt-3 ${rowClass}`}>
+        <div><span className="text-[#93c5fd]">{labels.task}{sep}</span>{snapshot.currentTask || (language === "zh" ? "核查任务状态" : "check task status")}</div>
+        <div><span className="text-[#93c5fd]">{labels.evidence}{sep}</span>{snapshot.latestEvidence || (language === "zh" ? "暂无项目源码证据" : "no project-source evidence yet")}</div>
+        {!compact && <div><span className="text-[#93c5fd]">{labels.tool}{sep}</span>{snapshot.currentTool || (language === "zh" ? "暂无工具调用" : "no tool call yet")}</div>}
+        <div><span className="text-[#93c5fd]">{labels.next}{sep}</span>{snapshot.nextStep || (language === "zh" ? "继续执行剩余任务" : "continue remaining tasks")}</div>
+      </div>
     </div>
   );
 }
@@ -1045,6 +1145,7 @@ export default function ChatArea({
     planTasks,
     isPlanApproved,
     planStage,
+    planExecutionProgressSnapshot,
     approvePlan,
     approvePendingReviewOnce,
     approvePendingReviewForSession,
@@ -1073,6 +1174,7 @@ export default function ChatArea({
     planTasks: useAppStore((s) => s.planTasks),
     isPlanApproved: useAppStore((s) => s.isPlanApproved),
     planStage: useAppStore((s) => s.planStage),
+    planExecutionProgressSnapshot: useAppStore((s) => s.planExecutionProgressSnapshot),
     approvePlan: useAppStore((s) => s.approvePlan),
     approvePendingReviewOnce: useAppStore((s) => s.approvePendingReviewOnce),
     approvePendingReviewForSession: useAppStore((s) => s.approvePendingReviewForSession),
@@ -1448,6 +1550,16 @@ export default function ChatArea({
       if (block.variant === "context_compression") {
         return <ContextCompressionNotice key={`${block.id}-${index}`} block={block} language={language} />;
       }
+      if (block.variant === "plan_execution_progress" || block.variant === "plan_execution_checkpoint") {
+        if (
+          block.variant === "plan_execution_progress" &&
+          planExecutionProgressSnapshot?.turnId &&
+          planExecutionProgressSnapshot.turnId === block.turnId
+        ) {
+          return null;
+        }
+        return <PlanExecutionSystemNotice key={`${block.id}-${index}`} block={block} language={language} />;
+      }
       return (
         <div key={`${block.id}-${index}`} className="flex w-full justify-center">
           <div className="rounded-full border border-[#27272a] bg-[#18181b] px-4 py-1.5 text-[11px] text-[#a1a1aa]">{block.content}</div>
@@ -1537,6 +1649,23 @@ export default function ChatArea({
       ? (language === "en" ? turnIntentPolicy.label.en : turnIntentPolicy.label.zh)
       : (language === "zh" ? "任务" : "Task");
     const isPlanTurn = turnIntent === "plan";
+    const turnProgressSnapshot =
+      planExecutionProgressSnapshot?.turnId === turn.id
+        ? planExecutionProgressSnapshot
+        : blocks
+            .map((block) => block.type === "system" ? block.planExecutionProgress : null)
+            .filter(Boolean)
+            .slice(-1)[0] || null;
+    const isPlanExecutionVisible =
+      isPlanTurn &&
+      !!turnProgressSnapshot &&
+      (
+        isPlanApproved ||
+        planStage === "executing" ||
+        turn.status === "executing" ||
+        turn.status === "stopped_no_action" ||
+        turn.status === "error"
+      );
     const forceExpandedTurn =
       turn.status === "awaiting_input" ||
       turn.status === "awaiting_approval";
@@ -1545,7 +1674,8 @@ export default function ChatArea({
     const hiddenCount = blocks.filter((block) => block.type !== "user").length;
     const { entries: turnChangeEntries, totalExecutedEdits } = collectTurnChangeEntries(blocks);
     const shouldShowTurnChanges = turnChangeEntries.length > 1 || totalExecutedEdits > 1;
-    const finalVisibleAgentIndex = isPlanTurn
+    const shouldPreservePlanExecutionAgentText = isPlanTurn && isPlanExecutionVisible;
+    const finalVisibleAgentIndex = isPlanTurn && !shouldPreservePlanExecutionAgentText
       ? -1
       : [...blocks]
           .map((block, idx) => ({ block, idx }))
@@ -1566,6 +1696,9 @@ export default function ChatArea({
       isPlanApproved;
     const hasCompletePlan = hasPlanContent && planTurnFinished;
     const finalAgentSummaryText = getLastAgentSummaryText(blocks);
+    const planProgressSummary = turnProgressSnapshot
+      ? summarizePlanExecutionProgressSnapshot(turnProgressSnapshot, language)
+      : "";
     const toolExecutionSummary = buildToolExecutionSummary(blocks, language);
     const activeTurnActivity = getActiveTurnActivity(blocks, turn.status, language);
     const displayTitleFallback = turn.userPrompt
@@ -1651,17 +1784,25 @@ export default function ChatArea({
           )}
 
           {!isTurnExpanded ? (
-            <div className="ml-9">
-              <TurnSummaryCard
-                turn={turn}
-                hiddenCount={(turn.status === "done" || turn.status === "completed_with_changes") ? collapsedProcessCount : hiddenCount}
-                fallbackSummary={finalAgentSummaryText || toolExecutionSummary}
-                onOpenPlan={isPlanTurn && hasPlanPanelContent && hasPlanContent ? () => openRightPanelTab("plan") : undefined}
-                onExpand={() => toggleConversationTurnCollapsed(turn.id)}
-                copy={copy}
-              />
-            </div>
-          ) : isPlanTurn && hasCompletePlan ? (
+            <>
+              <div className="ml-9">
+                <TurnSummaryCard
+                  turn={turn}
+                  hiddenCount={(turn.status === "done" || turn.status === "completed_with_changes") ? collapsedProcessCount : hiddenCount}
+                  fallbackSummary={planProgressSummary || finalAgentSummaryText || toolExecutionSummary}
+                  onOpenPlan={isPlanTurn && hasPlanPanelContent && hasPlanContent ? () => openRightPanelTab("plan") : undefined}
+                  onExpand={() => toggleConversationTurnCollapsed(turn.id)}
+                  copy={copy}
+                />
+              </div>
+              {isPlanExecutionVisible && turnProgressSnapshot && (
+                <PlanExecutionLiveCard snapshot={turnProgressSnapshot} language={language} compact />
+              )}
+              {blocks
+                .filter((block) => block.type === "system" && block.variant === "plan_execution_checkpoint")
+                .map((block, blockIndex) => renderBlock(block, blockIndex))}
+            </>
+          ) : shouldPlanShortcutReplaceTurn({ isPlanTurn, hasCompletePlan, isPlanExecutionVisible }) ? (
             <PlanShortcutCard
               turn={turn}
               hasPlanContent={hasPlanContent}
@@ -1670,7 +1811,21 @@ export default function ChatArea({
               copy={copy}
             />
           ) : (
-            buildBlockRenderItems(blocks, false).map(renderBlockItem)
+            <>
+              {isPlanExecutionVisible && turnProgressSnapshot && (
+                <PlanExecutionLiveCard snapshot={turnProgressSnapshot} language={language} />
+              )}
+              {isPlanExecutionVisible && hasCompletePlan && (
+                <PlanShortcutCard
+                  turn={turn}
+                  hasPlanContent={hasPlanContent}
+                  canOpenPlan={hasPlanPanelContent && hasPlanContent}
+                  onOpenPlan={() => openRightPanelTab("plan")}
+                  copy={copy}
+                />
+              )}
+              {buildBlockRenderItems(blocks, false).map(renderBlockItem)}
+            </>
           )}
           {activeTurnActivity && <TurnActivityNotice text={activeTurnActivity} />}
         </div>

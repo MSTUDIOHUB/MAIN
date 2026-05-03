@@ -953,7 +953,17 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
         evidenceLedger: planExecutionEvidenceLedger,
       }),
       undefined,
-      { hidden: true, reuseCurrentTurn: false, preservePlanState: true, resolvedIntent: "plan", skipIntentResolution: true },
+      {
+        hidden: true,
+        reuseCurrentTurn: false,
+        preservePlanState: true,
+        resolvedIntent: "plan",
+        skipIntentResolution: true,
+        turnTitle: language === "zh" ? "计划执行恢复" : "Plan Execution Resume",
+        intentSummary: language === "zh"
+          ? "从已批准计划的剩余任务继续执行。"
+          : "Resume execution from the remaining tasks in the approved plan.",
+      },
     );
   };
   const handleSavePlanDocument = async (document: { title: string; suggestedFileName: string; content: string; sourcePath?: string }) => {

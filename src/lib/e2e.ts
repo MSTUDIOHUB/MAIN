@@ -1,4 +1,4 @@
-import { finalizeStreamingTaskBlocks, useAppStore } from "../store/useAppStore";
+import { GLOBAL_CHAT_KEY, finalizeStreamingTaskBlocks, useAppStore } from "../store/useAppStore";
 import { syncPlanArtifactAfterToolSuccess } from "./planArtifactSync";
 import { getPlanArtifactTitle } from "./workflowModels";
 import type { NexusModeKey } from "./gameStudioCatalog";
@@ -23,6 +23,7 @@ const CLOUD_TOOL_FALLBACK_SCENARIO = "cloud-tool-fallback";
 const REPLY_OPTIONS_TOOL_PAUSE_SCENARIO = "reply-options-tool-pause";
 const PLAN_APPROVAL_EXECUTE_TOOLS_SCENARIO = "plan-approval-execute-tools";
 const TOP_ISLAND_EXECUTION_PROGRESS_SCENARIO = "top-island-execution-progress";
+const SIDEBAR_REMOVE_LAST_WORKSPACE_SCENARIO = "sidebar-remove-last-workspace";
 const E2E_SEED_COUNT_PREFIX = "__CODELY_E2E_SEED_COUNT__:";
 
 function getScenarioName(): string | null {
@@ -2642,6 +2643,115 @@ export function getE2EResumeExecutionHandler(): (() => Promise<boolean>) | null 
   };
 }
 
+
+function seedSidebarRemoveLastWorkspaceScenario() {
+  const bridge = getBridge();
+  if (!bridge) return undefined;
+
+  bridge.events = [{ type: "boot" }];
+  bridge.savedDocuments = [];
+  bridge.completed = false;
+
+  const workspace = "/tmp/e2e-sidebar-remove-last";
+  const sessionId = 999601;
+  const now = Date.now();
+  const userBlockId = useAppStore.getState()._nextTaskId();
+  const agentBlockId = useAppStore.getState()._nextTaskId();
+
+  useAppStore.setState((state) => ({
+    ...state,
+    config: {
+      ...state.config,
+      language: "zh",
+      workflowMode: "chat",
+      sessionRecordingEnabled: true,
+    },
+    currentWorkspace: workspace,
+    selectedWorkspace: workspace,
+    workspaces: [
+      { path: workspace, name: "E2E Sidebar Remove Last", addedAt: now, lastActiveAt: now },
+    ],
+    activeSessionByWorkspace: {
+      [workspace]: sessionId,
+    },
+    sessionsByWorkspace: {
+      [workspace]: [
+        {
+          id: sessionId,
+          title: "E2E Sidebar Remove Last Session",
+          date: new Date(now).toISOString(),
+          active: true,
+          messages: [],
+        },
+      ],
+      [GLOBAL_CHAT_KEY]: [],
+    },
+    currentSessionId: sessionId,
+    taskFlow: [
+      { id: userBlockId, turnId: "e2e-sidebar-turn", type: "user", content: "请帮我分析当前项目架构。" },
+      {
+        id: agentBlockId,
+        turnId: "e2e-sidebar-turn",
+        type: "agent",
+        content: "当前项目是一个桌面 AI 编程助手，基于 Tauri + React 技术栈。",
+        streaming: false,
+      },
+    ],
+    conversationTurns: [
+      {
+        id: "e2e-sidebar-turn",
+        userPrompt: "请帮我分析当前项目架构。",
+        title: "E2E Sidebar Remove Last",
+        mode: "chat",
+        status: "done",
+        summary: "已完成项目架构分析。",
+        blockIds: [userBlockId, agentBlockId],
+        collapsed: false,
+        createdAt: now,
+      },
+    ],
+    currentTurnId: "e2e-sidebar-turn",
+    agentMessages: [],
+    selectedMainModeKey: "main_mode",
+    selectedNexusModeKey: "nexus_general",
+    activeStudioAgentKey: "studio_auto",
+    gameStudioInitialized: false,
+    pendingSlashCommand: null,
+    planArtifacts: [],
+    planTasks: [],
+    planExecutionEvidenceLedger: [],
+    planExecutionEvidenceCount: 0,
+    planStage: "idle",
+    isPlanApproved: false,
+    planApprovalChoice: null,
+    showPlanPanel: false,
+    showDiff: false,
+    showTerminal: false,
+    showFilePanel: false,
+    rightPanelTab: "plan",
+    selectedDiffTaskId: null,
+    agentStatus: "idle",
+    isGenerating: false,
+    abortController: null,
+    pendingReviewResolve: null,
+    pendingReviewTaskId: null,
+    pendingToolCall: null,
+    input: "",
+    attachedFiles: [],
+    contextMentions: [],
+    readOnlyAutoApproveForSession: false,
+  }));
+
+  bindBridgeSnapshot(SIDEBAR_REMOVE_LAST_WORKSPACE_SCENARIO);
+
+  const cleanup = () => {
+    bridge.initialized = false;
+  };
+
+  bridge.cleanup = cleanup;
+  return cleanup;
+}
+
 export function initializeE2EScenarios(): (() => void) | undefined {
   const scenario = getScenarioName();
   if (!scenario) return undefined;
@@ -2734,6 +2844,11 @@ export function initializeE2EScenarios(): (() => void) | undefined {
     return seedTopIslandExecutionProgressScenario();
   }
 
-  bridge.initialized = false;
+  
+  if (scenario === SIDEBAR_REMOVE_LAST_WORKSPACE_SCENARIO) {
+    return seedSidebarRemoveLastWorkspaceScenario();
+  }
+
+bridge.initialized = false;
   return undefined;
 }

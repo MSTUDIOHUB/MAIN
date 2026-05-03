@@ -1,4 +1,4 @@
-import type { NormalizedStreamState, PlanArtifact, PlanExecutionEvidenceEntry, PlanStage, PlanTask } from "./workflowModels";
+import type { NormalizedStreamState, PlanArtifact, PlanExecutionEvidenceEntry, PlanExecutionProgressSnapshot, PlanStage, PlanTask } from "./workflowModels";
 
 export interface ClosedActivePlanRuntimePatch {
   isPlanApproved: false;
@@ -6,6 +6,8 @@ export interface ClosedActivePlanRuntimePatch {
   planTasks: PlanTask[];
   planExecutionEvidenceLedger: PlanExecutionEvidenceEntry[];
   planExecutionEvidenceCount: 0;
+  planAutoResumeCount: 0;
+  planExecutionProgressSnapshot: PlanExecutionProgressSnapshot | null;
   planStage: PlanStage;
   showPlanPanel: false;
   normalizedStreamState?: NormalizedStreamState;
@@ -18,6 +20,8 @@ export function buildClosedActivePlanRuntimePatch(): ClosedActivePlanRuntimePatc
     planTasks: [],
     planExecutionEvidenceLedger: [],
     planExecutionEvidenceCount: 0,
+    planAutoResumeCount: 0,
+    planExecutionProgressSnapshot: null,
     planStage: "idle",
     showPlanPanel: false,
   };

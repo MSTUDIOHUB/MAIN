@@ -49,6 +49,8 @@ import {
   isPlanTaskTrustedComplete,
   validatePlanArtifactContent,
   type PlanExecutionEvidenceEntry,
+  type PlanExecutionProgressPhase,
+  type PlanExecutionProgressUpdate,
   type PlanTask,
   type ReplyOption,
 } from "./workflowModels";
@@ -95,6 +97,13 @@ import {
   resolveMissingToolCallRepromptKind,
 } from "./missingToolCallReprompt";
 import { buildPlanApprovalChoiceHint } from "./planControl";
+import {
+  buildPlanExecutionProgressUpdate,
+  buildPlanMaxIterationsCheckpoint,
+  buildPlanMaxIterationsPauseNotice,
+  type PlanMaxIterationsCheckpoint,
+  type PlanToolActivitySummary,
+} from "./planExecutionRecovery";
 
 // ── Spec file auto-approval helpers ────────────────────────────────
 
@@ -267,6 +276,7 @@ export interface OrchestratorCallbacks {
   getPlanStage: () => "idle" | "requirements" | "design" | "tasks" | "bugfix" | "ready_to_execute" | "executing" | "completed";
   getPlanTasks: () => PlanTask[];
   getPlanExecutionEvidenceLedger: () => PlanExecutionEvidenceEntry[];
+  getPlanAutoResumeCount?: () => number;
   getStatus: () => "idle" | "running" | "pending_review" | "error";
   startNewTurn: () => void;
 
@@ -281,6 +291,8 @@ export interface OrchestratorCallbacks {
   onPlanArtifactUpdated: (path: string, content: string, kind: "requirements" | "design" | "tasks" | "bugfix") => void;
   onPlanStageChanged: (stage: "idle" | "requirements" | "design" | "tasks" | "bugfix" | "ready_to_execute" | "executing" | "completed") => void;
   onPlanTasksUpdated: (content: string) => void;
+  onPlanExecutionProgress?: (progress: PlanExecutionProgressUpdate) => void;
+  onPlanMaxIterationsCheckpoint?: (checkpoint: PlanMaxIterationsCheckpoint) => boolean | Promise<boolean>;
   onTurnSummaryReady: (summary: string) => void;
   onInstructionsResolved: (resolved: ResolvedInstructionSet) => void;
   onHooksLoaded: (hooks: HookDefinition[], loadedAt?: number | null) => void;
@@ -444,6 +456,46 @@ function buildNonActionableStopMessage(language: "zh" | "en", reason: "no_output
     default:
       return "The model only produced prose and did not create real tool calls or file changes, so this turn stopped.";
   }
+}
+
+function buildApprovedPlanNoToolPauseMessage(
+  language: "zh" | "en",
+  remainingText: string,
+  consecutiveNoToolCount: number,
+): string {
+  return language === "zh"
+    ? [
+        "计划执行已暂停",
+        "",
+        `原因：模型连续 ${consecutiveNoToolCount} 次提前停止，返回了正文但没有继续调用工具；tasks.md 仍有证据未满足的任务。`,
+        "已保留当前 workspace、工具结果和任务证据，不会把这次正文当作完成证据。",
+        "",
+        "未完成任务：",
+        remainingText,
+        "",
+        "下一步：点击 Resume Execution 后，MAIN 应先重新读取当前 workspace 状态，再继续第一个证据未满足的任务。",
+        "",
+        "RecoveryDetails:",
+        "- type: remaining_plan_tasks_limit",
+        `- noToolStops: ${consecutiveNoToolCount}`,
+        "- action: Resume Execution",
+      ].join("\n")
+    : [
+        "Plan execution paused",
+        "",
+        `Reason: the model stopped early ${consecutiveNoToolCount} time(s), returned prose, and did not continue with tool calls while tasks.md still has unsatisfied evidence.`,
+        "MAIN preserved the current workspace, tool results, and evidence ledger. This prose is not treated as completion evidence.",
+        "",
+        "Remaining tasks:",
+        remainingText,
+        "",
+        "Next: click Resume Execution so MAIN rereads current workspace state and continues from the first task whose evidence is not satisfied.",
+        "",
+        "RecoveryDetails:",
+        "- type: remaining_plan_tasks_limit",
+        `- noToolStops: ${consecutiveNoToolCount}`,
+        "- action: Resume Execution",
+      ].join("\n");
 }
 
 function buildPlanFallbackNotice(language: "zh" | "en", sourceChars: number): string {
@@ -1436,6 +1488,7 @@ async function executeWriteToolWithReview(
 
 const MAX_ITERATIONS = 25;
 const MAX_ITERATIONS_PLAN_EXECUTION = 50;
+const MAX_RECENT_PLAN_TOOL_ACTIVITY = 12;
 const CONCISE_PLAN_ARTIFACT_HINT_ZH =
   "计划文档必须精简：requirements.md 40-80 行、design.md 60-120 行、bugfix.md 40-80 行、tasks.md 8-20 个 checkbox；不要写教程式长文、完整代码清单或重复背景。Proposal 只做一页审阅摘要。";
 const CONCISE_PLAN_ARTIFACT_HINT_EN =
@@ -1712,6 +1765,20 @@ export async function executeAgentLoop(
   const attemptedPlanWriteTargets: string[] = [];
   let recentSuccessfulProjectWrite: { name: string; target: string } | null = null;
   let recoveringFromEmptyAssistantReplyAfterWrite = false;
+  let lastAssistantTextForCheckpoint = "";
+  const recentPlanToolActivity: PlanToolActivitySummary[] = [];
+  const rememberPlanToolActivity = (result: ToolExecutionResult) => {
+    const detail = truncateForLog(result.displayContent || result.content || "", 120);
+    recentPlanToolActivity.push({
+      name: result.name,
+      target: result.target,
+      status: result.isError ? "failed" : "succeeded",
+      ...(detail ? { detail } : {}),
+    });
+    if (recentPlanToolActivity.length > MAX_RECENT_PLAN_TOOL_ACTIVITY) {
+      recentPlanToolActivity.splice(0, recentPlanToolActivity.length - MAX_RECENT_PLAN_TOOL_ACTIVITY);
+    }
+  };
 
   // ── Strict Repeat Guard ──────────────────────────────────────────
   // Track recent tool calls to detect repetition loops. For read-only
@@ -1755,6 +1822,25 @@ export async function executeAgentLoop(
   const effectiveMaxIterations = workflowMode === "plan"
     ? MAX_ITERATIONS_PLAN_EXECUTION
     : MAX_ITERATIONS;
+  const emitPlanExecutionProgress = (
+    phase: PlanExecutionProgressPhase,
+    overrides: Partial<PlanExecutionProgressUpdate> = {},
+  ) => {
+    if (workflowMode !== "plan" || !callbacks.getIsPlanApproved() || !callbacks.onPlanExecutionProgress) return;
+    callbacks.onPlanExecutionProgress({
+      ...buildPlanExecutionProgressUpdate({
+        language: callbacks.getPreferredLanguage(),
+        phase,
+        iterationCount: iteration,
+        maxIterations: effectiveMaxIterations,
+        autoResumeCount: callbacks.getPlanAutoResumeCount?.() ?? 0,
+        tasks: callbacks.getPlanTasks(),
+        evidenceLedger: callbacks.getPlanExecutionEvidenceLedger(),
+        recentToolActivity: recentPlanToolActivity,
+      }),
+      ...overrides,
+    });
+  };
   const loopStartRuntimeIntent = resolveRuntimeIntent();
   const loopStartTools = resolveAllToolsForRuntime(loopStartRuntimeIntent);
 
@@ -1770,9 +1856,11 @@ export async function executeAgentLoop(
     xmlToolsEnabled: true,
     maxOutputEscalations: getMaxOutputEscalations(),
   });
+  emitPlanExecutionProgress("starting");
 
   while (iteration < effectiveMaxIterations) {
     iteration++;
+    emitPlanExecutionProgress("running");
 
     if (abortController.signal.aborted) {
       callbacks.onStatusChange("idle");
@@ -1814,6 +1902,7 @@ export async function executeAgentLoop(
           tokenReduction: managedResult.tokenReduction,
           compressedContext: managedResult.compressedContext,
         }, "proactive");
+        emitPlanExecutionProgress("context_compression");
       }
     }
 
@@ -1929,6 +2018,7 @@ export async function executeAgentLoop(
             tokenReduction: aggressivelyManagedResult.tokenReduction,
             compressedContext: aggressivelyManagedResult.compressedContext,
           }, "reactive");
+          emitPlanExecutionProgress("context_compression");
         }
 
         // Retry once with the compacted context
@@ -1991,6 +2081,7 @@ export async function executeAgentLoop(
               tokenReduction: emergencyManagedResult.tokenReduction,
               compressedContext: emergencyManagedResult.compressedContext,
             }, "reactive");
+            emitPlanExecutionProgress("context_compression");
           }
 
           try {
@@ -2269,6 +2360,9 @@ export async function executeAgentLoop(
       : normalizedVisibleTextForUser;
     const finalReplyOptions = compactedProseCodeDump || autoContinueReadOnlyPermission ? [] : normalized.replyOptions;
     const historyAssistantText = finalVisibleText || "";
+    if (historyAssistantText.trim()) {
+      lastAssistantTextForCheckpoint = historyAssistantText;
+    }
 
     if (finalReplyOptions.length > 0) {
       logAgentEvent("reply_options_detected", {
@@ -2659,23 +2753,35 @@ export async function executeAgentLoop(
         if (approvedPlanMissingTasks || hasRemainingApprovedPlanTasks) {
           callbacks.onStatusChange("running");
           consecutiveNoToolCount++;
-          if (consecutiveNoToolCount >= MAX_NO_ACTION_RETRIES) {
-            logAgentEvent("loop_stop", {
-              reason: "remaining_plan_tasks_limit",
-              iteration,
-              consecutiveNoToolCount,
-            });
-            callbacks.onError("计划执行过程中模型连续多次提前停下，但仍有未完成任务。已中止本轮，请重试或切换更稳定的模型。");
-            callbacks.onStatusChange("error");
-            return;
-          }
-
           const remainingTasks = approvedPlanTasks.filter((task) => !isPlanTaskTrustedComplete(task)).slice(0, 3);
           const remainingText = remainingTasks.length > 0
             ? remainingTasks.map((task) => `- ${task.text}`).join("\n")
             : callbacks.getPreferredLanguage() === "zh"
             ? "- 先生成 `.MAIN/plans/tasks.md`，再执行源码或交付物写入。"
             : "- First generate `.MAIN/plans/tasks.md`, then execute source or deliverable writes.";
+          if (consecutiveNoToolCount >= MAX_NO_ACTION_RETRIES) {
+            logAgentEvent("loop_stop", {
+              reason: "remaining_plan_tasks_limit",
+              iteration,
+              consecutiveNoToolCount,
+            });
+            emitPlanExecutionProgress("paused", {
+              nextStep: callbacks.getPreferredLanguage() === "zh"
+                ? "点击 Resume Execution 后重新读取当前 workspace 状态并继续"
+                : "click Resume Execution, reread current workspace state, and continue",
+            });
+            callbacks.onNonActionableStop(
+              buildApprovedPlanNoToolPauseMessage(
+                callbacks.getPreferredLanguage(),
+                remainingText,
+                consecutiveNoToolCount,
+              ),
+              "incomplete_plan",
+            );
+            callbacks.onStatusChange("idle");
+            return;
+          }
+
           const language = callbacks.getPreferredLanguage();
           callbacks.appendMessage({
             role: "user",
@@ -2693,6 +2799,7 @@ export async function executeAgentLoop(
         }
 
         if (workflowMode === "plan" && callbacks.getIsPlanApproved()) {
+          emitPlanExecutionProgress("completed");
           callbacks.onPlanStageChanged("completed");
         }
 
@@ -2988,6 +3095,10 @@ export async function executeAgentLoop(
       }
     }
 
+    if (workflowMode === "plan" && callbacks.getIsPlanApproved()) {
+      allResults.forEach(rememberPlanToolActivity);
+    }
+
     // Append all tool result messages
     for (const result of allResults) {
       callbacks.appendMessage({
@@ -3003,6 +3114,14 @@ export async function executeAgentLoop(
 
     if (workflowMode === "plan" && callbacks.getIsPlanApproved() && allResults.some((result) => !result.isError)) {
       callbacks.onPlanStageChanged("executing");
+    }
+
+    if (workflowMode === "plan" && callbacks.getIsPlanApproved()) {
+      if (allResults.some((result) => result.isError)) {
+        emitPlanExecutionProgress("tool_error");
+      } else if (allResults.some((result) => !result.isError)) {
+        emitPlanExecutionProgress("tool_done");
+      }
     }
 
     // ── Strict Repeat Guard check ────────────────────────────────────
@@ -3073,6 +3192,45 @@ export async function executeAgentLoop(
     }
 
     // Loop continues — the model sees all tool results and can respond
+  }
+
+  if (workflowMode === "plan" && callbacks.getIsPlanApproved()) {
+    const checkpoint = buildPlanMaxIterationsCheckpoint({
+      iterationCount: effectiveMaxIterations,
+      maxIterations: effectiveMaxIterations,
+      autoResumeCount: callbacks.getPlanAutoResumeCount?.() ?? 0,
+      tasks: callbacks.getPlanTasks(),
+      evidenceLedger: callbacks.getPlanExecutionEvidenceLedger(),
+      recentToolActivity: recentPlanToolActivity,
+      lastAssistantText: lastAssistantTextForCheckpoint,
+      unresolvedBlockers: [
+        `Agent loop reached maximum iterations (${effectiveMaxIterations}) while plan execution was still active.`,
+      ],
+    });
+    logAgentEvent("max_iterations_checkpoint", {
+      workflowMode,
+      iteration: effectiveMaxIterations,
+      autoResumeCount: checkpoint.autoResumeCount,
+      remainingTasks: checkpoint.remainingTasks.length,
+      recentToolActivity: checkpoint.recentToolActivity.length,
+    });
+    emitPlanExecutionProgress(
+      checkpoint.autoResumeCount < 1 ? "checkpoint" : "paused",
+      {
+        nextStep: checkpoint.autoResumeCount < 1
+          ? callbacks.getPreferredLanguage() === "zh"
+            ? "保存检查点并自动开启一次隐藏续跑"
+            : "save checkpoint and start one hidden auto-resume"
+          : callbacks.getPreferredLanguage() === "zh"
+          ? "点击 Resume Execution 后从检查点继续"
+          : "click Resume Execution to continue from checkpoint",
+      },
+    );
+    callbacks.onStatusChange("idle");
+    const handled = await callbacks.onPlanMaxIterationsCheckpoint?.(checkpoint);
+    if (handled) return;
+    callbacks.onError(buildPlanMaxIterationsPauseNotice(checkpoint, callbacks.getPreferredLanguage()));
+    return;
   }
 
   callbacks.onError(`Agent loop reached maximum iterations (${effectiveMaxIterations}).`);

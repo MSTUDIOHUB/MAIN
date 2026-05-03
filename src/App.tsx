@@ -1037,6 +1037,36 @@ export default function App() {
     } catch (error) { console.error('Failed to select workspace:', error); }
   };
 
+  // ── Shared helper: reset chat runtime state to empty view ──────────────
+  const resetToEmptyChatView = useCallback(() => {
+    useAppStore.setState({
+      taskFlow: [],
+      agentMessages: [],
+      conversationTurns: [],
+      currentTurnId: null,
+      selectedDiffTaskId: null,
+      pendingSlashCommand: null,
+      planArtifacts: [],
+      planTasks: [],
+      planExecutionEvidenceLedger: [],
+      planExecutionEvidenceCount: 0,
+      planStage: "idle",
+      isPlanApproved: false,
+      planApprovalChoice: null,
+      agentStatus: "idle",
+      isGenerating: false,
+      abortController: null,
+      pendingReviewResolve: null,
+      pendingReviewTaskId: null,
+      pendingToolCall: null,
+      showPlanPanel: false,
+      showDiff: false,
+      showTerminal: false,
+      showFilePanel: false,
+      rightPanelTab: "plan",
+    });
+  }, []);
+
   const handleOpenGlobalChat = async () => {
     const state = useAppStore.getState();
     if (!state.currentWorkspace && state.currentSessionId) return;
@@ -1045,6 +1075,8 @@ export default function App() {
     openSessionScope(GLOBAL_CHAT_KEY);
     const existing = await refreshSessionsForScope(GLOBAL_CHAT_KEY);
     if (existing.length === 0) {
+      resetToEmptyChatView();
+      setCurrentWorkspace("");
       setCurrentSessionId(null);
       return;
     }

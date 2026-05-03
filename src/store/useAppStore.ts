@@ -27,6 +27,8 @@ import {
   type NormalizedStreamState,
   type PlanArtifact,
   type PlanExecutionEvidenceEntry,
+  type PlanExecutionProgressSnapshot,
+  type PlanExecutionProgressUpdate,
   type PlanStage,
   type PlanTask,
   type ReplyOption,
@@ -73,6 +75,16 @@ import {
 } from "../lib/cloudServers";
 import { buildToolDiffPreview, supportsToolDiffPreview } from "../lib/toolDiff";
 import { buildPlanApprovalChoiceHint, normalizePlanApprovalChoice } from "../lib/planControl";
+import {
+  PLAN_MAX_AUTO_RESUME_LIMIT,
+  buildPlanExecutionProgressUpdate,
+  formatPlanExecutionProgressSnapshot,
+  buildPlanMaxIterationsAutoResumeNotice,
+  buildPlanMaxIterationsPauseNotice,
+  buildPlanMaxIterationsResumePrompt,
+  normalizePlanExecutionProgressSnapshot,
+  type PlanMaxIterationsCheckpoint,
+} from "../lib/planExecutionRecovery";
 import {
   type AttachedFile,
   type AttachmentKind,
@@ -443,6 +455,8 @@ export interface SessionRuntimeSnapshot {
   planTasks: PlanTask[];
   planExecutionEvidenceLedger: PlanExecutionEvidenceEntry[];
   planExecutionEvidenceCount: number;
+  planAutoResumeCount?: number;
+  planExecutionProgressSnapshot?: PlanExecutionProgressSnapshot | null;
   planStage: PlanStage;
   isPlanApproved: boolean;
   planApprovalChoice?: string | null;
@@ -620,7 +634,8 @@ export type TaskBlock =
       type: "system";
       content: string;
       icon?: string;
-      variant?: "context_compression" | "plan_quality_gate";
+      variant?: "context_compression" | "plan_quality_gate" | "plan_execution_progress" | "plan_execution_checkpoint";
+      planExecutionProgress?: PlanExecutionProgressSnapshot;
       contextCompression?: {
         reason: "proactive" | "reactive";
         droppedCount: number;
@@ -835,6 +850,8 @@ interface AppState {
   planTasks: PlanTask[];
   planExecutionEvidenceLedger: PlanExecutionEvidenceEntry[];
   planExecutionEvidenceCount: number;
+  planAutoResumeCount: number;
+  planExecutionProgressSnapshot: PlanExecutionProgressSnapshot | null;
   normalizedStreamState: NormalizedStreamState;
   setWorkflowMode: (mode: "chat" | "edit" | "plan") => void;
   setIsPlanApproved: (v: boolean) => void;
@@ -1014,6 +1031,8 @@ const defaultNormalizedStreamState: NormalizedStreamState = {
   finishReason: null,
 };
 
+const PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS = 50;
+
 const defaultHookDefinitions: HookDefinition[] = [];
 
 function createDefaultCurrentTurnState() {
@@ -1090,6 +1109,28 @@ function normalizeStoredRightPanelTab(value: unknown): RightPanelTab {
   return value === "diff" || value === "terminal" ? value : "plan";
 }
 
+function normalizeStoredPlanExecutionProgressSnapshot(value: unknown): PlanExecutionProgressSnapshot | null {
+  const snapshot = value as Partial<PlanExecutionProgressSnapshot> | null | undefined;
+  if (!snapshot || typeof snapshot !== "object") return null;
+  const turnId = typeof snapshot.turnId === "string" ? snapshot.turnId : "";
+  if (!turnId) return null;
+  return normalizePlanExecutionProgressSnapshot({
+    turnId,
+    update: {
+      phase: snapshot.phase || "running",
+      currentTask: String(snapshot.currentTask || ""),
+      currentTool: String(snapshot.currentTool || ""),
+      latestEvidence: String(snapshot.latestEvidence || ""),
+      nextStep: String(snapshot.nextStep || ""),
+      iteration: Math.max(0, Number(snapshot.iteration) || 0),
+      maxIterations: Math.max(0, Number(snapshot.maxIterations) || 0),
+      autoResumeCount: Math.max(0, Number(snapshot.autoResumeCount) || 0),
+      updatedAt: Math.max(0, Number(snapshot.updatedAt) || 0),
+    },
+    now: Number(snapshot.updatedAt) || Date.now(),
+  });
+}
+
 function normalizeSessionRuntimeSnapshot(
   snapshot: Partial<SessionRuntimeSnapshot> | null | undefined,
 ): SessionRuntimeSnapshot | undefined {
@@ -1114,6 +1155,8 @@ function normalizeSessionRuntimeSnapshot(
     planTasks: snapshot.planTasks || [],
     planExecutionEvidenceLedger: snapshot.planExecutionEvidenceLedger || [],
     planExecutionEvidenceCount: snapshot.planExecutionEvidenceCount ?? 0,
+    planAutoResumeCount: Math.max(0, Number(snapshot.planAutoResumeCount) || 0),
+    planExecutionProgressSnapshot: normalizeStoredPlanExecutionProgressSnapshot(snapshot.planExecutionProgressSnapshot),
     planStage: snapshot.planStage ?? "idle",
     isPlanApproved: snapshot.isPlanApproved ?? false,
     planApprovalChoice: normalizePlanApprovalChoice(snapshot.planApprovalChoice),
@@ -1140,6 +1183,8 @@ const sessionRuntimeKeys = [
   "planTasks",
   "planExecutionEvidenceLedger",
   "planExecutionEvidenceCount",
+  "planAutoResumeCount",
+  "planExecutionProgressSnapshot",
   "planStage",
   "isPlanApproved",
   "planApprovalChoice",
@@ -1211,6 +1256,8 @@ function createSessionRuntimeFromState(state: Partial<AppState>): SessionRuntime
     planTasks: state.planTasks || [],
     planExecutionEvidenceLedger: state.planExecutionEvidenceLedger || [],
     planExecutionEvidenceCount: state.planExecutionEvidenceCount ?? 0,
+    planAutoResumeCount: Math.max(0, Number(state.planAutoResumeCount) || 0),
+    planExecutionProgressSnapshot: normalizeStoredPlanExecutionProgressSnapshot(state.planExecutionProgressSnapshot),
     planStage: state.planStage ?? "idle",
     isPlanApproved: state.isPlanApproved === true,
     planApprovalChoice: normalizePlanApprovalChoice(state.planApprovalChoice),
@@ -1931,6 +1978,9 @@ export function sanitizeTaskBlocksForPersist(blocks: TaskBlock[]): TaskBlock[] {
           content: String(b.content),
           ...(b.icon ? { icon: String(b.icon) } : {}),
           ...(b.variant ? { variant: b.variant } : {}),
+          ...(b.planExecutionProgress
+            ? { planExecutionProgress: normalizeStoredPlanExecutionProgressSnapshot(b.planExecutionProgress) || undefined }
+            : {}),
           ...(b.contextCompression
             ? (() => {
                 const compressedContext = trimPersistedContextCompression(b.contextCompression?.compressedContext);
@@ -3401,6 +3451,8 @@ export const useAppStore = create<AppState>()(
         planTasks: [],
         planExecutionEvidenceLedger: [],
         planExecutionEvidenceCount: 0,
+        planAutoResumeCount: 0,
+        planExecutionProgressSnapshot: null,
         planStage: "idle",
         planApprovalChoice: null,
         normalizedStreamState: defaultNormalizedStreamState,
@@ -3456,6 +3508,8 @@ export const useAppStore = create<AppState>()(
       planTasks: [],
       planExecutionEvidenceLedger: [],
       planExecutionEvidenceCount: 0,
+      planAutoResumeCount: 0,
+      planExecutionProgressSnapshot: null,
       planStage: "idle",
       planApprovalChoice: null,
       normalizedStreamState: defaultNormalizedStreamState,
@@ -3471,6 +3525,8 @@ export const useAppStore = create<AppState>()(
   planTasks: [],
   planExecutionEvidenceLedger: [],
   planExecutionEvidenceCount: 0,
+  planAutoResumeCount: 0,
+  planExecutionProgressSnapshot: null,
   normalizedStreamState: defaultNormalizedStreamState,
   setWorkflowMode: (mode) => set((s) => ({
     config: { ...s.config, workflowMode: mode },
@@ -3559,6 +3615,8 @@ export const useAppStore = create<AppState>()(
       planTasks: [],
       planExecutionEvidenceLedger: [],
       planExecutionEvidenceCount: 0,
+      planAutoResumeCount: 0,
+      planExecutionProgressSnapshot: null,
       normalizedStreamState: defaultNormalizedStreamState,
       planApprovalChoice: null,
       showPlanPanel: false,
@@ -3577,7 +3635,7 @@ export const useAppStore = create<AppState>()(
     } finally {
       invalidateWorkspaceTreeCache();
       get().clearPlanArtifacts();
-      set({ isPlanApproved: false, planApprovalChoice: null, planExecutionEvidenceLedger: [], planExecutionEvidenceCount: 0 });
+      set({ isPlanApproved: false, planApprovalChoice: null, planExecutionEvidenceLedger: [], planExecutionEvidenceCount: 0, planAutoResumeCount: 0, planExecutionProgressSnapshot: null });
       get().bumpWorkspaceContentVersion();
     }
   },
@@ -3599,6 +3657,22 @@ export const useAppStore = create<AppState>()(
       const normalizedApprovalChoice = normalizePlanApprovalChoice(approvalChoice);
       const approvalChoicePatch = { planApprovalChoice: normalizedApprovalChoice || null };
       const approvedTurnId = state.currentTurnId;
+      const initialProgressSnapshot = approvedTurnId
+        ? normalizePlanExecutionProgressSnapshot({
+            turnId: approvedTurnId,
+            update: buildPlanExecutionProgressUpdate({
+              language: state.config.language === "en" ? "en" : "zh",
+              phase: "starting",
+              iterationCount: 0,
+              maxIterations: PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS,
+              autoResumeCount: 0,
+              tasks: state.planTasks,
+              evidenceLedger: [],
+              recentToolActivity: [],
+            }),
+            now: Date.now(),
+          })
+        : null;
       const executionConsentPatch = {
         currentTurnExecutionConsent: {
           turnId: approvedTurnId,
@@ -3613,6 +3687,8 @@ export const useAppStore = create<AppState>()(
           ...executionConsentPatch,
           planExecutionEvidenceLedger: [],
           planExecutionEvidenceCount: 0,
+          planAutoResumeCount: 0,
+          planExecutionProgressSnapshot: initialProgressSnapshot,
           agentStatus: "running",
           isGenerating: true,
           planStage: "executing",
@@ -3633,6 +3709,8 @@ export const useAppStore = create<AppState>()(
         ...executionConsentPatch,
         planExecutionEvidenceLedger: [],
         planExecutionEvidenceCount: 0,
+        planAutoResumeCount: 0,
+        planExecutionProgressSnapshot: initialProgressSnapshot,
         planStage: "executing",
         showPlanPanel: true,
         showDiff: false,
@@ -3687,6 +3765,8 @@ export const useAppStore = create<AppState>()(
       planApprovalChoice: null,
       planExecutionEvidenceLedger: [],
       planExecutionEvidenceCount: 0,
+      planAutoResumeCount: 0,
+      planExecutionProgressSnapshot: null,
       agentStatus: "idle",
       isGenerating: false,
       abortController: null,
@@ -3840,6 +3920,8 @@ export const useAppStore = create<AppState>()(
       planTasks: [],
       planExecutionEvidenceLedger: [],
       planExecutionEvidenceCount: 0,
+      planAutoResumeCount: 0,
+      planExecutionProgressSnapshot: null,
       planStage: "idle",
       normalizedStreamState: defaultNormalizedStreamState,
       resolvedInstructionSet: null,
@@ -4119,6 +4201,10 @@ export const useAppStore = create<AppState>()(
             preservePlanState: true,
             resolvedIntent: "plan",
             skipIntentResolution: true,
+            turnTitle: preferredLanguage === "zh" ? "计划执行恢复" : "Plan Execution Resume",
+            intentSummary: preferredLanguage === "zh"
+              ? "从已批准计划的剩余任务继续执行。"
+              : "Resume execution from the remaining tasks in the approved plan.",
           },
         );
         return true;
@@ -4240,6 +4326,8 @@ export const useAppStore = create<AppState>()(
         planApprovalChoice: null,
         planExecutionEvidenceLedger: [],
         planExecutionEvidenceCount: 0,
+        planAutoResumeCount: 0,
+        planExecutionProgressSnapshot: null,
         normalizedStreamState: defaultNormalizedStreamState,
         planArtifacts: [],
         planTasks: [],
@@ -4618,6 +4706,8 @@ export const useAppStore = create<AppState>()(
             planTasks: sessionGet().planTasks,
             planExecutionEvidenceLedger: sessionGet().planExecutionEvidenceLedger,
             planExecutionEvidenceCount: sessionGet().planExecutionEvidenceCount,
+            planAutoResumeCount: sessionGet().planAutoResumeCount,
+            planExecutionProgressSnapshot: sessionGet().planExecutionProgressSnapshot,
             planStage: sessionGet().planStage,
             isPlanApproved: sessionGet().isPlanApproved,
             showPlanPanel: sessionGet().showPlanPanel,
@@ -4731,10 +4821,10 @@ export const useAppStore = create<AppState>()(
                   ],
             };
         })()
-        : reuseCurrentTurn
-        ? {
-            taskFlow: shouldArchiveChoiceFeedback
-              ? s.taskFlow.map((block) =>
+	        : reuseCurrentTurn
+	        ? {
+	            taskFlow: shouldArchiveChoiceFeedback
+	              ? s.taskFlow.map((block) =>
                   block.turnId === turnId &&
                   block.type === "agent" &&
                   Array.isArray(block.options) &&
@@ -4757,10 +4847,27 @@ export const useAppStore = create<AppState>()(
                     intentSummary: turn.intentSummary || effectiveIntentSummary,
                     mode: effectiveWorkflowMode,
                   }
-                : turn
-            ),
-          }
-        : {}),
+	                : turn
+	            ),
+	          }
+	        : {
+	            conversationTurns: [
+	              ...s.conversationTurns,
+	              {
+	                id: turnId,
+	                userPrompt: text,
+	                title: turnTitle,
+	                intentSummary: effectiveIntentSummary,
+	                mode: effectiveWorkflowMode,
+	                intent: effectiveRunIntent,
+	                status: initialTurnStatus,
+	                summary: "",
+	                blockIds: [],
+	                collapsed: false,
+	                createdAt: Date.now(),
+	              },
+	            ],
+	          }),
       currentTurnId: turnId,
       input: isHidden ? s.input : "",
       preferredResponseLanguage: preferredLanguage,
@@ -4779,6 +4886,7 @@ export const useAppStore = create<AppState>()(
       isGenerating: true,
       config: { ...s.config, workflowMode: effectiveWorkflowMode },
       ...(preservePlanState ? {} : { isPlanApproved: false, planApprovalChoice: null }),
+      ...(preservePlanState ? {} : { planAutoResumeCount: 0, planExecutionProgressSnapshot: null }),
       elapsedTime: 0,
     }));
 
@@ -5413,6 +5521,79 @@ export const useAppStore = create<AppState>()(
         elapsedMs: Math.round(nowMs() - workspaceTreeStartedAt),
       });
 
+      const writePlanExecutionProgress = (progress: PlanExecutionProgressUpdate) => {
+        const snapshot = normalizePlanExecutionProgressSnapshot({
+          turnId,
+          update: progress,
+          previous: sessionGet().planExecutionProgressSnapshot,
+          now: Date.now(),
+        });
+        const language = sessionGet().preferredResponseLanguage || sessionGet().config.language;
+        const content = formatPlanExecutionProgressSnapshot(snapshot, language === "en" ? "en" : "zh").trim();
+        if (!content) return;
+        sessionSet((s) => {
+          const existingIndex = s.taskFlow.findIndex((block) =>
+            block.turnId === turnId &&
+            block.type === "system" &&
+            block.variant === "plan_execution_progress"
+          );
+          if (existingIndex >= 0) {
+            const nextFlow = [...s.taskFlow];
+            nextFlow[existingIndex] = {
+              ...nextFlow[existingIndex],
+              content,
+              planExecutionProgress: snapshot,
+            } as TaskBlock;
+            return {
+              taskFlow: nextFlow,
+              planExecutionProgressSnapshot: snapshot,
+            };
+          }
+
+          const blockId = nextId();
+          const block: TaskBlock = {
+            id: blockId,
+            turnId,
+            type: "system",
+            content,
+            variant: "plan_execution_progress",
+            planExecutionProgress: snapshot,
+          };
+          return {
+            taskFlow: [...s.taskFlow, block],
+            planExecutionProgressSnapshot: snapshot,
+            conversationTurns: s.conversationTurns.map((turn) =>
+              turn.id === turnId && !turn.blockIds.includes(blockId)
+                ? { ...turn, blockIds: [...turn.blockIds, blockId] }
+                : turn
+            ),
+          };
+        });
+      };
+
+      const emitLocalPlanExecutionProgress = (
+        phase: PlanExecutionProgressUpdate["phase"],
+        overrides: Partial<PlanExecutionProgressUpdate> = {},
+      ) => {
+        const latest = sessionGet();
+        if (effectiveRunIntent !== "plan" || !latest.isPlanApproved) return;
+        const language = latest.preferredResponseLanguage || latest.config.language;
+        const previous = latest.planExecutionProgressSnapshot;
+        writePlanExecutionProgress({
+          ...buildPlanExecutionProgressUpdate({
+            language: language === "en" ? "en" : "zh",
+            phase,
+            iterationCount: previous?.iteration ?? 0,
+            maxIterations: previous?.maxIterations || PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS,
+            autoResumeCount: latest.planAutoResumeCount,
+            tasks: latest.planTasks,
+            evidenceLedger: latest.planExecutionEvidenceLedger,
+            recentToolActivity: [],
+          }),
+          ...overrides,
+        });
+      };
+
       const callbacks: OrchestratorCallbacks = {
         getMessages: () => sessionGet().agentMessages,
         getConfig: () => ({ ...sessionGet().config, workspace: runWorkspace }),
@@ -5443,6 +5624,7 @@ export const useAppStore = create<AppState>()(
         getPlanStage: () => sessionGet().planStage,
         getPlanTasks: () => sessionGet().planTasks,
         getPlanExecutionEvidenceLedger: () => sessionGet().planExecutionEvidenceLedger,
+        getPlanAutoResumeCount: () => sessionGet().planAutoResumeCount,
         getStatus: () => sessionGet().agentStatus,
         startNewTurn: () => sessionGet().startNewTurn(),
 
@@ -5810,6 +5992,13 @@ export const useAppStore = create<AppState>()(
               ),
             }));
           }
+
+          emitLocalPlanExecutionProgress("tool_start", {
+            currentTool: `${toolName}${target ? ` ${target}` : ""}`,
+            nextStep: sessionGet().config.language === "en"
+              ? "wait for this tool result, then update evidence"
+              : "等待该工具返回结果，然后更新执行证据",
+          });
         },
 
         onToolDone: (toolName, target, result) => {
@@ -5871,6 +6060,12 @@ export const useAppStore = create<AppState>()(
                 : {}),
             };
           });
+          emitLocalPlanExecutionProgress("tool_done", {
+            currentTool: `${toolName}${target ? ` ${target}` : ""}`,
+            nextStep: sessionGet().config.language === "en"
+              ? "continue with the next task whose evidence is not satisfied"
+              : "继续下一个证据未满足的任务",
+          });
           if (
             toolName === "write_file" ||
             toolName === "replace_in_file" ||
@@ -5896,6 +6091,12 @@ export const useAppStore = create<AppState>()(
             const updated = [...s.taskFlow];
             updated[idx] = { ...updated[idx], toolStatus: "failed" as const, status: "error" as const, message: error } as TaskBlock;
             return { taskFlow: updated };
+          });
+          emitLocalPlanExecutionProgress("tool_error", {
+            currentTool: `${toolName}${target ? ` ${target}` : ""}`,
+            nextStep: sessionGet().config.language === "en"
+              ? "recover from the tool error or pause with recovery details"
+              : "根据工具错误修正下一步，必要时给出恢复信息",
           });
           if (toolName === "execute_command") {
             invalidateWorkspaceTreeCache();
@@ -5948,6 +6149,11 @@ export const useAppStore = create<AppState>()(
                 planStage: state.planStage,
               });
               state.openRightPanelTab("plan");
+              emitLocalPlanExecutionProgress("waiting_review", {
+                nextStep: state.config.language === "en"
+                  ? "wait for approval of the pending tool call"
+                  : "等待当前工具调用审批",
+              });
             }
           }
           if (turnId) {
@@ -6059,12 +6265,21 @@ export const useAppStore = create<AppState>()(
             message: friendlyError,
           };
           appendTurnBlock(block);
+          emitLocalPlanExecutionProgress("context_compression", {
+            nextStep: sessionGet().config.language === "en"
+              ? "continue with compacted context and reread current files if needed"
+              : "基于压缩后的上下文继续，必要时重新读取当前文件",
+          });
         },
 
         onNonActionableStop: (message, reason) => {
           terminalTurnStatusOverride = reason === "no_output"
             ? "stopped_no_output"
             : "stopped_no_action";
+          const isApprovedExecutionPause =
+            effectiveRunIntent === "plan" &&
+            sessionGet().isPlanApproved &&
+            sessionGet().planStage === "executing";
           logStoreEvent("non_actionable_stop", {
             turnId,
             reason,
@@ -6072,11 +6287,19 @@ export const useAppStore = create<AppState>()(
             taskFlowBlocks: sessionGet().taskFlow.length,
             agentMessages: sessionGet().agentMessages.length,
           });
+          if (isApprovedExecutionPause) {
+            emitLocalPlanExecutionProgress("paused", {
+              nextStep: sessionGet().config.language === "en"
+                ? "resume from the current workspace state"
+                : "基于当前 workspace 状态恢复执行",
+            });
+          }
           const block: TaskBlock = {
             id: nextId(),
             turnId,
             type: "system",
             content: message,
+            ...(isApprovedExecutionPause ? { variant: "plan_execution_checkpoint" as const } : {}),
           };
           appendTurnBlock(block);
           sessionGet().setConversationTurnSummary(turnId, summarizeAssistantText(message));
@@ -6160,6 +6383,131 @@ export const useAppStore = create<AppState>()(
           if (sanitized.trim()) {
             sessionGet().setPlanTasks(extractPlanTasks(sanitized));
           }
+        },
+
+        onPlanExecutionProgress: (progress: PlanExecutionProgressUpdate) => {
+          writePlanExecutionProgress(progress);
+        },
+
+        onPlanMaxIterationsCheckpoint: (checkpoint: PlanMaxIterationsCheckpoint) => {
+          const language = sessionGet().preferredResponseLanguage || sessionGet().config.language;
+          const currentCount = Math.max(0, Number(sessionGet().planAutoResumeCount) || 0);
+          const shouldAutoResume = currentCount < PLAN_MAX_AUTO_RESUME_LIMIT;
+          const effectiveCheckpoint = {
+            ...checkpoint,
+            autoResumeCount: shouldAutoResume ? currentCount + 1 : currentCount,
+          };
+          const notice = shouldAutoResume
+            ? buildPlanMaxIterationsAutoResumeNotice(effectiveCheckpoint, language)
+            : buildPlanMaxIterationsPauseNotice(effectiveCheckpoint, language);
+          const progressSnapshot = normalizePlanExecutionProgressSnapshot({
+            turnId,
+            update: buildPlanExecutionProgressUpdate({
+              language,
+              phase: shouldAutoResume ? "auto_resume" : "paused",
+              iterationCount: effectiveCheckpoint.iterationCount,
+              maxIterations: effectiveCheckpoint.maxIterations,
+              autoResumeCount: effectiveCheckpoint.autoResumeCount,
+              tasks: sessionGet().planTasks,
+              evidenceLedger: sessionGet().planExecutionEvidenceLedger,
+              recentToolActivity: effectiveCheckpoint.recentToolActivity,
+              latestEvidence: effectiveCheckpoint.completedEvidence[0],
+              nextStep: shouldAutoResume
+                ? language === "zh"
+                  ? "自动开启一次隐藏续跑，先重新读取当前 workspace 状态"
+                  : "start one hidden auto-resume and reread current workspace state first"
+                : language === "zh"
+                ? "点击 Resume Execution 后从检查点继续"
+                : "click Resume Execution to continue from checkpoint",
+            }),
+            previous: sessionGet().planExecutionProgressSnapshot,
+            now: Date.now(),
+          });
+          writePlanExecutionProgress(progressSnapshot);
+          const blockId = nextId();
+
+          sessionSet((s) => ({
+            planAutoResumeCount: effectiveCheckpoint.autoResumeCount,
+            planExecutionProgressSnapshot: progressSnapshot,
+            planStage: s.planStage === "completed" ? "completed" : "executing",
+            showPlanPanel: true,
+            showDiff: false,
+            rightPanelTab: "plan",
+            taskFlow: [
+              ...s.taskFlow,
+              {
+                id: blockId,
+                turnId,
+                type: "system",
+                content: notice,
+                variant: "plan_execution_checkpoint",
+              } as TaskBlock,
+            ],
+            conversationTurns: s.conversationTurns.map((turn) =>
+              turn.id === turnId && !turn.blockIds.includes(blockId)
+                ? { ...turn, blockIds: [...turn.blockIds, blockId], status: "stopped_no_action", collapsed: false }
+                : turn
+            ),
+          }));
+          sessionGet().setConversationTurnSummary(turnId, summarizeAssistantText(notice));
+
+          if (!shouldAutoResume) {
+            logStoreEvent("plan_max_iterations_paused", {
+              turnId,
+              sessionKey: runSessionKey,
+              workspace: runWorkspace || null,
+              autoResumeCount: currentCount,
+              maxIterations: checkpoint.maxIterations,
+            });
+            return true;
+          }
+
+          logStoreEvent("plan_max_iterations_auto_resume", {
+            turnId,
+            sessionKey: runSessionKey,
+            workspace: runWorkspace || null,
+            autoResumeCount: effectiveCheckpoint.autoResumeCount,
+            maxIterations: checkpoint.maxIterations,
+          });
+
+          runAfterNextPaint(() => {
+            const latest = get();
+            const latestSessionKey = resolveSessionRuntimeKey(
+              resolveSessionWorkspaceKey(latest.currentWorkspace),
+              latest.currentSessionId,
+            );
+            if (latestSessionKey !== runSessionKey) return;
+            if (latest.isGenerating || latest.agentStatus === "running" || latest.agentStatus === "pending_review") return;
+            if (!latest.isPlanApproved || latest.planStage !== "executing") return;
+
+            const hasTasksArtifact =
+              latest.planArtifacts.some((artifact) => artifact.kind === "tasks") ||
+              latest.planTasks.length > 0;
+            latest.sendMessage(
+              buildPlanMaxIterationsResumePrompt({
+                language,
+                checkpoint: effectiveCheckpoint,
+                hasTasksArtifact,
+                tasks: latest.planTasks,
+                artifacts: latest.planArtifacts,
+                evidenceLedger: latest.planExecutionEvidenceLedger,
+              }),
+              undefined,
+              {
+                hidden: true,
+                reuseCurrentTurn: false,
+                preservePlanState: true,
+                resolvedIntent: "plan",
+                skipIntentResolution: true,
+                turnTitle: language === "zh" ? "计划执行自动恢复" : "Plan Execution Auto-Resume",
+                intentSummary: language === "zh"
+                  ? "计划执行达到安全轮次边界后自动恢复一次。"
+                  : "Auto-resume once after the plan execution safety boundary.",
+              },
+            );
+          });
+
+          return true;
         },
 
         onTurnSummaryReady: (summary) => {
@@ -6449,6 +6797,8 @@ export const useAppStore = create<AppState>()(
               planTasks: s.planTasks,
               planExecutionEvidenceLedger: s.planExecutionEvidenceLedger,
               planExecutionEvidenceCount: s.planExecutionEvidenceCount,
+              planAutoResumeCount: s.planAutoResumeCount,
+              planExecutionProgressSnapshot: s.planExecutionProgressSnapshot,
               planStage: s.planStage,
               isPlanApproved: s.isPlanApproved,
               showPlanPanel: s.showPlanPanel,
@@ -6530,6 +6880,8 @@ export const useAppStore = create<AppState>()(
         planTasks: state.planTasks,
         planExecutionEvidenceLedger: state.planExecutionEvidenceLedger,
         planExecutionEvidenceCount: state.planExecutionEvidenceCount,
+        planAutoResumeCount: state.planAutoResumeCount,
+        planExecutionProgressSnapshot: state.planExecutionProgressSnapshot,
         planStage: state.planStage,
         isPlanApproved: state.isPlanApproved,
         showPlanPanel: state.showPlanPanel,

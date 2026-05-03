@@ -36,6 +36,18 @@ export type PlanStage =
 export type PlanTaskStatus = "pending" | "in_progress" | "completed";
 export type PlanTaskEvidenceKind = "file" | "cmd" | "deliverable" | "tool" | "text";
 export type PlanTaskEvidenceStatus = "missing" | "partial" | "satisfied";
+export type PlanExecutionProgressPhase =
+  | "starting"
+  | "running"
+  | "tool_start"
+  | "tool_done"
+  | "tool_error"
+  | "waiting_review"
+  | "context_compression"
+  | "checkpoint"
+  | "auto_resume"
+  | "paused"
+  | "completed";
 
 export interface PlanTaskEvidence {
   kind: PlanTaskEvidenceKind;
@@ -51,6 +63,24 @@ export interface PlanExecutionEvidenceEntry {
   target?: string;
   createdAt: number;
 }
+
+export interface PlanExecutionProgressSnapshot {
+  turnId: string;
+  phase: PlanExecutionProgressPhase;
+  currentTask: string;
+  currentTool: string;
+  latestEvidence: string;
+  nextStep: string;
+  iteration: number;
+  maxIterations: number;
+  autoResumeCount: number;
+  updatedAt: number;
+}
+
+export type PlanExecutionProgressUpdate = Omit<PlanExecutionProgressSnapshot, "turnId" | "updatedAt"> & {
+  turnId?: string;
+  updatedAt?: number;
+};
 
 export interface PlanArtifact {
   kind: PlanArtifactKind;
@@ -120,6 +150,14 @@ export interface ConversationTurn {
   blockIds: number[];
   collapsed: boolean;
   createdAt: number;
+}
+
+export function shouldPlanShortcutReplaceTurn(input: {
+  isPlanTurn: boolean;
+  hasCompletePlan: boolean;
+  isPlanExecutionVisible: boolean;
+}): boolean {
+  return input.isPlanTurn && input.hasCompletePlan && !input.isPlanExecutionVisible;
 }
 
 export interface NormalizedToolCall {
