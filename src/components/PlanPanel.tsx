@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
 import MarkdownRenderer from "./MarkdownRenderer";
 import { IconCheck, IconSave } from "./Icons";
-import { extractPlanTasks, isPlanConversationTurn, isPlanTaskTrustedComplete, type ConversationTurn, type PlanArtifact, type PlanStage, type PlanTask } from "../lib/workflowModels";
+import { buildPlanTaskEvidenceAudit, extractPlanTasks, isPlanConversationTurn, isPlanTaskTrustedComplete, type ConversationTurn, type PlanArtifact, type PlanExecutionEvidenceEntry, type PlanStage, type PlanTask } from "../lib/workflowModels";
 
 interface PlanPanelProps {
   artifacts: PlanArtifact[];
   tasks: PlanTask[];
+  evidenceLedger?: PlanExecutionEvidenceEntry[];
   stage: PlanStage;
   isAwaitingApproval: boolean;
   isAwaitingInput?: boolean;
@@ -147,6 +148,7 @@ function getStageTone(stage: PlanStage): string {
 export default function PlanPanel({
   artifacts,
   tasks,
+  evidenceLedger = [],
   stage,
   isAwaitingApproval,
   isAwaitingInput = false,
@@ -192,10 +194,15 @@ export default function PlanPanel({
     () => (tasks.length > 0 ? tasks : previewMarkdown ? extractPlanTasks(previewMarkdown) : []),
     [tasks, previewMarkdown],
   );
-  const doneCount = displayTasks.filter(isPlanTaskTrustedComplete).length;
-  const progressPct = displayTasks.length > 0 ? Math.round((doneCount / displayTasks.length) * 100) : 0;
+  const taskAudit = useMemo(
+    () => buildPlanTaskEvidenceAudit({ tasks: displayTasks, evidenceLedger }),
+    [displayTasks, evidenceLedger],
+  );
+  const auditedTasks = taskAudit.tasks;
+  const doneCount = taskAudit.completedCount;
+  const progressPct = taskAudit.totalCount > 0 ? Math.round((doneCount / taskAudit.totalCount) * 100) : 0;
   const activeTurn = [...turns].reverse().find((turn) => isPlanConversationTurn(turn)) || turns[turns.length - 1];
-  const showTaskProgress = !hideIslandOwnedSections && (isApproved || stage === "executing" || stage === "completed") && displayTasks.length > 0;
+  const showTaskProgress = !hideIslandOwnedSections && (isApproved || stage === "executing" || stage === "completed") && auditedTasks.length > 0;
   const stageLabel = isAwaitingApproval
     ? copy.pendingApproval
     : isAwaitingInput
@@ -304,7 +311,7 @@ export default function PlanPanel({
           <div data-testid="plan-task-progress" className="mt-4 rounded-xl border border-[#1f1f23] bg-[#0d0d11] p-3">
             <div className="flex items-center justify-between text-[11px] text-[#a1a1aa]">
               <span>{copy.taskProgress}</span>
-              <span>{doneCount}/{displayTasks.length}</span>
+              <span>{doneCount}/{taskAudit.totalCount}</span>
             </div>
             <div className="mt-2 h-2 overflow-hidden rounded-full bg-[#18181b]">
               <div
@@ -313,7 +320,7 @@ export default function PlanPanel({
               />
             </div>
             <div className="mt-3 space-y-2">
-              {displayTasks.map((task) => (
+              {auditedTasks.map((task) => (
                 <div key={task.id} className="flex items-start gap-2 rounded-lg border border-[#18181b] bg-[#09090b] px-3 py-2">
                   <span
                     className={`mt-[2px] h-4 w-4 shrink-0 rounded-full border flex items-center justify-center ${

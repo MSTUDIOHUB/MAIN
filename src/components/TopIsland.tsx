@@ -1,7 +1,7 @@
 import { memo, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { IconColumns, IconFileText, IconLock, IconUnlock } from "./Icons";
 import type { TurnProgressItem } from "../lib/turnProgress";
-import { isPlanTaskTrustedComplete, type PlanStage, type PlanTask, type ReplyOption } from "../lib/workflowModels";
+import { buildPlanTaskEvidenceAudit, type PlanExecutionEvidenceEntry, type PlanStage, type PlanTask, type ReplyOption } from "../lib/workflowModels";
 import type { PendingRunDecision, ResolvedUserIntent } from "../lib/runIntent";
 import MarkdownRenderer from "./MarkdownRenderer";
 
@@ -14,6 +14,7 @@ interface TopIslandProps {
   themeMode: "light" | "dark";
   isVisible?: boolean;
   planTasks: PlanTask[];
+  planExecutionEvidenceLedger?: PlanExecutionEvidenceEntry[];
   planStage: PlanStage;
   executionSteps?: TurnProgressItem[];
   progressMode?: "plan" | "execution";
@@ -70,6 +71,7 @@ const TopIsland = memo(function TopIsland({
   themeMode,
   isVisible = true,
   planTasks,
+  planExecutionEvidenceLedger = [],
   planStage,
   executionSteps = [],
   progressMode,
@@ -118,13 +120,18 @@ const TopIsland = memo(function TopIsland({
     !hasPendingRunDecision &&
     !activeDiffTask;
   const activeProgressMode = planTasks.length > 0 ? "plan" : progressMode === "execution" ? "execution" : executionSteps.length > 0 ? "execution" : "plan";
+  const planTaskAudit = useMemo(
+    () => buildPlanTaskEvidenceAudit({ tasks: planTasks, evidenceLedger: planExecutionEvidenceLedger }),
+    [planExecutionEvidenceLedger, planTasks],
+  );
+  const auditedPlanTasks = planTaskAudit.tasks;
   const progressItems = useMemo(() => {
     if (activeProgressMode === "plan") {
-      return planTasks.map((task) => ({
+      return auditedPlanTasks.map((task) => ({
         id: task.id,
         text: task.text,
         status: task.status,
-        complete: isPlanTaskTrustedComplete(task),
+        complete: task.evidenceStatus === "satisfied" && task.status === "completed",
       }));
     }
 
@@ -134,7 +141,7 @@ const TopIsland = memo(function TopIsland({
       status: step.status,
       complete: step.status === "completed",
     }));
-  }, [activeProgressMode, executionSteps, planTasks]);
+  }, [activeProgressMode, auditedPlanTasks, executionSteps]);
   const hasTasks = progressItems.length > 0;
   const shouldExpandWidth = forceExpanded || (hasExpandableContent && (hovered || pinnedOpen));
   const isExpanded = forceExpanded || (hasExpandableContent && (hovered || pinnedOpen));
@@ -143,11 +150,11 @@ const TopIsland = memo(function TopIsland({
   const progress = progressItems.length > 0 ? Math.round((completedCount / progressItems.length) * 100) : 0;
   const currentPhaseKey = useMemo(() => {
     if (activeProgressMode !== "plan") return null;
-    const firstIncomplete = planTasks.find((task) => !isPlanTaskTrustedComplete(task)) || planTasks[planTasks.length - 1];
+    const firstIncomplete = auditedPlanTasks.find((task) => !(task.evidenceStatus === "satisfied" && task.status === "completed")) || auditedPlanTasks[auditedPlanTasks.length - 1];
     if (!firstIncomplete) return null;
     const matched = firstIncomplete.text.match(/(?:Task|T)\s*([0-9]+)(?:[.\-][0-9]+)?/i);
     return matched?.[1] || null;
-  }, [activeProgressMode, planTasks]);
+  }, [activeProgressMode, auditedPlanTasks]);
   const visibleTasks = useMemo(() => {
     if (activeProgressMode !== "plan" || !currentPhaseKey) return progressItems;
     const grouped = progressItems.filter((task) => {

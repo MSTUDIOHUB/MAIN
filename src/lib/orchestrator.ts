@@ -42,6 +42,7 @@ import { buildToolDiffPreview, type ToolDiffPreview } from "./toolDiff";
 import { syncPlanArtifactAfterToolSuccess } from "./planArtifactSync";
 import type { AppConfig, Skill } from "../store/useAppStore";
 import {
+  buildPlanTaskEvidenceAudit,
   detectPlanArtifactKind,
   extractPlanTasks,
   findDroppedPlanTasks,
@@ -51,6 +52,7 @@ import {
   type PlanExecutionEvidenceEntry,
   type PlanExecutionProgressPhase,
   type PlanExecutionProgressUpdate,
+  type PlanTaskEvidenceAudit,
   type PlanTask,
   type ReplyOption,
 } from "./workflowModels";
@@ -458,17 +460,53 @@ function buildNonActionableStopMessage(language: "zh" | "en", reason: "no_output
   }
 }
 
+function looksLikePlanCompletionClaim(text: string): boolean {
+  const normalized = String(text || "").replace(/\s+/g, " ").trim();
+  if (!normalized) return false;
+  return (
+    /(?:全部|所有|全[部都]?|已|已经).{0,24}(?:完成|满足|通过)|(?:任务|证据).{0,16}(?:全部|全都).{0,16}(?:完成|满足|通过)|\b\d+\s*\/\s*\d+\b.{0,24}(?:完成|complete|completed|done|satisfied|passed)/i.test(normalized) ||
+    /(?:all|every).{0,40}(?:task|evidence|item).{0,40}(?:complete|completed|done|satisfied|passed)|(?:complete|completed|done|satisfied).{0,40}(?:all|every).{0,40}(?:task|evidence|item)/i.test(normalized)
+  );
+}
+
+function formatPlanAuditRemainingTasks(
+  audit: PlanTaskEvidenceAudit,
+  language: "zh" | "en",
+  fallback: string,
+  limit = 8,
+): string {
+  const lines = audit.remainingTasks.slice(0, limit).map((task, index) => {
+    const evidence = task.evidence?.map((item) => `${item.kind}:${item.value}`).join(", ") ||
+      (language === "zh" ? "缺少证据标签" : "missing evidence label");
+    const status = task.evidenceStatus || task.status || "missing";
+    const reason = task.blockedReason || (language === "zh" ? "证据未满足" : "evidence is not satisfied");
+    return `- ${index + 1}. ${task.text} [${status}; ${evidence}] - ${reason}`;
+  });
+  return lines.length > 0 ? lines.join("\n") : fallback;
+}
+
 function buildApprovedPlanNoToolPauseMessage(
   language: "zh" | "en",
   remainingText: string,
   consecutiveNoToolCount: number,
+  audit?: PlanTaskEvidenceAudit,
+  completionClaimRejected = false,
 ): string {
+  const auditLine = audit && audit.totalCount > 0
+    ? language === "zh"
+      ? `可信审计进度：${audit.completedCount}/${audit.totalCount}`
+      : `Trusted audit progress: ${audit.completedCount}/${audit.totalCount}`
+    : "";
+
   return language === "zh"
     ? [
-        "计划执行已暂停",
+        completionClaimRejected ? "完成声明未验证" : "计划执行已暂停",
         "",
-        `原因：模型连续 ${consecutiveNoToolCount} 次提前停止，返回了正文但没有继续调用工具；tasks.md 仍有证据未满足的任务。`,
+        completionClaimRejected
+          ? `原因：模型声称计划已完成，但可信任务审计没有通过；模型正文不会被当作完成证据。`
+          : `原因：模型连续 ${consecutiveNoToolCount} 次提前停止，返回了正文但没有继续调用工具；tasks.md 仍有证据未满足的任务。`,
         "已保留当前 workspace、工具结果和任务证据，不会把这次正文当作完成证据。",
+        ...(auditLine ? [auditLine] : []),
         "",
         "未完成任务：",
         remainingText,
@@ -478,13 +516,17 @@ function buildApprovedPlanNoToolPauseMessage(
         "RecoveryDetails:",
         "- type: remaining_plan_tasks_limit",
         `- noToolStops: ${consecutiveNoToolCount}`,
+        `- completionClaimRejected: ${completionClaimRejected ? "true" : "false"}`,
         "- action: Resume Execution",
       ].join("\n")
     : [
-        "Plan execution paused",
+        completionClaimRejected ? "Completion claim not accepted" : "Plan execution paused",
         "",
-        `Reason: the model stopped early ${consecutiveNoToolCount} time(s), returned prose, and did not continue with tool calls while tasks.md still has unsatisfied evidence.`,
+        completionClaimRejected
+          ? "Reason: the model claimed the plan was complete, but the trusted task audit did not pass. Assistant prose is not completion evidence."
+          : `Reason: the model stopped early ${consecutiveNoToolCount} time(s), returned prose, and did not continue with tool calls while tasks.md still has unsatisfied evidence.`,
         "MAIN preserved the current workspace, tool results, and evidence ledger. This prose is not treated as completion evidence.",
+        ...(auditLine ? [auditLine] : []),
         "",
         "Remaining tasks:",
         remainingText,
@@ -494,6 +536,7 @@ function buildApprovedPlanNoToolPauseMessage(
         "RecoveryDetails:",
         "- type: remaining_plan_tasks_limit",
         `- noToolStops: ${consecutiveNoToolCount}`,
+        `- completionClaimRejected: ${completionClaimRejected ? "true" : "false"}`,
         "- action: Resume Execution",
       ].join("\n");
 }
@@ -770,8 +813,8 @@ function buildApprovedPlanContinuationPrompt(callbacks: OrchestratorCallbacks): 
   return (
     approvalChoiceHint +
     (language === "zh"
-      ? "计划已批准，现在进入执行阶段（EXECUTION MODE）。请按以下顺序继续：\n1. 先基于已批准的 requirements/design 或 bugfix 生成 `.MAIN/plans/tasks.md`，把执行任务拆清楚；tasks.md 必须精简为 8-20 个 checkbox，每项一句话。\n2. 生成 tasks.md 后，TopIsland 会显示任务进度；之后再按 tasks.md 逐个执行，使用 <tool_use> 格式调用工具。\n3. 任何需要 shell 的任务都必须在 tasks.md checkbox 中写出精确命令，并用反引号包裹；进入执行后，一次性命令优先用 run_command 并检查 exitCode/stdout/stderr；长驻或交互式命令用 execute_command 后再用 read_pty_since/read_pty_tail/get_pty_status 验证结果。\n4. 你可以正常修改项目源码文件，写入路径必须是项目中的正确位置，绝对不要将源码写入 `.MAIN/plans/` 或任何隐藏目录。\n5. 每完成一个任务后，先同步更新 `.MAIN/plans/tasks.md` 中对应的 checkbox 状态；tasks.md 是审计记录，不能删除已完成或旧任务，只能勾选、追加或保留“已完成任务”区块。只有全部任务都标记为 `[x]` 后，才能结束执行。\n"
-      : "The plan is approved. You are now in EXECUTION MODE. Continue in this order:\n1. First generate `.MAIN/plans/tasks.md` from the approved requirements/design or bugfix so the execution steps are explicit. Keep tasks.md concise: 8-20 checkboxes, one sentence each.\n2. After tasks.md is generated, follow it task by task using tool calls.\n3. Any task that needs shell work must include the exact command inside the tasks.md checkbox text using backticks. During execution, prefer run_command for finite commands and inspect exitCode/stdout/stderr; use execute_command for long-running or interactive commands, then verify with read_pty_since/read_pty_tail/get_pty_status.\n4. You may now edit project source files, but write them to the proper project paths and never into `.MAIN/plans/` or hidden folders.\n5. After each task, update the matching checkbox in `.MAIN/plans/tasks.md` before moving on; tasks.md is an audit record, so never delete completed or previous tasks. Only check items off, append tasks, or keep a completed-tasks section. Only stop when all tasks are `[x]`.\n") +
+      ? "计划已批准，现在进入执行阶段（EXECUTION MODE）。请按以下顺序继续：\n1. 先基于已批准的 requirements/design 或 bugfix 生成 `.MAIN/plans/tasks.md`，把执行任务拆清楚；tasks.md 必须精简为 8-20 个 checkbox，每项一句话，并且每项都要带显式证据标签，例如 `— 证据: file:src/App.tsx`、`— 证据: cmd:npx tsc --noEmit` 或 `— 证据: deliverable:PLAN.md`。\n2. 生成 tasks.md 后，TopIsland 会显示任务进度；之后再按 tasks.md 逐个执行，使用 <tool_use> 格式调用工具。\n3. 任何需要 shell 的任务都必须在 tasks.md checkbox 中写出精确命令，并用反引号包裹；进入执行后，一次性命令优先用 run_command 并检查 exitCode/stdout/stderr；长驻或交互式命令用 execute_command 后再用 read_pty_since/read_pty_tail/get_pty_status 验证结果。\n4. 你可以正常修改项目源码文件，写入路径必须是项目中的正确位置，绝对不要将源码写入 `.MAIN/plans/` 或任何隐藏目录。\n5. 每完成一个任务后，先同步更新 `.MAIN/plans/tasks.md` 中对应的 checkbox 状态；tasks.md 是审计记录，不能删除已完成或旧任务，只能勾选、追加或保留“已完成任务”区块。只有全部任务都有真实文件/命令/交付物证据满足后，才能结束执行。\n"
+      : "The plan is approved. You are now in EXECUTION MODE. Continue in this order:\n1. First generate `.MAIN/plans/tasks.md` from the approved requirements/design or bugfix so the execution steps are explicit. Keep tasks.md concise: 8-20 checkboxes, one sentence each, and give every item an explicit evidence label such as `— evidence: file:src/App.tsx`, `— evidence: cmd:npx tsc --noEmit`, or `— evidence: deliverable:PLAN.md`.\n2. After tasks.md is generated, follow it task by task using tool calls.\n3. Any task that needs shell work must include the exact command inside the tasks.md checkbox text using backticks. During execution, prefer run_command for finite commands and inspect exitCode/stdout/stderr; use execute_command for long-running or interactive commands, then verify with read_pty_since/read_pty_tail/get_pty_status.\n4. You may now edit project source files, but write them to the proper project paths and never into `.MAIN/plans/` or hidden folders.\n5. After each task, update the matching checkbox in `.MAIN/plans/tasks.md` before moving on; tasks.md is an audit record, so never delete completed or previous tasks. Only check items off, append tasks, or keep a completed-tasks section. Only stop when every task has satisfied real file/command/deliverable evidence.\n") +
     deliverableHint +
     "\n" +
     buildPlanCommandExecutionHint(callbacks.getPlanTasks(), language)
@@ -2410,13 +2453,53 @@ export async function executeAgentLoop(
       });
     }
 
-    callbacks.onTurnSummaryReady(finalVisibleText);
+    const approvedPlanAuditForNoTool =
+      workflowMode === "plan" &&
+      callbacks.getIsPlanApproved() &&
+      effectiveToolCalls.length === 0
+        ? buildPlanTaskEvidenceAudit({
+            tasks: callbacks.getPlanTasks(),
+            evidenceLedger: callbacks.getPlanExecutionEvidenceLedger(),
+            highlightNext: true,
+          })
+        : null;
+    const approvedPlanMissingTasksForNoTool =
+      workflowMode === "plan" &&
+      callbacks.getIsPlanApproved() &&
+      effectiveToolCalls.length === 0 &&
+      approvedPlanAuditForNoTool?.totalCount === 0;
+    const hasRemainingApprovedPlanTasksForNoTool =
+      workflowMode === "plan" &&
+      callbacks.getIsPlanApproved() &&
+      effectiveToolCalls.length === 0 &&
+      !!approvedPlanAuditForNoTool &&
+      !approvedPlanAuditForNoTool.acceptedCompletion;
+    const shouldSuppressApprovedPlanNoToolText =
+      approvedPlanMissingTasksForNoTool || hasRemainingApprovedPlanTasksForNoTool;
+    const rejectedCompletionClaim =
+      shouldSuppressApprovedPlanNoToolText && looksLikePlanCompletionClaim(finalVisibleText);
+
+    if (shouldSuppressApprovedPlanNoToolText && (finalVisibleText.trim() || finalReplyOptions.length > 0)) {
+      callbacks.onStreamToken("__ESCALATION_RESET__:", assistantMsgId);
+      logAgentEvent(rejectedCompletionClaim ? "plan_completion_claim_rejected" : "plan_no_tool_text_suppressed", {
+        iteration,
+        completionClaimRejected: rejectedCompletionClaim,
+        auditCompleted: approvedPlanAuditForNoTool?.completedCount ?? 0,
+        auditTotal: approvedPlanAuditForNoTool?.totalCount ?? 0,
+        remaining: approvedPlanAuditForNoTool?.remainingTasks.length ?? 0,
+        visibleChars: finalVisibleText.length,
+      });
+    }
+
+    if (!shouldSuppressApprovedPlanNoToolText) {
+      callbacks.onTurnSummaryReady(finalVisibleText);
+    }
 
     if (normalized.hiddenThought) {
       callbacks.onThought(normalized.hiddenThought);
     }
 
-    if (finalVisibleText || finalReplyOptions.length > 0) {
+    if (!shouldSuppressApprovedPlanNoToolText && (finalVisibleText || finalReplyOptions.length > 0)) {
       callbacks.onAssistantFinalText(finalVisibleText, finalReplyOptions);
     }
 
@@ -2478,7 +2561,7 @@ export async function executeAgentLoop(
     });
 
     // 4. Handle turn termination or continuation
-    if (shouldPauseForUserChoice) {
+    if (shouldPauseForUserChoice && !shouldSuppressApprovedPlanNoToolText) {
       logAgentEvent("reply_options_pause", {
         iteration,
         replyOptions: finalReplyOptions.length,
@@ -2738,25 +2821,38 @@ export async function executeAgentLoop(
         }
 
         // No intent detected — genuinely done
-        const approvedPlanTasks = workflowMode === "plan" && callbacks.getIsPlanApproved()
-          ? callbacks.getPlanTasks()
-          : [];
+        const approvedPlanAudit = approvedPlanAuditForNoTool ||
+          (workflowMode === "plan" && callbacks.getIsPlanApproved()
+            ? buildPlanTaskEvidenceAudit({
+                tasks: callbacks.getPlanTasks(),
+                evidenceLedger: callbacks.getPlanExecutionEvidenceLedger(),
+                highlightNext: true,
+              })
+            : null);
+        const approvedPlanTasks = approvedPlanAudit?.tasks || [];
         const approvedPlanMissingTasks =
           workflowMode === "plan" &&
           callbacks.getIsPlanApproved() &&
-          approvedPlanTasks.length === 0;
+          (approvedPlanAudit?.totalCount || 0) === 0;
         const hasRemainingApprovedPlanTasks =
           workflowMode === "plan" &&
           callbacks.getIsPlanApproved() &&
-          approvedPlanTasks.some((task) => !isPlanTaskTrustedComplete(task));
+          !!approvedPlanAudit &&
+          !approvedPlanAudit.acceptedCompletion;
 
         if (approvedPlanMissingTasks || hasRemainingApprovedPlanTasks) {
           callbacks.onStatusChange("running");
           consecutiveNoToolCount++;
-          const remainingTasks = approvedPlanTasks.filter((task) => !isPlanTaskTrustedComplete(task)).slice(0, 3);
-          const remainingText = remainingTasks.length > 0
-            ? remainingTasks.map((task) => `- ${task.text}`).join("\n")
-            : callbacks.getPreferredLanguage() === "zh"
+          const language = callbacks.getPreferredLanguage();
+          const remainingText = approvedPlanAudit
+            ? formatPlanAuditRemainingTasks(
+                approvedPlanAudit,
+                language,
+                language === "zh"
+                  ? "- 先生成 `.MAIN/plans/tasks.md`，再执行源码或交付物写入。"
+                  : "- First generate `.MAIN/plans/tasks.md`, then execute source or deliverable writes.",
+              )
+            : language === "zh"
             ? "- 先生成 `.MAIN/plans/tasks.md`，再执行源码或交付物写入。"
             : "- First generate `.MAIN/plans/tasks.md`, then execute source or deliverable writes.";
           if (consecutiveNoToolCount >= MAX_NO_ACTION_RETRIES) {
@@ -2764,6 +2860,9 @@ export async function executeAgentLoop(
               reason: "remaining_plan_tasks_limit",
               iteration,
               consecutiveNoToolCount,
+              completionClaimRejected: rejectedCompletionClaim,
+              auditCompleted: approvedPlanAudit?.completedCount ?? 0,
+              auditTotal: approvedPlanAudit?.totalCount ?? 0,
             });
             emitPlanExecutionProgress("paused", {
               nextStep: callbacks.getPreferredLanguage() === "zh"
@@ -2775,6 +2874,8 @@ export async function executeAgentLoop(
                 callbacks.getPreferredLanguage(),
                 remainingText,
                 consecutiveNoToolCount,
+                approvedPlanAudit || undefined,
+                rejectedCompletionClaim,
               ),
               "incomplete_plan",
             );
@@ -2782,15 +2883,14 @@ export async function executeAgentLoop(
             return;
           }
 
-          const language = callbacks.getPreferredLanguage();
           callbacks.appendMessage({
             role: "user",
             content:
               (approvedPlanMissingTasks
                 ? buildApprovedPlanContinuationPrompt(callbacks) + "\n\n"
                 : language === "zh"
-                ? "继续执行 tasks.md 中证据未满足的任务。不要重复计划说明，直接根据当前进度继续实现下一个任务；如果需要修改文件，继续使用工具调用。凡是任务里带有 shell 命令的，一次性命令优先用 run_command 并检查 exitCode/stdout/stderr；长驻或交互式命令用 execute_command 后再用 read_pty_since/read_pty_tail/get_pty_status 检查结果。完成当前任务后，必须先产生真实文件/命令/验证证据，再把 `.MAIN/plans/tasks.md` 中对应 checkbox 更新为 `[x]`；不要删除已完成或旧任务记录，只有所有任务证据满足后才能结束。\n下一批优先任务：\n"
-                : "Continue executing tasks whose evidence is not satisfied. Do not restate the plan; just move to the next task based on the current progress. If a task includes shell commands, prefer run_command for finite commands and inspect exitCode/stdout/stderr; use execute_command for long-running or interactive commands, then verify with read_pty_since/read_pty_tail/get_pty_status. After each task, produce real file/command/verification evidence before updating the matching checkbox in `.MAIN/plans/tasks.md`; do not delete completed or previous task records. Only stop when every task has satisfied evidence.\nNext priority tasks:\n") +
+                ? `${rejectedCompletionClaim ? "你刚才的完成声明没有通过可信证据审计；不要再输出完成总结，先继续真实执行。\n" : ""}继续执行 tasks.md 中证据未满足的任务。不要重复计划说明，直接根据当前进度继续实现下一个任务；如果需要修改文件，继续使用工具调用。凡是任务里带有 shell 命令的，一次性命令优先用 run_command 并检查 exitCode/stdout/stderr；长驻或交互式命令用 execute_command 后再用 read_pty_since/read_pty_tail/get_pty_status 检查结果。完成当前任务后，必须先产生真实文件/命令/验证证据，再把 \`.MAIN/plans/tasks.md\` 中对应 checkbox 更新为 \`[x]\`；不要删除已完成或旧任务记录，只有所有任务证据满足后才能结束。\n下一批优先任务：\n`
+                : `${rejectedCompletionClaim ? "Your completion claim did not pass the trusted evidence audit; do not output a final summary yet, continue the real work first.\n" : ""}Continue executing tasks whose evidence is not satisfied. Do not restate the plan; just move to the next task based on the current progress. If a task includes shell commands, prefer run_command for finite commands and inspect exitCode/stdout/stderr; use execute_command for long-running or interactive commands, then verify with read_pty_since/read_pty_tail/get_pty_status. After each task, produce real file/command/verification evidence before updating the matching checkbox in \`.MAIN/plans/tasks.md\`; do not delete completed or previous task records. Only stop when every task has satisfied evidence.\nNext priority tasks:\n`) +
               remainingText +
               "\n\n" +
               buildPlanCommandExecutionHint(approvedPlanTasks, language),

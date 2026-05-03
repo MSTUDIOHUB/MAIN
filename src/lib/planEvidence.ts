@@ -29,6 +29,10 @@ const VERIFICATION_EVIDENCE_TOOLS = new Set([
   "get_pty_status",
 ]);
 
+const WORKSPACE_FILE_REF_RE =
+  /(?:^|[\s`"'(（])((?:\.{1,2}\/|[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,10})(?=$|[\s`"',，。；;:)）])/g;
+const MAX_EVIDENCE_REFERENCES = 20;
+
 export function isPlanArtifactPath(path: string): boolean {
   return path.replace(/\\/g, "/").toLowerCase().includes(".main/plans/");
 }
@@ -66,6 +70,23 @@ export function isPlanEvidenceLedgerTool(toolName: string, target: string): bool
   return isPlanExecutionEvidenceTool(toolName, target) || VERIFICATION_EVIDENCE_TOOLS.has(toolName);
 }
 
+function extractWorkspaceFileReferences(...values: string[]): string[] {
+  const seen = new Set<string>();
+  const references: string[] = [];
+  for (const value of values) {
+    for (const matched of String(value || "").matchAll(WORKSPACE_FILE_REF_RE)) {
+      const candidate = String(matched[1] || "").replace(/\\/g, "/").trim();
+      if (!candidate || isPlanArtifactPath(candidate)) continue;
+      const key = normalizePlanEvidenceValue(candidate);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      references.push(candidate);
+      if (references.length >= MAX_EVIDENCE_REFERENCES) return references;
+    }
+  }
+  return references;
+}
+
 export function createPlanExecutionEvidenceEntry(input: {
   toolName: string;
   target: string;
@@ -82,6 +103,7 @@ export function createPlanExecutionEvidenceEntry(input: {
       kind: "file",
       value: target,
       target,
+      references: extractWorkspaceFileReferences(target),
       sourceTool: input.toolName,
       createdAt: timestamp,
     };
@@ -94,6 +116,7 @@ export function createPlanExecutionEvidenceEntry(input: {
       kind: "cmd",
       value: target,
       target,
+      references: extractWorkspaceFileReferences(target, input.result),
       sourceTool: input.toolName,
       createdAt: timestamp,
     };
@@ -105,6 +128,7 @@ export function createPlanExecutionEvidenceEntry(input: {
       kind: "tool",
       value: target,
       target,
+      references: extractWorkspaceFileReferences(target, input.result),
       sourceTool: input.toolName,
       createdAt: timestamp,
     };

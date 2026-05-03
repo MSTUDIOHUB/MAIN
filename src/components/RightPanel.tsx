@@ -19,7 +19,7 @@ import { getE2EResumeExecutionHandler, getE2ESavePlanDocumentHandler } from "../
 import { extractPlanDraftPreview, extractStructuredPlanProposal, hasPlanDraftPreview, hasStructuredPlanProposal } from "../lib/planProposal";
 import { resolveGlobalChatSessionKey, resolveSessionRuntimeKey, resolveSessionWorkspaceKey, type DiffRevertRequest, type TaskBlock, useAppStore } from "../store/useAppStore";
 import { deleteChatTempPath, exportTextFile, getPtyStatus, onPtyData, readPtyBuffer, resizePty, spawnPty, writePty } from "../lib/ipc";
-import { collectChangeEntries, isPlanConversationTurn, isPlanTaskTrustedComplete, type PlanArtifact, type PlanExecutionEvidenceEntry, type PlanTask } from "../lib/workflowModels";
+import { buildPlanTaskEvidenceAudit, collectChangeEntries, isPlanConversationTurn, type PlanArtifact, type PlanExecutionEvidenceEntry, type PlanTask } from "../lib/workflowModels";
 
 const CODE_FONT_FAMILY = "'JetBrains Mono', 'Fira Code', Menlo, Monaco, 'Courier New', monospace";
 const TERMINAL_FONT_FAMILY = [
@@ -46,7 +46,12 @@ function buildTrustedResumePrompt(input: {
   artifacts: PlanArtifact[];
   evidenceLedger: PlanExecutionEvidenceEntry[];
 }): string {
-  const remainingTasks = input.tasks.filter((task) => !isPlanTaskTrustedComplete(task)).slice(0, 8);
+  const audit = buildPlanTaskEvidenceAudit({
+    tasks: input.tasks,
+    evidenceLedger: input.evidenceLedger,
+    highlightNext: true,
+  });
+  const remainingTasks = audit.remainingTasks.slice(0, 8);
   const evidenceSummary = input.evidenceLedger.slice(-8).map((entry) => {
     const target = entry.target || entry.value;
     return `- ${entry.kind}:${target} (${entry.sourceTool})`;
@@ -916,7 +921,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     planStage === "executing" &&
     (agentStatus === "idle" || agentStatus === "error") &&
     (
-      planTasks.some((task) => !isPlanTaskTrustedComplete(task)) ||
+      !buildPlanTaskEvidenceAudit({ tasks: planTasks, evidenceLedger: planExecutionEvidenceLedger }).acceptedCompletion ||
       !planArtifacts.some((artifact) => artifact.kind === "tasks")
     );
   const handleContinuePlanning = () => {
@@ -1066,6 +1071,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
             <PlanPanel
               artifacts={planArtifacts}
               tasks={planTasks}
+              evidenceLedger={planExecutionEvidenceLedger}
               stage={planStage}
               isAwaitingApproval={isAwaitingApproval}
               isAwaitingInput={isAwaitingInput}

@@ -76,6 +76,7 @@ function loadTranspiledModuleSync(sourcePath) {
 }
 
 const {
+  buildPlanTaskEvidenceAudit,
   collectChangeEntries,
   deriveVisibleConversationTurnStatus,
   extractPlanTasks,
@@ -527,7 +528,7 @@ test("plan evidence records successful commands and deduplicates repeated record
   assert.equal(secondLedger, firstLedger);
 });
 
-test("plan verification reads enter the ledger without satisfying file evidence", () => {
+test("plan verification reads can satisfy explicit file evidence", () => {
   const verification = createPlanExecutionEvidenceEntry({
     toolName: "read_file",
     target: "README.md",
@@ -547,8 +548,71 @@ test("plan verification reads enter the ledger without satisfying file evidence"
   assert.equal(isPlanExecutionEvidenceTool("read_file", "README.md"), false);
   assert.equal(isPlanEvidenceLedgerTool("read_file", "README.md"), true);
   assert.equal(verification?.kind, "tool");
-  assert.equal(isPlanTaskTrustedComplete(fileTask[0]), false);
+  assert.equal(isPlanTaskTrustedComplete(fileTask[0]), true);
   assert.equal(isPlanTaskTrustedComplete(toolTask[0]), true);
+});
+
+test("plan audit rejects completion claims when trusted evidence is incomplete", () => {
+  const parsed = extractPlanTasks([
+    "- [x] 修改 src/App.tsx 空状态 — 证据: file:src/App.tsx",
+    "- [x] 新增 src/lib/e2e.ts 场景 — 证据: file:src/lib/e2e.ts",
+    "- [x] 运行 `npx tsc --noEmit` — 证据: cmd:npx tsc --noEmit",
+  ].join("\n"));
+  const audit = buildPlanTaskEvidenceAudit({
+    tasks: parsed,
+    evidenceLedger: [{
+      id: "evidence-app",
+      kind: "file",
+      value: "src/App.tsx",
+      target: "src/App.tsx",
+      sourceTool: "replace_in_file",
+      createdAt: 1,
+    }],
+    highlightNext: true,
+  });
+
+  assert.equal(audit.completedCount, 1);
+  assert.equal(audit.totalCount, 3);
+  assert.equal(audit.acceptedCompletion, false);
+  assert.equal(audit.remainingTasks.length, 2);
+  assert.match(audit.blockedReasons.join("\n"), /src\/lib\/e2e\.ts/);
+});
+
+test("command evidence matches successful commands with cd wrappers and redirection", () => {
+  const parsed = extractPlanTasks("- [x] 运行 TypeScript 检查 `npx tsc --noEmit` — 证据: cmd:npx tsc --noEmit");
+  const command = createPlanExecutionEvidenceEntry({
+    toolName: "run_command",
+    target: "cd /Users/michael/Documents/GitHub/MAIN && npx tsc --noEmit 2>&1",
+    result: JSON.stringify({ exitCode: 0, stdout: "" }),
+  });
+  const reconciled = reconcilePlanTaskCompletion([], parsed, command ? [command] : []);
+
+  assert.equal(isPlanTaskTrustedComplete(reconciled[0]), true);
+});
+
+test("verification evidence never treats .MAIN plans as project source", () => {
+  const planVerification = createPlanExecutionEvidenceEntry({
+    toolName: "read_file",
+    target: ".MAIN/plans/tasks.md",
+    result: "- [x] 修改 src/App.tsx",
+  });
+  const manualPlanVerification = {
+    id: "manual-plan",
+    kind: "tool",
+    value: ".MAIN/plans/tasks.md",
+    target: ".MAIN/plans/tasks.md",
+    references: [".MAIN/plans/tasks.md"],
+    sourceTool: "read_file",
+    createdAt: 1,
+  };
+  const reconciled = reconcilePlanTaskCompletion(
+    [],
+    extractPlanTasks("- [x] 更新计划任务文件 — 证据: file:.MAIN/plans/tasks.md"),
+    [manualPlanVerification],
+  );
+
+  assert.equal(planVerification, null);
+  assert.equal(isPlanTaskTrustedComplete(reconciled[0]), false);
 });
 
 test("findDroppedPlanTasks detects task deletion from rewritten tasks.md", () => {
@@ -598,6 +662,12 @@ test("validatePlanArtifactContent accepts real requirements and design artifacts
 
   assert.equal(validatePlanArtifactContent(requirements, "requirements").ok, true);
   assert.equal(validatePlanArtifactContent(design, "design").ok, true);
+});
+
+test("validatePlanArtifactContent requires inferable task evidence", () => {
+  assert.equal(validatePlanArtifactContent("- [ ] 调整空状态", "tasks").ok, false);
+  assert.equal(validatePlanArtifactContent("- [ ] 调整 src/App.tsx 空状态", "tasks").ok, true);
+  assert.equal(validatePlanArtifactContent("- [ ] 运行检查 — 证据: cmd:npx tsc --noEmit", "tasks").ok, true);
 });
 
 test("collectChangeEntries collects source and plan diffs with source files first", () => {

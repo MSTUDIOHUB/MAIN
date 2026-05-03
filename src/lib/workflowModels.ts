@@ -61,6 +61,7 @@ export interface PlanExecutionEvidenceEntry {
   value: string;
   sourceTool: string;
   target?: string;
+  references?: string[];
   createdAt: number;
 }
 
@@ -101,6 +102,15 @@ export interface PlanTask {
   evidenceStatus?: PlanTaskEvidenceStatus;
   blockedReason?: string;
   retained?: boolean;
+}
+
+export interface PlanTaskEvidenceAudit {
+  tasks: PlanTask[];
+  completedCount: number;
+  totalCount: number;
+  remainingTasks: PlanTask[];
+  blockedReasons: string[];
+  acceptedCompletion: boolean;
 }
 
 export interface PlanArtifactValidationResult {
@@ -481,6 +491,55 @@ export function normalizePlanEvidenceValue(value: string): string {
     .toLowerCase();
 }
 
+const INTERNAL_PLAN_EVIDENCE_RE = /(?:^|[\\/])\.main[\\/]plans[\\/]/i;
+
+function isInternalPlanEvidenceValue(value: string | undefined | null): boolean {
+  return INTERNAL_PLAN_EVIDENCE_RE.test(String(value || "").replace(/\\/g, "/").toLowerCase());
+}
+
+function normalizeCommandEvidenceValue(value: string): string {
+  return normalizePlanEvidenceValue(value)
+    .replace(/\s+\d?>&\d+\b/g, "")
+    .replace(/\s+\d?>{1,2}\s*(?:"[^"]+"|'[^']+'|\S+)/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function splitCommandEvidenceSegments(value: string): string[] {
+  const normalized = normalizeCommandEvidenceValue(value);
+  if (!normalized) return [];
+  const segments = normalized
+    .split(/\s*(?:&&|\|\||;)\s*/g)
+    .map((segment) => segment.replace(/^\(\s*/, "").replace(/\s*\)$/, "").trim())
+    .filter(Boolean)
+    .filter((segment) => !/^(?:cd|pushd|popd)\b/.test(segment));
+  return segments.length > 0 ? segments : [normalized];
+}
+
+function commandEvidenceMatches(expectedRaw: string, actualRaw: string): boolean {
+  const expected = normalizeCommandEvidenceValue(expectedRaw);
+  const actual = normalizeCommandEvidenceValue(actualRaw);
+  if (!expected || !actual) return false;
+  if (expected === actual) return true;
+
+  const actualSegments = splitCommandEvidenceSegments(actual);
+  return actualSegments.some((segment) =>
+    segment === expected ||
+    segment.startsWith(`${expected} `)
+  );
+}
+
+function evidencePathMatches(candidateRaw: string, expectedRaw: string): boolean {
+  const expected = normalizePlanEvidenceValue(expectedRaw);
+  const candidate = normalizePlanEvidenceValue(candidateRaw);
+  if (!expected || !candidate) return false;
+  if (isInternalPlanEvidenceValue(expected) || isInternalPlanEvidenceValue(candidate)) return false;
+  if (candidate === expected || candidate.endsWith(`/${expected}`) || expected.endsWith(`/${candidate}`)) return true;
+
+  const escaped = expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?:^|[\\s"'(:=])${escaped}(?:$|[\\s"',):;])`, "i").test(candidate);
+}
+
 function makePlanTaskEvidence(
   kind: PlanTaskEvidenceKind,
   value: string,
@@ -546,7 +605,7 @@ function evidenceMatchesRecord(
   if (!expected || !actual) return false;
 
   if (evidence.kind === "cmd") {
-    return record.kind === "cmd" && expected === actual;
+    return record.kind === "cmd" && commandEvidenceMatches(evidence.value, record.value || record.target || "");
   }
 
   if (evidence.kind === "tool") {
@@ -558,8 +617,18 @@ function evidenceMatchesRecord(
   }
 
   if (evidence.kind === "file" || evidence.kind === "deliverable") {
-    if (record.kind !== "file" && record.kind !== "deliverable") return false;
-    return actual === expected || actual.endsWith(`/${expected}`) || expected.endsWith(`/${actual}`);
+    if (record.kind === "file" || record.kind === "deliverable") {
+      return evidencePathMatches(record.value || record.target || "", evidence.value);
+    }
+    if (record.kind === "tool" || record.kind === "cmd") {
+      const candidates = [
+        record.value,
+        record.target || "",
+        ...(record.references || []),
+      ];
+      return candidates.some((candidate) => evidencePathMatches(candidate, evidence.value));
+    }
+    return false;
   }
 
   return false;
@@ -641,6 +710,45 @@ export function reconcilePlanTaskCompletion(
   return reconciled.map((task, index) =>
     index === firstPendingIndex ? { ...task, status: "in_progress" as const } : task
   );
+}
+
+function formatAuditEvidence(task: PlanTask): string {
+  const evidence = task.evidence && task.evidence.length > 0
+    ? task.evidence.map((item) => `${item.kind}:${item.value}`).join(", ")
+    : "";
+  return evidence || "missing evidence label";
+}
+
+export function buildPlanTaskEvidenceAudit(input: {
+  tasks: PlanTask[];
+  evidenceLedger?: PlanExecutionEvidenceEntry[];
+  preserveMissing?: boolean;
+  highlightNext?: boolean;
+}): PlanTaskEvidenceAudit {
+  const tasks = Array.isArray(input.tasks) ? input.tasks : [];
+  const auditedTasks = input.evidenceLedger
+    ? reconcilePlanTaskCompletion([], tasks, input.evidenceLedger, {
+        preserveMissing: input.preserveMissing ?? false,
+        highlightNext: input.highlightNext ?? false,
+      })
+    : tasks;
+  const remainingTasks = auditedTasks.filter((task) => !isPlanTaskTrustedComplete(task));
+  const blockedReasons = remainingTasks.map((task, index) => {
+    const status = task.evidenceStatus || task.status || "missing";
+    const reason = task.blockedReason || (task.evidence && task.evidence.length > 0
+      ? "waiting for trusted execution evidence"
+      : "missing verifiable evidence label or inferable file/command reference");
+    return `${index + 1}. ${task.text} [${status}; ${formatAuditEvidence(task)}] - ${reason}`;
+  });
+
+  return {
+    tasks: auditedTasks,
+    completedCount: auditedTasks.filter(isPlanTaskTrustedComplete).length,
+    totalCount: auditedTasks.length,
+    remainingTasks,
+    blockedReasons,
+    acceptedCompletion: auditedTasks.length > 0 && remainingTasks.length === 0,
+  };
 }
 
 export function getPendingPlanTaskCommandFocus(
@@ -786,10 +894,19 @@ export function validatePlanArtifactContent(
   content: string,
   kind: PlanArtifactKind,
 ): PlanArtifactValidationResult {
-  if (kind === "tasks" || kind === "summary") return { ok: true };
+  if (kind === "summary") return { ok: true };
 
   const raw = String(content || "").trim();
   if (!raw) return { ok: false, reason: "empty" };
+
+  if (kind === "tasks") {
+    const hasCheckboxTasks = /^\s*[-*]\s+\[[ xX]\]\s+.+$/m.test(raw);
+    const tasks = extractPlanTasks(raw);
+    if (hasCheckboxTasks && tasks.some((task) => !task.evidence || task.evidence.length === 0)) {
+      return { ok: false, reason: "missing_task_evidence" };
+    }
+    return { ok: true };
+  }
 
   for (const entry of PLAN_ARTIFACT_NOISE_PATTERNS) {
     if (entry.pattern.test(raw)) {

@@ -17,11 +17,11 @@ import { deriveTurnProgressItems } from "../lib/turnProgress";
 import { useAppStore } from "../store/useAppStore";
 import {
   collectChangeEntries,
+  buildPlanTaskEvidenceAudit,
   deriveVisibleConversationTurnStatus,
   isGenericConversationTitle,
   normalizeConversationDisplayTitle,
   isPlanConversationTurn,
-  isPlanTaskTrustedComplete,
   looksLikeReasoningLeakTitle,
   resolveActiveConversationTurn,
   resolvePinnedConversationTurn,
@@ -1143,6 +1143,7 @@ export default function ChatArea({
     toggleConversationTurnCollapsed,
     planArtifacts,
     planTasks,
+    planExecutionEvidenceLedger,
     isPlanApproved,
     planStage,
     planExecutionProgressSnapshot,
@@ -1172,6 +1173,7 @@ export default function ChatArea({
     toggleConversationTurnCollapsed: useAppStore((s) => s.toggleConversationTurnCollapsed),
     planArtifacts: useAppStore((s) => s.planArtifacts),
     planTasks: useAppStore((s) => s.planTasks),
+    planExecutionEvidenceLedger: useAppStore((s) => s.planExecutionEvidenceLedger),
     isPlanApproved: useAppStore((s) => s.isPlanApproved),
     planStage: useAppStore((s) => s.planStage),
     planExecutionProgressSnapshot: useAppStore((s) => s.planExecutionProgressSnapshot),
@@ -1309,12 +1311,12 @@ export default function ChatArea({
       isPlanApproved,
       planStage,
       agentStatus,
-      hasIncompletePlanTasks: planTasks.some((task) => !isPlanTaskTrustedComplete(task)),
+      hasIncompletePlanTasks: !buildPlanTaskEvidenceAudit({ tasks: planTasks, evidenceLedger: planExecutionEvidenceLedger }).acceptedCompletion,
       hasTasksArtifact:
         planArtifacts.some((artifact) => artifact.kind === "tasks") ||
         planTasks.length > 0,
     });
-  }, [agentStatus, isPlanApproved, pinnedPlanTurn, planArtifacts, planStage, planTasks, topIslandTurn]);
+  }, [agentStatus, isPlanApproved, pinnedPlanTurn, planArtifacts, planExecutionEvidenceLedger, planStage, planTasks, topIslandTurn]);
   const shouldShowPinnedPlanTasks =
     !!pinnedPlanTurn &&
     (isPlanApproved || planStage === "executing" || planStage === "completed");
@@ -1933,6 +1935,7 @@ export default function ChatArea({
           language={language}
           themeMode={config.themeMode}
           planTasks={shouldShowPinnedPlanTasks ? planTasks : []}
+          planExecutionEvidenceLedger={shouldShowPinnedPlanTasks ? planExecutionEvidenceLedger : []}
           planStage={pinnedPlanTurn ? planStage : "idle"}
           executionSteps={shouldShowPinnedPlanTasks ? [] : topIslandExecutionSteps}
           progressMode={shouldShowPinnedPlanTasks ? "plan" : "execution"}

@@ -1,5 +1,5 @@
 import {
-  isPlanTaskTrustedComplete,
+  buildPlanTaskEvidenceAudit,
   type PlanArtifact,
   type PlanExecutionEvidenceEntry,
   type PlanExecutionProgressPhase,
@@ -154,7 +154,12 @@ export function buildPlanExecutionProgressUpdate(input: {
   latestEvidence?: string;
   nextStep?: string;
 }): PlanExecutionProgressUpdate {
-  const remaining = input.tasks.filter((task) => !isPlanTaskTrustedComplete(task));
+  const audit = buildPlanTaskEvidenceAudit({
+    tasks: input.tasks,
+    evidenceLedger: input.evidenceLedger,
+    highlightNext: true,
+  });
+  const remaining = audit.remainingTasks;
   const remainingTask = remaining[0];
   const recentTool = input.recentToolActivity.length > 0
     ? summarizeToolActivity(input.recentToolActivity[input.recentToolActivity.length - 1])
@@ -243,7 +248,12 @@ export function buildPlanMaxIterationsCheckpoint(input: {
   lastAssistantText?: string;
   unresolvedBlockers?: string[];
 }): PlanMaxIterationsCheckpoint {
-  const remaining = input.tasks.filter((task) => !isPlanTaskTrustedComplete(task));
+  const audit = buildPlanTaskEvidenceAudit({
+    tasks: input.tasks,
+    evidenceLedger: input.evidenceLedger,
+    highlightNext: true,
+  });
+  const remaining = audit.remainingTasks;
   const completedEvidence = summarizePlanExecutionEvidence(input.evidenceLedger);
   const currentTask = remaining[0]
     ? summarizeTask(remaining[0])
@@ -379,7 +389,12 @@ export function buildPlanMaxIterationsResumePrompt(input: {
   artifacts: PlanArtifact[];
   evidenceLedger: PlanExecutionEvidenceEntry[];
 }): string {
-  const remaining = input.tasks.filter((task) => !isPlanTaskTrustedComplete(task)).slice(0, 8);
+  const audit = buildPlanTaskEvidenceAudit({
+    tasks: input.tasks,
+    evidenceLedger: input.evidenceLedger,
+    highlightNext: true,
+  });
+  const remaining = audit.remainingTasks.slice(0, 8);
   const remainingText = remaining.length > 0
     ? remaining.map((task, index) => `${index + 1}. ${summarizeTask(task)}`).join("\n")
     : input.language === "zh"

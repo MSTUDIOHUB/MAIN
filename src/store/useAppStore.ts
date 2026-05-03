@@ -33,6 +33,7 @@ import {
   type PlanTask,
   type ReplyOption,
   type RightPanelTab,
+  buildPlanTaskEvidenceAudit,
   detectPlanArtifactKind,
   detectDominantLanguage,
   extractPlanTasks,
@@ -40,7 +41,6 @@ import {
   getPendingPlanTaskCommandFocus,
   getPlanArtifactTitle,
   isGenericConversationTitle,
-  isPlanTaskTrustedComplete,
   looksLikeReasoningLeakTitle,
   normalizeConversationDisplayTitle,
   reconcilePlanTaskCompletion,
@@ -2218,7 +2218,12 @@ function buildTrustedPlanResumePrompt(input: {
   artifacts: PlanArtifact[];
   evidenceLedger: PlanExecutionEvidenceEntry[];
 }): string {
-  const remaining = input.tasks.filter((task) => !isPlanTaskTrustedComplete(task)).slice(0, 8);
+  const audit = buildPlanTaskEvidenceAudit({
+    tasks: input.tasks,
+    evidenceLedger: input.evidenceLedger,
+    highlightNext: true,
+  });
+  const remaining = audit.remainingTasks.slice(0, 8);
   const remainingText = remaining.length > 0
     ? remaining.map((task, index) => {
         const evidence = task.evidence?.map((item) => `${item.kind}:${item.value}`).join(", ") ||
@@ -2392,8 +2397,7 @@ function deriveIdleConversationTurnStatus(input: {
     input.planTasks.length > 0 ||
     input.planArtifacts.some((artifact) => artifact.kind === "tasks");
   const allTasksComplete =
-    input.planTasks.length > 0 &&
-    input.planTasks.every((task) => isPlanTaskTrustedComplete(task));
+    buildPlanTaskEvidenceAudit({ tasks: input.planTasks }).acceptedCompletion;
   const hasExecutionEvidence =
     input.planExecutionEvidenceCount > 0 ||
     turnBlocks.some((block) =>
@@ -6350,12 +6354,16 @@ export const useAppStore = create<AppState>()(
           const turnBlocks = current.taskFlow.filter((block) => block.turnId === turnId);
           const currentTurn = current.conversationTurns.find((turn) => turn.id === turnId);
           const requestedDocs = detectRequestedRootMarkdownDeliverables(currentTurn?.userPrompt || "");
+          const taskAudit = buildPlanTaskEvidenceAudit({
+            tasks: current.planTasks,
+            evidenceLedger: current.planExecutionEvidenceLedger,
+            highlightNext: current.isPlanApproved,
+          });
           const canMarkPlanCompleted =
             stage === "completed" &&
             current.isPlanApproved &&
             current.planExecutionEvidenceCount > 0 &&
-            current.planTasks.length > 0 &&
-            current.planTasks.every((task) => isPlanTaskTrustedComplete(task)) &&
+            taskAudit.acceptedCompletion &&
             hasRootMarkdownDeliverableEvidence(turnBlocks, requestedDocs);
           const nextStage =
             stage === "idle"
@@ -6369,6 +6377,9 @@ export const useAppStore = create<AppState>()(
                   stage === "executing" ? "executing" : current.planStage,
                 );
 
+          if (current.planTasks.length > 0) {
+            sessionSet({ planTasks: taskAudit.tasks });
+          }
           sessionGet().setPlanStage(nextStage);
           if (nextStage !== "idle") {
             const latest = sessionGet();
