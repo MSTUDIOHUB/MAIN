@@ -81,6 +81,7 @@ const {
   deriveVisibleConversationTurnStatus,
   extractPlanTasks,
   findDroppedPlanTasks,
+  isEphemeralPlanArtifactPath,
   isPlanTaskTrustedComplete,
   looksLikeReasoningLeakTitle,
   mergePlanTasks,
@@ -147,6 +148,30 @@ test("plan approval quick reply routes through approvePlan control path", () => 
       planArtifacts: [{ kind: "design", path: ".MAIN/plans/design.md", title: "Design", content: "# Design", updatedAt: 1 }],
     }),
     false,
+  );
+
+  assert.equal(
+    shouldRouteQuickReplyToPlanApproval({
+      text: "批准执行：先运行诊断脚本，再根据结果修复字体加载",
+      optionAction: "execute_once",
+      sourceIntent: "plan",
+      isPlanApproved: false,
+      planStage: "design",
+      planArtifacts: [{ kind: "design", path: ".MAIN/plans/design.md", title: "Design", content: "# Design", updatedAt: 1 }],
+    }),
+    true,
+  );
+
+  assert.equal(
+    shouldRouteQuickReplyToPlanApproval({
+      text: "直接执行部署脚本 deploy.sh",
+      optionAction: "execute_once",
+      sourceIntent: "plan",
+      isPlanApproved: false,
+      planStage: "design",
+      planArtifacts: [{ kind: "design", path: ".MAIN/plans/design.md", title: "Design", content: "# Design", updatedAt: 1 }],
+    }),
+    true,
   );
 
   assert.equal(
@@ -670,7 +695,7 @@ test("validatePlanArtifactContent requires inferable task evidence", () => {
   assert.equal(validatePlanArtifactContent("- [ ] 运行检查 — 证据: cmd:npx tsc --noEmit", "tasks").ok, true);
 });
 
-test("collectChangeEntries collects source and plan diffs with source files first", () => {
+test("collectChangeEntries ignores ephemeral plan files but keeps source and bugfix diffs", () => {
   const stats = (oldText, newText) => ({
     added: newText.split("\n").length,
     removed: oldText.split("\n").length,
@@ -685,6 +710,14 @@ test("collectChangeEntries collects source and plan diffs with source files firs
       diff: { old: "", new: "- [ ] Task", path: ".MAIN/plans/tasks.md" },
     },
     {
+      id: 3,
+      type: "tool",
+      toolName: "write_file",
+      toolStatus: "executed",
+      target: ".MAIN/plans/bugfix.md",
+      diff: { old: "", new: "# Bugfix", path: ".MAIN/plans/bugfix.md" },
+    },
+    {
       id: 2,
       type: "tool",
       toolName: "replace_in_file",
@@ -695,7 +728,12 @@ test("collectChangeEntries collects source and plan diffs with source files firs
   ], stats);
 
   assert.equal(result.totalExecutedEdits, 2);
+  assert.equal(isEphemeralPlanArtifactPath(".MAIN/plans/requirements.md"), true);
+  assert.equal(isEphemeralPlanArtifactPath(".MAIN/plans/design.md"), true);
+  assert.equal(isEphemeralPlanArtifactPath(".MAIN/plans/tasks.md"), true);
+  assert.equal(isEphemeralPlanArtifactPath(".MAIN/plans/bugfix.md"), false);
   assert.equal(result.entries[0].target, "Scripts/Battle/Core/BattleUnit.cs");
   assert.equal(result.entries[0].isPlanFile, false);
+  assert.equal(result.entries[1].target, ".MAIN/plans/bugfix.md");
   assert.equal(result.entries[1].isPlanFile, true);
 });

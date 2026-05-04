@@ -26,6 +26,8 @@ test("plan panel refreshes when tasks.md is updated through replace_in_file", as
     )
     .toEqual(["completed", "in_progress", "pending"]);
 
+  await page.evaluate(() => (window as any).__CODELY_E2E__?.replacePlanTasks?.());
+
   await expect
     .poll(async () =>
       page.evaluate(() => {

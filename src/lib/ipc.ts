@@ -40,6 +40,26 @@ export interface TerminalCommandOutput {
   stderrTruncated: boolean;
 }
 
+export interface GitStatus {
+  isRepo: boolean;
+  gitAvailable: boolean;
+  repoRoot?: string | null;
+  branch?: string | null;
+  upstream?: string | null;
+  ahead: number;
+  behind: number;
+  changedFiles: number;
+  insertions: number;
+  deletions: number;
+  untrackedFiles: number;
+  stagedFiles: number;
+  unstagedFiles: number;
+  conflictedFiles: number;
+  clean: boolean;
+  hasOrigin: boolean;
+  error?: string | null;
+}
+
 export interface PtyReadResult {
   text: string;
   startOffset: number;
@@ -370,6 +390,22 @@ export function runCommand(
     timeoutMs,
     workspace,
   });
+}
+
+export function getGitStatus(workspace?: string, includeStats?: boolean): Promise<GitStatus> {
+  return invoke<GitStatus>("get_git_status", { workspace, includeStats });
+}
+
+export function gitCommitAll(workspace: string, message: string): Promise<GitStatus> {
+  return invoke<GitStatus>("git_commit_all", { workspace, message });
+}
+
+export function gitPushCurrentBranch(workspace: string): Promise<GitStatus> {
+  return invoke<GitStatus>("git_push_current_branch", { workspace });
+}
+
+export function gitCreateBranch(workspace: string, branch: string): Promise<GitStatus> {
+  return invoke<GitStatus>("git_create_branch", { workspace, branch });
 }
 
 // endregion

@@ -306,6 +306,31 @@ test("extractReplyOptions converts Gemma-style read-only permission prompts into
   assert.match(result.replyOptions[1].value, /本会话只读读取、搜索和分析步骤全部允许/);
 });
 
+test("extractReplyOptions marks explicit execution choices for runtime execute", () => {
+  const inferred = extractReplyOptions(`
+请选择下一步：
+
+1. 直接执行部署脚本 deploy.sh
+2. 我来确认无误再执行
+  `);
+
+  assert.equal(inferred.replyOptions[0].value, "直接执行部署脚本 deploy.sh");
+  assert.equal(inferred.replyOptions[0].action, "execute_once");
+  assert.equal(inferred.replyOptions[1].action, undefined);
+
+  const explicit = extractReplyOptions(`
+请选择下一步：
+
+<user_options>
+<option action="execute_once" value="直接执行部署脚本 deploy.sh">直接执行部署脚本 deploy.sh</option>
+<option value="我来确认无误再执行">我来确认无误再执行</option>
+</user_options>
+  `);
+
+  assert.equal(explicit.replyOptions[0].action, "execute_once");
+  assert.equal(explicit.replyOptions[1].action, undefined);
+});
+
 test("read-only auto approval strips repeated permission prompts and builds continuation", () => {
   const result = extractReplyOptions("请问是否同意我下一步分析 `CombatUnit.cs` 的内容？");
 

@@ -264,6 +264,59 @@ struct TerminalCommandOutput {
     stderr_truncated: bool,
 }
 
+struct GitProcessOutput {
+    stdout: String,
+    stderr: String,
+    exit_code: i32,
+    timed_out: bool,
+    success: bool,
+}
+
+#[derive(Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitStatus {
+    is_repo: bool,
+    git_available: bool,
+    repo_root: Option<String>,
+    branch: Option<String>,
+    upstream: Option<String>,
+    ahead: usize,
+    behind: usize,
+    changed_files: usize,
+    insertions: usize,
+    deletions: usize,
+    untracked_files: usize,
+    staged_files: usize,
+    unstaged_files: usize,
+    conflicted_files: usize,
+    clean: bool,
+    has_origin: bool,
+    error: Option<String>,
+}
+
+#[derive(Default)]
+struct GitBranchInfo {
+    branch: Option<String>,
+    upstream: Option<String>,
+    ahead: usize,
+    behind: usize,
+}
+
+#[derive(Default)]
+struct GitWorktreeCounts {
+    changed_files: usize,
+    untracked_files: usize,
+    staged_files: usize,
+    unstaged_files: usize,
+    conflicted_files: usize,
+}
+
+#[derive(Default)]
+struct GitNumstatCounts {
+    insertions: usize,
+    deletions: usize,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct FeishuAdapterStatus {
@@ -1304,6 +1357,467 @@ fn run_workspace_shell_command(
         stdout_truncated: stdout.truncated,
         stderr_truncated: stderr.truncated,
     })
+}
+
+fn run_git_process(
+    workspace: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<GitProcessOutput, String> {
+    let mut process = ProcessCommand::new("git");
+    process
+        .args(args)
+        .current_dir(workspace)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = process.spawn().map_err(|e| format!("启动 git 失败: {e}"))?;
+
+    let stdout_handle = child
+        .stdout
+        .take()
+        .map(|stdout| thread::spawn(move || read_limited_pipe(stdout, COMMAND_OUTPUT_LIMIT_BYTES)));
+    let stderr_handle = child
+        .stderr
+        .take()
+        .map(|stderr| thread::spawn(move || read_limited_pipe(stderr, COMMAND_OUTPUT_LIMIT_BYTES)));
+
+    let started_at = Instant::now();
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if started_at.elapsed() >= timeout {
+                    timed_out = true;
+                    let _ = child.kill();
+                    break child
+                        .wait()
+                        .map_err(|e| format!("等待被终止的 git 命令结束失败: {e}"))?;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => return Err(format!("等待 git 命令结束失败: {e}")),
+        }
+    };
+
+    let stdout = join_captured_pipe(stdout_handle, "git stdout")?;
+    let stderr = join_captured_pipe(stderr_handle, "git stderr")?;
+    let exit_code = status.code().unwrap_or(if timed_out { -1 } else { 1 });
+
+    Ok(GitProcessOutput {
+        stdout: stdout.text,
+        stderr: stderr.text,
+        exit_code,
+        timed_out,
+        success: !timed_out && status.success(),
+    })
+}
+
+fn git_failure_message(output: &GitProcessOutput) -> String {
+    let detail = if output.stderr.trim().is_empty() {
+        output.stdout.trim()
+    } else {
+        output.stderr.trim()
+    };
+    let fallback = if output.timed_out {
+        "git 命令超时".to_string()
+    } else {
+        format!("git 命令失败，退出码 {}", output.exit_code)
+    };
+    if detail.is_empty() {
+        fallback
+    } else {
+        detail.to_string()
+    }
+}
+
+fn has_git_marker(mut path: &Path) -> bool {
+    loop {
+        if path.join(".git").exists() {
+            return true;
+        }
+        match path.parent() {
+            Some(parent) => path = parent,
+            None => return false,
+        }
+    }
+}
+
+fn empty_git_status(git_available: bool, is_repo: bool, error: Option<String>) -> GitStatus {
+    GitStatus {
+        is_repo,
+        git_available,
+        clean: true,
+        error,
+        ..GitStatus::default()
+    }
+}
+
+fn parse_git_ahead_behind(detail: &str) -> (usize, usize) {
+    let mut ahead = 0;
+    let mut behind = 0;
+    for part in detail.split(',') {
+        let trimmed = part.trim();
+        if let Some(value) = trimmed.strip_prefix("ahead ") {
+            ahead = value.trim().parse::<usize>().unwrap_or(0);
+        } else if let Some(value) = trimmed.strip_prefix("behind ") {
+            behind = value.trim().parse::<usize>().unwrap_or(0);
+        }
+    }
+    (ahead, behind)
+}
+
+fn parse_git_branch_line(line: &str) -> GitBranchInfo {
+    let mut info = GitBranchInfo::default();
+    let mut text = line.strip_prefix("## ").unwrap_or(line).trim();
+
+    if let Some(rest) = text.strip_prefix("No commits yet on ") {
+        info.branch = Some(rest.trim().to_string());
+        return info;
+    }
+
+    if let Some(bracket_start) = text.rfind(" [") {
+        if text.ends_with(']') {
+            let detail = &text[bracket_start + 2..text.len() - 1];
+            let (ahead, behind) = parse_git_ahead_behind(detail);
+            info.ahead = ahead;
+            info.behind = behind;
+            text = text[..bracket_start].trim();
+        }
+    }
+
+    if let Some((branch, upstream)) = text.split_once("...") {
+        let branch = branch.trim();
+        if !branch.is_empty() {
+            info.branch = Some(branch.to_string());
+        }
+        let upstream = upstream.trim();
+        if !upstream.is_empty() {
+            info.upstream = Some(upstream.to_string());
+        }
+    } else if !text.is_empty() {
+        info.branch = Some(text.to_string());
+    }
+
+    info
+}
+
+fn is_git_conflict_status(x: char, y: char) -> bool {
+    matches!(
+        (x, y),
+        ('D', 'D') | ('A', 'U') | ('U', 'D') | ('U', 'A') | ('D', 'U') | ('A', 'A') | ('U', 'U')
+    )
+}
+
+fn parse_git_porcelain_status(output: &str) -> (GitBranchInfo, GitWorktreeCounts) {
+    let mut branch = GitBranchInfo::default();
+    let mut counts = GitWorktreeCounts::default();
+
+    for line in output.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if line.starts_with("## ") {
+            branch = parse_git_branch_line(line);
+            continue;
+        }
+        if line.starts_with("!!") {
+            continue;
+        }
+
+        counts.changed_files += 1;
+        let mut chars = line.chars();
+        let x = chars.next().unwrap_or(' ');
+        let y = chars.next().unwrap_or(' ');
+
+        if x == '?' && y == '?' {
+            counts.untracked_files += 1;
+            continue;
+        }
+
+        if is_git_conflict_status(x, y) {
+            counts.conflicted_files += 1;
+            continue;
+        }
+
+        if x != ' ' && x != '?' {
+            counts.staged_files += 1;
+        }
+        if y != ' ' && y != '?' {
+            counts.unstaged_files += 1;
+        }
+    }
+
+    (branch, counts)
+}
+
+fn parse_git_numstat(output: &str) -> GitNumstatCounts {
+    let mut counts = GitNumstatCounts::default();
+    for line in output.lines() {
+        let mut parts = line.split('\t');
+        let Some(insertions) = parts.next() else {
+            continue;
+        };
+        let Some(deletions) = parts.next() else {
+            continue;
+        };
+        counts.insertions += insertions.parse::<usize>().unwrap_or(0);
+        counts.deletions += deletions.parse::<usize>().unwrap_or(0);
+    }
+    counts
+}
+
+fn is_valid_git_branch_name(branch: &str) -> bool {
+    let trimmed = branch.trim();
+    if trimmed.is_empty() || trimmed != branch || trimmed == "HEAD" || trimmed.starts_with('-') {
+        return false;
+    }
+    if trimmed.starts_with('/') || trimmed.ends_with('/') || trimmed.ends_with(".lock") {
+        return false;
+    }
+    if trimmed.contains("..") || trimmed.contains("//") || trimmed.contains("@{") {
+        return false;
+    }
+    if trimmed
+        .chars()
+        .any(|ch| ch.is_control() || ch.is_whitespace() || "\\~^:?*[".contains(ch))
+    {
+        return false;
+    }
+    trimmed.split('/').all(|part| {
+        !part.is_empty() && !part.starts_with('.') && !part.ends_with('.') && part != "@"
+    })
+}
+
+fn get_git_status_for_workspace(
+    workspace: &Path,
+    include_stats: bool,
+) -> Result<GitStatus, String> {
+    let timeout = Duration::from_millis(10_000);
+    let repo = match run_git_process(workspace, &["rev-parse", "--show-toplevel"], timeout) {
+        Ok(output) if output.success => output.stdout.trim().to_string(),
+        Ok(_) => return Ok(empty_git_status(true, false, None)),
+        Err(error) => {
+            return Ok(empty_git_status(
+                false,
+                has_git_marker(workspace),
+                Some(error),
+            ));
+        }
+    };
+
+    let repo_root = PathBuf::from(repo.trim());
+    let repo_root_string = repo_root.to_string_lossy().to_string();
+    let status_output = run_git_process(
+        &repo_root,
+        &["status", "--porcelain=v1", "--branch"],
+        timeout,
+    )?;
+    if !status_output.success {
+        return Ok(GitStatus {
+            is_repo: true,
+            git_available: true,
+            repo_root: Some(repo_root_string),
+            clean: true,
+            error: Some(git_failure_message(&status_output)),
+            ..GitStatus::default()
+        });
+    }
+
+    let (branch, counts) = parse_git_porcelain_status(&status_output.stdout);
+    let has_head = run_git_process(&repo_root, &["rev-parse", "--verify", "HEAD"], timeout)
+        .map(|output| output.success)
+        .unwrap_or(false);
+    let numstat = if include_stats && has_head {
+        run_git_process(&repo_root, &["diff", "--numstat", "HEAD", "--"], timeout)
+            .ok()
+            .filter(|output| output.success)
+            .map(|output| parse_git_numstat(&output.stdout))
+            .unwrap_or_default()
+    } else {
+        GitNumstatCounts::default()
+    };
+    let has_origin = run_git_process(&repo_root, &["remote", "get-url", "origin"], timeout)
+        .map(|output| output.success && !output.stdout.trim().is_empty())
+        .unwrap_or(false);
+
+    Ok(GitStatus {
+        is_repo: true,
+        git_available: true,
+        repo_root: Some(repo_root_string),
+        branch: branch.branch,
+        upstream: branch.upstream,
+        ahead: branch.ahead,
+        behind: branch.behind,
+        changed_files: counts.changed_files,
+        insertions: numstat.insertions,
+        deletions: numstat.deletions,
+        untracked_files: counts.untracked_files,
+        staged_files: counts.staged_files,
+        unstaged_files: counts.unstaged_files,
+        conflicted_files: counts.conflicted_files,
+        clean: counts.changed_files == 0,
+        has_origin,
+        error: None,
+    })
+}
+
+fn ensure_git_ready(status: &GitStatus) -> Result<(), String> {
+    if !status.git_available {
+        return Err(status
+            .error
+            .clone()
+            .unwrap_or_else(|| "未找到 Git".to_string()));
+    }
+    if !status.is_repo {
+        return Err("当前文件夹不是 Git 仓库".to_string());
+    }
+    Ok(())
+}
+
+fn current_git_branch(status: &GitStatus) -> Result<String, String> {
+    let branch = status.branch.as_deref().unwrap_or("").trim();
+    if branch.is_empty() || branch.starts_with("HEAD") {
+        return Err("当前仓库不在普通分支上，无法执行该操作".to_string());
+    }
+    Ok(branch.to_string())
+}
+
+#[tauri::command]
+fn get_git_status(
+    state: State<WorkspaceState>,
+    workspace: Option<String>,
+    include_stats: Option<bool>,
+) -> Result<GitStatus, String> {
+    let workspace = resolve_workspace_root(&state, workspace)?;
+    get_git_status_for_workspace(&workspace, include_stats.unwrap_or(false))
+}
+
+#[tauri::command]
+fn git_commit_all(
+    state: State<WorkspaceState>,
+    workspace: Option<String>,
+    message: String,
+) -> Result<GitStatus, String> {
+    let message = message.trim();
+    if message.is_empty() {
+        return Err("提交信息不能为空".to_string());
+    }
+
+    let workspace = resolve_workspace_root(&state, workspace)?;
+    let status = get_git_status_for_workspace(&workspace, true)?;
+    ensure_git_ready(&status)?;
+    if status.conflicted_files > 0 {
+        return Err("当前存在冲突文件，请先解决冲突再提交".to_string());
+    }
+    if status.changed_files == 0 {
+        return Err("没有可提交的更改".to_string());
+    }
+
+    let repo_root = status
+        .repo_root
+        .as_deref()
+        .ok_or_else(|| "无法确定 Git 仓库根目录".to_string())?;
+    let repo_root = PathBuf::from(repo_root);
+    let timeout = Duration::from_millis(120_000);
+
+    let add = run_git_process(&repo_root, &["add", "-A"], timeout)?;
+    if !add.success {
+        return Err(git_failure_message(&add));
+    }
+
+    let diff = run_git_process(
+        &repo_root,
+        &["diff", "--cached", "--quiet", "--exit-code"],
+        timeout,
+    )?;
+    if diff.success {
+        return Err("没有可提交的更改".to_string());
+    }
+    if diff.exit_code != 1 {
+        return Err(git_failure_message(&diff));
+    }
+
+    let commit = run_git_process(&repo_root, &["commit", "-m", message], timeout)?;
+    if !commit.success {
+        return Err(git_failure_message(&commit));
+    }
+
+    get_git_status_for_workspace(&repo_root, true)
+}
+
+#[tauri::command]
+fn git_push_current_branch(
+    state: State<WorkspaceState>,
+    workspace: Option<String>,
+) -> Result<GitStatus, String> {
+    let workspace = resolve_workspace_root(&state, workspace)?;
+    let status = get_git_status_for_workspace(&workspace, true)?;
+    ensure_git_ready(&status)?;
+    let branch = current_git_branch(&status)?;
+    let repo_root = status
+        .repo_root
+        .as_deref()
+        .ok_or_else(|| "无法确定 Git 仓库根目录".to_string())?;
+    let repo_root = PathBuf::from(repo_root);
+    let timeout = Duration::from_millis(120_000);
+    let push = if status.upstream.is_some() {
+        run_git_process(&repo_root, &["push"], timeout)?
+    } else if status.has_origin {
+        run_git_process(
+            &repo_root,
+            &["push", "-u", "origin", branch.as_str()],
+            timeout,
+        )?
+    } else {
+        return Err("当前分支没有 upstream，且没有 origin remote".to_string());
+    };
+
+    if !push.success {
+        return Err(git_failure_message(&push));
+    }
+
+    get_git_status_for_workspace(&repo_root, true)
+}
+
+#[tauri::command]
+fn git_create_branch(
+    state: State<WorkspaceState>,
+    workspace: Option<String>,
+    branch: String,
+) -> Result<GitStatus, String> {
+    let branch = branch.trim();
+    if !is_valid_git_branch_name(branch) {
+        return Err("分支名不合法".to_string());
+    }
+
+    let workspace = resolve_workspace_root(&state, workspace)?;
+    let status = get_git_status_for_workspace(&workspace, true)?;
+    ensure_git_ready(&status)?;
+    let repo_root = status
+        .repo_root
+        .as_deref()
+        .ok_or_else(|| "无法确定 Git 仓库根目录".to_string())?;
+    let repo_root = PathBuf::from(repo_root);
+    let timeout = Duration::from_millis(60_000);
+
+    let check = run_git_process(
+        &repo_root,
+        &["check-ref-format", "--branch", branch],
+        timeout,
+    )?;
+    if !check.success {
+        return Err(git_failure_message(&check));
+    }
+
+    let created = run_git_process(&repo_root, &["switch", "-c", branch], timeout)?;
+    if !created.success {
+        return Err(git_failure_message(&created));
+    }
+
+    get_git_status_for_workspace(&repo_root, true)
 }
 
 fn start_pty_reader_thread(
@@ -4389,6 +4903,10 @@ pub fn run() {
             clear_pty_buffer,
             get_pty_status,
             run_command,
+            get_git_status,
+            git_commit_all,
+            git_push_current_branch,
+            git_create_branch,
             count_tokens,
             get_system_memory,
             append_debug_log,
@@ -4439,6 +4957,10 @@ pub fn run() {
 mod tests {
     use super::{
         compare_file_nodes,
+        is_valid_git_branch_name,
+        parse_git_branch_line,
+        parse_git_numstat,
+        parse_git_porcelain_status,
         resolve_existing_path,
         resolve_write_path,
         should_hide_list_directory_entry,
@@ -4542,5 +5064,69 @@ mod tests {
         nodes.sort_by(compare_file_nodes);
         let ordered_names: Vec<&str> = nodes.iter().map(|node| node.name.as_str()).collect();
         assert_eq!(ordered_names, vec!["Scripts", "capabilities", "Cargo.toml", "README.md"]);
+    }
+
+    #[test]
+    fn parse_git_branch_line_extracts_upstream_and_divergence() {
+        let info = parse_git_branch_line("## feature/ui...origin/feature/ui [ahead 2, behind 1]");
+
+        assert_eq!(info.branch.as_deref(), Some("feature/ui"));
+        assert_eq!(info.upstream.as_deref(), Some("origin/feature/ui"));
+        assert_eq!(info.ahead, 2);
+        assert_eq!(info.behind, 1);
+    }
+
+    #[test]
+    fn parse_git_branch_line_handles_repo_without_head_commit() {
+        let info = parse_git_branch_line("## No commits yet on main");
+
+        assert_eq!(info.branch.as_deref(), Some("main"));
+        assert_eq!(info.upstream, None);
+        assert_eq!(info.ahead, 0);
+        assert_eq!(info.behind, 0);
+    }
+
+    #[test]
+    fn parse_git_porcelain_status_counts_worktree_states() {
+        let output = [
+            "## main...origin/main [ahead 1]",
+            " M src/App.tsx",
+            "M  src/lib/ipc.ts",
+            "A  src/new.ts",
+            "?? notes.md",
+            "UU conflicted.txt",
+        ]
+        .join("\n");
+
+        let (branch, counts) = parse_git_porcelain_status(&output);
+
+        assert_eq!(branch.branch.as_deref(), Some("main"));
+        assert_eq!(branch.ahead, 1);
+        assert_eq!(counts.changed_files, 5);
+        assert_eq!(counts.unstaged_files, 1);
+        assert_eq!(counts.staged_files, 2);
+        assert_eq!(counts.untracked_files, 1);
+        assert_eq!(counts.conflicted_files, 1);
+    }
+
+    #[test]
+    fn parse_git_numstat_sums_text_changes_and_ignores_binary_rows() {
+        let counts = parse_git_numstat("10\t2\tsrc/a.ts\n-\t-\tpublic/logo.png\n3\t0\tsrc/b.ts\n");
+
+        assert_eq!(counts.insertions, 13);
+        assert_eq!(counts.deletions, 2);
+    }
+
+    #[test]
+    fn git_branch_name_validation_rejects_risky_names() {
+        assert!(is_valid_git_branch_name("feature/sidebar-git"));
+        assert!(is_valid_git_branch_name("release/1.5.1"));
+        assert!(!is_valid_git_branch_name(""));
+        assert!(!is_valid_git_branch_name("-oops"));
+        assert!(!is_valid_git_branch_name("feature bad"));
+        assert!(!is_valid_git_branch_name("feature..bad"));
+        assert!(!is_valid_git_branch_name("feature/@{bad"));
+        assert!(!is_valid_git_branch_name("feature.lock"));
+        assert!(!is_valid_git_branch_name("HEAD"));
     }
 }

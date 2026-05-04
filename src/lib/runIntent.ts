@@ -81,6 +81,7 @@ export interface ResolveTurnRunIntentContext {
     | "executing"
     | "completed";
   isPlanApproved: boolean;
+  previousTurnIntent?: ResolvedRunIntent | null;
 }
 
 export interface RunIntentPolicy {
@@ -231,6 +232,10 @@ const STRONG_EXECUTE_PATTERNS = [
   /\bgit\s+(?:add|commit|push|status|diff)\b/i,
   /\bcommit (?:and )?push(?: my| the| these)?(?: changes)?\b/i,
   /\bpush (?:my|the|these|current)? ?(?:changes|branch|commits)\b/i,
+  /(?:直接|开始|继续|立即|马上|现在)?(?:执行|运行).{0,16}(?:部署脚本|deploy(?:\.sh)?|deployment script|脚本|命令)/i,
+  /(?:把|将)?.{0,32}(?:同步|部署|上传|发布).{0,32}(?:服务器|远程|生产|线上|server|remote|production)/i,
+  /(?:服务器|远程|生产|线上|server|remote|production).{0,32}(?:同步|部署|上传|发布)/i,
+  /\b(?:run|execute|start).{0,24}(?:deploy(?:\.sh)?|deployment script|command)\b/i,
   /\b(?:apply|patch|build it|go implement|implement it|fix it|ship it)\b/i,
 ];
 
@@ -1000,6 +1005,19 @@ export function resolveTurnRunIntent(
   }
 
   if (context.mainModeKey === "game_studio") {
+    if (context.previousTurnIntent === "studio_workflow") {
+      return {
+        intent: "studio_workflow",
+        reason: localizeReason(
+          language,
+          "上一轮为 Game Studio 工作流，本轮延续工作室流程。",
+          "The previous turn was a Game Studio workflow, so this turn continues the studio workflow.",
+        ),
+        confidence: 0.92,
+        bypassMainRouter: true,
+        riskLevel: "medium",
+      };
+    }
     return {
       intent: "discuss",
       reason: localizeReason(

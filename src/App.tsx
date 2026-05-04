@@ -672,11 +672,25 @@ export default function App() {
     }
 
     const shouldReuseSourceTurn = !!sourceTurnId && !!sourceTurn;
+    const shouldExecuteFromQuickReply = optionAction === "execute_once" && sourceIntent !== "plan";
     const sendOptions = shouldReuseSourceTurn
       ? {
           reuseCurrentTurn: true,
           preservePlanState: sourceIntent === "plan",
-          resolvedIntent: sourceIntent,
+          resolvedIntent: shouldExecuteFromQuickReply ? "execute" as const : sourceIntent,
+          ...(shouldExecuteFromQuickReply
+            ? {
+                runtimeIntentOverride: "execute" as const,
+                executionConsentGranted: true,
+              }
+            : {}),
+          skipIntentResolution: true,
+        }
+      : shouldExecuteFromQuickReply
+      ? {
+          resolvedIntent: "execute" as const,
+          runtimeIntentOverride: "execute" as const,
+          executionConsentGranted: true,
           skipIntentResolution: true,
         }
       : undefined;
@@ -687,6 +701,9 @@ export default function App() {
       contextMentions: [],
       attachedFiles: [],
       ...(optionAction === "allow_readonly_session" ? { readOnlyAutoApproveForSession: true } : {}),
+      ...(shouldExecuteFromQuickReply && sourceTurnId
+        ? { currentTurnExecutionConsent: { turnId: sourceTurnId, granted: true } }
+        : {}),
     });
 
     runAfterNextPaint(() => {

@@ -132,7 +132,7 @@ export interface ChangeEntry {
 export interface ReplyOption {
   label: string;
   value: string;
-  action?: "continue_readonly_once" | "allow_readonly_session";
+  action?: "continue_readonly_once" | "allow_readonly_session" | "execute_once";
 }
 
 export type ConversationTurnStatus =
@@ -380,6 +380,11 @@ export function detectPlanArtifactKind(path: string): PlanArtifactKind | null {
   if (normalized.endsWith("tasks.md")) return "tasks";
   if (normalized.endsWith("bugfix.md")) return "bugfix";
   return null;
+}
+
+export function isEphemeralPlanArtifactPath(path: string | undefined | null): boolean {
+  const kind = detectPlanArtifactKind(String(path || ""));
+  return kind === "requirements" || kind === "design" || kind === "tasks";
 }
 
 export function isPlanConversationTurn(turn: ConversationTurn | null | undefined): boolean {
@@ -942,8 +947,10 @@ export function collectChangeEntries(
     if (block.toolName !== "write_file" && block.toolName !== "replace_in_file") return;
     if (block.revertStatus === "reverted") return;
 
-    totalExecutedEdits++;
     const target = String(block.target || block.diff.path || block.toolName || "");
+    if (isEphemeralPlanArtifactPath(target)) return;
+
+    totalExecutedEdits++;
     const displayTarget = target.split("/").pop() || target;
     const stats = getStats(block.diff.old, block.diff.new);
     const existingIndex = indexByTarget.get(target);

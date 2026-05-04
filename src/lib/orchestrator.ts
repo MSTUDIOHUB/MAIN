@@ -47,6 +47,7 @@ import {
   extractPlanTasks,
   findDroppedPlanTasks,
   getPendingPlanTaskCommandFocus,
+  isEphemeralPlanArtifactPath,
   isPlanTaskTrustedComplete,
   validatePlanArtifactContent,
   type PlanExecutionEvidenceEntry,
@@ -150,6 +151,11 @@ function isExecutionPlanArtifactWrite(name: string, args: Record<string, unknown
 function isTasksPlanWrite(name: string, args: Record<string, unknown>): boolean {
   const target = getPlanArtifactMutationTarget(name, args);
   return !!target && target.fileName === "tasks.md";
+}
+
+function isEphemeralPlanArtifactMutation(name: string, args: Record<string, unknown>): boolean {
+  if (!PLAN_ARTIFACT_MUTATION_TOOLS.has(name)) return false;
+  return isEphemeralPlanArtifactPath((args.path as string) || "");
 }
 
 function isPlanArtifactPath(path: string): boolean {
@@ -1241,7 +1247,9 @@ async function executeToolCallWithLifecycle(
     return planArtifactValidationError;
   }
 
-  const diffPreview = await buildToolDiffPreview(tc.name, effectiveArgs, { workspace, sessionKey });
+  const diffPreview = isEphemeralPlanArtifactMutation(tc.name, effectiveArgs)
+    ? undefined
+    : await buildToolDiffPreview(tc.name, effectiveArgs, { workspace, sessionKey });
   callbacks.onToolExecuting(tc.name, target, diffPreview);
 
   try {

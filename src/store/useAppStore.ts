@@ -40,6 +40,7 @@ import {
   findDroppedPlanTasks,
   getPendingPlanTaskCommandFocus,
   getPlanArtifactTitle,
+  isEphemeralPlanArtifactPath,
   isGenericConversationTitle,
   looksLikeReasoningLeakTitle,
   normalizeConversationDisplayTitle,
@@ -928,6 +929,7 @@ interface AppState {
       preservePlanState?: boolean;
       resolvedIntent?: ResolvedUserIntent;
       runtimeIntentOverride?: ResolvedUserIntent;
+      executionConsentGranted?: boolean;
       skipIntentResolution?: boolean;
       turnTitle?: string;
       intentSummary?: string;
@@ -4019,6 +4021,7 @@ export const useAppStore = create<AppState>()(
     preservePlanState?: boolean;
     resolvedIntent?: ResolvedRunIntent;
     runtimeIntentOverride?: ResolvedRunIntent;
+    executionConsentGranted?: boolean;
     skipIntentResolution?: boolean;
     turnTitle?: string;
     intentSummary?: string;
@@ -4185,6 +4188,7 @@ export const useAppStore = create<AppState>()(
         hasPlanArtifacts,
         planStage: state.planStage,
         isPlanApproved: state.isPlanApproved,
+        previousTurnIntent: currentTurnIntent,
       });
       effectiveIntentSummary = buildRunIntentSummary({
         input: text,
@@ -4347,6 +4351,7 @@ export const useAppStore = create<AppState>()(
     const effectiveIntentPolicy = getIntentPolicy(effectiveRunIntent);
     const effectiveWorkflowMode = effectiveIntentPolicy.workflowMode;
     const runtimeRunIntent = options?.runtimeIntentOverride || effectiveRunIntent;
+    const shouldGrantExecutionConsentForTurn = options?.executionConsentGranted === true;
     const initialTurnStatus: ConversationTurnStatus = effectiveRunIntent === "plan" ? "planning" : "executing";
 
     // Reset plan approval state at the start of each new request
@@ -4917,6 +4922,9 @@ export const useAppStore = create<AppState>()(
       config: { ...s.config, workflowMode: effectiveWorkflowMode },
       ...(preservePlanState ? {} : { isPlanApproved: false, planApprovalChoice: null }),
       ...(preservePlanState ? {} : { planAutoResumeCount: 0, planExecutionProgressSnapshot: null }),
+      ...(shouldGrantExecutionConsentForTurn
+        ? { currentTurnExecutionConsent: { turnId, granted: true } }
+        : {}),
       elapsedTime: 0,
     }));
 
@@ -5959,6 +5967,9 @@ export const useAppStore = create<AppState>()(
         onToolExecuting: (toolName, target, diffPreview) => {
           let runningTaskId: number | null = null;
           let shouldAttachDiff = false;
+          const isEphemeralPlanArtifactTool =
+            (toolName === "write_file" || toolName === "replace_in_file") &&
+            isEphemeralPlanArtifactPath(target);
 
           sessionSet((s) => {
             const pendingIdx = [...s.taskFlow]
@@ -5977,7 +5988,7 @@ export const useAppStore = create<AppState>()(
               const pendingTask = nextFlow[pendingIdx];
               if (pendingTask?.type === "tool") {
                 runningTaskId = pendingTask.id;
-                shouldAttachDiff = !pendingTask.diff && !!diffPreview;
+                shouldAttachDiff = !isEphemeralPlanArtifactTool && !pendingTask.diff && !!diffPreview;
                 nextFlow[pendingIdx] = {
                   ...pendingTask,
                   toolStatus: "running",
@@ -5988,7 +5999,7 @@ export const useAppStore = create<AppState>()(
             } else {
               appendedBlockId = nextId();
               runningTaskId = appendedBlockId;
-              shouldAttachDiff = !!diffPreview && supportsToolDiffPreview(toolName);
+              shouldAttachDiff = !isEphemeralPlanArtifactTool && !!diffPreview && supportsToolDiffPreview(toolName);
               nextFlow.push({
                 id: appendedBlockId,
                 turnId,
@@ -6023,15 +6034,20 @@ export const useAppStore = create<AppState>()(
             }));
           }
 
-          emitLocalPlanExecutionProgress("tool_start", {
-            currentTool: `${toolName}${target ? ` ${target}` : ""}`,
-            nextStep: sessionGet().config.language === "en"
-              ? "wait for this tool result, then update evidence"
-              : "等待该工具返回结果，然后更新执行证据",
-          });
+          if (!isEphemeralPlanArtifactTool) {
+            emitLocalPlanExecutionProgress("tool_start", {
+              currentTool: `${toolName}${target ? ` ${target}` : ""}`,
+              nextStep: sessionGet().config.language === "en"
+                ? "wait for this tool result, then update evidence"
+                : "等待该工具返回结果，然后更新执行证据",
+            });
+          }
         },
 
         onToolDone: (toolName, target, result) => {
+          const isEphemeralPlanArtifactTool =
+            (toolName === "write_file" || toolName === "replace_in_file") &&
+            isEphemeralPlanArtifactPath(target);
           sessionSet((s) => {
             let idx = -1;
             for (let i = s.taskFlow.length - 1; i >= 0; i--) {
@@ -6090,12 +6106,14 @@ export const useAppStore = create<AppState>()(
                 : {}),
             };
           });
-          emitLocalPlanExecutionProgress("tool_done", {
-            currentTool: `${toolName}${target ? ` ${target}` : ""}`,
-            nextStep: sessionGet().config.language === "en"
-              ? "continue with the next task whose evidence is not satisfied"
-              : "继续下一个证据未满足的任务",
-          });
+          if (!isEphemeralPlanArtifactTool) {
+            emitLocalPlanExecutionProgress("tool_done", {
+              currentTool: `${toolName}${target ? ` ${target}` : ""}`,
+              nextStep: sessionGet().config.language === "en"
+                ? "continue with the next task whose evidence is not satisfied"
+                : "继续下一个证据未满足的任务",
+            });
+          }
           if (
             toolName === "write_file" ||
             toolName === "replace_in_file" ||
@@ -6614,6 +6632,13 @@ export const useAppStore = create<AppState>()(
         requestReview: (toolCall) => {
           // ── Auto-approve path ──
           if (sessionGet().autoApproveTools) {
+            return Promise.resolve({ action: "accept" });
+          }
+          const toolTarget = getToolTarget(toolCall.name, toolCall.arguments);
+          const isEphemeralPlanArtifactTool =
+            (toolCall.name === "write_file" || toolCall.name === "replace_in_file") &&
+            isEphemeralPlanArtifactPath(toolTarget);
+          if (isEphemeralPlanArtifactTool) {
             return Promise.resolve({ action: "accept" });
           }
 

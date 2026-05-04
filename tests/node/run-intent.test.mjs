@@ -131,6 +131,18 @@ test("Git status inspection resolves to execute for shell access", () => {
   assert.equal(result.needsDecision, undefined);
 });
 
+test("deployment and server sync requests resolve to execute", () => {
+  for (const input of [
+    "将本地网站同步到服务器里",
+    "直接执行部署脚本 deploy.sh",
+    "run deployment script",
+  ]) {
+    const result = resolveTurnRunIntent(input, createContext());
+    assert.equal(result.intent, "execute", input);
+    assert.equal(result.needsDecision, undefined, input);
+  }
+});
+
 test("design based implementation request approves an existing plan", () => {
   const result = resolveTurnRunIntent(
     "请根据设计方案 design.md 来完成修改",

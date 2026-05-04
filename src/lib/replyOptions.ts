@@ -2,7 +2,7 @@ import type { ReplyOption } from "./workflowModels";
 
 const USER_OPTIONS_BLOCK_RE = /<user_options>([\s\S]*?)<\/user_options>/gi;
 const OPTION_RE = /<option\b([^>]*)>([\s\S]*?)<\/option>/gi;
-const OPTION_ATTR_RE = /\b(label|value|text|title)\s*=\s*"([^"]*)"/gi;
+const OPTION_ATTR_RE = /\b(label|value|text|title|action)\s*=\s*"([^"]*)"/gi;
 const DECISION_CUE_RE = /(?:请选择|请确认|请告诉我|请说明|你可以选择|可选方案|备选方案|选项|选择下一步|下一步可以|选一个|选一项|任选其一|从下面.*选|options?|choices?|would you like|do you want|please choose|please confirm|choose one|pick one|select one)/i;
 const ENUMERATED_DECISION_CUE_RE = /(?:请选择|请确认|选一个|选一项|任选其一|从下面.*选|please choose|please confirm|choose one|pick one|select one)/i;
 const ENUM_OPTION_RE = /^\s*(?:[-*]|(?:\d+|[A-Za-z])[\.\)、:：])\s+(.+?)\s*$/;
@@ -12,6 +12,8 @@ const READONLY_PERMISSION_CUE_RE = /(?:是否|能否|可否|要不要|是否同�
 const READONLY_ACTION_RE = /(?:读取|查看|分析|检查|扫描|搜索|查询|浏览|梳理|提取|汇总|read|open|view|inspect|analy[sz]e|scan|search|query|review|summari[sz]e)/i;
 const READONLY_WRITE_EXCLUSION_RE = /(?:写入|修改|删除|创建|执行命令|运行命令|改动|更改|write|modify|delete|create|edit|run command|execute command)/i;
 const READONLY_TARGET_RE = /[`"“']([^`"“”']{2,160})[`"”']|([A-Za-z0-9_.\-\/\\]+\.[A-Za-z0-9]{1,12})/;
+const EXECUTE_REPLY_NEGATION_RE = /(?:不(?:要|用|进入|开始|继续)?执行|不运行|不部署|暂不执行|暂不运行|继续讨论|先确认|我来确认|don't execute|do not execute|do not run|don't run|not execute|not run|discuss first|confirm first)/i;
+const EXECUTE_REPLY_ACTION_RE = /(?:直接|开始|继续|立即|马上|现在)?(?:执行|运行|部署|发布|同步|上传|实现|处理)(?:部署脚本|脚本|命令|deploy(?:\.sh)?|deployment script|command)?|(?:deploy(?:\.sh)?|部署脚本|执行命令|运行命令)|\b(?:run|execute|deploy|ship|implement)(?:\s+(?:the\s+)?)?(?:deploy(?:\.sh)?|deployment script|script|command)?\b/i;
 const PLAN_ARTIFACT_PATH_RE = /\.MAIN[\/\\]plans[\/\\](?:requirements|design|bugfix|tasks)\.md/i;
 const PLAN_ARTIFACT_FILE_RE = /\b(?:requirements|design|bugfix|tasks)\.md\b/i;
 const PLAN_ARTIFACT_DOC_RE = /(?:计划文档|计划文件|规划文档|规划文件|plan documents?|plan files?|planning documents?|planning files?)/i;
@@ -71,7 +73,8 @@ function addReplyOption(
   if (looksLikeInternalPlanArtifactStep(label) || looksLikeInternalPlanArtifactStep(value)) return;
   if (looksLikePlanSummaryItem(label) || looksLikePlanSummaryItem(value)) return;
   seenValues.add(value);
-  replyOptions.push({ label, value, ...(action ? { action } : {}) });
+  const resolvedAction = action ?? inferReplyOptionAction(label, value);
+  replyOptions.push({ label, value, ...(resolvedAction ? { action: resolvedAction } : {}) });
 }
 
 function parseOptionAttributes(rawAttributes: string): Record<string, string> {
@@ -84,6 +87,29 @@ function parseOptionAttributes(rawAttributes: string): Record<string, string> {
     if (key && value) attrs[key] = value;
   }
   return attrs;
+}
+
+function normalizeReplyOptionAction(value: string | undefined): ReplyOption["action"] | undefined {
+  const normalized = String(value || "").trim();
+  if (
+    normalized === "continue_readonly_once" ||
+    normalized === "allow_readonly_session" ||
+    normalized === "execute_once"
+  ) {
+    return normalized;
+  }
+  return undefined;
+}
+
+function looksLikeExecuteReplyOption(text: string): boolean {
+  const normalized = normalizeOptionText(text);
+  if (!normalized || EXECUTE_REPLY_NEGATION_RE.test(normalized)) return false;
+  return EXECUTE_REPLY_ACTION_RE.test(normalized);
+}
+
+function inferReplyOptionAction(label: string, value: string): ReplyOption["action"] | undefined {
+  const combined = `${label}\n${value}`;
+  return looksLikeExecuteReplyOption(combined) ? "execute_once" : undefined;
 }
 
 function convertAssistantClauseToUserChoice(clause: string): string {
@@ -318,8 +344,9 @@ export function extractReplyOptions(text: string): {
         const bodyValue = normalizeOptionText(optionMatch[2] || "");
         const value = attrValue || bodyValue || attrLabel;
         const label = attrLabel || bodyValue || attrValue;
+        const action = normalizeReplyOptionAction(attrs.action);
 
-        addReplyOption(replyOptions, seenValues, label, value);
+        addReplyOption(replyOptions, seenValues, label, value, action);
       }
 
       return "";

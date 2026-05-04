@@ -2,6 +2,7 @@ import type { PlanArtifact, PlanStage, ReplyOption } from "./workflowModels";
 
 const REVIEWABLE_PLAN_STAGES = new Set<PlanStage>(["design", "bugfix", "ready_to_execute"]);
 const REVIEWABLE_PLAN_ARTIFACTS = new Set(["design", "bugfix", "tasks"]);
+const PLAN_EXECUTION_CHOICE_RE = /(?:直接|开始|继续|立即|马上|现在)?(?:执行|运行|部署|发布|同步|上传)(?:.{0,24}(?:脚本|命令|deploy(?:\.sh)?|deployment|server|服务器|远程|生产|线上))?|\b(?:run|execute|deploy|publish|ship|sync)(?:.{0,24}(?:script|command|deploy(?:\.sh)?|deployment|server|remote|production))?\b/i;
 
 export function hasReviewablePlanContext(input: {
   planArtifacts?: PlanArtifact[];
@@ -22,6 +23,12 @@ export function looksLikePlanApprovalQuickReply(text: string): boolean {
     /confirm.{0,20}(?:execution|start)/i.test(normalized) ||
     /start execution/i.test(normalized)
   );
+}
+
+function looksLikePlanExecutionChoice(text: string): boolean {
+  const normalized = String(text || "").replace(/\s+/g, " ").trim();
+  if (!normalized) return false;
+  return PLAN_EXECUTION_CHOICE_RE.test(normalized);
 }
 
 export function normalizePlanApprovalChoice(text: string | null | undefined): string {
@@ -49,9 +56,10 @@ export function shouldRouteQuickReplyToPlanApproval(input: {
   planArtifacts?: PlanArtifact[];
   planStage?: PlanStage;
 }): boolean {
-  if (input.optionAction) return false;
+  if (input.optionAction && input.optionAction !== "execute_once") return false;
   if (input.sourceIntent !== "plan") return false;
   if (input.isPlanApproved) return false;
   if (!hasReviewablePlanContext(input)) return false;
+  if (input.optionAction === "execute_once" && looksLikePlanExecutionChoice(input.text)) return true;
   return looksLikePlanApprovalQuickReply(input.text);
 }

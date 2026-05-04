@@ -16,6 +16,18 @@ test("reply options pause the turn and continue within the same turn after selec
   await expect(page.getByTestId("reply-option-0")).toHaveCount(0);
   await expect(page.getByTestId("top-island-awaiting-choice")).toBeVisible();
   await expect(page.getByTestId("top-island-reply-option-0")).toBeVisible();
+  await expect(page.getByTestId("top-island-collapse-options")).toContainText("收起选项");
+
+  await page.getByTestId("top-island-collapse-options").click();
+  await expect(page.getByTestId("top-island-awaiting-choice")).toHaveCount(0);
+  await expect(page.getByTestId("top-island-show-options")).toContainText("展开选项");
+
+  await page.getByTestId("top-island-shell").hover();
+  await expect(page.getByTestId("top-island-awaiting-choice")).toHaveCount(0);
+
+  await page.getByTestId("top-island-show-options").click();
+  await expect(page.getByTestId("top-island-awaiting-choice")).toBeVisible();
+  await expect(page.getByTestId("top-island-reply-option-0")).toBeVisible();
 
   await page.getByTestId("top-island-reply-option-0").click();
 

@@ -23,7 +23,9 @@ const SESSION_AUTO_CREATE_SCENARIO = "session-auto-create";
 const CLOUD_TOOL_FALLBACK_SCENARIO = "cloud-tool-fallback";
 const REPLY_OPTIONS_TOOL_PAUSE_SCENARIO = "reply-options-tool-pause";
 const PLAN_APPROVAL_EXECUTE_TOOLS_SCENARIO = "plan-approval-execute-tools";
+const EXECUTE_QUICK_REPLY_RUNTIME_SCENARIO = "execute-quick-reply-runtime";
 const TOP_ISLAND_EXECUTION_PROGRESS_SCENARIO = "top-island-execution-progress";
+const TOP_ISLAND_PLAN_TASK_PROGRESS_SCENARIO = "top-island-plan-task-progress";
 const SIDEBAR_REMOVE_LAST_WORKSPACE_SCENARIO = "sidebar-remove-last-workspace";
 const E2E_SEED_COUNT_PREFIX = "__CODELY_E2E_SEED_COUNT__:";
 
@@ -1335,7 +1337,13 @@ function seedPlanReplaceRefreshScenario() {
       },
     ],
     planTasks: [
-      { id: "replace-task-1", text: "补齐计划文档与需求说明", status: "completed", evidenceStatus: "satisfied" },
+      {
+        id: "replace-task-1",
+        text: "补齐计划文档与需求说明",
+        status: "completed",
+        evidenceStatus: "satisfied",
+        evidence: [{ kind: "file", value: "plan-output.md" }],
+      },
       { id: "replace-task-2", text: "保存方案供用户留档", status: "in_progress" },
       { id: "replace-task-3", text: "批准执行并完成最终收尾", status: "pending" },
     ],
@@ -1370,64 +1378,72 @@ function seedPlanReplaceRefreshScenario() {
   appendBridgeEvent("seeded", { seedCount: readSeedCount(PLAN_REPLACE_REFRESH_SCENARIO) });
   bindBridgeSnapshot(PLAN_REPLACE_REFRESH_SCENARIO);
 
+  const replacePlanTasks = async () => {
+    const updatedTasksContent = [
+      "# Tasks",
+      "",
+      "- [x] 补齐计划文档与需求说明 — 证据: file:plan-output.md",
+      "- [x] 保存方案供用户留档（已完成） — 证据: file:saved-plan.md",
+      "- [ ] 批准执行并完成最终收尾 — 证据: file:final-summary.md",
+    ].join("\n");
+
+    useAppStore.setState((state) => ({
+      planExecutionEvidenceLedger: [
+        ...state.planExecutionEvidenceLedger,
+        {
+          id: "e2e-replace-evidence-2",
+          kind: "file",
+          value: "saved-plan.md",
+          target: "saved-plan.md",
+          sourceTool: "write_file",
+          createdAt: Date.now(),
+        },
+      ],
+      planExecutionEvidenceCount: state.planExecutionEvidenceCount + 1,
+    }));
+
+    await syncPlanArtifactAfterToolSuccess(
+      "replace_in_file",
+      {
+        path: ".MAIN/plans/tasks.md",
+        search_text: "- [ ] 保存方案供用户留档 — 证据: file:saved-plan.md",
+        replace_text: "- [x] 保存方案供用户留档（已完成） — 证据: file:saved-plan.md",
+      },
+      {
+        onPlanArtifactUpdated: (path, content, kind) => {
+          const state = useAppStore.getState();
+          state.upsertPlanArtifact({
+            kind,
+            path,
+            title: getPlanArtifactTitle(kind, state.config.language === "en" ? "en" : "zh"),
+            content,
+            updatedAt: Date.now(),
+          });
+        },
+        onPlanTasksUpdated: () => {},
+      },
+      {
+        readFile: async () => updatedTasksContent,
+        warn: (message, error) => console.warn(message, error),
+      },
+    );
+
+    const current = useAppStore.getState();
+    appendBridgeEvent("tasks-replaced", {
+      statuses: current.planTasks.map((task) => task.status),
+      artifactContent: current.planArtifacts.find((artifact) => artifact.kind === "tasks")?.content ?? "",
+    });
+  };
+
   let replaceTimer: number | null = window.setTimeout(() => {
-    void (async () => {
-      const updatedTasksContent = [
-        "# Tasks",
-        "",
-        "- [x] 补齐计划文档与需求说明 — 证据: file:plan-output.md",
-        "- [x] 保存方案供用户留档（已完成） — 证据: file:saved-plan.md",
-        "- [ ] 批准执行并完成最终收尾 — 证据: file:final-summary.md",
-      ].join("\n");
-
-      useAppStore.setState((state) => ({
-        planExecutionEvidenceLedger: [
-          ...state.planExecutionEvidenceLedger,
-          {
-            id: "e2e-replace-evidence-2",
-            kind: "file",
-            value: "saved-plan.md",
-            target: "saved-plan.md",
-            sourceTool: "write_file",
-            createdAt: Date.now(),
-          },
-        ],
-        planExecutionEvidenceCount: state.planExecutionEvidenceCount + 1,
-      }));
-
-      await syncPlanArtifactAfterToolSuccess(
-        "replace_in_file",
-        {
-          path: ".MAIN/plans/tasks.md",
-          search_text: "- [ ] 保存方案供用户留档 — 证据: file:saved-plan.md",
-          replace_text: "- [x] 保存方案供用户留档（已完成） — 证据: file:saved-plan.md",
-        },
-        {
-          onPlanArtifactUpdated: (path, content, kind) => {
-            const state = useAppStore.getState();
-            state.upsertPlanArtifact({
-              kind,
-              path,
-              title: getPlanArtifactTitle(kind, state.config.language === "en" ? "en" : "zh"),
-              content,
-              updatedAt: Date.now(),
-            });
-          },
-          onPlanTasksUpdated: () => {},
-        },
-        {
-          readFile: async () => updatedTasksContent,
-          warn: (message, error) => console.warn(message, error),
-        },
-      );
-
-      const current = useAppStore.getState();
-      appendBridgeEvent("tasks-replaced", {
-        statuses: current.planTasks.map((task) => task.status),
-        artifactContent: current.planArtifacts.find((artifact) => artifact.kind === "tasks")?.content ?? "",
-      });
-    })();
-  }, 1500);
+    void replacePlanTasks();
+  }, 30_000);
+  bridge.replacePlanTasks = () => {
+    if (replaceTimer != null) window.clearTimeout(replaceTimer);
+    replaceTimer = null;
+    void replacePlanTasks();
+    return true;
+  };
 
   const cleanup = () => {
     if (replaceTimer != null) window.clearTimeout(replaceTimer);
@@ -1560,6 +1576,122 @@ function seedTopIslandExecutionProgressScenario() {
   };
 
   bridge.cleanup = cleanup;
+  return cleanup;
+}
+
+function seedTopIslandPlanTaskProgressScenario() {
+  const bridge = getBridge();
+  if (!bridge) return undefined;
+
+  bridge.events = [{ type: "boot" }];
+  bridge.savedDocuments = [];
+  bridge.completed = false;
+
+  const workspace = "/tmp/e2e-top-island-plan-task-progress";
+  const sessionId = 999602;
+  const now = Date.now();
+  const turnId = "e2e-top-island-plan-task-progress-turn";
+  const userBlockId = useAppStore.getState()._nextTaskId();
+  const planTasks = Array.from({ length: 9 }, (_, index) => {
+    const taskNumber = index + 1;
+    const filePath = `src/task-${taskNumber}.ts`;
+    return {
+      id: `plan-task-${taskNumber}`,
+      text: `T${taskNumber}: 更新 ${filePath} — 证据: file:${filePath}`,
+      status: taskNumber === 9 ? "in_progress" as const : "completed" as const,
+      claimedStatus: taskNumber === 9 ? "pending" as const : "completed" as const,
+      evidence: [{ kind: "file" as const, value: filePath }],
+      evidenceStatus: taskNumber === 9 ? "missing" as const : "satisfied" as const,
+      ...(taskNumber === 9 ? { blockedReason: "缺少真实执行证据，暂不能标记完成" } : {}),
+    };
+  });
+  const evidenceLedger = planTasks.slice(0, 8).map((_, index) => ({
+    id: `evidence-${index + 1}`,
+    kind: "file" as const,
+    value: `src/task-${index + 1}.ts`,
+    target: `src/task-${index + 1}.ts`,
+    sourceTool: "replace_in_file",
+    createdAt: now + index,
+  }));
+
+  incrementSeedCount(TOP_ISLAND_PLAN_TASK_PROGRESS_SCENARIO);
+
+  useAppStore.setState((state) => ({
+    ...state,
+    config: {
+      ...state.config,
+      language: "zh",
+      workflowMode: "plan",
+    },
+    currentWorkspace: workspace,
+    sessionsByWorkspace: {
+      [workspace]: [
+        {
+          id: sessionId,
+          title: "E2E TopIsland Plan Task Progress",
+          date: new Date(now).toISOString(),
+          active: true,
+          messages: [],
+        },
+      ],
+    },
+    currentSessionId: sessionId,
+    taskFlow: [
+      { id: userBlockId, turnId, type: "user", content: "/计划 执行 9 个任务并追踪进度。" },
+    ],
+    conversationTurns: [
+      {
+        id: turnId,
+        userPrompt: "/计划 执行 9 个任务并追踪进度。",
+        title: "计划任务进度回归",
+        mode: "plan",
+        intent: "plan",
+        status: "executing",
+        summary: "计划执行阶段 TopIsland 应展示完整任务列表。",
+        blockIds: [userBlockId],
+        collapsed: false,
+        createdAt: now,
+      },
+    ],
+    currentTurnId: turnId,
+    planArtifacts: [
+      {
+        kind: "tasks",
+        path: ".MAIN/plans/tasks.md",
+        title: "Tasks",
+        content: planTasks.map((task) => `- [${task.status === "completed" ? "x" : " "}] ${task.text}`).join("\n"),
+        updatedAt: now,
+      },
+    ],
+    planTasks,
+    planExecutionEvidenceLedger: evidenceLedger,
+    planExecutionEvidenceCount: evidenceLedger.length,
+    planStage: "executing",
+    isPlanApproved: true,
+    showPlanPanel: true,
+    showDiff: false,
+    showTerminal: false,
+    showFilePanel: false,
+    rightPanelTab: "plan",
+    agentStatus: "running",
+    isGenerating: true,
+    abortController: new AbortController(),
+    pendingReviewResolve: null,
+    pendingReviewTaskId: null,
+    pendingToolCall: null,
+    selectedDiffTaskId: null,
+    input: "",
+    attachedFiles: [],
+    contextMentions: [],
+  }));
+
+  appendBridgeEvent("seeded", { seedCount: readSeedCount(TOP_ISLAND_PLAN_TASK_PROGRESS_SCENARIO) });
+  bindBridgeSnapshot(TOP_ISLAND_PLAN_TASK_PROGRESS_SCENARIO);
+
+  const cleanup = () => {
+    useAppStore.setState({ abortController: null, isGenerating: false, agentStatus: "idle" });
+  };
+
   return cleanup;
 }
 
@@ -2350,6 +2482,7 @@ function seedCloudToolProtocolScenario(scenario: string) {
       agentStatus: state.agentStatus,
       isGenerating: state.isGenerating,
       currentTurnStatus: currentTurn?.status ?? null,
+      currentTurnIntent: currentTurn?.intent ?? null,
       conversationTurns: state.conversationTurns.length,
       taskFlowBlocks: state.taskFlow.length,
       taskFlowUserCount: state.taskFlow.filter((block) => block.type === "user").length,
@@ -2957,6 +3090,10 @@ export function initializeE2EScenarios(): (() => void) | undefined {
     return seedCloudToolProtocolScenario(REPLY_OPTIONS_TOOL_PAUSE_SCENARIO);
   }
 
+  if (scenario === EXECUTE_QUICK_REPLY_RUNTIME_SCENARIO) {
+    return seedCloudToolProtocolScenario(EXECUTE_QUICK_REPLY_RUNTIME_SCENARIO);
+  }
+
   if (scenario === PLAN_APPROVAL_EXECUTE_TOOLS_SCENARIO) {
     return seedPlanApprovalExecuteToolsScenario();
   }
@@ -2967,6 +3104,10 @@ export function initializeE2EScenarios(): (() => void) | undefined {
 
   if (scenario === TOP_ISLAND_EXECUTION_PROGRESS_SCENARIO) {
     return seedTopIslandExecutionProgressScenario();
+  }
+
+  if (scenario === TOP_ISLAND_PLAN_TASK_PROGRESS_SCENARIO) {
+    return seedTopIslandPlanTaskProgressScenario();
   }
 
   

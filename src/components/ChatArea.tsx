@@ -21,6 +21,7 @@ import {
   buildPlanTaskEvidenceAudit,
   deriveVisibleConversationTurnStatus,
   isGenericConversationTitle,
+  isEphemeralPlanArtifactPath,
   normalizeConversationDisplayTitle,
   isPlanConversationTurn,
   looksLikeReasoningLeakTitle,
@@ -1651,6 +1652,12 @@ export default function ChatArea({
 
     if (block.type === "tool") {
       if (block.toolStatus === "pending") return null;
+      if (
+        (block.toolName === "write_file" || block.toolName === "replace_in_file") &&
+        isEphemeralPlanArtifactPath(block.target)
+      ) {
+        return null;
+      }
       const autoCollapse = index < taskFlow.length - 1 && taskFlow.findIndex((t, i) => i > index && t.type === "agent") !== -1;
       return (
         <div key={`${block.id}-${index}`} className="flex w-full justify-start">

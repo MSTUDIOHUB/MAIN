@@ -1,5 +1,5 @@
 import { memo, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
-import { IconColumns, IconFileText, IconLock, IconUnlock } from "./Icons";
+import { IconChevronDown, IconChevronUp, IconColumns, IconFileText, IconLock, IconUnlock } from "./Icons";
 import type { TurnProgressItem } from "../lib/turnProgress";
 import { buildPlanTaskEvidenceAudit, type PlanExecutionEvidenceEntry, type PlanStage, type PlanTask, type ReplyOption } from "../lib/workflowModels";
 import type { PendingRunDecision, ResolvedUserIntent } from "../lib/runIntent";
@@ -96,6 +96,7 @@ const TopIsland = memo(function TopIsland({
 }: TopIslandProps) {
   const [hovered, setHovered] = useState(false);
   const [pinnedOpen, setPinnedOpen] = useState(false);
+  const [manualChoiceCollapsedKey, setManualChoiceCollapsedKey] = useState<string | null>(null);
   const [customReplyText, setCustomReplyText] = useState("");
   const shellRef = useRef<HTMLDivElement | null>(null);
 
@@ -103,6 +104,16 @@ const TopIsland = memo(function TopIsland({
   const hasReplyOptions = replyOptions.length > 0;
   const hasPendingRunDecision = !!pendingRunDecision;
   const hasActiveDiffPreview = !!activeDiffTask?.diff;
+  const hasChoicePromptContent = hasReplyOptions || isAwaitingChoice || hasPendingRunDecision;
+  const choicePromptKey = useMemo(() => {
+    if (!hasChoicePromptContent) return "";
+    return [
+      isAwaitingChoice ? "awaiting" : "ready",
+      pendingRunDecision ? `${pendingRunDecision.kind}:${pendingRunDecision.title || ""}:${pendingRunDecision.reason || ""}` : "",
+      replyOptions.map((option) => `${option.label}:${option.value}`).join("|"),
+    ].join("::");
+  }, [hasChoicePromptContent, isAwaitingChoice, pendingRunDecision, replyOptions]);
+  const isChoicePromptManuallyCollapsed = !!choicePromptKey && manualChoiceCollapsedKey === choicePromptKey;
   const hasExpandableContent =
     hasReplyOptions ||
     isAwaitingChoice ||
@@ -111,8 +122,11 @@ const TopIsland = memo(function TopIsland({
     canApprovePlan ||
     planTasks.length > 0 ||
     executionSteps.length > 0;
-  const forceExpanded = hasReplyOptions || isAwaitingChoice || hasPendingRunDecision || !!activeDiffTask || canApprovePlan;
-  const actionable = forceExpanded || hasPendingRunDecision || !!activeDiffTask || canApprovePlan;
+  const hasNonChoiceExpandableContent = !!activeDiffTask || canApprovePlan || planTasks.length > 0 || executionSteps.length > 0;
+  const choicePromptForcesExpanded = hasChoicePromptContent && !isChoicePromptManuallyCollapsed;
+  const forceExpanded = choicePromptForcesExpanded || !!activeDiffTask || canApprovePlan;
+  const hoverExpandableContent = isChoicePromptManuallyCollapsed ? hasNonChoiceExpandableContent : hasExpandableContent;
+  const actionable = hasChoicePromptContent || !!activeDiffTask || canApprovePlan;
   const isPlanApprovalOnly =
     canApprovePlan &&
     !hasReplyOptions &&
@@ -143,26 +157,17 @@ const TopIsland = memo(function TopIsland({
     }));
   }, [activeProgressMode, auditedPlanTasks, executionSteps]);
   const hasTasks = progressItems.length > 0;
-  const shouldExpandWidth = forceExpanded || (hasExpandableContent && (hovered || pinnedOpen));
-  const isExpanded = forceExpanded || (hasExpandableContent && (hovered || pinnedOpen));
+  const shouldExpandWidth = forceExpanded || (hoverExpandableContent && (hovered || pinnedOpen));
+  const isExpanded = forceExpanded || (hoverExpandableContent && (hovered || pinnedOpen));
   // endregion
   const completedCount = progressItems.filter((item) => item.complete).length;
   const progress = progressItems.length > 0 ? Math.round((completedCount / progressItems.length) * 100) : 0;
-  const currentPhaseKey = useMemo(() => {
+  const currentPlanTaskId = useMemo(() => {
     if (activeProgressMode !== "plan") return null;
     const firstIncomplete = auditedPlanTasks.find((task) => !(task.evidenceStatus === "satisfied" && task.status === "completed")) || auditedPlanTasks[auditedPlanTasks.length - 1];
-    if (!firstIncomplete) return null;
-    const matched = firstIncomplete.text.match(/(?:Task|T)\s*([0-9]+)(?:[.\-][0-9]+)?/i);
-    return matched?.[1] || null;
+    return firstIncomplete?.id || null;
   }, [activeProgressMode, auditedPlanTasks]);
-  const visibleTasks = useMemo(() => {
-    if (activeProgressMode !== "plan" || !currentPhaseKey) return progressItems;
-    const grouped = progressItems.filter((task) => {
-      const matched = task.text.match(/(?:Task|T)\s*([0-9]+)(?:[.\-][0-9]+)?/i);
-      return (matched?.[1] || null) === currentPhaseKey;
-    });
-    return grouped.length > 0 ? grouped : progressItems;
-  }, [activeProgressMode, currentPhaseKey, progressItems]);
+  const visibleTasks = progressItems;
 
   const copy = useMemo(() => ({
     viewing: language === "zh" ? "当前查看" : "Viewing",
@@ -180,6 +185,8 @@ const TopIsland = memo(function TopIsland({
     waitingChoice: language === "zh" ? "等待选择" : "Awaiting Choice",
     pendingDecision: language === "zh" ? "待决定" : "Decision Needed",
     chooseToContinue: language === "zh" ? "选择下一步" : "Choose the next step",
+    showOptions: language === "zh" ? "展开选项" : "Show Options",
+    collapseOptions: language === "zh" ? "收起选项" : "Collapse Options",
     diffRequest: language === "zh" ? "待确认变更" : "Pending Change",
     chooseApproval: language === "zh" ? "请选择审批方式" : "Choose an approval option",
     choiceHint: language === "zh"
@@ -206,12 +213,8 @@ const TopIsland = memo(function TopIsland({
       ? `共 ${progressItems.length} 个任务，已完成 ${completedCount} 个`
       : `${completedCount}/${progressItems.length} tasks completed`,
     executionStage: language === "zh" ? "执行步骤" : "Execution",
-    phaseLabel: currentPhaseKey
-      ? language === "zh"
-        ? `阶段 ${currentPhaseKey}`
-        : `Phase ${currentPhaseKey}`
-      : "",
-  }), [activeProgressMode, completedCount, currentPhaseKey, language, progressItems.length]);
+    currentTask: language === "zh" ? "当前" : "Current",
+  }), [activeProgressMode, completedCount, language, progressItems.length]);
 
   const isBlackTheme = themeMode === "black";
   const shellClass = themeMode === "light"
@@ -230,6 +233,9 @@ const TopIsland = memo(function TopIsland({
     ? "bg-[rgba(255,255,255,0.025)] border-[#17171c]"
     : "bg-[rgba(255,255,255,0.04)] border-[#1f1f23]";
   const normalizedCustomReply = customReplyText.replace(/\s+/g, " ").trim();
+  const showChoicePromptContent = !isChoicePromptManuallyCollapsed;
+  const showPendingRunDecision = !!pendingRunDecision && showChoicePromptContent;
+  const showAwaitingChoice = isAwaitingChoice && showChoicePromptContent;
 
   const submitCustomReply = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -240,6 +246,12 @@ const TopIsland = memo(function TopIsland({
     });
     setCustomReplyText("");
   };
+
+  useEffect(() => {
+    if (!choicePromptKey || (manualChoiceCollapsedKey && manualChoiceCollapsedKey !== choicePromptKey)) {
+      setManualChoiceCollapsedKey(null);
+    }
+  }, [choicePromptKey, manualChoiceCollapsedKey]);
 
   // region: TopIsland 高度同步
   useEffect(() => {
@@ -307,13 +319,38 @@ const TopIsland = memo(function TopIsland({
               <span className="shrink-0 h-2 w-2 rounded-full bg-[var(--accent,#7c3aed)] animate-pulse" />
             )}
           </div>
-          <button
-            onClick={() => setPinnedOpen((value) => !value)}
-            className="shrink-0 rounded-full border border-[#27272a] bg-[#09090b] p-1 text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#f5f5f5]"
-            title={pinnedOpen ? (language === "zh" ? "解除锁定" : "Unlock") : (language === "zh" ? "锁定展开" : "Pin Open")}
-          >
-            {pinnedOpen ? <IconUnlock className="h-4 w-4" /> : <IconLock className="h-4 w-4" />}
-          </button>
+          <div className="flex shrink-0 items-center gap-2">
+            {isChoicePromptManuallyCollapsed && (
+              <button
+                data-testid="top-island-show-options"
+                onClick={() => {
+                  setManualChoiceCollapsedKey(null);
+                  setPinnedOpen(true);
+                }}
+                className="rounded-full border border-[rgba(124,58,237,0.25)] bg-[rgba(124,58,237,0.14)] px-3 py-1 text-[11px] text-[#ddd6fe] transition-colors hover:bg-[rgba(124,58,237,0.22)]"
+                title={copy.showOptions}
+              >
+                <span className="inline-flex items-center gap-1.5">
+                  <IconChevronDown className="h-3.5 w-3.5" />
+                  {copy.showOptions}
+                </span>
+              </button>
+            )}
+            <button
+              onClick={() => {
+                if (isChoicePromptManuallyCollapsed) {
+                  setManualChoiceCollapsedKey(null);
+                  setPinnedOpen(true);
+                  return;
+                }
+                setPinnedOpen((value) => !value);
+              }}
+              className="rounded-full border border-[#27272a] bg-[#09090b] p-1 text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#f5f5f5]"
+              title={pinnedOpen ? (language === "zh" ? "解除锁定" : "Unlock") : (language === "zh" ? "锁定展开" : "Pin Open")}
+            >
+              {pinnedOpen ? <IconUnlock className="h-4 w-4" /> : <IconLock className="h-4 w-4" />}
+            </button>
+          </div>
         </div>
 
         <div
@@ -323,7 +360,7 @@ const TopIsland = memo(function TopIsland({
         >
           <div className="overflow-hidden">
             <div className="border-t border-[rgba(255,255,255,0.06)] px-4 pb-4 pt-3">
-            {pendingRunDecision && (
+            {showPendingRunDecision && (
               <div>
                 <div data-testid="top-island-pending-run-decision" className={`rounded-2xl border p-3 ${surface}`}>
                   <div className={`text-[12px] font-medium ${primaryText}`}>
@@ -413,11 +450,10 @@ const TopIsland = memo(function TopIsland({
             )}
 
             {hasTasks && (
-              <div data-testid={activeProgressMode === "execution" ? "top-island-execution-progress" : "top-island-plan-progress"} className={`${pendingRunDecision ? "mt-3 " : ""}rounded-2xl border p-3 ${surface}`}>
+              <div data-testid={activeProgressMode === "execution" ? "top-island-execution-progress" : "top-island-plan-progress"} className={`${showPendingRunDecision ? "mt-3 " : ""}rounded-2xl border p-3 ${surface}`}>
                 <div className="flex items-center justify-between gap-3">
                   <div className={`text-[12px] font-medium ${primaryText}`}>{copy.taskSummary}</div>
                   <div className="flex items-center gap-2">
-                    {copy.phaseLabel && <span className={`text-[11px] ${secondaryText}`}>{copy.phaseLabel}</span>}
                     <span className={`text-[11px] ${secondaryText}`}>
                       {activeProgressMode === "execution" ? copy.executionStage : getStageLabel(planStage, language)}
                     </span>
@@ -441,40 +477,55 @@ const TopIsland = memo(function TopIsland({
                   />
                 </div>
                 <div className="mt-3 max-h-[220px] space-y-2 overflow-y-auto pr-1">
-                  {visibleTasks.map((task, index) => (
-                    <div key={task.id} className="flex items-start gap-3 rounded-xl bg-[rgba(0,0,0,0.18)] px-3 py-2">
-                      <span
-                        className={`mt-1 h-3.5 w-3.5 shrink-0 rounded-full border flex items-center justify-center ${
-                          task.complete
-                            ? "border-[#34d399] bg-[#34d399] text-[#050507]"
-                          : task.status === "in_progress"
-                          ? "border-[#60a5fa] bg-[#60a5fa]"
-                          : task.status === "failed"
-                          ? "border-[#f87171] bg-[#f87171]"
-                          : "border-[#3f3f46] bg-transparent"
+                  {visibleTasks.map((task, index) => {
+                    const isCurrentPlanTask = activeProgressMode === "plan" && task.id === currentPlanTaskId && !task.complete;
+                    return (
+                      <div
+                        key={task.id}
+                        className={`flex items-start gap-3 rounded-xl px-3 py-2 ${
+                          isCurrentPlanTask
+                            ? "border border-[rgba(96,165,250,0.24)] bg-[rgba(37,99,235,0.14)]"
+                            : "bg-[rgba(0,0,0,0.18)]"
                         }`}
                       >
-                        {task.complete && (
-                          <svg className="h-2 w-2" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                            <path d="M2.5 6L5 8.5L9.5 3.5" />
-                          </svg>
-                        )}
-                      </span>
-                      <div className={`min-w-0 text-[12px] leading-6 ${primaryText}`}>
-                        <div className="flex items-start gap-2">
-                          <span className="mt-[2px] shrink-0 text-[12px] font-medium">{index + 1}.</span>
-                          <div className="min-w-0 flex-1 [&_.markdown-body]:text-[12px] [&_.markdown-body]:leading-6 [&_.markdown-body_p]:mb-0 [&_.markdown-body_p]:text-inherit [&_.markdown-body_strong]:text-inherit [&_.markdown-body_code]:align-baseline">
-                            <MarkdownRenderer content={task.text} baseFontSize={12} />
+                        <span
+                          className={`mt-1 h-3.5 w-3.5 shrink-0 rounded-full border flex items-center justify-center ${
+                            task.complete
+                              ? "border-[#34d399] bg-[#34d399] text-[#050507]"
+                            : task.status === "in_progress"
+                            ? "border-[#60a5fa] bg-[#60a5fa]"
+                            : task.status === "failed"
+                            ? "border-[#f87171] bg-[#f87171]"
+                            : "border-[#3f3f46] bg-transparent"
+                          }`}
+                        >
+                          {task.complete && (
+                            <svg className="h-2 w-2" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                              <path d="M2.5 6L5 8.5L9.5 3.5" />
+                            </svg>
+                          )}
+                        </span>
+                        <div className={`min-w-0 text-[12px] leading-6 ${primaryText}`}>
+                          <div className="flex items-start gap-2">
+                            <span className="mt-[2px] shrink-0 text-[12px] font-medium">{index + 1}.</span>
+                            <div className="min-w-0 flex-1 [&_.markdown-body]:text-[12px] [&_.markdown-body]:leading-6 [&_.markdown-body_p]:mb-0 [&_.markdown-body_p]:text-inherit [&_.markdown-body_strong]:text-inherit [&_.markdown-body_code]:align-baseline">
+                              <MarkdownRenderer content={task.text} baseFontSize={12} />
+                            </div>
+                            {isCurrentPlanTask && (
+                              <span className={`mt-1 shrink-0 rounded-full border border-[rgba(96,165,250,0.25)] bg-[rgba(96,165,250,0.12)] px-2 py-0.5 text-[10px] ${secondaryText}`}>
+                                {copy.currentTask}
+                              </span>
+                            )}
                           </div>
                         </div>
                       </div>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
             )}
 
-            {isAwaitingChoice && (
+            {showAwaitingChoice && (
               <div data-testid="top-island-awaiting-choice" className={`mt-3 rounded-2xl border p-3 ${surface}`}>
                 <div className={`text-[12px] font-medium ${primaryText}`}>{copy.chooseToContinue}</div>
                 <div className={`mt-1 text-[12px] leading-6 ${secondaryText}`}>
@@ -605,6 +656,27 @@ const TopIsland = memo(function TopIsland({
                     </div>
                   </div>
                 )}
+              </div>
+            )}
+
+            {hasChoicePromptContent && showChoicePromptContent && (
+              <div className="mt-3 flex justify-center">
+                <button
+                  data-testid="top-island-collapse-options"
+                  onClick={() => {
+                    if (choicePromptKey) setManualChoiceCollapsedKey(choicePromptKey);
+                    setPinnedOpen(false);
+                    setHovered(false);
+                  }}
+                  className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-[11px] transition-colors ${
+                    themeMode === "light"
+                      ? "border-[rgba(15,23,42,0.12)] bg-[rgba(255,255,255,0.55)] text-[#4b5563] hover:bg-white hover:text-[#111827]"
+                      : "border-[#27272a] bg-[#09090b] text-[#a1a1aa] hover:bg-[#18181b] hover:text-[#f5f5f5]"
+                  }`}
+                >
+                  <IconChevronUp className="h-3.5 w-3.5" />
+                  {copy.collapseOptions}
+                </button>
               </div>
             )}
             </div>

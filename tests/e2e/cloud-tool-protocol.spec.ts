@@ -116,6 +116,29 @@ test.beforeEach(async ({ page }) => {
           });
         }
 
+        if (scenario === "execute-quick-reply-runtime") {
+          if (body.includes("直接执行部署脚本 deploy.sh")) {
+            return JSON.stringify({
+              output_text: [
+                "我会执行部署脚本。",
+                "<tool_use>",
+                "<tool>execute_command</tool>",
+                "<parameter name=\"command\">./deploy.sh</parameter>",
+                "</tool_use>",
+              ].join("\n"),
+            });
+          }
+          return JSON.stringify({
+            output_text: [
+              "部署方式已确认，请选择下一步。",
+              "<user_options>",
+              "<option>直接执行部署脚本 deploy.sh</option>",
+              "<option>我来确认无误再执行</option>",
+              "</user_options>",
+            ].join("\n"),
+          });
+        }
+
         if (scenario === "plan-approval-execute-tools") {
           return JSON.stringify({
             output_text: [
@@ -220,6 +243,47 @@ test("reply options pause before mixed XML tool calls and continue from the sour
       archivedOptionCount: 1,
       selectedOptions: ["请采用保守方案继续"],
       readFileCalls: 0,
+    });
+});
+
+test("execute quick reply switches a discuss turn to execute runtime and keeps tool review", async ({ page }) => {
+  await page.goto("/?e2eScenario=execute-quick-reply-runtime");
+
+  const sent = await page.evaluate(() =>
+    (window as any).__CODELY_E2E__?.sendCloudMessage?.("请检查部署方式并让我选择下一步。"),
+  );
+  expect(sent).toBe(true);
+
+  await expect(page.getByTestId("top-island-awaiting-choice")).toBeVisible();
+  await expect(page.getByTestId("top-island-reply-option-0")).toContainText("直接执行部署脚本");
+
+  await page.getByTestId("top-island-reply-option-0").click();
+
+  await expect
+    .poll(async () =>
+      page.evaluate(() => {
+        const probe = (window as any).__CLOUD_TOOL_PROTOCOL_TEST__;
+        const requests = probe?.requests || [];
+        const executionRequest = [...requests]
+          .reverse()
+          .find((request: any) => request.hasTools && String(request.body || "").includes("直接执行部署脚本 deploy.sh"));
+        if (!executionRequest) return null;
+        const parsed = JSON.parse(executionRequest.body || "{}");
+        const names = (parsed.tools || []).map((tool: any) => tool?.name || tool?.function?.name).filter(Boolean);
+        const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+        return {
+          hasShell: names.includes("run_command") && names.includes("execute_command"),
+          currentTurnIntent: snapshot?.currentTurnIntent,
+          agentStatus: snapshot?.agentStatus,
+          hasExecuteToolBlock: (snapshot?.toolNames || []).includes("execute_command"),
+        };
+      }),
+    )
+    .toEqual({
+      hasShell: true,
+      currentTurnIntent: "execute",
+      agentStatus: "pending_review",
+      hasExecuteToolBlock: true,
     });
 });
 
