@@ -178,6 +178,7 @@ export default function WorkspaceTreePanel({
   const storeOpenFileViewer = useAppStore((s) => s.openFileViewer);
   const deletePersistedPlanFiles = useAppStore((s) => s.deletePersistedPlanFiles);
   const workspaceContentVersion = useAppStore((s) => s.workspaceContentVersion);
+  const themeMode = useAppStore((s) => s.config.themeMode);
   const [treeNodesByPath, setTreeNodesByPath] = useState<Record<string, FileNode[]>>({});
   const [expandedPaths, setExpandedPaths] = useState<Record<string, boolean>>({});
   const [loadingPaths, setLoadingPaths] = useState<Record<string, boolean>>({});
@@ -202,6 +203,7 @@ export default function WorkspaceTreePanel({
     clearPlans: language === "en" ? "Clear Plans" : "清理计划文件",
     close: language === "en" ? "Close file tree" : "关闭文件树",
   }), [language]);
+  const isBlackTheme = themeMode === "black";
 
   useEffect(() => {
     treeNodesRef.current = treeNodesByPath;
@@ -346,12 +348,16 @@ export default function WorkspaceTreePanel({
     <div
       className={embedded
         ? "relative flex h-full min-w-0 flex-col bg-[#050505]"
-        : "relative z-10 flex shrink-0 flex-col border-r border-[#27272a] bg-[#09090b]"
+        : `relative z-10 flex shrink-0 flex-col border-r border-[#27272a] ${
+          isBlackTheme ? "bg-[rgba(7,7,8,0.76)] backdrop-blur-xl backdrop-saturate-150" : "bg-[#09090b]"
+        }`
       }
       style={embedded ? undefined : { width: `${width}px` }}
     >
       {!embedded && (
-      <div className="min-h-[72px] shrink-0 border-b border-[#27272a] bg-[#09090b] px-3 py-3">
+      <div className={`min-h-[72px] shrink-0 border-b border-[#27272a] px-3 py-3 ${
+        isBlackTheme ? "bg-[rgba(10,10,12,0.58)]" : "bg-[#09090b]"
+      }`}>
         <div className="flex items-start justify-between gap-3">
           <div className="min-w-0 flex items-center gap-3">
             <div className="flex h-8 w-8 items-center justify-center rounded-lg border border-[#27272a] bg-[#000000] text-[#e4e4e7]">

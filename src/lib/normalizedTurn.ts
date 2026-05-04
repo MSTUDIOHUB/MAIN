@@ -9,6 +9,13 @@ import type { NormalizedStreamState, NormalizedToolCall, ReplyOption } from "./w
 
 // region: 推理文本提取
 
+export const SYNTHETIC_VISIBLE_CONCLUSION =
+  "后台思考已折叠，模型尚未生成可见回复或可执行动作。";
+
+export function isSyntheticVisibleConclusion(text: string): boolean {
+  return String(text || "").replace(/\s+/g, " ").trim() === SYNTHETIC_VISIBLE_CONCLUSION;
+}
+
 const REASONING_TAG_RE = /<(?:analysis|thought|thinking|reasoning)(?:\s[^>]*)?>([\s\S]*?)<\/(?:analysis|thought|thinking|reasoning)>/gi;
 const LEAKED_REASONING_MARKERS = [
   /^thinking\b/i,
@@ -425,7 +432,7 @@ export function ensureVisibleConclusion(normalized: NormalizedStreamState): Norm
 
   return {
     ...normalized,
-    visibleText: "后台思考已折叠，模型尚未生成可见回复或可执行动作。",
+    visibleText: SYNTHETIC_VISIBLE_CONCLUSION,
   };
 }
 

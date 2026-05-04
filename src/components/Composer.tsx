@@ -26,14 +26,15 @@ import {
 
 // ── ContextRing SVG Component ──────────────────────────────────────────
 
-function ContextRing({ percentage, themeMode }: { percentage: number; themeMode: "light" | "dark" }) {
+function ContextRing({ percentage, themeMode }: { percentage: number; themeMode: "light" | "dark" | "black" }) {
   const r = 6;
   const circumference = 2 * Math.PI * r;
   const offset = circumference * (1 - Math.min(percentage, 100) / 100);
   const isLightTheme = themeMode === "light";
-  const track = isLightTheme ? "#d4d4d8" : "#27272a";
+  const isBlackTheme = themeMode === "black";
+  const track = isLightTheme ? "#d4d4d8" : isBlackTheme ? "#202026" : "#27272a";
 
-  let stroke = isLightTheme ? "#2563eb" : "#a1a1aa";
+  let stroke = isLightTheme ? "#2563eb" : isBlackTheme ? "#c4c4cc" : "#a1a1aa";
   if (percentage > 90) stroke = isLightTheme ? "#dc2626" : "#ef4444";
   else if (percentage >= 75) stroke = isLightTheme ? "#b45309" : "#eab308";
 
@@ -1208,9 +1209,29 @@ export default function Composer({
   const handleKeyDown = (e: React.KeyboardEvent) => {
     const nativeEvent = e.nativeEvent as KeyboardEvent & { isComposing?: boolean };
     const justFinishedComposition = Date.now() - compositionEndedAtRef.current < 140;
+    const isImeKeyInput = isComposingRef.current || nativeEvent.isComposing || e.keyCode === 229 || justFinishedComposition;
+    if (
+      isMainMode &&
+      !activeDiffTask &&
+      e.key === "Tab" &&
+      e.shiftKey &&
+      !e.altKey &&
+      !e.ctrlKey &&
+      !e.metaKey &&
+      !isImeKeyInput
+    ) {
+      e.preventDefault();
+      e.stopPropagation();
+      closeMentionMenu();
+      closeSlashMenu();
+      setDismissedSuggestedIntentKey(null);
+      setLockedComposerIntent(lockedComposerIntent === "plan" ? null : "plan");
+      requestAnimationFrame(() => textareaRef.current?.focus());
+      return;
+    }
     if (
       e.key === "Enter" &&
-      (isComposingRef.current || nativeEvent.isComposing || e.keyCode === 229 || justFinishedComposition)
+      isImeKeyInput
     ) {
       return;
     }

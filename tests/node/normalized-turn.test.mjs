@@ -57,7 +57,7 @@ function loadTranspiledModuleSync(sourcePath) {
   return module.exports;
 }
 
-const { isAssistantTurnEmpty, normalizeAssistantTurn } = loadTranspiledModuleSync(
+const { ensureVisibleConclusion, isAssistantTurnEmpty, isSyntheticVisibleConclusion, normalizeAssistantTurn } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/normalizedTurn.ts"),
 );
 
@@ -93,6 +93,19 @@ test("assistant turn empty guard ignores tool-only and text responses", () => {
     }),
     false,
   );
+});
+
+test("hidden-thought placeholder is marked as synthetic", () => {
+  const normalized = ensureVisibleConclusion({
+    visibleText: "",
+    hiddenThought: "我已经检查了上下文，需要给出结论。",
+    replyOptions: [],
+    toolCalls: [],
+    finishReason: "stop",
+  });
+
+  assert.equal(isSyntheticVisibleConclusion(normalized.visibleText), true);
+  assert.equal(isAssistantTurnEmpty(normalized), false);
 });
 
 test("normalization collapses repeated local-model preamble loops", () => {

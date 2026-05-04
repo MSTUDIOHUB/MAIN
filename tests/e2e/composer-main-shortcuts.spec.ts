@@ -84,6 +84,30 @@ test("MAIN shortcut order, keyboard selection, and labels stay aligned", async (
   await expect(textarea).toHaveValue("");
 });
 
+test("Shift+Tab toggles plan intent mode in the MAIN composer", async ({ page }) => {
+  await page.goto("/?e2eScenario=composer-main-shortcuts");
+
+  const textarea = page.getByTestId("composer-textarea");
+  await textarea.fill("需要先规划这个改动");
+  await textarea.focus();
+  await page.keyboard.press("Shift+Tab");
+
+  await expect
+    .poll(async () =>
+      page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().lockedComposerIntent ?? null),
+    )
+    .toBe("plan");
+  await expect(textarea).toHaveValue("需要先规划这个改动");
+
+  await page.keyboard.press("Shift+Tab");
+  await expect
+    .poll(async () =>
+      page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().lockedComposerIntent ?? null),
+    )
+    .toBe(null);
+  await expect(textarea).toHaveValue("需要先规划这个改动");
+});
+
 test("user message bubble preserves multiline composer input", async ({ page }) => {
   await page.goto("/?e2eScenario=composer-main-shortcuts");
 

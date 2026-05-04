@@ -11,6 +11,7 @@ const PLAN_REPLACE_REFRESH_SCENARIO = "plan-replace-refresh";
 const AWAITING_CHOICE_SCENARIO = "awaiting-choice";
 const FEISHU_REMOTE_ANALYSIS_SCENARIO = "feishu-remote-analysis";
 const READ_CONTEXT_COLLAPSE_SCENARIO = "read-context-collapse";
+const THOUGHT_DISPLAY_SCENARIO = "thought-display-mode";
 const GAME_STUDIO_ONBOARDING_SCENARIO = "game-studio-onboarding";
 const COMPOSER_MAIN_SHORTCUTS_SCENARIO = "composer-main-shortcuts";
 const CLOUD_SETTINGS_MODEL_SELECT_SCENARIO = "cloud-settings-model-select";
@@ -97,8 +98,16 @@ function bindBridgeSnapshot(scenario: string) {
       toolNames: toolBlocks.map((block) => block.toolName),
       toolTargets: toolBlocks.map((block) => block.target),
       selectedOptions: archivedOptionBlocks.map((block) => block.selectedOption).filter(Boolean),
+      themeMode: state.config.themeMode,
+      thoughtDisplayMode: state.config.thoughtDisplayMode,
       seedCount: readSeedCount(scenario),
     };
+  };
+  bridge.setThoughtDisplayMode = (mode: "hidden" | "summary" | "detailed") => {
+    useAppStore.getState().setConfig((prev) => ({
+      ...prev,
+      thoughtDisplayMode: mode,
+    }));
   };
 }
 
@@ -934,6 +943,118 @@ function seedReadContextCollapseScenario() {
   return cleanup;
 }
 
+function seedThoughtDisplayScenario() {
+  const bridge = getBridge();
+  if (!bridge) return undefined;
+
+  bridge.events = [{ type: "boot" }];
+  bridge.savedDocuments = [];
+  bridge.completed = true;
+
+  incrementSeedCount(THOUGHT_DISPLAY_SCENARIO);
+
+  const now = Date.now();
+  const turnId = "e2e-thought-display-turn";
+  const sessionId = 999018;
+  const userBlockId = useAppStore.getState()._nextTaskId();
+  const thoughtBlockId = useAppStore.getState()._nextTaskId();
+  const agentBlockId = useAppStore.getState()._nextTaskId();
+  const thoughtDisplayMode = useAppStore.getState().config.thoughtDisplayMode || "hidden";
+
+  useAppStore.setState((state) => ({
+    ...state,
+    config: {
+      ...state.config,
+      language: "zh",
+      workflowMode: "chat",
+      thoughtDisplayMode,
+    },
+    currentWorkspace: "/tmp/e2e-thought-display",
+    sessionsByWorkspace: {
+      "/tmp/e2e-thought-display": [
+        {
+          id: sessionId,
+          title: "E2E Thought Display",
+          date: new Date(now).toISOString(),
+          active: true,
+          messages: [],
+        },
+      ],
+    },
+    currentSessionId: sessionId,
+    selectedMainModeKey: "main_mode",
+    selectedNexusModeKey: "nexus_general",
+    taskFlow: [
+      { id: userBlockId, turnId, type: "user", content: "验证思考显示模式。" },
+      {
+        id: thoughtBlockId,
+        turnId,
+        type: "thought",
+        content: [
+          'data: {"choices":[{"delta":{"content":"noise"}}]}',
+          '{"tool":"read_file","arguments":{"path":"src/components/SettingsModal.tsx"}}',
+          "我需要先检查 SettingsModal 的通用设置区域。",
+          "我需要先检查 SettingsModal 的通用设置区域。",
+          "**检查范围**：`SettingsModal` 的通用设置区域。",
+          "下一步会把思考显示接入三档配置，并避免原始长文本刷屏。",
+          "由于似乎缓存，换一种方式。，使用来获取关键代码片段，，，，，，，，，整个 ...... 陷入了循环。。，，，，，所以我无法直接。",
+          "```ts",
+          "const noisy = true;",
+          "function dumpRawCode() {",
+          "  return noisy;",
+          "}",
+          "if (noisy) {",
+          "  dumpRawCode();",
+          "}",
+          "```",
+          ".........................",
+        ].join("\n\n"),
+        isStreaming: false,
+        duration: 2,
+      },
+      {
+        id: agentBlockId,
+        turnId,
+        type: "agent",
+        content: "思考显示模式测试回复。",
+        streaming: false,
+      },
+    ],
+    conversationTurns: [
+      {
+        id: turnId,
+        userPrompt: "验证思考显示模式。",
+        title: "思考显示模式",
+        mode: "chat",
+        status: "done",
+        summary: "已准备思考显示测试数据。",
+        blockIds: [userBlockId, thoughtBlockId, agentBlockId],
+        collapsed: false,
+        createdAt: now,
+      },
+    ],
+    currentTurnId: turnId,
+    agentMessages: [],
+    agentStatus: "idle",
+    isGenerating: false,
+    showDiff: false,
+    showPlanPanel: false,
+    showTerminal: false,
+    showFilePanel: false,
+    selectedDiffTaskId: null,
+  }));
+
+  bindBridgeSnapshot(THOUGHT_DISPLAY_SCENARIO);
+  appendBridgeEvent("seeded", { seedCount: readSeedCount(THOUGHT_DISPLAY_SCENARIO) });
+
+  const cleanup = () => {
+    bridge.initialized = false;
+  };
+
+  bridge.cleanup = cleanup;
+  return cleanup;
+}
+
 function hasDiffReloadSummaryState(workspace: string, sessionId: number): boolean {
   const state = useAppStore.getState();
   return (
@@ -1595,7 +1716,7 @@ function seedGameStudioOnboardingScenario() {
       seedCount: readSeedCount(GAME_STUDIO_ONBOARDING_SCENARIO),
     };
   };
-  bridge.setThemeMode = (mode: "light" | "dark") => {
+  bridge.setThemeMode = (mode: "light" | "dark" | "black") => {
     useAppStore.getState().setConfig((prev) => ({
       ...prev,
       themeMode: mode,
@@ -2794,6 +2915,10 @@ export function initializeE2EScenarios(): (() => void) | undefined {
 
   if (scenario === READ_CONTEXT_COLLAPSE_SCENARIO) {
     return seedReadContextCollapseScenario();
+  }
+
+  if (scenario === THOUGHT_DISPLAY_SCENARIO) {
+    return seedThoughtDisplayScenario();
   }
 
   if (scenario === GAME_STUDIO_ONBOARDING_SCENARIO) {

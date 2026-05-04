@@ -111,6 +111,22 @@ test("intent filtering exposes read-only tools for chat and write/shell tools fo
   );
 });
 
+test("execute intent exposes run_command for Git workflows", () => {
+  const tools = [
+    tool("read_file", "Read a file"),
+    tool("run_command", "Run shell command"),
+    tool("execute_command", "Run interactive shell command"),
+  ];
+  const registry = buildToolCapabilityRegistry({
+    toolDefinitions: tools,
+    policy: createDefaultToolPermissionPolicy(),
+  });
+
+  const names = filterToolDefinitionsForIntent(tools, "execute", registry).map((item) => item.function.name);
+  assert.ok(names.includes("run_command"));
+  assert.ok(names.includes("execute_command"));
+});
+
 test("permission policy auto-executes only safe read classes by default", () => {
   const tools = [
     tool("read_file", "Read a file"),

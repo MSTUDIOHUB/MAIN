@@ -163,7 +163,7 @@ export function buildSystemPrompt(
     "",
     "## ⚠️ 输出可见性规则（最重要）",
     "你的回复中，**只有 XML 标签之外的 Markdown 正文才会被用户看到**。",
-    "- `<analysis>`、`<thought>`、`<thinking>`、`<reasoning>` 标签内的内容会被 **隐藏** 在折叠的思考块中，用户默认看不到。",
+    "- `<analysis>`、`<thought>`、`<thinking>`、`<reasoning>` 标签内的内容会进入折叠的后台过程块；用户默认看不到，也可能在设置中以过滤摘要查看。",
     "- 因此：你的分析、总结、结论、方案等所有需要用户看到的内容，**必须以普通 Markdown 文本的形式输出，绝不能放在任何 XML 标签内部**。",
     "- `<analysis>` 仅用于调用工具前的 1-2 句极简内心备注（如「我需要先检查 Scripts 目录」），**禁止将任何分析正文、方案内容或最终结论写在 `<analysis>` 内**。",
     "- 调用 native tools 时可以直接发出工具调用；界面会展示执行状态。只有在真正需要向用户说明判断、结果或阻塞时，才输出普通 Markdown。",
@@ -366,7 +366,7 @@ export function buildSystemPrompt(
     tfl.push(String.raw`<parameter name="参数名">参数值</parameter>`);
     tfl.push("</tool_use>");
     tfl.push("");
-    tfl.push("⚠️ `<analysis>` 中的内容用户看不到！你的分析、总结、方案必须以普通 Markdown 文本输出，不能放在 `<analysis>` 内。");
+    tfl.push("⚠️ `<analysis>` 中的内容默认对用户隐藏，且即使用户开启过程显示也只会以过滤摘要呈现；你的分析、总结、方案必须以普通 Markdown 文本输出，不能放在 `<analysis>` 内。");
     tfl.push("");
     tfl.push("可用的工具：" + formatToolNameList(
       customToolNames,
@@ -389,7 +389,7 @@ export function buildSystemPrompt(
     addToolDescription("analyze_tabular_document", "- analyze_tabular_document: 对 CSV、TSV、XLSX 等大表格做全表统计分析，返回总行数、列概况、缺失值、数值统计和样本行。处理大型表格时优先用它，而不是盲目把整张表塞进上下文。");
     addToolDescription("query_tabular_document", "- query_tabular_document: 对 CSV、TSV、XLSX 做结构化查询，支持筛选、选列、排序、分页、分组聚合。要回答计数、汇总、Top N、条件过滤等问题时优先用它。");
     addToolDescription("index_workspace_documents", "- index_workspace_documents: 扫描某个目录中的文档文件并生成索引摘要。适合先了解资料库，再决定进一步读取哪些文件。");
-    addToolDescription("run_command", "- run_command: 同步执行一次性 shell 命令并等待完成，返回 stdout、stderr、exitCode、timedOut、durationMs。运行测试、构建、Python 脚本时优先使用它，并基于返回结果总结成功/失败。");
+    addToolDescription("run_command", "- run_command: 同步执行一次性 shell 命令并等待完成，返回 stdout、stderr、exitCode、timedOut、durationMs。运行测试、构建、Python 脚本、Git 状态检查/提交/推送等有限命令时优先使用它，并基于返回结果总结成功/失败。");
     addToolDescription("execute_command", "- execute_command: 向集成 PTY 发送命令，适合开发服务器、watch 模式、交互式程序或需要保留终端上下文的命令。它返回本次发送后的新增输出和 offset；后续用 read_pty_since/read_pty_tail/get_pty_status 继续检查。");
     addToolDescription("send_pty_input", "- send_pty_input: 向当前 PTY 前台进程发送原始输入，适合回答交互提示、输入 y/n、发送 Ctrl+C（input 使用 \\u0003）。");
     addToolDescription("read_pty_tail", "- read_pty_tail: 读取终端最近日志，适合快速查看错误栈或长任务尾部输出。");
@@ -418,6 +418,7 @@ export function buildSystemPrompt(
       tfl.push("2. 如果当前是在延续一个已批准的计划，则优先遵循 `.MAIN/plans/tasks.md`，完成后及时更新对应任务状态。");
       tfl.push("3. 只有在用户明确要求保存方案、当前回合本来就是计划落盘，或你正在继续一个已批准计划时，才写入 `.MAIN/plans/*.md`。");
       tfl.push("4. 凡是需要 shell 的步骤，必须真实执行：一次性命令用 `run_command` 并检查 exitCode/stdout/stderr；长驻或交互式命令用 `execute_command`，随后调用 `read_pty_since`、`read_pty_tail` 或 `get_pty_status` 验证结果。");
+      tfl.push("5. 当用户要求 Git 提交、推送或“提交并推送”时，不要因为 PTY 未启动而声称无法执行；Git 是有限命令，优先用 `run_command` 依次检查 `git status`，必要时查看 `git diff --stat` / `git diff`，再按用户要求执行 `git add ...`、`git commit -m ...`、`git push`。如果没有变更、没有 remote、认证失败、upstream 未设置或 push 被拒绝，必须把 stdout/stderr/exitCode 如实反馈给用户并停止猜测。");
     }
     tfl.push("");
     tfl.push("### Steering 发现规则（Steering Discovery）");

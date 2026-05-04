@@ -38,7 +38,7 @@ function normalizeMarkdownForDisplay(content: string): string {
     .replace(/\n{4,}/g, "\n\n\n");
 }
 
-function getLanguageTone(language: string, isDiagram: boolean, themeMode: "light" | "dark" = "dark") {
+function getLanguageTone(language: string, isDiagram: boolean, themeMode: "light" | "dark" | "black" = "dark") {
   const normalized = language.toLowerCase();
   const isLightTheme = themeMode === "light";
 
@@ -147,6 +147,7 @@ function CodeBlock({ inline, className, children, baseFontSize = 13, ...rest }: 
     ? { diagram: "图表", expand: "展开", copied: "已复制", copy: "复制", expandedDiagram: "展开图表视图", copySource: "复制源码", closeExpanded: "关闭展开图表" }
     : { diagram: "Diagram", expand: "Expand", copied: "Copied", copy: "Copy", expandedDiagram: "Expanded Diagram View", copySource: "Copy Source", closeExpanded: "Close expanded diagram" };
   const isLightTheme = themeMode === "light";
+  const isBlackTheme = themeMode === "black";
   const match = /language-(\w+)/.exec(className || "");
   const language = match ? match[1].toLowerCase() : "";
   const codeStr = String(children).replace(/\n$/, "");
@@ -172,15 +173,15 @@ function CodeBlock({ inline, className, children, baseFontSize = 13, ...rest }: 
       }
     : {
         overlay: "rgba(0,0,0,0.68)",
-        modalBorder: "#34343b",
-        modalBackground: "#1d1d20",
+        modalBorder: isBlackTheme ? "#202026" : "#34343b",
+        modalBackground: isBlackTheme ? "#030304" : "#1d1d20",
         modalShadow: "0 28px 80px rgba(0,0,0,0.45)",
-        headerBorder: "#2c2c32",
+        headerBorder: isBlackTheme ? "#141418" : "#2c2c32",
         titleText: "#d4d4d8",
-        buttonBorder: "#34343b",
-        buttonBackground: "#181818",
+        buttonBorder: isBlackTheme ? "#202026" : "#34343b",
+        buttonBackground: isBlackTheme ? "#070708" : "#181818",
         buttonText: "#c4c4cc",
-        bodyBackground: "#181818",
+        bodyBackground: isBlackTheme ? "#000000" : "#181818",
       };
 
   useEffect(() => {

@@ -113,6 +113,24 @@ test("Chinese design based implementation request resolves to execute", () => {
   assert.equal(result.needsDecision, undefined);
 });
 
+test("Git commit and push requests resolve to execute", () => {
+  for (const input of [
+    "提交并推送",
+    "帮我提交 git 并推送",
+    "commit and push my changes",
+  ]) {
+    const result = resolveTurnRunIntent(input, createContext());
+    assert.equal(result.intent, "execute", input);
+    assert.equal(result.needsDecision, undefined, input);
+  }
+});
+
+test("Git status inspection resolves to execute for shell access", () => {
+  const result = resolveTurnRunIntent("先帮我查看 Git 状态和变更内容", createContext());
+  assert.equal(result.intent, "execute");
+  assert.equal(result.needsDecision, undefined);
+});
+
 test("design based implementation request approves an existing plan", () => {
   const result = resolveTurnRunIntent(
     "请根据设计方案 design.md 来完成修改",

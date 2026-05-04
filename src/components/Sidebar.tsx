@@ -192,17 +192,22 @@ export default function Sidebar({
   };
 
   const sortedGlobalSessions = sortSessions(globalSessions);
+  const isBlackTheme = config.themeMode === "black";
 
   return (
     <div
-      className={`relative z-10 flex shrink-0 flex-col overflow-hidden border-r bg-[#09090b] shadow-sm ${
+      className={`relative z-10 flex shrink-0 flex-col overflow-hidden border-r shadow-sm ${
+        isBlackTheme ? "bg-[rgba(8,8,10,0.78)] backdrop-blur-xl backdrop-saturate-150" : "bg-[#09090b]"
+      } ${
         isWorkspaceDropActive ? "border-[var(--accent)]" : "border-[#27272a]"
       }`}
       style={{ width: `${sidebarWidth}px` }}
       data-testid="workspace-sidebar"
     >
       <div
-        className="flex shrink-0 flex-col justify-center border-b border-[#27272a] bg-[#09090b] px-4 pb-4 pt-10 select-none"
+        className={`flex shrink-0 flex-col justify-center border-b border-[#27272a] px-4 pb-4 pt-10 select-none ${
+          isBlackTheme ? "bg-[rgba(10,10,12,0.62)]" : "bg-[#09090b]"
+        }`}
         data-tauri-drag-region
       >
         <div className="mb-4 flex items-center gap-[2px] select-none pointer-events-none">
@@ -396,7 +401,9 @@ export default function Sidebar({
         </div>
       </div>
 
-      <div className="flex shrink-0 flex-col gap-1 border-t border-[#27272a] bg-[#09090b] p-3">
+      <div className={`flex shrink-0 flex-col gap-1 border-t border-[#27272a] p-3 ${
+        isBlackTheme ? "bg-[rgba(10,10,12,0.58)]" : "bg-[#09090b]"
+      }`}>
         <button
           onClick={config.onOpenSkills}
           className="flex w-full items-center gap-2.5 rounded-md px-3 py-2 text-left text-xs font-medium text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#e4e4e7]"

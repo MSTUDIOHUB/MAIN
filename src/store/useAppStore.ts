@@ -156,6 +156,10 @@ import {
   type PromptLanguageStrategy,
   type ToolPermissionPolicy,
 } from "../lib/toolCapabilities";
+import {
+  normalizeThoughtDisplayMode,
+  type ThoughtDisplayMode,
+} from "../lib/thoughtDisplay";
 
 function logStoreEvent(event: string, data: Record<string, unknown> = {}) {
   try {
@@ -189,8 +193,14 @@ export const translations = {
     themeDesc: "Choose your preferred editor highlight color.",
     chatFontSize: "Chat Font Size",
     chatFontSizeDesc: "Adjust the text size in the chat area (10–20 px).",
+    thoughtDisplay: "Thinking Display",
+    thoughtDisplayDesc: "Show filtered model process notes without flooding the chat with raw long thinking.",
+    thoughtDisplayHidden: "Hidden",
+    thoughtDisplaySummary: "Brief",
+    thoughtDisplayDetailed: "Detailed",
     themeMode: "Appearance",
     themeModeDark: "Dark",
+    themeModeBlack: "Black",
     themeModeLight: "Light",
     switchPersona: "Switch Persona",
     switchMainMode: "MAIN Mode",
@@ -287,8 +297,14 @@ export const translations = {
     themeDesc: "选择你偏好的代码编辑器高亮色彩风格。",
     chatFontSize: "聊天区域文字大小",
     chatFontSizeDesc: "调整聊天区域的文字显示大小（10–20 px）。",
+    thoughtDisplay: "思考显示",
+    thoughtDisplayDesc: "显示过滤后的模型过程，避免原始长文本刷屏。",
+    thoughtDisplayHidden: "隐藏",
+    thoughtDisplaySummary: "简洁",
+    thoughtDisplayDetailed: "详细",
     themeMode: "外观模式",
     themeModeDark: "深色",
+    themeModeBlack: "黑色",
     themeModeLight: "浅色",
     switchPersona: "切换执行角色",
     switchMainMode: "MAIN 模式",
@@ -372,6 +388,11 @@ export const translations = {
 
 export type Lang = keyof typeof translations;
 export type TranslationKey = keyof typeof translations.en;
+export type ThemeMode = "light" | "dark" | "black";
+
+export function normalizeThemeMode(value: unknown): ThemeMode {
+  return value === "light" || value === "dark" || value === "black" ? value : "dark";
+}
 
 // ── Themes ───────────────────────────────────────────────────────────
 
@@ -533,7 +554,7 @@ export type { CloudServerConfig } from "../lib/cloudServers";
 export interface AppConfig {
   language: Lang;
   theme: ThemeKey;
-  themeMode: "light" | "dark";
+  themeMode: ThemeMode;
   workflowMode: "chat" | "edit" | "plan";  // Legacy mirror of the active turn intent.
   promptLanguageStrategy: PromptLanguageStrategy;
   toolPermissionPolicy: ToolPermissionPolicy;
@@ -542,6 +563,7 @@ export interface AppConfig {
   hooksEnabled: boolean;
   activeProfile: "local" | "cloud";
   chatFontSize: number;  // px, default 13
+  thoughtDisplayMode: ThoughtDisplayMode;
   sessionRecordingEnabled: boolean;
   local: LocalConfig;
   cloud: CloudConfig;
@@ -964,6 +986,7 @@ const defaultConfig: AppConfig = {
   hooksEnabled: true,
   activeProfile: "local",
   chatFontSize: 13,
+  thoughtDisplayMode: "hidden",
   sessionRecordingEnabled: true,
   local: { provider: "OMLX", endpoint: "http://127.0.0.1:8080/v1", model: "", contextLimit: 16384, apiKey: "" },
   cloud: defaultCloudState.cloud,
@@ -2192,10 +2215,13 @@ function buildPlanCommandExecutionHint(
   language: "zh" | "en",
 ): string {
   const focus = getPendingPlanTaskCommandFocus(tasks, 3);
+  const diagnosticHint = language === "zh"
+    ? "诊断步骤优先使用内联 `run_command`，避免在项目根目录创建临时诊断脚本；确需脚本文件时，必须先写进 tasks.md，并使用明确临时路径或清理策略。"
+    : "For diagnostics, prefer inline `run_command` and avoid creating temporary diagnostic scripts in the project root; if a script file is truly needed, put that in tasks.md first and use an explicit temporary path or cleanup strategy.";
   if (focus.length === 0) {
     return language === "zh"
-      ? "如果某个任务需要 shell 命令，请在 tasks.md 的 checkbox 文本里写出精确命令并用反引号包裹；执行阶段看到这些命令时，一次性命令优先用 run_command 并检查 exitCode/stdout/stderr，长驻或交互式命令用 execute_command 后再用 read_pty_since/read_pty_tail/get_pty_status 检查输出。"
-      : "If a task needs shell work, place the exact command inside the tasks.md checkbox text using backticks. During execution, prefer run_command for finite commands and inspect exitCode/stdout/stderr; use execute_command for long-running or interactive commands, then verify with read_pty_since/read_pty_tail/get_pty_status.";
+      ? "如果某个任务需要 shell 命令，请在 tasks.md 的 checkbox 文本里写出精确命令并用反引号包裹；执行阶段看到这些命令时，一次性命令优先用 run_command 并检查 exitCode/stdout/stderr，长驻或交互式命令用 execute_command 后再用 read_pty_since/read_pty_tail/get_pty_status 检查输出。" + diagnosticHint
+      : "If a task needs shell work, place the exact command inside the tasks.md checkbox text using backticks. During execution, prefer run_command for finite commands and inspect exitCode/stdout/stderr; use execute_command for long-running or interactive commands, then verify with read_pty_since/read_pty_tail/get_pty_status. " + diagnosticHint;
   }
 
   const lines = focus
@@ -2207,8 +2233,8 @@ function buildPlanCommandExecutionHint(
     .join("\n\n");
 
   return language === "zh"
-    ? "以下未完成任务里已经包含明确的 shell 命令，恢复执行后请优先真实运行它们：一次性命令用 run_command；长驻或交互式命令用 execute_command 后再读取 PTY 日志。不要只复述：\n\n" + lines
-    : "The remaining tasks already include concrete shell commands. After resuming, run them for real: use run_command for finite commands; use execute_command and then read PTY logs for long-running or interactive commands. Do not only describe them:\n\n" + lines;
+    ? "以下未完成任务里已经包含明确的 shell 命令，恢复执行后请优先真实运行它们：一次性命令用 run_command；长驻或交互式命令用 execute_command 后再读取 PTY 日志。不要只复述：\n\n" + lines + "\n\n" + diagnosticHint
+    : "The remaining tasks already include concrete shell commands. After resuming, run them for real: use run_command for finite commands; use execute_command and then read PTY logs for long-running or interactive commands. Do not only describe them:\n\n" + lines + "\n\n" + diagnosticHint;
 }
 
 function buildTrustedPlanResumePrompt(input: {
@@ -6983,6 +7009,8 @@ export const useAppStore = create<AppState>()(
             persistedState.config?.promptLanguageStrategy === "english_core_localized_output"
               ? persistedState.config.promptLanguageStrategy
               : current.config.promptLanguageStrategy,
+          thoughtDisplayMode: normalizeThoughtDisplayMode(persistedState.config?.thoughtDisplayMode),
+          themeMode: normalizeThemeMode(persistedState.config?.themeMode),
           toolPermissionPolicy: normalizeToolPermissionPolicy(persistedState.config?.toolPermissionPolicy),
           mcpRouting: normalizeMcpRoutingConfig(persistedState.config?.mcpRouting),
           sessionRecordingEnabled: persistedState.config?.sessionRecordingEnabled ?? current.config.sessionRecordingEnabled,

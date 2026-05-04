@@ -29,7 +29,7 @@ import { generateId } from "./utils";
 import { buildSystemPrompt } from "./systemPrompt";
 import { discoverAllMcpTools, getMcpToolServerMap, setMcpToolServerMap, type MCPServer, type MCPTool } from "./mcpClient";
 import { getFileMetadata } from "./ipc";
-import { ensureVisibleConclusion, isAssistantTurnEmpty, normalizeAssistantTurn } from "./normalizedTurn";
+import { ensureVisibleConclusion, isAssistantTurnEmpty, isSyntheticVisibleConclusion, normalizeAssistantTurn } from "./normalizedTurn";
 import { hasStructuredPlanProposal } from "./planProposal";
 import {
   buildReadOnlyPermissionContinuationPrompt,
@@ -460,6 +460,22 @@ function buildNonActionableStopMessage(language: "zh" | "en", reason: "no_output
   }
 }
 
+function buildHiddenThoughtOnlyContinuationPrompt(language: "zh" | "en", consecutiveNoToolCount: number): string {
+  return language === "zh"
+    ? [
+        `上一条回复只有后台思考，没有给用户可见结论（第 ${consecutiveNoToolCount} 次）。`,
+        "你已经读取/搜索了上下文；现在必须直接输出面向用户的 Markdown 结论。",
+        "不要继续只返回 thinking/analysis 标签；除非真的缺少关键证据，否则不要再读同一批文件。",
+        "结论至少包含：是否已经实现、哪些证据支持、仍缺什么或下一步。",
+      ].join("\n")
+    : [
+        `The previous reply only contained hidden thinking and no user-visible conclusion (${consecutiveNoToolCount} time).`,
+        "You have already read/searched the context; now output a user-visible Markdown conclusion.",
+        "Do not return only thinking/analysis tags again. Do not reread the same files unless a key fact is still missing.",
+        "Include at least: whether it is implemented, supporting evidence, and what is still missing or next.",
+      ].join("\n");
+}
+
 function looksLikePlanCompletionClaim(text: string): boolean {
   const normalized = String(text || "").replace(/\s+/g, " ").trim();
   if (!normalized) return false;
@@ -781,10 +797,13 @@ function buildPlanCommandExecutionHint(
   language: "zh" | "en",
 ): string {
   const focus = getPendingPlanTaskCommandFocus(tasks, 3);
+  const diagnosticHint = language === "zh"
+    ? "诊断步骤优先使用内联 `run_command`，避免在项目根目录创建临时诊断脚本；确需脚本文件时，必须先写进 tasks.md，并使用明确临时路径或清理策略。"
+    : "For diagnostics, prefer inline `run_command` and avoid creating temporary diagnostic scripts in the project root; if a script file is truly needed, put that in tasks.md first and use an explicit temporary path or cleanup strategy.";
   if (focus.length === 0) {
     return language === "zh"
-      ? "如果某个任务需要运行 shell 命令，请先把精确命令写在 tasks.md 的 checkbox 文本里并用反引号包裹；进入执行后，一次性命令优先调用 run_command 并检查 exitCode/stdout/stderr，长驻或交互式命令调用 execute_command 后再用 read_pty_since/read_pty_tail/get_pty_status 检查输出，不能只用文字复述。"
-      : "If a task requires shell commands, write the exact commands inside the tasks.md checkbox text using backticks. During execution, prefer run_command for finite commands and inspect exitCode/stdout/stderr; use execute_command for long-running or interactive commands, then verify with read_pty_since/read_pty_tail/get_pty_status. Do not merely describe commands in prose.";
+      ? "如果某个任务需要运行 shell 命令，请先把精确命令写在 tasks.md 的 checkbox 文本里并用反引号包裹；进入执行后，一次性命令优先调用 run_command 并检查 exitCode/stdout/stderr，长驻或交互式命令调用 execute_command 后再用 read_pty_since/read_pty_tail/get_pty_status 检查输出，不能只用文字复述。" + diagnosticHint
+      : "If a task requires shell commands, write the exact commands inside the tasks.md checkbox text using backticks. During execution, prefer run_command for finite commands and inspect exitCode/stdout/stderr; use execute_command for long-running or interactive commands, then verify with read_pty_since/read_pty_tail/get_pty_status. Do not merely describe commands in prose. " + diagnosticHint;
   }
 
   const detail = focus
@@ -796,8 +815,8 @@ function buildPlanCommandExecutionHint(
     .join("\n\n");
 
   return language === "zh"
-    ? "在当前未完成任务里检测到了必须实际运行的 shell 命令。一次性命令请优先调用 run_command；长驻或交互式命令调用 execute_command 后再用 read_pty_since/read_pty_tail/get_pty_status 检查结果；不要只在正文里重复这些命令：\n\n" + detail
-    : "The remaining tasks include shell commands that must be run for real. Prefer run_command for finite commands; for long-running or interactive commands call execute_command and verify with read_pty_since/read_pty_tail/get_pty_status. Do not just repeat them in prose:\n\n" + detail;
+    ? "在当前未完成任务里检测到了必须实际运行的 shell 命令。一次性命令请优先调用 run_command；长驻或交互式命令调用 execute_command 后再用 read_pty_since/read_pty_tail/get_pty_status 检查结果；不要只在正文里重复这些命令：\n\n" + detail + "\n\n" + diagnosticHint
+    : "The remaining tasks include shell commands that must be run for real. Prefer run_command for finite commands; for long-running or interactive commands call execute_command and verify with read_pty_since/read_pty_tail/get_pty_status. Do not just repeat them in prose:\n\n" + detail + "\n\n" + diagnosticHint;
 }
 
 function buildApprovedPlanContinuationPrompt(callbacks: OrchestratorCallbacks): string {
@@ -2402,7 +2421,22 @@ export async function executeAgentLoop(
       ? buildPlanFallbackNotice(callbacks.getPreferredLanguage(), sourceVisibleText.length)
       : normalizedVisibleTextForUser;
     const finalReplyOptions = compactedProseCodeDump || autoContinueReadOnlyPermission ? [] : normalized.replyOptions;
-    const historyAssistantText = finalVisibleText || "";
+    const syntheticVisibleConclusion =
+      !compactedProseCodeDump &&
+      !compactedIncompletePlanText &&
+      isSyntheticVisibleConclusion(finalVisibleText);
+    const userVisibleText = syntheticVisibleConclusion ? "" : finalVisibleText;
+    if (syntheticVisibleConclusion) {
+      callbacks.onStreamToken("__ESCALATION_RESET__:", assistantMsgId);
+      logAgentEvent("synthetic_visible_conclusion_suppressed", {
+        iteration,
+        workflowMode,
+        turnIntent,
+        hiddenThoughtChars: normalized.hiddenThought.length,
+        toolCalls: effectiveToolCalls.length,
+      });
+    }
+    const historyAssistantText = userVisibleText || "";
     if (historyAssistantText.trim()) {
       lastAssistantTextForCheckpoint = historyAssistantText;
     }
@@ -2424,7 +2458,7 @@ export async function executeAgentLoop(
       effectiveToolCalls.length === 0 &&
       finalReplyOptions.length === 0 &&
       !compactedProseCodeDump &&
-      looksLikeToolUnavailableClaim(finalVisibleText);
+      looksLikeToolUnavailableClaim(userVisibleText);
 
     if (shouldRecoverToolUnavailableClaim && !usedToolUnavailableRecoveryPrompt) {
       usedToolUnavailableRecoveryPrompt = true;
@@ -2433,7 +2467,7 @@ export async function executeAgentLoop(
         allTools: iterationAllTools.length,
         llmTools: llmTools.length,
         xmlToolsEnabled: true,
-        visibleChars: finalVisibleText.length,
+        visibleChars: userVisibleText.length,
       });
       callbacks.onStatusChange("running");
       callbacks.appendMessage({
@@ -2477,9 +2511,9 @@ export async function executeAgentLoop(
     const shouldSuppressApprovedPlanNoToolText =
       approvedPlanMissingTasksForNoTool || hasRemainingApprovedPlanTasksForNoTool;
     const rejectedCompletionClaim =
-      shouldSuppressApprovedPlanNoToolText && looksLikePlanCompletionClaim(finalVisibleText);
+      shouldSuppressApprovedPlanNoToolText && looksLikePlanCompletionClaim(userVisibleText);
 
-    if (shouldSuppressApprovedPlanNoToolText && (finalVisibleText.trim() || finalReplyOptions.length > 0)) {
+    if (shouldSuppressApprovedPlanNoToolText && (userVisibleText.trim() || finalReplyOptions.length > 0)) {
       callbacks.onStreamToken("__ESCALATION_RESET__:", assistantMsgId);
       logAgentEvent(rejectedCompletionClaim ? "plan_completion_claim_rejected" : "plan_no_tool_text_suppressed", {
         iteration,
@@ -2487,20 +2521,20 @@ export async function executeAgentLoop(
         auditCompleted: approvedPlanAuditForNoTool?.completedCount ?? 0,
         auditTotal: approvedPlanAuditForNoTool?.totalCount ?? 0,
         remaining: approvedPlanAuditForNoTool?.remainingTasks.length ?? 0,
-        visibleChars: finalVisibleText.length,
+        visibleChars: userVisibleText.length,
       });
     }
 
     if (!shouldSuppressApprovedPlanNoToolText) {
-      callbacks.onTurnSummaryReady(finalVisibleText);
+      callbacks.onTurnSummaryReady(userVisibleText);
     }
 
     if (normalized.hiddenThought) {
       callbacks.onThought(normalized.hiddenThought);
     }
 
-    if (!shouldSuppressApprovedPlanNoToolText && (finalVisibleText || finalReplyOptions.length > 0)) {
-      callbacks.onAssistantFinalText(finalVisibleText, finalReplyOptions);
+    if (!shouldSuppressApprovedPlanNoToolText && (userVisibleText || finalReplyOptions.length > 0)) {
+      callbacks.onAssistantFinalText(userVisibleText, finalReplyOptions);
     }
 
     if (autoContinueReadOnlyPermission) {
@@ -2545,8 +2579,13 @@ export async function executeAgentLoop(
       isPlanApproved: callbacks.getIsPlanApproved(),
     });
     const assistantHistoryText = serializeAssistantReplyForHistory(historyAssistantText, finalReplyOptions);
-    const hasMeaningfulVisibleText = finalVisibleText.trim().length > 0;
+    const hasMeaningfulVisibleText = userVisibleText.trim().length > 0;
     const wasTruncated = normalized.finishReason === "length";
+    const hiddenThoughtOnlyNoToolStop =
+      effectiveToolCalls.length === 0 &&
+      finalReplyOptions.length === 0 &&
+      !hasMeaningfulVisibleText &&
+      normalized.hiddenThought.trim().length > 0;
 
     logAgentEvent("normalized_turn", {
       iteration,
@@ -2775,7 +2814,8 @@ export async function executeAgentLoop(
             });
         const shouldRepromptForMissingToolCall =
           (!hasMeaningfulVisibleText && workflowMode !== "chat") ||
-          missingToolCallRepromptKind !== "none";
+          missingToolCallRepromptKind !== "none" ||
+          hiddenThoughtOnlyNoToolStop;
 
         if (shouldRepromptForMissingToolCall) {
           callbacks.onStatusChange("running");
@@ -2785,7 +2825,9 @@ export async function executeAgentLoop(
           }
           logAgentEvent("missing_tool_reprompt", {
             iteration,
-            kind: missingToolCallRepromptKind === "none" ? "generic" : missingToolCallRepromptKind,
+            kind: hiddenThoughtOnlyNoToolStop
+              ? "hidden_thought_only"
+              : missingToolCallRepromptKind === "none" ? "generic" : missingToolCallRepromptKind,
             consecutiveNoToolCount,
             visibleChars: normalized.visibleText.length,
             preservedVisibleText: hasMeaningfulVisibleText,
@@ -2795,11 +2837,16 @@ export async function executeAgentLoop(
               reason: "missing_tool_reprompt_limit",
               iteration,
               consecutiveNoToolCount,
-              kind: missingToolCallRepromptKind === "none" ? "generic" : missingToolCallRepromptKind,
+              kind: hiddenThoughtOnlyNoToolStop
+                ? "hidden_thought_only"
+                : missingToolCallRepromptKind === "none" ? "generic" : missingToolCallRepromptKind,
             });
             callbacks.onNonActionableStop(
-              buildNonActionableStopMessage(callbacks.getPreferredLanguage(), "missing_tool_loop"),
-              "missing_tool_loop",
+              buildNonActionableStopMessage(
+                callbacks.getPreferredLanguage(),
+                hiddenThoughtOnlyNoToolStop ? "no_output" : "missing_tool_loop",
+              ),
+              hiddenThoughtOnlyNoToolStop ? "no_output" : "missing_tool_loop",
             );
             callbacks.onStatusChange("idle");
             return;
@@ -2807,11 +2854,13 @@ export async function executeAgentLoop(
 
           const continuationMsg: AgentMessage = {
             role: "user",
-            content: buildMissingToolCallContinuationPrompt(
-              missingToolCallRepromptKind === "none" ? "generic" : missingToolCallRepromptKind,
-              callbacks.getPreferredLanguage(),
-              consecutiveNoToolCount,
-            ),
+            content: hiddenThoughtOnlyNoToolStop
+              ? buildHiddenThoughtOnlyContinuationPrompt(callbacks.getPreferredLanguage(), consecutiveNoToolCount)
+              : buildMissingToolCallContinuationPrompt(
+                  missingToolCallRepromptKind === "none" ? "generic" : missingToolCallRepromptKind,
+                  callbacks.getPreferredLanguage(),
+                  consecutiveNoToolCount,
+                ),
           };
           if (missingToolCallRepromptKind === "post_write_verify") {
             recoveringFromEmptyAssistantReplyAfterWrite = true;

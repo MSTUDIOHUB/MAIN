@@ -222,6 +222,15 @@ const STRONG_EXECUTE_PATTERNS = [
   /现在就(?:做|改|实现|修复)/i,
   /(?:完成|继续)(?:修改|实现|执行|处理)/i,
   /(?:根据|按照|按).{0,24}(?:design\.md|设计方案|方案).{0,48}(?:完成修改|开始执行|继续执行|执行|实现|落地|修改)/i,
+  /(?:提交|commit).{0,16}(?:并|和|然后|&|&&|and).{0,16}(?:推送|push)/i,
+  /^(?:帮我|请|直接|现在)?(?:提交|commit)(?:一下)?[。.!！\s]*$/i,
+  /(?:帮我|请|直接|现在)?(?:把|将)?.{0,16}(?:git|代码|改动|修改|变更).{0,16}(?:提交|commit)/i,
+  /(?:提交|commit).{0,16}(?:git|代码|改动|修改|变更|当前|这些)/i,
+  /(?:帮我|请|直接|现在)?(?:把|将)?.{0,12}(?:git\s+)?(?:推送|push)(?:一下|掉|到远程|当前分支)?/i,
+  /(?:查看|检查|获取).{0,16}git.{0,24}(?:状态|变更|改动|status|diff)/i,
+  /\bgit\s+(?:add|commit|push|status|diff)\b/i,
+  /\bcommit (?:and )?push(?: my| the| these)?(?: changes)?\b/i,
+  /\bpush (?:my|the|these|current)? ?(?:changes|branch|commits)\b/i,
   /\b(?:apply|patch|build it|go implement|implement it|fix it|ship it)\b/i,
 ];
 

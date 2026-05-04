@@ -13,6 +13,7 @@ export default function ThemeStyles() {
     <style>{`
       :root { --inline-chip-text: #f5f5f5; }
       html[data-theme="light"] { --inline-chip-text: #09090b; }
+      html[data-theme="black"] { --inline-chip-text: #ffffff; }
       .theme-bg { background-color: var(--accent) !important; color: white !important; }
       .theme-bg-hover:hover { background-color: var(--accent-hover) !important; color: white !important; }
       .theme-text { color: var(--accent-light) !important; }
@@ -140,6 +141,26 @@ export default function ThemeStyles() {
       }
       html[data-theme="light"] .composer-toolbar-divider {
         background: rgba(15, 23, 42, 0.14);
+      }
+      html[data-theme="black"] .panel-tab-icon-button,
+      html[data-theme="black"] .composer-toolbar-pill-button {
+        color: #a5a5ae;
+      }
+      html[data-theme="black"] .panel-tab-icon-button:hover:not(:disabled),
+      html[data-theme="black"] .composer-toolbar-pill-button:hover:not(:disabled) {
+        color: var(--accent-light);
+        background: color-mix(in srgb, var(--accent) 12%, #000000 88%);
+        border-color: color-mix(in srgb, var(--accent-light) 26%, transparent);
+      }
+      html[data-theme="black"] .panel-tab-icon-button.is-active,
+      html[data-theme="black"] .composer-toolbar-pill-button.is-active {
+        color: var(--accent-light);
+        background: rgba(255,255,255,0.02);
+        border-color: color-mix(in srgb, var(--accent-light) 68%, transparent);
+        outline-color: color-mix(in srgb, var(--accent-light) 48%, transparent);
+      }
+      html[data-theme="black"] .composer-toolbar-divider {
+        background: rgba(255, 255, 255, 0.08);
       }
     `}</style>
   );

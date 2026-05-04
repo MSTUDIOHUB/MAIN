@@ -11,7 +11,7 @@
         "silent": true
       },
       "wix": {
-        "version": "1.4.8.0",
+        "version": "1.5.0.0",
         "upgradeCode": "465E437A-3D8C-4708-850B-6CDBFCD4C079"
       }
     }

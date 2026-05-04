@@ -11,7 +11,7 @@ interface TopIslandProps {
   status: string;
   statusToneClass: string;
   language: "zh" | "en";
-  themeMode: "light" | "dark";
+  themeMode: "light" | "dark" | "black";
   isVisible?: boolean;
   planTasks: PlanTask[];
   planExecutionEvidenceLedger?: PlanExecutionEvidenceEntry[];
@@ -213,15 +213,22 @@ const TopIsland = memo(function TopIsland({
       : "",
   }), [activeProgressMode, completedCount, currentPhaseKey, language, progressItems.length]);
 
+  const isBlackTheme = themeMode === "black";
   const shellClass = themeMode === "light"
     ? "bg-[rgba(255,255,255,0.72)] border-[rgba(15,23,42,0.1)] shadow-[0_18px_50px_rgba(15,23,42,0.12)]"
+    : isBlackTheme
+    ? "bg-[rgba(3,3,4,0.72)] border-[rgba(255,255,255,0.07)] shadow-[0_22px_70px_rgba(0,0,0,0.42)]"
     : "bg-[rgba(10,10,16,0.68)] border-[rgba(255,255,255,0.08)] shadow-[0_20px_60px_rgba(0,0,0,0.28)]";
   const actionableOutline = actionable
     ? "ring-1 ring-[var(--accent)] ring-offset-1 ring-offset-transparent"
     : "";
   const primaryText = themeMode === "light" ? "text-[#111827]" : "text-[#f5f5f5]";
   const secondaryText = themeMode === "light" ? "text-[#4b5563]" : "text-[#71717a]";
-  const surface = themeMode === "light" ? "bg-[rgba(255,255,255,0.36)] border-[rgba(15,23,42,0.08)]" : "bg-[rgba(255,255,255,0.04)] border-[#1f1f23]";
+  const surface = themeMode === "light"
+    ? "bg-[rgba(255,255,255,0.36)] border-[rgba(15,23,42,0.08)]"
+    : isBlackTheme
+    ? "bg-[rgba(255,255,255,0.025)] border-[#17171c]"
+    : "bg-[rgba(255,255,255,0.04)] border-[#1f1f23]";
   const normalizedCustomReply = customReplyText.replace(/\s+/g, " ").trim();
 
   const submitCustomReply = (event: FormEvent<HTMLFormElement>) => {
@@ -494,6 +501,8 @@ const TopIsland = memo(function TopIsland({
                         className={`min-w-0 flex-1 rounded-xl border px-3 py-2.5 text-[12px] leading-6 outline-none transition-colors ${
                           themeMode === "light"
                             ? "border-[rgba(15,23,42,0.12)] bg-[rgba(255,255,255,0.62)] text-[#111827] placeholder:text-[#6b7280] focus:border-[rgba(124,58,237,0.45)]"
+                            : isBlackTheme
+                            ? "border-[#202026] bg-[#030304] text-[#f5f5f5] placeholder:text-[#74747e] focus:border-[rgba(124,58,237,0.5)]"
                             : "border-[#3f3f46] bg-[#09090b] text-[#f5f5f5] placeholder:text-[#71717a] focus:border-[rgba(124,58,237,0.5)]"
                         }`}
                       />

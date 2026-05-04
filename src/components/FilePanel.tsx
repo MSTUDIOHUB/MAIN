@@ -324,7 +324,7 @@ function getTablePreview(content: string, path: string) {
   };
 }
 
-function getFileViewerPalette(isLight: boolean) {
+function getFileViewerPalette(isLight: boolean, isBlack: boolean) {
   return isLight
     ? {
         rootBg: "#f7f7f8",
@@ -347,6 +347,29 @@ function getFileViewerPalette(isLight: boolean) {
         dangerText: "#be123c",
         tableHeaderBg: "#f0f1f4",
         tableRowAlt: "#fafafa",
+      }
+    : isBlack
+    ? {
+        rootBg: "#000000",
+        headerBg: "#050506",
+        headerBorder: "#141418",
+        surfaceBg: "#070708",
+        surfaceAltBg: "#0b0b0d",
+        surfaceBorder: "#17171c",
+        text: "#e7e7ea",
+        muted: "#a5a5ae",
+        subtle: "#74747e",
+        buttonBg: "#030304",
+        buttonBorder: "#202026",
+        buttonActiveBg: "#f4f4f5",
+        buttonActiveText: "#09090b",
+        codeBg: "#000000",
+        lineNumber: "#74747e",
+        dangerBg: "rgba(127,29,29,0.14)",
+        dangerBorder: "#7f1d1d",
+        dangerText: "#f48771",
+        tableHeaderBg: "#070708",
+        tableRowAlt: "#030304",
       }
     : {
         rootBg: "#050505",
@@ -431,7 +454,7 @@ function FileViewerPanel({
   fileCategory: FileCategory;
   fileLang: string;
   fileName: string;
-  themeMode: "light" | "dark";
+  themeMode: "light" | "dark" | "black";
   uiLanguage: string;
   onClose: () => void;
 }) {
@@ -456,7 +479,8 @@ function FileViewerPanel({
   };
 
   const isLight = themeMode === "light";
-  const palette = useMemo(() => getFileViewerPalette(isLight), [isLight]);
+  const isBlack = themeMode === "black";
+  const palette = useMemo(() => getFileViewerPalette(isLight, isBlack), [isBlack, isLight]);
   const langBadge = useMemo(() => getFileDisplayMeta(fileCategory, fileLang, filePath, isLight), [fileCategory, fileLang, filePath, isLight]);
   const jsonPreview = useMemo(() => fileCategory === "json" ? getJsonPreview(fileContent, filePath) : null, [fileCategory, fileContent, filePath]);
   const tablePreview = useMemo(() => fileCategory === "table" ? getTablePreview(fileContent, filePath) : null, [fileCategory, fileContent, filePath]);

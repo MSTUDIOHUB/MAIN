@@ -12,6 +12,8 @@ export default function ThoughtBlock({
   const theme = useTheme();
   const language = useAppStore((s) => s.config.language);
   const themeMode = useAppStore((s) => s.config.themeMode);
+  const isLightTheme = themeMode === "light";
+  const isBlackTheme = themeMode === "black";
 
   const label = language === "zh" ? "思考中" : "Thinking";
 
@@ -20,9 +22,9 @@ export default function ThoughtBlock({
       <div
         className="inline-flex items-center gap-2 rounded-md border px-3 py-2 font-mono text-[11px] shadow-sm"
         style={{
-          color: isStreaming ? theme.light : themeMode === "light" ? "#52525b" : "#a1a1aa",
-          backgroundColor: themeMode === "light" ? "#ffffff" : "#07070a",
-          borderColor: isStreaming ? theme.subtleBorder : themeMode === "light" ? "#d4d4d8" : "#27272a",
+          color: isStreaming ? theme.light : isLightTheme ? "#52525b" : isBlackTheme ? "#a5a5ae" : "#a1a1aa",
+          backgroundColor: isLightTheme ? "#ffffff" : isBlackTheme ? "#030304" : "#07070a",
+          borderColor: isStreaming ? theme.subtleBorder : isLightTheme ? "#d4d4d8" : isBlackTheme ? "#202026" : "#27272a",
         }}
       >
         <span

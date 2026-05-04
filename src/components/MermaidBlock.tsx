@@ -12,8 +12,9 @@ function loadMermaid() {
   return mermaidModulePromise;
 }
 
-function getMermaidTheme(themeMode: "light" | "dark") {
+function getMermaidTheme(themeMode: "light" | "dark" | "black") {
   const isLight = themeMode === "light";
+  const isBlack = themeMode === "black";
 
   return {
     startOnLoad: false,
@@ -41,11 +42,32 @@ function getMermaidTheme(themeMode: "light" | "dark") {
           nodeBorder: "#94a3b8",
           fontFamily: "ui-sans-serif, system-ui, sans-serif",
         }
+      : isBlack
+      ? {
+          darkMode: true,
+          background: "#000000",
+          primaryColor: "#070708",
+          primaryBorderColor: "#303038",
+          primaryTextColor: "#ffffff",
+          secondaryColor: "#08111f",
+          secondaryBorderColor: "#60a5fa",
+          secondaryTextColor: "#dbeafe",
+          tertiaryColor: "#15101f",
+          tertiaryBorderColor: "#a78bfa",
+          tertiaryTextColor: "#ede9fe",
+          clusterBkg: "#030304",
+          clusterBorder: "#202026",
+          lineColor: "#a5a5ae",
+          edgeLabelBackground: "#000000",
+          mainBkg: "#000000",
+          nodeBorder: "#303038",
+          fontFamily: "ui-sans-serif, system-ui, sans-serif",
+        }
       : {
           darkMode: true,
-          background: "#232327",
-          primaryColor: "#2a2a30",
-          primaryBorderColor: "#5a5a66",
+          background: "#19191d",
+          primaryColor: "#202025",
+          primaryBorderColor: "#4a4a54",
           primaryTextColor: "#f5f5f5",
           secondaryColor: "#233041",
           secondaryBorderColor: "#60a5fa",

@@ -162,7 +162,7 @@ function IntegratedTerminal({
   workspace,
   sessionKey,
 }: {
-  themeMode: "light" | "dark";
+  themeMode: "light" | "dark" | "black";
   workspace: string;
   sessionKey?: string;
 }) {
@@ -206,13 +206,37 @@ function IntegratedTerminal({
             brightCyan: "#06b6d4",
             brightWhite: "#09090b",
           }
+        : themeMode === "black"
+        ? {
+            background: "#000000",
+            foreground: "#dedee3",
+            cursor: "#dedee3",
+            cursorAccent: "#000000",
+            selectionBackground: "#202026",
+            black: "#050506",
+            red: "#f48771",
+            green: "#86d9a3",
+            yellow: "#fbbf24",
+            blue: "#6cb6ff",
+            magenta: "#d2a8ff",
+            cyan: "#56d4dd",
+            white: "#dedee3",
+            brightBlack: "#74747e",
+            brightRed: "#f48771",
+            brightGreen: "#86d9a3",
+            brightYellow: "#fbbf24",
+            brightBlue: "#6cb6ff",
+            brightMagenta: "#d2a8ff",
+            brightCyan: "#56d4dd",
+            brightWhite: "#ffffff",
+          }
         : {
-            background: "#181818",
+            background: "#111112",
             foreground: "#d4d4d8",
             cursor: "#d4d4d8",
-            cursorAccent: "#181818",
-            selectionBackground: "#34343b",
-            black: "#1d1d20",
+            cursorAccent: "#111112",
+            selectionBackground: "#2b2b32",
+            black: "#151518",
             red: "#f48771",
             green: "#86d9a3",
             yellow: "#fbbf24",
@@ -1026,6 +1050,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
 
   const isVisible = (showPlanPanel && hasPlanPanelContent) || showDiff || showTerminal;
   const terminalSessionKey = resolveSessionRuntimeKey(resolveSessionWorkspaceKey(currentWorkspace), currentSessionId) || undefined;
+  const isBlackTheme = config.themeMode === "black";
 
   if (!isVisible) return null;
 
@@ -1034,8 +1059,15 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
   return (
     <>
       <div className="w-1 cursor-col-resize hover:bg-[#3f3f46] active:bg-[#555] z-20 transition-colors" onMouseDown={startResizing} />
-      <div className="bg-[#000000] flex min-w-0 flex-col shrink-0 border-l border-[#27272a] z-10" style={{ width: `${rightPanelWidth}px`, display: window.innerWidth < 1220 ? "none" : "flex" }}>
-        <div className="min-h-[56px] shrink-0 border-b border-[#27272a] bg-[#09090b] px-3 py-2 flex items-center justify-between gap-3">
+      <div
+        className={`flex min-w-0 flex-col shrink-0 border-l border-[#27272a] z-10 ${
+          isBlackTheme ? "bg-[rgba(0,0,0,0.96)]" : "bg-[#000000]"
+        }`}
+        style={{ width: `${rightPanelWidth}px`, display: window.innerWidth < 1220 ? "none" : "flex" }}
+      >
+        <div className={`min-h-[56px] shrink-0 border-b border-[#27272a] px-3 py-2 flex items-center justify-between gap-3 ${
+          isBlackTheme ? "bg-[#050506]" : "bg-[#09090b]"
+        }`}>
           <div className="min-w-0 flex items-center gap-3">
             <div className="flex h-8 w-8 items-center justify-center rounded-lg border border-[#27272a] bg-[#050505] text-[#e4e4e7]">
               <HeaderIcon className="h-4 w-4" />

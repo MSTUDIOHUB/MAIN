@@ -33,6 +33,7 @@ import {
   createCloudServerConfig,
   normalizeCloudServerState,
 } from "../lib/cloudServers";
+import { normalizeThoughtDisplayMode } from "../lib/thoughtDisplay";
 
 function buildCloudConnectionFingerprint(server: any, apiFormatOverride?: unknown, modelOverride?: unknown): string {
   if (!server) return "";
@@ -56,6 +57,17 @@ function isSameCloudConnectionTarget(current: any, target: any): boolean {
     && String(current.customHeaders || "") === String(target.customHeaders || "");
 }
 
+const settingsSectionRowClass = "grid gap-3 lg:grid-cols-[minmax(190px,300px)_minmax(0,1fr)] lg:items-start lg:gap-8";
+const settingsControlColumnClass = "w-full lg:ml-auto lg:max-w-[620px]";
+const settingsOptionBaseClass = "border bg-[#000000] text-[#a1a1aa] transition-all duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-[#09090b]";
+const settingsOptionSelectedClass = "theme-text theme-subtle-border bg-transparent ring-1 ring-inset ring-[var(--accent-light)] hover:bg-[var(--accent-subtle)]";
+const settingsOptionIdleClass = "border-[#27272a] hover:border-[#3f3f46] hover:bg-[#18181b] hover:text-white";
+const settingsSelectClass = "w-full rounded-md border border-[#27272a] bg-[#000000] p-2.5 text-[14px] text-white outline-none theme-ring transition-all cursor-pointer focus:border-[var(--accent)] focus:ring-1 focus:ring-inset focus:ring-[var(--accent-light)] disabled:cursor-not-allowed disabled:opacity-60";
+
+function settingsOptionButtonClass(isSelected: boolean, extra = "") {
+  return `${settingsOptionBaseClass} ${isSelected ? settingsOptionSelectedClass : settingsOptionIdleClass} ${extra}`.trim();
+}
+
 const SETTINGS_COPY = {
   zh: {
     activeProfile: "当前配置",
@@ -71,6 +83,11 @@ const SETTINGS_COPY = {
     testing: "测试中...",
     test: "测试",
     displayLanguage: "显示语言",
+    enabled: "已启用",
+    disabled: "已关闭",
+    thoughtDisplayHiddenDesc: "只显示最终回复和执行状态。",
+    thoughtDisplaySummaryDesc: "显示过滤后的关键过程和下一步意图。",
+    thoughtDisplayDetailedDesc: "展开更多过滤后的过程文本，仍会限长去噪。",
 
     mcpServerTitle: "MCP 服务器",
     mcpScanTools: "扫描工具",
@@ -219,6 +236,11 @@ const SETTINGS_COPY = {
     testing: "Testing...",
     test: "Test",
     displayLanguage: "Display Language",
+    enabled: "Enabled",
+    disabled: "Disabled",
+    thoughtDisplayHiddenDesc: "Show only final replies and execution status.",
+    thoughtDisplaySummaryDesc: "Show filtered key process notes and the model's next intended step.",
+    thoughtDisplayDetailedDesc: "Show more filtered process text while still limiting length and noise.",
 
     mcpServerTitle: "MCP Servers",
     mcpScanTools: "Scan Tools",
@@ -1257,6 +1279,12 @@ export default function SettingsModal({
     mcpServerTitle: t.mcpServers || SETTINGS_COPY[language].mcpServerTitle,
     mcpScanning: t.mcpScanning || SETTINGS_COPY[language].mcpScanning,
   };
+  const thoughtDisplayMode = normalizeThoughtDisplayMode(config.thoughtDisplayMode);
+  const thoughtDisplayOptions = [
+    { value: "hidden", label: t.thoughtDisplayHidden, description: copy.thoughtDisplayHiddenDesc },
+    { value: "summary", label: t.thoughtDisplaySummary, description: copy.thoughtDisplaySummaryDesc },
+    { value: "detailed", label: t.thoughtDisplayDetailed, description: copy.thoughtDisplayDetailedDesc },
+  ];
 
   // Auto-clear cloud fetch message after 5 seconds
   useEffect(() => {
@@ -2194,38 +2222,44 @@ export default function SettingsModal({
       >
         <div className="shrink-0 px-5 py-4 border-b border-[#27272a] flex items-center justify-between bg-[#000000]">
           <h2 className="text-base font-bold text-white flex items-center gap-2"><IconSettings className="w-5 h-5" /> {t.settings}</h2>
-          <button onClick={onClose} className="text-[#a1a1aa] hover:text-white transition-colors"><IconClose className="w-4 h-4" /></button>
+          <button data-testid="settings-close" onClick={onClose} className="text-[#a1a1aa] hover:text-white transition-colors"><IconClose className="w-4 h-4" /></button>
         </div>
 
         <div className="flex min-h-0 flex-1">
           <div className="w-52 shrink-0 overflow-y-auto border-r border-[#27272a] bg-[#000000] p-2 flex flex-col gap-1">
-            <button onClick={() => setSettingsTab('general')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'general' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.general}</button>
-            <button onClick={() => setSettingsTab('local')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'local' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.localSetup}</button>
-            <button onClick={() => setSettingsTab('cloud')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'cloud' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.cloudSetup}</button>
-            <button onClick={() => setSettingsTab('context')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'context' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.contextSetup}</button>
-            <button onClick={() => setSettingsTab('mcp')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'mcp' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{copy.mcpServerTitle}</button>
-            <button onClick={() => setSettingsTab('im')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'im' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.imAdapters}</button>
-            <button onClick={() => setSettingsTab('data')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'data' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.dataManagement}</button>
-            <button onClick={() => setSettingsTab('debug')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'debug' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.debugLog}</button>
+            <button data-testid="settings-tab-general" onClick={() => setSettingsTab('general')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'general' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.general}</button>
+            <button data-testid="settings-tab-local" onClick={() => setSettingsTab('local')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'local' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.localSetup}</button>
+            <button data-testid="settings-tab-cloud" onClick={() => setSettingsTab('cloud')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'cloud' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.cloudSetup}</button>
+            <button data-testid="settings-tab-context" onClick={() => setSettingsTab('context')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'context' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.contextSetup}</button>
+            <button data-testid="settings-tab-mcp" onClick={() => setSettingsTab('mcp')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'mcp' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{copy.mcpServerTitle}</button>
+            <button data-testid="settings-tab-im" onClick={() => setSettingsTab('im')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'im' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.imAdapters}</button>
+            <button data-testid="settings-tab-data" onClick={() => setSettingsTab('data')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'data' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.dataManagement}</button>
+            <button data-testid="settings-tab-debug" onClick={() => setSettingsTab('debug')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'debug' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.debugLog}</button>
           </div>
           <div className="min-h-0 flex-1 overflow-y-auto bg-[#09090b] p-6 pb-8">
 
             {/* GENERAL SETTINGS + THEME */}
             {settingsTab === 'general' && (
-              <div className="space-y-6">
+              <div className="space-y-5">
                 <div className="flex items-center justify-between"><h3 className="text-[13px] font-bold text-[#a1a1aa] uppercase tracking-wider">{t.general}</h3></div>
-                <div>
-                  <label className="block text-[13px] font-bold text-[#e4e4e7] mb-2">{copy.displayLanguage}</label>
-                  <select value={config.language} onChange={(e) => setConfig({ ...config, language: e.target.value })} className="w-full bg-[#000000] border border-[#27272a] rounded-md p-2.5 text-[14px] text-white focus:outline-none theme-ring transition-all cursor-pointer">
-                    <option value="en">English</option><option value="zh">简体中文</option>
-                  </select>
+                <div className={settingsSectionRowClass}>
+                  <div>
+                    <label className="block text-[13px] font-bold text-[#e4e4e7]">{copy.displayLanguage}</label>
+                  </div>
+                  <div className={settingsControlColumnClass}>
+                    <select value={config.language} onChange={(e) => setConfig({ ...config, language: e.target.value })} className={settingsSelectClass}>
+                      <option value="en">English</option><option value="zh">简体中文</option>
+                    </select>
+                  </div>
                 </div>
 
                 {/* THEME COLOR PICKER */}
-                <div className="pt-4 border-t border-[#27272a]">
-                  <label className="block text-[13px] font-bold text-[#e4e4e7] mb-1.5">{t.themeColor}</label>
-                  <p className="text-[12px] text-[#a1a1aa] mb-4">{t.themeDesc}</p>
-                  <div className="flex flex-wrap gap-3">
+                <div className={`${settingsSectionRowClass} border-t border-[#27272a] pt-5`}>
+                  <div>
+                    <label className="block text-[13px] font-bold text-[#e4e4e7]">{t.themeColor}</label>
+                    <p className="mt-1.5 text-[12px] leading-relaxed text-[#a1a1aa]">{t.themeDesc}</p>
+                  </div>
+                  <div className={`${settingsControlColumnClass} flex flex-wrap gap-3 lg:justify-end`}>
                     {Object.entries(THEMES).map(([key, theme]) => (
                       <button
                         key={key}
@@ -2244,27 +2278,31 @@ export default function SettingsModal({
                 </div>
 
                 {/* THEME MODE TOGGLE */}
-                <div className="pt-4 border-t border-[#27272a]">
-                  <label className="block text-[13px] font-bold text-[#e4e4e7] mb-1.5">{t.themeMode}</label>
-                  <div className="flex items-center gap-2">
+                <div className={`${settingsSectionRowClass} border-t border-[#27272a] pt-5`}>
+                  <div>
+                    <label className="block text-[13px] font-bold text-[#e4e4e7]">{t.themeMode}</label>
+                  </div>
+                  <div className={`${settingsControlColumnClass} flex flex-wrap items-center gap-2 lg:justify-end`}>
                     <button
                       onClick={() => setConfig({ ...config, themeMode: "dark" })}
-                      className={`flex items-center gap-2 px-4 py-2 text-[12px] font-bold rounded-md border transition-colors ${
-                        config.themeMode !== "light"
-                          ? "theme-subtle-bg theme-subtle-border theme-text"
-                          : "bg-[#000000] border-[#27272a] text-[#a1a1aa] hover:text-white"
-                      }`}
+                      aria-pressed={config.themeMode === "dark"}
+                      className={settingsOptionButtonClass(config.themeMode === "dark", "flex items-center gap-2 rounded-md px-4 py-2 text-[12px] font-bold")}
                     >
                       <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" /></svg>
                       {t.themeModeDark}
                     </button>
                     <button
+                      onClick={() => setConfig({ ...config, themeMode: "black" })}
+                      aria-pressed={config.themeMode === "black"}
+                      className={settingsOptionButtonClass(config.themeMode === "black", "flex items-center gap-2 rounded-md px-4 py-2 text-[12px] font-bold")}
+                    >
+                      <span className="h-3.5 w-3.5 rounded-full border border-current bg-black shadow-[inset_0_0_0_2px_rgba(255,255,255,0.08)]" />
+                      {t.themeModeBlack}
+                    </button>
+                    <button
                       onClick={() => setConfig({ ...config, themeMode: "light" })}
-                      className={`flex items-center gap-2 px-4 py-2 text-[12px] font-bold rounded-md border transition-colors ${
-                        config.themeMode === "light"
-                          ? "theme-subtle-bg theme-subtle-border theme-text"
-                          : "bg-[#000000] border-[#27272a] text-[#a1a1aa] hover:text-white"
-                      }`}
+                      aria-pressed={config.themeMode === "light"}
+                      className={settingsOptionButtonClass(config.themeMode === "light", "flex items-center gap-2 rounded-md px-4 py-2 text-[12px] font-bold")}
                     >
                       <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="5" /><line x1="12" y1="1" x2="12" y2="3" /><line x1="12" y1="21" x2="12" y2="23" /><line x1="4.22" y1="4.22" x2="5.64" y2="5.64" /><line x1="18.36" y1="18.36" x2="19.78" y2="19.78" /><line x1="1" y1="12" x2="3" y2="12" /><line x1="21" y1="12" x2="23" y2="12" /><line x1="4.22" y1="19.78" x2="5.64" y2="18.36" /><line x1="18.36" y1="5.64" x2="19.78" y2="4.22" /></svg>
                       {t.themeModeLight}
@@ -2273,13 +2311,15 @@ export default function SettingsModal({
                 </div>
 
                 {/* CHAT FONT SIZE */}
-                <div className="pt-4 border-t border-[#27272a]">
-                  <div className="max-w-[520px]">
-                    <div className="flex items-center justify-between mb-1.5">
-                      <label className="text-[13px] font-bold text-[#e4e4e7]">{t.chatFontSize}</label>
+                <div className={`${settingsSectionRowClass} border-t border-[#27272a] pt-5`}>
+                  <div>
+                    <label className="block text-[13px] font-bold text-[#e4e4e7]">{t.chatFontSize}</label>
+                    <p className="mt-1.5 text-[12px] leading-relaxed text-[#a1a1aa]">{t.chatFontSizeDesc}</p>
+                  </div>
+                  <div className={settingsControlColumnClass}>
+                    <div className="mb-3 flex items-center justify-end">
                       <span className="text-[12px] font-mono theme-subtle-bg px-2 py-0.5 rounded border theme-subtle-border">{config.chatFontSize ?? 13} px</span>
                     </div>
-                    <p className="text-[12px] text-[#a1a1aa] mb-3">{t.chatFontSizeDesc}</p>
                     <input
                       type="range" min={10} max={20} step={1}
                       value={config.chatFontSize ?? 13}
@@ -2295,19 +2335,48 @@ export default function SettingsModal({
                   </div>
                 </div>
 
+                {/* THOUGHT DISPLAY */}
+                <div className={`${settingsSectionRowClass} border-t border-[#27272a] pt-5`}>
+                  <div>
+                    <label className="block text-[13px] font-bold text-[#e4e4e7]">{t.thoughtDisplay}</label>
+                    <p className="mt-1.5 text-[12px] leading-relaxed text-[#a1a1aa]">{t.thoughtDisplayDesc}</p>
+                  </div>
+                  <div className={`${settingsControlColumnClass} grid gap-3 lg:grid-cols-3`}>
+                    {thoughtDisplayOptions.map((option) => {
+                      const isThoughtOptionSelected = thoughtDisplayMode === option.value;
+                      return (
+                        <button
+                          key={option.value}
+                          type="button"
+                          data-testid={`thought-display-${option.value}`}
+                          aria-pressed={isThoughtOptionSelected}
+                          onClick={() => setConfig({ ...config, thoughtDisplayMode: option.value })}
+                          className={settingsOptionButtonClass(isThoughtOptionSelected, "min-h-[112px] rounded-lg p-3 text-left")}
+                        >
+                          <span className="flex items-start justify-between gap-3">
+                            <span className={`text-[13px] font-bold ${isThoughtOptionSelected ? "theme-text" : "text-[#e4e4e7]"}`}>{option.label}</span>
+                            <span className={`mt-0.5 h-2.5 w-2.5 shrink-0 rounded-full border ${isThoughtOptionSelected ? "theme-bg theme-glow border-transparent" : "border-[#52525b] bg-transparent"}`} />
+                          </span>
+                          <span className="mt-2 block text-[11.5px] leading-relaxed text-[#a1a1aa]">{option.description}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
                 {/* SESSION RECORDING */}
-                <div className="pt-4 border-t border-[#27272a]">
-                  <label className="flex cursor-pointer items-start gap-3">
+                <div className={`${settingsSectionRowClass} border-t border-[#27272a] pt-5`}>
+                  <div>
+                    <span className="block text-[13px] font-bold text-[#e4e4e7]">{t.sessionRecording}</span>
+                    <span className="mt-1.5 block text-[12px] leading-relaxed text-[#a1a1aa]">{t.sessionRecordingDesc}</span>
+                  </div>
+                  <label className={`${settingsControlColumnClass} ${settingsOptionButtonClass(config.sessionRecordingEnabled !== false, "flex cursor-pointer items-center justify-between gap-4 rounded-lg px-4 py-3")}`}>
+                    <span className={`min-w-0 text-[12px] font-bold ${config.sessionRecordingEnabled !== false ? "theme-text" : "text-[#a1a1aa]"}`}>{config.sessionRecordingEnabled !== false ? copy.enabled : copy.disabled}</span>
                     <input
                       type="checkbox"
                       checked={config.sessionRecordingEnabled !== false}
                       onChange={(e) => setConfig({ ...config, sessionRecordingEnabled: e.target.checked })}
-                      className="mt-1"
                     />
-                    <span>
-                      <span className="block text-[13px] font-bold text-[#e4e4e7]">{t.sessionRecording}</span>
-                      <span className="mt-1 block text-[12px] leading-relaxed text-[#a1a1aa]">{t.sessionRecordingDesc}</span>
-                    </span>
                   </label>
                 </div>
               </div>
@@ -2318,13 +2387,13 @@ export default function SettingsModal({
               <div className="space-y-6">
                 <div className="flex items-center justify-between">
                   <h3 className="text-[13px] font-bold text-[#a1a1aa] uppercase tracking-wider">{t.localSetup}</h3>
-                  <button onClick={() => setConfig({ ...config, activeProfile: 'local' })} className={`text-[11px] px-2.5 py-1.5 rounded border uppercase font-bold tracking-wider transition-colors ${config.activeProfile === 'local' ? 'theme-subtle-bg theme-subtle-border theme-text' : 'bg-[#18181b] text-[#a1a1aa] border-transparent hover:text-white'}`}>
+                  <button onClick={() => setConfig({ ...config, activeProfile: 'local' })} aria-pressed={config.activeProfile === 'local'} className={settingsOptionButtonClass(config.activeProfile === 'local', "rounded px-2.5 py-1.5 text-[11px] font-bold uppercase tracking-wider")}>
                     {config.activeProfile === 'local' ? copy.activeProfile : copy.setAsActive}
                   </button>
                 </div>
                 <div>
                   <label className="block text-[13px] font-bold text-[#e4e4e7] mb-2">{copy.providerEngine}</label>
-                  <select value={config.local.provider} onChange={handleProviderChange} className="w-full bg-[#000000] border border-[#27272a] rounded-md p-2.5 text-[14px] text-white focus:outline-none theme-ring cursor-pointer">
+                  <select value={config.local.provider} onChange={handleProviderChange} className={settingsSelectClass}>
                     <option value="LM Studio">LM Studio</option>
                     <option value="Ollama">Ollama</option>
                     <option value="OMLX">OMLX (MLX for Mac)</option>
@@ -2354,7 +2423,7 @@ export default function SettingsModal({
                       value={config.local.model || ""}
                       onChange={(e) => setConfig({ ...config, local: { ...config.local, model: e.target.value } })}
                       disabled={isFetchingModels}
-                      className="flex-1 bg-[#000000] border border-[#27272a] rounded-md p-2.5 text-[14px] text-white focus:outline-none theme-ring transition-colors cursor-pointer"
+                      className={`${settingsSelectClass} min-w-0 flex-1`}
                     >
                       {isFetchingModels ? (
                         <option value="">{copy.scanningModels}</option>
@@ -2411,7 +2480,7 @@ export default function SettingsModal({
                     <h3 className="text-[13px] font-bold text-[#a1a1aa] uppercase tracking-wider">{t.cloudSetup}</h3>
                     <p className="mt-1 text-[11.5px] text-[#71717a]">{copy.cloudDesc}</p>
                   </div>
-                  <button onClick={() => setConfig({ ...config, activeProfile: 'cloud' })} className={`text-[11px] px-2.5 py-1.5 rounded border uppercase font-bold tracking-wider transition-colors ${config.activeProfile === 'cloud' ? 'theme-subtle-bg theme-subtle-border theme-text' : 'bg-[#18181b] text-[#a1a1aa] border-transparent hover:text-white'}`}>
+                  <button onClick={() => setConfig({ ...config, activeProfile: 'cloud' })} aria-pressed={config.activeProfile === 'cloud'} className={settingsOptionButtonClass(config.activeProfile === 'cloud', "rounded px-2.5 py-1.5 text-[11px] font-bold uppercase tracking-wider")}>
                     {config.activeProfile === 'cloud' ? copy.activeProfile : copy.setAsActive}
                   </button>
                 </div>
@@ -2441,7 +2510,7 @@ export default function SettingsModal({
                               }
                               setCloudModelInputMode("manual");
                             }}
-                            className="text-[11px] font-bold text-[#a1a1aa] transition-colors hover:text-white"
+                            className={settingsOptionButtonClass(false, "rounded px-2.5 py-1.5 text-[11px] font-bold")}
                           >
                             {cloudModelInputMode === "select" ? copy.manualInput : copy.dropdownSelect}
                           </button>
@@ -2454,7 +2523,7 @@ export default function SettingsModal({
                             value={draftCloudConfig.model || ""}
                             onChange={(e) => confirmCloudModelSelection(e.target.value)}
                             disabled={isFetchingCloudModels}
-                            className="min-w-0 flex-1 rounded-md border border-[#27272a] bg-[#000000] p-2.5 text-[14px] text-white outline-none theme-ring transition-colors"
+                            className={`${settingsSelectClass} min-w-0 flex-1`}
                           >
                             {cloudAvailableModels.map((model) => (
                               <option key={model} value={model}>{model}</option>
@@ -2562,7 +2631,7 @@ export default function SettingsModal({
                                   selectCloudServer(server.id);
                                 }
                               }}
-                              className={`group w-full rounded-md border p-3 text-left transition-colors ${isSelectedServer ? "theme-subtle-bg theme-subtle-border" : "border-[#27272a] bg-[#09090b] hover:border-[#3f3f46]"}`}
+                              className={`group w-full rounded-md border p-3 text-left transition-all ${isSelectedServer ? "theme-subtle-border bg-transparent ring-1 ring-inset ring-[var(--accent-light)] hover:bg-[var(--accent-subtle)]" : "border-[#27272a] bg-[#09090b] hover:border-[#3f3f46]"}`}
                             >
                               <div className="flex items-start gap-2">
                                 <IconCloud className={`mt-0.5 h-4 w-4 ${isSelectedServer ? "theme-text" : "text-[#71717a]"}`} />
@@ -2593,7 +2662,7 @@ export default function SettingsModal({
                                     }
                                   }}
                                   className="mt-0.5 rounded p-1 text-[#71717a] opacity-0 transition-colors hover:bg-[#181111] hover:text-[#fca5a5] group-hover:opacity-100"
-                                  title={copy.remove}
+                                  title={language === "zh" ? "删除服务器" : "Delete server"}
                                 >
                                   <IconTrash className="h-3.5 w-3.5" />
                                 </span>
@@ -2648,7 +2717,7 @@ export default function SettingsModal({
                           <select
                             value={cloudProtocol}
                             onChange={handleCloudProtocolChange}
-                            className="w-full rounded-md border border-[#27272a] bg-[#000000] p-2.5 text-[14px] text-white outline-none theme-ring"
+                            className={settingsSelectClass}
                           >
                             <option value="openai">OpenAI Compatible</option>
                             <option value="anthropic">Anthropic</option>
@@ -2662,7 +2731,7 @@ export default function SettingsModal({
                             <select
                               value={cloudApiFormat}
                               onChange={handleCloudApiFormatChange}
-                              className="w-full rounded-md border border-[#27272a] bg-[#000000] p-2.5 text-[14px] text-white outline-none theme-ring"
+                              className={settingsSelectClass}
                             >
                               <option value="chat_completions">OpenAI Chat Completions</option>
                               <option value="responses">OpenAI Responses API</option>
@@ -2731,7 +2800,7 @@ export default function SettingsModal({
                               <select
                                 value={normalizeOpenAiReasoningEffort(draftCloudConfig.reasoningEffort)}
                                 onChange={(e) => updateCloudDraftServer({ reasoningEffort: normalizeOpenAiReasoningEffort(e.target.value) })}
-                                className="w-full rounded-md border border-[#27272a] bg-[#000000] p-2.5 text-[14px] text-white outline-none theme-ring"
+                                className={settingsSelectClass}
                               >
                                 <option value="none">None</option>
                                 <option value="minimal">Minimal</option>
