@@ -50,6 +50,7 @@ import { MAIN_MODE_KEYS, mapLegacyNexusModeToMainMode, mapMainModeToLegacyNexusM
 import { resolveConversationTurnIntent } from "./lib/runIntent";
 import { shouldRouteQuickReplyToPlanApproval } from "./lib/planControl";
 import { runAfterNextPaint } from "./lib/uiScheduling";
+import { checkForMainUpdate, installMainUpdate, type MainUpdateInfo, type MainUpdateProgress } from "./lib/updater";
 import { normalizeConversationDisplayTitle, type ReplyOption, type RightPanelTab } from "./lib/workflowModels";
 import { appendDebugLog } from "./lib/debugLog";
 import {
@@ -70,6 +71,23 @@ function normalizeStoredRightPanelTab(value: unknown): RightPanelTab {
   return value === "diff" || value === "terminal" || value === "plan"
     ? value
     : "plan";
+}
+
+type MainUpdateStatus = "idle" | "checking" | "available" | "downloading" | "installing" | "error";
+
+const MAIN_UPDATE_LAST_CHECK_KEY = "main:lastDesktopUpdateCheckAt";
+const MAIN_UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const MAIN_UPDATE_STARTUP_DELAY_MS = 3000;
+
+function getErrorMessage(error: unknown) {
+  return error instanceof Error ? error.message : String(error || "");
+}
+
+function summarizeUpdateNotes(notes: string, maxLength = 500) {
+  const normalized = notes.replace(/\r/g, "").trim();
+  if (!normalized) return "";
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, maxLength).trimEnd()}…`;
 }
 
 function buildSessionRuntimeSnapshotFromState(state: any) {
@@ -235,6 +253,10 @@ export default function App() {
   const [isFilePanelResizing, setIsFilePanelResizing] = useState(false);
   const [isSidebarResizing, setIsSidebarResizing] = useState(false);
   const [isWorkspaceDropActive, setIsWorkspaceDropActive] = useState(false);
+  const [mainUpdateStatus, setMainUpdateStatus] = useState<MainUpdateStatus>("idle");
+  const [availableMainUpdate, setAvailableMainUpdate] = useState<MainUpdateInfo | null>(null);
+  const [mainUpdateError, setMainUpdateError] = useState("");
+  const [mainUpdateProgress, setMainUpdateProgress] = useState<MainUpdateProgress | null>(null);
   const pendingRightPanelWidthRef = useRef<number | null>(null);
   const rightPanelResizeFrameRef = useRef<number | null>(null);
 
@@ -1690,6 +1712,80 @@ export default function App() {
   }, [handleOpenWorkspacePath]);
 
   useEffect(() => {
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      void (async () => {
+        const now = Date.now();
+        const lastCheckedAt = Number(window.localStorage.getItem(MAIN_UPDATE_LAST_CHECK_KEY) || "0");
+        if (Number.isFinite(lastCheckedAt) && now - lastCheckedAt < MAIN_UPDATE_CHECK_INTERVAL_MS) return;
+
+        window.localStorage.setItem(MAIN_UPDATE_LAST_CHECK_KEY, String(now));
+        setMainUpdateStatus("checking");
+
+        try {
+          const update = await checkForMainUpdate();
+          if (cancelled) return;
+
+          setMainUpdateError("");
+          setMainUpdateProgress(null);
+          setAvailableMainUpdate(update);
+          setMainUpdateStatus(update ? "available" : "idle");
+        } catch (error) {
+          if (cancelled) return;
+          console.debug("MAIN update check failed", error);
+          setMainUpdateStatus("idle");
+        }
+      })();
+    }, MAIN_UPDATE_STARTUP_DELAY_MS);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, []);
+
+  const handleInstallMainUpdate = useCallback(async () => {
+    if (!availableMainUpdate || mainUpdateStatus === "downloading" || mainUpdateStatus === "installing") return;
+
+    const language = languageRef.current === "en" ? "en" : "zh";
+    const notes = summarizeUpdateNotes(availableMainUpdate.notes);
+    const message = language === "en"
+      ? [
+          `Install MAIN ${availableMainUpdate.version}?`,
+          "",
+          `Current version: ${availableMainUpdate.currentVersion}`,
+          `New version: ${availableMainUpdate.version}`,
+          notes ? "" : null,
+          notes || null,
+        ].filter(Boolean).join("\n")
+      : [
+          `安装 MAIN ${availableMainUpdate.version}？`,
+          "",
+          `当前版本：${availableMainUpdate.currentVersion}`,
+          `新版本：${availableMainUpdate.version}`,
+          notes ? "" : null,
+          notes || null,
+        ].filter(Boolean).join("\n");
+
+    if (!window.confirm(message)) return;
+
+    setMainUpdateStatus("downloading");
+    setMainUpdateError("");
+    setMainUpdateProgress(null);
+
+    try {
+      await installMainUpdate(availableMainUpdate, (progress) => {
+        setMainUpdateProgress(progress);
+        setMainUpdateStatus(progress.stage);
+      });
+    } catch (error) {
+      setMainUpdateStatus("error");
+      setMainUpdateError(getErrorMessage(error) || (language === "en" ? "Update failed." : "更新失败。"));
+      setMainUpdateProgress(null);
+    }
+  }, [availableMainUpdate, mainUpdateStatus]);
+
+  useEffect(() => {
     const MIN_SIDEBAR_WIDTH = 220;
     const MIN_RIGHT_PANEL_WIDTH = 340;
     const MIN_FILE_PANEL_WIDTH = 260;
@@ -1973,6 +2069,11 @@ export default function App() {
         workspaceStatuses={workspaceStatuses}
         sessionStatuses={sessionStatuses}
         isWorkspaceDropActive={isWorkspaceDropActive}
+        updateStatus={mainUpdateStatus}
+        availableUpdateVersion={availableMainUpdate?.version || ""}
+        updateError={mainUpdateError}
+        updateProgressPercent={mainUpdateProgress?.percent ?? null}
+        onInstallUpdate={handleInstallMainUpdate}
         onSetSidebarWidth={setSidebarWidth}
         onStartResizing={startSidebarResizing}
         onOpenGlobalChat={handleOpenGlobalChat}

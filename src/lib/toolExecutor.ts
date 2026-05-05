@@ -39,6 +39,7 @@ import {
 } from "./toolCapabilities";
 import { applyShellCwd } from "./toolExecutionContract";
 import { formatDirectoryNodesForTool } from "./workspacePaths";
+import { formatReadFileWindowForModel } from "./readFileWindow";
 
 /** Delay helper for waiting on PTY output after a command. */
 function sleep(ms: number): Promise<void> {
@@ -56,6 +57,10 @@ function parseOptionalNumber(value: unknown): number | undefined {
 
 function parseOptionalString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+function shouldReturnRawReadFile(args: Record<string, unknown>): boolean {
+  return args.__raw === true || args.__raw === "true";
 }
 
 function shouldUseChatTempStorage(workspace: string, sessionKey?: string): boolean {
@@ -126,13 +131,17 @@ export async function executeTool(
     case "read_file": {
       const rawPath = (args.path as string) || "";
       const readWorkspace = await resolveWorkspaceForReadPath(rawPath, workspace, sessionKey);
+      let content: string;
       if (readWorkspace !== workspace) {
-        return await readFile(rawPath, readWorkspace);
+        content = await readFile(rawPath, readWorkspace);
+      } else if (shouldUseChatTempStorage(workspace, sessionKey)) {
+        content = await readChatTempFile(sessionKey!, rawPath);
+      } else {
+        content = await readFile(rawPath, workspace);
       }
-      if (shouldUseChatTempStorage(workspace, sessionKey)) {
-        return await readChatTempFile(sessionKey!, rawPath);
-      }
-      return await readFile(rawPath, workspace);
+      return shouldReturnRawReadFile(args)
+        ? content
+        : formatReadFileWindowForModel(rawPath, content, args);
     }
 
     case "read_document": {

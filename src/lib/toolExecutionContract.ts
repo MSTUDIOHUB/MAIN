@@ -38,7 +38,12 @@ export function validateShellToolContract(name: string, args: Record<string, unk
   }
 
   const cwdError = validateShellToolCwd(getShellToolCwd(args));
-  if (cwdError) return `Tool '${name}' is missing required execution metadata: cwd. ${cwdError}`;
+  if (cwdError) {
+    const toolSpecificHint = name === "execute_command"
+      ? " If this is a finite one-shot command, prefer `run_command`; otherwise add `cwd` (use `.` for the workspace root)."
+      : " Add `cwd` (use `.` for the workspace root).";
+    return `Tool '${name}' is missing required execution metadata: cwd. ${cwdError}${toolSpecificHint}`;
+  }
 
   return null;
 }

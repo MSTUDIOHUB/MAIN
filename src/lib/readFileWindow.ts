@@ -1,0 +1,206 @@
+export const READ_FILE_RESULT_MARKER = "READ_FILE_RESULT";
+
+const DEFAULT_WINDOW_MAX_LINES = 180;
+const DEFAULT_WINDOW_MAX_CHARS = 6800;
+const MAX_REQUESTED_WINDOW_LINES = 600;
+
+interface NormalizedReadFileWindow {
+  startLine: number;
+  requestedEndLine: number;
+  requestedMaxLines: number;
+  explicitWindow: boolean;
+}
+
+export interface ReadFileWindowMetadata {
+  marker: typeof READ_FILE_RESULT_MARKER;
+  path: string;
+  truncated: boolean;
+  totalLines: number;
+  totalChars: number;
+  returnedStartLine: number;
+  returnedEndLine: number;
+  returnedChars: number;
+  nextStartLine?: number;
+}
+
+function parsePositiveInteger(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const rounded = Math.floor(value);
+    return rounded > 0 ? rounded : undefined;
+  }
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) {
+      const rounded = Math.floor(parsed);
+      return rounded > 0 ? rounded : undefined;
+    }
+  }
+  return undefined;
+}
+
+function splitTextLines(content: string): string[] {
+  if (!content) return [];
+  const normalized = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  const lines = normalized.split("\n");
+  if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
+  return lines;
+}
+
+function normalizeWindowArgs(
+  args: Record<string, unknown>,
+  totalLines: number,
+): NormalizedReadFileWindow {
+  const explicitStartLine = parsePositiveInteger(args.start_line);
+  const explicitEndLine = parsePositiveInteger(args.end_line);
+  const explicitMaxLines = parsePositiveInteger(args.max_lines);
+  const explicitWindow = !!explicitStartLine || !!explicitEndLine || !!explicitMaxLines;
+  const requestedMaxLines = Math.min(
+    explicitMaxLines ?? DEFAULT_WINDOW_MAX_LINES,
+    MAX_REQUESTED_WINDOW_LINES,
+  );
+  const startLine = Math.min(Math.max(explicitStartLine ?? 1, 1), Math.max(totalLines, 1));
+  const maxLineEnd = startLine + requestedMaxLines - 1;
+  const requestedEndLine = Math.min(
+    explicitEndLine ? Math.min(explicitEndLine, maxLineEnd) : maxLineEnd,
+    Math.max(totalLines, 1),
+  );
+
+  return {
+    startLine,
+    requestedEndLine: Math.max(startLine, requestedEndLine),
+    requestedMaxLines,
+    explicitWindow,
+  };
+}
+
+function selectWindowLines(
+  lines: string[],
+  startLine: number,
+  requestedEndLine: number,
+): { content: string; endLine: number; lineTruncated: boolean } {
+  if (lines.length === 0) {
+    return { content: "", endLine: 0, lineTruncated: false };
+  }
+
+  const selected: string[] = [];
+  let charCount = 0;
+  let lineTruncated = false;
+  const startIndex = startLine - 1;
+  const requestedEndIndex = Math.min(requestedEndLine - 1, lines.length - 1);
+
+  for (let index = startIndex; index <= requestedEndIndex; index += 1) {
+    const line = lines[index] ?? "";
+    const separatorLength = selected.length > 0 ? 1 : 0;
+    const nextLength = charCount + separatorLength + line.length;
+    if (selected.length > 0 && nextLength > DEFAULT_WINDOW_MAX_CHARS) break;
+    if (selected.length === 0 && nextLength > DEFAULT_WINDOW_MAX_CHARS) {
+      selected.push(line.slice(0, DEFAULT_WINDOW_MAX_CHARS));
+      charCount = DEFAULT_WINDOW_MAX_CHARS;
+      lineTruncated = true;
+      break;
+    }
+    selected.push(line);
+    charCount = nextLength;
+  }
+
+  const endLine = selected.length > 0 ? startLine + selected.length - 1 : startLine;
+  return {
+    content: selected.join("\n"),
+    endLine,
+    lineTruncated,
+  };
+}
+
+export function extractReadFileWindowMetadata(content: string): ReadFileWindowMetadata | null {
+  if (!content.startsWith(`${READ_FILE_RESULT_MARKER}\n`)) return null;
+  const headerEnd = content.indexOf("\n---CONTENT START---");
+  const header = headerEnd >= 0 ? content.slice(0, headerEnd) : content;
+  const values = new Map<string, string>();
+  for (const line of header.split("\n").slice(1)) {
+    const match = /^([A-Za-z][A-Za-z0-9]*):\s*(.*)$/.exec(line);
+    if (match) values.set(match[1], match[2]);
+  }
+
+  const returnedLines = values.get("returnedLines") || "";
+  const returnedMatch = /^(\d+)-(\d+)$/.exec(returnedLines);
+  const totalLines = Number(values.get("totalLines"));
+  const totalChars = Number(values.get("totalChars"));
+  const returnedChars = Number(values.get("returnedChars"));
+  const nextStartLine = Number(values.get("nextStartLine"));
+  if (!Number.isFinite(totalLines) || !Number.isFinite(totalChars) || !returnedMatch) return null;
+
+  return {
+    marker: READ_FILE_RESULT_MARKER,
+    path: values.get("path") || "",
+    truncated: values.get("truncated") === "true",
+    totalLines,
+    totalChars,
+    returnedStartLine: Number(returnedMatch[1]),
+    returnedEndLine: Number(returnedMatch[2]),
+    returnedChars: Number.isFinite(returnedChars) ? returnedChars : 0,
+    ...(Number.isFinite(nextStartLine) && nextStartLine > 0 ? { nextStartLine } : {}),
+  };
+}
+
+export function formatReadFileWindowForModel(
+  path: string,
+  content: string,
+  args: Record<string, unknown> = {},
+): string {
+  const lines = splitTextLines(content);
+  const totalLines = lines.length;
+  const normalized = normalizeWindowArgs(args, totalLines);
+  const shouldReturnRaw =
+    !normalized.explicitWindow &&
+    content.length <= DEFAULT_WINDOW_MAX_CHARS &&
+    totalLines <= DEFAULT_WINDOW_MAX_LINES;
+
+  if (shouldReturnRaw) return content;
+
+  const { content: windowContent, endLine, lineTruncated } = selectWindowLines(
+    lines,
+    normalized.startLine,
+    normalized.requestedEndLine,
+  );
+  const returnedEndLine = totalLines === 0 ? 0 : endLine;
+  const returnedStartLine = totalLines === 0 ? 0 : normalized.startLine;
+  const moreRequestedLines = returnedEndLine < normalized.requestedEndLine;
+  const moreFileLines = returnedEndLine > 0 && returnedEndLine < totalLines;
+  const notWholeFile = returnedStartLine !== 1 || returnedEndLine !== totalLines;
+  const truncated = notWholeFile || moreRequestedLines || moreFileLines || lineTruncated;
+  const nextStartLine = moreFileLines || moreRequestedLines || lineTruncated
+    ? Math.max(returnedEndLine + 1, normalized.startLine + 1)
+    : undefined;
+  const suggestedMaxLines = normalized.requestedMaxLines || DEFAULT_WINDOW_MAX_LINES;
+
+  const header = [
+    READ_FILE_RESULT_MARKER,
+    `path: ${path}`,
+    `truncated: ${truncated ? "true" : "false"}`,
+    `totalLines: ${totalLines}`,
+    `totalChars: ${content.length}`,
+    `returnedLines: ${returnedStartLine}-${returnedEndLine}`,
+    `returnedChars: ${windowContent.length}`,
+    nextStartLine ? `nextStartLine: ${nextStartLine}` : "",
+    nextStartLine
+      ? `nextRead: read_file({"path":${JSON.stringify(path)},"start_line":${nextStartLine},"max_lines":${suggestedMaxLines}})`
+      : "",
+    "note: read_file returns a bounded content window for large or ranged reads. For more source, call read_file with start_line/end_line/max_lines; do not use run_command merely to page file contents.",
+    "---CONTENT START---",
+  ].filter(Boolean);
+
+  return `${header.join("\n")}\n${windowContent}\n---CONTENT END---`;
+}
+
+export function buildReadFileWindowContinuationGuidance(content: string): string | null {
+  const metadata = extractReadFileWindowMetadata(content);
+  if (!metadata?.truncated) return null;
+
+  return [
+    "The earlier read_file result was a bounded window, not the whole file.",
+    metadata.nextStartLine
+      ? `Next: call read_file with start_line=${metadata.nextStartLine} and max_lines to continue, or use a narrower start_line/end_line range around the line you need.`
+      : "Next: call read_file with a different start_line/end_line/max_lines range around the line you need.",
+    "Do not use run_command merely to page file contents.",
+  ].join("\n");
+}

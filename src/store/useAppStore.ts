@@ -4,7 +4,7 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import { executeAgentLoop, type AgentMessage, type OrchestratorCallbacks, type ReviewDecision, type ContentPart } from "../lib/orchestrator";
-import { analyzeTabularDocument, deleteChatTempPath, deletePlanFiles, deleteWorkspacePath, ingestAttachmentFile, readChatTempFile, readDocument, readFile, writeChatTempFile, writeFile } from "../lib/ipc";
+import { analyzeTabularDocument, deleteChatTempPath, deletePlanFiles, deleteWorkspacePath, ingestAttachmentFile, readChatTempFile, readDocument, readFile, writeChatTempFile, writeFile, type GitDiffEntry } from "../lib/ipc";
 import { invoke } from "@tauri-apps/api/core";
 import { setWorkspaceRoot as setWorkspaceRootIpc } from "../lib/ipc";
 import { appendDebugLog } from "../lib/debugLog";
@@ -645,6 +645,12 @@ export interface ToolDiffSnapshot {
   path?: string;
   existed?: boolean;
   fullFile?: boolean;
+  binary?: boolean;
+}
+
+export interface GitDiffPreviewState {
+  entries: GitDiffEntry[];
+  sourceLabel?: string;
 }
 
 export type DiffRevertStatus = "reverting" | "reverted" | "failed";
@@ -728,12 +734,15 @@ interface AppState {
   fileViewerError: string;
   fileViewerLoading: boolean;
   selectedDiffTaskId: number | null;
+  gitDiffPreview: GitDiffPreviewState | null;
   openFileTreePanel: () => void;
   openFileViewer: (path: string, workspace?: string) => Promise<void>;
   clearFileViewer: () => void;
   closeFilePanel: () => void;
   setSelectedDiffTaskId: (id: number | null) => void;
   openDiffForTask: (taskId: number) => void;
+  openGitDiffPreview: (entries: GitDiffEntry[], sourceLabel?: string) => void;
+  clearGitDiffPreview: () => void;
   setRightPanelTab: (tab: RightPanelTab) => void;
   openRightPanelTab: (tab: RightPanelTab) => void;
   closeRightPanel: () => void;
@@ -2802,6 +2811,7 @@ export const useAppStore = create<AppState>()(
   fileViewerError: "",
   fileViewerLoading: false,
   selectedDiffTaskId: null,
+  gitDiffPreview: null,
   rightPanelTab: "plan",
   rightPanelWidth: 450,
   setShowDiff: (v) => set({
@@ -2876,12 +2886,24 @@ export const useAppStore = create<AppState>()(
 
     set({
       selectedDiffTaskId: taskId,
+      gitDiffPreview: null,
       showDiff: true,
       showPlanPanel: false,
       showTerminal: false,
       rightPanelTab: "diff",
     });
   },
+  openGitDiffPreview: (entries, sourceLabel) => {
+    set({
+      gitDiffPreview: { entries, sourceLabel },
+      selectedDiffTaskId: null,
+      showDiff: true,
+      showPlanPanel: false,
+      showTerminal: false,
+      rightPanelTab: "diff",
+    });
+  },
+  clearGitDiffPreview: () => set({ gitDiffPreview: null }),
   setRightPanelTab: (tab) => set({
     rightPanelTab: tab,
     showPlanPanel: tab === "plan",

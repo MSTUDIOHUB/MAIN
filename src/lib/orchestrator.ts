@@ -40,6 +40,10 @@ import {
 } from "./replyOptions";
 import { buildToolDiffPreview, type ToolDiffPreview } from "./toolDiff";
 import { syncPlanArtifactAfterToolSuccess } from "./planArtifactSync";
+import {
+  buildReadFileWindowContinuationGuidance,
+  extractReadFileWindowMetadata,
+} from "./readFileWindow";
 import type { AppConfig, Skill } from "../store/useAppStore";
 import {
   buildPlanTaskEvidenceAudit,
@@ -1222,6 +1226,9 @@ function formatCachedReadOnlyToolResult(
   duplicateCount: number,
 ): string {
   const suffix = target ? ` (target: "${target}")` : "";
+  const readFileWindowGuidance = name === "read_file" && cached?.content
+    ? buildReadFileWindowContinuationGuidance(cached.content)
+    : null;
   const preview = cached?.content
     ? `\n\nEarlier result preview:\n${cached.content.slice(0, 1600)}${cached.content.length > 1600 ? "\n...[preview truncated]" : ""}`
     : "";
@@ -1229,7 +1236,7 @@ function formatCachedReadOnlyToolResult(
   return [
     `Repeated read-only tool call skipped: "${name}" was already called with identical arguments${suffix}.`,
     `Duplicate skip count in this run: ${duplicateCount}.`,
-    "Reuse the earlier tool result already in context. Do not call the same tool with the same arguments again; continue with a different file, a more specific outline/search tool, or produce the next visible answer.",
+    readFileWindowGuidance || "Reuse the earlier tool result already in context. Do not call the same tool with the same arguments again; continue with a different file, a more specific outline/search tool, or produce the next visible answer.",
     preview,
   ].filter(Boolean).join("\n");
 }
@@ -1275,6 +1282,18 @@ function buildFileReadSignature(path: string, args: Record<string, unknown>): st
 }
 
 function buildFileUnchangedStub(state: FileReadState): string {
+  const readFileWindow = extractReadFileWindowMetadata(state.modelContent);
+  if (readFileWindow?.truncated) {
+    return [
+      `${FILE_UNCHANGED_STUB}: "${state.path}" has already been read with the same range/options, and the file is unchanged.`,
+      `Previous read window: lines ${readFileWindow.returnedStartLine}-${readFileWindow.returnedEndLine} of ${readFileWindow.totalLines}, ${state.contentLength.toLocaleString()} result chars, file size ${state.sizeBytes.toLocaleString()} bytes, modified ${state.modifiedMs}, hash ${state.contentHash}.`,
+      readFileWindow.nextStartLine
+        ? `This was not the whole file. Next: call read_file with start_line=${readFileWindow.nextStartLine} and max_lines to continue, or use start_line/end_line around the exact error line.`
+        : "This was not the whole file. Next: call read_file with a different start_line/end_line/max_lines range around the exact line you need.",
+      "Do not use run_command merely to page file contents; run_command is for tests, builds, diagnostics, and other shell work.",
+    ].join("\n");
+  }
+
   return [
     `${FILE_UNCHANGED_STUB}: "${state.path}" has already been read with the same range/options, and the content is unchanged.`,
     `Previous read: ${state.contentLength.toLocaleString()} chars, file size ${state.sizeBytes.toLocaleString()} bytes, modified ${state.modifiedMs}, hash ${state.contentHash}.`,
@@ -1419,7 +1438,7 @@ async function executeToolCallWithLifecycle(
       },
       {
         readFile: async (path) => {
-          const content = await executeTool("read_file", { path }, workspace, sessionKey);
+          const content = await executeTool("read_file", { path, __raw: true }, workspace, sessionKey);
           return String(content ?? "");
         },
         warn: (message, error) => console.warn(message, error),
@@ -1556,7 +1575,7 @@ async function buildPlanArtifactMutationValidationError(
     const replaceText = typeof args.replace_text === "string" ? args.replace_text : "";
     if (searchText) {
       try {
-        const currentContent = String(await executeTool("read_file", { path }, workspace, callbacks.getSessionKey()) ?? "");
+        const currentContent = String(await executeTool("read_file", { path, __raw: true }, workspace, callbacks.getSessionKey()) ?? "");
         nextContent = currentContent.includes(searchText)
           ? currentContent.replace(searchText, replaceText)
           : null;

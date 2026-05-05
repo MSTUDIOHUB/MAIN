@@ -33,6 +33,30 @@ npm run release:bump -- <version>
 1. 安装 Node.js、Rust、Xcode Command Line Tools。
 2. 在项目根目录执行 `npm install`。
 3. 如果需要重新生成图标，执行 `npm run icon:app`。
+4. 如果要发布支持自动更新的公开版本，确认私有 `MAIN` 仓库 Actions Secrets 已配置 `PUBLIC_RELEASES_TOKEN`、`TAURI_SIGNING_PRIVATE_KEY`、`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。
+
+## 一键公开发布
+
+现在推荐的公开发布入口是：
+
+```bash
+npm run release:desktop -- <version>
+```
+
+例如：
+
+```bash
+npm run release:desktop -- 1.5.5
+```
+
+这条命令不会在本机打包，而是触发私有 `MAIN` 仓库的 GitHub Actions。workflow 会构建：
+
+- `MAIN_<version>_macOS_universal.zip`
+- `MAIN_<version>_macOS_apple_silicon.zip`
+- `MAIN_<version>_windows_x64.zip`
+- Tauri updater 使用的签名更新包、`.sig` 和 `latest.json`
+
+如果缺少 updater 签名 Secrets，workflow 会失败并提示补齐，避免发布一个无法自动更新的版本。
 
 ## macOS 打包
 

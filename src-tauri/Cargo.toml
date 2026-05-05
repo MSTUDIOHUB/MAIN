@@ -1,6 +1,6 @@
 [package]
 name = "tauri-app"
-version = "1.5.3"
+version = "1.5.5"
 description = "MAIN desktop app"
 authors = ["you"]
 edition = "2021"
@@ -41,3 +41,5 @@ sysinfo = "0.34"
 # Protocol Package ZIP extraction
 zip = "2.3"
 tempfile = "3"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"

@@ -18,7 +18,7 @@ import { buildLineDiff, getDiffStats } from "../lib/diff";
 import { getE2EResumeExecutionHandler, getE2ESavePlanDocumentHandler } from "../lib/e2e";
 import { extractPlanDraftPreview, extractStructuredPlanProposal, hasPlanDraftPreview, hasStructuredPlanProposal } from "../lib/planProposal";
 import { resolveGlobalChatSessionKey, resolveSessionRuntimeKey, resolveSessionWorkspaceKey, type DiffRevertRequest, type TaskBlock, useAppStore } from "../store/useAppStore";
-import { deleteChatTempPath, exportTextFile, getPtyStatus, onPtyData, readPtyBuffer, resizePty, spawnPty, writePty } from "../lib/ipc";
+import { deleteChatTempPath, exportTextFile, getPtyStatus, onPtyData, readPtyBuffer, resizePty, spawnPty, writePty, type GitDiffEntry } from "../lib/ipc";
 import { buildPlanTaskEvidenceAudit, collectChangeEntries, isPlanConversationTurn, type PlanArtifact, type PlanExecutionEvidenceEntry, type PlanTask } from "../lib/workflowModels";
 
 const CODE_FONT_FAMILY = "'JetBrains Mono', 'Fira Code', Menlo, Monaco, 'Courier New', monospace";
@@ -460,6 +460,7 @@ interface ReviewFileDiff {
   taskIds: number[];
   isBinaryLike: boolean;
   isPlanFile: boolean;
+  isGitPreview?: boolean;
 }
 
 type ReviewRow =
@@ -481,7 +482,35 @@ function getReviewFileRevertStatus(blocks: ToolDiffBlock[]): ReviewFileDiff["rev
   return undefined;
 }
 
-function collectReviewFileDiffs(taskFlow: TaskBlock[], activeDiffTask?: ToolDiffBlock | null): ReviewFileDiff[] {
+function collectGitReviewFileDiffs(entries: GitDiffEntry[]): ReviewFileDiff[] {
+  return entries.map((entry) => {
+    const stats = getDiffStats(entry.old || "", entry.new || "");
+    return {
+      key: `git:${entry.path}`,
+      path: entry.path,
+      displayPath: entry.path,
+      oldText: entry.old || "",
+      newText: entry.new || "",
+      existed: entry.existed,
+      fullFile: entry.fullFile,
+      canRevert: false,
+      hasPendingReview: false,
+      hasExecuted: false,
+      added: stats.added,
+      removed: stats.removed,
+      taskIds: [],
+      isBinaryLike: entry.binary === true || isBinaryFile(entry.path) || looksBinary(entry.old || "") || looksBinary(entry.new || ""),
+      isPlanFile: false,
+      isGitPreview: true,
+    };
+  }).sort((a, b) => a.path.localeCompare(b.path));
+}
+
+function collectReviewFileDiffs(taskFlow: TaskBlock[], activeDiffTask?: ToolDiffBlock | null, gitDiffEntries: GitDiffEntry[] = []): ReviewFileDiff[] {
+  if (gitDiffEntries.length > 0) {
+    return collectGitReviewFileDiffs(gitDiffEntries);
+  }
+
   const diffBlocks = taskFlow.filter((block): block is ToolDiffBlock => block.type === "tool" && !!block.diff);
   const activeBlock = activeDiffTask?.diff ? activeDiffTask : null;
   const blocks = activeBlock && !diffBlocks.some((block) => block.id === activeBlock.id)
@@ -500,7 +529,7 @@ function collectReviewFileDiffs(taskFlow: TaskBlock[], activeDiffTask?: ToolDiff
     const oldText = first.diff?.old || "";
     const newText = last.diff?.new || "";
     const stats = getDiffStats(oldText, newText);
-    const isBinaryLike = isBinaryFile(path) || looksBinary(oldText) || looksBinary(newText);
+    const isBinaryLike = first.diff?.binary === true || last.diff?.binary === true || isBinaryFile(path) || looksBinary(oldText) || looksBinary(newText);
     const executedBlocks = blocksForPath.filter((block) => block.toolStatus === "executed");
     const hasPendingReview = blocksForPath.some((block) => block.toolStatus === "pending");
     const fullFile = executedBlocks.length > 0
@@ -591,8 +620,8 @@ function buildReviewRows(oldText: string, newText: string, contextSize = 3): Rev
   return rows;
 }
 
-function DiffReviewPanel({ taskFlow, activeDiffTask, language }: { taskFlow: TaskBlock[]; activeDiffTask?: ToolDiffBlock | null; language: "zh" | "en" }) {
-  const files = useMemo(() => collectReviewFileDiffs(taskFlow, activeDiffTask), [activeDiffTask, taskFlow]);
+function DiffReviewPanel({ taskFlow, activeDiffTask, gitDiffEntries = [], gitDiffSourceLabel, language }: { taskFlow: TaskBlock[]; activeDiffTask?: ToolDiffBlock | null; gitDiffEntries?: GitDiffEntry[]; gitDiffSourceLabel?: string; language: "zh" | "en" }) {
+  const files = useMemo(() => collectReviewFileDiffs(taskFlow, activeDiffTask, gitDiffEntries), [activeDiffTask, gitDiffEntries, taskFlow]);
   const revertDiffGroups = useAppStore((s) => s.revertDiffGroups);
   const [collapsedFiles, setCollapsedFiles] = useState<Set<string>>(() => new Set());
   const [revertingKeys, setRevertingKeys] = useState<Set<string>>(() => new Set());
@@ -609,7 +638,7 @@ function DiffReviewPanel({ taskFlow, activeDiffTask, language }: { taskFlow: Tas
     () => files.reduce((sum, file) => ({ added: sum.added + file.added, removed: sum.removed + file.removed }), { added: 0, removed: 0 }),
     [files],
   );
-  const activeDiffTarget = activeDiffTask?.diff?.path || activeDiffTask?.target || "";
+  const activeDiffTarget = gitDiffSourceLabel || activeDiffTask?.diff?.path || activeDiffTask?.target || "";
   const allCollapsed = files.length > 0 && files.every((file) => collapsedFiles.has(file.key));
   const toggleAll = () => setCollapsedFiles(allCollapsed ? new Set() : new Set(files.map((file) => file.key)));
   const revertableFiles = files.filter((file) => file.canRevert);
@@ -660,7 +689,7 @@ function DiffReviewPanel({ taskFlow, activeDiffTask, language }: { taskFlow: Tas
     <div data-testid="diff-panel" className="flex h-full flex-col bg-[#101010] text-[#d4d4d8]">
       <div data-testid="diff-panel-title" className="flex shrink-0 items-center justify-between border-b border-[#252525] px-4 py-3">
         <div className="min-w-0 flex items-center gap-2">
-          <span className="text-[18px] font-bold text-[#f4f4f5]">{language === "zh" ? "未暂存" : "Changes"}</span>
+          <span className="text-[18px] font-bold text-[#f4f4f5]">{gitDiffEntries.length > 0 ? "Git" : language === "zh" ? "未暂存" : "Changes"}</span>
           <span className="rounded-full bg-[#2b2b2d] px-2.5 py-1 text-[12px] font-bold text-[#d4d4d8]">{files.length}</span>
           <span className="truncate font-mono text-[12px] text-[#34d399]">+{totals.added}</span>
           <span className="font-mono text-[12px] text-[#ff5c5c]">-{totals.removed}</span>
@@ -720,6 +749,9 @@ function DiffReviewPanel({ taskFlow, activeDiffTask, language }: { taskFlow: Tas
                 >
                   {collapsed ? <IconChevronRight className="h-4 w-4 text-[#a1a1aa]" /> : <IconChevronUp className="h-4 w-4 text-[#a1a1aa]" />}
                   <span className="truncate font-mono text-[14px] font-bold text-[#f4f4f5]">{file.displayPath}</span>
+                  {file.isGitPreview && (
+                    <span className="rounded-full border border-[#2f2f32] px-1.5 py-0.5 text-[10px] text-[#a1a1aa]">Git</span>
+                  )}
                 </button>
                 <div className="flex shrink-0 items-center gap-2">
                   {statusLabel && (
@@ -845,6 +877,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     currentWorkspace,
     currentSessionId,
     selectedDiffTaskId,
+    gitDiffPreview,
   } = {
     showDiff: useAppStore((s) => s.showDiff),
     showPlanPanel: useAppStore((s) => s.showPlanPanel),
@@ -867,6 +900,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     currentWorkspace: useAppStore((s) => s.currentWorkspace),
     currentSessionId: useAppStore((s) => s.currentSessionId),
     selectedDiffTaskId: useAppStore((s) => s.selectedDiffTaskId),
+    gitDiffPreview: useAppStore((s) => s.gitDiffPreview),
   };
 
   const selectedDiffTask = useMemo(() => {
@@ -1129,7 +1163,13 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
           )}
 
           {rightPanelTab === "diff" && (
-            <DiffReviewPanel taskFlow={taskFlow} activeDiffTask={viewedDiffTask} language={language} />
+            <DiffReviewPanel
+              taskFlow={taskFlow}
+              activeDiffTask={viewedDiffTask}
+              gitDiffEntries={gitDiffPreview?.entries || []}
+              gitDiffSourceLabel={gitDiffPreview?.sourceLabel}
+              language={language}
+            />
           )}
 
           {rightPanelTab === "terminal" && (

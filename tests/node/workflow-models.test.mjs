@@ -30,6 +30,10 @@ function loadTurnProgressModule() {
   return loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/turnProgress.ts"));
 }
 
+function loadDiffModule() {
+  return loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/diff.ts"));
+}
+
 function loadTranspiledModuleSync(sourcePath) {
   const normalizedPath = path.resolve(sourcePath);
   if (transpiledModuleCache.has(normalizedPath)) {
@@ -113,6 +117,10 @@ const {
 const {
   deriveTurnProgressItems,
 } = loadTurnProgressModule();
+
+const {
+  buildLineDiff,
+} = loadDiffModule();
 
 test("normalizeConversationDisplayTitle strips speaker timestamps from transcript-style prompts", () => {
   const title = normalizeConversationDisplayTitle("Michael@: 04-23 17:57:52 这个它要建模 是啥意思", 40, "新的任务");
@@ -290,17 +298,29 @@ test("deriveTurnProgressItems prefers explicit jobs and ignores plain numbered p
   );
 });
 
-test("deriveTurnProgressItems falls back to tool activity progress", () => {
+test("deriveTurnProgressItems ignores plain tool activity without explicit ordered progress", () => {
   const steps = deriveTurnProgressItems([
     { id: 1, type: "tool", toolName: "read_file", target: "src/App.tsx", toolStatus: "executed" },
     { id: 2, type: "tool", toolName: "replace_in_file", target: "src/App.tsx", toolStatus: "running" },
     { id: 3, type: "tool", toolName: "run_command", target: "npm test", toolStatus: "failed" },
   ], "zh");
 
-  assert.deepEqual(steps, [
-    { id: "1", text: "读取文件: App.tsx", status: "completed" },
-    { id: "2", text: "修改文件: App.tsx", status: "in_progress" },
-    { id: "3", text: "执行命令: npm test", status: "failed" },
+  assert.deepEqual(steps, []);
+});
+
+test("buildLineDiff keeps unchanged middle context for small localized edits", () => {
+  const diff = buildLineDiff(
+    ["alpha", "keep-one", "old", "keep-two", "omega"].join("\n"),
+    ["alpha", "keep-one", "new", "keep-two", "omega"].join("\n"),
+  );
+
+  assert.deepEqual(diff.map((line) => `${line.type}:${line.text}`), [
+    "unchanged:alpha",
+    "unchanged:keep-one",
+    "removed:old",
+    "added:new",
+    "unchanged:keep-two",
+    "unchanged:omega",
   ]);
 });
 

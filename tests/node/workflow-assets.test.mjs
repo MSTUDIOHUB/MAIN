@@ -101,3 +101,15 @@ test("completion hook switches to finalization guidance when tasks are done", as
   assert.match(response.additionalContext[0], /all checkbox tasks/);
   assert.match(response.additionalContext[1], /verify the implemented result/);
 });
+
+test("desktop release workflow publishes updater manifest and signatures", async () => {
+  const workflow = await fs.readFile(path.join(workspaceRoot, ".github/workflows/build-desktop.yml"), "utf8");
+
+  assert.match(workflow, /TAURI_SIGNING_PRIVATE_KEY/);
+  assert.match(workflow, /TAURI_SIGNING_PRIVATE_KEY_PASSWORD/);
+  assert.match(workflow, /latest\.json/);
+  assert.match(workflow, /darwin-x86_64/);
+  assert.match(workflow, /darwin-aarch64/);
+  assert.match(workflow, /windows-x86_64/);
+  assert.doesNotMatch(workflow, /release-assets\/SHA256SUMS/);
+});

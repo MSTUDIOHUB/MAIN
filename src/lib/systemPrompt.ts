@@ -122,10 +122,15 @@ export function buildSystemPrompt(
   const shellToolsAvailable =
     isToolNameAvailable("run_command", availableToolNames) ||
     isToolNameAvailable("execute_command", availableToolNames);
+  const filePagingWarning = shellToolsAvailable
+    ? "不要用 `run_command`、`cat`、`sed`、`head`、`tail` 作为常规分页读文件手段。"
+    : "不要用 shell 命令作为常规分页读文件手段。";
   parts.push("当前工作区绝对路径为：" + workspace);
   parts.push("你执行任何文件操作或搜索时，都必须基于此路径。所有相对路径都相对于此根目录解析。");
   parts.push("根目录探索优先使用 `get_project_skeleton`，不要把 `list_directory('.')` 当成默认第一步；只有明确需要根目录即时文件列表时才调用一次，拿到结果后必须复用，不能反复对 `.` 重复扫描。");
   parts.push("当 `list_directory`、`glob_search` 或其他工具返回文件/目录路径时，后续工具调用必须优先复用返回的完整相对路径，不要自行裁掉父目录。");
+  parts.push("`read_file` 返回的是源码/文本内容窗口；如果结果包含 `truncated: true`、`returnedLines` 或 `nextStartLine`，说明这不是完整文件。需要更多内容时继续调用 `read_file` 并传 `start_line` / `end_line` / `max_lines`，" + filePagingWarning);
+  parts.push("遇到 TypeScript、测试、构建或 lint 报错行号时，优先读取报错行附近的小窗口，例如 `read_file(path, start_line, max_lines)`；不要先全量读取大型源文件。");
   if (workspaceTree) { parts.push("该目录的基础结构如下：\n" + workspaceTree); }
 
   parts.push([
@@ -209,7 +214,7 @@ export function buildSystemPrompt(
     "`get_project_skeleton` 只返回项目/资料目录结构，不包含任何文件内容。仅凭目录结构做出的分析毫无价值。",
     "在给出代码分析或架构总结之前，你必须：",
     "1. 源码/Unity 项目先用 `get_project_skeleton` 定位核心目录；表格/文档/资料分析任务先用 `list_directory` 或用户提供的 `path:` 找到文件，再直接使用文档/表格工具；",
-    "2. 再用 `get_file_outline`、`read_file`、`read_document`、`analyze_tabular_document` 或 `query_tabular_document` 实际读取关键文件的内容；源码/纯文本优先用 `read_file`，PDF/DOCX 优先用 `read_document`，大型 CSV/TSV/XLSX 优先先用 `analyze_tabular_document` 看全表，再用 `query_tabular_document` 做筛选/聚合，最后才按需用 `read_document` 分段读取原始行窗口；",
+    "2. 再用 `get_file_outline`、`read_file`、`read_document`、`analyze_tabular_document` 或 `query_tabular_document` 实际读取关键文件的内容；源码/纯文本优先用 `read_file` 的行窗口参数读取关键范围，PDF/DOCX 优先用 `read_document`，大型 CSV/TSV/XLSX 优先先用 `analyze_tabular_document` 看全表，再用 `query_tabular_document` 做筛选/聚合，最后才按需用 `read_document` 分段读取原始行窗口；",
     "3. 基于代码内容（而非目录名称）给出有价值的分析。",
     "4. 如果用户消息里包含附件预览，并出现 `truncatedPreview: true`、`attached_tabular_file` 或明确的 `path:` 字段，你必须把它视为“只给了预览，不是全量内容”，不能直接据此下完整结论，应继续对该路径调用工具。",
   ].join("\n"));
@@ -415,12 +420,12 @@ export function buildSystemPrompt(
     addToolDescription("get_project_skeleton", "- get_project_skeleton: (depth?: number) 极速获取项目宏观骨架。Unity 感知：自动识别 .asmdef 模块边界、折叠大目录、弹性穿透无关键文件的层级。始终作为第一步使用。");
     addToolDescription("get_file_outline", "- get_file_outline: (path: string) 提取 C# 文件的类型定义和 public/protected 成员签名，剔除函数体。用于理解类的接口和耦合关系，无需读取完整源码。");
     addToolDescription("list_directory", "- list_directory: 列出特定目录内容。在你通过 skeleton 锁定目标后使用。");
-    addToolDescription("read_file", "- read_file: 读取源码、Markdown、JSON、纯文本等可直接按文本处理的文件。");
+    addToolDescription("read_file", "- read_file: 读取源码、Markdown、JSON、纯文本等可直接按文本处理的文件窗口。支持 start_line/end_line/max_lines；大文件会返回 truncated、returnedLines、nextStartLine。遇到报错行号时读附近窗口；" + (shellToolsAvailable ? "不要用 run_command/cat/sed/head/tail 作为常规文件分页工具。" : "不要用 shell 命令作为常规文件分页工具。"));
     addToolDescription("read_document", "- read_document: 读取 PDF、DOCX、XLSX、CSV、TSV 等文档内容，返回提取文本和来源元数据（页码、sheet、单元格范围等）；对表格文件可结合 `row_offset` / `max_rows` 做分段读取。");
     addToolDescription("analyze_tabular_document", "- analyze_tabular_document: 对 CSV、TSV、XLSX 等大表格做全表统计分析，返回总行数、列概况、缺失值、数值统计和样本行。处理大型表格时优先用它，而不是盲目把整张表塞进上下文。");
     addToolDescription("query_tabular_document", "- query_tabular_document: 对 CSV、TSV、XLSX 做结构化查询，支持筛选、选列、排序、分页、分组聚合。要回答计数、汇总、Top N、条件过滤等问题时优先用它。");
     addToolDescription("index_workspace_documents", "- index_workspace_documents: 扫描某个目录中的文档文件并生成索引摘要。适合先了解资料库，再决定进一步读取哪些文件。");
-    addToolDescription("run_command", "- run_command: 同步执行一次性 shell 命令并等待完成，返回 stdout、stderr、exitCode、timedOut、durationMs。必须传 `description` 和工作区相对 `cwd`（根目录用 `.`），长命令设置 `timeout_ms`。运行测试、构建、Python 脚本、Git 状态检查/提交/推送等有限命令时优先使用它，并基于返回结果总结成功/失败。");
+    addToolDescription("run_command", "- run_command: 同步执行一次性 shell 命令并等待完成，返回 stdout、stderr、exitCode、timedOut、durationMs。必须传 `description` 和工作区相对 `cwd`（根目录用 `.`），长命令设置 `timeout_ms`。运行测试、构建、Python 脚本、Git 状态检查/提交/推送等有限命令时优先使用它，并基于返回结果总结成功/失败；不要把它当作常规文件分页读取工具。");
     addToolDescription("execute_command", "- execute_command: 向集成 PTY 发送命令，适合开发服务器、watch 模式、交互式程序或需要保留终端上下文的命令。必须传 `description` 和工作区相对 `cwd`（根目录用 `.`）。它返回本次发送后的新增输出和 offset；后续用 read_pty_since/read_pty_tail/get_pty_status 继续检查。");
     addToolDescription("send_pty_input", "- send_pty_input: 向当前 PTY 前台进程发送原始输入，适合回答交互提示、输入 y/n、发送 Ctrl+C（input 使用 \\u0003）。");
     addToolDescription("read_pty_tail", "- read_pty_tail: 读取终端最近日志，适合快速查看错误栈或长任务尾部输出。");

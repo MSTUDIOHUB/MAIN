@@ -9,18 +9,21 @@ import {
   IconGitCommit,
   IconGitPush,
   IconPlus,
+  IconRefresh,
   IconSettings,
   IconTrash,
 } from "./Icons";
-import { GLOBAL_CHAT_KEY, type WorkspaceEntry } from "../store/useAppStore";
+import { createPortal } from "react-dom";
+import { GLOBAL_CHAT_KEY, useAppStore, type WorkspaceEntry } from "../store/useAppStore";
 import { looksLikeReasoningLeakTitle, normalizeConversationDisplayTitle } from "../lib/workflowModels";
-import { getGitStatus, getGitFileList, gitCommitAll, gitCreateBranch, gitPushCurrentBranch, type GitFileEntry, type GitStatus } from "../lib/ipc";
-
-type GitMenuView = "overview" | "changed" | "added" | "deleted";
+import { getGitStatus, getGitDiff, gitCommitAll, gitCreateBranch, gitPushCurrentBranch, type GitStatus } from "../lib/ipc";
+import { generateGitCommitMessage } from "../lib/gitCommitMessage";
 
 interface GitMenuState {
   workspacePath: string;
   top: number;
+  left: number;
+  maxHeight: number;
 }
 
 interface GitMenuThemeClasses {
@@ -32,19 +35,22 @@ interface GitMenuThemeClasses {
   mutedText: string;
   inputBg: string;
   divider: string;
-  statBg: string;
-  statHover: string;
-  addedBg: string;
-  addedHover: string;
-  deletedBg: string;
-  deletedHover: string;
-  fileHover: string;
+  strongText: string;
+  lineText: string;
+  dangerText: string;
+  successText: string;
+  warningText: string;
+  dangerBg: string;
+  successBg: string;
+  warningBg: string;
 }
 
 interface GitFeedbackState {
   type: "success" | "error";
   text: string;
 }
+
+type SidebarUpdateStatus = "idle" | "checking" | "available" | "downloading" | "installing" | "error";
 
 const IconLogoM = ({ className, ...props }: { className?: string; [key: string]: any }) => (
   <svg
@@ -72,6 +78,11 @@ interface SidebarProps {
   workspaceStatuses?: Record<string, string>;
   sessionStatuses?: Record<string, string>;
   isWorkspaceDropActive?: boolean;
+  updateStatus?: SidebarUpdateStatus;
+  availableUpdateVersion?: string;
+  updateError?: string;
+  updateProgressPercent?: number | null;
+  onInstallUpdate?: () => void;
   onSetSidebarWidth: (w: number) => void;
   onOpenGlobalChat: () => void;
   onAddWorkspace: () => void;
@@ -137,6 +148,11 @@ export default function Sidebar({
   workspaceStatuses = {},
   sessionStatuses = {},
   isWorkspaceDropActive = false,
+  updateStatus = "idle",
+  availableUpdateVersion = "",
+  updateError = "",
+  updateProgressPercent = null,
+  onInstallUpdate,
   onOpenGlobalChat,
   onAddWorkspace,
   onSelectWorkspace,
@@ -155,13 +171,13 @@ export default function Sidebar({
   const [gitLoading, setGitLoading] = useState<Record<string, boolean>>({});
   const [gitActionBusy, setGitActionBusy] = useState(false);
   const [gitMenu, setGitMenu] = useState<GitMenuState | null>(null);
-  const [gitMenuView, setGitMenuView] = useState<GitMenuView>("overview");
-  const [gitFileList, setGitFileList] = useState<GitFileEntry[]>([]);
-  const [gitFileListLoading, setGitFileListLoading] = useState(false);
   const [gitActionMode, setGitActionMode] = useState<"commit" | "branch" | null>(null);
   const [gitCommitMessage, setGitCommitMessage] = useState("");
   const [gitBranchName, setGitBranchName] = useState("");
   const [gitFeedback, setGitFeedback] = useState<GitFeedbackState | null>(null);
+  const [generatingCommitMessage, setGeneratingCommitMessage] = useState(false);
+  const [gitMenuCachedTime, setGitMenuCachedTime] = useState<number | null>(null);
+  const openGitDiffPreview = useAppStore((s) => s.openGitDiffPreview);
   const activeWorkspace = selectedWorkspace || currentWorkspace;
 
   const workspaceEntries = useMemo(() => {
@@ -177,10 +193,13 @@ export default function Sidebar({
 
   const refreshGitStatus = useCallback(async (workspacePath: string, includeStats = false) => {
     if (!workspacePath) return null;
+
     setGitLoading((prev) => ({ ...prev, [workspacePath]: true }));
+
     try {
       const status = await getGitStatus(workspacePath, includeStats);
       setGitStatuses((prev) => ({ ...prev, [workspacePath]: status }));
+      if (includeStats) setGitMenuCachedTime(Date.now());
       return status;
     } catch (error) {
       const status = createEmptyGitStatus({
@@ -204,36 +223,37 @@ export default function Sidebar({
 
   useEffect(() => {
     const paths = workspacePathsKey.split("\n").filter(Boolean);
+    if (paths.length === 0) return;
     let cancelled = false;
-    setGitStatuses((prev) => {
-      const next: Record<string, GitStatus> = {};
-      paths.forEach((path) => {
-        if (prev[path]) next[path] = prev[path];
-      });
-      return next;
-    });
-    paths.forEach((path) => {
-      void getGitStatus(path, false)
-        .then((status) => {
-          if (cancelled) return;
-          setGitStatuses((prev) => ({ ...prev, [path]: status }));
-        })
-        .catch((error) => {
-          if (cancelled) return;
-          setGitStatuses((prev) => ({
-            ...prev,
-            [path]: createEmptyGitStatus({
-              gitAvailable: false,
-              isRepo: false,
-              error: getErrorMessage(error),
-            }),
-          }));
+
+    const promises = paths.map((path) =>
+      getGitStatus(path, false).catch((error) => createEmptyGitStatus({
+        gitAvailable: false,
+        isRepo: false,
+        error: getErrorMessage(error) || "Unknown error",
+      }))
+    );
+
+    Promise.all(promises).then((results) => {
+      if (cancelled) return;
+      setGitStatuses((prev) => {
+        const next: Record<string, GitStatus> = { ...prev };
+        paths.forEach((path, index) => {
+          next[path] = results[index];
         });
+        return next;
+      });
     });
-    return () => {
-      cancelled = true;
-    };
+
+    return () => { cancelled = true; };
   }, [workspacePathsKey]);
+
+  useEffect(() => {
+    if (!gitFeedback) return;
+    const timeoutMs = gitFeedback.type === "error" ? 5_000 : 3_000;
+    const timer = window.setTimeout(() => setGitFeedback(null), timeoutMs);
+    return () => window.clearTimeout(timer);
+  }, [gitFeedback]);
 
   useEffect(() => {
     if (!gitMenu) return;
@@ -273,6 +293,23 @@ export default function Sidebar({
   const addWorkspaceLabel = config.language === "en" ? "New Project" : "新项目";
   const missingLabel = config.language === "en" ? "Missing details" : "详情缺失";
   const dropHint = config.language === "en" ? "Drop folders here to add workspaces" : "拖拽文件夹到这里加入工作区";
+  const showUpdateButton = Boolean(availableUpdateVersion) && updateStatus !== "idle" && updateStatus !== "checking";
+  const updateInProgress = updateStatus === "downloading" || updateStatus === "installing";
+  const updateButtonText = (() => {
+    if (config.language === "en") {
+      if (updateStatus === "downloading") return updateProgressPercent ? `Downloading ${updateProgressPercent}%` : "Downloading...";
+      if (updateStatus === "installing") return "Installing...";
+      return "Update";
+    }
+
+    if (updateStatus === "downloading") return updateProgressPercent ? `下载中 ${updateProgressPercent}%` : "下载中...";
+    if (updateStatus === "installing") return "安装中...";
+    return "更新";
+  })();
+  const updateButtonTitle = updateError
+    || (availableUpdateVersion
+      ? (config.language === "en" ? `Install MAIN ${availableUpdateVersion}` : `安装 MAIN ${availableUpdateVersion}`)
+      : "");
   const gitCopy = config.language === "en"
     ? {
         title: "Git",
@@ -289,6 +326,8 @@ export default function Sidebar({
         push: "Push",
         createBranch: "Create branch",
         commitPlaceholder: "Commit message",
+        autoCommitPlaceholder: "Leave blank to auto-generate",
+        generatingCommit: "Generating...",
         branchPlaceholder: "new-branch-name",
         cancel: "Cancel",
         confirm: "Confirm",
@@ -317,6 +356,8 @@ export default function Sidebar({
         push: "推送",
         createBranch: "创建分支",
         commitPlaceholder: "提交信息",
+        autoCommitPlaceholder: "留空以自动生成提交信息",
+        generatingCommit: "生成中...",
         branchPlaceholder: "new-branch-name",
         cancel: "取消",
         confirm: "确认",
@@ -333,66 +374,85 @@ export default function Sidebar({
 
   const activeGitStatus = gitMenu ? gitStatuses[gitMenu.workspacePath] : null;
   const activeGitLoading = gitMenu ? !!gitLoading[gitMenu.workspacePath] : false;
-  const gitOperationsDisabled = !activeGitStatus?.gitAvailable || !activeGitStatus?.isRepo || gitActionBusy || activeGitLoading;
+  const gitOperationsDisabled = !activeGitStatus?.gitAvailable || !activeGitStatus?.isRepo || gitActionBusy || generatingCommitMessage || activeGitLoading;
+  const panelIconButtonClass = "panel-tab-icon-button flex h-7 w-7 shrink-0 items-center justify-center rounded-[7px] p-0 transition-all duration-150";
+  const gitMenuIconButtonClass = "git-menu-theme-button flex h-7 w-7 shrink-0 items-center justify-center rounded-[7px] p-0 transition-all duration-150";
+  const gitMenuActionButtonClass = "git-menu-theme-button flex w-full items-center gap-2 rounded-[7px] border px-2 py-2 text-left text-[13px] transition-all duration-150 disabled:cursor-not-allowed disabled:opacity-40";
+  const gitMenuInlineButtonClass = "git-menu-theme-button rounded-[7px] border px-2 py-1 text-[11px] transition-all duration-150 disabled:cursor-not-allowed disabled:opacity-40";
+
+  const buildGitMenuPlacement = (rect: DOMRect, workspacePath: string): GitMenuState => {
+    const menuWidth = 300;
+    const preferredHeight = 520;
+    const gap = 8;
+    const margin = 12;
+    const viewportWidth = typeof window !== "undefined" ? window.innerWidth : 1280;
+    const viewportHeight = typeof window !== "undefined" ? window.innerHeight : 800;
+    const sidebarRect = sidebarRef.current?.getBoundingClientRect();
+    const preferredLeft = Math.max(rect.right + gap, (sidebarRect?.right ?? rect.right) + gap);
+    const left = preferredLeft + menuWidth <= viewportWidth - margin
+      ? preferredLeft
+      : Math.max(margin, Math.min(viewportWidth - menuWidth - margin, preferredLeft));
+    const availableHeight = Math.max(220, viewportHeight - margin * 2);
+    const menuHeight = Math.min(preferredHeight, availableHeight);
+    const top = Math.min(
+      Math.max(margin, rect.top),
+      Math.max(margin, viewportHeight - menuHeight - margin),
+    );
+
+    return {
+      workspacePath,
+      left,
+      top,
+      maxHeight: Math.min(menuHeight, viewportHeight - top - margin),
+    };
+  };
 
   const openGitMenu = (event: React.MouseEvent<HTMLButtonElement>, workspacePath: string) => {
     event.stopPropagation();
-    setGitMenu((prev) => prev?.workspacePath === workspacePath ? null : { workspacePath, top: 0 });
-    setGitMenuView("overview");
-    setGitFileList([]);
+    const isToggling = gitMenu?.workspacePath === workspacePath;
+
+    if (isToggling) {
+      setGitMenu(null);
+      setGitActionMode(null);
+      setGitFeedback(null);
+      setGitCommitMessage("");
+      setGitBranchName("");
+      setGeneratingCommitMessage(false);
+      return;
+    }
+
+    setGitMenu(buildGitMenuPlacement(event.currentTarget.getBoundingClientRect(), workspacePath));
     setGitActionMode(null);
     setGitFeedback(null);
     setGitCommitMessage("");
     setGitBranchName("");
+    setGeneratingCommitMessage(false);
+
     void refreshGitStatus(workspacePath, true);
   };
 
-  const fetchGitFileList = useCallback(async (workspacePath: string, filter: string) => {
-    setGitFileListLoading(true);
+  const openGitDiff = useCallback(async (workspacePath: string, options: { path?: string; filter?: "changed" | "added" | "deleted"; label?: string }) => {
     try {
-      const list = await getGitFileList(workspacePath, filter);
-      setGitFileList(list);
+      const entries = await getGitDiff(workspacePath, options.path, options.filter);
+      if (entries.length === 0) {
+        setGitFeedback({
+          type: "error",
+          text: config.language === "en" ? "No diff is available for this selection." : "当前选择没有可显示的 Diff。",
+        });
+        return;
+      }
+      openGitDiffPreview(entries, options.label || options.path || "Git");
     } catch (error) {
-      setGitFileList([]);
-    } finally {
-      setGitFileListLoading(false);
+      setGitFeedback({ type: "error", text: getErrorMessage(error) || gitCopy.refreshFailed });
     }
-  }, []);
+  }, [config.language, gitCopy.refreshFailed, openGitDiffPreview]);
 
-  const handleStatClick = useCallback((filter: string) => {
-    const validView = (["overview", "changed", "added", "deleted"] as const).includes(filter as GitMenuView)
-      ? (filter as GitMenuView)
-      : "overview";
-    setGitMenuView(validView);
-    void fetchGitFileList(gitMenu!.workspacePath, filter);
-  }, [gitMenu, fetchGitFileList]);
-
-  const handleBackToOverview = useCallback(() => {
-    setGitMenuView("overview");
-    setGitFileList([]);
-  }, []);
-
-  const getStatusIcon = (status: string) => {
-    switch (status) {
-      case "M": return "M";
-      case "A": return "+";
-      case "D": return "−";
-      case "R": return "⟶";
-      case "U": return "?";
-      default: return "·";
-    }
-  };
-
-  const getStatusColor = (status: string) => {
-    switch (status) {
-      case "M": return "text-[#e2b931]";
-      case "A": return "text-[#6ee7b7]";
-      case "D": return "text-[#f87171]";
-      case "R": return "text-[#60a5fa]";
-      case "U": return "text-[#a78bfa]";
-      default: return "text-[#71717a]";
-    }
-  };
+  const handleSummaryDiffClick = useCallback(() => {
+    if (!gitMenu?.workspacePath) return;
+    void openGitDiff(gitMenu.workspacePath, {
+      label: config.language === "en" ? "Git Changes" : "Git 更改",
+    });
+  }, [config.language, gitMenu, openGitDiff]);
 
   const runGitAction = async (operation: () => Promise<GitStatus>, successText: string) => {
     if (!gitMenu?.workspacePath) return;
@@ -416,12 +476,30 @@ export default function Sidebar({
   const handleGitCommit = async (event: React.FormEvent) => {
     event.preventDefault();
     if (!gitMenu?.workspacePath) return;
-    const message = gitCommitMessage.trim();
+    let message = gitCommitMessage.trim();
+    if (!message) {
+      setGeneratingCommitMessage(true);
+      setGitFeedback(null);
+      try {
+        const entries = await getGitDiff(gitMenu.workspacePath).catch(() => []);
+        const generated = await generateGitCommitMessage({
+          config,
+          language: config.language === "en" ? "en" : "zh",
+          workspace: gitMenu.workspacePath,
+          status: activeGitStatus,
+          entries,
+        });
+        message = generated.message;
+        setGitCommitMessage(message);
+      } finally {
+        setGeneratingCommitMessage(false);
+      }
+    }
     if (!message) {
       setGitFeedback({ type: "error", text: gitCopy.missingMessage });
       return;
     }
-    await runGitAction(() => gitCommitAll(gitMenu.workspacePath, message), gitCopy.commitDone);
+    await runGitAction(() => gitCommitAll(gitMenu.workspacePath, message), `${gitCopy.commitDone} ${message}`);
   };
 
   const handleGitPush = async () => {
@@ -435,12 +513,40 @@ export default function Sidebar({
   const handleGitCreateBranch = async (event: React.FormEvent) => {
     event.preventDefault();
     if (!gitMenu?.workspacePath) return;
-    const branch = gitBranchName.trim();
-    if (!branch) {
-      setGitFeedback({ type: "error", text: gitCopy.missingBranch });
+
+    const validation = sanitizeBranchName(gitBranchName);
+    if (!validation.valid) {
+      setGitFeedback({ type: "error", text: validation.error! });
       return;
     }
-    await runGitAction(() => gitCreateBranch(gitMenu.workspacePath, branch), gitCopy.branchDone);
+
+    await runGitAction(() => gitCreateBranch(gitMenu.workspacePath, gitBranchName.trim()), gitCopy.branchDone);
+  };
+
+  const sanitizeBranchName = (name: string): { valid: boolean; error?: string } => {
+    const trimmed = name.trim();
+
+    if (!trimmed) {
+      return { valid: false, error: config.language === "en" ? "Branch name cannot be empty." : "分支名不能为空。" };
+    }
+
+    if (trimmed.length > 255) {
+      return { valid: false, error: config.language === "en" ? "Branch name cannot exceed 255 characters." : "分支名不能超过 255 个字符。" };
+    }
+
+    if (!/^[a-zA-Z0-9/_-]+$/.test(trimmed)) {
+      return { valid: false, error: config.language === "en" ? "Branch name can only contain letters, numbers, hyphens, underscores, and slashes." : "分支名只能包含字母、数字、连字符、下划线和斜杠。" };
+    }
+
+    if (trimmed.startsWith("-")) {
+      return { valid: false, error: config.language === "en" ? "Branch name cannot start with a hyphen." : "分支名不能以连字符开头。" };
+    }
+
+    if (trimmed.includes("..") || trimmed.includes("@{") || trimmed.includes("*") || trimmed.includes("?")) {
+      return { valid: false, error: config.language === "en" ? "Branch name contains invalid characters." : "分支名包含非法字符。" };
+    }
+
+    return { valid: true };
   };
 
   const resolveSessionDisplayTitle = (session: any) => {
@@ -514,7 +620,7 @@ export default function Sidebar({
   const isBlackTheme = config.themeMode === "black";
   const isLightTheme = config.themeMode === "light";
 
-  const gitMenuThemeClasses = useMemo(() => {
+  const gitMenuThemeClasses: GitMenuThemeClasses = useMemo(() => {
     if (isBlackTheme) {
       return {
         bg: "bg-[rgba(12,12,14,0.95)]",
@@ -525,13 +631,14 @@ export default function Sidebar({
         mutedText: "text-[#a1a1aa]",
         inputBg: "bg-[#111113]",
         divider: "border-[#3f3f46]",
-        statBg: "bg-[#18181b]",
-        statHover: "hover:bg-[#27272a]",
-        addedBg: "bg-[#112018]",
-        addedHover: "hover:bg-[#1a2a20]",
-        deletedBg: "bg-[#241515]",
-        deletedHover: "hover:bg-[#2f1a1a]",
-        fileHover: "hover:bg-[rgba(40,40,45,0.6)]",
+        strongText: "text-[#f4f4f5]",
+        lineText: "text-[#d4d4d8]",
+        dangerText: "text-[#fca5a5]",
+        successText: "text-[#86d9a3]",
+        warningText: "text-[#facc15]",
+        dangerBg: "bg-[#2a1010]",
+        successBg: "bg-[#112018]",
+        warningBg: "bg-[#3a2412]",
       };
     }
     if (isLightTheme) {
@@ -544,13 +651,14 @@ export default function Sidebar({
         mutedText: "text-[#52525b]",
         inputBg: "bg-[#fafafa]",
         divider: "border-[#e4e4e7]",
-        statBg: "bg-[#f4f4f5]",
-        statHover: "hover:bg-[#e4e4e7]",
-        addedBg: "bg-[#f0fdf4]",
-        addedHover: "hover:bg-[#dcfce7]",
-        deletedBg: "bg-[#fef2f2]",
-        deletedHover: "hover:bg-[#fee2e2]",
-        fileHover: "hover:bg-[#f4f4f5]",
+        strongText: "text-[#111827]",
+        lineText: "text-[#27272a]",
+        dangerText: "text-[#b91c1c]",
+        successText: "text-[#047857]",
+        warningText: "text-[#a16207]",
+        dangerBg: "bg-[#fef2f2]",
+        successBg: "bg-[#ecfdf5]",
+        warningBg: "bg-[#fefce8]",
       };
     }
     // dark (default)
@@ -563,13 +671,14 @@ export default function Sidebar({
       mutedText: "text-[#a1a1aa]",
       inputBg: "bg-[#111113]",
       divider: "border-[#3f3f46]",
-      statBg: "bg-[#18181b]",
-      statHover: "hover:bg-[#27272a]",
-      addedBg: "bg-[#112018]",
-      addedHover: "hover:bg-[#1a2a20]",
-      deletedBg: "bg-[#241515]",
-      deletedHover: "hover:bg-[#2f1a1a]",
-      fileHover: "hover:bg-[#27272a]",
+      strongText: "text-[#f4f4f5]",
+      lineText: "text-[#d4d4d8]",
+      dangerText: "text-[#fca5a5]",
+      successText: "text-[#86d9a3]",
+      warningText: "text-[#facc15]",
+      dangerBg: "bg-[#2a1010]",
+      successBg: "bg-[#112018]",
+      warningBg: "bg-[#3a2412]",
     };
   }, [isBlackTheme, isLightTheme]);
 
@@ -590,15 +699,38 @@ export default function Sidebar({
         }`}
         data-tauri-drag-region
       >
-        <div className="mb-4 flex items-center gap-[2px] select-none pointer-events-none">
-          <IconLogoM className="h-[18px] w-[18px] theme-text drop-shadow-[0_0_8px_var(--accent-subtle)] pointer-events-none" />
-          <span
-            className="pointer-events-none text-[12px] font-black leading-none tracking-widest text-[#e4e4e7]"
-            style={{ fontFamily: "var(--font-sans)" }}
-          >
-            AIN
-          </span>
+        <div className="mb-4 flex items-center justify-between gap-2 select-none">
+          <div className="flex items-center gap-[2px] pointer-events-none">
+            <IconLogoM className="h-[18px] w-[18px] theme-text drop-shadow-[0_0_8px_var(--accent-subtle)] pointer-events-none" />
+            <span
+              className="pointer-events-none text-[12px] font-black leading-none tracking-widest text-[#e4e4e7]"
+              style={{ fontFamily: "var(--font-sans)" }}
+            >
+              AIN
+            </span>
+          </div>
+          {showUpdateButton && (
+            <button
+              type="button"
+              data-testid="sidebar-update-button"
+              onClick={onInstallUpdate}
+              disabled={updateInProgress}
+              title={updateButtonTitle}
+              className={`pointer-events-auto h-6 shrink-0 rounded-full border px-2.5 text-[11px] font-semibold transition-colors disabled:cursor-wait disabled:opacity-80 ${
+                updateError
+                  ? "border-[#7f1d1d] bg-[#2a1010] text-[#fca5a5] hover:bg-[#3a1414]"
+                  : "border-[var(--accent-subtle-border)] bg-[var(--accent-subtle)] text-white hover:bg-[var(--accent)]"
+              }`}
+            >
+              {updateButtonText}
+            </button>
+          )}
         </div>
+        {showUpdateButton && updateError && (
+          <div className="-mt-2 mb-3 truncate px-1 text-[10px] text-[#fca5a5]" title={updateError}>
+            {updateError}
+          </div>
+        )}
 
         <div className="flex items-center justify-between gap-3 text-[10px] font-bold uppercase tracking-widest text-[#71717a]">
           <span className="pointer-events-none">{t.workspace || "WORKSPACE"}</span>
@@ -691,15 +823,11 @@ export default function Sidebar({
                           <button
                             type="button"
                             data-sidebar-git-trigger="true"
+                            data-workspace={workspacePath}
                             data-testid="sidebar-git-button"
                             onClick={(event) => openGitMenu(event, workspacePath)}
-                            className={`rounded p-1 transition-colors ${
-                              gitIconDisabled
-                                ? "text-[#52525b] hover:bg-[#27272a]"
-                                : gitMenu?.workspacePath === workspacePath
-                                  ? "bg-[#27272a] theme-text"
-                                  : "text-[#71717a] opacity-80 hover:bg-[#27272a] hover:text-[#e4e4e7] group-hover:opacity-100"
-                            }`}
+                            disabled={gitIconDisabled}
+                            className={`${panelIconButtonClass} ${gitMenu?.workspacePath === workspacePath ? "is-active" : "opacity-80 group-hover:opacity-100"}`}
                             title={gitIconDisabled ? gitCopy.installGit : gitCopy.title}
                           >
                             <IconGitBranch className="h-3.5 w-3.5" />
@@ -711,10 +839,10 @@ export default function Sidebar({
                             e.stopPropagation();
                             workspacePath && onCreateSession?.(workspacePath);
                           }}
-                          className="rounded p-1 text-[#71717a] opacity-60 transition-opacity hover:bg-[#27272a] hover:text-[#e4e4e7] group-hover:opacity-100"
+                          className={`${panelIconButtonClass} opacity-60 group-hover:opacity-100`}
                           title={config.language === "en" ? "New project conversation" : "新建项目会话"}
                         >
-                          <IconPlus className="h-3 w-3" />
+                          <IconPlus className="h-3.5 w-3.5" />
                         </button>
                         <button
                           type="button"
@@ -722,10 +850,10 @@ export default function Sidebar({
                             e.stopPropagation();
                             onRemoveWorkspaceEntry?.(workspacePath);
                           }}
-                          className="rounded p-1 text-[#71717a] opacity-70 transition-opacity hover:bg-[#27272a] hover:text-[#f48771] group-hover:opacity-100"
+                          className={`${panelIconButtonClass} opacity-70 group-hover:opacity-100`}
                           title={config.language === "en" ? "Remove from sidebar" : "从侧边栏移除"}
                         >
-                          <IconTrash className="h-3 w-3" />
+                          <IconTrash className="h-3.5 w-3.5" />
                         </button>
                       </div>
 
@@ -821,36 +949,12 @@ export default function Sidebar({
         </button>
       </div>
 
-      {gitMenu && (() => {
-        const sidebarRect = sidebarRef.current?.getBoundingClientRect();
-        const buttonRect = sidebarRect
-          ? (() => {
-              const trigger = document.querySelector(`[data-sidebar-git-trigger="true"][data-workspace="${gitMenu.workspacePath}"]`) as HTMLElement | null;
-              return trigger?.getBoundingClientRect();
-            })()
-          : undefined;
-        const viewportHeight = typeof window !== "undefined" ? window.innerHeight : 800;
-        const menuHeight = 340;
-        const menuWidth = 280;
-        const sidebarLeft = sidebarRect?.left ?? 0;
-        const sidebarRight = sidebarRect?.right ?? sidebarLeft + sidebarWidth;
-        const fitsInViewport = sidebarRight + menuWidth <= viewportHeight;
-        const menuLeft = fitsInViewport ? sidebarWidth : -(menuWidth - 4);
-        const top = buttonRect
-          ? Math.max(74, buttonRect.bottom - (sidebarRect?.top ?? 0) + 6)
-          : 74;
-        const spaceBelow = (sidebarRect?.height ?? 600) - top;
-        const fitsBelow = spaceBelow >= menuHeight;
-        const menuTop = fitsBelow ? top : Math.max(74, top - menuHeight);
-        const maxHeight = fitsBelow
-          ? `calc(100% - ${top + 12}px)`
-          : `${Math.min(menuHeight, spaceBelow)}px`;
-        return (
+      {gitMenu && typeof document !== "undefined" && createPortal((
         <div
           ref={gitMenuRef}
           data-testid="sidebar-git-menu"
-          className={`absolute z-40 w-[280px] overflow-hidden rounded-md border shadow-2xl ${gitMenuThemeClasses.bg} ${gitMenuThemeClasses.text}`}
-          style={{ left: `${menuLeft}px`, top: `${menuTop}px`, maxHeight }}
+          className={`fixed z-[1000] w-[300px] overflow-hidden rounded-md border ${gitMenuThemeClasses.bg} ${gitMenuThemeClasses.border} ${gitMenuThemeClasses.text}`}
+          style={{ left: `${gitMenu.left}px`, top: `${gitMenu.top}px`, maxHeight: `${gitMenu.maxHeight}px` }}
           onClick={(event) => event.stopPropagation()}
         >
           <div className="max-h-full overflow-y-auto">
@@ -860,133 +964,86 @@ export default function Sidebar({
                   <IconGitBranch className="h-4 w-4 shrink-0 theme-text" />
                   <span className="truncate text-[12px] font-bold">{gitCopy.title}</span>
                 </div>
-                {activeGitLoading && (
-                  <span className={`text-[10px] ${gitMenuThemeClasses.mutedText}`}>{config.language === "en" ? "Loading" : "加载中"}</span>
-                )}
+                <div className="flex items-center gap-1">
+                  {gitMenuCachedTime && (
+                    <span className={`text-[10px] ${gitMenuThemeClasses.mutedText}`}>
+                      {config.language === "en" ? "Cached" : "缓存"} · {new Date(gitMenuCachedTime).toLocaleTimeString()}
+                    </span>
+                  )}
+                  <button
+                    onClick={() => void refreshGitStatus(gitMenu.workspacePath, true)}
+                    className={gitMenuIconButtonClass}
+                    title={config.language === "en" ? "Refresh" : "刷新"}
+                  >
+                    <IconRefresh className="h-3.5 w-3.5" />
+                  </button>
+                  {activeGitLoading && (
+                    <span className={`text-[10px] ${gitMenuThemeClasses.mutedText}`}>{config.language === "en" ? "Loading" : "加载中"}</span>
+                  )}
+                </div>
               </div>
-              <div className="mt-2 space-y-1 text-[11px] text-[#a1a1aa]">
+              <div className={`mt-2 space-y-1 text-[11px] ${gitMenuThemeClasses.mutedText}`}>
                 <div className="flex min-w-0 items-center justify-between gap-2">
-                  <span className={`text-[#71717a]`}>{gitCopy.branch}</span>
-                  <span className="truncate text-[#e4e4e7]" title={activeGitStatus?.branch || ""}>
+                  <span className={gitMenuThemeClasses.subtleText}>{gitCopy.branch}</span>
+                  <span className={`truncate ${gitMenuThemeClasses.strongText}`} title={activeGitStatus?.branch || ""}>
                     {activeGitStatus?.branch || "HEAD"}
                   </span>
                 </div>
                 <div className="flex min-w-0 items-center justify-between gap-2">
-                  <span className={`text-[#71717a]`}>{gitCopy.upstream}</span>
+                  <span className={gitMenuThemeClasses.subtleText}>{gitCopy.upstream}</span>
                   <span className="truncate" title={activeGitStatus?.upstream || ""}>
                     {activeGitStatus?.upstream || gitCopy.noUpstream}
                   </span>
                 </div>
                 {(activeGitStatus?.ahead || activeGitStatus?.behind) ? (
                   <div className="flex items-center justify-end gap-1.5">
-                    {activeGitStatus?.ahead > 0 && <span className="rounded bg-[#123524] px-1.5 py-0.5 text-[#86d9a3]">ahead {activeGitStatus.ahead}</span>}
-                    {activeGitStatus?.behind > 0 && <span className="rounded bg-[#3a2412] px-1.5 py-0.5 text-[#facc15]">behind {activeGitStatus.behind}</span>}
+                    {activeGitStatus?.ahead > 0 && <span className={`rounded px-1.5 py-0.5 ${gitMenuThemeClasses.successBg} ${gitMenuThemeClasses.successText}`}>ahead {activeGitStatus.ahead}</span>}
+                    {activeGitStatus?.behind > 0 && <span className={`rounded px-1.5 py-0.5 ${gitMenuThemeClasses.warningBg} ${gitMenuThemeClasses.warningText}`}>behind {activeGitStatus.behind}</span>}
                   </div>
                 ) : null}
               </div>
             </div>
 
-            {gitMenuView === "overview" ? (
-              <>
-                <div className={`grid grid-cols-3 gap-1 border-b ${gitMenuThemeClasses.divider} px-3 py-2 text-center`}>
-                  <button
-                    type="button"
-                    onClick={() => handleStatClick("changed")}
-                    className={`rounded ${gitMenuThemeClasses.statBg} px-2 py-1.5 transition-colors ${gitMenuThemeClasses.statHover} ${
-                      gitMenuView === "changed" ? "ring-1 ring-[var(--accent)]" : ""
-                    }`}
-                  >
-                    <div className="text-[13px] font-bold">{activeGitStatus?.changedFiles ?? 0}</div>
-                    <div className="text-[9px] uppercase tracking-wider text-[#71717a]">{gitCopy.changed}</div>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => handleStatClick("added")}
-                    className={`rounded ${gitMenuThemeClasses.addedBg} px-2 py-1.5 transition-colors ${gitMenuThemeClasses.addedHover} ${
-                      gitMenuView === "added" ? "ring-1 ring-[#6ee7b7]" : ""
-                    }`}
-                  >
-                    <div className="text-[13px] font-bold text-[#86d9a3]">+{activeGitStatus?.insertions ?? 0}</div>
-                    <div className="text-[9px] uppercase tracking-wider text-[#5f9f78]">+</div>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => handleStatClick("deleted")}
-                    className={`rounded ${gitMenuThemeClasses.deletedBg} px-2 py-1.5 transition-colors ${gitMenuThemeClasses.deletedHover} ${
-                      gitMenuView === "deleted" ? "ring-1 ring-[#f87171]" : ""
-                    }`}
-                  >
-                    <div className="text-[13px] font-bold text-[#fca5a5]">-{activeGitStatus?.deletions ?? 0}</div>
-                    <div className="text-[9px] uppercase tracking-wider text-[#b96c6c]">-</div>
-                  </button>
+            <div className={`border-b ${gitMenuThemeClasses.divider} px-3 py-2`}>
+              <button
+                type="button"
+                data-testid="sidebar-git-summary-button"
+                onClick={handleSummaryDiffClick}
+                className="git-menu-theme-button flex w-full items-center justify-between gap-3 rounded-[7px] border px-3 py-2 text-left transition-all duration-150"
+              >
+                <div className="min-w-0">
+                  <div className={`text-[11px] font-semibold ${gitMenuThemeClasses.subtleText}`}>{gitCopy.changed}</div>
+                  <div className="mt-0.5 text-[16px] font-bold">
+                    {activeGitStatus?.changedFiles ?? 0}
+                    <span className={`ml-1 text-[11px] font-medium ${gitMenuThemeClasses.mutedText}`}>
+                      {config.language === "en" ? "files" : "个文件"}
+                    </span>
+                  </div>
                 </div>
-                <div className={`grid grid-cols-2 gap-x-3 gap-y-1 border-b ${gitMenuThemeClasses.divider} px-3 py-2 text-[11px] ${gitMenuThemeClasses.mutedText}`}>
-                  <div className="flex justify-between gap-2"><span>{gitCopy.staged}</span><span>{activeGitStatus?.stagedFiles ?? 0}</span></div>
-                  <div className="flex justify-between gap-2"><span>{gitCopy.unstaged}</span><span>{activeGitStatus?.unstagedFiles ?? 0}</span></div>
-                  <div className="flex justify-between gap-2"><span>{gitCopy.untracked}</span><span>{activeGitStatus?.untrackedFiles ?? 0}</span></div>
-                  <div className="flex justify-between gap-2"><span>{gitCopy.conflicts}</span><span className={activeGitStatus?.conflictedFiles ? "text-[#fca5a5]" : ""}>{activeGitStatus?.conflictedFiles ?? 0}</span></div>
+                <div className="shrink-0 font-mono text-[13px] font-bold">
+                  <span className={gitMenuThemeClasses.successText}>+{activeGitStatus?.insertions ?? 0}</span>
+                  <span className="mx-1.5" />
+                  <span className={gitMenuThemeClasses.dangerText}>-{activeGitStatus?.deletions ?? 0}</span>
                 </div>
-              </>
-            ) : (
-              <div className={`border-b ${gitMenuThemeClasses.divider}`}>
-                <div className="flex items-center justify-between px-3 py-1.5">
-                  <button
-                    type="button"
-                    onClick={handleBackToOverview}
-                    className={`flex items-center gap-1 text-[11px] ${gitMenuThemeClasses.mutedText} hover:text-[#e4e4e7] transition-colors`}
-                  >
-                    <svg className="h-3 w-3" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M12.707 5.293a1 1 0 010 1.414L9.414 10l3.293 3.293a1 1 0 01-1.414 1.414l-4-4a1 1 0 010-1.414l4-4a1 1 0 011.414 0z" clipRule="evenodd" /></svg>
-                    <span>{config.language === "en" ? "Back" : "返回"}</span>
-                  </button>
-                  <span className={`text-[10px] uppercase tracking-wider ${gitMenuThemeClasses.subtleText}`}>
-                    {gitMenuView === "changed" ? gitCopy.changed : gitMenuView === "added" ? "+" : "-"}
-                    {` (${gitFileList.length})`}
-                  </span>
-                </div>
-                <div className="max-h-[280px] overflow-y-auto px-1">
-                  {gitFileListLoading ? (
-                    <div className="px-2 py-4 text-center text-[11px] text-[#71717a]">
-                      {config.language === "en" ? "Loading..." : "加载中..."}
-                    </div>
-                  ) : gitFileList.length === 0 ? (
-                    <div className="px-2 py-4 text-center text-[11px] text-[#71717a]">
-                      {config.language === "en" ? "No files" : "无文件"}
-                    </div>
-                  ) : (
-                    <div className="space-y-0.5 py-1">
-                      {gitFileList.map((entry, idx) => (
-                        <div
-                          key={`${entry.path}-${idx}`}
-                          className={`flex items-center gap-2 rounded px-2 py-1 text-[12px] transition-colors ${gitMenuThemeClasses.fileHover}`}
-                        >
-                          <span className={`shrink-0 font-mono text-[10px] font-bold w-4 text-center ${getStatusColor(entry.status)}`}>
-                            {getStatusIcon(entry.status)}
-                          </span>
-                          <span className="min-w-0 truncate text-[#d4d4d8]">{entry.path}</span>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              </div>
-            )}
+              </button>
+            </div>
 
             <div className={`grid grid-cols-2 gap-x-3 gap-y-1 border-b ${gitMenuThemeClasses.divider} px-3 py-2 text-[11px] ${gitMenuThemeClasses.mutedText}`}>
               <div className="flex justify-between gap-2"><span>{gitCopy.staged}</span><span>{activeGitStatus?.stagedFiles ?? 0}</span></div>
               <div className="flex justify-between gap-2"><span>{gitCopy.unstaged}</span><span>{activeGitStatus?.unstagedFiles ?? 0}</span></div>
               <div className="flex justify-between gap-2"><span>{gitCopy.untracked}</span><span>{activeGitStatus?.untrackedFiles ?? 0}</span></div>
-              <div className="flex justify-between gap-2"><span>{gitCopy.conflicts}</span><span className={activeGitStatus?.conflictedFiles ? "text-[#fca5a5]" : ""}>{activeGitStatus?.conflictedFiles ?? 0}</span></div>
+              <div className="flex justify-between gap-2"><span>{gitCopy.conflicts}</span><span className={activeGitStatus?.conflictedFiles ? gitMenuThemeClasses.dangerText : ""}>{activeGitStatus?.conflictedFiles ?? 0}</span></div>
             </div>
 
             {(activeGitStatus?.error || !activeGitStatus?.gitAvailable || !activeGitStatus?.isRepo) && (
-              <div className={`border-b ${gitMenuThemeClasses.divider} bg-[#2a1010] px-3 py-2 text-[11px] leading-relaxed text-[#fca5a5]`}>
+              <div className={`border-b ${gitMenuThemeClasses.divider} ${gitMenuThemeClasses.dangerBg} px-3 py-2 text-[11px] leading-relaxed ${gitMenuThemeClasses.dangerText}`}>
                 {activeGitStatus?.error || (!activeGitStatus?.gitAvailable ? gitCopy.installGit : gitCopy.noRepo)}
               </div>
             )}
 
             {gitFeedback && (
               <div className={`border-b ${gitMenuThemeClasses.divider} px-3 py-2 text-[11px] leading-relaxed ${
-                gitFeedback.type === "success" ? "bg-[#112018] text-[#86d9a3]" : "bg-[#2a1010] text-[#fca5a5]"
+                gitFeedback.type === "success" ? `${gitMenuThemeClasses.successBg} ${gitMenuThemeClasses.successText}` : `${gitMenuThemeClasses.dangerBg} ${gitMenuThemeClasses.dangerText}`
               }`}>
                 {gitFeedback.text}
               </div>
@@ -1000,7 +1057,7 @@ export default function Sidebar({
                   setGitActionMode((mode) => mode === "commit" ? null : "commit");
                   setGitFeedback(null);
                 }}
-                className={`flex w-full items-center gap-2 rounded px-2 py-2 text-left text-[13px] transition-colors ${gitMenuThemeClasses.hover} disabled:cursor-not-allowed disabled:opacity-45`}
+                className={`${gitMenuActionButtonClass} ${gitActionMode === "commit" ? "is-active" : ""}`}
               >
                 <IconGitCommit className="h-4 w-4" />
                 {gitCopy.commit}
@@ -1011,12 +1068,14 @@ export default function Sidebar({
                     autoFocus
                     value={gitCommitMessage}
                     onChange={(event) => setGitCommitMessage(event.target.value)}
-                    className={`h-8 w-full rounded border ${gitMenuThemeClasses.divider} ${gitMenuThemeClasses.inputBg} px-2 text-[12px] text-[#e4e4e7] outline-none focus:border-[var(--accent)]`}
-                    placeholder={gitCopy.commitPlaceholder}
+                    className={`h-8 w-full rounded border ${gitMenuThemeClasses.divider} ${gitMenuThemeClasses.inputBg} px-2 text-[12px] ${gitMenuThemeClasses.lineText} outline-none focus:border-[var(--accent)]`}
+                    placeholder={gitCopy.autoCommitPlaceholder || gitCopy.commitPlaceholder}
                   />
                   <div className="flex items-center justify-end gap-2">
-                    <button type="button" onClick={() => setGitActionMode(null)} className={`rounded px-2 py-1 text-[11px] ${gitMenuThemeClasses.mutedText} ${gitMenuThemeClasses.hover}`}>{gitCopy.cancel}</button>
-                    <button disabled={gitActionBusy} className="rounded bg-[var(--accent)] px-2 py-1 text-[11px] font-semibold text-white disabled:opacity-50">{gitCopy.confirm}</button>
+                    <button type="button" onClick={() => setGitActionMode(null)} className={gitMenuInlineButtonClass}>{gitCopy.cancel}</button>
+                    <button disabled={gitActionBusy || generatingCommitMessage} className={`${gitMenuInlineButtonClass} is-active font-semibold`}>
+                      {generatingCommitMessage ? gitCopy.generatingCommit : gitCopy.confirm}
+                    </button>
                   </div>
                 </form>
               )}
@@ -1025,7 +1084,7 @@ export default function Sidebar({
                 type="button"
                 disabled={gitOperationsDisabled}
                 onClick={handleGitPush}
-                className={`flex w-full items-center gap-2 rounded px-2 py-2 text-left text-[13px] transition-colors ${gitMenuThemeClasses.hover} disabled:cursor-not-allowed disabled:opacity-45`}
+                className={gitMenuActionButtonClass}
               >
                 <IconGitPush className="h-4 w-4" />
                 {gitCopy.push}
@@ -1038,7 +1097,7 @@ export default function Sidebar({
                   setGitActionMode((mode) => mode === "branch" ? null : "branch");
                   setGitFeedback(null);
                 }}
-                className={`flex w-full items-center gap-2 rounded px-2 py-2 text-left text-[13px] transition-colors ${gitMenuThemeClasses.hover} disabled:cursor-not-allowed disabled:opacity-45`}
+                className={`${gitMenuActionButtonClass} ${gitActionMode === "branch" ? "is-active" : ""}`}
               >
                 <IconGitBranch className="h-4 w-4" />
                 {gitCopy.createBranch}
@@ -1049,20 +1108,19 @@ export default function Sidebar({
                     autoFocus
                     value={gitBranchName}
                     onChange={(event) => setGitBranchName(event.target.value)}
-                    className={`h-8 w-full rounded border ${gitMenuThemeClasses.divider} ${gitMenuThemeClasses.inputBg} px-2 text-[12px] text-[#e4e4e7] outline-none focus:border-[var(--accent)]`}
+                    className={`h-8 w-full rounded border ${gitMenuThemeClasses.divider} ${gitMenuThemeClasses.inputBg} px-2 text-[12px] ${gitMenuThemeClasses.lineText} outline-none focus:border-[var(--accent)]`}
                     placeholder={gitCopy.branchPlaceholder}
                   />
                   <div className="flex items-center justify-end gap-2">
-                    <button type="button" onClick={() => setGitActionMode(null)} className={`rounded px-2 py-1 text-[11px] ${gitMenuThemeClasses.mutedText} ${gitMenuThemeClasses.hover}`}>{gitCopy.cancel}</button>
-                    <button disabled={gitActionBusy} className="rounded bg-[var(--accent)] px-2 py-1 text-[11px] font-semibold text-white disabled:opacity-50">{gitCopy.confirm}</button>
+                    <button type="button" onClick={() => setGitActionMode(null)} className={gitMenuInlineButtonClass}>{gitCopy.cancel}</button>
+                    <button disabled={gitActionBusy} className={`${gitMenuInlineButtonClass} is-active font-semibold`}>{gitCopy.confirm}</button>
                   </div>
                 </form>
               )}
             </div>
           </div>
         </div>
-        );
-      })()}
+      ), document.body)}
 
       <div
         onMouseDown={onStartResizing}

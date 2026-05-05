@@ -85,3 +85,17 @@ test("shell tool schemas require execution descriptions and expose cwd metadata"
   assert.ok(runCommand.function.parameters.properties.workdir);
   assert.ok(executeCommand.function.parameters.properties.cwd);
 });
+
+test("read_file schema exposes line-window parameters and does not promise full-file reads", () => {
+  const tools = buildToolDefinitions([]);
+  const readFile = tools.find((tool) => tool.function.name === "read_file");
+
+  assert.ok(readFile);
+  assert.match(readFile.function.description, /内容窗口/);
+  assert.match(readFile.function.description, /truncated/);
+  assert.doesNotMatch(readFile.function.description, /^读取文件完整内容$/);
+  assert.ok(readFile.function.parameters.properties.start_line);
+  assert.ok(readFile.function.parameters.properties.end_line);
+  assert.ok(readFile.function.parameters.properties.max_lines);
+  assert.deepEqual(readFile.function.parameters.required, ["path"]);
+});

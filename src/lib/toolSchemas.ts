@@ -140,11 +140,14 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     type: "function",
     function: {
       name: "read_file",
-      description: "读取文件完整内容",
+      description: "读取源码、Markdown、JSON、纯文本等文件的内容窗口。大文件不会伪装成完整内容，会返回 truncated、totalLines、totalChars、returnedLines、nextStartLine 等元数据；需要后续内容时继续用 start_line/end_line/max_lines 读取指定行区间。遇到 TypeScript/测试报错行号时，优先读取报错行附近窗口，不要全量读取大文件，也不要用 run_command 分段分页读文件。",
       parameters: {
         type: "object",
         properties: {
           path: { type: "string", description: "文件路径" },
+          start_line: { type: "number", description: "可选，1-based 起始行号。适合读取报错行附近或继续读取 nextStartLine。" },
+          end_line: { type: "number", description: "可选，1-based 结束行号。可与 start_line 搭配读取精确范围。" },
+          max_lines: { type: "number", description: "可选，最多返回多少行。大文件默认只返回安全窗口；继续读取时通常传 nextStartLine 和 max_lines。" },
         },
         required: ["path"],
       },

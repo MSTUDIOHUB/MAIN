@@ -8,7 +8,11 @@ const PRIVATE_REPO = "MSTUDIOHUB/MAIN";
 const RELEASE_REPO = "MSTUDIOHUB/MAIN-Releases";
 const WORKFLOW_FILE = "build-desktop.yml";
 const WORKFLOW_REF = "main";
-const SECRET_NAME = "PUBLIC_RELEASES_TOKEN";
+const REQUIRED_SECRET_NAMES = [
+  "PUBLIC_RELEASES_TOKEN",
+  "TAURI_SIGNING_PRIVATE_KEY",
+  "TAURI_SIGNING_PRIVATE_KEY_PASSWORD",
+];
 
 function printHelp() {
   console.log(`Usage:
@@ -32,6 +36,7 @@ Options:
 Notes:
   - The version is required and must not start with "v".
   - Default behavior publishes directly to ${RELEASE_REPO}.
+  - The workflow requires PUBLIC_RELEASES_TOKEN and Tauri updater signing secrets in ${PRIVATE_REPO}.
 `);
 }
 
@@ -188,12 +193,16 @@ function ensureSecretExists() {
     `Cannot list Actions secrets for ${PRIVATE_REPO}`,
   );
 
-  const hasSecret = result.stdout
-    .split("\n")
-    .some((line) => line.split(/\s+/)[0] === SECRET_NAME);
+  const secretNames = new Set(
+    result.stdout
+      .split("\n")
+      .map((line) => line.split(/\s+/)[0])
+      .filter(Boolean),
+  );
 
-  if (!hasSecret) {
-    fail(`Missing Actions secret ${SECRET_NAME} in ${PRIVATE_REPO}.`);
+  const missingSecrets = REQUIRED_SECRET_NAMES.filter((secretName) => !secretNames.has(secretName));
+  if (missingSecrets.length > 0) {
+    fail(`Missing Actions secrets in ${PRIVATE_REPO}: ${missingSecrets.join(", ")}.`);
   }
 }
 

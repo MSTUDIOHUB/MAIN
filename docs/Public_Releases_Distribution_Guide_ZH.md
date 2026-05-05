@@ -58,9 +58,16 @@
 - `MAIN_<version>_macOS_universal.zip`
 - `MAIN_<version>_macOS_apple_silicon.zip`
 - `MAIN_<version>_windows_x64.zip`
+- `MAIN_<version>_updater_darwin_x86_64.app.tar.gz`
+- `MAIN_<version>_updater_darwin_aarch64.app.tar.gz`
+- `MAIN_<version>_updater_windows_x86_64.exe`
+- 对应的 `.sig` 签名文件
+- `latest.json`
 
 不会上传 `src/`、`src-tauri/`、`dist/`、`target/` 这类源码或构建目录。
 Release Changelog 会自动写入私有 `MAIN` 仓库触发构建时的最后一次提交摘要、提交正文和变更文件列表，但不会公开源码 diff。
+
+其中前三个 zip 是给用户手动下载的安装包；`updater_*`、`.sig` 和 `latest.json` 是 Tauri 官方 updater 自动更新使用的安全更新产物。`latest.json` 会公开，但它只包含版本号、更新说明、下载 URL 和签名，不包含源码。
 
 ### 最快发布命令
 
@@ -70,7 +77,7 @@ Release Changelog 会自动写入私有 `MAIN` 仓库触发构建时的最后一
 npm run release:desktop -- 1.4.2
 ```
 
-这条命令会检查 GitHub CLI 登录、公开下载仓库、`PUBLIC_RELEASES_TOKEN`、当前工作区是否干净、当前 `HEAD` 是否已经推送到 `origin/main`，然后触发 GitHub Actions 构建 macOS + Windows zip，并直接公开发布到 `MAIN-Releases`。
+这条命令会检查 GitHub CLI 登录、公开下载仓库、`PUBLIC_RELEASES_TOKEN`、Tauri updater 签名 Secrets、当前工作区是否干净、当前 `HEAD` 是否已经推送到 `origin/main`，然后触发 GitHub Actions 构建 macOS + Windows zip 和自动更新包，并直接公开发布到 `MAIN-Releases`。
 
 常用参数：
 
@@ -126,6 +133,22 @@ Value: 上一步复制的 GitHub token
 
 不要把这个 token 写进代码、README、workflow 明文里。
 
+#### 4. 配置 Tauri updater 签名密钥
+
+自动更新必须使用 Tauri updater 的签名校验。私钥只放在私有 `MAIN` 仓库的 Actions Secrets，不放进代码仓库。
+
+当前需要这两个 Secrets：
+
+```text
+Name: TAURI_SIGNING_PRIVATE_KEY
+Value: Tauri updater 私钥内容
+
+Name: TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+Value: 生成私钥时设置的密码
+```
+
+公开仓库里只会出现 `.sig` 签名文件和 `latest.json`。应用内置的是 updater 公钥，用户端会用它校验更新包；如果 Release 附件被篡改，签名校验会失败，MAIN 不会安装该更新。
+
 ### 每次发布
 
 1. 打开私有 `MAIN` 仓库的 `Actions`
@@ -145,6 +168,14 @@ https://github.com/MSTUDIOHUB/MAIN-Releases/releases/tag/v1.4.1
 ```
 
 如果 `draft = true`，需要到 `MAIN-Releases > Releases` 页面手动点 `Publish release`。
+
+自动更新入口固定为：
+
+```text
+https://github.com/MSTUDIOHUB/MAIN-Releases/releases/latest/download/latest.json
+```
+
+用户已经安装的 MAIN 会在启动后自动检查这个文件；有新版本时，Sidebar 顶部 Logo 行右侧会出现“更新 / Update”按钮。
 
 ### 用户下载入口
 

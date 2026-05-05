@@ -45,6 +45,16 @@ export interface GitFileEntry {
   status: string;
 }
 
+export interface GitDiffEntry {
+  path: string;
+  status: string;
+  old: string;
+  new: string;
+  existed: boolean;
+  fullFile: boolean;
+  binary?: boolean;
+}
+
 export interface GitStatus {
   isRepo: boolean;
   gitAvailable: boolean;
@@ -403,6 +413,10 @@ export function getGitStatus(workspace?: string, includeStats?: boolean): Promis
 
 export function getGitFileList(workspace: string, filter?: string): Promise<GitFileEntry[]> {
   return invoke<GitFileEntry[]>("get_git_file_list", { workspace, filter });
+}
+
+export function getGitDiff(workspace: string, path?: string, filter?: string): Promise<GitDiffEntry[]> {
+  return invoke<GitDiffEntry[]>("get_git_diff", { workspace, path, filter });
 }
 
 export function gitCommitAll(workspace: string, message: string): Promise<GitStatus> {

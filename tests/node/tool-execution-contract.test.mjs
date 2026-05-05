@@ -41,6 +41,10 @@ test("shell contract rejects missing description and cwd metadata", () => {
     validateShellToolContract("run_command", { command: "npm test", description: "Run tests" }),
     /cwd/,
   );
+  assert.match(
+    validateShellToolContract("execute_command", { command: "npm test", description: "Run tests" }),
+    /prefer `run_command`/,
+  );
   assert.equal(
     validateShellToolContract("run_command", { command: "npm test", description: "Run tests", cwd: "." }),
     null,

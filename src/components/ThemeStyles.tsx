@@ -60,6 +60,45 @@ export default function ThemeStyles() {
         outline: 2px solid color-mix(in srgb, var(--accent-light) 70%, transparent);
         outline-offset: 2px;
       }
+      .git-menu-theme-button {
+        color: #a1a1aa;
+        background: transparent;
+        border: 1px solid transparent;
+        box-shadow: none;
+      }
+      .git-menu-theme-button:hover:not(:disabled) {
+        color: var(--accent-light);
+        background: color-mix(in srgb, var(--accent) 16%, transparent);
+        border-color: color-mix(in srgb, var(--accent-light) 30%, transparent);
+      }
+      .git-menu-theme-button.is-active {
+        color: var(--accent-light);
+        background: transparent;
+        border-color: color-mix(in srgb, var(--accent-light) 72%, transparent);
+        outline: 1px solid color-mix(in srgb, var(--accent-light) 56%, transparent);
+        outline-offset: -1px;
+        box-shadow: none;
+      }
+      .git-menu-theme-button.is-active:hover:not(:disabled) {
+        color: var(--accent-light);
+        background: color-mix(in srgb, var(--accent) 10%, transparent);
+        border-color: color-mix(in srgb, var(--accent-light) 82%, transparent);
+        outline-color: color-mix(in srgb, var(--accent-light) 70%, transparent);
+      }
+      .git-menu-theme-button:hover:not(:disabled) *,
+      .git-menu-theme-button.is-active * {
+        color: inherit !important;
+      }
+      .git-menu-theme-button:disabled {
+        color: #71717a;
+        background: transparent;
+        border-color: transparent;
+        box-shadow: none;
+      }
+      .git-menu-theme-button:focus-visible {
+        outline: 2px solid color-mix(in srgb, var(--accent-light) 70%, transparent);
+        outline-offset: 2px;
+      }
       .composer-toolbar-pill-button {
         color: #e4e4e7;
         background: transparent;
@@ -95,12 +134,28 @@ export default function ThemeStyles() {
       html[data-theme="light"] .panel-tab-icon-button {
         color: #52525b;
       }
+      html[data-theme="light"] .git-menu-theme-button {
+        color: #52525b;
+      }
       html[data-theme="light"] .panel-tab-icon-button:hover:not(:disabled) {
         color: color-mix(in srgb, var(--accent-hover), #111827 24%);
         background: color-mix(in srgb, var(--accent) 14%, #ffffff 86%);
         border-color: color-mix(in srgb, var(--accent) 28%, #ffffff 72%);
       }
+      html[data-theme="light"] .git-menu-theme-button:hover:not(:disabled) {
+        color: color-mix(in srgb, var(--accent-hover), #111827 24%);
+        background: color-mix(in srgb, var(--accent) 14%, #ffffff 86%);
+        border-color: color-mix(in srgb, var(--accent) 28%, #ffffff 72%);
+      }
       html[data-theme="light"] .panel-tab-icon-button.is-active {
+        color: color-mix(in srgb, var(--accent-hover), #111827 22%);
+        background: transparent;
+        border-color: color-mix(in srgb, var(--accent-hover) 62%, #ffffff 38%);
+        outline: 1px solid color-mix(in srgb, var(--accent-hover) 50%, #ffffff 50%);
+        outline-offset: -1px;
+        box-shadow: none;
+      }
+      html[data-theme="light"] .git-menu-theme-button.is-active {
         color: color-mix(in srgb, var(--accent-hover), #111827 22%);
         background: transparent;
         border-color: color-mix(in srgb, var(--accent-hover) 62%, #ffffff 38%);
@@ -114,7 +169,16 @@ export default function ThemeStyles() {
         border-color: color-mix(in srgb, var(--accent-hover) 72%, #ffffff 28%);
         outline-color: color-mix(in srgb, var(--accent-hover) 62%, #ffffff 38%);
       }
+      html[data-theme="light"] .git-menu-theme-button.is-active:hover:not(:disabled) {
+        color: color-mix(in srgb, var(--accent-hover), #111827 22%);
+        background: color-mix(in srgb, var(--accent) 10%, #ffffff 90%);
+        border-color: color-mix(in srgb, var(--accent-hover) 72%, #ffffff 28%);
+        outline-color: color-mix(in srgb, var(--accent-hover) 62%, #ffffff 38%);
+      }
       html[data-theme="light"] .panel-tab-icon-button:disabled {
+        color: #a1a1aa;
+      }
+      html[data-theme="light"] .git-menu-theme-button:disabled {
         color: #a1a1aa;
       }
       html[data-theme="light"] .composer-toolbar-pill-button {
@@ -143,16 +207,19 @@ export default function ThemeStyles() {
         background: rgba(15, 23, 42, 0.14);
       }
       html[data-theme="black"] .panel-tab-icon-button,
+      html[data-theme="black"] .git-menu-theme-button,
       html[data-theme="black"] .composer-toolbar-pill-button {
         color: #a5a5ae;
       }
       html[data-theme="black"] .panel-tab-icon-button:hover:not(:disabled),
+      html[data-theme="black"] .git-menu-theme-button:hover:not(:disabled),
       html[data-theme="black"] .composer-toolbar-pill-button:hover:not(:disabled) {
         color: var(--accent-light);
         background: color-mix(in srgb, var(--accent) 12%, #000000 88%);
         border-color: color-mix(in srgb, var(--accent-light) 26%, transparent);
       }
       html[data-theme="black"] .panel-tab-icon-button.is-active,
+      html[data-theme="black"] .git-menu-theme-button.is-active,
       html[data-theme="black"] .composer-toolbar-pill-button.is-active {
         color: var(--accent-light);
         background: rgba(255,255,255,0.02);

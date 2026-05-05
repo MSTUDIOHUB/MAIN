@@ -41,6 +41,8 @@ jobs:
       APPLE_ID: ${{ secrets.APPLE_ID }}
       APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
       APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
     steps:
       - uses: actions/checkout@v6
 
@@ -55,6 +57,21 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Check updater signing secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${TAURI_SIGNING_PRIVATE_KEY}" ]]; then
+            echo "::error::Missing TAURI_SIGNING_PRIVATE_KEY secret. Generate a Tauri updater key and add it to MAIN Actions secrets."
+            exit 1
+          fi
+
+          if [[ -z "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD}" ]]; then
+            echo "::error::Missing TAURI_SIGNING_PRIVATE_KEY_PASSWORD secret. Add the updater key password to MAIN Actions secrets."
+            exit 1
+          fi
 
       - name: Sync release version
         run: npm run release:bump -- "$VERSION"
@@ -109,11 +126,46 @@ jobs:
             "src-tauri/target/aarch64-apple-darwin/release/bundle/macos/${APP_NAME}.app" \
             "${APP_NAME}_${VERSION}_macOS_apple_silicon.zip"
 
-      - name: Upload macOS zip
+      - name: Collect macOS updater artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          create_updater_artifact() {
+            local app_path="$1"
+            local platform_name="$2"
+            local output_name="release-assets/${APP_NAME}_${VERSION}_updater_${platform_name}.app.tar.gz"
+
+            if [[ ! -d "${app_path}" ]]; then
+              echo "::error::Missing macOS app bundle: ${app_path}"
+              exit 1
+            fi
+
+            tar -czf "${output_name}" -C "$(dirname "${app_path}")" "$(basename "${app_path}")"
+            rm -f "${output_name}.sig"
+            npx tauri signer sign "${output_name}"
+
+            if [[ ! -f "${output_name}.sig" ]]; then
+              echo "::error::Failed to sign macOS updater artifact: ${output_name}"
+              exit 1
+            fi
+          }
+
+          create_updater_artifact \
+            "src-tauri/target/universal-apple-darwin/release/bundle/macos/${APP_NAME}.app" \
+            "darwin_x86_64"
+
+          create_updater_artifact \
+            "src-tauri/target/aarch64-apple-darwin/release/bundle/macos/${APP_NAME}.app" \
+            "darwin_aarch64"
+
+          ls -lah release-assets
+
+      - name: Upload macOS assets
         uses: actions/upload-artifact@v7
         with:
-          name: main-macos-zip
-          path: release-assets/*.zip
+          name: main-macos-assets
+          path: release-assets/*
           if-no-files-found: error
           retention-days: 7
 
@@ -122,6 +174,8 @@ jobs:
     runs-on: windows-latest
     env:
       VERSION: ${{ inputs.version }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
     steps:
       - uses: actions/checkout@v6
 
@@ -135,11 +189,27 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Check updater signing secrets
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
+            Write-Error "Missing TAURI_SIGNING_PRIVATE_KEY secret. Generate a Tauri updater key and add it to MAIN Actions secrets."
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD)) {
+            Write-Error "Missing TAURI_SIGNING_PRIVATE_KEY_PASSWORD secret. Add the updater key password to MAIN Actions secrets."
+          }
+
       - name: Sync release version
         run: npm run release:bump -- $env:VERSION
 
       - name: Build Windows portable package
         run: npm run build:windows:portable
+
+      - name: Build Windows updater installer
+        run: npm run tauri build -- --bundles nsis
 
       - name: Zip Windows portable package
         shell: pwsh
@@ -156,11 +226,38 @@ jobs:
           New-Item -ItemType Directory -Force -Path "release-assets" | Out-Null
           Compress-Archive -Path $exePath -DestinationPath $zipPath -Force
 
-      - name: Upload Windows zip
+      - name: Collect Windows updater artifacts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $nsisDir = "src-tauri\target\release\bundle\nsis"
+          $artifact = Get-ChildItem -Path $nsisDir -Recurse -File -Filter "*.exe" |
+            Where-Object { $_.Name -notlike "*.sig" } |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+
+          if ($null -eq $artifact) {
+            Get-ChildItem -Path $nsisDir -Recurse -File | ForEach-Object { Write-Host $_.FullName }
+            throw "Missing Windows updater NSIS artifact under $nsisDir"
+          }
+
+          $outputPath = "release-assets\${env:APP_NAME}_${env:VERSION}_updater_windows_x86_64.exe"
+          Copy-Item $artifact.FullName $outputPath -Force
+          Remove-Item "$outputPath.sig" -Force -ErrorAction SilentlyContinue
+          npx tauri signer sign $outputPath
+
+          if (!(Test-Path "$outputPath.sig")) {
+            throw "Failed to sign Windows updater artifact: $outputPath"
+          }
+
+          Get-ChildItem release-assets | Format-Table Name, Length
+
+      - name: Upload Windows assets
         uses: actions/upload-artifact@v7
         with:
-          name: main-windows-zip
-          path: release-assets/*.zip
+          name: main-windows-assets
+          path: release-assets/*
           if-no-files-found: error
           retention-days: 7
 
@@ -179,10 +276,10 @@ jobs:
         with:
           fetch-depth: 2
 
-      - name: Download release zips
+      - name: Download release assets
         uses: actions/download-artifact@v8
         with:
-          pattern: main-*-zip
+          pattern: main-*-assets
           path: release-assets
           merge-multiple: true
 
@@ -240,6 +337,67 @@ jobs:
 
           ls -lah release-assets
 
+      - name: Generate updater manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import urllib.parse
+          from datetime import datetime, timezone
+
+          app_name = os.environ["APP_NAME"]
+          version = os.environ["VERSION"]
+          release_repo = os.environ["RELEASE_REPO"]
+          tag = f"v{version}"
+          assets_dir = pathlib.Path("release-assets")
+          base_url = f"https://github.com/{release_repo}/releases/download/{tag}"
+
+          def asset_url(file_name):
+              return f"{base_url}/{urllib.parse.quote(file_name)}"
+
+          def platform_entry(file_name):
+              asset_path = assets_dir / file_name
+              signature_path = assets_dir / f"{file_name}.sig"
+              if not asset_path.is_file():
+                  raise SystemExit(f"Missing updater asset: {asset_path}")
+              if not signature_path.is_file():
+                  raise SystemExit(f"Missing updater signature: {signature_path}")
+              return {
+                  "signature": signature_path.read_text(encoding="utf-8").strip(),
+                  "url": asset_url(file_name),
+              }
+
+          darwin_x86_64 = platform_entry(f"{app_name}_{version}_updater_darwin_x86_64.app.tar.gz")
+          darwin_aarch64 = platform_entry(f"{app_name}_{version}_updater_darwin_aarch64.app.tar.gz")
+          windows_x86_64 = platform_entry(f"{app_name}_{version}_updater_windows_x86_64.exe")
+
+          manifest = {
+              "version": version,
+              "notes": (assets_dir / "release-notes.md").read_text(encoding="utf-8"),
+              "pub_date": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+              "platforms": {
+                  "darwin-x86_64": darwin_x86_64,
+                  "darwin-x86_64-app": darwin_x86_64,
+                  "darwin-aarch64": darwin_aarch64,
+                  "darwin-aarch64-app": darwin_aarch64,
+                  "windows-x86_64": windows_x86_64,
+                  "windows-x86_64-nsis": windows_x86_64,
+              },
+          }
+
+          (assets_dir / "latest.json").write_text(
+              json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+          python3 -m json.tool release-assets/latest.json >/dev/null
+          ls -lah release-assets/latest.json
+
       - name: Publish to public GitHub Releases repo
         shell: bash
         run: |
@@ -275,11 +433,15 @@ jobs:
 
             gh release upload "$tag" \
               release-assets/*.zip \
+              release-assets/*_updater_* \
+              release-assets/latest.json \
               --repo "$RELEASE_REPO" \
               --clobber
           else
             gh release create "$tag" \
               release-assets/*.zip \
+              release-assets/*_updater_* \
+              release-assets/latest.json \
               --repo "$RELEASE_REPO" \
               --title "${APP_NAME} ${VERSION}" \
               --notes-file release-assets/release-notes.md \

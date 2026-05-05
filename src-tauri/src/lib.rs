@@ -301,6 +301,24 @@ struct GitFileEntry {
     status: String,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitDiffEntry {
+    path: String,
+    status: String,
+    old: String,
+    new: String,
+    existed: bool,
+    full_file: bool,
+    binary: bool,
+}
+
+struct GitPorcelainEntry {
+    path: String,
+    original_path: Option<String>,
+    status: String,
+}
+
 #[derive(Default)]
 struct GitBranchInfo {
     branch: Option<String>,
@@ -1576,6 +1594,74 @@ fn parse_git_numstat(output: &str) -> GitNumstatCounts {
     counts
 }
 
+fn parse_git_porcelain_entries(output: &str, filter: Option<&str>) -> Vec<GitPorcelainEntry> {
+    let filter_type = filter.unwrap_or("");
+    let mut entries = Vec::new();
+
+    for line in output.lines() {
+        if line.len() < 3 {
+            continue;
+        }
+
+        let status_chars = line.chars().take(2).collect::<String>();
+        let path_part = line[2..].trim_start();
+        let (original_path, display_path) = if let Some(arrow_pos) = path_part.find(" -> ") {
+            (
+                Some(path_part[..arrow_pos].trim().to_string()),
+                path_part[arrow_pos + 4..].trim().to_string(),
+            )
+        } else {
+            (None, path_part.to_string())
+        };
+
+        let primary_status = if status_chars.starts_with('R') {
+            "R"
+        } else if status_chars.starts_with('A') {
+            "A"
+        } else if status_chars.starts_with('D') {
+            "D"
+        } else if status_chars.starts_with('?') {
+            "U"
+        } else if status_chars.starts_with('M') || status_chars.starts_with('C') {
+            "M"
+        } else {
+            "M"
+        };
+
+        match filter_type {
+            "changed" | "modified" => {
+                if primary_status != "M" && primary_status != "R" {
+                    continue;
+                }
+            }
+            "added" => {
+                if primary_status != "A" && primary_status != "U" {
+                    continue;
+                }
+            }
+            "deleted" => {
+                if primary_status != "D" {
+                    continue;
+                }
+            }
+            "untracked" => {
+                if primary_status != "U" {
+                    continue;
+                }
+            }
+            _ => {}
+        }
+
+        entries.push(GitPorcelainEntry {
+            path: display_path,
+            original_path,
+            status: primary_status.to_string(),
+        });
+    }
+
+    entries
+}
+
 fn is_valid_git_branch_name(branch: &str) -> bool {
     let trimmed = branch.trim();
     if trimmed.is_empty() || trimmed != branch || trimmed == "HEAD" || trimmed.starts_with('-') {
@@ -1728,75 +1814,118 @@ fn get_git_file_list(
         return Ok(Vec::new());
     }
 
-    let filter_type = filter.as_deref().unwrap_or("");
-    let mut entries: Vec<GitFileEntry> = Vec::new();
     let max_entries = 100;
+    Ok(parse_git_porcelain_entries(&status_output.stdout, filter.as_deref())
+        .into_iter()
+        .take(max_entries)
+        .map(|entry| GitFileEntry {
+            path: entry.path,
+            status: entry.status,
+        })
+        .collect())
+}
 
-    for line in status_output.stdout.lines() {
-        if entries.len() >= max_entries {
-            break;
+fn read_git_head_file(repo_root: &Path, path: &str, timeout: Duration) -> Result<String, String> {
+    let spec = format!("HEAD:{path}");
+    let output = run_git_process(repo_root, &["show", &spec], timeout)?;
+    if !output.success {
+        return Err(git_failure_message(&output));
+    }
+    Ok(output.stdout)
+}
+
+fn read_worktree_text_file(repo_root: &Path, path: &str) -> Result<String, String> {
+    let full_path = repo_root.join(path);
+    let bytes = fs::read(&full_path).map_err(|e| format!("读取文件失败: {e}"))?;
+    String::from_utf8(bytes).map_err(|_| "binary_or_non_utf8".to_string())
+}
+
+fn build_git_diff_entry(
+    repo_root: &Path,
+    entry: GitPorcelainEntry,
+    has_head: bool,
+    timeout: Duration,
+) -> GitDiffEntry {
+    let head_path = entry.original_path.as_deref().unwrap_or(&entry.path);
+    let mut old_text = String::new();
+    let mut new_text = String::new();
+    let mut existed = false;
+    let mut binary = false;
+
+    if has_head && entry.status != "A" && entry.status != "U" {
+        match read_git_head_file(repo_root, head_path, timeout) {
+            Ok(text) => {
+                old_text = text;
+                existed = true;
+            }
+            Err(_) => {
+                binary = true;
+            }
         }
-
-        // porcelain=v1 format: "XY PATH" or "XY PATH -> RENAMED_PATH"
-        // XY = status codes, e.g., "M " (modified, unstaged), " M" (modified, staged)
-        // "A " = added, "D " = deleted, "R " = renamed, "?? " = untracked
-        let status_chars = line.chars().take(2).collect::<String>();
-        let path_part = line[2..].trim_start();
-
-        // Handle renamed files: "R  old -> new"
-        let display_path = if let Some(arrow_pos) = path_part.find(" -> ") {
-            path_part[arrow_pos + 4..].trim().to_string()
-        } else {
-            path_part.to_string()
-        };
-
-        // Determine the primary status type
-        let primary_status = if status_chars.starts_with('R') {
-            "R"
-        } else if status_chars.starts_with('A') {
-            "A"
-        } else if status_chars.starts_with('D') {
-            "D"
-        } else if status_chars.starts_with('?') {
-            "U"
-        } else if status_chars.starts_with('M') || status_chars.starts_with('C') {
-            "M"
-        } else {
-            "M"
-        };
-
-        // Apply filter
-        match filter_type {
-            "changed" | "modified" => {
-                if primary_status != "M" && primary_status != "R" {
-                    continue;
-                }
-            }
-            "added" => {
-                if primary_status != "A" {
-                    continue;
-                }
-            }
-            "deleted" => {
-                if primary_status != "D" {
-                    continue;
-                }
-            }
-            "untracked" => {
-                if primary_status != "U" {
-                    continue;
-                }
-            }
-            _ => {} // no filter
-        }
-
-        entries.push(GitFileEntry {
-            path: display_path,
-            status: primary_status.to_string(),
-        });
     }
 
-    Ok(entries)
+    if entry.status != "D" {
+        match read_worktree_text_file(repo_root, &entry.path) {
+            Ok(text) => {
+                new_text = text;
+            }
+            Err(_) => {
+                binary = true;
+            }
+        }
+    }
+
+    if binary {
+        old_text.clear();
+        new_text.clear();
+    }
+
+    GitDiffEntry {
+        path: entry.path,
+        status: entry.status,
+        old: old_text,
+        new: new_text,
+        existed,
+        full_file: true,
+        binary,
+    }
+}
+
+#[tauri::command]
+fn get_git_diff(
+    state: State<WorkspaceState>,
+    workspace: Option<String>,
+    path: Option<String>,
+    filter: Option<String>,
+) -> Result<Vec<GitDiffEntry>, String> {
+    let workspace = resolve_workspace_root(&state, workspace)?;
+    let timeout = Duration::from_millis(10_000);
+    let repo = match run_git_process(&workspace, &["rev-parse", "--show-toplevel"], timeout) {
+        Ok(output) if output.success => output.stdout.trim().to_string(),
+        Ok(_) => return Ok(Vec::new()),
+        Err(_) => return Ok(Vec::new()),
+    };
+    let repo_root = PathBuf::from(repo.trim());
+    let status_output = run_git_process(&repo_root, &["status", "--porcelain=v1"], timeout)?;
+    if !status_output.success {
+        return Ok(Vec::new());
+    }
+    let requested_path = path.map(|value| value.replace('\\', "/"));
+    let has_head = run_git_process(&repo_root, &["rev-parse", "--verify", "HEAD"], timeout)
+        .map(|output| output.success)
+        .unwrap_or(false);
+
+    Ok(parse_git_porcelain_entries(&status_output.stdout, filter.as_deref())
+        .into_iter()
+        .filter(|entry| {
+            requested_path
+                .as_ref()
+                .map(|path| entry.path == *path || entry.original_path.as_deref() == Some(path.as_str()))
+                .unwrap_or(true)
+        })
+        .take(100)
+        .map(|entry| build_git_diff_entry(&repo_root, entry, has_head, timeout))
+        .collect())
 }
 
 #[tauri::command]
@@ -4985,6 +5114,8 @@ pub fn run() {
         .manage(FeishuAdapterManager::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .invoke_handler(tauri::generate_handler![
             get_workspace_root,
             set_workspace_root,
@@ -5009,6 +5140,7 @@ pub fn run() {
             run_command,
             get_git_status,
             get_git_file_list,
+            get_git_diff,
             git_commit_all,
             git_push_current_branch,
             git_create_branch,
@@ -5065,6 +5197,7 @@ mod tests {
         is_valid_git_branch_name,
         parse_git_branch_line,
         parse_git_numstat,
+        parse_git_porcelain_entries,
         parse_git_porcelain_status,
         resolve_existing_path,
         resolve_write_path,
@@ -5220,6 +5353,33 @@ mod tests {
 
         assert_eq!(counts.insertions, 13);
         assert_eq!(counts.deletions, 2);
+    }
+
+    #[test]
+    fn parse_git_porcelain_entries_filters_status_groups() {
+        let output = [
+            " M src/modified.ts",
+            "A  src/added.ts",
+            "D  src/deleted.ts",
+            "R  src/old.ts -> src/new.ts",
+            "?? notes.md",
+        ]
+        .join("\n");
+
+        let changed = parse_git_porcelain_entries(&output, Some("changed"));
+        assert_eq!(changed.len(), 2);
+        assert_eq!(changed[0].path, "src/modified.ts");
+        assert_eq!(changed[1].path, "src/new.ts");
+        assert_eq!(changed[1].original_path.as_deref(), Some("src/old.ts"));
+
+        let added = parse_git_porcelain_entries(&output, Some("added"));
+        assert_eq!(added.len(), 2);
+        assert_eq!(added[0].status, "A");
+        assert_eq!(added[1].status, "U");
+
+        let deleted = parse_git_porcelain_entries(&output, Some("deleted"));
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].path, "src/deleted.ts");
     }
 
     #[test]
