@@ -42,6 +42,33 @@ export interface ContextTrimResult {
   displaySummary?: string;
 }
 
+export type ContextTokenSource =
+  | "system"
+  | "user"
+  | "assistantVisible"
+  | "assistantToolCalls"
+  | "toolResult"
+  | "compressionMarker"
+  | "multimodal"
+  | "toolSchema"
+  | "thoughtUi";
+
+export interface ContextTokenBreakdown {
+  system: number;
+  user: number;
+  assistantVisible: number;
+  assistantToolCalls: number;
+  toolResult: number;
+  compressionMarker: number;
+  multimodal: number;
+  toolSchema: number;
+  thoughtUi: number;
+  total: number;
+  topSource: ContextTokenSource;
+  topSourceTokens: number;
+  topSourceLabel: string;
+}
+
 interface CompressionSummaryOptions {
   maxItems: number;
   maxCharsPerItem: number;
@@ -89,6 +116,82 @@ function estimateMessageTokens(msg: TrimMessage): number {
 
 export function estimateMessagesTokens(messages: TrimMessage[]): number {
   return messages.reduce((total, msg) => total + estimateMessageTokens(msg), 0);
+}
+
+const TOKEN_SOURCE_LABELS: Record<ContextTokenSource, string> = {
+  system: "system prompt",
+  user: "user/context messages",
+  assistantVisible: "assistant visible replies",
+  assistantToolCalls: "assistant tool calls",
+  toolResult: "tool results",
+  compressionMarker: "compression memory",
+  multimodal: "images/multimodal parts",
+  toolSchema: "tool schema reserve",
+  thoughtUi: "thought UI only",
+};
+
+function estimateTextAndImageTokens(content: string | TrimContentPart[]): { text: number; image: number } {
+  if (typeof content === "string") return { text: estimateTokens(content), image: 0 };
+  let text = 0;
+  let image = 0;
+  for (const part of content) {
+    if (part.type === "text") {
+      text += estimateTokens(part.text);
+    } else if (part.type === "image_url") {
+      image += 1000;
+    }
+  }
+  return { text, image };
+}
+
+export function computeContextTokenBreakdown(messages: TrimMessage[]): ContextTokenBreakdown {
+  const breakdown: Record<ContextTokenSource, number> = {
+    system: 0,
+    user: 0,
+    assistantVisible: 0,
+    assistantToolCalls: 0,
+    toolResult: 0,
+    compressionMarker: 0,
+    multimodal: 0,
+    toolSchema: 0,
+    thoughtUi: 0,
+  };
+
+  for (const message of messages) {
+    const { text, image } = estimateTextAndImageTokens(message.content);
+    const overhead = 10;
+    breakdown.multimodal += image;
+
+    if (message.role === "system") {
+      breakdown.system += text + overhead;
+    } else if (message.role === "tool") {
+      breakdown.toolResult += text + overhead;
+    } else if (message.role === "assistant") {
+      breakdown.assistantVisible += text + overhead;
+      if (message.tool_calls && Array.isArray(message.tool_calls)) {
+        breakdown.assistantToolCalls += estimateTokens(JSON.stringify(message.tool_calls));
+      }
+    } else if (isContextCompressionMarker(message)) {
+      breakdown.compressionMarker += text + overhead;
+    } else {
+      breakdown.user += text + overhead;
+    }
+  }
+
+  const entries = Object.entries(breakdown) as Array<[ContextTokenSource, number]>;
+  const [topSource, topSourceTokens] = entries.reduce(
+    (best, current) => current[1] > best[1] ? current : best,
+    ["user", 0] as [ContextTokenSource, number],
+  );
+  const total = entries.reduce((sum, [, tokens]) => sum + tokens, 0);
+
+  return {
+    ...breakdown,
+    total,
+    topSource,
+    topSourceTokens,
+    topSourceLabel: TOKEN_SOURCE_LABELS[topSource],
+  };
 }
 
 export function computeContextBudgets(
@@ -151,6 +254,7 @@ function isContextCompressionMarker(message: TrimMessage): boolean {
   if (message.role !== "user" || typeof message.content !== "string") return false;
   const text = message.content.trim();
   return (
+    text.startsWith("[System: ContextState") ||
     text.startsWith("[System: 较早对话已压缩。") ||
     (text.startsWith("[System:") && text.includes("Earlier context has been summarized"))
   );
@@ -164,9 +268,11 @@ function extractContextCompressionSummary(message: TrimMessage): string | undefi
     .split("\n")
     .map((line) => line.trim())
     .filter(Boolean)
+    .filter((line) => line !== "ContextState")
     .filter((line) => line !== "较早对话已压缩。")
     .filter((line) => line !== "Earlier context has been summarized — you have all essential information to continue.")
-    .filter((line) => line !== "请只把这些内容当作历史参考，优先依据当前最新消息继续。");
+    .filter((line) => line !== "请只把这些内容当作历史参考，优先依据当前最新消息继续。")
+    .filter((line) => !/^Use this as compact historical state only/i.test(line));
 
   if (lines.length === 0) return undefined;
   return lines.join(" ");
@@ -185,29 +291,208 @@ function compactTextLine(text: string, maxChars: number): string {
   return `${normalized.slice(0, maxChars).trim()}…`;
 }
 
-function summarizeDroppedMessage(message: TrimMessage): string | null {
-  const text = compactTextLine(messageContentToText(message.content), 220);
-  if (!text) return null;
-
-  if (message.role === "tool") {
-    return `工具结果：${text}`;
+function stableHash(input: string): string {
+  let hash = 2166136261;
+  for (let index = 0; index < input.length; index += 1) {
+    hash ^= input.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
   }
+  return (hash >>> 0).toString(36);
+}
 
-  if (message.role === "assistant") {
-    if (message.tool_calls && message.tool_calls.length > 0) {
-      const toolNames = message.tool_calls
-        .map((toolCall) => {
-          const candidate = toolCall as { function?: { name?: unknown } };
-          return typeof candidate.function?.name === "string" ? candidate.function.name : "tool_call";
-        })
-        .slice(0, 4)
-        .join("、");
-      return `助手调用工具：${toolNames || "tool_call"}`;
+function normalizeStateLine(text: string): string {
+  return String(text || "")
+    .toLowerCase()
+    .replace(/[，。！？；：,.!?;:、"'“”‘’`*_~\-\s]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function pushUnique(lines: string[], value: string | null | undefined, maxItems: number, maxChars: number): void {
+  const compacted = compactTextLine(String(value || ""), maxChars);
+  if (!compacted) return;
+  const key = normalizeStateLine(compacted);
+  if (!key || lines.some((line) => normalizeStateLine(line) === key)) return;
+  if (lines.length < maxItems) lines.push(compacted);
+}
+
+function parseJsonObject(text: unknown): Record<string, unknown> {
+  if (!text || typeof text !== "string") return {};
+  try {
+    const parsed = JSON.parse(text);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function readRecordString(record: Record<string, unknown>, keys: string[]): string {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return "";
+}
+
+interface ToolCallSummary {
+  id: string;
+  name: string;
+  args: Record<string, unknown>;
+}
+
+function extractToolCallSummary(toolCall: unknown): ToolCallSummary | null {
+  const candidate = toolCall as {
+    id?: unknown;
+    name?: unknown;
+    arguments?: unknown;
+    function?: { name?: unknown; arguments?: unknown };
+  };
+  const id = typeof candidate.id === "string" ? candidate.id : "";
+  const name =
+    typeof candidate.function?.name === "string"
+      ? candidate.function.name
+      : typeof candidate.name === "string"
+      ? candidate.name
+      : "";
+  const rawArgs =
+    typeof candidate.function?.arguments === "string"
+      ? candidate.function.arguments
+      : typeof candidate.arguments === "string"
+      ? candidate.arguments
+      : "";
+  if (!id && !name) return null;
+  return { id, name: name || "tool_call", args: parseJsonObject(rawArgs) };
+}
+
+function buildToolCallLookup(messages: TrimMessage[]): Map<string, ToolCallSummary> {
+  const lookup = new Map<string, ToolCallSummary>();
+  for (const message of messages) {
+    if (!message.tool_calls || !Array.isArray(message.tool_calls)) continue;
+    for (const toolCall of message.tool_calls) {
+      const summary = extractToolCallSummary(toolCall);
+      if (!summary || !summary.id) continue;
+      lookup.set(summary.id, summary);
     }
-    return `助手回复：${text}`;
+  }
+  return lookup;
+}
+
+function stripReasoningAndMarkup(text: string): string {
+  return String(text || "")
+    .replace(/<(?:analysis|thought|thinking|reasoning)(?:\s[^>]*)?>[\s\S]*?<\/(?:analysis|thought|thinking|reasoning)>/gi, " ")
+    .replace(/<\/?(?:analysis|thought|thinking|reasoning|tool_use|tool_call|function_call|tool|parameter|tool_response)(?:\s[^>]*)?>/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function splitUsefulSentences(text: string): string[] {
+  const source = stripReasoningAndMarkup(text);
+  return (source.match(/[^。！？.!?\n]+[。！？.!?]?/g) || [source])
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
+function isSystemContinuationNoise(text: string): boolean {
+  const trimmed = text.trim();
+  return trimmed.startsWith("[System:") ||
+    /^PLAN_[A-Z_]+:/i.test(trimmed) ||
+    /^RecoveryDetails:/i.test(trimmed) ||
+    /^Repeated read-only tool call skipped:/i.test(trimmed);
+}
+
+function extractConstraintCandidates(text: string): string[] {
+  return splitUsefulSentences(text).filter((sentence) =>
+    /(?:必须|不要|不能|禁止|只(?:能|保存)|保留|避免|优先|假设|约束|must|never|do not|don't|only|preserve|avoid|assumption|constraint|requirement)/i.test(sentence)
+  );
+}
+
+function extractDecisionCandidates(text: string): string[] {
+  return splitUsefulSentences(text).filter((sentence) =>
+    /(?:批准|确认|选择|决定|方案|执行|approved|confirmed|selected|decided|plan approved|execute)/i.test(sentence)
+  );
+}
+
+function extractCheckboxTasks(text: string): { total: number; completed: number; next: string[] } {
+  const matches = Array.from(String(text || "").matchAll(/^\s*[-*]\s+\[([ xX-])\]\s+(.+)$/gm));
+  let completed = 0;
+  const next: string[] = [];
+  for (const match of matches) {
+    const status = match[1] || " ";
+    const taskText = compactTextLine(match[2] || "", 180);
+    if (/x/i.test(status)) {
+      completed += 1;
+    } else if (next.length < 4) {
+      next.push(taskText);
+    }
+  }
+  return { total: matches.length, completed, next };
+}
+
+function extractRecoveryDetails(text: string): { failure?: string; next?: string } {
+  if (!/RecoveryDetails:|Detected a repetition loop/i.test(text)) return {};
+  const duplicateTool = text.match(/duplicateTool:\s*([^\n]+)/i)?.[1]?.trim();
+  const target = text.match(/target:\s*([^\n]+)/i)?.[1]?.trim();
+  const duplicateCount = text.match(/duplicateCount:\s*([^\n]+)/i)?.[1]?.trim();
+  const suggestedNextTask = text.match(/suggestedNextTask:\s*([^\n]+)/i)?.[1]?.trim();
+  const failure = [
+    duplicateTool ? `duplicateTool=${duplicateTool}` : "",
+    target ? `target=${target}` : "",
+    duplicateCount ? `duplicateCount=${duplicateCount}` : "",
+  ].filter(Boolean).join(", ");
+  return {
+    failure: failure ? `repeat loop: ${failure}` : compactTextLine(text, 180),
+    next: suggestedNextTask,
+  };
+}
+
+function summarizeToolResult(message: TrimMessage, lookup: Map<string, ToolCallSummary>): string | null {
+  if (message.role !== "tool" || typeof message.content !== "string") return null;
+  const tool = message.tool_call_id ? lookup.get(message.tool_call_id) : undefined;
+  const name = tool?.name || "tool";
+  const args = tool?.args || {};
+  const target = readRecordString(args, ["path", "target", "file", "cwd", "workspace"]) ||
+    readRecordString(args, ["command", "cmd", "query", "pattern"]);
+  const content = message.content;
+  const contentHash = stableHash(content).slice(0, 8);
+  const baseTarget = target ? ` ${compactTextLine(target, 120)}` : "";
+
+  if (/read_file|get_file_outline|grep_search|glob_search|list_directory/i.test(name)) {
+    return `${name}${baseTarget} (${content.length.toLocaleString()} chars, hash ${contentHash})`;
   }
 
-  return `用户请求：${text}`;
+  if (/write_file|replace_in_file|delete_workspace_path/i.test(name)) {
+    const noOp = /"noOp"\s*:\s*true|No file change|matched the current file/i.test(content);
+    const status = /error|failed|rejected/i.test(content) ? "failed" : noOp ? "no-op" : "changed";
+    return `${name}${baseTarget} (${status}, result hash ${contentHash})`;
+  }
+
+  if (/execute_command|run_command|send_pty_input|read_pty_tail|read_pty_since|get_pty_status/i.test(name)) {
+    const exitCode = content.match(/(?:exitCode|exit code|code)\D+(-?\d+)/i)?.[1];
+    const command = readRecordString(args, ["command", "cmd"]);
+    return `${name}${command ? ` ${compactTextLine(command, 120)}` : baseTarget}${exitCode ? ` (exit ${exitCode})` : ` (${content.length.toLocaleString()} chars, hash ${contentHash})`}`;
+  }
+
+  return `${name}${baseTarget} (${content.length.toLocaleString()} chars, hash ${contentHash})`;
+}
+
+function extractCarriedStateLines(carriedSummaries: string[], maxItems: number, maxChars: number): string[] {
+  const lines: string[] = [];
+  for (const summary of carriedSummaries) {
+    const cleaned = String(summary || "")
+      .replace(/^\[?System:\s*/i, "")
+      .replace(/^ContextState[^\n]*\n?/i, "")
+      .replace(/请只把这些内容当作历史参考[\s\S]*$/i, "")
+      .replace(/Use this as compact historical state only[\s\S]*$/i, "");
+    for (const line of cleaned.split(/\r?\n/)) {
+      const trimmed = line.replace(/^\s*[-*]\s*/, "").trim();
+      if (!trimmed) continue;
+      if (/^(Dropped|Token pressure|已压缩|单条长内容压缩|另有)/i.test(trimmed)) continue;
+      pushUnique(lines, trimmed, maxItems, maxChars);
+    }
+  }
+  return lines;
 }
 
 function buildCompactSummary(
@@ -215,24 +500,70 @@ function buildCompactSummary(
   carriedSummaries: string[],
   options: CompressionSummaryOptions,
 ): string | undefined {
-  const carriedItems = carriedSummaries.map((summary) => `更早历史摘要：${compactTextLine(summary, options.maxCharsPerItem)}`);
+  const sourceMessages = droppedMessages.filter((message) => !isContextCompressionMarker(message));
+  const lookup = buildToolCallLookup(sourceMessages);
+  const goals: string[] = [];
+  const constraints: string[] = [];
+  const decisions: string[] = [];
+  const tasks: string[] = [];
+  const evidence: string[] = [];
+  const failures: string[] = [];
+  const nextSteps: string[] = [];
+  const carryover = extractCarriedStateLines(carriedSummaries, Math.min(3, options.maxItems), options.maxCharsPerItem);
+  let taskTotal = 0;
+  let taskCompleted = 0;
 
-  const summaries = droppedMessages
-    .map(summarizeDroppedMessage)
-    .filter((summary): summary is string => Boolean(summary));
+  for (const message of sourceMessages) {
+    const text = messageContentToText(message.content);
+    if (!text.trim()) continue;
 
-  const combined = [...carriedItems, ...summaries];
-  if (combined.length === 0) {
-    return `已移除 ${droppedMessages.length} 条较早消息，以保留最近上下文。`;
+    const recovery = extractRecoveryDetails(text);
+    pushUnique(failures, recovery.failure, Math.min(4, options.maxItems), options.maxCharsPerItem);
+    pushUnique(nextSteps, recovery.next, Math.min(4, options.maxItems), options.maxCharsPerItem);
+
+    const taskSnapshot = extractCheckboxTasks(text);
+    if (taskSnapshot.total > taskTotal) {
+      taskTotal = taskSnapshot.total;
+      taskCompleted = taskSnapshot.completed;
+      tasks.length = 0;
+      taskSnapshot.next.forEach((task) => pushUnique(tasks, task, Math.min(4, options.maxItems), options.maxCharsPerItem));
+    }
+
+    if (message.role === "user" && !isSystemContinuationNoise(text)) {
+      pushUnique(goals, text, Math.min(3, options.maxItems), options.maxCharsPerItem);
+      extractConstraintCandidates(text).forEach((item) => pushUnique(constraints, item, Math.min(5, options.maxItems), options.maxCharsPerItem));
+      extractDecisionCandidates(text).forEach((item) => pushUnique(decisions, item, Math.min(4, options.maxItems), options.maxCharsPerItem));
+    } else if (message.role === "assistant") {
+      if (message.tool_calls && message.tool_calls.length > 0 && !stripReasoningAndMarkup(text)) continue;
+      extractDecisionCandidates(text).forEach((item) => pushUnique(decisions, item, Math.min(4, options.maxItems), options.maxCharsPerItem));
+      extractConstraintCandidates(text).forEach((item) => pushUnique(constraints, item, Math.min(5, options.maxItems), options.maxCharsPerItem));
+    } else if (message.role === "tool") {
+      pushUnique(evidence, summarizeToolResult(message, lookup), Math.min(8, options.maxItems + 2), options.maxCharsPerItem);
+      if (/error|failed|rejected|Detected a repetition loop/i.test(text)) {
+        pushUnique(failures, text, Math.min(4, options.maxItems), options.maxCharsPerItem);
+      }
+    }
   }
 
-  const selected = combined.slice(-options.maxItems);
-  const omitted = combined.length - selected.length;
-  return [
-    `已压缩 ${droppedMessages.length} 条较早消息，保留最近 ${selected.length} 条关键信息：`,
-    ...selected.map((summary) => `- ${summary}`),
-    ...(omitted > 0 ? [`- 另有 ${omitted} 条更早消息已省略。`] : []),
-  ].join("\n");
+  const lines = [
+    `ContextState: compressed ${droppedMessages.length} older message(s) into state-first memory; recent messages remain verbatim.`,
+  ];
+  if (goals.length) lines.push(`- Goal: ${goals.slice(-2).join(" | ")}`);
+  if (constraints.length) lines.push(`- Constraints: ${constraints.join(" | ")}`);
+  if (decisions.length) lines.push(`- Decisions: ${decisions.join(" | ")}`);
+  if (taskTotal > 0) {
+    lines.push(`- Plan tasks: ${taskCompleted}/${taskTotal} completed${tasks.length ? `; next ${tasks.join(" | ")}` : ""}`);
+  } else if (tasks.length) {
+    lines.push(`- Plan tasks: ${tasks.join(" | ")}`);
+  }
+  if (evidence.length) lines.push(`- Evidence: ${evidence.join(" | ")}`);
+  if (failures.length) lines.push(`- Recent failures/blockers: ${failures.join(" | ")}`);
+  if (nextSteps.length) lines.push(`- Next: ${nextSteps.join(" | ")}`);
+  if (carryover.length) lines.push(`- Earlier state carried forward: ${carryover.join(" | ")}`);
+  if (lines.length === 1) {
+    lines.push("- Preserved: no durable goal/evidence was found in the removed span; continue from the latest visible messages.");
+  }
+  return lines.join("\n");
 }
 
 function buildMicroCompactSummary(before: TrimMessage[], after: TrimMessage[], maxItems = 6): string[] {
@@ -247,11 +578,10 @@ function buildMicroCompactSummary(before: TrimMessage[], after: TrimMessage[], m
 
     const omittedMatch = compacted.content.match(/\.\.\.\[compact: (\d+) chars omitted\]/);
     const omittedChars = omittedMatch?.[1] ?? "部分";
-    const snippet = compactTextLine(original.content, 120);
     if (original.role === "tool") {
-      summaries.push(`工具结果已截断：${snippet}（省略 ${omittedChars} 字符）`);
+      summaries.push(`Tool result compacted: original ${original.content.length.toLocaleString()} chars, omitted ${omittedChars} chars.`);
     } else if (original.role === "assistant") {
-      summaries.push(`较长助手回复已截断：${snippet}（省略 ${omittedChars} 字符）`);
+      summaries.push(`Assistant reply compacted: original ${original.content.length.toLocaleString()} chars, omitted ${omittedChars} chars.`);
     }
   }
 
@@ -262,12 +592,23 @@ function buildMicroCompactSummary(before: TrimMessage[], after: TrimMessage[], m
   ];
 }
 
-function joinCompressionSummaries(microSummaries: string[], trimSummary?: string): string | undefined {
+function formatTokenPressureSummary(breakdown: ContextTokenBreakdown): string {
+  if (breakdown.total <= 0) return "";
+  return `Token pressure: ${breakdown.topSourceLabel} ~${breakdown.topSourceTokens.toLocaleString()} tokens (largest source).`;
+}
+
+function joinCompressionSummaries(
+  microSummaries: string[],
+  trimSummary?: string,
+  tokenBreakdown?: ContextTokenBreakdown,
+): string | undefined {
   const sections: string[] = [];
   if (trimSummary) sections.push(trimSummary);
+  const pressureSummary = tokenBreakdown ? formatTokenPressureSummary(tokenBreakdown) : "";
+  if (pressureSummary) sections.push(pressureSummary);
   if (microSummaries.length > 0) {
     sections.push([
-      "单条长内容压缩：",
+      "Single-message compaction:",
       ...microSummaries.map((summary) => `- ${summary}`),
     ].join("\n"));
   }
@@ -376,27 +717,60 @@ export function trimMessagesToContextDetailed(
     kept.unshift(rest[i]);
   }
 
-  const keptSet = new Set(kept);
-  const droppedMessages = rest.filter((message) => !keptSet.has(message));
-  const removedCount = originalRest.length - kept.length;
-  const markerSummary = buildCompactSummary(droppedMessages, carriedSummaries, { maxItems: 4, maxCharsPerItem: 110 });
-  const displaySummary = buildCompactSummary(droppedMessages, carriedSummaries, { maxItems: 8, maxCharsPerItem: 220 });
+  let keptForResult = [...kept];
+  let keptSet = new Set(keptForResult);
+  let droppedMessages = rest.filter((message) => !keptSet.has(message));
+  let markerSummary = buildCompactSummary(droppedMessages, carriedSummaries, { maxItems: 4, maxCharsPerItem: 110 });
+  let displaySummary = buildCompactSummary(droppedMessages, carriedSummaries, { maxItems: 8, maxCharsPerItem: 220 });
+  let compactMarker: TrimMessage | null = markerSummary
+    ? {
+        role: "user",
+        content: `[System: ContextState\n${markerSummary}\nUse this as compact historical state only; prioritize the latest messages and current workspace evidence.]`,
+      }
+    : null;
+  let markerTokens = compactMarker ? estimateMessageTokens(compactMarker) : 0;
 
-  // Insert a compact summary marker for dropped messages.
-  if (markerSummary) {
-    const compactMarker: TrimMessage = {
-      role: "user",
-      content: `[System: 较早对话已压缩。\n${markerSummary}\n请只把这些内容当作历史参考，优先依据当前最新消息继续。]`,
-    };
-    const markerTokens = estimateMessageTokens(compactMarker);
-
-    if (markerTokens < remaining) {
-      result.push(compactMarker);
-      remaining -= markerTokens;
+  // Prefer keeping a compact state marker over one more older raw message; the
+  // marker is what lets future turns recover goals, constraints, and evidence.
+  while (compactMarker && markerTokens >= remaining && keptForResult.length > 0) {
+    const removed = keptForResult.shift();
+    if (!removed) break;
+    remaining += estimateMessageTokens(removed);
+    if (removed.role === "assistant" && removed.tool_calls && Array.isArray(removed.tool_calls)) {
+      const removedToolCallIds = new Set(
+        (removed.tool_calls as Array<{ id?: string }>).map((toolCall) => toolCall.id).filter(Boolean),
+      );
+      while (
+        keptForResult.length > 0 &&
+        keptForResult[0]?.role === "tool" &&
+        keptForResult[0]?.tool_call_id &&
+        removedToolCallIds.has(keptForResult[0].tool_call_id)
+      ) {
+        const orphanedToolResult = keptForResult.shift();
+        if (!orphanedToolResult) break;
+        remaining += estimateMessageTokens(orphanedToolResult);
+      }
     }
+    keptSet = new Set(keptForResult);
+    droppedMessages = rest.filter((message) => !keptSet.has(message));
+    markerSummary = buildCompactSummary(droppedMessages, carriedSummaries, { maxItems: 4, maxCharsPerItem: 110 });
+    displaySummary = buildCompactSummary(droppedMessages, carriedSummaries, { maxItems: 8, maxCharsPerItem: 220 });
+    compactMarker = markerSummary
+      ? {
+          role: "user",
+          content: `[System: ContextState\n${markerSummary}\nUse this as compact historical state only; prioritize the latest messages and current workspace evidence.]`,
+        }
+      : null;
+    markerTokens = compactMarker ? estimateMessageTokens(compactMarker) : 0;
   }
 
-  result.push(...kept);
+  if (compactMarker && markerTokens < remaining) {
+    result.push(compactMarker);
+    remaining -= markerTokens;
+  }
+
+  result.push(...keptForResult);
+  const removedCount = originalRest.length - keptForResult.length;
 
   const totalInputTokens = inputBudget - remaining;
   if (removedCount > 0) {
@@ -477,6 +851,8 @@ export interface ManageContextResult {
   tokenCountBefore: number;
   tokenCountAfter: number;
   tokenReduction: number;
+  tokenBreakdownBefore: ContextTokenBreakdown;
+  tokenBreakdownAfter: ContextTokenBreakdown;
   budgets: ContextBudgets;
   compressedContext?: string;
 }
@@ -498,6 +874,7 @@ export function manageContext(
 ): ManageContextResult {
   const budgets = computeContextBudgets(contextLimit, reservedForOutput);
   const tokenCountBefore = estimateMessagesTokens(messages);
+  const tokenBreakdownBefore = computeContextTokenBreakdown(messages);
   const shouldManage = forceManage || tokenCountBefore > budgets.proactiveTriggerBudget;
 
   if (!shouldManage) {
@@ -508,6 +885,8 @@ export function manageContext(
       tokenCountBefore,
       tokenCountAfter: tokenCountBefore,
       tokenReduction: 0,
+      tokenBreakdownBefore,
+      tokenBreakdownAfter: tokenBreakdownBefore,
       budgets,
     };
   }
@@ -533,6 +912,7 @@ export function manageContext(
 
   const actualDropped = trimResult.removedCount;
   const tokenCountAfter = estimateMessagesTokens(trimmed);
+  const tokenBreakdownAfter = computeContextTokenBreakdown(trimmed);
 
   return {
     messages: trimmed,
@@ -541,7 +921,9 @@ export function manageContext(
     tokenCountBefore,
     tokenCountAfter,
     tokenReduction: Math.max(0, tokenCountBefore - tokenCountAfter),
+    tokenBreakdownBefore,
+    tokenBreakdownAfter,
     budgets,
-    compressedContext: joinCompressionSummaries(microSummaries, trimResult.displaySummary),
+    compressedContext: joinCompressionSummaries(microSummaries, trimResult.displaySummary, tokenBreakdownBefore),
   };
 }

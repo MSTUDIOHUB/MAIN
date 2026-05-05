@@ -59,7 +59,9 @@ function loadTranspiledModuleSync(sourcePath) {
 
 const {
   getIntentPolicy,
+  inferCommandDirective,
   looksLikePreviousTurnContinuationInput,
+  looksLikeExistingPlanExecutionRequest,
   mapResolvedRunIntentToWorkflowMode,
   parseMainDebugShortcut,
   parseMainIntentShortcut,
@@ -121,6 +123,9 @@ test("Git commit and push requests resolve to execute", () => {
   ]) {
     const result = resolveTurnRunIntent(input, createContext());
     assert.equal(result.intent, "execute", input);
+    assert.equal(result.commandDirective.kind, "git", input);
+    assert.equal(result.commandDirective.action, "commit_push", input);
+    assert.equal(result.requiresApproval, true, input);
     assert.equal(result.needsDecision, undefined, input);
   }
 });
@@ -128,6 +133,8 @@ test("Git commit and push requests resolve to execute", () => {
 test("Git status inspection resolves to execute for shell access", () => {
   const result = resolveTurnRunIntent("先帮我查看 Git 状态和变更内容", createContext());
   assert.equal(result.intent, "execute");
+  assert.equal(result.commandDirective.kind, "git");
+  assert.equal(result.commandDirective.action, "diff");
   assert.equal(result.needsDecision, undefined);
 });
 
@@ -139,8 +146,21 @@ test("deployment and server sync requests resolve to execute", () => {
   ]) {
     const result = resolveTurnRunIntent(input, createContext());
     assert.equal(result.intent, "execute", input);
+    assert.equal(result.commandDirective.kind, "shell", input);
+    assert.equal(result.commandDirective.requiresApproval, true, input);
     assert.equal(result.needsDecision, undefined, input);
   }
+});
+
+test("existing .MAIN/plans execution request resolves to approved plan resume", () => {
+  const input = "根据.MAIN/plans文件夹的内容，完成执行方案和任务的内容。";
+  const result = resolveTurnRunIntent(input, createContext());
+
+  assert.equal(looksLikeExistingPlanExecutionRequest(input), true);
+  assert.equal(result.intent, "plan");
+  assert.equal(result.controlAction, "resume_plan_execution");
+  assert.equal(result.commandDirective.kind, "plan_resume");
+  assert.equal(result.needsDecision, undefined);
 });
 
 test("design based implementation request approves an existing plan", () => {
@@ -154,6 +174,8 @@ test("design based implementation request approves an existing plan", () => {
   );
   assert.equal(result.intent, "plan");
   assert.equal(result.controlAction, "approve_plan");
+  assert.equal(result.commandDirective.kind, "plan_approval");
+  assert.equal(result.commandDirective.requiresApproval, false);
   assert.equal(result.needsDecision, undefined);
 });
 
@@ -169,6 +191,22 @@ test("approved plan resume keeps the conversation intent as plan", () => {
 
   assert.equal(result.intent, "plan");
   assert.equal(result.controlAction, "resume_plan_execution");
+  assert.equal(result.commandDirective.kind, "plan_resume");
+});
+
+test("command directive inference keeps Unity, reports, and file changes as second-level metadata", () => {
+  assert.deepEqual(
+    {
+      unity: inferCommandDirective("把 Unity 的 YAML/引用搜索做成 MCP 工具", "plan").kind,
+      report: inferCommandDirective("请整理成分析报告", "report").kind,
+      file: inferCommandDirective("直接修改标题同步逻辑", "execute").kind,
+    },
+    {
+      unity: "unity",
+      report: "report",
+      file: "file_modify",
+    },
+  );
 });
 
 test("complex multi-file generation routes to plan before execution", () => {

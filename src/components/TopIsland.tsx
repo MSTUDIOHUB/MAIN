@@ -2,7 +2,7 @@ import { memo, useEffect, useMemo, useRef, useState, type FormEvent } from "reac
 import { IconChevronDown, IconChevronUp, IconColumns, IconFileText, IconLock, IconUnlock } from "./Icons";
 import type { TurnProgressItem } from "../lib/turnProgress";
 import { buildPlanTaskEvidenceAudit, type PlanExecutionEvidenceEntry, type PlanStage, type PlanTask, type ReplyOption } from "../lib/workflowModels";
-import type { PendingRunDecision, ResolvedUserIntent } from "../lib/runIntent";
+import type { PendingRunDecision, PendingRunDecisionChoice } from "../lib/runIntent";
 import MarkdownRenderer from "./MarkdownRenderer";
 
 // region: TopIsland 属性定义
@@ -26,7 +26,7 @@ interface TopIslandProps {
   autoApproveTools?: boolean;
   onSelectReplyOption?: (option: ReplyOption) => void;
   onCancelTurn?: () => void;
-  onResolvePendingRunDecision?: (choice: ResolvedUserIntent | "approve_once" | "approve_thread" | "cancel") => void;
+  onResolvePendingRunDecision?: (choice: PendingRunDecisionChoice | "approve_once" | "approve_thread" | "cancel") => void;
   onDismissPendingRunDecision?: () => void;
   onApprovePlan: () => void;
   onRejectPlan: () => void;
@@ -213,7 +213,6 @@ const TopIsland = memo(function TopIsland({
       ? `共 ${progressItems.length} 个任务，已完成 ${completedCount} 个`
       : `${completedCount}/${progressItems.length} tasks completed`,
     executionStage: language === "zh" ? "执行步骤" : "Execution",
-    currentTask: language === "zh" ? "当前" : "Current",
   }), [activeProgressMode, completedCount, language, progressItems.length]);
 
   const isBlackTheme = themeMode === "black";
@@ -482,6 +481,7 @@ const TopIsland = memo(function TopIsland({
                     return (
                       <div
                         key={task.id}
+                        data-testid={isCurrentPlanTask ? "top-island-current-plan-task" : undefined}
                         className={`flex items-start gap-3 rounded-xl px-3 py-2 ${
                           isCurrentPlanTask
                             ? "border border-[rgba(96,165,250,0.24)] bg-[rgba(37,99,235,0.14)]"
@@ -511,11 +511,6 @@ const TopIsland = memo(function TopIsland({
                             <div className="min-w-0 flex-1 [&_.markdown-body]:text-[12px] [&_.markdown-body]:leading-6 [&_.markdown-body_p]:mb-0 [&_.markdown-body_p]:text-inherit [&_.markdown-body_strong]:text-inherit [&_.markdown-body_code]:align-baseline">
                               <MarkdownRenderer content={task.text} baseFontSize={12} />
                             </div>
-                            {isCurrentPlanTask && (
-                              <span className={`mt-1 shrink-0 rounded-full border border-[rgba(96,165,250,0.25)] bg-[rgba(96,165,250,0.12)] px-2 py-0.5 text-[10px] ${secondaryText}`}>
-                                {copy.currentTask}
-                              </span>
-                            )}
                           </div>
                         </div>
                       </div>

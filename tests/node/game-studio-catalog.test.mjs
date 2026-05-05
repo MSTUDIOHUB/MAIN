@@ -29,6 +29,7 @@ async function loadCatalogModule() {
 const {
   resolveLegacyNexusModeKey,
   parseGameStudioSlashCommand,
+  parseSetupEngineArgs,
   buildGameStudioUserEnvelope,
   buildWorkflowCommandCatalog,
   buildAgentCatalog,
@@ -69,6 +70,20 @@ test("slash parsing normalizes workflow aliases and specialist commands", () => 
   });
 });
 
+test("setup-engine args parse explicit Unity metadata", () => {
+  assert.deepEqual(parseSetupEngineArgs("unity 6.0"), {
+    mode: "configure",
+    engine: "unity",
+    version: "6.0",
+    raw: "unity 6.0",
+  });
+  assert.deepEqual(parseSetupEngineArgs(""), {
+    mode: "guided",
+    engine: null,
+    raw: "",
+  });
+});
+
 test("game studio user envelope includes protocol entry and selected agent", () => {
   const envelope = buildGameStudioUserEnvelope({
     originalText: "Help me define the first milestone.",
@@ -88,6 +103,26 @@ test("game studio user envelope includes protocol entry and selected agent", () 
   assert.match(envelope, /commandPath: \.protocols\/game-studio\/commands\/start\.md/);
   assert.match(envelope, /agentPath: \.protocols\/game-studio\/agents\/creative-director\.md/);
   assert.match(envelope, /User request:\nHelp me define the first milestone\./);
+});
+
+test("game studio user envelope includes Unity engine execution metadata", () => {
+  const envelope = buildGameStudioUserEnvelope({
+    originalText: "Implement the player controller.",
+    activeStudioAgent: "unity-specialist",
+    command: null,
+    studioConfig: {
+      engine: "unity",
+      engineLanguage: "C#",
+      engineVersion: "6",
+      reviewMode: "lean",
+      activeStudioAgent: "unity-specialist",
+      packVersion: "test",
+    },
+  });
+
+  assert.match(envelope, /engine: unity/);
+  assert.match(envelope, /engineLanguage: C#/);
+  assert.match(envelope, /unityExecutionContract:/);
 });
 
 test("workflow catalog localizes workflow descriptions and groups by UI language", () => {

@@ -109,6 +109,22 @@ function getPlanProgressPhaseLabel(phase: PlanExecutionProgressPhase, language: 
   }
 }
 
+function getPlanProgressStatusText(phase: PlanExecutionProgressPhase, language: "zh" | "en"): string {
+  if (language === "zh") {
+    if (phase === "auto_resume") return "计划自动恢复中";
+    if (phase === "paused") return "计划已暂停，等待继续执行";
+    if (phase === "completed") return "计划执行已完成";
+    if (phase === "tool_error") return "计划执行遇到工具错误";
+    return "计划继续执行中";
+  }
+
+  if (phase === "auto_resume") return "Plan auto-resume in progress";
+  if (phase === "paused") return "Plan paused, waiting to continue";
+  if (phase === "completed") return "Plan execution completed";
+  if (phase === "tool_error") return "Plan execution hit a tool error";
+  return "Plan execution continuing";
+}
+
 function getPlanProgressNextStep(
   phase: PlanExecutionProgressPhase,
   remainingTask: PlanTask | undefined,
@@ -207,10 +223,8 @@ export function summarizePlanExecutionProgressSnapshot(
   language: "zh" | "en",
 ): string {
   const phaseLabel = getPlanProgressPhaseLabel(snapshot.phase, language);
-  if (language === "zh") {
-    return `${phaseLabel}：当前 ${snapshot.currentTask || "核查任务"}；最近证据 ${snapshot.latestEvidence || "暂无"}；下一步 ${snapshot.nextStep || "继续执行"}。`;
-  }
-  return `${phaseLabel}: current ${snapshot.currentTask || "check task"}; latest evidence ${snapshot.latestEvidence || "none"}; next ${snapshot.nextStep || "continue"}.`;
+  const statusText = getPlanProgressStatusText(snapshot.phase, language);
+  return language === "zh" ? `${phaseLabel}：${statusText}。` : `${phaseLabel}: ${statusText}.`;
 }
 
 export function formatPlanExecutionProgressSnapshot(
@@ -221,20 +235,15 @@ export function formatPlanExecutionProgressSnapshot(
   const turnInfo = snapshot.maxIterations > 0
     ? `${snapshot.iteration}/${snapshot.maxIterations}`
     : String(snapshot.iteration || 0);
+  const statusText = getPlanProgressStatusText(snapshot.phase, language);
   return language === "zh"
     ? [
         `${phaseLabel} · 轮次 ${turnInfo} · 自动恢复 ${snapshot.autoResumeCount}/${PLAN_MAX_AUTO_RESUME_LIMIT}`,
-        `当前任务：${snapshot.currentTask || "核查任务状态"}`,
-        `最近证据：${snapshot.latestEvidence || "暂无项目源码证据"}`,
-        `当前工具：${snapshot.currentTool || "暂无工具调用"}`,
-        `下一步：${snapshot.nextStep || "继续执行剩余任务"}`,
+        statusText,
       ].join("\n")
     : [
         `${phaseLabel} · turn ${turnInfo} · auto-resume ${snapshot.autoResumeCount}/${PLAN_MAX_AUTO_RESUME_LIMIT}`,
-        `Current task: ${snapshot.currentTask || "check task status"}`,
-        `Latest evidence: ${snapshot.latestEvidence || "no project-source evidence yet"}`,
-        `Current tool: ${snapshot.currentTool || "no tool call yet"}`,
-        `Next: ${snapshot.nextStep || "continue remaining tasks"}`,
+        statusText,
       ].join("\n");
 }
 
@@ -310,22 +319,14 @@ export function buildPlanMaxIterationsAutoResumeNotice(
   checkpoint: PlanMaxIterationsCheckpoint,
   language: "zh" | "en",
 ): string {
-  const recentTool = checkpoint.recentToolActivity.length > 0
-    ? summarizeToolActivity(checkpoint.recentToolActivity[checkpoint.recentToolActivity.length - 1])
-    : language === "zh" ? "暂无工具结果" : "no tool result yet";
-
   return language === "zh"
     ? [
         `计划执行达到 ${checkpoint.maxIterations} 轮安全边界，MAIN 已保存检查点并自动开启 1 次恢复上下文。`,
-        `当前任务：${checkpoint.currentTask}`,
-        `最近工具：${recentTool}`,
-        "恢复时会重新读取当前 workspace 状态；`.MAIN/plans` 只作为内部计划状态，不会被当作用户源码证据。",
+        "计划将继续执行；恢复上下文会重新读取当前 workspace 状态。",
       ].join("\n")
     : [
         `Plan execution reached the ${checkpoint.maxIterations}-iteration safety boundary. MAIN saved a checkpoint and will auto-resume once in a fresh context.`,
-        `Current task: ${checkpoint.currentTask}`,
-        `Recent tool: ${recentTool}`,
-        "The recovery turn will reread current workspace state; `.MAIN/plans` is internal plan state, not project-source evidence.",
+        "Plan execution will continue; the recovery context will reread the current workspace state.",
       ].join("\n");
 }
 
@@ -381,6 +382,100 @@ export function buildPlanMaxIterationsPauseNotice(
   ].join("\n");
 }
 
+export function buildExecuteMaxIterationsAutoResumeNotice(
+  checkpoint: PlanMaxIterationsCheckpoint,
+  language: "zh" | "en",
+): string {
+  return language === "zh"
+    ? [
+        `执行达到 ${checkpoint.maxIterations} 轮安全边界，MAIN 已保存恢复点并自动开启 1 次恢复上下文。`,
+        "接下来会先基于当前 workspace 状态收束，避免重复同一批工具操作。",
+      ].join("\n")
+    : [
+        `Execution reached the ${checkpoint.maxIterations}-iteration safety boundary. MAIN saved a recovery checkpoint and will auto-resume once in a fresh context.`,
+        "The recovery context will first reconcile current workspace state to avoid repeating the same tool chain.",
+      ].join("\n");
+}
+
+export function buildExecuteMaxIterationsPauseNotice(
+  checkpoint: PlanMaxIterationsCheckpoint,
+  language: "zh" | "en",
+): string {
+  const toolLines = checkpoint.recentToolActivity.slice(-6).map((activity) => `- ${summarizeToolActivity(activity)}`);
+  const blockerLines = checkpoint.unresolvedBlockers.slice(0, 3).map((line) => `- ${line}`);
+
+  if (language === "zh") {
+    return [
+      `执行已暂停：本轮达到 ${checkpoint.iterationCount}/${checkpoint.maxIterations} 轮安全边界。`,
+      "这不是工具权限或模式切换失败；MAIN 已保留当前 workspace、工具结果和恢复点，避免继续进入无限工具循环。",
+      "",
+      "RecoveryDetails:",
+      `- reason: ${checkpoint.reason}`,
+      `- autoResumeCount: ${checkpoint.autoResumeCount}/${PLAN_MAX_AUTO_RESUME_LIMIT}`,
+      checkpoint.lastAssistantText ? `- lastAssistantText: ${checkpoint.lastAssistantText}` : "",
+      "- recentToolActivity:",
+      ...(toolLines.length ? toolLines : ["- 无"]),
+      "- blockers:",
+      ...(blockerLines.length ? blockerLines : ["- 命中执行安全轮次上限"]),
+      "",
+      "下一步：点击或发送 Resume Execution / 继续执行，MAIN 会开启新的恢复上下文，先核查当前状态，再只执行最小必要的后续工具调用。",
+    ].filter(Boolean).join("\n");
+  }
+
+  return [
+    `Execution paused after reaching the ${checkpoint.iterationCount}/${checkpoint.maxIterations}-iteration safety boundary.`,
+    "This is not a tool permission or mode-switch failure. MAIN preserved the workspace state, tool results, and a recovery checkpoint to avoid an infinite tool loop.",
+    "",
+    "RecoveryDetails:",
+    `- reason: ${checkpoint.reason}`,
+    `- autoResumeCount: ${checkpoint.autoResumeCount}/${PLAN_MAX_AUTO_RESUME_LIMIT}`,
+    checkpoint.lastAssistantText ? `- lastAssistantText: ${checkpoint.lastAssistantText}` : "",
+    "- recentToolActivity:",
+    ...(toolLines.length ? toolLines : ["- none"]),
+    "- blockers:",
+    ...(blockerLines.length ? blockerLines : ["- Hit the execution iteration safety limit"]),
+    "",
+    "Next: click or send Resume Execution so MAIN starts a fresh recovery context, checks current state first, and runs only the minimum necessary next tool call.",
+  ].filter(Boolean).join("\n");
+}
+
+export function buildExecuteMaxIterationsResumePrompt(input: {
+  language: "zh" | "en";
+  checkpoint: PlanMaxIterationsCheckpoint;
+}): string {
+  const toolText = input.checkpoint.recentToolActivity.slice(-8)
+    .map((activity) => `- ${summarizeToolActivity(activity)}`)
+    .join("\n") || (input.language === "zh" ? "- 暂无工具活动摘要" : "- No recent tool activity summary");
+
+  if (input.language === "zh") {
+    return [
+      "请在新的恢复上下文中继续上一轮执行任务。这是 MAIN 在普通 Execute 25 轮安全边界后的自动恢复，只允许继续真实未完成工作。",
+      "先核查当前 workspace 状态和最近工具结果；如果任务已经完成，直接输出最终总结并停止，不要再调用工具。",
+      "如果仍需工具，只选择一个最小必要的下一步工具调用；不要重复读取或重复执行最近已经有结果的同一批操作。",
+      "",
+      "Checkpoint:",
+      `- iterationBoundary: ${input.checkpoint.iterationCount}/${input.checkpoint.maxIterations}`,
+      input.checkpoint.lastAssistantText ? `- lastAssistantText: ${input.checkpoint.lastAssistantText}` : "",
+      "",
+      "最近工具活动：",
+      toolText,
+    ].filter(Boolean).join("\n");
+  }
+
+  return [
+    "Continue the previous execute task in a fresh recovery context. This is MAIN's automatic recovery after the normal Execute 25-iteration safety boundary; only continue real unfinished work.",
+    "First reconcile current workspace state and recent tool results. If the task is complete, output the final summary and stop without more tools.",
+    "If another tool is still needed, choose exactly one smallest necessary next tool call. Do not repeat the same reads or commands that already have results.",
+    "",
+    "Checkpoint:",
+    `- iterationBoundary: ${input.checkpoint.iterationCount}/${input.checkpoint.maxIterations}`,
+    input.checkpoint.lastAssistantText ? `- lastAssistantText: ${input.checkpoint.lastAssistantText}` : "",
+    "",
+    "Recent tool activity:",
+    toolText,
+  ].filter(Boolean).join("\n");
+}
+
 export function buildPlanMaxIterationsResumePrompt(input: {
   language: "zh" | "en";
   checkpoint: PlanMaxIterationsCheckpoint;
@@ -415,7 +510,7 @@ export function buildPlanMaxIterationsResumePrompt(input: {
       "请在新的恢复上下文中继续执行已批准计划。这是 MAIN 在 50 轮安全边界后的自动恢复，只允许继续真实未完成工作。",
       input.hasTasksArtifact
         ? "先重新读取当前 workspace 状态和 `.MAIN/plans/tasks.md`，从第一个证据未满足的任务继续。"
-        : "先基于已批准的 requirements/design 或 bugfix 重新生成 `.MAIN/plans/tasks.md`，再执行真实任务。",
+        : "先基于已批准的 design.md 或 bugfix.md 重新生成 `.MAIN/plans/tasks.md`；旧 requirements.md 只作为辅助上下文，再执行真实任务。",
       "不要重做已经满足证据的任务；不要只修改 checkbox；不要重复计划说明；不要把 `.MAIN/plans` 当作用户源码证据。需要判断源码现状时，直接读取真实项目文件。",
       "",
       "Checkpoint:",
@@ -441,7 +536,7 @@ export function buildPlanMaxIterationsResumePrompt(input: {
     "Continue the approved plan in a fresh recovery context. This is MAIN's automatic recovery after the 50-iteration safety boundary; only continue real unfinished work.",
     input.hasTasksArtifact
       ? "First reread current workspace state and `.MAIN/plans/tasks.md`, then continue from the first task whose evidence is not satisfied."
-      : "First regenerate `.MAIN/plans/tasks.md` from the approved requirements/design or bugfix, then execute real tasks.",
+      : "First regenerate `.MAIN/plans/tasks.md` from the approved design.md or bugfix.md; use any legacy requirements.md only as supporting context, then execute real tasks.",
     "Do not redo tasks whose evidence is already satisfied. Do not only edit checkboxes. Do not restate the plan. Do not treat `.MAIN/plans` as project-source evidence; read real project files when source state matters.",
     "",
     "Checkpoint:",

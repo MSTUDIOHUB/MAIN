@@ -165,6 +165,8 @@ function ContextCompressionNotice({ block, language }: { block: any; language: "
   const stats = block.contextCompression || {};
   const isReactive = stats.reason === "reactive";
   const isMicroOnly = !isReactive && Number(stats.droppedCount || 0) === 0;
+  const topSourceLabel = String(stats.topTokenSource?.label || "").trim();
+  const topSourceTokens = Number(stats.topTokenSource?.tokens || 0);
   const title = language === "zh"
     ? isReactive ? "背景压缩 · 溢出保护" : isMicroOnly ? "长内容已整理" : "背景已压缩"
     : isReactive ? "Context compressed · overflow guard" : isMicroOnly ? "Long content compacted" : "Context compressed";
@@ -259,6 +261,13 @@ function ContextCompressionNotice({ block, language }: { block: any; language: "
       >
         <span className="font-medium text-[#d4d4d8]" style={{ color: tone.titleText }}>{title}</span>
         <span className="text-[#71717a]" style={{ color: tone.mutedText }}>{formatTokenCount(stats.tokenCountBefore)} → {formatTokenCount(stats.tokenCountAfter)} tokens</span>
+        {topSourceLabel && topSourceTokens > 0 && (
+          <span className="hidden max-w-[220px] truncate text-[#71717a] sm:inline" style={{ color: tone.mutedText }}>
+            {language === "zh"
+              ? `最大来源：${topSourceLabel} ${formatTokenCount(topSourceTokens)}`
+              : `Top source: ${topSourceLabel} ${formatTokenCount(topSourceTokens)}`}
+          </span>
+        )}
         <span className="text-[#93c5fd]" style={{ color: tone.actionText }}>{compactLabel}</span>
       </button>
 
@@ -279,6 +288,11 @@ function ContextCompressionNotice({ block, language }: { block: any; language: "
                   {language === "zh"
                     ? `约 ${formatTokenCount(stats.tokenCountBefore)} → ${formatTokenCount(stats.tokenCountAfter)} tokens，释放 ${formatTokenCount(stats.tokenReduction)}，折叠 ${formatTokenCount(stats.droppedCount)} 条历史消息`
                     : `About ${formatTokenCount(stats.tokenCountBefore)} → ${formatTokenCount(stats.tokenCountAfter)} tokens, saved ${formatTokenCount(stats.tokenReduction)}, folded ${formatTokenCount(stats.droppedCount)} history message(s)`}
+                  {topSourceLabel && topSourceTokens > 0
+                    ? language === "zh"
+                      ? `；最大来源：${topSourceLabel} ${formatTokenCount(topSourceTokens)} tokens`
+                      : `; top source: ${topSourceLabel} ${formatTokenCount(topSourceTokens)} tokens`
+                    : ""}
                 </div>
               </div>
               <button
@@ -368,7 +382,6 @@ function getPlanProgressPhaseLabel(phase: string, language: "zh" | "en") {
 function PlanExecutionLiveCard({
   snapshot,
   language,
-  compact = false,
 }: {
   snapshot: PlanExecutionProgressSnapshot;
   language: "zh" | "en";
@@ -381,12 +394,27 @@ function PlanExecutionLiveCard({
     ? `${snapshot.iteration}/${snapshot.maxIterations}`
     : String(snapshot.iteration || 0);
   const labels = language === "zh"
-    ? { task: "当前任务", evidence: "最近证据", next: "下一步", tool: "当前工具", turn: "轮次", auto: "自动恢复" }
-    : { task: "Current task", evidence: "Latest evidence", next: "Next", tool: "Current tool", turn: "Turn", auto: "Auto-resume" };
-  const sep = language === "zh" ? "：" : ": ";
-  const rowClass = compact
-    ? "grid gap-1 text-[12px] leading-5 text-[#d4d4d8]"
-    : "grid gap-2 text-[12px] leading-5 text-[#d4d4d8] sm:grid-cols-2";
+    ? { turn: "轮次", auto: "自动恢复" }
+    : { turn: "Turn", auto: "Auto-resume" };
+  const statusText = language === "zh"
+    ? snapshot.phase === "auto_resume"
+      ? "计划自动恢复中"
+      : snapshot.phase === "paused"
+      ? "计划已暂停，等待继续执行"
+      : snapshot.phase === "completed"
+      ? "计划执行已完成"
+      : snapshot.phase === "tool_error"
+      ? "计划执行遇到工具错误"
+      : "计划继续执行中"
+    : snapshot.phase === "auto_resume"
+    ? "Plan auto-resume in progress"
+    : snapshot.phase === "paused"
+    ? "Plan paused, waiting to continue"
+    : snapshot.phase === "completed"
+    ? "Plan execution completed"
+    : snapshot.phase === "tool_error"
+    ? "Plan execution hit a tool error"
+    : "Plan execution continuing";
 
   return (
     <div data-testid="plan-execution-live-card" className="ml-9 rounded-2xl border border-[rgba(96,165,250,0.24)] bg-[rgba(37,99,235,0.08)] px-4 py-3">
@@ -401,11 +429,8 @@ function PlanExecutionLiveCard({
           {labels.turn} {iterationText} · {labels.auto} {snapshot.autoResumeCount}/1
         </span>
       </div>
-      <div className={`mt-3 ${rowClass}`}>
-        <div><span className="text-[#93c5fd]">{labels.task}{sep}</span>{snapshot.currentTask || (language === "zh" ? "核查任务状态" : "check task status")}</div>
-        <div><span className="text-[#93c5fd]">{labels.evidence}{sep}</span>{snapshot.latestEvidence || (language === "zh" ? "暂无项目源码证据" : "no project-source evidence yet")}</div>
-        {!compact && <div><span className="text-[#93c5fd]">{labels.tool}{sep}</span>{snapshot.currentTool || (language === "zh" ? "暂无工具调用" : "no tool call yet")}</div>}
-        <div><span className="text-[#93c5fd]">{labels.next}{sep}</span>{snapshot.nextStep || (language === "zh" ? "继续执行剩余任务" : "continue remaining tasks")}</div>
+      <div className="mt-3 text-[12px] leading-5 text-[#d4d4d8]">
+        {statusText}
       </div>
     </div>
   );

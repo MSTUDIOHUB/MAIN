@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import fs from "node:fs/promises";
+import fsSync from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
 
@@ -8,22 +8,56 @@ import ts from "typescript";
 
 const require = createRequire(import.meta.url);
 const workspaceRoot = process.cwd();
+const transpiledModuleCache = new Map();
 
-async function loadToolCapabilitiesModule() {
-  const sourcePath = path.join(workspaceRoot, "src/lib/toolCapabilities.ts");
-  const source = await fs.readFile(sourcePath, "utf8");
+function loadTranspiledModuleSync(sourcePath) {
+  const normalizedPath = path.resolve(sourcePath);
+  if (transpiledModuleCache.has(normalizedPath)) {
+    return transpiledModuleCache.get(normalizedPath);
+  }
+
+  const source = fsSync.readFileSync(normalizedPath, "utf8");
+  const localRequire = createRequire(normalizedPath);
   const transpiled = ts.transpileModule(source, {
     compilerOptions: {
       module: ts.ModuleKind.CommonJS,
       target: ts.ScriptTarget.ES2020,
     },
-    fileName: sourcePath,
+    fileName: normalizedPath,
   }).outputText;
 
   const module = { exports: {} };
+  transpiledModuleCache.set(normalizedPath, module.exports);
+
+  const runtimeRequire = (specifier) => {
+    if (specifier.startsWith(".")) {
+      const basePath = path.resolve(path.dirname(normalizedPath), specifier);
+      const candidates = [
+        basePath,
+        `${basePath}.ts`,
+        `${basePath}.tsx`,
+        path.join(basePath, "index.ts"),
+      ];
+
+      for (const candidate of candidates) {
+        if (!fsSync.existsSync(candidate)) continue;
+        if (candidate.endsWith(".ts") || candidate.endsWith(".tsx")) {
+          return loadTranspiledModuleSync(candidate);
+        }
+      }
+    }
+
+    return localRequire(specifier);
+  };
+
   const factory = new Function("exports", "module", "require", transpiled);
-  factory(module.exports, module, require);
+  factory(module.exports, module, runtimeRequire);
+  transpiledModuleCache.set(normalizedPath, module.exports);
   return module.exports;
+}
+
+async function loadToolCapabilitiesModule() {
+  return loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/toolCapabilities.ts"));
 }
 
 const {
@@ -162,6 +196,22 @@ test("SQL call risk is refined from arguments", () => {
   assert.equal(getToolRiskLevelForCall("postgres_query", { sql: "select * from users" }, registry), "external_read");
   assert.equal(getToolRiskLevelForCall("postgres_query", { sql: "update users set admin = true" }, registry), "external_write");
   assert.equal(getToolRiskLevelForCall("postgres_query", { sql: "drop table users" }, registry), "destructive");
+});
+
+test("dangerous shell command calls are elevated to destructive risk", () => {
+  const registry = buildToolCapabilityRegistry({
+    toolDefinitions: [tool("run_command", "Run shell command")],
+    policy: createDefaultToolPermissionPolicy(),
+  });
+
+  assert.equal(
+    getToolRiskLevelForCall("run_command", { command: "git reset --hard HEAD" }, registry),
+    "destructive",
+  );
+  assert.equal(
+    getToolRiskLevelForCall("run_command", { command: "git status --short" }, registry),
+    "shell",
+  );
 });
 
 test("MCP routing keeps small lists and heuristically selects relevant tools above threshold", () => {

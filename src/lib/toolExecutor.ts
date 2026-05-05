@@ -37,6 +37,7 @@ import {
   classifyMcpToolName,
   isRiskAutoExecutable,
 } from "./toolCapabilities";
+import { applyShellCwd } from "./toolExecutionContract";
 import { formatDirectoryNodesForTool } from "./workspacePaths";
 
 /** Delay helper for waiting on PTY output after a command. */
@@ -194,7 +195,8 @@ export async function executeTool(
     }
 
     case "execute_command": {
-      const command = args.command as string;
+      const command = applyShellCwd((args.command as string) || "", args);
+      if (!command) throw new Error("Missing required parameter 'command'.");
       const waitMs = Math.min(Math.max(parseOptionalNumber(args.wait_ms) ?? 1500, 0), 30_000);
       const maxChars = Math.min(Math.max(parseOptionalNumber(args.max_chars) ?? 8000, 100), 200_000);
       let beforeOffset = 0;
@@ -263,7 +265,7 @@ export async function executeTool(
     }
 
     case "run_command": {
-      const command = (args.command as string) || "";
+      const command = applyShellCwd((args.command as string) || "", args);
       if (!command) throw new Error("Missing required parameter 'command'.");
       return await runCommand(
         command,
@@ -377,7 +379,7 @@ export async function executeTool(
         if (msg.includes("not found") || msg.includes("Unknown")) {
           throw new Error(
             `Skill tool "${name}" is not registered in the backend. ` +
-            `Please ensure the Rust handler for "execute_skill" is implemented.`
+            `MAIN currently exposes Tool Skills as function schemas only; real execution needs a built-in tool, MCP tool, or a Rust "execute_skill" handler.`
           );
         }
         throw new Error(`Skill tool "${name}" execution failed: ${msg}`);

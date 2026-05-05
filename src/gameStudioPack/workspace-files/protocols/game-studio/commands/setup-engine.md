@@ -1,12 +1,17 @@
 ---
 name: setup-engine
-description: "Configure the project's game engine and version. Pins the engine in CLAUDE.md, detects knowledge gaps, and populates engine reference docs via WebSearch when the version is beyond the LLM's training data."
+description: "Configure the project's game engine and version. In MAIN, the runtime source of truth is .MAIN/game-studio/studio.config.json plus Game Studio technical preferences; CLAUDE.md/.claude updates are optional compatibility notes."
 argument-hint: "[engine] | [engine version] | refresh | upgrade [old-version] [new-version] | no args for guided selection"
 user-invocable: true
 allowed-tools: Read, Glob, Grep, Write, Edit, WebSearch, WebFetch, Task, AskUserQuestion
 ---
 
 When this skill is invoked:
+
+MAIN adaptation:
+- If the user explicitly names Unity, Godot, or Unreal, set that engine directly in `.MAIN/game-studio/studio.config.json` before continuing.
+- If the engine is unclear, ask the user to choose before writing engine-specific defaults.
+- For Unity, use `engine=unity`, `engineLanguage=C#`, and route through the Unity specialist. Unity Editor/scene/asset work should use Unity MCP when available; YAML/reference and C# symbol work should use dedicated MAIN/MCP tools when available.
 
 ## 1. Parse Arguments
 

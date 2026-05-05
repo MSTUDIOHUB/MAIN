@@ -1,4 +1,4 @@
-import type { LegacyWorkflowMode, ResolvedRunIntent } from "./runIntent";
+import type { CommandDirective, LegacyWorkflowMode, ResolvedRunIntent } from "./runIntent";
 import {
   resolveConversationTurnIntent,
   resolveRunIntentFromLegacyWorkflowMode,
@@ -153,6 +153,7 @@ export interface ConversationTurn {
   userPrompt: string;
   title: string;
   intentSummary?: string;
+  commandDirective?: CommandDirective | null;
   mode: LegacyWorkflowMode;
   intent?: ResolvedRunIntent;
   status: ConversationTurnStatus;
@@ -624,14 +625,6 @@ function evidenceMatchesRecord(
   if (evidence.kind === "file" || evidence.kind === "deliverable") {
     if (record.kind === "file" || record.kind === "deliverable") {
       return evidencePathMatches(record.value || record.target || "", evidence.value);
-    }
-    if (record.kind === "tool" || record.kind === "cmd") {
-      const candidates = [
-        record.value,
-        record.target || "",
-        ...(record.references || []),
-      ];
-      return candidates.some((candidate) => evidencePathMatches(candidate, evidence.value));
     }
     return false;
   }

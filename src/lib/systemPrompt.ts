@@ -6,12 +6,12 @@
 import type { Skill } from "../store/useAppStore";
 import type { Lang } from "../store/useAppStore";
 import type { ResolvedInstructionSet } from "./instructions";
-import type { PendingSlashCommand, StudioAgentKey } from "./gameStudioCatalog";
+import type { PendingSlashCommand, StudioAgentKey, StudioConfig } from "./gameStudioCatalog";
 import {
   getApplicableProtocolPackagesForWorkspace,
   getProtocolPackageEntryPath,
 } from "./protocolPackages";
-import { getIntentPolicy, resolveRunIntentFromLegacyWorkflowMode, type ResolvedUserIntent } from "./runIntent";
+import { getIntentPolicy, resolveRunIntentFromLegacyWorkflowMode, type CommandDirective, type ResolvedUserIntent } from "./runIntent";
 import { mapLegacyNexusModeToMainMode, type MainModeKey } from "./mainModes";
 import type { PromptLanguageStrategy } from "./toolCapabilities";
 
@@ -38,6 +38,7 @@ export type GameStudioPromptContext = {
   initialized?: boolean;
   activeStudioAgentKey?: StudioAgentKey;
   pendingSlashCommand?: PendingSlashCommand | null;
+  studioConfig?: StudioConfig | null;
 };
 
 const WORKSPACE_IGNORE_DIRS = new Set(["node_modules", ".git", ".svn", ".hg", ".idea", ".vscode", ".vs", "dist", "build", "out", "bin", "obj", "target", "vendor", "__pycache__", ".next", ".nuxt", ".cache", ".turbo", "coverage", ".gradle", ".dart_tool", ".fvm", ".DS_Store"]);
@@ -111,6 +112,7 @@ export function buildSystemPrompt(
   turnIntentOverride?: ResolvedUserIntent,
   promptLanguageStrategy: PromptLanguageStrategy = "english_core_localized_output",
   availableToolNames?: string[],
+  commandDirective?: CommandDirective | null,
 ): string {
   const parts: string[] = [];
   const fallbackLanguageName = uiLanguage === "zh" ? "中文" : "English";
@@ -131,13 +133,17 @@ export function buildSystemPrompt(
     "[CORE TOOL PROTOCOL]",
     `Prompt language strategy: ${promptLanguageStrategy}.`,
     "Tool availability is intent-scoped. Only call tools that are actually exposed in this turn's tool list.",
+    "MAIN may attach second-level command metadata for this turn; use it to choose the concrete tool family, but keep the top-level intent boundary intact.",
     "Native tool calls may be emitted directly; the UI will display tool progress, approvals, diffs, terminal output, and failures.",
     "Do not add placeholder prose solely to announce a native tool call, and do not claim tools are unavailable when they are listed.",
+    "Read-before-modify is mandatory: before changing an existing file, Unity asset, scene, prefab, or generated reference target, inspect the relevant current file/asset/context first.",
+    "If the same tool call fails repeatedly with identical arguments, stop retrying it verbatim; diagnose the latest error and change the parameters, tool, or strategy.",
+    "For complex work with three or more concrete steps, maintain a visible checklist or `.MAIN/plans/tasks.md` when the plan workflow is active; keep only one item in progress at a time.",
     "",
     "[SAFETY AND PERMISSION BOUNDARY]",
     "Read-only and external-read tools may be used without asking for step-by-step consent.",
     "Workspace writes, shell execution, browser control, external writes, and destructive operations are approval-gated by the runtime.",
-    "Plan turns may draft `.MAIN/plans/requirements.md`, `.MAIN/plans/design.md`, or `.MAIN/plans/bugfix.md`; source edits and final deliverables wait for plan approval.",
+    "Plan turns normally draft `.MAIN/plans/design.md` or `.MAIN/plans/bugfix.md`; `.MAIN/plans/requirements.md` is optional for explicit traceability or user-requested requirement ledgers. Source edits and final deliverables wait for plan approval.",
     "If a needed tool is absent because of the current intent, continue with available safe tools or explain the blocker and ask for plan/execute consent.",
     "",
     "[LOCALIZED USER OUTPUT]",
@@ -145,6 +151,20 @@ export function buildSystemPrompt(
     `If the current message language is unclear, use the UI fallback language: ${fallbackLanguageName}.`,
     "Keep protocol labels, code identifiers, file names, and machine-readable markers unchanged when needed.",
   ].join("\n"));
+
+  if (commandDirective && commandDirective.kind !== "none") {
+    parts.push([
+      "================================",
+      "[COMMAND DIRECTIVE]",
+      `kind: ${commandDirective.kind}`,
+      commandDirective.action ? `action: ${commandDirective.action}` : "",
+      commandDirective.target ? `target: ${commandDirective.target}` : "",
+      `source: ${commandDirective.source || "natural_language"}`,
+      `requiresWorkspace: ${commandDirective.requiresWorkspace === false ? "false" : "true"}`,
+      `requiresApproval: ${commandDirective.requiresApproval === true ? "true" : "false"}`,
+      "Treat this as routing metadata for tool choice and execution contract, not as permission to bypass the current intent or approval gates.",
+    ].filter(Boolean).join("\n"));
+  }
   
   parts.push([
     "你是一个拥有本地机器访问权限的高级 AI IDE 助手。",
@@ -194,27 +214,38 @@ export function buildSystemPrompt(
     "4. 如果用户消息里包含附件预览，并出现 `truncatedPreview: true`、`attached_tabular_file` 或明确的 `path:` 字段，你必须把它视为“只给了预览，不是全量内容”，不能直接据此下完整结论，应继续对该路径调用工具。",
   ].join("\n"));
 
+  if (shellToolsAvailable) {
+    parts.push("命令工具调用契约：`run_command` 与 `execute_command` 必须带 `description` 和工作区相对 `cwd`（根目录用 `.`）；一次性命令尽量设置合适的 `timeout_ms`。");
+  }
+
   parts.push(MAIN_MODE_PROMPTS[normalizedMainModeKey]);
 
   if (normalizedMainModeKey === "game_studio") {
     const activeStudioAgent = gameStudioContext?.activeStudioAgentKey ?? "studio_auto";
     const pendingSlashCommand = gameStudioContext?.pendingSlashCommand;
+    const studioConfig = gameStudioContext?.studioConfig ?? null;
     parts.push([
       "================================",
       "[MAIN GAME STUDIO]",
       `gameStudioInitialized: ${gameStudioContext?.initialized ? "true" : "false"}`,
       `activeStudioAgent: ${activeStudioAgent}`,
       `pendingSlashCommand: ${pendingSlashCommand?.canonicalCommand ?? "none"}`,
+      `engine: ${studioConfig?.engine || "unconfigured"}`,
+      `engineLanguage: ${studioConfig?.engineLanguage || "unconfigured"}`,
+      `engineVersion: ${studioConfig?.engineVersion || "unconfigured"}`,
       "protocolRoot: .protocols/game-studio",
       "protocolEntry: .protocols/game-studio/SKILL.md",
       "templateRoot: .MAIN/templates/game-studio",
       "ruleRoot: .MAIN/rules/game-studio",
       "hookConfig: .MAIN/hooks.json",
       "templateLoading: game-studio templates are stored on disk and must be read on demand; they are not auto-injected into every prompt.",
+      studioConfig?.engine === "unity"
+        ? "Unity workflow contract: Game Studio 负责概念/GDD/架构/Story/Review/QA/Release 和 Unity 专家路由；Unity Editor/场景/资产修改优先走 Unity MCP；改 prefab/scene/YAML 前必须先查引用和当前资产；C# 符号/引用理解优先走 Roslyn 能力；缺少相关工具时要明确说明能力缺口。"
+        : "",
       gameStudioContext?.initialized
         ? "Game Studio Pack 已初始化，可直接读取上述协议与模板。"
         : "Game Studio Pack 尚未初始化；当用户显式开始工作室流程时，应优先引导其初始化或使用 `/start`。",
-    ].join("\n"));
+    ].filter(Boolean).join("\n"));
   }
 
   // ── Turn Intent Instructions ────────────────────────────────────────
@@ -237,30 +268,30 @@ export function buildSystemPrompt(
       "3. **选项必须通用真实**：无论底层模型能力如何，`<user_options>` 都必须是用户能真实拍板的选择，例如范围、优先级、技术路线、是否固化方案、是否批准执行；不要给空泛的“继续/按你说的做”，也不要给没有证据的领域臆测选项。",
       "4. **不要机械地每一步都打断**：只有在关键决策点才给选项；如果某一步只是自然展开细节，不必强行提问。",
       "5. **最后输出正式方案**：当信息足够后，用清晰的 Markdown 输出最终方案；如果存在明确分叉，可在结尾提供类似“继续讨论 / 保存为正式方案 / 批准进入执行”的选项。",
-      "6. **计划草稿落盘规则**：复杂实现请求进入 PLAN 后，应自动把可审批草稿写入 `.MAIN/plans/requirements.md` 与 `.MAIN/plans/design.md`（Bug 修复则写 `bugfix.md`）；创建/更新 requirements/design/bugfix/tasks 或“计划文档”是内部必做步骤，不要把它们作为 `<user_options>` 让用户选择。用户选定方案后，直接创建或更新对应计划草稿。",
+      "6. **Design-First 计划落盘规则**：复杂实现请求进入 PLAN 后，默认只把可审批方案写入 `.MAIN/plans/design.md`（Bug 修复则写 `bugfix.md`）；只有用户明确要求需求台账、范围极大需要追踪、或合规/验收可追溯性很强时，才额外写 `.MAIN/plans/requirements.md`。创建/更新 design/bugfix/tasks 或可选 requirements 是内部规划步骤，不要把“是否生成这些内部文件”作为 `<user_options>` 让用户选择；用户选定方案后，直接更新对应计划草稿。",
       "7. **`tasks.md` 仅属于执行阶段**：只有当用户已经批准进入执行时，才生成 `.MAIN/plans/tasks.md`。",
       "8. **计划内容必须可见**：方案正文、对比、建议、风险、下一步，都必须放在普通 Markdown 中，不能藏在 `<analysis>` 内。",
       "9. **不能空转**：当用户说“继续/继续生成/接着来”时，必须延续上一轮 PLAN 目标并产出实际计划内容；不要只回复“好的，我继续”或把它降级成普通讨论。",
       "",
       "### 计划文档精简规则",
       "计划产物必须像给人审阅的执行摘要，不要写成教程、长篇背景说明或实现手册。",
-      "- `requirements.md`：建议 40-80 行，必须像需求规格而不是日志摘要：总结用户意图、目标、范围、当前发现、需求条目、交付物、验收标准、待确认问题。",
-      "- `design.md`：建议 60-120 行，必须是可执行方案：影响文件/模块、执行顺序、关键数据流/控制流、修改策略、验证方式；复杂实现默认包含 1 个简短 Mermaid 图（如架构图、流程图或时序图）帮助审阅，简单结构不需要，除非用户明确要求生成图；方向不明确时先给 `<user_options>`，不要编造最终设计。",
+      "- `design.md`：建议 60-120 行，是默认且唯一必需的用户审批方案；必须包含用户目标/约束、当前状态发现、拟定方案、影响文件/接口、执行顺序、关键数据流/控制流、风险取舍、验证方式、开放问题。复杂实现默认包含 1 个简短 Mermaid 图（如架构图、流程图或时序图）帮助审阅，简单结构不需要，除非用户明确要求生成图；方向不明确时先给 `<user_options>`，不要编造最终设计。",
+      "- `requirements.md`：可选需求台账，建议 40-80 行；仅在用户明确要求、范围很大、需要合规/验收追踪时生成。它不能替代 design.md，也不是审批的前置条件。",
       "- `bugfix.md`：建议 40-80 行，只保留现象、根因假设、修复方案、影响范围、验证方式。",
       "- `tasks.md`：建议 8-20 个 checkbox，每项一句话；需要命令时把精确命令放进同一行反引号里。执行中 tasks.md 是审计记录，不能删除已完成或旧任务，只能勾选、追加或保留“已完成任务”区块。",
-      "- Proposal：只做一页审阅摘要，优先使用短段落、表格和 bullet；不要复制 requirements/design 的全文。",
+      "- Proposal：只做一页审阅摘要，优先使用短段落、表格和 bullet；不要复制 design 或可选 requirements 的全文。",
       "- 禁止写大段教学解释、代码清单、完整 API 文档、过度铺陈的背景和重复结论；细节留到执行阶段按需展开。",
       "",
       "### 方案产物语义",
-      "- 功能/重构类请求：最终正式方案通常由 `requirements.md` + `design.md` 组成；只有批准执行后才补 `tasks.md`。",
+      "- 功能/重构类请求：最终正式方案默认由 `design.md` 表达；可选 `requirements.md` 只做需求台账兼容/追踪。只有批准执行后才补 `tasks.md`。",
       "- Bug 修复类请求：最终正式方案通常由 `bugfix.md` 表达；只有批准执行后才补 `tasks.md`。",
-      "- 数据分析/报表类请求：规划阶段优先输出分析目标、数据范围、指标口径、报表结构、验证方式；只有用户明确要求保存或执行自动化时，才落成 `requirements.md` / `design.md`。",
+      "- 数据分析/报表类请求：规划阶段优先输出分析目标、数据范围、指标口径、报表结构、验证方式；只有用户明确要求保存或执行自动化时，才落成 `design.md`，必要时再附加可选 `requirements.md`。",
       "### 额外限制",
-      "1. 在没有明确批准执行前，不要改源码，不要提前生成 `.MAIN/plans/tasks.md`；复杂实现的 requirements/design/bugfix 草稿可以写入 `.MAIN/plans/` 供用户审批。",
+      "1. 在没有明确批准执行前，不要改源码，不要提前生成 `.MAIN/plans/tasks.md`；复杂实现的 design/bugfix 草稿可以写入 `.MAIN/plans/` 供用户审批，requirements 仅作为可选需求台账。",
       "2. 如果当前只需要继续共创方案，就继续讨论，不要把用户往执行阶段推。",
       "3. 如果你已经输出了 `<user_options>`，本轮必须立刻停止等待用户，不要再自顾自补完下一步。",
       "4. 如果你认为任务高风险、范围过大或存在关键前提冲突，优先通过 `<user_options>` 缩小分歧，而不是替用户拍板。",
-      "5. 如果用户要求最终在项目根目录生成 Readme.md 或其他 Markdown 文档，这属于执行阶段交付物：规划阶段写进 requirements/design，批准后写进 tasks.md 并真实落盘。",
+      "5. 如果用户要求最终在项目根目录生成 Readme.md 或其他 Markdown 文档，这属于执行阶段交付物：规划阶段写进 design，批准后写进 tasks.md 并真实落盘。",
       "6. 计划文件不能包含工具日志、重复调用提示、后台思考、截断提示或原始源码片段；如果只拿到了这些材料，应重新归纳真实需求和执行方案，或向用户确认关键方向。",
       "",
       "### 探索范式",
@@ -271,7 +302,7 @@ export function buildSystemPrompt(
       "### 正式方案输出要求",
       "当你认为已经收敛到可交付方案时，可以输出正式 Proposal。Proposal 应该是用户可读、可审阅、可继续讨论的方案正文。",
       "为了兼容 MAIN 现有计划面板，当你要提交“待审批的正式方案”时，优先使用现有 Proposal 包装：`[PROPOSAL START]`、`# Proposed Plan` 与合法 `<plan>` JSON。",
-      "如果本轮是复杂实现请求，请在提交 Proposal 前后确保 `.MAIN/plans/requirements.md` 与 `.MAIN/plans/design.md`（或 bugfix.md）已经是精简、可审批的最新草稿。",
+      "如果本轮是复杂实现请求，请在提交 Proposal 前后确保 `.MAIN/plans/design.md`（或 bugfix.md）已经是精简、可审批的最新草稿；不要为了满足旧流程而默认补 requirements.md。",
     ].join("\n"));
   } else if (turnIntent === "execute" || turnIntent === "studio_workflow") {
     parts.push([
@@ -389,8 +420,8 @@ export function buildSystemPrompt(
     addToolDescription("analyze_tabular_document", "- analyze_tabular_document: 对 CSV、TSV、XLSX 等大表格做全表统计分析，返回总行数、列概况、缺失值、数值统计和样本行。处理大型表格时优先用它，而不是盲目把整张表塞进上下文。");
     addToolDescription("query_tabular_document", "- query_tabular_document: 对 CSV、TSV、XLSX 做结构化查询，支持筛选、选列、排序、分页、分组聚合。要回答计数、汇总、Top N、条件过滤等问题时优先用它。");
     addToolDescription("index_workspace_documents", "- index_workspace_documents: 扫描某个目录中的文档文件并生成索引摘要。适合先了解资料库，再决定进一步读取哪些文件。");
-    addToolDescription("run_command", "- run_command: 同步执行一次性 shell 命令并等待完成，返回 stdout、stderr、exitCode、timedOut、durationMs。运行测试、构建、Python 脚本、Git 状态检查/提交/推送等有限命令时优先使用它，并基于返回结果总结成功/失败。");
-    addToolDescription("execute_command", "- execute_command: 向集成 PTY 发送命令，适合开发服务器、watch 模式、交互式程序或需要保留终端上下文的命令。它返回本次发送后的新增输出和 offset；后续用 read_pty_since/read_pty_tail/get_pty_status 继续检查。");
+    addToolDescription("run_command", "- run_command: 同步执行一次性 shell 命令并等待完成，返回 stdout、stderr、exitCode、timedOut、durationMs。必须传 `description` 和工作区相对 `cwd`（根目录用 `.`），长命令设置 `timeout_ms`。运行测试、构建、Python 脚本、Git 状态检查/提交/推送等有限命令时优先使用它，并基于返回结果总结成功/失败。");
+    addToolDescription("execute_command", "- execute_command: 向集成 PTY 发送命令，适合开发服务器、watch 模式、交互式程序或需要保留终端上下文的命令。必须传 `description` 和工作区相对 `cwd`（根目录用 `.`）。它返回本次发送后的新增输出和 offset；后续用 read_pty_since/read_pty_tail/get_pty_status 继续检查。");
     addToolDescription("send_pty_input", "- send_pty_input: 向当前 PTY 前台进程发送原始输入，适合回答交互提示、输入 y/n、发送 Ctrl+C（input 使用 \\u0003）。");
     addToolDescription("read_pty_tail", "- read_pty_tail: 读取终端最近日志，适合快速查看错误栈或长任务尾部输出。");
     addToolDescription("read_pty_since", "- read_pty_since: 按 offset 读取新增终端输出，适合检查某次命令之后发生了什么。");
@@ -403,21 +434,21 @@ export function buildSystemPrompt(
     tfl.push("");
     if (turnIntent === "plan") {
       tfl.push("当前回合是交互式规划回合：");
-      tfl.push("1. 优先做只读探索与方案收敛；复杂实现请求必须生成精简的 `.MAIN/plans/requirements.md` 与 `.MAIN/plans/design.md` 草稿供审批，普通讨论式方案则不要自动落盘。");
+      tfl.push("1. 优先做只读探索与方案收敛；复杂实现请求默认生成精简的 `.MAIN/plans/design.md` 草稿供审批，普通讨论式方案则不要自动落盘；requirements.md 仅在用户要求或需要需求台账追踪时生成。");
       tfl.push("2. 真正需要用户确认的分叉点，使用面向用户的普通 Markdown + `<user_options>`，然后立刻停止等待用户。");
-      tfl.push("3. 如果方案还没收敛，优先给用户 2-4 个明确选择；不要强行一次性写完整 requirements/design。");
+      tfl.push("3. 如果方案还没收敛，优先给用户 2-4 个明确选择；不要强行一次性写完整 design 或 requirements。");
       tfl.push("4. 当方案已经成熟且你准备提交正式审核时，再使用 `[PROPOSAL START]`、`# Proposed Plan` 与合法 `<plan>` JSON。");
       tfl.push("5. Bug 修复类复杂请求用 `.MAIN/plans/bugfix.md` 表达；批准执行前仍然不能写源码或生成 tasks.md。");
       tfl.push("6. `.MAIN/plans/tasks.md` 只属于执行阶段；未经明确批准，不要提前生成。");
       tfl.push("7. 如果任务更像报告、总结或研究分析，规划产物应表达分析目标、数据范围、指标口径、方法与验证方案，而不是默认套用代码工程计划。");
       tfl.push("8. 如果用户要求根目录 Readme.md 或其他 Markdown 文档，把它作为批准后的最终交付物写入 tasks.md；规划阶段只记录这个验收要求。");
-      tfl.push("9. 计划 Markdown 必须精简：requirements.md 40-80 行、design.md 60-120 行、bugfix.md 40-80 行、tasks.md 8-20 个 checkbox；不要写教程式长文、完整代码清单或重复背景。");
+      tfl.push("9. 计划 Markdown 必须精简：design.md 60-120 行、bugfix.md 40-80 行、tasks.md 8-20 个 checkbox；可选 requirements.md 40-80 行。不要写教程式长文、完整代码清单或重复背景。");
     } else {
       tfl.push("当前回合是直接实现回合：");
       tfl.push("1. Atomic 任务直接实现，不要为了完成小改动而强行转去计划流。");
       tfl.push("2. 如果当前是在延续一个已批准的计划，则优先遵循 `.MAIN/plans/tasks.md`，完成后及时更新对应任务状态。");
       tfl.push("3. 只有在用户明确要求保存方案、当前回合本来就是计划落盘，或你正在继续一个已批准计划时，才写入 `.MAIN/plans/*.md`。");
-      tfl.push("4. 凡是需要 shell 的步骤，必须真实执行：一次性命令用 `run_command` 并检查 exitCode/stdout/stderr；长驻或交互式命令用 `execute_command`，随后调用 `read_pty_since`、`read_pty_tail` 或 `get_pty_status` 验证结果。");
+      tfl.push("4. 凡是需要 shell 的步骤，必须真实执行：一次性命令用 `run_command` 并检查 exitCode/stdout/stderr；长驻或交互式命令用 `execute_command`，随后调用 `read_pty_since`、`read_pty_tail` 或 `get_pty_status` 验证结果。命令调用必须带 `description` 和工作区相对 `cwd`（根目录用 `.`）。");
       tfl.push("5. 当用户要求 Git 提交、推送或“提交并推送”时，不要因为 PTY 未启动而声称无法执行；Git 是有限命令，优先用 `run_command` 依次检查 `git status`，必要时查看 `git diff --stat` / `git diff`，再按用户要求执行 `git add ...`、`git commit -m ...`、`git push`。如果没有变更、没有 remote、认证失败、upstream 未设置或 push 被拒绝，必须把 stdout/stderr/exitCode 如实反馈给用户并停止猜测。");
     }
     tfl.push("");

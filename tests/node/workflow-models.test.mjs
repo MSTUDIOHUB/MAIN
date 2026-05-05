@@ -553,7 +553,7 @@ test("plan evidence records successful commands and deduplicates repeated record
   assert.equal(secondLedger, firstLedger);
 });
 
-test("plan verification reads can satisfy explicit file evidence", () => {
+test("plan verification reads only satisfy explicit tool evidence", () => {
   const verification = createPlanExecutionEvidenceEntry({
     toolName: "read_file",
     target: "README.md",
@@ -573,8 +573,28 @@ test("plan verification reads can satisfy explicit file evidence", () => {
   assert.equal(isPlanExecutionEvidenceTool("read_file", "README.md"), false);
   assert.equal(isPlanEvidenceLedgerTool("read_file", "README.md"), true);
   assert.equal(verification?.kind, "tool");
-  assert.equal(isPlanTaskTrustedComplete(fileTask[0]), true);
+  assert.equal(isPlanTaskTrustedComplete(fileTask[0]), false);
   assert.equal(isPlanTaskTrustedComplete(toolTask[0]), true);
+});
+
+test("read-only shell commands do not satisfy file evidence", () => {
+  const parsed = extractPlanTasks("- [x] 在 Rust 后端新增 GitFileEntry 结构体 — 证据: file:src-tauri/src/lib.rs");
+  const readOnlyCommand = createPlanExecutionEvidenceEntry({
+    toolName: "run_command",
+    target: "sed -n '1690,1700p' /Users/michael/Documents/GitHub/MAIN/src-tauri/src/lib.rs",
+    result: JSON.stringify({ exitCode: 0, stdout: "fn git_push_current_branch() {}" }),
+  });
+  const writeEvidence = createPlanExecutionEvidenceEntry({
+    toolName: "replace_in_file",
+    target: "src-tauri/src/lib.rs",
+    result: JSON.stringify({ success: true }),
+  });
+  const afterReadOnly = reconcilePlanTaskCompletion([], parsed, readOnlyCommand ? [readOnlyCommand] : []);
+  const afterWrite = reconcilePlanTaskCompletion([], parsed, writeEvidence ? [writeEvidence] : []);
+
+  assert.equal(readOnlyCommand?.kind, "cmd");
+  assert.equal(isPlanTaskTrustedComplete(afterReadOnly[0]), false);
+  assert.equal(isPlanTaskTrustedComplete(afterWrite[0]), true);
 });
 
 test("plan audit rejects completion claims when trusted evidence is incomplete", () => {
@@ -609,6 +629,18 @@ test("command evidence matches successful commands with cd wrappers and redirect
     toolName: "run_command",
     target: "cd /Users/michael/Documents/GitHub/MAIN && npx tsc --noEmit 2>&1",
     result: JSON.stringify({ exitCode: 0, stdout: "" }),
+  });
+  const reconciled = reconcilePlanTaskCompletion([], parsed, command ? [command] : []);
+
+  assert.equal(isPlanTaskTrustedComplete(reconciled[0]), true);
+});
+
+test("command evidence still satisfies explicit cmd tasks", () => {
+  const parsed = extractPlanTasks("- [x] 验证当前 git 状态 `git status` — 证据: cmd:git status");
+  const command = createPlanExecutionEvidenceEntry({
+    toolName: "run_command",
+    target: "git status",
+    result: JSON.stringify({ exitCode: 0, stdout: "On branch main" }),
   });
   const reconciled = reconcilePlanTaskCompletion([], parsed, command ? [command] : []);
 

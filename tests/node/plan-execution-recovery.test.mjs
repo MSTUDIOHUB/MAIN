@@ -55,6 +55,9 @@ function loadTranspiledModuleSync(sourcePath) {
 
 const {
   PLAN_MAX_AUTO_RESUME_LIMIT,
+  buildExecuteMaxIterationsAutoResumeNotice,
+  buildExecuteMaxIterationsPauseNotice,
+  buildExecuteMaxIterationsResumePrompt,
   buildPlanExecutionProgressUpdate,
   buildPlanMaxIterationsCheckpoint,
   buildPlanMaxIterationsPauseNotice,
@@ -134,6 +137,28 @@ test("pause notice is structured and points to manual resume after one auto-resu
   assert.match(notice, /Add resume guard tests/);
 });
 
+test("execute max-iteration notices describe a recoverable boundary instead of failure", () => {
+  const checkpoint = buildPlanMaxIterationsCheckpoint({
+    iterationCount: 25,
+    maxIterations: 25,
+    autoResumeCount: PLAN_MAX_AUTO_RESUME_LIMIT,
+    tasks: [],
+    evidenceLedger: [],
+    recentToolActivity: [{ name: "run_command", target: "npm test", status: "succeeded", detail: "exitCode 0" }],
+    lastAssistantText: "继续验证剩余步骤。",
+    unresolvedBlockers: ["Agent loop reached maximum iterations (25)."],
+  });
+
+  const autoNotice = buildExecuteMaxIterationsAutoResumeNotice({ ...checkpoint, autoResumeCount: 1 }, "zh");
+  const pauseNotice = buildExecuteMaxIterationsPauseNotice(checkpoint, "zh");
+  const prompt = buildExecuteMaxIterationsResumePrompt({ language: "zh", checkpoint });
+
+  assert.match(autoNotice, /恢复点/);
+  assert.match(pauseNotice, /不是工具权限或模式切换失败/);
+  assert.match(pauseNotice, /Resume Execution/);
+  assert.match(prompt, /如果任务已经完成，直接输出最终总结/);
+});
+
 test("resume prompt requires fresh workspace reads and treats .MAIN plans as internal state", () => {
   const checkpoint = buildPlanMaxIterationsCheckpoint({
     iterationCount: 50,
@@ -183,5 +208,9 @@ test("plan execution progress snapshot is structured and ignores internal plan e
   assert.match(snapshot.latestEvidence, /src\/lib\/orchestrator\.ts/);
   assert.doesNotMatch(snapshot.latestEvidence, /\.MAIN\/plans/);
   assert.match(text, /Tool done/);
-  assert.match(text, /Current task:/);
+  assert.match(text, /Plan execution continuing/);
+  assert.doesNotMatch(text, /Current task:/);
+  assert.doesNotMatch(text, /Latest evidence:/);
+  assert.doesNotMatch(text, /Current tool:/);
+  assert.doesNotMatch(text, /Next:/);
 });

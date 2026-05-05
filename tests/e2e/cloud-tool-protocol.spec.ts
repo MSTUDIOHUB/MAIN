@@ -54,7 +54,43 @@ test.beforeEach(async ({ page }) => {
       if (cmd === "glob_search") return [];
       if (cmd === "read_file") {
         const path = String(args?.path ?? "");
-        if (path !== "README.md") {
+        const scenario = new URL(window.location.href).searchParams.get("e2eScenario");
+        const planFiles: Record<string, string> = {
+          ".MAIN/plans/requirements.md": [
+            "# Requirements",
+            "",
+            "## 需求",
+            "",
+            "用户要求根据 `.MAIN/plans` 执行时，MAIN 必须恢复计划执行语义，同时暴露执行工具并保留逐项审查。",
+            "",
+            "## 验收",
+            "",
+            "- PlanPanel 显示任务。",
+            "- runtime 工具包含 shell/write。",
+          ].join("\n"),
+          ".MAIN/plans/design.md": [
+            "# Design",
+            "",
+            "## 方案",
+            "",
+            "在发送前 hydrate `.MAIN/plans`，conversation intent 保持 plan，runtime intent 使用 execute。",
+            "",
+            "## 验证",
+            "",
+            "- 下一轮模型请求包含 run_command。",
+            "- 工具调用进入 ActionCard 审查。",
+          ].join("\n"),
+          ".MAIN/plans/tasks.md": [
+            "# Tasks",
+            "",
+            "- [ ] 运行计划执行验证命令 `npm run test:workflow-assets` — 证据: cmd:npm run test:workflow-assets",
+          ].join("\n"),
+        };
+        if (scenario === "existing-plan-folder-execute" && Object.prototype.hasOwnProperty.call(planFiles, path)) {
+          readFileCalls.push(path);
+          return planFiles[path];
+        }
+        if (path !== "README.md" && !/^README-\d+\.md$/.test(path)) {
           throw new Error(`ENOENT: ${path}`);
         }
         readFileCalls.push(path);
@@ -124,6 +160,8 @@ test.beforeEach(async ({ page }) => {
                 "<tool_use>",
                 "<tool>execute_command</tool>",
                 "<parameter name=\"command\">./deploy.sh</parameter>",
+                "<parameter name=\"cwd\">.</parameter>",
+                "<parameter name=\"description\">执行部署脚本</parameter>",
                 "</tool_use>",
               ].join("\n"),
             });
@@ -135,6 +173,32 @@ test.beforeEach(async ({ page }) => {
               "<option>直接执行部署脚本 deploy.sh</option>",
               "<option>我来确认无误再执行</option>",
               "</user_options>",
+            ].join("\n"),
+          });
+        }
+
+        if (scenario === "existing-plan-folder-execute") {
+          return JSON.stringify({
+            output_text: [
+              "我会执行计划任务中的验证命令。",
+              "<tool_use>",
+              "<tool>run_command</tool>",
+              "<parameter name=\"command\">npm run test:workflow-assets</parameter>",
+              "<parameter name=\"cwd\">.</parameter>",
+              "<parameter name=\"description\">运行计划任务验证命令</parameter>",
+              "</tool_use>",
+            ].join("\n"),
+          });
+        }
+
+        if (scenario === "execute-max-iterations-checkpoint") {
+          return JSON.stringify({
+            output_text: [
+              "继续读取下一份检查材料。",
+              "<tool_use>",
+              "<tool>read_file</tool>",
+              `<parameter name=\"path\">README-${requests.length}.md</parameter>`,
+              "</tool_use>",
             ].join("\n"),
           });
         }
@@ -284,6 +348,85 @@ test("execute quick reply switches a discuss turn to execute runtime and keeps t
       currentTurnIntent: "execute",
       agentStatus: "pending_review",
       hasExecuteToolBlock: true,
+    });
+});
+
+test("existing .MAIN/plans execution hydrates approved plan and exposes execute tools", async ({ page }) => {
+  await page.goto("/?e2eScenario=existing-plan-folder-execute");
+
+  const sent = await page.evaluate(() =>
+    (window as any).__CODELY_E2E__?.sendCloudMessage?.("根据.MAIN/plans文件夹的内容，完成执行方案和任务的内容。"),
+  );
+  expect(sent).toBe(true);
+
+  await expect
+    .poll(async () =>
+      page.evaluate(() => {
+        const probe = (window as any).__CLOUD_TOOL_PROTOCOL_TEST__;
+        const requests = probe?.requests || [];
+        const latestWithTools = [...requests].reverse().find((request: any) => request.hasTools);
+        if (!latestWithTools) return null;
+        const parsed = JSON.parse(latestWithTools.body || "{}");
+        const names = (parsed.tools || []).map((tool: any) => tool?.name || tool?.function?.name).filter(Boolean);
+        const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+        return {
+          hydratedFiles: probe?.readFileCalls || [],
+          hasShell: names.includes("run_command") && names.includes("execute_command"),
+          hasWrite: names.includes("write_file") && names.includes("replace_in_file"),
+          currentTurnIntent: snapshot?.currentTurnIntent,
+          isPlanApproved: snapshot?.isPlanApproved,
+          planStage: snapshot?.planStage,
+          planTaskCount: snapshot?.planTasks?.length || 0,
+          agentStatus: snapshot?.agentStatus,
+          hasRunCommandToolBlock: (snapshot?.toolNames || []).includes("run_command"),
+        };
+      }),
+    )
+    .toEqual({
+      hydratedFiles: [
+        ".MAIN/plans/requirements.md",
+        ".MAIN/plans/design.md",
+        ".MAIN/plans/tasks.md",
+      ],
+      hasShell: true,
+      hasWrite: true,
+      currentTurnIntent: "plan",
+      isPlanApproved: true,
+      planStage: "executing",
+      planTaskCount: 1,
+      agentStatus: "pending_review",
+      hasRunCommandToolBlock: true,
+    });
+});
+
+test("ordinary execute max iterations creates a recovery checkpoint instead of an error card", async ({ page }) => {
+  test.setTimeout(45_000);
+  await page.goto("/?e2eScenario=execute-max-iterations-checkpoint");
+
+  const sent = await page.evaluate(() =>
+    (window as any).__CODELY_E2E__?.sendCloudMessage?.("请直接执行一个需要多轮检查的长任务。"),
+  );
+  expect(sent).toBe(true);
+
+  await expect
+    .poll(async () =>
+      page.evaluate(() => {
+        const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+        const systemTexts = snapshot?.systemTexts || [];
+        return {
+          hasRecoveryCheckpoint: systemTexts.some((text: string) => /安全边界|恢复点/.test(text)),
+          hasPauseAfterAutoResume: systemTexts.some((text: string) => /执行已暂停|Execution paused/.test(text)),
+          autoResumeCount: snapshot?.planAutoResumeCount ?? 0,
+          hasErrorTool: (snapshot?.toolNames || []).includes("Error"),
+        };
+      }),
+      { timeout: 35_000 },
+    )
+    .toEqual({
+      hasRecoveryCheckpoint: true,
+      hasPauseAfterAutoResume: true,
+      autoResumeCount: 1,
+      hasErrorTool: false,
     });
 });
 

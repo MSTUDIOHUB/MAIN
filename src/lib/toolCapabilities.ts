@@ -1,6 +1,7 @@
 import type { MCPServer, MCPTool } from "./mcpClient";
 import type { ResolvedUserIntent } from "./runIntent";
 import type { ToolDefinition } from "./toolSchemas";
+import { looksDangerousShellCommand } from "./toolExecutionContract";
 
 export type PromptLanguageStrategy = "english_core_localized_output";
 
@@ -441,6 +442,9 @@ export function getToolRiskLevelForCall(
       const sqlValue = String(args.sql ?? args.query ?? args.statement ?? args.input ?? "").toLowerCase();
       return /\b(drop|truncate|delete|alter)\b/.test(sqlValue) ? "destructive" : "external_write";
     }
+  }
+  if (SHELL_BUILT_INS.has(name) && looksDangerousShellCommand(args.command)) {
+    return "destructive";
   }
   if (capability) return capability.risk;
   return classifyBuiltInTool(name);

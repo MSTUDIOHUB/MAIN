@@ -1,6 +1,13 @@
 import { normalizeCloudApiFormat, normalizeCloudProtocol } from "./cloudProtocol";
 import { streamChatCompletion, type StreamSettings } from "./streaming";
-import type { PendingRunDecisionOption, IntentPreflightResult, ResolvedUserIntent } from "./runIntent";
+import {
+  inferCommandDirective,
+  normalizeCommandDirective,
+  type PendingRunDecisionOption,
+  type IntentPreflightResult,
+  type ResolvedUserIntent,
+  type RunIntentRiskLevel,
+} from "./runIntent";
 import type { MainModeKey } from "./mainModes";
 import type { AppConfig } from "../store/useAppStore";
 import { normalizeConversationDisplayTitle } from "./workflowModels";
@@ -72,6 +79,14 @@ function normalizeIntent(value: unknown): ResolvedUserIntent | null {
   return ALLOWED_INTENTS.has(normalized) ? normalized : null;
 }
 
+function normalizeRiskLevel(value: unknown): RunIntentRiskLevel | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().toLowerCase();
+  return normalized === "low" || normalized === "medium" || normalized === "high"
+    ? normalized
+    : undefined;
+}
+
 function normalizeOption(option: unknown, language: "zh" | "en"): PendingRunDecisionOption | null {
   if (typeof option === "string") {
     const intent = normalizeIntent(option);
@@ -101,11 +116,21 @@ function normalizeOption(option: unknown, language: "zh" | "en"): PendingRunDeci
 function normalizePreflightResult(
   raw: unknown,
   language: "zh" | "en",
+  input: string,
 ): IntentPreflightResult | null {
   if (!raw || typeof raw !== "object") return null;
   const candidate = raw as Partial<IntentPreflightResult> & { options?: unknown[] };
   const intent = normalizeIntent(candidate.intent);
   if (!intent) return null;
+  const fallbackDirective = inferCommandDirective(input, intent, { source: "preflight" });
+  const commandDirective = normalizeCommandDirective(candidate.commandDirective, fallbackDirective) ?? fallbackDirective;
+  const riskLevel = normalizeRiskLevel(candidate.riskLevel) ?? (
+    commandDirective.kind === "shell" || commandDirective.kind === "git" || commandDirective.kind === "file_modify" || commandDirective.kind === "studio"
+      ? "medium"
+      : commandDirective.kind === "none"
+      ? "low"
+      : undefined
+  );
 
   const options = Array.isArray(candidate.options)
     ? candidate.options
@@ -127,6 +152,11 @@ function normalizePreflightResult(
     outputFormat: candidate.outputFormat,
     bypassMainRouter: candidate.bypassMainRouter === true,
     needsWorkspaceRead: candidate.needsWorkspaceRead === true,
+    ...(riskLevel ? { riskLevel } : {}),
+    requiresApproval: typeof candidate.requiresApproval === "boolean"
+      ? candidate.requiresApproval
+      : commandDirective.requiresApproval === true,
+    commandDirective,
   };
 }
 
@@ -148,10 +178,15 @@ export async function runIntentPreflight(params: {
     "Also provide title: a short clean UI title for sidebar / TopIsland. Ignore usernames, timestamps, and transcript noise.",
     "Also provide summary: a short user-facing intent summary of what MAIN is about to do. Do not copy the user's wording verbatim.",
     "Also provide reason: a brief routing reason for the chosen intent.",
+    "Also provide riskLevel: low, medium, or high.",
+    "Also provide requiresApproval: true only when this turn is likely to need shell, write, external write, browser, Unity/editor, Git mutation, or destructive tools.",
+    "Also provide commandDirective: a second-level command metadata object. Keep top-level intent unchanged; use commandDirective.kind for specific commands.",
+    "Allowed commandDirective.kind values: none, shell, unity, git, file_modify, report, plan_approval, plan_resume, studio, skill, knowledge, mcp.",
+    "commandDirective.source should be preflight. commandDirective.action should be short, such as status, commit_push, deploy, workspace_file_change, generate_report, editor_execute.",
     "If the request is ambiguous in a way that materially changes behavior, set needsUserChoice=true and provide a short user-facing question plus 2-3 clear options.",
     "Options must be plain user-facing choices, not reasoning.",
     "The JSON shape must be:",
-    "{\"intent\":\"discuss|plan|execute|analyze|summarize|report|studio_workflow\",\"confidence\":0.0,\"title\":\"修正标题同步逻辑\",\"summary\":\"调整 sidebar 与 TopIsland 的标题同步逻辑\",\"reason\":\"The request asks for a concrete UI change.\",\"needsUserChoice\":false,\"question\":\"\",\"options\":[{\"id\":\"plan\",\"label\":\"进入计划模式\",\"value\":\"先给我一个方案和计划，再决定是否执行\"}],\"outputFormat\":\"answer|summary|report|plan|analysis|execution\",\"bypassMainRouter\":false,\"needsWorkspaceRead\":false}",
+    "{\"intent\":\"discuss|plan|execute|analyze|summarize|report|studio_workflow\",\"confidence\":0.0,\"riskLevel\":\"low|medium|high\",\"requiresApproval\":false,\"commandDirective\":{\"kind\":\"none|shell|unity|git|file_modify|report|plan_approval|plan_resume|studio|skill|knowledge|mcp\",\"action\":\"status\",\"target\":\"git\",\"source\":\"preflight\",\"requiresWorkspace\":true,\"requiresApproval\":true,\"confidence\":0.0,\"reason\":\"Git status request\"},\"title\":\"修正标题同步逻辑\",\"summary\":\"调整 sidebar 与 TopIsland 的标题同步逻辑\",\"reason\":\"The request asks for a concrete UI change.\",\"needsUserChoice\":false,\"question\":\"\",\"options\":[{\"id\":\"plan\",\"label\":\"进入计划模式\",\"value\":\"先给我一个方案和计划，再决定是否执行\"}],\"outputFormat\":\"answer|summary|report|plan|analysis|execution\",\"bypassMainRouter\":false,\"needsWorkspaceRead\":false}",
     `Current visible mode: ${params.mainModeKey}`,
     `Preferred user language: ${params.language}`,
   ].join("\n");
@@ -187,12 +222,12 @@ export async function runIntentPreflight(params: {
 
     const jsonText = extractJsonObject(result.content || fullText);
     if (!jsonText) return null;
-    return normalizePreflightResult(JSON.parse(jsonText), params.language);
+    return normalizePreflightResult(JSON.parse(jsonText), params.language, params.input);
   } catch {
     const jsonText = extractJsonObject(fullText);
     if (!jsonText) return null;
     try {
-      return normalizePreflightResult(JSON.parse(jsonText), params.language);
+      return normalizePreflightResult(JSON.parse(jsonText), params.language, params.input);
     } catch {
       return null;
     }

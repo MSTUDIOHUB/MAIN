@@ -58,7 +58,7 @@ import {
   type ReplyOption,
 } from "./workflowModels";
 import type { MainModeKey } from "./mainModes";
-import type { ResolvedUserIntent } from "./runIntent";
+import type { CommandDirective, ResolvedUserIntent } from "./runIntent";
 import {
   loadResolvedInstructions,
   type ResolvedInstructionSet,
@@ -70,12 +70,15 @@ import {
   type HookExecutionRecord,
   type HookEvent,
 } from "./hooks";
-import type { PendingSlashCommand, StudioAgentKey } from "./gameStudioCatalog";
+import type { PendingSlashCommand, StudioAgentKey, StudioConfig } from "./gameStudioCatalog";
 import {
   buildRepeatLoopArgsKey,
   buildRepeatLoopSignature,
   formatRepeatLoopFatalMessage,
   formatRepeatLoopRecoveryMessage,
+  formatTargetProgressLoopRecoveryMessage,
+  isReadOnlyShellInspectionToolCall,
+  registerTargetProgressForLoopGuard,
   registerToolCallForRepeatGuard,
 } from "./repetitionGuard";
 import {
@@ -102,11 +105,13 @@ import {
 import { buildPlanApprovalChoiceHint } from "./planControl";
 import {
   buildPlanExecutionProgressUpdate,
+  buildExecuteMaxIterationsPauseNotice,
   buildPlanMaxIterationsCheckpoint,
   buildPlanMaxIterationsPauseNotice,
   type PlanMaxIterationsCheckpoint,
   type PlanToolActivitySummary,
 } from "./planExecutionRecovery";
+import { validateShellToolContract } from "./toolExecutionContract";
 
 // ── Spec file auto-approval helpers ────────────────────────────────
 
@@ -171,6 +176,110 @@ function isProjectSourceWriteResult(result: ToolExecutionResult): boolean {
   );
 }
 
+const READ_BEFORE_MODIFY_WRITE_TOOLS = new Set(["write_file", "replace_in_file"]);
+
+function normalizeEvidencePath(path: string): string {
+  return path.replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+/g, "/").toLowerCase();
+}
+
+function getParentEvidencePath(path: string): string {
+  const normalized = normalizeEvidencePath(path);
+  const index = normalized.lastIndexOf("/");
+  return index > 0 ? normalized.slice(0, index) : ".";
+}
+
+function getSessionReadBeforeModifyEvidence(sessionKey: string): Set<string> {
+  const key = sessionKey || "__default__";
+  const globalKey = "__MAIN_READ_BEFORE_MODIFY_EVIDENCE__";
+  const globalRecord = globalThis as typeof globalThis & {
+    [globalKey]?: Map<string, Set<string>>;
+  };
+  if (!globalRecord[globalKey]) {
+    globalRecord[globalKey] = new Map<string, Set<string>>();
+  }
+  let evidence = globalRecord[globalKey]!.get(key);
+  if (!evidence) {
+    evidence = new Set<string>();
+    globalRecord[globalKey]!.set(key, evidence);
+  }
+  return evidence;
+}
+
+function rememberReadBeforeModifyEvidence(
+  sessionKey: string,
+  name: string,
+  args: Record<string, unknown>,
+  result: ToolExecutionResult,
+): void {
+  if (result.isError) return;
+  const evidence = getSessionReadBeforeModifyEvidence(sessionKey);
+  const path = typeof args.path === "string" ? args.path : result.target;
+  if (name === "read_file" || name === "get_file_outline" || name === "read_document") {
+    if (path) evidence.add(`file:${normalizeEvidencePath(path)}`);
+    return;
+  }
+  if (name === "list_directory") {
+    const dir = typeof args.path === "string" && args.path.trim() ? args.path : ".";
+    evidence.add(`dir:${normalizeEvidencePath(dir) || "."}`);
+    return;
+  }
+  if (name === "get_project_skeleton" || name === "glob_search" || name === "grep_search") {
+    evidence.add("workspace:structure");
+    return;
+  }
+  if (/unity|yaml|reference|asset|prefab|scene/i.test(name) && /read|list|search|get|query|find/i.test(name)) {
+    evidence.add("unity:context");
+  }
+}
+
+async function buildReadBeforeModifyValidationError(
+  tc: ToolCallToExecute,
+  args: Record<string, unknown>,
+  workspace: string,
+  callbacks: OrchestratorCallbacks,
+): Promise<ToolExecutionResult | null> {
+  if (!READ_BEFORE_MODIFY_WRITE_TOOLS.has(tc.name)) return null;
+  const runtimeIntent = callbacks.getRuntimeRunIntent?.() ?? callbacks.getCurrentRunIntent();
+  if (runtimeIntent !== "execute" && runtimeIntent !== "studio_workflow" && !callbacks.getIsPlanApproved()) {
+    return null;
+  }
+
+  const path = typeof args.path === "string" ? args.path : "";
+  if (!path || isPlanArtifactPath(path)) return null;
+
+  const normalizedPath = normalizeEvidencePath(path);
+  const evidence = getSessionReadBeforeModifyEvidence(callbacks.getSessionKey());
+  const hasExactRead = evidence.has(`file:${normalizedPath}`);
+  const hasParentRead = evidence.has(`dir:${getParentEvidencePath(path)}`) || evidence.has("workspace:structure");
+
+  let existingFile = tc.name === "replace_in_file";
+  if (tc.name === "write_file") {
+    existingFile = !!(await readFileMetadataIfAvailable(path, workspace));
+  }
+
+  if (!existingFile && hasParentRead) return null;
+  if (hasExactRead) return null;
+
+  const target = getToolTarget(tc.name, args);
+  const language = callbacks.getPreferredLanguage();
+  const message = language === "zh"
+    ? existingFile
+      ? `READ_BEFORE_MODIFY_BLOCKED: 修改 ${path} 前必须先读取该文件。请先调用 read_file 或 get_file_outline 获取当前内容/结构，再重试写入。`
+      : `READ_BEFORE_MODIFY_BLOCKED: 创建 ${path} 前需要先检查目标目录或项目结构。请先调用 get_project_skeleton 或 list_directory，再重试写入。`
+    : existingFile
+    ? `READ_BEFORE_MODIFY_BLOCKED: Read ${path} before modifying it. Call read_file or get_file_outline first, then retry the write.`
+    : `READ_BEFORE_MODIFY_BLOCKED: Inspect the target directory or project structure before creating ${path}. Call get_project_skeleton or list_directory first, then retry the write.`;
+  callbacks.onToolExecuting(tc.name, target);
+  callbacks.onToolError(tc.name, target, message);
+  return {
+    toolCallId: tc.id,
+    name: tc.name,
+    target,
+    content: `Error: ${message}`,
+    isError: true,
+  };
+}
+
 // ── Tool argument validation ────────────────────────────────────────
 
 /**
@@ -183,8 +292,15 @@ function validateToolArgs(name: string, args: Record<string, unknown>, allTools:
   const required = def.function.parameters.required;
   const missing = required.filter(k => args[k] === undefined || args[k] === null || args[k] === "");
   if (missing.length === 0) return null;
-  return `Tool '${name}' is missing required parameter(s): ${missing.join(", ")}. ` +
+  const missingRequiredMessage = `Tool '${name}' is missing required parameter(s): ${missing.join(", ")}. ` +
     `Required: ${required.join(", ")}. Please retry with the correct arguments.`;
+  return missingRequiredMessage;
+}
+
+function validateToolExecutionContract(name: string, args: Record<string, unknown>, allTools: ToolDefinition[]): string | null {
+  const requiredError = validateToolArgs(name, args, allTools);
+  if (requiredError) return requiredError;
+  return validateShellToolContract(name, args);
 }
 
 // region: 上下文压缩预留
@@ -267,6 +383,7 @@ export interface OrchestratorCallbacks {
   getActiveStudioAgentKey: () => StudioAgentKey;
   getGameStudioInitialized: () => boolean;
   getPendingSlashCommand: () => PendingSlashCommand | null;
+  getGameStudioConfig?: () => StudioConfig | null;
   getWorkspaceTree: () => string;
   getMcpServers: () => MCPServer[];
   getMcpDiscoveredTools: () => MCPTool[];
@@ -277,6 +394,7 @@ export interface OrchestratorCallbacks {
   // Planning & Management
   getCurrentRunIntent: () => ResolvedUserIntent;
   getRuntimeRunIntent?: () => ResolvedUserIntent;
+  getCommandDirective?: () => CommandDirective | null;
   getWorkflowMode: () => "chat" | "edit" | "plan";
   getIsPlanApproved: () => boolean;
   getPlanApprovalChoice: () => string | null;
@@ -301,6 +419,7 @@ export interface OrchestratorCallbacks {
   onPlanTasksUpdated: (content: string) => void;
   onPlanExecutionProgress?: (progress: PlanExecutionProgressUpdate) => void;
   onPlanMaxIterationsCheckpoint?: (checkpoint: PlanMaxIterationsCheckpoint) => boolean | Promise<boolean>;
+  onExecuteMaxIterationsCheckpoint?: (checkpoint: PlanMaxIterationsCheckpoint) => boolean | Promise<boolean>;
   onTurnSummaryReady: (summary: string) => void;
   onInstructionsResolved: (resolved: ResolvedInstructionSet) => void;
   onHooksLoaded: (hooks: HookDefinition[], loadedAt?: number | null) => void;
@@ -318,6 +437,11 @@ export interface OrchestratorCallbacks {
       tokenCountAfter: number;
       tokenReduction: number;
       compressedContext?: string;
+      tokenBreakdown?: {
+        topSourceLabel: string;
+        topSourceTokens: number;
+        total: number;
+      };
     },
     reason: "proactive" | "reactive",
   ) => void;
@@ -399,6 +523,7 @@ function getToolTarget(name: string, args: Record<string, unknown>): string {
 const PROSE_CODE_DUMP_MIN_CHARS = 12_000;
 const PROSE_CODE_DUMP_LARGE_CHARS = 32_000;
 const MAX_NO_ACTION_RETRIES = 2;
+const EXECUTE_CONVERGENCE_PROMPT_RATIO = 0.72;
 
 function looksLikeProseCodeDump(text: string): boolean {
   const content = text.trim();
@@ -448,7 +573,7 @@ function buildNonActionableStopMessage(language: "zh" | "en", reason: "no_output
       case "missing_tool_loop":
         return "模型连续输出说明或代码正文，但没有使用写入/读取工具，本轮已停止。聊天内容不会被当作已写入文件。";
       case "incomplete_plan":
-        return "模型没有生成可审批的计划草稿或计划文件，本轮已停止。请重新发送明确要求写入 `.MAIN/plans/requirements.md` 和 `.MAIN/plans/design.md` 的计划请求，或切换到直接执行。";
+        return "模型没有生成可审批的计划草稿或计划文件，本轮已停止。请重新发送明确要求写入 `.MAIN/plans/design.md` 或 `.MAIN/plans/bugfix.md` 的计划请求，或切换到直接执行。";
       default:
         return "模型只输出了文字说明，没有产生真实工具调用或文件变更，本轮已停止。";
     }
@@ -460,7 +585,7 @@ function buildNonActionableStopMessage(language: "zh" | "en", reason: "no_output
     case "missing_tool_loop":
       return "The model kept producing prose or code in chat without using read/write tools, so this turn stopped. Chat text is not treated as written files.";
     case "incomplete_plan":
-      return "The model did not produce a reviewable plan draft or plan files, so this turn stopped. Send a clearer planning request that explicitly writes `.MAIN/plans/requirements.md` and `.MAIN/plans/design.md`, or switch to direct execution.";
+      return "The model did not produce a reviewable plan draft or plan files, so this turn stopped. Send a clearer planning request that explicitly writes `.MAIN/plans/design.md` or `.MAIN/plans/bugfix.md`, or switch to direct execution.";
     default:
       return "The model only produced prose and did not create real tool calls or file changes, so this turn stopped.";
   }
@@ -479,6 +604,20 @@ function buildHiddenThoughtOnlyContinuationPrompt(language: "zh" | "en", consecu
         "You have already read/searched the context; now output a user-visible Markdown conclusion.",
         "Do not return only thinking/analysis tags again. Do not reread the same files unless a key fact is still missing.",
         "Include at least: whether it is implemented, supporting evidence, and what is still missing or next.",
+      ].join("\n");
+}
+
+function buildExecuteConvergencePrompt(language: "zh" | "en", iteration: number, maxIterations: number): string {
+  return language === "zh"
+    ? [
+        `本轮 Execute 已进行 ${iteration}/${maxIterations} 轮工具循环，接近安全边界。`,
+        "请先根据已有工具结果判断任务是否已经完成：如果完成，直接输出最终总结并停止，不要再调用工具。",
+        "如果仍未完成，只调用一个最小必要的下一步工具；不要重复读取、重复验证或继续改同一个目标而没有新证据。",
+      ].join("\n")
+    : [
+        `This Execute turn has reached ${iteration}/${maxIterations} tool-loop iterations and is approaching the safety boundary.`,
+        "First decide from existing tool results whether the task is already complete. If it is complete, output the final summary and stop without more tools.",
+        "If it is not complete, call exactly one smallest necessary next tool. Do not repeat reads, repeat validation, or keep editing the same target without new evidence.",
       ].join("\n");
 }
 
@@ -566,8 +705,8 @@ function buildApprovedPlanNoToolPauseMessage(
 function buildPlanFallbackNotice(language: "zh" | "en", sourceChars: number): string {
   const formatted = sourceChars.toLocaleString();
   return language === "zh"
-    ? `模型刚才输出了约 ${formatted} 个字符的规划正文，但没有生成可审批的计划文件。MAIN 会要求模型通过工具写入真实的 \`.MAIN/plans/requirements.md\` 与 \`.MAIN/plans/design.md\`，或先用可点击选项向你确认关键分叉；不会把工具日志或截断内容强行写成计划。`
-    : `The model produced about ${formatted} characters of planning text but did not create reviewable plan files. MAIN will ask it to write real \`.MAIN/plans/requirements.md\` and \`.MAIN/plans/design.md\` artifacts through tools, or ask you for the key decision first; tool logs and truncated text will not be forced into plan files.`;
+    ? `模型刚才输出了约 ${formatted} 个字符的规划正文，但没有生成可审批的计划文件。MAIN 会要求模型通过工具写入真实的 \`.MAIN/plans/design.md\`（或 bugfix.md），或先用可点击选项向你确认关键分叉；不会把工具日志或截断内容强行写成计划。`
+    : `The model produced about ${formatted} characters of planning text but did not create reviewable plan files. MAIN will ask it to write a real \`.MAIN/plans/design.md\` (or bugfix.md) artifact through tools, or ask you for the key decision first; tool logs and truncated text will not be forced into plan files.`;
 }
 
 function looksLikeToolUnavailableClaim(text: string): boolean {
@@ -753,10 +892,10 @@ function buildPlanRecoveryPrompt(callbacks: OrchestratorCallbacks, sourceText: s
       "",
       "Rules:",
       "- Do not copy tool logs, duplicate-call warnings, hidden thinking, raw source code, or truncation messages into plan files.",
-      "- `requirements.md` must summarize the user's intent into real requirements: goal, scope, findings, deliverables, acceptance criteria, and open questions.",
-      "- `design.md` must be executable: affected files/modules, ordered implementation strategy, data/control flow, validation, and risks. For complex implementations, include one concise Mermaid diagram by default; skip diagrams for simple structures unless the user explicitly asks for one.",
+      "- `design.md` is the default required approval artifact. It must include the user goal/constraints, current findings, proposed approach, affected files/interfaces, ordered implementation strategy, data/control flow, risks/tradeoffs, validation, and open questions. For complex implementations, include one concise Mermaid diagram by default; skip diagrams for simple structures unless the user explicitly asks for one.",
+      "- `requirements.md` is optional. Only create it when the user explicitly asks for a requirement ledger or when large/compliance-heavy scope needs traceability; it is never a prerequisite for approval.",
       "- If a design direction is unclear, ask the user with `<user_options>` and stop. Do not invent a final design.",
-      "- If the direction is clear, call `write_file` or `replace_in_file` to create/update concise `.MAIN/plans/requirements.md` and `.MAIN/plans/design.md`, then submit the normal Proposal for approval. Do not generate `tasks.md` before approval.",
+      "- If the direction is clear, call `write_file` or `replace_in_file` to create/update concise `.MAIN/plans/design.md`, then submit the normal Proposal for approval. Do not generate `tasks.md` before approval.",
     ].filter(Boolean).join("\n");
   }
 
@@ -767,10 +906,10 @@ function buildPlanRecoveryPrompt(callbacks: OrchestratorCallbacks, sourceText: s
     "",
     "规则：",
     "- 不要把工具日志、重复调用提示、后台思考、原始源码或截断提示写进计划文件。",
-    "- `requirements.md` 必须总结用户真实意图并形成需求规格：目标、范围、当前发现、交付物、验收标准、待确认问题。",
-    "- `design.md` 必须是可执行方案：影响文件/模块、执行顺序、数据流/控制流、验证方式和风险。复杂实现默认包含 1 个简短 Mermaid 图；简单结构不需要，除非用户明确要求生成图。",
+    "- `design.md` 是默认必需的审批方案：必须包含用户目标/约束、当前发现、拟定方案、影响文件/接口、执行顺序、数据流/控制流、风险取舍、验证方式和开放问题。复杂实现默认包含 1 个简短 Mermaid 图；简单结构不需要，除非用户明确要求生成图。",
+    "- `requirements.md` 是可选需求台账；只有用户明确要求、范围很大或需要合规/验收追踪时才生成，绝不是审批前置条件。",
     "- 如果设计方向不明确，使用 `<user_options>` 让用户选择并立刻停止；不要编造最终方案。",
-    "- 如果方向已经明确，必须调用 `write_file` 或 `replace_in_file` 创建/更新精简的 `.MAIN/plans/requirements.md` 与 `.MAIN/plans/design.md`，然后提交正常 Proposal 等待审批。批准前不要生成 `tasks.md`。",
+    "- 如果方向已经明确，必须调用 `write_file` 或 `replace_in_file` 创建/更新精简的 `.MAIN/plans/design.md`，然后提交正常 Proposal 等待审批。批准前不要生成 `tasks.md`。",
   ].filter(Boolean).join("\n");
 }
 
@@ -838,8 +977,8 @@ function buildApprovedPlanContinuationPrompt(callbacks: OrchestratorCallbacks): 
   return (
     approvalChoiceHint +
     (language === "zh"
-      ? "计划已批准，现在进入执行阶段（EXECUTION MODE）。请按以下顺序继续：\n1. 先基于已批准的 requirements/design 或 bugfix 生成 `.MAIN/plans/tasks.md`，把执行任务拆清楚；tasks.md 必须精简为 8-20 个 checkbox，每项一句话，并且每项都要带显式证据标签，例如 `— 证据: file:src/App.tsx`、`— 证据: cmd:npx tsc --noEmit` 或 `— 证据: deliverable:PLAN.md`。\n2. 生成 tasks.md 后，TopIsland 会显示任务进度；之后再按 tasks.md 逐个执行，使用 <tool_use> 格式调用工具。\n3. 任何需要 shell 的任务都必须在 tasks.md checkbox 中写出精确命令，并用反引号包裹；进入执行后，一次性命令优先用 run_command 并检查 exitCode/stdout/stderr；长驻或交互式命令用 execute_command 后再用 read_pty_since/read_pty_tail/get_pty_status 验证结果。\n4. 你可以正常修改项目源码文件，写入路径必须是项目中的正确位置，绝对不要将源码写入 `.MAIN/plans/` 或任何隐藏目录。\n5. 每完成一个任务后，先同步更新 `.MAIN/plans/tasks.md` 中对应的 checkbox 状态；tasks.md 是审计记录，不能删除已完成或旧任务，只能勾选、追加或保留“已完成任务”区块。只有全部任务都有真实文件/命令/交付物证据满足后，才能结束执行。\n"
-      : "The plan is approved. You are now in EXECUTION MODE. Continue in this order:\n1. First generate `.MAIN/plans/tasks.md` from the approved requirements/design or bugfix so the execution steps are explicit. Keep tasks.md concise: 8-20 checkboxes, one sentence each, and give every item an explicit evidence label such as `— evidence: file:src/App.tsx`, `— evidence: cmd:npx tsc --noEmit`, or `— evidence: deliverable:PLAN.md`.\n2. After tasks.md is generated, follow it task by task using tool calls.\n3. Any task that needs shell work must include the exact command inside the tasks.md checkbox text using backticks. During execution, prefer run_command for finite commands and inspect exitCode/stdout/stderr; use execute_command for long-running or interactive commands, then verify with read_pty_since/read_pty_tail/get_pty_status.\n4. You may now edit project source files, but write them to the proper project paths and never into `.MAIN/plans/` or hidden folders.\n5. After each task, update the matching checkbox in `.MAIN/plans/tasks.md` before moving on; tasks.md is an audit record, so never delete completed or previous tasks. Only check items off, append tasks, or keep a completed-tasks section. Only stop when every task has satisfied real file/command/deliverable evidence.\n") +
+      ? "计划已批准，现在进入执行阶段（EXECUTION MODE）。请按以下顺序继续：\n1. 先基于已批准的 design.md 或 bugfix.md 生成 `.MAIN/plans/tasks.md`；如果现有旧计划包含 requirements.md，可以把它作为辅助上下文，但不要要求补 requirements.md。tasks.md 必须精简为 8-20 个 checkbox，每项一句话，并且每项都要带显式证据标签，例如 `— 证据: file:src/App.tsx`、`— 证据: cmd:npx tsc --noEmit` 或 `— 证据: deliverable:PLAN.md`。\n2. 生成 tasks.md 后，TopIsland 会显示任务进度；之后再按 tasks.md 逐个执行，使用 <tool_use> 格式调用工具。\n3. 任何需要 shell 的任务都必须在 tasks.md checkbox 中写出精确命令，并用反引号包裹；进入执行后，一次性命令优先用 run_command 并检查 exitCode/stdout/stderr；长驻或交互式命令用 execute_command 后再用 read_pty_since/read_pty_tail/get_pty_status 验证结果。\n4. 你可以正常修改项目源码文件，写入路径必须是项目中的正确位置，绝对不要将源码写入 `.MAIN/plans/` 或任何隐藏目录。\n5. 每完成一个任务后，先同步更新 `.MAIN/plans/tasks.md` 中对应的 checkbox 状态；tasks.md 是审计记录，不能删除已完成或旧任务，只能勾选、追加或保留“已完成任务”区块。只有全部任务都有真实文件/命令/交付物证据满足后，才能结束执行。\n"
+      : "The plan is approved. You are now in EXECUTION MODE. Continue in this order:\n1. First generate `.MAIN/plans/tasks.md` from the approved design.md or bugfix.md; if a legacy requirements.md is present, use it only as supporting context and do not require creating one. Keep tasks.md concise: 8-20 checkboxes, one sentence each, and give every item an explicit evidence label such as `— evidence: file:src/App.tsx`, `— evidence: cmd:npx tsc --noEmit`, or `— evidence: deliverable:PLAN.md`.\n2. After tasks.md is generated, follow it task by task using tool calls.\n3. Any task that needs shell work must include the exact command inside the tasks.md checkbox text using backticks. During execution, prefer run_command for finite commands and inspect exitCode/stdout/stderr; use execute_command for long-running or interactive commands, then verify with read_pty_since/read_pty_tail/get_pty_status.\n4. You may now edit project source files, but write them to the proper project paths and never into `.MAIN/plans/` or hidden folders.\n5. After each task, update the matching checkbox in `.MAIN/plans/tasks.md` before moving on; tasks.md is an audit record, so never delete completed or previous tasks. Only check items off, append tasks, or keep a completed-tasks section. Only stop when every task has satisfied real file/command/deliverable evidence.\n") +
     deliverableHint +
     "\n" +
     buildPlanCommandExecutionHint(callbacks.getPlanTasks(), language)
@@ -1197,7 +1336,7 @@ async function executeToolCallWithLifecycle(
   }
 
   // Validate required parameters before execution
-  const validationError = validateToolArgs(tc.name, toolArgs, allTools);
+  const validationError = validateToolExecutionContract(tc.name, toolArgs, allTools);
   if (validationError) {
     callbacks.onToolError(tc.name, "", validationError);
     return { toolCallId: tc.id, name: tc.name, target: "", content: `Error: ${validationError}`, isError: true };
@@ -1247,6 +1386,16 @@ async function executeToolCallWithLifecycle(
     return planArtifactValidationError;
   }
 
+  const readBeforeModifyValidationError = await buildReadBeforeModifyValidationError(
+    tc,
+    resolvedArgs,
+    workspace,
+    callbacks,
+  );
+  if (readBeforeModifyValidationError) {
+    return readBeforeModifyValidationError;
+  }
+
   const diffPreview = isEphemeralPlanArtifactMutation(tc.name, effectiveArgs)
     ? undefined
     : await buildToolDiffPreview(tc.name, effectiveArgs, { workspace, sessionKey });
@@ -1276,6 +1425,14 @@ async function executeToolCallWithLifecycle(
         warn: (message, error) => console.warn(message, error),
       },
     );
+    rememberReadBeforeModifyEvidence(sessionKey, tc.name, resolvedArgs, {
+      toolCallId: tc.id,
+      name: tc.name,
+      target,
+      content: modelContent,
+      displayContent,
+      isError: false,
+    });
 
     const postHookResult = await runLifecycleHooks(callbacks, hooksConfig, "PostToolUse", {
       toolName: tc.name,
@@ -1358,15 +1515,15 @@ function buildPlanGateBlockedResult(
   const language = callbacks.getPreferredLanguage();
   const message = language === "zh"
     ? reason === "pre_approval_tasks"
-      ? "PLAN 阶段尚未批准，不能提前生成 `.MAIN/plans/tasks.md`。请先完成 requirements/design 或 bugfix 草稿并等待用户批准。"
+      ? "PLAN 阶段尚未批准，不能提前生成 `.MAIN/plans/tasks.md`。请先完成 design.md 或 bugfix.md 草稿并等待用户批准。"
       : reason === "missing_tasks_before_source"
       ? "计划已批准，但还没有可执行的 `.MAIN/plans/tasks.md` 任务清单。请先生成 tasks.md，再按任务修改源码或交付文档。"
-      : "PLAN 阶段尚未批准，不能修改源码或项目交付文件。请先生成 `.MAIN/plans/requirements.md` 与 `.MAIN/plans/design.md`（或 bugfix.md）供用户审批。"
+      : "PLAN 阶段尚未批准，不能修改源码或项目交付文件。请先生成 `.MAIN/plans/design.md`（或 bugfix.md）供用户审批；requirements.md 仅在确有需求台账时可选生成。"
     : reason === "pre_approval_tasks"
-    ? "PLAN mode is not approved yet, so `.MAIN/plans/tasks.md` must not be generated. Create requirements/design or bugfix drafts and wait for approval first."
+    ? "PLAN mode is not approved yet, so `.MAIN/plans/tasks.md` must not be generated. Create a design.md or bugfix.md draft and wait for approval first."
     : reason === "missing_tasks_before_source"
     ? "The plan is approved, but there is no executable `.MAIN/plans/tasks.md` task list yet. Generate tasks.md before editing source or final deliverables."
-    : "PLAN mode is not approved yet, so source or deliverable files cannot be modified. Create `.MAIN/plans/requirements.md` plus `.MAIN/plans/design.md` (or bugfix.md) for review first.";
+    : "PLAN mode is not approved yet, so source or deliverable files cannot be modified. Create `.MAIN/plans/design.md` (or bugfix.md) for review first; requirements.md is optional for requirement-ledger cases.";
 
   callbacks.onToolExecuting(tc.name, target);
   callbacks.onToolError(tc.name, target, message);
@@ -1418,8 +1575,8 @@ async function buildPlanArtifactMutationValidationError(
     const validation = validatePlanArtifactContent(nextContent, kind);
     if (!validation.ok) {
       const message = language === "zh"
-        ? `PLAN_QUALITY_GATE: ${path} 被拦截，内容不像可审批的正式计划（${validation.reason || "质量不足"}）。请基于用户目标和已读源码重新生成 requirements/design，或用 <user_options> 询问关键分叉；不要写入工具日志、后台思考、截断提示或原始代码片段。`
-        : `PLAN_QUALITY_GATE: ${path} was rejected because it does not look like a reviewable plan artifact (${validation.reason || "quality gate"}). Regenerate requirements/design from the user goal and inspected source, or ask the user with <user_options>; do not write tool logs, hidden thinking, truncation notices, or raw source snippets.`;
+        ? `PLAN_QUALITY_GATE: ${path} 被拦截，内容不像可审批的正式计划（${validation.reason || "质量不足"}）。请基于用户目标和已读源码重新生成 design.md（或 bugfix.md），或用 <user_options> 询问关键分叉；不要写入工具日志、后台思考、截断提示或原始代码片段。`
+        : `PLAN_QUALITY_GATE: ${path} was rejected because it does not look like a reviewable plan artifact (${validation.reason || "quality gate"}). Regenerate design.md (or bugfix.md) from the user goal and inspected source, or ask the user with <user_options>; do not write tool logs, hidden thinking, truncation notices, or raw source snippets.`;
       callbacks.onToolExecuting(tc.name, target);
       callbacks.onToolError(tc.name, target, message);
       return {
@@ -1507,7 +1664,7 @@ async function executeWriteToolWithReview(
   }
 
   // Validate required parameters before presenting to user
-  const validationError = validateToolArgs(tc.name, toolArgs, allTools);
+  const validationError = validateToolExecutionContract(tc.name, toolArgs, allTools);
   if (validationError) {
     return { toolCallId: tc.id, name: tc.name, target: "", content: `Error: ${validationError}`, isError: true };
   }
@@ -1560,9 +1717,9 @@ const MAX_ITERATIONS = 25;
 const MAX_ITERATIONS_PLAN_EXECUTION = 50;
 const MAX_RECENT_PLAN_TOOL_ACTIVITY = 12;
 const CONCISE_PLAN_ARTIFACT_HINT_ZH =
-  "计划文档必须精简：requirements.md 40-80 行、design.md 60-120 行、bugfix.md 40-80 行、tasks.md 8-20 个 checkbox；不要写教程式长文、完整代码清单或重复背景。Proposal 只做一页审阅摘要。";
+  "计划文档必须精简：design.md 60-120 行、bugfix.md 40-80 行、tasks.md 8-20 个 checkbox；可选 requirements.md 40-80 行。不要写教程式长文、完整代码清单或重复背景。Proposal 只做一页审阅摘要。";
 const CONCISE_PLAN_ARTIFACT_HINT_EN =
-  "Keep plan artifacts concise: requirements.md 40-80 lines, design.md 60-120 lines, bugfix.md 40-80 lines, tasks.md 8-20 checkboxes. Do not write tutorial-style prose, full code listings, or repeated background. The Proposal should be a one-page review summary.";
+  "Keep plan artifacts concise: design.md 60-120 lines, bugfix.md 40-80 lines, tasks.md 8-20 checkboxes; optional requirements.md 40-80 lines. Do not write tutorial-style prose, full code listings, or repeated background. The Proposal should be a one-page review summary.";
 
 function logAgentEvent(event: string, data: Record<string, unknown> = {}) {
   try {
@@ -1730,6 +1887,10 @@ export async function executeAgentLoop(
       runtimeIntent,
       workflowMode,
       callbacks.getPreferredLanguage(),
+      callbacks.getGameStudioConfig?.()?.engine ?? "",
+      callbacks.getGameStudioConfig?.()?.engineVersion ?? "",
+      callbacks.getCommandDirective?.()?.kind ?? "none",
+      callbacks.getCommandDirective?.()?.action ?? "",
       availableToolNameList.join(","),
     ].join("|");
     if (systemPromptKey === appliedSystemPromptKey) return;
@@ -1750,10 +1911,12 @@ export async function executeAgentLoop(
         initialized: callbacks.getGameStudioInitialized(),
         activeStudioAgentKey: callbacks.getActiveStudioAgentKey(),
         pendingSlashCommand: callbacks.getPendingSlashCommand(),
+        studioConfig: callbacks.getGameStudioConfig?.() ?? null,
       },
       runtimeIntent,
       config.promptLanguageStrategy,
       availableToolNameList,
+      callbacks.getCommandDirective?.() ?? null,
     );
     const currentMessages = callbacks.getMessages();
     if (currentMessages.length === 0) {
@@ -1832,30 +1995,37 @@ export async function executeAgentLoop(
   let sawPlanModeToolActivity = false;
   let usedPlanRecoveryPrompt = false;
   let usedToolUnavailableRecoveryPrompt = false;
+  let usedExecuteConvergencePrompt = false;
   const attemptedPlanWriteTargets: string[] = [];
   let recentSuccessfulProjectWrite: { name: string; target: string } | null = null;
   let recoveringFromEmptyAssistantReplyAfterWrite = false;
   let lastAssistantTextForCheckpoint = "";
   const recentPlanToolActivity: PlanToolActivitySummary[] = [];
-  const rememberPlanToolActivity = (result: ToolExecutionResult) => {
+  const recentToolActivity: PlanToolActivitySummary[] = [];
+  const rememberToolActivity = (targetList: PlanToolActivitySummary[], result: ToolExecutionResult) => {
     const detail = truncateForLog(result.displayContent || result.content || "", 120);
-    recentPlanToolActivity.push({
+    targetList.push({
       name: result.name,
       target: result.target,
       status: result.isError ? "failed" : "succeeded",
       ...(detail ? { detail } : {}),
     });
-    if (recentPlanToolActivity.length > MAX_RECENT_PLAN_TOOL_ACTIVITY) {
-      recentPlanToolActivity.splice(0, recentPlanToolActivity.length - MAX_RECENT_PLAN_TOOL_ACTIVITY);
+    if (targetList.length > MAX_RECENT_PLAN_TOOL_ACTIVITY) {
+      targetList.splice(0, targetList.length - MAX_RECENT_PLAN_TOOL_ACTIVITY);
     }
   };
+  const rememberPlanToolActivity = (result: ToolExecutionResult) => rememberToolActivity(recentPlanToolActivity, result);
+  const rememberAnyToolActivity = (result: ToolExecutionResult) => rememberToolActivity(recentToolActivity, result);
 
   // ── Strict Repeat Guard ──────────────────────────────────────────
   // Track recent tool calls to detect repetition loops. For read-only
   // tools, inject one recovery hint back into the loop before treating
   // the pattern as fatal, so the model gets a chance to pivot tools.
   const recentToolCalls: Array<{ name: string; argsKey: string }> = [];
+  const recentTargetToolCalls: Array<{ name: string; targetKey: string; family: "edit" | "verify" | "other" }> = [];
   const repeatGuardRecoveredSignatures = new Set<string>();
+  const targetProgressGuardRecoveredSignatures = new Set<string>();
+  const failedToolCallCounts = new Map<string, number>();
   const readOnlyResultCache = new Map<string, CachedReadOnlyToolResult>();
   const readOnlyDuplicateSkipCounts = new Map<string, number>();
   const fileReadStates = getSessionFileReadStates(callbacks.getSessionKey());
@@ -1971,6 +2141,7 @@ export async function executeAgentLoop(
           tokenCountAfter: managedResult.tokenCountAfter,
           tokenReduction: managedResult.tokenReduction,
           compressedContext: managedResult.compressedContext,
+          tokenBreakdown: managedResult.tokenBreakdownBefore,
         }, "proactive");
         emitPlanExecutionProgress("context_compression");
       }
@@ -2087,6 +2258,7 @@ export async function executeAgentLoop(
             tokenCountAfter: aggressivelyManagedResult.tokenCountAfter,
             tokenReduction: aggressivelyManagedResult.tokenReduction,
             compressedContext: aggressivelyManagedResult.compressedContext,
+            tokenBreakdown: aggressivelyManagedResult.tokenBreakdownBefore,
           }, "reactive");
           emitPlanExecutionProgress("context_compression");
         }
@@ -2150,6 +2322,7 @@ export async function executeAgentLoop(
               tokenCountAfter: emergencyManagedResult.tokenCountAfter,
               tokenReduction: emergencyManagedResult.tokenReduction,
               compressedContext: emergencyManagedResult.compressedContext,
+              tokenBreakdown: emergencyManagedResult.tokenBreakdownBefore,
             }, "reactive");
             emitPlanExecutionProgress("context_compression");
           }
@@ -2757,7 +2930,7 @@ export async function executeAgentLoop(
           const missingStepHint =
             language === "zh"
               ? currentPlanStage === "requirements"
-                ? "你已经有 requirements.md，下一步必须基于现有需求规格生成 `.MAIN/plans/design.md`；如果设计方向仍不明确，只能用 `<user_options>` 给出面向用户的选择并停止。不要重复读取已读文件。"
+                ? "你已经有旧流程的 requirements.md，下一步必须生成或更新 `.MAIN/plans/design.md` 作为可审批方案；如果设计方向仍不明确，只能用 `<user_options>` 给出面向用户的选择并停止。不要重复读取已读文件。"
                 : currentPlanStage === "design"
                 ? "你已经有 design.md，下一步应输出正式 Proposal 或给用户关键选择；不要在批准前提前生成 tasks.md。"
                 : currentPlanStage === "bugfix"
@@ -2766,7 +2939,7 @@ export async function executeAgentLoop(
                 ? "你已经开始做项目探索了，但还没有给出可让用户决策的规划结果。下一步应先收束分歧并询问用户。"
                 : "请先给出可让用户决策的规划问题。"
               : currentPlanStage === "requirements"
-              ? "requirements.md exists. Next generate `.MAIN/plans/design.md` from the existing requirements; if the design direction is still unclear, offer `<user_options>` and stop. Do not repeat reads of files already in context."
+              ? "A legacy requirements.md exists. Next generate or update `.MAIN/plans/design.md` as the reviewable plan; if the design direction is still unclear, offer `<user_options>` and stop. Do not repeat reads of files already in context."
               : currentPlanStage === "design"
               ? "design.md exists. Next submit the formal Proposal or offer the key choices; do not generate tasks.md before approval."
               : currentPlanStage === "bugfix"
@@ -2784,8 +2957,8 @@ export async function executeAgentLoop(
                   "请继续规划，并在本轮结束前完成以下其一：\n" +
                   "1. 用普通 Markdown 输出 3-8 条关键判断，然后用面向用户的口吻给出 2-4 个 `<user_options>` 让用户选择；每个选项必须是用户可直接点击发送的完整选择，不要写成“是否……”问题句。\n" +
                   "2. 如果信息已经足够，输出正式 Proposal：`[PROPOSAL START]` + `# Proposed Plan` + 一页审阅摘要 + 合法 `<plan>` JSON。\n" +
-                  "3. 如果这是复杂实现计划，必须生成 `.MAIN/plans/requirements.md` 与 `.MAIN/plans/design.md` 供审批；在用户批准之前不要生成 `tasks.md` 或修改源码。\n" +
-                  `${currentPlanStage === "requirements" ? "当前已经有 requirements.md，本轮不要重复读文件；请直接写 design.md，或用 user_options 询问设计分叉。\n" : ""}` +
+                  "3. 如果这是复杂实现计划，必须生成 `.MAIN/plans/design.md` 供审批；requirements.md 只是可选需求台账，在用户批准之前不要生成 `tasks.md` 或修改源码。\n" +
+                  `${currentPlanStage === "requirements" ? "当前已经有旧流程 requirements.md，本轮不要重复读文件；请直接写 design.md，或用 user_options 询问设计分叉。\n" : ""}` +
                   `${wasTruncated ? "你上一条回复已经发生截断，请从中断处继续，不要重头重复。\n" : ""}` +
                   "不要只输出一句总结、结束语，或空结束符。"
                 : `The current plan has not reached an executable stage. ${missingStepHint}\n` +
@@ -2793,8 +2966,8 @@ export async function executeAgentLoop(
                   "Continue planning and complete one of these before ending this turn:\n" +
                   "1. Output 3-8 key judgments in Markdown, then offer 2-4 `<user_options>` for the user to choose from.\n" +
                   "2. If there is enough information, output the formal Proposal: `[PROPOSAL START]` + `# Proposed Plan` + one-page review summary + valid `<plan>` JSON.\n" +
-                  "3. For complex implementation planning, create `.MAIN/plans/requirements.md` and `.MAIN/plans/design.md` for review; do not generate `tasks.md` or edit source files before approval.\n" +
-                  `${currentPlanStage === "requirements" ? "requirements.md already exists. Do not repeat file reads in this turn; write design.md directly, or ask for design choices with user_options.\n" : ""}` +
+                  "3. For complex implementation planning, create `.MAIN/plans/design.md` for review; requirements.md is only an optional requirement ledger. Do not generate `tasks.md` or edit source files before approval.\n" +
+                  `${currentPlanStage === "requirements" ? "A legacy requirements.md already exists. Do not repeat file reads in this turn; write design.md directly, or ask for design choices with user_options.\n" : ""}` +
                   `${wasTruncated ? "Your previous reply was truncated; continue from the interruption point without restarting.\n" : ""}` +
                   "Do not output only a summary, sign-off, or empty stop.",
           };
@@ -3020,11 +3193,29 @@ export async function executeAgentLoop(
     const writeCalls: ToolCallToExecute[] = [];
     const readOnlyCallSignatures = new Map<string, string>();
     const queuedReadOnlySignatures = new Set<string>();
+    const toolFailureSignatures = new Map<string, string>();
     let allResults: ToolExecutionResult[] = [];
 
     for (const tc of effectiveToolCalls) {
       const toolArgs = parseToolCallArguments(tc);
       const target = getToolTarget(tc.name, toolArgs);
+      const failureSignature = buildRepeatLoopSignature(tc.name, buildRepeatLoopArgsKey(toolArgs));
+      toolFailureSignatures.set(tc.id, failureSignature);
+
+      if ((failedToolCallCounts.get(failureSignature) ?? 0) >= 2) {
+        const message = callbacks.getPreferredLanguage() === "zh"
+          ? `REPEATED_FAILURE_BLOCKED: ${tc.name}${target ? ` (${target})` : ""} 已用相同参数连续失败。请先诊断最近错误，改变参数或换一条策略，不要原样重试。`
+          : `REPEATED_FAILURE_BLOCKED: ${tc.name}${target ? ` (${target})` : ""} has failed repeatedly with identical arguments. Diagnose the latest error and change arguments or strategy before retrying.`;
+        callbacks.onToolError(tc.name, target, message);
+        allResults.push({
+          toolCallId: tc.id,
+          name: tc.name,
+          target,
+          content: `Error: ${message}`,
+          isError: true,
+        });
+        continue;
+      }
 
       if (!availableToolNames.has(tc.name)) {
         const message = callbacks.getPreferredLanguage() === "zh"
@@ -3252,8 +3443,20 @@ export async function executeAgentLoop(
       }
     }
 
+    allResults.forEach(rememberAnyToolActivity);
+
     if (workflowMode === "plan" && callbacks.getIsPlanApproved()) {
       allResults.forEach(rememberPlanToolActivity);
+    }
+
+    for (const result of allResults) {
+      const signature = toolFailureSignatures.get(result.toolCallId);
+      if (!signature) continue;
+      if (result.isError) {
+        failedToolCallCounts.set(signature, (failedToolCallCounts.get(signature) ?? 0) + 1);
+      } else {
+        failedToolCallCounts.delete(signature);
+      }
     }
 
     // Append all tool result messages
@@ -3292,13 +3495,17 @@ export async function executeAgentLoop(
         toolCapabilityRegistry,
         config.toolPermissionPolicy,
       );
-      const repeatCheck = registerToolCallForRepeatGuard(recentToolCalls, tc.name, toolArgs, autoExecutable);
+      const readOnlyShellInspection = isReadOnlyShellInspectionToolCall(tc.name, toolArgs);
+      const repeatGuardReadOnly = autoExecutable || readOnlyShellInspection;
+      const repeatCheck = registerToolCallForRepeatGuard(recentToolCalls, tc.name, toolArgs, repeatGuardReadOnly);
       if (!repeatCheck.repeated) continue;
 
       const target = getToolTarget(tc.name, toolArgs);
-      if (autoExecutable && !repeatGuardRecoveredSignatures.has(repeatCheck.signature)) {
+      if (repeatGuardReadOnly && (readOnlyShellInspection || !repeatGuardRecoveredSignatures.has(repeatCheck.signature))) {
         const recoveryMessage = formatRepeatLoopRecoveryMessage(tc.name, target, repeatCheck.threshold);
-        repeatGuardRecoveredSignatures.add(repeatCheck.signature);
+        if (!readOnlyShellInspection) {
+          repeatGuardRecoveredSignatures.add(repeatCheck.signature);
+        }
         recentToolCalls.length = 0;
         callbacks.onToolError(tc.name, target, recoveryMessage);
         callbacks.appendMessage({
@@ -3344,8 +3551,69 @@ export async function executeAgentLoop(
       return;
     }
 
-    if (recoveredReadOnlyRepeat) {
+    let recoveredTargetProgressLoop = false;
+    if (!recoveredReadOnlyRepeat) {
+      for (const tc of effectiveToolCalls) {
+        const toolArgs = parseToolCallArguments(tc);
+        const target = getToolTarget(tc.name, toolArgs);
+        const progressCheck = registerTargetProgressForLoopGuard(recentTargetToolCalls, tc.name, target);
+        if (!progressCheck.repeated) continue;
+
+        const recoveryMessage = formatTargetProgressLoopRecoveryMessage(
+          progressCheck.family,
+          target || progressCheck.targetKey,
+          progressCheck.threshold,
+        );
+        if (!targetProgressGuardRecoveredSignatures.has(progressCheck.signature)) {
+          targetProgressGuardRecoveredSignatures.add(progressCheck.signature);
+          recentTargetToolCalls.length = 0;
+          callbacks.onToolError(tc.name, target, recoveryMessage);
+          callbacks.appendMessage({
+            role: "system",
+            content: `[System: ${recoveryMessage}]`,
+          });
+          recoveredTargetProgressLoop = true;
+          break;
+        }
+
+        callbacks.onNonActionableStop(
+          callbacks.getPreferredLanguage() === "zh"
+            ? [
+                "执行已暂停：检测到同一目标上的工具进展循环。",
+                recoveryMessage,
+                "请继续时先核查当前 workspace 状态，再选择不同策略或输出最终结果。",
+              ].join("\n")
+            : [
+                "Execution paused: detected a tool progress loop on the same target.",
+                recoveryMessage,
+                "On resume, first inspect current workspace state, then choose a different strategy or output the final result.",
+              ].join("\n"),
+          "no_action",
+        );
+        callbacks.onStatusChange("idle");
+        return;
+      }
+    }
+
+    if (recoveredReadOnlyRepeat || recoveredTargetProgressLoop) {
       continue;
+    }
+
+    if (
+      workflowMode === "edit" &&
+      !usedExecuteConvergencePrompt &&
+      iteration >= Math.max(8, Math.floor(effectiveMaxIterations * EXECUTE_CONVERGENCE_PROMPT_RATIO))
+    ) {
+      usedExecuteConvergencePrompt = true;
+      logAgentEvent("execute_convergence_prompt", {
+        iteration,
+        maxIterations: effectiveMaxIterations,
+        recentToolActivity: recentToolActivity.length,
+      });
+      callbacks.appendMessage({
+        role: "user",
+        content: buildExecuteConvergencePrompt(callbacks.getPreferredLanguage(), iteration, effectiveMaxIterations),
+      });
     }
 
     // Loop continues — the model sees all tool results and can respond
@@ -3390,6 +3658,40 @@ export async function executeAgentLoop(
     return;
   }
 
-  callbacks.onError(`Agent loop reached maximum iterations (${effectiveMaxIterations}).`);
+  if (workflowMode === "edit") {
+    const checkpoint = buildPlanMaxIterationsCheckpoint({
+      iterationCount: effectiveMaxIterations,
+      maxIterations: effectiveMaxIterations,
+      autoResumeCount: callbacks.getPlanAutoResumeCount?.() ?? 0,
+      tasks: [],
+      evidenceLedger: [],
+      recentToolActivity,
+      lastAssistantText: lastAssistantTextForCheckpoint,
+      unresolvedBlockers: [
+        `Agent loop reached maximum iterations (${effectiveMaxIterations}) while execute runtime was still active.`,
+      ],
+    });
+    logAgentEvent("execute_max_iterations_checkpoint", {
+      workflowMode,
+      iteration: effectiveMaxIterations,
+      autoResumeCount: checkpoint.autoResumeCount,
+      recentToolActivity: checkpoint.recentToolActivity.length,
+    });
+    callbacks.onStatusChange("idle");
+    const handled = await callbacks.onExecuteMaxIterationsCheckpoint?.(checkpoint);
+    if (handled) return;
+    callbacks.onNonActionableStop(
+      buildExecuteMaxIterationsPauseNotice(checkpoint, callbacks.getPreferredLanguage()),
+      "no_action",
+    );
+    return;
+  }
+
+  callbacks.onNonActionableStop(
+    callbacks.getPreferredLanguage() === "zh"
+      ? `本轮达到 ${effectiveMaxIterations} 轮安全边界，已停止在可恢复状态。`
+      : `This turn reached the ${effectiveMaxIterations}-iteration safety boundary and stopped in a recoverable state.`,
+    "no_action",
+  );
   callbacks.onStatusChange("idle");
 }

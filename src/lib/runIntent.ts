@@ -14,12 +14,52 @@ export type ResolvedRunIntent = ResolvedUserIntent;
 export type RunIntentRiskLevel = "low" | "medium" | "high";
 export type RunIntentUiCategory = "workflow_mode" | "output_style" | "discussion" | "studio_workflow";
 export type RunIntentToolPolicy = "none" | "read_only" | "write" | "plan_gated" | "studio_workflow";
-export type PendingRunDecisionKind = "intent_confirmation" | "execution_consent";
+export type PendingRunDecisionKind = "intent_confirmation" | "execution_consent" | "mode_switch";
 export type PendingRunDecisionSource = "pre_submit" | "preflight" | "model" | "tool_gate";
+export type PendingRunDecisionChoice =
+  | ResolvedUserIntent
+  | "switch_game_studio"
+  | "switch_game_studio_choose_engine"
+  | "switch_game_studio_unity"
+  | "switch_game_studio_godot"
+  | "switch_game_studio_unreal"
+  | "stay_main";
 export type RunIntentControlAction = "approve_plan" | "resume_plan_execution";
+export type CommandDirectiveKind =
+  | "none"
+  | "shell"
+  | "unity"
+  | "git"
+  | "file_modify"
+  | "report"
+  | "plan_approval"
+  | "plan_resume"
+  | "studio"
+  | "skill"
+  | "knowledge"
+  | "mcp";
+export type CommandDirectiveSource =
+  | "natural_language"
+  | "main_shortcut"
+  | "studio_slash"
+  | "skill_command"
+  | "preflight"
+  | "continuation"
+  | "debug";
+
+export interface CommandDirective {
+  kind: CommandDirectiveKind;
+  action?: string;
+  target?: string;
+  source?: CommandDirectiveSource;
+  requiresWorkspace?: boolean;
+  requiresApproval?: boolean;
+  confidence?: number;
+  reason?: string;
+}
 
 export interface PendingRunDecisionOption {
-  id: ResolvedUserIntent;
+  id: PendingRunDecisionChoice;
   label: string;
   value: string;
 }
@@ -30,6 +70,8 @@ export interface RunIntentResolution {
   confidence: number;
   bypassMainRouter: boolean;
   riskLevel: RunIntentRiskLevel;
+  requiresApproval?: boolean;
+  commandDirective?: CommandDirective;
   needsDecision?: boolean;
   suggestedIntent?: ResolvedUserIntent;
   decisionOptions?: ResolvedUserIntent[];
@@ -48,6 +90,9 @@ export interface IntentPreflightResult {
   outputFormat?: "answer" | "summary" | "report" | "plan" | "analysis" | "execution";
   bypassMainRouter?: boolean;
   needsWorkspaceRead?: boolean;
+  riskLevel?: RunIntentRiskLevel;
+  requiresApproval?: boolean;
+  commandDirective?: CommandDirective;
 }
 
 export interface PendingRunDecision {
@@ -304,6 +349,13 @@ const RESUME_PLAN_PATTERNS = [
   /继续把(?:剩余)?任务做完/i,
 ];
 
+const EXISTING_PLAN_EXECUTION_PATTERNS = [
+  /(?:根据|按照|按).{0,24}(?:\.MAIN[\\/ ]*plans|\.main[\\/ ]*plans|plans\s*(?:文件夹|目录|folder)|计划(?:文件夹|目录)|tasks\.md|\.MAIN[\\/ ]*plans[\\/ ]*tasks\.md).{0,80}(?:完成|执行|继续|落地|处理|实现|推进)/i,
+  /(?:完成|执行|继续|落地|处理|实现|推进).{0,60}(?:\.MAIN[\\/ ]*plans|\.main[\\/ ]*plans|plans\s*(?:文件夹|目录|folder)|计划任务|任务清单|tasks\.md)/i,
+  /(?:执行|继续|完成).{0,24}(?:计划任务|计划中的任务|任务清单|执行方案和任务|方案和任务)/i,
+  /\b(?:execute|resume|continue|finish).{0,40}(?:\.MAIN[\\/ ]*plans|tasks\.md|plan tasks|task list)\b/i,
+];
+
 const PREVIOUS_TURN_CONTINUATION_PATTERNS = [
   /^(?:继续|继续吧|接着来|接着写|接着做|继续做|继续处理|继续执行|继续推进|往下继续|接着上面|接着刚才)[。.!！\s]*$/i,
   /^(?:继续|接着)(?:上次|上一轮|之前|刚才|前面|上面)(?:的)?(?:任务|操作|内容|步骤|流程)?[。.!！\s]*$/i,
@@ -478,6 +530,275 @@ function countPatternMatches(input: string, patterns: RegExp[]): number {
 
 function localizeReason(language: "zh" | "en", zh: string, en: string): string {
   return language === "en" ? en : zh;
+}
+
+const COMMAND_DIRECTIVE_KINDS = new Set<CommandDirectiveKind>([
+  "none",
+  "shell",
+  "unity",
+  "git",
+  "file_modify",
+  "report",
+  "plan_approval",
+  "plan_resume",
+  "studio",
+  "skill",
+  "knowledge",
+  "mcp",
+]);
+
+const COMMAND_DIRECTIVE_SOURCES = new Set<CommandDirectiveSource>([
+  "natural_language",
+  "main_shortcut",
+  "studio_slash",
+  "skill_command",
+  "preflight",
+  "continuation",
+  "debug",
+]);
+
+function normalizeDirectiveString(value: unknown, maxLength = 96): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.replace(/\s+/g, " ").trim();
+  return trimmed ? trimmed.slice(0, maxLength) : undefined;
+}
+
+function createCommandDirective(
+  kind: CommandDirectiveKind,
+  patch: Omit<CommandDirective, "kind"> = {},
+): CommandDirective {
+  return {
+    kind,
+    source: patch.source ?? "natural_language",
+    requiresWorkspace: patch.requiresWorkspace ?? kind !== "none",
+    requiresApproval: patch.requiresApproval ?? ["shell", "git", "file_modify", "unity", "studio", "mcp", "skill"].includes(kind),
+    confidence: patch.confidence ?? (kind === "none" ? 0.5 : 0.86),
+    ...(patch.action ? { action: patch.action } : {}),
+    ...(patch.target ? { target: patch.target } : {}),
+    ...(patch.reason ? { reason: patch.reason } : {}),
+  };
+}
+
+export function normalizeCommandDirective(
+  value: unknown,
+  fallback?: CommandDirective | null,
+): CommandDirective | undefined {
+  if (!value || typeof value !== "object") return fallback ?? undefined;
+  const candidate = value as Partial<CommandDirective>;
+  const kind = typeof candidate.kind === "string" && COMMAND_DIRECTIVE_KINDS.has(candidate.kind as CommandDirectiveKind)
+    ? candidate.kind as CommandDirectiveKind
+    : fallback?.kind;
+  if (!kind) return fallback ?? undefined;
+  const source = typeof candidate.source === "string" && COMMAND_DIRECTIVE_SOURCES.has(candidate.source as CommandDirectiveSource)
+    ? candidate.source as CommandDirectiveSource
+    : fallback?.source;
+  const confidence = typeof candidate.confidence === "number"
+    ? Math.max(0, Math.min(1, candidate.confidence))
+    : fallback?.confidence;
+  return {
+    kind,
+    ...(source ? { source } : {}),
+    ...(normalizeDirectiveString(candidate.action) ?? fallback?.action
+      ? { action: normalizeDirectiveString(candidate.action) ?? fallback?.action }
+      : {}),
+    ...(normalizeDirectiveString(candidate.target) ?? fallback?.target
+      ? { target: normalizeDirectiveString(candidate.target) ?? fallback?.target }
+      : {}),
+    requiresWorkspace: typeof candidate.requiresWorkspace === "boolean"
+      ? candidate.requiresWorkspace
+      : fallback?.requiresWorkspace,
+    requiresApproval: typeof candidate.requiresApproval === "boolean"
+      ? candidate.requiresApproval
+      : fallback?.requiresApproval,
+    ...(confidence !== undefined ? { confidence } : {}),
+    ...(normalizeDirectiveString(candidate.reason, 180) ?? fallback?.reason
+      ? { reason: normalizeDirectiveString(candidate.reason, 180) ?? fallback?.reason }
+      : {}),
+  };
+}
+
+function inferGitAction(input: string): string {
+  const lower = input.toLowerCase();
+  if (/(?:commit|提交).{0,24}(?:push|推送)|(?:push|推送).{0,24}(?:commit|提交)/i.test(input)) return "commit_push";
+  if (/\bpush\b|推送/i.test(input)) return "push";
+  if (/\bcommit\b|提交/i.test(input)) return "commit";
+  if (/\bdiff\b|变更|改动/i.test(input)) return "diff";
+  if (/\bstatus\b|状态/i.test(input)) return "status";
+  const command = lower.match(/\bgit\s+([a-z-]+)/i)?.[1];
+  return command || "git";
+}
+
+function inferShellAction(input: string): string {
+  if (/deploy|部署|发布|上线/i.test(input)) return "deploy";
+  if (/\b(?:test|pytest|vitest|jest|playwright)\b|测试|验证/i.test(input)) return "test";
+  if (/\b(?:build|package|release)\b|构建|打包|发布/i.test(input)) return "build";
+  if (/\b(?:start|dev|serve)\b|启动|服务/i.test(input)) return "start";
+  return "run";
+}
+
+function inferUnityAction(input: string): string {
+  if (/roslyn|c#|\.cs\b|代码|脚本/i.test(input)) return "code";
+  if (/引用|reference|yaml|prefab|预制体|scene|场景|asset|资源/i.test(input)) return "asset_context";
+  if (/execute|执行|editor|编辑器/i.test(input)) return "editor_execute";
+  return "unity_workflow";
+}
+
+export function inferCommandDirective(
+  input: string,
+  intent: ResolvedUserIntent,
+  options: {
+    source?: CommandDirectiveSource;
+    controlAction?: RunIntentControlAction;
+    parsedStudioCommand?: PendingSlashCommand | null;
+  } = {},
+): CommandDirective {
+  const source = options.source ?? "natural_language";
+  const normalizedInput = normalizeInput(input);
+  const lower = normalizedInput.toLowerCase();
+
+  if (options.controlAction === "approve_plan") {
+    return createCommandDirective("plan_approval", {
+      source,
+      action: "approve_plan",
+      requiresWorkspace: false,
+      requiresApproval: false,
+      confidence: 0.98,
+      reason: "The user is approving the current plan.",
+    });
+  }
+
+  if (options.controlAction === "resume_plan_execution") {
+    return createCommandDirective("plan_resume", {
+      source,
+      action: "resume_plan_execution",
+      requiresWorkspace: true,
+      requiresApproval: false,
+      confidence: 0.96,
+      reason: "The user is resuming an approved plan.",
+    });
+  }
+
+  if (options.parsedStudioCommand?.type === "workflow" || intent === "studio_workflow") {
+    return createCommandDirective("studio", {
+      source: source === "natural_language" ? "studio_slash" : source,
+      action: options.parsedStudioCommand?.type === "workflow" ? options.parsedStudioCommand.slug : "studio_workflow",
+      target: options.parsedStudioCommand?.type === "workflow" ? options.parsedStudioCommand.canonicalCommand : undefined,
+      requiresWorkspace: true,
+      requiresApproval: true,
+      confidence: 0.96,
+      reason: "MAIN Game Studio command or workflow.",
+    });
+  }
+
+  if (/\bgit\s+(?:add|commit|push|status|diff|log|branch|checkout|switch|merge|rebase)\b/i.test(normalizedInput) || /(?:提交|推送|查看|检查).{0,16}(?:git|代码|改动|变更|状态)/i.test(normalizedInput) || /(?:提交|commit).{0,16}(?:推送|push)|(?:推送|push).{0,16}(?:提交|commit)|^(?:提交|推送)(?:一下)?$/i.test(normalizedInput) || /(?:commit|push)(?: my| the| these| current)?(?: changes| branch| commits)?/i.test(normalizedInput)) {
+    return createCommandDirective("git", {
+      source,
+      action: inferGitAction(normalizedInput),
+      target: "git",
+      requiresWorkspace: true,
+      requiresApproval: true,
+      confidence: 0.94,
+      reason: "Git command intent detected.",
+    });
+  }
+
+  if (/\bunity\b|unity\s*mcp|editor\s*plugin|roslyn|prefab|scene|asset|yaml|\.asmdef\b|\.unity\b|\.prefab\b|预制体|场景|资源|编辑器插件|引用搜索|C#执行|c# 执行/i.test(normalizedInput)) {
+    return createCommandDirective("unity", {
+      source,
+      action: inferUnityAction(normalizedInput),
+      target: "unity",
+      requiresWorkspace: true,
+      requiresApproval: intent === "execute",
+      confidence: 0.9,
+      reason: "Unity or Unity tooling intent detected.",
+    });
+  }
+
+  if (/\bmcp\b/i.test(normalizedInput)) {
+    return createCommandDirective("mcp", {
+      source,
+      action: /tool|工具|server|服务器/i.test(normalizedInput) ? "tool_route" : "mcp_context",
+      target: "mcp",
+      requiresWorkspace: true,
+      requiresApproval: intent === "execute",
+      confidence: 0.84,
+      reason: "MCP tool intent detected.",
+    });
+  }
+
+  if (/^(?:npm|pnpm|yarn|bun|node|python|python3|pytest|cargo|go|rustc|dotnet|bash|sh|make)\b/i.test(lower) || /\b(?:run|execute|start)\b.{0,24}\b(?:command|script|deploy|test|build|server)\b/i.test(lower) || /(?:执行|运行|启动).{0,16}(?:命令|脚本|测试|构建|服务|部署)/i.test(normalizedInput) || /(?:同步|部署|上传|发布).{0,32}(?:服务器|远程|生产|线上|server|remote|production)|(?:服务器|远程|生产|线上|server|remote|production).{0,32}(?:同步|部署|上传|发布)/i.test(normalizedInput)) {
+    return createCommandDirective("shell", {
+      source,
+      action: inferShellAction(normalizedInput),
+      target: normalizeDirectiveString(normalizedInput, 80),
+      requiresWorkspace: true,
+      requiresApproval: true,
+      confidence: 0.9,
+      reason: "Shell command intent detected.",
+    });
+  }
+
+  if (intent === "report" || matchesAny(normalizedInput, STRONG_REPORT_PATTERNS)) {
+    return createCommandDirective("report", {
+      source,
+      action: "generate_report",
+      requiresWorkspace: /文件|项目|代码|workspace|repo|仓库|资料|数据/i.test(normalizedInput),
+      requiresApproval: false,
+      confidence: 0.9,
+      reason: "Report generation intent detected.",
+    });
+  }
+
+  if (/(?:修改|实现|修复|写入|创建|生成|补上|改掉|落地|新增|删除|替换|重构)|\b(?:implement|fix|write|create|generate|update|patch|modify|refactor|delete|replace)\b/i.test(normalizedInput) && (intent === "execute" || intent === "plan")) {
+    return createCommandDirective("file_modify", {
+      source,
+      action: intent === "plan" ? "plan_file_change" : "workspace_file_change",
+      requiresWorkspace: true,
+      requiresApproval: intent === "execute",
+      confidence: 0.86,
+      reason: "Workspace file modification intent detected.",
+    });
+  }
+
+  if (/搜索|检索|引用|查找|索引|\b(?:search|find|references?|index|lookup)\b/i.test(normalizedInput) && intent !== "discuss") {
+    return createCommandDirective("knowledge", {
+      source,
+      action: "workspace_search",
+      requiresWorkspace: true,
+      requiresApproval: false,
+      confidence: 0.78,
+      reason: "Workspace knowledge lookup intent detected.",
+    });
+  }
+
+  return createCommandDirective("none", {
+    source,
+    requiresWorkspace: false,
+    requiresApproval: false,
+    confidence: 0.5,
+  });
+}
+
+function finalizeRunIntentResolution(
+  input: string,
+  context: ResolveTurnRunIntentContext,
+  resolution: Omit<RunIntentResolution, "commandDirective" | "requiresApproval"> & {
+    commandDirective?: CommandDirective;
+    requiresApproval?: boolean;
+  },
+): RunIntentResolution {
+  const commandDirective =
+    resolution.commandDirective ??
+    inferCommandDirective(input, resolution.intent, {
+      controlAction: resolution.controlAction,
+      parsedStudioCommand: context.parsedStudioCommand,
+      source: context.parsedStudioCommand?.type === "workflow" ? "studio_slash" : "natural_language",
+    });
+  return {
+    ...resolution,
+    commandDirective,
+    requiresApproval: resolution.requiresApproval ?? commandDirective.requiresApproval ?? resolution.riskLevel === "high",
+  };
 }
 
 export function getMainIntentShortcuts(language: "zh" | "en" = "zh"): MainIntentShortcutItem[] {
@@ -793,6 +1114,12 @@ export function looksLikePreviousTurnContinuationInput(input: string): boolean {
   return matchesAny(normalizedInput, PREVIOUS_TURN_CONTINUATION_PATTERNS);
 }
 
+export function looksLikeExistingPlanExecutionRequest(input: string): boolean {
+  const normalizedInput = normalizeInput(input);
+  if (!normalizedInput) return false;
+  return matchesAny(normalizedInput, EXISTING_PLAN_EXECUTION_PATTERNS);
+}
+
 export function isResumablePreviousTurnStatus(status?: string | null): boolean {
   return !!status && RESUMABLE_PREVIOUS_TURN_STATUSES.has(status);
 }
@@ -820,19 +1147,21 @@ export function resolveTurnRunIntent(
 ): RunIntentResolution {
   const language = context.language === "en" ? "en" : "zh";
   const normalizedInput = normalizeInput(input);
+  const finalize = (resolution: Parameters<typeof finalizeRunIntentResolution>[2]) =>
+    finalizeRunIntentResolution(input, context, resolution);
 
   if (!normalizedInput) {
-    return {
+    return finalize({
       intent: "discuss",
       reason: localizeReason(language, "空输入默认按普通讨论处理。", "Empty input defaults to discuss."),
       confidence: 0.5,
       bypassMainRouter: false,
       riskLevel: "low",
-    };
+    });
   }
 
   if (context.parsedStudioCommand?.type === "workflow") {
-    return {
+    return finalize({
       intent: "studio_workflow",
       reason: localizeReason(
         language,
@@ -842,11 +1171,11 @@ export function resolveTurnRunIntent(
       confidence: 0.99,
       bypassMainRouter: true,
       riskLevel: "medium",
-    };
+    });
   }
 
   if (context.hasPlanArtifacts && !context.isPlanApproved && matchesAny(normalizedInput, APPROVE_PLAN_PATTERNS)) {
-    return {
+    return finalize({
       intent: "plan",
       reason: localizeReason(
         language,
@@ -857,7 +1186,7 @@ export function resolveTurnRunIntent(
       bypassMainRouter: false,
       riskLevel: "low",
       controlAction: "approve_plan",
-    };
+    });
   }
 
   if (
@@ -865,7 +1194,7 @@ export function resolveTurnRunIntent(
     (context.isPlanApproved || context.planStage === "executing") &&
     matchesAny(normalizedInput, RESUME_PLAN_PATTERNS)
   ) {
-    return {
+    return finalize({
       intent: "plan",
       reason: localizeReason(
         language,
@@ -876,11 +1205,26 @@ export function resolveTurnRunIntent(
       bypassMainRouter: false,
       riskLevel: "low",
       controlAction: "resume_plan_execution",
-    };
+    });
+  }
+
+  if (looksLikeExistingPlanExecutionRequest(normalizedInput)) {
+    return finalize({
+      intent: "plan",
+      reason: localizeReason(
+        language,
+        "检测到你要按现有 `.MAIN/plans` 或任务清单继续执行，本轮会恢复计划执行语义并使用执行工具。",
+        "Detected a request to execute the existing `.MAIN/plans` or task list, so this turn will resume plan execution with execute tools.",
+      ),
+      confidence: 0.95,
+      bypassMainRouter: false,
+      riskLevel: "medium",
+      controlAction: "resume_plan_execution",
+    });
   }
 
   if (matchesAny(normalizedInput, STRONG_REPORT_PATTERNS)) {
-    return {
+    return finalize({
       intent: "report",
       reason: localizeReason(
         language,
@@ -890,11 +1234,11 @@ export function resolveTurnRunIntent(
       confidence: 0.96,
       bypassMainRouter: false,
       riskLevel: "medium",
-    };
+    });
   }
 
   if (matchesAny(normalizedInput, STRONG_SUMMARIZE_PATTERNS)) {
-    return {
+    return finalize({
       intent: "summarize",
       reason: localizeReason(
         language,
@@ -904,11 +1248,11 @@ export function resolveTurnRunIntent(
       confidence: 0.94,
       bypassMainRouter: false,
       riskLevel: "low",
-    };
+    });
   }
 
   if (matchesAny(normalizedInput, STRONG_ANALYZE_PATTERNS)) {
-    return {
+    return finalize({
       intent: "analyze",
       reason: localizeReason(
         language,
@@ -918,11 +1262,11 @@ export function resolveTurnRunIntent(
       confidence: 0.95,
       bypassMainRouter: false,
       riskLevel: "low",
-    };
+    });
   }
 
   if (matchesAny(normalizedInput, STRONG_PLAN_PATTERNS)) {
-    return {
+    return finalize({
       intent: "plan",
       reason: localizeReason(
         language,
@@ -932,12 +1276,12 @@ export function resolveTurnRunIntent(
       confidence: 0.96,
       bypassMainRouter: false,
       riskLevel: "medium",
-    };
+    });
   }
 
   const complexImplementationMatches = countPatternMatches(normalizedInput, COMPLEX_IMPLEMENTATION_PATTERNS);
   if (complexImplementationMatches >= 2) {
-    return {
+    return finalize({
       intent: "plan",
       reason: localizeReason(
         language,
@@ -947,11 +1291,11 @@ export function resolveTurnRunIntent(
       confidence: 0.93,
       bypassMainRouter: false,
       riskLevel: "high",
-    };
+    });
   }
 
   if (matchesAny(normalizedInput, STRONG_EXECUTE_PATTERNS)) {
-    return {
+    return finalize({
       intent: "execute",
       reason: localizeReason(
         language,
@@ -961,11 +1305,11 @@ export function resolveTurnRunIntent(
       confidence: 0.94,
       bypassMainRouter: false,
       riskLevel: "medium",
-    };
+    });
   }
 
   if (matchesAny(normalizedInput, WEAK_PLAN_PATTERNS)) {
-    return {
+    return finalize({
       intent: "discuss",
       reason: localizeReason(
         language,
@@ -978,7 +1322,7 @@ export function resolveTurnRunIntent(
       needsDecision: true,
       suggestedIntent: "plan",
       decisionOptions: ["plan", "execute", "discuss"],
-    };
+    });
   }
 
   let riskMatches = 0;
@@ -988,7 +1332,7 @@ export function resolveTurnRunIntent(
     }
   }
   if (riskMatches >= 2) {
-    return {
+    return finalize({
       intent: "execute",
       reason: localizeReason(
         language,
@@ -1001,12 +1345,12 @@ export function resolveTurnRunIntent(
       needsDecision: true,
       suggestedIntent: "plan",
       decisionOptions: ["plan", "execute", "discuss"],
-    };
+    });
   }
 
   if (context.mainModeKey === "game_studio") {
     if (context.previousTurnIntent === "studio_workflow") {
-      return {
+      return finalize({
         intent: "studio_workflow",
         reason: localizeReason(
           language,
@@ -1016,9 +1360,9 @@ export function resolveTurnRunIntent(
         confidence: 0.92,
         bypassMainRouter: true,
         riskLevel: "medium",
-      };
+      });
     }
-    return {
+    return finalize({
       intent: "discuss",
       reason: localizeReason(
         language,
@@ -1028,10 +1372,10 @@ export function resolveTurnRunIntent(
       confidence: 0.84,
       bypassMainRouter: false,
       riskLevel: "low",
-    };
+    });
   }
 
-  return {
+  return finalize({
     intent: "discuss",
     reason: localizeReason(
       language,
@@ -1041,5 +1385,5 @@ export function resolveTurnRunIntent(
     confidence: 0.74,
     bypassMainRouter: false,
     riskLevel: "low",
-  };
+  });
 }

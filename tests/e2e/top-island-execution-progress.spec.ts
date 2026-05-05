@@ -29,5 +29,6 @@ test("TopIsland shows the full approved plan task list during execution", async 
   await expect(page.getByTestId("top-island-plan-progress")).toContainText("T1: 更新");
   await expect(page.getByTestId("top-island-plan-progress")).toContainText("T8: 更新");
   await expect(page.getByTestId("top-island-plan-progress")).toContainText("T9: 更新");
-  await expect(page.getByTestId("top-island-plan-progress")).toContainText("当前");
+  await expect(page.getByTestId("top-island-current-plan-task")).toContainText("T9: 更新");
+  await expect(page.getByTestId("top-island-current-plan-task")).not.toContainText("当前");
 });

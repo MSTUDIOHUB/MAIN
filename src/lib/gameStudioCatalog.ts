@@ -8,6 +8,10 @@ export const NEXUS_MODE_KEYS = [
 
 export type NexusModeKey = (typeof NEXUS_MODE_KEYS)[number];
 
+export const STUDIO_ENGINE_KEYS = ["unity", "godot", "unreal"] as const;
+
+export type StudioEngineKey = (typeof STUDIO_ENGINE_KEYS)[number];
+
 export const STUDIO_AGENT_KEYS = [
   "studio_auto",
   "creative-director",
@@ -192,9 +196,17 @@ export type GameStudioPackManifest = {
 export type StudioConfig = {
   engine: string;
   engineLanguage: string;
+  engineVersion?: string;
   reviewMode: string;
   activeStudioAgent: StudioAgentKey;
   packVersion: string;
+};
+
+export type ParsedSetupEngineArgs = {
+  mode: "guided" | "configure" | "refresh" | "upgrade" | "unknown";
+  engine: StudioEngineKey | null;
+  version?: string;
+  raw: string;
 };
 
 export const GAME_STUDIO_PACK_VERSION = "ccgs-v1.0.0-beta-main-nexus-v1";
@@ -437,6 +449,68 @@ export function normalizeStudioAgentKey(value: string | null | undefined): Studi
   return (STUDIO_AGENT_KEYS as readonly string[]).includes(value) ? (value as StudioAgentKey) : "studio_auto";
 }
 
+export function normalizeStudioEngineKey(value: string | null | undefined): StudioEngineKey | null {
+  if (!value) return null;
+  const normalized = value
+    .trim()
+    .toLowerCase()
+    .replace(/^unreal\s+engine$/, "unreal")
+    .replace(/^ue\s*5?$/, "unreal");
+  if (normalized === "unity") return "unity";
+  if (normalized === "godot") return "godot";
+  if (normalized === "unreal" || normalized === "ue" || normalized === "ue5") return "unreal";
+  return null;
+}
+
+export function getDefaultStudioAgentForEngine(engine: StudioEngineKey | null | undefined): StudioAgentKey {
+  switch (engine) {
+    case "unity":
+      return "unity-specialist";
+    case "godot":
+      return "godot-specialist";
+    case "unreal":
+      return "unreal-specialist";
+    default:
+      return "studio_auto";
+  }
+}
+
+export function getDefaultStudioLanguageForEngine(engine: StudioEngineKey | null | undefined): string {
+  switch (engine) {
+    case "unity":
+      return "C#";
+    case "godot":
+      return "GDScript";
+    case "unreal":
+      return "C++ / Blueprint";
+    default:
+      return "unconfigured";
+  }
+}
+
+export function parseSetupEngineArgs(args: string | null | undefined): ParsedSetupEngineArgs {
+  const raw = (args || "").trim();
+  if (!raw) return { mode: "guided", engine: null, raw };
+
+  const tokens = raw.split(/\s+/);
+  const first = tokens[0]?.toLowerCase() || "";
+  if (first === "refresh") return { mode: "refresh", engine: null, raw };
+  if (first === "upgrade") return { mode: "upgrade", engine: null, raw };
+
+  const firstTwo = tokens.slice(0, 2).join(" ");
+  const engine = normalizeStudioEngineKey(first) || normalizeStudioEngineKey(firstTwo);
+  if (!engine) return { mode: "unknown", engine: null, raw };
+
+  const versionTokens = tokens.slice(engine === "unreal" && tokens[1]?.toLowerCase() === "engine" ? 2 : 1);
+  const version = versionTokens.join(" ").trim() || undefined;
+  return {
+    mode: "configure",
+    engine,
+    ...(version ? { version } : {}),
+    raw,
+  };
+}
+
 export function humanizeSlug(slug: string): string {
   return slug
     .split("-")
@@ -555,14 +629,19 @@ export function buildGameStudioUserEnvelope(params: {
   command: PendingSlashCommand | null;
   commandPath?: string | null;
   agentPath?: string | null;
+  studioConfig?: StudioConfig | null;
   responseLanguage?: "zh" | "en";
 }): string {
   const responseLanguage = params.responseLanguage === "en" ? "English" : "简体中文";
+  const studioConfig = params.studioConfig ?? null;
   const lines = [
     "[GAME_STUDIO_CONTEXT]",
     "mode: nexus_game_studio",
     `activeStudioAgent: ${params.activeStudioAgent}`,
     `responseLanguage: ${responseLanguage}`,
+    `engine: ${studioConfig?.engine || "unconfigured"}`,
+    `engineLanguage: ${studioConfig?.engineLanguage || "unconfigured"}`,
+    `engineVersion: ${studioConfig?.engineVersion || "unconfigured"}`,
     "protocolRoot: .protocols/game-studio",
     "protocolEntry: .protocols/game-studio/SKILL.md",
     params.command ? `slashCommand: ${params.command.canonicalCommand}` : "slashCommand: none",
@@ -577,6 +656,9 @@ export function buildGameStudioUserEnvelope(params: {
 
   lines.push(
     "instructions: Read the protocol entry first. Then read the referenced command and active agent files before deciding how to respond.",
+    studioConfig?.engine === "unity"
+      ? "unityExecutionContract: Game Studio owns workflow and expert routing; Unity Editor changes should use Unity MCP when available, prefab/scene/YAML references must be inspected before modification, and C# symbol/reference work should use Roslyn-capable tools when available. If these tools are not exposed, state the capability gap clearly."
+      : "",
     `languageInstruction: Reply to the user in ${responseLanguage}.`,
     "[/GAME_STUDIO_CONTEXT]",
     "",
@@ -584,7 +666,7 @@ export function buildGameStudioUserEnvelope(params: {
     params.originalText,
   );
 
-  return lines.join("\n");
+  return lines.filter((line) => line !== "").join("\n");
 }
 
 export function createDefaultStudioConfig(activeStudioAgent: StudioAgentKey = "studio_auto"): StudioConfig {

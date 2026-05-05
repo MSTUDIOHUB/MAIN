@@ -198,6 +198,19 @@ test("normalization collapses repeated hidden reasoning loops", () => {
   assert.match(normalized.visibleText, /最终结论/);
 });
 
+test("normalization keeps hidden thought out of visible text used for history", () => {
+  const normalized = normalizeAssistantTurn({
+    content: "<thinking>这里是不可回流给模型历史的内部推理。</thinking>\n\n可见结论：继续执行当前任务。",
+    toolCalls: [],
+    finishReason: "stop",
+  });
+
+  assert.match(normalized.hiddenThought, /内部推理/);
+  assert.match(normalized.visibleText, /可见结论/);
+  assert.doesNotMatch(normalized.visibleText, /内部推理/);
+  assert.doesNotMatch(normalized.visibleText, /thinking/);
+});
+
 test("normalization treats native user_options calls as UI choices, not executable tools", () => {
   const normalized = normalizeAssistantTurn({
     content: "我需要你确认下一步范围。",

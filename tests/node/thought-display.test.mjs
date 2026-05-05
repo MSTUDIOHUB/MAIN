@@ -187,6 +187,21 @@ test("thought display summary removes synthetic placeholder and near duplicate p
   assert.doesNotMatch(summary, /后台思考已折叠/);
 });
 
+test("thought display detailed text removes near duplicate Chinese process lines", () => {
+  const display = deriveThoughtDisplay([
+    "我需要先检查 SettingsModal 的通用设置区域。",
+    "我要先查看 SettingsModal 通用设置区域。",
+    "下一步会把思考显示接入三档配置。",
+    "下一步准备把 thought display 接入三档配置。",
+  ].join("\n"), {
+    mode: "detailed",
+    language: "zh",
+  });
+
+  assert.equal(countOccurrences(display.detailText, "SettingsModal"), 1);
+  assert.equal(countOccurrences(display.detailText, "三档配置"), 1);
+});
+
 test("thought summary comparison normalizes near duplicate English process lines", () => {
   assert.equal(
     normalizeThoughtSummaryForCompare("The file keeps returning same stub. Let try reading specific line ranges to get content need."),

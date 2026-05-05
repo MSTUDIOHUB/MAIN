@@ -78,6 +78,9 @@ import { buildToolDiffPreview, supportsToolDiffPreview } from "../lib/toolDiff";
 import { buildPlanApprovalChoiceHint, normalizePlanApprovalChoice } from "../lib/planControl";
 import {
   PLAN_MAX_AUTO_RESUME_LIMIT,
+  buildExecuteMaxIterationsAutoResumeNotice,
+  buildExecuteMaxIterationsPauseNotice,
+  buildExecuteMaxIterationsResumePrompt,
   buildPlanExecutionProgressUpdate,
   formatPlanExecutionProgressSnapshot,
   buildPlanMaxIterationsAutoResumeNotice,
@@ -99,8 +102,11 @@ import {
   loadGameStudioConfig,
   removeGameStudioWorkspaceAssets,
   setGameStudioActiveAgent,
+  setGameStudioEngineConfig,
 } from "../lib/gameStudioPack";
 import {
+  getDefaultStudioAgentForEngine,
+  parseSetupEngineArgs,
   normalizeStudioAgentKey,
   parseGameStudioSlashCommand,
   resolveLegacyNexusModeKey,
@@ -108,10 +114,18 @@ import {
   type NexusModeKey,
   type PendingSlashCommand,
   type StudioAgentKey,
+  type StudioConfig,
+  type StudioEngineKey,
 } from "../lib/gameStudioCatalog";
+import {
+  detectGameDevelopmentIntent,
+  type GameDevelopmentIntentSignal,
+} from "../lib/gameDevelopmentIntent";
 import {
   createPendingDecisionCopy,
   getIntentPolicy,
+  inferCommandDirective,
+  looksLikeExistingPlanExecutionRequest,
   looksLikePlanContinuationOrApprovalInput,
   looksLikePreviousTurnContinuationInput,
   resolveConversationTurnIntent,
@@ -122,11 +136,14 @@ import {
   shouldContinuePreviousTurnFromInput,
   shouldUseBlockingIntentPreflight,
   type ExecutionConsentPolicy,
+  type CommandDirective,
   type MainIntentShortcut,
   type PendingRunDecision,
+  type PendingRunDecisionChoice,
   type ResolvedUserIntent,
   type ResolvedRunIntent,
 } from "../lib/runIntent";
+import { hydratePlanArtifactsFromReader } from "../lib/planArtifactHydration";
 import { mapLegacyNexusModeToMainMode, mapMainModeToLegacyNexusMode, type MainModeKey } from "../lib/mainModes";
 import { runIntentPreflight } from "../lib/intentPreflight";
 import { runAfterNextPaint } from "../lib/uiScheduling";
@@ -159,6 +176,7 @@ import {
 } from "../lib/toolCapabilities";
 import {
   normalizeThoughtDisplayMode,
+  normalizeThoughtSummaryForCompare,
   type ThoughtDisplayMode,
 } from "../lib/thoughtDisplay";
 
@@ -657,7 +675,7 @@ export type TaskBlock =
       type: "system";
       content: string;
       icon?: string;
-      variant?: "context_compression" | "plan_quality_gate" | "plan_execution_progress" | "plan_execution_checkpoint";
+      variant?: "context_compression" | "plan_quality_gate" | "plan_execution_progress" | "plan_execution_checkpoint" | "execution_checkpoint";
       planExecutionProgress?: PlanExecutionProgressSnapshot;
       contextCompression?: {
         reason: "proactive" | "reactive";
@@ -666,6 +684,11 @@ export type TaskBlock =
         tokenCountAfter: number;
         tokenReduction: number;
         compressedContext?: string;
+        topTokenSource?: {
+          label: string;
+          tokens: number;
+          total?: number;
+        };
       };
     });
 
@@ -763,6 +786,7 @@ interface AppState {
   dismissPendingRunDecision: () => void;
   resolvePendingRunDecision: (
     choice:
+      | PendingRunDecisionChoice
       | ResolvedUserIntent
       | "approve_once"
       | "approve_thread"
@@ -929,8 +953,10 @@ interface AppState {
       preservePlanState?: boolean;
       resolvedIntent?: ResolvedUserIntent;
       runtimeIntentOverride?: ResolvedUserIntent;
+      commandDirective?: CommandDirective | null;
       executionConsentGranted?: boolean;
       skipIntentResolution?: boolean;
+      suppressGameStudioSuggestion?: boolean;
       turnTitle?: string;
       intentSummary?: string;
       contextMentionsSnapshot?: string[];
@@ -1378,12 +1404,57 @@ const THINKING_TAG_NAMES = new Set(["thinking", "thought", "analysis", "reasonin
 const MAX_VISIBLE_THOUGHT_CHARS = 36_000;
 
 function normalizeThoughtTextForCompare(text: string): string {
-  return String(text || "")
-    .trim()
-    .toLowerCase()
-    .replace(/[，。！？；：,.!?;:、"'“”‘’`*_~\-\s]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+  return normalizeThoughtSummaryForCompare(text);
+}
+
+function thoughtSimilarity(a: string, b: string): number {
+  const left = new Set(normalizeThoughtTextForCompare(a).split(/\s+/).filter((token) => token.length > 1));
+  const right = new Set(normalizeThoughtTextForCompare(b).split(/\s+/).filter((token) => token.length > 1));
+  if (left.size === 0 || right.size === 0) {
+    const compactLeft = normalizeThoughtTextForCompare(a).replace(/\s+/g, "");
+    const compactRight = normalizeThoughtTextForCompare(b).replace(/\s+/g, "");
+    if (compactLeft.length < 8 || compactRight.length < 8) return 0;
+    const grams = (value: string) => {
+      const set = new Set<string>();
+      for (let index = 0; index < value.length - 1; index++) set.add(value.slice(index, index + 2));
+      return set;
+    };
+    const leftGrams = grams(compactLeft);
+    const rightGrams = grams(compactRight);
+    let shared = 0;
+    for (const gram of leftGrams) {
+      if (rightGrams.has(gram)) shared++;
+    }
+    return shared / Math.max(leftGrams.size, rightGrams.size);
+  }
+  let shared = 0;
+  for (const token of left) {
+    if (right.has(token)) shared++;
+  }
+  return shared / Math.max(left.size, right.size);
+}
+
+function collapseNearDuplicateThoughtLines(text: string): string {
+  const lines = String(text || "")
+    .split(/\r?\n/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+  if (lines.length < 2) return text;
+  const kept: string[] = [];
+  for (const line of lines) {
+    const normalized = normalizeThoughtTextForCompare(line);
+    if (!normalized) continue;
+    if (kept.some((existing) => {
+      const existingNormalized = normalizeThoughtTextForCompare(existing);
+      return existingNormalized === normalized ||
+        (normalized.length > 24 && existingNormalized.length > 24 && (normalized.includes(existingNormalized) || existingNormalized.includes(normalized))) ||
+        thoughtSimilarity(line, existing) >= 0.72;
+    })) {
+      continue;
+    }
+    kept.push(line);
+  }
+  return kept.join("\n");
 }
 
 function sameThoughtParagraphSequence(paragraphs: string[], a: number, b: number, length: number): boolean {
@@ -1509,7 +1580,8 @@ function limitThoughtContent(text: string): string {
 function compactThoughtContent(text: string): string {
   const collapsedParagraphs = collapseRepeatedThoughtParagraphs(String(text || ""));
   const collapsedLines = collapseRepeatedThoughtLines(collapsedParagraphs);
-  return limitThoughtContent(compactThoughtNoise(collapsedLines));
+  const collapsedNearDuplicates = collapseNearDuplicateThoughtLines(collapsedLines);
+  return limitThoughtContent(compactThoughtNoise(collapsedNearDuplicates));
 }
 
 function appendThoughtDelta(existing: string, incoming: string): string {
@@ -1704,6 +1776,179 @@ const RUN_INTENT_LABELS: Record<ResolvedRunIntent, { zh: string; en: string }> =
   report: { zh: "报告", en: "Report" },
   studio_workflow: { zh: "Game Studio 工作流", en: "Game Studio Workflow" },
 };
+
+const RESOLVED_USER_INTENT_KEYS = new Set<ResolvedUserIntent>([
+  "discuss",
+  "plan",
+  "execute",
+  "analyze",
+  "summarize",
+  "report",
+  "studio_workflow",
+]);
+
+function isResolvedUserIntentChoice(choice: PendingRunDecisionChoice): choice is ResolvedUserIntent {
+  return RESOLVED_USER_INTENT_KEYS.has(choice as ResolvedUserIntent);
+}
+
+function isStudioEngineKey(value: string | null | undefined): value is StudioEngineKey {
+  return value === "unity" || value === "godot" || value === "unreal";
+}
+
+function resolveEngineFromModeSwitchChoice(
+  choice: PendingRunDecisionChoice | "approve_once" | "approve_thread" | "cancel",
+  pending: PendingRunDecision,
+): StudioEngineKey | null {
+  if (choice === "switch_game_studio_unity") return "unity";
+  if (choice === "switch_game_studio_godot") return "godot";
+  if (choice === "switch_game_studio_unreal") return "unreal";
+  return isStudioEngineKey(pending.target) ? pending.target : null;
+}
+
+function buildGameStudioSwitchReason(
+  signal: GameDevelopmentIntentSignal,
+  language: "zh" | "en",
+): string {
+  const evidence = [...signal.projectEvidence, ...signal.semanticEvidence].slice(0, 2).join("；");
+  if (language === "en") {
+    if (signal.engineStatus === "explicit" && signal.engine) {
+      return evidence
+        ? `Detected ${signal.engine} game-development context (${evidence}). Game Studio can route this through engine-aware workflows.`
+        : `Detected ${signal.engine} game-development context. Game Studio can route this through engine-aware workflows.`;
+    }
+    return evidence
+      ? `Detected game-development context (${evidence}), but the engine is not clear yet. Choose an engine before MAIN configures Game Studio.`
+      : "Detected game-development context, but the engine is not clear yet. Choose an engine before MAIN configures Game Studio.";
+  }
+
+  if (signal.engineStatus === "explicit" && signal.engine) {
+    return evidence
+      ? `检测到 ${signal.engine} 游戏开发上下文（${evidence}）。切换后 MAIN 会初始化 Game Studio，并同步设置该引擎。`
+      : `检测到 ${signal.engine} 游戏开发上下文。切换后 MAIN 会初始化 Game Studio，并同步设置该引擎。`;
+  }
+  return evidence
+    ? `检测到游戏开发语义（${evidence}），但还不能确定具体引擎。请先选定引擎，再让 MAIN 配置 Game Studio。`
+    : "检测到游戏开发语义，但还不能确定具体引擎。请先选定引擎，再让 MAIN 配置 Game Studio。";
+}
+
+function createGameStudioModeSwitchDecision(params: {
+  input: string;
+  images?: string[];
+  language: "zh" | "en";
+  signal: GameDevelopmentIntentSignal;
+}): PendingRunDecision {
+  const { input, images, language, signal } = params;
+  const isEnglish = language === "en";
+
+  if (signal.engineStatus === "explicit" && signal.engine) {
+    return {
+      kind: "mode_switch",
+      source: "pre_submit",
+      originalInput: input,
+      originalImages: images || [],
+      suggestedIntent: "studio_workflow",
+      reason: buildGameStudioSwitchReason(signal, language),
+      title: isEnglish ? "Switch to Game Studio?" : "切换到游戏工作室？",
+      target: signal.engine,
+      options: [
+        {
+          id: "switch_game_studio",
+          label: isEnglish ? "Switch to Game Studio" : "切换到游戏工作室",
+          value: isEnglish
+            ? "Switch to Game Studio and continue this game-development request."
+            : "切换到游戏工作室，并继续处理这个游戏开发请求。",
+        },
+        {
+          id: "stay_main",
+          label: isEnglish ? "Continue in MAIN" : "继续在 MAIN 中处理",
+          value: isEnglish
+            ? "Keep handling this request in MAIN mode."
+            : "继续在 MAIN 模式中处理这个请求。",
+        },
+      ],
+    };
+  }
+
+  return {
+    kind: "mode_switch",
+    source: "pre_submit",
+    originalInput: input,
+    originalImages: images || [],
+    suggestedIntent: "studio_workflow",
+    reason: buildGameStudioSwitchReason(signal, language),
+    title: isEnglish ? "Choose a game engine?" : "先选择游戏引擎？",
+    target: "engine",
+    options: [
+      {
+        id: "switch_game_studio_unity",
+        label: isEnglish ? "Use Unity" : "使用 Unity",
+        value: isEnglish
+          ? "Switch to Game Studio, set the engine to Unity, and continue."
+          : "切换到游戏工作室，设置引擎为 Unity，并继续处理。",
+      },
+      {
+        id: "switch_game_studio_godot",
+        label: isEnglish ? "Use Godot" : "使用 Godot",
+        value: isEnglish
+          ? "Switch to Game Studio, set the engine to Godot, and continue."
+          : "切换到游戏工作室，设置引擎为 Godot，并继续处理。",
+      },
+      {
+        id: "switch_game_studio_unreal",
+        label: isEnglish ? "Use Unreal" : "使用 Unreal",
+        value: isEnglish
+          ? "Switch to Game Studio, set the engine to Unreal, and continue."
+          : "切换到游戏工作室，设置引擎为 Unreal，并继续处理。",
+      },
+      {
+        id: "switch_game_studio_choose_engine",
+        label: isEnglish ? "Help Me Choose" : "先帮我选择",
+        value: isEnglish
+          ? "Switch to Game Studio and ask me the engine selection questions first."
+          : "切换到游戏工作室，并先向我确认游戏引擎选择。",
+      },
+      {
+        id: "stay_main",
+        label: isEnglish ? "Continue in MAIN" : "继续在 MAIN 中处理",
+        value: isEnglish
+          ? "Keep handling this request in MAIN mode."
+          : "继续在 MAIN 模式中处理这个请求。",
+      },
+    ],
+  };
+}
+
+function shouldConsiderGameStudioSuggestion(params: {
+  isHidden: boolean;
+  currentMainModeKey: MainModeKey;
+  hasPendingRunDecision: boolean;
+  hasMainDebugShortcut: boolean;
+  hasMainIntentShortcut: boolean;
+  hasLockedComposerIntent: boolean;
+  skipIntentResolution?: boolean;
+  resolvedIntent?: ResolvedRunIntent;
+  shouldContinuePlanIntent: boolean;
+  shouldContinuePreviousTurnIntent: boolean;
+  shouldReuseExistingTurnIntent: boolean;
+  suppressGameStudioSuggestion?: boolean;
+  input: string;
+  hasPlanArtifacts: boolean;
+  planStage: PlanStage;
+  isPlanApproved: boolean;
+}): boolean {
+  if (params.isHidden) return false;
+  if (params.currentMainModeKey !== "main_mode") return false;
+  if (params.hasPendingRunDecision) return false;
+  if (params.hasMainDebugShortcut || params.hasMainIntentShortcut || params.hasLockedComposerIntent) return false;
+  if (params.skipIntentResolution || params.resolvedIntent || params.suppressGameStudioSuggestion) return false;
+  if (params.shouldContinuePlanIntent || params.shouldContinuePreviousTurnIntent || params.shouldReuseExistingTurnIntent) return false;
+  if (looksLikePlanContinuationOrApprovalInput(params.input, {
+    hasPlanArtifacts: params.hasPlanArtifacts,
+    planStage: params.planStage,
+    isPlanApproved: params.isPlanApproved,
+  })) return false;
+  return true;
+}
 
 function normalizeIntentSummary(summary: string): string {
   return summary.replace(/\s+/g, " ").trim();
@@ -2017,6 +2262,15 @@ export function sanitizeTaskBlocksForPersist(blocks: TaskBlock[]): TaskBlock[] {
                     tokenCountAfter: Number(b.contextCompression.tokenCountAfter) || 0,
                     tokenReduction: Number(b.contextCompression.tokenReduction) || 0,
                     ...(compressedContext ? { compressedContext } : {}),
+                    ...(b.contextCompression.topTokenSource
+                      ? {
+                          topTokenSource: {
+                            label: String(b.contextCompression.topTokenSource.label || ""),
+                            tokens: Number(b.contextCompression.topTokenSource.tokens) || 0,
+                            total: Number(b.contextCompression.topTokenSource.total) || 0,
+                          },
+                        }
+                      : {}),
                   },
                 };
               })()
@@ -2273,7 +2527,9 @@ function buildTrustedPlanResumePrompt(input: {
       "请在新的恢复上下文中继续执行计划，不要复用上一轮错误链路。",
       input.hasTasksArtifact
         ? "从 `.MAIN/plans/tasks.md` 中第一个证据未满足的任务开始。只有真实写入/命令成功/验证证据满足后，才可以把任务视为完成。"
-        : "请先基于已批准的 requirements/design 或 bugfix 重新生成 `.MAIN/plans/tasks.md`，然后执行真实任务。",
+        : input.artifacts.length === 0
+        ? "先读取当前 workspace 的 `.MAIN/plans/design.md`、`.MAIN/plans/bugfix.md`、`.MAIN/plans/tasks.md`；如果旧计划存在 requirements.md，可作为辅助上下文读取；如果 tasks.md 不存在，再基于已读计划文件生成任务清单并执行真实任务。"
+        : "请先基于已批准的 design.md 或 bugfix.md 重新生成 `.MAIN/plans/tasks.md`；旧 requirements.md 只能作为辅助上下文，然后执行真实任务。",
       "不要重写已经满足证据的任务；不要只修改 checkbox；不要重复计划说明。",
       "",
       "计划文件摘要：",
@@ -2291,7 +2547,9 @@ function buildTrustedPlanResumePrompt(input: {
     "Continue plan execution in a fresh recovery context; do not reuse the previous errored loop.",
     input.hasTasksArtifact
       ? "Start from the first task whose evidence is not satisfied. Treat a task as complete only after real file-write, successful command, or verification evidence exists."
-      : "First regenerate `.MAIN/plans/tasks.md` from the approved requirements/design or bugfix, then execute real tasks.",
+      : input.artifacts.length === 0
+      ? "First read `.MAIN/plans/design.md`, `.MAIN/plans/bugfix.md`, and `.MAIN/plans/tasks.md` from the current workspace; if a legacy requirements.md exists, use it only as supporting context. If tasks.md does not exist, generate the task list from the plan files before doing real work."
+      : "First regenerate `.MAIN/plans/tasks.md` from the approved design.md or bugfix.md; use any legacy requirements.md only as supporting context, then execute real tasks.",
     "Do not redo tasks whose evidence is already satisfied. Do not only edit checkboxes. Do not restate the plan.",
     "",
     "Plan artifact summary:",
@@ -2303,6 +2561,16 @@ function buildTrustedPlanResumePrompt(input: {
     "Priority recovery tasks:",
     remainingText,
   ].join("\n");
+}
+
+async function hydrateExistingPlanArtifactsForWorkspace(
+  workspace: string,
+  language: "zh" | "en",
+) {
+  return hydratePlanArtifactsFromReader(
+    (path) => readFile(path, workspace || undefined),
+    language,
+  );
 }
 
 const STRUCTURED_ATTACHMENT_EXTENSIONS = new Set([
@@ -2759,12 +3027,108 @@ export const useAppStore = create<AppState>()(
       return;
     }
 
+    if (pending.kind === "mode_switch") {
+      const originalImages = pending.originalImages;
+      const language = detectDominantLanguage(pending.originalInput, state.config.language);
+
+      if (choice === "cancel") {
+        set({ pendingRunDecision: null });
+        return;
+      }
+
+      if (choice === "stay_main") {
+        set({ pendingRunDecision: null });
+        runAfterNextPaint(() => {
+          get().sendMessage(pending.originalInput, originalImages, {
+            suppressGameStudioSuggestion: true,
+          });
+        });
+        return;
+      }
+
+      const selectedEngine = resolveEngineFromModeSwitchChoice(choice, pending);
+      const shouldAskEngine = choice === "switch_game_studio_choose_engine" || !selectedEngine;
+      const nextAgent = selectedEngine ? getDefaultStudioAgentForEngine(selectedEngine) : state.activeStudioAgentKey;
+      set({
+        pendingRunDecision: null,
+        selectedMainModeKey: "game_studio",
+        selectedNexusModeKey: "nexus_game_studio",
+        activeStudioAgentKey: nextAgent,
+        lockedComposerIntent: null,
+      });
+
+      runAfterNextPaint(() => {
+        void (async () => {
+          let configuredAgent = nextAgent;
+          try {
+            const initialized = await ensureGameStudioWorkspaceInitialized(configuredAgent);
+            let studioConfig = initialized;
+            if (selectedEngine) {
+              studioConfig = await setGameStudioEngineConfig({
+                engine: selectedEngine,
+                activeStudioAgent: getDefaultStudioAgentForEngine(selectedEngine),
+              });
+            }
+            configuredAgent = normalizeStudioAgentKey(studioConfig.activeStudioAgent);
+            invalidateWorkspaceTreeCache();
+            set({
+              gameStudioInitialized: true,
+              activeStudioAgentKey: configuredAgent,
+              selectedMainModeKey: "game_studio",
+              selectedNexusModeKey: "nexus_game_studio",
+            });
+            get().bumpWorkspaceContentVersion();
+          } catch (error) {
+            appendDebugLog("warn", "game_studio_mode_switch_failed", {
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+
+          const directive: CommandDirective = {
+            kind: selectedEngine === "unity" ? "unity" : "studio",
+            action: shouldAskEngine ? "confirm_game_engine" : "game_studio_mode_switch",
+            target: selectedEngine || "engine_selection",
+            source: "natural_language",
+            requiresWorkspace: true,
+            requiresApproval: false,
+            confidence: selectedEngine ? 0.9 : 0.7,
+            reason: shouldAskEngine
+              ? "Game-development intent was detected, but the engine is ambiguous; ask the user to choose before configuring engine-specific workflow."
+              : `Game-development intent should continue in Game Studio with ${selectedEngine} engine metadata.`,
+          };
+
+          get().sendMessage(pending.originalInput, originalImages, {
+            resolvedIntent: "studio_workflow",
+            runtimeIntentOverride: "studio_workflow",
+            commandDirective: directive,
+            skipIntentResolution: true,
+            suppressGameStudioSuggestion: true,
+            intentSummary: buildRunIntentSummary({
+              input: pending.originalInput,
+              intent: "studio_workflow",
+              language,
+              reason: shouldAskEngine
+                ? language === "en"
+                  ? "Switch to Game Studio and ask the user to choose the game engine before continuing."
+                  : "切换到游戏工作室，并先确认游戏引擎再继续。"
+                : language === "en"
+                ? `Switch to Game Studio and configure ${selectedEngine}.`
+                : `切换到游戏工作室，并配置 ${selectedEngine} 引擎。`,
+            }),
+          });
+        })();
+      });
+      return;
+    }
+
     if (choice === "cancel") {
       set({ pendingRunDecision: null });
       return;
     }
 
-    const intentChoice = choice as ResolvedUserIntent;
+    const intentChoice = isResolvedUserIntentChoice(choice as PendingRunDecisionChoice)
+      ? (choice as ResolvedUserIntent)
+      : pending.suggestedIntent;
     const originalImages = pending.originalImages;
     const language = detectDominantLanguage(pending.originalInput, state.config.language);
     set({ pendingRunDecision: null });
@@ -3771,12 +4135,12 @@ export const useAppStore = create<AppState>()(
             if (language === "en") {
               return hasTasksArtifact
               ? approvalChoiceHint + "The plan is approved. Continue directly from the current tasks.md and execute the remaining items without repeating the plan. Do not delete completed or previous task records; only check an item off after real evidence exists for its file/command/deliverable." + deliverableHint + "\n\n" + buildPlanCommandExecutionHint(state.planTasks, "en")
-                : approvalChoiceHint + "The plan is approved. First generate `.MAIN/plans/tasks.md` from the approved requirements/design or bugfix, then execute the remaining work from that task list without repeating the plan. Keep tasks.md concise: 8-20 checkboxes, one sentence each, and add lightweight evidence tags such as `evidence: file:src/app.ts` or `evidence: cmd:npm test` when a task has a concrete deliverable. During execution tasks.md is an audit record; never delete completed or previous tasks, and only check an item off after trusted evidence exists." + deliverableHint;
+                : approvalChoiceHint + "The plan is approved. First generate `.MAIN/plans/tasks.md` from the approved design.md or bugfix.md; if a legacy requirements.md exists, use it only as supporting context. Then execute the remaining work from that task list without repeating the plan. Keep tasks.md concise: 8-20 checkboxes, one sentence each, and add lightweight evidence tags such as `evidence: file:src/app.ts` or `evidence: cmd:npm test` when a task has a concrete deliverable. During execution tasks.md is an audit record; never delete completed or previous tasks, and only check an item off after trusted evidence exists." + deliverableHint;
             }
 
             return hasTasksArtifact
               ? approvalChoiceHint + "计划已批准。请直接基于当前 tasks.md 继续执行剩余任务，不要重复计划内容。不要删除已完成或旧任务记录；只有文件/命令/交付物的真实证据满足后，才能勾选对应任务。" + deliverableHint + "\n\n" + buildPlanCommandExecutionHint(state.planTasks, "zh")
-              : approvalChoiceHint + "计划已批准。请先基于已批准的 requirements/design 或 bugfix 生成 `.MAIN/plans/tasks.md`，然后再按照任务清单继续执行，不要重复计划内容。tasks.md 必须精简为 8-20 个 checkbox，每项一句话；有明确交付物的任务请追加轻量证据标签，例如 `证据: file:src/app.ts` 或 `证据: cmd:npm test`。执行中 tasks.md 是审计记录，不能删除已完成或旧任务；只有可信证据满足后才能勾选任务。" + deliverableHint;
+              : approvalChoiceHint + "计划已批准。请先基于已批准的 design.md 或 bugfix.md 生成 `.MAIN/plans/tasks.md`；如果旧计划存在 requirements.md，只作为辅助上下文使用。然后再按照任务清单继续执行，不要重复计划内容。tasks.md 必须精简为 8-20 个 checkbox，每项一句话；有明确交付物的任务请追加轻量证据标签，例如 `证据: file:src/app.ts` 或 `证据: cmd:npm test`。执行中 tasks.md 是审计记录，不能删除已完成或旧任务；只有可信证据满足后才能勾选任务。" + deliverableHint;
           })(),
           undefined,
           {
@@ -4021,8 +4385,10 @@ export const useAppStore = create<AppState>()(
     preservePlanState?: boolean;
     resolvedIntent?: ResolvedRunIntent;
     runtimeIntentOverride?: ResolvedRunIntent;
+    commandDirective?: CommandDirective | null;
     executionConsentGranted?: boolean;
     skipIntentResolution?: boolean;
+    suppressGameStudioSuggestion?: boolean;
     turnTitle?: string;
     intentSummary?: string;
     contextMentionsSnapshot?: string[];
@@ -4084,6 +4450,10 @@ export const useAppStore = create<AppState>()(
     const parsedStudioCommand = currentMainModeKey === "game_studio"
       ? parseGameStudioSlashCommand(text)
       : null;
+    const parsedSetupEngineCommand =
+      parsedStudioCommand?.type === "workflow" && parsedStudioCommand.slug === "setup-engine"
+        ? parseSetupEngineArgs(parsedStudioCommand.args)
+        : null;
     const preferredLanguage = isHidden
       ? state.preferredResponseLanguage
       : parsedStudioCommand
@@ -4104,6 +4474,48 @@ export const useAppStore = create<AppState>()(
     const lockedComposerIntent = !isHidden && currentMainModeKey === "main_mode" && !mainDebugShortcut
       ? state.lockedComposerIntent || mainIntentShortcut?.intent || null
       : null;
+    const cachedWorkspaceTreeForGameDetection =
+      state.currentWorkspace &&
+      workspaceTreeCacheKey === state.currentWorkspace &&
+      workspaceTreeCacheVersion === state.workspaceContentVersion
+        ? workspaceTreeCache
+        : "";
+    if (!cachedWorkspaceTreeForGameDetection && state.currentWorkspace.trim()) {
+      void getWorkspaceTree(state.currentWorkspace);
+    }
+    if (shouldConsiderGameStudioSuggestion({
+      isHidden,
+      currentMainModeKey,
+      hasPendingRunDecision: !!state.pendingRunDecision,
+      hasMainDebugShortcut: !!mainDebugShortcut,
+      hasMainIntentShortcut: !!mainIntentShortcut,
+      hasLockedComposerIntent: !!lockedComposerIntent,
+      skipIntentResolution: options?.skipIntentResolution,
+      resolvedIntent: options?.resolvedIntent,
+      shouldContinuePlanIntent,
+      shouldContinuePreviousTurnIntent,
+      shouldReuseExistingTurnIntent,
+      suppressGameStudioSuggestion: options?.suppressGameStudioSuggestion,
+      input: text,
+      hasPlanArtifacts,
+      planStage: state.planStage,
+      isPlanApproved: state.isPlanApproved,
+    })) {
+      const gameDevelopmentSignal = detectGameDevelopmentIntent(text, {
+        workspaceTree: cachedWorkspaceTreeForGameDetection,
+      });
+      if (gameDevelopmentSignal.shouldSuggest) {
+        set({
+          pendingRunDecision: createGameStudioModeSwitchDecision({
+            input: text,
+            images,
+            language: preferredLanguage,
+            signal: gameDevelopmentSignal,
+          }),
+        });
+        return true;
+      }
+    }
     if (!text.trim() && !hasSupplementalInput && !images?.length) {
       return false;
     }
@@ -4142,9 +4554,31 @@ export const useAppStore = create<AppState>()(
         ? currentTurnIntent
         : resolveRunIntentFromLegacyWorkflowMode(state.config.workflowMode));
     let effectiveIntentSummary = normalizeIntentSummary(options?.intentSummary || "");
+    let effectiveCommandDirective: CommandDirective | null = options?.commandDirective ?? null;
+
+    if (!effectiveCommandDirective && parsedStudioCommand?.type === "workflow") {
+      effectiveCommandDirective = inferCommandDirective(text, "studio_workflow", {
+        source: "studio_slash",
+        parsedStudioCommand,
+      });
+    }
+
+    if (parsedSetupEngineCommand?.engine === "unity") {
+      effectiveCommandDirective = {
+        kind: "unity",
+        action: "setup-engine",
+        target: "unity",
+        source: "studio_slash",
+        requiresWorkspace: true,
+        requiresApproval: false,
+        confidence: 0.98,
+        reason: "Game Studio setup-engine explicitly selected Unity.",
+      };
+    }
 
     if (mainDebugShortcut && !effectiveIntentSummary) {
       effectiveIntentSummary = "MDEBUG：用户反馈自修复";
+      effectiveCommandDirective = effectiveCommandDirective || inferCommandDirective(text, "plan", { source: "debug" });
     }
 
     if (shouldContinuePlanIntent && !effectiveIntentSummary) {
@@ -4156,6 +4590,7 @@ export const useAppStore = create<AppState>()(
           ? "Continue the previous planning turn until the plan is produced."
           : "继续上一轮计划目标，直到生成计划结果。",
       });
+      effectiveCommandDirective = effectiveCommandDirective || inferCommandDirective(text, "plan", { source: "continuation" });
     }
 
     if (shouldContinuePreviousTurnIntent && previousTurnContinuationTarget && !effectiveIntentSummary) {
@@ -4167,6 +4602,11 @@ export const useAppStore = create<AppState>()(
           ? "Continue the previous unfinished turn and complete the remaining work."
           : "继续上一轮未完成内容并完成剩余操作。",
       });
+      effectiveCommandDirective = effectiveCommandDirective || inferCommandDirective(
+        previousTurnContinuationTarget.userPrompt || text,
+        previousTurnContinuationIntent || effectiveRunIntent,
+        { source: "continuation" },
+      );
     }
 
     if (lockedComposerIntent && !effectiveIntentSummary) {
@@ -4177,6 +4617,9 @@ export const useAppStore = create<AppState>()(
         reason: preferredLanguage === "en"
           ? "The user confirmed this composer intent before sending."
           : "用户已在发送前确认本轮胶囊意图。",
+      });
+      effectiveCommandDirective = effectiveCommandDirective || inferCommandDirective(text, lockedComposerIntent, {
+        source: mainIntentShortcut ? "main_shortcut" : "natural_language",
       });
     }
 
@@ -4196,6 +4639,7 @@ export const useAppStore = create<AppState>()(
         language: preferredLanguage,
         reason: resolution.reason,
       });
+      effectiveCommandDirective = resolution.commandDirective || inferCommandDirective(text, resolution.intent);
 
       if (resolution.controlAction === "approve_plan") {
         set({
@@ -4210,9 +4654,6 @@ export const useAppStore = create<AppState>()(
       }
 
       if (resolution.controlAction === "resume_plan_execution") {
-        const hasTasksArtifact =
-          state.planArtifacts.some((artifact) => artifact.kind === "tasks") ||
-          state.planTasks.length > 0;
         set({
           input: "",
           contextMentions: [],
@@ -4220,27 +4661,68 @@ export const useAppStore = create<AppState>()(
           lockedComposerIntent: null,
           pendingRunDecision: null,
         });
-        get().sendMessage(
-          buildTrustedPlanResumePrompt({
-            language: preferredLanguage,
-            hasTasksArtifact,
-            tasks: state.planTasks,
-            artifacts: state.planArtifacts,
-            evidenceLedger: state.planExecutionEvidenceLedger,
-          }),
-          undefined,
-          {
-            hidden: true,
-            reuseCurrentTurn: false,
-            preservePlanState: true,
-            resolvedIntent: "plan",
-            skipIntentResolution: true,
-            turnTitle: preferredLanguage === "zh" ? "计划执行恢复" : "Plan Execution Resume",
-            intentSummary: preferredLanguage === "zh"
-              ? "从已批准计划的剩余任务继续执行。"
-              : "Resume execution from the remaining tasks in the approved plan.",
-          },
-        );
+        void (async () => {
+          const shouldHydrateExistingPlan = looksLikeExistingPlanExecutionRequest(text);
+          let latest = get();
+
+          if (shouldHydrateExistingPlan) {
+            const hydrated = await hydrateExistingPlanArtifactsForWorkspace(
+              latest.currentWorkspace,
+              preferredLanguage,
+            );
+            latest = get();
+            set({
+              planArtifacts: hydrated.artifacts,
+              planTasks: hydrated.tasks,
+              isPlanApproved: true,
+              planApprovalChoice: text.trim() || null,
+              planStage: "executing",
+              planAutoResumeCount: 0,
+              planExecutionProgressSnapshot: null,
+              showPlanPanel: true,
+              rightPanelTab: "plan",
+              showDiff: false,
+            });
+            logStoreEvent("existing_plan_hydrated_for_execution", {
+              workspace: latest.currentWorkspace || null,
+              artifacts: hydrated.artifacts.map((artifact) => artifact.path),
+              taskCount: hydrated.tasks.length,
+            });
+          }
+
+          latest = get();
+          const hasTasksArtifact =
+            latest.planArtifacts.some((artifact) => artifact.kind === "tasks") ||
+            latest.planTasks.length > 0;
+
+          get().sendMessage(
+            buildTrustedPlanResumePrompt({
+              language: preferredLanguage,
+              hasTasksArtifact,
+              tasks: latest.planTasks,
+              artifacts: latest.planArtifacts,
+              evidenceLedger: latest.planExecutionEvidenceLedger,
+            }),
+            undefined,
+            {
+              hidden: true,
+              reuseCurrentTurn: false,
+              preservePlanState: true,
+              resolvedIntent: "plan",
+              runtimeIntentOverride: "execute",
+              commandDirective: resolution.commandDirective || inferCommandDirective(text, "plan", {
+                source: "continuation",
+                controlAction: "resume_plan_execution",
+              }),
+              executionConsentGranted: true,
+              skipIntentResolution: true,
+              turnTitle: preferredLanguage === "zh" ? "计划执行恢复" : "Plan Execution Resume",
+              intentSummary: preferredLanguage === "zh"
+                ? "从已批准计划的剩余任务继续执行。"
+                : "Resume execution from the remaining tasks in the approved plan.",
+            },
+          );
+        })();
         return true;
       }
 
@@ -4295,7 +4777,9 @@ export const useAppStore = create<AppState>()(
             const fallbackCopy = createPendingDecisionCopy(
               {
                 suggestedIntent: preflight.intent,
-                decisionOptions: preflight.options?.map((option) => option.id),
+                decisionOptions: preflight.options
+                  ?.map((option) => option.id)
+                  .filter(isResolvedUserIntentChoice),
                 riskLevel: resolution.riskLevel,
                 reason: resolution.reason,
               },
@@ -4319,10 +4803,15 @@ export const useAppStore = create<AppState>()(
           const resolvedByPreflight =
             preflight?.intent === "studio_workflow" ? resolution.intent : preflight?.intent;
           const resolvedIntent = resolvedByPreflight || resolution.intent;
+          const resolvedCommandDirective =
+            preflight?.commandDirective ||
+            resolution.commandDirective ||
+            inferCommandDirective(text, resolvedIntent);
 
           get().sendMessage(text, images, {
             ...(options || {}),
             resolvedIntent,
+            commandDirective: resolvedCommandDirective,
             skipIntentResolution: true,
             turnTitle: preflight?.title,
             intentSummary: buildRunIntentSummary({
@@ -4340,6 +4829,13 @@ export const useAppStore = create<AppState>()(
       effectiveRunIntent = resolution.intent;
     }
 
+    if (!effectiveCommandDirective) {
+      effectiveCommandDirective = inferCommandDirective(text, effectiveRunIntent, {
+        source: mainIntentShortcut ? "main_shortcut" : parsedStudioCommand?.type === "workflow" ? "studio_slash" : "natural_language",
+        parsedStudioCommand,
+      });
+    }
+
     if (!effectiveIntentSummary) {
       effectiveIntentSummary = buildRunIntentSummary({
         input: text,
@@ -4352,7 +4848,10 @@ export const useAppStore = create<AppState>()(
     const effectiveWorkflowMode = effectiveIntentPolicy.workflowMode;
     const runtimeRunIntent = options?.runtimeIntentOverride || effectiveRunIntent;
     const shouldGrantExecutionConsentForTurn = options?.executionConsentGranted === true;
-    const initialTurnStatus: ConversationTurnStatus = effectiveRunIntent === "plan" ? "planning" : "executing";
+    const initialTurnStatus: ConversationTurnStatus =
+      effectiveRunIntent === "plan" && !state.isPlanApproved
+        ? "planning"
+        : "executing";
 
     // Reset plan approval state at the start of each new request
     if (!preservePlanState && !isLocalStudioCommand) {
@@ -4688,6 +5187,7 @@ export const useAppStore = create<AppState>()(
                     ...turn,
                     status: "done",
                     intentSummary: turn.intentSummary || effectiveIntentSummary,
+                    commandDirective: turn.commandDirective || effectiveCommandDirective || undefined,
                     blockIds: [...turn.blockIds, ...(userBlock ? [userBlock.id] : []), systemBlock.id].filter(
                       (value, index, array) => array.indexOf(value) === index,
                     ),
@@ -4701,6 +5201,7 @@ export const useAppStore = create<AppState>()(
                 userPrompt: text,
                 title: turnTitle,
                 intentSummary: effectiveIntentSummary,
+                commandDirective: effectiveCommandDirective || undefined,
                 mode: effectiveWorkflowMode,
                 intent: effectiveRunIntent,
                 status: "done",
@@ -4833,6 +5334,7 @@ export const useAppStore = create<AppState>()(
                           status: initialTurnStatus,
                           intent: effectiveRunIntent,
                           intentSummary: turn.intentSummary || effectiveIntentSummary,
+                          commandDirective: turn.commandDirective || effectiveCommandDirective || undefined,
                           mode: effectiveWorkflowMode,
                           blockIds: turn.blockIds.includes(userBlock.id) ? turn.blockIds : [...turn.blockIds, userBlock.id],
                         }
@@ -4845,6 +5347,7 @@ export const useAppStore = create<AppState>()(
                       userPrompt: text,
                       title: turnTitle,
                       intentSummary: effectiveIntentSummary,
+                      commandDirective: effectiveCommandDirective || undefined,
                       mode: effectiveWorkflowMode,
                       intent: effectiveRunIntent,
                       status: initialTurnStatus,
@@ -4880,6 +5383,7 @@ export const useAppStore = create<AppState>()(
                     status: initialTurnStatus,
                     intent: effectiveRunIntent,
                     intentSummary: turn.intentSummary || effectiveIntentSummary,
+                    commandDirective: turn.commandDirective || effectiveCommandDirective || undefined,
                     mode: effectiveWorkflowMode,
                   }
 	                : turn
@@ -4893,6 +5397,7 @@ export const useAppStore = create<AppState>()(
 	                userPrompt: text,
 	                title: turnTitle,
 	                intentSummary: effectiveIntentSummary,
+	                commandDirective: effectiveCommandDirective || undefined,
 	                mode: effectiveWorkflowMode,
 	                intent: effectiveRunIntent,
 	                status: initialTurnStatus,
@@ -4938,6 +5443,8 @@ export const useAppStore = create<AppState>()(
       userBlockId: userBlock?.id ?? null,
       effectiveRunIntent,
       effectiveWorkflowMode,
+      commandDirectiveKind: effectiveCommandDirective?.kind ?? null,
+      commandDirectiveAction: effectiveCommandDirective?.action ?? null,
       initialTurnStatus,
       elapsedMs: Math.round(nowMs() - sendStartedAt),
       taskFlowBlocks: sessionGet().taskFlow.length,
@@ -5007,6 +5514,7 @@ export const useAppStore = create<AppState>()(
       let userContent = text;
       let activeStudioAgentKey = sessionGet().activeStudioAgentKey;
       let gameStudioInitialized = sessionGet().gameStudioInitialized;
+      let gameStudioConfigForTurn: StudioConfig | null = null;
       const mentions = mentionSnapshot;
       const files = attachedFilesSnapshot;
       const attachmentRefs: AttachmentReadRef[] = [];
@@ -5120,15 +5628,15 @@ export const useAppStore = create<AppState>()(
           : "本轮处于 PLAN 模式。";
         userContent = preferredLanguage === "en"
           ? [
-              `${planModeLead} If the request is a complex implementation, call \`write_file\` or \`replace_in_file\` to create or update concise reviewable plan drafts in \`.MAIN/plans/requirements.md\` and \`.MAIN/plans/design.md\` before asking for approval; do not write project source files or tasks.md before approval.`,
-              "Creating or updating requirements/design drafts and plan documents is an automatic internal planning step, not a user choice. After the user picks a route, update the plan drafts directly instead of asking whether to update them.",
+              `${planModeLead} If the request is a complex implementation, call \`write_file\` or \`replace_in_file\` to create or update the concise reviewable plan draft in \`.MAIN/plans/design.md\` before asking for approval; create \`.MAIN/plans/requirements.md\` only when the user explicitly wants a requirement ledger or the scope needs traceability. Do not write project source files or tasks.md before approval.`,
+              "Creating or updating design/bugfix plan documents is an automatic internal planning step, not a user choice. After the user picks a route, update the plan draft directly instead of asking whether to update internal plan documents.",
               "If it is only a discussion-style plan, keep the answer concise and use user options for real decisions.",
               "",
               userContent,
             ].join("\n")
           : [
-              `${planModeLead}如果这是复杂实现请求，请调用 \`write_file\` 或 \`replace_in_file\` 创建或更新可审批的精简计划草稿：\`.MAIN/plans/requirements.md\` 与 \`.MAIN/plans/design.md\`，等待用户批准后再改源码；批准前不要生成 tasks.md。`,
-              "创建或更新 requirements/design 草稿和计划文档是自动的内部规划步骤，不是用户需要选择的下一步；用户选定方案后应直接更新计划草稿，不要再询问是否更新计划文档。",
+              `${planModeLead}如果这是复杂实现请求，请调用 \`write_file\` 或 \`replace_in_file\` 创建或更新可审批的精简计划草稿：默认写 \`.MAIN/plans/design.md\`；只有用户明确要求需求台账或范围需要追踪时，才额外写 \`.MAIN/plans/requirements.md\`。等待用户批准后再改源码；批准前不要生成 tasks.md。`,
+              "创建或更新 design/bugfix 计划文档是自动的内部规划步骤，不是用户需要选择的下一步；用户选定方案后应直接更新计划草稿，不要再询问是否更新内部计划文件。",
               "如果只是讨论式方案，请保持简洁，并在真实分叉点用可点击选项让用户选择。",
               "",
               userContent,
@@ -5141,14 +5649,14 @@ export const useAppStore = create<AppState>()(
           ? [
               "Continue the previous PLAN turn. The user is asking to keep going, not to start a new discussion.",
               originalPlanPrompt ? `Original plan request: ${originalPlanPrompt}` : "Original plan request: use the current conversation context.",
-              "Produce real planning progress now. If key choices remain, summarize them briefly and use <user_options>; otherwise call `write_file` or `replace_in_file` to update `.MAIN/plans/requirements.md` and `.MAIN/plans/design.md`, then provide the concise Proposal.",
+              "Produce real planning progress now. If key choices remain, summarize them briefly and use <user_options>; otherwise call `write_file` or `replace_in_file` to update `.MAIN/plans/design.md`, then provide the concise Proposal. Do not create requirements.md unless a requirement ledger is explicitly needed.",
               "Keep any plan Markdown concise: review-summary style, no tutorial prose, no full code listings, no repeated background.",
               text.trim() ? `Latest user message: ${text.trim()}` : "Latest user message: continue",
             ].join("\n")
           : [
               "请继续上一轮 PLAN 回合。用户是在要求继续推进，不是开启新的普通讨论。",
               originalPlanPrompt ? `上一轮计划请求：${originalPlanPrompt}` : "上一轮计划请求：请依据当前对话上下文继续。",
-              "现在必须产生实际规划进展。如果仍有关键选择需要用户确认，就先简短归纳并用面向用户的口吻给出 <user_options>；否则调用 `write_file` 或 `replace_in_file` 更新 `.MAIN/plans/requirements.md` 与 `.MAIN/plans/design.md`，再给出精简 Proposal。",
+              "现在必须产生实际规划进展。如果仍有关键选择需要用户确认，就先简短归纳并用面向用户的口吻给出 <user_options>；否则调用 `write_file` 或 `replace_in_file` 更新 `.MAIN/plans/design.md`，再给出精简 Proposal。除非明确需要需求台账，否则不要生成 requirements.md。",
               "每个 <option> 必须是用户点击后会发送的完整选择，不要写成“是否……”问题句。",
               "所有计划 Markdown 都要精简成审阅摘要风格，不要写教程式长文、完整代码清单或重复背景。",
               text.trim() ? `用户最新消息：${text.trim()}` : "用户最新消息：继续",
@@ -5196,6 +5704,67 @@ export const useAppStore = create<AppState>()(
             ].filter(Boolean).join("\n");
       }
 
+      if (currentMainModeKey === "game_studio") {
+        if (parsedSetupEngineCommand?.mode === "configure" && parsedSetupEngineCommand.engine) {
+          try {
+            const engineAgent = getDefaultStudioAgentForEngine(parsedSetupEngineCommand.engine);
+            await ensureGameStudioWorkspaceInitialized(engineAgent);
+            gameStudioConfigForTurn = await setGameStudioEngineConfig({
+              engine: parsedSetupEngineCommand.engine,
+              version: parsedSetupEngineCommand.version,
+              activeStudioAgent: engineAgent,
+            });
+            activeStudioAgentKey = normalizeStudioAgentKey(gameStudioConfigForTurn.activeStudioAgent);
+            gameStudioInitialized = true;
+            invalidateWorkspaceTreeCache();
+            sessionSet({
+              gameStudioInitialized: true,
+              activeStudioAgentKey,
+            });
+            sessionGet().bumpWorkspaceContentVersion();
+          } catch (error) {
+            appendDebugLog("warn", "game_studio_setup_engine_failed", {
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+        } else {
+          const engineSignal = detectGameDevelopmentIntent(text, {
+            workspaceTree: cachedWorkspaceTreeForGameDetection,
+          });
+          if (engineSignal.engineStatus === "explicit" && engineSignal.engine) {
+            const currentConfig = await loadGameStudioConfig();
+            if (!currentConfig || currentConfig.engine === "unconfigured" || currentConfig.engine !== engineSignal.engine) {
+              try {
+                const engineAgent = getDefaultStudioAgentForEngine(engineSignal.engine);
+                await ensureGameStudioWorkspaceInitialized(engineAgent);
+                gameStudioConfigForTurn = await setGameStudioEngineConfig({
+                  engine: engineSignal.engine,
+                  activeStudioAgent: engineAgent,
+                });
+                activeStudioAgentKey = normalizeStudioAgentKey(gameStudioConfigForTurn.activeStudioAgent);
+                gameStudioInitialized = true;
+                invalidateWorkspaceTreeCache();
+                sessionSet({
+                  gameStudioInitialized: true,
+                  activeStudioAgentKey,
+                });
+                sessionGet().bumpWorkspaceContentVersion();
+              } catch (error) {
+                appendDebugLog("warn", "game_studio_auto_engine_config_failed", {
+                  error: error instanceof Error ? error.message : String(error),
+                });
+              }
+            } else {
+              gameStudioConfigForTurn = currentConfig;
+            }
+          }
+        }
+
+        if (!gameStudioConfigForTurn) {
+          gameStudioConfigForTurn = await loadGameStudioConfig();
+        }
+      }
+
       const shouldUseGameStudioEnvelope =
         currentMainModeKey === "game_studio" &&
         (
@@ -5212,6 +5781,7 @@ export const useAppStore = create<AppState>()(
         try {
           const studioConfig = await ensureGameStudioWorkspaceInitialized(activeStudioAgentKey);
           activeStudioAgentKey = normalizeStudioAgentKey(studioConfig.activeStudioAgent);
+          gameStudioConfigForTurn = studioConfig;
           gameStudioInitialized = true;
           invalidateWorkspaceTreeCache();
           sessionSet({
@@ -5256,6 +5826,7 @@ export const useAppStore = create<AppState>()(
           nexusMode: mapMainModeToLegacyNexusMode(currentMainModeKey),
           activeStudioAgent: activeStudioAgentKey,
           command: parsedStudioCommand?.type === "workflow" ? parsedStudioCommand : null,
+          studioConfig: gameStudioConfigForTurn,
           responseLanguage: preferredLanguage,
         });
       }
@@ -5641,6 +6212,7 @@ export const useAppStore = create<AppState>()(
         getActiveStudioAgentKey: () => sessionGet().activeStudioAgentKey,
         getGameStudioInitialized: () => sessionGet().gameStudioInitialized,
         getPendingSlashCommand: () => sessionGet().pendingSlashCommand,
+        getGameStudioConfig: () => gameStudioConfigForTurn,
         getWorkspaceTree: () => workspaceTree,
         getMcpServers: () => sessionGet().mcpServers,
         getMcpDiscoveredTools: () => sessionGet().mcpDiscoveredTools,
@@ -5655,6 +6227,7 @@ export const useAppStore = create<AppState>()(
         onHookBlocked: (_event, _reason, _record) => { /* UI feedback placeholder */ },
         getCurrentRunIntent: () => sessionGet().getCurrentRunIntent(),
         getRuntimeRunIntent: () => runtimeRunIntent,
+        getCommandDirective: () => effectiveCommandDirective,
         getWorkflowMode: () => getIntentPolicy(sessionGet().getCurrentRunIntent()).workflowMode,
         getIsPlanApproved: () => sessionGet().isPlanApproved,
         getPlanApprovalChoice: () => sessionGet().planApprovalChoice,
@@ -6374,8 +6947,8 @@ export const useAppStore = create<AppState>()(
               turnId,
               type: "system",
               content: sessionGet().config.language === "en"
-                ? `Plan artifact rejected: ${path} does not look like a reviewable ${kind} document (${validation.reason || "quality gate"}). MAIN will ask the model to regenerate real \`.MAIN/plans/requirements.md\` and \`.MAIN/plans/design.md\` artifacts or request your decision.`
-                : `计划文件已被拦截：${path} 不像可审批的${getPlanArtifactTitle(kind, "zh")}（${validation.reason || "质量门禁"}）。MAIN 会要求模型重新生成真实的 \`.MAIN/plans/requirements.md\` 与 \`.MAIN/plans/design.md\`，或先向你确认关键分叉。`,
+                ? `Plan artifact rejected: ${path} does not look like a reviewable ${kind} document (${validation.reason || "quality gate"}). MAIN will ask the model to regenerate a real \`.MAIN/plans/design.md\` or bugfix.md artifact, or request your decision.`
+                : `计划文件已被拦截：${path} 不像可审批的${getPlanArtifactTitle(kind, "zh")}（${validation.reason || "质量门禁"}）。MAIN 会要求模型重新生成真实的 \`.MAIN/plans/design.md\` 或 bugfix.md，或先向你确认关键分叉。`,
               variant: "plan_quality_gate",
             });
             return;
@@ -6565,6 +7138,94 @@ export const useAppStore = create<AppState>()(
           return true;
         },
 
+        onExecuteMaxIterationsCheckpoint: (checkpoint: PlanMaxIterationsCheckpoint) => {
+          const language = sessionGet().preferredResponseLanguage || sessionGet().config.language;
+          const currentCount = Math.max(0, Number(sessionGet().planAutoResumeCount) || 0);
+          const shouldAutoResume = currentCount < PLAN_MAX_AUTO_RESUME_LIMIT;
+          const effectiveCheckpoint = {
+            ...checkpoint,
+            autoResumeCount: shouldAutoResume ? currentCount + 1 : currentCount,
+          };
+          const notice = shouldAutoResume
+            ? buildExecuteMaxIterationsAutoResumeNotice(effectiveCheckpoint, language)
+            : buildExecuteMaxIterationsPauseNotice(effectiveCheckpoint, language);
+          const blockId = nextId();
+
+          sessionSet((s) => ({
+            planAutoResumeCount: effectiveCheckpoint.autoResumeCount,
+            taskFlow: [
+              ...s.taskFlow,
+              {
+                id: blockId,
+                turnId,
+                type: "system",
+                content: notice,
+                variant: "execution_checkpoint",
+              } as TaskBlock,
+            ],
+            conversationTurns: s.conversationTurns.map((turn) =>
+              turn.id === turnId && !turn.blockIds.includes(blockId)
+                ? { ...turn, blockIds: [...turn.blockIds, blockId], status: "stopped_no_action", collapsed: false }
+                : turn
+            ),
+          }));
+          sessionGet().setConversationTurnSummary(turnId, summarizeAssistantText(notice));
+
+          if (!shouldAutoResume) {
+            logStoreEvent("execute_max_iterations_paused", {
+              turnId,
+              sessionKey: runSessionKey,
+              workspace: runWorkspace || null,
+              autoResumeCount: currentCount,
+              maxIterations: checkpoint.maxIterations,
+            });
+            return true;
+          }
+
+          logStoreEvent("execute_max_iterations_auto_resume", {
+            turnId,
+            sessionKey: runSessionKey,
+            workspace: runWorkspace || null,
+            autoResumeCount: effectiveCheckpoint.autoResumeCount,
+            maxIterations: checkpoint.maxIterations,
+          });
+
+          runAfterNextPaint(() => {
+            const latest = get();
+            const latestSessionKey = resolveSessionRuntimeKey(
+              resolveSessionWorkspaceKey(latest.currentWorkspace),
+              latest.currentSessionId,
+            );
+            if (latestSessionKey !== runSessionKey) return;
+            if (latest.isGenerating || latest.agentStatus === "running" || latest.agentStatus === "pending_review") return;
+
+            latest.sendMessage(
+              buildExecuteMaxIterationsResumePrompt({
+                language,
+                checkpoint: effectiveCheckpoint,
+              }),
+              undefined,
+              {
+                hidden: true,
+                reuseCurrentTurn: false,
+                // Keep the recovery counter across the hidden Execute resume.
+                // The visible Execute request already reset any stale plan state.
+                preservePlanState: true,
+                resolvedIntent: "execute",
+                runtimeIntentOverride: "execute",
+                executionConsentGranted: true,
+                skipIntentResolution: true,
+                turnTitle: language === "zh" ? "执行自动恢复" : "Execution Auto-Resume",
+                intentSummary: language === "zh"
+                  ? "执行达到安全轮次边界后自动恢复一次。"
+                  : "Auto-resume once after the execution safety boundary.",
+              },
+            );
+          });
+
+          return true;
+        },
+
         onTurnSummaryReady: (summary) => {
           if (!summary.trim()) return;
           const summarized = summarizeAssistantText(summary);
@@ -6599,9 +7260,26 @@ export const useAppStore = create<AppState>()(
           const saved = Math.max(0, Math.round(stats.tokenReduction));
           const before = Math.max(0, Math.round(stats.tokenCountBefore));
           const after = Math.max(0, Math.round(stats.tokenCountAfter));
+          const topTokenSource = stats.tokenBreakdown
+            ? {
+                label: String(stats.tokenBreakdown.topSourceLabel || ""),
+                tokens: Math.max(0, Math.round(stats.tokenBreakdown.topSourceTokens || 0)),
+                total: Math.max(0, Math.round(stats.tokenBreakdown.total || 0)),
+              }
+            : undefined;
           const label = reason === "reactive"
             ? `上下文溢出，已压缩背景，约 ${before.toLocaleString()} → ${after.toLocaleString()} tokens（释放 ${saved.toLocaleString()}）`
             : `上下文已压缩背景，约 ${before.toLocaleString()} → ${after.toLocaleString()} tokens（释放 ${saved.toLocaleString()}，适配 KV Cache）`;
+          logStoreEvent("context_compressed", {
+            turnId,
+            reason,
+            before,
+            after,
+            saved,
+            droppedCount: Math.max(0, Math.round(stats.droppedCount)),
+            topTokenSource: topTokenSource?.label || null,
+            topTokenSourceTokens: topTokenSource?.tokens ?? null,
+          });
           const block: TaskBlock = {
             id: nextId(),
             turnId,
@@ -6615,6 +7293,7 @@ export const useAppStore = create<AppState>()(
               tokenCountAfter: after,
               tokenReduction: saved,
               compressedContext: trimPersistedContextCompression(stats.compressedContext),
+              ...(topTokenSource ? { topTokenSource } : {}),
             },
           };
           appendTurnBlock(block);

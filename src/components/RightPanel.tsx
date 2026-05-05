@@ -68,7 +68,7 @@ function buildTrustedResumePrompt(input: {
       "请在新的恢复上下文中继续执行计划，不要复用上一轮错误链路。",
       input.hasTasksArtifact
         ? "从 `.MAIN/plans/tasks.md` 中第一个证据未满足的任务开始。只有真实写入/命令成功/验证证据满足后，才可以把任务视为完成。"
-        : "请先基于已批准的 requirements/design 或 bugfix 重新生成 `.MAIN/plans/tasks.md`，然后执行真实任务。",
+        : "请先基于已批准的 design.md 或 bugfix.md 重新生成 `.MAIN/plans/tasks.md`；旧 requirements.md 只作为辅助上下文，然后执行真实任务。",
       "不要重写已经满足证据的任务；不要只修改 checkbox；不要重复计划说明。",
       "",
       "计划文件摘要：",
@@ -86,7 +86,7 @@ function buildTrustedResumePrompt(input: {
     "Continue plan execution in a fresh recovery context; do not reuse the previous errored loop.",
     input.hasTasksArtifact
       ? "Start from the first task whose evidence is not satisfied. Treat a task as complete only after real file-write, successful command, or verification evidence exists."
-      : "First regenerate `.MAIN/plans/tasks.md` from the approved requirements/design or bugfix, then execute real tasks.",
+      : "First regenerate `.MAIN/plans/tasks.md` from the approved design.md or bugfix.md; use any legacy requirements.md only as supporting context, then execute real tasks.",
     "Do not redo tasks whose evidence is already satisfied. Do not only edit checkboxes. Do not restate the plan.",
     "",
     "Plan artifact summary:",
@@ -907,11 +907,12 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
 
     return "";
   }, [latestPlanEntry]);
+  const hasReviewablePlanArtifact = planArtifacts.some((artifact) =>
+    artifact.kind === "design" || artifact.kind === "bugfix" || artifact.kind === "tasks"
+  );
   const hasReviewablePlanDraft =
-    fallbackPlanPreview.length > 0 &&
-    planArtifacts.some((artifact) =>
-      artifact.kind === "requirements" || artifact.kind === "design" || artifact.kind === "bugfix",
-    );
+    hasReviewablePlanArtifact ||
+    fallbackPlanPreview.length > 0;
   const hasActivePlanContext =
     !!latestPlanTurn ||
     planArtifacts.length > 0 ||
@@ -953,10 +954,10 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     sendMessage(
       language === "zh"
         ? isRequirementsStage
-          ? "已生成 requirements.md。请不要重复读取已读文件，直接基于 requirements 和已有上下文生成 `.MAIN/plans/design.md`；如果设计方向不明确，用 `<user_options>` 给出用户可点击选择并停止。不要生成 tasks.md 或修改源码。"
+          ? "已存在旧流程 requirements.md。请不要重复读取已读文件，直接基于已有上下文生成或更新 `.MAIN/plans/design.md`；如果设计方向不明确，用 `<user_options>` 给出用户可点击选择并停止。不要生成 tasks.md 或修改源码。"
           : "请基于当前已经生成的计划草案继续收敛，不要重复前文。优先补齐关键分叉点，并在需要用户确认时用面向用户的口吻给出可点击选项；如果已经足够清晰，就输出正式 Proposal 供用户确认。未经明确批准，不要提前生成执行用的 tasks.md。"
         : isRequirementsStage
-        ? "requirements.md has been generated. Do not reread files already in context; generate `.MAIN/plans/design.md` directly from requirements and existing context. If the design direction is unclear, offer `<user_options>` and stop. Do not generate tasks.md or edit source files."
+        ? "A legacy requirements.md exists. Do not reread files already in context; generate or update `.MAIN/plans/design.md` from the existing context. If the design direction is unclear, offer `<user_options>` and stop. Do not generate tasks.md or edit source files."
         : "Continue refining the current plan draft without repeating earlier content. Use clickable options when a real decision is needed; once the plan is clear enough, produce the formal proposal for approval. Do not generate execution tasks.md before the user explicitly approves execution.",
       undefined,
       { hidden: true, reuseCurrentTurn: true, preservePlanState: true, resolvedIntent: "plan", skipIntentResolution: true },

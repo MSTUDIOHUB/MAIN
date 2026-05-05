@@ -40,6 +40,11 @@ export interface TerminalCommandOutput {
   stderrTruncated: boolean;
 }
 
+export interface GitFileEntry {
+  path: string;
+  status: string;
+}
+
 export interface GitStatus {
   isRepo: boolean;
   gitAvailable: boolean;
@@ -394,6 +399,10 @@ export function runCommand(
 
 export function getGitStatus(workspace?: string, includeStats?: boolean): Promise<GitStatus> {
   return invoke<GitStatus>("get_git_status", { workspace, includeStats });
+}
+
+export function getGitFileList(workspace: string, filter?: string): Promise<GitFileEntry[]> {
+  return invoke<GitFileEntry[]>("get_git_file_list", { workspace, filter });
 }
 
 export function gitCommitAll(workspace: string, message: string): Promise<GitStatus> {

@@ -24,6 +24,8 @@ const CLOUD_TOOL_FALLBACK_SCENARIO = "cloud-tool-fallback";
 const REPLY_OPTIONS_TOOL_PAUSE_SCENARIO = "reply-options-tool-pause";
 const PLAN_APPROVAL_EXECUTE_TOOLS_SCENARIO = "plan-approval-execute-tools";
 const EXECUTE_QUICK_REPLY_RUNTIME_SCENARIO = "execute-quick-reply-runtime";
+const EXISTING_PLAN_FOLDER_EXECUTE_SCENARIO = "existing-plan-folder-execute";
+const EXECUTE_MAX_ITERATIONS_CHECKPOINT_SCENARIO = "execute-max-iterations-checkpoint";
 const TOP_ISLAND_EXECUTION_PROGRESS_SCENARIO = "top-island-execution-progress";
 const TOP_ISLAND_PLAN_TASK_PROGRESS_SCENARIO = "top-island-plan-task-progress";
 const SIDEBAR_REMOVE_LAST_WORKSPACE_SCENARIO = "sidebar-remove-last-workspace";
@@ -180,18 +182,11 @@ function seedPlanFlowScenario() {
 
   const artifacts = [
     {
-      kind: "requirements" as const,
-      path: ".MAIN/plans/requirements.md",
-      title: "Requirements",
-      updatedAt: now - 2_000,
-      content: "# Requirements\n\n- 需要支持生成计划、保存方案、批准执行与最终收尾。\n",
-    },
-    {
       kind: "design" as const,
       path: ".MAIN/plans/design.md",
       title: "Design",
       updatedAt: now - 1_000,
-      content: "# Design\n\n- 右侧 Plan Workspace 负责展示方案与审批入口。\n- 保存成功后应明确反馈已保存。\n",
+      content: "# Design\n\n- 目标：支持生成计划、保存方案、批准执行与最终收尾。\n- 右侧 Plan Workspace 负责展示方案与审批入口。\n- 保存成功后应明确反馈已保存。\n- 验证：批准后生成 tasks.md 并进入执行进度。\n",
     },
   ];
 
@@ -226,10 +221,10 @@ function seedPlanFlowScenario() {
           "# Proposed Plan",
           "",
           "## 目标",
-          "- 先生成可保存的需求与设计方案，再等待用户确认是否执行。",
+          "- 先生成可保存的 design 方案，再等待用户确认是否执行。",
           "",
           "## 执行策略",
-          "1. 先补齐 `requirements.md` 与 `design.md`。",
+          "1. 先补齐 `design.md`。",
           "2. 用户可先保存方案留档。",
           "3. 只有在用户批准后，才生成 `.MAIN/plans/tasks.md` 并进入执行。",
           "",
@@ -239,7 +234,7 @@ function seedPlanFlowScenario() {
           "",
           "<plan>",
           JSON.stringify([
-            { id: "proposal-1", subject: "补齐需求与设计文档" },
+            { id: "proposal-1", subject: "补齐 design 方案文档" },
             { id: "proposal-2", subject: "允许用户保存当前方案" },
             { id: "proposal-3", subject: "批准后生成 tasks 并完成收尾" },
           ]),
@@ -414,18 +409,11 @@ function seedPlanQuickReplyApprovalScenario() {
     currentTurnId: turnId,
     planArtifacts: [
       {
-        kind: "requirements" as const,
-        path: ".MAIN/plans/requirements.md",
-        title: "Requirements",
-        updatedAt: now - 2_000,
-        content: "# Requirements\n\n- 修复字体加载诊断流程。\n",
-      },
-      {
         kind: "design" as const,
         path: ".MAIN/plans/design.md",
         title: "Design",
         updatedAt: now - 1_000,
-        content: "# Design\n\n- 批准后先运行诊断，再根据结果修复字体加载。\n",
+        content: "# Design\n\n- 目标：修复字体加载诊断流程。\n- 方案：批准后先运行诊断，再根据结果修复字体加载。\n- 验证：根据 tasks.md 记录诊断命令和修复证据。\n",
       },
     ],
     planTasks: [],
@@ -2458,6 +2446,25 @@ function seedCloudToolProtocolScenario(scenario: string) {
   }));
 
   bridge.sendCloudMessage = (text?: string) => {
+    if (scenario === EXISTING_PLAN_FOLDER_EXECUTE_SCENARIO) {
+      return useAppStore.getState().sendMessage(
+        text || "根据.MAIN/plans文件夹的内容，完成执行方案和任务的内容。",
+      );
+    }
+
+    if (scenario === EXECUTE_MAX_ITERATIONS_CHECKPOINT_SCENARIO) {
+      return useAppStore.getState().sendMessage(
+        text || "请直接执行一个需要多轮检查的长任务。",
+        undefined,
+        {
+          resolvedIntent: "execute",
+          runtimeIntentOverride: "execute",
+          executionConsentGranted: true,
+          skipIntentResolution: true,
+        },
+      );
+    }
+
     return useAppStore.getState().sendMessage(
       text || "请读取 README.md 并告诉我是否包含 fallback-ok。",
       undefined,
@@ -2481,6 +2488,10 @@ function seedCloudToolProtocolScenario(scenario: string) {
     return {
       agentStatus: state.agentStatus,
       isGenerating: state.isGenerating,
+      planStage: state.planStage,
+      isPlanApproved: state.isPlanApproved,
+      planAutoResumeCount: state.planAutoResumeCount,
+      planTasks: state.planTasks,
       currentTurnStatus: currentTurn?.status ?? null,
       currentTurnIntent: currentTurn?.intent ?? null,
       conversationTurns: state.conversationTurns.length,
@@ -2493,6 +2504,7 @@ function seedCloudToolProtocolScenario(scenario: string) {
       selectedOptions: archivedOptionBlocks.map((block) => block.selectedOption).filter(Boolean),
       toolNames: toolBlocks.map((block) => block.toolName),
       toolTargets: toolBlocks.map((block) => block.target),
+      systemTexts: (state.taskFlow.filter((block) => block.type === "system") as any[]).map((block) => block.content),
       seedCount: readSeedCount(scenario),
     };
   };
@@ -2601,18 +2613,11 @@ function seedPlanApprovalExecuteToolsScenario() {
     contextMentions: [],
     planArtifacts: [
       {
-        kind: "requirements" as const,
-        path: ".MAIN/plans/requirements.md",
-        title: "Requirements",
-        updatedAt: now - 2_000,
-        content: "# Requirements\n\n- 批准后应允许执行工具出现在运行时工具列表中。\n",
-      },
-      {
         kind: "design" as const,
         path: ".MAIN/plans/design.md",
         title: "Design",
         updatedAt: now - 1_000,
-        content: "# Design\n\n- Plan 回合保持 plan 身份，但批准后的 runtime intent 使用 execute。\n",
+        content: "# Design\n\n- 目标：批准后应允许执行工具出现在运行时工具列表中。\n- 方案：Plan 回合保持 plan 身份，但批准后的 runtime intent 使用 execute。\n- 验证：下一轮请求包含 run_command 和写入工具能力。\n",
       },
     ],
     planTasks: [],
@@ -3092,6 +3097,14 @@ export function initializeE2EScenarios(): (() => void) | undefined {
 
   if (scenario === EXECUTE_QUICK_REPLY_RUNTIME_SCENARIO) {
     return seedCloudToolProtocolScenario(EXECUTE_QUICK_REPLY_RUNTIME_SCENARIO);
+  }
+
+  if (scenario === EXISTING_PLAN_FOLDER_EXECUTE_SCENARIO) {
+    return seedCloudToolProtocolScenario(EXISTING_PLAN_FOLDER_EXECUTE_SCENARIO);
+  }
+
+  if (scenario === EXECUTE_MAX_ITERATIONS_CHECKPOINT_SCENARIO) {
+    return seedCloudToolProtocolScenario(EXECUTE_MAX_ITERATIONS_CHECKPOINT_SCENARIO);
   }
 
   if (scenario === PLAN_APPROVAL_EXECUTE_TOOLS_SCENARIO) {

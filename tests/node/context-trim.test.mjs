@@ -28,6 +28,7 @@ async function loadContextTrimModule() {
 
 const {
   computeContextBudgets,
+  computeContextTokenBreakdown,
   manageContext,
 } = await loadContextTrimModule();
 
@@ -102,4 +103,95 @@ test("manageContext force mode trims even after microcompaction leaves context o
   assert.equal(result.changed, true);
   assert.ok(result.droppedCount > 0);
   assert.ok(result.tokenCountAfter <= result.budgets.proactiveTargetBudget);
+});
+
+test("manageContext builds state-first compressed memory instead of tool transcript noise", () => {
+  const readToolCall = {
+    id: "call_read",
+    function: {
+      name: "read_file",
+      arguments: JSON.stringify({ path: "snake.py" }),
+    },
+  };
+  const replaceToolCall = {
+    id: "call_replace",
+    function: {
+      name: "replace_in_file",
+      arguments: JSON.stringify({ path: "snake.py" }),
+    },
+  };
+  const messages = [
+    { role: "system", content: "system prompt" },
+    { role: "user", content: "请修复 snake.py 的重复替换问题，必须保留审计历史，不要删除 .MAIN/plans 文件。" },
+    { role: "assistant", content: "", tool_calls: [readToolCall] },
+    { role: "tool", tool_call_id: "call_read", content: "snake.py contents\n" + "def move(): pass\n".repeat(900) },
+    { role: "assistant", content: "", tool_calls: [replaceToolCall] },
+    {
+      role: "tool",
+      tool_call_id: "call_replace",
+      content: [
+        'Detected a repetition loop: tool "replace_in_file" called with identical arguments 3+ times (target: "snake.py").',
+        "RecoveryDetails:",
+        "- duplicateTool: replace_in_file",
+        "- target: snake.py",
+        "- duplicateCount: 3+",
+        "- suggestedNextTask: 重新读取 tasks.md 与证据摘要后继续",
+      ].join("\n"),
+    },
+    ...Array.from({ length: 18 }, (_, index) => ({
+      role: index % 2 === 0 ? "user" : "assistant",
+      content: `recent-${index} ` + "R".repeat(900),
+    })),
+  ];
+
+  const result = manageContext(messages, 4096, 1024, 4000, 4000, true);
+  const compressed = String(result.compressedContext || "");
+  const marker = result.messages.find((message) =>
+    message.role === "user" &&
+    typeof message.content === "string" &&
+    message.content.includes("ContextState")
+  );
+
+  assert.ok(marker, "expected a ContextState marker in the managed messages");
+  assert.match(compressed, /ContextState/);
+  assert.match(compressed, /snake\.py/);
+  assert.match(compressed, /duplicateTool=replace_in_file|repeat loop/);
+  assert.match(compressed, /重新读取 tasks\.md/);
+  assert.doesNotMatch(compressed, /助手调用工具|工具结果：/);
+});
+
+test("manageContext carries compressed state without nesting earlier transcript summaries", () => {
+  const first = manageContext([
+    { role: "system", content: "system prompt" },
+    { role: "user", content: "目标：实现 TopIsland 步骤进度，必须只展示当前回合。" },
+    ...Array.from({ length: 12 }, (_, index) => ({
+      role: index % 2 === 0 ? "user" : "assistant",
+      content: `old-${index} ` + "A".repeat(1000),
+    })),
+  ], 4096, 1024, 4000, 4000, true);
+
+  const second = manageContext([
+    ...first.messages,
+    ...Array.from({ length: 12 }, (_, index) => ({
+      role: index % 2 === 0 ? "user" : "assistant",
+      content: `new-${index} ` + "B".repeat(1000),
+    })),
+  ], 4096, 1024, 4000, 4000, true);
+
+  const compressed = String(second.compressedContext || "");
+  assert.doesNotMatch(compressed, /更早历史摘要/);
+  assert.doesNotMatch(compressed, /助手调用工具|工具结果：/);
+  assert.ok((compressed.match(/ContextState:/g) || []).length <= 1);
+});
+
+test("computeContextTokenBreakdown reports tool results as the largest source", () => {
+  const result = computeContextTokenBreakdown([
+    { role: "system", content: "system prompt" },
+    { role: "user", content: "short request" },
+    { role: "tool", content: "T".repeat(12000) },
+  ]);
+
+  assert.equal(result.topSource, "toolResult");
+  assert.match(result.topSourceLabel, /tool results/);
+  assert.ok(result.topSourceTokens > result.user);
 });

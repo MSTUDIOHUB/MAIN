@@ -1,4 +1,3 @@
-// @ts-nocheck
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   IconBook,
@@ -15,7 +14,37 @@ import {
 } from "./Icons";
 import { GLOBAL_CHAT_KEY, type WorkspaceEntry } from "../store/useAppStore";
 import { looksLikeReasoningLeakTitle, normalizeConversationDisplayTitle } from "../lib/workflowModels";
-import { getGitStatus, gitCommitAll, gitCreateBranch, gitPushCurrentBranch, type GitStatus } from "../lib/ipc";
+import { getGitStatus, getGitFileList, gitCommitAll, gitCreateBranch, gitPushCurrentBranch, type GitFileEntry, type GitStatus } from "../lib/ipc";
+
+type GitMenuView = "overview" | "changed" | "added" | "deleted";
+
+interface GitMenuState {
+  workspacePath: string;
+  top: number;
+}
+
+interface GitMenuThemeClasses {
+  bg: string;
+  border: string;
+  text: string;
+  hover: string;
+  subtleText: string;
+  mutedText: string;
+  inputBg: string;
+  divider: string;
+  statBg: string;
+  statHover: string;
+  addedBg: string;
+  addedHover: string;
+  deletedBg: string;
+  deletedHover: string;
+  fileHover: string;
+}
+
+interface GitFeedbackState {
+  type: "success" | "error";
+  text: string;
+}
 
 const IconLogoM = ({ className, ...props }: { className?: string; [key: string]: any }) => (
   <svg
@@ -125,11 +154,14 @@ export default function Sidebar({
   const [gitStatuses, setGitStatuses] = useState<Record<string, GitStatus>>({});
   const [gitLoading, setGitLoading] = useState<Record<string, boolean>>({});
   const [gitActionBusy, setGitActionBusy] = useState(false);
-  const [gitMenu, setGitMenu] = useState<{ workspacePath: string; top: number } | null>(null);
+  const [gitMenu, setGitMenu] = useState<GitMenuState | null>(null);
+  const [gitMenuView, setGitMenuView] = useState<GitMenuView>("overview");
+  const [gitFileList, setGitFileList] = useState<GitFileEntry[]>([]);
+  const [gitFileListLoading, setGitFileListLoading] = useState(false);
   const [gitActionMode, setGitActionMode] = useState<"commit" | "branch" | null>(null);
   const [gitCommitMessage, setGitCommitMessage] = useState("");
   const [gitBranchName, setGitBranchName] = useState("");
-  const [gitFeedback, setGitFeedback] = useState<{ type: "success" | "error"; text: string } | null>(null);
+  const [gitFeedback, setGitFeedback] = useState<GitFeedbackState | null>(null);
   const activeWorkspace = selectedWorkspace || currentWorkspace;
 
   const workspaceEntries = useMemo(() => {
@@ -305,17 +337,61 @@ export default function Sidebar({
 
   const openGitMenu = (event: React.MouseEvent<HTMLButtonElement>, workspacePath: string) => {
     event.stopPropagation();
-    const buttonRect = event.currentTarget.getBoundingClientRect();
-    const sidebarRect = sidebarRef.current?.getBoundingClientRect();
-    const top = sidebarRect
-      ? Math.max(74, Math.min(buttonRect.bottom - sidebarRect.top + 6, Math.max(74, sidebarRect.height - 340)))
-      : buttonRect.bottom + 6;
-    setGitMenu((prev) => prev?.workspacePath === workspacePath ? null : { workspacePath, top });
+    setGitMenu((prev) => prev?.workspacePath === workspacePath ? null : { workspacePath, top: 0 });
+    setGitMenuView("overview");
+    setGitFileList([]);
     setGitActionMode(null);
     setGitFeedback(null);
     setGitCommitMessage("");
     setGitBranchName("");
     void refreshGitStatus(workspacePath, true);
+  };
+
+  const fetchGitFileList = useCallback(async (workspacePath: string, filter: string) => {
+    setGitFileListLoading(true);
+    try {
+      const list = await getGitFileList(workspacePath, filter);
+      setGitFileList(list);
+    } catch (error) {
+      setGitFileList([]);
+    } finally {
+      setGitFileListLoading(false);
+    }
+  }, []);
+
+  const handleStatClick = useCallback((filter: string) => {
+    const validView = (["overview", "changed", "added", "deleted"] as const).includes(filter as GitMenuView)
+      ? (filter as GitMenuView)
+      : "overview";
+    setGitMenuView(validView);
+    void fetchGitFileList(gitMenu!.workspacePath, filter);
+  }, [gitMenu, fetchGitFileList]);
+
+  const handleBackToOverview = useCallback(() => {
+    setGitMenuView("overview");
+    setGitFileList([]);
+  }, []);
+
+  const getStatusIcon = (status: string) => {
+    switch (status) {
+      case "M": return "M";
+      case "A": return "+";
+      case "D": return "−";
+      case "R": return "⟶";
+      case "U": return "?";
+      default: return "·";
+    }
+  };
+
+  const getStatusColor = (status: string) => {
+    switch (status) {
+      case "M": return "text-[#e2b931]";
+      case "A": return "text-[#6ee7b7]";
+      case "D": return "text-[#f87171]";
+      case "R": return "text-[#60a5fa]";
+      case "U": return "text-[#a78bfa]";
+      default: return "text-[#71717a]";
+    }
   };
 
   const runGitAction = async (operation: () => Promise<GitStatus>, successText: string) => {
@@ -436,6 +512,66 @@ export default function Sidebar({
 
   const sortedGlobalSessions = sortSessions(globalSessions);
   const isBlackTheme = config.themeMode === "black";
+  const isLightTheme = config.themeMode === "light";
+
+  const gitMenuThemeClasses = useMemo(() => {
+    if (isBlackTheme) {
+      return {
+        bg: "bg-[rgba(12,12,14,0.95)]",
+        border: "border-[#3f3f46]",
+        text: "text-[#e4e4e7]",
+        hover: "hover:bg-[rgba(40,40,45,0.6)]",
+        subtleText: "text-[#71717a]",
+        mutedText: "text-[#a1a1aa]",
+        inputBg: "bg-[#111113]",
+        divider: "border-[#3f3f46]",
+        statBg: "bg-[#18181b]",
+        statHover: "hover:bg-[#27272a]",
+        addedBg: "bg-[#112018]",
+        addedHover: "hover:bg-[#1a2a20]",
+        deletedBg: "bg-[#241515]",
+        deletedHover: "hover:bg-[#2f1a1a]",
+        fileHover: "hover:bg-[rgba(40,40,45,0.6)]",
+      };
+    }
+    if (isLightTheme) {
+      return {
+        bg: "bg-white",
+        border: "border-[#d4d4d9]",
+        text: "text-[#18181b]",
+        hover: "hover:bg-[#f4f4f5]",
+        subtleText: "text-[#71717a]",
+        mutedText: "text-[#52525b]",
+        inputBg: "bg-[#fafafa]",
+        divider: "border-[#e4e4e7]",
+        statBg: "bg-[#f4f4f5]",
+        statHover: "hover:bg-[#e4e4e7]",
+        addedBg: "bg-[#f0fdf4]",
+        addedHover: "hover:bg-[#dcfce7]",
+        deletedBg: "bg-[#fef2f2]",
+        deletedHover: "hover:bg-[#fee2e2]",
+        fileHover: "hover:bg-[#f4f4f5]",
+      };
+    }
+    // dark (default)
+    return {
+      bg: "bg-[#202022]",
+      border: "border-[#3f3f46]",
+      text: "text-[#e4e4e7]",
+      hover: "hover:bg-[#27272a]",
+      subtleText: "text-[#71717a]",
+      mutedText: "text-[#a1a1aa]",
+      inputBg: "bg-[#111113]",
+      divider: "border-[#3f3f46]",
+      statBg: "bg-[#18181b]",
+      statHover: "hover:bg-[#27272a]",
+      addedBg: "bg-[#112018]",
+      addedHover: "hover:bg-[#1a2a20]",
+      deletedBg: "bg-[#241515]",
+      deletedHover: "hover:bg-[#2f1a1a]",
+      fileHover: "hover:bg-[#27272a]",
+    };
+  }, [isBlackTheme, isLightTheme]);
 
   return (
     <div
@@ -685,34 +821,58 @@ export default function Sidebar({
         </button>
       </div>
 
-      {gitMenu && (
+      {gitMenu && (() => {
+        const sidebarRect = sidebarRef.current?.getBoundingClientRect();
+        const buttonRect = sidebarRect
+          ? (() => {
+              const trigger = document.querySelector(`[data-sidebar-git-trigger="true"][data-workspace="${gitMenu.workspacePath}"]`) as HTMLElement | null;
+              return trigger?.getBoundingClientRect();
+            })()
+          : undefined;
+        const viewportHeight = typeof window !== "undefined" ? window.innerHeight : 800;
+        const menuHeight = 340;
+        const menuWidth = 280;
+        const sidebarLeft = sidebarRect?.left ?? 0;
+        const sidebarRight = sidebarRect?.right ?? sidebarLeft + sidebarWidth;
+        const fitsInViewport = sidebarRight + menuWidth <= viewportHeight;
+        const menuLeft = fitsInViewport ? sidebarWidth : -(menuWidth - 4);
+        const top = buttonRect
+          ? Math.max(74, buttonRect.bottom - (sidebarRect?.top ?? 0) + 6)
+          : 74;
+        const spaceBelow = (sidebarRect?.height ?? 600) - top;
+        const fitsBelow = spaceBelow >= menuHeight;
+        const menuTop = fitsBelow ? top : Math.max(74, top - menuHeight);
+        const maxHeight = fitsBelow
+          ? `calc(100% - ${top + 12}px)`
+          : `${Math.min(menuHeight, spaceBelow)}px`;
+        return (
         <div
           ref={gitMenuRef}
           data-testid="sidebar-git-menu"
-          className="absolute right-3 z-40 w-[236px] overflow-hidden rounded-md border border-[#3f3f46] bg-[#202022] text-[#e4e4e7] shadow-2xl"
-          style={{ top: `${gitMenu.top}px`, maxHeight: `calc(100% - ${gitMenu.top + 12}px)` }}
+          className={`absolute z-40 w-[280px] overflow-hidden rounded-md border shadow-2xl ${gitMenuThemeClasses.bg} ${gitMenuThemeClasses.text}`}
+          style={{ left: `${menuLeft}px`, top: `${menuTop}px`, maxHeight }}
           onClick={(event) => event.stopPropagation()}
         >
           <div className="max-h-full overflow-y-auto">
-            <div className="border-b border-[#3f3f46] px-3 py-2">
+            <div className={`border-b ${gitMenuThemeClasses.divider} px-3 py-2`}>
               <div className="flex items-center justify-between gap-2">
                 <div className="flex min-w-0 items-center gap-2">
                   <IconGitBranch className="h-4 w-4 shrink-0 theme-text" />
                   <span className="truncate text-[12px] font-bold">{gitCopy.title}</span>
                 </div>
                 {activeGitLoading && (
-                  <span className="text-[10px] text-[#a1a1aa]">{config.language === "en" ? "Loading" : "加载中"}</span>
+                  <span className={`text-[10px] ${gitMenuThemeClasses.mutedText}`}>{config.language === "en" ? "Loading" : "加载中"}</span>
                 )}
               </div>
               <div className="mt-2 space-y-1 text-[11px] text-[#a1a1aa]">
                 <div className="flex min-w-0 items-center justify-between gap-2">
-                  <span className="text-[#71717a]">{gitCopy.branch}</span>
+                  <span className={`text-[#71717a]`}>{gitCopy.branch}</span>
                   <span className="truncate text-[#e4e4e7]" title={activeGitStatus?.branch || ""}>
                     {activeGitStatus?.branch || "HEAD"}
                   </span>
                 </div>
                 <div className="flex min-w-0 items-center justify-between gap-2">
-                  <span className="text-[#71717a]">{gitCopy.upstream}</span>
+                  <span className={`text-[#71717a]`}>{gitCopy.upstream}</span>
                   <span className="truncate" title={activeGitStatus?.upstream || ""}>
                     {activeGitStatus?.upstream || gitCopy.noUpstream}
                   </span>
@@ -726,22 +886,92 @@ export default function Sidebar({
               </div>
             </div>
 
-            <div className="grid grid-cols-3 gap-1 border-b border-[#3f3f46] px-3 py-2 text-center">
-              <div className="rounded bg-[#18181b] px-2 py-1.5">
-                <div className="text-[13px] font-bold">{activeGitStatus?.changedFiles ?? 0}</div>
-                <div className="text-[9px] uppercase tracking-wider text-[#71717a]">{gitCopy.changed}</div>
+            {gitMenuView === "overview" ? (
+              <>
+                <div className={`grid grid-cols-3 gap-1 border-b ${gitMenuThemeClasses.divider} px-3 py-2 text-center`}>
+                  <button
+                    type="button"
+                    onClick={() => handleStatClick("changed")}
+                    className={`rounded ${gitMenuThemeClasses.statBg} px-2 py-1.5 transition-colors ${gitMenuThemeClasses.statHover} ${
+                      gitMenuView === "changed" ? "ring-1 ring-[var(--accent)]" : ""
+                    }`}
+                  >
+                    <div className="text-[13px] font-bold">{activeGitStatus?.changedFiles ?? 0}</div>
+                    <div className="text-[9px] uppercase tracking-wider text-[#71717a]">{gitCopy.changed}</div>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleStatClick("added")}
+                    className={`rounded ${gitMenuThemeClasses.addedBg} px-2 py-1.5 transition-colors ${gitMenuThemeClasses.addedHover} ${
+                      gitMenuView === "added" ? "ring-1 ring-[#6ee7b7]" : ""
+                    }`}
+                  >
+                    <div className="text-[13px] font-bold text-[#86d9a3]">+{activeGitStatus?.insertions ?? 0}</div>
+                    <div className="text-[9px] uppercase tracking-wider text-[#5f9f78]">+</div>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleStatClick("deleted")}
+                    className={`rounded ${gitMenuThemeClasses.deletedBg} px-2 py-1.5 transition-colors ${gitMenuThemeClasses.deletedHover} ${
+                      gitMenuView === "deleted" ? "ring-1 ring-[#f87171]" : ""
+                    }`}
+                  >
+                    <div className="text-[13px] font-bold text-[#fca5a5]">-{activeGitStatus?.deletions ?? 0}</div>
+                    <div className="text-[9px] uppercase tracking-wider text-[#b96c6c]">-</div>
+                  </button>
+                </div>
+                <div className={`grid grid-cols-2 gap-x-3 gap-y-1 border-b ${gitMenuThemeClasses.divider} px-3 py-2 text-[11px] ${gitMenuThemeClasses.mutedText}`}>
+                  <div className="flex justify-between gap-2"><span>{gitCopy.staged}</span><span>{activeGitStatus?.stagedFiles ?? 0}</span></div>
+                  <div className="flex justify-between gap-2"><span>{gitCopy.unstaged}</span><span>{activeGitStatus?.unstagedFiles ?? 0}</span></div>
+                  <div className="flex justify-between gap-2"><span>{gitCopy.untracked}</span><span>{activeGitStatus?.untrackedFiles ?? 0}</span></div>
+                  <div className="flex justify-between gap-2"><span>{gitCopy.conflicts}</span><span className={activeGitStatus?.conflictedFiles ? "text-[#fca5a5]" : ""}>{activeGitStatus?.conflictedFiles ?? 0}</span></div>
+                </div>
+              </>
+            ) : (
+              <div className={`border-b ${gitMenuThemeClasses.divider}`}>
+                <div className="flex items-center justify-between px-3 py-1.5">
+                  <button
+                    type="button"
+                    onClick={handleBackToOverview}
+                    className={`flex items-center gap-1 text-[11px] ${gitMenuThemeClasses.mutedText} hover:text-[#e4e4e7] transition-colors`}
+                  >
+                    <svg className="h-3 w-3" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M12.707 5.293a1 1 0 010 1.414L9.414 10l3.293 3.293a1 1 0 01-1.414 1.414l-4-4a1 1 0 010-1.414l4-4a1 1 0 011.414 0z" clipRule="evenodd" /></svg>
+                    <span>{config.language === "en" ? "Back" : "返回"}</span>
+                  </button>
+                  <span className={`text-[10px] uppercase tracking-wider ${gitMenuThemeClasses.subtleText}`}>
+                    {gitMenuView === "changed" ? gitCopy.changed : gitMenuView === "added" ? "+" : "-"}
+                    {` (${gitFileList.length})`}
+                  </span>
+                </div>
+                <div className="max-h-[280px] overflow-y-auto px-1">
+                  {gitFileListLoading ? (
+                    <div className="px-2 py-4 text-center text-[11px] text-[#71717a]">
+                      {config.language === "en" ? "Loading..." : "加载中..."}
+                    </div>
+                  ) : gitFileList.length === 0 ? (
+                    <div className="px-2 py-4 text-center text-[11px] text-[#71717a]">
+                      {config.language === "en" ? "No files" : "无文件"}
+                    </div>
+                  ) : (
+                    <div className="space-y-0.5 py-1">
+                      {gitFileList.map((entry, idx) => (
+                        <div
+                          key={`${entry.path}-${idx}`}
+                          className={`flex items-center gap-2 rounded px-2 py-1 text-[12px] transition-colors ${gitMenuThemeClasses.fileHover}`}
+                        >
+                          <span className={`shrink-0 font-mono text-[10px] font-bold w-4 text-center ${getStatusColor(entry.status)}`}>
+                            {getStatusIcon(entry.status)}
+                          </span>
+                          <span className="min-w-0 truncate text-[#d4d4d8]">{entry.path}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
               </div>
-              <div className="rounded bg-[#112018] px-2 py-1.5">
-                <div className="text-[13px] font-bold text-[#86d9a3]">+{activeGitStatus?.insertions ?? 0}</div>
-                <div className="text-[9px] uppercase tracking-wider text-[#5f9f78]">+</div>
-              </div>
-              <div className="rounded bg-[#241515] px-2 py-1.5">
-                <div className="text-[13px] font-bold text-[#fca5a5]">-{activeGitStatus?.deletions ?? 0}</div>
-                <div className="text-[9px] uppercase tracking-wider text-[#b96c6c]">-</div>
-              </div>
-            </div>
+            )}
 
-            <div className="grid grid-cols-2 gap-x-3 gap-y-1 border-b border-[#3f3f46] px-3 py-2 text-[11px] text-[#a1a1aa]">
+            <div className={`grid grid-cols-2 gap-x-3 gap-y-1 border-b ${gitMenuThemeClasses.divider} px-3 py-2 text-[11px] ${gitMenuThemeClasses.mutedText}`}>
               <div className="flex justify-between gap-2"><span>{gitCopy.staged}</span><span>{activeGitStatus?.stagedFiles ?? 0}</span></div>
               <div className="flex justify-between gap-2"><span>{gitCopy.unstaged}</span><span>{activeGitStatus?.unstagedFiles ?? 0}</span></div>
               <div className="flex justify-between gap-2"><span>{gitCopy.untracked}</span><span>{activeGitStatus?.untrackedFiles ?? 0}</span></div>
@@ -749,13 +979,13 @@ export default function Sidebar({
             </div>
 
             {(activeGitStatus?.error || !activeGitStatus?.gitAvailable || !activeGitStatus?.isRepo) && (
-              <div className="border-b border-[#3f3f46] bg-[#2a1010] px-3 py-2 text-[11px] leading-relaxed text-[#fca5a5]">
+              <div className={`border-b ${gitMenuThemeClasses.divider} bg-[#2a1010] px-3 py-2 text-[11px] leading-relaxed text-[#fca5a5]`}>
                 {activeGitStatus?.error || (!activeGitStatus?.gitAvailable ? gitCopy.installGit : gitCopy.noRepo)}
               </div>
             )}
 
             {gitFeedback && (
-              <div className={`border-b border-[#3f3f46] px-3 py-2 text-[11px] leading-relaxed ${
+              <div className={`border-b ${gitMenuThemeClasses.divider} px-3 py-2 text-[11px] leading-relaxed ${
                 gitFeedback.type === "success" ? "bg-[#112018] text-[#86d9a3]" : "bg-[#2a1010] text-[#fca5a5]"
               }`}>
                 {gitFeedback.text}
@@ -770,7 +1000,7 @@ export default function Sidebar({
                   setGitActionMode((mode) => mode === "commit" ? null : "commit");
                   setGitFeedback(null);
                 }}
-                className="flex w-full items-center gap-2 rounded px-2 py-2 text-left text-[13px] transition-colors hover:bg-[#2f2f32] disabled:cursor-not-allowed disabled:opacity-45"
+                className={`flex w-full items-center gap-2 rounded px-2 py-2 text-left text-[13px] transition-colors ${gitMenuThemeClasses.hover} disabled:cursor-not-allowed disabled:opacity-45`}
               >
                 <IconGitCommit className="h-4 w-4" />
                 {gitCopy.commit}
@@ -781,11 +1011,11 @@ export default function Sidebar({
                     autoFocus
                     value={gitCommitMessage}
                     onChange={(event) => setGitCommitMessage(event.target.value)}
-                    className="h-8 w-full rounded border border-[#3f3f46] bg-[#111113] px-2 text-[12px] text-[#e4e4e7] outline-none focus:border-[var(--accent)]"
+                    className={`h-8 w-full rounded border ${gitMenuThemeClasses.divider} ${gitMenuThemeClasses.inputBg} px-2 text-[12px] text-[#e4e4e7] outline-none focus:border-[var(--accent)]`}
                     placeholder={gitCopy.commitPlaceholder}
                   />
                   <div className="flex items-center justify-end gap-2">
-                    <button type="button" onClick={() => setGitActionMode(null)} className="rounded px-2 py-1 text-[11px] text-[#a1a1aa] hover:bg-[#2f2f32]">{gitCopy.cancel}</button>
+                    <button type="button" onClick={() => setGitActionMode(null)} className={`rounded px-2 py-1 text-[11px] ${gitMenuThemeClasses.mutedText} ${gitMenuThemeClasses.hover}`}>{gitCopy.cancel}</button>
                     <button disabled={gitActionBusy} className="rounded bg-[var(--accent)] px-2 py-1 text-[11px] font-semibold text-white disabled:opacity-50">{gitCopy.confirm}</button>
                   </div>
                 </form>
@@ -795,7 +1025,7 @@ export default function Sidebar({
                 type="button"
                 disabled={gitOperationsDisabled}
                 onClick={handleGitPush}
-                className="flex w-full items-center gap-2 rounded px-2 py-2 text-left text-[13px] transition-colors hover:bg-[#2f2f32] disabled:cursor-not-allowed disabled:opacity-45"
+                className={`flex w-full items-center gap-2 rounded px-2 py-2 text-left text-[13px] transition-colors ${gitMenuThemeClasses.hover} disabled:cursor-not-allowed disabled:opacity-45`}
               >
                 <IconGitPush className="h-4 w-4" />
                 {gitCopy.push}
@@ -808,7 +1038,7 @@ export default function Sidebar({
                   setGitActionMode((mode) => mode === "branch" ? null : "branch");
                   setGitFeedback(null);
                 }}
-                className="flex w-full items-center gap-2 rounded px-2 py-2 text-left text-[13px] transition-colors hover:bg-[#2f2f32] disabled:cursor-not-allowed disabled:opacity-45"
+                className={`flex w-full items-center gap-2 rounded px-2 py-2 text-left text-[13px] transition-colors ${gitMenuThemeClasses.hover} disabled:cursor-not-allowed disabled:opacity-45`}
               >
                 <IconGitBranch className="h-4 w-4" />
                 {gitCopy.createBranch}
@@ -819,11 +1049,11 @@ export default function Sidebar({
                     autoFocus
                     value={gitBranchName}
                     onChange={(event) => setGitBranchName(event.target.value)}
-                    className="h-8 w-full rounded border border-[#3f3f46] bg-[#111113] px-2 text-[12px] text-[#e4e4e7] outline-none focus:border-[var(--accent)]"
+                    className={`h-8 w-full rounded border ${gitMenuThemeClasses.divider} ${gitMenuThemeClasses.inputBg} px-2 text-[12px] text-[#e4e4e7] outline-none focus:border-[var(--accent)]`}
                     placeholder={gitCopy.branchPlaceholder}
                   />
                   <div className="flex items-center justify-end gap-2">
-                    <button type="button" onClick={() => setGitActionMode(null)} className="rounded px-2 py-1 text-[11px] text-[#a1a1aa] hover:bg-[#2f2f32]">{gitCopy.cancel}</button>
+                    <button type="button" onClick={() => setGitActionMode(null)} className={`rounded px-2 py-1 text-[11px] ${gitMenuThemeClasses.mutedText} ${gitMenuThemeClasses.hover}`}>{gitCopy.cancel}</button>
                     <button disabled={gitActionBusy} className="rounded bg-[var(--accent)] px-2 py-1 text-[11px] font-semibold text-white disabled:opacity-50">{gitCopy.confirm}</button>
                   </div>
                 </form>
@@ -831,7 +1061,8 @@ export default function Sidebar({
             </div>
           </div>
         </div>
-      )}
+        );
+      })()}
 
       <div
         onMouseDown={onStartResizing}

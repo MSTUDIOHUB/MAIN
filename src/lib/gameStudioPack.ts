@@ -7,6 +7,8 @@ import {
   GAME_STUDIO_PACK_VERSION,
   GAME_STUDIO_SOURCE_REPO,
   GAME_STUDIO_SOURCE_TAG,
+  getDefaultStudioAgentForEngine,
+  getDefaultStudioLanguageForEngine,
   type GameStudioPackManifest,
   type NexusModeKey,
   type NonAutoStudioAgentKey,
@@ -15,6 +17,7 @@ import {
   type StudioCatalogLanguage,
   type StudioAgentKey,
   type StudioConfig,
+  type StudioEngineKey,
   type StudioWorkflowCommandSlug,
 } from "./gameStudioCatalog";
 
@@ -337,6 +340,28 @@ export async function setGameStudioActiveAgent(activeStudioAgent: StudioAgentKey
   return next;
 }
 
+export async function setGameStudioEngineConfig(params: {
+  engine: StudioEngineKey;
+  version?: string;
+  activeStudioAgent?: StudioAgentKey;
+}): Promise<StudioConfig> {
+  const activeStudioAgent = params.activeStudioAgent ?? getDefaultStudioAgentForEngine(params.engine);
+  const current = (await loadGameStudioConfig()) ?? createDefaultStudioConfig(activeStudioAgent);
+  const next: StudioConfig = {
+    ...current,
+    engine: params.engine,
+    engineLanguage: getDefaultStudioLanguageForEngine(params.engine),
+    activeStudioAgent,
+  };
+  if (params.version) {
+    next.engineVersion = params.version;
+  } else if (current.engine !== params.engine) {
+    delete next.engineVersion;
+  }
+  await writeFile(GAME_STUDIO_CONFIG_PATH, `${JSON.stringify(next, null, 2)}\n`);
+  return next;
+}
+
 export async function removeGameStudioWorkspaceAssets(): Promise<void> {
   const existingHooks = await readHookConfigFile();
   const cleanedHooks = removeGameStudioHooksFromConfig(existingHooks);
@@ -355,6 +380,7 @@ export function buildGameStudioEnvelopeForTurn(params: {
   nexusMode: NexusModeKey;
   activeStudioAgent: StudioAgentKey;
   command: PendingSlashCommand | null;
+  studioConfig?: StudioConfig | null;
   responseLanguage?: "zh" | "en";
 }): string {
   if (params.nexusMode !== "nexus_game_studio") {
@@ -376,6 +402,7 @@ export function buildGameStudioEnvelopeForTurn(params: {
     command: params.command,
     commandPath,
     agentPath,
+    studioConfig: params.studioConfig,
     responseLanguage: params.responseLanguage,
   });
 }

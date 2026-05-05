@@ -30,6 +30,9 @@ const {
   buildRepeatLoopArgsKey,
   formatRepeatLoopFatalMessage,
   formatRepeatLoopRecoveryMessage,
+  formatTargetProgressLoopRecoveryMessage,
+  isReadOnlyShellInspectionToolCall,
+  registerTargetProgressForLoopGuard,
   registerToolCallForRepeatGuard,
 } = await loadRepetitionGuardModule();
 
@@ -63,6 +66,46 @@ test("repeat guard keeps write tools on the stricter threshold", () => {
   assert.equal(result.threshold, 3);
 });
 
+test("repeat guard treats read-only shell inspection commands as recoverable reads", () => {
+  const args = {
+    command: "sed -n '1690,1700p' /Users/michael/Documents/GitHub/MAIN/src-tauri/src/lib.rs",
+  };
+  const history = [];
+  let result = null;
+
+  assert.equal(isReadOnlyShellInspectionToolCall("run_command", args), true);
+  for (let i = 0; i < 6; i += 1) {
+    result = registerToolCallForRepeatGuard(
+      history,
+      "run_command",
+      args,
+      isReadOnlyShellInspectionToolCall("run_command", args),
+    );
+  }
+
+  assert.equal(result.repeated, true);
+  assert.equal(result.threshold, 6);
+});
+
+test("repeat guard keeps non-inspection shell commands on the strict threshold", () => {
+  const args = { command: "npm test" };
+  const history = [];
+  let result = null;
+
+  assert.equal(isReadOnlyShellInspectionToolCall("run_command", args), false);
+  for (let i = 0; i < 3; i += 1) {
+    result = registerToolCallForRepeatGuard(
+      history,
+      "run_command",
+      args,
+      isReadOnlyShellInspectionToolCall("run_command", args),
+    );
+  }
+
+  assert.equal(result.repeated, true);
+  assert.equal(result.threshold, 3);
+});
+
 test("repeat guard messages include the actual threshold and target", () => {
   const recovery = formatRepeatLoopRecoveryMessage("list_directory", "src-tauri", 6);
   const fatal = formatRepeatLoopFatalMessage("write_file", "notes.md", 3);
@@ -71,4 +114,21 @@ test("repeat guard messages include the actual threshold and target", () => {
   assert.match(recovery, /src-tauri/);
   assert.match(fatal, /3\+ times/);
   assert.match(fatal, /notes\.md/);
+});
+
+test("target progress guard catches repeated edits to the same target even with different content", () => {
+  const history = [];
+  let result = null;
+
+  for (const tool of ["replace_in_file", "write_file", "replace_in_file", "replace_in_file"]) {
+    result = registerTargetProgressForLoopGuard(history, tool, "src/App.tsx");
+  }
+
+  assert.equal(result.repeated, true);
+  assert.equal(result.threshold, 4);
+  assert.equal(result.family, "edit");
+
+  const recovery = formatTargetProgressLoopRecoveryMessage(result.family, result.targetKey, result.threshold);
+  assert.match(recovery, /Progress guard/);
+  assert.match(recovery, /src\/app\.tsx/);
 });

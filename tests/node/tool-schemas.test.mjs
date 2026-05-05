@@ -27,6 +27,7 @@ async function loadToolSchemasModule() {
 }
 
 const {
+  buildToolDefinitions,
   normalizeToolParametersSchema,
   normalizeToolDefinition,
 } = await loadToolSchemasModule();
@@ -69,4 +70,18 @@ test("tool definition normalization fills missing object properties", () => {
 
   assert.deepEqual(tool.function.parameters.properties, {});
   assert.deepEqual(tool.function.parameters.required, []);
+});
+
+test("shell tool schemas require execution descriptions and expose cwd metadata", () => {
+  const tools = buildToolDefinitions([]);
+  const runCommand = tools.find((tool) => tool.function.name === "run_command");
+  const executeCommand = tools.find((tool) => tool.function.name === "execute_command");
+
+  assert.ok(runCommand);
+  assert.ok(executeCommand);
+  assert.ok(runCommand.function.parameters.required.includes("description"));
+  assert.ok(executeCommand.function.parameters.required.includes("description"));
+  assert.ok(runCommand.function.parameters.properties.cwd);
+  assert.ok(runCommand.function.parameters.properties.workdir);
+  assert.ok(executeCommand.function.parameters.properties.cwd);
 });

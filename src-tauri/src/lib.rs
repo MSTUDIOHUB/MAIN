@@ -294,6 +294,13 @@ struct GitStatus {
     error: Option<String>,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitFileEntry {
+    path: String,
+    status: String,
+}
+
 #[derive(Default)]
 struct GitBranchInfo {
     branch: Option<String>,
@@ -1693,6 +1700,103 @@ fn get_git_status(
 ) -> Result<GitStatus, String> {
     let workspace = resolve_workspace_root(&state, workspace)?;
     get_git_status_for_workspace(&workspace, include_stats.unwrap_or(false))
+}
+
+#[tauri::command]
+fn get_git_file_list(
+    state: State<WorkspaceState>,
+    workspace: Option<String>,
+    filter: Option<String>,
+) -> Result<Vec<GitFileEntry>, String> {
+    let workspace = resolve_workspace_root(&state, workspace)?;
+    let timeout = Duration::from_millis(10_000);
+
+    let repo = match run_git_process(&workspace, &["rev-parse", "--show-toplevel"], timeout) {
+        Ok(output) if output.success => output.stdout.trim().to_string(),
+        Ok(_) => return Ok(Vec::new()),
+        Err(_) => return Ok(Vec::new()),
+    };
+
+    let repo_root = PathBuf::from(repo.trim());
+    let status_output = run_git_process(
+        &repo_root,
+        &["status", "--porcelain=v1"],
+        timeout,
+    )?;
+
+    if !status_output.success {
+        return Ok(Vec::new());
+    }
+
+    let filter_type = filter.as_deref().unwrap_or("");
+    let mut entries: Vec<GitFileEntry> = Vec::new();
+    let max_entries = 100;
+
+    for line in status_output.stdout.lines() {
+        if entries.len() >= max_entries {
+            break;
+        }
+
+        // porcelain=v1 format: "XY PATH" or "XY PATH -> RENAMED_PATH"
+        // XY = status codes, e.g., "M " (modified, unstaged), " M" (modified, staged)
+        // "A " = added, "D " = deleted, "R " = renamed, "?? " = untracked
+        let status_chars = line.chars().take(2).collect::<String>();
+        let path_part = line[2..].trim_start();
+
+        // Handle renamed files: "R  old -> new"
+        let display_path = if let Some(arrow_pos) = path_part.find(" -> ") {
+            path_part[arrow_pos + 4..].trim().to_string()
+        } else {
+            path_part.to_string()
+        };
+
+        // Determine the primary status type
+        let primary_status = if status_chars.starts_with('R') {
+            "R"
+        } else if status_chars.starts_with('A') {
+            "A"
+        } else if status_chars.starts_with('D') {
+            "D"
+        } else if status_chars.starts_with('?') {
+            "U"
+        } else if status_chars.starts_with('M') || status_chars.starts_with('C') {
+            "M"
+        } else {
+            "M"
+        };
+
+        // Apply filter
+        match filter_type {
+            "changed" | "modified" => {
+                if primary_status != "M" && primary_status != "R" {
+                    continue;
+                }
+            }
+            "added" => {
+                if primary_status != "A" {
+                    continue;
+                }
+            }
+            "deleted" => {
+                if primary_status != "D" {
+                    continue;
+                }
+            }
+            "untracked" => {
+                if primary_status != "U" {
+                    continue;
+                }
+            }
+            _ => {} // no filter
+        }
+
+        entries.push(GitFileEntry {
+            path: display_path,
+            status: primary_status.to_string(),
+        });
+    }
+
+    Ok(entries)
 }
 
 #[tauri::command]
@@ -4904,6 +5008,7 @@ pub fn run() {
             get_pty_status,
             run_command,
             get_git_status,
+            get_git_file_list,
             git_commit_all,
             git_push_current_branch,
             git_create_branch,

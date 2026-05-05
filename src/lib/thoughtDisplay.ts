@@ -36,6 +36,14 @@ function normalizeForCompare(text: string): string {
 
 export function normalizeThoughtSummaryForCompare(text: string): string {
   return normalizeForCompare(text)
+    .replace(/\bthought display\b/g, "思考显示")
+    .replace(/(?:下一步|会把|把|接入)/g, "")
+    .replace(/我(?:需要|准备|会|将|先|正在|已经|要)?/g, "")
+    .replace(/(?:需要|准备|正在|已经|先)/g, "")
+    .replace(/(?:检查|查看|读取|读|搜索|确认)/g, "看")
+    .replace(/(?:内容|上下文|具体实现|具体内容)/g, "")
+    .replace(/(?:尝试|试着|换一种方式)/g, "")
+    .replace(/的/g, "")
     .replace(/\bthe same\b/g, "same")
     .replace(/\bsame\b/g, "")
     .replace(/\bme\b/g, "")
@@ -155,12 +163,32 @@ function jaccardSimilarity(a: string, b: string): number {
   return intersection / Math.max(left.size, right.size);
 }
 
+function charBigramSimilarity(a: string, b: string): number {
+  const toBigrams = (value: string) => {
+    const compact = normalizeThoughtSummaryForCompare(value).replace(/\s+/g, "");
+    const bigrams = new Set<string>();
+    for (let index = 0; index < compact.length - 1; index += 1) {
+      bigrams.add(compact.slice(index, index + 2));
+    }
+    return bigrams;
+  };
+  const left = toBigrams(a);
+  const right = toBigrams(b);
+  if (left.size === 0 || right.size === 0) return 0;
+  let intersection = 0;
+  for (const token of left) {
+    if (right.has(token)) intersection += 1;
+  }
+  return intersection / Math.max(left.size, right.size);
+}
+
 function isNearDuplicateSummary(candidate: string, existing: string): boolean {
   const left = normalizeThoughtSummaryForCompare(candidate);
   const right = normalizeThoughtSummaryForCompare(existing);
   if (!left || !right) return false;
   if (left === right) return true;
   if (left.length > 24 && right.length > 24 && (left.includes(right) || right.includes(left))) return true;
+  if (/[\u4e00-\u9fff]/.test(left + right) && charBigramSimilarity(candidate, existing) >= 0.68) return true;
   return jaccardSimilarity(candidate, existing) >= 0.72;
 }
 
@@ -236,6 +264,25 @@ function foldCodeLikeRuns(lines: string[], language: "zh" | "en"): string[] {
   return result;
 }
 
+function dedupeNearDuplicateThoughtLines(lines: string[]): string[] {
+  const result: string[] = [];
+  for (const line of lines) {
+    if (isMarkdownStructureLine(line) || isCodeLikeLine(line)) {
+      result.push(line);
+      continue;
+    }
+    if (result.some((existing) =>
+      !isMarkdownStructureLine(existing) &&
+      !isCodeLikeLine(existing) &&
+      isNearDuplicateSummary(line, existing)
+    )) {
+      continue;
+    }
+    result.push(line);
+  }
+  return result;
+}
+
 function normalizePunctuationNoise(line: string): string {
   return String(line || "")
     .replace(/\u2026/g, "...")
@@ -270,7 +317,8 @@ function cleanThoughtText(raw: string, language: "zh" | "en"): string {
     })
     .map((line) => line.cleanLine);
 
-  return collapseRepeatedLines(collapseRepeatedParagraphs(foldCodeLikeRuns(filteredLines, language).join("\n")))
+  const readableLines = dedupeNearDuplicateThoughtLines(foldCodeLikeRuns(filteredLines, language));
+  return collapseRepeatedLines(collapseRepeatedParagraphs(readableLines.join("\n")))
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
