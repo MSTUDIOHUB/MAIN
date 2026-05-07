@@ -21,6 +21,18 @@ export interface FileMetadata {
   modifiedMs: number;
 }
 
+export interface ReadFileWindowResult {
+  path: string;
+  content: string;
+  startLine: number;
+  endLine: number;
+  totalLines: number;
+  totalChars: number;
+  returnedChars: number;
+  truncated: boolean;
+  nextStartLine?: number | null;
+}
+
 export interface HookCommandOutput {
   stdout: string;
   stderr: string;
@@ -191,6 +203,24 @@ export function readFile(path: string, workspace?: string): Promise<string> {
   return invoke<string>("read_file", { path, workspace });
 }
 
+export function readFileWindow(
+  path: string,
+  workspace?: string,
+  startLine?: number,
+  endLine?: number,
+  maxLines?: number,
+  maxChars?: number,
+): Promise<ReadFileWindowResult> {
+  return invoke<ReadFileWindowResult>("read_file_window", {
+    path,
+    workspace,
+    startLine,
+    endLine,
+    maxLines,
+    maxChars,
+  });
+}
+
 export function getFileMetadata(path: string, workspace?: string): Promise<FileMetadata> {
   return invoke<FileMetadata>("get_file_metadata", { path, workspace });
 }
@@ -261,6 +291,35 @@ export function saveProjectSession(workspace: string, session: any): Promise<any
 
 export function loadProjectSession(workspace: string, sessionId: number | string): Promise<any> {
   return invoke<any>("load_project_session", { workspace, sessionId });
+}
+
+export interface ProjectSessionPage {
+  sessionId: string;
+  turns: any[];
+  messages: any[];
+  startTurnIndex: number;
+  endTurnIndex: number;
+  totalTurns: number;
+  hasMore: boolean;
+  nextBeforeTurnIndex?: number | null;
+}
+
+export function loadProjectSessionMeta(workspace: string, sessionId: number | string): Promise<any> {
+  return invoke<any>("load_project_session_meta", { workspace, sessionId });
+}
+
+export function loadProjectSessionPage(
+  workspace: string,
+  sessionId: number | string,
+  beforeTurnIndex?: number | null,
+  limit?: number,
+): Promise<ProjectSessionPage> {
+  return invoke<ProjectSessionPage>("load_project_session_page", {
+    workspace,
+    sessionId,
+    beforeTurnIndex,
+    limit,
+  });
 }
 
 export function deleteProjectSession(workspace: string, sessionId: number | string): Promise<any[]> {

@@ -438,6 +438,7 @@ function getFileDisplayMeta(category: FileCategory, fileLang: string, filePath: 
 function FileViewerPanel({
   filePath,
   fileContent,
+  fileWindow,
   fileError,
   fileLoading,
   fileCategory,
@@ -446,9 +447,18 @@ function FileViewerPanel({
   themeMode,
   uiLanguage,
   onClose,
+  onLoadNextWindow,
 }: {
   filePath: string;
   fileContent: string;
+  fileWindow: {
+    startLine: number;
+    endLine: number;
+    totalLines: number;
+    totalChars: number;
+    truncated: boolean;
+    nextStartLine?: number | null;
+  } | null;
   fileError: string | null;
   fileLoading: boolean;
   fileCategory: FileCategory;
@@ -457,6 +467,7 @@ function FileViewerPanel({
   themeMode: "light" | "dark" | "black";
   uiLanguage: string;
   onClose: () => void;
+  onLoadNextWindow: () => void;
 }) {
   const [copied, setCopied] = useState(false);
   const [wrapLines, setWrapLines] = useState(false);
@@ -488,6 +499,7 @@ function FileViewerPanel({
   const hasPreviewToggle = fileCategory === "json" || fileCategory === "table";
   const showPreview = hasPreviewToggle && viewMode === "preview";
   const BadgeIcon = langBadge.Icon;
+  const hasMoreFileContent = !!fileWindow?.truncated && !!fileWindow.nextStartLine;
 
   const buttonBaseStyle = {
     borderColor: palette.buttonBorder,
@@ -727,6 +739,31 @@ function FileViewerPanel({
         </button>
       </div>
       <div className="flex-1 overflow-y-auto p-4">
+        {fileWindow && !fileError && fileCategory !== "image" && fileCategory !== "binary" && (
+          <div
+            className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-lg border px-3 py-2 text-[11px]"
+            style={{ borderColor: palette.surfaceBorder, backgroundColor: palette.surfaceAltBg, color: palette.subtle }}
+          >
+            <span>
+              {uiLanguage === "zh"
+                ? `当前窗口：第 ${fileWindow.startLine}-${fileWindow.endLine} 行 / 共 ${fileWindow.totalLines} 行`
+                : `Window: lines ${fileWindow.startLine}-${fileWindow.endLine} of ${fileWindow.totalLines}`}
+            </span>
+            {hasMoreFileContent && (
+              <button
+                type="button"
+                onClick={onLoadNextWindow}
+                disabled={fileLoading}
+                className="rounded-md border px-2.5 py-1 text-[10px] font-semibold transition-opacity hover:opacity-75 disabled:cursor-not-allowed disabled:opacity-50"
+                style={buttonBaseStyle}
+              >
+                {fileLoading
+                  ? (uiLanguage === "zh" ? "加载中..." : "Loading...")
+                  : (uiLanguage === "zh" ? "加载下一段" : "Load Next")}
+              </button>
+            )}
+          </div>
+        )}
         {fileLoading ? (
           <div className="text-[12px]" style={{ color: palette.subtle }}>{uiLanguage === "zh" ? "加载中..." : "Loading..."}</div>
         ) : fileCategory === "binary" ? (
@@ -781,11 +818,13 @@ export default function FilePanel({ width, onStartResizing }: FilePanelProps) {
   const showFilePanel = useAppStore((s) => s.showFilePanel);
   const fileViewerPath = useAppStore((s) => s.fileViewerPath);
   const fileViewerContent = useAppStore((s) => s.fileViewerContent);
+  const fileViewerWindow = useAppStore((s) => s.fileViewerWindow);
   const fileViewerError = useAppStore((s) => s.fileViewerError);
   const fileViewerLoading = useAppStore((s) => s.fileViewerLoading);
   const clearFileViewer = useAppStore((s) => s.clearFileViewer);
   const closeFilePanel = useAppStore((s) => s.closeFilePanel);
   const openFileViewer = useAppStore((s) => s.openFileViewer);
+  const loadNextFileViewerWindow = useAppStore((s) => s.loadNextFileViewerWindow);
   const currentWorkspace = useAppStore((s) => s.currentWorkspace);
   const currentSessionId = useAppStore((s) => s.currentSessionId);
   const config = useAppStore((s) => s.config);
@@ -880,6 +919,7 @@ export default function FilePanel({ width, onStartResizing }: FilePanelProps) {
             <MemoizedFileViewerPanel
               filePath={fileViewerPath}
               fileContent={fileViewerContent}
+              fileWindow={fileViewerWindow}
               fileError={fileViewerError}
               fileLoading={fileViewerLoading}
               fileCategory={effectiveCategory}
@@ -888,6 +928,7 @@ export default function FilePanel({ width, onStartResizing }: FilePanelProps) {
               themeMode={config.themeMode}
               uiLanguage={language}
               onClose={clearFileViewer}
+              onLoadNextWindow={loadNextFileViewerWindow}
             />
           ) : (
             <WorkspaceTreePanel

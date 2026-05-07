@@ -23,6 +23,18 @@ export interface ReadFileWindowMetadata {
   nextStartLine?: number;
 }
 
+export interface ReadFileWindowPayload {
+  path?: string;
+  content: string;
+  startLine: number;
+  endLine: number;
+  totalLines: number;
+  totalChars: number;
+  returnedChars?: number;
+  truncated: boolean;
+  nextStartLine?: number | null;
+}
+
 function parsePositiveInteger(value: unknown): number | undefined {
   if (typeof value === "number" && Number.isFinite(value)) {
     const rounded = Math.floor(value);
@@ -190,6 +202,42 @@ export function formatReadFileWindowForModel(
   ].filter(Boolean);
 
   return `${header.join("\n")}\n${windowContent}\n---CONTENT END---`;
+}
+
+export function formatReadFileWindowPayloadForModel(
+  path: string,
+  payload: ReadFileWindowPayload,
+  args: Record<string, unknown> = {},
+): string {
+  const content = String(payload.content || "");
+  const returnedStartLine = Math.max(0, Number(payload.startLine) || 0);
+  const returnedEndLine = Math.max(0, Number(payload.endLine) || 0);
+  const totalLines = Math.max(0, Number(payload.totalLines) || 0);
+  const totalChars = Math.max(0, Number(payload.totalChars) || 0);
+  const returnedChars = Math.max(0, Number(payload.returnedChars ?? content.length) || 0);
+  const nextStartLine = parsePositiveInteger(payload.nextStartLine);
+  const requestedMaxLines = Math.min(
+    parsePositiveInteger(args.max_lines) ?? DEFAULT_WINDOW_MAX_LINES,
+    MAX_REQUESTED_WINDOW_LINES,
+  );
+
+  const header = [
+    READ_FILE_RESULT_MARKER,
+    `path: ${path}`,
+    `truncated: ${payload.truncated ? "true" : "false"}`,
+    `totalLines: ${totalLines}`,
+    `totalChars: ${totalChars}`,
+    `returnedLines: ${returnedStartLine}-${returnedEndLine}`,
+    `returnedChars: ${returnedChars}`,
+    nextStartLine ? `nextStartLine: ${nextStartLine}` : "",
+    nextStartLine
+      ? `nextRead: read_file({"path":${JSON.stringify(path)},"start_line":${nextStartLine},"max_lines":${requestedMaxLines}})`
+      : "",
+    "note: read_file returns a bounded content window for large or ranged reads. For more source, call read_file with start_line/end_line/max_lines; do not use run_command merely to page file contents.",
+    "---CONTENT START---",
+  ].filter(Boolean);
+
+  return `${header.join("\n")}\n${content}\n---CONTENT END---`;
 }
 
 export function buildReadFileWindowContinuationGuidance(content: string): string | null {

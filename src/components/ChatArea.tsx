@@ -1,5 +1,5 @@
 // @ts-nocheck
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { IconCheck, IconChevronDown, IconChevronRight, IconClose, IconCloud, IconCode, IconColumns, IconFileText, IconFolder, IconLogoM, IconStop, IconTerminal } from "./Icons";
 import ActionCard from "./ActionCard";
@@ -1132,6 +1132,77 @@ function AgentContentBlock({
   );
 }
 
+const RunStatusTimer = memo(function RunStatusTimer({
+  activeSessionKey,
+  isStreaming,
+  label,
+}: {
+  activeSessionKey?: string | null;
+  isStreaming: boolean;
+  label: string;
+}) {
+  const storedElapsedTime = useAppStore((s) => {
+    const runtimeElapsed = activeSessionKey
+      ? s.runtimeBySessionKey?.[activeSessionKey]?.elapsedTime
+      : undefined;
+    return Math.max(0, Number(runtimeElapsed ?? s.elapsedTime ?? 0) || 0);
+  });
+  const [displayElapsedTime, setDisplayElapsedTime] = useState(storedElapsedTime);
+  const elapsedBaseRef = useRef(storedElapsedTime);
+  const elapsedSessionKeyRef = useRef(activeSessionKey ?? null);
+  const wasStreamingRef = useRef(false);
+
+  useEffect(() => {
+    const nextSessionKey = activeSessionKey ?? null;
+    if (elapsedSessionKeyRef.current === nextSessionKey) return;
+    elapsedSessionKeyRef.current = nextSessionKey;
+    elapsedBaseRef.current = storedElapsedTime;
+    wasStreamingRef.current = false;
+    setDisplayElapsedTime(storedElapsedTime);
+  }, [activeSessionKey, storedElapsedTime]);
+
+  useEffect(() => {
+    elapsedBaseRef.current = Math.max(elapsedBaseRef.current, storedElapsedTime);
+    setDisplayElapsedTime((current) => Math.max(current, storedElapsedTime));
+  }, [storedElapsedTime]);
+
+  useEffect(() => {
+    if (!isStreaming) {
+      wasStreamingRef.current = false;
+      return;
+    }
+
+    const isNewRun = !wasStreamingRef.current && storedElapsedTime === 0;
+    const baseElapsed = isNewRun ? 0 : Math.max(elapsedBaseRef.current, storedElapsedTime);
+    wasStreamingRef.current = true;
+    if (isNewRun) {
+      elapsedBaseRef.current = 0;
+      setDisplayElapsedTime(0);
+    }
+    const startedAt = Date.now();
+
+    const tick = () => {
+      const derivedElapsed = baseElapsed + Math.floor((Date.now() - startedAt) / 1000);
+      elapsedBaseRef.current = Math.max(elapsedBaseRef.current, derivedElapsed);
+      setDisplayElapsedTime((current) => Math.max(current, storedElapsedTime, derivedElapsed));
+    };
+
+    tick();
+    const timerId = window.setInterval(tick, 250);
+    return () => {
+      window.clearInterval(timerId);
+      tick();
+    };
+  }, [activeSessionKey, storedElapsedTime, isStreaming]);
+
+  return (
+    <div className="pointer-events-none flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-[4px] border border-[#27272a] bg-[#09090b] px-2.5 py-1 text-[10px] font-medium text-[#a1a1aa]" style={{ height: 28 }}>
+      <span className="h-1.5 w-1.5 rounded-full bg-amber-400 shadow-[0_0_5px_#fbbf24] animate-pulse" />
+      {label} {Math.floor(displayElapsedTime / 60)}m{displayElapsedTime % 60}s
+    </div>
+  );
+});
+
 export default function ChatArea({
   taskFlow,
   t,
@@ -1141,9 +1212,9 @@ export default function ChatArea({
   activeDiffTask,
   endOfFlowRef,
   isStreaming,
-  elapsedTime = 0,
   activeSessionKey,
   onStopGeneration,
+  onLoadOlderSessionHistory,
   allowToolAction,
   rejectToolAction,
   autoApproveTools,
@@ -1172,10 +1243,6 @@ export default function ChatArea({
   onQuickReply,
 }) {
   const language = config.language === "en" ? "en" : "zh";
-  const [displayElapsedTime, setDisplayElapsedTime] = useState(elapsedTime);
-  const elapsedBaseRef = useRef(elapsedTime);
-  const elapsedSessionKeyRef = useRef(activeSessionKey ?? null);
-  const wasStreamingRef = useRef(false);
   const copy = useMemo(() => ({
     planLabel: language === "zh" ? "计划" : "Plan",
     stopLabel: language === "zh" ? "停止" : "Stop",
@@ -1290,58 +1357,19 @@ export default function ChatArea({
   const chatContainerRef = useRef<HTMLDivElement>(null);
   const turnRefs = useRef<Record<string, HTMLDivElement | null>>({});
   const lastScrollTopRef = useRef(0);
+  const previousSessionKeyRef = useRef(activeSessionKey ?? null);
+  const previousFirstTurnIdRef = useRef<string | null>(null);
   const historyPeekHideTimerRef = useRef<number | null>(null);
   const topIslandHideTimerRef = useRef<number | null>(null);
   const [isAutoScroll, setIsAutoScroll] = useState(true);
   const [activeVisibleTurnId, setActiveVisibleTurnId] = useState<string | null>(null);
   const [showTopIslandDuringHistoryPeek, setShowTopIslandDuringHistoryPeek] = useState(false);
+  const [olderHistoryLoading, setOlderHistoryLoading] = useState(false);
   // region: 浮层显隐状态
   const [composerHeight, setComposerHeight] = useState(220);
   const [shouldRenderTopIsland, setShouldRenderTopIsland] = useState(false);
   const [isTopIslandVisible, setIsTopIslandVisible] = useState(false);
   // endregion
-  useEffect(() => {
-    const nextSessionKey = activeSessionKey ?? null;
-    if (elapsedSessionKeyRef.current === nextSessionKey) return;
-    elapsedSessionKeyRef.current = nextSessionKey;
-    elapsedBaseRef.current = elapsedTime;
-    wasStreamingRef.current = false;
-    setDisplayElapsedTime(elapsedTime);
-  }, [activeSessionKey, elapsedTime]);
-
-  useEffect(() => {
-    elapsedBaseRef.current = Math.max(elapsedBaseRef.current, elapsedTime);
-    setDisplayElapsedTime((current) => Math.max(current, elapsedTime));
-  }, [elapsedTime]);
-
-  useEffect(() => {
-    if (!isStreaming) {
-      wasStreamingRef.current = false;
-      return;
-    }
-
-    const isNewRun = !wasStreamingRef.current && elapsedTime === 0;
-    const baseElapsed = isNewRun ? 0 : Math.max(elapsedBaseRef.current, elapsedTime);
-    wasStreamingRef.current = true;
-    if (isNewRun) {
-      elapsedBaseRef.current = 0;
-      setDisplayElapsedTime(0);
-    }
-    const startedAt = Date.now();
-
-    const tick = () => {
-      const derivedElapsed = baseElapsed + Math.floor((Date.now() - startedAt) / 1000);
-      elapsedBaseRef.current = Math.max(elapsedBaseRef.current, derivedElapsed);
-      setDisplayElapsedTime((current) => Math.max(current, elapsedTime, derivedElapsed));
-    };
-
-    tick();
-    const timerId = window.setInterval(tick, 250);
-    return () => {
-      window.clearInterval(timerId);
-      tick();
-    };
-  }, [activeSessionKey, elapsedTime, isStreaming]);
 
   useEffect(() => {
     return () => {
@@ -1351,18 +1379,58 @@ export default function ChatArea({
     };
   }, []);
 
+  const blocksByTurnId = useMemo(() => {
+    const next = new Map<string, any[]>();
+    const legacyBlocks: any[] = [];
+    for (const block of taskFlow) {
+      const turnId = block?.turnId;
+      if (!turnId) {
+        legacyBlocks.push(block);
+        continue;
+      }
+      const existing = next.get(turnId);
+      if (existing) {
+        existing.push(block);
+      } else {
+        next.set(turnId, [block]);
+      }
+    }
+    return { byTurnId: next, legacyBlocks };
+  }, [taskFlow]);
+
   const groupedTurns = useMemo(() => {
     if (conversationTurns.length === 0) {
-      return taskFlow.length > 0
-        ? [{ turn: null, blocks: taskFlow }]
+      return blocksByTurnId.legacyBlocks.length > 0
+        ? [{ turn: null, blocks: blocksByTurnId.legacyBlocks }]
         : [];
     }
 
     return conversationTurns.map((turn) => ({
       turn,
-      blocks: taskFlow.filter((block) => block.turnId === turn.id),
+      blocks: blocksByTurnId.byTurnId.get(turn.id) || [],
     }));
-  }, [conversationTurns, taskFlow]);
+  }, [blocksByTurnId, conversationTurns]);
+
+  useEffect(() => {
+    const nextSessionKey = activeSessionKey ?? null;
+    const firstTurnId = conversationTurns[0]?.id ?? null;
+    const sessionChanged = previousSessionKeyRef.current !== nextSessionKey;
+    const replacedHistory = previousFirstTurnIdRef.current !== firstTurnId;
+    previousSessionKeyRef.current = nextSessionKey;
+    previousFirstTurnIdRef.current = firstTurnId;
+    if (!sessionChanged && !replacedHistory) return;
+
+    setIsAutoScroll(true);
+    setActiveVisibleTurnId(conversationTurns[conversationTurns.length - 1]?.id ?? null);
+    setShowTopIslandDuringHistoryPeek(false);
+    const rafId = window.requestAnimationFrame(() => {
+      const el = chatContainerRef.current;
+      if (!el) return;
+      el.scrollTop = el.scrollHeight;
+      lastScrollTopRef.current = el.scrollTop;
+    });
+    return () => window.cancelAnimationFrame(rafId);
+  }, [activeSessionKey, conversationTurns]);
 
   const activeTurn = useMemo(() => {
     return resolveActiveConversationTurn(conversationTurns, activeVisibleTurnId, isAutoScroll);
@@ -1871,7 +1939,7 @@ export default function ChatArea({
             {!isTurnExpanded ? (
               <span className="truncate text-[13px] font-semibold text-[#f5f5f5]">{displayTurnTitle}</span>
             ) : (
-              <span className="text-[11px] uppercase tracking-[0.18em] text-[#71717a]">{copy.turnDetails}</span>
+              <span className="min-w-0 truncate text-[13px] font-semibold text-[#f5f5f5]">{displayTurnTitle}</span>
             )}
             {turnIntentLabel && (
               <span data-testid={`turn-intent-badge-${turnIntent}`} className={`rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-[0.16em] ${isPlanTurn ? "border-[rgba(124,58,237,0.25)] bg-[rgba(124,58,237,0.12)] text-[#c4b5fd]" : turnIntent === "execute" ? "border-[rgba(96,165,250,0.25)] bg-[rgba(96,165,250,0.12)] text-[#93c5fd]" : "border-[rgba(52,211,153,0.22)] bg-[rgba(52,211,153,0.1)] text-[#86efac]"}`}>
@@ -1984,10 +2052,11 @@ export default function ChatArea({
 
         <div className="flex min-w-0 items-center gap-2 overflow-x-auto">
           {shouldShowRunStatus && (
-            <div className="pointer-events-none flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-[4px] border border-[#27272a] bg-[#09090b] px-2.5 py-1 text-[10px] font-medium text-[#a1a1aa]" style={{ height: 28 }}>
-              <span className="h-1.5 w-1.5 rounded-full bg-amber-400 shadow-[0_0_5px_#fbbf24] animate-pulse" />
-              {runStatusLabel} {Math.floor(displayElapsedTime / 60)}m{displayElapsedTime % 60}s
-            </div>
+            <RunStatusTimer
+              activeSessionKey={activeSessionKey}
+              isStreaming={isStreaming}
+              label={runStatusLabel}
+            />
           )}
 
           {shouldShowRunStatus && (
@@ -2093,55 +2162,55 @@ export default function ChatArea({
       <div
         ref={chatContainerRef}
         onScroll={handleScroll}
+        data-testid="chat-scroll-container"
         className="flex-1 overflow-y-auto px-5 pt-5 transition-[padding-bottom] duration-250 ease-out"
         style={{ paddingBottom: `${composerPaddingBottom}px` }}
       >
 
         {groupedTurns.length === 0 ? (
-          isGlobalChat ? (
-            <div className="flex h-full items-center justify-center">
-              <div className="w-full max-w-3xl rounded-[32px] border border-[#18181b] bg-[#050507] px-8 py-10">
-                <div className="flex items-center gap-3">
-                  <IconLogoM className="h-10 w-10 theme-text drop-shadow-[0_0_18px_var(--accent-subtle)]" />
-                    <div>
-                      <div className="text-[11px] font-semibold uppercase tracking-[0.22em] text-[#71717a]">
-                      {language === "zh" ? "聊天" : "Chat"}
-                      </div>
-                    <div className="mt-1 text-[28px] font-semibold text-[#f5f5f5]">
-                      {language === "zh" ? "先用 MAIN 模式做总结、分析、报告或计划" : "Use MAIN mode for summaries, analysis, reports, or planning"}
-                    </div>
-                  </div>
-                </div>
-                <div className="mt-4 max-w-2xl text-[14px] leading-7 text-[#a1a1aa]">
-                  {language === "zh"
-                    ? "这里可以直接用自然语言让 MAIN 做总结、分析、报告、提炼、讨论或计划。等你准备好进入项目，再从左侧切换到工作区会话即可。"
-                    : "Ask MAIN naturally for summaries, analysis, reports, extraction, discussion, or planning before switching into a project workspace."}
-                </div>
-                <div className="mt-6 flex flex-wrap gap-2">
-                  {emptyStatePrompts.map((prompt) => (
-                    <button
-                      key={prompt}
-                      onClick={() => setInput(prompt)}
-                      className="rounded-full border border-[#27272a] bg-[#09090b] px-4 py-2 text-[12px] text-[#d4d4d8] transition-colors hover:border-[var(--accent)] hover:text-white"
-                    >
-                      {prompt}
-                    </button>
-                  ))}
-                </div>
-              </div>
+          <div
+            data-testid="chat-empty-state"
+            className="flex h-full items-center justify-center select-none pointer-events-none"
+          >
+            <div className="flex items-center gap-[4px] opacity-20">
+              <IconLogoM className="w-[72px] h-[72px] theme-text drop-shadow-[0_0_24px_var(--accent-subtle)]" />
+              <span className="text-[#e4e4e7] text-[48px] font-black tracking-[0.3em] leading-none" style={{ fontFamily: 'var(--font-sans)' }}>
+                AIN
+              </span>
             </div>
-          ) : (
-            <div className="flex h-full items-center justify-center select-none pointer-events-none">
-              <div className="flex items-center gap-[4px] opacity-20">
-                <IconLogoM className="w-[72px] h-[72px] theme-text drop-shadow-[0_0_24px_var(--accent-subtle)]" />
-                <span className="text-[#e4e4e7] text-[48px] font-black tracking-[0.3em] leading-none" style={{ fontFamily: 'var(--font-sans)' }}>
-                  AIN
-                </span>
-              </div>
-            </div>
-          )
+          </div>
         ) : (
           <div className="space-y-5">
+            {onLoadOlderSessionHistory && (
+              <div className="flex justify-center">
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (olderHistoryLoading) return;
+                    const el = chatContainerRef.current;
+                    const previousScrollHeight = el?.scrollHeight ?? 0;
+                    const previousScrollTop = el?.scrollTop ?? 0;
+                    setOlderHistoryLoading(true);
+                    Promise.resolve(onLoadOlderSessionHistory()).finally(() => {
+                      window.requestAnimationFrame(() => {
+                        const latestEl = chatContainerRef.current;
+                        if (latestEl && previousScrollHeight > 0) {
+                          latestEl.scrollTop = latestEl.scrollHeight - previousScrollHeight + previousScrollTop;
+                          lastScrollTopRef.current = latestEl.scrollTop;
+                        }
+                        setOlderHistoryLoading(false);
+                      });
+                    });
+                  }}
+                  className="rounded-full border border-[#27272a] bg-[#09090b] px-3 py-1.5 text-[11px] text-[#a1a1aa] transition-colors hover:border-[var(--accent)] hover:text-white disabled:cursor-not-allowed disabled:opacity-50"
+                  disabled={olderHistoryLoading}
+                >
+                  {olderHistoryLoading
+                    ? (language === "zh" ? "加载中..." : "Loading...")
+                    : (language === "zh" ? "加载更早历史" : "Load Older History")}
+                </button>
+              </div>
+            )}
             {groupedTurns.map((entry, index) => renderTurn(entry, index))}
           </div>
         )}

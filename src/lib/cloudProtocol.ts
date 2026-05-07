@@ -7,6 +7,7 @@ import {
 export type CloudApiProtocol = "openai" | "anthropic";
 export type OpenAiApiFormat = "chat_completions" | "responses";
 export type OpenAiReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
+export type CloudToolProtocol = "auto" | "native" | "xml";
 
 export const DEFAULT_ANTHROPIC_VERSION = "2023-06-01";
 
@@ -59,6 +60,14 @@ export interface OpenAiResponsesInputCandidate {
 export interface OpenAiResponsesProbeRequestCandidate {
   mode: OpenAiResponsesInputCandidate["mode"];
   body: Record<string, unknown>;
+}
+
+export interface ModelInstructionProfile {
+  provider: "openai" | "anthropic" | "qwen" | "deepseek" | "kimi" | "generic";
+  visibleLanguage: "follow_user" | "localized";
+  reasoning: "native_hidden" | "tagged" | "none";
+  toolProtocolPreference: CloudToolProtocol;
+  noiseRules: string[];
 }
 
 interface AnthropicTextBlock {
@@ -125,6 +134,9 @@ export interface AnthropicStreamProcessor {
   flush: () => void;
   getResult: () => StreamResultLike;
 }
+
+const ANTHROPIC_THINKING_TAG_OPEN = "<thinking>";
+const ANTHROPIC_THINKING_TAG_CLOSE = "</thinking>";
 
 function normalizeUrl(url: string): string {
   return url.trim().replace(/\/+$/, "");
@@ -264,6 +276,84 @@ export function normalizeOpenAiReasoningEffort(value: unknown): OpenAiReasoningE
     default:
       return "none";
   }
+}
+
+export function normalizeCloudToolProtocol(value: unknown): CloudToolProtocol {
+  return value === "native" || value === "xml" ? value : "auto";
+}
+
+export function getModelInstructionProfile(input: {
+  protocol?: unknown;
+  provider?: unknown;
+  model?: unknown;
+}): ModelInstructionProfile {
+  const protocol = normalizeCloudProtocol(input.protocol);
+  const providerText = String(input.provider || "").toLowerCase();
+  const modelText = String(input.model || "").toLowerCase();
+  const haystack = `${providerText} ${modelText}`;
+
+  if (protocol === "anthropic" || /claude|anthropic/.test(haystack)) {
+    return {
+      provider: "anthropic",
+      visibleLanguage: "follow_user",
+      reasoning: "native_hidden",
+      toolProtocolPreference: "native",
+      noiseRules: [
+        "Map thinking deltas to the thought block, not the assistant body.",
+        "Hide repeated assistant prefaces and duplicate thought summaries.",
+      ],
+    };
+  }
+
+  if (/qwen|qwq/.test(haystack)) {
+    return {
+      provider: "qwen",
+      visibleLanguage: "localized",
+      reasoning: "tagged",
+      toolProtocolPreference: "auto",
+      noiseRules: [
+        "Treat reasoning_content as hidden thought.",
+        "Suppress repeated XML tool tags from visible text.",
+      ],
+    };
+  }
+
+  if (/deepseek/.test(haystack)) {
+    return {
+      provider: "deepseek",
+      visibleLanguage: "localized",
+      reasoning: "tagged",
+      toolProtocolPreference: "auto",
+      noiseRules: [
+        "Treat reasoning deltas as hidden thought.",
+        "Collapse duplicate assistant prefixes.",
+      ],
+    };
+  }
+
+  if (/kimi|moonshot/.test(haystack)) {
+    return {
+      provider: "kimi",
+      visibleLanguage: "localized",
+      reasoning: "none",
+      toolProtocolPreference: "xml",
+      noiseRules: [
+        "Prefer XML tools on gateways with weak function-calling compatibility.",
+        "Remove duplicated tool prose from visible answers.",
+      ],
+    };
+  }
+
+  return {
+    provider: protocol === "openai" ? "openai" : "generic",
+    visibleLanguage: "follow_user",
+    reasoning: protocol === "openai" ? "native_hidden" : "none",
+    toolProtocolPreference: "auto",
+    noiseRules: [
+      "Separate visible text, reasoning text, and tool calls before rendering.",
+      "Deduplicate repeated thought summaries and assistant prefixes.",
+    ],
+  };
 }
 
 export function buildCloudMessagesApiUrl(
@@ -692,6 +782,42 @@ export function buildOpenAiResponsesRequestExtras(options?: {
   return extras;
 }
 
+export function buildOpenAiResponsesRequestCandidates(options: {
+  messages: ProtocolChatMessage[];
+  model: string;
+  tools?: ToolDefinition[];
+  disableResponseStorage?: boolean;
+  reasoningEffort?: unknown;
+  compact?: boolean;
+  includeTools?: boolean;
+}): OpenAiResponsesProbeRequestCandidate[] {
+  const protocolMessages = options.compact
+    ? compactCloudResponsesMessages(options.messages)
+    : options.messages;
+  const rawInstructions = extractOpenAiResponsesInstructions(protocolMessages);
+  const instructions = options.compact
+    ? compactCloudResponsesInstructions(rawInstructions)
+    : rawInstructions;
+  const tools = options.includeTools === false ? [] : convertOpenAiToolsToResponses(options.tools);
+
+  return buildOpenAiResponsesInputCandidates(protocolMessages).map((candidate) => {
+    const candidateTools = candidate.mode !== "transcript_text" ? tools : [];
+    return {
+      mode: candidate.mode,
+      body: {
+        model: options.model,
+        input: candidate.input,
+        ...(instructions ? { instructions } : {}),
+        ...(candidateTools.length > 0 ? { tools: candidateTools } : {}),
+        ...buildOpenAiResponsesRequestExtras({
+          disableResponseStorage: options.disableResponseStorage,
+          reasoningEffort: options.reasoningEffort,
+        }),
+      },
+    };
+  });
+}
+
 export function buildOpenAiResponsesProbeRequestCandidates(options: {
   messages: ProtocolChatMessage[];
   model: string;
@@ -836,6 +962,7 @@ export function createAnthropicStreamProcessor(onToken: (token: string) => void)
   let currentEvent: string | null = null;
   let currentDataLines: string[] = [];
   let fullContent = "";
+  let thinkingOpen = false;
   let finishReason: StreamResultLike["finishReason"] = null;
 
   const toolCallsMap = new Map<number, StreamedToolCallLike>();
@@ -882,6 +1009,33 @@ export function createAnthropicStreamProcessor(onToken: (token: string) => void)
         if (!delta || typeof delta !== "object") return;
 
         if (delta.type === "text_delta" && typeof delta.text === "string") {
+          if (thinkingOpen) {
+            thinkingOpen = false;
+            fullContent += ANTHROPIC_THINKING_TAG_CLOSE;
+            onToken(ANTHROPIC_THINKING_TAG_CLOSE);
+          }
+          fullContent += delta.text;
+          onToken(delta.text);
+          return;
+        }
+
+        if (delta.type === "thinking_delta" && typeof delta.thinking === "string") {
+          if (!thinkingOpen) {
+            thinkingOpen = true;
+            fullContent += ANTHROPIC_THINKING_TAG_OPEN;
+            onToken(ANTHROPIC_THINKING_TAG_OPEN);
+          }
+          fullContent += delta.thinking;
+          onToken(delta.thinking);
+          return;
+        }
+
+        if (delta.type === "thinking_delta" && typeof delta.text === "string") {
+          if (!thinkingOpen) {
+            thinkingOpen = true;
+            fullContent += ANTHROPIC_THINKING_TAG_OPEN;
+            onToken(ANTHROPIC_THINKING_TAG_OPEN);
+          }
           fullContent += delta.text;
           onToken(delta.text);
           return;
@@ -947,6 +1101,11 @@ export function createAnthropicStreamProcessor(onToken: (token: string) => void)
         buffer = "";
       }
       finalizePendingEvent();
+      if (thinkingOpen) {
+        thinkingOpen = false;
+        fullContent += ANTHROPIC_THINKING_TAG_CLOSE;
+        onToken(ANTHROPIC_THINKING_TAG_CLOSE);
+      }
 
       for (const [index, fallbackInput] of toolInputFallbacks.entries()) {
         const existing = toolCallsMap.get(index);

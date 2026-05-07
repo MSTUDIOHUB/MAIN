@@ -61,6 +61,7 @@ async function loadCloudProtocolModule() {
 
 const {
   buildOpenAiResponsesInputCandidates,
+  buildOpenAiResponsesRequestCandidates,
   buildOpenAiResponsesProbeRequestCandidates,
   buildOpenAiResponsesRequestExtras,
   buildOpenAiResponsesTranscript,
@@ -75,6 +76,8 @@ const {
   extractAnthropicResponseText,
   extractOpenAiResponseText,
   mapMessagesForAnthropic,
+  getModelInstructionProfile,
+  normalizeCloudToolProtocol,
   parseCloudCustomHeaders,
 } = await loadCloudProtocolModule();
 
@@ -181,6 +184,19 @@ test("anthropic stream processor handles named SSE events and tool json deltas",
   assert.equal(result.toolCalls[0].id, "toolu_1");
   assert.equal(result.toolCalls[0].name, "read_file");
   assert.equal(result.toolCalls[0].arguments, "{\"path\":\"src/App.tsx\"}");
+});
+
+test("anthropic stream processor routes thinking delta through thinking tags", () => {
+  const tokens = [];
+  const processor = createAnthropicStreamProcessor((token) => tokens.push(token));
+
+  processor.processChunk('event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hidden"}}\n\n');
+  processor.processChunk('event: content_block_delta\ndata: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"visible"}}\n\n');
+  processor.flush();
+
+  const result = processor.getResult();
+  assert.deepEqual(tokens, ["<thinking>", "hidden", "</thinking>", "visible"]);
+  assert.equal(result.content, "<thinking>hidden</thinking>visible");
 });
 
 test("cloud helpers build protocol-specific endpoints and headers", () => {
@@ -299,6 +315,44 @@ test("responses helpers build Codex-style store and reasoning options", () => {
       stream: false,
     },
   );
+});
+
+test("responses request builder emits deterministic store false, instructions, and native tools", () => {
+  const candidates = buildOpenAiResponsesRequestCandidates({
+    messages: [
+      { role: "system", content: "Follow rules." },
+      { role: "user", content: "Read file" },
+    ],
+    model: "gpt-5.4",
+    disableResponseStorage: true,
+    reasoningEffort: "high",
+    tools: [{
+      type: "function",
+      function: {
+        name: "read_file",
+        description: "Read a file",
+        parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
+      },
+    }],
+  });
+
+  assert.equal(candidates[0].body.model, "gpt-5.4");
+  assert.equal(candidates[0].body.instructions, "Follow rules.");
+  assert.equal(candidates[0].body.store, false);
+  assert.deepEqual(candidates[0].body.reasoning, { effort: "high" });
+  assert.equal(candidates[0].body.tools[0].name, "read_file");
+  assert.equal(candidates[2].mode, "transcript_text");
+  assert.equal(candidates[2].body.tools, undefined);
+});
+
+test("cloud tool protocol and model profile helpers normalize provider behavior", () => {
+  assert.equal(normalizeCloudToolProtocol("native"), "native");
+  assert.equal(normalizeCloudToolProtocol("xml"), "xml");
+  assert.equal(normalizeCloudToolProtocol("bad"), "auto");
+
+  assert.equal(getModelInstructionProfile({ protocol: "anthropic", model: "claude-sonnet-4-5" }).provider, "anthropic");
+  assert.equal(getModelInstructionProfile({ protocol: "openai", model: "qwen3-coder" }).reasoning, "tagged");
+  assert.equal(getModelInstructionProfile({ protocol: "openai", model: "kimi-k2" }).toolProtocolPreference, "xml");
 });
 
 test("responses probe helpers keep base probes minimal and advanced probes explicit", () => {

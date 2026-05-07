@@ -16,6 +16,7 @@ import {
   parseCloudCustomHeaders,
   normalizeCloudApiFormat,
   normalizeCloudProtocol,
+  normalizeCloudToolProtocol,
   normalizeOpenAiReasoningEffort,
 } from "../lib/cloudProtocol";
 import { isRetryableCloudErrorMessage } from "../lib/cloudRetry";
@@ -194,6 +195,8 @@ const SETTINGS_COPY = {
     reasoningEffortDesc: "建议保持 None，响应最快且不容易触发云端 524；只有复杂推理任务再手动切到 High / XHigh。",
     disableResponseStorage: "Disable Response Storage",
     disableResponseStorageDesc: "对应 Codex `disable_response_storage = true`，会发送 `store: false`。",
+    toolProtocol: "Tool Protocol",
+    toolProtocolDesc: "Auto 会先尝试原生 tools，遇到不兼容网关会回退 XML；Native 强制原生；XML 直接使用文本工具协议。",
     responsesCodexDesc: "`Responses + gpt-5.4` 现在会尽量贴近 Codex 请求形态：使用顶层 `instructions`、发送 `store: false` / `reasoning.effort`，并让采样参数走服务端默认值。",
     temperatureDesc: "控制输出的随机性。值越低越确定，值越高越多样。",
     topPDesc: "核采样阈值，与 Temperature 共同影响生成质量。",
@@ -347,6 +350,8 @@ const SETTINGS_COPY = {
     reasoningEffortDesc: "Keep this at None for the fastest responses and fewer cloud 524s. Switch to High / XHigh only for complex reasoning tasks.",
     disableResponseStorage: "Disable Response Storage",
     disableResponseStorageDesc: "Maps to Codex `disable_response_storage = true` and sends `store: false`.",
+    toolProtocol: "Tool Protocol",
+    toolProtocolDesc: "Auto tries native tools first and falls back to XML on weak gateways. Native forces function calling; XML uses text tool calls directly.",
     responsesCodexDesc: "`Responses + gpt-5.4` now mirrors Codex request shape where possible: top-level `instructions`, `store: false` / `reasoning.effort`, and server defaults for sampling.",
     temperatureDesc: "Controls randomness. Lower values are more deterministic; higher values are more varied.",
     topPDesc: "Nucleus sampling threshold. It works together with Temperature to influence generation quality.",
@@ -1600,6 +1605,7 @@ export default function SettingsModal({
       topP: Number(server.topP ?? 0.95),
       disableResponseStorage: server.disableResponseStorage !== false,
       reasoningEffort: normalizeOpenAiReasoningEffort(server.reasoningEffort),
+      toolProtocol: normalizeCloudToolProtocol(server.toolProtocol),
     });
   }, []);
 
@@ -1806,6 +1812,7 @@ export default function SettingsModal({
       endpoint,
       model: testModel,
       protocol: cloudProtocol,
+      toolProtocol: normalizeCloudToolProtocol(draftCloudConfig.toolProtocol),
     } : null;
     if (!endpoint) {
       setCloudProbeMsg({ text: copy.cloudEndpointRequired, type: "error" });
@@ -2048,6 +2055,7 @@ export default function SettingsModal({
     draftCloudConfig.endpoint,
     draftCloudConfig.model,
     draftCloudConfig.reasoningEffort,
+    draftCloudConfig.toolProtocol,
     draftCloudConfig.temperature,
     draftCloudConfig.topP,
     isTestingCloudConnection,
@@ -2738,6 +2746,20 @@ export default function SettingsModal({
                             </select>
                           </div>
                         )}
+
+                        <div>
+                          <label className="mb-2 block text-[13px] font-bold text-[#e4e4e7]">{copy.toolProtocol}</label>
+                          <p className="mb-2 text-[11.5px] text-[#71717a]">{copy.toolProtocolDesc}</p>
+                          <select
+                            value={normalizeCloudToolProtocol(draftCloudConfig.toolProtocol)}
+                            onChange={(e) => updateCloudDraftServer({ toolProtocol: normalizeCloudToolProtocol(e.target.value) })}
+                            className={settingsSelectClass}
+                          >
+                            <option value="auto">Auto</option>
+                            <option value="native">Native</option>
+                            <option value="xml">XML</option>
+                          </select>
+                        </div>
 
                         <div>
                           <label className="mb-2 block text-[13px] font-bold text-[#e4e4e7]">{copy.apiEndpoint}</label>

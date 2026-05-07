@@ -1,8 +1,10 @@
 import {
   normalizeCloudApiFormat,
   normalizeCloudProtocol,
+  normalizeCloudToolProtocol,
   normalizeOpenAiReasoningEffort,
   type CloudApiProtocol,
+  type CloudToolProtocol,
   type OpenAiApiFormat,
   type OpenAiReasoningEffort,
 } from "./cloudProtocol";
@@ -19,6 +21,7 @@ export interface CloudProfileConfig {
   topP: number;
   disableResponseStorage: boolean;
   reasoningEffort: OpenAiReasoningEffort;
+  toolProtocol: CloudToolProtocol;
 }
 
 export interface CloudServerConfig extends CloudProfileConfig {
@@ -58,6 +61,7 @@ export function createDefaultCloudConfig(): CloudProfileConfig {
     topP: 0.95,
     disableResponseStorage: true,
     reasoningEffort: "none",
+    toolProtocol: "auto",
   };
 }
 
@@ -99,6 +103,7 @@ export function normalizeCloudConfig(input?: Partial<CloudProfileConfig> | null)
     topP: cleanNumber(input?.topP, fallback.topP),
     disableResponseStorage: input?.disableResponseStorage ?? fallback.disableResponseStorage,
     reasoningEffort: normalizeOpenAiReasoningEffort(input?.reasoningEffort),
+    toolProtocol: normalizeCloudToolProtocol(input?.toolProtocol),
   };
 }
 

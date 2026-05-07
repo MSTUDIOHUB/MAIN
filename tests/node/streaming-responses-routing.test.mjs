@@ -92,6 +92,45 @@ test("OpenAI Responses cloud requests use the non-streaming Rust proxy path", as
   assert.equal(requests[0].reasoning.effort, "xhigh");
 });
 
+test("OpenAI Responses respects XML tool protocol by omitting native tools", async () => {
+  const requests = [];
+  const { streamChatCompletion } = await loadStreamingModule(async (command, args) => {
+    assert.equal(command, "proxy_request");
+    const body = JSON.parse(args.body);
+    requests.push(body);
+    return JSON.stringify({ output_text: "ok" });
+  });
+
+  await streamChatCompletion(
+    [{ role: "user", content: "读文件" }],
+    {
+      baseUrl: "https://api.openai.test/v1",
+      apiKey: "test-key",
+      model: "gpt-5.4",
+      apiProtocol: "openai",
+      apiFormat: "responses",
+      useRustProxy: true,
+      toolProtocol: "xml",
+    },
+    {
+      onToken: () => {},
+      onDone: () => {},
+      onError: (error) => { throw error; },
+    },
+    undefined,
+    [{
+      type: "function",
+      function: {
+        name: "read_file",
+        description: "Read a file",
+        parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
+      },
+    }],
+  );
+
+  assert.equal(requests[0].tools, undefined);
+});
+
 test("local Rust stream read errors fall back to a non-streaming request", async () => {
   const listeners = new Map();
   const invokeCalls = [];

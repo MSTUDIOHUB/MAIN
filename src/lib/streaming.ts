@@ -13,21 +13,18 @@ import { normalizeToolDefinitions, type ToolDefinition } from "./toolSchemas";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
-  buildOpenAiResponsesInputCandidates,
-  buildOpenAiResponsesRequestExtras,
-  extractOpenAiResponsesInstructions,
+  buildOpenAiResponsesRequestCandidates,
   buildAnthropicRequestBody,
   buildCloudHeaders,
   buildCloudMessagesApiUrl,
-  compactCloudResponsesInstructions,
-  compactCloudResponsesMessages,
-  convertOpenAiToolsToResponses,
   createAnthropicStreamProcessor,
   extractOpenAiResponseText,
   finalizeStreamedToolCalls,
   normalizeCloudApiFormat,
   normalizeCloudProtocol,
+  normalizeCloudToolProtocol,
   type CloudApiProtocol,
+  type CloudToolProtocol,
   type OpenAiApiFormat,
   type OpenAiReasoningEffort,
   type ProtocolChatMessage,
@@ -70,6 +67,7 @@ export interface StreamSettings {
   topP?: number;
   disableResponseStorage?: boolean;
   reasoningEffort?: OpenAiReasoningEffort;
+  toolProtocol?: CloudToolProtocol;
   contextLimit?: number; // total context window for the model (used to calculate max_tokens)
   provider?: string;    // "Ollama" | "LM Studio" | "OMLX" | "OpenAI" — controls SSE format
   useRustProxy?: boolean; // Route through Rust backend to bypass CORS (for cloud endpoints)
@@ -327,6 +325,10 @@ function isOpenAiResponsesApi(settings: StreamSettings): boolean {
   return !isAnthropicProvider(settings) && normalizeCloudApiFormat(settings.apiFormat) === "responses";
 }
 
+function shouldSendNativeTools(settings: StreamSettings): boolean {
+  return normalizeCloudToolProtocol(settings.toolProtocol) !== "xml";
+}
+
 function isTranscriptCompatibilityRequest(messages: ChatMessage[]): boolean {
   return messages.some((message) =>
     typeof message.content === "string"
@@ -529,48 +531,45 @@ async function requestOpenAiNonStreaming(
     let payload: unknown;
 
     if (apiFormat === "responses") {
-      const protocolMessages = compactCloudResponsesMessages(messages as ProtocolChatMessage[]);
-      const inputCandidates = buildOpenAiResponsesInputCandidates(protocolMessages);
-      const rawInstructions = extractOpenAiResponsesInstructions(protocolMessages);
-      const instructions = compactCloudResponsesInstructions(rawInstructions);
-      const responseTools = !minimalCompatibilityMode && tools && tools.length > 0
-        ? convertOpenAiToolsToResponses(tools)
+      const requestCandidates = buildOpenAiResponsesRequestCandidates({
+        messages: messages as ProtocolChatMessage[],
+        model: settings.model,
+        tools,
+        disableResponseStorage: settings.disableResponseStorage,
+        reasoningEffort: settings.reasoningEffort,
+        compact: true,
+        includeTools: !minimalCompatibilityMode && shouldSendNativeTools(settings),
+      });
+      const responseTools = !minimalCompatibilityMode && shouldSendNativeTools(settings) && tools && tools.length > 0
+        ? tools
         : [];
       let lastCompatibilityError: Error | null = null;
       let sawRetryableGatewayError = false;
       let gatewayRetryUsed = false;
 
-      for (const candidate of inputCandidates) {
+      for (const candidate of requestCandidates) {
         if (signal?.aborted) throw createAbortError();
         if (sawRetryableGatewayError && candidate.mode === "input_text_array") {
           continue;
         }
         try {
+          const input = candidate.body.input;
+          const instructions = candidate.body.instructions;
+          const candidateTools = Array.isArray(candidate.body.tools) ? candidate.body.tools : [];
           console.log("[streaming] OpenAI responses request", JSON.stringify({
             url: apiUrl,
             model: settings.model,
             mode: candidate.mode,
-            inputType: Array.isArray(candidate.input) ? "array" : typeof candidate.input,
-            inputLen: Array.isArray(candidate.input) ? candidate.input.length : String(candidate.input ?? "").length,
-            instructionsLen: instructions?.length ?? 0,
-            rawInstructionsLen: rawInstructions?.length ?? 0,
+            inputType: Array.isArray(input) ? "array" : typeof input,
+            inputLen: Array.isArray(input) ? input.length : String(input ?? "").length,
+            instructionsLen: typeof instructions === "string" ? instructions.length : 0,
             reasoningEffort: settings.reasoningEffort ?? "none",
-            nativeTools: candidate.mode !== "transcript_text" ? responseTools.length : 0,
+            nativeTools: candidateTools.length,
           }));
-          const candidateTools = candidate.mode !== "transcript_text" ? responseTools : [];
           payload = await postJsonRequest(
             apiUrl,
             headers,
-            {
-              model: settings.model,
-              input: candidate.input,
-              ...(instructions ? { instructions } : {}),
-              ...(candidateTools.length > 0 ? { tools: candidateTools } : {}),
-              ...buildOpenAiResponsesRequestExtras({
-                disableResponseStorage: settings.disableResponseStorage,
-                reasoningEffort: settings.reasoningEffort,
-              }),
-            },
+            candidate.body,
             settings,
             signal,
           );
@@ -717,7 +716,7 @@ async function streamViaRustProxy(
           ...(settings.topP != null ? { top_p: settings.topP } : {}),
         };
 
-  if (tools && tools.length > 0 && !isOllama && !isAnthropic) {
+  if (tools && tools.length > 0 && !isOllama && !isAnthropic && shouldSendNativeTools(settings)) {
     body.tools = normalizeToolDefinitions(tools);
   }
 
@@ -1096,7 +1095,7 @@ export async function streamChatCompletion(
         };
 
   // Include tools if provided (native function calling) — only for non-Ollama
-  if (tools && tools.length > 0 && !isOllama && !isAnthropic) {
+  if (tools && tools.length > 0 && !isOllama && !isAnthropic && shouldSendNativeTools(settings)) {
     body.tools = normalizeToolDefinitions(tools);
   }
 

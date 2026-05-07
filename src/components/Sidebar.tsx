@@ -100,10 +100,23 @@ function getWorkspaceName(path: string) {
 }
 
 function sortSessions(sessions: any[]) {
-  return [...(sessions || [])].sort((a, b) => {
-    const dateA = a.date ? new Date(a.date).getTime() : 0;
-    const dateB = b.date ? new Date(b.date).getTime() : 0;
-    return dateB - dateA;
+  const isMissingSession = (session: any) =>
+    session?.storageStatus === "missing" ||
+    (session?.title === "Missing Session" && !String(session?.date || "").trim());
+  return [...(sessions || [])].filter((session) => !isMissingSession(session)).sort((a, b) => {
+    const sortTime = (session: any) => {
+      for (const value of [session?.date, session?.id]) {
+        if (typeof value === "number" && Number.isFinite(value) && value > 0) return value;
+        if (typeof value === "string" && value.trim()) {
+          const parsed = Date.parse(value);
+          if (Number.isFinite(parsed)) return parsed;
+          const numeric = Number(value);
+          if (Number.isFinite(numeric) && numeric > 0) return numeric;
+        }
+      }
+      return 0;
+    };
+    return sortTime(b) - sortTime(a);
   });
 }
 
@@ -574,6 +587,7 @@ export default function Sidebar({
     return (
       <div
         key={session.id}
+        data-testid={`session-item-${session.id}`}
         onClick={() => onSelectSession?.(workspacePath, session.id)}
         className={`group flex cursor-pointer items-center gap-2.5 rounded-md px-2 py-1.5 transition-colors ${
           isActive ? "bg-[#18181b] text-[#ffffff] shadow-sm" : "text-[#e4e4e7] hover:bg-[#18181b]"
@@ -603,6 +617,7 @@ export default function Sidebar({
           </span>
         </div>
         <button
+          data-testid={`session-delete-${session.id}`}
           onClick={(e) => {
             e.stopPropagation();
             onDeleteSession?.(workspacePath, session.id);
@@ -835,6 +850,7 @@ export default function Sidebar({
                         )}
                         <button
                           type="button"
+                          data-testid="workspace-new-session"
                           onClick={(e) => {
                             e.stopPropagation();
                             workspacePath && onCreateSession?.(workspacePath);

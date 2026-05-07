@@ -9,6 +9,175 @@ test.beforeEach(async ({ page }) => {
   });
 });
 
+test("manual project session starts as a top temporary row and never becomes Missing before first send", async ({ page }) => {
+  const workspace = "/tmp/e2e-manual-session-create";
+  const oldSessions = [
+    {
+      id: 6101,
+      title: "Older Project Session",
+      date: "2020-01-02T00:00:00.000Z",
+      active: true,
+      storageStatus: "ok",
+      recordingDisabled: false,
+      turnCount: 1,
+      messageCount: 2,
+    },
+    {
+      id: 6102,
+      title: "Oldest Project Session",
+      date: "2020-01-01T00:00:00.000Z",
+      active: false,
+      storageStatus: "ok",
+      recordingDisabled: false,
+      turnCount: 1,
+      messageCount: 2,
+    },
+  ];
+  await page.addInitScript(({ workspace, oldSessions }) => {
+    window.sessionStorage.setItem("__CODELY_E2E_STORAGE_RESET__", "1");
+    window.localStorage.clear();
+
+    window.localStorage.setItem("local-agent-ide", JSON.stringify({
+      state: {
+        config: {
+          language: "zh",
+          workflowMode: "chat",
+          sessionRecordingEnabled: true,
+          themeMode: "dark",
+          activeProfile: "local",
+          local: {
+            provider: "LM Studio",
+            endpoint: "http://127.0.0.1:1234/v1",
+            model: "test",
+            contextLimit: 16384,
+            apiKey: "",
+          },
+        },
+        currentWorkspace: workspace,
+        selectedWorkspace: workspace,
+        currentSessionId: 6101,
+        workspaces: [{ path: workspace, name: "Manual Create Workspace", addedAt: Date.now(), lastActiveAt: Date.now() }],
+        activeSessionByWorkspace: { [workspace]: 6101 },
+        sessionsByWorkspace: { [workspace]: oldSessions, __MAIN_GLOBAL_CHAT__: [] },
+        taskFlow: [
+          { id: 1, turnId: "old-turn", type: "user", content: "Older Project Session" },
+          { id: 2, turnId: "old-turn", type: "agent", content: "Older content", streaming: false },
+        ],
+        agentMessages: [],
+        conversationTurns: [{
+          id: "old-turn",
+          userPrompt: "Older Project Session",
+          title: "Older Project Session",
+          mode: "chat",
+          status: "done",
+          summary: "Older content",
+          blockIds: [1, 2],
+          collapsed: false,
+          createdAt: 1,
+        }],
+        currentTurnId: "old-turn",
+        selectedMainModeKey: "main_mode",
+        selectedNexusModeKey: "nexus_general",
+        activeStudioAgentKey: "studio_auto",
+      },
+      version: 0,
+    }));
+
+    (window as any).__MANUAL_CREATE_SESSION_LOADS__ = [];
+    let callbackId = 1;
+    const callbacks = new Map<number, unknown>();
+    const internals = ((window as any).__TAURI_INTERNALS__ ??= {});
+    (window as any).__TAURI_EVENT_PLUGIN_INTERNALS__ ??= { unregisterListener: () => {} };
+    internals.transformCallback = (callback: unknown) => {
+      const id = callbackId++;
+      callbacks.set(id, callback);
+      return id;
+    };
+    internals.unregisterCallback = (id: number) => callbacks.delete(Number(id));
+    internals.metadata ??= {
+      currentWindow: { label: "main" },
+      currentWebview: { label: "main" },
+    };
+    internals.invoke = async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "plugin:event|listen") return callbackId++;
+      if (cmd === "plugin:event|unlisten") return null;
+      if (cmd === "get_system_memory") return { total_gb: 32, available_gb: 24 };
+      if (cmd === "get_workspace_root") return workspace;
+      if (cmd === "set_workspace_root" || cmd === "canonicalize_workspace_path") return String(args?.path ?? workspace);
+      if (cmd === "list_project_sessions" || cmd === "rebuild_project_sessions_index") {
+        const raw = window.localStorage.getItem("local-agent-ide");
+        const state = raw ? JSON.parse(raw).state : {};
+        const currentId = Number(state.currentSessionId || 0);
+        const hasLocalNewSession = currentId && !oldSessions.some((session) => session.id === currentId);
+        return hasLocalNewSession
+          ? [
+              ...oldSessions.map((session) => ({ ...session, active: false })),
+              {
+                id: currentId,
+                title: "Missing Session",
+                date: "",
+                active: false,
+                storageStatus: "missing",
+                turnCount: 0,
+                messageCount: 0,
+              },
+            ]
+          : oldSessions;
+      }
+      if (cmd === "save_project_session") {
+        return { ...(args?.session as object), storageStatus: "ok", recordingDisabled: false };
+      }
+      if (cmd === "load_project_session_meta") {
+        (window as any).__MANUAL_CREATE_SESSION_LOADS__.push(Number(args?.sessionId));
+        return {
+          id: Number(args?.sessionId),
+          title: "Missing Session",
+          date: "",
+          active: false,
+          storageStatus: "missing",
+          turnCount: 0,
+          messageCount: 0,
+        };
+      }
+      if (cmd === "load_project_session_page") {
+        return {
+          sessionId: String(args?.sessionId),
+          turns: [],
+          messages: [],
+          startTurnIndex: 0,
+          endTurnIndex: 0,
+          totalTurns: 0,
+          hasMore: false,
+          nextBeforeTurnIndex: null,
+        };
+      }
+      if (cmd === "load_project_session") return {};
+      return null;
+    };
+  }, { workspace, oldSessions });
+
+  await page.goto("/");
+  await expect(
+    page.locator('[data-testid^="session-item-"]').first().locator(".sidebar-session-title"),
+  ).toHaveText("Older Project Session");
+
+  await page.getByTestId("workspace-new-session").first().click();
+
+  const firstSessionTitle = page.locator('[data-testid^="session-item-"]').first().locator(".sidebar-session-title");
+  await expect(firstSessionTitle).toHaveText("新聊天");
+  await expect(page.getByText("Missing Session")).toHaveCount(0);
+  await expect(page.getByText("详情缺失")).toHaveCount(0);
+  await expect(page.locator('[data-testid^="session-item-"]').nth(1).locator(".sidebar-session-title")).toHaveText("Older Project Session");
+
+  await page.getByTitle(workspace).first().click();
+  await expect(firstSessionTitle).toHaveText("新聊天");
+  await expect(page.getByText("Missing Session")).toHaveCount(0);
+  await expect(page.getByText("详情缺失")).toHaveCount(0);
+  await expect
+    .poll(async () => page.evaluate(() => (window as any).__MANUAL_CREATE_SESSION_LOADS__?.length ?? -1))
+    .toBe(0);
+});
+
 test("first real send creates and activates a project session", async ({ page }) => {
   await page.goto("/?e2eScenario=session-auto-create");
 

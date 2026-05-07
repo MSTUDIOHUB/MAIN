@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { memo, useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -414,7 +414,7 @@ function Heading({ level, children, baseFontSize = 13 }: { level: number; childr
   );
 }
 
-export default function MarkdownRenderer({ content, baseFontSize = 13 }: { content: string; baseFontSize?: number }) {
+const MarkdownRenderer = memo(function MarkdownRenderer({ content, baseFontSize = 13 }: { content: string; baseFontSize?: number }) {
   const normalized = useMemo(() => normalizeMarkdownForDisplay(content), [content]);
 
   const components = useMemo(() => ({
@@ -479,4 +479,6 @@ export default function MarkdownRenderer({ content, baseFontSize = 13 }: { conte
       </ReactMarkdown>
     </div>
   );
-}
+});
+
+export default MarkdownRenderer;

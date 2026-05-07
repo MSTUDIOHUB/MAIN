@@ -31,6 +31,7 @@ test.beforeEach(async ({ page }) => {
             apiKey: "test-key",
             customHeaders: "",
             disableResponseStorage: true,
+            toolProtocol: "auto",
           },
         },
         currentWorkspace: gitWorkspace,

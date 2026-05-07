@@ -492,6 +492,7 @@ function deriveStreamSettings(config: AppConfig): StreamSettings {
     topP: config.cloud.topP ?? 0.95,
     disableResponseStorage: config.cloud.disableResponseStorage ?? true,
     reasoningEffort: config.cloud.reasoningEffort ?? "none",
+    toolProtocol: config.cloud.toolProtocol ?? "auto",
     // Cloud profile should not inherit the local KV-cache/context limit.
     contextLimit: undefined,
     provider: config.cloud.provider,
@@ -1799,6 +1800,7 @@ export async function executeAgentLoop(
     hasApiKey: !!settings.apiKey,
     provider: settings.provider,
     nativeToolsEnabled,
+    toolProtocol: config.cloud.toolProtocol ?? "auto",
     xmlToolsEnabled: true,
   }));
 
@@ -2111,7 +2113,8 @@ export async function executeAgentLoop(
     allTools: loopStartTools.length,
     mcpTools: mcpTools.length,
     builtinAndSkillTools: Math.max(0, loopStartTools.length - mcpTools.length),
-    nativeToolsEnabled: !hasProviderNativeToolsDisabled(callbacks.getMessages()),
+    nativeToolsEnabled: !(isCloudProfile && config.cloud.toolProtocol === "xml") && !hasProviderNativeToolsDisabled(callbacks.getMessages()),
+    toolProtocol: isCloudProfile ? config.cloud.toolProtocol ?? "auto" : "native",
     xmlToolsEnabled: true,
     maxOutputEscalations: getMaxOutputEscalations(),
   });
@@ -2136,7 +2139,8 @@ export async function executeAgentLoop(
     // 1. Context management. Cloud mode uses a lightweight pass so tool-heavy
     // histories do not trigger slow Responses requests or gateway 524s.
     let managedAgentMessages = callbacks.getMessages() as AgentMessage[];
-    const llmTools = !hasProviderNativeToolsDisabled(callbacks.getMessages()) ? iterationAllTools : [];
+    const forceXmlTools = isCloudProfile && config.cloud.toolProtocol === "xml";
+    const llmTools = !forceXmlTools && !hasProviderNativeToolsDisabled(callbacks.getMessages()) ? iterationAllTools : [];
     const cloudResponsesCompact = isCloudProfile && config.cloud.apiFormat === "responses";
     if (snapshotContextLimit != null || cloudResponsesCompact) {
       const contextLimit = snapshotContextLimit ?? 32768;
@@ -2179,6 +2183,7 @@ export async function executeAgentLoop(
       messagesLen: managedAgentMessages.length,
       allTools: iterationAllTools.length,
       llmTools: llmTools.length,
+      toolProtocol: isCloudProfile ? config.cloud.toolProtocol ?? "auto" : "native",
       xmlToolsEnabled: true,
       mcpTools: mcpTools.length,
       currentMaxTokens: currentMaxTokens ?? "default",

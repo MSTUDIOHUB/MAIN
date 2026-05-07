@@ -25,6 +25,7 @@ import {
   runCommand,
   getFileOutline,
   readFile,
+  readFileWindow,
   readDocument,
   writeChatTempFile,
   writeFile,
@@ -39,7 +40,7 @@ import {
 } from "./toolCapabilities";
 import { applyShellCwd } from "./toolExecutionContract";
 import { formatDirectoryNodesForTool } from "./workspacePaths";
-import { formatReadFileWindowForModel } from "./readFileWindow";
+import { formatReadFileWindowForModel, formatReadFileWindowPayloadForModel } from "./readFileWindow";
 
 /** Delay helper for waiting on PTY output after a command. */
 function sleep(ms: number): Promise<void> {
@@ -63,8 +64,20 @@ function shouldReturnRawReadFile(args: Record<string, unknown>): boolean {
   return args.__raw === true || args.__raw === "true";
 }
 
+function parseWindowLineArg(args: Record<string, unknown>, key: string): number | undefined {
+  const value = parseOptionalNumber(args[key]);
+  if (value === undefined) return undefined;
+  const rounded = Math.floor(value);
+  return rounded > 0 ? rounded : undefined;
+}
+
 function shouldUseChatTempStorage(workspace: string, sessionKey?: string): boolean {
   return !workspace.trim() && !!sessionKey;
+}
+
+function isMissingReadFileWindowCommand(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error || "");
+  return /read_file_window/i.test(message) && /(unknown|not found|unhandled|not implemented|command)/i.test(message);
 }
 
 async function resolveWorkspaceForReadPath(
@@ -131,7 +144,40 @@ export async function executeTool(
     case "read_file": {
       const rawPath = (args.path as string) || "";
       const readWorkspace = await resolveWorkspaceForReadPath(rawPath, workspace, sessionKey);
+      const startLine = parseWindowLineArg(args, "start_line");
+      const endLine = parseWindowLineArg(args, "end_line");
+      const maxLines = parseWindowLineArg(args, "max_lines");
+      const maxChars = parseWindowLineArg(args, "max_chars");
       let content: string;
+      if (shouldReturnRawReadFile(args)) {
+        if (readWorkspace !== workspace) {
+          content = await readFile(rawPath, readWorkspace);
+        } else if (shouldUseChatTempStorage(workspace, sessionKey)) {
+          content = await readChatTempFile(sessionKey!, rawPath);
+        } else {
+          content = await readFile(rawPath, workspace);
+        }
+        return content;
+      }
+
+      if (readWorkspace !== workspace || !shouldUseChatTempStorage(workspace, sessionKey)) {
+        try {
+          const payload = await readFileWindow(
+            rawPath,
+            readWorkspace,
+            startLine,
+            endLine,
+            maxLines,
+            maxChars,
+          );
+          return formatReadFileWindowPayloadForModel(rawPath, payload, args);
+        } catch (error) {
+          if (!isMissingReadFileWindowCommand(error)) throw error;
+          content = await readFile(rawPath, readWorkspace);
+          return formatReadFileWindowForModel(rawPath, content, args);
+        }
+      }
+
       if (readWorkspace !== workspace) {
         content = await readFile(rawPath, readWorkspace);
       } else if (shouldUseChatTempStorage(workspace, sessionKey)) {
@@ -139,9 +185,7 @@ export async function executeTool(
       } else {
         content = await readFile(rawPath, workspace);
       }
-      return shouldReturnRawReadFile(args)
-        ? content
-        : formatReadFileWindowForModel(rawPath, content, args);
+      return formatReadFileWindowForModel(rawPath, content, args);
     }
 
     case "read_document": {

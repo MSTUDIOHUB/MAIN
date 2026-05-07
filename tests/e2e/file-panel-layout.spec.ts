@@ -108,6 +108,28 @@ test.beforeEach(async ({ page }) => {
         if (Object.prototype.hasOwnProperty.call(files, path)) return files[path];
         throw new Error(`ENOENT: ${path}`);
       }
+      if (cmd === "read_file_window") {
+        const path = String(args?.path ?? "");
+        if (!Object.prototype.hasOwnProperty.call(files, path)) throw new Error(`ENOENT: ${path}`);
+        const content = files[path];
+        const lines = content.split(/\r?\n/);
+        if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
+        const startLine = Math.max(1, Number(args?.startLine ?? 1) || 1);
+        const maxLines = Math.max(1, Number(args?.maxLines ?? 240) || 240);
+        const endLine = Math.min(lines.length, startLine + maxLines - 1);
+        const windowContent = lines.slice(startLine - 1, endLine).join("\n");
+        return {
+          path,
+          content: windowContent,
+          startLine,
+          endLine,
+          totalLines: lines.length,
+          totalChars: content.length,
+          returnedChars: windowContent.length,
+          truncated: endLine < lines.length,
+          nextStartLine: endLine < lines.length ? endLine + 1 : null,
+        };
+      }
       if (cmd === "get_pty_status") {
         return {
           active: true,
@@ -125,6 +147,24 @@ test.beforeEach(async ({ page }) => {
       return null;
     };
   });
+});
+
+test("large file viewer renders a bounded window and loads the next window on demand", async ({ page }) => {
+  await page.goto("/?e2eScenario=diff-reload-summary");
+  await page.locator('button[aria-label="文件"]').click();
+  await page.evaluate(() => (window as any).__FILE_PANEL_TEST__.addRootFile(
+    "huge.log",
+    Array.from({ length: 520 }, (_, index) => `line ${index + 1}`).join("\n"),
+  ));
+  await page.getByRole("button", { name: /huge\.log/ }).click();
+
+  await expect(page.getByText(/当前窗口：第 1-240 行 \/ 共 520 行/)).toBeVisible();
+  await expect(page.getByText("line 240")).toBeVisible();
+  await expect(page.getByText("line 241")).toHaveCount(0);
+
+  await page.getByRole("button", { name: "加载下一段" }).click();
+  await expect(page.getByText(/当前窗口：第 1-480 行 \/ 共 520 行/)).toBeVisible();
+  await expect(page.getByText("line 241")).toBeVisible();
 });
 
 test("file panel stays open beside terminal", async ({ page }) => {

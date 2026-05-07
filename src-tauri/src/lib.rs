@@ -3,7 +3,7 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::cmp::Ordering;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -29,6 +29,10 @@ const MODEL_REQUEST_TIMEOUT_SECS: u64 = 30 * 60;
 const STREAM_READ_TIMEOUT_SECS: u64 = 15 * 60;
 const STREAM_FIRST_RESPONSE_TIMEOUT_SECS: u64 = 180;
 const STREAM_FIRST_CHUNK_TIMEOUT_SECS: u64 = 180;
+const READ_FILE_WINDOW_DEFAULT_MAX_LINES: usize = 180;
+const READ_FILE_WINDOW_MAX_LINES: usize = 600;
+const READ_FILE_WINDOW_DEFAULT_MAX_CHARS: usize = 6_800;
+const READ_FILE_WINDOW_MAX_CHARS: usize = 24_000;
 
 static TOKENIZER: OnceLock<CoreBPE> = OnceLock::new();
 
@@ -782,6 +786,344 @@ fn read_jsonl_file(path: &Path) -> Result<Vec<Value>, String> {
     Ok(rows)
 }
 
+fn write_jsonl_atomic(path: &Path, values: &[Value], error_label: &str) -> Result<(), String> {
+    let mut lines = String::new();
+    for row in values {
+        let line = serde_json::to_string(row)
+            .map_err(|e| format!("序列化{error_label}失败: {e}"))?;
+        lines.push_str(&line);
+        lines.push('\n');
+    }
+    write_text_atomic(path, &lines)
+}
+
+fn strip_runtime_transcript_fields(runtime: &mut Value) {
+    if let Some(object) = runtime.as_object_mut() {
+        object.remove("taskFlow");
+        object.remove("conversationTurns");
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SessionTranscript {
+    messages: Vec<Value>,
+    turns: Vec<Value>,
+    recovered_from_agent_messages: bool,
+}
+
+fn runtime_array_field(path: &Path, field: &str) -> Result<Vec<Value>, String> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    Ok(read_json_file(path)?
+        .get(field)
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default())
+}
+
+fn agent_message_role(value: &Value) -> &str {
+    value
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+}
+
+fn agent_message_content(value: &Value) -> String {
+    value
+        .get("content")
+        .or_else(|| value.get("text"))
+        .or_else(|| value.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+fn push_synthetic_turn(
+    turns: &mut Vec<Value>,
+    turn_id: &mut Option<String>,
+    block_ids: &mut Vec<Value>,
+    first_user_prompt: &mut String,
+    turn_index: usize,
+) {
+    if let Some(id) = turn_id.take() {
+        let title = if first_user_prompt.trim().is_empty() {
+            "Recovered conversation".to_string()
+        } else {
+            first_user_prompt.chars().take(80).collect::<String>()
+        };
+        turns.push(json!({
+            "id": id,
+            "userPrompt": first_user_prompt,
+            "title": title,
+            "mode": "chat",
+            "status": "done",
+            "summary": title,
+            "blockIds": block_ids.clone(),
+            "collapsed": false,
+            "createdAt": turn_index,
+            "recoveredFromAgentMessages": true,
+        }));
+    }
+    block_ids.clear();
+    first_user_prompt.clear();
+}
+
+fn agent_messages_to_synthetic_transcript(agent_messages: Vec<Value>, session_id: &str) -> (Vec<Value>, Vec<Value>) {
+    let mut messages = Vec::new();
+    let mut turns = Vec::new();
+    let mut current_turn_id: Option<String> = None;
+    let mut current_block_ids: Vec<Value> = Vec::new();
+    let mut first_user_prompt = String::new();
+    let mut turn_index = 0usize;
+    let mut block_id = 1usize;
+
+    for message in agent_messages {
+        let role = agent_message_role(&message);
+        if role == "system" || role.is_empty() {
+            continue;
+        }
+
+        let content = agent_message_content(&message);
+        if content.trim().is_empty() {
+            continue;
+        }
+
+        if role == "user" || current_turn_id.is_none() {
+            if current_turn_id.is_some() {
+                push_synthetic_turn(
+                    &mut turns,
+                    &mut current_turn_id,
+                    &mut current_block_ids,
+                    &mut first_user_prompt,
+                    turn_index,
+                );
+                turn_index += 1;
+            }
+            current_turn_id = Some(format!("recovered-{session_id}-{turn_index}"));
+            first_user_prompt = if role == "user" {
+                content.clone()
+            } else {
+                String::new()
+            };
+        }
+
+        let turn_id = current_turn_id
+            .clone()
+            .unwrap_or_else(|| format!("recovered-{session_id}-{turn_index}"));
+        let id = block_id as u64;
+        block_id += 1;
+        current_block_ids.push(Value::Number(id.into()));
+
+        let block = match role {
+            "user" => json!({
+                "id": id,
+                "turnId": turn_id,
+                "type": "user",
+                "content": content,
+                "recoveredFromAgentMessages": true,
+            }),
+            "assistant" => json!({
+                "id": id,
+                "turnId": turn_id,
+                "type": "agent",
+                "content": content,
+                "recoveredFromAgentMessages": true,
+            }),
+            "tool" => json!({
+                "id": id,
+                "turnId": turn_id,
+                "type": "tool",
+                "toolName": message
+                    .get("name")
+                    .or_else(|| message.get("toolName"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool"),
+                "target": message
+                    .get("tool_call_id")
+                    .or_else(|| message.get("toolCallId"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+                "status": "done",
+                "toolStatus": "executed",
+                "message": content,
+                "recoveredFromAgentMessages": true,
+            }),
+            _ => json!({
+                "id": id,
+                "turnId": turn_id,
+                "type": "agent",
+                "content": content,
+                "recoveredFromAgentMessages": true,
+            }),
+        };
+        messages.push(block);
+    }
+
+    if current_turn_id.is_some() && !current_block_ids.is_empty() {
+        push_synthetic_turn(
+            &mut turns,
+            &mut current_turn_id,
+            &mut current_block_ids,
+            &mut first_user_prompt,
+            turn_index,
+        );
+    }
+
+    (messages, turns)
+}
+
+fn read_session_transcript_with_fallback(
+    messages_path: &Path,
+    turns_path: &Path,
+    runtime_path: &Path,
+    session_id: &str,
+) -> Result<SessionTranscript, String> {
+    let messages = read_jsonl_file(messages_path)?;
+    let turns = read_jsonl_file(turns_path)?;
+    if !messages.is_empty() || !turns.is_empty() {
+        return Ok(SessionTranscript {
+            messages,
+            turns,
+            recovered_from_agent_messages: false,
+        });
+    }
+
+    let runtime_messages = runtime_array_field(runtime_path, "taskFlow")?;
+    let runtime_turns = runtime_array_field(runtime_path, "conversationTurns")?;
+    if !runtime_messages.is_empty() || !runtime_turns.is_empty() {
+        return Ok(SessionTranscript {
+            messages: runtime_messages,
+            turns: runtime_turns,
+            recovered_from_agent_messages: false,
+        });
+    }
+
+    let agent_messages = runtime_array_field(runtime_path, "agentMessages")?;
+    if !agent_messages.is_empty() {
+        let (messages, turns) = agent_messages_to_synthetic_transcript(agent_messages, session_id);
+        if !messages.is_empty() || !turns.is_empty() {
+            return Ok(SessionTranscript {
+                messages,
+                turns,
+                recovered_from_agent_messages: true,
+            });
+        }
+    }
+
+    Ok(SessionTranscript {
+        messages: Vec::new(),
+        turns: Vec::new(),
+        recovered_from_agent_messages: false,
+    })
+}
+
+fn restore_runtime_transcript_fields(runtime: &mut Value, messages: Vec<Value>, turns: Vec<Value>) {
+    if let Some(object) = runtime.as_object_mut() {
+        object.insert("taskFlow".to_string(), Value::Array(messages));
+        object.insert("conversationTurns".to_string(), Value::Array(turns));
+    }
+}
+
+fn read_jsonl_rows_by_block_ids(path: &Path, block_ids: &HashSet<String>) -> Result<Vec<Value>, String> {
+    if !path.exists() || block_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let file = File::open(path).map_err(|e| format!("打开会话消息记录失败: {e}"))?;
+    let reader = BufReader::new(file);
+    let mut rows = Vec::new();
+    for (index, line) in reader.lines().enumerate() {
+        let line = line.map_err(|e| format!("读取会话消息记录失败: {e}"))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value = serde_json::from_str::<Value>(&line)
+            .map_err(|e| format!("解析会话消息第 {} 行失败: {e}", index + 1))?;
+        let id_key = match value.get("id") {
+            Some(Value::Number(number)) => number.to_string(),
+            Some(Value::String(text)) => text.trim().to_string(),
+            _ => String::new(),
+        };
+        if block_ids.contains(&id_key) {
+            rows.push(value);
+        }
+    }
+    Ok(rows)
+}
+
+fn json_row_id_key(value: &Value) -> Option<String> {
+    match value.get("id") {
+        Some(Value::Number(number)) => Some(number.to_string()),
+        Some(Value::String(text)) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        _ => None,
+    }
+}
+
+fn merge_json_rows_by_id(existing: Vec<Value>, incoming: Vec<Value>) -> Vec<Value> {
+    let mut rows = existing;
+    let mut positions: HashMap<String, usize> = HashMap::new();
+    for (index, row) in rows.iter().enumerate() {
+        if let Some(key) = json_row_id_key(row) {
+            positions.insert(key, index);
+        }
+    }
+
+    for row in incoming {
+        if let Some(key) = json_row_id_key(&row) {
+            if let Some(index) = positions.get(&key).copied() {
+                rows[index] = row;
+                continue;
+            }
+            positions.insert(key, rows.len());
+        }
+        rows.push(row);
+    }
+    rows
+}
+
+fn resolve_session_transcript_to_write(
+    existing_transcript: &SessionTranscript,
+    incoming_messages: Vec<Value>,
+    incoming_turns: Vec<Value>,
+    transcript_partial: bool,
+) -> (Vec<Value>, Vec<Value>) {
+    let existing_messages = if transcript_partial {
+        existing_transcript.messages.clone()
+    } else {
+        Vec::new()
+    };
+    let existing_turns = if transcript_partial {
+        existing_transcript.turns.clone()
+    } else {
+        Vec::new()
+    };
+    let mut messages_to_write = if transcript_partial {
+        merge_json_rows_by_id(existing_messages, incoming_messages)
+    } else {
+        incoming_messages
+    };
+    let mut turns_to_write = if transcript_partial {
+        merge_json_rows_by_id(existing_turns, incoming_turns)
+    } else {
+        incoming_turns
+    };
+    if messages_to_write.is_empty() && !existing_transcript.messages.is_empty() {
+        messages_to_write = existing_transcript.messages.clone();
+    }
+    if turns_to_write.is_empty() && !existing_transcript.turns.is_empty() {
+        turns_to_write = existing_transcript.turns.clone();
+    }
+    (messages_to_write, turns_to_write)
+}
+
 fn session_detail_status(dir: &Path) -> &'static str {
     let has_messages = dir.join("messages.jsonl").exists();
     let has_runtime = dir.join("runtime.json").exists();
@@ -829,13 +1171,11 @@ fn rebuild_sessions_index_for_project(
 
     sessions.sort_by(|a, b| {
         let a_date = a
-            .get("updatedAt")
-            .or_else(|| a.get("date"))
+            .get("date")
             .and_then(Value::as_str)
             .unwrap_or("");
         let b_date = b
-            .get("updatedAt")
-            .or_else(|| b.get("date"))
+            .get("date")
             .and_then(Value::as_str)
             .unwrap_or("");
         b_date.cmp(a_date)
@@ -853,6 +1193,33 @@ fn rebuild_sessions_index_for_project(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default())
+}
+
+fn merge_session_lists(index_sessions: Vec<Value>, disk_sessions: Vec<Value>) -> Vec<Value> {
+    let mut by_id: HashMap<String, Value> = HashMap::new();
+    for session in index_sessions {
+        if let Ok(session_id) = session_id_from_object(&session) {
+            by_id.insert(session_id, session);
+        }
+    }
+    for session in disk_sessions {
+        if let Ok(session_id) = session_id_from_object(&session) {
+            by_id.insert(session_id, session);
+        }
+    }
+    let mut sessions: Vec<Value> = by_id.into_values().collect();
+    sessions.sort_by(|a, b| {
+        let a_date = a
+            .get("date")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let b_date = b
+            .get("date")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        b_date.cmp(a_date)
+    });
+    sessions
 }
 
 fn ensure_in_workspace(path: &Path, workspace: &Path) -> Result<(), String> {
@@ -2136,6 +2503,39 @@ struct FileMetadata {
     modified_ms: u128,
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReadFileWindowResult {
+    path: String,
+    content: String,
+    start_line: usize,
+    end_line: usize,
+    total_lines: usize,
+    total_chars: usize,
+    returned_chars: usize,
+    truncated: bool,
+    next_start_line: Option<usize>,
+}
+
+fn normalize_read_file_line(mut raw: String) -> String {
+    if raw.ends_with('\n') {
+        raw.pop();
+        if raw.ends_with('\r') {
+            raw.pop();
+        }
+    } else if raw.ends_with('\r') {
+        raw.pop();
+    }
+    raw
+}
+
+fn take_prefix_chars(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    value.chars().take(max_chars).collect()
+}
+
 #[tauri::command]
 fn get_file_metadata(state: State<WorkspaceState>, path: String, workspace: Option<String>) -> Result<FileMetadata, String> {
     let workspace = resolve_workspace_root(&state, workspace)?;
@@ -2155,6 +2555,110 @@ fn get_file_metadata(state: State<WorkspaceState>, path: String, workspace: Opti
         path: real_path.to_string_lossy().to_string(),
         size_bytes: metadata.len(),
         modified_ms,
+    })
+}
+
+#[tauri::command]
+fn read_file_window(
+    state: State<WorkspaceState>,
+    path: String,
+    workspace: Option<String>,
+    start_line: Option<usize>,
+    end_line: Option<usize>,
+    max_lines: Option<usize>,
+    max_chars: Option<usize>,
+) -> Result<ReadFileWindowResult, String> {
+    let workspace = resolve_workspace_root(&state, workspace)?;
+    let real_path = resolve_existing_path(&path, &workspace)?;
+    if !real_path.is_file() {
+        return Err("read_file_window 目标不是文件".to_string());
+    }
+
+    let start = start_line.unwrap_or(1).max(1);
+    let requested_max_lines = max_lines
+        .unwrap_or(READ_FILE_WINDOW_DEFAULT_MAX_LINES)
+        .clamp(1, READ_FILE_WINDOW_MAX_LINES);
+    let requested_end = end_line
+        .unwrap_or(start.saturating_add(requested_max_lines).saturating_sub(1))
+        .min(start.saturating_add(requested_max_lines).saturating_sub(1))
+        .max(start);
+    let char_limit = max_chars
+        .unwrap_or(READ_FILE_WINDOW_DEFAULT_MAX_CHARS)
+        .clamp(1, READ_FILE_WINDOW_MAX_CHARS);
+
+    let file = File::open(&real_path).map_err(|e| e.to_string())?;
+    let mut reader = BufReader::new(file);
+    let mut raw = String::new();
+    let mut total_lines = 0usize;
+    let mut total_chars = 0usize;
+    let mut selected: Vec<String> = Vec::new();
+    let mut selected_chars = 0usize;
+    let mut line_truncated = false;
+
+    loop {
+        raw.clear();
+        let bytes = reader.read_line(&mut raw).map_err(|e| e.to_string())?;
+        if bytes == 0 {
+            break;
+        }
+        total_lines += 1;
+        let line = normalize_read_file_line(raw.clone());
+        let line_chars = line.chars().count();
+        total_chars += line_chars;
+        if total_lines > 1 {
+            total_chars += 1;
+        }
+
+        if total_lines < start || total_lines > requested_end {
+            continue;
+        }
+        if line_truncated {
+            continue;
+        }
+
+        let separator_chars = if selected.is_empty() { 0 } else { 1 };
+        let next_chars = selected_chars + separator_chars + line_chars;
+        if !selected.is_empty() && next_chars > char_limit {
+            line_truncated = true;
+            continue;
+        }
+        if selected.is_empty() && next_chars > char_limit {
+            selected.push(take_prefix_chars(&line, char_limit));
+            selected_chars = char_limit;
+            line_truncated = true;
+            continue;
+        }
+        selected.push(line);
+        selected_chars = next_chars;
+    }
+
+    let returned_start = if total_lines == 0 || selected.is_empty() { 0 } else { start.min(total_lines) };
+    let returned_end = if total_lines == 0 || selected.is_empty() {
+        0
+    } else {
+        returned_start + selected.len().saturating_sub(1)
+    };
+    let content = selected.join("\n");
+    let not_whole_file = returned_start != 1 || returned_end != total_lines;
+    let more_requested_lines = returned_end > 0 && returned_end < requested_end.min(total_lines.max(1));
+    let more_file_lines = returned_end > 0 && returned_end < total_lines;
+    let truncated = not_whole_file || more_requested_lines || more_file_lines || line_truncated;
+    let next_start_line = if truncated && returned_end > 0 && (more_file_lines || more_requested_lines || line_truncated) {
+        Some(returned_end + 1)
+    } else {
+        None
+    };
+
+    Ok(ReadFileWindowResult {
+        path,
+        content,
+        start_line: returned_start,
+        end_line: returned_end,
+        total_lines,
+        total_chars,
+        returned_chars: selected_chars,
+        truncated,
+        next_start_line,
     })
 }
 
@@ -2316,10 +2820,11 @@ fn read_attachment_image_data_url(source_path: String) -> Result<String, String>
 fn list_project_sessions(app: AppHandle, workspace: String) -> Result<Vec<Value>, String> {
     let (project_root, project_id, workspace_root) = sessions_project_root(&app, &workspace)?;
     let index_path = session_index_path(&project_root);
+    let disk_sessions = rebuild_sessions_index_for_project(&project_root, &project_id, &workspace_root)?;
     if index_path.exists() {
         let index = read_json_file(&index_path)?;
         if let Some(sessions) = index.get("sessions").and_then(Value::as_array) {
-            return Ok(sessions
+            let index_sessions = sessions
                 .iter()
                 .map(|session| {
                     let session_id = session_id_from_object(session).unwrap_or_else(|_| "session".to_string());
@@ -2330,10 +2835,11 @@ fn list_project_sessions(app: AppHandle, workspace: String) -> Result<Vec<Value>
                         &session_dir(&project_root, &session_id),
                     )
                 })
-                .collect());
+                .collect();
+            return Ok(merge_session_lists(index_sessions, disk_sessions));
         }
     }
-    rebuild_sessions_index_for_project(&project_root, &project_id, &workspace_root)
+    Ok(disk_sessions)
 }
 
 #[tauri::command]
@@ -2354,7 +2860,51 @@ fn save_project_session(app: AppHandle, workspace: String, session: Value) -> Re
         .cloned()
         .ok_or_else(|| "会话记录必须是对象".to_string())?;
     let messages = meta.remove("messages").unwrap_or_else(|| Value::Array(Vec::new()));
-    let runtime = meta.remove("runtimeSnapshot");
+    let mut runtime = meta.remove("runtimeSnapshot");
+    let turns = runtime
+        .as_ref()
+        .and_then(|value| value.get("conversationTurns"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let transcript_partial = runtime
+        .as_ref()
+        .and_then(|value| value.get("transcriptPartial"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || meta
+            .get("transcriptPartial")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    let messages_path = dir.join("messages.jsonl");
+    let turns_path = dir.join("turns.jsonl");
+    let runtime_path = dir.join("runtime.json");
+    let incoming_messages = messages.as_array().cloned().unwrap_or_default();
+    let existing_transcript = read_session_transcript_with_fallback(
+        &messages_path,
+        &turns_path,
+        &runtime_path,
+        &session_id,
+    )?;
+    let (messages_to_write, turns_to_write) = resolve_session_transcript_to_write(
+        &existing_transcript,
+        incoming_messages,
+        turns,
+        transcript_partial,
+    );
+    if let Some(runtime_value) = runtime.as_mut() {
+        if let Some(object) = runtime_value.as_object_mut() {
+            object.remove("transcriptPartial");
+            object.remove("transcriptLoadedTurns");
+            object.remove("transcriptTotalTurns");
+        }
+        strip_runtime_transcript_fields(runtime_value);
+    }
+    meta.remove("transcriptPartial");
+    meta.remove("transcriptLoadedTurns");
+    meta.remove("transcriptTotalTurns");
+    meta.insert("turnCount".to_string(), Value::Number(turns_to_write.len().into()));
+    meta.insert("messageCount".to_string(), Value::Number(messages_to_write.len().into()));
     meta.insert("projectId".to_string(), Value::String(project_id.clone()));
     meta.insert("workspaceRoot".to_string(), Value::String(workspace_root.clone()));
     meta.insert("updatedAtMs".to_string(), Value::Number(now_millis().into()));
@@ -2363,19 +2913,11 @@ fn save_project_session(app: AppHandle, workspace: String, session: Value) -> Re
     let meta_value = Value::Object(meta);
     write_json_atomic(&dir.join("session.json"), &meta_value)?;
 
-    let mut message_lines = String::new();
-    if let Some(rows) = messages.as_array() {
-        for row in rows {
-            let line = serde_json::to_string(row)
-                .map_err(|e| format!("序列化会话消息失败: {e}"))?;
-            message_lines.push_str(&line);
-            message_lines.push('\n');
-        }
-    }
-    write_text_atomic(&dir.join("messages.jsonl"), &message_lines)?;
+    write_jsonl_atomic(&messages_path, &messages_to_write, "会话消息")?;
+    write_jsonl_atomic(&turns_path, &turns_to_write, "会话回合")?;
 
     if let Some(runtime_value) = runtime {
-        write_json_atomic(&dir.join("runtime.json"), &runtime_value)?;
+        write_json_atomic(&runtime_path, &runtime_value)?;
     }
 
     let sessions = rebuild_sessions_index_for_project(&project_root, &project_id, &workspace_root)?;
@@ -2404,9 +2946,34 @@ fn load_project_session(app: AppHandle, workspace: String, session_id: Value) ->
     };
 
     let messages_path = dir.join("messages.jsonl");
+    let turns_path = dir.join("turns.jsonl");
     let runtime_path = dir.join("runtime.json");
     let messages_missing = !messages_path.exists();
     let runtime_missing = !runtime_path.exists();
+    let transcript = read_session_transcript_with_fallback(
+        &messages_path,
+        &turns_path,
+        &runtime_path,
+        &session_id,
+    )?;
+    let mut runtime = if runtime_path.exists() {
+        Some(read_json_file(&runtime_path)?)
+    } else {
+        None
+    };
+    if let Some(runtime_value) = runtime.as_mut() {
+        restore_runtime_transcript_fields(
+            runtime_value,
+            transcript.messages.clone(),
+            transcript.turns.clone(),
+        );
+        if let Some(object) = runtime_value.as_object_mut() {
+            object.insert(
+                "recoveredFromAgentMessages".to_string(),
+                Value::Bool(transcript.recovered_from_agent_messages),
+            );
+        }
+    }
 
     if let Some(object) = session.as_object_mut() {
         object.insert("projectId".to_string(), Value::String(project_id));
@@ -2415,13 +2982,166 @@ fn load_project_session(app: AppHandle, workspace: String, session_id: Value) ->
             "storageStatus".to_string(),
             Value::String(if messages_missing && runtime_missing { "missing" } else { "ok" }.to_string()),
         );
-        object.insert("messages".to_string(), Value::Array(read_jsonl_file(&messages_path)?));
-        if runtime_path.exists() {
-            object.insert("runtimeSnapshot".to_string(), read_json_file(&runtime_path)?);
+        let message_count = transcript.messages.len();
+        let turn_count = transcript.turns.len();
+        object.insert("messages".to_string(), Value::Array(transcript.messages));
+        object.insert("messageCount".to_string(), Value::Number(message_count.into()));
+        object.insert("turnCount".to_string(), Value::Number(turn_count.into()));
+        object.insert(
+            "recoveredFromAgentMessages".to_string(),
+            Value::Bool(transcript.recovered_from_agent_messages),
+        );
+        if let Some(runtime_value) = runtime {
+            object.insert("runtimeSnapshot".to_string(), runtime_value);
         }
     }
 
     Ok(session)
+}
+
+#[tauri::command]
+fn load_project_session_meta(app: AppHandle, workspace: String, session_id: Value) -> Result<Value, String> {
+    let (project_root, project_id, workspace_root) = sessions_project_root(&app, &workspace)?;
+    let session_id = session_id_from_value(&session_id)?;
+    let dir = session_dir(&project_root, &session_id);
+    let meta_path = dir.join("session.json");
+
+    let mut session = if meta_path.exists() {
+        read_json_file(&meta_path)?
+    } else {
+        json!({
+            "id": session_id,
+            "title": "Missing Session",
+            "date": "",
+            "active": false,
+        })
+    };
+
+    let turns_path = dir.join("turns.jsonl");
+    let messages_path = dir.join("messages.jsonl");
+    let runtime_path = dir.join("runtime.json");
+    let transcript = read_session_transcript_with_fallback(
+        &messages_path,
+        &turns_path,
+        &runtime_path,
+        &session_id,
+    )?;
+
+    if let Some(object) = session.as_object_mut() {
+        object.insert("projectId".to_string(), Value::String(project_id));
+        object.insert("workspaceRoot".to_string(), Value::String(workspace_root));
+        object.insert("storageStatus".to_string(), Value::String(session_detail_status(&dir).to_string()));
+        object.insert("storageVersion".to_string(), Value::Number(2.into()));
+        object.insert("turnCount".to_string(), Value::Number(transcript.turns.len().into()));
+        object.insert("messageCount".to_string(), Value::Number(transcript.messages.len().into()));
+        object.insert(
+            "recoveredFromAgentMessages".to_string(),
+            Value::Bool(transcript.recovered_from_agent_messages),
+        );
+        if runtime_path.exists() {
+            let mut runtime_value = read_json_file(&runtime_path)?;
+            restore_runtime_transcript_fields(
+                &mut runtime_value,
+                transcript.messages.clone(),
+                transcript.turns.clone(),
+            );
+            if let Some(runtime_object) = runtime_value.as_object_mut() {
+                runtime_object.insert(
+                    "recoveredFromAgentMessages".to_string(),
+                    Value::Bool(transcript.recovered_from_agent_messages),
+                );
+            }
+            object.insert("runtimeSnapshot".to_string(), runtime_value);
+        }
+    }
+
+    Ok(session)
+}
+
+#[tauri::command]
+fn load_project_session_page(
+    app: AppHandle,
+    workspace: String,
+    session_id: Value,
+    before_turn_index: Option<usize>,
+    limit: Option<usize>,
+) -> Result<Value, String> {
+    let (project_root, _project_id, _workspace_root) = sessions_project_root(&app, &workspace)?;
+    let session_id = session_id_from_value(&session_id)?;
+    let dir = session_dir(&project_root, &session_id);
+    let turns_path = dir.join("turns.jsonl");
+    let messages_path = dir.join("messages.jsonl");
+    let runtime_path = dir.join("runtime.json");
+    let transcript = read_session_transcript_with_fallback(
+        &messages_path,
+        &turns_path,
+        &runtime_path,
+        &session_id,
+    )?;
+    let turns_all = transcript.turns.clone();
+    let total_turns = turns_all.len();
+    let page_limit = limit.unwrap_or(30).clamp(1, 120);
+    let end = before_turn_index.unwrap_or(total_turns).min(total_turns);
+    let start = end.saturating_sub(page_limit);
+    let page_turns = turns_all[start..end].to_vec();
+    let mut block_ids = HashSet::new();
+    for turn in &page_turns {
+        if let Some(ids) = turn.get("blockIds").and_then(Value::as_array) {
+            for id in ids {
+                match id {
+                    Value::Number(number) => {
+                        block_ids.insert(number.to_string());
+                    }
+                    Value::String(text) => {
+                        block_ids.insert(text.trim().to_string());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    let messages = if messages_path.exists() && !block_ids.is_empty() {
+        read_jsonl_rows_by_block_ids(&messages_path, &block_ids)?
+    } else {
+        transcript.messages.clone()
+            .into_iter()
+            .filter(|value| {
+                let id_key = match value.get("id") {
+                    Some(Value::Number(number)) => number.to_string(),
+                    Some(Value::String(text)) => text.trim().to_string(),
+                    _ => String::new(),
+                };
+                block_ids.contains(&id_key)
+            })
+            .collect()
+    };
+    let messages = if messages.is_empty() && !block_ids.is_empty() {
+        transcript.messages
+            .into_iter()
+            .filter(|value| {
+                let id_key = match value.get("id") {
+                    Some(Value::Number(number)) => number.to_string(),
+                    Some(Value::String(text)) => text.trim().to_string(),
+                    _ => String::new(),
+                };
+                block_ids.contains(&id_key)
+            })
+            .collect()
+    } else {
+        messages
+    };
+
+    Ok(json!({
+        "sessionId": session_id,
+        "turns": page_turns,
+        "messages": messages,
+        "startTurnIndex": start,
+        "endTurnIndex": end,
+        "totalTurns": total_turns,
+        "hasMore": start > 0,
+        "nextBeforeTurnIndex": if start > 0 { Value::Number(start.into()) } else { Value::Null },
+        "recoveredFromAgentMessages": transcript.recovered_from_agent_messages,
+    }))
 }
 
 #[tauri::command]
@@ -5124,6 +5844,7 @@ pub fn run() {
             get_project_skeleton,
             get_file_outline,
             read_file,
+            read_file_window,
             get_file_metadata,
             write_file,
             export_text_file,
@@ -5169,6 +5890,8 @@ pub fn run() {
             rebuild_project_sessions_index,
             save_project_session,
             load_project_session,
+            load_project_session_meta,
+            load_project_session_page,
             delete_project_session,
             clear_project_sessions,
             delete_workspace_path,
@@ -5195,16 +5918,23 @@ mod tests {
     use super::{
         compare_file_nodes,
         is_valid_git_branch_name,
+        merge_json_rows_by_id,
         parse_git_branch_line,
         parse_git_numstat,
         parse_git_porcelain_entries,
         parse_git_porcelain_status,
+        read_session_transcript_with_fallback,
+        resolve_session_transcript_to_write,
         resolve_existing_path,
         resolve_write_path,
+        SessionTranscript,
         should_hide_list_directory_entry,
         should_skip_recursive_search_dir,
+        write_json_atomic,
+        write_jsonl_atomic,
         FileNode,
     };
+    use serde_json::json;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -5217,6 +5947,181 @@ mod tests {
         let root = std::env::temp_dir().join(format!("main-workspace-{name}-{unique}"));
         fs::create_dir_all(&root).unwrap();
         root.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn merge_json_rows_by_id_preserves_existing_rows_and_replaces_loaded_page() {
+        let existing = vec![
+            json!({"id": 1, "content": "old one"}),
+            json!({"id": 2, "content": "old two"}),
+            json!({"id": 3, "content": "old three"}),
+        ];
+        let incoming = vec![
+            json!({"id": 2, "content": "new two"}),
+            json!({"id": 4, "content": "new four"}),
+        ];
+
+        let merged = merge_json_rows_by_id(existing, incoming);
+
+        assert_eq!(merged.len(), 4);
+        assert_eq!(merged[0]["content"], "old one");
+        assert_eq!(merged[1]["content"], "new two");
+        assert_eq!(merged[2]["content"], "old three");
+        assert_eq!(merged[3]["content"], "new four");
+    }
+
+    #[test]
+    fn session_transcript_readers_fall_back_to_legacy_runtime_snapshot() {
+        let workspace = make_temp_workspace("legacy-session-runtime");
+        let runtime_path = workspace.join("runtime.json");
+        let messages_path = workspace.join("messages.jsonl");
+        let turns_path = workspace.join("turns.jsonl");
+        write_json_atomic(&runtime_path, &json!({
+            "taskFlow": [
+                {"id": 11, "type": "user", "content": "legacy user"},
+                {"id": 12, "type": "agent", "content": "legacy agent"}
+            ],
+            "conversationTurns": [
+                {"id": "turn-legacy", "blockIds": [11, 12], "createdAt": 1}
+            ]
+        })).unwrap();
+
+        let transcript = read_session_transcript_with_fallback(
+            &messages_path,
+            &turns_path,
+            &runtime_path,
+            "legacy",
+        ).unwrap();
+
+        assert_eq!(transcript.messages.len(), 2);
+        assert_eq!(transcript.messages[0]["content"], "legacy user");
+        assert_eq!(transcript.turns.len(), 1);
+        assert_eq!(transcript.turns[0]["id"], "turn-legacy");
+
+        fs::remove_dir_all(&workspace).unwrap();
+    }
+
+    #[test]
+    fn session_transcript_readers_recover_legacy_runtime_when_v2_jsonl_is_empty() {
+        let workspace = make_temp_workspace("v2-session-runtime");
+        let runtime_path = workspace.join("runtime.json");
+        let messages_path = workspace.join("messages.jsonl");
+        let turns_path = workspace.join("turns.jsonl");
+        write_json_atomic(&runtime_path, &json!({
+            "taskFlow": [{"id": 11, "type": "user", "content": "legacy user"}],
+            "conversationTurns": [{"id": "turn-legacy", "blockIds": [11], "createdAt": 1}]
+        })).unwrap();
+        write_jsonl_atomic(&messages_path, &[], "test messages").unwrap();
+        write_jsonl_atomic(&turns_path, &[], "test turns").unwrap();
+
+        let transcript = read_session_transcript_with_fallback(
+            &messages_path,
+            &turns_path,
+            &runtime_path,
+            "v2",
+        ).unwrap();
+
+        assert_eq!(transcript.messages.len(), 1);
+        assert_eq!(transcript.messages[0]["content"], "legacy user");
+        assert_eq!(transcript.turns.len(), 1);
+        assert_eq!(transcript.turns[0]["id"], "turn-legacy");
+
+        fs::remove_dir_all(&workspace).unwrap();
+    }
+
+    #[test]
+    fn session_transcript_readers_recover_from_agent_messages_when_jsonl_and_legacy_runtime_are_empty() {
+        let workspace = make_temp_workspace("agent-message-session-runtime");
+        let runtime_path = workspace.join("runtime.json");
+        let messages_path = workspace.join("messages.jsonl");
+        let turns_path = workspace.join("turns.jsonl");
+        write_json_atomic(&runtime_path, &json!({
+            "agentMessages": [
+                {"role": "system", "content": "hidden instruction"},
+                {"role": "user", "content": "recover this user prompt"},
+                {"role": "assistant", "content": "recover this assistant reply"},
+                {"role": "tool", "tool_call_id": "tool-1", "content": "recover this tool output"}
+            ]
+        })).unwrap();
+        write_jsonl_atomic(&messages_path, &[], "test messages").unwrap();
+        write_jsonl_atomic(&turns_path, &[], "test turns").unwrap();
+
+        let transcript = read_session_transcript_with_fallback(
+            &messages_path,
+            &turns_path,
+            &runtime_path,
+            "177",
+        ).unwrap();
+
+        assert!(transcript.recovered_from_agent_messages);
+        assert_eq!(transcript.messages.len(), 3);
+        assert_eq!(transcript.turns.len(), 1);
+        assert_eq!(transcript.messages[0]["type"], "user");
+        assert_eq!(transcript.messages[1]["type"], "agent");
+        assert_eq!(transcript.messages[2]["type"], "tool");
+        assert_eq!(transcript.turns[0]["id"], "recovered-177-0");
+        assert_eq!(transcript.turns[0]["blockIds"].as_array().unwrap().len(), 3);
+
+        fs::remove_dir_all(&workspace).unwrap();
+    }
+
+    #[test]
+    fn session_transcript_fallback_prefers_existing_jsonl_over_agent_messages() {
+        let workspace = make_temp_workspace("jsonl-before-agent-runtime");
+        let runtime_path = workspace.join("runtime.json");
+        let messages_path = workspace.join("messages.jsonl");
+        let turns_path = workspace.join("turns.jsonl");
+        write_json_atomic(&runtime_path, &json!({
+            "agentMessages": [
+                {"role": "user", "content": "agent user"},
+                {"role": "assistant", "content": "agent assistant"}
+            ]
+        })).unwrap();
+        write_jsonl_atomic(
+            &messages_path,
+            &[json!({"id": 9, "turnId": "jsonl-turn", "type": "user", "content": "jsonl user"})],
+            "test messages",
+        ).unwrap();
+        write_jsonl_atomic(
+            &turns_path,
+            &[json!({"id": "jsonl-turn", "blockIds": [9], "createdAt": 1})],
+            "test turns",
+        ).unwrap();
+
+        let transcript = read_session_transcript_with_fallback(
+            &messages_path,
+            &turns_path,
+            &runtime_path,
+            "178",
+        ).unwrap();
+
+        assert!(!transcript.recovered_from_agent_messages);
+        assert_eq!(transcript.messages.len(), 1);
+        assert_eq!(transcript.messages[0]["content"], "jsonl user");
+        assert_eq!(transcript.turns[0]["id"], "jsonl-turn");
+
+        fs::remove_dir_all(&workspace).unwrap();
+    }
+
+    #[test]
+    fn session_save_resolution_keeps_existing_transcript_when_incoming_is_empty() {
+        let existing = SessionTranscript {
+            messages: vec![json!({"id": 1, "type": "user", "content": "existing message"})],
+            turns: vec![json!({"id": "turn-existing", "blockIds": [1], "createdAt": 1})],
+            recovered_from_agent_messages: false,
+        };
+
+        let (messages, turns) = resolve_session_transcript_to_write(
+            &existing,
+            Vec::new(),
+            Vec::new(),
+            false,
+        );
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["content"], "existing message");
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0]["id"], "turn-existing");
     }
 
     #[test]

@@ -139,4 +139,5 @@ test("fills protocol-specific defaults for incomplete server records", () => {
   assert.equal(state.cloudServers[0].apiFormat, "chat_completions");
   assert.equal(state.cloudServers[0].disableResponseStorage, true);
   assert.equal(state.cloudServers[0].reasoningEffort, "none");
+  assert.equal(state.cloudServers[0].toolProtocol, "auto");
 });

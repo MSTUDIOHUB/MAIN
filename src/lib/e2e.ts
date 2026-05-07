@@ -18,6 +18,7 @@ const CLOUD_SETTINGS_MODEL_SELECT_SCENARIO = "cloud-settings-model-select";
 const CLOUD_SETTINGS_EMPTY_SCENARIO = "cloud-settings-empty";
 const CLOUD_STATUS_ACTIVE_SERVER_MODEL_SCENARIO = "cloud-status-active-server-model";
 const STREAMING_TIMER_SCENARIO = "streaming-timer";
+const STREAMING_RESPONSIVENESS_SCENARIO = "streaming-responsiveness";
 const STREAM_ERROR_RECOVERY_SCENARIO = "stream-error-recovery";
 const SESSION_AUTO_CREATE_SCENARIO = "session-auto-create";
 const CLOUD_TOOL_FALLBACK_SCENARIO = "cloud-tool-fallback";
@@ -81,7 +82,13 @@ function bindBridgeSnapshot(scenario: string) {
     const agentBlocks = state.taskFlow.filter((block) => block.type === "agent") as any[];
     const toolBlocks = state.taskFlow.filter((block) => block.type === "tool") as any[];
     const archivedOptionBlocks = agentBlocks.filter((block) => block.archivedAfterChoice);
+    const scopeKey = state.currentWorkspace || GLOBAL_CHAT_KEY;
+    const sessions = state.sessionsByWorkspace[scopeKey] || [];
     return {
+      workspace: state.currentWorkspace || "",
+      currentSessionId: state.currentSessionId,
+      sessionCount: sessions.length,
+      taskFlowBlocks: state.taskFlow.length,
       planStage: state.planStage,
       isPlanApproved: state.isPlanApproved,
       agentStatus: state.agentStatus,
@@ -1972,6 +1979,7 @@ function seedCloudSettingsModelSelectScenario() {
         topP: 0.95,
         reasoningEffort: "none",
         disableResponseStorage: true,
+        toolProtocol: "auto",
       }],
       cloud: {
         ...state.config.cloud,
@@ -1983,6 +1991,7 @@ function seedCloudSettingsModelSelectScenario() {
         model: "",
         reasoningEffort: "none",
         disableResponseStorage: true,
+        toolProtocol: "auto",
       },
     },
     currentWorkspace: "",
@@ -2118,6 +2127,7 @@ function seedCloudStatusActiveServerModelScenario() {
         topP: 0.95,
         reasoningEffort: "none",
         disableResponseStorage: true,
+        toolProtocol: "auto",
       }],
       cloud: {
         ...state.config.cloud,
@@ -2240,6 +2250,138 @@ function seedStreamingTimerScenario() {
   };
 
   const cleanup = () => {
+    bridge.initialized = false;
+  };
+
+  bridge.cleanup = cleanup;
+  return cleanup;
+}
+
+function seedStreamingResponsivenessScenario() {
+  const bridge = getBridge();
+  if (!bridge) return undefined;
+
+  bridge.events = [{ type: "boot" }];
+  bridge.savedDocuments = [];
+  bridge.completed = false;
+
+  incrementSeedCount(STREAMING_RESPONSIVENESS_SCENARIO);
+
+  const now = Date.now();
+  const workspace = "/tmp/e2e-streaming-responsiveness";
+  const taskFlow: any[] = [];
+  const conversationTurns: any[] = [];
+  for (let index = 0; index < 70; index += 1) {
+    const turnId = `e2e-responsive-history-${index}`;
+    const userBlockId = 30_000 + index * 3;
+    const agentBlockId = userBlockId + 1;
+    taskFlow.push(
+      { id: userBlockId, turnId, type: "user", content: `历史问题 ${index}` },
+      {
+        id: agentBlockId,
+        turnId,
+        type: "agent",
+        content: [
+          `历史回复 ${index}`,
+          "这是一段用于制造可滚动聊天历史的稳定内容。",
+          "- 读取上下文",
+          "- 整理结论",
+          "- 输出摘要",
+        ].join("\n"),
+      },
+    );
+    conversationTurns.push({
+      id: turnId,
+      userPrompt: `历史问题 ${index}`,
+      title: `历史回合 ${index}`,
+      mode: "chat",
+      status: "done",
+      summary: `历史回合 ${index}`,
+      blockIds: [userBlockId, agentBlockId],
+      collapsed: false,
+      createdAt: now + index,
+    });
+  }
+
+  const activeTurnId = "e2e-responsive-active-turn";
+  const activeUserBlockId = 40_000;
+  const activeAgentBlockId = 40_001;
+  taskFlow.push(
+    { id: activeUserBlockId, turnId: activeTurnId, type: "user", content: "请持续输出，同时保持历史滚动流畅。" },
+    { id: activeAgentBlockId, turnId: activeTurnId, type: "agent", content: "开始生成...\n", streaming: true },
+  );
+  conversationTurns.push({
+    id: activeTurnId,
+    userPrompt: "请持续输出，同时保持历史滚动流畅。",
+    title: "流式滚动回归",
+    mode: "chat",
+    status: "executing",
+    summary: "",
+    blockIds: [activeUserBlockId, activeAgentBlockId],
+    collapsed: false,
+    createdAt: now + 100,
+  });
+
+  useAppStore.setState((state) => ({
+    ...state,
+    config: {
+      ...state.config,
+      language: "zh",
+      workflowMode: "chat",
+    },
+    currentWorkspace: workspace,
+    sessionsByWorkspace: {
+      [workspace]: [{
+        id: 999008,
+        title: "E2E Streaming Responsiveness",
+        date: new Date(now).toISOString(),
+        active: true,
+        messages: [],
+      }],
+    },
+    currentSessionId: 999008,
+    taskFlow,
+    conversationTurns,
+    currentTurnId: activeTurnId,
+    input: "",
+    attachedFiles: [],
+    contextMentions: [],
+    elapsedTime: 0,
+    isGenerating: true,
+    agentStatus: "running",
+    showDiff: false,
+    showPlanPanel: false,
+    showTerminal: false,
+    showFilePanel: false,
+    selectedDiffTaskId: null,
+  }));
+
+  let tickCount = 0;
+  const timerId = window.setInterval(() => {
+    tickCount += 1;
+    useAppStore.setState((current) => ({
+      ...current,
+      taskFlow: current.taskFlow.map((block) =>
+        block.id === activeAgentBlockId && block.type === "agent"
+          ? { ...block, content: `${block.content}片段 ${tickCount}：保持 UI 可滚动。\n` }
+          : block
+      ),
+    }));
+  }, 45);
+
+  bridge.getSnapshot = () => {
+    const state = useAppStore.getState();
+    return {
+      isGenerating: state.isGenerating,
+      elapsedTime: state.elapsedTime,
+      tickCount,
+      taskFlowBlocks: state.taskFlow.length,
+      seedCount: readSeedCount(STREAMING_RESPONSIVENESS_SCENARIO),
+    };
+  };
+
+  const cleanup = () => {
+    window.clearInterval(timerId);
     bridge.initialized = false;
   };
 
@@ -2392,6 +2534,7 @@ function seedCloudToolProtocolScenario(scenario: string) {
     topP: 0.95,
     disableResponseStorage: true,
     reasoningEffort: "none" as const,
+    toolProtocol: "auto" as const,
   };
 
   useAppStore.setState((state) => ({
@@ -2547,6 +2690,7 @@ function seedPlanApprovalExecuteToolsScenario() {
     topP: 0.95,
     disableResponseStorage: true,
     reasoningEffort: "none" as const,
+    toolProtocol: "auto" as const,
   };
 
   useAppStore.setState((state) => ({
@@ -3081,6 +3225,10 @@ export function initializeE2EScenarios(): (() => void) | undefined {
 
   if (scenario === STREAMING_TIMER_SCENARIO) {
     return seedStreamingTimerScenario();
+  }
+
+  if (scenario === STREAMING_RESPONSIVENESS_SCENARIO) {
+    return seedStreamingResponsivenessScenario();
   }
 
   if (scenario === STREAM_ERROR_RECOVERY_SCENARIO) {

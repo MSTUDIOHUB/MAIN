@@ -22,46 +22,37 @@ test("sidebar remove last workspace clears ChatArea and shows global empty state
   expect(snapshot?.taskFlowBlocks).toBeGreaterThan(0);
 
   // Verify sidebar shows the workspace
-  await expect(page.getByText("E2E Sidebar Remove Last")).toBeVisible();
+  const workspaceRow = page.getByTestId("sidebar-workspace-row").filter({ hasText: "E2E Sidebar Remove Last" }).first();
+  await expect(workspaceRow).toBeVisible();
 
   // Find and click the "Remove from sidebar" button for this workspace
   // The button is typically a context menu or icon button next to the workspace entry
-  const removeButton = page.getByRole("button", { name: /remove/i }).first();
-  if (await removeButton.isVisible({ timeout: 3000 }).catch(() => false)) {
-    await removeButton.click();
-  } else {
-    // Fallback: try clicking on workspace context menu or right-click
-    const workspaceEntry = page.getByText("E2E Sidebar Remove Last").first();
-    await workspaceEntry.click({ button: "right" });
-    await expect(page.getByText("Remove from sidebar")).toBeVisible();
-    await page.getByText("Remove from sidebar").click();
-  }
+  const removeButton = workspaceRow.getByTitle(/Remove from sidebar|从侧边栏移除/);
+  await expect(removeButton).toBeVisible();
+  await removeButton.click();
 
   // Wait for navigation to global chat
   await page.waitForTimeout(500);
 
   // Verify ChatArea is cleared: taskFlow should be empty
-  await expect(
-    page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().taskFlowBlocks ?? -1),
-  ).toBe(0);
+  await expect
+    .poll(async () => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().taskFlowBlocks ?? -1))
+    .toBe(0);
 
   // Verify currentSessionId is null
-  await expect(
-    page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().currentSessionId ?? -1),
-  ).toBe(null);
+  await expect
+    .poll(async () => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().currentSessionId))
+    .toBe(null);
 
   // Verify global empty state is shown
   // The empty state typically shows a message like "Start a new conversation" or similar
-  const chatAreaEmpty = await page
-    .locator('[data-testid="chat-area"], .chat-area, [class*="chat"]')
-    .first()
-    .isVisible({ timeout: 3000 })
-    .catch(() => false);
+  const chatAreaEmpty = await page.getByTestId("chat-empty-state").isVisible({ timeout: 3000 }).catch(() => false);
+  expect(chatAreaEmpty).toBe(true);
 
   // Verify sidebar no longer shows the removed workspace
   const sidebarStillHasWorkspace = await page
-    .getByText("E2E Sidebar Remove Last")
-    .first()
+    .getByTestId("sidebar-workspace-row")
+    .filter({ hasText: "E2E Sidebar Remove Last" })
     .isVisible({ timeout: 2000 })
     .catch(() => false);
   expect(sidebarStillHasWorkspace).toBe(false);
