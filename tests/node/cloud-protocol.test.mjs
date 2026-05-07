@@ -65,7 +65,10 @@ const {
   buildOpenAiResponsesProbeRequestCandidates,
   buildOpenAiResponsesRequestExtras,
   buildOpenAiResponsesTranscript,
+  buildGeminiGenerateContentUrl,
+  buildGeminiRequestBody,
   extractOpenAiResponsesInstructions,
+  extractGeminiResponseText,
   buildAnthropicRequestBody,
   buildCloudHeaders,
   buildCloudMessagesApiUrl,
@@ -77,6 +80,7 @@ const {
   extractOpenAiResponseText,
   mapMessagesForAnthropic,
   getModelInstructionProfile,
+  normalizeCloudAuthMode,
   normalizeCloudToolProtocol,
   parseCloudCustomHeaders,
 } = await loadCloudProtocolModule();
@@ -346,6 +350,9 @@ test("responses request builder emits deterministic store false, instructions, a
 });
 
 test("cloud tool protocol and model profile helpers normalize provider behavior", () => {
+  assert.equal(normalizeCloudAuthMode("openai_chatgpt_oauth"), "openai_chatgpt_oauth");
+  assert.equal(normalizeCloudAuthMode("gemini_google_oauth"), "gemini_google_oauth");
+  assert.equal(normalizeCloudAuthMode("bad"), "api_key");
   assert.equal(normalizeCloudToolProtocol("native"), "native");
   assert.equal(normalizeCloudToolProtocol("xml"), "xml");
   assert.equal(normalizeCloudToolProtocol("bad"), "auto");
@@ -353,6 +360,50 @@ test("cloud tool protocol and model profile helpers normalize provider behavior"
   assert.equal(getModelInstructionProfile({ protocol: "anthropic", model: "claude-sonnet-4-5" }).provider, "anthropic");
   assert.equal(getModelInstructionProfile({ protocol: "openai", model: "qwen3-coder" }).reasoning, "tagged");
   assert.equal(getModelInstructionProfile({ protocol: "openai", model: "kimi-k2" }).toolProtocolPreference, "xml");
+  assert.equal(getModelInstructionProfile({ protocol: "gemini", model: "gemini-2.5-pro" }).toolProtocolPreference, "xml");
+});
+
+test("gemini helpers build native generateContent requests and extract text", () => {
+  const body = buildGeminiRequestBody({
+    messages: [
+      { role: "system", content: "Follow repo rules." },
+      { role: "user", content: "Say ok" },
+      { role: "assistant", content: "ok" },
+    ],
+    model: "gemini-2.5-pro",
+    maxTokens: 64,
+  });
+
+  assert.equal(body.systemInstruction.parts[0].text, "Follow repo rules.");
+  assert.equal(body.contents[0].role, "user");
+  assert.equal(body.contents[1].role, "model");
+  assert.equal(body.generationConfig.maxOutputTokens, 64);
+  assert.equal(
+    buildGeminiGenerateContentUrl("https://generativelanguage.googleapis.com", "models/gemini-2.5-pro"),
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent",
+  );
+  assert.equal(
+    extractGeminiResponseText({ candidates: [{ content: { parts: [{ text: "o" }, { text: "k" }] } }] }),
+    "ok",
+  );
+});
+
+test("cloud headers support Gemini API key and OAuth bearer modes", () => {
+  assert.deepEqual(
+    buildCloudHeaders("gemini", "api-key", true, undefined, "api_key"),
+    { "Content-Type": "application/json", "x-goog-api-key": "api-key" },
+  );
+  assert.deepEqual(
+    buildCloudHeaders("gemini", "access-token", true, undefined, "gemini_google_oauth"),
+    { "Content-Type": "application/json", Authorization: "Bearer access-token" },
+  );
+});
+
+test("OpenAI ChatGPT OAuth headers omit regular API key credentials", () => {
+  assert.deepEqual(
+    buildCloudHeaders("openai", "dummy-key", true, undefined, "openai_chatgpt_oauth"),
+    { "Content-Type": "application/json" },
+  );
 });
 
 test("responses probe helpers keep base probes minimal and advanced probes explicit", () => {

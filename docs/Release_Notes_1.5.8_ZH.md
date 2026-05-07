@@ -63,3 +63,45 @@ MAIN 1.5.8 重点补强了“桌面端自更新体验”“Game Studio 执行型
 ## 推荐展示文案
 
 MAIN 1.5.8 是一次围绕“更新体验更清晰、工作室执行衔接更顺、云端工具调用更稳”的增强更新。它把桌面端 About 与自更新入口整理成一个更完整的用户面板，也让 Game Studio 中明确的实现型回复可以更自然地继续进入执行链路；同时针对部分云端模型常见的伪工具占位输出，加入了自动恢复与协议纠偏，减少真实项目里因为网关兼容性差异导致的工具调用中断。
+
+---
+
+## 当前工作区新增变化（待提交）
+
+以下内容是当前工作区相对上一版 `1.5.8` 已整理但尚未提交的新增改动摘要。
+
+### 云端账号登录与安全存储
+
+- 云端设置新增认证方式切换，除传统 `API Key` 外，支持 `OpenAI 登录` 与 `Gemini 登录` 两条实验链路。
+- OpenAI 实验登录会通过系统浏览器完成 OAuth，并在登录后切换到 ChatGPT / Codex 兼容端点；Gemini 实验登录则走 Google OAuth 与 Gemini API / Code Assist 兼容路线。
+- 前端只保存 `tokenRef` 等摘要信息，真实 access token / refresh token 交由 Rust 后端处理，不再暴露到前端配置里。
+- Rust 后端新增云端 OAuth 生命周期接口，包括 `cloud_auth_begin`、`cloud_auth_finish`、`cloud_auth_status` 与 `cloud_auth_logout`，打通浏览器授权、本地回调、token 刷新和退出登录流程。
+- token 默认保存在本机 app data 文件并收紧到 `0600` 权限；在 macOS 上如果 Keychain 可用，会优先写入系统钥匙串。
+
+### Gemini 协议与实验模型支持
+
+- 云端协议新增 `Gemini` 选项，补齐模型列表地址、`generateContent` 请求地址和 Gemini 响应文本提取逻辑。
+- 新增 Gemini 请求体构造器与响应解析器，支持从现有对话消息生成 Gemini 原生 `contents` / `systemInstruction` 结构。
+- Gemini API Key 会走 `x-goog-api-key` 请求头；Gemini OAuth 登录模式则改用 Bearer token。
+- 补充 Gemini 实验模型候选列表，并在设置中给出 `GOOGLE_CLOUD_PROJECT` 提示，方便 Workspace / 企业 / Code Assist 场景排查。
+
+### 云端设置面板重构
+
+- 云端设置新增“认证方式”面板，可在 API Key、OpenAI 登录、Gemini 登录之间直接切换。
+- 新增实验登录状态显示，包括已登录账号、登录过期、存储位置和手动打开授权链接等反馈。
+- 将 Endpoint、请求头、API Format、工具协议、响应存储与推理强度整合进折叠的“高级兼容性”区域，默认首屏更简洁。
+- 默认隐藏 `Temperature` 与 `Top P` 采样参数，减少在弱兼容网关上的无效扰动。
+- OpenAI 登录模式下会额外展示实际使用的 Codex endpoint，方便排查兼容性问题。
+
+### 请求链路与代理兼容性
+
+- 流式请求、非流式请求、预检请求、语义标题生成与 AI commit message 生成，现在都能透传 `authMode` 与 `tokenRef`，统一走 Rust 代理侧的 OAuth token 注入逻辑。
+- OpenAI ChatGPT OAuth 模式下，请求头会去掉常规 `Authorization` / `x-api-key` 自动拼装，改由后端注入 Bearer token 与必要账号标识。
+- Gemini OAuth 模式下，请求头会改由后端注入 OAuth Bearer，不再复用 API Key 路径。
+- 针对 OpenAI / Gemini 的兼容性路径，云端聊天、预检与辅助生成任务中都收紧了采样参数发送策略，减少对弱兼容端点的额外干扰。
+
+### 稳定性与测试覆盖
+
+- 补充 Node 测试，覆盖 Gemini URL / request body / response 解析、云端认证模式归一化、OAuth 头部处理，以及 Gemini / OpenAI OAuth 下的流式代理路由。
+- 补充云端设置 Playwright E2E，覆盖高级兼容性折叠、OpenAI 实验登录、Gemini 登录提示和模型刷新后的候选展示。
+- 补强云端配置归一化逻辑，确保 legacy 配置迁移到新 auth 结构后仍能保持可用。

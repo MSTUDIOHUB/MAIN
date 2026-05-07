@@ -74,6 +74,8 @@ test("keeps a fresh default cloud config empty until the user adds a server", ()
   assert.equal(state.activeCloudServerId, "");
   assert.equal(state.cloud.endpoint, "https://api.openai.com/v1");
   assert.equal(state.cloud.model, "");
+  assert.equal(state.cloud.auth.mode, "api_key");
+  assert.equal(state.cloud.auth.status, "disconnected");
 });
 
 test("normalizes legacy single cloud config into one active server", () => {
@@ -94,6 +96,7 @@ test("normalizes legacy single cloud config into one active server", () => {
   assert.equal(state.cloud.endpoint, "https://openrouter.ai/api/v1");
   assert.equal(state.cloud.model, "openrouter/model");
   assert.equal(state.cloud.apiFormat, "responses");
+  assert.equal(state.cloud.auth.mode, "api_key");
 });
 
 test("repairs invalid active server ids and mirrors the selected server to cloud", () => {
@@ -140,4 +143,32 @@ test("fills protocol-specific defaults for incomplete server records", () => {
   assert.equal(state.cloudServers[0].disableResponseStorage, true);
   assert.equal(state.cloudServers[0].reasoningEffort, "none");
   assert.equal(state.cloudServers[0].toolProtocol, "auto");
+  assert.equal(state.cloudServers[0].auth.mode, "api_key");
+});
+
+test("normalizes Gemini servers and preserves OAuth auth summaries", () => {
+  const state = normalizeCloudServerState({
+    activeCloudServerId: "gemini-login",
+    cloudServers: [
+      {
+        id: "gemini-login",
+        name: "Gemini Login",
+        protocol: "gemini",
+        auth: {
+          mode: "gemini_google_oauth",
+          status: "connected",
+          email: "user@example.com",
+          tokenRef: "gemini-login",
+          expiresAt: 123,
+          storage: "file",
+        },
+      },
+    ],
+  });
+
+  assert.equal(state.cloudServers[0].provider, "Gemini");
+  assert.equal(state.cloudServers[0].endpoint, "https://generativelanguage.googleapis.com");
+  assert.equal(state.cloud.auth.mode, "gemini_google_oauth");
+  assert.equal(state.cloud.auth.status, "connected");
+  assert.equal(state.cloud.auth.email, "user@example.com");
 });

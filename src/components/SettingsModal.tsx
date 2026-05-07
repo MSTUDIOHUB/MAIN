@@ -11,14 +11,21 @@ import {
   buildCloudHeaders,
   buildCloudMessagesApiUrl,
   buildCloudModelListCandidates,
+  buildGeminiGenerateContentUrl,
+  buildGeminiRequestBody,
   extractAnthropicResponseText,
   extractCloudModelIds,
+  extractGeminiResponseText,
   extractOpenAiResponseText,
+  GEMINI_EXPERIMENTAL_MODELS,
   parseCloudCustomHeaders,
   normalizeCloudApiFormat,
+  normalizeCloudAuthMode,
   normalizeCloudProtocol,
   normalizeCloudToolProtocol,
   normalizeOpenAiReasoningEffort,
+  OPENAI_CHATGPT_CODEX_ENDPOINT,
+  OPENAI_CHATGPT_EXPERIMENTAL_MODELS,
 } from "../lib/cloudProtocol";
 import { isRetryableCloudErrorMessage } from "../lib/cloudRetry";
 import { isProviderCompatibilityErrorMessage } from "../lib/providerCompatibility";
@@ -33,6 +40,8 @@ import {
 import {
   createDefaultCloudConfig,
   createCloudServerConfig,
+  createDefaultCloudAuth,
+  normalizeCloudAuth,
   normalizeCloudServerState,
 } from "../lib/cloudServers";
 import { normalizeThoughtDisplayMode } from "../lib/thoughtDisplay";
@@ -40,10 +49,13 @@ import { APP_ICON_ASSETS, applyAppIconVariant, normalizeAppIconVariant, type App
 
 function buildCloudConnectionFingerprint(server: any, apiFormatOverride?: unknown, modelOverride?: unknown): string {
   if (!server) return "";
+  const auth = server.auth || {};
   return JSON.stringify({
     endpoint: String(server.endpoint || "").trim(),
     protocol: normalizeCloudProtocol(server.protocol),
     apiFormat: normalizeCloudApiFormat(apiFormatOverride ?? server.apiFormat),
+    authMode: normalizeCloudAuthMode(auth.mode),
+    tokenRef: String(auth.tokenRef || ""),
     apiKey: String(server.apiKey || ""),
     customHeaders: String(server.customHeaders || ""),
     model: String(modelOverride ?? server.model ?? "").trim(),
@@ -56,6 +68,8 @@ function isSameCloudConnectionTarget(current: any, target: any): boolean {
     && String(current.endpoint || "") === String(target.endpoint || "")
     && normalizeCloudProtocol(current.protocol) === normalizeCloudProtocol(target.protocol)
     && normalizeCloudApiFormat(current.apiFormat) === normalizeCloudApiFormat(target.apiFormat)
+    && normalizeCloudAuthMode(current.auth?.mode) === normalizeCloudAuthMode(target.auth?.mode)
+    && String(current.auth?.tokenRef || "") === String(target.auth?.tokenRef || "")
     && String(current.apiKey || "") === String(target.apiKey || "")
     && String(current.customHeaders || "") === String(target.customHeaders || "");
 }
@@ -220,11 +234,37 @@ const SETTINGS_COPY = {
     apiKeyOptional: "如服务不需要可留空",
     apiKeyDescAnthropic: "Anthropic 协议会使用 x-api-key 请求头。",
     apiKeyDescOpenAi: "OpenAI 兼容协议会默认同时发送 Authorization: Bearer 和 x-api-key 请求头，以兼容更多聚合网关。",
+    apiKeyDescGemini: "Gemini API Key 会使用 x-goog-api-key 请求头；Google 登录会改用 OAuth Bearer。",
+    authMethod: "认证方式",
+    authMethodDesc: "API Key 是稳定主线；账号登录是实验入口，只保存 token 引用，真实 token 留在后端安全存储。",
+    authApiKey: "API Key",
+    authOpenAiLogin: "OpenAI 登录",
+    authGeminiLogin: "Gemini 登录",
+    openAiExperimentalLoginTitle: "ChatGPT Pro/Plus/Codex 实验登录",
+    openAiExperimentalLoginDesc: "使用系统浏览器完成 OpenAI OAuth，本地回调后改走 ChatGPT/Codex 兼容端点。不承诺免费账号可用。",
+    geminiExperimentalLoginTitle: "Gemini Google 实验登录",
+    geminiExperimentalLoginDesc: "使用 Google 账号 OAuth，走 Gemini API / Code Assist 兼容路线，不复用 gemini.google.com 网页会话。",
+    geminiCloudProjectHint: "部分 Workspace、企业或 Code Assist 场景可能需要配置 GOOGLE_CLOUD_PROJECT。",
+    login: "登录",
+    loggingIn: "登录中...",
+    logout: "退出登录",
+    authConnected: "已登录",
+    authPending: "等待浏览器授权...",
+    authDisconnected: "未登录",
+    authExpired: "登录已过期",
+    authStorageFile: "token 已保存到本机 app data 文件（0600 权限），不是系统钥匙串。",
+    authStorageKeychain: "token 已保存到系统钥匙串。",
+    authStartFailed: (message: string) => `登录启动失败: ${message}`,
+    authFinishFailed: (message: string) => `登录完成失败: ${message}`,
+    authLogoutFailed: (message: string) => `退出登录失败: ${message}`,
+    authBrowserFallback: "浏览器未能自动打开，请手动打开授权链接。",
+    authManualOpen: "打开授权链接",
     additionalHeaders: "Additional Headers (JSON)",
     optional: "可选",
     additionalHeadersDesc: "需要厂商专用请求头时可填写 JSON 对象，或 {\"header\",\"value\"} 数组。",
     customHeadersCount: (count: number) => `当前将附加 ${count} 个自定义请求头`,
-    modelParams: "模型参数",
+    advancedCompatibility: "高级兼容性",
+    advancedCompatibilityDesc: "Endpoint、请求头、API format、工具协议、响应存储和推理强度等兼容项默认折叠。",
     reasoningEffort: "Reasoning Effort",
     reasoningEffortDesc: "建议保持 None，响应最快且不容易触发云端 524；只有复杂推理任务再手动切到 High / XHigh。",
     disableResponseStorage: "Disable Response Storage",
@@ -232,12 +272,6 @@ const SETTINGS_COPY = {
     toolProtocol: "Tool Protocol",
     toolProtocolDesc: "Auto 会先尝试原生 tools，遇到不兼容网关会回退 XML；Native 强制原生；XML 直接使用文本工具协议。",
     responsesCodexDesc: "`Responses + gpt-5.4` 现在会尽量贴近 Codex 请求形态：使用顶层 `instructions`、发送 `store: false` / `reasoning.effort`，并让采样参数走服务端默认值。",
-    temperatureDesc: "控制输出的随机性。值越低越确定，值越高越多样。",
-    topPDesc: "核采样阈值，与 Temperature 共同影响生成质量。",
-    tempPrecise: "0 (精确)",
-    tempCreative: "2 (创意)",
-    topPNarrow: "0 (窄)",
-    topPWide: "1 (宽)",
     cloudStartTitle: "从 0 开始添加云端服务器",
     cloudStartDesc: "当前没有任何云端接口配置。点击新增后填写名称、协议、Endpoint 和 API Key。",
     cloudTip: "推荐优先让用户直接在这里填写协议、Endpoint、API Key、额外请求头与模型名，不额外依赖外部配置文件。点击“刷新”会按当前选中的服务器尝试发现可用模型。",
@@ -396,11 +430,37 @@ const SETTINGS_COPY = {
     apiKeyOptional: "leave blank if the service does not require one",
     apiKeyDescAnthropic: "Anthropic protocol sends the x-api-key header.",
     apiKeyDescOpenAi: "OpenAI-compatible protocol sends both Authorization: Bearer and x-api-key by default for broader gateway compatibility.",
+    apiKeyDescGemini: "Gemini API Key uses the x-goog-api-key header; Google login switches to OAuth Bearer.",
+    authMethod: "Authentication",
+    authMethodDesc: "API Key is the stable path. Account login is experimental; the frontend stores only a token reference.",
+    authApiKey: "API Key",
+    authOpenAiLogin: "OpenAI Login",
+    authGeminiLogin: "Gemini Login",
+    openAiExperimentalLoginTitle: "ChatGPT Pro/Plus/Codex Experimental Login",
+    openAiExperimentalLoginDesc: "Uses system-browser OpenAI OAuth, a local callback, and the ChatGPT/Codex compatible endpoint. Free-account availability is not promised.",
+    geminiExperimentalLoginTitle: "Gemini Google Experimental Login",
+    geminiExperimentalLoginDesc: "Uses Google OAuth for the Gemini API / Code Assist compatible path, without reusing gemini.google.com web sessions.",
+    geminiCloudProjectHint: "Some Workspace, enterprise, or Code Assist accounts may require GOOGLE_CLOUD_PROJECT.",
+    login: "Log In",
+    loggingIn: "Logging in...",
+    logout: "Log Out",
+    authConnected: "Signed in",
+    authPending: "Waiting for browser authorization...",
+    authDisconnected: "Not signed in",
+    authExpired: "Sign-in expired",
+    authStorageFile: "Token is stored in the local app data file with 0600 permissions, not the OS keychain.",
+    authStorageKeychain: "Token is stored in the OS keychain.",
+    authStartFailed: (message: string) => `Could not start login: ${message}`,
+    authFinishFailed: (message: string) => `Could not finish login: ${message}`,
+    authLogoutFailed: (message: string) => `Could not log out: ${message}`,
+    authBrowserFallback: "The browser did not open automatically. Open the authorization URL manually.",
+    authManualOpen: "Open Authorization URL",
     additionalHeaders: "Additional Headers (JSON)",
     optional: "optional",
     additionalHeadersDesc: "Use a JSON object, or a {\"header\",\"value\"} array, when a vendor requires custom request headers.",
     customHeadersCount: (count: number) => `${count} custom header(s) will be attached`,
-    modelParams: "Model Parameters",
+    advancedCompatibility: "Advanced Compatibility",
+    advancedCompatibilityDesc: "Endpoint, headers, API format, tool protocol, response storage, and reasoning compatibility are collapsed by default.",
     reasoningEffort: "Reasoning Effort",
     reasoningEffortDesc: "Keep this at None for the fastest responses and fewer cloud 524s. Switch to High / XHigh only for complex reasoning tasks.",
     disableResponseStorage: "Disable Response Storage",
@@ -408,12 +468,6 @@ const SETTINGS_COPY = {
     toolProtocol: "Tool Protocol",
     toolProtocolDesc: "Auto tries native tools first and falls back to XML on weak gateways. Native forces function calling; XML uses text tool calls directly.",
     responsesCodexDesc: "`Responses + gpt-5.4` now mirrors Codex request shape where possible: top-level `instructions`, `store: false` / `reasoning.effort`, and server defaults for sampling.",
-    temperatureDesc: "Controls randomness. Lower values are more deterministic; higher values are more varied.",
-    topPDesc: "Nucleus sampling threshold. It works together with Temperature to influence generation quality.",
-    tempPrecise: "0 (Precise)",
-    tempCreative: "2 (Creative)",
-    topPNarrow: "0 (Narrow)",
-    topPWide: "1 (Wide)",
     cloudStartTitle: "Add a cloud server from scratch",
     cloudStartDesc: "No cloud API configuration exists yet. Add a server, then fill in name, protocol, endpoint, and API key.",
     cloudTip: "Prefer entering protocol, endpoint, API key, extra headers, and model name here directly, without relying on external config files. Refresh tries to discover available models for the selected server.",
@@ -1367,6 +1421,10 @@ export default function SettingsModal({
   const [cloudServerSearch, setCloudServerSearch] = useState("");
   const [cloudDraftServer, setCloudDraftServer] = useState<any | null>(null);
   const [cloudDraftMode, setCloudDraftMode] = useState<"saved" | "new" | null>(null);
+  const [isCloudAdvancedOpen, setIsCloudAdvancedOpen] = useState(false);
+  const [cloudAuthBusy, setCloudAuthBusy] = useState(false);
+  const [cloudAuthSession, setCloudAuthSession] = useState<any | null>(null);
+  const [cloudAuthMsg, setCloudAuthMsg] = useState<{ text: string; type: 'success' | 'warning' | 'error' } | null>(null);
   const [isFetchingModels, setIsFetchingModels] = useState(false);
   const [isFetchingCloudModels, setIsFetchingCloudModels] = useState(false);
   const [isTestingCloudConnection, setIsTestingCloudConnection] = useState(false);
@@ -1483,6 +1541,12 @@ export default function SettingsModal({
     const timer = setTimeout(() => setCloudProbeMsg(null), 5000);
     return () => clearTimeout(timer);
   }, [cloudProbeMsg]);
+
+  useEffect(() => {
+    if (!cloudAuthMsg) return;
+    const timer = setTimeout(() => setCloudAuthMsg(null), 5000);
+    return () => clearTimeout(timer);
+  }, [cloudAuthMsg]);
 
   useEffect(() => {
     if (!cloudSaveMsg) return;
@@ -1626,6 +1690,9 @@ export default function SettingsModal({
   const cloudProtocol = normalizeCloudProtocol(draftCloudConfig.protocol);
   const cloudApiFormat = normalizeCloudApiFormat(draftCloudConfig.apiFormat);
   const parsedCloudCustomHeaders = parseCloudCustomHeaders(draftCloudConfig.customHeaders || "");
+  const cloudAuth = normalizeCloudAuth(draftCloudConfig.auth, cloudProtocol);
+  const cloudAuthMode = normalizeCloudAuthMode(cloudAuth.mode);
+  const cloudUsesOAuth = cloudAuthMode !== "api_key";
   const filteredCloudServers = cloudServers.filter((server) => {
     const query = cloudServerSearch.trim().toLowerCase();
     if (!query) return true;
@@ -1642,19 +1709,24 @@ export default function SettingsModal({
     : filteredCloudServers;
   const cloudEndpointPlaceholder = cloudProtocol === "anthropic"
     ? "https://api.anthropic.com"
-    : cloudApiFormat === "responses"
-      ? copy.responsesEndpointPlaceholder
-      : copy.chatEndpointPlaceholder;
-  const cloudApiKeyPlaceholder = cloudProtocol === "anthropic" ? "sk-ant-..." : "sk-...";
-  const cloudModelPlaceholder = cloudProtocol === "anthropic" ? "claude-sonnet-4-5" : "gpt-4.1 / qwen-max / openrouter-model";
+    : cloudProtocol === "gemini"
+      ? "https://generativelanguage.googleapis.com"
+      : cloudApiFormat === "responses"
+        ? copy.responsesEndpointPlaceholder
+        : copy.chatEndpointPlaceholder;
+  const cloudApiKeyPlaceholder = cloudProtocol === "anthropic" ? "sk-ant-..." : cloudProtocol === "gemini" ? "AIza..." : "sk-...";
+  const cloudModelPlaceholder = cloudProtocol === "anthropic" ? "claude-sonnet-4-5" : cloudProtocol === "gemini" ? "gemini-2.5-pro" : "gpt-4.1 / qwen-max / openrouter-model";
   const cloudEndpointHint = cloudProtocol === "anthropic"
     ? copy.anthropicEndpointHint
-    : cloudApiFormat === "responses"
-      ? copy.responsesEndpointHint
-      : copy.chatEndpointHint;
+    : cloudProtocol === "gemini"
+      ? "Gemini API root, for example https://generativelanguage.googleapis.com."
+      : cloudApiFormat === "responses"
+        ? copy.responsesEndpointHint
+        : copy.chatEndpointHint;
   const cloudConnectionFingerprint = useMemo(() => buildCloudConnectionFingerprint(draftCloudConfig), [
     draftCloudConfig.apiFormat,
     draftCloudConfig.apiKey,
+    draftCloudConfig.auth,
     draftCloudConfig.customHeaders,
     draftCloudConfig.endpoint,
     draftCloudConfig.model,
@@ -1683,6 +1755,8 @@ export default function SettingsModal({
     setCloudModelInputMode(nextDraft && (cloudModelsByServer[nextDraft.id] || []).length > 0 ? "select" : "manual");
     setCloudFetchMsg(null);
     setCloudProbeMsg(null);
+    setCloudAuthMsg(null);
+    setCloudAuthSession(null);
   }, [activeCloudServerId, cloudDraftMode, isOpen, savedActiveCloudServer, settingsTab]);
 
   const makeBlankCloudServerDraft = useCallback(() => ({
@@ -1693,6 +1767,7 @@ export default function SettingsModal({
     model: "",
     apiKey: "",
     customHeaders: "",
+    auth: createDefaultCloudAuth("api_key"),
   }), []);
 
   const commitCloudServers = useCallback((servers, activeId, prevConfig) => {
@@ -1781,11 +1856,10 @@ export default function SettingsModal({
       model: String(server.model ?? ""),
       apiKey: String(server.apiKey ?? ""),
       customHeaders: String(server.customHeaders ?? ""),
-      temperature: Number(server.temperature ?? 0.6),
-      topP: Number(server.topP ?? 0.95),
       disableResponseStorage: server.disableResponseStorage !== false,
       reasoningEffort: normalizeOpenAiReasoningEffort(server.reasoningEffort),
       toolProtocol: normalizeCloudToolProtocol(server.toolProtocol),
+      auth: normalizeCloudAuth(server.auth, normalizeCloudProtocol(server.protocol)),
     });
   }, []);
 
@@ -1817,6 +1891,8 @@ export default function SettingsModal({
     setCloudFetchMsg(null);
     setCloudProbeMsg(null);
     setCloudSaveMsg(null);
+    setCloudAuthMsg(null);
+    setCloudAuthSession(null);
     setCloudConnectionStatus(null);
     setCloudModelInputMode((cloudModelsByServer[serverId] || []).length > 0 ? "select" : "manual");
   }, [cloudModelsByServer, cloudServers, commitCloudServers, setConfig]);
@@ -1828,6 +1904,8 @@ export default function SettingsModal({
     setCloudFetchMsg(null);
     setCloudProbeMsg(null);
     setCloudSaveMsg(null);
+    setCloudAuthMsg(null);
+    setCloudAuthSession(null);
     setCloudConnectionStatus(null);
     setCloudModelInputMode("manual");
   }, [makeBlankCloudServerDraft]);
@@ -1843,6 +1921,8 @@ export default function SettingsModal({
     persistCloudServer({ ...cloudDraftServer, name, endpoint });
     setCloudFetchMsg(null);
     setCloudProbeMsg(null);
+    setCloudAuthMsg(null);
+    setCloudAuthSession(null);
     setCloudConnectionStatus(null);
     setCloudSaveMsg({ text: copy.cloudSaved, type: "success" });
   }, [cloudDraftServer, copy, persistCloudServer]);
@@ -1854,6 +1934,8 @@ export default function SettingsModal({
       setCloudFetchMsg(null);
       setCloudProbeMsg(null);
       setCloudSaveMsg(null);
+      setCloudAuthMsg(null);
+      setCloudAuthSession(null);
       setCloudConnectionStatus(null);
       return;
     }
@@ -1886,6 +1968,8 @@ export default function SettingsModal({
     }
     setCloudFetchMsg(null);
     setCloudProbeMsg(null);
+    setCloudAuthMsg(null);
+    setCloudAuthSession(null);
     setCloudConnectionStatus(null);
     setCloudSaveMsg(null);
   }, [cloudDraftMode, cloudDraftServer, cloudModelsByServer, cloudServers, commitCloudServers, savedActiveCloudServer, setConfig]);
@@ -1893,19 +1977,30 @@ export default function SettingsModal({
   const handleCloudProtocolChange = (e) => {
     if (!cloudDraftServer) return;
     const nextProtocol = normalizeCloudProtocol(e.target.value);
-    const nextEndpoint = nextProtocol === "anthropic" ? "https://api.anthropic.com" : "https://api.openai.com/v1";
+    const nextEndpoint = nextProtocol === "anthropic"
+      ? "https://api.anthropic.com"
+      : nextProtocol === "gemini"
+        ? "https://generativelanguage.googleapis.com"
+        : "https://api.openai.com/v1";
     const previousProtocol = normalizeCloudProtocol(draftCloudConfig.protocol);
-    const previousDefaultEndpoint = previousProtocol === "anthropic" ? "https://api.anthropic.com" : "https://api.openai.com/v1";
+    const previousDefaultEndpoint = previousProtocol === "anthropic"
+      ? "https://api.anthropic.com"
+      : previousProtocol === "gemini"
+        ? "https://generativelanguage.googleapis.com"
+        : "https://api.openai.com/v1";
     const currentEndpoint = draftCloudConfig.endpoint || "";
     const shouldReplaceEndpoint = !currentEndpoint.trim() || currentEndpoint === previousDefaultEndpoint;
 
     updateCloudDraftServer({
       protocol: nextProtocol,
       apiFormat: nextProtocol === "anthropic" ? "chat_completions" : normalizeCloudApiFormat(draftCloudConfig.apiFormat),
-      provider: nextProtocol === "anthropic" ? "Anthropic" : "OpenAI",
+      provider: nextProtocol === "anthropic" ? "Anthropic" : nextProtocol === "gemini" ? "Gemini" : "OpenAI",
       endpoint: shouldReplaceEndpoint ? nextEndpoint : currentEndpoint,
       model: "",
+      auth: createDefaultCloudAuth("api_key"),
     }, { clearModels: true });
+    setCloudAuthMsg(null);
+    setCloudAuthSession(null);
     setCloudFetchMsg(null);
     setCloudProbeMsg(null);
     setCloudConnectionStatus(null);
@@ -1918,6 +2013,119 @@ export default function SettingsModal({
     setCloudConnectionStatus(null);
   };
 
+  const handleCloudAuthModeChange = useCallback((mode) => {
+    if (!cloudDraftServer) return;
+    const nextMode = normalizeCloudAuthMode(mode);
+    const protocolPatch = nextMode === "gemini_google_oauth"
+      ? { protocol: "gemini", provider: "Gemini", endpoint: draftCloudConfig.endpoint || "https://generativelanguage.googleapis.com" }
+      : nextMode === "openai_chatgpt_oauth"
+        ? { protocol: "openai", provider: "OpenAI", apiFormat: "responses", endpoint: draftCloudConfig.endpoint || "https://api.openai.com/v1" }
+        : {};
+    updateCloudDraftServer({
+      ...protocolPatch,
+      auth: createDefaultCloudAuth(nextMode),
+      apiKey: nextMode === "api_key" ? draftCloudConfig.apiKey || "" : "",
+    }, { clearModels: true });
+    setCloudAuthMsg(null);
+    setCloudAuthSession(null);
+    setCloudProbeMsg(null);
+    setCloudConnectionStatus(null);
+  }, [cloudDraftServer, draftCloudConfig.apiKey, draftCloudConfig.endpoint, updateCloudDraftServer]);
+
+  const updateCloudDraftAuth = useCallback((patch) => {
+    const nextAuth = normalizeCloudAuth({
+      ...cloudAuth,
+      ...patch,
+    }, normalizeCloudProtocol(cloudDraftServer?.protocol));
+    updateCloudDraftServer({ auth: nextAuth }, { clearModels: true });
+    setCloudConnectionStatus(null);
+  }, [cloudAuth, cloudDraftServer?.protocol, updateCloudDraftServer]);
+
+  const finishCloudAuthSession = useCallback(async (session) => {
+    if (!session || !cloudDraftServer) return null;
+    const status = await invoke<any>("cloud_auth_finish", {
+      sessionId: session.sessionId,
+      serverId: cloudDraftServer.id,
+    });
+    if (status?.status === "connected") {
+      updateCloudDraftAuth({
+        mode: normalizeCloudAuthMode(status.mode ?? cloudAuthMode),
+        status: "connected",
+        accountId: status.accountId,
+        email: status.email,
+        tokenRef: status.tokenRef || cloudDraftServer.id,
+        expiresAt: status.expiresAt,
+        storage: status.storage,
+        message: status.message,
+      });
+      setCloudAuthSession(null);
+      setCloudAuthMsg({
+        text: `${copy.authConnected}${status.email ? ` · ${status.email}` : ""}`,
+        type: "success",
+      });
+      return status;
+    }
+    if (status?.status === "error") {
+      setCloudAuthMsg({ text: status.message || copy.authFinishFailed("unknown"), type: "error" });
+      return status;
+    }
+    setCloudAuthMsg({ text: copy.authPending, type: "warning" });
+    return status;
+  }, [cloudAuthMode, cloudDraftServer, copy, updateCloudDraftAuth]);
+
+  const beginCloudAuth = useCallback(async () => {
+    if (!cloudDraftServer || cloudAuthMode === "api_key" || cloudAuthBusy) return;
+    setCloudAuthBusy(true);
+    setCloudAuthMsg(null);
+    setCloudAuthSession(null);
+    try {
+      const session = await invoke<any>("cloud_auth_begin", {
+        provider: cloudProtocol === "gemini" ? "gemini" : "openai",
+        mode: cloudAuthMode,
+        serverId: cloudDraftServer.id,
+      });
+      setCloudAuthSession(session);
+      setCloudAuthMsg({
+        text: session.browserOpened === false ? copy.authBrowserFallback : copy.authPending,
+        type: session.browserOpened === false ? "warning" : "success",
+      });
+
+      let completed = false;
+      for (let attempt = 0; attempt < 120; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        const status = await finishCloudAuthSession(session);
+        if (status?.status === "connected" || status?.status === "error") {
+          completed = true;
+          break;
+        }
+      }
+      if (!completed) {
+        setCloudAuthMsg({ text: copy.authPending, type: "warning" });
+      }
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      setCloudAuthMsg({ text: copy.authStartFailed(errMsg), type: "error" });
+    } finally {
+      setCloudAuthBusy(false);
+    }
+  }, [cloudAuthBusy, cloudAuthMode, cloudDraftServer, cloudProtocol, copy, finishCloudAuthSession]);
+
+  const logoutCloudAuth = useCallback(async () => {
+    if (!cloudDraftServer || cloudAuthMode === "api_key") return;
+    setCloudAuthBusy(true);
+    try {
+      await invoke<any>("cloud_auth_logout", { serverId: cloudAuth.tokenRef || cloudDraftServer.id });
+      updateCloudDraftAuth({ mode: cloudAuthMode, status: "disconnected", tokenRef: undefined, accountId: undefined, email: undefined, expiresAt: undefined, storage: undefined, message: undefined });
+      setCloudAuthSession(null);
+      setCloudAuthMsg({ text: copy.authDisconnected, type: "success" });
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      setCloudAuthMsg({ text: copy.authLogoutFailed(errMsg), type: "error" });
+    } finally {
+      setCloudAuthBusy(false);
+    }
+  }, [cloudAuth.tokenRef, cloudAuthMode, cloudDraftServer, copy, updateCloudDraftAuth]);
+
   const refreshCloudModels = useCallback(async (serverOverride = null) => {
     if (isFetchingCloudModels) return;
     const targetServer = serverOverride || cloudDraftServer;
@@ -1927,6 +2135,8 @@ export default function SettingsModal({
     }
     const targetServerId = targetServer.id;
     const targetProtocol = normalizeCloudProtocol(targetServer.protocol);
+    const targetAuth = normalizeCloudAuth(targetServer.auth, targetProtocol);
+    const targetAuthMode = normalizeCloudAuthMode(targetAuth.mode);
     setIsFetchingCloudModels(true);
     setCloudFetchMsg(null);
 
@@ -1937,8 +2147,28 @@ export default function SettingsModal({
         return;
       }
 
+      if (targetAuthMode === "openai_chatgpt_oauth") {
+        const models = [...OPENAI_CHATGPT_EXPERIMENTAL_MODELS];
+        const selectedModel = models.includes(targetServer.model) ? targetServer.model : models[0];
+        setCloudModelsByServer((prev) => ({ ...prev, [targetServerId]: models }));
+        setCloudModelInputMode("select");
+        confirmCloudModelSelection(selectedModel, targetServer);
+        setCloudFetchMsg({ text: copy.cloudModelsPulled(models.length, selectedModel), type: "success" });
+        return;
+      }
+
+      if (targetAuthMode === "gemini_google_oauth") {
+        const models = [...GEMINI_EXPERIMENTAL_MODELS];
+        const selectedModel = models.includes(targetServer.model) ? targetServer.model : models[0];
+        setCloudModelsByServer((prev) => ({ ...prev, [targetServerId]: models }));
+        setCloudModelInputMode("select");
+        confirmCloudModelSelection(selectedModel, targetServer);
+        setCloudFetchMsg({ text: copy.cloudModelsPulled(models.length, selectedModel), type: "success" });
+        return;
+      }
+
       const candidates = buildCloudModelListCandidates(endpoint, targetProtocol);
-      const headers = buildCloudHeaders(targetProtocol, targetServer.apiKey || "", false, targetServer.customHeaders);
+      const headers = buildCloudHeaders(targetProtocol, targetServer.apiKey || "", false, targetServer.customHeaders, targetAuthMode);
 
       for (const url of candidates) {
         try {
@@ -1947,6 +2177,8 @@ export default function SettingsModal({
             method: "GET",
             headers,
             body: null,
+            authMode: targetAuthMode,
+            tokenRef: targetAuth.tokenRef,
           });
           const models = extractCloudModelIds(JSON.parse(body));
           if (models.length === 0) continue;
@@ -1957,7 +2189,9 @@ export default function SettingsModal({
             || normalizeCloudProtocol(latestServer.protocol) !== targetProtocol
             || latestServer.endpoint !== targetServer.endpoint
             || latestServer.apiKey !== targetServer.apiKey
-            || latestServer.customHeaders !== targetServer.customHeaders;
+            || latestServer.customHeaders !== targetServer.customHeaders
+            || normalizeCloudAuthMode(latestServer.auth?.mode) !== targetAuthMode
+            || String(latestServer.auth?.tokenRef || "") !== String(targetAuth.tokenRef || "");
           if (isStaleResult) return;
 
           const selectedModel = models.includes(targetServer.model) ? targetServer.model : models[0];
@@ -1993,6 +2227,7 @@ export default function SettingsModal({
       model: testModel,
       protocol: cloudProtocol,
       toolProtocol: normalizeCloudToolProtocol(draftCloudConfig.toolProtocol),
+      auth: cloudAuth,
     } : null;
     if (!endpoint) {
       setCloudProbeMsg({ text: copy.cloudEndpointRequired, type: "error" });
@@ -2008,7 +2243,7 @@ export default function SettingsModal({
     setCloudConnectionStatus(null);
 
     try {
-      const headers = buildCloudHeaders(cloudProtocol, draftCloudConfig.apiKey || "", true, draftCloudConfig.customHeaders);
+      const headers = buildCloudHeaders(cloudProtocol, cloudUsesOAuth ? "" : draftCloudConfig.apiKey || "", true, draftCloudConfig.customHeaders, cloudAuthMode);
       let effectiveApiFormat = cloudApiFormat;
       let payload: unknown = null;
       let successfulResponsesMode: string | null = null;
@@ -2042,6 +2277,8 @@ export default function SettingsModal({
               method: "POST",
               headers,
               body: JSON.stringify(body),
+              authMode: cloudAuthMode,
+              tokenRef: cloudAuth.tokenRef || cloudDraftServer?.id,
             });
             return JSON.parse(raw);
           } catch (err) {
@@ -2133,9 +2370,14 @@ export default function SettingsModal({
           model: testModel,
           maxTokens: 32,
           stream: false,
-          temperature: draftCloudConfig.temperature ?? 0.2,
-          topP: draftCloudConfig.topP ?? 0.95,
         }), "base", "anthropic");
+      } else if (cloudProtocol === "gemini") {
+        const url = buildGeminiGenerateContentUrl(endpoint, testModel, false);
+        payload = await sendJsonProbe(url, buildGeminiRequestBody({
+          messages: probeMessages,
+          model: testModel,
+          maxTokens: 32,
+        }), "base", "gemini");
       } else {
         const result = await runOpenAiBaseProbe();
         payload = result.payload;
@@ -2150,7 +2392,7 @@ export default function SettingsModal({
       }
       if (cloudDraftServer) {
         confirmCloudModelSelection(testModel, {
-          ...cloudDraftServer,
+          ...(targetServer || cloudDraftServer),
           apiFormat: effectiveApiFormat,
           model: testModel,
         });
@@ -2158,7 +2400,9 @@ export default function SettingsModal({
 
       const reply = cloudProtocol === "anthropic"
         ? extractAnthropicResponseText(payload).trim()
-        : extractOpenAiResponseText(payload, effectiveApiFormat).trim();
+        : cloudProtocol === "gemini"
+          ? extractGeminiResponseText(payload).trim()
+          : extractOpenAiResponseText(payload, effectiveApiFormat).trim();
       const switchedText = cloudProtocol === "openai" && effectiveApiFormat !== cloudApiFormat
         ? copy.cloudAutoSwitch(effectiveApiFormat === "responses" ? "Responses API" : "Chat Completions")
         : "";
@@ -2183,6 +2427,7 @@ export default function SettingsModal({
 
       const shouldRunAdvancedProbe = cloudProtocol === "openai"
         && effectiveApiFormat === "responses"
+        && cloudAuthMode !== "openai_chatgpt_oauth"
         && (
           draftCloudConfig.disableResponseStorage !== false
           || normalizeOpenAiReasoningEffort(draftCloudConfig.reasoningEffort) !== "none"
@@ -2225,8 +2470,11 @@ export default function SettingsModal({
   }, [
     cloudApiFormat,
     cloudAvailableModels,
+    cloudAuth,
+    cloudAuthMode,
     cloudDraftServer,
     cloudProtocol,
+    cloudUsesOAuth,
     confirmCloudModelSelection,
     copy,
     draftCloudConfig.apiKey,
@@ -2236,8 +2484,6 @@ export default function SettingsModal({
     draftCloudConfig.model,
     draftCloudConfig.reasoningEffort,
     draftCloudConfig.toolProtocol,
-    draftCloudConfig.temperature,
-    draftCloudConfig.topP,
     isTestingCloudConnection,
     language,
     updateCloudDraftServer,
@@ -2950,7 +3196,8 @@ export default function SettingsModal({
                                     {isUnsavedServer && <span className="shrink-0 rounded border border-[#3f3f46] px-1.5 py-0.5 text-[9px] font-bold uppercase text-[#a1a1aa]">{copy.unsaved}</span>}
                                   </div>
                                   <div className="mt-1 flex items-center gap-1.5">
-                                    <span className="rounded bg-[#18181b] px-1.5 py-0.5 text-[9px] font-bold uppercase text-[#a1a1aa]">{normalizeCloudProtocol(server.protocol) === "anthropic" ? "Anthropic" : "OpenAI"}</span>
+                                    <span className="rounded bg-[#18181b] px-1.5 py-0.5 text-[9px] font-bold uppercase text-[#a1a1aa]">{normalizeCloudProtocol(server.protocol) === "anthropic" ? "Anthropic" : normalizeCloudProtocol(server.protocol) === "gemini" ? "Gemini" : "OpenAI"}</span>
+                                    {normalizeCloudAuthMode(server.auth?.mode) !== "api_key" && <span className="rounded bg-[#18181b] px-1.5 py-0.5 text-[9px] font-bold uppercase text-[#86d9a3]">Login</span>}
                                     {server.model && <span className="truncate text-[10px] text-[#71717a]">{server.model}</span>}
                                   </div>
                                   <div className="mt-1 truncate font-mono text-[10px] text-[#71717a]">{server.endpoint || copy.noEndpoint}</div>
@@ -3019,6 +3266,95 @@ export default function SettingsModal({
                           />
                         </div>
 
+                        <div data-testid="cloud-auth-mode-section">
+                          <label className="mb-2 block text-[13px] font-bold text-[#e4e4e7]">{copy.authMethod}</label>
+                          <p className="mb-2 text-[11.5px] text-[#71717a]">{copy.authMethodDesc}</p>
+                          <div className="grid gap-2 sm:grid-cols-3">
+                            {[
+                              { mode: "api_key", label: copy.authApiKey },
+                              { mode: "openai_chatgpt_oauth", label: copy.authOpenAiLogin },
+                              { mode: "gemini_google_oauth", label: copy.authGeminiLogin },
+                            ].map((item) => (
+                              <button
+                                key={item.mode}
+                                type="button"
+                                data-testid={`cloud-auth-mode-${item.mode}`}
+                                onClick={() => handleCloudAuthModeChange(item.mode)}
+                                className={settingsOptionButtonClass(cloudAuthMode === item.mode, "rounded-md px-3 py-2 text-[12px] font-bold")}
+                              >
+                                {item.label}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+
+                        {cloudUsesOAuth && (
+                          <div data-testid="cloud-oauth-panel" className="rounded-md border border-[#27272a] bg-[#09090b] p-3">
+                            <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                              <div className="min-w-0">
+                                <div className="text-[12px] font-bold text-[#e4e4e7]">
+                                  {cloudAuthMode === "openai_chatgpt_oauth" ? copy.openAiExperimentalLoginTitle : copy.geminiExperimentalLoginTitle}
+                                </div>
+                                <p className="mt-1 text-[11px] leading-relaxed text-[#71717a]">
+                                  {cloudAuthMode === "openai_chatgpt_oauth" ? copy.openAiExperimentalLoginDesc : copy.geminiExperimentalLoginDesc}
+                                </p>
+                                {cloudAuthMode === "gemini_google_oauth" && (
+                                  <p className="mt-1 text-[11px] text-[#fbbf24]">{copy.geminiCloudProjectHint}</p>
+                                )}
+                                <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px]">
+                                  <span className={`rounded border px-2 py-0.5 ${cloudAuth.status === "connected" ? "border-[#14532d] bg-[#052e16] text-[#86d9a3]" : "border-[#3f3f46] bg-[#18181b] text-[#a1a1aa]"}`}>
+                                    {cloudAuth.status === "connected" ? copy.authConnected : cloudAuth.status === "expired" ? copy.authExpired : copy.authDisconnected}
+                                  </span>
+                                  {(cloudAuth.email || cloudAuth.accountId) && (
+                                    <span className="truncate font-mono text-[#a1a1aa]">{cloudAuth.email || cloudAuth.accountId}</span>
+                                  )}
+                                </div>
+                                {cloudAuth.storage && (
+                                  <p className="mt-2 text-[11px] text-[#71717a]">
+                                    {cloudAuth.storage === "keychain" ? copy.authStorageKeychain : copy.authStorageFile}
+                                  </p>
+                                )}
+                              </div>
+                              <div className="flex shrink-0 gap-2">
+                                {cloudAuth.status === "connected" ? (
+                                  <button
+                                    type="button"
+                                    onClick={logoutCloudAuth}
+                                    disabled={cloudAuthBusy}
+                                    className="rounded-md border border-[#27272a] bg-[#18181b] px-3 py-2 text-[12px] font-bold text-[#a1a1aa] transition-colors hover:text-white disabled:opacity-50"
+                                  >
+                                    {copy.logout}
+                                  </button>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    data-testid="cloud-auth-login"
+                                    onClick={beginCloudAuth}
+                                    disabled={cloudAuthBusy}
+                                    className="rounded-md theme-bg theme-bg-hover px-3 py-2 text-[12px] font-bold text-white transition-colors disabled:opacity-50"
+                                  >
+                                    {cloudAuthBusy ? copy.loggingIn : copy.login}
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+                            {cloudAuthSession?.authUrl && (
+                              <button
+                                type="button"
+                                onClick={() => openUrl(cloudAuthSession.authUrl).catch(() => {})}
+                                className="mt-3 text-[11px] font-bold theme-text hover:underline"
+                              >
+                                {copy.authManualOpen}
+                              </button>
+                            )}
+                            {cloudAuthMsg && (
+                              <p className={`mt-2 text-[12px] ${cloudAuthMsg.type === "error" ? "text-[#f48771]" : cloudAuthMsg.type === "warning" ? "text-[#fbbf24]" : "text-[#86d9a3]"}`}>
+                                {cloudAuthMsg.text}
+                              </p>
+                            )}
+                          </div>
+                        )}
+
                         <div>
                           <label className="mb-2 block text-[13px] font-bold text-[#e4e4e7]">{copy.apiProtocol}</label>
                           <p className="mb-2 text-[11.5px] text-[#71717a]">{copy.apiProtocolDesc}</p>
@@ -3029,150 +3365,137 @@ export default function SettingsModal({
                           >
                             <option value="openai">OpenAI Compatible</option>
                             <option value="anthropic">Anthropic</option>
+                            <option value="gemini">Gemini</option>
                           </select>
                         </div>
 
-                        {cloudProtocol === "openai" && (
+                        {!cloudUsesOAuth && (
                           <div>
-                            <label className="mb-2 block text-[13px] font-bold text-[#e4e4e7]">{copy.apiFormat}</label>
-                            <p className="mb-2 text-[11.5px] text-[#71717a]">{copy.apiFormatDesc}</p>
-                            <select
-                              value={cloudApiFormat}
-                              onChange={handleCloudApiFormatChange}
-                              className={settingsSelectClass}
-                            >
-                              <option value="chat_completions">OpenAI Chat Completions</option>
-                              <option value="responses">OpenAI Responses API</option>
-                            </select>
+                            <label className="mb-2 block text-[13px] font-bold text-[#e4e4e7]">API Key <span className="font-normal text-[#71717a]">({copy.apiKeyOptional})</span></label>
+                            <p className="mb-2 text-[11.5px] text-[#71717a]">{cloudProtocol === "anthropic" ? copy.apiKeyDescAnthropic : cloudProtocol === "gemini" ? copy.apiKeyDescGemini : copy.apiKeyDescOpenAi}</p>
+                            <input
+                              data-testid="cloud-server-api-key-input"
+                              type="password"
+                              value={draftCloudConfig.apiKey || ""}
+                              onChange={(e) => {
+                                updateCloudDraftServer({ apiKey: e.target.value }, { clearModels: true });
+                              }}
+                              placeholder={cloudApiKeyPlaceholder}
+                              className="w-full rounded-md border border-[#27272a] bg-[#000000] p-2.5 font-mono text-[14px] text-white outline-none theme-ring placeholder:text-[#3f3f46]"
+                            />
                           </div>
                         )}
 
-                        <div>
-                          <label className="mb-2 block text-[13px] font-bold text-[#e4e4e7]">{copy.toolProtocol}</label>
-                          <p className="mb-2 text-[11.5px] text-[#71717a]">{copy.toolProtocolDesc}</p>
-                          <select
-                            value={normalizeCloudToolProtocol(draftCloudConfig.toolProtocol)}
-                            onChange={(e) => updateCloudDraftServer({ toolProtocol: normalizeCloudToolProtocol(e.target.value) })}
-                            className={settingsSelectClass}
-                          >
-                            <option value="auto">Auto</option>
-                            <option value="native">Native</option>
-                            <option value="xml">XML</option>
-                          </select>
-                        </div>
-
-                        <div>
-                          <label className="mb-2 block text-[13px] font-bold text-[#e4e4e7]">{copy.apiEndpoint}</label>
-                          <p className="mb-2 text-[11.5px] text-[#71717a]">{cloudEndpointHint}</p>
-                          <input
-                            data-testid="cloud-server-endpoint-input"
-                            type="text"
-                            value={draftCloudConfig.endpoint || ""}
-                            onChange={(e) => {
-                              updateCloudDraftServer({ endpoint: e.target.value }, { clearModels: true });
-                            }}
-                            placeholder={cloudEndpointPlaceholder}
-                            className="w-full rounded-md border border-[#27272a] bg-[#000000] p-2.5 font-mono text-[14px] text-white outline-none theme-ring placeholder:text-[#3f3f46]"
-                          />
-                        </div>
-
-                        <div>
-                          <label className="mb-2 block text-[13px] font-bold text-[#e4e4e7]">API Key <span className="font-normal text-[#71717a]">({copy.apiKeyOptional})</span></label>
-                          <p className="mb-2 text-[11.5px] text-[#71717a]">{cloudProtocol === "anthropic" ? copy.apiKeyDescAnthropic : copy.apiKeyDescOpenAi}</p>
-                          <input
-                            data-testid="cloud-server-api-key-input"
-                            type="password"
-                            value={draftCloudConfig.apiKey || ""}
-                            onChange={(e) => {
-                              updateCloudDraftServer({ apiKey: e.target.value }, { clearModels: true });
-                            }}
-                            placeholder={cloudApiKeyPlaceholder}
-                            className="w-full rounded-md border border-[#27272a] bg-[#000000] p-2.5 font-mono text-[14px] text-white outline-none theme-ring placeholder:text-[#3f3f46]"
-                          />
-                        </div>
-
-                        <div>
-                          <label className="mb-2 block text-[13px] font-bold text-[#e4e4e7]">{copy.additionalHeaders} <span className="font-normal text-[#71717a]">({copy.optional})</span></label>
-                          <p className="mb-2 text-[11.5px] text-[#71717a]">{copy.additionalHeadersDesc} {language === "zh" ? "例如" : "For example"} {`{"HTTP-Referer":"https://example.com","X-Title":"MAIN"}`}</p>
-                          <textarea
-                            value={draftCloudConfig.customHeaders || ""}
-                            onChange={(e) => {
-                              updateCloudDraftServer({ customHeaders: e.target.value }, { clearModels: true });
-                            }}
-                            placeholder='{"HTTP-Referer":"https://example.com","X-Title":"MAIN"}'
-                            className="min-h-[92px] w-full resize-y rounded-md border border-[#27272a] bg-[#000000] p-2.5 font-mono text-[13px] text-white outline-none theme-ring placeholder:text-[#3f3f46]"
-                          />
-                          {parsedCloudCustomHeaders.error ? (
-                            <p className="mt-2 text-[12px] text-[#f48771]">{parsedCloudCustomHeaders.error}</p>
-                          ) : (
-                            <p className="mt-2 text-[11px] text-[#71717a]">{copy.customHeadersCount(Object.keys(parsedCloudCustomHeaders.headers).length)}</p>
-                          )}
-                        </div>
-                      </div>
-                    </section>
-
-                    <section className="rounded-lg border border-[#27272a] bg-[#000000] p-4">
-                      <div className="mb-4 text-[12px] font-bold uppercase tracking-wider text-[#a1a1aa]">{copy.modelParams}</div>
-                      <div className="space-y-4">
-                        {cloudProtocol === "openai" && cloudApiFormat === "responses" && (
-                          <>
+                        <details
+                          data-testid="cloud-advanced-compatibility"
+                          open={isCloudAdvancedOpen}
+                          onToggle={(e) => setIsCloudAdvancedOpen((e.currentTarget as HTMLDetailsElement).open)}
+                          className="rounded-md border border-[#27272a] bg-[#09090b] p-3"
+                        >
+                          <summary className="cursor-pointer select-none text-[12px] font-bold uppercase tracking-wider text-[#a1a1aa]">
+                            {copy.advancedCompatibility}
+                          </summary>
+                          <p className="mt-2 text-[11.5px] text-[#71717a]">{copy.advancedCompatibilityDesc}</p>
+                          <div className="mt-4 space-y-4">
                             <div>
-                              <label className="mb-1.5 block text-[12px] text-[#a1a1aa]">{copy.reasoningEffort}</label>
-                              <p className="mb-2 text-[11px] text-[#71717a]">{copy.reasoningEffortDesc}</p>
+                              <label className="mb-2 block text-[13px] font-bold text-[#e4e4e7]">{copy.apiEndpoint}</label>
+                              <p className="mb-2 text-[11.5px] text-[#71717a]">{cloudEndpointHint}</p>
+                              <input
+                                data-testid="cloud-server-endpoint-input"
+                                type="text"
+                                value={draftCloudConfig.endpoint || ""}
+                                onChange={(e) => {
+                                  updateCloudDraftServer({ endpoint: e.target.value }, { clearModels: true });
+                                }}
+                                placeholder={cloudEndpointPlaceholder}
+                                className="w-full rounded-md border border-[#27272a] bg-[#000000] p-2.5 font-mono text-[14px] text-white outline-none theme-ring placeholder:text-[#3f3f46]"
+                              />
+                            </div>
+
+                            {cloudProtocol === "openai" && (
+                              <div>
+                                <label className="mb-2 block text-[13px] font-bold text-[#e4e4e7]">{copy.apiFormat}</label>
+                                <p className="mb-2 text-[11.5px] text-[#71717a]">{copy.apiFormatDesc}</p>
+                                <select
+                                  value={cloudApiFormat}
+                                  onChange={handleCloudApiFormatChange}
+                                  className={settingsSelectClass}
+                                >
+                                  <option value="chat_completions">OpenAI Chat Completions</option>
+                                  <option value="responses">OpenAI Responses API</option>
+                                </select>
+                              </div>
+                            )}
+
+                            <div>
+                              <label className="mb-2 block text-[13px] font-bold text-[#e4e4e7]">{copy.toolProtocol}</label>
+                              <p className="mb-2 text-[11.5px] text-[#71717a]">{copy.toolProtocolDesc}</p>
                               <select
-                                value={normalizeOpenAiReasoningEffort(draftCloudConfig.reasoningEffort)}
-                                onChange={(e) => updateCloudDraftServer({ reasoningEffort: normalizeOpenAiReasoningEffort(e.target.value) })}
+                                value={normalizeCloudToolProtocol(draftCloudConfig.toolProtocol)}
+                                onChange={(e) => updateCloudDraftServer({ toolProtocol: normalizeCloudToolProtocol(e.target.value) })}
                                 className={settingsSelectClass}
                               >
-                                <option value="none">None</option>
-                                <option value="minimal">Minimal</option>
-                                <option value="low">Low</option>
-                                <option value="medium">Medium</option>
-                                <option value="high">High</option>
-                                <option value="xhigh">XHigh</option>
+                                <option value="auto">Auto</option>
+                                <option value="native">Native</option>
+                                <option value="xml">XML</option>
                               </select>
                             </div>
 
-                            <label className="flex items-start gap-3 rounded-md border border-[#27272a] bg-[#000000] p-3">
-                              <input
-                                type="checkbox"
-                                checked={draftCloudConfig.disableResponseStorage !== false}
-                                onChange={(e) => updateCloudDraftServer({ disableResponseStorage: e.target.checked })}
-                                className="mt-0.5"
+                            {cloudProtocol === "openai" && cloudApiFormat === "responses" && (
+                              <>
+                                <div>
+                                  <label className="mb-1.5 block text-[12px] text-[#a1a1aa]">{copy.reasoningEffort}</label>
+                                  <p className="mb-2 text-[11px] text-[#71717a]">{copy.reasoningEffortDesc}</p>
+                                  <select
+                                    value={normalizeOpenAiReasoningEffort(draftCloudConfig.reasoningEffort)}
+                                    onChange={(e) => updateCloudDraftServer({ reasoningEffort: normalizeOpenAiReasoningEffort(e.target.value) })}
+                                    className={settingsSelectClass}
+                                  >
+                                    <option value="none">None</option>
+                                    <option value="minimal">Minimal</option>
+                                    <option value="low">Low</option>
+                                    <option value="medium">Medium</option>
+                                    <option value="high">High</option>
+                                    <option value="xhigh">XHigh</option>
+                                  </select>
+                                </div>
+
+                                <label className="flex items-start gap-3 rounded-md border border-[#27272a] bg-[#000000] p-3">
+                                  <input
+                                    type="checkbox"
+                                    checked={draftCloudConfig.disableResponseStorage !== false}
+                                    onChange={(e) => updateCloudDraftServer({ disableResponseStorage: e.target.checked })}
+                                    className="mt-0.5"
+                                  />
+                                  <span className="min-w-0">
+                                    <span className="block text-[12px] font-medium text-[#e4e4e7]">{copy.disableResponseStorage}</span>
+                                    <span className="mt-1 block text-[11px] text-[#71717a]">{copy.disableResponseStorageDesc}</span>
+                                  </span>
+                                </label>
+
+                                <p className="text-[11px] leading-relaxed text-[#71717a]">{cloudAuthMode === "openai_chatgpt_oauth" ? `Codex endpoint: ${OPENAI_CHATGPT_CODEX_ENDPOINT}` : copy.responsesCodexDesc}</p>
+                              </>
+                            )}
+
+                            <div>
+                              <label className="mb-2 block text-[13px] font-bold text-[#e4e4e7]">{copy.additionalHeaders} <span className="font-normal text-[#71717a]">({copy.optional})</span></label>
+                              <p className="mb-2 text-[11.5px] text-[#71717a]">{copy.additionalHeadersDesc} {language === "zh" ? "例如" : "For example"} {`{"HTTP-Referer":"https://example.com","X-Title":"MAIN"}`}</p>
+                              <textarea
+                                value={draftCloudConfig.customHeaders || ""}
+                                onChange={(e) => {
+                                  updateCloudDraftServer({ customHeaders: e.target.value }, { clearModels: true });
+                                }}
+                                placeholder='{"HTTP-Referer":"https://example.com","X-Title":"MAIN"}'
+                                className="min-h-[92px] w-full resize-y rounded-md border border-[#27272a] bg-[#000000] p-2.5 font-mono text-[13px] text-white outline-none theme-ring placeholder:text-[#3f3f46]"
                               />
-                              <span className="min-w-0">
-                                <span className="block text-[12px] font-medium text-[#e4e4e7]">{copy.disableResponseStorage}</span>
-                                <span className="mt-1 block text-[11px] text-[#71717a]">{copy.disableResponseStorageDesc}</span>
-                              </span>
-                            </label>
-
-                            <p className="text-[11px] leading-relaxed text-[#71717a]">{copy.responsesCodexDesc}</p>
-                          </>
-                        )}
-
-                        <div>
-                          <div className="mb-1.5 flex items-center justify-between">
-                            <span className="text-[12px] text-[#a1a1aa]">Temperature</span>
-                            <span className="rounded border theme-subtle-border px-2 py-0.5 font-mono text-[12px] theme-subtle-bg">{(draftCloudConfig.temperature ?? 0.6).toFixed(2)}</span>
+                              {parsedCloudCustomHeaders.error ? (
+                                <p className="mt-2 text-[12px] text-[#f48771]">{parsedCloudCustomHeaders.error}</p>
+                              ) : (
+                                <p className="mt-2 text-[11px] text-[#71717a]">{copy.customHeadersCount(Object.keys(parsedCloudCustomHeaders.headers).length)}</p>
+                              )}
+                            </div>
                           </div>
-                          <p className="mb-2 text-[11px] text-[#71717a]">{copy.temperatureDesc}</p>
-                          <input type="range" min="0" max="2" step="0.05" value={draftCloudConfig.temperature ?? 0.6} onChange={(e) => updateCloudDraftServer({ temperature: parseFloat(e.target.value) })} className="w-full cursor-pointer theme-slider" />
-                          <div className="mt-1 flex justify-between font-mono text-[11px] text-[#3f3f46]">
-                            <span>{copy.tempPrecise}</span><span>1</span><span>{copy.tempCreative}</span>
-                          </div>
-                        </div>
-
-                        <div>
-                          <div className="mb-1.5 flex items-center justify-between">
-                            <span className="text-[12px] text-[#a1a1aa]">Top P</span>
-                            <span className="rounded border theme-subtle-border px-2 py-0.5 font-mono text-[12px] theme-subtle-bg">{(draftCloudConfig.topP ?? 0.95).toFixed(2)}</span>
-                          </div>
-                          <p className="mb-2 text-[11px] text-[#71717a]">{copy.topPDesc}</p>
-                          <input type="range" min="0" max="1" step="0.05" value={draftCloudConfig.topP ?? 0.95} onChange={(e) => updateCloudDraftServer({ topP: parseFloat(e.target.value) })} className="w-full cursor-pointer theme-slider" />
-                          <div className="mt-1 flex justify-between font-mono text-[11px] text-[#3f3f46]">
-                            <span>{copy.topPNarrow}</span><span>0.5</span><span>{copy.topPWide}</span>
-                          </div>
-                        </div>
+                        </details>
                       </div>
                     </section>
                       </>

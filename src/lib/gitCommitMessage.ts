@@ -2,11 +2,15 @@ import {
   buildAnthropicRequestBody,
   buildCloudHeaders,
   buildCloudMessagesApiUrl,
+  buildGeminiGenerateContentUrl,
+  buildGeminiRequestBody,
   buildOpenAiResponsesInputCandidates,
   buildOpenAiResponsesRequestExtras,
   extractAnthropicResponseText,
+  extractGeminiResponseText,
   extractOpenAiResponsesInstructions,
   extractOpenAiResponseText,
+  normalizeCloudAuthMode,
   normalizeCloudApiFormat,
   normalizeCloudProtocol,
   type ProtocolChatMessage,
@@ -33,6 +37,10 @@ interface CommitMessageConfig {
     apiKey?: string;
     customHeaders?: string;
     disableResponseStorage?: boolean;
+    auth?: {
+      mode?: unknown;
+      tokenRef?: string;
+    };
   };
 }
 
@@ -48,6 +56,8 @@ export interface GenerateGitCommitMessageParams {
     headers: Record<string, string>;
     body: Record<string, unknown>;
     isCloud: boolean;
+    authMode?: unknown;
+    tokenRef?: string;
   }) => Promise<unknown>;
 }
 
@@ -177,6 +187,8 @@ async function defaultRequestJson(request: {
   headers: Record<string, string>;
   body: Record<string, unknown>;
   isCloud: boolean;
+  authMode?: unknown;
+  tokenRef?: string;
 }): Promise<unknown> {
   if (request.isCloud) {
     const { invoke } = await import("@tauri-apps/api/core");
@@ -185,6 +197,8 @@ async function defaultRequestJson(request: {
       method: request.method,
       headers: request.headers,
       body: JSON.stringify(request.body),
+      authMode: request.authMode,
+      tokenRef: request.tokenRef,
     });
     return JSON.parse(result);
   }
@@ -226,6 +240,9 @@ async function requestModelCommitMessage(params: GenerateGitCommitMessageParams)
   const cloudProtocol = normalizeCloudProtocol(isCloud ? params.config.cloud?.protocol : "openai");
   const cloudApiFormat = normalizeCloudApiFormat(isCloud ? params.config.cloud?.apiFormat : "chat_completions");
   const isAnthropicCloud = isCloud && cloudProtocol === "anthropic";
+  const isGeminiCloud = isCloud && cloudProtocol === "gemini";
+  const cloudAuthMode = isCloud ? normalizeCloudAuthMode(params.config.cloud?.auth?.mode) : undefined;
+  const cloudTokenRef = isCloud ? params.config.cloud?.auth?.tokenRef : undefined;
   let url = "";
   let body: Record<string, unknown> = {};
   let headers: Record<string, string> = {};
@@ -236,8 +253,12 @@ async function requestModelCommitMessage(params: GenerateGitCommitMessageParams)
     headers = { "Content-Type": "application/json" };
   } else if (isAnthropicCloud) {
     url = buildCloudMessagesApiUrl(endpoint, "anthropic");
-    body = buildAnthropicRequestBody({ messages, model, maxTokens: 80, stream: false, temperature: 0.1, topP: 0.8 });
-    headers = buildCloudHeaders("anthropic", params.config.cloud?.apiKey || "", true, params.config.cloud?.customHeaders);
+    body = buildAnthropicRequestBody({ messages, model, maxTokens: 80, stream: false });
+    headers = buildCloudHeaders("anthropic", params.config.cloud?.apiKey || "", true, params.config.cloud?.customHeaders, cloudAuthMode);
+  } else if (isGeminiCloud) {
+    url = buildGeminiGenerateContentUrl(endpoint, model, false);
+    body = buildGeminiRequestBody({ messages, model, maxTokens: 80 });
+    headers = buildCloudHeaders("gemini", params.config.cloud?.apiKey || "", true, params.config.cloud?.customHeaders, cloudAuthMode);
   } else {
     url = buildCloudMessagesApiUrl(endpoint, "openai", cloudApiFormat);
     body = cloudApiFormat === "responses"
@@ -250,8 +271,8 @@ async function requestModelCommitMessage(params: GenerateGitCommitMessageParams)
             reasoningEffort: "none",
           }),
         }
-      : { model, messages, stream: false, max_tokens: 80, temperature: 0.1, top_p: 0.8 };
-    headers = buildCloudHeaders("openai", isCloud ? params.config.cloud?.apiKey || "" : params.config.local?.apiKey || "", true, isCloud ? params.config.cloud?.customHeaders : undefined);
+      : { model, messages, stream: false, max_tokens: 80 };
+    headers = buildCloudHeaders("openai", isCloud ? params.config.cloud?.apiKey || "" : params.config.local?.apiKey || "", true, isCloud ? params.config.cloud?.customHeaders : undefined, cloudAuthMode);
   }
 
   const requestJson = params.requestJson || defaultRequestJson;
@@ -259,7 +280,7 @@ async function requestModelCommitMessage(params: GenerateGitCommitMessageParams)
     globalThis.setTimeout(() => reject(new Error("Commit message generation timed out")), 6_000);
   });
   const payload = await Promise.race([
-    requestJson({ url, method: "POST", headers, body, isCloud }),
+    requestJson({ url, method: "POST", headers, body, isCloud, authMode: cloudAuthMode, tokenRef: cloudTokenRef }),
     timeout,
   ]);
 
@@ -267,7 +288,9 @@ async function requestModelCommitMessage(params: GenerateGitCommitMessageParams)
     ? String((payload as { message?: { content?: unknown } })?.message?.content || "")
     : isAnthropicCloud
       ? extractAnthropicResponseText(payload)
-      : extractOpenAiResponseText(payload, cloudApiFormat);
+      : isGeminiCloud
+        ? extractGeminiResponseText(payload)
+        : extractOpenAiResponseText(payload, cloudApiFormat);
 
   return sanitizeGitCommitSubject(raw);
 }

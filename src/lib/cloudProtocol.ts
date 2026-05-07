@@ -4,12 +4,28 @@ import {
   type ToolDefinition,
 } from "./toolSchemas";
 
-export type CloudApiProtocol = "openai" | "anthropic";
+export type CloudApiProtocol = "openai" | "anthropic" | "gemini";
 export type OpenAiApiFormat = "chat_completions" | "responses";
 export type OpenAiReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
 export type CloudToolProtocol = "auto" | "native" | "xml";
+export type CloudAuthMode = "api_key" | "openai_chatgpt_oauth" | "gemini_google_oauth";
 
 export const DEFAULT_ANTHROPIC_VERSION = "2023-06-01";
+export const OPENAI_CHATGPT_CODEX_ENDPOINT = "https://chatgpt.com/backend-api/codex/responses";
+export const OPENAI_CHATGPT_EXPERIMENTAL_MODELS = [
+  "gpt-5.5",
+  "gpt-5.4",
+  "gpt-5.4-mini",
+  "gpt-5.3-codex",
+  "gpt-5.3-codex-spark",
+  "gpt-5.2",
+];
+export const GEMINI_EXPERIMENTAL_MODELS = [
+  "gemini-3-pro-preview",
+  "gemini-3-flash-preview",
+  "gemini-2.5-pro",
+  "gemini-2.5-flash",
+];
 
 interface TextContentPart {
   type: "text";
@@ -127,6 +143,14 @@ export interface BuildAnthropicRequestOptions {
   temperature?: number;
   topP?: number;
   tools?: ToolDefinition[];
+}
+
+export interface BuildGeminiRequestOptions {
+  messages: ProtocolChatMessage[];
+  model: string;
+  maxTokens?: number;
+  tools?: ToolDefinition[];
+  stream?: boolean;
 }
 
 export interface AnthropicStreamProcessor {
@@ -258,7 +282,9 @@ function ensureAlternatingAnthropicMessages(messages: AnthropicRequestMessage[])
 }
 
 export function normalizeCloudProtocol(protocol: unknown): CloudApiProtocol {
-  return protocol === "anthropic" ? "anthropic" : "openai";
+  if (protocol === "anthropic") return "anthropic";
+  if (protocol === "gemini") return "gemini";
+  return "openai";
 }
 
 export function normalizeCloudApiFormat(format: unknown): OpenAiApiFormat {
@@ -280,6 +306,11 @@ export function normalizeOpenAiReasoningEffort(value: unknown): OpenAiReasoningE
 
 export function normalizeCloudToolProtocol(value: unknown): CloudToolProtocol {
   return value === "native" || value === "xml" ? value : "auto";
+}
+
+export function normalizeCloudAuthMode(value: unknown): CloudAuthMode {
+  if (value === "openai_chatgpt_oauth" || value === "gemini_google_oauth") return value;
+  return "api_key";
 }
 
 export function getModelInstructionProfile(input: {
@@ -344,6 +375,19 @@ export function getModelInstructionProfile(input: {
     };
   }
 
+  if (protocol === "gemini" || /gemini|google/.test(haystack)) {
+    return {
+      provider: "generic",
+      visibleLanguage: "follow_user",
+      reasoning: "none",
+      toolProtocolPreference: "xml",
+      noiseRules: [
+        "Prefer XML tools for Gemini until native tool compatibility is explicitly enabled.",
+        "Keep visible replies concise and avoid repeating tool call prose.",
+      ],
+    };
+  }
+
   return {
     provider: protocol === "openai" ? "openai" : "generic",
     visibleLanguage: "follow_user",
@@ -371,6 +415,13 @@ export function buildCloudMessagesApiUrl(
     return `${base}/v1/messages`;
   }
 
+  if (protocol === "gemini") {
+    const base = normalized
+      .replace(/\/v1beta\/models\/[^/]+:(?:streamGenerateContent|generateContent)$/i, "")
+      .replace(/\/models\/[^/]+:(?:streamGenerateContent|generateContent)$/i, "");
+    return base.endsWith("/v1beta") ? base : `${base}/v1beta`;
+  }
+
   const normalizedApiFormat = normalizeCloudApiFormat(apiFormat);
   const base = stripOpenAiResponsesPath(stripOpenAiChatPath(normalized));
 
@@ -396,6 +447,15 @@ export function buildCloudModelListCandidates(endpoint: string, protocol: CloudA
     return [`${base}/v1/models`];
   }
 
+  if (protocol === "gemini") {
+    const base = normalized
+      .replace(/\/v1beta\/models\/[^/]+:(?:streamGenerateContent|generateContent)$/i, "")
+      .replace(/\/models\/[^/]+:(?:streamGenerateContent|generateContent)$/i, "");
+    if (normalized.endsWith("/models")) return [normalized];
+    if (base.endsWith("/v1beta")) return [`${base}/models`];
+    return [`${base}/v1beta/models`];
+  }
+
   const base = stripOpenAiChatPath(normalized);
   if (normalized.endsWith("/models")) return [normalized];
   if (base.endsWith("/v1")) {
@@ -409,6 +469,7 @@ export function buildCloudHeaders(
   apiKey: string,
   includeContentType = false,
   customHeadersInput?: unknown,
+  authMode?: CloudAuthMode,
 ): Record<string, string> {
   const headers: Record<string, string> = {};
   if (includeContentType) headers["Content-Type"] = "application/json";
@@ -416,7 +477,13 @@ export function buildCloudHeaders(
   if (protocol === "anthropic") {
     headers["anthropic-version"] = DEFAULT_ANTHROPIC_VERSION;
     if (apiKey) headers["x-api-key"] = apiKey;
-  } else if (apiKey) {
+  } else if (protocol === "gemini") {
+    if (apiKey && normalizeCloudAuthMode(authMode) === "gemini_google_oauth") {
+      headers["Authorization"] = `Bearer ${apiKey}`;
+    } else if (apiKey) {
+      headers["x-goog-api-key"] = apiKey;
+    }
+  } else if (apiKey && normalizeCloudAuthMode(authMode) !== "openai_chatgpt_oauth") {
     headers["Authorization"] = `Bearer ${apiKey}`;
     headers["x-api-key"] = apiKey;
   }
@@ -492,13 +559,36 @@ export function extractCloudModelIds(payload: unknown): string[] {
         const candidate = (item as { id?: unknown; name?: unknown; model?: unknown }).id
           ?? (item as { name?: unknown }).name
           ?? (item as { model?: unknown }).model;
-        return typeof candidate === "string" && candidate.trim() ? candidate : null;
+        if (typeof candidate !== "string" || !candidate.trim()) return null;
+        return candidate.replace(/^models\//, "");
       })
       .filter((id): id is string => typeof id === "string");
     if (extracted.length > 0) return Array.from(new Set(extracted));
   }
 
   return [];
+}
+
+export function extractGeminiResponseText(payload: unknown): string {
+  if (!payload || typeof payload !== "object") return "";
+  const candidates = (payload as { candidates?: unknown }).candidates;
+  if (!Array.isArray(candidates)) return "";
+  return candidates
+    .map((candidate) => {
+      if (!candidate || typeof candidate !== "object") return "";
+      const content = (candidate as { content?: { parts?: unknown } }).content;
+      const parts = content?.parts;
+      if (!Array.isArray(parts)) return "";
+      return parts
+        .map((part) => {
+          if (!part || typeof part !== "object") return "";
+          const text = (part as { text?: unknown }).text;
+          return typeof text === "string" ? text : "";
+        })
+        .join("");
+    })
+    .filter(Boolean)
+    .join("");
 }
 
 export function extractAnthropicResponseText(payload: unknown): string {
@@ -845,6 +935,35 @@ export function buildOpenAiResponsesProbeRequestCandidates(options: {
       ...extras,
     },
   }));
+}
+
+function mapGeminiRole(role: ProtocolChatMessage["role"]): "user" | "model" {
+  return role === "assistant" ? "model" : "user";
+}
+
+export function buildGeminiRequestBody(options: BuildGeminiRequestOptions): Record<string, unknown> {
+  const systemInstruction = extractOpenAiResponsesInstructions(options.messages);
+  const contents = options.messages
+    .filter((message) => message.role !== "system")
+    .map((message) => ({
+      role: mapGeminiRole(message.role),
+      parts: [{ text: extractTextContent(message.content) }],
+    }))
+    .filter((item) => String(item.parts[0].text || "").trim().length > 0);
+
+  const body: Record<string, unknown> = {
+    contents: contents.length > 0 ? contents : [{ role: "user", parts: [{ text: "" }] }],
+  };
+  if (systemInstruction) body.systemInstruction = { parts: [{ text: systemInstruction }] };
+  if (options.maxTokens) body.generationConfig = { maxOutputTokens: options.maxTokens };
+  return body;
+}
+
+export function buildGeminiGenerateContentUrl(endpoint: string, model: string, stream = false): string {
+  const base = buildCloudMessagesApiUrl(endpoint, "gemini");
+  const cleanModel = model.replace(/^models\//, "").trim();
+  const action = stream ? "streamGenerateContent" : "generateContent";
+  return `${base}/models/${encodeURIComponent(cleanModel)}:${action}`;
 }
 
 export function convertOpenAiToolsToResponses(tools: ToolDefinition[] | undefined): Record<string, unknown>[] {

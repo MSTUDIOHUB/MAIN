@@ -1982,6 +1982,7 @@ function seedCloudSettingsModelSelectScenario() {
         reasoningEffort: "none",
         disableResponseStorage: true,
         toolProtocol: "auto",
+        auth: { mode: "api_key", status: "disconnected" },
       }],
       cloud: {
         ...state.config.cloud,
@@ -1994,6 +1995,7 @@ function seedCloudSettingsModelSelectScenario() {
         reasoningEffort: "none",
         disableResponseStorage: true,
         toolProtocol: "auto",
+        auth: { mode: "api_key", status: "disconnected" },
       },
     },
     currentWorkspace: "",
@@ -2130,6 +2132,7 @@ function seedCloudStatusActiveServerModelScenario() {
         reasoningEffort: "none",
         disableResponseStorage: true,
         toolProtocol: "auto",
+        auth: { mode: "api_key", status: "disconnected" },
       }],
       cloud: {
         ...state.config.cloud,
@@ -2139,6 +2142,7 @@ function seedCloudStatusActiveServerModelScenario() {
         endpoint: "https://qwen-gateway.example/v1",
         apiKey: "qwen-key",
         model: "",
+        auth: { mode: "api_key", status: "disconnected" },
       },
     },
     currentWorkspace: "",
@@ -2543,6 +2547,7 @@ function seedCloudToolProtocolScenario(scenario: string) {
     disableResponseStorage: true,
     reasoningEffort: "none" as const,
     toolProtocol: "auto" as const,
+    auth: { mode: "api_key" as const, status: "disconnected" as const },
   };
 
   useAppStore.setState((state) => ({
@@ -2705,6 +2710,7 @@ function seedPlanApprovalExecuteToolsScenario() {
     disableResponseStorage: true,
     reasoningEffort: "none" as const,
     toolProtocol: "auto" as const,
+    auth: { mode: "api_key" as const, status: "disconnected" as const },
   };
 
   useAppStore.setState((state) => ({

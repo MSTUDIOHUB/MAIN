@@ -1,18 +1,23 @@
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use glob::glob;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use rand::{distributions::Alphanumeric, rngs::OsRng, Rng, RngCore};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child as ProcessChild, ChildStdin, Command as ProcessCommand, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_opener::OpenerExt;
 use tiktoken_rs::{cl100k_base, CoreBPE};
 use walkdir::WalkDir;
 
@@ -149,7 +154,12 @@ fn record_debug_log(app: &AppHandle, level: &str, source: &str, message: impl As
 }
 
 #[tauri::command]
-fn append_debug_log(app: AppHandle, level: String, source: String, message: String) -> Result<(), String> {
+fn append_debug_log(
+    app: AppHandle,
+    level: String,
+    source: String,
+    message: String,
+) -> Result<(), String> {
     let payload = DebugLogPayload {
         timestamp: debug_timestamp(),
         level,
@@ -548,7 +558,10 @@ fn canonicalize_workspace_dir(path: &str) -> Result<PathBuf, String> {
         .map_err(|e| format!("无法解析工作区路径: {e}"))
 }
 
-fn resolve_workspace_root(state: &WorkspaceState, workspace: Option<String>) -> Result<PathBuf, String> {
+fn resolve_workspace_root(
+    state: &WorkspaceState,
+    workspace: Option<String>,
+) -> Result<PathBuf, String> {
     match workspace {
         Some(path) if !path.trim().is_empty() => canonicalize_workspace_dir(path.trim()),
         _ => state.get_root(),
@@ -598,13 +611,52 @@ fn ensure_chat_temp_root(session_key: &str) -> Result<PathBuf, String> {
 const CHAT_ATTACHMENT_PREFIX: &str = ".MAIN-chat-attachments";
 
 const SUPPORTED_ATTACHMENT_EXTENSIONS: &[&str] = &[
-    "txt", "md", "markdown",
-    "js", "ts", "tsx", "jsx",
-    "py", "cs", "java", "c", "cpp", "h", "hpp",
-    "json", "yaml", "yml", "toml", "xml", "html", "css", "scss", "less",
-    "sh", "bash", "zsh", "fish", "rs", "go", "rb", "php", "swift", "kt", "dart", "lua",
-    "sql", "graphql", "env", "gitignore", "ignore",
-    "pdf", "docx", "xlsx", "xls", "csv", "tsv",
+    "txt",
+    "md",
+    "markdown",
+    "js",
+    "ts",
+    "tsx",
+    "jsx",
+    "py",
+    "cs",
+    "java",
+    "c",
+    "cpp",
+    "h",
+    "hpp",
+    "json",
+    "yaml",
+    "yml",
+    "toml",
+    "xml",
+    "html",
+    "css",
+    "scss",
+    "less",
+    "sh",
+    "bash",
+    "zsh",
+    "fish",
+    "rs",
+    "go",
+    "rb",
+    "php",
+    "swift",
+    "kt",
+    "dart",
+    "lua",
+    "sql",
+    "graphql",
+    "env",
+    "gitignore",
+    "ignore",
+    "pdf",
+    "docx",
+    "xlsx",
+    "xls",
+    "csv",
+    "tsv",
 ];
 
 const SUPPORTED_IMAGE_ATTACHMENT_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg"];
@@ -706,7 +758,10 @@ fn session_project_id(workspace_root: &str) -> String {
     format!("p_{}", stable_project_hash(&scope))
 }
 
-fn sessions_project_root(app: &AppHandle, workspace: &str) -> Result<(PathBuf, String, String), String> {
+fn sessions_project_root(
+    app: &AppHandle,
+    workspace: &str,
+) -> Result<(PathBuf, String, String), String> {
     let workspace_root = normalize_workspace_for_sessions(workspace);
     let project_id = session_project_id(&workspace_root);
     let data_root = app
@@ -740,7 +795,9 @@ fn session_id_from_object(value: &Value) -> Result<String, String> {
 }
 
 fn session_dir(project_root: &Path, session_id: &str) -> PathBuf {
-    project_root.join("sessions").join(sanitize_session_key(session_id))
+    project_root
+        .join("sessions")
+        .join(sanitize_session_key(session_id))
 }
 
 fn session_index_path(project_root: &Path) -> PathBuf {
@@ -757,8 +814,8 @@ fn write_text_atomic(path: &Path, content: &str) -> Result<(), String> {
 }
 
 fn write_json_atomic(path: &Path, value: &Value) -> Result<(), String> {
-    let content = serde_json::to_string_pretty(value)
-        .map_err(|e| format!("序列化会话记录失败: {e}"))?;
+    let content =
+        serde_json::to_string_pretty(value).map_err(|e| format!("序列化会话记录失败: {e}"))?;
     write_text_atomic(path, &(content + "\n"))
 }
 
@@ -789,8 +846,8 @@ fn read_jsonl_file(path: &Path) -> Result<Vec<Value>, String> {
 fn write_jsonl_atomic(path: &Path, values: &[Value], error_label: &str) -> Result<(), String> {
     let mut lines = String::new();
     for row in values {
-        let line = serde_json::to_string(row)
-            .map_err(|e| format!("序列化{error_label}失败: {e}"))?;
+        let line =
+            serde_json::to_string(row).map_err(|e| format!("序列化{error_label}失败: {e}"))?;
         lines.push_str(&line);
         lines.push('\n');
     }
@@ -870,7 +927,10 @@ fn push_synthetic_turn(
     first_user_prompt.clear();
 }
 
-fn agent_messages_to_synthetic_transcript(agent_messages: Vec<Value>, session_id: &str) -> (Vec<Value>, Vec<Value>) {
+fn agent_messages_to_synthetic_transcript(
+    agent_messages: Vec<Value>,
+    session_id: &str,
+) -> (Vec<Value>, Vec<Value>) {
     let mut messages = Vec::new();
     let mut turns = Vec::new();
     let mut current_turn_id: Option<String> = None;
@@ -1026,7 +1086,10 @@ fn restore_runtime_transcript_fields(runtime: &mut Value, messages: Vec<Value>, 
     }
 }
 
-fn read_jsonl_rows_by_block_ids(path: &Path, block_ids: &HashSet<String>) -> Result<Vec<Value>, String> {
+fn read_jsonl_rows_by_block_ids(
+    path: &Path,
+    block_ids: &HashSet<String>,
+) -> Result<Vec<Value>, String> {
     if !path.exists() || block_ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -1134,10 +1197,21 @@ fn session_detail_status(dir: &Path) -> &'static str {
     }
 }
 
-fn annotate_session_meta(mut meta: Value, project_id: &str, workspace_root: &str, dir: &Path) -> Value {
+fn annotate_session_meta(
+    mut meta: Value,
+    project_id: &str,
+    workspace_root: &str,
+    dir: &Path,
+) -> Value {
     if let Some(object) = meta.as_object_mut() {
-        object.insert("projectId".to_string(), Value::String(project_id.to_string()));
-        object.insert("workspaceRoot".to_string(), Value::String(workspace_root.to_string()));
+        object.insert(
+            "projectId".to_string(),
+            Value::String(project_id.to_string()),
+        );
+        object.insert(
+            "workspaceRoot".to_string(),
+            Value::String(workspace_root.to_string()),
+        );
         object.insert(
             "storageStatus".to_string(),
             Value::String(session_detail_status(dir).to_string()),
@@ -1155,7 +1229,8 @@ fn rebuild_sessions_index_for_project(
     fs::create_dir_all(&sessions_root).map_err(|e| format!("创建会话目录失败: {e}"))?;
 
     let mut sessions = Vec::new();
-    for entry in fs::read_dir(&sessions_root).map_err(|e| format!("读取会话目录失败: {e}"))? {
+    for entry in fs::read_dir(&sessions_root).map_err(|e| format!("读取会话目录失败: {e}"))?
+    {
         let entry = entry.map_err(|e| format!("读取会话目录项失败: {e}"))?;
         let path = entry.path();
         if !path.is_dir() {
@@ -1166,18 +1241,17 @@ fn rebuild_sessions_index_for_project(
             continue;
         }
         let meta = read_json_file(&meta_path)?;
-        sessions.push(annotate_session_meta(meta, project_id, workspace_root, &path));
+        sessions.push(annotate_session_meta(
+            meta,
+            project_id,
+            workspace_root,
+            &path,
+        ));
     }
 
     sessions.sort_by(|a, b| {
-        let a_date = a
-            .get("date")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let b_date = b
-            .get("date")
-            .and_then(Value::as_str)
-            .unwrap_or("");
+        let a_date = a.get("date").and_then(Value::as_str).unwrap_or("");
+        let b_date = b.get("date").and_then(Value::as_str).unwrap_or("");
         b_date.cmp(a_date)
     });
 
@@ -1209,14 +1283,8 @@ fn merge_session_lists(index_sessions: Vec<Value>, disk_sessions: Vec<Value>) ->
     }
     let mut sessions: Vec<Value> = by_id.into_values().collect();
     sessions.sort_by(|a, b| {
-        let a_date = a
-            .get("date")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let b_date = b
-            .get("date")
-            .and_then(Value::as_str)
-            .unwrap_or("");
+        let a_date = a.get("date").and_then(Value::as_str).unwrap_or("");
+        let b_date = b.get("date").and_then(Value::as_str).unwrap_or("");
         b_date.cmp(a_date)
     });
     sessions
@@ -1268,10 +1336,7 @@ fn validate_glob_pattern(pattern: &str) -> Result<(), String> {
     if path.is_absolute() {
         return Err("glob 模式不允许绝对路径".to_string());
     }
-    if path
-        .components()
-        .any(|c| matches!(c, Component::ParentDir))
-    {
+    if path.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err("glob 模式不允许包含 ..".to_string());
     }
     Ok(())
@@ -1328,7 +1393,10 @@ fn should_try_curl_transport_fallback(url: &str, method: &str, error_message: &s
         return false;
     }
 
-    if !(url.contains("/v1/responses") || url.contains("/v1/chat/completions") || url.contains("/v1/messages")) {
+    if !(url.contains("/v1/responses")
+        || url.contains("/v1/chat/completions")
+        || url.contains("/v1/messages"))
+    {
         return false;
     }
 
@@ -1358,9 +1426,13 @@ fn proxy_request_via_curl(
     command.arg("-L");
     command.arg("-X").arg(method);
     command.arg(url);
-    command.arg("--connect-timeout").arg(HTTP_CONNECT_TIMEOUT_SECS.to_string());
+    command
+        .arg("--connect-timeout")
+        .arg(HTTP_CONNECT_TIMEOUT_SECS.to_string());
     let max_time_secs = if method.eq_ignore_ascii_case("POST")
-        && (url.contains("/v1/responses") || url.contains("/v1/chat/completions") || url.contains("/v1/messages"))
+        && (url.contains("/v1/responses")
+            || url.contains("/v1/chat/completions")
+            || url.contains("/v1/messages"))
     {
         MODEL_REQUEST_TIMEOUT_SECS
     } else {
@@ -1370,7 +1442,10 @@ fn proxy_request_via_curl(
     command.arg("-w").arg("\n__HTTP_STATUS__:%{http_code}");
 
     let has_accept_encoding = headers
-        .map(|hdrs| hdrs.keys().any(|key| key.eq_ignore_ascii_case("accept-encoding")))
+        .map(|hdrs| {
+            hdrs.keys()
+                .any(|key| key.eq_ignore_ascii_case("accept-encoding"))
+        })
         .unwrap_or(false);
     if !has_accept_encoding {
         command.arg("-H").arg("Accept-Encoding: identity");
@@ -1446,8 +1521,8 @@ fn grep_file(
     output: &mut String,
     matched: &mut usize,
 ) -> Result<(), String> {
-    let file = File::open(file_path)
-        .map_err(|e| format!("无法读取文件 {}: {e}", file_path.display()))?;
+    let file =
+        File::open(file_path).map_err(|e| format!("无法读取文件 {}: {e}", file_path.display()))?;
     let reader = BufReader::new(file);
 
     for (idx, line_result) in reader.lines().enumerate() {
@@ -1546,8 +1621,7 @@ fn decode_utf8_stream_chunk(pending: &mut Vec<u8>, data: &[u8]) -> String {
                 let valid_up_to = error.valid_up_to();
                 if valid_up_to > 0 {
                     output.push_str(
-                        std::str::from_utf8(&bytes[start..start + valid_up_to])
-                            .unwrap_or_default(),
+                        std::str::from_utf8(&bytes[start..start + valid_up_to]).unwrap_or_default(),
                     );
                 }
 
@@ -1608,7 +1682,9 @@ fn take_tail_chars(text: &str, max_chars: usize) -> (String, bool) {
         return (text.to_string(), false);
     }
     (
-        text.chars().skip(char_count - max_chars).collect::<String>(),
+        text.chars()
+            .skip(char_count - max_chars)
+            .collect::<String>(),
         true,
     )
 }
@@ -1695,16 +1771,16 @@ fn run_workspace_shell_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = process
-        .spawn()
-        .map_err(|e| format!("启动命令失败: {e}"))?;
+    let mut child = process.spawn().map_err(|e| format!("启动命令失败: {e}"))?;
 
-    let stdout_handle = child.stdout.take().map(|stdout| {
-        thread::spawn(move || read_limited_pipe(stdout, COMMAND_OUTPUT_LIMIT_BYTES))
-    });
-    let stderr_handle = child.stderr.take().map(|stderr| {
-        thread::spawn(move || read_limited_pipe(stderr, COMMAND_OUTPUT_LIMIT_BYTES))
-    });
+    let stdout_handle = child
+        .stdout
+        .take()
+        .map(|stdout| thread::spawn(move || read_limited_pipe(stdout, COMMAND_OUTPUT_LIMIT_BYTES)));
+    let stderr_handle = child
+        .stderr
+        .take()
+        .map(|stderr| thread::spawn(move || read_limited_pipe(stderr, COMMAND_OUTPUT_LIMIT_BYTES)));
 
     if let Some(stdin) = child.stdin.as_mut() {
         if let Some(payload) = input.as_ref() {
@@ -2171,25 +2247,23 @@ fn get_git_file_list(
     };
 
     let repo_root = PathBuf::from(repo.trim());
-    let status_output = run_git_process(
-        &repo_root,
-        &["status", "--porcelain=v1"],
-        timeout,
-    )?;
+    let status_output = run_git_process(&repo_root, &["status", "--porcelain=v1"], timeout)?;
 
     if !status_output.success {
         return Ok(Vec::new());
     }
 
     let max_entries = 100;
-    Ok(parse_git_porcelain_entries(&status_output.stdout, filter.as_deref())
-        .into_iter()
-        .take(max_entries)
-        .map(|entry| GitFileEntry {
-            path: entry.path,
-            status: entry.status,
-        })
-        .collect())
+    Ok(
+        parse_git_porcelain_entries(&status_output.stdout, filter.as_deref())
+            .into_iter()
+            .take(max_entries)
+            .map(|entry| GitFileEntry {
+                path: entry.path,
+                status: entry.status,
+            })
+            .collect(),
+    )
 }
 
 fn read_git_head_file(repo_root: &Path, path: &str, timeout: Duration) -> Result<String, String> {
@@ -2282,17 +2356,21 @@ fn get_git_diff(
         .map(|output| output.success)
         .unwrap_or(false);
 
-    Ok(parse_git_porcelain_entries(&status_output.stdout, filter.as_deref())
-        .into_iter()
-        .filter(|entry| {
-            requested_path
-                .as_ref()
-                .map(|path| entry.path == *path || entry.original_path.as_deref() == Some(path.as_str()))
-                .unwrap_or(true)
-        })
-        .take(100)
-        .map(|entry| build_git_diff_entry(&repo_root, entry, has_head, timeout))
-        .collect())
+    Ok(
+        parse_git_porcelain_entries(&status_output.stdout, filter.as_deref())
+            .into_iter()
+            .filter(|entry| {
+                requested_path
+                    .as_ref()
+                    .map(|path| {
+                        entry.path == *path || entry.original_path.as_deref() == Some(path.as_str())
+                    })
+                    .unwrap_or(true)
+            })
+            .take(100)
+            .map(|entry| build_git_diff_entry(&repo_root, entry, has_head, timeout))
+            .collect(),
+    )
 }
 
 #[tauri::command]
@@ -2442,10 +2520,13 @@ fn start_pty_reader_thread(
 
                     let text = decode_utf8_stream_chunk(&mut pending_utf8, data);
                     if !text.is_empty() {
-                        let _ = app.emit("pty-data", PtyDataPayload {
-                            session_key: session_key.clone(),
-                            chunk: text,
-                        });
+                        let _ = app.emit(
+                            "pty-data",
+                            PtyDataPayload {
+                                session_key: session_key.clone(),
+                                chunk: text,
+                            },
+                        );
                     }
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -2485,11 +2566,17 @@ fn set_workspace_root(state: State<WorkspaceState>, path: String) -> Result<Stri
 
 #[tauri::command]
 fn canonicalize_workspace_path(path: String) -> Result<String, String> {
-    Ok(canonicalize_workspace_dir(&path)?.to_string_lossy().to_string())
+    Ok(canonicalize_workspace_dir(&path)?
+        .to_string_lossy()
+        .to_string())
 }
 
 #[tauri::command]
-fn read_file(state: State<WorkspaceState>, path: String, workspace: Option<String>) -> Result<String, String> {
+fn read_file(
+    state: State<WorkspaceState>,
+    path: String,
+    workspace: Option<String>,
+) -> Result<String, String> {
     let workspace = resolve_workspace_root(&state, workspace)?;
     let real_path = resolve_existing_path(&path, &workspace)?;
     fs::read_to_string(real_path).map_err(|e| e.to_string())
@@ -2537,7 +2624,11 @@ fn take_prefix_chars(value: &str, max_chars: usize) -> String {
 }
 
 #[tauri::command]
-fn get_file_metadata(state: State<WorkspaceState>, path: String, workspace: Option<String>) -> Result<FileMetadata, String> {
+fn get_file_metadata(
+    state: State<WorkspaceState>,
+    path: String,
+    workspace: Option<String>,
+) -> Result<FileMetadata, String> {
     let workspace = resolve_workspace_root(&state, workspace)?;
     let real_path = resolve_existing_path(&path, &workspace)?;
     if !real_path.is_file() {
@@ -2632,7 +2723,11 @@ fn read_file_window(
         selected_chars = next_chars;
     }
 
-    let returned_start = if total_lines == 0 || selected.is_empty() { 0 } else { start.min(total_lines) };
+    let returned_start = if total_lines == 0 || selected.is_empty() {
+        0
+    } else {
+        start.min(total_lines)
+    };
     let returned_end = if total_lines == 0 || selected.is_empty() {
         0
     } else {
@@ -2640,10 +2735,14 @@ fn read_file_window(
     };
     let content = selected.join("\n");
     let not_whole_file = returned_start != 1 || returned_end != total_lines;
-    let more_requested_lines = returned_end > 0 && returned_end < requested_end.min(total_lines.max(1));
+    let more_requested_lines =
+        returned_end > 0 && returned_end < requested_end.min(total_lines.max(1));
     let more_file_lines = returned_end > 0 && returned_end < total_lines;
     let truncated = not_whole_file || more_requested_lines || more_file_lines || line_truncated;
-    let next_start_line = if truncated && returned_end > 0 && (more_file_lines || more_requested_lines || line_truncated) {
+    let next_start_line = if truncated
+        && returned_end > 0
+        && (more_file_lines || more_requested_lines || line_truncated)
+    {
         Some(returned_end + 1)
     } else {
         None
@@ -2663,7 +2762,12 @@ fn read_file_window(
 }
 
 #[tauri::command]
-fn write_file(state: State<WorkspaceState>, path: String, content: String, workspace: Option<String>) -> Result<(), String> {
+fn write_file(
+    state: State<WorkspaceState>,
+    path: String,
+    content: String,
+    workspace: Option<String>,
+) -> Result<(), String> {
     let workspace = resolve_workspace_root(&state, workspace)?;
     let real_path = resolve_write_path(&path, &workspace)?;
     if real_path.exists() && real_path.is_dir() {
@@ -2676,7 +2780,11 @@ fn write_file(state: State<WorkspaceState>, path: String, content: String, works
 }
 
 #[tauri::command]
-fn write_chat_temp_file(session_key: String, path: String, content: String) -> Result<String, String> {
+fn write_chat_temp_file(
+    session_key: String,
+    path: String,
+    content: String,
+) -> Result<String, String> {
     let workspace = ensure_chat_temp_root(&session_key)?;
     let real_path = resolve_write_path(&path, &workspace)?;
     if real_path.exists() && real_path.is_dir() {
@@ -2698,7 +2806,9 @@ fn read_chat_temp_file(session_key: String, path: String) -> Result<String, Stri
 
 #[tauri::command]
 fn get_chat_temp_root(session_key: String) -> Result<String, String> {
-    Ok(ensure_chat_temp_root(&session_key)?.to_string_lossy().to_string())
+    Ok(ensure_chat_temp_root(&session_key)?
+        .to_string_lossy()
+        .to_string())
 }
 
 #[derive(Serialize)]
@@ -2712,7 +2822,10 @@ struct AttachmentIngestResult {
 }
 
 #[tauri::command]
-fn ingest_attachment_file(session_key: String, source_path: String) -> Result<AttachmentIngestResult, String> {
+fn ingest_attachment_file(
+    session_key: String,
+    source_path: String,
+) -> Result<AttachmentIngestResult, String> {
     let raw = PathBuf::from(source_path.trim());
     let source = raw
         .canonicalize()
@@ -2778,7 +2891,12 @@ fn ingest_attachment_bytes(
     let relative_path = format!(
         "{}/{}-{}",
         CHAT_ATTACHMENT_PREFIX,
-        stable_project_hash(&format!("{}:{}:{}", display_name, bytes.len(), now_millis())),
+        stable_project_hash(&format!(
+            "{}:{}:{}",
+            display_name,
+            bytes.len(),
+            now_millis()
+        )),
         safe_name,
     );
     let real_path = resolve_write_path(&relative_path, &workspace)?;
@@ -2820,14 +2938,16 @@ fn read_attachment_image_data_url(source_path: String) -> Result<String, String>
 fn list_project_sessions(app: AppHandle, workspace: String) -> Result<Vec<Value>, String> {
     let (project_root, project_id, workspace_root) = sessions_project_root(&app, &workspace)?;
     let index_path = session_index_path(&project_root);
-    let disk_sessions = rebuild_sessions_index_for_project(&project_root, &project_id, &workspace_root)?;
+    let disk_sessions =
+        rebuild_sessions_index_for_project(&project_root, &project_id, &workspace_root)?;
     if index_path.exists() {
         let index = read_json_file(&index_path)?;
         if let Some(sessions) = index.get("sessions").and_then(Value::as_array) {
             let index_sessions = sessions
                 .iter()
                 .map(|session| {
-                    let session_id = session_id_from_object(session).unwrap_or_else(|_| "session".to_string());
+                    let session_id =
+                        session_id_from_object(session).unwrap_or_else(|_| "session".to_string());
                     annotate_session_meta(
                         session.clone(),
                         &project_id,
@@ -2849,7 +2969,11 @@ fn rebuild_project_sessions_index(app: AppHandle, workspace: String) -> Result<V
 }
 
 #[tauri::command]
-fn save_project_session(app: AppHandle, workspace: String, session: Value) -> Result<Value, String> {
+fn save_project_session(
+    app: AppHandle,
+    workspace: String,
+    session: Value,
+) -> Result<Value, String> {
     let (project_root, project_id, workspace_root) = sessions_project_root(&app, &workspace)?;
     let session_id = session_id_from_object(&session)?;
     let dir = session_dir(&project_root, &session_id);
@@ -2859,7 +2983,9 @@ fn save_project_session(app: AppHandle, workspace: String, session: Value) -> Re
         .as_object()
         .cloned()
         .ok_or_else(|| "会话记录必须是对象".to_string())?;
-    let messages = meta.remove("messages").unwrap_or_else(|| Value::Array(Vec::new()));
+    let messages = meta
+        .remove("messages")
+        .unwrap_or_else(|| Value::Array(Vec::new()));
     let mut runtime = meta.remove("runtimeSnapshot");
     let turns = runtime
         .as_ref()
@@ -2903,11 +3029,23 @@ fn save_project_session(app: AppHandle, workspace: String, session: Value) -> Re
     meta.remove("transcriptPartial");
     meta.remove("transcriptLoadedTurns");
     meta.remove("transcriptTotalTurns");
-    meta.insert("turnCount".to_string(), Value::Number(turns_to_write.len().into()));
-    meta.insert("messageCount".to_string(), Value::Number(messages_to_write.len().into()));
+    meta.insert(
+        "turnCount".to_string(),
+        Value::Number(turns_to_write.len().into()),
+    );
+    meta.insert(
+        "messageCount".to_string(),
+        Value::Number(messages_to_write.len().into()),
+    );
     meta.insert("projectId".to_string(), Value::String(project_id.clone()));
-    meta.insert("workspaceRoot".to_string(), Value::String(workspace_root.clone()));
-    meta.insert("updatedAtMs".to_string(), Value::Number(now_millis().into()));
+    meta.insert(
+        "workspaceRoot".to_string(),
+        Value::String(workspace_root.clone()),
+    );
+    meta.insert(
+        "updatedAtMs".to_string(),
+        Value::Number(now_millis().into()),
+    );
     meta.insert("storageStatus".to_string(), Value::String("ok".to_string()));
 
     let meta_value = Value::Object(meta);
@@ -2928,7 +3066,11 @@ fn save_project_session(app: AppHandle, workspace: String, session: Value) -> Re
 }
 
 #[tauri::command]
-fn load_project_session(app: AppHandle, workspace: String, session_id: Value) -> Result<Value, String> {
+fn load_project_session(
+    app: AppHandle,
+    workspace: String,
+    session_id: Value,
+) -> Result<Value, String> {
     let (project_root, project_id, workspace_root) = sessions_project_root(&app, &workspace)?;
     let session_id = session_id_from_value(&session_id)?;
     let dir = session_dir(&project_root, &session_id);
@@ -2980,12 +3122,22 @@ fn load_project_session(app: AppHandle, workspace: String, session_id: Value) ->
         object.insert("workspaceRoot".to_string(), Value::String(workspace_root));
         object.insert(
             "storageStatus".to_string(),
-            Value::String(if messages_missing && runtime_missing { "missing" } else { "ok" }.to_string()),
+            Value::String(
+                if messages_missing && runtime_missing {
+                    "missing"
+                } else {
+                    "ok"
+                }
+                .to_string(),
+            ),
         );
         let message_count = transcript.messages.len();
         let turn_count = transcript.turns.len();
         object.insert("messages".to_string(), Value::Array(transcript.messages));
-        object.insert("messageCount".to_string(), Value::Number(message_count.into()));
+        object.insert(
+            "messageCount".to_string(),
+            Value::Number(message_count.into()),
+        );
         object.insert("turnCount".to_string(), Value::Number(turn_count.into()));
         object.insert(
             "recoveredFromAgentMessages".to_string(),
@@ -3000,7 +3152,11 @@ fn load_project_session(app: AppHandle, workspace: String, session_id: Value) ->
 }
 
 #[tauri::command]
-fn load_project_session_meta(app: AppHandle, workspace: String, session_id: Value) -> Result<Value, String> {
+fn load_project_session_meta(
+    app: AppHandle,
+    workspace: String,
+    session_id: Value,
+) -> Result<Value, String> {
     let (project_root, project_id, workspace_root) = sessions_project_root(&app, &workspace)?;
     let session_id = session_id_from_value(&session_id)?;
     let dir = session_dir(&project_root, &session_id);
@@ -3030,10 +3186,19 @@ fn load_project_session_meta(app: AppHandle, workspace: String, session_id: Valu
     if let Some(object) = session.as_object_mut() {
         object.insert("projectId".to_string(), Value::String(project_id));
         object.insert("workspaceRoot".to_string(), Value::String(workspace_root));
-        object.insert("storageStatus".to_string(), Value::String(session_detail_status(&dir).to_string()));
+        object.insert(
+            "storageStatus".to_string(),
+            Value::String(session_detail_status(&dir).to_string()),
+        );
         object.insert("storageVersion".to_string(), Value::Number(2.into()));
-        object.insert("turnCount".to_string(), Value::Number(transcript.turns.len().into()));
-        object.insert("messageCount".to_string(), Value::Number(transcript.messages.len().into()));
+        object.insert(
+            "turnCount".to_string(),
+            Value::Number(transcript.turns.len().into()),
+        );
+        object.insert(
+            "messageCount".to_string(),
+            Value::Number(transcript.messages.len().into()),
+        );
         object.insert(
             "recoveredFromAgentMessages".to_string(),
             Value::Bool(transcript.recovered_from_agent_messages),
@@ -3103,7 +3268,9 @@ fn load_project_session_page(
     let messages = if messages_path.exists() && !block_ids.is_empty() {
         read_jsonl_rows_by_block_ids(&messages_path, &block_ids)?
     } else {
-        transcript.messages.clone()
+        transcript
+            .messages
+            .clone()
             .into_iter()
             .filter(|value| {
                 let id_key = match value.get("id") {
@@ -3116,7 +3283,8 @@ fn load_project_session_page(
             .collect()
     };
     let messages = if messages.is_empty() && !block_ids.is_empty() {
-        transcript.messages
+        transcript
+            .messages
             .into_iter()
             .filter(|value| {
                 let id_key = match value.get("id") {
@@ -3145,7 +3313,11 @@ fn load_project_session_page(
 }
 
 #[tauri::command]
-fn delete_project_session(app: AppHandle, workspace: String, session_id: Value) -> Result<Vec<Value>, String> {
+fn delete_project_session(
+    app: AppHandle,
+    workspace: String,
+    session_id: Value,
+) -> Result<Vec<Value>, String> {
     let (project_root, project_id, workspace_root) = sessions_project_root(&app, &workspace)?;
     let session_id = session_id_from_value(&session_id)?;
     let dir = session_dir(&project_root, &session_id);
@@ -3187,9 +3359,22 @@ pub struct FileNode {
 }
 
 const LIST_DIRECTORY_IGNORED_DIRS: &[&str] = &[
-    "Library", "Logs", "obj", "bin", ".git", "node_modules",
-    "Temp", "UserSettings", ".vs", "Build", "Builds", "dist",
-    "out", "target", "coverage", "PackageCache",
+    "Library",
+    "Logs",
+    "obj",
+    "bin",
+    ".git",
+    "node_modules",
+    "Temp",
+    "UserSettings",
+    ".vs",
+    "Build",
+    "Builds",
+    "dist",
+    "out",
+    "target",
+    "coverage",
+    "PackageCache",
 ];
 
 fn should_hide_list_directory_entry(name: &str, is_dir: bool) -> bool {
@@ -3237,15 +3422,31 @@ fn list_directory(
 // region: get_project_skeleton 辅助
 
 const SKELETON_WHITELIST_EXT: &[&str] = &[
-    "cs", "asmdef", "asmref", "shader", "hlsl", "compute", "scene",
-    "xlsx", "xls", "csv", "tsv", "pdf", "docx", "doc", "txt", "md", "json",
+    "cs", "asmdef", "asmref", "shader", "hlsl", "compute", "scene", "xlsx", "xls", "csv", "tsv",
+    "pdf", "docx", "doc", "txt", "md", "json",
 ];
 const SKELETON_BLACKLIST_EXT: &[&str] = &[
-    "meta", "png", "fbx", "mat", "anim", "controller", "unitypackage", "asset",
+    "meta",
+    "png",
+    "fbx",
+    "mat",
+    "anim",
+    "controller",
+    "unitypackage",
+    "asset",
 ];
 const SKELETON_IGNORED_DIRS: &[&str] = &[
-    "Library", "Logs", "obj", "bin", ".git", "node_modules",
-    "Temp", "UserSettings", ".vs", "Build", "dist",
+    "Library",
+    "Logs",
+    "obj",
+    "bin",
+    ".git",
+    "node_modules",
+    "Temp",
+    "UserSettings",
+    ".vs",
+    "Build",
+    "dist",
 ];
 const CS_COLLAPSE_THRESHOLD: usize = 12;
 
@@ -3608,18 +3809,26 @@ fn spawn_pty(
     let shared_writer = Arc::new(Mutex::new(writer));
     start_pty_reader_thread(reader, Arc::clone(&shared_buffer), app, key.clone());
 
-    guard.insert(key, PtySession {
-        master: pair.master,
-        writer: shared_writer,
-        buffer: shared_buffer,
-        child,
-    });
+    guard.insert(
+        key,
+        PtySession {
+            master: pair.master,
+            writer: shared_writer,
+            buffer: shared_buffer,
+            child,
+        },
+    );
 
     Ok(())
 }
 
 #[tauri::command]
-fn resize_pty(state: State<PtyManager>, cols: u16, rows: u16, session_key: Option<String>) -> Result<(), String> {
+fn resize_pty(
+    state: State<PtyManager>,
+    cols: u16,
+    rows: u16,
+    session_key: Option<String>,
+) -> Result<(), String> {
     let guard = state
         .sessions
         .lock()
@@ -3640,7 +3849,11 @@ fn resize_pty(state: State<PtyManager>, cols: u16, rows: u16, session_key: Optio
 }
 
 #[tauri::command]
-fn write_pty(state: State<PtyManager>, input: String, session_key: Option<String>) -> Result<(), String> {
+fn write_pty(
+    state: State<PtyManager>,
+    input: String,
+    session_key: Option<String>,
+) -> Result<(), String> {
     let guard = state
         .sessions
         .lock()
@@ -3732,7 +3945,10 @@ fn read_pty_since(
 }
 
 #[tauri::command]
-fn clear_pty_buffer(state: State<PtyManager>, session_key: Option<String>) -> Result<PtyReadResult, String> {
+fn clear_pty_buffer(
+    state: State<PtyManager>,
+    session_key: Option<String>,
+) -> Result<PtyReadResult, String> {
     let guard = state
         .sessions
         .lock()
@@ -3758,7 +3974,10 @@ fn clear_pty_buffer(state: State<PtyManager>, session_key: Option<String>) -> Re
 }
 
 #[tauri::command]
-fn get_pty_status(state: State<PtyManager>, session_key: Option<String>) -> Result<PtyStatus, String> {
+fn get_pty_status(
+    state: State<PtyManager>,
+    session_key: Option<String>,
+) -> Result<PtyStatus, String> {
     let mut guard = state
         .sessions
         .lock()
@@ -3829,6 +4048,997 @@ fn get_system_memory() -> Result<serde_json::Value, String> {
     }))
 }
 
+// region: 云端账号 OAuth 登录与安全存储
+
+const CLOUD_AUTH_FILE_NAME: &str = "cloud-auth.json";
+const CLOUD_AUTH_REFRESH_SKEW_MS: u64 = 60_000;
+const OPENAI_CHATGPT_CODEX_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
+const OPENAI_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const OPENAI_OAUTH_ISSUER: &str = "https://auth.openai.com";
+const OPENAI_OAUTH_PREFERRED_PORT: u16 = 1455;
+const GEMINI_OAUTH_CLIENT_ID: &str =
+    "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com";
+const GEMINI_OAUTH_CLIENT_SECRET: &str = "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";
+const CLOUD_AUTH_KEYCHAIN_SERVICE: &str = "MAIN Cloud Auth";
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CloudAuthPublicStatus {
+    mode: String,
+    status: String,
+    token_ref: Option<String>,
+    account_id: Option<String>,
+    email: Option<String>,
+    expires_at: Option<u64>,
+    storage: Option<String>,
+    message: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CloudAuthBeginResult {
+    session_id: String,
+    provider: String,
+    mode: String,
+    auth_url: String,
+    redirect_uri: String,
+    expires_at: u64,
+    browser_opened: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredCloudToken {
+    provider: String,
+    mode: String,
+    token_ref: String,
+    access_token: String,
+    refresh_token: Option<String>,
+    id_token: Option<String>,
+    expires_at: u64,
+    account_id: Option<String>,
+    email: Option<String>,
+    storage: String,
+    message: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredCloudTokenSecrets {
+    access_token: String,
+    refresh_token: Option<String>,
+    id_token: Option<String>,
+}
+
+#[derive(Default, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CloudAuthStore {
+    records: HashMap<String, StoredCloudToken>,
+}
+
+#[derive(Default, Clone, Debug)]
+struct PendingCloudAuthCallback {
+    code: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingCloudAuth {
+    session_id: String,
+    provider: String,
+    mode: String,
+    server_id: Option<String>,
+    verifier: String,
+    redirect_uri: String,
+    started_at_ms: u64,
+    callback: Arc<Mutex<PendingCloudAuthCallback>>,
+}
+
+static CLOUD_AUTH_PENDING: OnceLock<Mutex<HashMap<String, PendingCloudAuth>>> = OnceLock::new();
+
+fn cloud_auth_pending() -> &'static Mutex<HashMap<String, PendingCloudAuth>> {
+    CLOUD_AUTH_PENDING.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn normalize_cloud_auth_mode(mode: &str) -> &str {
+    match mode {
+        "openai_chatgpt_oauth" => "openai_chatgpt_oauth",
+        "gemini_google_oauth" => "gemini_google_oauth",
+        _ => "api_key",
+    }
+}
+
+fn normalize_cloud_auth_provider(provider: &str, mode: &str) -> String {
+    let normalized = provider.trim().to_ascii_lowercase();
+    if normalized.contains("gemini") || mode == "gemini_google_oauth" {
+        "gemini".to_string()
+    } else {
+        "openai".to_string()
+    }
+}
+
+fn random_urlsafe_bytes(byte_len: usize) -> String {
+    let mut bytes = vec![0u8; byte_len];
+    OsRng.fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn random_pkce_verifier() -> String {
+    (&mut OsRng)
+        .sample_iter(&Alphanumeric)
+        .take(64)
+        .map(char::from)
+        .collect()
+}
+
+fn pkce_challenge(verifier: &str) -> String {
+    let digest = Sha256::digest(verifier.as_bytes());
+    URL_SAFE_NO_PAD.encode(digest)
+}
+
+fn cloud_auth_file_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("解析云端登录存储目录失败: {e}"))?;
+    fs::create_dir_all(&dir).map_err(|e| format!("创建云端登录存储目录失败: {e}"))?;
+    Ok(dir.join(CLOUD_AUTH_FILE_NAME))
+}
+
+fn load_cloud_auth_store(app: &AppHandle) -> Result<CloudAuthStore, String> {
+    let path = cloud_auth_file_path(app)?;
+    if !path.exists() {
+        return Ok(CloudAuthStore::default());
+    }
+    let content = fs::read_to_string(&path).map_err(|e| format!("读取云端登录存储失败: {e}"))?;
+    serde_json::from_str(&content).map_err(|e| format!("解析云端登录存储失败: {e}"))
+}
+
+fn save_cloud_auth_store(app: &AppHandle, store: &CloudAuthStore) -> Result<(), String> {
+    let path = cloud_auth_file_path(app)?;
+    let content =
+        serde_json::to_string_pretty(store).map_err(|e| format!("序列化云端登录存储失败: {e}"))?;
+    write_text_atomic(&path, &(content + "\n"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&path)
+            .map_err(|e| format!("读取云端登录存储权限失败: {e}"))?
+            .permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(&path, permissions)
+            .map_err(|e| format!("设置云端登录存储权限失败: {e}"))?;
+    }
+    Ok(())
+}
+
+fn cloud_token_secrets(record: &StoredCloudToken) -> StoredCloudTokenSecrets {
+    StoredCloudTokenSecrets {
+        access_token: record.access_token.clone(),
+        refresh_token: record.refresh_token.clone(),
+        id_token: record.id_token.clone(),
+    }
+}
+
+fn clear_record_secrets_for_keychain(record: &mut StoredCloudToken) {
+    record.access_token.clear();
+    record.refresh_token = None;
+    record.id_token = None;
+}
+
+fn apply_token_secrets(record: &mut StoredCloudToken, secrets: StoredCloudTokenSecrets) {
+    record.access_token = secrets.access_token;
+    record.refresh_token = secrets.refresh_token;
+    record.id_token = secrets.id_token;
+}
+
+#[cfg(target_os = "macos")]
+fn save_cloud_token_to_keychain(
+    token_ref: &str,
+    secrets: &StoredCloudTokenSecrets,
+) -> Result<(), String> {
+    let payload =
+        serde_json::to_vec(secrets).map_err(|e| format!("序列化 Keychain token 失败: {e}"))?;
+    security_framework::passwords::set_generic_password(
+        CLOUD_AUTH_KEYCHAIN_SERVICE,
+        token_ref,
+        &payload,
+    )
+    .map_err(|e| format!("写入 macOS Keychain 失败: {e}"))?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn save_cloud_token_to_keychain(
+    _token_ref: &str,
+    _secrets: &StoredCloudTokenSecrets,
+) -> Result<(), String> {
+    Err("当前平台没有可用的 OS keychain 适配。".to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn load_cloud_token_from_keychain(token_ref: &str) -> Result<StoredCloudTokenSecrets, String> {
+    let payload =
+        security_framework::passwords::get_generic_password(CLOUD_AUTH_KEYCHAIN_SERVICE, token_ref)
+            .map_err(|e| format!("读取 macOS Keychain 失败: {e}"))?;
+    serde_json::from_slice(&payload).map_err(|e| format!("解析 Keychain token 失败: {e}"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn load_cloud_token_from_keychain(_token_ref: &str) -> Result<StoredCloudTokenSecrets, String> {
+    Err("当前平台没有可用的 OS keychain 适配。".to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn delete_cloud_token_from_keychain(token_ref: &str) -> Result<(), String> {
+    match security_framework::passwords::delete_generic_password(
+        CLOUD_AUTH_KEYCHAIN_SERVICE,
+        token_ref,
+    ) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let message = err.to_string();
+            if message.contains("-25300") || message.contains("ItemNotFound") {
+                Ok(())
+            } else {
+                Err(format!("删除 macOS Keychain token 失败: {err}"))
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn delete_cloud_token_from_keychain(_token_ref: &str) -> Result<(), String> {
+    Ok(())
+}
+
+fn record_with_loaded_secrets(record: &StoredCloudToken) -> Result<StoredCloudToken, String> {
+    if record.storage == "keychain" {
+        let mut loaded = record.clone();
+        let secrets = load_cloud_token_from_keychain(&record.token_ref)?;
+        apply_token_secrets(&mut loaded, secrets);
+        return Ok(loaded);
+    }
+    Ok(record.clone())
+}
+
+fn store_cloud_auth_record(
+    app: &AppHandle,
+    record: &StoredCloudToken,
+) -> Result<StoredCloudToken, String> {
+    let mut persisted = record.clone();
+    let secrets = cloud_token_secrets(record);
+    match save_cloud_token_to_keychain(&record.token_ref, &secrets) {
+        Ok(()) => {
+            clear_record_secrets_for_keychain(&mut persisted);
+            persisted.storage = "keychain".to_string();
+            persisted.message = Some("Stored in the operating system keychain.".to_string());
+        }
+        Err(err) => {
+            persisted.storage = "file".to_string();
+            persisted.message = Some(format!(
+                "Keychain unavailable ({err}); stored in app data with 0600 file permissions."
+            ));
+        }
+    }
+
+    let mut store = load_cloud_auth_store(app)?;
+    store
+        .records
+        .insert(persisted.token_ref.clone(), persisted.clone());
+    save_cloud_auth_store(app, &store)?;
+    Ok(record_with_loaded_secrets(&persisted).unwrap_or(persisted))
+}
+
+fn cloud_auth_status_from_record(record: &StoredCloudToken) -> CloudAuthPublicStatus {
+    let status = if record.expires_at <= now_millis() {
+        "expired"
+    } else {
+        "connected"
+    };
+    CloudAuthPublicStatus {
+        mode: record.mode.clone(),
+        status: status.to_string(),
+        token_ref: Some(record.token_ref.clone()),
+        account_id: record.account_id.clone(),
+        email: record.email.clone(),
+        expires_at: Some(record.expires_at),
+        storage: Some(record.storage.clone()),
+        message: record.message.clone(),
+    }
+}
+
+fn disconnected_cloud_auth_status(mode: &str, message: Option<String>) -> CloudAuthPublicStatus {
+    CloudAuthPublicStatus {
+        mode: normalize_cloud_auth_mode(mode).to_string(),
+        status: "disconnected".to_string(),
+        token_ref: None,
+        account_id: None,
+        email: None,
+        expires_at: None,
+        storage: None,
+        message,
+    }
+}
+
+fn pending_cloud_auth_status(pending: &PendingCloudAuth) -> CloudAuthPublicStatus {
+    CloudAuthPublicStatus {
+        mode: pending.mode.clone(),
+        status: "pending".to_string(),
+        token_ref: pending
+            .server_id
+            .clone()
+            .or_else(|| Some(pending.session_id.clone())),
+        account_id: None,
+        email: None,
+        expires_at: Some(pending.started_at_ms + 5 * 60 * 1000),
+        storage: None,
+        message: Some("Browser authorization is still pending.".to_string()),
+    }
+}
+
+fn parse_jwt_claims(token: &str) -> Option<Value> {
+    let payload = token.split('.').nth(1)?;
+    let decoded = URL_SAFE_NO_PAD
+        .decode(payload)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(payload))
+        .ok()?;
+    serde_json::from_slice(&decoded).ok()
+}
+
+fn extract_openai_account_id(claims: &Value) -> Option<String> {
+    claims
+        .get("chatgpt_account_id")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            claims
+                .get("https://api.openai.com/auth")
+                .and_then(Value::as_object)
+                .and_then(|auth| auth.get("chatgpt_account_id"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            claims
+                .get("organizations")
+                .and_then(Value::as_array)
+                .and_then(|orgs| orgs.first())
+                .and_then(|org| org.get("id"))
+                .and_then(Value::as_str)
+        })
+        .map(str::to_string)
+}
+
+fn extract_claim_string(claims: &Value, key: &str) -> Option<String> {
+    claims.get(key).and_then(Value::as_str).map(str::to_string)
+}
+
+fn build_openai_oauth_url(
+    redirect_uri: &str,
+    challenge: &str,
+    state: &str,
+) -> Result<String, String> {
+    let mut url = url::Url::parse(&format!("{OPENAI_OAUTH_ISSUER}/oauth/authorize"))
+        .map_err(|e| format!("构建 OpenAI 登录地址失败: {e}"))?;
+    url.query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", OPENAI_OAUTH_CLIENT_ID)
+        .append_pair("redirect_uri", redirect_uri)
+        .append_pair("scope", "openid profile email offline_access")
+        .append_pair("code_challenge", challenge)
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("id_token_add_organizations", "true")
+        .append_pair("codex_cli_simplified_flow", "true")
+        .append_pair("originator", "main")
+        .append_pair("state", state);
+    Ok(url.to_string())
+}
+
+fn build_gemini_oauth_url(
+    redirect_uri: &str,
+    challenge: &str,
+    state: &str,
+) -> Result<String, String> {
+    let mut url = url::Url::parse("https://accounts.google.com/o/oauth2/v2/auth")
+        .map_err(|e| format!("构建 Gemini 登录地址失败: {e}"))?;
+    url.query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", GEMINI_OAUTH_CLIENT_ID)
+        .append_pair("redirect_uri", redirect_uri)
+        .append_pair(
+            "scope",
+            "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile",
+        )
+        .append_pair("access_type", "offline")
+        .append_pair("prompt", "consent")
+        .append_pair("code_challenge", challenge)
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("state", state);
+    Ok(url.to_string())
+}
+
+fn bind_oauth_listener(mode: &str) -> Result<(TcpListener, u16), String> {
+    if mode == "openai_chatgpt_oauth" {
+        if let Ok(listener) = TcpListener::bind(("127.0.0.1", OPENAI_OAUTH_PREFERRED_PORT)) {
+            return Ok((listener, OPENAI_OAUTH_PREFERRED_PORT));
+        }
+    }
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .map_err(|e| format!("启动本地登录回调服务失败: {e}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| format!("读取本地登录回调端口失败: {e}"))?
+        .port();
+    Ok((listener, port))
+}
+
+fn oauth_success_html() -> &'static str {
+    "<!doctype html><html><head><meta charset=\"utf-8\"><title>MAIN authorization complete</title></head><body style=\"font-family:system-ui,sans-serif;background:#09090b;color:#f4f4f5;display:grid;place-items:center;min-height:100vh;margin:0\"><main style=\"text-align:center\"><h1>Authorization complete</h1><p>You can close this window and return to MAIN.</p><script>setTimeout(()=>window.close(),1600)</script></main></body></html>"
+}
+
+fn oauth_error_html(message: &str) -> String {
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>MAIN authorization failed</title></head><body style=\"font-family:system-ui,sans-serif;background:#09090b;color:#f4f4f5;display:grid;place-items:center;min-height:100vh;margin:0\"><main style=\"text-align:center;max-width:640px\"><h1 style=\"color:#fca5a5\">Authorization failed</h1><p>{}</p></main></body></html>",
+        message.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;"),
+    )
+}
+
+fn write_oauth_response(stream: &mut std::net::TcpStream, status: &str, body: String) {
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.as_bytes().len(),
+        body,
+    );
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.flush();
+}
+
+fn spawn_oauth_callback_listener(
+    listener: TcpListener,
+    expected_path: String,
+    expected_state: String,
+    callback: Arc<Mutex<PendingCloudAuthCallback>>,
+) {
+    thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut buffer = [0u8; 4096];
+        let read_len = stream.read(&mut buffer).unwrap_or(0);
+        let request = String::from_utf8_lossy(&buffer[..read_len]);
+        let request_target = request
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or("/");
+        let parsed = url::Url::parse(&format!("http://localhost{request_target}"));
+        let mut status = "200 OK";
+        let mut html = oauth_success_html().to_string();
+
+        match parsed {
+            Ok(url) if url.path() == expected_path => {
+                let code = url
+                    .query_pairs()
+                    .find(|(key, _)| key == "code")
+                    .map(|(_, value)| value.to_string());
+                let state = url
+                    .query_pairs()
+                    .find(|(key, _)| key == "state")
+                    .map(|(_, value)| value.to_string());
+                let error = url
+                    .query_pairs()
+                    .find(|(key, _)| key == "error_description")
+                    .or_else(|| url.query_pairs().find(|(key, _)| key == "error"))
+                    .map(|(_, value)| value.to_string());
+                let mut slot = callback
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(message) = error {
+                    slot.error = Some(message.clone());
+                    status = "400 Bad Request";
+                    html = oauth_error_html(&message);
+                } else if state.as_deref() != Some(expected_state.as_str()) {
+                    let message = "Invalid OAuth state.".to_string();
+                    slot.error = Some(message.clone());
+                    status = "400 Bad Request";
+                    html = oauth_error_html(&message);
+                } else if let Some(code) = code {
+                    slot.code = Some(code);
+                } else {
+                    let message = "Missing authorization code.".to_string();
+                    slot.error = Some(message.clone());
+                    status = "400 Bad Request";
+                    html = oauth_error_html(&message);
+                }
+            }
+            _ => {
+                status = "404 Not Found";
+                html = oauth_error_html("Unknown OAuth callback path.");
+            }
+        }
+
+        write_oauth_response(&mut stream, status, html);
+    });
+}
+
+async fn fetch_gemini_userinfo(access_token: &str) -> (Option<String>, Option<String>) {
+    let client = reqwest::Client::new();
+    let result = client
+        .get("https://www.googleapis.com/oauth2/v2/userinfo")
+        .bearer_auth(access_token)
+        .send()
+        .await;
+    let Ok(response) = result else {
+        return (None, None);
+    };
+    let Ok(payload_text) = response.text().await else {
+        return (None, None);
+    };
+    let Ok(payload) = serde_json::from_str::<Value>(&payload_text) else {
+        return (None, None);
+    };
+    (
+        extract_claim_string(&payload, "id").or_else(|| extract_claim_string(&payload, "sub")),
+        extract_claim_string(&payload, "email"),
+    )
+}
+
+async fn exchange_cloud_oauth_code(
+    pending: &PendingCloudAuth,
+    code: &str,
+) -> Result<StoredCloudToken, String> {
+    let token_ref = pending
+        .server_id
+        .clone()
+        .unwrap_or_else(|| pending.session_id.clone());
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(HTTP_CONNECT_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(HTTP_SHORT_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| format!("创建 OAuth 客户端失败: {e}"))?;
+
+    let (token_url, mut form): (String, Vec<(&str, String)>) =
+        if pending.mode == "gemini_google_oauth" {
+            (
+                "https://oauth2.googleapis.com/token".to_string(),
+                vec![
+                    ("grant_type", "authorization_code".to_string()),
+                    ("code", code.to_string()),
+                    ("redirect_uri", pending.redirect_uri.clone()),
+                    ("client_id", GEMINI_OAUTH_CLIENT_ID.to_string()),
+                    ("client_secret", GEMINI_OAUTH_CLIENT_SECRET.to_string()),
+                    ("code_verifier", pending.verifier.clone()),
+                ],
+            )
+        } else {
+            (
+                format!("{OPENAI_OAUTH_ISSUER}/oauth/token"),
+                vec![
+                    ("grant_type", "authorization_code".to_string()),
+                    ("code", code.to_string()),
+                    ("redirect_uri", pending.redirect_uri.clone()),
+                    ("client_id", OPENAI_OAUTH_CLIENT_ID.to_string()),
+                    ("code_verifier", pending.verifier.clone()),
+                ],
+            )
+        };
+
+    let response = client
+        .post(&token_url)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .form(&form)
+        .send()
+        .await
+        .map_err(|e| format!("OAuth token exchange failed: {e}"))?;
+    let status = response.status();
+    let payload_text = response
+        .text()
+        .await
+        .map_err(|e| format!("读取 OAuth token 响应失败: {e}"))?;
+    let payload = serde_json::from_str::<Value>(&payload_text)
+        .map_err(|e| format!("解析 OAuth token 响应失败: {e}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "OAuth token exchange failed: HTTP {status}: {}",
+            payload
+        ));
+    }
+
+    let access_token = payload
+        .get("access_token")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "OAuth token 响应缺少 access_token".to_string())?
+        .to_string();
+    let refresh_token = payload
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let id_token = payload
+        .get("id_token")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let expires_in = payload
+        .get("expires_in")
+        .and_then(Value::as_u64)
+        .unwrap_or(3600);
+    let expires_at = now_millis().saturating_add(expires_in.saturating_mul(1000));
+
+    let mut account_id = None;
+    let mut email = None;
+    if pending.mode == "openai_chatgpt_oauth" {
+        if let Some(claims) = id_token.as_deref().and_then(parse_jwt_claims) {
+            account_id = extract_openai_account_id(&claims);
+            email = extract_claim_string(&claims, "email");
+        }
+        if account_id.is_none() {
+            if let Some(claims) = parse_jwt_claims(&access_token) {
+                account_id = extract_openai_account_id(&claims);
+                if email.is_none() {
+                    email = extract_claim_string(&claims, "email");
+                }
+            }
+        }
+    } else {
+        if let Some(claims) = id_token.as_deref().and_then(parse_jwt_claims) {
+            account_id = extract_claim_string(&claims, "sub");
+            email = extract_claim_string(&claims, "email");
+        }
+        let (userinfo_id, userinfo_email) = fetch_gemini_userinfo(&access_token).await;
+        if account_id.is_none() {
+            account_id = userinfo_id;
+        }
+        if email.is_none() {
+            email = userinfo_email;
+        }
+    }
+
+    form.clear();
+    Ok(StoredCloudToken {
+        provider: pending.provider.clone(),
+        mode: pending.mode.clone(),
+        token_ref,
+        access_token,
+        refresh_token,
+        id_token,
+        expires_at,
+        account_id,
+        email,
+        storage: "file".to_string(),
+        message: None,
+    })
+}
+
+async fn refresh_stored_cloud_token(
+    app: &AppHandle,
+    token_ref: &str,
+    force: bool,
+) -> Result<StoredCloudToken, String> {
+    let mut store = load_cloud_auth_store(app)?;
+    let stored_record = store
+        .records
+        .get(token_ref)
+        .cloned()
+        .ok_or_else(|| "未找到云端登录 token，请重新登录。".to_string())?;
+    let mut record = record_with_loaded_secrets(&stored_record)?;
+    if !force && record.expires_at > now_millis().saturating_add(CLOUD_AUTH_REFRESH_SKEW_MS) {
+        return Ok(record);
+    }
+    let refresh_token = record
+        .refresh_token
+        .clone()
+        .ok_or_else(|| "当前登录没有 refresh token，请重新登录。".to_string())?;
+
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(HTTP_CONNECT_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(HTTP_SHORT_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| format!("创建 OAuth 刷新客户端失败: {e}"))?;
+
+    let (token_url, form): (String, Vec<(&str, String)>) = if record.mode == "gemini_google_oauth" {
+        (
+            "https://oauth2.googleapis.com/token".to_string(),
+            vec![
+                ("grant_type", "refresh_token".to_string()),
+                ("refresh_token", refresh_token),
+                ("client_id", GEMINI_OAUTH_CLIENT_ID.to_string()),
+                ("client_secret", GEMINI_OAUTH_CLIENT_SECRET.to_string()),
+            ],
+        )
+    } else {
+        (
+            format!("{OPENAI_OAUTH_ISSUER}/oauth/token"),
+            vec![
+                ("grant_type", "refresh_token".to_string()),
+                ("refresh_token", refresh_token),
+                ("client_id", OPENAI_OAUTH_CLIENT_ID.to_string()),
+            ],
+        )
+    };
+
+    let response = client
+        .post(&token_url)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .form(&form)
+        .send()
+        .await
+        .map_err(|e| format!("OAuth token refresh failed: {e}"))?;
+    let status = response.status();
+    let payload_text = response
+        .text()
+        .await
+        .map_err(|e| format!("读取 OAuth 刷新响应失败: {e}"))?;
+    let payload = serde_json::from_str::<Value>(&payload_text)
+        .map_err(|e| format!("解析 OAuth 刷新响应失败: {e}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "OAuth token refresh failed: HTTP {status}: {}",
+            payload
+        ));
+    }
+
+    if let Some(access_token) = payload.get("access_token").and_then(Value::as_str) {
+        record.access_token = access_token.to_string();
+    }
+    if let Some(refresh_token) = payload.get("refresh_token").and_then(Value::as_str) {
+        record.refresh_token = Some(refresh_token.to_string());
+    }
+    if let Some(id_token) = payload.get("id_token").and_then(Value::as_str) {
+        record.id_token = Some(id_token.to_string());
+    }
+    let expires_in = payload
+        .get("expires_in")
+        .and_then(Value::as_u64)
+        .unwrap_or(3600);
+    record.expires_at = now_millis().saturating_add(expires_in.saturating_mul(1000));
+
+    if record.mode == "openai_chatgpt_oauth" {
+        if let Some(claims) = record.id_token.as_deref().and_then(parse_jwt_claims) {
+            record.account_id = extract_openai_account_id(&claims).or(record.account_id);
+            record.email = extract_claim_string(&claims, "email").or(record.email);
+        }
+    }
+
+    let mut persisted = record.clone();
+    if stored_record.storage == "keychain" {
+        save_cloud_token_to_keychain(token_ref, &cloud_token_secrets(&record))?;
+        clear_record_secrets_for_keychain(&mut persisted);
+        persisted.storage = "keychain".to_string();
+        persisted.message = Some("Stored in the operating system keychain.".to_string());
+    }
+    store.records.insert(token_ref.to_string(), persisted);
+    save_cloud_auth_store(app, &store)?;
+    Ok(record)
+}
+
+async fn valid_cloud_oauth_token(
+    app: &AppHandle,
+    token_ref: &str,
+) -> Result<StoredCloudToken, String> {
+    refresh_stored_cloud_token(app, token_ref, false).await
+}
+
+#[tauri::command]
+async fn cloud_auth_begin(
+    app: AppHandle,
+    provider: String,
+    mode: String,
+    server_id: Option<String>,
+) -> Result<CloudAuthBeginResult, String> {
+    let mode = normalize_cloud_auth_mode(&mode).to_string();
+    if mode == "api_key" {
+        return Err("API Key 模式不需要浏览器登录。".to_string());
+    }
+    let provider = normalize_cloud_auth_provider(&provider, &mode);
+    let (listener, port) = bind_oauth_listener(&mode)?;
+    let callback_path = if mode == "gemini_google_oauth" {
+        "/oauth2callback"
+    } else {
+        "/auth/callback"
+    };
+    let host = if mode == "openai_chatgpt_oauth" {
+        "localhost"
+    } else {
+        "127.0.0.1"
+    };
+    let redirect_uri = format!("http://{host}:{port}{callback_path}");
+    let verifier = random_pkce_verifier();
+    let challenge = pkce_challenge(&verifier);
+    let state = random_urlsafe_bytes(32);
+    let auth_url = if mode == "gemini_google_oauth" {
+        build_gemini_oauth_url(&redirect_uri, &challenge, &state)?
+    } else {
+        build_openai_oauth_url(&redirect_uri, &challenge, &state)?
+    };
+    let session_id = format!("cloud-auth-{}", random_urlsafe_bytes(18));
+    let callback = Arc::new(Mutex::new(PendingCloudAuthCallback::default()));
+    spawn_oauth_callback_listener(listener, callback_path.to_string(), state, callback.clone());
+
+    let pending = PendingCloudAuth {
+        session_id: session_id.clone(),
+        provider: provider.clone(),
+        mode: mode.clone(),
+        server_id,
+        verifier,
+        redirect_uri: redirect_uri.clone(),
+        started_at_ms: now_millis(),
+        callback,
+    };
+    {
+        let mut pending_map = cloud_auth_pending()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pending_map.insert(session_id.clone(), pending);
+    }
+
+    let browser_opened = match app.opener().open_url(auth_url.clone(), None::<&str>) {
+        Ok(_) => true,
+        Err(err) => {
+            record_debug_log(
+                &app,
+                "warn",
+                "cloud_auth",
+                format!("open_browser_failed mode={} err={}", mode, err),
+            );
+            false
+        }
+    };
+
+    Ok(CloudAuthBeginResult {
+        session_id,
+        provider,
+        mode,
+        auth_url,
+        redirect_uri,
+        expires_at: now_millis() + 5 * 60 * 1000,
+        browser_opened,
+    })
+}
+
+#[tauri::command]
+async fn cloud_auth_finish(
+    app: AppHandle,
+    session_id: String,
+    server_id: Option<String>,
+) -> Result<CloudAuthPublicStatus, String> {
+    let pending = {
+        let pending_map = cloud_auth_pending()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pending_map.get(&session_id).cloned()
+    }
+    .ok_or_else(|| "登录会话不存在或已结束，请重新开始登录。".to_string())?;
+
+    let callback_state = pending
+        .callback
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+
+    if let Some(error) = callback_state.error {
+        let mut pending_map = cloud_auth_pending()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pending_map.remove(&session_id);
+        return Ok(CloudAuthPublicStatus {
+            mode: pending.mode,
+            status: "error".to_string(),
+            token_ref: None,
+            account_id: None,
+            email: None,
+            expires_at: None,
+            storage: None,
+            message: Some(error),
+        });
+    }
+
+    let Some(code) = callback_state.code else {
+        return Ok(pending_cloud_auth_status(&pending));
+    };
+
+    let mut pending_for_exchange = pending.clone();
+    if pending_for_exchange.server_id.is_none() {
+        pending_for_exchange.server_id = server_id;
+    }
+    let record = exchange_cloud_oauth_code(&pending_for_exchange, &code).await?;
+    let record = store_cloud_auth_record(&app, &record)?;
+
+    {
+        let mut pending_map = cloud_auth_pending()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pending_map.remove(&session_id);
+    }
+
+    Ok(cloud_auth_status_from_record(&record))
+}
+
+#[tauri::command]
+fn cloud_auth_status(app: AppHandle, server_id: String) -> Result<CloudAuthPublicStatus, String> {
+    let store = load_cloud_auth_store(&app)?;
+    let Some(record) = store.records.get(&server_id) else {
+        return Ok(disconnected_cloud_auth_status("api_key", None));
+    };
+    Ok(cloud_auth_status_from_record(record))
+}
+
+#[tauri::command]
+fn cloud_auth_logout(app: AppHandle, server_id: String) -> Result<CloudAuthPublicStatus, String> {
+    let mut store = load_cloud_auth_store(&app)?;
+    let removed = store.records.remove(&server_id);
+    let keychain_error = removed
+        .as_ref()
+        .filter(|record| record.storage == "keychain")
+        .and_then(|_| delete_cloud_token_from_keychain(&server_id).err());
+    save_cloud_auth_store(&app, &store)?;
+    Ok(disconnected_cloud_auth_status(
+        removed
+            .as_ref()
+            .map(|record| record.mode.as_str())
+            .unwrap_or("api_key"),
+        Some(keychain_error.unwrap_or_else(|| "Logged out.".to_string())),
+    ))
+}
+
+async fn prepare_cloud_auth_request(
+    app: &AppHandle,
+    url: String,
+    headers: Option<HashMap<String, String>>,
+    auth_mode: Option<String>,
+    token_ref: Option<String>,
+) -> Result<(String, HashMap<String, String>), String> {
+    let mode = auth_mode
+        .as_deref()
+        .map(normalize_cloud_auth_mode)
+        .unwrap_or("api_key");
+    let mut next_url = url;
+    let mut next_headers = headers.unwrap_or_default();
+    if mode == "api_key" {
+        return Ok((next_url, next_headers));
+    }
+
+    let token_ref = token_ref
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "当前云端配置缺少 OAuth token 引用，请重新登录。".to_string())?;
+    let token = valid_cloud_oauth_token(app, &token_ref).await?;
+
+    if mode == "openai_chatgpt_oauth" {
+        next_headers.retain(|key, _| {
+            let key = key.to_ascii_lowercase();
+            key != "authorization" && key != "x-api-key"
+        });
+        next_headers.insert(
+            "Authorization".to_string(),
+            format!("Bearer {}", token.access_token),
+        );
+        if let Some(account_id) = token
+            .account_id
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            next_headers.insert("ChatGPT-Account-Id".to_string(), account_id.clone());
+        }
+        if next_url.contains("/v1/responses")
+            || next_url.contains("/responses")
+            || next_url.contains("/v1/chat/completions")
+            || next_url.contains("/chat/completions")
+        {
+            next_url = OPENAI_CHATGPT_CODEX_ENDPOINT.to_string();
+        }
+    } else if mode == "gemini_google_oauth" {
+        next_headers.retain(|key, _| {
+            let key = key.to_ascii_lowercase();
+            key != "authorization" && key != "x-goog-api-key"
+        });
+        next_headers.insert(
+            "Authorization".to_string(),
+            format!("Bearer {}", token.access_token),
+        );
+    }
+
+    Ok((next_url, next_headers))
+}
+
+// endregion
+
 #[tauri::command]
 fn count_tokens(text: String) -> Result<usize, String> {
     let tokenizer = get_tokenizer()?;
@@ -3837,8 +5047,10 @@ fn count_tokens(text: String) -> Result<usize, String> {
 
 /// Proxy an HTTP request through the Rust backend (bypasses WebView CORS).
 /// Uses async reqwest with a timeout — prevents UI freeze during model discovery.
-static PROXY_REQUEST_CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static PROXY_REQUEST_ABORT: std::sync::Mutex<Option<futures_util::future::AbortHandle>> = std::sync::Mutex::new(None);
+static PROXY_REQUEST_CANCEL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static PROXY_REQUEST_ABORT: std::sync::Mutex<Option<futures_util::future::AbortHandle>> =
+    std::sync::Mutex::new(None);
 
 fn set_proxy_abort_handle(handle: Option<futures_util::future::AbortHandle>) {
     if let Ok(mut slot) = PROXY_REQUEST_ABORT.lock() {
@@ -3847,13 +5059,25 @@ fn set_proxy_abort_handle(handle: Option<futures_util::future::AbortHandle>) {
 }
 
 #[tauri::command]
-async fn proxy_request(app: AppHandle, url: String, method: String, headers: Option<std::collections::HashMap<String, String>>, body: Option<String>) -> Result<String, String> {
+async fn proxy_request(
+    app: AppHandle,
+    url: String,
+    method: String,
+    headers: Option<std::collections::HashMap<String, String>>,
+    body: Option<String>,
+    auth_mode: Option<String>,
+    token_ref: Option<String>,
+) -> Result<String, String> {
+    let (url, headers) =
+        prepare_cloud_auth_request(&app, url, headers, auth_mode, token_ref).await?;
     PROXY_REQUEST_CANCEL.store(false, std::sync::atomic::Ordering::Relaxed);
     let meth = method.to_uppercase();
     let body_for_debug = body.clone();
     let request_started_at = std::time::Instant::now();
 
-    let is_model_request = url.contains("/v1/chat/completions") || url.contains("/v1/responses") || url.contains("/v1/messages");
+    let is_model_request = url.contains("/v1/chat/completions")
+        || url.contains("/v1/responses")
+        || url.contains("/v1/messages");
     let request_timeout_secs = if meth == "POST" && is_model_request {
         MODEL_REQUEST_TIMEOUT_SECS
     } else {
@@ -3882,17 +5106,15 @@ async fn proxy_request(app: AppHandle, url: String, method: String, headers: Opt
         req = req.header("Accept-Encoding", "identity");
     }
 
-    if let Some(hdrs) = &headers {
-        for (key, value) in hdrs {
-            req = req.header(key.as_str(), value.as_str());
-        }
+    for (key, value) in &headers {
+        req = req.header(key.as_str(), value.as_str());
     }
 
-    if url.contains("/v1/chat/completions") || url.contains("/v1/responses") || url.contains("/v1/messages") {
-        let mut debug_parts = vec![
-            format!("method={meth}"),
-            format!("url={url}"),
-        ];
+    if url.contains("/v1/chat/completions")
+        || url.contains("/v1/responses")
+        || url.contains("/v1/messages")
+    {
+        let mut debug_parts = vec![format!("method={meth}"), format!("url={url}")];
 
         if let Some(body_str) = &body_for_debug {
             if let Ok(json) = serde_json::from_str::<Value>(body_str) {
@@ -3912,7 +5134,8 @@ async fn proxy_request(app: AppHandle, url: String, method: String, headers: Opt
                             debug_parts.push(format!("first_input_role={role}"));
                         }
                         if let Some(content) = first.get("content").and_then(Value::as_array) {
-                            debug_parts.push(format!("first_input_content_parts={}", content.len()));
+                            debug_parts
+                                .push(format!("first_input_content_parts={}", content.len()));
                         } else if first.get("content").is_some() {
                             debug_parts.push("first_input_content=scalar".to_string());
                         }
@@ -3956,7 +5179,8 @@ async fn proxy_request(app: AppHandle, url: String, method: String, headers: Opt
     let (abort_handle, abort_registration) = futures_util::future::AbortHandle::new_pair();
     set_proxy_abort_handle(Some(abort_handle));
 
-    let response = match futures_util::future::Abortable::new(req.send(), abort_registration).await {
+    let response = match futures_util::future::Abortable::new(req.send(), abort_registration).await
+    {
         Err(_) => {
             set_proxy_abort_handle(None);
             return Err("Aborted".to_string());
@@ -3977,10 +5201,17 @@ async fn proxy_request(app: AppHandle, url: String, method: String, headers: Opt
             if is_model_request {
                 record_debug_log(
                     &app,
-                    if should_retry_transport { "warn" } else { "error" },
+                    if should_retry_transport {
+                        "warn"
+                    } else {
+                        "error"
+                    },
                     "proxy_request",
                     if should_retry_transport {
-                        format!("primary_transport_failed url={} err={} trying_curl_fallback=true", url, msg)
+                        format!(
+                            "primary_transport_failed url={} err={} trying_curl_fallback=true",
+                            url, msg
+                        )
                     } else {
                         format!("request_failed url={} err={}", url, msg)
                     },
@@ -3988,10 +5219,25 @@ async fn proxy_request(app: AppHandle, url: String, method: String, headers: Opt
             }
 
             if should_retry_transport {
-                record_debug_log(&app, "warn", "proxy_request", format!("primary failed, trying curl fallback: {}", url));
-                match proxy_request_via_curl(&url, &meth, headers.as_ref(), body_for_debug.as_deref()) {
+                record_debug_log(
+                    &app,
+                    "warn",
+                    "proxy_request",
+                    format!("primary failed, trying curl fallback: {}", url),
+                );
+                match proxy_request_via_curl(&url, &meth, Some(&headers), body_for_debug.as_deref())
+                {
                     Ok(result) => {
-                        record_debug_log(&app, "info", "proxy_request", format!("recovered_by=curl url={} elapsed_ms={}", url, request_started_at.elapsed().as_millis()));
+                        record_debug_log(
+                            &app,
+                            "info",
+                            "proxy_request",
+                            format!(
+                                "recovered_by=curl url={} elapsed_ms={}",
+                                url,
+                                request_started_at.elapsed().as_millis()
+                            ),
+                        );
                         return Ok(result);
                     }
                     Err(curl_err) => {
@@ -4022,22 +5268,19 @@ async fn proxy_request(app: AppHandle, url: String, method: String, headers: Opt
             let error_excerpt = error_body.chars().take(240).collect::<String>();
             record_debug_log(
                 &app,
-                if should_retry_via_curl { "warn" } else { "error" },
+                if should_retry_via_curl {
+                    "warn"
+                } else {
+                    "error"
+                },
                 "proxy_request",
                 if should_retry_via_curl {
                     format!(
                         "primary_status_failed status={} url={} body={} trying_curl_fallback=true",
-                        status,
-                        url,
-                        error_excerpt,
+                        status, url, error_excerpt,
                     )
                 } else {
-                    format!(
-                        "error status={} url={} body={}",
-                        status,
-                        url,
-                        error_excerpt,
-                    )
+                    format!("error status={} url={} body={}", status, url, error_excerpt,)
                 },
             );
         }
@@ -4049,18 +5292,31 @@ async fn proxy_request(app: AppHandle, url: String, method: String, headers: Opt
                 "proxy_request",
                 format!(
                     "fallback_decision status={} url={} use_curl={}",
-                    status,
-                    url,
-                    should_retry_via_curl,
+                    status, url, should_retry_via_curl,
                 ),
             );
         }
 
         if should_retry_via_curl {
-            record_debug_log(&app, "warn", "proxy_request", format!("primary failed, trying curl fallback: {}", url));
-            match proxy_request_via_curl(&url, &meth, headers.as_ref(), body_for_debug.as_deref()) {
+            record_debug_log(
+                &app,
+                "warn",
+                "proxy_request",
+                format!("primary failed, trying curl fallback: {}", url),
+            );
+            match proxy_request_via_curl(&url, &meth, Some(&headers), body_for_debug.as_deref()) {
                 Ok(result) => {
-                    record_debug_log(&app, "info", "proxy_request", format!("recovered_by=curl status={} url={} elapsed_ms={}", status, url, request_started_at.elapsed().as_millis()));
+                    record_debug_log(
+                        &app,
+                        "info",
+                        "proxy_request",
+                        format!(
+                            "recovered_by=curl status={} url={} elapsed_ms={}",
+                            status,
+                            url,
+                            request_started_at.elapsed().as_millis()
+                        ),
+                    );
                     return Ok(result);
                 }
                 Err(curl_err) => {
@@ -4080,15 +5336,25 @@ async fn proxy_request(app: AppHandle, url: String, method: String, headers: Opt
             }
         }
 
-        return Err(format!("HTTP {}: {}", status, error_body.chars().take(500).collect::<String>()));
+        return Err(format!(
+            "HTTP {}: {}",
+            status,
+            error_body.chars().take(500).collect::<String>()
+        ));
     }
 
     if PROXY_REQUEST_CANCEL.load(std::sync::atomic::Ordering::Relaxed) {
         return Err("Aborted".to_string());
     }
-    let (text_abort_handle, text_abort_registration) = futures_util::future::AbortHandle::new_pair();
+    let (text_abort_handle, text_abort_registration) =
+        futures_util::future::AbortHandle::new_pair();
     set_proxy_abort_handle(Some(text_abort_handle));
-    let text_result = match futures_util::future::Abortable::new(response.text(), text_abort_registration).await {
+    let text_result = match futures_util::future::Abortable::new(
+        response.text(),
+        text_abort_registration,
+    )
+    .await
+    {
         Err(_) => {
             set_proxy_abort_handle(None);
             return Err("Aborted".to_string());
@@ -4111,17 +5377,35 @@ async fn proxy_request(app: AppHandle, url: String, method: String, headers: Opt
                     if should_retry_read { "warn" } else { "error" },
                     "proxy_request",
                     if should_retry_read {
-                        format!("primary_read_failed url={} err={} trying_curl_fallback=true", url, msg)
+                        format!(
+                            "primary_read_failed url={} err={} trying_curl_fallback=true",
+                            url, msg
+                        )
                     } else {
                         format!("read_failed url={} err={}", url, msg)
                     },
                 );
             }
             if should_retry_read {
-                record_debug_log(&app, "warn", "proxy_request", format!("primary failed, trying curl fallback: {}", url));
-                match proxy_request_via_curl(&url, &meth, headers.as_ref(), body_for_debug.as_deref()) {
+                record_debug_log(
+                    &app,
+                    "warn",
+                    "proxy_request",
+                    format!("primary failed, trying curl fallback: {}", url),
+                );
+                match proxy_request_via_curl(&url, &meth, Some(&headers), body_for_debug.as_deref())
+                {
                     Ok(result) => {
-                        record_debug_log(&app, "info", "proxy_request", format!("recovered_by=curl url={} elapsed_ms={}", url, request_started_at.elapsed().as_millis()));
+                        record_debug_log(
+                            &app,
+                            "info",
+                            "proxy_request",
+                            format!(
+                                "recovered_by=curl url={} elapsed_ms={}",
+                                url,
+                                request_started_at.elapsed().as_millis()
+                            ),
+                        );
                         return Ok(result);
                     }
                     Err(curl_err) => {
@@ -4132,8 +5416,21 @@ async fn proxy_request(app: AppHandle, url: String, method: String, headers: Opt
             return Err(format!("读取响应失败: {msg}"));
         }
     };
-    if url.contains("/v1/chat/completions") || url.contains("/v1/responses") || url.contains("/v1/messages") {
-        record_debug_log(&app, "info", "proxy_request", format!("success status={} url={} elapsed_ms={}", status, url, request_started_at.elapsed().as_millis()));
+    if url.contains("/v1/chat/completions")
+        || url.contains("/v1/responses")
+        || url.contains("/v1/messages")
+    {
+        record_debug_log(
+            &app,
+            "info",
+            "proxy_request",
+            format!(
+                "success status={} url={} elapsed_ms={}",
+                status,
+                url,
+                request_started_at.elapsed().as_millis()
+            ),
+        );
     }
     Ok(text)
 }
@@ -4155,7 +5452,8 @@ fn cancel_proxy_request() -> Result<(), String> {
 
 /// Global cancellation token for the active chat stream.
 static STREAM_CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static STREAM_ABORT: std::sync::Mutex<Option<futures_util::future::AbortHandle>> = std::sync::Mutex::new(None);
+static STREAM_ABORT: std::sync::Mutex<Option<futures_util::future::AbortHandle>> =
+    std::sync::Mutex::new(None);
 
 fn set_stream_abort_handle(handle: Option<futures_util::future::AbortHandle>) {
     if let Ok(mut slot) = STREAM_ABORT.lock() {
@@ -4205,12 +5503,18 @@ async fn start_chat_stream(
     url: String,
     headers: std::collections::HashMap<String, String>,
     body: String,
+    auth_mode: Option<String>,
+    token_ref: Option<String>,
 ) -> Result<(), String> {
+    let (url, headers) =
+        prepare_cloud_auth_request(&app, url, Some(headers), auth_mode, token_ref).await?;
     STREAM_CANCEL.store(false, std::sync::atomic::Ordering::Relaxed);
     set_stream_abort_handle(None);
     let stream_started_at = Instant::now();
 
-    let is_model_request = url.contains("/v1/chat/completions") || url.contains("/v1/responses") || url.contains("/v1/messages");
+    let is_model_request = url.contains("/v1/chat/completions")
+        || url.contains("/v1/responses")
+        || url.contains("/v1/messages");
 
     if is_model_request {
         let mut debug_parts = vec![format!("method=POST"), format!("url={}", url)];
@@ -4242,9 +5546,7 @@ async fn start_chat_stream(
         .read_timeout(Duration::from_secs(STREAM_READ_TIMEOUT_SECS))
         .build()
         .map_err(|e| format!("创建 HTTP 客户端失败: {e}"))?;
-    let mut req_builder = client
-        .post(&url)
-        .header("Content-Type", "application/json");
+    let mut req_builder = client.post(&url).header("Content-Type", "application/json");
     if is_model_request {
         req_builder = req_builder.header("Accept-Encoding", "identity");
     }
@@ -4255,7 +5557,8 @@ async fn start_chat_stream(
 
     req_builder = req_builder.body(body);
 
-    let (send_abort_handle, send_abort_registration) = futures_util::future::AbortHandle::new_pair();
+    let (send_abort_handle, send_abort_registration) =
+        futures_util::future::AbortHandle::new_pair();
     set_stream_abort_handle(Some(send_abort_handle));
     let response_result = match tokio::time::timeout(
         Duration::from_secs(STREAM_FIRST_RESPONSE_TIMEOUT_SECS),
@@ -4316,9 +5619,14 @@ async fn start_chat_stream(
     };
 
     let response = response_result.map_err(|e| {
-            record_debug_log(&app, "error", "start_chat_stream", format!("request_failed url={} err={}", url, e));
-            format!("请求失败: {e}")
-        })?;
+        record_debug_log(
+            &app,
+            "error",
+            "start_chat_stream",
+            format!("request_failed url={} err={}", url, e),
+        );
+        format!("请求失败: {e}")
+    })?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -4336,7 +5644,11 @@ async fn start_chat_stream(
                 ),
             );
         }
-        return Err(format!("HTTP {}: {}", status, error_body.chars().take(500).collect::<String>()));
+        return Err(format!(
+            "HTTP {}: {}",
+            status,
+            error_body.chars().take(500).collect::<String>()
+        ));
     }
 
     let mut stream = response.bytes_stream();
@@ -4349,7 +5661,8 @@ async fn start_chat_stream(
     let mut byte_count: usize = 0;
 
     loop {
-        let (chunk_abort_handle, chunk_abort_registration) = futures_util::future::AbortHandle::new_pair();
+        let (chunk_abort_handle, chunk_abort_registration) =
+            futures_util::future::AbortHandle::new_pair();
         set_stream_abort_handle(Some(chunk_abort_handle));
         let next_chunk = if chunk_count == 0 {
             match tokio::time::timeout(
@@ -4410,7 +5723,9 @@ async fn start_chat_stream(
                 }
             }
         } else {
-            match futures_util::future::Abortable::new(stream.next(), chunk_abort_registration).await {
+            match futures_util::future::Abortable::new(stream.next(), chunk_abort_registration)
+                .await
+            {
                 Err(_) => {
                     set_stream_abort_handle(None);
                     record_debug_log(
@@ -4444,7 +5759,13 @@ async fn start_chat_stream(
                 &app,
                 "info",
                 "start_chat_stream",
-                format!("cancelled url={} chunks={} bytes={} elapsed_ms={}", url, chunk_count, byte_count, stream_started_at.elapsed().as_millis()),
+                format!(
+                    "cancelled url={} chunks={} bytes={} elapsed_ms={}",
+                    url,
+                    chunk_count,
+                    byte_count,
+                    stream_started_at.elapsed().as_millis()
+                ),
             );
             emit_chat_stream_done(&app, &stream_id, "cancelled", None);
             return Ok(());
@@ -4508,7 +5829,14 @@ async fn start_chat_stream(
                     &app,
                     "error",
                     "start_chat_stream",
-                    format!("read_error url={} chunks={} bytes={} elapsed_ms={} err={}", url, chunk_count, byte_count, stream_started_at.elapsed().as_millis(), e),
+                    format!(
+                        "read_error url={} chunks={} bytes={} elapsed_ms={} err={}",
+                        url,
+                        chunk_count,
+                        byte_count,
+                        stream_started_at.elapsed().as_millis(),
+                        e
+                    ),
                 );
                 emit_chat_stream_done(&app, &stream_id, "error", Some(format!("流读取错误: {e}")));
                 return Ok(());
@@ -4524,7 +5852,13 @@ async fn start_chat_stream(
             &app,
             "info",
             "start_chat_stream",
-            format!("success url={} chunks={} bytes={} elapsed_ms={}", url, chunk_count, byte_count, stream_started_at.elapsed().as_millis()),
+            format!(
+                "success url={} chunks={} bytes={} elapsed_ms={}",
+                url,
+                chunk_count,
+                byte_count,
+                stream_started_at.elapsed().as_millis()
+            ),
         );
     }
 
@@ -4565,8 +5899,7 @@ fn get_file_outline(
         return Err("get_file_outline 仅支持 .cs 文件".to_string());
     }
 
-    let source = fs::read_to_string(&real_path)
-        .map_err(|e| format!("无法读取文件: {e}"))?;
+    let source = fs::read_to_string(&real_path).map_err(|e| format!("无法读取文件: {e}"))?;
 
     Ok(extract_csharp_outline(&source))
 }
@@ -4586,13 +5919,9 @@ fn extract_csharp_outline(source: &str) -> String {
         r"(?i)^\s*(public|protected)\s+(?:static\s+|virtual\s+|override\s+|async\s+|unsafe\s+)*(?:\w+(?:<[^>]+>)?(?:\[\])?)\s+([A-Za-z_]\w*)\s*\([^)]*\)"
     ).unwrap();
 
-    let re_property = Regex::new(
-        r"(?i)^\s*(public|protected)\s+.*\s+([A-Za-z_]\w*)\s*\{"
-    ).unwrap();
+    let re_property = Regex::new(r"(?i)^\s*(public|protected)\s+.*\s+([A-Za-z_]\w*)\s*\{").unwrap();
 
-    let re_enum_member = Regex::new(
-        r"^\s*([A-Za-z_]\w*)\s*(?:=|,|$)"
-    ).unwrap();
+    let re_enum_member = Regex::new(r"^\s*([A-Za-z_]\w*)\s*(?:=|,|$)").unwrap();
 
     let mut current_type_kind = String::new(); // "class", "interface", "enum", "struct"
 
@@ -4620,9 +5949,20 @@ fn extract_csharp_outline(source: &str) -> String {
 
                 current_type_kind = kind.to_lowercase();
 
-                let mod_str = if modifier.is_empty() { String::new() } else { format!("{} ", modifier) };
-                let inherit_str = if inherits.is_empty() { String::new() } else { format!(" : {}", inherits) };
-                outline.push_str(&format!("{} {}{}{}{}\n", access, mod_str, kind, name, inherit_str));
+                let mod_str = if modifier.is_empty() {
+                    String::new()
+                } else {
+                    format!("{} ", modifier)
+                };
+                let inherit_str = if inherits.is_empty() {
+                    String::new()
+                } else {
+                    format!(" : {}", inherits)
+                };
+                outline.push_str(&format!(
+                    "{} {}{}{}{}\n",
+                    access, mod_str, kind, name, inherit_str
+                ));
 
                 type_depth = brace_depth;
                 in_type_body = true;
@@ -4819,12 +6159,16 @@ fn extract_protocol_package(
         };
 
         // Security: ensure the extracted path stays within target_dir
-        let canonical_target = target_dir.canonicalize().unwrap_or_else(|_| target_dir.clone());
+        let canonical_target = target_dir
+            .canonicalize()
+            .unwrap_or_else(|_| target_dir.clone());
         if let Some(parent) = out_path.parent() {
             fs::create_dir_all(parent).map_err(|e| format!("创建子目录失败: {e}"))?;
             // Verify the parent is within target_dir after creation
             if let Ok(canonical_parent) = parent.canonicalize() {
-                if !canonical_parent.starts_with(&canonical_target) && canonical_parent != canonical_target {
+                if !canonical_parent.starts_with(&canonical_target)
+                    && canonical_parent != canonical_target
+                {
                     // Parent could be the target_dir itself before canonicalization
                     let target_parent = canonical_target.parent();
                     if target_parent.is_none() || canonical_parent != *target_parent.unwrap() {
@@ -4837,10 +6181,8 @@ fn extract_protocol_package(
         if entry.is_dir() {
             fs::create_dir_all(&out_path).map_err(|e| format!("创建目录失败: {e}"))?;
         } else {
-            let mut outfile = File::create(&out_path)
-                .map_err(|e| format!("创建文件失败: {e}"))?;
-            std::io::copy(&mut entry, &mut outfile)
-                .map_err(|e| format!("写入文件失败: {e}"))?;
+            let mut outfile = File::create(&out_path).map_err(|e| format!("创建文件失败: {e}"))?;
+            std::io::copy(&mut entry, &mut outfile).map_err(|e| format!("写入文件失败: {e}"))?;
         }
     }
 
@@ -5013,8 +6355,8 @@ fn run_document_reader_with_python(
         .map_err(|e| format!("无法启动 Python 解析器 `{python_bin}`: {e}"))?;
 
     if let Some(stdin) = child.stdin.as_mut() {
-        let input = serde_json::to_vec(payload)
-            .map_err(|e| format!("无法序列化文档读取参数: {e}"))?;
+        let input =
+            serde_json::to_vec(payload).map_err(|e| format!("无法序列化文档读取参数: {e}"))?;
         stdin
             .write_all(&input)
             .map_err(|e| format!("无法写入文档读取请求: {e}"))?;
@@ -5189,10 +6531,7 @@ fn index_workspace_documents(
 
 /// Delete a protocol package folder when the skill is removed from the UI.
 #[tauri::command]
-fn delete_protocol_package(
-    state: State<WorkspaceState>,
-    local_path: String,
-) -> Result<(), String> {
+fn delete_protocol_package(state: State<WorkspaceState>, local_path: String) -> Result<(), String> {
     let workspace = state.get_root()?;
     let full_path = workspace.join(&local_path);
 
@@ -5282,12 +6621,7 @@ fn delete_plan_files(state: State<WorkspaceState>) -> Result<(), String> {
         return Ok(());
     }
 
-    let spec_names = [
-        "requirements.md",
-        "design.md",
-        "tasks.md",
-        "bugfix.md",
-    ];
+    let spec_names = ["requirements.md", "design.md", "tasks.md", "bugfix.md"];
 
     for name in &spec_names {
         let file_path = plans_dir.join(name);
@@ -5374,22 +6708,35 @@ fn candidate_node_paths() -> Vec<PathBuf> {
             push_node_candidate(&mut candidates, home.join(".asdf/shims/node"));
             collect_glob_node_candidates(
                 &mut candidates,
-                home.join(".nvm/versions/node/*/bin/node").to_string_lossy().to_string(),
+                home.join(".nvm/versions/node/*/bin/node")
+                    .to_string_lossy()
+                    .to_string(),
             );
             collect_glob_node_candidates(
                 &mut candidates,
-                home.join(".fnm/node-versions/*/installation/bin/node").to_string_lossy().to_string(),
+                home.join(".fnm/node-versions/*/installation/bin/node")
+                    .to_string_lossy()
+                    .to_string(),
             );
         }
     } else if cfg!(target_os = "windows") {
         if let Some(program_files) = std::env::var_os("ProgramFiles") {
-            push_node_candidate(&mut candidates, PathBuf::from(program_files).join("nodejs/node.exe"));
+            push_node_candidate(
+                &mut candidates,
+                PathBuf::from(program_files).join("nodejs/node.exe"),
+            );
         }
         if let Some(program_files_x86) = std::env::var_os("ProgramFiles(x86)") {
-            push_node_candidate(&mut candidates, PathBuf::from(program_files_x86).join("nodejs/node.exe"));
+            push_node_candidate(
+                &mut candidates,
+                PathBuf::from(program_files_x86).join("nodejs/node.exe"),
+            );
         }
         if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
-            push_node_candidate(&mut candidates, PathBuf::from(local_app_data).join("Programs/nodejs/node.exe"));
+            push_node_candidate(
+                &mut candidates,
+                PathBuf::from(local_app_data).join("Programs/nodejs/node.exe"),
+            );
         }
     } else {
         push_node_candidate(&mut candidates, "/usr/bin/node");
@@ -5401,11 +6748,15 @@ fn candidate_node_paths() -> Vec<PathBuf> {
             push_node_candidate(&mut candidates, home.join(".asdf/shims/node"));
             collect_glob_node_candidates(
                 &mut candidates,
-                home.join(".nvm/versions/node/*/bin/node").to_string_lossy().to_string(),
+                home.join(".nvm/versions/node/*/bin/node")
+                    .to_string_lossy()
+                    .to_string(),
             );
             collect_glob_node_candidates(
                 &mut candidates,
-                home.join(".fnm/node-versions/*/installation/bin/node").to_string_lossy().to_string(),
+                home.join(".fnm/node-versions/*/installation/bin/node")
+                    .to_string_lossy()
+                    .to_string(),
             );
         }
     }
@@ -5439,7 +6790,8 @@ fn get_feishu_node_runtime_status() -> Result<NodeRuntimeStatus, String> {
             found: false,
             executable: None,
             version: None,
-            message: "未找到 Node.js。请在飞书设置中使用快速配置，或手动安装 Node.js LTS。".to_string(),
+            message: "未找到 Node.js。请在飞书设置中使用快速配置，或手动安装 Node.js LTS。"
+                .to_string(),
         });
     };
     let version = get_node_version(&path);
@@ -5487,15 +6839,24 @@ fn update_feishu_status_from_event(
     let status = value
         .get("status")
         .and_then(Value::as_str)
-        .unwrap_or(if event_type == "error" { "error" } else { "idle" });
+        .unwrap_or(if event_type == "error" {
+            "error"
+        } else {
+            "idle"
+        });
     let running = value
         .get("running")
         .and_then(Value::as_bool)
         .unwrap_or(matches!(status, "starting" | "connected"));
-    let message = value
-        .get("message")
-        .and_then(Value::as_str)
-        .unwrap_or(if event_type == "error" { "Feishu adapter error." } else { "" });
+    let message =
+        value
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or(if event_type == "error" {
+                "Feishu adapter error."
+            } else {
+                ""
+            });
     let pid = value
         .get("pid")
         .and_then(Value::as_u64)
@@ -5513,11 +6874,15 @@ fn write_feishu_sidecar_command(
         .lock()
         .map_err(|_| "无法写入飞书适配器：状态锁已损坏".to_string())?;
     writeln!(guard, "{command}").map_err(|e| format!("写入飞书适配器失败: {e}"))?;
-    guard.flush().map_err(|e| format!("刷新飞书适配器命令失败: {e}"))
+    guard
+        .flush()
+        .map_err(|e| format!("刷新飞书适配器命令失败: {e}"))
 }
 
 #[tauri::command]
-fn get_feishu_adapter_status(state: State<FeishuAdapterManager>) -> Result<FeishuAdapterStatus, String> {
+fn get_feishu_adapter_status(
+    state: State<FeishuAdapterManager>,
+) -> Result<FeishuAdapterStatus, String> {
     state
         .status
         .lock()
@@ -5552,15 +6917,24 @@ fn start_feishu_adapter(
         }
     }
 
-    let starting = set_feishu_status(&state.status, "starting", true, "正在启动飞书长连接...", None);
-    let _ = app.emit("feishu-adapter-event", json!({
-        "type": "status",
-        "adapter": "feishu",
-        "status": starting.status,
-        "running": starting.running,
-        "message": starting.message,
-        "timestamp": starting.updated_at,
-    }));
+    let starting = set_feishu_status(
+        &state.status,
+        "starting",
+        true,
+        "正在启动飞书长连接...",
+        None,
+    );
+    let _ = app.emit(
+        "feishu-adapter-event",
+        json!({
+            "type": "status",
+            "adapter": "feishu",
+            "status": starting.status,
+            "running": starting.running,
+            "message": starting.message,
+            "timestamp": starting.updated_at,
+        }),
+    );
 
     let node_path = resolve_node_executable().ok_or_else(|| {
         "启动飞书适配器失败：未找到 Node.js。请在「系统设置 > 即时通讯适配器」点击「快速配置 Node.js」，或手动安装 Node.js LTS 后重启 MAIN。".to_string()
@@ -5584,9 +6958,18 @@ fn start_feishu_adapter(
         .spawn()
         .map_err(|e| format!("启动飞书适配器失败，请确认已安装 Node.js: {e}"))?;
     let pid = child.id();
-    let stdin = child.stdin.take().ok_or_else(|| "无法打开飞书适配器输入管道".to_string())?;
-    let stdout = child.stdout.take().ok_or_else(|| "无法打开飞书适配器输出管道".to_string())?;
-    let stderr = child.stderr.take().ok_or_else(|| "无法打开飞书适配器日志管道".to_string())?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "无法打开飞书适配器输入管道".to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "无法打开飞书适配器输出管道".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "无法打开飞书适配器日志管道".to_string())?;
     let writer = Arc::new(Mutex::new(stdin));
     let status_slot = state.status.clone();
     let app_for_stdout = app.clone();
@@ -5622,15 +7005,18 @@ fn start_feishu_adapter(
             "飞书适配器进程已退出。",
             Some(pid),
         );
-        let _ = app_for_stdout.emit("feishu-adapter-event", json!({
-            "type": "status",
-            "adapter": "feishu",
-            "status": stopped.status,
-            "running": stopped.running,
-            "message": stopped.message,
-            "pid": stopped.pid,
-            "timestamp": stopped.updated_at,
-        }));
+        let _ = app_for_stdout.emit(
+            "feishu-adapter-event",
+            json!({
+                "type": "status",
+                "adapter": "feishu",
+                "status": stopped.status,
+                "running": stopped.running,
+                "message": stopped.message,
+                "pid": stopped.pid,
+                "timestamp": stopped.updated_at,
+            }),
+        );
     });
 
     let app_for_stderr = app.clone();
@@ -5644,14 +7030,17 @@ fn start_feishu_adapter(
         }
     });
 
-    write_feishu_sidecar_command(&writer, json!({
-        "type": "start",
-        "config": {
-            "appId": app_id,
-            "appSecret": app_secret,
-            "domain": sanitize_feishu_domain(config.domain),
-        },
-    }))?;
+    write_feishu_sidecar_command(
+        &writer,
+        json!({
+            "type": "start",
+            "config": {
+                "appId": app_id,
+                "appSecret": app_secret,
+                "domain": sanitize_feishu_domain(config.domain),
+            },
+        }),
+    )?;
 
     let status = set_feishu_status(
         &state.status,
@@ -5683,14 +7072,17 @@ fn stop_feishu_adapter(
         process.shutdown();
     }
     let status = set_feishu_status(&state.status, "stopped", false, "飞书适配器已停止。", None);
-    let _ = app.emit("feishu-adapter-event", json!({
-        "type": "status",
-        "adapter": "feishu",
-        "status": status.status,
-        "running": status.running,
-        "message": status.message,
-        "timestamp": status.updated_at,
-    }));
+    let _ = app.emit(
+        "feishu-adapter-event",
+        json!({
+            "type": "status",
+            "adapter": "feishu",
+            "status": status.status,
+            "running": status.running,
+            "message": status.message,
+            "timestamp": status.updated_at,
+        }),
+    );
     Ok(status)
 }
 
@@ -5710,14 +7102,17 @@ fn send_feishu_message(
     let process = process_guard
         .as_ref()
         .ok_or_else(|| "飞书适配器尚未启动".to_string())?;
-    write_feishu_sidecar_command(&process.writer, json!({
-        "type": "send_text",
-        "chatId": chat_id,
-        "userId": user_id,
-        "openId": open_id,
-        "messageId": message_id,
-        "text": text,
-    }))
+    write_feishu_sidecar_command(
+        &process.writer,
+        json!({
+            "type": "send_text",
+            "chatId": chat_id,
+            "userId": user_id,
+            "openId": open_id,
+            "messageId": message_id,
+            "text": text,
+        }),
+    )
 }
 
 #[tauri::command]
@@ -5737,16 +7132,19 @@ fn send_feishu_card(
     let process = process_guard
         .as_ref()
         .ok_or_else(|| "飞书适配器尚未启动".to_string())?;
-    write_feishu_sidecar_command(&process.writer, json!({
-        "type": "send_card",
-        "chatId": chat_id,
-        "userId": user_id,
-        "openId": open_id,
-        "messageId": message_id,
-        "approvalId": approval_id,
-        "messageKind": "approval_card",
-        "card": card,
-    }))
+    write_feishu_sidecar_command(
+        &process.writer,
+        json!({
+            "type": "send_card",
+            "chatId": chat_id,
+            "userId": user_id,
+            "openId": open_id,
+            "messageId": message_id,
+            "approvalId": approval_id,
+            "messageKind": "approval_card",
+            "card": card,
+        }),
+    )
 }
 
 #[tauri::command]
@@ -5762,11 +7160,14 @@ fn patch_feishu_card(
     let process = process_guard
         .as_ref()
         .ok_or_else(|| "飞书适配器尚未启动".to_string())?;
-    write_feishu_sidecar_command(&process.writer, json!({
-        "type": "patch_card",
-        "messageId": message_id,
-        "card": card,
-    }))
+    write_feishu_sidecar_command(
+        &process.writer,
+        json!({
+            "type": "patch_card",
+            "messageId": message_id,
+            "card": card,
+        }),
+    )
 }
 
 #[tauri::command]
@@ -5840,8 +7241,9 @@ fn apply_app_icon_variant_macos(app: AppHandle, variant: String) -> Result<(), S
     let (tx, rx) = mpsc::channel();
     app.run_on_main_thread(move || {
         let result = (|| -> Result<(), String> {
-            let mtm = MainThreadMarker::new()
-                .ok_or_else(|| "macOS app icon update did not run on the main thread".to_string())?;
+            let mtm = MainThreadMarker::new().ok_or_else(|| {
+                "macOS app icon update did not run on the main thread".to_string()
+            })?;
             let bytes = generate_app_icon_png(&variant);
             let data = NSData::with_bytes(&bytes);
             let image = NSImage::initWithData(NSImage::alloc(), &data)
@@ -5853,9 +7255,11 @@ fn apply_app_icon_variant_macos(app: AppHandle, variant: String) -> Result<(), S
             Ok(())
         })();
         let _ = tx.send(result);
-    }).map_err(|e| format!("调度 macOS 图标更新失败: {e}"))?;
+    })
+    .map_err(|e| format!("调度 macOS 图标更新失败: {e}"))?;
 
-    rx.recv().map_err(|e| format!("等待 macOS 图标更新失败: {e}"))?
+    rx.recv()
+        .map_err(|e| format!("等待 macOS 图标更新失败: {e}"))?
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -5876,9 +7280,8 @@ fn apply_app_icon_variant(app: AppHandle, variant: String) -> Result<(), String>
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let workspace_root = default_workspace_root().unwrap_or_else(|_| {
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-    });
+    let workspace_root = default_workspace_root()
+        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
     tauri::Builder::default()
         .manage(WorkspaceState::new(workspace_root))
@@ -5922,6 +7325,10 @@ pub fn run() {
             append_debug_log,
             read_debug_log,
             clear_debug_log,
+            cloud_auth_begin,
+            cloud_auth_finish,
+            cloud_auth_status,
+            cloud_auth_logout,
             proxy_request,
             cancel_proxy_request,
             start_chat_stream,
@@ -5969,23 +7376,12 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        compare_file_nodes,
-        is_valid_git_branch_name,
-        merge_json_rows_by_id,
-        parse_git_branch_line,
-        parse_git_numstat,
-        parse_git_porcelain_entries,
-        parse_git_porcelain_status,
-        read_session_transcript_with_fallback,
-        resolve_session_transcript_to_write,
-        resolve_existing_path,
-        resolve_write_path,
+        compare_file_nodes, is_valid_git_branch_name, merge_json_rows_by_id, parse_git_branch_line,
+        parse_git_numstat, parse_git_porcelain_entries, parse_git_porcelain_status,
+        read_session_transcript_with_fallback, resolve_existing_path,
+        resolve_session_transcript_to_write, resolve_write_path, should_hide_list_directory_entry,
+        should_skip_recursive_search_dir, write_json_atomic, write_jsonl_atomic, FileNode,
         SessionTranscript,
-        should_hide_list_directory_entry,
-        should_skip_recursive_search_dir,
-        write_json_atomic,
-        write_jsonl_atomic,
-        FileNode,
     };
     use serde_json::json;
     use std::fs;
@@ -6029,22 +7425,27 @@ mod tests {
         let runtime_path = workspace.join("runtime.json");
         let messages_path = workspace.join("messages.jsonl");
         let turns_path = workspace.join("turns.jsonl");
-        write_json_atomic(&runtime_path, &json!({
-            "taskFlow": [
-                {"id": 11, "type": "user", "content": "legacy user"},
-                {"id": 12, "type": "agent", "content": "legacy agent"}
-            ],
-            "conversationTurns": [
-                {"id": "turn-legacy", "blockIds": [11, 12], "createdAt": 1}
-            ]
-        })).unwrap();
+        write_json_atomic(
+            &runtime_path,
+            &json!({
+                "taskFlow": [
+                    {"id": 11, "type": "user", "content": "legacy user"},
+                    {"id": 12, "type": "agent", "content": "legacy agent"}
+                ],
+                "conversationTurns": [
+                    {"id": "turn-legacy", "blockIds": [11, 12], "createdAt": 1}
+                ]
+            }),
+        )
+        .unwrap();
 
         let transcript = read_session_transcript_with_fallback(
             &messages_path,
             &turns_path,
             &runtime_path,
             "legacy",
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(transcript.messages.len(), 2);
         assert_eq!(transcript.messages[0]["content"], "legacy user");
@@ -6060,19 +7461,20 @@ mod tests {
         let runtime_path = workspace.join("runtime.json");
         let messages_path = workspace.join("messages.jsonl");
         let turns_path = workspace.join("turns.jsonl");
-        write_json_atomic(&runtime_path, &json!({
-            "taskFlow": [{"id": 11, "type": "user", "content": "legacy user"}],
-            "conversationTurns": [{"id": "turn-legacy", "blockIds": [11], "createdAt": 1}]
-        })).unwrap();
+        write_json_atomic(
+            &runtime_path,
+            &json!({
+                "taskFlow": [{"id": 11, "type": "user", "content": "legacy user"}],
+                "conversationTurns": [{"id": "turn-legacy", "blockIds": [11], "createdAt": 1}]
+            }),
+        )
+        .unwrap();
         write_jsonl_atomic(&messages_path, &[], "test messages").unwrap();
         write_jsonl_atomic(&turns_path, &[], "test turns").unwrap();
 
-        let transcript = read_session_transcript_with_fallback(
-            &messages_path,
-            &turns_path,
-            &runtime_path,
-            "v2",
-        ).unwrap();
+        let transcript =
+            read_session_transcript_with_fallback(&messages_path, &turns_path, &runtime_path, "v2")
+                .unwrap();
 
         assert_eq!(transcript.messages.len(), 1);
         assert_eq!(transcript.messages[0]["content"], "legacy user");
@@ -6083,7 +7485,8 @@ mod tests {
     }
 
     #[test]
-    fn session_transcript_readers_recover_from_agent_messages_when_jsonl_and_legacy_runtime_are_empty() {
+    fn session_transcript_readers_recover_from_agent_messages_when_jsonl_and_legacy_runtime_are_empty(
+    ) {
         let workspace = make_temp_workspace("agent-message-session-runtime");
         let runtime_path = workspace.join("runtime.json");
         let messages_path = workspace.join("messages.jsonl");
@@ -6104,7 +7507,8 @@ mod tests {
             &turns_path,
             &runtime_path,
             "177",
-        ).unwrap();
+        )
+        .unwrap();
 
         assert!(transcript.recovered_from_agent_messages);
         assert_eq!(transcript.messages.len(), 3);
@@ -6124,29 +7528,36 @@ mod tests {
         let runtime_path = workspace.join("runtime.json");
         let messages_path = workspace.join("messages.jsonl");
         let turns_path = workspace.join("turns.jsonl");
-        write_json_atomic(&runtime_path, &json!({
-            "agentMessages": [
-                {"role": "user", "content": "agent user"},
-                {"role": "assistant", "content": "agent assistant"}
-            ]
-        })).unwrap();
+        write_json_atomic(
+            &runtime_path,
+            &json!({
+                "agentMessages": [
+                    {"role": "user", "content": "agent user"},
+                    {"role": "assistant", "content": "agent assistant"}
+                ]
+            }),
+        )
+        .unwrap();
         write_jsonl_atomic(
             &messages_path,
             &[json!({"id": 9, "turnId": "jsonl-turn", "type": "user", "content": "jsonl user"})],
             "test messages",
-        ).unwrap();
+        )
+        .unwrap();
         write_jsonl_atomic(
             &turns_path,
             &[json!({"id": "jsonl-turn", "blockIds": [9], "createdAt": 1})],
             "test turns",
-        ).unwrap();
+        )
+        .unwrap();
 
         let transcript = read_session_transcript_with_fallback(
             &messages_path,
             &turns_path,
             &runtime_path,
             "178",
-        ).unwrap();
+        )
+        .unwrap();
 
         assert!(!transcript.recovered_from_agent_messages);
         assert_eq!(transcript.messages.len(), 1);
@@ -6164,12 +7575,8 @@ mod tests {
             recovered_from_agent_messages: false,
         };
 
-        let (messages, turns) = resolve_session_transcript_to_write(
-            &existing,
-            Vec::new(),
-            Vec::new(),
-            false,
-        );
+        let (messages, turns) =
+            resolve_session_transcript_to_write(&existing, Vec::new(), Vec::new(), false);
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["content"], "existing message");
@@ -6197,7 +7604,8 @@ mod tests {
         fs::create_dir_all(&workspace).unwrap();
         fs::create_dir_all(&outside).unwrap();
 
-        let err = resolve_existing_path("../outside", &workspace.canonicalize().unwrap()).unwrap_err();
+        let err =
+            resolve_existing_path("../outside", &workspace.canonicalize().unwrap()).unwrap_err();
         assert!(err.contains("路径越界"));
 
         fs::remove_dir_all(&parent).unwrap();
@@ -6259,7 +7667,10 @@ mod tests {
 
         nodes.sort_by(compare_file_nodes);
         let ordered_names: Vec<&str> = nodes.iter().map(|node| node.name.as_str()).collect();
-        assert_eq!(ordered_names, vec!["Scripts", "capabilities", "Cargo.toml", "README.md"]);
+        assert_eq!(
+            ordered_names,
+            vec!["Scripts", "capabilities", "Cargo.toml", "README.md"]
+        );
     }
 
     #[test]

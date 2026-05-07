@@ -1,13 +1,26 @@
 import {
   normalizeCloudApiFormat,
+  normalizeCloudAuthMode,
   normalizeCloudProtocol,
   normalizeCloudToolProtocol,
   normalizeOpenAiReasoningEffort,
+  type CloudAuthMode,
   type CloudApiProtocol,
   type CloudToolProtocol,
   type OpenAiApiFormat,
   type OpenAiReasoningEffort,
 } from "./cloudProtocol";
+
+export interface CloudAuthSummary {
+  mode: CloudAuthMode;
+  status: "disconnected" | "connected" | "expired" | "error";
+  accountId?: string;
+  email?: string;
+  tokenRef?: string;
+  expiresAt?: number;
+  storage?: "keychain" | "file";
+  message?: string;
+}
 
 export interface CloudProfileConfig {
   protocol: CloudApiProtocol;
@@ -22,6 +35,7 @@ export interface CloudProfileConfig {
   disableResponseStorage: boolean;
   reasoningEffort: OpenAiReasoningEffort;
   toolProtocol: CloudToolProtocol;
+  auth: CloudAuthSummary;
 }
 
 export interface CloudServerConfig extends CloudProfileConfig {
@@ -31,6 +45,7 @@ export interface CloudServerConfig extends CloudProfileConfig {
 
 export const DEFAULT_CLOUD_SERVER_ID = "cloud-server-default";
 const DEFAULT_OPENAI_ENDPOINT = "https://api.openai.com/v1";
+const DEFAULT_GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com";
 
 function cleanString(value: unknown): string {
   return typeof value === "string" ? value : "";
@@ -41,11 +56,38 @@ function cleanNumber(value: unknown, fallback: number): number {
 }
 
 function defaultEndpointForProtocol(protocol: CloudApiProtocol): string {
-  return protocol === "anthropic" ? "https://api.anthropic.com" : DEFAULT_OPENAI_ENDPOINT;
+  if (protocol === "anthropic") return "https://api.anthropic.com";
+  if (protocol === "gemini") return DEFAULT_GEMINI_ENDPOINT;
+  return DEFAULT_OPENAI_ENDPOINT;
 }
 
 function defaultProviderForProtocol(protocol: CloudApiProtocol): string {
+  if (protocol === "gemini") return "Gemini";
   return protocol === "anthropic" ? "Anthropic" : "OpenAI";
+}
+
+export function createDefaultCloudAuth(mode: CloudAuthMode = "api_key"): CloudAuthSummary {
+  return {
+    mode,
+    status: "disconnected",
+  };
+}
+
+export function normalizeCloudAuth(input?: Partial<CloudAuthSummary> | null, protocol?: CloudApiProtocol): CloudAuthSummary {
+  const inferredMode = protocol === "gemini" ? "api_key" : "api_key";
+  const mode = normalizeCloudAuthMode(input?.mode ?? inferredMode);
+  const rawStatus = input?.status;
+  const status = rawStatus === "connected" || rawStatus === "expired" || rawStatus === "error"
+    ? rawStatus
+    : "disconnected";
+  const auth: CloudAuthSummary = { mode, status };
+  if (typeof input?.accountId === "string" && input.accountId.trim()) auth.accountId = input.accountId.trim();
+  if (typeof input?.email === "string" && input.email.trim()) auth.email = input.email.trim();
+  if (typeof input?.tokenRef === "string" && input.tokenRef.trim()) auth.tokenRef = input.tokenRef.trim();
+  if (typeof input?.expiresAt === "number" && Number.isFinite(input.expiresAt)) auth.expiresAt = input.expiresAt;
+  if (input?.storage === "keychain" || input?.storage === "file") auth.storage = input.storage;
+  if (typeof input?.message === "string" && input.message.trim()) auth.message = input.message.trim();
+  return auth;
 }
 
 export function createDefaultCloudConfig(): CloudProfileConfig {
@@ -62,6 +104,7 @@ export function createDefaultCloudConfig(): CloudProfileConfig {
     disableResponseStorage: true,
     reasoningEffort: "none",
     toolProtocol: "auto",
+    auth: createDefaultCloudAuth(),
   };
 }
 
@@ -90,6 +133,7 @@ export function normalizeCloudConfig(input?: Partial<CloudProfileConfig> | null)
     : normalizeCloudApiFormat(input?.apiFormat);
   const provider = cleanString(input?.provider).trim() || defaultProviderForProtocol(protocol);
   const endpoint = cleanString(input?.endpoint).trim() || defaultEndpointForProtocol(protocol);
+  const auth = normalizeCloudAuth(input?.auth, protocol);
 
   return {
     protocol,
@@ -104,6 +148,7 @@ export function normalizeCloudConfig(input?: Partial<CloudProfileConfig> | null)
     disableResponseStorage: input?.disableResponseStorage ?? fallback.disableResponseStorage,
     reasoningEffort: normalizeOpenAiReasoningEffort(input?.reasoningEffort),
     toolProtocol: normalizeCloudToolProtocol(input?.toolProtocol),
+    auth,
   };
 }
 

@@ -26,6 +26,10 @@ serde_json = "1"
 glob = "0.3"
 regex = "1"
 walkdir = "2"
+base64 = "0.22"
+rand = "0.8"
+sha2 = "0.10"
+url = "2"
 
 # ── Architecture Spec §1 Backend Requirements ──────────────────────────
 # Context-limit token counting
@@ -48,3 +52,4 @@ tauri-plugin-process = "2"
 objc2 = "0.6.4"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSApplication", "NSImage", "NSResponder", "std"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSData", "NSString", "std"] }
+security-framework = "3.7.0"

@@ -17,13 +17,17 @@ import {
   buildAnthropicRequestBody,
   buildCloudHeaders,
   buildCloudMessagesApiUrl,
+  buildGeminiGenerateContentUrl,
+  buildGeminiRequestBody,
   createAnthropicStreamProcessor,
+  extractGeminiResponseText,
   extractOpenAiResponseText,
   finalizeStreamedToolCalls,
   normalizeCloudApiFormat,
   normalizeCloudProtocol,
   normalizeCloudToolProtocol,
   type CloudApiProtocol,
+  type CloudAuthMode,
   type CloudToolProtocol,
   type OpenAiApiFormat,
   type OpenAiReasoningEffort,
@@ -62,7 +66,10 @@ export interface StreamSettings {
   model: string;
   apiProtocol?: CloudApiProtocol;
   apiFormat?: OpenAiApiFormat;
+  authMode?: CloudAuthMode;
+  tokenRef?: string;
   customHeaders?: string;
+  sendSamplingParameters?: boolean;
   temperature?: number;
   topP?: number;
   disableResponseStorage?: boolean;
@@ -321,8 +328,12 @@ function isAnthropicProvider(settings: StreamSettings): boolean {
   return normalizeCloudProtocol(settings.apiProtocol) === "anthropic";
 }
 
+function isGeminiProvider(settings: StreamSettings): boolean {
+  return normalizeCloudProtocol(settings.apiProtocol) === "gemini";
+}
+
 function isOpenAiResponsesApi(settings: StreamSettings): boolean {
-  return !isAnthropicProvider(settings) && normalizeCloudApiFormat(settings.apiFormat) === "responses";
+  return !isAnthropicProvider(settings) && !isGeminiProvider(settings) && normalizeCloudApiFormat(settings.apiFormat) === "responses";
 }
 
 function shouldSendNativeTools(settings: StreamSettings): boolean {
@@ -481,6 +492,8 @@ async function postJsonRequest(
         method: "POST",
         headers,
         body: JSON.stringify(body),
+        authMode: settings.authMode,
+        tokenRef: settings.tokenRef,
       });
     } catch (err) {
       if (signal?.aborted) throw createAbortError();
@@ -524,13 +537,28 @@ async function requestOpenAiNonStreaming(
 
   try {
     const maxTokens = maxTokensOverride ?? computeInitialMaxTokens(settings.contextLimit);
+    const isGemini = isGeminiProvider(settings);
     const apiFormat = normalizeCloudApiFormat(settings.apiFormat);
-    const apiUrl = buildApiUrl(settings);
-    const headers = buildCloudHeaders("openai", settings.apiKey, true, settings.customHeaders);
+    const apiUrl = isGemini ? buildGeminiGenerateContentUrl(settings.baseUrl, settings.model, false) : buildApiUrl(settings);
+    const headers = isGemini
+      ? buildCloudHeaders("gemini", settings.apiKey, true, settings.customHeaders, settings.authMode)
+      : buildCloudHeaders("openai", settings.apiKey, true, settings.customHeaders, settings.authMode);
     const minimalCompatibilityMode = isTranscriptCompatibilityRequest(messages);
     let payload: unknown;
 
-    if (apiFormat === "responses") {
+    if (isGemini) {
+      payload = await postJsonRequest(
+        apiUrl,
+        headers,
+        buildGeminiRequestBody({
+          messages: messages as ProtocolChatMessage[],
+          model: settings.model,
+          maxTokens,
+        }),
+        settings,
+        signal,
+      );
+    } else if (apiFormat === "responses") {
       const requestCandidates = buildOpenAiResponsesRequestCandidates({
         messages: messages as ProtocolChatMessage[],
         model: settings.model,
@@ -616,16 +644,18 @@ async function requestOpenAiNonStreaming(
           stream: false,
           ...(!minimalCompatibilityMode && tools && tools.length > 0 ? { tools: normalizeToolDefinitions(tools) } : {}),
           ...(!minimalCompatibilityMode ? { max_tokens: maxTokens } : {}),
-          ...(!minimalCompatibilityMode && settings.temperature != null ? { temperature: settings.temperature } : {}),
-          ...(!minimalCompatibilityMode && settings.topP != null ? { top_p: settings.topP } : {}),
+          ...(!minimalCompatibilityMode && settings.sendSamplingParameters === true && settings.temperature != null ? { temperature: settings.temperature } : {}),
+          ...(!minimalCompatibilityMode && settings.sendSamplingParameters === true && settings.topP != null ? { top_p: settings.topP } : {}),
         },
         settings,
         signal,
       );
     }
 
-    const content = extractOpenAiResponseText(payload, apiFormat);
-    const toolCalls = apiFormat === "chat_completions"
+    const content = isGemini ? extractGeminiResponseText(payload) : extractOpenAiResponseText(payload, apiFormat);
+    const toolCalls = isGemini
+      ? []
+      : apiFormat === "chat_completions"
       ? extractOpenAiChatCompletionToolCalls(payload)
       : extractOpenAiResponsesToolCalls(payload);
     const result: StreamResult = {
@@ -667,7 +697,7 @@ function buildApiUrl(settings: StreamSettings): string {
 
   return buildCloudMessagesApiUrl(
     base,
-    isAnthropicProvider(settings) ? "anthropic" : "openai",
+    isAnthropicProvider(settings) ? "anthropic" : isGeminiProvider(settings) ? "gemini" : "openai",
     normalizeCloudApiFormat(settings.apiFormat),
   );
 }
@@ -687,6 +717,7 @@ async function streamViaRustProxy(
   const { onToken, onDone, onError } = callbacks;
   const isOllama = isOllamaProvider(settings);
   const isAnthropic = isAnthropicProvider(settings);
+  const isGemini = isGeminiProvider(settings);
   const maxTokens = maxTokensOverride ?? computeInitialMaxTokens(settings.contextLimit);
 
   // Build the request body (same logic as streamChatCompletion)
@@ -703,28 +734,48 @@ async function streamViaRustProxy(
           model: settings.model,
           maxTokens,
           stream: true,
-          temperature: settings.temperature ?? 0.2,
-          topP: settings.topP,
           tools,
         })
+      : isGemini
+        ? buildGeminiRequestBody({
+            messages: messages as ProtocolChatMessage[],
+            model: settings.model,
+            maxTokens,
+            stream: false,
+          })
       : {
           model: settings.model,
           messages: messages.map((m) => mapMessageForApi(m, false)),
           stream: true,
           max_tokens: maxTokens,
-          temperature: settings.temperature ?? 0.2,
-          ...(settings.topP != null ? { top_p: settings.topP } : {}),
+          ...(settings.sendSamplingParameters === true && settings.temperature != null ? { temperature: settings.temperature } : {}),
+          ...(settings.sendSamplingParameters === true && settings.topP != null ? { top_p: settings.topP } : {}),
         };
 
-  if (tools && tools.length > 0 && !isOllama && !isAnthropic && shouldSendNativeTools(settings)) {
+  if (tools && tools.length > 0 && !isOllama && !isAnthropic && !isGemini && shouldSendNativeTools(settings)) {
     body.tools = normalizeToolDefinitions(tools);
   }
 
-  const apiUrl = buildApiUrl(settings);
-  const protocol: CloudApiProtocol = isAnthropic ? "anthropic" : "openai";
+  const apiUrl = isGemini ? buildGeminiGenerateContentUrl(settings.baseUrl, settings.model, false) : buildApiUrl(settings);
+  const protocol: CloudApiProtocol = isAnthropic ? "anthropic" : isGemini ? "gemini" : "openai";
   const headers: Record<string, string> = isOllama
     ? { "Content-Type": "application/json" }
-    : buildCloudHeaders(protocol, settings.apiKey, true, settings.customHeaders);
+    : buildCloudHeaders(protocol, settings.apiKey, true, settings.customHeaders, settings.authMode);
+
+  if (isGemini) {
+    try {
+      const payload = await postJsonRequest(apiUrl, headers, body, settings, signal);
+      const content = extractGeminiResponseText(payload);
+      if (content) onToken(content);
+      const result: StreamResult = { content, toolCalls: [], finishReason: "stop" };
+      onDone(result);
+      return result;
+    } catch (err) {
+      const normalizedError = toError(err, "Gemini request failed.");
+      onError(normalizedError);
+      throw normalizedError;
+    }
+  }
 
   // Generate a unique stream ID
   const streamId = `stream-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -1018,6 +1069,8 @@ async function streamViaRustProxy(
     url: apiUrl,
     headers,
     body: JSON.stringify(body),
+    authMode: settings.authMode,
+    tokenRef: settings.tokenRef,
   }).catch(err => {
     if (resolved) return;
     resolved = true;
@@ -1052,7 +1105,7 @@ export async function streamChatCompletion(
   const shouldUseNonStreamingOpenAi =
     !isOllama
     && !isAnthropic
-    && (isOpenAiResponsesApi(settings) || isTranscriptCompatibilityRequest(messages));
+    && (isGeminiProvider(settings) || isOpenAiResponsesApi(settings) || isTranscriptCompatibilityRequest(messages));
 
   if (shouldUseNonStreamingOpenAi) {
     return requestOpenAiNonStreaming(messages, settings, callbacks, signal, maxTokensOverride, tools);
@@ -1066,6 +1119,7 @@ export async function streamChatCompletion(
 
   const { onToken, onDone, onError } = callbacks;
   const maxTokens = maxTokensOverride ?? computeInitialMaxTokens(settings.contextLimit);
+  const isGemini = isGeminiProvider(settings);
 
   // Build the request body based on provider
   const body: Record<string, unknown> = isOllama
@@ -1081,29 +1135,49 @@ export async function streamChatCompletion(
           model: settings.model,
           maxTokens,
           stream: true,
-          temperature: settings.temperature ?? 0.2,
-          topP: settings.topP,
           tools,
         })
+      : isGemini
+        ? buildGeminiRequestBody({
+            messages: messages as ProtocolChatMessage[],
+            model: settings.model,
+            maxTokens,
+            stream: false,
+          })
       : {
           model: settings.model,
           messages: messages.map((m) => mapMessageForApi(m, false)),
           stream: true,
           max_tokens: maxTokens,
-          temperature: settings.temperature ?? 0.2,
-          ...(settings.topP != null ? { top_p: settings.topP } : {}),
+          ...(settings.sendSamplingParameters === true && settings.temperature != null ? { temperature: settings.temperature } : {}),
+          ...(settings.sendSamplingParameters === true && settings.topP != null ? { top_p: settings.topP } : {}),
         };
 
   // Include tools if provided (native function calling) — only for non-Ollama
-  if (tools && tools.length > 0 && !isOllama && !isAnthropic && shouldSendNativeTools(settings)) {
+  if (tools && tools.length > 0 && !isOllama && !isAnthropic && !isGemini && shouldSendNativeTools(settings)) {
     body.tools = normalizeToolDefinitions(tools);
   }
 
-  const apiUrl = buildApiUrl(settings);
-  const protocol: CloudApiProtocol = isAnthropic ? "anthropic" : "openai";
+  const apiUrl = isGemini ? buildGeminiGenerateContentUrl(settings.baseUrl, settings.model, false) : buildApiUrl(settings);
+  const protocol: CloudApiProtocol = isAnthropic ? "anthropic" : isGemini ? "gemini" : "openai";
   const headers: Record<string, string> = isOllama
     ? { "Content-Type": "application/json" }
-    : buildCloudHeaders(protocol, settings.apiKey, true, settings.customHeaders);
+    : buildCloudHeaders(protocol, settings.apiKey, true, settings.customHeaders, settings.authMode);
+
+  if (isGemini) {
+    try {
+      const payload = await postJsonRequest(apiUrl, headers, body, settings, signal);
+      const content = extractGeminiResponseText(payload);
+      if (content) onToken(content);
+      const result: StreamResult = { content, toolCalls: [], finishReason: "stop" };
+      onDone(result);
+      return result;
+    } catch (err) {
+      const normalizedError = toError(err, "Gemini request failed.");
+      onError(normalizedError);
+      throw normalizedError;
+    }
+  }
 
   let response: Response;
   try {

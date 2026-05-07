@@ -58,9 +58,12 @@ import {
 import { buildClosedActivePlanRuntimePatch } from "../lib/planLifecycle";
 import {
   buildAnthropicRequestBody,
+  buildGeminiGenerateContentUrl,
+  buildGeminiRequestBody,
   buildOpenAiResponsesInputCandidates,
   buildOpenAiResponsesRequestExtras,
   extractOpenAiResponsesInstructions,
+  extractGeminiResponseText,
   extractOpenAiResponseText,
   buildCloudHeaders,
   buildCloudMessagesApiUrl,
@@ -8124,6 +8127,7 @@ async function requestSemanticTurnMetadata(params: {
     const provider = isCloud ? params.config.cloud.provider : params.config.local.provider;
     const cloudProtocol = normalizeCloudProtocol(isCloud ? params.config.cloud.protocol : "openai");
     const cloudApiFormat = normalizeCloudApiFormat(isCloud ? params.config.cloud.apiFormat : "chat_completions");
+    const cloudAuthMode = isCloud ? params.config.cloud.auth?.mode ?? "api_key" : "api_key";
     if (!model || !endpoint) return null;
 
     const msgs: Array<{ role: "system" | "user"; content: string }> = [
@@ -8154,6 +8158,7 @@ async function requestSemanticTurnMetadata(params: {
       },
     ];
     const isAnthropicCloud = isCloud && cloudProtocol === "anthropic";
+    const isGeminiCloud = isCloud && cloudProtocol === "gemini";
     let url: string;
     let body: Record<string, unknown>;
     let headers: Record<string, string>;
@@ -8169,10 +8174,16 @@ async function requestSemanticTurnMetadata(params: {
         model,
         maxTokens: 120,
         stream: false,
-        temperature: 0.1,
-        topP: 0.8,
       });
-      headers = buildCloudHeaders("anthropic", ac.apiKey, true, params.config.cloud.customHeaders);
+      headers = buildCloudHeaders("anthropic", ac.apiKey, true, params.config.cloud.customHeaders, cloudAuthMode);
+    } else if (isGeminiCloud) {
+      url = buildGeminiGenerateContentUrl(endpoint, model, false);
+      body = buildGeminiRequestBody({
+        messages: msgs,
+        model,
+        maxTokens: 120,
+      });
+      headers = buildCloudHeaders("gemini", ac.apiKey, true, params.config.cloud.customHeaders, cloudAuthMode);
     } else {
       url = buildCloudMessagesApiUrl(endpoint, "openai", cloudApiFormat);
       body = cloudApiFormat === "responses"
@@ -8187,8 +8198,8 @@ async function requestSemanticTurnMetadata(params: {
               reasoningEffort: "none",
             }),
           }
-        : { model, messages: msgs, stream: false, max_tokens: 120, temperature: 0.1, top_p: 0.8 };
-      headers = buildCloudHeaders("openai", ac.apiKey, true, params.config.cloud.customHeaders);
+        : { model, messages: msgs, stream: false, max_tokens: 120 };
+      headers = buildCloudHeaders("openai", ac.apiKey, true, params.config.cloud.customHeaders, cloudAuthMode);
     }
 
     let j: any;
@@ -8198,6 +8209,8 @@ async function requestSemanticTurnMetadata(params: {
         method: "POST",
         headers,
         body: JSON.stringify(body),
+        authMode: cloudAuthMode,
+        tokenRef: params.config.cloud.auth?.tokenRef,
       });
       j = JSON.parse(result);
     } else {
@@ -8210,7 +8223,9 @@ async function requestSemanticTurnMetadata(params: {
       ? j.message?.content?.trim()
       : isAnthropicCloud
         ? extractAnthropicResponseText(j).trim()
-        : extractOpenAiResponseText(j, cloudApiFormat).trim();
+        : isGeminiCloud
+          ? extractGeminiResponseText(j).trim()
+          : extractOpenAiResponseText(j, cloudApiFormat).trim();
 
     const jsonText = extractJsonObject(rawText || "");
     const parsedMetadata = jsonText

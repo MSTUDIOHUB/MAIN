@@ -33,6 +33,36 @@ test.beforeEach(async ({ page }) => {
       if (cmd === "get_system_memory") {
         return { total_gb: 32, available_gb: 24 };
       }
+      if (cmd === "cloud_auth_begin") {
+        ((window as any).__CLOUD_AUTH_COMMANDS__ ??= []).push({ cmd, args });
+        return {
+          sessionId: "mock-cloud-auth-session",
+          provider: args?.provider,
+          mode: args?.mode,
+          authUrl: "https://auth.example/mock",
+          redirectUri: "http://127.0.0.1:1455/auth/callback",
+          expiresAt: Date.now() + 300000,
+          browserOpened: true,
+        };
+      }
+      if (cmd === "cloud_auth_finish") {
+        ((window as any).__CLOUD_AUTH_COMMANDS__ ??= []).push({ cmd, args });
+        const mode = ((window as any).__CLOUD_AUTH_MODE__ ?? "openai_chatgpt_oauth") as string;
+        return {
+          mode,
+          status: "connected",
+          tokenRef: String(args?.serverId ?? "mock-server"),
+          accountId: mode === "openai_chatgpt_oauth" ? "chatgpt-account" : "google-account",
+          email: mode === "openai_chatgpt_oauth" ? "openai@example.com" : "gemini@example.com",
+          expiresAt: Date.now() + 3600000,
+          storage: "file",
+          message: "Stored in app data with 0600 file permissions.",
+        };
+      }
+      if (cmd === "cloud_auth_logout") {
+        ((window as any).__CLOUD_AUTH_COMMANDS__ ??= []).push({ cmd, args });
+        return { mode: "api_key", status: "disconnected" };
+      }
       if (cmd === "proxy_request") {
         ((window as any).__CLOUD_REQUESTS__ ??= []).push({
           url: String(args?.url ?? ""),
@@ -81,6 +111,58 @@ test.beforeEach(async ({ page }) => {
   }, { seededModels: models });
 });
 
+test("cloud settings hides sampling params and keeps advanced compatibility collapsed", async ({ page }) => {
+  await page.goto("/?e2eScenario=cloud-settings-model-select");
+
+  await expect(page.getByText("Temperature")).toHaveCount(0);
+  await expect(page.getByText("Top P")).toHaveCount(0);
+  await expect(page.getByTestId("cloud-advanced-compatibility")).not.toHaveAttribute("open", "");
+  await expect(page.getByTestId("cloud-server-endpoint-input")).not.toBeVisible();
+
+  await page.getByText("高级兼容性").click();
+  await expect(page.getByTestId("cloud-server-endpoint-input")).toBeVisible();
+  await expect(page.getByText("Reasoning Effort")).toBeVisible();
+  await expect(page.getByText("Disable Response Storage")).toBeVisible();
+});
+
+test("OpenAI experimental login shows status and refreshes Codex model candidates", async ({ page }) => {
+  await page.goto("/?e2eScenario=cloud-settings-model-select");
+  await page.evaluate(() => {
+    (window as any).__CLOUD_AUTH_MODE__ = "openai_chatgpt_oauth";
+  });
+
+  await page.getByTestId("cloud-auth-mode-openai_chatgpt_oauth").click();
+  await expect(page.getByText("ChatGPT Pro/Plus/Codex 实验登录")).toBeVisible();
+  await expect(page.getByText("不承诺免费账号可用")).toBeVisible();
+  await page.getByTestId("cloud-auth-login").click();
+  await expect(page.getByText(/已登录 · openai@example\.com/)).toBeVisible();
+
+  await page.getByTestId("cloud-model-refresh").click();
+  await expect(page.getByTestId("cloud-model-select")).toBeVisible();
+  await expect(page.getByTestId("cloud-model-select")).toHaveValue("gpt-5.5");
+  await expect(page.getByTestId("cloud-model-select").locator("option", { hasText: /^gpt-5\.4$/ })).toHaveCount(1);
+
+  const commands = await page.evaluate(() => (window as any).__CLOUD_AUTH_COMMANDS__ ?? []);
+  expect(commands.some((call: any) => call.cmd === "cloud_auth_begin" && call.args.mode === "openai_chatgpt_oauth")).toBeTruthy();
+});
+
+test("Gemini Google login shows Cloud Project hint and native model candidates", async ({ page }) => {
+  await page.goto("/?e2eScenario=cloud-settings-model-select");
+  await page.evaluate(() => {
+    (window as any).__CLOUD_AUTH_MODE__ = "gemini_google_oauth";
+  });
+
+  await page.getByTestId("cloud-auth-mode-gemini_google_oauth").click();
+  await expect(page.getByText("Gemini Google 实验登录")).toBeVisible();
+  await expect(page.getByText(/GOOGLE_CLOUD_PROJECT/)).toBeVisible();
+  await page.getByTestId("cloud-auth-login").click();
+  await expect(page.getByText(/已登录 · gemini@example\.com/)).toBeVisible();
+
+  await page.getByTestId("cloud-model-refresh").click();
+  await expect(page.getByTestId("cloud-model-select")).toBeVisible();
+  await expect(page.getByTestId("cloud-model-select").locator("option").filter({ hasText: "gemini-2.5-pro" })).toHaveCount(1);
+});
+
 test("cloud settings starts empty and saves a newly added server explicitly", async ({ page }) => {
   await page.goto("/?e2eScenario=cloud-settings-empty");
 
@@ -93,6 +175,7 @@ test("cloud settings starts empty and saves a newly added server explicitly", as
   await expect(page.getByTestId("cloud-server-item")).toHaveCount(1);
   await expect(page.getByTestId("cloud-server-item")).toContainText("未保存服务器");
   await expect(page.getByTestId("cloud-server-name-input")).toHaveValue("");
+  await page.getByText("高级兼容性").click();
   await expect(page.getByTestId("cloud-server-endpoint-input")).toHaveValue("");
   await expect(page.getByTestId("cloud-server-save")).toBeDisabled();
 
@@ -127,17 +210,9 @@ test("cloud status uses the active server model when the compatibility mirror is
 test("cloud settings refreshes models only on request and saves the selected model", async ({ page }) => {
   await page.goto("/?e2eScenario=cloud-settings-model-select");
 
-  const apiFormatSelect = page.locator("select").filter({
-    has: page.locator("option[value='responses']"),
-  });
-  const reasoningEffortSelect = page.locator("select").filter({
-    has: page.locator("option[value='xhigh']"),
-  });
-
   await expect(page.getByRole("heading", { name: "云端接口配置" })).toBeVisible();
   await expect(page.getByTestId("cloud-server-item")).toHaveCount(1);
   await expect(page.getByTestId("cloud-server-item")).toContainText("Demo Gateway");
-  await expect(apiFormatSelect).toHaveValue("responses");
   await expect(page.getByTestId("cloud-model-input")).toBeVisible();
   await expect(page.getByTestId("cloud-model-select")).toHaveCount(0);
   await expect
@@ -155,6 +230,10 @@ test("cloud settings refreshes models only on request and saves the selected mod
       page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().selectedCloudModel ?? null),
     )
     .toBe("gpt-4.1");
+  await page.getByText("高级兼容性").click();
+  const reasoningEffortSelect = page.locator("select").filter({
+    has: page.locator("option[value='xhigh']"),
+  });
   await expect(reasoningEffortSelect).toHaveValue("none");
   await expect(page.getByText("Disable Response Storage")).toBeVisible();
 
@@ -231,14 +310,14 @@ test("cloud model test falls back from Responses to Chat Completions and records
     (window as any).__CLOUD_TEST_BEHAVIOR__ = "responses-fail-chat-succeeds";
   });
 
-  const apiFormatSelect = page.locator("select").filter({
-    has: page.locator("option[value='responses']"),
-  });
-
   await page.getByTestId("cloud-model-refresh").click();
   await page.getByTestId("cloud-model-test").click();
 
   await expect(page.getByTestId("cloud-model-connected-status")).toContainText("已连通 gpt-4.1，已自动切换到 Chat Completions");
+  await page.getByText("高级兼容性").click();
+  const apiFormatSelect = page.locator("select").filter({
+    has: page.locator("option[value='responses']"),
+  });
   await expect(apiFormatSelect).toHaveValue("chat_completions");
 });
 
@@ -253,6 +332,7 @@ test("cloud settings can add, switch, refresh, and delete server configs", async
   await page.getByTestId("cloud-server-add").click();
   await expect(page.getByTestId("cloud-server-item")).toHaveCount(2);
   await page.getByTestId("cloud-server-name-input").fill("Second Gateway");
+  await page.getByText("高级兼容性").click();
   await page.getByTestId("cloud-server-endpoint-input").fill("https://second-gateway.example/v1");
   await page.getByTestId("cloud-server-api-key-input").fill("second-key");
   await page.getByTestId("cloud-model-refresh").click();

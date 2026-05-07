@@ -92,6 +92,80 @@ test("OpenAI Responses cloud requests use the non-streaming Rust proxy path", as
   assert.equal(requests[0].reasoning.effort, "xhigh");
 });
 
+test("OpenAI ChatGPT OAuth cloud requests pass token references to the Rust proxy without sampling params", async () => {
+  const invokeArgs = [];
+  const { streamChatCompletion } = await loadStreamingModule(async (command, args) => {
+    assert.equal(command, "proxy_request");
+    invokeArgs.push(args);
+    const body = JSON.parse(args.body);
+    assert.equal(args.authMode, "openai_chatgpt_oauth");
+    assert.equal(args.tokenRef, "openai-login");
+    assert.equal(args.headers.Authorization, undefined);
+    assert.equal(args.headers["x-api-key"], undefined);
+    assert.equal(body.temperature, undefined);
+    assert.equal(body.top_p, undefined);
+    return JSON.stringify({ output_text: "ok" });
+  });
+
+  await streamChatCompletion(
+    [{ role: "user", content: "hi" }],
+    {
+      baseUrl: "https://api.openai.com/v1",
+      apiKey: "",
+      model: "gpt-5.4",
+      apiProtocol: "openai",
+      apiFormat: "responses",
+      authMode: "openai_chatgpt_oauth",
+      tokenRef: "openai-login",
+      useRustProxy: true,
+    },
+    {
+      onToken: () => {},
+      onDone: () => {},
+      onError: (error) => { throw error; },
+    },
+  );
+
+  assert.equal(invokeArgs[0].url, "https://api.openai.com/v1/responses");
+});
+
+test("Gemini OAuth cloud requests use native generateContent and token refs", async () => {
+  const { streamChatCompletion } = await loadStreamingModule(async (command, args) => {
+    assert.equal(command, "proxy_request");
+    const body = JSON.parse(args.body);
+    assert.equal(args.url, "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent");
+    assert.equal(args.authMode, "gemini_google_oauth");
+    assert.equal(args.tokenRef, "gemini-login");
+    assert.equal(args.headers.Authorization, undefined);
+    assert.equal(args.headers["x-goog-api-key"], undefined);
+    assert.equal(body.contents[0].parts[0].text, "你好");
+    assert.equal(body.generationConfig.maxOutputTokens > 0, true);
+    assert.equal(body.temperature, undefined);
+    assert.equal(body.top_p, undefined);
+    return JSON.stringify({ candidates: [{ content: { parts: [{ text: "ok" }] } }] });
+  });
+
+  const result = await streamChatCompletion(
+    [{ role: "user", content: "你好" }],
+    {
+      baseUrl: "https://generativelanguage.googleapis.com",
+      apiKey: "",
+      model: "gemini-2.5-pro",
+      apiProtocol: "gemini",
+      authMode: "gemini_google_oauth",
+      tokenRef: "gemini-login",
+      useRustProxy: true,
+    },
+    {
+      onToken: () => {},
+      onDone: () => {},
+      onError: (error) => { throw error; },
+    },
+  );
+
+  assert.equal(result.content, "ok");
+});
+
 test("OpenAI Responses respects XML tool protocol by omitting native tools", async () => {
   const requests = [];
   const { streamChatCompletion } = await loadStreamingModule(async (command, args) => {
