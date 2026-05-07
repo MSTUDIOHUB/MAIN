@@ -284,6 +284,13 @@ const STRONG_EXECUTE_PATTERNS = [
   /\b(?:apply|patch|build it|go implement|implement it|fix it|ship it)\b/i,
 ];
 
+const GAME_STUDIO_EXECUTE_PATTERNS = [
+  /(?:立即|马上|现在|直接|开始|继续)(?:开始)?(?:重构|完善|实现|改造|开发|处理|执行|接入|集成)/i,
+  /(?:重构|完善|实现|改造|开发|处理|接入|集成).{0,32}(?:controller|manager|system|SnakeController|SnakeBody|脚本|系统|逻辑|功能|模块)/i,
+  /(?:把|将).{0,32}(?:接入|集成|完善|实现|改造|重构)/i,
+  /\b(?:implement|refactor|complete|continue|integrate|wire up|build|fix)\b.{0,40}\b(?:controller|manager|system|script|feature|logic)\b/i,
+];
+
 const COMPLEX_IMPLEMENTATION_PATTERNS = [
   /生成一套/i,
   /完整(?:的)?(?:系统|框架|项目|模块|流程|架构)/i,
@@ -1291,6 +1298,20 @@ export function resolveTurnRunIntent(
       confidence: 0.93,
       bypassMainRouter: false,
       riskLevel: "high",
+    });
+  }
+
+  if (context.mainModeKey === "game_studio" && matchesAny(normalizedInput, GAME_STUDIO_EXECUTE_PATTERNS)) {
+    return finalize({
+      intent: "studio_workflow",
+      reason: localizeReason(
+        language,
+        "检测到 Game Studio 中明确的实现/重构/完善请求，本轮会进入工作室执行链路。",
+        "Detected an explicit implementation/refactor/completion request inside Game Studio, so this turn will use the studio execution workflow.",
+      ),
+      confidence: 0.9,
+      bypassMainRouter: true,
+      riskLevel: "medium",
     });
   }
 

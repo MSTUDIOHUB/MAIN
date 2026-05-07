@@ -1356,14 +1356,15 @@ export default function App() {
 
     const shouldReuseSourceTurn = !!sourceTurnId && !!sourceTurn;
     const shouldExecuteFromQuickReply = optionAction === "execute_once" && sourceIntent !== "plan";
+    const executeQuickReplyIntent = state.selectedMainModeKey === "game_studio" ? "studio_workflow" as const : "execute" as const;
     const sendOptions = shouldReuseSourceTurn
       ? {
           reuseCurrentTurn: true,
           preservePlanState: sourceIntent === "plan",
-          resolvedIntent: shouldExecuteFromQuickReply ? "execute" as const : sourceIntent,
+          resolvedIntent: shouldExecuteFromQuickReply ? executeQuickReplyIntent : sourceIntent,
           ...(shouldExecuteFromQuickReply
             ? {
-                runtimeIntentOverride: "execute" as const,
+                runtimeIntentOverride: executeQuickReplyIntent,
                 executionConsentGranted: true,
               }
             : {}),
@@ -1371,8 +1372,8 @@ export default function App() {
         }
       : shouldExecuteFromQuickReply
       ? {
-          resolvedIntent: "execute" as const,
-          runtimeIntentOverride: "execute" as const,
+          resolvedIntent: executeQuickReplyIntent,
+          runtimeIntentOverride: executeQuickReplyIntent,
           executionConsentGranted: true,
           skipIntentResolution: true,
         }

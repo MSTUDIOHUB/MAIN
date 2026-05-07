@@ -10,6 +10,7 @@ test.beforeEach(async ({ page }) => {
     let callbackId = 1;
     const callbacks = new Map<number, unknown>();
     let fallbackNoToolRequests = 0;
+    let pseudoToolRecoveryRequests = 0;
     const requests: Array<{ hasTools: boolean; body: string }> = [];
     const readFileCalls: string[] = [];
 
@@ -18,6 +19,9 @@ test.beforeEach(async ({ page }) => {
       readFileCalls,
       get fallbackNoToolRequests() {
         return fallbackNoToolRequests;
+      },
+      get pseudoToolRecoveryRequests() {
+        return pseudoToolRecoveryRequests;
       },
     };
 
@@ -52,6 +56,40 @@ test.beforeEach(async ({ page }) => {
         return { path: String(args?.path ?? ""), sizeBytes: 32, modifiedMs: 1 };
       }
       if (cmd === "glob_search") return [];
+      if (cmd === "read_file_window") {
+        const path = String(args?.path ?? "");
+        const scenario = new URL(window.location.href).searchParams.get("e2eScenario");
+        if (
+          scenario === "game-studio-execute-reply-runtime" &&
+          path === "Assets/Scripts/Entities/SnakeController.cs"
+        ) {
+          readFileCalls.push(path);
+          return {
+            path,
+            content: "public class SnakeController {}",
+            startLine: 1,
+            endLine: 1,
+            totalLines: 1,
+            totalChars: 31,
+            returnedChars: 31,
+            truncated: false,
+          };
+        }
+        if (path === "README.md" || /^README-\d+\.md$/.test(path)) {
+          readFileCalls.push(path);
+          return {
+            path,
+            content: "# README\n\nfallback-ok\n",
+            startLine: 1,
+            endLine: 3,
+            totalLines: 3,
+            totalChars: 22,
+            returnedChars: 22,
+            truncated: false,
+          };
+        }
+        throw new Error(`ENOENT: ${path}`);
+      }
       if (cmd === "read_file") {
         const path = String(args?.path ?? "");
         const scenario = new URL(window.location.href).searchParams.get("e2eScenario");
@@ -89,6 +127,13 @@ test.beforeEach(async ({ page }) => {
         if (scenario === "existing-plan-folder-execute" && Object.prototype.hasOwnProperty.call(planFiles, path)) {
           readFileCalls.push(path);
           return planFiles[path];
+        }
+        if (
+          scenario === "game-studio-execute-reply-runtime" &&
+          path === "Assets/Scripts/Entities/SnakeController.cs"
+        ) {
+          readFileCalls.push(path);
+          return "public class SnakeController {}";
         }
         if (path !== "README.md" && !/^README-\d+\.md$/.test(path)) {
           throw new Error(`ENOENT: ${path}`);
@@ -174,6 +219,52 @@ test.beforeEach(async ({ page }) => {
               "<option>我来确认无误再执行</option>",
               "</user_options>",
             ].join("\n"),
+          });
+        }
+
+        if (scenario === "game-studio-execute-reply-runtime") {
+          if (body.includes("立即开始重构并完善")) {
+            return JSON.stringify({
+              output_text: [
+                "我会读取 SnakeController 并开始重构。",
+                "<tool_use>",
+                "<tool>read_file</tool>",
+                "<parameter name=\"path\">Assets/Scripts/Entities/SnakeController.cs</parameter>",
+                "</tool_use>",
+              ].join("\n"),
+            });
+          }
+          return JSON.stringify({
+            output_text: [
+              "我需要确认是否进入执行能力继续。",
+              "<user_options>",
+              "<option>立即开始重构并完善</option>",
+              "<option>先继续讨论方案</option>",
+              "</user_options>",
+            ].join("\n"),
+          });
+        }
+
+        if (scenario === "pseudo-tool-call-recovery") {
+          if (body.includes("READ_FILE_RESULT") || body.includes("fallback-ok")) {
+            return JSON.stringify({
+              output_text: "已读取 README.md，确认包含 fallback-ok。",
+            });
+          }
+          if (body.includes("不是可执行工具调用") || body.includes("not an executable tool call")) {
+            pseudoToolRecoveryRequests += 1;
+            return JSON.stringify({
+              output_text: [
+                "我会改用正式 XML 工具调用读取文件。",
+                "<tool_use>",
+                "<tool>read_file</tool>",
+                "<parameter name=\"path\">README.md</parameter>",
+                "</tool_use>",
+              ].join("\n"),
+            });
+          }
+          return JSON.stringify({
+            output_text: "[Tool call: read_file]",
           });
         }
 
@@ -348,6 +439,78 @@ test("execute quick reply switches a discuss turn to execute runtime and keeps t
       currentTurnIntent: "execute",
       agentStatus: "pending_review",
       hasExecuteToolBlock: true,
+    });
+});
+
+test("game studio execute reply resumes the source turn with studio workflow tools", async ({ page }) => {
+  await page.goto("/?e2eScenario=game-studio-execute-reply-runtime");
+
+  const sent = await page.evaluate(() =>
+    (window as any).__CODELY_E2E__?.sendCloudMessage?.("请检查 SnakeController 下一步。"),
+  );
+  expect(sent).toBe(true);
+
+  await expect(page.getByTestId("top-island-awaiting-choice")).toBeVisible();
+  await expect(page.getByTestId("top-island-reply-option-0")).toContainText("立即开始重构并完善");
+
+  await page.getByTestId("top-island-reply-option-0").click();
+
+  await expect
+    .poll(async () =>
+      page.evaluate(() => {
+        const probe = (window as any).__CLOUD_TOOL_PROTOCOL_TEST__;
+        const requests = probe?.requests || [];
+        const executionRequest = [...requests]
+          .reverse()
+          .find((request: any) => request.hasTools && String(request.body || "").includes("立即开始重构并完善"));
+        if (!executionRequest) return null;
+        const parsed = JSON.parse(executionRequest.body || "{}");
+        const names = (parsed.tools || []).map((tool: any) => tool?.name || tool?.function?.name).filter(Boolean);
+        const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+        return {
+          hasRead: names.includes("read_file"),
+          hasWrite: names.includes("write_file") && names.includes("replace_in_file"),
+          currentTurnIntent: snapshot?.currentTurnIntent,
+          turns: snapshot?.conversationTurns,
+          archivedOptionCount: snapshot?.archivedOptionCount,
+          readFileCalls: probe?.readFileCalls || [],
+        };
+      }),
+    )
+    .toEqual({
+      hasRead: true,
+      hasWrite: true,
+      currentTurnIntent: "studio_workflow",
+      turns: 1,
+      archivedOptionCount: 1,
+      readFileCalls: ["Assets/Scripts/Entities/SnakeController.cs"],
+    });
+});
+
+test("pseudo tool call placeholder triggers XML recovery instead of stopping as final text", async ({ page }) => {
+  await page.goto("/?e2eScenario=pseudo-tool-call-recovery");
+
+  const sent = await page.evaluate(() =>
+    (window as any).__CODELY_E2E__?.sendCloudMessage?.("请读取 README.md。"),
+  );
+  expect(sent).toBe(true);
+
+  await expect(page.getByText("我会改用正式 XML 工具调用读取文件。")).toBeVisible();
+  await expect(page.getByText("[Tool call: read_file]")).toHaveCount(0);
+
+  await expect
+    .poll(async () =>
+      page.evaluate(() => {
+        const probe = (window as any).__CLOUD_TOOL_PROTOCOL_TEST__;
+        return {
+          recoveryRequests: probe?.pseudoToolRecoveryRequests ?? 0,
+          readFileCalls: probe?.readFileCalls || [],
+        };
+      }),
+    )
+    .toEqual({
+      recoveryRequests: 1,
+      readFileCalls: ["README.md"],
     });
 });
 

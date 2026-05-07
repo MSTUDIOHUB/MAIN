@@ -401,6 +401,7 @@ export function buildSystemPrompt(
     tfl.push("<tool>工具名称</tool>");
     tfl.push(String.raw`<parameter name="参数名">参数值</parameter>`);
     tfl.push("</tool_use>");
+    tfl.push("禁止输出 `[Tool call: ...]`、`Tool call: read_file`、`我要调用工具` 这类占位文本；这些不是可执行工具调用，会被视为协议错误。需要工具时必须输出完整 `<tool_use>`，并补齐必填参数。");
     tfl.push("");
     tfl.push("⚠️ `<analysis>` 中的内容默认对用户隐藏，且即使用户开启过程显示也只会以过滤摘要呈现；你的分析、总结、方案必须以普通 Markdown 文本输出，不能放在 `<analysis>` 内。");
     tfl.push("");

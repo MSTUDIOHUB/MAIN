@@ -420,6 +420,34 @@ test("game studio workflow slash bypasses MAIN plan interception", () => {
   assert.equal(result.bypassMainRouter, true);
 });
 
+test("game studio explicit implementation text enters studio workflow", () => {
+  for (const input of [
+    "立即开始重构并完善",
+    "继续实现 SnakeController",
+    "开始重构 SnakeController 移动逻辑",
+    "完善 SnakeController",
+  ]) {
+    const result = resolveTurnRunIntent(
+      input,
+      createContext({
+        mainModeKey: "game_studio",
+      }),
+    );
+    assert.equal(result.intent, "studio_workflow", input);
+    assert.equal(result.bypassMainRouter, true, input);
+  }
+});
+
+test("game studio ordinary explanatory text still defaults to discuss", () => {
+  const result = resolveTurnRunIntent(
+    "帮我解释一下当前玩法思路",
+    createContext({
+      mainModeKey: "game_studio",
+    }),
+  );
+  assert.equal(result.intent, "discuss");
+});
+
 test("natural Chinese approval phrases advance an existing plan into execution", () => {
   const result = resolveTurnRunIntent(
     "可以开始执行设计方案了",

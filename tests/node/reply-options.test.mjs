@@ -318,6 +318,19 @@ test("extractReplyOptions marks explicit execution choices for runtime execute",
   assert.equal(inferred.replyOptions[0].action, "execute_once");
   assert.equal(inferred.replyOptions[1].action, undefined);
 
+  const gameStudio = extractReplyOptions(`
+我需要确认是否进入执行能力继续。
+
+<user_options>
+<option>立即开始重构并完善</option>
+<option>先继续讨论方案</option>
+</user_options>
+  `);
+
+  assert.equal(gameStudio.replyOptions[0].value, "立即开始重构并完善");
+  assert.equal(gameStudio.replyOptions[0].action, "execute_once");
+  assert.equal(gameStudio.replyOptions[1].action, undefined);
+
   const explicit = extractReplyOptions(`
 请选择下一步：
 

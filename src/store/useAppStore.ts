@@ -4622,6 +4622,15 @@ export const useAppStore = create<AppState>()(
     const currentTurn = state.currentTurnId
       ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId) || null
       : null;
+    const currentTurnReplyOptionBlocks = currentTurn
+      ? state.taskFlow.filter((block): block is Extract<TaskBlock, { type: "agent" }> =>
+          block.turnId === currentTurn.id &&
+          block.type === "agent" &&
+          Array.isArray(block.options) &&
+          block.options.length > 0,
+        )
+      : [];
+    const currentTurnHasReplyOptions = currentTurnReplyOptionBlocks.length > 0;
     const currentTurnIntent = resolveConversationTurnIntent(currentTurn);
     const currentMainModeKey = state.selectedMainModeKey;
     const hasPlanArtifacts = state.planArtifacts.length > 0 || state.planStage !== "idle";
@@ -4642,7 +4651,8 @@ export const useAppStore = create<AppState>()(
     const shouldAutoResumeChoiceTurn =
       !isHidden &&
       options?.reuseCurrentTurn !== true &&
-      currentTurn?.status === "awaiting_input";
+      !!currentTurn &&
+      (currentTurn.status === "awaiting_input" || currentTurnHasReplyOptions);
     const reusableTurnId = shouldContinuePreviousTurnIntent
       ? previousTurnContinuationTarget?.id ?? null
       : state.currentTurnId;
@@ -4651,7 +4661,22 @@ export const useAppStore = create<AppState>()(
       !!reusableTurnId;
     const shouldReuseExistingTurnIntent =
       reuseCurrentTurn &&
-      currentTurn?.status === "awaiting_input";
+      !!currentTurn &&
+      (currentTurn.status === "awaiting_input" || currentTurnHasReplyOptions);
+    const awaitingChoiceBlocks = shouldReuseExistingTurnIntent
+      ? currentTurnReplyOptionBlocks
+      : [];
+    const selectedAwaitingChoice = text.trim();
+    const selectedAwaitingReplyOption = selectedAwaitingChoice
+      ? awaitingChoiceBlocks
+          .flatMap((block) => block.options || [])
+          .find((option) =>
+            option.value === selectedAwaitingChoice ||
+            option.label === selectedAwaitingChoice
+          ) || null
+      : null;
+    const shouldExecuteOnceFromReplyOption =
+      selectedAwaitingReplyOption?.action === "execute_once";
     const preservePlanState =
       options?.preservePlanState === true ||
       shouldContinuePlanIntent ||
@@ -4771,6 +4796,20 @@ export const useAppStore = create<AppState>()(
         : resolveRunIntentFromLegacyWorkflowMode(state.config.workflowMode));
     let effectiveIntentSummary = normalizeIntentSummary(options?.intentSummary || "");
     let effectiveCommandDirective: CommandDirective | null = options?.commandDirective ?? null;
+    if (shouldExecuteOnceFromReplyOption && effectiveRunIntent === "discuss") {
+      effectiveRunIntent = currentMainModeKey === "game_studio" ? "studio_workflow" : "execute";
+      effectiveCommandDirective = effectiveCommandDirective || inferCommandDirective(text, effectiveRunIntent, {
+        source: "continuation",
+      });
+      effectiveIntentSummary = effectiveIntentSummary || buildRunIntentSummary({
+        input: text,
+        intent: effectiveRunIntent,
+        language: preferredLanguage,
+        reason: preferredLanguage === "en"
+          ? "The user selected an execution reply option, so this turn resumes with execute runtime tools."
+          : "用户选择了执行型回复选项，本轮使用执行运行能力继续。",
+      });
+    }
 
     if (!effectiveCommandDirective && parsedStudioCommand?.type === "workflow") {
       effectiveCommandDirective = inferCommandDirective(text, "studio_workflow", {
@@ -5062,8 +5101,13 @@ export const useAppStore = create<AppState>()(
 
     const effectiveIntentPolicy = getIntentPolicy(effectiveRunIntent);
     const effectiveWorkflowMode = effectiveIntentPolicy.workflowMode;
-    const runtimeRunIntent = options?.runtimeIntentOverride || effectiveRunIntent;
-    const shouldGrantExecutionConsentForTurn = options?.executionConsentGranted === true;
+    const runtimeRunIntent = options?.runtimeIntentOverride ||
+      (shouldExecuteOnceFromReplyOption
+        ? currentMainModeKey === "game_studio" ? "studio_workflow" : "execute"
+        : effectiveRunIntent);
+    const shouldGrantExecutionConsentForTurn =
+      options?.executionConsentGranted === true ||
+      shouldExecuteOnceFromReplyOption;
     const initialTurnStatus: ConversationTurnStatus =
       effectiveRunIntent === "plan" && !state.isPlanApproved
         ? "planning"

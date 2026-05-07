@@ -277,6 +277,31 @@ test("game studio prompt exposes protocol paths and sticky specialist context", 
   assert.match(prompt, /Game Studio Pack 已初始化/);
 });
 
+test("execute prompt forbids pseudo tool call placeholders", () => {
+  const prompt = buildSystemPrompt(
+    [],
+    "/tmp/workspace",
+    "nexus_game_studio",
+    "",
+    [],
+    [],
+    "studio_workflow",
+    "zh",
+    null,
+    {
+      initialized: true,
+      activeStudioAgentKey: "studio_auto",
+      pendingSlashCommand: null,
+    },
+    "studio_workflow",
+    "english_core_localized_output",
+    ["read_file", "replace_in_file"],
+  );
+
+  assert.match(prompt, /禁止输出 `\[Tool call: \.\.\.\]`/);
+  assert.match(prompt, /必须输出完整 `<tool_use>`/);
+});
+
 test("active protocol packages advertise the exact entry path instead of a bare file name", () => {
   const prompt = buildSystemPrompt(
     [{

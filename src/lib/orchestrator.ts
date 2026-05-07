@@ -626,6 +626,38 @@ function buildExecuteConvergencePrompt(language: "zh" | "en", iteration: number,
       ].join("\n");
 }
 
+const PSEUDO_TOOL_CALL_RE = /(?:^|\n)\s*(?:\[(?:Tool call|tool_call|工具调用)\s*:\s*([a-z_][a-z0-9_]*)\s*\]|(?:Tool call|tool_call|工具调用)\s*:\s*([a-z_][a-z0-9_]*))\s*$/im;
+
+export function looksLikePseudoToolCallPlaceholder(text: string): boolean {
+  const content = String(text || "");
+  if (!content.trim()) return false;
+  if (/<tool_use>|<tool_call|<function_call/i.test(content)) return false;
+  return PSEUDO_TOOL_CALL_RE.test(content);
+}
+
+export function buildPseudoToolCallRecoveryPrompt(language: "zh" | "en", workflowMode: "chat" | "edit" | "plan"): string {
+  const modeText = workflowMode === "chat" ? "read-only/discussion" : workflowMode === "plan" ? "plan" : "execute";
+  return language === "zh"
+    ? [
+        "你刚才输出了 `[Tool call: ...]` 这种占位文本，但它不是可执行工具调用，MAIN 不能据此执行工具。",
+        "如果你需要工具，必须立即用正式 XML 工具协议重发，并补齐所有必填参数：",
+        "<tool_use>",
+        "<tool>read_file</tool>",
+        "<parameter name=\"path\">相对 workspace 的文件路径</parameter>",
+        "</tool_use>",
+        `当前运行阶段：${modeText}。不要再输出 \`[Tool call: ...]\`、不要只描述“我要调用工具”。如果缺少路径或参数，请先用可用的只读工具获取上下文，或直接用可见正文说明缺口。`,
+      ].join("\n")
+    : [
+        "You just emitted a `[Tool call: ...]` placeholder. That is not an executable tool call, so MAIN cannot run a tool from it.",
+        "If you need a tool, immediately resend it using the formal XML tool protocol with all required parameters:",
+        "<tool_use>",
+        "<tool>read_file</tool>",
+        "<parameter name=\"path\">workspace-relative file path</parameter>",
+        "</tool_use>",
+        `Current workflow mode: ${modeText}. Do not output \`[Tool call: ...]\` again or merely describe that you will call a tool. If a path or argument is missing, use an available read-only tool to gather context or explain the gap in visible text.`,
+      ].join("\n");
+}
+
 function looksLikePlanCompletionClaim(text: string): boolean {
   const normalized = String(text || "").replace(/\s+/g, " ").trim();
   if (!normalized) return false;
@@ -2017,6 +2049,7 @@ export async function executeAgentLoop(
   let sawPlanModeToolActivity = false;
   let usedPlanRecoveryPrompt = false;
   let usedToolUnavailableRecoveryPrompt = false;
+  let usedPseudoToolCallRecoveryPrompt = false;
   let usedExecuteConvergencePrompt = false;
   const attemptedPlanWriteTargets: string[] = [];
   let recentSuccessfulProjectWrite: { name: string; target: string } | null = null;
@@ -2627,10 +2660,19 @@ export async function executeAgentLoop(
       ? buildPlanFallbackNotice(callbacks.getPreferredLanguage(), sourceVisibleText.length)
       : normalizedVisibleTextForUser;
     const finalReplyOptions = compactedProseCodeDump || autoContinueReadOnlyPermission ? [] : normalized.replyOptions;
+    const pseudoToolCallPlaceholder =
+      effectiveToolCalls.length === 0 &&
+      finalReplyOptions.length === 0 &&
+      !compactedProseCodeDump &&
+      !compactedIncompletePlanText &&
+      (
+        looksLikePseudoToolCallPlaceholder(normalized.visibleText) ||
+        looksLikePseudoToolCallPlaceholder(normalized.hiddenThought)
+      );
     const syntheticVisibleConclusion =
       !compactedProseCodeDump &&
       !compactedIncompletePlanText &&
-      isSyntheticVisibleConclusion(finalVisibleText);
+      (isSyntheticVisibleConclusion(finalVisibleText) || pseudoToolCallPlaceholder);
     const userVisibleText = syntheticVisibleConclusion ? "" : finalVisibleText;
     if (syntheticVisibleConclusion) {
       callbacks.onStreamToken("__ESCALATION_RESET__:", assistantMsgId);
@@ -2679,6 +2721,23 @@ export async function executeAgentLoop(
       callbacks.appendMessage({
         role: "user",
         content: buildToolUnavailableRecoveryPrompt(callbacks.getPreferredLanguage(), workflowMode),
+      });
+      continue;
+    }
+
+    if (pseudoToolCallPlaceholder && !usedPseudoToolCallRecoveryPrompt) {
+      usedPseudoToolCallRecoveryPrompt = true;
+      logAgentEvent("pseudo_tool_call_reprompt", {
+        iteration,
+        workflowMode,
+        turnIntent,
+        visibleChars: normalized.visibleText.length,
+        hiddenThoughtChars: normalized.hiddenThought.length,
+      });
+      callbacks.onStatusChange("running");
+      callbacks.appendMessage({
+        role: "user",
+        content: buildPseudoToolCallRecoveryPrompt(callbacks.getPreferredLanguage(), workflowMode),
       });
       continue;
     }

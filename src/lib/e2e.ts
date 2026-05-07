@@ -25,6 +25,8 @@ const CLOUD_TOOL_FALLBACK_SCENARIO = "cloud-tool-fallback";
 const REPLY_OPTIONS_TOOL_PAUSE_SCENARIO = "reply-options-tool-pause";
 const PLAN_APPROVAL_EXECUTE_TOOLS_SCENARIO = "plan-approval-execute-tools";
 const EXECUTE_QUICK_REPLY_RUNTIME_SCENARIO = "execute-quick-reply-runtime";
+const GAME_STUDIO_EXECUTE_REPLY_SCENARIO = "game-studio-execute-reply-runtime";
+const PSEUDO_TOOL_CALL_RECOVERY_SCENARIO = "pseudo-tool-call-recovery";
 const EXISTING_PLAN_FOLDER_EXECUTE_SCENARIO = "existing-plan-folder-execute";
 const EXECUTE_MAX_ITERATIONS_CHECKPOINT_SCENARIO = "execute-max-iterations-checkpoint";
 const TOP_ISLAND_EXECUTION_PROGRESS_SCENARIO = "top-island-execution-progress";
@@ -2519,7 +2521,13 @@ function seedCloudToolProtocolScenario(scenario: string) {
 
   const now = Date.now();
   const workspace = `/tmp/e2e-${scenario}`;
-  const sessionId = scenario === CLOUD_TOOL_FALLBACK_SCENARIO ? 999501 : 999502;
+  const sessionId = scenario === CLOUD_TOOL_FALLBACK_SCENARIO
+    ? 999501
+    : scenario === GAME_STUDIO_EXECUTE_REPLY_SCENARIO
+    ? 999504
+    : scenario === PSEUDO_TOOL_CALL_RECOVERY_SCENARIO
+    ? 999505
+    : 999502;
   const server = {
     id: `e2e-${scenario}-server`,
     name: "E2E Cloud",
@@ -2558,7 +2566,13 @@ function seedCloudToolProtocolScenario(scenario: string) {
       [workspace]: [
         {
           id: sessionId,
-          title: scenario === CLOUD_TOOL_FALLBACK_SCENARIO ? "E2E Cloud Tool Fallback" : "E2E Reply Options Tool Pause",
+          title: scenario === CLOUD_TOOL_FALLBACK_SCENARIO
+            ? "E2E Cloud Tool Fallback"
+            : scenario === GAME_STUDIO_EXECUTE_REPLY_SCENARIO
+            ? "E2E Game Studio Execute Reply"
+            : scenario === PSEUDO_TOOL_CALL_RECOVERY_SCENARIO
+            ? "E2E Pseudo Tool Call Recovery"
+            : "E2E Reply Options Tool Pause",
           date: new Date(now).toISOString(),
           active: true,
           storageStatus: "temporary",
@@ -2568,8 +2582,8 @@ function seedCloudToolProtocolScenario(scenario: string) {
       ],
     },
     currentSessionId: sessionId,
-    selectedMainModeKey: "main_mode",
-    selectedNexusModeKey: "nexus_general",
+    selectedMainModeKey: scenario === GAME_STUDIO_EXECUTE_REPLY_SCENARIO ? "game_studio" : "main_mode",
+    selectedNexusModeKey: scenario === GAME_STUDIO_EXECUTE_REPLY_SCENARIO ? "nexus_game_studio" : "nexus_general",
     taskFlow: [],
     agentMessages: [],
     conversationTurns: [],
@@ -3245,6 +3259,14 @@ export function initializeE2EScenarios(): (() => void) | undefined {
 
   if (scenario === EXECUTE_QUICK_REPLY_RUNTIME_SCENARIO) {
     return seedCloudToolProtocolScenario(EXECUTE_QUICK_REPLY_RUNTIME_SCENARIO);
+  }
+
+  if (scenario === GAME_STUDIO_EXECUTE_REPLY_SCENARIO) {
+    return seedCloudToolProtocolScenario(GAME_STUDIO_EXECUTE_REPLY_SCENARIO);
+  }
+
+  if (scenario === PSEUDO_TOOL_CALL_RECOVERY_SCENARIO) {
+    return seedCloudToolProtocolScenario(PSEUDO_TOOL_CALL_RECOVERY_SCENARIO);
   }
 
   if (scenario === EXISTING_PLAN_FOLDER_EXECUTE_SCENARIO) {
