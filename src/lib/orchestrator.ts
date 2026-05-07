@@ -1811,12 +1811,13 @@ export async function executeAgentLoop(
 
   // Discover MCP tools from configured servers
   const mcpServers = callbacks.getMcpServers();
+  const enabledMcpServers = mcpServers.filter((server) => server.enabled !== false);
   let mcpTools = callbacks.getMcpDiscoveredTools();
   let mcpToolServerMap = getMcpToolServerMap();
 
-  if (mcpServers.length > 0) {
-    console.log(`[orchestrator] Discovering tools from ${mcpServers.length} MCP server(s)...`);
-    const { tools: discovered, toolServerMap } = await discoverAllMcpTools(mcpServers);
+  if (enabledMcpServers.length > 0) {
+    console.log(`[orchestrator] Discovering tools from ${enabledMcpServers.length} enabled MCP server(s)...`);
+    const { tools: discovered, toolServerMap } = await discoverAllMcpTools(enabledMcpServers);
     mcpToolServerMap = toolServerMap;
     setMcpToolServerMap(toolServerMap);
     if (discovered.length > 0) {
@@ -1833,7 +1834,7 @@ export async function executeAgentLoop(
     .find((message) => message.role === "user");
   const mcpRoutingResult = routeMcpToolsForPrompt({
     tools: mcpTools,
-    servers: mcpServers,
+    servers: enabledMcpServers,
     toolServerMap: mcpToolServerMap,
     userPrompt: latestUserPrompt ? extractCompatibilityTextContent(latestUserPrompt.content) : "",
     config: config.mcpRouting,
@@ -1847,7 +1848,7 @@ export async function executeAgentLoop(
     toolDefinitions: routedToolDefinitions,
     skills,
     mcpTools,
-    mcpServers,
+    mcpServers: enabledMcpServers,
     mcpToolServerMap,
     policy: config.toolPermissionPolicy,
   });

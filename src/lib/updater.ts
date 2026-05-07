@@ -34,7 +34,7 @@ function isUpdaterUnavailable(error: unknown) {
   );
 }
 
-export async function checkForMainUpdate() {
+export async function checkForMainUpdate(options: { ignoreUnavailable?: boolean } = {}) {
   try {
     const update = await check({ timeout: 15_000 });
     if (!update) return null;
@@ -47,7 +47,7 @@ export async function checkForMainUpdate() {
       date: update.date,
     } satisfies MainUpdateInfo;
   } catch (error) {
-    if (isUpdaterUnavailable(error)) return null;
+    if (options.ignoreUnavailable !== false && isUpdaterUnavailable(error)) return null;
     throw error;
   }
 }

@@ -50,7 +50,7 @@ interface GitFeedbackState {
   text: string;
 }
 
-type SidebarUpdateStatus = "idle" | "checking" | "available" | "downloading" | "installing" | "error";
+type SidebarUpdateStatus = "idle" | "checking" | "upToDate" | "available" | "downloading" | "installing" | "error";
 
 const IconLogoM = ({ className, ...props }: { className?: string; [key: string]: any }) => (
   <svg

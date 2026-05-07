@@ -2,6 +2,7 @@ import { useRef, useEffect, useCallback, useMemo, useState } from "react";
 import { open } from '@tauri-apps/plugin-dialog';
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getVersion } from "@tauri-apps/api/app";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 
 import Sidebar from "./components/Sidebar";
@@ -56,6 +57,7 @@ import { runAfterNextPaint } from "./lib/uiScheduling";
 import { checkForMainUpdate, installMainUpdate, type MainUpdateInfo, type MainUpdateProgress } from "./lib/updater";
 import { normalizeConversationDisplayTitle, type ReplyOption, type RightPanelTab } from "./lib/workflowModels";
 import { appendDebugLog } from "./lib/debugLog";
+import { applyAppIconVariant } from "./lib/appIcon";
 import {
   createFeishuPairedUserFromMessage,
   createFeishuPairingRequest,
@@ -76,7 +78,7 @@ function normalizeStoredRightPanelTab(value: unknown): RightPanelTab {
     : "plan";
 }
 
-type MainUpdateStatus = "idle" | "checking" | "available" | "downloading" | "installing" | "error";
+type MainUpdateStatus = "idle" | "checking" | "upToDate" | "available" | "downloading" | "installing" | "error";
 
 const MAIN_UPDATE_LAST_CHECK_KEY = "main:lastDesktopUpdateCheckAt";
 const MAIN_UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
@@ -719,6 +721,8 @@ export default function App() {
   const [availableMainUpdate, setAvailableMainUpdate] = useState<MainUpdateInfo | null>(null);
   const [mainUpdateError, setMainUpdateError] = useState("");
   const [mainUpdateProgress, setMainUpdateProgress] = useState<MainUpdateProgress | null>(null);
+  const [lastMainUpdateCheckedAt, setLastMainUpdateCheckedAt] = useState<number | null>(null);
+  const [appVersion, setAppVersion] = useState("");
   const pendingRightPanelWidthRef = useRef<number | null>(null);
   const rightPanelResizeFrameRef = useRef<number | null>(null);
 
@@ -956,6 +960,14 @@ export default function App() {
   // Log only the initial mount snapshot.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+  useEffect(() => {
+    void applyAppIconVariant(config.appIconVariant).catch((error) => {
+      appendDebugLog("warn", "app.icon", {
+        phase: "apply_failed",
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
+  }, [config.appIconVariant]);
   useEffect(() => {
     let cancelled = false;
     const migrateLegacySessions = async () => {
@@ -2529,28 +2541,99 @@ export default function App() {
 
   useEffect(() => {
     let cancelled = false;
+    const storedLastCheckedAt = Number(window.localStorage.getItem(MAIN_UPDATE_LAST_CHECK_KEY) || "0");
+    if (Number.isFinite(storedLastCheckedAt) && storedLastCheckedAt > 0) {
+      setLastMainUpdateCheckedAt(storedLastCheckedAt);
+    }
+
+    void getVersion()
+      .then((version) => {
+        if (!cancelled) setAppVersion(version);
+      })
+      .catch((error) => {
+        appendDebugLog("warn", "main.update", {
+          phase: "version_read_failed",
+          error: getErrorMessage(error),
+        });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const runMainUpdateCheck = useCallback(async (
+    source: "startup" | "manual",
+    options: { force?: boolean } = {},
+  ) => {
+    const now = Date.now();
+    const lastCheckedAt = Number(window.localStorage.getItem(MAIN_UPDATE_LAST_CHECK_KEY) || "0");
+    const elapsedMs = Number.isFinite(lastCheckedAt) ? now - lastCheckedAt : Number.POSITIVE_INFINITY;
+
+    if (!options.force && Number.isFinite(lastCheckedAt) && elapsedMs < MAIN_UPDATE_CHECK_INTERVAL_MS) {
+      if (lastCheckedAt > 0) setLastMainUpdateCheckedAt(lastCheckedAt);
+      appendDebugLog("info", "main.update", {
+        phase: "check_skipped_throttled",
+        source,
+        lastCheckedAt,
+        elapsedMs,
+        nextAllowedAt: lastCheckedAt + MAIN_UPDATE_CHECK_INTERVAL_MS,
+      });
+      return null;
+    }
+
+    window.localStorage.setItem(MAIN_UPDATE_LAST_CHECK_KEY, String(now));
+    setLastMainUpdateCheckedAt(now);
+    setMainUpdateStatus("checking");
+    setMainUpdateError("");
+    setMainUpdateProgress(null);
+    setAvailableMainUpdate(null);
+    appendDebugLog("info", "main.update", {
+      phase: "check_start",
+      source,
+      force: !!options.force,
+      currentVersion: appVersion || undefined,
+    });
+
+    try {
+      const update = await checkForMainUpdate({ ignoreUnavailable: !options.force });
+      setAvailableMainUpdate(update);
+      setMainUpdateStatus(update ? "available" : "upToDate");
+
+      appendDebugLog("info", "main.update", update
+        ? {
+            phase: "check_available",
+            source,
+            currentVersion: update.currentVersion,
+            version: update.version,
+            date: update.date,
+          }
+        : {
+            phase: "check_up_to_date",
+            source,
+            currentVersion: appVersion || undefined,
+          });
+
+      return update;
+    } catch (error) {
+      const message = getErrorMessage(error) || "Update check failed.";
+      setMainUpdateStatus("error");
+      setMainUpdateError(message);
+      setMainUpdateProgress(null);
+      appendDebugLog("warn", "main.update", {
+        phase: "check_failed",
+        source,
+        error: message,
+      });
+      return null;
+    }
+  }, [appVersion]);
+
+  useEffect(() => {
+    let cancelled = false;
     const timer = window.setTimeout(() => {
       void (async () => {
-        const now = Date.now();
-        const lastCheckedAt = Number(window.localStorage.getItem(MAIN_UPDATE_LAST_CHECK_KEY) || "0");
-        if (Number.isFinite(lastCheckedAt) && now - lastCheckedAt < MAIN_UPDATE_CHECK_INTERVAL_MS) return;
-
-        window.localStorage.setItem(MAIN_UPDATE_LAST_CHECK_KEY, String(now));
-        setMainUpdateStatus("checking");
-
-        try {
-          const update = await checkForMainUpdate();
-          if (cancelled) return;
-
-          setMainUpdateError("");
-          setMainUpdateProgress(null);
-          setAvailableMainUpdate(update);
-          setMainUpdateStatus(update ? "available" : "idle");
-        } catch (error) {
-          if (cancelled) return;
-          console.debug("MAIN update check failed", error);
-          setMainUpdateStatus("idle");
-        }
+        if (cancelled) return;
+        await runMainUpdateCheck("startup", { force: false });
       })();
     }, MAIN_UPDATE_STARTUP_DELAY_MS);
 
@@ -2558,7 +2641,11 @@ export default function App() {
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, []);
+  }, [runMainUpdateCheck]);
+
+  const handleCheckMainUpdate = useCallback(() => {
+    void runMainUpdateCheck("manual", { force: true });
+  }, [runMainUpdateCheck]);
 
   const handleInstallMainUpdate = useCallback(async () => {
     if (!availableMainUpdate || mainUpdateStatus === "downloading" || mainUpdateStatus === "installing") return;
@@ -2588,6 +2675,11 @@ export default function App() {
     setMainUpdateStatus("downloading");
     setMainUpdateError("");
     setMainUpdateProgress(null);
+    appendDebugLog("info", "main.update", {
+      phase: "install_start",
+      currentVersion: availableMainUpdate.currentVersion,
+      version: availableMainUpdate.version,
+    });
 
     try {
       await installMainUpdate(availableMainUpdate, (progress) => {
@@ -2595,9 +2687,16 @@ export default function App() {
         setMainUpdateStatus(progress.stage);
       });
     } catch (error) {
+      const message = getErrorMessage(error) || (language === "en" ? "Update failed." : "更新失败。");
       setMainUpdateStatus("error");
-      setMainUpdateError(getErrorMessage(error) || (language === "en" ? "Update failed." : "更新失败。"));
+      setMainUpdateError(message);
       setMainUpdateProgress(null);
+      appendDebugLog("warn", "main.update", {
+        phase: "install_failed",
+        currentVersion: availableMainUpdate.currentVersion,
+        version: availableMainUpdate.version,
+        error: message,
+      });
     }
   }, [availableMainUpdate, mainUpdateStatus]);
 
@@ -2916,7 +3015,7 @@ export default function App() {
       <ChatArea taskFlow={taskFlow} t={t} config={config} setSettingsTab={setSettingsTab} setIsSettingsOpen={setIsSettingsOpen} activeDiffTask={activeDiffTask} endOfFlowRef={endOfFlowRef} isStreaming={isStreaming} activeSessionKey={activeSessionKey} onStopGeneration={handleStopGeneration} onLoadOlderSessionHistory={getCachedSessionTranscript(activeSessionKey)?.hasMore ? handleLoadOlderSessionHistory : undefined} allowToolAction={allowToolAction} rejectToolAction={rejectToolAction} autoApproveTools={autoApproveTools} onToggleAutoApprove={setAutoApproveTools} input={input} setInput={setInput} contextMentions={contextMentions} setContextMentions={setContextMentions} attachedFiles={attachedFiles} setAttachedFiles={setAttachedFiles} onAttachFile={handleAttachFile} showAgentPicker={showAgentPicker} setShowAgentPicker={setShowAgentPicker} selectedMainModeKey={selectedMainModeKey} setSelectedMainModeKey={setSelectedMainModeKey} mainModes={mainModes} activeStudioAgentKey={activeStudioAgentKey} setActiveStudioAgentKey={setActiveStudioAgentKey} gameStudioInitialized={gameStudioInitialized} initializeGameStudioWorkspace={initializeGameStudioWorkspace} removeGameStudioWorkspace={removeGameStudioWorkspace} currentWorkspace={currentWorkspace} handleAcceptInline={handleAcceptInline} handleRejectInline={handleRejectInline} onSendMessage={handleSendMessage} onQuickReply={handleQuickReply} />
       <FilePanel width={filePanelWidth} onStartResizing={startFilePanelResizing} />
       <RightPanel activeDiffTask={activeDiffTask} rightPanelWidth={rightPanelWidth} startResizing={startResizing} />
-      <SettingsModal isOpen={isSettingsOpen} onClose={() => setIsSettingsOpen(false)} config={config} setConfig={setConfig} t={t} THEMES={THEMES} settingsTab={settingsTab} setSettingsTab={setSettingsTab} mcpServers={mcpServers} setMcpServers={setMcpServers} mcpDiscoveredTools={mcpDiscoveredTools} setMcpDiscoveredTools={setMcpDiscoveredTools} />
+      <SettingsModal isOpen={isSettingsOpen} onClose={() => setIsSettingsOpen(false)} config={config} setConfig={setConfig} t={t} THEMES={THEMES} settingsTab={settingsTab} setSettingsTab={setSettingsTab} mcpServers={mcpServers} setMcpServers={setMcpServers} mcpDiscoveredTools={mcpDiscoveredTools} setMcpDiscoveredTools={setMcpDiscoveredTools} appVersion={appVersion} updateStatus={mainUpdateStatus} availableUpdateVersion={availableMainUpdate?.version || ""} availableUpdateNotes={availableMainUpdate?.notes || ""} updateError={mainUpdateError} updateProgressPercent={mainUpdateProgress?.percent ?? null} lastUpdateCheckedAt={lastMainUpdateCheckedAt} onCheckForUpdate={handleCheckMainUpdate} onInstallUpdate={handleInstallMainUpdate} />
       <SkillsModal isOpen={isSkillsOpen} onClose={() => setIsSkillsOpen(false)} t={t} skills={skills} currentWorkspace={currentWorkspace} toggleSkill={toggleSkill} deleteSkill={deleteSkill} addSkill={addSkill} updateSkill={updateSkill} isAddingSkill={isAddingSkill} setIsAddingSkill={setIsAddingSkill} />
     </div>
   );

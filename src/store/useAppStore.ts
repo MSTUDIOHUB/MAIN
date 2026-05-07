@@ -9,7 +9,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { setWorkspaceRoot as setWorkspaceRootIpc } from "../lib/ipc";
 import { appendDebugLog } from "../lib/debugLog";
 import { formatWorkspaceTree } from "../lib/systemPrompt";
-import { type MCPServer, type MCPTool } from "../lib/mcpClient";
+import { setMcpToolServerMap, type MCPServer, type MCPTool } from "../lib/mcpClient";
 import { sanitizePlanArtifactContent } from "../lib/sanitize";
 import {
   loadResolvedInstructions,
@@ -248,6 +248,14 @@ export const translations = {
     mcpDiscoveryFailedMessage: "Discovery failed: {message}",
     mcpTip: "Start the MCP server and make sure it is listening on the configured port, then click Scan Tools. Discovered tools become available to the AI automatically. Unity MCP defaults to",
     instructionsHooks: "Instructions & Hooks",
+    about: "About",
+    currentVersion: "Current Version",
+    checkForUpdates: "Check for Updates",
+    checkingForUpdates: "Checking for updates...",
+    upToDate: "MAIN is up to date.",
+    updateAvailable: "Update available",
+    installAndRestart: "Install and Restart",
+    updateCheckFailed: "Update check failed",
     instructionsEnabled: "Enable workspace instructions",
     hooksEnabled: "Enable lifecycle hooks",
     sessionRecording: "Record project sessions",
@@ -352,6 +360,14 @@ export const translations = {
     mcpDiscoveryFailedMessage: "发现失败：{message}",
     mcpTip: "MCP 服务器需先启动并监听指定端口，然后点击「扫描工具」发现可用工具。发现后的工具会在对话中自动供 AI 调用。Unity MCP 服务器默认地址为",
     instructionsHooks: "指令与 Hooks",
+    about: "关于",
+    currentVersion: "当前版本",
+    checkForUpdates: "检查更新",
+    checkingForUpdates: "正在检查更新...",
+    upToDate: "MAIN 已是最新版本。",
+    updateAvailable: "发现新版本",
+    installAndRestart: "安装并重启",
+    updateCheckFailed: "检查更新失败",
     instructionsEnabled: "启用工作区指令",
     hooksEnabled: "启用生命周期 Hooks",
     sessionRecording: "记录项目会话",
@@ -585,6 +601,7 @@ export interface AppConfig {
   language: Lang;
   theme: ThemeKey;
   themeMode: ThemeMode;
+  appIconVariant: "light" | "dark";
   workflowMode: "chat" | "edit" | "plan";  // Legacy mirror of the active turn intent.
   promptLanguageStrategy: PromptLanguageStrategy;
   toolPermissionPolicy: ToolPermissionPolicy;
@@ -1032,6 +1049,7 @@ const defaultConfig: AppConfig = {
   language: "zh",
   theme: "purple",
   themeMode: "dark",
+  appIconVariant: "light",
   workflowMode: "chat",
   promptLanguageStrategy: "english_core_localized_output",
   toolPermissionPolicy: createDefaultToolPermissionPolicy(),
@@ -1051,6 +1069,42 @@ const defaultConfig: AppConfig = {
 };
 
 const defaultSkills: Skill[] = [];
+
+const DEFAULT_MCP_SERVERS: MCPServer[] = [
+  { name: "unityMCP", type: "http", url: "http://localhost:8080/mcp", enabled: true },
+];
+
+function normalizeAppIconVariant(value: unknown): AppConfig["appIconVariant"] {
+  return value === "dark" ? "dark" : "light";
+}
+
+function normalizeMcpServers(servers: unknown): MCPServer[] {
+  if (!Array.isArray(servers)) return DEFAULT_MCP_SERVERS;
+  return servers
+    .map((server: any) => ({
+      name: String(server?.name || "").trim(),
+      type: "http" as const,
+      url: String(server?.url || "").trim(),
+      enabled: server?.enabled !== false,
+    }))
+    .filter((server) => server.name && server.url);
+}
+
+function filterMcpDiscoveryForServers(
+  tools: MCPTool[],
+  toolServerMap: Record<string, string>,
+  servers: MCPServer[],
+): { tools: MCPTool[]; toolServerMap: Record<string, string> } {
+  const enabledUrls = new Set(servers.filter((server) => server.enabled !== false).map((server) => server.url));
+  const nextMap: Record<string, string> = {};
+  const nextTools = tools.filter((tool) => {
+    const serverUrl = toolServerMap[tool.name];
+    if (!serverUrl || !enabledUrls.has(serverUrl)) return false;
+    nextMap[tool.name] = serverUrl;
+    return true;
+  });
+  return { tools: nextTools, toolServerMap: nextMap };
+}
 
 const defaultSessionsByWorkspace: Record<string, Session[]> = {};
 
@@ -3380,13 +3434,27 @@ export const useAppStore = create<AppState>()(
   },
 
   // MCP servers & discovered tools
-  mcpServers: [{ name: "unityMCP", type: "http", url: "http://localhost:8080/mcp" }],
+  mcpServers: DEFAULT_MCP_SERVERS,
   mcpDiscoveredTools: [],
   mcpToolServerMap: {},
-  setMcpServers: (servers) => set({ mcpServers: servers }),
-  addMcpServer: (server) => set((s) => ({ mcpServers: [...s.mcpServers, server] })),
-  removeMcpServer: (name) => set((s) => ({ mcpServers: s.mcpServers.filter((sv) => sv.name !== name) })),
-  setMcpDiscoveredTools: (tools, toolServerMap) => set({ mcpDiscoveredTools: tools, mcpToolServerMap: toolServerMap }),
+  setMcpServers: (servers) =>
+    set((s) => {
+      const normalizedServers = normalizeMcpServers(servers);
+      const filtered = filterMcpDiscoveryForServers(s.mcpDiscoveredTools, s.mcpToolServerMap, normalizedServers);
+      setMcpToolServerMap(filtered.toolServerMap);
+      return {
+        mcpServers: normalizedServers,
+        mcpDiscoveredTools: filtered.tools,
+        mcpToolServerMap: filtered.toolServerMap,
+      };
+    }),
+  addMcpServer: (server) => get().setMcpServers([...get().mcpServers, server]),
+  removeMcpServer: (name) => get().setMcpServers(get().mcpServers.filter((sv) => sv.name !== name)),
+  setMcpDiscoveredTools: (tools, toolServerMap) => {
+    const filtered = filterMcpDiscoveryForServers(tools, toolServerMap, get().mcpServers);
+    setMcpToolServerMap(filtered.toolServerMap);
+    set({ mcpDiscoveredTools: filtered.tools, mcpToolServerMap: filtered.toolServerMap });
+  },
 
   // IM adapters
   feishuAdapterStatus: createDefaultFeishuAdapterRuntimeStatus(),
@@ -4015,7 +4083,9 @@ export const useAppStore = create<AppState>()(
     set({
       config: defaultConfig,
       skills: defaultSkills,
-      mcpServers: [{ name: "unityMCP", type: "http", url: "http://localhost:8080/mcp" }],
+      mcpServers: DEFAULT_MCP_SERVERS,
+      mcpDiscoveredTools: [],
+      mcpToolServerMap: {},
       sessionsByWorkspace: {},
       workspaces: [],
       activeSessionByWorkspace: {},
@@ -7920,12 +7990,16 @@ export const useAppStore = create<AppState>()(
               : current.config.promptLanguageStrategy,
           thoughtDisplayMode: normalizeThoughtDisplayMode(persistedState.config?.thoughtDisplayMode),
           themeMode: normalizeThemeMode(persistedState.config?.themeMode),
+          appIconVariant: normalizeAppIconVariant(persistedState.config?.appIconVariant),
           toolPermissionPolicy: normalizeToolPermissionPolicy(persistedState.config?.toolPermissionPolicy),
           mcpRouting: normalizeMcpRoutingConfig(persistedState.config?.mcpRouting),
           sessionRecordingEnabled: persistedState.config?.sessionRecordingEnabled ?? current.config.sessionRecordingEnabled,
           imAdapters: normalizeImAdaptersConfig(persistedState.config?.imAdapters),
         },
         sessionsByWorkspace: normalizedSessionsByWorkspace,
+        mcpServers: normalizeMcpServers(persistedState.mcpServers),
+        mcpDiscoveredTools: [],
+        mcpToolServerMap: {},
         runtimeBySessionKey: {},
         workspaces: normalizeWorkspaceEntries(
           (persistedState as Partial<AppState>).workspaces,

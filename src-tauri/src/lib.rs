@@ -5820,6 +5820,58 @@ async fn test_feishu_adapter_connection(
 
 // endregion
 
+// region: App icon
+
+fn generate_app_icon_png(variant: &str) -> Vec<u8> {
+    if variant == "dark" {
+        include_bytes!("../../public/app-icon-dark.png").to_vec()
+    } else {
+        include_bytes!("../../public/app-icon-light.png").to_vec()
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn apply_app_icon_variant_macos(app: AppHandle, variant: String) -> Result<(), String> {
+    use objc2::{AllocAnyThread, MainThreadMarker};
+    use objc2_app_kit::{NSApp, NSImage};
+    use objc2_foundation::NSData;
+    use std::sync::mpsc;
+
+    let (tx, rx) = mpsc::channel();
+    app.run_on_main_thread(move || {
+        let result = (|| -> Result<(), String> {
+            let mtm = MainThreadMarker::new()
+                .ok_or_else(|| "macOS app icon update did not run on the main thread".to_string())?;
+            let bytes = generate_app_icon_png(&variant);
+            let data = NSData::with_bytes(&bytes);
+            let image = NSImage::initWithData(NSImage::alloc(), &data)
+                .ok_or_else(|| "macOS could not decode the selected app icon".to_string())?;
+            let ns_app = NSApp(mtm);
+            unsafe {
+                ns_app.setApplicationIconImage(Some(&image));
+            }
+            Ok(())
+        })();
+        let _ = tx.send(result);
+    }).map_err(|e| format!("调度 macOS 图标更新失败: {e}"))?;
+
+    rx.recv().map_err(|e| format!("等待 macOS 图标更新失败: {e}"))?
+}
+
+#[cfg(not(target_os = "macos"))]
+#[allow(clippy::unnecessary_wraps)]
+fn apply_app_icon_variant_macos(_app: AppHandle, _variant: String) -> Result<(), String> {
+    Ok(())
+}
+
+#[tauri::command]
+fn apply_app_icon_variant(app: AppHandle, variant: String) -> Result<(), String> {
+    let normalized = if variant == "dark" { "dark" } else { "light" }.to_string();
+    apply_app_icon_variant_macos(app, normalized)
+}
+
+// endregion
+
 // region: 应用启动
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -5905,7 +5957,8 @@ pub fn run() {
             send_feishu_message,
             send_feishu_card,
             patch_feishu_card,
-            test_feishu_adapter_connection
+            test_feishu_adapter_connection,
+            apply_app_icon_variant
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

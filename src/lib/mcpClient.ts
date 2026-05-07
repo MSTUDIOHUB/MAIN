@@ -15,6 +15,7 @@ export interface MCPServer {
   name: string;
   type: "http";
   url: string;
+  enabled?: boolean;
 }
 
 export interface MCPTool {
@@ -113,7 +114,7 @@ export async function discoverAllMcpTools(
   const allTools: MCPTool[] = [];
   const map: Record<string, string> = {};
 
-  const httpServers = servers.filter((s) => s.type === "http");
+  const httpServers = servers.filter((s) => s.type === "http" && s.enabled !== false);
 
   const results = await Promise.allSettled(
     httpServers.map(async (server) => {

@@ -1,8 +1,9 @@
 // @ts-nocheck
 import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { save } from "@tauri-apps/plugin-dialog";
-import { IconSettings, IconClose, IconPlus, IconTrash, IconCloud, IconSave, IconCheck } from "./Icons";
+import { IconSettings, IconClose, IconPlus, IconTrash, IconCloud, IconSave, IconCheck, IconGitHub } from "./Icons";
 import { type MCPServer, type MCPTool, discoverAllMcpTools, setMcpToolServerMap } from "../lib/mcpClient";
 import {
   buildOpenAiResponsesProbeRequestCandidates,
@@ -35,6 +36,7 @@ import {
   normalizeCloudServerState,
 } from "../lib/cloudServers";
 import { normalizeThoughtDisplayMode } from "../lib/thoughtDisplay";
+import { APP_ICON_ASSETS, applyAppIconVariant, normalizeAppIconVariant, type AppIconVariant } from "../lib/appIcon";
 
 function buildCloudConnectionFingerprint(server: any, apiFormatOverride?: unknown, modelOverride?: unknown): string {
   if (!server) return "";
@@ -69,6 +71,17 @@ function settingsOptionButtonClass(isSelected: boolean, extra = "") {
   return `${settingsOptionBaseClass} ${isSelected ? settingsOptionSelectedClass : settingsOptionIdleClass} ${extra}`.trim();
 }
 
+type SettingsUpdateStatus = "idle" | "checking" | "upToDate" | "available" | "downloading" | "installing" | "error";
+
+const MAIN_RELEASES_URL = "https://github.com/MSTUDIOHUB/MAIN-Releases/releases";
+
+function summarizeReleaseNotes(notes: string, maxLength = 520) {
+  const normalized = String(notes || "").replace(/\r/g, "").trim();
+  if (!normalized) return "";
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, maxLength).trimEnd()}…`;
+}
+
 const SETTINGS_COPY = {
   zh: {
     activeProfile: "当前配置",
@@ -97,6 +110,8 @@ const SETTINGS_COPY = {
     mcpNoServersConfigured: "暂无 MCP 服务器配置",
     mcpNoServersHint: "点击下方「添加服务器」连接外部引擎",
     remove: "移除",
+    mcpEnabled: "已启用",
+    mcpDisabled: "已关闭",
     addServer: "添加服务器",
     serverNamePlaceholder: "名称 (如 unityMCP)",
     add: "添加",
@@ -120,6 +135,25 @@ const SETTINGS_COPY = {
     exportLog: "导出日志",
     clearLog: "清空日志",
     logTailOnly: "当前只显示日志尾部",
+
+    aboutDesc: "查看 MAIN 版本并手动检查 GitHub Release 更新。",
+    appName: "应用名称",
+    appIconStyle: "软件图标样式",
+    appIconStyleDesc: "选择 MAIN 在系统窗口、任务栏或 Dock 中使用的软件图标。",
+    appIconLight: "白底黑 M",
+    appIconDark: "黑底白 M",
+    appIconApplyFailed: "软件图标已保存，但当前系统图标未能立即更新，重启应用后会再次应用。",
+    unknownVersion: "未知",
+    latestCheck: "上次检查",
+    neverChecked: "尚未检查",
+    noUpdateChecked: "点击检查更新，MAIN 会连接公开 Release 清单并验证签名更新包。",
+    updateReadyDesc: (version: string) => `发现 MAIN ${version}，可以安装并重启。`,
+    updateUpToDateDesc: "当前已是最新公开版本。",
+    updateInstallingDesc: "更新安装完成后，MAIN 会自动重启。",
+    updateErrorDesc: "检查或安装失败。你可以稍后重试，或查看调试日志中的 main.update。",
+    openGitHubReleases: "打开 GitHub Releases",
+    openGitHubReleasesDesc: "在浏览器中查看公开下载页面。",
+    openGitHubReleasesFailed: "无法打开 GitHub Releases 页面。",
 
     compressionLow: "省显存",
     compressionBalanced: "均衡",
@@ -252,6 +286,8 @@ const SETTINGS_COPY = {
     mcpNoServersConfigured: "No MCP servers configured",
     mcpNoServersHint: "Use Add Server below to connect an external engine",
     remove: "Remove",
+    mcpEnabled: "Enabled",
+    mcpDisabled: "Disabled",
     addServer: "Add Server",
     serverNamePlaceholder: "Name (for example unityMCP)",
     add: "Add",
@@ -275,6 +311,25 @@ const SETTINGS_COPY = {
     exportLog: "Export Log",
     clearLog: "Clear Log",
     logTailOnly: "Only the tail of the log is shown",
+
+    aboutDesc: "View the MAIN version and manually check GitHub Release updates.",
+    appName: "App Name",
+    appIconStyle: "App Icon Style",
+    appIconStyleDesc: "Choose the software icon MAIN uses for the system window, taskbar, or Dock.",
+    appIconLight: "White background, black M",
+    appIconDark: "Black background, white M",
+    appIconApplyFailed: "The app icon preference was saved, but the current system icon could not update immediately. MAIN will try again on restart.",
+    unknownVersion: "Unknown",
+    latestCheck: "Last checked",
+    neverChecked: "Never checked",
+    noUpdateChecked: "Click Check for Updates to fetch the public release manifest and verify signed updater packages.",
+    updateReadyDesc: (version: string) => `MAIN ${version} is available. Install it and restart when ready.`,
+    updateUpToDateDesc: "You are on the latest public version.",
+    updateInstallingDesc: "MAIN will relaunch automatically after the update is installed.",
+    updateErrorDesc: "The check or install failed. Try again later, or inspect main.update in the debug log.",
+    openGitHubReleases: "Open GitHub Releases",
+    openGitHubReleasesDesc: "View the public download page in your browser.",
+    openGitHubReleasesFailed: "Could not open the GitHub Releases page.",
 
     compressionLow: "Memory Saver",
     compressionBalanced: "Balanced",
@@ -438,6 +493,7 @@ function McpServerPanel({
   // Form state for adding a new server
   const [newName, setNewName] = useState("");
   const [newUrl, setNewUrl] = useState("http://localhost:8000/mcp");
+  const enabledMcpServerCount = mcpServers.filter((server) => server.enabled !== false).length;
   const tipSeparator = language === "zh" ? "：" : ": ";
   const tipEnd = language === "zh" ? "。" : ".";
 
@@ -464,8 +520,8 @@ function McpServerPanel({
       setMcpDiscoveredTools(tools, toolServerMap);
       setMcpToolServerMap(toolServerMap);
       if (tools.length > 0) {
-        setDiscoverMsg({ kind: "discovered", type: "success", toolCount: tools.length, serverCount: mcpServers.length });
-      } else if (mcpServers.length === 0) {
+        setDiscoverMsg({ kind: "discovered", type: "success", toolCount: tools.length, serverCount: enabledMcpServerCount });
+      } else if (enabledMcpServerCount === 0) {
         setDiscoverMsg({ kind: "noServers", type: "error" });
       } else {
         setDiscoverMsg({ kind: "noTools", type: "error" });
@@ -483,9 +539,13 @@ function McpServerPanel({
     if (!name || !url) return;
     // Prevent duplicate names
     if (mcpServers.some(s => s.name === name)) return;
-    setMcpServers([...mcpServers, { name, type: "http", url }]);
+    setMcpServers([...mcpServers, { name, type: "http", url, enabled: true }]);
     setNewName("");
     setNewUrl("http://localhost:8000/mcp");
+  };
+
+  const handleToggleServer = (name: string, enabled: boolean) => {
+    setMcpServers(mcpServers.map((server) => server.name === name ? { ...server, enabled } : server));
   };
 
   const handleRemoveServer = (name: string) => {
@@ -517,28 +577,55 @@ function McpServerPanel({
             <p className="text-[11px] text-[#3f3f46] mt-1">{copy.mcpNoServersHint}</p>
           </div>
         ) : (
-          mcpServers.map((server) => (
+          mcpServers.map((server) => {
+            const enabled = server.enabled !== false;
+            return (
             <div
               key={server.name}
               className="bg-[#000000] border border-[#27272a] rounded-lg p-4 flex items-center justify-between group"
             >
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2">
-                  <span className="inline-block w-2 h-2 rounded-full bg-[#22c55e] shrink-0" title="HTTP" />
+                  <span className={`inline-block w-2 h-2 rounded-full shrink-0 ${enabled ? "bg-[#22c55e]" : "bg-[#3f3f46]"}`} title="HTTP" />
                   <span className="text-[13px] font-bold text-[#e4e4e7] truncate">{server.name}</span>
                   <span className="text-[10px] px-1.5 py-0.5 rounded bg-[#18181b] text-[#71717a] border border-[#27272a] uppercase font-mono">HTTP</span>
+                  <span className={`text-[10px] px-1.5 py-0.5 rounded border font-bold ${enabled ? "theme-subtle-border theme-subtle-bg" : "border-[#27272a] bg-[#09090b] text-[#71717a]"}`}>
+                    {enabled ? copy.mcpEnabled : copy.mcpDisabled}
+                  </span>
                 </div>
                 <p className="text-[11px] text-[#71717a] font-mono mt-1 truncate">{server.url}</p>
               </div>
-              <button
-                onClick={() => handleRemoveServer(server.name)}
-                className="text-[#71717a] hover:text-[#f87171] transition-colors ml-3 opacity-0 group-hover:opacity-100 shrink-0"
-                title={copy.remove}
-              >
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
-              </button>
+              <div className="ml-4 flex shrink-0 items-center gap-3">
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={enabled}
+                  aria-label={`${server.name} ${enabled ? copy.mcpEnabled : copy.mcpDisabled}`}
+                  onClick={() => handleToggleServer(server.name, !enabled)}
+                  className={`relative inline-flex h-6 w-11 items-center rounded-full border p-0.5 transition-all duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-[#000000] ${
+                    enabled ? "border-transparent shadow-[0_0_12px_var(--accent-subtle)]" : "border-[#3f3f46] bg-[#18181b]"
+                  }`}
+                  style={enabled ? { backgroundColor: "var(--accent)" } : undefined}
+                  title={enabled ? copy.mcpEnabled : copy.mcpDisabled}
+                >
+                  <span
+                    className={`block h-5 w-5 rounded-full bg-white shadow-sm transition-transform duration-200 ${
+                      enabled ? "translate-x-5" : "translate-x-0"
+                    }`}
+                  />
+                </button>
+                <button
+                  onClick={() => handleRemoveServer(server.name)}
+                  className="flex h-7 w-7 items-center justify-center rounded-md border border-transparent text-[#71717a] transition-colors hover:border-[#3f1f1f] hover:bg-[#181111] hover:text-[#f87171]"
+                  title={copy.remove}
+                  aria-label={copy.remove}
+                >
+                  <IconTrash className="h-3.5 w-3.5" />
+                </button>
+              </div>
             </div>
-          ))
+            );
+          })
         )}
       </div>
 
@@ -1243,6 +1330,15 @@ export default function SettingsModal({
   setMcpServers,
   mcpDiscoveredTools,
   setMcpDiscoveredTools,
+  appVersion,
+  updateStatus = "idle",
+  availableUpdateVersion = "",
+  availableUpdateNotes = "",
+  updateError = "",
+  updateProgressPercent = null,
+  lastUpdateCheckedAt = null,
+  onCheckForUpdate,
+  onInstallUpdate,
 }: {
   isOpen: boolean;
   onClose: () => void;
@@ -1256,6 +1352,15 @@ export default function SettingsModal({
   setMcpServers: (servers: MCPServer[]) => void;
   mcpDiscoveredTools: MCPTool[];
   setMcpDiscoveredTools: (tools: MCPTool[], toolServerMap: Record<string, string>) => void;
+  appVersion?: string;
+  updateStatus?: SettingsUpdateStatus;
+  availableUpdateVersion?: string;
+  availableUpdateNotes?: string;
+  updateError?: string;
+  updateProgressPercent?: number | null;
+  lastUpdateCheckedAt?: number | null;
+  onCheckForUpdate?: () => void;
+  onInstallUpdate?: () => void;
 }) {
   const [availableModels, setAvailableModels] = useState([]);
   const [cloudModelsByServer, setCloudModelsByServer] = useState<Record<string, string[]>>({});
@@ -1276,6 +1381,9 @@ export default function SettingsModal({
   const [cloudSaveMsg, setCloudSaveMsg] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
   const [localFetchMsg, setLocalFetchMsg] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
   const [systemMemory, setSystemMemory] = useState<{ total_gb: number; available_gb: number; total_bytes?: number; available_bytes?: number } | null>(null);
+  const [draftAppIconVariant, setDraftAppIconVariant] = useState<AppIconVariant>(() => normalizeAppIconVariant(config.appIconVariant));
+  const [appIconApplyMsg, setAppIconApplyMsg] = useState<{ text: string; type: 'warning' } | null>(null);
+  const [isApplyingAppIcon, setIsApplyingAppIcon] = useState(false);
   const hasAutoFetched = useRef(false);
   const cloudDraftServerRef = useRef<any | null>(null);
   const language = config.language === "en" ? "en" : "zh";
@@ -1290,6 +1398,78 @@ export default function SettingsModal({
     { value: "summary", label: t.thoughtDisplaySummary, description: copy.thoughtDisplaySummaryDesc },
     { value: "detailed", label: t.thoughtDisplayDetailed, description: copy.thoughtDisplayDetailedDesc },
   ];
+  const appIconOptions: Array<{ value: AppIconVariant; label: string; src: string }> = [
+    { value: "light", label: copy.appIconLight, src: APP_ICON_ASSETS.light },
+    { value: "dark", label: copy.appIconDark, src: APP_ICON_ASSETS.dark },
+  ];
+  const updateBusy = updateStatus === "checking" || updateStatus === "downloading" || updateStatus === "installing";
+  const updateInstalling = updateStatus === "downloading" || updateStatus === "installing";
+  const updateStatusText = (() => {
+    if (updateStatus === "checking") return t.checkingForUpdates;
+    if (updateStatus === "upToDate") return t.upToDate;
+    if (updateStatus === "available" && availableUpdateVersion) return `${t.updateAvailable}: ${availableUpdateVersion}`;
+    if (updateStatus === "downloading") return updateProgressPercent ? `${language === "en" ? "Downloading" : "下载中"} ${updateProgressPercent}%` : (language === "en" ? "Downloading..." : "下载中...");
+    if (updateStatus === "installing") return language === "en" ? "Installing..." : "安装中...";
+    if (updateStatus === "error") return t.updateCheckFailed;
+    return copy.noUpdateChecked;
+  })();
+  const updateStatusDesc = (() => {
+    if (updateStatus === "available" && availableUpdateVersion) return copy.updateReadyDesc(availableUpdateVersion);
+    if (updateStatus === "upToDate") return copy.updateUpToDateDesc;
+    if (updateInstalling) return copy.updateInstallingDesc;
+    if (updateStatus === "error") return updateError || copy.updateErrorDesc;
+    return copy.noUpdateChecked;
+  })();
+  const lastUpdateCheckedText = lastUpdateCheckedAt
+    ? new Date(lastUpdateCheckedAt).toLocaleString()
+    : copy.neverChecked;
+  const releaseNotesSummary = summarizeReleaseNotes(availableUpdateNotes);
+  const handleOpenGitHubReleases = useCallback(() => {
+    void openUrl(MAIN_RELEASES_URL).catch((error) => {
+      console.warn("Failed to open GitHub Releases", error);
+      window.alert(copy.openGitHubReleasesFailed);
+    });
+  }, [copy.openGitHubReleasesFailed]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    setDraftAppIconVariant(normalizeAppIconVariant(config.appIconVariant));
+    setAppIconApplyMsg(null);
+    setIsApplyingAppIcon(false);
+  }, [config.appIconVariant, isOpen]);
+
+  const handleCancelSettings = useCallback(() => {
+    setDraftAppIconVariant(normalizeAppIconVariant(config.appIconVariant));
+    setAppIconApplyMsg(null);
+    setIsApplyingAppIcon(false);
+    onClose();
+  }, [config.appIconVariant, onClose]);
+
+  const handleDoneSettings = useCallback(async () => {
+    const nextVariant = normalizeAppIconVariant(draftAppIconVariant);
+    const savedVariant = normalizeAppIconVariant(config.appIconVariant);
+    setAppIconApplyMsg(null);
+    if (nextVariant === savedVariant) {
+      onClose();
+      return;
+    }
+
+    setIsApplyingAppIcon(true);
+    setConfig((prev: any) => ({
+      ...prev,
+      appIconVariant: nextVariant,
+    }));
+
+    try {
+      await applyAppIconVariant(nextVariant);
+      onClose();
+    } catch (error) {
+      console.warn("Failed to apply app icon variant", error);
+      setAppIconApplyMsg({ text: copy.appIconApplyFailed, type: "warning" });
+    } finally {
+      setIsApplyingAppIcon(false);
+    }
+  }, [config.appIconVariant, copy.appIconApplyFailed, draftAppIconVariant, onClose, setConfig]);
 
   // Auto-clear cloud fetch message after 5 seconds
   useEffect(() => {
@@ -2230,7 +2410,7 @@ export default function SettingsModal({
       >
         <div className="shrink-0 px-5 py-4 border-b border-[#27272a] flex items-center justify-between bg-[#000000]">
           <h2 className="text-base font-bold text-white flex items-center gap-2"><IconSettings className="w-5 h-5" /> {t.settings}</h2>
-          <button data-testid="settings-close" onClick={onClose} className="text-[#a1a1aa] hover:text-white transition-colors"><IconClose className="w-4 h-4" /></button>
+          <button data-testid="settings-close" onClick={handleCancelSettings} className="text-[#a1a1aa] hover:text-white transition-colors"><IconClose className="w-4 h-4" /></button>
         </div>
 
         <div className="flex min-h-0 flex-1">
@@ -2243,6 +2423,7 @@ export default function SettingsModal({
             <button data-testid="settings-tab-im" onClick={() => setSettingsTab('im')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'im' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.imAdapters}</button>
             <button data-testid="settings-tab-data" onClick={() => setSettingsTab('data')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'data' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.dataManagement}</button>
             <button data-testid="settings-tab-debug" onClick={() => setSettingsTab('debug')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'debug' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.debugLog}</button>
+            <button data-testid="settings-tab-about" onClick={() => setSettingsTab('about')} className={`mt-auto text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'about' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.about}</button>
           </div>
           <div className="min-h-0 flex-1 overflow-y-auto bg-[#09090b] p-6 pb-8">
 
@@ -2386,6 +2567,125 @@ export default function SettingsModal({
                       onChange={(e) => setConfig({ ...config, sessionRecordingEnabled: e.target.checked })}
                     />
                   </label>
+                </div>
+              </div>
+            )}
+
+            {/* ABOUT / UPDATES */}
+            {settingsTab === 'about' && (
+              <div className="space-y-5">
+                <div>
+                  <h3 className="text-[13px] font-bold text-[#a1a1aa] uppercase tracking-wider">{t.about}</h3>
+                  <p className="mt-1.5 text-[12px] leading-relaxed text-[#71717a]">{copy.aboutDesc}</p>
+                </div>
+
+                <div className={settingsSectionRowClass}>
+                  <div>
+                    <label className="block text-[13px] font-bold text-[#e4e4e7]">{copy.appIconStyle}</label>
+                  </div>
+                  <div className={`${settingsControlColumnClass} space-y-2`}>
+                    <div className="flex flex-wrap gap-3">
+                      {appIconOptions.map((option) => {
+                        const selected = draftAppIconVariant === option.value;
+                        return (
+                          <button
+                            key={option.value}
+                            type="button"
+                            aria-pressed={selected}
+                            aria-label={option.label}
+                            title={option.label}
+                            onClick={() => {
+                              setDraftAppIconVariant(option.value);
+                              setAppIconApplyMsg(null);
+                            }}
+                            className={settingsOptionButtonClass(selected, "relative flex h-[86px] w-[86px] items-center justify-center rounded-md p-2")}
+                          >
+                            <img
+                              src={option.src}
+                              alt=""
+                              className="h-16 w-16 shrink-0 rounded-[14px] border border-[#3f3f46] bg-[#000000] object-cover"
+                              draggable={false}
+                            />
+                            {selected && (
+                              <span className="absolute right-1.5 top-1.5 inline-flex h-5 w-5 items-center justify-center rounded-full border border-[var(--accent-subtle-border)] bg-[#09090b] theme-text">
+                                <IconCheck className="h-3.5 w-3.5" />
+                              </span>
+                            )}
+                          </button>
+                        );
+                      })}
+                    </div>
+                    {appIconApplyMsg && (
+                      <p className="text-[11.5px] leading-relaxed text-[#fbbf24]">{appIconApplyMsg.text}</p>
+                    )}
+                  </div>
+                </div>
+
+                <div className={`${settingsSectionRowClass} border-t border-[#27272a] pt-5`}>
+                  <div>
+                    <label className="block text-[13px] font-bold text-[#e4e4e7]">{t.currentVersion}</label>
+                    <p className="mt-1.5 text-[12px] leading-relaxed text-[#a1a1aa]">{copy.latestCheck}: {lastUpdateCheckedText}</p>
+                  </div>
+                  <div className={settingsControlColumnClass}>
+                    <div className="rounded-md border border-[#27272a] bg-[#000000] px-3 py-2.5 font-mono text-[13px] text-[#e4e4e7]">
+                      {appVersion || copy.unknownVersion}
+                    </div>
+                  </div>
+                </div>
+
+                <div className={`${settingsSectionRowClass} border-t border-[#27272a] pt-5`}>
+                  <div>
+                    <label className="block text-[13px] font-bold text-[#e4e4e7]">{t.checkForUpdates}</label>
+                    <p className="mt-1.5 text-[12px] leading-relaxed text-[#a1a1aa]">{updateStatusDesc}</p>
+                  </div>
+                  <div className={`${settingsControlColumnClass} space-y-3`}>
+                    <div className={`rounded-md border px-3 py-2.5 text-[12px] ${
+                      updateStatus === "error"
+                        ? "border-[#3f1f1f] bg-[#181111] text-[#fca5a5]"
+                        : updateStatus === "available"
+                          ? "theme-subtle-border theme-subtle-bg theme-text"
+                          : "border-[#27272a] bg-[#000000] text-[#a1a1aa]"
+                    }`}>
+                      {updateStatusText}
+                    </div>
+                    {releaseNotesSummary && availableUpdateVersion && (updateStatus === "available" || updateStatus === "error") && (
+                      <pre className="max-h-44 overflow-auto whitespace-pre-wrap rounded-md border border-[#27272a] bg-[#000000] p-3 text-[11px] leading-relaxed text-[#a1a1aa]">
+                        {releaseNotesSummary}
+                      </pre>
+                    )}
+                    <div className="flex flex-wrap gap-2">
+                      <button
+                        type="button"
+                        data-testid="settings-check-update"
+                        onClick={onCheckForUpdate}
+                        disabled={updateBusy || !onCheckForUpdate}
+                        className="rounded-md border border-[#27272a] bg-[#18181b] px-3 py-2 text-[12px] font-bold text-[#e4e4e7] transition-colors hover:border-[#3f3f46] hover:text-white disabled:cursor-wait disabled:opacity-50"
+                      >
+                        {updateStatus === "checking" ? t.checkingForUpdates : t.checkForUpdates}
+                      </button>
+                      <button
+                        type="button"
+                        data-testid="settings-open-github-releases"
+                        aria-label={copy.openGitHubReleases}
+                        title={copy.openGitHubReleases}
+                        onClick={handleOpenGitHubReleases}
+                        className="inline-flex h-9 w-9 items-center justify-center rounded-md border border-[#27272a] bg-[#18181b] text-[#e4e4e7] transition-colors hover:border-[#3f3f46] hover:text-white"
+                      >
+                        <IconGitHub className="h-4 w-4" />
+                      </button>
+                      {availableUpdateVersion && updateStatus !== "checking" && (
+                        <button
+                          type="button"
+                          data-testid="settings-install-update"
+                          onClick={onInstallUpdate}
+                          disabled={updateBusy || !onInstallUpdate}
+                          className="rounded-md border border-[var(--accent-subtle-border)] bg-[var(--accent-subtle)] px-3 py-2 text-[12px] font-bold text-white transition-colors hover:bg-[var(--accent)] disabled:cursor-wait disabled:opacity-50"
+                        >
+                          {t.installAndRestart}
+                        </button>
+                      )}
+                    </div>
+                  </div>
                 </div>
               </div>
             )}
@@ -2904,8 +3204,8 @@ export default function SettingsModal({
           </div>
         </div>
         <div className="shrink-0 px-6 py-4 border-t border-[#27272a] bg-[#000000] flex justify-end gap-3">
-          <button onClick={onClose} className="px-5 py-1.5 text-[13px] text-[#a1a1aa] hover:text-white transition-colors">{copy.cancel}</button>
-          <button onClick={onClose} className="px-6 py-1.5 theme-bg theme-bg-hover text-[13px] font-bold rounded-md transition-colors shadow-sm">{copy.done}</button>
+          <button onClick={handleCancelSettings} disabled={isApplyingAppIcon} className="px-5 py-1.5 text-[13px] text-[#a1a1aa] hover:text-white transition-colors disabled:cursor-wait disabled:opacity-50">{copy.cancel}</button>
+          <button onClick={handleDoneSettings} disabled={isApplyingAppIcon} className="px-6 py-1.5 theme-bg theme-bg-hover text-[13px] font-bold rounded-md transition-colors shadow-sm disabled:cursor-wait disabled:opacity-60">{copy.done}</button>
         </div>
       </div>
     </div>
