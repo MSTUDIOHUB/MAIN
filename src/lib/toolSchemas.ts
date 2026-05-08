@@ -140,7 +140,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     type: "function",
     function: {
       name: "read_file",
-      description: "读取源码、Markdown、JSON、纯文本等文件的内容窗口。大文件不会伪装成完整内容，会返回 truncated、totalLines、totalChars、returnedLines、nextStartLine 等元数据；需要后续内容时继续用 start_line/end_line/max_lines 读取指定行区间。遇到 TypeScript/测试报错行号时，优先读取报错行附近窗口，不要全量读取大文件，也不要用 run_command 分段分页读文件。",
+      description: "读取源码、Markdown、JSON、日志、纯文本等文件的内容窗口。工作区外的本机绝对路径会先请求用户授权，授权后通过临时附件副本读取。大文件不会伪装成完整内容，会返回 truncated、totalLines、totalChars、returnedLines、nextStartLine 等元数据；需要后续内容时继续用 start_line/end_line/max_lines 读取指定行区间。遇到 TypeScript/测试报错行号时，优先读取报错行附近窗口，不要全量读取大文件，也不要用 run_command 分段分页读文件。",
       parameters: {
         type: "object",
         properties: {

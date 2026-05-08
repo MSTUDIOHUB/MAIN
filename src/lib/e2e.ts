@@ -29,6 +29,7 @@ const GAME_STUDIO_EXECUTE_REPLY_SCENARIO = "game-studio-execute-reply-runtime";
 const PSEUDO_TOOL_CALL_RECOVERY_SCENARIO = "pseudo-tool-call-recovery";
 const EXISTING_PLAN_FOLDER_EXECUTE_SCENARIO = "existing-plan-folder-execute";
 const EXECUTE_MAX_ITERATIONS_CHECKPOINT_SCENARIO = "execute-max-iterations-checkpoint";
+const LOCAL_FILE_READ_APPROVAL_SCENARIO = "local-file-read-approval";
 const TOP_ISLAND_EXECUTION_PROGRESS_SCENARIO = "top-island-execution-progress";
 const TOP_ISLAND_PLAN_TASK_PROGRESS_SCENARIO = "top-island-plan-task-progress";
 const SIDEBAR_REMOVE_LAST_WORKSPACE_SCENARIO = "sidebar-remove-last-workspace";
@@ -58,6 +59,26 @@ function appendBridgeEvent(type: string, payload: Record<string, unknown> = {}) 
   const bridge = getBridge();
   if (!bridge) return;
   bridge.events = [...(bridge.events || []), { type, ...payload }];
+}
+
+function bindCloudServerBridgeControls() {
+  const bridge = getBridge();
+  if (!bridge || bridge.setCloudServers) return;
+  bridge.setCloudServers = (servers: any[], activeCloudServerId?: string) => {
+    const normalizedServers = Array.isArray(servers) ? servers : [];
+    const activeId = activeCloudServerId || normalizedServers[0]?.id;
+    const activeServer = normalizedServers.find((server) => server.id === activeId) || normalizedServers[0] || null;
+    useAppStore.setState((state) => ({
+      ...state,
+      config: {
+        ...state.config,
+        activeProfile: "cloud",
+        cloudServers: normalizedServers,
+        activeCloudServerId: activeServer?.id || "",
+        ...(activeServer ? { cloud: activeServer } : {}),
+      },
+    }));
+  };
 }
 
 function getSeedCountKey(scenario: string): string {
@@ -122,6 +143,7 @@ function bindBridgeSnapshot(scenario: string) {
       thoughtDisplayMode: mode,
     }));
   };
+  bindCloudServerBridgeControls();
 }
 
 function finishPlanExecution(finalMessage: string, summary: string) {
@@ -2025,6 +2047,7 @@ function seedCloudSettingsModelSelectScenario() {
       activeCloudServerId: state.config.activeCloudServerId,
       activeCloudServerModel: state.config.cloudServers.find((server: any) => server.id === state.config.activeCloudServerId)?.model ?? null,
       cloudServerCount: state.config.cloudServers.length,
+      cloudServers: state.config.cloudServers,
       seedCount: readSeedCount(CLOUD_SETTINGS_MODEL_SELECT_SCENARIO),
     };
   };
@@ -2088,6 +2111,7 @@ function seedCloudSettingsEmptyScenario() {
       selectedCloudModel: state.config.cloud.model,
       activeCloudServerId: state.config.activeCloudServerId,
       cloudServerCount: state.config.cloudServers.length,
+      cloudServers: state.config.cloudServers,
       seedCount: readSeedCount(CLOUD_SETTINGS_EMPTY_SCENARIO),
     };
   };
@@ -2531,6 +2555,8 @@ function seedCloudToolProtocolScenario(scenario: string) {
     ? 999504
     : scenario === PSEUDO_TOOL_CALL_RECOVERY_SCENARIO
     ? 999505
+    : scenario === LOCAL_FILE_READ_APPROVAL_SCENARIO
+    ? 999506
     : 999502;
   const server = {
     id: `e2e-${scenario}-server`,
@@ -2577,6 +2603,8 @@ function seedCloudToolProtocolScenario(scenario: string) {
             ? "E2E Game Studio Execute Reply"
             : scenario === PSEUDO_TOOL_CALL_RECOVERY_SCENARIO
             ? "E2E Pseudo Tool Call Recovery"
+            : scenario === LOCAL_FILE_READ_APPROVAL_SCENARIO
+            ? "E2E Local File Read Approval"
             : "E2E Reply Options Tool Pause",
           date: new Date(now).toISOString(),
           active: true,
@@ -2666,6 +2694,7 @@ function seedCloudToolProtocolScenario(scenario: string) {
       selectedOptions: archivedOptionBlocks.map((block) => block.selectedOption).filter(Boolean),
       toolNames: toolBlocks.map((block) => block.toolName),
       toolTargets: toolBlocks.map((block) => block.target),
+      toolStatuses: toolBlocks.map((block) => block.toolStatus),
       systemTexts: (state.taskFlow.filter((block) => block.type === "system") as any[]).map((block) => block.content),
       seedCount: readSeedCount(scenario),
     };
@@ -3186,6 +3215,7 @@ export function initializeE2EScenarios(): (() => void) | undefined {
 
   bridge.initialized = true;
   bridge.scenario = scenario;
+  bindCloudServerBridgeControls();
 
   if (scenario === PLAN_FLOW_SCENARIO) {
     return seedPlanFlowScenario();
@@ -3281,6 +3311,10 @@ export function initializeE2EScenarios(): (() => void) | undefined {
 
   if (scenario === EXECUTE_MAX_ITERATIONS_CHECKPOINT_SCENARIO) {
     return seedCloudToolProtocolScenario(EXECUTE_MAX_ITERATIONS_CHECKPOINT_SCENARIO);
+  }
+
+  if (scenario === LOCAL_FILE_READ_APPROVAL_SCENARIO) {
+    return seedCloudToolProtocolScenario(LOCAL_FILE_READ_APPROVAL_SCENARIO);
   }
 
   if (scenario === PLAN_APPROVAL_EXECUTE_TOOLS_SCENARIO) {

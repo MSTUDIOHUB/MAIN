@@ -50,6 +50,7 @@ import {
   SUPPORTED_ATTACHMENT_EXTENSIONS,
 } from "./lib/attachments";
 import { normalizeStudioAgentKey } from "./lib/gameStudioCatalog";
+import { normalizeContextMemoryState } from "./lib/contextMemory";
 import { MAIN_MODE_KEYS, mapLegacyNexusModeToMainMode, mapMainModeToLegacyNexusMode } from "./lib/mainModes";
 import { resolveConversationTurnIntent } from "./lib/runIntent";
 import { shouldRouteQuickReplyToPlanApproval } from "./lib/planControl";
@@ -100,6 +101,7 @@ function buildSessionRuntimeSnapshotFromState(state: any) {
   return {
     taskFlow,
     agentMessages: sanitizeAgentMessagesForPersist(state.agentMessages || []),
+    contextMemoryState: normalizeContextMemoryState(state.contextMemoryState),
     conversationTurns: normalizeInterruptedConversationTurnsForRestore(state.conversationTurns, taskFlow),
     currentTurnId: state.currentTurnId ?? null,
     selectedMainModeKey: state.selectedMainModeKey,
@@ -324,6 +326,7 @@ function stableRuntimeSignature(value: unknown): string {
     messages: compactBlockListSignature((value as any)?.messages),
     taskFlow: compactBlockListSignature(snapshot.taskFlow),
     agentMessages: compactBlockListSignature(snapshot.agentMessages),
+    contextMemoryState: compactTextSignature(JSON.stringify(snapshot.contextMemoryState || null)),
     conversationTurns: compactTurnListSignature(snapshot.conversationTurns),
     currentTurnId: snapshot.currentTurnId ?? null,
     selectedMainModeKey: snapshot.selectedMainModeKey ?? null,
@@ -480,6 +483,7 @@ function buildPagedRuntimePatch(entry: SessionTranscriptCacheEntry, fallbackStat
   return {
     taskFlow: restoredTaskFlow,
     agentMessages: sanitizeAgentMessagesForPersist(entry.runtimeSnapshot?.agentMessages || []),
+    contextMemoryState: normalizeContextMemoryState(entry.runtimeSnapshot?.contextMemoryState),
     selectedMainModeKey: mapLegacyNexusModeToMainMode(
       entry.runtimeSnapshot?.selectedMainModeKey ||
         entry.runtimeSnapshot?.selectedNexusModeKey ||
@@ -570,6 +574,7 @@ export default function App() {
   // ── Agent State (from store, replaces all inline implementations) ─────
   const taskFlow = useAppStore((s) => s.taskFlow);
   const agentMessages = useAppStore((s) => s.agentMessages);
+  const contextMemoryState = useAppStore((s) => s.contextMemoryState);
   const conversationTurns = useAppStore((s) => s.conversationTurns);
   const currentTurnId = useAppStore((s) => s.currentTurnId);
   const planArtifacts = useAppStore((s) => s.planArtifacts);
@@ -1068,6 +1073,7 @@ export default function App() {
     const runtimeSnapshot = {
       taskFlow: messages,
       agentMessages: sanitizeAgentMessagesForPersist(agentMessages),
+      contextMemoryState,
       conversationTurns,
       currentTurnId,
       selectedMainModeKey,
@@ -1172,6 +1178,7 @@ export default function App() {
     agentMessages,
     activeSessionScope,
     activeSessionKey,
+    contextMemoryState,
     conversationTurns,
     config.sessionRecordingEnabled,
     currentSessionId,
@@ -1654,6 +1661,7 @@ export default function App() {
       useAppStore.setState({
         taskFlow: restoredTaskFlow,
         agentMessages: sanitizeAgentMessagesForPersist(snapshot.agentMessages || []),
+        contextMemoryState: normalizeContextMemoryState(snapshot.contextMemoryState),
         selectedMainModeKey: mapLegacyNexusModeToMainMode(
           (snapshot as any).selectedMainModeKey ||
             (snapshot as any).selectedNexusModeKey ||
@@ -1786,6 +1794,7 @@ export default function App() {
         turnId: "",
       },
       agentMessages: [],
+      contextMemoryState: null,
       agentStatus: 'idle',
       isGenerating: false,
       abortController: null,
@@ -1861,6 +1870,7 @@ export default function App() {
         useAppStore.setState({
           taskFlow: [],
           agentMessages: [],
+          contextMemoryState: null,
           conversationTurns: [],
           currentTurnId: null,
           selectedDiffTaskId: null,
@@ -1905,6 +1915,7 @@ export default function App() {
     useAppStore.setState({
       taskFlow: [],
       agentMessages: [],
+      contextMemoryState: null,
       conversationTurns: [],
       currentTurnId: null,
       selectedDiffTaskId: null,
@@ -1995,6 +2006,7 @@ export default function App() {
     const emptyRuntimeSnapshot = buildSessionRuntimeSnapshotFromState({
       taskFlow: [],
       agentMessages: [],
+      contextMemoryState: null,
       conversationTurns: [],
       currentTurnId: null,
       selectedMainModeKey: "main_mode",

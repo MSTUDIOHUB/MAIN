@@ -10,6 +10,19 @@ const require = createRequire(import.meta.url);
 const workspaceRoot = process.cwd();
 
 async function loadContextTrimModule() {
+  const contextMemoryPath = path.join(workspaceRoot, "src/lib/contextMemory.ts");
+  const contextMemorySource = await fs.readFile(contextMemoryPath, "utf8");
+  const contextMemoryTranspiled = ts.transpileModule(contextMemorySource, {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2020,
+    },
+    fileName: contextMemoryPath,
+  }).outputText;
+  const contextMemoryModule = { exports: {} };
+  const contextMemoryFactory = new Function("exports", "module", "require", contextMemoryTranspiled);
+  contextMemoryFactory(contextMemoryModule.exports, contextMemoryModule, require);
+
   const sourcePath = path.join(workspaceRoot, "src/lib/contextTrim.ts");
   const source = await fs.readFile(sourcePath, "utf8");
   const transpiled = ts.transpileModule(source, {
@@ -21,8 +34,12 @@ async function loadContextTrimModule() {
   }).outputText;
 
   const module = { exports: {} };
+  const localRequire = (id) => {
+    if (id === "./contextMemory") return contextMemoryModule.exports;
+    return require(id);
+  };
   const factory = new Function("exports", "module", "require", transpiled);
-  factory(module.exports, module, require);
+  factory(module.exports, module, localRequire);
   return module.exports;
 }
 
@@ -51,10 +68,11 @@ test("manageContext leaves long tool output untouched while under the proactive 
   const result = manageContext(messages, 32768, undefined, 100, 2000);
 
   assert.equal(result.droppedCount, 0);
-  assert.equal(result.changed, false);
+  assert.equal(result.changed, true);
   assert.equal(result.tokenReduction, 0);
-  assert.equal(result.messages.length, messages.length);
-  assert.equal(result.messages[1].content, messages[1].content);
+  assert.match(result.memoryPacket, /ContextMemoryState v1/);
+  assert.equal(result.messages.length, messages.length + 1);
+  assert.equal(result.messages[2].content, messages[1].content);
 });
 
 test("manageContext can persist token savings once the proactive trigger is crossed", () => {
@@ -68,8 +86,10 @@ test("manageContext can persist token savings once the proactive trigger is cros
   assert.equal(result.droppedCount, 0);
   assert.equal(result.changed, true);
   assert.ok(result.tokenReduction > 0);
-  assert.equal(result.messages.length, messages.length);
-  assert.notEqual(result.messages[1].content, messages[1].content);
+  assert.equal(result.messages.length, messages.length + 1);
+  assert.notEqual(result.messages[2].content, messages[1].content);
+  assert.equal(result.microCompactionKind, "tool_results");
+  assert.equal(result.microCompactedCount, 1);
 });
 
 test("manageContext trims down to a lower hysteresis target once the trigger is crossed", () => {
@@ -87,6 +107,50 @@ test("manageContext trims down to a lower hysteresis target once the trigger is 
   assert.ok(result.droppedCount > 0);
   assert.ok(result.tokenReduction > 0);
   assert.ok(result.tokenCountAfter <= result.budgets.proactiveTargetBudget);
+});
+
+test("manageContext preserves pinned memory and latest user request under small windows", () => {
+  const toolCall = {
+    id: "call_read_latest",
+    function: {
+      name: "read_file",
+      arguments: JSON.stringify({ path: "Assets/Scripts/GameManager.cs" }),
+    },
+  };
+  const messages = [
+    { role: "system", content: "system prompt" },
+    ...Array.from({ length: 18 }, (_, index) => ({
+      role: index % 2 === 0 ? "user" : "assistant",
+      content: `old-${index} ` + "O".repeat(700),
+    })),
+    { role: "user", content: "继续修复 Unity 编译错误，必须保留 README 中列出的 Snake 玩法要求。" },
+    { role: "assistant", content: "", tool_calls: [toolCall] },
+    { role: "tool", tool_call_id: "call_read_latest", content: "public class GameManager {}\n" + "line\n".repeat(260) },
+  ];
+
+  const result = manageContext(messages, 4096, 1024, 4000, 4000, true);
+  const combined = result.messages.map((message) => String(message.content || "")).join("\n");
+
+  assert.match(combined, /ContextMemoryState v1/);
+  assert.match(combined, /继续修复 Unity 编译错误/);
+  assert.match(combined, /必须保留 README/);
+  assert.match(result.memoryPacket, /Assets\/Scripts\/GameManager\.cs/);
+});
+
+test("manageContext keeps default memory buckets above two entries", () => {
+  const messages = [
+    { role: "system", content: "system prompt" },
+    ...Array.from({ length: 6 }, (_, index) => ({
+      role: "user",
+      content: `必须保留约束 ${index}: do not drop verified requirement ${index}.`,
+    })),
+  ];
+
+  const result = manageContext(messages, 65536);
+
+  assert.equal(result.droppedCount, 0);
+  assert.ok(result.memoryState.constraints.length >= 6);
+  assert.match(result.memoryPacket, /verified requirement 5/);
 });
 
 test("manageContext force mode trims even after microcompaction leaves context over provider window", () => {

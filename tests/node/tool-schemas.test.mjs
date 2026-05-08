@@ -92,6 +92,8 @@ test("read_file schema exposes line-window parameters and does not promise full-
 
   assert.ok(readFile);
   assert.match(readFile.function.description, /内容窗口/);
+  assert.match(readFile.function.description, /工作区外/);
+  assert.match(readFile.function.description, /用户授权/);
   assert.match(readFile.function.description, /truncated/);
   assert.doesNotMatch(readFile.function.description, /^读取文件完整内容$/);
   assert.ok(readFile.function.parameters.properties.start_line);

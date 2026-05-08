@@ -20,6 +20,10 @@ export interface CloudAuthSummary {
   expiresAt?: number;
   storage?: "keychain" | "file";
   message?: string;
+  projectId?: string;
+  tier?: string;
+  onboarded?: boolean;
+  codeAssistMessage?: string;
 }
 
 export interface CloudProfileConfig {
@@ -87,6 +91,10 @@ export function normalizeCloudAuth(input?: Partial<CloudAuthSummary> | null, pro
   if (typeof input?.expiresAt === "number" && Number.isFinite(input.expiresAt)) auth.expiresAt = input.expiresAt;
   if (input?.storage === "keychain" || input?.storage === "file") auth.storage = input.storage;
   if (typeof input?.message === "string" && input.message.trim()) auth.message = input.message.trim();
+  if (typeof input?.projectId === "string" && input.projectId.trim()) auth.projectId = input.projectId.trim();
+  if (typeof input?.tier === "string" && input.tier.trim()) auth.tier = input.tier.trim();
+  if (typeof input?.onboarded === "boolean") auth.onboarded = input.onboarded;
+  if (typeof input?.codeAssistMessage === "string" && input.codeAssistMessage.trim()) auth.codeAssistMessage = input.codeAssistMessage.trim();
   return auth;
 }
 

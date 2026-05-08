@@ -13,10 +13,12 @@ test.beforeEach(async ({ page }) => {
     let pseudoToolRecoveryRequests = 0;
     const requests: Array<{ hasTools: boolean; body: string }> = [];
     const readFileCalls: string[] = [];
+    const ingestedAttachments: Array<{ sessionKey: string; sourcePath: string }> = [];
 
     (window as any).__CLOUD_TOOL_PROTOCOL_TEST__ = {
       requests,
       readFileCalls,
+      ingestedAttachments,
       get fallbackNoToolRequests() {
         return fallbackNoToolRequests;
       },
@@ -55,10 +57,44 @@ test.beforeEach(async ({ page }) => {
       if (cmd === "get_file_metadata") {
         return { path: String(args?.path ?? ""), sizeBytes: 32, modifiedMs: 1 };
       }
+      if (cmd === "ingest_attachment_file") {
+        const sourcePath = String(args?.sourcePath ?? "");
+        ingestedAttachments.push({
+          sessionKey: String(args?.sessionKey ?? ""),
+          sourcePath,
+        });
+        if (sourcePath === "/tmp/e2e-outside-main-debug.log") {
+          return {
+            path: ".MAIN-chat-attachments/outside-main-debug.log",
+            workspace: "/tmp/e2e-chat-temp",
+            originalPath: sourcePath,
+            displayName: "outside-main-debug.log",
+            sizeBytes: 64,
+          };
+        }
+        throw new Error(`unsupported attachment: ${sourcePath}`);
+      }
       if (cmd === "glob_search") return [];
       if (cmd === "read_file_window") {
         const path = String(args?.path ?? "");
         const scenario = new URL(window.location.href).searchParams.get("e2eScenario");
+        if (
+          scenario === "local-file-read-approval" &&
+          path === ".MAIN-chat-attachments/outside-main-debug.log" &&
+          args?.workspace === "/tmp/e2e-chat-temp"
+        ) {
+          readFileCalls.push(path);
+          return {
+            path,
+            content: "LOCAL_FILE_READ_OK: debug log line",
+            startLine: 1,
+            endLine: 1,
+            totalLines: 1,
+            totalChars: 34,
+            returnedChars: 34,
+            truncated: false,
+          };
+        }
         if (
           scenario === "game-studio-execute-reply-runtime" &&
           path === "Assets/Scripts/Entities/SnakeController.cs"
@@ -93,6 +129,14 @@ test.beforeEach(async ({ page }) => {
       if (cmd === "read_file") {
         const path = String(args?.path ?? "");
         const scenario = new URL(window.location.href).searchParams.get("e2eScenario");
+        if (
+          scenario === "local-file-read-approval" &&
+          path === ".MAIN-chat-attachments/outside-main-debug.log" &&
+          args?.workspace === "/tmp/e2e-chat-temp"
+        ) {
+          readFileCalls.push(path);
+          return "LOCAL_FILE_READ_OK: debug log line";
+        }
         const planFiles: Record<string, string> = {
           ".MAIN/plans/requirements.md": [
             "# Requirements",
@@ -302,6 +346,28 @@ test.beforeEach(async ({ page }) => {
               "<tool>write_file</tool>",
               "<parameter name=\"path\">.MAIN/plans/tasks.md</parameter>",
               "<parameter name=\"content\"># Tasks\n\n- [ ] 验证批准后执行工具可用</parameter>",
+              "</tool_use>",
+            ].join("\n"),
+          });
+        }
+
+        if (scenario === "local-file-read-approval") {
+          if (body.includes("LOCAL_FILE_READ_OK")) {
+            return JSON.stringify({
+              output_text: "已读取外部日志，确认包含 LOCAL_FILE_READ_OK。",
+            });
+          }
+          if (body.includes("User rejected reading this local file outside the workspace")) {
+            return JSON.stringify({
+              output_text: "已按拒绝处理，没有读取外部日志。",
+            });
+          }
+          return JSON.stringify({
+            output_text: [
+              "我会读取外部日志。",
+              "<tool_use>",
+              "<tool>read_file</tool>",
+              "<parameter name=\"path\">/tmp/e2e-outside-main-debug.log</parameter>",
               "</tool_use>",
             ].join("\n"),
           });
@@ -637,5 +703,122 @@ test("approved plan resumes with execute runtime tools while preserving plan tur
     .toEqual({
       hasWriteToolBlock: true,
       hasExecutionAgentText: true,
+    });
+});
+
+test("workspace-external local file reads request approval before ingesting and reading", async ({ page }) => {
+  await page.goto("/?e2eScenario=local-file-read-approval");
+
+  const sent = await page.evaluate(() =>
+    (window as any).__CODELY_E2E__?.sendCloudMessage?.("请读取外部日志 /tmp/e2e-outside-main-debug.log。"),
+  );
+  expect(sent).toBe(true);
+
+  await expect
+    .poll(async () =>
+      page.evaluate(() => {
+        const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+        const probe = (window as any).__CLOUD_TOOL_PROTOCOL_TEST__;
+        return {
+          agentStatus: snapshot?.agentStatus,
+          toolNames: snapshot?.toolNames || [],
+          toolTargets: snapshot?.toolTargets || [],
+          toolStatuses: snapshot?.toolStatuses || [],
+          ingested: probe?.ingestedAttachments || [],
+          readFileCalls: probe?.readFileCalls || [],
+        };
+      }),
+    )
+    .toEqual({
+      agentStatus: "pending_review",
+      toolNames: ["read_file"],
+      toolTargets: ["/tmp/e2e-outside-main-debug.log"],
+      toolStatuses: ["pending"],
+      ingested: [],
+      readFileCalls: [],
+    });
+
+  await page.getByText("允许执行").click();
+
+  await expect(page.getByText("已读取外部日志，确认包含 LOCAL_FILE_READ_OK。")).toBeVisible();
+
+  await expect
+    .poll(async () =>
+      page.evaluate(() => {
+        const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+        const probe = (window as any).__CLOUD_TOOL_PROTOCOL_TEST__;
+        return {
+          agentStatus: snapshot?.agentStatus,
+          toolStatuses: snapshot?.toolStatuses || [],
+          ingested: probe?.ingestedAttachments || [],
+          readFileCalls: probe?.readFileCalls || [],
+        };
+      }),
+    )
+    .toEqual({
+      agentStatus: "idle",
+      toolStatuses: ["executed"],
+      ingested: [
+        {
+          sessionKey: "/tmp/e2e-local-file-read-approval:999506",
+          sourcePath: "/tmp/e2e-outside-main-debug.log",
+        },
+      ],
+      readFileCalls: [".MAIN-chat-attachments/outside-main-debug.log"],
+    });
+});
+
+test("workspace-external local file read rejection fails without ingesting or reading", async ({ page }) => {
+  await page.goto("/?e2eScenario=local-file-read-approval");
+
+  const sent = await page.evaluate(() =>
+    (window as any).__CODELY_E2E__?.sendCloudMessage?.("请读取外部日志 /tmp/e2e-outside-main-debug.log。"),
+  );
+  expect(sent).toBe(true);
+
+  await expect
+    .poll(async () =>
+      page.evaluate(() => {
+        const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+        const probe = (window as any).__CLOUD_TOOL_PROTOCOL_TEST__;
+        return {
+          agentStatus: snapshot?.agentStatus,
+          toolNames: snapshot?.toolNames || [],
+          toolTargets: snapshot?.toolTargets || [],
+          toolStatuses: snapshot?.toolStatuses || [],
+          ingested: probe?.ingestedAttachments || [],
+          readFileCalls: probe?.readFileCalls || [],
+        };
+      }),
+    )
+    .toEqual({
+      agentStatus: "pending_review",
+      toolNames: ["read_file"],
+      toolTargets: ["/tmp/e2e-outside-main-debug.log"],
+      toolStatuses: ["pending"],
+      ingested: [],
+      readFileCalls: [],
+    });
+
+  await page.getByTestId("chat-scroll-container").getByRole("button", { name: "拒绝" }).click();
+
+  await expect
+    .poll(async () =>
+      page.evaluate(() => {
+        const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+        const probe = (window as any).__CLOUD_TOOL_PROTOCOL_TEST__;
+        return {
+          agentStatus: snapshot?.agentStatus,
+          toolStatuses: snapshot?.toolStatuses || [],
+          ingested: probe?.ingestedAttachments || [],
+          readFileCalls: probe?.readFileCalls || [],
+        };
+      }),
+    )
+    .toEqual({
+      agentStatus: "idle",
+      toolStatuses: ["rejected"],
+      ingested: [],
+      readFileCalls: [],
     });
 });

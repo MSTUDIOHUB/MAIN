@@ -2,14 +2,15 @@ import {
   buildAnthropicRequestBody,
   buildCloudHeaders,
   buildCloudMessagesApiUrl,
-  buildGeminiGenerateContentUrl,
-  buildGeminiRequestBody,
+  buildGeminiRequestForAuthMode,
   buildOpenAiResponsesInputCandidates,
   buildOpenAiResponsesRequestExtras,
+  ensureOpenAiChatGptCodexRequestBody,
   extractAnthropicResponseText,
   extractGeminiResponseText,
   extractOpenAiResponsesInstructions,
   extractOpenAiResponseText,
+  parseOpenAiResponsesSseText,
   normalizeCloudAuthMode,
   normalizeCloudApiFormat,
   normalizeCloudProtocol,
@@ -200,6 +201,10 @@ async function defaultRequestJson(request: {
       authMode: request.authMode,
       tokenRef: request.tokenRef,
     });
+    const contentType = (result.match(/^__CONTENT_TYPE__:(.*)\n/) || [])[1]?.trim() || "";
+    if (contentType.includes("text/event-stream")) {
+      return { output_text: parseOpenAiResponsesSseText(result.replace(/^__CONTENT_TYPE__:.*\n/, "")) };
+    }
     return JSON.parse(result);
   }
 
@@ -218,7 +223,13 @@ async function requestModelCommitMessage(params: GenerateGitCommitMessageParams)
   const endpoint = String(activeConfig?.endpoint || "").trim();
   const model = String(activeConfig?.model || "").trim();
   const provider = String(activeConfig?.provider || "").trim();
-  if (!endpoint || !model) return null;
+  const cloudExperimentalLoginEnabled = isCloud && params.config.cloudExperimentalLoginEnabled === true;
+  const cloudAuthMode = isCloud
+    ? cloudExperimentalLoginEnabled
+      ? normalizeCloudAuthMode(params.config.cloud?.auth?.mode)
+      : "api_key"
+    : undefined;
+  if ((!endpoint && cloudAuthMode !== "gemini_google_oauth") || !model) return null;
 
   const messages: ProtocolChatMessage[] = [
     {
@@ -241,8 +252,7 @@ async function requestModelCommitMessage(params: GenerateGitCommitMessageParams)
   const cloudApiFormat = normalizeCloudApiFormat(isCloud ? params.config.cloud?.apiFormat : "chat_completions");
   const isAnthropicCloud = isCloud && cloudProtocol === "anthropic";
   const isGeminiCloud = isCloud && cloudProtocol === "gemini";
-  const cloudAuthMode = isCloud ? normalizeCloudAuthMode(params.config.cloud?.auth?.mode) : undefined;
-  const cloudTokenRef = isCloud ? params.config.cloud?.auth?.tokenRef : undefined;
+  const cloudTokenRef = cloudExperimentalLoginEnabled ? params.config.cloud?.auth?.tokenRef : undefined;
   let url = "";
   let body: Record<string, unknown> = {};
   let headers: Record<string, string> = {};
@@ -256,13 +266,14 @@ async function requestModelCommitMessage(params: GenerateGitCommitMessageParams)
     body = buildAnthropicRequestBody({ messages, model, maxTokens: 80, stream: false });
     headers = buildCloudHeaders("anthropic", params.config.cloud?.apiKey || "", true, params.config.cloud?.customHeaders, cloudAuthMode);
   } else if (isGeminiCloud) {
-    url = buildGeminiGenerateContentUrl(endpoint, model, false);
-    body = buildGeminiRequestBody({ messages, model, maxTokens: 80 });
+    const request = buildGeminiRequestForAuthMode(endpoint, { messages, model, maxTokens: 80 }, cloudAuthMode);
+    url = request.url;
+    body = request.body;
     headers = buildCloudHeaders("gemini", params.config.cloud?.apiKey || "", true, params.config.cloud?.customHeaders, cloudAuthMode);
   } else {
     url = buildCloudMessagesApiUrl(endpoint, "openai", cloudApiFormat);
     body = cloudApiFormat === "responses"
-      ? {
+      ? ensureOpenAiChatGptCodexRequestBody({
           model,
           ...(extractOpenAiResponsesInstructions(messages) ? { instructions: extractOpenAiResponsesInstructions(messages) } : {}),
           input: buildOpenAiResponsesInputCandidates(messages)[0].input,
@@ -270,7 +281,7 @@ async function requestModelCommitMessage(params: GenerateGitCommitMessageParams)
             disableResponseStorage: params.config.cloud?.disableResponseStorage,
             reasoningEffort: "none",
           }),
-        }
+        }, { userPromptId: "main-commit-message" })
       : { model, messages, stream: false, max_tokens: 80 };
     headers = buildCloudHeaders("openai", isCloud ? params.config.cloud?.apiKey || "" : params.config.local?.apiKey || "", true, isCloud ? params.config.cloud?.customHeaders : undefined, cloudAuthMode);
   }

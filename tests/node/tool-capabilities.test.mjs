@@ -66,6 +66,7 @@ const {
   classifyMcpTool,
   createDefaultToolPermissionPolicy,
   filterToolDefinitionsForIntent,
+  getLocalFileReadPathForToolCall,
   getToolRiskLevelForCall,
   isToolAutoExecutableForCall,
   routeMcpToolsForPrompt,
@@ -183,6 +184,55 @@ test("permission policy auto-executes only safe read classes by default", () => 
   assert.equal(isToolAutoExecutableForCall("web_search", {}, registry), true);
   assert.equal(isToolAutoExecutableForCall("write_file", {}, registry), false);
   assert.equal(isToolAutoExecutableForCall("browser_click", {}, registry), false);
+});
+
+test("workspace-external local file reads require approval until the path is granted", () => {
+  const registry = buildToolCapabilityRegistry({
+    toolDefinitions: [
+      tool("read_file", "Read a file"),
+      tool("read_document", "Read a document"),
+      tool("analyze_tabular_document", "Analyze a table"),
+      tool("query_tabular_document", "Query a table"),
+    ],
+    policy: createDefaultToolPermissionPolicy(),
+  });
+  const workspace = "/tmp/workspace";
+  const externalLog = "/tmp/outside/main-debug.log";
+
+  assert.equal(
+    getLocalFileReadPathForToolCall("read_file", { path: externalLog }, workspace),
+    externalLog,
+  );
+  assert.equal(
+    getLocalFileReadPathForToolCall("read_file", { path: "/tmp/outside/../outside/main-debug.log" }, workspace),
+    externalLog,
+  );
+  assert.equal(
+    getToolRiskLevelForCall("read_file", { path: `${workspace}/README.md` }, registry, { workspace }),
+    "read_only",
+  );
+  assert.equal(
+    getToolRiskLevelForCall("read_file", { path: externalLog }, registry, { workspace }),
+    "local_file_read",
+  );
+  assert.equal(
+    isToolAutoExecutableForCall("read_file", { path: externalLog }, registry, undefined, { workspace }),
+    false,
+  );
+  assert.equal(
+    getToolRiskLevelForCall("read_document", { path: externalLog }, registry, {
+      workspace,
+      approvedLocalFileReadPaths: [externalLog],
+    }),
+    "read_only",
+  );
+  assert.equal(
+    isToolAutoExecutableForCall("read_file", { path: externalLog }, registry, undefined, {
+      workspace,
+      approvedLocalFileReadPaths: ["/tmp/outside/../outside/main-debug.log"],
+    }),
+    true,
+  );
 });
 
 test("SQL call risk is refined from arguments", () => {

@@ -7,6 +7,15 @@
 //   - Compact: summarize old messages instead of just dropping them
 // ────────────────────────────────────────────────────────────────────
 
+import {
+  buildContextMemoryState,
+  contextMemoryContentToText,
+  formatContextMemoryPacket,
+  injectContextMemoryMessage,
+  isContextMemoryMessage,
+  type ContextMemoryState,
+} from "./contextMemory";
+
 export interface TrimMessage {
   role: "system" | "user" | "assistant" | "tool";
   content: string | TrimContentPart[];
@@ -251,18 +260,12 @@ function messagesEqual(a: TrimMessage[], b: TrimMessage[]): boolean {
 // region: 压缩摘要辅助
 
 function isContextCompressionMarker(message: TrimMessage): boolean {
-  if (message.role !== "user" || typeof message.content !== "string") return false;
-  const text = message.content.trim();
-  return (
-    text.startsWith("[System: ContextState") ||
-    text.startsWith("[System: 较早对话已压缩。") ||
-    (text.startsWith("[System:") && text.includes("Earlier context has been summarized"))
-  );
+  return isContextMemoryMessage(message);
 }
 
 function extractContextCompressionSummary(message: TrimMessage): string | undefined {
-  if (!isContextCompressionMarker(message) || typeof message.content !== "string") return undefined;
-  const lines = message.content
+  if (!isContextCompressionMarker(message)) return undefined;
+  const lines = contextMemoryContentToText(message.content)
     .replace(/^\[System:\s*/, "")
     .replace(/\]$/, "")
     .split("\n")
@@ -656,6 +659,8 @@ export function trimMessagesToContextDetailed(
   const systemTokens = systemMsg.role === "system" ? estimateMessageTokens(systemMsg) : 0;
   let remaining = inputBudget - systemTokens;
   const originalRest = messages.slice(1);
+  const contextMarkers = originalRest.filter(isContextCompressionMarker);
+  const pinnedContextMarker = contextMarkers[contextMarkers.length - 1] || null;
   const carriedSummaries = originalRest
     .map(extractContextCompressionSummary)
     .filter((summary): summary is string => Boolean(summary));
@@ -675,6 +680,15 @@ export function trimMessagesToContextDetailed(
 
   // Build result starting with system message
   const result: TrimMessage[] = [systemMsg];
+  let pinnedMarkerKept = false;
+  if (pinnedContextMarker) {
+    const markerTokens = estimateMessageTokens(pinnedContextMarker);
+    if (markerTokens < remaining) {
+      result.push(pinnedContextMarker);
+      remaining -= markerTokens;
+      pinnedMarkerKept = true;
+    }
+  }
 
   // Iterate recent messages in reverse (newest first), accumulate until budget exhausted
   // ── Atomic message pairing ──────────────────────────────────────────
@@ -722,7 +736,7 @@ export function trimMessagesToContextDetailed(
   let droppedMessages = rest.filter((message) => !keptSet.has(message));
   let markerSummary = buildCompactSummary(droppedMessages, carriedSummaries, { maxItems: 4, maxCharsPerItem: 110 });
   let displaySummary = buildCompactSummary(droppedMessages, carriedSummaries, { maxItems: 8, maxCharsPerItem: 220 });
-  let compactMarker: TrimMessage | null = markerSummary
+  let compactMarker: TrimMessage | null = !pinnedMarkerKept && markerSummary
     ? {
         role: "user",
         content: `[System: ContextState\n${markerSummary}\nUse this as compact historical state only; prioritize the latest messages and current workspace evidence.]`,
@@ -755,7 +769,7 @@ export function trimMessagesToContextDetailed(
     droppedMessages = rest.filter((message) => !keptSet.has(message));
     markerSummary = buildCompactSummary(droppedMessages, carriedSummaries, { maxItems: 4, maxCharsPerItem: 110 });
     displaySummary = buildCompactSummary(droppedMessages, carriedSummaries, { maxItems: 8, maxCharsPerItem: 220 });
-    compactMarker = markerSummary
+    compactMarker = !pinnedMarkerKept && markerSummary
       ? {
           role: "user",
           content: `[System: ContextState\n${markerSummary}\nUse this as compact historical state only; prioritize the latest messages and current workspace evidence.]`,
@@ -770,7 +784,7 @@ export function trimMessagesToContextDetailed(
   }
 
   result.push(...keptForResult);
-  const removedCount = originalRest.length - keptForResult.length;
+  const removedCount = droppedMessages.length;
 
   const totalInputTokens = inputBudget - remaining;
   if (removedCount > 0) {
@@ -847,14 +861,26 @@ export function compactAssistantMessages(
 export interface ManageContextResult {
   messages: TrimMessage[];
   droppedCount: number;
+  droppedMessageCount: number;
   changed: boolean;
   tokenCountBefore: number;
   tokenCountAfter: number;
   tokenReduction: number;
   tokenBreakdownBefore: ContextTokenBreakdown;
   tokenBreakdownAfter: ContextTokenBreakdown;
+  retainedTokenBreakdown: ContextTokenBreakdown;
   budgets: ContextBudgets;
   compressedContext?: string;
+  memoryState: ContextMemoryState;
+  memoryPacket: string;
+  microCompactionKind: "none" | "tool_results" | "assistant_messages" | "mixed";
+  microCompactedCount: number;
+}
+
+export interface ManageContextOptions {
+  previousMemoryState?: ContextMemoryState | null;
+  turnId?: string | null;
+  now?: number;
 }
 
 /**
@@ -871,32 +897,68 @@ export function manageContext(
   maxToolResultTokens: number = 4000,
   maxAssistantTokens: number = 1500,
   forceManage: boolean = false,
+  options: ManageContextOptions = {},
 ): ManageContextResult {
   const budgets = computeContextBudgets(contextLimit, reservedForOutput);
-  const tokenCountBefore = estimateMessagesTokens(messages);
-  const tokenBreakdownBefore = computeContextTokenBreakdown(messages);
+  const memoryState = buildContextMemoryState(messages, {
+    previous: options.previousMemoryState,
+    turnId: options.turnId,
+    now: options.now,
+  });
+  const memoryPacket = formatContextMemoryPacket(memoryState);
+  const messagesWithMemory = injectContextMemoryMessage(messages, memoryState) as TrimMessage[];
+  const tokenCountBefore = estimateMessagesTokens(messagesWithMemory);
+  const tokenBreakdownBefore = computeContextTokenBreakdown(messagesWithMemory);
   const shouldManage = forceManage || tokenCountBefore > budgets.proactiveTriggerBudget;
 
   if (!shouldManage) {
+    const changed = !messagesEqual(messages, messagesWithMemory);
     return {
-      messages,
+      messages: messagesWithMemory,
       droppedCount: 0,
-      changed: false,
+      droppedMessageCount: 0,
+      changed,
       tokenCountBefore,
       tokenCountAfter: tokenCountBefore,
       tokenReduction: 0,
       tokenBreakdownBefore,
       tokenBreakdownAfter: tokenBreakdownBefore,
+      retainedTokenBreakdown: tokenBreakdownBefore,
       budgets,
+      compressedContext: memoryPacket,
+      memoryState,
+      memoryPacket,
+      microCompactionKind: "none",
+      microCompactedCount: 0,
     };
   }
 
   // Step 1: Compact oversized tool results
-  const compacted = compactToolResults(messages, maxToolResultTokens);
+  const compacted = compactToolResults(messagesWithMemory, maxToolResultTokens);
 
   // Step 2: Compact verbose assistant messages
   const assistantCompacted = compactAssistantMessages(compacted, maxAssistantTokens);
-  const microSummaries = buildMicroCompactSummary(messages, assistantCompacted);
+  const microSummaries = buildMicroCompactSummary(messagesWithMemory, assistantCompacted);
+  let toolMicroCompacted = 0;
+  let assistantMicroCompacted = 0;
+  for (let index = 0; index < Math.min(messagesWithMemory.length, assistantCompacted.length); index += 1) {
+    const before = messagesWithMemory[index];
+    const after = assistantCompacted[index];
+    if (before.role !== after.role) continue;
+    if (typeof before.content !== "string" || typeof after.content !== "string") continue;
+    if (before.content === after.content) continue;
+    if (before.role === "tool") toolMicroCompacted += 1;
+    if (before.role === "assistant") assistantMicroCompacted += 1;
+  }
+  const microCompactedCount = toolMicroCompacted + assistantMicroCompacted;
+  const microCompactionKind =
+    toolMicroCompacted > 0 && assistantMicroCompacted > 0
+      ? "mixed"
+      : toolMicroCompacted > 0
+        ? "tool_results"
+        : assistantMicroCompacted > 0
+          ? "assistant_messages"
+          : "none";
 
   // Step 3: Trim with hysteresis. When we cross the proactive trigger,
   // compact down to a lower target budget so we don't re-trigger every turn.
@@ -917,13 +979,22 @@ export function manageContext(
   return {
     messages: trimmed,
     droppedCount: actualDropped,
+    droppedMessageCount: actualDropped,
     changed: !messagesEqual(messages, trimmed),
     tokenCountBefore,
     tokenCountAfter,
     tokenReduction: Math.max(0, tokenCountBefore - tokenCountAfter),
     tokenBreakdownBefore,
     tokenBreakdownAfter,
+    retainedTokenBreakdown: tokenBreakdownAfter,
     budgets,
-    compressedContext: joinCompressionSummaries(microSummaries, trimResult.displaySummary, tokenBreakdownBefore),
+    compressedContext: [
+      memoryPacket,
+      joinCompressionSummaries(microSummaries, trimResult.displaySummary, tokenBreakdownBefore),
+    ].filter(Boolean).join("\n\n"),
+    memoryState,
+    memoryPacket,
+    microCompactionKind,
+    microCompactedCount,
   };
 }

@@ -17,15 +17,16 @@ import {
   buildAnthropicRequestBody,
   buildCloudHeaders,
   buildCloudMessagesApiUrl,
-  buildGeminiGenerateContentUrl,
-  buildGeminiRequestBody,
+  buildGeminiRequestForAuthMode,
   createAnthropicStreamProcessor,
+  ensureOpenAiChatGptCodexRequestBody,
   extractGeminiResponseText,
   extractOpenAiResponseText,
   finalizeStreamedToolCalls,
   normalizeCloudApiFormat,
   normalizeCloudProtocol,
   normalizeCloudToolProtocol,
+  parseOpenAiResponsesSseText,
   type CloudApiProtocol,
   type CloudAuthMode,
   type CloudToolProtocol,
@@ -467,6 +468,20 @@ function extractOpenAiChatCompletionFinishReason(payload: unknown): StreamResult
   return "stop";
 }
 
+function buildGeminiRuntimeRequest(
+  settings: StreamSettings,
+  messages: ChatMessage[],
+  maxTokens: number,
+): { url: string; body: Record<string, unknown> } {
+  const request = buildGeminiRequestForAuthMode(settings.baseUrl, {
+    messages: messages as ProtocolChatMessage[],
+    model: settings.model,
+    maxTokens,
+    stream: false,
+  }, settings.authMode);
+  return { url: request.url, body: request.body };
+}
+
 async function postJsonRequest(
   url: string,
   headers: Record<string, string>,
@@ -476,8 +491,8 @@ async function postJsonRequest(
 ): Promise<unknown> {
   if (signal?.aborted) throw createAbortError();
 
-  if (settings.useRustProxy) {
-    let result: string;
+    if (settings.useRustProxy) {
+      let result: string;
     const cancelProxyRequest = () => {
       invoke("cancel_proxy_request").catch(() => {});
     };
@@ -502,6 +517,10 @@ async function postJsonRequest(
       signal?.removeEventListener("abort", cancelProxyRequest);
     }
     if (signal?.aborted) throw createAbortError();
+    const contentType = (result.match(/^__CONTENT_TYPE__:(.*)\n/) || [])[1]?.trim() || "";
+    if (contentType.includes("text/event-stream")) {
+      return { output_text: parseOpenAiResponsesSseText(result.replace(/^__CONTENT_TYPE__:.*\n/, "")) };
+    }
     return JSON.parse(result);
   }
 
@@ -539,7 +558,8 @@ async function requestOpenAiNonStreaming(
     const maxTokens = maxTokensOverride ?? computeInitialMaxTokens(settings.contextLimit);
     const isGemini = isGeminiProvider(settings);
     const apiFormat = normalizeCloudApiFormat(settings.apiFormat);
-    const apiUrl = isGemini ? buildGeminiGenerateContentUrl(settings.baseUrl, settings.model, false) : buildApiUrl(settings);
+    const geminiRequest = isGemini ? buildGeminiRuntimeRequest(settings, messages, maxTokens) : null;
+    const apiUrl = geminiRequest?.url ?? buildApiUrl(settings);
     const headers = isGemini
       ? buildCloudHeaders("gemini", settings.apiKey, true, settings.customHeaders, settings.authMode)
       : buildCloudHeaders("openai", settings.apiKey, true, settings.customHeaders, settings.authMode);
@@ -550,11 +570,7 @@ async function requestOpenAiNonStreaming(
       payload = await postJsonRequest(
         apiUrl,
         headers,
-        buildGeminiRequestBody({
-          messages: messages as ProtocolChatMessage[],
-          model: settings.model,
-          maxTokens,
-        }),
+        geminiRequest?.body ?? {},
         settings,
         signal,
       );
@@ -567,6 +583,9 @@ async function requestOpenAiNonStreaming(
         reasoningEffort: settings.reasoningEffort,
         compact: true,
         includeTools: !minimalCompatibilityMode && shouldSendNativeTools(settings),
+        targetInputTokens: settings.contextLimit
+          ? computeContextBudgets(settings.contextLimit, maxTokens).inputBudget
+          : undefined,
       });
       const responseTools = !minimalCompatibilityMode && shouldSendNativeTools(settings) && tools && tools.length > 0
         ? tools
@@ -597,7 +616,9 @@ async function requestOpenAiNonStreaming(
           payload = await postJsonRequest(
             apiUrl,
             headers,
-            candidate.body,
+            settings.authMode === "openai_chatgpt_oauth"
+              ? ensureOpenAiChatGptCodexRequestBody(candidate.body)
+              : candidate.body,
             settings,
             signal,
           );
@@ -721,6 +742,7 @@ async function streamViaRustProxy(
   const maxTokens = maxTokensOverride ?? computeInitialMaxTokens(settings.contextLimit);
 
   // Build the request body (same logic as streamChatCompletion)
+  const geminiRequest = isGemini ? buildGeminiRuntimeRequest(settings, messages, maxTokens) : null;
   const body: Record<string, unknown> = isOllama
     ? {
         model: settings.model,
@@ -737,12 +759,7 @@ async function streamViaRustProxy(
           tools,
         })
       : isGemini
-        ? buildGeminiRequestBody({
-            messages: messages as ProtocolChatMessage[],
-            model: settings.model,
-            maxTokens,
-            stream: false,
-          })
+        ? geminiRequest?.body ?? {}
       : {
           model: settings.model,
           messages: messages.map((m) => mapMessageForApi(m, false)),
@@ -756,7 +773,7 @@ async function streamViaRustProxy(
     body.tools = normalizeToolDefinitions(tools);
   }
 
-  const apiUrl = isGemini ? buildGeminiGenerateContentUrl(settings.baseUrl, settings.model, false) : buildApiUrl(settings);
+  const apiUrl = geminiRequest?.url ?? buildApiUrl(settings);
   const protocol: CloudApiProtocol = isAnthropic ? "anthropic" : isGemini ? "gemini" : "openai";
   const headers: Record<string, string> = isOllama
     ? { "Content-Type": "application/json" }
@@ -1122,6 +1139,7 @@ export async function streamChatCompletion(
   const isGemini = isGeminiProvider(settings);
 
   // Build the request body based on provider
+  const geminiRequest = isGemini ? buildGeminiRuntimeRequest(settings, messages, maxTokens) : null;
   const body: Record<string, unknown> = isOllama
     ? {
         model: settings.model,
@@ -1138,12 +1156,7 @@ export async function streamChatCompletion(
           tools,
         })
       : isGemini
-        ? buildGeminiRequestBody({
-            messages: messages as ProtocolChatMessage[],
-            model: settings.model,
-            maxTokens,
-            stream: false,
-          })
+        ? geminiRequest?.body ?? {}
       : {
           model: settings.model,
           messages: messages.map((m) => mapMessageForApi(m, false)),
@@ -1158,7 +1171,7 @@ export async function streamChatCompletion(
     body.tools = normalizeToolDefinitions(tools);
   }
 
-  const apiUrl = isGemini ? buildGeminiGenerateContentUrl(settings.baseUrl, settings.model, false) : buildApiUrl(settings);
+  const apiUrl = geminiRequest?.url ?? buildApiUrl(settings);
   const protocol: CloudApiProtocol = isAnthropic ? "anthropic" : isGemini ? "gemini" : "openai";
   const headers: Record<string, string> = isOllama
     ? { "Content-Type": "application/json" }

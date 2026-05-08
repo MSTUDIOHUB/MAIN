@@ -24,6 +24,7 @@ import {
   getPtyStatus,
   runCommand,
   getFileOutline,
+  ingestAttachmentFile,
   readFile,
   readFileWindow,
   readDocument,
@@ -37,6 +38,7 @@ import {
   classifyBuiltInTool,
   classifyMcpToolName,
   isRiskAutoExecutable,
+  normalizeLocalFileReadPath,
 } from "./toolCapabilities";
 import { applyShellCwd } from "./toolExecutionContract";
 import { formatDirectoryNodesForTool } from "./workspacePaths";
@@ -58,6 +60,24 @@ function parseOptionalNumber(value: unknown): number | undefined {
 
 function parseOptionalString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+const LOCAL_FILE_READ_TOOLS = new Set([
+  "read_file",
+  "read_document",
+  "analyze_tabular_document",
+  "query_tabular_document",
+]);
+
+function isAbsoluteLocalPath(value: string): boolean {
+  return value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value);
+}
+
+function pathStartsWithRoot(path: string, root: string): boolean {
+  const normalizedPath = normalizeLocalFileReadPath(path);
+  const normalizedRoot = normalizeLocalFileReadPath(root);
+  if (!normalizedPath || !normalizedRoot) return false;
+  return normalizedPath === normalizedRoot || normalizedPath.startsWith(`${normalizedRoot}/`);
 }
 
 function shouldReturnRawReadFile(args: Record<string, unknown>): boolean {
@@ -104,6 +124,46 @@ function buildChatTempSuccessMessage(
   ].join("\n");
 }
 
+export interface ToolExecutionOptions {
+  allowExternalLocalRead?: boolean;
+}
+
+async function prepareExternalLocalReadArgs(
+  name: string,
+  args: Record<string, unknown>,
+  workspace: string,
+  sessionKey?: string,
+  options: ToolExecutionOptions = {},
+): Promise<{
+  args: Record<string, unknown>;
+  workspace: string;
+  externalLocalReadIngested?: boolean;
+}> {
+  const rawPath = typeof args.path === "string" ? args.path.trim() : "";
+  if (!LOCAL_FILE_READ_TOOLS.has(name) || !rawPath || !isAbsoluteLocalPath(rawPath)) {
+    return { args, workspace };
+  }
+  if (workspace && pathStartsWithRoot(rawPath, workspace)) {
+    return { args, workspace };
+  }
+  if (!sessionKey) {
+    throw new Error("Reading a local file outside the workspace requires an active session.");
+  }
+  if (!options.allowExternalLocalRead) {
+    throw new Error("Reading a local file outside the workspace requires user approval.");
+  }
+
+  const ingested = await ingestAttachmentFile(sessionKey, rawPath);
+  return {
+    args: {
+      ...args,
+      path: ingested.path,
+    },
+    workspace: ingested.workspace,
+    externalLocalReadIngested: true,
+  };
+}
+
 /**
  * Execute a tool by name and return the result.
  *
@@ -119,6 +179,7 @@ export async function executeTool(
   args: Record<string, unknown>,
   workspace: string,
   sessionKey?: string,
+  options: ToolExecutionOptions = {},
 ): Promise<unknown> {
   // ── MCP tool routing ────────────────────────────────────────
   // If the tool was discovered from an MCP server, forward the call
@@ -130,6 +191,11 @@ export async function executeTool(
     }
     return await executeMcpTool(serverUrl, name, args);
   }
+
+  const prepared = await prepareExternalLocalReadArgs(name, args, workspace, sessionKey, options);
+  args = prepared.args;
+  workspace = prepared.workspace;
+  const effectiveSessionKey = prepared.externalLocalReadIngested ? undefined : sessionKey;
 
   switch (name) {
     // ── Tauri IPC (std::fs on Rust side) ──────────────────────
@@ -143,7 +209,7 @@ export async function executeTool(
 
     case "read_file": {
       const rawPath = (args.path as string) || "";
-      const readWorkspace = await resolveWorkspaceForReadPath(rawPath, workspace, sessionKey);
+      const readWorkspace = await resolveWorkspaceForReadPath(rawPath, workspace, effectiveSessionKey);
       const startLine = parseWindowLineArg(args, "start_line");
       const endLine = parseWindowLineArg(args, "end_line");
       const maxLines = parseWindowLineArg(args, "max_lines");
@@ -191,7 +257,7 @@ export async function executeTool(
     case "read_document": {
       const rawPath = (args.path as string) || "";
       if (!rawPath) throw new Error("Missing required parameter 'path'.");
-      const readWorkspace = await resolveWorkspaceForReadPath(rawPath, workspace, sessionKey);
+      const readWorkspace = await resolveWorkspaceForReadPath(rawPath, workspace, effectiveSessionKey);
       return await readDocument(
         rawPath,
         parseOptionalNumber(args.max_chars),
@@ -206,7 +272,7 @@ export async function executeTool(
     case "analyze_tabular_document": {
       const rawPath = (args.path as string) || "";
       if (!rawPath) throw new Error("Missing required parameter 'path'.");
-      const readWorkspace = await resolveWorkspaceForReadPath(rawPath, workspace, sessionKey);
+      const readWorkspace = await resolveWorkspaceForReadPath(rawPath, workspace, effectiveSessionKey);
       return await analyzeTabularDocument(
         rawPath,
         parseOptionalString(args.sheet),
@@ -220,7 +286,7 @@ export async function executeTool(
     case "query_tabular_document": {
       const rawPath = (args.path as string) || "";
       if (!rawPath) throw new Error("Missing required parameter 'path'.");
-      const readWorkspace = await resolveWorkspaceForReadPath(rawPath, workspace, sessionKey);
+      const readWorkspace = await resolveWorkspaceForReadPath(rawPath, workspace, effectiveSessionKey);
       return await queryTabularDocument(
         rawPath,
         parseOptionalString(args.sheet),

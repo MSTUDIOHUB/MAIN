@@ -3,6 +3,13 @@ import {
   normalizeToolParametersSchema,
   type ToolDefinition,
 } from "./toolSchemas";
+import {
+  buildContextMemoryState,
+  contextMemoryContentToText,
+  formatContextMemoryPacket,
+  isContextMemoryMessage,
+  type ContextMemoryState,
+} from "./contextMemory";
 
 export type CloudApiProtocol = "openai" | "anthropic" | "gemini";
 export type OpenAiApiFormat = "chat_completions" | "responses";
@@ -12,6 +19,9 @@ export type CloudAuthMode = "api_key" | "openai_chatgpt_oauth" | "gemini_google_
 
 export const DEFAULT_ANTHROPIC_VERSION = "2023-06-01";
 export const OPENAI_CHATGPT_CODEX_ENDPOINT = "https://chatgpt.com/backend-api/codex/responses";
+export const GEMINI_CODE_ASSIST_ENDPOINT = "https://cloudcode-pa.googleapis.com/v1internal:generateContent";
+export const OPENAI_CHATGPT_CODEX_DEFAULT_INSTRUCTIONS = "You are MAIN, a concise coding assistant. Follow the user request exactly.";
+export const OPENAI_CHATGPT_CODEX_MAX_INSTRUCTIONS_CHARS = 24_000;
 export const OPENAI_CHATGPT_EXPERIMENTAL_MODELS = [
   "gpt-5.5",
   "gpt-5.4",
@@ -151,6 +161,7 @@ export interface BuildGeminiRequestOptions {
   maxTokens?: number;
   tools?: ToolDefinition[];
   stream?: boolean;
+  projectId?: string;
 }
 
 export interface AnthropicStreamProcessor {
@@ -161,6 +172,11 @@ export interface AnthropicStreamProcessor {
 
 const ANTHROPIC_THINKING_TAG_OPEN = "<thinking>";
 const ANTHROPIC_THINKING_TAG_CLOSE = "</thinking>";
+
+function truncateText(value: string, maxChars: number): string {
+  if (value.length <= maxChars) return value;
+  return value.slice(0, maxChars).trimEnd();
+}
 
 function normalizeUrl(url: string): string {
   return url.trim().replace(/\/+$/, "");
@@ -570,8 +586,9 @@ export function extractCloudModelIds(payload: unknown): string[] {
 }
 
 export function extractGeminiResponseText(payload: unknown): string {
-  if (!payload || typeof payload !== "object") return "";
-  const candidates = (payload as { candidates?: unknown }).candidates;
+  const responsePayload = extractGeminiResponsePayload(payload);
+  if (!responsePayload || typeof responsePayload !== "object") return "";
+  const candidates = (responsePayload as { candidates?: unknown }).candidates;
   if (!Array.isArray(candidates)) return "";
   return candidates
     .map((candidate) => {
@@ -717,6 +734,13 @@ export function buildOpenAiResponsesTranscript(messages: ProtocolChatMessage[]):
 
 const CLOUD_RESPONSES_INSTRUCTION_MAX_CHARS = 8000;
 const CLOUD_RESPONSES_MESSAGE_KEEP_TAIL = 8;
+const OPENAI_CHATGPT_PROBE_USER_PROMPT_ID = "main-cloud-test";
+
+export interface CloudResponsesMessageCompactionOptions {
+  contextMemoryState?: ContextMemoryState | null;
+  maxInputMessages?: number;
+  targetInputTokens?: number;
+}
 
 function truncateTextForCloud(value: string, maxChars: number): string {
   if (value.length <= maxChars) return value;
@@ -738,18 +762,57 @@ function compactProtocolMessageForCloud(message: ProtocolChatMessage): ProtocolC
   };
 }
 
-export function compactCloudResponsesMessages(messages: ProtocolChatMessage[]): ProtocolChatMessage[] {
-  const systemMessages = messages.filter((message) => message.role === "system");
-  const conversationMessages = messages.filter((message) => message.role !== "system");
+function buildCloudMemoryMessage(
+  messages: ProtocolChatMessage[],
+  options: CloudResponsesMessageCompactionOptions = {},
+): ProtocolChatMessage | null {
+  const explicitPacket = options.contextMemoryState
+    ? formatContextMemoryPacket(options.contextMemoryState, 3200)
+    : "";
+  const existingMemoryMessage = [...messages].reverse().find((message) => isContextMemoryMessage(message));
+  const existingPacket = existingMemoryMessage
+    ? contextMemoryContentToText(existingMemoryMessage.content)
+    : "";
+  const packet = existingPacket || formatContextMemoryPacket(buildContextMemoryState(messages), 3200);
+  const effectivePacket = explicitPacket || packet;
+  return effectivePacket ? { role: "user", content: effectivePacket } : null;
+}
 
-  if (conversationMessages.length <= CLOUD_RESPONSES_MESSAGE_KEEP_TAIL + 2) {
-    return [...systemMessages, ...conversationMessages.map(compactProtocolMessageForCloud)];
+export function compactCloudResponsesMessages(
+  messages: ProtocolChatMessage[],
+  options: CloudResponsesMessageCompactionOptions = {},
+): ProtocolChatMessage[] {
+  const systemMessages = messages.filter((message) => message.role === "system");
+  const memoryMessage = buildCloudMemoryMessage(messages, options);
+  const conversationMessages = messages.filter((message) => message.role !== "system" && !isContextMemoryMessage(message));
+  const maxInputMessages = Math.max(
+    6,
+    options.maxInputMessages ||
+      Math.min(18, Math.max(10, Math.floor((options.targetInputTokens || 9000) / 700))),
+  );
+  const reservedForMemoryAndSummary = (memoryMessage ? 1 : 0) + 1;
+  const keepTail = Math.max(4, Math.min(CLOUD_RESPONSES_MESSAGE_KEEP_TAIL, maxInputMessages - reservedForMemoryAndSummary));
+
+  if (conversationMessages.length <= keepTail + 2) {
+    return [
+      ...systemMessages,
+      ...(memoryMessage ? [memoryMessage] : []),
+      ...conversationMessages.map(compactProtocolMessageForCloud),
+    ];
   }
 
-  const omitted = conversationMessages.slice(0, -CLOUD_RESPONSES_MESSAGE_KEEP_TAIL);
-  const recent = conversationMessages.slice(-CLOUD_RESPONSES_MESSAGE_KEEP_TAIL);
+  const omitted = conversationMessages.slice(0, -keepTail);
+  const recent = conversationMessages.slice(-keepTail);
   const summary = omitted
-    .slice(-6)
+    .filter((message) => {
+      const text = extractTextContent(message.content);
+      return (
+        message.role === "user" ||
+        message.role === "tool" ||
+        /目标|必须|不要|错误|失败|next|todo|must|error|failed|path|file/i.test(text)
+      );
+    })
+    .slice(-10)
     .map((message, index) => {
       const text = truncateTextForCloud(extractTextContent(message.content).replace(/\s+/g, " ").trim(), 260);
       return `${index + 1}. ${labelForResponsesTranscript(message.role)}: ${text}`;
@@ -758,10 +821,11 @@ export function compactCloudResponsesMessages(messages: ProtocolChatMessage[]): 
 
   return [
     ...systemMessages,
+    ...(memoryMessage ? [memoryMessage] : []),
     {
       role: "user",
       content: [
-        `[Cloud history summary: ${omitted.length} older messages compacted for faster response]`,
+        `[Cloud history summary: ${omitted.length} older non-pinned messages compacted for faster response; ContextState above is pinned task memory]`,
         summary,
       ].filter(Boolean).join("\n"),
     },
@@ -880,9 +944,14 @@ export function buildOpenAiResponsesRequestCandidates(options: {
   reasoningEffort?: unknown;
   compact?: boolean;
   includeTools?: boolean;
+  contextMemoryState?: ContextMemoryState | null;
+  targetInputTokens?: number;
 }): OpenAiResponsesProbeRequestCandidate[] {
   const protocolMessages = options.compact
-    ? compactCloudResponsesMessages(options.messages)
+    ? compactCloudResponsesMessages(options.messages, {
+        contextMemoryState: options.contextMemoryState,
+        targetInputTokens: options.targetInputTokens,
+      })
     : options.messages;
   const rawInstructions = extractOpenAiResponsesInstructions(protocolMessages);
   const instructions = options.compact
@@ -914,12 +983,19 @@ export function buildOpenAiResponsesProbeRequestCandidates(options: {
   includeAdvanced?: boolean;
   disableResponseStorage?: boolean;
   reasoningEffort?: unknown;
+  authMode?: CloudAuthMode;
 }): OpenAiResponsesProbeRequestCandidate[] {
   const inputCandidates = buildOpenAiResponsesInputCandidates(options.messages);
-  const orderedCandidates = [
-    ...inputCandidates.filter((candidate) => candidate.mode === "transcript_text"),
-    ...inputCandidates.filter((candidate) => candidate.mode !== "transcript_text"),
-  ];
+  const isChatGptOauth = normalizeCloudAuthMode(options.authMode) === "openai_chatgpt_oauth";
+  const orderedCandidates = isChatGptOauth
+    ? [
+        ...inputCandidates.filter((candidate) => candidate.mode === "input_text_array"),
+        ...inputCandidates.filter((candidate) => candidate.mode !== "input_text_array"),
+      ]
+    : [
+        ...inputCandidates.filter((candidate) => candidate.mode === "transcript_text"),
+        ...inputCandidates.filter((candidate) => candidate.mode !== "transcript_text"),
+      ];
   const extras = options.includeAdvanced
     ? buildOpenAiResponsesRequestExtras({
         disableResponseStorage: options.disableResponseStorage,
@@ -932,9 +1008,80 @@ export function buildOpenAiResponsesProbeRequestCandidates(options: {
     body: {
       model: options.model,
       input: candidate.input,
+      ...(isChatGptOauth ? { user_prompt_id: OPENAI_CHATGPT_PROBE_USER_PROMPT_ID } : {}),
       ...extras,
     },
   }));
+}
+
+export function ensureOpenAiChatGptCodexRequestBody(
+  body: Record<string, unknown>,
+  options: {
+    userPromptId?: string;
+    instructions?: string;
+  } = {},
+): Record<string, unknown> {
+  const rawInstructions = typeof options.instructions === "string" && options.instructions.trim()
+    ? options.instructions.trim()
+    : typeof body.instructions === "string" && body.instructions.trim()
+      ? body.instructions.trim()
+      : OPENAI_CHATGPT_CODEX_DEFAULT_INSTRUCTIONS;
+  const instructions = truncateText(rawInstructions, OPENAI_CHATGPT_CODEX_MAX_INSTRUCTIONS_CHARS);
+  return {
+    ...body,
+    instructions,
+    stream: true,
+    store: false,
+    ...(typeof body.user_prompt_id === "string" && body.user_prompt_id.trim()
+      ? {}
+      : { user_prompt_id: options.userPromptId || OPENAI_CHATGPT_PROBE_USER_PROMPT_ID }),
+  };
+}
+
+export function parseOpenAiResponsesSseText(streamText: string): string {
+  const lines = String(streamText || "").split(/\r?\n/);
+  let eventName = "";
+  let text = "";
+  const flushData = (rawData: string) => {
+    const data = rawData.trim();
+    if (!data || data === "[DONE]") return;
+    try {
+      const payload = JSON.parse(data);
+      const delta = (payload as { delta?: unknown }).delta;
+      if (typeof delta === "string" && (eventName === "response.output_text.delta" || !eventName)) {
+        text += delta;
+        return;
+      }
+      const outputText = (payload as { output_text?: unknown }).output_text;
+      if (typeof outputText === "string") {
+        text += outputText;
+        return;
+      }
+      const responseText = extractOpenAiResponseText(payload, "responses");
+      if (responseText) text += responseText;
+    } catch {
+      // Ignore malformed SSE data lines.
+    }
+  };
+
+  let dataLines: string[] = [];
+  for (const line of lines) {
+    if (!line.trim()) {
+      flushData(dataLines.join("\n"));
+      dataLines = [];
+      eventName = "";
+      continue;
+    }
+    if (line.startsWith("event:")) {
+      eventName = line.slice(6).trim();
+      continue;
+    }
+    if (line.startsWith("data:")) {
+      dataLines.push(line.slice(5).trimStart());
+    }
+  }
+  flushData(dataLines.join("\n"));
+  return text;
 }
 
 function mapGeminiRole(role: ProtocolChatMessage["role"]): "user" | "model" {
@@ -959,11 +1106,49 @@ export function buildGeminiRequestBody(options: BuildGeminiRequestOptions): Reco
   return body;
 }
 
+export function buildGeminiCodeAssistRequestBody(options: BuildGeminiRequestOptions): Record<string, unknown> {
+  const cleanModel = options.model.replace(/^models\//, "").trim();
+  return {
+    model: cleanModel,
+    ...(options.projectId ? { project: options.projectId } : {}),
+    user_prompt_id: `main-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
+    request: buildGeminiRequestBody({
+      ...options,
+      model: cleanModel,
+    }),
+  };
+}
+
 export function buildGeminiGenerateContentUrl(endpoint: string, model: string, stream = false): string {
   const base = buildCloudMessagesApiUrl(endpoint, "gemini");
   const cleanModel = model.replace(/^models\//, "").trim();
   const action = stream ? "streamGenerateContent" : "generateContent";
   return `${base}/models/${encodeURIComponent(cleanModel)}:${action}`;
+}
+
+export function buildGeminiRequestForAuthMode(
+  endpoint: string,
+  options: BuildGeminiRequestOptions,
+  authMode?: CloudAuthMode,
+): { url: string; body: Record<string, unknown>; responseMode: "native" | "code_assist" } {
+  if (normalizeCloudAuthMode(authMode) === "gemini_google_oauth") {
+    return {
+      url: GEMINI_CODE_ASSIST_ENDPOINT,
+      body: buildGeminiCodeAssistRequestBody(options),
+      responseMode: "code_assist",
+    };
+  }
+  return {
+    url: buildGeminiGenerateContentUrl(endpoint, options.model, Boolean(options.stream)),
+    body: buildGeminiRequestBody(options),
+    responseMode: "native",
+  };
+}
+
+export function extractGeminiResponsePayload(payload: unknown): unknown {
+  if (!payload || typeof payload !== "object") return payload;
+  const response = (payload as { response?: unknown }).response;
+  return response && typeof response === "object" ? response : payload;
 }
 
 export function convertOpenAiToolsToResponses(tools: ToolDefinition[] | undefined): Record<string, unknown>[] {

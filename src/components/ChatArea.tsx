@@ -164,14 +164,17 @@ function ContextCompressionNotice({ block, language }: { block: any; language: "
   const isBlackTheme = themeMode === "black";
   const stats = block.contextCompression || {};
   const isReactive = stats.reason === "reactive";
-  const isMicroOnly = !isReactive && Number(stats.droppedCount || 0) === 0;
+  const droppedMessageCount = Number(stats.droppedMessageCount ?? stats.droppedCount ?? 0);
+  const microCompactedCount = Number(stats.microCompactedCount || 0);
+  const microKind = String(stats.microCompactionKind || "none");
+  const isMicroOnly = !isReactive && droppedMessageCount === 0 && microCompactedCount > 0;
   const topSourceLabel = String(stats.topTokenSource?.label || "").trim();
   const topSourceTokens = Number(stats.topTokenSource?.tokens || 0);
   const title = language === "zh"
-    ? isReactive ? "背景压缩 · 溢出保护" : isMicroOnly ? "长内容已整理" : "背景已压缩"
-    : isReactive ? "Context compressed · overflow guard" : isMicroOnly ? "Long content compacted" : "Context compressed";
+    ? isReactive ? "上下文溢出保护" : isMicroOnly ? (microKind === "tool_results" ? "长工具输出已截断" : "长内容已整理") : "历史上下文已压缩"
+    : isReactive ? "Context overflow guard" : isMicroOnly ? (microKind === "tool_results" ? "Long tool output truncated" : "Long content compacted") : "History context compressed";
   const compactLabel = language === "zh" ? "查看" : "View";
-  const bodyText = String(stats.compressedContext || "").trim() || (language === "zh"
+  const bodyText = String(stats.memoryPacket || stats.compressedContext || "").trim() || (language === "zh"
     ? "当前只保存了压缩统计，暂无可展示的压缩摘要。"
     : "Only compression stats are available for this event.");
   const tone = isLightTheme
@@ -1744,7 +1747,10 @@ export default function ChatArea({
     }
 
     if (block.type === "tool") {
-      if (block.toolStatus === "pending") return null;
+      const shouldHidePendingTool =
+        block.toolStatus === "pending" &&
+        (block.toolName === "write_file" || block.toolName === "replace_in_file");
+      if (shouldHidePendingTool) return null;
       if (
         (block.toolName === "write_file" || block.toolName === "replace_in_file") &&
         isEphemeralPlanArtifactPath(block.target)

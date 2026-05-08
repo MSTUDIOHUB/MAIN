@@ -24,6 +24,7 @@ import {
 import { buildToolDefinitions, skillNameToToolName, type ToolDefinition } from "./toolSchemas";
 import { executeTool } from "./toolExecutor";
 import { computeContextBudgets, estimateTokens, manageContext } from "./contextTrim";
+import type { ContextMemoryState } from "./contextMemory";
 import { clampContextLimitToReported } from "./contextWindow";
 import { generateId } from "./utils";
 import { buildSystemPrompt } from "./systemPrompt";
@@ -88,6 +89,8 @@ import {
 import {
   buildToolCapabilityRegistry,
   filterToolDefinitionsForIntent,
+  getLocalFileReadPathForToolCall,
+  isLocalFileReadApproved,
   isToolAutoExecutableForCall,
   routeMcpToolsForPrompt,
 } from "./toolCapabilities";
@@ -373,7 +376,7 @@ function summarizeReplyOptionsForLog(replyOptions: ReplyOption[], limit = 4) {
 
 /** Result returned when the user acts on a pending Action Card. */
 export type ReviewDecision =
-  | { action: "accept" }
+  | { action: "accept"; grantLocalFileReadPath?: string }
   | { action: "reject" }
   | { action: "error"; error: string };
 
@@ -403,12 +406,14 @@ export interface OrchestratorCallbacks {
   getIsPlanApproved: () => boolean;
   getPlanApprovalChoice: () => string | null;
   getReadOnlyAutoApproveForSession: () => boolean;
+  getApprovedLocalFileReadPaths: () => string[];
   getPlanStage: () => "idle" | "requirements" | "design" | "tasks" | "bugfix" | "ready_to_execute" | "executing" | "completed";
   getPlanTasks: () => PlanTask[];
   getPlanExecutionEvidenceLedger: () => PlanExecutionEvidenceEntry[];
   getPlanAutoResumeCount?: () => number;
   getStatus: () => "idle" | "running" | "pending_review" | "error";
   startNewTurn: () => void;
+  getContextMemoryState?: () => ContextMemoryState | null;
 
   // UI updates
   onStreamToken: (token: string, messageId: string) => void;
@@ -434,13 +439,18 @@ export interface OrchestratorCallbacks {
   // Message history management
   appendMessage: (msg: AgentMessage) => void;
   replaceMessages: (msgs: AgentMessage[]) => void;
+  onContextMemoryBuilt?: (state: ContextMemoryState, packet: string) => void;
   onContextCompress: (
     stats: {
       droppedCount: number;
+      droppedMessageCount?: number;
       tokenCountBefore: number;
       tokenCountAfter: number;
       tokenReduction: number;
       compressedContext?: string;
+      memoryPacket?: string;
+      microCompactionKind?: "none" | "tool_results" | "assistant_messages" | "mixed";
+      microCompactedCount?: number;
       tokenBreakdown?: {
         topSourceLabel: string;
         topSourceTokens: number;
@@ -460,6 +470,8 @@ export interface OrchestratorCallbacks {
   requestReview: (toolCall: {
     name: string;
     arguments: Record<string, unknown>;
+    risk?: "local_file_read";
+    localFileReadPath?: string;
   }) => Promise<ReviewDecision>;
 }
 
@@ -488,8 +500,8 @@ function deriveStreamSettings(config: AppConfig): StreamSettings {
     model: config.cloud.model,
     apiProtocol: config.cloud.protocol || "openai",
     apiFormat: config.cloud.apiFormat || "chat_completions",
-    authMode: config.cloud.auth?.mode ?? "api_key",
-    tokenRef: config.cloud.auth?.tokenRef,
+    authMode: config.cloudExperimentalLoginEnabled === true ? config.cloud.auth?.mode ?? "api_key" : "api_key",
+    tokenRef: config.cloudExperimentalLoginEnabled === true ? config.cloud.auth?.tokenRef : undefined,
     customHeaders: config.cloud.customHeaders || "",
     disableResponseStorage: config.cloud.disableResponseStorage ?? true,
     reasoningEffort: config.cloud.reasoningEffort ?? "none",
@@ -1373,6 +1385,7 @@ async function executeToolCallWithLifecycle(
   callbacks: OrchestratorCallbacks,
   allTools: ToolDefinition[],
   hooksConfig: Awaited<ReturnType<typeof loadHooksConfig>>,
+  options: { allowExternalLocalRead?: boolean } = {},
 ): Promise<ToolExecutionResult> {
   const sessionKey = callbacks.getSessionKey();
   let toolArgs: Record<string, unknown>;
@@ -1455,7 +1468,9 @@ async function executeToolCallWithLifecycle(
   callbacks.onToolExecuting(tc.name, target, diffPreview);
 
   try {
-    const rawResult = await executeTool(tc.name, resolvedArgs, workspace, sessionKey);
+    const rawResult = await executeTool(tc.name, resolvedArgs, workspace, sessionKey, {
+      allowExternalLocalRead: options.allowExternalLocalRead === true,
+    });
     const resultStr = typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult);
     const cloudProfile = callbacks.getConfig().activeProfile === "cloud";
     const budgets = getToolResultBudgets(tc.name, cloudProfile);
@@ -1472,7 +1487,9 @@ async function executeToolCallWithLifecycle(
       },
       {
         readFile: async (path) => {
-          const content = await executeTool("read_file", { path, __raw: true }, workspace, sessionKey);
+          const content = await executeTool("read_file", { path, __raw: true }, workspace, sessionKey, {
+            allowExternalLocalRead: options.allowExternalLocalRead === true,
+          });
           return String(content ?? "");
         },
         warn: (message, error) => console.warn(message, error),
@@ -1546,16 +1563,84 @@ async function executeToolCallWithLifecycle(
  * From claude-code-haha's toolOrchestration.ts: safe tools can run in parallel.
  */
 async function executeReadOnlyToolsConcurrently(
-  toolCalls: ToolCallToExecute[],
+  toolCalls: Array<ToolCallToExecute & { allowExternalLocalRead?: boolean }>,
   workspace: string,
   callbacks: OrchestratorCallbacks,
   allTools: ToolDefinition[],
   hooksConfig: Awaited<ReturnType<typeof loadHooksConfig>>,
 ): Promise<ToolExecutionResult[]> {
   const promises = toolCalls.map(tc =>
-    executeToolCallWithLifecycle(tc, workspace, callbacks, allTools, hooksConfig),
+    executeToolCallWithLifecycle(tc, workspace, callbacks, allTools, hooksConfig, {
+      allowExternalLocalRead: tc.allowExternalLocalRead === true,
+    }),
   );
   return Promise.all(promises);
+}
+
+async function executeLocalFileReadToolWithReview(
+  tc: ToolCallToExecute,
+  toolArgs: Record<string, unknown>,
+  localFileReadPath: string,
+  workspace: string,
+  callbacks: OrchestratorCallbacks,
+  allTools: ToolDefinition[],
+  hooksConfig: Awaited<ReturnType<typeof loadHooksConfig>>,
+): Promise<ToolExecutionResult> {
+  const target = getToolTarget(tc.name, toolArgs);
+  callbacks.onStatusChange("pending_review");
+
+  let decision: ReviewDecision;
+  try {
+    decision = await callbacks.requestReview({
+      name: tc.name,
+      arguments: toolArgs,
+      risk: "local_file_read",
+      localFileReadPath,
+    });
+  } catch {
+    callbacks.onStatusChange("idle");
+    return {
+      toolCallId: tc.id,
+      name: tc.name,
+      target,
+      content: "User cancelled the local file read approval.",
+      isError: true,
+    };
+  }
+
+  callbacks.onStatusChange("running");
+
+  if (decision.action === "accept") {
+    const allowExternalLocalRead =
+      isLocalFileReadApproved(decision.grantLocalFileReadPath || "", [localFileReadPath]) ||
+      isLocalFileReadApproved(localFileReadPath, callbacks.getApprovedLocalFileReadPaths());
+    return await executeToolCallWithLifecycle(
+      tc,
+      workspace,
+      callbacks,
+      allTools,
+      hooksConfig,
+      { allowExternalLocalRead },
+    );
+  }
+
+  if (decision.action === "reject") {
+    return {
+      toolCallId: tc.id,
+      name: tc.name,
+      target,
+      content: "User rejected reading this local file outside the workspace. Ask for a different file, use an attached file, or continue without it.",
+      isError: true,
+    };
+  }
+
+  return {
+    toolCallId: tc.id,
+    name: tc.name,
+    target,
+    content: `Tool execution failed: ${decision.error}`,
+    isError: true,
+  };
 }
 
 function buildPlanGateBlockedResult(
@@ -2187,7 +2272,20 @@ export async function executeAgentLoop(
         cloudResponsesCompact ? Math.min(outputBudget, 2048) : outputBudget,
         cloudResponsesCompact ? 700 : Math.max(4000, Math.floor(inputBudget * 0.45)),
         cloudResponsesCompact ? 500 : Math.max(2000, Math.floor(inputBudget * 0.25)),
+        false,
+        {
+          previousMemoryState: callbacks.getContextMemoryState?.() || null,
+        },
       );
+      callbacks.onContextMemoryBuilt?.(managedResult.memoryState, managedResult.memoryPacket);
+      logAgentEvent("context_memory_built", {
+        memoryId: managedResult.memoryState.id,
+        goals: managedResult.memoryState.goals.length,
+        constraints: managedResult.memoryState.constraints.length,
+        evidence: managedResult.memoryState.evidence.length,
+        files: managedResult.memoryState.files.length,
+        packetChars: managedResult.memoryPacket.length,
+      });
       managedAgentMessages = managedResult.messages as AgentMessage[];
       if (managedResult.changed) {
         callbacks.replaceMessages(managedAgentMessages);
@@ -2195,14 +2293,27 @@ export async function executeAgentLoop(
       if (managedResult.changed && managedResult.tokenReduction > 0) {
         callbacks.onContextCompress({
           droppedCount: managedResult.droppedCount,
+          droppedMessageCount: managedResult.droppedMessageCount,
           tokenCountBefore: managedResult.tokenCountBefore,
           tokenCountAfter: managedResult.tokenCountAfter,
           tokenReduction: managedResult.tokenReduction,
           compressedContext: managedResult.compressedContext,
+          memoryPacket: managedResult.memoryPacket,
+          microCompactionKind: managedResult.microCompactionKind,
+          microCompactedCount: managedResult.microCompactedCount,
           tokenBreakdown: managedResult.tokenBreakdownBefore,
         }, "proactive");
         emitPlanExecutionProgress("context_compression");
       }
+      logAgentEvent("context_pack_built", {
+        messagesBefore: callbacks.getMessages().length,
+        messagesAfter: managedAgentMessages.length,
+        tokenBefore: Math.round(managedResult.tokenCountBefore),
+        tokenAfter: Math.round(managedResult.tokenCountAfter),
+        droppedMessageCount: managedResult.droppedMessageCount,
+        microCompactionKind: managedResult.microCompactionKind,
+        microCompactedCount: managedResult.microCompactedCount,
+      });
     }
 
     // 2. Stream LLM response
@@ -2305,7 +2416,11 @@ export async function executeAgentLoop(
           maxToolResultTokens,
           480,
           true,
+          {
+            previousMemoryState: callbacks.getContextMemoryState?.() || null,
+          },
         );
+        callbacks.onContextMemoryBuilt?.(aggressivelyManagedResult.memoryState, aggressivelyManagedResult.memoryPacket);
         const aggressivelyManaged = aggressivelyManagedResult.messages as AgentMessage[];
         if (aggressivelyManagedResult.changed) {
           callbacks.replaceMessages(aggressivelyManaged);
@@ -2313,10 +2428,14 @@ export async function executeAgentLoop(
         if (aggressivelyManagedResult.changed && aggressivelyManagedResult.tokenReduction > 0) {
           callbacks.onContextCompress({
             droppedCount: aggressivelyManagedResult.droppedCount,
+            droppedMessageCount: aggressivelyManagedResult.droppedMessageCount,
             tokenCountBefore: aggressivelyManagedResult.tokenCountBefore,
             tokenCountAfter: aggressivelyManagedResult.tokenCountAfter,
             tokenReduction: aggressivelyManagedResult.tokenReduction,
             compressedContext: aggressivelyManagedResult.compressedContext,
+            memoryPacket: aggressivelyManagedResult.memoryPacket,
+            microCompactionKind: aggressivelyManagedResult.microCompactionKind,
+            microCompactedCount: aggressivelyManagedResult.microCompactedCount,
             tokenBreakdown: aggressivelyManagedResult.tokenBreakdownBefore,
           }, "reactive");
           emitPlanExecutionProgress("context_compression");
@@ -2370,17 +2489,25 @@ export async function executeAgentLoop(
             320,
             220,
             true,
+            {
+              previousMemoryState: callbacks.getContextMemoryState?.() || null,
+            },
           );
+          callbacks.onContextMemoryBuilt?.(emergencyManagedResult.memoryState, emergencyManagedResult.memoryPacket);
           const emergencyManaged = emergencyManagedResult.messages as AgentMessage[];
 
           if (emergencyManagedResult.changed && emergencyManagedResult.tokenReduction > 0) {
             callbacks.replaceMessages(emergencyManaged);
             callbacks.onContextCompress({
               droppedCount: emergencyManagedResult.droppedCount,
+              droppedMessageCount: emergencyManagedResult.droppedMessageCount,
               tokenCountBefore: emergencyManagedResult.tokenCountBefore,
               tokenCountAfter: emergencyManagedResult.tokenCountAfter,
               tokenReduction: emergencyManagedResult.tokenReduction,
               compressedContext: emergencyManagedResult.compressedContext,
+              memoryPacket: emergencyManagedResult.memoryPacket,
+              microCompactionKind: emergencyManagedResult.microCompactionKind,
+              microCompactedCount: emergencyManagedResult.microCompactedCount,
               tokenBreakdown: emergencyManagedResult.tokenBreakdownBefore,
             }, "reactive");
             emitPlanExecutionProgress("context_compression");
@@ -3271,9 +3398,10 @@ export async function executeAgentLoop(
       tool_calls: toolCallsForMsg,
     });
 
-    // Partition tool calls into auto-executable, spec file writes
-    // (auto-approved in Plan Mode), and review-gated tools.
-    const readOnlyCalls: ToolCallToExecute[] = [];
+    // Partition tool calls into auto-executable, local file read approvals,
+    // spec file writes (auto-approved in Plan Mode), and review-gated tools.
+    const readOnlyCalls: Array<ToolCallToExecute & { allowExternalLocalRead?: boolean }> = [];
+    const localFileReadCalls: Array<ToolCallToExecute & { localFileReadPath: string }> = [];
     const specFileCalls: ToolCallToExecute[] = [];
     const writeCalls: ToolCallToExecute[] = [];
     const readOnlyCallSignatures = new Map<string, string>();
@@ -3317,7 +3445,20 @@ export async function executeAgentLoop(
         continue;
       }
 
-      if (isToolAutoExecutableForCall(tc.name, toolArgs, toolCapabilityRegistry, config.toolPermissionPolicy)) {
+      const approvedLocalFileReadPaths = callbacks.getApprovedLocalFileReadPaths();
+      const localFileReadPath = getLocalFileReadPathForToolCall(tc.name, toolArgs, workspace);
+      const shouldGateLocalFileRead =
+        !!localFileReadPath && !isLocalFileReadApproved(localFileReadPath, approvedLocalFileReadPaths);
+
+      if (shouldGateLocalFileRead) {
+        localFileReadCalls.push({ id: tc.id, name: tc.name, arguments: tc.arguments, localFileReadPath });
+      } else if (isToolAutoExecutableForCall(
+        tc.name,
+        toolArgs,
+        toolCapabilityRegistry,
+        config.toolPermissionPolicy,
+        { workspace, approvedLocalFileReadPaths },
+      )) {
         const signature = buildReadOnlyCacheSignature(tc.name, toolArgs);
         const cached = readOnlyResultCache.get(signature);
         const fileReadMetadata =
@@ -3410,7 +3551,12 @@ export async function executeAgentLoop(
         queuedReadOnlySignatures.add(signature);
         readOnlyCallSignatures.set(tc.id, signature);
         if (fileReadSignature) readOnlyCallSignatures.set(`${tc.id}:file_read`, fileReadSignature);
-        readOnlyCalls.push({ id: tc.id, name: tc.name, arguments: tc.arguments });
+        readOnlyCalls.push({
+          id: tc.id,
+          name: tc.name,
+          arguments: tc.arguments,
+          allowExternalLocalRead: !!localFileReadPath && isLocalFileReadApproved(localFileReadPath, approvedLocalFileReadPaths),
+        });
       } else if (workflowMode === "plan" && runtimeIntent !== "execute" && runtimeIntent !== "studio_workflow") {
         const approved = callbacks.getIsPlanApproved();
         const hasExecutableTasks = callbacks.getPlanTasks().length > 0;
@@ -3480,6 +3626,28 @@ export async function executeAgentLoop(
         }
       }
       allResults.push(...readResults);
+    }
+
+    // Execute approved-by-user local file reads sequentially. These are read
+    // tools, but the first access to each external path is intentionally
+    // human-gated.
+    for (const tc of localFileReadCalls) {
+      const toolArgs = parseToolCallArguments(tc);
+      const result = await executeLocalFileReadToolWithReview(
+        tc,
+        toolArgs,
+        tc.localFileReadPath,
+        workspace,
+        callbacks,
+        iterationAllTools,
+        hooksConfig,
+      );
+      allResults.push(result);
+
+      if (abortController.signal.aborted) {
+        callbacks.onStatusChange("idle");
+        return;
+      }
     }
 
     // Execute spec file writes concurrently — auto-approved, no user review needed
@@ -3579,6 +3747,10 @@ export async function executeAgentLoop(
         toolArgs,
         toolCapabilityRegistry,
         config.toolPermissionPolicy,
+        {
+          workspace,
+          approvedLocalFileReadPaths: callbacks.getApprovedLocalFileReadPaths(),
+        },
       );
       const readOnlyShellInspection = isReadOnlyShellInspectionToolCall(tc.name, toolArgs);
       const repeatGuardReadOnly = autoExecutable || readOnlyShellInspection;

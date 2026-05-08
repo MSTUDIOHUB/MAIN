@@ -57,6 +57,10 @@ test.beforeEach(async ({ page }) => {
           expiresAt: Date.now() + 3600000,
           storage: "file",
           message: "Stored in app data with 0600 file permissions.",
+          projectId: mode === "gemini_google_oauth" ? "mock-code-assist-project" : undefined,
+          tier: mode === "gemini_google_oauth" ? "free-tier" : undefined,
+          onboarded: mode === "gemini_google_oauth" ? true : undefined,
+          codeAssistMessage: mode === "gemini_google_oauth" ? "Gemini Code Assist project loaded." : undefined,
         };
       }
       if (cmd === "cloud_auth_logout") {
@@ -82,7 +86,17 @@ test.beforeEach(async ({ page }) => {
             throw new Error("HTTP 400: unsupported parameter: store");
           }
           if (requestUrl.includes("/responses")) {
-            return JSON.stringify({ output_text: "ok" });
+            return "__CONTENT_TYPE__:text/event-stream\n"
+              + "event: response.output_text.delta\n"
+              + "data: {\"delta\":\"ok\"}\n\n"
+              + "event: response.completed\n"
+              + "data: {}\n\n";
+          }
+          if (requestUrl.includes("v1internal:generateContent")) {
+            return JSON.stringify({ response: { candidates: [{ content: { parts: [{ text: "ok" }] } }] } });
+          }
+          if (requestUrl.includes(":generateContent")) {
+            return JSON.stringify({ candidates: [{ content: { parts: [{ text: "ok" }] } }] });
           }
           return JSON.stringify({
             choices: [
@@ -111,18 +125,32 @@ test.beforeEach(async ({ page }) => {
   }, { seededModels: models });
 });
 
+async function enableCloudLab(page: import("@playwright/test").Page) {
+  await page.getByTestId("cloud-lab-toggle").click();
+  await expect(page.getByTestId("cloud-lab-toggle")).toHaveAttribute("aria-checked", "true");
+}
+
 test("cloud settings hides sampling params and keeps advanced compatibility collapsed", async ({ page }) => {
   await page.goto("/?e2eScenario=cloud-settings-model-select");
 
+  await expect(page.getByTestId("cloud-lab-toggle")).toHaveAttribute("aria-checked", "false");
+  await expect(page.getByTestId("cloud-auth-mode-api_key")).toBeVisible();
+  await expect(page.getByTestId("cloud-auth-mode-openai_chatgpt_oauth")).toHaveCount(0);
+  await expect(page.getByTestId("cloud-auth-mode-gemini_google_oauth")).toHaveCount(0);
+  await expect(page.getByText("ChatGPT Pro/Plus/Codex 实验登录")).toHaveCount(0);
+  await expect(page.getByText("Gemini Google 实验登录")).toHaveCount(0);
   await expect(page.getByText("Temperature")).toHaveCount(0);
   await expect(page.getByText("Top P")).toHaveCount(0);
   await expect(page.getByTestId("cloud-advanced-compatibility")).not.toHaveAttribute("open", "");
-  await expect(page.getByTestId("cloud-server-endpoint-input")).not.toBeVisible();
-
-  await page.getByText("高级兼容性").click();
   await expect(page.getByTestId("cloud-server-endpoint-input")).toBeVisible();
+  await expect(page.getByText("高级兼容性")).toHaveCount(0);
+  await expect(page.getByText("详细设置")).toBeVisible();
+  await expect(page.getByText("推荐优先让用户直接在这里填写协议")).toHaveCount(0);
+
+  await page.getByText("详细设置").click();
   await expect(page.getByText("Reasoning Effort")).toBeVisible();
   await expect(page.getByText("Disable Response Storage")).toBeVisible();
+  await expect(page.getByText("Additional Headers (JSON)")).toBeVisible();
 });
 
 test("OpenAI experimental login shows status and refreshes Codex model candidates", async ({ page }) => {
@@ -131,6 +159,7 @@ test("OpenAI experimental login shows status and refreshes Codex model candidate
     (window as any).__CLOUD_AUTH_MODE__ = "openai_chatgpt_oauth";
   });
 
+  await enableCloudLab(page);
   await page.getByTestId("cloud-auth-mode-openai_chatgpt_oauth").click();
   await expect(page.getByText("ChatGPT Pro/Plus/Codex 实验登录")).toBeVisible();
   await expect(page.getByText("不承诺免费账号可用")).toBeVisible();
@@ -146,21 +175,101 @@ test("OpenAI experimental login shows status and refreshes Codex model candidate
   expect(commands.some((call: any) => call.cmd === "cloud_auth_begin" && call.args.mode === "openai_chatgpt_oauth")).toBeTruthy();
 });
 
+test("OpenAI experimental login probes with Codex-compatible input text", async ({ page }) => {
+  await page.goto("/?e2eScenario=cloud-settings-model-select");
+  await page.evaluate(() => {
+    (window as any).__CLOUD_AUTH_MODE__ = "openai_chatgpt_oauth";
+  });
+
+  await enableCloudLab(page);
+  await page.getByTestId("cloud-auth-mode-openai_chatgpt_oauth").click();
+  await page.getByTestId("cloud-auth-login").click();
+  await expect(page.getByText(/已登录 · openai@example\.com/)).toBeVisible();
+  await page.getByTestId("cloud-model-refresh").click();
+  await page.getByTestId("cloud-model-test").click();
+
+  const requests = await page.evaluate(() => (window as any).__CLOUD_REQUESTS__ ?? []);
+  const probe = requests.find((request: any) => request.method === "POST" && request.url.includes("/responses"));
+  expect(probe?.body?.model).toBe("gpt-5.5");
+  expect(probe?.body?.input?.[0]?.content?.[0]?.type).toBe("input_text");
+  expect(probe?.body?.user_prompt_id).toBe("main-cloud-test");
+  expect(probe?.body?.instructions).toBeTruthy();
+  expect(probe?.body?.store).toBe(false);
+  expect(probe?.body?.stream).toBe(true);
+  expect(probe?.body?.temperature).toBeUndefined();
+  expect(probe?.body?.top_p).toBeUndefined();
+});
+
 test("Gemini Google login shows Cloud Project hint and native model candidates", async ({ page }) => {
   await page.goto("/?e2eScenario=cloud-settings-model-select");
   await page.evaluate(() => {
     (window as any).__CLOUD_AUTH_MODE__ = "gemini_google_oauth";
   });
 
+  await enableCloudLab(page);
   await page.getByTestId("cloud-auth-mode-gemini_google_oauth").click();
   await expect(page.getByText("Gemini Google 实验登录")).toBeVisible();
   await expect(page.getByText(/GOOGLE_CLOUD_PROJECT/)).toBeVisible();
   await page.getByTestId("cloud-auth-login").click();
   await expect(page.getByText(/已登录 · gemini@example\.com/)).toBeVisible();
+  await expect(page.getByText(/Project: mock-code-assist-project/)).toBeVisible();
 
   await page.getByTestId("cloud-model-refresh").click();
   await expect(page.getByTestId("cloud-model-select")).toBeVisible();
   await expect(page.getByTestId("cloud-model-select").locator("option").filter({ hasText: "gemini-2.5-pro" })).toHaveCount(1);
+});
+
+test("Gemini Google login replaces stale OpenAI endpoint before testing", async ({ page }) => {
+  await page.goto("/?e2eScenario=cloud-settings-model-select");
+  await page.evaluate(() => {
+    (window as any).__CLOUD_AUTH_MODE__ = "gemini_google_oauth";
+  });
+
+  await enableCloudLab(page);
+  await page.getByTestId("cloud-auth-mode-gemini_google_oauth").click();
+  await page.getByTestId("cloud-auth-login").click();
+  await expect(page.getByText(/已登录 · gemini@example\.com/)).toBeVisible();
+  await page.getByTestId("cloud-model-refresh").click();
+  await page.getByTestId("cloud-model-test").click();
+
+  const requests = await page.evaluate(() => (window as any).__CLOUD_REQUESTS__ ?? []);
+  const probe = requests.find((request: any) => request.method === "POST" && request.url.includes("v1internal:generateContent"));
+  expect(probe?.url).toBe("https://cloudcode-pa.googleapis.com/v1internal:generateContent");
+  expect(probe?.body?.model).toBe("gemini-3-pro-preview");
+  expect(probe?.body?.project).toBeUndefined();
+  expect(probe?.body?.request?.contents?.[0]?.parts?.[0]?.text).toContain("ok");
+});
+
+test("saved Gemini OAuth configs repair stale OpenAI endpoints at test time", async ({ page }) => {
+  await page.goto("/?e2eScenario=cloud-settings-model-select");
+  await page.evaluate(() => {
+    const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+    const server = snapshot?.cloudServers?.[0];
+    (window as any).__CODELY_E2E__?.setCloudServers?.([
+      {
+        ...server,
+        provider: "Gemini",
+        protocol: "gemini",
+        endpoint: "https://api.openai.com/v1",
+        model: "gemini-2.5-pro",
+        auth: {
+          mode: "gemini_google_oauth",
+          status: "connected",
+          tokenRef: server?.id ?? "demo-cloud",
+          email: "gemini@example.com",
+        },
+      },
+    ], server?.id);
+  });
+
+  await enableCloudLab(page);
+  await expect(page.getByTestId("cloud-model-input")).toHaveValue("gemini-2.5-pro");
+  await page.getByTestId("cloud-model-test").click();
+
+  const requests = await page.evaluate(() => (window as any).__CLOUD_REQUESTS__ ?? []);
+  const probe = requests.find((request: any) => request.method === "POST" && request.url.includes("v1internal:generateContent"));
+  expect(probe?.url).toBe("https://cloudcode-pa.googleapis.com/v1internal:generateContent");
+  expect(probe?.body?.model).toBe("gemini-2.5-pro");
 });
 
 test("cloud settings starts empty and saves a newly added server explicitly", async ({ page }) => {
@@ -175,7 +284,6 @@ test("cloud settings starts empty and saves a newly added server explicitly", as
   await expect(page.getByTestId("cloud-server-item")).toHaveCount(1);
   await expect(page.getByTestId("cloud-server-item")).toContainText("未保存服务器");
   await expect(page.getByTestId("cloud-server-name-input")).toHaveValue("");
-  await page.getByText("高级兼容性").click();
   await expect(page.getByTestId("cloud-server-endpoint-input")).toHaveValue("");
   await expect(page.getByTestId("cloud-server-save")).toBeDisabled();
 
@@ -230,7 +338,7 @@ test("cloud settings refreshes models only on request and saves the selected mod
       page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().selectedCloudModel ?? null),
     )
     .toBe("gpt-4.1");
-  await page.getByText("高级兼容性").click();
+  await page.getByText("详细设置").click();
   const reasoningEffortSelect = page.locator("select").filter({
     has: page.locator("option[value='xhigh']"),
   });
@@ -314,7 +422,7 @@ test("cloud model test falls back from Responses to Chat Completions and records
   await page.getByTestId("cloud-model-test").click();
 
   await expect(page.getByTestId("cloud-model-connected-status")).toContainText("已连通 gpt-4.1，已自动切换到 Chat Completions");
-  await page.getByText("高级兼容性").click();
+  await page.getByText("详细设置").click();
   const apiFormatSelect = page.locator("select").filter({
     has: page.locator("option[value='responses']"),
   });
@@ -332,7 +440,6 @@ test("cloud settings can add, switch, refresh, and delete server configs", async
   await page.getByTestId("cloud-server-add").click();
   await expect(page.getByTestId("cloud-server-item")).toHaveCount(2);
   await page.getByTestId("cloud-server-name-input").fill("Second Gateway");
-  await page.getByText("高级兼容性").click();
   await page.getByTestId("cloud-server-endpoint-input").fill("https://second-gateway.example/v1");
   await page.getByTestId("cloud-server-api-key-input").fill("second-key");
   await page.getByTestId("cloud-model-refresh").click();

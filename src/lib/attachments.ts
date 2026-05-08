@@ -22,7 +22,7 @@ export interface AttachmentPickerResult {
 }
 
 const TEXT_ATTACHMENT_EXTENSIONS = [
-  "txt", "md", "markdown",
+  "txt", "log", "md", "markdown",
   "js", "ts", "tsx", "jsx",
   "py", "cs", "java", "c", "cpp", "h", "hpp",
   "json", "yaml", "yml", "toml", "xml", "html", "css", "scss", "less",

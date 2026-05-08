@@ -9,6 +9,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { setWorkspaceRoot as setWorkspaceRootIpc } from "../lib/ipc";
 import { appendDebugLog } from "../lib/debugLog";
 import { formatWorkspaceTree } from "../lib/systemPrompt";
+import { normalizeContextMemoryState, type ContextMemoryState } from "../lib/contextMemory";
 import { setMcpToolServerMap, type MCPServer, type MCPTool } from "../lib/mcpClient";
 import { sanitizePlanArtifactContent } from "../lib/sanitize";
 import {
@@ -58,13 +59,14 @@ import {
 import { buildClosedActivePlanRuntimePatch } from "../lib/planLifecycle";
 import {
   buildAnthropicRequestBody,
-  buildGeminiGenerateContentUrl,
-  buildGeminiRequestBody,
+  buildGeminiRequestForAuthMode,
   buildOpenAiResponsesInputCandidates,
   buildOpenAiResponsesRequestExtras,
+  ensureOpenAiChatGptCodexRequestBody,
   extractOpenAiResponsesInstructions,
   extractGeminiResponseText,
   extractOpenAiResponseText,
+  parseOpenAiResponsesSseText,
   buildCloudHeaders,
   buildCloudMessagesApiUrl,
   extractAnthropicResponseText,
@@ -171,6 +173,8 @@ import {
 import {
   createDefaultMcpRoutingConfig,
   createDefaultToolPermissionPolicy,
+  isLocalFileReadApproved,
+  normalizeLocalFileReadPath,
   normalizeMcpRoutingConfig,
   normalizeToolPermissionPolicy,
   type McpRoutingConfig,
@@ -503,6 +507,7 @@ export interface SessionModelConfig {
 export interface SessionRuntimeSnapshot {
   taskFlow: TaskBlock[];
   agentMessages: AgentMessage[];
+  contextMemoryState?: ContextMemoryState | null;
   conversationTurns: ConversationTurn[];
   currentTurnId: string | null;
   selectedMainModeKey: MainModeKey;
@@ -541,6 +546,7 @@ export interface SessionRuntimeState extends SessionRuntimeSnapshot {
     | ((choice: "approve_once" | "approve_thread" | "cancel") => void)
     | null;
   currentTurnExecutionConsent: { turnId: string | null; granted: boolean };
+  approvedLocalFileReadPaths: string[];
   readOnlyAutoApproveForSession: boolean;
   planApprovalChoice: string | null;
   normalizedStreamState: NormalizedStreamState;
@@ -551,7 +557,7 @@ export interface SessionRuntimeState extends SessionRuntimeSnapshot {
   elapsedTime: number;
   pendingReviewResolve: ((decision: ReviewDecision) => void) | null;
   pendingReviewTaskId: number | null;
-  pendingToolCall: { name: string; arguments: Record<string, unknown> } | null;
+  pendingToolCall: { name: string; arguments: Record<string, unknown>; localFileReadPath?: string } | null;
   showFilePanel: boolean;
   fileViewerPath: string;
   fileViewerContent: string;
@@ -619,6 +625,7 @@ export interface AppConfig {
   cloud: CloudConfig;
   cloudServers: CloudServerConfig[];
   activeCloudServerId: string;
+  cloudExperimentalLoginEnabled: boolean;
   imAdapters: ImAdaptersConfig;
   workspace: string;
 }
@@ -721,6 +728,10 @@ export type TaskBlock =
         tokenCountAfter: number;
         tokenReduction: number;
         compressedContext?: string;
+        memoryPacket?: string;
+        microCompactionKind?: "none" | "tool_results" | "assistant_messages" | "mixed";
+        microCompactedCount?: number;
+        droppedMessageCount?: number;
         topTokenSource?: {
           label: string;
           tokens: number;
@@ -965,12 +976,14 @@ interface AppState {
   // ── Agent Orchestrator State ──────────────────────────────────────
   agentStatus: AgentStatus;
   agentMessages: AgentMessage[];
+  contextMemoryState: ContextMemoryState | null;
   pendingReviewResolve: ((decision: ReviewDecision) => void) | null;
   pendingReviewTaskId: number | null;
-  pendingToolCall: { name: string; arguments: Record<string, unknown> } | null;
+  pendingToolCall: { name: string; arguments: Record<string, unknown>; localFileReadPath?: string } | null;
   autoApproveTools: boolean;
-  readOnlyAutoApproveForSession: boolean;
   currentTurnExecutionConsent: { turnId: string | null; granted: boolean };
+  approvedLocalFileReadPaths: string[];
+  readOnlyAutoApproveForSession: boolean;
   pendingRunDecisionResolver:
     | ((choice: "approve_once" | "approve_thread" | "cancel") => void)
     | null;
@@ -1052,7 +1065,7 @@ const defaultConfig: AppConfig = {
   language: "zh",
   theme: "purple",
   themeMode: "dark",
-  appIconVariant: "light",
+  appIconVariant: "dark",
   workflowMode: "chat",
   promptLanguageStrategy: "english_core_localized_output",
   toolPermissionPolicy: createDefaultToolPermissionPolicy(),
@@ -1067,6 +1080,7 @@ const defaultConfig: AppConfig = {
   cloud: defaultCloudState.cloud,
   cloudServers: defaultCloudState.cloudServers,
   activeCloudServerId: defaultCloudState.activeCloudServerId,
+  cloudExperimentalLoginEnabled: false,
   imAdapters: createDefaultImAdaptersConfig(),
   workspace: "",
 };
@@ -1078,7 +1092,7 @@ const DEFAULT_MCP_SERVERS: MCPServer[] = [
 ];
 
 function normalizeAppIconVariant(value: unknown): AppConfig["appIconVariant"] {
-  return value === "dark" ? "dark" : "light";
+  return value === "light" ? "light" : "dark";
 }
 
 function normalizeMcpServers(servers: unknown): MCPServer[] {
@@ -1278,6 +1292,7 @@ function normalizeSessionRuntimeSnapshot(
   return {
     taskFlow,
     agentMessages: sanitizeAgentMessagesForPersist(snapshot.agentMessages || []),
+    contextMemoryState: normalizeContextMemoryState(snapshot.contextMemoryState),
     conversationTurns: normalizeInterruptedConversationTurnsForRestore(snapshot.conversationTurns, taskFlow),
     currentTurnId: snapshot.currentTurnId ?? null,
     selectedMainModeKey,
@@ -1309,6 +1324,7 @@ function normalizeSessionRuntimeSnapshot(
 const sessionRuntimeKeys = [
   "taskFlow",
   "agentMessages",
+  "contextMemoryState",
   "conversationTurns",
   "currentTurnId",
   "selectedMainModeKey",
@@ -1339,6 +1355,7 @@ const sessionRuntimeKeys = [
   "pendingRunDecision",
   "pendingRunDecisionResolver",
   "currentTurnExecutionConsent",
+  "approvedLocalFileReadPaths",
   "readOnlyAutoApproveForSession",
   "normalizedStreamState",
   "currentTurnState",
@@ -1383,6 +1400,7 @@ function createSessionRuntimeFromState(state: Partial<AppState>): SessionRuntime
   return {
     taskFlow: Array.isArray(state.taskFlow) ? state.taskFlow : [],
     agentMessages: Array.isArray(state.agentMessages) ? state.agentMessages : [],
+    contextMemoryState: normalizeContextMemoryState(state.contextMemoryState),
     conversationTurns: Array.isArray(state.conversationTurns) ? state.conversationTurns : [],
     currentTurnId: state.currentTurnId ?? null,
     selectedMainModeKey,
@@ -1415,6 +1433,9 @@ function createSessionRuntimeFromState(state: Partial<AppState>): SessionRuntime
     pendingRunDecision: state.pendingRunDecision ?? null,
     pendingRunDecisionResolver: state.pendingRunDecisionResolver ?? null,
     currentTurnExecutionConsent: state.currentTurnExecutionConsent || { turnId: null, granted: false },
+    approvedLocalFileReadPaths: Array.isArray(state.approvedLocalFileReadPaths)
+      ? state.approvedLocalFileReadPaths.filter((path): path is string => typeof path === "string" && path.trim().length > 0)
+      : [],
     readOnlyAutoApproveForSession: state.readOnlyAutoApproveForSession === true,
     normalizedStreamState: state.normalizedStreamState || defaultNormalizedStreamState,
     currentTurnState: state.currentTurnState || createDefaultCurrentTurnState(),
@@ -2385,6 +2406,18 @@ export function sanitizeTaskBlocksForPersist(blocks: TaskBlock[]): TaskBlock[] {
                     tokenCountAfter: Number(b.contextCompression.tokenCountAfter) || 0,
                     tokenReduction: Number(b.contextCompression.tokenReduction) || 0,
                     ...(compressedContext ? { compressedContext } : {}),
+                    ...(b.contextCompression.memoryPacket
+                      ? { memoryPacket: trimPersistedContextCompression(b.contextCompression.memoryPacket) }
+                      : {}),
+                    ...(b.contextCompression.microCompactionKind
+                      ? { microCompactionKind: b.contextCompression.microCompactionKind }
+                      : {}),
+                    ...(typeof b.contextCompression.microCompactedCount === "number"
+                      ? { microCompactedCount: Number(b.contextCompression.microCompactedCount) || 0 }
+                      : {}),
+                    ...(typeof b.contextCompression.droppedMessageCount === "number"
+                      ? { droppedMessageCount: Number(b.contextCompression.droppedMessageCount) || 0 }
+                      : {}),
                     ...(b.contextCompression.topTokenSource
                       ? {
                           topTokenSource: {
@@ -3719,6 +3752,7 @@ export const useAppStore = create<AppState>()(
         currentWorkspace: "",
         config: { ...s.config, workspace: "" },
         sessionHookCache: [],
+        approvedLocalFileReadPaths: [],
         readOnlyAutoApproveForSession: false,
         showWorkspaceTreePanel: false,
       }));
@@ -3751,6 +3785,7 @@ export const useAppStore = create<AppState>()(
         activeSessionByWorkspace,
         config: { ...s.config, workspace: normalizedPath },
         sessionHookCache: [],
+        approvedLocalFileReadPaths: [],
         readOnlyAutoApproveForSession: false,
       };
     });
@@ -3835,7 +3870,7 @@ export const useAppStore = create<AppState>()(
           : s.activeSessionByWorkspace,
         currentSessionId: isCurrentSession ? nextSessionId : s.currentSessionId,
         runtimeBySessionKey,
-        ...(isCurrentSession ? { readOnlyAutoApproveForSession: false } : {}),
+        ...(isCurrentSession ? { approvedLocalFileReadPaths: [], readOnlyAutoApproveForSession: false } : {}),
       };
     });
   },
@@ -3877,6 +3912,7 @@ export const useAppStore = create<AppState>()(
         [resolveSessionWorkspaceKey(s.currentWorkspace)]: id,
       },
       ...(s.currentSessionId !== id ? { readOnlyAutoApproveForSession: false } : {}),
+      ...(s.currentSessionId !== id ? { approvedLocalFileReadPaths: [] } : {}),
     })),
 
   // Task Flow — now starts empty (no more mock data)
@@ -4048,6 +4084,7 @@ export const useAppStore = create<AppState>()(
       return {
         taskFlow: [],
         agentMessages: [],
+        contextMemoryState: null,
         messages: [],
         selectedDiffTaskId: null,
         selectedMainModeKey: "main_mode",
@@ -4058,6 +4095,7 @@ export const useAppStore = create<AppState>()(
         pendingRunDecisionResolver: null,
         executionConsentPolicy: "ask_per_turn",
         currentTurnExecutionConsent: { turnId: null, granted: false },
+        approvedLocalFileReadPaths: [],
         readOnlyAutoApproveForSession: false,
         planArtifacts: [],
         planTasks: [],
@@ -4099,6 +4137,7 @@ export const useAppStore = create<AppState>()(
       selectedNexusModeKey: "nexus_general",
       taskFlow: [],
       agentMessages: [],
+      contextMemoryState: null,
       messages: [],
       feishuAdapterStatus: createDefaultFeishuAdapterRuntimeStatus(),
       feishuPairingRequests: [],
@@ -4110,6 +4149,7 @@ export const useAppStore = create<AppState>()(
       pendingRunDecisionResolver: null,
       executionConsentPolicy: "ask_per_turn",
       currentTurnExecutionConsent: { turnId: null, granted: false },
+      approvedLocalFileReadPaths: [],
       readOnlyAutoApproveForSession: false,
       resolvedInstructionSet: null,
       instructionSources: [],
@@ -4398,10 +4438,12 @@ export const useAppStore = create<AppState>()(
 
   agentStatus: "idle",
   agentMessages: [],
+  contextMemoryState: null,
   pendingReviewResolve: null,
   pendingReviewTaskId: null,
   pendingToolCall: null,
   autoApproveTools: false,
+  approvedLocalFileReadPaths: [],
   readOnlyAutoApproveForSession: false,
   currentTurnExecutionConsent: { turnId: null, granted: false },
   pendingRunDecisionResolver: null,
@@ -4426,7 +4468,10 @@ export const useAppStore = create<AppState>()(
   },
   approvePendingReviewForSession: () => {
     const state = get();
-    set({ autoApproveTools: true });
+    const pendingLocalFileReadPath = normalizeLocalFileReadPath(state.pendingToolCall?.localFileReadPath);
+    if (!pendingLocalFileReadPath) {
+      set({ autoApproveTools: true });
+    }
     if (state.pendingReviewTaskId != null) {
       get().allowToolAction(state.pendingReviewTaskId);
     }
@@ -4441,8 +4486,12 @@ export const useAppStore = create<AppState>()(
     if (!state.pendingReviewResolve || state.pendingReviewTaskId !== taskId) return;
 
     const resolve = state.pendingReviewResolve;
+    const localFileReadPath = normalizeLocalFileReadPath(state.pendingToolCall?.localFileReadPath);
 
     set((s) => ({
+      approvedLocalFileReadPaths: localFileReadPath && !isLocalFileReadApproved(localFileReadPath, s.approvedLocalFileReadPaths)
+        ? [...s.approvedLocalFileReadPaths, localFileReadPath]
+        : s.approvedLocalFileReadPaths,
       pendingReviewResolve: null,
       pendingReviewTaskId: null,
       pendingToolCall: null,
@@ -4465,7 +4514,9 @@ export const useAppStore = create<AppState>()(
       get().setConversationTurnStatus(state.currentTurnId, "executing");
     }
     runAfterNextPaint(() => {
-      resolve({ action: "accept" });
+      resolve(localFileReadPath
+        ? { action: "accept", grantLocalFileReadPath: localFileReadPath }
+        : { action: "accept" });
     });
   },
 
@@ -4503,6 +4554,7 @@ export const useAppStore = create<AppState>()(
       taskFlow: [],
       messages: [],
       agentMessages: [],
+      contextMemoryState: null,
       selectedDiffTaskId: null,
       input: "",
       contextMentions: [],
@@ -4528,6 +4580,7 @@ export const useAppStore = create<AppState>()(
       pendingToolCall: null,
       pendingFeishuApprovals: [],
       autoApproveTools: false,
+      approvedLocalFileReadPaths: [],
       readOnlyAutoApproveForSession: false,
       currentTurnExecutionConsent: { turnId: null, granted: false },
       planArtifacts: [],
@@ -5199,6 +5252,7 @@ export const useAppStore = create<AppState>()(
           ],
         },
         currentSessionId: autoSessionId,
+        approvedLocalFileReadPaths: [],
         readOnlyAutoApproveForSession: false,
       }));
 
@@ -5498,6 +5552,7 @@ export const useAppStore = create<AppState>()(
           runtimeSnapshot: normalizeSessionRuntimeSnapshot({
             taskFlow: sessionGet().taskFlow,
             agentMessages: sessionGet().agentMessages,
+            contextMemoryState: sessionGet().contextMemoryState,
             conversationTurns: sessionGet().conversationTurns,
             currentTurnId: sessionGet().currentTurnId,
             selectedMainModeKey: sessionGet().selectedMainModeKey,
@@ -6533,12 +6588,14 @@ export const useAppStore = create<AppState>()(
         getIsPlanApproved: () => sessionGet().isPlanApproved,
         getPlanApprovalChoice: () => sessionGet().planApprovalChoice,
         getReadOnlyAutoApproveForSession: () => sessionGet().readOnlyAutoApproveForSession,
+        getApprovedLocalFileReadPaths: () => sessionGet().approvedLocalFileReadPaths || [],
         getPlanStage: () => sessionGet().planStage,
         getPlanTasks: () => sessionGet().planTasks,
         getPlanExecutionEvidenceLedger: () => sessionGet().planExecutionEvidenceLedger,
         getPlanAutoResumeCount: () => sessionGet().planAutoResumeCount,
         getStatus: () => sessionGet().agentStatus,
         startNewTurn: () => sessionGet().startNewTurn(),
+        getContextMemoryState: () => sessionGet().contextMemoryState,
 
         onStreamToken: (token, _msgId) => {
           // Handle escalation reset signal
@@ -7557,10 +7614,26 @@ export const useAppStore = create<AppState>()(
           sessionSet({ agentMessages: msgs });
         },
 
+        onContextMemoryBuilt: (state, packet) => {
+          logStoreEvent("context_memory_built", {
+            turnId,
+            sessionKey: runSessionKey,
+            workspace: runWorkspace || null,
+            memoryId: state.id,
+            packetChars: packet.length,
+            goals: state.goals.length,
+            evidence: state.evidence.length,
+            files: state.files.length,
+          });
+          sessionSet({ contextMemoryState: state });
+        },
+
         onContextCompress: (stats, reason) => {
           const saved = Math.max(0, Math.round(stats.tokenReduction));
           const before = Math.max(0, Math.round(stats.tokenCountBefore));
           const after = Math.max(0, Math.round(stats.tokenCountAfter));
+          const droppedMessageCount = Math.max(0, Math.round(stats.droppedMessageCount ?? stats.droppedCount));
+          const microCompactedCount = Math.max(0, Math.round(stats.microCompactedCount || 0));
           const topTokenSource = stats.tokenBreakdown
             ? {
                 label: String(stats.tokenBreakdown.topSourceLabel || ""),
@@ -7570,7 +7643,9 @@ export const useAppStore = create<AppState>()(
             : undefined;
           const label = reason === "reactive"
             ? `上下文溢出，已压缩背景，约 ${before.toLocaleString()} → ${after.toLocaleString()} tokens（释放 ${saved.toLocaleString()}）`
-            : `上下文已压缩背景，约 ${before.toLocaleString()} → ${after.toLocaleString()} tokens（释放 ${saved.toLocaleString()}，适配 KV Cache）`;
+            : droppedMessageCount === 0 && microCompactedCount > 0
+              ? `长工具输出已截断，约 ${before.toLocaleString()} → ${after.toLocaleString()} tokens（释放 ${saved.toLocaleString()}，保留任务记忆）`
+              : `历史上下文已压缩，约 ${before.toLocaleString()} → ${after.toLocaleString()} tokens（释放 ${saved.toLocaleString()}，保留任务记忆）`;
           logStoreEvent("context_compressed", {
             turnId,
             reason,
@@ -7578,6 +7653,9 @@ export const useAppStore = create<AppState>()(
             after,
             saved,
             droppedCount: Math.max(0, Math.round(stats.droppedCount)),
+            droppedMessageCount,
+            microCompactionKind: stats.microCompactionKind || "none",
+            microCompactedCount,
             topTokenSource: topTokenSource?.label || null,
             topTokenSourceTokens: topTokenSource?.tokens ?? null,
           });
@@ -7590,10 +7668,14 @@ export const useAppStore = create<AppState>()(
             contextCompression: {
               reason,
               droppedCount: Math.max(0, Math.round(stats.droppedCount)),
+              droppedMessageCount,
               tokenCountBefore: before,
               tokenCountAfter: after,
               tokenReduction: saved,
               compressedContext: trimPersistedContextCompression(stats.compressedContext),
+              memoryPacket: trimPersistedContextCompression(stats.memoryPacket),
+              microCompactionKind: stats.microCompactionKind || "none",
+              microCompactedCount,
               ...(topTokenSource ? { topTokenSource } : {}),
             },
           };
@@ -7610,11 +7692,15 @@ export const useAppStore = create<AppState>()(
          * a pending card, resolving immediately as "accept".
          */
         requestReview: (toolCall) => {
+          const toolTarget = getToolTarget(toolCall.name, toolCall.arguments);
+          const isLocalFileReadApproval =
+            toolCall.risk === "local_file_read" && !!toolCall.localFileReadPath;
           // ── Auto-approve path ──
-          if (sessionGet().autoApproveTools) {
+          // External local file reads always require first-use approval, even
+          // when the session-wide command auto-approval toggle is enabled.
+          if (sessionGet().autoApproveTools && !isLocalFileReadApproval) {
             return Promise.resolve({ action: "accept" });
           }
-          const toolTarget = getToolTarget(toolCall.name, toolCall.arguments);
           const isEphemeralPlanArtifactTool =
             (toolCall.name === "write_file" || toolCall.name === "replace_in_file") &&
             isEphemeralPlanArtifactPath(toolTarget);
@@ -7667,7 +7753,7 @@ export const useAppStore = create<AppState>()(
                 return decision;
               }
 
-              if (sessionGet().autoApproveTools) {
+              if (sessionGet().autoApproveTools && !isLocalFileReadApproval) {
                 return { action: "accept" } as ReviewDecision;
               }
 
@@ -7677,10 +7763,12 @@ export const useAppStore = create<AppState>()(
                 const toolArgs = toolCall.arguments;
                 const target = getToolTarget(toolName, toolArgs);
                 void (async () => {
-                  const diff = await buildToolDiffPreview(toolName, toolArgs, {
-                    workspace: runWorkspace,
-                    sessionKey: runSessionKey,
-                  });
+                  const diff = isLocalFileReadApproval
+                    ? undefined
+                    : await buildToolDiffPreview(toolName, toolArgs, {
+                        workspace: runWorkspace,
+                        sessionKey: runSessionKey,
+                      });
                   const block: TaskBlock = {
                     id: reviewTaskId,
                     turnId,
@@ -7705,7 +7793,11 @@ export const useAppStore = create<AppState>()(
                     rightPanelTab: diff ? "diff" : s.rightPanelTab,
                     pendingReviewResolve: resolve,
                     pendingReviewTaskId: reviewTaskId,
-                    pendingToolCall: { name: toolName, arguments: toolArgs },
+                    pendingToolCall: {
+                      name: toolName,
+                      arguments: toolArgs,
+                      ...(isLocalFileReadApproval ? { localFileReadPath: toolCall.localFileReadPath } : {}),
+                    },
                   }));
                 })();
               });
@@ -7719,10 +7811,12 @@ export const useAppStore = create<AppState>()(
             const toolArgs = toolCall.arguments;
             const target = getToolTarget(toolName, toolArgs);
             void (async () => {
-              const diff = await buildToolDiffPreview(toolName, toolArgs, {
-                workspace: runWorkspace,
-                sessionKey: runSessionKey,
-              });
+              const diff = isLocalFileReadApproval
+                ? undefined
+                : await buildToolDiffPreview(toolName, toolArgs, {
+                    workspace: runWorkspace,
+                    sessionKey: runSessionKey,
+                  });
               const block: TaskBlock = {
                 id: reviewTaskId,
                 turnId,
@@ -7747,7 +7841,11 @@ export const useAppStore = create<AppState>()(
                 rightPanelTab: diff ? "diff" : s.rightPanelTab,
                 pendingReviewResolve: resolve,
                 pendingReviewTaskId: reviewTaskId,
-                pendingToolCall: { name: toolName, arguments: toolArgs },
+                pendingToolCall: {
+                  name: toolName,
+                  arguments: toolArgs,
+                  ...(isLocalFileReadApproval ? { localFileReadPath: toolCall.localFileReadPath } : {}),
+                },
               }));
               if (remoteFeishu) {
                 const code = createFeishuApprovalCode();
@@ -7830,6 +7928,7 @@ export const useAppStore = create<AppState>()(
             runtimeSnapshot: normalizeSessionRuntimeSnapshot({
               taskFlow: messages,
               agentMessages: sanitizeAgentMessagesForPersist(s.agentMessages),
+              contextMemoryState: s.contextMemoryState,
               conversationTurns: s.conversationTurns,
               currentTurnId: s.currentTurnId,
               selectedMainModeKey: s.selectedMainModeKey,
@@ -7917,6 +8016,7 @@ export const useAppStore = create<AppState>()(
         gameStudioInitialized: state.gameStudioInitialized,
         taskFlow: sanitizeTaskBlocksForPersist(state.taskFlow),
         agentMessages: sanitizeAgentMessagesForPersist(state.agentMessages),
+        contextMemoryState: state.contextMemoryState,
         conversationTurns: state.conversationTurns,
         currentTurnId: state.currentTurnId,
         pendingSlashCommand: state.pendingSlashCommand,
@@ -8031,6 +8131,7 @@ export const useAppStore = create<AppState>()(
           cloud: cloudState.cloud,
           cloudServers: cloudState.cloudServers,
           activeCloudServerId: cloudState.activeCloudServerId,
+          cloudExperimentalLoginEnabled: persistedState.config?.cloudExperimentalLoginEnabled === true,
           promptLanguageStrategy:
             persistedState.config?.promptLanguageStrategy === "english_core_localized_output"
               ? persistedState.config.promptLanguageStrategy
@@ -8105,6 +8206,7 @@ export const useAppStore = create<AppState>()(
         pendingRunDecisionResolver: null,
         executionConsentPolicy: "ask_per_turn",
         currentTurnExecutionConsent: { turnId: null, granted: false },
+        approvedLocalFileReadPaths: [],
         messages: [],
         elapsedTime: 0,
       };
@@ -8127,8 +8229,12 @@ async function requestSemanticTurnMetadata(params: {
     const provider = isCloud ? params.config.cloud.provider : params.config.local.provider;
     const cloudProtocol = normalizeCloudProtocol(isCloud ? params.config.cloud.protocol : "openai");
     const cloudApiFormat = normalizeCloudApiFormat(isCloud ? params.config.cloud.apiFormat : "chat_completions");
-    const cloudAuthMode = isCloud ? params.config.cloud.auth?.mode ?? "api_key" : "api_key";
-    if (!model || !endpoint) return null;
+    const cloudExperimentalLoginEnabled = isCloud && params.config.cloudExperimentalLoginEnabled === true;
+    const cloudAuthMode = isCloud && cloudExperimentalLoginEnabled
+      ? params.config.cloud.auth?.mode ?? "api_key"
+      : "api_key";
+    const cloudTokenRef = cloudExperimentalLoginEnabled ? params.config.cloud.auth?.tokenRef : undefined;
+    if (!model || (!endpoint && cloudAuthMode !== "gemini_google_oauth")) return null;
 
     const msgs: Array<{ role: "system" | "user"; content: string }> = [
       {
@@ -8177,17 +8283,18 @@ async function requestSemanticTurnMetadata(params: {
       });
       headers = buildCloudHeaders("anthropic", ac.apiKey, true, params.config.cloud.customHeaders, cloudAuthMode);
     } else if (isGeminiCloud) {
-      url = buildGeminiGenerateContentUrl(endpoint, model, false);
-      body = buildGeminiRequestBody({
+      const request = buildGeminiRequestForAuthMode(endpoint, {
         messages: msgs,
         model,
         maxTokens: 120,
-      });
+      }, cloudAuthMode);
+      url = request.url;
+      body = request.body;
       headers = buildCloudHeaders("gemini", ac.apiKey, true, params.config.cloud.customHeaders, cloudAuthMode);
     } else {
       url = buildCloudMessagesApiUrl(endpoint, "openai", cloudApiFormat);
       body = cloudApiFormat === "responses"
-        ? {
+        ? ensureOpenAiChatGptCodexRequestBody({
             model,
             ...(extractOpenAiResponsesInstructions(msgs as Array<{ role: "system" | "user"; content: string }>) ? {
               instructions: extractOpenAiResponsesInstructions(msgs as Array<{ role: "system" | "user"; content: string }>),
@@ -8197,7 +8304,7 @@ async function requestSemanticTurnMetadata(params: {
               disableResponseStorage: params.config.cloud.disableResponseStorage,
               reasoningEffort: "none",
             }),
-          }
+          }, { userPromptId: "main-turn-metadata" })
         : { model, messages: msgs, stream: false, max_tokens: 120 };
       headers = buildCloudHeaders("openai", ac.apiKey, true, params.config.cloud.customHeaders, cloudAuthMode);
     }
@@ -8210,9 +8317,12 @@ async function requestSemanticTurnMetadata(params: {
         headers,
         body: JSON.stringify(body),
         authMode: cloudAuthMode,
-        tokenRef: params.config.cloud.auth?.tokenRef,
+        tokenRef: cloudTokenRef,
       });
-      j = JSON.parse(result);
+      const contentType = (result.match(/^__CONTENT_TYPE__:(.*)\n/) || [])[1]?.trim() || "";
+      j = contentType.includes("text/event-stream")
+        ? { output_text: parseOpenAiResponsesSseText(result.replace(/^__CONTENT_TYPE__:.*\n/, "")) }
+        : JSON.parse(result);
     } else {
       const r = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
       if (!r.ok) return null;

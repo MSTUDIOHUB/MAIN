@@ -612,6 +612,7 @@ const CHAT_ATTACHMENT_PREFIX: &str = ".MAIN-chat-attachments";
 
 const SUPPORTED_ATTACHMENT_EXTENSIONS: &[&str] = &[
     "txt",
+    "log",
     "md",
     "markdown",
     "js",
@@ -1344,7 +1345,7 @@ fn validate_glob_pattern(pattern: &str) -> Result<(), String> {
 
 // endregion
 
-fn parse_curl_status_output(output: String) -> Result<String, String> {
+fn parse_curl_status_output(output: String, url: &str) -> Result<String, String> {
     let marker = "\n__HTTP_STATUS__:";
     let Some(idx) = output.rfind(marker) else {
         return Err("curl 回退未返回状态标记".to_string());
@@ -1357,7 +1358,11 @@ fn parse_curl_status_output(output: String) -> Result<String, String> {
         .map_err(|_| format!("curl 回退返回了无法解析的状态码: {status_raw}"))?;
 
     if (200..300).contains(&status_code) {
-        Ok(body)
+        if url.contains("/backend-api/codex/responses") {
+            Ok(response_with_content_type(body, Some("text/event-stream")))
+        } else {
+            Ok(body)
+        }
     } else {
         Err(format!(
             "HTTP {}: {}",
@@ -1377,7 +1382,10 @@ fn should_use_curl_fallback(
         return false;
     }
 
-    if !(url.contains("/v1/responses") || url.contains("/v1/chat/completions")) {
+    if !(url.contains("/v1/responses")
+        || url.contains("/v1/chat/completions")
+        || url.contains("/backend-api/codex/responses"))
+    {
         return false;
     }
 
@@ -1395,7 +1403,9 @@ fn should_try_curl_transport_fallback(url: &str, method: &str, error_message: &s
 
     if !(url.contains("/v1/responses")
         || url.contains("/v1/chat/completions")
-        || url.contains("/v1/messages"))
+        || url.contains("/v1/messages")
+        || url.contains("/backend-api/codex/responses")
+        || url.contains("/v1internal:generateContent"))
     {
         return false;
     }
@@ -1432,7 +1442,9 @@ fn proxy_request_via_curl(
     let max_time_secs = if method.eq_ignore_ascii_case("POST")
         && (url.contains("/v1/responses")
             || url.contains("/v1/chat/completions")
-            || url.contains("/v1/messages"))
+            || url.contains("/v1/messages")
+            || url.contains("/backend-api/codex/responses")
+            || url.contains("/v1internal:generateContent"))
     {
         MODEL_REQUEST_TIMEOUT_SECS
     } else {
@@ -1440,6 +1452,16 @@ fn proxy_request_via_curl(
     };
     command.arg("--max-time").arg(max_time_secs.to_string());
     command.arg("-w").arg("\n__HTTP_STATUS__:%{http_code}");
+
+    let has_content_type = headers
+        .map(|hdrs| {
+            hdrs.keys()
+                .any(|key| key.eq_ignore_ascii_case("content-type"))
+        })
+        .unwrap_or(false);
+    if !has_content_type {
+        command.arg("-H").arg("Content-Type: application/json");
+    }
 
     let has_accept_encoding = headers
         .map(|hdrs| {
@@ -1476,13 +1498,41 @@ fn proxy_request_via_curl(
         });
     }
 
-    parse_curl_status_output(stdout).map_err(|err| {
+    parse_curl_status_output(stdout, url).map_err(|err| {
         if stderr.is_empty() {
             err
         } else {
             format!("{err} | curl stderr: {stderr}")
         }
     })
+}
+
+fn inject_gemini_code_assist_project(body: &str, project_id: &str) -> Result<String, String> {
+    let mut payload = serde_json::from_str::<Value>(body)
+        .map_err(|e| format!("解析 Gemini Code Assist 请求失败: {e}"))?;
+    let object = payload
+        .as_object_mut()
+        .ok_or_else(|| "Gemini Code Assist 请求体必须是 JSON object。".to_string())?;
+    object
+        .entry("project".to_string())
+        .or_insert_with(|| Value::String(project_id.to_string()));
+    serde_json::to_string(&payload).map_err(|e| format!("序列化 Gemini Code Assist 请求失败: {e}"))
+}
+
+fn has_header_case_insensitive(headers: &HashMap<String, String>, name: &str) -> bool {
+    headers.keys().any(|key| key.eq_ignore_ascii_case(name))
+}
+
+fn response_with_content_type(body: String, content_type: Option<&str>) -> String {
+    if let Some(content_type) = content_type.filter(|value| {
+        value
+            .to_ascii_lowercase()
+            .contains("text/event-stream")
+    }) {
+        format!("__CONTENT_TYPE__:{}\n{}", content_type.trim(), body)
+    } else {
+        body
+    }
 }
 
 // region: grep 辅助
@@ -4053,6 +4103,13 @@ fn get_system_memory() -> Result<serde_json::Value, String> {
 const CLOUD_AUTH_FILE_NAME: &str = "cloud-auth.json";
 const CLOUD_AUTH_REFRESH_SKEW_MS: u64 = 60_000;
 const OPENAI_CHATGPT_CODEX_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
+const GEMINI_CODE_ASSIST_ENDPOINT: &str = "https://cloudcode-pa.googleapis.com/v1internal:generateContent";
+const GEMINI_CODE_ASSIST_LOAD_ENDPOINT: &str = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
+const GEMINI_CODE_ASSIST_ONBOARD_ENDPOINT: &str = "https://cloudcode-pa.googleapis.com/v1internal:onboardUser";
+const GEMINI_CODE_ASSIST_OPERATIONS_ENDPOINT: &str = "https://cloudcode-pa.googleapis.com/v1internal";
+const GEMINI_CODE_ASSIST_CLIENT_IDE_TYPE: &str = "IDE_UNSPECIFIED";
+const GEMINI_CODE_ASSIST_CLIENT_PLATFORM: &str = "PLATFORM_UNSPECIFIED";
+const GEMINI_CODE_ASSIST_CLIENT_PLUGIN_TYPE: &str = "GEMINI";
 const OPENAI_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OPENAI_OAUTH_ISSUER: &str = "https://auth.openai.com";
 const OPENAI_OAUTH_PREFERRED_PORT: u16 = 1455;
@@ -4072,6 +4129,10 @@ struct CloudAuthPublicStatus {
     expires_at: Option<u64>,
     storage: Option<String>,
     message: Option<String>,
+    project_id: Option<String>,
+    tier: Option<String>,
+    onboarded: Option<bool>,
+    code_assist_message: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -4098,6 +4159,10 @@ struct StoredCloudToken {
     expires_at: u64,
     account_id: Option<String>,
     email: Option<String>,
+    project_id: Option<String>,
+    tier: Option<String>,
+    onboarded: Option<bool>,
+    code_assist_message: Option<String>,
     storage: String,
     message: Option<String>,
 }
@@ -4345,6 +4410,10 @@ fn cloud_auth_status_from_record(record: &StoredCloudToken) -> CloudAuthPublicSt
         expires_at: Some(record.expires_at),
         storage: Some(record.storage.clone()),
         message: record.message.clone(),
+        project_id: record.project_id.clone(),
+        tier: record.tier.clone(),
+        onboarded: record.onboarded,
+        code_assist_message: record.code_assist_message.clone(),
     }
 }
 
@@ -4358,6 +4427,10 @@ fn disconnected_cloud_auth_status(mode: &str, message: Option<String>) -> CloudA
         expires_at: None,
         storage: None,
         message,
+        project_id: None,
+        tier: None,
+        onboarded: None,
+        code_assist_message: None,
     }
 }
 
@@ -4374,6 +4447,10 @@ fn pending_cloud_auth_status(pending: &PendingCloudAuth) -> CloudAuthPublicStatu
         expires_at: Some(pending.started_at_ms + 5 * 60 * 1000),
         storage: None,
         message: Some("Browser authorization is still pending.".to_string()),
+        project_id: None,
+        tier: None,
+        onboarded: None,
+        code_assist_message: None,
     }
 }
 
@@ -4582,6 +4659,282 @@ async fn fetch_gemini_userinfo(access_token: &str) -> (Option<String>, Option<St
     )
 }
 
+fn extract_gemini_code_assist_project(payload: &Value) -> Option<String> {
+    payload
+        .pointer("/cloudaicompanionProject")
+        .and_then(Value::as_str)
+        .or_else(|| payload.pointer("/cloudaicompanionProject/id").and_then(Value::as_str))
+        .or_else(|| payload.pointer("/response/cloudaicompanionProject").and_then(Value::as_str))
+        .or_else(|| payload.pointer("/response/cloudaicompanionProject/id").and_then(Value::as_str))
+        .or_else(|| payload.pointer("/project").and_then(Value::as_str))
+        .or_else(|| payload.pointer("/response/project").and_then(Value::as_str))
+        .or_else(|| payload.pointer("/metadata/cloudaicompanionProject").and_then(Value::as_str))
+        .map(str::to_string)
+}
+
+fn extract_gemini_code_assist_tier(payload: &Value) -> Option<String> {
+    payload
+        .pointer("/paidTier/id")
+        .and_then(Value::as_str)
+        .or_else(|| payload.pointer("/response/paidTier/id").and_then(Value::as_str))
+        .or_else(|| payload.pointer("/currentTier/id").and_then(Value::as_str))
+        .or_else(|| payload.pointer("/tier/id").and_then(Value::as_str))
+        .or_else(|| payload.pointer("/response/currentTier/id").and_then(Value::as_str))
+        .or_else(|| payload.pointer("/response/tier/id").and_then(Value::as_str))
+        .map(str::to_string)
+}
+
+fn gemini_code_assist_metadata(project_id: Option<&str>) -> Value {
+    let mut metadata = json!({
+        "ideType": GEMINI_CODE_ASSIST_CLIENT_IDE_TYPE,
+        "platform": GEMINI_CODE_ASSIST_CLIENT_PLATFORM,
+        "pluginType": GEMINI_CODE_ASSIST_CLIENT_PLUGIN_TYPE,
+    });
+    if let Some(project_id) = project_id.filter(|value| !value.trim().is_empty()) {
+        if let Some(object) = metadata.as_object_mut() {
+            object.insert("duetProject".to_string(), Value::String(project_id.to_string()));
+        }
+    }
+    metadata
+}
+
+fn gemini_code_assist_load_body(project_id: Option<&str>) -> Value {
+    json!({
+        "cloudaicompanionProject": project_id,
+        "metadata": gemini_code_assist_metadata(project_id),
+    })
+}
+
+fn gemini_code_assist_onboard_body(tier_id: &str, project_id: Option<&str>) -> Value {
+    let is_free_tier = tier_id == "free-tier";
+    json!({
+        "tierId": tier_id,
+        "cloudaicompanionProject": if is_free_tier { None } else { project_id },
+        "metadata": gemini_code_assist_metadata(if is_free_tier { None } else { project_id }),
+    })
+}
+
+fn extract_gemini_code_assist_onboard_tier(payload: &Value) -> Option<String> {
+    payload
+        .pointer("/allowedTiers")
+        .and_then(Value::as_array)
+        .and_then(|tiers| {
+            tiers
+                .iter()
+                .find(|tier| tier.get("isDefault").and_then(Value::as_bool).unwrap_or(false))
+                .or_else(|| tiers.first())
+        })
+        .and_then(|tier| tier.get("id").and_then(Value::as_str))
+        .map(str::to_string)
+        .or_else(|| Some("legacy-tier".to_string()))
+}
+
+fn extract_gemini_code_assist_ineligible_message(payload: &Value) -> Option<String> {
+    let tiers = payload.pointer("/ineligibleTiers").and_then(Value::as_array)?;
+    let messages = tiers
+        .iter()
+        .filter_map(|tier| {
+            tier
+                .get("reasonMessage")
+                .and_then(Value::as_str)
+                .or_else(|| tier.get("validationErrorMessage").and_then(Value::as_str))
+        })
+        .filter(|value| !value.trim().is_empty())
+        .collect::<Vec<_>>();
+    if messages.is_empty() {
+        None
+    } else {
+        Some(messages.join(" "))
+    }
+}
+
+async fn poll_gemini_code_assist_operation(
+    client: &reqwest::Client,
+    access_token: &str,
+    operation_name: &str,
+) -> Result<Value, String> {
+    let trimmed_name = operation_name.trim().trim_start_matches('/');
+    if trimmed_name.is_empty() {
+        return Err("Gemini Code Assist operation name is empty.".to_string());
+    }
+    let endpoint = format!(
+        "{}/{}",
+        GEMINI_CODE_ASSIST_OPERATIONS_ENDPOINT,
+        trimmed_name
+    );
+    let mut last_payload = json!({});
+    for _ in 0..6 {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let response = client
+            .get(&endpoint)
+            .bearer_auth(access_token)
+            .header("Content-Type", "application/json")
+            .send()
+            .await
+            .map_err(|e| format!("Gemini Code Assist operation 查询失败: {e}"))?;
+        let status = response.status();
+        let payload_text = response
+            .text()
+            .await
+            .map_err(|e| format!("读取 Gemini Code Assist operation 响应失败: {e}"))?;
+        let payload = serde_json::from_str::<Value>(&payload_text)
+            .unwrap_or_else(|_| json!({ "raw": payload_text }));
+        if !status.is_success() {
+            return Err(format!("Gemini Code Assist operation HTTP {status}: {}", payload));
+        }
+        if payload.get("done").and_then(Value::as_bool).unwrap_or(false) {
+            return Ok(payload);
+        }
+        last_payload = payload;
+    }
+    Ok(last_payload)
+}
+
+async fn post_gemini_code_assist_json(
+    client: &reqwest::Client,
+    endpoint: &str,
+    access_token: &str,
+    body: Value,
+) -> Result<Value, String> {
+    let body_text = serde_json::to_string(&body)
+        .map_err(|e| format!("序列化 Gemini Code Assist 请求失败: {e}"))?;
+    let response = client
+        .post(endpoint)
+        .bearer_auth(access_token)
+        .header("Content-Type", "application/json")
+        .body(body_text)
+        .send()
+        .await
+        .map_err(|e| format!("Gemini Code Assist 请求失败: {e}"))?;
+    let status = response.status();
+    let payload_text = response
+        .text()
+        .await
+        .map_err(|e| format!("读取 Gemini Code Assist 响应失败: {e}"))?;
+    let payload = serde_json::from_str::<Value>(&payload_text).unwrap_or_else(|_| json!({ "raw": payload_text }));
+    if !status.is_success() {
+        return Err(format!("Gemini Code Assist HTTP {status}: {}", payload));
+    }
+    Ok(payload)
+}
+
+async fn initialize_gemini_code_assist_record(
+    mut record: StoredCloudToken,
+) -> StoredCloudToken {
+    if record.mode != "gemini_google_oauth" || record.project_id.is_some() {
+        return record;
+    }
+    let project_override = std::env::var("GOOGLE_CLOUD_PROJECT")
+        .ok()
+        .or_else(|| std::env::var("GOOGLE_CLOUD_PROJECT_ID").ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let project_override_ref = project_override.as_deref();
+
+    let Ok(client) = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(HTTP_CONNECT_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(HTTP_SHORT_TIMEOUT_SECS))
+        .build()
+    else {
+        record.onboarded = Some(false);
+        record.code_assist_message = Some("Could not create Gemini Code Assist client.".to_string());
+        return record;
+    };
+
+    match post_gemini_code_assist_json(
+        &client,
+        GEMINI_CODE_ASSIST_LOAD_ENDPOINT,
+        &record.access_token,
+        gemini_code_assist_load_body(project_override_ref),
+    ).await {
+        Ok(payload) => {
+            record.project_id = extract_gemini_code_assist_project(&payload)
+                .or_else(|| project_override.clone());
+            record.tier = extract_gemini_code_assist_tier(&payload);
+            if record.project_id.is_some() {
+                record.onboarded = Some(true);
+                record.code_assist_message = Some("Gemini Code Assist project loaded.".to_string());
+                return record;
+            }
+            if record.code_assist_message.is_none() {
+                record.code_assist_message = extract_gemini_code_assist_ineligible_message(&payload);
+            }
+            let Some(tier_id) = extract_gemini_code_assist_onboard_tier(&payload) else {
+                record.onboarded = Some(false);
+                record.code_assist_message = Some(record.code_assist_message.unwrap_or_else(|| {
+                    "Gemini Code Assist requires GOOGLE_CLOUD_PROJECT for this account.".to_string()
+                }));
+                return record;
+            };
+
+            match post_gemini_code_assist_json(
+                &client,
+                GEMINI_CODE_ASSIST_ONBOARD_ENDPOINT,
+                &record.access_token,
+                gemini_code_assist_onboard_body(&tier_id, project_override_ref),
+            ).await {
+                Ok(mut payload) => {
+                    if !payload.get("done").and_then(Value::as_bool).unwrap_or(true) {
+                        if let Some(name) = payload.get("name").and_then(Value::as_str) {
+                            if let Ok(polled_payload) = poll_gemini_code_assist_operation(&client, &record.access_token, name).await {
+                                payload = polled_payload;
+                            }
+                        }
+                    }
+                    record.project_id = extract_gemini_code_assist_project(&payload)
+                        .or_else(|| project_override.clone());
+                    record.tier = Some(tier_id);
+                    record.onboarded = Some(record.project_id.is_some());
+                    record.code_assist_message = Some(if record.project_id.is_some() {
+                        "Gemini Code Assist onboarding completed.".to_string()
+                    } else {
+                        "Gemini Code Assist onboarding did not return a project.".to_string()
+                    });
+                }
+                Err(err) => {
+                    record.onboarded = Some(false);
+                    record.code_assist_message = Some(err);
+                }
+            }
+        }
+        Err(err) => {
+            record.onboarded = Some(false);
+            record.code_assist_message = Some(err);
+        }
+    }
+    record
+}
+
+fn classify_gemini_code_assist_error(status: reqwest::StatusCode, body: &str) -> String {
+    let body_excerpt = body.chars().take(500).collect::<String>();
+    if body.contains("SERVICE_DISABLED") || body.contains("Cloud Code Private API has not been used") {
+        return format!(
+            "Gemini Code Assist 请求使用的 Google Cloud Project 未启用 Cloud Code Private API。请在 Google Cloud Console 启用 cloudcode-pa.googleapis.com，或清除 GOOGLE_CLOUD_PROJECT / GOOGLE_CLOUD_PROJECT_ID 后重新登录让 Code Assist 使用可用项目；也可以改用 Gemini API Key。原始响应: {}",
+            body_excerpt
+        );
+    }
+    if body.contains("ACCESS_TOKEN_SCOPE_INSUFFICIENT") {
+        return format!(
+            "Gemini Code Assist 登录 token 缺少 cloud-platform 授权范围。请退出后重新登录 Gemini Google 账号；也可以改用 Gemini API Key。原始响应: {}",
+            body_excerpt
+        );
+    }
+    if body.contains("PERMISSION_DENIED") || status.as_u16() == 403 {
+        return format!(
+            "Gemini Code Assist 登录通道未获得可用项目或权限。请确认账号已完成 Gemini Code Assist onboarding，或设置可用的 GOOGLE_CLOUD_PROJECT；也可以改用 Gemini API Key。原始响应: {}",
+            body_excerpt
+        );
+    }
+    if status.is_server_error() {
+        return format!(
+            "Gemini Code Assist 后端返回 {}。这通常是账号/项目 provisioning 或预览模型波动；请尝试 gemini-2.5-pro/flash，或改用 Gemini API Key。原始响应: {}",
+            status,
+            body_excerpt
+        );
+    }
+    format!("HTTP {}: {}", status, body_excerpt)
+}
+
 async fn exchange_cloud_oauth_code(
     pending: &PendingCloudAuth,
     code: &str,
@@ -4702,6 +5055,10 @@ async fn exchange_cloud_oauth_code(
         expires_at,
         account_id,
         email,
+        project_id: None,
+        tier: None,
+        onboarded: None,
+        code_assist_message: None,
         storage: "file".to_string(),
         message: None,
     })
@@ -4927,6 +5284,10 @@ async fn cloud_auth_finish(
             expires_at: None,
             storage: None,
             message: Some(error),
+            project_id: None,
+            tier: None,
+            onboarded: None,
+            code_assist_message: None,
         });
     }
 
@@ -4939,6 +5300,7 @@ async fn cloud_auth_finish(
         pending_for_exchange.server_id = server_id;
     }
     let record = exchange_cloud_oauth_code(&pending_for_exchange, &code).await?;
+    let record = initialize_gemini_code_assist_record(record).await;
     let record = store_cloud_auth_record(&app, &record)?;
 
     {
@@ -4984,15 +5346,16 @@ async fn prepare_cloud_auth_request(
     headers: Option<HashMap<String, String>>,
     auth_mode: Option<String>,
     token_ref: Option<String>,
-) -> Result<(String, HashMap<String, String>), String> {
+) -> Result<(String, HashMap<String, String>, Option<String>), String> {
     let mode = auth_mode
         .as_deref()
         .map(normalize_cloud_auth_mode)
         .unwrap_or("api_key");
     let mut next_url = url;
     let mut next_headers = headers.unwrap_or_default();
+    let mut next_body: Option<String> = None;
     if mode == "api_key" {
-        return Ok((next_url, next_headers));
+        return Ok((next_url, next_headers, next_body));
     }
 
     let token_ref = token_ref
@@ -5023,18 +5386,58 @@ async fn prepare_cloud_auth_request(
         {
             next_url = OPENAI_CHATGPT_CODEX_ENDPOINT.to_string();
         }
+        next_headers.insert("originator".to_string(), "main".to_string());
+        next_headers.insert("session_id".to_string(), token_ref.clone());
+        next_headers.insert("version".to_string(), env!("CARGO_PKG_VERSION").to_string());
+        next_headers.insert("OpenAI-Beta".to_string(), "responses=v1".to_string());
+        next_headers.insert("Accept".to_string(), "text/event-stream".to_string());
+        next_headers.insert(
+            "User-Agent".to_string(),
+            format!(
+                "MAIN/{} ({} {}; {})",
+                env!("CARGO_PKG_VERSION"),
+                std::env::consts::OS,
+                std::env::consts::ARCH,
+                token_ref
+            ),
+        );
     } else if mode == "gemini_google_oauth" {
+        let mut token = token;
+        if token.project_id.is_none()
+            && std::env::var("GOOGLE_CLOUD_PROJECT").ok().is_none()
+            && std::env::var("GOOGLE_CLOUD_PROJECT_ID").ok().is_none()
+        {
+            token = initialize_gemini_code_assist_record(token).await;
+            let mut store = load_cloud_auth_store(app)?;
+            if let Some(stored) = store.records.get_mut(&token_ref) {
+                stored.project_id = token.project_id.clone();
+                stored.tier = token.tier.clone();
+                stored.onboarded = token.onboarded;
+                stored.code_assist_message = token.code_assist_message.clone();
+                save_cloud_auth_store(app, &store)?;
+            }
+        }
         next_headers.retain(|key, _| {
             let key = key.to_ascii_lowercase();
-            key != "authorization" && key != "x-goog-api-key"
+            key != "authorization" && key != "x-goog-api-key" && key != "x-goog-user-project"
         });
         next_headers.insert(
             "Authorization".to_string(),
             format!("Bearer {}", token.access_token),
         );
+        next_url = GEMINI_CODE_ASSIST_ENDPOINT.to_string();
+        let project_id = std::env::var("GOOGLE_CLOUD_PROJECT")
+            .ok()
+            .or_else(|| std::env::var("GOOGLE_CLOUD_PROJECT_ID").ok())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .or_else(|| token.project_id.clone());
+        if let Some(project_id) = project_id {
+            next_body = Some(project_id);
+        }
     }
 
-    Ok((next_url, next_headers))
+    Ok((next_url, next_headers, next_body))
 }
 
 // endregion
@@ -5068,16 +5471,25 @@ async fn proxy_request(
     auth_mode: Option<String>,
     token_ref: Option<String>,
 ) -> Result<String, String> {
-    let (url, headers) =
+    let (url, headers, body_project_id) =
         prepare_cloud_auth_request(&app, url, headers, auth_mode, token_ref).await?;
     PROXY_REQUEST_CANCEL.store(false, std::sync::atomic::Ordering::Relaxed);
     let meth = method.to_uppercase();
+    let body = if let Some(project_id) = body_project_id {
+        body.map(|body_str| inject_gemini_code_assist_project(&body_str, &project_id))
+            .transpose()?
+    } else {
+        body
+    };
     let body_for_debug = body.clone();
+    let body_for_request = body_for_debug.clone();
     let request_started_at = std::time::Instant::now();
 
     let is_model_request = url.contains("/v1/chat/completions")
         || url.contains("/v1/responses")
-        || url.contains("/v1/messages");
+        || url.contains("/v1/messages")
+        || url.contains("/backend-api/codex/responses")
+        || url.contains("/v1internal:generateContent");
     let request_timeout_secs = if meth == "POST" && is_model_request {
         MODEL_REQUEST_TIMEOUT_SECS
     } else {
@@ -5101,7 +5513,9 @@ async fn proxy_request(
         _ => return Err(format!("Unsupported HTTP method: {meth}")),
     };
 
-    req = req.header("Content-Type", "application/json");
+    if !has_header_case_insensitive(&headers, "Content-Type") {
+        req = req.header("Content-Type", "application/json");
+    }
     if is_model_request {
         req = req.header("Accept-Encoding", "identity");
     }
@@ -5110,10 +5524,7 @@ async fn proxy_request(
         req = req.header(key.as_str(), value.as_str());
     }
 
-    if url.contains("/v1/chat/completions")
-        || url.contains("/v1/responses")
-        || url.contains("/v1/messages")
-    {
+    if is_model_request {
         let mut debug_parts = vec![format!("method={meth}"), format!("url={url}")];
 
         if let Some(body_str) = &body_for_debug {
@@ -5170,7 +5581,7 @@ async fn proxy_request(
         record_debug_log(&app, "info", "proxy_request", debug_parts.join(" "));
     }
 
-    let req = if let Some(body_str) = body {
+    let req = if let Some(body_str) = body_for_request {
         req.body(body_str)
     } else {
         req
@@ -5261,8 +5672,22 @@ async fn proxy_request(
     };
 
     let status = response.status();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
     if !status.is_success() {
         let error_body = response.text().await.unwrap_or_default();
+        let error_message = if url.contains("/v1internal:generateContent") {
+            classify_gemini_code_assist_error(status, &error_body)
+        } else {
+            format!(
+                "HTTP {}: {}",
+                status,
+                error_body.chars().take(500).collect::<String>()
+            )
+        };
         let should_retry_via_curl = should_use_curl_fallback(&url, &meth, status, &error_body);
         if is_model_request {
             let error_excerpt = error_body.chars().take(240).collect::<String>();
@@ -5336,11 +5761,7 @@ async fn proxy_request(
             }
         }
 
-        return Err(format!(
-            "HTTP {}: {}",
-            status,
-            error_body.chars().take(500).collect::<String>()
-        ));
+        return Err(error_message);
     }
 
     if PROXY_REQUEST_CANCEL.load(std::sync::atomic::Ordering::Relaxed) {
@@ -5416,10 +5837,7 @@ async fn proxy_request(
             return Err(format!("读取响应失败: {msg}"));
         }
     };
-    if url.contains("/v1/chat/completions")
-        || url.contains("/v1/responses")
-        || url.contains("/v1/messages")
-    {
+    if is_model_request {
         record_debug_log(
             &app,
             "info",
@@ -5432,7 +5850,7 @@ async fn proxy_request(
             ),
         );
     }
-    Ok(text)
+    Ok(response_with_content_type(text, content_type.as_deref()))
 }
 
 #[tauri::command]
@@ -5506,15 +5924,22 @@ async fn start_chat_stream(
     auth_mode: Option<String>,
     token_ref: Option<String>,
 ) -> Result<(), String> {
-    let (url, headers) =
+    let (url, headers, body_project_id) =
         prepare_cloud_auth_request(&app, url, Some(headers), auth_mode, token_ref).await?;
+    let body = if let Some(project_id) = body_project_id {
+        inject_gemini_code_assist_project(&body, &project_id)?
+    } else {
+        body
+    };
     STREAM_CANCEL.store(false, std::sync::atomic::Ordering::Relaxed);
     set_stream_abort_handle(None);
     let stream_started_at = Instant::now();
 
     let is_model_request = url.contains("/v1/chat/completions")
         || url.contains("/v1/responses")
-        || url.contains("/v1/messages");
+        || url.contains("/v1/messages")
+        || url.contains("/backend-api/codex/responses")
+        || url.contains("/v1internal:generateContent");
 
     if is_model_request {
         let mut debug_parts = vec![format!("method=POST"), format!("url={}", url)];
@@ -5546,7 +5971,10 @@ async fn start_chat_stream(
         .read_timeout(Duration::from_secs(STREAM_READ_TIMEOUT_SECS))
         .build()
         .map_err(|e| format!("创建 HTTP 客户端失败: {e}"))?;
-    let mut req_builder = client.post(&url).header("Content-Type", "application/json");
+    let mut req_builder = client.post(&url);
+    if !has_header_case_insensitive(&headers, "Content-Type") {
+        req_builder = req_builder.header("Content-Type", "application/json");
+    }
     if is_model_request {
         req_builder = req_builder.header("Accept-Encoding", "identity");
     }
@@ -7376,8 +7804,9 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        compare_file_nodes, is_valid_git_branch_name, merge_json_rows_by_id, parse_git_branch_line,
-        parse_git_numstat, parse_git_porcelain_entries, parse_git_porcelain_status,
+        compare_file_nodes, is_supported_attachment_path, is_valid_git_branch_name,
+        merge_json_rows_by_id, parse_git_branch_line, parse_git_numstat,
+        parse_git_porcelain_entries, parse_git_porcelain_status,
         read_session_transcript_with_fallback, resolve_existing_path,
         resolve_session_transcript_to_write, resolve_write_path, should_hide_list_directory_entry,
         should_skip_recursive_search_dir, write_json_atomic, write_jsonl_atomic, FileNode,
@@ -7609,6 +8038,11 @@ mod tests {
         assert!(err.contains("路径越界"));
 
         fs::remove_dir_all(&parent).unwrap();
+    }
+
+    #[test]
+    fn log_files_are_supported_attachments() {
+        assert!(is_supported_attachment_path(PathBuf::from("main-debug.log").as_path()));
     }
 
     #[test]

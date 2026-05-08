@@ -9,6 +9,7 @@ export type ToolRiskLevel =
   | "read_only"
   | "workspace_write"
   | "shell"
+  | "local_file_read"
   | "external_read"
   | "external_write"
   | "browser_control"
@@ -38,6 +39,11 @@ export interface ToolCapability {
 export interface ToolCapabilityRegistry {
   tools: Record<string, ToolCapability>;
   policy: ToolPermissionPolicy;
+}
+
+export interface ToolCallRiskContext {
+  workspace?: string | null;
+  approvedLocalFileReadPaths?: Iterable<string> | null;
 }
 
 export interface ToolIntentFilterOptions {
@@ -93,6 +99,13 @@ const READ_ONLY_BUILT_INS = new Set([
 const WORKSPACE_WRITE_BUILT_INS = new Set(["replace_in_file", "write_file"]);
 const SHELL_BUILT_INS = new Set(["run_command", "execute_command", "send_pty_input"]);
 const DESTRUCTIVE_BUILT_INS = new Set(["delete_workspace_path"]);
+
+const LOCAL_FILE_READ_BUILT_INS = new Set([
+  "read_file",
+  "read_document",
+  "analyze_tabular_document",
+  "query_tabular_document",
+]);
 
 const READ_VERBS = [
   "read",
@@ -193,6 +206,7 @@ export function createDefaultToolPermissionPolicy(): ToolPermissionPolicy {
   return {
     autoExecuteRiskLevels: ["read_only", "external_read"],
     approvalRequiredRiskLevels: [
+      "local_file_read",
       "workspace_write",
       "shell",
       "external_write",
@@ -209,6 +223,7 @@ export function normalizeToolPermissionPolicy(policy?: Partial<ToolPermissionPol
     "read_only",
     "workspace_write",
     "shell",
+    "local_file_read",
     "external_read",
     "external_write",
     "browser_control",
@@ -285,6 +300,68 @@ function isSqlReadOnly(args: Record<string, unknown>): boolean | null {
     return false;
   }
   return null;
+}
+
+export function normalizeLocalFileReadPath(value: string | null | undefined): string {
+  const raw = String(value || "").trim().replace(/\\/g, "/");
+  if (!raw) return "";
+
+  const driveMatch = raw.match(/^([A-Za-z]:)(?:\/+|$)(.*)$/);
+  const root = driveMatch ? `${driveMatch[1]}/` : raw.startsWith("/") ? "/" : "";
+  const rest = driveMatch ? driveMatch[2] : root ? raw.replace(/^\/+/, "") : raw;
+  const parts: string[] = [];
+
+  for (const part of rest.split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") {
+      if (parts.length > 0) {
+        parts.pop();
+      } else if (!root) {
+        parts.push(part);
+      }
+      continue;
+    }
+    parts.push(part);
+  }
+
+  const normalized = `${root}${parts.join("/")}`;
+  if (normalized.length > 1 && normalized.endsWith("/")) return normalized.slice(0, -1);
+  return normalized || root;
+}
+
+function isAbsoluteLocalPath(value: string): boolean {
+  return value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value);
+}
+
+function pathStartsWithRoot(path: string, root: string): boolean {
+  const normalizedPath = normalizeLocalFileReadPath(path);
+  const normalizedRoot = normalizeLocalFileReadPath(root);
+  if (!normalizedPath || !normalizedRoot) return false;
+  return normalizedPath === normalizedRoot || normalizedPath.startsWith(`${normalizedRoot}/`);
+}
+
+export function getLocalFileReadPathForToolCall(
+  name: string,
+  args: Record<string, unknown>,
+  workspace?: string | null,
+): string | null {
+  if (!LOCAL_FILE_READ_BUILT_INS.has(name)) return null;
+  const rawPath = typeof args.path === "string" ? args.path.trim() : "";
+  if (!rawPath || !isAbsoluteLocalPath(rawPath)) return null;
+  if (workspace && pathStartsWithRoot(rawPath, workspace)) return null;
+  return normalizeLocalFileReadPath(rawPath);
+}
+
+export function isLocalFileReadApproved(
+  path: string,
+  approvedPaths?: Iterable<string> | null,
+): boolean {
+  const normalizedPath = normalizeLocalFileReadPath(path);
+  if (!normalizedPath || !approvedPaths) return false;
+  for (const approved of approvedPaths) {
+    if (normalizeLocalFileReadPath(approved) === normalizedPath) return true;
+  }
+  return false;
 }
 
 export function classifyBuiltInTool(name: string): ToolRiskLevel {
@@ -433,8 +510,16 @@ export function getToolRiskLevelForCall(
   name: string,
   args: Record<string, unknown>,
   registry?: ToolCapabilityRegistry,
+  context: ToolCallRiskContext = {},
 ): ToolRiskLevel {
   const capability = registry?.tools[name];
+  const localFileReadPath = getLocalFileReadPathForToolCall(name, args, context.workspace);
+  if (
+    localFileReadPath &&
+    !isLocalFileReadApproved(localFileReadPath, context.approvedLocalFileReadPaths)
+  ) {
+    return "local_file_read";
+  }
   if (capability?.category === "database" || containsAny(normalizeText(name), DATABASE_TERMS)) {
     const readOnlySql = isSqlReadOnly(args);
     if (readOnlySql === true) return "external_read";
@@ -455,9 +540,10 @@ export function isToolAutoExecutableForCall(
   args: Record<string, unknown>,
   registry?: ToolCapabilityRegistry,
   policy?: ToolPermissionPolicy,
+  context: ToolCallRiskContext = {},
 ): boolean {
   const effectivePolicy = normalizeToolPermissionPolicy(policy ?? registry?.policy);
-  const risk = getToolRiskLevelForCall(name, args, registry);
+  const risk = getToolRiskLevelForCall(name, args, registry, context);
   return effectivePolicy.autoExecuteRiskLevels.includes(risk) && !effectivePolicy.disabledRiskLevels.includes(risk);
 }
 

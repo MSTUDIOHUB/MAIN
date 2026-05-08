@@ -12,7 +12,7 @@ import type { MainModeKey } from "./mainModes";
 import type { AppConfig } from "../store/useAppStore";
 import { normalizeConversationDisplayTitle } from "./workflowModels";
 
-type PreflightConfig = Pick<AppConfig, "activeProfile" | "local" | "cloud">;
+type PreflightConfig = Pick<AppConfig, "activeProfile" | "local" | "cloud" | "cloudExperimentalLoginEnabled">;
 
 const ALLOWED_INTENTS = new Set<ResolvedUserIntent>([
   "discuss",
@@ -47,8 +47,8 @@ function deriveStreamSettings(config: PreflightConfig): StreamSettings {
     model: config.cloud.model,
     apiProtocol: normalizeCloudProtocol(config.cloud.protocol || "openai"),
     apiFormat: normalizeCloudApiFormat(config.cloud.apiFormat || "chat_completions"),
-    authMode: config.cloud.auth?.mode ?? "api_key",
-    tokenRef: config.cloud.auth?.tokenRef,
+    authMode: config.cloudExperimentalLoginEnabled === true ? config.cloud.auth?.mode ?? "api_key" : "api_key",
+    tokenRef: config.cloudExperimentalLoginEnabled === true ? config.cloud.auth?.tokenRef : undefined,
     customHeaders: config.cloud.customHeaders || "",
     disableResponseStorage: config.cloud.disableResponseStorage ?? true,
     reasoningEffort: "none",

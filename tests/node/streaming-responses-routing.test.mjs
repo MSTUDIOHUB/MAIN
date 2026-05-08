@@ -102,9 +102,16 @@ test("OpenAI ChatGPT OAuth cloud requests pass token references to the Rust prox
     assert.equal(args.tokenRef, "openai-login");
     assert.equal(args.headers.Authorization, undefined);
     assert.equal(args.headers["x-api-key"], undefined);
+    assert.equal(body.user_prompt_id, "main-cloud-test");
+    assert.equal(body.stream, true);
+    assert.equal(body.store, false);
+    assert.equal(typeof body.instructions, "string");
+    assert.equal(body.instructions.length > 0, true);
     assert.equal(body.temperature, undefined);
     assert.equal(body.top_p, undefined);
-    return JSON.stringify({ output_text: "ok" });
+    return "__CONTENT_TYPE__:text/event-stream\n"
+      + "event: response.output_text.delta\n"
+      + "data: {\"delta\":\"ok\"}\n\n";
   });
 
   await streamChatCompletion(
@@ -129,20 +136,21 @@ test("OpenAI ChatGPT OAuth cloud requests pass token references to the Rust prox
   assert.equal(invokeArgs[0].url, "https://api.openai.com/v1/responses");
 });
 
-test("Gemini OAuth cloud requests use native generateContent and token refs", async () => {
+test("Gemini OAuth cloud requests use Code Assist endpoint and token refs", async () => {
   const { streamChatCompletion } = await loadStreamingModule(async (command, args) => {
     assert.equal(command, "proxy_request");
     const body = JSON.parse(args.body);
-    assert.equal(args.url, "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent");
+    assert.equal(args.url, "https://cloudcode-pa.googleapis.com/v1internal:generateContent");
     assert.equal(args.authMode, "gemini_google_oauth");
     assert.equal(args.tokenRef, "gemini-login");
     assert.equal(args.headers.Authorization, undefined);
     assert.equal(args.headers["x-goog-api-key"], undefined);
-    assert.equal(body.contents[0].parts[0].text, "你好");
-    assert.equal(body.generationConfig.maxOutputTokens > 0, true);
+    assert.equal(body.model, "gemini-2.5-pro");
+    assert.equal(body.request.contents[0].parts[0].text, "你好");
+    assert.equal(body.request.generationConfig.maxOutputTokens > 0, true);
     assert.equal(body.temperature, undefined);
     assert.equal(body.top_p, undefined);
-    return JSON.stringify({ candidates: [{ content: { parts: [{ text: "ok" }] } }] });
+    return JSON.stringify({ response: { candidates: [{ content: { parts: [{ text: "ok" }] } }] } });
   });
 
   const result = await streamChatCompletion(

@@ -63,10 +63,13 @@ const {
   buildOpenAiResponsesInputCandidates,
   buildOpenAiResponsesRequestCandidates,
   buildOpenAiResponsesProbeRequestCandidates,
+  ensureOpenAiChatGptCodexRequestBody,
+  parseOpenAiResponsesSseText,
   buildOpenAiResponsesRequestExtras,
   buildOpenAiResponsesTranscript,
   buildGeminiGenerateContentUrl,
   buildGeminiRequestBody,
+  buildGeminiRequestForAuthMode,
   extractOpenAiResponsesInstructions,
   extractGeminiResponseText,
   buildAnthropicRequestBody,
@@ -386,6 +389,25 @@ test("gemini helpers build native generateContent requests and extract text", ()
     extractGeminiResponseText({ candidates: [{ content: { parts: [{ text: "o" }, { text: "k" }] } }] }),
     "ok",
   );
+  assert.equal(
+    extractGeminiResponseText({ response: { candidates: [{ content: { parts: [{ text: "oauth ok" }] } }] } }),
+    "oauth ok",
+  );
+  const oauthRequest = buildGeminiRequestForAuthMode("https://generativelanguage.googleapis.com", {
+    messages: [{ role: "user", content: "Say ok" }],
+    model: "models/gemini-2.5-pro",
+    maxTokens: 64,
+    projectId: "mock-code-assist-project",
+  }, "gemini_google_oauth");
+  assert.equal(oauthRequest.url, "https://cloudcode-pa.googleapis.com/v1internal:generateContent");
+  assert.equal(oauthRequest.body.model, "gemini-2.5-pro");
+  assert.equal(oauthRequest.body.project, "mock-code-assist-project");
+  assert.equal(typeof oauthRequest.body.user_prompt_id, "string");
+  assert.equal(oauthRequest.body.user_prompt_id.startsWith("main-"), true);
+  assert.equal(oauthRequest.body.request.contents[0].parts[0].text, "Say ok");
+  assert.equal(oauthRequest.body.request.generationConfig.maxOutputTokens, 64);
+  assert.equal(oauthRequest.body.request.generationConfig.temperature, undefined);
+  assert.equal(oauthRequest.body.request.generationConfig.topP, undefined);
 });
 
 test("cloud headers support Gemini API key and OAuth bearer modes", () => {
@@ -435,6 +457,47 @@ test("responses probe helpers keep base probes minimal and advanced probes expli
   assert.equal(advancedCandidates[0].mode, "transcript_text");
   assert.equal(advancedCandidates[0].body.store, false);
   assert.deepEqual(advancedCandidates[0].body.reasoning, { effort: "xhigh" });
+
+  const chatGptCandidates = buildOpenAiResponsesProbeRequestCandidates({
+    messages,
+    model: "gpt-5.4-mini",
+    includeAdvanced: false,
+    authMode: "openai_chatgpt_oauth",
+  });
+  assert.equal(chatGptCandidates[0].mode, "input_text_array");
+  assert.equal(Array.isArray(chatGptCandidates[0].body.input), true);
+  assert.equal(chatGptCandidates[0].body.input[0].content[0].type, "input_text");
+  assert.equal(chatGptCandidates[0].body.user_prompt_id, "main-cloud-test");
+});
+
+test("ChatGPT OAuth Codex request helper adds required stream instructions and store false", () => {
+  const body = ensureOpenAiChatGptCodexRequestBody({
+    model: "gpt-5.4-mini",
+    input: [{ role: "user", content: [{ type: "input_text", text: "ok" }] }],
+  });
+
+  assert.equal(body.model, "gpt-5.4-mini");
+  assert.equal(body.stream, true);
+  assert.equal(body.store, false);
+  assert.equal(typeof body.instructions, "string");
+  assert.equal(body.instructions.length > 0, true);
+  assert.equal(body.user_prompt_id, "main-cloud-test");
+});
+
+test("Responses SSE parser aggregates output text deltas", () => {
+  const text = parseOpenAiResponsesSseText([
+    "event: response.output_text.delta",
+    "data: {\"delta\":\"o\"}",
+    "",
+    "event: response.output_text.delta",
+    "data: {\"delta\":\"k\"}",
+    "",
+    "event: response.completed",
+    "data: {\"output_text\":\"!\"}",
+    "",
+  ].join("\n"));
+
+  assert.equal(text, "ok!");
 });
 
 test("cloud responses compact instructions preserve workspace write tools", () => {
@@ -468,9 +531,53 @@ test("cloud responses compact messages keep recent context and summarize old his
   const compacted = compactCloudResponsesMessages(messages);
 
   assert.equal(compacted[0].role, "system");
-  assert.match(compacted[1].content, /older messages compacted/);
+  assert.match(compacted[1].content, /ContextMemoryState v1/);
+  assert.match(compacted[2].content, /older non-pinned messages compacted/);
   assert.ok(compacted.length < messages.length);
   assert.match(compacted[compacted.length - 1].content, /message 11/);
+});
+
+test("cloud responses compact messages preserve explicit ContextState outside omitted summary", () => {
+  const messages = [
+    { role: "system", content: "system" },
+    { role: "user", content: "[System: ContextState\nContextMemoryState v1 id=test updatedAt=1\nLatest user request: fix Snake compile errors\nHard constraints:\n- preserve current files\n]" },
+    ...Array.from({ length: 18 }, (_, index) => ({
+      role: index % 3 === 0 ? "tool" : index % 2 === 0 ? "user" : "assistant",
+      content: `message ${index} ${"x".repeat(900)}`,
+    })),
+  ];
+
+  const compacted = compactCloudResponsesMessages(messages, { maxInputMessages: 10 });
+  const memory = compacted.find((message) => String(message.content).includes("ContextMemoryState v1"));
+  const summary = compacted.find((message) => String(message.content).includes("Cloud history summary"));
+
+  assert.ok(memory, "expected pinned ContextState memory");
+  assert.match(String(memory?.content || ""), /fix Snake compile errors/);
+  assert.ok(summary, "expected old history summary");
+  assert.doesNotMatch(String(summary?.content || ""), /ContextMemoryState v1/);
+});
+
+test("responses compact transcript fallback keeps pinned ContextState memory", () => {
+  const messages = [
+    { role: "system", content: "system" },
+    { role: "user", content: "[System: ContextState\nContextMemoryState v1 id=test updatedAt=1\nLatest user request: continue Game Studio task\n]" },
+    ...Array.from({ length: 14 }, (_, index) => ({
+      role: index % 2 === 0 ? "user" : "assistant",
+      content: `history ${index} ${"x".repeat(700)}`,
+    })),
+  ];
+
+  const candidates = buildOpenAiResponsesRequestCandidates({
+    messages,
+    model: "gpt-5.5",
+    compact: true,
+    includeTools: false,
+  });
+  const transcript = candidates.find((candidate) => candidate.mode === "transcript_text");
+
+  assert.equal(typeof transcript?.body.input, "string");
+  assert.match(String(transcript?.body.input || ""), /ContextMemoryState v1/);
+  assert.match(String(transcript?.body.input || ""), /continue Game Studio task/);
 });
 
 test("anthropic response text extractor joins text content blocks", () => {
