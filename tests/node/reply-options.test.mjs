@@ -344,6 +344,24 @@ test("extractReplyOptions marks explicit execution choices for runtime execute",
   assert.equal(explicit.replyOptions[1].action, undefined);
 });
 
+test("extractReplyOptions filters internal process or mode-switch pseudo options", () => {
+  const result = extractReplyOptions(`
+请选择下一步：
+
+<user_options>
+<option>切换到执行模式</option>
+<option>我要调用工具 read_file</option>
+<option>直接执行部署脚本 deploy.sh</option>
+</user_options>
+  `);
+
+  assert.deepEqual(
+    result.replyOptions.map((option) => option.value),
+    ["直接执行部署脚本 deploy.sh"],
+  );
+  assert.equal(result.replyOptions[0].action, "execute_once");
+});
+
 test("read-only auto approval strips repeated permission prompts and builds continuation", () => {
   const result = extractReplyOptions("请问是否同意我下一步分析 `CombatUnit.cs` 的内容？");
 

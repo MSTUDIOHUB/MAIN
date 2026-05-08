@@ -213,6 +213,87 @@ test("OpenAI Responses respects XML tool protocol by omitting native tools", asy
   assert.equal(requests[0].tools, undefined);
 });
 
+test("OpenAI-compatible history keeps tool call arguments as JSON strings", async () => {
+  const listeners = new Map();
+  const bodies = [];
+  const listenMock = async (eventName, handler) => {
+    listeners.set(eventName, handler);
+    return () => listeners.delete(eventName);
+  };
+  const { streamChatCompletion } = await loadStreamingModule(async (command, args) => {
+    assert.equal(command, "start_chat_stream");
+    bodies.push(JSON.parse(args.body));
+    const streamId = args.streamId;
+    queueMicrotask(() => {
+      listeners.get("chat-stream-chunk")?.({
+        payload: {
+          stream_id: streamId,
+          chunk: `data: ${JSON.stringify({ choices: [{ delta: { content: "ok" }, finish_reason: "stop" }] })}\n\n`,
+        },
+      });
+      listeners.get("chat-stream-done")?.({
+        payload: {
+          stream_id: streamId,
+          status: "success",
+        },
+      });
+    });
+    return undefined;
+  }, listenMock);
+
+  const result = await streamChatCompletion(
+    [
+      {
+        role: "assistant",
+        content: "",
+        tool_calls: [{
+          id: "call_1",
+          type: "function",
+          function: {
+            name: "read_file",
+            arguments: "{\"path\":\"README.md\"}",
+          },
+        }],
+      },
+      {
+        role: "tool",
+        content: "ok",
+        tool_call_id: "call_1",
+      },
+      {
+        role: "assistant",
+        content: "",
+        tool_calls: [{
+          id: "call_2",
+          type: "function",
+          function: {
+            name: "list_directory",
+            arguments: { path: "." },
+          },
+        }],
+      },
+    ],
+    {
+      baseUrl: "http://127.0.0.1:1234/v1",
+      apiKey: "not-needed",
+      model: "local-model",
+      provider: "LM Studio",
+      useRustProxy: true,
+    },
+    {
+      onToken: () => {},
+      onDone: () => {},
+      onError: (error) => { throw error; },
+    },
+  );
+
+  assert.equal(result.content, "ok");
+  assert.equal(typeof bodies[0].messages[0].tool_calls[0].function.arguments, "string");
+  assert.equal(bodies[0].messages[0].tool_calls[0].function.arguments, "{\"path\":\"README.md\"}");
+  assert.equal(typeof bodies[0].messages[2].tool_calls[0].function.arguments, "string");
+  assert.equal(bodies[0].messages[2].tool_calls[0].function.arguments, "{\"path\":\".\"}");
+});
+
 test("local Rust stream read errors fall back to a non-streaming request", async () => {
   const listeners = new Map();
   const invokeCalls = [];

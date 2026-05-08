@@ -202,6 +202,21 @@ test("thought display detailed text removes near duplicate Chinese process lines
   assert.equal(countOccurrences(display.detailText, "三档配置"), 1);
 });
 
+test("thought display filters repeated mode-complaint self-talk", () => {
+  const display = deriveThoughtDisplay([
+    "当前 discuss 模式下 write_file 不可用，需要切换到执行模式。",
+    "工具 disabled in discuss mode，必须进入 execute mode。",
+    "我会继续检查目标文件并完成修改。",
+  ].join("\n"), {
+    mode: "detailed",
+    language: "zh",
+  });
+
+  assert.doesNotMatch(display.detailText, /discuss 模式下 write_file 不可用/);
+  assert.doesNotMatch(display.detailText, /disabled in discuss mode/);
+  assert.match(display.detailText, /继续检查目标文件/);
+});
+
 test("thought summary comparison normalizes near duplicate English process lines", () => {
   assert.equal(
     normalizeThoughtSummaryForCompare("The file keeps returning same stub. Let try reading specific line ranges to get content need."),

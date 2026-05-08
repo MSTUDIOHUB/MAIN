@@ -102,6 +102,7 @@ import {
   hasProviderNativeToolsDisabled,
   isProviderCompatibilityErrorMessage,
 } from "./providerCompatibility";
+import { normalizeCloudToolProtocol, normalizeLocalToolProtocol } from "./cloudProtocol";
 import { getErrorMessage } from "./errorUtils";
 import { resolveProtocolPackageReadPath } from "./protocolPackages";
 import { isCloudGatewayTimeoutMessage, isRetryableCloudErrorMessage } from "./cloudRetry";
@@ -480,6 +481,7 @@ export interface OrchestratorCallbacks {
 function deriveStreamSettings(config: AppConfig): StreamSettings {
   if (config.activeProfile === "local") {
     const isOllama = config.local.provider === "Ollama";
+    const toolProtocol = normalizeLocalToolProtocol(config.local.toolProtocol, config.local.provider);
     return {
       baseUrl: config.local.endpoint,
       apiKey: config.local.apiKey || "not-needed",
@@ -488,6 +490,7 @@ function deriveStreamSettings(config: AppConfig): StreamSettings {
       temperature: 0.2,
       contextLimit: config.local.contextLimit,
       provider: config.local.provider,
+      toolProtocol,
       // LM Studio / OMLX 的本地流式接口在桌面 WebView 中可能触发
       // “Load Failed”，统一交给 Tauri 后端请求，避开 WebView 限制。
       // Ollama 保留前端直连，因为它使用原生 /api/chat 流格式。
@@ -505,12 +508,32 @@ function deriveStreamSettings(config: AppConfig): StreamSettings {
     customHeaders: config.cloud.customHeaders || "",
     disableResponseStorage: config.cloud.disableResponseStorage ?? true,
     reasoningEffort: config.cloud.reasoningEffort ?? "none",
-    toolProtocol: config.cloud.toolProtocol ?? "auto",
+    toolProtocol: normalizeCloudToolProtocol(config.cloud.toolProtocol),
     // Cloud profile should not inherit the local KV-cache/context limit.
     contextLimit: undefined,
     provider: config.cloud.provider,
     useRustProxy: true,  // Route through Rust to bypass WebView CORS
   };
+}
+
+function resolveEffectiveToolProtocol(config: AppConfig, settings: StreamSettings) {
+  return config.activeProfile === "local"
+    ? normalizeLocalToolProtocol(settings.toolProtocol, config.local.provider)
+    : normalizeCloudToolProtocol(settings.toolProtocol);
+}
+
+function shouldUseXmlToolProtocol(config: AppConfig, settings: StreamSettings, messages: AgentMessage[]): boolean {
+  return resolveEffectiveToolProtocol(config, settings) === "xml" || hasProviderNativeToolsDisabled(messages);
+}
+
+function prepareMessagesForToolProtocol(
+  messages: AgentMessage[],
+  config: AppConfig,
+  settings: StreamSettings,
+): AgentMessage[] {
+  return shouldUseXmlToolProtocol(config, settings, messages)
+    ? buildCompatibilityRetryMessages(messages) as AgentMessage[]
+    : messages;
 }
 
 /** Derive a short display target from tool arguments. */
@@ -1891,6 +1914,7 @@ export async function executeAgentLoop(
   const initialMessages = callbacks.getMessages();
   const nativeToolsEnabled = !hasProviderNativeToolsDisabled(initialMessages);
   const settings = deriveStreamSettings(config);
+  const effectiveToolProtocol = resolveEffectiveToolProtocol(config, settings);
   const workspace = config.workspace;
   const mainModeKey = callbacks.getMainModeKey();
   const workspaceTree = callbacks.getWorkspaceTree();
@@ -1917,8 +1941,8 @@ export async function executeAgentLoop(
     useRustProxy: settings.useRustProxy,
     hasApiKey: !!settings.apiKey,
     provider: settings.provider,
-    nativeToolsEnabled,
-    toolProtocol: config.cloud.toolProtocol ?? "auto",
+    nativeToolsEnabled: effectiveToolProtocol !== "xml" && nativeToolsEnabled,
+    toolProtocol: effectiveToolProtocol,
     xmlToolsEnabled: true,
   }));
 
@@ -2233,8 +2257,8 @@ export async function executeAgentLoop(
     allTools: loopStartTools.length,
     mcpTools: mcpTools.length,
     builtinAndSkillTools: Math.max(0, loopStartTools.length - mcpTools.length),
-    nativeToolsEnabled: !(isCloudProfile && config.cloud.toolProtocol === "xml") && !hasProviderNativeToolsDisabled(callbacks.getMessages()),
-    toolProtocol: isCloudProfile ? config.cloud.toolProtocol ?? "auto" : "native",
+    nativeToolsEnabled: effectiveToolProtocol !== "xml" && !hasProviderNativeToolsDisabled(callbacks.getMessages()),
+    toolProtocol: effectiveToolProtocol,
     xmlToolsEnabled: true,
     maxOutputEscalations: getMaxOutputEscalations(),
   });
@@ -2259,7 +2283,7 @@ export async function executeAgentLoop(
     // 1. Context management. Cloud mode uses a lightweight pass so tool-heavy
     // histories do not trigger slow Responses requests or gateway 524s.
     let managedAgentMessages = callbacks.getMessages() as AgentMessage[];
-    const forceXmlTools = isCloudProfile && config.cloud.toolProtocol === "xml";
+    const forceXmlTools = effectiveToolProtocol === "xml";
     const llmTools = !forceXmlTools && !hasProviderNativeToolsDisabled(callbacks.getMessages()) ? iterationAllTools : [];
     const cloudResponsesCompact = isCloudProfile && config.cloud.apiFormat === "responses";
     if (snapshotContextLimit != null || cloudResponsesCompact) {
@@ -2329,15 +2353,16 @@ export async function executeAgentLoop(
       messagesLen: managedAgentMessages.length,
       allTools: iterationAllTools.length,
       llmTools: llmTools.length,
-      toolProtocol: isCloudProfile ? config.cloud.toolProtocol ?? "auto" : "native",
+      toolProtocol: effectiveToolProtocol,
       xmlToolsEnabled: true,
       mcpTools: mcpTools.length,
       currentMaxTokens: currentMaxTokens ?? "default",
     });
 
     try {
+      const messagesForLLM = prepareMessagesForToolProtocol(managedAgentMessages, config, settings);
       streamResult = await fetchLLMStream(
-        managedAgentMessages,
+        messagesForLLM,
         settings,
         assistantMsgId,
         callbacks,
@@ -2443,8 +2468,9 @@ export async function executeAgentLoop(
 
         // Retry once with the compacted context
         try {
+          const aggressivelyManagedForLLM = prepareMessagesForToolProtocol(aggressivelyManaged, config, settings);
           streamResult = await fetchLLMStream(
-            aggressivelyManaged,
+            aggressivelyManagedForLLM,
             settings,
             assistantMsgId,
             callbacks,
@@ -2514,8 +2540,9 @@ export async function executeAgentLoop(
           }
 
           try {
+            const emergencyManagedForLLM = prepareMessagesForToolProtocol(emergencyManaged, config, settings);
             streamResult = await fetchLLMStream(
-              emergencyManaged,
+              emergencyManagedForLLM,
               settings,
               assistantMsgId,
               callbacks,

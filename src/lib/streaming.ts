@@ -283,8 +283,8 @@ function mapMessageForApi(m: ChatMessage, isOllama: boolean): Record<string, unk
         function: {
           name: tc.function.name,
           arguments: typeof tc.function.arguments === "string"
-            ? (() => { try { return JSON.parse(tc.function.arguments); } catch { return tc.function.arguments; } })()
-            : tc.function.arguments,
+            ? tc.function.arguments
+            : JSON.stringify(tc.function.arguments ?? {}),
         },
       })),
     };

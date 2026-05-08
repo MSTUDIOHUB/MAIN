@@ -13,7 +13,7 @@ test("composer keeps a two-line minimum height and grows until it scrolls", asyn
   await page.goto("/?e2eScenario=composer-main-shortcuts");
 
   const textarea = page.getByTestId("composer-textarea");
-  await expect(textarea).toHaveAttribute("placeholder", /输入需求，或输入 \/ 选择计划、执行、分析、总结、报告/);
+  await expect(textarea).toHaveAttribute("placeholder", /输入需求，或输入 \/ 选择计划入口、分析、总结、报告/);
 
   const initialBox = await textarea.boundingBox();
   expect(initialBox?.height ?? 0).toBeGreaterThanOrEqual(56);
@@ -50,7 +50,7 @@ test("MAIN shortcut menu works from a leading slash before existing content", as
 
   await expect(page.getByText("MAIN 快捷入口").first()).toBeVisible();
   await expect(page.getByTestId("main-shortcut-item-plan")).toBeVisible();
-  await expect(page.getByTestId("main-shortcut-item-execute")).toBeVisible();
+  await expect(page.getByTestId("main-shortcut-item-execute")).toHaveCount(0);
 });
 
 test("MAIN shortcut order, keyboard selection, and labels stay aligned", async ({ page }) => {
@@ -64,23 +64,18 @@ test("MAIN shortcut order, keyboard selection, and labels stay aligned", async (
     .evaluateAll((nodes) => nodes.map((node) => node.getAttribute("data-testid")));
   expect(shortcutIds).toEqual([
     "main-shortcut-item-plan",
-    "main-shortcut-item-execute",
     "main-shortcut-item-report",
     "main-shortcut-item-analyze",
     "main-shortcut-item-summarize",
   ]);
 
-  await expect(page.getByTestId("main-shortcut-item-execute")).toContainText("/执行");
-  await expect(page.getByTestId("main-shortcut-item-execute")).not.toContainText("/执行 · 执行");
-
-  await page.keyboard.press("ArrowDown");
   await page.keyboard.press("Enter");
 
   await expect
     .poll(async () =>
       page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().lockedComposerIntent ?? null),
     )
-    .toBe("execute");
+    .toBe("plan");
   await expect(textarea).toHaveValue("");
 });
 

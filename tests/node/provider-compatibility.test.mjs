@@ -31,6 +31,7 @@ const {
   buildCompatibilityRetryMessages,
   buildTranscriptCompatibilityRetryMessages,
   isProviderCompatibilityErrorMessage,
+  isNativeToolCompatibilityErrorMessage,
 } = await loadProviderCompatibilityModule();
 
 test("provider compatibility error helper matches weak OpenAI-compatible gateways", () => {
@@ -44,6 +45,18 @@ test("provider compatibility error helper matches weak OpenAI-compatible gateway
   );
   assert.equal(
     isProviderCompatibilityErrorMessage("HTTP 400: Responses API is not supported"),
+    true,
+  );
+  assert.equal(
+    isProviderCompatibilityErrorMessage("HTTP 400: Invalid 'messages' in payload"),
+    true,
+  );
+  assert.equal(
+    isNativeToolCompatibilityErrorMessage('HTTP 400: Invalid "messages" in payload'),
+    true,
+  );
+  assert.equal(
+    isNativeToolCompatibilityErrorMessage("HTTP 400: invalid messages"),
     true,
   );
   assert.equal(

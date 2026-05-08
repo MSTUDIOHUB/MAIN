@@ -2821,6 +2821,7 @@ function seedPlanApprovalExecuteToolsScenario() {
     planApprovalChoice: null,
     currentTurnExecutionConsent: { turnId: null, granted: false },
     autoApproveTools: false,
+    autoApproveToolScopes: [],
     readOnlyAutoApproveForSession: false,
     showPlanPanel: true,
     showDiff: false,

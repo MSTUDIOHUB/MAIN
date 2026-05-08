@@ -83,8 +83,10 @@ const {
   extractOpenAiResponseText,
   mapMessagesForAnthropic,
   getModelInstructionProfile,
+  getDefaultLocalToolProtocol,
   normalizeCloudAuthMode,
   normalizeCloudToolProtocol,
+  normalizeLocalToolProtocol,
   parseCloudCustomHeaders,
 } = await loadCloudProtocolModule();
 
@@ -359,6 +361,14 @@ test("cloud tool protocol and model profile helpers normalize provider behavior"
   assert.equal(normalizeCloudToolProtocol("native"), "native");
   assert.equal(normalizeCloudToolProtocol("xml"), "xml");
   assert.equal(normalizeCloudToolProtocol("bad"), "auto");
+  assert.equal(getDefaultLocalToolProtocol("LM Studio"), "xml");
+  assert.equal(getDefaultLocalToolProtocol("Ollama"), "xml");
+  assert.equal(getDefaultLocalToolProtocol("OMLX"), "auto");
+  assert.equal(normalizeLocalToolProtocol(undefined, "LM Studio"), "xml");
+  assert.equal(normalizeLocalToolProtocol(undefined, "Ollama"), "xml");
+  assert.equal(normalizeLocalToolProtocol(undefined, "OMLX"), "auto");
+  assert.equal(normalizeLocalToolProtocol("native", "LM Studio"), "native");
+  assert.equal(normalizeLocalToolProtocol("xml", "OMLX"), "xml");
 
   assert.equal(getModelInstructionProfile({ protocol: "anthropic", model: "claude-sonnet-4-5" }).provider, "anthropic");
   assert.equal(getModelInstructionProfile({ protocol: "openai", model: "qwen3-coder" }).reasoning, "tagged");

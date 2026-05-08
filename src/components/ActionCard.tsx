@@ -251,14 +251,16 @@ export default function ActionCard({ blockId, toolName, target, toolStatus, mess
                 onChange={(e) => onToggleAutoApprove(e.target.checked)}
                 className="w-3.5 h-3.5 rounded border-[#3f3f46] bg-[#000000] accent-[var(--accent)] cursor-pointer"
               />
-              <span className="text-[11px] text-[#71717a] group-hover:text-[#a1a1aa] transition-colors">
-                {toolName === "read_file" || toolName === "read_document" || toolName === "analyze_tabular_document" || toolName === "query_tabular_document"
-                  ? language === "zh" ? "允许后，本会话内不再重复询问这个文件" : "After allowing, this file will stay approved for this session"
-                  : language === "zh" ? "本次会话内自动允许后续所有命令" : "Auto-approve all commands in this session"}
-              </span>
-            </label>
-          </div>
-        )}
+                <span className="text-[11px] text-[#71717a] group-hover:text-[#a1a1aa] transition-colors">
+                  {toolName === "read_file" || toolName === "read_document" || toolName === "analyze_tabular_document" || toolName === "query_tabular_document"
+                    ? language === "zh" ? "允许后，本会话内不再重复询问这个文件" : "After allowing, this file will stay approved for this session"
+                  : language === "zh"
+                    ? "本会话内自动允许后续写入与命令（高风险仍逐项审查）"
+                    : "Auto-allow writes and commands in this session (high-risk still reviewed per step)"}
+                </span>
+              </label>
+            </div>
+          )}
 
         {/* Expandable message area for executed/rejected — terminal styling for commands */}
         {message && !isPending && (() => {

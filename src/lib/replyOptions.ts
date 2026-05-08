@@ -18,6 +18,7 @@ const PLAN_ARTIFACT_PATH_RE = /\.MAIN[\/\\]plans[\/\\](?:requirements|design|bug
 const PLAN_ARTIFACT_FILE_RE = /\b(?:requirements|design|bugfix|tasks)\.md\b/i;
 const PLAN_ARTIFACT_DOC_RE = /(?:计划文档|计划文件|规划文档|规划文件|plan documents?|plan files?|planning documents?|planning files?)/i;
 const INTERNAL_PLAN_ARTIFACT_STEP_RE = /(?:创建|生成|写入|更新|保存|落盘|create|generate|write|update|save)/i;
+const INTERNAL_PROCESS_OPTION_RE = /(?:切换(?:到)?(?:执行|讨论|计划)模式|进入(?:执行|讨论|计划)模式|进入执行能力|执行模式|workflow mode|mode switch|switch mode|我要调用工具|将调用工具|tool call|^\s*\[?\s*tool[_ ]?call)/i;
 const PLAN_SUMMARY_HEADING_RE = /(?:方案总结|需求规格|设计方案|关键设计决策|设计决策|方案正文|计划摘要|方案摘要|requirements?|design|proposal|plan summary|design decisions?)/i;
 const PLAN_SUMMARY_ITEM_RE = /^(?:\*\*)?(?:技术栈|核心玩法|交互控制|交付物|架构|游戏循环|渲染|碰撞检测|执行顺序|关键设计决策|需求规格|设计方案|文件|模块|验证方式|测试方案|范围|目标|验收标准)(?:\*\*)?\s*[:：]/i;
 
@@ -70,6 +71,7 @@ function addReplyOption(
   const label = normalizeReplyOptionLabel(rawLabel || rawValue || "");
   const value = normalizeReplyOptionValue(rawValue || rawLabel);
   if (!label || !value || seenValues.has(value)) return;
+  if (INTERNAL_PROCESS_OPTION_RE.test(label) || INTERNAL_PROCESS_OPTION_RE.test(value)) return;
   if (looksLikeInternalPlanArtifactStep(label) || looksLikeInternalPlanArtifactStep(value)) return;
   if (looksLikePlanSummaryItem(label) || looksLikePlanSummaryItem(value)) return;
   seenValues.add(value);

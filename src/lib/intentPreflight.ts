@@ -1,4 +1,4 @@
-import { normalizeCloudApiFormat, normalizeCloudProtocol } from "./cloudProtocol";
+import { normalizeCloudApiFormat, normalizeCloudProtocol, normalizeLocalToolProtocol } from "./cloudProtocol";
 import { streamChatCompletion, type StreamSettings } from "./streaming";
 import {
   inferCommandDirective,
@@ -35,6 +35,7 @@ function deriveStreamSettings(config: PreflightConfig): StreamSettings {
       temperature: 0.1,
       contextLimit: config.local.contextLimit,
       provider: config.local.provider,
+      toolProtocol: normalizeLocalToolProtocol(config.local.toolProtocol, config.local.provider),
       // LM Studio / OMLX 的本地请求也走 Tauri 后端，避免 WebView 的
       // “Load Failed” 网络错误；Ollama 继续使用原生前端流式接口。
       useRustProxy: !isOllama,
@@ -52,6 +53,7 @@ function deriveStreamSettings(config: PreflightConfig): StreamSettings {
     customHeaders: config.cloud.customHeaders || "",
     disableResponseStorage: config.cloud.disableResponseStorage ?? true,
     reasoningEffort: "none",
+    toolProtocol: config.cloud.toolProtocol,
     contextLimit: undefined,
     provider: config.cloud.provider,
     useRustProxy: true,
@@ -187,7 +189,7 @@ export async function runIntentPreflight(params: {
     "If the request is ambiguous in a way that materially changes behavior, set needsUserChoice=true and provide a short user-facing question plus 2-3 clear options.",
     "Options must be plain user-facing choices, not reasoning.",
     "The JSON shape must be:",
-    "{\"intent\":\"discuss|plan|execute|analyze|summarize|report|studio_workflow\",\"confidence\":0.0,\"riskLevel\":\"low|medium|high\",\"requiresApproval\":false,\"commandDirective\":{\"kind\":\"none|shell|unity|git|file_modify|report|plan_approval|plan_resume|studio|skill|knowledge|mcp\",\"action\":\"status\",\"target\":\"git\",\"source\":\"preflight\",\"requiresWorkspace\":true,\"requiresApproval\":true,\"confidence\":0.0,\"reason\":\"Git status request\"},\"title\":\"修正标题同步逻辑\",\"summary\":\"调整 sidebar 与 TopIsland 的标题同步逻辑\",\"reason\":\"The request asks for a concrete UI change.\",\"needsUserChoice\":false,\"question\":\"\",\"options\":[{\"id\":\"plan\",\"label\":\"进入计划模式\",\"value\":\"先给我一个方案和计划，再决定是否执行\"}],\"outputFormat\":\"answer|summary|report|plan|analysis|execution\",\"bypassMainRouter\":false,\"needsWorkspaceRead\":false}",
+    "{\"intent\":\"discuss|plan|execute|analyze|summarize|report|studio_workflow\",\"confidence\":0.0,\"riskLevel\":\"low|medium|high\",\"requiresApproval\":false,\"commandDirective\":{\"kind\":\"none|shell|unity|git|file_modify|report|plan_approval|plan_resume|studio|skill|knowledge|mcp\",\"action\":\"status\",\"target\":\"git\",\"source\":\"preflight\",\"requiresWorkspace\":true,\"requiresApproval\":true,\"confidence\":0.0,\"reason\":\"Git status request\"},\"title\":\"修正标题同步逻辑\",\"summary\":\"调整 sidebar 与 TopIsland 的标题同步逻辑\",\"reason\":\"The request asks for a concrete UI change.\",\"needsUserChoice\":false,\"question\":\"\",\"options\":[{\"id\":\"plan\",\"label\":\"先给方案\",\"value\":\"先给我一个方案和计划，再决定是否执行\"}],\"outputFormat\":\"answer|summary|report|plan|analysis|execution\",\"bypassMainRouter\":false,\"needsWorkspaceRead\":false}",
     `Current visible mode: ${params.mainModeKey}`,
     `Preferred user language: ${params.language}`,
   ].join("\n");

@@ -256,11 +256,11 @@ export default function Composer({
   const slashHint = language === "en" ? "Select to insert canonical command" : "选择后会插入标准命令";
   const mainIntentSearchLabel = slashQuery
     ? (language === "en" ? `Shortcut: ${slashQuery}` : `快捷入口：${slashQuery}`)
-    : (language === "en" ? "Type / to choose workflow modes or output styles" : "输入 / 选择流程模式或输出方式");
+    : (language === "en" ? "Type / for planning and output styles" : "输入 / 选择计划入口和输出方式");
   const mainIntentEmptyLabel = language === "en" ? "No matching shortcuts" : "没有匹配的快捷入口";
   const mainIntentHint = language === "en"
-    ? "Workflow modes change execution; output styles only shape the answer"
-    : "流程模式会改变执行边界；输出方式只改变回答格式";
+    ? "Use natural language for direct execution; shortcuts are optional."
+    : "直接用自然语言下达执行任务；快捷入口是可选的。";
   const studioWorkflowHeading = language === "en" ? "Workflow Commands" : "工作流命令";
   const studioAgentHeading = language === "en" ? "Specialist Agents" : "专业 Agent";
   const workflowKindLabel = language === "en" ? "workflow" : "工作流";
@@ -1310,8 +1310,8 @@ export default function Composer({
     : isGameStudioMode
     ? (language === "en" ? "Ask the studio, or type / for workflows and specialists..." : "询问工作室中枢，或输入 / 打开工作流和专家面板...")
     : language === "en"
-    ? "Describe what you need, or type / for plan, execute, analyze, summary, and report..."
-    : "输入需求，或输入 / 选择计划、执行、分析、总结、报告...";
+    ? "Describe what you need, or type / for planning and output styles..."
+    : "输入需求，或输入 / 选择计划入口、分析、总结、报告...";
 
   // region: Composer 高度同步
   useEffect(() => {
@@ -1509,7 +1509,7 @@ export default function Composer({
                       {" "}
                       {suggestedComposerIntentIsOutputStyle
                         ? (language === "en" ? "output style for this turn?" : "输出方式处理本轮请求？")
-                        : (language === "en" ? "workflow mode for this turn?" : "流程模式处理本轮请求？")}
+                        : (language === "en" ? "intent for this turn?" : "按这个意图处理本轮请求？")}
                     </>
                   )}
               </span>

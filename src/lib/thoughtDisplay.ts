@@ -220,6 +220,10 @@ function isLikelyToolLogLine(line: string): boolean {
     /\b(?:truncatedPreview|ANGEDUB|get_outline)\b/i.test(line);
 }
 
+function isModeComplaintLine(line: string): boolean {
+  return /(?:当前|目前).{0,20}(?:discuss|讨论).{0,24}(?:不(?:可|能)|不能|不可用).{0,20}(?:write_file|replace_in_file|execute_command|run_command)|(?:需要|请先|必须).{0,20}(?:切换|进入).{0,12}(?:执行模式|execute mode)|(?:tool|工具).{0,16}(?:disabled|不可用).{0,20}(?:discuss|讨论)/i.test(line);
+}
+
 function isCodeLikeLine(line: string): boolean {
   const trimmed = line.trim();
   return /^(?:import|export|const|let|var|function|class|interface|type|return|if|else|for|while|switch|case|try|catch)\b/.test(trimmed) ||
@@ -313,6 +317,7 @@ function cleanThoughtText(raw: string, language: "zh" | "en"): string {
       if (hasDensePunctuationNoise(line.cleanLine)) return false;
       if (isLikelyJsonLine(line.cleanLine)) return false;
       if (isLikelyToolLogLine(line.cleanLine)) return false;
+      if (isModeComplaintLine(line.cleanLine)) return false;
       return true;
     })
     .map((line) => line.cleanLine);

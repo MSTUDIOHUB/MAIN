@@ -24,6 +24,8 @@ import {
   normalizeCloudAuthMode,
   normalizeCloudProtocol,
   normalizeCloudToolProtocol,
+  getDefaultLocalToolProtocol,
+  normalizeLocalToolProtocol,
   normalizeOpenAiReasoningEffort,
   OPENAI_CHATGPT_CODEX_ENDPOINT,
   OPENAI_CHATGPT_EXPERIMENTAL_MODELS,
@@ -227,6 +229,7 @@ const SETTINGS_COPY = {
     optionalOmlxAuth: "可选，OMLX 服务鉴权用",
     noAuthPlaceholder: "留空则不发送鉴权头",
     localModel: "Local Model",
+    localModelUnselected: "未选择模型",
     scanningModels: "正在扫描模型...",
     noModels: "未发现模型 — 请先启动本地推理服务",
     scanModels: "扫描",
@@ -312,6 +315,7 @@ const SETTINGS_COPY = {
     disableResponseStorageDesc: "对应 Codex `disable_response_storage = true`，会发送 `store: false`。",
     toolProtocol: "Tool Protocol",
     toolProtocolDesc: "Auto 会先尝试原生 tools，遇到不兼容网关会回退 XML；Native 强制原生；XML 直接使用文本工具协议。",
+    localToolProtocolOllamaHint: "Ollama 会继续走 /api/chat 文本工具模式，不会发送 OpenAI native tools 参数。",
     responsesCodexDesc: "`Responses + gpt-5.4` 现在会尽量贴近 Codex 请求形态：使用顶层 `instructions`、发送 `store: false` / `reasoning.effort`，并让采样参数走服务端默认值。",
     cloudStartTitle: "从 0 开始添加云端服务器",
     cloudStartDesc: "当前没有任何云端接口配置。点击新增后填写名称、协议、Endpoint 和 API Key。",
@@ -427,6 +431,7 @@ const SETTINGS_COPY = {
     optionalOmlxAuth: "optional, for OMLX service auth",
     noAuthPlaceholder: "Leave blank to skip the auth header",
     localModel: "Local Model",
+    localModelUnselected: "No model selected",
     scanningModels: "Scanning models...",
     noModels: "No models found - start the local inference service first",
     scanModels: "Scan",
@@ -512,6 +517,7 @@ const SETTINGS_COPY = {
     disableResponseStorageDesc: "Maps to Codex `disable_response_storage = true` and sends `store: false`.",
     toolProtocol: "Tool Protocol",
     toolProtocolDesc: "Auto tries native tools first and falls back to XML on weak gateways. Native forces function calling; XML uses text tool calls directly.",
+    localToolProtocolOllamaHint: "Ollama keeps using /api/chat text tools and will not receive OpenAI native tools parameters.",
     responsesCodexDesc: "`Responses + gpt-5.4` now mirrors Codex request shape where possible: top-level `instructions`, `store: false` / `reasoning.effort`, and server defaults for sampling.",
     cloudStartTitle: "Add a cloud server from scratch",
     cloudStartDesc: "No cloud API configuration exists yet. Add a server, then fill in name, protocol, endpoint, and API key.",
@@ -1017,7 +1023,7 @@ function FeishuGuideModal({ t, language, onClose }: { t: any; language: "zh" | "
   const commands = isEn
     ? [
         "Plain text: run read-only analysis in the current MAIN workspace by default.",
-        "Use /execute or /plan before a task when you want MAIN to modify files or create a reviewed plan.",
+        "Describe tasks naturally; MAIN will infer discuss, plan, or execute intent. Use /plan only when you explicitly want a review-first plan flow.",
         "/status: show adapter, MAIN and workspace status.",
         "/stop: stop current generation and clear queued remote messages.",
         "Remote approvals appear as interactive cards. Use the card buttons to allow or reject tool actions.",
@@ -1026,7 +1032,7 @@ function FeishuGuideModal({ t, language, onClose }: { t: any; language: "zh" | "
       ]
     : [
         "普通文本：默认在 MAIN 当前工作区执行只读分析。",
-        "需要修改文件或先出方案时，在任务前加 /execute 或 /plan。",
+        "直接用自然语言描述任务，MAIN 会按语义判断是讨论、计划还是执行；只有你想明确走“先审阅方案”时再用 /计划。",
         "/status：查看飞书适配器、MAIN 和工作区状态。",
         "/stop：停止当前生成，并清空远程队列。",
         "远程审批会以交互式卡片出现，请直接点击卡片按钮允许或拒绝工具执行。",
@@ -1466,6 +1472,7 @@ export default function SettingsModal({
   const [cloudDraftServer, setCloudDraftServer] = useState<any | null>(null);
   const [cloudDraftMode, setCloudDraftMode] = useState<"saved" | "new" | null>(null);
   const [isCloudAdvancedOpen, setIsCloudAdvancedOpen] = useState(false);
+  const [isLocalAdvancedOpen, setIsLocalAdvancedOpen] = useState(false);
   const [cloudAuthBusy, setCloudAuthBusy] = useState(false);
   const [cloudAuthSession, setCloudAuthSession] = useState<any | null>(null);
   const [cloudAuthMsg, setCloudAuthMsg] = useState<{ text: string; type: 'success' | 'warning' | 'error' } | null>(null);
@@ -1487,6 +1494,7 @@ export default function SettingsModal({
   const [appIconApplyMsg, setAppIconApplyMsg] = useState<{ text: string; type: 'warning' } | null>(null);
   const [isApplyingAppIcon, setIsApplyingAppIcon] = useState(false);
   const hasAutoFetched = useRef(false);
+  const skipNextLocalModelAutoPickRef = useRef(false);
   const cloudDraftServerRef = useRef<any | null>(null);
   const language = config.language === "en" ? "en" : "zh";
   const copy = {
@@ -1615,11 +1623,21 @@ export default function SettingsModal({
 
   const handleProviderChange = (e) => {
     const provider = e.target.value;
+    skipNextLocalModelAutoPickRef.current = true;
     let endpoint = config.local.endpoint;
     if (provider === "LM Studio") endpoint = "http://127.0.0.1:1234/v1";
     if (provider === "Ollama") endpoint = "http://127.0.0.1:11434/v1";
     if (provider === "OMLX") endpoint = "http://127.0.0.1:8000/v1";
-    setConfig({ ...config, local: { ...config.local, provider, endpoint, model: "" } });
+    setConfig({
+      ...config,
+      local: {
+        ...config.local,
+        provider,
+        endpoint,
+        model: "",
+        toolProtocol: getDefaultLocalToolProtocol(provider),
+      },
+    });
   };
 
   const getVramEstimate = (tokens) => {
@@ -1680,9 +1698,10 @@ export default function SettingsModal({
 
         if (models.length > 0) {
           setAvailableModels(models);
-          if (!models.includes(config.local.model)) {
+          if (!skipNextLocalModelAutoPickRef.current && !models.includes(config.local.model)) {
             setConfig(prev => ({ ...prev, local: { ...prev.local, model: models[0] } }));
           }
+          skipNextLocalModelAutoPickRef.current = false;
           setLocalFetchMsg({ text: copy.discoveredModels(models.length), type: 'success' });
           setIsFetchingModels(false);
           return;
@@ -1693,6 +1712,7 @@ export default function SettingsModal({
     }
 
     setAvailableModels([]);
+    skipNextLocalModelAutoPickRef.current = false;
     setLocalFetchMsg({ text: copy.localFetchError, type: 'error' });
     setIsFetchingModels(false);
   }, [config, copy]);
@@ -3045,7 +3065,7 @@ export default function SettingsModal({
                 </div>
                 <div>
                   <label className="block text-[13px] font-bold text-[#e4e4e7] mb-2">{copy.providerEngine}</label>
-                  <select value={config.local.provider} onChange={handleProviderChange} className={settingsSelectClass}>
+                  <select data-testid="local-provider-select" value={config.local.provider} onChange={handleProviderChange} className={settingsSelectClass}>
                     <option value="LM Studio">LM Studio</option>
                     <option value="Ollama">Ollama</option>
                     <option value="OMLX">OMLX (MLX for Mac)</option>
@@ -3053,7 +3073,7 @@ export default function SettingsModal({
                 </div>
                 <div>
                   <label className="block text-[13px] font-bold text-[#e4e4e7] mb-2">{copy.apiEndpoint}</label>
-                  <input type="text" value={config.local.endpoint} onChange={(e) => setConfig({ ...config, local: { ...config.local, endpoint: e.target.value } })} className="w-full bg-[#000000] border border-[#27272a] rounded-md p-2.5 text-[14px] text-white focus:outline-none theme-ring font-mono" />
+                  <input data-testid="local-endpoint-input" type="text" value={config.local.endpoint} onChange={(e) => setConfig({ ...config, local: { ...config.local, endpoint: e.target.value } })} className="w-full bg-[#000000] border border-[#27272a] rounded-md p-2.5 text-[14px] text-white focus:outline-none theme-ring font-mono" />
                 </div>
                 {config.local.provider === "OMLX" && (
                   <div>
@@ -3067,11 +3087,52 @@ export default function SettingsModal({
                     />
                   </div>
                 )}
+                <details
+                  data-testid="local-advanced-compatibility"
+                  open={isLocalAdvancedOpen}
+                  onToggle={(e) => setIsLocalAdvancedOpen((e.currentTarget as HTMLDetailsElement).open)}
+                  className="group rounded-md border border-[#27272a] bg-[#09090b] p-3 [&>summary::-webkit-details-marker]:hidden"
+                >
+                  <summary style={{ listStyle: "none" }} className="flex cursor-pointer select-none items-center justify-between gap-3">
+                    <span className="min-w-0">
+                      <span className="block text-[13px] font-bold text-[#e4e4e7]">{copy.advancedCompatibility}</span>
+                      <span className="mt-1 block text-[11.5px] text-[#71717a]">{copy.advancedCompatibilityDesc}</span>
+                    </span>
+                    <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-[#27272a] bg-[#000000] text-[#a1a1aa] transition-colors">
+                      {isLocalAdvancedOpen ? <IconChevronUp className="h-4 w-4" /> : <IconChevronDown className="h-4 w-4" />}
+                    </span>
+                  </summary>
+                  <div className="mt-4 space-y-4">
+                    <div>
+                      <label className="mb-2 block text-[13px] font-bold text-[#e4e4e7]">{copy.toolProtocol}</label>
+                      <p className="mb-2 text-[11.5px] text-[#71717a]">
+                        {config.local.provider === "Ollama" ? copy.localToolProtocolOllamaHint : copy.toolProtocolDesc}
+                      </p>
+                      <select
+                        data-testid="local-tool-protocol-select"
+                        value={normalizeLocalToolProtocol(config.local.toolProtocol, config.local.provider)}
+                        onChange={(e) => setConfig({
+                          ...config,
+                          local: {
+                            ...config.local,
+                            toolProtocol: normalizeLocalToolProtocol(e.target.value, config.local.provider),
+                          },
+                        })}
+                        className={settingsSelectClass}
+                      >
+                        <option value="auto">Auto</option>
+                        <option value="native">Native</option>
+                        <option value="xml">{config.local.provider === "Ollama" ? "XML / Text Tools" : "XML"}</option>
+                      </select>
+                    </div>
+                  </div>
+                </details>
                 {/* Auto-detected model selector */}
                 <div>
                   <label className="block text-[13px] font-bold text-[#e4e4e7] mb-2">{copy.localModel}</label>
                   <div className="flex gap-2">
                     <select
+                      data-testid="local-model-select"
                       value={config.local.model || ""}
                       onChange={(e) => setConfig({ ...config, local: { ...config.local, model: e.target.value } })}
                       disabled={isFetchingModels}
@@ -3082,7 +3143,10 @@ export default function SettingsModal({
                       ) : availableModels.length === 0 ? (
                         <option value="">{copy.noModels}</option>
                       ) : (
-                        availableModels.map(m => (<option key={m} value={m}>{m}</option>))
+                        <>
+                          <option value="">{copy.localModelUnselected}</option>
+                          {availableModels.map(m => (<option key={m} value={m}>{m}</option>))}
+                        </>
                       )}
                     </select>
                     <button

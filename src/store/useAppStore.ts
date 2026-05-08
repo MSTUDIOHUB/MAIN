@@ -72,6 +72,8 @@ import {
   extractAnthropicResponseText,
   normalizeCloudApiFormat,
   normalizeCloudProtocol,
+  normalizeLocalToolProtocol,
+  type CloudToolProtocol,
 } from "../lib/cloudProtocol";
 import {
   createDefaultCloudConfig,
@@ -197,6 +199,48 @@ function logStoreEvent(event: string, data: Record<string, unknown> = {}) {
 
 function nowMs() {
   return typeof performance !== "undefined" ? performance.now() : Date.now();
+}
+
+type SessionAutoApproveScope = "workspace_write" | "shell";
+
+const SESSION_AUTO_APPROVE_SCOPE_SET = new Set<SessionAutoApproveScope>(["workspace_write", "shell"]);
+const DEFAULT_SESSION_AUTO_APPROVE_SCOPES: SessionAutoApproveScope[] = ["workspace_write", "shell"];
+
+function normalizeSessionAutoApproveScopes(value: unknown): SessionAutoApproveScope[] {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<SessionAutoApproveScope>();
+  const scopes: SessionAutoApproveScope[] = [];
+  for (const item of value) {
+    if (typeof item !== "string") continue;
+    if (!SESSION_AUTO_APPROVE_SCOPE_SET.has(item as SessionAutoApproveScope)) continue;
+    const scope = item as SessionAutoApproveScope;
+    if (seen.has(scope)) continue;
+    seen.add(scope);
+    scopes.push(scope);
+  }
+  return scopes;
+}
+
+function buildSessionAutoApproveScopes(enabled: boolean): SessionAutoApproveScope[] {
+  return enabled ? [...DEFAULT_SESSION_AUTO_APPROVE_SCOPES] : [];
+}
+
+function resolveSessionAutoApproveScopeForToolCall(toolCall: {
+  name: string;
+  risk?: string;
+}): SessionAutoApproveScope | null {
+  if (toolCall.risk === "local_file_read") return null;
+  if (toolCall.name === "write_file" || toolCall.name === "replace_in_file") return "workspace_write";
+  if (toolCall.name === "run_command" || toolCall.name === "execute_command" || toolCall.name === "send_pty_input") return "shell";
+  return null;
+}
+
+function shouldSessionAutoApproveToolCall(
+  toolCall: { name: string; risk?: string },
+  scopes: SessionAutoApproveScope[],
+): boolean {
+  const scope = resolveSessionAutoApproveScopeForToolCall(toolCall);
+  return !!scope && scopes.includes(scope);
 }
 
 // ── i18n ────────────────────────────────────────────────────────────
@@ -533,6 +577,8 @@ export interface SessionRuntimeSnapshot {
   transcriptPartial?: boolean;
   transcriptLoadedTurns?: number;
   transcriptTotalTurns?: number;
+  autoApproveTools?: boolean;
+  autoApproveToolScopes?: SessionAutoApproveScope[];
 }
 
 export interface SessionRuntimeState extends SessionRuntimeSnapshot {
@@ -545,6 +591,7 @@ export interface SessionRuntimeState extends SessionRuntimeSnapshot {
   pendingRunDecisionResolver:
     | ((choice: "approve_once" | "approve_thread" | "cancel") => void)
     | null;
+  autoApproveTools: boolean;
   currentTurnExecutionConsent: { turnId: string | null; granted: boolean };
   approvedLocalFileReadPaths: string[];
   readOnlyAutoApproveForSession: boolean;
@@ -558,6 +605,7 @@ export interface SessionRuntimeState extends SessionRuntimeSnapshot {
   pendingReviewResolve: ((decision: ReviewDecision) => void) | null;
   pendingReviewTaskId: number | null;
   pendingToolCall: { name: string; arguments: Record<string, unknown>; localFileReadPath?: string } | null;
+  autoApproveToolScopes: SessionAutoApproveScope[];
   showFilePanel: boolean;
   fileViewerPath: string;
   fileViewerContent: string;
@@ -601,6 +649,7 @@ export interface LocalConfig {
   model: string;
   contextLimit: number;
   apiKey: string;
+  toolProtocol?: CloudToolProtocol;
 }
 
 export type CloudConfig = CloudProfileConfig;
@@ -981,6 +1030,7 @@ interface AppState {
   pendingReviewTaskId: number | null;
   pendingToolCall: { name: string; arguments: Record<string, unknown>; localFileReadPath?: string } | null;
   autoApproveTools: boolean;
+  autoApproveToolScopes: SessionAutoApproveScope[];
   currentTurnExecutionConsent: { turnId: string | null; granted: boolean };
   approvedLocalFileReadPaths: string[];
   readOnlyAutoApproveForSession: boolean;
@@ -1076,7 +1126,7 @@ const defaultConfig: AppConfig = {
   chatFontSize: 13,
   thoughtDisplayMode: "hidden",
   sessionRecordingEnabled: true,
-  local: { provider: "OMLX", endpoint: "http://127.0.0.1:8080/v1", model: "", contextLimit: 16384, apiKey: "" },
+  local: { provider: "OMLX", endpoint: "http://127.0.0.1:8080/v1", model: "", contextLimit: 16384, apiKey: "", toolProtocol: "auto" },
   cloud: defaultCloudState.cloud,
   cloudServers: defaultCloudState.cloudServers,
   activeCloudServerId: defaultCloudState.activeCloudServerId,
@@ -1084,6 +1134,34 @@ const defaultConfig: AppConfig = {
   imAdapters: createDefaultImAdaptersConfig(),
   workspace: "",
 };
+
+function normalizeLocalConfig(
+  input?: Partial<LocalConfig> | null,
+  fallback: LocalConfig = defaultConfig.local,
+): LocalConfig {
+  const provider = typeof input?.provider === "string" && input.provider.trim()
+    ? input.provider
+    : fallback.provider;
+  const endpoint = typeof input?.endpoint === "string" ? input.endpoint : fallback.endpoint;
+  const model = typeof input?.model === "string" ? input.model : fallback.model;
+  const contextLimit = typeof input?.contextLimit === "number" && Number.isFinite(input.contextLimit)
+    ? input.contextLimit
+    : fallback.contextLimit;
+  const apiKey = typeof input?.apiKey === "string" ? input.apiKey : fallback.apiKey;
+  const hasStoredToolProtocol = !!input && Object.prototype.hasOwnProperty.call(input, "toolProtocol");
+
+  return {
+    provider,
+    endpoint,
+    model,
+    contextLimit,
+    apiKey,
+    toolProtocol: normalizeLocalToolProtocol(
+      hasStoredToolProtocol ? input?.toolProtocol : undefined,
+      provider,
+    ),
+  };
+}
 
 const defaultSkills: Skill[] = [];
 
@@ -1288,6 +1366,12 @@ function normalizeSessionRuntimeSnapshot(
       (snapshot as Partial<SessionRuntimeSnapshot> & { selectedAgentKey?: string }).selectedNexusModeKey ||
       (snapshot as Partial<SessionRuntimeSnapshot> & { selectedAgentKey?: string }).selectedAgentKey,
   );
+  const normalizedAutoApproveToolScopes = normalizeSessionAutoApproveScopes(snapshot.autoApproveToolScopes);
+  const effectiveAutoApproveToolScopes = normalizedAutoApproveToolScopes.length > 0
+    ? normalizedAutoApproveToolScopes
+    : snapshot.autoApproveTools === true
+    ? buildSessionAutoApproveScopes(true)
+    : [];
   const taskFlow = sanitizeTaskBlocksForPersist(snapshot.taskFlow || []);
   return {
     taskFlow,
@@ -1318,6 +1402,8 @@ function normalizeSessionRuntimeSnapshot(
     transcriptPartial: snapshot.transcriptPartial === true,
     transcriptLoadedTurns: Math.max(0, Number(snapshot.transcriptLoadedTurns) || 0),
     transcriptTotalTurns: Math.max(0, Number(snapshot.transcriptTotalTurns) || 0),
+    autoApproveTools: effectiveAutoApproveToolScopes.length > 0,
+    autoApproveToolScopes: effectiveAutoApproveToolScopes,
   };
 }
 
@@ -1354,6 +1440,8 @@ const sessionRuntimeKeys = [
   "lockedComposerIntent",
   "pendingRunDecision",
   "pendingRunDecisionResolver",
+  "autoApproveTools",
+  "autoApproveToolScopes",
   "currentTurnExecutionConsent",
   "approvedLocalFileReadPaths",
   "readOnlyAutoApproveForSession",
@@ -1397,6 +1485,11 @@ function createSessionRuntimeFromState(state: Partial<AppState>): SessionRuntime
   const selectedMainModeKey = mapLegacyNexusModeToMainMode(
     state.selectedMainModeKey || state.selectedNexusModeKey,
   );
+  const normalizedAutoApproveToolScopes = (() => {
+    const scopes = normalizeSessionAutoApproveScopes(state.autoApproveToolScopes);
+    if (scopes.length > 0) return scopes;
+    return state.autoApproveTools === true ? buildSessionAutoApproveScopes(true) : [];
+  })();
   return {
     taskFlow: Array.isArray(state.taskFlow) ? state.taskFlow : [],
     agentMessages: Array.isArray(state.agentMessages) ? state.agentMessages : [],
@@ -1432,6 +1525,8 @@ function createSessionRuntimeFromState(state: Partial<AppState>): SessionRuntime
     lockedComposerIntent: state.lockedComposerIntent ?? null,
     pendingRunDecision: state.pendingRunDecision ?? null,
     pendingRunDecisionResolver: state.pendingRunDecisionResolver ?? null,
+    autoApproveTools: normalizedAutoApproveToolScopes.length > 0,
+    autoApproveToolScopes: normalizedAutoApproveToolScopes,
     currentTurnExecutionConsent: state.currentTurnExecutionConsent || { turnId: null, granted: false },
     approvedLocalFileReadPaths: Array.isArray(state.approvedLocalFileReadPaths)
       ? state.approvedLocalFileReadPaths.filter((path): path is string => typeof path === "string" && path.trim().length > 0)
@@ -2895,12 +2990,18 @@ function normalizeSkillContent(content: string): string {
 export const useAppStore = create<AppState>()(
   persist(
     (set, get) => ({
-  // Config
-  config: defaultConfig,
-  setConfig: (patch) =>
-    set((s) => ({
-      config: typeof patch === "function" ? patch(s.config) : { ...s.config, ...patch },
-    })),
+	  // Config
+	  config: defaultConfig,
+	  setConfig: (patch) =>
+	    set((s) => {
+	      const nextConfig = typeof patch === "function" ? patch(s.config) : { ...s.config, ...patch };
+	      return {
+	        config: {
+	          ...nextConfig,
+	          local: normalizeLocalConfig(nextConfig.local, s.config.local),
+	        },
+	      };
+	    }),
 
   // Chat
   messages: [],
@@ -3203,6 +3304,7 @@ export const useAppStore = create<AppState>()(
         set({
           executionConsentPolicy: "auto_thread",
           autoApproveTools: true,
+          autoApproveToolScopes: buildSessionAutoApproveScopes(true),
           currentTurnExecutionConsent: {
             turnId: pending.turnId ?? state.currentTurnId,
             granted: true,
@@ -3752,6 +3854,8 @@ export const useAppStore = create<AppState>()(
         currentWorkspace: "",
         config: { ...s.config, workspace: "" },
         sessionHookCache: [],
+        autoApproveTools: false,
+        autoApproveToolScopes: [],
         approvedLocalFileReadPaths: [],
         readOnlyAutoApproveForSession: false,
         showWorkspaceTreePanel: false,
@@ -3785,6 +3889,8 @@ export const useAppStore = create<AppState>()(
         activeSessionByWorkspace,
         config: { ...s.config, workspace: normalizedPath },
         sessionHookCache: [],
+        autoApproveTools: false,
+        autoApproveToolScopes: [],
         approvedLocalFileReadPaths: [],
         readOnlyAutoApproveForSession: false,
       };
@@ -3870,7 +3976,14 @@ export const useAppStore = create<AppState>()(
           : s.activeSessionByWorkspace,
         currentSessionId: isCurrentSession ? nextSessionId : s.currentSessionId,
         runtimeBySessionKey,
-        ...(isCurrentSession ? { approvedLocalFileReadPaths: [], readOnlyAutoApproveForSession: false } : {}),
+        ...(isCurrentSession
+          ? {
+              autoApproveTools: false,
+              autoApproveToolScopes: [],
+              approvedLocalFileReadPaths: [],
+              readOnlyAutoApproveForSession: false,
+            }
+          : {}),
       };
     });
   },
@@ -3911,6 +4024,7 @@ export const useAppStore = create<AppState>()(
         ...s.activeSessionByWorkspace,
         [resolveSessionWorkspaceKey(s.currentWorkspace)]: id,
       },
+      ...(s.currentSessionId !== id ? { autoApproveTools: false, autoApproveToolScopes: [] } : {}),
       ...(s.currentSessionId !== id ? { readOnlyAutoApproveForSession: false } : {}),
       ...(s.currentSessionId !== id ? { approvedLocalFileReadPaths: [] } : {}),
     })),
@@ -4095,6 +4209,8 @@ export const useAppStore = create<AppState>()(
         pendingRunDecisionResolver: null,
         executionConsentPolicy: "ask_per_turn",
         currentTurnExecutionConsent: { turnId: null, granted: false },
+        autoApproveTools: false,
+        autoApproveToolScopes: [],
         approvedLocalFileReadPaths: [],
         readOnlyAutoApproveForSession: false,
         planArtifacts: [],
@@ -4149,6 +4265,8 @@ export const useAppStore = create<AppState>()(
       pendingRunDecisionResolver: null,
       executionConsentPolicy: "ask_per_turn",
       currentTurnExecutionConsent: { turnId: null, granted: false },
+      autoApproveTools: false,
+      autoApproveToolScopes: [],
       approvedLocalFileReadPaths: [],
       readOnlyAutoApproveForSession: false,
       resolvedInstructionSet: null,
@@ -4443,11 +4561,16 @@ export const useAppStore = create<AppState>()(
   pendingReviewTaskId: null,
   pendingToolCall: null,
   autoApproveTools: false,
+  autoApproveToolScopes: [],
   approvedLocalFileReadPaths: [],
   readOnlyAutoApproveForSession: false,
   currentTurnExecutionConsent: { turnId: null, granted: false },
   pendingRunDecisionResolver: null,
-  setAutoApproveTools: (v) => set({ autoApproveTools: v }),
+  setAutoApproveTools: (v) =>
+    set({
+      autoApproveTools: v,
+      autoApproveToolScopes: v ? buildSessionAutoApproveScopes(true) : [],
+    }),
   setReadOnlyAutoApproveForSession: (v) => set({ readOnlyAutoApproveForSession: v }),
   setAgentStatus: (s) => set({ agentStatus: s }),
   resolveReview: (action) => {
@@ -4470,7 +4593,10 @@ export const useAppStore = create<AppState>()(
     const state = get();
     const pendingLocalFileReadPath = normalizeLocalFileReadPath(state.pendingToolCall?.localFileReadPath);
     if (!pendingLocalFileReadPath) {
-      set({ autoApproveTools: true });
+      set({
+        autoApproveTools: true,
+        autoApproveToolScopes: buildSessionAutoApproveScopes(true),
+      });
     }
     if (state.pendingReviewTaskId != null) {
       get().allowToolAction(state.pendingReviewTaskId);
@@ -4580,6 +4706,7 @@ export const useAppStore = create<AppState>()(
       pendingToolCall: null,
       pendingFeishuApprovals: [],
       autoApproveTools: false,
+      autoApproveToolScopes: [],
       approvedLocalFileReadPaths: [],
       readOnlyAutoApproveForSession: false,
       currentTurnExecutionConsent: { turnId: null, granted: false },
@@ -5252,6 +5379,8 @@ export const useAppStore = create<AppState>()(
           ],
         },
         currentSessionId: autoSessionId,
+        autoApproveTools: false,
+        autoApproveToolScopes: [],
         approvedLocalFileReadPaths: [],
         readOnlyAutoApproveForSession: false,
       }));
@@ -7688,17 +7817,22 @@ export const useAppStore = create<AppState>()(
          * resolver + tool call info. The loop pauses until the user
          * clicks Allow & Run or Reject on the Action Card.
          *
-         * If autoApproveTools is true, auto-executes without creating
+         * If session auto-approve scopes include this tool class
+         * (workspace_write/shell), auto-executes without creating
          * a pending card, resolving immediately as "accept".
          */
         requestReview: (toolCall) => {
           const toolTarget = getToolTarget(toolCall.name, toolCall.arguments);
           const isLocalFileReadApproval =
             toolCall.risk === "local_file_read" && !!toolCall.localFileReadPath;
+          const autoApproveScopes = normalizeSessionAutoApproveScopes(sessionGet().autoApproveToolScopes);
           // ── Auto-approve path ──
           // External local file reads always require first-use approval, even
           // when the session-wide command auto-approval toggle is enabled.
-          if (sessionGet().autoApproveTools && !isLocalFileReadApproval) {
+          if (
+            !isLocalFileReadApproval &&
+            shouldSessionAutoApproveToolCall(toolCall, autoApproveScopes)
+          ) {
             return Promise.resolve({ action: "accept" });
           }
           const isEphemeralPlanArtifactTool =
@@ -7753,7 +7887,11 @@ export const useAppStore = create<AppState>()(
                 return decision;
               }
 
-              if (sessionGet().autoApproveTools && !isLocalFileReadApproval) {
+              const latestScopes = normalizeSessionAutoApproveScopes(sessionGet().autoApproveToolScopes);
+              if (
+                !isLocalFileReadApproval &&
+                shouldSessionAutoApproveToolCall(toolCall, latestScopes)
+              ) {
                 return { action: "accept" } as ReviewDecision;
               }
 
@@ -8115,6 +8253,10 @@ export const useAppStore = create<AppState>()(
         cloudServers: persistedState.config?.cloudServers,
         activeCloudServerId: persistedState.config?.activeCloudServerId,
       });
+      const localConfig = normalizeLocalConfig(
+        persistedState.config?.local,
+        current.config.local,
+      );
       const hydratedTaskFlow = hasHydratedCurrentSession
         ? sanitizeTaskBlocksForPersist(persistedState.taskFlow || [])
         : [];
@@ -8124,10 +8266,7 @@ export const useAppStore = create<AppState>()(
         config: {
           ...current.config,
           ...(persistedState.config ?? {}),
-          local: {
-            ...current.config.local,
-            ...(persistedState.config?.local ?? {}),
-          },
+          local: localConfig,
           cloud: cloudState.cloud,
           cloudServers: cloudState.cloudServers,
           activeCloudServerId: cloudState.activeCloudServerId,
@@ -8201,6 +8340,7 @@ export const useAppStore = create<AppState>()(
         pendingReviewTaskId: null,
         pendingToolCall: null,
         autoApproveTools: false,
+        autoApproveToolScopes: [],
         readOnlyAutoApproveForSession: false,
         pendingRunDecision: null,
         pendingRunDecisionResolver: null,

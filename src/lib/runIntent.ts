@@ -263,8 +263,9 @@ const STRONG_PLAN_PATTERNS = [
 ];
 
 const STRONG_EXECUTE_PATTERNS = [
+  /(?:帮我|请|直接|现在)?(?:修改|改一下|改动|处理一下)(?:这个|该|当前)?(?:功能|逻辑|问题|模块|文件)?/i,
   /直接(?:改|做|实现|修|写|上手|处理)/i,
-  /帮我(?:实现|修复|改掉|补上|落地)/i,
+  /帮我(?:实现|修复|修改|改掉|补上|落地)/i,
   /现在就(?:做|改|实现|修复)/i,
   /(?:完成|继续)(?:修改|实现|执行|处理)/i,
   /(?:根据|按照|按).{0,24}(?:design\.md|设计方案|方案).{0,48}(?:完成修改|开始执行|继续执行|执行|实现|落地|修改)/i,
@@ -421,6 +422,7 @@ export interface MainIntentShortcutItem {
   description: string;
   category: RunIntentUiCategory;
   aliases: string[];
+  visibleInMenu: boolean;
 }
 
 export type ComposerIntentSuggestionKind = "suggestion" | "explicit_conflict";
@@ -445,6 +447,7 @@ const MAIN_INTENT_SHORTCUTS_ZH: MainIntentShortcutItem[] = [
     description: RUN_INTENT_POLICIES.plan.description.zh,
     category: RUN_INTENT_POLICIES.plan.uiCategory,
     aliases: ["plan", "规划", "方案", "spec", "roadmap"],
+    visibleInMenu: true,
   },
   {
     intent: "execute",
@@ -453,6 +456,7 @@ const MAIN_INTENT_SHORTCUTS_ZH: MainIntentShortcutItem[] = [
     description: RUN_INTENT_POLICIES.execute.description.zh,
     category: RUN_INTENT_POLICIES.execute.uiCategory,
     aliases: ["execute", "implement", "实现", "处理", "修复"],
+    visibleInMenu: false,
   },
   {
     intent: "report",
@@ -461,6 +465,7 @@ const MAIN_INTENT_SHORTCUTS_ZH: MainIntentShortcutItem[] = [
     description: RUN_INTENT_POLICIES.report.description.zh,
     category: RUN_INTENT_POLICIES.report.uiCategory,
     aliases: ["report", "汇报", "分析报告"],
+    visibleInMenu: true,
   },
   {
     intent: "analyze",
@@ -469,6 +474,7 @@ const MAIN_INTENT_SHORTCUTS_ZH: MainIntentShortcutItem[] = [
     description: RUN_INTENT_POLICIES.analyze.description.zh,
     category: RUN_INTENT_POLICIES.analyze.uiCategory,
     aliases: ["analyze", "检查", "验证", "诊断", "review", "inspect"],
+    visibleInMenu: true,
   },
   {
     intent: "summarize",
@@ -477,6 +483,7 @@ const MAIN_INTENT_SHORTCUTS_ZH: MainIntentShortcutItem[] = [
     description: RUN_INTENT_POLICIES.summarize.description.zh,
     category: RUN_INTENT_POLICIES.summarize.uiCategory,
     aliases: ["summary", "summarize", "摘要", "概括", "归纳"],
+    visibleInMenu: true,
   },
 ];
 
@@ -488,6 +495,7 @@ const MAIN_INTENT_SHORTCUTS_EN: MainIntentShortcutItem[] = [
     description: RUN_INTENT_POLICIES.plan.description.en,
     category: RUN_INTENT_POLICIES.plan.uiCategory,
     aliases: ["计划", "规划", "方案", "spec", "roadmap"],
+    visibleInMenu: true,
   },
   {
     intent: "execute",
@@ -496,6 +504,7 @@ const MAIN_INTENT_SHORTCUTS_EN: MainIntentShortcutItem[] = [
     description: RUN_INTENT_POLICIES.execute.description.en,
     category: RUN_INTENT_POLICIES.execute.uiCategory,
     aliases: ["执行", "实现", "处理", "修复", "implement"],
+    visibleInMenu: false,
   },
   {
     intent: "report",
@@ -504,6 +513,7 @@ const MAIN_INTENT_SHORTCUTS_EN: MainIntentShortcutItem[] = [
     description: RUN_INTENT_POLICIES.report.description.en,
     category: RUN_INTENT_POLICIES.report.uiCategory,
     aliases: ["报告", "汇报", "analysis report"],
+    visibleInMenu: true,
   },
   {
     intent: "analyze",
@@ -512,6 +522,7 @@ const MAIN_INTENT_SHORTCUTS_EN: MainIntentShortcutItem[] = [
     description: RUN_INTENT_POLICIES.analyze.description.en,
     category: RUN_INTENT_POLICIES.analyze.uiCategory,
     aliases: ["分析", "检查", "验证", "诊断", "review", "inspect"],
+    visibleInMenu: true,
   },
   {
     intent: "summarize",
@@ -520,6 +531,7 @@ const MAIN_INTENT_SHORTCUTS_EN: MainIntentShortcutItem[] = [
     description: RUN_INTENT_POLICIES.summarize.description.en,
     category: RUN_INTENT_POLICIES.summarize.uiCategory,
     aliases: ["总结", "摘要", "概括", "归纳", "summary"],
+    visibleInMenu: true,
   },
 ];
 
@@ -808,8 +820,12 @@ function finalizeRunIntentResolution(
   };
 }
 
-export function getMainIntentShortcuts(language: "zh" | "en" = "zh"): MainIntentShortcutItem[] {
-  return language === "en" ? MAIN_INTENT_SHORTCUTS_EN : MAIN_INTENT_SHORTCUTS_ZH;
+export function getMainIntentShortcuts(
+  language: "zh" | "en" = "zh",
+  options: { includeHidden?: boolean } = {},
+): MainIntentShortcutItem[] {
+  const shortcuts = language === "en" ? MAIN_INTENT_SHORTCUTS_EN : MAIN_INTENT_SHORTCUTS_ZH;
+  return options.includeHidden ? shortcuts : shortcuts.filter((item) => item.visibleInMenu);
 }
 
 export function getIntentPolicy(intent: ResolvedUserIntent): RunIntentPolicy {
@@ -869,8 +885,8 @@ function createOption(intent: ResolvedUserIntent, language: "zh" | "en"): Pendin
       valueEn: "Let's discuss the goal first before doing anything else.",
     },
     plan: {
-      zh: "进入计划模式",
-      en: "Enter Planning",
+      zh: "先给方案",
+      en: "Plan First",
       valueZh: "先给我一个方案和计划，再决定是否执行",
       valueEn: "Please create a plan first before execution.",
     },

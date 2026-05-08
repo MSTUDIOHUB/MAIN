@@ -43,6 +43,9 @@ export function isProviderCompatibilityErrorMessage(message: string): boolean {
     normalized.includes("unknown parameter") ||
     normalized.includes("unrecognized request argument") ||
     normalized.includes("unrecognized field") ||
+    normalized.includes("invalid 'messages'") ||
+    normalized.includes('invalid "messages"') ||
+    normalized.includes("invalid messages") ||
     normalized.includes("messages[") ||
     normalized.includes("tool_calls") ||
     normalized.includes("\"tools\"") ||
@@ -56,6 +59,9 @@ export function isNativeToolCompatibilityErrorMessage(message: string): boolean 
   if (!isProviderCompatibilityErrorMessage(normalized)) return false;
   return (
     normalized.includes("tool_calls") ||
+    normalized.includes("invalid 'messages'") ||
+    normalized.includes('invalid "messages"') ||
+    normalized.includes("invalid messages") ||
     normalized.includes("\"tools\"") ||
     normalized.includes("'tools'") ||
     normalized.includes(" tools ") ||
@@ -104,7 +110,7 @@ function buildProviderCompatibilityInstructionText(
       "<tool>read_file</tool>",
       "<parameter name=\"path\">src/foo.ts</parameter>",
       "</tool_use>",
-      "Because this is chat mode, only use read-only tools unless the user explicitly switches to implementation/planning mode.",
+      "Because this runtime is read-oriented, keep tools read-only unless the user clearly asks for implementation, file changes, or command execution.",
     ].join("\n");
   }
 

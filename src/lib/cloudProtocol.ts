@@ -324,6 +324,19 @@ export function normalizeCloudToolProtocol(value: unknown): CloudToolProtocol {
   return value === "native" || value === "xml" ? value : "auto";
 }
 
+export function getDefaultLocalToolProtocol(provider: unknown): CloudToolProtocol {
+  const normalized = String(provider || "").trim().toLowerCase();
+  if (normalized === "lm studio") return "xml";
+  if (normalized === "ollama") return "xml";
+  return "auto";
+}
+
+export function normalizeLocalToolProtocol(value: unknown, provider: unknown): CloudToolProtocol {
+  return value === "native" || value === "xml" || value === "auto"
+    ? value
+    : getDefaultLocalToolProtocol(provider);
+}
+
 export function normalizeCloudAuthMode(value: unknown): CloudAuthMode {
   if (value === "openai_chatgpt_oauth" || value === "gemini_google_oauth") return value;
   return "api_key";

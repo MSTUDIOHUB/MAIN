@@ -153,6 +153,32 @@ test("cloud settings hides sampling params and keeps advanced compatibility coll
   await expect(page.getByText("Additional Headers (JSON)")).toBeVisible();
 });
 
+test("local settings exposes tool protocol and resets endpoint/model/protocol on provider switch", async ({ page }) => {
+  await page.goto("/?e2eScenario=cloud-settings-model-select");
+
+  await page.getByTestId("settings-tab-local").click();
+  await expect(page.getByTestId("local-model-select")).toBeVisible();
+  await expect(page.getByTestId("local-model-select")).not.toHaveValue("");
+  await expect(page.getByTestId("local-advanced-compatibility")).not.toHaveAttribute("open", "");
+  await page.getByTestId("local-advanced-compatibility").locator("summary").click();
+  await expect(page.getByTestId("local-tool-protocol-select")).toHaveValue("auto");
+
+  await page.getByTestId("local-provider-select").selectOption("LM Studio");
+  await expect(page.getByTestId("local-endpoint-input")).toHaveValue("http://127.0.0.1:1234/v1");
+  await expect(page.getByTestId("local-tool-protocol-select")).toHaveValue("xml");
+  await expect(page.getByTestId("local-model-select")).toHaveValue("");
+
+  await page.getByTestId("local-provider-select").selectOption("OMLX");
+  await expect(page.getByTestId("local-endpoint-input")).toHaveValue("http://127.0.0.1:8000/v1");
+  await expect(page.getByTestId("local-tool-protocol-select")).toHaveValue("auto");
+  await expect(page.getByTestId("local-model-select")).toHaveValue("");
+
+  await page.getByTestId("local-provider-select").selectOption("Ollama");
+  await expect(page.getByTestId("local-endpoint-input")).toHaveValue("http://127.0.0.1:11434/v1");
+  await expect(page.getByTestId("local-tool-protocol-select")).toHaveValue("xml");
+  await expect(page.getByTestId("local-model-select")).toHaveValue("");
+});
+
 test("OpenAI experimental login shows status and refreshes Codex model candidates", async ({ page }) => {
   await page.goto("/?e2eScenario=cloud-settings-model-select");
   await page.evaluate(() => {

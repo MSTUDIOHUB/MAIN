@@ -199,10 +199,10 @@ const TopIsland = memo(function TopIsland({
     customChoiceSubmit: language === "zh" ? "确认" : "Confirm",
     executionConsentTitle: language === "zh" ? "允许开始执行本轮改动？" : "Allow this turn to start making changes?",
     executionConsentHint: language === "zh"
-      ? "这是本轮第一次真实写入/执行动作。确认后 MAIN 才会继续推进。"
-      : "This is the first real write/execute action in the turn. MAIN will continue only after you confirm.",
+      ? "这是本轮第一次真实写入/命令动作。确认后 MAIN 会继续；高风险操作仍逐项审查。"
+      : "This is the first real write/command action in this turn. MAIN continues after confirmation; high-risk actions still require per-step review.",
     approveExecuteOnce: language === "zh" ? "仅本轮执行" : "Allow This Turn",
-    approveThread: language === "zh" ? "本对话自动执行" : "Auto-Run In Thread",
+    approveThread: language === "zh" ? "本会话自动允许写入与命令" : "Auto-Allow Writes & Commands",
     dismiss: language === "zh" ? "取消" : "Cancel",
     cancelTurn: language === "zh" ? "结束本轮" : "End This Turn",
     taskSummary: activeProgressMode === "execution"

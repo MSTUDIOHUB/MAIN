@@ -58,6 +58,7 @@ function loadTranspiledModuleSync(sourcePath) {
 }
 
 const {
+  getMainIntentShortcuts,
   getIntentPolicy,
   inferCommandDirective,
   looksLikePreviousTurnContinuationInput,
@@ -287,6 +288,20 @@ test("MAIN intent shortcuts parse slash command and remaining prompt", () => {
     rest: "check this flow",
   });
   assert.equal(parseMainIntentShortcut("/setup-engine unity"), null);
+});
+
+test("visible shortcuts hide /执行 while parser stays backward compatible", () => {
+  const visibleZh = getMainIntentShortcuts("zh");
+  const visibleEn = getMainIntentShortcuts("en");
+  const allZh = getMainIntentShortcuts("zh", { includeHidden: true });
+
+  assert.equal(visibleZh.some((item) => item.intent === "execute"), false);
+  assert.equal(visibleEn.some((item) => item.intent === "execute"), false);
+  assert.equal(allZh.some((item) => item.intent === "execute"), true);
+
+  const parsed = parseMainIntentShortcut("/执行 直接修复这个问题");
+  assert.equal(parsed?.intent, "execute");
+  assert.equal(parsed?.command, "/执行");
 });
 
 test("hidden MDEBUG shortcut parses without entering visible intent shortcuts", () => {
