@@ -7,6 +7,7 @@ import { estimateTokens } from "../lib/contextTrim";
 import { ingestAttachmentBytes } from "../lib/ipc";
 import { useAppStore } from "../store/useAppStore";
 import type { AgentMessage, ContentPart } from "../lib/orchestrator";
+import { createWorkspaceFileIndexController } from "../lib/workspaceFileIndex";
 import { getGameStudioSlashCatalog } from "../lib/gameStudioPack";
 import { humanizeSlug } from "../lib/gameStudioCatalog";
 import { getIntentPolicy, getMainIntentShortcuts, getRunIntentCategoryLabel, getRunIntentLabel, parseMainDebugShortcut, parseMainIntentShortcut, resolveComposerIntentSuggestion } from "../lib/runIntent";
@@ -97,6 +98,11 @@ function removeSlashSessionToken(value: string, anchor: number): string {
   return value.slice(0, anchor) + value.slice(tokenEnd + trailingWhitespaceLength);
 }
 
+const workspaceFileIndexController = createWorkspaceFileIndexController(
+  (workspacePath: string) => getAllWorkspaceFiles(workspacePath),
+  { maxEntries: 8 },
+);
+
 function ExecutionProgressCard({
   tasks,
   stage,
@@ -150,8 +156,6 @@ function ExecutionProgressCard({
 }
 
 export default function Composer({
-  input,
-  setInput,
   contextMentions,
   setContextMentions,
   attachedFiles,
@@ -212,7 +216,7 @@ export default function Composer({
   const submitPendingRef = useRef(false);
   const isComposingRef = useRef(false);
   const compositionEndedAtRef = useRef(0);
-  const mentionRefreshTimerRef = useRef<number | null>(null);
+  const mentionLoadRequestIdRef = useRef(0);
 
   // ── Image paste/drop state (local to avoid large base64 in global store) ──
   const [pendingImages, setPendingImages] = useState<string[]>([]);
@@ -225,6 +229,8 @@ export default function Composer({
   const themeMode = useAppStore((s) => s.config.themeMode);
   const contextLimit = useAppStore((s) => s.config.local.contextLimit);
   const language = useAppStore((s) => s.config.language);
+  const storeInput = useAppStore((s) => s.input);
+  const setStoreInput = useAppStore((s) => s.setInput);
   const workspaceContentVersion = useAppStore((s) => s.workspaceContentVersion);
   const isPlanApproved = useAppStore((s) => s.isPlanApproved);
   const planTasks = useAppStore((s) => s.planTasks);
@@ -232,7 +238,8 @@ export default function Composer({
   const conversationTurns = useAppStore((s) => s.conversationTurns);
   const lockedComposerIntent = useAppStore((s) => s.lockedComposerIntent);
   const setLockedComposerIntent = useAppStore((s) => s.setLockedComposerIntent);
-  const [debouncedInput, setDebouncedInput] = useState(input);
+  const [draftInput, setDraftInput] = useState(storeInput);
+  const [debouncedInput, setDebouncedInput] = useState(storeInput);
   const slashCatalog = useMemo(
     () => getGameStudioSlashCatalog(language === "en" ? "en" : "zh"),
     [language],
@@ -297,7 +304,7 @@ export default function Composer({
   const currentWorkspaceOnboardingKey = currentWorkspace || "__no_workspace__";
   const composerIntentSuggestion = useMemo(() => {
     return resolveComposerIntentSuggestion({
-      input,
+      input: draftInput,
       language: language === "en" ? "en" : "zh",
       mainModeKey: selectedMainModeKey,
       lockedComposerIntent,
@@ -306,7 +313,7 @@ export default function Composer({
       planStage,
       isPlanApproved,
     });
-  }, [dismissedSuggestedIntentKey, input, isPlanApproved, language, lockedComposerIntent, planStage, planTasks.length, selectedMainModeKey]);
+  }, [dismissedSuggestedIntentKey, draftInput, isPlanApproved, language, lockedComposerIntent, planStage, planTasks.length, selectedMainModeKey]);
   const suggestedComposerIntent = composerIntentSuggestion?.intent ?? null;
   const explicitComposerIntent = composerIntentSuggestion?.explicitIntent ?? null;
   const composerIntentSuggestionKind = composerIntentSuggestion?.kind ?? null;
@@ -330,7 +337,7 @@ export default function Composer({
     hasWorkspace: Boolean(currentWorkspace),
     gameStudioInitialized,
     nonPackFileCount: nonPackFiles.length,
-    input,
+    input: draftInput,
     hasConversationHistory: conversationTurns.length > 0,
     showSlashMenu,
     dismissed: Boolean(dismissedStudioOnboardingByWorkspace[currentWorkspaceOnboardingKey]),
@@ -478,9 +485,13 @@ export default function Composer({
 
   // Debounce input for token estimation (300ms)
   useEffect(() => {
-    const timer = setTimeout(() => setDebouncedInput(input), 300);
+    const timer = setTimeout(() => setDebouncedInput(draftInput), 300);
     return () => clearTimeout(timer);
-  }, [input]);
+  }, [draftInput]);
+
+  useEffect(() => {
+    setDraftInput(storeInput || "");
+  }, [storeInput]);
 
   useEffect(() => {
     if (isStreaming && isSubmitPending) {
@@ -553,33 +564,50 @@ export default function Composer({
     ? "Cloud mode does not use the local context compression limit"
     : "云端模式不使用本地上下文压缩阈值";
 
-  // ── Load workspace files on workspace change or workspace mutations ──
-  useEffect(() => {
+  const ensureWorkspaceFilesLoaded = useCallback(async (options?: { forceRefresh?: boolean }) => {
     if (!currentWorkspace) {
       setAllFiles([]);
       setIsFilesLoading(false);
-      return;
+      return [];
     }
-    let cancelled = false;
-    const timer = window.setTimeout(() => {
-      setIsFilesLoading(true);
-      getAllWorkspaceFiles(currentWorkspace).then(files => {
-        if (!cancelled) {
-          setAllFiles(files);
-          setIsFilesLoading(false);
-        }
-      }).catch(() => {
-        if (!cancelled) {
-          setAllFiles([]);
-          setIsFilesLoading(false);
-        }
-      });
-    }, 250);
-    return () => {
-      cancelled = true;
-      window.clearTimeout(timer);
-    };
+
+    const cached = !options?.forceRefresh
+      ? workspaceFileIndexController.getCachedFiles(currentWorkspace, workspaceContentVersion)
+      : null;
+    if (cached) {
+      setAllFiles(cached);
+      setIsFilesLoading(false);
+      return cached;
+    }
+
+    const requestId = mentionLoadRequestIdRef.current + 1;
+    mentionLoadRequestIdRef.current = requestId;
+    setIsFilesLoading(true);
+    const files = await workspaceFileIndexController.ensureLoaded({
+      workspacePath: currentWorkspace,
+      contentVersion: workspaceContentVersion,
+      forceRefresh: options?.forceRefresh === true,
+    });
+    if (mentionLoadRequestIdRef.current !== requestId) {
+      return files;
+    }
+    setAllFiles(files);
+    setIsFilesLoading(false);
+    return files;
   }, [currentWorkspace, workspaceContentVersion]);
+
+  useEffect(() => {
+    setAllFiles([]);
+    setMentionResults([]);
+    setHighlightedIndex(0);
+    setIsFilesLoading(false);
+    mentionLoadRequestIdRef.current += 1;
+  }, [currentWorkspace, workspaceContentVersion]);
+
+  useEffect(() => {
+    if (!showMentionMenu) return;
+    void ensureWorkspaceFilesLoaded();
+  }, [ensureWorkspaceFilesLoaded, showMentionMenu]);
 
   // ── Fuzzy filter whenever query or allFiles change ──
   useEffect(() => {
@@ -877,8 +905,8 @@ export default function Composer({
 
     const start = ta.selectionStart;
     const end = ta.selectionEnd;
-    const before = input.slice(0, start);
-    const after = input.slice(end);
+    const before = draftInput.slice(0, start);
+    const after = draftInput.slice(end);
 
     // Only insert @ if preceded by whitespace or at start (avoid email-like)
     const charBefore = start > 0 ? before[start - 1] : " ";
@@ -886,14 +914,15 @@ export default function Composer({
 
     const insert = needSpace ? " @" : "@";
     const newValue = before + insert + after;
-    setInput(newValue);
+    setDraftInput(newValue);
+    setStoreInput(newValue, { preserveLockedComposerIntent: true });
 
     // Schedule cursor position and trigger mention menu
     const anchorPos = start + insert.length - 1; // position of the @
     mentionAnchorRef.current = anchorPos;
     setMentionQuery("");
     setShowMentionMenu(true);
-    void refreshWorkspaceFiles();
+    void ensureWorkspaceFilesLoaded();
 
     requestAnimationFrame(() => {
       ta.selectionStart = ta.selectionEnd = anchorPos + 1;
@@ -905,46 +934,12 @@ export default function Composer({
     markStudioOnboardingUsed();
     setShowSlashMenu(true);
     const textarea = textareaRef.current;
-    const cursorPos = textarea?.selectionStart ?? input.length;
-    const slashSession = getSlashSession(input, cursorPos);
+    const cursorPos = textarea?.selectionStart ?? draftInput.length;
+    const slashSession = getSlashSession(draftInput, cursorPos);
     slashAnchorRef.current = slashSession?.anchor ?? -1;
     setSlashQuery(slashSession?.query ?? "");
     textareaRef.current?.focus();
   };
-
-  const refreshWorkspaceFiles = useCallback(async () => {
-    if (!currentWorkspace) {
-      setAllFiles([]);
-      return;
-    }
-
-    setIsFilesLoading(true);
-    try {
-      const files = await getAllWorkspaceFiles(currentWorkspace);
-      setAllFiles(files);
-    } catch {
-      setAllFiles([]);
-    } finally {
-      setIsFilesLoading(false);
-    }
-  }, [currentWorkspace]);
-
-  useEffect(() => {
-    if (!showMentionMenu) return;
-    if (mentionRefreshTimerRef.current !== null) {
-      window.clearTimeout(mentionRefreshTimerRef.current);
-    }
-    mentionRefreshTimerRef.current = window.setTimeout(() => {
-      mentionRefreshTimerRef.current = null;
-      void refreshWorkspaceFiles();
-    }, 120);
-    return () => {
-      if (mentionRefreshTimerRef.current !== null) {
-        window.clearTimeout(mentionRefreshTimerRef.current);
-        mentionRefreshTimerRef.current = null;
-      }
-    };
-  }, [mentionQuery, refreshWorkspaceFiles, showMentionMenu, workspaceContentVersion]);
 
   const reopenStudioOnboarding = useCallback((options?: { resetUsed?: boolean }) => {
     setForceVisibleStudioOnboardingByWorkspace((prev) => ({
@@ -986,7 +981,8 @@ export default function Composer({
   }, [currentWorkspaceOnboardingKey]);
 
   const applyComposerDraft = useCallback((value: string) => {
-    setInput(value);
+    setDraftInput(value);
+    setStoreInput(value, { preserveLockedComposerIntent: true });
     setShowSlashMenu(false);
     setHighlightedSlashIndex(0);
     requestAnimationFrame(() => {
@@ -996,7 +992,7 @@ export default function Composer({
         textareaRef.current.focus();
       }
     });
-  }, [setInput]);
+  }, [setStoreInput]);
 
   const handleSelectSlashItem = (item) => {
     const value = item.kind === "workflow" ? `${item.canonicalCommand} ` : item.canonicalCommand;
@@ -1005,15 +1001,16 @@ export default function Composer({
   };
 
   const handleSelectMainIntentShortcut = (item) => {
-    const parsed = parseMainIntentShortcut(input);
+    const parsed = parseMainIntentShortcut(draftInput);
     const slashAnchor = slashAnchorRef.current;
     const nextInput = slashAnchor >= 0
-      ? removeSlashSessionToken(input, slashAnchor)
+      ? removeSlashSessionToken(draftInput, slashAnchor)
       : parsed
       ? parsed.rest.trimStart()
-      : input.replace(/^\s*\/[^\s]*\s*/, "");
+      : draftInput.replace(/^\s*\/[^\s]*\s*/, "");
     closeSlashMenu();
-    setInput(nextInput);
+    setDraftInput(nextInput);
+    setStoreInput(nextInput, { preserveLockedComposerIntent: true });
     setLockedComposerIntent(item.intent);
     requestAnimationFrame(() => textareaRef.current?.focus());
   };
@@ -1029,8 +1026,10 @@ export default function Composer({
       try {
         await initializeGameStudioWorkspace();
         markStudioOnboardingUsed();
-        await refreshWorkspaceFiles();
-        setInput("");
+        workspaceFileIndexController.clearWorkspace(currentWorkspace || "");
+        await ensureWorkspaceFilesLoaded({ forceRefresh: true });
+        setDraftInput("");
+        setStoreInput("");
       } catch (error) {
         console.error("Failed to initialize Game Studio workspace:", error);
       }
@@ -1052,9 +1051,11 @@ export default function Composer({
 
     try {
       await removeGameStudioWorkspace();
-      setInput("");
+      workspaceFileIndexController.clearWorkspace(currentWorkspace || "");
+      setDraftInput("");
+      setStoreInput("");
       setShowSlashMenu(false);
-      await refreshWorkspaceFiles();
+      await ensureWorkspaceFilesLoaded({ forceRefresh: true });
       reopenStudioOnboarding({ resetUsed: true });
     } catch (error) {
       console.error("Failed to remove Game Studio workspace assets:", error);
@@ -1062,8 +1063,9 @@ export default function Composer({
   };
 
   const handleSubmitComposerMessage = useCallback(() => {
+    const textToSend = draftInput;
     const hasPayload =
-      input.trim().length > 0 ||
+      textToSend.trim().length > 0 ||
       contextMentions.length > 0 ||
       attachedFiles.length > 0 ||
       pendingImages.length > 0;
@@ -1078,14 +1080,16 @@ export default function Composer({
       markStudioOnboardingUsed();
     }
     closeSlashMenu();
-    const didSend = onSendMessage(pendingImages);
+    setStoreInput(textToSend, { preserveLockedComposerIntent: true });
+    const didSend = onSendMessage(textToSend, pendingImages);
     if (didSend === false) {
       submitPendingRef.current = false;
       setIsSubmitPending(false);
       return;
     }
+    setDraftInput("");
     setPendingImages([]);
-  }, [attachedFiles.length, closeSlashMenu, contextMentions.length, input, isComposerSubmitting, isGameStudioMode, markStudioOnboardingUsed, onSendMessage, pendingImages]);
+  }, [attachedFiles.length, closeSlashMenu, contextMentions.length, draftInput, isComposerSubmitting, isGameStudioMode, markStudioOnboardingUsed, onSendMessage, pendingImages, setStoreInput]);
 
   // ── Handle textarea change (detect @ typing) ──
   const resizeTextarea = useCallback(() => {
@@ -1112,7 +1116,7 @@ export default function Composer({
 
   useEffect(() => {
     resizeTextarea();
-  }, [activeDiffTask, input, resizeTextarea]);
+  }, [activeDiffTask, draftInput, resizeTextarea]);
 
   const handleInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const value = e.target.value;
@@ -1124,9 +1128,10 @@ export default function Composer({
       nativeEvent.isComposing === true ||
       inputType.includes("composition") ||
       justFinishedComposition;
-    setInput(value, {
-      preserveLockedComposerIntent: Boolean(lockedComposerIntent && value.trim().length === 0 && isImeCompositionInput),
-    });
+    setDraftInput(value);
+    if (lockedComposerIntent && value.trim().length === 0 && !isImeCompositionInput) {
+      setLockedComposerIntent(null);
+    }
 
     const cursorPos = e.target.selectionStart ?? value.length;
     const textBeforeCursor = value.slice(0, cursorPos);
@@ -1154,8 +1159,11 @@ export default function Composer({
       if (/[\s\n]/.test(charBefore) && !textAfterAt.includes(" ")) {
         mentionAnchorRef.current = lastAtIndex;
         setMentionQuery(textAfterAt);
+        const shouldLoadWorkspaceFiles = !showMentionMenu;
         setShowMentionMenu(true);
-        void refreshWorkspaceFiles();
+        if (shouldLoadWorkspaceFiles) {
+          void ensureWorkspaceFilesLoaded();
+        }
         if (showSlashMenu) closeSlashMenu();
         return;
       }
@@ -1178,10 +1186,12 @@ export default function Composer({
     // Remove the "@query" text from the input
     const anchor = mentionAnchorRef.current;
     if (anchor >= 0) {
-      const cursorPos = textareaRef.current?.selectionStart ?? input.length;
-      const before = input.slice(0, anchor);
-      const after = input.slice(cursorPos);
-      setInput(before + after);
+      const cursorPos = textareaRef.current?.selectionStart ?? draftInput.length;
+      const before = draftInput.slice(0, anchor);
+      const after = draftInput.slice(cursorPos);
+      const nextValue = before + after;
+      setDraftInput(nextValue);
+      setStoreInput(nextValue, { preserveLockedComposerIntent: true });
 
       // Move cursor to end of insertion point
       requestAnimationFrame(() => {
@@ -1280,7 +1290,7 @@ export default function Composer({
           } else {
             handleSelectSlashItem(visibleSlashItems[highlightedSlashIndex]);
           }
-        } else if (e.key === "Enter" && !e.altKey && input.trim().startsWith("/")) {
+        } else if (e.key === "Enter" && !e.altKey && draftInput.trim().startsWith("/")) {
           handleSubmitComposerMessage();
         }
         return;
@@ -1526,7 +1536,7 @@ export default function Composer({
                 </button>
                 <button
                   type="button"
-                  onClick={() => setDismissedSuggestedIntentKey(composerIntentSuggestion?.inputKey || input.trim())}
+                  onClick={() => setDismissedSuggestedIntentKey(composerIntentSuggestion?.inputKey || draftInput.trim())}
                   className="rounded-full border border-[#27272a] px-2.5 py-1 text-[10px] text-[#a1a1aa] transition-colors hover:bg-[#18181b]"
                 >
                   {language === "en" ? "Ignore" : "忽略"}
@@ -1604,7 +1614,7 @@ export default function Composer({
               className="max-h-[36vh] min-h-[3.5rem] w-full bg-transparent border-none outline-none resize-none overflow-hidden text-[#e4e4e7] p-4 text-[13px] leading-relaxed placeholder:text-[#a1a1aa]"
               rows={activeDiffTask ? 1 : 2}
               placeholder={composerPlaceholder}
-              value={input}
+              value={draftInput}
               onChange={handleInputChange}
               onKeyDown={handleKeyDown}
               onCompositionStart={() => {
@@ -1983,7 +1993,7 @@ export default function Composer({
                 ) : (
                   <button
                     data-testid="composer-send-button"
-                    disabled={isComposerSubmitting || (!input.trim() && contextMentions.length === 0 && attachedFiles.length === 0 && pendingImages.length === 0)}
+                    disabled={isComposerSubmitting || (!draftInput.trim() && contextMentions.length === 0 && attachedFiles.length === 0 && pendingImages.length === 0)}
                     onClick={handleSubmitComposerMessage}
                     className="bg-[#09090b] border border-[#27272a] text-[#a1a1aa] hover:bg-white hover:text-black w-8 h-8 flex items-center justify-center rounded-md transition-colors disabled:opacity-50 shadow-sm"
                   >

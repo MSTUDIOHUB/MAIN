@@ -596,8 +596,6 @@ export default function App() {
   const runtimeBySessionKey = useAppStore((s) => s.runtimeBySessionKey);
 
   // ── Composer State ────────────────────────────────────────────────────
-  const input = useAppStore((s) => s.input);
-  const setInput = useAppStore((s) => s.setInput);
   const contextMentions = useAppStore((s) => s.contextMentions);
   const setContextMentions = useAppStore((s) => s.setContextMentions);
   const attachedFiles = useAppStore((s) => s.attachedFiles);
@@ -1256,9 +1254,8 @@ export default function App() {
   // ── Send Message: delegates to store's sendMessage ─────────────────────
   // This replaces the old inline handleSendMessage + runAgentLoop + 
   // executeToolCall + parseFullText + SSE parsing monolith.
-  const handleSendMessage = useCallback((images?: string[]) => {
+  const handleSendMessage = useCallback((text: string, images?: string[]) => {
     const state = useAppStore.getState();
-    const text = input;
     const contextMentionsSnapshot = [...state.contextMentions];
     const attachedFilesSnapshot = [...state.attachedFiles];
     const hasPayload =
@@ -1299,7 +1296,7 @@ export default function App() {
     });
 
     return true;
-  }, [input]);
+  }, []);
 
   const handleQuickReply = useCallback((choice: string | ReplyOption, sourceTurnId?: string) => {
     const text = typeof choice === "string" ? choice : choice.value;
@@ -3028,7 +3025,7 @@ export default function App() {
         onSelectSession={handleSelectSession}
         onDeleteSession={handleDeleteSession}
       />
-      <ChatArea taskFlow={taskFlow} t={t} config={config} setSettingsTab={setSettingsTab} setIsSettingsOpen={setIsSettingsOpen} activeDiffTask={activeDiffTask} endOfFlowRef={endOfFlowRef} isStreaming={isStreaming} activeSessionKey={activeSessionKey} onStopGeneration={handleStopGeneration} onLoadOlderSessionHistory={getCachedSessionTranscript(activeSessionKey)?.hasMore ? handleLoadOlderSessionHistory : undefined} allowToolAction={allowToolAction} rejectToolAction={rejectToolAction} autoApproveTools={autoApproveTools} onToggleAutoApprove={setAutoApproveTools} input={input} setInput={setInput} contextMentions={contextMentions} setContextMentions={setContextMentions} attachedFiles={attachedFiles} setAttachedFiles={setAttachedFiles} onAttachFile={handleAttachFile} showAgentPicker={showAgentPicker} setShowAgentPicker={setShowAgentPicker} selectedMainModeKey={selectedMainModeKey} setSelectedMainModeKey={setSelectedMainModeKey} mainModes={mainModes} activeStudioAgentKey={activeStudioAgentKey} setActiveStudioAgentKey={setActiveStudioAgentKey} gameStudioInitialized={gameStudioInitialized} initializeGameStudioWorkspace={initializeGameStudioWorkspace} removeGameStudioWorkspace={removeGameStudioWorkspace} currentWorkspace={currentWorkspace} handleAcceptInline={handleAcceptInline} handleRejectInline={handleRejectInline} onSendMessage={handleSendMessage} onQuickReply={handleQuickReply} />
+      <ChatArea taskFlow={taskFlow} t={t} config={config} setSettingsTab={setSettingsTab} setIsSettingsOpen={setIsSettingsOpen} activeDiffTask={activeDiffTask} endOfFlowRef={endOfFlowRef} isStreaming={isStreaming} activeSessionKey={activeSessionKey} onStopGeneration={handleStopGeneration} onLoadOlderSessionHistory={getCachedSessionTranscript(activeSessionKey)?.hasMore ? handleLoadOlderSessionHistory : undefined} allowToolAction={allowToolAction} rejectToolAction={rejectToolAction} autoApproveTools={autoApproveTools} onToggleAutoApprove={setAutoApproveTools} contextMentions={contextMentions} setContextMentions={setContextMentions} attachedFiles={attachedFiles} setAttachedFiles={setAttachedFiles} onAttachFile={handleAttachFile} showAgentPicker={showAgentPicker} setShowAgentPicker={setShowAgentPicker} selectedMainModeKey={selectedMainModeKey} setSelectedMainModeKey={setSelectedMainModeKey} mainModes={mainModes} activeStudioAgentKey={activeStudioAgentKey} setActiveStudioAgentKey={setActiveStudioAgentKey} gameStudioInitialized={gameStudioInitialized} initializeGameStudioWorkspace={initializeGameStudioWorkspace} removeGameStudioWorkspace={removeGameStudioWorkspace} currentWorkspace={currentWorkspace} handleAcceptInline={handleAcceptInline} handleRejectInline={handleRejectInline} onSendMessage={handleSendMessage} onQuickReply={handleQuickReply} />
       <FilePanel width={filePanelWidth} onStartResizing={startFilePanelResizing} />
       <RightPanel activeDiffTask={activeDiffTask} rightPanelWidth={rightPanelWidth} startResizing={startResizing} />
       <SettingsModal isOpen={isSettingsOpen} onClose={() => setIsSettingsOpen(false)} config={config} setConfig={setConfig} t={t} THEMES={THEMES} settingsTab={settingsTab} setSettingsTab={setSettingsTab} mcpServers={mcpServers} setMcpServers={setMcpServers} mcpDiscoveredTools={mcpDiscoveredTools} setMcpDiscoveredTools={setMcpDiscoveredTools} appVersion={appVersion} updateStatus={mainUpdateStatus} availableUpdateVersion={availableMainUpdate?.version || ""} availableUpdateNotes={availableMainUpdate?.notes || ""} updateError={mainUpdateError} updateProgressPercent={mainUpdateProgress?.percent ?? null} lastUpdateCheckedAt={lastMainUpdateCheckedAt} onCheckForUpdate={handleCheckMainUpdate} onInstallUpdate={handleInstallMainUpdate} />

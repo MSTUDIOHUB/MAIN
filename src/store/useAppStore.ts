@@ -104,6 +104,11 @@ import {
   normalizeAttachedFile,
 } from "../lib/attachments";
 import {
+  LOCAL_PERSIST_SCHEMA_VERSION,
+  buildPersistedAppState,
+  stripLegacyRuntimeFieldsFromPersistedState,
+} from "../lib/persistState";
+import {
   buildGameStudioEnvelopeForTurn,
   ensureGameStudioWorkspaceInitialized,
   loadGameStudioConfig,
@@ -1606,31 +1611,6 @@ function normalizeSessionsByWorkspace(
   });
 
   return Object.fromEntries(normalizedEntries.entries());
-}
-
-function stripSessionDetailsForLocalPersist(session: Session): Session | null {
-  if (session.recordingDisabled && session.storageStatus !== "temporary") return null;
-  const { messages: _messages, runtimeSnapshot: _runtimeSnapshot, ...meta } = session;
-  return {
-    ...meta,
-    storageStatus: session.storageStatus === "temporary" ? "temporary" : session.storageStatus,
-  };
-}
-
-function stripSessionsByWorkspaceForLocalPersist(
-  sessionsByWorkspace: Record<string, Session[]> | undefined,
-): Record<string, Session[]> {
-  if (!sessionsByWorkspace) return {};
-  return Object.fromEntries(
-    Object.entries(sessionsByWorkspace)
-      .map(([workspace, sessions]) => [
-        workspace,
-        (sessions || [])
-          .map(stripSessionDetailsForLocalPersist)
-          .filter((session): session is Session => Boolean(session)),
-      ])
-      .filter(([, sessions]) => sessions.length > 0),
-  );
 }
 
 // ── Streaming Thinking Interceptor ────────────────────────────────────
@@ -5194,8 +5174,9 @@ export const useAppStore = create<AppState>()(
 
           const latestState = get();
           const latestInput = latestState.input.trim();
+          const hasComparableLatestInput = latestInput.length > 0;
           const stalePreflight =
-            latestInput !== text.trim() ||
+            (hasComparableLatestInput && latestInput !== text.trim()) ||
             latestState.selectedMainModeKey !== currentMainModeKey ||
             !!latestState.lockedComposerIntent ||
             !!parseMainIntentShortcut(latestInput) ||
@@ -8137,48 +8118,13 @@ export const useAppStore = create<AppState>()(
     }),
     {
       name: "local-agent-ide",
-      // Persist the active runtime snapshot so self-modifying the app or a
-      // hot reload does not wipe the current conversation / plan state.
-      partialize: (state) => ({
-        config: state.config,
-        skills: state.skills,
-        sessionsByWorkspace: stripSessionsByWorkspaceForLocalPersist(state.sessionsByWorkspace),
-        workspaces: state.workspaces,
-        activeSessionByWorkspace: state.activeSessionByWorkspace,
-        currentWorkspace: state.currentWorkspace,
-        selectedWorkspace: state.selectedWorkspace,
-        currentSessionId: state.currentSessionId,
-        selectedMainModeKey: state.selectedMainModeKey,
-        selectedNexusModeKey: state.selectedNexusModeKey,
-        activeStudioAgentKey: state.activeStudioAgentKey,
-        gameStudioInitialized: state.gameStudioInitialized,
-        taskFlow: sanitizeTaskBlocksForPersist(state.taskFlow),
-        agentMessages: sanitizeAgentMessagesForPersist(state.agentMessages),
-        contextMemoryState: state.contextMemoryState,
-        conversationTurns: state.conversationTurns,
-        currentTurnId: state.currentTurnId,
-        pendingSlashCommand: state.pendingSlashCommand,
-        planArtifacts: state.planArtifacts,
-        planTasks: state.planTasks,
-        planExecutionEvidenceLedger: state.planExecutionEvidenceLedger,
-        planExecutionEvidenceCount: state.planExecutionEvidenceCount,
-        planAutoResumeCount: state.planAutoResumeCount,
-        planExecutionProgressSnapshot: state.planExecutionProgressSnapshot,
-        planStage: state.planStage,
-        isPlanApproved: state.isPlanApproved,
-        showPlanPanel: state.showPlanPanel,
-        showDiff: state.showDiff,
-        showTerminal: state.showTerminal,
-        showFilePanel: state.showFilePanel,
-        rightPanelTab: normalizeStoredRightPanelTab(state.rightPanelTab),
-        selectedDiffTaskId: state.selectedDiffTaskId,
-        preferredResponseLanguage: state.preferredResponseLanguage,
-        mcpServers: state.mcpServers,
-        sidebarWidth: state.sidebarWidth,
-        showWorkspaceTreePanel: state.showWorkspaceTreePanel,
-        workspaceTreePanelWidth: state.workspaceTreePanelWidth,
-        rightPanelWidth: state.rightPanelWidth,
-      }),
+      version: LOCAL_PERSIST_SCHEMA_VERSION,
+      partialize: (state: AppState) =>
+        buildPersistedAppState(state as Record<string, any>) as Partial<AppState>,
+      migrate: (persistedState: unknown): Partial<AppState> =>
+        stripLegacyRuntimeFieldsFromPersistedState(
+          (persistedState || {}) as Record<string, unknown>,
+        ) as Partial<AppState>,
       onRehydrateStorage: () => {
         const startedAt = nowMs();
         logStoreEvent("rehydrate_start", {});

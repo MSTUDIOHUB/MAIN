@@ -1222,8 +1222,6 @@ export default function ChatArea({
   rejectToolAction,
   autoApproveTools,
   onToggleAutoApprove,
-  input,
-  setInput,
   contextMentions,
   setContextMentions,
   attachedFiles,
@@ -2224,8 +2222,6 @@ export default function ChatArea({
       </div>
 
       <Composer
-        input={input}
-        setInput={setInput}
         contextMentions={contextMentions}
         setContextMentions={setContextMentions}
         attachedFiles={attachedFiles}
