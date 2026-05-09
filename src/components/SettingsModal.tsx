@@ -4,7 +4,15 @@ import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { save } from "@tauri-apps/plugin-dialog";
 import { IconSettings, IconClose, IconPlus, IconTrash, IconCloud, IconSave, IconCheck, IconGitHub, IconChevronDown, IconChevronUp } from "./Icons";
-import { type MCPServer, type MCPTool, discoverAllMcpTools, setMcpToolServerMap } from "../lib/mcpClient";
+import {
+  type MCPDiagnosticCategory,
+  type MCPServer,
+  type MCPServerTestResult,
+  type MCPTool,
+  discoverAllMcpTools,
+  setMcpToolServerMap,
+  testMcpServer,
+} from "../lib/mcpClient";
 import {
   buildOpenAiResponsesProbeRequestCandidates,
   buildAnthropicRequestBody,
@@ -47,7 +55,7 @@ import {
   normalizeCloudAuth,
   normalizeCloudServerState,
 } from "../lib/cloudServers";
-import { normalizeThoughtDisplayMode } from "../lib/thoughtDisplay";
+import { normalizeThinkingPolicy } from "../lib/thoughtDisplay";
 import { APP_ICON_ASSETS, applyAppIconVariant, normalizeAppIconVariant, type AppIconVariant } from "../lib/appIcon";
 
 function buildCloudConnectionFingerprint(server: any, apiFormatOverride?: unknown, modelOverride?: unknown): string {
@@ -151,9 +159,8 @@ const SETTINGS_COPY = {
     displayLanguage: "显示语言",
     enabled: "已启用",
     disabled: "已关闭",
-    thoughtDisplayHiddenDesc: "只显示最终回复和执行状态。",
-    thoughtDisplaySummaryDesc: "显示过滤后的关键过程和下一步意图。",
-    thoughtDisplayDetailedDesc: "展开更多过滤后的过程文本，仍会限长去噪。",
+    thinkingPolicyNormalDesc: "显示过滤后的关键过程说明。",
+    thinkingPolicyActionOnlyDesc: "不显示过程，仅保留结论与执行动作。",
 
     mcpServerTitle: "MCP 服务器",
     mcpScanTools: "扫描工具",
@@ -173,6 +180,16 @@ const SETTINGS_COPY = {
     mcpNoTools: "未发现任何工具，请检查服务器是否在线",
     mcpDiscoveryFailed: (message: string) => `发现失败: ${message}`,
     mcpTip: "MCP 服务器需先启动并监听指定端口，然后点击「扫描工具」发现可用工具。发现后的工具会在对话中自动供 AI 调用。Unity MCP 服务器默认地址为",
+    mcpTestingStatus: "正在测试连接...",
+    mcpTestSuccess: (count: number) => `连接成功，发现 ${count} 个工具`,
+    mcpTestEmptyTools: "连接成功，但未返回任何工具。请确认 Unity 会话已连接并暴露工具。",
+    mcpTestUnreachable: "无法连接服务器。请确认服务已启动并监听该地址。",
+    mcpTestRouteMismatch: "地址路由不匹配。请检查 URL 是否应包含 /mcp。",
+    mcpTestHeaderMismatch: "请求头不兼容。该服务器要求 Accept: application/json, text/event-stream。",
+    mcpTestRpcError: (message: string) => `MCP 返回错误：${message}`,
+    mcpTestHttpError: (status: number) => `服务器返回 HTTP ${status} 错误。`,
+    mcpTestInvalidResponse: "服务器返回了不可解析的响应，请检查 MCP 实现或代理配置。",
+    mcpTestFailed: (message: string) => `测试失败: ${message}`,
 
     dataPanelDesc: "管理本地数据。设置与会话索引保存在 localStorage，完整会话记录保存在 MAIN 应用数据目录，不写入项目的 .MAIN 目录。",
     dataTip: "所有数据保存在浏览器本地存储中。重置设置不会删除已解压到 .protocols/ 目录的协议包文件，如需彻底清理请手动删除该目录。",
@@ -353,9 +370,8 @@ const SETTINGS_COPY = {
     displayLanguage: "Display Language",
     enabled: "Enabled",
     disabled: "Disabled",
-    thoughtDisplayHiddenDesc: "Show only final replies and execution status.",
-    thoughtDisplaySummaryDesc: "Show filtered key process notes and the model's next intended step.",
-    thoughtDisplayDetailedDesc: "Show more filtered process text while still limiting length and noise.",
+    thinkingPolicyNormalDesc: "Show filtered key process notes in the chat stream.",
+    thinkingPolicyActionOnlyDesc: "Hide process notes and keep only conclusions and actions.",
 
     mcpServerTitle: "MCP Servers",
     mcpScanTools: "Scan Tools",
@@ -375,6 +391,16 @@ const SETTINGS_COPY = {
     mcpNoTools: "No tools found. Check whether the servers are online.",
     mcpDiscoveryFailed: (message: string) => `Discovery failed: ${message}`,
     mcpTip: "Start the MCP server and make sure it is listening on the configured port, then click Scan Tools. Discovered tools become available to the AI automatically. Unity MCP defaults to",
+    mcpTestingStatus: "Testing connection...",
+    mcpTestSuccess: (count: number) => `Connected. Found ${count} tool(s).`,
+    mcpTestEmptyTools: "Connected, but no tools were returned. Check Unity session exposure.",
+    mcpTestUnreachable: "Cannot reach this server. Make sure it is running and listening on this URL.",
+    mcpTestRouteMismatch: "Route mismatch. Check whether the URL should include /mcp.",
+    mcpTestHeaderMismatch: "Header mismatch. This server expects Accept: application/json, text/event-stream.",
+    mcpTestRpcError: (message: string) => `MCP returned an error: ${message}`,
+    mcpTestHttpError: (status: number) => `Server returned HTTP ${status}.`,
+    mcpTestInvalidResponse: "Server returned an unparsable response. Check MCP implementation or proxy behavior.",
+    mcpTestFailed: (message: string) => `Test failed: ${message}`,
 
     dataPanelDesc: "Manage local data. Settings and session indexes are stored in localStorage; full conversations are stored in MAIN app data and are not written into the project's .MAIN folder.",
     dataTip: "All data is stored locally in the browser. Resetting settings will not delete protocol packages extracted into .protocols/. Delete that folder manually for a full cleanup.",
@@ -548,6 +574,13 @@ function formatMcpTemplate(template: string | undefined, values: Record<string, 
   return template.replace(/\{(\w+)\}/g, (_match, key) => String(values[key] ?? `{${key}}`));
 }
 
+type McpTestUiState = {
+  phase: "testing" | "success" | "error";
+  category?: MCPDiagnosticCategory;
+  message: string;
+  toolCount: number;
+};
+
 function McpServerPanel({
   mcpServers,
   setMcpServers,
@@ -587,6 +620,16 @@ function McpServerPanel({
         ? formatMcpTemplate(t.mcpDiscoveryFailedMessage, { message })
         : SETTINGS_COPY[language].mcpDiscoveryFailed(message),
     mcpTip: t.mcpTip || SETTINGS_COPY[language].mcpTip,
+    mcpTestingStatus: t.mcpTestingStatus || SETTINGS_COPY[language].mcpTestingStatus,
+    mcpTestSuccess: SETTINGS_COPY[language].mcpTestSuccess,
+    mcpTestEmptyTools: t.mcpTestEmptyTools || SETTINGS_COPY[language].mcpTestEmptyTools,
+    mcpTestUnreachable: t.mcpTestUnreachable || SETTINGS_COPY[language].mcpTestUnreachable,
+    mcpTestRouteMismatch: t.mcpTestRouteMismatch || SETTINGS_COPY[language].mcpTestRouteMismatch,
+    mcpTestHeaderMismatch: t.mcpTestHeaderMismatch || SETTINGS_COPY[language].mcpTestHeaderMismatch,
+    mcpTestRpcError: SETTINGS_COPY[language].mcpTestRpcError,
+    mcpTestHttpError: SETTINGS_COPY[language].mcpTestHttpError,
+    mcpTestInvalidResponse: t.mcpTestInvalidResponse || SETTINGS_COPY[language].mcpTestInvalidResponse,
+    mcpTestFailed: SETTINGS_COPY[language].mcpTestFailed,
   };
   const [isDiscovering, setIsDiscovering] = useState(false);
   const [discoverMsg, setDiscoverMsg] = useState<(
@@ -594,9 +637,10 @@ function McpServerPanel({
     | { kind: "noServers" | "noTools"; type: "error" }
     | { kind: "failed"; type: "error"; message: string }
   ) | null>(null);
+  const [testStateByServer, setTestStateByServer] = useState<Record<string, McpTestUiState>>({});
   // Form state for adding a new server
   const [newName, setNewName] = useState("");
-  const [newUrl, setNewUrl] = useState("http://localhost:8000/mcp");
+  const [newUrl, setNewUrl] = useState("http://localhost:8080/mcp");
   const enabledMcpServerCount = mcpServers.filter((server) => server.enabled !== false).length;
   const tipSeparator = language === "zh" ? "：" : ": ";
   const tipEnd = language === "zh" ? "。" : ".";
@@ -609,12 +653,34 @@ function McpServerPanel({
     return copy.mcpDiscoveryFailed(discoverMsg.message);
   };
 
+  const getTestResultMessage = (result: MCPServerTestResult) => {
+    if (result.ok) return copy.mcpTestSuccess(result.toolCount);
+    if (result.category === "empty_tools") return copy.mcpTestEmptyTools;
+    if (result.category === "unreachable") return copy.mcpTestUnreachable;
+    if (result.category === "route_mismatch") return copy.mcpTestRouteMismatch;
+    if (result.category === "header_mismatch") return copy.mcpTestHeaderMismatch;
+    if (result.category === "rpc_error") return copy.mcpTestRpcError(result.message);
+    if (result.category === "http_error") return copy.mcpTestHttpError(result.status ?? 0);
+    if (result.category === "invalid_response") return copy.mcpTestInvalidResponse;
+    return copy.mcpTestFailed(result.message);
+  };
+
   // Auto-clear discovery message after 5 seconds
   useEffect(() => {
     if (!discoverMsg) return;
     const timer = setTimeout(() => setDiscoverMsg(null), 5000);
     return () => clearTimeout(timer);
   }, [discoverMsg]);
+
+  useEffect(() => {
+    const activeNames = new Set(mcpServers.map((server) => server.name));
+    setTestStateByServer((prev) => {
+      const next = Object.fromEntries(
+        Object.entries(prev).filter(([name]) => activeNames.has(name))
+      ) as Record<string, McpTestUiState>;
+      return Object.keys(next).length === Object.keys(prev).length ? prev : next;
+    });
+  }, [mcpServers]);
 
   const handleDiscover = async () => {
     setIsDiscovering(true);
@@ -645,15 +711,49 @@ function McpServerPanel({
     if (mcpServers.some(s => s.name === name)) return;
     setMcpServers([...mcpServers, { name, type: "http", url, enabled: true }]);
     setNewName("");
-    setNewUrl("http://localhost:8000/mcp");
+    setNewUrl("http://localhost:8080/mcp");
   };
 
   const handleToggleServer = (name: string, enabled: boolean) => {
     setMcpServers(mcpServers.map((server) => server.name === name ? { ...server, enabled } : server));
   };
 
+  const handleTestServer = async (server: MCPServer) => {
+    setTestStateByServer((prev) => ({
+      ...prev,
+      [server.name]: {
+        phase: "testing",
+        message: copy.mcpTestingStatus,
+        toolCount: 0,
+      },
+    }));
+
+    const result = await testMcpServer(server);
+    const nextState: McpTestUiState = {
+      phase: result.ok ? "success" : "error",
+      category: result.category,
+      message: getTestResultMessage(result),
+      toolCount: result.toolCount,
+    };
+    setTestStateByServer((prev) => ({ ...prev, [server.name]: nextState }));
+    console.log("[MCP] Server test result", {
+      server: server.name,
+      url: server.url,
+      ok: result.ok,
+      category: result.category,
+      status: result.status,
+      toolCount: result.toolCount,
+    });
+  };
+
   const handleRemoveServer = (name: string) => {
     setMcpServers(mcpServers.filter(s => s.name !== name));
+    setTestStateByServer((prev) => {
+      if (!(name in prev)) return prev;
+      const next = { ...prev };
+      delete next[name];
+      return next;
+    });
   };
 
   return (
@@ -683,6 +783,8 @@ function McpServerPanel({
         ) : (
           mcpServers.map((server) => {
             const enabled = server.enabled !== false;
+            const serverTestState = testStateByServer[server.name];
+            const isTestingServer = serverTestState?.phase === "testing";
             return (
             <div
               key={server.name}
@@ -698,6 +800,19 @@ function McpServerPanel({
                   </span>
                 </div>
                 <p className="text-[11px] text-[#71717a] font-mono mt-1 truncate">{server.url}</p>
+                {serverTestState && (
+                  <p
+                    className={`mt-1 text-[11px] ${
+                      serverTestState.phase === "success"
+                        ? "text-[#86d9a3]"
+                        : serverTestState.phase === "testing"
+                          ? "text-[#a1a1aa]"
+                          : "text-[#f48771]"
+                    }`}
+                  >
+                    {serverTestState.message}
+                  </p>
+                )}
               </div>
               <div className="ml-4 flex shrink-0 items-center gap-3">
                 <button
@@ -717,6 +832,16 @@ function McpServerPanel({
                       enabled ? "translate-x-5" : "translate-x-0"
                     }`}
                   />
+                </button>
+                <button
+                  onClick={() => handleTestServer(server)}
+                  disabled={isTestingServer}
+                  data-testid={`mcp-test-${server.name}`}
+                  className="h-7 min-w-[44px] rounded-md border border-[#27272a] bg-[#18181b] px-2.5 text-[11px] font-bold text-[#a1a1aa] transition-colors hover:text-white disabled:cursor-not-allowed disabled:opacity-50"
+                  title={copy.test}
+                  aria-label={`${copy.test} ${server.name}`}
+                >
+                  {isTestingServer ? copy.testing : copy.test}
                 </button>
                 <button
                   onClick={() => handleRemoveServer(server.name)}
@@ -1502,11 +1627,10 @@ export default function SettingsModal({
     mcpServerTitle: t.mcpServers || SETTINGS_COPY[language].mcpServerTitle,
     mcpScanning: t.mcpScanning || SETTINGS_COPY[language].mcpScanning,
   };
-  const thoughtDisplayMode = normalizeThoughtDisplayMode(config.thoughtDisplayMode);
-  const thoughtDisplayOptions = [
-    { value: "hidden", label: t.thoughtDisplayHidden, description: copy.thoughtDisplayHiddenDesc },
-    { value: "summary", label: t.thoughtDisplaySummary, description: copy.thoughtDisplaySummaryDesc },
-    { value: "detailed", label: t.thoughtDisplayDetailed, description: copy.thoughtDisplayDetailedDesc },
+  const thinkingPolicy = normalizeThinkingPolicy(config.thinkingPolicy);
+  const thinkingPolicyOptions = [
+    { value: "normal", label: t.thinkingPolicyNormal, description: copy.thinkingPolicyNormalDesc },
+    { value: "action_only", label: t.thinkingPolicyActionOnly, description: copy.thinkingPolicyActionOnlyDesc },
   ];
   const appIconOptions: Array<{ value: AppIconVariant; label: string; src: string }> = [
     { value: "light", label: copy.appIconLight, src: APP_ICON_ASSETS.light },
@@ -2888,27 +3012,27 @@ export default function SettingsModal({
                   </div>
                 </div>
 
-                {/* THOUGHT DISPLAY */}
+                {/* THINKING POLICY */}
                 <div className={`${settingsSectionRowClass} border-t border-[#27272a] pt-5`}>
                   <div>
-                    <label className="block text-[13px] font-bold text-[#e4e4e7]">{t.thoughtDisplay}</label>
-                    <p className="mt-1.5 text-[12px] leading-relaxed text-[#a1a1aa]">{t.thoughtDisplayDesc}</p>
+                    <label className="block text-[13px] font-bold text-[#e4e4e7]">{t.thinkingPolicy}</label>
+                    <p className="mt-1.5 text-[12px] leading-relaxed text-[#a1a1aa]">{t.thinkingPolicyDesc}</p>
                   </div>
-                  <div className={`${settingsControlColumnClass} grid gap-3 lg:grid-cols-3`}>
-                    {thoughtDisplayOptions.map((option) => {
-                      const isThoughtOptionSelected = thoughtDisplayMode === option.value;
+                  <div className={`${settingsControlColumnClass} grid gap-3 lg:grid-cols-2`}>
+                    {thinkingPolicyOptions.map((option) => {
+                      const selected = thinkingPolicy === option.value;
                       return (
                         <button
                           key={option.value}
                           type="button"
-                          data-testid={`thought-display-${option.value}`}
-                          aria-pressed={isThoughtOptionSelected}
-                          onClick={() => setConfig({ ...config, thoughtDisplayMode: option.value })}
-                          className={settingsOptionButtonClass(isThoughtOptionSelected, "min-h-[112px] rounded-lg p-3 text-left")}
+                          data-testid={`thinking-policy-${option.value}`}
+                          aria-pressed={selected}
+                          onClick={() => setConfig({ ...config, thinkingPolicy: option.value })}
+                          className={settingsOptionButtonClass(selected, "min-h-[88px] rounded-lg p-3 text-left")}
                         >
                           <span className="flex items-start justify-between gap-3">
-                            <span className={`text-[13px] font-bold ${isThoughtOptionSelected ? "theme-text" : "text-[#e4e4e7]"}`}>{option.label}</span>
-                            <span className={`mt-0.5 h-2.5 w-2.5 shrink-0 rounded-full border ${isThoughtOptionSelected ? "theme-bg theme-glow border-transparent" : "border-[#52525b] bg-transparent"}`} />
+                            <span className={`text-[13px] font-bold ${selected ? "theme-text" : "text-[#e4e4e7]"}`}>{option.label}</span>
+                            <span className={`mt-0.5 h-2.5 w-2.5 shrink-0 rounded-full border ${selected ? "theme-bg theme-glow border-transparent" : "border-[#52525b] bg-transparent"}`} />
                           </span>
                           <span className="mt-2 block text-[11.5px] leading-relaxed text-[#a1a1aa]">{option.description}</span>
                         </button>
@@ -2923,14 +3047,31 @@ export default function SettingsModal({
                     <span className="block text-[13px] font-bold text-[#e4e4e7]">{t.sessionRecording}</span>
                     <span className="mt-1.5 block text-[12px] leading-relaxed text-[#a1a1aa]">{t.sessionRecordingDesc}</span>
                   </div>
-                  <label className={`${settingsControlColumnClass} ${settingsOptionButtonClass(config.sessionRecordingEnabled !== false, "flex cursor-pointer items-center justify-between gap-4 rounded-lg px-4 py-3")}`}>
-                    <span className={`min-w-0 text-[12px] font-bold ${config.sessionRecordingEnabled !== false ? "theme-text" : "text-[#a1a1aa]"}`}>{config.sessionRecordingEnabled !== false ? copy.enabled : copy.disabled}</span>
-                    <input
-                      type="checkbox"
-                      checked={config.sessionRecordingEnabled !== false}
-                      onChange={(e) => setConfig({ ...config, sessionRecordingEnabled: e.target.checked })}
-                    />
-                  </label>
+                  <div className={`${settingsControlColumnClass} flex items-center justify-between rounded-lg border border-[#27272a] bg-[#000000] px-4 py-3`}>
+                    <span className={`min-w-0 text-[12px] font-bold ${config.sessionRecordingEnabled !== false ? "theme-text" : "text-[#a1a1aa]"}`}>
+                      {config.sessionRecordingEnabled !== false ? copy.enabled : copy.disabled}
+                    </span>
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={config.sessionRecordingEnabled !== false}
+                      data-testid="session-recording-switch"
+                      aria-label={t.sessionRecording}
+                      onClick={() => setConfig({ ...config, sessionRecordingEnabled: !(config.sessionRecordingEnabled !== false) })}
+                      className={`relative inline-flex h-6 w-11 items-center rounded-full border p-0.5 transition-all duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-[#000000] ${
+                        config.sessionRecordingEnabled !== false
+                          ? "border-transparent shadow-[0_0_12px_var(--accent-subtle)]"
+                          : "border-[#3f3f46] bg-[#18181b]"
+                      }`}
+                      style={config.sessionRecordingEnabled !== false ? { backgroundColor: "var(--accent)" } : undefined}
+                    >
+                      <span
+                        className={`block h-5 w-5 rounded-full bg-white shadow-sm transition-transform duration-200 ${
+                          config.sessionRecordingEnabled !== false ? "translate-x-5" : "translate-x-0"
+                        }`}
+                      />
+                    </button>
+                  </div>
                 </div>
               </div>
             )}

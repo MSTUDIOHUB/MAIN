@@ -11,7 +11,7 @@ const PLAN_REPLACE_REFRESH_SCENARIO = "plan-replace-refresh";
 const AWAITING_CHOICE_SCENARIO = "awaiting-choice";
 const FEISHU_REMOTE_ANALYSIS_SCENARIO = "feishu-remote-analysis";
 const READ_CONTEXT_COLLAPSE_SCENARIO = "read-context-collapse";
-const THOUGHT_DISPLAY_SCENARIO = "thought-display-mode";
+const THINKING_POLICY_SCENARIO = "thinking-policy";
 const GAME_STUDIO_ONBOARDING_SCENARIO = "game-studio-onboarding";
 const COMPOSER_MAIN_SHORTCUTS_SCENARIO = "composer-main-shortcuts";
 const CLOUD_SETTINGS_MODEL_SELECT_SCENARIO = "cloud-settings-model-select";
@@ -133,14 +133,14 @@ function bindBridgeSnapshot(scenario: string) {
       toolTargets: toolBlocks.map((block) => block.target),
       selectedOptions: archivedOptionBlocks.map((block) => block.selectedOption).filter(Boolean),
       themeMode: state.config.themeMode,
-      thoughtDisplayMode: state.config.thoughtDisplayMode,
+      thinkingPolicy: state.config.thinkingPolicy,
       seedCount: readSeedCount(scenario),
     };
   };
-  bridge.setThoughtDisplayMode = (mode: "hidden" | "summary" | "detailed") => {
+  bridge.setThinkingPolicy = (policy: "normal" | "action_only") => {
     useAppStore.getState().setConfig((prev) => ({
       ...prev,
-      thoughtDisplayMode: mode,
+      thinkingPolicy: policy,
     }));
   };
   bindCloudServerBridgeControls();
@@ -964,7 +964,7 @@ function seedReadContextCollapseScenario() {
   return cleanup;
 }
 
-function seedThoughtDisplayScenario() {
+function seedThinkingPolicyScenario() {
   const bridge = getBridge();
   if (!bridge) return undefined;
 
@@ -972,15 +972,15 @@ function seedThoughtDisplayScenario() {
   bridge.savedDocuments = [];
   bridge.completed = true;
 
-  incrementSeedCount(THOUGHT_DISPLAY_SCENARIO);
+  incrementSeedCount(THINKING_POLICY_SCENARIO);
 
   const now = Date.now();
-  const turnId = "e2e-thought-display-turn";
+  const turnId = "e2e-thinking-policy-turn";
   const sessionId = 999018;
   const userBlockId = useAppStore.getState()._nextTaskId();
   const thoughtBlockId = useAppStore.getState()._nextTaskId();
   const agentBlockId = useAppStore.getState()._nextTaskId();
-  const thoughtDisplayMode = useAppStore.getState().config.thoughtDisplayMode || "hidden";
+  const thinkingPolicy = useAppStore.getState().config.thinkingPolicy || "normal";
 
   useAppStore.setState((state) => ({
     ...state,
@@ -988,14 +988,14 @@ function seedThoughtDisplayScenario() {
       ...state.config,
       language: "zh",
       workflowMode: "chat",
-      thoughtDisplayMode,
+      thinkingPolicy,
     },
-    currentWorkspace: "/tmp/e2e-thought-display",
+    currentWorkspace: "/tmp/e2e-thinking-policy",
     sessionsByWorkspace: {
-      "/tmp/e2e-thought-display": [
+      "/tmp/e2e-thinking-policy": [
         {
           id: sessionId,
-          title: "E2E Thought Display",
+          title: "E2E Thinking Policy",
           date: new Date(now).toISOString(),
           active: true,
           messages: [],
@@ -1006,7 +1006,7 @@ function seedThoughtDisplayScenario() {
     selectedMainModeKey: "main_mode",
     selectedNexusModeKey: "nexus_general",
     taskFlow: [
-      { id: userBlockId, turnId, type: "user", content: "验证思考显示模式。" },
+      { id: userBlockId, turnId, type: "user", content: "验证思考策略。" },
       {
         id: thoughtBlockId,
         turnId,
@@ -1017,7 +1017,7 @@ function seedThoughtDisplayScenario() {
           "我需要先检查 SettingsModal 的通用设置区域。",
           "我需要先检查 SettingsModal 的通用设置区域。",
           "**检查范围**：`SettingsModal` 的通用设置区域。",
-          "下一步会把思考显示接入三档配置，并避免原始长文本刷屏。",
+          "下一步会把思考策略接入两档配置，并避免原始长文本刷屏。",
           "由于似乎缓存，换一种方式。，使用来获取关键代码片段，，，，，，，，，整个 ...... 陷入了循环。。，，，，，所以我无法直接。",
           "```ts",
           "const noisy = true;",
@@ -1037,18 +1037,18 @@ function seedThoughtDisplayScenario() {
         id: agentBlockId,
         turnId,
         type: "agent",
-        content: "思考显示模式测试回复。",
+        content: "思考策略测试回复。",
         streaming: false,
       },
     ],
     conversationTurns: [
       {
         id: turnId,
-        userPrompt: "验证思考显示模式。",
-        title: "思考显示模式",
+        userPrompt: "验证思考策略。",
+        title: "思考策略",
         mode: "chat",
         status: "done",
-        summary: "已准备思考显示测试数据。",
+        summary: "已准备思考策略测试数据。",
         blockIds: [userBlockId, thoughtBlockId, agentBlockId],
         collapsed: false,
         createdAt: now,
@@ -1065,8 +1065,8 @@ function seedThoughtDisplayScenario() {
     selectedDiffTaskId: null,
   }));
 
-  bindBridgeSnapshot(THOUGHT_DISPLAY_SCENARIO);
-  appendBridgeEvent("seeded", { seedCount: readSeedCount(THOUGHT_DISPLAY_SCENARIO) });
+  bindBridgeSnapshot(THINKING_POLICY_SCENARIO);
+  appendBridgeEvent("seeded", { seedCount: readSeedCount(THINKING_POLICY_SCENARIO) });
 
   const cleanup = () => {
     bridge.initialized = false;
@@ -3250,8 +3250,8 @@ export function initializeE2EScenarios(): (() => void) | undefined {
     return seedReadContextCollapseScenario();
   }
 
-  if (scenario === THOUGHT_DISPLAY_SCENARIO) {
-    return seedThoughtDisplayScenario();
+  if (scenario === THINKING_POLICY_SCENARIO) {
+    return seedThinkingPolicyScenario();
   }
 
   if (scenario === GAME_STUDIO_ONBOARDING_SCENARIO) {

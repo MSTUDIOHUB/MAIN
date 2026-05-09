@@ -1,28 +1,38 @@
-export type ThoughtDisplayMode = "hidden" | "summary" | "detailed";
+export type ThinkingPolicy = "normal" | "action_only";
 
 export interface ThoughtDisplayOptions {
-  mode?: ThoughtDisplayMode;
   language?: "zh" | "en";
-  maxDetailChars?: number;
   maxSummaryLines?: number;
 }
 
 export interface ThoughtDisplayResult {
   title: string;
-  meta: string;
   summaryLines: string[];
-  detailText: string;
-  truncated: boolean;
-  hiddenChars: number;
+  summaryText: string;
 }
 
-const DEFAULT_DETAIL_CHARS = 8_000;
 const DEFAULT_SUMMARY_LINES = 3;
 const SYNTHETIC_VISIBLE_CONCLUSION_ZH = "后台思考已折叠，模型尚未生成可见回复或可执行动作。";
 const SYNTHETIC_VISIBLE_CONCLUSION_RE = /后台思考已折叠[，,]\s*模型尚未生成可见回复或可执行动作。?/;
 
-export function normalizeThoughtDisplayMode(value: unknown): ThoughtDisplayMode {
-  return value === "summary" || value === "detailed" ? value : "hidden";
+export function normalizeThinkingPolicy(value: unknown): ThinkingPolicy {
+  return value === "action_only" ? "action_only" : "normal";
+}
+
+export function normalizeThinkingPolicyWithLegacy(
+  thinkingPolicyValue: unknown,
+  legacyThoughtDisplayModeValue: unknown,
+): ThinkingPolicy {
+  if (thinkingPolicyValue === "normal" || thinkingPolicyValue === "action_only") {
+    return thinkingPolicyValue;
+  }
+  if (legacyThoughtDisplayModeValue === "hidden") {
+    return "action_only";
+  }
+  if (legacyThoughtDisplayModeValue === "summary" || legacyThoughtDisplayModeValue === "detailed") {
+    return "normal";
+  }
+  return "normal";
 }
 
 function normalizeForCompare(text: string): string {
@@ -63,8 +73,10 @@ export function normalizeThoughtSummaryForCompare(text: string): string {
 
 export function isSyntheticThoughtPlaceholder(text: string): boolean {
   const normalized = String(text || "").replace(/\s+/g, "").trim();
-  return normalized === SYNTHETIC_VISIBLE_CONCLUSION_ZH.replace(/\s+/g, "") ||
-    SYNTHETIC_VISIBLE_CONCLUSION_RE.test(String(text || ""));
+  return (
+    normalized === SYNTHETIC_VISIBLE_CONCLUSION_ZH.replace(/\s+/g, "") ||
+    SYNTHETIC_VISIBLE_CONCLUSION_RE.test(String(text || ""))
+  );
 }
 
 function sameSequence(items: string[], a: number, b: number, length: number): boolean {
@@ -328,8 +340,8 @@ function cleanThoughtText(raw: string, language: "zh" | "en"): string {
     .trim();
 }
 
-function splitSummaryCandidates(detailText: string): string[] {
-  const units = detailText
+function splitSummaryCandidates(cleanText: string): string[] {
+  const units = cleanText
     .split(/\n{2,}|\n/)
     .flatMap((part) => {
       const trimmed = part.trim();
@@ -359,8 +371,8 @@ function truncateSummaryLine(text: string, maxChars = 180): string {
   return `${normalized.slice(0, maxChars - 3).trim()}...`;
 }
 
-function pickSummaryLines(detailText: string, maxLines: number): string[] {
-  const candidates = splitSummaryCandidates(detailText);
+function pickSummaryLines(cleanText: string, maxLines: number): string[] {
+  const candidates = splitSummaryCandidates(cleanText);
   const chosen: string[] = [];
   const seen = new Set<string>();
 
@@ -388,22 +400,15 @@ export function deriveThoughtDisplay(
   options: ThoughtDisplayOptions = {},
 ): ThoughtDisplayResult {
   const language = options.language === "en" ? "en" : "zh";
-  const mode = normalizeThoughtDisplayMode(options.mode);
-  const raw = String(content || "");
-  const clean = cleanThoughtText(raw, language);
-  const maxDetailChars = Math.max(0, options.maxDetailChars ?? DEFAULT_DETAIL_CHARS);
-  const hiddenChars = Math.max(0, clean.length - maxDetailChars);
-  const detailText = hiddenChars > 0 ? clean.slice(0, maxDetailChars).trimEnd() : clean;
-  const summaryLines = pickSummaryLines(detailText, Math.max(1, options.maxSummaryLines ?? DEFAULT_SUMMARY_LINES));
+  const clean = cleanThoughtText(String(content || ""), language);
+  const summaryLines = pickSummaryLines(
+    clean,
+    Math.max(1, options.maxSummaryLines ?? DEFAULT_SUMMARY_LINES),
+  );
 
   return {
-    title: language === "zh"
-      ? mode === "detailed" ? "思考详情" : "思考过程"
-      : mode === "detailed" ? "Thinking Details" : "Thinking Process",
-    meta: language === "zh" ? `${raw.length.toLocaleString()} 字符` : `${raw.length.toLocaleString()} chars`,
+    title: language === "zh" ? "思考过程" : "Thinking Process",
     summaryLines,
-    detailText,
-    truncated: hiddenChars > 0,
-    hiddenChars,
+    summaryText: summaryLines.join("\n\n"),
   };
 }

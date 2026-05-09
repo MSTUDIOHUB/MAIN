@@ -427,6 +427,14 @@ export function normalizeAssistantTurn(result: StreamResult): NormalizedStreamSt
  * 用隐藏推理生成一个最小可见摘要，避免用户看到空回复。
  */
 export function ensureVisibleConclusion(normalized: NormalizedStreamState): NormalizedStreamState {
+  return ensureVisibleConclusionWithPolicy(normalized, true);
+}
+
+export function ensureVisibleConclusionWithPolicy(
+  normalized: NormalizedStreamState,
+  allowSyntheticVisibleConclusion: boolean,
+): NormalizedStreamState {
+  if (!allowSyntheticVisibleConclusion) return normalized;
   if (normalized.visibleText.trim()) return normalized;
   if (!normalized.hiddenThought.trim()) return normalized;
 

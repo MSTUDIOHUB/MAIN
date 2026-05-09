@@ -10,7 +10,7 @@ test.beforeEach(async ({ page }) => {
 });
 
 test("black appearance mode persists and applies the pure black theme", async ({ page }) => {
-  await page.goto("/?e2eScenario=thought-display-mode");
+  await page.goto("/?e2eScenario=thinking-policy");
 
   await page.getByTestId("model-settings-button").click();
   await page.getByTestId("settings-tab-general").click();

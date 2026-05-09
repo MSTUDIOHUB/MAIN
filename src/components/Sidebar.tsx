@@ -105,7 +105,7 @@ function sortSessions(sessions: any[]) {
     (session?.title === "Missing Session" && !String(session?.date || "").trim());
   return [...(sessions || [])].filter((session) => !isMissingSession(session)).sort((a, b) => {
     const sortTime = (session: any) => {
-      for (const value of [session?.date, session?.id]) {
+      for (const value of [session?.updatedAtMs, session?.updatedAt, session?.date, session?.id]) {
         if (typeof value === "number" && Number.isFinite(value) && value > 0) return value;
         if (typeof value === "string" && value.trim()) {
           const parsed = Date.parse(value);
@@ -605,7 +605,7 @@ export default function Sidebar({
         <div className="flex min-w-0 flex-1 flex-col">
           <span className="sidebar-session-title truncate text-[13px]">{resolveSessionDisplayTitle(session)}</span>
           <span className="mt-0.5 flex items-center gap-1 text-[10px] text-[#71717a]">
-            <span>{formatDate(session.date)}</span>
+            <span>{formatDate(session.updatedAt || session.date)}</span>
             {session.storageStatus === "missing" && (
               <span className="rounded border border-[#7f1d1d] bg-[#2a1010] px-1 text-[#fca5a5]">{missingLabel}</span>
             )}

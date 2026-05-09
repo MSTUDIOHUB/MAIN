@@ -13,7 +13,11 @@ import { getDiffStats } from "../lib/diff";
 import { parseMessageContent } from "../lib/messageParser";
 import { hasPlanDraftPreview, hasStructuredPlanProposal } from "../lib/planProposal";
 import { sanitizeAIOutput } from "../lib/sanitize";
-import { deriveThoughtDisplay, normalizeThoughtDisplayMode, normalizeThoughtSummaryForCompare } from "../lib/thoughtDisplay";
+import {
+  deriveThoughtDisplay,
+  normalizeThinkingPolicy,
+  normalizeThoughtSummaryForCompare,
+} from "../lib/thoughtDisplay";
 import { deriveTurnProgressItems } from "../lib/turnProgress";
 import { useAppStore } from "../store/useAppStore";
 import {
@@ -729,91 +733,36 @@ function TurnActivityNotice({ text }: { text: string }) {
 function ThoughtBlock({
   block,
   language,
-  mode,
   chatFontSize,
+  summaryText,
 }: {
   block: any;
   language: "zh" | "en";
-  mode: unknown;
   chatFontSize: number;
+  summaryText?: string;
 }) {
-  const displayMode = normalizeThoughtDisplayMode(mode);
-  const [isExpanded, setIsExpanded] = useState(displayMode === "detailed");
   const rawContent = String(block.content || "").trim();
-  useEffect(() => {
-    setIsExpanded(displayMode === "detailed");
-  }, [block.id, displayMode]);
-
-  if (displayMode === "hidden" || !rawContent) return null;
-
-  const display = deriveThoughtDisplay(rawContent, {
-    mode: displayMode,
-    language,
-  });
-  if (!display.detailText && display.summaryLines.length === 0) return null;
-
-  const title = block.isStreaming
-    ? language === "zh" ? "后台思考中" : "Background Thinking"
-    : display.title;
-  const metaParts: string[] = [];
-  if (typeof block.duration === "number" && block.duration > 0) {
-    metaParts.push(language === "zh" ? `${block.duration}s` : `${block.duration}s`);
-  }
-  const isDetailed = displayMode === "detailed";
-  const summaryText = display.summaryLines.join("\n\n");
-  const detailText = display.truncated
-    ? language === "zh"
-      ? `${display.detailText}\n\n> 已折叠 ${display.hiddenChars.toLocaleString()} 个字符`
-      : `${display.detailText}\n\n> ${display.hiddenChars.toLocaleString()} chars folded`
-    : display.detailText;
-
-  if (!isDetailed) {
-    if (!summaryText) return null;
-    return (
-      <div data-testid="thought-block" className="mt-4 flex w-full min-w-0 items-start justify-start gap-3">
-        <div className="mt-1 flex-shrink-0">
-          <IconLogoM className="theme-text h-6 w-6 drop-shadow-[0_0_8px_var(--accent-subtle)]" />
-        </div>
-        <div
-          data-testid="thought-summary-lines"
-          className="chat-agent-content my-2 min-w-0 flex-1 bg-[#09090b]/60 px-5 py-4 text-[#e4e4e7]"
-          style={{ fontSize: `${chatFontSize}px` }}
-        >
-          <MarkdownRenderer content={summaryText} baseFontSize={chatFontSize} />
-        </div>
-      </div>
-    );
-  }
+  if (!rawContent) return null;
+  const computedSummaryText = useMemo(() => {
+    const display = deriveThoughtDisplay(rawContent, {
+      language,
+    });
+    return display.summaryText;
+  }, [language, rawContent]);
+  const resolvedSummaryText = String(summaryText || "").trim() || computedSummaryText;
+  if (!resolvedSummaryText) return null;
 
   return (
-    <div data-testid="thought-block" className="ml-9 flex min-w-0 max-w-full">
-      <div className="min-w-0 flex-1 rounded-2xl border border-[#27272a] bg-[#07070a] px-4 py-3 text-left">
-        <button
-          type="button"
-          data-testid="thought-detail-toggle"
-          onClick={() => setIsExpanded((value) => !value)}
-          className="inline-flex max-w-full min-w-0 items-center gap-2 rounded-lg px-2 py-1 text-left transition-colors hover:bg-[#18181b]"
-        >
-          {isExpanded ? (
-            <IconChevronDown className="h-4 w-4 shrink-0 text-[#71717a]" />
-          ) : (
-            <IconChevronRight className="h-4 w-4 shrink-0 text-[#71717a]" />
-          )}
-          <span className="min-w-0 truncate text-[12px] font-medium text-[#d4d4d8]">{title}</span>
-          {metaParts.length > 0 && (
-            <span className="shrink-0 text-[11px] text-[#71717a]">{metaParts.join(" · ")}</span>
-          )}
-          {block.isStreaming && (
-            <span className="h-2 w-2 shrink-0 rounded-full bg-[#60a5fa] shadow-[0_0_8px_rgba(96,165,250,0.8)] animate-pulse" />
-          )}
-        </button>
-        {isExpanded && (
-          <div className="mt-3 max-h-[360px] min-w-0 overflow-auto rounded-xl border border-[#1f1f23] bg-[#050507] p-3">
-            <div data-testid="thought-detail" style={{ fontSize: `${chatFontSize}px` }}>
-              <MarkdownRenderer content={detailText} baseFontSize={chatFontSize} />
-            </div>
-          </div>
-        )}
+    <div data-testid="thought-block" className="mt-4 flex w-full min-w-0 items-start justify-start gap-3">
+      <div className="mt-1 flex-shrink-0">
+        <IconLogoM className="theme-text h-6 w-6 drop-shadow-[0_0_8px_var(--accent-subtle)]" />
+      </div>
+      <div
+        data-testid="thought-summary-lines"
+        className="chat-agent-content my-2 min-w-0 flex-1 bg-[#09090b]/60 px-5 py-4 text-[#e4e4e7]"
+        style={{ fontSize: `${chatFontSize}px` }}
+      >
+        <MarkdownRenderer content={resolvedSummaryText} baseFontSize={chatFontSize} />
       </div>
     </div>
   );
@@ -1244,6 +1193,8 @@ export default function ChatArea({
   onQuickReply,
 }) {
   const language = config.language === "en" ? "en" : "zh";
+  const thinkingPolicy = normalizeThinkingPolicy(config.thinkingPolicy);
+  const shouldSuppressThoughtBlocks = thinkingPolicy === "action_only";
   const copy = useMemo(() => ({
     planLabel: language === "zh" ? "计划" : "Plan",
     stopLabel: language === "zh" ? "停止" : "Stop",
@@ -1725,12 +1676,12 @@ export default function ChatArea({
     }
 
     if (block.type === "thought") {
+      if (shouldSuppressThoughtBlocks) return null;
       return (
         <ThoughtBlock
           key={`${block.id}-${index}`}
           block={block}
           language={language}
-          mode={config.thoughtDisplayMode}
           chatFontSize={config.chatFontSize ?? 13}
         />
       );
@@ -1876,17 +1827,28 @@ export default function ChatArea({
     const toolExecutionSummary = buildToolExecutionSummary(blocks, language);
     const activeTurnActivity = getActiveTurnActivity(blocks, turn.status, language);
     const seenThoughtSummaryDedupeKeys = new Set<string>();
+    const thoughtSummaryCache = new Map<string, string>();
+    const getThoughtSummaryText = (thoughtBlock: any) => {
+      const cacheKey = String(thoughtBlock?.id ?? "");
+      if (thoughtSummaryCache.has(cacheKey)) {
+        return thoughtSummaryCache.get(cacheKey) || "";
+      }
+      const summary = deriveThoughtDisplay(String(thoughtBlock?.content || ""), {
+        language,
+      }).summaryText;
+      thoughtSummaryCache.set(cacheKey, summary);
+      return summary;
+    };
     const renderTurnBlockItem = (item) => {
+      if (shouldSuppressThoughtBlocks && item.kind !== "readContextGroup" && item.block?.type === "thought") {
+        return null;
+      }
       if (
-        normalizeThoughtDisplayMode(config.thoughtDisplayMode) === "summary" &&
+        !shouldSuppressThoughtBlocks &&
         item.kind !== "readContextGroup" &&
         item.block?.type === "thought"
       ) {
-        const display = deriveThoughtDisplay(String(item.block.content || ""), {
-          mode: "summary",
-          language,
-        });
-        const summaryText = display.summaryLines.join("\n\n");
+        const summaryText = getThoughtSummaryText(item.block);
         const summaryDedupeKey = normalizeThoughtSummaryForCompare(summaryText);
         if (!summaryText) return null;
         if (summaryDedupeKey) {
@@ -1898,8 +1860,8 @@ export default function ChatArea({
             key={`${item.block.id}-${item.index}`}
             block={item.block}
             language={language}
-            mode={config.thoughtDisplayMode}
             chatFontSize={config.chatFontSize ?? 13}
+            summaryText={summaryText}
           />
         );
       }

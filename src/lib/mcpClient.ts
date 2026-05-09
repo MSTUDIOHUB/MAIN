@@ -1,15 +1,7 @@
 // lib/mcpClient.ts
 // MCP (Model Context Protocol) HTTP Client — Streamable HTTP transport.
 // Implements tool discovery (tools/list) and tool execution (tools/call)
-// per the MCP specification (2025-03-26).
-//
-// Architecture:
-//   1. discoverMcpTools(server) → fetches available tools from an MCP server
-//   2. executeMcpTool(serverUrl, name, args) → invokes a tool on the server
-//   3. Module-level tool→server routing map for zero-signature-change integration
-// ────────────────────────────────────────────────────────────────────
-
-// ── Types ──────────────────────────────────────────────────────────
+// with session initialization compatible with Unity MCP / OpenCode style flows.
 
 export interface MCPServer {
   name: string;
@@ -24,96 +16,459 @@ export interface MCPTool {
   inputSchema: any;
 }
 
-// ── JSON-RPC 2.0 ───────────────────────────────────────────────────
-
 interface JsonRpcRequest {
   jsonrpc: "2.0";
-  id: number;
+  id?: number;
   method: string;
   params?: Record<string, unknown>;
 }
 
 interface JsonRpcResponse {
   jsonrpc: "2.0";
-  id: number;
+  id?: number;
   result?: any;
   error?: { code: number; message: string; data?: any };
 }
 
-let rpcIdCounter = 0;
+interface ProxyDetailedResponse {
+  status: number;
+  ok: boolean;
+  body: string;
+  contentType?: string;
+  headers?: Record<string, string>;
+}
 
-// ── Module-level Tool→Server Routing Map ────────────────────────────
-// Allows executeTool() and isReadOnlyTool() in other modules to check
-// whether a tool belongs to an MCP server without threading the map
-// through every function signature.
+interface McpSessionState {
+  sessionId?: string;
+  initialized: boolean;
+  protocolVersion: string;
+}
+
+type InvokeFn = <T = any>(command: string, args?: Record<string, unknown>) => Promise<T>;
+
+const MCP_ACCEPT_HEADER = "application/json, text/event-stream";
+const MCP_PROTOCOL_VERSION = "2025-03-26";
+const MCP_SESSION_HEADER = "mcp-session-id";
+
+export type MCPDiagnosticCategory =
+  | "ok"
+  | "unreachable"
+  | "route_mismatch"
+  | "header_mismatch"
+  | "rpc_error"
+  | "empty_tools"
+  | "http_error"
+  | "invalid_response";
+
+export interface MCPDiagnostic {
+  category: MCPDiagnosticCategory;
+  message: string;
+  status?: number;
+  statusText?: string;
+  responseSnippet?: string;
+}
+
+export interface MCPServerTestResult extends MCPDiagnostic {
+  serverName: string;
+  url: string;
+  toolCount: number;
+  ok: boolean;
+}
+
+class MCPRequestError extends Error {
+  readonly category: Exclude<MCPDiagnosticCategory, "ok" | "empty_tools">;
+  readonly url: string;
+  readonly status?: number;
+  readonly statusText?: string;
+  readonly responseSnippet?: string;
+  readonly sessionId?: string;
+
+  constructor(params: {
+    category: Exclude<MCPDiagnosticCategory, "ok" | "empty_tools">;
+    message: string;
+    url: string;
+    status?: number;
+    statusText?: string;
+    responseSnippet?: string;
+    sessionId?: string;
+  }) {
+    super(params.message);
+    this.name = "MCPRequestError";
+    this.category = params.category;
+    this.url = params.url;
+    this.status = params.status;
+    this.statusText = params.statusText;
+    this.responseSnippet = params.responseSnippet;
+    this.sessionId = params.sessionId;
+  }
+}
+
+let rpcIdCounter = 0;
+let invokePromise: Promise<InvokeFn | null> | null = null;
+const mcpSessions = new Map<string, McpSessionState>();
 
 let toolServerMap: Record<string, string> = {};
 
-/** Update the routing map (called by orchestrator after discovery). */
 export function setMcpToolServerMap(map: Record<string, string>): void {
   toolServerMap = { ...map };
 }
 
-/** Read the current routing map. */
 export function getMcpToolServerMap(): Record<string, string> {
   return toolServerMap;
 }
 
-/** Check if a tool name belongs to a discovered MCP server. */
 export function isMcpTool(name: string): boolean {
   return name in toolServerMap;
 }
 
-/** Get the server URL that provides a given MCP tool. */
 export function getMcpServerUrl(toolName: string): string | undefined {
   return toolServerMap[toolName];
 }
 
-// ── Tool Discovery ─────────────────────────────────────────────────
+function getSession(url: string): McpSessionState {
+  const existing = mcpSessions.get(url);
+  if (existing) return existing;
+  const created: McpSessionState = {
+    initialized: false,
+    protocolVersion: MCP_PROTOCOL_VERSION,
+  };
+  mcpSessions.set(url, created);
+  return created;
+}
 
-/**
- * Discover available tools from a single MCP server.
- * Sends a JSON-RPC `tools/list` request via HTTP POST.
- */
+function resetSession(url: string): void {
+  mcpSessions.set(url, {
+    initialized: false,
+    protocolVersion: MCP_PROTOCOL_VERSION,
+  });
+}
+
+function getResponseSnippet(text: string): string | undefined {
+  const normalized = String(text || "").replace(/\s+/g, " ").trim();
+  if (!normalized) return undefined;
+  return normalized.slice(0, 260);
+}
+
+function extractSessionId(headers?: Record<string, string>): string | undefined {
+  if (!headers) return undefined;
+  return headers[MCP_SESSION_HEADER] || headers["Mcp-Session-Id"] || headers["MCP-Session-Id"];
+}
+
+function parseSseJsonRpc(body: string): JsonRpcResponse | null {
+  const payloads: string[] = [];
+  const dataLines: string[] = [];
+  for (const line of body.split(/\r?\n/)) {
+    if (line.startsWith("data:")) {
+      dataLines.push(line.slice(5).trimStart());
+      continue;
+    }
+    if (!line.trim() && dataLines.length > 0) {
+      payloads.push(dataLines.join("\n"));
+      dataLines.length = 0;
+    }
+  }
+  if (dataLines.length > 0) payloads.push(dataLines.join("\n"));
+
+  for (const payload of payloads) {
+    if (!payload || payload === "[DONE]") continue;
+    try {
+      const parsed = JSON.parse(payload) as JsonRpcResponse;
+      if (parsed && typeof parsed === "object") return parsed;
+    } catch {
+      // ignore invalid chunk
+    }
+  }
+  return null;
+}
+
+function parseJsonRpcBody(body: string, contentType?: string): JsonRpcResponse | null {
+  const text = String(body || "").trim();
+  if (!text) return null;
+  const normalizedType = String(contentType || "").toLowerCase();
+
+  if (normalizedType.includes("text/event-stream") || text.startsWith("event:") || text.includes("\ndata:")) {
+    return parseSseJsonRpc(text);
+  }
+
+  try {
+    return JSON.parse(text) as JsonRpcResponse;
+  } catch {
+    return null;
+  }
+}
+
+function categorizeHttpStatus(status: number): Exclude<MCPDiagnosticCategory, "ok" | "empty_tools"> {
+  if (status === 404 || status === 405) return "route_mismatch";
+  if (status === 406) return "header_mismatch";
+  return "http_error";
+}
+
+function buildHttpErrorMessage(
+  category: Exclude<MCPDiagnosticCategory, "ok" | "empty_tools">,
+  status: number,
+  responseSnippet?: string,
+): string {
+  if (category === "route_mismatch") {
+    return `HTTP ${status}. MCP route mismatch; check whether the URL should include "/mcp".`;
+  }
+  if (category === "header_mismatch") {
+    return `HTTP ${status}. MCP server requires Accept: ${MCP_ACCEPT_HEADER}.`;
+  }
+  if (status === 400 && /missing session id/i.test(String(responseSnippet || ""))) {
+    return `HTTP ${status}. MCP session is required; the client needs to initialize and reuse mcp-session-id.`;
+  }
+  return `HTTP ${status}.`;
+}
+
+async function getInvoke(): Promise<InvokeFn | null> {
+  if (!invokePromise) {
+    invokePromise = import("@tauri-apps/api/core")
+      .then((mod) => mod.invoke as InvokeFn)
+      .catch(() => null);
+  }
+  return invokePromise;
+}
+
+async function requestViaRustProxy(
+  url: string,
+  method: "GET" | "POST" | "DELETE",
+  headers: Record<string, string>,
+  body?: string,
+): Promise<ProxyDetailedResponse> {
+  const invoke = await getInvoke();
+  if (!invoke) {
+    throw new MCPRequestError({
+      category: "unreachable",
+      message: "Rust HTTP proxy unavailable in current runtime.",
+      url,
+    });
+  }
+
+  try {
+    return await invoke<ProxyDetailedResponse>("proxy_request_detailed", {
+      url,
+      method,
+      headers,
+      body: body ?? null,
+    });
+  } catch (err) {
+    const reason = err instanceof Error && err.message ? err.message : String(err);
+    throw new MCPRequestError({
+      category: "unreachable",
+      message: `Unable to reach MCP server (${url}). ${reason}`,
+      url,
+    });
+  }
+}
+
+async function sendJsonRpcRequest(
+  url: string,
+  request: JsonRpcRequest,
+  session: McpSessionState,
+): Promise<JsonRpcResponse> {
+  const headers: Record<string, string> = {
+    Accept: MCP_ACCEPT_HEADER,
+    "Content-Type": "application/json",
+  };
+  if (session.sessionId) headers[MCP_SESSION_HEADER] = session.sessionId;
+  if (session.protocolVersion) headers["mcp-protocol-version"] = session.protocolVersion;
+
+  const response = await requestViaRustProxy(url, "POST", headers, JSON.stringify(request));
+  const sessionIdFromHeader = extractSessionId(response.headers);
+  if (sessionIdFromHeader) session.sessionId = sessionIdFromHeader;
+
+  const snippet = getResponseSnippet(response.body);
+  const json = parseJsonRpcBody(response.body, response.contentType);
+
+  if (!response.ok) {
+    if (json?.error) {
+      throw new MCPRequestError({
+        category: "rpc_error",
+        message: `MCP error [${json.error.code}] ${json.error.message}`,
+        url,
+        status: response.status,
+        statusText: `HTTP ${response.status}`,
+        responseSnippet: snippet,
+        sessionId: sessionIdFromHeader,
+      });
+    }
+    const category = categorizeHttpStatus(response.status);
+    throw new MCPRequestError({
+      category,
+      message: buildHttpErrorMessage(category, response.status, snippet),
+      url,
+      status: response.status,
+      statusText: `HTTP ${response.status}`,
+      responseSnippet: snippet,
+      sessionId: sessionIdFromHeader,
+    });
+  }
+
+  if (!json || typeof json !== "object") {
+    throw new MCPRequestError({
+      category: "invalid_response",
+      message: "MCP server returned a non-JSON response.",
+      url,
+      status: response.status,
+      statusText: `HTTP ${response.status}`,
+      responseSnippet: snippet,
+      sessionId: sessionIdFromHeader,
+    });
+  }
+
+  if (json.error) {
+    throw new MCPRequestError({
+      category: "rpc_error",
+      message: `MCP error [${json.error.code}] ${json.error.message}`,
+      url,
+      status: response.status,
+      statusText: `HTTP ${response.status}`,
+      responseSnippet: snippet,
+      sessionId: sessionIdFromHeader,
+    });
+  }
+
+  return json;
+}
+
+function shouldRecoverSession(err: unknown): boolean {
+  if (!(err instanceof MCPRequestError)) return false;
+  if (err.category !== "rpc_error" && err.category !== "http_error") return false;
+  const msg = (err.message || "").toLowerCase();
+  return msg.includes("missing session") || msg.includes("unknown session") || msg.includes("invalid session");
+}
+
+async function ensureMcpInitialized(server: MCPServer, session: McpSessionState): Promise<void> {
+  if (session.initialized) return;
+
+  const initializeRequest: JsonRpcRequest = {
+    jsonrpc: "2.0",
+    id: ++rpcIdCounter,
+    method: "initialize",
+    params: {
+      protocolVersion: session.protocolVersion || MCP_PROTOCOL_VERSION,
+      capabilities: {},
+      clientInfo: {
+        name: "MAIN",
+        version: "1.6.1",
+      },
+    },
+  };
+
+  const runInitialize = async () => sendJsonRpcRequest(server.url, initializeRequest, session);
+
+  let initialized = false;
+  try {
+    const initJson = await runInitialize();
+    const protocolVersion = String(initJson.result?.protocolVersion || "").trim();
+    if (protocolVersion) session.protocolVersion = protocolVersion;
+    initialized = true;
+  } catch (err) {
+    if (err instanceof MCPRequestError && err.sessionId && !session.sessionId) {
+      session.sessionId = err.sessionId;
+      const initJson = await runInitialize();
+      const protocolVersion = String(initJson.result?.protocolVersion || "").trim();
+      if (protocolVersion) session.protocolVersion = protocolVersion;
+      initialized = true;
+    } else {
+      throw err;
+    }
+  }
+
+  if (!initialized) return;
+  session.initialized = true;
+
+  // Best-effort notification for streamable MCP initialization lifecycle.
+  try {
+    await sendJsonRpcRequest(server.url, {
+      jsonrpc: "2.0",
+      method: "notifications/initialized",
+    }, session);
+  } catch {
+    // Some servers ignore or reject this notification; discovery can still proceed.
+  }
+}
+
+function toMcpDiagnostic(err: unknown): MCPDiagnostic {
+  if (err instanceof MCPRequestError) {
+    return {
+      category: err.category,
+      message: err.message,
+      status: err.status,
+      statusText: err.statusText,
+      responseSnippet: err.responseSnippet,
+    };
+  }
+  return {
+    category: "invalid_response",
+    message: err instanceof Error ? err.message : String(err),
+  };
+}
+
 export async function discoverMcpTools(server: MCPServer): Promise<MCPTool[]> {
+  const session = getSession(server.url);
+  await ensureMcpInitialized(server, session);
+
   const request: JsonRpcRequest = {
     jsonrpc: "2.0",
     id: ++rpcIdCounter,
     method: "tools/list",
+    params: {},
   };
 
-  const response = await fetch(server.url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(request),
-  });
-
-  if (!response.ok) {
-    throw new Error(
-      `MCP discovery failed for ${server.name}: HTTP ${response.status} ${response.statusText}`
-    );
+  try {
+    const json = await sendJsonRpcRequest(server.url, request, session);
+    return json.result?.tools ?? [];
+  } catch (err) {
+    if (shouldRecoverSession(err)) {
+      resetSession(server.url);
+      const refreshed = getSession(server.url);
+      await ensureMcpInitialized(server, refreshed);
+      const retried = await sendJsonRpcRequest(server.url, request, refreshed);
+      return retried.result?.tools ?? [];
+    }
+    throw err;
   }
-
-  const json: JsonRpcResponse = await response.json();
-
-  if (json.error) {
-    throw new Error(`MCP error from ${server.name}: [${json.error.code}] ${json.error.message}`);
-  }
-
-  return json.result?.tools ?? [];
 }
 
-/**
- * Discover tools from all configured MCP servers concurrently.
- * Failed servers are silently skipped (logged as warnings).
- * Returns the merged tool list and a tool→server URL routing map.
- */
+export async function testMcpServer(server: MCPServer): Promise<MCPServerTestResult> {
+  try {
+    const tools = await discoverMcpTools(server);
+    if (tools.length === 0) {
+      return {
+        serverName: server.name,
+        url: server.url,
+        ok: false,
+        toolCount: 0,
+        category: "empty_tools",
+        message: "Connected to MCP server but no tools were returned.",
+      };
+    }
+    return {
+      serverName: server.name,
+      url: server.url,
+      ok: true,
+      toolCount: tools.length,
+      category: "ok",
+      message: `Connected and discovered ${tools.length} tool(s).`,
+    };
+  } catch (err) {
+    const diagnostic = toMcpDiagnostic(err);
+    return {
+      serverName: server.name,
+      url: server.url,
+      ok: false,
+      toolCount: 0,
+      ...diagnostic,
+    };
+  }
+}
+
 export async function discoverAllMcpTools(
   servers: MCPServer[],
 ): Promise<{ tools: MCPTool[]; toolServerMap: Record<string, string> }> {
   const allTools: MCPTool[] = [];
   const map: Record<string, string> = {};
-
   const httpServers = servers.filter((s) => s.type === "http" && s.enabled !== false);
 
   const results = await Promise.allSettled(
@@ -125,37 +480,42 @@ export async function discoverAllMcpTools(
           map[tool.name] = server.url;
         }
       } catch (err) {
-        console.warn(
-          `[MCP] Failed to discover tools from ${server.name} (${server.url}):`,
-          err instanceof Error ? err.message : err
-        );
+        const diagnostic = toMcpDiagnostic(err);
+        console.warn(`[MCP] Failed to discover tools from ${server.name} (${server.url}): ${diagnostic.message}`);
+        console.warn("[MCP] Discovery diagnostics", {
+          server: server.name,
+          url: server.url,
+          category: diagnostic.category,
+          status: diagnostic.status,
+          responseSnippet: diagnostic.responseSnippet,
+        });
       }
     }),
   );
 
-  // Log any unexpected rejections (shouldn't happen due to try/catch above)
   for (const r of results) {
     if (r.status === "rejected") {
-      console.warn("[MCP] Unexpected rejection during discovery:", r.reason);
+      const diagnostic = toMcpDiagnostic(r.reason);
+      console.warn("[MCP] Unexpected rejection during discovery:", {
+        category: diagnostic.category,
+        message: diagnostic.message,
+        status: diagnostic.status,
+        responseSnippet: diagnostic.responseSnippet,
+      });
     }
   }
 
   return { tools: allTools, toolServerMap: map };
 }
 
-// ── Tool Execution ─────────────────────────────────────────────────
-
-/**
- * Execute a tool call on an MCP server.
- * Sends a JSON-RPC `tools/call` request via HTTP POST.
- * Returns the result as a string (for compatibility with the existing
- * tool result pipeline that feeds back into the LLM context).
- */
 export async function executeMcpTool(
   serverUrl: string,
   toolName: string,
   args: Record<string, unknown>,
 ): Promise<string> {
+  const session = getSession(serverUrl);
+  await ensureMcpInitialized({ name: "MCP", type: "http", url: serverUrl }, session);
+
   const request: JsonRpcRequest = {
     jsonrpc: "2.0",
     id: ++rpcIdCounter,
@@ -163,36 +523,26 @@ export async function executeMcpTool(
     params: { name: toolName, arguments: args },
   };
 
-  const response = await fetch(serverUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(request),
-  });
-
-  if (!response.ok) {
-    throw new Error(
-      `MCP execution failed for ${toolName}: HTTP ${response.status} ${response.statusText}`
-    );
+  let json: JsonRpcResponse;
+  try {
+    json = await sendJsonRpcRequest(serverUrl, request, session);
+  } catch (err) {
+    if (shouldRecoverSession(err)) {
+      resetSession(serverUrl);
+      const refreshed = getSession(serverUrl);
+      await ensureMcpInitialized({ name: "MCP", type: "http", url: serverUrl }, refreshed);
+      json = await sendJsonRpcRequest(serverUrl, request, refreshed);
+    } else {
+      throw err;
+    }
   }
 
-  const json: JsonRpcResponse = await response.json();
-
-  if (json.error) {
-    throw new Error(
-      `MCP tool error for ${toolName}: [${json.error.code}] ${json.error.message}`
-    );
-  }
-
-  // MCP `tools/call` returns { content: [{ type: "text", text: "..." }, ...] }
   const content = json.result?.content;
   if (Array.isArray(content)) {
     return content
-      .map((c: any) =>
-        typeof c === "string" ? c : c.text ?? JSON.stringify(c)
-      )
+      .map((c: any) => (typeof c === "string" ? c : c.text ?? JSON.stringify(c)))
       .join("\n");
   }
 
-  // Fallback: serialize the entire result
   return JSON.stringify(json.result ?? {});
 }

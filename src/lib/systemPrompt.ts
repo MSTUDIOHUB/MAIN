@@ -111,6 +111,7 @@ export function buildSystemPrompt(
   gameStudioContext?: GameStudioPromptContext,
   turnIntentOverride?: ResolvedUserIntent,
   promptLanguageStrategy: PromptLanguageStrategy = "english_core_localized_output",
+  thinkingPolicy: "normal" | "action_only" = "normal",
   availableToolNames?: string[],
   commandDirective?: CommandDirective | null,
 ): string {
@@ -218,6 +219,16 @@ export function buildSystemPrompt(
     "3. 基于代码内容（而非目录名称）给出有价值的分析。",
     "4. 如果用户消息里包含附件预览，并出现 `truncatedPreview: true`、`attached_tabular_file` 或明确的 `path:` 字段，你必须把它视为“只给了预览，不是全量内容”，不能直接据此下完整结论，应继续对该路径调用工具。",
   ].join("\n"));
+
+  if (thinkingPolicy === "action_only") {
+    parts.push([
+      "================================",
+      "[ACTION-ONLY THINKING POLICY]",
+      "当前会话已启用 Action-only：尽量只输出结论、执行动作、结果和下一步。",
+      "不要主动输出 `<analysis>`、`<thought>`、`<thinking>`、`<reasoning>` 标签正文。",
+      "避免长篇推理过程复述；用简短可执行语句替代。",
+    ].join("\n"));
+  }
 
   if (shellToolsAvailable) {
     parts.push("命令工具调用契约：`run_command` 与 `execute_command` 必须带 `description` 和工作区相对 `cwd`（根目录用 `.`）；一次性命令尽量设置合适的 `timeout_ms`。");

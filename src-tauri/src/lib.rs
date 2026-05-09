@@ -1221,6 +1221,54 @@ fn annotate_session_meta(
     meta
 }
 
+fn session_sort_numeric(value: &Value, key: &str) -> i64 {
+    match value.get(key) {
+        Some(Value::Number(number)) => number.as_i64().unwrap_or(0),
+        Some(Value::String(text)) => text.trim().parse::<i64>().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+fn session_sort_string(value: &Value, key: &str) -> String {
+    match value.get(key) {
+        Some(Value::String(text)) => text.trim().to_string(),
+        Some(Value::Number(number)) => number.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn sort_sessions_by_recent(sessions: &mut Vec<Value>) {
+    sessions.sort_by(|a, b| {
+        let a_updated_ms = session_sort_numeric(a, "updatedAtMs");
+        let b_updated_ms = session_sort_numeric(b, "updatedAtMs");
+        if a_updated_ms != b_updated_ms {
+            return b_updated_ms.cmp(&a_updated_ms);
+        }
+
+        let a_updated = session_sort_string(a, "updatedAt");
+        let b_updated = session_sort_string(b, "updatedAt");
+        if a_updated != b_updated {
+            return b_updated.cmp(&a_updated);
+        }
+
+        let a_date = session_sort_string(a, "date");
+        let b_date = session_sort_string(b, "date");
+        if a_date != b_date {
+            return b_date.cmp(&a_date);
+        }
+
+        let a_id_num = session_sort_numeric(a, "id");
+        let b_id_num = session_sort_numeric(b, "id");
+        if a_id_num != b_id_num {
+            return b_id_num.cmp(&a_id_num);
+        }
+
+        let a_id = session_sort_string(a, "id");
+        let b_id = session_sort_string(b, "id");
+        b_id.cmp(&a_id)
+    });
+}
+
 fn rebuild_sessions_index_for_project(
     project_root: &Path,
     project_id: &str,
@@ -1250,11 +1298,7 @@ fn rebuild_sessions_index_for_project(
         ));
     }
 
-    sessions.sort_by(|a, b| {
-        let a_date = a.get("date").and_then(Value::as_str).unwrap_or("");
-        let b_date = b.get("date").and_then(Value::as_str).unwrap_or("");
-        b_date.cmp(a_date)
-    });
+    sort_sessions_by_recent(&mut sessions);
 
     let index = json!({
         "projectId": project_id,
@@ -1268,27 +1312,6 @@ fn rebuild_sessions_index_for_project(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default())
-}
-
-fn merge_session_lists(index_sessions: Vec<Value>, disk_sessions: Vec<Value>) -> Vec<Value> {
-    let mut by_id: HashMap<String, Value> = HashMap::new();
-    for session in index_sessions {
-        if let Ok(session_id) = session_id_from_object(&session) {
-            by_id.insert(session_id, session);
-        }
-    }
-    for session in disk_sessions {
-        if let Ok(session_id) = session_id_from_object(&session) {
-            by_id.insert(session_id, session);
-        }
-    }
-    let mut sessions: Vec<Value> = by_id.into_values().collect();
-    sessions.sort_by(|a, b| {
-        let a_date = a.get("date").and_then(Value::as_str).unwrap_or("");
-        let b_date = b.get("date").and_then(Value::as_str).unwrap_or("");
-        b_date.cmp(a_date)
-    });
-    sessions
 }
 
 fn ensure_in_workspace(path: &Path, workspace: &Path) -> Result<(), String> {
@@ -1533,6 +1556,16 @@ fn response_with_content_type(body: String, content_type: Option<&str>) -> Strin
     } else {
         body
     }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProxyDetailedResponse {
+    status: u16,
+    ok: bool,
+    body: String,
+    content_type: Option<String>,
+    headers: std::collections::HashMap<String, String>,
 }
 
 // region: grep 辅助
@@ -2988,28 +3021,28 @@ fn read_attachment_image_data_url(source_path: String) -> Result<String, String>
 fn list_project_sessions(app: AppHandle, workspace: String) -> Result<Vec<Value>, String> {
     let (project_root, project_id, workspace_root) = sessions_project_root(&app, &workspace)?;
     let index_path = session_index_path(&project_root);
-    let disk_sessions =
-        rebuild_sessions_index_for_project(&project_root, &project_id, &workspace_root)?;
     if index_path.exists() {
-        let index = read_json_file(&index_path)?;
-        if let Some(sessions) = index.get("sessions").and_then(Value::as_array) {
-            let index_sessions = sessions
-                .iter()
-                .map(|session| {
-                    let session_id =
-                        session_id_from_object(session).unwrap_or_else(|_| "session".to_string());
-                    annotate_session_meta(
-                        session.clone(),
-                        &project_id,
-                        &workspace_root,
-                        &session_dir(&project_root, &session_id),
-                    )
-                })
-                .collect();
-            return Ok(merge_session_lists(index_sessions, disk_sessions));
+        if let Ok(index) = read_json_file(&index_path) {
+            if let Some(sessions) = index.get("sessions").and_then(Value::as_array) {
+                let mut index_sessions: Vec<Value> = sessions
+                    .iter()
+                    .map(|session| {
+                        let session_id =
+                            session_id_from_object(session).unwrap_or_else(|_| "session".to_string());
+                        annotate_session_meta(
+                            session.clone(),
+                            &project_id,
+                            &workspace_root,
+                            &session_dir(&project_root, &session_id),
+                        )
+                    })
+                    .collect();
+                sort_sessions_by_recent(&mut index_sessions);
+                return Ok(index_sessions);
+            }
         }
     }
-    Ok(disk_sessions)
+    rebuild_sessions_index_for_project(&project_root, &project_id, &workspace_root)
 }
 
 #[tauri::command]
@@ -3092,10 +3125,22 @@ fn save_project_session(
         "workspaceRoot".to_string(),
         Value::String(workspace_root.clone()),
     );
-    meta.insert(
-        "updatedAtMs".to_string(),
-        Value::Number(now_millis().into()),
-    );
+    let updated_at_ms = meta
+        .get("updatedAtMs")
+        .and_then(|value| match value {
+            Value::Number(number) => number.as_i64(),
+            Value::String(text) => text.trim().parse::<i64>().ok(),
+            _ => None,
+        })
+        .filter(|value| *value > 0);
+    if let Some(value) = updated_at_ms {
+        meta.insert(
+            "updatedAtMs".to_string(),
+            Value::Number(value.into()),
+        );
+    } else {
+        meta.remove("updatedAtMs");
+    }
     meta.insert("storageStatus".to_string(), Value::String("ok".to_string()));
 
     let meta_value = Value::Object(meta);
@@ -5854,6 +5899,72 @@ async fn proxy_request(
 }
 
 #[tauri::command]
+async fn proxy_request_detailed(
+    url: String,
+    method: String,
+    headers: Option<std::collections::HashMap<String, String>>,
+    body: Option<String>,
+) -> Result<ProxyDetailedResponse, String> {
+    let headers = headers.unwrap_or_default();
+    let meth = method.to_uppercase();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(HTTP_SHORT_TIMEOUT_SECS))
+        .read_timeout(Duration::from_secs(STREAM_READ_TIMEOUT_SECS))
+        .connect_timeout(Duration::from_secs(HTTP_CONNECT_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| format!("创建 HTTP 客户端失败: {e}"))?;
+
+    let mut req = match meth.as_str() {
+        "GET" => client.get(&url),
+        "POST" => client.post(&url),
+        "DELETE" => client.delete(&url),
+        _ => return Err(format!("Unsupported HTTP method: {meth}")),
+    };
+
+    if meth == "POST" && !has_header_case_insensitive(&headers, "Content-Type") {
+        req = req.header("Content-Type", "application/json");
+    }
+
+    for (key, value) in &headers {
+        req = req.header(key.as_str(), value.as_str());
+    }
+
+    let req = if let Some(body_str) = body { req.body(body_str) } else { req };
+
+    let response = req
+        .send()
+        .await
+        .map_err(|e| format!("请求失败: {e}"))?;
+
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+
+    let mut response_headers = std::collections::HashMap::new();
+    for (name, value) in response.headers().iter() {
+        if let Ok(text) = value.to_str() {
+            response_headers.insert(name.as_str().to_ascii_lowercase(), text.to_string());
+        }
+    }
+
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("读取响应失败: {e}"))?;
+
+    Ok(ProxyDetailedResponse {
+        status: status.as_u16(),
+        ok: status.is_success(),
+        body,
+        content_type,
+        headers: response_headers,
+    })
+}
+
+#[tauri::command]
 fn cancel_proxy_request() -> Result<(), String> {
     PROXY_REQUEST_CANCEL.store(true, std::sync::atomic::Ordering::Relaxed);
     if let Ok(mut slot) = PROXY_REQUEST_ABORT.lock() {
@@ -7660,12 +7771,27 @@ fn generate_app_icon_png(variant: &str) -> Vec<u8> {
 }
 
 #[cfg(target_os = "macos")]
+fn current_macos_app_bundle_path() -> Option<std::path::PathBuf> {
+    let executable = std::env::current_exe().ok()?;
+    executable
+        .ancestors()
+        .find(|path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("app"))
+                .unwrap_or(false)
+        })
+        .map(|path| path.to_path_buf())
+}
+
+#[cfg(target_os = "macos")]
 fn apply_app_icon_variant_macos(app: AppHandle, variant: String) -> Result<(), String> {
     use objc2::{AllocAnyThread, MainThreadMarker};
-    use objc2_app_kit::{NSApp, NSImage};
-    use objc2_foundation::NSData;
+    use objc2_app_kit::{NSApp, NSImage, NSWorkspace, NSWorkspaceIconCreationOptions};
+    use objc2_foundation::{NSData, NSString};
     use std::sync::mpsc;
 
+    let bundle_path = current_macos_app_bundle_path();
     let (tx, rx) = mpsc::channel();
     app.run_on_main_thread(move || {
         let result = (|| -> Result<(), String> {
@@ -7679,6 +7805,28 @@ fn apply_app_icon_variant_macos(app: AppHandle, variant: String) -> Result<(), S
             let ns_app = NSApp(mtm);
             unsafe {
                 ns_app.setApplicationIconImage(Some(&image));
+            }
+            if let Some(path) = &bundle_path {
+                let path_string = path.to_string_lossy().to_string();
+                let ns_path = NSString::from_str(&path_string);
+                let workspace = NSWorkspace::sharedWorkspace();
+                let _ = workspace.setIcon_forFile_options(
+                    None,
+                    &ns_path,
+                    NSWorkspaceIconCreationOptions::empty(),
+                );
+                let set_ok = workspace.setIcon_forFile_options(
+                    Some(&image),
+                    &ns_path,
+                    NSWorkspaceIconCreationOptions::empty(),
+                );
+                workspace.noteFileSystemChanged_(&ns_path);
+                if !set_ok {
+                    return Err(format!(
+                        "macOS could not update the app bundle icon at {}",
+                        path.display()
+                    ));
+                }
             }
             Ok(())
         })();
@@ -7758,6 +7906,7 @@ pub fn run() {
             cloud_auth_status,
             cloud_auth_logout,
             proxy_request,
+            proxy_request_detailed,
             cancel_proxy_request,
             start_chat_stream,
             cancel_chat_stream,

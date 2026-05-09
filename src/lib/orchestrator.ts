@@ -30,7 +30,7 @@ import { generateId } from "./utils";
 import { buildSystemPrompt } from "./systemPrompt";
 import { discoverAllMcpTools, getMcpToolServerMap, setMcpToolServerMap, type MCPServer, type MCPTool } from "./mcpClient";
 import { getFileMetadata } from "./ipc";
-import { ensureVisibleConclusion, isAssistantTurnEmpty, isSyntheticVisibleConclusion, normalizeAssistantTurn } from "./normalizedTurn";
+import { ensureVisibleConclusionWithPolicy, isAssistantTurnEmpty, isSyntheticVisibleConclusion, normalizeAssistantTurn } from "./normalizedTurn";
 import { hasStructuredPlanProposal } from "./planProposal";
 import {
   buildReadOnlyPermissionContinuationPrompt,
@@ -507,7 +507,7 @@ function deriveStreamSettings(config: AppConfig): StreamSettings {
     tokenRef: config.cloudExperimentalLoginEnabled === true ? config.cloud.auth?.tokenRef : undefined,
     customHeaders: config.cloud.customHeaders || "",
     disableResponseStorage: config.cloud.disableResponseStorage ?? true,
-    reasoningEffort: config.cloud.reasoningEffort ?? "none",
+    reasoningEffort: config.thinkingPolicy === "action_only" ? "none" : (config.cloud.reasoningEffort ?? "none"),
     toolProtocol: normalizeCloudToolProtocol(config.cloud.toolProtocol),
     // Cloud profile should not inherit the local KV-cache/context limit.
     contextLimit: undefined,
@@ -2079,6 +2079,7 @@ export async function executeAgentLoop(
       },
       runtimeIntent,
       config.promptLanguageStrategy,
+      config.thinkingPolicy ?? "normal",
       availableToolNameList,
       callbacks.getCommandDirective?.() ?? null,
     );
@@ -2740,7 +2741,10 @@ export async function executeAgentLoop(
 
     // 3. 将不同模型输出统一整理成标准结构，避免 UI 继续靠多处分支猜测。
     const normalizedBase = normalizeAssistantTurn(streamResult);
-    const normalized = ensureVisibleConclusion(normalizedBase);
+    const normalized = ensureVisibleConclusionWithPolicy(
+      normalizedBase,
+      config.thinkingPolicy !== "action_only",
+    );
     if (isAssistantTurnEmpty(normalized)) {
       consecutiveEmptyResponseCount++;
       if (consecutiveEmptyResponseCount >= 3) {

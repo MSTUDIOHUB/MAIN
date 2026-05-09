@@ -174,6 +174,7 @@ test("system prompt lists only intent-filtered tools when available names are pr
     undefined,
     undefined,
     "english_core_localized_output",
+    "normal",
     ["read_file", "write_file", "replace_in_file"],
   );
 
@@ -295,6 +296,7 @@ test("execute prompt forbids pseudo tool call placeholders", () => {
     },
     "studio_workflow",
     "english_core_localized_output",
+    "normal",
     ["read_file", "replace_in_file"],
   );
 

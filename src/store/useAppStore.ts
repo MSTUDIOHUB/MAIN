@@ -189,9 +189,10 @@ import {
   type ToolPermissionPolicy,
 } from "../lib/toolCapabilities";
 import {
-  normalizeThoughtDisplayMode,
+  deriveThoughtDisplay,
+  normalizeThinkingPolicyWithLegacy,
   normalizeThoughtSummaryForCompare,
-  type ThoughtDisplayMode,
+  type ThinkingPolicy,
 } from "../lib/thoughtDisplay";
 
 function logStoreEvent(event: string, data: Record<string, unknown> = {}) {
@@ -268,11 +269,10 @@ export const translations = {
     themeDesc: "Choose your preferred editor highlight color.",
     chatFontSize: "Chat Font Size",
     chatFontSizeDesc: "Adjust the text size in the chat area (10–20 px).",
-    thoughtDisplay: "Thinking Display",
-    thoughtDisplayDesc: "Show filtered model process notes without flooding the chat with raw long thinking.",
-    thoughtDisplayHidden: "Hidden",
-    thoughtDisplaySummary: "Brief",
-    thoughtDisplayDetailed: "Detailed",
+    thinkingPolicy: "Thinking Policy",
+    thinkingPolicyDesc: "Choose whether to keep model process notes or force action-only responses.",
+    thinkingPolicyNormal: "Normal",
+    thinkingPolicyActionOnly: "Action-only",
     themeMode: "Appearance",
     themeModeDark: "Dark",
     themeModeBlack: "Black",
@@ -380,11 +380,10 @@ export const translations = {
     themeDesc: "选择你偏好的代码编辑器高亮色彩风格。",
     chatFontSize: "聊天区域文字大小",
     chatFontSizeDesc: "调整聊天区域的文字显示大小（10–20 px）。",
-    thoughtDisplay: "思考显示",
-    thoughtDisplayDesc: "显示过滤后的模型过程，避免原始长文本刷屏。",
-    thoughtDisplayHidden: "隐藏",
-    thoughtDisplaySummary: "简洁",
-    thoughtDisplayDetailed: "详细",
+    thinkingPolicy: "思考策略",
+    thinkingPolicyDesc: "选择保留模型过程说明，或强制仅输出结论与执行动作。",
+    thinkingPolicyNormal: "正常",
+    thinkingPolicyActionOnly: "仅结论/动作",
     themeMode: "外观模式",
     themeModeDark: "深色",
     themeModeBlack: "黑色",
@@ -673,7 +672,7 @@ export interface AppConfig {
   hooksEnabled: boolean;
   activeProfile: "local" | "cloud";
   chatFontSize: number;  // px, default 13
-  thoughtDisplayMode: ThoughtDisplayMode;
+  thinkingPolicy: ThinkingPolicy;
   sessionRecordingEnabled: boolean;
   local: LocalConfig;
   cloud: CloudConfig;
@@ -1129,7 +1128,7 @@ const defaultConfig: AppConfig = {
   hooksEnabled: true,
   activeProfile: "local",
   chatFontSize: 13,
-  thoughtDisplayMode: "hidden",
+  thinkingPolicy: "normal",
   sessionRecordingEnabled: true,
   local: { provider: "OMLX", endpoint: "http://127.0.0.1:8080/v1", model: "", contextLimit: 16384, apiKey: "", toolProtocol: "auto" },
   cloud: defaultCloudState.cloud,
@@ -1803,6 +1802,13 @@ function compactThoughtContent(text: string): string {
   return limitThoughtContent(compactThoughtNoise(collapsedNearDuplicates));
 }
 
+function compactThoughtContentForPersist(text: string): string {
+  const compacted = compactThoughtContent(text);
+  const summarized = deriveThoughtDisplay(compacted, { maxSummaryLines: 3 }).summaryText;
+  if (summarized) return summarized;
+  return compacted.length > 1200 ? compacted.slice(0, 1200).trimEnd() : compacted;
+}
+
 function appendThoughtDelta(existing: string, incoming: string): string {
   const current = String(existing || "");
   const delta = String(incoming || "");
@@ -2437,7 +2443,12 @@ export function sanitizeTaskBlocksForPersist(blocks: TaskBlock[]): TaskBlock[] {
             : {}),
         };
       case "thought":
-        return { id: b.id, turnId: b.turnId, type: "thought" as const, content: compactThoughtContent(String(b.content)) };
+        return {
+          id: b.id,
+          turnId: b.turnId,
+          type: "thought" as const,
+          content: compactThoughtContentForPersist(String(b.content)),
+        };
       case "tool":
         return {
           id: b.id, turnId: b.turnId, type: "tool" as const,
@@ -4778,6 +4789,7 @@ export const useAppStore = create<AppState>()(
     const sendStartedAt = nowMs();
     console.log('[sendMessage] called, text:', text?.slice(0, 50), 'agentStatus:', state.agentStatus, 'workspace:', state.currentWorkspace, 'activeProfile:', state.config.activeProfile);
     const isHidden = options?.hidden === true;
+    const suppressThoughtOutput = state.config.thinkingPolicy === "action_only";
     const mentionSnapshot = options?.contextMentionsSnapshot ?? state.contextMentions;
     const attachedFilesSnapshot = options?.attachedFilesSnapshot ?? state.attachedFiles;
     const remoteFeishu = options?.remoteFeishu;
@@ -4945,6 +4957,7 @@ export const useAppStore = create<AppState>()(
       attachedFiles: attachedFilesSnapshot.length,
       images: images?.length ?? 0,
       mainDebugShortcut: !!mainDebugShortcut,
+      suppressThoughtOutput,
     });
     const isLocalStudioCommand =
       parsedStudioCommand?.type === "agent" || parsedStudioCommand?.type === "auto";
@@ -5342,6 +5355,7 @@ export const useAppStore = create<AppState>()(
         title: autoSessionTitle,
         date: autoSessionDate,
         updatedAt: autoSessionDate,
+        updatedAtMs: autoSessionId,
         active: true,
         storageStatus: "temporary",
         recordingDisabled: !state.config.sessionRecordingEnabled,
@@ -5373,6 +5387,15 @@ export const useAppStore = create<AppState>()(
     const runScopeKey = sessionScopeKey;
     const runSessionId = ensuredSessionId;
     const runSessionKey = resolveSessionRuntimeKey(runScopeKey, runSessionId)!;
+    const commandIssuedAtMs = Date.now();
+    const commandIssuedAtIso = new Date(commandIssuedAtMs).toISOString();
+    if (runSessionId) {
+      get().updateSession(runScopeKey, runSessionId, {
+        updatedAt: commandIssuedAtIso,
+        updatedAtMs: commandIssuedAtMs,
+        active: true,
+      });
+    }
     const backgroundRunningSessions = Object.entries(state.runtimeBySessionKey)
       .filter(([sessionKey, runtime]) =>
         sessionKey !== runSessionKey &&
@@ -6379,7 +6402,12 @@ export const useAppStore = create<AppState>()(
         if (!chunk) return;
 
         // Run through the thinking interceptor
-        const { agent, thinking, thoughtStarted, thoughtEnded } = thinkingInterceptor.feed(chunk);
+        let { agent, thinking, thoughtStarted, thoughtEnded } = thinkingInterceptor.feed(chunk);
+        if (suppressThoughtOutput) {
+          thinking = "";
+          thoughtStarted = false;
+          thoughtEnded = false;
+        }
 
         const latestStateForDedupe = sessionGet();
         const nextInterceptorThought = thinking
@@ -6791,6 +6819,9 @@ export const useAppStore = create<AppState>()(
         },
 
         onThought: (thought) => {
+          if (suppressThoughtOutput) {
+            return;
+          }
           const duration = thoughtStartTime
             ? Math.round((Date.now() - thoughtStartTime) / 1000)
             : undefined;
@@ -8221,7 +8252,10 @@ export const useAppStore = create<AppState>()(
             persistedState.config?.promptLanguageStrategy === "english_core_localized_output"
               ? persistedState.config.promptLanguageStrategy
               : current.config.promptLanguageStrategy,
-          thoughtDisplayMode: normalizeThoughtDisplayMode(persistedState.config?.thoughtDisplayMode),
+          thinkingPolicy: normalizeThinkingPolicyWithLegacy(
+            persistedState.config?.thinkingPolicy,
+            (persistedState.config as any)?.thoughtDisplayMode,
+          ),
           themeMode: normalizeThemeMode(persistedState.config?.themeMode),
           appIconVariant: normalizeAppIconVariant(persistedState.config?.appIconVariant),
           toolPermissionPolicy: normalizeToolPermissionPolicy(persistedState.config?.toolPermissionPolicy),

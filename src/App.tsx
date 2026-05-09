@@ -223,6 +223,8 @@ function shouldDiscardMissingSession(session: any): boolean {
 
 function sessionSortTime(session: any): number {
   const candidates = [
+    session?.updatedAtMs,
+    session?.updatedAt,
     session?.date,
     session?.id,
   ];
@@ -827,52 +829,6 @@ export default function App() {
     }
   }, []);
 
-  const persistCurrentSessionNow = useCallback(async () => {
-    const state = useAppStore.getState();
-    if (!state.currentSessionId) return;
-    const scopeKey = resolveSessionWorkspaceKey(state.currentWorkspace);
-    const snapshot = buildStoredSessionSnapshot(
-      state,
-      scopeKey,
-      state.currentSessionId,
-      sessionTranscriptCacheRef.current,
-    );
-    if (!snapshot) return;
-    if (
-      hasStoredSessionDetailPointer(snapshot) &&
-      !hasRecoverableSessionTranscript(snapshot) &&
-      (state.taskFlow || []).length === 0 &&
-      (state.conversationTurns || []).length === 0
-    ) {
-      return;
-    }
-    if (!hasPersistableSessionTranscript(snapshot)) {
-      return;
-    }
-
-    state.updateSession(scopeKey, state.currentSessionId, {
-      messages: snapshot.messages,
-      runtimeSnapshot: snapshot.runtimeSnapshot,
-    });
-
-    if (!state.config.sessionRecordingEnabled || snapshot.recordingDisabled) return;
-    try {
-      const saved = await saveProjectSession(scopeKey, snapshot);
-      state.updateSession(scopeKey, state.currentSessionId, {
-        ...saved,
-        storageStatus: "ok",
-        recordingDisabled: false,
-      });
-    } catch (error) {
-      appendDebugLog("warn", "session.storage", {
-        phase: "save_failed",
-        scopeKey,
-        sessionId: state.currentSessionId,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
-  }, []);
-
   const persistCurrentSessionInBackground = useCallback(() => {
     const state = useAppStore.getState();
     state.saveCurrentRuntimeToSession();
@@ -931,12 +887,6 @@ export default function App() {
         });
       });
   }, [cacheSessionTranscript]);
-
-  const settleCurrentSessionBeforeNavigation = useCallback(async () => {
-    const state = useAppStore.getState();
-    state.saveCurrentRuntimeToSession();
-    await persistCurrentSessionNow();
-  }, [persistCurrentSessionNow]);
 
   // ── Skills ────────────────────────────────────────────────────────────
   const skills = useAppStore((s) => s.skills);
@@ -1846,7 +1796,7 @@ export default function App() {
     const rawPath = String(path || "").trim();
     if (!rawPath) return;
     try {
-      await settleCurrentSessionBeforeNavigation();
+      persistCurrentSessionInBackground();
       let stablePath = rawPath;
       try {
         stablePath = await canonicalizeWorkspacePath(rawPath);
@@ -2035,6 +1985,7 @@ export default function App() {
         : (config.language === "en" ? "New Conversation" : "新会话"),
       date: createdAtIso,
       updatedAt: createdAtIso,
+      updatedAtMs: createdAt,
       active: true,
       storageStatus: "temporary" as const,
       recordingDisabled: !config.sessionRecordingEnabled,
@@ -2234,6 +2185,7 @@ export default function App() {
         title,
         date: createdAtIso,
         updatedAt: createdAtIso,
+        updatedAtMs: createdAt,
         active: true,
         storageStatus: "temporary",
         recordingDisabled: !state.config.sessionRecordingEnabled,
