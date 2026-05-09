@@ -107,6 +107,13 @@ test("MCP classification recognizes browser, search, GitHub write, and database 
     classifyMcpTool({ name: "postgres_query", description: "Run SQL against a database", inputSchema: {} }),
     "external_write",
   );
+  assert.equal(
+    classifyMcpTool(
+      { name: "apply_text_edits", description: "Apply text edits to a Unity script", inputSchema: {} },
+      { name: "Unity", type: "http", url: "http://127.0.0.1:8080/mcp" },
+    ),
+    "external_write",
+  );
 });
 
 test("intent filtering exposes read-only tools for chat and write/shell tools for execute", () => {
@@ -303,5 +310,40 @@ test("MCP routing keeps small lists and heuristically selects relevant tools abo
   assert.deepEqual(
     routed.tools.map((item) => item.name).sort(),
     ["browser_click", "browser_screenshot"],
+  );
+});
+
+test("Unity MCP-first routing keeps Unity server tools and forces read_console to the front", () => {
+  const servers = [
+    { name: "unityMCP", type: "http", url: "http://127.0.0.1:8080/mcp" },
+    { name: "research", type: "http", url: "http://research.test" },
+  ];
+  const tools = [
+    { name: "manage_scene", description: "Manage Unity scenes", inputSchema: {} },
+    { name: "read_console", description: "Read Unity Console errors and warnings", inputSchema: {} },
+    { name: "web_search", description: "Search the web", inputSchema: {} },
+  ];
+  const toolServerMap = {
+    manage_scene: "http://127.0.0.1:8080/mcp",
+    read_console: "http://127.0.0.1:8080/mcp",
+    web_search: "http://research.test",
+  };
+
+  const routed = routeMcpToolsForPrompt({
+    tools,
+    servers,
+    toolServerMap,
+    userPrompt: "检查一下 Unity console 报错",
+    config: { enabled: true, threshold: 1, routerModel: "", timeoutMs: 800, fallbackToFullList: true, disabledToolKeys: [] },
+    priorityMode: "unity_mcp_first",
+    preferredServerUrls: ["http://127.0.0.1:8080/mcp"],
+    forceFirstTools: ["read_console", "set_active_instance"],
+  });
+
+  assert.equal(routed.telemetry.pickSource, "heuristic");
+  assert.equal(routed.tools[0]?.name, "read_console");
+  assert.deepEqual(
+    routed.tools.map((item) => item.name).sort(),
+    ["manage_scene", "read_console"],
   );
 });

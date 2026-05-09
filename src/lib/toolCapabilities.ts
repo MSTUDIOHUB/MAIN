@@ -71,6 +71,8 @@ export interface McpRoutingTelemetry {
   estimatedTokenCost?: number;
 }
 
+export type McpRoutingPriorityMode = "none" | "unity_mcp_first";
+
 type SkillLike = {
   name: string;
   desc?: string;
@@ -201,6 +203,8 @@ const WEB_RESEARCH_TERMS = [
 
 const GITHUB_TERMS = ["github", "git hub", "issue", "pull request", " pr ", "repo", "repository"];
 const DATABASE_TERMS = ["sql", "sqlite", "postgres", "postgresql", "mysql", "database", "db", "table"];
+const UNITY_TERMS = ["unity", "gameobject", "prefab", "scene", "asset", "editor"];
+const UNITY_CONSOLE_TERMS = ["console", "error", "warning", "compile", "报错", "错误", "警告", "编译"];
 
 export function createDefaultToolPermissionPolicy(): ToolPermissionPolicy {
   return {
@@ -385,7 +389,8 @@ export function classifySkillTool(skillOrTool: SkillLike | ToolDefinition): Tool
 }
 
 export function classifyMcpTool(tool: MCPTool, server?: MCPServer): ToolRiskLevel {
-  const text = normalizeText(`${server?.name || ""} ${server?.url || ""} ${tool.name} ${tool.description || ""}`);
+  const text = normalizeText(`${server?.name || ""} ${tool.name} ${tool.description || ""}`);
+  if (tool.name === "read_console") return "external_read";
 
   if (containsAny(text, DESTRUCTIVE_TERMS)) return "destructive";
 
@@ -605,7 +610,7 @@ function extractQueryTerms(userPrompt: string): string[] {
 
 function scoreMcpToolForPrompt(tool: MCPTool, server: MCPServer | undefined, userPrompt: string): number {
   const prompt = normalizeText(userPrompt);
-  const text = normalizeText(`${server?.name || ""} ${server?.url || ""} ${tool.name} ${tool.description || ""}`);
+  const text = normalizeText(`${server?.name || ""} ${tool.name} ${tool.description || ""}`);
   let score = 0;
 
   for (const term of extractQueryTerms(userPrompt)) {
@@ -627,6 +632,12 @@ function scoreMcpToolForPrompt(tool: MCPTool, server: MCPServer | undefined, use
   if (containsAny(prompt, ["diagnostic", "symbol", "reference", "rename", "诊断", "符号", "引用"]) && containsAny(text, ["lsp", "diagnostic", "symbol", "reference", "rename"])) {
     score += 10;
   }
+  if (containsAny(prompt, UNITY_TERMS) && containsAny(text, UNITY_TERMS)) {
+    score += 12;
+  }
+  if (containsAny(prompt, UNITY_CONSOLE_TERMS) && containsAny(text, ["read_console", "console"])) {
+    score += 64;
+  }
 
   if (score === 0 && classifyMcpTool(tool, server) === "external_read" && containsReadIntent(text)) {
     score += 1;
@@ -641,6 +652,9 @@ export function routeMcpToolsForPrompt(params: {
   toolServerMap: Record<string, string>;
   userPrompt: string;
   config?: McpRoutingConfig;
+  priorityMode?: McpRoutingPriorityMode;
+  preferredServerUrls?: string[];
+  forceFirstTools?: string[];
 }): { tools: MCPTool[]; telemetry: McpRoutingTelemetry } {
   const startedAt = Date.now();
   const config = normalizeMcpRoutingConfig(params.config);
@@ -681,6 +695,43 @@ export function routeMcpToolsForPrompt(params: {
   };
 
   if (!config.enabled) return finish(enabledTools, "disabled");
+
+  if (params.priorityMode === "unity_mcp_first") {
+    const preferredServerUrls = new Set(
+      (params.preferredServerUrls ?? []).filter((url) => typeof url === "string" && url.trim().length > 0),
+    );
+    const scopedTools = preferredServerUrls.size > 0
+      ? enabledTools.filter((tool) => preferredServerUrls.has(params.toolServerMap[tool.name] || ""))
+      : enabledTools;
+    const candidateTools = scopedTools.length > 0 ? scopedTools : enabledTools;
+
+    const serverByUrl = buildServerLookup(params.servers);
+    const scoredTools = candidateTools
+      .map((tool) => {
+        const server = serverByUrl[params.toolServerMap[tool.name]];
+        return { tool, score: scoreMcpToolForPrompt(tool, server, params.userPrompt) };
+      })
+      .sort((a, b) => b.score - a.score || a.tool.name.localeCompare(b.tool.name))
+      .map((entry) => entry.tool);
+
+    const forcedOrder = (params.forceFirstTools ?? [])
+      .map((name) => candidateTools.find((tool) => tool.name === name))
+      .filter((tool): tool is MCPTool => !!tool);
+    const forcedNameSet = new Set(forcedOrder.map((tool) => tool.name));
+    const prioritized = [
+      ...forcedOrder,
+      ...scoredTools.filter((tool) => !forcedNameSet.has(tool.name)),
+    ];
+    if (prioritized.length > 0) {
+      return finish(prioritized, "heuristic");
+    }
+
+    if (config.fallbackToFullList) {
+      return finish(enabledTools, "fallback_full_list", "unity_priority_no_candidates");
+    }
+    return finish([], "safe_empty", "unity_priority_no_candidates");
+  }
+
   if (enabledTools.length <= config.threshold) return finish(enabledTools, "full_list");
 
   const serverByUrl = buildServerLookup(params.servers);

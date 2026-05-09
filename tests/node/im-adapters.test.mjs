@@ -103,7 +103,11 @@ test("Feishu plain text defaults to read-only analysis unless an intent shortcut
     resolvedIntent: "analyze",
     skipIntentResolution: true,
   });
-  assert.deepEqual(resolveFeishuRemoteIntentOverride("/execute 修复编译错误"), {});
+  assert.deepEqual(resolveFeishuRemoteIntentOverride("/execute 修复编译错误"), {
+    resolvedIntent: "analyze",
+    skipIntentResolution: true,
+  });
+  assert.deepEqual(resolveFeishuRemoteIntentOverride("/分析 检查编译错误"), {});
   assert.deepEqual(resolveFeishuRemoteIntentOverride("/计划 先给我实现方案"), {});
   assert.deepEqual(resolveFeishuRemoteIntentOverride("/MDEBUG\n# MAIN 用户反馈修复请求"), {});
 });

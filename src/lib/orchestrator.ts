@@ -28,7 +28,14 @@ import type { ContextMemoryState } from "./contextMemory";
 import { clampContextLimitToReported } from "./contextWindow";
 import { generateId } from "./utils";
 import { buildSystemPrompt } from "./systemPrompt";
-import { discoverAllMcpTools, getMcpToolServerMap, setMcpToolServerMap, type MCPServer, type MCPTool } from "./mcpClient";
+import {
+  discoverAllMcpTools,
+  getMcpToolServerMap,
+  setMcpToolServerMap,
+  type MCPServer,
+  type MCPTool,
+  type MCPServerStatusSnapshot,
+} from "./mcpClient";
 import { getFileMetadata } from "./ipc";
 import { ensureVisibleConclusionWithPolicy, isAssistantTurnEmpty, isSyntheticVisibleConclusion, normalizeAssistantTurn } from "./normalizedTurn";
 import { hasStructuredPlanProposal } from "./planProposal";
@@ -48,6 +55,7 @@ import {
 import type { AppConfig, Skill } from "../store/useAppStore";
 import {
   buildPlanTaskEvidenceAudit,
+  detectResponseLanguageMismatch,
   detectPlanArtifactKind,
   extractPlanTasks,
   findDroppedPlanTasks,
@@ -91,6 +99,7 @@ import {
   filterToolDefinitionsForIntent,
   getLocalFileReadPathForToolCall,
   isLocalFileReadApproved,
+  type McpRoutingPriorityMode,
   isToolAutoExecutableForCall,
   routeMcpToolsForPrompt,
 } from "./toolCapabilities";
@@ -658,8 +667,63 @@ function buildExecuteConvergencePrompt(language: "zh" | "en", iteration: number,
     : [
         `This Execute turn has reached ${iteration}/${maxIterations} tool-loop iterations and is approaching the safety boundary.`,
         "First decide from existing tool results whether the task is already complete. If it is complete, output the final summary and stop without more tools.",
-        "If it is not complete, call exactly one smallest necessary next tool. Do not repeat reads, repeat validation, or keep editing the same target without new evidence.",
+      "If it is not complete, call exactly one smallest necessary next tool. Do not repeat reads, repeat validation, or keep editing the same target without new evidence.",
+    ].join("\n");
+}
+
+function buildLanguageMismatchRecoveryPrompt(language: "zh" | "en"): string {
+  return language === "zh"
+    ? [
+        "上一条可见回复语言与本轮目标语言不一致。",
+        "不要解释语言策略，也不要复述过程。",
+        "请基于已完成的上下文与证据，重新输出同等结论，并且必须使用简体中文。",
+      ].join("\n")
+    : [
+        "The previous visible reply used the wrong language for this turn.",
+        "Do not explain language policy and do not repeat process narration.",
+      "Using the existing context and evidence, restate the same conclusion in English.",
       ].join("\n");
+}
+
+export function shouldRecoverLanguageMismatchTurn(input: {
+  text: string;
+  targetLanguage: "zh" | "en";
+  suppressedByPlanGuard: boolean;
+  toolCallCount: number;
+  alreadyRetried: boolean;
+}): {
+  shouldRecover: boolean;
+  exhausted: boolean;
+  mismatch: boolean;
+  detectedLanguage: "zh" | "en" | null;
+  hanCount: number;
+  latinLetters: number;
+  latinWords: number;
+} {
+  const mismatch = detectResponseLanguageMismatch({
+    text: input.text,
+    targetLanguage: input.targetLanguage,
+  });
+  const shouldRecover =
+    !input.suppressedByPlanGuard &&
+    input.toolCallCount === 0 &&
+    input.text.trim().length > 0 &&
+    mismatch.mismatch &&
+    !input.alreadyRetried;
+  return {
+    shouldRecover,
+    exhausted:
+      !input.suppressedByPlanGuard &&
+      input.toolCallCount === 0 &&
+      input.text.trim().length > 0 &&
+      mismatch.mismatch &&
+      input.alreadyRetried,
+    mismatch: mismatch.mismatch,
+    detectedLanguage: mismatch.detectedLanguage,
+    hanCount: mismatch.hanCount,
+    latinLetters: mismatch.latinLetters,
+    latinWords: mismatch.latinWords,
+  };
 }
 
 const PSEUDO_TOOL_CALL_RE = /(?:^|\n)\s*(?:\[(?:Tool call|tool_call|工具调用)\s*:\s*([a-z_][a-z0-9_]*)\s*\]|(?:Tool call|tool_call|工具调用)\s*:\s*([a-z_][a-z0-9_]*))\s*$/im;
@@ -1890,6 +1954,23 @@ function logAgentEvent(event: string, data: Record<string, unknown> = {}) {
   }
 }
 
+function isUnityCommandDirective(commandDirective?: CommandDirective | null): boolean {
+  return commandDirective?.kind === "unity";
+}
+
+function isUnityConsoleDiagnosticsDirective(commandDirective?: CommandDirective | null): boolean {
+  return commandDirective?.kind === "unity" && commandDirective?.action === "console_diagnostics";
+}
+
+function isUnityLikelyServer(server: MCPServer): boolean {
+  return /unity/i.test(`${server.name} ${server.url}`);
+}
+
+function extractMcpCallFailureCategory(content: string): string | null {
+  const match = content.match(/MCP_CALL_FAILURE\[([^[\]]+)\]/i);
+  return match ? match[1].toLowerCase() : null;
+}
+
 /**
  * Execute the Agent loop.
  *
@@ -1953,13 +2034,38 @@ export async function executeAgentLoop(
 
   // Discover MCP tools from configured servers
   const mcpServers = callbacks.getMcpServers();
+  const latestUserPrompt = [...initialMessages]
+    .reverse()
+    .find((message) => message.role === "user");
+  const latestUserPromptText = latestUserPrompt ? extractCompatibilityTextContent(latestUserPrompt.content) : "";
+  const commandDirective = callbacks.getCommandDirective?.() ?? null;
+  const gameStudioUnityContext =
+    callbacks.getMainModeKey() === "game_studio" &&
+    callbacks.getGameStudioConfig?.()?.engine === "unity";
+  const unityCommandRequested = isUnityCommandDirective(commandDirective) || gameStudioUnityContext;
+  const unityConsoleDiagnosticsRequested =
+    isUnityConsoleDiagnosticsDirective(commandDirective) ||
+    (unityCommandRequested && /console|报错|错误|warning|警告|compile|编译/i.test(latestUserPromptText));
+
   const enabledMcpServers = mcpServers.filter((server) => server.enabled !== false);
   let mcpTools = callbacks.getMcpDiscoveredTools();
   let mcpToolServerMap = getMcpToolServerMap();
+  let mcpServerStatuses: MCPServerStatusSnapshot[] = mcpServers.map((server) => ({
+    serverName: server.name,
+    url: server.url,
+    enabled: server.enabled !== false,
+    status: server.enabled === false ? "disabled" : "failed",
+    toolCount: 0,
+    category: server.enabled === false ? "ok" : "invalid_response",
+    message: server.enabled === false
+      ? "Server is disabled in settings."
+      : "Server status is unknown until discovery runs.",
+  }));
 
-  if (enabledMcpServers.length > 0) {
+  if (mcpServers.length > 0) {
     console.log(`[orchestrator] Discovering tools from ${enabledMcpServers.length} enabled MCP server(s)...`);
-    const { tools: discovered, toolServerMap } = await discoverAllMcpTools(enabledMcpServers);
+    const { tools: discovered, toolServerMap, serverStatuses } = await discoverAllMcpTools(mcpServers);
+    mcpServerStatuses = serverStatuses;
     mcpToolServerMap = toolServerMap;
     setMcpToolServerMap(toolServerMap);
     if (discovered.length > 0) {
@@ -1971,15 +2077,48 @@ export async function executeAgentLoop(
     }
   }
 
-  const latestUserPrompt = [...initialMessages]
-    .reverse()
-    .find((message) => message.role === "user");
+  const connectedMcpServerUrls = new Set(
+    mcpServerStatuses
+      .filter((status) => status.status === "connected" && status.enabled)
+      .map((status) => status.url),
+  );
+  const connectedMcpServers = enabledMcpServers.filter((server) => connectedMcpServerUrls.has(server.url));
+  const preferredUnityMcpServerUrls = connectedMcpServers
+    .filter((server) => isUnityLikelyServer(server))
+    .map((server) => server.url);
+  const effectivePreferredUnityUrls = preferredUnityMcpServerUrls.length > 0
+    ? preferredUnityMcpServerUrls
+    : connectedMcpServers.map((server) => server.url);
+  const unityMcpFirstEligible = unityCommandRequested && effectivePreferredUnityUrls.length > 0;
+  const mcpPriorityMode: McpRoutingPriorityMode = unityMcpFirstEligible ? "unity_mcp_first" : "none";
+  const forceFirstMcpTools = unityMcpFirstEligible && unityConsoleDiagnosticsRequested
+    ? ["read_console", "set_active_instance"]
+    : [];
+
+  logAgentEvent("mcp_server_status", {
+    requestedUnityRouting: unityCommandRequested,
+    gameStudioUnityContext,
+    unityConsoleDiagnosticsRequested,
+    statuses: mcpServerStatuses.map((status) => ({
+      server: status.serverName,
+      url: status.url,
+      enabled: status.enabled,
+      state: status.status,
+      toolCount: status.toolCount,
+      category: status.category,
+      httpStatus: status.httpStatus,
+    })),
+  });
+
   const mcpRoutingResult = routeMcpToolsForPrompt({
     tools: mcpTools,
-    servers: enabledMcpServers,
+    servers: connectedMcpServers,
     toolServerMap: mcpToolServerMap,
-    userPrompt: latestUserPrompt ? extractCompatibilityTextContent(latestUserPrompt.content) : "",
+    userPrompt: latestUserPromptText,
     config: config.mcpRouting,
+    priorityMode: mcpPriorityMode,
+    preferredServerUrls: effectivePreferredUnityUrls,
+    forceFirstTools: forceFirstMcpTools,
   });
   mcpTools = mcpRoutingResult.tools;
   logAgentEvent("mcp_routing", { ...mcpRoutingResult.telemetry });
@@ -1990,12 +2129,40 @@ export async function executeAgentLoop(
     toolDefinitions: routedToolDefinitions,
     skills,
     mcpTools,
-    mcpServers: enabledMcpServers,
+    mcpServers: connectedMcpServers,
     mcpToolServerMap,
     policy: config.toolPermissionPolicy,
   });
-  const resolveAllToolsForRuntime = (runtimeIntent: ResolvedUserIntent): ToolDefinition[] =>
-    filterToolDefinitionsForIntent(
+  const preferredUnityServerUrlSet = new Set(effectivePreferredUnityUrls);
+  const preferredUnityMcpToolNameSet = new Set(
+    mcpTools
+      .filter((tool) => preferredUnityServerUrlSet.has(mcpToolServerMap[tool.name] || ""))
+      .map((tool) => tool.name),
+  );
+  const fallbackUnityMcpToolNameSet = new Set(mcpTools.map((tool) => tool.name));
+  const effectiveUnityMcpToolNameSet = preferredUnityMcpToolNameSet.size > 0
+    ? preferredUnityMcpToolNameSet
+    : fallbackUnityMcpToolNameSet;
+  let unityMcpFirstPhaseActive = unityMcpFirstEligible && effectiveUnityMcpToolNameSet.size > 0;
+  let unityMcpFallbackReason: string | null = null;
+  let unityMcpFirstIterationPending = unityMcpFirstPhaseActive;
+  let unityMcpForceConsoleFirstPending = unityMcpFirstPhaseActive && unityConsoleDiagnosticsRequested;
+
+  const activateUnityMcpFallback = (reason: string) => {
+    if (!unityMcpFirstPhaseActive) return;
+    unityMcpFirstPhaseActive = false;
+    unityMcpForceConsoleFirstPending = false;
+    unityMcpFallbackReason = reason;
+    logAgentEvent("unity_mcp_fallback", {
+      reason,
+      unityCommandRequested,
+      unityConsoleDiagnosticsRequested,
+      preferredServers: effectivePreferredUnityUrls,
+    });
+  };
+
+  const resolveAllToolsForRuntime = (runtimeIntent: ResolvedUserIntent): ToolDefinition[] => {
+    const filtered = filterToolDefinitionsForIntent(
       routedToolDefinitions,
       callbacks.getCurrentRunIntent(),
       toolCapabilityRegistry,
@@ -2004,6 +2171,43 @@ export async function executeAgentLoop(
         planApproved: callbacks.getIsPlanApproved(),
       },
     );
+
+    if (!unityMcpFirstPhaseActive) {
+      return filtered;
+    }
+
+    const forcedOrder = unityMcpForceConsoleFirstPending
+      ? ["read_console", "set_active_instance"]
+      : [];
+    const forcedTools = forcedOrder
+      .map((name) => filtered.find((tool) => tool.function.name === name))
+      .filter((tool): tool is ToolDefinition => !!tool);
+
+    if (unityMcpForceConsoleFirstPending && forcedTools.length === 0) {
+      activateUnityMcpFallback("missing_required_console_tool");
+      return filtered;
+    }
+
+    const forcedSet = new Set(forcedTools.map((tool) => tool.function.name));
+    const prioritizedUnityMcpTools = filtered.filter(
+      (tool) => effectiveUnityMcpToolNameSet.has(tool.function.name) && !forcedSet.has(tool.function.name),
+    );
+
+    if (forcedTools.length === 0 && prioritizedUnityMcpTools.length === 0) {
+      activateUnityMcpFallback("mcp_tools_not_exposed_for_runtime");
+      return filtered;
+    }
+
+    return [
+      ...forcedTools,
+      ...prioritizedUnityMcpTools,
+      ...filtered.filter(
+        (tool) =>
+          !forcedSet.has(tool.function.name) &&
+          !effectiveUnityMcpToolNameSet.has(tool.function.name),
+      ),
+    ];
+  };
   const associatedPaths = callbacks.getAssociatedPaths();
   const resolvedInstructions = config.instructionsEnabled
     ? await loadResolvedInstructions(workspace, skills, associatedPaths)
@@ -2082,6 +2286,13 @@ export async function executeAgentLoop(
       config.thinkingPolicy ?? "normal",
       availableToolNameList,
       callbacks.getCommandDirective?.() ?? null,
+      {
+        unityMcpFirst: unityMcpFirstPhaseActive,
+        unityConsoleFirst: unityMcpFirstPhaseActive && unityConsoleDiagnosticsRequested,
+        connectedServerNames: mcpServerStatuses
+          .filter((status) => status.status === "connected" && /unity/i.test(`${status.serverName} ${status.url}`))
+          .map((status) => status.serverName),
+      },
     );
     const currentMessages = callbacks.getMessages();
     if (currentMessages.length === 0) {
@@ -2161,6 +2372,7 @@ export async function executeAgentLoop(
   let usedPlanRecoveryPrompt = false;
   let usedToolUnavailableRecoveryPrompt = false;
   let usedPseudoToolCallRecoveryPrompt = false;
+  let usedLanguageMismatchRecoveryPrompt = false;
   let usedExecuteConvergencePrompt = false;
   const attemptedPlanWriteTargets: string[] = [];
   let recentSuccessfulProjectWrite: { name: string; target: string } | null = null;
@@ -2261,6 +2473,8 @@ export async function executeAgentLoop(
     nativeToolsEnabled: effectiveToolProtocol !== "xml" && !hasProviderNativeToolsDisabled(callbacks.getMessages()),
     toolProtocol: effectiveToolProtocol,
     xmlToolsEnabled: true,
+    unityMcpFirstPhaseActive,
+    unityMcpFallbackReason,
     maxOutputEscalations: getMaxOutputEscalations(),
   });
   emitPlanExecutionProgress("starting");
@@ -2901,6 +3115,19 @@ export async function executeAgentLoop(
       continue;
     }
 
+    if (effectiveToolCalls.length === 0 && unityMcpFirstPhaseActive && unityMcpFirstIterationPending) {
+      unityMcpFirstIterationPending = false;
+      activateUnityMcpFallback("first_iteration_no_tool_call");
+      callbacks.onStatusChange("running");
+      callbacks.appendMessage({
+        role: "user",
+        content: callbacks.getPreferredLanguage() === "zh"
+          ? "Unity MCP 首轮没有触发工具调用。请立即改用当前可用的本地只读工具继续诊断，不要再声称将要读取。先读取最相关的日志/文件并给出发现。"
+          : "Unity MCP did not produce a tool call in the first iteration. Immediately continue with currently available local read-only tools, read the most relevant logs/files now, and report findings.",
+      });
+      continue;
+    }
+
     if (compactedProseCodeDump) {
       logAgentEvent("prose_code_dump_compacted", {
         iteration,
@@ -2945,6 +3172,43 @@ export async function executeAgentLoop(
         auditCompleted: approvedPlanAuditForNoTool?.completedCount ?? 0,
         auditTotal: approvedPlanAuditForNoTool?.totalCount ?? 0,
         remaining: approvedPlanAuditForNoTool?.remainingTasks.length ?? 0,
+        visibleChars: userVisibleText.length,
+      });
+    }
+
+    const languageMismatchDecision = shouldRecoverLanguageMismatchTurn({
+      text: userVisibleText,
+      targetLanguage: callbacks.getPreferredLanguage(),
+      suppressedByPlanGuard: shouldSuppressApprovedPlanNoToolText,
+      toolCallCount: effectiveToolCalls.length,
+      alreadyRetried: usedLanguageMismatchRecoveryPrompt,
+    });
+
+    if (languageMismatchDecision.shouldRecover) {
+      usedLanguageMismatchRecoveryPrompt = true;
+      callbacks.onStreamToken("__ESCALATION_RESET__:", assistantMsgId);
+      logAgentEvent("language_mismatch_reprompt", {
+        iteration,
+        targetLanguage: callbacks.getPreferredLanguage(),
+        detectedLanguage: languageMismatchDecision.detectedLanguage,
+        hanCount: languageMismatchDecision.hanCount,
+        latinLetters: languageMismatchDecision.latinLetters,
+        latinWords: languageMismatchDecision.latinWords,
+        visibleChars: userVisibleText.length,
+      });
+      callbacks.onStatusChange("running");
+      callbacks.appendMessage({
+        role: "user",
+        content: buildLanguageMismatchRecoveryPrompt(callbacks.getPreferredLanguage()),
+      });
+      continue;
+    }
+
+    if (languageMismatchDecision.exhausted) {
+      logAgentEvent("language_mismatch_reprompt_exhausted", {
+        iteration,
+        targetLanguage: callbacks.getPreferredLanguage(),
+        detectedLanguage: languageMismatchDecision.detectedLanguage,
         visibleChars: userVisibleText.length,
       });
     }
@@ -3406,6 +3670,9 @@ export async function executeAgentLoop(
 
     // Tools have been found, reset the no-tool streak
     consecutiveNoToolCount = 0;
+    if (unityMcpFirstIterationPending) {
+      unityMcpFirstIterationPending = false;
+    }
     logAgentEvent("tool_calls_detected", {
       iteration,
       count: effectiveToolCalls.length,
@@ -3727,6 +3994,31 @@ export async function executeAgentLoop(
       }
     }
 
+    let unityMcpFallbackPrompt: string | null = null;
+    if (unityMcpForceConsoleFirstPending) {
+      const readConsoleResult = allResults.find((result) => result.name === "read_console");
+      if (!readConsoleResult) {
+        activateUnityMcpFallback("forced_console_tool_not_called");
+        unityMcpForceConsoleFirstPending = false;
+        unityMcpFallbackPrompt = callbacks.getPreferredLanguage() === "zh"
+          ? "Unity MCP 未按预期执行 read_console，本轮自动回退到本地诊断路径。请立即使用本地只读工具读取最相关日志并给出结论。"
+          : "Unity MCP did not execute read_console as expected. This turn has been auto-fallbacked to local diagnostics. Use local read-only tools now and report findings.";
+      } else if (readConsoleResult.isError) {
+        const failureCategory = extractMcpCallFailureCategory(readConsoleResult.content || "");
+        if (failureCategory && ["unreachable", "route_mismatch", "session"].includes(failureCategory)) {
+          activateUnityMcpFallback(`forced_console_call_failed:${failureCategory}`);
+          unityMcpForceConsoleFirstPending = false;
+          unityMcpFallbackPrompt = callbacks.getPreferredLanguage() === "zh"
+            ? "Unity MCP 首轮 read_console 调用失败，已自动回退到本地诊断路径。请直接读取本地日志并给出报错定位。"
+            : "Unity MCP read_console failed on the first pass, so the turn has auto-fallbacked to local diagnostics. Read local logs directly and provide error localization.";
+        } else {
+          unityMcpForceConsoleFirstPending = false;
+        }
+      } else {
+        unityMcpForceConsoleFirstPending = false;
+      }
+    }
+
     allResults.forEach(rememberAnyToolActivity);
 
     if (workflowMode === "plan" && callbacks.getIsPlanApproved()) {
@@ -3754,6 +4046,12 @@ export async function executeAgentLoop(
         createHookContextMessages("PostToolUse", result.additionalContexts)
           .forEach(message => callbacks.appendMessage(message));
       }
+    }
+    if (unityMcpFallbackPrompt) {
+      callbacks.appendMessage({
+        role: "user",
+        content: unityMcpFallbackPrompt,
+      });
     }
 
     if (workflowMode === "plan" && callbacks.getIsPlanApproved() && allResults.some((result) => !result.isError)) {

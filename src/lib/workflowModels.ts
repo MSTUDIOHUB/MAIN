@@ -13,12 +13,168 @@ import {
 
 export type RightPanelTab = "plan" | "diff" | "terminal";
 
+export type ResponseLanguagePolicy =
+  | "follow_input_language"
+  | "prefer_system_language_with_explicit_switch";
+
+export function normalizeResponseLanguagePolicy(value: unknown): ResponseLanguagePolicy {
+  return value === "prefer_system_language_with_explicit_switch"
+    ? "prefer_system_language_with_explicit_switch"
+    : "follow_input_language";
+}
+
+function stripLeadingSlashCommand(text: string): string {
+  return String(text || "").replace(/^\/[^\s]+\s*/u, "").trim();
+}
+
 export function detectDominantLanguage(text: string, fallback: "zh" | "en" = "zh"): "zh" | "en" {
-  const hanCount = (text.match(/[\u3400-\u9fff]/g) || []).length;
-  const latinCount = (text.match(/[A-Za-z]/g) || []).length;
+  const probe = stripLeadingSlashCommand(text);
+  const hanCount = (probe.match(/[\u3400-\u9fff]/g) || []).length;
+  const latinCount = (probe.match(/[A-Za-z]/g) || []).length;
 
   if (hanCount === 0 && latinCount === 0) return fallback;
   return hanCount * 2 >= latinCount ? "zh" : "en";
+}
+
+const EXPLICIT_ENGLISH_OVERRIDE_PATTERNS = [
+  /请(?:你)?用(?:英文|英语|English|EN)(?:回复|回答|输出|说明|继续)?/i,
+  /请改用(?:英文|英语|English|EN)/i,
+  /切换到(?:英文|英语|English|EN)/i,
+  /\b(?:reply|respond|answer|write)(?:\s+to\s+me)?\s+(?:in|using)\s+(?:english|en)\b/i,
+  /\b(?:please\s+)?use\s+english\s+(?:for\s+)?(?:reply|response|responses)\b/i,
+];
+
+const EXPLICIT_CHINESE_OVERRIDE_PATTERNS = [
+  /请(?:你)?用(?:中文|汉语|简体中文|Chinese|ZH)(?:回复|回答|输出|说明|继续)?/i,
+  /请改用(?:中文|汉语|简体中文|Chinese|ZH)/i,
+  /切换到(?:中文|汉语|简体中文|Chinese|ZH)/i,
+  /\b(?:reply|respond|answer|write)(?:\s+to\s+me)?\s+(?:in|using)\s+(?:chinese|mandarin|zh|simplified chinese)\b/i,
+  /\b(?:please\s+)?use\s+(?:chinese|mandarin|zh)\s+(?:for\s+)?(?:reply|response|responses)\b/i,
+];
+
+function hasAnyPatternMatch(text: string, patterns: RegExp[]): boolean {
+  return patterns.some((pattern) => pattern.test(text));
+}
+
+export function detectExplicitLanguageOverride(text: string): "zh" | "en" | null {
+  const probe = stripLeadingSlashCommand(text);
+  if (!probe) return null;
+  const wantsEnglish = hasAnyPatternMatch(probe, EXPLICIT_ENGLISH_OVERRIDE_PATTERNS);
+  const wantsChinese = hasAnyPatternMatch(probe, EXPLICIT_CHINESE_OVERRIDE_PATTERNS);
+  if (wantsEnglish === wantsChinese) return null;
+  return wantsEnglish ? "en" : "zh";
+}
+
+export function resolveTurnResponseLanguage(input: {
+  text: string;
+  policy: ResponseLanguagePolicy;
+  systemLanguage: "zh" | "en";
+  fallbackLanguage: "zh" | "en";
+}): "zh" | "en" {
+  const override = detectExplicitLanguageOverride(input.text);
+  if (override) return override;
+
+  if (input.policy === "prefer_system_language_with_explicit_switch") {
+    return input.systemLanguage === "en" ? "en" : "zh";
+  }
+  return detectDominantLanguage(input.text, input.fallbackLanguage);
+}
+
+function stripNonNaturalLanguageContent(text: string): string {
+  return String(text || "")
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/`[^`\n]+`/g, " ")
+    .replace(/https?:\/\/\S+/gi, " ")
+    .replace(/(?:^|\n)\s*>.*$/gm, " ")
+    .replace(/[\[\]{}()<>_=+*/\\|~^#@:$%&-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+export function detectResponseNaturalLanguage(input: string): {
+  hasEnoughSignal: boolean;
+  detectedLanguage: "zh" | "en" | null;
+  hanCount: number;
+  latinLetters: number;
+  latinWords: number;
+} {
+  const cleaned = stripNonNaturalLanguageContent(input);
+  const hanCount = (cleaned.match(/[\u3400-\u9fff]/g) || []).length;
+  const latinLetters = (cleaned.match(/[A-Za-z]/g) || []).length;
+  const latinWords = (cleaned.match(/[A-Za-z]{2,}/g) || []).length;
+
+  const hasZhSignal = hanCount >= 4;
+  const hasEnSignal = latinLetters >= 12 && latinWords >= 3;
+  if (!hasZhSignal && !hasEnSignal) {
+    return {
+      hasEnoughSignal: false,
+      detectedLanguage: null,
+      hanCount,
+      latinLetters,
+      latinWords,
+    };
+  }
+
+  if (hasZhSignal && (!hasEnSignal || hanCount >= Math.max(6, Math.floor(latinLetters * 1.2)))) {
+    return {
+      hasEnoughSignal: true,
+      detectedLanguage: "zh",
+      hanCount,
+      latinLetters,
+      latinWords,
+    };
+  }
+
+  if (hasEnSignal && (!hasZhSignal || latinLetters >= Math.max(14, Math.floor(hanCount * 1.8)))) {
+    return {
+      hasEnoughSignal: true,
+      detectedLanguage: "en",
+      hanCount,
+      latinLetters,
+      latinWords,
+    };
+  }
+
+  return {
+    hasEnoughSignal: false,
+    detectedLanguage: null,
+    hanCount,
+    latinLetters,
+    latinWords,
+  };
+}
+
+export function detectResponseLanguageMismatch(input: {
+  text: string;
+  targetLanguage: "zh" | "en";
+}): {
+  mismatch: boolean;
+  hasEnoughSignal: boolean;
+  detectedLanguage: "zh" | "en" | null;
+  hanCount: number;
+  latinLetters: number;
+  latinWords: number;
+} {
+  const signal = detectResponseNaturalLanguage(input.text);
+  if (!signal.hasEnoughSignal || !signal.detectedLanguage) {
+    return {
+      mismatch: false,
+      hasEnoughSignal: signal.hasEnoughSignal,
+      detectedLanguage: signal.detectedLanguage,
+      hanCount: signal.hanCount,
+      latinLetters: signal.latinLetters,
+      latinWords: signal.latinWords,
+    };
+  }
+
+  return {
+    mismatch: signal.detectedLanguage !== input.targetLanguage,
+    hasEnoughSignal: true,
+    detectedLanguage: signal.detectedLanguage,
+    hanCount: signal.hanCount,
+    latinLetters: signal.latinLetters,
+    latinWords: signal.latinWords,
+  };
 }
 
 export type PlanArtifactKind = "requirements" | "design" | "tasks" | "bugfix" | "summary";

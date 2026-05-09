@@ -12,7 +12,7 @@ test.beforeEach(async ({ page }) => {
 test("TopIsland does not invent execution step progress from plain tool activity", async ({ page }) => {
   await page.goto("/?e2eScenario=top-island-execution-progress");
 
-  await expect(page.getByTestId("top-island-shell")).toBeVisible();
+  await expect(page.getByTestId("top-island-shell")).toHaveCount(0);
   await expect(page.getByTestId("top-island-execution-badge")).toHaveCount(0);
   await expect(page.getByTestId("top-island-execution-progress")).toHaveCount(0);
 });

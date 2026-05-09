@@ -199,11 +199,13 @@ test("command directive inference keeps Unity, reports, and file changes as seco
   assert.deepEqual(
     {
       unity: inferCommandDirective("把 Unity 的 YAML/引用搜索做成 MCP 工具", "plan").kind,
+      unityConsoleAction: inferCommandDirective("检查一下Unity console的报错", "analyze").action,
       report: inferCommandDirective("请整理成分析报告", "report").kind,
       file: inferCommandDirective("直接修改标题同步逻辑", "execute").kind,
     },
     {
       unity: "unity",
+      unityConsoleAction: "console_diagnostics",
       report: "report",
       file: "file_modify",
     },
@@ -290,18 +292,16 @@ test("MAIN intent shortcuts parse slash command and remaining prompt", () => {
   assert.equal(parseMainIntentShortcut("/setup-engine unity"), null);
 });
 
-test("visible shortcuts hide /执行 while parser stays backward compatible", () => {
+test("MAIN intent shortcuts no longer parse /执行 or /execute", () => {
   const visibleZh = getMainIntentShortcuts("zh");
   const visibleEn = getMainIntentShortcuts("en");
   const allZh = getMainIntentShortcuts("zh", { includeHidden: true });
 
   assert.equal(visibleZh.some((item) => item.intent === "execute"), false);
   assert.equal(visibleEn.some((item) => item.intent === "execute"), false);
-  assert.equal(allZh.some((item) => item.intent === "execute"), true);
-
-  const parsed = parseMainIntentShortcut("/执行 直接修复这个问题");
-  assert.equal(parsed?.intent, "execute");
-  assert.equal(parsed?.command, "/执行");
+  assert.equal(allZh.some((item) => item.intent === "execute"), false);
+  assert.equal(parseMainIntentShortcut("/执行 直接修复这个问题"), null);
+  assert.equal(parseMainIntentShortcut("/execute fix this issue"), null);
 });
 
 test("hidden MDEBUG shortcut parses without entering visible intent shortcuts", () => {

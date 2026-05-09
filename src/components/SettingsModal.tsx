@@ -157,6 +157,10 @@ const SETTINGS_COPY = {
     testing: "测试中...",
     test: "测试",
     displayLanguage: "显示语言",
+    responseLanguagePolicy: "回复语言策略",
+    responseLanguagePolicyDesc: "控制模型回复是跟随输入语言，还是优先使用系统显示语言（可被显式语言指令临时覆盖）。",
+    responseLanguageFollowInput: "跟随输入语言（兼容旧行为）",
+    responseLanguageSystemPreferred: "系统语言优先（显式指令可切换）",
     enabled: "已启用",
     disabled: "已关闭",
     thinkingPolicyNormalDesc: "显示过滤后的关键过程说明。",
@@ -195,6 +199,8 @@ const SETTINGS_COPY = {
     dataTip: "所有数据保存在浏览器本地存储中。重置设置不会删除已解压到 .protocols/ 目录的协议包文件，如需彻底清理请手动删除该目录。",
 
     debugDesc: "记录前端 console、界面崩溃、Rust 代理请求和流式读取错误。日志会自动隐藏常见密钥字段。",
+    debugRecordFullTurnProcess: "记录完整回合过程",
+    debugRecordFullTurnProcessDesc: "开启后保留完整工具/过程流水（用于排错）；关闭时回合完成后仅保留结论、改动摘要和异常详情。",
     debugFile: "日志文件",
     noDebugLog: "暂无调试日志",
     copiedDebugLog: "已复制调试日志",
@@ -368,6 +374,10 @@ const SETTINGS_COPY = {
     testing: "Testing...",
     test: "Test",
     displayLanguage: "Display Language",
+    responseLanguagePolicy: "Response Language Policy",
+    responseLanguagePolicyDesc: "Choose whether replies follow each input language or prefer the system language unless the user explicitly requests another language.",
+    responseLanguageFollowInput: "Follow Input Language (Legacy)",
+    responseLanguageSystemPreferred: "Prefer System Language (Explicit Override)",
     enabled: "Enabled",
     disabled: "Disabled",
     thinkingPolicyNormalDesc: "Show filtered key process notes in the chat stream.",
@@ -406,6 +416,8 @@ const SETTINGS_COPY = {
     dataTip: "All data is stored locally in the browser. Resetting settings will not delete protocol packages extracted into .protocols/. Delete that folder manually for a full cleanup.",
 
     debugDesc: "Records frontend console output, UI crashes, Rust agent requests, and streaming errors. Common secret fields are redacted automatically.",
+    debugRecordFullTurnProcess: "Record Full Turn Process",
+    debugRecordFullTurnProcessDesc: "When enabled, keep the full tool/process trace for debugging. When disabled, finished turns keep only conclusions, change summaries, and failure details.",
     debugFile: "Log File",
     noDebugLog: "No debug logs yet",
     copiedDebugLog: "Debug log copied",
@@ -1026,10 +1038,21 @@ function DataManagerPanel({ t, language }: { t: any; language: "zh" | "en" }) {
   );
 }
 
-function DebugLogPanel({ t, language }: { t: any; language: "zh" | "en" }) {
+function DebugLogPanel({
+  t,
+  language,
+  config,
+  setConfig,
+}: {
+  t: any;
+  language: "zh" | "en";
+  config: any;
+  setConfig: (patch: any) => void;
+}) {
   const copy = SETTINGS_COPY[language];
   const [snapshot, setSnapshot] = useState({ path: "", content: "", truncated: false });
   const [status, setStatus] = useState("");
+  const recordFullTurnProcess = config.debugRecordFullTurnProcess === true;
 
   const refresh = useCallback(async () => {
     const next = await readDebugLogSnapshot(1024 * 1024);
@@ -1081,6 +1104,38 @@ function DebugLogPanel({ t, language }: { t: any; language: "zh" | "en" }) {
         >
           {copy.refresh}
         </button>
+      </div>
+
+      <div className="flex items-center justify-between gap-4 rounded-lg border border-[#27272a] bg-[#000000] px-4 py-3">
+        <div>
+          <p className="text-[12.5px] font-bold text-[#e4e4e7]">{copy.debugRecordFullTurnProcess}</p>
+          <p className="mt-1 text-[11.5px] leading-relaxed text-[#a1a1aa]">{copy.debugRecordFullTurnProcessDesc}</p>
+        </div>
+        <div className="flex items-center gap-3">
+          <span className={`text-[12px] font-bold ${recordFullTurnProcess ? "theme-text" : "text-[#a1a1aa]"}`}>
+            {recordFullTurnProcess ? copy.enabled : copy.disabled}
+          </span>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={recordFullTurnProcess}
+            data-testid="debug-full-turn-process-switch"
+            aria-label={copy.debugRecordFullTurnProcess}
+            onClick={() => setConfig({ ...config, debugRecordFullTurnProcess: !recordFullTurnProcess })}
+            className={`relative inline-flex h-6 w-11 items-center rounded-full border p-0.5 transition-all duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-[#000000] ${
+              recordFullTurnProcess
+                ? "border-transparent shadow-[0_0_12px_var(--accent-subtle)]"
+                : "border-[#3f3f46] bg-[#18181b]"
+            }`}
+            style={recordFullTurnProcess ? { backgroundColor: "var(--accent)" } : undefined}
+          >
+            <span
+              className={`block h-5 w-5 rounded-full bg-white shadow-sm transition-transform duration-200 ${
+                recordFullTurnProcess ? "translate-x-5" : "translate-x-0"
+              }`}
+            />
+          </button>
+        </div>
       </div>
 
       <div className="rounded-lg border border-[#27272a] bg-[#000000] p-3">
@@ -2930,6 +2985,31 @@ export default function SettingsModal({
                   </div>
                 </div>
 
+                <div className={`${settingsSectionRowClass} border-t border-[#27272a] pt-5`}>
+                  <div>
+                    <label className="block text-[13px] font-bold text-[#e4e4e7]">{copy.responseLanguagePolicy}</label>
+                    <p className="mt-1.5 text-[12px] leading-relaxed text-[#a1a1aa]">{copy.responseLanguagePolicyDesc}</p>
+                  </div>
+                  <div className={settingsControlColumnClass}>
+                    <select
+                      value={config.responseLanguagePolicy || "follow_input_language"}
+                      onChange={(e) =>
+                        setConfig({
+                          ...config,
+                          responseLanguagePolicy:
+                            e.target.value === "prefer_system_language_with_explicit_switch"
+                              ? "prefer_system_language_with_explicit_switch"
+                              : "follow_input_language",
+                        })
+                      }
+                      className={settingsSelectClass}
+                    >
+                      <option value="follow_input_language">{copy.responseLanguageFollowInput}</option>
+                      <option value="prefer_system_language_with_explicit_switch">{copy.responseLanguageSystemPreferred}</option>
+                    </select>
+                  </div>
+                </div>
+
                 {/* THEME COLOR PICKER */}
                 <div className={`${settingsSectionRowClass} border-t border-[#27272a] pt-5`}>
                   <div>
@@ -3324,7 +3404,14 @@ export default function SettingsModal({
             {settingsTab === 'data' && <DataManagerPanel t={t} language={language} />}
 
             {/* DEBUG LOG */}
-            {settingsTab === 'debug' && <DebugLogPanel t={t} language={language} />}
+            {settingsTab === 'debug' && (
+              <DebugLogPanel
+                t={t}
+                language={language}
+                config={config}
+                setConfig={setConfig}
+              />
+            )}
 
             {/* IM ADAPTER SETTINGS */}
             {settingsTab === 'im' && <FeishuAdapterPanel config={config} setConfig={setConfig} t={t} />}

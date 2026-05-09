@@ -110,6 +110,7 @@ function TurnSummaryCard({
   fallbackSummary,
   onOpenPlan,
   onExpand,
+  embedded = false,
   copy,
 }: {
   turn: ConversationTurn;
@@ -117,6 +118,7 @@ function TurnSummaryCard({
   fallbackSummary?: string;
   onOpenPlan?: () => void;
   onExpand?: () => void;
+  embedded?: boolean;
   copy: {
     summary: string;
     collapsedSummary: string;
@@ -126,9 +128,12 @@ function TurnSummaryCard({
 }) {
   const cleanTurnSummary = sanitizeAIOutput(turn.summary || "");
   const summaryText = (looksLikeReasoningLeakTitle(cleanTurnSummary) ? "" : cleanTurnSummary) || sanitizeAIOutput(fallbackSummary || "") || copy.collapsedSummary;
+  const shellClass = embedded
+    ? "px-1 py-1"
+    : "rounded-2xl border border-[#1f1f23] bg-[#09090b] px-4 py-3";
 
   return (
-    <div data-testid="turn-summary-card" className="rounded-2xl border border-[#1f1f23] bg-[#09090b] px-4 py-3">
+    <div data-testid="turn-summary-card" className={shellClass}>
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0 flex-1">
           <div className="text-[11px] uppercase tracking-[0.18em] text-[#71717a]">{copy.summary}</div>
@@ -759,7 +764,7 @@ function ThoughtBlock({
       </div>
       <div
         data-testid="thought-summary-lines"
-        className="chat-agent-content my-2 min-w-0 flex-1 bg-[#09090b]/60 px-5 py-4 text-[#e4e4e7]"
+        className="chat-agent-content my-1 min-w-0 flex-1 px-2 py-1 text-[#e4e4e7]"
         style={{ fontSize: `${chatFontSize}px` }}
       >
         <MarkdownRenderer content={resolvedSummaryText} baseFontSize={chatFontSize} />
@@ -1009,7 +1014,7 @@ function AgentContentBlock({
       <div className="mt-1 flex-shrink-0">
         <IconLogoM className="theme-text h-6 w-6 drop-shadow-[0_0_8px_var(--accent-subtle)]" />
       </div>
-      <div className="chat-agent-content my-2 min-w-0 flex-1 bg-[#09090b]/60 px-5 py-4 text-[#e4e4e7]" style={{ fontSize: `${chatFontSize}px` }}>
+      <div className="chat-agent-content my-1 min-w-0 flex-1 px-2 py-1 text-[#e4e4e7]" style={{ fontSize: `${chatFontSize}px` }}>
         {isArchivedAfterChoice && (
           <div data-testid="archived-choice-feedback-expanded" className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-[#27272a] bg-[#050507] px-3 py-2">
             <div className="min-w-0 flex flex-wrap items-center gap-2">
@@ -1393,10 +1398,10 @@ export default function ChatArea({
   const shouldKeepTopIslandResident =
     !!pinnedTurn &&
     (
-      agentStatus === "running" ||
-      agentStatus === "pending_review" ||
+      pinnedTurn.status === "executing" ||
       pinnedTurn.status === "awaiting_input" ||
-      pinnedTurn.status === "awaiting_approval"
+      pinnedTurn.status === "awaiting_approval" ||
+      agentStatus === "pending_review"
     );
   const topIslandTurn = shouldKeepTopIslandResident ? pinnedTurn : activeTurn;
   const topIslandTurnEntry = useMemo(() => {
@@ -1464,37 +1469,28 @@ export default function ChatArea({
   const runStatusLabel = isStreaming
     ? copy.processingLabel
     : language === "zh" ? "等待选择..." : "Awaiting choice...";
-  const topIslandHasBlockingPrompt =
+  const topIslandHasChoiceContext =
+    topIslandReplyOptions.length > 0 ||
     !!pendingRunDecision ||
     topIslandTurnStatusKey === "awaiting_input" ||
     topIslandTurnStatusKey === "awaiting_approval" ||
     !!activeDiffTask ||
     canApprovePlan;
-  const hasTopIslandCommandContext =
-    !!topIslandTurn &&
-    (
-      resolveConversationTurnIntent(topIslandTurn) !== "discuss" ||
-      topIslandTurnBlocks.some((block) => block.type === "tool")
-    );
-  const hasTopIslandTaskContext =
-    !!pendingRunDecision ||
+  const topIslandHasProgressContext =
     planTasks.length > 0 ||
-    topIslandExecutionSteps.length > 0 ||
-    !!activeDiffTask ||
-    canApprovePlan ||
-    topIslandTurnStatusKey === "awaiting_input";
+    topIslandExecutionSteps.length > 0;
   const shouldShowTopIslandNormally =
     !!topIslandTurn &&
     topIslandTurnStatusKey !== "done" &&
     topIslandTurnStatusKey !== "completed_with_changes" &&
-    (hasTopIslandCommandContext || hasTopIslandTaskContext);
+    (topIslandHasChoiceContext || topIslandHasProgressContext);
   const shouldShowTopIslandForHistoryPeek =
     showTopIslandDuringHistoryPeek && shouldShowTopIslandNormally;
   const shouldShowTopIsland =
     (!!topIslandTurn || !!pendingRunDecision) &&
     (
-      topIslandHasBlockingPrompt ||
-      shouldKeepTopIslandResident ||
+      topIslandHasChoiceContext ||
+      (topIslandHasProgressContext && shouldKeepTopIslandResident) ||
       (isAutoScroll
         ? shouldShowTopIslandNormally
         : shouldShowTopIslandForHistoryPeek)
@@ -1875,8 +1871,10 @@ export default function ChatArea({
           language === "en" ? "New task" : "新的任务",
         )
       : language === "en" ? "New task" : "新的任务";
+    const intentSummaryTitle = String(turn.intentSummary || "").trim();
+    const explicitTurnTitle = !isGenericConversationTitle(turn.title) ? turn.title : "";
     const displayTurnTitle = normalizeConversationDisplayTitle(
-      !isGenericConversationTitle(turn.title) ? turn.title : turn.intentSummary || "",
+      intentSummaryTitle || explicitTurnTitle,
       language === "en" ? 48 : 40,
       displayTitleFallback,
     );
@@ -1887,59 +1885,76 @@ export default function ChatArea({
         ref={(node) => {
           turnRefs.current[turn.id] = node;
         }}
-        className="rounded-[24px] border border-[#18181b] bg-[#050507] p-4"
+        className="py-3"
       >
-        <div
-          role="button"
-          tabIndex={0}
-          onClick={() => toggleConversationTurnCollapsed(turn.id)}
-          onKeyDown={(event) => {
-            if (event.key === "Enter" || event.key === " ") {
-              event.preventDefault();
-              toggleConversationTurnCollapsed(turn.id);
-            }
-          }}
-          className="flex w-full items-center justify-between gap-4 rounded-2xl border border-[#18181b] bg-[#09090b] px-4 py-3 text-left transition-colors hover:border-[#27272a]"
-        >
-          <div className="min-w-0 flex flex-wrap items-center gap-2">
-            {!isTurnExpanded ? (
-              <span className="truncate text-[13px] font-semibold text-[#f5f5f5]">{displayTurnTitle}</span>
-            ) : (
-              <span className="min-w-0 truncate text-[13px] font-semibold text-[#f5f5f5]">{displayTurnTitle}</span>
-            )}
-            {turnIntentLabel && (
-              <span data-testid={`turn-intent-badge-${turnIntent}`} className={`rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-[0.16em] ${isPlanTurn ? "border-[rgba(124,58,237,0.25)] bg-[rgba(124,58,237,0.12)] text-[#c4b5fd]" : turnIntent === "execute" ? "border-[rgba(96,165,250,0.25)] bg-[rgba(96,165,250,0.12)] text-[#93c5fd]" : "border-[rgba(52,211,153,0.22)] bg-[rgba(52,211,153,0.1)] text-[#86efac]"}`}>
-                {turnIntentLabel}
+        <div className={isTurnExpanded ? "" : "rounded-2xl border border-[#1f1f23] bg-[#09090b]"}>
+          <div
+            role="button"
+            tabIndex={0}
+            onClick={() => toggleConversationTurnCollapsed(turn.id)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                toggleConversationTurnCollapsed(turn.id);
+              }
+            }}
+            className={`flex w-full items-center justify-between gap-4 px-3 py-2 text-left transition-colors ${
+              isTurnExpanded
+                ? "rounded-xl border border-[#1f1f23] bg-transparent hover:border-[#2f2f36] hover:bg-[#070709]/35"
+                : "rounded-t-2xl border-b border-[#1f1f23] hover:bg-[#0d0d11]"
+            }`}
+          >
+            <div className="min-w-0 flex flex-wrap items-center gap-2">
+              {turnIntentLabel && (
+                <span data-testid={`turn-intent-badge-${turnIntent}`} className={`rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-[0.16em] ${isPlanTurn ? "border-[rgba(124,58,237,0.25)] bg-[rgba(124,58,237,0.12)] text-[#c4b5fd]" : turnIntent === "execute" ? "border-[rgba(96,165,250,0.25)] bg-[rgba(96,165,250,0.12)] text-[#93c5fd]" : "border-[rgba(52,211,153,0.22)] bg-[rgba(52,211,153,0.1)] text-[#86efac]"}`}>
+                  {turnIntentLabel}
+                </span>
+              )}
+              <span className={`rounded-full border px-2 py-0.5 text-[10px] ${getTurnStatusTone(turn.status)}`}>
+                {copy.turnStatusLabels[turn.status] || turn.status}
               </span>
-            )}
-            <span className={`rounded-full border px-2 py-0.5 text-[10px] ${getTurnStatusTone(turn.status)}`}>
-              {copy.turnStatusLabels[turn.status] || turn.status}
-            </span>
-            {shouldShowTurnChanges && (
-              <span className="rounded-full border border-[rgba(37,99,235,0.25)] bg-[rgba(37,99,235,0.12)] px-2 py-0.5 text-[10px] text-[#93c5fd]">
-                {language === "zh" ? `${turnChangeEntries.length} 个变更文件` : `${turnChangeEntries.length} changed file${turnChangeEntries.length > 1 ? "s" : ""}`}
-              </span>
-            )}
-          </div>
-          <div className="flex items-center gap-3">
-            <div className="flex flex-wrap items-center gap-2">
-              {isTurnExpanded && isPlanTurn && hasCompletePlan && (
-                <button
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    openRightPanelTab("plan");
-                  }}
-                  className="rounded-full border border-[rgba(124,58,237,0.25)] bg-[rgba(124,58,237,0.1)] px-3 py-1 text-[11px] text-[#c4b5fd] transition-colors hover:bg-[rgba(124,58,237,0.18)]"
-                >
-                  {copy.viewPlan}
-                </button>
+              {shouldShowTurnChanges && (
+                <span className="rounded-full border border-[rgba(37,99,235,0.25)] bg-[rgba(37,99,235,0.12)] px-2 py-0.5 text-[10px] text-[#93c5fd]">
+                  {language === "zh" ? `${turnChangeEntries.length} 个变更文件` : `${turnChangeEntries.length} changed file${turnChangeEntries.length > 1 ? "s" : ""}`}
+                </span>
               )}
             </div>
-            <div className="shrink-0 text-[#71717a]">{isTurnExpanded ? <IconChevronDown className="h-4 w-4" /> : <IconChevronRight className="h-4 w-4" />}</div>
+            <div className="ml-auto flex min-w-0 flex-1 items-center justify-end gap-3">
+              <span className="min-w-0 flex-1 break-words text-right text-[13px] font-semibold leading-5 text-[#f5f5f5]">
+                {displayTurnTitle}
+              </span>
+              <div className="flex flex-wrap items-center gap-2">
+                {isTurnExpanded && isPlanTurn && hasCompletePlan && (
+                  <button
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      openRightPanelTab("plan");
+                    }}
+                    className="rounded-full border border-[rgba(124,58,237,0.25)] bg-[rgba(124,58,237,0.1)] px-3 py-1 text-[11px] text-[#c4b5fd] transition-colors hover:bg-[rgba(124,58,237,0.18)]"
+                  >
+                    {copy.viewPlan}
+                  </button>
+                )}
+              </div>
+              <div className="shrink-0 text-[#71717a]">{isTurnExpanded ? <IconChevronDown className="h-4 w-4" /> : <IconChevronRight className="h-4 w-4" />}</div>
+            </div>
           </div>
+          {!isTurnExpanded && (
+            <div className="px-3 pb-3 pt-2">
+              <TurnSummaryCard
+                turn={turn}
+                hiddenCount={(turn.status === "done" || turn.status === "completed_with_changes") ? collapsedProcessCount : hiddenCount}
+                fallbackSummary={planProgressSummary || finalAgentSummaryText || toolExecutionSummary}
+                onOpenPlan={isPlanTurn && hasPlanPanelContent && hasPlanContent ? () => openRightPanelTab("plan") : undefined}
+                onExpand={() => toggleConversationTurnCollapsed(turn.id)}
+                embedded
+                copy={copy}
+              />
+            </div>
+          )}
         </div>
 
-        <div className="mt-4 space-y-4">
+        <div className={`${isTurnExpanded ? "mt-4 " : ""}space-y-4`}>
           {isTurnExpanded && userBlock ? renderBlock(userBlock, 0) : null}
           {isTurnExpanded && shouldShowTurnChanges && (
             <TurnChangesCard
@@ -1952,16 +1967,6 @@ export default function ChatArea({
 
           {!isTurnExpanded ? (
             <>
-              <div className="ml-9">
-                <TurnSummaryCard
-                  turn={turn}
-                  hiddenCount={(turn.status === "done" || turn.status === "completed_with_changes") ? collapsedProcessCount : hiddenCount}
-                  fallbackSummary={planProgressSummary || finalAgentSummaryText || toolExecutionSummary}
-                  onOpenPlan={isPlanTurn && hasPlanPanelContent && hasPlanContent ? () => openRightPanelTab("plan") : undefined}
-                  onExpand={() => toggleConversationTurnCollapsed(turn.id)}
-                  copy={copy}
-                />
-              </div>
               {isPlanExecutionVisible && turnProgressSnapshot && (
                 <PlanExecutionLiveCard snapshot={turnProgressSnapshot} language={language} compact />
               )}
@@ -1996,6 +2001,10 @@ export default function ChatArea({
           )}
           {activeTurnActivity && <TurnActivityNotice text={activeTurnActivity} />}
         </div>
+        <div
+          className="mt-4 h-px w-full rounded-full"
+          style={{ backgroundColor: "color-mix(in srgb, var(--accent, #7c3aed) 50%, transparent)" }}
+        />
       </section>
     );
   };

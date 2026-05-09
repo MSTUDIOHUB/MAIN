@@ -659,7 +659,7 @@ export function buildGameStudioUserEnvelope(params: {
     studioConfig?.engine === "unity"
       ? "unityExecutionContract: Game Studio owns workflow and expert routing; Unity Editor changes should use Unity MCP when available, prefab/scene/YAML references must be inspected before modification, and C# symbol/reference work should use Roslyn-capable tools when available. If these tools are not exposed, state the capability gap clearly."
       : "",
-    `languageInstruction: Reply to the user in ${responseLanguage}.`,
+    `languageInstruction: Reply to the user in ${responseLanguage}. This is a hard output constraint. Only switch language when the user explicitly asks for another reply language in the current turn.`,
     "[/GAME_STUDIO_CONTEXT]",
     "",
     "User request:",

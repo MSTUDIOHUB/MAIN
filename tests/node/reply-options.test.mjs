@@ -342,6 +342,15 @@ test("extractReplyOptions marks explicit execution choices for runtime execute",
 
   assert.equal(explicit.replyOptions[0].action, "execute_once");
   assert.equal(explicit.replyOptions[1].action, undefined);
+
+  const fixChoice = extractReplyOptions(`
+<user_options>
+<option>帮我修复这个错误，将第128行改为显式转换</option>
+<option>先不改，我想先讨论原因</option>
+</user_options>
+  `);
+  assert.equal(fixChoice.replyOptions[0].action, "execute_once");
+  assert.equal(fixChoice.replyOptions[1].action, undefined);
 });
 
 test("extractReplyOptions filters internal process or mode-switch pseudo options", () => {

@@ -450,15 +450,6 @@ const MAIN_INTENT_SHORTCUTS_ZH: MainIntentShortcutItem[] = [
     visibleInMenu: true,
   },
   {
-    intent: "execute",
-    command: "/执行",
-    label: "执行",
-    description: RUN_INTENT_POLICIES.execute.description.zh,
-    category: RUN_INTENT_POLICIES.execute.uiCategory,
-    aliases: ["execute", "implement", "实现", "处理", "修复"],
-    visibleInMenu: false,
-  },
-  {
     intent: "report",
     command: "/报告",
     label: "报告",
@@ -496,15 +487,6 @@ const MAIN_INTENT_SHORTCUTS_EN: MainIntentShortcutItem[] = [
     category: RUN_INTENT_POLICIES.plan.uiCategory,
     aliases: ["计划", "规划", "方案", "spec", "roadmap"],
     visibleInMenu: true,
-  },
-  {
-    intent: "execute",
-    command: "/execute",
-    label: "Execute",
-    description: RUN_INTENT_POLICIES.execute.description.en,
-    category: RUN_INTENT_POLICIES.execute.uiCategory,
-    aliases: ["执行", "实现", "处理", "修复", "implement"],
-    visibleInMenu: false,
   },
   {
     intent: "report",
@@ -656,6 +638,7 @@ function inferShellAction(input: string): string {
 }
 
 function inferUnityAction(input: string): string {
+  if (/console|报错|错误|warning|警告|compile|编译|编译失败|编译错误/i.test(input)) return "console_diagnostics";
   if (/roslyn|c#|\.cs\b|代码|脚本/i.test(input)) return "code";
   if (/引用|reference|yaml|prefab|预制体|scene|场景|asset|资源/i.test(input)) return "asset_context";
   if (/execute|执行|editor|编辑器/i.test(input)) return "editor_execute";
@@ -879,22 +862,22 @@ export function parseMainDebugShortcut(input: string): MainDebugShortcut | null 
 function createOption(intent: ResolvedUserIntent, language: "zh" | "en"): PendingRunDecisionOption {
   const labels: Record<ResolvedUserIntent, { zh: string; en: string; valueZh: string; valueEn: string }> = {
     discuss: {
-      zh: "先讨论一下",
-      en: "Discuss First",
-      valueZh: "先讨论一下具体需求和目标",
-      valueEn: "Let's discuss the goal first before doing anything else.",
+      zh: "继续讨论/只读分析",
+      en: "Discuss / Read-only",
+      valueZh: "先继续讨论或只做只读分析，不直接改动代码",
+      valueEn: "Continue discussion or read-only analysis first, without applying code changes yet.",
     },
     plan: {
-      zh: "先给方案",
+      zh: "先生成 Plan（批准后执行）",
       en: "Plan First",
-      valueZh: "先给我一个方案和计划，再决定是否执行",
-      valueEn: "Please create a plan first before execution.",
+      valueZh: "先生成可审阅 Plan，等我批准后再执行修改",
+      valueEn: "Create a reviewable plan first, then execute after approval.",
     },
     execute: {
-      zh: "直接执行",
+      zh: "直接执行修改",
       en: "Execute Directly",
-      valueZh: "直接开始处理并执行，不需要先出完整方案",
-      valueEn: "Handle it directly without a separate planning phase.",
+      valueZh: "直接开始修改并验证结果，不先走完整 Plan",
+      valueEn: "Start implementing and validating now without a separate planning phase.",
     },
     analyze: {
       zh: "先做分析",

@@ -155,7 +155,7 @@ test("system prompt uses English core tool protocol with localized output strate
   assert.match(prompt, /Prompt language strategy: english_core_localized_output/);
   assert.match(prompt, /Tool availability is intent-scoped/);
   assert.match(prompt, /\[LOCALIZED USER OUTPUT\]/);
-  assert.match(prompt, /用户当前这条请求所用的语言/);
+  assert.match(prompt, /本轮已解析的目标语言/);
   assert.doesNotMatch(prompt, /在执行文件读取、搜索、修改、构建、测试等操作前，必须先用普通 Markdown 输出一句/);
   assert.doesNotMatch(prompt, /调用工具前，先用普通 Markdown 写一句用户可见的操作说明/);
 });
@@ -329,4 +329,33 @@ test("active protocol packages advertise the exact entry path instead of a bare 
 
   assert.match(prompt, /Entry: \.protocols\/Auto-Optimize-main-1776311699903\/Auto-Optimize-main\/SKILL\.md/);
   assert.match(prompt, /不要只传裸文件名/);
+});
+
+test("Unity MCP-first prompt explicitly prioritizes read_console over local scans", () => {
+  const prompt = buildSystemPrompt(
+    [],
+    "/tmp/workspace",
+    "main_mode",
+    "",
+    [],
+    ["read_console", "manage_scene"],
+    "chat",
+    "zh",
+    null,
+    undefined,
+    "analyze",
+    "english_core_localized_output",
+    "normal",
+    ["read_console", "get_project_skeleton", "read_file"],
+    { kind: "unity", action: "console_diagnostics" },
+    {
+      unityMcpFirst: true,
+      unityConsoleFirst: true,
+      connectedServerNames: ["Unity"],
+    },
+  );
+
+  assert.match(prompt, /\[UNITY MCP PRIORITY\]/);
+  assert.match(prompt, /Do not start with get_project_skeleton or local log file scanning/);
+  assert.match(prompt, /call read_console first/);
 });

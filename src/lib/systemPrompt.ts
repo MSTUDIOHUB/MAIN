@@ -41,6 +41,12 @@ export type GameStudioPromptContext = {
   studioConfig?: StudioConfig | null;
 };
 
+export type McpPriorityPromptContext = {
+  unityMcpFirst?: boolean;
+  unityConsoleFirst?: boolean;
+  connectedServerNames?: string[];
+};
+
 const WORKSPACE_IGNORE_DIRS = new Set(["node_modules", ".git", ".svn", ".hg", ".idea", ".vscode", ".vs", "dist", "build", "out", "bin", "obj", "target", "vendor", "__pycache__", ".next", ".nuxt", ".cache", ".turbo", "coverage", ".gradle", ".dart_tool", ".fvm", ".DS_Store"]);
 
 const READ_ONLY_BUILT_IN_TOOL_NAMES = [
@@ -114,6 +120,7 @@ export function buildSystemPrompt(
   thinkingPolicy: "normal" | "action_only" = "normal",
   availableToolNames?: string[],
   commandDirective?: CommandDirective | null,
+  mcpPriorityContext?: McpPriorityPromptContext,
 ): string {
   const parts: string[] = [];
   const fallbackLanguageName = uiLanguage === "zh" ? "中文" : "English";
@@ -153,8 +160,8 @@ export function buildSystemPrompt(
     "If a needed tool is absent because of the current intent, continue with available safe tools or explain the blocker and ask for plan/execute consent.",
     "",
     "[LOCALIZED USER OUTPUT]",
-    "All user-visible explanations, summaries, plans, task titles, and approval text must follow the user's current message language.",
-    `If the current message language is unclear, use the UI fallback language: ${fallbackLanguageName}.`,
+    "All user-visible explanations, summaries, plans, task titles, and approval text must follow this turn's resolved target language.",
+    `If the resolved language is unclear, use the UI fallback language: ${fallbackLanguageName}.`,
     "Keep protocol labels, code identifiers, file names, and machine-readable markers unchanged when needed.",
   ].join("\n"));
 
@@ -171,6 +178,23 @@ export function buildSystemPrompt(
       "Treat this as routing metadata for tool choice and execution contract, not as permission to bypass the current intent or approval gates.",
     ].filter(Boolean).join("\n"));
   }
+
+  if (mcpPriorityContext?.unityMcpFirst) {
+    parts.push([
+      "================================",
+      "[UNITY MCP PRIORITY]",
+      `unityMcpFirst: true`,
+      `unityConsoleFirst: ${mcpPriorityContext.unityConsoleFirst ? "true" : "false"}`,
+      mcpPriorityContext.connectedServerNames?.length
+        ? `connectedUnityMcpServers: ${mcpPriorityContext.connectedServerNames.join(", ")}`
+        : "",
+      "For Unity requests in this turn, prioritize Unity MCP tools before local workspace scan tools.",
+      "Do not start with get_project_skeleton or local log file scanning when Unity MCP is available.",
+      mcpPriorityContext.unityConsoleFirst
+        ? "This request is a Unity console diagnostics task: call read_console first (set_active_instance when required) before any other investigation path."
+        : "",
+    ].filter(Boolean).join("\n"));
+  }
   
   parts.push([
     "你是一个拥有本地机器访问权限的高级 AI IDE 助手。",
@@ -183,7 +207,7 @@ export function buildSystemPrompt(
       ? "4. 执行验证 — 命令工具在本轮可用时，一次性命令优先用 `run_command` 获取 stdout/stderr/exitCode；交互式或长驻命令用 `execute_command` 后必须跟随 `read_pty_since`、`read_pty_tail` 或 `get_pty_status` 验证结果。"
       : "4. 执行验证 — 本轮未暴露命令工具时，不要尝试 shell 执行；需要验证时先记录为计划、检查项或后续执行步骤。",
     "5. 流程优先级 — 若下方启用了特定 Workflow Skills（工作流协议），必须优先且严格遵守该协议规则。",
-    `6. 语言跟随 — 所有对用户可见的正文、总结、Plan 文档（.MAIN/plans/*.md）、任务标题、审批说明，必须优先使用**用户当前这条请求所用的语言**。如果当前请求语言不明确，则默认使用界面语言：${fallbackLanguageName}。文件名、固定协议标记（如 \`[PROPOSAL START]\`、\`# Proposed Plan\`）和代码标识符可以保留英文，但解释性正文必须跟随用户语言。`,
+    `6. 语言跟随 — 所有对用户可见的正文、总结、Plan 文档（.MAIN/plans/*.md）、任务标题、审批说明，必须优先使用**本轮已解析的目标语言（resolved turn language）**。如果目标语言不明确，则默认使用界面语言：${fallbackLanguageName}。文件名、固定协议标记（如 \`[PROPOSAL START]\`、\`# Proposed Plan\`）和代码标识符可以保留英文，但解释性正文必须跟随目标语言。`,
     "7. 目标先行 — 在进入规划或执行前，先判断用户本轮真正想要的是：只要解释、只要方案、先方案后执行、还是直接执行。优先对齐终极目标，而不是机械重复用户字面步骤。",
     "8. 模板优先 — 若下方提供了工作区模板（尤其是意图分析模板与 Plan 模板），优先沿用其章节顺序与检查清单，再填入当前任务的真实内容；不要原样保留占位提示。",
     "",

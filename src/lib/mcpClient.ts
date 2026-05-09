@@ -75,6 +75,19 @@ export interface MCPServerTestResult extends MCPDiagnostic {
   ok: boolean;
 }
 
+export type MCPServerConnectionState = "connected" | "failed" | "disabled";
+
+export interface MCPServerStatusSnapshot {
+  serverName: string;
+  url: string;
+  enabled: boolean;
+  status: MCPServerConnectionState;
+  toolCount: number;
+  category?: MCPDiagnosticCategory;
+  message?: string;
+  httpStatus?: number;
+}
+
 class MCPRequestError extends Error {
   readonly category: Exclude<MCPDiagnosticCategory, "ok" | "empty_tools">;
   readonly url: string;
@@ -466,21 +479,60 @@ export async function testMcpServer(server: MCPServer): Promise<MCPServerTestRes
 
 export async function discoverAllMcpTools(
   servers: MCPServer[],
-): Promise<{ tools: MCPTool[]; toolServerMap: Record<string, string> }> {
+): Promise<{
+  tools: MCPTool[];
+  toolServerMap: Record<string, string>;
+  serverStatuses: MCPServerStatusSnapshot[];
+}> {
   const allTools: MCPTool[] = [];
   const map: Record<string, string> = {};
-  const httpServers = servers.filter((s) => s.type === "http" && s.enabled !== false);
+  const statusSnapshots: MCPServerStatusSnapshot[] = [];
+  const httpServers = servers.filter((s) => s.type === "http");
+  const statusOrder = new Map(httpServers.map((server, index) => [`${server.name}\u0000${server.url}`, index]));
 
   const results = await Promise.allSettled(
     httpServers.map(async (server) => {
+      if (server.enabled === false) {
+        statusSnapshots.push({
+          serverName: server.name,
+          url: server.url,
+          enabled: false,
+          status: "disabled",
+          toolCount: 0,
+          category: "ok",
+          message: "Server is disabled in settings.",
+        });
+        return;
+      }
       try {
         const tools = await discoverMcpTools(server);
         for (const tool of tools) {
           allTools.push(tool);
           map[tool.name] = server.url;
         }
+        statusSnapshots.push({
+          serverName: server.name,
+          url: server.url,
+          enabled: true,
+          status: "connected",
+          toolCount: tools.length,
+          category: tools.length > 0 ? "ok" : "empty_tools",
+          message: tools.length > 0
+            ? `Connected and discovered ${tools.length} tool(s).`
+            : "Connected to MCP server but no tools were returned.",
+        });
       } catch (err) {
         const diagnostic = toMcpDiagnostic(err);
+        statusSnapshots.push({
+          serverName: server.name,
+          url: server.url,
+          enabled: true,
+          status: "failed",
+          toolCount: 0,
+          category: diagnostic.category,
+          message: diagnostic.message,
+          httpStatus: diagnostic.status,
+        });
         console.warn(`[MCP] Failed to discover tools from ${server.name} (${server.url}): ${diagnostic.message}`);
         console.warn("[MCP] Discovery diagnostics", {
           server: server.name,
@@ -505,7 +557,13 @@ export async function discoverAllMcpTools(
     }
   }
 
-  return { tools: allTools, toolServerMap: map };
+  statusSnapshots.sort((a, b) => {
+    const keyA = `${a.serverName}\u0000${a.url}`;
+    const keyB = `${b.serverName}\u0000${b.url}`;
+    return (statusOrder.get(keyA) ?? Number.MAX_SAFE_INTEGER) - (statusOrder.get(keyB) ?? Number.MAX_SAFE_INTEGER);
+  });
+
+  return { tools: allTools, toolServerMap: map, serverStatuses: statusSnapshots };
 }
 
 export async function executeMcpTool(
@@ -527,13 +585,16 @@ export async function executeMcpTool(
   try {
     json = await sendJsonRpcRequest(serverUrl, request, session);
   } catch (err) {
-    if (shouldRecoverSession(err)) {
+    try {
+      if (!shouldRecoverSession(err)) throw err;
       resetSession(serverUrl);
       const refreshed = getSession(serverUrl);
       await ensureMcpInitialized({ name: "MCP", type: "http", url: serverUrl }, refreshed);
       json = await sendJsonRpcRequest(serverUrl, request, refreshed);
-    } else {
-      throw err;
+    } catch (finalErr) {
+      const diagnostic = toMcpDiagnostic(finalErr);
+      const category = /session/i.test(diagnostic.message) ? "session" : diagnostic.category;
+      throw new Error(`MCP_CALL_FAILURE[${category}] ${diagnostic.message}`);
     }
   }
 

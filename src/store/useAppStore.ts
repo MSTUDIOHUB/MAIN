@@ -33,23 +33,27 @@ import {
   type PlanStage,
   type PlanTask,
   type ReplyOption,
+  type ResponseLanguagePolicy,
   type RightPanelTab,
   buildPlanTaskEvidenceAudit,
   detectPlanArtifactKind,
-  detectDominantLanguage,
   extractPlanTasks,
   findDroppedPlanTasks,
   getPendingPlanTaskCommandFocus,
   getPlanArtifactTitle,
+  collectChangeEntries,
   isEphemeralPlanArtifactPath,
   isGenericConversationTitle,
   looksLikeReasoningLeakTitle,
+  normalizeResponseLanguagePolicy,
   normalizeConversationDisplayTitle,
   reconcilePlanTaskCompletion,
+  resolveTurnResponseLanguage,
   summarizeAssistantText,
   summarizeUserPrompt,
   validatePlanArtifactContent,
 } from "../lib/workflowModels";
+import { getDiffStats } from "../lib/diff";
 import {
   appendPlanEvidenceEntry,
   createPlanExecutionEvidenceEntry,
@@ -661,6 +665,7 @@ export type { CloudServerConfig } from "../lib/cloudServers";
 
 export interface AppConfig {
   language: Lang;
+  responseLanguagePolicy: ResponseLanguagePolicy;
   theme: ThemeKey;
   themeMode: ThemeMode;
   appIconVariant: "light" | "dark";
@@ -674,6 +679,7 @@ export interface AppConfig {
   chatFontSize: number;  // px, default 13
   thinkingPolicy: ThinkingPolicy;
   sessionRecordingEnabled: boolean;
+  debugRecordFullTurnProcess: boolean;
   local: LocalConfig;
   cloud: CloudConfig;
   cloudServers: CloudServerConfig[];
@@ -1117,6 +1123,7 @@ const defaultCloudState = normalizeCloudServerState({ cloud: createDefaultCloudC
 
 const defaultConfig: AppConfig = {
   language: "zh",
+  responseLanguagePolicy: "follow_input_language",
   theme: "purple",
   themeMode: "dark",
   appIconVariant: "dark",
@@ -1130,6 +1137,7 @@ const defaultConfig: AppConfig = {
   chatFontSize: 13,
   thinkingPolicy: "normal",
   sessionRecordingEnabled: true,
+  debugRecordFullTurnProcess: false,
   local: { provider: "OMLX", endpoint: "http://127.0.0.1:8080/v1", model: "", contextLimit: 16384, apiKey: "", toolProtocol: "auto" },
   cloud: defaultCloudState.cloud,
   cloudServers: defaultCloudState.cloudServers,
@@ -2257,6 +2265,96 @@ function getLastVisibleTurnAgentSummary(turnId: string, taskFlow: TaskBlock[]): 
   return "";
 }
 
+function buildTurnCompactionAssistantMessage(params: {
+  turnSummary: string;
+  turnBlocks: TaskBlock[];
+  language: "zh" | "en";
+}): string {
+  const turnSummary = normalizeIntentSummary(params.turnSummary);
+  if (!turnSummary) return "";
+
+  const { entries } = collectChangeEntries(params.turnBlocks, getDiffStats);
+  const changeLines = entries.map((entry) => {
+    const editSuffix = entry.editCount > 1
+      ? params.language === "en"
+        ? `, ${entry.editCount} edits`
+        : `，${entry.editCount} 次修改`
+      : "";
+    return `- \`${entry.target}\` (+${entry.added} / -${entry.removed}${editSuffix})`;
+  });
+
+  const failureBlocks = params.turnBlocks.filter(
+    (block): block is Extract<TaskBlock, { type: "tool" }> =>
+      block.type === "tool" && (block.toolStatus === "failed" || block.toolStatus === "rejected"),
+  );
+  const failureLines = failureBlocks.map((block, index) => {
+    const statusText = block.toolStatus === "rejected"
+      ? (params.language === "en" ? "rejected" : "已拒绝")
+      : (params.language === "en" ? "failed" : "失败");
+    const header = `${index + 1}. \`${block.toolName}${block.target ? ` ${block.target}` : ""}\` (${statusText})`;
+    const detail = String(block.message || "").trim();
+    if (!detail) return header;
+    const quotedDetail = detail
+      .split(/\r?\n/)
+      .map((line) => `> ${line}`)
+      .join("\n");
+    return `${header}\n${quotedDetail}`;
+  });
+
+  const sections: string[] = [
+    params.language === "en" ? "### Final Conclusion" : "### 最终结论",
+    turnSummary,
+  ];
+
+  if (changeLines.length > 0) {
+    sections.push(
+      params.language === "en" ? "### Turn Changes" : "### 本轮改动",
+      changeLines.join("\n"),
+    );
+  }
+
+  if (failureLines.length > 0) {
+    sections.push(
+      params.language === "en" ? "### Failure Details" : "### 异常详情",
+      failureLines.join("\n\n"),
+    );
+  }
+
+  return sections.join("\n\n").trim();
+}
+
+function compactCompletedTurnAgentMessages(params: {
+  agentMessages: AgentMessage[];
+  turnStartIndex: number;
+  turnSummary: string;
+  turnBlocks: TaskBlock[];
+  language: "zh" | "en";
+}): AgentMessage[] {
+  if (!Array.isArray(params.agentMessages) || params.agentMessages.length === 0) {
+    return params.agentMessages;
+  }
+  if (params.turnStartIndex < 0 || params.turnStartIndex >= params.agentMessages.length) {
+    return params.agentMessages;
+  }
+
+  const compactAssistantContent = buildTurnCompactionAssistantMessage({
+    turnSummary: params.turnSummary,
+    turnBlocks: params.turnBlocks,
+    language: params.language,
+  });
+  if (!compactAssistantContent) return params.agentMessages;
+
+  const turnSegment = params.agentMessages.slice(params.turnStartIndex);
+  const preservedUserMessage = turnSegment.find((message) => message.role === "user");
+  if (!preservedUserMessage) return params.agentMessages;
+
+  return [
+    ...params.agentMessages.slice(0, params.turnStartIndex),
+    preservedUserMessage,
+    { role: "assistant", content: compactAssistantContent },
+  ];
+}
+
 function buildLocalTurnTitle(input: string, intent: ResolvedRunIntent, language: "zh" | "en"): string {
   const cleanedInput = summarizeUserPrompt(input, language === "en" ? 52 : 40);
   if (cleanedInput) return cleanedInput;
@@ -3332,7 +3430,12 @@ export const useAppStore = create<AppState>()(
 
     if (pending.kind === "mode_switch") {
       const originalImages = pending.originalImages;
-      const language = detectDominantLanguage(pending.originalInput, state.config.language);
+      const language = resolveTurnResponseLanguage({
+        text: pending.originalInput,
+        policy: state.config.responseLanguagePolicy,
+        systemLanguage: state.config.language === "en" ? "en" : "zh",
+        fallbackLanguage: state.config.language === "en" ? "en" : "zh",
+      });
 
       if (choice === "cancel") {
         set({ pendingRunDecision: null });
@@ -3433,7 +3536,12 @@ export const useAppStore = create<AppState>()(
       ? (choice as ResolvedUserIntent)
       : pending.suggestedIntent;
     const originalImages = pending.originalImages;
-    const language = detectDominantLanguage(pending.originalInput, state.config.language);
+    const language = resolveTurnResponseLanguage({
+      text: pending.originalInput,
+      policy: state.config.responseLanguagePolicy,
+      systemLanguage: state.config.language === "en" ? "en" : "zh",
+      fallbackLanguage: state.config.language === "en" ? "en" : "zh",
+    });
     set({ pendingRunDecision: null });
     runAfterNextPaint(() => {
       get().sendMessage(pending.originalInput, originalImages, {
@@ -4866,15 +4974,25 @@ export const useAppStore = create<AppState>()(
     const parsedStudioCommand = currentMainModeKey === "game_studio"
       ? parseGameStudioSlashCommand(text)
       : null;
+    const parsedStudioWorkflowArgs = parsedStudioCommand?.type === "workflow"
+      ? parsedStudioCommand.args
+      : "";
     const parsedSetupEngineCommand =
       parsedStudioCommand?.type === "workflow" && parsedStudioCommand.slug === "setup-engine"
-        ? parseSetupEngineArgs(parsedStudioCommand.args)
+        ? parseSetupEngineArgs(parsedStudioWorkflowArgs)
         : null;
+    const languageResolutionInput =
+      parsedStudioCommand?.type === "workflow"
+        ? (parsedStudioWorkflowArgs || text)
+        : text;
     const preferredLanguage = isHidden
       ? state.preferredResponseLanguage
-      : parsedStudioCommand
-      ? state.config.language
-      : detectDominantLanguage(text, state.config.language);
+      : resolveTurnResponseLanguage({
+          text: languageResolutionInput,
+          policy: state.config.responseLanguagePolicy,
+          systemLanguage: state.config.language === "en" ? "en" : "zh",
+          fallbackLanguage: state.config.language === "en" ? "en" : "zh",
+        });
     const mainDebugShortcut = !isHidden && currentMainModeKey === "main_mode"
       ? parseMainDebugShortcut(text)
       : null;
@@ -4972,7 +5090,12 @@ export const useAppStore = create<AppState>()(
         : resolveRunIntentFromLegacyWorkflowMode(state.config.workflowMode));
     let effectiveIntentSummary = normalizeIntentSummary(options?.intentSummary || "");
     let effectiveCommandDirective: CommandDirective | null = options?.commandDirective ?? null;
-    if (shouldExecuteOnceFromReplyOption && effectiveRunIntent === "discuss") {
+    if (
+      shouldExecuteOnceFromReplyOption &&
+      effectiveRunIntent !== "execute" &&
+      effectiveRunIntent !== "studio_workflow" &&
+      effectiveRunIntent !== "plan"
+    ) {
       effectiveRunIntent = currentMainModeKey === "game_studio" ? "studio_workflow" : "execute";
       effectiveCommandDirective = effectiveCommandDirective || inferCommandDirective(text, effectiveRunIntent, {
         source: "continuation",
@@ -5052,6 +5175,81 @@ export const useAppStore = create<AppState>()(
       effectiveCommandDirective = effectiveCommandDirective || inferCommandDirective(text, lockedComposerIntent, {
         source: mainIntentShortcut ? "main_shortcut" : "natural_language",
       });
+    }
+
+    const shouldReevaluateReuseTurnIntent =
+      !isHidden &&
+      shouldReuseExistingTurnIntent &&
+      !mainDebugShortcut &&
+      !lockedComposerIntent &&
+      !shouldContinuePlanIntent &&
+      !shouldContinuePreviousTurnIntent &&
+      !options?.skipIntentResolution &&
+      !options?.resolvedIntent;
+
+    if (shouldReevaluateReuseTurnIntent) {
+      const reuseResolution = resolveTurnRunIntent(text, {
+        language: preferredLanguage,
+        mainModeKey: currentMainModeKey,
+        parsedStudioCommand,
+        hasPlanArtifacts,
+        planStage: state.planStage,
+        isPlanApproved: state.isPlanApproved,
+        previousTurnIntent: currentTurnIntent,
+      });
+      const reuseLooksLikeExecutionIntent =
+        shouldExecuteOnceFromReplyOption ||
+        reuseResolution.intent === "execute" ||
+        reuseResolution.intent === "studio_workflow" ||
+        reuseResolution.commandDirective?.kind === "file_modify" ||
+        reuseResolution.commandDirective?.kind === "shell" ||
+        reuseResolution.commandDirective?.kind === "git" ||
+        reuseResolution.commandDirective?.kind === "unity";
+      const shouldRequestPlanDecision =
+        reuseResolution.needsDecision === true ||
+        (reuseLooksLikeExecutionIntent &&
+          (reuseResolution.riskLevel === "high" || reuseResolution.intent === "plan"));
+
+      if (shouldRequestPlanDecision) {
+        const pendingCopy = createPendingDecisionCopy({
+          suggestedIntent: "plan",
+          decisionOptions: ["plan", "execute", "discuss"],
+          riskLevel: reuseResolution.riskLevel,
+          reason: reuseResolution.reason,
+        }, preferredLanguage);
+        set({
+          pendingRunDecision: {
+            kind: "intent_confirmation",
+            source: "pre_submit",
+            originalInput: text,
+            originalImages: images || [],
+            suggestedIntent: "plan",
+            reason: pendingCopy.reason,
+            title: pendingCopy.title,
+            options: pendingCopy.options,
+          },
+        });
+        return true;
+      }
+
+      if (
+        reuseLooksLikeExecutionIntent &&
+        (reuseResolution.intent === "execute" || reuseResolution.intent === "studio_workflow")
+      ) {
+        effectiveRunIntent = reuseResolution.intent;
+        effectiveCommandDirective =
+          reuseResolution.commandDirective ||
+          effectiveCommandDirective ||
+          inferCommandDirective(text, reuseResolution.intent, { source: "continuation" });
+        effectiveIntentSummary = buildRunIntentSummary({
+          input: text,
+          intent: reuseResolution.intent,
+          language: preferredLanguage,
+          reason: preferredLanguage === "en"
+            ? "The user selected a fix/implement continuation option, so this reused turn is auto-upgraded to execution."
+            : "用户在复用回合中选择了修复/实现型选项，本轮自动升级为执行模式。",
+        });
+      }
     }
 
     if (!isHidden && !mainDebugShortcut && !lockedComposerIntent && !shouldContinuePlanIntent && !shouldContinuePreviousTurnIntent && !shouldReuseExistingTurnIntent && !options?.skipIntentResolution && !options?.resolvedIntent) {
@@ -6301,6 +6499,7 @@ export const useAppStore = create<AppState>()(
 
       // 4. Append to LLM conversation history
       // Build multimodal content if images are present
+      const turnAgentMessagesStart = sessionGet().agentMessages.length;
       let agentUserMsg: AgentMessage;
       if (currentImages.length > 0) {
         const parts: ContentPart[] = [];
@@ -8067,8 +8266,27 @@ export const useAppStore = create<AppState>()(
         clearInterval(timerInterval);
         sessionSet({ pendingSlashCommand: null, elapsedTime: getElapsedSeconds() });
 
+        let latestState = sessionGet();
+        if (!latestState.config.debugRecordFullTurnProcess) {
+          const completedTurn = latestState.conversationTurns.find((turn) => turn.id === turnId);
+          const completedTurnSummary = String(completedTurn?.summary || "").trim();
+          if (completedTurnSummary) {
+            const compactedMessages = compactCompletedTurnAgentMessages({
+              agentMessages: latestState.agentMessages,
+              turnStartIndex: turnAgentMessagesStart,
+              turnSummary: completedTurnSummary,
+              turnBlocks: latestState.taskFlow.filter((block) => block.turnId === turnId),
+              language: (latestState.preferredResponseLanguage || latestState.config.language) === "en" ? "en" : "zh",
+            });
+            if (compactedMessages !== latestState.agentMessages) {
+              sessionSet({ agentMessages: compactedMessages });
+              latestState = sessionGet();
+            }
+          }
+        }
+
         // Save session messages (sanitized for serialization safety)
-        const s = sessionGet();
+        const s = latestState;
         if (runSessionId) {
           const messages = sanitizeTaskBlocksForPersist(s.taskFlow);
           s.updateSession(runScopeKey, runSessionId, {
@@ -8243,6 +8461,7 @@ export const useAppStore = create<AppState>()(
         config: {
           ...current.config,
           ...(persistedState.config ?? {}),
+          responseLanguagePolicy: normalizeResponseLanguagePolicy(persistedState.config?.responseLanguagePolicy),
           local: localConfig,
           cloud: cloudState.cloud,
           cloudServers: cloudState.cloudServers,
@@ -8261,6 +8480,7 @@ export const useAppStore = create<AppState>()(
           toolPermissionPolicy: normalizeToolPermissionPolicy(persistedState.config?.toolPermissionPolicy),
           mcpRouting: normalizeMcpRoutingConfig(persistedState.config?.mcpRouting),
           sessionRecordingEnabled: persistedState.config?.sessionRecordingEnabled ?? current.config.sessionRecordingEnabled,
+          debugRecordFullTurnProcess: persistedState.config?.debugRecordFullTurnProcess === true,
           imAdapters: normalizeImAdaptersConfig(persistedState.config?.imAdapters),
         },
         sessionsByWorkspace: normalizedSessionsByWorkspace,

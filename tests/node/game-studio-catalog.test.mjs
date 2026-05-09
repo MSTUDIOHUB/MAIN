@@ -102,6 +102,7 @@ test("game studio user envelope includes protocol entry and selected agent", () 
   assert.match(envelope, /activeStudioAgent: creative-director/);
   assert.match(envelope, /commandPath: \.protocols\/game-studio\/commands\/start\.md/);
   assert.match(envelope, /agentPath: \.protocols\/game-studio\/agents\/creative-director\.md/);
+  assert.match(envelope, /languageInstruction: Reply to the user in 简体中文\. This is a hard output constraint\./);
   assert.match(envelope, /User request:\nHelp me define the first milestone\./);
 });
 

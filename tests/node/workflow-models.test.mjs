@@ -82,6 +82,8 @@ function loadTranspiledModuleSync(sourcePath) {
 const {
   buildPlanTaskEvidenceAudit,
   collectChangeEntries,
+  detectExplicitLanguageOverride,
+  detectResponseLanguageMismatch,
   deriveVisibleConversationTurnStatus,
   extractPlanTasks,
   findDroppedPlanTasks,
@@ -90,7 +92,9 @@ const {
   looksLikeReasoningLeakTitle,
   mergePlanTasks,
   normalizeConversationDisplayTitle,
+  normalizeResponseLanguagePolicy,
   reconcilePlanTaskCompletion,
+  resolveTurnResponseLanguage,
   resolveActiveConversationTurn,
   resolvePinnedConversationTurn,
   shouldPlanShortcutReplaceTurn,
@@ -121,6 +125,67 @@ const {
 const {
   buildLineDiff,
 } = loadDiffModule();
+
+test("response language policy normalizes unknown values to follow-input mode", () => {
+  assert.equal(normalizeResponseLanguagePolicy("prefer_system_language_with_explicit_switch"), "prefer_system_language_with_explicit_switch");
+  assert.equal(normalizeResponseLanguagePolicy("follow_input_language"), "follow_input_language");
+  assert.equal(normalizeResponseLanguagePolicy("unknown"), "follow_input_language");
+  assert.equal(normalizeResponseLanguagePolicy(null), "follow_input_language");
+});
+
+test("explicit language override detects English and Chinese directives", () => {
+  assert.equal(detectExplicitLanguageOverride("请用英文回复我后续的结果"), "en");
+  assert.equal(detectExplicitLanguageOverride("reply in chinese please"), "zh");
+  assert.equal(detectExplicitLanguageOverride("我在做本地化，不需要切换回复语言"), null);
+});
+
+test("turn response language resolver respects explicit override and policy", () => {
+  const explicitOverride = resolveTurnResponseLanguage({
+    text: "请用英文回复，然后继续",
+    policy: "prefer_system_language_with_explicit_switch",
+    systemLanguage: "zh",
+    fallbackLanguage: "zh",
+  });
+  assert.equal(explicitOverride, "en");
+
+  const systemPreferred = resolveTurnResponseLanguage({
+    text: "这是中文请求，需要你分析并给出方案。This is only a short note.",
+    policy: "prefer_system_language_with_explicit_switch",
+    systemLanguage: "en",
+    fallbackLanguage: "en",
+  });
+  assert.equal(systemPreferred, "en");
+
+  const followInput = resolveTurnResponseLanguage({
+    text: "这是中文请求，需要你分析并给出方案。This is only a short note.",
+    policy: "follow_input_language",
+    systemLanguage: "en",
+    fallbackLanguage: "en",
+  });
+  assert.equal(followInput, "zh");
+});
+
+test("response language mismatch detection ignores code-heavy text and catches real mismatch", () => {
+  const codeLike = detectResponseLanguageMismatch({
+    text: "```ts\\nconst value = 1;\\nfunction run() { return value; }\\n```",
+    targetLanguage: "zh",
+  });
+  assert.equal(codeLike.mismatch, false);
+  assert.equal(codeLike.hasEnoughSignal, false);
+
+  const mismatch = detectResponseLanguageMismatch({
+    text: "Let me summarize the current findings. The root cause is a null pointer in setup.",
+    targetLanguage: "zh",
+  });
+  assert.equal(mismatch.hasEnoughSignal, true);
+  assert.equal(mismatch.mismatch, true);
+
+  const aligned = detectResponseLanguageMismatch({
+    text: "当前结论：已经定位到根因，下一步修复初始化空引用。",
+    targetLanguage: "zh",
+  });
+  assert.equal(aligned.mismatch, false);
+});
 
 test("normalizeConversationDisplayTitle strips speaker timestamps from transcript-style prompts", () => {
   const title = normalizeConversationDisplayTitle("Michael@: 04-23 17:57:52 这个它要建模 是啥意思", 40, "新的任务");
