@@ -85,6 +85,7 @@ const {
   getModelInstructionProfile,
   getDefaultLocalToolProtocol,
   normalizeCloudAuthMode,
+  resolveEffectiveCloudApiFormat,
   normalizeCloudToolProtocol,
   normalizeLocalToolProtocol,
   parseCloudCustomHeaders,
@@ -358,6 +359,21 @@ test("cloud tool protocol and model profile helpers normalize provider behavior"
   assert.equal(normalizeCloudAuthMode("openai_chatgpt_oauth"), "openai_chatgpt_oauth");
   assert.equal(normalizeCloudAuthMode("gemini_google_oauth"), "gemini_google_oauth");
   assert.equal(normalizeCloudAuthMode("bad"), "api_key");
+  assert.equal(resolveEffectiveCloudApiFormat({
+    protocol: "openai",
+    apiFormat: "chat_completions",
+    authMode: "openai_chatgpt_oauth",
+  }), "responses");
+  assert.equal(resolveEffectiveCloudApiFormat({
+    protocol: "openai",
+    apiFormat: "responses",
+    authMode: "api_key",
+  }), "responses");
+  assert.equal(resolveEffectiveCloudApiFormat({
+    protocol: "gemini",
+    apiFormat: "chat_completions",
+    authMode: "openai_chatgpt_oauth",
+  }), "chat_completions");
   assert.equal(normalizeCloudToolProtocol("native"), "native");
   assert.equal(normalizeCloudToolProtocol("xml"), "xml");
   assert.equal(normalizeCloudToolProtocol("bad"), "auto");

@@ -1243,7 +1243,27 @@ export function resolveTurnRunIntent(
     });
   }
 
-  if (matchesAny(normalizedInput, STRONG_SUMMARIZE_PATTERNS)) {
+  const hasStrongSummarizeSignal = matchesAny(normalizedInput, STRONG_SUMMARIZE_PATTERNS);
+  const hasStrongExecuteSignal = matchesAny(normalizedInput, STRONG_EXECUTE_PATTERNS);
+
+  if (context.mainModeKey === "main_mode" && hasStrongSummarizeSignal && hasStrongExecuteSignal) {
+    return finalize({
+      intent: "discuss",
+      reason: localizeReason(
+        language,
+        "同时检测到“总结”与“执行”强信号，本轮先让你确认意图（执行 / 总结 / 讨论），避免误判为强制总结。",
+        "Both summary and execution signals were detected, so this turn asks you to choose intent (execute / summarize / discuss) instead of forcing summary mode.",
+      ),
+      confidence: 0.9,
+      bypassMainRouter: false,
+      riskLevel: "medium",
+      needsDecision: true,
+      suggestedIntent: "execute",
+      decisionOptions: ["execute", "summarize", "discuss"],
+    });
+  }
+
+  if (hasStrongSummarizeSignal) {
     return finalize({
       intent: "summarize",
       reason: localizeReason(
@@ -1314,7 +1334,7 @@ export function resolveTurnRunIntent(
     });
   }
 
-  if (matchesAny(normalizedInput, STRONG_EXECUTE_PATTERNS)) {
+  if (hasStrongExecuteSignal) {
     return finalize({
       intent: "execute",
       reason: localizeReason(

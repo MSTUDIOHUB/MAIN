@@ -1,4 +1,4 @@
-# MAIN 闭源主仓库 + 公开 Releases 仓库发布方案
+# MAIN 闭源主仓库 + 双公开仓库发布方案
 
 这份方案专门对应你现在的目标：
 
@@ -37,6 +37,16 @@
 - 你继续在私有仓库里开发
 - 不需要开源主项目代码
 
+### 3. 公开更新源仓库：`MAIN-UpdateFeed`
+
+这个仓库只承担“应用内自动更新源”，不承担手动下载入口：
+
+- `latest.json`
+- `*_updater_*` 更新包
+- 对应 `.sig` 签名文件
+
+这样可以把手动下载页面和自动更新资产解耦，下载页只展示用户真正需要点击的 zip。
+
 ## 为什么这是当前最稳方案
 
 相比“直接把安装包放网站服务器”或“把源码也公开到同一仓库”，这套结构更适合你现在的产品阶段：
@@ -53,11 +63,16 @@
 
 - `.github/workflows/build-desktop.yml`
 
-它会在私有 `MAIN` 仓库里构建，然后只把下面这些公开附件发布到 `MAIN-Releases`：
+它会在私有 `MAIN` 仓库里构建，然后分两路发布：
+
+发布到 `MAIN-Releases`（用户下载页）：
 
 - `MAIN_<version>_macOS_universal.zip`
 - `MAIN_<version>_macOS_apple_silicon.zip`
 - `MAIN_<version>_windows_x64.zip`
+
+发布到 `MAIN-UpdateFeed`（自动更新源）：
+
 - `MAIN_<version>_updater_darwin_x86_64.app.tar.gz`
 - `MAIN_<version>_updater_darwin_aarch64.app.tar.gz`
 - `MAIN_<version>_updater_windows_x86_64.exe`
@@ -67,7 +82,7 @@
 不会上传 `src/`、`src-tauri/`、`dist/`、`target/` 这类源码或构建目录。
 Release Changelog 会自动写入私有 `MAIN` 仓库触发构建时的最后一次提交摘要、提交正文和变更文件列表，但不会公开源码 diff。
 
-其中前三个 zip 是给用户手动下载的安装包；`updater_*`、`.sig` 和 `latest.json` 是 Tauri 官方 updater 自动更新使用的安全更新产物。`latest.json` 会公开，但它只包含版本号、更新说明、下载 URL 和签名，不包含源码。
+其中 `MAIN-Releases` 只保留用户手动下载的 zip；`MAIN-UpdateFeed` 承担 Tauri updater 自动更新所需的 `updater_*`、`.sig` 和 `latest.json`。`latest.json` 只包含版本号、更新说明、下载 URL 和签名，不包含源码。
 
 ### 最快发布命令
 
@@ -77,7 +92,10 @@ Release Changelog 会自动写入私有 `MAIN` 仓库触发构建时的最后一
 npm run release:desktop -- 1.4.2
 ```
 
-这条命令会检查 GitHub CLI 登录、公开下载仓库、`PUBLIC_RELEASES_TOKEN`、Tauri updater 签名 Secrets、当前工作区是否干净、当前 `HEAD` 是否已经推送到 `origin/main`，然后触发 GitHub Actions 构建 macOS + Windows zip 和自动更新包，并直接公开发布到 `MAIN-Releases`。
+这条命令会检查 GitHub CLI 登录、两个公开仓库访问、`PUBLIC_RELEASES_TOKEN`、Tauri updater 签名 Secrets、当前工作区是否干净、当前 `HEAD` 是否已经推送到 `origin/main`，然后触发 GitHub Actions 构建并发布：
+
+- zip 到 `MAIN-Releases`
+- updater feed 到 `MAIN-UpdateFeed`
 
 常用参数：
 
@@ -92,15 +110,19 @@ npm run release:desktop -- 1.4.2 --dry-run
 
 ### 一次性配置
 
-#### 1. 创建公开下载仓库
+#### 1. 创建公开仓库
 
 在 GitHub 创建一个 public 仓库：
 
 ```text
 MSTUDIOHUB/MAIN-Releases
+MSTUDIOHUB/MAIN-UpdateFeed
 ```
 
-这个仓库只用来放 Releases 附件，不放源码。
+两个仓库都不放源码：
+
+- `MAIN-Releases`: 只放用户下载 zip
+- `MAIN-UpdateFeed`: 只放 updater feed 资产
 
 创建时建议勾选 `Add a README file`，让公开仓库拥有默认分支。GitHub Release 的 tag 会挂在这个公开仓库自己的默认分支上，不会指向私有 `MAIN` 的源码提交。
 
@@ -110,7 +132,9 @@ MSTUDIOHUB/MAIN-Releases
 
 1. 打开 `GitHub > Settings > Developer settings > Personal access tokens > Fine-grained tokens`
 2. 选择 `Generate new token`
-3. Repository access 只选择 `MSTUDIOHUB/MAIN-Releases`
+3. Repository access 选择：
+   - `MSTUDIOHUB/MAIN-Releases`
+   - `MSTUDIOHUB/MAIN-UpdateFeed`
 4. Repository permissions 至少给：
    - `Contents: Read and write`
    - `Metadata: Read-only`
@@ -147,7 +171,7 @@ Name: TAURI_SIGNING_PRIVATE_KEY_PASSWORD
 Value: 生成私钥时设置的密码
 ```
 
-公开仓库里只会出现 `.sig` 签名文件和 `latest.json`。应用内置的是 updater 公钥，用户端会用它校验更新包；如果 Release 附件被篡改，签名校验会失败，MAIN 不会安装该更新。
+`MAIN-UpdateFeed` 仓库会出现 `.sig` 与 `latest.json`。应用内置 updater 公钥，用户端会校验签名；如果附件被篡改，签名校验会失败，MAIN 不会安装该更新。
 
 ### 每次发布
 
@@ -157,6 +181,7 @@ Value: 生成私钥时设置的密码
 4. 填：
    - `version`: 例如 `1.4.1`
    - `release_repo`: 默认 `MSTUDIOHUB/MAIN-Releases`
+   - `update_repo`: 默认 `MSTUDIOHUB/MAIN-UpdateFeed`
    - `draft`: 第一次建议选 `true`，确认附件无误后再公开
    - `prerelease`: 测试版才选 `true`
 5. 点击绿色 `Run workflow`
@@ -172,7 +197,7 @@ https://github.com/MSTUDIOHUB/MAIN-Releases/releases/tag/v1.4.1
 自动更新入口固定为：
 
 ```text
-https://github.com/MSTUDIOHUB/MAIN-Releases/releases/latest/download/latest.json
+https://github.com/MSTUDIOHUB/MAIN-UpdateFeed/releases/latest/download/latest.json
 ```
 
 用户已经安装的 MAIN 会在启动后自动检查这个文件；有新版本时，Sidebar 顶部 Logo 行右侧会出现“更新 / Update”按钮。

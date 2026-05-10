@@ -98,6 +98,7 @@ import {
   buildToolCapabilityRegistry,
   filterToolDefinitionsForIntent,
   getLocalFileReadPathForToolCall,
+  isUnityApplyTextPrecisePatchArgs,
   isLocalFileReadApproved,
   type McpRoutingPriorityMode,
   isToolAutoExecutableForCall,
@@ -111,7 +112,7 @@ import {
   hasProviderNativeToolsDisabled,
   isProviderCompatibilityErrorMessage,
 } from "./providerCompatibility";
-import { normalizeCloudToolProtocol, normalizeLocalToolProtocol } from "./cloudProtocol";
+import { normalizeCloudToolProtocol, normalizeLocalToolProtocol, resolveEffectiveCloudApiFormat } from "./cloudProtocol";
 import { getErrorMessage } from "./errorUtils";
 import { resolveProtocolPackageReadPath } from "./protocolPackages";
 import { isCloudGatewayTimeoutMessage, isRetryableCloudErrorMessage } from "./cloudRetry";
@@ -129,6 +130,7 @@ import {
   type PlanToolActivitySummary,
 } from "./planExecutionRecovery";
 import { validateShellToolContract } from "./toolExecutionContract";
+import { buildExecutionDigest } from "./executionDigest";
 
 // ── Spec file auto-approval helpers ────────────────────────────────
 
@@ -440,6 +442,7 @@ export interface OrchestratorCallbacks {
   onPlanMaxIterationsCheckpoint?: (checkpoint: PlanMaxIterationsCheckpoint) => boolean | Promise<boolean>;
   onExecuteMaxIterationsCheckpoint?: (checkpoint: PlanMaxIterationsCheckpoint) => boolean | Promise<boolean>;
   onTurnSummaryReady: (summary: string) => void;
+  onExecutionDigestUpdate?: (summary: string) => void;
   onInstructionsResolved: (resolved: ResolvedInstructionSet) => void;
   onHooksLoaded: (hooks: HookDefinition[], loadedAt?: number | null) => void;
   onHookStart: (event: HookEvent, hook: HookDefinition) => void;
@@ -458,6 +461,7 @@ export interface OrchestratorCallbacks {
       tokenCountAfter: number;
       tokenReduction: number;
       compressedContext?: string;
+      displaySummary?: string;
       memoryPacket?: string;
       microCompactionKind?: "none" | "tool_results" | "assistant_messages" | "mixed";
       microCompactedCount?: number;
@@ -506,13 +510,18 @@ function deriveStreamSettings(config: AppConfig): StreamSettings {
       useRustProxy: !isOllama,
     };
   }
+  const cloudAuthMode = config.cloudExperimentalLoginEnabled === true ? config.cloud.auth?.mode ?? "api_key" : "api_key";
   return {
     baseUrl: config.cloud.endpoint || "https://api.openai.com/v1",
     apiKey: config.cloud.apiKey,
     model: config.cloud.model,
     apiProtocol: config.cloud.protocol || "openai",
-    apiFormat: config.cloud.apiFormat || "chat_completions",
-    authMode: config.cloudExperimentalLoginEnabled === true ? config.cloud.auth?.mode ?? "api_key" : "api_key",
+    apiFormat: resolveEffectiveCloudApiFormat({
+      protocol: config.cloud.protocol || "openai",
+      apiFormat: config.cloud.apiFormat || "chat_completions",
+      authMode: cloudAuthMode,
+    }),
+    authMode: cloudAuthMode,
     tokenRef: config.cloudExperimentalLoginEnabled === true ? config.cloud.auth?.tokenRef : undefined,
     customHeaders: config.cloud.customHeaders || "",
     disableResponseStorage: config.cloud.disableResponseStorage ?? true,
@@ -574,6 +583,38 @@ const PROSE_CODE_DUMP_MIN_CHARS = 12_000;
 const PROSE_CODE_DUMP_LARGE_CHARS = 32_000;
 const MAX_NO_ACTION_RETRIES = 2;
 const EXECUTE_CONVERGENCE_PROMPT_RATIO = 0.72;
+const MAX_NO_PROGRESS_LOOP_REPEATS = 3;
+const NO_PROGRESS_EXCLUDED_TOOLS = new Set([
+  "execute_command",
+  "send_pty_input",
+  "read_pty_buffer",
+  "read_pty_tail",
+  "read_pty_since",
+  "get_pty_status",
+  "clear_pty_buffer",
+]);
+
+function stableProgressHash(input: string): string {
+  let hash = 2166136261;
+  for (let index = 0; index < input.length; index += 1) {
+    hash ^= input.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function buildNoProgressBatchSignature(results: ToolExecutionResult[]): string {
+  const usable = results.filter((result) => !result.isError);
+  if (usable.length === 0) return "";
+  if (usable.every((result) => NO_PROGRESS_EXCLUDED_TOOLS.has(result.name))) return "";
+  const fragments = usable
+    .map((result) => {
+      const contentHash = stableProgressHash(result.content || "");
+      return `${result.name}::${result.target || ""}::${contentHash}`;
+    })
+    .sort();
+  return fragments.join("||");
+}
 
 function looksLikeProseCodeDump(text: string): boolean {
   const content = text.trim();
@@ -1549,6 +1590,24 @@ async function executeToolCallWithLifecycle(
     return readBeforeModifyValidationError;
   }
 
+  const unityExecutionContext = isUnityExecutionContext(callbacks);
+  if (
+    unityExecutionContext &&
+    tc.name === "apply_text_edits" &&
+    !isUnityApplyTextPrecisePatchArgs(resolvedArgs)
+  ) {
+    const message = buildUnityApplyTextPolicyBlockedMessage(callbacks.getPreferredLanguage());
+    callbacks.onToolError(tc.name, target, message);
+    return {
+      toolCallId: tc.id,
+      name: tc.name,
+      target,
+      content: `Error: ${message}`,
+      isError: true,
+      additionalContexts: [...preHookResult.additionalContexts],
+    };
+  }
+
   const diffPreview = isEphemeralPlanArtifactMutation(tc.name, effectiveArgs)
     ? undefined
     : await buildToolDiffPreview(tc.name, effectiveArgs, { workspace, sessionKey });
@@ -1971,6 +2030,55 @@ function extractMcpCallFailureCategory(content: string): string | null {
   return match ? match[1].toLowerCase() : null;
 }
 
+function isUnityExecutionContext(callbacks: OrchestratorCallbacks): boolean {
+  const commandDirective = callbacks.getCommandDirective?.() ?? null;
+  const gameStudioUnityContext =
+    callbacks.getMainModeKey() === "game_studio" &&
+    callbacks.getGameStudioConfig?.()?.engine === "unity";
+  return isUnityCommandDirective(commandDirective) || gameStudioUnityContext;
+}
+
+function isUnityScriptEditToolName(name: string): boolean {
+  return name === "script_apply_edits" || name === "apply_text_edits";
+}
+
+function isUnityScriptWriteToolCall(name: string, args: Record<string, unknown>): boolean {
+  if (isUnityScriptEditToolName(name)) return true;
+  if (name === "create_script" || name === "delete_script") return true;
+  if (name !== "manage_script") return false;
+  const action = typeof args.action === "string" ? args.action.trim().toLowerCase() : "";
+  return action === "create" || action === "delete";
+}
+
+function buildUnityApplyTextPolicyBlockedMessage(language: "zh" | "en"): string {
+  return language === "zh"
+    ? "UNITY_EDIT_POLICY_BLOCKED: apply_text_edits 仅允许用于“精确补丁”（必须提供 uri、完整坐标 edits，以及 precondition_sha/ precondition_sha256）。当前参数不满足约束。请改用 script_apply_edits，或先读取文件并补全精确坐标与 precondition 后重试。"
+    : "UNITY_EDIT_POLICY_BLOCKED: apply_text_edits is allowed only for precise patches (uri + full coordinate edits + precondition_sha/precondition_sha256). The current arguments are non-compliant. Use script_apply_edits instead, or read the file and retry with exact coordinates and precondition.";
+}
+
+function annotateUnityEditToolDescriptions(tools: MCPTool[], enabled: boolean): MCPTool[] {
+  if (!enabled) return tools;
+  return tools.map((tool) => {
+    if (tool.name === "script_apply_edits") {
+      const guidance = "Unity policy: preferred tool for C# method/class edits.";
+      if ((tool.description || "").includes(guidance)) return tool;
+      return {
+        ...tool,
+        description: `${tool.description || ""}${tool.description ? " " : ""}${guidance}`.trim(),
+      };
+    }
+    if (tool.name === "apply_text_edits") {
+      const guidance = "Unity policy: only for precise coordinate patches with precondition SHA.";
+      if ((tool.description || "").includes(guidance)) return tool;
+      return {
+        ...tool,
+        description: `${tool.description || ""}${tool.description ? " " : ""}${guidance}`.trim(),
+      };
+    }
+    return tool;
+  });
+}
+
 /**
  * Execute the Agent loop.
  *
@@ -2046,6 +2154,11 @@ export async function executeAgentLoop(
   const unityConsoleDiagnosticsRequested =
     isUnityConsoleDiagnosticsDirective(commandDirective) ||
     (unityCommandRequested && /console|报错|错误|warning|警告|compile|编译/i.test(latestUserPromptText));
+  const unityScriptEditRequested =
+    unityCommandRequested &&
+    /fix|repair|patch|edit|modify|refactor|script|code|c#|cs|修复|补丁|修改|脚本|代码|编译|报错|错误/i.test(
+      latestUserPromptText,
+    );
 
   const enabledMcpServers = mcpServers.filter((server) => server.enabled !== false);
   let mcpTools = callbacks.getMcpDiscoveredTools();
@@ -2119,8 +2232,12 @@ export async function executeAgentLoop(
     priorityMode: mcpPriorityMode,
     preferredServerUrls: effectivePreferredUnityUrls,
     forceFirstTools: forceFirstMcpTools,
+    unityRoutingContext: {
+      preferStructuredScriptEdits: unityScriptEditRequested,
+    },
   });
   mcpTools = mcpRoutingResult.tools;
+  mcpTools = annotateUnityEditToolDescriptions(mcpTools, unityCommandRequested);
   logAgentEvent("mcp_routing", { ...mcpRoutingResult.telemetry });
 
   // Build intent-scoped tool definitions: built-ins + active skills + routed MCP tools.
@@ -2147,6 +2264,8 @@ export async function executeAgentLoop(
   let unityMcpFallbackReason: string | null = null;
   let unityMcpFirstIterationPending = unityMcpFirstPhaseActive;
   let unityMcpForceConsoleFirstPending = unityMcpFirstPhaseActive && unityConsoleDiagnosticsRequested;
+  let unityConsoleFinalVerificationRequired = false;
+  let unityConsoleRefreshObservedAfterWrite = false;
 
   const activateUnityMcpFallback = (reason: string) => {
     if (!unityMcpFirstPhaseActive) return;
@@ -2380,6 +2499,8 @@ export async function executeAgentLoop(
   let lastAssistantTextForCheckpoint = "";
   const recentPlanToolActivity: PlanToolActivitySummary[] = [];
   const recentToolActivity: PlanToolActivitySummary[] = [];
+  let lastNoProgressBatchSignature = "";
+  let noProgressBatchRepeatCount = 0;
   const rememberToolActivity = (targetList: PlanToolActivitySummary[], result: ToolExecutionResult) => {
     const detail = truncateForLog(result.displayContent || result.content || "", 120);
     targetList.push({
@@ -2537,6 +2658,7 @@ export async function executeAgentLoop(
           tokenCountAfter: managedResult.tokenCountAfter,
           tokenReduction: managedResult.tokenReduction,
           compressedContext: managedResult.compressedContext,
+          displaySummary: managedResult.displaySummary,
           memoryPacket: managedResult.memoryPacket,
           microCompactionKind: managedResult.microCompactionKind,
           microCompactedCount: managedResult.microCompactedCount,
@@ -2673,6 +2795,7 @@ export async function executeAgentLoop(
             tokenCountAfter: aggressivelyManagedResult.tokenCountAfter,
             tokenReduction: aggressivelyManagedResult.tokenReduction,
             compressedContext: aggressivelyManagedResult.compressedContext,
+            displaySummary: aggressivelyManagedResult.displaySummary,
             memoryPacket: aggressivelyManagedResult.memoryPacket,
             microCompactionKind: aggressivelyManagedResult.microCompactionKind,
             microCompactedCount: aggressivelyManagedResult.microCompactedCount,
@@ -2746,6 +2869,7 @@ export async function executeAgentLoop(
               tokenCountAfter: emergencyManagedResult.tokenCountAfter,
               tokenReduction: emergencyManagedResult.tokenReduction,
               compressedContext: emergencyManagedResult.compressedContext,
+              displaySummary: emergencyManagedResult.displaySummary,
               memoryPacket: emergencyManagedResult.memoryPacket,
               microCompactionKind: emergencyManagedResult.microCompactionKind,
               microCompactedCount: emergencyManagedResult.microCompactedCount,
@@ -3557,6 +3681,17 @@ export async function executeAgentLoop(
           continue;
         }
 
+        if (unityConsoleDiagnosticsRequested && unityConsoleFinalVerificationRequired) {
+          callbacks.onStatusChange("running");
+          callbacks.appendMessage({
+            role: "user",
+            content: callbacks.getPreferredLanguage() === "zh"
+              ? "在输出最终结论前，必须先完成一次最终验证：先调用 refresh_unity，再调用 read_console。完成这一次验证后再给结论，不要重复多轮验证。"
+              : "Before giving the final conclusion, run one final verification pass: call refresh_unity first, then read_console. After this single verification pass, provide the conclusion without repeating more verification loops.",
+          });
+          continue;
+        }
+
         // No intent detected — genuinely done
         const approvedPlanAudit = approvedPlanAuditForNoTool ||
           (workflowMode === "plan" && callbacks.getIsPlanApproved()
@@ -3702,6 +3837,7 @@ export async function executeAgentLoop(
     const localFileReadCalls: Array<ToolCallToExecute & { localFileReadPath: string }> = [];
     const specFileCalls: ToolCallToExecute[] = [];
     const writeCalls: ToolCallToExecute[] = [];
+    const toolArgsByCallId = new Map<string, Record<string, unknown>>();
     const readOnlyCallSignatures = new Map<string, string>();
     const queuedReadOnlySignatures = new Set<string>();
     const toolFailureSignatures = new Map<string, string>();
@@ -3709,6 +3845,7 @@ export async function executeAgentLoop(
 
     for (const tc of effectiveToolCalls) {
       const toolArgs = parseToolCallArguments(tc);
+      toolArgsByCallId.set(tc.id, toolArgs);
       const target = getToolTarget(tc.name, toolArgs);
       const failureSignature = buildRepeatLoopSignature(tc.name, buildRepeatLoopArgsKey(toolArgs));
       toolFailureSignatures.set(tc.id, failureSignature);
@@ -3980,6 +4117,20 @@ export async function executeAgentLoop(
 
     for (const result of allResults) {
       if (result.isError) continue;
+      const resultArgs = toolArgsByCallId.get(result.toolCallId) ?? {};
+      if (unityConsoleDiagnosticsRequested && isUnityScriptWriteToolCall(result.name, resultArgs)) {
+        unityConsoleFinalVerificationRequired = true;
+        unityConsoleRefreshObservedAfterWrite = false;
+      }
+      if (unityConsoleDiagnosticsRequested && unityConsoleFinalVerificationRequired) {
+        if (result.name === "refresh_unity") {
+          unityConsoleRefreshObservedAfterWrite = true;
+        } else if (result.name === "read_console" && unityConsoleRefreshObservedAfterWrite) {
+          unityConsoleFinalVerificationRequired = false;
+          unityConsoleRefreshObservedAfterWrite = false;
+        }
+      }
+
       if (isProjectSourceWriteResult(result)) {
         recentSuccessfulProjectWrite = {
           name: result.name,
@@ -4020,9 +4171,63 @@ export async function executeAgentLoop(
     }
 
     allResults.forEach(rememberAnyToolActivity);
+    const remainingTaskForDigest = callbacks.getPlanTasks().find((task) => !isPlanTaskTrustedComplete(task));
+    if (callbacks.onExecutionDigestUpdate && allResults.length > 0) {
+      const digest = buildExecutionDigest({
+        language: callbacks.getPreferredLanguage(),
+        turnIntent,
+        toolResults: allResults,
+        remainingTask: remainingTaskForDigest?.text,
+      });
+      if (digest) callbacks.onExecutionDigestUpdate(digest);
+    }
 
     if (workflowMode === "plan" && callbacks.getIsPlanApproved()) {
       allResults.forEach(rememberPlanToolActivity);
+    }
+
+    const noProgressBatchSignature = buildNoProgressBatchSignature(allResults);
+    if (noProgressBatchSignature) {
+      if (noProgressBatchSignature === lastNoProgressBatchSignature) {
+        noProgressBatchRepeatCount += 1;
+      } else {
+        lastNoProgressBatchSignature = noProgressBatchSignature;
+        noProgressBatchRepeatCount = 1;
+      }
+    } else {
+      lastNoProgressBatchSignature = "";
+      noProgressBatchRepeatCount = 0;
+    }
+
+    if (noProgressBatchRepeatCount >= MAX_NO_PROGRESS_LOOP_REPEATS) {
+      const remainingText = remainingTaskForDigest?.text || (
+        callbacks.getPreferredLanguage() === "zh"
+          ? "先重新核对当前目标与参数，再选择不同策略继续。"
+          : "Recheck current targets and parameters, then continue with a different strategy."
+      );
+      logAgentEvent("loop_stop", {
+        reason: "no_progress_batch_loop",
+        iteration,
+        repeats: noProgressBatchRepeatCount,
+      });
+      callbacks.onNonActionableStop(
+        callbacks.getPreferredLanguage() === "zh"
+          ? [
+              "执行已暂停：连续多轮工具结果没有实质变化。",
+              "这通常意味着当前策略在原地重复，继续重试只会消耗上下文。",
+              "",
+              `建议下一步：${remainingText}`,
+            ].join("\n")
+          : [
+              "Execution paused: consecutive tool batches showed no material progress.",
+              "This usually means the current strategy is repeating in place and further retries will only consume context.",
+              "",
+              `Suggested next step: ${remainingText}`,
+            ].join("\n"),
+        "no_action",
+      );
+      callbacks.onStatusChange("idle");
+      return;
     }
 
     for (const result of allResults) {

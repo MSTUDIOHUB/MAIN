@@ -4,6 +4,7 @@ import {
   normalizeCloudProtocol,
   normalizeCloudToolProtocol,
   normalizeOpenAiReasoningEffort,
+  resolveEffectiveCloudApiFormat,
   type CloudAuthMode,
   type CloudApiProtocol,
   type CloudToolProtocol,
@@ -136,12 +137,16 @@ function hasMeaningfulLegacyCloudConfig(input?: Partial<CloudProfileConfig> | nu
 export function normalizeCloudConfig(input?: Partial<CloudProfileConfig> | null): CloudProfileConfig {
   const fallback = createDefaultCloudConfig();
   const protocol = normalizeCloudProtocol(input?.protocol);
+  const auth = normalizeCloudAuth(input?.auth, protocol);
   const apiFormat = protocol === "anthropic"
     ? "chat_completions"
-    : normalizeCloudApiFormat(input?.apiFormat);
+    : resolveEffectiveCloudApiFormat({
+      protocol,
+      apiFormat: input?.apiFormat,
+      authMode: auth.mode,
+    });
   const provider = cleanString(input?.provider).trim() || defaultProviderForProtocol(protocol);
   const endpoint = cleanString(input?.endpoint).trim() || defaultEndpointForProtocol(protocol);
-  const auth = normalizeCloudAuth(input?.auth, protocol);
 
   return {
     protocol,

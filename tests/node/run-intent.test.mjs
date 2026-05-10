@@ -233,6 +233,21 @@ test("analysis report requests still resolve to report", () => {
   assert.equal(result.intent, "report");
 });
 
+test("mixed summarize and execute signals request an explicit intent decision", () => {
+  const result = resolveTurnRunIntent("请先总结一下当前改动，然后 commit 并 push 到远程", createContext());
+  assert.equal(result.intent, "discuss");
+  assert.equal(result.needsDecision, true);
+  assert.equal(result.suggestedIntent, "execute");
+  assert.deepEqual(result.decisionOptions, ["execute", "summarize", "discuss"]);
+  assert.notEqual(result.intent, "summarize");
+});
+
+test("pure summarize request still resolves directly to summarize", () => {
+  const result = resolveTurnRunIntent("请总结一下这次排查结论", createContext());
+  assert.equal(result.intent, "summarize");
+  assert.equal(result.needsDecision, undefined);
+});
+
 test("output-style intents stay inside the chat workflow", () => {
   for (const intent of ["analyze", "summarize", "report"]) {
     const policy = getIntentPolicy(intent);

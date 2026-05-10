@@ -227,21 +227,21 @@ export function buildMissingToolCallContinuationPrompt(
   }
 
   return language === "zh"
-    ? "请继续执行你的计划。注意以下规则：\n" +
-        "1. 不要询问用户指示，你自己做决定并执行。\n" +
+    ? "请继续执行当前任务。注意以下规则：\n" +
+        "1. 直接调用最小必要工具推进，不要只写“我将执行/我会处理”这类过程化台词。\n" +
         "2. 必须使用 <tool_use> 格式调用工具，不要只用文字描述。例如：\n" +
         "<tool_use>\n<tool>read_file</tool>\n<parameter name=\"path\">src/foo.ts</parameter>\n</tool_use>\n" +
         "或：\n<tool_use>\n<tool>write_file</tool>\n<parameter name=\"path\">report.md</parameter>\n<parameter name=\"content\"># 分析报告\n...</parameter>\n</tool_use>\n" +
         "3. 不要在聊天区输出完整项目代码或大段 Markdown；如果要生成多个文件，只先写第一个最小核心文件。\n" +
-        "4. 如果不确定，选择最合理的方案直接执行，不要等待确认。\n" +
+        "4. 若关键参数缺失且会影响结果，可先用一句话提出澄清；否则先执行最小可验证步骤并标注你的假设。\n" +
         "现在请立即用工具继续执行。"
-    : "Please continue executing your plan. Follow these rules:\n" +
-        "1. Do not ask the user what to do next. Make the best reasonable decision and proceed.\n" +
+    : "Please continue the current task. Follow these rules:\n" +
+        "1. Call the smallest necessary tool step now instead of process narration like “I will do X”.\n" +
         "2. You must call tools with the <tool_use> format instead of only describing them in prose. For example:\n" +
         "<tool_use>\n<tool>read_file</tool>\n<parameter name=\"path\">src/foo.ts</parameter>\n</tool_use>\n" +
         "or:\n" +
         "<tool_use>\n<tool>write_file</tool>\n<parameter name=\"path\">report.md</parameter>\n<parameter name=\"content\"># Analysis Report\n...</parameter>\n</tool_use>\n" +
-        "3. Do not output full project code or large Markdown blocks in the chat. If generating multiple files, write only the first minimal core file now.\n" +
-        "4. If uncertain, choose the most reasonable path and execute it instead of waiting for confirmation.\n" +
+        "3. Do not output full project code or large Markdown blocks in chat. If generating multiple files, write only the first minimal core file now.\n" +
+        "4. If a missing key parameter would change the result, ask one short clarifying question first; otherwise execute the smallest verifiable step and state your assumption.\n" +
         "Now immediately continue using tools.";
 }

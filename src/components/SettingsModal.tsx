@@ -32,12 +32,14 @@ import {
   normalizeCloudAuthMode,
   normalizeCloudProtocol,
   normalizeCloudToolProtocol,
+  resolveEffectiveCloudApiFormat,
   getDefaultLocalToolProtocol,
   normalizeLocalToolProtocol,
   normalizeOpenAiReasoningEffort,
   OPENAI_CHATGPT_CODEX_ENDPOINT,
   OPENAI_CHATGPT_EXPERIMENTAL_MODELS,
 } from "../lib/cloudProtocol";
+import { buildCloudAuthFriendlyError } from "../lib/cloudAuthErrorHints";
 import { isRetryableCloudErrorMessage } from "../lib/cloudRetry";
 import { isProviderCompatibilityErrorMessage } from "../lib/providerCompatibility";
 import { clearDebugLog, copyDebugLogToClipboard, readDebugLogSnapshot } from "../lib/debugLog";
@@ -291,6 +293,7 @@ const SETTINGS_COPY = {
     apiProtocolDesc: "选择云端服务遵循的协议格式。聚合平台通常走 OpenAI Compatible，Claude 原生接口走 Anthropic。",
     apiFormat: "API Format",
     apiFormatDesc: "弱兼容网关可先尝试 Chat Completions；如果服务像 Codex 一样使用 `wire_api = responses`，请切换到 Responses API。",
+    apiFormatLockedByOpenAiOAuth: "OpenAI 实验登录固定使用 Responses API。",
     responsesEndpointPlaceholder: "https://api.openai.com/v1 或完整 /v1/responses 地址",
     chatEndpointPlaceholder: "https://api.openai.com/v1 或完整 /v1/chat/completions 地址",
     anthropicEndpointHint: "Anthropic 协议通常填写根地址，例如 https://api.anthropic.com",
@@ -347,6 +350,7 @@ const SETTINGS_COPY = {
     cloudSelectServerFirst: "请先新建或选择一个服务器",
     cloudEndpointRequired: "请先填写 API Endpoint",
     cloudModelsPulled: (count: number, model: string) => `已拉取 ${count} 个模型，当前选择 ${model}`,
+    cloudOpenAiProbeFallbackWarning: (model: string) => `模型列表已刷新，但登录探测未找到稳定可用模型。已保留当前选择 ${model}，建议点击“测试”或重新登录。`,
     cloudNoModels: "未发现可用模型，请检查 Endpoint、协议和 API Key",
     cloudConnectionFailed: (message: string) => `连接失败: ${message}`,
     cloudModelRequired: "请先选择或填写一个模型名称",
@@ -508,6 +512,7 @@ const SETTINGS_COPY = {
     apiProtocolDesc: "Choose the cloud service protocol. Aggregators usually use OpenAI Compatible; native Claude endpoints use Anthropic.",
     apiFormat: "API Format",
     apiFormatDesc: "Try Chat Completions for loosely compatible gateways. If the service uses `wire_api = responses`, switch to Responses API.",
+    apiFormatLockedByOpenAiOAuth: "OpenAI experimental login is fixed to Responses API.",
     responsesEndpointPlaceholder: "https://api.openai.com/v1 or a full /v1/responses URL",
     chatEndpointPlaceholder: "https://api.openai.com/v1 or a full /v1/chat/completions URL",
     anthropicEndpointHint: "Anthropic usually uses the root URL, for example https://api.anthropic.com.",
@@ -564,6 +569,7 @@ const SETTINGS_COPY = {
     cloudSelectServerFirst: "Create or select a server first",
     cloudEndpointRequired: "Fill API Endpoint first",
     cloudModelsPulled: (count: number, model: string) => `Fetched ${count} model(s); selected ${model}`,
+    cloudOpenAiProbeFallbackWarning: (model: string) => `Model list refreshed, but login probing could not find a stable model. Kept current selection ${model}; run Test or sign in again.`,
     cloudNoModels: "No available models found. Check endpoint, protocol, and API key.",
     cloudConnectionFailed: (message: string) => `Connection failed: ${message}`,
     cloudModelRequired: "Select or enter a model name first",
@@ -1656,11 +1662,12 @@ export default function SettingsModal({
   const [cloudAuthBusy, setCloudAuthBusy] = useState(false);
   const [cloudAuthSession, setCloudAuthSession] = useState<any | null>(null);
   const [cloudAuthMsg, setCloudAuthMsg] = useState<{ text: string; type: 'success' | 'warning' | 'error' } | null>(null);
+  const [cloudOpenAiLastGoodModelByServer, setCloudOpenAiLastGoodModelByServer] = useState<Record<string, string>>({});
   const [isFetchingModels, setIsFetchingModels] = useState(false);
   const [isFetchingCloudModels, setIsFetchingCloudModels] = useState(false);
   const [isTestingCloudConnection, setIsTestingCloudConnection] = useState(false);
   const [cloudModelInputMode, setCloudModelInputMode] = useState<"select" | "manual">("manual");
-  const [cloudFetchMsg, setCloudFetchMsg] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
+  const [cloudFetchMsg, setCloudFetchMsg] = useState<{ text: string; type: 'success' | 'warning' | 'error' } | null>(null);
   const [cloudProbeMsg, setCloudProbeMsg] = useState<{ text: string; type: 'success' | 'warning' | 'error' } | null>(null);
   const [cloudConnectionStatus, setCloudConnectionStatus] = useState<{
     fingerprint: string;
@@ -1931,14 +1938,19 @@ export default function SettingsModal({
     : createDefaultCloudConfig();
   const cloudAvailableModels = cloudDraftServer ? (cloudModelsByServer[cloudDraftServer.id] || []) : [];
   const cloudProtocol = normalizeCloudProtocol(draftCloudConfig.protocol);
-  const cloudApiFormat = normalizeCloudApiFormat(draftCloudConfig.apiFormat);
   const parsedCloudCustomHeaders = parseCloudCustomHeaders(draftCloudConfig.customHeaders || "");
   const cloudAuth = normalizeCloudAuth(draftCloudConfig.auth, cloudProtocol);
   const rawCloudAuthMode = normalizeCloudAuthMode(cloudAuth.mode);
   const cloudExperimentalLoginEnabled = config.cloudExperimentalLoginEnabled === true;
   const cloudAuthMode = cloudExperimentalLoginEnabled ? rawCloudAuthMode : "api_key";
+  const cloudApiFormat = resolveEffectiveCloudApiFormat({
+    protocol: cloudProtocol,
+    apiFormat: draftCloudConfig.apiFormat,
+    authMode: cloudAuthMode,
+  });
   const cloudRuntimeAuth = cloudExperimentalLoginEnabled ? cloudAuth : createDefaultCloudAuth("api_key");
   const cloudUsesOAuth = cloudAuthMode !== "api_key";
+  const cloudApiFormatLockedByOAuth = cloudProtocol === "openai" && cloudAuthMode === "openai_chatgpt_oauth";
   const filteredCloudServers = cloudServers.filter((server) => {
     const query = cloudServerSearch.trim().toLowerCase();
     if (!query) return true;
@@ -1976,14 +1988,14 @@ export default function SettingsModal({
   const cloudConnectionFingerprint = useMemo(() => buildCloudConnectionFingerprint({
     ...draftCloudConfig,
     auth: cloudRuntimeAuth,
-  }), [
-    draftCloudConfig.apiFormat,
+  }, cloudApiFormat), [
     draftCloudConfig.apiKey,
     draftCloudConfig.auth,
     draftCloudConfig.customHeaders,
     draftCloudConfig.endpoint,
     draftCloudConfig.model,
     draftCloudConfig.protocol,
+    cloudApiFormat,
     cloudExperimentalLoginEnabled,
   ]);
   const activeCloudConnectionStatus = cloudConnectionStatus?.fingerprint === cloudConnectionFingerprint
@@ -2049,6 +2061,16 @@ export default function SettingsModal({
     setCloudModelsByServer((prev) => ({ ...prev, [serverId]: [] }));
     setCloudModelInputMode("manual");
   }, [cloudDraftServer?.id]);
+
+  const clearOpenAiProbeCache = useCallback((serverId?: string) => {
+    if (!serverId) return;
+    setCloudOpenAiLastGoodModelByServer((prev) => {
+      if (!prev[serverId]) return prev;
+      const next = { ...prev };
+      delete next[serverId];
+      return next;
+    });
+  }, []);
 
   const updateCloudDraftServer = useCallback((patch, options = {}) => {
     setCloudDraftServer((prev) => prev ? { ...prev, ...patch } : prev);
@@ -2139,6 +2161,10 @@ export default function SettingsModal({
   const selectCloudServer = useCallback((serverId) => {
     const targetServer = cloudServers.find((server) => server.id === serverId);
     if (!targetServer) return;
+    const previousServerId = cloudDraftServer?.id;
+    if (previousServerId && previousServerId !== serverId) {
+      clearOpenAiProbeCache(previousServerId);
+    }
     setConfig((prev) => {
       const state = normalizeCloudServerState({
         cloud: prev.cloud,
@@ -2156,7 +2182,7 @@ export default function SettingsModal({
     setCloudAuthSession(null);
     setCloudConnectionStatus(null);
     setCloudModelInputMode((cloudModelsByServer[serverId] || []).length > 0 ? "select" : "manual");
-  }, [cloudModelsByServer, cloudServers, commitCloudServers, setConfig]);
+  }, [clearOpenAiProbeCache, cloudDraftServer?.id, cloudModelsByServer, cloudServers, commitCloudServers, setConfig]);
 
   const addCloudServer = useCallback(() => {
     const nextDraft = makeBlankCloudServerDraft();
@@ -2218,6 +2244,7 @@ export default function SettingsModal({
       delete next[serverId];
       return next;
     });
+    clearOpenAiProbeCache(serverId);
     if (cloudDraftServer?.id === serverId) {
       const removedIndex = cloudServers.findIndex((server) => server.id === serverId);
       const remainingServers = cloudServers.filter((server) => server.id !== serverId);
@@ -2233,7 +2260,7 @@ export default function SettingsModal({
     setCloudAuthSession(null);
     setCloudConnectionStatus(null);
     setCloudSaveMsg(null);
-  }, [cloudDraftMode, cloudDraftServer, cloudModelsByServer, cloudServers, commitCloudServers, savedActiveCloudServer, setConfig]);
+  }, [clearOpenAiProbeCache, cloudDraftMode, cloudDraftServer, cloudModelsByServer, cloudServers, commitCloudServers, savedActiveCloudServer, setConfig]);
 
   const handleCloudProtocolChange = (e) => {
     if (!cloudDraftServer) return;
@@ -2255,10 +2282,16 @@ export default function SettingsModal({
     setCloudFetchMsg(null);
     setCloudProbeMsg(null);
     setCloudConnectionStatus(null);
+    clearOpenAiProbeCache(cloudDraftServer.id);
   };
 
   const handleCloudApiFormatChange = (e) => {
-    const nextApiFormat = normalizeCloudApiFormat(e.target.value);
+    if (cloudApiFormatLockedByOAuth) return;
+    const nextApiFormat = resolveEffectiveCloudApiFormat({
+      protocol: cloudProtocol,
+      apiFormat: e.target.value,
+      authMode: cloudAuthMode,
+    });
     updateCloudDraftServer({ apiFormat: nextApiFormat });
     setCloudProbeMsg(null);
     setCloudConnectionStatus(null);
@@ -2287,11 +2320,14 @@ export default function SettingsModal({
       auth: createDefaultCloudAuth(nextMode),
       apiKey: nextMode === "api_key" ? draftCloudConfig.apiKey || "" : "",
     }, { clearModels: true });
+    if (nextMode !== "openai_chatgpt_oauth") {
+      clearOpenAiProbeCache(cloudDraftServer.id);
+    }
     setCloudAuthMsg(null);
     setCloudAuthSession(null);
     setCloudProbeMsg(null);
     setCloudConnectionStatus(null);
-  }, [cloudDraftServer, cloudExperimentalLoginEnabled, draftCloudConfig.apiKey, draftCloudConfig.endpoint, updateCloudDraftServer]);
+  }, [clearOpenAiProbeCache, cloudDraftServer, cloudExperimentalLoginEnabled, draftCloudConfig.apiKey, updateCloudDraftServer]);
 
   const updateCloudDraftAuth = useCallback((patch) => {
     const nextAuth = normalizeCloudAuth({
@@ -2381,6 +2417,7 @@ export default function SettingsModal({
     try {
       await invoke<any>("cloud_auth_logout", { serverId: cloudAuth.tokenRef || cloudDraftServer.id });
       updateCloudDraftAuth({ mode: cloudAuthMode, status: "disconnected", tokenRef: undefined, accountId: undefined, email: undefined, expiresAt: undefined, storage: undefined, message: undefined });
+      clearOpenAiProbeCache(cloudDraftServer.id);
       setCloudAuthSession(null);
       setCloudAuthMsg({ text: copy.authDisconnected, type: "success" });
     } catch (err) {
@@ -2389,7 +2426,7 @@ export default function SettingsModal({
     } finally {
       setCloudAuthBusy(false);
     }
-  }, [cloudAuth.tokenRef, cloudAuthMode, cloudDraftServer, cloudExperimentalLoginEnabled, copy, updateCloudDraftAuth]);
+  }, [clearOpenAiProbeCache, cloudAuth.tokenRef, cloudAuthMode, cloudDraftServer, cloudExperimentalLoginEnabled, copy, updateCloudDraftAuth]);
 
   const refreshCloudModels = useCallback(async (serverOverride = null) => {
     if (isFetchingCloudModels) return;
@@ -2417,11 +2454,55 @@ export default function SettingsModal({
 
       if (targetAuthMode === "openai_chatgpt_oauth") {
         const models = [...OPENAI_CHATGPT_EXPERIMENTAL_MODELS];
-        const selectedModel = models.includes(targetServer.model) ? targetServer.model : models[0];
+        let selectedModel = models.includes(targetServer.model) ? targetServer.model : models[0];
+        const canProbe = Boolean(targetAuth.tokenRef && String(targetAuth.tokenRef).trim());
+        let probeSucceeded = false;
+        if (canProbe) {
+          const probeUrl = buildCloudMessagesApiUrl(endpoint, "openai", "responses");
+          const probeHeaders = buildCloudHeaders("openai", "", true, targetServer.customHeaders, targetAuthMode);
+          const probeMessages = [{ role: "user", content: language === "en" ? "Hello, please reply with only ok" : "你好，请只回复 ok" }];
+          const probeModels = Array.from(new Set([
+            cloudOpenAiLastGoodModelByServer[targetServerId] || "",
+            String(targetServer.model || "").trim(),
+            ...models,
+          ].filter(Boolean))).slice(0, 3);
+          probeLoop:
+          for (const probeModel of probeModels) {
+            const probeCandidates = buildOpenAiResponsesProbeRequestCandidates({
+              messages: probeMessages,
+              model: probeModel,
+              includeAdvanced: false,
+              authMode: targetAuthMode,
+            });
+            for (const candidate of probeCandidates) {
+              try {
+                await invoke<string>("proxy_request", {
+                  url: probeUrl,
+                  method: "POST",
+                  headers: probeHeaders,
+                  body: JSON.stringify(ensureOpenAiChatGptCodexRequestBody(candidate.body)),
+                  authMode: targetAuthMode,
+                  tokenRef: targetAuth.tokenRef,
+                });
+                selectedModel = probeModel;
+                probeSucceeded = true;
+                setCloudOpenAiLastGoodModelByServer((prev) => ({ ...prev, [targetServerId]: probeModel }));
+                break probeLoop;
+              } catch (probeErr) {
+                const errMsg = probeErr instanceof Error ? probeErr.message : String(probeErr);
+                if (!isProviderCompatibilityErrorMessage(errMsg) && !isRetryableCloudErrorMessage(errMsg)) {
+                  break;
+                }
+              }
+            }
+          }
+        }
         setCloudModelsByServer((prev) => ({ ...prev, [targetServerId]: models }));
         setCloudModelInputMode("select");
         confirmCloudModelSelection(selectedModel, targetServerForRuntime);
-        setCloudFetchMsg({ text: copy.cloudModelsPulled(models.length, selectedModel), type: "success" });
+        setCloudFetchMsg(canProbe && !probeSucceeded
+          ? { text: copy.cloudOpenAiProbeFallbackWarning(selectedModel), type: "warning" }
+          : { text: copy.cloudModelsPulled(models.length, selectedModel), type: "success" });
         return;
       }
 
@@ -2477,11 +2558,17 @@ export default function SettingsModal({
       setCloudFetchMsg({ text: copy.cloudNoModels, type: "error" });
     } catch (err) {
       setCloudModelsByServer((prev) => ({ ...prev, [targetServerId]: [] }));
-      setCloudFetchMsg({ text: copy.cloudConnectionFailed(err instanceof Error ? err.message : String(err)), type: "error" });
+      const friendlyError = buildCloudAuthFriendlyError({
+        protocol: targetProtocol,
+        authMode: targetAuthMode,
+        error: err instanceof Error ? err.message : String(err),
+        language,
+      });
+      setCloudFetchMsg({ text: copy.cloudConnectionFailed(friendlyError), type: "error" });
     } finally {
       setIsFetchingCloudModels(false);
     }
-  }, [cloudDraftServer, cloudExperimentalLoginEnabled, confirmCloudModelSelection, copy, isFetchingCloudModels]);
+  }, [cloudDraftServer, cloudExperimentalLoginEnabled, cloudOpenAiLastGoodModelByServer, confirmCloudModelSelection, copy, isFetchingCloudModels, language]);
 
   const testCloudConnection = useCallback(async () => {
     if (isTestingCloudConnection) return;
@@ -2714,6 +2801,9 @@ export default function SettingsModal({
         model: effectiveTestModel,
         text: copy.cloudConnected(effectiveTestModel, switchedText),
       });
+      if (cloudProtocol === "openai" && cloudAuthMode === "openai_chatgpt_oauth" && cloudDraftServer?.id) {
+        setCloudOpenAiLastGoodModelByServer((prev) => ({ ...prev, [cloudDraftServer.id]: effectiveTestModel }));
+      }
 
       setCloudProbeMsg({
         text: reply
@@ -2754,13 +2844,19 @@ export default function SettingsModal({
       }
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
+      const friendlyError = buildCloudAuthFriendlyError({
+        protocol: cloudProtocol,
+        authMode: cloudAuthMode,
+        error: errMsg,
+        language,
+      });
       const protocolHint = cloudProtocol === "anthropic" && errMsg.includes("/v1/messages")
         ? copy.cloudProtocolHint
         : "";
       const retryHint = isRetryableCloudErrorMessage(errMsg)
         ? copy.cloudRetryHint
         : "";
-      setCloudProbeMsg({ text: copy.cloudTestFailed(errMsg, protocolHint, retryHint), type: "error" });
+      setCloudProbeMsg({ text: copy.cloudTestFailed(friendlyError, protocolHint, retryHint), type: "error" });
     } finally {
       setIsTestingCloudConnection(false);
     }
@@ -3529,7 +3625,7 @@ export default function SettingsModal({
                           <span>{activeCloudConnectionStatus.text}</span>
                         </p>
                       )}
-                      {cloudFetchMsg && <p className={`mt-2 text-[12px] ${cloudFetchMsg.type === 'error' ? 'text-[#f48771]' : 'text-[#86d9a3]'}`}>{cloudFetchMsg.text}</p>}
+                      {cloudFetchMsg && <p className={`mt-2 text-[12px] ${cloudFetchMsg.type === 'error' ? 'text-[#f48771]' : cloudFetchMsg.type === 'warning' ? 'text-[#fbbf24]' : 'text-[#86d9a3]'}`}>{cloudFetchMsg.text}</p>}
                       {cloudProbeMsg && <p className={`mt-2 text-[12px] ${cloudProbeMsg.type === 'error' ? 'text-[#f48771]' : cloudProbeMsg.type === 'warning' ? 'text-[#fbbf24]' : 'text-[#86d9a3]'}`}>{cloudProbeMsg.text}</p>}
                     </>
                   ) : (
@@ -3848,13 +3944,18 @@ export default function SettingsModal({
                                 <label className="mb-2 block text-[13px] font-bold text-[#e4e4e7]">{copy.apiFormat}</label>
                                 <p className="mb-2 text-[11.5px] text-[#71717a]">{copy.apiFormatDesc}</p>
                                 <select
+                                  data-testid="cloud-api-format-select"
                                   value={cloudApiFormat}
                                   onChange={handleCloudApiFormatChange}
+                                  disabled={cloudApiFormatLockedByOAuth}
                                   className={settingsSelectClass}
                                 >
                                   <option value="chat_completions">OpenAI Chat Completions</option>
                                   <option value="responses">OpenAI Responses API</option>
                                 </select>
+                                {cloudApiFormatLockedByOAuth && (
+                                  <p className="mt-2 text-[11px] text-[#fbbf24]">{copy.apiFormatLockedByOpenAiOAuth}</p>
+                                )}
                               </div>
                             )}
 

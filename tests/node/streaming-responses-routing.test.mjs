@@ -136,6 +136,44 @@ test("OpenAI ChatGPT OAuth cloud requests pass token references to the Rust prox
   assert.equal(invokeArgs[0].url, "https://api.openai.com/v1/responses");
 });
 
+test("OpenAI ChatGPT OAuth forces responses endpoint even when apiFormat is chat_completions", async () => {
+  const invokeArgs = [];
+  const { streamChatCompletion } = await loadStreamingModule(async (command, args) => {
+    assert.equal(command, "proxy_request");
+    invokeArgs.push(args);
+    const body = JSON.parse(args.body);
+    assert.equal(args.authMode, "openai_chatgpt_oauth");
+    assert.equal(body.user_prompt_id, "main-cloud-test");
+    assert.equal(body.stream, true);
+    assert.equal(body.store, false);
+    assert.equal(typeof body.instructions, "string");
+    return "__CONTENT_TYPE__:text/event-stream\n"
+      + "event: response.output_text.delta\n"
+      + "data: {\"delta\":\"ok\"}\n\n";
+  });
+
+  await streamChatCompletion(
+    [{ role: "user", content: "hi" }],
+    {
+      baseUrl: "https://api.openai.com/v1",
+      apiKey: "",
+      model: "gpt-5.4",
+      apiProtocol: "openai",
+      apiFormat: "chat_completions",
+      authMode: "openai_chatgpt_oauth",
+      tokenRef: "openai-login",
+      useRustProxy: true,
+    },
+    {
+      onToken: () => {},
+      onDone: () => {},
+      onError: (error) => { throw error; },
+    },
+  );
+
+  assert.equal(invokeArgs[0].url, "https://api.openai.com/v1/responses");
+});
+
 test("Gemini OAuth cloud requests use Code Assist endpoint and token refs", async () => {
   const { streamChatCompletion } = await loadStreamingModule(async (command, args) => {
     assert.equal(command, "proxy_request");
@@ -549,6 +587,69 @@ test("OpenAI Responses retries 502 upstream failures with compact input", async 
   assert.equal(requests[0].reasoning.effort, "xhigh");
   assert.equal(requests[1].reasoning.effort, "xhigh");
   assert.equal(typeof requests[1].input, "string");
+});
+
+test("OpenAI Responses falls back when a successful candidate returns empty content and no tool calls", async () => {
+  const requests = [];
+  const { streamChatCompletion } = await loadStreamingModule(async (_command, args) => {
+    requests.push(JSON.parse(args.body));
+    if (requests.length === 1) {
+      return JSON.stringify({ output_text: "" });
+    }
+    return JSON.stringify({ output_text: "ok after empty fallback" });
+  });
+
+  const result = await streamChatCompletion(
+    [{ role: "user", content: "继续执行" }],
+    {
+      baseUrl: "https://www.aiwanwu.cc/v1",
+      apiKey: "test-key",
+      model: "gpt-5.5",
+      apiProtocol: "openai",
+      apiFormat: "responses",
+      useRustProxy: true,
+      reasoningEffort: "high",
+    },
+    {
+      onToken: () => {},
+      onDone: () => {},
+      onError: (error) => { throw error; },
+    },
+  );
+
+  assert.equal(result.content, "ok after empty fallback");
+  assert.equal(requests.length >= 2, true);
+});
+
+test("OpenAI Responses throws a tagged compatibility error when every candidate is empty", async () => {
+  const requests = [];
+  const { streamChatCompletion } = await loadStreamingModule(async (_command, args) => {
+    requests.push(JSON.parse(args.body));
+    return JSON.stringify({ output_text: "" });
+  });
+
+  await assert.rejects(
+    () => streamChatCompletion(
+      [{ role: "user", content: "继续执行" }],
+      {
+        baseUrl: "https://www.aiwanwu.cc/v1",
+        apiKey: "test-key",
+        model: "gpt-5.5",
+        apiProtocol: "openai",
+        apiFormat: "responses",
+        useRustProxy: true,
+        reasoningEffort: "high",
+      },
+      {
+        onToken: () => {},
+        onDone: () => {},
+        onError: () => {},
+      },
+    ),
+    /responses_empty_after_fallbacks/,
+  );
+
+  assert.equal(requests.length >= 2, true);
 });
 
 test("OpenAI Responses sends compacted system instructions for cloud requests", async () => {

@@ -79,6 +79,17 @@ test.beforeEach(async ({ page }) => {
         if (method === "POST") {
           const body = args?.body ? JSON.parse(String(args.body)) : {};
           const behavior = (window as any).__CLOUD_TEST_BEHAVIOR__ ?? "success";
+          if (behavior === "openai-probe-first-fails" && requestUrl.includes("/responses")) {
+            if (body.model === "gpt-5.5") {
+              throw new Error("HTTP 401: invalid_token");
+            }
+          }
+          if (behavior === "openai-oauth-instructions-required" && requestUrl.includes("/responses")) {
+            throw new Error("HTTP 400: {\"detail\":\"Instructions are required\"}");
+          }
+          if (behavior === "gemini-oauth-scope-insufficient" && requestUrl.includes("v1internal:generateContent")) {
+            throw new Error("HTTP 403: {\"error\":{\"code\":403,\"message\":\"Request had insufficient authentication scopes.\",\"status\":\"PERMISSION_DENIED\",\"details\":[{\"reason\":\"ACCESS_TOKEN_SCOPE_INSUFFICIENT\"}]}}");
+          }
           if (behavior === "responses-fail-chat-succeeds" && requestUrl.includes("/responses")) {
             throw new Error("HTTP 400: unsupported Responses API");
           }
@@ -187,6 +198,10 @@ test("OpenAI experimental login shows status and refreshes Codex model candidate
 
   await enableCloudLab(page);
   await page.getByTestId("cloud-auth-mode-openai_chatgpt_oauth").click();
+  await page.getByText("详细设置").click();
+  await expect(page.getByTestId("cloud-api-format-select")).toHaveValue("responses");
+  await expect(page.getByTestId("cloud-api-format-select")).toBeDisabled();
+  await expect(page.getByText("OpenAI 实验登录固定使用 Responses API。")).toBeVisible();
   await expect(page.getByText("ChatGPT Pro/Plus/Codex 实验登录")).toBeVisible();
   await expect(page.getByText("不承诺免费账号可用")).toBeVisible();
   await page.getByTestId("cloud-auth-login").click();
@@ -199,6 +214,37 @@ test("OpenAI experimental login shows status and refreshes Codex model candidate
 
   const commands = await page.evaluate(() => (window as any).__CLOUD_AUTH_COMMANDS__ ?? []);
   expect(commands.some((call: any) => call.cmd === "cloud_auth_begin" && call.args.mode === "openai_chatgpt_oauth")).toBeTruthy();
+});
+
+test("OpenAI experimental login refresh prefers cached probe-success model on subsequent refreshes", async ({ page }) => {
+  await page.goto("/?e2eScenario=cloud-settings-model-select");
+  await page.evaluate(() => {
+    (window as any).__CLOUD_AUTH_MODE__ = "openai_chatgpt_oauth";
+    (window as any).__CLOUD_TEST_BEHAVIOR__ = "openai-probe-first-fails";
+  });
+
+  await enableCloudLab(page);
+  await page.getByTestId("cloud-auth-mode-openai_chatgpt_oauth").click();
+  await page.getByTestId("cloud-auth-login").click();
+  await expect(page.getByText(/已登录 · openai@example\.com/)).toBeVisible();
+
+  await page.getByTestId("cloud-model-refresh").click();
+  await expect(page.getByTestId("cloud-model-select")).toHaveValue("gpt-5.4");
+
+  const firstRefreshRequests = await page.evaluate(() =>
+    ((window as any).__CLOUD_REQUESTS__ ?? []).filter((request: any) => request.method === "POST" && request.url.includes("/responses")),
+  );
+  expect(firstRefreshRequests[0]?.body?.model).toBe("gpt-5.5");
+  expect(firstRefreshRequests.some((request: any) => request.body?.model === "gpt-5.4")).toBeTruthy();
+
+  await page.evaluate(() => { (window as any).__CLOUD_REQUESTS__ = []; });
+  await page.getByTestId("cloud-model-refresh").click();
+  await expect(page.getByTestId("cloud-model-select")).toHaveValue("gpt-5.4");
+
+  const secondRefreshRequests = await page.evaluate(() =>
+    ((window as any).__CLOUD_REQUESTS__ ?? []).filter((request: any) => request.method === "POST" && request.url.includes("/responses")),
+  );
+  expect(secondRefreshRequests[0]?.body?.model).toBe("gpt-5.4");
 });
 
 test("OpenAI experimental login probes with Codex-compatible input text", async ({ page }) => {
@@ -243,6 +289,31 @@ test("Gemini Google login shows Cloud Project hint and native model candidates",
   await page.getByTestId("cloud-model-refresh").click();
   await expect(page.getByTestId("cloud-model-select")).toBeVisible();
   await expect(page.getByTestId("cloud-model-select").locator("option").filter({ hasText: "gemini-2.5-pro" })).toHaveCount(1);
+});
+
+test("OAuth cloud test maps OpenAI instructions-required and Gemini scope errors to actionable hints", async ({ page }) => {
+  await page.goto("/?e2eScenario=cloud-settings-model-select");
+
+  await page.evaluate(() => {
+    (window as any).__CLOUD_AUTH_MODE__ = "openai_chatgpt_oauth";
+    (window as any).__CLOUD_TEST_BEHAVIOR__ = "openai-oauth-instructions-required";
+  });
+  await enableCloudLab(page);
+  await page.getByTestId("cloud-auth-mode-openai_chatgpt_oauth").click();
+  await page.getByTestId("cloud-auth-login").click();
+  await page.getByTestId("cloud-model-refresh").click();
+  await page.getByTestId("cloud-model-test").click();
+  await expect(page.getByText(/OpenAI 实验登录通道要求 Responses 请求携带 instructions/)).toBeVisible();
+
+  await page.evaluate(() => {
+    (window as any).__CLOUD_AUTH_MODE__ = "gemini_google_oauth";
+    (window as any).__CLOUD_TEST_BEHAVIOR__ = "gemini-oauth-scope-insufficient";
+  });
+  await page.getByTestId("cloud-auth-mode-gemini_google_oauth").click();
+  await page.getByTestId("cloud-auth-login").click();
+  await page.getByTestId("cloud-model-refresh").click();
+  await page.getByTestId("cloud-model-test").click();
+  await expect(page.getByText(/Gemini 登录 token 缺少 cloud-platform 授权范围/)).toBeVisible();
 });
 
 test("Gemini Google login replaces stale OpenAI endpoint before testing", async ({ page }) => {

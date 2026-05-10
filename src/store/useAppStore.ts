@@ -74,8 +74,8 @@ import {
   buildCloudHeaders,
   buildCloudMessagesApiUrl,
   extractAnthropicResponseText,
-  normalizeCloudApiFormat,
   normalizeCloudProtocol,
+  resolveEffectiveCloudApiFormat,
   normalizeLocalToolProtocol,
   type CloudToolProtocol,
 } from "../lib/cloudProtocol";
@@ -198,6 +198,12 @@ import {
   normalizeThoughtSummaryForCompare,
   type ThinkingPolicy,
 } from "../lib/thoughtDisplay";
+import {
+  canUpdateSeedSessionTitle,
+  isSemanticTurnMetadataCallbackCurrent,
+  shouldRequestSemanticTurnMetadataForTurn,
+  shouldSeedSessionTitle,
+} from "../lib/intentTitlePolicy";
 
 function logStoreEvent(event: string, data: Record<string, unknown> = {}) {
   try {
@@ -209,6 +215,13 @@ function logStoreEvent(event: string, data: Record<string, unknown> = {}) {
 
 function nowMs() {
   return typeof performance !== "undefined" ? performance.now() : Date.now();
+}
+
+function normalizePendingDecisionInputKey(input: string): string {
+  return String(input || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
 }
 
 type SessionAutoApproveScope = "workspace_write" | "shell";
@@ -787,6 +800,7 @@ export type TaskBlock =
         tokenCountAfter: number;
         tokenReduction: number;
         compressedContext?: string;
+        displaySummary?: string;
         memoryPacket?: string;
         microCompactionKind?: "none" | "tool_results" | "assistant_messages" | "mixed";
         microCompactedCount?: number;
@@ -882,6 +896,7 @@ interface AppState {
   pendingSlashCommand: PendingSlashCommand | null;
   lockedComposerIntent: MainIntentShortcut | null;
   pendingRunDecision: PendingRunDecision | null;
+  dismissedPendingDecisionInputKey: string | null;
   executionConsentPolicy: ExecutionConsentPolicy;
   setInput: (v: string, options?: { preserveLockedComposerIntent?: boolean }) => void;
   setPreferredResponseLanguage: (lang: Lang) => void;
@@ -2411,16 +2426,6 @@ function buildMainDebugPrompt(feedback: string): string {
 
 // region: 回合标题语义同步
 
-const NOISY_TURN_INPUT_RE =
-  /(?:\n|(?:\d{2,4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2})\s+\d{1,2}:\d{2}(?::\d{2})?|^[A-Za-z][\w.-]{0,31}\s*[@:：-]\s*(?=\d{1,2}:\d{2}))/m;
-
-function shouldRequestSemanticTurnMetadata(input: string, shouldSeedSessionTitle: boolean): boolean {
-  const normalized = String(input || "").trim();
-  if (!normalized) return false;
-  if (shouldSeedSessionTitle) return true;
-  return normalized.length > 72 || NOISY_TURN_INPUT_RE.test(normalized);
-}
-
 function stripJsonFence(text: string): string {
   const trimmed = text.trim();
   const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
@@ -2590,6 +2595,9 @@ export function sanitizeTaskBlocksForPersist(blocks: TaskBlock[]): TaskBlock[] {
                     tokenCountAfter: Number(b.contextCompression.tokenCountAfter) || 0,
                     tokenReduction: Number(b.contextCompression.tokenReduction) || 0,
                     ...(compressedContext ? { compressedContext } : {}),
+                    ...(b.contextCompression.displaySummary
+                      ? { displaySummary: trimPersistedContextCompression(b.contextCompression.displaySummary) }
+                      : {}),
                     ...(b.contextCompression.memoryPacket
                       ? { memoryPacket: trimPersistedContextCompression(b.contextCompression.memoryPacket) }
                       : {}),
@@ -3330,10 +3338,18 @@ export const useAppStore = create<AppState>()(
   pendingSlashCommand: null,
   lockedComposerIntent: null,
   pendingRunDecision: null,
+  dismissedPendingDecisionInputKey: null,
   executionConsentPolicy: "ask_per_turn",
-  setInput: (v, options) => set({
-    input: v,
-    ...(v.trim().length === 0 && !options?.preserveLockedComposerIntent ? { lockedComposerIntent: null } : {}),
+  setInput: (v, options) => set((s) => {
+    const currentInputKey = normalizePendingDecisionInputKey(s.input);
+    const nextInputKey = normalizePendingDecisionInputKey(v);
+    return {
+      input: v,
+      ...(v.trim().length === 0 && !options?.preserveLockedComposerIntent ? { lockedComposerIntent: null } : {}),
+      ...(s.dismissedPendingDecisionInputKey && currentInputKey !== nextInputKey
+        ? { dismissedPendingDecisionInputKey: null }
+        : {}),
+    };
   }),
   setPreferredResponseLanguage: (lang) => set({ preferredResponseLanguage: lang }),
   setContextMentions: (v) => set({ contextMentions: v }),
@@ -3373,14 +3389,24 @@ export const useAppStore = create<AppState>()(
   setPendingSlashCommand: (command) => set({ pendingSlashCommand: command }),
   setLockedComposerIntent: (intent) => set({ lockedComposerIntent: intent }),
   dismissPendingRunDecision: () =>
-    set({
-      pendingRunDecision: null,
-      pendingRunDecisionResolver: null,
+    set((s) => {
+      const dismissedKey =
+        s.pendingRunDecision?.kind === "intent_confirmation"
+          ? normalizePendingDecisionInputKey(s.pendingRunDecision.originalInput)
+          : null;
+      return {
+        pendingRunDecision: null,
+        pendingRunDecisionResolver: null,
+        dismissedPendingDecisionInputKey: dismissedKey,
+      };
     }),
   resolvePendingRunDecision: (choice) => {
     const state = get();
     const pending = state.pendingRunDecision;
     if (!pending) return;
+    if (state.dismissedPendingDecisionInputKey) {
+      set({ dismissedPendingDecisionInputKey: null });
+    }
 
     if (pending.kind === "execution_consent") {
       const resolver = state.pendingRunDecisionResolver;
@@ -3923,7 +3949,10 @@ export const useAppStore = create<AppState>()(
     const runtime = get().runtimeBySessionKey[sessionKey];
     if (!runtime) return false;
     if (options.requireTranscript && !hasSessionRuntimeTranscript(runtime)) return false;
-    set(getSessionRuntimeUiPatch(runtime, options));
+    set({
+      ...getSessionRuntimeUiPatch(runtime, options),
+      dismissedPendingDecisionInputKey: null,
+    });
     return true;
   },
   updateRuntimeForSession: (sessionKey, patchOrUpdater) => {
@@ -5053,6 +5082,18 @@ export const useAppStore = create<AppState>()(
     if (!text.trim() && !hasSupplementalInput && !images?.length) {
       return false;
     }
+    const normalizedPendingDecisionInputKey = normalizePendingDecisionInputKey(text);
+    const shouldSuppressSameInputDecision =
+      !isHidden &&
+      normalizedPendingDecisionInputKey.length > 0 &&
+      state.dismissedPendingDecisionInputKey === normalizedPendingDecisionInputKey;
+    let decisionSuppressionConsumed = false;
+    const consumeDecisionSuppression = () => {
+      if (!shouldSuppressSameInputDecision || decisionSuppressionConsumed) return false;
+      decisionSuppressionConsumed = true;
+      set({ dismissedPendingDecisionInputKey: null });
+      return true;
+    };
     logStoreEvent("send_start", {
       textChars: text.length,
       isHidden,
@@ -5090,6 +5131,25 @@ export const useAppStore = create<AppState>()(
         : resolveRunIntentFromLegacyWorkflowMode(state.config.workflowMode));
     let effectiveIntentSummary = normalizeIntentSummary(options?.intentSummary || "");
     let effectiveCommandDirective: CommandDirective | null = options?.commandDirective ?? null;
+    const applyDecisionSuppressedFallback = (
+      source: "reuse_resolution" | "resolution",
+      reason: string,
+    ) => {
+      effectiveRunIntent = "discuss";
+      effectiveIntentSummary = buildRunIntentSummary({
+        input: text,
+        intent: "discuss",
+        language: preferredLanguage,
+        reason,
+      });
+      effectiveCommandDirective = inferCommandDirective(text, "discuss", {
+        source: source === "reuse_resolution" ? "continuation" : "natural_language",
+      });
+      logStoreEvent("intent_decision_suppressed_for_same_input", {
+        source,
+        inputChars: text.trim().length,
+      });
+    };
     if (
       shouldExecuteOnceFromReplyOption &&
       effectiveRunIntent !== "execute" &&
@@ -5211,25 +5271,34 @@ export const useAppStore = create<AppState>()(
           (reuseResolution.riskLevel === "high" || reuseResolution.intent === "plan"));
 
       if (shouldRequestPlanDecision) {
-        const pendingCopy = createPendingDecisionCopy({
-          suggestedIntent: "plan",
-          decisionOptions: ["plan", "execute", "discuss"],
-          riskLevel: reuseResolution.riskLevel,
-          reason: reuseResolution.reason,
-        }, preferredLanguage);
-        set({
-          pendingRunDecision: {
-            kind: "intent_confirmation",
-            source: "pre_submit",
-            originalInput: text,
-            originalImages: images || [],
+        if (consumeDecisionSuppression()) {
+          applyDecisionSuppressedFallback(
+            "reuse_resolution",
+            preferredLanguage === "en"
+              ? "You ignored the same intent decision for this draft, so this turn continues in discuss mode without showing the popup again."
+              : "你刚刚忽略了同一草稿的意图确认，本轮先按讨论继续，不再重复弹窗。",
+          );
+        } else {
+          const pendingCopy = createPendingDecisionCopy({
             suggestedIntent: "plan",
-            reason: pendingCopy.reason,
-            title: pendingCopy.title,
-            options: pendingCopy.options,
-          },
-        });
-        return true;
+            decisionOptions: ["plan", "execute", "discuss"],
+            riskLevel: reuseResolution.riskLevel,
+            reason: reuseResolution.reason,
+          }, preferredLanguage);
+          set({
+            pendingRunDecision: {
+              kind: "intent_confirmation",
+              source: "pre_submit",
+              originalInput: text,
+              originalImages: images || [],
+              suggestedIntent: "plan",
+              reason: pendingCopy.reason,
+              title: pendingCopy.title,
+              options: pendingCopy.options,
+            },
+          });
+          return true;
+        }
       }
 
       if (
@@ -5356,20 +5425,29 @@ export const useAppStore = create<AppState>()(
       }
 
       if (resolution.needsDecision) {
-        const pendingCopy = createPendingDecisionCopy(resolution, preferredLanguage);
-        set({
-          pendingRunDecision: {
-            kind: "intent_confirmation",
-            source: "pre_submit",
-            originalInput: text,
-            originalImages: images || [],
-            suggestedIntent: resolution.suggestedIntent || "plan",
-            reason: pendingCopy.reason,
-            title: pendingCopy.title,
-            options: pendingCopy.options,
-          },
-        });
-        return true;
+        if (consumeDecisionSuppression()) {
+          applyDecisionSuppressedFallback(
+            "resolution",
+            preferredLanguage === "en"
+              ? "You ignored the same intent decision for this draft, so this turn continues in discuss mode without showing the popup again."
+              : "你刚刚忽略了同一草稿的意图确认，本轮先按讨论继续，不再重复弹窗。",
+          );
+        } else {
+          const pendingCopy = createPendingDecisionCopy(resolution, preferredLanguage);
+          set({
+            pendingRunDecision: {
+              kind: "intent_confirmation",
+              source: "pre_submit",
+              originalInput: text,
+              originalImages: images || [],
+              suggestedIntent: resolution.suggestedIntent || "plan",
+              reason: pendingCopy.reason,
+              title: pendingCopy.title,
+              options: pendingCopy.options,
+            },
+          });
+          return true;
+        }
       }
 
       // 普通消息不应该因为额外的意图 preflight 而阻塞发送热路径。
@@ -5805,12 +5883,8 @@ export const useAppStore = create<AppState>()(
     const activeSession = ensuredSessionId
       ? (refreshedState.sessionsByWorkspace[sessionScopeKey] || []).find((session) => session.id === ensuredSessionId)
       : null;
-    const shouldSeedSessionTitle = !!activeSession && (
-      !String(activeSession.title || "").trim() ||
-      activeSession.title === "New Conversation" ||
-      activeSession.title === "新会话" ||
-      (activeSession.messages?.length ?? 0) === 0
-    );
+    const shouldSeedSessionTitleForTurn = shouldSeedSessionTitle(activeSession);
+    const seededSessionTitleCandidate = shouldSeedSessionTitleForTurn ? turnTitle : "";
     const appendLocalStudioTurn = async (systemContent: string) => {
       const userBlock = isHidden
         ? null
@@ -5873,7 +5947,7 @@ export const useAppStore = create<AppState>()(
         elapsedTime: 0,
       }));
 
-      if (!isHidden && shouldSeedSessionTitle && ensuredSessionId) {
+      if (!isHidden && shouldSeedSessionTitleForTurn && ensuredSessionId) {
         sessionGet().updateSession(sessionScopeKey, ensuredSessionId, {
           title: turnTitle,
           active: true,
@@ -6104,7 +6178,7 @@ export const useAppStore = create<AppState>()(
       conversationTurns: sessionGet().conversationTurns.length,
     });
 
-    if (!isHidden && shouldSeedSessionTitle && ensuredSessionId) {
+    if (!isHidden && shouldSeedSessionTitleForTurn && ensuredSessionId) {
       sessionGet().updateSession(sessionScopeKey, ensuredSessionId, {
         title: turnTitle,
         active: true,
@@ -6114,15 +6188,17 @@ export const useAppStore = create<AppState>()(
       });
     }
 
-    // 对首轮会话或噪音较重的输入，额外让模型生成一份稳定的人话标题，
-    // 再同步回当前 turn 与 sidebar，避免用户名/时间戳/推理文本直接泄漏到 UI。
-    const shouldRequestSmartLocalTitle = sessionGet().config.activeProfile === "local";
-    if (
-      !isHidden &&
-      !reuseCurrentTurn &&
-      !options?.turnTitle &&
-      (shouldRequestSmartLocalTitle || shouldRequestSemanticTurnMetadata(text, shouldSeedSessionTitle))
-    ) {
+    // 每个新 turn 都异步请求一次轻量语义标题：
+    // 先用本地标题占位，不阻塞发送；模型结果回来后再覆盖 turn/sidebar 标题。
+    if (shouldRequestSemanticTurnMetadataForTurn({
+      input: text,
+      hidden: isHidden,
+      reuseCurrentTurn,
+      turnTitle: options?.turnTitle,
+      mainModeKey: currentMainModeKey,
+    })) {
+      const expectedTurnPrompt = text.trim();
+      const expectedSessionId = ensuredSessionId ?? null;
       void requestSemanticTurnMetadata({
         input: text,
         intent: effectiveRunIntent,
@@ -6133,7 +6209,17 @@ export const useAppStore = create<AppState>()(
 
         const latestState = sessionGet();
         const targetTurn = latestState.conversationTurns.find((turn) => turn.id === turnId);
-        if (!targetTurn) return;
+        const latestSession = expectedSessionId != null
+          ? (latestState.sessionsByWorkspace[sessionScopeKey] || [])
+            .find((session) => session.id === expectedSessionId) || null
+          : null;
+        if (!isSemanticTurnMetadataCallbackCurrent({
+          expectedTurnId: turnId,
+          expectedUserPrompt: expectedTurnPrompt,
+          expectedSessionId,
+          turn: targetTurn,
+          session: latestSession,
+        })) return;
         if (
           looksLikeReasoningLeakTitle(metadata.title) ||
           looksLikeReasoningLeakTitle(metadata.summary) ||
@@ -6145,8 +6231,11 @@ export const useAppStore = create<AppState>()(
           intentSummary: metadata.summary,
         });
 
-        if (shouldSeedSessionTitle && ensuredSessionId) {
-          latestState.updateSession(sessionScopeKey, ensuredSessionId, {
+        if (shouldSeedSessionTitleForTurn && expectedSessionId != null) {
+          if (!canUpdateSeedSessionTitle({ session: latestSession, seededTitle: seededSessionTitleCandidate })) {
+            return;
+          }
+          latestState.updateSession(sessionScopeKey, expectedSessionId, {
             title: metadata.title,
             active: true,
           });
@@ -7931,6 +8020,13 @@ export const useAppStore = create<AppState>()(
           sessionGet().setConversationTurnSummary(turnId, summarized);
         },
 
+        onExecutionDigestUpdate: (summary) => {
+          if (!summary.trim()) return;
+          const summarized = summarizeAssistantText(summary);
+          if (looksLikeReasoningLeakTitle(summarized)) return;
+          sessionGet().setConversationTurnSummary(turnId, summarized);
+        },
+
         appendMessage: (msg) => {
           logStoreEvent("append_agent_message", {
             turnId,
@@ -8013,6 +8109,7 @@ export const useAppStore = create<AppState>()(
               tokenCountAfter: after,
               tokenReduction: saved,
               compressedContext: trimPersistedContextCompression(stats.compressedContext),
+              displaySummary: trimPersistedContextCompression(stats.displaySummary),
               memoryPacket: trimPersistedContextCompression(stats.memoryPacket),
               microCompactionKind: stats.microCompactionKind || "none",
               microCompactedCount,
@@ -8568,11 +8665,15 @@ async function requestSemanticTurnMetadata(params: {
     const model = ac.model;
     const provider = isCloud ? params.config.cloud.provider : params.config.local.provider;
     const cloudProtocol = normalizeCloudProtocol(isCloud ? params.config.cloud.protocol : "openai");
-    const cloudApiFormat = normalizeCloudApiFormat(isCloud ? params.config.cloud.apiFormat : "chat_completions");
     const cloudExperimentalLoginEnabled = isCloud && params.config.cloudExperimentalLoginEnabled === true;
     const cloudAuthMode = isCloud && cloudExperimentalLoginEnabled
       ? params.config.cloud.auth?.mode ?? "api_key"
       : "api_key";
+    const cloudApiFormat = resolveEffectiveCloudApiFormat({
+      protocol: isCloud ? params.config.cloud.protocol : "openai",
+      apiFormat: isCloud ? params.config.cloud.apiFormat : "chat_completions",
+      authMode: cloudAuthMode,
+    });
     const cloudTokenRef = cloudExperimentalLoginEnabled ? params.config.cloud.auth?.tokenRef : undefined;
     if (!model || (!endpoint && cloudAuthMode !== "gemini_google_oauth")) return null;
 

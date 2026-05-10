@@ -12,7 +12,7 @@ import {
   extractOpenAiResponseText,
   parseOpenAiResponsesSseText,
   normalizeCloudAuthMode,
-  normalizeCloudApiFormat,
+  resolveEffectiveCloudApiFormat,
   normalizeCloudProtocol,
   type ProtocolChatMessage,
 } from "./cloudProtocol";
@@ -249,7 +249,11 @@ async function requestModelCommitMessage(params: GenerateGitCommitMessageParams)
   ];
 
   const cloudProtocol = normalizeCloudProtocol(isCloud ? params.config.cloud?.protocol : "openai");
-  const cloudApiFormat = normalizeCloudApiFormat(isCloud ? params.config.cloud?.apiFormat : "chat_completions");
+  const cloudApiFormat = resolveEffectiveCloudApiFormat({
+    protocol: isCloud ? params.config.cloud?.protocol : "openai",
+    apiFormat: isCloud ? params.config.cloud?.apiFormat : "chat_completions",
+    authMode: cloudAuthMode,
+  });
   const isAnthropicCloud = isCloud && cloudProtocol === "anthropic";
   const isGeminiCloud = isCloud && cloudProtocol === "gemini";
   const cloudTokenRef = cloudExperimentalLoginEnabled ? params.config.cloud?.auth?.tokenRef : undefined;

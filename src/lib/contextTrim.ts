@@ -15,6 +15,7 @@ import {
   isContextMemoryMessage,
   type ContextMemoryState,
 } from "./contextMemory";
+import { looksLikeSyntheticContinuationText } from "./syntheticContinuation";
 
 export interface TrimMessage {
   role: "system" | "user" | "assistant" | "tool";
@@ -402,7 +403,8 @@ function isSystemContinuationNoise(text: string): boolean {
   return trimmed.startsWith("[System:") ||
     /^PLAN_[A-Z_]+:/i.test(trimmed) ||
     /^RecoveryDetails:/i.test(trimmed) ||
-    /^Repeated read-only tool call skipped:/i.test(trimmed);
+    /^Repeated read-only tool call skipped:/i.test(trimmed) ||
+    looksLikeSyntheticContinuationText(trimmed);
 }
 
 function extractConstraintCandidates(text: string): string[] {
@@ -413,7 +415,7 @@ function extractConstraintCandidates(text: string): string[] {
 
 function extractDecisionCandidates(text: string): string[] {
   return splitUsefulSentences(text).filter((sentence) =>
-    /(?:批准|确认|选择|决定|方案|执行|approved|confirmed|selected|decided|plan approved|execute)/i.test(sentence)
+    /(?:批准|确认|选择|决定|已批准|已确认|approved|confirmed|selected|decided|plan approved)/i.test(sentence)
   );
 }
 
@@ -492,6 +494,7 @@ function extractCarriedStateLines(carriedSummaries: string[], maxItems: number, 
       const trimmed = line.replace(/^\s*[-*]\s*/, "").trim();
       if (!trimmed) continue;
       if (/^(Dropped|Token pressure|已压缩|单条长内容压缩|另有)/i.test(trimmed)) continue;
+      if (looksLikeSyntheticContinuationText(trimmed)) continue;
       pushUnique(lines, trimmed, maxItems, maxChars);
     }
   }
@@ -532,14 +535,10 @@ function buildCompactSummary(
       taskSnapshot.next.forEach((task) => pushUnique(tasks, task, Math.min(4, options.maxItems), options.maxCharsPerItem));
     }
 
-    if (message.role === "user" && !isSystemContinuationNoise(text)) {
+    if (message.role === "user" && !isSystemContinuationNoise(text) && !looksLikeSyntheticContinuationText(text)) {
       pushUnique(goals, text, Math.min(3, options.maxItems), options.maxCharsPerItem);
       extractConstraintCandidates(text).forEach((item) => pushUnique(constraints, item, Math.min(5, options.maxItems), options.maxCharsPerItem));
       extractDecisionCandidates(text).forEach((item) => pushUnique(decisions, item, Math.min(4, options.maxItems), options.maxCharsPerItem));
-    } else if (message.role === "assistant") {
-      if (message.tool_calls && message.tool_calls.length > 0 && !stripReasoningAndMarkup(text)) continue;
-      extractDecisionCandidates(text).forEach((item) => pushUnique(decisions, item, Math.min(4, options.maxItems), options.maxCharsPerItem));
-      extractConstraintCandidates(text).forEach((item) => pushUnique(constraints, item, Math.min(5, options.maxItems), options.maxCharsPerItem));
     } else if (message.role === "tool") {
       pushUnique(evidence, summarizeToolResult(message, lookup), Math.min(8, options.maxItems + 2), options.maxCharsPerItem);
       if (/error|failed|rejected|Detected a repetition loop/i.test(text)) {
@@ -871,6 +870,7 @@ export interface ManageContextResult {
   retainedTokenBreakdown: ContextTokenBreakdown;
   budgets: ContextBudgets;
   compressedContext?: string;
+  displaySummary?: string;
   memoryState: ContextMemoryState;
   memoryPacket: string;
   microCompactionKind: "none" | "tool_results" | "assistant_messages" | "mixed";
@@ -926,6 +926,7 @@ export function manageContext(
       retainedTokenBreakdown: tokenBreakdownBefore,
       budgets,
       compressedContext: memoryPacket,
+      displaySummary: undefined,
       memoryState,
       memoryPacket,
       microCompactionKind: "none",
@@ -975,6 +976,7 @@ export function manageContext(
   const actualDropped = trimResult.removedCount;
   const tokenCountAfter = estimateMessagesTokens(trimmed);
   const tokenBreakdownAfter = computeContextTokenBreakdown(trimmed);
+  const displaySummary = joinCompressionSummaries(microSummaries, trimResult.displaySummary, tokenBreakdownBefore);
 
   return {
     messages: trimmed,
@@ -988,10 +990,8 @@ export function manageContext(
     tokenBreakdownAfter,
     retainedTokenBreakdown: tokenBreakdownAfter,
     budgets,
-    compressedContext: [
-      memoryPacket,
-      joinCompressionSummaries(microSummaries, trimResult.displaySummary, tokenBreakdownBefore),
-    ].filter(Boolean).join("\n\n"),
+    compressedContext: displaySummary || memoryPacket,
+    displaySummary,
     memoryState,
     memoryPacket,
     microCompactionKind,

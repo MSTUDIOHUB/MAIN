@@ -73,6 +73,10 @@ export interface McpRoutingTelemetry {
 
 export type McpRoutingPriorityMode = "none" | "unity_mcp_first";
 
+export interface UnityMcpRoutingContext {
+  preferStructuredScriptEdits?: boolean;
+}
+
 type SkillLike = {
   name: string;
   desc?: string;
@@ -205,6 +209,26 @@ const GITHUB_TERMS = ["github", "git hub", "issue", "pull request", " pr ", "rep
 const DATABASE_TERMS = ["sql", "sqlite", "postgres", "postgresql", "mysql", "database", "db", "table"];
 const UNITY_TERMS = ["unity", "gameobject", "prefab", "scene", "asset", "editor"];
 const UNITY_CONSOLE_TERMS = ["console", "error", "warning", "compile", "报错", "错误", "警告", "编译"];
+const UNITY_SCRIPT_EDIT_TERMS = [
+  "fix",
+  "repair",
+  "patch",
+  "edit",
+  "modify",
+  "refactor",
+  "script",
+  "code",
+  "c#",
+  "cs",
+  "修复",
+  "补丁",
+  "修改",
+  "脚本",
+  "代码",
+  "编译",
+  "报错",
+  "错误",
+];
 
 export function createDefaultToolPermissionPolicy(): ToolPermissionPolicy {
   return {
@@ -646,6 +670,84 @@ function scoreMcpToolForPrompt(tool: MCPTool, server: MCPServer | undefined, use
   return score;
 }
 
+function scoreUnityStructuredEditPreference(
+  tool: MCPTool,
+  userPrompt: string,
+  context?: UnityMcpRoutingContext,
+): number {
+  if (!context?.preferStructuredScriptEdits) return 0;
+  const prompt = normalizeText(userPrompt);
+  if (!containsAny(prompt, UNITY_SCRIPT_EDIT_TERMS)) return 0;
+  if (tool.name === "script_apply_edits") return 48;
+  if (tool.name === "apply_text_edits") return -48;
+  return 0;
+}
+
+function compareUnityPriorityToolNames(
+  left: MCPTool,
+  right: MCPTool,
+  context?: UnityMcpRoutingContext,
+): number {
+  if (!context?.preferStructuredScriptEdits) {
+    return left.name.localeCompare(right.name);
+  }
+  const rank = (name: string): number => {
+    if (name === "read_console") return 200;
+    if (name === "set_active_instance") return 180;
+    if (name === "script_apply_edits") return 160;
+    if (name === "apply_text_edits") return 10;
+    return 100;
+  };
+  const rankDelta = rank(right.name) - rank(left.name);
+  if (rankDelta !== 0) return rankDelta;
+  return left.name.localeCompare(right.name);
+}
+
+function toPositiveInteger(value: unknown): number | null {
+  if (typeof value === "number" && Number.isInteger(value) && value > 0) return value;
+  if (typeof value === "string" && /^\d+$/.test(value.trim())) {
+    const parsed = Number(value);
+    if (Number.isInteger(parsed) && parsed > 0) return parsed;
+  }
+  return null;
+}
+
+function hasValidApplyTextPreconditionSha(args: Record<string, unknown>): boolean {
+  const candidates = [
+    args.precondition_sha256,
+    args.precondition_sha,
+    args.preconditionSha256,
+    args.preconditionSha,
+  ];
+  return candidates.some((value) =>
+    typeof value === "string" && /^[a-f0-9]{40,128}$/i.test(value.trim()),
+  );
+}
+
+export function isUnityApplyTextPrecisePatchArgs(args: Record<string, unknown>): boolean {
+  const uri = typeof args.uri === "string" ? args.uri.trim() : "";
+  if (!uri) return false;
+  if (!hasValidApplyTextPreconditionSha(args)) return false;
+  const edits = args.edits;
+  if (!Array.isArray(edits) || edits.length === 0) return false;
+
+  return edits.every((edit) => {
+    if (!edit || typeof edit !== "object") return false;
+    const record = edit as Record<string, unknown>;
+    const startLine = toPositiveInteger(record.startLine);
+    const startCol = toPositiveInteger(record.startCol);
+    const endLine = toPositiveInteger(record.endLine);
+    const endCol = toPositiveInteger(record.endCol);
+    if (startLine == null || startCol == null || endLine == null || endCol == null) {
+      return false;
+    }
+    if (endLine < startLine) return false;
+    if (endLine === startLine && endCol < startCol) return false;
+    if (!Object.prototype.hasOwnProperty.call(record, "newText")) return false;
+    return true;
+  });
+}
+
 export function routeMcpToolsForPrompt(params: {
   tools: MCPTool[];
   servers: MCPServer[];
@@ -655,6 +757,7 @@ export function routeMcpToolsForPrompt(params: {
   priorityMode?: McpRoutingPriorityMode;
   preferredServerUrls?: string[];
   forceFirstTools?: string[];
+  unityRoutingContext?: UnityMcpRoutingContext;
 }): { tools: MCPTool[]; telemetry: McpRoutingTelemetry } {
   const startedAt = Date.now();
   const config = normalizeMcpRoutingConfig(params.config);
@@ -709,9 +812,14 @@ export function routeMcpToolsForPrompt(params: {
     const scoredTools = candidateTools
       .map((tool) => {
         const server = serverByUrl[params.toolServerMap[tool.name]];
-        return { tool, score: scoreMcpToolForPrompt(tool, server, params.userPrompt) };
+        return {
+          tool,
+          score:
+            scoreMcpToolForPrompt(tool, server, params.userPrompt) +
+            scoreUnityStructuredEditPreference(tool, params.userPrompt, params.unityRoutingContext),
+        };
       })
-      .sort((a, b) => b.score - a.score || a.tool.name.localeCompare(b.tool.name))
+      .sort((a, b) => b.score - a.score || compareUnityPriorityToolNames(a.tool, b.tool, params.unityRoutingContext))
       .map((entry) => entry.tool);
 
     const forcedOrder = (params.forceFirstTools ?? [])

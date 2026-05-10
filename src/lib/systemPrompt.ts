@@ -189,6 +189,7 @@ export function buildSystemPrompt(
         ? `connectedUnityMcpServers: ${mcpPriorityContext.connectedServerNames.join(", ")}`
         : "",
       "For Unity requests in this turn, prioritize Unity MCP tools before local workspace scan tools.",
+      "For Unity C# edits, prefer script_apply_edits. Use apply_text_edits only for precise coordinate patches with precondition SHA.",
       "Do not start with get_project_skeleton or local log file scanning when Unity MCP is available.",
       mcpPriorityContext.unityConsoleFirst
         ? "This request is a Unity console diagnostics task: call read_console first (set_active_instance when required) before any other investigation path."

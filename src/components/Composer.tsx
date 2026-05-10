@@ -24,6 +24,7 @@ import {
   mergeAttachedFiles,
   normalizeAttachedFile,
 } from "../lib/attachments";
+import { safeConfirm } from "../lib/safeConfirm";
 
 // ── ContextRing SVG Component ──────────────────────────────────────────
 
@@ -1041,10 +1042,11 @@ export default function Composer({
   };
 
   const handleRemoveGameStudioWorkspace = async () => {
-    const confirmed = window.confirm(
+    const confirmed = safeConfirm(
       language === "en"
         ? "Remove MAIN GAME STUDIO from this workspace? This will delete the Game Studio hidden folders and merged hooks for the current project."
         : "要从当前工作区移除 MAIN GAME STUDIO 吗？这会删除该项目中的 Game Studio 隐藏文件夹和已合并的 hooks。",
+      { source: "Composer", action: "remove_game_studio_workspace" },
     );
 
     if (!confirmed) return;

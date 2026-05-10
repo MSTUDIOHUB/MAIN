@@ -1,4 +1,4 @@
-import { normalizeCloudApiFormat, normalizeCloudProtocol, normalizeLocalToolProtocol } from "./cloudProtocol";
+import { normalizeCloudProtocol, normalizeLocalToolProtocol, resolveEffectiveCloudApiFormat } from "./cloudProtocol";
 import { streamChatCompletion, type StreamSettings } from "./streaming";
 import {
   inferCommandDirective,
@@ -41,14 +41,18 @@ function deriveStreamSettings(config: PreflightConfig): StreamSettings {
       useRustProxy: !isOllama,
     };
   }
-
+  const cloudAuthMode = config.cloudExperimentalLoginEnabled === true ? config.cloud.auth?.mode ?? "api_key" : "api_key";
   return {
     baseUrl: config.cloud.endpoint || "https://api.openai.com/v1",
     apiKey: config.cloud.apiKey,
     model: config.cloud.model,
     apiProtocol: normalizeCloudProtocol(config.cloud.protocol || "openai"),
-    apiFormat: normalizeCloudApiFormat(config.cloud.apiFormat || "chat_completions"),
-    authMode: config.cloudExperimentalLoginEnabled === true ? config.cloud.auth?.mode ?? "api_key" : "api_key",
+    apiFormat: resolveEffectiveCloudApiFormat({
+      protocol: config.cloud.protocol || "openai",
+      apiFormat: config.cloud.apiFormat || "chat_completions",
+      authMode: cloudAuthMode,
+    }),
+    authMode: cloudAuthMode,
     tokenRef: config.cloudExperimentalLoginEnabled === true ? config.cloud.auth?.tokenRef : undefined,
     customHeaders: config.cloud.customHeaders || "",
     disableResponseStorage: config.cloud.disableResponseStorage ?? true,

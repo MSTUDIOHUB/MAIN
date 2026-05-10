@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import fs from "node:fs/promises";
+import fsSync from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
 
@@ -8,38 +8,49 @@ import ts from "typescript";
 
 const require = createRequire(import.meta.url);
 const workspaceRoot = process.cwd();
+const transpiledModuleCache = new Map();
 
-async function loadContextTrimModule() {
-  const contextMemoryPath = path.join(workspaceRoot, "src/lib/contextMemory.ts");
-  const contextMemorySource = await fs.readFile(contextMemoryPath, "utf8");
-  const contextMemoryTranspiled = ts.transpileModule(contextMemorySource, {
-    compilerOptions: {
-      module: ts.ModuleKind.CommonJS,
-      target: ts.ScriptTarget.ES2020,
-    },
-    fileName: contextMemoryPath,
-  }).outputText;
-  const contextMemoryModule = { exports: {} };
-  const contextMemoryFactory = new Function("exports", "module", "require", contextMemoryTranspiled);
-  contextMemoryFactory(contextMemoryModule.exports, contextMemoryModule, require);
+function loadTranspiledModuleSync(sourcePath) {
+  const normalizedPath = path.resolve(sourcePath);
+  if (transpiledModuleCache.has(normalizedPath)) {
+    return transpiledModuleCache.get(normalizedPath);
+  }
 
-  const sourcePath = path.join(workspaceRoot, "src/lib/contextTrim.ts");
-  const source = await fs.readFile(sourcePath, "utf8");
+  const source = fsSync.readFileSync(normalizedPath, "utf8");
+  const localRequire = createRequire(normalizedPath);
   const transpiled = ts.transpileModule(source, {
     compilerOptions: {
       module: ts.ModuleKind.CommonJS,
       target: ts.ScriptTarget.ES2020,
     },
-    fileName: sourcePath,
+    fileName: normalizedPath,
   }).outputText;
 
   const module = { exports: {} };
-  const localRequire = (id) => {
-    if (id === "./contextMemory") return contextMemoryModule.exports;
-    return require(id);
+  transpiledModuleCache.set(normalizedPath, module.exports);
+
+  const runtimeRequire = (specifier) => {
+    if (specifier.startsWith(".")) {
+      const basePath = path.resolve(path.dirname(normalizedPath), specifier);
+      const candidates = [
+        basePath,
+        `${basePath}.ts`,
+        `${basePath}.tsx`,
+        path.join(basePath, "index.ts"),
+      ];
+      for (const candidate of candidates) {
+        if (!fsSync.existsSync(candidate)) continue;
+        if (candidate.endsWith(".ts") || candidate.endsWith(".tsx")) {
+          return loadTranspiledModuleSync(candidate);
+        }
+      }
+    }
+    return localRequire(specifier);
   };
+
   const factory = new Function("exports", "module", "require", transpiled);
-  factory(module.exports, module, localRequire);
+  factory(module.exports, module, runtimeRequire);
+  transpiledModuleCache.set(normalizedPath, module.exports);
   return module.exports;
 }
 
@@ -47,7 +58,7 @@ const {
   computeContextBudgets,
   computeContextTokenBreakdown,
   manageContext,
-} = await loadContextTrimModule();
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/contextTrim.ts"));
 
 test("computeContextBudgets reserves a smaller, capped output budget for long contexts", () => {
   const budgets16k = computeContextBudgets(16384);

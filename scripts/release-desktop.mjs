@@ -6,6 +6,7 @@ import { parseAppVersion } from "./release_tools.mjs";
 
 const PRIVATE_REPO = "MSTUDIOHUB/MAIN";
 const RELEASE_REPO = "MSTUDIOHUB/MAIN-Releases";
+const UPDATE_REPO = "MSTUDIOHUB/MAIN-UpdateFeed";
 const WORKFLOW_FILE = "build-desktop.yml";
 const WORKFLOW_REF = "main";
 const REQUIRED_SECRET_NAMES = [
@@ -35,7 +36,8 @@ Options:
 
 Notes:
   - The version is required and must not start with "v".
-  - Default behavior publishes directly to ${RELEASE_REPO}.
+  - Default behavior publishes downloads to ${RELEASE_REPO}.
+  - Updater feed assets publish to ${UPDATE_REPO}.
   - The workflow requires PUBLIC_RELEASES_TOKEN and Tauri updater signing secrets in ${PRIVATE_REPO}.
 `);
 }
@@ -163,6 +165,8 @@ function workflowArgs(options) {
     "-f",
     `release_repo=${RELEASE_REPO}`,
     "-f",
+    `update_repo=${UPDATE_REPO}`,
+    "-f",
     `draft=${String(options.draft)}`,
     "-f",
     `prerelease=${String(options.prerelease)}`,
@@ -172,8 +176,10 @@ function workflowArgs(options) {
 function printReleaseLinks(version) {
   console.log("");
   console.log("Release URLs:");
-  console.log(`- Release: https://github.com/${RELEASE_REPO}/releases/tag/v${version}`);
-  console.log(`- Latest:  https://github.com/${RELEASE_REPO}/releases/latest`);
+  console.log(`- Downloads release: https://github.com/${RELEASE_REPO}/releases/tag/v${version}`);
+  console.log(`- Downloads latest:  https://github.com/${RELEASE_REPO}/releases/latest`);
+  console.log(`- Updater release:   https://github.com/${UPDATE_REPO}/releases/tag/v${version}`);
+  console.log(`- Updater manifest:  https://github.com/${UPDATE_REPO}/releases/latest/download/latest.json`);
 }
 
 function ensureGhReady() {
@@ -183,7 +189,8 @@ function ensureGhReady() {
 
 function ensureRepoAccess() {
   requireSuccess("gh", ["repo", "view", PRIVATE_REPO, "--json", "nameWithOwner"], `Cannot access private repo: ${PRIVATE_REPO}`);
-  requireSuccess("gh", ["repo", "view", RELEASE_REPO, "--json", "nameWithOwner"], `Cannot access public release repo: ${RELEASE_REPO}`);
+  requireSuccess("gh", ["repo", "view", RELEASE_REPO, "--json", "nameWithOwner"], `Cannot access public downloads repo: ${RELEASE_REPO}`);
+  requireSuccess("gh", ["repo", "view", UPDATE_REPO, "--json", "nameWithOwner"], `Cannot access public updater repo: ${UPDATE_REPO}`);
 }
 
 function ensureSecretExists() {
@@ -240,17 +247,17 @@ function ensureHeadIsOriginMain() {
   return head;
 }
 
-function ensureReleaseDoesNotExist(version) {
+function ensureReleaseDoesNotExist(version, repo, label) {
   const tag = `v${version}`;
-  const result = run("gh", ["release", "view", tag, "--repo", RELEASE_REPO, "--json", "tagName,url"]);
+  const result = run("gh", ["release", "view", tag, "--repo", repo, "--json", "tagName,url"]);
 
   if (result.status === 0) {
-    fail(`Release ${tag} already exists in ${RELEASE_REPO}. Pick a new version.`);
+    fail(`Release ${tag} already exists in ${label} (${repo}). Pick a new version.`);
   }
 
   const output = `${result.stderr}\n${result.stdout}`.toLowerCase();
   if (!output.includes("not found") && !output.includes("release not found") && !output.includes("http 404")) {
-    fail(`Could not check whether release ${tag} exists.`, result.stderr || result.stdout);
+    fail(`Could not check whether release ${tag} exists in ${label} (${repo}).`, result.stderr || result.stdout);
   }
 }
 
@@ -259,7 +266,8 @@ function preflight(options) {
   ensureGhReady();
   ensureRepoAccess();
   ensureSecretExists();
-  ensureReleaseDoesNotExist(options.version);
+  ensureReleaseDoesNotExist(options.version, RELEASE_REPO, "downloads repo");
+  ensureReleaseDoesNotExist(options.version, UPDATE_REPO, "updater repo");
   ensureCleanWorktree();
   const headSha = ensureHeadIsOriginMain();
   console.log("Preflight checks passed.");

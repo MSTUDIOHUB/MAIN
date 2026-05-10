@@ -23,9 +23,9 @@ import {
   extractGeminiResponseText,
   extractOpenAiResponseText,
   finalizeStreamedToolCalls,
-  normalizeCloudApiFormat,
   normalizeCloudProtocol,
   normalizeCloudToolProtocol,
+  resolveEffectiveCloudApiFormat,
   parseOpenAiResponsesSseText,
   type CloudApiProtocol,
   type CloudAuthMode,
@@ -334,7 +334,11 @@ function isGeminiProvider(settings: StreamSettings): boolean {
 }
 
 function isOpenAiResponsesApi(settings: StreamSettings): boolean {
-  return !isAnthropicProvider(settings) && !isGeminiProvider(settings) && normalizeCloudApiFormat(settings.apiFormat) === "responses";
+  return !isAnthropicProvider(settings) && !isGeminiProvider(settings) && resolveEffectiveCloudApiFormat({
+    protocol: settings.apiProtocol,
+    apiFormat: settings.apiFormat,
+    authMode: settings.authMode,
+  }) === "responses";
 }
 
 function shouldSendNativeTools(settings: StreamSettings): boolean {
@@ -557,7 +561,11 @@ async function requestOpenAiNonStreaming(
   try {
     const maxTokens = maxTokensOverride ?? computeInitialMaxTokens(settings.contextLimit);
     const isGemini = isGeminiProvider(settings);
-    const apiFormat = normalizeCloudApiFormat(settings.apiFormat);
+    const apiFormat = resolveEffectiveCloudApiFormat({
+      protocol: settings.apiProtocol,
+      apiFormat: settings.apiFormat,
+      authMode: settings.authMode,
+    });
     const geminiRequest = isGemini ? buildGeminiRuntimeRequest(settings, messages, maxTokens) : null;
     const apiUrl = geminiRequest?.url ?? buildApiUrl(settings);
     const headers = isGemini
@@ -593,6 +601,8 @@ async function requestOpenAiNonStreaming(
       let lastCompatibilityError: Error | null = null;
       let sawRetryableGatewayError = false;
       let gatewayRetryUsed = false;
+      let sawEmptyResponseCandidate = false;
+      let lastEmptyResponseMode: string | null = null;
 
       for (const candidate of requestCandidates) {
         if (signal?.aborted) throw createAbortError();
@@ -613,7 +623,7 @@ async function requestOpenAiNonStreaming(
             reasoningEffort: settings.reasoningEffort ?? "none",
             nativeTools: candidateTools.length,
           }));
-          payload = await postJsonRequest(
+          const candidatePayload = await postJsonRequest(
             apiUrl,
             headers,
             settings.authMode === "openai_chatgpt_oauth"
@@ -622,6 +632,16 @@ async function requestOpenAiNonStreaming(
             settings,
             signal,
           );
+          const candidateContent = extractOpenAiResponseText(candidatePayload, "responses");
+          const candidateToolCalls = extractOpenAiResponsesToolCalls(candidatePayload);
+          if (!candidateContent && candidateToolCalls.length === 0) {
+            sawEmptyResponseCandidate = true;
+            lastEmptyResponseMode = candidate.mode;
+            console.warn(`[streaming] OpenAI responses empty output for ${candidate.mode}; trying next compatibility candidate`);
+            lastCompatibilityError = new Error(`responses_empty_candidate:${candidate.mode}`);
+            continue;
+          }
+          payload = candidatePayload;
           if (candidate.mode !== "message_text") {
             console.log(`[streaming] OpenAI responses fallback succeeded with ${candidate.mode}`);
           }
@@ -650,6 +670,12 @@ async function requestOpenAiNonStreaming(
       }
 
       if (payload == null) {
+        if (sawEmptyResponseCandidate) {
+          const emptyModeSuffix = lastEmptyResponseMode ? ` mode=${lastEmptyResponseMode}` : "";
+          throw new Error(
+            `${PROVIDER_COMPATIBILITY_TAG} unsupported responses empty_body responses_empty_after_fallbacks${emptyModeSuffix}`,
+          );
+        }
         throw lastCompatibilityError ?? new Error("Responses request failed without a compatibility fallback result.");
       }
     } else {
@@ -719,7 +745,11 @@ function buildApiUrl(settings: StreamSettings): string {
   return buildCloudMessagesApiUrl(
     base,
     isAnthropicProvider(settings) ? "anthropic" : isGeminiProvider(settings) ? "gemini" : "openai",
-    normalizeCloudApiFormat(settings.apiFormat),
+    resolveEffectiveCloudApiFormat({
+      protocol: settings.apiProtocol,
+      apiFormat: settings.apiFormat,
+      authMode: settings.authMode,
+    }),
   );
 }
 

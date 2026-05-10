@@ -12,14 +12,19 @@ test.beforeEach(async ({ page }) => {
 test("completed read tools collapse into one expandable context group", async ({ page }) => {
   await page.goto("/?e2eScenario=read-context-collapse");
 
-  const group = page.getByTestId("read-context-group");
-  await expect(group).toBeVisible();
-  await expect(group).toContainText("已读取 10 项上下文");
-  await expect(group).toContainText("+7");
+  const groups = page.getByTestId("read-context-group");
+  await expect(groups).toHaveCount(2);
+  const firstGroup = groups.nth(0);
+  const secondGroup = groups.nth(1);
+
+  await expect(firstGroup).toBeVisible();
+  await expect(firstGroup).toContainText("已读取 10 项上下文");
+  await expect(firstGroup).toContainText("+7");
+  await expect(secondGroup).toContainText("已读取 1 项上下文");
   await expect(page.getByTestId("read-context-group-details")).toHaveCount(0);
   await expect(page.getByText("BattleActionQueue.cs")).not.toBeVisible();
 
-  await group.click();
+  await firstGroup.click();
 
   const details = page.getByTestId("read-context-group-details");
   await expect(details).toBeVisible();
@@ -27,7 +32,7 @@ test("completed read tools collapse into one expandable context group", async ({
   await expect(details).toContainText("BattleActionQueue.cs");
   await expect(details).not.toContainText("MissingConfig.cs");
 
-  await group.click();
+  await firstGroup.click();
   await expect(page.getByTestId("read-context-group-details")).toHaveCount(0);
 
   await expect(page.getByText("MissingConfig.cs")).toBeVisible();

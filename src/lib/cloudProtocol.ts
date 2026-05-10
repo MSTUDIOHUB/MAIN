@@ -342,6 +342,19 @@ export function normalizeCloudAuthMode(value: unknown): CloudAuthMode {
   return "api_key";
 }
 
+export function resolveEffectiveCloudApiFormat(options: {
+  protocol?: unknown;
+  apiFormat?: unknown;
+  authMode?: unknown;
+}): OpenAiApiFormat {
+  const protocol = normalizeCloudProtocol(options.protocol);
+  const authMode = normalizeCloudAuthMode(options.authMode);
+  if (protocol === "openai" && authMode === "openai_chatgpt_oauth") {
+    return "responses";
+  }
+  return normalizeCloudApiFormat(options.apiFormat);
+}
+
 export function getModelInstructionProfile(input: {
   protocol?: unknown;
   provider?: unknown;

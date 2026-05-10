@@ -11,6 +11,8 @@ const PLAN_REPLACE_REFRESH_SCENARIO = "plan-replace-refresh";
 const AWAITING_CHOICE_SCENARIO = "awaiting-choice";
 const FEISHU_REMOTE_ANALYSIS_SCENARIO = "feishu-remote-analysis";
 const READ_CONTEXT_COLLAPSE_SCENARIO = "read-context-collapse";
+const READ_CONTEXT_INTERLEAVED_SCENARIO = "read-context-interleaved";
+const READ_CONTEXT_AGENT_SEGMENT_SCENARIO = "read-context-agent-segment";
 const THINKING_POLICY_SCENARIO = "thinking-policy";
 const GAME_STUDIO_ONBOARDING_SCENARIO = "game-studio-onboarding";
 const COMPOSER_MAIN_SHORTCUTS_SCENARIO = "composer-main-shortcuts";
@@ -896,6 +898,8 @@ function seedReadContextCollapseScenario() {
     },
   };
   const agentBlockId = useAppStore.getState()._nextTaskId();
+  const singleReadBlockId = useAppStore.getState()._nextTaskId();
+  const agentAfterSingleReadBlockId = useAppStore.getState()._nextTaskId();
   const taskFlow = [
     { id: userBlockId, turnId, type: "user" as const, content: "请读取战斗系统上下文并继续分析。" },
     ...readBlocks,
@@ -906,6 +910,23 @@ function seedReadContextCollapseScenario() {
       turnId,
       type: "agent" as const,
       content: "已读取核心战斗上下文，失败项和写入项需要保持单独展示。",
+      streaming: false,
+    },
+    {
+      id: singleReadBlockId,
+      turnId,
+      type: "tool" as const,
+      toolName: "read_file",
+      target: "README.md",
+      status: "done",
+      toolStatus: "executed" as const,
+      message: "OK",
+    },
+    {
+      id: agentAfterSingleReadBlockId,
+      turnId,
+      type: "agent" as const,
+      content: "补充读取了 README 作为单项上下文，用于校验单项也能折叠。",
       streaming: false,
     },
   ];
@@ -955,6 +976,247 @@ function seedReadContextCollapseScenario() {
 
   bindBridgeSnapshot(READ_CONTEXT_COLLAPSE_SCENARIO);
   appendBridgeEvent("seeded", { seedCount: readSeedCount(READ_CONTEXT_COLLAPSE_SCENARIO) });
+
+  const cleanup = () => {
+    bridge.initialized = false;
+  };
+
+  bridge.cleanup = cleanup;
+  return cleanup;
+}
+
+function seedReadContextInterleavedScenario() {
+  const bridge = getBridge();
+  if (!bridge) return undefined;
+
+  bridge.events = [{ type: "boot" }];
+  bridge.savedDocuments = [];
+  bridge.completed = true;
+
+  const turnId = "e2e-read-context-interleaved-turn";
+  const sessionId = 999026;
+  const now = Date.now();
+  const userBlockId = useAppStore.getState()._nextTaskId();
+  const taskFlow = [
+    { id: userBlockId, turnId, type: "user" as const, content: "读取并搜索后执行几条命令，继续总结。" },
+    {
+      id: useAppStore.getState()._nextTaskId(),
+      turnId,
+      type: "tool" as const,
+      toolName: "read_file",
+      target: "package.json",
+      status: "done",
+      toolStatus: "executed" as const,
+      message: "OK",
+    },
+    {
+      id: useAppStore.getState()._nextTaskId(),
+      turnId,
+      type: "tool" as const,
+      toolName: "run_command",
+      target: "git status --short --branch",
+      status: "done",
+      toolStatus: "executed" as const,
+      message: "## main",
+    },
+    {
+      id: useAppStore.getState()._nextTaskId(),
+      turnId,
+      type: "tool" as const,
+      toolName: "read_file",
+      target: "src/store/useAppStore.ts",
+      status: "done",
+      toolStatus: "executed" as const,
+      message: "OK",
+    },
+    {
+      id: useAppStore.getState()._nextTaskId(),
+      turnId,
+      type: "tool" as const,
+      toolName: "execute_command",
+      target: "npm run build -- --mode test",
+      status: "done",
+      toolStatus: "executed" as const,
+      message: "Build done",
+    },
+    {
+      id: useAppStore.getState()._nextTaskId(),
+      turnId,
+      type: "tool" as const,
+      toolName: "glob_search",
+      target: "**/*release*.md",
+      status: "done",
+      toolStatus: "executed" as const,
+      message: "OK",
+    },
+    {
+      id: useAppStore.getState()._nextTaskId(),
+      turnId,
+      type: "agent" as const,
+      content: "读取与命令交错完成，继续保持命令卡独立显示。",
+      streaming: false,
+    },
+  ];
+
+  useAppStore.setState((state) => ({
+    ...state,
+    config: {
+      ...state.config,
+      language: "zh",
+      workflowMode: "edit",
+    },
+    currentWorkspace: "/tmp/e2e-read-context-interleaved",
+    sessionsByWorkspace: {
+      "/tmp/e2e-read-context-interleaved": [
+        {
+          id: sessionId,
+          title: "E2E Read Context Interleaved",
+          date: new Date(now).toISOString(),
+          active: true,
+          messages: [],
+        },
+      ],
+    },
+    currentSessionId: sessionId,
+    taskFlow,
+    conversationTurns: [
+      {
+        id: turnId,
+        userPrompt: "读取并搜索后执行几条命令，继续总结。",
+        title: "读搜命令交错",
+        mode: "edit" as const,
+        status: "done" as const,
+        summary: "读搜与命令交错执行完成。",
+        blockIds: taskFlow.map((block) => block.id),
+        collapsed: false,
+        createdAt: now,
+      },
+    ],
+    currentTurnId: turnId,
+    agentStatus: "idle",
+    isGenerating: false,
+    showPlanPanel: false,
+    showDiff: false,
+    showTerminal: false,
+    showFilePanel: false,
+  }));
+
+  bindBridgeSnapshot(READ_CONTEXT_INTERLEAVED_SCENARIO);
+  appendBridgeEvent("seeded", { seedCount: readSeedCount(READ_CONTEXT_INTERLEAVED_SCENARIO) });
+
+  const cleanup = () => {
+    bridge.initialized = false;
+  };
+
+  bridge.cleanup = cleanup;
+  return cleanup;
+}
+
+function seedReadContextAgentSegmentScenario() {
+  const bridge = getBridge();
+  if (!bridge) return undefined;
+
+  bridge.events = [{ type: "boot" }];
+  bridge.savedDocuments = [];
+  bridge.completed = true;
+
+  const turnId = "e2e-read-context-agent-segment-turn";
+  const sessionId = 999027;
+  const now = Date.now();
+  const userBlockId = useAppStore.getState()._nextTaskId();
+  const taskFlow = [
+    { id: userBlockId, turnId, type: "user" as const, content: "分两段读取上下文并在中间输出一次结论。" },
+    {
+      id: useAppStore.getState()._nextTaskId(),
+      turnId,
+      type: "tool" as const,
+      toolName: "read_file",
+      target: "src/components/ChatArea.tsx",
+      status: "done",
+      toolStatus: "executed" as const,
+      message: "OK",
+    },
+    {
+      id: useAppStore.getState()._nextTaskId(),
+      turnId,
+      type: "tool" as const,
+      toolName: "glob_search",
+      target: "src/**/*.tsx",
+      status: "done",
+      toolStatus: "executed" as const,
+      message: "OK",
+    },
+    {
+      id: useAppStore.getState()._nextTaskId(),
+      turnId,
+      type: "agent" as const,
+      content: "第一段读取完成，先输出阶段结论。",
+      streaming: false,
+    },
+    {
+      id: useAppStore.getState()._nextTaskId(),
+      turnId,
+      type: "tool" as const,
+      toolName: "read_document",
+      target: "README.md",
+      status: "done",
+      toolStatus: "executed" as const,
+      message: "OK",
+    },
+    {
+      id: useAppStore.getState()._nextTaskId(),
+      turnId,
+      type: "agent" as const,
+      content: "第二段读取完成。",
+      streaming: false,
+    },
+  ];
+
+  useAppStore.setState((state) => ({
+    ...state,
+    config: {
+      ...state.config,
+      language: "zh",
+      workflowMode: "edit",
+    },
+    currentWorkspace: "/tmp/e2e-read-context-agent-segment",
+    sessionsByWorkspace: {
+      "/tmp/e2e-read-context-agent-segment": [
+        {
+          id: sessionId,
+          title: "E2E Read Context Agent Segment",
+          date: new Date(now).toISOString(),
+          active: true,
+          messages: [],
+        },
+      ],
+    },
+    currentSessionId: sessionId,
+    taskFlow,
+    conversationTurns: [
+      {
+        id: turnId,
+        userPrompt: "分两段读取上下文并在中间输出一次结论。",
+        title: "读搜按正文断段",
+        mode: "edit" as const,
+        status: "done" as const,
+        summary: "中间正文把读取段落切开。",
+        blockIds: taskFlow.map((block) => block.id),
+        collapsed: false,
+        createdAt: now,
+      },
+    ],
+    currentTurnId: turnId,
+    agentStatus: "idle",
+    isGenerating: false,
+    showPlanPanel: false,
+    showDiff: false,
+    showTerminal: false,
+    showFilePanel: false,
+  }));
+
+  bindBridgeSnapshot(READ_CONTEXT_AGENT_SEGMENT_SCENARIO);
+  appendBridgeEvent("seeded", { seedCount: readSeedCount(READ_CONTEXT_AGENT_SEGMENT_SCENARIO) });
 
   const cleanup = () => {
     bridge.initialized = false;
@@ -3248,6 +3510,14 @@ export function initializeE2EScenarios(): (() => void) | undefined {
 
   if (scenario === READ_CONTEXT_COLLAPSE_SCENARIO) {
     return seedReadContextCollapseScenario();
+  }
+
+  if (scenario === READ_CONTEXT_INTERLEAVED_SCENARIO) {
+    return seedReadContextInterleavedScenario();
+  }
+
+  if (scenario === READ_CONTEXT_AGENT_SEGMENT_SCENARIO) {
+    return seedReadContextAgentSegmentScenario();
   }
 
   if (scenario === THINKING_POLICY_SCENARIO) {

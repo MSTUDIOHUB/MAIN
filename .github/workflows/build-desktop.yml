@@ -12,6 +12,11 @@ on:
         required: true
         default: "MSTUDIOHUB/MAIN-Releases"
         type: string
+      update_repo:
+        description: "Public GitHub repo for updater feed assets"
+        required: true
+        default: "MSTUDIOHUB/MAIN-UpdateFeed"
+        type: string
       draft:
         description: "Create the public GitHub Release as a draft"
         required: true
@@ -270,6 +275,7 @@ jobs:
     env:
       VERSION: ${{ inputs.version }}
       RELEASE_REPO: ${{ inputs.release_repo }}
+      UPDATE_REPO: ${{ inputs.update_repo }}
       GH_TOKEN: ${{ secrets.PUBLIC_RELEASES_TOKEN }}
     steps:
       - uses: actions/checkout@v6
@@ -351,10 +357,10 @@ jobs:
 
           app_name = os.environ["APP_NAME"]
           version = os.environ["VERSION"]
-          release_repo = os.environ["RELEASE_REPO"]
+          update_repo = os.environ["UPDATE_REPO"]
           tag = f"v{version}"
           assets_dir = pathlib.Path("release-assets")
-          base_url = f"https://github.com/{release_repo}/releases/download/{tag}"
+          base_url = f"https://github.com/{update_repo}/releases/download/{tag}"
 
           def asset_url(file_name):
               return f"{base_url}/{urllib.parse.quote(file_name)}"
@@ -398,13 +404,13 @@ jobs:
           python3 -m json.tool release-assets/latest.json >/dev/null
           ls -lah release-assets/latest.json
 
-      - name: Publish to public GitHub Releases repo
+      - name: Publish to public GitHub Releases repos
         shell: bash
         run: |
           set -euo pipefail
 
           if [[ -z "${GH_TOKEN}" ]]; then
-            echo "::error::Missing PUBLIC_RELEASES_TOKEN secret. Add a GitHub token that can write releases to ${RELEASE_REPO}."
+            echo "::error::Missing PUBLIC_RELEASES_TOKEN secret. Add a GitHub token that can write releases to ${RELEASE_REPO} and ${UPDATE_REPO}."
             exit 1
           fi
 
@@ -433,17 +439,40 @@ jobs:
 
             gh release upload "$tag" \
               release-assets/*.zip \
-              release-assets/*_updater_* \
-              release-assets/latest.json \
               --repo "$RELEASE_REPO" \
               --clobber
           else
             gh release create "$tag" \
               release-assets/*.zip \
-              release-assets/*_updater_* \
-              release-assets/latest.json \
               --repo "$RELEASE_REPO" \
               --title "${APP_NAME} ${VERSION}" \
+              --notes-file release-assets/release-notes.md \
+              "${create_flags[@]}"
+          fi
+
+          if gh release view "$tag" --repo "$UPDATE_REPO" >/dev/null 2>&1; then
+            gh release edit "$tag" \
+              --repo "$UPDATE_REPO" \
+              --title "${APP_NAME} Updater ${VERSION}" \
+              --notes-file release-assets/release-notes.md \
+              --draft="${{ inputs.draft }}" \
+              --prerelease="${{ inputs.prerelease }}"
+
+            gh release delete-asset "$tag" SHA256SUMS.txt \
+              --repo "$UPDATE_REPO" \
+              --yes >/dev/null 2>&1 || true
+
+            gh release upload "$tag" \
+              release-assets/*_updater_* \
+              release-assets/latest.json \
+              --repo "$UPDATE_REPO" \
+              --clobber
+          else
+            gh release create "$tag" \
+              release-assets/*_updater_* \
+              release-assets/latest.json \
+              --repo "$UPDATE_REPO" \
+              --title "${APP_NAME} Updater ${VERSION}" \
               --notes-file release-assets/release-notes.md \
               "${create_flags[@]}"
           fi

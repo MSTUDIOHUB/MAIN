@@ -56,6 +56,11 @@ npm run release:desktop -- 1.5.5
 - `MAIN_<version>_windows_x64.zip`
 - Tauri updater 使用的签名更新包、`.sig` 和 `latest.json`
 
+发布时会分仓库上传：
+
+- `MAIN-Releases`：只放用户下载 zip
+- `MAIN-UpdateFeed`：只放 updater feed（`latest.json + *_updater_* + .sig`）
+
 如果缺少 updater 签名 Secrets，workflow 会失败并提示补齐，避免发布一个无法自动更新的版本。
 
 ## macOS 打包

@@ -183,9 +183,11 @@ function ContextCompressionNotice({ block, language }: { block: any; language: "
     ? isReactive ? "上下文溢出保护" : isMicroOnly ? (microKind === "tool_results" ? "长工具输出已截断" : "长内容已整理") : "历史上下文已压缩"
     : isReactive ? "Context overflow guard" : isMicroOnly ? (microKind === "tool_results" ? "Long tool output truncated" : "Long content compacted") : "History context compressed";
   const compactLabel = language === "zh" ? "查看" : "View";
-  const bodyText = String(stats.memoryPacket || stats.compressedContext || "").trim() || (language === "zh"
+  const bodyText = String(stats.displaySummary || stats.compressedContext || "").trim() || (language === "zh"
     ? "当前只保存了压缩统计，暂无可展示的压缩摘要。"
     : "Only compression stats are available for this event.");
+  const debugPacket = String(stats.memoryPacket || "").trim();
+  const showDebugPacket = !!debugPacket && debugPacket !== bodyText;
   const tone = isLightTheme
     ? {
         pillBorder: "#cbd5e1",
@@ -331,6 +333,23 @@ function ContextCompressionNotice({ block, language }: { block: any; language: "
               >
                 {bodyText}
               </pre>
+              {showDebugPacket && (
+                <details className="mt-4 rounded-2xl border border-[#2c2c32] bg-[#111113] p-3" style={{ borderColor: tone.preBorder, backgroundColor: tone.preBackground }}>
+                  <summary className="cursor-pointer select-none text-[11px] font-medium text-[#a1a1aa]">
+                    {language === "zh" ? "调试信息（Context Memory Packet）" : "Debug Info (Context Memory Packet)"}
+                  </summary>
+                  <pre
+                    className="mt-3 m-0 whitespace-pre-wrap break-words rounded-xl border border-[#2c2c32] bg-[#0b0b0d] p-3 font-mono text-[11px] leading-6 text-[#a1a1aa]"
+                    style={{
+                      borderColor: tone.preBorder,
+                      backgroundColor: tone.preBackground,
+                      color: tone.mutedText,
+                    }}
+                  >
+                    {debugPacket}
+                  </pre>
+                </details>
+              )}
             </div>
           </div>
         </div>,
@@ -586,6 +605,20 @@ function isCompletedReadContextTool(block: any) {
   );
 }
 
+function isReadContextHardBoundary(block: any) {
+  if (!block) return false;
+  if (block.type === "user" || block.type === "jobList") return true;
+  if (block.type === "agent") {
+    if (block.hiddenProcess && !block.streaming) return false;
+    return hasRenderableAgentBlock(block);
+  }
+  if (block.type === "tool") {
+    if (block.toolStatus !== "pending") return false;
+    return block.toolName !== "write_file" && block.toolName !== "replace_in_file";
+  }
+  return false;
+}
+
 function compactToolTarget(rawTarget: string, toolName: string, language: "zh" | "en") {
   const target = String(rawTarget || "").trim();
   if (!target) {
@@ -617,26 +650,27 @@ function buildBlockRenderItems(blocks: any[], includeUser = true) {
     | { kind: "block"; block: any; index: number }
     | { kind: "readContextGroup"; blocks: any[]; index: number }
   > = [];
+  let activeReadContextGroup: { kind: "readContextGroup"; blocks: any[]; index: number } | null = null;
 
   for (let index = 0; index < blocks.length; index += 1) {
     const block = blocks[index];
-    if (!includeUser && block?.type === "user") continue;
-
     if (isCompletedReadContextTool(block)) {
-      const groupStart = index;
-      const group: any[] = [];
-      while (index < blocks.length && isCompletedReadContextTool(blocks[index])) {
-        group.push(blocks[index]);
-        index += 1;
-      }
-      index -= 1;
-
-      if (group.length > 1) {
-        items.push({ kind: "readContextGroup", blocks: group, index: groupStart });
+      if (!activeReadContextGroup) {
+        activeReadContextGroup = { kind: "readContextGroup", blocks: [block], index };
+        items.push(activeReadContextGroup);
       } else {
-        items.push({ kind: "block", block: group[0], index: groupStart });
+        activeReadContextGroup.blocks.push(block);
       }
       continue;
+    }
+
+    if (!includeUser && block?.type === "user") {
+      activeReadContextGroup = null;
+      continue;
+    }
+
+    if (isReadContextHardBoundary(block)) {
+      activeReadContextGroup = null;
     }
 
     items.push({ kind: "block", block, index });

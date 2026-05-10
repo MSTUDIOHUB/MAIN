@@ -68,6 +68,7 @@ const {
   filterToolDefinitionsForIntent,
   getLocalFileReadPathForToolCall,
   getToolRiskLevelForCall,
+  isUnityApplyTextPrecisePatchArgs,
   isToolAutoExecutableForCall,
   routeMcpToolsForPrompt,
 } = await loadToolCapabilitiesModule();
@@ -346,4 +347,56 @@ test("Unity MCP-first routing keeps Unity server tools and forces read_console t
     routed.tools.map((item) => item.name).sort(),
     ["manage_scene", "read_console"],
   );
+});
+
+test("Unity MCP-first routing prefers script_apply_edits over apply_text_edits for script fixes", () => {
+  const servers = [{ name: "unityMCP", type: "http", url: "http://127.0.0.1:8080/mcp" }];
+  const tools = [
+    { name: "apply_text_edits", description: "Apply text edits to Unity script using coordinates", inputSchema: {} },
+    { name: "script_apply_edits", description: "Structured script edits for Unity C#", inputSchema: {} },
+    { name: "manage_scene", description: "Manage Unity scenes", inputSchema: {} },
+  ];
+  const toolServerMap = {
+    apply_text_edits: "http://127.0.0.1:8080/mcp",
+    script_apply_edits: "http://127.0.0.1:8080/mcp",
+    manage_scene: "http://127.0.0.1:8080/mcp",
+  };
+
+  const routed = routeMcpToolsForPrompt({
+    tools,
+    servers,
+    toolServerMap,
+    userPrompt: "请修复 Unity C# 脚本报错",
+    config: { enabled: true, threshold: 1, routerModel: "", timeoutMs: 800, fallbackToFullList: true, disabledToolKeys: [] },
+    priorityMode: "unity_mcp_first",
+    preferredServerUrls: ["http://127.0.0.1:8080/mcp"],
+    unityRoutingContext: { preferStructuredScriptEdits: true },
+  });
+
+  const orderedNames = routed.tools.map((item) => item.name);
+  assert.ok(orderedNames.indexOf("script_apply_edits") >= 0);
+  assert.ok(orderedNames.indexOf("apply_text_edits") >= 0);
+  assert.ok(orderedNames.indexOf("script_apply_edits") < orderedNames.indexOf("apply_text_edits"));
+});
+
+test("Unity apply_text_edits precise patch validator enforces uri, coordinates, and precondition sha", () => {
+  const valid = isUnityApplyTextPrecisePatchArgs({
+    uri: "Assets/Scripts/Player.cs",
+    precondition_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    edits: [{ startLine: 10, startCol: 5, endLine: 10, endCol: 12, newText: "foo" }],
+  });
+  assert.equal(valid, true);
+
+  const missingPrecondition = isUnityApplyTextPrecisePatchArgs({
+    uri: "Assets/Scripts/Player.cs",
+    edits: [{ startLine: 10, startCol: 5, endLine: 10, endCol: 12, newText: "foo" }],
+  });
+  assert.equal(missingPrecondition, false);
+
+  const missingCoordinates = isUnityApplyTextPrecisePatchArgs({
+    uri: "Assets/Scripts/Player.cs",
+    precondition_sha: "0123456789abcdef0123456789abcdef01234567",
+    edits: [{ startLine: 10, endLine: 10, newText: "foo" }],
+  });
+  assert.equal(missingCoordinates, false);
 });

@@ -1,3 +1,5 @@
+import { looksLikeSyntheticContinuationText } from "./syntheticContinuation";
+
 export type ContextMemoryRole = "system" | "user" | "assistant" | "tool";
 
 export interface ContextMemoryContentPart {
@@ -98,6 +100,22 @@ function normalizeLine(value: unknown): string {
     .replace(/[，。！？；：,.!?;:、"'“”‘’`*_~\-\s]+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function stripTrailingSourceTag(text: string): string {
+  return String(text || "")
+    .replace(/\s+\[[^\]\n]{1,180}\]\s*$/g, "")
+    .trim();
+}
+
+function isSyntheticDurableEntryText(text: string): boolean {
+  const compacted = stripTrailingSourceTag(String(text || ""));
+  if (!compacted) return false;
+  const stripped = compacted.replace(
+    /^(?:Goal|Goals|Hard constraints|Constraints|Decisions|Next steps|Open questions)\s*:?\s*/i,
+    "",
+  ).trim();
+  return looksLikeSyntheticContinuationText(stripped || compacted);
 }
 
 export function contextMemoryContentToText(content: ContextMemoryMessage["content"]): string {
@@ -215,7 +233,7 @@ function matchesConstraint(text: string): boolean {
 }
 
 function matchesDecision(text: string): boolean {
-  return /(?:批准|确认|选择|决定|方案|执行|已完成|approved|confirmed|selected|decided|plan approved|execute|implemented|completed)/i.test(text);
+  return /(?:批准|确认|选择|决定|已批准|已确认|approved|confirmed|selected|decided|plan approved)/i.test(text);
 }
 
 function matchesBlocker(text: string): boolean {
@@ -310,14 +328,24 @@ function extractCarryoverFromContextText(text: string, messageIndex: number, upd
     if (!line || /^(\[?System:|ContextState|ContextMemoryState|Use this as compact)/i.test(line)) continue;
     const item = entry(line, source, updatedAt);
     if (!item) continue;
-    if (/^Goal:/i.test(line)) carried.goals = [...(carried.goals || []), item];
-    else if (/^Constraints?:/i.test(line)) carried.constraints = [...(carried.constraints || []), item];
-    else if (/^Decisions?:/i.test(line)) carried.decisions = [...(carried.decisions || []), item];
+    if (/^Goal:/i.test(line)) {
+      if (!isSyntheticDurableEntryText(line)) carried.goals = [...(carried.goals || []), item];
+    }
+    else if (/^Constraints?:/i.test(line)) {
+      if (!isSyntheticDurableEntryText(line)) carried.constraints = [...(carried.constraints || []), item];
+    }
+    else if (/^Decisions?:/i.test(line)) {
+      if (!isSyntheticDurableEntryText(line)) carried.decisions = [...(carried.decisions || []), item];
+    }
     else if (/^Evidence:/i.test(line)) carried.evidence = [...(carried.evidence || []), item];
     else if (/^Files?:/i.test(line)) carried.files = [...(carried.files || []), { ...item, path: line }];
     else if (/^Recent failures|^Blockers?:/i.test(line)) carried.blockers = [...(carried.blockers || []), item];
-    else if (/^Next:/i.test(line)) carried.nextSteps = [...(carried.nextSteps || []), item];
-    else carried.progress = [...(carried.progress || []), item];
+    else if (/^Next:/i.test(line)) {
+      if (!isSyntheticDurableEntryText(line)) carried.nextSteps = [...(carried.nextSteps || []), item];
+    }
+    else if (!isSyntheticDurableEntryText(line)) {
+      carried.progress = [...(carried.progress || []), item];
+    }
   }
   return carried;
 }
@@ -372,6 +400,27 @@ function normalizeFileArray(value: unknown): ContextMemoryFileEntry[] {
     .filter((item): item is ContextMemoryFileEntry => Boolean(item));
 }
 
+function sanitizeDurableEntries(entries: ContextMemoryEntry[] | undefined): ContextMemoryEntry[] {
+  return (entries || []).filter((item) => !isSyntheticDurableEntryText(item.text));
+}
+
+function sanitizeContextMemoryState(state: ContextMemoryState | null): ContextMemoryState | null {
+  if (!state) return null;
+  const latestUserRequest =
+    state.latestUserRequest && !isSyntheticDurableEntryText(state.latestUserRequest.text)
+      ? state.latestUserRequest
+      : undefined;
+  return {
+    ...state,
+    ...(latestUserRequest ? { latestUserRequest } : { latestUserRequest: undefined }),
+    goals: sanitizeDurableEntries(state.goals),
+    constraints: sanitizeDurableEntries(state.constraints),
+    decisions: sanitizeDurableEntries(state.decisions),
+    nextSteps: sanitizeDurableEntries(state.nextSteps),
+    openQuestions: sanitizeDurableEntries(state.openQuestions),
+  };
+}
+
 export function normalizeContextMemoryState(value: unknown): ContextMemoryState | null {
   if (!value || typeof value !== "object") return null;
   const candidate = value as Partial<ContextMemoryState>;
@@ -380,7 +429,7 @@ export function normalizeContextMemoryState(value: unknown): ContextMemoryState 
   const latest = candidate.latestUserRequest && typeof candidate.latestUserRequest === "object"
     ? normalizeEntryArray([candidate.latestUserRequest])[0]
     : undefined;
-  return {
+  const normalized: ContextMemoryState = {
     version: 1,
     id: typeof candidate.id === "string" && candidate.id ? candidate.id : `ctx-${now.toString(36)}`,
     updatedAt: now,
@@ -395,6 +444,7 @@ export function normalizeContextMemoryState(value: unknown): ContextMemoryState 
     nextSteps: normalizeEntryArray(candidate.nextSteps),
     openQuestions: normalizeEntryArray(candidate.openQuestions),
   };
+  return sanitizeContextMemoryState(normalized);
 }
 
 export function buildContextMemoryState(
@@ -402,7 +452,7 @@ export function buildContextMemoryState(
   options: BuildContextMemoryOptions = {},
 ): ContextMemoryState {
   const now = options.now ?? Date.now();
-  const previous = normalizeContextMemoryState(options.previous);
+  const previous = sanitizeContextMemoryState(normalizeContextMemoryState(options.previous));
   const lookup = buildToolCallLookup(messages);
   const collected: Omit<ContextMemoryState, "version" | "id" | "updatedAt"> = {
     latestUserRequest: previous?.latestUserRequest,
@@ -438,6 +488,7 @@ export function buildContextMemoryState(
 
     const source = sourceFor(message, index, options.turnId ? { turnId: options.turnId } : {});
     if (message.role === "user") {
+      if (looksLikeSyntheticContinuationText(text)) continue;
       const request = entry(text, source, updatedAt);
       if (request) {
         collected.latestUserRequest = request;
@@ -451,11 +502,11 @@ export function buildContextMemoryState(
       }
     } else if (message.role === "assistant") {
       if (!Array.isArray(message.tool_calls) || message.tool_calls.length === 0) {
-        for (const sentence of splitSentences(text)) {
-          if (matchesDecision(sentence)) pushEntry(collected.decisions, entry(sentence, source, updatedAt));
-          if (matchesConstraint(sentence)) pushEntry(collected.constraints, entry(sentence, source, updatedAt));
-          if (matchesNextStep(sentence)) pushEntry(collected.nextSteps, entry(sentence, source, updatedAt));
-          if (matchesBlocker(sentence)) pushEntry(collected.blockers, entry(sentence, source, updatedAt));
+        if (!looksLikeSyntheticContinuationText(text)) {
+          for (const sentence of splitSentences(text)) {
+            if (matchesNextStep(sentence)) pushEntry(collected.nextSteps, entry(sentence, source, updatedAt));
+            if (matchesBlocker(sentence)) pushEntry(collected.blockers, entry(sentence, source, updatedAt));
+          }
         }
         collected.progress.push(...extractCheckboxProgress(text, source, updatedAt));
       }
@@ -483,7 +534,7 @@ export function buildContextMemoryState(
     openQuestions: Math.min(DEFAULT_BUCKET_LIMITS.openQuestions, explicitLimit),
   } : DEFAULT_BUCKET_LIMITS;
 
-  return {
+  const state: ContextMemoryState = {
     version: 1,
     id: previous?.id || `ctx-${now.toString(36)}-${stableContextHash(messages.map((message) => contextMemoryContentToText(message.content)).join("\n")).slice(0, 6)}`,
     updatedAt: now,
@@ -498,6 +549,7 @@ export function buildContextMemoryState(
     nextSteps: mergeEntries(previous?.nextSteps, collected.nextSteps, limits.nextSteps),
     openQuestions: mergeEntries(previous?.openQuestions, collected.openQuestions, limits.openQuestions),
   };
+  return sanitizeContextMemoryState(state) || state;
 }
 
 function formatEntryList(label: string, entries: ContextMemoryEntry[], maxItems: number): string[] {

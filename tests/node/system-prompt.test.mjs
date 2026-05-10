@@ -358,4 +358,5 @@ test("Unity MCP-first prompt explicitly prioritizes read_console over local scan
   assert.match(prompt, /\[UNITY MCP PRIORITY\]/);
   assert.match(prompt, /Do not start with get_project_skeleton or local log file scanning/);
   assert.match(prompt, /call read_console first/);
+  assert.match(prompt, /prefer script_apply_edits/i);
 });

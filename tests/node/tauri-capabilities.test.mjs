@@ -24,6 +24,6 @@ test("Tauri updater config points at public release manifest", () => {
   assert.equal(config.bundle.createUpdaterArtifacts, true);
   assert.match(config.plugins.updater.pubkey, /^dW50cnVzdGVk/);
   assert.deepEqual(config.plugins.updater.endpoints, [
-    "https://github.com/MSTUDIOHUB/MAIN-Releases/releases/latest/download/latest.json",
+    "https://github.com/MSTUDIOHUB/MAIN-UpdateFeed/releases/latest/download/latest.json",
   ]);
 });

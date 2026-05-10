@@ -99,6 +99,29 @@ test("normalizes legacy single cloud config into one active server", () => {
   assert.equal(state.cloud.auth.mode, "api_key");
 });
 
+test("normalizes OpenAI OAuth servers to responses api format", () => {
+  const state = normalizeCloudServerState({
+    activeCloudServerId: "openai-login",
+    cloudServers: [
+      {
+        id: "openai-login",
+        name: "OpenAI Login",
+        protocol: "openai",
+        apiFormat: "chat_completions",
+        auth: {
+          mode: "openai_chatgpt_oauth",
+          status: "connected",
+          tokenRef: "openai-login",
+        },
+      },
+    ],
+  });
+
+  assert.equal(state.cloud.apiFormat, "responses");
+  assert.equal(state.cloudServers[0].apiFormat, "responses");
+  assert.equal(state.cloud.auth.mode, "openai_chatgpt_oauth");
+});
+
 test("repairs invalid active server ids and mirrors the selected server to cloud", () => {
   const state = normalizeCloudServerState({
     activeCloudServerId: "missing",

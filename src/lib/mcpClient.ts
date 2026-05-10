@@ -49,6 +49,7 @@ type InvokeFn = <T = any>(command: string, args?: Record<string, unknown>) => Pr
 const MCP_ACCEPT_HEADER = "application/json, text/event-stream";
 const MCP_PROTOCOL_VERSION = "2025-03-26";
 const MCP_SESSION_HEADER = "mcp-session-id";
+const UNITY_EDIT_TOOL_NAMES = new Set(["apply_text_edits", "script_apply_edits"]);
 
 export type MCPDiagnosticCategory =
   | "ok"
@@ -160,6 +161,28 @@ function getResponseSnippet(text: string): string | undefined {
   const normalized = String(text || "").replace(/\s+/g, " ").trim();
   if (!normalized) return undefined;
   return normalized.slice(0, 260);
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function isUnityEditEmptyResult(toolName: string, result: unknown): boolean {
+  if (!UNITY_EDIT_TOOL_NAMES.has(toolName)) return false;
+  if (isPlainObject(result) && Object.keys(result).length === 0) return true;
+  if (!isPlainObject(result)) return false;
+  const content = result.content;
+  if (!Array.isArray(content)) return false;
+  if (content.length === 0) return true;
+  const merged = content
+    .map((entry) => {
+      if (typeof entry === "string") return entry;
+      if (isPlainObject(entry) && typeof entry.text === "string") return entry.text;
+      return JSON.stringify(entry ?? "");
+    })
+    .join("")
+    .trim();
+  return merged.length === 0;
 }
 
 function extractSessionId(headers?: Record<string, string>): string | undefined {
@@ -596,6 +619,14 @@ export async function executeMcpTool(
       const category = /session/i.test(diagnostic.message) ? "session" : diagnostic.category;
       throw new Error(`MCP_CALL_FAILURE[${category}] ${diagnostic.message}`);
     }
+  }
+
+  if (isUnityEditEmptyResult(toolName, json.result)) {
+    throw new Error(
+      toolName === "apply_text_edits"
+        ? "MCP_CALL_FAILURE[empty_result] apply_text_edits returned an empty result ({}). Treat this as a failed edit and switch to script_apply_edits or re-run with strict coordinates + precondition SHA."
+        : "MCP_CALL_FAILURE[empty_result] script_apply_edits returned an empty result ({}). Treat this as failed and retry with explicit edits/anchors or verify the target script/class/method names.",
+    );
   }
 
   const content = json.result?.content;

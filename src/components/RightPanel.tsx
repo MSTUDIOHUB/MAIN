@@ -20,6 +20,7 @@ import { extractPlanDraftPreview, extractStructuredPlanProposal, hasPlanDraftPre
 import { resolveGlobalChatSessionKey, resolveSessionRuntimeKey, resolveSessionWorkspaceKey, type DiffRevertRequest, type TaskBlock, useAppStore } from "../store/useAppStore";
 import { deleteChatTempPath, exportTextFile, getPtyStatus, onPtyData, readPtyBuffer, resizePty, spawnPty, writePty, type GitDiffEntry } from "../lib/ipc";
 import { buildPlanTaskEvidenceAudit, collectChangeEntries, isPlanConversationTurn, type PlanArtifact, type PlanExecutionEvidenceEntry, type PlanTask } from "../lib/workflowModels";
+import { safeConfirm } from "../lib/safeConfirm";
 
 const CODE_FONT_FAMILY = "'JetBrains Mono', 'Fira Code', Menlo, Monaco, 'Courier New', monospace";
 const TERMINAL_FONT_FAMILY = [
@@ -662,7 +663,10 @@ function DiffReviewPanel({ taskFlow, activeDiffTask, gitDiffEntries = [], gitDif
       : actionableTargets.length === 1
         ? `${hasPending ? "Reject" : "Revert"} changes to ${actionableTargets[0].displayPath}? This will update workspace files.`
         : `Revert changes to ${actionableTargets.length} files? This will update workspace files.`;
-    if (!window.confirm(confirmMessage)) return;
+    if (!safeConfirm(confirmMessage, {
+      source: "RightPanel",
+      action: hasPending ? "reject_diff_changes" : "revert_diff_changes",
+    })) return;
 
     const keys = actionableTargets.map((file) => file.key);
     setRevertingKeys((prev) => new Set([...prev, ...keys]));

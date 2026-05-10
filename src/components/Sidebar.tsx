@@ -18,6 +18,7 @@ import { GLOBAL_CHAT_KEY, useAppStore, type WorkspaceEntry } from "../store/useA
 import { looksLikeReasoningLeakTitle, normalizeConversationDisplayTitle } from "../lib/workflowModels";
 import { getGitStatus, getGitDiff, gitCommitAll, gitCreateBranch, gitPushCurrentBranch, type GitStatus } from "../lib/ipc";
 import { generateGitCommitMessage } from "../lib/gitCommitMessage";
+import { safeConfirm } from "../lib/safeConfirm";
 
 interface GitMenuState {
   workspacePath: string;
@@ -517,7 +518,11 @@ export default function Sidebar({
 
   const handleGitPush = async () => {
     if (!gitMenu?.workspacePath || !activeGitStatus) return;
-    if (!activeGitStatus.upstream && activeGitStatus.hasOrigin && !window.confirm(gitCopy.noOriginPush)) {
+    if (
+      !activeGitStatus.upstream &&
+      activeGitStatus.hasOrigin &&
+      !safeConfirm(gitCopy.noOriginPush, { source: "Sidebar", action: "git_push_without_upstream" })
+    ) {
       return;
     }
     await runGitAction(() => gitPushCurrentBranch(gitMenu.workspacePath), gitCopy.pushDone);
@@ -574,7 +579,7 @@ export default function Sidebar({
       : [];
     const seedTurn = turns[0] || turns[turns.length - 1] || null;
     return normalizeConversationDisplayTitle(
-      seedTurn?.title || seedTurn?.intentSummary || session?.title || "",
+      seedTurn?.intentSummary || seedTurn?.title || session?.title || "",
       48,
       fallback,
     );
