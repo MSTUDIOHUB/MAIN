@@ -59,3 +59,26 @@ test("parses local-model function-style tool calls", () => {
   });
   assert.equal(readFile.cleanText, "");
 });
+
+test("parses local-model single positional argument safely for whitelisted tools", () => {
+  const parsed = parseTextForTools('list_directory("src")');
+  assert.equal(parsed.toolCalls.length, 1);
+  assert.equal(parsed.toolCalls[0].name, "list_directory");
+  assert.deepEqual(parsed.toolCalls[0].arguments, { path: "src" });
+  assert.equal(parsed.cleanText, "");
+});
+
+test("parses <tool_code> wrapper into a real tool call and strips wrapper text", () => {
+  const parsed = parseTextForTools([
+    "先看项目目录。",
+    "<tool_code>",
+    "list_directory(\"src\")",
+    "</tool_code>",
+  ].join("\n"));
+
+  assert.equal(parsed.toolCalls.length, 1);
+  assert.equal(parsed.toolCalls[0].name, "list_directory");
+  assert.deepEqual(parsed.toolCalls[0].arguments, { path: "src" });
+  assert.match(parsed.cleanText, /先看项目目录/);
+  assert.doesNotMatch(parsed.cleanText, /tool_code|list_directory\(\"src\"\)/i);
+});

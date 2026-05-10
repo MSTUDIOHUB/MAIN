@@ -60,12 +60,14 @@ function loadTranspiledModuleSync(sourcePath) {
 const {
   getMainIntentShortcuts,
   getIntentPolicy,
+  hasExplicitUnityConsoleDiagnosticCue,
   inferCommandDirective,
   looksLikePreviousTurnContinuationInput,
   looksLikeExistingPlanExecutionRequest,
   mapResolvedRunIntentToWorkflowMode,
   parseMainDebugShortcut,
   parseMainIntentShortcut,
+  parseMainIntentShortcutForMode,
   resolveComposerIntentSuggestion,
   resolveTurnRunIntent,
   shouldContinuePreviousTurnFromInput,
@@ -212,6 +214,13 @@ test("command directive inference keeps Unity, reports, and file changes as seco
   );
 });
 
+test("unity console diagnostic cue ignores explicit no-error phrasing", () => {
+  assert.equal(hasExplicitUnityConsoleDiagnosticCue("检查一下Unity console的报错"), true);
+  assert.equal(hasExplicitUnityConsoleDiagnosticCue("Unity 里没有报错，但蛇没有移动"), false);
+  assert.equal(hasExplicitUnityConsoleDiagnosticCue("no compile error, only runtime behavior issue"), false);
+  assert.equal(inferCommandDirective("Unity 里没有报错，但蛇没有移动", "analyze").action, "unity_workflow");
+});
+
 test("complex multi-file generation routes to plan before execution", () => {
   const result = resolveTurnRunIntent(
     "生成一套游戏框架代码包括文件夹，实现《歧路旅人》CTB回合制战斗逻辑。",
@@ -319,6 +328,29 @@ test("MAIN intent shortcuts no longer parse /执行 or /execute", () => {
   assert.equal(parseMainIntentShortcut("/execute fix this issue"), null);
 });
 
+test("game studio only exposes plan shortcut from MAIN shortcut set", () => {
+  const studioShortcutsZh = getMainIntentShortcuts("zh", { mainModeKey: "game_studio" });
+  const studioShortcutsEn = getMainIntentShortcuts("en", { mainModeKey: "game_studio" });
+
+  assert.deepEqual(studioShortcutsZh.map((item) => item.intent), ["plan"]);
+  assert.deepEqual(studioShortcutsEn.map((item) => item.intent), ["plan"]);
+});
+
+test("mode-aware shortcut parsing keeps only /plan in game studio", () => {
+  assert.equal(parseMainIntentShortcutForMode("/报告 输出报告", "game_studio"), null);
+  assert.equal(parseMainIntentShortcutForMode("/report output report", "game_studio"), null);
+  assert.deepEqual(parseMainIntentShortcutForMode("/计划 先出方案", "game_studio"), {
+    intent: "plan",
+    command: "/计划",
+    rest: "先出方案",
+  });
+  assert.deepEqual(parseMainIntentShortcutForMode("/plan write a plan first", "game_studio"), {
+    intent: "plan",
+    command: "/计划",
+    rest: "write a plan first",
+  });
+});
+
 test("hidden MDEBUG shortcut parses without entering visible intent shortcuts", () => {
   assert.deepEqual(parseMainDebugShortcut("/MDEBUG 反馈内容"), {
     command: "/MDEBUG",
@@ -353,6 +385,21 @@ test("composer suggestion keeps explicit slash intent as the default", () => {
   assert.equal(suggestion.kind, "explicit_conflict");
   assert.equal(suggestion.explicitIntent, "plan");
   assert.equal(suggestion.intent, "summarize");
+});
+
+test("game studio suggestion never upgrades /plan to non-plan output styles", () => {
+  const suggestion = resolveComposerIntentSuggestion({
+    input: "/计划 帮我总结这段内容",
+    language: "zh",
+    mainModeKey: "game_studio",
+    lockedComposerIntent: null,
+    dismissedSuggestedIntentKey: null,
+    hasPlanArtifacts: false,
+    planStage: "idle",
+    isPlanApproved: false,
+  });
+
+  assert.equal(suggestion, null);
 });
 
 test("composer suggestion ignore and locked intent do not override explicit user choice", () => {

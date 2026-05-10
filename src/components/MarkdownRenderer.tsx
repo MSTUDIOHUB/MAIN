@@ -3,7 +3,7 @@ import { createPortal } from "react-dom";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
-import { vscDarkPlus } from "react-syntax-highlighter/dist/esm/styles/prism";
+import { oneLight, vscDarkPlus } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { IconClose, IconExpand } from "./Icons";
 import MermaidBlock from "./MermaidBlock";
 import { useAppStore } from "../store/useAppStore";
@@ -148,6 +148,24 @@ function CodeBlock({ inline, className, children, baseFontSize = 13, ...rest }: 
     : { diagram: "Diagram", expand: "Expand", copied: "Copied", copy: "Copy", expandedDiagram: "Expanded Diagram View", copySource: "Copy Source", closeExpanded: "Close expanded diagram" };
   const isLightTheme = themeMode === "light";
   const isBlackTheme = themeMode === "black";
+  const syntaxTheme = isLightTheme ? oneLight : vscDarkPlus;
+  const codeSurfaceTone = isLightTheme
+    ? {
+        border: "#d4d4d8",
+        background: "#fafafa",
+        text: "#1f2937",
+      }
+    : isBlackTheme
+    ? {
+        border: "#202026",
+        background: "#000000",
+        text: "#dedee3",
+      }
+    : {
+        border: "#1f1f23",
+        background: "#09090b",
+        text: "#d4d4d8",
+      };
   const match = /language-(\w+)/.exec(className || "");
   const language = match ? match[1].toLowerCase() : "";
   const codeStr = String(children).replace(/\n$/, "");
@@ -248,13 +266,20 @@ function CodeBlock({ inline, className, children, baseFontSize = 13, ...rest }: 
 
   if (isPlainText) {
     return (
-      <div className="my-4 overflow-x-auto rounded-2xl border border-[#1f1f23] bg-[#09090b] px-4 py-3 shadow-[0_12px_40px_rgba(0,0,0,0.18)]">
+      <div
+        className="my-4 overflow-x-auto rounded-2xl border px-4 py-3"
+        style={{
+          borderColor: codeSurfaceTone.border,
+          backgroundColor: codeSurfaceTone.background,
+        }}
+      >
         <pre
-          className="m-0 whitespace-pre font-mono text-[#d4d4d8]"
+          className="m-0 whitespace-pre font-mono"
           style={{
             fontFamily: CODE_FONT_FAMILY,
             fontSize: `${baseFontSize}px`,
             lineHeight: `${Math.max(22, Math.round(baseFontSize * 1.7))}px`,
+            color: codeSurfaceTone.text,
           }}
         >
           {codeStr}
@@ -265,7 +290,13 @@ function CodeBlock({ inline, className, children, baseFontSize = 13, ...rest }: 
 
   return (
     <>
-      <div className="my-4 overflow-hidden rounded-2xl border border-[#1f1f23] bg-[#09090b] shadow-[0_12px_40px_rgba(0,0,0,0.22)]">
+      <div
+        className="my-4 overflow-hidden rounded-2xl border"
+        style={{
+          borderColor: codeSurfaceTone.border,
+          backgroundColor: codeSurfaceTone.background,
+        }}
+      >
         <div className="flex items-center justify-between border-b border-[#1f1f23] px-4 py-2" style={{ background: tone.headerBackground }}>
           <div className="flex min-w-0 items-center gap-2">
             <span
@@ -305,13 +336,14 @@ function CodeBlock({ inline, className, children, baseFontSize = 13, ...rest }: 
         ) : (
           <SyntaxHighlighter
             {...rest}
-            style={vscDarkPlus}
+            style={syntaxTheme}
             language={resolvedLang}
             PreTag="div"
             customStyle={{
               margin: 0,
               padding: "1rem",
-              background: "var(--surface-2, #232327)",
+              background: "transparent",
+              color: codeSurfaceTone.text,
               fontFamily: CODE_FONT_FAMILY,
               fontSize: `${baseFontSize}px`,
               lineHeight: 1.7,

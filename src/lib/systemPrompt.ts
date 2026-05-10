@@ -162,6 +162,7 @@ export function buildSystemPrompt(
     "[LOCALIZED USER OUTPUT]",
     "All user-visible explanations, summaries, plans, task titles, and approval text must follow this turn's resolved target language.",
     `If the resolved language is unclear, use the UI fallback language: ${fallbackLanguageName}.`,
+    "Any user-visible pre-tool narration must also use the resolved target language. If unsure, emit the tool call directly instead of filler prose in another language.",
     "Keep protocol labels, code identifiers, file names, and machine-readable markers unchanged when needed.",
   ].join("\n"));
 
@@ -208,7 +209,7 @@ export function buildSystemPrompt(
       ? "4. 执行验证 — 命令工具在本轮可用时，一次性命令优先用 `run_command` 获取 stdout/stderr/exitCode；交互式或长驻命令用 `execute_command` 后必须跟随 `read_pty_since`、`read_pty_tail` 或 `get_pty_status` 验证结果。"
       : "4. 执行验证 — 本轮未暴露命令工具时，不要尝试 shell 执行；需要验证时先记录为计划、检查项或后续执行步骤。",
     "5. 流程优先级 — 若下方启用了特定 Workflow Skills（工作流协议），必须优先且严格遵守该协议规则。",
-    `6. 语言跟随 — 所有对用户可见的正文、总结、Plan 文档（.MAIN/plans/*.md）、任务标题、审批说明，必须优先使用**本轮已解析的目标语言（resolved turn language）**。如果目标语言不明确，则默认使用界面语言：${fallbackLanguageName}。文件名、固定协议标记（如 \`[PROPOSAL START]\`、\`# Proposed Plan\`）和代码标识符可以保留英文，但解释性正文必须跟随目标语言。`,
+    `6. 语言跟随 — 所有对用户可见的正文、总结、Plan 文档（.MAIN/plans/*.md）、任务标题、审批说明，必须优先使用**本轮已解析的目标语言（resolved turn language）**。如果目标语言不明确，则默认使用界面语言：${fallbackLanguageName}。工具调用前若需要输出可见说明，也必须使用目标语言；若不确定语言，宁可直接发工具调用，不要输出其他语言的过程句。文件名、固定协议标记（如 \`[PROPOSAL START]\`、\`# Proposed Plan\`）和代码标识符可以保留英文，但解释性正文必须跟随目标语言。`,
     "7. 目标先行 — 在进入规划或执行前，先判断用户本轮真正想要的是：只要解释、只要方案、先方案后执行、还是直接执行。优先对齐终极目标，而不是机械重复用户字面步骤。",
     "8. 模板优先 — 若下方提供了工作区模板（尤其是意图分析模板与 Plan 模板），优先沿用其章节顺序与检查清单，再填入当前任务的真实内容；不要原样保留占位提示。",
     "",
@@ -437,7 +438,7 @@ export function buildSystemPrompt(
     tfl.push("<tool>工具名称</tool>");
     tfl.push(String.raw`<parameter name="参数名">参数值</parameter>`);
     tfl.push("</tool_use>");
-    tfl.push("禁止输出 `[Tool call: ...]`、`Tool call: read_file`、`我要调用工具` 这类占位文本；这些不是可执行工具调用，会被视为协议错误。需要工具时必须输出完整 `<tool_use>`，并补齐必填参数。");
+    tfl.push("禁止输出 `[Tool call: ...]`、`Tool call: read_file`、`<tool_code>...</tool_code>`、`我要调用工具` 这类占位文本；这些不是可执行工具调用，会被视为协议错误。需要工具时必须输出完整 `<tool_use>`，并补齐必填参数。");
     tfl.push("");
     tfl.push("⚠️ `<analysis>` 中的内容默认对用户隐藏，且即使用户开启过程显示也只会以过滤摘要呈现；你的分析、总结、方案必须以普通 Markdown 文本输出，不能放在 `<analysis>` 内。");
     tfl.push("");

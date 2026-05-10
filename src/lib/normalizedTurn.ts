@@ -401,6 +401,9 @@ export function normalizeAssistantTurn(result: StreamResult): NormalizedStreamSt
   const toolCalls = rawToolCalls.filter((call) => !isUserOptionsToolName(call.name));
   const parsedOptions = extractReplyOptions(parsed.cleanText || "");
   const replyOptions = mergeReplyOptions(initialOptions.replyOptions, parsedOptions.replyOptions, protocolToolOptions);
+  const hasExplicitUserChoiceRequest =
+    initialOptions.hasExplicitUserOptionsTag ||
+    rawToolCalls.some((call) => isUserOptionsToolName(call.name));
   const textWithoutOptions = parsedOptions.cleanText;
   const preSanitizedVisible = collapseRepeatedParagraphLoops(sanitizeAIOutput(textWithoutOptions))
     .replace(/\n{3,}/g, "\n\n")
@@ -417,6 +420,7 @@ export function normalizeAssistantTurn(result: StreamResult): NormalizedStreamSt
     visibleText,
     hiddenThought,
     replyOptions,
+    hasExplicitUserChoiceRequest,
     toolCalls,
     finishReason: result.finishReason,
   };

@@ -637,8 +637,16 @@ function inferShellAction(input: string): string {
   return "run";
 }
 
+const UNITY_CONSOLE_DIAGNOSTIC_RE = /console|报错|错误|warning|警告|compile|编译|编译失败|编译错误/i;
+const UNITY_CONSOLE_NEGATION_RE = /(?:没有|无|未见|不是|并非|不\s*是|not|no|without).{0,12}(?:console|报错|错误|warning|警告|compile|编译|编译失败|编译错误)|(?:console|报错|错误|warning|警告|compile|编译|编译失败|编译错误).{0,12}(?:没有|无|未见|不是|并非|not|no|without)/i;
+
+export function hasExplicitUnityConsoleDiagnosticCue(input: string): boolean {
+  const normalized = normalizeInput(input);
+  return UNITY_CONSOLE_DIAGNOSTIC_RE.test(normalized) && !UNITY_CONSOLE_NEGATION_RE.test(normalized);
+}
+
 function inferUnityAction(input: string): string {
-  if (/console|报错|错误|warning|警告|compile|编译|编译失败|编译错误/i.test(input)) return "console_diagnostics";
+  if (hasExplicitUnityConsoleDiagnosticCue(input)) return "console_diagnostics";
   if (/roslyn|c#|\.cs\b|代码|脚本/i.test(input)) return "code";
   if (/引用|reference|yaml|prefab|预制体|scene|场景|asset|资源/i.test(input)) return "asset_context";
   if (/execute|执行|editor|编辑器/i.test(input)) return "editor_execute";
@@ -805,10 +813,18 @@ function finalizeRunIntentResolution(
 
 export function getMainIntentShortcuts(
   language: "zh" | "en" = "zh",
-  options: { includeHidden?: boolean } = {},
+  options: { includeHidden?: boolean; mainModeKey?: MainModeKey } = {},
 ): MainIntentShortcutItem[] {
   const shortcuts = language === "en" ? MAIN_INTENT_SHORTCUTS_EN : MAIN_INTENT_SHORTCUTS_ZH;
-  return options.includeHidden ? shortcuts : shortcuts.filter((item) => item.visibleInMenu);
+  const visibleShortcuts = options.includeHidden ? shortcuts : shortcuts.filter((item) => item.visibleInMenu);
+  const mainModeKey = options.mainModeKey;
+  if (!mainModeKey) return visibleShortcuts;
+  return visibleShortcuts.filter((item) => isMainIntentShortcutAllowedInMainMode(item.intent, mainModeKey));
+}
+
+export function isMainIntentShortcutAllowedInMainMode(intent: MainIntentShortcut, mainModeKey: MainModeKey): boolean {
+  if (mainModeKey === "game_studio") return intent === "plan";
+  return true;
 }
 
 export function getIntentPolicy(intent: ResolvedUserIntent): RunIntentPolicy {
@@ -846,6 +862,15 @@ export function parseMainIntentShortcut(input: string): { intent: MainIntentShor
     }
   }
   return null;
+}
+
+export function parseMainIntentShortcutForMode(
+  input: string,
+  mainModeKey: MainModeKey,
+): { intent: MainIntentShortcut; command: string; rest: string } | null {
+  const parsed = parseMainIntentShortcut(input);
+  if (!parsed) return null;
+  return isMainIntentShortcutAllowedInMainMode(parsed.intent, mainModeKey) ? parsed : null;
 }
 
 export function parseMainDebugShortcut(input: string): MainDebugShortcut | null {
@@ -980,11 +1005,11 @@ export function resolveComposerIntentSuggestion(params: {
   const language = params.language === "en" ? "en" : "zh";
   const normalizedInput = params.input.trim();
   if (!normalizedInput) return null;
-  if (params.mainModeKey !== "main_mode") return null;
+  if (params.mainModeKey !== "main_mode" && params.mainModeKey !== "game_studio") return null;
   if (params.lockedComposerIntent) return null;
   if (params.dismissedSuggestedIntentKey === normalizedInput) return null;
 
-  const shortcut = parseMainIntentShortcut(normalizedInput);
+  const shortcut = parseMainIntentShortcutForMode(normalizedInput, params.mainModeKey);
   if (shortcut) {
     const rest = shortcut.rest.trim();
     if (!rest) return null;
@@ -1002,6 +1027,7 @@ export function resolveComposerIntentSuggestion(params: {
       !resolution.needsDecision &&
       resolution.confidence >= 0.9 &&
       isComposerSuggestibleIntent(resolution.intent) &&
+      isMainIntentShortcutAllowedInMainMode(resolution.intent, params.mainModeKey) &&
       resolution.intent !== shortcut.intent
     ) {
       return {
@@ -1027,7 +1053,8 @@ export function resolveComposerIntentSuggestion(params: {
   if (
     !resolution.needsDecision &&
     resolution.confidence >= 0.9 &&
-    isComposerSuggestibleIntent(resolution.intent)
+    isComposerSuggestibleIntent(resolution.intent) &&
+    isMainIntentShortcutAllowedInMainMode(resolution.intent, params.mainModeKey)
   ) {
     return {
       kind: "suggestion",

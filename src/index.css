@@ -129,6 +129,104 @@ body,
   outline-offset: -1px;
 }
 
+/* ── TopIsland 选项：跟随当前主题高亮色 ────────────────────── */
+.top-island-choice-number {
+  color: var(--accent-light, #a855f7);
+}
+
+.group:hover .top-island-choice-number {
+  color: var(--accent, #9333ea);
+}
+
+.top-island-choice-option {
+  border-color: var(--accent-subtle-border, rgba(147, 51, 234, 0.3));
+  background-color: var(--accent-subtle, rgba(147, 51, 234, 0.15));
+  color: var(--accent-light, #a855f7);
+}
+
+.top-island-choice-option:hover {
+  border-color: var(--accent, #9333ea);
+  background-color: color-mix(in srgb, var(--accent, #9333ea) 22%, transparent);
+  color: #ffffff;
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent-light, #a855f7) 45%, transparent);
+}
+
+.top-island-approval-option {
+  border-color: color-mix(in srgb, var(--accent, #9333ea) 28%, transparent);
+  background-color: color-mix(in srgb, var(--accent, #9333ea) 8%, transparent);
+  color: color-mix(in srgb, var(--accent-light, #a855f7) 70%, #d4d4d8 30%);
+}
+
+.top-island-approval-option:hover {
+  border-color: var(--accent, #9333ea);
+  background-color: color-mix(in srgb, var(--accent, #9333ea) 16%, transparent);
+  color: #ffffff;
+}
+
+.top-island-choice-input {
+  border-color: var(--accent-subtle-border, rgba(147, 51, 234, 0.3));
+  background-color: color-mix(in srgb, var(--accent, #9333ea) 10%, transparent);
+  color: var(--surface-text-strong, #f5f5f5);
+}
+
+.top-island-choice-input::placeholder {
+  color: var(--surface-text-subtle, #74747e);
+  opacity: 1;
+}
+
+.top-island-choice-input:hover {
+  border-color: var(--accent, #9333ea);
+  background-color: color-mix(in srgb, var(--accent, #9333ea) 15%, transparent);
+}
+
+.top-island-choice-input:focus {
+  border-color: var(--accent, #9333ea);
+  outline: none;
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent-light, #a855f7) 48%, transparent);
+}
+
+html[data-theme="light"] .top-island-choice-number {
+  color: color-mix(in srgb, var(--accent-hover, #7e22ce), #111827 28%);
+}
+
+html[data-theme="light"] .group:hover .top-island-choice-number {
+  color: color-mix(in srgb, var(--accent-hover, #7e22ce), #111827 14%);
+}
+
+html[data-theme="light"] .top-island-choice-option {
+  color: color-mix(in srgb, var(--accent-hover, #7e22ce), #111827 24%);
+  background-color: color-mix(in srgb, var(--accent, #9333ea) 12%, #ffffff 88%);
+  border-color: color-mix(in srgb, var(--accent, #9333ea) 30%, #ffffff 70%);
+}
+
+html[data-theme="light"] .top-island-choice-option:hover {
+  color: color-mix(in srgb, var(--accent-hover, #7e22ce), #111827 12%);
+  background-color: color-mix(in srgb, var(--accent, #9333ea) 20%, #ffffff 80%);
+  border-color: color-mix(in srgb, var(--accent-hover, #7e22ce) 70%, #ffffff 30%);
+}
+
+html[data-theme="light"] .top-island-approval-option {
+  color: color-mix(in srgb, var(--accent-hover, #7e22ce), #334155 42%);
+  background-color: color-mix(in srgb, var(--accent, #9333ea) 7%, #ffffff 93%);
+  border-color: color-mix(in srgb, var(--accent, #9333ea) 20%, #cbd5e1 80%);
+}
+
+html[data-theme="light"] .top-island-approval-option:hover {
+  color: color-mix(in srgb, var(--accent-hover, #7e22ce), #111827 16%);
+  background-color: color-mix(in srgb, var(--accent, #9333ea) 14%, #ffffff 86%);
+  border-color: color-mix(in srgb, var(--accent-hover, #7e22ce) 66%, #ffffff 34%);
+}
+
+html[data-theme="light"] .top-island-choice-input {
+  color: #111827;
+  background-color: color-mix(in srgb, var(--accent, #9333ea) 8%, #ffffff 92%);
+  border-color: color-mix(in srgb, var(--accent, #9333ea) 24%, #ffffff 76%);
+}
+
+html[data-theme="light"] .top-island-choice-input::placeholder {
+  color: #6b7280;
+}
+
 /* ── 优雅的暗黑模式滚动条 ────────────────────── */
 ::-webkit-scrollbar {
   width: 6px;

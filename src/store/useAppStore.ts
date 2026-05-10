@@ -86,6 +86,7 @@ import {
   type CloudServerConfig,
 } from "../lib/cloudServers";
 import { buildToolDiffPreview, supportsToolDiffPreview } from "../lib/toolDiff";
+import { findToolLifecycleBlockIndex, type ToolLifecycleMeta } from "../lib/toolLifecycle";
 import { buildPlanApprovalChoiceHint, normalizePlanApprovalChoice } from "../lib/planControl";
 import {
   PLAN_MAX_AUTO_RESUME_LIMIT,
@@ -148,7 +149,8 @@ import {
   resolveRunIntentFromLegacyWorkflowMode,
   resolveTurnRunIntent,
   parseMainDebugShortcut,
-  parseMainIntentShortcut,
+  parseMainIntentShortcutForMode,
+  isMainIntentShortcutAllowedInMainMode,
   shouldContinuePreviousTurnFromInput,
   shouldUseBlockingIntentPreflight,
   type ExecutionConsentPolicy,
@@ -783,7 +785,7 @@ export interface DiffRevertResult {
 
 export type TaskBlock =
   | (TaskBlockBase & { type: "user"; content: string; images?: string[] })
-  | (TaskBlockBase & { type: "tool"; toolName: string; target: string; status: string; toolStatus: "pending" | "executed" | "rejected" | "running" | "failed"; message?: string; diff?: ToolDiffSnapshot; revertStatus?: DiffRevertStatus; revertMessage?: string })
+  | (TaskBlockBase & { type: "tool"; toolName: string; target: string; status: string; toolStatus: "pending" | "executed" | "rejected" | "running" | "failed"; toolCallId?: string; message?: string; diff?: ToolDiffSnapshot; revertStatus?: DiffRevertStatus; revertMessage?: string })
   | (TaskBlockBase & { type: "agent"; content: string; options?: ReplyOption[]; streaming?: boolean; hiddenProcess?: boolean; archivedAfterChoice?: boolean; selectedOption?: string })
   | (TaskBlockBase & { type: "thought"; content: string; isStreaming?: boolean; duration?: number })
   | (TaskBlockBase & { type: "jobList"; jobs: JobItem[] })
@@ -1280,6 +1282,7 @@ const defaultNormalizedStreamState: NormalizedStreamState = {
   visibleText: "",
   hiddenThought: "",
   replyOptions: [],
+  hasExplicitUserChoiceRequest: false,
   toolCalls: [],
   finishReason: null,
 };
@@ -2558,6 +2561,7 @@ export function sanitizeTaskBlocksForPersist(blocks: TaskBlock[]): TaskBlock[] {
           toolName: String(b.toolName), target: String(b.target),
           status: String(b.status),
           toolStatus: b.toolStatus,
+          ...(b.toolCallId ? { toolCallId: String(b.toolCallId) } : {}),
           ...(b.message ? { message: String(b.message) } : {}),
           ...(b.diff
             ? {
@@ -4948,12 +4952,18 @@ export const useAppStore = create<AppState>()(
     const hasPlanArtifacts = state.planArtifacts.length > 0 || state.planStage !== "idle";
     const shouldContinuePlanIntent =
       !isHidden &&
-      currentMainModeKey === "main_mode" &&
       currentTurnIntent === "plan" &&
       isContinuationPrompt(text) &&
       (state.planStage !== "completed" || state.planArtifacts.length === 0);
+    const shouldAllowPreviousTurnContinuation =
+      !isHidden &&
+      !shouldContinuePlanIntent &&
+      (
+        currentMainModeKey === "main_mode" ||
+        (currentMainModeKey === "game_studio" && (currentTurnIntent === "plan" || hasPlanArtifacts))
+      );
     const previousTurnContinuationTarget =
-      !isHidden && currentMainModeKey === "main_mode" && !shouldContinuePlanIntent
+      shouldAllowPreviousTurnContinuation
         ? findPreviousTurnContinuationTarget(text, currentTurn, state.conversationTurns, state.taskFlow)
         : null;
     const shouldContinuePreviousTurnIntent = !!previousTurnContinuationTarget;
@@ -4969,7 +4979,7 @@ export const useAppStore = create<AppState>()(
       ? previousTurnContinuationTarget?.id ?? null
       : state.currentTurnId;
     const reuseCurrentTurn =
-      (options?.reuseCurrentTurn === true || shouldAutoResumeChoiceTurn || shouldContinuePreviousTurnIntent) &&
+      (options?.reuseCurrentTurn === true || shouldAutoResumeChoiceTurn || shouldContinuePlanIntent || shouldContinuePreviousTurnIntent) &&
       !!reusableTurnId;
     const shouldReuseExistingTurnIntent =
       reuseCurrentTurn &&
@@ -5028,14 +5038,18 @@ export const useAppStore = create<AppState>()(
     if (mainDebugShortcut) {
       text = buildMainDebugPrompt(mainDebugShortcut.rest);
     }
-    const mainIntentShortcut = !isHidden && currentMainModeKey === "main_mode" && !mainDebugShortcut
-      ? parseMainIntentShortcut(text)
+    const mainIntentShortcut = !isHidden && !mainDebugShortcut
+      ? parseMainIntentShortcutForMode(text, currentMainModeKey)
       : null;
     if (mainIntentShortcut) {
       text = mainIntentShortcut.rest.trimStart();
     }
-    const lockedComposerIntent = !isHidden && currentMainModeKey === "main_mode" && !mainDebugShortcut
-      ? state.lockedComposerIntent || mainIntentShortcut?.intent || null
+    const modeScopedLockedComposerIntent =
+      state.lockedComposerIntent && isMainIntentShortcutAllowedInMainMode(state.lockedComposerIntent, currentMainModeKey)
+        ? state.lockedComposerIntent
+        : null;
+    const lockedComposerIntent = !isHidden && !mainDebugShortcut
+      ? modeScopedLockedComposerIntent || mainIntentShortcut?.intent || null
       : null;
     const cachedWorkspaceTreeForGameDetection =
       state.currentWorkspace &&
@@ -5468,7 +5482,7 @@ export const useAppStore = create<AppState>()(
             (hasComparableLatestInput && latestInput !== text.trim()) ||
             latestState.selectedMainModeKey !== currentMainModeKey ||
             !!latestState.lockedComposerIntent ||
-            !!parseMainIntentShortcut(latestInput) ||
+            !!parseMainIntentShortcutForMode(latestInput, latestState.selectedMainModeKey) ||
             !!parseMainDebugShortcut(latestInput);
           if (stalePreflight) {
             logStoreEvent("intent_preflight_stale_discarded", {
@@ -5476,7 +5490,9 @@ export const useAppStore = create<AppState>()(
               latestChars: latestInput.length,
               selectedMainModeKey: latestState.selectedMainModeKey,
               hasLockedComposerIntent: !!latestState.lockedComposerIntent,
-              hasExplicitShortcut: !!parseMainIntentShortcut(latestInput) || !!parseMainDebugShortcut(latestInput),
+              hasExplicitShortcut:
+                !!parseMainIntentShortcutForMode(latestInput, latestState.selectedMainModeKey) ||
+                !!parseMainDebugShortcut(latestInput),
             });
             return;
           }
@@ -5555,7 +5571,7 @@ export const useAppStore = create<AppState>()(
     const effectiveIntentPolicy = getIntentPolicy(effectiveRunIntent);
     const effectiveWorkflowMode = effectiveIntentPolicy.workflowMode;
     const runtimeRunIntent = options?.runtimeIntentOverride ||
-      (shouldExecuteOnceFromReplyOption
+      (shouldExecuteOnceFromReplyOption && effectiveRunIntent !== "plan"
         ? currentMainModeKey === "game_studio" ? "studio_workflow" : "execute"
         : effectiveRunIntent);
     const shouldGrantExecutionConsentForTurn =
@@ -5885,6 +5901,17 @@ export const useAppStore = create<AppState>()(
       : null;
     const shouldSeedSessionTitleForTurn = shouldSeedSessionTitle(activeSession);
     const seededSessionTitleCandidate = shouldSeedSessionTitleForTurn ? turnTitle : "";
+    const autoCollapsePreviousTurnForNewTurn = (turns: ConversationTurn[]): ConversationTurn[] => {
+      // Auto-collapse only the immediate previous turn when the user starts a brand-new visible turn.
+      // This runs once per new-turn creation and never touches older turns.
+      if (isHidden || reuseCurrentTurn || turns.length === 0) return turns;
+      const previousTurnIndex = turns.length - 1;
+      const previousTurn = turns[previousTurnIndex];
+      if (!previousTurn || previousTurn.collapsed) return turns;
+      return turns.map((turn, index) =>
+        index === previousTurnIndex ? { ...turn, collapsed: true } : turn,
+      );
+    };
     const appendLocalStudioTurn = async (systemContent: string) => {
       const userBlock = isHidden
         ? null
@@ -5918,7 +5945,7 @@ export const useAppStore = create<AppState>()(
                 : turn,
             )
           : [
-              ...s.conversationTurns,
+              ...autoCollapsePreviousTurnForNewTurn(s.conversationTurns),
               {
                 id: turnId,
                 userPrompt: text,
@@ -6068,7 +6095,7 @@ export const useAppStore = create<AppState>()(
                       : turn
                   )
                 : [
-                    ...s.conversationTurns,
+                    ...autoCollapsePreviousTurnForNewTurn(s.conversationTurns),
                     {
                       id: turnId,
                       userPrompt: text,
@@ -6114,15 +6141,15 @@ export const useAppStore = create<AppState>()(
                     mode: effectiveWorkflowMode,
                   }
 	                : turn
-	            ),
-	          }
-	        : {
-	            conversationTurns: [
-	              ...s.conversationTurns,
-	              {
-	                id: turnId,
-	                userPrompt: text,
-	                title: turnTitle,
+		            ),
+		          }
+		        : {
+		            conversationTurns: [
+		              ...autoCollapsePreviousTurnForNewTurn(s.conversationTurns),
+		              {
+		                id: turnId,
+		                userPrompt: text,
+		                title: turnTitle,
 	                intentSummary: effectiveIntentSummary,
 	                commandDirective: effectiveCommandDirective || undefined,
 	                mode: effectiveWorkflowMode,
@@ -7324,27 +7351,26 @@ export const useAppStore = create<AppState>()(
           }));
         },
 
-        onToolExecuting: (toolName, target, diffPreview) => {
+        onToolExecuting: (toolName, target, diffPreview, meta?: ToolLifecycleMeta) => {
           let runningTaskId: number | null = null;
           let shouldAttachDiff = false;
+          const normalizedToolCallId = String(meta?.toolCallId || "").trim() || undefined;
           const isEphemeralPlanArtifactTool =
             (toolName === "write_file" || toolName === "replace_in_file") &&
             isEphemeralPlanArtifactPath(target);
 
           sessionSet((s) => {
-            const pendingIdx = [...s.taskFlow]
-              .map((task, index) => ({ task, index }))
-              .reverse()
-              .find(({ task }) =>
-                task.turnId === turnId &&
-                task.type === "tool" &&
-                task.toolName === toolName &&
-                task.target === target &&
-                (task.toolStatus === "pending" || task.toolStatus === "running")
-              )?.index;
+            const pendingIdx = findToolLifecycleBlockIndex({
+              taskFlow: s.taskFlow,
+              turnId,
+              toolName,
+              target,
+              allowedStatuses: ["pending", "running"],
+              meta,
+            });
             const nextFlow = [...s.taskFlow];
             let appendedBlockId: number | null = null;
-            if (pendingIdx != null && pendingIdx >= 0) {
+            if (pendingIdx >= 0) {
               const pendingTask = nextFlow[pendingIdx];
               if (pendingTask?.type === "tool") {
                 runningTaskId = pendingTask.id;
@@ -7353,6 +7379,7 @@ export const useAppStore = create<AppState>()(
                   ...pendingTask,
                   toolStatus: "running",
                   status: "running",
+                  ...(normalizedToolCallId ? { toolCallId: normalizedToolCallId } : {}),
                   message: "Executing...",
                 };
               }
@@ -7368,6 +7395,7 @@ export const useAppStore = create<AppState>()(
                 target,
                 status: "running",
                 toolStatus: "running",
+                ...(normalizedToolCallId ? { toolCallId: normalizedToolCallId } : {}),
                 message: "Executing...",
               });
             }
@@ -7404,19 +7432,19 @@ export const useAppStore = create<AppState>()(
           }
         },
 
-        onToolDone: (toolName, target, result) => {
+        onToolDone: (toolName, target, result, meta?: ToolLifecycleMeta) => {
           const isEphemeralPlanArtifactTool =
             (toolName === "write_file" || toolName === "replace_in_file") &&
             isEphemeralPlanArtifactPath(target);
           sessionSet((s) => {
-            let idx = -1;
-            for (let i = s.taskFlow.length - 1; i >= 0; i--) {
-              const t = s.taskFlow[i];
-              if (t.type === "tool" && t.toolName === toolName && t.target === target && t.toolStatus === "running") {
-                idx = i;
-                break;
-              }
-            }
+            const idx = findToolLifecycleBlockIndex({
+              taskFlow: s.taskFlow,
+              turnId,
+              toolName,
+              target,
+              allowedStatuses: ["running"],
+              meta,
+            });
             if (idx === -1) return {};
             const updated = [...s.taskFlow];
             const previousBlock = updated[idx];
@@ -7435,6 +7463,7 @@ export const useAppStore = create<AppState>()(
               ...updated[idx],
               toolStatus: "executed" as const,
               status: "done" as const,
+              ...(meta?.toolCallId ? { toolCallId: String(meta.toolCallId) } : {}),
               message: noOpWrite
                 ? "No file change: requested content matched the current file, so this did not advance plan evidence."
                 : result.length > 500 ? result.slice(0, 500) + "..." : result,
@@ -7485,19 +7514,25 @@ export const useAppStore = create<AppState>()(
           }
         },
 
-        onToolError: (toolName, target, error) => {
+        onToolError: (toolName, target, error, meta?: ToolLifecycleMeta) => {
           sessionSet((s) => {
-            let idx = -1;
-            for (let i = s.taskFlow.length - 1; i >= 0; i--) {
-              const t = s.taskFlow[i];
-              if (t.type === "tool" && t.toolName === toolName && t.target === target && t.toolStatus === "running") {
-                idx = i;
-                break;
-              }
-            }
+            const idx = findToolLifecycleBlockIndex({
+              taskFlow: s.taskFlow,
+              turnId,
+              toolName,
+              target,
+              allowedStatuses: ["running"],
+              meta,
+            });
             if (idx === -1) return {};
             const updated = [...s.taskFlow];
-            updated[idx] = { ...updated[idx], toolStatus: "failed" as const, status: "error" as const, message: error } as TaskBlock;
+            updated[idx] = {
+              ...updated[idx],
+              toolStatus: "failed" as const,
+              status: "error" as const,
+              ...(meta?.toolCallId ? { toolCallId: String(meta.toolCallId) } : {}),
+              message: error,
+            } as TaskBlock;
             return { taskFlow: updated };
           });
           emitLocalPlanExecutionProgress("tool_error", {
@@ -7523,14 +7558,19 @@ export const useAppStore = create<AppState>()(
             agentMessages: sessionGet().agentMessages.length,
             elapsedMs: Math.round(nowMs() - sendStartedAt),
           });
-          const finalizeStaleRunningTools = (finalStatus: "executed" | "failed", message: string) => {
+          const finalizeStaleRunningTools = (finalStatus: "executed" | "failed" | "rejected", message: string) => {
             sessionSet((s) => ({
               taskFlow: s.taskFlow.map((task) =>
                 task.turnId === turnId && task.type === "tool" && task.toolStatus === "running"
                   ? {
                       ...task,
                       toolStatus: finalStatus,
-                      status: finalStatus === "executed" ? "done" : "error",
+                      status:
+                        finalStatus === "executed"
+                          ? "done"
+                          : finalStatus === "rejected"
+                          ? "stopped_no_action"
+                          : "error",
                       message: task.message && task.message !== "Executing..." ? task.message : message,
                     }
                   : task
@@ -7611,9 +7651,14 @@ export const useAppStore = create<AppState>()(
           if (status === "idle" || status === "error") {
             clearNoFirstTokenNoticeTimer();
             finalizeStreamingUi();
+            const abortedByUser = abortCtrl.signal.aborted;
             finalizeStaleRunningTools(
-              "failed",
-              status === "idle" ? "请求已停止或未返回工具结果" : "请求已停止",
+              abortedByUser ? "rejected" : "failed",
+              abortedByUser
+                ? "请求已停止，当前步骤未执行完成"
+                : status === "idle"
+                ? "请求已停止或未返回工具结果"
+                : "请求已停止",
             );
             if (remoteFeishu) {
               const language = sessionGet().config.language === "en" ? "en" : "zh";

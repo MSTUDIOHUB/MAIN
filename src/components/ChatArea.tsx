@@ -39,6 +39,7 @@ import {
 } from "../lib/workflowModels";
 import { getIntentPolicy, resolveConversationTurnIntent } from "../lib/runIntent";
 import { summarizePlanExecutionProgressSnapshot } from "../lib/planExecutionRecovery";
+import { buildCompletedToolGroupRanges, countCompletedToolCalls } from "../lib/toolUiGrouping";
 
 const TURN_STATUS_LABELS: Record<string, string> = {
   planning: "Planning",
@@ -596,6 +597,18 @@ const READ_CONTEXT_TOOL_LABELS: Record<string, { zh: string; en: string }> = {
   index_workspace_documents: { zh: "索引文档", en: "Index documents" },
 };
 
+const COMPLETED_TOOL_GROUP_LABELS: Record<string, { zh: string; en: string }> = {
+  find_gameobjects: { zh: "查找对象", en: "Find objects" },
+  find_in_file: { zh: "文件搜索", en: "Search file" },
+  execute_code: { zh: "执行代码", en: "Execute code" },
+  script_apply_edits: { zh: "脚本编辑", en: "Script edits" },
+  manage_camera: { zh: "相机管理", en: "Manage camera" },
+  manage_gameobject: { zh: "对象管理", en: "Manage object" },
+  manage_components: { zh: "组件管理", en: "Manage components" },
+  manage_scene: { zh: "场景管理", en: "Manage scene" },
+  refresh_unity: { zh: "刷新 Unity", en: "Refresh Unity" },
+};
+
 function isCompletedReadContextTool(block: any) {
   return (
     block?.type === "tool" &&
@@ -645,15 +658,36 @@ function getReadContextToolLabel(toolName: string, language: "zh" | "en") {
   return labels[language === "zh" ? "zh" : "en"];
 }
 
-function buildBlockRenderItems(blocks: any[], includeUser = true) {
+function buildBlockRenderItems(blocks: any[], includeUser = true, enableCompletedToolGrouping = false) {
   const items: Array<
     | { kind: "block"; block: any; index: number }
     | { kind: "readContextGroup"; blocks: any[]; index: number }
+    | { kind: "completedToolGroup"; blocks: any[]; index: number }
   > = [];
   let activeReadContextGroup: { kind: "readContextGroup"; blocks: any[]; index: number } | null = null;
+  const completedToolGroupRangesByStart = new Map(
+    enableCompletedToolGrouping
+      ? buildCompletedToolGroupRanges({
+          blocks,
+          excludedToolNames: READ_CONTEXT_TOOL_NAMES,
+        }).map((range) => [range.startIndex, range])
+      : [],
+  );
 
   for (let index = 0; index < blocks.length; index += 1) {
     const block = blocks[index];
+    const completedToolGroupRange = completedToolGroupRangesByStart.get(index);
+    if (completedToolGroupRange) {
+      activeReadContextGroup = null;
+      items.push({
+        kind: "completedToolGroup",
+        blocks: blocks.slice(completedToolGroupRange.startIndex, completedToolGroupRange.endIndex + 1),
+        index,
+      });
+      index = completedToolGroupRange.endIndex;
+      continue;
+    }
+
     if (isCompletedReadContextTool(block)) {
       if (!activeReadContextGroup) {
         activeReadContextGroup = { kind: "readContextGroup", blocks: [block], index };
@@ -718,6 +752,7 @@ function buildToolExecutionSummary(blocks: any[], language: "zh" | "en") {
 }
 
 function getActiveTurnActivity(blocks: any[], turnStatus: string, language: "zh" | "en") {
+  const completedToolCallCount = countCompletedToolCalls(blocks);
   const runningTool = [...blocks].reverse().find((block) => block.type === "tool" && block.toolStatus === "running");
   if (runningTool) {
     const target = String(runningTool.target || runningTool.toolName || "").split("/").pop() || runningTool.toolName;
@@ -725,16 +760,19 @@ function getActiveTurnActivity(blocks: any[], turnStatus: string, language: "zh"
     const readTools = new Set(["read_file", "read_document", "list_directory", "glob_search", "grep_search", "index_workspace_documents", "get_project_skeleton"]);
     const commandTools = new Set(["execute_command", "run_command", "send_pty_input"]);
     const toolName = String(runningTool.toolName || "");
+    const prefix = language === "zh"
+      ? completedToolCallCount > 0 ? `已完成 ${completedToolCallCount} 次，` : ""
+      : completedToolCallCount > 0 ? `${completedToolCallCount} completed, ` : "";
     if (language === "zh") {
-      if (tableTools.has(toolName)) return `正在分析表格：${target}`;
-      if (readTools.has(toolName)) return `正在读取资料：${target}`;
-      if (commandTools.has(toolName)) return `正在执行命令：${target}`;
-      return `正在调用工具：${target}`;
+      if (tableTools.has(toolName)) return `${prefix}当前分析表格：${target}`;
+      if (readTools.has(toolName)) return `${prefix}当前读取资料：${target}`;
+      if (commandTools.has(toolName)) return `${prefix}当前执行命令：${target}`;
+      return `${prefix}当前调用工具：${target}`;
     }
-    if (tableTools.has(toolName)) return `Analyzing table: ${target}`;
-    if (readTools.has(toolName)) return `Reading context: ${target}`;
-    if (commandTools.has(toolName)) return `Running command: ${target}`;
-    return `Using tool: ${target}`;
+    if (tableTools.has(toolName)) return `${prefix}analyzing table: ${target}`;
+    if (readTools.has(toolName)) return `${prefix}reading context: ${target}`;
+    if (commandTools.has(toolName)) return `${prefix}running command: ${target}`;
+    return `${prefix}using tool: ${target}`;
   }
 
   const streamingThought = [...blocks].reverse().find((block) => block.type === "thought" && block.isStreaming);
@@ -752,7 +790,14 @@ function getActiveTurnActivity(blocks: any[], turnStatus: string, language: "zh"
   if (hasStreamingAgent) return language === "zh" ? "正在生成回复..." : "Writing the response...";
 
   if (turnStatus === "planning") return language === "zh" ? "正在整理计划..." : "Building the plan...";
-  if (turnStatus === "executing") return language === "zh" ? "正在处理任务，可能暂时没有文字输出..." : "Working on the task; output may pause briefly...";
+  if (turnStatus === "executing") {
+    if (completedToolCallCount > 0) {
+      return language === "zh"
+        ? `已完成 ${completedToolCallCount} 次，正在等待模型规划下一步...`
+        : `${completedToolCallCount} completed, waiting for the model to plan the next step...`;
+    }
+    return language === "zh" ? "正在等待模型规划下一步..." : "Waiting for the model to plan the next step...";
+  }
   return "";
 }
 
@@ -934,6 +979,101 @@ function ReadContextGroupCard({
               <div
                 key={block.id}
                 data-testid="read-context-item"
+                className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2 rounded-lg px-2 py-1.5 text-[11px] text-[#a1a1aa]"
+              >
+                <IconCheck className="h-3 w-3 text-[#10b981]" />
+                <div className="min-w-0">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <span className="shrink-0 text-[#71717a]">{label}</span>
+                    <span className="min-w-0 truncate font-mono text-[#d4d4d8]" title={target}>
+                      {displayTarget}
+                    </span>
+                  </div>
+                  {target !== displayTarget && (
+                    <div className="truncate font-mono text-[10px] text-[#52525b]" title={target}>
+                      {target}
+                    </div>
+                  )}
+                </div>
+                <span className="shrink-0 rounded-full border border-[rgba(52,211,153,0.18)] bg-[rgba(52,211,153,0.08)] px-1.5 py-0.5 text-[9px] text-[#86efac]">
+                  {language === "zh" ? "完成" : "Done"}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function getCompletedToolGroupToolLabel(toolName: string, language: "zh" | "en") {
+  const labels = COMPLETED_TOOL_GROUP_LABELS[toolName];
+  if (labels) return labels[language === "zh" ? "zh" : "en"];
+  return toolName.replace(/_/g, " ");
+}
+
+function CompletedToolGroupCard({
+  blocks,
+  language,
+}: {
+  blocks: any[];
+  language: "zh" | "en";
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const previewNames = blocks
+    .slice(0, 3)
+    .map((block) => compactToolTarget(block.target, String(block.toolName || ""), language))
+    .filter(Boolean);
+  const hiddenCount = Math.max(0, blocks.length - previewNames.length);
+  const title = language === "zh"
+    ? `已完成 ${blocks.length} 次工具调用`
+    : `${blocks.length} completed tool call${blocks.length > 1 ? "s" : ""}`;
+  const toggleText = expanded
+    ? language === "zh" ? "收起" : "Collapse"
+    : language === "zh" ? "展开" : "Expand";
+
+  return (
+    <div className="ml-9 max-w-[calc(100%-2.25rem)] min-w-0">
+      <button
+        type="button"
+        data-testid="completed-tool-group"
+        aria-expanded={expanded}
+        onClick={() => setExpanded((value) => !value)}
+        className="flex w-full min-w-0 items-center gap-2 rounded-xl border border-[#1f2937] bg-[#07070a] px-3 py-2 text-left transition-colors hover:border-[#374151] hover:bg-[#09090b]"
+      >
+        {expanded ? (
+          <IconChevronDown className="h-3.5 w-3.5 shrink-0 text-[#71717a]" />
+        ) : (
+          <IconChevronRight className="h-3.5 w-3.5 shrink-0 text-[#71717a]" />
+        )}
+        <IconCheck className="h-3.5 w-3.5 shrink-0 text-[#10b981]" />
+        <span className="shrink-0 text-[12px] font-medium text-[#d4d4d8]">{title}</span>
+        {previewNames.length > 0 && (
+          <span className="min-w-0 flex-1 truncate text-[11px] text-[#71717a]">
+            · {previewNames.join(language === "zh" ? "、" : ", ")}{hiddenCount > 0 ? ` +${hiddenCount}` : ""}
+          </span>
+        )}
+        <span className="shrink-0 rounded-full border border-[#27272a] bg-[#050507] px-2 py-0.5 text-[10px] text-[#a1a1aa]">
+          {toggleText}
+        </span>
+      </button>
+
+      {expanded && (
+        <div
+          data-testid="completed-tool-group-details"
+          className="mt-2 space-y-1 rounded-xl border border-[#1f1f23] bg-[#050507] p-2"
+        >
+          {blocks.map((block) => {
+            const toolName = String(block.toolName || "");
+            const label = getCompletedToolGroupToolLabel(toolName, language);
+            const displayTarget = compactToolTarget(block.target, toolName, language);
+            const target = fullToolTarget(block.target, toolName, language);
+
+            return (
+              <div
+                key={block.id}
+                data-testid="completed-tool-group-item"
                 className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2 rounded-lg px-2 py-1.5 text-[11px] text-[#a1a1aa]"
               >
                 <IconCheck className="h-3 w-3 text-[#10b981]" />
@@ -1783,6 +1923,17 @@ export default function ChatArea({
         />
       );
     }
+    if (item.kind === "completedToolGroup") {
+      const firstId = item.blocks[0]?.id ?? item.index;
+      const lastId = item.blocks[item.blocks.length - 1]?.id ?? item.index;
+      return (
+        <CompletedToolGroupCard
+          key={`completed-tool-group-${firstId}-${lastId}`}
+          blocks={item.blocks}
+          language={language}
+        />
+      );
+    }
 
     return renderBlock(item.block, item.index);
   };
@@ -1804,6 +1955,7 @@ export default function ChatArea({
       ? (language === "en" ? turnIntentPolicy.label.en : turnIntentPolicy.label.zh)
       : (language === "zh" ? "任务" : "Task");
     const isPlanTurn = turnIntent === "plan";
+    const enableCompletedToolGrouping = turnIntent === "studio_workflow";
     const turnProgressSnapshot =
       planExecutionProgressSnapshot?.turnId === turn.id
         ? planExecutionProgressSnapshot
@@ -1912,6 +2064,38 @@ export default function ChatArea({
       language === "en" ? 48 : 40,
       displayTitleFallback,
     );
+    const isLightThemeMode = config.themeMode === "light";
+    const isBlackThemeMode = config.themeMode === "black";
+    const turnShellClass = isTurnExpanded
+      ? ""
+      : isLightThemeMode
+      ? "rounded-2xl border border-[#d4d4d8] bg-[#ffffff]"
+      : "rounded-2xl border border-[#1f1f23] bg-[#09090b]";
+    const turnHeaderClass = isTurnExpanded
+      ? isLightThemeMode
+        ? "rounded-xl border border-[#d4d4d8] bg-transparent hover:border-[#cbd5e1] hover:bg-[#f5f5f6]"
+        : "rounded-xl border border-[#1f1f23] bg-transparent hover:border-[#2f2f36] hover:bg-[#070709]/35"
+      : isLightThemeMode
+      ? "rounded-t-2xl border-b border-[#e4e4e7] hover:bg-[color-mix(in_srgb,var(--accent)_16%,#ffffff_84%)]"
+      : "rounded-t-2xl border-b border-[#1f1f23] hover:bg-[color-mix(in_srgb,var(--accent)_18%,transparent)]";
+    const collapsedTurnHeaderStyle = !isTurnExpanded
+      ? isLightThemeMode
+        ? {
+            backgroundColor: "color-mix(in srgb, var(--accent, #7c3aed) 12%, #ffffff 88%)",
+            borderBottomColor: "color-mix(in srgb, var(--accent, #7c3aed) 28%, #e5e7eb 72%)",
+          }
+        : isBlackThemeMode
+        ? {
+            backgroundColor: "color-mix(in srgb, var(--accent, #7c3aed) 14%, #000000 86%)",
+            borderBottomColor: "color-mix(in srgb, var(--accent-light, #a855f7) 30%, #202026 70%)",
+          }
+        : {
+            backgroundColor: "color-mix(in srgb, var(--accent, #7c3aed) 14%, #09090b 86%)",
+            borderBottomColor: "color-mix(in srgb, var(--accent-light, #a855f7) 28%, #27272a 72%)",
+          }
+      : undefined;
+    const turnTitleClass = isLightThemeMode ? "text-[#111827]" : "text-[#f5f5f5]";
+    const turnChevronClass = isLightThemeMode ? "text-[#6b7280]" : "text-[#71717a]";
 
     return (
       <section
@@ -1921,7 +2105,7 @@ export default function ChatArea({
         }}
         className="py-3"
       >
-        <div className={isTurnExpanded ? "" : "rounded-2xl border border-[#1f1f23] bg-[#09090b]"}>
+        <div className={turnShellClass}>
           <div
             role="button"
             tabIndex={0}
@@ -1932,11 +2116,8 @@ export default function ChatArea({
                 toggleConversationTurnCollapsed(turn.id);
               }
             }}
-            className={`flex w-full items-center justify-between gap-4 px-3 py-2 text-left transition-colors ${
-              isTurnExpanded
-                ? "rounded-xl border border-[#1f1f23] bg-transparent hover:border-[#2f2f36] hover:bg-[#070709]/35"
-                : "rounded-t-2xl border-b border-[#1f1f23] hover:bg-[#0d0d11]"
-            }`}
+            className={`flex w-full items-center justify-between gap-4 px-3 py-2 text-left transition-colors ${turnHeaderClass}`}
+            style={collapsedTurnHeaderStyle}
           >
             <div className="min-w-0 flex flex-wrap items-center gap-2">
               {turnIntentLabel && (
@@ -1954,7 +2135,7 @@ export default function ChatArea({
               )}
             </div>
             <div className="ml-auto flex min-w-0 flex-1 items-center justify-end gap-3">
-              <span className="min-w-0 flex-1 break-words text-right text-[13px] font-semibold leading-5 text-[#f5f5f5]">
+              <span className={`min-w-0 flex-1 break-words text-right text-[13px] font-semibold leading-5 ${turnTitleClass}`}>
                 {displayTurnTitle}
               </span>
               <div className="flex flex-wrap items-center gap-2">
@@ -1970,7 +2151,7 @@ export default function ChatArea({
                   </button>
                 )}
               </div>
-              <div className="shrink-0 text-[#71717a]">{isTurnExpanded ? <IconChevronDown className="h-4 w-4" /> : <IconChevronRight className="h-4 w-4" />}</div>
+              <div className={`shrink-0 ${turnChevronClass}`}>{isTurnExpanded ? <IconChevronDown className="h-4 w-4" /> : <IconChevronRight className="h-4 w-4" />}</div>
             </div>
           </div>
           {!isTurnExpanded && (
@@ -2030,7 +2211,7 @@ export default function ChatArea({
                   copy={copy}
                 />
               )}
-              {buildBlockRenderItems(blocks, false).map(renderTurnBlockItem)}
+              {buildBlockRenderItems(blocks, false, enableCompletedToolGrouping).map(renderTurnBlockItem)}
             </>
           )}
           {activeTurnActivity && <TurnActivityNotice text={activeTurnActivity} />}
@@ -2143,6 +2324,7 @@ export default function ChatArea({
           statusToneClass={getTurnStatusTone(topIslandTurnStatusKey || "awaiting_input")}
           language={language}
           themeMode={config.themeMode}
+          chatFontSize={config.chatFontSize ?? 13}
           planTasks={shouldShowPinnedPlanTasks ? planTasks : []}
           planExecutionEvidenceLedger={shouldShowPinnedPlanTasks ? planExecutionEvidenceLedger : []}
           planStage={pinnedPlanTurn ? planStage : "idle"}

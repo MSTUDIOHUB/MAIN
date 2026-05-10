@@ -3075,7 +3075,17 @@ export default function SettingsModal({
                     <label className="block text-[13px] font-bold text-[#e4e4e7]">{copy.displayLanguage}</label>
                   </div>
                   <div className={settingsControlColumnClass}>
-                    <select value={config.language} onChange={(e) => setConfig({ ...config, language: e.target.value })} className={settingsSelectClass}>
+                    <select
+                      value={config.language}
+                      onChange={(e) =>
+                        setConfig({
+                          ...config,
+                          language: e.target.value,
+                          responseLanguagePolicy: "prefer_system_language_with_explicit_switch",
+                        })
+                      }
+                      className={settingsSelectClass}
+                    >
                       <option value="en">English</option><option value="zh">简体中文</option>
                     </select>
                   </div>

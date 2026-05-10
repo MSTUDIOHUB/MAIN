@@ -65,17 +65,35 @@ test("language mismatch guard triggers one recovery attempt on first mismatch", 
     text: "Let me summarize the findings. The root cause is a null pointer.",
     targetLanguage: "zh",
     suppressedByPlanGuard: false,
-    toolCallCount: 0,
+    toolCallCount: 1,
     alreadyRetried: false,
   });
 
   assert.equal(first.mismatch, true);
   assert.equal(first.detectedLanguage, "en");
+  assert.equal(first.action, "recover_once");
   assert.equal(first.shouldRecover, true);
   assert.equal(first.exhausted, false);
+  assert.equal(first.hideTextForToolCall, false);
 });
 
-test("language mismatch guard does not retry more than once", () => {
+test("language mismatch guard hides visible text when mismatch persists in tool-call turns", () => {
+  const exhausted = shouldRecoverLanguageMismatchTurn({
+    text: "Let me summarize the findings. The root cause is a null pointer.",
+    targetLanguage: "zh",
+    suppressedByPlanGuard: false,
+    toolCallCount: 2,
+    alreadyRetried: true,
+  });
+
+  assert.equal(exhausted.mismatch, true);
+  assert.equal(exhausted.action, "hide_text_continue");
+  assert.equal(exhausted.shouldRecover, false);
+  assert.equal(exhausted.exhausted, false);
+  assert.equal(exhausted.hideTextForToolCall, true);
+});
+
+test("language mismatch guard keeps no-tool exhausted behavior after one retry", () => {
   const exhausted = shouldRecoverLanguageMismatchTurn({
     text: "Let me summarize the findings. The root cause is a null pointer.",
     targetLanguage: "zh",
@@ -85,8 +103,10 @@ test("language mismatch guard does not retry more than once", () => {
   });
 
   assert.equal(exhausted.mismatch, true);
+  assert.equal(exhausted.action, "pass");
   assert.equal(exhausted.shouldRecover, false);
   assert.equal(exhausted.exhausted, true);
+  assert.equal(exhausted.hideTextForToolCall, false);
 });
 
 test("language mismatch guard skips code-like responses without natural-language signal", () => {
@@ -99,6 +119,8 @@ test("language mismatch guard skips code-like responses without natural-language
   });
 
   assert.equal(codeLike.mismatch, false);
+  assert.equal(codeLike.action, "pass");
   assert.equal(codeLike.shouldRecover, false);
   assert.equal(codeLike.exhausted, false);
+  assert.equal(codeLike.hideTextForToolCall, false);
 });

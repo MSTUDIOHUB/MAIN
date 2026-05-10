@@ -81,7 +81,7 @@ test("shouldPauseForReplyOptions pauses when the model asks the user to choose",
   assert.equal(shouldPause, true);
 });
 
-test("shouldPauseForReplyOptions does not override plan approval or edit tool execution", () => {
+test("shouldPauseForReplyOptions respects forcePause while keeping legacy edit/runtime guard", () => {
   assert.equal(
     shouldPauseForReplyOptions({
       replyOptions: [{ label: "方案 A", value: "方案 A" }],
@@ -89,6 +89,16 @@ test("shouldPauseForReplyOptions does not override plan approval or edit tool ex
       workflowMode: "edit",
     }),
     false,
+  );
+
+  assert.equal(
+    shouldPauseForReplyOptions({
+      replyOptions: [{ label: "方案 A", value: "方案 A" }],
+      toolCallCount: 1,
+      workflowMode: "edit",
+      forcePause: true,
+    }),
+    true,
   );
 
   assert.equal(

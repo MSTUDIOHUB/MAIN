@@ -5,6 +5,7 @@
 //   1. <tool_use> with nested <tool> and <parameter> tags
 //   2. <tool_call> with JSON inside
 //   3. <function_call> with JSON inside
+//   4. <tool_code> wrappers containing a single function-style call
 //
 // Reasoning tags extracted as thoughts:
 //   <analysis>, <thought>, <thinking>, <reasoning>
@@ -55,6 +56,18 @@ const TOOL_BODY_ARG_NAMES: Partial<Record<string, string>> = {
   send_pty_input: "input",
   run_command: "command",
   write_file: "content",
+};
+
+const TOOL_POSITIONAL_ARG_NAMES: Partial<Record<string, string>> = {
+  get_file_outline: "path",
+  list_directory: "path",
+  read_file: "path",
+  read_document: "path",
+  analyze_tabular_document: "path",
+  query_tabular_document: "path",
+  index_workspace_documents: "path",
+  glob_search: "pattern",
+  grep_search: "query",
 };
 
 function extractMatches(text: string, regex: RegExp): string[] {
@@ -109,6 +122,29 @@ function normalizeInlineArgValue(value: string): unknown {
   if (/^-?\d+(?:\.\d+)?$/.test(trimmed)) return Number(trimmed);
   if (/^(?:true|false)$/i.test(trimmed)) return trimmed.toLowerCase() === "true";
   return trimmed;
+}
+
+function parseSinglePositionalArg(text: string): unknown | undefined {
+  const trimmed = text.trim().replace(/,$/, "");
+  if (!trimmed || trimmed.includes(",") || /^[a-z_][a-z0-9_]*\s*=/i.test(trimmed)) return undefined;
+
+  if (
+    (trimmed.startsWith("\"") && trimmed.endsWith("\"")) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'"))
+  ) {
+    const quote = trimmed[0];
+    const body = trimmed.slice(1, -1);
+    if (quote === "\"") {
+      try {
+        return JSON.parse(trimmed);
+      } catch {
+        return body.replace(/\\"/g, "\"").replace(/\\\\/g, "\\");
+      }
+    }
+    return body.replace(/\\'/g, "'").replace(/\\\\/g, "\\");
+  }
+
+  return normalizeInlineArgValue(trimmed);
 }
 
 function parseNamedArguments(text: string): Record<string, unknown> {
@@ -181,7 +217,27 @@ function parseFunctionStyleInvocation(text: string): ParsedToolCall | null {
     };
   }
 
+  const positionalArgName = TOOL_POSITIONAL_ARG_NAMES[toolName];
+  const positionalArg = positionalArgName ? parseSinglePositionalArg(body) : undefined;
+  if (positionalArgName && positionalArg !== undefined) {
+    return {
+      id: nextCallId(),
+      name: toolName,
+      arguments: { [positionalArgName]: positionalArg },
+    };
+  }
+
   return null;
+}
+
+function parseToolCodeBlock(inner: string): ParsedToolCall[] {
+  const normalized = inner
+    .trim()
+    .replace(/^```[a-z0-9_-]*\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+  const parsed = parseInlineToolInvocation(normalized);
+  return parsed ? [parsed] : [];
 }
 
 function parseInlineToolInvocation(text: string): ParsedToolCall | null {
@@ -380,6 +436,12 @@ export function parseTextForTools(text: string): ParsedTextResult {
     if (parsed) toolCalls.push(parsed);
   }
 
+  // Format 4: local-model tool_code wrappers with a single function-style call
+  const toolCodeBlocks = extractMatches(text, /<tool_code(?:\s[^>]*)?>([\s\S]*?)<\/tool_code>/);
+  for (const block of toolCodeBlocks) {
+    toolCalls.push(...parseToolCodeBlock(block));
+  }
+
   // 3. Build clean text by removing all known XML blocks
   const xmlStrippedText = text
     .replace(
@@ -391,8 +453,9 @@ export function parseTextForTools(text: string): ParsedTextResult {
       /<(?:tool_call|function_call)(?:\s[^>]*)?>[\s\S]*?<\/(?:tool_call|function_call)>/g,
       "",
     )
+    .replace(/<tool_code(?:\s[^>]*)?>[\s\S]*?<\/tool_code>/g, "")
     .replace(
-      /<\/?(?:analysis|thought|thinking|reasoning|tool_use|tool_call|function_call|tool|parameter|tool_response)(?:\s[^>]*)?>/g,
+      /<\/?(?:analysis|thought|thinking|reasoning|tool_use|tool_call|function_call|tool_code|tool|parameter|tool_response)(?:\s[^>]*)?>/g,
       "",
     )
     .trim();

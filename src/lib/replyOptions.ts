@@ -323,19 +323,23 @@ export function buildReadOnlyPermissionContinuationPrompt(language: "zh" | "en")
 export function extractReplyOptions(text: string): {
   cleanText: string;
   replyOptions: ReplyOption[];
+  hasExplicitUserOptionsTag: boolean;
 } {
   if (!text) {
     return {
       cleanText: "",
       replyOptions: [],
+      hasExplicitUserOptionsTag: false,
     };
   }
 
   const replyOptions: ReplyOption[] = [];
   const seenValues = new Set<string>();
+  let hasExplicitUserOptionsTag = false;
 
   const cleanText = text
     .replace(USER_OPTIONS_BLOCK_RE, (_fullMatch, blockContent: string) => {
+      hasExplicitUserOptionsTag = true;
       OPTION_RE.lastIndex = 0;
 
       let optionMatch: RegExpExecArray | null;
@@ -371,6 +375,7 @@ export function extractReplyOptions(text: string): {
   return {
     cleanText,
     replyOptions,
+    hasExplicitUserOptionsTag,
   };
 }
 
@@ -381,6 +386,7 @@ export function shouldPauseForReplyOptions(params: {
   hasStructuredProposal?: boolean;
   hasReadyPlanArtifacts?: boolean;
   isPlanApproved?: boolean;
+  forcePause?: boolean;
 }): boolean {
   const {
     replyOptions,
@@ -389,9 +395,11 @@ export function shouldPauseForReplyOptions(params: {
     hasStructuredProposal = false,
     hasReadyPlanArtifacts = false,
     isPlanApproved = false,
+    forcePause = false,
   } = params;
 
   if (!Array.isArray(replyOptions) || replyOptions.length === 0) return false;
+  if (forcePause) return true;
   if (toolCallCount > 0 && workflowMode === "edit") return false;
 
   if (workflowMode === "plan" && !isPlanApproved && (hasStructuredProposal || hasReadyPlanArtifacts)) {

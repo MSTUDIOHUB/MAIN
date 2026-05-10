@@ -71,7 +71,7 @@ import {
   type ReplyOption,
 } from "./workflowModels";
 import type { MainModeKey } from "./mainModes";
-import type { CommandDirective, ResolvedUserIntent } from "./runIntent";
+import { hasExplicitUnityConsoleDiagnosticCue, type CommandDirective, type ResolvedUserIntent } from "./runIntent";
 import {
   loadResolvedInstructions,
   type ResolvedInstructionSet,
@@ -288,8 +288,8 @@ async function buildReadBeforeModifyValidationError(
     : existingFile
     ? `READ_BEFORE_MODIFY_BLOCKED: Read ${path} before modifying it. Call read_file or get_file_outline first, then retry the write.`
     : `READ_BEFORE_MODIFY_BLOCKED: Inspect the target directory or project structure before creating ${path}. Call get_project_skeleton or list_directory first, then retry the write.`;
-  callbacks.onToolExecuting(tc.name, target);
-  callbacks.onToolError(tc.name, target, message);
+  callbacks.onToolExecuting(tc.name, target, undefined, { toolCallId: tc.id });
+  callbacks.onToolError(tc.name, target, message, { toolCallId: tc.id });
   return {
     toolCallId: tc.id,
     name: tc.name,
@@ -475,9 +475,24 @@ export interface OrchestratorCallbacks {
   ) => void;
 
   // Tool execution UI feedback
-  onToolExecuting: (toolName: string, target: string, diff?: ToolDiffPreview) => void;
-  onToolDone: (toolName: string, target: string, result: string) => void;
-  onToolError: (toolName: string, target: string, error: string) => void;
+  onToolExecuting: (
+    toolName: string,
+    target: string,
+    diff?: ToolDiffPreview,
+    meta?: { toolCallId?: string },
+  ) => void;
+  onToolDone: (
+    toolName: string,
+    target: string,
+    result: string,
+    meta?: { toolCallId?: string },
+  ) => void;
+  onToolError: (
+    toolName: string,
+    target: string,
+    error: string,
+    meta?: { toolCallId?: string },
+  ) => void;
 
   // Human-in-the-loop — only for write/execute tools.
   // Read-only tools are auto-executed by the orchestrator.
@@ -733,8 +748,10 @@ export function shouldRecoverLanguageMismatchTurn(input: {
   toolCallCount: number;
   alreadyRetried: boolean;
 }): {
+  action: "recover_once" | "hide_text_continue" | "pass";
   shouldRecover: boolean;
   exhausted: boolean;
+  hideTextForToolCall: boolean;
   mismatch: boolean;
   detectedLanguage: "zh" | "en" | null;
   hanCount: number;
@@ -745,20 +762,24 @@ export function shouldRecoverLanguageMismatchTurn(input: {
     text: input.text,
     targetLanguage: input.targetLanguage,
   });
-  const shouldRecover =
+  const hasActionableMismatch =
     !input.suppressedByPlanGuard &&
-    input.toolCallCount === 0 &&
     input.text.trim().length > 0 &&
-    mismatch.mismatch &&
-    !input.alreadyRetried;
+    mismatch.mismatch;
+  const shouldRecover = hasActionableMismatch && !input.alreadyRetried;
+  const hideTextForToolCall =
+    hasActionableMismatch &&
+    input.alreadyRetried &&
+    input.toolCallCount > 0;
+  const exhausted =
+    hasActionableMismatch &&
+    input.alreadyRetried &&
+    input.toolCallCount === 0;
   return {
+    action: shouldRecover ? "recover_once" : hideTextForToolCall ? "hide_text_continue" : "pass",
     shouldRecover,
-    exhausted:
-      !input.suppressedByPlanGuard &&
-      input.toolCallCount === 0 &&
-      input.text.trim().length > 0 &&
-      mismatch.mismatch &&
-      input.alreadyRetried,
+    exhausted,
+    hideTextForToolCall,
     mismatch: mismatch.mismatch,
     detectedLanguage: mismatch.detectedLanguage,
     hanCount: mismatch.hanCount,
@@ -768,6 +789,24 @@ export function shouldRecoverLanguageMismatchTurn(input: {
 }
 
 const PSEUDO_TOOL_CALL_RE = /(?:^|\n)\s*(?:\[(?:Tool call|tool_call|工具调用)\s*:\s*([a-z_][a-z0-9_]*)\s*\]|(?:Tool call|tool_call|工具调用)\s*:\s*([a-z_][a-z0-9_]*))\s*$/im;
+const NON_STANDARD_TOOL_WRAPPER_RE = /<tool_code(?:\s[^>]*)?>[\s\S]*?<\/tool_code>/i;
+const UNITY_FALLBACK_RECOVERY_READ_ONLY_TOOL_NAMES = new Set([
+  "list_directory",
+  "get_project_skeleton",
+  "glob_search",
+  "grep_search",
+  "read_file",
+  "get_file_outline",
+  "read_document",
+  "analyze_tabular_document",
+  "query_tabular_document",
+  "index_workspace_documents",
+  "unity_docs",
+  "unity_reflect",
+  "find_gameobjects",
+  "find_in_file",
+  "read_console",
+]);
 
 export function looksLikePseudoToolCallPlaceholder(text: string): boolean {
   const content = String(text || "");
@@ -776,27 +815,42 @@ export function looksLikePseudoToolCallPlaceholder(text: string): boolean {
   return PSEUDO_TOOL_CALL_RE.test(content);
 }
 
+export function looksLikeNonStandardToolCallFormat(text: string): boolean {
+  const content = String(text || "");
+  if (!content.trim()) return false;
+  if (/<tool_use>|<tool_call|<function_call/i.test(content)) return false;
+  return NON_STANDARD_TOOL_WRAPPER_RE.test(content);
+}
+
 export function buildPseudoToolCallRecoveryPrompt(language: "zh" | "en", workflowMode: "chat" | "edit" | "plan"): string {
   const modeText = workflowMode === "chat" ? "read-only/discussion" : workflowMode === "plan" ? "plan" : "execute";
   return language === "zh"
     ? [
-        "你刚才输出了 `[Tool call: ...]` 这种占位文本，但它不是可执行工具调用，MAIN 不能据此执行工具。",
+        "你刚才输出了非标准工具格式（如 `[Tool call: ...]` 或 `<tool_code>...</tool_code>`），它不是可执行工具调用，MAIN 不能据此执行工具。",
         "如果你需要工具，必须立即用正式 XML 工具协议重发，并补齐所有必填参数：",
         "<tool_use>",
         "<tool>read_file</tool>",
         "<parameter name=\"path\">相对 workspace 的文件路径</parameter>",
         "</tool_use>",
-        `当前运行阶段：${modeText}。不要再输出 \`[Tool call: ...]\`、不要只描述“我要调用工具”。如果缺少路径或参数，请先用可用的只读工具获取上下文，或直接用可见正文说明缺口。`,
+        `当前运行阶段：${modeText}。不要再输出 \`[Tool call: ...]\`、\`<tool_code>...</tool_code>\`，也不要只描述“我要调用工具”。如果缺少路径或参数，请先用可用的只读工具获取上下文，或直接用可见正文说明缺口。`,
       ].join("\n")
     : [
-        "You just emitted a `[Tool call: ...]` placeholder. That is not an executable tool call, so MAIN cannot run a tool from it.",
+        "You just emitted a non-standard tool format (for example `[Tool call: ...]` or `<tool_code>...</tool_code>`). That is not an executable tool call, so MAIN cannot run a tool from it.",
         "If you need a tool, immediately resend it using the formal XML tool protocol with all required parameters:",
         "<tool_use>",
         "<tool>read_file</tool>",
         "<parameter name=\"path\">workspace-relative file path</parameter>",
         "</tool_use>",
-        `Current workflow mode: ${modeText}. Do not output \`[Tool call: ...]\` again or merely describe that you will call a tool. If a path or argument is missing, use an available read-only tool to gather context or explain the gap in visible text.`,
+        `Current workflow mode: ${modeText}. Do not output \`[Tool call: ...]\`, \`<tool_code>...</tool_code>\`, or merely describe that you will call a tool. If a path or argument is missing, use an available read-only tool to gather context or explain the gap in visible text.`,
       ].join("\n");
+}
+
+export function shouldRepromptBeforeUnityConsoleFallback(input: {
+  readConsoleCalled: boolean;
+  hasSuccessfulReadOnlyActivity: boolean;
+  repromptAlreadyIssued: boolean;
+}): boolean {
+  return !input.readConsoleCalled && input.hasSuccessfulReadOnlyActivity && !input.repromptAlreadyIssued;
 }
 
 function looksLikePlanCompletionClaim(text: string): boolean {
@@ -1532,7 +1586,7 @@ async function executeToolCallWithLifecycle(
   // Validate required parameters before execution
   const validationError = validateToolExecutionContract(tc.name, toolArgs, allTools);
   if (validationError) {
-    callbacks.onToolError(tc.name, "", validationError);
+    callbacks.onToolError(tc.name, "", validationError, { toolCallId: tc.id });
     return { toolCallId: tc.id, name: tc.name, target: "", content: `Error: ${validationError}`, isError: true };
   }
 
@@ -1557,7 +1611,7 @@ async function executeToolCallWithLifecycle(
 
   if (preHookResult.blocked) {
     const reason = preHookResult.blockedReason ?? `${tc.name} was blocked by a PreToolUse hook.`;
-    callbacks.onToolError(tc.name, target, reason);
+    callbacks.onToolError(tc.name, target, reason, { toolCallId: tc.id });
     return {
       toolCallId: tc.id,
       name: tc.name,
@@ -1597,7 +1651,7 @@ async function executeToolCallWithLifecycle(
     !isUnityApplyTextPrecisePatchArgs(resolvedArgs)
   ) {
     const message = buildUnityApplyTextPolicyBlockedMessage(callbacks.getPreferredLanguage());
-    callbacks.onToolError(tc.name, target, message);
+    callbacks.onToolError(tc.name, target, message, { toolCallId: tc.id });
     return {
       toolCallId: tc.id,
       name: tc.name,
@@ -1611,7 +1665,7 @@ async function executeToolCallWithLifecycle(
   const diffPreview = isEphemeralPlanArtifactMutation(tc.name, effectiveArgs)
     ? undefined
     : await buildToolDiffPreview(tc.name, effectiveArgs, { workspace, sessionKey });
-  callbacks.onToolExecuting(tc.name, target, diffPreview);
+  callbacks.onToolExecuting(tc.name, target, diffPreview, { toolCallId: tc.id });
 
   try {
     const rawResult = await executeTool(tc.name, resolvedArgs, workspace, sessionKey, {
@@ -1661,7 +1715,7 @@ async function executeToolCallWithLifecycle(
       associatedPaths: callbacks.getAssociatedPaths(),
     });
 
-    callbacks.onToolDone(tc.name, target, displayContent);
+    callbacks.onToolDone(tc.name, target, displayContent, { toolCallId: tc.id });
     return {
       toolCallId: tc.id,
       name: tc.name,
@@ -1679,7 +1733,7 @@ async function executeToolCallWithLifecycle(
     // Instead of throwing, we return the error as a tool result.
     // The AI sees the error and can self-correct (e.g., try a different path).
     const errorMsg = (err as Error).message || String(err);
-    callbacks.onToolError(tc.name, target, errorMsg);
+    callbacks.onToolError(tc.name, target, errorMsg, { toolCallId: tc.id });
     const postHookResult = await runLifecycleHooks(callbacks, hooksConfig, "PostToolUse", {
       toolName: tc.name,
       toolArgs: resolvedArgs,
@@ -1809,8 +1863,8 @@ function buildPlanGateBlockedResult(
     ? "The plan is approved, but there is no executable `.MAIN/plans/tasks.md` task list yet. Generate tasks.md before editing source or final deliverables."
     : "PLAN mode is not approved yet, so source or deliverable files cannot be modified. Create `.MAIN/plans/design.md` (or bugfix.md) for review first; requirements.md is optional for requirement-ledger cases.";
 
-  callbacks.onToolExecuting(tc.name, target);
-  callbacks.onToolError(tc.name, target, message);
+  callbacks.onToolExecuting(tc.name, target, undefined, { toolCallId: tc.id });
+  callbacks.onToolError(tc.name, target, message, { toolCallId: tc.id });
   return {
     toolCallId: tc.id,
     name: tc.name,
@@ -1861,8 +1915,8 @@ async function buildPlanArtifactMutationValidationError(
       const message = language === "zh"
         ? `PLAN_QUALITY_GATE: ${path} 被拦截，内容不像可审批的正式计划（${validation.reason || "质量不足"}）。请基于用户目标和已读源码重新生成 design.md（或 bugfix.md），或用 <user_options> 询问关键分叉；不要写入工具日志、后台思考、截断提示或原始代码片段。`
         : `PLAN_QUALITY_GATE: ${path} was rejected because it does not look like a reviewable plan artifact (${validation.reason || "quality gate"}). Regenerate design.md (or bugfix.md) from the user goal and inspected source, or ask the user with <user_options>; do not write tool logs, hidden thinking, truncation notices, or raw source snippets.`;
-      callbacks.onToolExecuting(tc.name, target);
-      callbacks.onToolError(tc.name, target, message);
+      callbacks.onToolExecuting(tc.name, target, undefined, { toolCallId: tc.id });
+      callbacks.onToolError(tc.name, target, message, { toolCallId: tc.id });
       return {
         toolCallId: tc.id,
         name: tc.name,
@@ -1885,8 +1939,8 @@ async function buildPlanArtifactMutationValidationError(
       const message = language === "zh"
         ? `PLAN_TASK_HISTORY_BLOCKED: tasks.md 不能删除已有任务记录。本次写入会移除 ${droppedTasks.length} 个任务（例如：${droppedTasks.slice(0, 3).map((task) => task.text).join("；")}）。请只把完成项的 checkbox 改成 [x]、追加新任务，或保留“已完成任务”区块。`
         : `PLAN_TASK_HISTORY_BLOCKED: tasks.md must not delete existing task history. This write would remove ${droppedTasks.length} task(s) (for example: ${droppedTasks.slice(0, 3).map((task) => task.text).join("; ")}). Only mark completed checkboxes as [x], append tasks, or keep a completed-tasks section.`;
-      callbacks.onToolExecuting(tc.name, target);
-      callbacks.onToolError(tc.name, target, message);
+      callbacks.onToolExecuting(tc.name, target, undefined, { toolCallId: tc.id });
+      callbacks.onToolError(tc.name, target, message, { toolCallId: tc.id });
       return {
         toolCallId: tc.id,
         name: tc.name,
@@ -1908,8 +1962,8 @@ async function buildPlanArtifactMutationValidationError(
         const message = language === "zh"
           ? `PLAN_TASK_EVIDENCE_BLOCKED: tasks.md 不能把缺少真实执行证据的任务直接勾选完成。请先真实执行并验证这些任务，再更新 checkbox：${unsupportedCompletions.slice(0, 3).map((task) => task.text).join("；")}`
           : `PLAN_TASK_EVIDENCE_BLOCKED: tasks.md cannot mark tasks complete before trusted execution evidence exists. Execute and verify these tasks first, then update their checkboxes: ${unsupportedCompletions.slice(0, 3).map((task) => task.text).join("; ")}`;
-        callbacks.onToolExecuting(tc.name, target);
-        callbacks.onToolError(tc.name, target, message);
+        callbacks.onToolExecuting(tc.name, target, undefined, { toolCallId: tc.id });
+        callbacks.onToolError(tc.name, target, message, { toolCallId: tc.id });
         return {
           toolCallId: tc.id,
           name: tc.name,
@@ -2019,6 +2073,20 @@ function isUnityCommandDirective(commandDirective?: CommandDirective | null): bo
 
 function isUnityConsoleDiagnosticsDirective(commandDirective?: CommandDirective | null): boolean {
   return commandDirective?.kind === "unity" && commandDirective?.action === "console_diagnostics";
+}
+
+export function shouldTriggerUnityMcpFirstIterationFallback(input: {
+  toolCallCount: number;
+  replyOptionCount: number;
+  unityMcpFirstPhaseActive: boolean;
+  unityMcpFirstIterationPending: boolean;
+}): boolean {
+  return (
+    input.toolCallCount === 0 &&
+    input.replyOptionCount === 0 &&
+    input.unityMcpFirstPhaseActive &&
+    input.unityMcpFirstIterationPending
+  );
 }
 
 function isUnityLikelyServer(server: MCPServer): boolean {
@@ -2153,7 +2221,7 @@ export async function executeAgentLoop(
   const unityCommandRequested = isUnityCommandDirective(commandDirective) || gameStudioUnityContext;
   const unityConsoleDiagnosticsRequested =
     isUnityConsoleDiagnosticsDirective(commandDirective) ||
-    (unityCommandRequested && /console|报错|错误|warning|警告|compile|编译/i.test(latestUserPromptText));
+    (unityCommandRequested && hasExplicitUnityConsoleDiagnosticCue(latestUserPromptText));
   const unityScriptEditRequested =
     unityCommandRequested &&
     /fix|repair|patch|edit|modify|refactor|script|code|c#|cs|修复|补丁|修改|脚本|代码|编译|报错|错误/i.test(
@@ -2264,6 +2332,7 @@ export async function executeAgentLoop(
   let unityMcpFallbackReason: string | null = null;
   let unityMcpFirstIterationPending = unityMcpFirstPhaseActive;
   let unityMcpForceConsoleFirstPending = unityMcpFirstPhaseActive && unityConsoleDiagnosticsRequested;
+  let unityConsoleMissingFirstToolRepromptIssued = false;
   let unityConsoleFinalVerificationRequired = false;
   let unityConsoleRefreshObservedAfterWrite = false;
 
@@ -3164,7 +3233,8 @@ export async function executeAgentLoop(
       !compactedIncompletePlanText &&
       (
         looksLikePseudoToolCallPlaceholder(normalized.visibleText) ||
-        looksLikePseudoToolCallPlaceholder(normalized.hiddenThought)
+        looksLikePseudoToolCallPlaceholder(normalized.hiddenThought) ||
+        looksLikeNonStandardToolCallFormat(streamText)
       );
     const syntheticVisibleConclusion =
       !compactedProseCodeDump &&
@@ -3181,11 +3251,6 @@ export async function executeAgentLoop(
         toolCalls: effectiveToolCalls.length,
       });
     }
-    const historyAssistantText = userVisibleText || "";
-    if (historyAssistantText.trim()) {
-      lastAssistantTextForCheckpoint = historyAssistantText;
-    }
-
     if (finalReplyOptions.length > 0) {
       logAgentEvent("reply_options_detected", {
         iteration,
@@ -3239,7 +3304,12 @@ export async function executeAgentLoop(
       continue;
     }
 
-    if (effectiveToolCalls.length === 0 && unityMcpFirstPhaseActive && unityMcpFirstIterationPending) {
+    if (shouldTriggerUnityMcpFirstIterationFallback({
+      toolCallCount: effectiveToolCalls.length,
+      replyOptionCount: finalReplyOptions.length,
+      unityMcpFirstPhaseActive,
+      unityMcpFirstIterationPending,
+    })) {
       unityMcpFirstIterationPending = false;
       activateUnityMcpFallback("first_iteration_no_tool_call");
       callbacks.onStatusChange("running");
@@ -3308,7 +3378,7 @@ export async function executeAgentLoop(
       alreadyRetried: usedLanguageMismatchRecoveryPrompt,
     });
 
-    if (languageMismatchDecision.shouldRecover) {
+    if (languageMismatchDecision.action === "recover_once") {
       usedLanguageMismatchRecoveryPrompt = true;
       callbacks.onStreamToken("__ESCALATION_RESET__:", assistantMsgId);
       logAgentEvent("language_mismatch_reprompt", {
@@ -3328,6 +3398,22 @@ export async function executeAgentLoop(
       continue;
     }
 
+    let visibleAssistantText = userVisibleText;
+    if (languageMismatchDecision.action === "hide_text_continue") {
+      callbacks.onStreamToken("__ESCALATION_RESET__:", assistantMsgId);
+      visibleAssistantText = "";
+      logAgentEvent("language_mismatch_text_hidden_for_tool_calls", {
+        iteration,
+        targetLanguage: callbacks.getPreferredLanguage(),
+        detectedLanguage: languageMismatchDecision.detectedLanguage,
+        hanCount: languageMismatchDecision.hanCount,
+        latinLetters: languageMismatchDecision.latinLetters,
+        latinWords: languageMismatchDecision.latinWords,
+        visibleChars: userVisibleText.length,
+        toolCalls: effectiveToolCalls.length,
+      });
+    }
+
     if (languageMismatchDecision.exhausted) {
       logAgentEvent("language_mismatch_reprompt_exhausted", {
         iteration,
@@ -3337,16 +3423,21 @@ export async function executeAgentLoop(
       });
     }
 
+    const historyAssistantText = visibleAssistantText || "";
+    if (historyAssistantText.trim()) {
+      lastAssistantTextForCheckpoint = historyAssistantText;
+    }
+
     if (!shouldSuppressApprovedPlanNoToolText) {
-      callbacks.onTurnSummaryReady(userVisibleText);
+      callbacks.onTurnSummaryReady(visibleAssistantText);
     }
 
     if (normalized.hiddenThought) {
       callbacks.onThought(normalized.hiddenThought);
     }
 
-    if (!shouldSuppressApprovedPlanNoToolText && (userVisibleText || finalReplyOptions.length > 0)) {
-      callbacks.onAssistantFinalText(userVisibleText, finalReplyOptions);
+    if (!shouldSuppressApprovedPlanNoToolText && (visibleAssistantText || finalReplyOptions.length > 0)) {
+      callbacks.onAssistantFinalText(visibleAssistantText, finalReplyOptions);
     }
 
     if (autoContinueReadOnlyPermission) {
@@ -3389,9 +3480,10 @@ export async function executeAgentLoop(
       hasStructuredProposal,
       hasReadyPlanArtifacts,
       isPlanApproved: callbacks.getIsPlanApproved(),
+      forcePause: normalized.hasExplicitUserChoiceRequest,
     });
     const assistantHistoryText = serializeAssistantReplyForHistory(historyAssistantText, finalReplyOptions);
-    const hasMeaningfulVisibleText = userVisibleText.trim().length > 0;
+    const hasMeaningfulVisibleText = visibleAssistantText.trim().length > 0;
     const wasTruncated = normalized.finishReason === "length";
     const hiddenThoughtOnlyNoToolStop =
       effectiveToolCalls.length === 0 &&
@@ -3854,7 +3946,7 @@ export async function executeAgentLoop(
         const message = callbacks.getPreferredLanguage() === "zh"
           ? `REPEATED_FAILURE_BLOCKED: ${tc.name}${target ? ` (${target})` : ""} 已用相同参数连续失败。请先诊断最近错误，改变参数或换一条策略，不要原样重试。`
           : `REPEATED_FAILURE_BLOCKED: ${tc.name}${target ? ` (${target})` : ""} has failed repeatedly with identical arguments. Diagnose the latest error and change arguments or strategy before retrying.`;
-        callbacks.onToolError(tc.name, target, message);
+        callbacks.onToolError(tc.name, target, message, { toolCallId: tc.id });
         allResults.push({
           toolCallId: tc.id,
           name: tc.name,
@@ -3869,7 +3961,7 @@ export async function executeAgentLoop(
         const message = callbacks.getPreferredLanguage() === "zh"
           ? `工具 "${tc.name}" 当前没有暴露给 ${runtimeIntent} 运行意图。请使用本轮可用工具；如果这是已批准计划的执行步骤，请继续按执行阶段恢复。`
           : `Tool "${tc.name}" is not exposed for the current ${runtimeIntent} runtime intent. Use an available tool; if this is approved plan execution, continue from the execution stage.`;
-        callbacks.onToolError(tc.name, target, message);
+        callbacks.onToolError(tc.name, target, message, { toolCallId: tc.id });
         allResults.push({
           toolCallId: tc.id,
           name: tc.name,
@@ -4149,11 +4241,25 @@ export async function executeAgentLoop(
     if (unityMcpForceConsoleFirstPending) {
       const readConsoleResult = allResults.find((result) => result.name === "read_console");
       if (!readConsoleResult) {
-        activateUnityMcpFallback("forced_console_tool_not_called");
-        unityMcpForceConsoleFirstPending = false;
-        unityMcpFallbackPrompt = callbacks.getPreferredLanguage() === "zh"
-          ? "Unity MCP 未按预期执行 read_console，本轮自动回退到本地诊断路径。请立即使用本地只读工具读取最相关日志并给出结论。"
-          : "Unity MCP did not execute read_console as expected. This turn has been auto-fallbacked to local diagnostics. Use local read-only tools now and report findings.";
+        const hasSuccessfulReadOnlyActivity = allResults.some(
+          (result) => !result.isError && UNITY_FALLBACK_RECOVERY_READ_ONLY_TOOL_NAMES.has(result.name),
+        );
+        if (shouldRepromptBeforeUnityConsoleFallback({
+          readConsoleCalled: false,
+          hasSuccessfulReadOnlyActivity,
+          repromptAlreadyIssued: unityConsoleMissingFirstToolRepromptIssued,
+        })) {
+          unityConsoleMissingFirstToolRepromptIssued = true;
+          unityMcpFallbackPrompt = callbacks.getPreferredLanguage() === "zh"
+            ? "你已经调用了可用工具，但这轮是 Unity console 诊断路径，仍缺少必需的 `read_console`。下一条请只输出一个标准 XML `<tool_use>` 调用 `read_console`（必要时先 `set_active_instance`），不要输出 `<tool_code>` 或过程说明。"
+            : "You already called an available tool, but this Unity console diagnostics path still requires `read_console`. In the next reply, output exactly one standard XML `<tool_use>` call for `read_console` (use `set_active_instance` first only if required), with no `<tool_code>` wrapper and no process narration.";
+        } else {
+          activateUnityMcpFallback("forced_console_tool_not_called");
+          unityMcpForceConsoleFirstPending = false;
+          unityMcpFallbackPrompt = callbacks.getPreferredLanguage() === "zh"
+            ? "Unity MCP 未按预期执行 read_console，本轮自动回退到本地诊断路径。请立即使用本地只读工具读取最相关日志并给出结论。"
+            : "Unity MCP did not execute read_console as expected. This turn has been auto-fallbacked to local diagnostics. Use local read-only tools now and report findings.";
+        }
       } else if (readConsoleResult.isError) {
         const failureCategory = extractMcpCallFailureCategory(readConsoleResult.content || "");
         if (failureCategory && ["unreachable", "route_mismatch", "session"].includes(failureCategory)) {
@@ -4298,7 +4404,7 @@ export async function executeAgentLoop(
           repeatGuardRecoveredSignatures.add(repeatCheck.signature);
         }
         recentToolCalls.length = 0;
-        callbacks.onToolError(tc.name, target, recoveryMessage);
+        callbacks.onToolError(tc.name, target, recoveryMessage, { toolCallId: tc.id });
         callbacks.appendMessage({
           role: "system",
           content: `[System: ${recoveryMessage}]`,
@@ -4309,6 +4415,9 @@ export async function executeAgentLoop(
 
       const fatalMessage = formatRepeatLoopFatalMessage(tc.name, target, repeatCheck.threshold);
       const remainingTask = callbacks.getPlanTasks().find((task) => !isPlanTaskTrustedComplete(task));
+      const defaultSuggestedNextTask = callbacks.getPreferredLanguage() === "zh"
+        ? "先复用已成功结果，再继续下一个文件或不同目标"
+        : "reuse successful results already in context, then continue with the next file or a different target";
       const recentEvidence = callbacks.getPlanExecutionEvidenceLedger().slice(-5);
       const recentEvidenceText = recentEvidence.length > 0
         ? recentEvidence.map((entry) => `${entry.kind}:${entry.target || entry.value} via ${entry.sourceTool}`).join(" | ")
@@ -4320,7 +4429,7 @@ export async function executeAgentLoop(
             `- target: ${target || "unknown"}`,
             `- duplicateCount: ${repeatCheck.threshold}+`,
             `- recentSuccessfulEvidence: ${recentEvidenceText}`,
-            `- suggestedNextTask: ${remainingTask?.text || "重新读取 tasks.md 与证据摘要后继续"}`,
+            `- suggestedNextTask: ${remainingTask?.text || defaultSuggestedNextTask}`,
           ].join("\n")
         : [
             "RecoveryDetails:",
@@ -4328,15 +4437,15 @@ export async function executeAgentLoop(
             `- target: ${target || "unknown"}`,
             `- duplicateCount: ${repeatCheck.threshold}+`,
             `- recentSuccessfulEvidence: ${recentEvidenceText}`,
-            `- suggestedNextTask: ${remainingTask?.text || "reread tasks.md plus the evidence summary, then continue"}`,
+            `- suggestedNextTask: ${remainingTask?.text || defaultSuggestedNextTask}`,
           ].join("\n");
       const recoveryHint = remainingTask
         ? callbacks.getPreferredLanguage() === "zh"
           ? `\nRecovery: 请开启新的恢复上下文，从证据未满足的任务继续：${remainingTask.text}`
           : `\nRecovery: start a fresh recovery context and continue from the first task with unsatisfied evidence: ${remainingTask.text}`
         : callbacks.getPreferredLanguage() === "zh"
-        ? "\nRecovery: 请开启新的恢复上下文，重新读取 tasks.md 与证据摘要后继续。"
-        : "\nRecovery: start a fresh recovery context, reread tasks.md plus the evidence summary, then continue.";
+        ? "\nRecovery: 请开启新的恢复上下文，先复用已成功结果，再继续下一个文件或不同目标。"
+        : "\nRecovery: start a fresh recovery context, reuse successful results, then continue with the next file or a different target.";
       callbacks.onError(`${fatalMessage}\n${structuredRecovery}${recoveryHint}`);
       callbacks.onStatusChange("error");
       return;
@@ -4358,7 +4467,7 @@ export async function executeAgentLoop(
         if (!targetProgressGuardRecoveredSignatures.has(progressCheck.signature)) {
           targetProgressGuardRecoveredSignatures.add(progressCheck.signature);
           recentTargetToolCalls.length = 0;
-          callbacks.onToolError(tc.name, target, recoveryMessage);
+          callbacks.onToolError(tc.name, target, recoveryMessage, { toolCallId: tc.id });
           callbacks.appendMessage({
             role: "system",
             content: `[System: ${recoveryMessage}]`,

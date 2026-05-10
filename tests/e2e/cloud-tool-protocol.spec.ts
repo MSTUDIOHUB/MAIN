@@ -13,11 +13,13 @@ test.beforeEach(async ({ page }) => {
     let pseudoToolRecoveryRequests = 0;
     const requests: Array<{ hasTools: boolean; body: string }> = [];
     const readFileCalls: string[] = [];
+    const listDirectoryCalls: string[] = [];
     const ingestedAttachments: Array<{ sessionKey: string; sourcePath: string }> = [];
 
     (window as any).__CLOUD_TOOL_PROTOCOL_TEST__ = {
       requests,
       readFileCalls,
+      listDirectoryCalls,
       ingestedAttachments,
       get fallbackNoToolRequests() {
         return fallbackNoToolRequests;
@@ -75,6 +77,17 @@ test.beforeEach(async ({ page }) => {
         throw new Error(`unsupported attachment: ${sourcePath}`);
       }
       if (cmd === "glob_search") return [];
+      if (cmd === "list_directory") {
+        const path = String(args?.path ?? "");
+        listDirectoryCalls.push(path);
+        if (path === "src") {
+          return [
+            { name: "Gameplay", path: "src/Gameplay", is_dir: true },
+            { name: "SnakeController.cs", path: "src/SnakeController.cs", is_dir: false },
+          ];
+        }
+        return [];
+      }
       if (cmd === "read_file_window") {
         const path = String(args?.path ?? "");
         const scenario = new URL(window.location.href).searchParams.get("e2eScenario");
@@ -289,6 +302,72 @@ test.beforeEach(async ({ page }) => {
           });
         }
 
+        if (scenario === "unity-mcp-options-priority") {
+          if (body.includes("请继续执行轻量读取路径")) {
+            return JSON.stringify({
+              output_text: "已收到选择，按轻量读取路径继续。",
+            });
+          }
+          return JSON.stringify({
+            output_text: [
+              "Unity 任务开始前，需要你先确认执行分支。",
+              "<user_options>",
+              "<option>请继续执行轻量读取路径</option>",
+              "<option>先停在方案评审阶段</option>",
+              "</user_options>",
+            ].join("\n"),
+          });
+        }
+
+        if (scenario === "unity-tool-code-compat") {
+          if (body.includes("src/SnakeController.cs")) {
+            return JSON.stringify({
+              output_text: "已读取 src 目录，定位到 SnakeController.cs，可继续细化排查。",
+            });
+          }
+          if (body.includes("非标准工具格式") || body.includes("not an executable tool call")) {
+            return JSON.stringify({
+              output_text: [
+                "我改用标准 XML 工具调用。",
+                "<tool_use>",
+                "<tool>list_directory</tool>",
+                "<parameter name=\"path\">src</parameter>",
+                "</tool_use>",
+              ].join("\n"),
+            });
+          }
+          return JSON.stringify({
+            output_text: [
+              "我先读取 src 目录。",
+              "<tool_code>",
+              "list_directory(\"src\")",
+              "</tool_code>",
+            ].join("\n"),
+          });
+        }
+
+        if (scenario === "unity-no-error-routing") {
+          if (body.includes("仍缺少必需的 `read_console`") || body.includes("auto-fallbacked to local diagnostics")) {
+            return JSON.stringify({
+              output_text: "UNEXPECTED_READ_CONSOLE_FALLBACK",
+            });
+          }
+          if (body.includes("fallback-ok")) {
+            return JSON.stringify({
+              output_text: "已按行为问题路径继续，没有强制 console 诊断。",
+            });
+          }
+          return JSON.stringify({
+            output_text: [
+              "我先走行为问题排查路径，读取 README 上下文。",
+              "<tool_use>",
+              "<tool>read_file</tool>",
+              "<parameter name=\"path\">README.md</parameter>",
+              "</tool_use>",
+            ].join("\n"),
+          });
+        }
+
         if (scenario === "pseudo-tool-call-recovery") {
           if (body.includes("READ_FILE_RESULT") || body.includes("fallback-ok")) {
             return JSON.stringify({
@@ -398,7 +477,9 @@ test("cloud Responses falls back from native tools to XML tools and reprompts to
           attemptedNativeTools: probe?.requests?.some((request: any) => request.hasTools) ?? false,
           retriedWithoutNativeTools: (probe?.requests || []).some((request: any) => !request.hasTools),
           readFileCalls: probe?.readFileCalls || [],
-          noToolRequests: probe?.fallbackNoToolRequests ?? 0,
+          noToolRequestsInExpectedRange:
+            (probe?.fallbackNoToolRequests ?? 0) >= 3 &&
+            (probe?.fallbackNoToolRequests ?? 0) <= 5,
         };
       }),
     )
@@ -406,7 +487,7 @@ test("cloud Responses falls back from native tools to XML tools and reprompts to
       attemptedNativeTools: true,
       retriedWithoutNativeTools: true,
       readFileCalls: ["README.md"],
-      noToolRequests: 3,
+      noToolRequestsInExpectedRange: true,
     });
 });
 
@@ -464,6 +545,108 @@ test("reply options pause before mixed XML tool calls and continue from the sour
       archivedOptionCount: 1,
       selectedOptions: ["请采用保守方案继续"],
       readFileCalls: 0,
+    });
+});
+
+test("unity first-iteration fallback does not override explicit reply options", async ({ page }) => {
+  await page.goto("/?e2eScenario=unity-mcp-options-priority");
+
+  const sent = await page.evaluate(() =>
+    (window as any).__CODELY_E2E__?.sendCloudMessage?.("请在 Unity 场景下先给我可点击选项。"),
+  );
+  expect(sent).toBe(true);
+
+  await expect(page.getByTestId("top-island-awaiting-choice")).toBeVisible();
+  await expect(page.getByTestId("top-island-reply-option-0")).toContainText("继续执行轻量读取路径");
+
+  await expect
+    .poll(async () =>
+      page.evaluate(() => {
+        const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+        const probe = (window as any).__CLOUD_TOOL_PROTOCOL_TEST__;
+        return {
+          status: snapshot?.currentTurnStatus,
+          optionBlockCount: snapshot?.optionBlockCount,
+          readFileCalls: probe?.readFileCalls?.length ?? -1,
+          requestCountInExpectedRange:
+            (probe?.requests?.length ?? 0) >= 1 &&
+            (probe?.requests?.length ?? 0) <= 2,
+        };
+      }),
+    )
+    .toEqual({
+      status: "awaiting_input",
+      optionBlockCount: 1,
+      readFileCalls: 0,
+      requestCountInExpectedRange: true,
+    });
+});
+
+test("unity tool_code wrapper is recovered into executable flow instead of idle stop", async ({ page }) => {
+  await page.goto("/?e2eScenario=unity-tool-code-compat");
+
+  const sent = await page.evaluate(() =>
+    (window as any).__CODELY_E2E__?.sendCloudMessage?.("请在 Unity 项目里先读取 src 目录定位脚本入口。"),
+  );
+  expect(sent).toBe(true);
+
+  await expect(page.getByText("已读取 src 目录，定位到 SnakeController.cs，可继续细化排查。")).toBeVisible();
+  await expect(page.getByText("UNEXPECTED_READ_CONSOLE_FALLBACK")).toHaveCount(0);
+
+  await expect
+    .poll(async () =>
+      page.evaluate(() => {
+        const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+        const probe = (window as any).__CLOUD_TOOL_PROTOCOL_TEST__;
+        const listDirectoryCalls = probe?.listDirectoryCalls || [];
+        return {
+          status: snapshot?.currentTurnStatus,
+          usedListDirectory: listDirectoryCalls.includes("src"),
+          requestCountInExpectedRange:
+            (probe?.requests?.length ?? 0) >= 2 &&
+            (probe?.requests?.length ?? 0) <= 3,
+        };
+      }),
+    )
+    .toEqual({
+      status: "done",
+      usedListDirectory: true,
+      requestCountInExpectedRange: true,
+    });
+});
+
+test("unity no-error behavior route does not trigger forced read_console fallback", async ({ page }) => {
+  await page.goto("/?e2eScenario=unity-no-error-routing");
+
+  const sent = await page.evaluate(() =>
+    (window as any).__CODELY_E2E__?.sendCloudMessage?.("Unity 没有报错，但蛇没有自动移动，请先排查行为问题。"),
+  );
+  expect(sent).toBe(true);
+
+  await expect(page.getByText("已按行为问题路径继续，没有强制 console 诊断。")).toBeVisible();
+  await expect(page.getByText("UNEXPECTED_READ_CONSOLE_FALLBACK")).toHaveCount(0);
+
+  await expect
+    .poll(async () =>
+      page.evaluate(() => {
+        const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+        const probe = (window as any).__CLOUD_TOOL_PROTOCOL_TEST__;
+        const requests = probe?.requests || [];
+        const forcedConsoleFallbackSeen = requests.some((request: any) =>
+          String(request.body || "").includes("仍缺少必需的 `read_console`") ||
+          String(request.body || "").includes("auto-fallbacked to local diagnostics"),
+        );
+        return {
+          status: snapshot?.currentTurnStatus,
+          readFileCalls: probe?.readFileCalls || [],
+          forcedConsoleFallbackSeen,
+        };
+      }),
+    )
+    .toEqual({
+      status: "done",
+      readFileCalls: ["README.md"],
+      forcedConsoleFallbackSeen: false,
     });
 });
 

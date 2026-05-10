@@ -57,41 +57,78 @@ function loadTranspiledModuleSync(sourcePath) {
 }
 
 const {
-  buildPseudoToolCallRecoveryPrompt,
-  looksLikeNonStandardToolCallFormat,
-  looksLikePseudoToolCallPlaceholder,
-} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"));
+  shouldRepromptBeforeUnityConsoleFallback,
+  shouldTriggerUnityMcpFirstIterationFallback,
+} = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/lib/orchestrator.ts"),
+);
 
-test("detects bracketed pseudo tool call placeholders", () => {
-  assert.equal(looksLikePseudoToolCallPlaceholder("[Tool call: read_file]"), true);
-  assert.equal(looksLikePseudoToolCallPlaceholder("Tool call: read_file"), true);
-  assert.equal(looksLikePseudoToolCallPlaceholder("工具调用: read_file"), true);
-});
-
-test("does not treat real XML tool calls as pseudo placeholders", () => {
+test("unity fallback triggers only when no tool call and no reply options exist", () => {
   assert.equal(
-    looksLikePseudoToolCallPlaceholder("<tool_use><tool>read_file</tool><parameter name=\"path\">README.md</parameter></tool_use>"),
-    false,
-  );
-});
-
-test("detects non-standard tool_code wrapper as protocol mismatch", () => {
-  assert.equal(
-    looksLikeNonStandardToolCallFormat("<tool_code>list_directory(\"src\")</tool_code>"),
+    shouldTriggerUnityMcpFirstIterationFallback({
+      toolCallCount: 0,
+      replyOptionCount: 0,
+      unityMcpFirstPhaseActive: true,
+      unityMcpFirstIterationPending: true,
+    }),
     true,
   );
+
   assert.equal(
-    looksLikeNonStandardToolCallFormat("<tool_use><tool>read_file</tool></tool_use>"),
+    shouldTriggerUnityMcpFirstIterationFallback({
+      toolCallCount: 0,
+      replyOptionCount: 2,
+      unityMcpFirstPhaseActive: true,
+      unityMcpFirstIterationPending: true,
+    }),
+    false,
+  );
+
+  assert.equal(
+    shouldTriggerUnityMcpFirstIterationFallback({
+      toolCallCount: 1,
+      replyOptionCount: 0,
+      unityMcpFirstPhaseActive: true,
+      unityMcpFirstIterationPending: true,
+    }),
     false,
   );
 });
 
-test("pseudo tool recovery prompt requires XML tool_use with parameters", () => {
-  const prompt = buildPseudoToolCallRecoveryPrompt("zh", "chat");
+test("unity forced console path gives one soft reprompt after valid read-only activity", () => {
+  assert.equal(
+    shouldRepromptBeforeUnityConsoleFallback({
+      readConsoleCalled: false,
+      hasSuccessfulReadOnlyActivity: true,
+      repromptAlreadyIssued: false,
+    }),
+    true,
+  );
 
-  assert.match(prompt, /不是可执行工具调用/);
-  assert.match(prompt, /<tool_code>/);
-  assert.match(prompt, /<tool_use>/);
-  assert.match(prompt, /<parameter name="path">/);
-  assert.match(prompt, /不要再输出 `\[Tool call: \.\.\.\]`、`<tool_code>/);
+  assert.equal(
+    shouldRepromptBeforeUnityConsoleFallback({
+      readConsoleCalled: true,
+      hasSuccessfulReadOnlyActivity: true,
+      repromptAlreadyIssued: false,
+    }),
+    false,
+  );
+
+  assert.equal(
+    shouldRepromptBeforeUnityConsoleFallback({
+      readConsoleCalled: false,
+      hasSuccessfulReadOnlyActivity: false,
+      repromptAlreadyIssued: false,
+    }),
+    false,
+  );
+
+  assert.equal(
+    shouldRepromptBeforeUnityConsoleFallback({
+      readConsoleCalled: false,
+      hasSuccessfulReadOnlyActivity: true,
+      repromptAlreadyIssued: true,
+    }),
+    false,
+  );
 });

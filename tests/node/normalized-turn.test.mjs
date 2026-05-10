@@ -235,6 +235,7 @@ test("normalization treats native user_options calls as UI choices, not executab
     normalized.replyOptions.map((option) => option.value),
     ["仅创建核心模块", "完整生成战斗系统"],
   );
+  assert.equal(normalized.hasExplicitUserChoiceRequest, true);
 });
 
 test("normalization ignores text tool_call user_options instead of executing it", () => {
@@ -258,4 +259,28 @@ test("normalization ignores text tool_call user_options instead of executing it"
     ["只做 BattleUnit.cs", "继续补齐完整 CTB"],
   );
   assert.doesNotMatch(normalized.visibleText, /tool_call/);
+  assert.equal(normalized.hasExplicitUserChoiceRequest, true);
+});
+
+test("normalization marks explicit <user_options> tags even when tool calls coexist", () => {
+  const normalized = normalizeAssistantTurn({
+    content: [
+      "先确认下一步。",
+      "<user_options>",
+      "<option>保守推进</option>",
+      "<option>立即执行</option>",
+      "</user_options>",
+      "<tool_use>",
+      "<tool>read_file</tool>",
+      "<parameter name=\"path\">README.md</parameter>",
+      "</tool_use>",
+    ].join("\n"),
+    toolCalls: [],
+    finishReason: "tool_calls",
+  });
+
+  assert.equal(normalized.hasExplicitUserChoiceRequest, true);
+  assert.equal(normalized.replyOptions.length, 2);
+  assert.equal(normalized.toolCalls.length, 1);
+  assert.equal(normalized.toolCalls[0].name, "read_file");
 });

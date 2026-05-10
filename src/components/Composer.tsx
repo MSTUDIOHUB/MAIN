@@ -10,7 +10,7 @@ import type { AgentMessage, ContentPart } from "../lib/orchestrator";
 import { createWorkspaceFileIndexController } from "../lib/workspaceFileIndex";
 import { getGameStudioSlashCatalog } from "../lib/gameStudioPack";
 import { humanizeSlug } from "../lib/gameStudioCatalog";
-import { getIntentPolicy, getMainIntentShortcuts, getRunIntentCategoryLabel, getRunIntentLabel, parseMainDebugShortcut, parseMainIntentShortcut, resolveComposerIntentSuggestion } from "../lib/runIntent";
+import { getIntentPolicy, getMainIntentShortcuts, getRunIntentCategoryLabel, getRunIntentLabel, parseMainDebugShortcut, parseMainIntentShortcutForMode, resolveComposerIntentSuggestion } from "../lib/runIntent";
 import {
   resolveGameStudioOnboardingAction,
   shouldShowGameStudioOnboarding,
@@ -246,7 +246,11 @@ export default function Composer({
     [language],
   );
   const mainIntentShortcuts = useMemo(
-    () => getMainIntentShortcuts(language === "en" ? "en" : "zh"),
+    () => getMainIntentShortcuts(language === "en" ? "en" : "zh", { mainModeKey: "main_mode" }),
+    [language],
+  );
+  const gameStudioPlanShortcuts = useMemo(
+    () => getMainIntentShortcuts(language === "en" ? "en" : "zh", { mainModeKey: "game_studio" }),
     [language],
   );
   const isGameStudioMode = selectedMainModeKey === "game_studio";
@@ -259,8 +263,8 @@ export default function Composer({
   const slashCommandLabel = language === "en" ? "Studio Commands" : "Studio 命令";
   const slashSearchLabel = slashQuery
     ? (language === "en" ? `Command: ${slashQuery}` : `命令：${slashQuery}`)
-    : (language === "en" ? "Type / to search commands and agents" : "输入 / 搜索工作流命令和专业 Agent");
-  const slashEmptyLabel = language === "en" ? "No matching commands or agents" : "没有匹配的命令或 Agent";
+    : (language === "en" ? "Type / to search plan shortcuts, commands, and agents" : "输入 / 搜索计划入口、工作流命令和专业 Agent");
+  const slashEmptyLabel = language === "en" ? "No matching shortcuts, commands, or agents" : "没有匹配的计划入口、命令或 Agent";
   const slashHint = language === "en" ? "Select to insert canonical command" : "选择后会插入标准命令";
   const mainIntentSearchLabel = slashQuery
     ? (language === "en" ? `Shortcut: ${slashQuery}` : `快捷入口：${slashQuery}`)
@@ -269,8 +273,10 @@ export default function Composer({
   const mainIntentHint = language === "en"
     ? "Use natural language for direct execution; shortcuts are optional."
     : "直接用自然语言下达执行任务；快捷入口是可选的。";
+  const studioPlanHeading = language === "en" ? "Plan Shortcuts" : "计划入口";
   const studioWorkflowHeading = language === "en" ? "Workflow Commands" : "工作流命令";
   const studioAgentHeading = language === "en" ? "Specialist Agents" : "专业 Agent";
+  const planKindLabel = language === "en" ? "plan" : "计划";
   const workflowKindLabel = language === "en" ? "workflow" : "工作流";
   const agentKindLabel = language === "en" ? "agent" : "专家";
   const studioInitLabel = language === "en" ? "Initialize Game Studio" : "初始化 Game Studio";
@@ -283,8 +289,8 @@ export default function Composer({
       ? "Ask naturally for summaries, analysis, reports, extraction, plans, or execution in one place."
       : "直接用自然语言提出总结、分析、报告、提炼、计划或执行需求。",
     game_studio: language === "en"
-      ? "Run MAIN GAME STUDIO workflows, slash commands, and specialist studio agents."
-      : "运行 MAIN GAME STUDIO 工作流、slash 命令和专业工作室 Agent。",
+      ? "Run MAIN GAME STUDIO workflows and specialists, with /plan available for large changes."
+      : "运行 MAIN GAME STUDIO 工作流与专业 Agent，并支持用 /plan 进入计划流。",
   };
   const mentionSearchLabel = mentionQuery
     ? (language === "en" ? `Search: ${mentionQuery}` : `搜索：${mentionQuery}`)
@@ -631,6 +637,21 @@ export default function Composer({
       });
     }
     if (!isGameStudioMode) return [];
+    const planShortcuts = gameStudioPlanShortcuts
+      .map((item) => ({
+        ...item,
+        id: `main_intent:${item.intent}`,
+        kind: "main_intent" as const,
+        group: studioPlanHeading,
+      }))
+      .filter((item) => {
+        if (!normalizedQuery) return true;
+        const categoryLabel = getRunIntentCategoryLabel(item.intent, language === "en" ? "en" : "zh");
+        const haystacks = [item.label, item.command, item.description, categoryLabel, ...(item.aliases || [])]
+          .join(" ")
+          .toLowerCase();
+        return haystacks.includes(normalizedQuery);
+      });
     const ranked = slashCatalog.filter((item) => {
       if (!normalizedQuery) return true;
       const haystacks = [
@@ -644,8 +665,8 @@ export default function Composer({
         .toLowerCase();
       return haystacks.includes(normalizedQuery);
     });
-    return ranked;
-  }, [isGameStudioMode, isMainMode, mainIntentShortcuts, slashCatalog, slashQuery]);
+    return [...planShortcuts, ...ranked];
+  }, [gameStudioPlanShortcuts, isGameStudioMode, isMainMode, language, mainIntentShortcuts, slashCatalog, slashQuery, studioPlanHeading]);
 
   const mainIntentSlashGroups = useMemo(() => {
     if (!isMainMode || filteredSlashItems.length === 0) return [];
@@ -681,12 +702,24 @@ export default function Composer({
       }
       return groups;
     }
+    const planGroups = new Map();
     const workflowGroups = new Map();
     const agentGroups = new Map();
     for (const item of filteredSlashItems) {
-      const target = item.kind === "workflow" ? workflowGroups : agentGroups;
+      const target = item.kind === "main_intent"
+        ? planGroups
+        : item.kind === "workflow"
+        ? workflowGroups
+        : agentGroups;
       if (!target.has(item.group)) target.set(item.group, []);
       target.get(item.group).push(item);
+    }
+    if (planGroups.size > 0) {
+      groups.push({
+        kind: "main_intent",
+        heading: studioPlanHeading,
+        groups: Array.from(planGroups.entries()),
+      });
     }
     if (workflowGroups.size > 0) {
       groups.push({
@@ -703,7 +736,7 @@ export default function Composer({
       });
     }
     return groups;
-  }, [filteredSlashItems, isMainMode, language, mainIntentSlashGroups, studioAgentHeading, studioWorkflowHeading]);
+  }, [filteredSlashItems, isMainMode, language, mainIntentSlashGroups, studioAgentHeading, studioPlanHeading, studioWorkflowHeading]);
 
   const closeMentionMenu = useCallback(() => {
     setShowMentionMenu(false);
@@ -1002,7 +1035,7 @@ export default function Composer({
   };
 
   const handleSelectMainIntentShortcut = (item) => {
-    const parsed = parseMainIntentShortcut(draftInput);
+    const parsed = parseMainIntentShortcutForMode(draftInput, selectedMainModeKey);
     const slashAnchor = slashAnchorRef.current;
     const nextInput = slashAnchor >= 0
       ? removeSlashSessionToken(draftInput, slashAnchor)
@@ -1223,7 +1256,7 @@ export default function Composer({
     const justFinishedComposition = Date.now() - compositionEndedAtRef.current < 140;
     const isImeKeyInput = isComposingRef.current || nativeEvent.isComposing || e.keyCode === 229 || justFinishedComposition;
     if (
-      isMainMode &&
+      (isMainMode || isGameStudioMode) &&
       !activeDiffTask &&
       e.key === "Tab" &&
       e.shiftKey &&
@@ -1287,10 +1320,11 @@ export default function Composer({
       if ((e.key === "Enter" && !e.altKey && !e.shiftKey) || e.key === "Tab") {
         e.preventDefault();
         if (visibleSlashItems.length > 0 && highlightedSlashIndex < visibleSlashItems.length) {
-          if (isMainMode) {
-            handleSelectMainIntentShortcut(visibleSlashItems[highlightedSlashIndex]);
+          const slashItem = visibleSlashItems[highlightedSlashIndex];
+          if (isMainMode || slashItem?.kind === "main_intent") {
+            handleSelectMainIntentShortcut(slashItem);
           } else {
-            handleSelectSlashItem(visibleSlashItems[highlightedSlashIndex]);
+            handleSelectSlashItem(slashItem);
           }
         } else if (e.key === "Enter" && !e.altKey && draftInput.trim().startsWith("/")) {
           handleSubmitComposerMessage();
@@ -1320,7 +1354,7 @@ export default function Composer({
   const composerPlaceholder = activeDiffTask
     ? "..."
     : isGameStudioMode
-    ? (language === "en" ? "Ask the studio, or type / for workflows and specialists..." : "询问工作室中枢，或输入 / 打开工作流和专家面板...")
+    ? (language === "en" ? "Ask the studio, or type / for plan, workflows, and specialists..." : "询问工作室中枢，或输入 / 打开计划入口、工作流和专家面板...")
     : language === "en"
     ? "Describe what you need, or type / for planning and output styles..."
     : "输入需求，或输入 / 选择计划入口、分析、总结、报告...";
@@ -1798,10 +1832,20 @@ export default function Composer({
                               {items.map((item) => {
                                 globalIndex += 1;
                                 const isActive = globalIndex === highlightedSlashIndex;
+                                const itemTitle = item.kind === "workflow"
+                                  ? item.canonicalCommand
+                                  : item.kind === "main_intent"
+                                  ? item.command
+                                  : item.label;
+                                const itemKindLabel = item.kind === "workflow"
+                                  ? workflowKindLabel
+                                  : item.kind === "main_intent"
+                                  ? planKindLabel
+                                  : agentKindLabel;
                                 return (
                                   <button
                                     key={item.id}
-                                    onClick={() => handleSelectSlashItem(item)}
+                                    onClick={() => (item.kind === "main_intent" ? handleSelectMainIntentShortcut(item) : handleSelectSlashItem(item))}
                                     className={`w-full rounded-md px-3 py-2 text-left transition-colors ${
                                       isActive ? "bg-[#18181b]" : "hover:bg-[#131316]"
                                     }`}
@@ -1809,14 +1853,14 @@ export default function Composer({
                                     <div className="flex items-center justify-between gap-3">
                                       <div className="min-w-0">
                                         <div className="text-[12px] font-semibold text-[#f4f4f5] truncate">
-                                          {item.kind === "workflow" ? item.canonicalCommand : item.label}
+                                          {itemTitle}
                                         </div>
                                         <div className="mt-0.5 text-[11px] leading-snug text-[#71717a]">
                                           {item.description}
                                         </div>
                                       </div>
                                       <div className="shrink-0 rounded-full border border-[#27272a] bg-[#050507] px-2 py-0.5 text-[10px] text-[#a1a1aa]">
-                                        {item.kind === "workflow" ? workflowKindLabel : agentKindLabel}
+                                        {itemKindLabel}
                                       </div>
                                     </div>
                                   </button>

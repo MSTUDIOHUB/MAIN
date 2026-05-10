@@ -12,6 +12,7 @@ interface TopIslandProps {
   statusToneClass: string;
   language: "zh" | "en";
   themeMode: "light" | "dark" | "black";
+  chatFontSize?: number;
   isVisible?: boolean;
   planTasks: PlanTask[];
   planExecutionEvidenceLedger?: PlanExecutionEvidenceEntry[];
@@ -38,6 +39,10 @@ interface TopIslandProps {
   onHeightChange?: (height: number) => void;
 }
 // endregion
+
+function isApprovalActionOption(option: ReplyOption): boolean {
+  return option.action === "continue_readonly_once" || option.action === "allow_readonly_session";
+}
 
 function getStageLabel(stage: PlanStage, language: "zh" | "en"): string {
   const zh: Record<PlanStage, string> = {
@@ -69,6 +74,7 @@ const TopIsland = memo(function TopIsland({
   statusToneClass,
   language,
   themeMode,
+  chatFontSize = 13,
   isVisible = true,
   planTasks,
   planExecutionEvidenceLedger = [],
@@ -100,8 +106,19 @@ const TopIsland = memo(function TopIsland({
   const [customReplyText, setCustomReplyText] = useState("");
   const shellRef = useRef<HTMLDivElement | null>(null);
 
+  const realChoiceOptions = useMemo(
+    () => replyOptions.filter((option) => !isApprovalActionOption(option)),
+    [replyOptions],
+  );
+  const approvalActionOptions = useMemo(
+    () => replyOptions.filter((option) => isApprovalActionOption(option)),
+    [replyOptions],
+  );
+  const hasRealChoiceOptions = realChoiceOptions.length > 0;
+  const hasApprovalActionOptions = approvalActionOptions.length > 0;
+
   // region: TopIsland 展开时机
-  const hasReplyOptions = replyOptions.length > 0;
+  const hasReplyOptions = hasRealChoiceOptions || hasApprovalActionOptions;
   const hasPendingRunDecision = !!pendingRunDecision;
   const hasActiveDiffPreview = !!activeDiffTask?.diff;
   const hasChoicePromptContent = hasReplyOptions || isAwaitingChoice || hasPendingRunDecision;
@@ -110,7 +127,7 @@ const TopIsland = memo(function TopIsland({
     return [
       isAwaitingChoice ? "awaiting" : "ready",
       pendingRunDecision ? `${pendingRunDecision.kind}:${pendingRunDecision.title || ""}:${pendingRunDecision.reason || ""}` : "",
-      replyOptions.map((option) => `${option.label}:${option.value}`).join("|"),
+      replyOptions.map((option) => `${option.label}:${option.value}:${option.action || "none"}`).join("|"),
     ].join("::");
   }, [hasChoicePromptContent, isAwaitingChoice, pendingRunDecision, replyOptions]);
   const isChoicePromptManuallyCollapsed = !!choicePromptKey && manualChoiceCollapsedKey === choicePromptKey;
@@ -195,6 +212,11 @@ const TopIsland = memo(function TopIsland({
     choicePrompt: language === "zh"
       ? "直接在这里点选即可继续当前回合。"
       : "Choose an option here to continue the current turn.",
+    choicesSectionTitle: language === "zh" ? "选择下一步" : "Choose the next step",
+    approvalActionsTitle: language === "zh" ? "执行批准动作" : "Execution Approval Actions",
+    approvalActionsHint: language === "zh"
+      ? "以下属于执行授权动作，不是模型分叉提问选项。"
+      : "These are execution approval actions, not model decision branches.",
     customChoicePlaceholder: language === "zh" ? "输入你的想法作为选项" : "Type your own choice",
     customChoiceSubmit: language === "zh" ? "确认" : "Confirm",
     executionConsentTitle: language === "zh" ? "允许开始执行本轮改动？" : "Allow this turn to start making changes?",
@@ -235,6 +257,21 @@ const TopIsland = memo(function TopIsland({
   const showChoicePromptContent = !isChoicePromptManuallyCollapsed;
   const showPendingRunDecision = !!pendingRunDecision && showChoicePromptContent;
   const showAwaitingChoice = isAwaitingChoice && showChoicePromptContent;
+  const choiceTextFontSize = Math.max(12, chatFontSize);
+  const choiceTextLineHeight = Math.max(20, Math.round(choiceTextFontSize * 1.7));
+  const choiceSectionFontSize = Math.max(11, choiceTextFontSize - 1);
+  const choiceSectionLineHeight = Math.max(16, Math.round(choiceSectionFontSize * 1.55));
+  const customChoiceNumber = hasRealChoiceOptions ? realChoiceOptions.length + 1 : 1;
+  const choiceTextStyle = { fontSize: `${choiceTextFontSize}px`, lineHeight: `${choiceTextLineHeight}px` };
+  const choiceSectionStyle = { fontSize: `${choiceSectionFontSize}px`, lineHeight: `${choiceSectionLineHeight}px` };
+  const choiceOptionButtonClass = "top-island-choice-option w-full min-w-0 rounded-xl border px-3 py-2.5 text-left transition-all duration-150";
+  const choiceNumberClass = "top-island-choice-number w-7 shrink-0 text-right font-semibold transition-colors duration-150";
+  const approvalOptionButtonClass = "top-island-approval-option w-full rounded-xl border px-3 py-2.5 text-left transition-all duration-150";
+  const neutralActionButtonClass = themeMode === "light"
+    ? "rounded-xl border border-[rgba(15,23,42,0.14)] bg-[rgba(255,255,255,0.72)] text-[#334155] transition-all duration-150 hover:border-[var(--accent)] hover:bg-[var(--accent-subtle)] hover:text-[#111827]"
+    : isBlackTheme
+    ? "rounded-xl border border-[#202026] bg-[#030304] text-[#c4c4cc] transition-all duration-150 hover:border-[var(--accent)] hover:bg-[color-mix(in_srgb,var(--accent)_14%,transparent)] hover:text-[#f5f5f5]"
+    : "rounded-xl border border-[#3f3f46] bg-[#09090b] text-[#a1a1aa] transition-all duration-150 hover:border-[var(--accent)] hover:bg-[color-mix(in_srgb,var(--accent)_14%,transparent)] hover:text-[#f5f5f5]";
 
   const submitCustomReply = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -326,7 +363,7 @@ const TopIsland = memo(function TopIsland({
                   setManualChoiceCollapsedKey(null);
                   setPinnedOpen(true);
                 }}
-                className="rounded-full border border-[rgba(124,58,237,0.25)] bg-[rgba(124,58,237,0.14)] px-3 py-1 text-[11px] text-[#ddd6fe] transition-colors hover:bg-[rgba(124,58,237,0.22)]"
+                className="rounded-full border border-[var(--accent-subtle-border)] bg-[var(--accent-subtle)] px-3 py-1 text-[11px] text-[var(--accent-light)] transition-colors hover:border-[var(--accent)] hover:bg-[var(--accent)] hover:text-white"
                 title={copy.showOptions}
               >
                 <span className="inline-flex items-center gap-1.5">
@@ -362,16 +399,16 @@ const TopIsland = memo(function TopIsland({
             {showPendingRunDecision && (
               <div>
                 <div data-testid="top-island-pending-run-decision" className={`rounded-2xl border p-3 ${surface}`}>
-                  <div className={`text-[12px] font-medium ${primaryText}`}>
+                  <div className={`font-medium ${primaryText}`} style={choiceTextStyle}>
                     {pendingRunDecision.kind === "execution_consent"
                       ? copy.executionConsentTitle
                       : pendingRunDecision.title || copy.chooseToContinue}
                   </div>
-                  <div className={`mt-1 break-words text-[12px] leading-6 ${secondaryText}`}>
+                  <div className={`mt-1 break-words ${secondaryText}`} style={choiceTextStyle}>
                     {pendingRunDecision.reason}
                   </div>
                   {pendingRunDecision.kind === "execution_consent" && (
-                    <div className={`mt-1 break-words text-[11px] leading-6 ${secondaryText}`}>
+                    <div className={`mt-1 break-words ${secondaryText}`} style={choiceSectionStyle}>
                       {copy.executionConsentHint}
                       {pendingRunDecision.target ? ` ${pendingRunDecision.target}` : ""}
                     </div>
@@ -382,7 +419,7 @@ const TopIsland = memo(function TopIsland({
                     <>
                       <button
                         onClick={() => onResolvePendingRunDecision?.("cancel")}
-                        className="rounded-lg border border-[#3f3f46] bg-[#09090b] px-4 py-2 text-[12px] font-medium text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#f5f5f5]"
+                        className={`${neutralActionButtonClass} px-4 py-2 text-[12px] font-medium`}
                       >
                         {copy.dismiss}
                       </button>
@@ -407,28 +444,27 @@ const TopIsland = memo(function TopIsland({
                     </>
                   ) : (
                     <>
-                      {(pendingRunDecision.options || []).map((option, index) => (
-                        <button
-                          key={`${option.id}-${index}`}
-                          data-testid={`top-island-intent-option-${option.id}`}
-                          onClick={() => onResolvePendingRunDecision?.(option.id)}
-                          className={`rounded-lg px-4 py-2 text-[12px] font-medium transition-colors ${
-                            index === 0
-                              ? "text-white"
-                              : "border border-[#3f3f46] bg-[#09090b] text-[#a1a1aa] hover:bg-[#18181b] hover:text-[#f5f5f5]"
-                          }`}
-                          style={
-                            index === 0
-                              ? { background: "linear-gradient(135deg, var(--accent, #7c3aed), #2563eb)" }
-                              : undefined
-                          }
-                        >
-                          {option.label}
-                        </button>
-                      ))}
+                      <div className="w-full space-y-2">
+                        {(pendingRunDecision.options || []).map((option, index) => (
+                          <div
+                            key={`${option.id}-${index}`}
+                            className="group flex min-w-0 items-center gap-2"
+                          >
+                            <span data-testid={`top-island-intent-option-badge-${index}`} className={choiceNumberClass} style={choiceTextStyle}>{index + 1}.</span>
+                            <button
+                              data-testid={`top-island-intent-option-${option.id}`}
+                              onClick={() => onResolvePendingRunDecision?.(option.id)}
+                              className={choiceOptionButtonClass}
+                              style={choiceTextStyle}
+                            >
+                              <span className="min-w-0 break-words">{option.label}</span>
+                            </button>
+                          </div>
+                        ))}
+                      </div>
                       <button
                         onClick={() => onResolvePendingRunDecision?.("cancel")}
-                        className="rounded-lg border border-[#3f3f46] bg-[#09090b] px-4 py-2 text-[12px] font-medium text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#f5f5f5]"
+                        className={`${neutralActionButtonClass} px-4 py-2 text-[12px] font-medium`}
                       >
                         {copy.dismiss}
                       </button>
@@ -522,51 +558,90 @@ const TopIsland = memo(function TopIsland({
 
             {showAwaitingChoice && (
               <div data-testid="top-island-awaiting-choice" className={`mt-3 rounded-2xl border p-3 ${surface}`}>
-                <div className={`text-[12px] font-medium ${primaryText}`}>{copy.chooseToContinue}</div>
-                <div className={`mt-1 text-[12px] leading-6 ${secondaryText}`}>
-                  {hasReplyOptions ? copy.choicePrompt : copy.choiceHint}
+                <div className={`font-medium ${primaryText}`} style={choiceTextStyle}>{copy.chooseToContinue}</div>
+                <div className={`mt-1 ${secondaryText}`} style={choiceTextStyle}>
+                  {hasRealChoiceOptions ? copy.choicePrompt : hasApprovalActionOptions ? copy.approvalActionsHint : copy.choiceHint}
                 </div>
                 {hasReplyOptions && (
-                  <div className="mt-3 flex flex-col gap-2">
-                    {replyOptions.map((option, index) => (
-                      <button
-                        key={`${option.value}-${index}`}
-                        data-testid={`top-island-reply-option-${index}`}
-                        onClick={() => onSelectReplyOption?.(option)}
-                        className="w-full rounded-xl border border-[rgba(124,58,237,0.24)] bg-[rgba(124,58,237,0.08)] px-3 py-2.5 text-left text-[12px] leading-6 text-[#f5f3ff] transition-colors hover:bg-[rgba(124,58,237,0.16)]"
-                      >
-                        {option.label}
-                      </button>
-                    ))}
-                    <form onSubmit={submitCustomReply} className="flex min-w-0 items-center gap-2">
-                      <input
-                        data-testid="top-island-custom-reply-input"
-                        value={customReplyText}
-                        onChange={(event) => setCustomReplyText(event.target.value)}
-                        placeholder={copy.customChoicePlaceholder}
-                        className={`min-w-0 flex-1 rounded-xl border px-3 py-2.5 text-[12px] leading-6 outline-none transition-colors ${
-                          themeMode === "light"
-                            ? "border-[rgba(15,23,42,0.12)] bg-[rgba(255,255,255,0.62)] text-[#111827] placeholder:text-[#6b7280] focus:border-[rgba(124,58,237,0.45)]"
-                            : isBlackTheme
-                            ? "border-[#202026] bg-[#030304] text-[#f5f5f5] placeholder:text-[#74747e] focus:border-[rgba(124,58,237,0.5)]"
-                            : "border-[#3f3f46] bg-[#09090b] text-[#f5f5f5] placeholder:text-[#71717a] focus:border-[rgba(124,58,237,0.5)]"
-                        }`}
-                      />
-                      <button
-                        type="submit"
-                        data-testid="top-island-custom-reply-submit"
-                        disabled={!normalizedCustomReply || !onSelectReplyOption}
-                        className={`shrink-0 rounded-xl px-3 py-2.5 text-[12px] font-semibold transition-opacity ${
-                          normalizedCustomReply && onSelectReplyOption ? "text-white opacity-100" : "cursor-not-allowed text-white opacity-40"
-                        }`}
-                        style={{ background: "linear-gradient(135deg, var(--accent, #7c3aed), #2563eb)" }}
-                      >
-                        {copy.customChoiceSubmit}
-                      </button>
+                  <div className="mt-3 flex flex-col gap-3">
+                    {hasRealChoiceOptions && (
+                      <div>
+                        <div className={`font-medium uppercase tracking-[0.14em] ${secondaryText}`} style={choiceSectionStyle}>
+                          {copy.choicesSectionTitle}
+                        </div>
+                        <div className="mt-2 space-y-2">
+                          {realChoiceOptions.map((option, index) => (
+                            <div
+                              key={`${option.value}-${index}`}
+                              className="group flex min-w-0 items-center gap-2"
+                            >
+                              <span data-testid={`top-island-reply-option-badge-${index}`} className={choiceNumberClass} style={choiceTextStyle}>{index + 1}.</span>
+                              <button
+                                data-testid={`top-island-reply-option-${index}`}
+                                onClick={() => onSelectReplyOption?.(option)}
+                                className={choiceOptionButtonClass}
+                                style={choiceTextStyle}
+                              >
+                                <span className="min-w-0 break-words">{option.label}</span>
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {hasApprovalActionOptions && (
+                      <div data-testid="top-island-approval-actions" className={`rounded-xl border p-3 ${surface}`}>
+                        <div className={`font-medium uppercase tracking-[0.14em] ${secondaryText}`} style={choiceSectionStyle}>
+                          {copy.approvalActionsTitle}
+                        </div>
+                        <div className={`mt-1 ${secondaryText}`} style={choiceSectionStyle}>{copy.approvalActionsHint}</div>
+                        <div className="mt-2 space-y-2">
+                          {approvalActionOptions.map((option, index) => (
+                            <button
+                              key={`${option.value}-${index}`}
+                              data-testid={`top-island-approval-option-${index}`}
+                              onClick={() => onSelectReplyOption?.(option)}
+                              className={approvalOptionButtonClass}
+                              style={choiceTextStyle}
+                            >
+                              {option.label}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    <form onSubmit={submitCustomReply} data-testid="top-island-custom-reply-row" className="group flex min-w-0 items-center gap-2">
+                      <span data-testid="top-island-custom-reply-badge" className={choiceNumberClass} style={choiceTextStyle}>{customChoiceNumber}.</span>
+                      <div className="min-w-0 flex-1">
+                        <div className="flex min-w-0 items-center gap-2">
+                          <input
+                            data-testid="top-island-custom-reply-input"
+                            value={customReplyText}
+                            onChange={(event) => setCustomReplyText(event.target.value)}
+                            placeholder={copy.customChoicePlaceholder}
+                            className="top-island-choice-input min-w-0 flex-1 rounded-xl border px-3 py-2.5 outline-none transition-all"
+                            style={choiceTextStyle}
+                          />
+                          <button
+                            type="submit"
+                            data-testid="top-island-custom-reply-submit"
+                            disabled={!normalizedCustomReply || !onSelectReplyOption}
+                            className={`shrink-0 rounded-xl px-3 py-2.5 text-[12px] font-semibold transition-opacity ${
+                              normalizedCustomReply && onSelectReplyOption ? "text-white opacity-100" : "cursor-not-allowed text-white opacity-40"
+                            }`}
+                            style={{ background: "linear-gradient(135deg, var(--accent, #7c3aed), #2563eb)" }}
+                          >
+                            {copy.customChoiceSubmit}
+                          </button>
+                        </div>
+                      </div>
                     </form>
                     <button
                       onClick={onCancelTurn}
-                      className="w-full rounded-xl border border-[#3f3f46] bg-[#09090b] px-3 py-2.5 text-left text-[12px] leading-6 text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#f5f5f5]"
+                      className={`${neutralActionButtonClass} w-full px-3 py-2.5 text-left`}
+                      style={choiceTextStyle}
                     >
                       {copy.cancelTurn}
                     </button>

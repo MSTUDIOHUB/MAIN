@@ -9,6 +9,7 @@ const PLAN_RELOAD_RESUME_SCENARIO = "plan-reload-resume";
 const DIFF_RELOAD_SUMMARY_SCENARIO = "diff-reload-summary";
 const PLAN_REPLACE_REFRESH_SCENARIO = "plan-replace-refresh";
 const AWAITING_CHOICE_SCENARIO = "awaiting-choice";
+const AWAITING_CHOICE_MIXED_OPTIONS_SCENARIO = "awaiting-choice-mixed-options";
 const FEISHU_REMOTE_ANALYSIS_SCENARIO = "feishu-remote-analysis";
 const READ_CONTEXT_COLLAPSE_SCENARIO = "read-context-collapse";
 const READ_CONTEXT_INTERLEAVED_SCENARIO = "read-context-interleaved";
@@ -16,6 +17,7 @@ const READ_CONTEXT_AGENT_SEGMENT_SCENARIO = "read-context-agent-segment";
 const THINKING_POLICY_SCENARIO = "thinking-policy";
 const GAME_STUDIO_ONBOARDING_SCENARIO = "game-studio-onboarding";
 const COMPOSER_MAIN_SHORTCUTS_SCENARIO = "composer-main-shortcuts";
+const GAME_STUDIO_PLAN_SHORTCUTS_SCENARIO = "game-studio-plan-shortcuts";
 const CLOUD_SETTINGS_MODEL_SELECT_SCENARIO = "cloud-settings-model-select";
 const CLOUD_SETTINGS_EMPTY_SCENARIO = "cloud-settings-empty";
 const CLOUD_STATUS_ACTIVE_SERVER_MODEL_SCENARIO = "cloud-status-active-server-model";
@@ -28,12 +30,17 @@ const REPLY_OPTIONS_TOOL_PAUSE_SCENARIO = "reply-options-tool-pause";
 const PLAN_APPROVAL_EXECUTE_TOOLS_SCENARIO = "plan-approval-execute-tools";
 const EXECUTE_QUICK_REPLY_RUNTIME_SCENARIO = "execute-quick-reply-runtime";
 const GAME_STUDIO_EXECUTE_REPLY_SCENARIO = "game-studio-execute-reply-runtime";
+const UNITY_MCP_OPTIONS_PRIORITY_SCENARIO = "unity-mcp-options-priority";
+const UNITY_TOOL_CODE_COMPAT_SCENARIO = "unity-tool-code-compat";
+const UNITY_NO_ERROR_ROUTING_SCENARIO = "unity-no-error-routing";
 const PSEUDO_TOOL_CALL_RECOVERY_SCENARIO = "pseudo-tool-call-recovery";
 const EXISTING_PLAN_FOLDER_EXECUTE_SCENARIO = "existing-plan-folder-execute";
 const EXECUTE_MAX_ITERATIONS_CHECKPOINT_SCENARIO = "execute-max-iterations-checkpoint";
 const LOCAL_FILE_READ_APPROVAL_SCENARIO = "local-file-read-approval";
 const TOP_ISLAND_EXECUTION_PROGRESS_SCENARIO = "top-island-execution-progress";
 const TOP_ISLAND_PLAN_TASK_PROGRESS_SCENARIO = "top-island-plan-task-progress";
+const GAME_STUDIO_TOOL_GROUP_COLLAPSE_SCENARIO = "game-studio-tool-group-collapse";
+const GAME_STUDIO_AWAITING_CHOICE_SCENARIO = "game-studio-awaiting-choice";
 const SIDEBAR_REMOVE_LAST_WORKSPACE_SCENARIO = "sidebar-remove-last-workspace";
 const E2E_SEED_COUNT_PREFIX = "__CODELY_E2E_SEED_COUNT__:";
 
@@ -741,6 +748,103 @@ function seedAwaitingChoiceScenario() {
   return cleanup;
 }
 
+function seedAwaitingChoiceMixedOptionsScenario() {
+  const bridge = getBridge();
+  if (!bridge) return undefined;
+
+  bridge.events = [{ type: "boot" }];
+  bridge.savedDocuments = [];
+  bridge.completed = false;
+
+  const turnId = "e2e-awaiting-choice-mixed-options-turn";
+  const sessionId = 999028;
+  const now = Date.now();
+  const userBlockId = useAppStore.getState()._nextTaskId();
+  const agentBlockId = useAppStore.getState()._nextTaskId();
+
+  useAppStore.setState((state) => ({
+    ...state,
+    config: {
+      ...state.config,
+      language: "zh",
+      workflowMode: "plan",
+    },
+    currentWorkspace: "/tmp/e2e-awaiting-choice-mixed-options",
+    sessionsByWorkspace: {
+      "/tmp/e2e-awaiting-choice-mixed-options": [
+        {
+          id: sessionId,
+          title: "E2E Awaiting Choice Mixed",
+          date: new Date(now).toISOString(),
+          active: true,
+          messages: [],
+        },
+      ],
+    },
+    currentSessionId: sessionId,
+    taskFlow: [
+      { id: userBlockId, turnId, type: "user", content: "请告诉我下一步该怎么处理。" },
+      {
+        id: agentBlockId,
+        turnId,
+        type: "agent",
+        content: "这里有真实分叉和只读授权动作，请先选择。",
+        streaming: false,
+        options: [
+          { label: "先确认代码主逻辑，再决定是否改动", value: "先确认代码主逻辑，再决定是否改动" },
+          { label: "先确认渲染层，再回头看业务逻辑", value: "先确认渲染层，再回头看业务逻辑" },
+          { label: "继续当前只读读取", value: "请继续当前只读读取。", action: "continue_readonly_once" },
+          { label: "当前会话只读步骤全部批准", value: "本会话只读读取、搜索和分析步骤全部允许。", action: "allow_readonly_session" },
+        ],
+      },
+    ],
+    conversationTurns: [
+      {
+        id: turnId,
+        userPrompt: "请告诉我下一步该怎么处理。",
+        title: "混合选项分区",
+        mode: "plan",
+        status: "awaiting_input",
+        summary: "等待用户选择真实分叉或授权动作。",
+        blockIds: [userBlockId, agentBlockId],
+        collapsed: false,
+        createdAt: now,
+      },
+    ],
+    currentTurnId: turnId,
+    planArtifacts: [],
+    planTasks: [],
+    planExecutionEvidenceLedger: [],
+    planStage: "design",
+    isPlanApproved: false,
+    showPlanPanel: false,
+    showDiff: false,
+    showTerminal: false,
+    showFilePanel: false,
+    rightPanelTab: "plan",
+    agentStatus: "idle",
+    isGenerating: false,
+    abortController: null,
+    pendingReviewResolve: null,
+    pendingReviewTaskId: null,
+    pendingToolCall: null,
+    selectedDiffTaskId: null,
+    input: "",
+    attachedFiles: [],
+    contextMentions: [],
+  }));
+
+  bindBridgeSnapshot(AWAITING_CHOICE_MIXED_OPTIONS_SCENARIO);
+  appendBridgeEvent("choice-requested-mixed");
+
+  const cleanup = () => {
+    bridge.initialized = false;
+  };
+
+  bridge.cleanup = cleanup;
+  return cleanup;
+}
+
 function seedFeishuRemoteAnalysisScenario() {
   const bridge = getBridge();
   if (!bridge) return undefined;
@@ -900,7 +1004,7 @@ function seedReadContextCollapseScenario() {
   const agentBlockId = useAppStore.getState()._nextTaskId();
   const singleReadBlockId = useAppStore.getState()._nextTaskId();
   const agentAfterSingleReadBlockId = useAppStore.getState()._nextTaskId();
-  const taskFlow = [
+  const taskFlow: any[] = [
     { id: userBlockId, turnId, type: "user" as const, content: "请读取战斗系统上下文并继续分析。" },
     ...readBlocks,
     failedReadBlock,
@@ -997,7 +1101,7 @@ function seedReadContextInterleavedScenario() {
   const sessionId = 999026;
   const now = Date.now();
   const userBlockId = useAppStore.getState()._nextTaskId();
-  const taskFlow = [
+  const taskFlow: any[] = [
     { id: userBlockId, turnId, type: "user" as const, content: "读取并搜索后执行几条命令，继续总结。" },
     {
       id: useAppStore.getState()._nextTaskId(),
@@ -1124,7 +1228,7 @@ function seedReadContextAgentSegmentScenario() {
   const sessionId = 999027;
   const now = Date.now();
   const userBlockId = useAppStore.getState()._nextTaskId();
-  const taskFlow = [
+  const taskFlow: any[] = [
     { id: userBlockId, turnId, type: "user" as const, content: "分两段读取上下文并在中间输出一次结论。" },
     {
       id: useAppStore.getState()._nextTaskId(),
@@ -1976,6 +2080,150 @@ function seedTopIslandPlanTaskProgressScenario() {
   return cleanup;
 }
 
+function seedGameStudioToolGroupScenario(status: "executing" | "awaiting_input") {
+  const bridge = getBridge();
+  if (!bridge) return undefined;
+
+  bridge.events = [{ type: "boot" }];
+  bridge.savedDocuments = [];
+  bridge.completed = status !== "executing";
+
+  const workspace = status === "executing"
+    ? "/tmp/e2e-game-studio-tool-group"
+    : "/tmp/e2e-game-studio-awaiting-choice";
+  const sessionId = status === "executing" ? 999611 : 999612;
+  const now = Date.now();
+  const turnId = status === "executing"
+    ? "e2e-game-studio-tool-group-turn"
+    : "e2e-game-studio-awaiting-choice-turn";
+  const userBlockId = useAppStore.getState()._nextTaskId();
+  const completedAId = useAppStore.getState()._nextTaskId();
+  const completedBId = useAppStore.getState()._nextTaskId();
+  const completedCId = useAppStore.getState()._nextTaskId();
+  const tailToolId = useAppStore.getState()._nextTaskId();
+  const agentBlockId = useAppStore.getState()._nextTaskId();
+
+  const taskFlow: any[] = [
+    { id: userBlockId, turnId, type: "user" as const, content: "继续排查 Main Camera 行为。" },
+    {
+      id: completedAId,
+      turnId,
+      type: "tool" as const,
+      toolName: "find_gameobjects",
+      target: "Main Camera",
+      status: "done",
+      toolStatus: "executed" as const,
+      message: "OK",
+    },
+    {
+      id: completedBId,
+      turnId,
+      type: "tool" as const,
+      toolName: "manage_camera",
+      target: "Main Camera",
+      status: "done",
+      toolStatus: "executed" as const,
+      message: "OK",
+    },
+    {
+      id: completedCId,
+      turnId,
+      type: "tool" as const,
+      toolName: "execute_code",
+      target: "Assets/Scripts/Camera/SnakeCameraController.cs",
+      status: "done",
+      toolStatus: "executed" as const,
+      message: "OK",
+    },
+  ];
+
+  if (status === "executing") {
+    taskFlow.push({
+      id: tailToolId,
+      turnId,
+      type: "tool",
+      toolName: "manage_camera",
+      target: "Main Camera",
+      status: "running",
+      toolStatus: "running",
+      message: "Executing...",
+    });
+  } else {
+    taskFlow.push({
+      id: agentBlockId,
+      turnId,
+      type: "agent",
+      content: "请选择下一步。",
+      options: [
+        { label: "继续分析 Main Camera", value: "继续分析 Main Camera", action: "continue_readonly_once" },
+        { label: "本会话只读全部允许", value: "本会话只读全部允许", action: "allow_readonly_session" },
+      ],
+      streaming: false,
+    });
+  }
+
+  useAppStore.setState((state) => ({
+    ...state,
+    config: {
+      ...state.config,
+      language: "zh",
+      workflowMode: "edit",
+    },
+    selectedMainModeKey: "game_studio",
+    selectedNexusModeKey: "nexus_game_studio",
+    currentWorkspace: workspace,
+    sessionsByWorkspace: {
+      [workspace]: [
+        {
+          id: sessionId,
+          title: status === "executing"
+            ? "E2E Game Studio Tool Group Collapse"
+            : "E2E Game Studio Awaiting Choice",
+          date: new Date(now).toISOString(),
+          active: true,
+          messages: [],
+        },
+      ],
+    },
+    currentSessionId: sessionId,
+    taskFlow,
+    conversationTurns: [
+      {
+        id: turnId,
+        userPrompt: "继续排查 Main Camera 行为。",
+        title: status === "executing" ? "工具折叠回归" : "等待选择状态回归",
+        mode: "edit",
+        intent: "studio_workflow",
+        status,
+        summary: status === "executing" ? "Game Studio 连续工具调用中。" : "Game Studio 已暂停等待选择。",
+        blockIds: taskFlow.map((block) => block.id),
+        collapsed: false,
+        createdAt: now,
+      },
+    ],
+    currentTurnId: turnId,
+    agentStatus: status === "executing" ? "running" : "idle",
+    isGenerating: status === "executing",
+    showPlanPanel: false,
+    showDiff: false,
+    showTerminal: false,
+    showFilePanel: false,
+  }));
+
+  bindBridgeSnapshot(
+    status === "executing"
+      ? GAME_STUDIO_TOOL_GROUP_COLLAPSE_SCENARIO
+      : GAME_STUDIO_AWAITING_CHOICE_SCENARIO,
+  );
+
+  const cleanup = () => {
+    bridge.initialized = false;
+  };
+
+  bridge.cleanup = cleanup;
+  return cleanup;
+}
+
 function seedGameStudioOnboardingScenario() {
   const bridge = getBridge();
   if (!bridge) return undefined;
@@ -2224,6 +2472,135 @@ function seedComposerMainShortcutsScenario() {
       planStage: state.planStage,
       seedCount: readSeedCount(COMPOSER_MAIN_SHORTCUTS_SCENARIO),
     };
+  };
+
+  const cleanup = () => {
+    bridge.initialized = false;
+  };
+
+  bridge.cleanup = cleanup;
+  return cleanup;
+}
+
+function seedGameStudioPlanShortcutsScenario() {
+  const bridge = getBridge();
+  if (!bridge) return undefined;
+
+  bridge.events = [{ type: "boot" }];
+  bridge.savedDocuments = [];
+  bridge.completed = false;
+
+  incrementSeedCount(GAME_STUDIO_PLAN_SHORTCUTS_SCENARIO);
+
+  useAppStore.setState((state) => ({
+    ...state,
+    config: {
+      ...state.config,
+      language: "zh",
+      workflowMode: "chat",
+    },
+    currentWorkspace: "/tmp/e2e-game-studio-plan-shortcuts",
+    selectedWorkspace: "/tmp/e2e-game-studio-plan-shortcuts",
+    sessionsByWorkspace: {},
+    currentSessionId: null,
+    selectedMainModeKey: "game_studio",
+    selectedNexusModeKey: "nexus_game_studio",
+    activeStudioAgentKey: "studio_auto",
+    gameStudioInitialized: false,
+    pendingSlashCommand: null,
+    taskFlow: [],
+    agentMessages: [],
+    conversationTurns: [],
+    currentTurnId: null,
+    input: "",
+    attachedFiles: [],
+    contextMentions: [],
+    showAgentPicker: false,
+    showWorkflowMenu: false,
+    isGenerating: false,
+    agentStatus: "idle",
+    elapsedTime: 0,
+    planArtifacts: [],
+    planTasks: [],
+    planExecutionEvidenceLedger: [],
+    planExecutionEvidenceCount: 0,
+    planStage: "idle",
+    isPlanApproved: false,
+    showPlanPanel: false,
+    showDiff: false,
+    showTerminal: false,
+    showFilePanel: false,
+    rightPanelTab: "plan",
+    selectedDiffTaskId: null,
+    lockedComposerIntent: null,
+  }));
+
+  bridge.getSnapshot = () => {
+    const state = useAppStore.getState();
+    return {
+      input: state.input,
+      selectedMainModeKey: state.selectedMainModeKey,
+      lockedComposerIntent: state.lockedComposerIntent,
+      currentTurnIntent: state.currentTurnId
+        ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId)?.intent ?? null
+        : null,
+      currentTurnTitle: state.currentTurnId
+        ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId)?.title ?? null
+        : null,
+      currentTurnPrompt: state.currentTurnId
+        ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId)?.userPrompt ?? null
+        : null,
+      currentTurnStatus: state.currentTurnId
+        ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId)?.status ?? null
+        : null,
+      conversationTurns: state.conversationTurns.length,
+      planStage: state.planStage,
+      seedCount: readSeedCount(GAME_STUDIO_PLAN_SHORTCUTS_SCENARIO),
+    };
+  };
+
+  bridge.seedPlanTurnForContinuation = () => {
+    const now = Date.now();
+    const turnId = "e2e-game-studio-plan-continuation-turn";
+    const userBlockId = useAppStore.getState()._nextTaskId();
+    const agentBlockId = useAppStore.getState()._nextTaskId();
+    useAppStore.setState((state) => ({
+      ...state,
+      taskFlow: [
+        { id: userBlockId, turnId, type: "user", content: "先规划 Game Studio 大整改" },
+        {
+          id: agentBlockId,
+          turnId,
+          type: "agent",
+          content: "计划回合还需要继续推进。",
+          streaming: false,
+        },
+      ],
+      conversationTurns: [
+        {
+          id: turnId,
+          userPrompt: "先规划 Game Studio 大整改",
+          title: "Game Studio 大整改计划",
+          mode: "plan",
+          intent: "plan",
+          status: "stopped_no_action",
+          summary: "等待继续生成计划。",
+          blockIds: [userBlockId, agentBlockId],
+          collapsed: false,
+          createdAt: now,
+        },
+      ],
+      currentTurnId: turnId,
+      planArtifacts: [],
+      planTasks: [],
+      planStage: "design",
+      isPlanApproved: false,
+      lockedComposerIntent: null,
+      input: "",
+      isGenerating: false,
+      agentStatus: "idle",
+      abortController: null,
+    }));
   };
 
   const cleanup = () => {
@@ -2815,6 +3192,12 @@ function seedCloudToolProtocolScenario(scenario: string) {
     ? 999501
     : scenario === GAME_STUDIO_EXECUTE_REPLY_SCENARIO
     ? 999504
+    : scenario === UNITY_MCP_OPTIONS_PRIORITY_SCENARIO
+    ? 999507
+    : scenario === UNITY_TOOL_CODE_COMPAT_SCENARIO
+    ? 999508
+    : scenario === UNITY_NO_ERROR_ROUTING_SCENARIO
+    ? 999509
     : scenario === PSEUDO_TOOL_CALL_RECOVERY_SCENARIO
     ? 999505
     : scenario === LOCAL_FILE_READ_APPROVAL_SCENARIO
@@ -2863,6 +3246,12 @@ function seedCloudToolProtocolScenario(scenario: string) {
             ? "E2E Cloud Tool Fallback"
             : scenario === GAME_STUDIO_EXECUTE_REPLY_SCENARIO
             ? "E2E Game Studio Execute Reply"
+            : scenario === UNITY_MCP_OPTIONS_PRIORITY_SCENARIO
+            ? "E2E Unity MCP Options Priority"
+            : scenario === UNITY_TOOL_CODE_COMPAT_SCENARIO
+            ? "E2E Unity Tool Code Compatibility"
+            : scenario === UNITY_NO_ERROR_ROUTING_SCENARIO
+            ? "E2E Unity No Error Routing"
             : scenario === PSEUDO_TOOL_CALL_RECOVERY_SCENARIO
             ? "E2E Pseudo Tool Call Recovery"
             : scenario === LOCAL_FILE_READ_APPROVAL_SCENARIO
@@ -2877,8 +3266,18 @@ function seedCloudToolProtocolScenario(scenario: string) {
       ],
     },
     currentSessionId: sessionId,
-    selectedMainModeKey: scenario === GAME_STUDIO_EXECUTE_REPLY_SCENARIO ? "game_studio" : "main_mode",
-    selectedNexusModeKey: scenario === GAME_STUDIO_EXECUTE_REPLY_SCENARIO ? "nexus_game_studio" : "nexus_general",
+    selectedMainModeKey:
+      scenario === GAME_STUDIO_EXECUTE_REPLY_SCENARIO ||
+        scenario === UNITY_TOOL_CODE_COMPAT_SCENARIO ||
+        scenario === UNITY_NO_ERROR_ROUTING_SCENARIO
+        ? "game_studio"
+        : "main_mode",
+    selectedNexusModeKey:
+      scenario === GAME_STUDIO_EXECUTE_REPLY_SCENARIO ||
+        scenario === UNITY_TOOL_CODE_COMPAT_SCENARIO ||
+        scenario === UNITY_NO_ERROR_ROUTING_SCENARIO
+        ? "nexus_game_studio"
+        : "nexus_general",
     taskFlow: [],
     agentMessages: [],
     conversationTurns: [],
@@ -2913,6 +3312,54 @@ function seedCloudToolProtocolScenario(scenario: string) {
           runtimeIntentOverride: "execute",
           executionConsentGranted: true,
           skipIntentResolution: true,
+        },
+      );
+    }
+
+    if (scenario === UNITY_MCP_OPTIONS_PRIORITY_SCENARIO) {
+      return useAppStore.getState().sendMessage(
+        text || "请在 Unity 场景下先给我可点击选项。",
+        undefined,
+        {
+          resolvedIntent: "discuss",
+          skipIntentResolution: true,
+          commandDirective: {
+            kind: "unity",
+            action: "code",
+            source: "debug",
+          },
+        },
+      );
+    }
+
+    if (scenario === UNITY_TOOL_CODE_COMPAT_SCENARIO) {
+      return useAppStore.getState().sendMessage(
+        text || "请在 Unity 项目里先读取 src 目录定位脚本入口。",
+        undefined,
+        {
+          resolvedIntent: "discuss",
+          skipIntentResolution: true,
+          commandDirective: {
+            kind: "unity",
+            action: "code",
+            source: "debug",
+          },
+        },
+      );
+    }
+
+    if (scenario === UNITY_NO_ERROR_ROUTING_SCENARIO) {
+      return useAppStore.getState().sendMessage(
+        text || "Unity 没有报错，但蛇没有自动移动，请先排查行为问题。",
+        undefined,
+        {
+          resolvedIntent: "discuss",
+          skipIntentResolution: true,
+          commandDirective: {
+            kind: "unity",
+            action: "code",
+            source: "debug",
+          },
         },
       );
     }
@@ -3504,6 +3951,10 @@ export function initializeE2EScenarios(): (() => void) | undefined {
     return seedAwaitingChoiceScenario();
   }
 
+  if (scenario === AWAITING_CHOICE_MIXED_OPTIONS_SCENARIO) {
+    return seedAwaitingChoiceMixedOptionsScenario();
+  }
+
   if (scenario === FEISHU_REMOTE_ANALYSIS_SCENARIO) {
     return seedFeishuRemoteAnalysisScenario();
   }
@@ -3530,6 +3981,10 @@ export function initializeE2EScenarios(): (() => void) | undefined {
 
   if (scenario === COMPOSER_MAIN_SHORTCUTS_SCENARIO) {
     return seedComposerMainShortcutsScenario();
+  }
+
+  if (scenario === GAME_STUDIO_PLAN_SHORTCUTS_SCENARIO) {
+    return seedGameStudioPlanShortcutsScenario();
   }
 
   if (scenario === CLOUD_SETTINGS_MODEL_SELECT_SCENARIO) {
@@ -3572,6 +4027,18 @@ export function initializeE2EScenarios(): (() => void) | undefined {
     return seedCloudToolProtocolScenario(GAME_STUDIO_EXECUTE_REPLY_SCENARIO);
   }
 
+  if (scenario === UNITY_MCP_OPTIONS_PRIORITY_SCENARIO) {
+    return seedCloudToolProtocolScenario(UNITY_MCP_OPTIONS_PRIORITY_SCENARIO);
+  }
+
+  if (scenario === UNITY_TOOL_CODE_COMPAT_SCENARIO) {
+    return seedCloudToolProtocolScenario(UNITY_TOOL_CODE_COMPAT_SCENARIO);
+  }
+
+  if (scenario === UNITY_NO_ERROR_ROUTING_SCENARIO) {
+    return seedCloudToolProtocolScenario(UNITY_NO_ERROR_ROUTING_SCENARIO);
+  }
+
   if (scenario === PSEUDO_TOOL_CALL_RECOVERY_SCENARIO) {
     return seedCloudToolProtocolScenario(PSEUDO_TOOL_CALL_RECOVERY_SCENARIO);
   }
@@ -3602,6 +4069,14 @@ export function initializeE2EScenarios(): (() => void) | undefined {
 
   if (scenario === TOP_ISLAND_PLAN_TASK_PROGRESS_SCENARIO) {
     return seedTopIslandPlanTaskProgressScenario();
+  }
+
+  if (scenario === GAME_STUDIO_TOOL_GROUP_COLLAPSE_SCENARIO) {
+    return seedGameStudioToolGroupScenario("executing");
+  }
+
+  if (scenario === GAME_STUDIO_AWAITING_CHOICE_SCENARIO) {
+    return seedGameStudioToolGroupScenario("awaiting_input");
   }
 
   

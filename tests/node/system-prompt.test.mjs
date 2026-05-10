@@ -156,6 +156,7 @@ test("system prompt uses English core tool protocol with localized output strate
   assert.match(prompt, /Tool availability is intent-scoped/);
   assert.match(prompt, /\[LOCALIZED USER OUTPUT\]/);
   assert.match(prompt, /本轮已解析的目标语言/);
+  assert.match(prompt, /Any user-visible pre-tool narration must also use the resolved target language/);
   assert.doesNotMatch(prompt, /在执行文件读取、搜索、修改、构建、测试等操作前，必须先用普通 Markdown 输出一句/);
   assert.doesNotMatch(prompt, /调用工具前，先用普通 Markdown 写一句用户可见的操作说明/);
 });

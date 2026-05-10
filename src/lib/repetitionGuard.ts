@@ -188,5 +188,5 @@ export function formatRepeatLoopFatalMessage(
   threshold: number,
 ): string {
   const suffix = target ? ` (target: "${target}")` : "";
-  return `Detected a repetition loop: tool "${name}" called with identical arguments ${threshold}+ times${suffix}. This usually means the model lost context. Reuse earlier tool results or increase the context limit and retry.`;
+  return `Detected a repetition loop: tool "${name}" called with identical arguments ${threshold}+ times${suffix}. This is a repeated-call safety guard, not a write engine failure. Reuse successful results already in context, then continue with a different or next target.`;
 }

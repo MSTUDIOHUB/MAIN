@@ -28,6 +28,18 @@ test("reply options pause the turn and continue within the same turn after selec
   await page.getByTestId("top-island-show-options").click();
   await expect(page.getByTestId("top-island-awaiting-choice")).toBeVisible();
   await expect(page.getByTestId("top-island-reply-option-0")).toBeVisible();
+  await expect(page.getByTestId("top-island-reply-option-badge-0")).toHaveText("1.");
+  await expect(page.getByTestId("top-island-reply-option-badge-1")).toHaveText("2.");
+  await expect(page.getByTestId("top-island-custom-reply-badge")).toHaveText("3.");
+
+  const optionBeforeHover = await page.getByTestId("top-island-reply-option-0").evaluate(
+    (node) => getComputedStyle(node).backgroundColor,
+  );
+  await page.getByTestId("top-island-reply-option-0").hover();
+  const optionAfterHover = await page.getByTestId("top-island-reply-option-0").evaluate(
+    (node) => getComputedStyle(node).backgroundColor,
+  );
+  expect(optionAfterHover).not.toBe(optionBeforeHover);
 
   await page.getByTestId("top-island-reply-option-0").click();
 
@@ -84,4 +96,31 @@ test("custom reply option continues within the same turn", async ({ page }) => {
     .toEqual(["我想先补一个轻量方案再继续"]);
 
   await expect(page.getByText(/已按你的选择继续/)).toBeVisible();
+});
+
+test("mixed choice options split approval actions and keep numbering for real choices", async ({ page }) => {
+  await page.goto("/?e2eScenario=awaiting-choice-mixed-options");
+
+  await expect(page.getByTestId("top-island-awaiting-choice")).toBeVisible();
+  await expect(page.getByTestId("top-island-reply-option-0")).toBeVisible();
+  await expect(page.getByTestId("top-island-reply-option-1")).toBeVisible();
+  await expect(page.getByTestId("top-island-reply-option-2")).toHaveCount(0);
+  await expect(page.getByTestId("top-island-reply-option-badge-0")).toHaveText("1.");
+  await expect(page.getByTestId("top-island-reply-option-badge-1")).toHaveText("2.");
+  await expect(page.getByTestId("top-island-custom-reply-badge")).toHaveText("3.");
+
+  const approvalSection = page.getByTestId("top-island-approval-actions");
+  await expect(approvalSection).toBeVisible();
+  await expect(approvalSection).toContainText("执行批准动作");
+  await expect(page.getByTestId("top-island-approval-option-0")).toContainText("继续当前只读读取");
+  await expect(page.getByTestId("top-island-approval-option-1")).toContainText("当前会话只读步骤全部批准");
+
+  const approvalBeforeHover = await page.getByTestId("top-island-approval-option-0").evaluate(
+    (node) => getComputedStyle(node).backgroundColor,
+  );
+  await page.getByTestId("top-island-approval-option-0").hover();
+  const approvalAfterHover = await page.getByTestId("top-island-approval-option-0").evaluate(
+    (node) => getComputedStyle(node).backgroundColor,
+  );
+  expect(approvalAfterHover).not.toBe(approvalBeforeHover);
 });

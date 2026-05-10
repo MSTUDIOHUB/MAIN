@@ -338,6 +338,7 @@ export interface NormalizedStreamState {
   visibleText: string;
   hiddenThought: string;
   replyOptions: ReplyOption[];
+  hasExplicitUserChoiceRequest: boolean;
   toolCalls: NormalizedToolCall[];
   finishReason: "stop" | "length" | "tool_calls" | null;
 }
