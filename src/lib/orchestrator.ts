@@ -426,6 +426,9 @@ export interface OrchestratorCallbacks {
   getStatus: () => "idle" | "running" | "pending_review" | "error";
   startNewTurn: () => void;
   getContextMemoryState?: () => ContextMemoryState | null;
+  shouldForceXmlForProviderCompatibility?: () => boolean;
+  onProviderCompatibilityFallback?: (reason: string) => void;
+  onProviderNativeToolSuccess?: () => void;
 
   // UI updates
   onStreamToken: (token: string, messageId: string) => void;
@@ -555,16 +558,25 @@ function resolveEffectiveToolProtocol(config: AppConfig, settings: StreamSetting
     : normalizeCloudToolProtocol(settings.toolProtocol);
 }
 
-function shouldUseXmlToolProtocol(config: AppConfig, settings: StreamSettings, messages: AgentMessage[]): boolean {
-  return resolveEffectiveToolProtocol(config, settings) === "xml" || hasProviderNativeToolsDisabled(messages);
+function shouldUseXmlToolProtocol(
+  config: AppConfig,
+  settings: StreamSettings,
+  messages: AgentMessage[],
+  compatibilityOverride?: boolean,
+): boolean {
+  if (resolveEffectiveToolProtocol(config, settings) === "xml") return true;
+  if (compatibilityOverride === true) return true;
+  if (compatibilityOverride === false) return false;
+  return hasProviderNativeToolsDisabled(messages);
 }
 
 function prepareMessagesForToolProtocol(
   messages: AgentMessage[],
   config: AppConfig,
   settings: StreamSettings,
+  compatibilityOverride?: boolean,
 ): AgentMessage[] {
-  return shouldUseXmlToolProtocol(config, settings, messages)
+  return shouldUseXmlToolProtocol(config, settings, messages, compatibilityOverride)
     ? buildCompatibilityRetryMessages(messages) as AgentMessage[]
     : messages;
 }
@@ -2169,9 +2181,15 @@ export async function executeAgentLoop(
   const isCloudProfile = config.activeProfile === "cloud";
   const skills = callbacks.getSkills();
   const initialMessages = callbacks.getMessages();
-  const nativeToolsEnabled = !hasProviderNativeToolsDisabled(initialMessages);
   const settings = deriveStreamSettings(config);
   const effectiveToolProtocol = resolveEffectiveToolProtocol(config, settings);
+  const compatibilityForcedAtStart = callbacks.shouldForceXmlForProviderCompatibility?.();
+  const nativeToolsEnabled = !shouldUseXmlToolProtocol(
+    config,
+    settings,
+    initialMessages,
+    compatibilityForcedAtStart,
+  );
   const workspace = config.workspace;
   const mainModeKey = callbacks.getMainModeKey();
   const workspaceTree = callbacks.getWorkspaceTree();
@@ -2198,7 +2216,7 @@ export async function executeAgentLoop(
     useRustProxy: settings.useRustProxy,
     hasApiKey: !!settings.apiKey,
     provider: settings.provider,
-    nativeToolsEnabled: effectiveToolProtocol !== "xml" && nativeToolsEnabled,
+    nativeToolsEnabled,
     toolProtocol: effectiveToolProtocol,
     xmlToolsEnabled: true,
   }));
@@ -2660,7 +2678,12 @@ export async function executeAgentLoop(
     allTools: loopStartTools.length,
     mcpTools: mcpTools.length,
     builtinAndSkillTools: Math.max(0, loopStartTools.length - mcpTools.length),
-    nativeToolsEnabled: effectiveToolProtocol !== "xml" && !hasProviderNativeToolsDisabled(callbacks.getMessages()),
+    nativeToolsEnabled: !shouldUseXmlToolProtocol(
+      config,
+      settings,
+      callbacks.getMessages(),
+      callbacks.shouldForceXmlForProviderCompatibility?.(),
+    ),
     toolProtocol: effectiveToolProtocol,
     xmlToolsEnabled: true,
     unityMcpFirstPhaseActive,
@@ -2688,8 +2711,14 @@ export async function executeAgentLoop(
     // 1. Context management. Cloud mode uses a lightweight pass so tool-heavy
     // histories do not trigger slow Responses requests or gateway 524s.
     let managedAgentMessages = callbacks.getMessages() as AgentMessage[];
-    const forceXmlTools = effectiveToolProtocol === "xml";
-    const llmTools = !forceXmlTools && !hasProviderNativeToolsDisabled(callbacks.getMessages()) ? iterationAllTools : [];
+    const providerCompatibilityOverride = callbacks.shouldForceXmlForProviderCompatibility?.();
+    const forceXmlTools = shouldUseXmlToolProtocol(
+      config,
+      settings,
+      callbacks.getMessages(),
+      providerCompatibilityOverride,
+    );
+    const llmTools = !forceXmlTools ? iterationAllTools : [];
     const cloudResponsesCompact = isCloudProfile && config.cloud.apiFormat === "responses";
     if (snapshotContextLimit != null || cloudResponsesCompact) {
       const contextLimit = snapshotContextLimit ?? 32768;
@@ -2766,7 +2795,12 @@ export async function executeAgentLoop(
     });
 
     try {
-      const messagesForLLM = prepareMessagesForToolProtocol(managedAgentMessages, config, settings);
+      const messagesForLLM = prepareMessagesForToolProtocol(
+        managedAgentMessages,
+        config,
+        settings,
+        providerCompatibilityOverride,
+      );
       streamResult = await fetchLLMStream(
         messagesForLLM,
         settings,
@@ -2777,6 +2811,9 @@ export async function executeAgentLoop(
         currentMaxTokens,
         maxOutputEscalations,
       );
+      if (llmTools.length > 0) {
+        callbacks.onProviderNativeToolSuccess?.();
+      }
     } catch (err) {
       if ((err as Error).name === "AbortError") {
         callbacks.onStatusChange("idle");
@@ -2875,7 +2912,12 @@ export async function executeAgentLoop(
 
         // Retry once with the compacted context
         try {
-          const aggressivelyManagedForLLM = prepareMessagesForToolProtocol(aggressivelyManaged, config, settings);
+          const aggressivelyManagedForLLM = prepareMessagesForToolProtocol(
+            aggressivelyManaged,
+            config,
+            settings,
+            providerCompatibilityOverride,
+          );
           streamResult = await fetchLLMStream(
             aggressivelyManagedForLLM,
             settings,
@@ -2886,6 +2928,9 @@ export async function executeAgentLoop(
             aggressiveOutputBudget,
             1,
           );
+          if (llmTools.length > 0) {
+            callbacks.onProviderNativeToolSuccess?.();
+          }
         } catch (retryErr) {
           if ((retryErr as Error).name === "AbortError") {
             callbacks.onStatusChange("idle");
@@ -2948,7 +2993,12 @@ export async function executeAgentLoop(
           }
 
           try {
-            const emergencyManagedForLLM = prepareMessagesForToolProtocol(emergencyManaged, config, settings);
+            const emergencyManagedForLLM = prepareMessagesForToolProtocol(
+              emergencyManaged,
+              config,
+              settings,
+              providerCompatibilityOverride,
+            );
             streamResult = await fetchLLMStream(
               emergencyManagedForLLM,
               settings,
@@ -2959,6 +3009,9 @@ export async function executeAgentLoop(
               emergencyOutputBudget,
               0,
             );
+            if (llmTools.length > 0) {
+              callbacks.onProviderNativeToolSuccess?.();
+            }
           } catch (finalErr) {
             if ((finalErr as Error).name === "AbortError") {
               callbacks.onStatusChange("idle");
@@ -2986,11 +3039,100 @@ export async function executeAgentLoop(
           }
         }
       } else if (isContextError) {
-        callbacks.onError("Remote context limit exceeded. Cloud mode is not using local context compression, so please start a new conversation or shorten the history.");
-        callbacks.onStatusChange("error");
-        return;
+        console.log("[orchestrator] Cloud context length exceeded — compact and retry once");
+        const cloudReactiveContextLimit = 32768;
+        const cloudReactiveOutputBudget = Math.min(
+          2048,
+          Math.max(1024, Math.floor(cloudReactiveContextLimit * 0.06)),
+        );
+        const cloudReactiveManagedLimit = computeManagedContextLimit(
+          cloudReactiveContextLimit,
+          llmTools,
+          cloudReactiveOutputBudget,
+        );
+        const cloudManagedResult = manageContext(
+          callbacks.getMessages(),
+          cloudReactiveManagedLimit,
+          cloudReactiveOutputBudget,
+          700,
+          500,
+          true,
+          {
+            previousMemoryState: callbacks.getContextMemoryState?.() || null,
+          },
+        );
+        callbacks.onContextMemoryBuilt?.(cloudManagedResult.memoryState, cloudManagedResult.memoryPacket);
+        const cloudManagedMessages = cloudManagedResult.messages as AgentMessage[];
+        if (cloudManagedResult.changed) {
+          callbacks.replaceMessages(cloudManagedMessages);
+        }
+        if (cloudManagedResult.changed && cloudManagedResult.tokenReduction > 0) {
+          callbacks.onContextCompress({
+            droppedCount: cloudManagedResult.droppedCount,
+            droppedMessageCount: cloudManagedResult.droppedMessageCount,
+            tokenCountBefore: cloudManagedResult.tokenCountBefore,
+            tokenCountAfter: cloudManagedResult.tokenCountAfter,
+            tokenReduction: cloudManagedResult.tokenReduction,
+            compressedContext: cloudManagedResult.compressedContext,
+            displaySummary: cloudManagedResult.displaySummary,
+            memoryPacket: cloudManagedResult.memoryPacket,
+            microCompactionKind: cloudManagedResult.microCompactionKind,
+            microCompactedCount: cloudManagedResult.microCompactedCount,
+            tokenBreakdown: cloudManagedResult.tokenBreakdownBefore,
+          }, "reactive");
+          emitPlanExecutionProgress("context_compression");
+        }
+
+        try {
+          const cloudManagedForLLM = prepareMessagesForToolProtocol(
+            cloudManagedMessages,
+            config,
+            settings,
+            providerCompatibilityOverride,
+          );
+          streamResult = await fetchLLMStream(
+            cloudManagedForLLM,
+            settings,
+            assistantMsgId,
+            callbacks,
+            abortController.signal,
+            llmTools,
+            cloudReactiveOutputBudget,
+            1,
+          );
+          if (llmTools.length > 0) {
+            callbacks.onProviderNativeToolSuccess?.();
+          }
+        } catch (cloudRetryErr) {
+          if ((cloudRetryErr as Error).name === "AbortError") {
+            callbacks.onStatusChange("idle");
+            return;
+          }
+          const cloudRetryErrMsg = (cloudRetryErr as Error).message || "";
+          if (workflowMode === "plan" && !callbacks.getIsPlanApproved() && isStreamWatchdogTimeoutMessage(cloudRetryErrMsg)) {
+            const planStage = callbacks.getPlanStage();
+            logAgentEvent("plan_stage_waiting_for_design", {
+              iteration,
+              planStage,
+              reason: "stream_first_chunk_timeout_after_cloud_compaction",
+              message: cloudRetryErrMsg.slice(0, 240),
+            });
+            callbacks.onNonActionableStop(
+              buildPlanStreamTimeoutPauseMessage(callbacks.getPreferredLanguage(), planStage),
+              "incomplete_plan",
+            );
+            callbacks.onStatusChange("idle");
+            return;
+          }
+          callbacks.onError(
+            "Remote context limit exceeded even after local compaction retry. Please start a new conversation or shorten the history.",
+          );
+          callbacks.onStatusChange("error");
+          return;
+        }
       } else if (isCompatibilityError) {
         console.log("[orchestrator] Provider compatibility retry: disabling native tools and enabling XML tool_use");
+        callbacks.onProviderCompatibilityFallback?.(errMsg);
         const compatibilityMessages = ensureProviderCompatibilityMode(
           buildCompatibilityRetryMessages(managedAgentMessages),
           workflowMode,
