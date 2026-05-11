@@ -53,6 +53,16 @@ import {
   summarizeUserPrompt,
   validatePlanArtifactContent,
 } from "../lib/workflowModels";
+import {
+  appendRuntimeEvent,
+  normalizeEventStreamMode,
+  normalizeToolFeedbackFormat,
+  withEventSchema,
+  type EventStreamMode,
+  type MainThreadEvent,
+  type MainThreadEventInput,
+  type ToolFeedbackFormat,
+} from "../lib/turnEvents";
 import { getDiffStats } from "../lib/diff";
 import {
   appendPlanEvidenceEntry,
@@ -580,6 +590,8 @@ export interface ProviderCompatibilityRuntimeLaneState {
 }
 
 export interface SessionRuntimeSnapshot {
+  runtimeEventSchemaVersion?: number;
+  runtimeEvents?: MainThreadEvent[];
   taskFlow: TaskBlock[];
   agentMessages: AgentMessage[];
   contextMemoryState?: ContextMemoryState | null;
@@ -705,6 +717,8 @@ export interface AppConfig {
   thinkingPolicy: ThinkingPolicy;
   sessionRecordingEnabled: boolean;
   debugRecordFullTurnProcess: boolean;
+  eventStreamMode: EventStreamMode;
+  toolFeedbackFormat: ToolFeedbackFormat;
   local: LocalConfig;
   cloud: CloudConfig;
   cloudServers: CloudServerConfig[];
@@ -1043,6 +1057,7 @@ interface AppState {
   planAutoResumeCount: number;
   planExecutionProgressSnapshot: PlanExecutionProgressSnapshot | null;
   normalizedStreamState: NormalizedStreamState;
+  runtimeEvents: MainThreadEvent[];
   setWorkflowMode: (mode: "chat" | "edit" | "plan") => void;
   setIsPlanApproved: (v: boolean) => void;
   setPlanStage: (stage: PlanStage) => void;
@@ -1167,6 +1182,8 @@ const defaultConfig: AppConfig = {
   thinkingPolicy: "normal",
   sessionRecordingEnabled: true,
   debugRecordFullTurnProcess: false,
+  eventStreamMode: "dual",
+  toolFeedbackFormat: "envelope_v1",
   local: { provider: "OMLX", endpoint: "http://127.0.0.1:8080/v1", model: "", contextLimit: 16384, apiKey: "", toolProtocol: "auto" },
   cloud: defaultCloudState.cloud,
   cloudServers: defaultCloudState.cloudServers,
@@ -1535,6 +1552,35 @@ function normalizeStoredPlanExecutionProgressSnapshot(value: unknown): PlanExecu
   });
 }
 
+function normalizeRuntimeEvents(value: unknown): MainThreadEvent[] {
+  if (!Array.isArray(value)) return [];
+  const validTypes = new Set([
+    "thread.started",
+    "turn.started",
+    "turn.completed",
+    "turn.failed",
+    "item.started",
+    "item.updated",
+    "item.completed",
+    "error",
+  ]);
+
+  const normalized: MainThreadEvent[] = [];
+  for (const raw of value) {
+    if (!raw || typeof raw !== "object") continue;
+    const record = raw as Record<string, unknown>;
+    const type = typeof record.type === "string" ? record.type : "";
+    if (!validTypes.has(type)) continue;
+    try {
+      normalized.push(withEventSchema(record as MainThreadEventInput));
+    } catch {
+      // ignore malformed runtime events
+    }
+  }
+
+  return normalized;
+}
+
 function normalizeSessionRuntimeSnapshot(
   snapshot: Partial<SessionRuntimeSnapshot> | null | undefined,
 ): SessionRuntimeSnapshot | undefined {
@@ -1553,6 +1599,8 @@ function normalizeSessionRuntimeSnapshot(
   const taskFlow = sanitizeTaskBlocksForPersist(snapshot.taskFlow || []);
   const normalizedContextMemoryState = normalizeContextMemoryState(snapshot.contextMemoryState);
   return {
+    runtimeEventSchemaVersion: Math.max(1, Number(snapshot.runtimeEventSchemaVersion) || 1),
+    runtimeEvents: normalizeRuntimeEvents(snapshot.runtimeEvents),
     taskFlow,
     agentMessages: sanitizeAgentMessagesForPersist(snapshot.agentMessages || []),
     contextMemoryState: normalizedContextMemoryState,
@@ -1591,6 +1639,8 @@ function normalizeSessionRuntimeSnapshot(
 }
 
 const sessionRuntimeKeys = [
+  "runtimeEventSchemaVersion",
+  "runtimeEvents",
   "taskFlow",
   "agentMessages",
   "contextMemoryState",
@@ -1685,6 +1735,8 @@ function createSessionRuntimeFromState(state: Partial<AppState>): SessionRuntime
     return state.autoApproveTools === true ? buildSessionAutoApproveScopes(true) : [];
   })();
   return {
+    runtimeEventSchemaVersion: 1,
+    runtimeEvents: normalizeRuntimeEvents(state.runtimeEvents),
     taskFlow: Array.isArray(state.taskFlow) ? state.taskFlow : [],
     agentMessages: Array.isArray(state.agentMessages) ? state.agentMessages : [],
     contextMemoryState: normalizedContextMemoryState,
@@ -3266,6 +3318,8 @@ export const useAppStore = create<AppState>()(
 	      const nextConfig = typeof patch === "function" ? patch(s.config) : { ...s.config, ...patch };
 	      const normalizedConfig: AppConfig = {
 	        ...nextConfig,
+	        eventStreamMode: normalizeEventStreamMode(nextConfig.eventStreamMode, s.config.eventStreamMode),
+	        toolFeedbackFormat: normalizeToolFeedbackFormat(nextConfig.toolFeedbackFormat, s.config.toolFeedbackFormat),
 	        local: normalizeLocalConfig(nextConfig.local, s.config.local),
 	      };
 	      const runtimeLaneKey = resolveRuntimeLaneKey(normalizedConfig);
@@ -4504,6 +4558,7 @@ export const useAppStore = create<AppState>()(
       }
       return {
         taskFlow: [],
+        runtimeEvents: [],
         agentMessages: [],
         contextMemoryState: null,
         contextMemoryStateByRuntimeKey: {},
@@ -4561,6 +4616,7 @@ export const useAppStore = create<AppState>()(
       selectedMainModeKey: "main_mode",
       selectedNexusModeKey: "nexus_general",
       taskFlow: [],
+      runtimeEvents: [],
       agentMessages: [],
       contextMemoryState: null,
       contextMemoryStateByRuntimeKey: {},
@@ -4611,6 +4667,7 @@ export const useAppStore = create<AppState>()(
   planAutoResumeCount: 0,
   planExecutionProgressSnapshot: null,
   normalizedStreamState: defaultNormalizedStreamState,
+  runtimeEvents: [],
   setWorkflowMode: (mode) => set((s) => ({
     config: { ...s.config, workflowMode: mode },
     ...(mode === "chat" ? { showPlanPanel: false, showDiff: false } : {}),
@@ -4991,6 +5048,7 @@ export const useAppStore = create<AppState>()(
     state.abortController?.abort();
     set({
       taskFlow: [],
+      runtimeEvents: [],
       messages: [],
       agentMessages: [],
       contextMemoryState: null,
@@ -6165,6 +6223,8 @@ export const useAppStore = create<AppState>()(
           storageStatus: sessionGet().config.sessionRecordingEnabled ? "ok" : "temporary",
           recordingDisabled: !sessionGet().config.sessionRecordingEnabled,
           runtimeSnapshot: normalizeSessionRuntimeSnapshot({
+            runtimeEventSchemaVersion: 1,
+            runtimeEvents: sessionGet().runtimeEvents,
             taskFlow: sessionGet().taskFlow,
             agentMessages: sessionGet().agentMessages,
             contextMemoryState: sessionGet().contextMemoryState,
@@ -7212,6 +7272,7 @@ export const useAppStore = create<AppState>()(
         getMcpDiscoveredTools: () => sessionGet().mcpDiscoveredTools,
         getAssociatedPaths: () => sessionGet().resolvedInstructionSet?.associatedPaths ?? [],
         getSessionKey: () => runSessionKey,
+        getCurrentTurnId: () => turnId,
         hasSessionHookInitialized: (key) => sessionGet().hasSessionHookInitialized(key),
         markSessionHookInitialized: (key) => sessionGet().markSessionHookInitialized(key),
         onInstructionsResolved: (resolved) => sessionGet().setResolvedInstructionSet(resolved),
@@ -8338,6 +8399,14 @@ export const useAppStore = create<AppState>()(
           sessionGet().setConversationTurnSummary(turnId, summarized);
         },
 
+        onTurnEvent: (event) => {
+          const mode = normalizeEventStreamMode(sessionGet().config.eventStreamMode);
+          if (mode === "legacy") return;
+          sessionSet((s) => ({
+            runtimeEvents: appendRuntimeEvent(s.runtimeEvents, event),
+          }));
+        },
+
         appendMessage: (msg) => {
           logStoreEvent("append_agent_message", {
             turnId,
@@ -8710,6 +8779,8 @@ export const useAppStore = create<AppState>()(
             storageStatus: s.config.sessionRecordingEnabled ? "ok" : "temporary",
             recordingDisabled: !s.config.sessionRecordingEnabled,
             runtimeSnapshot: normalizeSessionRuntimeSnapshot({
+              runtimeEventSchemaVersion: 1,
+              runtimeEvents: s.runtimeEvents,
               taskFlow: messages,
               agentMessages: sanitizeAgentMessagesForPersist(s.agentMessages),
               contextMemoryState: s.contextMemoryState,
@@ -8899,6 +8970,14 @@ export const useAppStore = create<AppState>()(
           mcpRouting: normalizeMcpRoutingConfig(persistedState.config?.mcpRouting),
           sessionRecordingEnabled: persistedState.config?.sessionRecordingEnabled ?? current.config.sessionRecordingEnabled,
           debugRecordFullTurnProcess: persistedState.config?.debugRecordFullTurnProcess === true,
+          eventStreamMode: normalizeEventStreamMode(
+            persistedState.config?.eventStreamMode,
+            current.config.eventStreamMode,
+          ),
+          toolFeedbackFormat: normalizeToolFeedbackFormat(
+            persistedState.config?.toolFeedbackFormat,
+            current.config.toolFeedbackFormat,
+          ),
           imAdapters: normalizeImAdaptersConfig(persistedState.config?.imAdapters),
         },
         sessionsByWorkspace: normalizedSessionsByWorkspace,
@@ -8913,6 +8992,9 @@ export const useAppStore = create<AppState>()(
         ),
         activeSessionByWorkspace: persistedState.activeSessionByWorkspace || {},
         taskFlow: hydratedTaskFlow,
+        runtimeEvents: hasHydratedCurrentSession
+          ? normalizeRuntimeEvents(persistedState.runtimeEvents)
+          : [],
         agentMessages: hasHydratedCurrentSession
           ? sanitizeAgentMessagesForPersist(persistedState.agentMessages || [])
           : [],

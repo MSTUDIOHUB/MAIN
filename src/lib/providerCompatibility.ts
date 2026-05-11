@@ -1,3 +1,8 @@
+import {
+  TOOL_FEEDBACK_ENVELOPE_PREFIX,
+  parseToolFeedbackEnvelope,
+} from "./toolFeedbackEnvelope";
+
 export interface CompatibilityToolCall {
   id: string;
   type: "function";
@@ -173,6 +178,22 @@ export function buildCompatibilityRetryMessages(messages: CompatibilityMessage[]
     }
 
     if (message.role === "tool") {
+      const rawToolContent = typeof message.content === "string"
+        ? message.content
+        : compatibilityText || String(message.content);
+      const parsedEnvelope = parseToolFeedbackEnvelope(rawToolContent);
+      if (parsedEnvelope) {
+        const envelopeHeader = `${TOOL_FEEDBACK_ENVELOPE_PREFIX}${JSON.stringify(parsedEnvelope.envelope)}`;
+        const body = parsedEnvelope.body.slice(0, 800);
+        return {
+          role: "user",
+          content: [
+            "[Tool result]:",
+            envelopeHeader,
+            body,
+          ].filter(Boolean).join("\n"),
+        };
+      }
       return {
         role: "user",
         content: `[Tool result]: ${(compatibilityText || String(message.content)).slice(0, 800)}`,

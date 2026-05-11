@@ -33,11 +33,20 @@ MAIN 1.6.6 重点强化了“云端兼容回退隔离”“远程上下文超限
 - 回合启动、迭代执行、压缩重试等阶段的 `nativeToolsEnabled` 判定统一使用同一逻辑，工具协议行为更一致。
 - 当原生工具调用成功时，新增回调上报，为兼容回退自动恢复提供可靠信号。
 
+### 运行时工具事件与反馈封装（新增）
+
+- 新增 `runtimeTools` 运行时规划模块：统一产出工具调用的计划动作（auto execute / review required / blocked 等）与生命周期初始状态。
+- 编排层工具结果增加生命周期状态标注（`completed / failed / declined / blocked`），让“失败、拦截、拒绝、无变化”等状态更可区分。
+- 新增 `toolFeedbackEnvelope`（`[MAIN_TOOL_FEEDBACK_V1]`）：对工具结果增加结构化头部，保留 `tool_call_id/tool/target/status/summary`，便于后续兼容重放和诊断。
+- Provider compatibility 重试链路支持识别并保留 envelope 头，避免降级重试时丢失关键工具上下文。
+- 新增 `turnEvents` 事件模型与 ring buffer（`thread/turn/item/error`），支持运行时事件流的结构化记录。
+
 ### 版本与打包配置同步到 1.6.6
 
 - 前端与桌面端版本号已同步更新到 `1.6.6`（`package.json`、Tauri/Cargo 配置）。
 - macOS / Windows bundle 版本号同步刷新，确保安装包显示版本与应用内版本一致。
 - `Release_Notes_1.6.6_ZH.md` 已纳入发布内容，方便后续直接用于公开下载页说明。
+- 新增配置项 `eventStreamMode` 与 `toolFeedbackFormat`，并完成持久化与恢复路径接入。
 
 ## 修复与稳定性
 
@@ -49,6 +58,9 @@ MAIN 1.6.6 重点强化了“云端兼容回退隔离”“远程上下文超限
 ## 验证覆盖
 
 - 本次改动集中在运行时编排与状态管理层（`orchestrator` / `useAppStore`）。
+- 新增/更新 Node 测试：
+  - `tests/node/runtime-tools-events-envelope.test.mjs`（运行时工具规划、事件流与 envelope 解析）
+  - `tests/node/provider-compatibility.test.mjs`（兼容重试保留工具反馈 envelope 头）
 - 建议发布前至少执行：
   - `npm run test:workflow-assets`
   - `npm run release:desktop -- 1.6.6`

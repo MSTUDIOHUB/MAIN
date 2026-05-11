@@ -52,6 +52,11 @@ import {
   buildReadFileWindowContinuationGuidance,
   extractReadFileWindowMetadata,
 } from "./readFileWindow";
+import {
+  initialLifecycleStateForPlanAction,
+  planRuntimeToolCall,
+  type ToolLifecycleState,
+} from "./runtimeTools";
 import type { AppConfig, Skill } from "../store/useAppStore";
 import {
   buildPlanTaskEvidenceAudit,
@@ -97,7 +102,6 @@ import {
 import {
   buildToolCapabilityRegistry,
   filterToolDefinitionsForIntent,
-  getLocalFileReadPathForToolCall,
   isUnityApplyTextPrecisePatchArgs,
   isLocalFileReadApproved,
   type McpRoutingPriorityMode,
@@ -131,6 +135,16 @@ import {
 } from "./planExecutionRecovery";
 import { validateShellToolContract } from "./toolExecutionContract";
 import { buildExecutionDigest } from "./executionDigest";
+import {
+  formatToolFeedbackEnvelope,
+  type ToolFeedbackStatus,
+} from "./toolFeedbackEnvelope";
+import {
+  withEventSchema,
+  type MainThreadEventInput,
+  type MainThreadEvent,
+  type MainThreadItem,
+} from "./turnEvents";
 
 // ── Spec file auto-approval helpers ────────────────────────────────
 
@@ -296,6 +310,7 @@ async function buildReadBeforeModifyValidationError(
     target,
     content: `Error: ${message}`,
     isError: true,
+    lifecycleState: "blocked",
   };
 }
 
@@ -408,6 +423,7 @@ export interface OrchestratorCallbacks {
   getMcpDiscoveredTools: () => MCPTool[];
   getAssociatedPaths: () => string[];
   getSessionKey: () => string;
+  getCurrentTurnId?: () => string | null;
   hasSessionHookInitialized: (sessionKey: string) => boolean;
   markSessionHookInitialized: (sessionKey: string) => void;
   // Planning & Management
@@ -446,6 +462,7 @@ export interface OrchestratorCallbacks {
   onExecuteMaxIterationsCheckpoint?: (checkpoint: PlanMaxIterationsCheckpoint) => boolean | Promise<boolean>;
   onTurnSummaryReady: (summary: string) => void;
   onExecutionDigestUpdate?: (summary: string) => void;
+  onTurnEvent?: (event: MainThreadEvent) => void;
   onInstructionsResolved: (resolved: ResolvedInstructionSet) => void;
   onHooksLoaded: (hooks: HookDefinition[], loadedAt?: number | null) => void;
   onHookStart: (event: HookEvent, hook: HookDefinition) => void;
@@ -1403,6 +1420,7 @@ interface ToolExecutionResult {
   content: string; // model-facing result or error message
   displayContent?: string; // UI-facing result, can differ from model-facing content
   isError: boolean;
+  lifecycleState?: ToolLifecycleState;
   additionalContexts?: string[];
 }
 
@@ -1573,6 +1591,70 @@ function getToolResultBudgets(name: string, cloudProfile: boolean): { modelChars
   return { modelChars: 12000, displayChars: 10000 };
 }
 
+function inferLifecycleStateFromToolResult(result: ToolExecutionResult): ToolLifecycleState {
+  if (result.lifecycleState) return result.lifecycleState;
+  if (!result.isError) {
+    if (/"noOp"\s*:\s*true/.test(result.content || "")) return "completed";
+    if (result.content.includes(FILE_UNCHANGED_STUB) || /Repeated read-only tool call skipped:/i.test(result.content)) {
+      return "completed";
+    }
+    return "completed";
+  }
+
+  if (
+    /PLAN_STAGE_BLOCKED|PLAN_TASK_HISTORY_BLOCKED|PLAN_TASK_EVIDENCE_BLOCKED|PLAN_QUALITY_GATE|REPEATED_FAILURE_BLOCKED/i.test(result.content)
+  ) {
+    return "blocked";
+  }
+  if (/rejected by user|User rejected the tool call|declined/i.test(result.content)) {
+    return "declined";
+  }
+  return "failed";
+}
+
+function buildToolResultHistoryContent(result: ToolExecutionResult): string {
+  const lifecycleState = inferLifecycleStateFromToolResult(result);
+  const isNoOp = /"noOp"\s*:\s*true/.test(result.content || "");
+  const isCachedReuse =
+    result.content.includes(FILE_UNCHANGED_STUB) ||
+    /Repeated read-only tool call skipped:/i.test(result.content);
+  const status: ToolFeedbackStatus =
+    lifecycleState === "declined"
+      ? "declined"
+      : lifecycleState === "blocked"
+      ? "blocked"
+      : lifecycleState === "failed"
+      ? "failed"
+      : isNoOp
+      ? "no_op"
+      : isCachedReuse
+      ? "cached"
+      : "completed";
+  const noOpSummary = isNoOp
+    ? "No-op update; target already matched requested content."
+    : undefined;
+  return formatToolFeedbackEnvelope({
+    status,
+    toolCallId: result.toolCallId,
+    tool: result.name,
+    target: result.target,
+    content: result.content,
+    summary: noOpSummary || result.displayContent || result.content,
+    truncated:
+      typeof result.displayContent === "string" &&
+      result.displayContent.length > 0 &&
+      result.displayContent.length < result.content.length,
+  });
+}
+
+function buildToolResultHistoryContentByFormat(
+  result: ToolExecutionResult,
+  format: AppConfig["toolFeedbackFormat"],
+): string {
+  if (format !== "envelope_v1") return result.content;
+  return buildToolResultHistoryContent(result);
+}
+
 async function executeToolCallWithLifecycle(
   tc: ToolCallToExecute,
   workspace: string,
@@ -1592,6 +1674,7 @@ async function executeToolCallWithLifecycle(
       target: "",
       content: `Error: Invalid JSON in tool call arguments: ${tc.arguments}`,
       isError: true,
+      lifecycleState: "failed",
     };
   }
 
@@ -1599,7 +1682,14 @@ async function executeToolCallWithLifecycle(
   const validationError = validateToolExecutionContract(tc.name, toolArgs, allTools);
   if (validationError) {
     callbacks.onToolError(tc.name, "", validationError, { toolCallId: tc.id });
-    return { toolCallId: tc.id, name: tc.name, target: "", content: `Error: ${validationError}`, isError: true };
+    return {
+      toolCallId: tc.id,
+      name: tc.name,
+      target: "",
+      content: `Error: ${validationError}`,
+      isError: true,
+      lifecycleState: "blocked",
+    };
   }
 
   const preHookResult = await runLifecycleHooks(callbacks, hooksConfig, "PreToolUse", {
@@ -1630,6 +1720,7 @@ async function executeToolCallWithLifecycle(
       target,
       content: `Error: ${reason}`,
       isError: true,
+      lifecycleState: "blocked",
       ...(preHookResult.additionalContexts.length > 0
         ? { additionalContexts: preHookResult.additionalContexts }
         : {}),
@@ -1670,6 +1761,7 @@ async function executeToolCallWithLifecycle(
       target,
       content: `Error: ${message}`,
       isError: true,
+      lifecycleState: "blocked",
       additionalContexts: [...preHookResult.additionalContexts],
     };
   }
@@ -1735,6 +1827,7 @@ async function executeToolCallWithLifecycle(
       content: modelContent,
       displayContent,
       isError: false,
+      lifecycleState: "completed",
       additionalContexts: [
         ...preHookResult.additionalContexts,
         ...postHookResult.additionalContexts,
@@ -1762,6 +1855,7 @@ async function executeToolCallWithLifecycle(
       target,
       content: `Error: ${errorMsg}`,
       isError: true,
+      lifecycleState: "failed",
       additionalContexts: [
         ...preHookResult.additionalContexts,
         ...postHookResult.additionalContexts,
@@ -1817,6 +1911,7 @@ async function executeLocalFileReadToolWithReview(
       target,
       content: "User cancelled the local file read approval.",
       isError: true,
+      lifecycleState: "declined",
     };
   }
 
@@ -1843,6 +1938,7 @@ async function executeLocalFileReadToolWithReview(
       target,
       content: "User rejected reading this local file outside the workspace. Ask for a different file, use an attached file, or continue without it.",
       isError: true,
+      lifecycleState: "declined",
     };
   }
 
@@ -1852,6 +1948,7 @@ async function executeLocalFileReadToolWithReview(
     target,
     content: `Tool execution failed: ${decision.error}`,
     isError: true,
+    lifecycleState: "failed",
   };
 }
 
@@ -1883,6 +1980,7 @@ function buildPlanGateBlockedResult(
     target,
     content: `Error: PLAN_STAGE_BLOCKED: ${message}`,
     isError: true,
+    lifecycleState: "blocked",
   };
 }
 
@@ -1935,6 +2033,7 @@ async function buildPlanArtifactMutationValidationError(
         target,
         content: `Error: ${message}`,
         isError: true,
+        lifecycleState: "blocked",
       };
     }
   }
@@ -1959,6 +2058,7 @@ async function buildPlanArtifactMutationValidationError(
         target,
         content: `Error: ${message}`,
         isError: true,
+        lifecycleState: "blocked",
       };
     }
 
@@ -1982,6 +2082,7 @@ async function buildPlanArtifactMutationValidationError(
           target,
           content: `Error: ${message}`,
           isError: true,
+          lifecycleState: "blocked",
         };
       }
     }
@@ -2010,13 +2111,21 @@ async function executeWriteToolWithReview(
       target: "",
       content: `Error: Invalid JSON in tool call arguments: ${tc.arguments}`,
       isError: true,
+      lifecycleState: "failed",
     };
   }
 
   // Validate required parameters before presenting to user
   const validationError = validateToolExecutionContract(tc.name, toolArgs, allTools);
   if (validationError) {
-    return { toolCallId: tc.id, name: tc.name, target: "", content: `Error: ${validationError}`, isError: true };
+    return {
+      toolCallId: tc.id,
+      name: tc.name,
+      target: "",
+      content: `Error: ${validationError}`,
+      isError: true,
+      lifecycleState: "blocked",
+    };
   }
 
   const target = getToolTarget(tc.name, toolArgs);
@@ -2033,6 +2142,7 @@ async function executeWriteToolWithReview(
       target,
       content: "User cancelled the review.",
       isError: true,
+      lifecycleState: "declined",
     };
   }
 
@@ -2058,7 +2168,14 @@ async function executeWriteToolWithReview(
     isError = true;
   }
 
-  return { toolCallId: tc.id, name: tc.name, target, content, isError };
+  return {
+    toolCallId: tc.id,
+    name: tc.name,
+    target,
+    content,
+    isError,
+    lifecycleState: decision.action === "reject" ? "declined" : isError ? "failed" : "declined",
+  };
 }
 
 // ── The Loop ──────────────────────────────────────────────────────
@@ -2207,6 +2324,44 @@ export async function executeAgentLoop(
     }
     return requestedRuntimeIntent;
   };
+  const eventThreadId = callbacks.getSessionKey() || "default";
+  const eventTurnId = callbacks.getCurrentTurnId?.() || generateId();
+  let turnEventTerminalEmitted = false;
+  const emitTurnEvent = (event: MainThreadEventInput): void => {
+    callbacks.onTurnEvent?.(withEventSchema(event));
+  };
+  const emitTurnCompletedEvent = () => {
+    if (turnEventTerminalEmitted) return;
+    turnEventTerminalEmitted = true;
+    emitTurnEvent({
+      type: "turn.completed",
+      threadId: eventThreadId,
+      turnId: eventTurnId,
+      timestampMs: Date.now(),
+    });
+  };
+  const emitTurnFailedEvent = (message: string) => {
+    if (turnEventTerminalEmitted) return;
+    turnEventTerminalEmitted = true;
+    emitTurnEvent({
+      type: "turn.failed",
+      threadId: eventThreadId,
+      turnId: eventTurnId,
+      timestampMs: Date.now(),
+      error: { message },
+    });
+  };
+  emitTurnEvent({
+    type: "thread.started",
+    threadId: eventThreadId,
+    timestampMs: Date.now(),
+  });
+  emitTurnEvent({
+    type: "turn.started",
+    threadId: eventThreadId,
+    turnId: eventTurnId,
+    timestampMs: Date.now(),
+  });
 
   console.log('[orchestrator] executeAgentLoop');
   console.log('[orchestrator] activeProfile:', config.activeProfile);
@@ -4018,11 +4173,25 @@ export async function executeAgentLoop(
             planStage: currentPlanStage,
           });
           callbacks.appendMessage({ role: "assistant", content: assistantHistoryText });
+          emitTurnEvent({
+            type: "item.completed",
+            threadId: eventThreadId,
+            turnId: eventTurnId,
+            timestampMs: Date.now(),
+            item: {
+              id: assistantMsgId,
+              details: {
+                type: "agent_message",
+                text: assistantHistoryText,
+              },
+            } as MainThreadItem,
+          });
           callbacks.onNonActionableStop(
             buildNonActionableStopMessage(callbacks.getPreferredLanguage(), "incomplete_plan"),
             "incomplete_plan",
           );
           callbacks.onStatusChange("idle");
+          emitTurnCompletedEvent();
           return;
         }
 
@@ -4033,7 +4202,21 @@ export async function executeAgentLoop(
           replyOptions: normalized.replyOptions.length,
         });
         callbacks.appendMessage({ role: "assistant", content: assistantHistoryText });
+        emitTurnEvent({
+          type: "item.completed",
+          threadId: eventThreadId,
+          turnId: eventTurnId,
+          timestampMs: Date.now(),
+          item: {
+            id: assistantMsgId,
+            details: {
+              type: "agent_message",
+              text: assistantHistoryText,
+            },
+          } as MainThreadItem,
+        });
         callbacks.onStatusChange("idle");
+        emitTurnCompletedEvent();
         return;
       }
 
@@ -4095,6 +4278,7 @@ export async function executeAgentLoop(
           target,
           content: `Error: ${message}`,
           isError: true,
+          lifecycleState: "blocked",
         });
         continue;
       }
@@ -4110,24 +4294,49 @@ export async function executeAgentLoop(
           target,
           content: `Error: ${message}`,
           isError: true,
+          lifecycleState: "blocked",
         });
         continue;
       }
 
       const approvedLocalFileReadPaths = callbacks.getApprovedLocalFileReadPaths();
-      const localFileReadPath = getLocalFileReadPathForToolCall(tc.name, toolArgs, workspace);
-      const shouldGateLocalFileRead =
-        !!localFileReadPath && !isLocalFileReadApproved(localFileReadPath, approvedLocalFileReadPaths);
+      const planned = planRuntimeToolCall({
+        toolCall: tc,
+        workspace,
+        availableToolNames,
+        capabilityRegistry: toolCapabilityRegistry,
+        toolPermissionPolicy: config.toolPermissionPolicy,
+        approvedLocalFileReadPaths,
+        workflowMode,
+        runtimeIntent,
+        isPlanApproved: callbacks.getIsPlanApproved(),
+        planTaskCount: callbacks.getPlanTasks().length,
+        getToolTarget,
+        isPreApprovalPlanDraftWrite,
+        isExecutionPlanArtifactWrite,
+        isTasksPlanWrite,
+      });
+      const targetState = initialLifecycleStateForPlanAction(planned.action);
+      emitTurnEvent({
+        type: "item.started",
+        threadId: eventThreadId,
+        turnId: eventTurnId,
+        timestampMs: Date.now(),
+        item: {
+          id: tc.id,
+          details: {
+            type: "tool_lifecycle",
+            toolCallId: tc.id,
+            tool: tc.name,
+            target: planned.target,
+            status: targetState,
+          },
+        } as MainThreadItem,
+      });
 
-      if (shouldGateLocalFileRead) {
-        localFileReadCalls.push({ id: tc.id, name: tc.name, arguments: tc.arguments, localFileReadPath });
-      } else if (isToolAutoExecutableForCall(
-        tc.name,
-        toolArgs,
-        toolCapabilityRegistry,
-        config.toolPermissionPolicy,
-        { workspace, approvedLocalFileReadPaths },
-      )) {
+      if (planned.action === "local_file_read_review" && planned.localFileReadPath) {
+        localFileReadCalls.push({ id: tc.id, name: tc.name, arguments: tc.arguments, localFileReadPath: planned.localFileReadPath });
+      } else if (planned.action === "auto_execute") {
         const signature = buildReadOnlyCacheSignature(tc.name, toolArgs);
         const cached = readOnlyResultCache.get(signature);
         const fileReadMetadata =
@@ -4224,25 +4433,28 @@ export async function executeAgentLoop(
           id: tc.id,
           name: tc.name,
           arguments: tc.arguments,
-          allowExternalLocalRead: !!localFileReadPath && isLocalFileReadApproved(localFileReadPath, approvedLocalFileReadPaths),
+          allowExternalLocalRead:
+            !!planned.localFileReadPath &&
+            isLocalFileReadApproved(planned.localFileReadPath, approvedLocalFileReadPaths),
         });
-      } else if (workflowMode === "plan" && runtimeIntent !== "execute" && runtimeIntent !== "studio_workflow") {
-        const approved = callbacks.getIsPlanApproved();
-        const hasExecutableTasks = callbacks.getPlanTasks().length > 0;
-
-        if (!approved && isPreApprovalPlanDraftWrite(tc.name, toolArgs)) {
-          specFileCalls.push({ id: tc.id, name: tc.name, arguments: tc.arguments });
-        } else if (approved && isExecutionPlanArtifactWrite(tc.name, toolArgs)) {
-          specFileCalls.push({ id: tc.id, name: tc.name, arguments: tc.arguments });
-        } else {
-          if (target) attemptedPlanWriteTargets.push(target);
-          const reason = !approved && isTasksPlanWrite(tc.name, toolArgs)
-            ? "pre_approval_tasks"
-            : approved && !hasExecutableTasks
-            ? "missing_tasks_before_source"
-            : "pre_approval_source_write";
-          allResults.push(buildPlanGateBlockedResult(tc, toolArgs, callbacks, reason));
-        }
+      } else if (planned.action === "spec_file_auto_approved") {
+        specFileCalls.push({ id: tc.id, name: tc.name, arguments: tc.arguments });
+      } else if (planned.action === "blocked_plan_gate") {
+        if (planned.target) attemptedPlanWriteTargets.push(planned.target);
+        allResults.push(buildPlanGateBlockedResult(tc, toolArgs, callbacks, planned.reason || "pre_approval_source_write"));
+      } else if (planned.action === "blocked_unavailable") {
+        const message = callbacks.getPreferredLanguage() === "zh"
+          ? `工具 "${tc.name}" 当前没有暴露给 ${runtimeIntent} 运行意图。请使用本轮可用工具；如果这是已批准计划的执行步骤，请继续按执行阶段恢复。`
+          : `Tool "${tc.name}" is not exposed for the current ${runtimeIntent} runtime intent. Use an available tool; if this is approved plan execution, continue from the execution stage.`;
+        callbacks.onToolError(tc.name, planned.target, message, { toolCallId: tc.id });
+        allResults.push({
+          toolCallId: tc.id,
+          name: tc.name,
+          target: planned.target,
+          content: `Error: ${message}`,
+          isError: true,
+          lifecycleState: "blocked",
+        });
       } else {
         writeCalls.push({ id: tc.id, name: tc.name, arguments: tc.arguments });
       }
@@ -4490,10 +4702,28 @@ export async function executeAgentLoop(
 
     // Append all tool result messages
     for (const result of allResults) {
+      const toolHistoryContent = buildToolResultHistoryContentByFormat(result, config.toolFeedbackFormat);
       callbacks.appendMessage({
         role: "tool",
-        content: result.content,
+        content: toolHistoryContent,
         tool_call_id: result.toolCallId,
+      });
+      emitTurnEvent({
+        type: "item.completed",
+        threadId: eventThreadId,
+        turnId: eventTurnId,
+        timestampMs: Date.now(),
+        item: {
+          id: result.toolCallId,
+          details: {
+            type: "tool_result",
+            toolCallId: result.toolCallId,
+            tool: result.name,
+            target: result.target,
+            status: inferLifecycleStateFromToolResult(result),
+            text: result.displayContent || result.content,
+          },
+        } as MainThreadItem,
       });
       if (result.additionalContexts?.length) {
         createHookContextMessages("PostToolUse", result.additionalContexts)
@@ -4590,6 +4820,7 @@ export async function executeAgentLoop(
         : "\nRecovery: start a fresh recovery context, reuse successful results, then continue with the next file or a different target.";
       callbacks.onError(`${fatalMessage}\n${structuredRecovery}${recoveryHint}`);
       callbacks.onStatusChange("error");
+      emitTurnFailedEvent(fatalMessage);
       return;
     }
 
@@ -4736,4 +4967,5 @@ export async function executeAgentLoop(
     "no_action",
   );
   callbacks.onStatusChange("idle");
+  emitTurnCompletedEvent();
 }

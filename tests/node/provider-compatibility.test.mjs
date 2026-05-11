@@ -1,30 +1,60 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import fs from "node:fs/promises";
+import fsSync from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
 
 import ts from "typescript";
 
-const require = createRequire(import.meta.url);
 const workspaceRoot = process.cwd();
+const transpiledModuleCache = new Map();
 
-async function loadProviderCompatibilityModule() {
-  const sourcePath = path.join(workspaceRoot, "src/lib/providerCompatibility.ts");
-  const source = await fs.readFile(sourcePath, "utf8");
+function loadTranspiledModuleSync(sourcePath) {
+  const normalizedPath = path.resolve(sourcePath);
+  if (transpiledModuleCache.has(normalizedPath)) {
+    return transpiledModuleCache.get(normalizedPath);
+  }
+
+  const source = fsSync.readFileSync(normalizedPath, "utf8");
   const transpiled = ts.transpileModule(source, {
     compilerOptions: {
       module: ts.ModuleKind.CommonJS,
       target: ts.ScriptTarget.ES2020,
     },
-    fileName: sourcePath,
+    fileName: normalizedPath,
   }).outputText;
 
   const module = { exports: {} };
+  transpiledModuleCache.set(normalizedPath, module.exports);
+  const localRequire = createRequire(normalizedPath);
+  const runtimeRequire = (specifier) => {
+    if (specifier.startsWith(".")) {
+      const basePath = path.resolve(path.dirname(normalizedPath), specifier);
+      const candidates = [
+        basePath,
+        `${basePath}.ts`,
+        `${basePath}.tsx`,
+        path.join(basePath, "index.ts"),
+      ];
+
+      for (const candidate of candidates) {
+        if (!fsSync.existsSync(candidate)) continue;
+        if (candidate.endsWith(".ts") || candidate.endsWith(".tsx")) {
+          return loadTranspiledModuleSync(candidate);
+        }
+      }
+    }
+    return localRequire(specifier);
+  };
+
   const factory = new Function("exports", "module", "require", transpiled);
-  factory(module.exports, module, require);
+  factory(module.exports, module, runtimeRequire);
+  transpiledModuleCache.set(normalizedPath, module.exports);
   return module.exports;
 }
+
+const providerCompatibility = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/providerCompatibility.ts"));
+const toolFeedbackEnvelope = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/toolFeedbackEnvelope.ts"));
 
 const {
   buildProviderCompatibilitySystemMessage,
@@ -32,7 +62,9 @@ const {
   buildTranscriptCompatibilityRetryMessages,
   isProviderCompatibilityErrorMessage,
   isNativeToolCompatibilityErrorMessage,
-} = await loadProviderCompatibilityModule();
+} = providerCompatibility;
+
+const { TOOL_FEEDBACK_ENVELOPE_PREFIX, formatToolFeedbackEnvelope } = toolFeedbackEnvelope;
 
 test("provider compatibility error helper matches weak OpenAI-compatible gateways", () => {
   assert.equal(
@@ -129,4 +161,27 @@ test("transcript compatibility retry collapses history into one plain-text user 
   assert.match(messages[0].content, /\[Assistant 3\]/);
   assert.match(messages[0].content, /\[User 4\]/);
   assert.match(messages[0].content, /emit XML <tool_use> blocks only/);
+});
+
+test("compatibility retry preserves v1 envelope header for tool messages", () => {
+  const enveloped = formatToolFeedbackEnvelope({
+    status: "blocked",
+    toolCallId: "call_9",
+    tool: "write_file",
+    target: "src/App.tsx",
+    content: "Error: PLAN_STAGE_BLOCKED",
+  });
+  const retried = buildCompatibilityRetryMessages([
+    {
+      role: "tool",
+      content: enveloped,
+      tool_call_id: "call_9",
+    },
+  ]);
+
+  assert.equal(retried.length, 1);
+  assert.equal(retried[0].role, "user");
+  assert.match(retried[0].content, /\[Tool result\]:/);
+  assert.match(retried[0].content, new RegExp(`\\${TOOL_FEEDBACK_ENVELOPE_PREFIX}\\{\"version\":1,\"status\":\"blocked\"`));
+  assert.match(retried[0].content, /PLAN_STAGE_BLOCKED/);
 });
