@@ -25,6 +25,7 @@ MAIN 1.6.6 重点强化了“云端兼容回退隔离”“远程上下文超限
 - `contextMemoryState` 扩展为按 runtime lane 存储（`contextMemoryStateByRuntimeKey`），不同模型/协议通道各自维护记忆，不再混用。
 - 切换配置时会自动加载对应通道的上下文记忆，降低“上一通道残留上下文”对当前对话的干扰。
 - Session runtime snapshot 新增按通道的 context memory 与 provider compatibility 状态持久化，重启后恢复更完整。
+- `setConfig` 切换配置后会按当前 lane 自动对齐上下文记忆，减少“切换模型后沿用旧上下文”的错位感。
 
 ### 工具协议决策链路收敛
 
@@ -32,11 +33,18 @@ MAIN 1.6.6 重点强化了“云端兼容回退隔离”“远程上下文超限
 - 回合启动、迭代执行、压缩重试等阶段的 `nativeToolsEnabled` 判定统一使用同一逻辑，工具协议行为更一致。
 - 当原生工具调用成功时，新增回调上报，为兼容回退自动恢复提供可靠信号。
 
+### 版本与打包配置同步到 1.6.6
+
+- 前端与桌面端版本号已同步更新到 `1.6.6`（`package.json`、Tauri/Cargo 配置）。
+- macOS / Windows bundle 版本号同步刷新，确保安装包显示版本与应用内版本一致。
+- `Release_Notes_1.6.6_ZH.md` 已纳入发布内容，方便后续直接用于公开下载页说明。
+
 ## 修复与稳定性
 
 - 修复多云端配置并行使用时，兼容回退状态可能串线的问题。
 - 改进配置切换后的上下文记忆一致性，减少跨配置“历史污染”导致的意图偏移。
 - 改进远程超限场景下的失败路径，优先尝试可恢复策略，再进入终止错误。
+- 持久化快照新增 `contextMemoryStateByRuntimeKey` 与 `providerCompatibilityByRuntimeKey`，多次重启后状态恢复更稳定。
 
 ## 验证覆盖
 
