@@ -3,6 +3,7 @@ export const TOOL_FEEDBACK_ENVELOPE_PREFIX = "[MAIN_TOOL_FEEDBACK_V1]";
 export type ToolFeedbackStatus =
   | "completed"
   | "failed"
+  | "no_effect_mutation"
   | "declined"
   | "blocked"
   | "cached"

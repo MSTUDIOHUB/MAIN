@@ -145,6 +145,7 @@ export const STUDIO_WORKFLOW_COMMAND_SLUGS = [
 
 export type StudioWorkflowCommandSlug = (typeof STUDIO_WORKFLOW_COMMAND_SLUGS)[number];
 export type StudioCatalogLanguage = "en" | "zh";
+export type SlashCommandExecutionMode = "local_fast" | "model_workflow";
 
 type LocalizedCatalogText = string | Partial<Record<StudioCatalogLanguage, string>>;
 
@@ -157,6 +158,14 @@ export type SlashCommandCatalogItem = {
   group: string;
   description: string;
   engineTags: string[];
+  executionMode: SlashCommandExecutionMode;
+};
+
+export type GameStudioSlashCommandSpec = {
+  type: PendingSlashCommand["type"];
+  canonicalCommand: string;
+  executionMode: SlashCommandExecutionMode;
+  slug?: StudioWorkflowCommandSlug | NonAutoStudioAgentKey;
 };
 
 export type PendingSlashCommand =
@@ -391,6 +400,46 @@ const COMMAND_ALIAS_MAP: Partial<Record<StudioWorkflowCommandSlug, string[]>> = 
   "project-stage-detect": ["stage"],
 };
 
+const LOCAL_FAST_WORKFLOW_COMMANDS = new Set<StudioWorkflowCommandSlug>([
+  "help",
+  "sprint-status",
+  "story-readiness",
+  "scope-check",
+]);
+
+export function getGameStudioWorkflowCommandExecutionMode(
+  slug: StudioWorkflowCommandSlug,
+): SlashCommandExecutionMode {
+  return LOCAL_FAST_WORKFLOW_COMMANDS.has(slug) ? "local_fast" : "model_workflow";
+}
+
+export function getGameStudioSlashCommandSpec(
+  command: PendingSlashCommand | null,
+): GameStudioSlashCommandSpec | null {
+  if (!command) return null;
+  if (command.type === "workflow") {
+    return {
+      type: "workflow",
+      slug: command.slug,
+      canonicalCommand: command.canonicalCommand,
+      executionMode: getGameStudioWorkflowCommandExecutionMode(command.slug),
+    };
+  }
+  if (command.type === "agent") {
+    return {
+      type: "agent",
+      slug: command.slug,
+      canonicalCommand: command.canonicalCommand,
+      executionMode: "local_fast",
+    };
+  }
+  return {
+    type: "auto",
+    canonicalCommand: command.canonicalCommand,
+    executionMode: "local_fast",
+  };
+}
+
 const COMMAND_NAME_LOOKUP = (() => {
   const lookup = new Map<string, StudioWorkflowCommandSlug>();
   for (const slug of STUDIO_WORKFLOW_COMMAND_SLUGS) {
@@ -559,6 +608,7 @@ export function buildWorkflowCommandCatalog(
           resolvedLanguage === "en" ? "Game Studio workflow command." : WORKFLOW_COMMAND_DESCRIPTION_ZH[slug],
         ),
         engineTags: getStudioAgentEngineTags(slug),
+        executionMode: getGameStudioWorkflowCommandExecutionMode(slug),
       };
     }),
   );
@@ -582,6 +632,7 @@ export function buildAgentCatalog(
       resolvedLanguage === "en" ? "Game Studio specialist profile." : "Game Studio 专家角色说明。",
     ),
     engineTags: getStudioAgentEngineTags(slug),
+    executionMode: "local_fast",
   }));
 }
 

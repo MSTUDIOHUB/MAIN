@@ -44,6 +44,7 @@ import {
   collectChangeEntries,
   isEphemeralPlanArtifactPath,
   isGenericConversationTitle,
+  isPlanTaskTrustedComplete,
   looksLikeReasoningLeakTitle,
   normalizeResponseLanguagePolicy,
   normalizeConversationDisplayTitle,
@@ -127,12 +128,14 @@ import {
 import {
   buildGameStudioEnvelopeForTurn,
   ensureGameStudioWorkspaceInitialized,
+  getGameStudioSlashCatalog,
   loadGameStudioConfig,
   removeGameStudioWorkspaceAssets,
   setGameStudioActiveAgent,
   setGameStudioEngineConfig,
 } from "../lib/gameStudioPack";
 import {
+  getGameStudioSlashCommandSpec,
   getDefaultStudioAgentForEngine,
   parseSetupEngineArgs,
   normalizeStudioAgentKey,
@@ -172,6 +175,10 @@ import {
   type ResolvedUserIntent,
   type ResolvedRunIntent,
 } from "../lib/runIntent";
+import {
+  resolvePlanStateHydrationReason,
+  shouldPromoteHydratedPlanToExecuting,
+} from "../lib/planStateHydration";
 import { hydratePlanArtifactsFromReader } from "../lib/planArtifactHydration";
 import { mapLegacyNexusModeToMainMode, mapMainModeToLegacyNexusMode, type MainModeKey } from "../lib/mainModes";
 import { runIntentPreflight } from "../lib/intentPreflight";
@@ -1125,6 +1132,7 @@ interface AppState {
       contextMentionsSnapshot?: string[];
       attachedFilesSnapshot?: Array<AttachedFile | string>;
       remoteFeishu?: FeishuRemoteContext;
+      skipAutoPlanHydration?: boolean;
     },
   ) => boolean;
   // Resume loop after human review
@@ -1559,6 +1567,11 @@ function normalizeRuntimeEvents(value: unknown): MainThreadEvent[] {
     "turn.started",
     "turn.completed",
     "turn.failed",
+    "slash.command.started",
+    "slash.command.completed",
+    "slash.command.failed",
+    "path_alias_hit",
+    "plan_state_hydrated",
     "item.started",
     "item.updated",
     "item.completed",
@@ -2419,6 +2432,256 @@ function shouldConsiderGameStudioSuggestion(params: {
     isPlanApproved: params.isPlanApproved,
   })) return false;
   return true;
+}
+
+function buildGameStudioLocalHelpMessage(params: {
+  language: "zh" | "en";
+  activeStudioAgent: StudioAgentKey;
+  initialized: boolean;
+  requestedCommand?: string;
+}): string {
+  const language = params.language === "en" ? "en" : "zh";
+  const catalog = getGameStudioSlashCatalog(language);
+  const workflowItems = catalog.filter((item) => item.kind === "workflow");
+  const normalizedRequested = String(params.requestedCommand || "")
+    .trim()
+    .replace(/^\//, "")
+    .toLowerCase();
+
+  if (normalizedRequested) {
+    const exact = workflowItems.find((item) => {
+      const canonical = item.canonicalCommand.replace(/^\//, "").toLowerCase().split(/\s+/)[0];
+      if (canonical === normalizedRequested) return true;
+      return item.aliases.some((alias) => alias.replace(/^\//, "").toLowerCase() === normalizedRequested);
+    });
+    if (exact) {
+      return language === "en"
+        ? [
+            `Game Studio Help: ${exact.canonicalCommand}`,
+            exact.description,
+            "",
+            `Group: ${exact.group}`,
+            `Aliases: ${exact.aliases.join(", ")}`,
+            "",
+            "Tip: Use `/agent <slug>` to switch specialist and `/auto` to return to auto-orchestration.",
+          ].join("\n")
+        : [
+            `Game Studio 帮助：${exact.canonicalCommand}`,
+            exact.description,
+            "",
+            `分组：${exact.group}`,
+            `别名：${exact.aliases.join("、")}`,
+            "",
+            "提示：用 `/agent <slug>` 切换专家，用 `/auto` 恢复自动编排。",
+          ].join("\n");
+    }
+  }
+
+  const preferred = [
+    "start",
+    "help",
+    "project-stage-detect",
+    "setup-engine",
+    "dev-story",
+    "code-review",
+    "smoke-check",
+    "release-checklist",
+  ];
+  const preferredMap = new Set(preferred);
+  const selected = workflowItems
+    .filter((item) => preferredMap.has(item.canonicalCommand.replace(/^\//, "").split(/\s+/)[0]))
+    .slice(0, 8);
+  const quickLines = selected.map((item) =>
+    `${item.canonicalCommand} - ${item.description}`,
+  );
+
+  if (language === "en") {
+    return [
+      "Game Studio Local Help (fast path, no model round-trip)",
+      `Active specialist: ${params.activeStudioAgent}`,
+      `Workspace initialized: ${params.initialized ? "yes" : "no"}`,
+      "",
+      "Quick commands:",
+      ...quickLines,
+      "",
+      "Use `/agent <slug>` to pin a specialist, `/auto` to restore auto orchestration.",
+      "Type `/` in the composer to browse all Game Studio slash commands.",
+    ].join("\n");
+  }
+
+  return [
+    "Game Studio 本地帮助（快速通道，不走模型推理）",
+    `当前专家：${params.activeStudioAgent}`,
+    `工作区初始化：${params.initialized ? "已初始化" : "未初始化"}`,
+    "",
+    "常用命令：",
+    ...quickLines,
+    "",
+    "使用 `/agent <slug>` 固定专家，使用 `/auto` 恢复自动编排。",
+    "在输入框键入 `/` 可查看完整命令菜单。",
+  ].join("\n");
+}
+
+function buildGameStudioLocalSprintStatusMessage(params: {
+  language: "zh" | "en";
+  planTasks: PlanTask[];
+  planStage: PlanStage;
+  artifacts: PlanArtifact[];
+}): string {
+  const completed = params.planTasks.filter((task) => isPlanTaskTrustedComplete(task)).length;
+  const total = params.planTasks.length;
+  const pending = Math.max(0, total - completed);
+  const nextTask = params.planTasks.find((task) => !isPlanTaskTrustedComplete(task));
+  const hasTasksArtifact = params.artifacts.some((artifact) => artifact.kind === "tasks");
+
+  if (params.language === "en") {
+    return [
+      "Game Studio Sprint Status (local fast path)",
+      `Stage: ${params.planStage}`,
+      `Tasks: ${completed}/${total} completed`,
+      `Remaining: ${pending}`,
+      `tasks.md detected: ${hasTasksArtifact ? "yes" : "no"}`,
+      nextTask ? `Next: ${nextTask.text}` : "Next: no pending tracked task",
+      "",
+      total === 0
+        ? "No local task board was found in memory yet. Run `/dev-story` or continue plan execution to generate/update tasks."
+        : "Use execution commands to produce real evidence before marking more tasks complete.",
+    ].join("\n");
+  }
+
+  return [
+    "Game Studio Sprint 状态（本地快路径）",
+    `阶段：${params.planStage}`,
+    `任务：已完成 ${completed}/${total}`,
+    `剩余：${pending}`,
+    `是否检测到 tasks.md：${hasTasksArtifact ? "是" : "否"}`,
+    nextTask ? `下一项：${nextTask.text}` : "下一项：暂无待执行任务",
+    "",
+    total === 0
+      ? "当前内存里还没有可追踪任务板。可先运行 `/dev-story` 或继续计划执行来生成/同步 tasks。"
+      : "请继续通过真实执行证据推进任务，再更新完成状态。",
+  ].join("\n");
+}
+
+function buildGameStudioLocalStoryReadinessMessage(params: {
+  language: "zh" | "en";
+  initialized: boolean;
+  planTasks: PlanTask[];
+  artifacts: PlanArtifact[];
+}): string {
+  const hasDesign = params.artifacts.some((artifact) => artifact.kind === "design" || artifact.kind === "bugfix");
+  const hasTasks = params.planTasks.length > 0 || params.artifacts.some((artifact) => artifact.kind === "tasks");
+  const readinessScore = [params.initialized, hasDesign, hasTasks].filter(Boolean).length;
+  const ready = readinessScore >= 2 && hasTasks;
+
+  if (params.language === "en") {
+    return [
+      "Game Studio Story Readiness (local fast path)",
+      `Workspace initialized: ${params.initialized ? "yes" : "no"}`,
+      `Design baseline: ${hasDesign ? "ready" : "missing"}`,
+      `Task board: ${hasTasks ? "ready" : "missing"}`,
+      `Readiness: ${ready ? "READY" : "NOT READY"} (${readinessScore}/3)`,
+      "",
+      ready
+        ? "Story input is sufficient for execution. Proceed with `/dev-story` or execution prompts."
+        : "Fill missing design/tasks first, then re-check readiness.",
+    ].join("\n");
+  }
+
+  return [
+    "Game Studio Story 就绪检查（本地快路径）",
+    `工作区初始化：${params.initialized ? "已完成" : "未完成"}`,
+    `设计基线：${hasDesign ? "已具备" : "缺失"}`,
+    `任务板：${hasTasks ? "已具备" : "缺失"}`,
+    `就绪度：${ready ? "READY" : "NOT READY"}（${readinessScore}/3）`,
+    "",
+    ready
+      ? "当前 Story 输入已满足执行条件，可继续 `/dev-story` 或执行型请求。"
+      : "请先补齐缺失的设计/任务信息，再重新检查。",
+  ].join("\n");
+}
+
+function buildGameStudioLocalScopeCheckMessage(params: {
+  language: "zh" | "en";
+  planTasks: PlanTask[];
+  artifacts: PlanArtifact[];
+}): string {
+  const designArtifacts = params.artifacts.filter((artifact) => artifact.kind === "design" || artifact.kind === "bugfix");
+  const tasks = params.planTasks.length;
+  const completed = params.planTasks.filter((task) => isPlanTaskTrustedComplete(task)).length;
+  const pending = Math.max(0, tasks - completed);
+  const driftHigh = tasks >= 40 || pending >= 24;
+
+  if (params.language === "en") {
+    return [
+      "Game Studio Scope Check (local fast path)",
+      `Design artifacts: ${designArtifacts.length}`,
+      `Tracked tasks: ${tasks} (pending ${pending})`,
+      `Scope drift risk: ${driftHigh ? "high" : tasks === 0 ? "unknown" : "normal"}`,
+      "",
+      tasks === 0
+        ? "No scoped task board found. Generate tasks before judging scope drift."
+        : driftHigh
+        ? "Backlog is large for the current slice. Re-run scope trimming before adding new work."
+        : "Current scope is within a manageable range for execution.",
+    ].join("\n");
+  }
+
+  return [
+    "Game Studio 范围检查（本地快路径）",
+    `设计类文档：${designArtifacts.length}`,
+    `已追踪任务：${tasks}（待完成 ${pending}）`,
+    `范围膨胀风险：${driftHigh ? "高" : tasks === 0 ? "未知" : "正常"}`,
+    "",
+    tasks === 0
+      ? "尚未发现可用于范围判断的任务板，请先生成 tasks。"
+      : driftHigh
+      ? "当前积压任务偏大，建议先做范围收敛，再追加新需求。"
+      : "当前范围处于可执行区间，可继续推进。",
+  ].join("\n");
+}
+
+function buildGameStudioLocalWorkflowMessage(params: {
+  language: "zh" | "en";
+  command: PendingSlashCommand & { type: "workflow" };
+  initialized: boolean;
+  activeStudioAgent: StudioAgentKey;
+  planTasks: PlanTask[];
+  planStage: PlanStage;
+  artifacts: PlanArtifact[];
+}): string | null {
+  if (params.command.slug === "help") {
+    return buildGameStudioLocalHelpMessage({
+      language: params.language,
+      activeStudioAgent: params.activeStudioAgent,
+      initialized: params.initialized,
+      requestedCommand: params.command.args,
+    });
+  }
+  if (params.command.slug === "sprint-status") {
+    return buildGameStudioLocalSprintStatusMessage({
+      language: params.language,
+      planTasks: params.planTasks,
+      planStage: params.planStage,
+      artifacts: params.artifacts,
+    });
+  }
+  if (params.command.slug === "story-readiness") {
+    return buildGameStudioLocalStoryReadinessMessage({
+      language: params.language,
+      initialized: params.initialized,
+      planTasks: params.planTasks,
+      artifacts: params.artifacts,
+    });
+  }
+  if (params.command.slug === "scope-check") {
+    return buildGameStudioLocalScopeCheckMessage({
+      language: params.language,
+      planTasks: params.planTasks,
+      artifacts: params.artifacts,
+    });
+  }
+  return null;
 }
 
 function normalizeIntentSummary(summary: string): string {
@@ -5166,6 +5429,7 @@ export const useAppStore = create<AppState>()(
     contextMentionsSnapshot?: string[];
     attachedFilesSnapshot?: Array<AttachedFile | string>;
     remoteFeishu?: FeishuRemoteContext;
+    skipAutoPlanHydration?: boolean;
   }) => {
     const state = get();
     const sendStartedAt = nowMs();
@@ -5273,6 +5537,96 @@ export const useAppStore = create<AppState>()(
           systemLanguage: state.config.language === "en" ? "en" : "zh",
           fallbackLanguage: state.config.language === "en" ? "en" : "zh",
         });
+    const hasRuntimePlanState =
+      state.planArtifacts.length > 0 ||
+      state.planTasks.length > 0 ||
+      state.planStage !== "idle";
+    const shouldAttemptAutoPlanHydration =
+      !isHidden &&
+      options?.skipAutoPlanHydration !== true &&
+      !!state.currentWorkspace.trim();
+    const autoHydrationReason = shouldAttemptAutoPlanHydration
+      ? resolvePlanStateHydrationReason({
+          text,
+          hasPlanState: hasRuntimePlanState,
+          hasContinuationState: state.isPlanApproved || state.planStage === "executing",
+          slashCommand: parsedStudioCommand,
+        })
+      : null;
+    if (autoHydrationReason) {
+      void (async () => {
+        let hydrated:
+          | Awaited<ReturnType<typeof hydrateExistingPlanArtifactsForWorkspace>>
+          | null = null;
+        try {
+          hydrated = await hydrateExistingPlanArtifactsForWorkspace(
+            state.currentWorkspace,
+            preferredLanguage === "en" ? "en" : "zh",
+          );
+        } catch {
+          hydrated = null;
+        }
+
+        const shouldPromoteToExecuting = shouldPromoteHydratedPlanToExecuting(autoHydrationReason);
+        const hasHydratedData = !!hydrated && (hydrated.artifacts.length > 0 || hydrated.tasks.length > 0);
+        if (hydrated && hasHydratedData) {
+          set((s) => {
+            const alreadyHasPlanState =
+              s.planArtifacts.length > 0 ||
+              s.planTasks.length > 0 ||
+              s.planStage !== "idle";
+            if (alreadyHasPlanState) return {};
+            const baseStage = derivePlanStageFromArtifacts(
+              hydrated.artifacts,
+              hydrated.tasks,
+              shouldPromoteToExecuting,
+              s.planStage,
+            );
+            const nextStage =
+              shouldPromoteToExecuting && (baseStage === "idle" || baseStage === "ready_to_execute")
+                ? "executing"
+                : baseStage;
+            const threadId =
+              resolveSessionRuntimeKey(resolveSessionWorkspaceKey(s.currentWorkspace), s.currentSessionId) ||
+              "default";
+            const nextEvent = withEventSchema({
+              type: "plan_state_hydrated",
+              threadId,
+              turnId: s.currentTurnId || undefined,
+              timestampMs: Date.now(),
+              reason: autoHydrationReason,
+              taskCount: hydrated.tasks.length,
+              artifactPaths: hydrated.artifacts.map((artifact) => artifact.path),
+            });
+            return {
+              planArtifacts: hydrated.artifacts,
+              planTasks: hydrated.tasks,
+              planStage: nextStage,
+              isPlanApproved: shouldPromoteToExecuting || s.isPlanApproved,
+              showPlanPanel: true,
+              rightPanelTab: "plan",
+              showDiff: false,
+              runtimeEvents: appendRuntimeEvent(s.runtimeEvents, nextEvent),
+            };
+          });
+          logStoreEvent("plan_state_hydrated", {
+            workspace: state.currentWorkspace || null,
+            reason: autoHydrationReason,
+            artifacts: hydrated.artifacts.map((artifact) => artifact.path),
+            taskCount: hydrated.tasks.length,
+          });
+        }
+
+        const nextOptions = {
+          ...(options || {}),
+          skipAutoPlanHydration: true,
+          preservePlanState:
+            options?.preservePlanState === true || (hasHydratedData && shouldPromoteToExecuting),
+        };
+        get().sendMessage(text, images, nextOptions);
+      })();
+      return true;
+    }
     const mainDebugShortcut = !isHidden && currentMainModeKey === "main_mode"
       ? parseMainDebugShortcut(text)
       : null;
@@ -6256,21 +6610,102 @@ export const useAppStore = create<AppState>()(
       }
     };
 
-    if (parsedStudioCommand?.type === "agent") {
-      void sessionGet().setActiveStudioAgentKey(parsedStudioCommand.slug, {
-        persistToWorkspace: sessionGet().gameStudioInitialized,
-      });
-      void appendLocalStudioTurn(
-        `Game Studio 当前专家已切换为 \`${parsedStudioCommand.slug}\`。后续普通消息会默认按该专家视角继续；发送 \`/auto\` 可恢复自动编排。`,
-      );
-      return true;
-    }
+    const emitLocalSlashRuntimeEvent = (event: MainThreadEventInput) => {
+      if (normalizeEventStreamMode(sessionGet().config.eventStreamMode) === "legacy") return;
+      sessionSet((s) => ({
+        runtimeEvents: appendRuntimeEvent(s.runtimeEvents, withEventSchema(event)),
+      }));
+    };
 
-    if (parsedStudioCommand?.type === "auto") {
-      void sessionGet().setActiveStudioAgentKey("studio_auto", {
-        persistToWorkspace: sessionGet().gameStudioInitialized,
-      });
-      void appendLocalStudioTurn("Game Studio 已恢复自动编排。后续消息将不再固定绑定某个专家。");
+    const dispatchGameStudioSlashCommand = (command: PendingSlashCommand | null): boolean => {
+      const spec = getGameStudioSlashCommandSpec(command);
+      if (!spec) return false;
+
+      const runLocalSlash = (handler: () => Promise<string> | string) => {
+        emitLocalSlashRuntimeEvent({
+          type: "slash.command.started",
+          threadId: runSessionKey,
+          turnId,
+          timestampMs: Date.now(),
+          command: spec.canonicalCommand,
+          executionMode: spec.executionMode,
+        });
+
+        void (async () => {
+          try {
+            const content = await handler();
+            await appendLocalStudioTurn(content);
+            emitLocalSlashRuntimeEvent({
+              type: "slash.command.completed",
+              threadId: runSessionKey,
+              turnId,
+              timestampMs: Date.now(),
+              command: spec.canonicalCommand,
+              executionMode: spec.executionMode,
+            });
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error || "Unknown slash command error");
+            await appendLocalStudioTurn(
+              preferredLanguage === "en"
+                ? `Slash command failed: ${message}`
+                : `斜杠命令执行失败：${message}`,
+            );
+            emitLocalSlashRuntimeEvent({
+              type: "slash.command.failed",
+              threadId: runSessionKey,
+              turnId,
+              timestampMs: Date.now(),
+              command: spec.canonicalCommand,
+              executionMode: spec.executionMode,
+              error: { message },
+            });
+          }
+        })();
+      };
+
+      if (command?.type === "agent") {
+        runLocalSlash(async () => {
+          await sessionGet().setActiveStudioAgentKey(command.slug, {
+            persistToWorkspace: sessionGet().gameStudioInitialized,
+          });
+          return preferredLanguage === "en"
+            ? `Game Studio specialist switched to \`${command.slug}\`. Future messages will follow this specialist until you send \`/auto\`.`
+            : `Game Studio 当前专家已切换为 \`${command.slug}\`。后续普通消息会默认按该专家视角继续；发送 \`/auto\` 可恢复自动编排。`;
+        });
+        return true;
+      }
+
+      if (command?.type === "auto") {
+        runLocalSlash(async () => {
+          await sessionGet().setActiveStudioAgentKey("studio_auto", {
+            persistToWorkspace: sessionGet().gameStudioInitialized,
+          });
+          return preferredLanguage === "en"
+            ? "Game Studio has switched back to auto-orchestration."
+            : "Game Studio 已恢复自动编排。后续消息将不再固定绑定某个专家。";
+        });
+        return true;
+      }
+
+      if (command?.type === "workflow" && spec.executionMode === "local_fast") {
+        const content = buildGameStudioLocalWorkflowMessage({
+          language: preferredLanguage === "en" ? "en" : "zh",
+          command,
+          initialized: sessionGet().gameStudioInitialized,
+          activeStudioAgent: sessionGet().activeStudioAgentKey,
+          planTasks: sessionGet().planTasks,
+          planStage: sessionGet().planStage,
+          artifacts: sessionGet().planArtifacts,
+        });
+        if (!content) return false;
+        runLocalSlash(() => content);
+        return true;
+      }
+
+      return false;
+    };
+
+    if (dispatchGameStudioSlashCommand(parsedStudioCommand)) {
       return true;
     }
 

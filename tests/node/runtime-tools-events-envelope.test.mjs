@@ -199,6 +199,29 @@ test("thread event helpers stamp schema, detect terminal events, and keep ring b
     buffered.map((event) => event.type),
     ["turn.completed", "turn.failed"],
   );
+
+  const slash = withEventSchema({
+    type: "slash.command.started",
+    threadId: "thread-1",
+    turnId: "turn-1",
+    timestampMs: 4,
+    command: "/help",
+    executionMode: "local_fast",
+  });
+  assert.equal(slash.type, "slash.command.started");
+
+  const alias = withEventSchema({
+    type: "path_alias_hit",
+    threadId: "thread-1",
+    turnId: "turn-1",
+    timestampMs: 5,
+    tool: "read_file",
+    field: "path",
+    from: ".claude/docs/workflow-catalog.yaml",
+    to: ".protocols/game-studio/docs/workflow-catalog.yaml",
+    rule: "docs",
+  });
+  assert.equal(alias.type, "path_alias_hit");
 });
 
 test("tool feedback envelope v1 supports parse/format roundtrip", () => {
@@ -223,4 +246,17 @@ test("tool feedback envelope v1 supports parse/format roundtrip", () => {
   assert.equal(parsed.body, "FILE_UNCHANGED_STUB: reuse prior read");
 
   assert.equal(parseToolFeedbackEnvelope("plain-text"), null);
+});
+
+test("tool feedback envelope v1 supports no_effect_mutation status", () => {
+  const formatted = formatToolFeedbackEnvelope({
+    status: "no_effect_mutation",
+    toolCallId: "call-999",
+    tool: "apply_text_edits",
+    target: "Assets/Scripts/Player.cs",
+    content: "NO_EFFECT_MUTATION: apply_text_edits reported success but no file change.",
+  });
+  const parsed = parseToolFeedbackEnvelope(formatted);
+  assert.ok(parsed);
+  assert.equal(parsed.envelope.status, "no_effect_mutation");
 });

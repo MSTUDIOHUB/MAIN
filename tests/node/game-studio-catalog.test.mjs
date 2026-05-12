@@ -33,6 +33,7 @@ const {
   buildGameStudioUserEnvelope,
   buildWorkflowCommandCatalog,
   buildAgentCatalog,
+  getGameStudioSlashCommandSpec,
 } = await loadCatalogModule();
 
 test("legacy persona keys migrate into nexus modes", () => {
@@ -68,6 +69,23 @@ test("slash parsing normalizes workflow aliases and specialist commands", () => 
     type: "auto",
     canonicalCommand: "/auto",
   });
+});
+
+test("slash command specs expose local fast mode only for selected workflow commands", () => {
+  const helpSpec = getGameStudioSlashCommandSpec(parseGameStudioSlashCommand("/help"));
+  assert.equal(helpSpec?.executionMode, "local_fast");
+
+  const sprintSpec = getGameStudioSlashCommandSpec(parseGameStudioSlashCommand("/sprint-status"));
+  assert.equal(sprintSpec?.executionMode, "local_fast");
+
+  const modelSpec = getGameStudioSlashCommandSpec(parseGameStudioSlashCommand("/dev-story"));
+  assert.equal(modelSpec?.executionMode, "model_workflow");
+
+  const agentSpec = getGameStudioSlashCommandSpec(parseGameStudioSlashCommand("/agent creative-director"));
+  assert.equal(agentSpec?.executionMode, "local_fast");
+
+  const autoSpec = getGameStudioSlashCommandSpec(parseGameStudioSlashCommand("/auto"));
+  assert.equal(autoSpec?.executionMode, "local_fast");
 });
 
 test("setup-engine args parse explicit Unity metadata", () => {

@@ -119,6 +119,7 @@ import {
 import { normalizeCloudToolProtocol, normalizeLocalToolProtocol, resolveEffectiveCloudApiFormat } from "./cloudProtocol";
 import { getErrorMessage } from "./errorUtils";
 import { resolveProtocolPackageReadPath } from "./protocolPackages";
+import { resolveStudioCompatToolArgs } from "./studioCompatPathResolver";
 import { isCloudGatewayTimeoutMessage, isRetryableCloudErrorMessage } from "./cloudRetry";
 import {
   buildMissingToolCallContinuationPrompt,
@@ -1573,6 +1574,103 @@ async function readFileMetadataIfAvailable(path: string, workspace?: string): Pr
   }
 }
 
+function normalizePathLike(value: string): string {
+  return String(value || "").trim().replace(/\\/g, "/").replace(/\/+/g, "/");
+}
+
+function resolveUnityScriptPathFromArgs(args: Record<string, unknown>): string | null {
+  const folder = typeof args.path === "string" ? normalizePathLike(args.path) : "";
+  const name = typeof args.name === "string" ? String(args.name).trim() : "";
+  if (!folder || !name) return null;
+  const fileName = name.endsWith(".cs") ? name : `${name}.cs`;
+  return normalizePathLike(`${folder.replace(/\/+$/, "")}/${fileName}`);
+}
+
+function resolveMutationVerificationPath(name: string, args: Record<string, unknown>): string | null {
+  const pathArg = typeof args.path === "string" ? normalizePathLike(args.path) : "";
+
+  switch (name) {
+    case "write_file":
+    case "replace_in_file":
+    case "create_script":
+    case "delete_script":
+      return pathArg || null;
+    case "script_apply_edits":
+      return resolveUnityScriptPathFromArgs(args);
+    case "manage_script": {
+      const action = typeof args.action === "string" ? args.action.trim().toLowerCase() : "";
+      if (action !== "create" && action !== "delete") return null;
+      return resolveUnityScriptPathFromArgs(args);
+    }
+    case "apply_text_edits": {
+      const uri = typeof args.uri === "string" ? String(args.uri).trim() : "";
+      if (!uri) return null;
+      if (uri.startsWith("Assets/")) return normalizePathLike(uri);
+      if (uri.startsWith("file://")) {
+        try {
+          return normalizePathLike(decodeURIComponent(uri.replace(/^file:\/\//, "")));
+        } catch {
+          return normalizePathLike(uri.replace(/^file:\/\//, ""));
+        }
+      }
+      return null;
+    }
+    default:
+      return null;
+  }
+}
+
+function isSameFileMetadata(
+  left: { path: string; sizeBytes: number; modifiedMs: number } | null,
+  right: { path: string; sizeBytes: number; modifiedMs: number } | null,
+): boolean {
+  if (!left && !right) return true;
+  if (!left || !right) return false;
+  return (
+    normalizePathLike(left.path) === normalizePathLike(right.path) &&
+    left.sizeBytes === right.sizeBytes &&
+    left.modifiedMs === right.modifiedMs
+  );
+}
+
+function isNoEffectMutationResult(input: {
+  result: string;
+  before: { path: string; sizeBytes: number; modifiedMs: number } | null;
+  after: { path: string; sizeBytes: number; modifiedMs: number } | null;
+}): boolean {
+  const normalized = input.result.trim();
+  const emptyPayload = normalized === "" || normalized === "{}" || normalized === "null";
+  const unchanged = isSameFileMetadata(input.before, input.after);
+  return emptyPayload && unchanged;
+}
+
+function buildNoEffectMutationMessage(input: {
+  language: "zh" | "en";
+  toolName: string;
+  target: string;
+  verificationPath: string;
+  result: string;
+}): string {
+  const toolLabel = input.target
+    ? `${input.toolName} (${input.target})`
+    : input.toolName;
+  const resultPreview = input.result.trim().slice(0, 120) || "{}";
+  if (input.language === "zh") {
+    return [
+      `NO_EFFECT_MUTATION: ${toolLabel} 返回了成功结果，但未观察到实际文件变化。`,
+      `校验路径: ${input.verificationPath}`,
+      `返回摘要: ${resultPreview}`,
+      "请先读取目标文件并精确定位修改点，再重试一次带明确 patch 的工具调用；不要重复同一参数。",
+    ].join("\n");
+  }
+  return [
+    `NO_EFFECT_MUTATION: ${toolLabel} reported success, but no observable file change was detected.`,
+    `Verification path: ${input.verificationPath}`,
+    `Result summary: ${resultPreview}`,
+    "Read the target file, identify the exact edit location, and retry with a precise patch instead of repeating identical arguments.",
+  ].join("\n");
+}
+
 function getToolResultBudgets(name: string, cloudProfile: boolean): { modelChars: number; displayChars: number } {
   if (cloudProfile) {
     if (name === "read_file") return { modelChars: 8000, displayChars: 8000 };
@@ -1615,17 +1713,20 @@ function inferLifecycleStateFromToolResult(result: ToolExecutionResult): ToolLif
 function buildToolResultHistoryContent(result: ToolExecutionResult): string {
   const lifecycleState = inferLifecycleStateFromToolResult(result);
   const isNoOp = /"noOp"\s*:\s*true/.test(result.content || "");
+  const isNoEffectMutation = /NO_EFFECT_MUTATION/i.test(result.content || "");
   const isCachedReuse =
     result.content.includes(FILE_UNCHANGED_STUB) ||
     /Repeated read-only tool call skipped:/i.test(result.content);
   const status: ToolFeedbackStatus =
     lifecycleState === "declined"
       ? "declined"
-      : lifecycleState === "blocked"
+    : lifecycleState === "blocked"
       ? "blocked"
-      : lifecycleState === "failed"
+    : isNoEffectMutation
+      ? "no_effect_mutation"
+    : lifecycleState === "failed"
       ? "failed"
-      : isNoOp
+    : isNoOp
       ? "no_op"
       : isCachedReuse
       ? "cached"
@@ -1702,13 +1803,32 @@ async function executeToolCallWithLifecycle(
   });
 
   const effectiveArgs = preHookResult.updatedToolArgs ?? toolArgs;
+  const compatResolved = resolveStudioCompatToolArgs(tc.name, effectiveArgs);
+  const compatArgs = compatResolved.args;
+  if (compatResolved.hits.length > 0) {
+    const threadId = callbacks.getSessionKey() || "default";
+    const turnId = callbacks.getCurrentTurnId?.() || generateId();
+    for (const hit of compatResolved.hits) {
+      callbacks.onTurnEvent?.(withEventSchema({
+        type: "path_alias_hit",
+        threadId,
+        turnId,
+        timestampMs: Date.now(),
+        tool: hit.tool,
+        field: hit.field,
+        from: hit.from,
+        to: hit.to,
+        rule: hit.rule,
+      }));
+    }
+  }
   const resolvedArgs =
-    tc.name === "read_file" && typeof effectiveArgs.path === "string"
+    tc.name === "read_file" && typeof compatArgs.path === "string"
       ? {
-          ...effectiveArgs,
-          path: resolveProtocolPackageReadPath(effectiveArgs.path, callbacks.getSkills(), workspace),
+          ...compatArgs,
+          path: resolveProtocolPackageReadPath(compatArgs.path, callbacks.getSkills(), workspace),
         }
-      : effectiveArgs;
+      : compatArgs;
   const target = getToolTarget(tc.name, resolvedArgs);
 
   if (preHookResult.blocked) {
@@ -1766,16 +1886,62 @@ async function executeToolCallWithLifecycle(
     };
   }
 
-  const diffPreview = isEphemeralPlanArtifactMutation(tc.name, effectiveArgs)
+  const diffPreview = isEphemeralPlanArtifactMutation(tc.name, resolvedArgs)
     ? undefined
-    : await buildToolDiffPreview(tc.name, effectiveArgs, { workspace, sessionKey });
+    : await buildToolDiffPreview(tc.name, resolvedArgs, { workspace, sessionKey });
   callbacks.onToolExecuting(tc.name, target, diffPreview, { toolCallId: tc.id });
+  const mutationVerificationPath = resolveMutationVerificationPath(tc.name, resolvedArgs);
+  const mutationBeforeMeta = mutationVerificationPath
+    ? await readFileMetadataIfAvailable(mutationVerificationPath, workspace)
+    : null;
 
   try {
     const rawResult = await executeTool(tc.name, resolvedArgs, workspace, sessionKey, {
       allowExternalLocalRead: options.allowExternalLocalRead === true,
     });
     const resultStr = typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult);
+    const mutationAfterMeta = mutationVerificationPath
+      ? await readFileMetadataIfAvailable(mutationVerificationPath, workspace)
+      : null;
+    if (
+      mutationVerificationPath &&
+      isNoEffectMutationResult({
+        result: resultStr,
+        before: mutationBeforeMeta,
+        after: mutationAfterMeta,
+      })
+    ) {
+      const noEffectMessage = buildNoEffectMutationMessage({
+        language: callbacks.getPreferredLanguage(),
+        toolName: tc.name,
+        target,
+        verificationPath: mutationVerificationPath,
+        result: resultStr,
+      });
+      callbacks.onToolError(tc.name, target, noEffectMessage, { toolCallId: tc.id });
+      const postHookResult = await runLifecycleHooks(callbacks, hooksConfig, "PostToolUse", {
+        toolName: tc.name,
+        toolArgs: resolvedArgs,
+        toolResult: noEffectMessage,
+        isError: true,
+        workspace,
+        workflowMode: callbacks.getWorkflowMode(),
+        language: callbacks.getPreferredLanguage(),
+        associatedPaths: callbacks.getAssociatedPaths(),
+      });
+      return {
+        toolCallId: tc.id,
+        name: tc.name,
+        target,
+        content: `Error: ${noEffectMessage}`,
+        isError: true,
+        lifecycleState: "failed",
+        additionalContexts: [
+          ...preHookResult.additionalContexts,
+          ...postHookResult.additionalContexts,
+        ],
+      };
+    }
     const cloudProfile = callbacks.getConfig().activeProfile === "cloud";
     const budgets = getToolResultBudgets(tc.name, cloudProfile);
     const modelContent = truncateToolContent(resultStr, budgets.modelChars);
