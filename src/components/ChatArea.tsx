@@ -1838,6 +1838,21 @@ export default function ChatArea({
         }
         return <PlanExecutionSystemNotice key={`${block.id}-${index}`} block={block} language={language} />;
       }
+      if (block.variant === "game_studio_local_markdown") {
+        return (
+          <div key={`${block.id}-${index}`} className="mt-4 flex w-full min-w-0 items-start justify-start gap-3">
+            <div className="mt-1 flex-shrink-0">
+              <IconLogoM className="theme-text h-6 w-6 drop-shadow-[0_0_8px_var(--accent-subtle)]" />
+            </div>
+            <div
+              data-testid="game-studio-local-markdown"
+              className="min-w-0 flex-1 rounded-lg border border-[#1f1f23] bg-[#09090b] px-4 py-4 text-[#e4e4e7]"
+            >
+              <MarkdownRenderer content={block.content} baseFontSize={config.chatFontSize ?? 13} />
+            </div>
+          </div>
+        );
+      }
       return (
         <div key={`${block.id}-${index}`} className="flex w-full justify-center">
           <div className="rounded-full border border-[#27272a] bg-[#18181b] px-4 py-1.5 text-[11px] text-[#a1a1aa]">{block.content}</div>

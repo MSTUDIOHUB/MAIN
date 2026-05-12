@@ -402,9 +402,6 @@ const COMMAND_ALIAS_MAP: Partial<Record<StudioWorkflowCommandSlug, string[]>> = 
 
 const LOCAL_FAST_WORKFLOW_COMMANDS = new Set<StudioWorkflowCommandSlug>([
   "help",
-  "sprint-status",
-  "story-readiness",
-  "scope-check",
 ]);
 
 export function getGameStudioWorkflowCommandExecutionMode(

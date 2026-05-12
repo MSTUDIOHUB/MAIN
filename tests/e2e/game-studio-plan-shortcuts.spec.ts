@@ -82,6 +82,33 @@ test("locked game studio plan turn submits as plan intent", async ({ page }) => 
     .toBe("plan");
 });
 
+test("game studio help renders local command markdown instead of system pill", async ({ page }) => {
+  await page.goto("/?e2eScenario=game-studio-plan-shortcuts");
+
+  const textarea = page.getByTestId("composer-textarea");
+  await textarea.fill("/help /dev-story");
+  await page.getByTestId("composer-send-button").click();
+
+  const markdown = page.getByTestId("game-studio-local-markdown");
+  await expect(markdown).toBeVisible();
+  await expect(markdown).toContainText("/dev-story");
+  await expect(markdown).toContainText("选择一个 Story");
+  await expect(markdown).toContainText(".protocols/game-studio");
+  await expect(markdown).not.toContainText("不走模型");
+
+  await expect
+    .poll(async () =>
+      page.evaluate(() => {
+        const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+        return {
+          conversationTurns: snapshot?.conversationTurns ?? -1,
+          currentTurnStatus: snapshot?.currentTurnStatus ?? null,
+        };
+      }),
+    )
+    .toEqual({ conversationTurns: 1, currentTurnStatus: "done" });
+});
+
 test("game studio continuation keeps previous plan turn identity", async ({ page }) => {
   await page.goto("/?e2eScenario=game-studio-plan-shortcuts");
 

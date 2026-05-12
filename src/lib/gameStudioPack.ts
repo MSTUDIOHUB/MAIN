@@ -9,6 +9,8 @@ import {
   GAME_STUDIO_SOURCE_TAG,
   getDefaultStudioAgentForEngine,
   getDefaultStudioLanguageForEngine,
+  parseGameStudioSlashCommand,
+  STUDIO_WORKFLOW_COMMAND_SLUGS,
   type GameStudioPackManifest,
   type NexusModeKey,
   type NonAutoStudioAgentKey,
@@ -20,6 +22,10 @@ import {
   type StudioEngineKey,
   type StudioWorkflowCommandSlug,
 } from "./gameStudioCatalog";
+import {
+  formatGameStudioCommandDocForDisplay as formatCommandDocForDisplay,
+  formatMissingGameStudioCommandDoc,
+} from "./gameStudioCommandDocs";
 
 type WorkspacePackFile = {
   path: string;
@@ -41,6 +47,12 @@ type HookConfigFile = {
 };
 
 const rawWorkspaceFiles = import.meta.glob("../gameStudioPack/workspace-files/**/*", {
+  eager: true,
+  import: "default",
+  query: "?raw",
+}) as Record<string, string>;
+
+const rawLocalizedZhCommandFiles = import.meta.glob("../gameStudioPack/localized/zh/commands/*.md", {
   eager: true,
   import: "default",
   query: "?raw",
@@ -144,6 +156,20 @@ function parseCommandDescriptions(): Partial<Record<StudioWorkflowCommandSlug, s
   return result;
 }
 
+function parseCommandMarkdownFiles(
+  files: Record<string, string>,
+  marker: string,
+): Partial<Record<StudioWorkflowCommandSlug, string>> {
+  const result: Partial<Record<StudioWorkflowCommandSlug, string>> = {};
+  for (const [key, content] of Object.entries(files)) {
+    if (!key.includes(marker)) continue;
+    const slug = key.split("/").pop()?.replace(/\.md$/i, "");
+    if (!slug || !(STUDIO_WORKFLOW_COMMAND_SLUGS as readonly string[]).includes(slug)) continue;
+    result[slug as StudioWorkflowCommandSlug] = content;
+  }
+  return result;
+}
+
 const bundledWorkspaceFiles: WorkspacePackFile[] = Object.entries(rawWorkspaceFiles)
   .map(([sourcePath, content]) => {
     const path = mapWorkspacePath(sourcePath);
@@ -154,6 +180,14 @@ const bundledWorkspaceFiles: WorkspacePackFile[] = Object.entries(rawWorkspaceFi
 
 const agentDescriptions = parseAgentDescriptions();
 const commandDescriptions = parseCommandDescriptions();
+const commandMarkdownBySlug = parseCommandMarkdownFiles(
+  rawWorkspaceFiles,
+  "/protocols/game-studio/commands/",
+);
+const localizedZhCommandMarkdownBySlug = parseCommandMarkdownFiles(
+  rawLocalizedZhCommandFiles,
+  "/localized/zh/commands/",
+);
 
 export const GAME_STUDIO_COMMAND_PATH_ROOT = ".protocols/game-studio/commands";
 export const GAME_STUDIO_AGENT_PATH_ROOT = ".protocols/game-studio/agents";
@@ -182,6 +216,107 @@ export function getGameStudioSlashCatalog(language: StudioCatalogLanguage = "en"
     ...buildWorkflowCommandCatalog(commandDescriptions, language),
     ...buildAgentCatalog(agentDescriptions, language),
   ];
+}
+
+function normalizeCommandDocLanguage(language: StudioCatalogLanguage = "en"): StudioCatalogLanguage {
+  return language === "en" ? "en" : "zh";
+}
+
+export function getBundledGameStudioCommandMarkdown(
+  slug: StudioWorkflowCommandSlug,
+  language: StudioCatalogLanguage = "en",
+): string | null {
+  const resolvedLanguage = normalizeCommandDocLanguage(language);
+  if (resolvedLanguage === "zh" && localizedZhCommandMarkdownBySlug[slug]) {
+    return localizedZhCommandMarkdownBySlug[slug] || null;
+  }
+  return commandMarkdownBySlug[slug] || null;
+}
+
+export function hasBundledGameStudioLocalizedCommandMarkdown(
+  slug: StudioWorkflowCommandSlug,
+  language: StudioCatalogLanguage = "en",
+): boolean {
+  const resolvedLanguage = normalizeCommandDocLanguage(language);
+  if (resolvedLanguage !== "zh") return Boolean(commandMarkdownBySlug[slug]);
+  return Boolean(localizedZhCommandMarkdownBySlug[slug]);
+}
+
+export type GameStudioHelpTargetResolution =
+  | {
+      ok: true;
+      slug: StudioWorkflowCommandSlug;
+      requested: string;
+    }
+  | {
+      ok: false;
+      requested: string;
+      suggestions: StudioWorkflowCommandSlug[];
+    };
+
+function scoreCommandSuggestion(requested: string, slug: StudioWorkflowCommandSlug): number {
+  if (!requested) return 0;
+  if (slug === requested) return 100;
+  if (slug.startsWith(requested)) return 80;
+  if (slug.includes(requested)) return 60;
+  const requestedParts = requested.split(/[-_\s]+/).filter(Boolean);
+  const slugParts = slug.split("-");
+  return requestedParts.reduce((score, part) => score + (slugParts.includes(part) ? 12 : 0), 0);
+}
+
+export function resolveGameStudioHelpTarget(rawArgs: string | null | undefined): GameStudioHelpTargetResolution {
+  const requested = String(rawArgs || "").trim();
+  if (!requested) {
+    return { ok: true, slug: "help", requested: "" };
+  }
+
+  const firstToken = requested.split(/\s+/)[0]?.replace(/^\//, "").trim().toLowerCase() || "";
+  const parsed = parseGameStudioSlashCommand(`/${firstToken}`);
+  if (parsed?.type === "workflow") {
+    return {
+      ok: true,
+      slug: parsed.slug,
+      requested,
+    };
+  }
+
+  const suggestions = [...STUDIO_WORKFLOW_COMMAND_SLUGS]
+    .map((slug) => ({ slug, score: scoreCommandSuggestion(firstToken, slug) }))
+    .filter((item) => item.score > 0)
+    .sort((a, b) => b.score - a.score || a.slug.localeCompare(b.slug))
+    .slice(0, 5)
+    .map((item) => item.slug);
+
+  return {
+    ok: false,
+    requested,
+    suggestions,
+  };
+}
+
+export function formatGameStudioCommandDocForDisplay(
+  slug: StudioWorkflowCommandSlug,
+  language: StudioCatalogLanguage = "en",
+): string | null {
+  const resolvedLanguage = normalizeCommandDocLanguage(language);
+  const raw = getBundledGameStudioCommandMarkdown(slug, resolvedLanguage);
+  if (!raw) return null;
+  return formatCommandDocForDisplay({
+    slug,
+    rawMarkdown: raw,
+    language: resolvedLanguage,
+  });
+}
+
+export function formatGameStudioMissingCommandDoc(
+  resolution: Extract<GameStudioHelpTargetResolution, { ok: false }>,
+  language: StudioCatalogLanguage = "en",
+): string {
+  return formatMissingGameStudioCommandDoc({
+    requested: resolution.requested,
+    language: normalizeCommandDocLanguage(language),
+    suggestions: resolution.suggestions,
+  });
 }
 
 export function createGameStudioPackManifest(): GameStudioPackManifest {

@@ -71,12 +71,18 @@ test("slash parsing normalizes workflow aliases and specialist commands", () => 
   });
 });
 
-test("slash command specs expose local fast mode only for selected workflow commands", () => {
+test("slash command specs expose local fast mode only for help workflow command", () => {
   const helpSpec = getGameStudioSlashCommandSpec(parseGameStudioSlashCommand("/help"));
   assert.equal(helpSpec?.executionMode, "local_fast");
 
   const sprintSpec = getGameStudioSlashCommandSpec(parseGameStudioSlashCommand("/sprint-status"));
-  assert.equal(sprintSpec?.executionMode, "local_fast");
+  assert.equal(sprintSpec?.executionMode, "model_workflow");
+
+  const readinessSpec = getGameStudioSlashCommandSpec(parseGameStudioSlashCommand("/story-readiness"));
+  assert.equal(readinessSpec?.executionMode, "model_workflow");
+
+  const scopeSpec = getGameStudioSlashCommandSpec(parseGameStudioSlashCommand("/scope-check"));
+  assert.equal(scopeSpec?.executionMode, "model_workflow");
 
   const modelSpec = getGameStudioSlashCommandSpec(parseGameStudioSlashCommand("/dev-story"));
   assert.equal(modelSpec?.executionMode, "model_workflow");
