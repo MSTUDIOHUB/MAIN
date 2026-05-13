@@ -82,3 +82,38 @@ test("parses <tool_code> wrapper into a real tool call and strips wrapper text",
   assert.match(parsed.cleanText, /先看项目目录/);
   assert.doesNotMatch(parsed.cleanText, /tool_code|list_directory\(\"src\"\)/i);
 });
+
+test("parses bare tool name followed by path and key-value arguments", () => {
+  const parsed = parseTextForTools([
+    "read_file",
+    "/Users/michael/Documents/GitHub/MAIN/src/lib/orchestrator.ts",
+    "max_lines=100",
+  ].join("\n"));
+
+  assert.equal(parsed.toolCalls.length, 1);
+  assert.equal(parsed.toolCalls[0].name, "read_file");
+  assert.deepEqual(parsed.toolCalls[0].arguments, {
+    path: "/Users/michael/Documents/GitHub/MAIN/src/lib/orchestrator.ts",
+    max_lines: 100,
+  });
+  assert.equal(parsed.cleanText, "");
+});
+
+test("strips malformed parameter fragments from visible text", () => {
+  const visibleText = sanitizeAIOutput([
+    "准备读取文件。",
+    "</parametermax_lines\">100",
+    "path=src/lib/orchestrator.ts",
+  ].join("\n"));
+
+  assert.equal(visibleText, "准备读取文件。");
+});
+
+test("parses bare get_project_skeleton as a tool call", () => {
+  const parsed = parseTextForTools("get_project_skeleton");
+
+  assert.equal(parsed.toolCalls.length, 1);
+  assert.equal(parsed.toolCalls[0].name, "get_project_skeleton");
+  assert.deepEqual(parsed.toolCalls[0].arguments, {});
+  assert.equal(parsed.cleanText, "");
+});

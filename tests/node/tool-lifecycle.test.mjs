@@ -55,6 +55,7 @@ function loadTranspiledModuleSync(sourcePath) {
 
 const { findToolLifecycleBlockIndex } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/toolLifecycle.ts"));
 const { buildCompletedToolGroupRanges } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/toolUiGrouping.ts"));
+const { formatToolPresentation } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/toolPresentation.ts"));
 
 test("tool lifecycle matching prefers toolCallId and then falls back to name+target", () => {
   const taskFlow = [
@@ -121,4 +122,23 @@ test("completed tool groups break on pending/failed/agent blocks and skip exclud
     { startIndex: 6, endIndex: 7 },
     { startIndex: 12, endIndex: 13 },
   ]);
+});
+
+test("tool presentation uses friendly labels and compact targets", () => {
+  const readFile = formatToolPresentation({
+    toolName: "read_file",
+    target: "/Users/michael/Documents/GitHub/MAIN/src/lib/orchestrator.ts",
+    language: "zh",
+  });
+
+  assert.equal(readFile.label, "读取文件");
+  assert.equal(readFile.target, ".../src/lib/orchestrator.ts");
+  assert.equal(readFile.summary, "读取文件：.../src/lib/orchestrator.ts");
+
+  const skeleton = formatToolPresentation({
+    toolName: "get_project_skeleton",
+    target: "",
+    language: "zh",
+  });
+  assert.equal(skeleton.summary, "查看项目结构：项目骨架");
 });

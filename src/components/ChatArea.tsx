@@ -40,6 +40,7 @@ import {
 import { getIntentPolicy, resolveConversationTurnIntent } from "../lib/runIntent";
 import { summarizePlanExecutionProgressSnapshot } from "../lib/planExecutionRecovery";
 import { buildCompletedToolGroupRanges, countCompletedToolCalls } from "../lib/toolUiGrouping";
+import { compactToolPresentationTarget, getToolPresentationLabel } from "../lib/toolPresentation";
 
 const TURN_STATUS_LABELS: Record<string, string> = {
   planning: "Planning",
@@ -633,16 +634,7 @@ function isReadContextHardBoundary(block: any) {
 }
 
 function compactToolTarget(rawTarget: string, toolName: string, language: "zh" | "en") {
-  const target = String(rawTarget || "").trim();
-  if (!target) {
-    if (toolName === "get_project_skeleton") return language === "zh" ? "项目骨架" : "Project skeleton";
-    if (toolName === "index_workspace_documents") return language === "zh" ? "工作区文档" : "Workspace documents";
-    return language === "zh" ? "当前工作区" : "Current workspace";
-  }
-
-  if (target === "." || target === "./") return language === "zh" ? "项目根目录" : "Project root";
-  const normalized = target.replace(/[\\/]+$/g, "");
-  return normalized.split(/[\\/]/).pop() || target;
+  return compactToolPresentationTarget(rawTarget, toolName, language);
 }
 
 function fullToolTarget(rawTarget: string, toolName: string, language: "zh" | "en") {
@@ -654,8 +646,8 @@ function fullToolTarget(rawTarget: string, toolName: string, language: "zh" | "e
 
 function getReadContextToolLabel(toolName: string, language: "zh" | "en") {
   const labels = READ_CONTEXT_TOOL_LABELS[toolName];
-  if (!labels) return language === "zh" ? "读取上下文" : "Read context";
-  return labels[language === "zh" ? "zh" : "en"];
+  if (labels) return labels[language === "zh" ? "zh" : "en"];
+  return getToolPresentationLabel(toolName, language);
 }
 
 function buildBlockRenderItems(blocks: any[], includeUser = true, enableCompletedToolGrouping = false) {
@@ -1010,7 +1002,7 @@ function ReadContextGroupCard({
 function getCompletedToolGroupToolLabel(toolName: string, language: "zh" | "en") {
   const labels = COMPLETED_TOOL_GROUP_LABELS[toolName];
   if (labels) return labels[language === "zh" ? "zh" : "en"];
-  return toolName.replace(/_/g, " ");
+  return getToolPresentationLabel(toolName, language);
 }
 
 function CompletedToolGroupCard({

@@ -284,3 +284,21 @@ test("normalization marks explicit <user_options> tags even when tool calls coex
   assert.equal(normalized.toolCalls.length, 1);
   assert.equal(normalized.toolCalls[0].name, "read_file");
 });
+
+test("normalization keeps malformed tool protocol out of visible text", () => {
+  const normalized = normalizeAssistantTurn({
+    content: [
+      "我先读取核心编排文件。",
+      "read_file",
+      "/Users/michael/Documents/GitHub/MAIN/src/lib/orchestrator.ts",
+      "</parametermax_lines\">100",
+    ].join("\n"),
+    toolCalls: [],
+    finishReason: "stop",
+  });
+
+  assert.equal(normalized.toolCalls.length, 1);
+  assert.equal(normalized.toolCalls[0].name, "read_file");
+  assert.equal(normalized.visibleText, "我先读取核心编排文件。");
+  assert.doesNotMatch(normalized.visibleText, /parameter|max_lines|read_file|orchestrator\.ts/);
+});

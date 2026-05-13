@@ -2,7 +2,8 @@
 import React, { useState, useEffect, useMemo } from "react";
 import { IconSearch, IconFile, IconFolder, IconTerminal, IconCode, IconTool, IconCheck, IconChevronDown, IconChevronRight } from "./Icons";
 import { getDiffStats } from "../lib/diff";
-import { stripAnsi } from "../lib/sanitize";
+import { sanitizeAIOutput, stripAnsi } from "../lib/sanitize";
+import { compactToolPresentationTarget, getToolPresentationLabel } from "../lib/toolPresentation";
 import { useAppStore } from "../store/useAppStore";
 
 // Map tool names to human-readable action labels
@@ -61,7 +62,8 @@ export default function ActionCard({ blockId, toolName, target, toolStatus, mess
   const language = useAppStore((s) => s.config.language);
   const openDiffForTask = useAppStore((s) => s.openDiffForTask);
   const info = TOOL_LABELS[toolName] || { verb: { zh: "调用工具", en: "use tool" }, icon: IconTool };
-  const localizedVerb = info.verb[language === "en" ? "en" : "zh"];
+  const uiLanguage = language === "en" ? "en" : "zh";
+  const localizedVerb = getToolPresentationLabel(toolName, uiLanguage);
   const IconComponent = info.icon;
   const isPending = toolStatus === "pending";
   const isRunning = toolStatus === "running";
@@ -90,9 +92,7 @@ export default function ActionCard({ blockId, toolName, target, toolStatus, mess
 
   const displayTarget = isSystemErrorCard
     ? (language === "zh" ? "系统请求失败" : "System request failed")
-    : target
-      ? target.split("/").pop() || target
-      : toolName;
+    : compactToolPresentationTarget(target, toolName, uiLanguage);
   const canOpenDiff = isExecuted && !!diff && blockId != null;
   const diffStats = useMemo(
     () => (diff ? getDiffStats(diff.old, diff.new) : null),
@@ -265,7 +265,7 @@ export default function ActionCard({ blockId, toolName, target, toolStatus, mess
         {/* Expandable message area for executed/rejected — terminal styling for commands */}
         {message && !isPending && (() => {
           const isTerminal = toolName === 'execute_command' || toolName === 'send_pty_input' || toolName === 'run_command' || toolName === 'read_pty_buffer' || toolName === 'read_pty_tail' || toolName === 'read_pty_since' || toolName === 'get_pty_status' || toolName === 'clear_pty_buffer';
-          const cleanMessage = isTerminal ? stripAnsi(message) : message;
+          const cleanMessage = isTerminal ? stripAnsi(message) : sanitizeAIOutput(message);
           return (
             <div className="mt-3 pt-3 border-t border-[#27272a]">
               <pre className={`whitespace-pre-wrap break-all max-h-[200px] overflow-y-auto ${

@@ -156,7 +156,7 @@ export function buildSystemPrompt(
     "[SAFETY AND PERMISSION BOUNDARY]",
     "Read-only and external-read tools may be used without asking for step-by-step consent.",
     "Workspace writes, shell execution, browser control, external writes, and destructive operations are approval-gated by the runtime.",
-    "Plan turns normally draft `.MAIN/plans/design.md` or `.MAIN/plans/bugfix.md`; `.MAIN/plans/requirements.md` is optional for explicit traceability or user-requested requirement ledgers. Source edits and final deliverables wait for plan approval.",
+    "Plan turns normally draft `.MAIN/plans/design.md`; `.MAIN/plans/requirements.md` is optional for explicit traceability or user-requested requirement ledgers. Source edits and final deliverables wait for plan approval.",
     "If a needed tool is absent because of the current intent, continue with available safe tools or explain the blocker and ask for plan/execute consent.",
     "",
     "[LOCALIZED USER OUTPUT]",
@@ -302,7 +302,7 @@ export function buildSystemPrompt(
       "当本轮是复杂实现请求被路由到 PLAN 时，目标不是长篇聊天，而是先生成可审阅的精简计划草稿，并在右侧计划面板等待用户批准后再执行。",
       "你应该参考 Codex 风格的 plan mode：在关键决策点用可点击选项引导用户，而不是一次性替用户走完整个实施链路。",
       "只要方案还没有真正收敛，就优先通过短摘要 + `<user_options>` 征询用户想法；不要用长篇计划文档替用户做完所有选择。",
-      "当用户只是想要方案时，停在方案本身；不要偷偷进入执行，也不要未经明确要求就把内容落到 `.MAIN/plans/*.md`。",
+      "当用户只是轻量讨论方案时，停在聊天方案本身；但复杂实现、修复类请求、或 `plan_file_change` 路由到 PLAN 后，必须把可审批草稿落到 `.MAIN/plans/design.md`。",
       "",
       "### 规划流程",
       "1. **先做只读探索**：允许你读取工作区、搜索代码、整理约束、比较方向，但优先保持在分析层。",
@@ -310,7 +310,7 @@ export function buildSystemPrompt(
       "3. **选项必须通用真实**：无论底层模型能力如何，`<user_options>` 都必须是用户能真实拍板的选择，例如范围、优先级、技术路线、是否固化方案、是否批准执行；不要给空泛的“继续/按你说的做”，也不要给没有证据的领域臆测选项。",
       "4. **不要机械地每一步都打断**：只有在关键决策点才给选项；如果某一步只是自然展开细节，不必强行提问。",
       "5. **最后输出正式方案**：当信息足够后，用清晰的 Markdown 输出最终方案；如果存在明确分叉，可在结尾提供类似“继续讨论 / 保存为正式方案 / 批准进入执行”的选项。",
-      "6. **Design-First 计划落盘规则**：复杂实现请求进入 PLAN 后，默认只把可审批方案写入 `.MAIN/plans/design.md`（Bug 修复则写 `bugfix.md`）；只有用户明确要求需求台账、范围极大需要追踪、或合规/验收可追溯性很强时，才额外写 `.MAIN/plans/requirements.md`。创建/更新 design/bugfix/tasks 或可选 requirements 是内部规划步骤，不要把“是否生成这些内部文件”作为 `<user_options>` 让用户选择；用户选定方案后，直接更新对应计划草稿。",
+      "6. **Design-First 计划落盘规则**：复杂实现或修复类请求进入 PLAN 后，默认只把可审批方案写入 `.MAIN/plans/design.md`；只有用户明确要求需求台账、范围极大需要追踪、或合规/验收可追溯性很强时，才额外写 `.MAIN/plans/requirements.md`。创建/更新 design/tasks 或可选 requirements 是内部规划步骤，不要把“是否生成这些内部文件”作为 `<user_options>` 让用户选择；用户选定方案后，直接更新对应计划草稿。",
       "7. **`tasks.md` 仅属于执行阶段**：只有当用户已经批准进入执行时，才生成 `.MAIN/plans/tasks.md`。",
       "8. **计划内容必须可见**：方案正文、对比、建议、风险、下一步，都必须放在普通 Markdown 中，不能藏在 `<analysis>` 内。",
       "9. **不能空转**：当用户说“继续/继续生成/接着来”时，必须延续上一轮 PLAN 目标并产出实际计划内容；不要只回复“好的，我继续”或把它降级成普通讨论。",
@@ -319,17 +319,16 @@ export function buildSystemPrompt(
       "计划产物必须像给人审阅的执行摘要，不要写成教程、长篇背景说明或实现手册。",
       "- `design.md`：建议 60-120 行，是默认且唯一必需的用户审批方案；必须包含用户目标/约束、当前状态发现、拟定方案、影响文件/接口、执行顺序、关键数据流/控制流、风险取舍、验证方式、开放问题。复杂实现默认包含 1 个简短 Mermaid 图（如架构图、流程图或时序图）帮助审阅，简单结构不需要，除非用户明确要求生成图；方向不明确时先给 `<user_options>`，不要编造最终设计。",
       "- `requirements.md`：可选需求台账，建议 40-80 行；仅在用户明确要求、范围很大、需要合规/验收追踪时生成。它不能替代 design.md，也不是审批的前置条件。",
-      "- `bugfix.md`：建议 40-80 行，只保留现象、根因假设、修复方案、影响范围、验证方式。",
       "- `tasks.md`：建议 8-20 个 checkbox，每项一句话；需要命令时把精确命令放进同一行反引号里。执行中 tasks.md 是审计记录，不能删除已完成或旧任务，只能勾选、追加或保留“已完成任务”区块。",
       "- Proposal：只做一页审阅摘要，优先使用短段落、表格和 bullet；不要复制 design 或可选 requirements 的全文。",
       "- 禁止写大段教学解释、代码清单、完整 API 文档、过度铺陈的背景和重复结论；细节留到执行阶段按需展开。",
       "",
       "### 方案产物语义",
       "- 功能/重构类请求：最终正式方案默认由 `design.md` 表达；可选 `requirements.md` 只做需求台账兼容/追踪。只有批准执行后才补 `tasks.md`。",
-      "- Bug 修复类请求：最终正式方案通常由 `bugfix.md` 表达；只有批准执行后才补 `tasks.md`。",
+      "- 修复类请求：最终正式方案也由 `design.md` 表达；代码修改必须等批准执行后再通过执行工具完成，批准后才补 `tasks.md`。",
       "- 数据分析/报表类请求：规划阶段优先输出分析目标、数据范围、指标口径、报表结构、验证方式；只有用户明确要求保存或执行自动化时，才落成 `design.md`，必要时再附加可选 `requirements.md`。",
       "### 额外限制",
-      "1. 在没有明确批准执行前，不要改源码，不要提前生成 `.MAIN/plans/tasks.md`；复杂实现的 design/bugfix 草稿可以写入 `.MAIN/plans/` 供用户审批，requirements 仅作为可选需求台账。",
+      "1. 在没有明确批准执行前，不要改源码，不要提前生成 `.MAIN/plans/tasks.md`；复杂实现和修复类的 design 草稿可以写入 `.MAIN/plans/` 供用户审批，requirements 仅作为可选需求台账。",
       "2. 如果当前只需要继续共创方案，就继续讨论，不要把用户往执行阶段推。",
       "3. 如果你已经输出了 `<user_options>`，本轮必须立刻停止等待用户，不要再自顾自补完下一步。",
       "4. 如果你认为任务高风险、范围过大或存在关键前提冲突，优先通过 `<user_options>` 缩小分歧，而不是替用户拍板。",
@@ -344,7 +343,7 @@ export function buildSystemPrompt(
       "### 正式方案输出要求",
       "当你认为已经收敛到可交付方案时，可以输出正式 Proposal。Proposal 应该是用户可读、可审阅、可继续讨论的方案正文。",
       "为了兼容 MAIN 现有计划面板，当你要提交“待审批的正式方案”时，优先使用现有 Proposal 包装：`[PROPOSAL START]`、`# Proposed Plan` 与合法 `<plan>` JSON。",
-      "如果本轮是复杂实现请求，请在提交 Proposal 前后确保 `.MAIN/plans/design.md`（或 bugfix.md）已经是精简、可审批的最新草稿；不要为了满足旧流程而默认补 requirements.md。",
+      "如果本轮是复杂实现或修复类请求，请在提交 Proposal 前后确保 `.MAIN/plans/design.md` 已经是精简、可审批的最新草稿；不要为了满足旧流程而默认补 requirements.md。",
     ].join("\n"));
   } else if (turnIntent === "execute" || turnIntent === "studio_workflow") {
     parts.push([
@@ -392,7 +391,7 @@ export function buildSystemPrompt(
       "[TURN INTENT: DISCUSS]",
       "你当前这一轮的真实意图是：DISCUSS（正常对话）。",
       "这一轮用于普通聊天、问答、解释、头脑风暴、澄清需求、比较方案和轻量讨论。",
-      "不要主动进入正式计划协议，不要擅自生成 requirements.md / design.md / tasks.md / bugfix.md，也不要输出仅供执行流使用的 Proposal 结构。",
+      "不要主动进入正式计划协议，不要擅自生成 requirements.md / design.md / tasks.md，也不要输出仅供执行流使用的 Proposal 结构。",
       "默认不要修改文件、不要执行命令、不要调用写入类工具。除非用户明确要求你切换到实现或规划流程，否则保持在聊天与说明层面。",
       "如果用户的表达里只有弱计划关键词或轻微执行倾向，不要自作主张切到别的模式；先正常解释，或在必要时给出 `<user_options>` 让用户选择这轮是继续讨论、先出方案，还是直接实现。",
       "不要再提及需要用户去切换 Chat / Fast / Plan 之类的界面选项。",
@@ -481,11 +480,11 @@ export function buildSystemPrompt(
       tfl.push("2. 真正需要用户确认的分叉点，使用面向用户的普通 Markdown + `<user_options>`，然后立刻停止等待用户。");
       tfl.push("3. 如果方案还没收敛，优先给用户 2-4 个明确选择；不要强行一次性写完整 design 或 requirements。");
       tfl.push("4. 当方案已经成熟且你准备提交正式审核时，再使用 `[PROPOSAL START]`、`# Proposed Plan` 与合法 `<plan>` JSON。");
-      tfl.push("5. Bug 修复类复杂请求用 `.MAIN/plans/bugfix.md` 表达；批准执行前仍然不能写源码或生成 tasks.md。");
+      tfl.push("5. 修复类复杂请求也用 `.MAIN/plans/design.md` 表达；批准执行前仍然不能写源码或生成 tasks.md。");
       tfl.push("6. `.MAIN/plans/tasks.md` 只属于执行阶段；未经明确批准，不要提前生成。");
       tfl.push("7. 如果任务更像报告、总结或研究分析，规划产物应表达分析目标、数据范围、指标口径、方法与验证方案，而不是默认套用代码工程计划。");
       tfl.push("8. 如果用户要求根目录 Readme.md 或其他 Markdown 文档，把它作为批准后的最终交付物写入 tasks.md；规划阶段只记录这个验收要求。");
-      tfl.push("9. 计划 Markdown 必须精简：design.md 60-120 行、bugfix.md 40-80 行、tasks.md 8-20 个 checkbox；可选 requirements.md 40-80 行。不要写教程式长文、完整代码清单或重复背景。");
+      tfl.push("9. 计划 Markdown 必须精简：design.md 60-120 行、tasks.md 8-20 个 checkbox；可选 requirements.md 40-80 行。不要写教程式长文、完整代码清单或重复背景。");
     } else {
       tfl.push("当前回合是直接实现回合：");
       tfl.push("1. Atomic 任务直接实现，不要为了完成小改动而强行转去计划流。");

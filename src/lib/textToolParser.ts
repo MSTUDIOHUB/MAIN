@@ -161,6 +161,99 @@ function parseNamedArguments(text: string): Record<string, unknown> {
   return args;
 }
 
+function parseLooseParameterLine(line: string): [string, unknown] | null {
+  const trimmed = line.trim();
+  if (!trimmed) return null;
+
+  const malformedClose = trimmed.match(/^<\/parameter\s*([a-z_][a-z0-9_]*)["']?\s*>\s*([\s\S]*?)\s*$/i);
+  if (malformedClose) {
+    return [malformedClose[1], normalizeInlineArgValue(malformedClose[2])];
+  }
+
+  const malformedOpen = trimmed.match(/^<?parameter\s+name=["']?([a-z_][a-z0-9_]*)["']?\s*>\s*([\s\S]*?)(?:<\/parameter>)?\s*$/i);
+  if (malformedOpen) {
+    return [malformedOpen[1], normalizeInlineArgValue(malformedOpen[2])];
+  }
+
+  const tagLike = trimmed.match(/^<parameter\s+name=["']?([a-z_][a-z0-9_]*)["']?\s*>\s*([\s\S]*?)(?:<\/parameter>)?\s*$/i);
+  if (tagLike) {
+    return [tagLike[1], normalizeInlineArgValue(tagLike[2])];
+  }
+
+  const namedArgs = parseNamedArguments(trimmed);
+  const entries = Object.entries(namedArgs);
+  if (entries.length === 1 && /^[a-z_][a-z0-9_]*\s*=/i.test(trimmed)) {
+    return entries[0];
+  }
+
+  return null;
+}
+
+function parseMultilineBareToolCall(
+  toolName: string,
+  lines: string[],
+  index: number,
+): { call: ParsedToolCall; consumed: number } | null {
+  const args: Record<string, unknown> = {};
+  let consumed = 1;
+  const next = lines[index + 1]?.trim() || "";
+
+  if (next.startsWith("{") && next.endsWith("}")) {
+    try {
+      const parsed = JSON.parse(next);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return {
+          call: {
+            id: nextCallId(),
+            name: toolName,
+            arguments: parsed,
+          },
+          consumed: 2,
+        };
+      }
+    } catch {
+      // Fall through to the loose line parser.
+    }
+  }
+
+  if (toolName === "get_project_skeleton" && /^\d+$/.test(next)) {
+    return {
+      call: {
+        id: nextCallId(),
+        name: toolName,
+        arguments: { depth: Number(next) },
+      },
+      consumed: 2,
+    };
+  }
+
+  const positionalArgName = TOOL_POSITIONAL_ARG_NAMES[toolName];
+  if (positionalArgName && next && !BARE_TOOL_NAMES.has(next) && !parseLooseParameterLine(next)) {
+    const positionalArg = parseSinglePositionalArg(next);
+    if (positionalArg !== undefined) {
+      args[positionalArgName] = positionalArg;
+      consumed = 2;
+    }
+  }
+
+  let cursor = index + consumed;
+  while (cursor < lines.length) {
+    const parameter = parseLooseParameterLine(lines[cursor]);
+    if (!parameter) break;
+    args[parameter[0]] = parameter[1];
+    cursor += 1;
+  }
+
+  return {
+    call: {
+      id: nextCallId(),
+      name: toolName,
+      arguments: args,
+    },
+    consumed: Math.max(consumed, cursor - index),
+  };
+}
+
 function parseFunctionStyleInvocation(text: string): ParsedToolCall | null {
   const match = text.trim().match(/^([a-z_][a-z0-9_]*)\s*\(([\s\S]*)\)$/i);
   if (!match) return null;
@@ -361,39 +454,20 @@ function parseBareToolCalls(text: string): { toolCalls: ParsedToolCall[]; cleanT
     const rawLine = lines[i];
     const trimmed = rawLine.trim();
 
+    if (BARE_TOOL_NAMES.has(trimmed)) {
+      const multilineCall = parseMultilineBareToolCall(trimmed, lines, i);
+      if (multilineCall) {
+        toolCalls.push(multilineCall.call);
+        i += multilineCall.consumed;
+        continue;
+      }
+    }
+
     const inlineCall = parseInlineToolInvocation(trimmed);
     if (inlineCall) {
       toolCalls.push(inlineCall);
       i += 1;
       continue;
-    }
-
-    if (BARE_TOOL_NAMES.has(trimmed)) {
-      const next = lines[i + 1]?.trim() || "";
-      if (next.startsWith("{") && next.endsWith("}")) {
-        try {
-          const parsed = JSON.parse(next);
-          toolCalls.push({
-            id: nextCallId(),
-            name: trimmed,
-            arguments: parsed,
-          });
-          i += 2;
-          continue;
-        } catch {
-          // fall through
-        }
-      }
-
-      if (trimmed === "get_project_skeleton" && /^\d+$/.test(next)) {
-        toolCalls.push({
-          id: nextCallId(),
-          name: trimmed,
-          arguments: { depth: Number(next) },
-        });
-        i += 2;
-        continue;
-      }
     }
 
     keep.push(rawLine);

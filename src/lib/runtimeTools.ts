@@ -9,6 +9,7 @@ import {
   type ToolPermissionPolicy,
 } from "./toolCapabilities";
 import type { ToolDefinition } from "./toolSchemas";
+import { normalizeToolCallForExecution } from "./toolCallNormalization";
 
 export type ToolLifecycleState =
   | "queued"
@@ -81,12 +82,13 @@ export interface PlanRuntimeToolCallInput {
   isTasksPlanWrite: (name: string, args: Record<string, unknown>) => boolean;
 }
 
-function parseToolCallArguments(call: RuntimeToolCall): Record<string, unknown> {
+function parseToolCallArguments(call: RuntimeToolCall, workspace?: string | null): Record<string, unknown> {
   try {
     const parsed = JSON.parse(call.arguments || "{}");
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+    const args = parsed && typeof parsed === "object" && !Array.isArray(parsed)
       ? parsed as Record<string, unknown>
       : {};
+    return normalizeToolCallForExecution(call.name, args, workspace);
   } catch {
     return {};
   }
@@ -135,7 +137,7 @@ export function initialLifecycleStateForPlanAction(action: RuntimeToolPlanAction
 }
 
 export function planRuntimeToolCall(input: PlanRuntimeToolCallInput): RuntimeToolPlanResult {
-  const toolArgs = parseToolCallArguments(input.toolCall);
+  const toolArgs = parseToolCallArguments(input.toolCall, input.workspace);
   const target = input.getToolTarget(input.toolCall.name, toolArgs);
 
   if (!input.availableToolNames.has(input.toolCall.name)) {

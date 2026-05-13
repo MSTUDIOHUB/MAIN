@@ -204,6 +204,7 @@ test("data analyst plan prompt uses interactive planning and analysis semantics"
   assert.match(prompt, /用户能真实拍板的选择/);
   assert.match(prompt, /Design-First 计划落盘规则/);
   assert.match(prompt, /默认只把可审批方案写入 `\.MAIN\/plans\/design\.md`/);
+  assert.match(prompt, /`plan_file_change` 路由到 PLAN 后，必须把可审批草稿落到 `\.MAIN\/plans\/design\.md`/);
   assert.match(prompt, /requirements\.md.*审批的前置条件/);
   assert.match(prompt, /复杂实现默认包含 1 个简短 Mermaid 图/);
   assert.match(prompt, /简单结构不需要，除非用户明确要求生成图/);
@@ -211,6 +212,7 @@ test("data analyst plan prompt uses interactive planning and analysis semantics"
   assert.match(prompt, /复杂实现请求默认生成精简的 `\.MAIN\/plans\/design\.md` 草稿供审批/);
   assert.match(prompt, /批准执行前仍然不能写源码或生成 tasks\.md/);
   assert.doesNotMatch(prompt, /必须生成精简的 `\.MAIN\/plans\/requirements\.md` 与 `\.MAIN\/plans\/design\.md`/);
+  assert.doesNotMatch(prompt, /未经明确要求就把内容落到 `\.MAIN\/plans\/\*\.md`/);
 });
 
 test("system prompt tells the model to stop after emitting user options", () => {
