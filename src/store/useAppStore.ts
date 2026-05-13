@@ -120,6 +120,11 @@ import {
   normalizeAttachedFile,
 } from "../lib/attachments";
 import {
+  buildUserContextItems,
+  sanitizeUserContextItemsForPersist,
+  type UserContextItem,
+} from "../lib/userContextItems";
+import {
   LOCAL_PERSIST_SCHEMA_VERSION,
   buildPersistedAppState,
   stripLegacyRuntimeFieldsFromPersistedState,
@@ -817,7 +822,7 @@ export interface DiffRevertResult {
 }
 
 export type TaskBlock =
-  | (TaskBlockBase & { type: "user"; content: string; images?: string[] })
+  | (TaskBlockBase & { type: "user"; content: string; images?: string[]; contextItems?: UserContextItem[] })
   | (TaskBlockBase & { type: "tool"; toolName: string; target: string; status: string; toolStatus: "pending" | "executed" | "rejected" | "running" | "failed"; toolCallId?: string; message?: string; diff?: ToolDiffSnapshot; revertStatus?: DiffRevertStatus; revertMessage?: string })
   | (TaskBlockBase & { type: "agent"; content: string; options?: ReplyOption[]; streaming?: boolean; hiddenProcess?: boolean; archivedAfterChoice?: boolean; selectedOption?: string })
   | (TaskBlockBase & { type: "thought"; content: string; isStreaming?: boolean; duration?: number })
@@ -2805,7 +2810,14 @@ export function sanitizeTaskBlocksForPersist(blocks: TaskBlock[]): TaskBlock[] {
     switch (b.type) {
       case "user":
         // Strip large image data URLs from persisted state (only keep metadata)
-        return { id: b.id, turnId: b.turnId, type: "user" as const, content: String(b.content) };
+        const contextItems = sanitizeUserContextItemsForPersist(b.contextItems);
+        return {
+          id: b.id,
+          turnId: b.turnId,
+          type: "user" as const,
+          content: String(b.content),
+          ...(contextItems ? { contextItems } : {}),
+        };
       case "agent":
         // Remove streaming flag (transient UI state) — keep content (string)
         return {
@@ -3156,8 +3168,8 @@ function buildTrustedPlanResumePrompt(input: {
       input.hasTasksArtifact
         ? "从 `.MAIN/plans/tasks.md` 中第一个证据未满足的任务开始。只有真实写入/命令成功/验证证据满足后，才可以把任务视为完成。"
         : input.artifacts.length === 0
-        ? "先读取当前 workspace 的 `.MAIN/plans/design.md`、`.MAIN/plans/bugfix.md`、`.MAIN/plans/tasks.md`；如果旧计划存在 requirements.md，可作为辅助上下文读取；如果 tasks.md 不存在，再基于已读计划文件生成任务清单并执行真实任务。"
-        : "请先基于已批准的 design.md 或 bugfix.md 重新生成 `.MAIN/plans/tasks.md`；旧 requirements.md 只能作为辅助上下文，然后执行真实任务。",
+        ? "先读取当前 workspace 的 `.MAIN/plans/design.md` 和 `.MAIN/plans/tasks.md`；如果旧会话已存在 bugfix.md 或 requirements.md，可作为辅助上下文读取；如果 tasks.md 不存在，再基于已读计划文件生成任务清单并执行真实任务。"
+        : "请先基于已批准的 design.md 重新生成 `.MAIN/plans/tasks.md`；旧 bugfix.md 或 requirements.md 只能作为辅助上下文，然后执行真实任务。",
       "不要重写已经满足证据的任务；不要只修改 checkbox；不要重复计划说明。",
       "",
       "计划文件摘要：",
@@ -3176,8 +3188,8 @@ function buildTrustedPlanResumePrompt(input: {
     input.hasTasksArtifact
       ? "Start from the first task whose evidence is not satisfied. Treat a task as complete only after real file-write, successful command, or verification evidence exists."
       : input.artifacts.length === 0
-      ? "First read `.MAIN/plans/design.md`, `.MAIN/plans/bugfix.md`, and `.MAIN/plans/tasks.md` from the current workspace; if a legacy requirements.md exists, use it only as supporting context. If tasks.md does not exist, generate the task list from the plan files before doing real work."
-      : "First regenerate `.MAIN/plans/tasks.md` from the approved design.md or bugfix.md; use any legacy requirements.md only as supporting context, then execute real tasks.",
+      ? "First read `.MAIN/plans/design.md` and `.MAIN/plans/tasks.md` from the current workspace; if a legacy bugfix.md or requirements.md exists, use it only as supporting context. If tasks.md does not exist, generate the task list from the plan files before doing real work."
+      : "First regenerate `.MAIN/plans/tasks.md` from the approved design.md; use any legacy bugfix.md or requirements.md only as supporting context, then execute real tasks.",
     "Do not redo tasks whose evidence is already satisfied. Do not only edit checkboxes. Do not restate the plan.",
     "",
     "Plan artifact summary:",
@@ -4935,12 +4947,12 @@ export const useAppStore = create<AppState>()(
             if (language === "en") {
               return hasTasksArtifact
               ? approvalChoiceHint + "The plan is approved. Continue directly from the current tasks.md and execute the remaining items without repeating the plan. Do not delete completed or previous task records; only check an item off after real evidence exists for its file/command/deliverable." + deliverableHint + "\n\n" + buildPlanCommandExecutionHint(state.planTasks, "en")
-                : approvalChoiceHint + "The plan is approved. First generate `.MAIN/plans/tasks.md` from the approved design.md or bugfix.md; if a legacy requirements.md exists, use it only as supporting context. Then execute the remaining work from that task list without repeating the plan. Keep tasks.md concise: 8-20 checkboxes, one sentence each, and add lightweight evidence tags such as `evidence: file:src/app.ts` or `evidence: cmd:npm test` when a task has a concrete deliverable. During execution tasks.md is an audit record; never delete completed or previous tasks, and only check an item off after trusted evidence exists." + deliverableHint;
+                : approvalChoiceHint + "The plan is approved. First generate `.MAIN/plans/tasks.md` from the approved design.md; use any legacy bugfix.md or requirements.md only as supporting context. Then execute the remaining work from that task list without repeating the plan. Keep tasks.md concise: 8-20 checkboxes, one sentence each, and add lightweight evidence tags such as `evidence: file:src/app.ts` or `evidence: cmd:npm test` when a task has a concrete deliverable. During execution tasks.md is an audit record; never delete completed or previous tasks, and only check an item off after trusted evidence exists." + deliverableHint;
             }
 
             return hasTasksArtifact
               ? approvalChoiceHint + "计划已批准。请直接基于当前 tasks.md 继续执行剩余任务，不要重复计划内容。不要删除已完成或旧任务记录；只有文件/命令/交付物的真实证据满足后，才能勾选对应任务。" + deliverableHint + "\n\n" + buildPlanCommandExecutionHint(state.planTasks, "zh")
-              : approvalChoiceHint + "计划已批准。请先基于已批准的 design.md 或 bugfix.md 生成 `.MAIN/plans/tasks.md`；如果旧计划存在 requirements.md，只作为辅助上下文使用。然后再按照任务清单继续执行，不要重复计划内容。tasks.md 必须精简为 8-20 个 checkbox，每项一句话；有明确交付物的任务请追加轻量证据标签，例如 `证据: file:src/app.ts` 或 `证据: cmd:npm test`。执行中 tasks.md 是审计记录，不能删除已完成或旧任务；只有可信证据满足后才能勾选任务。" + deliverableHint;
+              : approvalChoiceHint + "计划已批准。请先基于已批准的 design.md 生成 `.MAIN/plans/tasks.md`；旧 bugfix.md 或 requirements.md 只作为辅助上下文使用。然后再按照任务清单继续执行，不要重复计划内容。tasks.md 必须精简为 8-20 个 checkbox，每项一句话；有明确交付物的任务请追加轻量证据标签，例如 `证据: file:src/app.ts` 或 `证据: cmd:npm test`。执行中 tasks.md 是审计记录，不能删除已完成或旧任务；只有可信证据满足后才能勾选任务。" + deliverableHint;
           })(),
           undefined,
           {
@@ -5764,12 +5776,28 @@ export const useAppStore = create<AppState>()(
         void (async () => {
           const shouldHydrateExistingPlan = looksLikeExistingPlanExecutionRequest(text);
           let latest = get();
+          let hydratedForExecution:
+            | Awaited<ReturnType<typeof hydrateExistingPlanArtifactsForWorkspace>>
+            | null = null;
 
           if (shouldHydrateExistingPlan) {
-            const hydrated = await hydrateExistingPlanArtifactsForWorkspace(
-              latest.currentWorkspace,
-              preferredLanguage,
-            );
+            const alreadyHydrated =
+              latest.planArtifacts.length > 0 ||
+              latest.planTasks.length > 0 ||
+              latest.planStage !== "idle";
+            const hydrated = alreadyHydrated
+              ? {
+                  artifacts: latest.planArtifacts,
+                  tasks: latest.planTasks,
+                  hasTasksArtifact:
+                    latest.planArtifacts.some((artifact) => artifact.kind === "tasks") ||
+                    latest.planTasks.length > 0,
+                }
+              : await hydrateExistingPlanArtifactsForWorkspace(
+                  latest.currentWorkspace,
+                  preferredLanguage,
+                );
+            hydratedForExecution = hydrated;
             latest = get();
             set({
               planArtifacts: hydrated.artifacts,
@@ -5785,6 +5813,7 @@ export const useAppStore = create<AppState>()(
             });
             logStoreEvent("existing_plan_hydrated_for_execution", {
               workspace: latest.currentWorkspace || null,
+              reusedExistingState: alreadyHydrated,
               artifacts: hydrated.artifacts.map((artifact) => artifact.path),
               taskCount: hydrated.tasks.length,
             });
@@ -5792,8 +5821,8 @@ export const useAppStore = create<AppState>()(
 
           latest = get();
           const hasTasksArtifact =
-            latest.planArtifacts.some((artifact) => artifact.kind === "tasks") ||
-            latest.planTasks.length > 0;
+            (hydratedForExecution?.artifacts || latest.planArtifacts).some((artifact) => artifact.kind === "tasks") ||
+            (hydratedForExecution?.tasks || latest.planTasks).length > 0;
 
           get().sendMessage(
             buildTrustedPlanResumePrompt({
@@ -6266,6 +6295,14 @@ export const useAppStore = create<AppState>()(
 
     const nextId = sessionGet()._nextTaskId;
     const turnId = reuseCurrentTurn ? reusableTurnId! : `turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const currentImages = images || [];
+    const userContextItems = buildUserContextItems({
+      contextMentions: mentionSnapshot,
+      attachedFiles: attachedFilesSnapshot,
+      images: currentImages,
+      workspace: runWorkspace,
+      language: preferredLanguage === "en" ? "en" : "zh",
+    });
     const existingTurn = reuseCurrentTurn
       ? state.conversationTurns.find((turn) => turn.id === turnId) || null
       : null;
@@ -6311,6 +6348,7 @@ export const useAppStore = create<AppState>()(
             turnId,
             type: "user",
             content: text,
+            ...(userContextItems.length > 0 ? { contextItems: userContextItems } : {}),
           } as TaskBlock);
       const systemBlock: TaskBlock = {
         id: nextId(),
@@ -6509,7 +6547,6 @@ export const useAppStore = create<AppState>()(
     }
 
     // 1. Push user message to visible taskFlow
-    const currentImages = images || [];
     const shouldArchiveChoiceFeedback =
       reuseCurrentTurn &&
       !isHidden &&
@@ -6536,6 +6573,7 @@ export const useAppStore = create<AppState>()(
           turnId,
           type: "user",
           content: text,
+          ...(userContextItems.length > 0 ? { contextItems: userContextItems } : {}),
           ...(currentImages.length > 0 ? { images: currentImages } : {}),
         };
     sessionSet((s) => ({
@@ -6684,6 +6722,22 @@ export const useAppStore = create<AppState>()(
       conversationTurns: sessionGet().conversationTurns.length,
     });
 
+    const markUserContextItemFailed = (path: string | undefined | null) => {
+      const failedPath = String(path || "").trim();
+      if (!failedPath || userContextItems.length === 0) return;
+      sessionSet((s) => ({
+        taskFlow: s.taskFlow.map((block) => {
+          if (block.turnId !== turnId || block.type !== "user" || !Array.isArray(block.contextItems)) return block;
+          return {
+            ...block,
+            contextItems: block.contextItems.map((item) =>
+              item.path === failedPath ? { ...item, status: "failed" as const } : item
+            ),
+          };
+        }),
+      }));
+    };
+
     if (!isHidden && shouldSeedSessionTitleForTurn && ensuredSessionId) {
       sessionGet().updateSession(sessionScopeKey, ensuredSessionId, {
         title: turnTitle,
@@ -6782,6 +6836,7 @@ export const useAppStore = create<AppState>()(
           attachmentRefs.push(await prepareAttachedFileForRead(file, runSessionKey));
         } catch {
           const attachment = normalizeAttachedFile(file);
+          markUserContextItemFailed(attachment.sourcePath || attachment.path);
           failedAttachmentParts.push(`[无法读取文件：${attachment.displayName || getAttachmentDisplayName(attachment.path)}]`);
         }
       }
@@ -6870,6 +6925,8 @@ export const useAppStore = create<AppState>()(
             parts.push("```" + n + "\n" + c + "\n```");
           } catch {
             const n = ref.displayName || fp.split("/").pop() || fp;
+            markUserContextItemFailed(ref.sourcePath || fp);
+            if (ref.sourcePath) markUserContextItemFailed(fp);
             parts.push(`[无法读取文件：${n}]`);
           }
         }
@@ -6887,14 +6944,14 @@ export const useAppStore = create<AppState>()(
         userContent = preferredLanguage === "en"
           ? [
               `${planModeLead} If the request is a complex implementation, call \`write_file\` or \`replace_in_file\` to create or update the concise reviewable plan draft in \`.MAIN/plans/design.md\` before asking for approval; create \`.MAIN/plans/requirements.md\` only when the user explicitly wants a requirement ledger or the scope needs traceability. Do not write project source files or tasks.md before approval.`,
-              "Creating or updating design/bugfix plan documents is an automatic internal planning step, not a user choice. After the user picks a route, update the plan draft directly instead of asking whether to update internal plan documents.",
+              "Creating or updating design.md is an automatic internal planning step, not a user choice. After the user picks a route, update the plan draft directly instead of asking whether to update internal plan documents.",
               "If it is only a discussion-style plan, keep the answer concise and use user options for real decisions.",
               "",
               userContent,
             ].join("\n")
           : [
               `${planModeLead}如果这是复杂实现请求，请调用 \`write_file\` 或 \`replace_in_file\` 创建或更新可审批的精简计划草稿：默认写 \`.MAIN/plans/design.md\`；只有用户明确要求需求台账或范围需要追踪时，才额外写 \`.MAIN/plans/requirements.md\`。等待用户批准后再改源码；批准前不要生成 tasks.md。`,
-              "创建或更新 design/bugfix 计划文档是自动的内部规划步骤，不是用户需要选择的下一步；用户选定方案后应直接更新计划草稿，不要再询问是否更新内部计划文件。",
+              "创建或更新 design.md 是自动的内部规划步骤，不是用户需要选择的下一步；用户选定方案后应直接更新计划草稿，不要再询问是否更新内部计划文件。",
               "如果只是讨论式方案，请保持简洁，并在真实分叉点用可点击选项让用户选择。",
               "",
               userContent,
@@ -8340,8 +8397,8 @@ export const useAppStore = create<AppState>()(
               turnId,
               type: "system",
               content: sessionGet().config.language === "en"
-                ? `Plan artifact rejected: ${path} does not look like a reviewable ${kind} document (${validation.reason || "quality gate"}). MAIN will ask the model to regenerate a real \`.MAIN/plans/design.md\` or bugfix.md artifact, or request your decision.`
-                : `计划文件已被拦截：${path} 不像可审批的${getPlanArtifactTitle(kind, "zh")}（${validation.reason || "质量门禁"}）。MAIN 会要求模型重新生成真实的 \`.MAIN/plans/design.md\` 或 bugfix.md，或先向你确认关键分叉。`,
+                ? `Plan artifact rejected: ${path} does not look like a reviewable ${kind} document (${validation.reason || "quality gate"}). MAIN will ask the model to regenerate a real \`.MAIN/plans/design.md\` artifact, or request your decision.`
+                : `计划文件已被拦截：${path} 不像可审批的${getPlanArtifactTitle(kind, "zh")}（${validation.reason || "质量门禁"}）。MAIN 会要求模型重新生成真实的 \`.MAIN/plans/design.md\`，或先向你确认关键分叉。`,
               variant: "plan_quality_gate",
             });
             return;

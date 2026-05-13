@@ -163,6 +163,14 @@ test("turn response language resolver respects explicit override and policy", ()
     fallbackLanguage: "en",
   });
   assert.equal(followInput, "zh");
+
+  const chineseWithPath = resolveTurnResponseLanguage({
+    text: "请读取外部日志 /tmp/e2e-outside-main-debug.log。",
+    policy: "follow_input_language",
+    systemLanguage: "en",
+    fallbackLanguage: "en",
+  });
+  assert.equal(chineseWithPath, "zh");
 });
 
 test("response language mismatch detection ignores code-heavy text and catches real mismatch", () => {

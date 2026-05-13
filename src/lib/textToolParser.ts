@@ -82,24 +82,45 @@ function extractMatches(text: string, regex: RegExp): string[] {
 
 function parseToolUseBlock(inner: string): ParsedToolCall[] {
   const calls: ParsedToolCall[] = [];
-  const parts = inner.split(/<tool>/).filter((p) => p.trim());
+  const paramRe = /<parameter\s+name=["']([^"']+)["']>([\s\S]*?)<\/parameter>/gi;
+  const parseArgs = (part: string): Record<string, unknown> => {
+    const args: Record<string, unknown> = {};
+    let pm: RegExpExecArray | null;
+    paramRe.lastIndex = 0;
+    while ((pm = paramRe.exec(part)) !== null) {
+      const key = String(pm[1] || "").trim();
+      if (!key) continue;
+      args[key] = pm[2].trim();
+    }
+    return args;
+  };
+  const stripToolNameRecoveryFields = (args: Record<string, unknown>): Record<string, unknown> => {
+    delete args.tool;
+    delete args.name;
+    delete args.function;
+    return args;
+  };
+
+  const parts = inner.split(/<tool>/i).filter((p) => p.trim());
 
   for (const part of parts) {
-    const nameMatch = part.match(/^([\s\S]*?)<\/tool>/);
+    const nameMatch = part.match(/^([\s\S]*?)<\/tool>/i);
     if (!nameMatch) continue;
     const name = nameMatch[1].trim();
-    if (!name) continue;
+    if (!BARE_TOOL_NAMES.has(name)) continue;
 
-    const args: Record<string, unknown> = {};
-    const paramRe = /<parameter\s+name=["']([^"']+)["']>([\s\S]*?)<\/parameter>/g;
-    let pm: RegExpExecArray | null;
-    while ((pm = paramRe.exec(part)) !== null) {
-      args[pm[1]] = pm[2].trim();
-    }
-
+    const args = stripToolNameRecoveryFields(parseArgs(part));
     calls.push({ id: nextCallId(), name, arguments: args });
   }
 
+  if (calls.length > 0) return calls;
+
+  const fallbackArgs = parseArgs(inner);
+  const fallbackToolValue = fallbackArgs.tool ?? fallbackArgs.name ?? fallbackArgs.function;
+  const fallbackToolName = typeof fallbackToolValue === "string" ? fallbackToolValue.trim() : "";
+  if (!BARE_TOOL_NAMES.has(fallbackToolName)) return calls;
+
+  calls.push({ id: nextCallId(), name: fallbackToolName, arguments: stripToolNameRecoveryFields(fallbackArgs) });
   return calls;
 }
 

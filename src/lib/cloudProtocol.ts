@@ -776,7 +776,7 @@ function truncateTextForCloud(value: string, maxChars: number): string {
 function compactProtocolMessageForCloud(message: ProtocolChatMessage): ProtocolChatMessage {
   const text = extractTextContent(message.content);
   const maxChars = message.role === "tool"
-    ? 700
+    ? 2200
     : message.role === "assistant"
       ? 1200
       : 2200;

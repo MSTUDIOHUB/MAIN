@@ -1,7 +1,7 @@
 // @ts-nocheck
 import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { IconCheck, IconChevronDown, IconChevronRight, IconClose, IconCloud, IconCode, IconColumns, IconFileText, IconFolder, IconLogoM, IconStop, IconTerminal } from "./Icons";
+import { IconAt, IconCheck, IconChevronDown, IconChevronRight, IconClose, IconCloud, IconCode, IconColumns, IconFile, IconFileText, IconFolder, IconImageIcon, IconLogoM, IconStop, IconTerminal } from "./Icons";
 import ActionCard from "./ActionCard";
 import Composer from "./Composer";
 import JobListCard from "./JobListCard";
@@ -41,6 +41,7 @@ import { getIntentPolicy, resolveConversationTurnIntent } from "../lib/runIntent
 import { summarizePlanExecutionProgressSnapshot } from "../lib/planExecutionRecovery";
 import { buildCompletedToolGroupRanges, countCompletedToolCalls } from "../lib/toolUiGrouping";
 import { compactToolPresentationTarget, getToolPresentationLabel } from "../lib/toolPresentation";
+import type { UserContextItem } from "../lib/userContextItems";
 
 const TURN_STATUS_LABELS: Record<string, string> = {
   planning: "Planning",
@@ -57,6 +58,135 @@ const TURN_STATUS_LABELS: Record<string, string> = {
 
 const AGENT_CONTENT_PREVIEW_CHARS = 60_000;
 const STREAMING_AGENT_CONTENT_PREVIEW_CHARS = 16_000;
+
+function UserContextPillRow({
+  items,
+  language,
+  onPreviewImage,
+}: {
+  items?: UserContextItem[];
+  language: "zh" | "en";
+  onPreviewImage: (item: UserContextItem) => void;
+}) {
+  const visibleItems = Array.isArray(items) ? items.filter((item) => item?.label) : [];
+  if (visibleItems.length === 0) return null;
+
+  return (
+    <div data-testid="user-context-pill-row" className="mt-2 flex flex-wrap justify-end gap-1.5">
+      {visibleItems.map((item, index) => {
+        const isImage = item.kind === "image";
+        const isMention = item.kind === "mention";
+        const canPreview = isImage && !!item.previewDataUrl;
+        const label = item.label || (language === "en" ? `Image ${index + 1}` : `截图 ${index + 1}`);
+        const statusTitle = item.status === "failed"
+          ? language === "en" ? "Read failed" : "读取失败"
+          : item.path || label;
+        const content = (
+          <>
+            {isImage && item.previewDataUrl ? (
+              <img
+                src={item.previewDataUrl}
+                alt=""
+                className="h-5 w-5 rounded-[5px] border border-[#3f3f46] object-cover"
+              />
+            ) : isImage ? (
+              <IconImageIcon className="h-3.5 w-3.5" />
+            ) : isMention ? (
+              <IconAt className="h-3.5 w-3.5" />
+            ) : (
+              <IconFile className="h-3.5 w-3.5" />
+            )}
+            <span className="max-w-[180px] truncate">{isMention ? `@ ${label}` : label}</span>
+            {item.status === "failed" && (
+              <span className="text-[#fbbf24]">{language === "en" ? "failed" : "失败"}</span>
+            )}
+          </>
+        );
+        const className = [
+          "inline-flex h-7 max-w-full items-center gap-1.5 rounded-full border px-2.5 text-[11px] font-mono transition-colors",
+          item.status === "failed"
+            ? "border-[rgba(251,191,36,0.28)] bg-[rgba(251,191,36,0.10)] text-[#fbbf24]"
+            : "border-[#27272a] bg-[#09090b] text-[#d4d4d8]",
+          canPreview ? "cursor-pointer hover:border-[#3f3f46] hover:bg-[#18181b] hover:text-white" : "cursor-default",
+        ].join(" ");
+
+        return canPreview ? (
+          <button
+            key={item.id || `${item.kind}-${index}`}
+            type="button"
+            data-testid="user-context-pill"
+            className={className}
+            title={statusTitle}
+            onClick={() => onPreviewImage(item)}
+          >
+            {content}
+          </button>
+        ) : (
+          <span
+            key={item.id || `${item.kind}-${index}`}
+            data-testid="user-context-pill"
+            className={className}
+            title={statusTitle}
+          >
+            {content}
+          </span>
+        );
+      })}
+    </div>
+  );
+}
+
+function UserImagePreviewModal({
+  item,
+  onClose,
+}: {
+  item: UserContextItem | null;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    if (!item?.previewDataUrl) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [item?.previewDataUrl, onClose]);
+
+  if (!item?.previewDataUrl || typeof document === "undefined") return null;
+  return createPortal(
+    <div
+      data-testid="user-image-preview-modal"
+      className="fixed inset-0 z-[150] flex items-center justify-center bg-[rgba(0,0,0,0.78)] p-6"
+      onClick={onClose}
+    >
+      <div
+        className="relative max-h-[90vh] max-w-[92vw] overflow-hidden rounded-2xl border border-[#34343b] bg-[#09090b] p-3 shadow-2xl"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <button
+          type="button"
+          className="absolute right-4 top-4 rounded-full border border-[#34343b] bg-[#18181b] p-2 text-[#c4c4cc] transition-colors hover:bg-[#232327] hover:text-white"
+          onClick={onClose}
+          title="Close"
+        >
+          <IconClose className="h-4 w-4" />
+        </button>
+        <img
+          data-testid="user-image-preview"
+          src={item.previewDataUrl}
+          alt={item.label || "preview"}
+          className="max-h-[84vh] max-w-[88vw] rounded-xl object-contain"
+        />
+      </div>
+    </div>,
+    document.body,
+  );
+}
 
 function getDisplayAgentContent(content: string, showFull: boolean, previewChars = AGENT_CONTENT_PREVIEW_CHARS) {
   const raw = String(content || "");
@@ -1492,6 +1622,7 @@ export default function ChatArea({
   const [composerHeight, setComposerHeight] = useState(220);
   const [shouldRenderTopIsland, setShouldRenderTopIsland] = useState(false);
   const [isTopIslandVisible, setIsTopIslandVisible] = useState(false);
+  const [previewImageItem, setPreviewImageItem] = useState<UserContextItem | null>(null);
   // endregion
 
   useEffect(() => {
@@ -1784,21 +1915,21 @@ export default function ChatArea({
 
   const renderBlock = (block, index) => {
     if (block.type === "user") {
+      const existingContextItems = Array.isArray(block.contextItems) ? block.contextItems : [];
+      const hasImageContextItem = existingContextItems.some((item: UserContextItem) => item.kind === "image");
+      const legacyImageItems = !hasImageContextItem && Array.isArray(block.images)
+        ? block.images.map((dataUrl: string, imgIdx: number) => ({
+            id: `legacy-image:${block.id}:${imgIdx}`,
+            kind: "image",
+            label: language === "en" ? `Image ${imgIdx + 1}` : `截图 ${imgIdx + 1}`,
+            status: "ready",
+            previewDataUrl: dataUrl,
+          }))
+        : [];
+      const userContextItems = [...existingContextItems, ...legacyImageItems];
       return (
         <div key={`${block.id}-${index}`} className="flex w-full justify-end">
           <div className="theme-subtle-bg theme-subtle-border max-w-[85%] rounded-2xl rounded-tr-sm border p-4">
-            {block.images && block.images.length > 0 && (
-              <div className="mb-2 flex flex-wrap gap-2">
-                {block.images.map((dataUrl: string, imgIdx: number) => (
-                  <img
-                    key={`${block.id}-img-${imgIdx}`}
-                    src={dataUrl}
-                    alt={`user-image-${imgIdx}`}
-                    className="max-h-48 w-auto rounded-md border border-[#27272a]"
-                  />
-                ))}
-              </div>
-            )}
             {block.content && (
               <div
                 data-testid="user-message-content"
@@ -1811,6 +1942,11 @@ export default function ChatArea({
                 {block.content}
               </div>
             )}
+            <UserContextPillRow
+              items={userContextItems}
+              language={language}
+              onPreviewImage={setPreviewImageItem}
+            />
           </div>
         </div>
       );
@@ -2444,6 +2580,10 @@ export default function ChatArea({
         onToggleAutoApprove={onToggleAutoApprove}
         activeSessionKey={activeSessionKey}
         onHeightChange={setComposerHeight}
+      />
+      <UserImagePreviewModal
+        item={previewImageItem}
+        onClose={() => setPreviewImageItem(null)}
       />
     </div>
   );

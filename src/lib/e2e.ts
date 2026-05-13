@@ -34,6 +34,7 @@ const UNITY_MCP_OPTIONS_PRIORITY_SCENARIO = "unity-mcp-options-priority";
 const UNITY_TOOL_CODE_COMPAT_SCENARIO = "unity-tool-code-compat";
 const UNITY_NO_ERROR_ROUTING_SCENARIO = "unity-no-error-routing";
 const PSEUDO_TOOL_CALL_RECOVERY_SCENARIO = "pseudo-tool-call-recovery";
+const MALFORMED_TOOL_USE_PLAN_SCENARIO = "malformed-tool-use-plan";
 const EXISTING_PLAN_FOLDER_EXECUTE_SCENARIO = "existing-plan-folder-execute";
 const EXECUTE_MAX_ITERATIONS_CHECKPOINT_SCENARIO = "execute-max-iterations-checkpoint";
 const LOCAL_FILE_READ_APPROVAL_SCENARIO = "local-file-read-approval";
@@ -42,6 +43,7 @@ const TOP_ISLAND_PLAN_TASK_PROGRESS_SCENARIO = "top-island-plan-task-progress";
 const GAME_STUDIO_TOOL_GROUP_COLLAPSE_SCENARIO = "game-studio-tool-group-collapse";
 const GAME_STUDIO_AWAITING_CHOICE_SCENARIO = "game-studio-awaiting-choice";
 const SIDEBAR_REMOVE_LAST_WORKSPACE_SCENARIO = "sidebar-remove-last-workspace";
+const USER_CONTEXT_PILLS_SCENARIO = "user-context-pills";
 const E2E_SEED_COUNT_PREFIX = "__CODELY_E2E_SEED_COUNT__:";
 
 function getScenarioName(): string | null {
@@ -113,7 +115,26 @@ function bindBridgeSnapshot(scenario: string) {
     const state = useAppStore.getState();
     const agentBlocks = state.taskFlow.filter((block) => block.type === "agent") as any[];
     const toolBlocks = state.taskFlow.filter((block) => block.type === "tool") as any[];
+    const userBlocks = state.taskFlow.filter((block) => block.type === "user") as any[];
     const archivedOptionBlocks = agentBlocks.filter((block) => block.archivedAfterChoice);
+    const agentMessageSummaries = (state.agentMessages || []).map((message: any) => {
+      const content = message?.content;
+      if (Array.isArray(content)) {
+        return {
+          role: message?.role || "",
+          hasImage: content.some((part: any) => part?.type === "image_url" || part?.type === "input_image"),
+          text: content
+            .filter((part: any) => part?.type === "text" || part?.type === "input_text")
+            .map((part: any) => String(part.text || ""))
+            .join("\n"),
+        };
+      }
+      return {
+        role: message?.role || "",
+        hasImage: false,
+        text: String(content || ""),
+      };
+    });
     const scopeKey = state.currentWorkspace || GLOBAL_CHAT_KEY;
     const sessions = state.sessionsByWorkspace[scopeKey] || [];
     return {
@@ -140,6 +161,12 @@ function bindBridgeSnapshot(scenario: string) {
       agentTexts: agentBlocks.map((block) => block.content),
       toolNames: toolBlocks.map((block) => block.toolName),
       toolTargets: toolBlocks.map((block) => block.target),
+      userContextItems: userBlocks.flatMap((block) => Array.isArray(block.contextItems) ? block.contextItems : []),
+      userBlockImagesCount: userBlocks.reduce(
+        (count, block) => count + (Array.isArray(block.images) ? block.images.length : 0),
+        0,
+      ),
+      agentMessageSummaries,
       selectedOptions: archivedOptionBlocks.map((block) => block.selectedOption).filter(Boolean),
       themeMode: state.config.themeMode,
       thinkingPolicy: state.config.thinkingPolicy,
@@ -3202,6 +3229,8 @@ function seedCloudToolProtocolScenario(scenario: string) {
     ? 999505
     : scenario === LOCAL_FILE_READ_APPROVAL_SCENARIO
     ? 999506
+    : scenario === MALFORMED_TOOL_USE_PLAN_SCENARIO
+    ? 999510
     : 999502;
   const server = {
     id: `e2e-${scenario}-server`,
@@ -3226,7 +3255,7 @@ function seedCloudToolProtocolScenario(scenario: string) {
     config: {
       ...state.config,
       language: "zh",
-      workflowMode: "chat",
+      workflowMode: scenario === MALFORMED_TOOL_USE_PLAN_SCENARIO ? "plan" : "chat",
       activeProfile: "cloud",
       workspace,
       cloud: server,
@@ -3256,6 +3285,8 @@ function seedCloudToolProtocolScenario(scenario: string) {
             ? "E2E Pseudo Tool Call Recovery"
             : scenario === LOCAL_FILE_READ_APPROVAL_SCENARIO
             ? "E2E Local File Read Approval"
+            : scenario === MALFORMED_TOOL_USE_PLAN_SCENARIO
+            ? "E2E Malformed Tool Use Plan"
             : "E2E Reply Options Tool Pause",
           date: new Date(now).toISOString(),
           active: true,
@@ -3297,6 +3328,17 @@ function seedCloudToolProtocolScenario(scenario: string) {
   }));
 
   bridge.sendCloudMessage = (text?: string) => {
+    if (scenario === MALFORMED_TOOL_USE_PLAN_SCENARIO) {
+      return useAppStore.getState().sendMessage(
+        text || "请基于 orders.csv 生成一个数据分析自动化设计方案。",
+        undefined,
+        {
+          resolvedIntent: "plan",
+          skipIntentResolution: true,
+        },
+      );
+    }
+
     if (scenario === EXISTING_PLAN_FOLDER_EXECUTE_SCENARIO) {
       return useAppStore.getState().sendMessage(
         text || "根据.MAIN/plans文件夹的内容，完成执行方案和任务的内容。",
@@ -3390,6 +3432,7 @@ function seedCloudToolProtocolScenario(scenario: string) {
       planStage: state.planStage,
       isPlanApproved: state.isPlanApproved,
       planAutoResumeCount: state.planAutoResumeCount,
+      planArtifactPaths: state.planArtifacts.map((artifact) => artifact.path),
       planTasks: state.planTasks,
       currentTurnStatus: currentTurn?.status ?? null,
       currentTurnIntent: currentTurn?.intent ?? null,
@@ -3805,6 +3848,156 @@ export function getE2EResumeExecutionHandler(): (() => Promise<boolean>) | null 
   };
 }
 
+function seedUserContextPillsScenario() {
+  const bridge = getBridge();
+  if (!bridge) return undefined;
+
+  bridge.events = [{ type: "boot" }];
+  bridge.savedDocuments = [];
+  bridge.completed = true;
+
+  const workspace = "/tmp/e2e-user-context-pills";
+  const sessionId = 999701;
+  const turnId = "e2e-user-context-pills-turn";
+  const now = Date.now();
+  const previewDataUrl =
+    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+  const userBlockId = useAppStore.getState()._nextTaskId();
+  const agentBlockId = useAppStore.getState()._nextTaskId();
+
+  useAppStore.setState((state) => ({
+    ...state,
+    config: {
+      ...state.config,
+      language: "zh",
+      workflowMode: "chat",
+      sessionRecordingEnabled: false,
+    },
+    currentWorkspace: workspace,
+    selectedWorkspace: workspace,
+    sessionsByWorkspace: {
+      [workspace]: [
+        {
+          id: sessionId,
+          title: "E2E User Context Pills",
+          date: new Date(now).toISOString(),
+          active: true,
+          storageStatus: "temporary",
+          recordingDisabled: true,
+          messages: [],
+        },
+      ],
+    },
+    currentSessionId: sessionId,
+    selectedMainModeKey: "main_mode",
+    selectedNexusModeKey: "nexus_general",
+    taskFlow: [
+      {
+        id: userBlockId,
+        turnId,
+        type: "user",
+        content: "请结合 @ 文件、附件和截图检查逻辑。",
+        images: [previewDataUrl],
+        contextItems: [
+          {
+            id: "mention:/tmp/e2e-user-context-pills/src/App.tsx",
+            kind: "mention",
+            label: "src/App.tsx",
+            path: "/tmp/e2e-user-context-pills/src/App.tsx",
+            status: "ready",
+          },
+          {
+            id: "attachment:/tmp/e2e-user-context-pills/data/report.csv",
+            kind: "attachment",
+            label: "report.csv",
+            path: "/tmp/e2e-user-context-pills/data/report.csv",
+            status: "failed",
+          },
+          {
+            id: "image:0",
+            kind: "image",
+            label: "截图 1",
+            status: "ready",
+            previewDataUrl,
+          },
+          {
+            id: "image:restored",
+            kind: "image",
+            label: "截图 2",
+            status: "ready",
+          },
+        ],
+      },
+      {
+        id: agentBlockId,
+        turnId,
+        type: "agent",
+        content: "已接收文件和截图上下文。",
+        streaming: false,
+      },
+    ],
+    agentMessages: [
+      {
+        role: "user",
+        content: [
+          { type: "image_url", image_url: { url: previewDataUrl } },
+          {
+            type: "text",
+            text: [
+              "```App.tsx",
+              "[attached_file]",
+              "path: /tmp/e2e-user-context-pills/src/App.tsx",
+              "export const ready = true;",
+              "```",
+              "",
+              "请结合 @ 文件、附件和截图检查逻辑。",
+            ].join("\n"),
+          },
+        ],
+      },
+    ],
+    conversationTurns: [
+      {
+        id: turnId,
+        userPrompt: "请结合 @ 文件、附件和截图检查逻辑。",
+        title: "E2E User Context Pills",
+        intent: "discuss",
+        mode: "chat",
+        status: "done",
+        summary: "已接收上下文。",
+        blockIds: [userBlockId, agentBlockId],
+        collapsed: false,
+        createdAt: now,
+      },
+    ],
+    currentTurnId: turnId,
+    input: "",
+    attachedFiles: [],
+    contextMentions: [],
+    readOnlyAutoApproveForSession: false,
+    planArtifacts: [],
+    planTasks: [],
+    planExecutionEvidenceLedger: [],
+    planStage: "idle",
+    isPlanApproved: false,
+    showPlanPanel: false,
+    showDiff: false,
+    showTerminal: false,
+    showFilePanel: false,
+    rightPanelTab: "plan",
+    agentStatus: "idle",
+    isGenerating: false,
+  }));
+
+  bindBridgeSnapshot(USER_CONTEXT_PILLS_SCENARIO);
+
+  const cleanup = () => {
+    bridge.initialized = false;
+  };
+
+  bridge.cleanup = cleanup;
+  return cleanup;
+}
 
 function seedSidebarRemoveLastWorkspaceScenario() {
   const bridge = getBridge();
@@ -4043,6 +4236,10 @@ export function initializeE2EScenarios(): (() => void) | undefined {
     return seedCloudToolProtocolScenario(PSEUDO_TOOL_CALL_RECOVERY_SCENARIO);
   }
 
+  if (scenario === MALFORMED_TOOL_USE_PLAN_SCENARIO) {
+    return seedCloudToolProtocolScenario(MALFORMED_TOOL_USE_PLAN_SCENARIO);
+  }
+
   if (scenario === EXISTING_PLAN_FOLDER_EXECUTE_SCENARIO) {
     return seedCloudToolProtocolScenario(EXISTING_PLAN_FOLDER_EXECUTE_SCENARIO);
   }
@@ -4077,6 +4274,10 @@ export function initializeE2EScenarios(): (() => void) | undefined {
 
   if (scenario === GAME_STUDIO_AWAITING_CHOICE_SCENARIO) {
     return seedGameStudioToolGroupScenario("awaiting_input");
+  }
+
+  if (scenario === USER_CONTEXT_PILLS_SCENARIO) {
+    return seedUserContextPillsScenario();
   }
 
   

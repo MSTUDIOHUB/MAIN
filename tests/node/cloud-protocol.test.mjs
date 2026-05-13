@@ -583,6 +583,38 @@ test("cloud responses compact messages preserve explicit ContextState outside om
   assert.doesNotMatch(String(summary?.content || ""), /ContextMemoryState v1/);
 });
 
+test("cloud responses compact messages keep small read_file tool content", () => {
+  const messages = [
+    { role: "system", content: "system" },
+    { role: "user", content: "请读取外部日志 /tmp/e2e-outside-main-debug.log。" },
+    { role: "assistant", content: "" },
+    {
+      role: "tool",
+      tool_call_id: "text_call_1",
+      content: [
+        "[MAIN_TOOL_FEEDBACK_V1]{\"version\":1,\"status\":\"completed\",\"tool_call_id\":\"text_call_1\",\"tool\":\"read_file\",\"target\":\"/tmp/e2e-outside-main-debug.log\",\"summary\":\"READ_FILE_RESULT path: .MAIN-chat-attachments/outside-main-debug.log truncated: false totalLines: 1 totalChars: 34 returnedLines: 1-1 returnedChars: 34 note: read_file returns a bounded content window for large or ranged reads.\"}",
+        "READ_FILE_RESULT",
+        "path: .MAIN-chat-attachments/outside-main-debug.log",
+        "truncated: false",
+        "totalLines: 1",
+        "totalChars: 34",
+        "returnedLines: 1-1",
+        "returnedChars: 34",
+        "note: read_file returns a bounded content window for large or ranged reads. For more source, call read_file with start_line/end_line/max_lines; do not use run_command merely to page file contents.",
+        "---CONTENT START---",
+        "LOCAL_FILE_READ_OK: debug log line",
+        "---CONTENT END---",
+      ].join("\n"),
+    },
+  ];
+
+  const compacted = compactCloudResponsesMessages(messages);
+  const toolMessage = compacted.find((message) => message.role === "tool");
+
+  assert.ok(toolMessage, "expected compacted tool message");
+  assert.match(String(toolMessage.content || ""), /LOCAL_FILE_READ_OK/);
+});
+
 test("responses compact transcript fallback keeps pinned ContextState memory", () => {
   const messages = [
     { role: "system", content: "system" },

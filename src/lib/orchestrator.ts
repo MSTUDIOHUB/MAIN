@@ -41,6 +41,7 @@ import { ensureVisibleConclusionWithPolicy, isAssistantTurnEmpty, isSyntheticVis
 import { hasStructuredPlanProposal } from "./planProposal";
 import {
   buildReadOnlyPermissionContinuationPrompt,
+  hasOnlyReadOnlyPermissionReplyOptions,
   serializeAssistantReplyForHistory,
   shouldAutoContinueReadOnlyPermission as shouldAutoContinueReadOnlyPermissionState,
   shouldPauseForReplyOptions,
@@ -877,6 +878,48 @@ export function buildPseudoToolCallRecoveryPrompt(language: "zh" | "en", workflo
       ].join("\n");
 }
 
+function containsToolUseBlock(text: string): boolean {
+  return /<tool_use\b/i.test(String(text || ""));
+}
+
+function containsToolNameParameterFallback(text: string): boolean {
+  return /<tool_use\b[\s\S]*?<parameter\s+name=["'](?:tool|name|function)["']/i.test(String(text || ""));
+}
+
+function summarizeProtocolFragmentForLog(text: string): string {
+  return String(text || "")
+    .replace(/```[\s\S]*?```/g, "[code block]")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 180);
+}
+
+function buildMalformedToolUseRecoveryPrompt(language: "zh" | "en"): string {
+  if (language === "en") {
+    return [
+      "Your previous reply contained a `<tool_use>` block, but MAIN could not parse it as an executable tool call.",
+      "Continue with exactly one valid XML tool call now. Use this shape:",
+      "<tool_use>",
+      "<tool>query_tabular_document</tool>",
+      "<parameter name=\"path\">path/to/file.csv</parameter>",
+      "<parameter name=\"query\">SQL or natural-language query</parameter>",
+      "</tool_use>",
+      "Do not put the tool name inside `<parameter name=\"tool\">`, and do not output prose around the tool call.",
+    ].join("\n");
+  }
+
+  return [
+    "上一条回复包含 `<tool_use>`，但 MAIN 没能解析成可执行工具调用。",
+    "现在请只输出一个合法 XML 工具调用，格式如下：",
+    "<tool_use>",
+    "<tool>query_tabular_document</tool>",
+    "<parameter name=\"path\">path/to/file.csv</parameter>",
+    "<parameter name=\"query\">SQL 或自然语言查询</parameter>",
+    "</tool_use>",
+    "不要把工具名写进 `<parameter name=\"tool\">`，也不要在工具调用前后输出说明文字。",
+  ].join("\n");
+}
+
 export function shouldRepromptBeforeUnityConsoleFallback(input: {
   readConsoleCalled: boolean;
   hasSuccessfulReadOnlyActivity: boolean;
@@ -1259,15 +1302,39 @@ function shouldTreatCloudGatewayErrorAsCompatibility(
   return nativeToolsWereAttempted || hasToolRoundHistory(messages);
 }
 
-function isStreamWatchdogTimeoutMessage(message: string): boolean {
+const PLAN_NO_VISIBLE_TOKEN_TIMEOUT_MS = 125_000;
+
+interface FetchLLMStreamOptions {
+  noVisibleTokenTimeoutMs?: number;
+  noVisibleTokenTimeoutLabel?: string;
+}
+
+export function isStreamWatchdogTimeoutMessage(message: string): boolean {
   const normalized = String(message || "").toLowerCase();
   return (
     normalized.includes("stream_first_chunk_timeout") ||
+    normalized.includes("stream_no_visible_token_timeout") ||
     normalized.includes("first chunk timeout") ||
     normalized.includes("first response timeout") ||
     normalized.includes("没有返回首个流式 chunk") ||
+    normalized.includes("长时间没有返回可见流式内容") ||
     normalized.includes("没有返回响应头")
   );
+}
+
+export function createStreamNoVisibleTokenTimeoutError(timeoutMs: number, label?: string): Error {
+  const suffix = label ? ` (${label})` : "";
+  const error = new Error(`STREAM_NO_VISIBLE_TOKEN_TIMEOUT: no visible model output after ${timeoutMs}ms${suffix}`);
+  (error as Error & { code?: string }).code = "STREAM_NO_VISIBLE_TOKEN_TIMEOUT";
+  return error;
+}
+
+export function shouldUsePlanNoVisibleTokenWatchdog(input: {
+  workflowMode: "chat" | "edit" | "plan";
+  isPlanApproved: boolean;
+  nativeToolCount: number;
+}): boolean {
+  return input.workflowMode === "plan" && !input.isPlanApproved && input.nativeToolCount === 0;
 }
 
 function buildPlanStreamTimeoutPauseMessage(
@@ -1322,6 +1389,7 @@ async function fetchLLMStream(
   allTools: ToolDefinition[],
   maxTokensOverride?: number,
   maxEscalationsOverride?: number,
+  options: FetchLLMStreamOptions = {},
 ): Promise<StreamResult> {
   let fullText = "";
   let currentMaxTokens = maxTokensOverride ?? computeInitialMaxTokens(settings.contextLimit);
@@ -1338,22 +1406,72 @@ async function fetchLLMStream(
     try {
       result = await new Promise<StreamResult>((resolve, reject) => {
         let settled = false;
-        const safeResolve = (r: StreamResult) => { if (!settled) { settled = true; resolve(r); } };
-        const safeReject = (err: Error) => { if (!settled) { settled = true; reject(err); } };
+        const requestAbortController = new AbortController();
+        const timeoutMs = options.noVisibleTokenTimeoutMs ?? 0;
+        let noVisibleTokenTimer: ReturnType<typeof setTimeout> | null = null;
+        const cleanup = () => {
+          if (noVisibleTokenTimer !== null) {
+            clearTimeout(noVisibleTokenTimer);
+            noVisibleTokenTimer = null;
+          }
+          signal.removeEventListener("abort", onExternalAbort);
+        };
+        const safeResolve = (r: StreamResult) => {
+          if (!settled) {
+            settled = true;
+            cleanup();
+            resolve(r);
+          }
+        };
+        const safeReject = (err: Error) => {
+          if (!settled) {
+            settled = true;
+            cleanup();
+            reject(err);
+          }
+        };
+        const createAbortError = () => {
+          const abortErr = new Error("Aborted");
+          abortErr.name = "AbortError";
+          return abortErr;
+        };
+        function onExternalAbort() {
+          requestAbortController.abort();
+          safeReject(createAbortError());
+        }
+
+        if (signal.aborted) {
+          safeReject(createAbortError());
+          return;
+        }
+
+        signal.addEventListener("abort", onExternalAbort, { once: true });
+        if (timeoutMs > 0) {
+          noVisibleTokenTimer = setTimeout(() => {
+            const timeoutError = createStreamNoVisibleTokenTimeoutError(
+              timeoutMs,
+              options.noVisibleTokenTimeoutLabel,
+            );
+            safeReject(timeoutError);
+            requestAbortController.abort();
+          }, timeoutMs);
+        }
 
         void streamChatCompletion(
           messages,
           settings,
           {
             onToken: (token) => {
+              if (noVisibleTokenTimer !== null && token.length > 0) {
+                clearTimeout(noVisibleTokenTimer);
+                noVisibleTokenTimer = null;
+              }
               fullText += token;
               callbacks.onStreamToken(token, messageId);
             },
             onDone: (result) => {
-              if (signal.aborted) {
-                const abortErr = new Error("Aborted");
-                abortErr.name = "AbortError";
-                safeReject(abortErr);
+              if (signal.aborted || requestAbortController.signal.aborted) {
+                safeReject(createAbortError());
                 return;
               }
               safeResolve(result);
@@ -1362,7 +1480,7 @@ async function fetchLLMStream(
               safeReject(err);
             },
           },
-          signal,
+          requestAbortController.signal,
           allTools,
           currentMaxTokens,
         ).catch((err) => {
@@ -3004,10 +3122,22 @@ export async function executeAgentLoop(
     workflowMode === "plan" && !callbacks.getIsPlanApproved()
       ? 0
       : 2;
+  const getPlanStreamWatchdogOptions = (nativeToolCount: number): FetchLLMStreamOptions | undefined =>
+    shouldUsePlanNoVisibleTokenWatchdog({
+      workflowMode,
+      isPlanApproved: callbacks.getIsPlanApproved(),
+      nativeToolCount,
+    })
+      ? {
+          noVisibleTokenTimeoutMs: PLAN_NO_VISIBLE_TOKEN_TIMEOUT_MS,
+          noVisibleTokenTimeoutLabel: `${workflowMode}:preapproval_xml_tools`,
+        }
+      : undefined;
   let sawPlanModeToolActivity = false;
   let usedPlanRecoveryPrompt = false;
   let usedToolUnavailableRecoveryPrompt = false;
   let usedPseudoToolCallRecoveryPrompt = false;
+  let usedMalformedToolUseRecoveryPrompt = false;
   let usedLanguageMismatchRecoveryPrompt = false;
   let usedExecuteConvergencePrompt = false;
   const attemptedPlanWriteTargets: string[] = [];
@@ -3240,6 +3370,7 @@ export async function executeAgentLoop(
         llmTools,
         currentMaxTokens,
         maxOutputEscalations,
+        getPlanStreamWatchdogOptions(llmTools.length),
       );
       if (llmTools.length > 0) {
         callbacks.onProviderNativeToolSuccess?.();
@@ -3357,6 +3488,7 @@ export async function executeAgentLoop(
             llmTools,
             aggressiveOutputBudget,
             1,
+            getPlanStreamWatchdogOptions(llmTools.length),
           );
           if (llmTools.length > 0) {
             callbacks.onProviderNativeToolSuccess?.();
@@ -3438,6 +3570,7 @@ export async function executeAgentLoop(
               llmTools,
               emergencyOutputBudget,
               0,
+              getPlanStreamWatchdogOptions(llmTools.length),
             );
             if (llmTools.length > 0) {
               callbacks.onProviderNativeToolSuccess?.();
@@ -3529,6 +3662,7 @@ export async function executeAgentLoop(
             llmTools,
             cloudReactiveOutputBudget,
             1,
+            getPlanStreamWatchdogOptions(llmTools.length),
           );
           if (llmTools.length > 0) {
             callbacks.onProviderNativeToolSuccess?.();
@@ -3588,6 +3722,7 @@ export async function executeAgentLoop(
             [],
             currentMaxTokens,
             maxOutputEscalations,
+            getPlanStreamWatchdogOptions(0),
           );
         } catch (retryErr) {
           if ((retryErr as Error).name === "AbortError") {
@@ -3631,6 +3766,7 @@ export async function executeAgentLoop(
                 [],
                 currentMaxTokens,
                 maxOutputEscalations,
+                getPlanStreamWatchdogOptions(0),
               );
             } catch (finalErr) {
               if ((finalErr as Error).name === "AbortError") {
@@ -3668,6 +3804,7 @@ export async function executeAgentLoop(
                   [],
                   currentMaxTokens,
                   maxOutputEscalations,
+                  getPlanStreamWatchdogOptions(0),
                 );
               } catch (lastErr) {
                 if ((lastErr as Error).name === "AbortError") {
@@ -3725,6 +3862,28 @@ export async function executeAgentLoop(
       config.thinkingPolicy !== "action_only",
     );
     if (isAssistantTurnEmpty(normalized)) {
+      const malformedToolUseBlock =
+        workflowMode === "plan" &&
+        !callbacks.getIsPlanApproved() &&
+        containsToolUseBlock(streamText) &&
+        normalizedBase.toolCalls.length === 0;
+      if (malformedToolUseBlock && !usedMalformedToolUseRecoveryPrompt) {
+        usedMalformedToolUseRecoveryPrompt = true;
+        logAgentEvent("tool_protocol_parse_failed", {
+          iteration,
+          workflowMode,
+          turnIntent,
+          reason: "unparsed_tool_use_block",
+          preview: summarizeProtocolFragmentForLog(streamText),
+        });
+        callbacks.onStatusChange("running");
+        callbacks.appendMessage({
+          role: "user",
+          content: buildMalformedToolUseRecoveryPrompt(callbacks.getPreferredLanguage()),
+        });
+        continue;
+      }
+
       consecutiveEmptyResponseCount++;
       if (workflowMode === "plan" && !callbacks.getIsPlanApproved()) {
         if (consecutiveEmptyResponseCount >= 2) {
@@ -3789,6 +3948,25 @@ export async function executeAgentLoop(
         name: call.name,
         arguments: call.arguments,
       }, workspace));
+    if (effectiveToolCalls.length > 0 && containsToolNameParameterFallback(streamText)) {
+      const recoveredArgKeys = (() => {
+        try {
+          const parsedArgs = JSON.parse(effectiveToolCalls[0].arguments || "{}");
+          return parsedArgs && typeof parsedArgs === "object" && !Array.isArray(parsedArgs)
+            ? Object.keys(parsedArgs).sort()
+            : [];
+        } catch {
+          return [];
+        }
+      })();
+      logAgentEvent("tool_protocol_parse_recovered", {
+        iteration,
+        toolName: effectiveToolCalls[0].name,
+        argumentKeys: recoveredArgKeys,
+        workflowMode,
+        turnIntent,
+      });
+    }
 
     const compactedProseCodeDump = shouldCompactProseCodeDump({
       workflowMode,
@@ -3811,8 +3989,11 @@ export async function executeAgentLoop(
         replyOptions: normalized.replyOptions,
         readOnlyAutoApproveForSession: callbacks.getReadOnlyAutoApproveForSession(),
       });
+    const suppressReadOnlyPermissionOptionsForToolCalls =
+      effectiveToolCalls.length > 0 &&
+      hasOnlyReadOnlyPermissionReplyOptions(normalized.replyOptions);
     const sourceVisibleText = normalizedBase.visibleText || normalized.visibleText;
-    const normalizedVisibleTextForUser = autoContinueReadOnlyPermission
+    const normalizedVisibleTextForUser = autoContinueReadOnlyPermission || suppressReadOnlyPermissionOptionsForToolCalls
       ? stripReadOnlyPermissionPrompt(normalized.visibleText)
       : normalized.visibleText;
     const finalVisibleText = compactedProseCodeDump
@@ -3820,7 +4001,18 @@ export async function executeAgentLoop(
       : compactedIncompletePlanText
       ? buildPlanFallbackNotice(callbacks.getPreferredLanguage(), sourceVisibleText.length)
       : normalizedVisibleTextForUser;
-    const finalReplyOptions = compactedProseCodeDump || autoContinueReadOnlyPermission ? [] : normalized.replyOptions;
+    const finalReplyOptions = compactedProseCodeDump || autoContinueReadOnlyPermission || suppressReadOnlyPermissionOptionsForToolCalls
+      ? []
+      : normalized.replyOptions;
+    if (suppressReadOnlyPermissionOptionsForToolCalls) {
+      logAgentEvent("readonly_permission_options_ignored_for_tool_call", {
+        iteration,
+        toolCalls: effectiveToolCalls.length,
+        replyOptions: normalized.replyOptions.length,
+        workflowMode,
+        turnIntent,
+      });
+    }
     const pseudoToolCallPlaceholder =
       effectiveToolCalls.length === 0 &&
       finalReplyOptions.length === 0 &&
@@ -4015,6 +4207,16 @@ export async function executeAgentLoop(
         targetLanguage: callbacks.getPreferredLanguage(),
         detectedLanguage: languageMismatchDecision.detectedLanguage,
         visibleChars: userVisibleText.length,
+      });
+    }
+
+    if (effectiveToolCalls.length > 0 && !visibleAssistantText.trim() && containsToolUseBlock(streamText)) {
+      callbacks.onStreamToken("__ESCALATION_RESET__:", assistantMsgId);
+      logAgentEvent("tool_protocol_stream_cleared", {
+        iteration,
+        toolCalls: effectiveToolCalls.length,
+        workflowMode,
+        turnIntent,
       });
     }
 

@@ -59,6 +59,7 @@ function loadTranspiledModuleSync(sourcePath) {
 const {
   buildReadOnlyPermissionContinuationPrompt,
   extractReplyOptions,
+  hasOnlyReadOnlyPermissionReplyOptions,
   serializeAssistantReplyForHistory,
   shouldAutoContinueReadOnlyPermission,
   shouldPauseForReplyOptions,
@@ -404,4 +405,22 @@ test("read-only auto approval strips repeated permission prompts and builds cont
   );
   assert.match(buildReadOnlyPermissionContinuationPrompt("zh"), /不要再询问是否同意/);
   assert.match(buildReadOnlyPermissionContinuationPrompt("zh"), /read_file/);
+});
+
+test("read-only permission option classifier only matches synthetic permission choices", () => {
+  assert.equal(
+    hasOnlyReadOnlyPermissionReplyOptions([
+      { label: "继续分析 Dashboard", value: "请继续分析 Dashboard。", action: "continue_readonly_once" },
+      { label: "当前会话只读步骤全部批准", value: "本会话只读读取、搜索和分析步骤全部允许。", action: "allow_readonly_session" },
+    ]),
+    true,
+  );
+
+  assert.equal(
+    hasOnlyReadOnlyPermissionReplyOptions([
+      { label: "继续分析 Dashboard", value: "请继续分析 Dashboard。", action: "continue_readonly_once" },
+      { label: "改用更简洁方案", value: "改用更简洁方案" },
+    ]),
+    false,
+  );
 });

@@ -28,7 +28,7 @@ function stripLeadingSlashCommand(text: string): string {
 }
 
 export function detectDominantLanguage(text: string, fallback: "zh" | "en" = "zh"): "zh" | "en" {
-  const probe = stripLeadingSlashCommand(text);
+  const probe = stripNonNaturalLanguageContent(stripLeadingSlashCommand(text));
   const hanCount = (probe.match(/[\u3400-\u9fff]/g) || []).length;
   const latinCount = (probe.match(/[A-Za-z]/g) || []).length;
 
@@ -85,6 +85,8 @@ function stripNonNaturalLanguageContent(text: string): string {
     .replace(/```[\s\S]*?```/g, " ")
     .replace(/`[^`\n]+`/g, " ")
     .replace(/https?:\/\/\S+/gi, " ")
+    .replace(/(?:^|\s)(?:\/[^\s`'"，。；、]+)+/g, " ")
+    .replace(/(?:^|\s)[A-Za-z]:[\\/][^\s`'"，。；、]+/g, " ")
     .replace(/(?:^|\n)\s*>.*$/gm, " ")
     .replace(/[\[\]{}()<>_=+*/\\|~^#@:$%&-]/g, " ")
     .replace(/\s+/g, " ")

@@ -282,6 +282,16 @@ export function hasReadOnlyPermissionReplyOptions(replyOptions: ReplyOption[]): 
   );
 }
 
+export function hasOnlyReadOnlyPermissionReplyOptions(replyOptions: ReplyOption[]): boolean {
+  return (
+    Array.isArray(replyOptions) &&
+    replyOptions.length > 0 &&
+    replyOptions.every((option) =>
+      option.action === "continue_readonly_once" || option.action === "allow_readonly_session"
+    )
+  );
+}
+
 export function shouldAutoContinueReadOnlyPermission(params: {
   replyOptions: ReplyOption[];
   readOnlyAutoApproveForSession: boolean;

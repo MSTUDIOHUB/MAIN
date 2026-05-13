@@ -83,6 +83,57 @@ test("parses <tool_code> wrapper into a real tool call and strips wrapper text",
   assert.doesNotMatch(parsed.cleanText, /tool_code|list_directory\(\"src\"\)/i);
 });
 
+test("recovers malformed tool_use with tool name in a parameter", () => {
+  const parsed = parseTextForTools([
+    "<tool_use>",
+    "<parameter name=\"path\">/Users/michael/Desktop/DataFiles/cn_tutorial_orders_by_creator_20260512.csv</parameter>",
+    "<parameter name=\"query\">SELECT DISTINCT \"课程名称\" FROM \"cn_tutorial_orders_by_creator_20260512.csv\" LIMIT 20</parameter>",
+    "<parameter name=\"tool\">query_tabular_document</parameter>",
+    "</tool_use>",
+  ].join("\n"));
+
+  assert.equal(parsed.toolCalls.length, 1);
+  assert.equal(parsed.toolCalls[0].name, "query_tabular_document");
+  assert.deepEqual(parsed.toolCalls[0].arguments, {
+    path: "/Users/michael/Desktop/DataFiles/cn_tutorial_orders_by_creator_20260512.csv",
+    query: "SELECT DISTINCT \"课程名称\" FROM \"cn_tutorial_orders_by_creator_20260512.csv\" LIMIT 20",
+  });
+  assert.equal("tool" in parsed.toolCalls[0].arguments, false);
+  assert.equal(parsed.cleanText, "");
+});
+
+test("strips tool name recovery fields from XML execution arguments", () => {
+  const parsed = parseTextForTools([
+    "<tool_use>",
+    "<tool>query_tabular_document</tool>",
+    "<parameter name=\"tool\">query_tabular_document</parameter>",
+    "<parameter name=\"name\">query_tabular_document</parameter>",
+    "<parameter name=\"function\">query_tabular_document</parameter>",
+    "<parameter name=\"path\">orders.csv</parameter>",
+    "<parameter name=\"query\">SELECT COUNT(*) FROM orders</parameter>",
+    "</tool_use>",
+  ].join("\n"));
+
+  assert.equal(parsed.toolCalls.length, 1);
+  assert.equal(parsed.toolCalls[0].name, "query_tabular_document");
+  assert.deepEqual(parsed.toolCalls[0].arguments, {
+    path: "orders.csv",
+    query: "SELECT COUNT(*) FROM orders",
+  });
+});
+
+test("does not recover malformed tool_use with an unknown tool name", () => {
+  const parsed = parseTextForTools([
+    "<tool_use>",
+    "<parameter name=\"path\">orders.csv</parameter>",
+    "<parameter name=\"tool\">not_a_real_tool</parameter>",
+    "</tool_use>",
+  ].join("\n"));
+
+  assert.equal(parsed.toolCalls.length, 0);
+  assert.equal(parsed.cleanText, "");
+});
+
 test("parses bare tool name followed by path and key-value arguments", () => {
   const parsed = parseTextForTools([
     "read_file",

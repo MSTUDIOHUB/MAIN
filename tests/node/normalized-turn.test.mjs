@@ -285,6 +285,30 @@ test("normalization marks explicit <user_options> tags even when tool calls coex
   assert.equal(normalized.toolCalls[0].name, "read_file");
 });
 
+test("normalization recovers malformed tool_use without leaking XML or becoming empty", () => {
+  const normalized = normalizeAssistantTurn({
+    content: [
+      "<tool_use>",
+      "<parameter name=\"path\">/Users/michael/Desktop/DataFiles/cn_tutorial_orders_by_creator_20260512.csv</parameter>",
+      "<parameter name=\"query\">SELECT DISTINCT \"课程名称\" FROM \"cn_tutorial_orders_by_creator_20260512.csv\" LIMIT 20</parameter>",
+      "<parameter name=\"tool\">query_tabular_document</parameter>",
+      "</tool_use>",
+    ].join("\n"),
+    toolCalls: [],
+    finishReason: "tool_calls",
+  });
+
+  assert.equal(isAssistantTurnEmpty(normalized), false);
+  assert.equal(normalized.visibleText, "");
+  assert.equal(normalized.toolCalls.length, 1);
+  assert.equal(normalized.toolCalls[0].name, "query_tabular_document");
+  assert.deepEqual(JSON.parse(normalized.toolCalls[0].arguments), {
+    path: "/Users/michael/Desktop/DataFiles/cn_tutorial_orders_by_creator_20260512.csv",
+    query: "SELECT DISTINCT \"课程名称\" FROM \"cn_tutorial_orders_by_creator_20260512.csv\" LIMIT 20",
+  });
+  assert.doesNotMatch(normalized.visibleText, /tool_use|parameter|query_tabular_document/);
+});
+
 test("normalization keeps malformed tool protocol out of visible text", () => {
   const normalized = normalizeAssistantTurn({
     content: [

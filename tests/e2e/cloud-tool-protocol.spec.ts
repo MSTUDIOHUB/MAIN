@@ -14,12 +14,14 @@ test.beforeEach(async ({ page }) => {
     const requests: Array<{ hasTools: boolean; body: string }> = [];
     const readFileCalls: string[] = [];
     const listDirectoryCalls: string[] = [];
+    const queryTabularCalls: Array<{ path: string; selectColumns?: unknown; limit?: unknown }> = [];
     const ingestedAttachments: Array<{ sessionKey: string; sourcePath: string }> = [];
 
     (window as any).__CLOUD_TOOL_PROTOCOL_TEST__ = {
       requests,
       readFileCalls,
       listDirectoryCalls,
+      queryTabularCalls,
       ingestedAttachments,
       get fallbackNoToolRequests() {
         return fallbackNoToolRequests;
@@ -87,6 +89,21 @@ test.beforeEach(async ({ page }) => {
           ];
         }
         return [];
+      }
+      if (cmd === "query_tabular_document") {
+        const path = String(args?.path ?? "");
+        queryTabularCalls.push({
+          path,
+          selectColumns: args?.selectColumns,
+          limit: args?.limit,
+        });
+        return {
+          path,
+          columns: ["课程名称"],
+          rows: [{ "课程名称": "MAIN 稳定性课程" }],
+          totalRows: 1,
+          returnedRows: 1,
+        };
       }
       if (cmd === "read_file_window") {
         const path = String(args?.path ?? "");
@@ -388,6 +405,55 @@ test.beforeEach(async ({ page }) => {
           }
           return JSON.stringify({
             output_text: "[Tool call: read_file]",
+          });
+        }
+
+        if (scenario === "malformed-tool-use-plan") {
+          if (queryTabularCalls.length > 0) {
+            return JSON.stringify({
+              output_text: [
+                "# Design",
+                "",
+                "## 目标与约束",
+                "- 目标：基于 orders.csv 设计一个稳定的数据分析自动化流程，避免 Plan 阶段卡在工具协议恢复上。",
+                "- 约束：批准前只生成 `.MAIN/plans/design.md`，不生成 tasks.md，也不修改源码或业务数据。",
+                "",
+                "## 当前发现",
+                "- 已通过表格查询读取课程名称样例，确认数据中包含 `MAIN 稳定性课程`。",
+                "- 本轮只需要收敛设计方案，后续执行阶段再补充任务清单和验证命令。",
+                "",
+                "## 方案",
+                "- 入口接收用户选择的 CSV 文件路径，并优先调用表格查询工具抽取课程、订单、金额等关键字段。",
+                "- 设计层将查询结果整理成指标口径、异常检查和报表输出三部分，保持每一步都可追踪。",
+                "",
+                "## 影响文件与接口",
+                "- 计划文件：`.MAIN/plans/design.md`。",
+                "- 工具接口：`query_tabular_document` 负责筛选和聚合，必要时再由执行阶段补充 `run_command` 验证。",
+                "",
+                "## 执行顺序",
+                "1. 固化数据字段和指标口径。",
+                "2. 设计查询和聚合步骤。",
+                "3. 明确报表输出结构和人工复核点。",
+                "",
+                "## 数据流与验证",
+                "- 数据流：CSV 输入 -> 表格查询 -> 指标汇总 -> 报表草稿。",
+                "- 验证：抽样核对课程名称、订单数和金额聚合结果，确保异常行可以回溯到原始 CSV。",
+                "",
+                "## 风险与后续确认",
+                "- 风险：列名变化会导致查询条件失效，需要执行阶段增加列名兼容检查。",
+                "- 后续确认：执行前由用户选择输出格式；默认先生成 Markdown 报告草稿。",
+              ].join("\n"),
+            });
+          }
+          return JSON.stringify({
+            output_text: [
+              "<tool_use>",
+              "<parameter name=\"path\">orders.csv</parameter>",
+              "<parameter name=\"select_columns\">课程名称</parameter>",
+              "<parameter name=\"limit\">20</parameter>",
+              "<parameter name=\"tool\">query_tabular_document</parameter>",
+              "</tool_use>",
+            ].join("\n"),
           });
         }
 
@@ -744,7 +810,7 @@ test("pseudo tool call placeholder triggers XML recovery instead of stopping as 
   );
   expect(sent).toBe(true);
 
-  await expect(page.getByText("我会改用正式 XML 工具调用读取文件。")).toBeVisible();
+  await expect(page.getByText("已读取 README.md，确认包含 fallback-ok。")).toBeVisible();
   await expect(page.getByText("[Tool call: read_file]")).toHaveCount(0);
 
   await expect
@@ -752,14 +818,49 @@ test("pseudo tool call placeholder triggers XML recovery instead of stopping as 
       page.evaluate(() => {
         const probe = (window as any).__CLOUD_TOOL_PROTOCOL_TEST__;
         return {
-          recoveryRequests: probe?.pseudoToolRecoveryRequests ?? 0,
+          recovered: (probe?.pseudoToolRecoveryRequests ?? 0) >= 1,
           readFileCalls: probe?.readFileCalls || [],
         };
       }),
     )
     .toEqual({
-      recoveryRequests: 1,
+      recovered: true,
       readFileCalls: ["README.md"],
+    });
+});
+
+test("malformed plan XML tool parameter recovers into tabular query and design artifact", async ({ page }) => {
+  await page.goto("/?e2eScenario=malformed-tool-use-plan");
+
+  const sent = await page.evaluate(() =>
+    (window as any).__CODELY_E2E__?.sendCloudMessage?.("请基于 orders.csv 生成一个数据分析自动化设计方案。"),
+  );
+  expect(sent).toBe(true);
+
+  await expect
+    .poll(async () =>
+      page.evaluate(() => {
+        const probe = (window as any).__CLOUD_TOOL_PROTOCOL_TEST__;
+        const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+        const logs = JSON.parse(window.localStorage.getItem("main.debugLog.v1") || "[]");
+        const joinedAgentText = (snapshot?.agentTexts || []).join("\n");
+        return {
+          queryCalls: probe?.queryTabularCalls || [],
+          planStage: snapshot?.planStage,
+          planArtifactPaths: snapshot?.planArtifactPaths || [],
+          hasVisibleProtocolLeak: /<\s*\/?\s*(?:tool_use|parameter)\b/i.test(joinedAgentText),
+          stoppedAsEmptyPlan: logs.some((entry: { message?: string }) =>
+            String(entry.message || "").includes("plan_empty_response_checkpoint"),
+          ),
+        };
+      }),
+    )
+    .toEqual({
+      queryCalls: [{ path: "orders.csv", selectColumns: "课程名称", limit: 20 }],
+      planStage: "design",
+      planArtifactPaths: [".MAIN/plans/design.md"],
+      hasVisibleProtocolLeak: false,
+      stoppedAsEmptyPlan: false,
     });
 });
 
