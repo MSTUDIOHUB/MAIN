@@ -6,6 +6,11 @@ shell:
     - cargo test
     - npm run build
     - npm run lint
+    - main eval
+    - cargo run --bin main -- eval
+    - git status
+    - git diff
+    - git ls-files
     - node scripts/plan_completion_check.mjs
 
   deny:

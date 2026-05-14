@@ -52,6 +52,178 @@ export interface TerminalCommandOutput {
   stderrTruncated: boolean;
 }
 
+export interface RepositoryIndex {
+  root: string;
+  generatedAtMs: number;
+  symbols: SymbolEntry[];
+  imports: ImportEdge[];
+  dependencies: DependencyEdge[];
+  embeddings: EmbeddingRecord[];
+}
+
+export interface SymbolEntry {
+  name: string;
+  kind: string;
+  file: string;
+  line: number;
+  signature: string;
+}
+
+export interface ImportEdge {
+  from: string;
+  to: string;
+  kind: string;
+  line: number;
+}
+
+export interface DependencyEdge {
+  manifest: string;
+  package: string;
+  source: string;
+  requirement: string;
+}
+
+export interface EmbeddingRecord {
+  file: string;
+  chunkId: string;
+  textHash: string;
+  vector: number[];
+}
+
+export interface SessionMemory {
+  buildFlow: BuildFlowStep[];
+  packageManager?: string | null;
+  repoStructure: string[];
+  previousFailures: FailureRecord[];
+  reflections: ReflectionRecord[];
+  updatedAtMs: number;
+}
+
+export interface BuildFlowStep {
+  command: string;
+  purpose: string;
+}
+
+export interface FailureRecord {
+  stepId: string;
+  toolCall: string;
+  stderr: string;
+  verification: string;
+  timestampMs: number;
+}
+
+export interface ReflectionRecord {
+  failureStepId: string;
+  summary: string;
+  adjustedStrategy: string;
+  avoidRepeating: string[];
+  timestampMs: number;
+}
+
+export interface EvalReport {
+  generatedAtMs: number;
+  benchmarkRoot: string;
+  totalCases: number;
+  successRate: number;
+  retryRate: number;
+  hallucinationRate: number;
+  avgLatency: number;
+  avgToolCalls: number;
+  categories: CategoryEvalReport[];
+}
+
+export interface CategoryEvalReport {
+  category: string;
+  totalCases: number;
+  successRate: number;
+  retryRate: number;
+  hallucinationRate: number;
+  avgLatency: number;
+  avgToolCalls: number;
+}
+
+export type AgentRole = "planner" | "executor" | "critic";
+
+export interface TaskNode {
+  id: string;
+  description: string;
+  agent: AgentRole;
+  dependencies: string[];
+  tool?: string | null;
+  input: unknown;
+}
+
+export interface TaskGraph {
+  id: string;
+  nodes: TaskNode[];
+}
+
+export interface MultiAgentPlan {
+  objective: string;
+  graph: TaskGraph;
+}
+
+export interface TaskGraphStepResult {
+  nodeId: string;
+  success: boolean;
+  output: unknown;
+  latencyMs: number;
+  toolCalls: number;
+}
+
+export interface TaskGraphExecution {
+  graphId: string;
+  success: boolean;
+  waves: string[][];
+  results: TaskGraphStepResult[];
+  latencyMs: number;
+}
+
+export interface CriticReport {
+  hallucinationDetected: boolean;
+  checkedSteps: number;
+  missingEvidence: string[];
+  summary: string;
+}
+
+export type McpToolDomain = "unity" | "browser" | "git" | "filesystem" | "terminal";
+
+export interface McpToolDescriptor {
+  name: string;
+  domain: McpToolDomain;
+  description: string;
+  permissionScope: string;
+  traceable: boolean;
+  replayable: boolean;
+  inputSchema: unknown;
+}
+
+export interface McpReplayRef {
+  taskId: string;
+  stepId: string;
+}
+
+export interface McpToolCall {
+  id: string;
+  taskId: string;
+  tool: string;
+  arguments: unknown;
+  replay?: McpReplayRef | null;
+}
+
+export interface McpToolResult {
+  id: string;
+  taskId: string;
+  tool: string;
+  success: boolean;
+  content: unknown;
+  stdout: string;
+  stderr: string;
+  latencyMs: number;
+  tracePath?: string | null;
+  replayed: boolean;
+}
+
 export interface GitFileEntry {
   path: string;
   status: string;
@@ -464,6 +636,54 @@ export function runCommand(
     timeoutMs,
     workspace,
   });
+}
+
+export function buildRepositoryIndex(workspace?: string): Promise<RepositoryIndex> {
+  return invoke<RepositoryIndex>("build_repository_index", { workspace });
+}
+
+export function loadSessionMemory(workspace?: string): Promise<SessionMemory> {
+  return invoke<SessionMemory>("load_session_memory", { workspace });
+}
+
+export function recordSessionFailure(
+  stepId: string,
+  toolCall: string,
+  stderr: string,
+  verification: string,
+  workspace?: string,
+): Promise<ReflectionRecord> {
+  return invoke<ReflectionRecord>("record_session_failure", {
+    stepId,
+    toolCall,
+    stderr,
+    verification,
+    workspace,
+  });
+}
+
+export function runEvalHarness(workspace?: string): Promise<EvalReport> {
+  return invoke<EvalReport>("run_eval_harness", { workspace });
+}
+
+export function createMultiAgentPlan(objective: string): Promise<MultiAgentPlan> {
+  return invoke<MultiAgentPlan>("create_multi_agent_plan", { objective });
+}
+
+export function listMcpTools(): Promise<McpToolDescriptor[]> {
+  return invoke<McpToolDescriptor[]>("list_mcp_tools");
+}
+
+export function callMcpTool(call: McpToolCall, workspace?: string): Promise<McpToolResult> {
+  return invoke<McpToolResult>("call_mcp_tool", { call, workspace });
+}
+
+export function executeTaskGraph(graph: TaskGraph, workspace?: string): Promise<TaskGraphExecution> {
+  return invoke<TaskGraphExecution>("execute_task_graph", { graph, workspace });
+}
+
+export function reviewTaskGraphExecution(execution: TaskGraphExecution): Promise<CriticReport> {
+  return invoke<CriticReport>("review_task_graph_execution", { execution });
 }
 
 export function getGitStatus(workspace?: string, includeStats?: boolean): Promise<GitStatus> {

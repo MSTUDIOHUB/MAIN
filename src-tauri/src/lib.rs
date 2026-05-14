@@ -21,8 +21,16 @@ use tauri_plugin_opener::OpenerExt;
 use tiktoken_rs::{cl100k_base, CoreBPE};
 use walkdir::WalkDir;
 
+pub mod critic;
+pub mod eval;
+pub mod executor;
 pub mod harness;
+pub mod indexer;
+pub mod mcp;
+pub mod memory;
+pub mod planner;
 pub mod runtime;
+pub mod task_graph;
 
 // region: 全局常量与状态
 
@@ -1948,6 +1956,102 @@ fn validate_pty_input(
 
     *pending_command = next_pending;
     Ok(())
+}
+
+#[tauri::command]
+async fn build_repository_index(
+    state: State<'_, WorkspaceState>,
+    workspace: Option<String>,
+) -> Result<indexer::RepositoryIndex, String> {
+    let workspace = resolve_workspace_root(&state, workspace)?;
+    let (index, _) = indexer::RepositoryIndexer::new(&workspace)
+        .build_and_store()
+        .await?;
+    Ok(index)
+}
+
+#[tauri::command]
+async fn load_session_memory(
+    state: State<'_, WorkspaceState>,
+    workspace: Option<String>,
+) -> Result<memory::SessionMemory, String> {
+    let workspace = resolve_workspace_root(&state, workspace)?;
+    let store = memory::SessionMemoryStore::for_workspace(&workspace);
+    let memory = store.profile_repository(&workspace).await?;
+    Ok(memory)
+}
+
+#[tauri::command]
+async fn record_session_failure(
+    state: State<'_, WorkspaceState>,
+    step_id: String,
+    tool_call: String,
+    stderr: String,
+    verification: String,
+    workspace: Option<String>,
+) -> Result<memory::ReflectionRecord, String> {
+    let workspace = resolve_workspace_root(&state, workspace)?;
+    let store = memory::SessionMemoryStore::for_workspace(&workspace);
+    let (_, reflection) = store
+        .record_failure(memory::failure_record(
+            step_id,
+            tool_call,
+            stderr,
+            verification,
+        ))
+        .await?;
+    Ok(reflection)
+}
+
+#[tauri::command]
+fn run_eval_harness(
+    state: State<WorkspaceState>,
+    workspace: Option<String>,
+) -> Result<eval::EvalReport, String> {
+    let workspace = resolve_workspace_root(&state, workspace)?;
+    eval::EvalHarness::for_workspace(&workspace).run()
+}
+
+#[tauri::command]
+fn create_multi_agent_plan(objective: String) -> Result<planner::MultiAgentPlan, String> {
+    Ok(planner::PlannerAgent::new().plan(objective))
+}
+
+#[tauri::command]
+fn list_mcp_tools() -> Result<Vec<mcp::McpToolDescriptor>, String> {
+    Ok(mcp::McpRuntimeMesh::list_tools())
+}
+
+#[tauri::command]
+async fn call_mcp_tool(
+    state: State<'_, WorkspaceState>,
+    call: mcp::McpToolCall,
+    workspace: Option<String>,
+) -> Result<mcp::McpToolResult, String> {
+    let workspace = resolve_workspace_root(&state, workspace)?;
+    let mesh = mcp::McpRuntimeMesh::for_workspace(&workspace)?;
+    mesh.call_tool(call).await
+}
+
+#[tauri::command]
+async fn execute_task_graph(
+    state: State<'_, WorkspaceState>,
+    graph: task_graph::TaskGraph,
+    workspace: Option<String>,
+) -> Result<task_graph::TaskGraphExecution, String> {
+    let workspace = resolve_workspace_root(&state, workspace)?;
+    let mesh = mcp::McpRuntimeMesh::for_workspace(&workspace)?;
+    let runner = mcp::McpTaskGraphRunner::new(&mesh, graph.id.clone());
+    executor::ExecutorAgent::new()
+        .execute(&graph, &runner)
+        .await
+}
+
+#[tauri::command]
+fn review_task_graph_execution(
+    execution: task_graph::TaskGraphExecution,
+) -> Result<critic::CriticReport, String> {
+    Ok(critic::CriticAgent::new().review_execution(&execution))
 }
 
 fn run_git_process(
@@ -7933,6 +8037,15 @@ pub fn run() {
             clear_pty_buffer,
             get_pty_status,
             run_command,
+            build_repository_index,
+            load_session_memory,
+            record_session_failure,
+            run_eval_harness,
+            create_multi_agent_plan,
+            list_mcp_tools,
+            call_mcp_tool,
+            execute_task_graph,
+            review_task_graph_execution,
             get_git_status,
             get_git_file_list,
             get_git_diff,

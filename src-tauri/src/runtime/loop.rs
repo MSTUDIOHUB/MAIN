@@ -232,7 +232,10 @@ mod tests {
     use crate::runtime::event_bus::EventBus;
     use crate::runtime::retry::RetryPolicy;
     use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEMP_TRACE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     struct VecPlanner {
         steps: Vec<RuntimeStep>,
@@ -335,7 +338,11 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("main-runtime-loop-{unique}"));
+        let counter = TEMP_TRACE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "main-runtime-loop-{}-{unique}-{counter}",
+            std::process::id()
+        ));
         fs::create_dir_all(&root).unwrap();
         root
     }
