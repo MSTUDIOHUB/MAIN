@@ -1025,8 +1025,9 @@ export function findDroppedPlanTasks(previousTasks: PlanTask[], parsedTasks: Pla
 }
 
 const PLAN_ARTIFACT_NOISE_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
-  { pattern: /自动生成的兜底草稿|Auto-generated fallback draft|MAIN\s+将可用输出收束|condensed the usable output/i, reason: "fallback_notice" },
-  { pattern: /Repeated read-only tool call skipped|Duplicate skip count|FILE_UNCHANGED_STUB|already called with identical arguments/i, reason: "tool_log" },
+  { pattern: /自动生成的兜底草稿|兜底设计|Auto-generated fallback draft|fallback plan|MAIN\s+将可用输出收束|condensed the usable output/i, reason: "fallback_notice" },
+  { pattern: /Repeated read-only tool call skipped|Duplicate skip count|FILE_UNCHANGED_STUB|already called with identical arguments|MAIN TOOL FEEDBACK|tool call id|status=observed|hash=[a-z0-9]+|excerpt=/i, reason: "tool_log" },
+  { pattern: /ContextMemoryState|ContextState|\[System:\s*Context|Latest user request:|plan_empty_response_checkpoint|上一条\s*Plan\s*回复是空的|PLAN_REPEAT_READ_LIMIT/i, reason: "control_context" },
   { pattern: /后台思考已折叠|thinking process|chain of thought|<\/thinking>|<\/analysis>|让我(?:先|再)|但是等等|我认为/i, reason: "reasoning_leak" },
   { pattern: /回复被截断|maximum token|max token|finish_reason.*length/i, reason: "truncation_log" },
   { pattern: /\busing\s+System\s*;|namespace\s+[A-Za-z0-9_.]+\s*\{|public\s+(?:class|enum|struct|interface)\s+[A-Za-z0-9_]+/i, reason: "raw_source_code" },
@@ -1073,6 +1074,39 @@ export function validatePlanArtifactContent(
 
   if (!hasMeaningfulPlanSections(raw, kind)) {
     return { ok: false, reason: "missing_plan_sections" };
+  }
+
+  return { ok: true };
+}
+
+export function validateActionableDesignArtifact(
+  content: string,
+): PlanArtifactValidationResult {
+  const base = validatePlanArtifactContent(content, "design");
+  if (!base.ok) return base;
+
+  const raw = String(content || "").trim();
+  if (/(?:最小可用闭环|smallest useful workflow|Use the inspected context as the source of truth|基于当前可用的只读证据|available read-only evidence)/i.test(raw)) {
+    return { ok: false, reason: "generic_fallback_design" };
+  }
+  const hasTargetOrData =
+    /(?:\.tsx?|\.jsx?|\.swift|\.py|\.rs|\.go|\.json|\.csv|\.tsv|\.xlsx|\.md|\/[A-Za-z0-9_.-]+|\\[A-Za-z0-9_.-]+)/i.test(raw) ||
+    /(?:CSV|TSV|XLSX|字段|列|指标|数据|表格|column|metric|dataset|table)/i.test(raw);
+  const hasExecutionOrder = /(?:执行顺序|实施步骤|Execution Order|Implementation Steps|Plan of Work|\b1\.\s+)/i.test(raw);
+  const hasValidation = /(?:验证方式|验收|测试|构建|Validation|Acceptance|Test|Build)/i.test(raw);
+  const hasRiskOrQuestion = /(?:风险|取舍|开放问题|不确定|Risk|Tradeoff|Open Question|Unknown)/i.test(raw);
+  const hasConcreteUserGoal = /(?:用户目标|目标|User Goal|Goal)/i.test(raw) && !/(?:最小可用闭环|smallest useful workflow).{0,80}(?:默认|first version)/i.test(raw);
+
+  const signalCount = [
+    hasTargetOrData,
+    hasExecutionOrder,
+    hasValidation,
+    hasRiskOrQuestion,
+    hasConcreteUserGoal,
+  ].filter(Boolean).length;
+
+  if (signalCount < 4) {
+    return { ok: false, reason: "not_actionable_design" };
   }
 
   return { ok: true };

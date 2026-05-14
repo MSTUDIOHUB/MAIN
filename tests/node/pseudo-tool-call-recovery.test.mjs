@@ -58,14 +58,17 @@ function loadTranspiledModuleSync(sourcePath) {
 
 const {
   buildPseudoToolCallRecoveryPrompt,
+  extractPseudoToolCallName,
   looksLikeNonStandardToolCallFormat,
   looksLikePseudoToolCallPlaceholder,
+  recoverPseudoToolCallFromContext,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"));
 
 test("detects bracketed pseudo tool call placeholders", () => {
   assert.equal(looksLikePseudoToolCallPlaceholder("[Tool call: read_file]"), true);
   assert.equal(looksLikePseudoToolCallPlaceholder("Tool call: read_file"), true);
   assert.equal(looksLikePseudoToolCallPlaceholder("工具调用: read_file"), true);
+  assert.equal(extractPseudoToolCallName("[Tool call: read_file]"), "read_file");
 });
 
 test("does not treat real XML tool calls as pseudo placeholders", () => {
@@ -94,4 +97,33 @@ test("pseudo tool recovery prompt requires XML tool_use with parameters", () => 
   assert.match(prompt, /<tool_use>/);
   assert.match(prompt, /<parameter name="path">/);
   assert.match(prompt, /不要再输出 `\[Tool call: \.\.\.\]`、`<tool_code>/);
+});
+
+test("recovers pseudo read_file into tabular analysis for a unique @ CSV", () => {
+  const recovered = recoverPseudoToolCallFromContext({
+    text: "[Tool call: read_file]",
+    availableToolNames: ["read_file", "analyze_tabular_document"],
+    mentionedPaths: ["/Users/michael/Desktop/DataFiles/orders.csv"],
+    workflowMode: "plan",
+    turnIntent: "plan",
+  });
+
+  assert.equal(recovered.call?.name, "analyze_tabular_document");
+  assert.deepEqual(JSON.parse(recovered.call?.arguments || "{}"), {
+    path: "/Users/michael/Desktop/DataFiles/orders.csv",
+  });
+  assert.equal(recovered.reason, "unique_tabular_mention");
+});
+
+test("does not recover pseudo tools when required parameters are ambiguous", () => {
+  const recovered = recoverPseudoToolCallFromContext({
+    text: "[Tool call: query_tabular_document]",
+    availableToolNames: ["query_tabular_document"],
+    mentionedPaths: ["/tmp/a.csv", "/tmp/b.csv"],
+    workflowMode: "plan",
+    turnIntent: "plan",
+  });
+
+  assert.equal(recovered.call, null);
+  assert.equal(recovered.reason, "ambiguous_mentioned_paths");
 });

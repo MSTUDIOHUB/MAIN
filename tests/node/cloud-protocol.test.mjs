@@ -91,6 +91,48 @@ const {
   parseCloudCustomHeaders,
 } = await loadCloudProtocolModule();
 
+function loadOrchestratorModule() {
+  const sourcePath = path.join(workspaceRoot, "src/lib/orchestrator.ts");
+  const source = require("node:fs").readFileSync(sourcePath, "utf8");
+  const transpiled = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2020,
+    },
+    fileName: sourcePath,
+  }).outputText;
+  const module = { exports: {} };
+  const localRequire = createRequire(sourcePath);
+  const runtimeRequire = (specifier) => {
+    if (specifier === "@tauri-apps/api/core") return { invoke: async () => "" };
+    if (specifier === "@tauri-apps/api/event") return { listen: async () => () => {} };
+    if (specifier.startsWith(".")) {
+      const basePath = path.resolve(path.dirname(sourcePath), specifier);
+      for (const candidate of [basePath, `${basePath}.ts`, `${basePath}.tsx`, path.join(basePath, "index.ts")]) {
+        if (!require("node:fs").existsSync(candidate)) continue;
+        if (candidate.endsWith(".ts") || candidate.endsWith(".tsx")) {
+          const nestedSource = require("node:fs").readFileSync(candidate, "utf8");
+          const nestedTranspiled = ts.transpileModule(nestedSource, {
+            compilerOptions: {
+              module: ts.ModuleKind.CommonJS,
+              target: ts.ScriptTarget.ES2020,
+            },
+            fileName: candidate,
+          }).outputText;
+          const nestedModule = { exports: {} };
+          new Function("exports", "module", "require", nestedTranspiled)(nestedModule.exports, nestedModule, runtimeRequire);
+          return nestedModule.exports;
+        }
+      }
+    }
+    return localRequire(specifier);
+  };
+  new Function("exports", "module", "require", transpiled)(module.exports, module, runtimeRequire);
+  return module.exports;
+}
+
+const { resolveModelProtocolProfile } = loadOrchestratorModule();
+
 test("anthropic request body lifts system prompts and converts native tools/tool results", () => {
   const body = buildAnthropicRequestBody({
     messages: [
@@ -390,6 +432,38 @@ test("cloud tool protocol and model profile helpers normalize provider behavior"
   assert.equal(getModelInstructionProfile({ protocol: "openai", model: "qwen3-coder" }).reasoning, "tagged");
   assert.equal(getModelInstructionProfile({ protocol: "openai", model: "kimi-k2" }).toolProtocolPreference, "xml");
   assert.equal(getModelInstructionProfile({ protocol: "gemini", model: "gemini-2.5-pro" }).toolProtocolPreference, "xml");
+});
+
+test("model protocol profile covers local and cloud providers", () => {
+  assert.equal(resolveModelProtocolProfile({
+    activeProfile: "local",
+    provider: "Ollama",
+    model: "qwen3",
+    configuredToolProtocol: "auto",
+  }).toolProtocol, "xml");
+
+  assert.equal(resolveModelProtocolProfile({
+    activeProfile: "local",
+    provider: "OMLX",
+    model: "mlx-qwen",
+    configuredToolProtocol: "auto",
+  }).toolProtocol, "auto");
+
+  assert.equal(resolveModelProtocolProfile({
+    activeProfile: "cloud",
+    provider: "OpenAI",
+    model: "gpt-5.4",
+    protocol: "openai",
+    configuredToolProtocol: "auto",
+  }).toolProtocol, "auto");
+
+  assert.equal(resolveModelProtocolProfile({
+    activeProfile: "cloud",
+    provider: "Gemini",
+    model: "gemini-2.5-pro",
+    protocol: "gemini",
+    configuredToolProtocol: "auto",
+  }).toolProtocol, "xml");
 });
 
 test("gemini helpers build native generateContent requests and extract text", () => {

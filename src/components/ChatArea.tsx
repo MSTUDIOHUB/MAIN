@@ -78,6 +78,7 @@ function UserContextPillRow({
         const isMention = item.kind === "mention";
         const canPreview = isImage && !!item.previewDataUrl;
         const label = item.label || (language === "en" ? `Image ${index + 1}` : `截图 ${index + 1}`);
+        const displayLabel = isMention ? String(label).replace(/^@\s*/, "") : label;
         const statusTitle = item.status === "failed"
           ? language === "en" ? "Read failed" : "读取失败"
           : item.path || label;
@@ -96,7 +97,7 @@ function UserContextPillRow({
             ) : (
               <IconFile className="h-3.5 w-3.5" />
             )}
-            <span className="max-w-[180px] truncate">{isMention ? `@ ${label}` : label}</span>
+            <span className="max-w-[180px] truncate">{displayLabel}</span>
             {item.status === "failed" && (
               <span className="text-[#fbbf24]">{language === "en" ? "failed" : "失败"}</span>
             )}
@@ -780,7 +781,21 @@ function getReadContextToolLabel(toolName: string, language: "zh" | "en") {
   return getToolPresentationLabel(toolName, language);
 }
 
-function buildBlockRenderItems(blocks: any[], includeUser = true, enableCompletedToolGrouping = false) {
+function buildBlockRenderItems(
+  blocks: any[],
+  includeUser = true,
+  enableCompletedToolGrouping: boolean | {
+    enabled?: boolean;
+    includeDiff?: boolean;
+    includeReadContextTools?: boolean;
+    minGroupSize?: number;
+  } = false,
+) {
+  const completedToolGroupingConfig =
+    typeof enableCompletedToolGrouping === "object"
+      ? enableCompletedToolGrouping
+      : { enabled: enableCompletedToolGrouping };
+  const shouldGroupCompletedTools = completedToolGroupingConfig.enabled === true;
   const items: Array<
     | { kind: "block"; block: any; index: number }
     | { kind: "readContextGroup"; blocks: any[]; index: number }
@@ -788,10 +803,12 @@ function buildBlockRenderItems(blocks: any[], includeUser = true, enableComplete
   > = [];
   let activeReadContextGroup: { kind: "readContextGroup"; blocks: any[]; index: number } | null = null;
   const completedToolGroupRangesByStart = new Map(
-    enableCompletedToolGrouping
+    shouldGroupCompletedTools
       ? buildCompletedToolGroupRanges({
           blocks,
-          excludedToolNames: READ_CONTEXT_TOOL_NAMES,
+          excludedToolNames: completedToolGroupingConfig.includeReadContextTools ? undefined : READ_CONTEXT_TOOL_NAMES,
+          includeDiff: completedToolGroupingConfig.includeDiff,
+          minGroupSize: completedToolGroupingConfig.minGroupSize,
         }).map((range) => [range.startIndex, range])
       : [],
   );
@@ -871,6 +888,40 @@ function buildToolExecutionSummary(blocks: any[], language: "zh" | "en") {
   if (counts.other) parts.push(`${counts.other} tool call(s)`);
   if (counts.failed) parts.push(`${counts.failed} failed request(s)`);
   return parts.length > 0 ? `This turn completed ${parts.join(", ")}.` : "This turn is collapsed. The conclusion is kept here first.";
+}
+
+function shouldGroupPlanExecutionTools(input: {
+  turnIntent: string;
+  isPlanTurn: boolean;
+  isPlanApproved: boolean;
+  planStage: string;
+  turnStatus?: string;
+  isPlanExecutionVisible: boolean;
+}) {
+  if (input.turnIntent === "studio_workflow") {
+    return {
+      enabled: true,
+      includeDiff: false,
+      includeReadContextTools: false,
+      minGroupSize: 2,
+    };
+  }
+  const isApprovedPlanExecution =
+    input.isPlanTurn &&
+    (
+      input.isPlanApproved ||
+      input.planStage === "executing" ||
+      input.isPlanExecutionVisible ||
+      input.turnStatus === "executing" ||
+      input.turnStatus === "stopped_no_action" ||
+      input.turnStatus === "error"
+    );
+  return {
+    enabled: isApprovedPlanExecution,
+    includeDiff: isApprovedPlanExecution,
+    includeReadContextTools: isApprovedPlanExecution,
+    minGroupSize: isApprovedPlanExecution ? 1 : 2,
+  };
 }
 
 function getActiveTurnActivity(blocks: any[], turnStatus: string, language: "zh" | "en") {
@@ -2098,7 +2149,6 @@ export default function ChatArea({
       ? (language === "en" ? turnIntentPolicy.label.en : turnIntentPolicy.label.zh)
       : (language === "zh" ? "任务" : "Task");
     const isPlanTurn = turnIntent === "plan";
-    const enableCompletedToolGrouping = turnIntent === "studio_workflow";
     const turnProgressSnapshot =
       planExecutionProgressSnapshot?.turnId === turn.id
         ? planExecutionProgressSnapshot
@@ -2116,6 +2166,14 @@ export default function ChatArea({
         turn.status === "stopped_no_action" ||
         turn.status === "error"
       );
+    const enableCompletedToolGrouping = shouldGroupPlanExecutionTools({
+      turnIntent,
+      isPlanTurn,
+      isPlanApproved,
+      planStage,
+      turnStatus: turn.status,
+      isPlanExecutionVisible,
+    });
     const forceExpandedTurn =
       turn.status === "awaiting_input" ||
       turn.status === "awaiting_approval";

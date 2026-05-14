@@ -786,7 +786,7 @@ export function trimMessagesToContextDetailed(
   const removedCount = droppedMessages.length;
 
   const totalInputTokens = inputBudget - remaining;
-  if (removedCount > 0) {
+  if (removedCount > 0 && typeof window !== "undefined") {
     console.log(
       `[contextTrim] Middle-out trim: dropped ${removedCount} message(s). ` +
       `Input: ~${totalInputTokens} tokens, Output budget: ${reservedForOutput}, ` +

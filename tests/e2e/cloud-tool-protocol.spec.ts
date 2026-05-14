@@ -16,6 +16,7 @@ test.beforeEach(async ({ page }) => {
     const listDirectoryCalls: string[] = [];
     const queryTabularCalls: Array<{ path: string; selectColumns?: unknown; limit?: unknown }> = [];
     const ingestedAttachments: Array<{ sessionKey: string; sourcePath: string }> = [];
+    let localPlanClosureRequests = 0;
 
     (window as any).__CLOUD_TOOL_PROTOCOL_TEST__ = {
       requests,
@@ -28,6 +29,9 @@ test.beforeEach(async ({ page }) => {
       },
       get pseudoToolRecoveryRequests() {
         return pseudoToolRecoveryRequests;
+      },
+      get localPlanClosureRequests() {
+        return localPlanClosureRequests;
       },
     };
 
@@ -198,7 +202,10 @@ test.beforeEach(async ({ page }) => {
             "- [ ] 运行计划执行验证命令 `npm run test:workflow-assets` — 证据: cmd:npm run test:workflow-assets",
           ].join("\n"),
         };
-        if (scenario === "existing-plan-folder-execute" && Object.prototype.hasOwnProperty.call(planFiles, path)) {
+        if (
+          (scenario === "existing-plan-folder-execute" || scenario === "approved-plan-execution-no-tool") &&
+          Object.prototype.hasOwnProperty.call(planFiles, path)
+        ) {
           readFileCalls.push(path);
           return planFiles[path];
         }
@@ -471,6 +478,12 @@ test.beforeEach(async ({ page }) => {
           });
         }
 
+        if (scenario === "approved-plan-execution-no-tool") {
+          return JSON.stringify({
+            output_text: "继续执行下一步。",
+          });
+        }
+
         if (scenario === "execute-max-iterations-checkpoint") {
           return JSON.stringify({
             output_text: [
@@ -522,6 +535,159 @@ test.beforeEach(async ({ page }) => {
       }
 
       return null;
+    };
+
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const scenario = new URL(window.location.href).searchParams.get("e2eScenario");
+      const url = typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.toString()
+          : input.url;
+      if (
+        scenario !== "local-plan-slow-first-token" &&
+        scenario !== "plan-closure-guard-empty"
+      ) {
+        return nativeFetch(input, init);
+      }
+      if (!url.includes("/api/chat")) {
+        return nativeFetch(input, init);
+      }
+
+      const encoder = new TextEncoder();
+      if (scenario === "plan-closure-guard-empty") {
+        localPlanClosureRequests += 1;
+        const bodyText = typeof init?.body === "string" ? init.body : "";
+        const hasDesignClosurePrompt =
+          bodyText.includes("生成可审阅、可执行的正式设计方案") ||
+          bodyText.includes("Generate a reviewable, actionable design now");
+        const designContent = [
+          "# Design",
+          "",
+          "## 用户目标与约束",
+          "- 目标：基于 orders.csv 设计课程销售数据分析自动化流程。",
+          "- 约束：批准前只写 `.MAIN/plans/design.md`，不生成 tasks.md，不修改源码或业务数据。",
+          "",
+          "## 当前真实发现",
+          "- 已查询 orders.csv 的课程名称列，确认数据源可以通过表格工具读取。",
+          "- 关键字段包含课程名称，后续设计围绕课程、订单金额、购买时间等指标口径展开。",
+          "",
+          "## 拟定方案",
+          "- 导入 CSV 后先识别字段、缺失值和金额/时间格式。",
+          "- 生成课程维度销售排行、趋势摘要和异常订单提示。",
+          "- 在 Mac 轻量界面中提供文件选择、概览卡片、表格明细和导出入口。",
+          "",
+          "## 影响文件与接口",
+          "- 计划文件：`.MAIN/plans/design.md`。",
+          "- 执行阶段再确定 Swift/前端源码文件和 CSV 读取接口。",
+          "",
+          "## 执行顺序",
+          "1. 明确 CSV 字段映射和指标口径。",
+          "2. 实现 CSV 解析与字段校验。",
+          "3. 实现课程销售聚合和趋势计算。",
+          "4. 完成 Mac 轻量界面和导出验证。",
+          "",
+          "## 数据流与控制流",
+          "- 数据流：用户选择 orders.csv -> 字段校验 -> 聚合计算 -> 图表/表格展示 -> 导出。",
+          "- 控制流：设计审批 -> 生成 tasks.md -> 按任务实现 -> 运行验证。",
+          "",
+          "## 风险取舍",
+          "- CSV 字段命名可能变化，需要执行阶段做字段别名兼容。",
+          "- 第一版优先本地轻量分析，不引入数据库同步。",
+          "",
+          "## 验证方式",
+          "- 使用 orders.csv 样本核对课程销售聚合结果。",
+          "- 验证空文件、缺字段、金额格式异常的提示。",
+          "",
+          "## 开放问题",
+          "- 是否需要固定导出 Excel，还是先导出 CSV/Markdown 摘要。",
+        ].join("\n");
+        const content = queryTabularCalls.length === 0
+          ? [
+              "<tool_use>",
+              "<tool>query_tabular_document</tool>",
+              "<parameter name=\"path\">orders.csv</parameter>",
+              "<parameter name=\"select_columns\">课程名称</parameter>",
+              "<parameter name=\"limit\">20</parameter>",
+              "</tool_use>",
+            ].join("\n")
+          : hasDesignClosurePrompt
+            ? [
+                "<tool_use>",
+                "<tool>write_file</tool>",
+                "<parameter name=\"path\">.MAIN/plans/design.md</parameter>",
+                `<parameter name=\"content\">${designContent}</parameter>`,
+                "</tool_use>",
+              ].join("\n")
+            : "";
+
+        return new Response(new ReadableStream({
+          start(controller) {
+            controller.enqueue(encoder.encode(`${JSON.stringify({ message: { content }, done: false })}\n`));
+            controller.enqueue(encoder.encode(`${JSON.stringify({ done: true })}\n`));
+            controller.close();
+          },
+        }), {
+          status: 200,
+          headers: { "Content-Type": "application/x-ndjson" },
+        });
+      }
+
+      const designText = [
+        "# Design",
+        "",
+        "## 目标与约束",
+        "- 目标：验证本地 Plan 模式慢首 token 时不会被 125 秒硬看门狗中断。",
+        "- 约束：批准前只允许写入 `.MAIN/plans/design.md`，不生成 tasks.md，也不修改项目源码。",
+        "",
+        "## 当前发现",
+        "- 本地 Ollama/Qwen 首轮可能长时间没有可见 token，但请求仍可能继续完成。",
+        "- UI 应显示等待提示，底层请求必须保持运行，直到模型返回正文或用户手动停止。",
+        "",
+        "## 方案",
+        "- 本地 Plan+xml 请求关闭 no-visible-token hard timeout，只保留 120 秒 UI 提示。",
+        "- 云端请求继续保留 hard timeout，防止网关连接长期挂死。",
+        "",
+        "## 影响文件与接口",
+        "- 计划文件：`.MAIN/plans/design.md`。",
+        "- 运行接口：不改变工具 schema，只改变本地 Plan 请求的 watchdog 策略。",
+        "",
+        "## 执行顺序",
+        "1. 判断 activeProfile 是否为 local。",
+        "2. local Plan+xml 只显示等待提示，不 abort 请求。",
+        "3. 模型返回设计正文后自动 materialize 为 design.md。",
+        "",
+        "## 数据流与验证",
+        "- 数据流：用户 Plan 请求 -> 本地模型慢首 token -> UI notice -> 模型正文 -> design.md。",
+        "- 验证：日志不出现 `STREAM_NO_VISIBLE_TOKEN_TIMEOUT` 或 `plan_stage_waiting_for_design`。",
+        "",
+        "## 风险与后续确认",
+        "- 风险：本地模型如果永久无响应，需要用户手动停止。",
+        "- 后续确认：保留停止按钮和状态提示，避免用户误以为应用卡死。",
+      ].join("\n");
+
+      return new Response(new ReadableStream({
+        start(controller) {
+          const abort = () => {
+            controller.error(new DOMException("Aborted", "AbortError"));
+          };
+          if (init?.signal?.aborted) {
+            abort();
+            return;
+          }
+          init?.signal?.addEventListener("abort", abort, { once: true });
+          window.setTimeout(() => {
+            if (init?.signal?.aborted) return;
+            controller.enqueue(encoder.encode(`${JSON.stringify({ message: { content: designText }, done: false })}\n`));
+            controller.enqueue(encoder.encode(`${JSON.stringify({ done: true })}\n`));
+            controller.close();
+          }, 130_000);
+        },
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/x-ndjson" },
+      });
     };
   });
 });
@@ -844,14 +1010,16 @@ test("malformed plan XML tool parameter recovers into tabular query and design a
         const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
         const logs = JSON.parse(window.localStorage.getItem("main.debugLog.v1") || "[]");
         const joinedAgentText = (snapshot?.agentTexts || []).join("\n");
+        const hasLog = (needle: string) => logs.some((entry: { source?: string; message?: string }) =>
+          String(entry.source || "").includes(needle) ||
+          String(entry.message || "").includes(needle),
+        );
         return {
           queryCalls: probe?.queryTabularCalls || [],
           planStage: snapshot?.planStage,
           planArtifactPaths: snapshot?.planArtifactPaths || [],
           hasVisibleProtocolLeak: /<\s*\/?\s*(?:tool_use|parameter)\b/i.test(joinedAgentText),
-          stoppedAsEmptyPlan: logs.some((entry: { message?: string }) =>
-            String(entry.message || "").includes("plan_empty_response_checkpoint"),
-          ),
+          stoppedAsEmptyPlan: hasLog("plan_empty_response_checkpoint"),
         };
       }),
     )
@@ -861,6 +1029,133 @@ test("malformed plan XML tool parameter recovers into tabular query and design a
       planArtifactPaths: [".MAIN/plans/design.md"],
       hasVisibleProtocolLeak: false,
       stoppedAsEmptyPlan: false,
+    });
+});
+
+test("plan closure guard prompts model to write actionable design after read-only context", async ({ page }) => {
+  await page.goto("/?e2eScenario=plan-closure-guard-empty");
+
+  const sent = await page.evaluate(() =>
+    (window as any).__CODELY_E2E__?.sendCloudMessage?.("请基于 orders.csv 生成一个数据分析自动化设计方案。"),
+  );
+  expect(sent).toBe(true);
+
+  await expect
+    .poll(async () =>
+      page.evaluate(() => {
+        const probe = (window as any).__CLOUD_TOOL_PROTOCOL_TEST__;
+        const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+        const logs = JSON.parse(window.localStorage.getItem("main.debugLog.v1") || "[]");
+        const hasLog = (needle: string) => logs.some((entry: { source?: string; message?: string }) =>
+          String(entry.source || "").includes(needle) ||
+          String(entry.message || "").includes(needle),
+        );
+        return {
+          queryCalls: probe?.queryTabularCalls || [],
+          agentStatus: snapshot?.agentStatus,
+          planStage: snapshot?.planStage,
+          planArtifactPaths: snapshot?.planArtifactPaths || [],
+          currentTurnStatus: snapshot?.currentTurnStatus,
+          hasReviewPrompt: (snapshot?.agentTexts || []).some((text: string) =>
+            text.includes("可审批计划文件") || text.includes("停在审批阶段"),
+          ),
+          hasProcessSummary: (snapshot?.thoughtTexts || []).some((text: string) =>
+            text.includes("只读探索") || text.includes("design.md"),
+          ),
+          closurePrompted: hasLog("plan_design_closure_prompt"),
+          reviewReady: hasLog("plan_design_review_ready_after_tool"),
+          fallbackMaterialized: hasLog("plan_closure_artifact_materialized"),
+          stoppedAsEmptyPlan: hasLog("plan_empty_response_checkpoint"),
+        };
+      }),
+    )
+    .toEqual({
+      queryCalls: [{ path: "orders.csv", selectColumns: "课程名称", limit: 20 }],
+      agentStatus: "pending_review",
+      planStage: "design",
+      planArtifactPaths: [".MAIN/plans/design.md"],
+      currentTurnStatus: "awaiting_approval",
+      hasReviewPrompt: true,
+      hasProcessSummary: true,
+      closurePrompted: true,
+      reviewReady: true,
+      fallbackMaterialized: false,
+      stoppedAsEmptyPlan: false,
+    });
+});
+
+test("local plan slow first token shows notice without hard-stopping before design", async ({ page }) => {
+  await page.clock.install({ time: new Date("2026-05-13T09:00:00Z") });
+  await page.goto("/?e2eScenario=local-plan-slow-first-token");
+
+  const sent = await page.evaluate(() =>
+    (window as any).__CODELY_E2E__?.sendCloudMessage?.("请为慢首 token 的本地模型生成一个可审批设计方案。"),
+  );
+  expect(sent).toBe(true);
+
+  await expect
+    .poll(async () =>
+      page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().agentStatus ?? null),
+    )
+    .toBe("running");
+
+  await page.clock.fastForward(121_000);
+
+  await expect
+    .poll(async () =>
+      page.evaluate(() => {
+        const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+        const logs = JSON.parse(window.localStorage.getItem("main.debugLog.v1") || "[]");
+        const hasLog = (needle: string) => logs.some((entry: { source?: string; message?: string }) =>
+          String(entry.source || "").includes(needle) ||
+          String(entry.message || "").includes(needle),
+        );
+        return {
+          hasNotice: (snapshot?.systemTexts || []).some((text: string) =>
+            text.includes("模型已经较长时间没有返回可见流式内容"),
+          ),
+          noticeOnlyLogged: logs.some((entry: { source?: string }) =>
+            entry.source === "store.plan_no_visible_token_notice_only",
+          ),
+          hardStopped: hasLog("STREAM_NO_VISIBLE_TOKEN_TIMEOUT") || hasLog("plan_stage_waiting_for_design"),
+          agentStatus: snapshot?.agentStatus,
+        };
+      }),
+    )
+    .toEqual({
+      hasNotice: true,
+      noticeOnlyLogged: true,
+      hardStopped: false,
+      agentStatus: "running",
+    });
+
+  await page.clock.fastForward(10_000);
+
+  await expect
+    .poll(async () =>
+      page.evaluate(() => {
+        const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+        const logs = JSON.parse(window.localStorage.getItem("main.debugLog.v1") || "[]");
+        const hasLog = (needle: string) => logs.some((entry: { source?: string; message?: string }) =>
+          String(entry.source || "").includes(needle) ||
+          String(entry.message || "").includes(needle),
+        );
+        return {
+          planStage: snapshot?.planStage,
+          planArtifactPaths: snapshot?.planArtifactPaths || [],
+          currentTurnStatus: snapshot?.currentTurnStatus,
+          hardStopped:
+            hasLog("STREAM_NO_VISIBLE_TOKEN_TIMEOUT") ||
+            hasLog("plan_stage_waiting_for_design") ||
+            hasLog("plan_empty_response_checkpoint"),
+        };
+      }),
+    )
+    .toEqual({
+      planStage: "design",
+      planArtifactPaths: [".MAIN/plans/design.md"],
+      currentTurnStatus: "awaiting_approval",
+      hardStopped: false,
     });
 });
 
@@ -909,6 +1204,45 @@ test("existing .MAIN/plans execution hydrates approved plan and exposes execute 
       planTaskCount: 1,
       agentStatus: "pending_review",
       hasRunCommandToolBlock: true,
+    });
+});
+
+test("approved plan execution no-tool replies use execution checkpoint path", async ({ page }) => {
+  await page.goto("/?e2eScenario=approved-plan-execution-no-tool");
+
+  const sent = await page.evaluate(() =>
+    (window as any).__CODELY_E2E__?.sendCloudMessage?.("根据.MAIN/plans文件夹的内容，继续执行任务。"),
+  );
+  expect(sent).toBe(true);
+
+  await expect
+    .poll(async () =>
+      page.evaluate(() => {
+        const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+        const logs = JSON.parse(window.localStorage.getItem("main.debugLog.v1") || "[]");
+        const hasLog = (needle: string) => logs.some((entry: { source?: string; message?: string }) =>
+          String(entry.source || "").includes(needle) ||
+          String(entry.message || "").includes(needle),
+        );
+        return {
+          agentStatus: snapshot?.agentStatus,
+          planStage: snapshot?.planStage,
+          currentTurnStatus: snapshot?.currentTurnStatus,
+          hasExecutionReprompt: hasLog("plan_execution_no_tool_reprompt"),
+          stoppedGeneric: hasLog("missing_tool_reprompt_limit") || hasLog("missing_tool_loop"),
+          hasCheckpoint: (snapshot?.systemTexts || []).some((text: string) =>
+            text.includes("计划执行已暂停") || text.includes("remaining_plan_tasks_limit"),
+          ),
+        };
+      }),
+    )
+    .toEqual({
+      agentStatus: "idle",
+      planStage: "executing",
+      currentTurnStatus: "stopped_no_action",
+      hasExecutionReprompt: true,
+      stoppedGeneric: false,
+      hasCheckpoint: true,
     });
 });
 

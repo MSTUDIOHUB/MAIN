@@ -117,7 +117,13 @@ import {
   hasProviderNativeToolsDisabled,
   isProviderCompatibilityErrorMessage,
 } from "./providerCompatibility";
-import { normalizeCloudToolProtocol, normalizeLocalToolProtocol, resolveEffectiveCloudApiFormat } from "./cloudProtocol";
+import {
+  getModelInstructionProfile,
+  normalizeCloudToolProtocol,
+  normalizeLocalToolProtocol,
+  resolveEffectiveCloudApiFormat,
+  type CloudToolProtocol,
+} from "./cloudProtocol";
 import { getErrorMessage } from "./errorUtils";
 import { resolveProtocolPackageReadPath } from "./protocolPackages";
 import { resolveStudioCompatToolArgs } from "./studioCompatPathResolver";
@@ -135,6 +141,9 @@ import {
   type PlanMaxIterationsCheckpoint,
   type PlanToolActivitySummary,
 } from "./planExecutionRecovery";
+import {
+  buildPlanExecutionNoToolRecoveryPrompt,
+} from "./planExecutionNoTool";
 import { validateShellToolContract } from "./toolExecutionContract";
 import { buildExecutionDigest } from "./executionDigest";
 import {
@@ -148,7 +157,11 @@ import {
   type MainThreadItem,
 } from "./turnEvents";
 import { normalizeToolCallForExecution } from "./toolCallNormalization";
-import { materializePlanArtifactFromVisibleText } from "./planMaterialization";
+import {
+  composeReviewableDesignFromEvidence,
+  materializePlanArtifactFromVisibleText,
+} from "./planMaterialization";
+import { formatToolPresentation } from "./toolPresentation";
 
 // ── Spec file auto-approval helpers ────────────────────────────────
 
@@ -579,13 +592,69 @@ function resolveEffectiveToolProtocol(config: AppConfig, settings: StreamSetting
     : normalizeCloudToolProtocol(settings.toolProtocol);
 }
 
+export function resolveModelProtocolProfile(input: {
+  activeProfile?: "local" | "cloud";
+  provider?: string | null;
+  model?: string | null;
+  protocol?: string | null;
+  configuredToolProtocol?: CloudToolProtocol | null;
+  compatibilityOverride?: boolean | null;
+}): {
+  providerFamily: string;
+  toolProtocol: CloudToolProtocol;
+  reasoning: "native_hidden" | "tagged" | "none";
+  notes: string[];
+} {
+  const activeProfile = input.activeProfile === "cloud" ? "cloud" : "local";
+  const configured = input.configuredToolProtocol || "auto";
+  const provider = String(input.provider || "").trim();
+  const providerLower = provider.toLowerCase();
+  const model = String(input.model || "").trim();
+  const cloudProfile = getModelInstructionProfile({
+    protocol: input.protocol || "openai",
+    provider,
+    model,
+  });
+
+  let toolProtocol: CloudToolProtocol = configured;
+  if (activeProfile === "local") {
+    toolProtocol = normalizeLocalToolProtocol(configured === "auto" ? undefined : configured, provider);
+    if (input.compatibilityOverride === true) toolProtocol = "xml";
+    if (input.compatibilityOverride === false && toolProtocol === "xml" && providerLower.includes("omlx")) {
+      toolProtocol = "auto";
+    }
+  } else {
+    toolProtocol = normalizeCloudToolProtocol(configured);
+    if (toolProtocol === "auto") toolProtocol = cloudProfile.toolProtocolPreference;
+    if (input.compatibilityOverride === true) toolProtocol = "xml";
+    if (input.compatibilityOverride === false && toolProtocol === "xml" && cloudProfile.toolProtocolPreference !== "xml") {
+      toolProtocol = "native";
+    }
+  }
+
+  return {
+    providerFamily: activeProfile === "local" ? provider || "local" : cloudProfile.provider,
+    toolProtocol,
+    reasoning: cloudProfile.reasoning,
+    notes: cloudProfile.noiseRules,
+  };
+}
+
 function shouldUseXmlToolProtocol(
   config: AppConfig,
   settings: StreamSettings,
   messages: AgentMessage[],
   compatibilityOverride?: boolean,
 ): boolean {
-  if (resolveEffectiveToolProtocol(config, settings) === "xml") return true;
+  const profile = resolveModelProtocolProfile({
+    activeProfile: config.activeProfile,
+    provider: settings.provider,
+    model: settings.model,
+    protocol: settings.apiProtocol,
+    configuredToolProtocol: resolveEffectiveToolProtocol(config, settings),
+    compatibilityOverride,
+  });
+  if (profile.toolProtocol === "xml") return true;
   if (compatibilityOverride === true) return true;
   if (compatibilityOverride === false) return false;
   return hasProviderNativeToolsDisabled(messages);
@@ -630,6 +699,7 @@ function getToolTarget(name: string, args: Record<string, unknown>): string {
 const PROSE_CODE_DUMP_MIN_CHARS = 12_000;
 const PROSE_CODE_DUMP_LARGE_CHARS = 32_000;
 const MAX_NO_ACTION_RETRIES = 2;
+const PLAN_EXPLORATION_REPEAT_READ_LIMIT = 1;
 const EXECUTE_CONVERGENCE_PROMPT_RATIO = 0.72;
 const MAX_NO_PROGRESS_LOOP_REPEATS = 3;
 const NO_PROGRESS_EXCLUDED_TOOLS = new Set([
@@ -730,6 +800,46 @@ function buildNonActionableStopMessage(language: "zh" | "en", reason: "no_output
   }
 }
 
+function getPlanReviewArtifactLabel(
+  stage: ReturnType<OrchestratorCallbacks["getPlanStage"]>,
+  language: "zh" | "en",
+): string {
+  if (stage === "ready_to_execute") {
+    return language === "zh"
+      ? "`.MAIN/plans/design.md` 和 `.MAIN/plans/tasks.md`"
+      : "`.MAIN/plans/design.md` and `.MAIN/plans/tasks.md`";
+  }
+  if (stage === "bugfix") return "`.MAIN/plans/bugfix.md`";
+  return "`.MAIN/plans/design.md`";
+}
+
+function buildPlanReviewReadyMessage(
+  language: "zh" | "en",
+  stage: ReturnType<OrchestratorCallbacks["getPlanStage"]>,
+): string {
+  const artifact = getPlanReviewArtifactLabel(stage, language);
+  if (language === "en") {
+    return [
+      `I generated the reviewable plan artifact ${artifact} and paused here for your approval.`,
+      "Please review it in the Plan panel. If the direction, tech stack, output format, or scope is not right, reply with the adjustment; otherwise approve it to enter execution.",
+    ].join("\n\n");
+  }
+
+  return [
+    `我已经生成了可审批计划文件 ${artifact}，现在停在审批阶段。`,
+    "请在右侧计划面板审阅；如果技术栈、输出形式、范围或方案方向不对，直接回复你的调整。确认无误后再批准进入执行。",
+  ].join("\n\n");
+}
+
+function isSuccessfulPlanArtifactWriteResult(result: ToolExecutionResult): boolean {
+  return (
+    !result.isError &&
+    PLAN_ARTIFACT_MUTATION_TOOLS.has(result.name) &&
+    !!result.target &&
+    isPlanArtifactPath(result.target)
+  );
+}
+
 function buildHiddenThoughtOnlyContinuationPrompt(language: "zh" | "en", consecutiveNoToolCount: number): string {
   return language === "zh"
     ? [
@@ -823,6 +933,7 @@ export function shouldRecoverLanguageMismatchTurn(input: {
 
 const PSEUDO_TOOL_CALL_RE = /(?:^|\n)\s*(?:\[(?:Tool call|tool_call|工具调用)\s*:\s*([a-z_][a-z0-9_]*)\s*\]|(?:Tool call|tool_call|工具调用)\s*:\s*([a-z_][a-z0-9_]*))\s*$/im;
 const NON_STANDARD_TOOL_WRAPPER_RE = /<tool_code(?:\s[^>]*)?>[\s\S]*?<\/tool_code>/i;
+const TABULAR_FILE_RE = /\.(?:csv|tsv|xlsx|xls|xlsm)$/i;
 const UNITY_FALLBACK_RECOVERY_READ_ONLY_TOOL_NAMES = new Set([
   "list_directory",
   "get_project_skeleton",
@@ -841,11 +952,17 @@ const UNITY_FALLBACK_RECOVERY_READ_ONLY_TOOL_NAMES = new Set([
   "read_console",
 ]);
 
-export function looksLikePseudoToolCallPlaceholder(text: string): boolean {
+export function extractPseudoToolCallName(text: string): string | null {
   const content = String(text || "");
-  if (!content.trim()) return false;
-  if (/<tool_use>|<tool_call|<function_call/i.test(content)) return false;
-  return PSEUDO_TOOL_CALL_RE.test(content);
+  if (!content.trim()) return null;
+  if (/<tool_use>|<tool_call|<function_call/i.test(content)) return null;
+  const match = content.match(PSEUDO_TOOL_CALL_RE);
+  const name = String(match?.[1] || match?.[2] || "").trim();
+  return name || null;
+}
+
+export function looksLikePseudoToolCallPlaceholder(text: string): boolean {
+  return extractPseudoToolCallName(text) != null;
 }
 
 export function looksLikeNonStandardToolCallFormat(text: string): boolean {
@@ -878,6 +995,13 @@ export function buildPseudoToolCallRecoveryPrompt(language: "zh" | "en", workflo
       ].join("\n");
 }
 
+function buildToolProtocolDoomLoopStopMessage(language: "zh" | "en", toolName?: string | null): string {
+  const tool = toolName ? ` ${toolName}` : "";
+  return language === "zh"
+    ? `模型连续输出不可执行的伪工具调用${tool}，没有补齐正式 XML 参数。MAIN 已停止本轮以避免继续堆叠恢复提示。你可以继续当前任务，MAIN 会保留已读取的上下文；建议下一条明确指定文件路径或让 MAIN 先读取 @ 文件。`
+    : `The model repeatedly emitted a non-executable pseudo tool call${tool} without valid XML parameters. MAIN stopped this turn to avoid piling on more recovery prompts. You can continue the task; MAIN kept the context already read. For the next message, specify the file path or ask MAIN to read the @ file first.`;
+}
+
 function containsToolUseBlock(text: string): boolean {
   return /<tool_use\b/i.test(String(text || ""));
 }
@@ -892,6 +1016,161 @@ function summarizeProtocolFragmentForLog(text: string): string {
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 180);
+}
+
+function extractUserMentionedFilePathsFromMessages(messages: AgentMessage[]): string[] {
+  const paths: string[] = [];
+  const seen = new Set<string>();
+  for (const message of messages) {
+    if (message.role !== "user" || typeof message.content !== "string") continue;
+    const markerIndex = message.content.indexOf("[user_mentioned_files]");
+    if (markerIndex < 0) continue;
+    const section = message.content
+      .slice(markerIndex)
+      .split(/\n\[[a-z_]+(?:_[a-z_]+)*\]/i)[0] || "";
+    const pathRe = /^path:\s*(.+?)\s*$/gmi;
+    let match: RegExpExecArray | null;
+    while ((match = pathRe.exec(section)) !== null) {
+      const value = String(match[1] || "").trim();
+      if (!value || seen.has(value)) continue;
+      seen.add(value);
+      paths.push(value);
+    }
+  }
+  return paths;
+}
+
+function choosePseudoToolRecovery(input: {
+  pseudoToolName: string | null;
+  availableToolNames: Set<string>;
+  mentionedPaths: string[];
+  workflowMode: "chat" | "edit" | "plan";
+  turnIntent: ResolvedUserIntent;
+}): {
+  call: { id: string; name: string; arguments: string } | null;
+  requestedToolName: string | null;
+  recoveredToolName: string | null;
+  reason: string;
+  mentionedPathCount: number;
+  argumentKeys: string[];
+} {
+  const requestedToolName = String(input.pseudoToolName || "").trim();
+  if (!requestedToolName) {
+    return {
+      call: null,
+      requestedToolName: null,
+      recoveredToolName: null,
+      reason: "no_pseudo_tool_name",
+      mentionedPathCount: input.mentionedPaths.length,
+      argumentKeys: [],
+    };
+  }
+  if (!input.availableToolNames.has(requestedToolName)) {
+    return {
+      call: null,
+      requestedToolName,
+      recoveredToolName: null,
+      reason: "tool_not_available",
+      mentionedPathCount: input.mentionedPaths.length,
+      argumentKeys: [],
+    };
+  }
+
+  if (requestedToolName === "get_project_skeleton" || requestedToolName === "get_pty_status" || requestedToolName === "clear_pty_buffer") {
+    return {
+      call: {
+        id: `pseudo_recovered_${generateId()}`,
+        name: requestedToolName,
+        arguments: JSON.stringify({}),
+      },
+      requestedToolName,
+      recoveredToolName: requestedToolName,
+      reason: "no_required_arguments",
+      mentionedPathCount: input.mentionedPaths.length,
+      argumentKeys: [],
+    };
+  }
+
+  const uniqueMentionedPath = input.mentionedPaths.length === 1 ? input.mentionedPaths[0] : "";
+  if (!uniqueMentionedPath) {
+    return {
+      call: null,
+      requestedToolName,
+      recoveredToolName: null,
+      reason: input.mentionedPaths.length > 1 ? "ambiguous_mentioned_paths" : "missing_required_path",
+      mentionedPathCount: input.mentionedPaths.length,
+      argumentKeys: [],
+    };
+  }
+
+  const isTabular = TABULAR_FILE_RE.test(uniqueMentionedPath);
+  const shouldPreferTabularAnalysis =
+    requestedToolName === "read_file" &&
+    isTabular &&
+    input.availableToolNames.has("analyze_tabular_document") &&
+    (input.workflowMode === "plan" || input.turnIntent === "analyze" || input.turnIntent === "report" || input.turnIntent === "summarize");
+  const recoveredToolName = shouldPreferTabularAnalysis ? "analyze_tabular_document" : requestedToolName;
+  if (!input.availableToolNames.has(recoveredToolName)) {
+    return {
+      call: null,
+      requestedToolName,
+      recoveredToolName: null,
+      reason: "recovered_tool_not_available",
+      mentionedPathCount: input.mentionedPaths.length,
+      argumentKeys: [],
+    };
+  }
+
+  const pathOnlyTools = new Set([
+    "read_file",
+    "read_document",
+    "analyze_tabular_document",
+    "get_file_outline",
+    "list_directory",
+    "index_workspace_documents",
+  ]);
+  if (!pathOnlyTools.has(recoveredToolName)) {
+    return {
+      call: null,
+      requestedToolName,
+      recoveredToolName: null,
+      reason: "tool_requires_uninferrable_arguments",
+      mentionedPathCount: input.mentionedPaths.length,
+      argumentKeys: [],
+    };
+  }
+
+  const args = { path: uniqueMentionedPath };
+  return {
+    call: {
+      id: `pseudo_recovered_${generateId()}`,
+      name: recoveredToolName,
+      arguments: JSON.stringify(args),
+    },
+    requestedToolName,
+    recoveredToolName,
+    reason: shouldPreferTabularAnalysis ? "unique_tabular_mention" : "unique_mentioned_path",
+    mentionedPathCount: input.mentionedPaths.length,
+    argumentKeys: Object.keys(args),
+  };
+}
+
+export function recoverPseudoToolCallFromContext(input: {
+  text: string;
+  availableToolNames: Set<string> | string[];
+  mentionedPaths: string[];
+  workflowMode: "chat" | "edit" | "plan";
+  turnIntent: ResolvedUserIntent;
+}): ReturnType<typeof choosePseudoToolRecovery> {
+  return choosePseudoToolRecovery({
+    pseudoToolName: extractPseudoToolCallName(input.text),
+    availableToolNames: input.availableToolNames instanceof Set
+      ? input.availableToolNames
+      : new Set(input.availableToolNames),
+    mentionedPaths: input.mentionedPaths,
+    workflowMode: input.workflowMode,
+    turnIntent: input.turnIntent,
+  });
 }
 
 function buildMalformedToolUseRecoveryPrompt(language: "zh" | "en"): string {
@@ -1142,6 +1421,105 @@ function collectFallbackToolHighlights(callbacks: OrchestratorCallbacks, attempt
   return highlights.slice(0, 10);
 }
 
+function collectContextMemoryTexts(
+  entries: Array<{ text?: string } | null | undefined> | undefined,
+  maxItems: number,
+): string[] {
+  const result: string[] = [];
+  const seen = new Set<string>();
+  for (const entry of entries || []) {
+    const text = stripControlPromptForPlanFallback(entry?.text || "");
+    if (!text) continue;
+    const key = text.toLowerCase().replace(/\s+/g, " ");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(text);
+    if (result.length >= maxItems) break;
+  }
+  return result;
+}
+
+function collectPlanClosureMaterializationInput(
+  callbacks: OrchestratorCallbacks,
+  recentActivity: PlanToolActivitySummary[] = [],
+  attemptedTargets: string[] = [],
+): {
+  userGoal: string;
+  evidence: string[];
+  files: string[];
+  constraints: string[];
+} {
+  const memory = callbacks.getContextMemoryState?.() || null;
+  const userGoal =
+    getOriginalUserPromptForPlanFallback(callbacks) ||
+    stripControlPromptForPlanFallback(memory?.latestUserRequest?.text || "");
+  const constraints = collectContextMemoryTexts(memory?.constraints, 5);
+  const files = [
+    ...collectContextMemoryTexts(
+      (memory?.files || []).map((entry) => ({ text: entry.path || entry.text })),
+      8,
+    ),
+    ...recentActivity
+      .filter((item) => item.status === "succeeded" && item.target)
+      .map((item) => item.target),
+  ];
+
+  const evidenceFromMemory = collectContextMemoryTexts(memory?.evidence, 8);
+  const evidenceFromActivity = recentActivity
+    .filter((item) => item.status === "succeeded")
+    .map((item) => [item.name, item.target, item.detail].filter(Boolean).join("; "));
+  const fallbackHighlights = evidenceFromMemory.length > 0 || evidenceFromActivity.length > 0
+    ? []
+    : collectFallbackToolHighlights(callbacks, attemptedTargets)
+      .filter((item) => !/Repeated read-only tool call skipped|Duplicate skip count|already called with identical arguments/i.test(item));
+
+  return {
+    userGoal,
+    evidence: [...evidenceFromMemory, ...evidenceFromActivity, ...fallbackHighlights],
+    files,
+    constraints,
+  };
+}
+
+function hasSuccessfulTabularActivity(recentActivity: PlanToolActivitySummary[]): boolean {
+  return recentActivity.some((item) =>
+    item.status === "succeeded" &&
+    (item.name === "analyze_tabular_document" || item.name === "query_tabular_document")
+  );
+}
+
+function countSuccessfulPlanReadEvidence(recentActivity: PlanToolActivitySummary[]): number {
+  const evidenceTools = new Set([
+    "get_project_skeleton",
+    "list_directory",
+    "read_file",
+    "get_file_outline",
+    "read_document",
+    "analyze_tabular_document",
+    "query_tabular_document",
+    "glob_search",
+    "grep_search",
+  ]);
+  const signatures = new Set<string>();
+  for (const item of recentActivity) {
+    if (item.status !== "succeeded" || !evidenceTools.has(item.name)) continue;
+    signatures.add([item.name, item.target || "", item.detail || ""].join("|"));
+  }
+  return signatures.size;
+}
+
+function buildPlanDesignClosurePromptFromEvidence(
+  callbacks: OrchestratorCallbacks,
+  recentActivity: PlanToolActivitySummary[] = [],
+  attemptedTargets: string[] = [],
+): string {
+  const closureInput = collectPlanClosureMaterializationInput(callbacks, recentActivity, attemptedTargets);
+  return composeReviewableDesignFromEvidence({
+    ...closureInput,
+    language: callbacks.getPreferredLanguage(),
+  });
+}
+
 function collectFallbackPlanBullets(sourceText: string, fallbackPrompt: string, maxBullets = 8): string[] {
   const source = stripControlPromptForPlanFallback(sourceText)
     .replace(/[#>*_`~]/g, " ")
@@ -1333,8 +1711,76 @@ export function shouldUsePlanNoVisibleTokenWatchdog(input: {
   workflowMode: "chat" | "edit" | "plan";
   isPlanApproved: boolean;
   nativeToolCount: number;
+  activeProfile?: "local" | "cloud";
+  provider?: string | null;
+  toolProtocol?: string | null;
 }): boolean {
-  return input.workflowMode === "plan" && !input.isPlanApproved && input.nativeToolCount === 0;
+  if (input.workflowMode !== "plan" || input.isPlanApproved || input.nativeToolCount > 0) return false;
+  const toolProtocol = String(input.toolProtocol || "auto").toLowerCase();
+  const localTextToolProtocol =
+    input.activeProfile === "local" &&
+    (toolProtocol === "xml" || toolProtocol === "auto" || toolProtocol === "");
+  if (localTextToolProtocol) return false;
+  return true;
+}
+
+export function shouldAttemptPlanClosureGuard(input: {
+  workflowMode: "chat" | "edit" | "plan";
+  isPlanApproved: boolean;
+  hasReviewablePlanArtifacts: boolean;
+  evidenceCount: number;
+  consecutiveEmptyResponseCount?: number;
+  usedPlanRecoveryPrompt?: boolean;
+  rejectedVisibleChars?: number;
+  toolCallCount?: number;
+  replyOptionCount?: number;
+}): boolean {
+  if (input.workflowMode !== "plan" || input.isPlanApproved || input.hasReviewablePlanArtifacts) return false;
+  if (input.evidenceCount <= 0) return false;
+  if ((input.toolCallCount ?? 0) > 0 || (input.replyOptionCount ?? 0) > 0) return false;
+  if ((input.consecutiveEmptyResponseCount ?? 0) >= 2) return true;
+  if (input.usedPlanRecoveryPrompt) return true;
+  return typeof input.rejectedVisibleChars === "number" && input.rejectedVisibleChars > 0 && input.rejectedVisibleChars < 280;
+}
+
+export function buildPlanExplorationBudget(input: {
+  workflowMode: "chat" | "edit" | "plan";
+  isPlanApproved: boolean;
+  toolName: string;
+  target?: string;
+  duplicateCount?: number;
+  hasTabularEvidence?: boolean;
+  successfulReadEvidenceCount?: number;
+}): {
+  shouldRedirectToDesignClosure: boolean;
+  reason: string | null;
+} {
+  if (input.workflowMode !== "plan" || input.isPlanApproved) {
+    return { shouldRedirectToDesignClosure: false, reason: null };
+  }
+  const duplicateCount = input.duplicateCount ?? 0;
+  const isBroadStructureTool =
+    input.toolName === "get_project_skeleton" ||
+    (input.toolName === "list_directory" && (!input.target || input.target === "." || input.target === "./"));
+  if (isBroadStructureTool && duplicateCount >= PLAN_EXPLORATION_REPEAT_READ_LIMIT) {
+    return {
+      shouldRedirectToDesignClosure: true,
+      reason: "repeated_broad_structure_read",
+    };
+  }
+  if (input.hasTabularEvidence && isBroadStructureTool) {
+    return {
+      shouldRedirectToDesignClosure: true,
+      reason: "tabular_context_already_available",
+    };
+  }
+  if ((input.successfulReadEvidenceCount ?? 0) >= 2 && isBroadStructureTool) {
+    return {
+      shouldRedirectToDesignClosure: true,
+      reason: "sufficient_read_context_already_available",
+    };
+  }
+  return { shouldRedirectToDesignClosure: false, reason: null };
 }
 
 function buildPlanStreamTimeoutPauseMessage(
@@ -1497,7 +1943,11 @@ async function fetchLLMStream(
       ) {
         transientRetryCount++;
         callbacks.onStreamToken("__ESCALATION_RESET__:", messageId);
-        console.warn(`[orchestrator] transient cloud error, retrying request (${transientRetryCount}/${MAX_TRANSIENT_RETRIES})`, retryMessage);
+        logAgentEvent("transient_cloud_retry", {
+          attempt: transientRetryCount,
+          maxRetries: MAX_TRANSIENT_RETRIES,
+          message: retryMessage.slice(0, 240),
+        });
         await new Promise((resolve) => setTimeout(resolve, 350 * transientRetryCount));
         continue;
       }
@@ -1510,7 +1960,10 @@ async function fetchLLMStream(
       if (nextMaxTokens !== null) {
         escalationCount++;
         currentMaxTokens = nextMaxTokens;
-        console.log(`[orchestrator] Max output tokens escalated to ${currentMaxTokens} (attempt ${escalationCount})`);
+        logAgentEvent("max_output_escalated", {
+          currentMaxTokens,
+          attempt: escalationCount,
+        });
 
         // Clear the previous streaming content for this message
         // by resetting — the caller's onStreamToken will accumulate fresh content
@@ -1552,6 +2005,89 @@ interface PlanMaterializationResultForLoop {
   content?: string;
   reason?: string;
   toolResult?: ToolExecutionResult;
+}
+
+async function writeMaterializedPlanArtifact(input: {
+  materialized: {
+    ok: boolean;
+    path?: string;
+    kind?: "design";
+    content?: string;
+    reason?: string;
+  };
+  workspace: string;
+  callbacks: OrchestratorCallbacks;
+  toolCallPrefix: string;
+}): Promise<PlanMaterializationResultForLoop> {
+  const materialized = input.materialized;
+  if (!materialized.ok || !materialized.path || !materialized.content || !materialized.kind) {
+    return {
+      ok: false,
+      reason: materialized.reason || "quality_gate",
+    };
+  }
+
+  const toolCallId = `${input.toolCallPrefix}_${generateId()}`;
+  const args = { path: materialized.path, content: materialized.content };
+  input.callbacks.onToolExecuting("write_file", materialized.path, undefined, { toolCallId });
+
+  try {
+    const rawResult = await executeTool("write_file", args, input.workspace, input.callbacks.getSessionKey());
+    const resultStr = typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult);
+    await syncPlanArtifactAfterToolSuccess(
+      "write_file",
+      args,
+      {
+        onPlanArtifactUpdated: input.callbacks.onPlanArtifactUpdated,
+        onPlanTasksUpdated: input.callbacks.onPlanTasksUpdated,
+      },
+      {
+        readFile: async (path) => {
+          const content = await executeTool("read_file", { path, __raw: true }, input.workspace, input.callbacks.getSessionKey());
+          return String(content ?? "");
+        },
+        warn: (message, error) => logAgentEvent("plan_artifact_sync_warn", {
+          message,
+          error: error instanceof Error ? error.message : String(error || ""),
+        }),
+      },
+    );
+    input.callbacks.onToolDone("write_file", materialized.path, resultStr, { toolCallId });
+    return {
+      ok: true,
+      path: materialized.path,
+      kind: materialized.kind,
+      content: materialized.content,
+      toolResult: {
+        toolCallId,
+        name: "write_file",
+        target: materialized.path,
+        content: resultStr,
+        displayContent: resultStr,
+        isError: false,
+        lifecycleState: "completed",
+      },
+    };
+  } catch (error) {
+    const message = getErrorMessage(error, "Failed to write materialized plan artifact");
+    input.callbacks.onToolError("write_file", materialized.path, message, { toolCallId });
+    return {
+      ok: false,
+      path: materialized.path,
+      kind: materialized.kind,
+      content: materialized.content,
+      reason: message,
+      toolResult: {
+        toolCallId,
+        name: "write_file",
+        target: materialized.path,
+        content: `Error: ${message}`,
+        displayContent: `Error: ${message}`,
+        isError: true,
+        lifecycleState: "failed",
+      },
+    };
+  }
 }
 
 interface CachedReadOnlyToolResult {
@@ -1603,6 +2139,69 @@ function parseToolCallArguments(tc: ToolCallToExecute, workspace?: string | null
   } catch {
     return {};
   }
+}
+
+function buildToolActionNarration(input: {
+  calls: ToolCallToExecute[];
+  workspace: string;
+  language: "zh" | "en";
+  workflowMode: "chat" | "edit" | "plan";
+  isPlanApproved: boolean;
+}): string {
+  const calls = input.calls.slice(0, 3);
+  if (calls.length === 0) return "";
+
+  const presentations = calls.map((call) => {
+    const args = parseToolCallArguments(call, input.workspace);
+    const target = getToolTarget(call.name, args);
+    return {
+      name: call.name,
+      target,
+      presentation: formatToolPresentation({
+        toolName: call.name,
+        target,
+        language: input.language,
+      }),
+    };
+  });
+
+  const hasDesignWrite = presentations.some((item) =>
+    PLAN_ARTIFACT_MUTATION_TOOLS.has(item.name) &&
+    item.target.replace(/\\/g, "/").toLowerCase().endsWith(".main/plans/design.md")
+  );
+  const hasReadOrAnalysis = presentations.some((item) =>
+    [
+      "read_file",
+      "read_document",
+      "analyze_tabular_document",
+      "query_tabular_document",
+      "get_project_skeleton",
+      "list_directory",
+      "glob_search",
+      "grep_search",
+    ].includes(item.name)
+  );
+  const summaries = presentations.map((item) => item.presentation.summary).join(input.language === "zh" ? "；" : "; ");
+  const extraCount = Math.max(0, input.calls.length - presentations.length);
+  const suffix = extraCount > 0
+    ? input.language === "zh" ? ` 等 ${input.calls.length} 个动作` : ` and ${extraCount} more action${extraCount === 1 ? "" : "s"}`
+    : "";
+
+  if (input.workflowMode === "plan" && !input.isPlanApproved && hasDesignWrite) {
+    return input.language === "zh"
+      ? "我会把当前上下文整理成可审批的 `design.md` 草案，然后停下来等你审阅；如果技术栈、输出形式或范围需要调整，审批前仍可改。"
+      : "I will turn the current context into a reviewable `design.md` draft, then pause for your review; stack, output format, and scope can still be adjusted before approval.";
+  }
+
+  if (input.workflowMode === "plan" && !input.isPlanApproved && hasReadOrAnalysis) {
+    return input.language === "zh"
+      ? `我会先做只读探索：${summaries}${suffix}。拿到证据后再决定是提问确认分叉，还是生成可审批设计草案。`
+      : `I will first gather read-only context: ${summaries}${suffix}. After that I will either ask for a decision or draft a reviewable design.`;
+  }
+
+  return input.language === "zh"
+    ? `我会执行下一步工具动作：${summaries}${suffix}。`
+    : `I will run the next tool action: ${summaries}${suffix}.`;
 }
 
 function normalizeToolCallToExecute(
@@ -2108,7 +2707,10 @@ async function executeToolCallWithLifecycle(
           });
           return String(content ?? "");
         },
-        warn: (message, error) => console.warn(message, error),
+        warn: (message, error) => logAgentEvent("plan_artifact_sync_warn", {
+          message,
+          error: error instanceof Error ? error.message : String(error || ""),
+        }),
       },
     );
     rememberReadBeforeModifyEvidence(sessionKey, tc.name, resolvedArgs, {
@@ -2193,64 +2795,12 @@ async function autoMaterializePlanArtifactFromVisibleText(input: {
     };
   }
 
-  const toolCallId = `plan_materialize_${generateId()}`;
-  const args = { path: materialized.path, content: materialized.content };
-  input.callbacks.onToolExecuting("write_file", materialized.path, undefined, { toolCallId });
-
-  try {
-    const rawResult = await executeTool("write_file", args, input.workspace, input.callbacks.getSessionKey());
-    const resultStr = typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult);
-    await syncPlanArtifactAfterToolSuccess(
-      "write_file",
-      args,
-      {
-        onPlanArtifactUpdated: input.callbacks.onPlanArtifactUpdated,
-        onPlanTasksUpdated: input.callbacks.onPlanTasksUpdated,
-      },
-      {
-        readFile: async (path) => {
-          const content = await executeTool("read_file", { path, __raw: true }, input.workspace, input.callbacks.getSessionKey());
-          return String(content ?? "");
-        },
-        warn: (message, error) => console.warn(message, error),
-      },
-    );
-    input.callbacks.onToolDone("write_file", materialized.path, resultStr, { toolCallId });
-    return {
-      ok: true,
-      path: materialized.path,
-      kind: materialized.kind,
-      content: materialized.content,
-      toolResult: {
-        toolCallId,
-        name: "write_file",
-        target: materialized.path,
-        content: resultStr,
-        displayContent: resultStr,
-        isError: false,
-        lifecycleState: "completed",
-      },
-    };
-  } catch (error) {
-    const message = getErrorMessage(error, "Failed to write materialized plan artifact");
-    input.callbacks.onToolError("write_file", materialized.path, message, { toolCallId });
-    return {
-      ok: false,
-      path: materialized.path,
-      kind: materialized.kind,
-      content: materialized.content,
-      reason: message,
-      toolResult: {
-        toolCallId,
-        name: "write_file",
-        target: materialized.path,
-        content: `Error: ${message}`,
-        displayContent: `Error: ${message}`,
-        isError: true,
-        lifecycleState: "failed",
-      },
-    };
-  }
+  return writeMaterializedPlanArtifact({
+    materialized,
+    workspace: input.workspace,
+    callbacks: input.callbacks,
+    toolCallPrefix: "plan_materialize",
+  });
 }
 
 /**
@@ -2589,6 +3139,86 @@ function logAgentEvent(event: string, data: Record<string, unknown> = {}) {
   }
 }
 
+function summarizeMessageContentForDiagnostics(content: AgentMessage["content"]): {
+  chars: number;
+  images: number;
+} {
+  if (typeof content === "string") {
+    return { chars: content.length, images: 0 };
+  }
+  if (!Array.isArray(content)) {
+    return { chars: 0, images: 0 };
+  }
+  return content.reduce(
+    (summary, part) => {
+      if (part.type === "text") {
+        summary.chars += String(part.text || "").length;
+      } else if (part.type === "image_url") {
+        summary.images += 1;
+      }
+      return summary;
+    },
+    { chars: 0, images: 0 },
+  );
+}
+
+function summarizeMessagesForDiagnostics(messages: AgentMessage[]): Record<string, unknown> {
+  const byRole: Record<string, number> = {};
+  const charsByRole: Record<string, number> = {};
+  let textChars = 0;
+  let imageParts = 0;
+  let toolCallMessages = 0;
+  let toolResultMessages = 0;
+  let maxMessageChars = 0;
+  let maxMessageRole = "";
+
+  for (const message of messages) {
+    byRole[message.role] = (byRole[message.role] ?? 0) + 1;
+    const contentSummary = summarizeMessageContentForDiagnostics(message.content);
+    textChars += contentSummary.chars;
+    imageParts += contentSummary.images;
+    charsByRole[message.role] = (charsByRole[message.role] ?? 0) + contentSummary.chars;
+    if (contentSummary.chars > maxMessageChars) {
+      maxMessageChars = contentSummary.chars;
+      maxMessageRole = message.role;
+    }
+    if (message.role === "assistant" && Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
+      toolCallMessages += 1;
+    }
+    if (message.role === "tool") {
+      toolResultMessages += 1;
+    }
+  }
+
+  return {
+    count: messages.length,
+    byRole,
+    charsByRole,
+    textChars,
+    estimatedTokens: Math.ceil(textChars / 4),
+    imageParts,
+    toolCallMessages,
+    toolResultMessages,
+    maxMessageChars,
+    maxMessageRole: maxMessageRole || null,
+  };
+}
+
+function summarizeToolsForDiagnostics(tools: ToolDefinition[]): Record<string, unknown> {
+  let schemaChars = 0;
+  try {
+    schemaChars = JSON.stringify(tools).length;
+  } catch {
+    schemaChars = 0;
+  }
+  return {
+    count: tools.length,
+    names: tools.map((tool) => tool.function.name).slice(0, 20),
+    schemaChars,
+    estimatedSchemaTokens: Math.ceil(schemaChars / 4),
+  };
+}
+
 function isUnityCommandDirective(commandDirective?: CommandDirective | null): boolean {
   return commandDirective?.kind === "unity";
 }
@@ -2700,6 +3330,14 @@ export async function executeAgentLoop(
     initialMessages,
     compatibilityForcedAtStart,
   );
+  const modelProtocolProfile = resolveModelProtocolProfile({
+    activeProfile: config.activeProfile,
+    provider: settings.provider,
+    model: settings.model,
+    protocol: settings.apiProtocol,
+    configuredToolProtocol: effectiveToolProtocol,
+    compatibilityOverride: compatibilityForcedAtStart,
+  });
   const workspace = config.workspace;
   const mainModeKey = callbacks.getMainModeKey();
   const workspaceTree = callbacks.getWorkspaceTree();
@@ -2756,9 +3394,7 @@ export async function executeAgentLoop(
     timestampMs: Date.now(),
   });
 
-  console.log('[orchestrator] executeAgentLoop');
-  console.log('[orchestrator] activeProfile:', config.activeProfile);
-  console.log('[orchestrator] derived settings:', JSON.stringify({
+  logAgentEvent("runtime_settings", {
     baseUrl: settings.baseUrl,
     model: settings.model,
     useRustProxy: settings.useRustProxy,
@@ -2766,8 +3402,11 @@ export async function executeAgentLoop(
     provider: settings.provider,
     nativeToolsEnabled,
     toolProtocol: effectiveToolProtocol,
+    modelProtocolToolProtocol: modelProtocolProfile.toolProtocol,
+    modelProtocolReasoning: modelProtocolProfile.reasoning,
+    providerFamily: modelProtocolProfile.providerFamily,
     xmlToolsEnabled: true,
-  }));
+  });
 
   // ── Config Snapshot ──────────────────────────────────────────────
   // Local profile uses the slider-driven context limit. Cloud profile
@@ -2810,16 +3449,24 @@ export async function executeAgentLoop(
   }));
 
   if (mcpServers.length > 0) {
-    console.log(`[orchestrator] Discovering tools from ${enabledMcpServers.length} enabled MCP server(s)...`);
+    logAgentEvent("mcp_discovery_start", {
+      enabledServers: enabledMcpServers.length,
+      totalServers: mcpServers.length,
+    });
     const { tools: discovered, toolServerMap, serverStatuses } = await discoverAllMcpTools(mcpServers);
     mcpServerStatuses = serverStatuses;
     mcpToolServerMap = toolServerMap;
     setMcpToolServerMap(toolServerMap);
     if (discovered.length > 0) {
-      console.log(`[orchestrator] Discovered ${discovered.length} MCP tool(s):`, discovered.map(t => t.name).join(", "));
+      logAgentEvent("mcp_discovery_done", {
+        discoveredTools: discovered.length,
+        toolNames: discovered.map(t => t.name).slice(0, 24),
+      });
       mcpTools = discovered;
     } else {
-      console.log(`[orchestrator] No MCP tools discovered (servers may be offline).`);
+      logAgentEvent("mcp_discovery_done", {
+        discoveredTools: 0,
+      });
       mcpTools = [];
     }
   }
@@ -3047,6 +3694,22 @@ export async function executeAgentLoop(
           .filter((status) => status.status === "connected" && /unity/i.test(`${status.serverName} ${status.url}`))
           .map((status) => status.serverName),
       },
+      {
+        displayLanguage: config.language,
+        resolvedResponseLanguage: callbacks.getPreferredLanguage(),
+      },
+      {
+        activeProfile: config.activeProfile,
+        provider: settings.provider,
+        model: settings.model,
+        toolProtocol: effectiveToolProtocol,
+        nativeToolsEnabled: !shouldUseXmlToolProtocol(
+          config,
+          settings,
+          callbacks.getMessages(),
+          compatibilityForcedAtStart,
+        ),
+      },
     );
     const currentMessages = callbacks.getMessages();
     if (currentMessages.length === 0) {
@@ -3059,6 +3722,20 @@ export async function executeAgentLoop(
       callbacks.replaceMessages([{ role: "system", content: systemPrompt }, ...currentMessages]);
     }
     appliedSystemPromptKey = systemPromptKey;
+    logAgentEvent("tool_protocol_card_applied", {
+      runtimeIntent,
+      workflowMode,
+      activeProfile: config.activeProfile,
+      provider: settings.provider || "unknown",
+      toolProtocol: effectiveToolProtocol,
+      nativeToolsEnabled: !shouldUseXmlToolProtocol(
+        config,
+        settings,
+        callbacks.getMessages(),
+        compatibilityForcedAtStart,
+      ),
+      availableTools: availableToolNameList.length,
+    });
   };
 
   const initialRuntimeIntent = resolveRuntimeIntent();
@@ -3122,17 +3799,42 @@ export async function executeAgentLoop(
     workflowMode === "plan" && !callbacks.getIsPlanApproved()
       ? 0
       : 2;
-  const getPlanStreamWatchdogOptions = (nativeToolCount: number): FetchLLMStreamOptions | undefined =>
-    shouldUsePlanNoVisibleTokenWatchdog({
+  let loggedLocalPlanNoVisibleTokenNoticeOnly = false;
+  const getPlanStreamWatchdogOptions = (nativeToolCount: number): FetchLLMStreamOptions | undefined => {
+    const watchdogEnabled = shouldUsePlanNoVisibleTokenWatchdog({
       workflowMode,
       isPlanApproved: callbacks.getIsPlanApproved(),
       nativeToolCount,
-    })
+      activeProfile: config.activeProfile,
+      provider: settings.provider,
+      toolProtocol: effectiveToolProtocol,
+    });
+
+    if (
+      !watchdogEnabled &&
+      !loggedLocalPlanNoVisibleTokenNoticeOnly &&
+      workflowMode === "plan" &&
+      !callbacks.getIsPlanApproved() &&
+      nativeToolCount === 0 &&
+      config.activeProfile === "local"
+    ) {
+      loggedLocalPlanNoVisibleTokenNoticeOnly = true;
+      logAgentEvent("plan_no_visible_token_notice_only", {
+        activeProfile: config.activeProfile,
+        provider: settings.provider || "unknown",
+        toolProtocol: effectiveToolProtocol,
+        workflowMode,
+        turnIntent,
+      });
+    }
+
+    return watchdogEnabled
       ? {
           noVisibleTokenTimeoutMs: PLAN_NO_VISIBLE_TOKEN_TIMEOUT_MS,
           noVisibleTokenTimeoutLabel: `${workflowMode}:preapproval_xml_tools`,
         }
       : undefined;
+  };
   let sawPlanModeToolActivity = false;
   let usedPlanRecoveryPrompt = false;
   let usedToolUnavailableRecoveryPrompt = false;
@@ -3140,6 +3842,8 @@ export async function executeAgentLoop(
   let usedMalformedToolUseRecoveryPrompt = false;
   let usedLanguageMismatchRecoveryPrompt = false;
   let usedExecuteConvergencePrompt = false;
+  let usedPlanClosureGuard = false;
+  let usedPlanDesignClosurePrompt = false;
   const attemptedPlanWriteTargets: string[] = [];
   let recentSuccessfulProjectWrite: { name: string; target: string } | null = null;
   let recoveringFromEmptyAssistantReplyAfterWrite = false;
@@ -3205,6 +3909,105 @@ export async function executeAgentLoop(
     });
   }
 
+  async function pauseForReviewablePlanArtifact(trigger: string): Promise<"not_reviewable" | "stopped" | "approved_continue"> {
+    if (workflowMode !== "plan" || callbacks.getIsPlanApproved()) return "not_reviewable";
+    const stage = callbacks.getPlanStage();
+    if (!isReviewablePlanStage(stage)) return "not_reviewable";
+
+    const language = callbacks.getPreferredLanguage();
+    logAgentEvent("plan_design_review_ready_after_tool", {
+      trigger,
+      iteration,
+      planStage: stage,
+      isPlanApproved: callbacks.getIsPlanApproved(),
+      statusBeforeReview: callbacks.getStatus(),
+    });
+    callbacks.onAssistantFinalText(buildPlanReviewReadyMessage(language, stage));
+    const approved = await waitForPlanApprovalIfNeeded();
+    if (!approved) {
+      if (callbacks.getStatus() !== "pending_review") {
+        callbacks.onStatusChange("idle");
+      }
+      return "stopped";
+    }
+
+    callbacks.onPlanStageChanged("executing");
+    callbacks.appendMessage({
+      role: "user",
+      content: buildApprovedPlanContinuationPrompt(callbacks),
+    });
+    return "approved_continue";
+  }
+
+  async function tryClosePlanWithEvidence(trigger: string, details: {
+    consecutiveEmptyResponseCount?: number;
+    rejectedVisibleChars?: number;
+    toolCallCount?: number;
+    replyOptionCount?: number;
+  } = {}): Promise<"not_attempted" | "failed" | "stopped" | "approved_continue"> {
+    const closureInput = collectPlanClosureMaterializationInput(
+      callbacks,
+      recentPlanToolActivity,
+      attemptedPlanWriteTargets,
+    );
+    const evidenceCount = closureInput.evidence.length;
+    const currentStage = callbacks.getPlanStage();
+    const hasReviewablePlanArtifacts = isReviewablePlanStage(currentStage);
+    const shouldAttempt = shouldAttemptPlanClosureGuard({
+      workflowMode,
+      isPlanApproved: callbacks.getIsPlanApproved(),
+      hasReviewablePlanArtifacts,
+      evidenceCount,
+      usedPlanRecoveryPrompt,
+      ...details,
+    });
+
+    if (!shouldAttempt) return "not_attempted";
+    if (usedPlanClosureGuard) {
+      logAgentEvent("plan_closure_artifact_rejected", {
+        trigger,
+        iteration,
+        reason: "design_closure_prompt_already_used",
+        evidenceCount,
+        targetPath: ".MAIN/plans/design.md",
+      });
+      return "failed";
+    }
+
+    logAgentEvent("plan_closure_guard_start", {
+      trigger,
+      iteration,
+      evidenceCount,
+      fileCount: closureInput.files.length,
+      constraintCount: closureInput.constraints.length,
+      targetPath: ".MAIN/plans/design.md",
+      planStage: currentStage,
+    });
+
+    if (!usedPlanDesignClosurePrompt) {
+      usedPlanClosureGuard = true;
+      usedPlanDesignClosurePrompt = true;
+      const prompt = composeReviewableDesignFromEvidence({
+        ...closureInput,
+        language: callbacks.getPreferredLanguage(),
+      });
+      logAgentEvent("plan_design_closure_prompt", {
+        trigger,
+        iteration,
+        evidenceCount,
+        fileCount: closureInput.files.length,
+        targetPath: ".MAIN/plans/design.md",
+      });
+      callbacks.onStatusChange("running");
+      callbacks.appendMessage({
+        role: "user",
+        content: prompt,
+      });
+      return "approved_continue";
+    }
+    return "failed";
+  }
+
   const effectiveMaxIterations = workflowMode === "plan"
     ? MAX_ITERATIONS_PLAN_EXECUTION
     : MAX_ITERATIONS;
@@ -3238,6 +4041,8 @@ export async function executeAgentLoop(
     allTools: loopStartTools.length,
     mcpTools: mcpTools.length,
     builtinAndSkillTools: Math.max(0, loopStartTools.length - mcpTools.length),
+    activeProfile: config.activeProfile,
+    provider: settings.provider || "unknown",
     nativeToolsEnabled: !shouldUseXmlToolProtocol(
       config,
       settings,
@@ -3339,6 +4144,7 @@ export async function executeAgentLoop(
     const assistantMsgId = generateId();
     let streamResult: StreamResult;
     const maxOutputEscalations = getMaxOutputEscalations();
+    const iterationRequestStartedAt = Date.now();
 
     logAgentEvent("iteration_start", {
       iteration,
@@ -3361,6 +4167,40 @@ export async function executeAgentLoop(
         settings,
         providerCompatibilityOverride,
       );
+      const streamWatchdogOptions = getPlanStreamWatchdogOptions(llmTools.length) ?? {};
+      logAgentEvent("llm_request_shape", {
+        iteration,
+        workflowMode,
+        turnIntent,
+        runtimeIntent,
+        activeProfile: config.activeProfile,
+        provider: settings.provider || "unknown",
+        providerFamily: modelProtocolProfile.providerFamily,
+        model: settings.model,
+        apiProtocol: settings.apiProtocol,
+        useRustProxy: settings.useRustProxy,
+        contextLimit: settings.contextLimit,
+        configuredContextLimit: snapshotContextLimit ?? null,
+        currentMaxTokens: currentMaxTokens ?? "default",
+        maxOutputEscalations,
+        forceXmlTools,
+        toolProtocol: effectiveToolProtocol,
+        nativeToolsEnabled: !forceXmlTools,
+        compatibilityOverride: !!providerCompatibilityOverride,
+        messages: summarizeMessagesForDiagnostics(messagesForLLM),
+        managedMessages: summarizeMessagesForDiagnostics(managedAgentMessages),
+        allTools: summarizeToolsForDiagnostics(iterationAllTools),
+        llmTools: summarizeToolsForDiagnostics(llmTools),
+        watchdog: {
+          hardTimeoutMs: streamWatchdogOptions.noVisibleTokenTimeoutMs ?? null,
+          label: streamWatchdogOptions.noVisibleTokenTimeoutLabel ?? null,
+          noticeOnlyForLocalPlan:
+            workflowMode === "plan" &&
+            !callbacks.getIsPlanApproved() &&
+            config.activeProfile === "local" &&
+            forceXmlTools,
+        },
+      });
       streamResult = await fetchLLMStream(
         messagesForLLM,
         settings,
@@ -3370,7 +4210,7 @@ export async function executeAgentLoop(
         llmTools,
         currentMaxTokens,
         maxOutputEscalations,
-        getPlanStreamWatchdogOptions(llmTools.length),
+        streamWatchdogOptions,
       );
       if (llmTools.length > 0) {
         callbacks.onProviderNativeToolSuccess?.();
@@ -3418,15 +4258,21 @@ export async function executeAgentLoop(
         );
 
       if (isContextError && snapshotContextLimit != null) {
-        console.log("[orchestrator] Context length exceeded — reactive compact and retry");
+        logAgentEvent("context_retry_start", {
+          iteration,
+          reason: "local_context_length_exceeded",
+          snapshotContextLimit,
+          error: errMsg.slice(0, 240),
+        });
 
         const { contextLimit: reactiveContextLimit, reportedContextLimit } =
           clampContextLimitToReported(snapshotContextLimit, errMsg);
         if (reportedContextLimit != null && reportedContextLimit < snapshotContextLimit) {
-          console.log(
-            `[orchestrator] Provider reported context window ${reportedContextLimit}; ` +
-            `clamping configured limit ${snapshotContextLimit} for reactive retry`,
-          );
+          logAgentEvent("context_limit_clamped", {
+            iteration,
+            reportedContextLimit,
+            configuredContextLimit: snapshotContextLimit,
+          });
         }
 
         // More aggressive compaction: reduce tool result budget while keeping
@@ -3518,7 +4364,10 @@ export async function executeAgentLoop(
           // Second retry: strip tool_calls from messages entirely (some providers
           // like Ollama choke on tool_calls in message history) and retry with
           // plain text-only messages
-          console.log("[orchestrator] Second retry: stripping tool_calls from messages");
+          logAgentEvent("context_retry_start", {
+            iteration,
+            reason: "strip_tool_calls_for_emergency_retry",
+          });
           const strippedMessages = buildCompatibilityRetryMessages(aggressivelyManaged);
           const emergencyOutputBudget = Math.min(2048, Math.max(1024, Math.floor(reactiveContextLimit * 0.06)));
           const emergencyContextLimit = computeManagedContextLimit(reactiveContextLimit, llmTools, emergencyOutputBudget);
@@ -3602,7 +4451,11 @@ export async function executeAgentLoop(
           }
         }
       } else if (isContextError) {
-        console.log("[orchestrator] Cloud context length exceeded — compact and retry once");
+        logAgentEvent("context_retry_start", {
+          iteration,
+          reason: "cloud_context_length_exceeded",
+          error: errMsg.slice(0, 240),
+        });
         const cloudReactiveContextLimit = 32768;
         const cloudReactiveOutputBudget = Math.min(
           2048,
@@ -3695,7 +4548,11 @@ export async function executeAgentLoop(
           return;
         }
       } else if (isCompatibilityError) {
-        console.log("[orchestrator] Provider compatibility retry: disabling native tools and enabling XML tool_use");
+        logAgentEvent("provider_compatibility_retry", {
+          iteration,
+          reason: errMsg.slice(0, 240),
+          nativeToolsAttempted: nativeToolsWereAttempted,
+        });
         callbacks.onProviderCompatibilityFallback?.(errMsg);
         const compatibilityMessages = ensureProviderCompatibilityMode(
           buildCompatibilityRetryMessages(managedAgentMessages),
@@ -3853,7 +4710,32 @@ export async function executeAgentLoop(
       finishReason: streamResult.finishReason || "unknown",
       contentChars: streamText.length,
       toolCalls: streamResult.toolCalls.length,
+      elapsedMs: Date.now() - iterationRequestStartedAt,
+      emptyResult: streamText.length === 0 && streamResult.toolCalls.length === 0,
     });
+    if (streamText.length === 0 && streamResult.toolCalls.length === 0) {
+      logAgentEvent("llm_empty_response_diagnostic", {
+        iteration,
+        elapsedMs: Date.now() - iterationRequestStartedAt,
+        workflowMode,
+        turnIntent,
+        runtimeIntent,
+        activeProfile: config.activeProfile,
+        provider: settings.provider || "unknown",
+        model: settings.model,
+        toolProtocol: effectiveToolProtocol,
+        nativeToolsEnabled: llmTools.length > 0,
+        llmToolCount: llmTools.length,
+        messageCount: managedAgentMessages.length,
+        contextLimit: settings.contextLimit,
+        currentMaxTokens: currentMaxTokens ?? "default",
+        likelyCauses: [
+          config.activeProfile === "local" ? "local_prefill_or_provider_empty_completion" : "gateway_or_provider_empty_completion",
+          forceXmlTools ? "text_xml_tool_protocol_no_native_tool_call" : "native_tool_protocol",
+          managedAgentMessages.length > 12 ? "long_multi_turn_context" : "short_context",
+        ],
+      });
+    }
 
     // 3. 将不同模型输出统一整理成标准结构，避免 UI 继续靠多处分支猜测。
     const normalizedBase = normalizeAssistantTurn(streamResult);
@@ -3862,6 +4744,17 @@ export async function executeAgentLoop(
       config.thinkingPolicy !== "action_only",
     );
     if (isAssistantTurnEmpty(normalized)) {
+      if (workflowMode === "plan" && !callbacks.getIsPlanApproved() && isReviewablePlanStage(callbacks.getPlanStage())) {
+        logAgentEvent("plan_review_ready_after_empty_response", {
+          iteration,
+          planStage: callbacks.getPlanStage(),
+          consecutiveEmptyResponseCount,
+        });
+        const reviewResult = await pauseForReviewablePlanArtifact("empty_response_with_reviewable_artifact");
+        if (reviewResult === "approved_continue") continue;
+        if (reviewResult === "stopped") return;
+      }
+
       const malformedToolUseBlock =
         workflowMode === "plan" &&
         !callbacks.getIsPlanApproved() &&
@@ -3887,6 +4780,19 @@ export async function executeAgentLoop(
       consecutiveEmptyResponseCount++;
       if (workflowMode === "plan" && !callbacks.getIsPlanApproved()) {
         if (consecutiveEmptyResponseCount >= 2) {
+          const closureResult = await tryClosePlanWithEvidence("empty_response_checkpoint", {
+            consecutiveEmptyResponseCount,
+            toolCallCount: 0,
+            replyOptionCount: 0,
+          });
+          if (closureResult === "approved_continue") continue;
+          if (closureResult === "stopped") return;
+          if (closureResult === "failed") {
+            logAgentEvent("plan_empty_after_closure_failed", {
+              iteration,
+              consecutiveEmptyResponseCount,
+            });
+          }
           logAgentEvent("loop_stop", {
             reason: "plan_empty_response_checkpoint",
             iteration,
@@ -3942,7 +4848,7 @@ export async function executeAgentLoop(
     }
     consecutiveEmptyResponseCount = 0;
 
-    const effectiveToolCalls: Array<{ id: string; name: string; arguments: string }> =
+    let effectiveToolCalls: Array<{ id: string; name: string; arguments: string }> =
       normalized.toolCalls.map((call) => normalizeToolCallToExecute({
         id: call.id || `call_${generateId()}`,
         name: call.name,
@@ -4004,6 +4910,49 @@ export async function executeAgentLoop(
     const finalReplyOptions = compactedProseCodeDump || autoContinueReadOnlyPermission || suppressReadOnlyPermissionOptionsForToolCalls
       ? []
       : normalized.replyOptions;
+    let recoveredPseudoToolCall = false;
+    const pseudoToolNameCandidate =
+      effectiveToolCalls.length === 0 &&
+      finalReplyOptions.length === 0 &&
+      !compactedProseCodeDump &&
+      !compactedIncompletePlanText
+        ? extractPseudoToolCallName(normalized.visibleText) ||
+          extractPseudoToolCallName(normalized.hiddenThought) ||
+          extractPseudoToolCallName(streamText)
+        : null;
+    if (pseudoToolNameCandidate) {
+      const pseudoRecovery = choosePseudoToolRecovery({
+        pseudoToolName: pseudoToolNameCandidate,
+        availableToolNames,
+        mentionedPaths: extractUserMentionedFilePathsFromMessages(callbacks.getMessages()),
+        workflowMode,
+        turnIntent,
+      });
+      if (pseudoRecovery.call) {
+        recoveredPseudoToolCall = true;
+        effectiveToolCalls = [pseudoRecovery.call];
+        callbacks.onStreamToken("__ESCALATION_RESET__:", assistantMsgId);
+        logAgentEvent("pseudo_tool_recovered", {
+          iteration,
+          requestedToolName: pseudoRecovery.requestedToolName,
+          recoveredToolName: pseudoRecovery.recoveredToolName,
+          reason: pseudoRecovery.reason,
+          argumentKeys: pseudoRecovery.argumentKeys,
+          mentionedPathCount: pseudoRecovery.mentionedPathCount,
+          workflowMode,
+          turnIntent,
+        });
+      } else {
+        logAgentEvent("pseudo_tool_recovery_unavailable", {
+          iteration,
+          requestedToolName: pseudoRecovery.requestedToolName,
+          reason: pseudoRecovery.reason,
+          mentionedPathCount: pseudoRecovery.mentionedPathCount,
+          workflowMode,
+          turnIntent,
+        });
+      }
+    }
     if (suppressReadOnlyPermissionOptionsForToolCalls) {
       logAgentEvent("readonly_permission_options_ignored_for_tool_call", {
         iteration,
@@ -4026,7 +4975,7 @@ export async function executeAgentLoop(
     const syntheticVisibleConclusion =
       !compactedProseCodeDump &&
       !compactedIncompletePlanText &&
-      (isSyntheticVisibleConclusion(finalVisibleText) || pseudoToolCallPlaceholder);
+      (recoveredPseudoToolCall || isSyntheticVisibleConclusion(finalVisibleText) || pseudoToolCallPlaceholder);
     const userVisibleText = syntheticVisibleConclusion ? "" : finalVisibleText;
     if (syntheticVisibleConclusion) {
       callbacks.onStreamToken("__ESCALATION_RESET__:", assistantMsgId);
@@ -4076,10 +5025,11 @@ export async function executeAgentLoop(
 
     if (pseudoToolCallPlaceholder && !usedPseudoToolCallRecoveryPrompt) {
       usedPseudoToolCallRecoveryPrompt = true;
-      logAgentEvent("pseudo_tool_call_reprompt", {
+      logAgentEvent("pseudo_tool_repair_requested", {
         iteration,
         workflowMode,
         turnIntent,
+        requestedToolName: pseudoToolNameCandidate || "unknown",
         visibleChars: normalized.visibleText.length,
         hiddenThoughtChars: normalized.hiddenThought.length,
       });
@@ -4089,6 +5039,24 @@ export async function executeAgentLoop(
         content: buildPseudoToolCallRecoveryPrompt(callbacks.getPreferredLanguage(), workflowMode),
       });
       continue;
+    }
+
+    if (pseudoToolCallPlaceholder && usedPseudoToolCallRecoveryPrompt) {
+      logAgentEvent("tool_protocol_doom_loop", {
+        iteration,
+        workflowMode,
+        turnIntent,
+        requestedToolName: pseudoToolNameCandidate || "unknown",
+        visibleChars: normalized.visibleText.length,
+        hiddenThoughtChars: normalized.hiddenThought.length,
+      });
+      callbacks.onStreamToken("__ESCALATION_RESET__:", assistantMsgId);
+      callbacks.onNonActionableStop(
+        buildToolProtocolDoomLoopStopMessage(callbacks.getPreferredLanguage(), pseudoToolNameCandidate),
+        "missing_tool_loop",
+      );
+      callbacks.onStatusChange("idle");
+      return;
     }
 
     if (shouldTriggerUnityMcpFirstIterationFallback({
@@ -4210,11 +5178,34 @@ export async function executeAgentLoop(
       });
     }
 
-    if (effectiveToolCalls.length > 0 && !visibleAssistantText.trim() && containsToolUseBlock(streamText)) {
+    if (effectiveToolCalls.length > 0 && !visibleAssistantText.trim() && config.thinkingPolicy !== "action_only") {
+      const narration = buildToolActionNarration({
+        calls: effectiveToolCalls,
+        workspace,
+        language: callbacks.getPreferredLanguage(),
+        workflowMode,
+        isPlanApproved: callbacks.getIsPlanApproved(),
+      });
+      if (narration) {
+        visibleAssistantText = narration;
+        callbacks.onThought(narration);
+        logAgentEvent("tool_action_narration_injected", {
+          iteration,
+          workflowMode,
+          turnIntent,
+          thinkingPolicy: config.thinkingPolicy,
+          toolCalls: effectiveToolCalls.length,
+          toolNames: effectiveToolCalls.map((call) => call.name).slice(0, 8),
+        });
+      }
+    }
+
+    if (effectiveToolCalls.length > 0 && containsToolUseBlock(streamText)) {
       callbacks.onStreamToken("__ESCALATION_RESET__:", assistantMsgId);
       logAgentEvent("tool_protocol_stream_cleared", {
         iteration,
         toolCalls: effectiveToolCalls.length,
+        narrationInjected: visibleAssistantText.trim().length > 0,
         workflowMode,
         turnIntent,
       });
@@ -4268,6 +5259,10 @@ export async function executeAgentLoop(
 
     const hasStructuredProposal = hasStructuredPlanProposal(streamText);
     const currentPlanStageForReview = callbacks.getPlanStage();
+    const isApprovedPlanExecutionTurn =
+      workflowMode === "plan" &&
+      callbacks.getIsPlanApproved() &&
+      currentPlanStageForReview === "executing";
     const hasReadyPlanArtifacts = currentPlanStageForReview === "ready_to_execute";
     const hasReviewablePlanArtifacts = isReviewablePlanStage(currentPlanStageForReview);
     const shouldPauseForUserChoice = shouldPauseForReplyOptions({
@@ -4310,9 +5305,88 @@ export async function executeAgentLoop(
         workflowMode,
         turnIntent,
       });
+      if (workflowMode === "plan" && !callbacks.getIsPlanApproved()) {
+        logAgentEvent("plan_user_choice_checkpoint", {
+          iteration,
+          replyOptions: finalReplyOptions.length,
+          optionPreview: summarizeReplyOptionsForLog(finalReplyOptions),
+          hasStructuredProposal,
+          planStage: currentPlanStageForReview,
+        });
+      }
       callbacks.appendMessage({ role: "assistant", content: assistantHistoryText });
       callbacks.onStatusChange("idle");
       return;
+    }
+
+    if (isApprovedPlanExecutionTurn && effectiveToolCalls.length === 0 && shouldSuppressApprovedPlanNoToolText) {
+      callbacks.onStatusChange("running");
+      consecutiveNoToolCount++;
+      const language = callbacks.getPreferredLanguage();
+      const approvedPlanTasks = approvedPlanAuditForNoTool?.tasks || callbacks.getPlanTasks();
+      const approvedPlanMissingTasks = (approvedPlanAuditForNoTool?.totalCount || 0) === 0;
+      const remainingText = approvedPlanAuditForNoTool
+        ? formatPlanAuditRemainingTasks(
+            approvedPlanAuditForNoTool,
+            language,
+            language === "zh"
+              ? "- 先生成 `.MAIN/plans/tasks.md`，再执行源码或交付物写入。"
+              : "- First generate `.MAIN/plans/tasks.md`, then execute source or deliverable writes.",
+          )
+        : language === "zh"
+        ? "- 先生成 `.MAIN/plans/tasks.md`，再执行源码或交付物写入。"
+        : "- First generate `.MAIN/plans/tasks.md`, then execute source or deliverable writes.";
+
+      logAgentEvent("plan_execution_no_tool_reprompt", {
+        iteration,
+        consecutiveNoToolCount,
+        visibleChars: normalized.visibleText.length,
+        completionClaimRejected: rejectedCompletionClaim,
+        missingTasksArtifact: approvedPlanMissingTasks,
+        auditCompleted: approvedPlanAuditForNoTool?.completedCount ?? 0,
+        auditTotal: approvedPlanAuditForNoTool?.totalCount ?? 0,
+        remaining: approvedPlanAuditForNoTool?.remainingTasks.length ?? 0,
+      });
+
+      if (consecutiveNoToolCount >= MAX_NO_ACTION_RETRIES) {
+        logAgentEvent("loop_stop", {
+          reason: "plan_execution_no_tool_checkpoint",
+          iteration,
+          consecutiveNoToolCount,
+          completionClaimRejected: rejectedCompletionClaim,
+          auditCompleted: approvedPlanAuditForNoTool?.completedCount ?? 0,
+          auditTotal: approvedPlanAuditForNoTool?.totalCount ?? 0,
+        });
+        emitPlanExecutionProgress("paused", {
+          nextStep: language === "zh"
+            ? "恢复后先读取当前 tasks.md 和 workspace 状态，再继续第一个证据未满足的任务"
+            : "on resume, reread current tasks.md and workspace state, then continue the first task whose evidence is not satisfied",
+        });
+        callbacks.onNonActionableStop(
+          buildApprovedPlanNoToolPauseMessage(
+            language,
+            remainingText,
+            consecutiveNoToolCount,
+            approvedPlanAuditForNoTool || undefined,
+            rejectedCompletionClaim,
+          ),
+          "incomplete_plan",
+        );
+        callbacks.onStatusChange("idle");
+        return;
+      }
+
+      callbacks.appendMessage({
+        role: "user",
+        content: buildPlanExecutionNoToolRecoveryPrompt({
+          language,
+          missingTasksArtifact: approvedPlanMissingTasks,
+          remainingText,
+          commandHint: buildPlanCommandExecutionHint(approvedPlanTasks, language),
+          rejectedCompletionClaim,
+        }),
+      });
+      continue;
     }
 
     if (effectiveToolCalls.length === 0) {
@@ -4418,6 +5492,19 @@ export async function executeAgentLoop(
           callbacks.appendMessage({ role: "assistant", content: assistantHistoryText });
 
           if (usedPlanRecoveryPrompt) {
+            const closureResult = await tryClosePlanWithEvidence("plan_recovery_prompt_limit", {
+              rejectedVisibleChars: sourceVisibleText.length,
+              toolCallCount: effectiveToolCalls.length,
+              replyOptionCount: finalReplyOptions.length,
+            });
+            if (closureResult === "approved_continue") continue;
+            if (closureResult === "stopped") return;
+            if (closureResult === "failed") {
+              logAgentEvent("plan_empty_after_closure_failed", {
+                iteration,
+                visibleChars: sourceVisibleText.length,
+              });
+            }
             logAgentEvent("loop_stop", {
               reason: "plan_recovery_prompt_limit",
               iteration,
@@ -4484,6 +5571,19 @@ export async function executeAgentLoop(
         if (shouldForcePlanContinuation) {
           consecutiveNoToolCount++;
           if (consecutiveNoToolCount >= MAX_NO_ACTION_RETRIES) {
+            const closureResult = await tryClosePlanWithEvidence("force_plan_continuation_limit", {
+              rejectedVisibleChars: sourceVisibleText.length,
+              toolCallCount: effectiveToolCalls.length,
+              replyOptionCount: finalReplyOptions.length,
+            });
+            if (closureResult === "approved_continue") continue;
+            if (closureResult === "stopped") return;
+            if (closureResult === "failed") {
+              logAgentEvent("plan_empty_after_closure_failed", {
+                iteration,
+                consecutiveNoToolCount,
+              });
+            }
             logAgentEvent("loop_stop", {
               reason: "force_plan_continuation_limit",
               iteration,
@@ -4908,10 +6008,19 @@ export async function executeAgentLoop(
           } else {
             const duplicateCount = (readOnlyDuplicateSkipCounts.get(fileReadSignature) ?? 0) + 1;
             readOnlyDuplicateSkipCounts.set(fileReadSignature, duplicateCount);
+            const planBudget = buildPlanExplorationBudget({
+              workflowMode,
+              isPlanApproved: callbacks.getIsPlanApproved(),
+              toolName: tc.name,
+              target: target || fileReadState.path,
+              duplicateCount,
+              hasTabularEvidence: hasSuccessfulTabularActivity(recentPlanToolActivity),
+              successfulReadEvidenceCount: countSuccessfulPlanReadEvidence(recentPlanToolActivity),
+            });
             const shouldPushPlanReadLimit =
               workflowMode === "plan" &&
               !callbacks.getIsPlanApproved() &&
-              duplicateCount >= PLAN_REPEAT_READ_LIMIT;
+              (duplicateCount >= PLAN_REPEAT_READ_LIMIT || planBudget.shouldRedirectToDesignClosure);
             if (shouldPushPlanReadLimit) {
               logAgentEvent("plan_repeat_read_limit", {
                 iteration,
@@ -4919,15 +6028,20 @@ export async function executeAgentLoop(
                 tool: tc.name,
                 target: target || fileReadState.path,
                 duplicateCount,
+                reason: planBudget.reason || "duplicate_file_read",
               });
             }
+            const baseStub = buildFileUnchangedStub(fileReadState);
+            const closurePrompt = shouldPushPlanReadLimit
+              ? `\n\n${buildPlanDesignClosurePromptFromEvidence(callbacks, recentPlanToolActivity, attemptedPlanWriteTargets)}`
+              : "";
             const content = shouldPushPlanReadLimit
               ? appendPlanRepeatReadLimitGuidance(
-                  buildFileUnchangedStub(fileReadState),
+                  `${baseStub}${closurePrompt}`,
                   callbacks.getPreferredLanguage(),
                   callbacks.getPlanStage(),
                 )
-              : buildFileUnchangedStub(fileReadState);
+              : baseStub;
             allResults.push({
               toolCallId: tc.id,
               name: tc.name,
@@ -4943,10 +6057,19 @@ export async function executeAgentLoop(
         if (cached || queuedReadOnlySignatures.has(signature)) {
           const duplicateCount = (readOnlyDuplicateSkipCounts.get(signature) ?? 0) + 1;
           readOnlyDuplicateSkipCounts.set(signature, duplicateCount);
+          const planBudget = buildPlanExplorationBudget({
+            workflowMode,
+            isPlanApproved: callbacks.getIsPlanApproved(),
+            toolName: tc.name,
+            target,
+            duplicateCount,
+            hasTabularEvidence: hasSuccessfulTabularActivity(recentPlanToolActivity),
+            successfulReadEvidenceCount: countSuccessfulPlanReadEvidence(recentPlanToolActivity),
+          });
           const shouldPushPlanReadLimit =
             workflowMode === "plan" &&
             !callbacks.getIsPlanApproved() &&
-            duplicateCount >= PLAN_REPEAT_READ_LIMIT;
+            (duplicateCount >= PLAN_REPEAT_READ_LIMIT || planBudget.shouldRedirectToDesignClosure);
           if (shouldPushPlanReadLimit) {
             logAgentEvent("plan_repeat_read_limit", {
               iteration,
@@ -4954,16 +6077,20 @@ export async function executeAgentLoop(
               tool: tc.name,
               target,
               duplicateCount,
+              reason: planBudget.reason || "duplicate_read",
             });
           }
           const duplicateContent = formatCachedReadOnlyToolResult(tc.name, target, cached, duplicateCount);
+          const closurePrompt = shouldPushPlanReadLimit
+            ? `\n\n${buildPlanDesignClosurePromptFromEvidence(callbacks, recentPlanToolActivity, attemptedPlanWriteTargets)}`
+            : "";
           allResults.push({
             toolCallId: tc.id,
             name: tc.name,
             target,
             content: shouldPushPlanReadLimit
               ? appendPlanRepeatReadLimitGuidance(
-                  duplicateContent,
+                  `${duplicateContent}${closurePrompt}`,
                   callbacks.getPreferredLanguage(),
                   callbacks.getPlanStage(),
                 )
@@ -5189,7 +6316,7 @@ export async function executeAgentLoop(
       if (digest) callbacks.onExecutionDigestUpdate(digest);
     }
 
-    if (workflowMode === "plan" && callbacks.getIsPlanApproved()) {
+    if (workflowMode === "plan") {
       allResults.forEach(rememberPlanToolActivity);
     }
 
@@ -5282,6 +6409,24 @@ export async function executeAgentLoop(
         role: "user",
         content: unityMcpFallbackPrompt,
       });
+    }
+
+    if (workflowMode === "plan" && !callbacks.getIsPlanApproved() && allResults.some(isSuccessfulPlanArtifactWriteResult)) {
+      const currentStage = callbacks.getPlanStage();
+      if (isReviewablePlanStage(currentStage)) {
+        const reviewResult = await pauseForReviewablePlanArtifact("post_tool_plan_artifact_write");
+        if (reviewResult === "approved_continue") continue;
+        if (reviewResult === "stopped") return;
+      } else {
+        logAgentEvent("plan_artifact_write_not_reviewable_after_tool", {
+          iteration,
+          planStage: currentStage,
+          targets: allResults
+            .filter(isSuccessfulPlanArtifactWriteResult)
+            .map((result) => result.target)
+            .slice(0, 6),
+        });
+      }
     }
 
     if (workflowMode === "plan" && callbacks.getIsPlanApproved() && allResults.some((result) => !result.isError)) {

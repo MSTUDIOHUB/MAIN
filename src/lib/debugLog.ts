@@ -100,6 +100,48 @@ function shouldSkipConsoleLog(level: DebugLogLevel, args: unknown[]): boolean {
   return first.startsWith("[vite]") || first.includes("hot updated:");
 }
 
+function classifyConsoleLog(args: unknown[]): {
+  source: string;
+  messageArgs: unknown[];
+  suppressNativeConsole: boolean;
+} {
+  const first = typeof args[0] === "string" ? args[0] : "";
+  const agentMatch = first.match(/^\[agent\.([^\]]+)\]\s*(.*)$/);
+  if (agentMatch) {
+    const tail = agentMatch[2]?.trim();
+    return {
+      source: `agent.${agentMatch[1]}`,
+      messageArgs: tail ? [tail, ...args.slice(1)] : args.slice(1),
+      suppressNativeConsole: true,
+    };
+  }
+
+  const bracketMatch = first.match(/^\[(orchestrator|streaming|streamViaRustProxy|sendMessage|contextTrim)\]\s*(.*)$/);
+  if (bracketMatch) {
+    const source = bracketMatch[1] === "sendMessage" ? "store.sendMessage" : bracketMatch[1];
+    const tail = bracketMatch[2]?.trim();
+    return {
+      source,
+      messageArgs: tail ? [tail, ...args.slice(1)] : args.slice(1),
+      suppressNativeConsole: true,
+    };
+  }
+
+  if (first.startsWith("Agent loop crashed:")) {
+    return {
+      source: "store.agent_loop_crashed",
+      messageArgs: args,
+      suppressNativeConsole: true,
+    };
+  }
+
+  return {
+    source: "console",
+    messageArgs: args,
+    suppressNativeConsole: false,
+  };
+}
+
 function readLocalEntries(): DebugLogEntry[] {
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
@@ -278,9 +320,15 @@ export function installDebugLogCapture() {
 
   const wrapConsole = (level: DebugLogLevel, original: (...args: unknown[]) => void) => {
     return (...args: unknown[]) => {
-      original(...args);
-      if (shouldSkipConsoleLog(level, args)) return;
-      appendDebugLog(level, "console", args);
+      if (shouldSkipConsoleLog(level, args)) {
+        original(...args);
+        return;
+      }
+      const classified = classifyConsoleLog(args);
+      if (!classified.suppressNativeConsole) {
+        original(...args);
+      }
+      appendDebugLog(level, classified.source, classified.messageArgs);
     };
   };
 

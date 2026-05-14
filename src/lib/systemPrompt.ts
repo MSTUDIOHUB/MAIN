@@ -47,6 +47,160 @@ export type McpPriorityPromptContext = {
   connectedServerNames?: string[];
 };
 
+export type LanguageContract = {
+  displayLanguage?: Lang;
+  resolvedResponseLanguage?: Lang;
+};
+
+export type ToolProtocolCardProfile = {
+  activeProfile?: "local" | "cloud";
+  provider?: string | null;
+  model?: string | null;
+  toolProtocol?: string | null;
+  nativeToolsEnabled?: boolean;
+  workflowMode?: "chat" | "edit" | "plan";
+  availableToolNames?: string[];
+  language?: Lang;
+};
+
+function languageName(language: Lang | undefined, fallback: Lang = "zh"): string {
+  return (language === "en" ? "en" : language === "zh" ? "zh" : fallback) === "en"
+    ? "English"
+    : "简体中文";
+}
+
+export function buildLanguageContract(input: {
+  displayLanguage?: Lang;
+  resolvedResponseLanguage?: Lang;
+}): string {
+  const displayLanguage = input.displayLanguage === "en" ? "en" : "zh";
+  const resolvedResponseLanguage = input.resolvedResponseLanguage === "en" ? "en" : "zh";
+  return [
+    "================================",
+    "[LANGUAGE CONTRACT]",
+    `displayLanguage: ${displayLanguage} (${languageName(displayLanguage)})`,
+    `resolvedResponseLanguage: ${resolvedResponseLanguage} (${languageName(resolvedResponseLanguage)})`,
+    `All user-visible assistant text, summaries, options, approval copy, and .MAIN/plans/*.md content MUST use ${languageName(resolvedResponseLanguage)}.`,
+    `UI chrome/tool labels may use displayLanguage (${languageName(displayLanguage)}), but model-authored visible content follows resolvedResponseLanguage.`,
+    "Tool names, XML tags, JSON keys, code identifiers, commands, and file paths remain machine-readable and must not be translated.",
+    "If you need a tool, emit the tool call directly. Do not add pre-tool filler prose in a different language.",
+  ].join("\n");
+}
+
+const TOOL_REQUIRED_ARGUMENTS: Record<string, string> = {
+  get_project_skeleton: "depth?",
+  list_directory: "path",
+  read_file: "path, start_line?, max_lines?",
+  get_file_outline: "path",
+  read_document: "path, row_offset?, max_rows?",
+  analyze_tabular_document: "path",
+  query_tabular_document: "path, query",
+  index_workspace_documents: "path",
+  glob_search: "pattern",
+  grep_search: "query, path?",
+  write_file: "path, content",
+  replace_in_file: "path, search, replace",
+  run_command: "command, cwd, description, timeout_ms?",
+  execute_command: "command, cwd, description",
+  send_pty_input: "input",
+  read_pty_tail: "max_lines?",
+  read_pty_since: "offset",
+  get_pty_status: "",
+  clear_pty_buffer: "",
+};
+
+function compactToolSignature(name: string): string {
+  const args = TOOL_REQUIRED_ARGUMENTS[name];
+  return args == null ? name : args ? `${name}(${args})` : `${name}()`;
+}
+
+function selectProtocolExampleTool(available: string[]): string {
+  if (available.includes("read_file")) return "read_file";
+  if (available.includes("analyze_tabular_document")) return "analyze_tabular_document";
+  if (available.includes("get_project_skeleton")) return "get_project_skeleton";
+  return available[0] || "read_file";
+}
+
+function buildXmlExample(toolName: string): string[] {
+  if (toolName === "analyze_tabular_document") {
+    return [
+      "<tool_use>",
+      "<tool>analyze_tabular_document</tool>",
+      "<parameter name=\"path\">orders.csv</parameter>",
+      "</tool_use>",
+    ];
+  }
+  if (toolName === "get_project_skeleton") {
+    return [
+      "<tool_use>",
+      "<tool>get_project_skeleton</tool>",
+      "<parameter name=\"depth\">3</parameter>",
+      "</tool_use>",
+    ];
+  }
+  return [
+    "<tool_use>",
+    "<tool>read_file</tool>",
+    "<parameter name=\"path\">src/App.tsx</parameter>",
+    "</tool_use>",
+  ];
+}
+
+export function buildToolProtocolCard(profile: ToolProtocolCardProfile): string {
+  const language = profile.language === "en" ? "en" : "zh";
+  const available = (profile.availableToolNames || []).filter(Boolean);
+  const displayedTools = available.slice(0, 12).map(compactToolSignature);
+  const extraCount = Math.max(0, available.length - displayedTools.length);
+  const toolList = displayedTools.length
+    ? `${displayedTools.join(", ")}${extraCount > 0 ? `, +${extraCount} more` : ""}`
+    : "none";
+  const rawToolProtocol = String(profile.toolProtocol || "auto").toLowerCase();
+  const usesXml =
+    rawToolProtocol === "xml" ||
+    (
+      profile.activeProfile === "local" &&
+      profile.nativeToolsEnabled !== true &&
+      (rawToolProtocol === "auto" || rawToolProtocol === "")
+    );
+  const provider = [profile.activeProfile || "unknown", profile.provider || "unknown"]
+    .filter(Boolean)
+    .join("/");
+  const exampleTool = selectProtocolExampleTool(available);
+  const example = buildXmlExample(exampleTool);
+
+  if (!usesXml && profile.nativeToolsEnabled) {
+    return [
+      "================================",
+      "[TOOL PROTOCOL CARD]",
+      `profile: ${provider}; protocol: native`,
+      `availableTools: ${toolList}`,
+      language === "zh"
+        ? "需要工具时直接发起 native tool call；不要用正文写 `[Tool call: ...]`、`<tool_code>` 或伪 JSON。"
+        : "When you need a tool, emit a native tool call directly; do not write `[Tool call: ...]`, `<tool_code>`, or pseudo JSON in prose.",
+      language === "zh"
+        ? "不需要工具时，直接输出用户可见 Markdown。"
+        : "When no tool is needed, output user-visible Markdown directly.",
+    ].join("\n");
+  }
+
+  return [
+    "================================",
+    "[TOOL PROTOCOL CARD]",
+    `profile: ${provider}; protocol: xml-text`,
+    `availableTools: ${toolList}`,
+    language === "zh"
+      ? "需要工具时，下一条内容必须只包含一个完整 XML 工具块；不要在工具块前后写解释、过程句或占位文本。"
+      : "When you need a tool, the next content must contain exactly one complete XML tool block; do not add explanation, process narration, or placeholders around it.",
+    ...example,
+    language === "zh"
+      ? "禁止输出 `[Tool call: read_file]`、`Tool call: read_file`、`<tool_code>...</tool_code>`、`我要调用工具`。这些都不是可执行工具调用。"
+      : "Never output `[Tool call: read_file]`, `Tool call: read_file`, `<tool_code>...</tool_code>`, or prose saying you will call a tool. They are not executable tool calls.",
+    language === "zh"
+      ? "如果缺少必填参数，先用当前可用只读工具获取上下文；仍无法确定时，用普通 Markdown 说明缺口或用 `<user_options>` 请求用户选择。"
+      : "If required parameters are missing, first use available read-only tools to gather context; if still impossible, explain the gap in Markdown or ask with `<user_options>`.",
+  ].join("\n");
+}
+
 const WORKSPACE_IGNORE_DIRS = new Set(["node_modules", ".git", ".svn", ".hg", ".idea", ".vscode", ".vs", "dist", "build", "out", "bin", "obj", "target", "vendor", "__pycache__", ".next", ".nuxt", ".cache", ".turbo", "coverage", ".gradle", ".dart_tool", ".fvm", ".DS_Store"]);
 
 const READ_ONLY_BUILT_IN_TOOL_NAMES = [
@@ -121,11 +275,24 @@ export function buildSystemPrompt(
   availableToolNames?: string[],
   commandDirective?: CommandDirective | null,
   mcpPriorityContext?: McpPriorityPromptContext,
+  languageContract?: LanguageContract,
+  toolProtocolProfile?: Omit<ToolProtocolCardProfile, "availableToolNames" | "workflowMode" | "language">,
 ): string {
   const parts: string[] = [];
-  const fallbackLanguageName = uiLanguage === "zh" ? "中文" : "English";
+  const displayLanguage = languageContract?.displayLanguage === "en" ? "en" : "zh";
+  const resolvedResponseLanguage = languageContract?.resolvedResponseLanguage === "en"
+    ? "en"
+    : uiLanguage === "en" ? "en" : "zh";
+  const fallbackLanguageName = languageName(displayLanguage);
+  const resolvedLanguageName = languageName(resolvedResponseLanguage);
   const turnIntent = turnIntentOverride ?? resolveRunIntentFromLegacyWorkflowMode(workflowMode ?? "chat");
   const turnIntentPolicy = getIntentPolicy(turnIntent);
+  const protocolCard = buildToolProtocolCard({
+    ...toolProtocolProfile,
+    workflowMode,
+    availableToolNames,
+    language: resolvedResponseLanguage,
+  });
   const normalizedMainModeKey = mapLegacyNexusModeToMainMode(mainModeKey);
   const shellToolsAvailable =
     isToolNameAvailable("run_command", availableToolNames) ||
@@ -140,6 +307,10 @@ export function buildSystemPrompt(
   parts.push("`read_file` 返回的是源码/文本内容窗口；如果结果包含 `truncated: true`、`returnedLines` 或 `nextStartLine`，说明这不是完整文件。需要更多内容时继续调用 `read_file` 并传 `start_line` / `end_line` / `max_lines`，" + filePagingWarning);
   parts.push("遇到 TypeScript、测试、构建或 lint 报错行号时，优先读取报错行附近的小窗口，例如 `read_file(path, start_line, max_lines)`；不要先全量读取大型源文件。");
   if (workspaceTree) { parts.push("该目录的基础结构如下：\n" + workspaceTree); }
+  parts.push(buildLanguageContract({
+    displayLanguage,
+    resolvedResponseLanguage,
+  }));
 
   parts.push([
     "================================",
@@ -160,11 +331,13 @@ export function buildSystemPrompt(
     "If a needed tool is absent because of the current intent, continue with available safe tools or explain the blocker and ask for plan/execute consent.",
     "",
     "[LOCALIZED USER OUTPUT]",
-    "All user-visible explanations, summaries, plans, task titles, and approval text must follow this turn's resolved target language.",
+    `All user-visible explanations, summaries, plans, task titles, and approval text must use this turn's resolved response language: ${resolvedLanguageName}.`,
     `If the resolved language is unclear, use the UI fallback language: ${fallbackLanguageName}.`,
     "Any user-visible pre-tool narration must also use the resolved target language. If unsure, emit the tool call directly instead of filler prose in another language.",
     "Keep protocol labels, code identifiers, file names, and machine-readable markers unchanged when needed.",
   ].join("\n"));
+
+  parts.push(protocolCard);
 
   if (commandDirective && commandDirective.kind !== "none") {
     parts.push([
@@ -209,7 +382,7 @@ export function buildSystemPrompt(
       ? "4. 执行验证 — 命令工具在本轮可用时，一次性命令优先用 `run_command` 获取 stdout/stderr/exitCode；交互式或长驻命令用 `execute_command` 后必须跟随 `read_pty_since`、`read_pty_tail` 或 `get_pty_status` 验证结果。"
       : "4. 执行验证 — 本轮未暴露命令工具时，不要尝试 shell 执行；需要验证时先记录为计划、检查项或后续执行步骤。",
     "5. 流程优先级 — 若下方启用了特定 Workflow Skills（工作流协议），必须优先且严格遵守该协议规则。",
-    `6. 语言跟随 — 所有对用户可见的正文、总结、Plan 文档（.MAIN/plans/*.md）、任务标题、审批说明，必须优先使用**本轮已解析的目标语言（resolved turn language）**。如果目标语言不明确，则默认使用界面语言：${fallbackLanguageName}。工具调用前若需要输出可见说明，也必须使用目标语言；若不确定语言，宁可直接发工具调用，不要输出其他语言的过程句。文件名、固定协议标记（如 \`[PROPOSAL START]\`、\`# Proposed Plan\`）和代码标识符可以保留英文，但解释性正文必须跟随目标语言。`,
+    `6. 语言跟随 — 所有对用户可见的正文、总结、Plan 文档（.MAIN/plans/*.md）、任务标题、审批说明，必须使用本轮 resolvedResponseLanguage：${resolvedLanguageName}。显示语言仅用于 UI 外壳；文件名、固定协议标记（如 \`[PROPOSAL START]\`、\`# Proposed Plan\`）和代码标识符可以保留英文，但解释性正文必须跟随回复语言。`,
     "7. 目标先行 — 在进入规划或执行前，先判断用户本轮真正想要的是：只要解释、只要方案、先方案后执行、还是直接执行。优先对齐终极目标，而不是机械重复用户字面步骤。",
     "8. 模板优先 — 若下方提供了工作区模板（尤其是意图分析模板与 Plan 模板），优先沿用其章节顺序与检查清单，再填入当前任务的真实内容；不要原样保留占位提示。",
     "",
@@ -217,7 +390,7 @@ export function buildSystemPrompt(
     "你的回复中，**只有 XML 标签之外的 Markdown 正文才会被用户看到**。",
     "- `<analysis>`、`<thought>`、`<thinking>`、`<reasoning>` 标签内的内容会进入折叠的后台过程块；用户默认看不到，也可能在设置中以过滤摘要查看。",
     "- 因此：你的分析、总结、结论、方案等所有需要用户看到的内容，**必须以普通 Markdown 文本的形式输出，绝不能放在任何 XML 标签内部**。",
-    "- `<analysis>` 仅用于调用工具前的 1-2 句极简内心备注（如「我需要先检查 Scripts 目录」），**禁止将任何分析正文、方案内容或最终结论写在 `<analysis>` 内**。",
+    "- 不要主动输出 `<analysis>` 过程句；如果底层模型或服务端产生 hidden reasoning，运行时会折叠为过程摘要。**禁止将任何分析正文、方案内容或最终结论写在 `<analysis>` 内**。",
     "- 调用 native tools 时可以直接发出工具调用；界面会展示执行状态。只有在真正需要向用户说明判断、结果或阻塞时，才输出普通 Markdown。",
     "",
     "## 用户提问交互规则",
@@ -427,19 +600,29 @@ export function buildSystemPrompt(
     parts.push(chatInstructions.join("\n"));
   } else {
     const tfl: string[] = [];
+    const compactWorkflowToolGuide =
+      toolProtocolProfile?.activeProfile === "local" &&
+      toolProtocolProfile?.nativeToolsEnabled !== true &&
+      turnIntent === "plan";
+    const compactWorkflowToolDescriptions = new Set([
+      "get_project_skeleton",
+      "read_file",
+      "read_document",
+      "analyze_tabular_document",
+      "query_tabular_document",
+      "write_file",
+    ]);
     tfl.push("## 工具调用格式");
     tfl.push("优先使用 native tool calling；如果当前模型只支持文本工具协议，则使用 XML 格式调用工具：");
     tfl.push("");
-    tfl.push("如果需要在调用工具前做一个简短的内心备注（1-2 句话），可以用 `<analysis>` 包裹：");
-    tfl.push("<analysis>我需要先检查 Scripts 目录的结构</analysis>");
-    tfl.push("然后调用工具：");
+    tfl.push("需要工具时只输出完整工具调用，不要先写“我将读取/Let me check/I need to...”这类过程句：");
     tfl.push("<tool_use>");
     tfl.push("<tool>工具名称</tool>");
     tfl.push(String.raw`<parameter name="参数名">参数值</parameter>`);
     tfl.push("</tool_use>");
     tfl.push("禁止输出 `[Tool call: ...]`、`Tool call: read_file`、`<tool_code>...</tool_code>`、`我要调用工具` 这类占位文本；这些不是可执行工具调用，会被视为协议错误。需要工具时必须输出完整 `<tool_use>`，并补齐必填参数。");
     tfl.push("");
-    tfl.push("⚠️ `<analysis>` 中的内容默认对用户隐藏，且即使用户开启过程显示也只会以过滤摘要呈现；你的分析、总结、方案必须以普通 Markdown 文本输出，不能放在 `<analysis>` 内。");
+    tfl.push(`⚠️ 需要用户看到的分析、总结、方案必须以普通 Markdown 输出，并使用 ${resolvedLanguageName}；不要放进 XML 分析标签或 hidden reasoning。`);
     tfl.push("");
     tfl.push("可用的工具：" + formatToolNameList(
       customToolNames,
@@ -452,6 +635,7 @@ export function buildSystemPrompt(
     tfl.push("");
     tfl.push("### 工具说明：");
     const addToolDescription = (name: string, description: string) => {
+      if (compactWorkflowToolGuide && !compactWorkflowToolDescriptions.has(name)) return;
       if (isToolNameAvailable(name, availableToolNames)) tfl.push(description);
     };
     addToolDescription("get_project_skeleton", "- get_project_skeleton: (depth?: number) 极速获取项目宏观骨架。Unity 感知：自动识别 .asmdef 模块边界、折叠大目录、弹性穿透无关键文件的层级。始终作为第一步使用。");

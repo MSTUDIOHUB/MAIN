@@ -23,6 +23,7 @@ const CLOUD_SETTINGS_EMPTY_SCENARIO = "cloud-settings-empty";
 const CLOUD_STATUS_ACTIVE_SERVER_MODEL_SCENARIO = "cloud-status-active-server-model";
 const STREAMING_TIMER_SCENARIO = "streaming-timer";
 const STREAMING_RESPONSIVENESS_SCENARIO = "streaming-responsiveness";
+const LOCAL_PLAN_SLOW_FIRST_TOKEN_SCENARIO = "local-plan-slow-first-token";
 const STREAM_ERROR_RECOVERY_SCENARIO = "stream-error-recovery";
 const SESSION_AUTO_CREATE_SCENARIO = "session-auto-create";
 const CLOUD_TOOL_FALLBACK_SCENARIO = "cloud-tool-fallback";
@@ -35,7 +36,9 @@ const UNITY_TOOL_CODE_COMPAT_SCENARIO = "unity-tool-code-compat";
 const UNITY_NO_ERROR_ROUTING_SCENARIO = "unity-no-error-routing";
 const PSEUDO_TOOL_CALL_RECOVERY_SCENARIO = "pseudo-tool-call-recovery";
 const MALFORMED_TOOL_USE_PLAN_SCENARIO = "malformed-tool-use-plan";
+const PLAN_CLOSURE_GUARD_EMPTY_SCENARIO = "plan-closure-guard-empty";
 const EXISTING_PLAN_FOLDER_EXECUTE_SCENARIO = "existing-plan-folder-execute";
+const APPROVED_PLAN_EXECUTION_NO_TOOL_SCENARIO = "approved-plan-execution-no-tool";
 const EXECUTE_MAX_ITERATIONS_CHECKPOINT_SCENARIO = "execute-max-iterations-checkpoint";
 const LOCAL_FILE_READ_APPROVAL_SCENARIO = "local-file-read-approval";
 const TOP_ISLAND_EXECUTION_PROGRESS_SCENARIO = "top-island-execution-progress";
@@ -3203,6 +3206,227 @@ function seedStreamErrorRecoveryScenario() {
   return cleanup;
 }
 
+function seedLocalPlanSlowFirstTokenScenario() {
+  const bridge = getBridge();
+  if (!bridge) return undefined;
+
+  bridge.events = [{ type: "boot" }];
+  bridge.savedDocuments = [];
+  bridge.completed = false;
+
+  incrementSeedCount(LOCAL_PLAN_SLOW_FIRST_TOKEN_SCENARIO);
+
+  const now = Date.now();
+  const workspace = "/tmp/e2e-local-plan-slow-first-token";
+  const sessionId = 999511;
+
+  useAppStore.setState((state) => ({
+    ...state,
+    config: {
+      ...state.config,
+      language: "zh",
+      workflowMode: "plan",
+      activeProfile: "local",
+      local: {
+        ...state.config.local,
+        provider: "Ollama",
+        endpoint: "http://127.0.0.1:11434/v1",
+        model: "e2e-slow-local-plan",
+        apiKey: "ollama",
+        contextLimit: 16384,
+        toolProtocol: "xml",
+      },
+      workspace,
+      instructionsEnabled: false,
+      hooksEnabled: false,
+      sessionRecordingEnabled: false,
+    },
+    currentWorkspace: workspace,
+    selectedWorkspace: workspace,
+    sessionsByWorkspace: {
+      [workspace]: [
+        {
+          id: sessionId,
+          title: "E2E Local Plan Slow First Token",
+          date: new Date(now).toISOString(),
+          active: true,
+          storageStatus: "temporary",
+          recordingDisabled: true,
+          messages: [],
+        },
+      ],
+    },
+    currentSessionId: sessionId,
+    selectedMainModeKey: "main_mode",
+    selectedNexusModeKey: "nexus_general",
+    taskFlow: [],
+    agentMessages: [],
+    conversationTurns: [],
+    currentTurnId: null,
+    input: "",
+    attachedFiles: [],
+    contextMentions: [],
+    planArtifacts: [],
+    planTasks: [],
+    planStage: "idle",
+    isPlanApproved: false,
+    readOnlyAutoApproveForSession: false,
+    isGenerating: false,
+    agentStatus: "idle",
+    elapsedTime: 0,
+    showPlanPanel: false,
+    showTerminal: false,
+    showFilePanel: false,
+    showDiff: false,
+    selectedDiffTaskId: null,
+  }));
+
+  bridge.sendCloudMessage = (text?: string) =>
+    useAppStore.getState().sendMessage(
+      text || "请为慢首 token 的本地模型生成一个可审批设计方案。",
+      undefined,
+      {
+        resolvedIntent: "plan",
+        skipIntentResolution: true,
+      },
+    );
+
+  bridge.getSnapshot = () => {
+    const state = useAppStore.getState();
+    const currentTurn = state.currentTurnId
+      ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId) || null
+      : null;
+    return {
+      agentStatus: state.agentStatus,
+      isGenerating: state.isGenerating,
+      planStage: state.planStage,
+      planArtifactPaths: state.planArtifacts.map((artifact) => artifact.path),
+      currentTurnStatus: currentTurn?.status ?? null,
+      systemTexts: (state.taskFlow.filter((block) => block.type === "system") as any[]).map((block) => block.content),
+      seedCount: readSeedCount(LOCAL_PLAN_SLOW_FIRST_TOKEN_SCENARIO),
+    };
+  };
+
+  const cleanup = () => {
+    bridge.initialized = false;
+  };
+
+  bridge.cleanup = cleanup;
+  return cleanup;
+}
+
+function seedLocalPlanClosureGuardEmptyScenario() {
+  const bridge = getBridge();
+  if (!bridge) return undefined;
+
+  bridge.events = [{ type: "boot" }];
+  bridge.savedDocuments = [];
+  bridge.completed = false;
+
+  incrementSeedCount(PLAN_CLOSURE_GUARD_EMPTY_SCENARIO);
+
+  const now = Date.now();
+  const workspace = "/tmp/e2e-plan-closure-guard-empty";
+  const sessionId = 999512;
+
+  useAppStore.setState((state) => ({
+    ...state,
+    config: {
+      ...state.config,
+      language: "zh",
+      workflowMode: "plan",
+      activeProfile: "local",
+      local: {
+        ...state.config.local,
+        provider: "Ollama",
+        endpoint: "http://127.0.0.1:11434/v1",
+        model: "e2e-local-empty-plan",
+        apiKey: "ollama",
+        contextLimit: 16384,
+        toolProtocol: "xml",
+      },
+      workspace,
+      instructionsEnabled: false,
+      hooksEnabled: false,
+      sessionRecordingEnabled: false,
+    },
+    currentWorkspace: workspace,
+    selectedWorkspace: workspace,
+    sessionsByWorkspace: {
+      [workspace]: [
+        {
+          id: sessionId,
+          title: "E2E Plan Closure Guard Empty",
+          date: new Date(now).toISOString(),
+          active: true,
+          storageStatus: "temporary",
+          recordingDisabled: true,
+          messages: [],
+        },
+      ],
+    },
+    currentSessionId: sessionId,
+    selectedMainModeKey: "main_mode",
+    selectedNexusModeKey: "nexus_general",
+    taskFlow: [],
+    agentMessages: [],
+    conversationTurns: [],
+    currentTurnId: null,
+    input: "",
+    attachedFiles: [],
+    contextMentions: [],
+    planArtifacts: [],
+    planTasks: [],
+    planStage: "idle",
+    isPlanApproved: false,
+    readOnlyAutoApproveForSession: false,
+    isGenerating: false,
+    agentStatus: "idle",
+    elapsedTime: 0,
+    showPlanPanel: false,
+    showTerminal: false,
+    showFilePanel: false,
+    showDiff: false,
+    selectedDiffTaskId: null,
+  }));
+
+  bridge.sendCloudMessage = (text?: string) =>
+    useAppStore.getState().sendMessage(
+      text || "请基于 orders.csv 生成一个数据分析自动化设计方案。",
+      undefined,
+      {
+        resolvedIntent: "plan",
+        skipIntentResolution: true,
+      },
+    );
+
+  bridge.getSnapshot = () => {
+    const state = useAppStore.getState();
+    const currentTurn = state.currentTurnId
+      ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId) || null
+      : null;
+    const agentBlocks = state.taskFlow.filter((block) => block.type === "agent") as any[];
+    const thoughtBlocks = state.taskFlow.filter((block) => block.type === "thought") as any[];
+    return {
+      agentStatus: state.agentStatus,
+      isGenerating: state.isGenerating,
+      planStage: state.planStage,
+      planArtifactPaths: state.planArtifacts.map((artifact) => artifact.path),
+      currentTurnStatus: currentTurn?.status ?? null,
+      agentTexts: agentBlocks.map((block) => block.content),
+      thoughtTexts: thoughtBlocks.map((block) => block.content),
+      seedCount: readSeedCount(PLAN_CLOSURE_GUARD_EMPTY_SCENARIO),
+    };
+  };
+
+  const cleanup = () => {
+    bridge.initialized = false;
+  };
+
+  bridge.cleanup = cleanup;
+  return cleanup;
+}
+
 function seedCloudToolProtocolScenario(scenario: string) {
   const bridge = getBridge();
   if (!bridge) return undefined;
@@ -3231,6 +3455,8 @@ function seedCloudToolProtocolScenario(scenario: string) {
     ? 999506
     : scenario === MALFORMED_TOOL_USE_PLAN_SCENARIO
     ? 999510
+    : scenario === APPROVED_PLAN_EXECUTION_NO_TOOL_SCENARIO
+    ? 999513
     : 999502;
   const server = {
     id: `e2e-${scenario}-server`,
@@ -3255,7 +3481,11 @@ function seedCloudToolProtocolScenario(scenario: string) {
     config: {
       ...state.config,
       language: "zh",
-      workflowMode: scenario === MALFORMED_TOOL_USE_PLAN_SCENARIO ? "plan" : "chat",
+      workflowMode:
+        scenario === MALFORMED_TOOL_USE_PLAN_SCENARIO ||
+        scenario === APPROVED_PLAN_EXECUTION_NO_TOOL_SCENARIO
+          ? "plan"
+          : "chat",
       activeProfile: "cloud",
       workspace,
       cloud: server,
@@ -3287,6 +3517,8 @@ function seedCloudToolProtocolScenario(scenario: string) {
             ? "E2E Local File Read Approval"
             : scenario === MALFORMED_TOOL_USE_PLAN_SCENARIO
             ? "E2E Malformed Tool Use Plan"
+            : scenario === APPROVED_PLAN_EXECUTION_NO_TOOL_SCENARIO
+            ? "E2E Approved Plan No Tool"
             : "E2E Reply Options Tool Pause",
           date: new Date(now).toISOString(),
           active: true,
@@ -3325,6 +3557,18 @@ function seedCloudToolProtocolScenario(scenario: string) {
     showTerminal: false,
     showFilePanel: false,
     selectedDiffTaskId: null,
+    ...(scenario === APPROVED_PLAN_EXECUTION_NO_TOOL_SCENARIO
+      ? {
+          planArtifacts: [],
+          planTasks: [],
+          planExecutionEvidenceLedger: [],
+          planExecutionEvidenceCount: 0,
+          planStage: "idle",
+          isPlanApproved: false,
+          autoApproveTools: true,
+          autoApproveToolScopes: ["shell", "workspace_write"],
+        }
+      : {}),
   }));
 
   bridge.sendCloudMessage = (text?: string) => {
@@ -3339,7 +3583,7 @@ function seedCloudToolProtocolScenario(scenario: string) {
       );
     }
 
-    if (scenario === EXISTING_PLAN_FOLDER_EXECUTE_SCENARIO) {
+    if (scenario === EXISTING_PLAN_FOLDER_EXECUTE_SCENARIO || scenario === APPROVED_PLAN_EXECUTION_NO_TOOL_SCENARIO) {
       return useAppStore.getState().sendMessage(
         text || "根据.MAIN/plans文件夹的内容，完成执行方案和任务的内容。",
       );
@@ -4200,6 +4444,10 @@ export function initializeE2EScenarios(): (() => void) | undefined {
     return seedStreamingResponsivenessScenario();
   }
 
+  if (scenario === LOCAL_PLAN_SLOW_FIRST_TOKEN_SCENARIO) {
+    return seedLocalPlanSlowFirstTokenScenario();
+  }
+
   if (scenario === STREAM_ERROR_RECOVERY_SCENARIO) {
     return seedStreamErrorRecoveryScenario();
   }
@@ -4239,9 +4487,16 @@ export function initializeE2EScenarios(): (() => void) | undefined {
   if (scenario === MALFORMED_TOOL_USE_PLAN_SCENARIO) {
     return seedCloudToolProtocolScenario(MALFORMED_TOOL_USE_PLAN_SCENARIO);
   }
+  if (scenario === PLAN_CLOSURE_GUARD_EMPTY_SCENARIO) {
+    return seedLocalPlanClosureGuardEmptyScenario();
+  }
 
   if (scenario === EXISTING_PLAN_FOLDER_EXECUTE_SCENARIO) {
     return seedCloudToolProtocolScenario(EXISTING_PLAN_FOLDER_EXECUTE_SCENARIO);
+  }
+
+  if (scenario === APPROVED_PLAN_EXECUTION_NO_TOOL_SCENARIO) {
+    return seedCloudToolProtocolScenario(APPROVED_PLAN_EXECUTION_NO_TOOL_SCENARIO);
   }
 
   if (scenario === EXECUTE_MAX_ITERATIONS_CHECKPOINT_SCENARIO) {

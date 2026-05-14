@@ -22,6 +22,10 @@ function loadPlanControlModule() {
   return loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planControl.ts"));
 }
 
+function loadPlanExecutionNoToolModule() {
+  return loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planExecutionNoTool.ts"));
+}
+
 function loadPlanLifecycleModule() {
   return loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planLifecycle.ts"));
 }
@@ -99,6 +103,7 @@ const {
   resolvePinnedConversationTurn,
   shouldPlanShortcutReplaceTurn,
   summarizeUserPrompt,
+  validateActionableDesignArtifact,
   validatePlanArtifactContent,
 } = loadWorkflowModelsModule();
 
@@ -113,6 +118,11 @@ const {
   buildPlanApprovalChoiceHint,
   shouldRouteQuickReplyToPlanApproval,
 } = loadPlanControlModule();
+
+const {
+  buildPlanExecutionNoToolRecoveryPrompt,
+  shouldHandleApprovedPlanExecutionNoTool,
+} = loadPlanExecutionNoToolModule();
 
 const {
   buildClosedActivePlanRuntimePatch,
@@ -777,8 +787,30 @@ test("findDroppedPlanTasks detects task deletion from rewritten tasks.md", () =>
 test("validatePlanArtifactContent rejects fallback/log/thought/code fragments", () => {
   assert.equal(validatePlanArtifactContent("自动生成的兜底草稿：模型已经读取上下文。", "requirements").ok, false);
   assert.equal(validatePlanArtifactContent("Repeated read-only tool call skipped: get project skeleton", "design").ok, false);
+  assert.equal(validatePlanArtifactContent("ContextMemoryState v1\nLatest user request: foo", "design").ok, false);
+  assert.equal(validatePlanArtifactContent("[MAIN TOOL FEEDBACK V1]{\"tool\":\"read_file\"}", "design").ok, false);
   assert.equal(validatePlanArtifactContent("后台思考已折叠\n让我先分析用户需求。", "design").ok, false);
   assert.equal(validatePlanArtifactContent("using System;\nnamespace Battle.Core { public class BattleUnit {} }", "requirements").ok, false);
+});
+
+test("validateActionableDesignArtifact rejects generic fallback design", () => {
+  const generic = [
+    "# Design",
+    "## 用户目标与约束",
+    "- 用户目标：请生成一个方案。",
+    "## 当前发现",
+    "- 已经获得只读上下文，足以先形成可审批的设计方案。",
+    "## 拟定方案",
+    "- 围绕用户目标设计最小可用闭环：输入读取、数据校验、核心处理、结果展示或导出。",
+    "## 影响文件与接口",
+    "- 审批产物：`.MAIN/plans/design.md`。",
+    "## 执行顺序",
+    "1. 确认输入结构。",
+    "## 验证方式",
+    "- 运行检查。",
+  ].join("\n");
+
+  assert.equal(validateActionableDesignArtifact(generic).ok, false);
 });
 
 test("validatePlanArtifactContent accepts real requirements and design artifacts", () => {
@@ -818,6 +850,47 @@ test("validatePlanArtifactContent requires inferable task evidence", () => {
   assert.equal(validatePlanArtifactContent("- [ ] 调整空状态", "tasks").ok, false);
   assert.equal(validatePlanArtifactContent("- [ ] 调整 src/App.tsx 空状态", "tasks").ok, true);
   assert.equal(validatePlanArtifactContent("- [ ] 运行检查 — 证据: cmd:npx tsc --noEmit", "tasks").ok, true);
+  assert.equal(validatePlanArtifactContent("- [ ] 修复组件状态 — 证据: file:src/App.tsx", "tasks").ok, true);
+});
+
+test("approved plan execution no-tool recovery bypasses generic missing-tool stop", () => {
+  const audit = buildPlanTaskEvidenceAudit({
+    tasks: extractPlanTasks("- [ ] 修复执行阶段状态边界 — 证据: file:src/store/useAppStore.ts"),
+    evidenceLedger: [],
+    highlightNext: true,
+  });
+
+  assert.equal(
+    shouldHandleApprovedPlanExecutionNoTool({
+      workflowMode: "plan",
+      isPlanApproved: true,
+      planStage: "executing",
+      toolCallCount: 0,
+      audit,
+    }),
+    true,
+  );
+  assert.equal(
+    shouldHandleApprovedPlanExecutionNoTool({
+      workflowMode: "plan",
+      isPlanApproved: true,
+      planStage: "design",
+      toolCallCount: 0,
+      audit,
+    }),
+    false,
+  );
+
+  const prompt = buildPlanExecutionNoToolRecoveryPrompt({
+    language: "zh",
+    missingTasksArtifact: false,
+    remainingText: audit.blockedReasons.join("\n"),
+    commandHint: "命令提示",
+  });
+  assert.match(prompt, /已批准计划正在执行/);
+  assert.match(prompt, /直接调用工具/);
+  assert.match(prompt, /src\/store\/useAppStore\.ts/);
+  assert.doesNotMatch(prompt, /missing_tool_reprompt_limit|聊天失败/);
 });
 
 test("collectChangeEntries ignores ephemeral plan files but keeps source and bugfix diffs", () => {

@@ -58,7 +58,9 @@ function loadTranspiledModuleSync(sourcePath) {
 
 const {
   createStreamNoVisibleTokenTimeoutError,
+  buildPlanExplorationBudget,
   isStreamWatchdogTimeoutMessage,
+  shouldAttemptPlanClosureGuard,
   shouldUsePlanNoVisibleTokenWatchdog,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"));
 
@@ -70,12 +72,55 @@ test("classifies no-visible-token stream timeout as a plan watchdog timeout", ()
   assert.equal(isStreamWatchdogTimeoutMessage(error.message), true);
 });
 
-test("enables no-visible-token watchdog only for pre-approval plan text protocol", () => {
+test("keeps local pre-approval plan text protocol as notice-only", () => {
   assert.equal(
     shouldUsePlanNoVisibleTokenWatchdog({
       workflowMode: "plan",
       isPlanApproved: false,
       nativeToolCount: 0,
+      activeProfile: "local",
+      provider: "Ollama",
+      toolProtocol: "xml",
+    }),
+    false,
+  );
+
+  assert.equal(
+    shouldUsePlanNoVisibleTokenWatchdog({
+      workflowMode: "plan",
+      isPlanApproved: false,
+      nativeToolCount: 0,
+      activeProfile: "local",
+      provider: "OMLX",
+      toolProtocol: "auto",
+    }),
+    false,
+  );
+});
+
+test("keeps local native no-token stalls under the hard watchdog when no native tools are attached", () => {
+  assert.equal(
+    shouldUsePlanNoVisibleTokenWatchdog({
+      workflowMode: "plan",
+      isPlanApproved: false,
+      nativeToolCount: 0,
+      activeProfile: "local",
+      provider: "OMLX",
+      toolProtocol: "native",
+    }),
+    true,
+  );
+});
+
+test("enables no-visible-token watchdog for cloud pre-approval plan text protocol", () => {
+  assert.equal(
+    shouldUsePlanNoVisibleTokenWatchdog({
+      workflowMode: "plan",
+      isPlanApproved: false,
+      nativeToolCount: 0,
+      activeProfile: "cloud",
+      provider: "OpenAI",
+      toolProtocol: "xml",
     }),
     true,
   );
@@ -84,6 +129,9 @@ test("enables no-visible-token watchdog only for pre-approval plan text protocol
       workflowMode: "plan",
       isPlanApproved: true,
       nativeToolCount: 0,
+      activeProfile: "cloud",
+      provider: "OpenAI",
+      toolProtocol: "xml",
     }),
     false,
   );
@@ -92,6 +140,9 @@ test("enables no-visible-token watchdog only for pre-approval plan text protocol
       workflowMode: "plan",
       isPlanApproved: false,
       nativeToolCount: 2,
+      activeProfile: "cloud",
+      provider: "OpenAI",
+      toolProtocol: "native",
     }),
     false,
   );
@@ -100,7 +151,97 @@ test("enables no-visible-token watchdog only for pre-approval plan text protocol
       workflowMode: "edit",
       isPlanApproved: false,
       nativeToolCount: 0,
+      activeProfile: "cloud",
+      provider: "OpenAI",
+      toolProtocol: "xml",
     }),
     false,
+  );
+});
+
+test("plan closure guard runs before empty checkpoint when read-only evidence exists", () => {
+  assert.equal(
+    shouldAttemptPlanClosureGuard({
+      workflowMode: "plan",
+      isPlanApproved: false,
+      hasReviewablePlanArtifacts: false,
+      evidenceCount: 3,
+      consecutiveEmptyResponseCount: 2,
+      toolCallCount: 0,
+      replyOptionCount: 0,
+    }),
+    true,
+  );
+
+  assert.equal(
+    shouldAttemptPlanClosureGuard({
+      workflowMode: "plan",
+      isPlanApproved: false,
+      hasReviewablePlanArtifacts: false,
+      evidenceCount: 0,
+      consecutiveEmptyResponseCount: 2,
+      toolCallCount: 0,
+      replyOptionCount: 0,
+    }),
+    false,
+  );
+
+  assert.equal(
+    shouldAttemptPlanClosureGuard({
+      workflowMode: "plan",
+      isPlanApproved: false,
+      hasReviewablePlanArtifacts: true,
+      evidenceCount: 3,
+      consecutiveEmptyResponseCount: 2,
+      toolCallCount: 0,
+      replyOptionCount: 0,
+    }),
+    false,
+  );
+});
+
+test("plan exploration budget redirects repeated broad reads to design closure", () => {
+  assert.deepEqual(
+    buildPlanExplorationBudget({
+      workflowMode: "plan",
+      isPlanApproved: false,
+      toolName: "list_directory",
+      target: ".",
+      duplicateCount: 1,
+      hasTabularEvidence: false,
+    }),
+    {
+      shouldRedirectToDesignClosure: true,
+      reason: "repeated_broad_structure_read",
+    },
+  );
+
+  assert.equal(
+    buildPlanExplorationBudget({
+      workflowMode: "plan",
+      isPlanApproved: true,
+      toolName: "list_directory",
+      target: ".",
+      duplicateCount: 2,
+      hasTabularEvidence: true,
+    }).shouldRedirectToDesignClosure,
+    false,
+  );
+});
+
+test("plan exploration budget redirects broad reads after enough read evidence", () => {
+  assert.deepEqual(
+    buildPlanExplorationBudget({
+      workflowMode: "plan",
+      isPlanApproved: false,
+      toolName: "get_project_skeleton",
+      duplicateCount: 0,
+      hasTabularEvidence: false,
+      successfulReadEvidenceCount: 2,
+    }),
+    {
+      shouldRedirectToDesignClosure: true,
+      reason: "sufficient_read_context_already_available",
+    },
   );
 });

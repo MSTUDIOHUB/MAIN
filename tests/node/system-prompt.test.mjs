@@ -57,7 +57,7 @@ function loadTranspiledModuleSync(sourcePath) {
   return module.exports;
 }
 
-const { buildSystemPrompt } = loadTranspiledModuleSync(
+const { buildSystemPrompt, buildToolProtocolCard } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/systemPrompt.ts"),
 );
 
@@ -155,10 +155,76 @@ test("system prompt uses English core tool protocol with localized output strate
   assert.match(prompt, /Prompt language strategy: english_core_localized_output/);
   assert.match(prompt, /Tool availability is intent-scoped/);
   assert.match(prompt, /\[LOCALIZED USER OUTPUT\]/);
-  assert.match(prompt, /本轮已解析的目标语言/);
+  assert.match(prompt, /resolvedResponseLanguage/);
   assert.match(prompt, /Any user-visible pre-tool narration must also use the resolved target language/);
   assert.doesNotMatch(prompt, /在执行文件读取、搜索、修改、构建、测试等操作前，必须先用普通 Markdown 输出一句/);
   assert.doesNotMatch(prompt, /调用工具前，先用普通 Markdown 写一句用户可见的操作说明/);
+});
+
+test("system prompt separates display language from resolved response language", () => {
+  const prompt = buildSystemPrompt(
+    [],
+    "/tmp/workspace",
+    "main_mode",
+    "",
+    [],
+    [],
+    "plan",
+    "zh",
+    null,
+    undefined,
+    undefined,
+    "english_core_localized_output",
+    "normal",
+    ["read_file", "write_file"],
+    null,
+    undefined,
+    {
+      displayLanguage: "zh",
+      resolvedResponseLanguage: "en",
+    },
+  );
+
+  assert.match(prompt, /\[LANGUAGE CONTRACT\]/);
+  assert.match(prompt, /displayLanguage: zh/);
+  assert.match(prompt, /resolvedResponseLanguage: en/);
+  assert.match(prompt, /MUST use English/);
+  assert.doesNotMatch(prompt, /<analysis>我需要先检查/);
+  assert.match(prompt, /需要工具时只输出完整工具调用/);
+});
+
+test("tool protocol card gives compact XML instructions for local text tools", () => {
+  const card = buildToolProtocolCard({
+    activeProfile: "local",
+    provider: "Ollama",
+    toolProtocol: "xml",
+    nativeToolsEnabled: false,
+    workflowMode: "plan",
+    availableToolNames: ["read_file", "analyze_tabular_document", "query_tabular_document"],
+    language: "zh",
+  });
+
+  assert.match(card, /\[TOOL PROTOCOL CARD\]/);
+  assert.match(card, /protocol: xml-text/);
+  assert.match(card, /<tool_use>/);
+  assert.match(card, /<parameter name="path">/);
+  assert.match(card, /禁止输出 `\[Tool call: read_file\]`/);
+  assert.doesNotMatch(card, /run_command\(command/);
+});
+
+test("tool protocol card uses native contract for native-capable providers", () => {
+  const card = buildToolProtocolCard({
+    activeProfile: "cloud",
+    provider: "OpenAI",
+    toolProtocol: "native",
+    nativeToolsEnabled: true,
+    availableToolNames: ["read_file", "write_file"],
+    language: "en",
+  });
+
+  assert.match(card, /protocol: native/);
+  assert.match(card, /emit a native tool call directly/);
+  assert.doesNotMatch(card, /<tool_use>/);
 });
 
 test("system prompt lists only intent-filtered tools when available names are provided", () => {

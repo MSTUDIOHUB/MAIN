@@ -5238,7 +5238,12 @@ export const useAppStore = create<AppState>()(
   }) => {
     const state = get();
     const sendStartedAt = nowMs();
-    console.log('[sendMessage] called, text:', text?.slice(0, 50), 'agentStatus:', state.agentStatus, 'workspace:', state.currentWorkspace, 'activeProfile:', state.config.activeProfile);
+    logStoreEvent("send_message_called", {
+      textChars: text?.length ?? 0,
+      agentStatus: state.agentStatus,
+      workspace: state.currentWorkspace || null,
+      activeProfile: state.config.activeProfile,
+    });
     const isHidden = options?.hidden === true;
     const suppressThoughtOutput = state.config.thinkingPolicy === "action_only";
     const mentionSnapshot = options?.contextMentionsSnapshot ?? state.contextMentions;
@@ -6017,12 +6022,12 @@ export const useAppStore = create<AppState>()(
     }
 
     if (!text.trim() && (!images || images.length === 0) && !hasSupplementalInput) {
-      console.log('[sendMessage] blocked: empty text, no images, and no attached context');
+      logStoreEvent("send_blocked", { reason: "empty_text_no_images_no_context" });
       return false;
     }
 
     if (state.isGenerating) {
-      console.log('[sendMessage] blocked: generation already in progress');
+      logStoreEvent("send_blocked", { reason: "generation_in_progress" });
       return false;
     }
 
@@ -6032,7 +6037,9 @@ export const useAppStore = create<AppState>()(
       // the previous stream must have failed silently. Reset to idle so
       // the user isn't permanently blocked from sending messages.
       if ((state.agentStatus === "running" || state.agentStatus === "pending_review") && !state.abortController) {
-        console.log('[sendMessage] stuck-state detected, resetting to idle');
+        logStoreEvent("send_stuck_state_reset", {
+          previousStatus: state.agentStatus,
+        });
         set({ agentStatus: "idle", isGenerating: false });
         if (state.currentTurnId) {
           get().setConversationTurnStatus(
@@ -6043,7 +6050,10 @@ export const useAppStore = create<AppState>()(
         // Re-check after state reset
         if (!text.trim() && (!images || images.length === 0) && !hasSupplementalInput) return false;
       } else {
-        console.log('[sendMessage] blocked: empty text or already running');
+        logStoreEvent("send_blocked", {
+          reason: "agent_running_or_pending_review",
+          agentStatus: state.agentStatus,
+        });
         return false;
       }
     }
@@ -6859,6 +6869,19 @@ export const useAppStore = create<AppState>()(
 
       if (allFileRefs.length > 0 || failedAttachmentParts.length > 0) {
         const parts: string[] = [];
+        if (mentions.length > 0) {
+          parts.push(preferredLanguage === "en"
+            ? [
+                "[user_mentioned_files]",
+                "The user selected these files with @. Treat them as explicit context targets and use their exact paths for any follow-up read/query tools.",
+                ...mentions.map((mentionPath) => `path: ${mentionPath}`),
+              ].join("\n")
+            : [
+                "[user_mentioned_files]",
+                "用户通过 @ 选择了这些文件。请把它们视为明确上下文目标，后续读取/查询工具必须优先使用这些精确路径。",
+                ...mentions.map((mentionPath) => `path: ${mentionPath}`),
+              ].join("\n"));
+        }
         parts.push(...failedAttachmentParts);
         for (const ref of allFileRefs) {
           const fp = ref.path;
@@ -7242,7 +7265,44 @@ export const useAppStore = create<AppState>()(
           elapsedMs: Math.round(nowMs() - sendStartedAt),
           agentMessages: latest.agentMessages.length,
           planStage: latest.planStage,
+          workflowMode: latest.config.workflowMode,
+          effectiveRunIntent,
+          runtimeRunIntent,
+          activeProfile: latest.config.activeProfile,
+          provider: latest.config.activeProfile === "cloud"
+            ? latest.config.cloud.provider
+            : latest.config.local.provider,
+          model: latest.config.activeProfile === "cloud"
+            ? latest.config.cloud.model
+            : latest.config.local.model,
+          toolProtocol: latest.config.activeProfile === "cloud"
+            ? latest.config.cloud.toolProtocol
+            : latest.config.local.toolProtocol,
+          contextLimit: latest.config.activeProfile === "cloud"
+            ? null
+            : latest.config.local.contextLimit,
+          thinkingPolicy: latest.config.thinkingPolicy,
+          debugRecordFullTurnProcess: latest.config.debugRecordFullTurnProcess,
+          rootCauseProbe: "No visible token yet. Check agent.llm_request_shape for prompt/tool/context size and store.stream_done for empty completion.",
         });
+        if (
+          latest.config.workflowMode === "plan" &&
+          latest.config.activeProfile === "local" &&
+          latest.config.local.toolProtocol !== "native"
+        ) {
+          logStoreEvent("plan_no_visible_token_notice_only", {
+            turnId,
+            elapsedMs: Math.round(nowMs() - sendStartedAt),
+            agentMessages: latest.agentMessages.length,
+            planStage: latest.planStage,
+            activeProfile: latest.config.activeProfile,
+            provider: latest.config.local.provider,
+            model: latest.config.local.model,
+            toolProtocol: latest.config.local.toolProtocol,
+            contextLimit: latest.config.local.contextLimit,
+            strategy: "notice_only_no_auto_abort",
+          });
+        }
       }, 120_000);
 
       const flushBuffer = () => {
@@ -8207,22 +8267,51 @@ export const useAppStore = create<AppState>()(
               effectiveRunIntent === "plan" ||
               state.planArtifacts.length > 0 ||
               state.planStage !== "idle";
+            const isApprovedPlanExecution =
+              effectiveRunIntent === "plan" &&
+              state.isPlanApproved &&
+              state.planStage === "executing";
             if (hasPlanContext) {
-              logStoreEvent("plan_panel_open_for_review", {
+              logStoreEvent(isApprovedPlanExecution ? "tool_permission_review" : "plan_design_review", {
                 turnId,
                 effectiveRunIntent,
                 planArtifacts: state.planArtifacts.length,
                 planStage: state.planStage,
+                isPlanApproved: state.isPlanApproved,
               });
-              state.openRightPanelTab("plan");
-              emitLocalPlanExecutionProgress("waiting_review", {
-                nextStep: state.config.language === "en"
-                  ? "wait for approval of the pending tool call"
-                  : "等待当前工具调用审批",
+              if (!isApprovedPlanExecution) {
+                logStoreEvent("plan_panel_open_for_review", {
+                  turnId,
+                  effectiveRunIntent,
+                  planArtifacts: state.planArtifacts.length,
+                  planStage: state.planStage,
+                });
+                state.openRightPanelTab("plan");
+                emitLocalPlanExecutionProgress("waiting_review", {
+                  nextStep: state.config.language === "en"
+                    ? "wait for approval of the pending tool call"
+                    : "等待当前工具调用审批",
+                });
+              }
+            }
+          }
+          if (status === "running") {
+            const state = sessionGet();
+            if (effectiveRunIntent === "plan" && state.isPlanApproved && state.planStage === "executing") {
+              logStoreEvent("plan_execution_running", {
+                turnId,
+                effectiveRunIntent,
+                planStage: state.planStage,
+                planArtifacts: state.planArtifacts.length,
               });
             }
           }
           if (turnId) {
+            const current = sessionGet();
+            const isApprovedPlanExecution =
+              effectiveRunIntent === "plan" &&
+              current.isPlanApproved &&
+              current.planStage === "executing";
             const nextTurnStatus: ConversationTurnStatus =
               status === "error"
                 ? "error"
@@ -8230,20 +8319,20 @@ export const useAppStore = create<AppState>()(
                 ? deriveIdleConversationTurnStatus({
                     turnId,
                     effectiveRunIntent,
-                    isPlanApproved: sessionGet().isPlanApproved,
-                    planArtifacts: sessionGet().planArtifacts,
-                    planStage: sessionGet().planStage,
-                    planTasks: sessionGet().planTasks,
-                    planExecutionEvidenceCount: sessionGet().planExecutionEvidenceCount,
-                    replyOptionCount: sessionGet().normalizedStreamState.replyOptions.length,
-                    taskFlow: sessionGet().taskFlow,
+                    isPlanApproved: current.isPlanApproved,
+                    planArtifacts: current.planArtifacts,
+                    planStage: current.planStage,
+                    planTasks: current.planTasks,
+                    planExecutionEvidenceCount: current.planExecutionEvidenceCount,
+                    replyOptionCount: current.normalizedStreamState.replyOptions.length,
+                    taskFlow: current.taskFlow,
                     override: terminalTurnStatusOverride,
                   })
                 : status === "pending_review"
-                ? "awaiting_approval"
+                ? isApprovedPlanExecution ? "executing" : "awaiting_approval"
                 : effectiveRunIntent === "plan" &&
-                  !sessionGet().isPlanApproved &&
-                  (sessionGet().planArtifacts.length > 0 || sessionGet().planStage !== "idle")
+                  !current.isPlanApproved &&
+                  (current.planArtifacts.length > 0 || current.planStage !== "idle")
                 ? "planning"
                 : "executing";
             sessionGet().setConversationTurnStatus(turnId, nextTurnStatus);
@@ -8303,7 +8392,6 @@ export const useAppStore = create<AppState>()(
         },
 
         onError: (error) => {
-          console.error('[sendMessage] onError callback:', error);
           logStoreEvent("agent_error", {
             turnId,
             error: typeof error === "string" ? error : String(error),
@@ -8392,13 +8480,21 @@ export const useAppStore = create<AppState>()(
               kind,
               reason: validation.reason,
             });
+            const language = sessionGet().config.language === "en" ? "en" : "zh";
+            const reason = validation.reason || (language === "en" ? "quality gate" : "质量门禁");
+            const blockedMessage =
+              kind === "tasks" && validation.reason === "missing_task_evidence"
+                ? language === "en"
+                  ? `Task list rejected: ${path} is missing verifiable evidence labels (${reason}). MAIN will ask the model to regenerate \`.MAIN/plans/tasks.md\` with unchecked tasks and evidence labels such as \`evidence: file:src/App.tsx\`, \`evidence: cmd:npm test\`, or \`evidence: deliverable:REPORT.md\`.`
+                  : `任务清单已被拦截：${path} 缺少可验证 evidence 标签（${reason}）。MAIN 会要求模型重新生成真实的 \`.MAIN/plans/tasks.md\`，每项保持未完成 checkbox，并补充类似 \`证据: file:src/App.tsx\`、\`证据: cmd:npm test\` 或 \`证据: deliverable:REPORT.md\` 的证据标签。`
+                : language === "en"
+                ? `Plan artifact rejected: ${path} does not look like a reviewable ${kind} document (${reason}). MAIN will ask the model to regenerate a real \`.MAIN/plans/design.md\` artifact, or request your decision.`
+                : `计划文件已被拦截：${path} 不像可审批的${getPlanArtifactTitle(kind, "zh")}（${reason}）。MAIN 会要求模型重新生成真实的 \`.MAIN/plans/design.md\`，或先向你确认关键分叉。`;
             appendTurnBlock({
               id: nextId(),
               turnId,
               type: "system",
-              content: sessionGet().config.language === "en"
-                ? `Plan artifact rejected: ${path} does not look like a reviewable ${kind} document (${validation.reason || "quality gate"}). MAIN will ask the model to regenerate a real \`.MAIN/plans/design.md\` artifact, or request your decision.`
-                : `计划文件已被拦截：${path} 不像可审批的${getPlanArtifactTitle(kind, "zh")}（${validation.reason || "质量门禁"}）。MAIN 会要求模型重新生成真实的 \`.MAIN/plans/design.md\`，或先向你确认关键分叉。`,
+              content: blockedMessage,
               variant: "plan_quality_gate",
             });
             return;
@@ -9104,7 +9200,11 @@ export const useAppStore = create<AppState>()(
       }).catch((err) => {
         clearInterval(timerInterval);
         sessionSet({ pendingSlashCommand: null, elapsedTime: getElapsedSeconds() });
-        console.error("Agent loop crashed:", err);
+        logStoreEvent("agent_loop_crashed", {
+          turnId,
+          error: err instanceof Error ? err.message : String(err),
+          stack: err instanceof Error ? err.stack?.slice(0, 1200) : null,
+        });
         if (remoteFeishu) {
           const language = sessionGet().config.language === "en" ? "en" : "zh";
           void invoke("send_feishu_message", {

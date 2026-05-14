@@ -14,10 +14,12 @@ test("@ files, attachments, and screenshots render as compact user context pills
 
   const pillRow = page.getByTestId("user-context-pill-row");
   await expect(pillRow).toBeVisible();
+  await expect(page.getByTestId("user-context-inline-summary")).toHaveCount(0);
 
   const pills = page.getByTestId("user-context-pill");
   await expect(pills).toHaveCount(4);
-  await expect(pills.nth(0)).toContainText("@ src/App.tsx");
+  await expect(pills.nth(0)).toContainText("src/App.tsx");
+  await expect(pills.nth(0)).not.toContainText("@ src/App.tsx");
   await expect(pills.nth(1)).toContainText("report.csv");
   await expect(pills.nth(1)).toContainText("失败");
   await expect(pills.nth(2)).toContainText("截图 1");

@@ -53,7 +53,7 @@ function loadTranspiledModuleSync(sourcePath) {
   return module.exports;
 }
 
-const { materializePlanArtifactFromVisibleText } = loadTranspiledModuleSync(
+const { composeReviewableDesignFromEvidence, materializePlanArtifactFromVisibleText } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/planMaterialization.ts"),
 );
 
@@ -115,4 +115,22 @@ test("rejects low quality visible text instead of materializing a plan", () => {
 
   assert.equal(result.ok, false);
   assert.match(result.reason || "", /too_short|not_structured|quality_gate/);
+});
+
+test("composes strict design closure prompt from evidence without tool logs", () => {
+  const prompt = composeReviewableDesignFromEvidence({
+    userGoal: "制作 Mac 轻量软件分析课程销售 CSV。",
+    evidence: [
+      "analyze_tabular_document orders.csv; status=observed; 7441 chars; hash=abc123; excerpt=课程名称 | 订单金额 | 购买时间",
+      "[MAIN TOOL FEEDBACK V1]{\"tool\":\"list_directory\"}",
+    ],
+    files: ["orders.csv"],
+    language: "zh",
+  });
+
+  assert.match(prompt, /生成可审阅、可执行的正式设计方案/);
+  assert.match(prompt, /orders\.csv/);
+  assert.match(prompt, /课程名称/);
+  assert.doesNotMatch(prompt, /MAIN TOOL FEEDBACK/);
+  assert.doesNotMatch(prompt, /ContextMemoryState v1/);
 });

@@ -143,6 +143,22 @@ test("normalization collapses repeated local-model preamble loops", () => {
   assert.equal(normalized.toolCalls[0].name, "get_project_skeleton");
 });
 
+test("normalization keeps ordinary process narration visible", () => {
+  const normalized = normalizeAssistantTurn({
+    content: [
+      "我需要先读取你 @ 的 CSV 文件，确认字段和订单指标。",
+      "",
+      "然后我会根据字段差异提出 2-3 个软件方案选项。",
+    ].join("\n"),
+    toolCalls: [],
+    finishReason: "stop",
+  });
+
+  assert.match(normalized.visibleText, /我需要先读取/);
+  assert.match(normalized.visibleText, /提出 2-3 个软件方案选项/);
+  assert.equal(normalized.hiddenThought, "");
+});
+
 test("normalization hides leaked reasoning after a user-choice section", () => {
   const normalized = normalizeAssistantTurn({
     content: [

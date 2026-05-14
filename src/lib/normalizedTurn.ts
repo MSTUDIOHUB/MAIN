@@ -30,7 +30,6 @@ const LEAKED_REASONING_MARKERS = [
   /^i should respond\b/i,
   /^i should answer\b/i,
   /^i should\b/i,
-  /^i need to\b/i,
   /^i'll keep it\b/i,
   /^this is a simple\b/i,
   /^this is a standard\b/i,
@@ -44,7 +43,6 @@ const LEAKED_REASONING_MARKERS = [
   /\buser has provided\b/i,
   /\bmy plan is\b/i,
   /\bno tool calls are necessary\b/i,
-  /\bi will proceed\b/i,
   /\bi should respond\b/i,
   /\bi should answer\b/i,
   /\brespond in chinese\b/i,
@@ -54,17 +52,8 @@ const LEAKED_REASONING_MARKERS = [
   /用户.*提供/i,
   /我的计划是/i,
   /不需要调用工具/i,
-  /我将继续/i,
   /^用户要求我/i,
-  /^让我先/i,
-  /^我先调用/i,
-  /^我需要先/i,
-  /^继续执行计划/i,
-  /^请继续执行/i,
   /^The user asked me/i,
-  /^Let me first/i,
-  /^I need to/i,
-  /^Continue executing/i,
 ];
 
 const CHOICE_CONTEXT_MARKERS = [

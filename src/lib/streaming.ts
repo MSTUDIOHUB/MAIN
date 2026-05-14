@@ -39,6 +39,21 @@ import { isRetryableCloudErrorMessage } from "./cloudRetry";
 import { toError } from "./errorUtils";
 import { isNativeToolCompatibilityErrorMessage, isProviderCompatibilityErrorMessage, PROVIDER_COMPATIBILITY_TAG } from "./providerCompatibility";
 
+function emitStreamingConsole(
+  source: "streaming" | "streamViaRustProxy",
+  level: "info" | "warn",
+  message: string,
+  data?: unknown,
+) {
+  if (typeof window === "undefined") return;
+  const writer = level === "warn" ? console.warn : console.log;
+  if (data === undefined) {
+    writer(`[${source}] ${message}`);
+  } else {
+    writer(`[${source}] ${message}`, data);
+  }
+}
+
 /** Multimodal content parts (OpenAI-compatible). */
 interface TextContentPart {
   type: "text";
@@ -613,7 +628,7 @@ async function requestOpenAiNonStreaming(
           const input = candidate.body.input;
           const instructions = candidate.body.instructions;
           const candidateTools = Array.isArray(candidate.body.tools) ? candidate.body.tools : [];
-          console.log("[streaming] OpenAI responses request", JSON.stringify({
+          emitStreamingConsole("streaming", "info", "OpenAI responses request", {
             url: apiUrl,
             model: settings.model,
             mode: candidate.mode,
@@ -622,7 +637,7 @@ async function requestOpenAiNonStreaming(
             instructionsLen: typeof instructions === "string" ? instructions.length : 0,
             reasoningEffort: settings.reasoningEffort ?? "none",
             nativeTools: candidateTools.length,
-          }));
+          });
           const candidatePayload = await postJsonRequest(
             apiUrl,
             headers,
@@ -637,13 +652,13 @@ async function requestOpenAiNonStreaming(
           if (!candidateContent && candidateToolCalls.length === 0) {
             sawEmptyResponseCandidate = true;
             lastEmptyResponseMode = candidate.mode;
-            console.warn(`[streaming] OpenAI responses empty output for ${candidate.mode}; trying next compatibility candidate`);
+            emitStreamingConsole("streaming", "warn", `OpenAI responses empty output for ${candidate.mode}; trying next compatibility candidate`);
             lastCompatibilityError = new Error(`responses_empty_candidate:${candidate.mode}`);
             continue;
           }
           payload = candidatePayload;
           if (candidate.mode !== "message_text") {
-            console.log(`[streaming] OpenAI responses fallback succeeded with ${candidate.mode}`);
+            emitStreamingConsole("streaming", "info", `OpenAI responses fallback succeeded with ${candidate.mode}`);
           }
           break;
         } catch (err) {
@@ -658,7 +673,12 @@ async function requestOpenAiNonStreaming(
             if (candidate.mode !== "transcript_text" && !gatewayRetryUsed) {
               if (signal?.aborted) throw createAbortError();
               gatewayRetryUsed = true;
-              console.warn(`[streaming] OpenAI responses retryable gateway failure with ${candidate.mode}; retrying same reasoning effort with compact transcript input`, errMsg);
+              emitStreamingConsole(
+                "streaming",
+                "warn",
+                `OpenAI responses retryable gateway failure with ${candidate.mode}; retrying same reasoning effort with compact transcript input`,
+                errMsg,
+              );
               continue;
             }
           }
@@ -945,7 +965,7 @@ async function streamViaRustProxy(
                 // then report the error.
                 reasoningGarbled = true;
                 reasoningBuffer = "";
-                console.log("[streaming] reasoning_content is all '?' — cancelling stream");
+                emitStreamingConsole("streaming", "info", "reasoning_content is all '?' — cancelling stream");
                 invoke("cancel_chat_stream").catch(() => {});
                 const garbledErr = new Error(
                   "模型的思考令牌无法被服务器解码（reasoning_content 全为 '?'），无法产生回复。\n" +
@@ -1039,7 +1059,7 @@ async function streamViaRustProxy(
       if (event.payload.status === "error") {
         const errorMessage = event.payload.error?.trim() || "The cloud stream ended with an error but did not include details.";
         if (shouldRetryRustStreamAsNonStreaming(settings, errorMessage)) {
-          console.warn("[streaming] Rust stream read failed; retrying once with non-streaming local request", errorMessage);
+          emitStreamingConsole("streaming", "warn", "Rust stream read failed; retrying once with non-streaming local request", errorMessage);
           cleanup();
           onToken("__ESCALATION_RESET__:");
           void (async () => {
@@ -1110,7 +1130,11 @@ async function streamViaRustProxy(
   unlistenDone = doneUnlisten;
 
   // Now safe to start the stream — listeners are fully registered
-  console.log('[streamViaRustProxy] invoking start_chat_stream, url:', apiUrl, 'model:', settings.model, 'header_keys:', Object.keys(headers).join(","));
+  emitStreamingConsole("streamViaRustProxy", "info", "invoking start_chat_stream", {
+    url: apiUrl,
+    model: settings.model,
+    headerKeys: Object.keys(headers),
+  });
   invoke("start_chat_stream", {
     streamId,
     url: apiUrl,
@@ -1160,7 +1184,10 @@ export async function streamChatCompletion(
 
   // Route through Rust proxy for cloud endpoints (bypasses CORS)
   if (settings.useRustProxy) {
-    console.log('[streaming] routing through Rust proxy, url:', settings.baseUrl, 'model:', settings.model);
+    emitStreamingConsole("streaming", "info", "routing through Rust proxy", {
+      url: settings.baseUrl,
+      model: settings.model,
+    });
     return streamViaRustProxy(messages, settings, callbacks, signal, tools, maxTokensOverride);
   }
 
@@ -1381,7 +1408,7 @@ export async function streamChatCompletion(
                 } else if (reasoningBuffer.length > 20) {
                   reasoningGarbled = true;
                   reasoningBuffer = "";
-                  console.log("[streaming] reasoning_content is all '?' — cancelling stream");
+                  emitStreamingConsole("streaming", "info", "reasoning_content is all '?' — cancelling stream");
                   reader.cancel().catch(() => {});
                   const garbledErr = new Error(
                     "模型的思考令牌无法被服务器解码（reasoning_content 全为 '?'），无法产生回复。\n" +
@@ -1504,7 +1531,7 @@ export async function streamChatCompletion(
       };
 
   if (result.finishReason === "length") {
-    console.warn(`[streaming] Response truncated — finish_reason is "length". Consider increasing max_tokens.`);
+    emitStreamingConsole("streaming", "warn", `Response truncated — finish_reason is "length". Consider increasing max_tokens.`);
   }
 
   onDone(result);
