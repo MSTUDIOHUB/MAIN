@@ -21,6 +21,9 @@ use tauri_plugin_opener::OpenerExt;
 use tiktoken_rs::{cl100k_base, CoreBPE};
 use walkdir::WalkDir;
 
+pub mod harness;
+pub mod runtime;
+
 // region: 全局常量与状态
 
 const PTY_BUFFER_LIMIT_BYTES: usize = 512 * 1024;
@@ -227,6 +230,8 @@ struct PtySession {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     buffer: Arc<Mutex<PtyBuffer>>,
     child: Box<dyn portable_pty::Child + Send>,
+    workspace: PathBuf,
+    pending_command: String,
 }
 
 #[derive(Default)]
@@ -1846,6 +1851,9 @@ fn run_workspace_shell_command(
     if trimmed.is_empty() {
         return Err("命令不能为空".to_string());
     }
+    harness::permissions::PermissionGuard::from_workspace(workspace)
+        .and_then(|guard| guard.validate(trimmed))
+        .map_err(|error| error.to_string())?;
 
     let mut process = build_workspace_shell_command(trimmed);
     process
@@ -1908,6 +1916,38 @@ fn run_workspace_shell_command(
         stdout_truncated: stdout.truncated,
         stderr_truncated: stderr.truncated,
     })
+}
+
+fn validate_pty_input(
+    workspace: &Path,
+    pending_command: &mut String,
+    input: &str,
+) -> Result<(), String> {
+    let mut next_pending = pending_command.clone();
+
+    for ch in input.chars() {
+        match ch {
+            '\u{3}' => next_pending.clear(),
+            '\u{8}' | '\u{7f}' => {
+                let _ = next_pending.pop();
+            }
+            '\r' | '\n' => {
+                let command = next_pending.trim();
+                if !command.is_empty() {
+                    harness::permissions::PermissionGuard::from_workspace(workspace)
+                        .and_then(|guard| guard.validate(command))
+                        .map_err(|error| error.to_string())?;
+                }
+                next_pending.clear();
+            }
+            '\t' => next_pending.push(' '),
+            _ if !ch.is_control() => next_pending.push(ch),
+            _ => {}
+        }
+    }
+
+    *pending_command = next_pending;
+    Ok(())
 }
 
 fn run_git_process(
@@ -3884,7 +3924,7 @@ fn spawn_pty(
     }
     apply_pty_terminal_env(&mut cmd);
     let root = resolve_workspace_root(&workspace_state, workspace)?;
-    cmd.cwd(root);
+    cmd.cwd(&root);
     let child = pair
         .slave
         .spawn_command(cmd)
@@ -3911,6 +3951,8 @@ fn spawn_pty(
             writer: shared_writer,
             buffer: shared_buffer,
             child,
+            workspace: root,
+            pending_command: String::new(),
         },
     );
 
@@ -3949,14 +3991,15 @@ fn write_pty(
     input: String,
     session_key: Option<String>,
 ) -> Result<(), String> {
-    let guard = state
+    let mut guard = state
         .sessions
         .lock()
         .map_err(|_| "无法获取 PTY 会话锁".to_string())?;
     let key = normalize_pty_session_key(session_key);
     let session = guard
-        .get(&key)
+        .get_mut(&key)
         .ok_or_else(|| "PTY 尚未启动，请先调用 spawn_pty".to_string())?;
+    validate_pty_input(&session.workspace, &mut session.pending_command, &input)?;
     let mut writer = session
         .writer
         .lock()
@@ -7958,8 +8001,8 @@ mod tests {
         parse_git_porcelain_entries, parse_git_porcelain_status,
         read_session_transcript_with_fallback, resolve_existing_path,
         resolve_session_transcript_to_write, resolve_write_path, should_hide_list_directory_entry,
-        should_skip_recursive_search_dir, write_json_atomic, write_jsonl_atomic, FileNode,
-        SessionTranscript,
+        should_skip_recursive_search_dir, validate_pty_input, write_json_atomic,
+        write_jsonl_atomic, FileNode, SessionTranscript,
     };
     use serde_json::json;
     use std::fs;
@@ -7974,6 +8017,42 @@ mod tests {
         let root = std::env::temp_dir().join(format!("main-workspace-{name}-{unique}"));
         fs::create_dir_all(&root).unwrap();
         root.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn pty_input_validates_command_when_enter_is_sent() {
+        let workspace = make_temp_workspace("pty-permissions");
+        fs::create_dir_all(workspace.join(".MAIN")).unwrap();
+        fs::write(
+            workspace.join(".MAIN").join("permissions.yaml"),
+            "shell:\n  allow:\n    - cargo test\n  deny:\n    - sudo\n",
+        )
+        .unwrap();
+        let mut pending = String::new();
+
+        validate_pty_input(&workspace, &mut pending, "cargo test").unwrap();
+        assert_eq!(pending, "cargo test");
+
+        validate_pty_input(&workspace, &mut pending, "\r").unwrap();
+        assert_eq!(pending, "");
+    }
+
+    #[test]
+    fn pty_input_blocks_denied_command_before_enter_passes() {
+        let workspace = make_temp_workspace("pty-deny");
+        fs::create_dir_all(workspace.join(".MAIN")).unwrap();
+        fs::write(
+            workspace.join(".MAIN").join("permissions.yaml"),
+            "shell:\n  allow:\n    - cargo test\n  deny:\n    - sudo\n",
+        )
+        .unwrap();
+        let mut pending = "sudo whoami".to_string();
+
+        let error = validate_pty_input(&workspace, &mut pending, "\r")
+            .expect_err("denied command must not be accepted for execution");
+
+        assert!(error.contains("拒绝"));
+        assert_eq!(pending, "sudo whoami");
     }
 
     #[test]

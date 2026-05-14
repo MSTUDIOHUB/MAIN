@@ -1,0 +1,13 @@
+shell:
+  allow:
+    - ls
+    - rg
+    - cargo check
+    - cargo test
+    - npm run build
+    - npm run lint
+    - node scripts/plan_completion_check.mjs
+
+  deny:
+    - sudo
+    - rm -rf /

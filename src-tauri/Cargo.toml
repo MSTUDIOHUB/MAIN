@@ -39,7 +39,7 @@ portable-pty = "0.8"
 # HTTP client for cloud endpoint connectivity test, model discovery & streaming (bypasses CORS)
 reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
 futures-util = "0.3"
-tokio = { version = "1", features = ["sync"] }
+tokio = { version = "1", features = ["fs", "process", "rt", "sync", "time"] }
 # System memory info for VRAM pressure estimation
 sysinfo = "0.34"
 # Protocol Package ZIP extraction
