@@ -33,6 +33,11 @@ export interface ReadFileWindowResult {
   nextStartLine?: number | null;
 }
 
+export interface OpenFileExternalResult {
+  path: string;
+  opened: boolean;
+}
+
 export interface HookCommandOutput {
   stdout: string;
   stderr: string;
@@ -140,6 +145,62 @@ export interface CategoryEvalReport {
   hallucinationRate: number;
   avgLatency: number;
   avgToolCalls: number;
+}
+
+export interface RuntimeHarnessStepInput {
+  stepId: string;
+  toolCall: string;
+  verificationCommand?: string | null;
+  terminal?: boolean | null;
+}
+
+export interface RuntimeHarnessRequest {
+  taskId?: string | null;
+  steps: RuntimeHarnessStepInput[];
+  activeFiles?: string[];
+  workingMemory?: string[];
+  summaries?: string[];
+  maxAttempts?: number | null;
+  retryBackoffMs?: number | null;
+  timeoutMs?: number | null;
+}
+
+export interface RuntimeStepSummary {
+  stepId: string;
+  toolCall: string;
+  verification: string;
+  success: boolean;
+}
+
+export interface RuntimeContext {
+  activeFiles: string[];
+  recentSteps: RuntimeStepSummary[];
+  workingMemory: string[];
+  summaries: string[];
+  mistakes: string[];
+}
+
+export interface TraceRecord {
+  taskId: string;
+  stepId: string;
+  eventName: string;
+  toolCall: string;
+  stdout: string;
+  stderr: string;
+  verification: string;
+  latencyMs: number;
+  metadata: unknown;
+}
+
+export interface RuntimeHarnessReport {
+  run: {
+    taskId: string;
+    completed: boolean;
+    stepsExecuted: number;
+  };
+  context: RuntimeContext;
+  traces: TraceRecord[];
+  events: unknown[];
 }
 
 export type AgentRole = "planner" | "executor" | "critic";
@@ -395,6 +456,10 @@ export function readFileWindow(
 
 export function getFileMetadata(path: string, workspace?: string): Promise<FileMetadata> {
   return invoke<FileMetadata>("get_file_metadata", { path, workspace });
+}
+
+export function openFileExternal(path: string, workspace?: string): Promise<OpenFileExternalResult> {
+  return invoke<OpenFileExternalResult>("open_file_external", { path, workspace });
 }
 
 export function getWorkspaceRoot(): Promise<string> {
@@ -664,6 +729,13 @@ export function recordSessionFailure(
 
 export function runEvalHarness(workspace?: string): Promise<EvalReport> {
   return invoke<EvalReport>("run_eval_harness", { workspace });
+}
+
+export function runRuntimeHarness(
+  request: RuntimeHarnessRequest,
+  workspace?: string,
+): Promise<RuntimeHarnessReport> {
+  return invoke<RuntimeHarnessReport>("run_runtime_harness", { request, workspace });
 }
 
 export function createMultiAgentPlan(objective: string): Promise<MultiAgentPlan> {

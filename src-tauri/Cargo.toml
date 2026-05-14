@@ -4,6 +4,7 @@ version = "1.7.0"
 description = "MAIN desktop app"
 authors = ["you"]
 edition = "2021"
+default-run = "tauri-app"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

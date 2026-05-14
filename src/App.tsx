@@ -100,6 +100,9 @@ function summarizeUpdateNotes(notes: string, maxLength = 500) {
 function buildSessionRuntimeSnapshotFromState(state: any) {
   const taskFlow = sanitizeTaskBlocksForPersist(state.taskFlow || []);
   return {
+    runtimeEventSchemaVersion: 1,
+    runtimeEvents: state.runtimeEvents || [],
+    harnessRunMarker: state.harnessRunMarker || null,
     taskFlow,
     agentMessages: sanitizeAgentMessagesForPersist(state.agentMessages || []),
     contextMemoryState: normalizeContextMemoryState(state.contextMemoryState),
@@ -577,6 +580,8 @@ export default function App() {
 
   // ── Agent State (from store, replaces all inline implementations) ─────
   const taskFlow = useAppStore((s) => s.taskFlow);
+  const runtimeEvents = useAppStore((s) => s.runtimeEvents);
+  const harnessRunMarker = useAppStore((s) => s.harnessRunMarker);
   const agentMessages = useAppStore((s) => s.agentMessages);
   const contextMemoryState = useAppStore((s) => s.contextMemoryState);
   const conversationTurns = useAppStore((s) => s.conversationTurns);
@@ -1021,6 +1026,9 @@ export default function App() {
     const transcriptTotalTurns = Number(cachedTranscript?.totalTurns ?? loadedTurnCount) || loadedTurnCount;
     const transcriptPartial = transcriptTotalTurns > loadedTurnCount;
     const runtimeSnapshot = {
+      runtimeEventSchemaVersion: 1,
+      runtimeEvents,
+      harnessRunMarker,
       taskFlow: messages,
       agentMessages: sanitizeAgentMessagesForPersist(agentMessages),
       contextMemoryState,
@@ -1126,6 +1134,7 @@ export default function App() {
     }
   }, [
     agentMessages,
+    harnessRunMarker,
     activeSessionScope,
     activeSessionKey,
     contextMemoryState,
@@ -1151,6 +1160,7 @@ export default function App() {
     showPlanPanel,
     showTerminal,
     taskFlow,
+    runtimeEvents,
     getCachedSessionTranscript,
     updateSession,
   ]);

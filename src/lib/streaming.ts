@@ -115,6 +115,15 @@ interface StreamCallbacks {
   onToken: (token: string) => void;
   onDone: (result: StreamResult) => void;
   onError: (err: Error) => void;
+  onLifecycle?: (event: {
+    phase: "stream_started" | "first_chunk" | "chunk_progress" | "no_chunk_progress_warning" | "stream_done" | "stream_error" | "stream_cancelled";
+    streamId?: string;
+    elapsedMs?: number;
+    chunkCount?: number;
+    byteCount?: number;
+    status?: string;
+    error?: string;
+  }) => void;
 }
 
 // ── Max Output Tokens Escalation ────────────────────────────────────
@@ -846,6 +855,22 @@ async function streamViaRustProxy(
 
   // Generate a unique stream ID
   const streamId = `stream-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const streamStartedAt = Date.now();
+  let rustProxyChunkCount = 0;
+  let rustProxyByteCount = 0;
+  let lastChunkAt = streamStartedAt;
+  let lastProgressLifecycleAt = 0;
+  let lastNoProgressWarningAt = 0;
+  const STREAM_PROGRESS_LIFECYCLE_INTERVAL_MS = 15_000;
+  const STREAM_NO_PROGRESS_WARNING_MS = 45_000;
+  callbacks.onLifecycle?.({
+    phase: "stream_started",
+    streamId,
+    elapsedMs: 0,
+    chunkCount: 0,
+    byteCount: 0,
+    status: "started",
+  });
 
   // ── Deferred pattern: resolve/reject from outside the Promise ─────
   let resolveResult: ((result: StreamResult) => void) | null = null;
@@ -866,6 +891,7 @@ async function streamViaRustProxy(
 
   let unlistenChunk: UnlistenFn | null = null;
   let unlistenDone: UnlistenFn | null = null;
+  let noProgressInterval: ReturnType<typeof setInterval> | null = null;
   let resolved = false;
 
   // Buffer for partial SSE lines
@@ -1017,6 +1043,10 @@ async function streamViaRustProxy(
   const cleanup = () => {
     unlistenChunk?.();
     unlistenDone?.();
+    if (noProgressInterval !== null) {
+      clearInterval(noProgressInterval);
+      noProgressInterval = null;
+    }
   };
 
   // ── Await listeners BEFORE starting stream ──────────────────────
@@ -1026,11 +1056,44 @@ async function streamViaRustProxy(
     listen<{ stream_id: string; chunk: string }>("chat-stream-chunk", (event) => {
       if (event.payload.stream_id !== streamId) return;
       try {
+        const now = Date.now();
+        rustProxyChunkCount++;
+        rustProxyByteCount += event.payload.chunk.length;
+        lastChunkAt = now;
+        if (rustProxyChunkCount === 1) {
+          callbacks.onLifecycle?.({
+            phase: "first_chunk",
+            streamId,
+            elapsedMs: now - streamStartedAt,
+            chunkCount: rustProxyChunkCount,
+            byteCount: rustProxyByteCount,
+            status: "streaming",
+          });
+        } else if (now - lastProgressLifecycleAt >= STREAM_PROGRESS_LIFECYCLE_INTERVAL_MS) {
+          lastProgressLifecycleAt = now;
+          callbacks.onLifecycle?.({
+            phase: "chunk_progress",
+            streamId,
+            elapsedMs: now - streamStartedAt,
+            chunkCount: rustProxyChunkCount,
+            byteCount: rustProxyByteCount,
+            status: "streaming",
+          });
+        }
         processSseChunk(event.payload.chunk);
       } catch (err) {
         if (resolved) return;
         resolved = true;
         const error = toError(err, "Failed to parse streaming response.");
+        callbacks.onLifecycle?.({
+          phase: "stream_error",
+          streamId,
+          elapsedMs: Date.now() - streamStartedAt,
+          chunkCount: rustProxyChunkCount,
+          byteCount: rustProxyByteCount,
+          status: "error",
+          error: error.message,
+        });
         onError(error);
         rejectResult?.(error);
         cleanup();
@@ -1040,6 +1103,19 @@ async function streamViaRustProxy(
       if (event.payload.stream_id !== streamId) return;
       if (resolved) return;
       resolved = true;
+      callbacks.onLifecycle?.({
+        phase: event.payload.status === "cancelled"
+          ? "stream_cancelled"
+          : event.payload.status === "error"
+          ? "stream_error"
+          : "stream_done",
+        streamId,
+        elapsedMs: Date.now() - streamStartedAt,
+        chunkCount: rustProxyChunkCount,
+        byteCount: rustProxyByteCount,
+        status: event.payload.status,
+        error: event.payload.error,
+      });
 
       // Process any remaining buffer
       try {
@@ -1128,6 +1204,21 @@ async function streamViaRustProxy(
 
   unlistenChunk = chunkUnlisten;
   unlistenDone = doneUnlisten;
+  noProgressInterval = setInterval(() => {
+    if (resolved) return;
+    const now = Date.now();
+    if (now - lastChunkAt < STREAM_NO_PROGRESS_WARNING_MS) return;
+    if (now - lastNoProgressWarningAt < STREAM_NO_PROGRESS_WARNING_MS) return;
+    lastNoProgressWarningAt = now;
+    callbacks.onLifecycle?.({
+      phase: "no_chunk_progress_warning",
+      streamId,
+      elapsedMs: now - streamStartedAt,
+      chunkCount: rustProxyChunkCount,
+      byteCount: rustProxyByteCount,
+      status: "waiting_for_chunk",
+    });
+  }, 5_000);
 
   // Now safe to start the stream — listeners are fully registered
   emitStreamingConsole("streamViaRustProxy", "info", "invoking start_chat_stream", {

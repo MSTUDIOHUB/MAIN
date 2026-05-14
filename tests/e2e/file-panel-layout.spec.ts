@@ -28,6 +28,8 @@ test.beforeEach(async ({ page }) => {
       [`${workspace}/src/main.ts`]: "export function main() {\n  return 'new main';\n}\n",
       [`${workspace}/src/utils/helper.ts`]: "export const helper = () => 'after';\n",
     };
+    const openExternalCalls: string[] = [];
+    const openExternalFailures: Record<string, string> = {};
 
     const sortNodes = (nodes: Array<{ name: string; path: string; is_dir: boolean }>) =>
       nodes.sort((a, b) => {
@@ -59,6 +61,12 @@ test.beforeEach(async ({ page }) => {
       },
       pathFor(name: string) {
         return `${workspace}/${name}`;
+      },
+      openExternalCalls() {
+        return [...openExternalCalls];
+      },
+      failExternalOpen(path: string, message = "mock open failed") {
+        openExternalFailures[path] = message;
       },
     };
 
@@ -108,6 +116,15 @@ test.beforeEach(async ({ page }) => {
         if (Object.prototype.hasOwnProperty.call(files, path)) return files[path];
         throw new Error(`ENOENT: ${path}`);
       }
+      if (cmd === "get_file_metadata") {
+        const path = String(args?.path ?? "");
+        if (!Object.prototype.hasOwnProperty.call(files, path)) throw new Error(`ENOENT: ${path}`);
+        return {
+          path,
+          sizeBytes: files[path].length,
+          modifiedMs: Date.now(),
+        };
+      }
       if (cmd === "read_file_window") {
         const path = String(args?.path ?? "");
         if (!Object.prototype.hasOwnProperty.call(files, path)) throw new Error(`ENOENT: ${path}`);
@@ -116,19 +133,48 @@ test.beforeEach(async ({ page }) => {
         if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
         const startLine = Math.max(1, Number(args?.startLine ?? 1) || 1);
         const maxLines = Math.max(1, Number(args?.maxLines ?? 240) || 240);
-        const endLine = Math.min(lines.length, startLine + maxLines - 1);
-        const windowContent = lines.slice(startLine - 1, endLine).join("\n");
+        const maxChars = Math.max(1, Number(args?.maxChars ?? 12000) || 12000);
+        const requestedEndLine = Math.min(lines.length, startLine + maxLines - 1);
+        const selected: string[] = [];
+        let selectedChars = 0;
+        let lineTruncated = false;
+        for (let index = startLine - 1; index < requestedEndLine; index += 1) {
+          const line = lines[index] ?? "";
+          const separator = selected.length === 0 ? 0 : 1;
+          const nextChars = selectedChars + separator + line.length;
+          if (selected.length > 0 && nextChars > maxChars) {
+            lineTruncated = true;
+            break;
+          }
+          if (selected.length === 0 && nextChars > maxChars) {
+            selected.push(line.slice(0, maxChars));
+            selectedChars = maxChars;
+            lineTruncated = true;
+            break;
+          }
+          selected.push(line);
+          selectedChars = nextChars;
+        }
+        const endLine = selected.length > 0 ? startLine + selected.length - 1 : 0;
+        const windowContent = selected.join("\n");
+        const truncated = lineTruncated || endLine < lines.length || endLine < requestedEndLine;
         return {
           path,
           content: windowContent,
-          startLine,
+          startLine: selected.length > 0 ? startLine : 0,
           endLine,
           totalLines: lines.length,
           totalChars: content.length,
           returnedChars: windowContent.length,
-          truncated: endLine < lines.length,
-          nextStartLine: endLine < lines.length ? endLine + 1 : null,
+          truncated,
+          nextStartLine: truncated && endLine > 0 ? endLine + 1 : null,
         };
+      }
+      if (cmd === "open_file_external") {
+        const path = String(args?.path ?? "");
+        openExternalCalls.push(path);
+        if (openExternalFailures[path]) throw new Error(openExternalFailures[path]);
+        return { path, opened: true };
       }
       if (cmd === "get_pty_status") {
         return {
@@ -165,6 +211,50 @@ test("large file viewer renders a bounded window and loads the next window on de
   await page.getByRole("button", { name: "加载下一段" }).click();
   await expect(page.getByText(/当前窗口：第 1-480 行 \/ 共 520 行/)).toBeVisible();
   await expect(page.getByText("line 241")).toBeVisible();
+});
+
+test("office files recommend opening with the system default app", async ({ page }) => {
+  await page.goto("/?e2eScenario=diff-reload-summary");
+  await page.locator('button[aria-label="文件"]').click();
+  const reportPath = await page.evaluate(() => (window as any).__FILE_PANEL_TEST__.addRootFile(
+    "quarterly-report.docx",
+    "mock office bytes",
+  ));
+
+  await page.getByRole("button", { name: /quarterly-report\.docx/ }).click();
+
+  await expect(page.getByText(/Office 文件更适合使用系统默认应用/)).toBeVisible();
+  await page.getByRole("button", { name: "使用系统默认应用打开文件" }).first().click();
+  await expect.poll(() => page.evaluate(() => (window as any).__FILE_PANEL_TEST__.openExternalCalls())).toContain(reportPath);
+});
+
+test("large text files recommend external open while keeping segmented preview", async ({ page }) => {
+  await page.goto("/?e2eScenario=diff-reload-summary");
+  await page.locator('button[aria-label="文件"]').click();
+  await page.evaluate(() => (window as any).__FILE_PANEL_TEST__.addRootFile(
+    "large-output.log",
+    Array.from({ length: 400 }, (_, index) => `line ${index + 1} ${"x".repeat(3200)}`).join("\n"),
+  ));
+
+  await page.getByRole("button", { name: /large-output\.log/ }).click();
+
+  await expect(page.getByText(/文件较大.*建议使用系统默认应用打开/)).toBeVisible();
+  await expect(page.getByText(/当前窗口：第 1-\d+ 行 \/ 共 400 行/)).toBeVisible();
+});
+
+test("external open failures are shown in the file viewer", async ({ page }) => {
+  await page.goto("/?e2eScenario=diff-reload-summary");
+  await page.locator('button[aria-label="文件"]').click();
+  const pdfPath = await page.evaluate(() => (window as any).__FILE_PANEL_TEST__.addRootFile(
+    "broken-preview.pdf",
+    "%PDF mock",
+  ));
+  await page.evaluate((path) => (window as any).__FILE_PANEL_TEST__.failExternalOpen(path, "mock open failed"), pdfPath);
+
+  await page.getByRole("button", { name: /broken-preview\.pdf/ }).click();
+  await page.getByRole("button", { name: "使用系统默认应用打开文件" }).first().click();
+
+  await expect(page.getByRole("alert")).toContainText("无法使用系统默认应用打开文件：mock open failed");
 });
 
 test("file panel stays open beside terminal", async ({ page }) => {

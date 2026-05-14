@@ -45,6 +45,7 @@ const MODEL_REQUEST_TIMEOUT_SECS: u64 = 30 * 60;
 const STREAM_READ_TIMEOUT_SECS: u64 = 15 * 60;
 const STREAM_FIRST_RESPONSE_TIMEOUT_SECS: u64 = 180;
 const STREAM_FIRST_CHUNK_TIMEOUT_SECS: u64 = 180;
+const STREAM_PROGRESS_LOG_INTERVAL_SECS: u64 = 15;
 const READ_FILE_WINDOW_DEFAULT_MAX_LINES: usize = 180;
 const READ_FILE_WINDOW_MAX_LINES: usize = 600;
 const READ_FILE_WINDOW_DEFAULT_MAX_CHARS: usize = 6_800;
@@ -1560,11 +1561,9 @@ fn has_header_case_insensitive(headers: &HashMap<String, String>, name: &str) ->
 }
 
 fn response_with_content_type(body: String, content_type: Option<&str>) -> String {
-    if let Some(content_type) = content_type.filter(|value| {
-        value
-            .to_ascii_lowercase()
-            .contains("text/event-stream")
-    }) {
+    if let Some(content_type) =
+        content_type.filter(|value| value.to_ascii_lowercase().contains("text/event-stream"))
+    {
         format!("__CONTENT_TYPE__:{}\n{}", content_type.trim(), body)
     } else {
         body
@@ -2010,6 +2009,16 @@ fn run_eval_harness(
 ) -> Result<eval::EvalReport, String> {
     let workspace = resolve_workspace_root(&state, workspace)?;
     eval::EvalHarness::for_workspace(&workspace).run()
+}
+
+#[tauri::command]
+async fn run_runtime_harness(
+    state: State<'_, WorkspaceState>,
+    request: runtime::harness_runner::RuntimeHarnessRequest,
+    workspace: Option<String>,
+) -> Result<runtime::harness_runner::RuntimeHarnessReport, String> {
+    let workspace = resolve_workspace_root(&state, workspace)?;
+    runtime::harness_runner::run_workspace_harness(&workspace, request).await
 }
 
 #[tauri::command]
@@ -2831,6 +2840,13 @@ struct ReadFileWindowResult {
     next_start_line: Option<usize>,
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenFileExternalResult {
+    path: String,
+    opened: bool,
+}
+
 fn normalize_read_file_line(mut raw: String) -> String {
     if raw.ends_with('\n') {
         raw.pop();
@@ -2873,6 +2889,34 @@ fn get_file_metadata(
         path: real_path.to_string_lossy().to_string(),
         size_bytes: metadata.len(),
         modified_ms,
+    })
+}
+
+fn resolve_open_file_external_path(path: &str, workspace: &Path) -> Result<PathBuf, String> {
+    let real_path = resolve_existing_path(path, workspace)?;
+    if !real_path.is_file() {
+        return Err("open_file_external 目标不是文件".to_string());
+    }
+    Ok(real_path)
+}
+
+#[tauri::command]
+fn open_file_external(
+    app: AppHandle,
+    state: State<WorkspaceState>,
+    path: String,
+    workspace: Option<String>,
+) -> Result<OpenFileExternalResult, String> {
+    let workspace = resolve_workspace_root(&state, workspace)?;
+    let real_path = resolve_open_file_external_path(&path, &workspace)?;
+    let open_path = real_path.to_string_lossy().to_string();
+    app.opener()
+        .open_path(open_path.clone(), None::<&str>)
+        .map_err(|e| format!("无法使用系统默认应用打开文件：{e}"))?;
+
+    Ok(OpenFileExternalResult {
+        path: open_path,
+        opened: true,
     })
 }
 
@@ -3171,8 +3215,8 @@ fn list_project_sessions(app: AppHandle, workspace: String) -> Result<Vec<Value>
                 let mut index_sessions: Vec<Value> = sessions
                     .iter()
                     .map(|session| {
-                        let session_id =
-                            session_id_from_object(session).unwrap_or_else(|_| "session".to_string());
+                        let session_id = session_id_from_object(session)
+                            .unwrap_or_else(|_| "session".to_string());
                         annotate_session_meta(
                             session.clone(),
                             &project_id,
@@ -3278,10 +3322,7 @@ fn save_project_session(
         })
         .filter(|value| *value > 0);
     if let Some(value) = updated_at_ms {
-        meta.insert(
-            "updatedAtMs".to_string(),
-            Value::Number(value.into()),
-        );
+        meta.insert("updatedAtMs".to_string(), Value::Number(value.into()));
     } else {
         meta.remove("updatedAtMs");
     }
@@ -4295,10 +4336,14 @@ fn get_system_memory() -> Result<serde_json::Value, String> {
 const CLOUD_AUTH_FILE_NAME: &str = "cloud-auth.json";
 const CLOUD_AUTH_REFRESH_SKEW_MS: u64 = 60_000;
 const OPENAI_CHATGPT_CODEX_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
-const GEMINI_CODE_ASSIST_ENDPOINT: &str = "https://cloudcode-pa.googleapis.com/v1internal:generateContent";
-const GEMINI_CODE_ASSIST_LOAD_ENDPOINT: &str = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
-const GEMINI_CODE_ASSIST_ONBOARD_ENDPOINT: &str = "https://cloudcode-pa.googleapis.com/v1internal:onboardUser";
-const GEMINI_CODE_ASSIST_OPERATIONS_ENDPOINT: &str = "https://cloudcode-pa.googleapis.com/v1internal";
+const GEMINI_CODE_ASSIST_ENDPOINT: &str =
+    "https://cloudcode-pa.googleapis.com/v1internal:generateContent";
+const GEMINI_CODE_ASSIST_LOAD_ENDPOINT: &str =
+    "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
+const GEMINI_CODE_ASSIST_ONBOARD_ENDPOINT: &str =
+    "https://cloudcode-pa.googleapis.com/v1internal:onboardUser";
+const GEMINI_CODE_ASSIST_OPERATIONS_ENDPOINT: &str =
+    "https://cloudcode-pa.googleapis.com/v1internal";
 const GEMINI_CODE_ASSIST_CLIENT_IDE_TYPE: &str = "IDE_UNSPECIFIED";
 const GEMINI_CODE_ASSIST_CLIENT_PLATFORM: &str = "PLATFORM_UNSPECIFIED";
 const GEMINI_CODE_ASSIST_CLIENT_PLUGIN_TYPE: &str = "GEMINI";
@@ -4855,12 +4900,28 @@ fn extract_gemini_code_assist_project(payload: &Value) -> Option<String> {
     payload
         .pointer("/cloudaicompanionProject")
         .and_then(Value::as_str)
-        .or_else(|| payload.pointer("/cloudaicompanionProject/id").and_then(Value::as_str))
-        .or_else(|| payload.pointer("/response/cloudaicompanionProject").and_then(Value::as_str))
-        .or_else(|| payload.pointer("/response/cloudaicompanionProject/id").and_then(Value::as_str))
+        .or_else(|| {
+            payload
+                .pointer("/cloudaicompanionProject/id")
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            payload
+                .pointer("/response/cloudaicompanionProject")
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            payload
+                .pointer("/response/cloudaicompanionProject/id")
+                .and_then(Value::as_str)
+        })
         .or_else(|| payload.pointer("/project").and_then(Value::as_str))
         .or_else(|| payload.pointer("/response/project").and_then(Value::as_str))
-        .or_else(|| payload.pointer("/metadata/cloudaicompanionProject").and_then(Value::as_str))
+        .or_else(|| {
+            payload
+                .pointer("/metadata/cloudaicompanionProject")
+                .and_then(Value::as_str)
+        })
         .map(str::to_string)
 }
 
@@ -4868,10 +4929,18 @@ fn extract_gemini_code_assist_tier(payload: &Value) -> Option<String> {
     payload
         .pointer("/paidTier/id")
         .and_then(Value::as_str)
-        .or_else(|| payload.pointer("/response/paidTier/id").and_then(Value::as_str))
+        .or_else(|| {
+            payload
+                .pointer("/response/paidTier/id")
+                .and_then(Value::as_str)
+        })
         .or_else(|| payload.pointer("/currentTier/id").and_then(Value::as_str))
         .or_else(|| payload.pointer("/tier/id").and_then(Value::as_str))
-        .or_else(|| payload.pointer("/response/currentTier/id").and_then(Value::as_str))
+        .or_else(|| {
+            payload
+                .pointer("/response/currentTier/id")
+                .and_then(Value::as_str)
+        })
         .or_else(|| payload.pointer("/response/tier/id").and_then(Value::as_str))
         .map(str::to_string)
 }
@@ -4884,7 +4953,10 @@ fn gemini_code_assist_metadata(project_id: Option<&str>) -> Value {
     });
     if let Some(project_id) = project_id.filter(|value| !value.trim().is_empty()) {
         if let Some(object) = metadata.as_object_mut() {
-            object.insert("duetProject".to_string(), Value::String(project_id.to_string()));
+            object.insert(
+                "duetProject".to_string(),
+                Value::String(project_id.to_string()),
+            );
         }
     }
     metadata
@@ -4913,7 +4985,11 @@ fn extract_gemini_code_assist_onboard_tier(payload: &Value) -> Option<String> {
         .and_then(|tiers| {
             tiers
                 .iter()
-                .find(|tier| tier.get("isDefault").and_then(Value::as_bool).unwrap_or(false))
+                .find(|tier| {
+                    tier.get("isDefault")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                })
                 .or_else(|| tiers.first())
         })
         .and_then(|tier| tier.get("id").and_then(Value::as_str))
@@ -4922,12 +4998,13 @@ fn extract_gemini_code_assist_onboard_tier(payload: &Value) -> Option<String> {
 }
 
 fn extract_gemini_code_assist_ineligible_message(payload: &Value) -> Option<String> {
-    let tiers = payload.pointer("/ineligibleTiers").and_then(Value::as_array)?;
+    let tiers = payload
+        .pointer("/ineligibleTiers")
+        .and_then(Value::as_array)?;
     let messages = tiers
         .iter()
         .filter_map(|tier| {
-            tier
-                .get("reasonMessage")
+            tier.get("reasonMessage")
                 .and_then(Value::as_str)
                 .or_else(|| tier.get("validationErrorMessage").and_then(Value::as_str))
         })
@@ -4951,8 +5028,7 @@ async fn poll_gemini_code_assist_operation(
     }
     let endpoint = format!(
         "{}/{}",
-        GEMINI_CODE_ASSIST_OPERATIONS_ENDPOINT,
-        trimmed_name
+        GEMINI_CODE_ASSIST_OPERATIONS_ENDPOINT, trimmed_name
     );
     let mut last_payload = json!({});
     for _ in 0..6 {
@@ -4972,9 +5048,16 @@ async fn poll_gemini_code_assist_operation(
         let payload = serde_json::from_str::<Value>(&payload_text)
             .unwrap_or_else(|_| json!({ "raw": payload_text }));
         if !status.is_success() {
-            return Err(format!("Gemini Code Assist operation HTTP {status}: {}", payload));
+            return Err(format!(
+                "Gemini Code Assist operation HTTP {status}: {}",
+                payload
+            ));
         }
-        if payload.get("done").and_then(Value::as_bool).unwrap_or(false) {
+        if payload
+            .get("done")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
             return Ok(payload);
         }
         last_payload = payload;
@@ -5003,16 +5086,15 @@ async fn post_gemini_code_assist_json(
         .text()
         .await
         .map_err(|e| format!("读取 Gemini Code Assist 响应失败: {e}"))?;
-    let payload = serde_json::from_str::<Value>(&payload_text).unwrap_or_else(|_| json!({ "raw": payload_text }));
+    let payload = serde_json::from_str::<Value>(&payload_text)
+        .unwrap_or_else(|_| json!({ "raw": payload_text }));
     if !status.is_success() {
         return Err(format!("Gemini Code Assist HTTP {status}: {}", payload));
     }
     Ok(payload)
 }
 
-async fn initialize_gemini_code_assist_record(
-    mut record: StoredCloudToken,
-) -> StoredCloudToken {
+async fn initialize_gemini_code_assist_record(mut record: StoredCloudToken) -> StoredCloudToken {
     if record.mode != "gemini_google_oauth" || record.project_id.is_some() {
         return record;
     }
@@ -5029,7 +5111,8 @@ async fn initialize_gemini_code_assist_record(
         .build()
     else {
         record.onboarded = Some(false);
-        record.code_assist_message = Some("Could not create Gemini Code Assist client.".to_string());
+        record.code_assist_message =
+            Some("Could not create Gemini Code Assist client.".to_string());
         return record;
     };
 
@@ -5038,10 +5121,12 @@ async fn initialize_gemini_code_assist_record(
         GEMINI_CODE_ASSIST_LOAD_ENDPOINT,
         &record.access_token,
         gemini_code_assist_load_body(project_override_ref),
-    ).await {
+    )
+    .await
+    {
         Ok(payload) => {
-            record.project_id = extract_gemini_code_assist_project(&payload)
-                .or_else(|| project_override.clone());
+            record.project_id =
+                extract_gemini_code_assist_project(&payload).or_else(|| project_override.clone());
             record.tier = extract_gemini_code_assist_tier(&payload);
             if record.project_id.is_some() {
                 record.onboarded = Some(true);
@@ -5049,13 +5134,16 @@ async fn initialize_gemini_code_assist_record(
                 return record;
             }
             if record.code_assist_message.is_none() {
-                record.code_assist_message = extract_gemini_code_assist_ineligible_message(&payload);
+                record.code_assist_message =
+                    extract_gemini_code_assist_ineligible_message(&payload);
             }
             let Some(tier_id) = extract_gemini_code_assist_onboard_tier(&payload) else {
                 record.onboarded = Some(false);
-                record.code_assist_message = Some(record.code_assist_message.unwrap_or_else(|| {
-                    "Gemini Code Assist requires GOOGLE_CLOUD_PROJECT for this account.".to_string()
-                }));
+                record.code_assist_message =
+                    Some(record.code_assist_message.unwrap_or_else(|| {
+                        "Gemini Code Assist requires GOOGLE_CLOUD_PROJECT for this account."
+                            .to_string()
+                    }));
                 return record;
             };
 
@@ -5064,11 +5152,19 @@ async fn initialize_gemini_code_assist_record(
                 GEMINI_CODE_ASSIST_ONBOARD_ENDPOINT,
                 &record.access_token,
                 gemini_code_assist_onboard_body(&tier_id, project_override_ref),
-            ).await {
+            )
+            .await
+            {
                 Ok(mut payload) => {
                     if !payload.get("done").and_then(Value::as_bool).unwrap_or(true) {
                         if let Some(name) = payload.get("name").and_then(Value::as_str) {
-                            if let Ok(polled_payload) = poll_gemini_code_assist_operation(&client, &record.access_token, name).await {
+                            if let Ok(polled_payload) = poll_gemini_code_assist_operation(
+                                &client,
+                                &record.access_token,
+                                name,
+                            )
+                            .await
+                            {
                                 payload = polled_payload;
                             }
                         }
@@ -5099,7 +5195,9 @@ async fn initialize_gemini_code_assist_record(
 
 fn classify_gemini_code_assist_error(status: reqwest::StatusCode, body: &str) -> String {
     let body_excerpt = body.chars().take(500).collect::<String>();
-    if body.contains("SERVICE_DISABLED") || body.contains("Cloud Code Private API has not been used") {
+    if body.contains("SERVICE_DISABLED")
+        || body.contains("Cloud Code Private API has not been used")
+    {
         return format!(
             "Gemini Code Assist 请求使用的 Google Cloud Project 未启用 Cloud Code Private API。请在 Google Cloud Console 启用 cloudcode-pa.googleapis.com，或清除 GOOGLE_CLOUD_PROJECT / GOOGLE_CLOUD_PROJECT_ID 后重新登录让 Code Assist 使用可用项目；也可以改用 Gemini API Key。原始响应: {}",
             body_excerpt
@@ -6076,12 +6174,13 @@ async fn proxy_request_detailed(
         req = req.header(key.as_str(), value.as_str());
     }
 
-    let req = if let Some(body_str) = body { req.body(body_str) } else { req };
+    let req = if let Some(body_str) = body {
+        req.body(body_str)
+    } else {
+        req
+    };
 
-    let response = req
-        .send()
-        .await
-        .map_err(|e| format!("请求失败: {e}"))?;
+    let response = req.send().await.map_err(|e| format!("请求失败: {e}"))?;
 
     let status = response.status();
     let content_type = response
@@ -6220,6 +6319,12 @@ async fn start_chat_stream(
             }
         }
         record_debug_log(&app, "info", "start_chat_stream", debug_parts.join(" "));
+        record_debug_log(
+            &app,
+            "info",
+            "stream_started",
+            format!("stream_id={} url={}", stream_id, url),
+        );
     }
 
     let client = reqwest::Client::builder()
@@ -6288,9 +6393,10 @@ async fn start_chat_stream(
             record_debug_log(
                 &app,
                 "info",
-                "start_chat_stream",
+                "stream_cancelled",
                 format!(
-                    "cancelled_before_response url={} elapsed_ms={}",
+                    "cancelled_before_response stream_id={} url={} elapsed_ms={}",
+                    stream_id,
                     url,
                     stream_started_at.elapsed().as_millis(),
                 ),
@@ -6345,6 +6451,7 @@ async fn start_chat_stream(
     let mut utf8_tail: Vec<u8> = Vec::new();
     let mut chunk_count: usize = 0;
     let mut byte_count: usize = 0;
+    let mut last_progress_log_at = Instant::now();
 
     loop {
         let (chunk_abort_handle, chunk_abort_registration) =
@@ -6393,9 +6500,10 @@ async fn start_chat_stream(
                     record_debug_log(
                         &app,
                         "info",
-                        "start_chat_stream",
+                        "stream_cancelled",
                         format!(
-                            "cancelled_waiting_for_first_chunk url={} elapsed_ms={}",
+                            "cancelled_waiting_for_first_chunk stream_id={} url={} elapsed_ms={}",
+                            stream_id,
                             url,
                             stream_started_at.elapsed().as_millis(),
                         ),
@@ -6417,9 +6525,10 @@ async fn start_chat_stream(
                     record_debug_log(
                         &app,
                         "info",
-                        "start_chat_stream",
+                        "stream_cancelled",
                         format!(
-                            "cancelled url={} chunks={} bytes={} elapsed_ms={}",
+                            "cancelled stream_id={} url={} chunks={} bytes={} elapsed_ms={}",
+                            stream_id,
                             url,
                             chunk_count,
                             byte_count,
@@ -6444,9 +6553,10 @@ async fn start_chat_stream(
             record_debug_log(
                 &app,
                 "info",
-                "start_chat_stream",
+                "stream_cancelled",
                 format!(
-                    "cancelled url={} chunks={} bytes={} elapsed_ms={}",
+                    "cancelled stream_id={} url={} chunks={} bytes={} elapsed_ms={}",
+                    stream_id,
                     url,
                     chunk_count,
                     byte_count,
@@ -6474,6 +6584,25 @@ async fn start_chat_stream(
                 }
                 chunk_count += 1;
                 byte_count += bytes.len();
+                if is_model_request
+                    && last_progress_log_at.elapsed()
+                        >= Duration::from_secs(STREAM_PROGRESS_LOG_INTERVAL_SECS)
+                {
+                    last_progress_log_at = Instant::now();
+                    record_debug_log(
+                        &app,
+                        "info",
+                        "stream_chunk_progress",
+                        format!(
+                            "stream_id={} url={} chunks={} bytes={} elapsed_ms={}",
+                            stream_id,
+                            url,
+                            chunk_count,
+                            byte_count,
+                            stream_started_at.elapsed().as_millis(),
+                        ),
+                    );
+                }
 
                 // Prepend any leftover bytes from the previous chunk
                 let mut combined = Vec::with_capacity(utf8_tail.len() + bytes.len());
@@ -6514,9 +6643,10 @@ async fn start_chat_stream(
                 record_debug_log(
                     &app,
                     "error",
-                    "start_chat_stream",
+                    "stream_error",
                     format!(
-                        "read_error url={} chunks={} bytes={} elapsed_ms={} err={}",
+                        "read_error stream_id={} url={} chunks={} bytes={} elapsed_ms={} err={}",
+                        stream_id,
                         url,
                         chunk_count,
                         byte_count,
@@ -6537,9 +6667,10 @@ async fn start_chat_stream(
         record_debug_log(
             &app,
             "info",
-            "start_chat_stream",
+            "stream_done",
             format!(
-                "success url={} chunks={} bytes={} elapsed_ms={}",
+                "success stream_id={} url={} chunks={} bytes={} elapsed_ms={}",
+                stream_id,
                 url,
                 chunk_count,
                 byte_count,
@@ -8024,6 +8155,7 @@ pub fn run() {
             read_file,
             read_file_window,
             get_file_metadata,
+            open_file_external,
             write_file,
             export_text_file,
             glob_search,
@@ -8041,6 +8173,7 @@ pub fn run() {
             load_session_memory,
             record_session_failure,
             run_eval_harness,
+            run_runtime_harness,
             create_multi_agent_plan,
             list_mcp_tools,
             call_mcp_tool,
@@ -8113,9 +8246,9 @@ mod tests {
         merge_json_rows_by_id, parse_git_branch_line, parse_git_numstat,
         parse_git_porcelain_entries, parse_git_porcelain_status,
         read_session_transcript_with_fallback, resolve_existing_path,
-        resolve_session_transcript_to_write, resolve_write_path, should_hide_list_directory_entry,
-        should_skip_recursive_search_dir, validate_pty_input, write_json_atomic,
-        write_jsonl_atomic, FileNode, SessionTranscript,
+        resolve_open_file_external_path, resolve_session_transcript_to_write, resolve_write_path,
+        should_hide_list_directory_entry, should_skip_recursive_search_dir, validate_pty_input,
+        write_json_atomic, write_jsonl_atomic, FileNode, SessionTranscript,
     };
     use serde_json::json;
     use std::fs;
@@ -8382,8 +8515,58 @@ mod tests {
     }
 
     #[test]
+    fn open_file_external_path_accepts_workspace_file() {
+        let workspace = make_temp_workspace("external-open-file");
+        let target = workspace.join("notes.md");
+        fs::write(&target, "# Notes\n").unwrap();
+
+        let resolved = resolve_open_file_external_path("notes.md", &workspace).unwrap();
+
+        assert_eq!(resolved, target.canonicalize().unwrap());
+        fs::remove_dir_all(&workspace).unwrap();
+    }
+
+    #[test]
+    fn open_file_external_path_rejects_directory_targets() {
+        let workspace = make_temp_workspace("external-open-directory");
+        fs::create_dir_all(workspace.join("docs")).unwrap();
+
+        let error = resolve_open_file_external_path("docs", &workspace).unwrap_err();
+
+        assert!(error.contains("目标不是文件"));
+        fs::remove_dir_all(&workspace).unwrap();
+    }
+
+    #[test]
+    fn open_file_external_path_rejects_missing_files() {
+        let workspace = make_temp_workspace("external-open-missing");
+
+        let error = resolve_open_file_external_path("missing.docx", &workspace).unwrap_err();
+
+        assert!(error.contains("路径不存在") || error.contains("无法访问"));
+        fs::remove_dir_all(&workspace).unwrap();
+    }
+
+    #[test]
+    fn open_file_external_path_rejects_parent_escape() {
+        let parent = make_temp_workspace("external-open-parent");
+        let workspace = parent.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(parent.join("outside.txt"), "outside").unwrap();
+
+        let error =
+            resolve_open_file_external_path("../outside.txt", &workspace.canonicalize().unwrap())
+                .unwrap_err();
+
+        assert!(error.contains("路径越界"));
+        fs::remove_dir_all(&parent).unwrap();
+    }
+
+    #[test]
     fn log_files_are_supported_attachments() {
-        assert!(is_supported_attachment_path(PathBuf::from("main-debug.log").as_path()));
+        assert!(is_supported_attachment_path(
+            PathBuf::from("main-debug.log").as_path()
+        ));
     }
 
     #[test]

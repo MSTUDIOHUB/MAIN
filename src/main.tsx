@@ -4,9 +4,14 @@ import "./index.css";
 import App from "./App";
 import AppErrorBoundary from "./components/AppErrorBoundary";
 import { appendDebugLog, installDebugLogCapture } from "./lib/debugLog";
+import { markHarnessInstanceClosed, markHarnessInstanceStarted } from "./lib/harnessCrashTelemetry";
 
 installDebugLogCapture();
+markHarnessInstanceStarted();
 appendDebugLog("info", "app.startup", { phase: "before_react_render" });
+
+window.addEventListener("pagehide", () => markHarnessInstanceClosed("pagehide"));
+window.addEventListener("beforeunload", () => markHarnessInstanceClosed("beforeunload"));
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>

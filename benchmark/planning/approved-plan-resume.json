@@ -1,0 +1,9 @@
+{
+  "id": "approved-plan-resume",
+  "category": "planning",
+  "success": true,
+  "retries": 0,
+  "hallucinations": 0,
+  "latencyMs": 950,
+  "toolCalls": 3
+}

@@ -155,11 +155,15 @@ impl RuntimeLoop {
                 .record(&TraceRecord {
                     task_id: step.task_id.clone(),
                     step_id: step.step_id.clone(),
+                    event_name: RuntimeEventName::ToolCalled.as_str().to_string(),
                     tool_call: step.tool_call.clone(),
                     stdout: observation.stdout.clone(),
                     stderr: observation.stderr.clone(),
                     verification: verification.summary.clone(),
                     latency_ms: observation.latency_ms,
+                    metadata: json!({
+                        "verificationSuccess": verification.success,
+                    }),
                 })
                 .await?;
 

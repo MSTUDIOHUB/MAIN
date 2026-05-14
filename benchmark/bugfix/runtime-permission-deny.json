@@ -1,0 +1,9 @@
+{
+  "id": "runtime-permission-deny",
+  "category": "bugfix",
+  "success": true,
+  "retries": 1,
+  "hallucinations": 0,
+  "latencyMs": 1200,
+  "toolCalls": 4
+}

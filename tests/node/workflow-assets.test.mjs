@@ -29,6 +29,26 @@ test("plan templates and workflow assets exist", async () => {
   );
 });
 
+test("runtime foundation validation assets are wired", async () => {
+  const packageJson = JSON.parse(await fs.readFile(path.join(workspaceRoot, "package.json"), "utf8"));
+  assert.equal(packageJson.scripts?.lint, "tsc --noEmit");
+
+  const benchmarkCategories = ["bugfix", "refactor", "planning", "long_horizon"];
+  await Promise.all(
+    benchmarkCategories.map(async (category) => {
+      const directory = path.join(workspaceRoot, "benchmark", category);
+      const entries = await fs.readdir(directory);
+      const jsonCases = entries.filter((entry) => entry.endsWith(".json"));
+      assert.ok(jsonCases.length > 0, `benchmark/${category} should include at least one eval case`);
+      const sample = JSON.parse(await fs.readFile(path.join(directory, jsonCases[0]), "utf8"));
+      assert.equal(sample.category, category);
+      for (const field of ["success", "retries", "hallucinations", "latencyMs", "toolCalls"]) {
+        assert.ok(Object.hasOwn(sample, field), `${jsonCases[0]} should include ${field}`);
+      }
+    }),
+  );
+});
+
 test("plan templates explicitly support data-analysis planning semantics", async () => {
   const requirements = await fs.readFile(path.join(workspaceRoot, ".MAIN/templates/plan/requirements.md"), "utf8");
   const design = await fs.readFile(path.join(workspaceRoot, ".MAIN/templates/plan/design.md"), "utf8");

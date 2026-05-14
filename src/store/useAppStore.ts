@@ -8,6 +8,14 @@ import { analyzeTabularDocument, deleteChatTempPath, deletePlanFiles, deleteWork
 import { invoke } from "@tauri-apps/api/core";
 import { setWorkspaceRoot as setWorkspaceRootIpc } from "../lib/ipc";
 import { appendDebugLog } from "../lib/debugLog";
+import {
+  closeHarnessRunMarker,
+  consumePendingUncleanRestartDiagnostic,
+  getCurrentHarnessInstanceId,
+  normalizeHarnessRunMarker,
+  persistHarnessRunMarker,
+  type HarnessRunMarker,
+} from "../lib/harnessCrashTelemetry";
 import { formatWorkspaceTree } from "../lib/systemPrompt";
 import { normalizeContextMemoryState, type ContextMemoryState } from "../lib/contextMemory";
 import { setMcpToolServerMap, type MCPServer, type MCPTool } from "../lib/mcpClient";
@@ -119,6 +127,7 @@ import {
   getAttachmentDisplayName,
   normalizeAttachedFile,
 } from "../lib/attachments";
+import { getFilePreviewStrategy } from "../lib/filePreviewStrategy";
 import {
   buildUserContextItems,
   sanitizeUserContextItemsForPersist,
@@ -606,6 +615,7 @@ export interface ProviderCompatibilityRuntimeLaneState {
 export interface SessionRuntimeSnapshot {
   runtimeEventSchemaVersion?: number;
   runtimeEvents?: MainThreadEvent[];
+  harnessRunMarker?: HarnessRunMarker | null;
   taskFlow: TaskBlock[];
   agentMessages: AgentMessage[];
   contextMemoryState?: ContextMemoryState | null;
@@ -1072,6 +1082,7 @@ interface AppState {
   planExecutionProgressSnapshot: PlanExecutionProgressSnapshot | null;
   normalizedStreamState: NormalizedStreamState;
   runtimeEvents: MainThreadEvent[];
+  harnessRunMarker: HarnessRunMarker | null;
   setWorkflowMode: (mode: "chat" | "edit" | "plan") => void;
   setIsPlanApproved: (v: boolean) => void;
   setPlanStage: (stage: PlanStage) => void;
@@ -1579,6 +1590,7 @@ function normalizeRuntimeEvents(value: unknown): MainThreadEvent[] {
     "slash.command.failed",
     "path_alias_hit",
     "plan_state_hydrated",
+    "harness.telemetry",
     "item.started",
     "item.updated",
     "item.completed",
@@ -1621,6 +1633,7 @@ function normalizeSessionRuntimeSnapshot(
   return {
     runtimeEventSchemaVersion: Math.max(1, Number(snapshot.runtimeEventSchemaVersion) || 1),
     runtimeEvents: normalizeRuntimeEvents(snapshot.runtimeEvents),
+    harnessRunMarker: normalizeHarnessRunMarker(snapshot.harnessRunMarker),
     taskFlow,
     agentMessages: sanitizeAgentMessagesForPersist(snapshot.agentMessages || []),
     contextMemoryState: normalizedContextMemoryState,
@@ -1661,6 +1674,7 @@ function normalizeSessionRuntimeSnapshot(
 const sessionRuntimeKeys = [
   "runtimeEventSchemaVersion",
   "runtimeEvents",
+  "harnessRunMarker",
   "taskFlow",
   "agentMessages",
   "contextMemoryState",
@@ -1757,6 +1771,7 @@ function createSessionRuntimeFromState(state: Partial<AppState>): SessionRuntime
   return {
     runtimeEventSchemaVersion: 1,
     runtimeEvents: normalizeRuntimeEvents(state.runtimeEvents),
+    harnessRunMarker: normalizeHarnessRunMarker(state.harnessRunMarker),
     taskFlow: Array.isArray(state.taskFlow) ? state.taskFlow : [],
     agentMessages: Array.isArray(state.agentMessages) ? state.agentMessages : [],
     contextMemoryState: normalizedContextMemoryState,
@@ -3229,29 +3244,12 @@ const TABULAR_ATTACHMENT_EXTENSIONS = new Set([
   ".tsv",
 ]);
 
-const FILE_VIEWER_BINARY_EXTENSIONS = new Set([
-  ".exe", ".dll", ".so", ".dylib", ".bin", ".dat",
-  ".zip", ".tar", ".gz", ".rar", ".7z", ".bz2", ".xz", ".zst",
-  ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
-  ".mp3", ".mp4", ".avi", ".mov", ".mkv", ".wav", ".flac", ".ogg", ".webm",
-  ".woff", ".woff2", ".ttf", ".otf", ".eot",
-  ".class", ".jar", ".war", ".pyc", ".o", ".a",
-]);
-
 function shouldUseDocumentReader(path: string): boolean {
   const lower = path.toLowerCase();
   for (const ext of STRUCTURED_ATTACHMENT_EXTENSIONS) {
     if (lower.endsWith(ext)) return true;
   }
   return false;
-}
-
-function isBinaryFileViewerPath(path: string): boolean {
-  const fileName = path.split(/[\\/]/).pop()?.toLowerCase() || path.toLowerCase();
-  if (fileName === "dockerfile" || fileName === "makefile") return false;
-  const dotIdx = fileName.lastIndexOf(".");
-  if (dotIdx === -1) return false;
-  return FILE_VIEWER_BINARY_EXTENSIONS.has(fileName.slice(dotIdx));
 }
 
 function shouldUseTabularAnalyzer(path: string): boolean {
@@ -3497,7 +3495,8 @@ export const useAppStore = create<AppState>()(
       fileViewerError: "",
       fileViewerLoading: true,
     });
-    if (isBinaryFileViewerPath(path)) {
+    const previewStrategy = getFilePreviewStrategy({ path });
+    if (previewStrategy.mode === "externalOnly") {
       set({ fileViewerContent: "", fileViewerWindow: null, fileViewerError: "", fileViewerLoading: false });
       return;
     }
@@ -4627,6 +4626,7 @@ export const useAppStore = create<AppState>()(
       return {
         taskFlow: [],
         runtimeEvents: [],
+        harnessRunMarker: null,
         agentMessages: [],
         contextMemoryState: null,
         contextMemoryStateByRuntimeKey: {},
@@ -4720,6 +4720,7 @@ export const useAppStore = create<AppState>()(
       planStage: "idle",
       planApprovalChoice: null,
       normalizedStreamState: defaultNormalizedStreamState,
+      harnessRunMarker: null,
     });
   },
 
@@ -4736,6 +4737,7 @@ export const useAppStore = create<AppState>()(
   planExecutionProgressSnapshot: null,
   normalizedStreamState: defaultNormalizedStreamState,
   runtimeEvents: [],
+  harnessRunMarker: null,
   setWorkflowMode: (mode) => set((s) => ({
     config: { ...s.config, workflowMode: mode },
     ...(mode === "chat" ? { showPlanPanel: false, showDiff: false } : {}),
@@ -5117,6 +5119,7 @@ export const useAppStore = create<AppState>()(
     set({
       taskFlow: [],
       runtimeEvents: [],
+      harnessRunMarker: null,
       messages: [],
       agentMessages: [],
       contextMemoryState: null,
@@ -6424,6 +6427,7 @@ export const useAppStore = create<AppState>()(
           runtimeSnapshot: normalizeSessionRuntimeSnapshot({
             runtimeEventSchemaVersion: 1,
             runtimeEvents: sessionGet().runtimeEvents,
+            harnessRunMarker: sessionGet().harnessRunMarker,
             taskFlow: sessionGet().taskFlow,
             agentMessages: sessionGet().agentMessages,
             contextMemoryState: sessionGet().contextMemoryState,
@@ -7194,6 +7198,125 @@ export const useAppStore = create<AppState>()(
       // 5. Create AbortController and launch the loop
       const abortCtrl = new AbortController();
       sessionSet({ abortController: abortCtrl });
+      let harnessRunMarker: HarnessRunMarker = persistHarnessRunMarker({
+        schemaVersion: 1,
+        instanceId: getCurrentHarnessInstanceId(),
+        sessionKey: runSessionKey,
+        workspace: runWorkspace || null,
+        sessionId: runSessionId ?? null,
+        turnId,
+        status: "running",
+        workflowMode: getIntentPolicy(effectiveRunIntent).workflowMode,
+        runtimeIntent: runtimeRunIntent,
+        planStage: sessionGet().planStage,
+        isPlanApproved: sessionGet().isPlanApproved,
+        iteration: 0,
+        maxIterations: 0,
+        messagesLen: sessionGet().agentMessages.length,
+        toolCount: 0,
+        latestTool: null,
+        latestToolTarget: null,
+        activeStreamId: null,
+        streamStatus: "run_started",
+        streamChunkCount: 0,
+        streamByteCount: 0,
+        lastStreamError: null,
+        startedAt: Date.now(),
+        updatedAt: Date.now(),
+        closedAt: null,
+        closeReason: null,
+      });
+
+      const emitHarnessTelemetry = (name: string, details: Record<string, unknown>) => {
+        const event = withEventSchema({
+          type: "harness.telemetry",
+          threadId: runSessionKey,
+          turnId,
+          timestampMs: Date.now(),
+          telemetry: { name, details },
+        });
+        sessionSet((s) => ({
+          runtimeEvents: appendRuntimeEvent(s.runtimeEvents, event),
+        }));
+        appendDebugLog(
+          name === "unclean_termination" ? "error" : name.includes("warning") ? "warn" : "info",
+          `harness.${name}`,
+          details,
+        );
+      };
+
+      const updateHarnessRunMarker = (patch: Partial<HarnessRunMarker> & Record<string, unknown>) => {
+        const latest = sessionGet();
+        const next = persistHarnessRunMarker({
+          ...harnessRunMarker,
+          ...patch,
+          status: (patch.status as HarnessRunMarker["status"]) || "running",
+          planStage: latest.planStage,
+          isPlanApproved: latest.isPlanApproved,
+          messagesLen: typeof patch.messagesLen === "number" ? patch.messagesLen : latest.agentMessages.length,
+          updatedAt: Date.now(),
+          closedAt: null,
+          closeReason: null,
+        });
+        harnessRunMarker = next;
+        sessionSet({ harnessRunMarker: next });
+        const streamStatus = typeof patch.streamStatus === "string" ? patch.streamStatus : "";
+        if (
+          streamStatus === "stream_started" ||
+          streamStatus === "first_chunk" ||
+          streamStatus === "no_chunk_progress_warning" ||
+          streamStatus === "stream_done" ||
+          streamStatus === "stream_error" ||
+          streamStatus === "stream_cancelled" ||
+          streamStatus === "tool_called"
+        ) {
+          emitHarnessTelemetry(streamStatus, {
+            turnId,
+            iteration: next.iteration,
+            activeStreamId: next.activeStreamId,
+            streamStatus: next.streamStatus,
+            streamChunkCount: next.streamChunkCount,
+            streamByteCount: next.streamByteCount,
+            latestTool: next.latestTool,
+            latestToolTarget: next.latestToolTarget,
+            lastStreamError: next.lastStreamError,
+          });
+        }
+      };
+
+      const closeCurrentHarnessRunMarker = (status: HarnessRunMarker["status"], reason: string) => {
+        if (harnessRunMarker.status !== "running") return;
+        const closed = closeHarnessRunMarker({
+          ...harnessRunMarker,
+          status,
+          closeReason: reason,
+          planStage: sessionGet().planStage,
+          isPlanApproved: sessionGet().isPlanApproved,
+          messagesLen: sessionGet().agentMessages.length,
+        });
+        if (closed) {
+          harnessRunMarker = closed;
+          sessionSet({ harnessRunMarker: closed });
+          emitHarnessTelemetry("task_completed", {
+            turnId,
+            status,
+            reason,
+            iteration: closed.iteration,
+            streamStatus: closed.streamStatus,
+            latestTool: closed.latestTool,
+            latestToolTarget: closed.latestToolTarget,
+          });
+        }
+      };
+
+      sessionSet({ harnessRunMarker });
+      emitHarnessTelemetry("task_started", {
+        turnId,
+        runtimeIntent: runtimeRunIntent,
+        workflowMode: harnessRunMarker.workflowMode,
+        planStage: harnessRunMarker.planStage,
+        isPlanApproved: harnessRunMarker.isPlanApproved,
+      });
 
       // Track the current streaming assistant block
       let currentStreamingBlockId: number | null = null;
@@ -7727,6 +7850,9 @@ export const useAppStore = create<AppState>()(
             return { providerCompatibilityByRuntimeKey: nextMap };
           });
         },
+        onHarnessRunUpdate: (patch) => {
+          updateHarnessRunMarker(patch as Partial<HarnessRunMarker> & Record<string, unknown>);
+        },
 
         onStreamToken: (token, _msgId) => {
           // Handle escalation reset signal
@@ -8236,6 +8362,16 @@ export const useAppStore = create<AppState>()(
             agentMessages: sessionGet().agentMessages.length,
             elapsedMs: Math.round(nowMs() - sendStartedAt),
           });
+          if (status === "idle" || status === "error") {
+            closeCurrentHarnessRunMarker(
+              status === "error" ? "error" : abortCtrl.signal.aborted ? "idle" : "completed",
+              status === "error"
+                ? "agent_status_error"
+                : abortCtrl.signal.aborted
+                ? "aborted_by_user"
+                : "agent_status_idle",
+            );
+          }
           const finalizeStaleRunningTools = (finalStatus: "executed" | "failed" | "rejected", message: string) => {
             sessionSet((s) => ({
               taskFlow: s.taskFlow.map((task) =>
@@ -9135,6 +9271,7 @@ export const useAppStore = create<AppState>()(
 
       // Fire and forget — the loop manages its own lifecycle
       executeAgentLoop(callbacks, abortCtrl).then(() => {
+        closeCurrentHarnessRunMarker("completed", "agent_loop_resolved");
         clearInterval(timerInterval);
         sessionSet({ pendingSlashCommand: null, elapsedTime: getElapsedSeconds() });
 
@@ -9168,6 +9305,7 @@ export const useAppStore = create<AppState>()(
             runtimeSnapshot: normalizeSessionRuntimeSnapshot({
               runtimeEventSchemaVersion: 1,
               runtimeEvents: s.runtimeEvents,
+              harnessRunMarker: s.harnessRunMarker,
               taskFlow: messages,
               agentMessages: sanitizeAgentMessagesForPersist(s.agentMessages),
               contextMemoryState: s.contextMemoryState,
@@ -9198,6 +9336,7 @@ export const useAppStore = create<AppState>()(
           });
         }
       }).catch((err) => {
+        closeCurrentHarnessRunMarker("error", "agent_loop_crashed");
         clearInterval(timerInterval);
         sessionSet({ pendingSlashCommand: null, elapsedTime: getElapsedSeconds() });
         logStoreEvent("agent_loop_crashed", {
@@ -9279,6 +9418,59 @@ export const useAppStore = create<AppState>()(
           currentWorkspace: state.currentWorkspace || "global",
           currentSessionId: state.currentSessionId ?? null,
         });
+        const uncleanRestart = consumePendingUncleanRestartDiagnostic();
+        if (uncleanRestart) {
+          const marker = uncleanRestart.marker;
+          const details = {
+            previousInstanceId: uncleanRestart.previousInstanceId,
+            detectedAt: uncleanRestart.detectedAt,
+            sessionKey: marker.sessionKey,
+            workspace: marker.workspace,
+            sessionId: marker.sessionId,
+            turnId: marker.turnId,
+            runtimeIntent: marker.runtimeIntent,
+            workflowMode: marker.workflowMode,
+            planStage: marker.planStage,
+            isPlanApproved: marker.isPlanApproved,
+            iteration: marker.iteration,
+            maxIterations: marker.maxIterations,
+            activeStreamId: marker.activeStreamId,
+            streamStatus: marker.streamStatus,
+            streamChunkCount: marker.streamChunkCount,
+            streamByteCount: marker.streamByteCount,
+            latestTool: marker.latestTool,
+            latestToolTarget: marker.latestToolTarget,
+            lastStreamError: marker.lastStreamError,
+            lastUpdatedAt: marker.updatedAt,
+          };
+          logStoreEvent("unclean_restart_detected", details);
+          useAppStore.setState((s: AppState) => ({
+            harnessRunMarker: marker,
+            runtimeEvents: appendRuntimeEvent(s.runtimeEvents, withEventSchema({
+              type: "harness.telemetry",
+              threadId: marker.sessionKey || resolveSessionRuntimeKey(resolveSessionWorkspaceKey(s.currentWorkspace), s.currentSessionId) || "default",
+              turnId: marker.turnId || undefined,
+              timestampMs: Date.now(),
+              telemetry: {
+                name: "unclean_termination",
+                details,
+              },
+            })),
+          }));
+          if (marker.workspace) {
+            void invoke("record_session_failure", {
+              stepId: "unclean_termination",
+              toolCall: marker.latestTool || marker.activeStreamId || "runtime",
+              stderr: JSON.stringify(details),
+              verification: "MAIN restarted before the active run closed cleanly.",
+              workspace: marker.workspace,
+            }).catch((reflectionError) => {
+              logStoreEvent("unclean_restart_reflection_failed", {
+                error: reflectionError instanceof Error ? reflectionError.message : String(reflectionError),
+              });
+            });
+          }
+        }
         };
       },
     // Merge persisted data back into the default state on hydration,

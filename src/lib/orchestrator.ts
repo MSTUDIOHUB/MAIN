@@ -480,6 +480,7 @@ export interface OrchestratorCallbacks {
   onTurnSummaryReady: (summary: string) => void;
   onExecutionDigestUpdate?: (summary: string) => void;
   onTurnEvent?: (event: MainThreadEvent) => void;
+  onHarnessRunUpdate?: (patch: Record<string, unknown>) => void;
   onInstructionsResolved: (resolved: ResolvedInstructionSet) => void;
   onHooksLoaded: (hooks: HookDefinition[], loadedAt?: number | null) => void;
   onHookStart: (event: HookEvent, hook: HookDefinition) => void;
@@ -1924,6 +1925,17 @@ async function fetchLLMStream(
             },
             onError: (err) => {
               safeReject(err);
+            },
+            onLifecycle: (event) => {
+              callbacks.onHarnessRunUpdate?.({
+                activeStreamId: event.streamId || null,
+                streamStatus: event.phase,
+                streamChunkCount: event.chunkCount ?? 0,
+                streamByteCount: event.byteCount ?? 0,
+                lastStreamError: event.error || null,
+                streamElapsedMs: event.elapsedMs ?? 0,
+                streamLifecycleStatus: event.status || null,
+              });
             },
           },
           requestAbortController.signal,
@@ -4159,6 +4171,22 @@ export async function executeAgentLoop(
       mcpTools: mcpTools.length,
       currentMaxTokens: currentMaxTokens ?? "default",
     });
+    callbacks.onHarnessRunUpdate?.({
+      status: "running",
+      iteration,
+      maxIterations: effectiveMaxIterations,
+      workflowMode,
+      runtimeIntent,
+      planStage: callbacks.getPlanStage(),
+      isPlanApproved: callbacks.getIsPlanApproved(),
+      messagesLen: managedAgentMessages.length,
+      toolCount: iterationAllTools.length,
+      activeStreamId: null,
+      streamStatus: "iteration_started",
+      streamChunkCount: 0,
+      streamByteCount: 0,
+      lastStreamError: null,
+    });
 
     try {
       const messagesForLLM = prepareMessagesForToolProtocol(
@@ -5911,6 +5939,12 @@ export async function executeAgentLoop(
       const toolArgs = parseToolCallArguments(tc, workspace);
       toolArgsByCallId.set(tc.id, toolArgs);
       const target = getToolTarget(tc.name, toolArgs);
+      callbacks.onHarnessRunUpdate?.({
+        latestTool: tc.name,
+        latestToolTarget: target || null,
+        toolCallId: tc.id,
+        streamStatus: "tool_called",
+      });
       const failureSignature = buildRepeatLoopSignature(tc.name, buildRepeatLoopArgsKey(toolArgs));
       toolFailureSignatures.set(tc.id, failureSignature);
 

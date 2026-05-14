@@ -7,11 +7,15 @@ use tokio::fs;
 pub struct TraceRecord {
     pub task_id: String,
     pub step_id: String,
+    #[serde(default = "default_event_name")]
+    pub event_name: String,
     pub tool_call: String,
     pub stdout: String,
     pub stderr: String,
     pub verification: String,
     pub latency_ms: u128,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
 }
 
 #[derive(Debug, Clone)]
@@ -116,6 +120,10 @@ fn sanitize_trace_part(value: &str) -> String {
     }
 }
 
+fn default_event_name() -> String {
+    "tool_called".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{TraceRecord, TraceRecorder};
@@ -146,11 +154,13 @@ mod tests {
                 .record(&TraceRecord {
                     task_id: "task-a".to_string(),
                     step_id: "02".to_string(),
+                    event_name: "tool_called".to_string(),
                     tool_call: "cargo test".to_string(),
                     stdout: "ok".to_string(),
                     stderr: String::new(),
                     verification: "passed".to_string(),
                     latency_ms: 9,
+                    metadata: serde_json::json!({}),
                 })
                 .await
                 .unwrap();
@@ -158,11 +168,13 @@ mod tests {
                 .record(&TraceRecord {
                     task_id: "task-a".to_string(),
                     step_id: "01".to_string(),
+                    event_name: "tool_called".to_string(),
                     tool_call: "cargo check".to_string(),
                     stdout: "ok".to_string(),
                     stderr: String::new(),
                     verification: "passed".to_string(),
                     latency_ms: 7,
+                    metadata: serde_json::json!({}),
                 })
                 .await
                 .unwrap();

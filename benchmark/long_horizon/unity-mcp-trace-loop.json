@@ -1,0 +1,9 @@
+{
+  "id": "unity-mcp-trace-loop",
+  "category": "long_horizon",
+  "success": true,
+  "retries": 2,
+  "hallucinations": 0,
+  "latencyMs": 4200,
+  "toolCalls": 9
+}

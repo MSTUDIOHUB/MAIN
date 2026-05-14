@@ -1,0 +1,9 @@
+{
+  "id": "runtime-harness-modularization",
+  "category": "refactor",
+  "success": true,
+  "retries": 0,
+  "hallucinations": 0,
+  "latencyMs": 1800,
+  "toolCalls": 6
+}

@@ -3,6 +3,7 @@ import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneLight, vscDarkPlus } from "react-syntax-highlighter/dist/esm/styles/prism";
 import {
   IconClose,
+  IconExternalLink,
   IconFileArchive,
   IconFileCode,
   IconFileConfig,
@@ -16,6 +17,9 @@ import {
 import MarkdownRenderer from "./MarkdownRenderer";
 import WorkspaceTreePanel from "./WorkspaceTreePanel";
 import { useAppStore } from "../store/useAppStore";
+import { getFilePreviewStrategy } from "../lib/filePreviewStrategy";
+import { getFileMetadata } from "../lib/ipc";
+import { useExternalFileOpen } from "../lib/useExternalFileOpen";
 
 const CODE_FONT_FAMILY = "'JetBrains Mono', 'Fira Code', Menlo, Monaco, 'Courier New', monospace";
 const MAX_TABLE_PREVIEW_ROWS = 80;
@@ -63,9 +67,9 @@ const UNITY_EXTS = new Set(["asset", "prefab", "meta", "unity"]);
 const CONFIG_EXTS = new Set(["yaml", "yml", "toml", "ini", "cfg", "conf", "env", "xml", "svg", "editorconfig"]);
 const BINARY_EXTS = new Set([
   "exe", "dll", "so", "dylib", "bin", "dat",
-  "zip", "tar", "gz", "rar", "7z", "bz2", "xz", "zst",
-  "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
-  "mp3", "mp4", "avi", "mov", "mkv", "wav", "flac", "ogg", "webm",
+  "zip", "tar", "gz", "rar", "7z", "bz2", "xz", "zst", "tgz",
+  "pdf", "doc", "docx", "xls", "xlsx", "xlsm", "ppt", "pptx", "pptm",
+  "mp3", "mp4", "avi", "mov", "mkv", "wav", "flac", "ogg", "webm", "m4a",
   "woff", "woff2", "ttf", "otf", "eot",
   "class", "jar", "war", "pyc", "o", "a",
 ]);
@@ -141,6 +145,20 @@ function looksBinary(content: string): boolean {
     }
   }
   return nonPrintable / sample.length > 0.1;
+}
+
+function formatFileSize(bytes: number | undefined, language: "zh" | "en"): string {
+  if (typeof bytes !== "number" || !Number.isFinite(bytes) || bytes < 0) return "";
+  const units = ["B", "KiB", "MiB", "GiB"];
+  let value = bytes;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  const precision = value >= 10 || unitIndex === 0 ? 0 : 1;
+  const formatted = `${value.toFixed(precision)} ${units[unitIndex]}`;
+  return language === "zh" ? formatted : formatted;
 }
 
 function stripJsonComments(input: string): string {
@@ -437,6 +455,7 @@ function getFileDisplayMeta(category: FileCategory, fileLang: string, filePath: 
 
 function FileViewerPanel({
   filePath,
+  workspace,
   fileContent,
   fileWindow,
   fileError,
@@ -450,6 +469,7 @@ function FileViewerPanel({
   onLoadNextWindow,
 }: {
   filePath: string;
+  workspace: string;
   fileContent: string;
   fileWindow: {
     startLine: number;
@@ -465,19 +485,38 @@ function FileViewerPanel({
   fileLang: string;
   fileName: string;
   themeMode: "light" | "dark" | "black";
-  uiLanguage: string;
+  uiLanguage: "zh" | "en";
   onClose: () => void;
   onLoadNextWindow: () => void;
 }) {
   const [copied, setCopied] = useState(false);
   const [wrapLines, setWrapLines] = useState(false);
   const [viewMode, setViewMode] = useState<FileViewMode>("preview");
+  const [fileSizeBytes, setFileSizeBytes] = useState<number | undefined>(undefined);
 
   useEffect(() => {
     setCopied(false);
     setViewMode("preview");
     setWrapLines(false);
   }, [fileCategory, filePath]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setFileSizeBytes(undefined);
+    if (!filePath) return () => {
+      cancelled = true;
+    };
+    getFileMetadata(filePath, workspace)
+      .then((metadata) => {
+        if (!cancelled) setFileSizeBytes(metadata.sizeBytes);
+      })
+      .catch(() => {
+        if (!cancelled) setFileSizeBytes(undefined);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [filePath, workspace]);
 
   const handleCopy = async () => {
     try {
@@ -500,6 +539,13 @@ function FileViewerPanel({
   const showPreview = hasPreviewToggle && viewMode === "preview";
   const BadgeIcon = langBadge.Icon;
   const hasMoreFileContent = !!fileWindow?.truncated && !!fileWindow.nextStartLine;
+  const previewSizeBytes = fileSizeBytes ?? fileWindow?.totalChars ?? (fileContent ? fileContent.length : undefined);
+  const previewStrategy = useMemo(() => getFilePreviewStrategy({
+    path: filePath,
+    sizeBytes: previewSizeBytes,
+    isBinary: fileCategory === "binary",
+  }), [fileCategory, filePath, previewSizeBytes]);
+  const externalOpen = useExternalFileOpen({ path: filePath, workspace, language: uiLanguage });
 
   const buttonBaseStyle = {
     borderColor: palette.buttonBorder,
@@ -512,6 +558,44 @@ function FileViewerPanel({
     backgroundColor: palette.buttonActiveBg,
     color: palette.buttonActiveText,
   };
+
+  const openButtonLabel = externalOpen.opening
+    ? (uiLanguage === "zh" ? "打开中..." : "Opening...")
+    : (uiLanguage === "zh" ? "默认应用打开" : "Open in Default App");
+
+  const renderExternalOpenButton = (variant: "compact" | "primary" = "compact") => (
+    <button
+      type="button"
+      onClick={() => void externalOpen.openExternalFile()}
+      disabled={externalOpen.opening || !filePath}
+      className={[
+        "inline-flex shrink-0 items-center justify-center gap-1.5 border font-semibold transition-opacity hover:opacity-75 disabled:cursor-not-allowed disabled:opacity-50",
+        variant === "primary"
+          ? "rounded-lg px-3.5 py-2 text-[12px]"
+          : "rounded-md px-2.5 py-1 text-[11px]",
+      ].join(" ")}
+      style={variant === "primary" ? activeButtonStyle : buttonBaseStyle}
+      title={uiLanguage === "zh" ? "使用系统默认应用打开文件" : "Open with the system default app"}
+      aria-label={uiLanguage === "zh" ? "使用系统默认应用打开文件" : "Open with the system default app"}
+    >
+      <IconExternalLink className={variant === "primary" ? "h-4 w-4" : "h-3.5 w-3.5"} />
+      <span>{openButtonLabel}</span>
+    </button>
+  );
+
+  const externalOnlyText = previewStrategy.reason === "office"
+    ? (uiLanguage === "zh"
+      ? "Office 文件更适合使用系统默认应用查看和编辑。"
+      : "Office files are best viewed and edited in the system default app.")
+    : (uiLanguage === "zh"
+      ? "此文件类型暂不支持内联预览，建议使用系统默认应用打开。"
+      : "Inline preview is not available for this file type. Use the system default app instead.");
+
+  const largeFileRecommendation = previewStrategy.reason === "largeFile"
+    ? (uiLanguage === "zh"
+      ? `文件较大（${formatFileSize(previewStrategy.sizeBytes, uiLanguage)}），建议使用系统默认应用打开；仍可继续分段预览。`
+      : `This file is large (${formatFileSize(previewStrategy.sizeBytes, uiLanguage)}). Opening it in the system default app is recommended; segmented preview remains available.`)
+    : "";
 
   const renderSyntaxBlock = (content: string, language: string) => (
     <div className={wrapLines ? "overflow-hidden" : "overflow-x-auto"} style={{ backgroundColor: palette.codeBg }}>
@@ -730,15 +814,36 @@ function FileViewerPanel({
             <div className="truncate font-mono text-[11px]" style={{ color: palette.subtle }}>{filePath}</div>
           </div>
         </div>
-        <button
-          onClick={onClose}
-          className="shrink-0 rounded-md border px-2 py-1 text-[11px] transition-opacity hover:opacity-75"
-          style={buttonBaseStyle}
-        >
-          {uiLanguage === "zh" ? "返回" : "Back"}
-        </button>
+        <div className="flex shrink-0 items-center gap-2">
+          {renderExternalOpenButton("compact")}
+          <button
+            onClick={onClose}
+            className="shrink-0 rounded-md border px-2 py-1 text-[11px] transition-opacity hover:opacity-75"
+            style={buttonBaseStyle}
+          >
+            {uiLanguage === "zh" ? "返回" : "Back"}
+          </button>
+        </div>
       </div>
       <div className="flex-1 overflow-y-auto p-4">
+        {externalOpen.error && (
+          <div
+            role="alert"
+            className="mb-3 rounded-lg border p-3 text-[12px]"
+            style={{ borderColor: palette.dangerBorder, backgroundColor: palette.dangerBg, color: palette.dangerText }}
+          >
+            {externalOpen.error}
+          </div>
+        )}
+        {largeFileRecommendation && !fileError && (
+          <div
+            className="mb-3 flex flex-wrap items-center justify-between gap-3 rounded-lg border px-3 py-2 text-[12px]"
+            style={{ borderColor: langBadge.border, backgroundColor: langBadge.bg, color: langBadge.color }}
+          >
+            <span>{largeFileRecommendation}</span>
+            {renderExternalOpenButton("compact")}
+          </div>
+        )}
         {fileWindow && !fileError && fileCategory !== "image" && fileCategory !== "binary" && (
           <div
             className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-lg border px-3 py-2 text-[11px]"
@@ -769,8 +874,9 @@ function FileViewerPanel({
         ) : fileCategory === "binary" ? (
           <div className="flex flex-col items-center justify-center gap-3 py-20" style={{ color: palette.subtle }}>
             <IconFileText className="h-12 w-12 opacity-30" />
-            <div className="text-[13px]">{uiLanguage === "zh" ? "此文件类型暂不支持预览" : "Preview is not available for this file type"}</div>
+            <div className="max-w-[320px] text-center text-[13px]">{externalOnlyText}</div>
             <div className="font-mono text-[11px] opacity-60">{fileName}</div>
+            {renderExternalOpenButton("primary")}
           </div>
         ) : fileError ? (
           <div
@@ -918,6 +1024,7 @@ export default function FilePanel({ width, onStartResizing }: FilePanelProps) {
           {fileViewerPath ? (
             <MemoizedFileViewerPanel
               filePath={fileViewerPath}
+              workspace={currentWorkspace}
               fileContent={fileViewerContent}
               fileWindow={fileViewerWindow}
               fileError={fileViewerError}

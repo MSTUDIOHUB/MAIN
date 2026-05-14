@@ -138,11 +138,18 @@ impl McpRuntimeMesh {
             .record(&TraceRecord {
                 task_id: result.task_id.clone(),
                 step_id: result.id.clone(),
+                event_name: "tool_called".to_string(),
                 tool_call: result.tool.clone(),
                 stdout: result.stdout.clone(),
                 stderr: result.stderr.clone(),
                 verification: if result.success { "success" } else { "failed" }.to_string(),
                 latency_ms: result.latency_ms,
+                metadata: json!({
+                    "mcpTool": result.tool,
+                    "success": result.success,
+                    "traceAware": true,
+                    "replayAware": true,
+                }),
             })
             .await?;
         result.trace_path = Some(trace_path.to_string_lossy().to_string());
