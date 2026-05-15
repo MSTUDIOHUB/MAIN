@@ -11,6 +11,7 @@ import {
   toMacBundleVersion,
   toWindowsWixVersion,
 } from "../../scripts/release_tools.mjs";
+import { resolveReleaseMacVersion } from "../../scripts/release-mac.mjs";
 
 async function createTempWorkspace() {
   const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "main-release-tools-"));
@@ -48,6 +49,34 @@ test("version helpers derive platform-compatible versions", () => {
   assert.equal(toMacBundleVersion("1.2.3-beta.4"), "1.2.3");
   assert.equal(toWindowsWixVersion("1.2.3-beta.4"), "1.2.3.4");
   assert.equal(toWindowsWixVersion("2.0.0"), "2.0.0.0");
+});
+
+test("release:mac uses the current package version when no version is passed", async () => {
+  const rootDir = await createTempWorkspace();
+
+  const result = await resolveReleaseMacVersion({
+    rootDir,
+    argv: ["node", "scripts/release-mac.mjs"],
+  });
+
+  assert.deepEqual(result, {
+    version: "1.1.1",
+    source: "package.json",
+  });
+});
+
+test("release:mac prefers an explicit version argument", async () => {
+  const rootDir = await createTempWorkspace();
+
+  const result = await resolveReleaseMacVersion({
+    rootDir,
+    argv: ["node", "scripts/release-mac.mjs", "1.2.3"],
+  });
+
+  assert.deepEqual(result, {
+    version: "1.2.3",
+    source: "argument",
+  });
 });
 
 test("syncReleaseVersions updates all version sources", async () => {

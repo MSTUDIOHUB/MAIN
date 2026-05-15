@@ -26,6 +26,32 @@ clean_xattrs \
 npm run icon:app
 npm run tauri build -- --bundles app --no-sign
 
+BUNDLE_EXECUTABLE_NAME="$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP_PATH/Contents/Info.plist")"
+BUNDLE_EXECUTABLE_PATH="$APP_PATH/Contents/MacOS/$BUNDLE_EXECUTABLE_NAME"
+
+# Tauri's macOS bundler can leave the built desktop binary under its Cargo target
+# name while Info.plist points at mainBinaryName. Rename the bundled binary in
+# place so we keep Tauri's embedded frontend assets and signing metadata.
+bundled_bins=()
+while IFS= read -r bundled_bin; do
+  bundled_bins+=("$bundled_bin")
+done < <(find "$APP_PATH/Contents/MacOS" -mindepth 1 -maxdepth 1 -type f -perm +111 | sort)
+
+if [[ "${#bundled_bins[@]}" -ne 1 ]]; then
+  printf "Expected exactly one bundled executable in %s, found %s\n" "$APP_PATH/Contents/MacOS" "${#bundled_bins[@]}" >&2
+  exit 1
+fi
+
+BUNDLED_EXECUTABLE_PATH="${bundled_bins[0]}"
+BUNDLED_EXECUTABLE_NAME="$(basename "$BUNDLED_EXECUTABLE_PATH")"
+if [[ "$BUNDLED_EXECUTABLE_NAME" != "$BUNDLE_EXECUTABLE_NAME" ]]; then
+  TEMP_EXECUTABLE_PATH="$APP_PATH/Contents/MacOS/.${BUNDLE_EXECUTABLE_NAME}.rename-tmp"
+  rm -f "$TEMP_EXECUTABLE_PATH"
+  mv "$BUNDLED_EXECUTABLE_PATH" "$TEMP_EXECUTABLE_PATH"
+  mv "$TEMP_EXECUTABLE_PATH" "$BUNDLE_EXECUTABLE_PATH"
+fi
+chmod 755 "$BUNDLE_EXECUTABLE_PATH"
+
 clean_xattrs "$APP_PATH"
 
 # Re-sign the finished app with an ad-hoc signature so the bundle is internally consistent.

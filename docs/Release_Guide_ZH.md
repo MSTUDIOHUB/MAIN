@@ -97,10 +97,18 @@ npm run build:mac:share
 如果你想把“改版本号 + 打包”合成一步，可以直接运行：
 
 ```bash
+npm run release:mac
+```
+
+这条命令会使用当前 `package.json` 里的版本号，自动同步各平台版本文件，然后继续执行 `npm run build:mac:share`。
+
+如果要在打包前顺手改成指定版本，可以传入版本号：
+
+```bash
 npm run release:mac -- 1.1.2
 ```
 
-这条命令会自动同步版本号，然后继续执行 `npm run build:mac:share`。
+带版本号时脚本会先把版本同步为你传入的值，再继续打包。
 
 生成文件通常位于：
 
