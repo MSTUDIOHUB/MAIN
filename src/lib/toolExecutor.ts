@@ -318,7 +318,7 @@ export async function executeTool(
     case "execute_command": {
       const command = applyShellCwd((args.command as string) || "", args);
       if (!command) throw new Error("Missing required parameter 'command'.");
-      const waitMs = Math.min(Math.max(parseOptionalNumber(args.wait_ms) ?? 1500, 0), 30_000);
+      const waitMs = Math.min(Math.max(parseOptionalNumber(args.wait_ms) ?? 4000, 0), 30_000);
       const maxChars = Math.min(Math.max(parseOptionalNumber(args.max_chars) ?? 8000, 100), 200_000);
       let beforeOffset = 0;
       try {
@@ -330,7 +330,30 @@ export async function executeTool(
         await writePty(command + "\n", sessionKey, options.shellPermissionApproval);
       }
       await sleep(waitMs);
-      const output = await readPtySince(beforeOffset, maxChars, sessionKey);
+      let output = await readPtySince(beforeOffset, maxChars, sessionKey);
+
+      // Adaptive extend: if the PTY buffer is still growing, wait more
+      // to capture ongoing output (up to 2 extra rounds of 2000ms each).
+      const maxExtends = 2;
+      const extendMs = 2000;
+      let extendCount = 0;
+      while (extendCount < maxExtends) {
+        const statusAfter = await getPtyStatus(sessionKey);
+        if (statusAfter.bufferEndOffset <= output.endOffset) break;
+        await sleep(extendMs);
+        const extendedOutput = await readPtySince(output.endOffset, maxChars, sessionKey);
+        if (!extendedOutput.text.trim()) break;
+        output = {
+          text: output.text + extendedOutput.text,
+          startOffset: output.startOffset,
+          endOffset: extendedOutput.endOffset,
+          truncated: output.truncated || extendedOutput.truncated,
+          bufferStartOffset: output.bufferStartOffset,
+          bufferEndOffset: extendedOutput.bufferEndOffset,
+        };
+        extendCount++;
+      }
+
       return JSON.stringify({
         command,
         output: output.text,
@@ -345,15 +368,18 @@ export async function executeTool(
       return await readPtyBuffer(parseOptionalNumber(args.max_chars), sessionKey);
 
     case "read_pty_tail":
+      await sleep(Math.min(Math.max(parseOptionalNumber(args.wait_ms) ?? 0, 0), 30_000));
       return await readPtyTail(parseOptionalNumber(args.max_chars), sessionKey);
 
     case "read_pty_since": {
       const offset = parseOptionalNumber(args.offset);
       if (offset === undefined) throw new Error("Missing required parameter 'offset'.");
+      await sleep(Math.min(Math.max(parseOptionalNumber(args.wait_ms) ?? 0, 0), 30_000));
       return await readPtySince(offset, parseOptionalNumber(args.max_chars), sessionKey);
     }
 
     case "get_pty_status":
+      await sleep(Math.min(Math.max(parseOptionalNumber(args.wait_ms) ?? 0, 0), 30_000));
       return await getPtyStatus(sessionKey);
 
     case "clear_pty_buffer":
@@ -363,7 +389,7 @@ export async function executeTool(
       const input = (args.input as string) || "";
       if (!input) throw new Error("Missing required parameter 'input'.");
       const appendNewline = args.append_newline === true || args.append_newline === "true";
-      const waitMs = Math.min(Math.max(parseOptionalNumber(args.wait_ms) ?? 500, 0), 30_000);
+      const waitMs = Math.min(Math.max(parseOptionalNumber(args.wait_ms) ?? 1500, 0), 30_000);
       const maxChars = Math.min(Math.max(parseOptionalNumber(args.max_chars) ?? 8000, 100), 200_000);
       let beforeOffset = 0;
       try {

@@ -11,7 +11,7 @@ export interface ThoughtDisplayResult {
   summaryText: string;
 }
 
-const DEFAULT_SUMMARY_LINES = 3;
+const DEFAULT_SUMMARY_LINES = 1;
 const SYNTHETIC_VISIBLE_CONCLUSION_ZH = "后台思考已折叠，模型尚未生成可见回复或可执行动作。";
 const SYNTHETIC_VISIBLE_CONCLUSION_RE = /后台思考已折叠[，,]\s*模型尚未生成可见回复或可执行动作。?/;
 
@@ -362,7 +362,7 @@ function splitSummaryCandidates(cleanText: string): string[] {
 }
 
 function isProcessUseful(text: string): boolean {
-  return /(?:我(?:需要|准备|会|将|先|正在|已经)|先(?:检查|读取|确认|看|搜索)|下一步|需要先|正在|检查|读取|搜索|整理|确认|修改|验证|计划|准备|I need to|I will|I'll|I'm going to|checking|reading|searching|next|plan|verify|inspect)/i.test(text);
+  return /(?:我(?:需要|准备|会|将|先|正在|已经|要)|先(?:修改|验证|计划)|下一步|需要先|正在|修改|验证|计划|I need to|I will|I'll|I'm going to|next|plan|verify)/i.test(text);
 }
 
 function truncateSummaryLine(text: string, maxChars = 180): string {
@@ -375,6 +375,29 @@ function pickSummaryLines(cleanText: string, maxLines: number): string[] {
   const candidates = splitSummaryCandidates(cleanText);
   const chosen: string[] = [];
   const seen = new Set<string>();
+
+  if (maxLines === 1) {
+    const merged: string[] = [];
+    const mergedSeen = new Set<string>();
+    const addMerged = (candidate: string) => {
+      const normalized = normalizeForCompare(candidate);
+      if (!normalized || mergedSeen.has(normalized)) return;
+      if (merged.some((existing) => isNearDuplicateSummary(candidate, existing))) return;
+      mergedSeen.add(normalized);
+      merged.push(candidate);
+    };
+    const orderedCandidates = [
+      ...candidates.filter(isProcessUseful),
+      ...candidates,
+    ];
+    for (const candidate of orderedCandidates) {
+      addMerged(candidate);
+      if (merged.length >= 2) break;
+    }
+    if (merged.length >= 2) {
+      return [truncateSummaryLine(merged.join("; "))];
+    }
+  }
 
   const add = (candidate: string) => {
     const normalized = normalizeForCompare(candidate);

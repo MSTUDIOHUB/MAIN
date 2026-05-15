@@ -290,7 +290,7 @@ export interface ChangeEntry {
 export interface ReplyOption {
   label: string;
   value: string;
-  action?: "continue_readonly_once" | "allow_readonly_session" | "execute_once";
+  action?: "continue_readonly_once" | "allow_readonly_session" | "execute_once" | "adjust_plan";
 }
 
 export type ConversationTurnStatus =

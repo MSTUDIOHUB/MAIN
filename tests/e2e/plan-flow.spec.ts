@@ -30,6 +30,36 @@ test("plan flow supports save then approve and finish", async ({ page }) => {
     .toBe(1);
 
   await expect(page.getByTestId("top-island-plan-approve")).toBeVisible();
+  await expect(page.getByTestId("top-island-plan-adjust-input")).toBeVisible();
+  await page.getByTestId("top-island-plan-adjust-input").fill("请把验证步骤写得更具体");
+  await page.getByTestId("top-island-plan-adjust-submit").click();
+  await expect
+    .poll(async () =>
+      page.evaluate(() =>
+        (window as any).__CODELY_E2E__?.events?.some(
+          (item: { type: string; text?: string }) =>
+            item.type === "plan-adjustment-submitted" &&
+            item.text === "请把验证步骤写得更具体",
+        ) ?? false,
+      ),
+    )
+    .toBe(true);
+  await expect
+    .poll(async () =>
+      page.evaluate(() => {
+        const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+        return {
+          isPlanApproved: snapshot?.isPlanApproved,
+          planStage: snapshot?.planStage,
+        };
+      }),
+    )
+    .toEqual({
+      isPlanApproved: false,
+      planStage: "design",
+    });
+
+  await expect(page.getByTestId("top-island-plan-approve")).toBeVisible();
   await page.getByTestId("top-island-plan-approve").click();
 
   await expect

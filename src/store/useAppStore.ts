@@ -7611,9 +7611,27 @@ export const useAppStore = create<AppState>()(
 
         if (thoughtStarted) {
           thoughtStartTime = Date.now();
-          thoughtIdToCreate = nextId();
-          currentThoughtBlockId = thoughtIdToCreate;
-          thoughtIdToUpdate = thoughtIdToCreate;
+          // Merge into the existing thought block for this turn instead of creating a new one,
+          // so that thought blocks don't interleave with tool blocks and break grouping.
+          const existingThoughtBlock = sessionGet().taskFlow
+            .filter((b) => b.turnId === turnId)
+            .reverse()
+            .find((b) => b.type === "thought");
+          if (existingThoughtBlock && !existingThoughtBlock.isStreaming) {
+            // Reuse the existing thought block — just update it
+            thoughtIdToCreate = null;
+            currentThoughtBlockId = existingThoughtBlock.id;
+            thoughtIdToUpdate = existingThoughtBlock.id;
+          } else if (existingThoughtBlock && existingThoughtBlock.isStreaming) {
+            // Already streaming — just append to it
+            thoughtIdToCreate = null;
+            currentThoughtBlockId = existingThoughtBlock.id;
+            thoughtIdToUpdate = existingThoughtBlock.id;
+          } else {
+            thoughtIdToCreate = nextId();
+            currentThoughtBlockId = thoughtIdToCreate;
+            thoughtIdToUpdate = thoughtIdToCreate;
+          }
         }
 
         let thoughtEndedId: number | null = null;
@@ -8142,15 +8160,18 @@ export const useAppStore = create<AppState>()(
           }));
 
           const currentFlow = sessionGet().taskFlow;
-          const lastBlock = currentFlow[currentFlow.length - 1];
+          // Find the last thought block in this turn (not just the very last block),
+          // so that thought blocks can be merged even when tool blocks appear after them.
+          const turnBlocks = currentFlow.filter((b) => b.turnId === turnId);
+          const lastThoughtBlock = [...turnBlocks].reverse().find((b) => b.type === "thought");
 
-          if (lastBlock && lastBlock.type === "thought") {
-            const existing = normalizeForComp((lastBlock as Extract<TaskBlock, { type: "thought" }>).content);
+          if (lastThoughtBlock) {
+            const existing = normalizeForComp((lastThoughtBlock as Extract<TaskBlock, { type: "thought" }>).content);
             
             // If the incoming thought is already present, update metadata and avoid duplication.
             if (existing.includes(incoming)) {
               if (duration !== undefined) {
-                const tid = lastBlock.id;
+                const tid = lastThoughtBlock.id;
                 sessionSet((s) => ({
                   taskFlow: s.taskFlow.map((t) =>
                     t.id === tid && t.type === "thought"
@@ -8161,7 +8182,7 @@ export const useAppStore = create<AppState>()(
               }
               return;
             }
-            const tid = lastBlock.id;
+            const tid = lastThoughtBlock.id;
             sessionSet((s) => ({
               taskFlow: s.taskFlow.map((t) =>
                 t.id === tid && t.type === "thought"
@@ -8181,7 +8202,7 @@ export const useAppStore = create<AppState>()(
               thoughtStartTime = null;
             }, 1200);
           } else {
-            // No adjacent thought block — create a new one
+            // No thought block in this turn yet — create the first one
             const thoughtBlockId = nextId();
             const block: TaskBlock = {
               id: thoughtBlockId,

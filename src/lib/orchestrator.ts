@@ -703,6 +703,7 @@ const PROSE_CODE_DUMP_LARGE_CHARS = 32_000;
 const MAX_NO_ACTION_RETRIES = 2;
 const PLAN_EXPLORATION_REPEAT_READ_LIMIT = 1;
 const EXECUTE_CONVERGENCE_PROMPT_RATIO = 0.72;
+const PLAN_EXECUTE_CONVERGENCE_PROMPT_RATIO = 0.24;
 const MAX_NO_PROGRESS_LOOP_REPEATS = 3;
 const NO_PROGRESS_EXCLUDED_TOOLS = new Set([
   "execute_command",
@@ -6603,10 +6604,17 @@ export async function executeAgentLoop(
       continue;
     }
 
+    const shouldConvergeExecuteTurn =
+      workflowMode === "edit" ||
+      (workflowMode === "plan" && callbacks.getIsPlanApproved() && runtimeIntent === "execute");
+    const convergencePromptRatio =
+      workflowMode === "plan" && callbacks.getIsPlanApproved()
+        ? PLAN_EXECUTE_CONVERGENCE_PROMPT_RATIO
+        : EXECUTE_CONVERGENCE_PROMPT_RATIO;
     if (
-      workflowMode === "edit" &&
+      shouldConvergeExecuteTurn &&
       !usedExecuteConvergencePrompt &&
-      iteration >= Math.max(8, Math.floor(effectiveMaxIterations * EXECUTE_CONVERGENCE_PROMPT_RATIO))
+      iteration >= Math.max(8, Math.floor(effectiveMaxIterations * convergencePromptRatio))
     ) {
       usedExecuteConvergencePrompt = true;
       logAgentEvent("execute_convergence_prompt", {

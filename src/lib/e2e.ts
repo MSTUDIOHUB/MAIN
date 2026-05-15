@@ -2128,6 +2128,7 @@ function seedGameStudioToolGroupScenario(status: "executing" | "awaiting_input")
     : "e2e-game-studio-awaiting-choice-turn";
   const userBlockId = useAppStore.getState()._nextTaskId();
   const completedAId = useAppStore.getState()._nextTaskId();
+  const thoughtBlockId = useAppStore.getState()._nextTaskId();
   const completedBId = useAppStore.getState()._nextTaskId();
   const completedCId = useAppStore.getState()._nextTaskId();
   const tailToolId = useAppStore.getState()._nextTaskId();
@@ -2144,6 +2145,13 @@ function seedGameStudioToolGroupScenario(status: "executing" | "awaiting_input")
       status: "done",
       toolStatus: "executed" as const,
       message: "OK",
+    },
+    {
+      id: thoughtBlockId,
+      turnId,
+      type: "thought" as const,
+      content: "我需要先核对 Main Camera 状态，再继续调用相机管理工具。",
+      isStreaming: false,
     },
     {
       id: completedBId,
@@ -2198,6 +2206,7 @@ function seedGameStudioToolGroupScenario(status: "executing" | "awaiting_input")
       ...state.config,
       language: "zh",
       workflowMode: "edit",
+      thinkingPolicy: "normal",
     },
     selectedMainModeKey: "game_studio",
     selectedNexusModeKey: "nexus_game_studio",
@@ -3978,7 +3987,56 @@ export function getE2ESavePlanDocumentHandler():
 }
 
 export function getE2EQuickReplyHandler(): ((text: string, sourceTurnId?: string) => boolean) | null {
-  if (getScenarioName() !== AWAITING_CHOICE_SCENARIO) return null;
+  const scenario = getScenarioName();
+
+  if (scenario === PLAN_FLOW_SCENARIO) {
+    return (text, sourceTurnId) => {
+      const state = useAppStore.getState();
+      const turnId = sourceTurnId || state.currentTurnId || "e2e-plan-flow-turn";
+      const replyText = String(text || "").trim();
+      if (!replyText) return true;
+
+      appendBridgeEvent("plan-adjustment-submitted", { text: replyText, sourceTurnId: turnId });
+      const userBlockId = state._nextTaskId();
+      const agentBlockId = state._nextTaskId();
+
+      useAppStore.setState((current) => ({
+        ...current,
+        taskFlow: [
+          ...current.taskFlow,
+          { id: userBlockId, turnId, type: "user", content: replyText },
+          {
+            id: agentBlockId,
+            turnId,
+            type: "agent",
+            content: `已收到调整建议：${replyText}。我会先更新 design.md，然后再次等待确认。`,
+            streaming: false,
+          },
+        ],
+        conversationTurns: current.conversationTurns.map((turn) =>
+          turn.id === turnId
+            ? {
+                ...turn,
+                status: "awaiting_approval",
+                summary: "已收到计划调整建议，等待再次确认。",
+                blockIds: [
+                  ...turn.blockIds,
+                  ...[userBlockId, agentBlockId].filter((id) => !turn.blockIds.includes(id)),
+                ],
+              }
+            : turn
+        ),
+        currentTurnId: turnId,
+        isPlanApproved: false,
+        planStage: "design",
+        agentStatus: "pending_review",
+        isGenerating: false,
+      }));
+      return true;
+    };
+  }
+
+  if (scenario !== AWAITING_CHOICE_SCENARIO) return null;
 
   return (text, sourceTurnId) => {
     const bridge = getBridge();

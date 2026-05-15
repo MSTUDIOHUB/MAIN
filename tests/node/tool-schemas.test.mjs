@@ -84,6 +84,19 @@ test("shell tool schemas require execution descriptions and expose cwd metadata"
   assert.ok(runCommand.function.parameters.properties.cwd);
   assert.ok(runCommand.function.parameters.properties.workdir);
   assert.ok(executeCommand.function.parameters.properties.cwd);
+  assert.ok(executeCommand.function.parameters.properties.wait_ms);
+  assert.ok(executeCommand.function.parameters.properties.max_chars);
+});
+
+test("pty observation schemas expose wait controls", () => {
+  const tools = buildToolDefinitions([]);
+  const readSince = tools.find((tool) => tool.function.name === "read_pty_since");
+  const readTail = tools.find((tool) => tool.function.name === "read_pty_tail");
+  const status = tools.find((tool) => tool.function.name === "get_pty_status");
+
+  assert.ok(readSince.function.parameters.properties.wait_ms);
+  assert.ok(readTail.function.parameters.properties.wait_ms);
+  assert.ok(status.function.parameters.properties.wait_ms);
 });
 
 test("read_file schema exposes line-window parameters and does not promise full-file reads", () => {

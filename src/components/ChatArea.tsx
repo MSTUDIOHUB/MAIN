@@ -803,26 +803,47 @@ function buildBlockRenderItems(
     | { kind: "completedToolGroup"; blocks: any[]; index: number }
   > = [];
   let activeReadContextGroup: { kind: "readContextGroup"; blocks: any[]; index: number } | null = null;
-  const completedToolGroupRangesByStart = new Map(
-    shouldGroupCompletedTools
-      ? buildCompletedToolGroupRanges({
-          blocks,
-          excludedToolNames: completedToolGroupingConfig.includeReadContextTools ? undefined : READ_CONTEXT_TOOL_NAMES,
-          includeDiff: completedToolGroupingConfig.includeDiff,
-          minGroupSize: completedToolGroupingConfig.minGroupSize,
-        }).map((range) => [range.startIndex, range])
-      : [],
-  );
+
+  // Build tool group ranges ignoring thought blocks, so that thought blocks
+  // interleaved between tool calls do not prevent grouping.
+  const completedToolGroupRangesByStart = new Map<number, { startIndex: number; endIndex: number }>();
+  if (shouldGroupCompletedTools) {
+    // Map from grouping index to the original block index.
+    const toolBlockEntries: Array<{ block: any; originalIndex: number }> = [];
+    for (let i = 0; i < blocks.length; i++) {
+      if (blocks[i].type !== "thought") {
+        toolBlockEntries.push({ block: blocks[i], originalIndex: i });
+      }
+    }
+    const toolOnlyBlocks = toolBlockEntries.map((e) => e.block);
+    const ranges = buildCompletedToolGroupRanges({
+      blocks: toolOnlyBlocks,
+      excludedToolNames: completedToolGroupingConfig.includeReadContextTools ? undefined : READ_CONTEXT_TOOL_NAMES,
+      includeDiff: completedToolGroupingConfig.includeDiff,
+      minGroupSize: completedToolGroupingConfig.minGroupSize,
+    });
+    for (const range of ranges) {
+      const startOriginalIndex = toolBlockEntries[range.startIndex].originalIndex;
+      const endOriginalIndex = toolBlockEntries[range.endIndex].originalIndex;
+      completedToolGroupRangesByStart.set(startOriginalIndex, { startIndex: startOriginalIndex, endIndex: endOriginalIndex });
+    }
+  }
 
   for (let index = 0; index < blocks.length; index += 1) {
     const block = blocks[index];
     const completedToolGroupRange = completedToolGroupRangesByStart.get(index);
     if (completedToolGroupRange) {
       activeReadContextGroup = null;
+      const groupedWindow = blocks.slice(completedToolGroupRange.startIndex, completedToolGroupRange.endIndex + 1);
       items.push({
         kind: "completedToolGroup",
-        blocks: blocks.slice(completedToolGroupRange.startIndex, completedToolGroupRange.endIndex + 1),
+        blocks: groupedWindow.filter((windowBlock) => windowBlock.type === "tool"),
         index,
+      });
+      groupedWindow.forEach((windowBlock, offset) => {
+        if (windowBlock.type === "thought") {
+          items.push({ kind: "block", block: windowBlock, index: completedToolGroupRange.startIndex + offset });
+        }
       });
       index = completedToolGroupRange.endIndex;
       continue;
@@ -1227,14 +1248,16 @@ function CompletedToolGroupCard({
   language: "zh" | "en";
 }) {
   const [expanded, setExpanded] = useState(false);
-  const previewNames = blocks
+  // Only consider tool blocks; thought blocks in the range are transparent.
+  const toolBlocks = blocks.filter((block) => block.type === "tool");
+  const previewNames = toolBlocks
     .slice(0, 3)
     .map((block) => compactToolTarget(block.target, String(block.toolName || ""), language))
     .filter(Boolean);
-  const hiddenCount = Math.max(0, blocks.length - previewNames.length);
+  const hiddenCount = Math.max(0, toolBlocks.length - previewNames.length);
   const title = language === "zh"
-    ? `已完成 ${blocks.length} 次工具调用`
-    : `${blocks.length} completed tool call${blocks.length > 1 ? "s" : ""}`;
+    ? `已完成 ${toolBlocks.length} 次工具调用`
+    : `${toolBlocks.length} completed tool call${toolBlocks.length > 1 ? "s" : ""}`;
   const toggleText = expanded
     ? language === "zh" ? "收起" : "Collapse"
     : language === "zh" ? "展开" : "Expand";
@@ -1270,7 +1293,7 @@ function CompletedToolGroupCard({
           data-testid="completed-tool-group-details"
           className="mt-2 space-y-1 rounded-xl border border-[#1f1f23] bg-[#050507] p-2"
         >
-          {blocks.map((block) => {
+          {toolBlocks.map((block) => {
             const toolName = String(block.toolName || "");
             const label = getCompletedToolGroupToolLabel(toolName, language);
             const displayTarget = compactToolTarget(block.target, toolName, language);
@@ -2588,6 +2611,7 @@ export default function ChatArea({
           canApprovePlan={canApprovePlan}
           autoApproveTools={autoApproveTools}
           onSelectReplyOption={(option) => topIslandTurn && onQuickReply?.(option, topIslandTurn.id)}
+          onRequestPlanAdjustment={(text) => topIslandTurn && onQuickReply?.({ label: text, value: text, action: "adjust_plan" }, topIslandTurn.id)}
           onCancelTurn={onStopGeneration}
           onResolvePendingRunDecision={resolvePendingRunDecision}
           onDismissPendingRunDecision={dismissPendingRunDecision}

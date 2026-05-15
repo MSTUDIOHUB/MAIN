@@ -123,22 +123,40 @@ impl PermissionConfig {
                     "pwd".to_string(),
                     "ls".to_string(),
                     "rg".to_string(),
+                    "grep".to_string(),
+                    "find".to_string(),
+                    "wc".to_string(),
                     "which".to_string(),
                     "command -v".to_string(),
                     "cd".to_string(),
                     "git status".to_string(),
                     "git diff".to_string(),
+                    "git log".to_string(),
+                    "git branch".to_string(),
+                    "git show".to_string(),
                     "node --version".to_string(),
                     "npm --version".to_string(),
+                    "python --version".to_string(),
+                    "python3 --version".to_string(),
                     "cargo --version".to_string(),
                     "rustc --version".to_string(),
                     "cargo check".to_string(),
                     "cargo test".to_string(),
+                    "cargo clippy".to_string(),
                     "npm run build".to_string(),
                     "npm run lint".to_string(),
                     "node scripts/plan_completion_check.mjs".to_string(),
                 ],
                 ask: vec![
+                    "node".to_string(),
+                    "python".to_string(),
+                    "python3".to_string(),
+                    "tsc".to_string(),
+                    "vite".to_string(),
+                    "pnpm".to_string(),
+                    "yarn".to_string(),
+                    "bun".to_string(),
+                    "rustfmt".to_string(),
                     "npm create".to_string(),
                     "npm install".to_string(),
                     "npm add".to_string(),
@@ -149,6 +167,20 @@ impl PermissionConfig {
                     "cargo tauri build".to_string(),
                     "cargo run".to_string(),
                     "cargo build".to_string(),
+                    "git add".to_string(),
+                    "git commit".to_string(),
+                    "git push".to_string(),
+                    "mkdir".to_string(),
+                    "touch".to_string(),
+                    "cp".to_string(),
+                    "mv".to_string(),
+                    "curl".to_string(),
+                    "wget".to_string(),
+                    "printf".to_string(),
+                    "echo".to_string(),
+                    "rm".to_string(),
+                    "chmod".to_string(),
+                    "docker".to_string(),
                 ],
                 deny: vec!["sudo".to_string(), "rm -rf /".to_string()],
             },
@@ -329,10 +361,14 @@ impl PermissionGuard {
                 continue;
             }
 
-            overall = PermissionDecisionKind::Deny;
+            // Unknown commands default to Ask (require approval) instead of Deny,
+            // so users can approve them rather than being outright blocked.
+            if !matches!(overall, PermissionDecisionKind::Deny) {
+                overall = PermissionDecisionKind::Ask;
+            }
             segment_decisions.push(PermissionSegmentDecision {
                 command: segment.clone(),
-                decision: PermissionDecisionKind::Deny,
+                decision: PermissionDecisionKind::Ask,
                 matched_rule: None,
                 suggested_rule: Some(suggest_shell_rule(&segment)),
             });
@@ -488,11 +524,20 @@ fn suggest_shell_rule(command: &str) -> String {
                 | "cargo build"
                 | "git status"
                 | "git diff"
+                | "git log"
+                | "git branch"
+                | "git show"
+                | "git add"
+                | "git commit"
+                | "git push"
                 | "command -v"
                 | "node --version"
                 | "npm --version"
                 | "cargo --version"
                 | "rustc --version"
+                | "cargo check"
+                | "cargo test"
+                | "cargo clippy"
         ) {
             return first_two;
         }
@@ -725,5 +770,90 @@ shell:
             .validate_with_approval(command, Some(&approval))
             .expect("matching approval should satisfy ask command");
         assert_eq!(decision.decision, super::PermissionDecisionKind::Ask);
+    }
+
+    #[test]
+    fn unknown_commands_default_to_ask_instead_of_deny() {
+        let guard = PermissionGuard::new(PermissionConfig::default_runtime_foundation());
+
+        // These commands are not in any allow/ask/deny list.
+        let unknown_commands = ["pip install flask", "go build ./...", "ruby -v"];
+
+        for command in unknown_commands {
+            let decision = guard.inspect(command);
+            assert_eq!(
+                decision.decision,
+                super::PermissionDecisionKind::Ask,
+                "unknown command '{}' should default to Ask, got {:?}",
+                command,
+                decision.decision
+            );
+            assert!(decision.requires_approval);
+
+            // Approval should make it pass
+            let approval = super::ShellPermissionApproval {
+                command: command.to_string(),
+                approved_at_ms: Some(1),
+                scope: Some("once".to_string()),
+            };
+            let result = guard.validate_with_approval(command, Some(&approval));
+            assert!(
+                result.is_ok(),
+                "approved unknown command '{}' should pass validation",
+                command
+            );
+        }
+    }
+
+    #[test]
+    fn common_dev_commands_are_allowed() {
+        let guard = PermissionGuard::new(PermissionConfig::default_runtime_foundation());
+
+        let allowed_commands = [
+            "grep -r pattern src/",
+            "python3 --version",
+            "find . -name '*.rs'",
+            "git log --oneline -5",
+            "cargo clippy",
+            "node --version",
+            "npm run build",
+        ];
+
+        for command in allowed_commands {
+            let decision = guard.inspect(command);
+            assert_eq!(
+                decision.decision,
+                super::PermissionDecisionKind::Allow,
+                "command '{}' should be allowed, got {:?}",
+                command,
+                decision.decision
+            );
+        }
+    }
+
+    #[test]
+    fn mutating_or_network_commands_require_approval() {
+        let guard = PermissionGuard::new(PermissionConfig::default_runtime_foundation());
+
+        let ask_commands = [
+            "python3 -c 'print(1)'",
+            "node -e 'console.log(1)'",
+            "mkdir -p src/new_dir",
+            "curl https://example.com",
+            "git add src/main.rs",
+            "npm create vite@latest . -- --template react-ts",
+        ];
+
+        for command in ask_commands {
+            let decision = guard.inspect(command);
+            assert_eq!(
+                decision.decision,
+                super::PermissionDecisionKind::Ask,
+                "command '{}' should require approval, got {:?}",
+                command,
+                decision.decision
+            );
+            assert!(decision.requires_approval);
+        }
     }
 }

@@ -29,6 +29,7 @@ interface TopIslandProps {
   onCancelTurn?: () => void;
   onResolvePendingRunDecision?: (choice: PendingRunDecisionChoice | "approve_once" | "approve_thread" | "cancel") => void;
   onDismissPendingRunDecision?: () => void;
+  onRequestPlanAdjustment?: (text: string) => void;
   onApprovePlan: () => void;
   onRejectPlan: () => void;
   onRejectDiff?: (id: number) => void;
@@ -91,6 +92,7 @@ const TopIsland = memo(function TopIsland({
   onCancelTurn,
   onResolvePendingRunDecision,
   onDismissPendingRunDecision,
+  onRequestPlanAdjustment,
   onApprovePlan,
   onRejectPlan,
   onRejectDiff,
@@ -104,6 +106,7 @@ const TopIsland = memo(function TopIsland({
   const [pinnedOpen, setPinnedOpen] = useState(false);
   const [manualChoiceCollapsedKey, setManualChoiceCollapsedKey] = useState<string | null>(null);
   const [customReplyText, setCustomReplyText] = useState("");
+  const [planAdjustmentText, setPlanAdjustmentText] = useState("");
   const shellRef = useRef<HTMLDivElement | null>(null);
 
   const realChoiceOptions = useMemo(
@@ -199,6 +202,9 @@ const TopIsland = memo(function TopIsland({
     reject: language === "zh" ? "拒绝" : "Reject",
     approvePlan: language === "zh" ? "开始执行" : "Start Execution",
     waitingPlan: language === "zh" ? "计划待确认" : "Plan Waiting",
+    adjustPlan: language === "zh" ? "调整计划" : "Adjust Plan",
+    adjustPlanPlaceholder: language === "zh" ? "输入希望调整的点" : "Describe what to change",
+    adjustPlanSubmit: language === "zh" ? "提交调整" : "Submit Adjustment",
     waitingChoice: language === "zh" ? "等待选择" : "Awaiting Choice",
     pendingDecision: language === "zh" ? "待决定" : "Decision Needed",
     chooseToContinue: language === "zh" ? "选择下一步" : "Choose the next step",
@@ -254,6 +260,7 @@ const TopIsland = memo(function TopIsland({
     ? "bg-[rgba(255,255,255,0.025)] border-[#17171c]"
     : "bg-[rgba(255,255,255,0.04)] border-[#1f1f23]";
   const normalizedCustomReply = customReplyText.replace(/\s+/g, " ").trim();
+  const normalizedPlanAdjustment = planAdjustmentText.replace(/\s+/g, " ").trim();
   const showChoicePromptContent = !isChoicePromptManuallyCollapsed;
   const showPendingRunDecision = !!pendingRunDecision && showChoicePromptContent;
   const showAwaitingChoice = isAwaitingChoice && showChoicePromptContent;
@@ -281,6 +288,13 @@ const TopIsland = memo(function TopIsland({
       value: normalizedCustomReply,
     });
     setCustomReplyText("");
+  };
+
+  const submitPlanAdjustment = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!normalizedPlanAdjustment || !onRequestPlanAdjustment) return;
+    onRequestPlanAdjustment(normalizedPlanAdjustment);
+    setPlanAdjustmentText("");
   };
 
   useEffect(() => {
@@ -708,7 +722,36 @@ const TopIsland = memo(function TopIsland({
                         : "The current plan is ready. Approving it enables execution tools while keeping write and command steps review-gated."}
                       </div>
                     </div>
-                    <div className="mt-3 flex items-center justify-end gap-2 px-1">
+                    <div className="mt-3 flex flex-col gap-2 px-1 sm:flex-row sm:items-center sm:justify-end">
+                      <form
+                        onSubmit={submitPlanAdjustment}
+                        data-testid="top-island-plan-adjust-form"
+                        className="flex w-full min-w-0 flex-1 items-center gap-2 sm:mr-auto"
+                      >
+                        <div className="min-w-0 flex-1">
+                          <input
+                            data-testid="top-island-plan-adjust-input"
+                            value={planAdjustmentText}
+                            onChange={(event) => setPlanAdjustmentText(event.target.value)}
+                            placeholder={copy.adjustPlanPlaceholder}
+                            className="top-island-choice-input min-w-0 w-full rounded-xl border px-3 py-2 outline-none transition-all"
+                            style={choiceTextStyle}
+                            aria-label={copy.adjustPlan}
+                          />
+                        </div>
+                        <button
+                          type="submit"
+                          data-testid="top-island-plan-adjust-submit"
+                          disabled={!normalizedPlanAdjustment || !onRequestPlanAdjustment}
+                          className={`shrink-0 rounded-lg border px-3 py-2 text-[12px] font-medium transition-colors ${
+                            normalizedPlanAdjustment && onRequestPlanAdjustment
+                              ? "border-[rgba(96,165,250,0.28)] bg-[rgba(96,165,250,0.12)] text-[#bfdbfe] hover:bg-[rgba(96,165,250,0.2)]"
+                              : "cursor-not-allowed border-[#3f3f46] bg-[#09090b] text-[#71717a]"
+                          }`}
+                        >
+                          {copy.adjustPlanSubmit}
+                        </button>
+                      </form>
                       <button
                         onClick={onRejectPlan}
                         className="rounded-lg border border-[#3f3f46] bg-[#09090b] px-4 py-2 text-[12px] font-medium text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#f5f5f5]"

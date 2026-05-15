@@ -273,7 +273,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
           description: { type: "string", description: "本次命令的简短目的说明。必须说明为什么要执行，供审批与审计显示。" },
           cwd: { type: "string", description: "工作区相对目录；工作区根目录用 `.`。不要使用绝对路径或 `..`。" },
           workdir: { type: "string", description: "cwd 的兼容别名；优先使用 cwd。" },
-          wait_ms: { type: "number", description: "发送命令后等待多少毫秒再读取新增输出，默认 1500" },
+          wait_ms: { type: "number", description: "发送命令后等待多少毫秒再读取新增输出，默认 4000，最大 30000" },
           max_chars: { type: "number", description: "本次返回的新增终端输出最多多少字符，默认 8000" },
         },
         required: ["command", "description"],
@@ -334,11 +334,12 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     type: "function",
     function: {
       name: "read_pty_tail",
-      description: "读取 PTY 终端最近的 N 个字符，并返回偏移量信息，适合查看最新日志、错误栈和长命令的尾部输出。",
+      description: "可选等待后读取 PTY 终端最近的 N 个字符，并返回偏移量信息，适合查看最新日志、错误栈和长命令的尾部输出。",
       parameters: {
         type: "object",
         properties: {
           max_chars: { type: "number", description: "最多读取最近多少字符，默认 8000" },
+          wait_ms: { type: "number", description: "读取前等待多少毫秒，让运行中的命令继续产生日志，默认 0，最大 30000" },
         },
         required: [],
       },
@@ -348,12 +349,13 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     type: "function",
     function: {
       name: "read_pty_since",
-      description: "读取 PTY 终端从指定 buffer offset 之后的新输出，返回 text、startOffset、endOffset、truncated 等信息。适合在 execute_command 前记录 offset，之后只检查新增日志。",
+      description: "可选等待后读取 PTY 终端从指定 buffer offset 之后的新输出，返回 text、startOffset、endOffset、truncated 等信息。适合在 execute_command 前记录 offset，之后只检查新增日志。",
       parameters: {
         type: "object",
         properties: {
           offset: { type: "number", description: "从哪个 PTY buffer offset 开始读取" },
           max_chars: { type: "number", description: "最多返回多少字符，默认不截断" },
+          wait_ms: { type: "number", description: "读取前等待多少毫秒，让运行中的命令继续产生日志，默认 0，最大 30000" },
         },
         required: ["offset"],
       },
@@ -363,10 +365,12 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     type: "function",
     function: {
       name: "get_pty_status",
-      description: "检查集成 PTY 是否已启动、shell 是否仍在运行、当前捕获缓冲区 offset/字节数，以及最近少量输出。",
+      description: "可选等待后检查集成 PTY 是否已启动、shell 是否仍在运行、当前捕获缓冲区 offset/字节数，以及最近少量输出。",
       parameters: {
         type: "object",
-        properties: {},
+        properties: {
+          wait_ms: { type: "number", description: "检查前等待多少毫秒，默认 0，最大 30000" },
+        },
         required: [],
       },
     },
