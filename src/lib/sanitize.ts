@@ -82,6 +82,62 @@ export function stripPlanBlocks(text: string): string {
   return text.replace(/<(?:plan|jobList)>[\s\S]*?<\/(?:plan|jobList)>/gi, "");
 }
 
+function isReasoningTagStart(lowerText: string, index: number, tag: string): boolean {
+  if (!lowerText.startsWith(`<${tag}`, index)) return false;
+  const nextChar = lowerText[index + tag.length + 1] || "";
+  return !/[a-z0-9_-]/i.test(nextChar);
+}
+
+/**
+ * 移除完整的 reasoning/thinking 块，避免原始思考过程进入聊天正文。
+ * 使用 indexOf 状态机，避免在流式文本上做跨行贪婪匹配。
+ */
+export function stripReasoningBlocks(text: string): string {
+  if (!text) return "";
+
+  const tags = ["analysis", "thinking", "thought", "reasoning"];
+  const lower = text.toLowerCase();
+  let result = "";
+  let i = 0;
+
+  while (i < text.length) {
+    let openIdx = -1;
+    let openTag = "";
+
+    for (const tag of tags) {
+      let candidate = lower.indexOf(`<${tag}`, i);
+      while (candidate !== -1 && !isReasoningTagStart(lower, candidate, tag)) {
+        candidate = lower.indexOf(`<${tag}`, candidate + 1);
+      }
+      if (candidate !== -1 && (openIdx === -1 || candidate < openIdx)) {
+        openIdx = candidate;
+        openTag = tag;
+      }
+    }
+
+    if (openIdx === -1) {
+      result += text.slice(i);
+      break;
+    }
+
+    result += text.slice(i, openIdx);
+    const openEnd = text.indexOf(">", openIdx);
+    if (openEnd === -1) {
+      break;
+    }
+
+    const closeToken = `</${openTag}>`;
+    const closeIdx = lower.indexOf(closeToken, openEnd + 1);
+    if (closeIdx === -1) {
+      break;
+    }
+
+    i = closeIdx + closeToken.length;
+  }
+
+  return result;
+}
+
 /**
  * 移除完整的 tool_call / function_call 块，避免原始 JSON 混进聊天正文。
  */
@@ -209,6 +265,7 @@ export function sanitizePlanArtifactContent(text: string): string {
 export function sanitizeAIOutput(text: string): string {
   if (!text) return "";
   let out = stripPlanBlocks(text);
+  out = stripReasoningBlocks(out);
   out = stripRawToolCallBlocks(out);
   out = extractToolCalls(out).cleanText;
   out = stripAnsi(out);

@@ -94,6 +94,15 @@ function parseToolCallArguments(call: RuntimeToolCall, workspace?: string | null
   }
 }
 
+function isPlanFileReadBeforeTasks(name: string, args: Record<string, unknown>, target: string): boolean {
+  if (!["read_file", "read_document", "get_file_outline", "list_directory"].includes(name)) return false;
+  const rawPath = String(args.path || args.file_path || target || "")
+    .replace(/\\/g, "/")
+    .toLowerCase();
+  if (!rawPath) return false;
+  return rawPath.includes(".main/plans");
+}
+
 export function createRuntimeToolSpecRegistry(input: {
   toolDefinitions: ToolDefinition[];
   capabilityRegistry: ToolCapabilityRegistry;
@@ -145,6 +154,36 @@ export function planRuntimeToolCall(input: PlanRuntimeToolCallInput): RuntimeToo
       action: "blocked_unavailable",
       toolArgs,
       target,
+    };
+  }
+
+  if (
+    input.workflowMode === "plan" &&
+    input.isPlanApproved &&
+    input.runtimeIntent === "execute" &&
+    input.planTaskCount === 0
+  ) {
+    if (input.isExecutionPlanArtifactWrite(input.toolCall.name, toolArgs)) {
+      return {
+        action: "spec_file_auto_approved",
+        toolArgs,
+        target,
+      };
+    }
+
+    if (isPlanFileReadBeforeTasks(input.toolCall.name, toolArgs, target)) {
+      return {
+        action: "auto_execute",
+        toolArgs,
+        target,
+      };
+    }
+
+    return {
+      action: "blocked_plan_gate",
+      toolArgs,
+      target,
+      reason: "missing_tasks_before_source",
     };
   }
 

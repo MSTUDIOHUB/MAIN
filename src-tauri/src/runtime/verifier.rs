@@ -158,11 +158,11 @@ mod tests {
             );
 
             let error = verifier
-                .verify_command("git status", Duration::from_millis(100))
+                .verify_command("python --version", Duration::from_millis(100))
                 .await
                 .expect_err("unlisted shell command must not run");
 
-            assert!(error.contains("allow"));
+            assert!(error.contains("权限") || error.contains("permission"));
         });
     }
 

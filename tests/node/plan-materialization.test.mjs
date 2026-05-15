@@ -117,6 +117,55 @@ test("rejects low quality visible text instead of materializing a plan", () => {
   assert.match(result.reason || "", /too_short|not_structured|quality_gate/);
 });
 
+test("materializes MVP defaults without requiring open questions", () => {
+  const result = materializePlanArtifactFromVisibleText({
+    visibleText: [
+      "# Design",
+      "",
+      "## 用户目标与约束",
+      "- 用户目标：修复计划执行阶段的权限闭环，避免批准后陷入命令拦截循环。",
+      "- 约束：批准 Plan 不绕过 shell 权限，执行前必须有 tasks.md。",
+      "",
+      "## 当前状态发现",
+      "- `src/lib/runtimeTools.ts` 负责计划工具门禁。",
+      "- `src-tauri/src/harness/permissions.rs` 负责 shell 权限策略。",
+      "",
+      "## 拟定方案",
+      "- 在 execute 阶段缺少任务清单时阻止 shell 和源码写入。",
+      "- 为 shell 权限增加 allow/ask/deny 结构化预检。",
+      "",
+      "## 影响文件和接口",
+      "- `src/lib/runtimeTools.ts` 增加 missing_tasks_before_source gate。",
+      "- `src-tauri/src/harness/permissions.rs` 返回 structured permission decision。",
+      "",
+      "## 执行顺序",
+      "1. 先补计划执行门禁。",
+      "2. 再接入 shell preflight 审批。",
+      "3. 最后更新提示和测试。",
+      "",
+      "## 数据流与控制流",
+      "- ActionCard 先读取 preflight 结果，再把批准 metadata 传给工具执行。",
+      "- 后端再次校验命令未变且 deny 未命中。",
+      "",
+      "## 风险取舍",
+      "- 保留 deny 优先，避免前端批准覆盖危险命令。",
+      "- ask 命令不进入静默 allow，降低联网和项目改写风险。",
+      "",
+      "## 验证方式",
+      "- Node 单测覆盖计划门禁。",
+      "- Rust 单测覆盖 builtin_default、ask 和 deny。",
+      "",
+      "## 默认假设与后续增强",
+      "- 自动保存历史版本：MVP 不做。",
+      "- 权限策略编辑 UI：后续增强。",
+    ].join("\n"),
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.path, ".MAIN/plans/design.md");
+  assert.match(result.content || "", /默认假设与后续增强/);
+});
+
 test("composes strict design closure prompt from evidence without tool logs", () => {
   const prompt = composeReviewableDesignFromEvidence({
     userGoal: "制作 Mac 轻量软件分析课程销售 CSV。",

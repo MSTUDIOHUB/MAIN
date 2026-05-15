@@ -4,7 +4,24 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import { executeAgentLoop, type AgentMessage, type OrchestratorCallbacks, type ReviewDecision, type ContentPart } from "../lib/orchestrator";
-import { analyzeTabularDocument, deleteChatTempPath, deletePlanFiles, deleteWorkspacePath, ingestAttachmentFile, readChatTempFile, readDocument, readFile, readFileWindow, writeChatTempFile, writeFile, type GitDiffEntry, type ReadFileWindowResult } from "../lib/ipc";
+import {
+  analyzeTabularDocument,
+  deleteChatTempPath,
+  deletePlanFiles,
+  deleteWorkspacePath,
+  ingestAttachmentFile,
+  readChatTempFile,
+  readDocument,
+  readFile,
+  readFileWindow,
+  shellPermissionPreflight,
+  writeChatTempFile,
+  writeFile,
+  type GitDiffEntry,
+  type ReadFileWindowResult,
+  type ShellPermissionApproval,
+  type ShellPermissionDecision,
+} from "../lib/ipc";
 import { invoke } from "@tauri-apps/api/core";
 import { setWorkspaceRoot as setWorkspaceRootIpc } from "../lib/ipc";
 import { appendDebugLog } from "../lib/debugLog";
@@ -228,6 +245,7 @@ import {
   type PromptLanguageStrategy,
   type ToolPermissionPolicy,
 } from "../lib/toolCapabilities";
+import { applyShellCwd } from "../lib/toolExecutionContract";
 import {
   deriveThoughtDisplay,
   normalizeThinkingPolicyWithLegacy,
@@ -300,6 +318,96 @@ function shouldSessionAutoApproveToolCall(
 ): boolean {
   const scope = resolveSessionAutoApproveScopeForToolCall(toolCall);
   return !!scope && scopes.includes(scope);
+}
+
+function isShellReviewTool(name: string): boolean {
+  return name === "run_command" || name === "execute_command";
+}
+
+function commandMatchesPermissionRule(command: string, rule: string): boolean {
+  const cleanCommand = String(command || "").trim();
+  const cleanRule = String(rule || "").trim();
+  return !!cleanCommand && !!cleanRule && (
+    cleanCommand === cleanRule ||
+    cleanCommand.startsWith(`${cleanRule} `)
+  );
+}
+
+function isShellDecisionCoveredBySessionRules(
+  decision: ShellPermissionDecision | null | undefined,
+  rules: string[] | undefined,
+): boolean {
+  if (!decision || decision.decision !== "ask") return false;
+  const activeRules = Array.isArray(rules)
+    ? rules.map((rule) => rule.trim()).filter(Boolean)
+    : [];
+  if (activeRules.length === 0) return false;
+  const askSegments = (decision.segmentDecisions || []).filter((segment) => segment.decision === "ask");
+  if (askSegments.length === 0) return false;
+  return askSegments.every((segment) =>
+    activeRules.some((rule) => commandMatchesPermissionRule(segment.command, rule)),
+  );
+}
+
+function buildShellPermissionApproval(
+  decision: ShellPermissionDecision,
+  scope: "once" | "session",
+): ShellPermissionApproval {
+  return {
+    command: decision.command,
+    approvedAtMs: Date.now(),
+    scope,
+  };
+}
+
+function suggestedShellPermissionRules(decision: ShellPermissionDecision | null | undefined): string[] {
+  if (!decision) return [];
+  const seen = new Set<string>();
+  const rules: string[] = [];
+  for (const segment of decision.segmentDecisions || []) {
+    if (segment.decision !== "ask") continue;
+    const rule = String(segment.suggestedRule || segment.matchedRule || "").trim();
+    if (!rule || seen.has(rule)) continue;
+    seen.add(rule);
+    rules.push(rule);
+  }
+  const fallback = String(decision.suggestedRule || "").trim();
+  if (fallback && !seen.has(fallback)) rules.push(fallback);
+  return rules;
+}
+
+function formatShellPermissionDecisionForUser(
+  decision: ShellPermissionDecision,
+  language: "zh" | "en",
+): string {
+  const source =
+    decision.source === "workspace_file"
+      ? language === "zh"
+        ? "项目权限文件"
+        : "workspace permission file"
+      : language === "zh"
+      ? "内置默认策略"
+      : "built-in default policy";
+  const rules = suggestedShellPermissionRules(decision);
+  const rulesText = rules.length > 0 ? rules.map((rule) => `\`${rule}\``).join(", ") : "";
+  const relevantSegments = (decision.segmentDecisions || [])
+    .filter((segment) => segment.decision === decision.decision || (decision.decision === "deny" && segment.decision === "deny"))
+    .map((segment) => `\`${segment.command}\``);
+  const segmentText = relevantSegments.length > 0 ? relevantSegments.join(", ") : `\`${decision.command}\``;
+  const matchedRule = String(decision.matchedRule || "").trim();
+  if (decision.decision === "ask") {
+    return language === "zh"
+      ? `Shell 权限预检：当前命令未静默放行，将按 ${source} 请求批准。待批准 segment：${segmentText}。${rulesText ? `本线程批准会记住规则 ${rulesText}。` : ""}`
+      : `Shell permission preflight: this command is approval-gated by the ${source}. Segment: ${segmentText}. ${rulesText ? `Approving for this thread will remember ${rulesText}.` : ""}`;
+  }
+  if (decision.decision === "deny") {
+    return language === "zh"
+      ? `Shell 权限预检：当前命令被 ${source} 阻止。被拒 segment：${segmentText}。${matchedRule ? `命中 deny 规则：\`${matchedRule}\`。` : rulesText ? `缺少允许规则，建议规则：${rulesText}。` : ""}不要尝试读取 .MAIN/permissions.yaml；请调整命令或暂停让用户处理权限。`
+      : `Shell permission preflight: this command is blocked by the ${source}. Denied segment: ${segmentText}. ${matchedRule ? `Matched deny rule: \`${matchedRule}\`.` : rulesText ? `Suggested rule: ${rulesText}.` : ""} Do not try to read .MAIN/permissions.yaml; change the command or pause for the user to handle permissions.`;
+  }
+  return language === "zh"
+    ? `Shell 权限预检：当前命令已被 ${source} 允许。`
+    : `Shell permission preflight: this command is allowed by the ${source}.`;
 }
 
 // ── i18n ────────────────────────────────────────────────────────────
@@ -648,6 +756,7 @@ export interface SessionRuntimeSnapshot {
   transcriptTotalTurns?: number;
   autoApproveTools?: boolean;
   autoApproveToolScopes?: SessionAutoApproveScope[];
+  approvedShellPermissionRules?: string[];
 }
 
 export interface SessionRuntimeState extends SessionRuntimeSnapshot {
@@ -663,6 +772,7 @@ export interface SessionRuntimeState extends SessionRuntimeSnapshot {
   autoApproveTools: boolean;
   currentTurnExecutionConsent: { turnId: string | null; granted: boolean };
   approvedLocalFileReadPaths: string[];
+  approvedShellPermissionRules: string[];
   readOnlyAutoApproveForSession: boolean;
   planApprovalChoice: string | null;
   normalizedStreamState: NormalizedStreamState;
@@ -673,7 +783,12 @@ export interface SessionRuntimeState extends SessionRuntimeSnapshot {
   elapsedTime: number;
   pendingReviewResolve: ((decision: ReviewDecision) => void) | null;
   pendingReviewTaskId: number | null;
-  pendingToolCall: { name: string; arguments: Record<string, unknown>; localFileReadPath?: string } | null;
+  pendingToolCall: {
+    name: string;
+    arguments: Record<string, unknown>;
+    localFileReadPath?: string;
+    shellPermissionDecision?: ShellPermissionDecision;
+  } | null;
   autoApproveToolScopes: SessionAutoApproveScope[];
   showFilePanel: boolean;
   fileViewerPath: string;
@@ -833,7 +948,7 @@ export interface DiffRevertResult {
 
 export type TaskBlock =
   | (TaskBlockBase & { type: "user"; content: string; images?: string[]; contextItems?: UserContextItem[] })
-  | (TaskBlockBase & { type: "tool"; toolName: string; target: string; status: string; toolStatus: "pending" | "executed" | "rejected" | "running" | "failed"; toolCallId?: string; message?: string; diff?: ToolDiffSnapshot; revertStatus?: DiffRevertStatus; revertMessage?: string })
+  | (TaskBlockBase & { type: "tool"; toolName: string; target: string; status: string; toolStatus: "pending" | "executed" | "rejected" | "running" | "failed"; toolCallId?: string; message?: string; diff?: ToolDiffSnapshot; shellPermissionDecision?: ShellPermissionDecision; revertStatus?: DiffRevertStatus; revertMessage?: string })
   | (TaskBlockBase & { type: "agent"; content: string; options?: ReplyOption[]; streaming?: boolean; hiddenProcess?: boolean; archivedAfterChoice?: boolean; selectedOption?: string })
   | (TaskBlockBase & { type: "thought"; content: string; isStreaming?: boolean; duration?: number })
   | (TaskBlockBase & { type: "jobList"; jobs: JobItem[] })
@@ -1107,11 +1222,17 @@ interface AppState {
   providerCompatibilityByRuntimeKey: Record<string, ProviderCompatibilityRuntimeLaneState>;
   pendingReviewResolve: ((decision: ReviewDecision) => void) | null;
   pendingReviewTaskId: number | null;
-  pendingToolCall: { name: string; arguments: Record<string, unknown>; localFileReadPath?: string } | null;
+  pendingToolCall: {
+    name: string;
+    arguments: Record<string, unknown>;
+    localFileReadPath?: string;
+    shellPermissionDecision?: ShellPermissionDecision;
+  } | null;
   autoApproveTools: boolean;
   autoApproveToolScopes: SessionAutoApproveScope[];
   currentTurnExecutionConsent: { turnId: string | null; granted: boolean };
   approvedLocalFileReadPaths: string[];
+  approvedShellPermissionRules: string[];
   readOnlyAutoApproveForSession: boolean;
   pendingRunDecisionResolver:
     | ((choice: "approve_once" | "approve_thread" | "cancel") => void)
@@ -1668,6 +1789,9 @@ function normalizeSessionRuntimeSnapshot(
     transcriptTotalTurns: Math.max(0, Number(snapshot.transcriptTotalTurns) || 0),
     autoApproveTools: effectiveAutoApproveToolScopes.length > 0,
     autoApproveToolScopes: effectiveAutoApproveToolScopes,
+    approvedShellPermissionRules: Array.isArray(snapshot.approvedShellPermissionRules)
+      ? snapshot.approvedShellPermissionRules.filter((rule): rule is string => typeof rule === "string" && rule.trim().length > 0)
+      : [],
   };
 }
 
@@ -1713,6 +1837,7 @@ const sessionRuntimeKeys = [
   "autoApproveToolScopes",
   "currentTurnExecutionConsent",
   "approvedLocalFileReadPaths",
+  "approvedShellPermissionRules",
   "readOnlyAutoApproveForSession",
   "normalizedStreamState",
   "currentTurnState",
@@ -1815,6 +1940,9 @@ function createSessionRuntimeFromState(state: Partial<AppState>): SessionRuntime
     currentTurnExecutionConsent: state.currentTurnExecutionConsent || { turnId: null, granted: false },
     approvedLocalFileReadPaths: Array.isArray(state.approvedLocalFileReadPaths)
       ? state.approvedLocalFileReadPaths.filter((path): path is string => typeof path === "string" && path.trim().length > 0)
+      : [],
+    approvedShellPermissionRules: Array.isArray(state.approvedShellPermissionRules)
+      ? state.approvedShellPermissionRules.filter((rule): rule is string => typeof rule === "string" && rule.trim().length > 0)
       : [],
     readOnlyAutoApproveForSession: state.readOnlyAutoApproveForSession === true,
     normalizedStreamState: state.normalizedStreamState || defaultNormalizedStreamState,
@@ -2866,6 +2994,7 @@ export function sanitizeTaskBlocksForPersist(blocks: TaskBlock[]): TaskBlock[] {
           toolStatus: b.toolStatus,
           ...(b.toolCallId ? { toolCallId: String(b.toolCallId) } : {}),
           ...(b.message ? { message: String(b.message) } : {}),
+          ...(b.shellPermissionDecision ? { shellPermissionDecision: b.shellPermissionDecision } : {}),
           ...(b.diff
             ? {
                 diff: {
@@ -4285,6 +4414,7 @@ export const useAppStore = create<AppState>()(
         autoApproveTools: false,
         autoApproveToolScopes: [],
         approvedLocalFileReadPaths: [],
+        approvedShellPermissionRules: [],
         readOnlyAutoApproveForSession: false,
         showWorkspaceTreePanel: false,
       }));
@@ -4320,6 +4450,7 @@ export const useAppStore = create<AppState>()(
         autoApproveTools: false,
         autoApproveToolScopes: [],
         approvedLocalFileReadPaths: [],
+        approvedShellPermissionRules: [],
         readOnlyAutoApproveForSession: false,
       };
     });
@@ -4409,6 +4540,7 @@ export const useAppStore = create<AppState>()(
               autoApproveTools: false,
               autoApproveToolScopes: [],
               approvedLocalFileReadPaths: [],
+              approvedShellPermissionRules: [],
               readOnlyAutoApproveForSession: false,
             }
           : {}),
@@ -4455,6 +4587,7 @@ export const useAppStore = create<AppState>()(
       ...(s.currentSessionId !== id ? { autoApproveTools: false, autoApproveToolScopes: [] } : {}),
       ...(s.currentSessionId !== id ? { readOnlyAutoApproveForSession: false } : {}),
       ...(s.currentSessionId !== id ? { approvedLocalFileReadPaths: [] } : {}),
+      ...(s.currentSessionId !== id ? { approvedShellPermissionRules: [] } : {}),
     })),
 
   // Task Flow — now starts empty (no more mock data)
@@ -4644,6 +4777,7 @@ export const useAppStore = create<AppState>()(
         autoApproveTools: false,
         autoApproveToolScopes: [],
         approvedLocalFileReadPaths: [],
+        approvedShellPermissionRules: [],
         readOnlyAutoApproveForSession: false,
         planArtifacts: [],
         planTasks: [],
@@ -4703,6 +4837,7 @@ export const useAppStore = create<AppState>()(
       autoApproveTools: false,
       autoApproveToolScopes: [],
       approvedLocalFileReadPaths: [],
+      approvedShellPermissionRules: [],
       readOnlyAutoApproveForSession: false,
       resolvedInstructionSet: null,
       instructionSources: [],
@@ -5003,6 +5138,7 @@ export const useAppStore = create<AppState>()(
   autoApproveTools: false,
   autoApproveToolScopes: [],
   approvedLocalFileReadPaths: [],
+  approvedShellPermissionRules: [],
   readOnlyAutoApproveForSession: false,
   currentTurnExecutionConsent: { turnId: null, granted: false },
   pendingRunDecisionResolver: null,
@@ -5032,11 +5168,22 @@ export const useAppStore = create<AppState>()(
   approvePendingReviewForSession: () => {
     const state = get();
     const pendingLocalFileReadPath = normalizeLocalFileReadPath(state.pendingToolCall?.localFileReadPath);
+    const pendingShellDecision = state.pendingToolCall?.shellPermissionDecision || null;
+    const shellRules = suggestedShellPermissionRules(pendingShellDecision);
     if (!pendingLocalFileReadPath) {
-      set({
-        autoApproveTools: true,
-        autoApproveToolScopes: buildSessionAutoApproveScopes(true),
-      });
+      if (shellRules.length > 0) {
+        set((s) => ({
+          approvedShellPermissionRules: [
+            ...s.approvedShellPermissionRules,
+            ...shellRules.filter((rule) => !s.approvedShellPermissionRules.includes(rule)),
+          ],
+        }));
+      } else {
+        set({
+          autoApproveTools: true,
+          autoApproveToolScopes: buildSessionAutoApproveScopes(true),
+        });
+      }
     }
     if (state.pendingReviewTaskId != null) {
       get().allowToolAction(state.pendingReviewTaskId);
@@ -5053,6 +5200,13 @@ export const useAppStore = create<AppState>()(
 
     const resolve = state.pendingReviewResolve;
     const localFileReadPath = normalizeLocalFileReadPath(state.pendingToolCall?.localFileReadPath);
+    const shellDecision = state.pendingToolCall?.shellPermissionDecision || null;
+    const shellApproval = shellDecision?.requiresApproval
+      ? buildShellPermissionApproval(
+          shellDecision,
+          isShellDecisionCoveredBySessionRules(shellDecision, state.approvedShellPermissionRules) ? "session" : "once",
+        )
+      : undefined;
 
     set((s) => ({
       approvedLocalFileReadPaths: localFileReadPath && !isLocalFileReadApproved(localFileReadPath, s.approvedLocalFileReadPaths)
@@ -5080,9 +5234,11 @@ export const useAppStore = create<AppState>()(
       get().setConversationTurnStatus(state.currentTurnId, "executing");
     }
     runAfterNextPaint(() => {
-      resolve(localFileReadPath
-        ? { action: "accept", grantLocalFileReadPath: localFileReadPath }
-        : { action: "accept" });
+      resolve({
+        action: "accept",
+        ...(localFileReadPath ? { grantLocalFileReadPath: localFileReadPath } : {}),
+        ...(shellApproval ? { shellPermissionApproval: shellApproval } : {}),
+      });
     });
   },
 
@@ -5152,6 +5308,7 @@ export const useAppStore = create<AppState>()(
       autoApproveTools: false,
       autoApproveToolScopes: [],
       approvedLocalFileReadPaths: [],
+      approvedShellPermissionRules: [],
       readOnlyAutoApproveForSession: false,
       currentTurnExecutionConsent: { turnId: null, granted: false },
       planArtifacts: [],
@@ -6099,6 +6256,7 @@ export const useAppStore = create<AppState>()(
         autoApproveTools: false,
         autoApproveToolScopes: [],
         approvedLocalFileReadPaths: [],
+        approvedShellPermissionRules: [],
         readOnlyAutoApproveForSession: false,
       }));
 
@@ -9040,25 +9198,62 @@ export const useAppStore = create<AppState>()(
          * (workspace_write/shell), auto-executes without creating
          * a pending card, resolving immediately as "accept".
          */
-        requestReview: (toolCall) => {
+        requestReview: async (toolCall) => {
           const toolTarget = getToolTarget(toolCall.name, toolCall.arguments);
           const isLocalFileReadApproval =
             toolCall.risk === "local_file_read" && !!toolCall.localFileReadPath;
+          const language = sessionGet().config.language === "en" ? "en" : "zh";
+          let shellPermissionDecision: ShellPermissionDecision | null = null;
+          let sessionShellPermissionApproval: ShellPermissionApproval | undefined;
+          if (isShellReviewTool(toolCall.name)) {
+            try {
+              const rawCommand = typeof toolCall.arguments.command === "string" ? toolCall.arguments.command : "";
+              const effectiveCommand = applyShellCwd(rawCommand, toolCall.arguments);
+              shellPermissionDecision = await shellPermissionPreflight(effectiveCommand, runWorkspace || undefined);
+            } catch (error) {
+              const detail = error instanceof Error ? error.message : String(error);
+              return {
+                action: "error",
+                error: language === "zh"
+                  ? `Shell 权限预检失败：${detail}`
+                  : `Shell permission preflight failed: ${detail}`,
+              };
+            }
+
+            if (shellPermissionDecision.decision === "deny") {
+              return {
+                action: "error",
+                error: formatShellPermissionDecisionForUser(shellPermissionDecision, language),
+              };
+            }
+
+            if (isShellDecisionCoveredBySessionRules(shellPermissionDecision, sessionGet().approvedShellPermissionRules)) {
+              sessionShellPermissionApproval = buildShellPermissionApproval(shellPermissionDecision, "session");
+            }
+          }
+          const shellRequiresApproval = shellPermissionDecision?.requiresApproval === true;
+          const shellReviewMessage = shellRequiresApproval && shellPermissionDecision
+            ? formatShellPermissionDecisionForUser(shellPermissionDecision, language)
+            : undefined;
           const autoApproveScopes = normalizeSessionAutoApproveScopes(sessionGet().autoApproveToolScopes);
           // ── Auto-approve path ──
           // External local file reads always require first-use approval, even
           // when the session-wide command auto-approval toggle is enabled.
+          if (sessionShellPermissionApproval) {
+            return { action: "accept", shellPermissionApproval: sessionShellPermissionApproval };
+          }
           if (
             !isLocalFileReadApproval &&
+            !shellRequiresApproval &&
             shouldSessionAutoApproveToolCall(toolCall, autoApproveScopes)
           ) {
-            return Promise.resolve({ action: "accept" });
+            return { action: "accept" };
           }
           const isEphemeralPlanArtifactTool =
             (toolCall.name === "write_file" || toolCall.name === "replace_in_file") &&
             isEphemeralPlanArtifactPath(toolTarget);
           if (isEphemeralPlanArtifactTool) {
-            return Promise.resolve({ action: "accept" });
+            return { action: "accept" };
           }
 
           const latestState = sessionGet();
@@ -9107,8 +9302,17 @@ export const useAppStore = create<AppState>()(
               }
 
               const latestScopes = normalizeSessionAutoApproveScopes(sessionGet().autoApproveToolScopes);
+              const latestShellApproval =
+                shellPermissionDecision &&
+                isShellDecisionCoveredBySessionRules(shellPermissionDecision, sessionGet().approvedShellPermissionRules)
+                  ? buildShellPermissionApproval(shellPermissionDecision, "session")
+                  : sessionShellPermissionApproval;
+              if (latestShellApproval) {
+                return { action: "accept", shellPermissionApproval: latestShellApproval } as ReviewDecision;
+              }
               if (
                 !isLocalFileReadApproval &&
+                !shellRequiresApproval &&
                 shouldSessionAutoApproveToolCall(toolCall, latestScopes)
               ) {
                 return { action: "accept" } as ReviewDecision;
@@ -9134,6 +9338,8 @@ export const useAppStore = create<AppState>()(
                     target,
                     status: "pending_review",
                     toolStatus: "pending",
+                    ...(shellReviewMessage ? { message: shellReviewMessage } : {}),
+                    ...(shellPermissionDecision ? { shellPermissionDecision } : {}),
                     ...(diff ? { diff } : {}),
                   };
 
@@ -9154,6 +9360,7 @@ export const useAppStore = create<AppState>()(
                       name: toolName,
                       arguments: toolArgs,
                       ...(isLocalFileReadApproval ? { localFileReadPath: toolCall.localFileReadPath } : {}),
+                      ...(shellPermissionDecision ? { shellPermissionDecision } : {}),
                     },
                   }));
                 })();
@@ -9182,6 +9389,8 @@ export const useAppStore = create<AppState>()(
                 target,
                 status: "pending_review",
                 toolStatus: "pending",
+                ...(shellReviewMessage ? { message: shellReviewMessage } : {}),
+                ...(shellPermissionDecision ? { shellPermissionDecision } : {}),
                 ...(diff ? { diff } : {}),
               };
 
@@ -9202,6 +9411,7 @@ export const useAppStore = create<AppState>()(
                   name: toolName,
                   arguments: toolArgs,
                   ...(isLocalFileReadApproval ? { localFileReadPath: toolCall.localFileReadPath } : {}),
+                  ...(shellPermissionDecision ? { shellPermissionDecision } : {}),
                 },
               }));
               if (remoteFeishu) {
@@ -9630,6 +9840,7 @@ export const useAppStore = create<AppState>()(
         executionConsentPolicy: "ask_per_turn",
         currentTurnExecutionConsent: { turnId: null, granted: false },
         approvedLocalFileReadPaths: [],
+        approvedShellPermissionRules: [],
         messages: [],
         elapsedTime: 0,
       };

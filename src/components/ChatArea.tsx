@@ -41,6 +41,7 @@ import { getIntentPolicy, resolveConversationTurnIntent } from "../lib/runIntent
 import { summarizePlanExecutionProgressSnapshot } from "../lib/planExecutionRecovery";
 import { buildCompletedToolGroupRanges, countCompletedToolCalls } from "../lib/toolUiGrouping";
 import { compactToolPresentationTarget, getToolPresentationLabel } from "../lib/toolPresentation";
+import { getChatFeedbackStatusCopy, normalizeChatFeedbackStatus } from "../lib/chatFeedback";
 import type { UserContextItem } from "../lib/userContextItems";
 
 const TURN_STATUS_LABELS: Record<string, string> = {
@@ -50,7 +51,7 @@ const TURN_STATUS_LABELS: Record<string, string> = {
   executing: "Executing",
   completed_with_changes: "Changed",
   stopped_no_action: "Stopped",
-  stopped_no_output: "No Output",
+  stopped_no_output: "No visible reply",
   paused: "Paused",
   done: "Done",
   error: "Error",
@@ -987,6 +988,14 @@ function TurnActivityNotice({ text }: { text: string }) {
   );
 }
 
+function formatThoughtDuration(duration: unknown, language: "zh" | "en"): string {
+  const ms = Number(duration);
+  if (!Number.isFinite(ms) || ms <= 0) return "";
+  const seconds = ms > 600 ? ms / 1000 : ms;
+  const formatted = seconds >= 10 ? Math.round(seconds).toString() : seconds.toFixed(1).replace(/\.0$/, "");
+  return language === "zh" ? `用时 ${formatted}s` : `${formatted}s`;
+}
+
 function ThoughtBlock({
   block,
   language,
@@ -1008,6 +1017,14 @@ function ThoughtBlock({
   }, [language, rawContent]);
   const resolvedSummaryText = String(summaryText || "").trim() || computedSummaryText;
   if (!resolvedSummaryText) return null;
+  const isStreamingThought = !!block.isStreaming;
+  const durationLabel = formatThoughtDuration(block.duration, language);
+  const title = language === "zh"
+    ? isStreamingThought ? "正在整理思路" : "思考摘要"
+    : isStreamingThought ? "Thinking" : "Thinking summary";
+  const statusLabel = language === "zh"
+    ? isStreamingThought ? "摘要会持续更新" : "原始推理已折叠"
+    : isStreamingThought ? "Summary updates live" : "Raw reasoning is folded";
 
   return (
     <div data-testid="thought-block" className="mt-4 flex w-full min-w-0 items-start justify-start gap-3">
@@ -1016,10 +1033,26 @@ function ThoughtBlock({
       </div>
       <div
         data-testid="thought-summary-lines"
-        className="chat-agent-content my-1 min-w-0 flex-1 px-2 py-1 text-[#e4e4e7]"
+        className="my-1 min-w-0 flex-1 rounded-xl border border-[#27272a] bg-[#07070a] px-3 py-2 text-[#e4e4e7]"
         style={{ fontSize: `${chatFontSize}px` }}
       >
-        <MarkdownRenderer content={resolvedSummaryText} baseFontSize={chatFontSize} />
+        <div className="mb-2 flex flex-wrap items-center gap-2 font-mono text-[10.5px] text-[#a1a1aa]">
+          <span className="inline-flex items-center gap-1.5 text-[#d4d4d8]">
+            <span className={`h-1.5 w-1.5 rounded-full ${isStreamingThought ? "bg-amber-400 shadow-[0_0_6px_rgba(251,191,36,0.75)] animate-pulse" : "bg-[#34d399]"}`} />
+            {title}
+          </span>
+          <span className="rounded-full border border-[#27272a] bg-[#050507] px-2 py-0.5">{statusLabel}</span>
+          {durationLabel && (
+            <span className="rounded-full border border-[rgba(96,165,250,0.22)] bg-[rgba(37,99,235,0.08)] px-2 py-0.5 text-[#bfdbfe]">
+              {durationLabel}
+            </span>
+          )}
+        </div>
+        <MarkdownRenderer
+          content={resolvedSummaryText}
+          baseFontSize={chatFontSize}
+          sourceId={`thought-${block.id ?? "current"}`}
+        />
       </div>
     </div>
   );
@@ -1242,6 +1275,10 @@ function CompletedToolGroupCard({
             const label = getCompletedToolGroupToolLabel(toolName, language);
             const displayTarget = compactToolTarget(block.target, toolName, language);
             const target = fullToolTarget(block.target, toolName, language);
+            const statusCopy = getChatFeedbackStatusCopy(
+              normalizeChatFeedbackStatus(block.toolStatus || "executed"),
+              language,
+            );
 
             return (
               <div
@@ -1264,7 +1301,7 @@ function CompletedToolGroupCard({
                   )}
                 </div>
                 <span className="shrink-0 rounded-full border border-[rgba(52,211,153,0.18)] bg-[rgba(52,211,153,0.08)] px-1.5 py-0.5 text-[9px] text-[#86efac]">
-                  {language === "zh" ? "完成" : "Done"}
+                  {statusCopy.shortLabel}
                 </span>
               </div>
             );
@@ -1396,7 +1433,14 @@ function AgentContentBlock({
             }
             const cleanText = sanitizeAIOutput(seg.content);
             if (!cleanText) return null;
-            return <MarkdownRenderer key={`${block.id}-text-${segIdx}`} content={cleanText} baseFontSize={chatFontSize} />;
+            return (
+              <MarkdownRenderer
+                key={`${block.id}-text-${segIdx}`}
+                content={cleanText}
+                baseFontSize={chatFontSize}
+                sourceId={`agent-${block.id}-${segIdx}`}
+              />
+            );
           })
         )}
         {isLongContent && (
@@ -1559,7 +1603,7 @@ export default function ChatArea({
     collapsedSummary: language === "zh" ? "本轮过程已折叠，结论会优先保留在这里。" : "This turn is collapsed. The conclusion is kept here first.",
     expandHistory: (count: number) => language === "zh" ? `展开 ${count} 条过程记录` : `Expand ${count} process item(s)`,
     turnStatusLabels: language === "zh"
-      ? { planning: "规划中", awaiting_approval: "待审批", awaiting_input: "待选择", executing: "执行中", completed_with_changes: "已完成并写入", stopped_no_action: "已停止无产物", stopped_no_output: "无输出", paused: "已暂停", done: "完成", error: "错误" }
+      ? { planning: "规划中", awaiting_approval: "待批准", awaiting_input: "待选择", executing: "执行中", completed_with_changes: "已完成并写入", stopped_no_action: "已停止，未执行", stopped_no_output: "未生成可见回复", paused: "已暂停", done: "完成", error: "错误" }
       : TURN_STATUS_LABELS,
     describePlan: (prompt: string, maxLength = 40) =>
       summarizePlanIntent(prompt, maxLength, language),
@@ -2027,7 +2071,11 @@ export default function ChatArea({
               data-testid="game-studio-local-markdown"
               className="min-w-0 flex-1 rounded-lg border border-[#1f1f23] bg-[#09090b] px-4 py-4 text-[#e4e4e7]"
             >
-              <MarkdownRenderer content={block.content} baseFontSize={config.chatFontSize ?? 13} />
+              <MarkdownRenderer
+                content={block.content}
+                baseFontSize={config.chatFontSize ?? 13}
+                sourceId={`system-${block.id}`}
+              />
             </div>
           </div>
         );
@@ -2080,7 +2128,9 @@ export default function ChatArea({
             toolStatus={block.toolStatus}
             message={block.message}
             diff={block.diff}
+            shellPermissionDecision={block.shellPermissionDecision}
             onAllow={() => allowToolAction?.(block.id)}
+            onAllowForSession={() => approvePendingReviewForSession?.()}
             onReject={() => rejectToolAction?.(block.id)}
             autoApproveTools={autoApproveTools}
             onToggleAutoApprove={onToggleAutoApprove}

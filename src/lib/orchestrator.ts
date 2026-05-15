@@ -162,6 +162,7 @@ import {
   materializePlanArtifactFromVisibleText,
 } from "./planMaterialization";
 import { formatToolPresentation } from "./toolPresentation";
+import type { ShellPermissionApproval } from "./ipc";
 
 // ── Spec file auto-approval helpers ────────────────────────────────
 
@@ -420,7 +421,7 @@ function summarizeReplyOptionsForLog(replyOptions: ReplyOption[], limit = 4) {
 
 /** Result returned when the user acts on a pending Action Card. */
 export type ReviewDecision =
-  | { action: "accept"; grantLocalFileReadPath?: string }
+  | { action: "accept"; grantLocalFileReadPath?: string; shellPermissionApproval?: ShellPermissionApproval }
   | { action: "reject" }
   | { action: "error"; error: string };
 
@@ -1578,7 +1579,8 @@ function buildPlanRecoveryPrompt(callbacks: OrchestratorCallbacks, sourceText: s
       "",
       "Rules:",
       "- Do not copy tool logs, duplicate-call warnings, hidden thinking, raw source code, or truncation messages into plan files.",
-      "- `design.md` is the default required approval artifact. It must include the user goal/constraints, current findings, proposed approach, affected files/interfaces, ordered implementation strategy, data/control flow, risks/tradeoffs, validation, and open questions. For complex implementations, include one concise Mermaid diagram by default; skip diagrams for simple structures unless the user explicitly asks for one.",
+      "- `design.md` is the default required approval artifact. It must include the user goal/constraints, current findings, proposed approach, affected files/interfaces, ordered implementation strategy, data/control flow, risks/tradeoffs, validation, and default assumptions/follow-up enhancements. For complex implementations, include one concise Mermaid diagram by default; skip diagrams for simple structures unless the user explicitly asks for one.",
+      "- Non-blocking MVP tradeoffs must be written with explicit defaults as assumptions or follow-up enhancements. If a choice blocks execution, ask with `<user_options>` before approval and stop.",
       "- `requirements.md` is optional. Only create it when the user explicitly asks for a requirement ledger or when large/compliance-heavy scope needs traceability; it is never a prerequisite for approval.",
       "- If a design direction is unclear, ask the user with `<user_options>` and stop. Do not invent a final design.",
       "- If the direction is clear, call `write_file` or `replace_in_file` to create/update concise `.MAIN/plans/design.md`, then submit the normal Proposal for approval. Do not generate `tasks.md` before approval.",
@@ -1592,7 +1594,8 @@ function buildPlanRecoveryPrompt(callbacks: OrchestratorCallbacks, sourceText: s
     "",
     "规则：",
     "- 不要把工具日志、重复调用提示、后台思考、原始源码或截断提示写进计划文件。",
-    "- `design.md` 是默认必需的审批方案：必须包含用户目标/约束、当前发现、拟定方案、影响文件/接口、执行顺序、数据流/控制流、风险取舍、验证方式和开放问题。复杂实现默认包含 1 个简短 Mermaid 图；简单结构不需要，除非用户明确要求生成图。",
+    "- `design.md` 是默认必需的审批方案：必须包含用户目标/约束、当前发现、拟定方案、影响文件/接口、执行顺序、数据流/控制流、风险取舍、验证方式和默认假设/后续增强。复杂实现默认包含 1 个简短 Mermaid 图；简单结构不需要，除非用户明确要求生成图。",
+    "- 非阻塞 MVP 取舍必须写成带默认值的默认假设或后续增强；真正阻塞执行的选择必须在批准前用 `<user_options>` 提问并停止。",
     "- `requirements.md` 是可选需求台账；只有用户明确要求、范围很大或需要合规/验收追踪时才生成，绝不是审批前置条件。",
     "- 如果设计方向不明确，使用 `<user_options>` 让用户选择并立刻停止；不要编造最终方案。",
     "- 如果方向已经明确，必须调用 `write_file` 或 `replace_in_file` 创建/更新精简的 `.MAIN/plans/design.md`，然后提交正常 Proposal 等待审批。批准前不要生成 `tasks.md`。",
@@ -2515,7 +2518,7 @@ async function executeToolCallWithLifecycle(
   callbacks: OrchestratorCallbacks,
   allTools: ToolDefinition[],
   hooksConfig: Awaited<ReturnType<typeof loadHooksConfig>>,
-  options: { allowExternalLocalRead?: boolean } = {},
+  options: { allowExternalLocalRead?: boolean; shellPermissionApproval?: ShellPermissionApproval } = {},
 ): Promise<ToolExecutionResult> {
   const sessionKey = callbacks.getSessionKey();
   let toolArgs: Record<string, unknown>;
@@ -2655,6 +2658,7 @@ async function executeToolCallWithLifecycle(
   try {
     const rawResult = await executeTool(tc.name, resolvedArgs, workspace, sessionKey, {
       allowExternalLocalRead: options.allowExternalLocalRead === true,
+      shellPermissionApproval: options.shellPermissionApproval,
     });
     const resultStr = typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult);
     const mutationAfterMeta = mutationVerificationPath
@@ -3113,6 +3117,7 @@ async function executeWriteToolWithReview(
       callbacks,
       allTools,
       hooksConfig,
+      { shellPermissionApproval: decision.shellPermissionApproval },
     );
     return execution;
   } else if (decision.action === "reject") {

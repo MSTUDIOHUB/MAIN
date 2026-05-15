@@ -48,7 +48,7 @@ const TOOL_LABELS_EN: Record<string, string> = {
 function countPlanShapeSignals(content: string): number {
   const headingCount = (content.match(/^#{1,3}\s+\S+/gm) || []).length;
   const bulletCount = (content.match(/^\s*(?:[-*]|\d+[.)、])\s+\S+/gm) || []).length;
-  const keywordCount = (content.match(/目标|约束|发现|方案|设计|执行|接口|文件|数据流|控制流|风险|验证|开放问题|Goal|Constraint|Finding|Approach|Design|Interface|File|Flow|Risk|Validation|Open question/gi) || []).length;
+  const keywordCount = (content.match(/目标|约束|发现|方案|设计|执行|接口|文件|数据流|控制流|风险|验证|默认假设|后续增强|开放问题|Goal|Constraint|Finding|Approach|Design|Interface|File|Flow|Risk|Validation|Assumption|Default|Follow-up|Enhancement|Open question/gi) || []).length;
   return headingCount + Math.min(bulletCount, 6) + Math.min(keywordCount, 8);
 }
 
@@ -181,7 +181,7 @@ export function composeReviewableDesignFromEvidence(input: {
       files.length ? `Relevant paths:\n${formatBullets(files, "No path summary available.")}` : "",
       constraints.length ? `Constraints:\n${formatBullets(constraints, "No extra constraints.")}` : "",
       "",
-      "The design must include: user goal, concrete findings, proposed architecture/workflow, affected files/interfaces, execution order, data/control flow, risks/tradeoffs, validation, and open questions.",
+      "The design must include: user goal, concrete findings, proposed architecture/workflow, affected files/interfaces, execution order, data/control flow, risks/tradeoffs, validation, and default assumptions/follow-up enhancements. If a critical choice blocks execution, ask with `<user_options>` before approval instead of burying it as an open question.",
     ].filter(Boolean).join("\n");
   }
 
@@ -201,6 +201,6 @@ export function composeReviewableDesignFromEvidence(input: {
     files.length ? `相关路径：\n${formatBullets(files, "暂无路径摘要。")}` : "",
     constraints.length ? `约束：\n${formatBullets(constraints, "暂无额外约束。")}` : "",
     "",
-    "design.md 必须包含：用户目标、当前真实发现、拟定架构/流程、影响文件/接口、执行顺序、数据流/控制流、风险取舍、验证方式、开放问题。",
+    "design.md 必须包含：用户目标、当前真实发现、拟定架构/流程、影响文件/接口、执行顺序、数据流/控制流、风险取舍、验证方式、默认假设/后续增强。真正阻塞执行的选择必须在批准前用 `<user_options>` 提问，不要伪装成设计尾部的开放问题。",
   ].filter(Boolean).join("\n");
 }

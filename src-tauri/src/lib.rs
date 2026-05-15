@@ -1853,13 +1853,14 @@ fn run_workspace_shell_command(
     command: String,
     input: Option<String>,
     timeout: Duration,
+    permission_approval: Option<harness::permissions::ShellPermissionApproval>,
 ) -> Result<TerminalCommandOutput, String> {
     let trimmed = command.trim();
     if trimmed.is_empty() {
         return Err("命令不能为空".to_string());
     }
     harness::permissions::PermissionGuard::from_workspace(workspace)
-        .and_then(|guard| guard.validate(trimmed))
+        .and_then(|guard| guard.validate_with_approval(trimmed, permission_approval.as_ref()))
         .map_err(|error| error.to_string())?;
 
     let mut process = build_workspace_shell_command(trimmed);
@@ -1929,6 +1930,7 @@ fn validate_pty_input(
     workspace: &Path,
     pending_command: &mut String,
     input: &str,
+    permission_approval: Option<&harness::permissions::ShellPermissionApproval>,
 ) -> Result<(), String> {
     let mut next_pending = pending_command.clone();
 
@@ -1942,7 +1944,9 @@ fn validate_pty_input(
                 let command = next_pending.trim();
                 if !command.is_empty() {
                     harness::permissions::PermissionGuard::from_workspace(workspace)
-                        .and_then(|guard| guard.validate(command))
+                        .and_then(|guard| {
+                            guard.validate_with_approval(command, permission_approval)
+                        })
                         .map_err(|error| error.to_string())?;
                 }
                 next_pending.clear();
@@ -4135,6 +4139,7 @@ fn write_pty(
     state: State<PtyManager>,
     input: String,
     session_key: Option<String>,
+    permission_approval: Option<harness::permissions::ShellPermissionApproval>,
 ) -> Result<(), String> {
     let mut guard = state
         .sessions
@@ -4144,7 +4149,12 @@ fn write_pty(
     let session = guard
         .get_mut(&key)
         .ok_or_else(|| "PTY 尚未启动，请先调用 spawn_pty".to_string())?;
-    validate_pty_input(&session.workspace, &mut session.pending_command, &input)?;
+    validate_pty_input(
+        &session.workspace,
+        &mut session.pending_command,
+        &input,
+        permission_approval.as_ref(),
+    )?;
     let mut writer = session
         .writer
         .lock()
@@ -4312,10 +4322,27 @@ fn run_command(
     input: Option<String>,
     timeout_ms: Option<u64>,
     workspace: Option<String>,
+    permission_approval: Option<harness::permissions::ShellPermissionApproval>,
 ) -> Result<TerminalCommandOutput, String> {
     let workspace = resolve_workspace_root(&state, workspace)?;
     let timeout = Duration::from_millis(timeout_ms.unwrap_or(60_000).clamp(100, 600_000));
-    run_workspace_shell_command(&workspace, command, input, timeout)
+    run_workspace_shell_command(&workspace, command, input, timeout, permission_approval)
+}
+
+#[tauri::command]
+fn shell_permission_preflight(
+    state: State<WorkspaceState>,
+    command: String,
+    workspace: Option<String>,
+) -> Result<harness::permissions::PermissionDecision, String> {
+    let workspace = resolve_workspace_root(&state, workspace)?;
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return Err("命令不能为空".to_string());
+    }
+    harness::permissions::PermissionGuard::from_workspace(&workspace)
+        .map(|guard| guard.inspect(trimmed))
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -7093,7 +7120,7 @@ fn run_hook_command(
         return Err("Hook 命令不能为空".to_string());
     }
     let timeout = Duration::from_millis(timeout_ms.unwrap_or(4_000).clamp(100, 60_000));
-    let output = run_workspace_shell_command(&workspace, trimmed.to_string(), input, timeout)
+    let output = run_workspace_shell_command(&workspace, trimmed.to_string(), input, timeout, None)
         .map_err(|e| format!("Hook 命令执行失败: {e}"))?;
 
     Ok(HookCommandOutput {
@@ -8169,6 +8196,7 @@ pub fn run() {
             clear_pty_buffer,
             get_pty_status,
             run_command,
+            shell_permission_preflight,
             build_repository_index,
             load_session_memory,
             record_session_failure,
@@ -8276,10 +8304,10 @@ mod tests {
         .unwrap();
         let mut pending = String::new();
 
-        validate_pty_input(&workspace, &mut pending, "cargo test").unwrap();
+        validate_pty_input(&workspace, &mut pending, "cargo test", None).unwrap();
         assert_eq!(pending, "cargo test");
 
-        validate_pty_input(&workspace, &mut pending, "\r").unwrap();
+        validate_pty_input(&workspace, &mut pending, "\r", None).unwrap();
         assert_eq!(pending, "");
     }
 
@@ -8294,7 +8322,7 @@ mod tests {
         .unwrap();
         let mut pending = "sudo whoami".to_string();
 
-        let error = validate_pty_input(&workspace, &mut pending, "\r")
+        let error = validate_pty_input(&workspace, &mut pending, "\r", None)
             .expect_err("denied command must not be accepted for execution");
 
         assert!(error.contains("拒绝"));

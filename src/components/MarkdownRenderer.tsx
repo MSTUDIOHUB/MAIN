@@ -7,6 +7,13 @@ import { oneLight, vscDarkPlus } from "react-syntax-highlighter/dist/esm/styles/
 import { IconClose, IconExpand } from "./Icons";
 import MermaidBlock from "./MermaidBlock";
 import { useAppStore } from "../store/useAppStore";
+import {
+  decodeInlineMathCode,
+  extractMarkdownNodeSource,
+  isInlineMathCode,
+  markdownTableToTsv,
+  normalizeMarkdownForDisplay,
+} from "../lib/markdownDisplay";
 
 const LANG_MAP: Record<string, string> = {
   js: "javascript",
@@ -20,6 +27,7 @@ const LANG_MAP: Record<string, string> = {
   sh: "bash",
   yml: "yaml",
   md: "markdown",
+  html: "html",
 };
 
 const DIAGRAM_LANGS = new Set(["mermaid", "plantuml", "puml", "uml", "dot", "graphviz"]);
@@ -31,11 +39,23 @@ function resolveLanguage(lang?: string): string {
   return LANG_MAP[lower] || lower;
 }
 
-function normalizeMarkdownForDisplay(content: string): string {
-  return content
-    .replace(/\n```(?:text|plaintext|markdown)?\n([^\n`]{1,80})\n```\n/g, (_match, shortText: string) => ` \`${shortText.trim()}\` `)
-    .replace(/^> \[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]/gim, (_, level: string) => `> **${level}**`)
-    .replace(/\n{4,}/g, "\n\n\n");
+function collectText(children: React.ReactNode): string {
+  if (children == null || typeof children === "boolean") return "";
+  if (typeof children === "string" || typeof children === "number") return String(children);
+  if (Array.isArray(children)) return children.map(collectText).join("");
+  if (React.isValidElement(children)) {
+    return collectText((children.props as { children?: React.ReactNode }).children);
+  }
+  return "";
+}
+
+function slugify(value: string): string {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[`~!@#$%^&*()+=[\]{};:'",.<>/?\\|]+/g, "")
+    .replace(/\s+/g, "-")
+    .slice(0, 80);
 }
 
 function getLanguageTone(language: string, isDiagram: boolean, themeMode: "light" | "dark" | "black" = "dark") {
@@ -121,6 +141,21 @@ function getLanguageTone(language: string, isDiagram: boolean, themeMode: "light
         badgeText: "#f9a8d4",
         headerBackground: "linear-gradient(90deg, rgba(236,72,153,0.14), rgba(244,114,182,0.06))",
       };
+    case "html":
+    case "svg":
+      return {
+        badgeBorder: "rgba(45,212,191,0.28)",
+        badgeBackground: "rgba(45,212,191,0.12)",
+        badgeText: "#99f6e4",
+        headerBackground: "linear-gradient(90deg, rgba(20,184,166,0.14), rgba(59,130,246,0.06))",
+      };
+    case "math":
+      return {
+        badgeBorder: "rgba(251,191,36,0.28)",
+        badgeBackground: "rgba(251,191,36,0.12)",
+        badgeText: "#fde68a",
+        headerBackground: "linear-gradient(90deg, rgba(245,158,11,0.14), rgba(124,58,237,0.05))",
+      };
     case "markdown":
       return {
         badgeBorder: "rgba(161,161,170,0.28)",
@@ -138,43 +173,97 @@ function getLanguageTone(language: string, isDiagram: boolean, themeMode: "light
   }
 }
 
+function MathInline({ value, baseFontSize }: { value: string; baseFontSize: number }) {
+  return (
+    <span
+      className="mx-0.5 inline-flex max-w-full items-center rounded-md border px-1.5 py-[1px] font-mono align-baseline"
+      style={{
+        borderColor: "rgba(251,191,36,0.28)",
+        backgroundColor: "rgba(251,191,36,0.1)",
+        color: "var(--inline-chip-text, #fef3c7)",
+        fontSize: `${Math.max(11, baseFontSize - 1)}px`,
+        lineHeight: `${Math.max(16, baseFontSize + 3)}px`,
+      }}
+    >
+      {value}
+    </span>
+  );
+}
+
+function MathBlock({ value, baseFontSize }: { value: string; baseFontSize: number }) {
+  return (
+    <div className="my-4 overflow-x-auto rounded-xl border border-[rgba(251,191,36,0.24)] bg-[rgba(251,191,36,0.07)] px-4 py-3">
+      <pre
+        className="m-0 whitespace-pre-wrap break-words font-mono text-[#fde68a]"
+        style={{
+          fontSize: `${baseFontSize}px`,
+          lineHeight: `${Math.max(22, Math.round(baseFontSize * 1.7))}px`,
+        }}
+      >
+        {value}
+      </pre>
+    </div>
+  );
+}
+
 function CodeBlock({ inline, className, children, baseFontSize = 13, ...rest }: any) {
   const [copied, setCopied] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
+  const [isCodeExpanded, setIsCodeExpanded] = useState(false);
+  const [isWrapped, setIsWrapped] = useState(false);
+  const [isPreviewOpen, setIsPreviewOpen] = useState(false);
   const themeMode = useAppStore((s) => s.config.themeMode);
   const uiLanguage = useAppStore((s) => s.config.language) === "en" ? "en" : "zh";
   const copy = uiLanguage === "zh"
-    ? { diagram: "图表", expand: "展开", copied: "已复制", copy: "复制", expandedDiagram: "展开图表视图", copySource: "复制源码", closeExpanded: "关闭展开图表" }
-    : { diagram: "Diagram", expand: "Expand", copied: "Copied", copy: "Copy", expandedDiagram: "Expanded Diagram View", copySource: "Copy Source", closeExpanded: "Close expanded diagram" };
+    ? {
+        diagram: "图表",
+        expand: "展开",
+        collapse: "收起",
+        copied: "已复制",
+        copy: "复制",
+        wrap: "换行",
+        unwrap: "不换行",
+        preview: "预览",
+        htmlPreview: "沙盒预览",
+        expandedDiagram: "展开图表视图",
+        copySource: "复制源码",
+        closeExpanded: "关闭展开视图",
+      }
+    : {
+        diagram: "Diagram",
+        expand: "Expand",
+        collapse: "Collapse",
+        copied: "Copied",
+        copy: "Copy",
+        wrap: "Wrap",
+        unwrap: "No wrap",
+        preview: "Preview",
+        htmlPreview: "Sandbox Preview",
+        expandedDiagram: "Expanded Diagram View",
+        copySource: "Copy Source",
+        closeExpanded: "Close expanded view",
+      };
   const isLightTheme = themeMode === "light";
   const isBlackTheme = themeMode === "black";
   const syntaxTheme = isLightTheme ? oneLight : vscDarkPlus;
   const codeSurfaceTone = isLightTheme
-    ? {
-        border: "#d4d4d8",
-        background: "#fafafa",
-        text: "#1f2937",
-      }
+    ? { border: "#d4d4d8", background: "#fafafa", text: "#1f2937" }
     : isBlackTheme
-    ? {
-        border: "#202026",
-        background: "#000000",
-        text: "#dedee3",
-      }
-    : {
-        border: "#1f1f23",
-        background: "#09090b",
-        text: "#d4d4d8",
-      };
-  const match = /language-(\w+)/.exec(className || "");
+    ? { border: "#202026", background: "#000000", text: "#dedee3" }
+    : { border: "#1f1f23", background: "#09090b", text: "#d4d4d8" };
+  const match = /language-([\w-]+)/.exec(className || "");
   const language = match ? match[1].toLowerCase() : "";
   const codeStr = String(children).replace(/\n$/, "");
   const resolvedLang = resolveLanguage(language);
   const isDiagram = DIAGRAM_LANGS.has(resolvedLang);
   const isMermaid = resolvedLang === "mermaid";
+  const isMath = resolvedLang === "math";
+  const isHtmlPreviewable = resolvedLang === "html" || resolvedLang === "svg";
   const isPlainText = !language || resolvedLang === "text" || resolvedLang === "plaintext";
   const plainTextDisplay = codeStr.trim().replace(/\s+/g, " ");
   const isCompactPlainText = isPlainText && !codeStr.includes("\n") && plainTextDisplay.length <= 80;
+  const lineCount = codeStr.split(/\r?\n/).length;
+  const canCollapseCode = lineCount > 18 || codeStr.length > 2400;
   const tone = getLanguageTone(resolvedLang || "text", isDiagram, themeMode);
   const expandedTone = isLightTheme
     ? {
@@ -203,11 +292,12 @@ function CodeBlock({ inline, className, children, baseFontSize = 13, ...rest }: 
       };
 
   useEffect(() => {
-    if (!isExpanded) return;
+    if (!isExpanded && !isPreviewOpen) return;
 
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         setIsExpanded(false);
+        setIsPreviewOpen(false);
       }
     };
 
@@ -219,9 +309,13 @@ function CodeBlock({ inline, className, children, baseFontSize = 13, ...rest }: 
       document.body.style.overflow = previousOverflow;
       window.removeEventListener("keydown", onKeyDown);
     };
-  }, [isExpanded]);
+  }, [isExpanded, isPreviewOpen]);
 
   if (inline) {
+    if (isInlineMathCode(codeStr)) {
+      return <MathInline value={decodeInlineMathCode(codeStr)} baseFontSize={baseFontSize} />;
+    }
+
     return (
       <code
         className="rounded-md border px-2 py-[1px] font-mono align-baseline"
@@ -248,6 +342,10 @@ function CodeBlock({ inline, className, children, baseFontSize = 13, ...rest }: 
     }
   };
 
+  if (isMath) {
+    return <MathBlock value={codeStr} baseFontSize={baseFontSize} />;
+  }
+
   if (isCompactPlainText) {
     return (
       <span
@@ -267,15 +365,28 @@ function CodeBlock({ inline, className, children, baseFontSize = 13, ...rest }: 
   if (isPlainText) {
     return (
       <div
-        className="my-4 overflow-x-auto rounded-2xl border px-4 py-3"
-        style={{
-          borderColor: codeSurfaceTone.border,
-          backgroundColor: codeSurfaceTone.background,
-        }}
+        className="my-4 overflow-hidden rounded-2xl border"
+        style={{ borderColor: codeSurfaceTone.border, backgroundColor: codeSurfaceTone.background }}
       >
+        <div className="flex items-center justify-end gap-2 border-b border-[#1f1f23] px-4 py-2">
+          {canCollapseCode && (
+            <button onClick={() => setIsCodeExpanded((value) => !value)} className="rounded-full border border-[#27272a] bg-[#09090b] px-3 py-1 text-[10px] text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#f5f5f5]">
+              {isCodeExpanded ? copy.collapse : copy.expand}
+            </button>
+          )}
+          <button onClick={() => setIsWrapped((value) => !value)} className="rounded-full border border-[#27272a] bg-[#09090b] px-3 py-1 text-[10px] text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#f5f5f5]">
+            {isWrapped ? copy.unwrap : copy.wrap}
+          </button>
+          <button onClick={handleCopy} className="rounded-full border border-[#27272a] bg-[#09090b] px-3 py-1 text-[10px] text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#f5f5f5]">
+            {copied ? copy.copied : copy.copy}
+          </button>
+        </div>
         <pre
-          className="m-0 whitespace-pre font-mono"
+          className="m-0 overflow-auto p-4 font-mono"
           style={{
+            maxHeight: canCollapseCode && !isCodeExpanded ? 360 : undefined,
+            whiteSpace: isWrapped ? "pre-wrap" : "pre",
+            overflowWrap: isWrapped ? "anywhere" : "normal",
             fontFamily: CODE_FONT_FAMILY,
             fontSize: `${baseFontSize}px`,
             lineHeight: `${Math.max(22, Math.round(baseFontSize * 1.7))}px`,
@@ -287,6 +398,20 @@ function CodeBlock({ inline, className, children, baseFontSize = 13, ...rest }: 
       </div>
     );
   }
+
+  const syntaxCustomStyle: React.CSSProperties = {
+    margin: 0,
+    padding: "1rem",
+    maxHeight: canCollapseCode && !isCodeExpanded ? 420 : undefined,
+    overflow: "auto",
+    background: "transparent",
+    color: codeSurfaceTone.text,
+    fontFamily: CODE_FONT_FAMILY,
+    fontSize: `${baseFontSize}px`,
+    lineHeight: 1.7,
+    whiteSpace: isWrapped ? "pre-wrap" : "pre",
+    overflowWrap: isWrapped ? "anywhere" : "normal",
+  };
 
   return (
     <>
@@ -313,7 +438,29 @@ function CodeBlock({ inline, className, children, baseFontSize = 13, ...rest }: 
               <span className="text-[10px] uppercase tracking-[0.18em] text-[#cbd5e1]">{copy.diagram}</span>
             )}
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            {isHtmlPreviewable && (
+              <button
+                onClick={() => setIsPreviewOpen(true)}
+                className="rounded-full border border-[#27272a] bg-[#09090b] px-3 py-1 text-[10px] text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#f5f5f5]"
+              >
+                {copy.preview}
+              </button>
+            )}
+            {canCollapseCode && (
+              <button
+                onClick={() => setIsCodeExpanded((value) => !value)}
+                className="rounded-full border border-[#27272a] bg-[#09090b] px-3 py-1 text-[10px] text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#f5f5f5]"
+              >
+                {isCodeExpanded ? copy.collapse : copy.expand}
+              </button>
+            )}
+            <button
+              onClick={() => setIsWrapped((value) => !value)}
+              className="rounded-full border border-[#27272a] bg-[#09090b] px-3 py-1 text-[10px] text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#f5f5f5]"
+            >
+              {isWrapped ? copy.unwrap : copy.wrap}
+            </button>
             {isMermaid && (
               <button
                 onClick={() => setIsExpanded(true)}
@@ -339,19 +486,13 @@ function CodeBlock({ inline, className, children, baseFontSize = 13, ...rest }: 
             style={syntaxTheme}
             language={resolvedLang}
             PreTag="div"
-            customStyle={{
-              margin: 0,
-              padding: "1rem",
-              background: "transparent",
-              color: codeSurfaceTone.text,
-              fontFamily: CODE_FONT_FAMILY,
-              fontSize: `${baseFontSize}px`,
-              lineHeight: 1.7,
-            }}
+            wrapLongLines={isWrapped}
+            customStyle={syntaxCustomStyle}
             codeTagProps={{
               style: {
                 fontFamily: CODE_FONT_FAMILY,
                 fontSize: "inherit",
+                whiteSpace: "inherit",
               },
             }}
           >
@@ -418,6 +559,47 @@ function CodeBlock({ inline, className, children, baseFontSize = 13, ...rest }: 
         </div>,
         document.body,
       )}
+
+      {isHtmlPreviewable && isPreviewOpen && typeof document !== "undefined" && createPortal(
+        <div className="fixed inset-0 z-[140] flex items-center justify-center p-6" style={{ backgroundColor: expandedTone.overlay }} onClick={() => setIsPreviewOpen(false)}>
+          <div
+            className="flex h-[min(86vh,960px)] w-[min(96vw,1320px)] flex-col overflow-hidden rounded-[28px] border"
+            style={{
+              borderColor: expandedTone.modalBorder,
+              backgroundColor: expandedTone.modalBackground,
+              boxShadow: expandedTone.modalShadow,
+            }}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-center justify-between border-b px-5 py-3" style={{ borderColor: expandedTone.headerBorder, background: tone.headerBackground }}>
+              <div className="flex items-center gap-3">
+                <span
+                  className="rounded-full border px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.16em]"
+                  style={{ borderColor: tone.badgeBorder, backgroundColor: tone.badgeBackground, color: tone.badgeText }}
+                >
+                  {resolvedLang}
+                </span>
+                <span className="text-[12px]" style={{ color: expandedTone.titleText }}>{copy.htmlPreview}</span>
+              </div>
+              <button
+                onClick={() => setIsPreviewOpen(false)}
+                className="rounded-full border p-2 transition-colors"
+                style={{ borderColor: expandedTone.buttonBorder, backgroundColor: expandedTone.buttonBackground, color: expandedTone.buttonText }}
+                aria-label={copy.closeExpanded}
+              >
+                <IconClose className="h-4 w-4" />
+              </button>
+            </div>
+            <iframe
+              title={copy.htmlPreview}
+              sandbox=""
+              srcDoc={codeStr}
+              className="min-h-0 flex-1 border-0 bg-white"
+            />
+          </div>
+        </div>,
+        document.body,
+      )}
     </>
   );
 }
@@ -426,7 +608,17 @@ function PreBlock({ children }: any) {
   return <>{children}</>;
 }
 
-function Heading({ level, children, baseFontSize = 13 }: { level: number; children: React.ReactNode; baseFontSize?: number }) {
+function Heading({
+  level,
+  children,
+  baseFontSize = 13,
+  sourceId,
+}: {
+  level: number;
+  children: React.ReactNode;
+  baseFontSize?: number;
+  sourceId?: string;
+}) {
   const sizes: Record<number, number> = {
     1: baseFontSize * 1.85,
     2: baseFontSize * 1.45,
@@ -435,30 +627,109 @@ function Heading({ level, children, baseFontSize = 13 }: { level: number; childr
     5: baseFontSize * 1.02,
     6: baseFontSize * 0.94,
   };
+  const text = collectText(children);
+  const id = sourceId && text ? `md-${sourceId}-${slugify(text)}` : undefined;
 
   return (
     <div
-      className="mt-6 mb-3 first:mt-0 font-semibold text-[#f5f5f5]"
+      id={id}
+      className="group mt-6 mb-3 first:mt-0 font-semibold text-[#f5f5f5]"
       style={{ fontSize: `${Math.round((sizes[level] || sizes[3]) * 10) / 10}px` }}
     >
       {children}
+      {id && (
+        <a href={`#${id}`} className="ml-2 opacity-0 text-[0.72em] text-[#71717a] no-underline transition-opacity group-hover:opacity-100">
+          #
+        </a>
+      )}
     </div>
   );
 }
 
-const MarkdownRenderer = memo(function MarkdownRenderer({ content, baseFontSize = 13 }: { content: string; baseFontSize?: number }) {
+function Blockquote({ children }: { children: React.ReactNode }) {
+  const text = collectText(children).trim();
+  const level = (text.match(/^(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\b/i)?.[1] || "").toUpperCase();
+  const tone = level === "WARNING" || level === "CAUTION"
+    ? "border-[rgba(251,191,36,0.55)] bg-[rgba(251,191,36,0.08)] text-[#fde68a]"
+    : level === "IMPORTANT"
+    ? "border-[rgba(244,114,182,0.48)] bg-[rgba(244,114,182,0.08)] text-[#fbcfe8]"
+    : level === "TIP"
+    ? "border-[rgba(52,211,153,0.48)] bg-[rgba(52,211,153,0.08)] text-[#bbf7d0]"
+    : "border-[rgba(124,58,237,0.45)] bg-[rgba(124,58,237,0.08)] text-[#ddd6fe]";
+
+  return (
+    <blockquote className={`my-4 rounded-r-2xl border-l-2 px-4 py-3 ${tone}`}>
+      {children}
+    </blockquote>
+  );
+}
+
+function TableBlock({
+  children,
+  node,
+  source,
+  baseFontSize,
+}: {
+  children: React.ReactNode;
+  node?: any;
+  source: string;
+  baseFontSize: number;
+}) {
+  const [copied, setCopied] = useState(false);
+  const uiLanguage = useAppStore((s) => s.config.language) === "en" ? "en" : "zh";
+  const tableMarkdown = useMemo(() => extractMarkdownNodeSource(source, node?.position), [node?.position, source]);
+  const copyLabel = copied
+    ? uiLanguage === "zh" ? "已复制" : "Copied"
+    : uiLanguage === "zh" ? "复制" : "Copy";
+
+  const copyTable = async () => {
+    try {
+      const content = tableMarkdown || markdownTableToTsv(collectText(children));
+      await navigator.clipboard.writeText(markdownTableToTsv(content) || content);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1200);
+    } catch {
+      setCopied(false);
+    }
+  };
+
+  return (
+    <div className="group/table relative my-4 overflow-x-auto rounded-2xl border border-[#1f1f23] bg-[#09090b]">
+      <div className="absolute right-2 top-2 z-10 opacity-0 transition-opacity group-hover/table:opacity-100">
+        <button
+          type="button"
+          onClick={copyTable}
+          className="rounded-md border border-[#27272a] bg-[#09090b] px-2 py-1 text-[10px] text-[#a1a1aa] shadow-sm transition-colors hover:bg-[#18181b] hover:text-[#f5f5f5]"
+        >
+          {copyLabel}
+        </button>
+      </div>
+      <table className="min-w-full" style={{ fontSize: `${Math.max(12, baseFontSize - 1)}px` }}>{children}</table>
+    </div>
+  );
+}
+
+const MarkdownRenderer = memo(function MarkdownRenderer({
+  content,
+  baseFontSize = 13,
+  sourceId,
+}: {
+  content: string;
+  baseFontSize?: number;
+  sourceId?: string;
+}) {
   const normalized = useMemo(() => normalizeMarkdownForDisplay(content), [content]);
 
   const components = useMemo(() => ({
     code: (props: any) => <CodeBlock {...props} baseFontSize={baseFontSize} />,
     pre: PreBlock,
-    h1: ({ children }: any) => <Heading level={1} baseFontSize={baseFontSize}>{children}</Heading>,
-    h2: ({ children }: any) => <Heading level={2} baseFontSize={baseFontSize}>{children}</Heading>,
-    h3: ({ children }: any) => <Heading level={3} baseFontSize={baseFontSize}>{children}</Heading>,
-    h4: ({ children }: any) => <Heading level={4} baseFontSize={baseFontSize}>{children}</Heading>,
-    h5: ({ children }: any) => <Heading level={5} baseFontSize={baseFontSize}>{children}</Heading>,
-    h6: ({ children }: any) => <Heading level={6} baseFontSize={baseFontSize}>{children}</Heading>,
-    p: ({ children }: any) => <p className="mb-3 last:mb-0 text-[#d4d4d8]">{children}</p>,
+    h1: ({ children }: any) => <Heading level={1} baseFontSize={baseFontSize} sourceId={sourceId}>{children}</Heading>,
+    h2: ({ children }: any) => <Heading level={2} baseFontSize={baseFontSize} sourceId={sourceId}>{children}</Heading>,
+    h3: ({ children }: any) => <Heading level={3} baseFontSize={baseFontSize} sourceId={sourceId}>{children}</Heading>,
+    h4: ({ children }: any) => <Heading level={4} baseFontSize={baseFontSize} sourceId={sourceId}>{children}</Heading>,
+    h5: ({ children }: any) => <Heading level={5} baseFontSize={baseFontSize} sourceId={sourceId}>{children}</Heading>,
+    h6: ({ children }: any) => <Heading level={6} baseFontSize={baseFontSize} sourceId={sourceId}>{children}</Heading>,
+    p: ({ children }: any) => <p className="mb-3 whitespace-pre-wrap last:mb-0 text-[#d4d4d8]">{children}</p>,
     a: ({ href, children }: any) => (
       <a href={href} target="_blank" rel="noopener noreferrer" className="theme-text underline decoration-[rgba(167,139,250,0.45)] underline-offset-4 transition-opacity hover:opacity-80">
         {children}
@@ -466,23 +737,23 @@ const MarkdownRenderer = memo(function MarkdownRenderer({ content, baseFontSize 
     ),
     ul: ({ children }: any) => <ul className="mb-3 ml-5 list-disc space-y-1.5">{children}</ul>,
     ol: ({ children }: any) => <ol className="mb-3 ml-5 list-decimal space-y-1.5">{children}</ol>,
-    li: ({ children }: any) => <li className="text-[#d4d4d8]">{children}</li>,
-    blockquote: ({ children }: any) => (
-      <blockquote className="my-4 rounded-r-2xl border-l-2 border-[rgba(124,58,237,0.45)] bg-[rgba(124,58,237,0.08)] px-4 py-3 text-[#ddd6fe]">
-        {children}
-      </blockquote>
-    ),
+    li: ({ children }: any) => <li className="text-[#d4d4d8] marker:text-[#71717a]">{children}</li>,
+    blockquote: ({ children }: any) => <Blockquote>{children}</Blockquote>,
     hr: () => <hr className="my-5 border-t border-[#27272a]" />,
-    table: ({ children }: any) => (
-      <div className="my-4 overflow-x-auto rounded-2xl border border-[#1f1f23] bg-[#09090b]">
-        <table className="min-w-full" style={{ fontSize: `${Math.max(12, baseFontSize - 1)}px` }}>{children}</table>
-      </div>
+    table: ({ children, node }: any) => (
+      <TableBlock node={node} source={normalized} baseFontSize={baseFontSize}>{children}</TableBlock>
     ),
     thead: ({ children }: any) => <thead className="bg-[#121216] text-[#f5f5f5]">{children}</thead>,
     th: ({ children }: any) => <th className="border-b border-[#1f1f23] px-4 py-3 text-left font-semibold">{children}</th>,
     td: ({ children }: any) => <td className="border-b border-[#1f1f23] px-4 py-3 align-top text-[#d4d4d8]">{children}</td>,
     strong: ({ children }: any) => <strong className="font-semibold text-white">{children}</strong>,
     em: ({ children }: any) => <em className="italic text-[#ddd6fe]">{children}</em>,
+    sup: ({ children }: any) => <sup className="rounded-full bg-[rgba(124,58,237,0.18)] px-1 text-[0.75em] theme-text">{children}</sup>,
+    section: ({ children, className }: any) => (
+      <section className={`${className || ""} mt-4 rounded-xl border border-[#27272a] bg-[#050507] px-4 py-3 text-[#d4d4d8]`}>
+        {children}
+      </section>
+    ),
     input: ({ checked, type }: any) => {
       if (type !== "checkbox") return null;
       return (
@@ -491,7 +762,7 @@ const MarkdownRenderer = memo(function MarkdownRenderer({ content, baseFontSize 
         </span>
       );
     },
-  }), [baseFontSize]);
+  }), [baseFontSize, normalized, sourceId]);
 
   if (!normalized) return null;
 

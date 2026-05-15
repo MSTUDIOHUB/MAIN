@@ -847,6 +847,7 @@ test("validatePlanArtifactContent accepts real requirements and design artifacts
 });
 
 test("validatePlanArtifactContent requires inferable task evidence", () => {
+  assert.equal(validatePlanArtifactContent("先实现核心逻辑，再运行测试。", "tasks").ok, false);
   assert.equal(validatePlanArtifactContent("- [ ] 调整空状态", "tasks").ok, false);
   assert.equal(validatePlanArtifactContent("- [ ] 调整 src/App.tsx 空状态", "tasks").ok, true);
   assert.equal(validatePlanArtifactContent("- [ ] 运行检查 — 证据: cmd:npx tsc --noEmit", "tasks").ok, true);

@@ -1060,6 +1060,9 @@ export function validatePlanArtifactContent(
   if (kind === "tasks") {
     const hasCheckboxTasks = /^\s*[-*]\s+\[[ xX]\]\s+.+$/m.test(raw);
     const tasks = extractPlanTasks(raw);
+    if (!hasCheckboxTasks || tasks.length === 0) {
+      return { ok: false, reason: "missing_checkbox_tasks" };
+    }
     if (hasCheckboxTasks && tasks.some((task) => !task.evidence || task.evidence.length === 0)) {
       return { ok: false, reason: "missing_task_evidence" };
     }
@@ -1094,7 +1097,7 @@ export function validateActionableDesignArtifact(
     /(?:CSV|TSV|XLSX|字段|列|指标|数据|表格|column|metric|dataset|table)/i.test(raw);
   const hasExecutionOrder = /(?:执行顺序|实施步骤|Execution Order|Implementation Steps|Plan of Work|\b1\.\s+)/i.test(raw);
   const hasValidation = /(?:验证方式|验收|测试|构建|Validation|Acceptance|Test|Build)/i.test(raw);
-  const hasRiskOrQuestion = /(?:风险|取舍|开放问题|不确定|Risk|Tradeoff|Open Question|Unknown)/i.test(raw);
+  const hasRiskOrQuestion = /(?:风险|取舍|默认假设|后续增强|开放问题|不确定|Risk|Tradeoff|Assumption|Default|Follow-up|Enhancement|Open Question|Unknown)/i.test(raw);
   const hasConcreteUserGoal = /(?:用户目标|目标|User Goal|Goal)/i.test(raw) && !/(?:最小可用闭环|smallest useful workflow).{0,80}(?:默认|first version)/i.test(raw);
 
   const signalCount = [

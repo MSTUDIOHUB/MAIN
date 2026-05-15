@@ -57,6 +57,33 @@ export interface TerminalCommandOutput {
   stderrTruncated: boolean;
 }
 
+export type ShellPermissionDecisionKind = "allow" | "ask" | "deny";
+
+export interface ShellPermissionSegmentDecision {
+  command: string;
+  decision: ShellPermissionDecisionKind;
+  matchedRule?: string | null;
+  suggestedRule?: string | null;
+}
+
+export interface ShellPermissionDecision {
+  command: string;
+  decision: ShellPermissionDecisionKind;
+  source: "builtin_default" | "workspace_file" | string;
+  sourcePath?: string | null;
+  segmentDecisions: ShellPermissionSegmentDecision[];
+  allowedBy?: string | null;
+  matchedRule?: string | null;
+  suggestedRule?: string | null;
+  requiresApproval: boolean;
+}
+
+export interface ShellPermissionApproval {
+  command: string;
+  approvedAtMs?: number | null;
+  scope?: "once" | "session" | string | null;
+}
+
 export interface RepositoryIndex {
   root: string;
   generatedAtMs: number;
@@ -694,11 +721,23 @@ export function runCommand(
   input?: string,
   timeoutMs?: number,
   workspace?: string,
+  permissionApproval?: ShellPermissionApproval,
 ): Promise<TerminalCommandOutput> {
   return invoke<TerminalCommandOutput>("run_command", {
     command,
     input,
     timeoutMs,
+    workspace,
+    permissionApproval,
+  });
+}
+
+export function shellPermissionPreflight(
+  command: string,
+  workspace?: string,
+): Promise<ShellPermissionDecision> {
+  return invoke<ShellPermissionDecision>("shell_permission_preflight", {
+    command,
     workspace,
   });
 }
@@ -794,8 +833,12 @@ export function resizePty(cols: number, rows: number, sessionKey?: string): Prom
   return invoke<void>("resize_pty", { cols, rows, sessionKey });
 }
 
-export function writePty(input: string, sessionKey?: string): Promise<void> {
-  return invoke<void>("write_pty", { input, sessionKey });
+export function writePty(
+  input: string,
+  sessionKey?: string,
+  permissionApproval?: ShellPermissionApproval,
+): Promise<void> {
+  return invoke<void>("write_pty", { input, sessionKey, permissionApproval });
 }
 
 export function readPtyBuffer(maxChars?: number, sessionKey?: string): Promise<string> {

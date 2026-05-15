@@ -158,6 +158,69 @@ test("runtime tool planner classifies lifecycle actions and initial states", () 
   assert.equal(initialLifecycleStateForPlanAction(reviewRequired.action), "awaiting_review");
 });
 
+test("approved plan execution blocks shell and source writes until tasks exist", () => {
+  const base = {
+    workflowMode: "plan",
+    runtimeIntent: "execute",
+    isPlanApproved: true,
+    planTaskCount: 0,
+    availableToolNames: new Set(["read_file", "write_file", "run_command"]),
+  };
+
+  const shellBlocked = planRuntimeToolCall(createPlanInput({
+    ...base,
+    toolCall: {
+      id: "shell-before-tasks",
+      name: "run_command",
+      arguments: JSON.stringify({ command: "npm create vite@latest . -- --template react-ts", cwd: "." }),
+    },
+  }));
+  assert.equal(shellBlocked.action, "blocked_plan_gate");
+  assert.equal(shellBlocked.reason, "missing_tasks_before_source");
+
+  const sourceBlocked = planRuntimeToolCall(createPlanInput({
+    ...base,
+    toolCall: {
+      id: "source-before-tasks",
+      name: "write_file",
+      arguments: JSON.stringify({ path: "src/main.ts", content: "export {};" }),
+    },
+  }));
+  assert.equal(sourceBlocked.action, "blocked_plan_gate");
+  assert.equal(sourceBlocked.reason, "missing_tasks_before_source");
+
+  const sourceReadBlocked = planRuntimeToolCall(createPlanInput({
+    ...base,
+    toolCall: {
+      id: "source-read-before-tasks",
+      name: "read_file",
+      arguments: JSON.stringify({ path: "src/main.ts" }),
+    },
+  }));
+  assert.equal(sourceReadBlocked.action, "blocked_plan_gate");
+  assert.equal(sourceReadBlocked.reason, "missing_tasks_before_source");
+
+  const planReadAllowed = planRuntimeToolCall(createPlanInput({
+    ...base,
+    toolCall: {
+      id: "plan-read-before-tasks",
+      name: "read_file",
+      arguments: JSON.stringify({ path: ".MAIN/plans/design.md" }),
+    },
+  }));
+  assert.equal(planReadAllowed.action, "auto_execute");
+
+  const tasksAllowed = planRuntimeToolCall(createPlanInput({
+    ...base,
+    toolCall: {
+      id: "tasks-before-source",
+      name: "write_file",
+      arguments: JSON.stringify({ path: ".MAIN/plans/tasks.md", content: "- [ ] Implement [evidence: pending]" }),
+    },
+  }));
+  assert.equal(tasksAllowed.action, "spec_file_auto_approved");
+});
+
 test("thread event helpers stamp schema, detect terminal events, and keep ring buffer", () => {
   const started = withEventSchema({
     type: "turn.started",

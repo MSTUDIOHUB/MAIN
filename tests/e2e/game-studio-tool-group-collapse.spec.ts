@@ -16,7 +16,7 @@ test("game studio completed tool calls collapse into one group while keeping the
   await expect(groups).toHaveCount(1);
   await expect(groups.first()).toContainText("已完成 3 次工具调用");
   await expect(page.getByTestId("turn-activity-notice")).toContainText("已完成 3 次，当前调用工具：Main Camera");
-  await expect(page.getByText("执行中...")).toHaveCount(1);
+  await expect(page.getByTestId("tool-status-label").filter({ hasText: "执行中" })).toHaveCount(1);
 
   await groups.first().click();
   await expect(page.getByTestId("completed-tool-group-details")).toBeVisible();

@@ -4,6 +4,11 @@ import { IconSearch, IconFile, IconFolder, IconTerminal, IconCode, IconTool, Ico
 import { getDiffStats } from "../lib/diff";
 import { sanitizeAIOutput, stripAnsi } from "../lib/sanitize";
 import { compactToolPresentationTarget, getToolPresentationLabel } from "../lib/toolPresentation";
+import {
+  classifyChatError,
+  getChatFeedbackStatusCopy,
+  normalizeChatFeedbackStatus,
+} from "../lib/chatFeedback";
 import { useAppStore } from "../store/useAppStore";
 
 // Map tool names to human-readable action labels
@@ -51,19 +56,26 @@ interface ActionCardProps {
   toolStatus: "pending" | "executed" | "rejected" | "running" | "failed";
   message?: string;
   diff?: { old: string; new: string; path?: string };
+  shellPermissionDecision?: { requiresApproval?: boolean };
   onAllow?: () => void;
+  onAllowForSession?: () => void;
   onReject?: () => void;
   autoApproveTools?: boolean;
   onToggleAutoApprove?: (v: boolean) => void;
   autoCollapse?: boolean;
 }
 
-export default function ActionCard({ blockId, toolName, target, toolStatus, message, diff, onAllow, onReject, autoApproveTools, onToggleAutoApprove, autoCollapse }: ActionCardProps) {
+export default function ActionCard({ blockId, toolName, target, toolStatus, message, diff, shellPermissionDecision, onAllow, onAllowForSession, onReject, autoApproveTools, onToggleAutoApprove, autoCollapse }: ActionCardProps) {
   const language = useAppStore((s) => s.config.language);
+  const activeProfile = useAppStore((s) => s.config.activeProfile);
+  const setIsSettingsOpen = useAppStore((s) => s.setIsSettingsOpen);
+  const setSettingsTab = useAppStore((s) => s.setSettingsTab);
   const openDiffForTask = useAppStore((s) => s.openDiffForTask);
   const info = TOOL_LABELS[toolName] || { verb: { zh: "调用工具", en: "use tool" }, icon: IconTool };
   const uiLanguage = language === "en" ? "en" : "zh";
   const localizedVerb = getToolPresentationLabel(toolName, uiLanguage);
+  const feedbackStatus = normalizeChatFeedbackStatus(toolStatus);
+  const feedbackCopy = getChatFeedbackStatusCopy(feedbackStatus, uiLanguage);
   const IconComponent = info.icon;
   const isPending = toolStatus === "pending";
   const isRunning = toolStatus === "running";
@@ -72,6 +84,7 @@ export default function ActionCard({ blockId, toolName, target, toolStatus, mess
   const isFailed = toolStatus === "failed";
   const isDone = isExecuted || isRejected || isFailed;
   const isSystemErrorCard = toolName === "Error";
+  const isShellApprovalGated = !!shellPermissionDecision?.requiresApproval;
 
   // ── Collapsible state: expanded while pending/running, collapsed when done ──
   const [expanded, setExpanded] = useState(!isDone);
@@ -91,8 +104,15 @@ export default function ActionCard({ blockId, toolName, target, toolStatus, mess
   }, [autoCollapse]);
 
   const displayTarget = isSystemErrorCard
-    ? (language === "zh" ? "系统请求失败" : "System request failed")
+    ? (language === "zh" ? "请求失败" : "Request failed")
     : compactToolPresentationTarget(target, toolName, uiLanguage);
+  const errorInfo = isSystemErrorCard
+    ? classifyChatError(`${target || ""}\n${message || ""}`, {
+        language: uiLanguage,
+        activeProfile,
+      })
+    : null;
+  const errorTitle = errorInfo?.title || displayTarget;
   const canOpenDiff = isExecuted && !!diff && blockId != null;
   const diffStats = useMemo(
     () => (diff ? getDiffStats(diff.old, diff.new) : null),
@@ -113,6 +133,9 @@ export default function ActionCard({ blockId, toolName, target, toolStatus, mess
             <span className="min-w-0 truncate font-semibold theme-text">{displayTarget}</span>
             <span className="ml-auto shrink-0 text-[#10b981]">+{diffStats.added}</span>
             <span className="shrink-0 text-[#f87171]">-{diffStats.removed}</span>
+            <span className="shrink-0 rounded-full border border-[rgba(52,211,153,0.18)] bg-[rgba(52,211,153,0.08)] px-1.5 py-0.5 text-[9px] text-[#86efac]">
+              {feedbackCopy.shortLabel}
+            </span>
           </button>
           <button
             onClick={() => setExpanded(true)}
@@ -145,13 +168,23 @@ export default function ActionCard({ blockId, toolName, target, toolStatus, mess
           <IconComponent className="w-3.5 h-3.5" />
           <span className="text-[#e4e4e7]">
             {isSystemErrorCard
-              ? displayTarget
+              ? errorTitle
               : language === "zh"
                 ? `${localizedVerb}：`
                 : `${localizedVerb}: `}
             {!isSystemErrorCard && <span className="font-semibold">{displayTarget}</span>}
           </span>
-          {isExecuted && <IconCheck className="w-3 h-3 ml-1 text-[#10b981]" />}
+          <span
+            className={`ml-auto shrink-0 rounded-full border px-1.5 py-0.5 text-[9px] ${
+              isExecuted
+                ? "border-[rgba(52,211,153,0.18)] bg-[rgba(52,211,153,0.08)] text-[#86efac]"
+                : isRejected
+                ? "border-[rgba(251,113,133,0.22)] bg-[rgba(251,113,133,0.08)] text-[#fb7185]"
+                : "border-[rgba(251,146,60,0.22)] bg-[rgba(251,146,60,0.08)] text-[#fb923c]"
+            }`}
+          >
+            {feedbackCopy.shortLabel}
+          </span>
         </button>
       </div>
     );
@@ -176,25 +209,28 @@ export default function ActionCard({ blockId, toolName, target, toolStatus, mess
             <div className="flex flex-col">
               <span className="text-[13px] text-[#e4e4e7] leading-snug">
                 {isSystemErrorCard
-                  ? displayTarget
+                  ? errorTitle
                   : language === "zh"
                     ? `AI 申请${localizedVerb}：`
                     : `AI requests to ${localizedVerb}: `}
                 {!isSystemErrorCard && <span className="theme-text font-semibold">{displayTarget}</span>}
               </span>
               {isRunning && (
-                <span className="text-[11px] text-amber-400 mt-0.5">{language === "zh" ? "执行中..." : "Running..."}</span>
+                <span data-testid="tool-status-label" className="text-[11px] text-amber-400 mt-0.5">{feedbackCopy.label}</span>
+              )}
+              {isPending && (
+                <span data-testid="tool-status-label" className="text-[11px] text-[#a1a1aa] mt-0.5">{feedbackCopy.label}</span>
               )}
               {isExecuted && (
-                <span className="text-[11px] text-[#10b981] mt-0.5 flex items-center gap-1">
-                  <IconCheck className="w-3 h-3" /> {language === "zh" ? "已完成" : "Done"}
+                <span data-testid="tool-status-label" className="text-[11px] text-[#10b981] mt-0.5 flex items-center gap-1">
+                  <IconCheck className="w-3 h-3" /> {feedbackCopy.label}
                 </span>
               )}
               {isRejected && (
-                <span className="text-[11px] text-[#fb7185] mt-0.5">{language === "zh" ? "已拒绝" : "Rejected"}</span>
+                <span data-testid="tool-status-label" className="text-[11px] text-[#fb7185] mt-0.5">{feedbackCopy.label}</span>
               )}
               {isFailed && (
-                <span className="text-[11px] text-[#fb923c] mt-0.5">{language === "zh" ? "执行失败" : "Failed"}</span>
+                <span data-testid="tool-status-label" className="text-[11px] text-[#fb923c] mt-0.5">{feedbackCopy.label}</span>
               )}
             </div>
           </div>
@@ -230,19 +266,52 @@ export default function ActionCard({ blockId, toolName, target, toolStatus, mess
                 >
                   {language === "zh" ? "拒绝" : "Reject"}
                 </button>
+                {isShellApprovalGated && onAllowForSession && (
+                  <button
+                    onClick={onAllowForSession}
+                    className="px-3 py-1.5 text-[11px] font-medium rounded-md border border-[rgba(124,58,237,0.35)] bg-[rgba(124,58,237,0.14)] text-[#ddd6fe] hover:bg-[rgba(124,58,237,0.22)] transition-colors"
+                  >
+                    {language === "zh" ? "本线程允许" : "Allow Thread"}
+                  </button>
+                )}
                 <button
                   onClick={onAllow}
                   className="px-3 py-1.5 text-[11px] font-medium rounded-md theme-bg text-white hover:opacity-90 transition-opacity shadow-sm"
                 >
-                  {language === "zh" ? "允许执行" : "Allow & Run"}
+                  {isShellApprovalGated
+                    ? language === "zh" ? "允许一次" : "Allow Once"
+                    : language === "zh" ? "允许执行" : "Allow & Run"}
                 </button>
               </>
             )}
           </div>
         </div>
 
+        {isSystemErrorCard && errorInfo && (
+          <div className="mt-3 rounded-lg border border-[rgba(251,113,133,0.22)] bg-[rgba(251,113,133,0.06)] px-3 py-2">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="min-w-0">
+                <div className="text-[12px] font-semibold text-[#fecdd3]">{errorInfo.title}</div>
+                <div className="mt-1 text-[11px] leading-5 text-[#fda4af]">{errorInfo.detail}</div>
+              </div>
+              {errorInfo.settingsTab && errorInfo.actionLabel && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSettingsTab(errorInfo.settingsTab);
+                    setIsSettingsOpen(true);
+                  }}
+                  className="shrink-0 rounded-md border border-[rgba(251,113,133,0.28)] bg-[rgba(127,29,29,0.22)] px-2.5 py-1.5 text-[11px] text-[#fecdd3] transition-colors hover:border-[rgba(251,113,133,0.5)] hover:bg-[rgba(127,29,29,0.34)]"
+                >
+                  {errorInfo.actionLabel}
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+
         {/* Auto-approve toggle — only when pending */}
-        {isPending && onToggleAutoApprove && (
+        {isPending && onToggleAutoApprove && !isShellApprovalGated && (
           <div className="mt-2.5 pt-2.5 border-t border-[#27272a] flex items-center gap-2">
             <label className="flex items-center gap-2 cursor-pointer select-none group">
               <input
@@ -262,10 +331,10 @@ export default function ActionCard({ blockId, toolName, target, toolStatus, mess
             </div>
           )}
 
-        {/* Expandable message area for executed/rejected — terminal styling for commands */}
-        {message && !isPending && (() => {
+        {/* Expandable message area — pending cards may include permission preflight details. */}
+        {message && (() => {
           const isTerminal = toolName === 'execute_command' || toolName === 'send_pty_input' || toolName === 'run_command' || toolName === 'read_pty_buffer' || toolName === 'read_pty_tail' || toolName === 'read_pty_since' || toolName === 'get_pty_status' || toolName === 'clear_pty_buffer';
-          const cleanMessage = isTerminal ? stripAnsi(message) : sanitizeAIOutput(message);
+          const cleanMessage = isSystemErrorCard || isTerminal ? stripAnsi(message) : sanitizeAIOutput(message);
           return (
             <div className="mt-3 pt-3 border-t border-[#27272a]">
               <pre className={`whitespace-pre-wrap break-all max-h-[200px] overflow-y-auto ${

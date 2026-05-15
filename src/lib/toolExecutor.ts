@@ -30,6 +30,7 @@ import {
   readDocument,
   writeChatTempFile,
   writeFile,
+  type ShellPermissionApproval,
 } from "./ipc";
 import { isChatAttachmentPath } from "./attachments";
 import { invoke } from "@tauri-apps/api/core";
@@ -126,6 +127,7 @@ function buildChatTempSuccessMessage(
 
 export interface ToolExecutionOptions {
   allowExternalLocalRead?: boolean;
+  shellPermissionApproval?: ShellPermissionApproval;
 }
 
 async function prepareExternalLocalReadArgs(
@@ -321,11 +323,11 @@ export async function executeTool(
       let beforeOffset = 0;
       try {
         beforeOffset = (await getPtyStatus(sessionKey)).bufferEndOffset;
-        await writePty(command + "\n", sessionKey);
+        await writePty(command + "\n", sessionKey, options.shellPermissionApproval);
       } catch {
         await spawnPty(140, 40, sessionKey, workspace);
         beforeOffset = (await getPtyStatus(sessionKey)).bufferEndOffset;
-        await writePty(command + "\n", sessionKey);
+        await writePty(command + "\n", sessionKey, options.shellPermissionApproval);
       }
       await sleep(waitMs);
       const output = await readPtySince(beforeOffset, maxChars, sessionKey);
@@ -391,6 +393,7 @@ export async function executeTool(
         parseOptionalString(args.input),
         parseOptionalNumber(args.timeout_ms),
         workspace,
+        options.shellPermissionApproval,
       );
     }
 
