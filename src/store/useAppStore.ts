@@ -658,13 +658,13 @@ export function normalizeThemeMode(value: unknown): ThemeMode {
 // ── Themes ───────────────────────────────────────────────────────────
 
 export const THEMES = {
-  blue:   { accent: '#007acc', hover: '#005f9e', light: '#3b82f6', subtle: 'rgba(0,122,204,0.15)',   subtleBorder: 'rgba(0,122,204,0.3)',   name: 'VS Code Blue' },
-  purple: { accent: '#9333ea', hover: '#7e22ce', light: '#a855f7', subtle: 'rgba(147,51,234,0.15)',  subtleBorder: 'rgba(147,51,234,0.3)',  name: 'Amethyst' },
-  green:  { accent: '#059669', hover: '#047857', light: '#10b981', subtle: 'rgba(5,150,105,0.15)',   subtleBorder: 'rgba(5,150,105,0.3)',   name: 'Matrix Green' },
-  yellow: { accent: '#ca8a04', hover: '#a16207', light: '#eab308', subtle: 'rgba(202,138,4,0.15)',   subtleBorder: 'rgba(202,138,4,0.3)',   name: 'Sublime Gold' },
-  rose:   { accent: '#e11d48', hover: '#be123c', light: '#fb7185', subtle: 'rgba(225,29,72,0.15)',   subtleBorder: 'rgba(225,29,72,0.3)',   name: 'Ruby Red' },
-  hermesOrange: { accent: '#F37021', hover: '#D85F16', light: '#FB923C', subtle: 'rgba(243,112,33,0.15)', subtleBorder: 'rgba(243,112,33,0.32)', name: 'Hermes Orange' },
-  tiffanyBlue: { accent: '#81D8D0', hover: '#5EC7BD', light: '#A8EEE8', subtle: 'rgba(129,216,208,0.16)', subtleBorder: 'rgba(129,216,208,0.34)', name: 'Tiffany Blue' },
+  blue:   { accent: '#007acc', hover: '#005f9e', light: '#3b82f6', subtle: 'rgba(0,122,204,0.15)',   subtleBorder: 'rgba(0,122,204,0.3)',   contrast: '#ffffff', name: 'VS Code Blue' },
+  purple: { accent: '#9333ea', hover: '#7e22ce', light: '#a855f7', subtle: 'rgba(147,51,234,0.15)',  subtleBorder: 'rgba(147,51,234,0.3)',  contrast: '#ffffff', name: 'Amethyst' },
+  green:  { accent: '#059669', hover: '#047857', light: '#10b981', subtle: 'rgba(5,150,105,0.15)',   subtleBorder: 'rgba(5,150,105,0.3)',   contrast: '#ffffff', name: 'Matrix Green' },
+  yellow: { accent: '#ca8a04', hover: '#a16207', light: '#eab308', subtle: 'rgba(202,138,4,0.15)',   subtleBorder: 'rgba(202,138,4,0.3)',   contrast: '#111827', name: 'Sublime Gold' },
+  rose:   { accent: '#e11d48', hover: '#be123c', light: '#fb7185', subtle: 'rgba(225,29,72,0.15)',   subtleBorder: 'rgba(225,29,72,0.3)',   contrast: '#ffffff', name: 'Ruby Red' },
+  hermesOrange: { accent: '#F37021', hover: '#D85F16', light: '#FB923C', subtle: 'rgba(243,112,33,0.15)', subtleBorder: 'rgba(243,112,33,0.32)', contrast: '#111827', name: 'Hermes Orange' },
+  tiffanyBlue: { accent: '#81D8D0', hover: '#5EC7BD', light: '#A8EEE8', subtle: 'rgba(129,216,208,0.16)', subtleBorder: 'rgba(129,216,208,0.34)', contrast: '#063433', name: 'Tiffany Blue' },
 } as const;
 
 export type ThemeKey = keyof typeof THEMES;
@@ -1278,6 +1278,7 @@ interface AppState {
       suppressGameStudioSuggestion?: boolean;
       turnTitle?: string;
       intentSummary?: string;
+      uiParentTurnId?: string;
       contextMentionsSnapshot?: string[];
       attachedFilesSnapshot?: Array<AttachedFile | string>;
       remoteFeishu?: FeishuRemoteContext;
@@ -4955,12 +4956,18 @@ export const useAppStore = create<AppState>()(
         approved: s.isPlanApproved,
       });
 
+      const shouldAutoOpenPlanPanel = !s.isPlanApproved && s.planStage !== "executing";
+
       return {
         planArtifacts: nextArtifacts.sort((a, b) => a.updatedAt - b.updatedAt),
         planStage: nextStage,
         planTasks: normalizedTasks,
-        showPlanPanel: true,
-        rightPanelTab: s.showDiff && s.rightPanelTab === "diff" ? "diff" as const : "plan" as const,
+        ...(shouldAutoOpenPlanPanel
+          ? {
+              showPlanPanel: true,
+              rightPanelTab: s.showDiff && s.rightPanelTab === "diff" ? "diff" as const : "plan" as const,
+            }
+          : {}),
       };
     }),
   clearPlanArtifacts: () =>
@@ -5047,10 +5054,6 @@ export const useAppStore = create<AppState>()(
           agentStatus: "running",
           isGenerating: true,
           planStage: "executing",
-          showPlanPanel: true,
-          showDiff: false,
-          showTerminal: false,
-          rightPanelTab: "plan",
         });
         if (approvedTurnId) {
           get().setConversationTurnStatus(approvedTurnId, "executing");
@@ -5067,10 +5070,6 @@ export const useAppStore = create<AppState>()(
         planAutoResumeCount: 0,
         planExecutionProgressSnapshot: initialProgressSnapshot,
         planStage: "executing",
-        showPlanPanel: true,
-        showDiff: false,
-        showTerminal: false,
-        rightPanelTab: "plan",
       });
 
       runAfterNextPaint(() => {
@@ -5125,8 +5124,6 @@ export const useAppStore = create<AppState>()(
       agentStatus: "idle",
       isGenerating: false,
       abortController: null,
-      showPlanPanel: state.planArtifacts.length > 0 || state.planStage !== "idle" ? true : state.showPlanPanel,
-      rightPanelTab: state.planArtifacts.length > 0 || state.planStage !== "idle" ? "plan" : state.rightPanelTab,
     });
     if (state.currentTurnId) {
       get().setConversationTurnStatus(state.currentTurnId, "stopped_no_action");
@@ -5209,6 +5206,7 @@ export const useAppStore = create<AppState>()(
     if (!state.pendingReviewResolve || state.pendingReviewTaskId !== taskId) return;
 
     const resolve = state.pendingReviewResolve;
+    const reviewTurnId = state.taskFlow.find((block) => block.id === taskId)?.turnId || state.currentTurnId;
     const localFileReadPath = normalizeLocalFileReadPath(state.pendingToolCall?.localFileReadPath);
     const shellDecision = state.pendingToolCall?.shellPermissionDecision || null;
     const shellApproval = shellDecision?.requiresApproval
@@ -5225,8 +5223,6 @@ export const useAppStore = create<AppState>()(
       pendingReviewResolve: null,
       pendingReviewTaskId: null,
       pendingToolCall: null,
-      selectedDiffTaskId: s.selectedDiffTaskId === taskId ? null : s.selectedDiffTaskId,
-      showDiff: false,
       agentStatus: "running",
       isGenerating: true,
       taskFlow: s.taskFlow.map((task) =>
@@ -5242,6 +5238,9 @@ export const useAppStore = create<AppState>()(
     }));
     if (state.currentTurnId) {
       get().setConversationTurnStatus(state.currentTurnId, "executing");
+    }
+    if (reviewTurnId && reviewTurnId !== state.currentTurnId) {
+      get().setConversationTurnStatus(reviewTurnId, "executing");
     }
     runAfterNextPaint(() => {
       resolve({
@@ -5401,6 +5400,7 @@ export const useAppStore = create<AppState>()(
     suppressGameStudioSuggestion?: boolean;
     turnTitle?: string;
     intentSummary?: string;
+    uiParentTurnId?: string;
     contextMentionsSnapshot?: string[];
     attachedFilesSnapshot?: Array<AttachedFile | string>;
     remoteFeishu?: FeishuRemoteContext;
@@ -5415,6 +5415,10 @@ export const useAppStore = create<AppState>()(
       activeProfile: state.config.activeProfile,
     });
     const isHidden = options?.hidden === true;
+    const requestedUiParentTurnId = options?.uiParentTurnId || null;
+    const uiParentTurnId = requestedUiParentTurnId && state.conversationTurns.some((turn) => turn.id === requestedUiParentTurnId)
+      ? requestedUiParentTurnId
+      : null;
     const suppressThoughtOutput = state.config.thinkingPolicy === "action_only";
     const mentionSnapshot = options?.contextMentionsSnapshot ?? state.contextMentions;
     const attachedFilesSnapshot = options?.attachedFilesSnapshot ?? state.attachedFiles;
@@ -5466,6 +5470,7 @@ export const useAppStore = create<AppState>()(
     const reuseCurrentTurn =
       (options?.reuseCurrentTurn === true || shouldAutoResumeChoiceTurn || shouldContinuePlanIntent || shouldContinuePreviousTurnIntent) &&
       !!reusableTurnId;
+    const isInternalTurn = isHidden && !reuseCurrentTurn;
     const shouldReuseExistingTurnIntent =
       reuseCurrentTurn &&
       !!currentTurn &&
@@ -6011,6 +6016,7 @@ export const useAppStore = create<AppState>()(
             {
               hidden: true,
               reuseCurrentTurn: false,
+              uiParentTurnId: state.currentTurnId || undefined,
               preservePlanState: true,
               resolvedIntent: "plan",
               runtimeIntentOverride: "execute",
@@ -6476,6 +6482,7 @@ export const useAppStore = create<AppState>()(
 
     const nextId = sessionGet()._nextTaskId;
     const turnId = reuseCurrentTurn ? reusableTurnId! : `turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const uiDisplayTurnId = uiParentTurnId || turnId;
     const currentImages = images || [];
     const userContextItems = buildUserContextItems({
       contextMentions: mentionSnapshot,
@@ -6844,13 +6851,18 @@ export const useAppStore = create<AppState>()(
 		          }
 		        : {
 		            conversationTurns: [
-		              ...autoCollapsePreviousTurnForNewTurn(s.conversationTurns),
+		              ...autoCollapsePreviousTurnForNewTurn(s.conversationTurns).map((turn) =>
+                    uiParentTurnId && turn.id === uiParentTurnId
+                      ? { ...turn, status: initialTurnStatus, intent: turn.intent || effectiveRunIntent }
+                      : turn,
+                  ),
 		              {
 		                id: turnId,
 		                userPrompt: text,
 		                title: turnTitle,
 	                intentSummary: effectiveIntentSummary,
 	                commandDirective: effectiveCommandDirective || undefined,
+	                uiVisibility: isInternalTurn ? "internal" : "visible",
 	                mode: effectiveWorkflowMode,
 	                intent: effectiveRunIntent,
 	                status: initialTurnStatus,
@@ -7506,14 +7518,15 @@ export const useAppStore = create<AppState>()(
 
       // 将新产生的可视块自动挂到当前回合，避免聊天区之后再靠扫描推断归属。
       const appendTurnBlock = (block: TaskBlock) => {
-        const blockWithTurn: TaskBlock = { ...block, turnId: block.turnId ?? turnId };
+        const targetTurnId = block.turnId && block.turnId !== turnId ? block.turnId : uiDisplayTurnId;
+        const blockWithTurn: TaskBlock = { ...block, turnId: targetTurnId };
         if (blockWithTurn.type === "agent") {
           agentBlockIdsCreatedThisRun.add(blockWithTurn.id);
         }
         sessionSet((s) => ({
           taskFlow: [...s.taskFlow, blockWithTurn],
           conversationTurns: s.conversationTurns.map((turn) =>
-            turn.id === turnId && !turn.blockIds.includes(blockWithTurn.id)
+            turn.id === targetTurnId && !turn.blockIds.includes(blockWithTurn.id)
               ? { ...turn, blockIds: [...turn.blockIds, blockWithTurn.id] }
               : turn
           ),
@@ -7854,44 +7867,20 @@ export const useAppStore = create<AppState>()(
         const language = sessionGet().preferredResponseLanguage || sessionGet().config.language;
         const content = formatPlanExecutionProgressSnapshot(snapshot, language === "en" ? "en" : "zh").trim();
         if (!content) return;
-        sessionSet((s) => {
-          const existingIndex = s.taskFlow.findIndex((block) =>
-            block.turnId === turnId &&
-            block.type === "system" &&
-            block.variant === "plan_execution_progress"
-          );
-          if (existingIndex >= 0) {
-            const nextFlow = [...s.taskFlow];
-            nextFlow[existingIndex] = {
-              ...nextFlow[existingIndex],
-              content,
-              planExecutionProgress: snapshot,
-            } as TaskBlock;
-            return {
-              taskFlow: nextFlow,
-              planExecutionProgressSnapshot: snapshot,
-            };
-          }
-
-          const blockId = nextId();
-          const block: TaskBlock = {
-            id: blockId,
-            turnId,
-            type: "system",
-            content,
-            variant: "plan_execution_progress",
-            planExecutionProgress: snapshot,
-          };
-          return {
-            taskFlow: [...s.taskFlow, block],
-            planExecutionProgressSnapshot: snapshot,
-            conversationTurns: s.conversationTurns.map((turn) =>
-              turn.id === turnId && !turn.blockIds.includes(blockId)
-                ? { ...turn, blockIds: [...turn.blockIds, blockId] }
-                : turn
-            ),
-          };
+        appendDebugLog("info", "plan.execution_progress", {
+          turnId,
+          uiDisplayTurnId,
+          phase: snapshot.phase,
+          iteration: snapshot.iteration,
+          maxIterations: snapshot.maxIterations,
+          autoResumeCount: snapshot.autoResumeCount,
+          currentTask: snapshot.currentTask,
+          currentTool: snapshot.currentTool,
+          latestEvidence: snapshot.latestEvidence,
+          nextStep: snapshot.nextStep,
+          content,
         });
+        sessionSet({ planExecutionProgressSnapshot: snapshot });
       };
 
       const emitLocalPlanExecutionProgress = (
@@ -8605,13 +8594,12 @@ export const useAppStore = create<AppState>()(
                 isPlanApproved: state.isPlanApproved,
               });
               if (!isApprovedPlanExecution) {
-                logStoreEvent("plan_panel_open_for_review", {
+                logStoreEvent("plan_review_prompt_shown", {
                   turnId,
                   effectiveRunIntent,
                   planArtifacts: state.planArtifacts.length,
                   planStage: state.planStage,
                 });
-                state.openRightPanelTab("plan");
                 emitLocalPlanExecutionProgress("waiting_review", {
                   nextStep: state.config.language === "en"
                     ? "wait for approval of the pending tool call"
@@ -8661,6 +8649,9 @@ export const useAppStore = create<AppState>()(
                 ? "planning"
                 : "executing";
             sessionGet().setConversationTurnStatus(turnId, nextTurnStatus);
+            if (uiDisplayTurnId !== turnId) {
+              sessionGet().setConversationTurnStatus(uiDisplayTurnId, nextTurnStatus);
+            }
           }
           if (
             status === "idle" &&
@@ -8772,21 +8763,33 @@ export const useAppStore = create<AppState>()(
             agentMessages: sessionGet().agentMessages.length,
           });
           if (isApprovedExecutionPause) {
+            appendDebugLog("warn", "plan.non_actionable_stop", {
+              turnId,
+              uiDisplayTurnId,
+              reason,
+              message,
+            });
             emitLocalPlanExecutionProgress("paused", {
               nextStep: sessionGet().config.language === "en"
                 ? "resume from the current workspace state"
                 : "基于当前 workspace 状态恢复执行",
             });
           }
+          const language = sessionGet().config.language === "en" ? "en" : "zh";
+          const visibleMessage = isApprovedExecutionPause
+            ? language === "en"
+              ? "Plan execution paused. MAIN kept the current workspace state; use Resume Execution to continue from here."
+              : "计划执行已暂停。MAIN 已保留当前 workspace 状态；可使用 Resume Execution 从这里继续。"
+            : message;
           const block: TaskBlock = {
             id: nextId(),
             turnId,
             type: "system",
-            content: message,
+            content: visibleMessage,
             ...(isApprovedExecutionPause ? { variant: "plan_execution_checkpoint" as const } : {}),
           };
           appendTurnBlock(block);
-          sessionGet().setConversationTurnSummary(turnId, summarizeAssistantText(message));
+          sessionGet().setConversationTurnSummary(uiDisplayTurnId, summarizeAssistantText(visibleMessage));
         },
 
         onPlanArtifactUpdated: (path, content, kind) => {
@@ -8832,7 +8835,7 @@ export const useAppStore = create<AppState>()(
             updatedAt: Date.now(),
           });
           const latest = sessionGet();
-          if (!(latest.showDiff && latest.rightPanelTab === "diff")) {
+          if (!latest.isPlanApproved && latest.planStage !== "executing" && !(latest.showDiff && latest.rightPanelTab === "diff")) {
             latest.openRightPanelTab("plan");
           }
         },
@@ -8871,7 +8874,7 @@ export const useAppStore = create<AppState>()(
           sessionGet().setPlanStage(nextStage);
           if (nextStage !== "idle") {
             const latest = sessionGet();
-            if (!(latest.showDiff && latest.rightPanelTab === "diff")) {
+            if (!latest.isPlanApproved && nextStage !== "executing" && !(latest.showDiff && latest.rightPanelTab === "diff")) {
               latest.openRightPanelTab("plan");
             }
           }
@@ -8899,6 +8902,12 @@ export const useAppStore = create<AppState>()(
           const notice = shouldAutoResume
             ? buildPlanMaxIterationsAutoResumeNotice(effectiveCheckpoint, language)
             : buildPlanMaxIterationsPauseNotice(effectiveCheckpoint, language);
+          appendDebugLog(shouldAutoResume ? "info" : "warn", shouldAutoResume ? "plan.max_iterations_auto_resume" : "plan.max_iterations_paused", {
+            turnId,
+            uiDisplayTurnId,
+            checkpoint: effectiveCheckpoint,
+            notice,
+          });
           const progressSnapshot = normalizePlanExecutionProgressSnapshot({
             turnId,
             update: buildPlanExecutionProgressUpdate({
@@ -8923,32 +8932,32 @@ export const useAppStore = create<AppState>()(
             now: Date.now(),
           });
           writePlanExecutionProgress(progressSnapshot);
-          const blockId = nextId();
+          const visibleNotice = shouldAutoResume
+            ? ""
+            : language === "zh"
+            ? "计划执行已暂停：已达到安全轮次边界。MAIN 已保留当前 workspace 状态；可使用 Resume Execution 从这里继续。"
+            : "Plan execution paused after reaching the safety boundary. MAIN kept the current workspace state; use Resume Execution to continue from here.";
 
           sessionSet((s) => ({
             planAutoResumeCount: effectiveCheckpoint.autoResumeCount,
             planExecutionProgressSnapshot: progressSnapshot,
             planStage: s.planStage === "completed" ? "completed" : "executing",
-            showPlanPanel: true,
-            showDiff: false,
-            rightPanelTab: "plan",
-            taskFlow: [
-              ...s.taskFlow,
-              {
-                id: blockId,
-                turnId,
-                type: "system",
-                content: notice,
-                variant: "plan_execution_checkpoint",
-              } as TaskBlock,
-            ],
             conversationTurns: s.conversationTurns.map((turn) =>
-              turn.id === turnId && !turn.blockIds.includes(blockId)
-                ? { ...turn, blockIds: [...turn.blockIds, blockId], status: "stopped_no_action", collapsed: false }
+              turn.id === uiDisplayTurnId
+                ? { ...turn, status: shouldAutoResume ? "executing" : "stopped_no_action", collapsed: shouldAutoResume ? turn.collapsed : false }
                 : turn
             ),
           }));
-          sessionGet().setConversationTurnSummary(turnId, summarizeAssistantText(notice));
+          if (!shouldAutoResume) {
+            appendTurnBlock({
+              id: nextId(),
+              turnId: uiDisplayTurnId,
+              type: "system",
+              content: visibleNotice,
+              variant: "plan_execution_checkpoint",
+            });
+            sessionGet().setConversationTurnSummary(uiDisplayTurnId, summarizeAssistantText(visibleNotice));
+          }
 
           if (!shouldAutoResume) {
             logStoreEvent("plan_max_iterations_paused", {
@@ -8995,6 +9004,7 @@ export const useAppStore = create<AppState>()(
               {
                 hidden: true,
                 reuseCurrentTurn: false,
+                uiParentTurnId: turnId,
                 preservePlanState: true,
                 resolvedIntent: "plan",
                 skipIntentResolution: true,
@@ -9020,27 +9030,36 @@ export const useAppStore = create<AppState>()(
           const notice = shouldAutoResume
             ? buildExecuteMaxIterationsAutoResumeNotice(effectiveCheckpoint, language)
             : buildExecuteMaxIterationsPauseNotice(effectiveCheckpoint, language);
-          const blockId = nextId();
+          appendDebugLog(shouldAutoResume ? "info" : "warn", shouldAutoResume ? "execute.max_iterations_auto_resume" : "execute.max_iterations_paused", {
+            turnId,
+            uiDisplayTurnId,
+            checkpoint: effectiveCheckpoint,
+            notice,
+          });
+          const visibleNotice = shouldAutoResume
+            ? ""
+            : language === "zh"
+            ? "执行已暂停：本轮达到安全边界。MAIN 已保留当前 workspace 状态；可继续执行以从这里恢复。"
+            : "Execution paused after reaching the safety boundary. MAIN kept the current workspace state; continue execution to resume from here.";
 
           sessionSet((s) => ({
             planAutoResumeCount: effectiveCheckpoint.autoResumeCount,
-            taskFlow: [
-              ...s.taskFlow,
-              {
-                id: blockId,
-                turnId,
-                type: "system",
-                content: notice,
-                variant: "execution_checkpoint",
-              } as TaskBlock,
-            ],
             conversationTurns: s.conversationTurns.map((turn) =>
-              turn.id === turnId && !turn.blockIds.includes(blockId)
-                ? { ...turn, blockIds: [...turn.blockIds, blockId], status: "stopped_no_action", collapsed: false }
+              turn.id === uiDisplayTurnId
+                ? { ...turn, status: shouldAutoResume ? "executing" : "stopped_no_action", collapsed: shouldAutoResume ? turn.collapsed : false }
                 : turn
             ),
           }));
-          sessionGet().setConversationTurnSummary(turnId, summarizeAssistantText(notice));
+          if (!shouldAutoResume) {
+            appendTurnBlock({
+              id: nextId(),
+              turnId: uiDisplayTurnId,
+              type: "system",
+              content: visibleNotice,
+              variant: "execution_checkpoint",
+            });
+            sessionGet().setConversationTurnSummary(uiDisplayTurnId, summarizeAssistantText(visibleNotice));
+          }
 
           if (!shouldAutoResume) {
             logStoreEvent("execute_max_iterations_paused", {
@@ -9079,6 +9098,7 @@ export const useAppStore = create<AppState>()(
               {
                 hidden: true,
                 reuseCurrentTurn: false,
+                uiParentTurnId: turnId,
                 // Keep the recovery counter across the hidden Execute resume.
                 // The visible Execute request already reset any stale plan state.
                 preservePlanState: true,
@@ -9363,7 +9383,7 @@ export const useAppStore = create<AppState>()(
                       });
                   const block: TaskBlock = {
                     id: reviewTaskId,
-                    turnId,
+                    turnId: uiDisplayTurnId,
                     type: "tool",
                     toolName,
                     target,
@@ -9377,14 +9397,11 @@ export const useAppStore = create<AppState>()(
                   sessionSet((s) => ({
                     taskFlow: [...s.taskFlow, block],
                     conversationTurns: s.conversationTurns.map((turn) =>
-                      turn.id === turnId && !turn.blockIds.includes(block.id)
+                      turn.id === uiDisplayTurnId && !turn.blockIds.includes(block.id)
                         ? { ...turn, blockIds: [...turn.blockIds, block.id] }
                         : turn
                     ),
                     selectedDiffTaskId: diff ? reviewTaskId : s.selectedDiffTaskId,
-                    showDiff: !!diff,
-                    showPlanPanel: false,
-                    rightPanelTab: diff ? "diff" : s.rightPanelTab,
                     pendingReviewResolve: resolve,
                     pendingReviewTaskId: reviewTaskId,
                     pendingToolCall: {
@@ -9414,7 +9431,7 @@ export const useAppStore = create<AppState>()(
                   });
               const block: TaskBlock = {
                 id: reviewTaskId,
-                turnId,
+                turnId: uiDisplayTurnId,
                 type: "tool",
                 toolName,
                 target,
@@ -9428,14 +9445,11 @@ export const useAppStore = create<AppState>()(
               sessionSet((s) => ({
                 taskFlow: [...s.taskFlow, block],
                 conversationTurns: s.conversationTurns.map((turn) =>
-                  turn.id === turnId && !turn.blockIds.includes(block.id)
+                  turn.id === uiDisplayTurnId && !turn.blockIds.includes(block.id)
                     ? { ...turn, blockIds: [...turn.blockIds, block.id] }
                     : turn
                 ),
                 selectedDiffTaskId: diff ? reviewTaskId : s.selectedDiffTaskId,
-                showDiff: !!diff,
-                showPlanPanel: false,
-                rightPanelTab: diff ? "diff" : s.rightPanelTab,
                 pendingReviewResolve: resolve,
                 pendingReviewTaskId: reviewTaskId,
                 pendingToolCall: {

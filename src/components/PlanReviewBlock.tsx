@@ -78,11 +78,11 @@ export default function PlanReviewBlock({ segments, onApprove, onReject }: PlanR
   });
 
   return (
-    <div className="w-full max-w-3xl mx-auto my-3 rounded-xl border border-[rgba(124,58,237,0.35)] bg-[#0c0a1a] shadow-[0_0_24px_rgba(124,58,237,0.12)] overflow-hidden">
+    <div className="theme-plan-surface w-full max-w-3xl mx-auto my-3 rounded-xl border shadow-[0_0_24px_var(--accent-subtle)] overflow-hidden">
       {/* ── Header ── */}
-      <div className="flex items-center justify-between px-5 py-3 border-b border-[rgba(124,58,237,0.2)] bg-[rgba(124,58,237,0.06)]">
+      <div className="theme-plan-surface flex items-center justify-between px-5 py-3 border-b">
         <div className="flex items-center gap-2.5">
-          <svg className="w-4 h-4 text-[#a78bfa]" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <svg className="theme-plan-text w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
             <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
             <polyline points="14 2 14 8 20 8" />
             <line x1="16" y1="13" x2="8" y2="13" />
@@ -105,13 +105,10 @@ export default function PlanReviewBlock({ segments, onApprove, onReject }: PlanR
               <div className="space-y-3">
                 {/* Progress bar */}
                 <div className="flex items-center gap-3">
-                  <div className="flex-1 h-1.5 rounded-full bg-[#1e1b2e] overflow-hidden">
+                  <div className="flex-1 h-1.5 rounded-full bg-[#18181b] overflow-hidden">
                     <div
-                      className="h-full rounded-full transition-all duration-500"
-                      style={{
-                        width: `${progressPct}%`,
-                        background: "linear-gradient(90deg, #7c3aed, #a78bfa)",
-                      }}
+                      className="theme-plan-progress h-full rounded-full transition-all duration-500"
+                      style={{ width: `${progressPct}%` }}
                     />
                   </div>
                   <span className="text-[11px] text-[#a1a1aa] font-medium tabular-nums shrink-0">
@@ -124,9 +121,9 @@ export default function PlanReviewBlock({ segments, onApprove, onReject }: PlanR
                   {tasks.map((task, i) => (
                     <div
                       key={i}
-                      className="flex items-start gap-2.5 px-3 py-2 rounded-lg bg-[#0f0d1a] border border-[rgba(124,58,237,0.12)]"
+                      className="theme-plan-surface flex items-start gap-2.5 px-3 py-2 rounded-lg border"
                     >
-                      <div className={`mt-0.5 w-4 h-4 rounded flex items-center justify-center shrink-0 border transition-colors ${task.done ? 'bg-[#7c3aed] border-[#7c3aed]' : 'border-[#3f3f46] bg-transparent'}`}>
+                      <div className={`mt-0.5 w-4 h-4 rounded flex items-center justify-center shrink-0 border transition-colors ${task.done ? 'theme-bg theme-border' : 'border-[#3f3f46] bg-transparent'}`}>
                         {task.done && (
                           <svg className="w-2.5 h-2.5 text-white" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
                             <polyline points="20 6 9 17 4 12" />
@@ -181,7 +178,7 @@ export default function PlanReviewBlock({ segments, onApprove, onReject }: PlanR
       </div>
 
       {/* ── Footer ── */}
-      <div className="flex items-center justify-end gap-3 px-5 py-3.5 border-t border-[rgba(124,58,237,0.2)] bg-[rgba(124,58,237,0.04)]">
+      <div className="theme-plan-surface flex items-center justify-end gap-3 px-5 py-3.5 border-t">
         <button
           onClick={onReject}
           className="px-4 py-2 text-[12px] font-semibold rounded-lg border border-[#3f3f46] bg-[#09090b] text-[#a1a1aa] hover:bg-[#18181b] hover:text-[#e4e4e7] transition-colors"
@@ -190,10 +187,7 @@ export default function PlanReviewBlock({ segments, onApprove, onReject }: PlanR
         </button>
         <button
           onClick={onApprove}
-          className="flex items-center gap-2 px-5 py-2 text-[12px] font-bold rounded-lg text-white transition-all hover:scale-[1.03] shadow-[0_0_16px_rgba(124,58,237,0.35)]"
-          style={{
-            background: "linear-gradient(135deg, #7c3aed, #6d28d9)",
-          }}
+          className="theme-plan-primary flex items-center gap-2 px-5 py-2 text-[12px] font-bold rounded-lg transition-all hover:scale-[1.03] shadow-[0_0_16px_var(--accent-subtle)]"
         >
           <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
             <polygon points="5 3 19 12 5 21 5 3" />

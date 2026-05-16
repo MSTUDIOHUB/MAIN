@@ -14,8 +14,8 @@ export default function ThemeStyles() {
       :root { --inline-chip-text: #f5f5f5; }
       html[data-theme="light"] { --inline-chip-text: #09090b; }
       html[data-theme="black"] { --inline-chip-text: #ffffff; }
-      .theme-bg { background-color: var(--accent) !important; color: white !important; }
-      .theme-bg-hover:hover { background-color: var(--accent-hover) !important; color: white !important; }
+      .theme-bg { background-color: var(--accent) !important; color: var(--accent-contrast, #ffffff) !important; }
+      .theme-bg-hover:hover { background-color: var(--accent-hover) !important; color: var(--accent-contrast, #ffffff) !important; }
       .theme-text { color: var(--accent-light) !important; }
       .theme-border { border-color: var(--accent) !important; }
       .theme-subtle-bg { background-color: var(--accent-subtle) !important; color: var(--accent-light) !important; }
@@ -23,6 +23,47 @@ export default function ThemeStyles() {
       .theme-glow { box-shadow: 0 0 8px var(--accent-subtle) !important; }
       .theme-slider { accent-color: var(--accent) !important; }
       .theme-ring:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+      .theme-plan-surface {
+        border-color: color-mix(in srgb, var(--accent-light) 30%, transparent) !important;
+        background: color-mix(in srgb, var(--accent) 10%, transparent) !important;
+      }
+      .theme-plan-pill {
+        border-color: color-mix(in srgb, var(--accent-light) 34%, transparent) !important;
+        background: color-mix(in srgb, var(--accent) 14%, transparent) !important;
+        color: var(--accent-light) !important;
+      }
+      .theme-plan-text {
+        color: var(--accent-light) !important;
+      }
+      .theme-plan-button {
+        border-color: color-mix(in srgb, var(--accent-light) 34%, transparent) !important;
+        background: color-mix(in srgb, var(--accent) 16%, transparent) !important;
+        color: var(--accent-light) !important;
+      }
+      .theme-plan-button:hover {
+        border-color: color-mix(in srgb, var(--accent-light) 48%, transparent) !important;
+        background: color-mix(in srgb, var(--accent) 24%, transparent) !important;
+      }
+      .theme-plan-primary {
+        background: linear-gradient(135deg, var(--accent), var(--accent-hover)) !important;
+        color: var(--accent-contrast, #ffffff) !important;
+      }
+      .theme-plan-progress {
+        background: linear-gradient(90deg, var(--accent), var(--accent-light)) !important;
+      }
+      html[data-theme="light"] .theme-plan-surface {
+        border-color: color-mix(in srgb, var(--accent-hover) 30%, #ffffff 70%) !important;
+        background: color-mix(in srgb, var(--accent) 10%, #ffffff 90%) !important;
+      }
+      html[data-theme="light"] .theme-plan-pill,
+      html[data-theme="light"] .theme-plan-text,
+      html[data-theme="light"] .theme-plan-button {
+        color: color-mix(in srgb, var(--accent-hover), #111827 22%) !important;
+      }
+      html[data-theme="black"] .theme-plan-surface {
+        border-color: color-mix(in srgb, var(--accent-light) 28%, transparent) !important;
+        background: color-mix(in srgb, var(--accent) 9%, #000000 91%) !important;
+      }
       html[data-theme="light"] .theme-text { color: color-mix(in srgb, var(--accent-hover), #111827 28%) !important; }
       html[data-theme="light"] .theme-subtle-bg { color: color-mix(in srgb, var(--accent-hover), #111827 28%) !important; }
       .panel-tab-icon-button {

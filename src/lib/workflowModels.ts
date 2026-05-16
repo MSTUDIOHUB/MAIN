@@ -312,6 +312,7 @@ export interface ConversationTurn {
   title: string;
   intentSummary?: string;
   commandDirective?: CommandDirective | null;
+  uiVisibility?: "visible" | "internal";
   mode: LegacyWorkflowMode;
   intent?: ResolvedRunIntent;
   status: ConversationTurnStatus;

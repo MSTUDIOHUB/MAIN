@@ -14,6 +14,7 @@ interface TopIslandProps {
   themeMode: "light" | "dark" | "black";
   chatFontSize?: number;
   isVisible?: boolean;
+  isRunActive?: boolean;
   planTasks: PlanTask[];
   planExecutionEvidenceLedger?: PlanExecutionEvidenceEntry[];
   planStage: PlanStage;
@@ -78,6 +79,7 @@ const TopIsland = memo(function TopIsland({
   themeMode,
   chatFontSize = 13,
   isVisible = true,
+  isRunActive = false,
   planTasks,
   planExecutionEvidenceLedger = [],
   planStage,
@@ -254,7 +256,7 @@ const TopIsland = memo(function TopIsland({
     : isBlackTheme
     ? "bg-[rgba(3,3,4,0.72)] border-[rgba(255,255,255,0.07)] shadow-[0_22px_70px_rgba(0,0,0,0.42)]"
     : "bg-[rgba(10,10,16,0.68)] border-[rgba(255,255,255,0.08)] shadow-[0_20px_60px_rgba(0,0,0,0.28)]";
-  const actionableOutline = actionable
+  const activeRunOutline = isRunActive
     ? "ring-1 ring-[var(--accent)] ring-offset-1 ring-offset-transparent"
     : "";
   const primaryText = themeMode === "light" ? "text-[#111827]" : "text-[#f5f5f5]";
@@ -336,9 +338,10 @@ const TopIsland = memo(function TopIsland({
       <div
         ref={shellRef}
         data-testid="top-island-shell"
+        data-run-active={isRunActive ? "true" : "false"}
         onMouseEnter={() => setHovered(true)}
         onMouseLeave={() => setHovered(false)}
-        className={`w-full overflow-hidden rounded-[28px] border backdrop-blur-2xl backdrop-saturate-150 transition-all duration-300 ease-out [&_button]:pointer-events-auto ${isVisible && !isPlanApprovalOnly ? "pointer-events-auto" : "pointer-events-none"} ${shouldExpandWidth ? "max-w-4xl" : "max-w-[580px]"} ${shellClass} ${actionableOutline}`}
+        className={`w-full overflow-hidden rounded-[28px] border backdrop-blur-2xl backdrop-saturate-150 transition-all duration-300 ease-out [&_button]:pointer-events-auto ${isVisible && !isPlanApprovalOnly ? "pointer-events-auto" : "pointer-events-none"} ${shouldExpandWidth ? "max-w-4xl" : "max-w-[580px]"} ${shellClass} ${activeRunOutline}`}
       >
         <div className="flex items-center justify-between gap-3 px-4 py-3">
           <div className="min-w-0 flex items-center gap-2">
@@ -346,12 +349,12 @@ const TopIsland = memo(function TopIsland({
             <span className={`truncate text-[13px] font-semibold ${primaryText}`}>{title}</span>
             <span className={`shrink-0 rounded-full border px-2 py-0.5 text-[10px] ${statusToneClass}`}>{status}</span>
             {hasTasks && (
-              <span data-testid={activeProgressMode === "execution" ? "top-island-execution-badge" : "top-island-plan-badge"} className="shrink-0 rounded-full border border-[rgba(124,58,237,0.2)] bg-[rgba(124,58,237,0.1)] px-2 py-0.5 text-[10px] text-[#c4b5fd]">
+              <span data-testid={activeProgressMode === "execution" ? "top-island-execution-badge" : "top-island-plan-badge"} className="theme-plan-pill shrink-0 rounded-full border px-2 py-0.5 text-[10px]">
                 {activeProgressMode === "execution" ? copy.steps : copy.tasks} {completedCount}/{progressItems.length}
               </span>
             )}
             {canApprovePlan && (
-              <span className="shrink-0 rounded-full border border-[rgba(251,191,36,0.25)] bg-[rgba(251,191,36,0.12)] px-2 py-0.5 text-[10px] text-[#fbbf24]">
+              <span className="theme-plan-pill shrink-0 rounded-full border px-2 py-0.5 text-[10px]">
                 {copy.waitingPlan}
               </span>
             )}
@@ -371,7 +374,7 @@ const TopIsland = memo(function TopIsland({
               </span>
             )}
             {!isExpanded && actionable && (
-              <span className="shrink-0 h-2 w-2 rounded-full bg-[var(--accent,#7c3aed)] animate-pulse" />
+              <span className="shrink-0 h-2 w-2 rounded-full bg-[var(--accent)] animate-pulse" />
             )}
           </div>
           <div className="flex shrink-0 items-center gap-2">
@@ -382,7 +385,7 @@ const TopIsland = memo(function TopIsland({
                   setManualChoiceCollapsedKey(null);
                   setPinnedOpen(true);
                 }}
-                className="rounded-full border border-[var(--accent-subtle-border)] bg-[var(--accent-subtle)] px-3 py-1 text-[11px] text-[var(--accent-light)] transition-colors hover:border-[var(--accent)] hover:bg-[var(--accent)] hover:text-white"
+                className="rounded-full border border-[var(--accent-subtle-border)] bg-[var(--accent-subtle)] px-3 py-1 text-[11px] text-[var(--accent-light)] transition-colors hover:border-[var(--accent)] hover:bg-[var(--accent)] hover:text-[var(--accent-contrast)]"
                 title={copy.showOptions}
               >
                 <span className="inline-flex items-center gap-1.5">
@@ -446,7 +449,7 @@ const TopIsland = memo(function TopIsland({
                         onClick={() => onResolvePendingRunDecision?.("approve_thread")}
                         className={`rounded-lg border px-4 py-2 text-[12px] font-medium transition-colors ${
                           autoApproveTools
-                            ? "border-[rgba(124,58,237,0.35)] bg-[rgba(124,58,237,0.14)] text-[#ddd6fe]"
+                            ? "theme-plan-button"
                             : "border-[#3f3f46] bg-[#09090b] text-[#a1a1aa] hover:bg-[#18181b] hover:text-[#f5f5f5]"
                         }`}
                       >
@@ -455,8 +458,7 @@ const TopIsland = memo(function TopIsland({
                       <button
                         data-testid="top-island-approve-once"
                         onClick={() => onResolvePendingRunDecision?.("approve_once")}
-                        className="rounded-lg px-4 py-2 text-[12px] font-semibold text-white"
-                        style={{ background: "linear-gradient(135deg, var(--accent, #7c3aed), #2563eb)" }}
+                        className="theme-plan-primary rounded-lg px-4 py-2 text-[12px] font-semibold"
                       >
                         {copy.approveExecuteOnce}
                       </button>
@@ -514,7 +516,7 @@ const TopIsland = memo(function TopIsland({
                     {activeProgressMode === "plan" && (
                       <button
                         onClick={onOpenPlan}
-                        className="rounded-full border border-[rgba(124,58,237,0.25)] bg-[rgba(124,58,237,0.14)] px-3 py-1 text-[11px] text-[#ddd6fe] transition-colors hover:bg-[rgba(124,58,237,0.22)]"
+                        className="theme-plan-button rounded-full border px-3 py-1 text-[11px] transition-colors"
                       >
                         <span className="inline-flex items-center gap-1.5">
                           <IconFileText className="h-3.5 w-3.5" />
@@ -526,8 +528,8 @@ const TopIsland = memo(function TopIsland({
                 </div>
                 <div className="mt-3 h-2 overflow-hidden rounded-full bg-[#18181b]">
                   <div
-                    className="h-full rounded-full transition-all duration-300"
-                    style={{ width: `${progress}%`, background: "linear-gradient(90deg, var(--accent, #7c3aed), #3b82f6)" }}
+                    className="theme-plan-progress h-full rounded-full transition-all duration-300"
+                    style={{ width: `${progress}%` }}
                   />
                 </div>
                 {shouldCompactTasksForReview && (
@@ -547,7 +549,7 @@ const TopIsland = memo(function TopIsland({
                         data-testid={isCurrentPlanTask ? "top-island-current-plan-task" : undefined}
                         className={`flex items-start gap-3 rounded-xl px-3 py-2 ${
                           isCurrentPlanTask
-                            ? "border border-[rgba(96,165,250,0.24)] bg-[rgba(37,99,235,0.14)]"
+                            ? "theme-plan-surface border"
                             : "bg-[rgba(0,0,0,0.18)]"
                         }`}
                       >
@@ -656,10 +658,9 @@ const TopIsland = memo(function TopIsland({
                             type="submit"
                             data-testid="top-island-custom-reply-submit"
                             disabled={!normalizedCustomReply || !onSelectReplyOption}
-                            className={`shrink-0 rounded-xl px-3 py-2.5 text-[12px] font-semibold transition-opacity ${
-                              normalizedCustomReply && onSelectReplyOption ? "text-white opacity-100" : "cursor-not-allowed text-white opacity-40"
+                            className={`theme-plan-primary shrink-0 rounded-xl px-3 py-2.5 text-[12px] font-semibold transition-opacity ${
+                              normalizedCustomReply && onSelectReplyOption ? "opacity-100" : "cursor-not-allowed opacity-40"
                             }`}
-                            style={{ background: "linear-gradient(135deg, var(--accent, #7c3aed), #2563eb)" }}
                           >
                             {copy.customChoiceSubmit}
                           </button>
@@ -707,19 +708,20 @@ const TopIsland = memo(function TopIsland({
                         {copy.reject}
                       </button>
                       <button
+                        data-testid="top-island-tool-approve-session"
                         onClick={() => onApproveDiffSession?.()}
                         className={`rounded-lg border px-4 py-2 text-[12px] font-medium transition-colors ${
                           autoApproveTools
-                            ? "border-[rgba(124,58,237,0.35)] bg-[rgba(124,58,237,0.14)] text-[#ddd6fe]"
+                            ? "theme-plan-button"
                             : "border-[#3f3f46] bg-[#09090b] text-[#a1a1aa] hover:bg-[#18181b] hover:text-[#f5f5f5]"
                         }`}
                       >
                         {copy.approveDiffSession}
                       </button>
                       <button
+                        data-testid="top-island-tool-approve-once"
                         onClick={() => onApproveDiffOnce?.()}
-                        className="rounded-lg px-4 py-2 text-[12px] font-semibold text-white"
-                        style={{ background: "linear-gradient(135deg, var(--accent, #7c3aed), #2563eb)" }}
+                        className="theme-plan-primary rounded-lg px-4 py-2 text-[12px] font-semibold"
                       >
                         {copy.approveDiffOnce}
                       </button>
@@ -771,7 +773,7 @@ const TopIsland = memo(function TopIsland({
                           disabled={!normalizedPlanAdjustment || !onRequestPlanAdjustment}
                           className={`shrink-0 rounded-lg border px-3 py-2 text-[12px] font-medium transition-colors ${
                             normalizedPlanAdjustment && onRequestPlanAdjustment
-                              ? "border-[rgba(96,165,250,0.28)] bg-[rgba(96,165,250,0.12)] text-[#bfdbfe] hover:bg-[rgba(96,165,250,0.2)]"
+                              ? "theme-plan-button"
                               : "cursor-not-allowed border-[#3f3f46] bg-[#09090b] text-[#71717a]"
                           }`}
                         >
@@ -787,8 +789,7 @@ const TopIsland = memo(function TopIsland({
                       <button
                         data-testid="top-island-plan-approve"
                         onClick={onApprovePlan}
-                        className="rounded-lg px-4 py-2 text-[12px] font-semibold text-white"
-                        style={{ background: "linear-gradient(135deg, var(--accent, #7c3aed), #2563eb)" }}
+                        className="theme-plan-primary rounded-lg px-4 py-2 text-[12px] font-semibold"
                       >
                         {copy.approvePlan}
                       </button>

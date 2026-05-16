@@ -44,6 +44,7 @@ const LOCAL_FILE_READ_APPROVAL_SCENARIO = "local-file-read-approval";
 const TOP_ISLAND_EXECUTION_PROGRESS_SCENARIO = "top-island-execution-progress";
 const TOP_ISLAND_PLAN_TASK_PROGRESS_SCENARIO = "top-island-plan-task-progress";
 const TOP_ISLAND_PENDING_TOOL_REVIEW_SCENARIO = "top-island-pending-tool-review";
+const TOP_ISLAND_PANEL_STABILITY_SCENARIO = "top-island-panel-stability";
 const GAME_STUDIO_TOOL_GROUP_COLLAPSE_SCENARIO = "game-studio-tool-group-collapse";
 const GAME_STUDIO_AWAITING_CHOICE_SCENARIO = "game-studio-awaiting-choice";
 const SIDEBAR_REMOVE_LAST_WORKSPACE_SCENARIO = "sidebar-remove-last-workspace";
@@ -151,7 +152,11 @@ function bindBridgeSnapshot(scenario: string) {
       agentStatus: state.agentStatus,
       planTasks: state.planTasks,
       selectedDiffTaskId: state.selectedDiffTaskId,
+      showPlanPanel: state.showPlanPanel,
       showDiff: state.showDiff,
+      showTerminal: state.showTerminal,
+      rightPanelTab: state.rightPanelTab,
+      pendingReviewTaskId: state.pendingReviewTaskId,
       savedDocuments: bridge.savedDocuments || [],
       completed: Boolean(bridge.completed),
       currentTurnStatus: state.currentTurnId
@@ -181,6 +186,18 @@ function bindBridgeSnapshot(scenario: string) {
     useAppStore.getState().setConfig((prev) => ({
       ...prev,
       thinkingPolicy: policy,
+    }));
+  };
+  bridge.setThemeMode = (mode: "light" | "dark" | "black") => {
+    useAppStore.getState().setConfig((prev) => ({
+      ...prev,
+      themeMode: mode,
+    }));
+  };
+  bridge.setTheme = (theme: string) => {
+    useAppStore.getState().setConfig((prev) => ({
+      ...prev,
+      theme: theme as any,
     }));
   };
   bindCloudServerBridgeControls();
@@ -2280,6 +2297,280 @@ function seedTopIslandPendingToolReviewScenario() {
     });
   };
 
+  return cleanup;
+}
+
+function seedTopIslandPanelStabilityScenario() {
+  const bridge = getBridge();
+  if (!bridge) return undefined;
+
+  bridge.events = [{ type: "boot" }];
+  bridge.savedDocuments = [];
+  bridge.completed = false;
+
+  const workspace = "/tmp/e2e-top-island-panel-stability";
+  const sessionId = 999604;
+  const now = Date.now();
+  const turnId = "e2e-top-island-panel-stability-turn";
+  const userBlockId = useAppStore.getState()._nextTaskId();
+  const agentBlockId = useAppStore.getState()._nextTaskId();
+  const reviewBlockId = useAppStore.getState()._nextTaskId();
+  const planTasks = [
+    {
+      id: "panel-task-1",
+      text: "T1: 更新 TopIsland 审批状态 — 证据: file:src/components/TopIsland.tsx",
+      status: "pending" as const,
+      claimedStatus: "pending" as const,
+      evidence: [{ kind: "file" as const, value: "src/components/TopIsland.tsx" }],
+      evidenceStatus: "missing" as const,
+    },
+    {
+      id: "panel-task-2",
+      text: "T2: 验证右侧面板状态稳定 — 证据: cmd:npx playwright test tests/e2e/top-island-execution-progress.spec.ts",
+      status: "pending" as const,
+      claimedStatus: "pending" as const,
+      evidence: [{ kind: "cmd" as const, value: "npx playwright test tests/e2e/top-island-execution-progress.spec.ts" }],
+      evidenceStatus: "missing" as const,
+    },
+  ];
+  const reviewCommand = "npm run build";
+
+  incrementSeedCount(TOP_ISLAND_PANEL_STABILITY_SCENARIO);
+
+  const baseUserBlock = { id: userBlockId, turnId, type: "user" as const, content: "/计划 修复 TopIsland 审批时右侧面板状态。" };
+  const baseAgentBlock = {
+    id: agentBlockId,
+    turnId,
+    type: "agent" as const,
+    content: "已根据你的需求生成计划，等待确认后开始执行。",
+  };
+  const reviewBlock: any = {
+    id: reviewBlockId,
+    turnId,
+    type: "tool" as const,
+    toolName: "run_command",
+    target: reviewCommand,
+    status: "pending_review",
+    toolStatus: "pending" as const,
+    message: "Waiting for shell permission approval.",
+    shellPermissionDecision: {
+      command: reviewCommand,
+      decision: "ask",
+      source: "builtin_default",
+      sourcePath: null,
+      segmentDecisions: [],
+      allowedBy: null,
+      matchedRule: "npm run",
+      suggestedRule: "npm run build",
+      suggestedRules: ["npm run build"],
+      riskLevel: "medium",
+      reviewReason: "Command requires explicit approval.",
+      requiresApproval: true,
+    },
+  };
+
+  const removeReviewBlock = (state: ReturnType<typeof useAppStore.getState>) => ({
+    taskFlow: state.taskFlow.filter((block) => block.id !== reviewBlockId),
+    conversationTurns: state.conversationTurns.map((turn) =>
+      turn.id === turnId
+        ? { ...turn, blockIds: turn.blockIds.filter((id) => id !== reviewBlockId) }
+        : turn
+    ),
+  });
+
+  const addReviewBlock = (state: ReturnType<typeof useAppStore.getState>) => {
+    const hasReviewBlock = state.taskFlow.some((block) => block.id === reviewBlockId);
+    return {
+      taskFlow: hasReviewBlock
+        ? state.taskFlow.map((block) => block.id === reviewBlockId ? reviewBlock : block)
+        : [...state.taskFlow, reviewBlock],
+      conversationTurns: state.conversationTurns.map((turn) =>
+        turn.id === turnId && !turn.blockIds.includes(reviewBlockId)
+          ? { ...turn, blockIds: [...turn.blockIds, reviewBlockId] }
+          : turn
+      ),
+    };
+  };
+
+  useAppStore.setState((state) => ({
+    ...state,
+    config: {
+      ...state.config,
+      language: "zh",
+      workflowMode: "plan",
+      theme: "green",
+    },
+    currentWorkspace: workspace,
+    sessionsByWorkspace: {
+      [workspace]: [
+        {
+          id: sessionId,
+          title: "E2E TopIsland Panel Stability",
+          date: new Date(now).toISOString(),
+          active: true,
+          messages: [],
+        },
+      ],
+    },
+    currentSessionId: sessionId,
+    taskFlow: [baseUserBlock, baseAgentBlock],
+    conversationTurns: [
+      {
+        id: turnId,
+        userPrompt: "/计划 修复 TopIsland 审批时右侧面板状态。",
+        title: "TopIsland 面板稳定回归",
+        mode: "plan",
+        intent: "plan",
+        status: "awaiting_approval",
+        summary: "计划审批出现时不应改变右侧面板状态。",
+        blockIds: [userBlockId, agentBlockId],
+        collapsed: false,
+        createdAt: now,
+      },
+    ],
+    currentTurnId: turnId,
+    planArtifacts: [
+      {
+        kind: "design",
+        path: ".MAIN/plans/design.md",
+        title: "Design",
+        content: "# TopIsland 面板稳定设计\n\n> 计划高亮应跟随当前主题色。\n\n审批只更新 TopIsland 状态，不改动右侧面板。",
+        updatedAt: now,
+      },
+      {
+        kind: "tasks",
+        path: ".MAIN/plans/tasks.md",
+        title: "Tasks",
+        content: `${planTasks.map((task) => `- [ ] ${task.text}`).join("\n")}\n\n> 任务高亮也应跟随当前主题色。`,
+        updatedAt: now + 1,
+      },
+    ],
+    planTasks,
+    planExecutionEvidenceLedger: [],
+    planExecutionEvidenceCount: 0,
+    planStage: "ready_to_execute",
+    isPlanApproved: false,
+    showPlanPanel: true,
+    showDiff: false,
+    showTerminal: false,
+    showFilePanel: false,
+    rightPanelTab: "plan",
+    agentStatus: "pending_review",
+    isGenerating: false,
+    abortController: null,
+    pendingReviewResolve: null,
+    pendingReviewTaskId: null,
+    pendingToolCall: null,
+    selectedDiffTaskId: null,
+    input: "",
+    attachedFiles: [],
+    contextMentions: [],
+  }));
+
+  bridge.setPanelMode = (mode: "plan" | "diff" | "terminal" | "closed") => {
+    useAppStore.setState({
+      showPlanPanel: mode === "plan",
+      showDiff: mode === "diff",
+      showTerminal: mode === "terminal",
+      showFilePanel: false,
+      rightPanelTab: mode === "diff" ? "diff" : mode === "terminal" ? "terminal" : "plan",
+      selectedDiffTaskId: mode === "diff" ? reviewBlockId : null,
+    });
+    appendBridgeEvent("panel_mode", { mode });
+  };
+
+  bridge.resetPlanApprovalPrompt = () => {
+    useAppStore.setState((state) => {
+      const withoutReview = removeReviewBlock(state);
+      return {
+        ...withoutReview,
+        isPlanApproved: false,
+        planStage: "ready_to_execute",
+        agentStatus: "pending_review",
+        isGenerating: false,
+        abortController: null,
+        pendingReviewResolve: null,
+        pendingReviewTaskId: null,
+        pendingToolCall: null,
+        selectedDiffTaskId: state.selectedDiffTaskId === reviewBlockId ? null : state.selectedDiffTaskId,
+        conversationTurns: withoutReview.conversationTurns.map((turn) =>
+          turn.id === turnId ? { ...turn, status: "awaiting_approval" } : turn
+        ),
+      };
+    });
+    appendBridgeEvent("plan_prompt_reset");
+  };
+
+  bridge.showToolApprovalPrompt = () => {
+    useAppStore.setState((state) => {
+      const withReview = addReviewBlock(state);
+      return {
+        ...withReview,
+        isPlanApproved: true,
+        planStage: "executing",
+        agentStatus: "pending_review",
+        isGenerating: false,
+        abortController: null,
+        currentTurnExecutionConsent: { turnId, granted: true },
+        pendingReviewResolve: (decision: unknown) => appendBridgeEvent("tool_review_resolved", { decision }),
+        pendingReviewTaskId: reviewBlockId,
+        pendingToolCall: {
+          name: "run_command",
+          arguments: { command: reviewCommand },
+          shellPermissionDecision: reviewBlock.shellPermissionDecision,
+        },
+        conversationTurns: withReview.conversationTurns.map((turn) =>
+          turn.id === turnId ? { ...turn, status: "awaiting_approval" } : turn
+        ),
+      };
+    });
+    appendBridgeEvent("tool_prompt_shown");
+  };
+
+  bridge.setRunState = (stateName: "running" | "pending_review" | "idle") => {
+    if (stateName === "pending_review") {
+      bridge.showToolApprovalPrompt?.();
+      return;
+    }
+
+    useAppStore.setState((state) => {
+      const withoutReview = removeReviewBlock(state);
+      return {
+        ...withoutReview,
+        isPlanApproved: true,
+        planStage: stateName === "idle" ? "completed" : "executing",
+        agentStatus: stateName === "idle" ? "idle" : "running",
+        isGenerating: stateName === "running",
+        abortController: stateName === "running" ? new AbortController() : null,
+        pendingReviewResolve: null,
+        pendingReviewTaskId: null,
+        pendingToolCall: null,
+        conversationTurns: withoutReview.conversationTurns.map((turn) =>
+          turn.id === turnId ? { ...turn, status: stateName === "idle" ? "done" : "executing" } : turn
+        ),
+      };
+    });
+    appendBridgeEvent("run_state", { state: stateName });
+  };
+
+  appendBridgeEvent("seeded", { seedCount: readSeedCount(TOP_ISLAND_PANEL_STABILITY_SCENARIO) });
+  bindBridgeSnapshot(TOP_ISLAND_PANEL_STABILITY_SCENARIO);
+
+  const cleanup = () => {
+    const latest = useAppStore.getState();
+    latest.abortController?.abort();
+    useAppStore.setState({
+      abortController: null,
+      pendingReviewResolve: null,
+      pendingReviewTaskId: null,
+      pendingToolCall: null,
+      agentStatus: "idle",
+      isGenerating: false,
+    });
+    bridge.initialized = false;
+  };
+
+  bridge.cleanup = cleanup;
   return cleanup;
 }
 
@@ -4756,6 +5047,10 @@ export function initializeE2EScenarios(): (() => void) | undefined {
 
   if (scenario === TOP_ISLAND_PENDING_TOOL_REVIEW_SCENARIO) {
     return seedTopIslandPendingToolReviewScenario();
+  }
+
+  if (scenario === TOP_ISLAND_PANEL_STABILITY_SCENARIO) {
+    return seedTopIslandPanelStabilityScenario();
   }
 
   if (scenario === GAME_STUDIO_TOOL_GROUP_COLLAPSE_SCENARIO) {

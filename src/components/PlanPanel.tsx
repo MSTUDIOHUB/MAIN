@@ -141,7 +141,7 @@ function getStageTone(stage: PlanStage): string {
     case "bugfix":
       return "text-[#fb7185] border-[rgba(251,113,133,0.25)] bg-[rgba(251,113,133,0.12)]";
     default:
-      return "text-[#c4b5fd] border-[rgba(196,181,253,0.25)] bg-[rgba(196,181,253,0.12)]";
+      return "theme-plan-pill";
   }
 }
 
@@ -315,8 +315,8 @@ export default function PlanPanel({
             </div>
             <div className="mt-2 h-2 overflow-hidden rounded-full bg-[#18181b]">
               <div
-                className="h-full rounded-full transition-all duration-300"
-                style={{ width: `${progressPct}%`, background: "linear-gradient(90deg, #7c3aed, #3b82f6)" }}
+                className="theme-plan-progress h-full rounded-full transition-all duration-300"
+                style={{ width: `${progressPct}%` }}
               />
             </div>
             <div className="mt-3 space-y-2">
@@ -381,7 +381,7 @@ export default function PlanPanel({
                   onClick={() => setActiveArtifactPath(artifact.path)}
                   className={`rounded-full border px-3 py-1.5 text-[11px] transition-colors ${
                     active
-                      ? "border-[rgba(124,58,237,0.35)] bg-[rgba(124,58,237,0.14)] text-[#e9d5ff]"
+                      ? "theme-plan-button"
                       : "border-[#27272a] bg-[#09090b] text-[#a1a1aa] hover:bg-[#18181b] hover:text-[#e4e4e7]"
                   }`}
                 >
@@ -487,8 +487,7 @@ export default function PlanPanel({
                 <button
                   data-testid="plan-approve-button"
                   onClick={onApprove}
-                  className="rounded-lg px-4 py-2 text-[12px] font-semibold text-white"
-                  style={{ background: "linear-gradient(135deg, #7c3aed, #2563eb)" }}
+                  className="theme-plan-primary rounded-lg px-4 py-2 text-[12px] font-semibold"
                 >
                   {copy.approvePlan}
                 </button>
@@ -526,8 +525,7 @@ export default function PlanPanel({
               </button>
               <button
                 onClick={onContinuePlanning}
-                className="rounded-lg px-4 py-2 text-[12px] font-semibold text-white"
-                style={{ background: "linear-gradient(135deg, #7c3aed, #2563eb)" }}
+                className="theme-plan-primary rounded-lg px-4 py-2 text-[12px] font-semibold"
               >
                 {copy.continuePlanning}
               </button>
@@ -540,8 +538,7 @@ export default function PlanPanel({
               <button
                 data-testid="plan-resume-button"
                 onClick={onResumeExecution}
-                className="shrink-0 rounded-lg px-4 py-2 text-[12px] font-semibold text-white"
-                style={{ background: "linear-gradient(135deg, #7c3aed, #2563eb)" }}
+                className="theme-plan-primary shrink-0 rounded-lg px-4 py-2 text-[12px] font-semibold"
               >
                 {copy.resumeExecution}
               </button>

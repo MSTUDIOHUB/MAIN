@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 
 test.beforeEach(async ({ page }) => {
   await page.addInitScript(() => {
@@ -40,4 +40,104 @@ test("TopIsland keeps approval buttons visible for a long command with plan task
   await expect(page.getByTestId("top-island-tool-review")).toContainText("printf");
   await expect(page.getByTestId("top-island-plan-progress")).toContainText("任务明细已收起");
   await expect(page.getByTestId("top-island-current-plan-task")).toHaveCount(0);
+});
+
+const panelModes = ["plan", "diff", "terminal", "closed"] as const;
+
+async function getPanelSnapshot(page: Page) {
+  const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
+  return {
+    showPlanPanel: Boolean(snapshot?.showPlanPanel),
+    showDiff: Boolean(snapshot?.showDiff),
+    showTerminal: Boolean(snapshot?.showTerminal),
+    rightPanelTab: snapshot?.rightPanelTab ?? null,
+  };
+}
+
+for (const mode of panelModes) {
+  test(`TopIsland plan approval preserves right panel state: ${mode}`, async ({ page }) => {
+    await page.goto("/?e2eScenario=top-island-panel-stability");
+    await page.evaluate((nextMode) => (window as any).__CODELY_E2E__?.setPanelMode?.(nextMode), mode);
+    await page.evaluate(() => (window as any).__CODELY_E2E__?.resetPlanApprovalPrompt?.());
+
+    await expect(page.getByTestId("top-island-plan-approve")).toBeVisible();
+    const before = await getPanelSnapshot(page);
+
+    await page.getByTestId("top-island-plan-approve").click();
+    await expect.poll(async () => (
+      page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().isPlanApproved ?? false)
+    )).toBe(true);
+
+    expect(await getPanelSnapshot(page)).toEqual(before);
+  });
+
+  test(`TopIsland tool approval preserves right panel state: ${mode}`, async ({ page }) => {
+    await page.goto("/?e2eScenario=top-island-panel-stability");
+    await page.evaluate((nextMode) => (window as any).__CODELY_E2E__?.setPanelMode?.(nextMode), mode);
+    await page.evaluate(() => (window as any).__CODELY_E2E__?.showToolApprovalPrompt?.());
+
+    await expect(page.getByTestId("top-island-tool-review")).toBeVisible();
+    const before = await getPanelSnapshot(page);
+
+    await page.getByTestId("top-island-tool-approve-once").click();
+    await expect.poll(async () => (
+      page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().pendingReviewTaskId ?? null)
+    )).toBeNull();
+
+    expect(await getPanelSnapshot(page)).toEqual(before);
+  });
+}
+
+test("TopIsland run-active ring follows only the real running execution state", async ({ page }) => {
+  await page.goto("/?e2eScenario=top-island-panel-stability");
+
+  await page.evaluate(() => (window as any).__CODELY_E2E__?.setRunState?.("running"));
+  await expect(page.getByTestId("top-island-shell")).toHaveAttribute("data-run-active", "true");
+
+  await page.evaluate(() => (window as any).__CODELY_E2E__?.setRunState?.("pending_review"));
+  await expect(page.getByTestId("top-island-shell")).toHaveAttribute("data-run-active", "false");
+
+  await page.evaluate(() => (window as any).__CODELY_E2E__?.setRunState?.("idle"));
+  await expect.poll(async () => {
+    const shell = page.getByTestId("top-island-shell");
+    const count = await shell.count();
+    if (count === 0) return "gone";
+    return await shell.first().getAttribute("data-run-active");
+  }).not.toBe("true");
+});
+
+test("plan UI accents follow a non-purple theme across appearance modes", async ({ page }) => {
+  await page.goto("/?e2eScenario=top-island-panel-stability");
+  await page.evaluate(() => (window as any).__CODELY_E2E__?.setTheme?.("green"));
+
+  await expect(page.getByTestId("top-island-plan-approve")).toBeVisible();
+  await expect(page.locator("blockquote.theme-plan-surface").first()).toBeVisible();
+
+  for (const mode of ["light", "dark", "black"] as const) {
+    await page.evaluate((themeMode) => (window as any).__CODELY_E2E__?.setThemeMode?.(themeMode), mode);
+    await expect.poll(async () => (
+      page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().themeMode ?? null)
+    )).toBe(mode);
+
+    const styles = await page.evaluate(() => {
+      const appRoot = document.querySelector<HTMLElement>("[style*='--accent']");
+      const planSurface = document.querySelector<HTMLElement>(".theme-plan-surface");
+      const quote = document.querySelector<HTMLElement>("blockquote.theme-plan-surface");
+      const primary = document.querySelector<HTMLElement>("[data-testid='top-island-plan-approve']");
+      const rootStyle = appRoot ? getComputedStyle(appRoot) : null;
+      return {
+        accent: rootStyle?.getPropertyValue("--accent").trim() || "",
+        contrast: rootStyle?.getPropertyValue("--accent-contrast").trim() || "",
+        surfaceBorder: planSurface ? getComputedStyle(planSurface).borderTopColor : "",
+        quoteBorder: quote ? getComputedStyle(quote).borderLeftColor : "",
+        primaryColor: primary ? getComputedStyle(primary).color : "",
+      };
+    });
+
+    expect(styles.accent).toBe("#059669");
+    expect(styles.contrast).toBe("#ffffff");
+    expect(styles.primaryColor).toBe("rgb(255, 255, 255)");
+    expect(styles.surfaceBorder).not.toBe("rgb(147, 51, 234)");
+    expect(styles.quoteBorder).not.toBe("rgb(147, 51, 234)");
+  }
 });

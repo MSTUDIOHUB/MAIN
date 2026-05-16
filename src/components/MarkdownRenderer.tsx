@@ -154,7 +154,7 @@ function getLanguageTone(language: string, isDiagram: boolean, themeMode: "light
         badgeBorder: "rgba(251,191,36,0.28)",
         badgeBackground: "rgba(251,191,36,0.12)",
         badgeText: "#fde68a",
-        headerBackground: "linear-gradient(90deg, rgba(245,158,11,0.14), rgba(124,58,237,0.05))",
+        headerBackground: "linear-gradient(90deg, rgba(245,158,11,0.14), rgba(251,191,36,0.05))",
       };
     case "markdown":
       return {
@@ -165,10 +165,10 @@ function getLanguageTone(language: string, isDiagram: boolean, themeMode: "light
       };
     default:
       return {
-        badgeBorder: "rgba(161,161,170,0.28)",
-        badgeBackground: "rgba(161,161,170,0.1)",
-        badgeText: "#d4d4d8",
-        headerBackground: "linear-gradient(90deg, rgba(124,58,237,0.12), rgba(37,99,235,0.04))",
+        badgeBorder: "color-mix(in srgb, var(--accent-light) 30%, transparent)",
+        badgeBackground: "var(--accent-subtle)",
+        badgeText: "var(--accent-light)",
+        headerBackground: "linear-gradient(90deg, color-mix(in srgb, var(--accent) 12%, transparent), color-mix(in srgb, var(--accent-light) 4%, transparent))",
       };
   }
 }
@@ -655,7 +655,7 @@ function Blockquote({ children }: { children: React.ReactNode }) {
     ? "border-[rgba(244,114,182,0.48)] bg-[rgba(244,114,182,0.08)] text-[#fbcfe8]"
     : level === "TIP"
     ? "border-[rgba(52,211,153,0.48)] bg-[rgba(52,211,153,0.08)] text-[#bbf7d0]"
-    : "border-[rgba(124,58,237,0.45)] bg-[rgba(124,58,237,0.08)] text-[#ddd6fe]";
+    : "theme-plan-surface theme-plan-text";
 
   return (
     <blockquote className={`my-4 rounded-r-2xl border-l-2 px-4 py-3 ${tone}`}>
@@ -731,7 +731,7 @@ const MarkdownRenderer = memo(function MarkdownRenderer({
     h6: ({ children }: any) => <Heading level={6} baseFontSize={baseFontSize} sourceId={sourceId}>{children}</Heading>,
     p: ({ children }: any) => <p className="mb-3 whitespace-pre-wrap last:mb-0 text-[#d4d4d8]">{children}</p>,
     a: ({ href, children }: any) => (
-      <a href={href} target="_blank" rel="noopener noreferrer" className="theme-text underline decoration-[rgba(167,139,250,0.45)] underline-offset-4 transition-opacity hover:opacity-80">
+      <a href={href} target="_blank" rel="noopener noreferrer" className="theme-text underline underline-offset-4 transition-opacity hover:opacity-80" style={{ textDecorationColor: "var(--accent-subtle-border)" }}>
         {children}
       </a>
     ),
@@ -747,8 +747,8 @@ const MarkdownRenderer = memo(function MarkdownRenderer({
     th: ({ children }: any) => <th className="border-b border-[#1f1f23] px-4 py-3 text-left font-semibold">{children}</th>,
     td: ({ children }: any) => <td className="border-b border-[#1f1f23] px-4 py-3 align-top text-[#d4d4d8]">{children}</td>,
     strong: ({ children }: any) => <strong className="font-semibold text-white">{children}</strong>,
-    em: ({ children }: any) => <em className="italic text-[#ddd6fe]">{children}</em>,
-    sup: ({ children }: any) => <sup className="rounded-full bg-[rgba(124,58,237,0.18)] px-1 text-[0.75em] theme-text">{children}</sup>,
+    em: ({ children }: any) => <em className="theme-plan-text italic">{children}</em>,
+    sup: ({ children }: any) => <sup className="rounded-full bg-[var(--accent-subtle)] px-1 text-[0.75em] theme-text">{children}</sup>,
     section: ({ children, className }: any) => (
       <section className={`${className || ""} mt-4 rounded-xl border border-[#27272a] bg-[#050507] px-4 py-3 text-[#d4d4d8]`}>
         {children}
