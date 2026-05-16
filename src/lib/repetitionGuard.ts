@@ -37,7 +37,7 @@ export function buildRepeatLoopSignature(name: string, argsKey: string): string 
 }
 
 const READ_ONLY_SHELL_TOOL_NAMES = new Set(["run_command", "execute_command"]);
-const READ_ONLY_SHELL_COMMAND_RE = /^(?:pwd|ls(?:\s|$)|cat\s+|sed\s+-n\b|grep\b|rg\b|head\b|tail\b|wc\b|git\s+(?:status|diff|show|log|branch)\b)/i;
+const READ_ONLY_SHELL_COMMAND_RE = /^(?:pwd|ls(?:\s|$)|find\s+|cat\s+|sed\s+-n\b|grep\b|rg\b|head\b|tail\b|wc\b|git\s+(?:status|diff|show|log|branch)\b)/i;
 const UNSAFE_SHELL_INSPECTION_RE = /(?:^|\s)(?:sudo|rm|mv|cp|chmod|chown|touch|mkdir|rmdir|git\s+(?:add|commit|checkout|switch|reset|clean|push|pull|merge|rebase)|npm|pnpm|yarn|bun|cargo|python|python3|node|sh|bash|zsh)\b/i;
 
 function getShellCommandArgument(args: Record<string, unknown>): string {
@@ -110,7 +110,8 @@ export function registerToolCallForRepeatGuard(
   };
 }
 
-function getToolProgressFamily(name: string): RecentTargetToolCall["family"] {
+function getToolProgressFamily(name: string, target?: string): RecentTargetToolCall["family"] {
+  if (String(target || "").startsWith("shell-write:")) return "edit";
   if (name === "write_file" || name === "replace_in_file") return "edit";
   if (
     name === "run_command" ||
@@ -126,6 +127,41 @@ function getToolProgressFamily(name: string): RecentTargetToolCall["family"] {
   return "other";
 }
 
+function normalizeShellMutationPath(path: string): string {
+  return String(path || "")
+    .trim()
+    .replace(/^['"]|['"]$/g, "")
+    .replace(/\\/g, "/")
+    .replace(/^\.\//, "");
+}
+
+export function getShellMutationTargetForLoopGuard(
+  name: string,
+  args: Record<string, unknown>,
+): string | null {
+  if (name !== "run_command" && name !== "execute_command" && name !== "send_pty_input") return null;
+  const command = getShellCommandArgument(args);
+  if (!command) return null;
+
+  const redirection = command.match(/(?:^|\s)(?:>{1,2})\s*(['"]?)([^'"\s;&|]+)\1/);
+  const redirectionPath = normalizeShellMutationPath(redirection?.[2] || "");
+  if (redirectionPath && redirectionPath !== "/dev/null") {
+    return `shell-write:${redirectionPath}`;
+  }
+
+  const touchPath = command.match(/(?:^|\s)touch\s+(?:-[A-Za-z]+\s+)*(['"]?)([^'"\s;&|]+)\1/i);
+  const touchTarget = normalizeShellMutationPath(touchPath?.[2] || "");
+  if (touchTarget) return `shell-write:${touchTarget}`;
+
+  const openPath = command.match(/\bopen\(\s*(['"])([^'"]+)\1\s*,\s*(['"])[wa]/i);
+  const openTarget = normalizeShellMutationPath(openPath?.[2] || "");
+  if (openTarget) return `shell-write:${openTarget}`;
+
+  const filePath = command.match(/(?:^|\s)(\.?\/?[A-Za-z0-9_.@-][A-Za-z0-9_./@-]*\.(?:png|jpg|jpeg|gif|ico|icns|svg|json|md|txt|ts|tsx|js|jsx|rs|py|css|html|toml|yaml|yml))(?:\s|$|&&|;|\|)/i);
+  const fileTarget = normalizeShellMutationPath(filePath?.[1] || "");
+  return fileTarget ? `shell-write:${fileTarget}` : null;
+}
+
 function normalizeTargetKey(target: string): string {
   return String(target || "")
     .replace(/\\/g, "/")
@@ -134,17 +170,29 @@ function normalizeTargetKey(target: string): string {
     .toLowerCase();
 }
 
+function isInternalPlanProgressTarget(targetKey: string): boolean {
+  const normalized = targetKey.startsWith("shell-write:")
+    ? targetKey.slice("shell-write:".length)
+    : targetKey;
+  return normalized === ".main/plans/requirements.md" ||
+    normalized.endsWith("/.main/plans/requirements.md") ||
+    normalized === ".main/plans/design.md" ||
+    normalized.endsWith("/.main/plans/design.md") ||
+    normalized === ".main/plans/tasks.md" ||
+    normalized.endsWith("/.main/plans/tasks.md");
+}
+
 export function registerTargetProgressForLoopGuard(
   history: RecentTargetToolCall[],
   name: string,
   target: string,
 ): TargetProgressLoopCheck {
-  const family = getToolProgressFamily(name);
+  const family = getToolProgressFamily(name, target);
   const targetKey = normalizeTargetKey(target);
-  const threshold = family === "edit" ? 4 : 5;
+  const threshold = targetKey.startsWith("shell-write:") ? 3 : family === "edit" ? 4 : 5;
   const signature = `${family}::${targetKey}`;
 
-  if (!targetKey || family === "other") {
+  if (!targetKey || family === "other" || isInternalPlanProgressTarget(targetKey)) {
     return { repeated: false, threshold, targetKey, signature, family };
   }
 
@@ -170,7 +218,11 @@ export function formatTargetProgressLoopRecoveryMessage(
   threshold: number,
 ): string {
   const label = family === "edit" ? "edit" : family === "verify" ? "verification" : "tool";
-  return `Progress guard: ${label} tools have targeted "${target}" ${threshold}+ times without an intervening different target. Reconcile the latest result already in context, decide whether the task is complete, and only call a different smallest-necessary next tool if real evidence is still missing.`;
+  const displayTarget = target.startsWith("shell-write:") ? target.slice("shell-write:".length) : target;
+  const shellWriteHint = target.startsWith("shell-write:")
+    ? " This shell-write target has already failed to make progress; inspect the current file state and switch to a file tool or an existing asset helper instead of trying another shell writer."
+    : "";
+  return `Progress guard: ${label} tools have targeted "${displayTarget}" ${threshold}+ times without an intervening different target. Reconcile the latest result already in context, decide whether the task is complete, and only call a different smallest-necessary next tool if real evidence is still missing.${shellWriteHint}`;
 }
 
 export function formatRepeatLoopRecoveryMessage(

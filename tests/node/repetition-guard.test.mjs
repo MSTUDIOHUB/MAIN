@@ -31,6 +31,7 @@ const {
   formatRepeatLoopFatalMessage,
   formatRepeatLoopRecoveryMessage,
   formatTargetProgressLoopRecoveryMessage,
+  getShellMutationTargetForLoopGuard,
   isReadOnlyShellInspectionToolCall,
   registerTargetProgressForLoopGuard,
   registerToolCallForRepeatGuard,
@@ -87,6 +88,13 @@ test("repeat guard treats read-only shell inspection commands as recoverable rea
   assert.equal(result.threshold, 6);
 });
 
+test("read-only shell inspection includes safe find commands", () => {
+  assert.equal(
+    isReadOnlyShellInspectionToolCall("run_command", { command: "find . -maxdepth 2 -name package.json" }),
+    true,
+  );
+});
+
 test("repeat guard keeps non-inspection shell commands on the strict threshold", () => {
   const args = { command: "npm test" };
   const history = [];
@@ -131,4 +139,53 @@ test("target progress guard catches repeated edits to the same target even with 
   const recovery = formatTargetProgressLoopRecoveryMessage(result.family, result.targetKey, result.threshold);
   assert.match(recovery, /Progress guard/);
   assert.match(recovery, /src\/app\.tsx/);
+});
+
+test("target progress guard ignores internal plan task bookkeeping", () => {
+  const planOnlyHistory = [];
+  let planOnlyResult = null;
+
+  for (let i = 0; i < 6; i += 1) {
+    planOnlyResult = registerTargetProgressForLoopGuard(
+      planOnlyHistory,
+      "write_file",
+      ".MAIN/plans/tasks.md",
+    );
+  }
+
+  assert.equal(planOnlyResult.repeated, false);
+
+  const sourceHistory = [];
+  let sourceResult = null;
+  for (let i = 0; i < 4; i += 1) {
+    sourceResult = registerTargetProgressForLoopGuard(sourceHistory, "replace_in_file", "src/App.tsx");
+    registerTargetProgressForLoopGuard(sourceHistory, "write_file", ".MAIN/plans/tasks.md");
+  }
+
+  assert.equal(sourceResult.repeated, true);
+  assert.equal(sourceResult.targetKey, "src/app.tsx");
+});
+
+test("target progress guard converges repeated shell writes to the same file", () => {
+  const history = [];
+  const commands = [
+    "mkdir -p src-tauri/icons && touch src-tauri/icons/icon.png",
+    "printf '\\x89PNG\\r\\n' > src-tauri/icons/icon.png",
+    "python3 -c \"open('src-tauri/icons/icon.png','wb').write(b'png')\"",
+  ];
+  let result = null;
+
+  for (const command of commands) {
+    const target = getShellMutationTargetForLoopGuard("run_command", { command });
+    assert.equal(target, "shell-write:src-tauri/icons/icon.png");
+    result = registerTargetProgressForLoopGuard(history, "run_command", target);
+  }
+
+  assert.equal(result.repeated, true);
+  assert.equal(result.threshold, 3);
+  assert.equal(result.family, "edit");
+  assert.match(
+    formatTargetProgressLoopRecoveryMessage(result.family, result.targetKey, result.threshold),
+    /shell-write target/,
+  );
 });

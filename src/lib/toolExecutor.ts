@@ -394,11 +394,11 @@ export async function executeTool(
       let beforeOffset = 0;
       try {
         beforeOffset = (await getPtyStatus(sessionKey)).bufferEndOffset;
-        await writePty(input + (appendNewline ? "\n" : ""), sessionKey);
+        await writePty(input + (appendNewline ? "\n" : ""), sessionKey, options.shellPermissionApproval);
       } catch {
         await spawnPty(140, 40, sessionKey, workspace);
         beforeOffset = (await getPtyStatus(sessionKey)).bufferEndOffset;
-        await writePty(input + (appendNewline ? "\n" : ""), sessionKey);
+        await writePty(input + (appendNewline ? "\n" : ""), sessionKey, options.shellPermissionApproval);
       }
       await sleep(waitMs);
       const output = await readPtySince(beforeOffset, maxChars, sessionKey);

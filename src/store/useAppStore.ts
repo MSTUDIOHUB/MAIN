@@ -357,6 +357,8 @@ function buildShellPermissionApproval(
     command: decision.command,
     approvedAtMs: Date.now(),
     scope,
+    rules: suggestedShellPermissionRules(decision),
+    riskLevel: decision.riskLevel || null,
   };
 }
 
@@ -364,6 +366,12 @@ function suggestedShellPermissionRules(decision: ShellPermissionDecision | null 
   if (!decision) return [];
   const seen = new Set<string>();
   const rules: string[] = [];
+  for (const rule of decision.suggestedRules || []) {
+    const cleanRule = String(rule || "").trim();
+    if (!cleanRule || seen.has(cleanRule)) continue;
+    seen.add(cleanRule);
+    rules.push(cleanRule);
+  }
   for (const segment of decision.segmentDecisions || []) {
     if (segment.decision !== "ask") continue;
     const rule = String(segment.suggestedRule || segment.matchedRule || "").trim();
@@ -390,6 +398,8 @@ function formatShellPermissionDecisionForUser(
       : "built-in default policy";
   const rules = suggestedShellPermissionRules(decision);
   const rulesText = rules.length > 0 ? rules.map((rule) => `\`${rule}\``).join(", ") : "";
+  const riskText = decision.riskLevel ? `risk=${decision.riskLevel}` : "";
+  const reasonText = String(decision.reviewReason || "").trim();
   const relevantSegments = (decision.segmentDecisions || [])
     .filter((segment) => segment.decision === decision.decision || (decision.decision === "deny" && segment.decision === "deny"))
     .map((segment) => `\`${segment.command}\``);
@@ -397,8 +407,8 @@ function formatShellPermissionDecisionForUser(
   const matchedRule = String(decision.matchedRule || "").trim();
   if (decision.decision === "ask") {
     return language === "zh"
-      ? `Shell 权限预检：当前命令未静默放行，将按 ${source} 请求批准。待批准 segment：${segmentText}。${rulesText ? `本线程批准会记住规则 ${rulesText}。` : ""}`
-      : `Shell permission preflight: this command is approval-gated by the ${source}. Segment: ${segmentText}. ${rulesText ? `Approving for this thread will remember ${rulesText}.` : ""}`;
+      ? `Shell 权限预检：当前命令未静默放行，将按 ${source} 请求批准。${riskText ? `${riskText}。` : ""}${reasonText ? `${reasonText}。` : ""}待批准 segment：${segmentText}。${rulesText ? `本线程批准会记住规则 ${rulesText}。` : ""}`
+      : `Shell permission preflight: this command is approval-gated by the ${source}. ${riskText ? `${riskText}. ` : ""}${reasonText ? `${reasonText}. ` : ""}Segment: ${segmentText}. ${rulesText ? `Approving for this thread will remember ${rulesText}.` : ""}`;
   }
   if (decision.decision === "deny") {
     return language === "zh"

@@ -96,6 +96,7 @@ import {
   formatRepeatLoopFatalMessage,
   formatRepeatLoopRecoveryMessage,
   formatTargetProgressLoopRecoveryMessage,
+  getShellMutationTargetForLoopGuard,
   isReadOnlyShellInspectionToolCall,
   registerTargetProgressForLoopGuard,
   registerToolCallForRepeatGuard,
@@ -278,6 +279,10 @@ function rememberReadBeforeModifyEvidence(
     evidence.add("workspace:structure");
     return;
   }
+  if (isReadOnlyShellInspectionToolCall(name, args)) {
+    evidence.add("workspace:structure");
+    return;
+  }
   if (/unity|yaml|reference|asset|prefab|scene/i.test(name) && /read|list|search|get|query|find/i.test(name)) {
     evidence.add("unity:context");
   }
@@ -300,6 +305,9 @@ async function buildReadBeforeModifyValidationError(
 
   const normalizedPath = normalizeEvidencePath(path);
   const evidence = getSessionReadBeforeModifyEvidence(callbacks.getSessionKey());
+  if (callbacks.getWorkspaceTree().trim()) {
+    evidence.add("workspace:structure");
+  }
   const hasExactRead = evidence.has(`file:${normalizedPath}`);
   const hasParentRead = evidence.has(`dir:${getParentEvidencePath(path)}`) || evidence.has("workspace:structure");
 
@@ -6560,7 +6568,7 @@ export async function executeAgentLoop(
     if (!recoveredReadOnlyRepeat) {
       for (const tc of effectiveToolCalls) {
         const toolArgs = parseToolCallArguments(tc, workspace);
-        const target = getToolTarget(tc.name, toolArgs);
+        const target = getShellMutationTargetForLoopGuard(tc.name, toolArgs) || getToolTarget(tc.name, toolArgs);
         const progressCheck = registerTargetProgressForLoopGuard(recentTargetToolCalls, tc.name, target);
         if (!progressCheck.repeated) continue;
 

@@ -2608,6 +2608,7 @@ export default function ChatArea({
           replyOptions={topIslandReplyOptions}
           pendingRunDecision={pendingRunDecision}
           activeDiffTask={activeDiffTask}
+          pendingToolReview={activeDiffTask}
           canApprovePlan={canApprovePlan}
           autoApproveTools={autoApproveTools}
           onSelectReplyOption={(option) => topIslandTurn && onQuickReply?.(option, topIslandTurn.id)}

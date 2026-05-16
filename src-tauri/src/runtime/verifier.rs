@@ -158,11 +158,13 @@ mod tests {
             );
 
             let error = verifier
-                .verify_command("python --version", Duration::from_millis(100))
+                .verify_command("python -c 'print(1)'", Duration::from_millis(100))
                 .await
                 .expect_err("unlisted shell command must not run");
 
-            assert!(error.contains("权限") || error.contains("permission"));
+            assert!(
+                error.contains("权限") || error.contains("批准") || error.contains("permission")
+            );
         });
     }
 

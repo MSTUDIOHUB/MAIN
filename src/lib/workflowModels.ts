@@ -694,6 +694,26 @@ function commandEvidenceMatches(expectedRaw: string, actualRaw: string): boolean
   );
 }
 
+function isPackageManifestEvidence(value: string): boolean {
+  const normalized = normalizePlanEvidenceValue(value);
+  if (!normalized) return false;
+
+  const withoutQualifier = normalized
+    .replace(/\s*[（(][^）)]*[）)]\s*$/u, "")
+    .replace(/\s+(?:dependencies|devdependencies|scripts|section|block|区块|部分)\b.*$/iu, "")
+    .trim();
+  const manifestNameRe = /(?:^|\/)(?:package\.json|package-lock\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb)$/i;
+  return manifestNameRe.test(withoutQualifier);
+}
+
+function packageManagerCommandMutatesManifest(commandRaw: string): boolean {
+  const segments = splitCommandEvidenceSegments(commandRaw);
+  return segments.some((segment) =>
+    /^(?:npm|pnpm|bun)\s+(?:i|install|add|remove|uninstall|update)\b/i.test(segment) ||
+    /^yarn\s+(?:add|remove|install|upgrade)\b/i.test(segment)
+  );
+}
+
 function evidencePathMatches(candidateRaw: string, expectedRaw: string): boolean {
   const expected = normalizePlanEvidenceValue(expectedRaw);
   const candidate = normalizePlanEvidenceValue(candidateRaw);
@@ -784,6 +804,13 @@ function evidenceMatchesRecord(
   if (evidence.kind === "file" || evidence.kind === "deliverable") {
     if (record.kind === "file" || record.kind === "deliverable") {
       return evidencePathMatches(record.value || record.target || "", evidence.value);
+    }
+    if (
+      record.kind === "cmd" &&
+      isPackageManifestEvidence(evidence.value) &&
+      packageManagerCommandMutatesManifest(record.value || record.target || "")
+    ) {
+      return true;
     }
     return false;
   }

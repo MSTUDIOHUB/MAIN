@@ -58,12 +58,15 @@ export interface TerminalCommandOutput {
 }
 
 export type ShellPermissionDecisionKind = "allow" | "ask" | "deny";
+export type ShellPermissionRiskLevel = "low" | "medium" | "high" | "critical";
 
 export interface ShellPermissionSegmentDecision {
   command: string;
   decision: ShellPermissionDecisionKind;
   matchedRule?: string | null;
   suggestedRule?: string | null;
+  riskLevel?: ShellPermissionRiskLevel | null;
+  reviewReason?: string | null;
 }
 
 export interface ShellPermissionDecision {
@@ -75,6 +78,9 @@ export interface ShellPermissionDecision {
   allowedBy?: string | null;
   matchedRule?: string | null;
   suggestedRule?: string | null;
+  suggestedRules?: string[];
+  riskLevel?: ShellPermissionRiskLevel | null;
+  reviewReason?: string | null;
   requiresApproval: boolean;
 }
 
@@ -82,6 +88,8 @@ export interface ShellPermissionApproval {
   command: string;
   approvedAtMs?: number | null;
   scope?: "once" | "session" | string | null;
+  rules?: string[];
+  riskLevel?: ShellPermissionRiskLevel | null;
 }
 
 export interface RepositoryIndex {
@@ -837,8 +845,9 @@ export function writePty(
   input: string,
   sessionKey?: string,
   permissionApproval?: ShellPermissionApproval,
+  userTerminal?: boolean,
 ): Promise<void> {
-  return invoke<void>("write_pty", { input, sessionKey, permissionApproval });
+  return invoke<void>("write_pty", { input, sessionKey, permissionApproval, userTerminal });
 }
 
 export function readPtyBuffer(maxChars?: number, sessionKey?: string): Promise<string> {

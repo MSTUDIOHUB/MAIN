@@ -43,6 +43,7 @@ const EXECUTE_MAX_ITERATIONS_CHECKPOINT_SCENARIO = "execute-max-iterations-check
 const LOCAL_FILE_READ_APPROVAL_SCENARIO = "local-file-read-approval";
 const TOP_ISLAND_EXECUTION_PROGRESS_SCENARIO = "top-island-execution-progress";
 const TOP_ISLAND_PLAN_TASK_PROGRESS_SCENARIO = "top-island-plan-task-progress";
+const TOP_ISLAND_PENDING_TOOL_REVIEW_SCENARIO = "top-island-pending-tool-review";
 const GAME_STUDIO_TOOL_GROUP_COLLAPSE_SCENARIO = "game-studio-tool-group-collapse";
 const GAME_STUDIO_AWAITING_CHOICE_SCENARIO = "game-studio-awaiting-choice";
 const SIDEBAR_REMOVE_LAST_WORKSPACE_SCENARIO = "sidebar-remove-last-workspace";
@@ -2105,6 +2106,178 @@ function seedTopIslandPlanTaskProgressScenario() {
 
   const cleanup = () => {
     useAppStore.setState({ abortController: null, isGenerating: false, agentStatus: "idle" });
+  };
+
+  return cleanup;
+}
+
+function seedTopIslandPendingToolReviewScenario() {
+  const bridge = getBridge();
+  if (!bridge) return undefined;
+
+  bridge.events = [{ type: "boot" }];
+  bridge.savedDocuments = [];
+  bridge.completed = false;
+
+  const workspace = "/tmp/e2e-top-island-pending-tool-review";
+  const sessionId = 999603;
+  const now = Date.now();
+  const turnId = "e2e-top-island-pending-tool-review-turn";
+  const userBlockId = useAppStore.getState()._nextTaskId();
+  const reviewBlockId = useAppStore.getState()._nextTaskId();
+  const longCommand = "printf '\\x89PNG\\r\\n\\x1a\\n\\x00\\x00\\x00\\rIHDR\\x00\\x00\\x00\\x01\\x00\\x00\\x00\\x01\\x08\\x02\\x00\\x00\\x00\\x90wS\\xde\\x00\\x00\\x00\\x0cIDATx\\x9cc\\xf8\\x0f\\x00\\x01\\x01\\x01\\x00\\x18\\xdd\\x8d\\xb4\\x00\\x00\\x00\\x00IEND\\xaeB`\\x82' > src-tauri/icons/icon.png && echo Created valid icon.png";
+  const planTasks = Array.from({ length: 12 }, (_, index) => {
+    const taskNumber = index + 1;
+    return {
+      id: `review-plan-task-${taskNumber}`,
+      text: `T${taskNumber}: 执行验证步骤 — 证据: cmd:npm run check-${taskNumber}`,
+      status: taskNumber <= 8 ? "completed" as const : "in_progress" as const,
+      claimedStatus: taskNumber <= 8 ? "completed" as const : "pending" as const,
+      evidence: [{ kind: "cmd" as const, value: `npm run check-${taskNumber}` }],
+      evidenceStatus: taskNumber <= 8 ? "satisfied" as const : "missing" as const,
+    };
+  });
+  const evidenceLedger = planTasks.slice(0, 8).map((task, index) => ({
+    id: `review-evidence-${index + 1}`,
+    kind: "cmd" as const,
+    value: `npm run check-${index + 1}`,
+    target: task.text,
+    sourceTool: "run_command",
+    createdAt: now + index,
+  }));
+
+  incrementSeedCount(TOP_ISLAND_PENDING_TOOL_REVIEW_SCENARIO);
+
+  useAppStore.setState((state) => ({
+    ...state,
+    config: {
+      ...state.config,
+      language: "zh",
+      workflowMode: "plan",
+    },
+    currentWorkspace: workspace,
+    sessionsByWorkspace: {
+      [workspace]: [
+        {
+          id: sessionId,
+          title: "E2E TopIsland Pending Tool Review",
+          date: new Date(now).toISOString(),
+          active: true,
+          messages: [],
+        },
+      ],
+    },
+    currentSessionId: sessionId,
+    taskFlow: [
+      { id: userBlockId, turnId, type: "user", content: "/计划 执行含长命令审批的任务。" },
+      {
+        id: reviewBlockId,
+        turnId,
+        type: "tool" as const,
+        toolName: "run_command",
+        target: longCommand,
+        status: "pending_review",
+        toolStatus: "pending" as const,
+        message: "Waiting for shell permission approval.",
+        shellPermissionDecision: {
+          command: longCommand,
+          decision: "ask",
+          source: "builtin_default",
+          sourcePath: null,
+          segmentDecisions: [
+            {
+              command: longCommand,
+              decision: "ask",
+              matchedRule: "printf",
+              suggestedRule: "printf",
+              riskLevel: "medium",
+              reviewReason: "Shell segment writes a workspace file.",
+            },
+          ],
+          allowedBy: null,
+          matchedRule: "printf",
+          suggestedRule: "printf",
+          suggestedRules: ["printf"],
+          riskLevel: "medium",
+          reviewReason: "Shell segment writes a workspace file.",
+          requiresApproval: true,
+        },
+      },
+    ],
+    conversationTurns: [
+      {
+        id: turnId,
+        userPrompt: "/计划 执行含长命令审批的任务。",
+        title: "长命令审批回归",
+        mode: "plan",
+        intent: "plan",
+        status: "awaiting_approval",
+        summary: "TopIsland 应优先展示审批按钮。",
+        blockIds: [userBlockId, reviewBlockId],
+        collapsed: false,
+        createdAt: now,
+      },
+    ],
+    currentTurnId: turnId,
+    planArtifacts: [
+      {
+        kind: "tasks",
+        path: ".MAIN/plans/tasks.md",
+        title: "Tasks",
+        content: planTasks.map((task) => `- [${task.status === "completed" ? "x" : " "}] ${task.text}`).join("\n"),
+        updatedAt: now,
+      },
+    ],
+    planTasks,
+    planExecutionEvidenceLedger: evidenceLedger,
+    planExecutionEvidenceCount: evidenceLedger.length,
+    planStage: "executing",
+    isPlanApproved: true,
+    showPlanPanel: false,
+    showDiff: false,
+    showTerminal: false,
+    showFilePanel: false,
+    rightPanelTab: "plan",
+    agentStatus: "pending_review",
+    isGenerating: false,
+    abortController: null,
+    pendingReviewResolve: () => undefined,
+    pendingReviewTaskId: reviewBlockId,
+    pendingToolCall: {
+      name: "run_command",
+      arguments: { command: longCommand },
+      shellPermissionDecision: {
+        command: longCommand,
+        decision: "ask",
+        source: "builtin_default",
+        sourcePath: null,
+        segmentDecisions: [],
+        allowedBy: null,
+        matchedRule: "printf",
+        suggestedRule: "printf",
+        suggestedRules: ["printf"],
+        riskLevel: "medium",
+        reviewReason: "Shell segment writes a workspace file.",
+        requiresApproval: true,
+      },
+    },
+    selectedDiffTaskId: null,
+    input: "",
+    attachedFiles: [],
+    contextMentions: [],
+  }));
+
+  appendBridgeEvent("seeded", { seedCount: readSeedCount(TOP_ISLAND_PENDING_TOOL_REVIEW_SCENARIO) });
+  bindBridgeSnapshot(TOP_ISLAND_PENDING_TOOL_REVIEW_SCENARIO);
+
+  const cleanup = () => {
+    useAppStore.setState({
+      pendingReviewResolve: null,
+      pendingReviewTaskId: null,
+      pendingToolCall: null,
+      agentStatus: "idle",
+      isGenerating: false,
+    });
   };
 
   return cleanup;
@@ -4579,6 +4752,10 @@ export function initializeE2EScenarios(): (() => void) | undefined {
 
   if (scenario === TOP_ISLAND_PLAN_TASK_PROGRESS_SCENARIO) {
     return seedTopIslandPlanTaskProgressScenario();
+  }
+
+  if (scenario === TOP_ISLAND_PENDING_TOOL_REVIEW_SCENARIO) {
+    return seedTopIslandPendingToolReviewScenario();
   }
 
   if (scenario === GAME_STUDIO_TOOL_GROUP_COLLAPSE_SCENARIO) {

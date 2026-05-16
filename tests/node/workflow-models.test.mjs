@@ -750,6 +750,34 @@ test("command evidence still satisfies explicit cmd tasks", () => {
   assert.equal(isPlanTaskTrustedComplete(reconciled[0]), true);
 });
 
+test("package install commands satisfy package manifest evidence only", () => {
+  const installCommand = createPlanExecutionEvidenceEntry({
+    toolName: "run_command",
+    target: "npm install",
+    result: JSON.stringify({ exitCode: 0, stdout: "added 230 packages" }),
+  });
+  const verifyCommand = createPlanExecutionEvidenceEntry({
+    toolName: "run_command",
+    target: "npm ls echarts antd zustand",
+    result: JSON.stringify({ exitCode: 0, stdout: "echarts antd zustand" }),
+  });
+  const ledger = [installCommand, verifyCommand].filter(Boolean);
+
+  const dependencyTask = reconcilePlanTaskCompletion(
+    [],
+    extractPlanTasks("- [ ] 安装前端依赖 — 证据: file:package.json (dependencies 区块), cmd:npm ls echarts antd zustand"),
+    ledger,
+  );
+  const sourceTask = reconcilePlanTaskCompletion(
+    [],
+    extractPlanTasks("- [ ] 修改入口文件 — 证据: file:src/App.tsx"),
+    installCommand ? [installCommand] : [],
+  );
+
+  assert.equal(isPlanTaskTrustedComplete(dependencyTask[0]), true);
+  assert.equal(isPlanTaskTrustedComplete(sourceTask[0]), false);
+});
+
 test("verification evidence never treats .MAIN plans as project source", () => {
   const planVerification = createPlanExecutionEvidenceEntry({
     toolName: "read_file",

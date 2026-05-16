@@ -4140,6 +4140,7 @@ fn write_pty(
     input: String,
     session_key: Option<String>,
     permission_approval: Option<harness::permissions::ShellPermissionApproval>,
+    user_terminal: Option<bool>,
 ) -> Result<(), String> {
     let mut guard = state
         .sessions
@@ -4149,12 +4150,16 @@ fn write_pty(
     let session = guard
         .get_mut(&key)
         .ok_or_else(|| "PTY 尚未启动，请先调用 spawn_pty".to_string())?;
-    validate_pty_input(
-        &session.workspace,
-        &mut session.pending_command,
-        &input,
-        permission_approval.as_ref(),
-    )?;
+    if user_terminal != Some(true) {
+        validate_pty_input(
+            &session.workspace,
+            &mut session.pending_command,
+            &input,
+            permission_approval.as_ref(),
+        )?;
+    } else {
+        session.pending_command.clear();
+    }
     let mut writer = session
         .writer
         .lock()

@@ -23,6 +23,7 @@ interface TopIslandProps {
   replyOptions?: ReplyOption[];
   pendingRunDecision?: PendingRunDecision | null;
   activeDiffTask?: any;
+  pendingToolReview?: any;
   canApprovePlan: boolean;
   autoApproveTools?: boolean;
   onSelectReplyOption?: (option: ReplyOption) => void;
@@ -86,6 +87,7 @@ const TopIsland = memo(function TopIsland({
   replyOptions = [],
   pendingRunDecision = null,
   activeDiffTask,
+  pendingToolReview,
   canApprovePlan,
   autoApproveTools,
   onSelectReplyOption,
@@ -123,7 +125,9 @@ const TopIsland = memo(function TopIsland({
   // region: TopIsland 展开时机
   const hasReplyOptions = hasRealChoiceOptions || hasApprovalActionOptions;
   const hasPendingRunDecision = !!pendingRunDecision;
-  const hasActiveDiffPreview = !!activeDiffTask?.diff;
+  const activeReviewTask = pendingToolReview || activeDiffTask;
+  const hasPendingToolReview = !!activeReviewTask;
+  const hasActiveDiffPreview = !!activeReviewTask?.diff;
   const hasChoicePromptContent = hasReplyOptions || isAwaitingChoice || hasPendingRunDecision;
   const choicePromptKey = useMemo(() => {
     if (!hasChoicePromptContent) return "";
@@ -138,21 +142,21 @@ const TopIsland = memo(function TopIsland({
     hasReplyOptions ||
     isAwaitingChoice ||
     hasPendingRunDecision ||
-    !!activeDiffTask ||
+    hasPendingToolReview ||
     canApprovePlan ||
     planTasks.length > 0 ||
     executionSteps.length > 0;
-  const hasNonChoiceExpandableContent = !!activeDiffTask || canApprovePlan || planTasks.length > 0 || executionSteps.length > 0;
+  const hasNonChoiceExpandableContent = hasPendingToolReview || canApprovePlan || planTasks.length > 0 || executionSteps.length > 0;
   const choicePromptForcesExpanded = hasChoicePromptContent && !isChoicePromptManuallyCollapsed;
-  const forceExpanded = choicePromptForcesExpanded || !!activeDiffTask || canApprovePlan;
+  const forceExpanded = choicePromptForcesExpanded || hasPendingToolReview || canApprovePlan;
   const hoverExpandableContent = isChoicePromptManuallyCollapsed ? hasNonChoiceExpandableContent : hasExpandableContent;
-  const actionable = hasChoicePromptContent || !!activeDiffTask || canApprovePlan;
+  const actionable = hasChoicePromptContent || hasPendingToolReview || canApprovePlan;
   const isPlanApprovalOnly =
     canApprovePlan &&
     !hasReplyOptions &&
     !isAwaitingChoice &&
     !hasPendingRunDecision &&
-    !activeDiffTask;
+    !hasPendingToolReview;
   const activeProgressMode = planTasks.length > 0 ? "plan" : progressMode === "execution" ? "execution" : executionSteps.length > 0 ? "execution" : "plan";
   const planTaskAudit = useMemo(
     () => buildPlanTaskEvidenceAudit({ tasks: planTasks, evidenceLedger: planExecutionEvidenceLedger }),
@@ -177,6 +181,7 @@ const TopIsland = memo(function TopIsland({
     }));
   }, [activeProgressMode, auditedPlanTasks, executionSteps]);
   const hasTasks = progressItems.length > 0;
+  const shouldCompactTasksForReview = hasPendingToolReview && hasTasks;
   const shouldExpandWidth = forceExpanded || (hoverExpandableContent && (hovered || pinnedOpen));
   const isExpanded = forceExpanded || (hoverExpandableContent && (hovered || pinnedOpen));
   // endregion
@@ -187,7 +192,7 @@ const TopIsland = memo(function TopIsland({
     const firstIncomplete = auditedPlanTasks.find((task) => !(task.evidenceStatus === "satisfied" && task.status === "completed")) || auditedPlanTasks[auditedPlanTasks.length - 1];
     return firstIncomplete?.id || null;
   }, [activeProgressMode, auditedPlanTasks]);
-  const visibleTasks = progressItems;
+  const visibleTasks = shouldCompactTasksForReview ? [] : progressItems;
 
   const copy = useMemo(() => ({
     viewing: language === "zh" ? "当前查看" : "Viewing",
@@ -360,7 +365,7 @@ const TopIsland = memo(function TopIsland({
                 {copy.pendingDecision}
               </span>
             )}
-            {activeDiffTask && hasActiveDiffPreview && (
+            {activeReviewTask && hasActiveDiffPreview && (
               <span className="shrink-0 rounded-full border border-[rgba(96,165,250,0.25)] bg-[rgba(96,165,250,0.12)] px-2 py-0.5 text-[10px] text-[#93c5fd]">
                 {copy.diffRequest}
               </span>
@@ -525,6 +530,14 @@ const TopIsland = memo(function TopIsland({
                     style={{ width: `${progress}%`, background: "linear-gradient(90deg, var(--accent, #7c3aed), #3b82f6)" }}
                   />
                 </div>
+                {shouldCompactTasksForReview && (
+                  <div className={`mt-2 text-[11px] ${secondaryText}`}>
+                    {language === "zh"
+                      ? "已有待审批工具，任务明细已收起。"
+                      : "Task details are collapsed while a tool review is pending."}
+                  </div>
+                )}
+                {!shouldCompactTasksForReview && (
                 <div className="mt-3 max-h-[220px] space-y-2 overflow-y-auto pr-1">
                   {visibleTasks.map((task, index) => {
                     const isCurrentPlanTask = activeProgressMode === "plan" && task.id === currentPlanTaskId && !task.complete;
@@ -567,6 +580,7 @@ const TopIsland = memo(function TopIsland({
                     );
                   })}
                 </div>
+                )}
               </div>
             )}
 
@@ -664,16 +678,17 @@ const TopIsland = memo(function TopIsland({
               </div>
             )}
 
-            {(activeDiffTask || canApprovePlan) && (
-              <div className={`mt-3 grid gap-3 ${activeDiffTask && canApprovePlan ? "md:grid-cols-2" : ""}`}>
-                {activeDiffTask && (
-                  <div>
-                    <div className={`rounded-2xl border p-3 ${surface}`}>
-                      <div className={`text-[12px] font-medium ${primaryText}`}>{copy.pendingReview}</div>
-                      <div className={`mt-1 break-words text-[12px] leading-6 ${secondaryText}`}>{activeDiffTask.target}</div>
-                      <div className={`mt-1 text-[11px] ${secondaryText}`}>{copy.chooseApproval}</div>
+            {(activeReviewTask || canApprovePlan) && (
+              <div className={`mt-3 grid gap-3 ${activeReviewTask && canApprovePlan ? "md:grid-cols-2" : ""}`}>
+                {activeReviewTask && (
+                  <div data-testid="top-island-tool-review" className={`rounded-2xl border p-3 ${surface}`}>
+                    <div className="flex min-w-0 items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className={`text-[12px] font-medium ${primaryText}`}>{copy.pendingReview}</div>
+                        <div className={`mt-1 text-[11px] ${secondaryText}`}>{copy.chooseApproval}</div>
+                      </div>
                     </div>
-                    <div className="mt-3 flex flex-wrap items-center justify-end gap-2 px-1">
+                    <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
                       {hasActiveDiffPreview && (
                         <button
                           onClick={onOpenDiff}
@@ -686,7 +701,7 @@ const TopIsland = memo(function TopIsland({
                         </button>
                       )}
                       <button
-                        onClick={() => onRejectDiff?.(activeDiffTask.id)}
+                        onClick={() => onRejectDiff?.(activeReviewTask.id)}
                         className="rounded-lg border border-[#3f3f46] bg-[#09090b] px-4 py-2 text-[12px] font-medium text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#f5f5f5]"
                       >
                         {copy.reject}
@@ -708,6 +723,17 @@ const TopIsland = memo(function TopIsland({
                       >
                         {copy.approveDiffOnce}
                       </button>
+                    </div>
+                    <div
+                      className={`mt-3 max-h-[4.8rem] overflow-hidden rounded-xl border border-[rgba(255,255,255,0.06)] bg-[rgba(0,0,0,0.22)] px-3 py-2 font-mono text-[11px] leading-6 ${secondaryText}`}
+                      style={{
+                        overflowWrap: "anywhere",
+                        display: "-webkit-box",
+                        WebkitLineClamp: 3,
+                        WebkitBoxOrient: "vertical",
+                      }}
+                    >
+                      {activeReviewTask.target}
                     </div>
                   </div>
                 )}

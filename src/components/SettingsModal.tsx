@@ -1403,7 +1403,7 @@ function FeishuAdapterPanel({ config, setConfig, t }: { config: any; setConfig: 
     try {
       useAppStore.getState().setShowTerminal(true);
       await spawnPty(140, 40);
-      await writePty(buildNodeSetupCommand(language) + "\n");
+      await writePty(buildNodeSetupCommand(language) + "\n", undefined, undefined, true);
       setNodeSetupMsg({
         type: "success",
         text: language === "en"
