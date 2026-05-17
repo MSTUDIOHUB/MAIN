@@ -336,3 +336,125 @@ export async function preparePublicRelease({
     websiteLinksPath,
   };
 }
+
+export const UPDATER_PLATFORM_ASSETS = [
+  {
+    id: "darwin-x86_64",
+    fileName: ({ appName, version }) => `${appName}_${version}_updater_darwin_x86_64.app.tar.gz`,
+    aliases: ["darwin-x86_64", "darwin-x86_64-app"],
+  },
+  {
+    id: "darwin-aarch64",
+    fileName: ({ appName, version }) => `${appName}_${version}_updater_darwin_aarch64.app.tar.gz`,
+    aliases: ["darwin-aarch64", "darwin-aarch64-app"],
+  },
+  {
+    id: "windows-x86_64",
+    fileName: ({ appName, version }) => `${appName}_${version}_updater_windows_x86_64.exe`,
+    aliases: ["windows-x86_64", "windows-x86_64-nsis"],
+  },
+];
+
+function assetDownloadUrl({ updateRepo, version, fileName }) {
+  return `https://github.com/${updateRepo}/releases/download/v${version}/${encodeURIComponent(fileName)}`;
+}
+
+async function readExistingManifest(existingManifestPath, version) {
+  if (!existingManifestPath || !(await pathExists(existingManifestPath))) {
+    return null;
+  }
+
+  const manifest = JSON.parse(await fs.readFile(existingManifestPath, "utf8"));
+  if (manifest.version !== version || !manifest.platforms || typeof manifest.platforms !== "object") {
+    return null;
+  }
+
+  return manifest;
+}
+
+export async function buildUpdaterManifest({
+  assetsDir,
+  version,
+  updateRepo,
+  notes,
+  appName = APP_NAME,
+  existingManifestPath = "",
+  generatedAt = new Date(),
+}) {
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(updateRepo || "")) {
+    throw new Error(`Invalid updater repo: ${updateRepo}`);
+  }
+
+  const existingManifest = await readExistingManifest(existingManifestPath, version);
+  const platforms = {
+    ...(existingManifest?.platforms || {}),
+  };
+  const discoveredPlatformIds = [];
+
+  for (const spec of UPDATER_PLATFORM_ASSETS) {
+    const fileName = spec.fileName({ appName, version });
+    const assetPath = path.join(assetsDir, fileName);
+
+    if (!(await pathExists(assetPath))) {
+      continue;
+    }
+
+    const signaturePath = `${assetPath}.sig`;
+    if (!(await pathExists(signaturePath))) {
+      throw new Error(`Missing updater signature: ${signaturePath}`);
+    }
+
+    const entry = {
+      signature: (await fs.readFile(signaturePath, "utf8")).trim(),
+      url: assetDownloadUrl({ updateRepo, version, fileName }),
+    };
+
+    spec.aliases.forEach((alias) => {
+      platforms[alias] = entry;
+    });
+    discoveredPlatformIds.push(spec.id);
+  }
+
+  if (Object.keys(platforms).length === 0) {
+    throw new Error(`No updater assets found for version ${version}`);
+  }
+
+  return {
+    manifest: {
+      version,
+      notes,
+      pub_date: generatedAt.toISOString().replace(/\.\d{3}Z$/, "Z"),
+      platforms,
+    },
+    discoveredPlatformIds,
+  };
+}
+
+export async function writeUpdaterManifest({
+  assetsDir,
+  version,
+  updateRepo,
+  notesPath,
+  outputPath = path.join(assetsDir, "latest.json"),
+  appName = APP_NAME,
+  existingManifestPath = "",
+  generatedAt,
+}) {
+  const notes = await fs.readFile(notesPath, "utf8");
+  const result = await buildUpdaterManifest({
+    assetsDir,
+    version,
+    updateRepo,
+    notes,
+    appName,
+    existingManifestPath,
+    generatedAt,
+  });
+
+  await fs.writeFile(outputPath, `${JSON.stringify(result.manifest, null, 2)}\n`, "utf8");
+
+  return {
+    ...result,
+    outputPath,
+  };
+}

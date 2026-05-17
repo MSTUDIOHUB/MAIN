@@ -63,6 +63,80 @@ npm run release:desktop -- 1.5.5
 
 如果缺少 updater 签名 Secrets，workflow 会失败并提示补齐，避免发布一个无法自动更新的版本。
 
+## 本地公开发布：不用 GitHub Actions
+
+如果 Actions 额度用完，可以直接本地打包并上传公开 Release。先准备好 GitHub CLI 登录状态，并在当前 shell 设置 Tauri updater 私钥：
+
+本地上传不依赖 `PUBLIC_RELEASES_TOKEN` 这个 Actions Secret，但当前 `gh auth login` 的账号需要有 `MAIN-Releases` 和 `MAIN-UpdateFeed` 的 Release 写权限。
+
+macOS / zsh：
+
+```bash
+export TAURI_SIGNING_PRIVATE_KEY='<你的 updater 私钥内容>'
+export TAURI_SIGNING_PRIVATE_KEY_PASSWORD='<你的 updater 私钥密码>'
+```
+
+Windows / PowerShell：
+
+```powershell
+$env:TAURI_SIGNING_PRIVATE_KEY = '<你的 updater 私钥内容>'
+$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = '<你的 updater 私钥密码>'
+```
+
+### macOS 本机发布
+
+```bash
+npm run release:local:mac -- <version>
+```
+
+第一次在本机打 universal 包前，如果缺少 Rust target，脚本会提示执行：
+
+```bash
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
+```
+
+这会生成并上传：
+
+- `MAIN_<version>_macOS_universal.zip`
+- `MAIN_<version>_macOS_apple_silicon.zip`
+- `MAIN_<version>_updater_darwin_x86_64.app.tar.gz`
+- `MAIN_<version>_updater_darwin_x86_64.app.tar.gz.sig`
+- `MAIN_<version>_updater_darwin_aarch64.app.tar.gz`
+- `MAIN_<version>_updater_darwin_aarch64.app.tar.gz.sig`
+- `latest.json`
+
+本地暂存目录：
+
+```text
+release-output/local/v<version>/assets/
+```
+
+只生成文件、不上传：
+
+```bash
+npm run release:local:mac -- <version> --no-upload
+```
+
+### Windows 虚拟机发布
+
+Windows 正式发布建议在 Windows VM 或 Windows 真机里跑：
+
+```powershell
+npm install
+npm run release:local:windows -- <version>
+```
+
+这会生成并上传：
+
+- `MAIN_<version>_windows_x64.zip`
+- `MAIN_<version>_updater_windows_x86_64.exe`
+- `MAIN_<version>_updater_windows_x86_64.exe.sig`
+- `latest.json`
+
+如果另一个平台已经先上传过，脚本会下载并合并现有 `latest.json`，避免覆盖对方平台的自动更新入口。
+
+Windows 不建议作为默认流程在 Mac 上交叉打包：Tauri 官方文档说明 MSI 只能在 Windows 上生成，NSIS 虽可从 macOS/Linux 交叉编译但限制较多。稳定发布优先用 Windows VM。
+
 ## macOS 打包
 
 ### 本地验证未签名包

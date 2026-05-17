@@ -88,6 +88,7 @@ const {
   collectChangeEntries,
   detectExplicitLanguageOverride,
   detectResponseLanguageMismatch,
+  deriveRuntimePlanTasksFromArtifacts,
   deriveVisibleConversationTurnStatus,
   extractPlanTasks,
   findDroppedPlanTasks,
@@ -678,6 +679,56 @@ test("plan verification reads only satisfy explicit tool evidence", () => {
   assert.equal(verification?.kind, "tool");
   assert.equal(isPlanTaskTrustedComplete(fileTask[0]), false);
   assert.equal(isPlanTaskTrustedComplete(toolTask[0]), true);
+});
+
+test("runtime plan task derivation creates executable tasks without tasks.md", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([
+    {
+      kind: "design",
+      path: ".MAIN/plans/design.md",
+      title: "Design",
+      updatedAt: 1,
+      content: [
+        "# Design",
+        "",
+        "## 执行顺序",
+        "- 更新 src/lib/runtimeTools.ts，让批准后的 runtime 任务清单可以解锁执行。",
+        "- 调整 src/store/useAppStore.ts，在批准时派生 runtime 任务。",
+        "- 运行 `node --test tests/node/runtime-tools-events-envelope.test.mjs` 验证闸门。",
+      ].join("\n"),
+    },
+  ], { language: "zh" });
+
+  assert.ok(tasks.length >= 3);
+  assert.equal(tasks.some((task) => task.evidence?.some((item) => item.kind === "file" && item.value === "src/lib/runtimeTools.ts")), true);
+  assert.equal(tasks.some((task) => task.evidence?.some((item) => item.kind === "cmd" && item.value.includes("runtime-tools-events-envelope"))), true);
+});
+
+test("runtime synthetic tool evidence is reconciled from real workspace activity", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([
+    {
+      kind: "design",
+      path: ".MAIN/plans/design.md",
+      title: "Design",
+      updatedAt: 1,
+      content: "# Design\n\n## 执行顺序\n- 完成核心功能实现。\n- 验证实现结果是否可用。",
+    },
+  ], { language: "zh" });
+  const writeEvidence = createPlanExecutionEvidenceEntry({
+    toolName: "replace_in_file",
+    target: "src/App.tsx",
+    result: JSON.stringify({ success: true }),
+  });
+  const verificationEvidence = createPlanExecutionEvidenceEntry({
+    toolName: "run_command",
+    target: "npm test",
+    result: JSON.stringify({ exitCode: 0 }),
+  });
+  const reconciled = reconcilePlanTaskCompletion([], tasks, [writeEvidence, verificationEvidence].filter(Boolean));
+
+  assert.equal(reconciled.some((task) => task.evidence?.some((item) => item.value === "workspace_write")), true);
+  assert.equal(reconciled.some((task) => task.evidence?.some((item) => item.value === "verification")), true);
+  assert.equal(buildPlanTaskEvidenceAudit({ tasks: reconciled }).acceptedCompletion, true);
 });
 
 test("read-only shell commands do not satisfy file evidence", () => {

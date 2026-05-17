@@ -493,8 +493,8 @@ export function buildPlanMaxIterationsResumePrompt(input: {
   const remainingText = remaining.length > 0
     ? remaining.map((task, index) => `${index + 1}. ${summarizeTask(task)}`).join("\n")
     : input.language === "zh"
-    ? "没有找到证据未满足的任务；请先核查 tasks.md 是否缺失或状态不可信。"
-    : "No task with unsatisfied evidence was found; first verify whether tasks.md is missing or stale.";
+    ? "没有找到证据未满足的任务；请先核查 runtime 任务清单或 tasks.md 是否缺失、状态是否不可信。"
+    : "No task with unsatisfied evidence was found; first verify whether the runtime task list or tasks.md is missing or stale.";
   const evidenceText = summarizePlanExecutionEvidence(input.evidenceLedger)
     .map((line) => `- ${line}`)
     .join("\n") || (input.language === "zh" ? "- 暂无可信项目源码证据" : "- No trusted project-source evidence yet");
@@ -510,8 +510,10 @@ export function buildPlanMaxIterationsResumePrompt(input: {
       "请在新的恢复上下文中继续执行已批准计划。这是 MAIN 在 50 轮安全边界后的自动恢复，只允许继续真实未完成工作。",
       input.hasTasksArtifact
         ? "先重新读取当前 workspace 状态和 `.MAIN/plans/tasks.md`，从第一个证据未满足的任务继续。"
-        : "先基于已批准的 design.md 或 bugfix.md 重新生成 `.MAIN/plans/tasks.md`；旧 requirements.md 只作为辅助上下文，再执行真实任务。",
-      "不要重做已经满足证据的任务；不要只修改 checkbox；不要重复计划说明；不要把 `.MAIN/plans` 当作用户源码证据。需要判断源码现状时，直接读取真实项目文件。",
+        : input.tasks.length > 0
+        ? "当前已有 runtime 任务清单；先重新读取当前 workspace 状态，再从第一个证据未满足的任务继续。只有长任务、跨会话恢复或需要审计留档时才持久化 `.MAIN/plans/tasks.md`。"
+        : "先基于已批准的 design.md 或 bugfix.md 派生 runtime 任务清单；旧 requirements.md 只作为辅助上下文。只有长任务、跨会话恢复或需要审计留档时才生成 `.MAIN/plans/tasks.md`，再执行真实任务。",
+      "不要重做已经满足证据的任务；如果存在 tasks.md，不要只修改 checkbox；不要重复计划说明；不要把 `.MAIN/plans` 当作用户源码证据。需要判断源码现状时，直接读取真实项目文件。",
       "",
       "Checkpoint:",
       `- iterationBoundary: ${input.checkpoint.iterationCount}/${input.checkpoint.maxIterations}`,
@@ -536,8 +538,10 @@ export function buildPlanMaxIterationsResumePrompt(input: {
     "Continue the approved plan in a fresh recovery context. This is MAIN's automatic recovery after the 50-iteration safety boundary; only continue real unfinished work.",
     input.hasTasksArtifact
       ? "First reread current workspace state and `.MAIN/plans/tasks.md`, then continue from the first task whose evidence is not satisfied."
-      : "First regenerate `.MAIN/plans/tasks.md` from the approved design.md or bugfix.md; use any legacy requirements.md only as supporting context, then execute real tasks.",
-    "Do not redo tasks whose evidence is already satisfied. Do not only edit checkboxes. Do not restate the plan. Do not treat `.MAIN/plans` as project-source evidence; read real project files when source state matters.",
+      : input.tasks.length > 0
+      ? "A runtime task list is already available; first reread current workspace state, then continue from the first task whose evidence is not satisfied. Persist `.MAIN/plans/tasks.md` only for long work, cross-session recovery, or audit-file needs."
+      : "First derive a runtime task list from the approved design.md or bugfix.md; use any legacy requirements.md only as supporting context. Generate `.MAIN/plans/tasks.md` only for long work, cross-session recovery, or audit-file needs, then execute real tasks.",
+    "Do not redo tasks whose evidence is already satisfied. If tasks.md exists, do not only edit checkboxes. Do not restate the plan. Do not treat `.MAIN/plans` as project-source evidence; read real project files when source state matters.",
     "",
     "Checkpoint:",
     `- iterationBoundary: ${input.checkpoint.iterationCount}/${input.checkpoint.maxIterations}`,

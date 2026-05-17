@@ -158,7 +158,7 @@ test("runtime tool planner classifies lifecycle actions and initial states", () 
   assert.equal(initialLifecycleStateForPlanAction(reviewRequired.action), "awaiting_review");
 });
 
-test("approved plan execution blocks shell and source writes until tasks exist", () => {
+test("approved plan execution blocks shell and source writes until runtime tasks exist", () => {
   const base = {
     workflowMode: "plan",
     runtimeIntent: "execute",
@@ -219,6 +219,36 @@ test("approved plan execution blocks shell and source writes until tasks exist",
     },
   }));
   assert.equal(tasksAllowed.action, "spec_file_auto_approved");
+});
+
+test("approved plan execution allows source work when runtime tasks exist", () => {
+  const base = {
+    workflowMode: "plan",
+    runtimeIntent: "execute",
+    isPlanApproved: true,
+    planTaskCount: 2,
+    availableToolNames: new Set(["read_file", "write_file", "run_command"]),
+  };
+
+  const sourceWrite = planRuntimeToolCall(createPlanInput({
+    ...base,
+    toolCall: {
+      id: "source-with-runtime-tasks",
+      name: "write_file",
+      arguments: JSON.stringify({ path: "src/main.ts", content: "export {};" }),
+    },
+  }));
+  assert.equal(sourceWrite.action, "review_required");
+
+  const shellRun = planRuntimeToolCall(createPlanInput({
+    ...base,
+    toolCall: {
+      id: "shell-with-runtime-tasks",
+      name: "run_command",
+      arguments: JSON.stringify({ command: "npm test", cwd: "." }),
+    },
+  }));
+  assert.equal(shellRun.action, "review_required");
 });
 
 test("thread event helpers stamp schema, detect terminal events, and keep ring buffer", () => {

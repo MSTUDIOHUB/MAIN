@@ -10,6 +10,7 @@ import {
   syncReleaseVersions,
   toMacBundleVersion,
   toWindowsWixVersion,
+  writeUpdaterManifest,
 } from "../../scripts/release_tools.mjs";
 import { resolveReleaseMacVersion } from "../../scripts/release-mac.mjs";
 
@@ -158,4 +159,62 @@ test("preparePublicRelease copies assets and writes metadata", async () => {
   assert.deepEqual(stageFileNames, ["assets", "release-metadata.json", "release-notes.md", "website-links.json"]);
   assert.doesNotMatch(notes, /SHA256SUMS/);
   assert.match(notes, /gh release create v1\.1\.1/);
+});
+
+test("writeUpdaterManifest writes local updater entries and preserves existing platforms", async () => {
+  const rootDir = await createTempWorkspace();
+  const version = "1.1.1";
+  const assetsDir = path.join(rootDir, "release-assets");
+  const notesPath = path.join(assetsDir, "release-notes.md");
+  const existingManifestPath = path.join(rootDir, "existing-latest.json");
+
+  await fs.mkdir(assetsDir, { recursive: true });
+  await fs.writeFile(notesPath, "# MAIN 1.1.1\n");
+  await fs.writeFile(path.join(assetsDir, `MAIN_${version}_updater_darwin_aarch64.app.tar.gz`), "mac-updater");
+  await fs.writeFile(path.join(assetsDir, `MAIN_${version}_updater_darwin_aarch64.app.tar.gz.sig`), "mac-signature\n");
+  await fs.writeFile(
+    existingManifestPath,
+    `${JSON.stringify(
+      {
+        version,
+        notes: "old notes",
+        pub_date: "2026-01-01T00:00:00Z",
+        platforms: {
+          "windows-x86_64": {
+            signature: "windows-signature",
+            url: `https://github.com/mstudiohub/MAIN-UpdateFeed/releases/download/v${version}/MAIN_${version}_updater_windows_x86_64.exe`,
+          },
+          "windows-x86_64-nsis": {
+            signature: "windows-signature",
+            url: `https://github.com/mstudiohub/MAIN-UpdateFeed/releases/download/v${version}/MAIN_${version}_updater_windows_x86_64.exe`,
+          },
+        },
+      },
+      null,
+      2,
+    )}\n`,
+  );
+
+  const result = await writeUpdaterManifest({
+    assetsDir,
+    version,
+    updateRepo: "mstudiohub/MAIN-UpdateFeed",
+    notesPath,
+    existingManifestPath,
+    generatedAt: new Date("2026-05-17T00:00:00Z"),
+  });
+
+  const manifest = JSON.parse(await fs.readFile(result.outputPath, "utf8"));
+
+  assert.deepEqual(result.discoveredPlatformIds, ["darwin-aarch64"]);
+  assert.equal(manifest.version, version);
+  assert.equal(manifest.pub_date, "2026-05-17T00:00:00Z");
+  assert.equal(manifest.notes, "# MAIN 1.1.1\n");
+  assert.equal(manifest.platforms["darwin-aarch64"].signature, "mac-signature");
+  assert.equal(manifest.platforms["darwin-aarch64-app"].signature, "mac-signature");
+  assert.equal(manifest.platforms["windows-x86_64"].signature, "windows-signature");
+  assert.match(
+    manifest.platforms["darwin-aarch64"].url,
+    /https:\/\/github\.com\/mstudiohub\/MAIN-UpdateFeed\/releases\/download\/v1\.1\.1\/MAIN_1\.1\.1_updater_darwin_aarch64\.app\.tar\.gz/,
+  );
 });

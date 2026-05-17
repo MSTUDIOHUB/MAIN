@@ -1262,7 +1262,7 @@ function buildApprovedPlanNoToolPauseMessage(
         "",
         completionClaimRejected
           ? `原因：模型声称计划已完成，但可信任务审计没有通过；模型正文不会被当作完成证据。`
-          : `原因：模型连续 ${consecutiveNoToolCount} 次提前停止，返回了正文但没有继续调用工具；tasks.md 仍有证据未满足的任务。`,
+          : `原因：模型连续 ${consecutiveNoToolCount} 次提前停止，返回了正文但没有继续调用工具；当前任务清单仍有证据未满足的任务。`,
         "已保留当前 workspace、工具结果和任务证据，不会把这次正文当作完成证据。",
         ...(auditLine ? [auditLine] : []),
         "",
@@ -1282,7 +1282,7 @@ function buildApprovedPlanNoToolPauseMessage(
         "",
         completionClaimRejected
           ? "Reason: the model claimed the plan was complete, but the trusted task audit did not pass. Assistant prose is not completion evidence."
-          : `Reason: the model stopped early ${consecutiveNoToolCount} time(s), returned prose, and did not continue with tool calls while tasks.md still has unsatisfied evidence.`,
+          : `Reason: the model stopped early ${consecutiveNoToolCount} time(s), returned prose, and did not continue with tool calls while the current task list still has unsatisfied evidence.`,
         "MAIN preserved the current workspace, tool results, and evidence ledger. This prose is not treated as completion evidence.",
         ...(auditLine ? [auditLine] : []),
         "",
@@ -1641,12 +1641,12 @@ function buildPlanCommandExecutionHint(
 ): string {
   const focus = getPendingPlanTaskCommandFocus(tasks, 3);
   const diagnosticHint = language === "zh"
-    ? "诊断步骤优先使用内联 `run_command`，避免在项目根目录创建临时诊断脚本；确需脚本文件时，必须先写进 tasks.md，并使用明确临时路径或清理策略。"
-    : "For diagnostics, prefer inline `run_command` and avoid creating temporary diagnostic scripts in the project root; if a script file is truly needed, put that in tasks.md first and use an explicit temporary path or cleanup strategy.";
+    ? "诊断步骤优先使用内联 `run_command`，避免在项目根目录创建临时诊断脚本；确需脚本文件时，请先把它列入当前任务清单或持久化的 tasks.md，并使用明确临时路径或清理策略。"
+    : "For diagnostics, prefer inline `run_command` and avoid creating temporary diagnostic scripts in the project root; if a script file is truly needed, list it in the current task list or persisted tasks.md first and use an explicit temporary path or cleanup strategy.";
   if (focus.length === 0) {
     return language === "zh"
-      ? "如果某个任务需要运行 shell 命令，请先把精确命令写在 tasks.md 的 checkbox 文本里并用反引号包裹；进入执行后，一次性命令优先调用 run_command 并检查 exitCode/stdout/stderr，长驻或交互式命令调用 execute_command 后再用 read_pty_since/read_pty_tail/get_pty_status 检查输出，不能只用文字复述。" + diagnosticHint
-      : "If a task requires shell commands, write the exact commands inside the tasks.md checkbox text using backticks. During execution, prefer run_command for finite commands and inspect exitCode/stdout/stderr; use execute_command for long-running or interactive commands, then verify with read_pty_since/read_pty_tail/get_pty_status. Do not merely describe commands in prose. " + diagnosticHint;
+      ? "如果某个任务需要运行 shell 命令，请先把精确命令写在当前任务清单里并用反引号包裹；如果本轮持久化 tasks.md，也同步写入对应 checkbox。进入执行后，一次性命令优先调用 run_command 并检查 exitCode/stdout/stderr，长驻或交互式命令调用 execute_command 后再用 read_pty_since/read_pty_tail/get_pty_status 检查输出，不能只用文字复述。" + diagnosticHint
+      : "If a task requires shell commands, write the exact commands in the current task list using backticks; if this run persists tasks.md, mirror them in the matching checkbox. During execution, prefer run_command for finite commands and inspect exitCode/stdout/stderr; use execute_command for long-running or interactive commands, then verify with read_pty_since/read_pty_tail/get_pty_status. Do not merely describe commands in prose. " + diagnosticHint;
   }
 
   const detail = focus
@@ -1662,22 +1662,45 @@ function buildPlanCommandExecutionHint(
     : "The remaining tasks include shell commands that must be run for real. Prefer run_command for finite commands; for long-running or interactive commands call execute_command and verify with read_pty_since/read_pty_tail/get_pty_status. Do not just repeat them in prose:\n\n" + detail + "\n\n" + diagnosticHint;
 }
 
+function formatPlanTasksForContinuationPrompt(
+  tasks: PlanTask[],
+  language: "zh" | "en",
+  limit = 12,
+): string {
+  const visibleTasks = tasks.slice(0, limit);
+  if (visibleTasks.length === 0) return "";
+  const lines = visibleTasks.map((task, index) => {
+    const evidence = task.evidence?.map((item) => `${item.kind}:${item.value}`).join(", ") ||
+      (language === "zh" ? "无证据标签" : "no evidence label");
+    return `${index + 1}. ${task.text} [${evidence}]`;
+  }).join("\n");
+  return language === "zh"
+    ? "当前 runtime 任务清单：\n" + lines
+    : "Current runtime task list:\n" + lines;
+}
+
 function buildApprovedPlanContinuationPrompt(callbacks: OrchestratorCallbacks): string {
   const language = callbacks.getPreferredLanguage();
   const approvalChoiceHint = buildPlanApprovalChoiceHint(callbacks.getPlanApprovalChoice(), language);
   const requestedDocs = detectRequestedRootMarkdownDeliverables(getOriginalUserPromptForPlanFallback(callbacks));
+  const runtimeTaskList = formatPlanTasksForContinuationPrompt(callbacks.getPlanTasks(), language);
   const deliverableHint = requestedDocs.length > 0
     ? language === "zh"
-      ? `6. 用户明确要求最终文档：${requestedDocs.map((name) => `项目根目录 \`${name}\``).join("、")}。必须把它写进 tasks.md 的最后交付步骤，并在计划完成前真实写入。\n`
-      : `6. The user explicitly requested final document(s): ${requestedDocs.map((name) => `project-root \`${name}\``).join(", ")}. Add them as final tasks.md deliverables and write them before marking the plan complete.\n`
+      ? `6. 用户明确要求最终文档：${requestedDocs.map((name) => `项目根目录 \`${name}\``).join("、")}。必须把它写进当前任务清单；如果持久化 tasks.md，也作为最后交付步骤，并在计划完成前真实写入。\n`
+      : `6. The user explicitly requested final document(s): ${requestedDocs.map((name) => `project-root \`${name}\``).join(", ")}. Add them to the current task list; if tasks.md is persisted, include them as final deliverables and write them before marking the plan complete.\n`
     : "";
 
   return (
     approvalChoiceHint +
-    (language === "zh"
-      ? "计划已批准，现在进入执行阶段（EXECUTION MODE）。请按以下顺序继续：\n1. 先基于已批准的 design.md 生成 `.MAIN/plans/tasks.md`；如果现有旧计划包含 requirements.md，可以把它作为辅助上下文，但不要要求补 requirements.md。tasks.md 必须精简为 8-20 个 checkbox，每项一句话，并且每项都要带显式证据标签，例如 `— 证据: file:src/App.tsx`、`— 证据: cmd:npx tsc --noEmit` 或 `— 证据: deliverable:PLAN.md`。\n2. 生成 tasks.md 后，TopIsland 会显示任务进度；之后再按 tasks.md 逐个执行，使用 <tool_use> 格式调用工具。\n3. 任何需要 shell 的任务都必须在 tasks.md checkbox 中写出精确命令，并用反引号包裹；进入执行后，一次性命令优先用 run_command 并检查 exitCode/stdout/stderr；长驻或交互式命令用 execute_command 后再用 read_pty_since/read_pty_tail/get_pty_status 验证结果。\n4. 你可以正常修改项目源码文件，写入路径必须是项目中的正确位置，绝对不要将源码写入 `.MAIN/plans/` 或任何隐藏目录。\n5. 每完成一个任务后，先同步更新 `.MAIN/plans/tasks.md` 中对应的 checkbox 状态；tasks.md 是审计记录，不能删除已完成或旧任务，只能勾选、追加或保留“已完成任务”区块。只有全部任务都有真实文件/命令/交付物证据满足后，才能结束执行。\n"
-      : "The plan is approved. You are now in EXECUTION MODE. Continue in this order:\n1. First generate `.MAIN/plans/tasks.md` from the approved design.md; if a legacy requirements.md is present, use it only as supporting context and do not require creating one. Keep tasks.md concise: 8-20 checkboxes, one sentence each, and give every item an explicit evidence label such as `— evidence: file:src/App.tsx`, `— evidence: cmd:npx tsc --noEmit`, or `— evidence: deliverable:PLAN.md`.\n2. After tasks.md is generated, follow it task by task using tool calls.\n3. Any task that needs shell work must include the exact command inside the tasks.md checkbox text using backticks. During execution, prefer run_command for finite commands and inspect exitCode/stdout/stderr; use execute_command for long-running or interactive commands, then verify with read_pty_since/read_pty_tail/get_pty_status.\n4. You may now edit project source files, but write them to the proper project paths and never into `.MAIN/plans/` or hidden folders.\n5. After each task, update the matching checkbox in `.MAIN/plans/tasks.md` before moving on; tasks.md is an audit record, so never delete completed or previous tasks. Only check items off, append tasks, or keep a completed-tasks section. Only stop when every task has satisfied real file/command/deliverable evidence.\n") +
+    (callbacks.getPlanTasks().length > 0
+      ? language === "zh"
+        ? "计划已批准，现在进入执行阶段（EXECUTION MODE）。MAIN 已有 runtime 任务清单，TopIsland 会直接显示任务进度；不需要为了第一次源码写入强制创建 `.MAIN/plans/tasks.md`。请按当前任务清单逐项执行，使用 <tool_use> 格式调用工具；只有任务较长、需要跨会话审计或用户明确要求留档时，才先把清单持久化到 tasks.md。任何需要 shell 的任务都必须在当前任务清单中保留精确命令并用反引号包裹。你可以正常修改项目源码文件，写入路径必须是项目中的正确位置，绝对不要将源码写入 `.MAIN/plans/` 或任何隐藏目录。只有全部任务都有真实文件/命令/交付物证据满足后，才能结束执行；如果 tasks.md 已存在，完成任务后再同步更新对应 checkbox。\n"
+        : "The plan is approved. You are now in EXECUTION MODE. MAIN already has a runtime task list, so TopIsland can show task progress without forcing `.MAIN/plans/tasks.md` before the first source write. Execute the current task list with tool calls; persist the list to tasks.md only when the work is long, cross-session, or explicitly needs an audit file. Any task that needs shell work must keep the exact command in the current task list using backticks. You may now edit project source files, but write them to the proper project paths and never into `.MAIN/plans/` or hidden folders. Only stop when every task has satisfied real file/command/deliverable evidence; if tasks.md exists, update the matching checkbox after evidence exists.\n"
+      : language === "zh"
+      ? "计划已批准，现在进入执行阶段（EXECUTION MODE）。请先基于已批准的 design.md 派生精简 runtime 任务清单；只有任务较长、需要跨会话审计或用户明确要求留档时，才生成 `.MAIN/plans/tasks.md`。随后按任务逐项执行，使用 <tool_use> 格式调用工具。你可以正常修改项目源码文件，写入路径必须是项目中的正确位置，绝对不要将源码写入 `.MAIN/plans/` 或任何隐藏目录。只有全部任务都有真实文件/命令/交付物证据满足后，才能结束执行。\n"
+      : "The plan is approved. You are now in EXECUTION MODE. First derive a concise runtime task list from the approved design.md; generate `.MAIN/plans/tasks.md` only when the work is long, cross-session, or explicitly needs an audit file. Then execute the tasks one by one using tool calls. You may now edit project source files, but write them to the proper project paths and never into `.MAIN/plans/` or hidden folders. Only stop when every task has satisfied real file/command/deliverable evidence.\n") +
     deliverableHint +
+    (runtimeTaskList ? "\n" + runtimeTaskList + "\n" : "") +
     "\n" +
     buildPlanCommandExecutionHint(callbacks.getPlanTasks(), language)
   );
@@ -2928,12 +2951,12 @@ function buildPlanGateBlockedResult(
     ? reason === "pre_approval_tasks"
       ? "PLAN 阶段尚未批准，不能提前生成 `.MAIN/plans/tasks.md`。请先完成 design.md 草稿并等待用户批准。"
       : reason === "missing_tasks_before_source"
-      ? "计划已批准，但还没有可执行的 `.MAIN/plans/tasks.md` 任务清单。请先生成 tasks.md，再按任务修改源码或交付文档。"
+      ? "计划已批准，但还没有可执行的任务清单。请先从 design.md 派生 runtime 任务清单；只有长任务或需要审计留档时才生成 `.MAIN/plans/tasks.md`，再按任务修改源码或交付文档。"
       : "PLAN 阶段尚未批准，不能修改源码或项目交付文件。请先生成 `.MAIN/plans/design.md` 供用户审批；requirements.md 仅在确有需求台账时可选生成。"
     : reason === "pre_approval_tasks"
     ? "PLAN mode is not approved yet, so `.MAIN/plans/tasks.md` must not be generated. Create a design.md draft and wait for approval first."
     : reason === "missing_tasks_before_source"
-    ? "The plan is approved, but there is no executable `.MAIN/plans/tasks.md` task list yet. Generate tasks.md before editing source or final deliverables."
+    ? "The plan is approved, but there is no executable task list yet. First derive a runtime task list from design.md; generate `.MAIN/plans/tasks.md` only for long work or audit-file needs before editing source or final deliverables."
     : "PLAN mode is not approved yet, so source or deliverable files cannot be modified. Create `.MAIN/plans/design.md` for review first; requirements.md is optional for requirement-ledger cases.";
 
   callbacks.onToolExecuting(tc.name, target, undefined, { toolCallId: tc.id });
@@ -3153,9 +3176,9 @@ const MAX_ITERATIONS = 25;
 const MAX_ITERATIONS_PLAN_EXECUTION = 50;
 const MAX_RECENT_PLAN_TOOL_ACTIVITY = 12;
 const CONCISE_PLAN_ARTIFACT_HINT_ZH =
-  "计划文档必须精简：design.md 60-120 行、tasks.md 8-20 个 checkbox；可选 requirements.md 40-80 行。不要写教程式长文、完整代码清单或重复背景。Proposal 只做一页审阅摘要。";
+  "计划文档必须精简：design.md 60-120 行；可选 requirements.md 40-80 行；如确需持久化 tasks.md，保持 8-20 个 checkbox。不要写教程式长文、完整代码清单或重复背景。Proposal 只做一页审阅摘要。";
 const CONCISE_PLAN_ARTIFACT_HINT_EN =
-  "Keep plan artifacts concise: design.md 60-120 lines, tasks.md 8-20 checkboxes; optional requirements.md 40-80 lines. Do not write tutorial-style prose, full code listings, or repeated background. The Proposal should be a one-page review summary.";
+  "Keep plan artifacts concise: design.md 60-120 lines; optional requirements.md 40-80 lines; if tasks.md must be persisted, keep it to 8-20 checkboxes. Do not write tutorial-style prose, full code listings, or repeated background. The Proposal should be a one-page review summary.";
 
 function logAgentEvent(event: string, data: Record<string, unknown> = {}) {
   try {
@@ -5372,12 +5395,12 @@ export async function executeAgentLoop(
             approvedPlanAuditForNoTool,
             language,
             language === "zh"
-              ? "- 先生成 `.MAIN/plans/tasks.md`，再执行源码或交付物写入。"
-              : "- First generate `.MAIN/plans/tasks.md`, then execute source or deliverable writes.",
+              ? "- 先派生 runtime 任务清单；只有长任务或需要审计留档时才生成 `.MAIN/plans/tasks.md`，再执行源码或交付物写入。"
+              : "- First derive a runtime task list; generate `.MAIN/plans/tasks.md` only for long work or audit-file needs, then execute source or deliverable writes.",
           )
         : language === "zh"
-        ? "- 先生成 `.MAIN/plans/tasks.md`，再执行源码或交付物写入。"
-        : "- First generate `.MAIN/plans/tasks.md`, then execute source or deliverable writes.";
+        ? "- 先派生 runtime 任务清单；只有长任务或需要审计留档时才生成 `.MAIN/plans/tasks.md`，再执行源码或交付物写入。"
+        : "- First derive a runtime task list; generate `.MAIN/plans/tasks.md` only for long work or audit-file needs, then execute source or deliverable writes.";
 
       logAgentEvent("plan_execution_no_tool_reprompt", {
         iteration,
@@ -5799,12 +5822,12 @@ export async function executeAgentLoop(
                 approvedPlanAudit,
                 language,
                 language === "zh"
-                  ? "- 先生成 `.MAIN/plans/tasks.md`，再执行源码或交付物写入。"
-                  : "- First generate `.MAIN/plans/tasks.md`, then execute source or deliverable writes.",
+                  ? "- 先派生 runtime 任务清单；只有长任务或需要审计留档时才生成 `.MAIN/plans/tasks.md`，再执行源码或交付物写入。"
+                  : "- First derive a runtime task list; generate `.MAIN/plans/tasks.md` only for long work or audit-file needs, then execute source or deliverable writes.",
               )
             : language === "zh"
-            ? "- 先生成 `.MAIN/plans/tasks.md`，再执行源码或交付物写入。"
-            : "- First generate `.MAIN/plans/tasks.md`, then execute source or deliverable writes.";
+            ? "- 先派生 runtime 任务清单；只有长任务或需要审计留档时才生成 `.MAIN/plans/tasks.md`，再执行源码或交付物写入。"
+            : "- First derive a runtime task list; generate `.MAIN/plans/tasks.md` only for long work or audit-file needs, then execute source or deliverable writes.";
           if (consecutiveNoToolCount >= MAX_NO_ACTION_RETRIES) {
             logAgentEvent("loop_stop", {
               reason: "remaining_plan_tasks_limit",
@@ -5839,8 +5862,8 @@ export async function executeAgentLoop(
               (approvedPlanMissingTasks
                 ? buildApprovedPlanContinuationPrompt(callbacks) + "\n\n"
                 : language === "zh"
-                ? `${rejectedCompletionClaim ? "你刚才的完成声明没有通过可信证据审计；不要再输出完成总结，先继续真实执行。\n" : ""}继续执行 tasks.md 中证据未满足的任务。不要重复计划说明，直接根据当前进度继续实现下一个任务；如果需要修改文件，继续使用工具调用。凡是任务里带有 shell 命令的，一次性命令优先用 run_command 并检查 exitCode/stdout/stderr；长驻或交互式命令用 execute_command 后再用 read_pty_since/read_pty_tail/get_pty_status 检查结果。完成当前任务后，必须先产生真实文件/命令/验证证据，再把 \`.MAIN/plans/tasks.md\` 中对应 checkbox 更新为 \`[x]\`；不要删除已完成或旧任务记录，只有所有任务证据满足后才能结束。\n下一批优先任务：\n`
-                : `${rejectedCompletionClaim ? "Your completion claim did not pass the trusted evidence audit; do not output a final summary yet, continue the real work first.\n" : ""}Continue executing tasks whose evidence is not satisfied. Do not restate the plan; just move to the next task based on the current progress. If a task includes shell commands, prefer run_command for finite commands and inspect exitCode/stdout/stderr; use execute_command for long-running or interactive commands, then verify with read_pty_since/read_pty_tail/get_pty_status. After each task, produce real file/command/verification evidence before updating the matching checkbox in \`.MAIN/plans/tasks.md\`; do not delete completed or previous task records. Only stop when every task has satisfied evidence.\nNext priority tasks:\n`) +
+                ? `${rejectedCompletionClaim ? "你刚才的完成声明没有通过可信证据审计；不要再输出完成总结，先继续真实执行。\n" : ""}继续执行当前任务清单中证据未满足的任务。不要重复计划说明，直接根据当前进度继续实现下一个任务；如果需要修改文件，继续使用工具调用。凡是任务里带有 shell 命令的，一次性命令优先用 run_command 并检查 exitCode/stdout/stderr；长驻或交互式命令用 execute_command 后再用 read_pty_since/read_pty_tail/get_pty_status 检查结果。完成当前任务后，必须先产生真实文件/命令/验证证据；如果 \`.MAIN/plans/tasks.md\` 已存在，再更新对应 checkbox 为 \`[x]\`。只有所有任务证据满足后才能结束。\n下一批优先任务：\n`
+                : `${rejectedCompletionClaim ? "Your completion claim did not pass the trusted evidence audit; do not output a final summary yet, continue the real work first.\n" : ""}Continue executing tasks whose evidence is not satisfied in the current task list. Do not restate the plan; just move to the next task based on the current progress. If a task includes shell commands, prefer run_command for finite commands and inspect exitCode/stdout/stderr; use execute_command for long-running or interactive commands, then verify with read_pty_since/read_pty_tail/get_pty_status. After each task, produce real file/command/verification evidence; if \`.MAIN/plans/tasks.md\` exists, update the matching checkbox to \`[x]\`. Only stop when every task has satisfied evidence.\nNext priority tasks:\n`) +
               remainingText +
               "\n\n" +
               buildPlanCommandExecutionHint(approvedPlanTasks, language),

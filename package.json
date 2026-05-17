@@ -20,6 +20,8 @@
     "test:workflow-assets": "node --test tests/node/*.test.mjs",
     "release:bump": "node scripts/release-bump.mjs",
     "release:desktop": "node scripts/release-desktop.mjs",
+    "release:local:mac": "node scripts/release-local.mjs mac",
+    "release:local:windows": "node scripts/release-local.mjs windows",
     "release:mac": "node scripts/release-mac.mjs",
     "release:stage": "node scripts/prepare-public-release.mjs",
     "aimax:gateway": "node cloud-gateway/aimax/server.mjs",

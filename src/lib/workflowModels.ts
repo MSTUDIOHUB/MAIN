@@ -271,6 +271,11 @@ export interface PlanTaskEvidenceAudit {
   acceptedCompletion: boolean;
 }
 
+export interface RuntimePlanTaskDerivationOptions {
+  language?: "zh" | "en";
+  maxTasks?: number;
+}
+
 export interface PlanArtifactValidationResult {
   ok: boolean;
   reason?: string;
@@ -795,6 +800,19 @@ function evidenceMatchesRecord(
   }
 
   if (evidence.kind === "tool") {
+    if (expected === "workspace_write") {
+      return record.kind === "file" ||
+        record.kind === "deliverable" ||
+        ["write_file", "replace_in_file", "delete_workspace_path"].includes(record.sourceTool);
+    }
+    if (expected === "verification") {
+      return record.kind === "cmd" ||
+        record.kind === "tool" ||
+        ["run_command", "execute_command", "read_file", "grep_search", "read_document"].includes(record.sourceTool);
+    }
+    if (expected === "project_change") {
+      return record.kind === "file" || record.kind === "cmd" || record.kind === "deliverable" || record.kind === "tool";
+    }
     return normalizePlanEvidenceValue(record.sourceTool) === expected || actual === expected;
   }
 
@@ -993,6 +1011,183 @@ export function extractPlanTasks(markdown: string): PlanTask[] {
   }
 
   return tasks;
+}
+
+const RUNTIME_TASK_ACTION_RE =
+  /(?:实现|修改|更新|新增|修复|补齐|调整|接入|生成|输出|执行|运行|验证|测试|检查|落地|implement|update|modify|fix|add|wire|generate|write|run|verify|test|check|validate)/i;
+const RUNTIME_TASK_VALIDATION_RE =
+  /(?:验证|测试|检查|回归|构建|lint|typecheck|验收|verify|test|check|validate|build|lint|regression)/i;
+const RUNTIME_TASK_SECTION_RE =
+  /(?:执行|实施|任务|步骤|顺序|关键改动|改动点|影响文件|验证|验收|Execution|Implementation|Tasks|Steps|Order|Changes|Files|Validation|Acceptance)/i;
+const RUNTIME_TASK_PLACEHOLDER_RE =
+  /(?:使用方式|示例|建议|本设计要解决的问题|总体思路|为什么这样拆分|哪些部分保持不变|数据分析类任务|模块\s*\/\s*文件|状态\s*\/\s*数据流|交互\s*\/\s*UX|错误处理\s*\/\s*回退|允许修改的区域|暂不修改的区域|需要哪些测试|REQ-xxx|占位|TBD|TODO|\.\.\.)/i;
+
+function stripMarkdownTaskLine(line: string): string {
+  return String(line || "")
+    .replace(/^\s*[-*]\s+\[[ xX]\]\s+/, "")
+    .replace(/^\s*(?:[-*]|\d+[.)、:：-])\s+/, "")
+    .replace(/\*\*/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function collectRuntimeTaskCandidateLines(content: string): string[] {
+  const lines = String(content || "").split(/\r?\n/);
+  const candidates: string[] = [];
+  let inUsefulSection = false;
+
+  for (const line of lines) {
+    const heading = line.match(/^\s*#{1,4}\s+(.+)$/);
+    if (heading) {
+      inUsefulSection = RUNTIME_TASK_SECTION_RE.test(heading[1] || "");
+      continue;
+    }
+
+    if (!/^\s*(?:[-*]\s+(?:\[[ xX]\]\s+)?|\d+[.)、:：-]\s+)/.test(line)) continue;
+    const text = stripMarkdownTaskLine(line);
+    if (text.length < 8 || text.length > 220) continue;
+    if (RUNTIME_TASK_PLACEHOLDER_RE.test(text)) continue;
+    if (/[:：]\s*$/.test(text)) continue;
+
+    const hasEvidence = inferPlanTaskEvidence(text, extractShellCommandsFromText(text)).length > 0;
+    if (!inUsefulSection && !hasEvidence && !RUNTIME_TASK_ACTION_RE.test(text)) continue;
+    candidates.push(text);
+  }
+
+  return candidates;
+}
+
+function collectPlanFileReferences(content: string): string[] {
+  const refs: string[] = [];
+  const seen = new Set<string>();
+  for (const matched of String(content || "").matchAll(PLAN_TASK_FILE_REF_RE)) {
+    const value = String(matched[1] || "").replace(/\\/g, "/").trim();
+    if (!value || isInternalPlanEvidenceValue(value)) continue;
+    const key = normalizePlanEvidenceValue(value);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    refs.push(value);
+  }
+  return refs;
+}
+
+function makeRuntimeTask(text: string, language: "zh" | "en"): PlanTask | null {
+  const clean = stripMarkdownTaskLine(text);
+  if (!clean) return null;
+
+  const parsedEvidence = parsePlanTaskEvidenceLabel(clean);
+  const taskText = parsedEvidence.text || clean;
+  const commands = extractShellCommandsFromText(clean);
+  const inferredEvidence = parsedEvidence.evidence.length > 0
+    ? []
+    : inferPlanTaskEvidence(taskText, commands);
+  const fallbackEvidence: PlanTaskEvidence[] = parsedEvidence.evidence.length + inferredEvidence.length > 0
+    ? []
+    : RUNTIME_TASK_VALIDATION_RE.test(taskText)
+    ? [{ kind: "tool", value: "verification", inferred: true }]
+    : RUNTIME_TASK_ACTION_RE.test(taskText)
+    ? [{ kind: "tool", value: "workspace_write", inferred: true }]
+    : [{ kind: "tool", value: "project_change", inferred: true }];
+  const evidence = dedupePlanTaskEvidence([
+    ...parsedEvidence.evidence,
+    ...inferredEvidence,
+    ...fallbackEvidence,
+  ]);
+
+  return {
+    id: createPlanTaskId(taskText),
+    text: taskText,
+    status: "pending",
+    claimedStatus: "pending",
+    ...(commands.length > 0 ? { commands } : {}),
+    ...(evidence.length > 0 ? { evidence } : {}),
+    evidenceStatus: "missing",
+    blockedReason: language === "en"
+      ? "Waiting for trusted execution evidence"
+      : "等待真实执行证据确认完成",
+  };
+}
+
+function makeRuntimeTaskFromEvidenceText(
+  text: string,
+  evidence: PlanTaskEvidence,
+  language: "zh" | "en",
+): PlanTask {
+  return {
+    id: createPlanTaskId(text),
+    text,
+    status: "pending",
+    claimedStatus: "pending",
+    evidence: [evidence],
+    ...(evidence.kind === "cmd" ? { commands: [evidence.value] } : {}),
+    evidenceStatus: "missing",
+    blockedReason: language === "en"
+      ? "Waiting for trusted execution evidence"
+      : "等待真实执行证据确认完成",
+  };
+}
+
+export function deriveRuntimePlanTasksFromArtifacts(
+  artifacts: PlanArtifact[],
+  options: RuntimePlanTaskDerivationOptions = {},
+): PlanTask[] {
+  const language = options.language === "en" ? "en" : "zh";
+  const maxTasks = Math.max(2, Math.min(20, Number(options.maxTasks) || 8));
+  const sourceArtifacts = artifacts.filter((artifact) =>
+    artifact.kind === "design" || artifact.kind === "bugfix" || artifact.kind === "requirements"
+  );
+  const combinedContent = sourceArtifacts.map((artifact) => artifact.content).join("\n\n");
+  if (!combinedContent.trim()) return [];
+
+  const tasks: PlanTask[] = [];
+  const seen = new Set<string>();
+  const pushTask = (task: PlanTask | null) => {
+    if (!task) return;
+    const key = getPlanTaskIdentity(task);
+    if (seen.has(key)) return;
+    seen.add(key);
+    tasks.push(task);
+  };
+
+  for (const line of collectRuntimeTaskCandidateLines(combinedContent)) {
+    pushTask(makeRuntimeTask(line, language));
+    if (tasks.length >= maxTasks) return tasks;
+  }
+
+  for (const fileRef of collectPlanFileReferences(combinedContent).slice(0, Math.max(1, maxTasks - tasks.length))) {
+    pushTask(makeRuntimeTaskFromEvidenceText(
+      language === "en"
+        ? `Apply the approved design change for ${fileRef}`
+        : `落实已批准方案中涉及 ${fileRef} 的改动`,
+      { kind: "file", value: fileRef, inferred: true },
+      language,
+    ));
+    if (tasks.length >= maxTasks) return tasks;
+  }
+
+  for (const command of extractShellCommandsFromText(combinedContent).slice(0, Math.max(1, maxTasks - tasks.length))) {
+    pushTask(makeRuntimeTaskFromEvidenceText(
+      language === "en" ? `Run verification command \`${command}\`` : `运行验证命令 \`${command}\``,
+      { kind: "cmd", value: command, inferred: true },
+      language,
+    ));
+    if (tasks.length >= maxTasks) return tasks;
+  }
+
+  if (tasks.length === 0) {
+    pushTask(makeRuntimeTaskFromEvidenceText(
+      language === "en" ? "Execute the approved design changes" : "执行已批准设计中的核心改动",
+      { kind: "tool", value: "workspace_write", inferred: true },
+      language,
+    ));
+    pushTask(makeRuntimeTaskFromEvidenceText(
+      language === "en" ? "Verify the implemented result" : "验证已批准方案的落地结果",
+      { kind: "tool", value: "verification", inferred: true },
+      language,
+    ));
+  }
+
+  return tasks.slice(0, maxTasks);
 }
 
 function mergePlanTaskStatus(previous: PlanTask | undefined, next: PlanTask): PlanTaskStatus {

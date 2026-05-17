@@ -108,6 +108,118 @@ npm run release:desktop -- 1.4.2 --dry-run
 
 版本号必须写成 `1.4.2`，不要写成 `v1.4.2`；脚本会自动给 Release tag 加 `v` 前缀。
 
+## GitHub Actions 额度用完时：本地发布
+
+如果 GitHub Actions 额度用完，可以改走本地发布。新命令会在本机打包、生成 updater 文件、生成/合并 `latest.json`，并默认用 GitHub CLI 上传到两个公开仓库：
+
+- `MAIN-Releases`：上传用户手动下载的 `.zip`
+- `MAIN-UpdateFeed`：上传 `*_updater_*`、对应 `.sig` 和 `latest.json`
+
+本地上传不依赖 `PUBLIC_RELEASES_TOKEN` 这个 Actions Secret，但需要本机 `gh auth login` 后的账号有这两个公开仓库的 Release 写权限。
+
+### macOS：在 Mac 上打包并上传
+
+先在当前 shell 里放入 Tauri updater 私钥。不要把私钥写进仓库文件：
+
+```bash
+export TAURI_SIGNING_PRIVATE_KEY='<你的 updater 私钥内容>'
+export TAURI_SIGNING_PRIVATE_KEY_PASSWORD='<你的 updater 私钥密码>'
+```
+
+然后执行：
+
+```bash
+npm run release:local:mac -- 2.0.2
+```
+
+第一次在本机打 universal 包前，如果缺少 Rust target，脚本会提示执行：
+
+```bash
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
+```
+
+这条命令会自动完成：
+
+1. 同步版本号到 `package.json`、Tauri 配置和 `Cargo.toml`
+2. 构建 macOS universal app 和 Apple Silicon app
+3. 生成用户下载包：
+   - `MAIN_<version>_macOS_universal.zip`
+   - `MAIN_<version>_macOS_apple_silicon.zip`
+4. 生成自动更新包：
+   - `MAIN_<version>_updater_darwin_x86_64.app.tar.gz`
+   - `MAIN_<version>_updater_darwin_x86_64.app.tar.gz.sig`
+   - `MAIN_<version>_updater_darwin_aarch64.app.tar.gz`
+   - `MAIN_<version>_updater_darwin_aarch64.app.tar.gz.sig`
+5. 生成 `latest.json`
+6. 上传到 `MAIN-Releases` 和 `MAIN-UpdateFeed`
+
+本地暂存目录在：
+
+```text
+release-output/local/v<version>/assets/
+```
+
+如果只想生成文件、不上传：
+
+```bash
+npm run release:local:mac -- 2.0.2 --no-upload
+```
+
+如果已经打过包，只想重新整理、签 updater、生成 manifest、上传：
+
+```bash
+npm run release:local:mac -- 2.0.2 --skip-build
+```
+
+常用参数：
+
+```bash
+npm run release:local:mac -- 2.0.2 --draft
+npm run release:local:mac -- 2.0.2 --prerelease
+npm run release:local:mac -- 2.0.2 --release-repo MSTUDIOHUB/MAIN-Releases --update-repo MSTUDIOHUB/MAIN-UpdateFeed
+```
+
+如果对应 tag 已经存在，脚本会更新 Release 文案并用 `--clobber` 覆盖同名附件；如果 tag 不存在，脚本会新建 Release。
+
+### Windows：在 Windows 虚拟机里打包并上传
+
+Windows 正式发布建议在 Windows 虚拟机或 Windows 真机里跑。Tauri 官方文档说明：MSI 只能在 Windows 上生成；NSIS 从 macOS/Linux 交叉编译虽然可行，但有 caveats、维护成本更高，不如 VM 稳定。参考：`https://v2.tauri.app/distribute/windows-installer/`
+
+在 Windows VM 里打开 PowerShell：
+
+```powershell
+npm install
+$env:TAURI_SIGNING_PRIVATE_KEY = '<你的 updater 私钥内容>'
+$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = '<你的 updater 私钥密码>'
+npm run release:local:windows -- 2.0.2
+```
+
+这条命令会生成并上传：
+
+- `MAIN_<version>_windows_x64.zip`
+- `MAIN_<version>_updater_windows_x86_64.exe`
+- `MAIN_<version>_updater_windows_x86_64.exe.sig`
+- `latest.json`
+
+如果 macOS Release 已经先上传过，Windows 命令会先下载现有 `latest.json`，再合并 Windows 平台 entries，避免覆盖 macOS 更新入口。反过来也一样：先跑 Windows、再跑 macOS 时，macOS 命令会合并已有 Windows entries。
+
+只生成、不上传：
+
+```powershell
+npm run release:local:windows -- 2.0.2 --no-upload
+```
+
+### 本地发布顺序建议
+
+如果这次要同时发布 macOS 和 Windows：
+
+1. 在 Mac 上执行 `npm run release:local:mac -- <version>`
+2. 在 Windows VM 里执行 `npm run release:local:windows -- <version>`
+3. 打开 `https://github.com/MSTUDIOHUB/MAIN-UpdateFeed/releases/latest/download/latest.json`，确认里面同时有 `darwin-*` 和 `windows-*`
+4. 打开 `https://github.com/MSTUDIOHUB/MAIN-Releases/releases/latest`，确认三个用户下载 zip 都在
+
+两个命令谁先谁后都可以；后执行的命令会合并已有 `latest.json`。
+
 ### 一次性配置
 
 #### 1. 创建公开仓库

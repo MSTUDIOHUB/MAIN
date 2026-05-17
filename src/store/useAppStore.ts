@@ -62,6 +62,7 @@ import {
   type RightPanelTab,
   buildPlanTaskEvidenceAudit,
   detectPlanArtifactKind,
+  deriveRuntimePlanTasksFromArtifacts,
   extractPlanTasks,
   findDroppedPlanTasks,
   getPendingPlanTaskCommandFocus,
@@ -3267,12 +3268,12 @@ function buildPlanCommandExecutionHint(
 ): string {
   const focus = getPendingPlanTaskCommandFocus(tasks, 3);
   const diagnosticHint = language === "zh"
-    ? "诊断步骤优先使用内联 `run_command`，避免在项目根目录创建临时诊断脚本；确需脚本文件时，必须先写进 tasks.md，并使用明确临时路径或清理策略。"
-    : "For diagnostics, prefer inline `run_command` and avoid creating temporary diagnostic scripts in the project root; if a script file is truly needed, put that in tasks.md first and use an explicit temporary path or cleanup strategy.";
+    ? "诊断步骤优先使用内联 `run_command`，避免在项目根目录创建临时诊断脚本；确需脚本文件时，请先把它列入当前任务清单或持久化的 tasks.md，并使用明确临时路径或清理策略。"
+    : "For diagnostics, prefer inline `run_command` and avoid creating temporary diagnostic scripts in the project root; if a script file is truly needed, list it in the current task list or persisted tasks.md first and use an explicit temporary path or cleanup strategy.";
   if (focus.length === 0) {
     return language === "zh"
-      ? "如果某个任务需要 shell 命令，请在 tasks.md 的 checkbox 文本里写出精确命令并用反引号包裹；执行阶段看到这些命令时，一次性命令优先用 run_command 并检查 exitCode/stdout/stderr，长驻或交互式命令用 execute_command 后再用 read_pty_since/read_pty_tail/get_pty_status 检查输出。" + diagnosticHint
-      : "If a task needs shell work, place the exact command inside the tasks.md checkbox text using backticks. During execution, prefer run_command for finite commands and inspect exitCode/stdout/stderr; use execute_command for long-running or interactive commands, then verify with read_pty_since/read_pty_tail/get_pty_status. " + diagnosticHint;
+      ? "如果某个任务需要 shell 命令，请把精确命令写在当前任务清单里并用反引号包裹；如果本轮选择持久化 tasks.md，也同步写入对应 checkbox。执行阶段看到这些命令时，一次性命令优先用 run_command 并检查 exitCode/stdout/stderr，长驻或交互式命令用 execute_command 后再用 read_pty_since/read_pty_tail/get_pty_status 检查输出。" + diagnosticHint
+      : "If a task needs shell work, place the exact command in the current task list using backticks; if this run persists tasks.md, mirror it in the matching checkbox. During execution, prefer run_command for finite commands and inspect exitCode/stdout/stderr; use execute_command for long-running or interactive commands, then verify with read_pty_since/read_pty_tail/get_pty_status. " + diagnosticHint;
   }
 
   const lines = focus
@@ -3286,6 +3287,36 @@ function buildPlanCommandExecutionHint(
   return language === "zh"
     ? "以下未完成任务里已经包含明确的 shell 命令，恢复执行后请优先真实运行它们：一次性命令用 run_command；长驻或交互式命令用 execute_command 后再读取 PTY 日志。不要只复述：\n\n" + lines + "\n\n" + diagnosticHint
     : "The remaining tasks already include concrete shell commands. After resuming, run them for real: use run_command for finite commands; use execute_command and then read PTY logs for long-running or interactive commands. Do not only describe them:\n\n" + lines + "\n\n" + diagnosticHint;
+}
+
+function ensureApprovedPlanRuntimeTasksForState(
+  state: AppState,
+  language: "zh" | "en",
+): PlanTask[] {
+  if (state.planTasks.length > 0) {
+    return normalizePlanTaskStatuses(state.planTasks, state.planExecutionEvidenceLedger, state.isPlanApproved);
+  }
+  if (state.planArtifacts.some((artifact) => artifact.kind === "tasks")) {
+    return state.planTasks;
+  }
+  return deriveRuntimePlanTasksFromArtifacts(state.planArtifacts, {
+    language,
+    maxTasks: 8,
+  });
+}
+
+function formatPlanTaskListForPrompt(tasks: PlanTask[], language: "zh" | "en", limit = 12): string {
+  const visibleTasks = tasks.slice(0, limit);
+  if (visibleTasks.length === 0) {
+    return language === "zh"
+      ? "- 暂无 runtime 任务；请先从 design.md 生成可审计任务清单。"
+      : "- No runtime tasks yet; first derive an auditable task list from design.md.";
+  }
+  return visibleTasks.map((task, index) => {
+    const evidence = task.evidence?.map((item) => `${item.kind}:${item.value}`).join(", ") ||
+      (language === "zh" ? "无证据标签" : "no evidence label");
+    return `${index + 1}. ${task.text} [${evidence}]`;
+  }).join("\n");
 }
 
 function buildTrustedPlanResumePrompt(input: {
@@ -3324,8 +3355,10 @@ function buildTrustedPlanResumePrompt(input: {
         ? "从 `.MAIN/plans/tasks.md` 中第一个证据未满足的任务开始。只有真实写入/命令成功/验证证据满足后，才可以把任务视为完成。"
         : input.artifacts.length === 0
         ? "先读取当前 workspace 的 `.MAIN/plans/design.md` 和 `.MAIN/plans/tasks.md`；如果旧会话已存在 bugfix.md 或 requirements.md，可作为辅助上下文读取；如果 tasks.md 不存在，再基于已读计划文件生成任务清单并执行真实任务。"
-        : "请先基于已批准的 design.md 重新生成 `.MAIN/plans/tasks.md`；旧 bugfix.md 或 requirements.md 只能作为辅助上下文，然后执行真实任务。",
-      "不要重写已经满足证据的任务；不要只修改 checkbox；不要重复计划说明。",
+        : input.tasks.length > 0
+        ? "当前已恢复 runtime 任务清单；请从第一个证据未满足的任务开始直接执行。只有当任务较长、需要跨会话审计或用户要求留档时，才先把清单持久化到 `.MAIN/plans/tasks.md`。"
+        : "请先基于已批准的 design.md 派生 runtime 任务清单；只有长任务、跨会话恢复或需要审计留档时，才生成 `.MAIN/plans/tasks.md`，然后执行真实任务。",
+      "不要重写已经满足证据的任务；如果存在 tasks.md，不要只修改 checkbox；不要重复计划说明。",
       "",
       "计划文件摘要：",
       artifactText,
@@ -3344,8 +3377,10 @@ function buildTrustedPlanResumePrompt(input: {
       ? "Start from the first task whose evidence is not satisfied. Treat a task as complete only after real file-write, successful command, or verification evidence exists."
       : input.artifacts.length === 0
       ? "First read `.MAIN/plans/design.md` and `.MAIN/plans/tasks.md` from the current workspace; if a legacy bugfix.md or requirements.md exists, use it only as supporting context. If tasks.md does not exist, generate the task list from the plan files before doing real work."
-      : "First regenerate `.MAIN/plans/tasks.md` from the approved design.md; use any legacy bugfix.md or requirements.md only as supporting context, then execute real tasks.",
-    "Do not redo tasks whose evidence is already satisfied. Do not only edit checkboxes. Do not restate the plan.",
+      : input.tasks.length > 0
+      ? "A runtime task list is already available; start from the first task whose evidence is not satisfied. Persist it to `.MAIN/plans/tasks.md` only when the task is long, cross-session, or explicitly needs an audit file."
+      : "First derive a runtime task list from the approved design.md. Generate `.MAIN/plans/tasks.md` only for long work, cross-session recovery, or audit-file needs, then execute real tasks.",
+    "Do not redo tasks whose evidence is already satisfied. If tasks.md exists, do not only edit checkboxes. Do not restate the plan.",
     "",
     "Plan artifact summary:",
     artifactText,
@@ -5017,18 +5052,22 @@ export const useAppStore = create<AppState>()(
     (() => {
       const state = get();
       const normalizedApprovalChoice = normalizePlanApprovalChoice(approvalChoice);
+      const language = state.config.language === "en" ? "en" : "zh";
+      const executionPlanTasks = ensureApprovedPlanRuntimeTasksForState(state, language);
+      const hasPersistedTasksArtifact = state.planArtifacts.some((artifact) => artifact.kind === "tasks");
+      const derivedRuntimeTasks = state.planTasks.length === 0 && !hasPersistedTasksArtifact && executionPlanTasks.length > 0;
       const approvalChoicePatch = { planApprovalChoice: normalizedApprovalChoice || null };
       const approvedTurnId = state.currentTurnId;
       const initialProgressSnapshot = approvedTurnId
         ? normalizePlanExecutionProgressSnapshot({
             turnId: approvedTurnId,
             update: buildPlanExecutionProgressUpdate({
-              language: state.config.language === "en" ? "en" : "zh",
+              language,
               phase: "starting",
               iterationCount: 0,
               maxIterations: PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS,
               autoResumeCount: 0,
-              tasks: state.planTasks,
+              tasks: executionPlanTasks,
               evidenceLedger: [],
               recentToolActivity: [],
             }),
@@ -5051,6 +5090,7 @@ export const useAppStore = create<AppState>()(
           planExecutionEvidenceCount: 0,
           planAutoResumeCount: 0,
           planExecutionProgressSnapshot: initialProgressSnapshot,
+          ...(executionPlanTasks.length > 0 ? { planTasks: executionPlanTasks } : {}),
           agentStatus: "running",
           isGenerating: true,
           planStage: "executing",
@@ -5069,6 +5109,7 @@ export const useAppStore = create<AppState>()(
         planExecutionEvidenceCount: 0,
         planAutoResumeCount: 0,
         planExecutionProgressSnapshot: initialProgressSnapshot,
+        ...(executionPlanTasks.length > 0 ? { planTasks: executionPlanTasks } : {}),
         planStage: "executing",
       });
 
@@ -5077,7 +5118,7 @@ export const useAppStore = create<AppState>()(
           (() => {
             const hasTasksArtifact =
               state.planArtifacts.some((artifact) => artifact.kind === "tasks") ||
-              state.planTasks.length > 0;
+              executionPlanTasks.length > 0;
             const currentPlanTurn = state.currentTurnId
               ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId)
               : null;
@@ -5087,18 +5128,23 @@ export const useAppStore = create<AppState>()(
                 ? ` The final tasks must include writing ${requestedDocs.map((name) => `project-root \`${name}\``).join(", ")} before completion.`
                 : ` 最终 tasks 必须包含写入${requestedDocs.map((name) => `项目根目录 \`${name}\``).join("、")}，完成前必须真实落盘。`
               : "";
-            const language = state.config.language === "en" ? "en" : "zh";
             const approvalChoiceHint = buildPlanApprovalChoiceHint(normalizedApprovalChoice, language);
+            const taskListText = formatPlanTaskListForPrompt(executionPlanTasks, language);
+            const runtimeTaskNotice = derivedRuntimeTasks
+              ? language === "en"
+                ? "\n\nMAIN already derived a runtime task list from the approved design, so you do not need to create `.MAIN/plans/tasks.md` before the first source write. Use this list as the execution source of truth; persist it to tasks.md only if the work becomes long, needs cross-session audit, or the user explicitly asks for an audit file:\n" + taskListText
+                : "\n\nMAIN 已经从批准后的 design 派生出 runtime 任务清单，因此第一次源码写入前不必先创建 `.MAIN/plans/tasks.md`。请把下面清单作为本轮执行事实来源；只有任务变长、需要跨会话审计或用户明确要求留档时，才持久化到 tasks.md：\n" + taskListText
+              : "";
 
             if (language === "en") {
               return hasTasksArtifact
-              ? approvalChoiceHint + "The plan is approved. Continue directly from the current tasks.md and execute the remaining items without repeating the plan. Do not delete completed or previous task records; only check an item off after real evidence exists for its file/command/deliverable." + deliverableHint + "\n\n" + buildPlanCommandExecutionHint(state.planTasks, "en")
-                : approvalChoiceHint + "The plan is approved. First generate `.MAIN/plans/tasks.md` from the approved design.md; use any legacy bugfix.md or requirements.md only as supporting context. Then execute the remaining work from that task list without repeating the plan. Keep tasks.md concise: 8-20 checkboxes, one sentence each, and add lightweight evidence tags such as `evidence: file:src/app.ts` or `evidence: cmd:npm test` when a task has a concrete deliverable. During execution tasks.md is an audit record; never delete completed or previous tasks, and only check an item off after trusted evidence exists." + deliverableHint;
+              ? approvalChoiceHint + "The plan is approved. Continue directly from the current task list and execute the remaining items without repeating the plan. If `.MAIN/plans/tasks.md` exists, keep it as an audit record: do not delete completed or previous task records, and only check an item off after real evidence exists for its file/command/deliverable." + deliverableHint + runtimeTaskNotice + "\n\n" + buildPlanCommandExecutionHint(executionPlanTasks, "en")
+                : approvalChoiceHint + "The plan is approved. First derive a concise runtime task list from the approved design.md; generate `.MAIN/plans/tasks.md` only if the work is long, needs cross-session audit, or the user explicitly requested a durable task file. Then execute real work without repeating the plan. Task items should be concise and include lightweight evidence such as `evidence: file:src/app.ts` or `evidence: cmd:npm test` when there is a concrete deliverable." + deliverableHint;
             }
 
             return hasTasksArtifact
-              ? approvalChoiceHint + "计划已批准。请直接基于当前 tasks.md 继续执行剩余任务，不要重复计划内容。不要删除已完成或旧任务记录；只有文件/命令/交付物的真实证据满足后，才能勾选对应任务。" + deliverableHint + "\n\n" + buildPlanCommandExecutionHint(state.planTasks, "zh")
-              : approvalChoiceHint + "计划已批准。请先基于已批准的 design.md 生成 `.MAIN/plans/tasks.md`；旧 bugfix.md 或 requirements.md 只作为辅助上下文使用。然后再按照任务清单继续执行，不要重复计划内容。tasks.md 必须精简为 8-20 个 checkbox，每项一句话；有明确交付物的任务请追加轻量证据标签，例如 `证据: file:src/app.ts` 或 `证据: cmd:npm test`。执行中 tasks.md 是审计记录，不能删除已完成或旧任务；只有可信证据满足后才能勾选任务。" + deliverableHint;
+              ? approvalChoiceHint + "计划已批准。请直接基于当前任务清单继续执行剩余任务，不要重复计划内容。如果 `.MAIN/plans/tasks.md` 已存在，它是审计记录：不要删除已完成或旧任务记录；只有文件/命令/交付物的真实证据满足后，才能勾选对应任务。" + deliverableHint + runtimeTaskNotice + "\n\n" + buildPlanCommandExecutionHint(executionPlanTasks, "zh")
+              : approvalChoiceHint + "计划已批准。请先基于已批准的 design.md 派生精简 runtime 任务清单；只有任务较长、需要跨会话审计或用户明确要求持久任务文件时，才生成 `.MAIN/plans/tasks.md`。然后执行真实任务，不要重复计划内容。有明确交付物的任务请保留轻量证据标签，例如 `证据: file:src/app.ts` 或 `证据: cmd:npm test`。" + deliverableHint;
           })(),
           undefined,
           {
