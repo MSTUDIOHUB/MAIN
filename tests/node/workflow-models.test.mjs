@@ -704,7 +704,33 @@ test("runtime plan task derivation creates executable tasks without tasks.md", (
   assert.equal(tasks.some((task) => task.evidence?.some((item) => item.kind === "cmd" && item.value.includes("runtime-tools-events-envelope"))), true);
 });
 
-test("runtime synthetic tool evidence is reconciled from real workspace activity", () => {
+test("runtime plan task derivation ignores status findings and tech-stack bullets", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([
+    {
+      kind: "design",
+      path: ".MAIN/plans/design.md",
+      title: "Design",
+      updatedAt: 1,
+      content: [
+        "# Design",
+        "",
+        "## 当前状态发现",
+        "- 项目基于 Tauri + React + TypeScript + Ant Design + ECharts。",
+        "- TopIsland 当前显示任务 7/8，但实际还在修复 1.1。",
+        "",
+        "## 执行顺序",
+        "- 修改 src/components/TopIsland.tsx 的任务进度来源。",
+      ].join("\n"),
+    },
+  ], { language: "zh" });
+
+  assert.equal(tasks.some((task) => /项目基于/.test(task.text)), false);
+  assert.equal(tasks.some((task) => /TopIsland 当前显示任务/.test(task.text)), false);
+  assert.equal(tasks.length, 1);
+  assert.equal(tasks[0].evidence?.[0]?.value, "src/components/TopIsland.tsx");
+});
+
+test("runtime plan task derivation requires concrete evidence instead of synthetic tool fallback", () => {
   const tasks = deriveRuntimePlanTasksFromArtifacts([
     {
       kind: "design",
@@ -714,21 +740,38 @@ test("runtime synthetic tool evidence is reconciled from real workspace activity
       content: "# Design\n\n## 执行顺序\n- 完成核心功能实现。\n- 验证实现结果是否可用。",
     },
   ], { language: "zh" });
+
+  assert.deepEqual(tasks, []);
+});
+
+test("generic workspace_write and project_change evidence do not complete unrelated tasks", () => {
+  const parsed = [
+    {
+      id: "runtime-generic-write",
+      text: "完成核心功能实现",
+      status: "pending",
+      claimedStatus: "pending",
+      evidence: [{ kind: "tool", value: "workspace_write", inferred: true }],
+      evidenceStatus: "missing",
+    },
+    {
+      id: "runtime-generic-project",
+      text: "落实项目改动",
+      status: "pending",
+      claimedStatus: "pending",
+      evidence: [{ kind: "tool", value: "project_change", inferred: true }],
+      evidenceStatus: "missing",
+    },
+  ];
   const writeEvidence = createPlanExecutionEvidenceEntry({
     toolName: "replace_in_file",
     target: "src/App.tsx",
     result: JSON.stringify({ success: true }),
   });
-  const verificationEvidence = createPlanExecutionEvidenceEntry({
-    toolName: "run_command",
-    target: "npm test",
-    result: JSON.stringify({ exitCode: 0 }),
-  });
-  const reconciled = reconcilePlanTaskCompletion([], tasks, [writeEvidence, verificationEvidence].filter(Boolean));
+  const reconciled = reconcilePlanTaskCompletion([], parsed, writeEvidence ? [writeEvidence] : []);
 
-  assert.equal(reconciled.some((task) => task.evidence?.some((item) => item.value === "workspace_write")), true);
-  assert.equal(reconciled.some((task) => task.evidence?.some((item) => item.value === "verification")), true);
-  assert.equal(buildPlanTaskEvidenceAudit({ tasks: reconciled }).acceptedCompletion, true);
+  assert.equal(reconciled.every((task) => !isPlanTaskTrustedComplete(task)), true);
+  assert.equal(buildPlanTaskEvidenceAudit({ tasks: reconciled }).acceptedCompletion, false);
 });
 
 test("read-only shell commands do not satisfy file evidence", () => {

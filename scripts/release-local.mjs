@@ -24,11 +24,15 @@ Options:
   --prerelease                Mark GitHub Releases as pre-releases.
   --no-upload                 Build and stage assets without uploading.
   --skip-build                Reuse existing target artifacts and only stage/sign/upload.
+  --signing-key-file <path>   Read TAURI_SIGNING_PRIVATE_KEY from a local file outside the repo.
+  --signing-password-file <path>
+                              Read TAURI_SIGNING_PRIVATE_KEY_PASSWORD from a local file.
   --no-merge-existing-latest  Do not merge an existing updater latest.json before upload.
   -h, --help                  Show this help message.
 
 Environment:
-  TAURI_SIGNING_PRIVATE_KEY and TAURI_SIGNING_PRIVATE_KEY_PASSWORD are required.
+  TAURI_SIGNING_PRIVATE_KEY or TAURI_SIGNING_PRIVATE_KEY_PATH is required.
+  TAURI_SIGNING_PRIVATE_KEY_PASSWORD is only required when the key has a password.
 `);
 }
 
@@ -52,6 +56,8 @@ function parseArgs(argv) {
     upload: true,
     skipBuild: false,
     mergeExistingLatest: true,
+    signingKeyFile: "",
+    signingPasswordFile: "",
     help: false,
   };
 
@@ -97,6 +103,18 @@ function parseArgs(argv) {
 
     if (arg === "--skip-build") {
       options.skipBuild = true;
+      continue;
+    }
+
+    if (arg === "--signing-key-file" && args[index + 1]) {
+      options.signingKeyFile = args[index + 1];
+      index += 1;
+      continue;
+    }
+
+    if (arg === "--signing-password-file" && args[index + 1]) {
+      options.signingPasswordFile = args[index + 1];
+      index += 1;
       continue;
     }
 
@@ -154,10 +172,13 @@ function validateOptions(options) {
     fail("Windows local release assets should be built inside a Windows VM or Windows machine.");
   }
 
-  if (!process.env.TAURI_SIGNING_PRIVATE_KEY || !process.env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD) {
+  if (!process.env.TAURI_SIGNING_PRIVATE_KEY) {
     fail(
       "Missing Tauri updater signing environment.",
-      "Set TAURI_SIGNING_PRIVATE_KEY and TAURI_SIGNING_PRIVATE_KEY_PASSWORD before running this release command.",
+      [
+        "Set TAURI_SIGNING_PRIVATE_KEY_PATH or pass --signing-key-file before running this release command.",
+        "Set TAURI_SIGNING_PRIVATE_KEY_PASSWORD only if the private key has a password.",
+      ].join("\n"),
     );
   }
 }
@@ -205,6 +226,75 @@ async function pathExists(filePath) {
     return true;
   } catch {
     return false;
+  }
+}
+
+function resolveLocalPath(rootDir, filePath) {
+  if (!filePath) {
+    return "";
+  }
+
+  if (filePath === "~") {
+    return process.env.HOME || process.env.USERPROFILE || filePath;
+  }
+
+  if (filePath.startsWith("~/") || filePath.startsWith("~\\")) {
+    const homeDir = process.env.HOME || process.env.USERPROFILE;
+    return homeDir ? path.join(homeDir, filePath.slice(2)) : filePath;
+  }
+
+  return path.isAbsolute(filePath) ? filePath : path.resolve(rootDir, filePath);
+}
+
+function signingKeyPath(options, rootDir) {
+  const keyFile = options.signingKeyFile || process.env.TAURI_SIGNING_PRIVATE_KEY_PATH || "";
+  return resolveLocalPath(rootDir, keyFile);
+}
+
+async function loadSigningEnvironment(options, rootDir) {
+  const keyFile = signingKeyPath(options, rootDir);
+  const passwordFile = options.signingPasswordFile || process.env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD_PATH || "";
+
+  if (!process.env.TAURI_SIGNING_PRIVATE_KEY && keyFile) {
+    process.env.TAURI_SIGNING_PRIVATE_KEY = (await fs.readFile(keyFile, "utf8")).replace(/\r\n/g, "\n").trimEnd();
+  }
+
+  if (!process.env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD && passwordFile) {
+    const resolvedPasswordFile = resolveLocalPath(rootDir, passwordFile);
+    process.env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD = (await fs.readFile(resolvedPasswordFile, "utf8")).trimEnd();
+  }
+
+  if (process.env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD === undefined) {
+    process.env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD = "";
+  }
+}
+
+async function ensureUpdaterPublicKeyMatches(options, rootDir) {
+  const privateKeyFile = signingKeyPath(options, rootDir);
+  if (!privateKeyFile) {
+    return;
+  }
+
+  const publicKeyFile = `${privateKeyFile}.pub`;
+  if (!(await pathExists(publicKeyFile))) {
+    return;
+  }
+
+  const generatedPublicKey = (await fs.readFile(publicKeyFile, "utf8")).trim();
+  const tauriConfigPath = path.join(rootDir, "src-tauri", "tauri.conf.json");
+  const tauriConfig = JSON.parse(await fs.readFile(tauriConfigPath, "utf8"));
+  const configuredPublicKey = String(tauriConfig.plugins?.updater?.pubkey || "").trim();
+
+  if (generatedPublicKey && configuredPublicKey && generatedPublicKey !== configuredPublicKey) {
+    fail(
+      "Updater public key mismatch.",
+      [
+        `Private key file: ${privateKeyFile}`,
+        `Public key file:  ${publicKeyFile}`,
+        `Config file:      ${tauriConfigPath}`,
+        "Update plugins.updater.pubkey to the contents of the .pub file before publishing with this key.",
+      ].join("\n"),
+    );
   }
 }
 
@@ -649,9 +739,11 @@ async function main() {
     return;
   }
 
-  validateOptions(options);
-
   const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+  await loadSigningEnvironment(options, rootDir);
+  validateOptions(options);
+  await ensureUpdaterPublicKeyMatches(options, rootDir);
+
   const stageDir = path.join(rootDir, "release-output", "local", `v${options.version}`);
   const assetsDir = path.join(stageDir, "assets");
   const notesPath = path.join(stageDir, "release-notes.md");

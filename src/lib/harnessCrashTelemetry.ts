@@ -4,7 +4,7 @@ export const HARNESS_RUN_MARKER_STORAGE_KEY = "main.harnessRunMarker.v1";
 const HARNESS_INSTANCE_STORAGE_KEY = "main.harnessInstance.v1";
 const HARNESS_PENDING_UNCLEAN_RESTART_KEY = "main.harnessPendingUncleanRestart.v1";
 
-export type HarnessRunStatus = "running" | "completed" | "error" | "idle" | "closed";
+export type HarnessRunStatus = "running" | "completed" | "paused" | "error" | "idle" | "closed";
 
 export interface HarnessRunMarker {
   schemaVersion: 1;

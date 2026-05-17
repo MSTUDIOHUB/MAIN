@@ -644,6 +644,15 @@ const PLAN_TASK_EVIDENCE_ITEM_RE =
 const PLAN_TASK_FILE_REF_RE =
   /(?:^|[\s`"'(（])((?:\.{1,2}\/|[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,10})(?=$|[\s`"',，。；;:)）])/g;
 
+function isLikelyWorkspaceFileReference(value: string): boolean {
+  const normalized = String(value || "").replace(/\\/g, "/").trim();
+  if (!normalized) return false;
+  if (/^\d+(?:\.\d+)+$/.test(normalized)) return false;
+  const ext = normalized.split(".").pop() || "";
+  if (/^\d+$/.test(ext) && !normalized.includes("/")) return false;
+  return true;
+}
+
 function normalizeEvidenceKind(kind: string): PlanTaskEvidenceKind {
   const normalized = String(kind || "").trim().toLowerCase();
   if (normalized === "command") return "cmd";
@@ -780,6 +789,7 @@ export function inferPlanTaskEvidence(text: string, commands: string[] = []): Pl
   }
 
   for (const matched of String(text || "").matchAll(PLAN_TASK_FILE_REF_RE)) {
+    if (!isLikelyWorkspaceFileReference(matched[1] || "")) continue;
     const parsed = makePlanTaskEvidence("file", matched[1] || "", true);
     if (parsed) evidence.push(parsed);
   }
@@ -800,19 +810,6 @@ function evidenceMatchesRecord(
   }
 
   if (evidence.kind === "tool") {
-    if (expected === "workspace_write") {
-      return record.kind === "file" ||
-        record.kind === "deliverable" ||
-        ["write_file", "replace_in_file", "delete_workspace_path"].includes(record.sourceTool);
-    }
-    if (expected === "verification") {
-      return record.kind === "cmd" ||
-        record.kind === "tool" ||
-        ["run_command", "execute_command", "read_file", "grep_search", "read_document"].includes(record.sourceTool);
-    }
-    if (expected === "project_change") {
-      return record.kind === "file" || record.kind === "cmd" || record.kind === "deliverable" || record.kind === "tool";
-    }
     return normalizePlanEvidenceValue(record.sourceTool) === expected || actual === expected;
   }
 
@@ -1015,12 +1012,12 @@ export function extractPlanTasks(markdown: string): PlanTask[] {
 
 const RUNTIME_TASK_ACTION_RE =
   /(?:实现|修改|更新|新增|修复|补齐|调整|接入|生成|输出|执行|运行|验证|测试|检查|落地|implement|update|modify|fix|add|wire|generate|write|run|verify|test|check|validate)/i;
-const RUNTIME_TASK_VALIDATION_RE =
-  /(?:验证|测试|检查|回归|构建|lint|typecheck|验收|verify|test|check|validate|build|lint|regression)/i;
 const RUNTIME_TASK_SECTION_RE =
-  /(?:执行|实施|任务|步骤|顺序|关键改动|改动点|影响文件|验证|验收|Execution|Implementation|Tasks|Steps|Order|Changes|Files|Validation|Acceptance)/i;
+  /(?:执行|实施|任务|步骤|顺序|验证|验收|Execution|Implementation|Tasks|Steps|Order|Validation|Acceptance)/i;
+const RUNTIME_TASK_EXCLUDED_SECTION_RE =
+  /(?:当前状态|状态发现|现状|背景|问题分析|根因|技术栈|整体结构|关键改动|改动点|影响文件|涉及文件|设计思路|总体思路|Current State|Findings|Background|Root Cause|Tech Stack|Architecture|Changes|Files|Design Notes)/i;
 const RUNTIME_TASK_PLACEHOLDER_RE =
-  /(?:使用方式|示例|建议|本设计要解决的问题|总体思路|为什么这样拆分|哪些部分保持不变|数据分析类任务|模块\s*\/\s*文件|状态\s*\/\s*数据流|交互\s*\/\s*UX|错误处理\s*\/\s*回退|允许修改的区域|暂不修改的区域|需要哪些测试|REQ-xxx|占位|TBD|TODO|\.\.\.)/i;
+  /(?:使用方式|示例|建议|当前状态|状态发现|项目基于|技术栈|本设计要解决的问题|总体思路|为什么这样拆分|哪些部分保持不变|数据分析类任务|模块\s*\/\s*文件|状态\s*\/\s*数据流|交互\s*\/\s*UX|错误处理\s*\/\s*回退|允许修改的区域|暂不修改的区域|需要哪些测试|REQ-xxx|占位|TBD|TODO|\.\.\.)/i;
 
 function stripMarkdownTaskLine(line: string): string {
   return String(line || "")
@@ -1035,14 +1032,20 @@ function collectRuntimeTaskCandidateLines(content: string): string[] {
   const lines = String(content || "").split(/\r?\n/);
   const candidates: string[] = [];
   let inUsefulSection = false;
+  let inExcludedSection = false;
 
   for (const line of lines) {
     const heading = line.match(/^\s*#{1,4}\s+(.+)$/);
     if (heading) {
-      inUsefulSection = RUNTIME_TASK_SECTION_RE.test(heading[1] || "");
+      const headingText = heading[1] || "";
+      inExcludedSection = RUNTIME_TASK_EXCLUDED_SECTION_RE.test(headingText);
+      inUsefulSection =
+        RUNTIME_TASK_SECTION_RE.test(headingText) &&
+        !inExcludedSection;
       continue;
     }
 
+    if (inExcludedSection) continue;
     if (!/^\s*(?:[-*]\s+(?:\[[ xX]\]\s+)?|\d+[.)、:：-]\s+)/.test(line)) continue;
     const text = stripMarkdownTaskLine(line);
     if (text.length < 8 || text.length > 220) continue;
@@ -1057,11 +1060,28 @@ function collectRuntimeTaskCandidateLines(content: string): string[] {
   return candidates;
 }
 
+function stripRuntimeExcludedSections(content: string): string {
+  const lines = String(content || "").split(/\r?\n/);
+  const kept: string[] = [];
+  let inExcludedSection = false;
+  for (const line of lines) {
+    const heading = line.match(/^\s*#{1,4}\s+(.+)$/);
+    if (heading) {
+      inExcludedSection = RUNTIME_TASK_EXCLUDED_SECTION_RE.test(heading[1] || "");
+      if (!inExcludedSection) kept.push(line);
+      continue;
+    }
+    if (!inExcludedSection) kept.push(line);
+  }
+  return kept.join("\n");
+}
+
 function collectPlanFileReferences(content: string): string[] {
   const refs: string[] = [];
   const seen = new Set<string>();
   for (const matched of String(content || "").matchAll(PLAN_TASK_FILE_REF_RE)) {
     const value = String(matched[1] || "").replace(/\\/g, "/").trim();
+    if (!isLikelyWorkspaceFileReference(value)) continue;
     if (!value || isInternalPlanEvidenceValue(value)) continue;
     const key = normalizePlanEvidenceValue(value);
     if (!key || seen.has(key)) continue;
@@ -1081,18 +1101,11 @@ function makeRuntimeTask(text: string, language: "zh" | "en"): PlanTask | null {
   const inferredEvidence = parsedEvidence.evidence.length > 0
     ? []
     : inferPlanTaskEvidence(taskText, commands);
-  const fallbackEvidence: PlanTaskEvidence[] = parsedEvidence.evidence.length + inferredEvidence.length > 0
-    ? []
-    : RUNTIME_TASK_VALIDATION_RE.test(taskText)
-    ? [{ kind: "tool", value: "verification", inferred: true }]
-    : RUNTIME_TASK_ACTION_RE.test(taskText)
-    ? [{ kind: "tool", value: "workspace_write", inferred: true }]
-    : [{ kind: "tool", value: "project_change", inferred: true }];
   const evidence = dedupePlanTaskEvidence([
     ...parsedEvidence.evidence,
     ...inferredEvidence,
-    ...fallbackEvidence,
   ]);
+  if (evidence.length === 0) return null;
 
   return {
     id: createPlanTaskId(taskText),
@@ -1138,6 +1151,7 @@ export function deriveRuntimePlanTasksFromArtifacts(
   );
   const combinedContent = sourceArtifacts.map((artifact) => artifact.content).join("\n\n");
   if (!combinedContent.trim()) return [];
+  const runtimeRelevantContent = stripRuntimeExcludedSections(combinedContent);
 
   const tasks: PlanTask[] = [];
   const seen = new Set<string>();
@@ -1154,7 +1168,14 @@ export function deriveRuntimePlanTasksFromArtifacts(
     if (tasks.length >= maxTasks) return tasks;
   }
 
-  for (const fileRef of collectPlanFileReferences(combinedContent).slice(0, Math.max(1, maxTasks - tasks.length))) {
+  const existingFileEvidence = () => new Set(tasks.flatMap((task) =>
+    (task.evidence || [])
+      .filter((item) => item.kind === "file" || item.kind === "deliverable")
+      .map((item) => normalizePlanEvidenceValue(item.value))
+      .filter(Boolean)
+  ));
+  for (const fileRef of collectPlanFileReferences(runtimeRelevantContent).slice(0, Math.max(1, maxTasks - tasks.length))) {
+    if (existingFileEvidence().has(normalizePlanEvidenceValue(fileRef))) continue;
     pushTask(makeRuntimeTaskFromEvidenceText(
       language === "en"
         ? `Apply the approved design change for ${fileRef}`
@@ -1165,7 +1186,7 @@ export function deriveRuntimePlanTasksFromArtifacts(
     if (tasks.length >= maxTasks) return tasks;
   }
 
-  for (const command of extractShellCommandsFromText(combinedContent).slice(0, Math.max(1, maxTasks - tasks.length))) {
+  for (const command of extractShellCommandsFromText(runtimeRelevantContent).slice(0, Math.max(1, maxTasks - tasks.length))) {
     pushTask(makeRuntimeTaskFromEvidenceText(
       language === "en" ? `Run verification command \`${command}\`` : `运行验证命令 \`${command}\``,
       { kind: "cmd", value: command, inferred: true },
@@ -1175,16 +1196,7 @@ export function deriveRuntimePlanTasksFromArtifacts(
   }
 
   if (tasks.length === 0) {
-    pushTask(makeRuntimeTaskFromEvidenceText(
-      language === "en" ? "Execute the approved design changes" : "执行已批准设计中的核心改动",
-      { kind: "tool", value: "workspace_write", inferred: true },
-      language,
-    ));
-    pushTask(makeRuntimeTaskFromEvidenceText(
-      language === "en" ? "Verify the implemented result" : "验证已批准方案的落地结果",
-      { kind: "tool", value: "verification", inferred: true },
-      language,
-    ));
+    return [];
   }
 
   return tasks.slice(0, maxTasks);

@@ -123,8 +123,23 @@ npm run release:desktop -- 1.4.2 --dry-run
 
 ```bash
 export TAURI_SIGNING_PRIVATE_KEY='<你的 updater 私钥内容>'
-export TAURI_SIGNING_PRIVATE_KEY_PASSWORD='<你的 updater 私钥密码>'
+export TAURI_SIGNING_PRIVATE_KEY_PASSWORD='<你的 updater 私钥密码，如果生成 key 时没有设置密码可省略>'
 ```
+
+更方便的方式是把私钥放在仓库外的本机文件，例如 `~/.config/main/tauri-updater.key`，然后用路径环境变量：
+
+```bash
+export TAURI_SIGNING_PRIVATE_KEY_PATH="$HOME/.config/main/tauri-updater.key"
+export TAURI_SIGNING_PRIVATE_KEY_PASSWORD='<你的 updater 私钥密码，如果生成 key 时没有设置密码可省略>'
+```
+
+或者直接在命令里传：
+
+```bash
+npm run release:local:mac -- 2.0.2 --signing-key-file "$HOME/.config/main/tauri-updater.key"
+```
+
+如果你的 key 没有密码，只传 `--signing-key-file` 就够了。
 
 然后执行：
 
@@ -190,6 +205,14 @@ Windows 正式发布建议在 Windows 虚拟机或 Windows 真机里跑。Tauri 
 ```powershell
 npm install
 $env:TAURI_SIGNING_PRIVATE_KEY = '<你的 updater 私钥内容>'
+$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = '<你的 updater 私钥密码>'
+npm run release:local:windows -- 2.0.2
+```
+
+如果私钥存在本机文件里，也可以用：
+
+```powershell
+$env:TAURI_SIGNING_PRIVATE_KEY_PATH = "$env:USERPROFILE\.config\main\tauri-updater.key"
 $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = '<你的 updater 私钥密码>'
 npm run release:local:windows -- 2.0.2
 ```

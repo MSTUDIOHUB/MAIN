@@ -29,6 +29,7 @@ async function loadToolExecutionContractModule() {
 const {
   applyShellCwd,
   looksDangerousShellCommand,
+  looksLongRunningShellCommand,
   validateShellToolContract,
 } = await loadToolExecutionContractModule();
 
@@ -66,4 +67,33 @@ test("dangerous shell detection catches destructive command shapes", () => {
   assert.equal(looksDangerousShellCommand("git reset --hard HEAD"), true);
   assert.equal(looksDangerousShellCommand("rm -rf dist"), true);
   assert.equal(looksDangerousShellCommand("git status --short"), false);
+});
+
+test("run_command rejects long-running dev servers and watchers", () => {
+  assert.equal(looksLongRunningShellCommand("npm run tauri dev"), true);
+  assert.equal(looksLongRunningShellCommand("pnpm run dev"), true);
+  assert.equal(looksLongRunningShellCommand("vite --host 127.0.0.1"), true);
+  assert.equal(looksLongRunningShellCommand("next dev"), true);
+  assert.equal(looksLongRunningShellCommand("next start"), true);
+  assert.equal(looksLongRunningShellCommand("storybook dev --port 6006"), true);
+  assert.equal(looksLongRunningShellCommand("npm run build"), false);
+  assert.equal(looksLongRunningShellCommand("vite build"), false);
+  assert.equal(looksLongRunningShellCommand("next build"), false);
+  assert.equal(looksLongRunningShellCommand("storybook build"), false);
+  assert.match(
+    validateShellToolContract("run_command", {
+      command: "npm run tauri dev",
+      description: "Start the desktop dev server",
+      cwd: ".",
+    }),
+    /execute_command/,
+  );
+  assert.equal(
+    validateShellToolContract("execute_command", {
+      command: "npm run tauri dev",
+      description: "Start the desktop dev server",
+      cwd: ".",
+    }),
+    null,
+  );
 });

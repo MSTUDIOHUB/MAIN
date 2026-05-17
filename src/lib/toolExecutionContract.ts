@@ -45,6 +45,10 @@ export function validateShellToolContract(name: string, args: Record<string, unk
     return `Tool '${name}' is missing required execution metadata: cwd. ${cwdError}${toolSpecificHint}`;
   }
 
+  if (name === "run_command" && looksLongRunningShellCommand(args.command)) {
+    return "Tool 'run_command' is for finite commands. This command looks like a long-running dev server or watcher; use `execute_command` with the same `cwd`, then inspect it with `read_pty_since`, `read_pty_tail`, or `get_pty_status`.";
+  }
+
   return null;
 }
 
@@ -79,4 +83,24 @@ export function looksDangerousShellCommand(command: unknown): boolean {
   const normalized = command.trim();
   if (!normalized) return false;
   return DANGEROUS_SHELL_PATTERNS.some((pattern) => pattern.test(normalized));
+}
+
+const LONG_RUNNING_SHELL_PATTERNS = [
+  /\b(?:npm|pnpm|yarn|bun)\s+run\s+tauri\s+dev\b/i,
+  /\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?dev\b/i,
+  /\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:start|serve|watch|preview|storybook)\b/i,
+  /\b(?:cargo\s+)?tauri\s+dev\b/i,
+  /\bvite(?:\s+(?:dev|serve|preview)\b|\s+--|$)/i,
+  /\bnext\s+(?:dev|start)\b/i,
+  /\b(?:nuxt|nuxi)\s+(?:dev|start|preview)\b/i,
+  /\bastro\s+(?:dev|preview)\b/i,
+  /\bwebpack-dev-server\b/i,
+  /\bstorybook(?:\s+dev\b|\s+--|$)/i,
+];
+
+export function looksLongRunningShellCommand(command: unknown): boolean {
+  if (typeof command !== "string") return false;
+  const normalized = command.trim();
+  if (!normalized) return false;
+  return LONG_RUNNING_SHELL_PATTERNS.some((pattern) => pattern.test(normalized));
 }

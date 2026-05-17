@@ -302,7 +302,7 @@ export function buildSystemPrompt(
     : "不要用 shell 命令作为常规分页读文件手段。";
   parts.push("当前工作区绝对路径为：" + workspace);
   parts.push("你执行任何文件操作或搜索时，都必须基于此路径。所有相对路径都相对于此根目录解析。");
-  parts.push("根目录探索优先使用 `get_project_skeleton`，不要把 `list_directory('.')` 当成默认第一步；只有明确需要根目录即时文件列表时才调用一次，拿到结果后必须复用，不能反复对 `.` 重复扫描。");
+  parts.push("探索必须先收窄目标：如果用户给了路径、文件名、组件名、函数名或报错关键词，优先使用 `grep_search`、`glob_search`、`list_directory` 或小窗口 `read_file` 定向定位；只有没有任何可用线索、确实需要宏观结构时，才调用一次浅层 `get_project_skeleton(depth: 2)`。");
   parts.push("当 `list_directory`、`glob_search` 或其他工具返回文件/目录路径时，后续工具调用必须优先复用返回的完整相对路径，不要自行裁掉父目录。");
   parts.push("`read_file` 返回的是源码/文本内容窗口；如果结果包含 `truncated: true`、`returnedLines` 或 `nextStartLine`，说明这不是完整文件。需要更多内容时继续调用 `read_file` 并传 `start_line` / `end_line` / `max_lines`，" + filePagingWarning);
   parts.push("遇到 TypeScript、测试、构建或 lint 报错行号时，优先读取报错行附近的小窗口，例如 `read_file(path, start_line, max_lines)`；不要先全量读取大型源文件。");
@@ -413,7 +413,7 @@ export function buildSystemPrompt(
     "## ⚠️ 分析深度要求",
     "`get_project_skeleton` 只返回项目/资料目录结构，不包含任何文件内容。仅凭目录结构做出的分析毫无价值。",
     "在给出代码分析或架构总结之前，你必须：",
-    "1. 源码/Unity 项目先用 `get_project_skeleton` 定位核心目录；表格/文档/资料分析任务先用 `list_directory` 或用户提供的 `path:` 找到文件，再直接使用文档/表格工具；",
+    "1. 源码/Unity 项目先根据用户问题里的路径、文件名、符号或报错关键词做定向搜索/读取；只有缺少这些线索时，才用一次浅层 `get_project_skeleton(depth: 2)` 定位核心目录。表格/文档/资料分析任务先用 `list_directory` 或用户提供的 `path:` 找到文件，再直接使用文档/表格工具；",
     "2. 再用 `get_file_outline`、`read_file`、`read_document`、`analyze_tabular_document` 或 `query_tabular_document` 实际读取关键文件的内容；源码/纯文本优先用 `read_file` 的行窗口参数读取关键范围，PDF/DOCX 优先用 `read_document`，大型 CSV/TSV/XLSX 优先先用 `analyze_tabular_document` 看全表，再用 `query_tabular_document` 做筛选/聚合，最后才按需用 `read_document` 分段读取原始行窗口；",
     "3. 基于代码内容（而非目录名称）给出有价值的分析。",
     "4. 如果用户消息里包含附件预览，并出现 `truncatedPreview: true`、`attached_tabular_file` 或明确的 `path:` 字段，你必须把它视为“只给了预览，不是全量内容”，不能直接据此下完整结论，应继续对该路径调用工具。",
@@ -510,8 +510,8 @@ export function buildSystemPrompt(
       "6. 计划文件不能包含工具日志、重复调用提示、后台思考、截断提示或原始源码片段；如果只拿到了这些材料，应重新归纳真实需求和执行方案，或向用户确认关键方向。",
       "",
       "### 探索范式",
-      "1. 优先使用 `get_project_skeleton` 获取整个项目的宏观骨架（深度限制 3-4 层）。",
-      "2. 根据骨架快速锁定核心业务目录，再使用 `get_file_outline`、`read_file`、`read_document`、`analyze_tabular_document` 或 `query_tabular_document` 深入读取关键文件。",
+      "1. 优先根据路径、文件名、符号或报错关键词使用 `grep_search`、`glob_search`、`list_directory` 定向发现；没有线索时才使用一次 `get_project_skeleton(depth: 2)` 获取浅层宏观骨架。",
+      "2. 根据定向发现结果快速锁定核心业务目录，再使用 `get_file_outline`、`read_file`、`read_document`、`analyze_tabular_document` 或 `query_tabular_document` 深入读取关键文件。",
       "3. ⚠️ `get_project_skeleton` 只返回目录结构，不包含代码内容。仅凭目录结构做出的分析没有价值。你必须进一步读取实际文件内容后才能给出有意义的结论。",
       "",
       "### 正式方案输出要求",
@@ -631,7 +631,7 @@ export function buildSystemPrompt(
       WORKFLOW_BUILT_IN_TOOL_NAMES,
       availableToolNames,
     ));
-    tfl.push("当用户要求实现、修复、生成文件或修改项目时，写入工具可用：必须直接用 XML 调用 `write_file` 或 `replace_in_file`，不要声称当前环境没有写入能力。所有文件访问都以当前工作区为根目录。目录检查优先用 `get_project_skeleton`、`list_directory`、`glob_search`。");
+    tfl.push("当用户要求实现、修复、生成文件或修改项目时，写入工具可用：必须直接用 XML 调用 `write_file` 或 `replace_in_file`，不要声称当前环境没有写入能力。所有文件访问都以当前工作区为根目录。目录检查优先用 `grep_search`、`glob_search`、`list_directory` 定向定位；只有无线索时才用一次浅层 `get_project_skeleton(depth: 2)`。");
     tfl.push("实现/生成类任务禁止在聊天区输出完整项目代码或大段 Markdown 代码清单；必须把代码通过 `write_file` / `replace_in_file` 落到真实文件。多文件任务每轮优先只写/改 1-3 个文件，先建立最小可运行骨架，再逐步补齐。");
     tfl.push("");
     tfl.push("### 工具说明：");
@@ -639,9 +639,9 @@ export function buildSystemPrompt(
       if (compactWorkflowToolGuide && !compactWorkflowToolDescriptions.has(name)) return;
       if (isToolNameAvailable(name, availableToolNames)) tfl.push(description);
     };
-    addToolDescription("get_project_skeleton", "- get_project_skeleton: (depth?: number) 极速获取项目宏观骨架。Unity 感知：自动识别 .asmdef 模块边界、折叠大目录、弹性穿透无关键文件的层级。始终作为第一步使用。");
+    addToolDescription("get_project_skeleton", "- get_project_skeleton: (depth?: number) 极速获取项目宏观骨架。仅在没有明确路径/文件名/符号线索时作为一次浅层发现使用，建议 depth: 2；拿到结构后必须转向定向搜索或读取。");
     addToolDescription("get_file_outline", "- get_file_outline: (path: string) 提取 C# 文件的类型定义和 public/protected 成员签名，剔除函数体。用于理解类的接口和耦合关系，无需读取完整源码。");
-    addToolDescription("list_directory", "- list_directory: 列出特定目录内容。在你通过 skeleton 锁定目标后使用。");
+    addToolDescription("list_directory", "- list_directory: 列出特定目录内容。优先用于用户给出目录、文件附近路径，或通过搜索结果锁定目标后的定向检查。");
     addToolDescription("read_file", "- read_file: 读取源码、Markdown、JSON、纯文本等可直接按文本处理的文件窗口。支持 start_line/end_line/max_lines；大文件会返回 truncated、returnedLines、nextStartLine。遇到报错行号时读附近窗口；" + (shellToolsAvailable ? "不要用 run_command/cat/sed/head/tail 作为常规文件分页工具。" : "不要用 shell 命令作为常规文件分页工具。"));
     addToolDescription("read_document", "- read_document: 读取 PDF、DOCX、XLSX、CSV、TSV 等文档内容，返回提取文本和来源元数据（页码、sheet、单元格范围等）；对表格文件可结合 `row_offset` / `max_rows` 做分段读取。");
     addToolDescription("analyze_tabular_document", "- analyze_tabular_document: 对 CSV、TSV、XLSX 等大表格做全表统计分析，返回总行数、列概况、缺失值、数值统计和样本行。处理大型表格时优先用它，而不是盲目把整张表塞进上下文。");

@@ -877,6 +877,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     taskFlow,
     approvePlan,
     rejectPlan,
+    rejectPlanAndDeleteFiles,
     sendMessage,
     deletePersistedPlanFiles,
     agentStatus,
@@ -900,6 +901,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     taskFlow: useAppStore((s) => s.taskFlow),
     approvePlan: useAppStore((s) => s.approvePlan),
     rejectPlan: useAppStore((s) => s.rejectPlan),
+    rejectPlanAndDeleteFiles: useAppStore((s) => s.rejectPlanAndDeleteFiles),
     sendMessage: useAppStore((s) => s.sendMessage),
     deletePersistedPlanFiles: useAppStore((s) => s.deletePersistedPlanFiles),
     agentStatus: useAppStore((s) => s.agentStatus),
@@ -1167,6 +1169,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
               onSaveDocument={handleSavePlanDocument}
               onApprove={approvePlan}
               onReject={rejectPlan}
+              onRejectAndDelete={() => void rejectPlanAndDeleteFiles()}
             />
           )}
 

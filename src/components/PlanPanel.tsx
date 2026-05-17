@@ -27,6 +27,7 @@ interface PlanPanelProps {
   onSaveDocument?: (document: { title: string; suggestedFileName: string; content: string; sourcePath?: string }) => Promise<boolean> | boolean;
   onApprove: () => void;
   onReject: () => void;
+  onRejectAndDelete?: () => void;
 }
 
 const COPY = {
@@ -44,7 +45,8 @@ const COPY = {
     inProgress: "进行中",
     missingEvidence: "待验证",
     pending: "待办",
-    cancelPlan: "取消计划",
+    rejectAndKeepPlan: "拒绝并保留",
+    rejectAndDeletePlan: "拒绝并删除",
     deletePlanFiles: "删除计划文件",
     approvePlan: "确认方案并继续执行",
     continuePlanning: "继续生成正式计划",
@@ -53,7 +55,7 @@ const COPY = {
     savingDocument: "保存中...",
     savedDocument: "已保存",
     saveFailed: "保存失败",
-    savePlanHint: "如果你现在只想保留方案，不想继续执行，可以先保存当前文档，再取消计划。",
+    savePlanHint: "拒绝并保留会停止本轮但保留计划文件；拒绝并删除会同时清理 .MAIN/plans。",
     approvalRunningHint: "当前计划已经进入执行链路，右侧会持续显示最新文档与任务状态。",
     pausedExecutionHint: "检测到当前执行链路已中断，但任务进度已保留。可以从剩余任务继续恢复执行。",
     waitingPlanHint: "等待 Agent 生成可审批的计划正文，这里随后会显示预览、审批按钮和任务执行进度。",
@@ -93,7 +95,8 @@ const COPY = {
     inProgress: "In Progress",
     missingEvidence: "Needs Evidence",
     pending: "Pending",
-    cancelPlan: "Cancel Plan",
+    rejectAndKeepPlan: "Reject And Keep",
+    rejectAndDeletePlan: "Reject And Delete",
     deletePlanFiles: "Delete Plan Files",
     approvePlan: "Approve Plan And Continue",
     continuePlanning: "Continue Planning",
@@ -102,7 +105,7 @@ const COPY = {
     savingDocument: "Saving...",
     savedDocument: "Saved",
     saveFailed: "Save Failed",
-    savePlanHint: "If you only want to keep the plan for now, save the current document first and then cancel the plan.",
+    savePlanHint: "Reject and keep stops this turn while preserving plan files; reject and delete also clears .MAIN/plans.",
     approvalRunningHint: "The plan is now in the execution chain and the right panel will keep tracking document and task updates.",
     pausedExecutionHint: "Execution was interrupted, but the task progress is preserved. You can resume from the remaining tasks.",
     waitingPlanHint: "Waiting for the agent to generate a reviewable plan. The preview, approval actions, and task progress will appear here.",
@@ -169,6 +172,7 @@ export default function PlanPanel({
   onSaveDocument,
   onApprove,
   onReject,
+  onRejectAndDelete,
 }: PlanPanelProps) {
   const copy = COPY[language];
   const [activeArtifactPath, setActiveArtifactPath] = useState<string>(artifacts[artifacts.length - 1]?.path || "");
@@ -468,22 +472,23 @@ export default function PlanPanel({
               <div className="text-[11px] leading-relaxed text-[#71717a]">
                 {copy.savePlanHint}
               </div>
-              <div className="flex items-center gap-3">
-                {artifacts.length > 0 && onDeletePlanFiles && (
-                  <button
-                    onClick={onDeletePlanFiles}
-                    className="rounded-lg border border-[#3f3f46] bg-[#09090b] px-4 py-2 text-[12px] font-medium text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#f5f5f5]"
-                  >
-                    {copy.deletePlanFiles}
-                  </button>
-                )}
+              <div className="flex flex-wrap items-center justify-end gap-3">
                 <button
                   data-testid="plan-reject-button"
                   onClick={onReject}
                   className="rounded-lg border border-[#3f3f46] bg-[#09090b] px-4 py-2 text-[12px] font-medium text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#f5f5f5]"
                 >
-                  {copy.cancelPlan}
+                  {copy.rejectAndKeepPlan}
                 </button>
+                {artifacts.length > 0 && onRejectAndDelete && (
+                  <button
+                    data-testid="plan-reject-delete-button"
+                    onClick={onRejectAndDelete}
+                    className="rounded-lg border border-[rgba(244,63,94,0.35)] bg-[#09090b] px-4 py-2 text-[12px] font-medium text-[#fb7185] transition-colors hover:bg-[rgba(244,63,94,0.12)] hover:text-[#fecdd3]"
+                  >
+                    {copy.rejectAndDeletePlan}
+                  </button>
+                )}
                 <button
                   data-testid="plan-approve-button"
                   onClick={onApprove}
@@ -508,7 +513,7 @@ export default function PlanPanel({
               )}
             </div>
           ) : canContinuePlanning && onContinuePlanning ? (
-            <div className="flex items-center justify-end gap-3">
+            <div className="flex flex-wrap items-center justify-end gap-3">
               {artifacts.length > 0 && onDeletePlanFiles && (
                 <button
                   onClick={onDeletePlanFiles}
@@ -521,8 +526,16 @@ export default function PlanPanel({
                 onClick={onReject}
                 className="rounded-lg border border-[#3f3f46] bg-[#09090b] px-4 py-2 text-[12px] font-medium text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#f5f5f5]"
               >
-                {copy.cancelPlan}
+                {copy.rejectAndKeepPlan}
               </button>
+              {artifacts.length > 0 && onRejectAndDelete && (
+                <button
+                  onClick={onRejectAndDelete}
+                  className="rounded-lg border border-[rgba(244,63,94,0.35)] bg-[#09090b] px-4 py-2 text-[12px] font-medium text-[#fb7185] transition-colors hover:bg-[rgba(244,63,94,0.12)] hover:text-[#fecdd3]"
+                >
+                  {copy.rejectAndDeletePlan}
+                </button>
+              )}
               <button
                 onClick={onContinuePlanning}
                 className="theme-plan-primary rounded-lg px-4 py-2 text-[12px] font-semibold"

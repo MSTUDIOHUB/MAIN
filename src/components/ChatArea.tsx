@@ -1585,6 +1585,7 @@ export default function ChatArea({
     approvePendingReviewOnce,
     approvePendingReviewForSession,
     rejectPlan,
+    rejectPlanAndDeleteFiles,
     agentStatus,
     pendingRunDecision,
     resolvePendingRunDecision,
@@ -1615,6 +1616,7 @@ export default function ChatArea({
     approvePendingReviewOnce: useAppStore((s) => s.approvePendingReviewOnce),
     approvePendingReviewForSession: useAppStore((s) => s.approvePendingReviewForSession),
     rejectPlan: useAppStore((s) => s.rejectPlan),
+    rejectPlanAndDeleteFiles: useAppStore((s) => s.rejectPlanAndDeleteFiles),
     agentStatus: useAppStore((s) => s.agentStatus),
     pendingRunDecision: useAppStore((s) => s.pendingRunDecision),
     resolvePendingRunDecision: useAppStore((s) => s.resolvePendingRunDecision),
@@ -2523,6 +2525,7 @@ export default function ChatArea({
           onDismissPendingRunDecision={dismissPendingRunDecision}
           onApprovePlan={approvePlan}
           onRejectPlan={rejectPlan}
+          onRejectAndDeletePlan={planArtifacts.length > 0 ? () => void rejectPlanAndDeleteFiles() : undefined}
           onRejectDiff={handleRejectInline}
           onApproveDiffOnce={() => approvePendingReviewOnce()}
           onApproveDiffSession={() => approvePendingReviewForSession()}

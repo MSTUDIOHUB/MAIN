@@ -30,6 +30,15 @@ test("TopIsland shows the full approved plan task list during execution", async 
   await expect(page.getByTestId("top-island-current-plan-task")).not.toContainText("当前");
 });
 
+test("TopIsland counts only trusted evidence, not claimed completed checkboxes", async ({ page }) => {
+  await page.goto("/?e2eScenario=top-island-strict-evidence-progress");
+
+  await expect(page.getByTestId("top-island-plan-badge")).toContainText("任务 1/8");
+  await page.getByTestId("top-island-shell").hover();
+  await expect(page.getByTestId("top-island-plan-progress")).toContainText("共 8 个任务，已完成 1 个");
+  await expect(page.getByTestId("top-island-current-plan-task")).toContainText("1.1 修复 useTrendData 回退逻辑");
+});
+
 test("TopIsland keeps approval buttons visible for a long command with plan tasks", async ({ page }) => {
   await page.goto("/?e2eScenario=top-island-pending-tool-review");
 

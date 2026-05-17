@@ -12,7 +12,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Child as ProcessChild, ChildStdin, Command as ProcessCommand, Stdio};
+use std::process::{
+    Child as ProcessChild, ChildStdin, Command as ProcessCommand, ExitStatus, Stdio,
+};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -20,6 +22,11 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 use tiktoken_rs::{cl100k_base, CoreBPE};
 use walkdir::WalkDir;
+
+#[cfg(unix)]
+use std::os::raw::c_int;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 pub mod critic;
 pub mod eval;
@@ -50,6 +57,17 @@ const READ_FILE_WINDOW_DEFAULT_MAX_LINES: usize = 180;
 const READ_FILE_WINDOW_MAX_LINES: usize = 600;
 const READ_FILE_WINDOW_DEFAULT_MAX_CHARS: usize = 6_800;
 const READ_FILE_WINDOW_MAX_CHARS: usize = 24_000;
+
+#[cfg(unix)]
+const SIGTERM_SIGNAL: c_int = 15;
+#[cfg(unix)]
+const SIGKILL_SIGNAL: c_int = 9;
+
+#[cfg(unix)]
+extern "C" {
+    fn kill(pid: c_int, sig: c_int) -> c_int;
+    fn setpgid(pid: c_int, pgid: c_int) -> c_int;
+}
 
 static TOKENIZER: OnceLock<CoreBPE> = OnceLock::new();
 
@@ -1833,6 +1851,54 @@ fn join_captured_pipe(
     }
 }
 
+#[cfg(unix)]
+fn isolate_process_group(command: &mut ProcessCommand) {
+    unsafe {
+        command.pre_exec(|| {
+            let result = setpgid(0, 0);
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn isolate_process_group(_command: &mut ProcessCommand) {}
+
+fn terminate_timed_out_child(child: &mut ProcessChild) -> Result<ExitStatus, String> {
+    #[cfg(unix)]
+    {
+        let process_group_id = child.id() as c_int;
+        unsafe {
+            let _ = kill(-process_group_id, SIGTERM_SIGNAL);
+        }
+        thread::sleep(Duration::from_millis(250));
+        unsafe {
+            let _ = kill(-process_group_id, SIGKILL_SIGNAL);
+        }
+    }
+
+    let _ = child.kill();
+    child
+        .wait()
+        .map_err(|e| format!("等待被终止的命令结束失败: {e}"))
+}
+
+fn looks_long_running_shell_command(command: &str) -> bool {
+    static LONG_RUNNING_COMMAND_RE: OnceLock<Regex> = OnceLock::new();
+    LONG_RUNNING_COMMAND_RE
+        .get_or_init(|| {
+            Regex::new(
+                r"(?i)\b(?:npm|pnpm|yarn|bun)\s+run\s+tauri\s+dev\b|\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?dev\b|\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:start|serve|watch|preview|storybook)\b|\b(?:cargo\s+)?tauri\s+dev\b|\bvite(?:\s+(?:dev|serve|preview)\b|\s+--|$)|\bnext\s+(?:dev|start)\b|\b(?:nuxt|nuxi)\s+(?:dev|start|preview)\b|\bastro\s+(?:dev|preview)\b|\bwebpack-dev-server\b|\bstorybook(?:\s+dev\b|\s+--|$)",
+            )
+            .expect("valid long-running command regex")
+        })
+        .is_match(command)
+}
+
 fn build_workspace_shell_command(command: &str) -> ProcessCommand {
     if cfg!(target_os = "windows") {
         let mut cmd = ProcessCommand::new("cmd");
@@ -1844,6 +1910,7 @@ fn build_workspace_shell_command(command: &str) -> ProcessCommand {
         let mut cmd = ProcessCommand::new("/bin/sh");
         cmd.args(["-lc", command]);
         apply_process_terminal_env(&mut cmd);
+        isolate_process_group(&mut cmd);
         cmd
     }
 }
@@ -1858,6 +1925,12 @@ fn run_workspace_shell_command(
     let trimmed = command.trim();
     if trimmed.is_empty() {
         return Err("命令不能为空".to_string());
+    }
+    if looks_long_running_shell_command(trimmed) {
+        return Err(
+            "run_command 只适合会自行结束的命令。检测到开发服务器或 watch 类长驻命令，请改用 execute_command 并通过 read_pty_since/read_pty_tail/get_pty_status 观察输出。"
+                .to_string(),
+        );
     }
     harness::permissions::PermissionGuard::from_workspace(workspace)
         .and_then(|guard| guard.validate_with_approval(trimmed, permission_approval.as_ref()))
@@ -1898,10 +1971,7 @@ fn run_workspace_shell_command(
             Ok(None) => {
                 if started_at.elapsed() >= timeout {
                     timed_out = true;
-                    let _ = child.kill();
-                    break child
-                        .wait()
-                        .map_err(|e| format!("等待被终止的命令结束失败: {e}"))?;
+                    break terminate_timed_out_child(&mut child)?;
                 }
                 thread::sleep(Duration::from_millis(10));
             }
@@ -3731,6 +3801,11 @@ const SKELETON_IGNORED_DIRS: &[&str] = &[
     ".vs",
     "Build",
     "dist",
+    "out",
+    "target",
+    "coverage",
+    "PackageCache",
+    ".protocols",
 ];
 const CS_COLLAPSE_THRESHOLD: usize = 12;
 
@@ -3763,7 +3838,7 @@ fn build_skeleton_tree(
 
     for entry in entries.filter_map(|e| e.ok()) {
         let name = entry.file_name().to_string_lossy().to_string();
-        if name == ".DS_Store" || SKELETON_IGNORED_DIRS.contains(&name.as_str()) {
+        if name == ".DS_Store" || should_skip_recursive_search_dir(&name) {
             continue;
         }
         let path = entry.path();
@@ -3905,7 +3980,7 @@ fn directory_contains_asmdef(dir: &Path, current: usize, probe_depth: usize) -> 
     };
     for entry in entries.filter_map(|e| e.ok()) {
         let name = entry.file_name().to_string_lossy().to_string();
-        if SKELETON_IGNORED_DIRS.contains(&name.as_str()) || name == ".DS_Store" {
+        if should_skip_recursive_search_dir(&name) || name == ".DS_Store" {
             continue;
         }
         let path = entry.path();
@@ -7459,8 +7534,7 @@ fn delete_chat_temp_path(session_key: String, path: String) -> Result<(), String
 }
 
 /// Delete all spec files (requirements.md, design.md, tasks.md, bugfix.md)
-/// from the `.MAIN/plans/` directory. Called automatically when a plan is
-/// approved and execution begins, so the user never sees leftover plan files.
+/// from the `.MAIN/plans/` directory when the user explicitly requests cleanup.
 #[tauri::command]
 fn delete_plan_files(state: State<WorkspaceState>) -> Result<(), String> {
     let workspace = state.get_root()?;
@@ -8276,8 +8350,8 @@ pub fn run() {
 mod tests {
     use super::{
         compare_file_nodes, is_supported_attachment_path, is_valid_git_branch_name,
-        merge_json_rows_by_id, parse_git_branch_line, parse_git_numstat,
-        parse_git_porcelain_entries, parse_git_porcelain_status,
+        looks_long_running_shell_command, merge_json_rows_by_id, parse_git_branch_line,
+        parse_git_numstat, parse_git_porcelain_entries, parse_git_porcelain_status,
         read_session_transcript_with_fallback, resolve_existing_path,
         resolve_open_file_external_path, resolve_session_transcript_to_write, resolve_write_path,
         should_hide_list_directory_entry, should_skip_recursive_search_dir, validate_pty_input,
@@ -8314,6 +8388,21 @@ mod tests {
 
         validate_pty_input(&workspace, &mut pending, "\r", None).unwrap();
         assert_eq!(pending, "");
+    }
+
+    #[test]
+    fn long_running_shell_detection_catches_dev_servers_without_blocking_builds() {
+        assert!(looks_long_running_shell_command("npm run tauri dev"));
+        assert!(looks_long_running_shell_command("pnpm run dev"));
+        assert!(looks_long_running_shell_command("vite --host 127.0.0.1"));
+        assert!(looks_long_running_shell_command("next dev"));
+        assert!(looks_long_running_shell_command(
+            "storybook dev --port 6006"
+        ));
+        assert!(!looks_long_running_shell_command("npm run build"));
+        assert!(!looks_long_running_shell_command("vite build"));
+        assert!(!looks_long_running_shell_command("next build"));
+        assert!(!looks_long_running_shell_command("storybook build"));
     }
 
     #[test]
@@ -8626,8 +8715,10 @@ mod tests {
     fn recursive_search_skips_build_directories() {
         assert!(should_skip_recursive_search_dir("target"));
         assert!(should_skip_recursive_search_dir("PackageCache"));
+        assert!(should_skip_recursive_search_dir("coverage"));
+        assert!(should_skip_recursive_search_dir("out"));
+        assert!(should_skip_recursive_search_dir(".protocols"));
         assert!(!should_skip_recursive_search_dir(".MAIN"));
-        assert!(!should_skip_recursive_search_dir(".protocols"));
         assert!(!should_skip_recursive_search_dir("Scripts"));
     }
 

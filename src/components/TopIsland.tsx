@@ -34,6 +34,7 @@ interface TopIslandProps {
   onRequestPlanAdjustment?: (text: string) => void;
   onApprovePlan: () => void;
   onRejectPlan: () => void;
+  onRejectAndDeletePlan?: () => void;
   onRejectDiff?: (id: number) => void;
   onApproveDiffOnce?: () => void;
   onApproveDiffSession?: () => void;
@@ -99,6 +100,7 @@ const TopIsland = memo(function TopIsland({
   onRequestPlanAdjustment,
   onApprovePlan,
   onRejectPlan,
+  onRejectAndDeletePlan,
   onRejectDiff,
   onApproveDiffOnce,
   onApproveDiffSession,
@@ -207,6 +209,8 @@ const TopIsland = memo(function TopIsland({
     approveDiffOnce: language === "zh" ? "单次批准" : "Approve Once",
     approveDiffSession: language === "zh" ? "当前会话全部允许" : "Allow All In Session",
     reject: language === "zh" ? "拒绝" : "Reject",
+    rejectAndKeepPlan: language === "zh" ? "拒绝并保留" : "Reject And Keep",
+    rejectAndDeletePlan: language === "zh" ? "拒绝并删除" : "Reject And Delete",
     approvePlan: language === "zh" ? "开始执行" : "Start Execution",
     waitingPlan: language === "zh" ? "计划待确认" : "Plan Waiting",
     adjustPlan: language === "zh" ? "调整计划" : "Adjust Plan",
@@ -781,11 +785,21 @@ const TopIsland = memo(function TopIsland({
                         </button>
                       </form>
                       <button
+                        data-testid="top-island-plan-reject-keep"
                         onClick={onRejectPlan}
                         className="rounded-lg border border-[#3f3f46] bg-[#09090b] px-4 py-2 text-[12px] font-medium text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#f5f5f5]"
                       >
-                        {copy.reject}
+                        {copy.rejectAndKeepPlan}
                       </button>
+                      {onRejectAndDeletePlan && (
+                        <button
+                          data-testid="top-island-plan-reject-delete"
+                          onClick={onRejectAndDeletePlan}
+                          className="rounded-lg border border-[rgba(244,63,94,0.35)] bg-[#09090b] px-4 py-2 text-[12px] font-medium text-[#fb7185] transition-colors hover:bg-[rgba(244,63,94,0.12)] hover:text-[#fecdd3]"
+                        >
+                          {copy.rejectAndDeletePlan}
+                        </button>
+                      )}
                       <button
                         data-testid="top-island-plan-approve"
                         onClick={onApprovePlan}

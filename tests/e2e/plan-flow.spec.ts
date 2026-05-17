@@ -30,6 +30,8 @@ test("plan flow supports save then approve and finish", async ({ page }) => {
     .toBe(1);
 
   await expect(page.getByTestId("top-island-plan-approve")).toBeVisible();
+  await expect(page.getByTestId("top-island-plan-reject-keep")).toContainText("拒绝并保留");
+  await expect(page.getByTestId("top-island-plan-reject-delete")).toContainText("拒绝并删除");
   await expect(page.getByTestId("top-island-plan-adjust-input")).toBeVisible();
   await page.getByTestId("top-island-plan-adjust-input").fill("请把验证步骤写得更具体");
   await page.getByTestId("top-island-plan-adjust-submit").click();

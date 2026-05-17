@@ -60,12 +60,29 @@ const { shouldRecoverLanguageMismatchTurn } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/orchestrator.ts"),
 );
 
-test("language mismatch guard triggers one recovery attempt on first mismatch", () => {
+test("language mismatch guard hides wrong-language visible text on tool-call turns without reprompt", () => {
   const first = shouldRecoverLanguageMismatchTurn({
     text: "Let me summarize the findings. The root cause is a null pointer.",
     targetLanguage: "zh",
     suppressedByPlanGuard: false,
     toolCallCount: 1,
+    alreadyRetried: false,
+  });
+
+  assert.equal(first.mismatch, true);
+  assert.equal(first.detectedLanguage, "en");
+  assert.equal(first.action, "hide_text_continue");
+  assert.equal(first.shouldRecover, false);
+  assert.equal(first.exhausted, false);
+  assert.equal(first.hideTextForToolCall, true);
+});
+
+test("language mismatch guard still triggers one recovery attempt when no tools are present", () => {
+  const first = shouldRecoverLanguageMismatchTurn({
+    text: "Let me summarize the findings. The root cause is a null pointer.",
+    targetLanguage: "zh",
+    suppressedByPlanGuard: false,
+    toolCallCount: 0,
     alreadyRetried: false,
   });
 

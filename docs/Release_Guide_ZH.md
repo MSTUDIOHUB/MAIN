@@ -73,14 +73,28 @@ macOS / zsh：
 
 ```bash
 export TAURI_SIGNING_PRIVATE_KEY='<你的 updater 私钥内容>'
-export TAURI_SIGNING_PRIVATE_KEY_PASSWORD='<你的 updater 私钥密码>'
+export TAURI_SIGNING_PRIVATE_KEY_PASSWORD='<你的 updater 私钥密码，如果生成 key 时没有设置密码可省略>'
+```
+
+如果不想每次粘贴整段私钥，可以把私钥放在仓库外的文件里：
+
+```bash
+export TAURI_SIGNING_PRIVATE_KEY_PATH="$HOME/.config/main/tauri-updater.key"
+export TAURI_SIGNING_PRIVATE_KEY_PASSWORD='<你的 updater 私钥密码，如果生成 key 时没有设置密码可省略>'
 ```
 
 Windows / PowerShell：
 
 ```powershell
 $env:TAURI_SIGNING_PRIVATE_KEY = '<你的 updater 私钥内容>'
-$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = '<你的 updater 私钥密码>'
+$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = '<你的 updater 私钥密码，如果生成 key 时没有设置密码可省略>'
+```
+
+也可以在 Windows VM 里使用文件路径：
+
+```powershell
+$env:TAURI_SIGNING_PRIVATE_KEY_PATH = "$env:USERPROFILE\.config\main\tauri-updater.key"
+$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = '<你的 updater 私钥密码，如果生成 key 时没有设置密码可省略>'
 ```
 
 ### macOS 本机发布

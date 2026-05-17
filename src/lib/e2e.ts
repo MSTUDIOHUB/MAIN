@@ -43,6 +43,7 @@ const EXECUTE_MAX_ITERATIONS_CHECKPOINT_SCENARIO = "execute-max-iterations-check
 const LOCAL_FILE_READ_APPROVAL_SCENARIO = "local-file-read-approval";
 const TOP_ISLAND_EXECUTION_PROGRESS_SCENARIO = "top-island-execution-progress";
 const TOP_ISLAND_PLAN_TASK_PROGRESS_SCENARIO = "top-island-plan-task-progress";
+const TOP_ISLAND_STRICT_EVIDENCE_PROGRESS_SCENARIO = "top-island-strict-evidence-progress";
 const TOP_ISLAND_PENDING_TOOL_REVIEW_SCENARIO = "top-island-pending-tool-review";
 const TOP_ISLAND_PANEL_STABILITY_SCENARIO = "top-island-panel-stability";
 const GAME_STUDIO_TOOL_GROUP_COLLAPSE_SCENARIO = "game-studio-tool-group-collapse";
@@ -2120,6 +2121,124 @@ function seedTopIslandPlanTaskProgressScenario() {
 
   appendBridgeEvent("seeded", { seedCount: readSeedCount(TOP_ISLAND_PLAN_TASK_PROGRESS_SCENARIO) });
   bindBridgeSnapshot(TOP_ISLAND_PLAN_TASK_PROGRESS_SCENARIO);
+
+  const cleanup = () => {
+    useAppStore.setState({ abortController: null, isGenerating: false, agentStatus: "idle" });
+  };
+
+  return cleanup;
+}
+
+function seedTopIslandStrictEvidenceProgressScenario() {
+  const bridge = getBridge();
+  if (!bridge) return undefined;
+
+  bridge.events = [{ type: "boot" }];
+  bridge.savedDocuments = [];
+  bridge.completed = false;
+
+  const workspace = "/tmp/e2e-top-island-strict-evidence-progress";
+  const sessionId = 999604;
+  const now = Date.now();
+  const turnId = "e2e-top-island-strict-evidence-progress-turn";
+  const userBlockId = useAppStore.getState()._nextTaskId();
+  const planTasks = Array.from({ length: 8 }, (_, index) => {
+    const taskNumber = index + 1;
+    const filePath = `src/task-${taskNumber}.ts`;
+    return {
+      id: `strict-plan-task-${taskNumber}`,
+      text: taskNumber === 2
+        ? `1.1 修复 useTrendData 回退逻辑 — 证据: file:${filePath}`
+        : `T${taskNumber}: 更新 ${filePath} — 证据: file:${filePath}`,
+      status: taskNumber <= 7 ? "completed" as const : "pending" as const,
+      claimedStatus: taskNumber <= 7 ? "completed" as const : "pending" as const,
+      evidence: [{ kind: "file" as const, value: filePath }],
+      evidenceStatus: taskNumber === 1 ? "satisfied" as const : "missing" as const,
+      ...(taskNumber === 1 ? {} : { blockedReason: "缺少真实执行证据，暂不能标记完成" }),
+    };
+  });
+  const evidenceLedger = [{
+    id: "strict-evidence-1",
+    kind: "file" as const,
+    value: "src/task-1.ts",
+    target: "src/task-1.ts",
+    sourceTool: "replace_in_file",
+    createdAt: now,
+  }];
+
+  incrementSeedCount(TOP_ISLAND_STRICT_EVIDENCE_PROGRESS_SCENARIO);
+
+  useAppStore.setState((state) => ({
+    ...state,
+    config: {
+      ...state.config,
+      language: "zh",
+      workflowMode: "plan",
+    },
+    currentWorkspace: workspace,
+    sessionsByWorkspace: {
+      [workspace]: [
+        {
+          id: sessionId,
+          title: "E2E TopIsland Strict Evidence Progress",
+          date: new Date(now).toISOString(),
+          active: true,
+          messages: [],
+        },
+      ],
+    },
+    currentSessionId: sessionId,
+    taskFlow: [
+      { id: userBlockId, turnId, type: "user", content: "/计划 执行 8 个任务并严格追踪证据。" },
+    ],
+    conversationTurns: [
+      {
+        id: turnId,
+        userPrompt: "/计划 执行 8 个任务并严格追踪证据。",
+        title: "计划任务严格证据进度回归",
+        mode: "plan",
+        intent: "plan",
+        status: "executing",
+        summary: "TopIsland 不应把 claimed completed 当成可信完成。",
+        blockIds: [userBlockId],
+        collapsed: false,
+        createdAt: now,
+      },
+    ],
+    currentTurnId: turnId,
+    planArtifacts: [
+      {
+        kind: "tasks",
+        path: ".MAIN/plans/tasks.md",
+        title: "Tasks",
+        content: planTasks.map((task) => `- [${task.claimedStatus === "completed" ? "x" : " "}] ${task.text}`).join("\n"),
+        updatedAt: now,
+      },
+    ],
+    planTasks,
+    planExecutionEvidenceLedger: evidenceLedger,
+    planExecutionEvidenceCount: evidenceLedger.length,
+    planStage: "executing",
+    isPlanApproved: true,
+    showPlanPanel: true,
+    showDiff: false,
+    showTerminal: false,
+    showFilePanel: false,
+    rightPanelTab: "plan",
+    agentStatus: "running",
+    isGenerating: true,
+    abortController: new AbortController(),
+    pendingReviewResolve: null,
+    pendingReviewTaskId: null,
+    pendingToolCall: null,
+    selectedDiffTaskId: null,
+    input: "",
+    attachedFiles: [],
+    contextMentions: [],
+  }));
+
+  appendBridgeEvent("seeded", { seedCount: readSeedCount(TOP_ISLAND_STRICT_EVIDENCE_PROGRESS_SCENARIO) });
+  bindBridgeSnapshot(TOP_ISLAND_STRICT_EVIDENCE_PROGRESS_SCENARIO);
 
   const cleanup = () => {
     useAppStore.setState({ abortController: null, isGenerating: false, agentStatus: "idle" });
@@ -5043,6 +5162,10 @@ export function initializeE2EScenarios(): (() => void) | undefined {
 
   if (scenario === TOP_ISLAND_PLAN_TASK_PROGRESS_SCENARIO) {
     return seedTopIslandPlanTaskProgressScenario();
+  }
+
+  if (scenario === TOP_ISLAND_STRICT_EVIDENCE_PROGRESS_SCENARIO) {
+    return seedTopIslandStrictEvidenceProgressScenario();
   }
 
   if (scenario === TOP_ISLAND_PENDING_TOOL_REVIEW_SCENARIO) {

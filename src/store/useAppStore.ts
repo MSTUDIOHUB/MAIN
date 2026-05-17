@@ -1219,6 +1219,7 @@ interface AppState {
   setNormalizedStreamState: (state: NormalizedStreamState) => void;
   approvePlan: (approvalChoice?: string) => void;
   rejectPlan: () => void;
+  rejectPlanAndDeleteFiles: () => Promise<void>;
   showWorkflowMenu: boolean;
   setShowWorkflowMenu: (v: boolean) => void;
 
@@ -4296,9 +4297,9 @@ export const useAppStore = create<AppState>()(
       }
       return { skills: s.skills.filter((sk) => sk.id !== id) };
     }),
-  addSkill: ({ name, desc, content, type, toolParameters, packagePath, entryPoint }) =>
+  addSkill: ({ name, desc, content, type, toolParameters, packagePath, entryPoint, workspaceScope }) =>
     set((s) => ({
-      skills: [...s.skills, { id: Date.now().toString(), name, desc, content: normalizeSkillContent(content), active: true, isBuiltIn: false, type: type || "instruction", toolParameters, packagePath, entryPoint }],
+      skills: [...s.skills, { id: Date.now().toString(), name, desc, content: normalizeSkillContent(content), active: true, isBuiltIn: false, type: type || "instruction", toolParameters, packagePath, entryPoint, workspaceScope }],
     })),
   updateSkill: (id, patch) =>
     set((s) => ({
@@ -5174,6 +5175,10 @@ export const useAppStore = create<AppState>()(
     if (state.currentTurnId) {
       get().setConversationTurnStatus(state.currentTurnId, "stopped_no_action");
     }
+  },
+  rejectPlanAndDeleteFiles: async () => {
+    get().rejectPlan();
+    await get().deletePersistedPlanFiles();
   },
   showWorkflowMenu: false,
   setShowWorkflowMenu: (v) => set({ showWorkflowMenu: v }),
@@ -8587,12 +8592,21 @@ export const useAppStore = create<AppState>()(
             elapsedMs: Math.round(nowMs() - sendStartedAt),
           });
           if (status === "idle" || status === "error") {
+            const pausedByTerminalOverride =
+              status === "idle" &&
+              !abortCtrl.signal.aborted &&
+              (
+                terminalTurnStatusOverride === "stopped_no_action" ||
+                terminalTurnStatusOverride === "stopped_no_output"
+              );
             closeCurrentHarnessRunMarker(
-              status === "error" ? "error" : abortCtrl.signal.aborted ? "idle" : "completed",
+              status === "error" ? "error" : abortCtrl.signal.aborted ? "idle" : pausedByTerminalOverride ? "paused" : "completed",
               status === "error"
                 ? "agent_status_error"
                 : abortCtrl.signal.aborted
                 ? "aborted_by_user"
+                : pausedByTerminalOverride
+                ? "agent_status_idle_paused"
                 : "agent_status_idle",
             );
           }

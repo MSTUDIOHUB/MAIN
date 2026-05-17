@@ -164,6 +164,12 @@ import {
 } from "./planMaterialization";
 import { formatToolPresentation } from "./toolPresentation";
 import type { ShellPermissionApproval } from "./ipc";
+import {
+  buildTaskTargetingProfile,
+  getTaskTargetingEvidenceKey,
+  shouldBlockToolCallForTargeting,
+  type TaskOrchestratorPhase,
+} from "./taskTargeting";
 
 // ── Spec file auto-approval helpers ────────────────────────────────
 
@@ -180,6 +186,73 @@ const EXECUTION_VERIFICATION_TOOL_NAMES = new Set([
   "read_pty_since",
   "get_pty_status",
 ]);
+const FORCE_CONTEXT_TEXT_CHARS = 60_000;
+const FORCE_CONTEXT_TOOL_RESULT_CHARS = 35_000;
+const FORCE_CONTEXT_TOOL_MESSAGE_COUNT = 12;
+const FORCE_CONTEXT_TOOL_LOOP_INTERVAL = 6;
+
+function getMessageContentText(content: AgentMessage["content"]): string {
+  if (typeof content === "string") return content;
+  return content
+    .filter((part): part is TextContentPart => part.type === "text")
+    .map((part) => part.text || "")
+    .join("\n");
+}
+
+function computeContextForceReason(input: {
+  messages: AgentMessage[];
+  iteration: number;
+  workflowMode: "chat" | "edit" | "plan";
+  isPlanApproved: boolean;
+}): { shouldForce: boolean; reason: string | null; textChars: number; toolChars: number; toolMessages: number } {
+  let textChars = 0;
+  let toolChars = 0;
+  let toolMessages = 0;
+  for (const message of input.messages) {
+    const text = getMessageContentText(message.content);
+    textChars += text.length;
+    if (message.role === "tool") {
+      toolChars += text.length;
+      toolMessages += 1;
+    }
+  }
+
+  if (textChars >= FORCE_CONTEXT_TEXT_CHARS) {
+    return { shouldForce: true, reason: "text_chars_threshold", textChars, toolChars, toolMessages };
+  }
+  if (toolChars >= FORCE_CONTEXT_TOOL_RESULT_CHARS) {
+    return { shouldForce: true, reason: "tool_chars_threshold", textChars, toolChars, toolMessages };
+  }
+  if (toolMessages >= FORCE_CONTEXT_TOOL_MESSAGE_COUNT) {
+    return { shouldForce: true, reason: "tool_message_threshold", textChars, toolChars, toolMessages };
+  }
+  if (
+    input.workflowMode === "plan" &&
+    input.isPlanApproved &&
+    input.iteration > 1 &&
+    input.iteration % FORCE_CONTEXT_TOOL_LOOP_INTERVAL === 0
+  ) {
+    return { shouldForce: true, reason: "approved_plan_loop_interval", textChars, toolChars, toolMessages };
+  }
+  return { shouldForce: false, reason: null, textChars, toolChars, toolMessages };
+}
+
+function getSessionTaskTargetingEvidence(sessionKey: string): Set<string> {
+  const key = sessionKey || "__default__";
+  const globalKey = "__MAIN_TASK_TARGETING_EVIDENCE__";
+  const globalRecord = globalThis as typeof globalThis & {
+    [globalKey]?: Map<string, Set<string>>;
+  };
+  if (!globalRecord[globalKey]) {
+    globalRecord[globalKey] = new Map<string, Set<string>>();
+  }
+  let evidence = globalRecord[globalKey]!.get(key);
+  if (!evidence) {
+    evidence = new Set<string>();
+    globalRecord[globalKey]!.set(key, evidence);
+  }
+  return evidence;
+}
 
 /**
  * Returns true if a mutation targets a spec file inside `.MAIN/plans/`.
@@ -920,11 +993,13 @@ export function shouldRecoverLanguageMismatchTurn(input: {
     !input.suppressedByPlanGuard &&
     input.text.trim().length > 0 &&
     mismatch.mismatch;
-  const shouldRecover = hasActionableMismatch && !input.alreadyRetried;
   const hideTextForToolCall =
     hasActionableMismatch &&
-    input.alreadyRetried &&
     input.toolCallCount > 0;
+  const shouldRecover =
+    hasActionableMismatch &&
+    input.toolCallCount === 0 &&
+    !input.alreadyRetried;
   const exhausted =
     hasActionableMismatch &&
     input.alreadyRetried &&
@@ -3671,6 +3746,33 @@ export async function executeAgentLoop(
         debugSummary: "Workspace instructions are disabled.",
       };
   callbacks.onInstructionsResolved(resolvedInstructions);
+  const taskTargetingEvidence = getSessionTaskTargetingEvidence(callbacks.getSessionKey());
+  const emitTaskOrchestratorPhase = (phase: TaskOrchestratorPhase, extra: Record<string, unknown> = {}) => {
+    logAgentEvent("task_orchestrator_phase", {
+      phase,
+      workflowMode,
+      turnIntent,
+      planApproved: callbacks.getIsPlanApproved(),
+      ...extra,
+    });
+  };
+  const buildCurrentTaskTargetingProfile = () => buildTaskTargetingProfile({
+    userPrompt: latestUserPromptText,
+    planTaskTexts: callbacks.getPlanTasks().map((task) => task.text),
+    associatedPaths,
+    skills,
+    observedEvidence: [...taskTargetingEvidence],
+  });
+  const initialTaskTargetingProfile = buildCurrentTaskTargetingProfile();
+  emitTaskOrchestratorPhase("INTAKE_PARSE", {
+    facets: initialTaskTargetingProfile.facets,
+    explicitPaths: initialTaskTargetingProfile.explicitPaths.slice(0, 8),
+    symbols: initialTaskTargetingProfile.symbols.slice(0, 8),
+    preferredReadTools: initialTaskTargetingProfile.preferredReadTools,
+    allowRootSkeleton: initialTaskTargetingProfile.allowRootSkeleton,
+    requiresDesignProtocol: initialTaskTargetingProfile.requiresDesignProtocol,
+    designProtocolSatisfied: initialTaskTargetingProfile.designProtocolSatisfied,
+  });
 
   const hooksConfig = config.hooksEnabled
     ? await loadHooksConfig(workspace)
@@ -4138,15 +4240,22 @@ export async function executeAgentLoop(
       const contextLimit = snapshotContextLimit ?? 32768;
       const effectiveContextLimit = computeManagedContextLimit(contextLimit, llmTools);
       const { inputBudget, outputBudget } = computeContextBudgets(effectiveContextLimit);
+      const contextForce = computeContextForceReason({
+        messages: callbacks.getMessages() as AgentMessage[],
+        iteration,
+        workflowMode,
+        isPlanApproved: callbacks.getIsPlanApproved(),
+      });
       const managedResult = manageContext(
         callbacks.getMessages(),
         effectiveContextLimit,
         cloudResponsesCompact ? Math.min(outputBudget, 2048) : outputBudget,
         cloudResponsesCompact ? 700 : Math.max(4000, Math.floor(inputBudget * 0.45)),
         cloudResponsesCompact ? 500 : Math.max(2000, Math.floor(inputBudget * 0.25)),
-        false,
+        contextForce.shouldForce,
         {
           previousMemoryState: callbacks.getContextMemoryState?.() || null,
+          turnId: callbacks.getCurrentTurnId?.() || eventTurnId,
         },
       );
       callbacks.onContextMemoryBuilt?.(managedResult.memoryState, managedResult.memoryPacket);
@@ -4186,6 +4295,11 @@ export async function executeAgentLoop(
         droppedMessageCount: managedResult.droppedMessageCount,
         microCompactionKind: managedResult.microCompactionKind,
         microCompactedCount: managedResult.microCompactedCount,
+        forceManaged: contextForce.shouldForce,
+        forceReason: contextForce.reason,
+        textChars: contextForce.textChars,
+        toolChars: contextForce.toolChars,
+        toolMessages: contextForce.toolMessages,
       });
     }
 
@@ -5872,6 +5986,10 @@ export async function executeAgentLoop(
         }
 
         if (workflowMode === "plan" && callbacks.getIsPlanApproved()) {
+          emitTaskOrchestratorPhase("DONE", {
+            reason: "plan_evidence_complete",
+            iteration,
+          });
           emitPlanExecutionProgress("completed");
           callbacks.onPlanStageChanged("completed");
         }
@@ -5942,6 +6060,11 @@ export async function executeAgentLoop(
       count: effectiveToolCalls.length,
       names: effectiveToolCalls.map((call) => call.name).slice(0, 12),
     });
+    emitTaskOrchestratorPhase("EXECUTE_STEP", {
+      iteration,
+      toolCalls: effectiveToolCalls.length,
+      toolNames: effectiveToolCalls.map((call) => call.name).slice(0, 12),
+    });
 
     // 4. Process tool calls
     // Append the assistant message with tool_calls
@@ -6006,6 +6129,43 @@ export async function executeAgentLoop(
           ? `工具 "${tc.name}" 当前没有暴露给 ${runtimeIntent} 运行意图。请使用本轮可用工具；如果这是已批准计划的执行步骤，请继续按执行阶段恢复。`
           : `Tool "${tc.name}" is not exposed for the current ${runtimeIntent} runtime intent. Use an available tool; if this is approved plan execution, continue from the execution stage.`;
         callbacks.onToolError(tc.name, target, message, { toolCallId: tc.id });
+        allResults.push({
+          toolCallId: tc.id,
+          name: tc.name,
+          target,
+          content: `Error: ${message}`,
+          isError: true,
+          lifecycleState: "blocked",
+        });
+        continue;
+      }
+
+      const targetingProfile = buildCurrentTaskTargetingProfile();
+      const targetingGate = shouldBlockToolCallForTargeting({
+        profile: targetingProfile,
+        toolName: tc.name,
+        args: toolArgs,
+        target,
+        availableToolNames,
+        language: callbacks.getPreferredLanguage(),
+      });
+      if (targetingGate.blocked) {
+        const message = targetingGate.message || (
+          callbacks.getPreferredLanguage() === "zh"
+            ? "TASK_TARGETING_BLOCKED: 请先使用更定向的读取或确认步骤。"
+            : "TASK_TARGETING_BLOCKED: use a more targeted read or confirmation step first."
+        );
+        callbacks.onToolError(tc.name, target, message, { toolCallId: tc.id });
+        logAgentEvent("task_targeting_tool_blocked", {
+          iteration,
+          tool: tc.name,
+          target,
+          reason: targetingGate.reason || "unknown",
+          facets: targetingProfile.facets,
+          preferredReadTools: targetingProfile.preferredReadTools,
+          explicitPaths: targetingProfile.explicitPaths.slice(0, 8),
+          symbols: targetingProfile.symbols.slice(0, 8),
+        });
         allResults.push({
           toolCallId: tc.id,
           name: tc.name,
@@ -6309,6 +6469,10 @@ export async function executeAgentLoop(
     for (const result of allResults) {
       if (result.isError) continue;
       const resultArgs = toolArgsByCallId.get(result.toolCallId) ?? {};
+      const targetingEvidenceKey = getTaskTargetingEvidenceKey(result.name, resultArgs, result.target);
+      if (targetingEvidenceKey) {
+        taskTargetingEvidence.add(targetingEvidenceKey);
+      }
       if (unityConsoleDiagnosticsRequested && isUnityScriptWriteToolCall(result.name, resultArgs)) {
         unityConsoleFinalVerificationRequired = true;
         unityConsoleRefreshObservedAfterWrite = false;
@@ -6390,6 +6554,12 @@ export async function executeAgentLoop(
     if (workflowMode === "plan") {
       allResults.forEach(rememberPlanToolActivity);
     }
+    emitTaskOrchestratorPhase("EVIDENCE_RECONCILE", {
+      iteration,
+      results: allResults.length,
+      successfulResults: allResults.filter((result) => !result.isError).length,
+      evidenceKeys: [...taskTargetingEvidence].slice(-8),
+    });
 
     const noProgressBatchSignature = buildNoProgressBatchSignature(allResults);
     if (noProgressBatchSignature) {
@@ -6414,6 +6584,12 @@ export async function executeAgentLoop(
         reason: "no_progress_batch_loop",
         iteration,
         repeats: noProgressBatchRepeatCount,
+      });
+      emitTaskOrchestratorPhase("PAUSED", {
+        reason: "no_progress_batch_loop",
+        iteration,
+        repeats: noProgressBatchRepeatCount,
+        remainingTask: remainingText,
       });
       callbacks.onNonActionableStop(
         callbacks.getPreferredLanguage() === "zh"
