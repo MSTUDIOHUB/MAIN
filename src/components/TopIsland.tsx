@@ -345,7 +345,7 @@ const TopIsland = memo(function TopIsland({
         data-run-active={isRunActive ? "true" : "false"}
         onMouseEnter={() => setHovered(true)}
         onMouseLeave={() => setHovered(false)}
-        className={`w-full overflow-hidden rounded-[28px] border backdrop-blur-2xl backdrop-saturate-150 transition-all duration-300 ease-out [&_button]:pointer-events-auto ${isVisible && !isPlanApprovalOnly ? "pointer-events-auto" : "pointer-events-none"} ${shouldExpandWidth ? "max-w-4xl" : "max-w-[580px]"} ${shellClass} ${activeRunOutline}`}
+        className={`w-full overflow-hidden rounded-[28px] border backdrop-blur-2xl backdrop-saturate-150 transition-all duration-300 ease-out [&_button]:pointer-events-auto [&_input]:pointer-events-auto [&_textarea]:pointer-events-auto [&_select]:pointer-events-auto ${isVisible && !isPlanApprovalOnly ? "pointer-events-auto" : "pointer-events-none"} ${shouldExpandWidth ? "max-w-4xl" : "max-w-[580px]"} ${shellClass} ${activeRunOutline}`}
       >
         <div className="flex items-center justify-between gap-3 px-4 py-3">
           <div className="min-w-0 flex items-center gap-2">

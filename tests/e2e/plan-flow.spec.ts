@@ -9,6 +9,47 @@ test.beforeEach(async ({ page }) => {
   });
 });
 
+test("TopIsland plan adjustment input can be clicked, focused, and submitted", async ({ page }) => {
+  await page.goto("/?e2eScenario=plan-flow");
+
+  await expect(page.getByTestId("plan-save-button")).toBeVisible();
+  await page.getByTestId("plan-save-button").click();
+  await expect(page.getByTestId("plan-save-button")).toHaveAttribute("data-save-state", "saved");
+
+  const adjustmentInput = page.getByTestId("top-island-plan-adjust-input");
+  await expect(adjustmentInput).toBeVisible();
+  await adjustmentInput.click();
+  await expect(adjustmentInput).toBeFocused();
+  await adjustmentInput.pressSequentially("请把验证步骤写得更具体");
+
+  await page.getByTestId("top-island-plan-adjust-submit").click();
+  await expect
+    .poll(async () =>
+      page.evaluate(() =>
+        (window as any).__CODELY_E2E__?.events?.some(
+          (item: { type: string; text?: string }) =>
+            item.type === "plan-adjustment-submitted" &&
+            item.text === "请把验证步骤写得更具体",
+        ) ?? false,
+      ),
+    )
+    .toBe(true);
+  await expect
+    .poll(async () =>
+      page.evaluate(() => {
+        const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+        return {
+          isPlanApproved: snapshot?.isPlanApproved,
+          planStage: snapshot?.planStage,
+        };
+      }),
+    )
+    .toEqual({
+      isPlanApproved: false,
+      planStage: "design",
+    });
+});
+
 test("plan flow supports save then approve and finish", async ({ page }) => {
   await page.goto("/?e2eScenario=plan-flow");
 

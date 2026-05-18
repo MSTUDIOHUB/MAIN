@@ -13,19 +13,12 @@ test("thinking policy is the only thought visibility control and persists", asyn
   await page.goto("/?e2eScenario=thinking-policy");
 
   await expect(page.getByTestId("thought-block")).toHaveCount(0);
+  await expect(page.getByTestId("turn-activity-notice")).toHaveCount(0);
+  await expect(page.getByTestId("turn-activity-thought-summary")).toHaveCount(0);
   await expect(page.getByTestId("turn-process-archive-toggle")).toBeVisible();
   await page.getByTestId("turn-process-archive-toggle").click();
 
-  await expect(page.getByTestId("thought-block")).toHaveCount(1);
-  const summary = page.getByTestId("thought-summary-lines");
-  await expect(summary).toBeVisible();
-  await expect(summary).toContainText("验证结果");
-  await expect(summary).not.toContainText("SettingsModal");
-  await expect(summary).not.toContainText("两档配置");
-  await expect(summary).not.toContainText("data:");
-  await expect(summary).not.toContainText("read_file");
-  await expect(summary).not.toContainText("const noisy");
-  await expect(summary).toHaveCSS("font-size", "13px");
+  await expect(page.getByTestId("thought-block")).toHaveCount(0);
   await expect(page.locator('[data-testid="turn-archive-step"][data-kind="inspect"]')).toContainText("收集上下文");
   await expect(page.locator('[data-testid="turn-archive-step"][data-kind="inspect"]')).toContainText("读取目标内容");
 
@@ -43,7 +36,6 @@ test("thinking policy is the only thought visibility control and persists", asyn
 
   await page.locator('input[type="range"]').fill("18");
   await page.getByTestId("settings-close").click();
-  await expect(summary).toHaveCSS("font-size", "18px");
 
   await page.getByTestId("model-settings-button").click();
   await page.getByTestId("settings-tab-general").click();
@@ -52,11 +44,14 @@ test("thinking policy is the only thought visibility control and persists", asyn
   await page.getByTestId("settings-close").click();
 
   await expect(page.getByTestId("thought-block")).toHaveCount(0);
+  await expect(page.getByTestId("turn-activity-thought-summary")).toHaveCount(0);
+  await expect(page.getByTestId("turn-activity-notice")).toHaveCount(0);
   await expect(page.locator('[data-testid="turn-archive-step"][data-kind="inspect"]')).toBeVisible();
   await expect(page.locator('[data-testid="turn-archive-step"][data-kind="inspect"]')).toContainText("读取目标内容");
   expect(await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().thinkingPolicy ?? null)).toBe("action_only");
 
   await page.reload();
   await expect(page.getByTestId("thought-block")).toHaveCount(0);
+  await expect(page.getByTestId("turn-activity-thought-summary")).toHaveCount(0);
   expect(await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().thinkingPolicy ?? null)).toBe("action_only");
 });

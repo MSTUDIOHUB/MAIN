@@ -24,8 +24,6 @@ import { useExternalFileOpen } from "../lib/useExternalFileOpen";
 const CODE_FONT_FAMILY = "'JetBrains Mono', 'Fira Code', Menlo, Monaco, 'Courier New', monospace";
 const MAX_TABLE_PREVIEW_ROWS = 80;
 const MAX_TABLE_PREVIEW_COLUMNS = 24;
-const FILE_PANEL_REFRESH_INTERVAL_MS = 3000;
-
 type FileCategory = "markdown" | "image" | "binary" | "json" | "table" | "config" | "unity" | "code";
 type FileViewMode = "preview" | "raw";
 
@@ -935,7 +933,6 @@ export default function FilePanel({ width, onStartResizing }: FilePanelProps) {
   const currentSessionId = useAppStore((s) => s.currentSessionId);
   const config = useAppStore((s) => s.config);
   const workspaceContentVersion = useAppStore((s) => s.workspaceContentVersion);
-  const bumpWorkspaceContentVersion = useAppStore((s) => s.bumpWorkspaceContentVersion);
 
   const language = config.language === "en" ? "en" : "zh";
   const workspaceName = useMemo(() => {
@@ -963,14 +960,6 @@ export default function FilePanel({ width, onStartResizing }: FilePanelProps) {
       clearFileViewer();
     }
   }, [clearFileViewer, currentSessionId, currentWorkspace, showFilePanel]);
-
-  useEffect(() => {
-    if (!showFilePanel || !currentWorkspace) return;
-    const timer = window.setInterval(() => {
-      bumpWorkspaceContentVersion();
-    }, FILE_PANEL_REFRESH_INTERVAL_MS);
-    return () => window.clearInterval(timer);
-  }, [bumpWorkspaceContentVersion, currentWorkspace, showFilePanel]);
 
   useEffect(() => {
     if (!showFilePanel) {

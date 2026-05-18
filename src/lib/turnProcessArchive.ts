@@ -72,6 +72,15 @@ function isProcessArchiveCandidate(block: any, finalVisibleAgentIndex: number, b
   return block.type === "tool" || block.type === "thought" || block.type === "jobList" || block.type === "agent" || block.type === "system";
 }
 
+function isLiveProcessCandidate(block: any): boolean {
+  if (!block || block.type === "user" || block.type === "thought") return false;
+  if (block.type === "agent") return block.hiddenProcess === true;
+  if (block.type === "system") {
+    return block.variant !== "context_compression" && block.variant !== "plan_execution_checkpoint";
+  }
+  return block.type === "tool" || block.type === "jobList" || block.type === "system";
+}
+
 function mapToolStatus(block: any): TurnArchiveStepStatus {
   const status = String(block?.toolStatus || block?.status || "").toLowerCase();
   if (status === "failed" || status === "error") return "failed";
@@ -306,15 +315,45 @@ function makeSummaryText(steps: TurnArchiveStep[], counts: TurnProcessArchiveCou
   return parts.join(" / ");
 }
 
+function buildModelFromSteps(input: {
+  blocks: any[];
+  steps: TurnArchiveStep[];
+  language: ToolPresentationLanguage;
+}): TurnProcessArchiveModel {
+  const finalizedSteps = input.steps.map((step) => finalizeStep(step, input.language));
+  const counts = makeCounts(finalizedSteps);
+  const previewTargets: string[] = [];
+  for (const step of finalizedSteps) {
+    for (const target of step.targets) {
+      if (target && previewTargets.length < 3 && !previewTargets.includes(target)) {
+        previewTargets.push(target);
+      }
+    }
+  }
+
+  return {
+    blocks: input.blocks,
+    steps: finalizedSteps,
+    counts,
+    totalCount: input.blocks.length,
+    stepCount: finalizedSteps.length,
+    summaryText: makeSummaryText(finalizedSteps, counts, input.language),
+    previewTargets,
+  };
+}
+
 export function buildTurnProcessArchiveModel(input: {
   blocks: any[];
   finalVisibleAgentIndex: number;
   language?: ToolPresentationLanguage;
+  includeThoughts?: boolean;
 }): TurnProcessArchiveModel {
   const language = normalizeLanguage(input.language);
+  const includeThoughts = input.includeThoughts !== false;
   const latestThoughtId = getLatestThoughtBlock(input.blocks)?.id ?? null;
   const archiveBlocks = input.blocks.filter((block, index) => {
     if (!isProcessArchiveCandidate(block, input.finalVisibleAgentIndex, index)) return false;
+    if (block.type === "thought" && !includeThoughts) return false;
     if (block.type === "thought" && block.id !== latestThoughtId) return false;
     return true;
   });
@@ -335,24 +374,44 @@ export function buildTurnProcessArchiveModel(input: {
     steps.push(next);
   });
 
-  const finalizedSteps = steps.map((step) => finalizeStep(step, language));
-  const counts = makeCounts(finalizedSteps);
-  const previewTargets: string[] = [];
-  for (const step of finalizedSteps) {
-    for (const target of step.targets) {
-      if (target && previewTargets.length < 3 && !previewTargets.includes(target)) {
-        previewTargets.push(target);
-      }
-    }
-  }
+  return buildModelFromSteps({ blocks: archiveBlocks, steps, language });
+}
 
-  return {
-    blocks: archiveBlocks,
-    steps: finalizedSteps,
-    counts,
-    totalCount: archiveBlocks.length,
-    stepCount: finalizedSteps.length,
-    summaryText: makeSummaryText(finalizedSteps, counts, language),
-    previewTargets,
-  };
+export function buildLiveTurnProcessTimelineModel(input: {
+  blocks: any[];
+  language?: ToolPresentationLanguage;
+}): TurnProcessArchiveModel {
+  const language = normalizeLanguage(input.language);
+  const liveBlocks: any[] = [];
+  const steps: TurnArchiveStep[] = [];
+  let current: TurnArchiveStep | null = null;
+
+  input.blocks.forEach((block, index) => {
+    if (!block || block.type === "user") return;
+    if (block.type === "thought") {
+      current = null;
+      return;
+    }
+    if (!isLiveProcessCandidate(block)) {
+      current = null;
+      return;
+    }
+
+    liveBlocks.push(block);
+    const next = makeStep({ block, index, language });
+    if (canMergeSteps(current, next)) {
+      current!.items.push(...next.items);
+      current!.targets = uniqueTargets(current!.items, language);
+      current!.expandedByDefault = current!.expandedByDefault || next.expandedByDefault;
+      if (isContextPhase(current!.kind) && isContextPhase(next.kind)) {
+        current!.intent = defaultIntentForStep(current!.kind, language);
+      }
+      return;
+    }
+
+    steps.push(next);
+    current = next;
+  });
+
+  return buildModelFromSteps({ blocks: liveBlocks, steps, language });
 }

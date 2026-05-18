@@ -2762,6 +2762,7 @@ function seedGameStudioToolGroupScenario(status: "executing" | "awaiting_input")
       status: "done",
       toolStatus: "executed" as const,
       message: "OK",
+      intentSummary: "定位 Main Camera 对象",
     },
     {
       id: thoughtBlockId,
@@ -2779,6 +2780,7 @@ function seedGameStudioToolGroupScenario(status: "executing" | "awaiting_input")
       status: "done",
       toolStatus: "executed" as const,
       message: "OK",
+      intentSummary: "核对 Main Camera 当前相机参数",
     },
     {
       id: completedCId,
@@ -2789,6 +2791,7 @@ function seedGameStudioToolGroupScenario(status: "executing" | "awaiting_input")
       status: "done",
       toolStatus: "executed" as const,
       message: "OK",
+      intentSummary: "读取控制脚本确认行为",
     },
   ];
 
@@ -2802,6 +2805,7 @@ function seedGameStudioToolGroupScenario(status: "executing" | "awaiting_input")
       status: "running",
       toolStatus: "running",
       message: "Executing...",
+      intentSummary: "继续调整 Main Camera 视角",
     });
   } else {
     taskFlow.push({

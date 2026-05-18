@@ -39,7 +39,7 @@ import { getIntentPolicy, resolveConversationTurnIntent } from "../lib/runIntent
 import { summarizePlanExecutionProgressSnapshot } from "../lib/planExecutionRecovery";
 import { buildCompletedToolGroupRanges, countCompletedToolCalls } from "../lib/toolUiGrouping";
 import { compactToolPresentationTarget, getToolPresentationLabel } from "../lib/toolPresentation";
-import { buildTurnProcessArchiveModel, type TurnArchiveStep } from "../lib/turnProcessArchive";
+import { buildLiveTurnProcessTimelineModel, buildTurnProcessArchiveModel, type TurnArchiveStep } from "../lib/turnProcessArchive";
 import { getChatFeedbackStatusCopy, normalizeChatFeedbackStatus } from "../lib/chatFeedback";
 import type { UserContextItem } from "../lib/userContextItems";
 
@@ -914,15 +914,51 @@ function getActiveTurnActivity(blocks: any[], turnStatus: string, language: "zh"
   return "";
 }
 
-function TurnActivityNotice({ text }: { text: string }) {
-  if (!text) return null;
+function TurnActivityNotice({
+  activityText,
+  thoughtSummaryText,
+  isThinking,
+  language,
+  chatFontSize,
+  text,
+}: {
+  activityText?: string;
+  thoughtSummaryText?: string;
+  isThinking?: boolean;
+  language: "zh" | "en";
+  chatFontSize: number;
+  text?: string;
+}) {
+  const resolvedActivityText = String(activityText ?? text ?? "").trim();
+  const resolvedThoughtSummaryText = String(thoughtSummaryText || "").trim();
+  if (!resolvedActivityText && !resolvedThoughtSummaryText) return null;
+  const thoughtTitle = language === "zh"
+    ? isThinking ? "正在整理思路" : "思考摘要"
+    : isThinking ? "Thinking" : "Thinking summary";
   return (
     <div
       data-testid="turn-activity-notice"
-      className="ml-9 flex items-center gap-2 rounded-2xl border border-[rgba(96,165,250,0.2)] bg-[rgba(37,99,235,0.08)] px-4 py-3 text-[12px] text-[#bfdbfe]"
+      className="ml-9 rounded-2xl border border-[rgba(96,165,250,0.2)] bg-[rgba(37,99,235,0.08)] px-4 py-3 text-[12px] text-[#bfdbfe]"
     >
-      <span className="h-2 w-2 rounded-full bg-[#60a5fa] shadow-[0_0_8px_rgba(96,165,250,0.8)] animate-pulse" />
-      <span>{text}</span>
+      {resolvedThoughtSummaryText && (
+        <div data-testid="turn-activity-thought-summary" style={{ fontSize: `${chatFontSize}px` }}>
+          <div className="mb-1.5 flex items-center gap-2 font-mono text-[10.5px] text-[#93c5fd]">
+            <span className={`h-1.5 w-1.5 rounded-full ${isThinking ? "bg-amber-400 shadow-[0_0_6px_rgba(251,191,36,0.75)] animate-pulse" : "bg-[#34d399]"}`} />
+            <span>{thoughtTitle}</span>
+          </div>
+          <MarkdownRenderer
+            content={resolvedThoughtSummaryText}
+            baseFontSize={chatFontSize}
+            sourceId="turn-activity-thought-summary"
+          />
+        </div>
+      )}
+      {resolvedActivityText && (
+        <div className={`flex items-center gap-2 ${resolvedThoughtSummaryText ? "mt-2 border-t border-[rgba(147,197,253,0.14)] pt-2" : ""}`}>
+          <span className="h-2 w-2 rounded-full bg-[#60a5fa] shadow-[0_0_8px_rgba(96,165,250,0.8)] animate-pulse" />
+          <span>{resolvedActivityText}</span>
+        </div>
+      )}
     </div>
   );
 }
@@ -1298,18 +1334,21 @@ function TurnProcessArchive({
   const toggleText = expanded
     ? language === "zh" ? "收起过程" : "Collapse"
     : language === "zh" ? "展开过程" : "Expand";
+  const containerClassName = expanded
+    ? "ml-9 rounded-xl px-1 py-2 ring-1 ring-inset ring-[color-mix(in_srgb,var(--accent-light)_50%,transparent)] transition-all duration-150"
+    : "ml-9 rounded-xl px-1 py-2 ring-1 ring-inset ring-[color-mix(in_srgb,var(--accent-light)_32%,transparent)] transition-all duration-150 hover:ring-[color-mix(in_srgb,var(--accent-light)_44%,transparent)]";
 
   const thoughtSteps = archive.steps.filter((step) => step.kind === "thinking");
   const timelineSteps = archive.steps.filter((step) => step.kind !== "thinking");
 
   return (
-    <div className="ml-9 px-1 py-2">
+    <div className={containerClassName}>
       <button
         type="button"
         data-testid="turn-process-archive-toggle"
         aria-expanded={expanded}
         onClick={() => setExpanded((value) => !value)}
-        className="flex w-full min-w-0 items-center justify-between gap-3 rounded-lg px-2 py-1.5 text-left transition-colors hover:bg-[color-mix(in_srgb,var(--accent)_6%,transparent)]"
+        className="flex w-full min-w-0 items-center justify-between gap-3 rounded-lg px-2 py-1.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-transparent"
       >
         <span className="min-w-0 flex-1">
           <span className="flex min-w-0 flex-wrap items-center gap-2">
@@ -1413,25 +1452,32 @@ function TurnArchiveStepCard({
   language,
   renderArchivedItem,
   onOpenDiff,
+  variant = "archive",
 }: {
   step: TurnArchiveStep;
   language: "zh" | "en";
   renderArchivedItem: (item: any) => React.ReactNode;
   onOpenDiff: (taskId: number) => void;
+  variant?: "archive" | "live";
 }) {
   const [expanded, setExpanded] = useState(step.expandedByDefault);
   const { entries, totalExecutedEdits } = collectTurnChangeEntries(step.items);
   const hasChangeSummary = step.kind === "edit" && entries.length > 0;
   const detailItems = buildBlockRenderItems(step.items, false);
+  const isLive = variant === "live";
   const toggleText = expanded
-    ? language === "zh" ? "收起证据" : "Hide evidence"
-    : language === "zh" ? "查看证据" : "Show evidence";
+    ? isLive
+      ? language === "zh" ? "收起操作" : "Hide actions"
+      : language === "zh" ? "收起证据" : "Hide evidence"
+    : isLive
+      ? language === "zh" ? "展开操作" : "Show actions"
+      : language === "zh" ? "查看证据" : "Show evidence";
   const targetText = step.targets.slice(0, 3).join(language === "zh" ? "、" : ", ");
   const hiddenTargetCount = Math.max(0, step.targets.length - 3);
 
   return (
     <div
-      data-testid="turn-archive-step"
+      data-testid={isLive ? "live-turn-step" : "turn-archive-step"}
       data-kind={step.kind}
       data-status={step.status}
       className="border-t border-[var(--surface-border-soft)] py-2 first:border-t-0"
@@ -1488,6 +1534,54 @@ function TurnArchiveStepCard({
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+function LiveTurnProcessTimeline({
+  model,
+  language,
+  renderLiveItem,
+  onOpenDiff,
+}: {
+  model: ReturnType<typeof buildLiveTurnProcessTimelineModel> | null;
+  language: "zh" | "en";
+  renderLiveItem: (item: any) => React.ReactNode;
+  onOpenDiff: (taskId: number) => void;
+}) {
+  if (!model || model.totalCount === 0) return null;
+  const title = language === "zh" ? "本轮步骤" : "Turn steps";
+  const summary = model.summaryText || (language === "zh" ? "操作已按步骤折叠。" : "Actions are folded by step.");
+
+  return (
+    <div
+      data-testid="live-turn-process-timeline"
+      className="ml-9 rounded-xl px-1 py-2 ring-1 ring-inset ring-[color-mix(in_srgb,var(--accent-light)_32%,transparent)] transition-all duration-150"
+    >
+      <div className="px-2 pb-2">
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
+          <span className="inline-flex items-center gap-2 text-[11px] uppercase tracking-[0.16em] text-[#93c5fd]">
+            <IconColumns className="h-3.5 w-3.5" />
+            {title}
+          </span>
+          <span className="text-[10px] text-[var(--surface-text-muted)]">
+            {language === "zh" ? `${model.stepCount} 步` : `${model.stepCount} step${model.stepCount > 1 ? "s" : ""}`}
+          </span>
+        </div>
+        <div className="mt-1 truncate text-[12px] text-[var(--surface-text-subtle)]">{summary}</div>
+      </div>
+      <div className="space-y-2 px-2">
+        {model.steps.map((step) => (
+          <TurnArchiveStepCard
+            key={step.id}
+            step={step}
+            language={language}
+            renderArchivedItem={renderLiveItem}
+            onOpenDiff={onOpenDiff}
+            variant="live"
+          />
+        ))}
+      </div>
     </div>
   );
 }
@@ -2431,7 +2525,7 @@ export default function ChatArea({
       isFinishedTurn &&
       finalVisibleAgentIndex >= 0;
     const processArchive = shouldArchiveCompletedProcess
-      ? buildTurnProcessArchiveModel({ blocks, finalVisibleAgentIndex, language })
+      ? buildTurnProcessArchiveModel({ blocks, finalVisibleAgentIndex, language, includeThoughts: false })
       : null;
     const collapsedProcessCount = finalVisibleAgentBlock
       ? processArchive?.stepCount ?? blocks.filter((block, idx) => block.type !== "user" && idx !== finalVisibleAgentIndex).length
@@ -2452,6 +2546,14 @@ export default function ChatArea({
       : "";
     const toolExecutionSummary = buildToolExecutionSummary(blocks, language);
     const activeTurnActivity = getActiveTurnActivity(blocks, turn.status, language);
+    const liveProcessTimeline = !shouldArchiveCompletedProcess
+      ? buildLiveTurnProcessTimelineModel({ blocks, language })
+      : null;
+    const liveProcessBlockIds = new Set(
+      (liveProcessTimeline?.blocks || [])
+        .map((block: any) => block?.id)
+        .filter((id: any) => id !== undefined && id !== null),
+    );
     const thoughtSummaryCache = new Map<string, string>();
     const getThoughtSummaryText = (thoughtBlock: any) => {
       const cacheKey = String(thoughtBlock?.id ?? "");
@@ -2466,53 +2568,29 @@ export default function ChatArea({
       return summary;
     };
     const latestThoughtBlock = getLatestThoughtBlock(blocks);
-    const latestThoughtBlockId = latestThoughtBlock?.id ?? null;
+    const bottomThoughtSummary =
+      !shouldSuppressThoughtBlocks && turn.status !== "error" && latestThoughtBlock?.isStreaming
+        ? getThoughtSummaryText(latestThoughtBlock)
+        : "";
+    const isBottomThoughtStreaming = !!latestThoughtBlock?.isStreaming;
     const renderTurnBlockItem = (item) => {
-      if (shouldSuppressThoughtBlocks && item.kind !== "readContextGroup" && item.block?.type === "thought") {
-        return null;
-      }
-      if (
-        !shouldSuppressThoughtBlocks &&
-        item.kind !== "readContextGroup" &&
-        item.block?.type === "thought"
-      ) {
-        if (item.block?.id !== latestThoughtBlockId) return null;
-        const summaryText = getThoughtSummaryText(item.block);
-        if (!summaryText) return null;
-        return (
-          <ThoughtBlock
-            key={`${item.block.id}-${item.index}`}
-            block={item.block}
-            language={language}
-            chatFontSize={config.chatFontSize ?? 13}
-            summaryText={summaryText}
-          />
-        );
-      }
+      if (item.kind !== "readContextGroup" && item.block?.type === "thought") return null;
 
       return renderBlockItem(item);
     };
     const renderArchivedBlockItem = (item) => {
-      if (
-        !shouldSuppressThoughtBlocks &&
-        item.kind !== "readContextGroup" &&
-        item.block?.type === "thought"
-      ) {
-        if (item.block?.id !== latestThoughtBlockId) return null;
-        const summaryText = getThoughtSummaryText(item.block);
-        if (!summaryText) return null;
-        return (
-          <ThoughtBlock
-            key={`archive-${item.block.id}-${item.index}`}
-            block={item.block}
-            language={language}
-            chatFontSize={config.chatFontSize ?? 13}
-            summaryText={summaryText}
-            compact
-          />
-        );
-      }
+      if (item.kind !== "readContextGroup" && item.block?.type === "thought") return null;
       return renderBlockItem(item);
+    };
+    const isLiveProcessRenderItem = (item) => {
+      if (item.kind === "readContextGroup" || item.kind === "completedToolGroup") {
+        return item.blocks.every((block: any) => liveProcessBlockIds.has(block?.id));
+      }
+      return liveProcessBlockIds.has(item.block?.id);
+    };
+    const renderLiveRemainderItem = (item) => {
+      if (isLiveProcessRenderItem(item)) return null;
+      return renderTurnBlockItem(item);
     };
     const displayTitleFallback = turn.userPrompt
       ? normalizeConversationDisplayTitle(
@@ -2678,11 +2756,29 @@ export default function ChatArea({
                   {finalVisibleAgentBlock && renderBlock(finalVisibleAgentBlock, finalVisibleAgentIndex)}
                 </>
               ) : (
-                buildBlockRenderItems(blocks, false, enableCompletedToolGrouping).map(renderTurnBlockItem)
+                <>
+                  {liveProcessTimeline && liveProcessTimeline.totalCount > 0 && (
+                    <LiveTurnProcessTimeline
+                      model={liveProcessTimeline}
+                      language={language}
+                      renderLiveItem={renderBlockItem}
+                      onOpenDiff={openDiffForTask}
+                    />
+                  )}
+                  {buildBlockRenderItems(blocks, false, enableCompletedToolGrouping).map(renderLiveRemainderItem)}
+                </>
               )}
             </>
           )}
-          {activeTurnActivity && <TurnActivityNotice text={activeTurnActivity} />}
+          {(activeTurnActivity || bottomThoughtSummary) && (
+            <TurnActivityNotice
+              activityText={activeTurnActivity}
+              thoughtSummaryText={bottomThoughtSummary}
+              isThinking={isBottomThoughtStreaming}
+              language={language}
+              chatFontSize={config.chatFontSize ?? 13}
+            />
+          )}
         </div>
         <div
           className="mt-4 h-px w-full rounded-full"
