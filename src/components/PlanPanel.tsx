@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import MarkdownRenderer from "./MarkdownRenderer";
 import { IconCheck, IconSave } from "./Icons";
-import { buildPlanTaskEvidenceAudit, extractPlanTasks, isPlanConversationTurn, isPlanTaskTrustedComplete, type ConversationTurn, type PlanArtifact, type PlanExecutionEvidenceEntry, type PlanStage, type PlanTask } from "../lib/workflowModels";
+import { buildPlanTaskEvidenceAudit, extractPlanTasks, isPlanConversationTurn, isPlanTaskAwaitingBrowserValidation, isPlanTaskAwaitingExternalValidation, isPlanTaskTrustedComplete, type ConversationTurn, type PlanArtifact, type PlanExecutionEvidenceEntry, type PlanStage, type PlanTask } from "../lib/workflowModels";
 
 interface PlanPanelProps {
   artifacts: PlanArtifact[];
@@ -44,6 +44,8 @@ const COPY = {
     completed: "完成",
     inProgress: "进行中",
     missingEvidence: "待验证",
+    autoValidation: "自动验证",
+    userValidation: "待用户验证",
     pending: "待办",
     rejectAndKeepPlan: "拒绝并保留",
     rejectAndDeletePlan: "拒绝并删除",
@@ -94,6 +96,8 @@ const COPY = {
     completed: "Done",
     inProgress: "In Progress",
     missingEvidence: "Needs Evidence",
+    autoValidation: "Auto Validation",
+    userValidation: "User Validation",
     pending: "Pending",
     rejectAndKeepPlan: "Reject And Keep",
     rejectAndDeletePlan: "Reject And Delete",
@@ -362,6 +366,10 @@ export default function PlanPanel({
                   <div data-testid="plan-task-status" className="text-[10px] text-[#71717a] whitespace-nowrap">
                     {isPlanTaskTrustedComplete(task)
                       ? copy.completed
+                      : isPlanTaskAwaitingExternalValidation(task)
+                      ? copy.userValidation
+                      : isPlanTaskAwaitingBrowserValidation(task)
+                      ? copy.autoValidation
                       : task.claimedStatus === "completed" && task.evidenceStatus !== "satisfied"
                       ? copy.missingEvidence
                       : task.status === "in_progress" ? copy.inProgress : copy.pending}

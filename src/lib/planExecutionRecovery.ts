@@ -1,5 +1,7 @@
 import {
   buildPlanTaskEvidenceAudit,
+  isPlanTaskAwaitingBrowserValidation,
+  isPlanTaskAwaitingExternalValidation,
   type PlanArtifact,
   type PlanExecutionEvidenceEntry,
   type PlanExecutionProgressPhase,
@@ -46,7 +48,11 @@ function compactLine(value: string | undefined | null, maxChars = MAX_LINE_CHARS
 }
 
 function summarizeTask(task: PlanTask): string {
-  const status = task.evidenceStatus || task.status || "missing";
+  const status = isPlanTaskAwaitingExternalValidation(task)
+    ? "待用户验证"
+    : isPlanTaskAwaitingBrowserValidation(task)
+    ? "需要浏览器验证"
+    : task.evidenceStatus || task.status || "missing";
   return compactLine(`${task.text} [${status}]`);
 }
 

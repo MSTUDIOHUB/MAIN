@@ -2227,9 +2227,13 @@ function compactThoughtContent(text: string): string {
 
 function compactThoughtContentForPersist(text: string): string {
   const compacted = compactThoughtContent(text);
-  const summarized = deriveThoughtDisplay(compacted, { maxSummaryLines: 1, mode: "latest" }).summaryText;
+  const summarized = deriveThoughtDisplay(compacted, {
+    maxSummaryLines: 12,
+    mode: "latest",
+    density: "adaptive",
+  }).summaryText;
   if (summarized) return summarized;
-  return compacted.length > 1200 ? compacted.slice(0, 1200).trimEnd() : compacted;
+  return compacted.length > 2400 ? compacted.slice(0, 2400).trimEnd() : compacted;
 }
 
 function appendThoughtDelta(existing: string, incoming: string): string {
@@ -2982,6 +2986,7 @@ export function sanitizeTaskBlocksForPersist(blocks: TaskBlock[]): TaskBlock[] {
           turnId: b.turnId,
           type: "agent" as const,
           content: String(b.content),
+          ...(b.hiddenProcess ? { hiddenProcess: true } : {}),
           ...(b.archivedAfterChoice ? { archivedAfterChoice: true } : {}),
           ...(b.selectedOption ? { selectedOption: String(b.selectedOption) } : {}),
           ...(b.options && b.options.length > 0
@@ -3377,7 +3382,7 @@ function buildTrustedPlanResumePrompt(input: {
   return [
     "Continue plan execution in a fresh recovery context; do not reuse the previous errored loop.",
     input.hasTasksArtifact
-      ? "Start from the first task whose evidence is not satisfied. Treat a task as complete only after real file-write, successful command, or verification evidence exists."
+      ? "Start from the first task whose evidence is not satisfied. Treat a task as complete only after real file-write, successful command, Browser/Playwright DOM/screenshot evidence, or explicit pending user validation exists."
       : input.artifacts.length === 0
       ? "First read `.MAIN/plans/design.md` and `.MAIN/plans/tasks.md` from the current workspace; if a legacy bugfix.md or requirements.md exists, use it only as supporting context. If tasks.md does not exist, generate the task list from the plan files before doing real work."
       : input.tasks.length > 0
@@ -3509,7 +3514,7 @@ function deriveIdleConversationTurnStatus(input: {
     input.planTasks.length > 0 ||
     input.planArtifacts.some((artifact) => artifact.kind === "tasks");
   const allTasksComplete =
-    buildPlanTaskEvidenceAudit({ tasks: input.planTasks }).acceptedCompletion;
+    buildPlanTaskEvidenceAudit({ tasks: input.planTasks }).allTrustedComplete;
   const hasExecutionEvidence =
     input.planExecutionEvidenceCount > 0 ||
     turnBlocks.some((block) =>
@@ -5141,12 +5146,12 @@ export const useAppStore = create<AppState>()(
 
             if (language === "en") {
               return hasTasksArtifact
-              ? approvalChoiceHint + "The plan is approved. Continue directly from the current task list and execute the remaining items without repeating the plan. If `.MAIN/plans/tasks.md` exists, keep it as an audit record: do not delete completed or previous task records, and only check an item off after real evidence exists for its file/command/deliverable." + deliverableHint + runtimeTaskNotice + "\n\n" + buildPlanCommandExecutionHint(executionPlanTasks, "en")
+              ? approvalChoiceHint + "The plan is approved. Continue directly from the current task list and execute the remaining items without repeating the plan. If `.MAIN/plans/tasks.md` exists, keep it as an audit record: do not delete completed or previous task records, and only check an item off after real evidence exists for its file/command/deliverable/browser validation, or the item is explicitly pending user validation." + deliverableHint + runtimeTaskNotice + "\n\n" + buildPlanCommandExecutionHint(executionPlanTasks, "en")
                 : approvalChoiceHint + "The plan is approved. First derive a concise runtime task list from the approved design.md; generate `.MAIN/plans/tasks.md` only if the work is long, needs cross-session audit, or the user explicitly requested a durable task file. Then execute real work without repeating the plan. Task items should be concise and include lightweight evidence such as `evidence: file:src/app.ts` or `evidence: cmd:npm test` when there is a concrete deliverable." + deliverableHint;
             }
 
             return hasTasksArtifact
-              ? approvalChoiceHint + "计划已批准。请直接基于当前任务清单继续执行剩余任务，不要重复计划内容。如果 `.MAIN/plans/tasks.md` 已存在，它是审计记录：不要删除已完成或旧任务记录；只有文件/命令/交付物的真实证据满足后，才能勾选对应任务。" + deliverableHint + runtimeTaskNotice + "\n\n" + buildPlanCommandExecutionHint(executionPlanTasks, "zh")
+              ? approvalChoiceHint + "计划已批准。请直接基于当前任务清单继续执行剩余任务，不要重复计划内容。如果 `.MAIN/plans/tasks.md` 已存在，它是审计记录：不要删除已完成或旧任务记录；只有文件/命令/交付物/浏览器验证的真实证据满足，或该项明确待用户验证后，才能勾选对应任务。" + deliverableHint + runtimeTaskNotice + "\n\n" + buildPlanCommandExecutionHint(executionPlanTasks, "zh")
               : approvalChoiceHint + "计划已批准。请先基于已批准的 design.md 派生精简 runtime 任务清单；只有任务较长、需要跨会话审计或用户明确要求持久任务文件时，才生成 `.MAIN/plans/tasks.md`。然后执行真实任务，不要重复计划内容。有明确交付物的任务请保留轻量证据标签，例如 `证据: file:src/app.ts` 或 `证据: cmd:npm test`。" + deliverableHint;
           })(),
           undefined,
@@ -8219,7 +8224,8 @@ export const useAppStore = create<AppState>()(
           const lastThoughtBlock = [...turnBlocks].reverse().find((b) => b.type === "thought");
 
           if (lastThoughtBlock) {
-            const existing = normalizeForComp((lastThoughtBlock as Extract<TaskBlock, { type: "thought" }>).content);
+            const existingContent = (lastThoughtBlock as Extract<TaskBlock, { type: "thought" }>).content;
+            const existing = normalizeForComp(existingContent);
             
             // If the incoming thought is already present, update metadata and avoid duplication.
             if (existing.includes(incoming)) {
@@ -8236,10 +8242,11 @@ export const useAppStore = create<AppState>()(
               return;
             }
             const tid = lastThoughtBlock.id;
+            const nextContent = appendThoughtDelta(existingContent, thought);
             sessionSet((s) => ({
               taskFlow: s.taskFlow.map((t) =>
                 t.id === tid && t.type === "thought"
-                  ? { ...t, content: compactThoughtContent(thought), isStreaming: true, duration }
+                  ? { ...t, content: nextContent, isStreaming: true, duration }
                   : t
               ),
             }));
@@ -8281,13 +8288,14 @@ export const useAppStore = create<AppState>()(
           }
         },
 
-        onAssistantFinalText: (text, replyOptions = []) => {
+        onAssistantFinalText: (text, replyOptions = [], meta) => {
           const fallbackText = replyOptions.length > 0
             ? sessionGet().config.language === "en"
               ? "Choose how you'd like to continue."
               : "请选择你希望我如何继续。"
             : "";
           const cleanText = text.trim() || fallbackText;
+          const isProcessAssistantText = !!meta?.hasToolCalls && replyOptions.length === 0;
           const currentFlow = sessionGet().taskFlow;
           const latestBlock = [...currentFlow].reverse().find((block) =>
             block.turnId === turnId &&
@@ -8363,6 +8371,7 @@ export const useAppStore = create<AppState>()(
               type: "agent",
               content: cleanText,
               ...(replyOptions.length > 0 ? { options: replyOptions } : {}),
+              ...(isProcessAssistantText ? { hiddenProcess: true } : {}),
               streaming: false,
             });
             return;
@@ -8380,6 +8389,7 @@ export const useAppStore = create<AppState>()(
                     ...t,
                     content: cleanText,
                     ...(replyOptions.length > 0 ? { options: replyOptions } : { options: undefined }),
+                    ...(isProcessAssistantText ? { hiddenProcess: true } : { hiddenProcess: undefined }),
                     streaming: false,
                   }
                 : t
@@ -8926,7 +8936,7 @@ export const useAppStore = create<AppState>()(
             stage === "completed" &&
             current.isPlanApproved &&
             current.planExecutionEvidenceCount > 0 &&
-            taskAudit.acceptedCompletion &&
+            taskAudit.allTrustedComplete &&
             hasRootMarkdownDeliverableEvidence(turnBlocks, requestedDocs);
           const nextStage =
             stage === "idle"

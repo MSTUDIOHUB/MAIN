@@ -346,14 +346,14 @@ function extractReplyOptionsFromProtocolTool(call: NormalizedToolCall): ReplyOpt
     .map((item): ReplyOption | null => {
       if (typeof item === "string") {
         const text = normalizeReplyOptionText(item);
-        return text ? { label: text, value: text } : null;
+        return text ? { label: text, value: text, source: "explicit_user_options" } : null;
       }
 
       if (!item || typeof item !== "object") return null;
       const record = item as Record<string, unknown>;
       const label = normalizeReplyOptionText(record.label ?? record.title ?? record.text ?? record.value);
       const value = normalizeReplyOptionText(record.value ?? record.text ?? record.label ?? record.title);
-      return label && value ? { label, value } : null;
+      return label && value ? { label, value, source: "explicit_user_options" } : null;
     })
     .filter((option): option is ReplyOption => option != null);
 }
@@ -367,7 +367,7 @@ function mergeReplyOptions(...groups: ReplyOption[][]): ReplyOption[] {
       const label = normalizeReplyOptionText(option.label || option.value);
       if (!value || seen.has(value)) continue;
       seen.add(value);
-      merged.push({ label, value, ...(option.action ? { action: option.action } : {}) });
+      merged.push({ label, value, ...(option.action ? { action: option.action } : {}), ...(option.source ? { source: option.source } : {}) });
     }
   }
   return merged;

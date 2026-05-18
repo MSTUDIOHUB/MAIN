@@ -66,6 +66,10 @@ import {
   extractPlanTasks,
   findDroppedPlanTasks,
   getPendingPlanTaskCommandFocus,
+  hasBrowserValidationCapability,
+  describePlanValidationDecision,
+  isPlanTaskAwaitingBrowserValidation,
+  isPlanTaskAwaitingExternalValidation,
   isEphemeralPlanArtifactPath,
   isPlanTaskTrustedComplete,
   validatePlanArtifactContent,
@@ -497,6 +501,7 @@ function summarizeReplyOptionsForLog(replyOptions: ReplyOption[], limit = 4) {
     label: truncateForLog(option.label || ""),
     value: truncateForLog(option.value || ""),
     ...(option.action ? { action: option.action } : {}),
+    ...(option.source ? { source: option.source } : {}),
   }));
 }
 
@@ -549,7 +554,7 @@ export interface OrchestratorCallbacks {
   onStreamToken: (token: string, messageId: string) => void;
   onStreamDone: (fullText: string, messageId: string, truncated: boolean) => void;
   onThought: (thought: string) => void;
-  onAssistantFinalText: (text: string, replyOptions?: ReplyOption[]) => void;
+  onAssistantFinalText: (text: string, replyOptions?: ReplyOption[], meta?: { hasToolCalls?: boolean }) => void;
   onStatusChange: (status: "idle" | "running" | "pending_review" | "error") => void;
   onError: (error: string) => void;
   onNonActionableStop: (message: string, reason: "no_output" | "no_action" | "missing_tool_loop" | "incomplete_plan") => void;
@@ -1374,6 +1379,107 @@ function buildApprovedPlanNoToolPauseMessage(
       ].join("\n");
 }
 
+function formatPendingValidationTasks(
+  audit: PlanTaskEvidenceAudit,
+  language: "zh" | "en",
+  browserValidationAvailable: boolean,
+): string {
+  const tasks = audit.pendingUserValidationTasks.length > 0
+    ? audit.pendingUserValidationTasks
+    : audit.remainingTasks.filter((task) =>
+        isPlanTaskAwaitingBrowserValidation(task) || isPlanTaskAwaitingExternalValidation(task)
+      );
+  const lines = tasks.slice(0, 8).map((task, index) => {
+    const decision = describePlanValidationDecision({
+      task,
+      language,
+      browserValidationAvailable,
+    });
+    const evidence = task.evidence?.map((item) => `${item.kind}:${item.value}`).join(", ") ||
+      (language === "zh" ? "缺少证据标签" : "missing evidence label");
+    return `- ${index + 1}. ${task.text} [${task.evidenceStatus || "missing"}; ${evidence}]${decision ? ` - ${decision}` : ""}`;
+  });
+  return lines.length > 0
+    ? lines.join("\n")
+    : language === "zh"
+    ? "- 当前没有需要外部验证的任务。"
+    : "- No external validation tasks are pending.";
+}
+
+function buildApprovedPlanValidationPendingMessage(input: {
+  language: "zh" | "en";
+  audit: PlanTaskEvidenceAudit;
+  browserValidationAvailable: boolean;
+}): string {
+  const pendingText = formatPendingValidationTasks(input.audit, input.language, input.browserValidationAvailable);
+  return input.language === "zh"
+    ? [
+        "自动执行已到验证边界",
+        "",
+        `可信审计进度：${input.audit.completedCount}/${input.audit.totalCount}；剩余项需要浏览器/Tauri/用户确认，不能用 curl、grep 或 cat 替代。`,
+        "",
+        "待验证项：",
+        pendingText,
+        "",
+        "状态：已保留当前 workspace、端口/命令证据和任务清单；不会继续尝试 kill 端口或重复启动本地服务。",
+      ].join("\n")
+    : [
+        "Automated execution reached a validation boundary",
+        "",
+        `Trusted audit progress: ${input.audit.completedCount}/${input.audit.totalCount}. The remaining item(s) require browser, Tauri, or user confirmation and cannot be replaced by curl, grep, or cat.`,
+        "",
+        "Pending validation:",
+        pendingText,
+        "",
+        "State: MAIN preserved the workspace, port/command evidence, and task list; it will not keep killing ports or restarting local servers.",
+      ].join("\n");
+}
+
+function buildBrowserValidationContinuationPrompt(input: {
+  language: "zh" | "en";
+  remainingText: string;
+}): string {
+  if (input.language === "zh") {
+    return [
+      "当前剩余任务需要浏览器级验证。下一步必须调用可用的 Browser/Playwright 工具，而不是继续用 curl、grep、cat 或重复启动 dev server。",
+      "验证策略：使用当前实际 dev server URL；打开页面；执行 DOM 断言；必要时截图；如果是 Markdown Viewer/test-sample.md 场景，读取样例内容后注入编辑器 textarea，触发 input，再检查 preview 中标题、代码块、表格、脚注、Mermaid 容器和关键样式。",
+      "若 Browser/Playwright 工具调用失败或不可用，暂停并说明待用户验证，不要继续兜圈。",
+      "待验证任务：",
+      input.remainingText,
+    ].join("\n");
+  }
+  return [
+    "The remaining task requires browser-level validation. Next, call an available Browser/Playwright tool; do not keep using curl, grep, cat, or repeated dev-server starts.",
+    "Validation strategy: use the actual dev-server URL, open the page, run DOM assertions, and take a screenshot if needed. For Markdown Viewer/test-sample.md, read the sample content, inject it into the editor textarea, dispatch input, then assert the preview contains headings, code blocks, tables, footnotes, Mermaid containers, and key styles.",
+    "If Browser/Playwright is unavailable or fails, pause and report pending user validation instead of looping.",
+    "Pending validation:",
+    input.remainingText,
+  ].join("\n");
+}
+
+function resolveApprovedPlanValidationBoundary(input: {
+  audit: PlanTaskEvidenceAudit | null;
+  availableToolNames: Set<string>;
+}): "none" | "browser_prompt" | "pause_external_validation" {
+  const audit = input.audit;
+  if (!audit) return "none";
+  const browserAvailable = hasBrowserValidationCapability(input.availableToolNames);
+  if (audit.pendingExternalValidation && audit.automationComplete) {
+    return "pause_external_validation";
+  }
+  if (audit.allTrustedComplete) return "none";
+  const remaining = audit.remainingTasks;
+  if (remaining.length === 0) return "none";
+  const allBrowser = remaining.every(isPlanTaskAwaitingBrowserValidation);
+  const allExternal = remaining.every((task) =>
+    isPlanTaskAwaitingExternalValidation(task) ||
+    (isPlanTaskAwaitingBrowserValidation(task) && !browserAvailable)
+  );
+  if (allBrowser && browserAvailable) return "browser_prompt";
+  if (allExternal) return "pause_external_validation";
+  return "none";
+}
+
 function buildPlanFallbackNotice(language: "zh" | "en", sourceChars: number): string {
   const formatted = sourceChars.toLocaleString();
   return language === "zh"
@@ -1769,11 +1875,11 @@ function buildApprovedPlanContinuationPrompt(callbacks: OrchestratorCallbacks): 
     approvalChoiceHint +
     (callbacks.getPlanTasks().length > 0
       ? language === "zh"
-        ? "计划已批准，现在进入执行阶段（EXECUTION MODE）。MAIN 已有 runtime 任务清单，TopIsland 会直接显示任务进度；不需要为了第一次源码写入强制创建 `.MAIN/plans/tasks.md`。请按当前任务清单逐项执行，使用 <tool_use> 格式调用工具；只有任务较长、需要跨会话审计或用户明确要求留档时，才先把清单持久化到 tasks.md。任何需要 shell 的任务都必须在当前任务清单中保留精确命令并用反引号包裹。你可以正常修改项目源码文件，写入路径必须是项目中的正确位置，绝对不要将源码写入 `.MAIN/plans/` 或任何隐藏目录。只有全部任务都有真实文件/命令/交付物证据满足后，才能结束执行；如果 tasks.md 已存在，完成任务后再同步更新对应 checkbox。\n"
-        : "The plan is approved. You are now in EXECUTION MODE. MAIN already has a runtime task list, so TopIsland can show task progress without forcing `.MAIN/plans/tasks.md` before the first source write. Execute the current task list with tool calls; persist the list to tasks.md only when the work is long, cross-session, or explicitly needs an audit file. Any task that needs shell work must keep the exact command in the current task list using backticks. You may now edit project source files, but write them to the proper project paths and never into `.MAIN/plans/` or hidden folders. Only stop when every task has satisfied real file/command/deliverable evidence; if tasks.md exists, update the matching checkbox after evidence exists.\n"
+        ? "计划已批准，现在进入执行阶段（EXECUTION MODE）。MAIN 已有 runtime 任务清单，TopIsland 会直接显示任务进度；不需要为了第一次源码写入强制创建 `.MAIN/plans/tasks.md`。请按当前任务清单逐项执行，使用 <tool_use> 格式调用工具；只有任务较长、需要跨会话审计或用户明确要求留档时，才先把清单持久化到 tasks.md。任何需要 shell 的任务都必须在当前任务清单中保留精确命令并用反引号包裹。页面渲染验证必须使用 Browser/Playwright DOM 或截图证据，不能用 curl/grep/cat 代替；Tauri/人工验证不可自动完成时要暂停说明待用户验证。你可以正常修改项目源码文件，写入路径必须是项目中的正确位置，绝对不要将源码写入 `.MAIN/plans/` 或任何隐藏目录。只有全部任务都有真实文件/命令/交付物/浏览器证据满足，或剩余项明确待用户验证后，才能结束执行；如果 tasks.md 已存在，完成任务后再同步更新对应 checkbox。\n"
+        : "The plan is approved. You are now in EXECUTION MODE. MAIN already has a runtime task list, so TopIsland can show task progress without forcing `.MAIN/plans/tasks.md` before the first source write. Execute the current task list with tool calls; persist the list to tasks.md only when the work is long, cross-session, or explicitly needs an audit file. Any task that needs shell work must keep the exact command in the current task list using backticks. Rendered-page validation requires Browser/Playwright DOM or screenshot evidence; do not substitute curl/grep/cat. If Tauri or manual validation cannot be automated, pause and report pending user validation. You may now edit project source files, but write them to the proper project paths and never into `.MAIN/plans/` or hidden folders. Only stop when every task has satisfied real file/command/deliverable/browser evidence, or remaining items are explicitly pending user validation; if tasks.md exists, update the matching checkbox after evidence exists.\n"
       : language === "zh"
-      ? "计划已批准，现在进入执行阶段（EXECUTION MODE）。请先基于已批准的 design.md 派生精简 runtime 任务清单；只有任务较长、需要跨会话审计或用户明确要求留档时，才生成 `.MAIN/plans/tasks.md`。随后按任务逐项执行，使用 <tool_use> 格式调用工具。你可以正常修改项目源码文件，写入路径必须是项目中的正确位置，绝对不要将源码写入 `.MAIN/plans/` 或任何隐藏目录。只有全部任务都有真实文件/命令/交付物证据满足后，才能结束执行。\n"
-      : "The plan is approved. You are now in EXECUTION MODE. First derive a concise runtime task list from the approved design.md; generate `.MAIN/plans/tasks.md` only when the work is long, cross-session, or explicitly needs an audit file. Then execute the tasks one by one using tool calls. You may now edit project source files, but write them to the proper project paths and never into `.MAIN/plans/` or hidden folders. Only stop when every task has satisfied real file/command/deliverable evidence.\n") +
+      ? "计划已批准，现在进入执行阶段（EXECUTION MODE）。请先基于已批准的 design.md 派生精简 runtime 任务清单；只有任务较长、需要跨会话审计或用户明确要求留档时，才生成 `.MAIN/plans/tasks.md`。随后按任务逐项执行，使用 <tool_use> 格式调用工具。页面渲染验证必须使用 Browser/Playwright DOM 或截图证据；Tauri/人工验证不可自动完成时要暂停说明待用户验证。你可以正常修改项目源码文件，写入路径必须是项目中的正确位置，绝对不要将源码写入 `.MAIN/plans/` 或任何隐藏目录。只有全部任务都有真实文件/命令/交付物/浏览器证据满足，或剩余项明确待用户验证后，才能结束执行。\n"
+      : "The plan is approved. You are now in EXECUTION MODE. First derive a concise runtime task list from the approved design.md; generate `.MAIN/plans/tasks.md` only when the work is long, cross-session, or explicitly needs an audit file. Then execute the tasks one by one using tool calls. Rendered-page validation requires Browser/Playwright DOM or screenshot evidence; if Tauri or manual validation cannot be automated, pause and report pending user validation. You may now edit project source files, but write them to the proper project paths and never into `.MAIN/plans/` or hidden folders. Only stop when every task has satisfied real file/command/deliverable/browser evidence, or remaining items are explicitly pending user validation.\n") +
     deliverableHint +
     (runtimeTaskList ? "\n" + runtimeTaskList + "\n" : "") +
     "\n" +
@@ -4250,8 +4356,16 @@ export async function executeAgentLoop(
         callbacks.getMessages(),
         effectiveContextLimit,
         cloudResponsesCompact ? Math.min(outputBudget, 2048) : outputBudget,
-        cloudResponsesCompact ? 700 : Math.max(4000, Math.floor(inputBudget * 0.45)),
-        cloudResponsesCompact ? 500 : Math.max(2000, Math.floor(inputBudget * 0.25)),
+        cloudResponsesCompact
+          ? 700
+          : callbacks.getIsPlanApproved()
+          ? 2200
+          : Math.max(4000, Math.floor(inputBudget * 0.32)),
+        cloudResponsesCompact
+          ? 500
+          : callbacks.getIsPlanApproved()
+          ? 1400
+          : Math.max(2000, Math.floor(inputBudget * 0.18)),
         contextForce.shouldForce,
         {
           previousMemoryState: callbacks.getContextMemoryState?.() || null,
@@ -4271,7 +4385,7 @@ export async function executeAgentLoop(
       if (managedResult.changed) {
         callbacks.replaceMessages(managedAgentMessages);
       }
-      if (managedResult.changed && managedResult.tokenReduction > 0) {
+      if (managedResult.changed && managedResult.tokenReduction >= 256) {
         callbacks.onContextCompress({
           droppedCount: managedResult.droppedCount,
           droppedMessageCount: managedResult.droppedMessageCount,
@@ -5286,7 +5400,7 @@ export async function executeAgentLoop(
       callbacks.getIsPlanApproved() &&
       effectiveToolCalls.length === 0 &&
       !!approvedPlanAuditForNoTool &&
-      !approvedPlanAuditForNoTool.acceptedCompletion;
+      (!approvedPlanAuditForNoTool.allTrustedComplete || approvedPlanAuditForNoTool.pendingExternalValidation);
     const shouldSuppressApprovedPlanNoToolText =
       approvedPlanMissingTasksForNoTool || hasRemainingApprovedPlanTasksForNoTool;
     const rejectedCompletionClaim =
@@ -5367,7 +5481,6 @@ export async function executeAgentLoop(
       });
       if (narration) {
         visibleAssistantText = narration;
-        callbacks.onThought(narration);
         logAgentEvent("tool_action_narration_injected", {
           iteration,
           workflowMode,
@@ -5404,7 +5517,9 @@ export async function executeAgentLoop(
     }
 
     if (!shouldSuppressApprovedPlanNoToolText && (visibleAssistantText || finalReplyOptions.length > 0)) {
-      callbacks.onAssistantFinalText(visibleAssistantText, finalReplyOptions);
+      callbacks.onAssistantFinalText(visibleAssistantText, finalReplyOptions, {
+        hasToolCalls: effectiveToolCalls.length > 0,
+      });
     }
 
     if (autoContinueReadOnlyPermission) {
@@ -5452,6 +5567,7 @@ export async function executeAgentLoop(
       hasReadyPlanArtifacts,
       isPlanApproved: callbacks.getIsPlanApproved(),
       forcePause: normalized.hasExplicitUserChoiceRequest,
+      finishReason: normalized.finishReason,
     });
     const assistantHistoryText = serializeAssistantReplyForHistory(historyAssistantText, finalReplyOptions);
     const hasMeaningfulVisibleText = visibleAssistantText.trim().length > 0;
@@ -5473,6 +5589,18 @@ export async function executeAgentLoop(
       planStage: currentPlanStageForReview,
       isPlanApproved: callbacks.getIsPlanApproved(),
     });
+
+    if (finalReplyOptions.length > 0 && !shouldPauseForUserChoice) {
+      logAgentEvent("reply_options_rejected", {
+        iteration,
+        reason: wasTruncated ? "truncated_inferred_options" : "non_pauseable_options",
+        replyOptions: finalReplyOptions.length,
+        optionPreview: summarizeReplyOptionsForLog(finalReplyOptions),
+        finishReason: normalized.finishReason || "unknown",
+        workflowMode,
+        turnIntent,
+      });
+    }
 
     // 4. Handle turn termination or continuation
     if (shouldPauseForUserChoice && !shouldSuppressApprovedPlanNoToolText) {
@@ -5515,6 +5643,39 @@ export async function executeAgentLoop(
         : language === "zh"
         ? "- 先派生 runtime 任务清单；只有长任务或需要审计留档时才生成 `.MAIN/plans/tasks.md`，再执行源码或交付物写入。"
         : "- First derive a runtime task list; generate `.MAIN/plans/tasks.md` only for long work or audit-file needs, then execute source or deliverable writes.";
+      const validationBoundary = resolveApprovedPlanValidationBoundary({
+        audit: approvedPlanAuditForNoTool,
+        availableToolNames,
+      });
+      const browserValidationAvailable = hasBrowserValidationCapability(availableToolNames);
+
+      if (validationBoundary === "pause_external_validation" && approvedPlanAuditForNoTool) {
+        logAgentEvent("plan_execution_validation_boundary", {
+          iteration,
+          reason: "external_validation_unavailable",
+          auditCompleted: approvedPlanAuditForNoTool.completedCount,
+          auditTotal: approvedPlanAuditForNoTool.totalCount,
+          remaining: approvedPlanAuditForNoTool.remainingTasks.length,
+          pendingUserValidation: approvedPlanAuditForNoTool.pendingUserValidationTasks.length,
+          browserValidationAvailable,
+        });
+        emitPlanExecutionProgress("paused", {
+          currentTask: language === "zh" ? "待用户验证" : "pending user validation",
+          nextStep: language === "zh"
+            ? "自动验证能力不足，等待用户完成浏览器/Tauri/人工确认"
+            : "automation boundary reached; wait for browser/Tauri/user confirmation",
+        });
+        callbacks.onNonActionableStop(
+          buildApprovedPlanValidationPendingMessage({
+            language,
+            audit: approvedPlanAuditForNoTool,
+            browserValidationAvailable,
+          }),
+          "incomplete_plan",
+        );
+        callbacks.onStatusChange("idle");
+        return;
+      }
 
       logAgentEvent("plan_execution_no_tool_reprompt", {
         iteration,
@@ -5557,13 +5718,15 @@ export async function executeAgentLoop(
 
       callbacks.appendMessage({
         role: "user",
-        content: buildPlanExecutionNoToolRecoveryPrompt({
-          language,
-          missingTasksArtifact: approvedPlanMissingTasks,
-          remainingText,
-          commandHint: buildPlanCommandExecutionHint(approvedPlanTasks, language),
-          rejectedCompletionClaim,
-        }),
+        content: validationBoundary === "browser_prompt"
+          ? buildBrowserValidationContinuationPrompt({ language, remainingText })
+          : buildPlanExecutionNoToolRecoveryPrompt({
+              language,
+              missingTasksArtifact: approvedPlanMissingTasks,
+              remainingText,
+              commandHint: buildPlanCommandExecutionHint(approvedPlanTasks, language),
+              rejectedCompletionClaim,
+            }),
       });
       continue;
     }
@@ -5925,7 +6088,7 @@ export async function executeAgentLoop(
           workflowMode === "plan" &&
           callbacks.getIsPlanApproved() &&
           !!approvedPlanAudit &&
-          !approvedPlanAudit.acceptedCompletion;
+          (!approvedPlanAudit.allTrustedComplete || approvedPlanAudit.pendingExternalValidation);
 
         if (approvedPlanMissingTasks || hasRemainingApprovedPlanTasks) {
           callbacks.onStatusChange("running");
@@ -5942,6 +6105,38 @@ export async function executeAgentLoop(
             : language === "zh"
             ? "- 先派生 runtime 任务清单；只有长任务或需要审计留档时才生成 `.MAIN/plans/tasks.md`，再执行源码或交付物写入。"
             : "- First derive a runtime task list; generate `.MAIN/plans/tasks.md` only for long work or audit-file needs, then execute source or deliverable writes.";
+          const validationBoundary = resolveApprovedPlanValidationBoundary({
+            audit: approvedPlanAudit,
+            availableToolNames,
+          });
+          const browserValidationAvailable = hasBrowserValidationCapability(availableToolNames);
+          if (validationBoundary === "pause_external_validation" && approvedPlanAudit) {
+            logAgentEvent("plan_execution_validation_boundary", {
+              iteration,
+              reason: "external_validation_unavailable",
+              auditCompleted: approvedPlanAudit.completedCount,
+              auditTotal: approvedPlanAudit.totalCount,
+              remaining: approvedPlanAudit.remainingTasks.length,
+              pendingUserValidation: approvedPlanAudit.pendingUserValidationTasks.length,
+              browserValidationAvailable,
+            });
+            emitPlanExecutionProgress("paused", {
+              currentTask: callbacks.getPreferredLanguage() === "zh" ? "待用户验证" : "pending user validation",
+              nextStep: callbacks.getPreferredLanguage() === "zh"
+                ? "自动验证能力不足，等待用户完成浏览器/Tauri/人工确认"
+                : "automation boundary reached; wait for browser/Tauri/user confirmation",
+            });
+            callbacks.onNonActionableStop(
+              buildApprovedPlanValidationPendingMessage({
+                language,
+                audit: approvedPlanAudit,
+                browserValidationAvailable,
+              }),
+              "incomplete_plan",
+            );
+            callbacks.onStatusChange("idle");
+            return;
+          }
           if (consecutiveNoToolCount >= MAX_NO_ACTION_RETRIES) {
             logAgentEvent("loop_stop", {
               reason: "remaining_plan_tasks_limit",
@@ -5973,16 +6168,43 @@ export async function executeAgentLoop(
           callbacks.appendMessage({
             role: "user",
             content:
-              (approvedPlanMissingTasks
-                ? buildApprovedPlanContinuationPrompt(callbacks) + "\n\n"
-                : language === "zh"
-                ? `${rejectedCompletionClaim ? "你刚才的完成声明没有通过可信证据审计；不要再输出完成总结，先继续真实执行。\n" : ""}继续执行当前任务清单中证据未满足的任务。不要重复计划说明，直接根据当前进度继续实现下一个任务；如果需要修改文件，继续使用工具调用。凡是任务里带有 shell 命令的，一次性命令优先用 run_command 并检查 exitCode/stdout/stderr；长驻或交互式命令用 execute_command 后再用 read_pty_since/read_pty_tail/get_pty_status 检查结果。完成当前任务后，必须先产生真实文件/命令/验证证据；如果 \`.MAIN/plans/tasks.md\` 已存在，再更新对应 checkbox 为 \`[x]\`。只有所有任务证据满足后才能结束。\n下一批优先任务：\n`
-                : `${rejectedCompletionClaim ? "Your completion claim did not pass the trusted evidence audit; do not output a final summary yet, continue the real work first.\n" : ""}Continue executing tasks whose evidence is not satisfied in the current task list. Do not restate the plan; just move to the next task based on the current progress. If a task includes shell commands, prefer run_command for finite commands and inspect exitCode/stdout/stderr; use execute_command for long-running or interactive commands, then verify with read_pty_since/read_pty_tail/get_pty_status. After each task, produce real file/command/verification evidence; if \`.MAIN/plans/tasks.md\` exists, update the matching checkbox to \`[x]\`. Only stop when every task has satisfied evidence.\nNext priority tasks:\n`) +
-              remainingText +
-              "\n\n" +
-              buildPlanCommandExecutionHint(approvedPlanTasks, language),
+              validationBoundary === "browser_prompt"
+                ? buildBrowserValidationContinuationPrompt({ language, remainingText })
+                : (approvedPlanMissingTasks
+                    ? buildApprovedPlanContinuationPrompt(callbacks) + "\n\n"
+                    : language === "zh"
+                    ? `${rejectedCompletionClaim ? "你刚才的完成声明没有通过可信证据审计；不要再输出完成总结，先继续真实执行。\n" : ""}继续执行当前任务清单中证据未满足的任务。不要重复计划说明，直接根据当前进度继续实现下一个任务；如果需要修改文件，继续使用工具调用。凡是任务里带有 shell 命令的，一次性命令优先用 run_command 并检查 exitCode/stdout/stderr；长驻或交互式命令用 execute_command 后再用 read_pty_since/read_pty_tail/get_pty_status 检查结果。完成当前任务后，必须先产生真实文件/命令/验证证据；如果 \`.MAIN/plans/tasks.md\` 已存在，再更新对应 checkbox 为 \`[x]\`。只有所有任务证据满足后才能结束。\n下一批优先任务：\n`
+                    : `${rejectedCompletionClaim ? "Your completion claim did not pass the trusted evidence audit; do not output a final summary yet, continue the real work first.\n" : ""}Continue executing tasks whose evidence is not satisfied in the current task list. Do not restate the plan; just move to the next task based on the current progress. If a task includes shell commands, prefer run_command for finite commands and inspect exitCode/stdout/stderr; use execute_command for long-running or interactive commands, then verify with read_pty_since/read_pty_tail/get_pty_status. After each task, produce real file/command/verification evidence; if \`.MAIN/plans/tasks.md\` exists, update the matching checkbox to \`[x]\`. Only stop when every task has satisfied evidence.\nNext priority tasks:\n`) +
+                  remainingText +
+                  "\n\n" +
+                  buildPlanCommandExecutionHint(approvedPlanTasks, language),
           });
           continue;
+        }
+
+        if (
+          workflowMode === "plan" &&
+          callbacks.getIsPlanApproved() &&
+          approvedPlanAudit &&
+          approvedPlanAudit.pendingUserValidationTasks.length > 0
+        ) {
+          const language = callbacks.getPreferredLanguage();
+          emitPlanExecutionProgress("paused", {
+            currentTask: language === "zh" ? "待用户验证" : "pending user validation",
+            nextStep: language === "zh"
+              ? "自动部分已完成，等待用户完成剩余验证"
+              : "automated work is complete; waiting for remaining user validation",
+          });
+          callbacks.onNonActionableStop(
+            buildApprovedPlanValidationPendingMessage({
+              language,
+              audit: approvedPlanAudit,
+              browserValidationAvailable: hasBrowserValidationCapability(availableToolNames),
+            }),
+            "incomplete_plan",
+          );
+          callbacks.onStatusChange("idle");
+          return;
         }
 
         if (workflowMode === "plan" && callbacks.getIsPlanApproved()) {

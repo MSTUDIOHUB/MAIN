@@ -4,6 +4,7 @@ import {
   deriveToolPhase,
   type ToolPresentationLanguage,
 } from "./toolPresentation";
+import { deriveThoughtDisplay } from "./thoughtDisplay";
 
 export type TurnArchiveStepKind = "thinking" | "discover" | "inspect" | "edit" | "command" | "verify" | "blocked" | "message";
 export type TurnArchiveStepStatus = "running" | "done" | "failed" | "rejected";
@@ -13,10 +14,17 @@ export interface TurnArchiveStep {
   kind: TurnArchiveStepKind;
   status: TurnArchiveStepStatus;
   intent: string;
+  why: string;
+  action: string;
+  result: string;
+  next: string;
+  note: string;
   summary: string;
   targets: string[];
   items: any[];
   expandedByDefault: boolean;
+  sourceIndex: number;
+  sourceEndIndex: number;
 }
 
 export interface TurnProcessArchiveCounts {
@@ -40,6 +48,7 @@ export interface TurnProcessArchiveModel {
   totalCount: number;
   stepCount: number;
   summaryText: string;
+  currentJudgment: string;
   previewTargets: string[];
 }
 
@@ -129,6 +138,113 @@ function firstMeaningfulLine(text: string): string {
     .find(Boolean) || "";
 }
 
+function compactLine(text: string, maxChars = 180): string {
+  const normalized = String(text || "").replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxChars) return normalized;
+  return `${normalized.slice(0, maxChars - 3).trim()}...`;
+}
+
+function isLowValueProcessNote(text: string): boolean {
+  const normalized = String(text || "").replace(/\s+/g, " ").trim();
+  if (!normalized) return true;
+  if (/^我会执行下一步工具动作[:：]/.test(normalized)) return true;
+  if (/^I will run the next tool action:/i.test(normalized)) return true;
+  if (/^(?:让我|我(?:会|将|要|需要|继续|正在)|接下来|现在)?\s*(?:继续|再|先)?\s*(?:读取|检查|查看|分析|梳理|确认)(?:剩余|更多|相关|关键|必要)?(?:的)?(?:文件|内容|上下文|实现|代码)?[。.!！]*$/i.test(normalized)) return true;
+  if (/^(?:let me|i(?:'ll| will| need to| am going to)?|next)?\s*(?:continue|keep|first)?\s*(?:read|check|inspect|look at|analyze)\s+(?:the\s+)?(?:remaining|more|relevant|key)?\s*(?:files?|content|context|implementation|code)\.?$/i.test(normalized)) return true;
+  if (/等待(?:可见回复|模型|下一步动作|工具结果)|waiting for (?:the )?(?:model|next step|tool result)/i.test(normalized)) return true;
+  return false;
+}
+
+function extractReasoningNoteFromText(
+  text: string,
+  language: ToolPresentationLanguage,
+  maxLines = 3,
+): string {
+  const display = deriveThoughtDisplay(String(text || ""), {
+    language,
+    mode: "latest",
+    density: "adaptive",
+    maxSummaryLines: maxLines,
+  });
+  const usefulLines = display.summaryLines
+    .map((line) => line.trim())
+    .filter((line) => line && !isLowValueProcessNote(line));
+  if (usefulLines.length === 0) return "";
+  return compactLine(usefulLines.join(language === "zh" ? " " : " "), 320);
+}
+
+function isReasoningSourceBlock(block: any, includeThoughts: boolean): boolean {
+  if (!includeThoughts) return false;
+  if (!block) return false;
+  if (block.type === "thought") return true;
+  if (block.type === "agent") return String(block.content || "").trim().length > 0;
+  return false;
+}
+
+function getLatestReasoningNote(
+  blocks: any[],
+  language: ToolPresentationLanguage,
+  includeThoughts: boolean,
+): string {
+  for (let index = blocks.length - 1; index >= 0; index -= 1) {
+    const block = blocks[index];
+    if (!isReasoningSourceBlock(block, includeThoughts)) continue;
+    const note = extractReasoningNoteFromText(String(block.content || ""), language);
+    if (note) return note;
+  }
+  return "";
+}
+
+function findNearestReasoningNote(input: {
+  sourceBlocks: any[];
+  beforeIndex: number;
+  kind: TurnArchiveStepKind;
+  language: ToolPresentationLanguage;
+  includeThoughts: boolean;
+}): string {
+  const maxLookback = 10;
+  for (let index = Math.min(input.beforeIndex - 1, input.sourceBlocks.length - 1); index >= 0 && input.beforeIndex - index <= maxLookback; index -= 1) {
+    const block = input.sourceBlocks[index];
+    if (!isReasoningSourceBlock(block, input.includeThoughts)) continue;
+    const note = extractReasoningNoteFromText(String(block.content || ""), input.language);
+    if (note && noteMatchesStepKind(note, input.kind)) return note;
+  }
+  return "";
+}
+
+function noteMatchesStepKind(note: string, kind: TurnArchiveStepKind): boolean {
+  const text = String(note || "").toLowerCase();
+  if (!text) return false;
+  if (kind === "message" || kind === "thinking" || kind === "blocked") return true;
+  if (kind === "discover" || kind === "inspect") {
+    return /定位|搜索|读取|检查|查看|确认|审计|日志|上下文|范围|实现|文件|代码|look|read|inspect|check|search|scope|context|log|implementation|file/.test(text) &&
+      !/最终回复|整理验证结果|完成实现|final response|validation result/.test(text);
+  }
+  if (kind === "edit") {
+    return /修改|修复|调整|实现|接入|补充|落到|改成|rewrite|change|fix|edit|implement|wire|update/.test(text);
+  }
+  if (kind === "verify") {
+    return /验证|测试|回归|构建|build|test|verify|regression|check result/.test(text) &&
+      !/准备验证|整理验证结果|prepare.*validat|organize.*validat/.test(text);
+  }
+  if (kind === "command") {
+    return /命令|运行|执行|终端|command|run|terminal|shell/.test(text);
+  }
+  return true;
+}
+
+function getBlockResultLine(block: any): string {
+  return firstMeaningfulLine(String(block?.message || block?.summary || block?.resultPreview || block?.output || block?.content || ""));
+}
+
+function makeTargetSummary(targets: string[], language: ToolPresentationLanguage): string {
+  const visible = targets.slice(0, 3).filter(Boolean);
+  const hiddenCount = Math.max(0, targets.length - visible.length);
+  const joined = visible.join(language === "zh" ? "、" : ", ");
+  if (!joined) return "";
+  return hiddenCount > 0 ? `${joined} +${hiddenCount}` : joined;
+}
+
 function defaultIntentForStep(kind: TurnArchiveStepKind, language: ToolPresentationLanguage): string {
   if (language === "en") {
     if (kind === "thinking") return "Summarize the current judgment before the next action.";
@@ -146,6 +262,171 @@ function defaultIntentForStep(kind: TurnArchiveStepKind, language: ToolPresentat
   if (kind === "command") return "运行命令并查看结果。";
   if (kind === "blocked") return "保留受阻步骤，方便恢复处理。";
   return "保留过程消息，便于追溯。";
+}
+
+function defaultNarrativeForStep(
+  step: Pick<TurnArchiveStep, "kind" | "status" | "items" | "targets" | "summary">,
+  language: ToolPresentationLanguage,
+): Pick<TurnArchiveStep, "why" | "action" | "result" | "next"> {
+  const targets = step.targets.length > 0
+    ? step.targets.slice(0, 3).join(language === "zh" ? "、" : ", ")
+    : language === "zh" ? "当前工作区" : "current workspace";
+  const resultLine = compactLine(step.items.map(getBlockResultLine).find(Boolean) || step.summary || "", 150);
+  const failed = step.status === "failed" || step.status === "rejected" || step.kind === "blocked";
+
+  if (language === "en") {
+    if (step.kind === "thinking") {
+      return {
+        why: "Keep the latest model judgment visible without stacking older thoughts.",
+        action: "Summarized the newest useful reasoning step.",
+        result: resultLine || "Latest thought summary is available.",
+        next: "Use this judgment to guide the next operation.",
+      };
+    }
+    if (step.kind === "discover") {
+      return {
+        why: "Narrow the task to relevant files and symbols before reading more.",
+        action: `Searched or scanned ${targets}.`,
+        result: resultLine || `Relevant targets were narrowed to ${targets}.`,
+        next: "Read the smallest useful context next.",
+      };
+    }
+    if (step.kind === "inspect") {
+      return {
+        why: "Confirm the current implementation before deciding the change.",
+        action: `Read or inspected ${targets}.`,
+        result: resultLine || `Context from ${targets} was captured for the turn.`,
+        next: "Apply only the change supported by this context.",
+      };
+    }
+    if (step.kind === "edit") {
+      return {
+        why: "Apply the approved change to the concrete project files.",
+        action: `Edited ${targets}.`,
+        result: step.summary || resultLine || "File changes were recorded with diff evidence.",
+        next: "Verify the touched behavior.",
+      };
+    }
+    if (step.kind === "verify") {
+      return {
+        why: "Check whether the implementation now satisfies the requested behavior.",
+        action: `Ran verification for ${targets}.`,
+        result: resultLine || step.summary || "Verification evidence was recorded.",
+        next: failed ? "Fix the failure before claiming completion." : "Use the result as completion evidence when it matches the task.",
+      };
+    }
+    if (step.kind === "command") {
+      return {
+        why: "Use command output as concrete feedback for the next step.",
+        action: `Ran ${targets}.`,
+        result: resultLine || step.summary || "Command output was recorded.",
+        next: failed ? "Diagnose the failed command before retrying." : "Continue from the command result.",
+      };
+    }
+    if (failed) {
+      return {
+        why: "Keep the blocked operation visible so recovery starts from the real failure.",
+        action: `Attempted ${targets}.`,
+        result: resultLine || "The operation did not complete successfully.",
+        next: "Adjust the target, permission, or approach before retrying.",
+      };
+    }
+    return {
+      why: "Preserve process context for auditability.",
+      action: `Recorded process message for ${targets}.`,
+      result: resultLine || "Process message was kept in the archive.",
+      next: "Continue from the latest useful evidence.",
+    };
+  }
+
+  if (step.kind === "thinking") {
+    return {
+      why: "保留最新判断，避免旧思考在时间线里堆叠。",
+      action: "提取最新一段有效思考摘要。",
+      result: resultLine || "已生成最新思考摘要。",
+      next: "用这段判断指导下一步操作。",
+    };
+  }
+  if (step.kind === "discover") {
+    return {
+      why: "先把任务定位到相关文件或符号，减少无关读取。",
+      action: `搜索或扫描了 ${targets}。`,
+      result: resultLine || `已把范围收敛到 ${targets}。`,
+      next: "下一步读取最小必要上下文。",
+    };
+  }
+  if (step.kind === "inspect") {
+    return {
+      why: "在修改前确认当前实现，避免凭猜测改动。",
+      action: `读取或检查了 ${targets}。`,
+      result: resultLine || `已记录 ${targets} 的上下文。`,
+      next: "只基于已确认的上下文实施修改。",
+    };
+  }
+  if (step.kind === "edit") {
+    return {
+      why: "把已确认的方案落到具体项目文件。",
+      action: `编辑了 ${targets}。`,
+      result: step.summary || resultLine || "已记录文件 diff 证据。",
+      next: "继续验证被影响的行为。",
+    };
+  }
+  if (step.kind === "verify") {
+    return {
+      why: "确认改动是否真正满足任务，而不是只看文字总结。",
+      action: `运行验证：${targets}。`,
+      result: resultLine || step.summary || "已记录验证证据。",
+      next: failed ? "先修复失败原因，再重新验证。" : "若证据匹配任务，可用于完成审计。",
+    };
+  }
+  if (step.kind === "command") {
+    return {
+      why: "用命令输出作为下一步判断的真实反馈。",
+      action: `执行了 ${targets}。`,
+      result: resultLine || step.summary || "已记录命令输出。",
+      next: failed ? "先诊断失败命令，再调整重试。" : "根据命令结果继续推进。",
+    };
+  }
+  if (failed) {
+    return {
+      why: "保留受阻操作，恢复时从真实失败点继续。",
+      action: `尝试处理 ${targets}。`,
+      result: resultLine || "该操作没有成功完成。",
+      next: "调整目标、权限或方案后再继续。",
+    };
+  }
+  return {
+    why: "保留过程上下文，方便审计和回看。",
+    action: `记录了 ${targets} 的过程消息。`,
+    result: resultLine || "过程消息已进入归档。",
+    next: "从最新有效证据继续。",
+  };
+}
+
+function makeNarrativeIntent(step: TurnArchiveStep, language: ToolPresentationLanguage): string {
+  const note = String(step.note || "").trim();
+  if (note && !isLowValueProcessNote(note)) {
+    return compactLine(note, 320);
+  }
+
+  const targets = makeTargetSummary(step.targets, language);
+  const failed = step.status === "failed" || step.status === "rejected" || step.kind === "blocked";
+  if (language === "en") {
+    if (step.kind === "discover") return compactLine(`Narrow the relevant scope${targets ? ` around ${targets}` : ""}.`, 180);
+    if (step.kind === "inspect") return compactLine(`Check the necessary context${targets ? ` in ${targets}` : ""}.`, 180);
+    if (step.kind === "edit") return compactLine(`Apply the focused change${targets ? ` in ${targets}` : ""}.`, 180);
+    if (step.kind === "verify") return compactLine(`Verify the changed behavior${targets ? ` with ${targets}` : ""}.`, 180);
+    if (step.kind === "command") return compactLine(`Run the command${targets ? `: ${targets}` : ""}.`, 180);
+    if (failed) return compactLine(`This step is blocked${targets ? ` at ${targets}` : ""}; keep the evidence available.`, 180);
+    return compactLine(step.summary || step.action || step.why || "Keep this process step available.", 180);
+  }
+  if (step.kind === "discover") return compactLine(`收敛相关范围${targets ? `：${targets}` : ""}。`, 180);
+  if (step.kind === "inspect") return compactLine(`核对必要上下文${targets ? `：${targets}` : ""}。`, 180);
+  if (step.kind === "edit") return compactLine(`实施聚焦修改${targets ? `：${targets}` : ""}。`, 180);
+  if (step.kind === "verify") return compactLine(`验证受影响行为${targets ? `：${targets}` : ""}。`, 180);
+  if (step.kind === "command") return compactLine(`执行命令${targets ? `：${targets}` : ""}。`, 180);
+  if (failed) return compactLine(`该步骤受阻${targets ? `：${targets}` : ""}，保留证据便于恢复。`, 180);
+  return compactLine(step.summary || step.action || step.why || "保留过程步骤。", 180);
 }
 
 function resolveToolIntent(block: any, kind: TurnArchiveStepKind, language: ToolPresentationLanguage): string {
@@ -212,10 +493,17 @@ function makeStep(input: {
       kind: "thinking",
       status: block.isStreaming ? "running" : "done",
       intent: defaultIntentForStep("thinking", language),
+      why: "",
+      action: "",
+      result: "",
+      next: "",
+      note: extractReasoningNoteFromText(String(block.content || ""), language),
       summary: "",
       targets: [],
       items: [block],
       expandedByDefault: true,
+      sourceIndex: index,
+      sourceEndIndex: index,
     };
   }
 
@@ -228,36 +516,71 @@ function makeStep(input: {
       kind,
       status,
       intent: resolveToolIntent(block, kind, language),
+      why: "",
+      action: "",
+      result: "",
+      next: "",
+      note: "",
       summary: "",
       targets: target ? [target] : [],
       items: [block],
       expandedByDefault: status === "failed" || status === "rejected",
+      sourceIndex: index,
+      sourceEndIndex: index,
     };
   }
 
+  const note = block.type === "agent"
+    ? extractReasoningNoteFromText(String(block.content || block.message || ""), language)
+    : "";
   return {
     id: `turn-archive-step-message-${block.id ?? index}`,
     kind: "message",
     status: "done",
     intent: defaultIntentForStep("message", language),
+    why: "",
+    action: "",
+    result: "",
+    next: "",
+    note,
     summary: "",
     targets: [],
     items: [block],
     expandedByDefault: false,
+    sourceIndex: index,
+    sourceEndIndex: index,
   };
 }
 
-function finalizeStep(step: TurnArchiveStep, language: ToolPresentationLanguage): TurnArchiveStep {
+function finalizeStep(
+  step: TurnArchiveStep,
+  language: ToolPresentationLanguage,
+  sourceBlocks: any[],
+  includeThoughtNotes: boolean,
+): TurnArchiveStep {
   const targets = uniqueTargets(step.items, language);
   const kind = step.kind;
-  const intent = isContextPhase(kind) && step.items.length > 1
+  const fallbackIntent = isContextPhase(kind) && step.items.length > 1
     ? defaultIntentForStep(kind, language)
     : step.intent || defaultIntentForStep(kind, language);
+  const summary = makeSummaryForStep({ ...step, targets }, language);
+  const narrative = defaultNarrativeForStep({ ...step, targets, summary }, language);
+  const hasPersistedIntent = step.items.length === 1 && String(step.items[0]?.intentSummary || "").trim().length > 0;
+  const note = step.note || findNearestReasoningNote({
+    sourceBlocks,
+    beforeIndex: step.sourceIndex,
+    kind: step.kind,
+    language,
+    includeThoughts: includeThoughtNotes,
+  });
+  const intent = hasPersistedIntent ? fallbackIntent : makeNarrativeIntent({ ...step, targets, ...narrative, note, summary }, language);
   return {
     ...step,
     targets,
+    ...narrative,
+    note,
     intent,
-    summary: makeSummaryForStep({ ...step, targets }, language),
+    summary,
   };
 }
 
@@ -317,10 +640,14 @@ function makeSummaryText(steps: TurnArchiveStep[], counts: TurnProcessArchiveCou
 
 function buildModelFromSteps(input: {
   blocks: any[];
+  sourceBlocks?: any[];
   steps: TurnArchiveStep[];
   language: ToolPresentationLanguage;
+  includeThoughtNotes?: boolean;
 }): TurnProcessArchiveModel {
-  const finalizedSteps = input.steps.map((step) => finalizeStep(step, input.language));
+  const includeThoughtNotes = input.includeThoughtNotes !== false;
+  const sourceBlocks = input.sourceBlocks || input.blocks;
+  const finalizedSteps = input.steps.map((step) => finalizeStep(step, input.language, sourceBlocks, includeThoughtNotes));
   const counts = makeCounts(finalizedSteps);
   const previewTargets: string[] = [];
   for (const step of finalizedSteps) {
@@ -338,6 +665,7 @@ function buildModelFromSteps(input: {
     totalCount: input.blocks.length,
     stepCount: finalizedSteps.length,
     summaryText: makeSummaryText(finalizedSteps, counts, input.language),
+    currentJudgment: includeThoughtNotes ? getLatestReasoningNote(sourceBlocks, input.language, includeThoughtNotes) : "",
     previewTargets,
   };
 }
@@ -347,25 +675,31 @@ export function buildTurnProcessArchiveModel(input: {
   finalVisibleAgentIndex: number;
   language?: ToolPresentationLanguage;
   includeThoughts?: boolean;
+  includeThoughtNotes?: boolean;
 }): TurnProcessArchiveModel {
   const language = normalizeLanguage(input.language);
   const includeThoughts = input.includeThoughts !== false;
+  const includeThoughtNotes = input.includeThoughtNotes !== false;
   const latestThoughtId = getLatestThoughtBlock(input.blocks)?.id ?? null;
-  const archiveBlocks = input.blocks.filter((block, index) => {
+  const archiveEntries = input.blocks
+    .map((block, index) => ({ block, index }))
+    .filter(({ block, index }) => {
     if (!isProcessArchiveCandidate(block, input.finalVisibleAgentIndex, index)) return false;
     if (block.type === "thought" && !includeThoughts) return false;
     if (block.type === "thought" && block.id !== latestThoughtId) return false;
     return true;
   });
+  const archiveBlocks = archiveEntries.map((entry) => entry.block);
 
   const steps: TurnArchiveStep[] = [];
-  archiveBlocks.forEach((block, index) => {
+  archiveEntries.forEach(({ block, index }) => {
     const next = makeStep({ block, index, language });
     const current = steps[steps.length - 1] || null;
     if (canMergeSteps(current, next)) {
       current!.items.push(...next.items);
       current!.targets = uniqueTargets(current!.items, language);
       current!.expandedByDefault = current!.expandedByDefault || next.expandedByDefault;
+      current!.sourceEndIndex = next.sourceEndIndex;
       if (isContextPhase(current!.kind) && isContextPhase(next.kind)) {
         current!.intent = defaultIntentForStep(current!.kind, language);
       }
@@ -374,14 +708,22 @@ export function buildTurnProcessArchiveModel(input: {
     steps.push(next);
   });
 
-  return buildModelFromSteps({ blocks: archiveBlocks, steps, language });
+  return buildModelFromSteps({
+    blocks: archiveBlocks,
+    sourceBlocks: input.blocks,
+    steps,
+    language,
+    includeThoughtNotes,
+  });
 }
 
 export function buildLiveTurnProcessTimelineModel(input: {
   blocks: any[];
   language?: ToolPresentationLanguage;
+  includeThoughts?: boolean;
 }): TurnProcessArchiveModel {
   const language = normalizeLanguage(input.language);
+  const includeThoughts = input.includeThoughts !== false;
   const liveBlocks: any[] = [];
   const steps: TurnArchiveStep[] = [];
   let current: TurnArchiveStep | null = null;
@@ -403,6 +745,7 @@ export function buildLiveTurnProcessTimelineModel(input: {
       current!.items.push(...next.items);
       current!.targets = uniqueTargets(current!.items, language);
       current!.expandedByDefault = current!.expandedByDefault || next.expandedByDefault;
+      current!.sourceEndIndex = next.sourceEndIndex;
       if (isContextPhase(current!.kind) && isContextPhase(next.kind)) {
         current!.intent = defaultIntentForStep(current!.kind, language);
       }
@@ -413,5 +756,11 @@ export function buildLiveTurnProcessTimelineModel(input: {
     current = next;
   });
 
-  return buildModelFromSteps({ blocks: liveBlocks, steps, language });
+  return buildModelFromSteps({
+    blocks: liveBlocks,
+    sourceBlocks: input.blocks,
+    steps,
+    language,
+    includeThoughtNotes: includeThoughts,
+  });
 }

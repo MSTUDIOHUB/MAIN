@@ -10,6 +10,7 @@ const DIFF_RELOAD_SUMMARY_SCENARIO = "diff-reload-summary";
 const PLAN_REPLACE_REFRESH_SCENARIO = "plan-replace-refresh";
 const AWAITING_CHOICE_SCENARIO = "awaiting-choice";
 const AWAITING_CHOICE_MIXED_OPTIONS_SCENARIO = "awaiting-choice-mixed-options";
+const AWAITING_CHOICE_DIAGNOSTIC_REJECTED_SCENARIO = "awaiting-choice-diagnostic-rejected";
 const FEISHU_REMOTE_ANALYSIS_SCENARIO = "feishu-remote-analysis";
 const READ_CONTEXT_COLLAPSE_SCENARIO = "read-context-collapse";
 const READ_CONTEXT_INTERLEAVED_SCENARIO = "read-context-interleaved";
@@ -885,6 +886,85 @@ function seedAwaitingChoiceMixedOptionsScenario() {
 
   bindBridgeSnapshot(AWAITING_CHOICE_MIXED_OPTIONS_SCENARIO);
   appendBridgeEvent("choice-requested-mixed");
+
+  const cleanup = () => {
+    bridge.initialized = false;
+  };
+
+  bridge.cleanup = cleanup;
+  return cleanup;
+}
+
+function seedAwaitingChoiceDiagnosticRejectedScenario() {
+  const bridge = getBridge();
+  if (!bridge) return undefined;
+
+  bridge.events = [{ type: "boot" }];
+  bridge.savedDocuments = [];
+  bridge.completed = false;
+
+  const turnId = "e2e-awaiting-choice-diagnostic-rejected-turn";
+  const sessionId = 999007;
+  const now = Date.now();
+  const userBlockId = useAppStore.getState()._nextTaskId();
+  const agentBlockId = useAppStore.getState()._nextTaskId();
+
+  useAppStore.setState((state) => ({
+    ...state,
+    config: {
+      ...state.config,
+      language: "zh",
+      workflowMode: "chat",
+    },
+    currentWorkspace: "/tmp/e2e-awaiting-choice-diagnostic-rejected",
+    sessionsByWorkspace: {
+      "/tmp/e2e-awaiting-choice-diagnostic-rejected": [
+        {
+          id: sessionId,
+          title: "E2E Diagnostic Options Rejected",
+          date: new Date(now).toISOString(),
+          active: true,
+          messages: [],
+        },
+      ],
+    },
+    currentSessionId: sessionId,
+    taskFlow: [
+      { id: userBlockId, turnId, type: "user", content: "检查为什么样式没有生效。" },
+      {
+        id: agentBlockId,
+        turnId,
+        type: "agent",
+        content: "请选择：\n\n1. 那问题可能出在 Vite 的构建过程中\n2. `App.css` 被自动引入了",
+        streaming: false,
+        options: [],
+      },
+    ],
+    conversationTurns: [
+      {
+        id: turnId,
+        userPrompt: "检查为什么样式没有生效。",
+        title: "诊断陈述不应变成选项",
+        mode: "chat",
+        status: "stopped_no_action",
+        summary: "诊断陈述被保留为文本，不显示为可点击分叉。",
+        blockIds: [userBlockId, agentBlockId],
+        collapsed: false,
+        createdAt: now,
+      },
+    ],
+    currentTurnId: turnId,
+    agentMessages: [],
+    agentStatus: "idle",
+    isGenerating: false,
+    showDiff: false,
+    showPlanPanel: false,
+    showTerminal: false,
+    showFilePanel: false,
+    selectedDiffTaskId: null,
+  }));
+
+  bindBridgeSnapshot(AWAITING_CHOICE_DIAGNOSTIC_REJECTED_SCENARIO);
 
   const cleanup = () => {
     bridge.initialized = false;
@@ -5069,6 +5149,9 @@ export function initializeE2EScenarios(): (() => void) | undefined {
 
   if (scenario === AWAITING_CHOICE_MIXED_OPTIONS_SCENARIO) {
     return seedAwaitingChoiceMixedOptionsScenario();
+  }
+  if (scenario === AWAITING_CHOICE_DIAGNOSTIC_REJECTED_SCENARIO) {
+    return seedAwaitingChoiceDiagnosticRejectedScenario();
   }
 
   if (scenario === FEISHU_REMOTE_ANALYSIS_SCENARIO) {

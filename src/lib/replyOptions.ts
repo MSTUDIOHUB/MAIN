@@ -21,6 +21,8 @@ const INTERNAL_PLAN_ARTIFACT_STEP_RE = /(?:创建|生成|写入|更新|保存|�
 const INTERNAL_PROCESS_OPTION_RE = /(?:切换(?:到)?(?:执行|讨论|计划)模式|进入(?:执行|讨论|计划)模式|进入执行能力|执行模式|workflow mode|mode switch|switch mode|我要调用工具|将调用工具|tool call|^\s*\[?\s*tool[_ ]?call)/i;
 const PLAN_SUMMARY_HEADING_RE = /(?:方案总结|需求规格|设计方案|关键设计决策|设计决策|方案正文|计划摘要|方案摘要|requirements?|design|proposal|plan summary|design decisions?)/i;
 const PLAN_SUMMARY_ITEM_RE = /^(?:\*\*)?(?:技术栈|核心玩法|交互控制|交付物|架构|游戏循环|渲染|碰撞检测|执行顺序|关键设计决策|需求规格|设计方案|文件|模块|验证方式|测试方案|范围|目标|验收标准)(?:\*\*)?\s*[:：]/i;
+const DIAGNOSTIC_STATEMENT_OPTION_RE = /(?:问题可能|可能(?:是|在|出在)|看起来|似乎|应该是|原因(?:可能)?|被(?:自动)?(?:引入|加载|调用|覆盖)|已经(?:存在|完成|失败)|没有(?:被|正确)|is likely|likely due to|probably|seems? like|appears? to|was automatically|has been|is already)/i;
+const ACTIONABLE_OPTION_RE = /(?:^方案\s*[A-Z0-9一二三四五六七八九十]|^option\s*[A-Z0-9]|先|直接|继续|开始|执行|运行|批准|确认|选择|使用|改用|采用|切换|修复|修改|实现|重构|完善|生成|创建|删除|保留|跳过|我来|请|proceed|continue|start|run|execute|approve|confirm|choose|use|switch|fix|modify|implement|refactor|create|delete|skip)/i;
 
 function normalizeOptionText(text: string): string {
   return text.replace(/\s+/g, " ").trim();
@@ -67,6 +69,7 @@ function addReplyOption(
   rawLabel: string,
   rawValue?: string,
   action?: ReplyOption["action"],
+  source?: ReplyOption["source"],
 ) {
   const label = normalizeReplyOptionLabel(rawLabel || rawValue || "");
   const value = normalizeReplyOptionValue(rawValue || rawLabel);
@@ -76,7 +79,7 @@ function addReplyOption(
   if (looksLikePlanSummaryItem(label) || looksLikePlanSummaryItem(value)) return;
   seenValues.add(value);
   const resolvedAction = action ?? inferReplyOptionAction(label, value);
-  replyOptions.push({ label, value, ...(resolvedAction ? { action: resolvedAction } : {}) });
+  replyOptions.push({ label, value, ...(resolvedAction ? { action: resolvedAction } : {}), ...(source ? { source } : {}) });
 }
 
 function parseOptionAttributes(rawAttributes: string): Record<string, string> {
@@ -107,6 +110,24 @@ function looksLikeExecuteReplyOption(text: string): boolean {
   const normalized = normalizeOptionText(text);
   if (!normalized || EXECUTE_REPLY_NEGATION_RE.test(normalized)) return false;
   return EXECUTE_REPLY_ACTION_RE.test(normalized);
+}
+
+function looksLikeDiagnosticStatementOption(text: string): boolean {
+  const normalized = normalizeOptionText(text).replace(/^请\s*/, "");
+  if (!normalized) return false;
+  if (looksLikeExecuteReplyOption(normalized)) return false;
+  if (ACTIONABLE_OPTION_RE.test(normalized) && !DIAGNOSTIC_STATEMENT_OPTION_RE.test(normalized)) return false;
+  return DIAGNOSTIC_STATEMENT_OPTION_RE.test(normalized);
+}
+
+function looksLikeActionableReplyOption(text: string, source?: ReplyOption["source"]): boolean {
+  const normalized = normalizeOptionText(text);
+  if (!normalized) return false;
+  if (source === "readonly_permission") return true;
+  if (looksLikeExecuteReplyOption(normalized)) return true;
+  if (looksLikeDiagnosticStatementOption(normalized)) return false;
+  if (ACTIONABLE_OPTION_RE.test(normalized)) return true;
+  return /^方案\s*[A-Z0-9一二三四五六七八九十][\s:：-]/i.test(normalized);
 }
 
 function inferReplyOptionAction(label: string, value: string): ReplyOption["action"] | undefined {
@@ -195,7 +216,9 @@ function inferReplyOptionsFromEnumeratedChoices(
     }
 
     if (inferred.length >= 2) {
-      inferred.forEach((option) => addReplyOption(replyOptions, seenValues, option));
+      inferred
+        .filter((option) => looksLikeActionableReplyOption(option, "inferred_enumerated"))
+        .forEach((option) => addReplyOption(replyOptions, seenValues, option, undefined, undefined, "inferred_enumerated"));
       return;
     }
   }
@@ -225,8 +248,12 @@ function inferReplyOptionsFromBinaryChoice(
     const secondClause = convertAssistantClauseToUserChoice(parts[2] || "");
     if (!firstClause || !secondClause) continue;
 
-    addReplyOption(replyOptions, seenValues, firstClause);
-    addReplyOption(replyOptions, seenValues, secondClause);
+    if (!looksLikeActionableReplyOption(firstClause, "inferred_binary") || !looksLikeActionableReplyOption(secondClause, "inferred_binary")) {
+      continue;
+    }
+
+    addReplyOption(replyOptions, seenValues, firstClause, undefined, undefined, "inferred_binary");
+    addReplyOption(replyOptions, seenValues, secondClause, undefined, undefined, "inferred_binary");
     if (replyOptions.length >= 2) return;
   }
 }
@@ -266,6 +293,7 @@ function inferReadOnlyPermissionOptions(
     actionLabel,
     `请${actionLabel}。`,
     "continue_readonly_once",
+    "readonly_permission",
   );
   addReplyOption(
     replyOptions,
@@ -273,6 +301,7 @@ function inferReadOnlyPermissionOptions(
     "当前会话只读步骤全部批准",
     `本会话只读读取、搜索和分析步骤全部允许，请${actionLabel}。`,
     "allow_readonly_session",
+    "readonly_permission",
   );
 }
 
@@ -362,7 +391,7 @@ export function extractReplyOptions(text: string): {
         const label = attrLabel || bodyValue || attrValue;
         const action = normalizeReplyOptionAction(attrs.action);
 
-        addReplyOption(replyOptions, seenValues, label, value, action);
+        addReplyOption(replyOptions, seenValues, label, value, action, "explicit_user_options");
       }
 
       return "";
@@ -397,6 +426,7 @@ export function shouldPauseForReplyOptions(params: {
   hasReadyPlanArtifacts?: boolean;
   isPlanApproved?: boolean;
   forcePause?: boolean;
+  finishReason?: "stop" | "length" | "tool_calls" | null;
 }): boolean {
   const {
     replyOptions,
@@ -406,9 +436,17 @@ export function shouldPauseForReplyOptions(params: {
     hasReadyPlanArtifacts = false,
     isPlanApproved = false,
     forcePause = false,
+    finishReason = null,
   } = params;
 
   if (!Array.isArray(replyOptions) || replyOptions.length === 0) return false;
+  const hasExplicitOrPermissionOption = replyOptions.some((option) =>
+    option.source === "explicit_user_options" ||
+    option.source === "readonly_permission" ||
+    option.action === "continue_readonly_once" ||
+    option.action === "allow_readonly_session"
+  );
+  if (finishReason === "length" && !hasExplicitOrPermissionOption) return false;
   if (forcePause) return true;
   if (toolCallCount > 0 && workflowMode === "edit") return false;
 

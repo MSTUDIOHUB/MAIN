@@ -941,7 +941,7 @@ function TurnActivityNotice({
       className="ml-9 rounded-2xl border border-[rgba(96,165,250,0.2)] bg-[rgba(37,99,235,0.08)] px-4 py-3 text-[12px] text-[#bfdbfe]"
     >
       {resolvedThoughtSummaryText && (
-        <div data-testid="turn-activity-thought-summary" style={{ fontSize: `${chatFontSize}px` }}>
+        <div data-testid="turn-activity-thought-summary" className="max-h-[42vh] overflow-y-auto pr-1" style={{ fontSize: `${chatFontSize}px` }}>
           <div className="mb-1.5 flex items-center gap-2 font-mono text-[10.5px] text-[#93c5fd]">
             <span className={`h-1.5 w-1.5 rounded-full ${isThinking ? "bg-amber-400 shadow-[0_0_6px_rgba(251,191,36,0.75)] animate-pulse" : "bg-[#34d399]"}`} />
             <span>{thoughtTitle}</span>
@@ -989,9 +989,11 @@ function ThoughtBlock({
   const computedSummaryText = useMemo(() => {
     const display = deriveThoughtDisplay(rawContent, {
       language,
+      density: compact ? "adaptive" : "compact",
+      mode: compact ? "latest" : "first",
     });
     return display.summaryText;
-  }, [language, rawContent]);
+  }, [compact, language, rawContent]);
   const resolvedSummaryText = String(summaryText || "").trim() || computedSummaryText;
   if (!resolvedSummaryText) return null;
   const isStreamingThought = !!block.isStreaming;
@@ -1474,6 +1476,7 @@ function TurnArchiveStepCard({
       : language === "zh" ? "查看证据" : "Show evidence";
   const targetText = step.targets.slice(0, 3).join(language === "zh" ? "、" : ", ");
   const hiddenTargetCount = Math.max(0, step.targets.length - 3);
+  const shouldShowTargetSummary = targetText && !step.intent.includes(targetText);
 
   return (
     <div
@@ -1502,12 +1505,14 @@ function TurnArchiveStepCard({
               {getArchiveStepStatusLabel(step, language)}
             </span>
           </span>
-          <span data-testid="turn-archive-step-intent" className="mt-1 block text-[12.5px] font-medium leading-5 text-[var(--surface-text)]">
+          <span data-testid="turn-archive-step-intent" className="mt-1 block whitespace-pre-wrap text-[12.5px] font-medium leading-5 text-[var(--surface-text)]">
             {step.intent}
           </span>
-          <span data-testid="turn-archive-step-summary" className="mt-0.5 block truncate text-[11px] text-[var(--surface-text-subtle)]">
-            {step.summary}{targetText && step.summary.includes(targetText) ? "" : targetText ? ` · ${targetText}${hiddenTargetCount ? ` +${hiddenTargetCount}` : ""}` : ""}
-          </span>
+          {step.summary && (
+            <span data-testid="turn-archive-step-summary" className="mt-0.5 block truncate text-[11px] text-[var(--surface-text-subtle)]">
+              {step.summary}{shouldShowTargetSummary ? ` · ${targetText}${hiddenTargetCount ? ` +${hiddenTargetCount}` : ""}` : ""}
+            </span>
+          )}
         </span>
         <span className="inline-flex shrink-0 items-center gap-1.5 px-1 py-1 text-[10px] text-[var(--surface-text-muted)] transition-colors group-hover:text-[var(--surface-text)]">
           {expanded ? <IconChevronDown className="h-3.5 w-3.5" /> : <IconChevronRight className="h-3.5 w-3.5" />}
@@ -1549,39 +1554,70 @@ function LiveTurnProcessTimeline({
   renderLiveItem: (item: any) => React.ReactNode;
   onOpenDiff: (taskId: number) => void;
 }) {
+  const [expanded, setExpanded] = useState(true);
   if (!model || model.totalCount === 0) return null;
   const title = language === "zh" ? "本轮步骤" : "Turn steps";
   const summary = model.summaryText || (language === "zh" ? "操作已按步骤折叠。" : "Actions are folded by step.");
+  const currentJudgment = String(model.currentJudgment || "").trim();
+  const toggleText = expanded
+    ? language === "zh" ? "收起步骤" : "Collapse steps"
+    : language === "zh" ? "展开步骤" : "Expand steps";
 
   return (
     <div
       data-testid="live-turn-process-timeline"
       className="ml-9 rounded-xl px-1 py-2 ring-1 ring-inset ring-[color-mix(in_srgb,var(--accent-light)_32%,transparent)] transition-all duration-150"
     >
-      <div className="px-2 pb-2">
-        <div className="flex min-w-0 flex-wrap items-center gap-2">
-          <span className="inline-flex items-center gap-2 text-[11px] uppercase tracking-[0.16em] text-[#93c5fd]">
-            <IconColumns className="h-3.5 w-3.5" />
-            {title}
+      <button
+        type="button"
+        data-testid="live-turn-process-toggle"
+        aria-expanded={expanded}
+        onClick={() => setExpanded((value) => !value)}
+        className="group flex w-full min-w-0 items-start justify-between gap-3 rounded-lg px-2 py-1 text-left transition-colors hover:bg-[color-mix(in_srgb,var(--accent)_6%,transparent)]"
+      >
+        <span className="min-w-0 flex-1">
+          <span className="flex min-w-0 flex-wrap items-center gap-2">
+            <span className="inline-flex items-center gap-2 text-[11px] uppercase tracking-[0.16em] text-[#93c5fd]">
+              <IconColumns className="h-3.5 w-3.5" />
+              {title}
+            </span>
+            <span className="text-[10px] text-[var(--surface-text-muted)]">
+              {language === "zh" ? `${model.stepCount} 步` : `${model.stepCount} step${model.stepCount > 1 ? "s" : ""}`}
+            </span>
           </span>
-          <span className="text-[10px] text-[var(--surface-text-muted)]">
-            {language === "zh" ? `${model.stepCount} 步` : `${model.stepCount} step${model.stepCount > 1 ? "s" : ""}`}
-          </span>
+          <span className="mt-1 block truncate text-[12px] text-[var(--surface-text-subtle)]">{summary}</span>
+        </span>
+        <span className="inline-flex shrink-0 items-center gap-1.5 px-1 py-1 text-[10px] text-[var(--surface-text-muted)] transition-colors group-hover:text-[var(--surface-text)]">
+          {expanded ? <IconChevronDown className="h-3.5 w-3.5" /> : <IconChevronRight className="h-3.5 w-3.5" />}
+          {toggleText}
+        </span>
+      </button>
+      {expanded && (
+        <div data-testid="live-turn-process-details" className="space-y-2 px-2 pt-2">
+          {currentJudgment && (
+            <div data-testid="live-turn-current-judgment" className="rounded-lg px-1 py-1 text-[12.5px] leading-5 text-[var(--surface-text)]">
+              <div className="mb-1 text-[10px] font-medium uppercase tracking-[0.12em] text-[var(--surface-text-muted)]">
+                {language === "zh" ? "当前判断" : "Current judgment"}
+              </div>
+              <MarkdownRenderer
+                content={currentJudgment}
+                baseFontSize={12.5}
+                sourceId="live-turn-current-judgment"
+              />
+            </div>
+          )}
+          {model.steps.map((step) => (
+            <TurnArchiveStepCard
+              key={step.id}
+              step={step}
+              language={language}
+              renderArchivedItem={renderLiveItem}
+              onOpenDiff={onOpenDiff}
+              variant="live"
+            />
+          ))}
         </div>
-        <div className="mt-1 truncate text-[12px] text-[var(--surface-text-subtle)]">{summary}</div>
-      </div>
-      <div className="space-y-2 px-2">
-        {model.steps.map((step) => (
-          <TurnArchiveStepCard
-            key={step.id}
-            step={step}
-            language={language}
-            renderArchivedItem={renderLiveItem}
-            onOpenDiff={onOpenDiff}
-            variant="live"
-          />
-        ))}
-      </div>
+      )}
     </div>
   );
 }
@@ -2094,7 +2130,7 @@ export default function ChatArea({
       isPlanApproved,
       planStage,
       agentStatus,
-      hasIncompletePlanTasks: !buildPlanTaskEvidenceAudit({ tasks: planTasks, evidenceLedger: planExecutionEvidenceLedger }).acceptedCompletion,
+      hasIncompletePlanTasks: !buildPlanTaskEvidenceAudit({ tasks: planTasks, evidenceLedger: planExecutionEvidenceLedger }).allTrustedComplete,
       hasTasksArtifact:
         planArtifacts.some((artifact) => artifact.kind === "tasks") ||
         planTasks.length > 0,
@@ -2518,14 +2554,20 @@ export default function ChatArea({
       : [...blocks]
           .map((block, idx) => ({ block, idx }))
           .reverse()
-          .find(({ block }) => hasRenderableAgentBlock(block))?.idx ?? -1;
+          .find(({ block }) => !block.hiddenProcess && hasRenderableAgentBlock(block))?.idx ?? -1;
     const finalVisibleAgentBlock = finalVisibleAgentIndex >= 0 ? blocks[finalVisibleAgentIndex] : null;
     const isFinishedTurn = isFinishedTurnStatus(turn.status);
     const shouldArchiveCompletedProcess =
       isFinishedTurn &&
       finalVisibleAgentIndex >= 0;
     const processArchive = shouldArchiveCompletedProcess
-      ? buildTurnProcessArchiveModel({ blocks, finalVisibleAgentIndex, language, includeThoughts: false })
+      ? buildTurnProcessArchiveModel({
+          blocks,
+          finalVisibleAgentIndex,
+          language,
+          includeThoughts: false,
+          includeThoughtNotes: !shouldSuppressThoughtBlocks,
+        })
       : null;
     const collapsedProcessCount = finalVisibleAgentBlock
       ? processArchive?.stepCount ?? blocks.filter((block, idx) => block.type !== "user" && idx !== finalVisibleAgentIndex).length
@@ -2547,7 +2589,7 @@ export default function ChatArea({
     const toolExecutionSummary = buildToolExecutionSummary(blocks, language);
     const activeTurnActivity = getActiveTurnActivity(blocks, turn.status, language);
     const liveProcessTimeline = !shouldArchiveCompletedProcess
-      ? buildLiveTurnProcessTimelineModel({ blocks, language })
+      ? buildLiveTurnProcessTimelineModel({ blocks, language, includeThoughts: !shouldSuppressThoughtBlocks })
       : null;
     const liveProcessBlockIds = new Set(
       (liveProcessTimeline?.blocks || [])
@@ -2563,6 +2605,7 @@ export default function ChatArea({
       const summary = deriveThoughtDisplay(String(thoughtBlock?.content || ""), {
         language,
         mode: "latest",
+        density: "adaptive",
       }).summaryText;
       thoughtSummaryCache.set(cacheKey, summary);
       return summary;

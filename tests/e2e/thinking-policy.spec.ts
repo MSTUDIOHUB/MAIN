@@ -20,7 +20,8 @@ test("thinking policy is the only thought visibility control and persists", asyn
 
   await expect(page.getByTestId("thought-block")).toHaveCount(0);
   await expect(page.locator('[data-testid="turn-archive-step"][data-kind="inspect"]')).toContainText("收集上下文");
-  await expect(page.locator('[data-testid="turn-archive-step"][data-kind="inspect"]')).toContainText("读取目标内容");
+  await expect(page.locator('[data-testid="turn-archive-step"][data-kind="inspect"]')).toContainText("SettingsModal");
+  await expect(page.locator('[data-testid="turn-archive-step"][data-kind="inspect"]')).toContainText("避免原始长文本刷屏");
 
   await page.getByTestId("model-settings-button").click();
   await page.getByTestId("settings-tab-general").click();
@@ -47,7 +48,8 @@ test("thinking policy is the only thought visibility control and persists", asyn
   await expect(page.getByTestId("turn-activity-thought-summary")).toHaveCount(0);
   await expect(page.getByTestId("turn-activity-notice")).toHaveCount(0);
   await expect(page.locator('[data-testid="turn-archive-step"][data-kind="inspect"]')).toBeVisible();
-  await expect(page.locator('[data-testid="turn-archive-step"][data-kind="inspect"]')).toContainText("读取目标内容");
+  await expect(page.locator('[data-testid="turn-archive-step"][data-kind="inspect"]')).toContainText("核对必要上下文");
+  await expect(page.locator('[data-testid="turn-archive-step"][data-kind="inspect"]')).not.toContainText("SettingsModal");
   expect(await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().thinkingPolicy ?? null)).toBe("action_only");
 
   await page.reload();

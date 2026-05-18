@@ -148,6 +148,29 @@ test("latest thought summary prefers the newest useful step", () => {
   assert.doesNotMatch(summary, /read_file/);
 });
 
+test("adaptive latest thought summary keeps a recent useful reasoning chain", () => {
+  const display = deriveThoughtDisplay([
+    "我需要先读取用户第一次指令并确认范围。",
+    '{"tool":"read_file","arguments":{"path":"src/App.tsx"}}',
+    "下一步会检查旧的 App.tsx 结构。",
+    "我已经确认归档外层 ring 存在，所以视觉容器不是主要缺口。",
+    "现在需要增强每一步意图，把为什么读取、做了什么、结果如何放到同一条时间线。",
+    "最后会补充回归测试，确保 action_only 隐藏 thought 但保留工具意图。",
+  ].join("\n"), {
+    language: "zh",
+    mode: "latest",
+    density: "adaptive",
+  });
+
+  const summary = display.summaryLines.join("\n");
+  assert.ok(display.summaryLines.length >= 3);
+  assert.match(summary, /归档外层 ring/);
+  assert.match(summary, /增强每一步意图/);
+  assert.match(summary, /回归测试/);
+  assert.doesNotMatch(summary, /read_file/);
+  assert.doesNotMatch(summary, /第一次指令/);
+});
+
 test("thought summary removes dense punctuation noise and mode complaint loops", () => {
   const display = deriveThoughtDisplay([
     "当前 discuss 模式下 write_file 不可用，需要切换到执行模式。",

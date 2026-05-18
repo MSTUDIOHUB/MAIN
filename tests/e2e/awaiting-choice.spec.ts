@@ -124,3 +124,16 @@ test("mixed choice options split approval actions and keep numbering for real ch
   );
   expect(approvalAfterHover).not.toBe(approvalBeforeHover);
 });
+
+test("diagnostic statements are not rendered as awaiting-choice buttons", async ({ page }) => {
+  await page.goto("/?e2eScenario=awaiting-choice-diagnostic-rejected");
+
+  await expect(page.getByText("那问题可能出在 Vite 的构建过程中")).toBeVisible();
+  await expect(page.getByText("App.css", { exact: true })).toBeVisible();
+  await expect(page.getByText(/被自动引入了/)).toBeVisible();
+  await expect(page.getByTestId("top-island-awaiting-choice")).toHaveCount(0);
+  await expect(page.getByTestId("top-island-reply-option-0")).toHaveCount(0);
+
+  expect(await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().currentTurnStatus ?? null))
+    .toBe("stopped_no_action");
+});

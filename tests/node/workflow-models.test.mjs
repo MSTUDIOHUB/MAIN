@@ -92,6 +92,9 @@ const {
   deriveVisibleConversationTurnStatus,
   extractPlanTasks,
   findDroppedPlanTasks,
+  hasBrowserValidationCapability,
+  isPlanTaskAwaitingBrowserValidation,
+  isPlanTaskAwaitingExternalValidation,
   isEphemeralPlanArtifactPath,
   isPlanTaskTrustedComplete,
   looksLikeReasoningLeakTitle,
@@ -844,6 +847,74 @@ test("command evidence still satisfies explicit cmd tasks", () => {
   assert.equal(isPlanTaskTrustedComplete(reconciled[0]), true);
 });
 
+test("manual markdown render validation requires browser evidence, not curl reachability", () => {
+  const parsed = extractPlanTasks("- [x] 手动测试：打开 test-sample.md，验证所有 Markdown 元素渲染正确");
+  const curlEvidence = createPlanExecutionEvidenceEntry({
+    toolName: "run_command",
+    target: "curl -s http://localhost:1421 | head -30",
+    result: JSON.stringify({ exitCode: 0, stdout: "<!DOCTYPE html>" }),
+  });
+  const reconciled = reconcilePlanTaskCompletion([], parsed, curlEvidence ? [curlEvidence] : []);
+  const audit = buildPlanTaskEvidenceAudit({ tasks: reconciled });
+
+  assert.equal(parsed[0].evidence?.[0]?.kind, "browser_dom");
+  assert.equal(reconciled[0].evidenceStatus, "requires_browser_validation");
+  assert.equal(isPlanTaskAwaitingBrowserValidation(reconciled[0]), true);
+  assert.equal(isPlanTaskTrustedComplete(reconciled[0]), false);
+  assert.equal(audit.acceptedCompletion, false);
+  assert.equal(audit.automationComplete, false);
+  assert.equal(audit.allTrustedComplete, false);
+  assert.equal(audit.pendingExternalValidation, true);
+  assert.equal(audit.remainingTasks.length, 1);
+});
+
+test("browser or Playwright evidence satisfies browser render validation", () => {
+  const parsed = extractPlanTasks("- [x] 手动测试：打开 test-sample.md，验证所有 Markdown 元素渲染正确");
+  const browserEvidence = createPlanExecutionEvidenceEntry({
+    toolName: "browser_evaluate",
+    target: "http://localhost:1421 markdown render smoke",
+    result: JSON.stringify({ ok: true, assertions: ["h1", "table", "mermaid"] }),
+  });
+  const playwrightCommand = createPlanExecutionEvidenceEntry({
+    toolName: "run_command",
+    target: "npx playwright test tests/e2e/markdown-render.spec.ts",
+    result: JSON.stringify({ exitCode: 0, stdout: "1 passed" }),
+  });
+  const browserReconciled = reconcilePlanTaskCompletion([], parsed, browserEvidence ? [browserEvidence] : []);
+  const commandReconciled = reconcilePlanTaskCompletion([], parsed, playwrightCommand ? [playwrightCommand] : []);
+
+  assert.equal(browserEvidence?.kind, "browser_dom");
+  assert.equal(isPlanTaskTrustedComplete(browserReconciled[0]), true);
+  assert.equal(isPlanTaskTrustedComplete(commandReconciled[0]), true);
+});
+
+test("Tauri runtime validation pauses as user/external validation instead of curl substitute", () => {
+  const parsed = extractPlanTasks("- [x] 验证 Tauri open_file 文件选择器可以打开 test-sample.md");
+  const viteEvidence = createPlanExecutionEvidenceEntry({
+    toolName: "run_command",
+    target: "curl -s http://localhost:1421",
+    result: JSON.stringify({ exitCode: 0, stdout: "<!DOCTYPE html>" }),
+  });
+  const reconciled = reconcilePlanTaskCompletion([], parsed, viteEvidence ? [viteEvidence] : []);
+  const audit = buildPlanTaskEvidenceAudit({ tasks: reconciled });
+
+  assert.equal(parsed[0].evidence?.[0]?.kind, "tauri_required");
+  assert.equal(reconciled[0].evidenceStatus, "requires_tauri_validation");
+  assert.equal(isPlanTaskAwaitingExternalValidation(reconciled[0]), true);
+  assert.equal(audit.acceptedCompletion, true);
+  assert.equal(audit.automationComplete, true);
+  assert.equal(audit.allTrustedComplete, false);
+  assert.equal(audit.pendingExternalValidation, true);
+  assert.equal(audit.remainingTasks.length, 0);
+  assert.equal(audit.pendingUserValidationTasks.length, 1);
+});
+
+test("browser validation capability detection is tool-name based and provider neutral", () => {
+  assert.equal(hasBrowserValidationCapability(["run_command", "read_file"]), false);
+  assert.equal(hasBrowserValidationCapability(["browser_navigate", "browser_screenshot"]), true);
+  assert.equal(hasBrowserValidationCapability(["playwright_evaluate"]), true);
+});
+
 test("package install commands satisfy package manifest evidence only", () => {
   const installCommand = createPlanExecutionEvidenceEntry({
     toolName: "run_command",
@@ -1012,6 +1083,7 @@ test("approved plan execution no-tool recovery bypasses generic missing-tool sto
   });
   assert.match(prompt, /已批准计划正在执行/);
   assert.match(prompt, /直接调用工具/);
+  assert.match(prompt, /Browser\/Playwright/);
   assert.match(prompt, /src\/store\/useAppStore\.ts/);
   assert.doesNotMatch(prompt, /missing_tool_reprompt_limit|聊天失败/);
 });

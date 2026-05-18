@@ -1,7 +1,7 @@
 import { memo, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { IconChevronDown, IconChevronUp, IconColumns, IconFileText, IconLock, IconUnlock } from "./Icons";
 import type { TurnProgressItem } from "../lib/turnProgress";
-import { buildPlanTaskEvidenceAudit, type PlanExecutionEvidenceEntry, type PlanStage, type PlanTask, type ReplyOption } from "../lib/workflowModels";
+import { buildPlanTaskEvidenceAudit, isPlanTaskAwaitingBrowserValidation, isPlanTaskAwaitingExternalValidation, type PlanExecutionEvidenceEntry, type PlanStage, type PlanTask, type ReplyOption } from "../lib/workflowModels";
 import type { PendingRunDecision, PendingRunDecisionChoice } from "../lib/runIntent";
 import MarkdownRenderer from "./MarkdownRenderer";
 
@@ -173,6 +173,11 @@ const TopIsland = memo(function TopIsland({
         id: task.id,
         text: task.text,
         status: task.status,
+        validationStatus: isPlanTaskAwaitingExternalValidation(task)
+          ? "user"
+          : isPlanTaskAwaitingBrowserValidation(task)
+          ? "browser"
+          : "none",
         complete: task.evidenceStatus === "satisfied" && task.status === "completed",
       }));
     }
@@ -181,6 +186,7 @@ const TopIsland = memo(function TopIsland({
       id: step.id,
       text: step.text,
       status: step.status,
+      validationStatus: "none",
       complete: step.status === "completed",
     }));
   }, [activeProgressMode, auditedPlanTasks, executionSteps]);
@@ -244,6 +250,8 @@ const TopIsland = memo(function TopIsland({
     approveThread: language === "zh" ? "本会话自动允许写入与命令" : "Auto-Allow Writes & Commands",
     dismiss: language === "zh" ? "取消" : "Cancel",
     cancelTurn: language === "zh" ? "结束本轮" : "End This Turn",
+    autoValidation: language === "zh" ? "自动验证" : "Auto validation",
+    userValidation: language === "zh" ? "待用户验证" : "User validation",
     taskSummary: activeProgressMode === "execution"
       ? language === "zh"
         ? `共 ${progressItems.length} 个步骤，已完成 ${completedCount} 个`
@@ -579,6 +587,13 @@ const TopIsland = memo(function TopIsland({
                             <span className="mt-[2px] shrink-0 text-[12px] font-medium">{index + 1}.</span>
                             <div className="min-w-0 flex-1 [&_.markdown-body]:text-[12px] [&_.markdown-body]:leading-6 [&_.markdown-body_p]:mb-0 [&_.markdown-body_p]:text-inherit [&_.markdown-body_strong]:text-inherit [&_.markdown-body_code]:align-baseline">
                               <MarkdownRenderer content={task.text} baseFontSize={12} />
+                              {activeProgressMode === "plan" && task.validationStatus !== "none" && !task.complete && (
+                                <div className={`mt-1 text-[10px] leading-4 ${
+                                  task.validationStatus === "user" ? "text-[#fbbf24]" : "text-[#93c5fd]"
+                                }`}>
+                                  {task.validationStatus === "user" ? copy.userValidation : copy.autoValidation}
+                                </div>
+                              )}
                             </div>
                           </div>
                         </div>

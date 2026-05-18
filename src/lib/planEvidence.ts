@@ -33,6 +33,20 @@ const WORKSPACE_FILE_REF_RE =
   /(?:^|[\s`"'(（])((?:\.{1,2}\/|[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,10})(?=$|[\s`"',，。；;:)）])/g;
 const MAX_EVIDENCE_REFERENCES = 20;
 
+function sourceToolLooksLikeBrowserAutomation(toolName: string): boolean {
+  return /(?:browser|playwright|puppeteer|cypress)/i.test(String(toolName || ""));
+}
+
+function sourceToolLooksLikeTauriAutomation(toolName: string): boolean {
+  return /(?:tauri|desktop|computer|osascript|applescript|webdriver)/i.test(String(toolName || ""));
+}
+
+function commandLooksLikeDevServerOrHttpProbe(value: string): boolean {
+  return /\b(?:npm|pnpm|yarn|bun|npx)\s+(?:run\s+)?(?:dev|preview|vite)\b/i.test(String(value || "")) ||
+    /\b(?:vite|webpack-dev-server|next\s+dev)\b/i.test(String(value || "")) ||
+    /\bcurl\b[\s\S]{0,120}\bhttps?:\/\/(?:localhost|127\.0\.0\.1|\[?::1\]?)/i.test(String(value || ""));
+}
+
 export function isPlanArtifactPath(path: string): boolean {
   return path.replace(/\\/g, "/").toLowerCase().includes(".main/plans/");
 }
@@ -122,10 +136,35 @@ export function createPlanExecutionEvidenceEntry(input: {
     };
   }
 
+  if (sourceToolLooksLikeBrowserAutomation(input.toolName)) {
+    const isScreenshot = /screenshot|snapshot|capture/i.test(input.toolName) || /screenshot|image|png|jpeg|webp/i.test(input.result);
+    return {
+      id: `evidence-${timestamp}-${Math.random().toString(36).slice(2, 8)}`,
+      kind: isScreenshot ? "browser_screenshot" : "browser_dom",
+      value: target,
+      target,
+      references: extractWorkspaceFileReferences(target, input.result),
+      sourceTool: input.toolName,
+      createdAt: timestamp,
+    };
+  }
+
+  if (sourceToolLooksLikeTauriAutomation(input.toolName)) {
+    return {
+      id: `evidence-${timestamp}-${Math.random().toString(36).slice(2, 8)}`,
+      kind: "tauri_required",
+      value: target,
+      target,
+      references: extractWorkspaceFileReferences(target, input.result),
+      sourceTool: input.toolName,
+      createdAt: timestamp,
+    };
+  }
+
   if (VERIFICATION_EVIDENCE_TOOLS.has(input.toolName)) {
     return {
       id: `evidence-${timestamp}-${Math.random().toString(36).slice(2, 8)}`,
-      kind: "tool",
+      kind: commandLooksLikeDevServerOrHttpProbe(target) ? "dev_server_url" : "tool",
       value: target,
       target,
       references: extractWorkspaceFileReferences(target, input.result),

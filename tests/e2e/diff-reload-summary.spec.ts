@@ -134,8 +134,11 @@ test("diff summary stays folded by default and remains clickable after reload", 
   const editStep = page.locator('[data-testid="turn-archive-step"][data-kind="edit"]');
   const verifyStep = page.locator('[data-testid="turn-archive-step"][data-kind="verify"]');
   await expect(editStep).toContainText("实施修改");
-  await expect(editStep).toContainText("按方案修改目标文件");
+  await expect(editStep).toContainText("实施聚焦修改");
+  await expect(editStep).not.toContainText("结果：");
+  await expect(editStep).not.toContainText("下一步：继续验证");
   await expect(verifyStep).toContainText("运行验证");
+  await expect(verifyStep).toContainText("验证受影响行为");
   await expect(verifyStep).toContainText("npm test -- --runInBand");
   await expect(page.getByTestId("turn-changes-toggle")).toHaveCount(0);
 

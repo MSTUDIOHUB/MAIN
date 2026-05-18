@@ -88,7 +88,7 @@ function buildTrustedResumePrompt(input: {
   return [
     "Continue plan execution in a fresh recovery context; do not reuse the previous errored loop.",
     input.hasTasksArtifact
-      ? "Start from the first task whose evidence is not satisfied. Treat a task as complete only after real file-write, successful command, or verification evidence exists."
+      ? "Start from the first task whose evidence is not satisfied. Treat a task as complete only after real file-write, successful command, Browser/Playwright DOM/screenshot evidence, or explicit pending user validation exists."
       : input.tasks.length > 0
       ? "A runtime task list is already available; start from the first task whose evidence is not satisfied. Persist it to `.MAIN/plans/tasks.md` only when the task is long, cross-session, or explicitly needs an audit file."
       : "First derive a runtime task list from the approved design.md or bugfix.md. Generate `.MAIN/plans/tasks.md` only for long work, cross-session recovery, or audit-file needs, then execute real tasks.",
@@ -990,7 +990,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     planStage === "executing" &&
     (agentStatus === "idle" || agentStatus === "error") &&
     (
-      !buildPlanTaskEvidenceAudit({ tasks: planTasks, evidenceLedger: planExecutionEvidenceLedger }).acceptedCompletion ||
+      !buildPlanTaskEvidenceAudit({ tasks: planTasks, evidenceLedger: planExecutionEvidenceLedger }).allTrustedComplete ||
       !planArtifacts.some((artifact) => artifact.kind === "tasks")
     );
   const handleContinuePlanning = () => {

@@ -159,6 +159,44 @@ HTML 版本和 Pygame 版本的差异选项如下：
   assert.match(result.cleanText, /High score loaded/);
 });
 
+test("extractReplyOptions rejects diagnostic statements from truncated reasoning as choices", () => {
+  const result = extractReplyOptions(`
+请选择：
+
+1. 那问题可能出在 Vite 的构建过程中
+2. \`App.css\` 被自动引入了
+  `);
+
+  assert.equal(result.replyOptions.length, 0);
+});
+
+test("shouldPauseForReplyOptions rejects inferred options on length truncation", () => {
+  assert.equal(
+    shouldPauseForReplyOptions({
+      replyOptions: [
+        { label: "先做数据分析", value: "先做数据分析", source: "inferred_enumerated" },
+        { label: "直接进入软件开发", value: "直接进入软件开发", source: "inferred_enumerated" },
+      ],
+      toolCallCount: 0,
+      workflowMode: "chat",
+      finishReason: "length",
+    }),
+    false,
+  );
+
+  assert.equal(
+    shouldPauseForReplyOptions({
+      replyOptions: [
+        { label: "批准进入执行", value: "批准进入执行", source: "explicit_user_options" },
+      ],
+      toolCallCount: 0,
+      workflowMode: "plan",
+      finishReason: "length",
+    }),
+    true,
+  );
+});
+
 test("extractReplyOptions ignores plan summary bullets after proposal headings", () => {
   const result = extractReplyOptions(`
 计划文档已创建完成。

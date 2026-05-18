@@ -4,6 +4,7 @@ export interface ThoughtDisplayOptions {
   language?: "zh" | "en";
   maxSummaryLines?: number;
   mode?: "first" | "latest";
+  density?: "compact" | "adaptive";
 }
 
 export interface ThoughtDisplayResult {
@@ -13,6 +14,8 @@ export interface ThoughtDisplayResult {
 }
 
 const DEFAULT_SUMMARY_LINES = 1;
+const ADAPTIVE_SUMMARY_LINES = 12;
+const ADAPTIVE_SUMMARY_CHAR_BUDGET = 1800;
 const SYNTHETIC_VISIBLE_CONCLUSION_ZH = "后台思考已折叠，模型尚未生成可见回复或可执行动作。";
 const SYNTHETIC_VISIBLE_CONCLUSION_RE = /后台思考已折叠[，,]\s*模型尚未生成可见回复或可执行动作。?/;
 
@@ -363,7 +366,7 @@ function splitSummaryCandidates(cleanText: string): string[] {
 }
 
 function isProcessUseful(text: string): boolean {
-  return /(?:我(?:需要|准备|会|将|先|正在|已经|要)|先(?:修改|验证|计划)|下一步|需要先|正在|修改|验证|计划|I need to|I will|I'll|I'm going to|next|plan|verify)/i.test(text);
+  return /(?:我(?:需要|准备|会|将|先|正在|已经|要)|(?:现在|当前|最后|已经|正在)(?:需要|会|确认|整理|准备|补充)|先(?:修改|验证|计划)|下一步|需要先|正在|修改|验证|计划|I need to|I will|I'll|I'm going to|next|plan|verify)/i.test(text);
 }
 
 function truncateSummaryLine(text: string, maxChars = 180): string {
@@ -372,11 +375,69 @@ function truncateSummaryLine(text: string, maxChars = 180): string {
   return `${normalized.slice(0, maxChars - 3).trim()}...`;
 }
 
-function pickSummaryLines(cleanText: string, maxLines: number, mode: "first" | "latest" = "first"): string[] {
+function isLowValueProcessSummaryLine(text: string): boolean {
+  const normalized = String(text || "").replace(/\s+/g, " ").trim();
+  if (normalized.length > 90) return false;
+  return /^(?:让我|我(?:会|将|要|需要|继续|正在)|接下来|现在)?\s*(?:继续|再|先)?\s*(?:读取|检查|查看|分析|梳理|确认)(?:剩余|更多|相关|关键|必要)?(?:的)?(?:文件|内容|上下文|实现|代码)?[。.!！]*$/i.test(normalized) ||
+    /等待(?:可见回复|模型|下一步动作|工具结果)/i.test(normalized);
+}
+
+function isStaleSetupSummaryLine(text: string): boolean {
+  const normalized = String(text || "").replace(/\s+/g, " ").trim();
+  return /(?:第一次指令|最初指令|初始指令|first instruction|initial prompt|original prompt)/i.test(normalized);
+}
+
+function takeWithinBudget(lines: string[], maxLines: number, charBudget: number, mode: "first" | "latest"): string[] {
+  const result: string[] = [];
+  const source = mode === "latest" ? [...lines].reverse() : lines;
+  let chars = 0;
+  for (const line of source) {
+    const normalized = line.trim();
+    if (!normalized) continue;
+    const nextChars = chars + normalized.length + (result.length > 0 ? 2 : 0);
+    if (result.length > 0 && (result.length >= maxLines || nextChars > charBudget)) break;
+    result.push(normalized);
+    chars = nextChars;
+  }
+  return mode === "latest" ? result.reverse() : result;
+}
+
+function pickAdaptiveSummaryLines(cleanText: string, maxLines: number, mode: "first" | "latest"): string[] {
+  const lines = cleanText
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) =>
+      line &&
+      hasMeaningfulText(line) &&
+      !isSyntheticThoughtPlaceholder(line) &&
+      !isLikelyJsonLine(line) &&
+      !isCodeLikeLine(line)
+    );
+  if (lines.length === 0) return [];
+
+  const richLines = lines.filter((line) => !isLowValueProcessSummaryLine(line));
+  if (richLines.length === 0) return [];
+  const usefulLines = richLines.filter((line) => !isStaleSetupSummaryLine(line));
+  const source = usefulLines.length >= 2 ? usefulLines : richLines;
+  return takeWithinBudget(source, Math.max(3, maxLines), ADAPTIVE_SUMMARY_CHAR_BUDGET, mode);
+}
+
+function pickSummaryLines(
+  cleanText: string,
+  maxLines: number,
+  mode: "first" | "latest" = "first",
+  density: "compact" | "adaptive" = "compact",
+): string[] {
+  if (density === "adaptive") {
+    return pickAdaptiveSummaryLines(cleanText, maxLines, mode);
+  }
+
   const candidates = splitSummaryCandidates(cleanText);
   const chosen: string[] = [];
   const seen = new Set<string>();
   const orderedCandidates = mode === "latest" ? [...candidates].reverse() : candidates;
+  const maxLineChars = 180;
+  const charBudget = Number.POSITIVE_INFINITY;
 
   if (maxLines === 1) {
     if (mode === "latest") {
@@ -387,7 +448,7 @@ function pickSummaryLines(cleanText: string, maxLines: number, mode: "first" | "
         const normalized = normalizeForCompare(candidate);
         return normalized && all.findIndex((other) => normalizeForCompare(other) === normalized) === index;
       });
-      return latestCandidate ? [truncateSummaryLine(latestCandidate)] : [];
+      return latestCandidate ? [truncateSummaryLine(latestCandidate, maxLineChars)] : [];
     }
 
     const merged: string[] = [];
@@ -408,7 +469,7 @@ function pickSummaryLines(cleanText: string, maxLines: number, mode: "first" | "
       if (merged.length >= 2) break;
     }
     if (merged.length >= 2) {
-      return [truncateSummaryLine(merged.join("; "))];
+      return [truncateSummaryLine(merged.join("; "), maxLineChars)];
     }
   }
 
@@ -416,8 +477,11 @@ function pickSummaryLines(cleanText: string, maxLines: number, mode: "first" | "
     const normalized = normalizeForCompare(candidate);
     if (!normalized || seen.has(normalized)) return;
     if (chosen.some((existing) => isNearDuplicateSummary(candidate, existing))) return;
+    const nextLine = truncateSummaryLine(candidate, maxLineChars);
+    const nextLength = chosen.join("\n\n").length + nextLine.length + (chosen.length > 0 ? 2 : 0);
+    if (nextLength > charBudget && chosen.length > 0) return;
     seen.add(normalized);
-    chosen.push(truncateSummaryLine(candidate));
+    chosen.push(nextLine);
   };
 
   orderedCandidates.filter(isProcessUseful).forEach((candidate) => {
@@ -436,11 +500,13 @@ export function deriveThoughtDisplay(
   options: ThoughtDisplayOptions = {},
 ): ThoughtDisplayResult {
   const language = options.language === "en" ? "en" : "zh";
+  const density = options.density === "adaptive" ? "adaptive" : "compact";
   const clean = cleanThoughtText(String(content || ""), language);
   const summaryLines = pickSummaryLines(
     clean,
-    Math.max(1, options.maxSummaryLines ?? DEFAULT_SUMMARY_LINES),
+    Math.max(1, options.maxSummaryLines ?? (density === "adaptive" ? ADAPTIVE_SUMMARY_LINES : DEFAULT_SUMMARY_LINES)),
     options.mode === "latest" ? "latest" : "first",
+    density,
   );
 
   return {

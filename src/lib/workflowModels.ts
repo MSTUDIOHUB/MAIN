@@ -192,8 +192,32 @@ export type PlanStage =
   | "completed";
 
 export type PlanTaskStatus = "pending" | "in_progress" | "completed";
-export type PlanTaskEvidenceKind = "file" | "cmd" | "deliverable" | "tool" | "text";
-export type PlanTaskEvidenceStatus = "missing" | "partial" | "satisfied";
+export type PlanTaskEvidenceKind =
+  | "file"
+  | "cmd"
+  | "deliverable"
+  | "tool"
+  | "text"
+  | "browser_dom"
+  | "browser_screenshot"
+  | "dev_server_url"
+  | "tauri_required"
+  | "manual_user_validation";
+export type PlanTaskEvidenceStatus =
+  | "missing"
+  | "partial"
+  | "satisfied"
+  | "blocked"
+  | "requires_browser_validation"
+  | "requires_tauri_validation"
+  | "requires_user_confirmation";
+export type PlanTaskValidationCapability =
+  | "shell_one_shot"
+  | "dev_server"
+  | "browser_dom"
+  | "browser_screenshot"
+  | "tauri_runtime"
+  | "manual_user_validation";
 export type PlanExecutionProgressPhase =
   | "starting"
   | "running"
@@ -257,6 +281,7 @@ export interface PlanTask {
   requirementRef?: string;
   commands?: string[];
   evidence?: PlanTaskEvidence[];
+  validationCapability?: PlanTaskValidationCapability;
   evidenceStatus?: PlanTaskEvidenceStatus;
   blockedReason?: string;
   retained?: boolean;
@@ -267,7 +292,12 @@ export interface PlanTaskEvidenceAudit {
   completedCount: number;
   totalCount: number;
   remainingTasks: PlanTask[];
+  pendingUserValidationTasks: PlanTask[];
+  automationComplete: boolean;
+  allTrustedComplete: boolean;
+  pendingExternalValidation: boolean;
   blockedReasons: string[];
+  pendingUserValidationReasons: string[];
   acceptedCompletion: boolean;
 }
 
@@ -296,6 +326,7 @@ export interface ReplyOption {
   label: string;
   value: string;
   action?: "continue_readonly_once" | "allow_readonly_session" | "execute_once" | "adjust_plan";
+  source?: "explicit_user_options" | "inferred_binary" | "inferred_enumerated" | "readonly_permission";
 }
 
 export type ConversationTurnStatus =
@@ -640,7 +671,7 @@ export function createPlanTaskId(text: string, requirementRef?: string): string 
 
 const PLAN_TASK_EVIDENCE_LABEL_RE = /(?:^|\s)[（(]?\s*(?:证据|evidence)\s*[:：]\s*([\s\S]+?)\s*[）)]?\s*$/i;
 const PLAN_TASK_EVIDENCE_ITEM_RE =
-  /\b(file|cmd|command|deliverable|tool|text)\s*[:：]\s*([^,，;；]+(?:\s+(?!\b(?:file|cmd|command|deliverable|tool|text)\s*[:：])[^,，;；]+)*)/gi;
+  /\b(file|cmd|command|deliverable|tool|text|browser_dom|browser_screenshot|dev_server_url|tauri_required|manual_user_validation|manual|browser|screenshot|tauri)\s*[:：]\s*([^,，;；]+(?:\s+(?!\b(?:file|cmd|command|deliverable|tool|text|browser_dom|browser_screenshot|dev_server_url|tauri_required|manual_user_validation|manual|browser|screenshot|tauri)\s*[:：])[^,，;；]+)*)/gi;
 const PLAN_TASK_FILE_REF_RE =
   /(?:^|[\s`"'(（])((?:\.{1,2}\/|[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,10})(?=$|[\s`"',，。；;:)）])/g;
 
@@ -656,7 +687,22 @@ function isLikelyWorkspaceFileReference(value: string): boolean {
 function normalizeEvidenceKind(kind: string): PlanTaskEvidenceKind {
   const normalized = String(kind || "").trim().toLowerCase();
   if (normalized === "command") return "cmd";
-  if (normalized === "file" || normalized === "cmd" || normalized === "deliverable" || normalized === "tool" || normalized === "text") {
+  if (normalized === "browser") return "browser_dom";
+  if (normalized === "screenshot") return "browser_screenshot";
+  if (normalized === "manual") return "manual_user_validation";
+  if (normalized === "tauri") return "tauri_required";
+  if (
+    normalized === "file" ||
+    normalized === "cmd" ||
+    normalized === "deliverable" ||
+    normalized === "tool" ||
+    normalized === "text" ||
+    normalized === "browser_dom" ||
+    normalized === "browser_screenshot" ||
+    normalized === "dev_server_url" ||
+    normalized === "tauri_required" ||
+    normalized === "manual_user_validation"
+  ) {
     return normalized;
   }
   return "text";
@@ -696,6 +742,24 @@ function splitCommandEvidenceSegments(value: string): string[] {
   return segments.length > 0 ? segments : [normalized];
 }
 
+function commandLooksLikePlaywrightOrBrowserTest(value: string): boolean {
+  return /\b(?:playwright|cypress|puppeteer|browser\s+test|e2e)\b/i.test(String(value || ""));
+}
+
+function commandLooksLikeDevServerOrHttpProbe(value: string): boolean {
+  return /\b(?:npm|pnpm|yarn|bun|npx)\s+(?:run\s+)?(?:dev|preview|vite)\b/i.test(String(value || "")) ||
+    /\b(?:vite|webpack-dev-server|next\s+dev)\b/i.test(String(value || "")) ||
+    /\bcurl\b[\s\S]{0,120}\bhttps?:\/\/(?:localhost|127\.0\.0\.1|\[?::1\]?)/i.test(String(value || ""));
+}
+
+function sourceToolLooksLikeBrowserAutomation(toolName: string): boolean {
+  return /(?:browser|playwright|puppeteer|cypress)/i.test(String(toolName || ""));
+}
+
+function sourceToolLooksLikeTauriAutomation(toolName: string): boolean {
+  return /(?:tauri|desktop|computer|osascript|applescript|webdriver)/i.test(String(toolName || ""));
+}
+
 function commandEvidenceMatches(expectedRaw: string, actualRaw: string): boolean {
   const expected = normalizeCommandEvidenceValue(expectedRaw);
   const actual = normalizeCommandEvidenceValue(actualRaw);
@@ -707,6 +771,91 @@ function commandEvidenceMatches(expectedRaw: string, actualRaw: string): boolean
     segment === expected ||
     segment.startsWith(`${expected} `)
   );
+}
+
+const VALIDATION_ACTION_RE =
+  /(?:验证|测试|检查|验收|确认|打开|预览|渲染|显示|截图|verify|test|check|validate|render|preview|open|screenshot)/i;
+const BROWSER_VALIDATION_RE =
+  /(?:浏览器|页面|前端|UI|DOM|截图|可视|视觉|渲染|预览|localhost|127\.0\.0\.1|Playwright|Cypress|Puppeteer|browser|page|frontend|screenshot|render|preview|DOM)/i;
+const MARKDOWN_VIEWER_VALIDATION_RE =
+  /(?:Markdown|md|test-sample\.md|mermaid|代码块|表格|脚注|标题|preview|预览|渲染)/i;
+const TAURI_VALIDATION_RE =
+  /(?:Tauri|invoke\(['"`](?:open_file|save_file|save_file_as)|open_file|save_file|文件选择|文件对话框|系统浏览器|桌面|窗口|原生|desktop|file\s+dialog|native|system integration)/i;
+const MANUAL_VALIDATION_RE =
+  /(?:手动|人工|用户(?:自己)?|你自己|自行|肉眼|确认|manual|human|user confirmation|user validation|visually inspect)/i;
+
+function inferValidationTaskEvidence(text: string, commands: string[] = []): PlanTaskEvidence[] {
+  const normalized = String(text || "");
+  if (!VALIDATION_ACTION_RE.test(normalized)) return [];
+  if (commands.some(commandLooksLikePlaywrightOrBrowserTest)) {
+    return [];
+  }
+
+  if (TAURI_VALIDATION_RE.test(normalized)) {
+    const parsed = makePlanTaskEvidence("tauri_required", "tauri runtime validation", true);
+    return parsed ? [parsed] : [];
+  }
+
+  if (BROWSER_VALIDATION_RE.test(normalized) || MARKDOWN_VIEWER_VALIDATION_RE.test(normalized)) {
+    const parsed = makePlanTaskEvidence("browser_dom", "browser DOM validation", true);
+    return parsed ? [parsed] : [];
+  }
+
+  if (MANUAL_VALIDATION_RE.test(normalized)) {
+    const parsed = makePlanTaskEvidence("manual_user_validation", "user confirmation", true);
+    return parsed ? [parsed] : [];
+  }
+
+  if (/\b(?:localhost|127\.0\.0\.1|dev server|服务|端口|port)\b/i.test(normalized)) {
+    const parsed = makePlanTaskEvidence("dev_server_url", "dev server reachable", true);
+    return parsed ? [parsed] : [];
+  }
+
+  return [];
+}
+
+function planTaskEvidenceStatusForUnmatchedValidation(evidence: PlanTaskEvidence[]): {
+  status?: PlanTaskEvidenceStatus;
+  capability?: PlanTaskValidationCapability;
+  reason?: string;
+} {
+  if (evidence.some((item) => item.kind === "tauri_required")) {
+    return {
+      status: "requires_tauri_validation",
+      capability: "tauri_runtime",
+      reason: "需要 Tauri/桌面运行时或用户手动确认，普通 Vite/HTTP 验证不能替代",
+    };
+  }
+  if (evidence.some((item) => item.kind === "manual_user_validation")) {
+    return {
+      status: "requires_user_confirmation",
+      capability: "manual_user_validation",
+      reason: "该任务需要用户确认，模型不能用命令输出替代人工验收",
+    };
+  }
+  if (evidence.some((item) => item.kind === "browser_dom" || item.kind === "browser_screenshot")) {
+    return {
+      status: "requires_browser_validation",
+      capability: evidence.some((item) => item.kind === "browser_screenshot") ? "browser_screenshot" : "browser_dom",
+      reason: "需要浏览器 DOM/截图级验证；HTTP 可达性或 curl 输出不能证明页面渲染正确",
+    };
+  }
+  if (evidence.some((item) => item.kind === "dev_server_url")) {
+    return {
+      status: "missing",
+      capability: "dev_server",
+      reason: "缺少 dev server URL 或 HTTP 可达性证据",
+    };
+  }
+  return {};
+}
+
+function initialEvidenceStatusForEvidence(evidence: PlanTaskEvidence[]): PlanTaskEvidenceStatus {
+  return planTaskEvidenceStatusForUnmatchedValidation(evidence).status || "missing";
+}
+
+function validationCapabilityForEvidence(evidence: PlanTaskEvidence[]): PlanTaskValidationCapability | undefined {
+  return planTaskEvidenceStatusForUnmatchedValidation(evidence).capability;
 }
 
 function isPackageManifestEvidence(value: string): boolean {
@@ -788,6 +937,11 @@ export function inferPlanTaskEvidence(text: string, commands: string[] = []): Pl
     if (parsed) evidence.push(parsed);
   }
 
+  const validationEvidence = inferValidationTaskEvidence(text, commands);
+  if (validationEvidence.length > 0) {
+    return dedupePlanTaskEvidence(validationEvidence);
+  }
+
   for (const matched of String(text || "").matchAll(PLAN_TASK_FILE_REF_RE)) {
     if (!isLikelyWorkspaceFileReference(matched[1] || "")) continue;
     const parsed = makePlanTaskEvidence("file", matched[1] || "", true);
@@ -817,6 +971,25 @@ function evidenceMatchesRecord(
     return actual.includes(expected) || expected.includes(actual);
   }
 
+  if (evidence.kind === "dev_server_url") {
+    if (record.kind === "dev_server_url") return true;
+    return record.kind === "cmd" && commandLooksLikeDevServerOrHttpProbe(record.value || record.target || "");
+  }
+
+  if (evidence.kind === "browser_dom" || evidence.kind === "browser_screenshot") {
+    if (record.kind === "browser_dom" || record.kind === "browser_screenshot") return true;
+    if (record.kind === "cmd" && commandLooksLikePlaywrightOrBrowserTest(record.value || record.target || "")) return true;
+    return sourceToolLooksLikeBrowserAutomation(record.sourceTool);
+  }
+
+  if (evidence.kind === "tauri_required") {
+    return record.kind === "tauri_required" || sourceToolLooksLikeTauriAutomation(record.sourceTool);
+  }
+
+  if (evidence.kind === "manual_user_validation") {
+    return record.kind === "manual_user_validation";
+  }
+
   if (evidence.kind === "file" || evidence.kind === "deliverable") {
     if (record.kind === "file" || record.kind === "deliverable") {
       return evidencePathMatches(record.value || record.target || "", evidence.value);
@@ -837,7 +1010,7 @@ function evidenceMatchesRecord(
 function resolvePlanTaskEvidenceStatus(
   task: PlanTask,
   evidenceLedger: PlanExecutionEvidenceEntry[],
-): { status: PlanTaskEvidenceStatus; matched: number; total: number; blockedReason?: string } {
+): { status: PlanTaskEvidenceStatus; matched: number; total: number; blockedReason?: string; validationCapability?: PlanTaskValidationCapability } {
   const evidence = task.evidence && task.evidence.length > 0
     ? task.evidence
     : inferPlanTaskEvidence(task.text, task.commands || []);
@@ -858,6 +1031,17 @@ function resolvePlanTaskEvidenceStatus(
     return { status: "satisfied", matched, total: evidence.length };
   }
 
+  const validation = planTaskEvidenceStatusForUnmatchedValidation(evidence);
+  if (validation.status) {
+    return {
+      status: validation.status,
+      matched,
+      total: evidence.length,
+      blockedReason: validation.reason,
+      validationCapability: validation.capability,
+    };
+  }
+
   return {
     status: matched > 0 ? "partial" : "missing",
     matched,
@@ -870,6 +1054,69 @@ function resolvePlanTaskEvidenceStatus(
 
 export function isPlanTaskTrustedComplete(task: PlanTask): boolean {
   return task.status === "completed" && task.evidenceStatus === "satisfied";
+}
+
+export function isPlanTaskAwaitingExternalValidation(task: Pick<PlanTask, "evidenceStatus">): boolean {
+  return task.evidenceStatus === "requires_user_confirmation" ||
+    task.evidenceStatus === "requires_tauri_validation";
+}
+
+export function isPlanTaskAwaitingBrowserValidation(task: Pick<PlanTask, "evidenceStatus">): boolean {
+  return task.evidenceStatus === "requires_browser_validation";
+}
+
+export function isPlanTaskBlockingAutomation(
+  task: PlanTask,
+  options: { browserValidationAvailable?: boolean } = {},
+): boolean {
+  if (isPlanTaskTrustedComplete(task)) return false;
+  if (isPlanTaskAwaitingExternalValidation(task)) return false;
+  if (isPlanTaskAwaitingBrowserValidation(task) && !options.browserValidationAvailable) return false;
+  return true;
+}
+
+export function planTaskNeedsUserValidationLabel(
+  task: Pick<PlanTask, "evidenceStatus" | "validationCapability">,
+): boolean {
+  return isPlanTaskAwaitingExternalValidation(task) ||
+    (isPlanTaskAwaitingBrowserValidation(task) && task.validationCapability !== "browser_screenshot");
+}
+
+export function hasBrowserValidationCapability(toolNames: Iterable<string> | undefined | null): boolean {
+  if (!toolNames) return false;
+  for (const name of toolNames) {
+    if (sourceToolLooksLikeBrowserAutomation(name)) return true;
+  }
+  return false;
+}
+
+export function describePlanValidationDecision(input: {
+  task: Pick<PlanTask, "text" | "evidenceStatus" | "validationCapability">;
+  language: "zh" | "en";
+  browserValidationAvailable?: boolean;
+}): string {
+  const status = input.task.evidenceStatus;
+  if (status === "requires_browser_validation") {
+    if (input.browserValidationAvailable) {
+      return input.language === "zh"
+        ? "下一步应使用浏览器自动化：打开实际 dev server URL，执行 DOM 断言，必要时截图；不要用 curl/grep/cat 替代页面渲染验证。"
+        : "Next use browser automation: open the real dev-server URL, run DOM assertions, and take a screenshot if needed; do not substitute curl/grep/cat for rendered-page validation.";
+    }
+    return input.language === "zh"
+      ? "当前缺少浏览器自动化能力，自动验证到此为止；该项应标为待用户验证。"
+      : "Browser automation is not available, so automated validation stops here; this item should be left for user validation.";
+  }
+  if (status === "requires_tauri_validation") {
+    return input.language === "zh"
+      ? "该项需要 Tauri/桌面运行时验证；普通 Vite 页面只能验证网页渲染，不能替代文件对话框或系统集成。"
+      : "This item requires Tauri/desktop-runtime validation; a Vite page can only validate web rendering, not file dialogs or system integration.";
+  }
+  if (status === "requires_user_confirmation") {
+    return input.language === "zh"
+      ? "该项需要用户确认，模型应暂停并保留待验证状态。"
+      : "This item requires user confirmation; the model should pause and keep it pending validation.";
+  }
+  return "";
 }
 
 export function reconcilePlanTaskCompletion(
@@ -898,6 +1145,7 @@ export function reconcilePlanTaskCompletion(
       status,
       evidence,
       evidenceStatus: evidenceResult.status,
+      validationCapability: evidenceResult.validationCapability || task.validationCapability,
       blockedReason: evidenceResult.status === "satisfied" ? undefined : evidenceResult.blockedReason,
     };
   });
@@ -932,7 +1180,13 @@ export function buildPlanTaskEvidenceAudit(input: {
         highlightNext: input.highlightNext ?? false,
       })
     : tasks;
-  const remainingTasks = auditedTasks.filter((task) => !isPlanTaskTrustedComplete(task));
+  const pendingUserValidationTasks = auditedTasks.filter((task) =>
+    !isPlanTaskTrustedComplete(task) &&
+    (isPlanTaskAwaitingExternalValidation(task) || isPlanTaskAwaitingBrowserValidation(task))
+  );
+  const remainingTasks = auditedTasks.filter((task) => isPlanTaskBlockingAutomation(task, {
+    browserValidationAvailable: true,
+  }));
   const blockedReasons = remainingTasks.map((task, index) => {
     const status = task.evidenceStatus || task.status || "missing";
     const reason = task.blockedReason || (task.evidence && task.evidence.length > 0
@@ -940,14 +1194,27 @@ export function buildPlanTaskEvidenceAudit(input: {
       : "missing verifiable evidence label or inferable file/command reference");
     return `${index + 1}. ${task.text} [${status}; ${formatAuditEvidence(task)}] - ${reason}`;
   });
+  const pendingUserValidationReasons = pendingUserValidationTasks.map((task, index) => {
+    const status = task.evidenceStatus || task.status || "requires_user_confirmation";
+    const reason = task.blockedReason || "waiting for external validation";
+    return `${index + 1}. ${task.text} [${status}; ${formatAuditEvidence(task)}] - ${reason}`;
+  });
+  const automationComplete = auditedTasks.length > 0 && remainingTasks.length === 0;
+  const allTrustedComplete = auditedTasks.length > 0 && auditedTasks.every(isPlanTaskTrustedComplete);
+  const pendingExternalValidation = pendingUserValidationTasks.length > 0;
 
   return {
     tasks: auditedTasks,
     completedCount: auditedTasks.filter(isPlanTaskTrustedComplete).length,
     totalCount: auditedTasks.length,
     remainingTasks,
+    pendingUserValidationTasks,
+    automationComplete,
+    allTrustedComplete,
+    pendingExternalValidation,
     blockedReasons,
-    acceptedCompletion: auditedTasks.length > 0 && remainingTasks.length === 0,
+    pendingUserValidationReasons,
+    acceptedCompletion: automationComplete,
   };
 }
 
@@ -1002,7 +1269,8 @@ export function extractPlanTasks(markdown: string): PlanTask[] {
       ...(requirementMatched ? { requirementRef: requirementMatched[0] } : {}),
       ...(commands.length > 0 ? { commands } : {}),
       ...(evidence.length > 0 ? { evidence } : {}),
-      evidenceStatus: "missing",
+      ...(validationCapabilityForEvidence(evidence) ? { validationCapability: validationCapabilityForEvidence(evidence) } : {}),
+      evidenceStatus: initialEvidenceStatusForEvidence(evidence),
       ...(claimedStatus === "completed" ? { blockedReason: "等待真实执行证据确认完成" } : {}),
     });
   }
@@ -1114,10 +1382,12 @@ function makeRuntimeTask(text: string, language: "zh" | "en"): PlanTask | null {
     claimedStatus: "pending",
     ...(commands.length > 0 ? { commands } : {}),
     ...(evidence.length > 0 ? { evidence } : {}),
-    evidenceStatus: "missing",
-    blockedReason: language === "en"
-      ? "Waiting for trusted execution evidence"
-      : "等待真实执行证据确认完成",
+    ...(validationCapabilityForEvidence(evidence) ? { validationCapability: validationCapabilityForEvidence(evidence) } : {}),
+    evidenceStatus: initialEvidenceStatusForEvidence(evidence),
+    blockedReason: planTaskEvidenceStatusForUnmatchedValidation(evidence).reason ||
+      (language === "en"
+        ? "Waiting for trusted execution evidence"
+        : "等待真实执行证据确认完成"),
   };
 }
 
@@ -1133,10 +1403,12 @@ function makeRuntimeTaskFromEvidenceText(
     claimedStatus: "pending",
     evidence: [evidence],
     ...(evidence.kind === "cmd" ? { commands: [evidence.value] } : {}),
-    evidenceStatus: "missing",
-    blockedReason: language === "en"
-      ? "Waiting for trusted execution evidence"
-      : "等待真实执行证据确认完成",
+    ...(validationCapabilityForEvidence([evidence]) ? { validationCapability: validationCapabilityForEvidence([evidence]) } : {}),
+    evidenceStatus: initialEvidenceStatusForEvidence([evidence]),
+    blockedReason: planTaskEvidenceStatusForUnmatchedValidation([evidence]).reason ||
+      (language === "en"
+        ? "Waiting for trusted execution evidence"
+        : "等待真实执行证据确认完成"),
   };
 }
 
