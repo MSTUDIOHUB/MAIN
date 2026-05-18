@@ -144,12 +144,43 @@ function compactLine(text: string, maxChars = 180): string {
   return `${normalized.slice(0, maxChars - 3).trim()}...`;
 }
 
+const PROCESS_NOTE_TARGET_RE = /`?(?:(?:\.{1,2}\/|\/)?(?:[\w@()[\]. -]+[\\/])+)?[\w@()[\]. -]+\.(?:tsx?|jsx?|mjs|cjs|css|scss|sass|html?|mdx?|json|ya?ml|toml|rs|lock|svg|png|jpe?g|gif|webp|ico|icns)`?/gi;
+
+function stripProcessNoteTargetNoise(text: string): string {
+  return String(text || "")
+    .replace(PROCESS_NOTE_TARGET_RE, "<target>")
+    .replace(/`[^`]{1,120}`/g, (match) => {
+      return /[\\/]|\.tsx?|\.jsx?|\.css|\.html?|\.mdx?|\.json|\.ya?ml|\.toml|\.rs|npm|node|cargo|npx|pnpm|bun|yarn/i.test(match)
+        ? "`<target>`"
+        : match;
+    });
+}
+
+function normalizeProcessNoteForCompare(text: string): string {
+  return stripProcessNoteTargetNoise(text)
+    .toLowerCase()
+    .replace(/[，。！？；：,.!?;:、"'“”‘’`*_~\-\s]+/g, "")
+    .replace(/\s+/g, "")
+    .trim();
+}
+
+function processNotesOverlap(left: string, right: string): boolean {
+  const a = normalizeProcessNoteForCompare(left);
+  const b = normalizeProcessNoteForCompare(right);
+  if (!a || !b) return false;
+  if (a === b) return true;
+  return a.length >= 14 && b.length >= 14 && (a.includes(b) || b.includes(a));
+}
+
 function isLowValueProcessNote(text: string): boolean {
   const normalized = String(text || "").replace(/\s+/g, " ").trim();
+  const normalizedWithoutTargets = stripProcessNoteTargetNoise(normalized).replace(/<target>/g, "目标文件");
   if (!normalized) return true;
   if (/^我会执行下一步工具动作[:：]/.test(normalized)) return true;
   if (/^I will run the next tool action:/i.test(normalized)) return true;
-  if (/^(?:让我|我(?:会|将|要|需要|继续|正在)|接下来|现在)?\s*(?:继续|再|先)?\s*(?:读取|检查|查看|分析|梳理|确认)(?:剩余|更多|相关|关键|必要)?(?:的)?(?:文件|内容|上下文|实现|代码)?[。.!！]*$/i.test(normalized)) return true;
+  if (/^(?:我(?:会|将|要|需要)?\s*)?(?:继续|先|再)?\s*(?:按(?:照)?|根据)?(?:同一)?(?:方案|计划|策略)?\s*(?:修改|编辑|更新|调整|处理|应用|落地)(?:目标|相关|当前|这些|上述|对应|项目)?(?:文件|代码|样式|内容|改动)?[。.!！]*$/i.test(normalizedWithoutTargets)) return true;
+  if (/^(?:I(?:'ll| will| need to)?\s*)?(?:continue|first|next)?\s*(?:apply|make|perform|do|edit|update|change|modify)(?:\s+the)?(?:\s+planned|\s+target|\s+related|\s+current)?(?:\s+file|\s+files|\s+change|\s+changes|\s+edit|\s+edits)?\.?$/i.test(normalizedWithoutTargets)) return true;
+  if (/^(?:让我|我(?:会|将|要|需要|继续|正在)|接下来|现在)?\s*(?:继续|再|先)?\s*(?:读取|检查|查看|分析|梳理|确认)(?:(?:剩余|更多|相关|关键|必要)\s*)*(?:的)?(?:文件|内容|上下文|实现|代码)?[。.!！]*$/i.test(normalized)) return true;
   if (/^(?:let me|i(?:'ll| will| need to| am going to)?|next)?\s*(?:continue|keep|first)?\s*(?:read|check|inspect|look at|analyze)\s+(?:the\s+)?(?:remaining|more|relevant|key)?\s*(?:files?|content|context|implementation|code)\.?$/i.test(normalized)) return true;
   if (/等待(?:可见回复|模型|下一步动作|工具结果)|waiting for (?:the )?(?:model|next step|tool result)/i.test(normalized)) return true;
   return false;
@@ -174,25 +205,10 @@ function extractReasoningNoteFromText(
 }
 
 function isReasoningSourceBlock(block: any, includeThoughts: boolean): boolean {
-  if (!includeThoughts) return false;
   if (!block) return false;
-  if (block.type === "thought") return true;
-  if (block.type === "agent") return String(block.content || "").trim().length > 0;
+  if (block.type === "thought") return includeThoughts;
+  if (block.type === "agent") return block.hiddenProcess === true && String(block.content || "").trim().length > 0;
   return false;
-}
-
-function getLatestReasoningNote(
-  blocks: any[],
-  language: ToolPresentationLanguage,
-  includeThoughts: boolean,
-): string {
-  for (let index = blocks.length - 1; index >= 0; index -= 1) {
-    const block = blocks[index];
-    if (!isReasoningSourceBlock(block, includeThoughts)) continue;
-    const note = extractReasoningNoteFromText(String(block.content || ""), language);
-    if (note) return note;
-  }
-  return "";
 }
 
 function findNearestReasoningNote(input: {
@@ -245,6 +261,10 @@ function makeTargetSummary(targets: string[], language: ToolPresentationLanguage
   return hiddenCount > 0 ? `${joined} +${hiddenCount}` : joined;
 }
 
+function countToolItems(step: Pick<TurnArchiveStep, "items">): number {
+  return step.items.filter(isToolBlock).length;
+}
+
 function defaultIntentForStep(kind: TurnArchiveStepKind, language: ToolPresentationLanguage): string {
   if (language === "en") {
     if (kind === "thinking") return "Summarize the current judgment before the next action.";
@@ -253,7 +273,7 @@ function defaultIntentForStep(kind: TurnArchiveStepKind, language: ToolPresentat
     if (kind === "verify") return "Verify that the changes behave as expected.";
     if (kind === "command") return "Run the command and inspect the result.";
     if (kind === "blocked") return "Keep the blocked step visible so it can be recovered.";
-    return "Keep this process message in the turn archive.";
+    return "Keep the model note that led into this step.";
   }
   if (kind === "thinking") return "整理当前判断，再进入下一步动作。";
   if (kind === "discover" || kind === "inspect") return "收集并确认相关上下文，再决定修改范围。";
@@ -261,7 +281,7 @@ function defaultIntentForStep(kind: TurnArchiveStepKind, language: ToolPresentat
   if (kind === "verify") return "验证改动是否达到预期。";
   if (kind === "command") return "运行命令并查看结果。";
   if (kind === "blocked") return "保留受阻步骤，方便恢复处理。";
-  return "保留过程消息，便于追溯。";
+  return "保留模型对下一步的说明，便于追溯。";
 }
 
 function defaultNarrativeForStep(
@@ -332,10 +352,10 @@ function defaultNarrativeForStep(
       };
     }
     return {
-      why: "Preserve process context for auditability.",
-      action: `Recorded process message for ${targets}.`,
-      result: resultLine || "Process message was kept in the archive.",
-      next: "Continue from the latest useful evidence.",
+      why: "Show the model's short rationale as its own transcript item.",
+      action: "Recorded the model note before the next operation.",
+      result: resultLine || "Model note was kept in the turn history.",
+      next: "Keep tool operations separate from this explanation.",
     };
   }
 
@@ -396,10 +416,10 @@ function defaultNarrativeForStep(
     };
   }
   return {
-    why: "保留过程上下文，方便审计和回看。",
-    action: `记录了 ${targets} 的过程消息。`,
-    result: resultLine || "过程消息已进入归档。",
-    next: "从最新有效证据继续。",
+    why: "把模型的简短判断作为独立历史项展示。",
+    action: "记录了下一步操作前的模型说明。",
+    result: resultLine || "模型说明已保留在本轮历史中。",
+    next: "工具操作会作为单独步骤继续展示。",
   };
 }
 
@@ -410,8 +430,18 @@ function makeNarrativeIntent(step: TurnArchiveStep, language: ToolPresentationLa
   }
 
   const targets = makeTargetSummary(step.targets, language);
+  const toolCount = countToolItems(step);
   const failed = step.status === "failed" || step.status === "rejected" || step.kind === "blocked";
   if (language === "en") {
+    if (step.kind === "edit" && toolCount > 1) {
+      return compactLine(`Apply one edit strategy across ${toolCount} file changes${targets ? `: ${targets}` : ""}.`, 220);
+    }
+    if ((step.kind === "discover" || step.kind === "inspect") && toolCount > 1) {
+      return compactLine(`Use one context-gathering pass across ${toolCount} operations${targets ? `: ${targets}` : ""}.`, 220);
+    }
+    if ((step.kind === "command" || step.kind === "verify") && toolCount > 1) {
+      return compactLine(`Run ${toolCount} related ${step.kind === "verify" ? "verification" : "command"} steps${targets ? `: ${targets}` : ""}.`, 220);
+    }
     if (step.kind === "discover") return compactLine(`Narrow the relevant scope${targets ? ` around ${targets}` : ""}.`, 180);
     if (step.kind === "inspect") return compactLine(`Check the necessary context${targets ? ` in ${targets}` : ""}.`, 180);
     if (step.kind === "edit") return compactLine(`Apply the focused change${targets ? ` in ${targets}` : ""}.`, 180);
@@ -419,6 +449,15 @@ function makeNarrativeIntent(step: TurnArchiveStep, language: ToolPresentationLa
     if (step.kind === "command") return compactLine(`Run the command${targets ? `: ${targets}` : ""}.`, 180);
     if (failed) return compactLine(`This step is blocked${targets ? ` at ${targets}` : ""}; keep the evidence available.`, 180);
     return compactLine(step.summary || step.action || step.why || "Keep this process step available.", 180);
+  }
+  if (step.kind === "edit" && toolCount > 1) {
+    return compactLine(`按同一修改策略完成 ${toolCount} 次文件修改${targets ? `：${targets}` : ""}。`, 220);
+  }
+  if ((step.kind === "discover" || step.kind === "inspect") && toolCount > 1) {
+    return compactLine(`按同一上下文策略完成 ${toolCount} 次读取/搜索${targets ? `：${targets}` : ""}。`, 220);
+  }
+  if ((step.kind === "command" || step.kind === "verify") && toolCount > 1) {
+    return compactLine(`连续执行 ${toolCount} 个相关${step.kind === "verify" ? "验证" : "命令"}步骤${targets ? `：${targets}` : ""}。`, 220);
   }
   if (step.kind === "discover") return compactLine(`收敛相关范围${targets ? `：${targets}` : ""}。`, 180);
   if (step.kind === "inspect") return compactLine(`核对必要上下文${targets ? `：${targets}` : ""}。`, 180);
@@ -465,20 +504,133 @@ function makeSummaryForStep(step: TurnArchiveStep, language: ToolPresentationLan
     return targetText || (language === "en" ? "Blocked step" : "步骤受阻");
   }
   if (step.kind === "message") {
-    const message = blocks.map((block) => firstMeaningfulLine(String(block.content || block.message || ""))).find(Boolean);
-    return message || (language === "en" ? "Process message" : "过程消息");
+    return language === "en" ? "Model note before the next operation" : "下一步操作前的模型说明";
   }
   return language === "en"
     ? `${toolCount} context operation${toolCount > 1 ? "s" : ""}${targetText ? `: ${targetText}${hiddenCount ? ` +${hiddenCount}` : ""}` : ""}`
     : `${toolCount} 次上下文操作${targetText ? `：${targetText}${hiddenCount ? ` +${hiddenCount}` : ""}` : ""}`;
 }
 
-function canMergeSteps(current: TurnArchiveStep | null, next: TurnArchiveStep): boolean {
+function canMergeSteps(current: TurnArchiveStep | null, next: TurnArchiveStep, mergeAdjacent: boolean): boolean {
+  if (!mergeAdjacent) return false;
   if (!current) return false;
   if (current.status !== next.status) return false;
   if (current.status === "failed" || current.status === "rejected") return false;
   if (isContextPhase(current.kind) && isContextPhase(next.kind)) return true;
   return current.kind === next.kind && current.kind !== "thinking" && current.kind !== "message" && current.kind !== "blocked";
+}
+
+function isToolStrategyStep(step: TurnArchiveStep): boolean {
+  return step.kind !== "thinking" && step.kind !== "message" && step.kind !== "blocked";
+}
+
+function canMergeStrategyStep(current: TurnArchiveStep | null, next: TurnArchiveStep, pendingNote: string): boolean {
+  if (!current) return false;
+  if (!isToolStrategyStep(current) || !isToolStrategyStep(next)) return false;
+  if (current.status !== next.status) return false;
+  if (current.status === "failed" || current.status === "rejected") return false;
+  const samePhase = (isContextPhase(current.kind) && isContextPhase(next.kind)) || current.kind === next.kind;
+  if (!samePhase) return false;
+  if (!pendingNote || !current.note || processNotesOverlap(current.note, pendingNote)) return true;
+  return false;
+}
+
+function mergeStrategySteps(steps: TurnArchiveStep[], language: ToolPresentationLanguage): TurnArchiveStep[] {
+  const result: TurnArchiveStep[] = [];
+  let current: TurnArchiveStep | null = null;
+  let pendingMessageItems: any[] = [];
+  let pendingNote = "";
+
+  const flushCurrent = () => {
+    if (!current) return;
+    current.targets = uniqueTargets(current.items, language);
+    result.push(current);
+    current = null;
+  };
+
+  const flushPendingMessage = () => {
+    if (!pendingNote && pendingMessageItems.length === 0) return;
+    const first = pendingMessageItems[0];
+    result.push({
+      id: `turn-archive-step-message-${first?.id ?? result.length}`,
+      kind: "message",
+      status: "done",
+      intent: defaultIntentForStep("message", language),
+      why: "",
+      action: "",
+      result: "",
+      next: "",
+      note: pendingNote,
+      summary: "",
+      targets: [],
+      items: pendingMessageItems,
+      expandedByDefault: false,
+      sourceIndex: steps.length > 0 ? Math.min(...pendingMessageItems.map((item) => Number(item?.sourceIndex ?? 0))) : 0,
+      sourceEndIndex: steps.length > 0 ? Math.max(...pendingMessageItems.map((item) => Number(item?.sourceIndex ?? 0))) : 0,
+    });
+    pendingMessageItems = [];
+    pendingNote = "";
+  };
+
+  for (const step of steps) {
+    if (step.kind === "thinking") {
+      flushCurrent();
+      flushPendingMessage();
+      result.push(step);
+      continue;
+    }
+
+    if (step.kind === "message") {
+      const note = String(step.note || "").trim();
+      if (!note || isLowValueProcessNote(note)) {
+        pendingMessageItems.push(...step.items);
+        continue;
+      }
+      if (current && current.note && !processNotesOverlap(current.note, note)) {
+        flushCurrent();
+      }
+      pendingMessageItems.push(...step.items);
+      if (!pendingNote || !processNotesOverlap(pendingNote, note)) {
+        pendingNote = pendingNote ? `${pendingNote} ${note}` : note;
+        pendingNote = compactLine(pendingNote, 360);
+      }
+      continue;
+    }
+
+    if (!isToolStrategyStep(step)) {
+      flushCurrent();
+      flushPendingMessage();
+      result.push(step);
+      continue;
+    }
+
+    if (!canMergeStrategyStep(current, step, pendingNote)) {
+      flushCurrent();
+    }
+
+    if (!current) {
+      current = {
+        ...step,
+        id: `turn-archive-step-${step.kind}-${step.id}`,
+        note: pendingNote || step.note,
+        items: [...pendingMessageItems, ...step.items],
+        sourceIndex: pendingMessageItems.length > 0 ? Math.min(step.sourceIndex, ...pendingMessageItems.map((item) => Number(item?.sourceIndex ?? step.sourceIndex))) : step.sourceIndex,
+        sourceEndIndex: step.sourceEndIndex,
+      };
+    } else {
+      current.items.push(...pendingMessageItems, ...step.items);
+      current.targets = uniqueTargets(current.items, language);
+      current.expandedByDefault = current.expandedByDefault || step.expandedByDefault;
+      current.sourceEndIndex = step.sourceEndIndex;
+      if (!current.note && pendingNote) current.note = pendingNote;
+    }
+    pendingMessageItems = [];
+    pendingNote = "";
+  }
+
+  flushCurrent();
+  flushPendingMessage();
+  return result;
 }
 
 function makeStep(input: {
@@ -533,6 +685,7 @@ function makeStep(input: {
   const note = block.type === "agent"
     ? extractReasoningNoteFromText(String(block.content || block.message || ""), language)
     : "";
+  const sourceItem = block && typeof block === "object" ? { ...block, sourceIndex: index } : block;
   return {
     id: `turn-archive-step-message-${block.id ?? index}`,
     kind: "message",
@@ -545,7 +698,7 @@ function makeStep(input: {
     note,
     summary: "",
     targets: [],
-    items: [block],
+    items: [sourceItem],
     expandedByDefault: false,
     sourceIndex: index,
     sourceEndIndex: index,
@@ -566,13 +719,15 @@ function finalizeStep(
   const summary = makeSummaryForStep({ ...step, targets }, language);
   const narrative = defaultNarrativeForStep({ ...step, targets, summary }, language);
   const hasPersistedIntent = step.items.length === 1 && String(step.items[0]?.intentSummary || "").trim().length > 0;
-  const note = step.note || findNearestReasoningNote({
-    sourceBlocks,
-    beforeIndex: step.sourceIndex,
-    kind: step.kind,
-    language,
-    includeThoughts: includeThoughtNotes,
-  });
+  const note = step.note || (step.kind === "message" || step.kind === "thinking"
+    ? findNearestReasoningNote({
+        sourceBlocks,
+        beforeIndex: step.sourceIndex,
+        kind: step.kind,
+        language,
+        includeThoughts: includeThoughtNotes,
+      })
+    : "");
   const intent = hasPersistedIntent ? fallbackIntent : makeNarrativeIntent({ ...step, targets, ...narrative, note, summary }, language);
   return {
     ...step,
@@ -644,10 +799,30 @@ function buildModelFromSteps(input: {
   steps: TurnArchiveStep[];
   language: ToolPresentationLanguage;
   includeThoughtNotes?: boolean;
+  mergeAdjacent?: boolean;
 }): TurnProcessArchiveModel {
   const includeThoughtNotes = input.includeThoughtNotes !== false;
+  const mergeAdjacent = input.mergeAdjacent !== false;
   const sourceBlocks = input.sourceBlocks || input.blocks;
-  const finalizedSteps = input.steps.map((step) => finalizeStep(step, input.language, sourceBlocks, includeThoughtNotes));
+  const strategySteps = mergeStrategySteps(input.steps, input.language);
+  const normalizedSteps: TurnArchiveStep[] = [];
+  for (const next of strategySteps) {
+    const current = normalizedSteps[normalizedSteps.length - 1] || null;
+    if (canMergeSteps(current, next, mergeAdjacent)) {
+      current!.items.push(...next.items);
+      current!.targets = uniqueTargets(current!.items, input.language);
+      current!.expandedByDefault = current!.expandedByDefault || next.expandedByDefault;
+      current!.sourceEndIndex = next.sourceEndIndex;
+      if (isContextPhase(current!.kind) && isContextPhase(next.kind)) {
+        current!.intent = defaultIntentForStep(current!.kind, input.language);
+      }
+      continue;
+    }
+    normalizedSteps.push(next);
+  }
+  const finalizedSteps = normalizedSteps
+    .map((step) => finalizeStep(step, input.language, sourceBlocks, includeThoughtNotes))
+    .filter((step) => step.kind !== "message" || String(step.note || "").trim().length > 0);
   const counts = makeCounts(finalizedSteps);
   const previewTargets: string[] = [];
   for (const step of finalizedSteps) {
@@ -665,7 +840,7 @@ function buildModelFromSteps(input: {
     totalCount: input.blocks.length,
     stepCount: finalizedSteps.length,
     summaryText: makeSummaryText(finalizedSteps, counts, input.language),
-    currentJudgment: includeThoughtNotes ? getLatestReasoningNote(sourceBlocks, input.language, includeThoughtNotes) : "",
+    currentJudgment: "",
     previewTargets,
   };
 }
@@ -694,17 +869,6 @@ export function buildTurnProcessArchiveModel(input: {
   const steps: TurnArchiveStep[] = [];
   archiveEntries.forEach(({ block, index }) => {
     const next = makeStep({ block, index, language });
-    const current = steps[steps.length - 1] || null;
-    if (canMergeSteps(current, next)) {
-      current!.items.push(...next.items);
-      current!.targets = uniqueTargets(current!.items, language);
-      current!.expandedByDefault = current!.expandedByDefault || next.expandedByDefault;
-      current!.sourceEndIndex = next.sourceEndIndex;
-      if (isContextPhase(current!.kind) && isContextPhase(next.kind)) {
-        current!.intent = defaultIntentForStep(current!.kind, language);
-      }
-      return;
-    }
     steps.push(next);
   });
 
@@ -726,34 +890,18 @@ export function buildLiveTurnProcessTimelineModel(input: {
   const includeThoughts = input.includeThoughts !== false;
   const liveBlocks: any[] = [];
   const steps: TurnArchiveStep[] = [];
-  let current: TurnArchiveStep | null = null;
-
   input.blocks.forEach((block, index) => {
     if (!block || block.type === "user") return;
     if (block.type === "thought") {
-      current = null;
       return;
     }
     if (!isLiveProcessCandidate(block)) {
-      current = null;
       return;
     }
 
     liveBlocks.push(block);
     const next = makeStep({ block, index, language });
-    if (canMergeSteps(current, next)) {
-      current!.items.push(...next.items);
-      current!.targets = uniqueTargets(current!.items, language);
-      current!.expandedByDefault = current!.expandedByDefault || next.expandedByDefault;
-      current!.sourceEndIndex = next.sourceEndIndex;
-      if (isContextPhase(current!.kind) && isContextPhase(next.kind)) {
-        current!.intent = defaultIntentForStep(current!.kind, language);
-      }
-      return;
-    }
-
     steps.push(next);
-    current = next;
   });
 
   return buildModelFromSteps({
@@ -762,5 +910,6 @@ export function buildLiveTurnProcessTimelineModel(input: {
     steps,
     language,
     includeThoughtNotes: includeThoughts,
+    mergeAdjacent: false,
   });
 }

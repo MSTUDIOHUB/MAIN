@@ -349,6 +349,7 @@ export interface ConversationTurn {
   intentSummary?: string;
   commandDirective?: CommandDirective | null;
   uiVisibility?: "visible" | "internal";
+  parentPlanTurnId?: string;
   mode: LegacyWorkflowMode;
   intent?: ResolvedRunIntent;
   status: ConversationTurnStatus;

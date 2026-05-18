@@ -134,7 +134,7 @@ test("diff summary stays folded by default and remains clickable after reload", 
   const editStep = page.locator('[data-testid="turn-archive-step"][data-kind="edit"]');
   const verifyStep = page.locator('[data-testid="turn-archive-step"][data-kind="verify"]');
   await expect(editStep).toContainText("实施修改");
-  await expect(editStep).toContainText("实施聚焦修改");
+  await expect(editStep).toContainText("按同一修改策略完成 3 次文件修改");
   await expect(editStep).not.toContainText("结果：");
   await expect(editStep).not.toContainText("下一步：继续验证");
   await expect(verifyStep).toContainText("运行验证");

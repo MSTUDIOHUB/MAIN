@@ -144,6 +144,20 @@ function bindBridgeSnapshot(scenario: string) {
     });
     const scopeKey = state.currentWorkspace || GLOBAL_CHAT_KEY;
     const sessions = state.sessionsByWorkspace[scopeKey] || [];
+    const currentTurn = state.currentTurnId
+      ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId) || null
+      : null;
+    const visibleConversationTurns = state.conversationTurns
+      .filter((turn) => turn.uiVisibility !== "internal")
+      .map((turn) => ({
+        id: turn.id,
+        title: turn.title,
+        status: turn.status,
+        intent: turn.intent,
+        parentPlanTurnId: turn.parentPlanTurnId || null,
+        uiVisibility: turn.uiVisibility || "visible",
+        blockCount: turn.blockIds.length,
+      }));
     return {
       workspace: state.currentWorkspace || "",
       currentSessionId: state.currentSessionId,
@@ -161,13 +175,13 @@ function bindBridgeSnapshot(scenario: string) {
       pendingReviewTaskId: state.pendingReviewTaskId,
       savedDocuments: bridge.savedDocuments || [],
       completed: Boolean(bridge.completed),
-      currentTurnStatus: state.currentTurnId
-        ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId)?.status ?? null
-        : null,
-      currentTurnIntent: state.currentTurnId
-        ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId)?.intent ?? null
-        : null,
+      currentTurnId: currentTurn?.id ?? null,
+      currentTurnTitle: currentTurn?.title ?? null,
+      currentTurnStatus: currentTurn?.status ?? null,
+      currentTurnIntent: currentTurn?.intent ?? null,
+      currentTurnParentPlanTurnId: currentTurn?.parentPlanTurnId ?? null,
       conversationTurns: state.conversationTurns.length,
+      visibleConversationTurns,
       taskFlowUserCount: state.taskFlow.filter((block) => block.type === "user").length,
       agentTexts: agentBlocks.map((block) => block.content),
       toolNames: toolBlocks.map((block) => block.toolName),

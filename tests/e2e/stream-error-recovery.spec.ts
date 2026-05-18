@@ -15,7 +15,7 @@ test("stream error clears the lingering thinking notice", async ({ page }) => {
   const activityNotice = page.getByTestId("turn-activity-notice");
   await expect(activityNotice).toBeVisible();
 
-  const errorCard = page.getByRole("button", { name: "系统请求失败" });
+  const errorCard = page.getByRole("button", { name: /连接中断，回复可能不完整/ });
   await expect(errorCard).toBeVisible();
   await errorCard.click();
   await expect(page.getByText("模型服务在传输回复时中断或返回了无法解析的数据。")).toBeVisible();

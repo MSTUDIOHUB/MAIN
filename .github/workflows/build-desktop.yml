@@ -146,7 +146,42 @@ jobs:
               exit 1
             fi
 
-            tar -czf "${output_name}" -C "$(dirname "${app_path}")" "$(basename "${app_path}")"
+            COPYFILE_DISABLE=1 tar -czf "${output_name}" -C "$(dirname "${app_path}")" "$(basename "${app_path}")"
+            python3 - "${output_name}" "$(basename "${app_path}")" <<'PY'
+          import sys
+          import tarfile
+
+          archive_path = sys.argv[1]
+          app_name = sys.argv[2]
+
+          with tarfile.open(archive_path, "r:*") as archive:
+              names = archive.getnames()
+
+          def normalize(name):
+              return name.replace("\\", "/").removeprefix("./").rstrip("/")
+
+          def is_appledouble(name):
+              normalized = normalize(name)
+              return (
+                  normalized == "__MACOSX"
+                  or normalized.startswith("__MACOSX/")
+                  or any(part.startswith("._") for part in normalized.split("/"))
+              )
+
+          forbidden = [name for name in names if is_appledouble(name)]
+          if forbidden:
+              print(f"::error::macOS updater archive contains AppleDouble metadata: {archive_path}")
+              for name in forbidden[:20]:
+                  print(name)
+              raise SystemExit(1)
+
+          top_level = {normalize(name).split("/", 1)[0] for name in names if normalize(name)}
+          if top_level != {app_name}:
+              print(f"::error::macOS updater archive must contain only {app_name} at the top level: {archive_path}")
+              for name in sorted(top_level):
+                  print(name)
+              raise SystemExit(1)
+          PY
             rm -f "${output_name}.sig"
             npx tauri signer sign "${output_name}"
 

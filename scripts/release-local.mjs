@@ -187,6 +187,7 @@ function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
     cwd: options.cwd,
     encoding: "utf8",
+    env: options.env,
     stdio: options.stdio || "inherit",
   });
 
@@ -390,7 +391,74 @@ function zipMacApp({ rootDir, appPath, outputPath }) {
 }
 
 function createTarGz({ rootDir, appPath, outputPath }) {
-  run("tar", ["-czf", outputPath, "-C", path.dirname(appPath), path.basename(appPath)], { cwd: rootDir });
+  run("tar", ["-czf", outputPath, "-C", path.dirname(appPath), path.basename(appPath)], {
+    cwd: rootDir,
+    env: {
+      ...process.env,
+      COPYFILE_DISABLE: "1",
+    },
+  });
+  validateMacUpdaterArchive({ rootDir, archivePath: outputPath, appName: path.basename(appPath) });
+}
+
+function listTarEntries(rootDir, archivePath) {
+  const script = [
+    "import sys, tarfile",
+    "with tarfile.open(sys.argv[1], 'r:*') as archive:",
+    "    for name in archive.getnames():",
+    "        print(name)",
+  ].join("\n");
+
+  return runOutput("python3", ["-c", script, archivePath], { cwd: rootDir })
+    .stdout
+    .split("\n")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+function normalizeTarEntryName(entry) {
+  return String(entry || "")
+    .replace(/\\/g, "/")
+    .replace(/^\.\/+/, "")
+    .replace(/\/+$/, "");
+}
+
+function isAppleDoubleEntry(entry) {
+  const normalized = normalizeTarEntryName(entry);
+  if (!normalized) {
+    return false;
+  }
+
+  return (
+    normalized === "__MACOSX" ||
+    normalized.startsWith("__MACOSX/") ||
+    normalized.split("/").some((part) => part.startsWith("._"))
+  );
+}
+
+function validateMacUpdaterArchive({ rootDir, archivePath, appName }) {
+  const entries = listTarEntries(rootDir, archivePath);
+  const forbiddenEntries = entries.filter(isAppleDoubleEntry);
+
+  if (forbiddenEntries.length > 0) {
+    fail(
+      `macOS updater archive contains AppleDouble metadata: ${archivePath}`,
+      forbiddenEntries.slice(0, 20).join("\n"),
+    );
+  }
+
+  const topLevelEntries = new Set(
+    entries
+      .map((entry) => normalizeTarEntryName(entry).split("/")[0])
+      .filter(Boolean),
+  );
+
+  if (topLevelEntries.size !== 1 || !topLevelEntries.has(appName)) {
+    fail(
+      `macOS updater archive must contain only ${appName} at the top level: ${archivePath}`,
+      [...topLevelEntries].sort().join("\n"),
+    );
+  }
 }
 
 async function signUpdaterArtifact(rootDir, artifactPath) {

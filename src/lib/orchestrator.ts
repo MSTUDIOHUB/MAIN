@@ -554,7 +554,7 @@ export interface OrchestratorCallbacks {
   onStreamToken: (token: string, messageId: string) => void;
   onStreamDone: (fullText: string, messageId: string, truncated: boolean) => void;
   onThought: (thought: string) => void;
-  onAssistantFinalText: (text: string, replyOptions?: ReplyOption[], meta?: { hasToolCalls?: boolean }) => void;
+  onAssistantFinalText: (text: string, replyOptions?: ReplyOption[], meta?: { hasToolCalls?: boolean; hiddenThought?: string }) => void;
   onStatusChange: (status: "idle" | "running" | "pending_review" | "error") => void;
   onError: (error: string) => void;
   onNonActionableStop: (message: string, reason: "no_output" | "no_action" | "missing_tool_loop" | "incomplete_plan") => void;
@@ -562,6 +562,7 @@ export interface OrchestratorCallbacks {
   onPlanStageChanged: (stage: "idle" | "requirements" | "design" | "tasks" | "bugfix" | "ready_to_execute" | "executing" | "completed") => void;
   onPlanTasksUpdated: (content: string) => void;
   onPlanExecutionProgress?: (progress: PlanExecutionProgressUpdate) => void;
+  onApprovedPlanHandoff?: (prompt: string) => void;
   onPlanMaxIterationsCheckpoint?: (checkpoint: PlanMaxIterationsCheckpoint) => boolean | Promise<boolean>;
   onExecuteMaxIterationsCheckpoint?: (checkpoint: PlanMaxIterationsCheckpoint) => boolean | Promise<boolean>;
   onTurnSummaryReady: (summary: string) => void;
@@ -4189,9 +4190,15 @@ export async function executeAgentLoop(
     }
 
     callbacks.onPlanStageChanged("executing");
+    const continuationPrompt = buildApprovedPlanContinuationPrompt(callbacks);
+    if (callbacks.onApprovedPlanHandoff) {
+      callbacks.onApprovedPlanHandoff(continuationPrompt);
+      callbacks.onStatusChange("idle");
+      return "stopped";
+    }
     callbacks.appendMessage({
       role: "user",
-      content: buildApprovedPlanContinuationPrompt(callbacks),
+      content: continuationPrompt,
     });
     return "approved_continue";
   }
@@ -4352,17 +4359,31 @@ export async function executeAgentLoop(
         workflowMode,
         isPlanApproved: callbacks.getIsPlanApproved(),
       });
+      const forcedContextToolBudget = contextForce.shouldForce
+        ? callbacks.getIsPlanApproved()
+          ? 1200
+          : 1600
+        : null;
+      const forcedContextAssistantBudget = contextForce.shouldForce
+        ? callbacks.getIsPlanApproved()
+          ? 900
+          : 1000
+        : null;
       const managedResult = manageContext(
         callbacks.getMessages(),
         effectiveContextLimit,
         cloudResponsesCompact ? Math.min(outputBudget, 2048) : outputBudget,
         cloudResponsesCompact
           ? 700
+          : forcedContextToolBudget
+          ? forcedContextToolBudget
           : callbacks.getIsPlanApproved()
           ? 2200
           : Math.max(4000, Math.floor(inputBudget * 0.32)),
         cloudResponsesCompact
           ? 500
+          : forcedContextAssistantBudget
+          ? forcedContextAssistantBudget
           : callbacks.getIsPlanApproved()
           ? 1400
           : Math.max(2000, Math.floor(inputBudget * 0.18)),
@@ -5519,6 +5540,7 @@ export async function executeAgentLoop(
     if (!shouldSuppressApprovedPlanNoToolText && (visibleAssistantText || finalReplyOptions.length > 0)) {
       callbacks.onAssistantFinalText(visibleAssistantText, finalReplyOptions, {
         hasToolCalls: effectiveToolCalls.length > 0,
+        hiddenThought: normalized.hiddenThought,
       });
     }
 
@@ -5752,9 +5774,15 @@ export async function executeAgentLoop(
           }
           // Approved — 保留计划文件给右侧 Plan 面板继续展示，由用户在文件树或计划面板中手动删除。
           callbacks.onPlanStageChanged("executing");
+          const continuationPrompt = buildApprovedPlanContinuationPrompt(callbacks);
+          if (callbacks.onApprovedPlanHandoff) {
+            callbacks.onApprovedPlanHandoff(continuationPrompt);
+            callbacks.onStatusChange("idle");
+            return;
+          }
           const continuationMsg: AgentMessage = {
             role: "user",
-            content: buildApprovedPlanContinuationPrompt(callbacks),
+            content: continuationPrompt,
           };
           callbacks.appendMessage(continuationMsg);
           continue;
@@ -5816,9 +5844,15 @@ export async function executeAgentLoop(
               return;
             }
             callbacks.onPlanStageChanged("executing");
+            const continuationPrompt = buildApprovedPlanContinuationPrompt(callbacks);
+            if (callbacks.onApprovedPlanHandoff) {
+              callbacks.onApprovedPlanHandoff(continuationPrompt);
+              callbacks.onStatusChange("idle");
+              return;
+            }
             callbacks.appendMessage({
               role: "user",
-              content: buildApprovedPlanContinuationPrompt(callbacks),
+              content: continuationPrompt,
             });
             continue;
           }

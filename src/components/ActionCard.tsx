@@ -2,8 +2,8 @@
 import React, { useState, useEffect, useMemo } from "react";
 import { IconSearch, IconFile, IconFolder, IconTerminal, IconCode, IconTool, IconCheck, IconChevronDown, IconChevronRight } from "./Icons";
 import { getDiffStats } from "../lib/diff";
-import { sanitizeAIOutput, stripAnsi } from "../lib/sanitize";
 import { compactToolPresentationTarget, getToolPresentationLabel } from "../lib/toolPresentation";
+import { buildToolResultPresentation } from "../lib/toolResultPresentation";
 import {
   classifyChatError,
   getChatFeedbackStatusCopy,
@@ -63,6 +63,51 @@ interface ActionCardProps {
   autoApproveTools?: boolean;
   onToggleAutoApprove?: (v: boolean) => void;
   autoCollapse?: boolean;
+}
+
+function TerminalResultDetails({ presentation, language }) {
+  const sectionToneClass = (tone) => {
+    if (tone === "error") return "text-[#fda4af]";
+    if (tone === "muted") return "text-[#a1a1aa]";
+    return "text-[#d4d4d8]";
+  };
+
+  return (
+    <div className="space-y-2.5">
+      {presentation.command && (
+        <div className="flex min-w-0 items-start gap-2 rounded-md border border-[#27272a] bg-[#050505] px-3 py-2 font-mono text-[11px] leading-5 text-[#e4e4e7]">
+          <span className="shrink-0 select-none text-[#71717a]">$</span>
+          <span className="min-w-0 whitespace-pre-wrap break-words">{presentation.command}</span>
+        </div>
+      )}
+
+      {presentation.meta.length > 0 && (
+        <div className="flex flex-wrap gap-1.5">
+          {presentation.meta.map((item) => (
+            <span
+              key={item}
+              className="rounded-md border border-[#27272a] bg-[#111113] px-2 py-0.5 font-mono text-[10px] text-[#a1a1aa]"
+            >
+              {item}
+            </span>
+          ))}
+        </div>
+      )}
+
+      {presentation.sections.map((section, sectionIndex) => (
+        <div key={`${section.label}-${sectionIndex}`} className="min-w-0">
+          {section.label && (
+            <div className="mb-1 text-[10px] font-semibold text-[#71717a]">
+              {section.label}
+            </div>
+          )}
+          <pre className={`max-h-[220px] overflow-y-auto whitespace-pre-wrap break-words rounded-md border border-[#27272a] bg-[#000000] p-3 font-mono text-[11px] leading-5 shadow-inner ${sectionToneClass(section.tone)}`}>
+            {section.text || (language === "zh" ? "无输出" : "No output")}
+          </pre>
+        </div>
+      ))}
+    </div>
+  );
 }
 
 export default function ActionCard({ blockId, toolName, target, toolStatus, message, diff, shellPermissionDecision, onAllow, onAllowForSession, onReject, autoApproveTools, onToggleAutoApprove, autoCollapse }: ActionCardProps) {
@@ -333,17 +378,21 @@ export default function ActionCard({ blockId, toolName, target, toolStatus, mess
 
         {/* Expandable message area — pending cards may include permission preflight details. */}
         {message && (() => {
-          const isTerminal = toolName === 'execute_command' || toolName === 'send_pty_input' || toolName === 'run_command' || toolName === 'read_pty_buffer' || toolName === 'read_pty_tail' || toolName === 'read_pty_since' || toolName === 'get_pty_status' || toolName === 'clear_pty_buffer';
-          const cleanMessage = isSystemErrorCard || isTerminal ? stripAnsi(message) : sanitizeAIOutput(message);
+          const presentation = buildToolResultPresentation({
+            toolName: isSystemErrorCard ? "Error" : toolName,
+            message,
+            language: uiLanguage,
+          });
+          if (!presentation.text.trim() && presentation.sections.length === 0) return null;
           return (
             <div className="mt-3 pt-3 border-t border-[#27272a]">
-              <pre className={`whitespace-pre-wrap break-all max-h-[200px] overflow-y-auto ${
-                isTerminal
-                  ? 'bg-[#000000] border border-[#27272a] rounded-md p-3 font-mono text-[11px] text-[#d4d4d8]'
-                  : 'font-mono text-[11px] text-[#a1a1aa]'
-              }`}>
-                {cleanMessage}
-              </pre>
+              {presentation.kind === "terminal" ? (
+                <TerminalResultDetails presentation={presentation} language={uiLanguage} />
+              ) : (
+                <pre className="whitespace-pre-wrap break-words font-mono text-[11px] leading-5 text-[#a1a1aa]">
+                  {presentation.text}
+                </pre>
+              )}
             </div>
           );
         })()}

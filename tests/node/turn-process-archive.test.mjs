@@ -59,6 +59,7 @@ const {
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/toolPresentation.ts"));
 const {
   buildTurnProcessArchiveModel,
+  buildLiveTurnProcessTimelineModel,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/turnProcessArchive.ts"));
 
 test("tool intent helpers derive stable phases without model metadata", () => {
@@ -110,7 +111,7 @@ test("turn archive model groups latest thought, context, edits, verification, an
   );
   assert.equal(archive.steps[0].items[0].id, 3);
   assert.equal(archive.steps[1].items.length, 2);
-  assert.match(archive.steps[1].intent, /收敛相关范围/);
+  assert.match(archive.steps[1].intent, /同一上下文策略|收敛相关范围/);
   assert.doesNotMatch(archive.steps[1].intent, /结果|下一步/);
   assert.match(archive.steps[1].why, /定位/);
   assert.match(archive.steps[1].action, /搜索|扫描/);
@@ -146,4 +147,150 @@ test("persisted tool intent summaries win over deterministic fallback", () => {
 
   assert.equal(archive.steps.length, 1);
   assert.equal(archive.steps[0].intent, "用已有脚本检查归档 UI 状态。");
+});
+
+test("model notes become the strategy text for the following tool step", () => {
+  const note = "已经定位到 ChatArea 的归档入口；下一步读取组件实现，确认本轮步骤如何渲染。";
+  const archive = buildTurnProcessArchiveModel({
+    blocks: [
+      { id: 1, type: "user", content: "修复本轮步骤" },
+      { id: 2, type: "agent", content: note, hiddenProcess: true, streaming: false },
+      { id: 3, type: "tool", toolName: "read_file", target: "src/components/ChatArea.tsx", status: "done", toolStatus: "executed" },
+      { id: 4, type: "agent", content: "完成。", streaming: false },
+    ],
+    finalVisibleAgentIndex: 3,
+    language: "zh",
+  });
+
+  assert.equal(archive.steps.length, 1);
+  assert.equal(archive.steps[0].kind, "inspect");
+  assert.equal(archive.steps[0].intent, note);
+  assert.equal(archive.steps[0].items.length, 2);
+  assert.match(archive.steps[0].summary, /src\/components\/ChatArea\.tsx/);
+});
+
+test("live timeline groups repeated edits under one strategy until the next explicit note", () => {
+  const firstNote = "先按同一视觉方案更新设计文档、样式和入口文件。";
+  const secondNote = "修改完成后运行构建验证结果。";
+  const model = buildLiveTurnProcessTimelineModel({
+    language: "zh",
+    blocks: [
+      { id: 1, type: "agent", content: firstNote, hiddenProcess: true, streaming: false },
+      {
+        id: 2,
+        type: "tool",
+        toolName: "replace_in_file",
+        target: ".MAIN/plans/design.md",
+        status: "done",
+        toolStatus: "executed",
+        diff: { old: "a", new: "b", path: ".MAIN/plans/design.md" },
+      },
+      { id: 3, type: "agent", content: firstNote, hiddenProcess: true, streaming: false },
+      {
+        id: 4,
+        type: "tool",
+        toolName: "replace_in_file",
+        target: "src/styles/main.css",
+        status: "done",
+        toolStatus: "executed",
+        diff: { old: "a", new: "b", path: "src/styles/main.css" },
+      },
+      {
+        id: 5,
+        type: "tool",
+        toolName: "replace_in_file",
+        target: "index.html",
+        status: "done",
+        toolStatus: "executed",
+        diff: { old: "a", new: "b", path: "index.html" },
+      },
+      { id: 6, type: "agent", content: secondNote, hiddenProcess: true, streaming: false },
+      { id: 7, type: "tool", toolName: "execute_command", target: "npm run build", status: "done", toolStatus: "executed" },
+    ],
+  });
+
+  assert.equal(model.steps.length, 2);
+  assert.equal(model.steps[0].kind, "edit");
+  assert.equal(model.steps[0].intent, firstNote);
+  assert.match(model.steps[0].summary, /3 次文件修改/);
+  assert.deepEqual(model.steps[0].targets, [".MAIN/plans/design.md", "src/styles/main.css", "index.html"]);
+  assert.equal(model.steps[1].kind, "verify");
+  assert.equal(model.steps[1].intent, secondNote);
+});
+
+test("thin repeated edit narrations collapse into one synthesized strategy row", () => {
+  const model = buildLiveTurnProcessTimelineModel({
+    language: "zh",
+    blocks: [
+      { id: 1, type: "agent", content: "按方案修改目标文件。", hiddenProcess: true, streaming: false },
+      {
+        id: 2,
+        type: "tool",
+        toolName: "replace_in_file",
+        target: ".MAIN/plans/design.md",
+        status: "done",
+        toolStatus: "executed",
+        diff: { old: "a", new: "b", path: ".MAIN/plans/design.md" },
+      },
+      { id: 3, type: "agent", content: "按方案修改目标文件。", hiddenProcess: true, streaming: false },
+      {
+        id: 4,
+        type: "tool",
+        toolName: "replace_in_file",
+        target: "src/styles/main.css",
+        status: "done",
+        toolStatus: "executed",
+        diff: { old: "a", new: "b", path: "src/styles/main.css" },
+      },
+      { id: 5, type: "agent", content: "按方案修改目标文件。", hiddenProcess: true, streaming: false },
+      {
+        id: 6,
+        type: "tool",
+        toolName: "replace_in_file",
+        target: "index.html",
+        status: "done",
+        toolStatus: "executed",
+        diff: { old: "a", new: "b", path: "index.html" },
+      },
+    ],
+  });
+
+  assert.equal(model.steps.length, 1);
+  assert.equal(model.steps[0].kind, "edit");
+  assert.match(model.steps[0].intent, /按同一修改策略完成 3 次文件修改/);
+  assert.doesNotMatch(model.steps[0].intent, /按方案修改目标文件/);
+  assert.deepEqual(model.steps[0].targets, [".MAIN/plans/design.md", "src/styles/main.css", "index.html"]);
+});
+
+test("path-specific notes compare by strategy so same-purpose edits stay grouped", () => {
+  const model = buildLiveTurnProcessTimelineModel({
+    language: "zh",
+    blocks: [
+      { id: 1, type: "agent", content: "我会修改 `src/main.js` 的排版入口。", hiddenProcess: true, streaming: false },
+      {
+        id: 2,
+        type: "tool",
+        toolName: "replace_in_file",
+        target: "src/main.js",
+        status: "done",
+        toolStatus: "executed",
+        diff: { old: "a", new: "b", path: "src/main.js" },
+      },
+      { id: 3, type: "agent", content: "我会修改 `src/styles/main.css` 的排版入口。", hiddenProcess: true, streaming: false },
+      {
+        id: 4,
+        type: "tool",
+        toolName: "replace_in_file",
+        target: "src/styles/main.css",
+        status: "done",
+        toolStatus: "executed",
+        diff: { old: "a", new: "b", path: "src/styles/main.css" },
+      },
+    ],
+  });
+
+  assert.equal(model.steps.length, 1);
+  assert.equal(model.steps[0].kind, "edit");
+  assert.match(model.steps[0].summary, /2 次文件修改/);
+  assert.deepEqual(model.steps[0].targets, ["src/main.js", "src/styles/main.css"]);
 });

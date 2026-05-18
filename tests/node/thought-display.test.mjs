@@ -171,6 +171,25 @@ test("adaptive latest thought summary keeps a recent useful reasoning chain", ()
   assert.doesNotMatch(summary, /第一次指令/);
 });
 
+test("adaptive thought summary drops thin operation narrations", () => {
+  const display = deriveThoughtDisplay([
+    "按方案修改目标文件。",
+    "让我继续检查剩余关键文件。",
+    "已经确认重复的短说明会挤占本轮步骤，所以需要让阶段策略承载同一批编辑。",
+    "下一步保留 diff 证据，但主时间线只展示一个合并后的策略说明。",
+  ].join("\n"), {
+    language: "zh",
+    mode: "latest",
+    density: "adaptive",
+  });
+
+  const summary = display.summaryLines.join("\n");
+  assert.match(summary, /阶段策略/);
+  assert.match(summary, /diff 证据/);
+  assert.doesNotMatch(summary, /按方案修改目标文件/);
+  assert.doesNotMatch(summary, /继续检查剩余关键文件/);
+});
+
 test("thought summary removes dense punctuation noise and mode complaint loops", () => {
   const display = deriveThoughtDisplay([
     "当前 discuss 模式下 write_file 不可用，需要切换到执行模式。",

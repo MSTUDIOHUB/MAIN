@@ -378,7 +378,9 @@ function truncateSummaryLine(text: string, maxChars = 180): string {
 function isLowValueProcessSummaryLine(text: string): boolean {
   const normalized = String(text || "").replace(/\s+/g, " ").trim();
   if (normalized.length > 90) return false;
-  return /^(?:让我|我(?:会|将|要|需要|继续|正在)|接下来|现在)?\s*(?:继续|再|先)?\s*(?:读取|检查|查看|分析|梳理|确认)(?:剩余|更多|相关|关键|必要)?(?:的)?(?:文件|内容|上下文|实现|代码)?[。.!！]*$/i.test(normalized) ||
+  if (/^(?:我(?:会|将|要|需要)?\s*)?(?:继续|先|再)?\s*(?:按(?:照)?|根据)?(?:同一)?(?:方案|计划|策略)?\s*(?:修改|编辑|更新|调整|处理|应用|落地)(?:目标|相关|当前|这些|上述|对应|项目)?(?:文件|代码|样式|内容|改动)?[。.!！]*$/i.test(normalized)) return true;
+  if (/^(?:I(?:'ll| will| need to)?\s*)?(?:continue|first|next)?\s*(?:apply|make|perform|do|edit|update|change|modify)(?:\s+the)?(?:\s+planned|\s+target|\s+related|\s+current)?(?:\s+file|\s+files|\s+change|\s+changes|\s+edit|\s+edits)?\.?$/i.test(normalized)) return true;
+  return /^(?:让我|我(?:会|将|要|需要|继续|正在)|接下来|现在)?\s*(?:继续|再|先)?\s*(?:读取|检查|查看|分析|梳理|确认)(?:(?:剩余|更多|相关|关键|必要)\s*)*(?:的)?(?:文件|内容|上下文|实现|代码)?[。.!！]*$/i.test(normalized) ||
     /等待(?:可见回复|模型|下一步动作|工具结果)/i.test(normalized);
 }
 

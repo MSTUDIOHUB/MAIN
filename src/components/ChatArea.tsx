@@ -16,6 +16,7 @@ import { sanitizeAIOutput } from "../lib/sanitize";
 import {
   deriveThoughtDisplay,
   normalizeThinkingPolicy,
+  normalizeThoughtSummaryForCompare,
 } from "../lib/thoughtDisplay";
 import { deriveTurnProgressItems } from "../lib/turnProgress";
 import { useAppStore } from "../store/useAppStore";
@@ -1404,6 +1405,7 @@ function TurnProcessArchive({
 
 function getArchiveStepLabel(step: TurnArchiveStep, language: "zh" | "en") {
   if (language === "en") {
+    if (step.kind === "message") return "Model note";
     if (step.kind === "discover") return "Scope";
     if (step.kind === "inspect") return "Context";
     if (step.kind === "edit") return "Edit";
@@ -1412,13 +1414,37 @@ function getArchiveStepLabel(step: TurnArchiveStep, language: "zh" | "en") {
     if (step.kind === "blocked") return step.status === "rejected" ? "Rejected" : "Blocked";
     return "Process";
   }
+  if (step.kind === "message") return "模型说明";
   if (step.kind === "discover") return "定位范围";
   if (step.kind === "inspect") return "收集上下文";
   if (step.kind === "edit") return "实施修改";
   if (step.kind === "verify") return "运行验证";
   if (step.kind === "command") return "执行命令";
   if (step.kind === "blocked") return step.status === "rejected" ? "已拒绝" : "受阻";
-  return "过程消息";
+  return "过程记录";
+}
+
+function normalizeProcessTextForCompare(text: string): string {
+  return normalizeThoughtSummaryForCompare(text).replace(/\s+/g, "");
+}
+
+function processTextsOverlap(left: string, right: string): boolean {
+  const a = normalizeProcessTextForCompare(left);
+  const b = normalizeProcessTextForCompare(right);
+  if (!a || !b) return false;
+  if (a === b) return true;
+  if (a.length >= 12 && b.length >= 12 && (a.includes(b) || b.includes(a))) return true;
+  return false;
+}
+
+function liveTimelineContainsProcessText(model: ReturnType<typeof buildLiveTurnProcessTimelineModel> | null, text: string): boolean {
+  const value = String(text || "").trim();
+  if (!model || !value) return false;
+  return model.steps.some((step) => {
+    if (processTextsOverlap(step.intent, value)) return true;
+    if (processTextsOverlap(step.note, value)) return true;
+    return step.items.some((item: any) => item?.type === "agent" && item?.hiddenProcess && processTextsOverlap(String(item.content || ""), value));
+  });
 }
 
 function getArchiveStepStatusLabel(step: TurnArchiveStep, language: "zh" | "en") {
@@ -1558,7 +1584,6 @@ function LiveTurnProcessTimeline({
   if (!model || model.totalCount === 0) return null;
   const title = language === "zh" ? "本轮步骤" : "Turn steps";
   const summary = model.summaryText || (language === "zh" ? "操作已按步骤折叠。" : "Actions are folded by step.");
-  const currentJudgment = String(model.currentJudgment || "").trim();
   const toggleText = expanded
     ? language === "zh" ? "收起步骤" : "Collapse steps"
     : language === "zh" ? "展开步骤" : "Expand steps";
@@ -1594,18 +1619,6 @@ function LiveTurnProcessTimeline({
       </button>
       {expanded && (
         <div data-testid="live-turn-process-details" className="space-y-2 px-2 pt-2">
-          {currentJudgment && (
-            <div data-testid="live-turn-current-judgment" className="rounded-lg px-1 py-1 text-[12.5px] leading-5 text-[var(--surface-text)]">
-              <div className="mb-1 text-[10px] font-medium uppercase tracking-[0.12em] text-[var(--surface-text-muted)]">
-                {language === "zh" ? "当前判断" : "Current judgment"}
-              </div>
-              <MarkdownRenderer
-                content={currentJudgment}
-                baseFontSize={12.5}
-                sourceId="live-turn-current-judgment"
-              />
-            </div>
-          )}
           {model.steps.map((step) => (
             <TurnArchiveStepCard
               key={step.id}
@@ -1616,6 +1629,16 @@ function LiveTurnProcessTimeline({
               variant="live"
             />
           ))}
+          <button
+            type="button"
+            data-testid="live-turn-process-collapse-bottom"
+            aria-expanded={expanded}
+            onClick={() => setExpanded(false)}
+            className="flex w-full items-center justify-center gap-1.5 rounded-lg px-2 py-1.5 text-[10px] text-[var(--surface-text-muted)] transition-colors hover:bg-[color-mix(in_srgb,var(--accent)_6%,transparent)] hover:text-[var(--surface-text)]"
+          >
+            <IconChevronDown className="h-3.5 w-3.5" />
+            {language === "zh" ? "收起步骤" : "Collapse steps"}
+          </button>
         </div>
       )}
     </div>
@@ -2613,7 +2636,10 @@ export default function ChatArea({
     const latestThoughtBlock = getLatestThoughtBlock(blocks);
     const bottomThoughtSummary =
       !shouldSuppressThoughtBlocks && turn.status !== "error" && latestThoughtBlock?.isStreaming
-        ? getThoughtSummaryText(latestThoughtBlock)
+        ? (() => {
+            const summary = getThoughtSummaryText(latestThoughtBlock);
+            return liveTimelineContainsProcessText(liveProcessTimeline, summary) ? "" : summary;
+          })()
         : "";
     const isBottomThoughtStreaming = !!latestThoughtBlock?.isStreaming;
     const renderTurnBlockItem = (item) => {

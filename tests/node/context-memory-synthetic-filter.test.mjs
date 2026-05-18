@@ -53,7 +53,7 @@ function loadTranspiledModuleSync(sourcePath) {
   return module.exports;
 }
 
-const { buildContextMemoryState } = loadTranspiledModuleSync(
+const { buildContextMemoryState, formatContextMemoryPacket } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/contextMemory.ts"),
 );
 
@@ -125,4 +125,77 @@ test("polluted previous memory entries are cleaned before reuse", () => {
   assert.ok(decisions.includes("选择先跑回归测试再提交"));
   assert.equal(nextSteps.includes("Now immediately continue using tools"), false);
   assert.ok(nextSteps.includes("下一步：修复回调超时"));
+});
+
+test("context memory carryover does not ingest its own section headers", () => {
+  const previousPacket = [
+    "[System: ContextState",
+    "ContextMemoryState v1 id=ctx-test updatedAt=1",
+    "Latest user request: 继续修复 UI",
+    "Goals:",
+    "- 完成本轮步骤呈现 [m2]",
+    "Hard constraints:",
+    "- Constraints: [m1] [m1]",
+    "- 必须保留工具证据 [m3]",
+    "Decisions:",
+    "- Decisions: [m1] [m1] [m1]",
+    "- 选择 B 方案 [m4]",
+    "Verified evidence:",
+    "- read_file src/main.js; status=observed; 2719 chars; hash=abc; excerpt=[MAIN_TOOL_FEEDBACK_V1] {\"version\":1} [read_file, src/main.js, hash=abc, m7]",
+    "Relevant files:",
+    "- src/main.js via read_file; hash=abc; 2719 chars [read_file, src/main.js, hash=abc, m7]",
+    "Use this as compact historical state only; prioritize the latest messages and current workspace evidence.]",
+  ].join("\n");
+
+  const state = buildContextMemoryState([{ role: "user", content: previousPacket }], { now: 10 });
+  const decisions = state.decisions.map((item) => item.text).join("\n");
+  const constraints = state.constraints.map((item) => item.text).join("\n");
+  const packet = formatContextMemoryPacket(state);
+
+  assert.match(decisions, /选择 B 方案/);
+  assert.doesNotMatch(decisions, /^Decisions:/m);
+  assert.doesNotMatch(decisions, /\[m1\].*\[m1\]/);
+  assert.match(constraints, /必须保留工具证据/);
+  assert.doesNotMatch(constraints, /^Constraints:/m);
+  assert.doesNotMatch(packet, /Decisions:\s*\[m1\]/);
+  assert.doesNotMatch(packet, /Constraints:\s*\[m1\]/);
+});
+
+test("tool feedback envelopes produce compact evidence without raw JSON headers", () => {
+  const callA = {
+    id: "call_a",
+    function: {
+      name: "read_file",
+      arguments: JSON.stringify({ path: "src/main.js" }),
+    },
+  };
+  const callB = {
+    id: "call_b",
+    function: {
+      name: "read_file",
+      arguments: JSON.stringify({ path: "src/main.js" }),
+    },
+  };
+
+  const state = buildContextMemoryState([
+    { role: "assistant", content: "", tool_calls: [callA] },
+    {
+      role: "tool",
+      tool_call_id: "call_a",
+      content: '[MAIN_TOOL_FEEDBACK_V1]{"version":1,"status":"completed","tool_call_id":"call_a","tool":"read_file","target":"src/main.js","summary":"READ src/main.js: 120 lines"}\nconsole.log("one");',
+    },
+    { role: "assistant", content: "", tool_calls: [callB] },
+    {
+      role: "tool",
+      tool_call_id: "call_b",
+      content: '[MAIN_TOOL_FEEDBACK_V1]{"version":1,"status":"completed","tool_call_id":"call_b","tool":"read_file","target":"src/main.js","summary":"READ src/main.js: updated window"}\nconsole.log("two");',
+    },
+  ], { now: 20 });
+
+  assert.equal(state.files.filter((item) => item.path === "src/main.js").length, 1);
+  assert.equal(state.evidence.filter((item) => item.source.toolName === "read_file" && item.source.path === "src/main.js").length, 1);
+  const evidence = state.evidence.map((item) => item.text).join("\n");
+  assert.match(evidence, /summary=READ src\/main\.js: updated window/);
+  assert.doesNotMatch(evidence, /MAIN_TOOL_FEEDBACK_V1/);
+  assert.doesNotMatch(evidence, /"version"/);
 });

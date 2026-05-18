@@ -20,8 +20,8 @@ test("thinking policy is the only thought visibility control and persists", asyn
 
   await expect(page.getByTestId("thought-block")).toHaveCount(0);
   await expect(page.locator('[data-testid="turn-archive-step"][data-kind="inspect"]')).toContainText("收集上下文");
-  await expect(page.locator('[data-testid="turn-archive-step"][data-kind="inspect"]')).toContainText("SettingsModal");
-  await expect(page.locator('[data-testid="turn-archive-step"][data-kind="inspect"]')).toContainText("避免原始长文本刷屏");
+  await expect(page.locator('[data-testid="turn-archive-step"][data-kind="inspect"]')).toContainText("ChatArea.tsx");
+  await expect(page.locator('[data-testid="turn-archive-step"][data-kind="inspect"]')).not.toContainText("避免原始长文本刷屏");
 
   await page.getByTestId("model-settings-button").click();
   await page.getByTestId("settings-tab-general").click();

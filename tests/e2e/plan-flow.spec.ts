@@ -102,6 +102,10 @@ test("plan flow supports save then approve and finish", async ({ page }) => {
       planStage: "design",
     });
 
+  const userCountBeforeApproval = await page.evaluate(
+    () => (window as any).__CODELY_E2E__?.getSnapshot?.().taskFlowUserCount ?? 0,
+  );
+
   await expect(page.getByTestId("top-island-plan-approve")).toBeVisible();
   await page.getByTestId("top-island-plan-approve").click();
 
@@ -114,13 +118,44 @@ test("plan flow supports save then approve and finish", async ({ page }) => {
         if (!event) return null;
         return {
           stage: event.stage,
-          statuses: event.statuses,
+          firstStatuses: event.statuses.slice(0, 3),
+          preservedRuntimeTasks: event.statuses.length >= 3,
         };
       }),
     )
     .toEqual({
       stage: "executing",
-      statuses: ["completed", "in_progress", "pending"],
+      firstStatuses: ["completed", "in_progress", "pending"],
+      preservedRuntimeTasks: true,
+    });
+
+  await expect
+    .poll(async () =>
+      page.evaluate(() => {
+        const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+        const visibleTurns = snapshot?.visibleConversationTurns || [];
+        const planTurn = visibleTurns.find((turn: { id?: string }) => turn.id === "e2e-plan-flow-turn");
+        const executionTurn = visibleTurns.find(
+          (turn: { parentPlanTurnId?: string | null }) =>
+            turn.parentPlanTurnId === "e2e-plan-flow-turn",
+        );
+        return {
+          taskFlowUserCount: snapshot?.taskFlowUserCount,
+          visibleTurnCount: visibleTurns.length,
+          planTurnStatus: planTurn?.status || null,
+          executionTurnTitle: executionTurn?.title || null,
+          executionTurnParent: executionTurn?.parentPlanTurnId || null,
+          currentTurnParent: snapshot?.currentTurnParentPlanTurnId || null,
+        };
+      }),
+    )
+    .toEqual({
+      taskFlowUserCount: userCountBeforeApproval,
+      visibleTurnCount: 2,
+      planTurnStatus: "done",
+      executionTurnTitle: "执行已批准计划",
+      executionTurnParent: "e2e-plan-flow-turn",
+      currentTurnParent: "e2e-plan-flow-turn",
     });
 
   await expect(page.getByTestId("plan-stage-badge")).toContainText("已完成");

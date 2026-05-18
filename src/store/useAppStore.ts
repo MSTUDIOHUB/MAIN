@@ -1282,6 +1282,9 @@ interface AppState {
       turnTitle?: string;
       intentSummary?: string;
       uiParentTurnId?: string;
+      parentPlanTurnId?: string;
+      turnIdOverride?: string;
+      createVisibleTurnForHiddenMessage?: boolean;
       contextMentionsSnapshot?: string[];
       attachedFilesSnapshot?: Array<AttachedFile | string>;
       remoteFeishu?: FeishuRemoteContext;
@@ -2234,6 +2237,24 @@ function compactThoughtContentForPersist(text: string): string {
   }).summaryText;
   if (summarized) return summarized;
   return compacted.length > 2400 ? compacted.slice(0, 2400).trimEnd() : compacted;
+}
+
+function compactProcessAssistantText(text: string, language: "zh" | "en"): string {
+  const display = deriveThoughtDisplay(String(text || ""), {
+    language,
+    mode: "latest",
+    density: "adaptive",
+    maxSummaryLines: 6,
+  });
+  return display.summaryText || compactThoughtContentForPersist(String(text || ""));
+}
+
+function pickProcessAssistantText(visibleText: string, hiddenThought: string | undefined, language: "zh" | "en"): string {
+  const visible = String(visibleText || "").trim();
+  const hidden = String(hiddenThought || "").trim();
+  const hiddenSummary = hidden ? compactProcessAssistantText(hidden, language) : "";
+  if (hiddenSummary) return hiddenSummary;
+  return compactProcessAssistantText(visible, language);
 }
 
 function appendThoughtDelta(existing: string, incoming: string): string {
@@ -5066,9 +5087,12 @@ export const useAppStore = create<AppState>()(
       const derivedRuntimeTasks = state.planTasks.length === 0 && !hasPersistedTasksArtifact && executionPlanTasks.length > 0;
       const approvalChoicePatch = { planApprovalChoice: normalizedApprovalChoice || null };
       const approvedTurnId = state.currentTurnId;
-      const initialProgressSnapshot = approvedTurnId
-        ? normalizePlanExecutionProgressSnapshot({
-            turnId: approvedTurnId,
+      const approvedHandoffSummary = language === "zh"
+        ? "计划已批准，执行已交接到新的回合。"
+        : "Plan approved; execution was handed off to a new turn.";
+      const executionTurnId = `turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const initialProgressSnapshot = normalizePlanExecutionProgressSnapshot({
+            turnId: executionTurnId,
             update: buildPlanExecutionProgressUpdate({
               language,
               phase: "starting",
@@ -5080,16 +5104,15 @@ export const useAppStore = create<AppState>()(
               recentToolActivity: [],
             }),
             now: Date.now(),
-          })
-        : null;
+          });
       const executionConsentPatch = {
         currentTurnExecutionConsent: {
-          turnId: approvedTurnId,
+          turnId: executionTurnId,
           granted: true,
         },
       };
 
-      if (state.agentStatus === "pending_review") {
+      if (state.agentStatus === "pending_review" && state.abortController) {
         set({
           isPlanApproved: true,
           ...approvalChoicePatch,
@@ -5109,7 +5132,7 @@ export const useAppStore = create<AppState>()(
         return;
       }
 
-      set({
+      set((s) => ({
         isPlanApproved: true,
         ...approvalChoicePatch,
         ...executionConsentPatch,
@@ -5119,7 +5142,18 @@ export const useAppStore = create<AppState>()(
         planExecutionProgressSnapshot: initialProgressSnapshot,
         ...(executionPlanTasks.length > 0 ? { planTasks: executionPlanTasks } : {}),
         planStage: "executing",
-      });
+        conversationTurns: approvedTurnId
+          ? s.conversationTurns.map((turn) =>
+              turn.id === approvedTurnId
+                ? {
+                    ...turn,
+                    status: "done" as const,
+                    summary: approvedHandoffSummary,
+                  }
+                : turn,
+            )
+          : s.conversationTurns,
+      }));
 
       runAfterNextPaint(() => {
         get().sendMessage(
@@ -5157,10 +5191,19 @@ export const useAppStore = create<AppState>()(
           undefined,
           {
             hidden: true,
-            reuseCurrentTurn: true,
+            createVisibleTurnForHiddenMessage: true,
+            reuseCurrentTurn: false,
+            turnIdOverride: executionTurnId,
+            parentPlanTurnId: approvedTurnId || undefined,
             preservePlanState: true,
             resolvedIntent: "plan",
             runtimeIntentOverride: "execute",
+            executionConsentGranted: true,
+            skipIntentResolution: true,
+            turnTitle: language === "zh" ? "执行已批准计划" : "Execute Approved Plan",
+            intentSummary: language === "zh"
+              ? "用户已批准计划，MAIN 将在新的执行回合中按 design.md 落地。"
+              : "The user approved the plan; MAIN will execute design.md in a new execution turn.",
           },
         );
       });
@@ -5459,6 +5502,9 @@ export const useAppStore = create<AppState>()(
     turnTitle?: string;
     intentSummary?: string;
     uiParentTurnId?: string;
+    parentPlanTurnId?: string;
+    turnIdOverride?: string;
+    createVisibleTurnForHiddenMessage?: boolean;
     contextMentionsSnapshot?: string[];
     attachedFilesSnapshot?: Array<AttachedFile | string>;
     remoteFeishu?: FeishuRemoteContext;
@@ -5473,6 +5519,11 @@ export const useAppStore = create<AppState>()(
       activeProfile: state.config.activeProfile,
     });
     const isHidden = options?.hidden === true;
+    const createVisibleTurnForHiddenMessage = isHidden && options?.createVisibleTurnForHiddenMessage === true;
+    const parentPlanTurnId =
+      options?.parentPlanTurnId && state.conversationTurns.some((turn) => turn.id === options.parentPlanTurnId)
+        ? options.parentPlanTurnId
+        : null;
     const requestedUiParentTurnId = options?.uiParentTurnId || null;
     const uiParentTurnId = requestedUiParentTurnId && state.conversationTurns.some((turn) => turn.id === requestedUiParentTurnId)
       ? requestedUiParentTurnId
@@ -5528,7 +5579,7 @@ export const useAppStore = create<AppState>()(
     const reuseCurrentTurn =
       (options?.reuseCurrentTurn === true || shouldAutoResumeChoiceTurn || shouldContinuePlanIntent || shouldContinuePreviousTurnIntent) &&
       !!reusableTurnId;
-    const isInternalTurn = isHidden && !reuseCurrentTurn;
+    const isInternalTurn = isHidden && !reuseCurrentTurn && !createVisibleTurnForHiddenMessage;
     const shouldReuseExistingTurnIntent =
       reuseCurrentTurn &&
       !!currentTurn &&
@@ -6539,7 +6590,9 @@ export const useAppStore = create<AppState>()(
     };
 
     const nextId = sessionGet()._nextTaskId;
-    const turnId = reuseCurrentTurn ? reusableTurnId! : `turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const turnId = reuseCurrentTurn
+      ? reusableTurnId!
+      : options?.turnIdOverride || `turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const uiDisplayTurnId = uiParentTurnId || turnId;
     const currentImages = images || [];
     const userContextItems = buildUserContextItems({
@@ -6583,6 +6636,21 @@ export const useAppStore = create<AppState>()(
         index === previousTurnIndex ? { ...turn, collapsed: true } : turn,
       );
     };
+    const markParentPlanTurnDoneForExecution = (turns: ConversationTurn[]): ConversationTurn[] => {
+      if (!parentPlanTurnId) return turns;
+      const summary = preferredLanguage === "en"
+        ? "Plan approved; execution was handed off to a new turn."
+        : "计划已批准，执行已交接到新的回合。";
+      return turns.map((turn) =>
+        turn.id === parentPlanTurnId
+          ? {
+              ...turn,
+              status: "done" as const,
+              summary,
+            }
+          : turn,
+      );
+    };
     const appendLocalStudioTurn = async (
       systemContent: string,
       options?: { systemVariant?: Extract<TaskBlock, { type: "system" }>["variant"] },
@@ -6621,13 +6689,14 @@ export const useAppStore = create<AppState>()(
                 : turn,
             )
           : [
-              ...autoCollapsePreviousTurnForNewTurn(s.conversationTurns),
+              ...markParentPlanTurnDoneForExecution(autoCollapsePreviousTurnForNewTurn(s.conversationTurns)),
               {
                 id: turnId,
                 userPrompt: text,
                 title: turnTitle,
                 intentSummary: effectiveIntentSummary,
                 commandDirective: effectiveCommandDirective || undefined,
+                ...(parentPlanTurnId ? { parentPlanTurnId } : {}),
                 mode: effectiveWorkflowMode,
                 intent: effectiveRunIntent,
                 status: "done",
@@ -6859,7 +6928,7 @@ export const useAppStore = create<AppState>()(
                       : turn
                   )
                 : [
-                    ...autoCollapsePreviousTurnForNewTurn(s.conversationTurns),
+                    ...markParentPlanTurnDoneForExecution(autoCollapsePreviousTurnForNewTurn(s.conversationTurns)),
                     {
                       id: turnId,
                       userPrompt: text,
@@ -6909,19 +6978,20 @@ export const useAppStore = create<AppState>()(
 		          }
 		        : {
 		            conversationTurns: [
-		              ...autoCollapsePreviousTurnForNewTurn(s.conversationTurns).map((turn) =>
+		              ...markParentPlanTurnDoneForExecution(autoCollapsePreviousTurnForNewTurn(s.conversationTurns).map((turn) =>
                     uiParentTurnId && turn.id === uiParentTurnId
                       ? { ...turn, status: initialTurnStatus, intent: turn.intent || effectiveRunIntent }
                       : turn,
-                  ),
+                  )),
 		              {
 		                id: turnId,
 		                userPrompt: text,
 		                title: turnTitle,
 	                intentSummary: effectiveIntentSummary,
-	                commandDirective: effectiveCommandDirective || undefined,
-	                uiVisibility: isInternalTurn ? "internal" : "visible",
-	                mode: effectiveWorkflowMode,
+                commandDirective: effectiveCommandDirective || undefined,
+                uiVisibility: isInternalTurn ? "internal" : "visible",
+                ...(parentPlanTurnId ? { parentPlanTurnId } : {}),
+                mode: effectiveWorkflowMode,
 	                intent: effectiveRunIntent,
 	                status: initialTurnStatus,
 	                summary: "",
@@ -7964,6 +8034,15 @@ export const useAppStore = create<AppState>()(
           ...overrides,
         });
       };
+      let approvedPlanHandoff:
+        | {
+            prompt: string;
+            parentPlanTurnId: string;
+            executionTurnId: string;
+            title: string;
+            intentSummary: string;
+          }
+        | null = null;
 
       const callbacks: OrchestratorCallbacks = {
         getMessages: () => sessionGet().agentMessages,
@@ -8002,6 +8081,58 @@ export const useAppStore = create<AppState>()(
         getPlanAutoResumeCount: () => sessionGet().planAutoResumeCount,
         getStatus: () => sessionGet().agentStatus,
         startNewTurn: () => sessionGet().startNewTurn(),
+        onApprovedPlanHandoff: (prompt) => {
+          const language = sessionGet().config.language === "en" ? "en" : "zh";
+          const executionTurnId = `turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+          approvedPlanHandoff = {
+            prompt,
+            parentPlanTurnId: turnId,
+            executionTurnId,
+            title: language === "zh" ? "执行已批准计划" : "Execute Approved Plan",
+            intentSummary: language === "zh"
+              ? "用户已批准计划，MAIN 将在新的执行回合中按 design.md 落地。"
+              : "The user approved the plan; MAIN will execute design.md in a new execution turn.",
+          };
+          const progressSnapshot = normalizePlanExecutionProgressSnapshot({
+            turnId: executionTurnId,
+            update: buildPlanExecutionProgressUpdate({
+              language,
+              phase: "starting",
+              iterationCount: 0,
+              maxIterations: PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS,
+              autoResumeCount: 0,
+              tasks: sessionGet().planTasks,
+              evidenceLedger: [],
+              recentToolActivity: [],
+              nextStep: language === "zh"
+                ? "开启新的执行回合并按已批准 design.md 执行"
+                : "start a new execution turn and follow the approved design.md",
+            }),
+            previous: sessionGet().planExecutionProgressSnapshot,
+            now: Date.now(),
+          });
+          sessionSet((s) => ({
+            currentTurnExecutionConsent: { turnId: executionTurnId, granted: true },
+            planExecutionProgressSnapshot: progressSnapshot,
+            conversationTurns: s.conversationTurns.map((turn) =>
+              turn.id === turnId
+                ? {
+                    ...turn,
+                    status: "done",
+                    summary: language === "zh"
+                      ? "计划已批准，执行已交接到新的回合。"
+                      : "Plan approved; execution was handed off to a new turn.",
+                  }
+                : turn,
+            ),
+          }));
+          logStoreEvent("plan_approval_handoff_queued", {
+            planTurnId: turnId,
+            executionTurnId,
+            sessionKey: runSessionKey,
+            workspace: runWorkspace || null,
+          });
+        },
         getContextMemoryState: () => {
           const latest = sessionGet();
           const laneKey = resolveRuntimeLaneKey(latest.config);
@@ -8289,20 +8420,25 @@ export const useAppStore = create<AppState>()(
         },
 
         onAssistantFinalText: (text, replyOptions = [], meta) => {
+          const language = sessionGet().config.language === "en" ? "en" : "zh";
           const fallbackText = replyOptions.length > 0
-            ? sessionGet().config.language === "en"
+            ? language === "en"
               ? "Choose how you'd like to continue."
               : "请选择你希望我如何继续。"
             : "";
           const cleanText = text.trim() || fallbackText;
           const isProcessAssistantText = !!meta?.hasToolCalls && replyOptions.length === 0;
+          const displayText = isProcessAssistantText
+            ? pickProcessAssistantText(cleanText, meta?.hiddenThought, language)
+            : cleanText;
+          const stateVisibleText = isProcessAssistantText ? "" : displayText;
           const currentFlow = sessionGet().taskFlow;
           const latestBlock = [...currentFlow].reverse().find((block) =>
             block.turnId === turnId &&
             block.type === "agent" &&
             agentBlockIdsCreatedThisRun.has(block.id)
           );
-          const cleanTextKey = normalizeAgentContentForDedupe(cleanText);
+          const displayTextKey = normalizeAgentContentForDedupe(displayText);
           logStoreEvent("assistant_final_text", {
             turnId,
             sessionKey: runSessionKey,
@@ -8315,7 +8451,7 @@ export const useAppStore = create<AppState>()(
             taskFlowBlocks: currentFlow.length,
           });
 
-          if (!cleanText) {
+          if (!displayText) {
             if (latestBlock && latestBlock.type === "agent" && latestBlock.turnId === turnId) {
               sessionSet((s) => ({
                 taskFlow: s.taskFlow.map((t) =>
@@ -8328,21 +8464,21 @@ export const useAppStore = create<AppState>()(
             return;
           }
 
-          if (latestBlock && replyOptions.length === 0 && cleanTextKey) {
+          if (latestBlock && replyOptions.length === 0 && displayTextKey) {
             const duplicatedEarlierBlock = [...currentFlow]
               .reverse()
               .find((block): block is Extract<TaskBlock, { type: "agent" }> =>
                 block.turnId === turnId &&
                 block.type === "agent" &&
                 block.id !== latestBlock.id &&
-                normalizeAgentContentForDedupe(block.content) === cleanTextKey
+                normalizeAgentContentForDedupe(block.content) === displayTextKey
               );
 
             if (duplicatedEarlierBlock) {
               sessionSet((s) => ({
                 normalizedStreamState: {
                   ...s.normalizedStreamState,
-                  visibleText: String(duplicatedEarlierBlock.content || ""),
+                  visibleText: stateVisibleText || String(duplicatedEarlierBlock.content || ""),
                   replyOptions,
                 },
                 taskFlow: s.taskFlow.filter((block) => block.id !== latestBlock.id),
@@ -8361,7 +8497,7 @@ export const useAppStore = create<AppState>()(
             sessionSet((s) => ({
               normalizedStreamState: {
                 ...s.normalizedStreamState,
-                visibleText: cleanText,
+                visibleText: stateVisibleText,
                 replyOptions,
               },
             }));
@@ -8369,7 +8505,7 @@ export const useAppStore = create<AppState>()(
               id: nextId(),
               turnId,
               type: "agent",
-              content: cleanText,
+              content: displayText,
               ...(replyOptions.length > 0 ? { options: replyOptions } : {}),
               ...(isProcessAssistantText ? { hiddenProcess: true } : {}),
               streaming: false,
@@ -8380,14 +8516,14 @@ export const useAppStore = create<AppState>()(
           sessionSet((s) => ({
             normalizedStreamState: {
               ...s.normalizedStreamState,
-              visibleText: cleanText,
+              visibleText: stateVisibleText,
               replyOptions,
             },
             taskFlow: s.taskFlow.map((t) =>
               t.id === latestBlock.id && t.type === "agent"
                 ? {
                     ...t,
-                    content: cleanText,
+                    content: displayText,
                     ...(replyOptions.length > 0 ? { options: replyOptions } : { options: undefined }),
                     ...(isProcessAssistantText ? { hiddenProcess: true } : { hiddenProcess: undefined }),
                     streaming: false,
@@ -9647,9 +9783,9 @@ export const useAppStore = create<AppState>()(
 
         // Save session messages (sanitized for serialization safety)
         const s = latestState;
-        if (runSessionId) {
-          const messages = sanitizeTaskBlocksForPersist(s.taskFlow);
-          s.updateSession(runScopeKey, runSessionId, {
+          if (runSessionId) {
+            const messages = sanitizeTaskBlocksForPersist(s.taskFlow);
+            s.updateSession(runScopeKey, runSessionId, {
             messages,
             storageStatus: s.config.sessionRecordingEnabled ? "ok" : "temporary",
             recordingDisabled: !s.config.sessionRecordingEnabled,
@@ -9683,10 +9819,66 @@ export const useAppStore = create<AppState>()(
               showFilePanel: s.showFilePanel,
               rightPanelTab: s.rightPanelTab,
               selectedDiffTaskId: s.selectedDiffTaskId,
-            }),
-          });
-        }
-      }).catch((err) => {
+              }),
+            });
+          }
+          const handoff = approvedPlanHandoff;
+          if (handoff) {
+            approvedPlanHandoff = null;
+            runAfterNextPaint(() => {
+              const latest = get();
+              const latestSessionKey = resolveSessionRuntimeKey(
+                resolveSessionWorkspaceKey(latest.currentWorkspace),
+                latest.currentSessionId,
+              );
+              if (latestSessionKey !== runSessionKey) {
+                logStoreEvent("plan_approval_handoff_skipped", {
+                  reason: "session_changed",
+                  planTurnId: handoff.parentPlanTurnId,
+                  executionTurnId: handoff.executionTurnId,
+                  expectedSessionKey: runSessionKey,
+                  latestSessionKey,
+                });
+                return;
+              }
+              if (latest.isGenerating || latest.agentStatus === "running" || latest.agentStatus === "pending_review") {
+                logStoreEvent("plan_approval_handoff_skipped", {
+                  reason: "agent_busy",
+                  planTurnId: handoff.parentPlanTurnId,
+                  executionTurnId: handoff.executionTurnId,
+                  agentStatus: latest.agentStatus,
+                });
+                return;
+              }
+              latest.updateConversationTurn(handoff.parentPlanTurnId, {
+                status: "done",
+                summary: latest.config.language === "en"
+                  ? "Plan approved; execution was handed off to a new turn."
+                  : "计划已批准，执行已交接到新的回合。",
+              });
+              logStoreEvent("plan_approval_handoff_starting_execution_turn", {
+                planTurnId: handoff.parentPlanTurnId,
+                executionTurnId: handoff.executionTurnId,
+                sessionKey: runSessionKey,
+                workspace: runWorkspace || null,
+              });
+              latest.sendMessage(handoff.prompt, undefined, {
+                hidden: true,
+                createVisibleTurnForHiddenMessage: true,
+                reuseCurrentTurn: false,
+                turnIdOverride: handoff.executionTurnId,
+                parentPlanTurnId: handoff.parentPlanTurnId,
+                preservePlanState: true,
+                resolvedIntent: "plan",
+                runtimeIntentOverride: "execute",
+                executionConsentGranted: true,
+                skipIntentResolution: true,
+                turnTitle: handoff.title,
+                intentSummary: handoff.intentSummary,
+              });
+            });
+          }
+        }).catch((err) => {
         closeCurrentHarnessRunMarker("error", "agent_loop_crashed");
         clearInterval(timerInterval);
         sessionSet({ pendingSlashCommand: null, elapsedTime: getElapsedSeconds() });

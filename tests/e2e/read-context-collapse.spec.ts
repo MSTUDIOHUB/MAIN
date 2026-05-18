@@ -18,7 +18,7 @@ test("completed read tools collapse into one expandable context group", async ({
 
   const contextSteps = page.locator('[data-testid="turn-archive-step"][data-kind="discover"], [data-testid="turn-archive-step"][data-kind="inspect"]');
   await expect(contextSteps).toHaveCount(2);
-  await expect(contextSteps.nth(0)).toContainText("收敛相关范围");
+  await expect(contextSteps.nth(0)).toContainText("按同一上下文策略完成 10 次读取/搜索");
   await expect(contextSteps.nth(0)).not.toContainText("下一步读取最小必要上下文");
   await expect(contextSteps.nth(0)).toContainText("10 次上下文操作");
   await expect(contextSteps.nth(1)).toContainText("1 次上下文操作");

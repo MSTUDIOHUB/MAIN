@@ -1,4 +1,5 @@
 import { looksLikeSyntheticContinuationText } from "./syntheticContinuation";
+import { parseToolFeedbackEnvelope } from "./toolFeedbackEnvelope";
 
 export type ContextMemoryRole = "system" | "user" | "assistant" | "tool";
 
@@ -104,17 +105,30 @@ function normalizeLine(value: unknown): string {
 
 function stripTrailingSourceTag(text: string): string {
   return String(text || "")
-    .replace(/\s+\[[^\]\n]{1,180}\]\s*$/g, "")
+    .replace(/(?:\s+\[[^\]\n]{1,180}\]\s*)+$/g, "")
     .trim();
+}
+
+function stripContextMemoryLabel(text: string): string {
+  return stripTrailingSourceTag(String(text || ""))
+    .replace(
+      /^(?:Goal|Goals|Hard constraints|Constraints|Decisions|Progress|Evidence|Verified evidence|Files|Relevant files|Recent failures|Blockers|Next|Next steps|Open questions)\s*:?\s*/i,
+      "",
+    )
+    .trim();
+}
+
+function isBareContextMemorySection(text: string): boolean {
+  const stripped = stripTrailingSourceTag(String(text || "")).trim();
+  return /^(?:Goal|Goals|Hard constraints|Constraints|Decisions|Progress|Evidence|Verified evidence|Files|Relevant files|Recent failures|Blockers|Next|Next steps|Open questions)\s*:?\s*$/i.test(stripped);
 }
 
 function isSyntheticDurableEntryText(text: string): boolean {
   const compacted = stripTrailingSourceTag(String(text || ""));
   if (!compacted) return false;
-  const stripped = compacted.replace(
-    /^(?:Goal|Goals|Hard constraints|Constraints|Decisions|Next steps|Open questions)\s*:?\s*/i,
-    "",
-  ).trim();
+  if (isBareContextMemorySection(compacted)) return true;
+  const stripped = stripContextMemoryLabel(compacted);
+  if (!stripped) return true;
   return looksLikeSyntheticContinuationText(stripped || compacted);
 }
 
@@ -266,12 +280,16 @@ function extractToolEvidence(
 ): { evidence?: ContextMemoryEntry; file?: ContextMemoryFileEntry; blocker?: ContextMemoryEntry; next?: ContextMemoryEntry } {
   if (message.role !== "tool") return {};
   const tool = message.tool_call_id ? lookup.get(message.tool_call_id) : undefined;
-  const toolName = tool?.name || "tool";
-  const args = tool?.args || {};
   const content = contextMemoryContentToText(message.content);
-  const hash = stableContextHash(content).slice(0, 8);
-  const path = readRecordString(args, ["path", "file", "target", "workspace", "cwd"]);
-  const command = readRecordString(args, ["command", "cmd", "query", "pattern"]);
+  const parsedFeedback = parseToolFeedbackEnvelope(content);
+  const feedback = parsedFeedback?.envelope;
+  const body = parsedFeedback ? parsedFeedback.body : content;
+  const toolName = feedback?.tool || tool?.name || "tool";
+  const args = tool?.args || {};
+  const contentForMemory = body || content;
+  const hash = stableContextHash(contentForMemory).slice(0, 8);
+  const path = readRecordString(args, ["path", "file", "target", "workspace", "cwd"]) || (feedback?.target && /^(?:\.{0,2}\/|[A-Za-z0-9_.-]+\/|[A-Za-z0-9_.-]+\.[A-Za-z0-9]+$)/.test(feedback.target) ? feedback.target : "");
+  const command = readRecordString(args, ["command", "cmd", "query", "pattern"]) || (!path ? feedback?.target || "" : "");
   const target = path || command;
   const baseSource = sourceFor(message, messageIndex, {
     toolName,
@@ -279,69 +297,128 @@ function extractToolEvidence(
     ...(path ? { path } : {}),
     hash,
   });
-  const firstLines = content
+  const firstLines = contentForMemory
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean)
     .slice(0, 3)
     .join(" | ");
-  const exitCode = content.match(/(?:exitCode|exit code|code)\D+(-?\d+)/i)?.[1];
-  const status = /error|failed|rejected|timeout/i.test(content)
+  const exitCode = contentForMemory.match(/(?:exitCode|exit code|code)\D+(-?\d+)/i)?.[1];
+  const feedbackStatus = feedback?.status || "";
+  const status = /failed|declined|blocked/i.test(feedbackStatus)
     ? "failed"
-    : /no-op|no file change|matched the current file/i.test(content)
+    : /no_effect_mutation|no_op|cached/i.test(feedbackStatus) || /no-op|no file change|matched the current file/i.test(contentForMemory)
       ? "no-op"
+      : /error|failed|rejected|timeout/i.test(contentForMemory)
+        ? "failed"
       : /write_file|replace_in_file|delete_workspace_path/i.test(toolName)
         ? "changed"
         : "observed";
+  const resultSummary = compactLine(feedback?.summary || "", 180);
   const evidenceText = [
     `${toolName}${target ? ` ${compactLine(target, 120)}` : ""}`,
     `status=${status}`,
     exitCode ? `exit=${exitCode}` : "",
-    `${content.length.toLocaleString()} chars`,
+    `${contentForMemory.length.toLocaleString()} chars`,
     `hash=${hash}`,
-    firstLines ? `excerpt=${compactLine(firstLines, 180)}` : "",
+    resultSummary ? `summary=${resultSummary}` : firstLines ? `excerpt=${compactLine(firstLines, 180)}` : "",
   ].filter(Boolean).join("; ");
 
   const result: { evidence?: ContextMemoryEntry; file?: ContextMemoryFileEntry; blocker?: ContextMemoryEntry; next?: ContextMemoryEntry } = {
     evidence: entry(evidenceText, baseSource, updatedAt) || undefined,
   };
   if (path && /read_file|get_file_outline|write_file|replace_in_file|delete_workspace_path/i.test(toolName)) {
-    const fileText = `${path} via ${toolName}; hash=${hash}; ${content.length.toLocaleString()} chars`;
+    const fileText = `${path} via ${toolName}; hash=${hash}; ${contentForMemory.length.toLocaleString()} chars`;
     const fileEntry = entry(fileText, baseSource, updatedAt);
     if (fileEntry) result.file = { ...fileEntry, path, hash };
   }
-  if (matchesBlocker(content)) {
-    result.blocker = entry(`${toolName}${target ? ` ${target}` : ""}: ${compactLine(firstLines || content, 180)}`, baseSource, updatedAt) || undefined;
+  if (matchesBlocker(contentForMemory) || status === "failed") {
+    result.blocker = entry(`${toolName}${target ? ` ${target}` : ""}: ${compactLine(resultSummary || firstLines || contentForMemory, 180)}`, baseSource, updatedAt) || undefined;
   }
-  const suggestedNext = content.match(/suggestedNextTask:\s*([^\n]+)/i)?.[1]?.trim();
+  const suggestedNext = contentForMemory.match(/suggestedNextTask:\s*([^\n]+)/i)?.[1]?.trim();
   if (suggestedNext) {
     result.next = entry(suggestedNext, baseSource, updatedAt) || undefined;
   }
   return result;
 }
 
+type CarryoverBucket =
+  | "goals"
+  | "constraints"
+  | "decisions"
+  | "progress"
+  | "evidence"
+  | "files"
+  | "blockers"
+  | "nextSteps"
+  | "openQuestions";
+
+function carryoverBucketForLabel(label: string): CarryoverBucket | "latestUserRequest" | null {
+  const normalized = label.replace(/\s+/g, " ").trim().toLowerCase();
+  if (normalized === "latest user request") return "latestUserRequest";
+  if (normalized === "goal" || normalized === "goals") return "goals";
+  if (normalized === "hard constraints" || normalized === "constraint" || normalized === "constraints") return "constraints";
+  if (normalized === "decision" || normalized === "decisions") return "decisions";
+  if (normalized === "progress") return "progress";
+  if (normalized === "evidence" || normalized === "verified evidence") return "evidence";
+  if (normalized === "file" || normalized === "files" || normalized === "relevant files") return "files";
+  if (normalized === "blocker" || normalized === "blockers" || normalized === "recent failures") return "blockers";
+  if (normalized === "next" || normalized === "next step" || normalized === "next steps") return "nextSteps";
+  if (normalized === "open question" || normalized === "open questions") return "openQuestions";
+  return null;
+}
+
+function parseCarryoverLine(rawLine: string, currentBucket: CarryoverBucket | null): {
+  bucket: CarryoverBucket | "latestUserRequest" | null;
+  text: string;
+  headerOnly: boolean;
+} {
+  const withoutBullet = String(rawLine || "").replace(/^\s*[-*]\s*/, "").trim();
+  const line = stripTrailingSourceTag(withoutBullet);
+  if (!line || /^(\[?System:|ContextState|ContextMemoryState|Use this as compact|Operational rule)/i.test(line)) {
+    return { bucket: currentBucket, text: "", headerOnly: true };
+  }
+  const labeled = line.match(/^(Latest user request|Goal|Goals|Hard constraints|Constraints|Decisions|Progress|Verified evidence|Evidence|Relevant files|Files|Recent failures|Blockers|Next steps|Next|Open questions)\s*:?\s*(.*)$/i);
+  if (labeled) {
+    const bucket = carryoverBucketForLabel(labeled[1] || "");
+    const text = stripTrailingSourceTag(labeled[2] || "").trim();
+    return { bucket, text, headerOnly: !text };
+  }
+  return { bucket: currentBucket, text: line, headerOnly: false };
+}
+
 function extractCarryoverFromContextText(text: string, messageIndex: number, updatedAt: number): Partial<ContextMemoryState> {
   const source: ContextMemorySource = { role: "user", messageIndex };
   const carried: Partial<ContextMemoryState> = {};
+  let currentBucket: CarryoverBucket | null = null;
   for (const rawLine of text.split(/\r?\n/)) {
-    const line = rawLine.replace(/^\s*[-*]\s*/, "").trim();
-    if (!line || /^(\[?System:|ContextState|ContextMemoryState|Use this as compact)/i.test(line)) continue;
+    const parsed = parseCarryoverLine(rawLine, currentBucket);
+    if (parsed.bucket && parsed.bucket !== "latestUserRequest") currentBucket = parsed.bucket;
+    if (parsed.headerOnly || !parsed.text) continue;
+    const line = parsed.text;
     const item = entry(line, source, updatedAt);
     if (!item) continue;
-    if (/^Goal:/i.test(line)) {
+    const bucket = parsed.bucket || "progress";
+    if (bucket === "latestUserRequest") {
+      if (!isSyntheticDurableEntryText(line)) carried.latestUserRequest = item;
+    }
+    else if (bucket === "goals") {
       if (!isSyntheticDurableEntryText(line)) carried.goals = [...(carried.goals || []), item];
     }
-    else if (/^Constraints?:/i.test(line)) {
+    else if (bucket === "constraints") {
       if (!isSyntheticDurableEntryText(line)) carried.constraints = [...(carried.constraints || []), item];
     }
-    else if (/^Decisions?:/i.test(line)) {
+    else if (bucket === "decisions") {
       if (!isSyntheticDurableEntryText(line)) carried.decisions = [...(carried.decisions || []), item];
     }
-    else if (/^Evidence:/i.test(line)) carried.evidence = [...(carried.evidence || []), item];
-    else if (/^Files?:/i.test(line)) carried.files = [...(carried.files || []), { ...item, path: line }];
-    else if (/^Recent failures|^Blockers?:/i.test(line)) carried.blockers = [...(carried.blockers || []), item];
-    else if (/^Next:/i.test(line)) {
+    else if (bucket === "evidence") carried.evidence = [...(carried.evidence || []), item];
+    else if (bucket === "files") carried.files = [...(carried.files || []), { ...item, path: line }];
+    else if (bucket === "blockers") carried.blockers = [...(carried.blockers || []), item];
+    else if (bucket === "nextSteps") {
       if (!isSyntheticDurableEntryText(line)) carried.nextSteps = [...(carried.nextSteps || []), item];
+    }
+    else if (bucket === "openQuestions") {
+      if (!isSyntheticDurableEntryText(line)) carried.openQuestions = [...(carried.openQuestions || []), item];
     }
     else if (!isSyntheticDurableEntryText(line)) {
       carried.progress = [...(carried.progress || []), item];
@@ -353,10 +430,44 @@ function extractCarryoverFromContextText(text: string, messageIndex: number, upd
 function mergeEntries<T extends ContextMemoryEntry>(existing: T[] | undefined, incoming: T[] | undefined, limit: number): T[] {
   const byKey = new Map<string, T>();
   for (const item of [...(existing || []), ...(incoming || [])]) {
-    const text = compactLine(item?.text);
-    if (!text) continue;
+    const text = compactLine(stripTrailingSourceTag(item?.text || ""));
+    if (!text || isSyntheticDurableEntryText(text)) continue;
     const key = normalizeLine(text);
     byKey.set(key, { ...item, text });
+  }
+  return Array.from(byKey.values())
+    .sort((a, b) => (a.updatedAt || 0) - (b.updatedAt || 0))
+    .slice(-limit);
+}
+
+function evidenceMergeKey(item: ContextMemoryEntry): string {
+  const toolName = String(item.source?.toolName || "").toLowerCase();
+  const path = String(item.source?.path || "").trim();
+  if (path && /^(?:read_file|get_file_outline|read_document|analyze_tabular_document|query_tabular_document)$/.test(toolName)) {
+    return `${toolName}:${normalizeLine(path)}:observed`;
+  }
+  return normalizeLine(stripTrailingSourceTag(item.text));
+}
+
+function mergeEvidenceEntries(existing: ContextMemoryEntry[] | undefined, incoming: ContextMemoryEntry[] | undefined, limit: number): ContextMemoryEntry[] {
+  const byKey = new Map<string, ContextMemoryEntry>();
+  for (const item of [...(existing || []), ...(incoming || [])]) {
+    const text = compactLine(stripTrailingSourceTag(item?.text || ""));
+    if (!text) continue;
+    byKey.set(evidenceMergeKey({ ...item, text }), { ...item, text });
+  }
+  return Array.from(byKey.values())
+    .sort((a, b) => (a.updatedAt || 0) - (b.updatedAt || 0))
+    .slice(-limit);
+}
+
+function mergeFileEntries(existing: ContextMemoryFileEntry[] | undefined, incoming: ContextMemoryFileEntry[] | undefined, limit: number): ContextMemoryFileEntry[] {
+  const byKey = new Map<string, ContextMemoryFileEntry>();
+  for (const item of [...(existing || []), ...(incoming || [])]) {
+    const path = compactLine(stripTrailingSourceTag(item?.path || item?.source?.path || item?.text || ""));
+    const text = compactLine(stripTrailingSourceTag(item?.text || path));
+    if (!path || !text) continue;
+    byKey.set(normalizeLine(path), { ...item, path, text });
   }
   return Array.from(byKey.values())
     .sort((a, b) => (a.updatedAt || 0) - (b.updatedAt || 0))
@@ -401,7 +512,9 @@ function normalizeFileArray(value: unknown): ContextMemoryFileEntry[] {
 }
 
 function sanitizeDurableEntries(entries: ContextMemoryEntry[] | undefined): ContextMemoryEntry[] {
-  return (entries || []).filter((item) => !isSyntheticDurableEntryText(item.text));
+  return (entries || [])
+    .map((item) => ({ ...item, text: compactLine(stripTrailingSourceTag(item.text)) }))
+    .filter((item) => item.text && !isSyntheticDurableEntryText(item.text));
 }
 
 function sanitizeContextMemoryState(state: ContextMemoryState | null): ContextMemoryState | null {
@@ -543,8 +656,8 @@ export function buildContextMemoryState(
     constraints: mergeEntries(previous?.constraints, collected.constraints, limits.constraints),
     decisions: mergeEntries(previous?.decisions, collected.decisions, limits.decisions),
     progress: mergeEntries(previous?.progress, collected.progress, limits.progress),
-    evidence: mergeEntries(previous?.evidence, collected.evidence, limits.evidence),
-    files: mergeEntries(previous?.files, collected.files, limits.files),
+    evidence: mergeEvidenceEntries(previous?.evidence, collected.evidence, limits.evidence),
+    files: mergeFileEntries(previous?.files, collected.files, limits.files),
     blockers: mergeEntries(previous?.blockers, collected.blockers, limits.blockers),
     nextSteps: mergeEntries(previous?.nextSteps, collected.nextSteps, limits.nextSteps),
     openQuestions: mergeEntries(previous?.openQuestions, collected.openQuestions, limits.openQuestions),
