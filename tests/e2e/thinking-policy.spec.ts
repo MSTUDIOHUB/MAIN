@@ -12,11 +12,16 @@ test.beforeEach(async ({ page }) => {
 test("thinking policy is the only thought visibility control and persists", async ({ page }) => {
   await page.goto("/?e2eScenario=thinking-policy");
 
-  await expect(page.getByTestId("thought-block")).toBeVisible();
+  await expect(page.getByTestId("thought-block")).toHaveCount(0);
+  await expect(page.getByTestId("turn-process-archive-toggle")).toBeVisible();
+  await page.getByTestId("turn-process-archive-toggle").click();
+
+  await expect(page.getByTestId("thought-block")).toHaveCount(1);
   const summary = page.getByTestId("thought-summary-lines");
   await expect(summary).toBeVisible();
-  await expect(summary).toContainText("SettingsModal");
-  await expect(summary).toContainText("两档配置");
+  await expect(summary).toContainText("验证结果");
+  await expect(summary).not.toContainText("SettingsModal");
+  await expect(summary).not.toContainText("两档配置");
   await expect(summary).not.toContainText("data:");
   await expect(summary).not.toContainText("read_file");
   await expect(summary).not.toContainText("const noisy");

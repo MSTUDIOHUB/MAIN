@@ -12,6 +12,10 @@ test.beforeEach(async ({ page }) => {
 test("completed read tools collapse into one expandable context group", async ({ page }) => {
   await page.goto("/?e2eScenario=read-context-collapse");
 
+  await expect(page.getByTestId("turn-process-archive-toggle")).toBeVisible();
+  await expect(page.getByTestId("read-context-group")).toHaveCount(0);
+  await page.getByTestId("turn-process-archive-toggle").click();
+
   const groups = page.getByTestId("read-context-group");
   await expect(groups).toHaveCount(2);
   const firstGroup = groups.nth(0);

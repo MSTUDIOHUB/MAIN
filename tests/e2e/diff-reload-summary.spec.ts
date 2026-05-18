@@ -107,22 +107,39 @@ test.beforeEach(async ({ page }) => {
   });
 });
 
-test("diff summary stays clickable after reload and restores the diff viewer", async ({ page }) => {
+test("diff summary stays folded by default and remains clickable after reload", async ({ page }) => {
   await page.goto("/?e2eScenario=diff-reload-summary");
 
   await expect(page.getByText("3 个变更文件")).toBeVisible();
+  await expect(page.getByTestId("turn-changes-toggle")).toHaveAttribute("aria-expanded", "false");
+  await expect(page.getByTestId("turn-change-entry")).toHaveCount(0);
+  await expect(page.getByTestId("turn-process-archive-toggle")).toBeVisible();
+  await expect(page.getByText("已编辑")).toHaveCount(0);
+  await expect(page.getByText("npm test -- --runInBand")).toHaveCount(0);
+  await expect(page.getByText("已完成三个文件的修改，你可以在摘要卡中查看每个文件的 Diff。")).toBeVisible();
+  await expect
+    .poll(async () =>
+      page.evaluate(() => {
+        const archive = document.querySelector('[data-testid="turn-process-archive-toggle"]');
+        const conclusion = Array.from(document.querySelectorAll(".chat-agent-content"))
+          .find((node) => node.textContent?.includes("已完成三个文件的修改"));
+        if (!archive || !conclusion) return false;
+        return archive.getBoundingClientRect().top < conclusion.getBoundingClientRect().top;
+      }),
+    )
+    .toBe(true);
+
+  await page.getByTestId("turn-changes-toggle").click();
   await expect(page.getByTestId("turn-change-entry").filter({ hasText: "main.ts" })).toBeVisible();
   await expect(page.getByTestId("turn-change-entry").filter({ hasText: "helper.ts" })).toBeVisible();
   await expect(page.getByTestId("turn-change-entry").filter({ hasText: "generated.ts" })).toBeVisible();
 
-  await expect
-    .poll(async () =>
-      page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().seedCount ?? 0),
-    )
-    .toBe(1);
-
   await page.getByTestId("turn-change-entry").filter({ hasText: "main.ts" }).click();
   await expect(page.getByTestId("diff-panel-title")).toContainText("src/main.ts");
+
+  await page.getByTestId("turn-process-archive-toggle").click();
+  await expect(page.getByTestId("turn-process-archive-details")).toBeVisible();
+  await expect(page.getByText("npm test -- --runInBand")).toBeVisible();
 
   await expect
     .poll(async () =>
@@ -143,13 +160,12 @@ test("diff summary stays clickable after reload and restores the diff viewer", a
   await page.reload();
 
   await expect(page.getByText("3 个变更文件")).toBeVisible();
-  await expect(page.getByTestId("diff-panel-title")).toContainText("src/main.ts");
+  await expect(page.getByTestId("turn-changes-toggle")).toHaveAttribute("aria-expanded", "false");
+  await expect(page.getByTestId("turn-change-entry")).toHaveCount(0);
 
-  await expect
-    .poll(async () =>
-      page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().seedCount ?? 0),
-    )
-    .toBe(1);
+  await page.getByTestId("turn-changes-toggle").click();
+  await page.getByTestId("turn-change-entry").filter({ hasText: "main.ts" }).click();
+  await expect(page.getByTestId("diff-panel-title")).toContainText("src/main.ts");
 
   await page.getByTestId("turn-change-entry").filter({ hasText: "helper.ts" }).click();
   await expect(page.getByTestId("diff-panel-title")).toContainText("src/utils/helper.ts");
@@ -158,6 +174,7 @@ test("diff summary stays clickable after reload and restores the diff viewer", a
 test("diff panel reverts one file with confirmation and updates the summary", async ({ page }) => {
   await page.goto("/?e2eScenario=diff-reload-summary");
 
+  await page.getByTestId("turn-changes-toggle").click();
   await page.getByTestId("turn-change-entry").filter({ hasText: "main.ts" }).click();
   await expect(page.getByTestId("diff-panel-title")).toContainText("src/main.ts");
 
@@ -182,6 +199,7 @@ test("diff panel reverts one file with confirmation and updates the summary", as
 test("diff panel reverts all files and deletes files created by the AI", async ({ page }) => {
   await page.goto("/?e2eScenario=diff-reload-summary");
 
+  await page.getByTestId("turn-changes-toggle").click();
   await page.getByTestId("turn-change-entry").filter({ hasText: "helper.ts" }).click();
   await expect(page.getByTestId("diff-panel-title")).toContainText("src/utils/helper.ts");
 
@@ -213,6 +231,7 @@ test("diff panel reverts all files and deletes files created by the AI", async (
 test("diff revert refuses to overwrite later user edits", async ({ page }) => {
   await page.goto("/?e2eScenario=diff-reload-summary");
 
+  await page.getByTestId("turn-changes-toggle").click();
   await page.getByTestId("turn-change-entry").filter({ hasText: "helper.ts" }).click();
   await page.evaluate(() => {
     (window as any).__DIFF_REVERT_TEST__.set("src/utils/helper.ts", "manual edit\n");

@@ -16,7 +16,6 @@ import { sanitizeAIOutput } from "../lib/sanitize";
 import {
   deriveThoughtDisplay,
   normalizeThinkingPolicy,
-  normalizeThoughtSummaryForCompare,
 } from "../lib/thoughtDisplay";
 import { deriveTurnProgressItems } from "../lib/turnProgress";
 import { useAppStore } from "../store/useAppStore";
@@ -692,6 +691,104 @@ function getReadContextToolLabel(toolName: string, language: "zh" | "en") {
   return getToolPresentationLabel(toolName, language);
 }
 
+function isFinishedTurnStatus(status: string) {
+  return status === "done" || status === "completed_with_changes";
+}
+
+function isFinalConclusionBlock(block: any, finalVisibleAgentIndex: number, blockIndex: number) {
+  return block?.type === "agent" && blockIndex === finalVisibleAgentIndex && hasRenderableAgentBlock(block);
+}
+
+function isProcessArchiveCandidate(block: any, finalVisibleAgentIndex: number, blockIndex: number) {
+  if (!block || block.type === "user") return false;
+  if (isFinalConclusionBlock(block, finalVisibleAgentIndex, blockIndex)) return false;
+  if (block.type === "system") {
+    return block.variant !== "context_compression" && block.variant !== "plan_execution_checkpoint";
+  }
+  return block.type === "tool" || block.type === "thought" || block.type === "jobList" || block.type === "agent";
+}
+
+function getLatestThoughtBlock(blocks: any[]) {
+  return [...blocks].reverse().find((block) => block?.type === "thought" && String(block.content || "").trim());
+}
+
+function buildTurnProcessArchive(blocks: any[], finalVisibleAgentIndex: number, language: "zh" | "en") {
+  const latestThoughtId = getLatestThoughtBlock(blocks)?.id ?? null;
+  const archiveBlocks = blocks.filter((block, index) => {
+    if (!isProcessArchiveCandidate(block, finalVisibleAgentIndex, index)) return false;
+    if (block.type === "thought" && block.id !== latestThoughtId) return false;
+    return true;
+  });
+  const counts = {
+    read: 0,
+    table: 0,
+    edit: 0,
+    command: 0,
+    failed: 0,
+    rejected: 0,
+    other: 0,
+    thought: 0,
+    message: 0,
+  };
+  const previewTargets: string[] = [];
+
+  archiveBlocks.forEach((block) => {
+    if (block.type === "thought") {
+      counts.thought += 1;
+      return;
+    }
+    if (block.type === "agent" || block.type === "jobList" || block.type === "system") {
+      counts.message += 1;
+      return;
+    }
+    if (block.type !== "tool") return;
+    const toolName = String(block.toolName || "");
+    const status = String(block.toolStatus || "");
+    if (status === "failed") counts.failed += 1;
+    else if (status === "rejected") counts.rejected += 1;
+    if (TOOL_SUMMARY_GROUPS.table.has(toolName)) counts.table += 1;
+    else if (TOOL_SUMMARY_GROUPS.read.has(toolName)) counts.read += 1;
+    else if (TOOL_SUMMARY_GROUPS.edit.has(toolName)) counts.edit += 1;
+    else if (TOOL_SUMMARY_GROUPS.command.has(toolName)) counts.command += 1;
+    else counts.other += 1;
+    const target = compactToolTarget(block.target, toolName, language);
+    if (target && previewTargets.length < 3 && !previewTargets.includes(target)) {
+      previewTargets.push(target);
+    }
+  });
+
+  const summaryParts: string[] = [];
+  if (language === "zh") {
+    if (counts.read) summaryParts.push(`读取/搜索 ${counts.read}`);
+    if (counts.table) summaryParts.push(`表格 ${counts.table}`);
+    if (counts.edit) summaryParts.push(`编辑 ${counts.edit}`);
+    if (counts.command) summaryParts.push(`命令 ${counts.command}`);
+    if (counts.other) summaryParts.push(`工具 ${counts.other}`);
+    if (counts.failed) summaryParts.push(`失败 ${counts.failed}`);
+    if (counts.rejected) summaryParts.push(`拒绝 ${counts.rejected}`);
+    if (counts.thought) summaryParts.push(`思考 ${counts.thought}`);
+    if (counts.message) summaryParts.push(`过程消息 ${counts.message}`);
+  } else {
+    if (counts.read) summaryParts.push(`${counts.read} read/search`);
+    if (counts.table) summaryParts.push(`${counts.table} table`);
+    if (counts.edit) summaryParts.push(`${counts.edit} edit`);
+    if (counts.command) summaryParts.push(`${counts.command} command`);
+    if (counts.other) summaryParts.push(`${counts.other} tool`);
+    if (counts.failed) summaryParts.push(`${counts.failed} failed`);
+    if (counts.rejected) summaryParts.push(`${counts.rejected} rejected`);
+    if (counts.thought) summaryParts.push(`${counts.thought} thought`);
+    if (counts.message) summaryParts.push(`${counts.message} process message`);
+  }
+
+  return {
+    blocks: archiveBlocks,
+    counts,
+    totalCount: archiveBlocks.length,
+    summaryText: summaryParts.join(language === "zh" ? "，" : ", "),
+    previewTargets,
+  };
+}
+
 function buildBlockRenderItems(
   blocks: any[],
   includeUser = true,
@@ -932,11 +1029,13 @@ function ThoughtBlock({
   language,
   chatFontSize,
   summaryText,
+  compact = false,
 }: {
   block: any;
   language: "zh" | "en";
   chatFontSize: number;
   summaryText?: string;
+  compact?: boolean;
 }) {
   const rawContent = String(block.content || "").trim();
   if (!rawContent) return null;
@@ -956,15 +1055,18 @@ function ThoughtBlock({
   const statusLabel = language === "zh"
     ? isStreamingThought ? "摘要会持续更新" : "原始推理已折叠"
     : isStreamingThought ? "Summary updates live" : "Raw reasoning is folded";
+  const wrapperClass = compact
+    ? "mt-2 flex w-full min-w-0 items-start justify-start gap-3"
+    : "mt-4 flex w-full min-w-0 items-start justify-start gap-3";
 
   return (
-    <div data-testid="thought-block" className="mt-4 flex w-full min-w-0 items-start justify-start gap-3">
+    <div data-testid="thought-block" className={wrapperClass}>
       <div className="mt-1 flex-shrink-0">
-        <IconLogoM className="theme-text h-6 w-6 drop-shadow-[0_0_8px_var(--accent-subtle)]" />
+        <IconLogoM className={`theme-text drop-shadow-[0_0_8px_var(--accent-subtle)] ${compact ? "h-5 w-5" : "h-6 w-6"}`} />
       </div>
       <div
         data-testid="thought-summary-lines"
-        className="my-1 min-w-0 flex-1 rounded-xl border border-[#27272a] bg-[#07070a] px-3 py-2 text-[#e4e4e7]"
+        className={`${compact ? "my-0" : "my-1"} min-w-0 flex-1 rounded-xl border border-[#27272a] bg-[#07070a] px-3 py-2 text-[#e4e4e7]`}
         style={{ fontSize: `${chatFontSize}px` }}
       >
         <div className="mb-2 flex flex-wrap items-center gap-2 font-mono text-[10.5px] text-[#a1a1aa]">
@@ -994,6 +1096,7 @@ function TurnChangesCard({
   totalExecutedEdits,
   language,
   onOpenDiff,
+  defaultExpanded = false,
 }: {
   entries: Array<{
     taskId: number;
@@ -1006,7 +1109,9 @@ function TurnChangesCard({
   totalExecutedEdits: number;
   language: "zh" | "en";
   onOpenDiff: (taskId: number) => void;
+  defaultExpanded?: boolean;
 }) {
+  const [expanded, setExpanded] = useState(defaultExpanded);
   if (entries.length === 0) return null;
 
   const headerText = language === "zh"
@@ -1015,10 +1120,19 @@ function TurnChangesCard({
   const subText = language === "zh"
     ? `${totalExecutedEdits} 次已执行修改`
     : `${totalExecutedEdits} executed edit${totalExecutedEdits > 1 ? "s" : ""}`;
+  const toggleText = expanded
+    ? language === "zh" ? "收起" : "Collapse"
+    : language === "zh" ? "展开" : "Expand";
 
   return (
     <div className="ml-9 rounded-2xl border border-[#1d4ed8]/18 bg-[#060b14] px-4 py-3">
-      <div className="flex items-center justify-between gap-3">
+      <button
+        type="button"
+        data-testid="turn-changes-toggle"
+        aria-expanded={expanded}
+        onClick={() => setExpanded((value) => !value)}
+        className="flex w-full items-center justify-between gap-3 text-left"
+      >
         <div className="min-w-0">
           <div className="flex items-center gap-2 text-[11px] uppercase tracking-[0.16em] text-[#93c5fd]">
             <IconCode className="h-3.5 w-3.5" />
@@ -1026,8 +1140,12 @@ function TurnChangesCard({
           </div>
           <div className="mt-1 text-[12px] text-[#64748b]">{subText}</div>
         </div>
-      </div>
-      <div className="mt-3 space-y-2">
+        <span className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-[#1e293b] bg-[#05070d] px-2.5 py-1 text-[10px] text-[#93c5fd]">
+          {expanded ? <IconChevronDown className="h-3.5 w-3.5" /> : <IconChevronRight className="h-3.5 w-3.5" />}
+          {toggleText}
+        </span>
+      </button>
+      {expanded && <div data-testid="turn-changes-details" className="mt-3 space-y-2">
         {entries.map((entry) => (
           <button
             key={`${entry.target}-${entry.taskId}`}
@@ -1049,7 +1167,7 @@ function TurnChangesCard({
             <span className="shrink-0 text-[11px] font-medium text-[#f87171]">-{entry.removed}</span>
           </button>
         ))}
-      </div>
+      </div>}
     </div>
   );
 }
@@ -1239,6 +1357,69 @@ function CompletedToolGroupCard({
               </div>
             );
           })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TurnProcessArchive({
+  archive,
+  language,
+  renderArchivedItem,
+}: {
+  archive: ReturnType<typeof buildTurnProcessArchive>;
+  language: "zh" | "en";
+  renderArchivedItem: (item: any) => React.ReactNode;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  if (archive.totalCount === 0) return null;
+
+  const title = language === "zh" ? "本轮过程归档" : "Turn Process Archive";
+  const fallbackSummary = language === "zh" ? "过程记录已折叠保留，可展开追溯。" : "Process records are folded and kept for review.";
+  const previewText = archive.previewTargets.length > 0
+    ? archive.previewTargets.join(language === "zh" ? "、" : ", ")
+    : "";
+  const toggleText = expanded
+    ? language === "zh" ? "收起过程" : "Collapse"
+    : language === "zh" ? "展开过程" : "Expand";
+
+  return (
+    <div className="ml-9 rounded-2xl border border-[#1f2937] bg-[#07070a] px-4 py-3">
+      <button
+        type="button"
+        data-testid="turn-process-archive-toggle"
+        aria-expanded={expanded}
+        onClick={() => setExpanded((value) => !value)}
+        className="flex w-full min-w-0 items-center justify-between gap-3 text-left"
+      >
+        <span className="min-w-0 flex-1">
+          <span className="flex min-w-0 flex-wrap items-center gap-2">
+            <span className="inline-flex items-center gap-2 text-[11px] uppercase tracking-[0.16em] text-[#93c5fd]">
+              <IconColumns className="h-3.5 w-3.5" />
+              {title}
+            </span>
+            <span className="rounded-full border border-[#27272a] bg-[#050507] px-2 py-0.5 text-[10px] text-[#a1a1aa]">
+              {language === "zh" ? `${archive.totalCount} 条记录` : `${archive.totalCount} record${archive.totalCount > 1 ? "s" : ""}`}
+            </span>
+          </span>
+          <span className="mt-1 block truncate text-[12px] text-[#71717a]">
+            {archive.summaryText || fallbackSummary}{previewText ? ` · ${previewText}` : ""}
+          </span>
+        </span>
+        <span className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-[#27272a] bg-[#050507] px-2.5 py-1 text-[10px] text-[#a1a1aa]">
+          {expanded ? <IconChevronDown className="h-3.5 w-3.5" /> : <IconChevronRight className="h-3.5 w-3.5" />}
+          {toggleText}
+        </span>
+      </button>
+
+      {expanded && (
+        <div data-testid="turn-process-archive-details" className="mt-3 space-y-3">
+          {buildBlockRenderItems(archive.blocks, false).map((item: any, index: number) => (
+            <React.Fragment key={`archived-${item.block?.id ?? item.blocks?.[0]?.id ?? index}-${index}`}>
+              {renderArchivedItem(item)}
+            </React.Fragment>
+          ))}
         </div>
       )}
     </div>
@@ -2170,7 +2351,7 @@ export default function ChatArea({
     const userBlock = blocks.find((block) => block.type === "user");
     const hiddenCount = blocks.filter((block) => block.type !== "user").length;
     const { entries: turnChangeEntries, totalExecutedEdits } = collectTurnChangeEntries(blocks);
-    const shouldShowTurnChanges = turnChangeEntries.length > 1 || totalExecutedEdits > 1;
+    const shouldShowTurnChanges = turnChangeEntries.length > 0 || totalExecutedEdits > 0;
     const shouldPreservePlanExecutionAgentText = isPlanTurn && isPlanExecutionVisible;
     const finalVisibleAgentIndex = isPlanTurn && !shouldPreservePlanExecutionAgentText
       ? -1
@@ -2179,6 +2360,13 @@ export default function ChatArea({
           .reverse()
           .find(({ block }) => hasRenderableAgentBlock(block))?.idx ?? -1;
     const finalVisibleAgentBlock = finalVisibleAgentIndex >= 0 ? blocks[finalVisibleAgentIndex] : null;
+    const isFinishedTurn = isFinishedTurnStatus(turn.status);
+    const shouldArchiveCompletedProcess =
+      isFinishedTurn &&
+      finalVisibleAgentIndex >= 0;
+    const processArchive = shouldArchiveCompletedProcess
+      ? buildTurnProcessArchive(blocks, finalVisibleAgentIndex, language)
+      : null;
     const collapsedProcessCount = finalVisibleAgentBlock
       ? blocks.filter((block, idx) => block.type !== "user" && idx !== finalVisibleAgentIndex).length + (shouldShowTurnChanges ? 1 : 0)
       : hiddenCount + (shouldShowTurnChanges ? 1 : 0);
@@ -2198,7 +2386,6 @@ export default function ChatArea({
       : "";
     const toolExecutionSummary = buildToolExecutionSummary(blocks, language);
     const activeTurnActivity = getActiveTurnActivity(blocks, turn.status, language);
-    const seenThoughtSummaryDedupeKeys = new Set<string>();
     const thoughtSummaryCache = new Map<string, string>();
     const getThoughtSummaryText = (thoughtBlock: any) => {
       const cacheKey = String(thoughtBlock?.id ?? "");
@@ -2207,10 +2394,13 @@ export default function ChatArea({
       }
       const summary = deriveThoughtDisplay(String(thoughtBlock?.content || ""), {
         language,
+        mode: "latest",
       }).summaryText;
       thoughtSummaryCache.set(cacheKey, summary);
       return summary;
     };
+    const latestThoughtBlock = getLatestThoughtBlock(blocks);
+    const latestThoughtBlockId = latestThoughtBlock?.id ?? null;
     const renderTurnBlockItem = (item) => {
       if (shouldSuppressThoughtBlocks && item.kind !== "readContextGroup" && item.block?.type === "thought") {
         return null;
@@ -2220,13 +2410,9 @@ export default function ChatArea({
         item.kind !== "readContextGroup" &&
         item.block?.type === "thought"
       ) {
+        if (item.block?.id !== latestThoughtBlockId) return null;
         const summaryText = getThoughtSummaryText(item.block);
-        const summaryDedupeKey = normalizeThoughtSummaryForCompare(summaryText);
         if (!summaryText) return null;
-        if (summaryDedupeKey) {
-          if (seenThoughtSummaryDedupeKeys.has(summaryDedupeKey)) return null;
-          seenThoughtSummaryDedupeKeys.add(summaryDedupeKey);
-        }
         return (
           <ThoughtBlock
             key={`${item.block.id}-${item.index}`}
@@ -2238,6 +2424,28 @@ export default function ChatArea({
         );
       }
 
+      return renderBlockItem(item);
+    };
+    const renderArchivedBlockItem = (item) => {
+      if (
+        !shouldSuppressThoughtBlocks &&
+        item.kind !== "readContextGroup" &&
+        item.block?.type === "thought"
+      ) {
+        if (item.block?.id !== latestThoughtBlockId) return null;
+        const summaryText = getThoughtSummaryText(item.block);
+        if (!summaryText) return null;
+        return (
+          <ThoughtBlock
+            key={`archive-${item.block.id}-${item.index}`}
+            block={item.block}
+            language={language}
+            chatFontSize={config.chatFontSize ?? 13}
+            summaryText={summaryText}
+            compact
+          />
+        );
+      }
       return renderBlockItem(item);
     };
     const displayTitleFallback = turn.userPrompt
@@ -2391,7 +2599,20 @@ export default function ChatArea({
                   copy={copy}
                 />
               )}
-              {buildBlockRenderItems(blocks, false, enableCompletedToolGrouping).map(renderTurnBlockItem)}
+              {shouldArchiveCompletedProcess ? (
+                <>
+                  {processArchive && processArchive.totalCount > 0 && (
+                    <TurnProcessArchive
+                      archive={processArchive}
+                      language={language}
+                      renderArchivedItem={renderArchivedBlockItem}
+                    />
+                  )}
+                  {finalVisibleAgentBlock && renderBlock(finalVisibleAgentBlock, finalVisibleAgentIndex)}
+                </>
+              ) : (
+                buildBlockRenderItems(blocks, false, enableCompletedToolGrouping).map(renderTurnBlockItem)
+              )}
             </>
           )}
           {activeTurnActivity && <TurnActivityNotice text={activeTurnActivity} />}

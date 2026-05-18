@@ -131,6 +131,23 @@ test("thought summary filters logs json punctuation and large code", () => {
   assert.doesNotMatch(summary, /const noisy/);
 });
 
+test("latest thought summary prefers the newest useful step", () => {
+  const display = deriveThoughtDisplay([
+    "我需要先读取用户第一次指令并确认范围。",
+    '{"tool":"read_file","arguments":{"path":"src/App.tsx"}}',
+    "下一步会检查旧的 App.tsx 结构。",
+    "现在已经完成实现，正在整理验证结果和最终说明。",
+  ].join("\n"), {
+    language: "zh",
+    mode: "latest",
+  });
+
+  const summary = display.summaryLines.join("\n");
+  assert.match(summary, /整理验证结果/);
+  assert.doesNotMatch(summary, /第一次指令/);
+  assert.doesNotMatch(summary, /read_file/);
+});
+
 test("thought summary removes dense punctuation noise and mode complaint loops", () => {
   const display = deriveThoughtDisplay([
     "当前 discuss 模式下 write_file 不可用，需要切换到执行模式。",

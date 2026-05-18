@@ -1394,6 +1394,7 @@ function seedThinkingPolicyScenario() {
   const sessionId = 999018;
   const userBlockId = useAppStore.getState()._nextTaskId();
   const thoughtBlockId = useAppStore.getState()._nextTaskId();
+  const latestThoughtBlockId = useAppStore.getState()._nextTaskId();
   const agentBlockId = useAppStore.getState()._nextTaskId();
   const thinkingPolicy = useAppStore.getState().config.thinkingPolicy || "normal";
 
@@ -1449,6 +1450,17 @@ function seedThinkingPolicyScenario() {
         duration: 2,
       },
       {
+        id: latestThoughtBlockId,
+        turnId,
+        type: "thought",
+        content: [
+          "我已经完成设置项检查。",
+          "现在正在整理验证结果，并确认最终回复只保留最新步骤摘要。",
+        ].join("\n\n"),
+        isStreaming: false,
+        duration: 1,
+      },
+      {
         id: agentBlockId,
         turnId,
         type: "agent",
@@ -1464,7 +1476,7 @@ function seedThinkingPolicyScenario() {
         mode: "chat",
         status: "done",
         summary: "已准备思考策略测试数据。",
-        blockIds: [userBlockId, thoughtBlockId, agentBlockId],
+        blockIds: [userBlockId, thoughtBlockId, latestThoughtBlockId, agentBlockId],
         collapsed: false,
         createdAt: now,
       },
@@ -1519,6 +1531,7 @@ function seedDiffReloadSummaryScenario() {
     const toolBlockIdA = useAppStore.getState()._nextTaskId();
     const toolBlockIdB = useAppStore.getState()._nextTaskId();
     const toolBlockIdC = useAppStore.getState()._nextTaskId();
+    const commandBlockId = useAppStore.getState()._nextTaskId();
     const agentBlockId = useAppStore.getState()._nextTaskId();
 
     incrementSeedCount(DIFF_RELOAD_SUMMARY_SCENARIO);
@@ -1620,6 +1633,16 @@ function seedDiffReloadSummaryScenario() {
           },
         },
         {
+          id: commandBlockId,
+          turnId,
+          type: "tool",
+          toolName: "execute_command",
+          target: "npm test -- --runInBand",
+          status: "executed",
+          toolStatus: "executed",
+          message: "Tests passed.",
+        },
+        {
           id: agentBlockId,
           turnId,
           type: "agent",
@@ -1635,7 +1658,7 @@ function seedDiffReloadSummaryScenario() {
           mode: "edit",
           status: "done",
           summary: "三个文件已修改，可点击查看 Diff。",
-          blockIds: [userBlockId, toolBlockIdA, toolBlockIdB, toolBlockIdC, agentBlockId],
+          blockIds: [userBlockId, toolBlockIdA, toolBlockIdB, toolBlockIdC, commandBlockId, agentBlockId],
           collapsed: false,
           createdAt: now,
         },

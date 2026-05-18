@@ -3,6 +3,7 @@ export type ThinkingPolicy = "normal" | "action_only";
 export interface ThoughtDisplayOptions {
   language?: "zh" | "en";
   maxSummaryLines?: number;
+  mode?: "first" | "latest";
 }
 
 export interface ThoughtDisplayResult {
@@ -371,12 +372,24 @@ function truncateSummaryLine(text: string, maxChars = 180): string {
   return `${normalized.slice(0, maxChars - 3).trim()}...`;
 }
 
-function pickSummaryLines(cleanText: string, maxLines: number): string[] {
+function pickSummaryLines(cleanText: string, maxLines: number, mode: "first" | "latest" = "first"): string[] {
   const candidates = splitSummaryCandidates(cleanText);
   const chosen: string[] = [];
   const seen = new Set<string>();
+  const orderedCandidates = mode === "latest" ? [...candidates].reverse() : candidates;
 
   if (maxLines === 1) {
+    if (mode === "latest") {
+      const latestCandidate = [
+        ...orderedCandidates.filter(isProcessUseful),
+        ...orderedCandidates,
+      ].find((candidate, index, all) => {
+        const normalized = normalizeForCompare(candidate);
+        return normalized && all.findIndex((other) => normalizeForCompare(other) === normalized) === index;
+      });
+      return latestCandidate ? [truncateSummaryLine(latestCandidate)] : [];
+    }
+
     const merged: string[] = [];
     const mergedSeen = new Set<string>();
     const addMerged = (candidate: string) => {
@@ -386,11 +399,11 @@ function pickSummaryLines(cleanText: string, maxLines: number): string[] {
       mergedSeen.add(normalized);
       merged.push(candidate);
     };
-    const orderedCandidates = [
-      ...candidates.filter(isProcessUseful),
-      ...candidates,
+    const rankedCandidates = [
+      ...orderedCandidates.filter(isProcessUseful),
+      ...orderedCandidates,
     ];
-    for (const candidate of orderedCandidates) {
+    for (const candidate of rankedCandidates) {
       addMerged(candidate);
       if (merged.length >= 2) break;
     }
@@ -407,11 +420,11 @@ function pickSummaryLines(cleanText: string, maxLines: number): string[] {
     chosen.push(truncateSummaryLine(candidate));
   };
 
-  candidates.filter(isProcessUseful).forEach((candidate) => {
+  orderedCandidates.filter(isProcessUseful).forEach((candidate) => {
     if (chosen.length < maxLines) add(candidate);
   });
 
-  candidates.forEach((candidate) => {
+  orderedCandidates.forEach((candidate) => {
     if (chosen.length < maxLines) add(candidate);
   });
 
@@ -427,6 +440,7 @@ export function deriveThoughtDisplay(
   const summaryLines = pickSummaryLines(
     clean,
     Math.max(1, options.maxSummaryLines ?? DEFAULT_SUMMARY_LINES),
+    options.mode === "latest" ? "latest" : "first",
   );
 
   return {

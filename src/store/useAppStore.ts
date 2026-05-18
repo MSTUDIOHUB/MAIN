@@ -2226,7 +2226,7 @@ function compactThoughtContent(text: string): string {
 
 function compactThoughtContentForPersist(text: string): string {
   const compacted = compactThoughtContent(text);
-  const summarized = deriveThoughtDisplay(compacted, { maxSummaryLines: 3 }).summaryText;
+  const summarized = deriveThoughtDisplay(compacted, { maxSummaryLines: 1, mode: "latest" }).summaryText;
   if (summarized) return summarized;
   return compacted.length > 1200 ? compacted.slice(0, 1200).trimEnd() : compacted;
 }
@@ -7679,14 +7679,15 @@ export const useAppStore = create<AppState>()(
         const nextInterceptorThought = thinking
           ? appendThoughtDelta(latestStateForDedupe.currentTurnState.interceptorThought, thinking)
           : latestStateForDedupe.currentTurnState.interceptorThought;
+        const currentInterceptorThoughtContent = thinkingInterceptor.getThinkingContent() || thinking;
         let thoughtIdToCreate: number | null = null;
         let thoughtIdToUpdate = currentThoughtBlockId;
         const thoughtDuration = thoughtStartTime ? Math.round((Date.now() - thoughtStartTime) / 1000) : undefined;
 
         if (thoughtStarted) {
           thoughtStartTime = Date.now();
-          // Merge into the existing thought block for this turn instead of creating a new one,
-          // so that thought blocks don't interleave with tool blocks and break grouping.
+          // Keep one live thought cell per turn; the UI treats it as a replaceable
+          // activity summary instead of a transcript of every reasoning fragment.
           const existingThoughtBlock = sessionGet().taskFlow
             .filter((b) => b.turnId === turnId)
             .reverse()
@@ -7771,14 +7772,14 @@ export const useAppStore = create<AppState>()(
               id: thoughtIdToCreate,
               turnId,
               type: "thought",
-              content: compactThoughtContent(thinking),
+              content: compactThoughtContent(currentInterceptorThoughtContent),
               isStreaming: true,
             });
           } else if (thoughtIdToUpdate !== null && thinking) {
             const tid = thoughtIdToUpdate;
             taskFlow = taskFlow.map((t) =>
               t.id === tid && t.type === "thought"
-                ? { ...t, content: appendThoughtDelta((t as Extract<TaskBlock, { type: "thought" }>).content, thinking) }
+                ? { ...t, content: compactThoughtContent(currentInterceptorThoughtContent), isStreaming: true }
                 : t
             );
           }
@@ -7787,7 +7788,7 @@ export const useAppStore = create<AppState>()(
             const tid = thoughtEndedId;
             taskFlow = taskFlow.map((t) =>
               t.id === tid && t.type === "thought"
-                ? { ...t, isStreaming: false, duration: thoughtDuration }
+                ? { ...t, content: compactThoughtContentForPersist((t as Extract<TaskBlock, { type: "thought" }>).content), isStreaming: false, duration: thoughtDuration }
                 : t
             );
           }
@@ -8236,7 +8237,7 @@ export const useAppStore = create<AppState>()(
             sessionSet((s) => ({
               taskFlow: s.taskFlow.map((t) =>
                 t.id === tid && t.type === "thought"
-                  ? { ...t, content: appendThoughtDelta((t as Extract<TaskBlock, { type: "thought" }>).content, `\n\n${thought}`), isStreaming: true, duration }
+                  ? { ...t, content: compactThoughtContent(thought), isStreaming: true, duration }
                   : t
               ),
             }));
@@ -8245,7 +8246,7 @@ export const useAppStore = create<AppState>()(
               sessionSet((s) => ({
                 taskFlow: s.taskFlow.map((t) =>
                   t.id === tid && t.type === "thought"
-                    ? { ...t, isStreaming: false }
+                    ? { ...t, content: compactThoughtContentForPersist((t as Extract<TaskBlock, { type: "thought" }>).content), isStreaming: false }
                     : t
                 ),
               }));
@@ -8269,7 +8270,7 @@ export const useAppStore = create<AppState>()(
               sessionSet((s) => ({
                 taskFlow: s.taskFlow.map((t) =>
                   t.id === thoughtBlockId && t.type === "thought"
-                    ? { ...t, isStreaming: false }
+                    ? { ...t, content: compactThoughtContentForPersist((t as Extract<TaskBlock, { type: "thought" }>).content), isStreaming: false }
                     : t
                 ),
               }));
