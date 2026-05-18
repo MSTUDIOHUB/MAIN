@@ -1395,6 +1395,7 @@ function seedThinkingPolicyScenario() {
   const userBlockId = useAppStore.getState()._nextTaskId();
   const thoughtBlockId = useAppStore.getState()._nextTaskId();
   const latestThoughtBlockId = useAppStore.getState()._nextTaskId();
+  const toolBlockId = useAppStore.getState()._nextTaskId();
   const agentBlockId = useAppStore.getState()._nextTaskId();
   const thinkingPolicy = useAppStore.getState().config.thinkingPolicy || "normal";
 
@@ -1461,6 +1462,16 @@ function seedThinkingPolicyScenario() {
         duration: 1,
       },
       {
+        id: toolBlockId,
+        turnId,
+        type: "tool",
+        toolName: "read_file",
+        target: "src/components/ChatArea.tsx",
+        status: "done",
+        toolStatus: "executed",
+        message: "OK",
+      },
+      {
         id: agentBlockId,
         turnId,
         type: "agent",
@@ -1476,7 +1487,7 @@ function seedThinkingPolicyScenario() {
         mode: "chat",
         status: "done",
         summary: "已准备思考策略测试数据。",
-        blockIds: [userBlockId, thoughtBlockId, latestThoughtBlockId, agentBlockId],
+        blockIds: [userBlockId, thoughtBlockId, latestThoughtBlockId, toolBlockId, agentBlockId],
         collapsed: false,
         createdAt: now,
       },

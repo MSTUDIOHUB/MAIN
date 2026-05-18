@@ -26,6 +26,8 @@ test("thinking policy is the only thought visibility control and persists", asyn
   await expect(summary).not.toContainText("read_file");
   await expect(summary).not.toContainText("const noisy");
   await expect(summary).toHaveCSS("font-size", "13px");
+  await expect(page.locator('[data-testid="turn-archive-step"][data-kind="inspect"]')).toContainText("收集上下文");
+  await expect(page.locator('[data-testid="turn-archive-step"][data-kind="inspect"]')).toContainText("读取目标内容");
 
   await page.getByTestId("model-settings-button").click();
   await page.getByTestId("settings-tab-general").click();
@@ -50,6 +52,8 @@ test("thinking policy is the only thought visibility control and persists", asyn
   await page.getByTestId("settings-close").click();
 
   await expect(page.getByTestId("thought-block")).toHaveCount(0);
+  await expect(page.locator('[data-testid="turn-archive-step"][data-kind="inspect"]')).toBeVisible();
+  await expect(page.locator('[data-testid="turn-archive-step"][data-kind="inspect"]')).toContainText("读取目标内容");
   expect(await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().thinkingPolicy ?? null)).toBe("action_only");
 
   await page.reload();

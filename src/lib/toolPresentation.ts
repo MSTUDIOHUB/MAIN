@@ -1,4 +1,5 @@
 export type ToolPresentationLanguage = "zh" | "en";
+export type ToolExecutionPhase = "discover" | "inspect" | "edit" | "command" | "verify" | "blocked" | "message";
 
 const TOOL_VERB_LABELS: Record<string, { zh: string; en: string }> = {
   list_directory: { zh: "扫描目录", en: "Scan directory" },
@@ -23,6 +24,36 @@ const TOOL_VERB_LABELS: Record<string, { zh: string; en: string }> = {
   clear_pty_buffer: { zh: "清空终端缓冲", en: "Clear terminal buffer" },
   Error: { zh: "系统请求失败", en: "System request failed" },
 };
+
+const DISCOVERY_TOOLS = new Set([
+  "get_project_skeleton",
+  "list_directory",
+  "glob_search",
+  "grep_search",
+  "index_workspace_documents",
+]);
+
+const INSPECTION_TOOLS = new Set([
+  "get_file_outline",
+  "read_file",
+  "read_document",
+  "analyze_tabular_document",
+  "query_tabular_document",
+]);
+
+const EDIT_TOOLS = new Set(["replace_in_file", "write_file"]);
+const COMMAND_TOOLS = new Set([
+  "execute_command",
+  "run_command",
+  "send_pty_input",
+  "read_pty_buffer",
+  "read_pty_tail",
+  "read_pty_since",
+  "get_pty_status",
+  "clear_pty_buffer",
+]);
+
+const VERIFY_COMMAND_RE = /\b(?:test|build|lint|check|typecheck|tsc|playwright|vitest|jest|pytest|cargo\s+(?:test|check)|go\s+test)\b/i;
 
 function localize(language: ToolPresentationLanguage, labels: { zh: string; en: string }): string {
   return language === "en" ? labels.en : labels.zh;
@@ -82,4 +113,83 @@ export function formatToolPresentation(input: {
     target,
     summary: language === "en" ? `${label}: ${target}` : `${label}：${target}`,
   };
+}
+
+export function deriveToolPhase(input: {
+  toolName: string;
+  target?: string;
+  status?: string;
+  toolStatus?: string;
+}): ToolExecutionPhase {
+  const status = String(input.toolStatus || input.status || "").toLowerCase();
+  if (status === "failed" || status === "error" || status === "rejected") return "blocked";
+
+  const toolName = String(input.toolName || "");
+  if (DISCOVERY_TOOLS.has(toolName)) return "discover";
+  if (INSPECTION_TOOLS.has(toolName)) return "inspect";
+  if (EDIT_TOOLS.has(toolName)) return "edit";
+  if (COMMAND_TOOLS.has(toolName)) {
+    const target = String(input.target || "");
+    return VERIFY_COMMAND_RE.test(target) ? "verify" : "command";
+  }
+  if (toolName === "Error") return "blocked";
+  return "message";
+}
+
+function trimIntentSummary(text: string): string {
+  const normalized = String(text || "").replace(/\s+/g, " ").trim();
+  if (normalized.length <= 120) return normalized;
+  return `${normalized.slice(0, 117).trim()}...`;
+}
+
+export function deriveToolIntentSummary(input: {
+  toolName: string;
+  target?: string;
+  language?: ToolPresentationLanguage;
+  status?: string;
+  toolStatus?: string;
+}): string {
+  const language = input.language || "zh";
+  const phase = deriveToolPhase(input);
+  const toolName = String(input.toolName || "");
+
+  if (language === "en") {
+    if (phase === "blocked") return "Preserve the blocked step and its reason so recovery is possible.";
+    if (phase === "edit") return "Apply the planned change to the target file.";
+    if (phase === "verify") return "Run a verification command to check whether the change holds.";
+    if (phase === "command") return "Run the command and use its output to decide the next step.";
+    if (phase === "discover") {
+      if (toolName === "grep_search" || toolName === "glob_search") {
+        return "Locate relevant files or symbols before reading more context.";
+      }
+      return "Inspect the workspace shape and narrow the useful context.";
+    }
+    if (phase === "inspect") {
+      if (toolName === "analyze_tabular_document" || toolName === "query_tabular_document") {
+        return "Analyze the table data and confirm the relevant facts.";
+      }
+      if (toolName === "get_file_outline") return "Read the file structure before touching implementation details.";
+      return "Read the target content and confirm the implementation details.";
+    }
+    return "Keep the process message for traceability.";
+  }
+
+  if (phase === "blocked") return "保留受阻步骤和原因，方便后续恢复。";
+  if (phase === "edit") return "按方案修改目标文件。";
+  if (phase === "verify") return "运行验证命令，确认改动是否成立。";
+  if (phase === "command") return "执行命令并根据输出决定下一步。";
+  if (phase === "discover") {
+    if (toolName === "grep_search" || toolName === "glob_search") {
+      return "定位相关文件或符号，再收敛后续读取范围。";
+    }
+    return "查看工作区结构，缩小有效上下文范围。";
+  }
+  if (phase === "inspect") {
+    if (toolName === "analyze_tabular_document" || toolName === "query_tabular_document") {
+      return "分析表格数据，确认相关事实。";
+    }
+    if (toolName === "get_file_outline") return "先查看文件结构，再进入实现细节。";
+    return "读取目标内容，确认实现细节。";
+  }
+  return trimIntentSummary("记录过程消息，保留可追溯上下文。");
 }

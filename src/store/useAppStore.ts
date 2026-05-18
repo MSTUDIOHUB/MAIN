@@ -124,6 +124,7 @@ import {
 } from "../lib/cloudServers";
 import { buildToolDiffPreview, supportsToolDiffPreview } from "../lib/toolDiff";
 import { findToolLifecycleBlockIndex, type ToolLifecycleMeta } from "../lib/toolLifecycle";
+import { deriveToolIntentSummary } from "../lib/toolPresentation";
 import { buildPlanApprovalChoiceHint, normalizePlanApprovalChoice } from "../lib/planControl";
 import {
   PLAN_MAX_AUTO_RESUME_LIMIT,
@@ -959,7 +960,7 @@ export interface DiffRevertResult {
 
 export type TaskBlock =
   | (TaskBlockBase & { type: "user"; content: string; images?: string[]; contextItems?: UserContextItem[] })
-  | (TaskBlockBase & { type: "tool"; toolName: string; target: string; status: string; toolStatus: "pending" | "executed" | "rejected" | "running" | "failed"; toolCallId?: string; message?: string; diff?: ToolDiffSnapshot; shellPermissionDecision?: ShellPermissionDecision; revertStatus?: DiffRevertStatus; revertMessage?: string })
+  | (TaskBlockBase & { type: "tool"; toolName: string; target: string; status: string; toolStatus: "pending" | "executed" | "rejected" | "running" | "failed"; toolCallId?: string; message?: string; diff?: ToolDiffSnapshot; shellPermissionDecision?: ShellPermissionDecision; revertStatus?: DiffRevertStatus; revertMessage?: string; intentSummary?: string })
   | (TaskBlockBase & { type: "agent"; content: string; options?: ReplyOption[]; streaming?: boolean; hiddenProcess?: boolean; archivedAfterChoice?: boolean; selectedOption?: string })
   | (TaskBlockBase & { type: "thought"; content: string; isStreaming?: boolean; duration?: number })
   | (TaskBlockBase & { type: "jobList"; jobs: JobItem[] })
@@ -3007,6 +3008,7 @@ export function sanitizeTaskBlocksForPersist(blocks: TaskBlock[]): TaskBlock[] {
           toolStatus: b.toolStatus,
           ...(b.toolCallId ? { toolCallId: String(b.toolCallId) } : {}),
           ...(b.message ? { message: String(b.message) } : {}),
+          ...(b.intentSummary ? { intentSummary: String(b.intentSummary).slice(0, 160) } : {}),
           ...(b.shellPermissionDecision ? { shellPermissionDecision: b.shellPermissionDecision } : {}),
           ...(b.diff
             ? {
@@ -8389,6 +8391,13 @@ export const useAppStore = create<AppState>()(
           let runningTaskId: number | null = null;
           let shouldAttachDiff = false;
           const normalizedToolCallId = String(meta?.toolCallId || "").trim() || undefined;
+          const language = sessionGet().config.language === "en" ? "en" : "zh";
+          const intentSummary = deriveToolIntentSummary({
+            toolName,
+            target,
+            language,
+            toolStatus: "running",
+          });
           const isEphemeralPlanArtifactTool =
             (toolName === "write_file" || toolName === "replace_in_file") &&
             isEphemeralPlanArtifactPath(target);
@@ -8414,6 +8423,7 @@ export const useAppStore = create<AppState>()(
                   toolStatus: "running",
                   status: "running",
                   ...(normalizedToolCallId ? { toolCallId: normalizedToolCallId } : {}),
+                  intentSummary: pendingTask.intentSummary || intentSummary,
                   message: "Executing...",
                 };
               }
@@ -8430,6 +8440,7 @@ export const useAppStore = create<AppState>()(
                 status: "running",
                 toolStatus: "running",
                 ...(normalizedToolCallId ? { toolCallId: normalizedToolCallId } : {}),
+                intentSummary,
                 message: "Executing...",
               });
             }
@@ -9435,6 +9446,12 @@ export const useAppStore = create<AppState>()(
                 const toolName = toolCall.name;
                 const toolArgs = toolCall.arguments;
                 const target = getToolTarget(toolName, toolArgs);
+                const intentSummary = deriveToolIntentSummary({
+                  toolName,
+                  target,
+                  language,
+                  toolStatus: "pending",
+                });
                 void (async () => {
                   const diff = isLocalFileReadApproval
                     ? undefined
@@ -9450,6 +9467,7 @@ export const useAppStore = create<AppState>()(
                     target,
                     status: "pending_review",
                     toolStatus: "pending",
+                    intentSummary,
                     ...(shellReviewMessage ? { message: shellReviewMessage } : {}),
                     ...(shellPermissionDecision ? { shellPermissionDecision } : {}),
                     ...(diff ? { diff } : {}),
@@ -9483,6 +9501,12 @@ export const useAppStore = create<AppState>()(
             const toolName = toolCall.name;
             const toolArgs = toolCall.arguments;
             const target = getToolTarget(toolName, toolArgs);
+            const intentSummary = deriveToolIntentSummary({
+              toolName,
+              target,
+              language,
+              toolStatus: "pending",
+            });
             void (async () => {
               const diff = isLocalFileReadApproval
                 ? undefined
@@ -9498,6 +9522,7 @@ export const useAppStore = create<AppState>()(
                 target,
                 status: "pending_review",
                 toolStatus: "pending",
+                intentSummary,
                 ...(shellReviewMessage ? { message: shellReviewMessage } : {}),
                 ...(shellPermissionDecision ? { shellPermissionDecision } : {}),
                 ...(diff ? { diff } : {}),
