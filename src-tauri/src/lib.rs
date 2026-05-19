@@ -45,6 +45,8 @@ const PTY_BUFFER_LIMIT_BYTES: usize = 512 * 1024;
 const GREP_MATCH_LIMIT: usize = 2000;
 const GREP_OUTPUT_LIMIT_BYTES: usize = 512 * 1024;
 const COMMAND_OUTPUT_LIMIT_BYTES: usize = 1024 * 1024;
+const LOGIN_SHELL_ENV_TIMEOUT_MS: u64 = 4_000;
+const LOGIN_SHELL_ENV_OUTPUT_LIMIT_BYTES: usize = 256 * 1024;
 const DOCUMENT_READER_SCRIPT: &str = include_str!("../Scripts/document_reader.py");
 const HTTP_CONNECT_TIMEOUT_SECS: u64 = 15;
 const HTTP_SHORT_TIMEOUT_SECS: u64 = 15;
@@ -70,6 +72,7 @@ extern "C" {
 }
 
 static TOKENIZER: OnceLock<CoreBPE> = OnceLock::new();
+static TERMINAL_ENV_OVERRIDES: OnceLock<HashMap<String, String>> = OnceLock::new();
 
 // region: 调试日志
 
@@ -1669,6 +1672,261 @@ fn default_shell() -> String {
     }
 }
 
+fn shell_file_name(shell: &str) -> String {
+    Path::new(shell)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(shell)
+        .trim_start_matches('-')
+        .to_ascii_lowercase()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn apply_login_shell_args(cmd: &mut CommandBuilder, shell: &str) {
+    match shell_file_name(shell).as_str() {
+        "bash" | "fish" | "zsh" => cmd.args(["-l"]),
+        _ => {}
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn apply_login_shell_args(_cmd: &mut CommandBuilder, _shell: &str) {}
+
+#[cfg(not(target_os = "windows"))]
+fn configure_login_env_probe(command: &mut ProcessCommand, shell: &str) {
+    match shell_file_name(shell).as_str() {
+        "bash" | "fish" | "zsh" => {
+            command.args(["-i", "-l", "-c", "/usr/bin/env -0"]);
+        }
+        _ => {
+            command.args(["-l", "-c", "/usr/bin/env -0"]);
+        }
+    }
+}
+
+fn is_valid_env_key(key: &str) -> bool {
+    !key.is_empty()
+        && key
+            .chars()
+            .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn parse_login_shell_env_output(output: &str) -> HashMap<String, String> {
+    let mut env = HashMap::new();
+
+    for entry in output.split('\0') {
+        let cleaned = entry.rsplit('\n').next().unwrap_or(entry);
+        let Some((key, value)) = cleaned.split_once('=') else {
+            continue;
+        };
+        if is_valid_env_key(key) {
+            env.insert(key.to_string(), value.to_string());
+        }
+    }
+
+    env
+}
+
+fn push_unique_path_text(paths: &mut Vec<String>, path: String) {
+    if path.is_empty() || paths.iter().any(|existing| existing == &path) {
+        return;
+    }
+    paths.push(path);
+}
+
+fn push_unique_path(paths: &mut Vec<String>, path: impl AsRef<Path>) {
+    push_unique_path_text(paths, path.as_ref().to_string_lossy().to_string());
+}
+
+fn push_existing_path(paths: &mut Vec<String>, path: impl AsRef<Path>) {
+    let path = path.as_ref();
+    if path.is_dir() {
+        push_unique_path(paths, path);
+    }
+}
+
+fn collect_glob_path_candidates(paths: &mut Vec<String>, pattern: String) {
+    if let Ok(matches) = glob(&pattern) {
+        let mut entries = matches.flatten().collect::<Vec<_>>();
+        entries.sort_by(|a, b| b.cmp(a));
+        for entry in entries {
+            push_existing_path(paths, entry);
+        }
+    }
+}
+
+fn developer_path_candidates() -> Vec<String> {
+    let mut paths = Vec::new();
+
+    if cfg!(target_os = "macos") {
+        push_existing_path(&mut paths, "/opt/homebrew/bin");
+        push_existing_path(&mut paths, "/opt/homebrew/sbin");
+        push_existing_path(&mut paths, "/usr/local/bin");
+        push_existing_path(&mut paths, "/usr/local/sbin");
+        push_existing_path(&mut paths, "/opt/local/bin");
+        push_existing_path(&mut paths, "/opt/local/sbin");
+    } else if cfg!(target_os = "linux") {
+        push_existing_path(&mut paths, "/usr/local/bin");
+        push_existing_path(&mut paths, "/usr/local/sbin");
+        push_existing_path(&mut paths, "/snap/bin");
+    }
+
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        push_existing_path(&mut paths, home.join(".local/bin"));
+        push_existing_path(&mut paths, home.join("bin"));
+        push_existing_path(&mut paths, home.join(".cargo/bin"));
+        push_existing_path(&mut paths, home.join(".volta/bin"));
+        push_existing_path(&mut paths, home.join(".asdf/shims"));
+        push_existing_path(&mut paths, home.join(".pyenv/shims"));
+        push_existing_path(&mut paths, home.join(".rbenv/shims"));
+        push_existing_path(&mut paths, home.join(".deno/bin"));
+        push_existing_path(&mut paths, home.join(".bun/bin"));
+        push_existing_path(&mut paths, home.join(".npm-global/bin"));
+        push_existing_path(&mut paths, home.join(".local/share/pnpm"));
+        push_existing_path(&mut paths, home.join("Library/pnpm"));
+        collect_glob_path_candidates(
+            &mut paths,
+            home.join(".nvm/versions/node/*/bin")
+                .to_string_lossy()
+                .to_string(),
+        );
+        collect_glob_path_candidates(
+            &mut paths,
+            home.join(".fnm/node-versions/*/installation/bin")
+                .to_string_lossy()
+                .to_string(),
+        );
+    }
+
+    paths
+}
+
+fn split_path_text(path: &str) -> Vec<String> {
+    let raw = std::ffi::OsString::from(path);
+    std::env::split_paths(&raw)
+        .map(|entry| entry.to_string_lossy().to_string())
+        .collect()
+}
+
+fn join_path_text(paths: &[String]) -> Option<String> {
+    let path_bufs = paths.iter().map(PathBuf::from).collect::<Vec<_>>();
+    std::env::join_paths(path_bufs)
+        .ok()
+        .and_then(|value| value.into_string().ok())
+}
+
+fn build_terminal_path(base_path: Option<&str>, prefer_base_order: bool) -> Option<String> {
+    let mut paths = Vec::new();
+    let developer_paths = developer_path_candidates();
+
+    if !prefer_base_order {
+        for path in developer_paths.iter() {
+            push_unique_path_text(&mut paths, path.clone());
+        }
+    }
+
+    if let Some(base_path) = base_path {
+        for path in split_path_text(base_path) {
+            push_unique_path_text(&mut paths, path);
+        }
+    }
+
+    for path in developer_paths {
+        push_unique_path_text(&mut paths, path);
+    }
+
+    join_path_text(&paths)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn capture_login_shell_environment() -> Option<HashMap<String, String>> {
+    let shell = default_shell();
+    let mut command = ProcessCommand::new(&shell);
+    configure_login_env_probe(&mut command, &shell);
+    isolate_process_group(&mut command);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command.spawn().ok()?;
+    let stdout_handle = child.stdout.take().map(|stdout| {
+        thread::spawn(move || read_limited_pipe(stdout, LOGIN_SHELL_ENV_OUTPUT_LIMIT_BYTES))
+    });
+    let stderr_handle = child.stderr.take().map(|stderr| {
+        thread::spawn(move || read_limited_pipe(stderr, LOGIN_SHELL_ENV_OUTPUT_LIMIT_BYTES))
+    });
+
+    let started_at = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if started_at.elapsed() >= Duration::from_millis(LOGIN_SHELL_ENV_TIMEOUT_MS) {
+                    let _ = terminate_timed_out_child(&mut child);
+                    let _ = join_captured_pipe(stdout_handle, "login shell stdout");
+                    let _ = join_captured_pipe(stderr_handle, "login shell stderr");
+                    return None;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => return None,
+        }
+    };
+
+    let stdout = join_captured_pipe(stdout_handle, "login shell stdout").ok()?;
+    let _ = join_captured_pipe(stderr_handle, "login shell stderr");
+    if !status.success() && stdout.text.trim().is_empty() {
+        return None;
+    }
+
+    let env = parse_login_shell_env_output(&stdout.text);
+    if env.is_empty() {
+        None
+    } else {
+        Some(env)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn capture_login_shell_environment() -> Option<HashMap<String, String>> {
+    None
+}
+
+fn terminal_env_overrides() -> &'static HashMap<String, String> {
+    TERMINAL_ENV_OVERRIDES.get_or_init(|| {
+        let mut env = capture_login_shell_environment().unwrap_or_default();
+        let has_login_path = env
+            .get("PATH")
+            .is_some_and(|value| !value.trim().is_empty());
+        let base_path = if has_login_path {
+            env.get("PATH").map(String::as_str)
+        } else {
+            None
+        };
+        let fallback_path = std::env::var("PATH").ok();
+        let final_path =
+            build_terminal_path(base_path.or(fallback_path.as_deref()), has_login_path);
+        if let Some(path) = final_path {
+            env.insert("PATH".to_string(), path);
+        }
+        env
+    })
+}
+
+fn apply_terminal_env_to_pty(cmd: &mut CommandBuilder) {
+    for (key, value) in terminal_env_overrides() {
+        cmd.env(key, value);
+    }
+}
+
+fn apply_terminal_env_to_process(cmd: &mut ProcessCommand) {
+    for (key, value) in terminal_env_overrides() {
+        cmd.env(key, value);
+    }
+}
+
 fn preferred_utf8_locale() -> String {
     for key in ["LC_ALL", "LC_CTYPE", "LANG"] {
         if let Ok(value) = std::env::var(key) {
@@ -1694,6 +1952,7 @@ fn preferred_utf8_locale() -> String {
 }
 
 fn apply_pty_terminal_env(cmd: &mut CommandBuilder) {
+    apply_terminal_env_to_pty(cmd);
     let locale = preferred_utf8_locale();
     cmd.env("LANG", &locale);
     cmd.env("LC_ALL", &locale);
@@ -1705,6 +1964,7 @@ fn apply_pty_terminal_env(cmd: &mut CommandBuilder) {
 }
 
 fn apply_process_terminal_env(cmd: &mut ProcessCommand) {
+    apply_terminal_env_to_process(cmd);
     let locale = preferred_utf8_locale();
     cmd.env("LANG", &locale)
         .env("LC_ALL", &locale)
@@ -1786,6 +2046,20 @@ mod terminal_utf8_tests {
         let bytes = "中文".as_bytes();
 
         assert_eq!(decode_utf8_lossy_for_display(&bytes[1..]), "文");
+    }
+
+    #[test]
+    fn login_shell_env_parser_skips_noise_and_invalid_keys() {
+        let parsed = parse_login_shell_env_output(
+            "startup banner\nPATH=/opt/homebrew/bin:/usr/bin\0BAD-KEY=value\0HOME=/Users/test\0",
+        );
+
+        assert_eq!(
+            parsed.get("PATH").map(String::as_str),
+            Some("/opt/homebrew/bin:/usr/bin")
+        );
+        assert_eq!(parsed.get("HOME").map(String::as_str), Some("/Users/test"));
+        assert!(!parsed.contains_key("BAD-KEY"));
     }
 }
 
@@ -4145,6 +4419,8 @@ fn spawn_pty(
     let mut cmd = CommandBuilder::new(&shell);
     if cfg!(target_os = "windows") {
         cmd.args(["/K", "chcp 65001>nul"]);
+    } else {
+        apply_login_shell_args(&mut cmd, &shell);
     }
     apply_pty_terminal_env(&mut cmd);
     let root = resolve_workspace_root(&workspace_state, workspace)?;
