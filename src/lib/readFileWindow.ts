@@ -11,6 +11,22 @@ interface NormalizedReadFileWindow {
   explicitWindow: boolean;
 }
 
+export interface ReadFileWindowRange {
+  startLine: number;
+  endLine: number;
+  requestedMaxLines: number;
+  explicitWindow: boolean;
+}
+
+export interface ReadFileWindowCoveragePlan {
+  original: ReadFileWindowRange;
+  overlapped: boolean;
+  fullyCovered: boolean;
+  suggestedArgs?: Record<string, unknown>;
+  suggestedRange?: ReadFileWindowRange;
+  coveredRanges: Array<{ startLine: number; endLine: number }>;
+}
+
 export interface ReadFileWindowMetadata {
   marker: typeof READ_FILE_RESULT_MARKER;
   path: string;
@@ -82,6 +98,115 @@ function normalizeWindowArgs(
     requestedEndLine: Math.max(startLine, requestedEndLine),
     requestedMaxLines,
     explicitWindow,
+  };
+}
+
+export function resolveReadFileWindowRequest(
+  args: Record<string, unknown>,
+  totalLines: number,
+): ReadFileWindowRange {
+  const normalized = normalizeWindowArgs(args, totalLines);
+  return {
+    startLine: normalized.startLine,
+    endLine: normalized.requestedEndLine,
+    requestedMaxLines: normalized.requestedMaxLines,
+    explicitWindow: normalized.explicitWindow,
+  };
+}
+
+function normalizeCoverageRanges(
+  ranges: Array<{ startLine: number; endLine: number }>,
+  totalLines: number,
+): Array<{ startLine: number; endLine: number }> {
+  const clamped = ranges
+    .map((range) => ({
+      startLine: Math.max(1, Math.floor(Number(range.startLine) || 0)),
+      endLine: Math.min(Math.max(totalLines, 1), Math.floor(Number(range.endLine) || 0)),
+    }))
+    .filter((range) => range.startLine > 0 && range.endLine >= range.startLine)
+    .sort((a, b) => a.startLine - b.startLine || a.endLine - b.endLine);
+
+  const merged: Array<{ startLine: number; endLine: number }> = [];
+  for (const range of clamped) {
+    const previous = merged[merged.length - 1];
+    if (previous && range.startLine <= previous.endLine + 1) {
+      previous.endLine = Math.max(previous.endLine, range.endLine);
+    } else {
+      merged.push({ ...range });
+    }
+  }
+  return merged;
+}
+
+export function planReadFileWindowCoverage(
+  args: Record<string, unknown>,
+  totalLines: number,
+  coveredRanges: Array<{ startLine: number; endLine: number }>,
+): ReadFileWindowCoveragePlan {
+  const original = resolveReadFileWindowRequest(args, totalLines);
+  const normalizedCoverage = normalizeCoverageRanges(coveredRanges, totalLines);
+  const overlapped = normalizedCoverage.some((range) =>
+    range.startLine <= original.endLine && range.endLine >= original.startLine
+  );
+
+  if (!overlapped) {
+    return {
+      original,
+      overlapped: false,
+      fullyCovered: false,
+      coveredRanges: normalizedCoverage,
+    };
+  }
+
+  const gaps: Array<{ startLine: number; endLine: number }> = [];
+  let cursor = original.startLine;
+  for (const range of normalizedCoverage) {
+    if (range.endLine < cursor) continue;
+    if (range.startLine > original.endLine) break;
+    if (range.startLine > cursor) {
+      gaps.push({ startLine: cursor, endLine: Math.min(range.startLine - 1, original.endLine) });
+    }
+    cursor = Math.max(cursor, range.endLine + 1);
+    if (cursor > original.endLine) break;
+  }
+  if (cursor <= original.endLine) {
+    gaps.push({ startLine: cursor, endLine: original.endLine });
+  }
+
+  if (gaps.length === 0) {
+    return {
+      original,
+      overlapped: true,
+      fullyCovered: true,
+      coveredRanges: normalizedCoverage,
+    };
+  }
+
+  const firstGap = gaps[0];
+  const suggestedEndLine = Math.min(
+    firstGap.endLine,
+    firstGap.startLine + Math.max(1, original.requestedMaxLines) - 1,
+  );
+  const suggestedRange: ReadFileWindowRange = {
+    startLine: firstGap.startLine,
+    endLine: suggestedEndLine,
+    requestedMaxLines: Math.max(1, suggestedEndLine - firstGap.startLine + 1),
+    explicitWindow: true,
+  };
+  const suggestedArgs = {
+    ...args,
+    start_line: suggestedRange.startLine,
+    end_line: suggestedRange.endLine,
+    max_lines: suggestedRange.requestedMaxLines,
+  };
+
+  return {
+    original,
+    overlapped: true,
+    fullyCovered: false,
+    suggestedArgs,
+    suggestedRange,
+    coveredRanges: normalizedCoverage,
   };
 }
 

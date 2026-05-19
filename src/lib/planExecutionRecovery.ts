@@ -67,6 +67,101 @@ function summarizeToolActivity(activity: PlanToolActivitySummary): string {
   return compactLine(`${activity.status}:${activity.name}${target}${detail}`);
 }
 
+function normalizeMatchText(value: string): string {
+  return String(value || "")
+    .replace(/\\/g, "/")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function baseName(value: string): string {
+  const normalized = normalizeMatchText(value);
+  return normalized.split("/").filter(Boolean).pop() || normalized;
+}
+
+function collectPlanTaskMatchValues(task: PlanTask): string[] {
+  const values = [
+    task.text,
+    ...(task.commands || []),
+    ...(task.evidence || []).map((item) => item.value),
+  ].map(normalizeMatchText).filter(Boolean);
+  return [...new Set(values)];
+}
+
+function extractPathLikeSegments(value: string): string[] {
+  const source = String(value || "").replace(/\\/g, "/");
+  const matches = source.match(/[A-Za-z0-9_.@-]+(?:\/[A-Za-z0-9_.@-]+)+/g) || [];
+  return matches.map(normalizeMatchText).filter(Boolean);
+}
+
+function collectActivityTargets(input: {
+  recentToolActivity: PlanToolActivitySummary[];
+  currentTool?: string;
+  latestEvidence?: string;
+}): string[] {
+  const values: string[] = [];
+  for (const activity of input.recentToolActivity.slice(-4).reverse()) {
+    if (activity.target) values.push(activity.target);
+    values.push(`${activity.name} ${activity.target || ""}`);
+  }
+  if (input.currentTool) values.push(input.currentTool);
+  if (input.latestEvidence) values.push(input.latestEvidence);
+  const expanded = values.flatMap((value) => [value, ...extractPathLikeSegments(value)]);
+  return [...new Set(expanded.map(normalizeMatchText).filter(Boolean))];
+}
+
+function scoreTaskForActivity(task: PlanTask, targets: string[]): number {
+  const taskValues = collectPlanTaskMatchValues(task);
+  if (taskValues.length === 0 || targets.length === 0) return 0;
+  let score = 0;
+  for (const target of targets) {
+    const targetBase = baseName(target);
+    if (!targetBase) continue;
+    for (const value of taskValues) {
+      const valueBase = baseName(value);
+      if (value === target || (value.length > 8 && target.includes(value)) || (target.length > 8 && value.includes(target))) {
+        score = Math.max(score, 8);
+      } else if (valueBase && valueBase.length > 3 && valueBase === targetBase) {
+        score = Math.max(score, 5);
+      } else if (targetBase.length > 4 && value.includes(targetBase)) {
+        score = Math.max(score, 3);
+      }
+    }
+  }
+  if (score > 0 && task.status !== "completed") score += 1;
+  return score;
+}
+
+function resolveActivePlanTask(input: {
+  tasks: PlanTask[];
+  recentToolActivity: PlanToolActivitySummary[];
+  currentTool?: string;
+  latestEvidence?: string;
+}): PlanTask | undefined {
+  const targets = collectActivityTargets(input);
+  let bestTask: PlanTask | undefined;
+  let bestScore = 0;
+  let bestIndex = -1;
+  input.tasks.forEach((task, index) => {
+    const score = scoreTaskForActivity(task, targets);
+    if (score < 3) return;
+    if (!bestTask || score > bestScore || (score === bestScore && index > bestIndex)) {
+      bestTask = task;
+      bestScore = score;
+      bestIndex = index;
+    }
+  });
+  return bestTask;
+}
+
+function isBroadPlanTask(task: PlanTask | undefined): boolean {
+  const text = normalizeMatchText(task?.text || "");
+  if (!text) return false;
+  return /^(?:目标|goal)[：:]/i.test(text) ||
+    /(?:\b\d+\s*(?:个|core)?\s*(?:核心)?(?:问题|issues)|整体|全局|设计规范|design\s+spec|all\s+core\s+issues)/i.test(text);
+}
+
 function topLines(values: string[], fallback: string, limit = 5): string[] {
   const lines = values.map((value) => compactLine(value)).filter(Boolean).slice(0, limit);
   return lines.length > 0 ? lines : [fallback];
@@ -149,7 +244,7 @@ function getPlanProgressNextStep(
     return language === "zh" ? "保存检查点并决定是否自动续跑" : "save a checkpoint and decide whether to auto-resume";
   }
   if (phase === "context_compression") {
-    return language === "zh" ? "基于压缩后的上下文继续，必要时重新读取当前文件" : "continue with compacted context and reread current files if needed";
+    return language === "zh" ? "基于压缩后的上下文继续；只在需要精确缺失行时定向读取" : "continue with compacted context; reread only the exact missing lines if needed";
   }
   if (phase === "waiting_review") {
     return language === "zh" ? "等待工具调用审批后继续执行" : "wait for tool approval, then continue execution";
@@ -157,7 +252,13 @@ function getPlanProgressNextStep(
   if (phase === "tool_error") {
     return language === "zh" ? "根据工具错误修正下一步，必要时暂停给出恢复信息" : "recover from the tool error or pause with recovery details";
   }
-  if (remainingTask) return compactLine(remainingTask.text);
+  if (remainingTask) {
+    return compactLine(
+      language === "zh"
+        ? `继续满足剩余证据，可按当前诊断选择最合理顺序：${remainingTask.text}`
+        : `continue satisfying remaining evidence in the most reasonable order: ${remainingTask.text}`,
+    );
+  }
   return language === "zh"
     ? "确认 runtime 任务清单、交付物与验证证据都已满足；tasks.md 仅在已知存在时同步"
     : "confirm the runtime task list, deliverables, and verification evidence are satisfied; sync tasks.md only if it is known to exist";
@@ -187,8 +288,18 @@ export function buildPlanExecutionProgressUpdate(input: {
     ? summarizeToolActivity(input.recentToolActivity[input.recentToolActivity.length - 1])
     : "";
   const recentEvidence = summarizePlanExecutionEvidence(input.evidenceLedger, 1)[0] || "";
-  const currentTask = remainingTask
+  const activeTask = resolveActivePlanTask({
+    tasks: audit.tasks,
+    recentToolActivity: input.recentToolActivity,
+    currentTool: input.currentTool,
+    latestEvidence: input.latestEvidence || recentEvidence,
+  });
+  const currentTask = activeTask
+    ? summarizeTask(activeTask)
+    : remainingTask && !(recentTool && isBroadPlanTask(remainingTask))
     ? summarizeTask(remainingTask)
+    : recentTool
+    ? compactLine(input.language === "zh" ? `当前动作：${recentTool}` : `Current action: ${recentTool}`)
     : input.language === "zh" ? "核查最终证据" : "verify final evidence";
 
   return {
@@ -388,7 +499,7 @@ export function buildPlanMaxIterationsPauseNotice(
     "- blockers:",
     ...(blockerLines.length ? blockerLines : ["- Hit the plan execution iteration safety limit"]),
     "",
-    "Next: click Resume Execution to start a fresh recovery context, reread current workspace state, and continue from the first task whose evidence is not satisfied.",
+    "Next: click Resume Execution to start a fresh recovery context, reread current workspace state, and continue with the evidence-unsatisfied task that best matches the current diagnosis.",
   ].join("\n");
 }
 
@@ -519,9 +630,9 @@ export function buildPlanMaxIterationsResumePrompt(input: {
     return [
       "请在新的恢复上下文中继续执行已批准计划。这是 MAIN 在 50 轮安全边界后的自动恢复，只允许继续真实未完成工作。",
       input.hasTasksArtifact
-        ? "先重新读取当前 workspace 状态和 `.MAIN/plans/tasks.md`，从第一个证据未满足的任务继续。"
+        ? "先重新读取当前 workspace 状态和 `.MAIN/plans/tasks.md`，选择证据未满足且与当前改动最相关的任务继续；顺序是参考，不是强制线性流程。"
         : input.tasks.length > 0
-        ? "当前已有 runtime 任务清单；先重新读取当前 workspace 状态，再从第一个证据未满足的任务继续。只有长任务、跨会话恢复或需要审计留档时才持久化 `.MAIN/plans/tasks.md`；不要为了确认它是否存在而读取它。"
+        ? "当前已有 runtime 任务清单；先重新读取当前 workspace 状态，再选择证据未满足且与当前诊断最相关的任务继续。只有长任务、跨会话恢复或需要审计留档时才持久化 `.MAIN/plans/tasks.md`；不要为了确认它是否存在而读取它。"
         : "先基于已批准的 design.md 或 bugfix.md 派生 runtime 任务清单；旧 requirements.md 只作为辅助上下文。只有长任务、跨会话恢复或需要审计留档时才生成 `.MAIN/plans/tasks.md`；不要默认读取缺失的 tasks.md。",
       "不要重做已经满足证据的任务；如果存在 tasks.md，不要只修改 checkbox；不要重复计划说明；不要把 `.MAIN/plans` 当作用户源码证据。需要判断源码现状时，直接读取真实项目文件。",
       "",
@@ -547,9 +658,9 @@ export function buildPlanMaxIterationsResumePrompt(input: {
   return [
     "Continue the approved plan in a fresh recovery context. This is MAIN's automatic recovery after the 50-iteration safety boundary; only continue real unfinished work.",
     input.hasTasksArtifact
-      ? "First reread current workspace state and `.MAIN/plans/tasks.md`, then continue from the first task whose evidence is not satisfied."
+      ? "First reread current workspace state and `.MAIN/plans/tasks.md`, then choose the evidence-unsatisfied task that best matches the current change; task order is guidance, not a forced linear path."
       : input.tasks.length > 0
-      ? "A runtime task list is already available; first reread current workspace state, then continue from the first task whose evidence is not satisfied. Persist `.MAIN/plans/tasks.md` only for long work, cross-session recovery, or audit-file needs; do not read it just to check existence."
+      ? "A runtime task list is already available; first reread current workspace state, then choose the evidence-unsatisfied task that best matches the current diagnosis. Persist `.MAIN/plans/tasks.md` only for long work, cross-session recovery, or audit-file needs; do not read it just to check existence."
       : "First derive a runtime task list from the approved design.md or bugfix.md; use any legacy requirements.md only as supporting context. Generate `.MAIN/plans/tasks.md` only for long work, cross-session recovery, or audit-file needs; do not read missing tasks.md by default.",
     "Do not redo tasks whose evidence is already satisfied. If tasks.md exists, do not only edit checkboxes. Do not restate the plan. Do not treat `.MAIN/plans` as project-source evidence; read real project files when source state matters.",
     "",

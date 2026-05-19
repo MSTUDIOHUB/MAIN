@@ -51,6 +51,8 @@ function normalizeForCompare(text: string): string {
 export function normalizeThoughtSummaryForCompare(text: string): string {
   return normalizeForCompare(text)
     .replace(/\bthought display\b/g, "思考显示")
+    .replace(/(?:我)?(?:已经|已|刚刚)(?:完成|确认|处理|检查|读取|修改|更新|实现|验证)/g, "")
+    .replace(/(?:接下来|下一步|然后|现在)(?:我)?(?:会|将|要|需要|继续|准备)?/g, "")
     .replace(/(?:下一步|会把|把|接入)/g, "")
     .replace(/我(?:需要|准备|会|将|先|正在|已经|要)?/g, "")
     .replace(/(?:需要|准备|正在|已经|先)/g, "")
@@ -389,6 +391,27 @@ function isStaleSetupSummaryLine(text: string): boolean {
   return /(?:第一次指令|最初指令|初始指令|first instruction|initial prompt|original prompt)/i.test(normalized);
 }
 
+function isProgressEchoSummaryLine(text: string): boolean {
+  const normalized = String(text || "").replace(/\s+/g, " ").trim();
+  if (normalized.length < 18) return false;
+  return /(?:已(?:经)?|刚刚)(?:完成|确认|处理|读取|检查|修改|更新|实现|验证).{0,120}(?:接下来|下一步|继续|现在|然后)|(?:接下来|下一步).{0,120}(?:继续|处理|修复|检查|验证|实现|更新|修改)/i.test(normalized) ||
+    /\b(?:completed|confirmed|handled|checked|updated|implemented|verified)\b.{0,120}\b(?:next|continue|then|now)\b/i.test(normalized);
+}
+
+function limitProgressEchoSummaryLines(lines: string[], mode: "first" | "latest", maxProgressLines = 2): string[] {
+  const ordered = mode === "latest" ? [...lines].reverse() : lines;
+  const kept: string[] = [];
+  let progressCount = 0;
+  for (const line of ordered) {
+    if (isProgressEchoSummaryLine(line)) {
+      progressCount += 1;
+      if (progressCount > maxProgressLines) continue;
+    }
+    kept.push(line);
+  }
+  return mode === "latest" ? kept.reverse() : kept;
+}
+
 function takeWithinBudget(lines: string[], maxLines: number, charBudget: number, mode: "first" | "latest"): string[] {
   const result: string[] = [];
   const source = mode === "latest" ? [...lines].reverse() : lines;
@@ -420,7 +443,7 @@ function pickAdaptiveSummaryLines(cleanText: string, maxLines: number, mode: "fi
   const richLines = lines.filter((line) => !isLowValueProcessSummaryLine(line));
   if (richLines.length === 0) return [];
   const usefulLines = richLines.filter((line) => !isStaleSetupSummaryLine(line));
-  const source = usefulLines.length >= 2 ? usefulLines : richLines;
+  const source = limitProgressEchoSummaryLines(usefulLines.length >= 2 ? usefulLines : richLines, mode);
   return takeWithinBudget(source, Math.max(3, maxLines), ADAPTIVE_SUMMARY_CHAR_BUDGET, mode);
 }
 

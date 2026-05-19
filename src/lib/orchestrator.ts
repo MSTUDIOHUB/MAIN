@@ -52,6 +52,7 @@ import { syncPlanArtifactAfterToolSuccess } from "./planArtifactSync";
 import {
   buildReadFileWindowContinuationGuidance,
   extractReadFileWindowMetadata,
+  planReadFileWindowCoverage,
 } from "./readFileWindow";
 import {
   initialLifecycleStateForPlanAction,
@@ -1458,7 +1459,7 @@ function buildApprovedPlanNoToolPauseMessage(
         "未完成任务：",
         remainingText,
         "",
-        "下一步：点击 Resume Execution 后，MAIN 应先重新读取当前 workspace 状态，再继续第一个证据未满足的任务。",
+        "下一步：点击 Resume Execution 后，MAIN 应先重新读取当前 workspace 状态，再选择证据未满足且与当前诊断最相关的任务继续。",
         "",
         "RecoveryDetails:",
         "- type: remaining_plan_tasks_limit",
@@ -1478,7 +1479,7 @@ function buildApprovedPlanNoToolPauseMessage(
         "Remaining tasks:",
         remainingText,
         "",
-        "Next: click Resume Execution so MAIN rereads current workspace state and continues from the first task whose evidence is not satisfied.",
+        "Next: click Resume Execution so MAIN rereads current workspace state and continues with the evidence-unsatisfied task that best matches the current diagnosis.",
         "",
         "RecoveryDetails:",
         "- type: remaining_plan_tasks_limit",
@@ -2637,6 +2638,77 @@ function buildFileUnchangedStub(state: FileReadState): string {
     "Reuse the earlier file content already in context. Do not call read_file for this same file/range again unless you have reason to believe it changed.",
     "Next: inspect a different file, use get_file_outline/grep_search for a narrower question, or continue the implementation/answer from the cached content.",
   ].join("\n");
+}
+
+function formatReadFileWindowCoverageStub(
+  path: string,
+  plan: ReturnType<typeof planReadFileWindowCoverage>,
+): string {
+  const covered = plan.coveredRanges
+    .map((range) => `${range.startLine}-${range.endLine}`)
+    .join(", ");
+  return [
+    `${FILE_UNCHANGED_STUB}: "${path}" requested lines ${plan.original.startLine}-${plan.original.endLine}, but that window is already covered by unchanged earlier read_file results.`,
+    covered ? `Covered read windows already in context: ${covered}.` : "",
+    "Reuse the earlier source already in context instead of rereading the same lines.",
+    "Next: continue the implementation, use get_file_outline/grep_search for a narrower question, or request only a missing line range.",
+  ].filter(Boolean).join("\n");
+}
+
+function formatReadFileWindowNarrowedNote(
+  path: string,
+  plan: ReturnType<typeof planReadFileWindowCoverage>,
+): string {
+  const suggested = plan.suggestedRange;
+  if (!suggested) return "";
+  const covered = plan.coveredRanges
+    .map((range) => `${range.startLine}-${range.endLine}`)
+    .join(", ");
+  return [
+    `READ_FILE_WINDOW_NARROWED: "${path}" was requested as lines ${plan.original.startLine}-${plan.original.endLine}, overlapping unchanged lines already in context.`,
+    covered ? `Existing windows: ${covered}.` : "",
+    `MAIN returned only the missing window ${suggested.startLine}-${suggested.endLine} to avoid duplicating tool-result context.`,
+  ].filter(Boolean).join("\n");
+}
+
+function getReadFileCoverageForPath(input: {
+  states: Map<string, FileReadState>;
+  path: string;
+  metadata: { path: string; sizeBytes: number; modifiedMs: number } | null;
+  currentSignature: string;
+}): {
+  fullFileState: FileReadState | null;
+  ranges: Array<{ startLine: number; endLine: number }>;
+  totalLines: number;
+} {
+  const normalizedPath = normalizePathLike(input.metadata?.path || input.path).toLowerCase();
+  const ranges: Array<{ startLine: number; endLine: number }> = [];
+  let fullFileState: FileReadState | null = null;
+  let totalLines = 0;
+
+  for (const [signature, state] of input.states.entries()) {
+    if (signature === input.currentSignature) continue;
+    if (normalizePathLike(state.path).toLowerCase() !== normalizedPath) continue;
+    if (
+      input.metadata &&
+      (state.sizeBytes !== input.metadata.sizeBytes || state.modifiedMs !== input.metadata.modifiedMs)
+    ) {
+      continue;
+    }
+
+    const windowMetadata = extractReadFileWindowMetadata(state.modelContent);
+    if (windowMetadata) {
+      totalLines = Math.max(totalLines, windowMetadata.totalLines);
+      ranges.push({
+        startLine: windowMetadata.returnedStartLine,
+        endLine: windowMetadata.returnedEndLine,
+      });
+    } else if (!fullFileState) {
+      fullFileState = state;
+    }
+  }
+
+  return { fullFileState, ranges, totalLines };
 }
 
 async function readFileMetadataIfAvailable(path: string, workspace?: string): Promise<{ path: string; sizeBytes: number; modifiedMs: number } | null> {
@@ -6492,6 +6564,7 @@ export async function executeAgentLoop(
     const writeCalls: ToolCallToExecute[] = [];
     const toolArgsByCallId = new Map<string, Record<string, unknown>>();
     const readOnlyCallSignatures = new Map<string, string>();
+    const readFileWindowNarrowedNotes = new Map<string, string>();
     const queuedReadOnlySignatures = new Set<string>();
     const toolFailureSignatures = new Map<string, string>();
     let allResults: ToolExecutionResult[] = [];
@@ -6616,17 +6689,18 @@ export async function executeAgentLoop(
       if (planned.action === "local_file_read_review" && planned.localFileReadPath) {
         localFileReadCalls.push({ id: tc.id, name: tc.name, arguments: tc.arguments, localFileReadPath: planned.localFileReadPath });
       } else if (planned.action === "auto_execute") {
-        const signature = buildReadOnlyCacheSignature(tc.name, toolArgs);
-        const cached = readOnlyResultCache.get(signature);
+        let effectiveToolArgs = toolArgs;
+        let signature = buildReadOnlyCacheSignature(tc.name, effectiveToolArgs);
+        let cached = readOnlyResultCache.get(signature);
         const fileReadMetadata =
           tc.name === "read_file" && typeof toolArgs.path === "string"
             ? await readFileMetadataIfAvailable(toolArgs.path, workspace)
             : null;
-        const fileReadSignature =
+        let fileReadSignature =
           tc.name === "read_file" && typeof toolArgs.path === "string"
-            ? buildFileReadSignature(fileReadMetadata?.path ?? toolArgs.path, toolArgs)
+            ? buildFileReadSignature(fileReadMetadata?.path ?? toolArgs.path, effectiveToolArgs)
             : "";
-        const fileReadState = fileReadSignature ? fileReadStates.get(fileReadSignature) : undefined;
+        let fileReadState = fileReadSignature ? fileReadStates.get(fileReadSignature) : undefined;
 
         if (fileReadState) {
           const metadata = fileReadMetadata ?? await readFileMetadataIfAvailable(fileReadState.path, workspace);
@@ -6686,6 +6760,73 @@ export async function executeAgentLoop(
           }
         }
 
+        if (tc.name === "read_file" && typeof toolArgs.path === "string" && fileReadMetadata) {
+          const coverage = getReadFileCoverageForPath({
+            states: fileReadStates,
+            path: toolArgs.path,
+            metadata: fileReadMetadata,
+            currentSignature: fileReadSignature,
+          });
+          if (coverage.fullFileState) {
+            const duplicateCount = (readOnlyDuplicateSkipCounts.get(coverage.fullFileState.signature) ?? 0) + 1;
+            readOnlyDuplicateSkipCounts.set(coverage.fullFileState.signature, duplicateCount);
+            const content = buildFileUnchangedStub(coverage.fullFileState);
+            allResults.push({
+              toolCallId: tc.id,
+              name: tc.name,
+              target,
+              content,
+              displayContent: `${FILE_UNCHANGED_STUB}: ${target || coverage.fullFileState.path}`,
+              isError: false,
+            });
+            continue;
+          }
+
+          if (coverage.ranges.length > 0) {
+            const totalLines = Math.max(
+              coverage.totalLines,
+              ...coverage.ranges.map((range) => range.endLine),
+            );
+            const resolvedCoveragePlan = planReadFileWindowCoverage(effectiveToolArgs, totalLines, coverage.ranges);
+            if (resolvedCoveragePlan.fullyCovered) {
+              const duplicateCount = (readOnlyDuplicateSkipCounts.get(fileReadSignature || signature) ?? 0) + 1;
+              readOnlyDuplicateSkipCounts.set(fileReadSignature || signature, duplicateCount);
+              const content = formatReadFileWindowCoverageStub(fileReadMetadata.path, resolvedCoveragePlan);
+              allResults.push({
+                toolCallId: tc.id,
+                name: tc.name,
+                target,
+                content,
+                displayContent: `${FILE_UNCHANGED_STUB}: ${target || fileReadMetadata.path}`,
+                isError: false,
+              });
+              continue;
+            }
+            if (resolvedCoveragePlan.overlapped && resolvedCoveragePlan.suggestedArgs) {
+              effectiveToolArgs = resolvedCoveragePlan.suggestedArgs;
+              signature = buildReadOnlyCacheSignature(tc.name, effectiveToolArgs);
+              cached = readOnlyResultCache.get(signature);
+              fileReadSignature = buildFileReadSignature(fileReadMetadata.path, effectiveToolArgs);
+              fileReadState = fileReadStates.get(fileReadSignature);
+              const note = formatReadFileWindowNarrowedNote(fileReadMetadata.path, resolvedCoveragePlan);
+              if (note) readFileWindowNarrowedNotes.set(tc.id, note);
+              if (fileReadState) {
+                readFileWindowNarrowedNotes.delete(tc.id);
+                const content = buildFileUnchangedStub(fileReadState);
+                allResults.push({
+                  toolCallId: tc.id,
+                  name: tc.name,
+                  target,
+                  content,
+                  displayContent: `${FILE_UNCHANGED_STUB}: ${target || fileReadState.path}`,
+                  isError: false,
+                });
+                continue;
+              }
+            }
+          }
+        }
+
         if (cached || queuedReadOnlySignatures.has(signature)) {
           const duplicateCount = (readOnlyDuplicateSkipCounts.get(signature) ?? 0) + 1;
           readOnlyDuplicateSkipCounts.set(signature, duplicateCount);
@@ -6738,7 +6879,7 @@ export async function executeAgentLoop(
         readOnlyCalls.push({
           id: tc.id,
           name: tc.name,
-          arguments: tc.arguments,
+          arguments: JSON.stringify(effectiveToolArgs),
           allowExternalLocalRead:
             !!planned.localFileReadPath &&
             isLocalFileReadApproved(planned.localFileReadPath, approvedLocalFileReadPaths),
@@ -6775,7 +6916,16 @@ export async function executeAgentLoop(
         iterationAllTools,
         hooksConfig,
       );
+      const normalizedReadResults: ToolExecutionResult[] = [];
       for (const result of readResults) {
+        const narrowedNote = readFileWindowNarrowedNotes.get(result.toolCallId);
+        const resultForModel = narrowedNote && !result.isError
+          ? {
+              ...result,
+              content: `${narrowedNote}\n\n${result.content}`,
+              displayContent: result.displayContent || `${narrowedNote}\n\n${result.content}`,
+            }
+          : result;
         const signature = readOnlyCallSignatures.get(result.toolCallId);
         if (signature && !result.isError) {
           readOnlyResultCache.set(signature, {
@@ -6811,8 +6961,9 @@ export async function executeAgentLoop(
           }
           readOnlyDuplicateSkipCounts.delete(fileReadSignature);
         }
+        normalizedReadResults.push(resultForModel);
       }
-      allResults.push(...readResults);
+      allResults.push(...normalizedReadResults);
     }
 
     // Execute approved-by-user local file reads sequentially. These are read
@@ -7227,7 +7378,7 @@ export async function executeAgentLoop(
       const recoveryHint = remainingTask
         ? callbacks.getPreferredLanguage() === "zh"
           ? `\nRecovery: 请开启新的恢复上下文，从证据未满足的任务继续：${remainingTask.text}`
-          : `\nRecovery: start a fresh recovery context and continue from the first task with unsatisfied evidence: ${remainingTask.text}`
+          : `\nRecovery: start a fresh recovery context and continue with an evidence-unsatisfied task such as: ${remainingTask.text}`
         : callbacks.getPreferredLanguage() === "zh"
         ? "\nRecovery: 请开启新的恢复上下文，先复用已成功结果，再继续下一个文件或不同目标。"
         : "\nRecovery: start a fresh recovery context, reuse successful results, then continue with the next file or a different target.";

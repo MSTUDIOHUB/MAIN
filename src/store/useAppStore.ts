@@ -3400,11 +3400,11 @@ function buildTrustedPlanResumePrompt(input: {
     return [
       "请在新的恢复上下文中继续执行计划，不要复用上一轮错误链路。",
       input.hasTasksArtifact
-        ? "从 `.MAIN/plans/tasks.md` 中第一个证据未满足的任务开始。只有真实写入/命令成功/验证证据满足后，才可以把任务视为完成。"
+        ? "从 `.MAIN/plans/tasks.md` 中选择证据未满足且与当前改动最相关的任务继续；顺序是执行参考，不是强制线性流程。只有真实写入/命令成功/验证证据满足后，才可以把任务视为完成。"
         : input.artifacts.length === 0
         ? "先读取当前 workspace 的 `.MAIN/plans/design.md`；如果旧会话已存在 bugfix.md 或 requirements.md，可作为辅助上下文读取。不要默认读取 `.MAIN/plans/tasks.md`，除非它已在计划摘要中确认存在或用户明确要求。"
         : input.tasks.length > 0
-        ? "当前已恢复 runtime 任务清单；请从第一个证据未满足的任务开始直接执行。只有当任务较长、需要跨会话审计或用户要求留档时，才先把清单持久化到 `.MAIN/plans/tasks.md`；不要为了确认它是否存在而读取它。"
+        ? "当前已恢复 runtime 任务清单；请选择证据未满足且与当前诊断最相关的任务直接执行，顺序是参考而不是强制。只有当任务较长、需要跨会话审计或用户要求留档时，才先把清单持久化到 `.MAIN/plans/tasks.md`；不要为了确认它是否存在而读取它。"
         : "请先基于已批准的 design.md 派生 runtime 任务清单；只有长任务、跨会话恢复或需要审计留档时，才生成 `.MAIN/plans/tasks.md`；不要默认读取缺失的 tasks.md。然后执行真实任务。",
       "不要重写已经满足证据的任务；如果存在 tasks.md，不要只修改 checkbox；不要重复计划说明。",
       "",
@@ -3422,11 +3422,11 @@ function buildTrustedPlanResumePrompt(input: {
   return [
     "Continue plan execution in a fresh recovery context; do not reuse the previous errored loop.",
     input.hasTasksArtifact
-      ? "Start from the first task whose evidence is not satisfied. Treat a task as complete only after real file-write, successful command, Browser/Playwright DOM/screenshot evidence, or explicit pending user validation exists."
+      ? "Continue with an evidence-unsatisfied task that best matches the current change; task order is guidance, not a forced linear path. Treat a task as complete only after real file-write, successful command, Browser/Playwright DOM/screenshot evidence, or explicit pending user validation exists."
       : input.artifacts.length === 0
       ? "First read `.MAIN/plans/design.md` from the current workspace; if a legacy bugfix.md or requirements.md exists, use it only as supporting context. Do not read `.MAIN/plans/tasks.md` by default unless it is confirmed in the plan summary or the user explicitly asks for it."
       : input.tasks.length > 0
-      ? "A runtime task list is already available; start from the first task whose evidence is not satisfied. Persist it to `.MAIN/plans/tasks.md` only when the task is long, cross-session, or explicitly needs an audit file; do not read it just to check existence."
+      ? "A runtime task list is already available; choose the evidence-unsatisfied task that best matches the current diagnosis. Persist it to `.MAIN/plans/tasks.md` only when the task is long, cross-session, or explicitly needs an audit file; do not read it just to check existence."
       : "First derive a runtime task list from the approved design.md. Generate `.MAIN/plans/tasks.md` only for long work, cross-session recovery, or audit-file needs; do not read missing tasks.md by default. Then execute real tasks.",
     "Do not redo tasks whose evidence is already satisfied. If tasks.md exists, do not only edit checkboxes. Do not restate the plan.",
     "",
@@ -9508,10 +9508,13 @@ export const useAppStore = create<AppState>()(
                 total: Math.max(0, Math.round(stats.tokenBreakdown.total || 0)),
               }
             : undefined;
+          const topSourceSuffix = topTokenSource?.label && topTokenSource.tokens > 0
+            ? `，最大来源：${topTokenSource.label} ${topTokenSource.tokens.toLocaleString()} tokens`
+            : "";
           const label = reason === "reactive"
             ? `上下文溢出，已压缩背景，约 ${before.toLocaleString()} → ${after.toLocaleString()} tokens（释放 ${saved.toLocaleString()}）`
             : droppedMessageCount === 0 && microCompactedCount > 0
-              ? `长工具输出已截断，约 ${before.toLocaleString()} → ${after.toLocaleString()} tokens（释放 ${saved.toLocaleString()}，保留任务记忆）`
+              ? `长工具结果已压缩，约 ${before.toLocaleString()} → ${after.toLocaleString()} tokens（释放 ${saved.toLocaleString()}，保留任务记忆${topSourceSuffix}）`
               : `历史上下文已压缩，约 ${before.toLocaleString()} → ${after.toLocaleString()} tokens（释放 ${saved.toLocaleString()}，保留任务记忆）`;
           logStoreEvent("context_compressed", {
             turnId,

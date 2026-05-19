@@ -190,6 +190,25 @@ test("adaptive thought summary drops thin operation narrations", () => {
   assert.doesNotMatch(summary, /继续检查剩余关键文件/);
 });
 
+test("adaptive thought summary limits repeated progress echo lines", () => {
+  const display = deriveThoughtDisplay([
+    "已经完成主题配色检查，接下来继续处理 CSV 图表。",
+    "已经完成 CSV 图表检查，接下来继续处理课程名称清洗。",
+    "已经完成课程名称清洗检查，接下来继续处理布局遮挡。",
+    "已经完成布局遮挡检查，接下来继续验证构建。",
+    "关键结论是重复读取 App.tsx 会让 tool result 快速变大，需要缩窄 read_file 窗口。",
+  ].join("\n"), {
+    language: "zh",
+    mode: "latest",
+    density: "adaptive",
+  });
+
+  const summary = display.summaryLines.join("\n");
+  assert.ok(countOccurrences(summary, "接下来") <= 2);
+  assert.match(summary, /tool result/);
+  assert.match(summary, /read_file/);
+});
+
 test("thought summary removes dense punctuation noise and mode complaint loops", () => {
   const display = deriveThoughtDisplay([
     "当前 discuss 模式下 write_file 不可用，需要切换到执行模式。",

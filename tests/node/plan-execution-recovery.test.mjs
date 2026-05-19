@@ -245,8 +245,9 @@ test("plan execution progress snapshot is structured and ignores internal plan e
   assert.equal(snapshot.turnId, "turn-1");
   assert.equal(snapshot.phase, "tool_done");
   assert.equal(snapshot.iteration, 7);
-  assert.match(snapshot.currentTask, /Add resume guard tests/);
+  assert.match(snapshot.currentTask, /Update orchestrator recovery handling/);
   assert.match(snapshot.latestEvidence, /src\/lib\/orchestrator\.ts/);
+  assert.match(snapshot.nextStep, /Add resume guard tests/);
   assert.doesNotMatch(snapshot.latestEvidence, /\.MAIN\/plans/);
   assert.match(text, /Tool done/);
   assert.match(text, /Plan execution continuing/);
@@ -254,4 +255,59 @@ test("plan execution progress snapshot is structured and ignores internal plan e
   assert.doesNotMatch(text, /Latest evidence:/);
   assert.doesNotMatch(text, /Current tool:/);
   assert.doesNotMatch(text, /Next:/);
+});
+
+test("plan execution progress prefers active tool-matched task over broad first pending task", () => {
+  const update = buildPlanExecutionProgressUpdate({
+    language: "zh",
+    phase: "tool_start",
+    iterationCount: 3,
+    maxIterations: 50,
+    autoResumeCount: 0,
+    tasks: [
+      {
+        id: "broad",
+        text: "目标：修复 4 个核心问题，同时按 Linear.app 设计规范重构 UI 配色",
+        status: "pending",
+        evidenceStatus: "missing",
+        evidence: [{ kind: "text", value: "overall dashboard polish" }],
+      },
+      {
+        id: "upload",
+        text: "修复 DragUpload 导入状态和 CSV 数据流",
+        status: "pending",
+        evidenceStatus: "missing",
+        evidence: [{ kind: "file", value: "src/components/FileUploader/DragUpload.tsx" }],
+      },
+    ],
+    evidenceLedger: [],
+    recentToolActivity: [{ name: "replace_in_file", target: "src/components/FileUploader/DragUpload.tsx", status: "succeeded" }],
+  });
+
+  assert.match(update.currentTask, /DragUpload/);
+  assert.doesNotMatch(update.currentTask, /^目标：/);
+});
+
+test("plan execution progress shows current action when first pending task is too broad", () => {
+  const update = buildPlanExecutionProgressUpdate({
+    language: "zh",
+    phase: "tool_start",
+    iterationCount: 4,
+    maxIterations: 50,
+    autoResumeCount: 0,
+    tasks: [
+      {
+        id: "broad",
+        text: "目标：修复 4 个核心问题，同时按 Linear.app 设计规范重构 UI 配色",
+        status: "pending",
+        evidenceStatus: "missing",
+        evidence: [{ kind: "text", value: "overall dashboard polish" }],
+      },
+    ],
+    evidenceLedger: [],
+    recentToolActivity: [{ name: "read_file", target: "src/App.tsx", status: "succeeded" }],
+  });
+
+  assert.match(update.currentTask, /当前动作：/);
+  assert.match(update.currentTask, /src\/App\.tsx/);
 });
