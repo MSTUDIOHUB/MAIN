@@ -17,7 +17,7 @@ export interface HydratedPlanArtifacts {
 
 export type PlanArtifactReader = (path: string) => Promise<string>;
 
-const PLAN_ARTIFACT_PATHS = [
+export const PLAN_ARTIFACT_PATHS = [
   ".MAIN/plans/requirements.md",
   ".MAIN/plans/design.md",
   ".MAIN/plans/tasks.md",
@@ -38,10 +38,21 @@ export async function hydratePlanArtifactsFromReader(
   readPlanFile: PlanArtifactReader,
   language: "zh" | "en" = "zh",
   now = Date.now(),
+  options?: { availablePaths?: readonly string[] | null },
 ): Promise<HydratedPlanArtifacts> {
   const artifacts: PlanArtifact[] = [];
+  const availablePaths = options?.availablePaths
+    ? new Set(options.availablePaths.map((path) => path.replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase()))
+    : null;
+  const candidatePaths = availablePaths
+    ? PLAN_ARTIFACT_PATHS.filter((path) => {
+        const normalized = path.replace(/^\.\//, "").toLowerCase();
+        const fileName = normalized.split("/").pop() || normalized;
+        return availablePaths.has(normalized) || availablePaths.has(fileName);
+      })
+    : PLAN_ARTIFACT_PATHS;
 
-  for (const path of PLAN_ARTIFACT_PATHS) {
+  for (const path of candidatePaths) {
     const kind = detectPlanArtifactKind(path);
     if (!kind) continue;
 

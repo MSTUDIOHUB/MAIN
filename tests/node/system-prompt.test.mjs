@@ -277,6 +277,8 @@ test("data analyst plan prompt uses interactive planning and analysis semantics"
   assert.match(prompt, /数据分析\/报表类请求：规划阶段优先输出分析目标、数据范围、指标口径、报表结构、验证方式/);
   assert.match(prompt, /复杂实现请求默认生成精简的 `\.MAIN\/plans\/design\.md` 草稿供审批/);
   assert.match(prompt, /批准执行前仍然不能写源码或生成 tasks\.md/);
+  assert.match(prompt, /不要为了确认 tasks\.md 是否存在而主动读取/);
+  assert.match(prompt, /批准后优先使用 MAIN runtime 任务清单/);
   assert.doesNotMatch(prompt, /必须生成精简的 `\.MAIN\/plans\/requirements\.md` 与 `\.MAIN\/plans\/design\.md`/);
   assert.doesNotMatch(prompt, /未经明确要求就把内容落到 `\.MAIN\/plans\/\*\.md`/);
 });

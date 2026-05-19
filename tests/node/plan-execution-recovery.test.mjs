@@ -183,6 +183,47 @@ test("resume prompt requires fresh workspace reads and treats .MAIN plans as int
   assert.match(prompt, /Add resume guard tests/);
 });
 
+test("resume prompt does not tell the model to read missing optional tasks.md", () => {
+  const checkpoint = buildPlanMaxIterationsCheckpoint({
+    iterationCount: 50,
+    maxIterations: 50,
+    autoResumeCount: 1,
+    tasks,
+    evidenceLedger: [],
+    recentToolActivity: [{ name: "read_file", target: "src/App.tsx", status: "succeeded" }],
+  });
+  const prompt = buildPlanMaxIterationsResumePrompt({
+    language: "zh",
+    checkpoint,
+    hasTasksArtifact: false,
+    tasks,
+    artifacts: [{ kind: "design", path: ".MAIN/plans/design.md", title: "Design", content: "# Design\n\n方案", updatedAt: 1 }],
+    evidenceLedger: [],
+  });
+
+  assert.match(prompt, /runtime 任务清单/);
+  assert.match(prompt, /不要为了确认它是否存在而读取它/);
+  assert.doesNotMatch(prompt, /先重新读取当前 workspace 状态和 `\.MAIN\/plans\/tasks\.md`/);
+});
+
+test("empty checkpoint fallback treats tasks.md as optional", () => {
+  const checkpoint = buildPlanMaxIterationsCheckpoint({
+    iterationCount: 50,
+    maxIterations: 50,
+    autoResumeCount: 1,
+    tasks: [],
+    evidenceLedger: [],
+    recentToolActivity: [{ name: "read_file", target: "src/App.tsx", status: "succeeded" }],
+  });
+  const notice = buildPlanMaxIterationsPauseNotice(checkpoint, "zh");
+
+  assert.match(checkpoint.currentTask, /runtime task list/);
+  assert.match(checkpoint.remainingTasks.join("\n"), /Read tasks\.md only if it is already known to exist/);
+  assert.match(notice, /runtime 任务清单/);
+  assert.match(notice, /只有已知存在时才读取 tasks\.md/);
+  assert.doesNotMatch(notice, /重新读取 tasks\.md/);
+});
+
 test("plan execution progress snapshot is structured and ignores internal plan evidence", () => {
   const update = buildPlanExecutionProgressUpdate({
     language: "en",

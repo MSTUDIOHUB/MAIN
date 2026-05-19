@@ -110,3 +110,23 @@ test("hydrates design-only plans without requiring requirements.md", async () =>
   assert.equal(hydrated.hasTasksArtifact, false);
   assert.equal(hydrated.tasks.length, 0);
 });
+
+test("available path filter avoids probing missing optional tasks.md", async () => {
+  const readPaths = [];
+  const files = new Map([
+    [
+      ".MAIN/plans/design.md",
+      "# Design\n\n## 方案\n\n计划恢复时先列出实际存在的计划文件，只读取 design.md，不把缺失的 tasks.md 当作必读输入。影响文件包括 src/store/useAppStore.ts 和 src/lib/planArtifactHydration.ts，执行顺序是先收窄读取范围，再恢复 runtime 任务清单。\n\n## 验证\n\n- 不读取缺失的 tasks.md。\n- 仍可恢复 design 方案。\n- 运行 node --test tests/node/plan-artifact-hydration.test.mjs。\n",
+    ],
+  ]);
+
+  const hydrated = await hydratePlanArtifactsFromReader(async (filePath) => {
+    readPaths.push(filePath);
+    if (!files.has(filePath)) throw new Error(`ENOENT: ${filePath}`);
+    return files.get(filePath);
+  }, "zh", 3000, { availablePaths: [".MAIN/plans/design.md"] });
+
+  assert.deepEqual(readPaths, [".MAIN/plans/design.md"]);
+  assert.deepEqual(hydrated.artifacts.map((artifact) => artifact.path), [".MAIN/plans/design.md"]);
+  assert.equal(hydrated.hasTasksArtifact, false);
+});

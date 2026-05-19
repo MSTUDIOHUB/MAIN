@@ -484,7 +484,7 @@ export function buildSystemPrompt(
       "4. **不要机械地每一步都打断**：只有在关键决策点才给选项；如果某一步只是自然展开细节，不必强行提问。",
       "5. **最后输出正式方案**：当信息足够后，用清晰的 Markdown 输出最终方案；如果存在明确分叉，可在结尾提供类似“继续讨论 / 保存为正式方案 / 批准进入执行”的选项。",
       "6. **Design-First 计划落盘规则**：复杂实现或修复类请求进入 PLAN 后，默认只把可审批方案写入 `.MAIN/plans/design.md`；只有用户明确要求需求台账、范围极大需要追踪、或合规/验收可追溯性很强时，才额外写 `.MAIN/plans/requirements.md`。创建/更新 design/tasks 或可选 requirements 是内部规划步骤，不要把“是否生成这些内部文件”作为 `<user_options>` 让用户选择；用户选定方案后，直接更新对应计划草稿。",
-      "7. **`tasks.md` 仅属于执行阶段且默认可选**：用户批准进入执行后，优先使用 MAIN 派生的 runtime 任务清单；只有任务较长、需要跨会话恢复、需要审计留档或用户明确要求时，才生成 `.MAIN/plans/tasks.md`。",
+      "7. **`tasks.md` 仅属于执行阶段且默认可选**：用户批准进入执行后，优先使用 MAIN 派生的 runtime 任务清单；只有任务较长、需要跨会话恢复、需要审计留档或用户明确要求时，才生成 `.MAIN/plans/tasks.md`。不要为了确认 tasks.md 是否存在而主动读取它；只有已知存在、用户明确点名或你正在同步已有审计文件时才读取/更新。",
       "8. **计划内容必须可见**：方案正文、对比、建议、风险、下一步，都必须放在普通 Markdown 中，不能藏在 `<analysis>` 内。",
       "9. **不能空转**：当用户说“继续/继续生成/接着来”时，必须延续上一轮 PLAN 目标并产出实际计划内容；不要只回复“好的，我继续”或把它降级成普通讨论。",
       "",
@@ -506,7 +506,7 @@ export function buildSystemPrompt(
       "2. 如果当前只需要继续共创方案，就继续讨论，不要把用户往执行阶段推。",
       "3. 如果你已经输出了 `<user_options>`，本轮必须立刻停止等待用户，不要再自顾自补完下一步。",
       "4. 如果你认为任务高风险、范围过大或存在关键前提冲突，优先通过 `<user_options>` 缩小分歧，而不是替用户拍板。",
-      "5. 如果用户要求最终在项目根目录生成 Readme.md 或其他 Markdown 文档，这属于执行阶段交付物：规划阶段写进 design，批准后写进 tasks.md 并真实落盘。",
+      "5. 如果用户要求最终在项目根目录生成 Readme.md 或其他 Markdown 文档，这属于执行阶段交付物：规划阶段写进 design，批准后写进 runtime 任务清单；只有持久化审计文件时才同步写进 tasks.md，并且必须真实落盘。",
       "6. 计划文件不能包含工具日志、重复调用提示、后台思考、截断提示或原始源码片段；如果只拿到了这些材料，应重新归纳真实需求和执行方案，或向用户确认关键方向。",
       "",
       "### 探索范式",
@@ -669,14 +669,14 @@ export function buildSystemPrompt(
       tfl.push("3. 如果方案还没收敛，优先给用户 2-4 个明确选择；不要强行一次性写完整 design 或 requirements。");
       tfl.push("4. 当方案已经成熟且你准备提交正式审核时，再使用 `[PROPOSAL START]`、`# Proposed Plan` 与合法 `<plan>` JSON。");
       tfl.push("5. 修复类复杂请求也用 `.MAIN/plans/design.md` 表达；批准执行前仍然不能写源码或生成 tasks.md。");
-      tfl.push("6. `.MAIN/plans/tasks.md` 只属于执行阶段；未经明确批准，不要提前生成。批准后优先使用 MAIN runtime 任务清单，只有长任务、跨会话恢复或需要审计留档时才持久化 tasks.md。");
+      tfl.push("6. `.MAIN/plans/tasks.md` 只属于执行阶段；未经明确批准，不要提前生成。批准后优先使用 MAIN runtime 任务清单，只有长任务、跨会话恢复或需要审计留档时才持久化 tasks.md；不要为了确认它是否存在而主动读取。");
       tfl.push("7. 如果任务更像报告、总结或研究分析，规划产物应表达分析目标、数据范围、指标口径、方法与验证方案，而不是默认套用代码工程计划。");
-      tfl.push("8. 如果用户要求根目录 Readme.md 或其他 Markdown 文档，把它作为批准后的最终交付物写入 tasks.md；规划阶段只记录这个验收要求。");
+      tfl.push("8. 如果用户要求根目录 Readme.md 或其他 Markdown 文档，把它作为批准后的最终交付物写入 runtime 任务清单；只有持久化审计文件时才同步写进 tasks.md，规划阶段只记录这个验收要求。");
       tfl.push("9. 计划 Markdown 必须精简：design.md 60-120 行；可选 requirements.md 40-80 行；如果确需持久化 tasks.md，保持 8-20 个 checkbox。不要写教程式长文、完整代码清单或重复背景。");
     } else {
       tfl.push("当前回合是直接实现回合：");
       tfl.push("1. Atomic 任务直接实现，不要为了完成小改动而强行转去计划流。");
-      tfl.push("2. 如果当前是在延续一个已批准的计划，则优先遵循当前 runtime 任务清单；如果 `.MAIN/plans/tasks.md` 已存在，完成后再同步更新对应 checkbox 状态。");
+      tfl.push("2. 如果当前是在延续一个已批准的计划，则优先遵循当前 runtime 任务清单；不要为了确认 `.MAIN/plans/tasks.md` 是否存在而主动读取它；如果它已知存在，完成后再同步更新对应 checkbox 状态。");
       tfl.push("3. 只有在用户明确要求保存方案、当前回合本来就是计划落盘，或你正在继续一个已批准计划时，才写入 `.MAIN/plans/*.md`。");
       tfl.push("4. 凡是需要 shell 的步骤，必须真实执行：一次性命令用 `run_command` 并检查 exitCode/stdout/stderr；长驻或交互式命令用 `execute_command`，随后调用 `read_pty_since`、`read_pty_tail` 或 `get_pty_status` 验证结果。命令调用必须带 `description` 和工作区相对 `cwd`（根目录用 `.`）；需要等待长任务输出时传 `wait_ms`，不要另跑 sleep。");
       tfl.push("5. 当用户要求 Git 提交、推送或“提交并推送”时，不要因为 PTY 未启动而声称无法执行；Git 是有限命令，优先用 `run_command` 依次检查 `git status`，必要时查看 `git diff --stat` / `git diff`，再按用户要求执行 `git add ...`、`git commit -m ...`、`git push`。如果没有变更、没有 remote、认证失败、upstream 未设置或 push 被拒绝，必须把 stdout/stderr/exitCode 如实反馈给用户并停止猜测。");

@@ -210,7 +210,7 @@ test("manageContext builds state-first compressed memory instead of tool transcr
         "- duplicateTool: replace_in_file",
         "- target: snake.py",
         "- duplicateCount: 3+",
-        "- suggestedNextTask: 重新读取 tasks.md 与证据摘要后继续",
+        "- suggestedNextTask: 核查 runtime 任务清单、当前 workspace 状态和证据摘要后继续；只有已知存在时才读取 tasks.md",
       ].join("\n"),
     },
     ...Array.from({ length: 18 }, (_, index) => ({
@@ -231,7 +231,9 @@ test("manageContext builds state-first compressed memory instead of tool transcr
   assert.match(compressed, /ContextState/);
   assert.match(compressed, /snake\.py/);
   assert.match(compressed, /duplicateTool=replace_in_file|repeat loop/);
-  assert.match(compressed, /重新读取 tasks\.md/);
+  assert.match(compressed, /runtime 任务清单/);
+  assert.match(compressed, /只有已知存在时才读取 tasks\.md/);
+  assert.doesNotMatch(compressed, /重新读取 tasks\.md/);
   assert.doesNotMatch(compressed, /助手调用工具|工具结果：/);
 });
 

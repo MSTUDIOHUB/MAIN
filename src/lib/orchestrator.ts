@@ -296,6 +296,30 @@ function isPlanArtifactPath(path: string): boolean {
   return path.replace(/\\/g, "/").toLowerCase().includes(".main/plans/");
 }
 
+function isOptionalTasksMdRead(toolName: string, target: string): boolean {
+  if (toolName !== "read_file") return false;
+  const normalized = target.replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase();
+  return normalized === ".main/plans/tasks.md" || normalized.endsWith("/.main/plans/tasks.md");
+}
+
+function isMissingOptionalTasksMdReadError(errorMessage: string): boolean {
+  return /no such file or directory|os error 2|路径不存在|无法访问/i.test(errorMessage);
+}
+
+function buildOptionalTasksMdMissingResult(language: "zh" | "en", target: string): string {
+  return language === "zh"
+    ? [
+        `OPTIONAL_TASKS_MD_NOT_PRESENT path: ${target || ".MAIN/plans/tasks.md"}`,
+        "`tasks.md` 是可选审计文件，当前不存在也不阻塞执行。",
+        "请直接使用 MAIN 提供的 runtime 任务清单和已批准的 design.md；不要再为了确认是否存在而重复读取 `.MAIN/plans/tasks.md`。",
+      ].join("\n")
+    : [
+        `OPTIONAL_TASKS_MD_NOT_PRESENT path: ${target || ".MAIN/plans/tasks.md"}`,
+        "`tasks.md` is an optional audit file; it is not required for execution.",
+        "Use MAIN's runtime task list and the approved design.md instead; do not reread `.MAIN/plans/tasks.md` just to check existence.",
+      ].join("\n");
+}
+
 function isProjectSourceWriteResult(result: ToolExecutionResult): boolean {
   return (
     !result.isError &&
@@ -896,8 +920,8 @@ function getPlanReviewArtifactLabel(
 ): string {
   if (stage === "ready_to_execute") {
     return language === "zh"
-      ? "`.MAIN/plans/design.md` 和 `.MAIN/plans/tasks.md`"
-      : "`.MAIN/plans/design.md` and `.MAIN/plans/tasks.md`";
+      ? "`.MAIN/plans/design.md`"
+      : "`.MAIN/plans/design.md`";
   }
   if (stage === "bugfix") return "`.MAIN/plans/bugfix.md`";
   return "`.MAIN/plans/design.md`";
@@ -1876,11 +1900,11 @@ function buildApprovedPlanContinuationPrompt(callbacks: OrchestratorCallbacks): 
     approvalChoiceHint +
     (callbacks.getPlanTasks().length > 0
       ? language === "zh"
-        ? "计划已批准，现在进入执行阶段（EXECUTION MODE）。MAIN 已有 runtime 任务清单，TopIsland 会直接显示任务进度；不需要为了第一次源码写入强制创建 `.MAIN/plans/tasks.md`。请按当前任务清单逐项执行，使用 <tool_use> 格式调用工具；只有任务较长、需要跨会话审计或用户明确要求留档时，才先把清单持久化到 tasks.md。任何需要 shell 的任务都必须在当前任务清单中保留精确命令并用反引号包裹。页面渲染验证必须使用 Browser/Playwright DOM 或截图证据，不能用 curl/grep/cat 代替；Tauri/人工验证不可自动完成时要暂停说明待用户验证。你可以正常修改项目源码文件，写入路径必须是项目中的正确位置，绝对不要将源码写入 `.MAIN/plans/` 或任何隐藏目录。只有全部任务都有真实文件/命令/交付物/浏览器证据满足，或剩余项明确待用户验证后，才能结束执行；如果 tasks.md 已存在，完成任务后再同步更新对应 checkbox。\n"
-        : "The plan is approved. You are now in EXECUTION MODE. MAIN already has a runtime task list, so TopIsland can show task progress without forcing `.MAIN/plans/tasks.md` before the first source write. Execute the current task list with tool calls; persist the list to tasks.md only when the work is long, cross-session, or explicitly needs an audit file. Any task that needs shell work must keep the exact command in the current task list using backticks. Rendered-page validation requires Browser/Playwright DOM or screenshot evidence; do not substitute curl/grep/cat. If Tauri or manual validation cannot be automated, pause and report pending user validation. You may now edit project source files, but write them to the proper project paths and never into `.MAIN/plans/` or hidden folders. Only stop when every task has satisfied real file/command/deliverable/browser evidence, or remaining items are explicitly pending user validation; if tasks.md exists, update the matching checkbox after evidence exists.\n"
+        ? "计划已批准，现在进入执行阶段（EXECUTION MODE）。MAIN 已有 runtime 任务清单，TopIsland 会直接显示任务进度；不需要为了第一次源码写入强制创建或读取 `.MAIN/plans/tasks.md`。请按当前任务清单逐项执行，使用 <tool_use> 格式调用工具；只有任务较长、需要跨会话审计或用户明确要求留档时，才先把清单持久化到 tasks.md。不要为了确认 tasks.md 是否存在而读取它；只有它已知存在或你正在同步已有审计文件时，才读取/更新。任何需要 shell 的任务都必须在当前任务清单中保留精确命令并用反引号包裹。页面渲染验证必须使用 Browser/Playwright DOM 或截图证据，不能用 curl/grep/cat 代替；Tauri/人工验证不可自动完成时要暂停说明待用户验证。你可以正常修改项目源码文件，写入路径必须是项目中的正确位置，绝对不要将源码写入 `.MAIN/plans/` 或任何隐藏目录。只有全部任务都有真实文件/命令/交付物/浏览器证据满足，或剩余项明确待用户验证后，才能结束执行；如果 tasks.md 已存在，完成任务后再同步更新对应 checkbox。\n"
+        : "The plan is approved. You are now in EXECUTION MODE. MAIN already has a runtime task list, so TopIsland can show task progress without forcing creation or reads of `.MAIN/plans/tasks.md` before the first source write. Execute the current task list with tool calls; persist the list to tasks.md only when the work is long, cross-session, or explicitly needs an audit file. Do not read tasks.md just to check whether it exists; only read/update it when it is already known to exist or you are syncing an existing audit file. Any task that needs shell work must keep the exact command in the current task list using backticks. Rendered-page validation requires Browser/Playwright DOM or screenshot evidence; do not substitute curl/grep/cat. If Tauri or manual validation cannot be automated, pause and report pending user validation. You may now edit project source files, but write them to the proper project paths and never into `.MAIN/plans/` or hidden folders. Only stop when every task has satisfied real file/command/deliverable/browser evidence, or remaining items are explicitly pending user validation; if tasks.md exists, update the matching checkbox after evidence exists.\n"
       : language === "zh"
-      ? "计划已批准，现在进入执行阶段（EXECUTION MODE）。请先基于已批准的 design.md 派生精简 runtime 任务清单；只有任务较长、需要跨会话审计或用户明确要求留档时，才生成 `.MAIN/plans/tasks.md`。随后按任务逐项执行，使用 <tool_use> 格式调用工具。页面渲染验证必须使用 Browser/Playwright DOM 或截图证据；Tauri/人工验证不可自动完成时要暂停说明待用户验证。你可以正常修改项目源码文件，写入路径必须是项目中的正确位置，绝对不要将源码写入 `.MAIN/plans/` 或任何隐藏目录。只有全部任务都有真实文件/命令/交付物/浏览器证据满足，或剩余项明确待用户验证后，才能结束执行。\n"
-      : "The plan is approved. You are now in EXECUTION MODE. First derive a concise runtime task list from the approved design.md; generate `.MAIN/plans/tasks.md` only when the work is long, cross-session, or explicitly needs an audit file. Then execute the tasks one by one using tool calls. Rendered-page validation requires Browser/Playwright DOM or screenshot evidence; if Tauri or manual validation cannot be automated, pause and report pending user validation. You may now edit project source files, but write them to the proper project paths and never into `.MAIN/plans/` or hidden folders. Only stop when every task has satisfied real file/command/deliverable/browser evidence, or remaining items are explicitly pending user validation.\n") +
+      ? "计划已批准，现在进入执行阶段（EXECUTION MODE）。请先基于已批准的 design.md 派生精简 runtime 任务清单；只有任务较长、需要跨会话审计或用户明确要求留档时，才生成 `.MAIN/plans/tasks.md`。不要为了确认 tasks.md 是否存在而读取它。随后按任务逐项执行，使用 <tool_use> 格式调用工具。页面渲染验证必须使用 Browser/Playwright DOM 或截图证据；Tauri/人工验证不可自动完成时要暂停说明待用户验证。你可以正常修改项目源码文件，写入路径必须是项目中的正确位置，绝对不要将源码写入 `.MAIN/plans/` 或任何隐藏目录。只有全部任务都有真实文件/命令/交付物/浏览器证据满足，或剩余项明确待用户验证后，才能结束执行。\n"
+      : "The plan is approved. You are now in EXECUTION MODE. First derive a concise runtime task list from the approved design.md; generate `.MAIN/plans/tasks.md` only when the work is long, cross-session, or explicitly needs an audit file. Do not read tasks.md just to check whether it exists. Then execute the tasks one by one using tool calls. Rendered-page validation requires Browser/Playwright DOM or screenshot evidence; if Tauri or manual validation cannot be automated, pause and report pending user validation. You may now edit project source files, but write them to the proper project paths and never into `.MAIN/plans/` or hidden folders. Only stop when every task has satisfied real file/command/deliverable/browser evidence, or remaining items are explicitly pending user validation.\n") +
     deliverableHint +
     (runtimeTaskList ? "\n" + runtimeTaskList + "\n" : "") +
     "\n" +
@@ -2982,6 +3006,33 @@ async function executeToolCallWithLifecycle(
     // Instead of throwing, we return the error as a tool result.
     // The AI sees the error and can self-correct (e.g., try a different path).
     const errorMsg = (err as Error).message || String(err);
+    if (isOptionalTasksMdRead(tc.name, target) && isMissingOptionalTasksMdReadError(errorMsg)) {
+      const optionalMessage = buildOptionalTasksMdMissingResult(callbacks.getPreferredLanguage(), target);
+      callbacks.onToolDone(tc.name, target, optionalMessage, { toolCallId: tc.id });
+      const postHookResult = await runLifecycleHooks(callbacks, hooksConfig, "PostToolUse", {
+        toolName: tc.name,
+        toolArgs: resolvedArgs,
+        toolResult: optionalMessage,
+        isError: false,
+        workspace,
+        workflowMode: callbacks.getWorkflowMode(),
+        language: callbacks.getPreferredLanguage(),
+        associatedPaths: callbacks.getAssociatedPaths(),
+      });
+      return {
+        toolCallId: tc.id,
+        name: tc.name,
+        target,
+        content: optionalMessage,
+        displayContent: optionalMessage,
+        isError: false,
+        lifecycleState: "completed",
+        additionalContexts: [
+          ...preHookResult.additionalContexts,
+          ...postHookResult.additionalContexts,
+        ],
+      };
+    }
     callbacks.onToolError(tc.name, target, errorMsg, { toolCallId: tc.id });
     const postHookResult = await runLifecycleHooks(callbacks, hooksConfig, "PostToolUse", {
       toolName: tc.name,
@@ -5721,8 +5772,8 @@ export async function executeAgentLoop(
         });
         emitPlanExecutionProgress("paused", {
           nextStep: language === "zh"
-            ? "恢复后先读取当前 tasks.md 和 workspace 状态，再继续第一个证据未满足的任务"
-            : "on resume, reread current tasks.md and workspace state, then continue the first task whose evidence is not satisfied",
+            ? "恢复后先核查当前 workspace 状态，再基于 runtime 任务清单继续；只有已知存在时才读取 tasks.md"
+            : "on resume, inspect current workspace state and continue from the runtime task list; read tasks.md only if it is already known to exist",
         });
         callbacks.onNonActionableStop(
           buildApprovedPlanNoToolPauseMessage(

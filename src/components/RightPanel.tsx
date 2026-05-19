@@ -62,7 +62,7 @@ function buildTrustedResumePrompt(input: {
   const remainingText = remainingTasks.map((task, index) => {
     const evidence = task.evidence?.map((item) => `${item.kind}:${item.value}`).join(", ") || (input.language === "zh" ? "无证据标签" : "no evidence tags");
     return `${index + 1}. ${task.text} [${task.evidenceStatus || "missing"}; ${evidence}]`;
-  }).join("\n") || (input.language === "zh" ? "无剩余任务；请核查 runtime 任务清单或 tasks.md 是否需要生成。" : "No remaining tasks; verify whether the runtime task list or tasks.md needs to be generated.");
+  }).join("\n") || (input.language === "zh" ? "无剩余任务；请核查 runtime 任务清单是否为空或已完成。tasks.md 是可选审计文件，不要为了确认是否存在而读取它。" : "No remaining tasks; verify whether the runtime task list is empty or complete. tasks.md is optional; do not read it just to check existence.");
 
   if (input.language === "zh") {
     return [
@@ -70,8 +70,8 @@ function buildTrustedResumePrompt(input: {
       input.hasTasksArtifact
         ? "从 `.MAIN/plans/tasks.md` 中第一个证据未满足的任务开始。只有真实写入/命令成功/验证证据满足后，才可以把任务视为完成。"
         : input.tasks.length > 0
-        ? "当前已有 runtime 任务清单；请从第一个证据未满足的任务开始直接执行。只有任务较长、需要跨会话审计或用户要求留档时，才先把清单持久化到 `.MAIN/plans/tasks.md`。"
-        : "请先基于已批准的 design.md 或 bugfix.md 派生 runtime 任务清单；只有长任务、跨会话恢复或需要审计留档时才生成 `.MAIN/plans/tasks.md`，然后执行真实任务。",
+        ? "当前已有 runtime 任务清单；请从第一个证据未满足的任务开始直接执行。只有任务较长、需要跨会话审计或用户要求留档时，才先把清单持久化到 `.MAIN/plans/tasks.md`；不要为了确认它是否存在而读取它。"
+        : "请先基于已批准的 design.md 或 bugfix.md 派生 runtime 任务清单；只有长任务、跨会话恢复或需要审计留档时才生成 `.MAIN/plans/tasks.md`；不要默认读取缺失的 tasks.md。",
       "不要重写已经满足证据的任务；如果存在 tasks.md，不要只修改 checkbox；不要重复计划说明。",
       "",
       "计划文件摘要：",
@@ -90,8 +90,8 @@ function buildTrustedResumePrompt(input: {
     input.hasTasksArtifact
       ? "Start from the first task whose evidence is not satisfied. Treat a task as complete only after real file-write, successful command, Browser/Playwright DOM/screenshot evidence, or explicit pending user validation exists."
       : input.tasks.length > 0
-      ? "A runtime task list is already available; start from the first task whose evidence is not satisfied. Persist it to `.MAIN/plans/tasks.md` only when the task is long, cross-session, or explicitly needs an audit file."
-      : "First derive a runtime task list from the approved design.md or bugfix.md. Generate `.MAIN/plans/tasks.md` only for long work, cross-session recovery, or audit-file needs, then execute real tasks.",
+      ? "A runtime task list is already available; start from the first task whose evidence is not satisfied. Persist it to `.MAIN/plans/tasks.md` only when the task is long, cross-session, or explicitly needs an audit file; do not read it just to check existence."
+      : "First derive a runtime task list from the approved design.md or bugfix.md. Generate `.MAIN/plans/tasks.md` only for long work, cross-session recovery, or audit-file needs; do not read missing tasks.md by default.",
     "Do not redo tasks whose evidence is already satisfied. If tasks.md exists, do not only edit checkboxes. Do not restate the plan.",
     "",
     "Plan artifact summary:",

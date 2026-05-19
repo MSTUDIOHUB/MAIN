@@ -10,6 +10,7 @@ import {
   deletePlanFiles,
   deleteWorkspacePath,
   ingestAttachmentFile,
+  listDirectory,
   readChatTempFile,
   readDocument,
   readFile,
@@ -214,7 +215,7 @@ import {
   resolvePlanStateHydrationReason,
   shouldPromoteHydratedPlanToExecuting,
 } from "../lib/planStateHydration";
-import { hydratePlanArtifactsFromReader } from "../lib/planArtifactHydration";
+import { PLAN_ARTIFACT_PATHS, hydratePlanArtifactsFromReader } from "../lib/planArtifactHydration";
 import { mapLegacyNexusModeToMainMode, mapMainModeToLegacyNexusMode, type MainModeKey } from "../lib/mainModes";
 import { runIntentPreflight } from "../lib/intentPreflight";
 import { runAfterNextPaint } from "../lib/uiScheduling";
@@ -3368,8 +3369,8 @@ function buildTrustedPlanResumePrompt(input: {
         return `${index + 1}. ${task.text} [${task.evidenceStatus || "missing"}; ${evidence}]`;
       }).join("\n")
     : input.language === "zh"
-    ? "无剩余未满足证据的任务；请核查 tasks.md 是否缺失或需要生成。"
-    : "No remaining task with unsatisfied evidence; verify whether tasks.md is missing or needs to be generated.";
+    ? "无剩余未满足证据的任务；请核查 runtime 任务清单是否为空或已全部满足。tasks.md 是可选审计文件，不要为了确认是否存在而读取它。"
+    : "No remaining task with unsatisfied evidence; verify whether the runtime task list is empty or fully satisfied. tasks.md is optional; do not read it just to check existence.";
   const evidenceText = input.evidenceLedger.slice(-8).map((entry) =>
     `- ${entry.kind}:${entry.target || entry.value} (${entry.sourceTool})`
   ).join("\n") || (input.language === "zh" ? "- 暂无可信执行证据" : "- No trusted execution evidence yet");
@@ -3383,10 +3384,10 @@ function buildTrustedPlanResumePrompt(input: {
       input.hasTasksArtifact
         ? "从 `.MAIN/plans/tasks.md` 中第一个证据未满足的任务开始。只有真实写入/命令成功/验证证据满足后，才可以把任务视为完成。"
         : input.artifacts.length === 0
-        ? "先读取当前 workspace 的 `.MAIN/plans/design.md` 和 `.MAIN/plans/tasks.md`；如果旧会话已存在 bugfix.md 或 requirements.md，可作为辅助上下文读取；如果 tasks.md 不存在，再基于已读计划文件生成任务清单并执行真实任务。"
+        ? "先读取当前 workspace 的 `.MAIN/plans/design.md`；如果旧会话已存在 bugfix.md 或 requirements.md，可作为辅助上下文读取。不要默认读取 `.MAIN/plans/tasks.md`，除非它已在计划摘要中确认存在或用户明确要求。"
         : input.tasks.length > 0
-        ? "当前已恢复 runtime 任务清单；请从第一个证据未满足的任务开始直接执行。只有当任务较长、需要跨会话审计或用户要求留档时，才先把清单持久化到 `.MAIN/plans/tasks.md`。"
-        : "请先基于已批准的 design.md 派生 runtime 任务清单；只有长任务、跨会话恢复或需要审计留档时，才生成 `.MAIN/plans/tasks.md`，然后执行真实任务。",
+        ? "当前已恢复 runtime 任务清单；请从第一个证据未满足的任务开始直接执行。只有当任务较长、需要跨会话审计或用户要求留档时，才先把清单持久化到 `.MAIN/plans/tasks.md`；不要为了确认它是否存在而读取它。"
+        : "请先基于已批准的 design.md 派生 runtime 任务清单；只有长任务、跨会话恢复或需要审计留档时，才生成 `.MAIN/plans/tasks.md`；不要默认读取缺失的 tasks.md。然后执行真实任务。",
       "不要重写已经满足证据的任务；如果存在 tasks.md，不要只修改 checkbox；不要重复计划说明。",
       "",
       "计划文件摘要：",
@@ -3405,10 +3406,10 @@ function buildTrustedPlanResumePrompt(input: {
     input.hasTasksArtifact
       ? "Start from the first task whose evidence is not satisfied. Treat a task as complete only after real file-write, successful command, Browser/Playwright DOM/screenshot evidence, or explicit pending user validation exists."
       : input.artifacts.length === 0
-      ? "First read `.MAIN/plans/design.md` and `.MAIN/plans/tasks.md` from the current workspace; if a legacy bugfix.md or requirements.md exists, use it only as supporting context. If tasks.md does not exist, generate the task list from the plan files before doing real work."
+      ? "First read `.MAIN/plans/design.md` from the current workspace; if a legacy bugfix.md or requirements.md exists, use it only as supporting context. Do not read `.MAIN/plans/tasks.md` by default unless it is confirmed in the plan summary or the user explicitly asks for it."
       : input.tasks.length > 0
-      ? "A runtime task list is already available; start from the first task whose evidence is not satisfied. Persist it to `.MAIN/plans/tasks.md` only when the task is long, cross-session, or explicitly needs an audit file."
-      : "First derive a runtime task list from the approved design.md. Generate `.MAIN/plans/tasks.md` only for long work, cross-session recovery, or audit-file needs, then execute real tasks.",
+      ? "A runtime task list is already available; start from the first task whose evidence is not satisfied. Persist it to `.MAIN/plans/tasks.md` only when the task is long, cross-session, or explicitly needs an audit file; do not read it just to check existence."
+      : "First derive a runtime task list from the approved design.md. Generate `.MAIN/plans/tasks.md` only for long work, cross-session recovery, or audit-file needs; do not read missing tasks.md by default. Then execute real tasks.",
     "Do not redo tasks whose evidence is already satisfied. If tasks.md exists, do not only edit checkboxes. Do not restate the plan.",
     "",
     "Plan artifact summary:",
@@ -3426,9 +3427,27 @@ async function hydrateExistingPlanArtifactsForWorkspace(
   workspace: string,
   language: "zh" | "en",
 ) {
+  let availablePaths: string[] = [];
+  try {
+    const entries = await listDirectory(".MAIN/plans", workspace || undefined);
+    const fileNames = new Set(
+      entries
+        .filter((entry) => !entry.is_dir)
+        .map((entry) => entry.name.toLowerCase()),
+    );
+    availablePaths = PLAN_ARTIFACT_PATHS.filter((path) => {
+      const fileName = path.split("/").pop()?.toLowerCase() || "";
+      return fileNames.has(fileName);
+    });
+  } catch {
+    availablePaths = [];
+  }
+
   return hydratePlanArtifactsFromReader(
     (path) => readFile(path, workspace || undefined),
     language,
+    Date.now(),
+    { availablePaths },
   );
 }
 
@@ -5180,13 +5199,13 @@ export const useAppStore = create<AppState>()(
 
             if (language === "en") {
               return hasTasksArtifact
-              ? approvalChoiceHint + "The plan is approved. Continue directly from the current task list and execute the remaining items without repeating the plan. If `.MAIN/plans/tasks.md` exists, keep it as an audit record: do not delete completed or previous task records, and only check an item off after real evidence exists for its file/command/deliverable/browser validation, or the item is explicitly pending user validation." + deliverableHint + runtimeTaskNotice + "\n\n" + buildPlanCommandExecutionHint(executionPlanTasks, "en")
-                : approvalChoiceHint + "The plan is approved. First derive a concise runtime task list from the approved design.md; generate `.MAIN/plans/tasks.md` only if the work is long, needs cross-session audit, or the user explicitly requested a durable task file. Then execute real work without repeating the plan. Task items should be concise and include lightweight evidence such as `evidence: file:src/app.ts` or `evidence: cmd:npm test` when there is a concrete deliverable." + deliverableHint;
+              ? approvalChoiceHint + "The plan is approved. Continue directly from the current task list and execute the remaining items without repeating the plan. Do not read `.MAIN/plans/tasks.md` just to check whether it exists. If `.MAIN/plans/tasks.md` is already known to exist, keep it as an audit record: do not delete completed or previous task records, and only check an item off after real evidence exists for its file/command/deliverable/browser validation, or the item is explicitly pending user validation." + deliverableHint + runtimeTaskNotice + "\n\n" + buildPlanCommandExecutionHint(executionPlanTasks, "en")
+                : approvalChoiceHint + "The plan is approved. First derive a concise runtime task list from the approved design.md; generate `.MAIN/plans/tasks.md` only if the work is long, needs cross-session audit, or the user explicitly requested a durable task file. Do not read tasks.md just to check whether it exists. Then execute real work without repeating the plan. Task items should be concise and include lightweight evidence such as `evidence: file:src/app.ts` or `evidence: cmd:npm test` when there is a concrete deliverable." + deliverableHint;
             }
 
             return hasTasksArtifact
-              ? approvalChoiceHint + "计划已批准。请直接基于当前任务清单继续执行剩余任务，不要重复计划内容。如果 `.MAIN/plans/tasks.md` 已存在，它是审计记录：不要删除已完成或旧任务记录；只有文件/命令/交付物/浏览器验证的真实证据满足，或该项明确待用户验证后，才能勾选对应任务。" + deliverableHint + runtimeTaskNotice + "\n\n" + buildPlanCommandExecutionHint(executionPlanTasks, "zh")
-              : approvalChoiceHint + "计划已批准。请先基于已批准的 design.md 派生精简 runtime 任务清单；只有任务较长、需要跨会话审计或用户明确要求持久任务文件时，才生成 `.MAIN/plans/tasks.md`。然后执行真实任务，不要重复计划内容。有明确交付物的任务请保留轻量证据标签，例如 `证据: file:src/app.ts` 或 `证据: cmd:npm test`。" + deliverableHint;
+              ? approvalChoiceHint + "计划已批准。请直接基于当前任务清单继续执行剩余任务，不要重复计划内容。不要为了确认 `.MAIN/plans/tasks.md` 是否存在而读取它；如果它已知存在，它是审计记录：不要删除已完成或旧任务记录；只有文件/命令/交付物/浏览器验证的真实证据满足，或该项明确待用户验证后，才能勾选对应任务。" + deliverableHint + runtimeTaskNotice + "\n\n" + buildPlanCommandExecutionHint(executionPlanTasks, "zh")
+              : approvalChoiceHint + "计划已批准。请先基于已批准的 design.md 派生精简 runtime 任务清单；只有任务较长、需要跨会话审计或用户明确要求持久任务文件时，才生成 `.MAIN/plans/tasks.md`。不要为了确认 tasks.md 是否存在而读取它。然后执行真实任务，不要重复计划内容。有明确交付物的任务请保留轻量证据标签，例如 `证据: file:src/app.ts` 或 `证据: cmd:npm test`。" + deliverableHint;
           })(),
           undefined,
           {

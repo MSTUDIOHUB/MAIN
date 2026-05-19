@@ -159,8 +159,8 @@ function getPlanProgressNextStep(
   }
   if (remainingTask) return compactLine(remainingTask.text);
   return language === "zh"
-    ? "确认 tasks.md、交付物与验证证据都已满足"
-    : "confirm tasks.md, deliverables, and verification evidence are satisfied";
+    ? "确认 runtime 任务清单、交付物与验证证据都已满足；tasks.md 仅在已知存在时同步"
+    : "confirm the runtime task list, deliverables, and verification evidence are satisfied; sync tasks.md only if it is known to exist";
 }
 
 export function buildPlanExecutionProgressUpdate(input: {
@@ -272,7 +272,7 @@ export function buildPlanMaxIterationsCheckpoint(input: {
   const completedEvidence = summarizePlanExecutionEvidence(input.evidenceLedger);
   const currentTask = remaining[0]
     ? summarizeTask(remaining[0])
-    : "No task with unsatisfied evidence was found; verify tasks.md and current workspace state.";
+    : "No task with unsatisfied evidence was found; verify the runtime task list and current workspace state. tasks.md is optional; do not read it just to check existence.";
 
   return {
     reason: "max_iterations_checkpoint",
@@ -282,7 +282,7 @@ export function buildPlanMaxIterationsCheckpoint(input: {
     currentTask,
     remainingTasks: topLines(
       remaining.map(summarizeTask),
-      "No remaining task summary available; reread tasks.md and evidence before continuing.",
+      "No remaining task summary available; reconcile the runtime task list, current workspace state, and evidence before continuing. Read tasks.md only if it is already known to exist.",
       8,
     ),
     completedEvidence: topLines(
@@ -341,7 +341,11 @@ export function buildPlanMaxIterationsPauseNotice(
   language: "zh" | "en",
 ): string {
   const evidenceLines = checkpoint.completedEvidence.slice(0, 4).map((line) => `- ${line}`);
-  const remainingLines = checkpoint.remainingTasks.slice(0, 5).map((line) => `- ${line}`);
+  const rawRemainingLines = checkpoint.remainingTasks.slice(0, 5);
+  const hasOnlyFallbackRemaining =
+    rawRemainingLines.length === 1 &&
+    /No remaining task summary available/i.test(rawRemainingLines[0] || "");
+  const remainingLines = hasOnlyFallbackRemaining ? [] : rawRemainingLines.map((line) => `- ${line}`);
   const toolLines = checkpoint.recentToolActivity.slice(-4).map((activity) => `- ${summarizeToolActivity(activity)}`);
   const blockerLines = checkpoint.unresolvedBlockers.slice(0, 3).map((line) => `- ${line}`);
 
@@ -359,7 +363,7 @@ export function buildPlanMaxIterationsPauseNotice(
       "- recentProjectEvidence:",
       ...(evidenceLines.length ? evidenceLines : ["- 暂无可信项目源码证据"]),
       "- remainingTasks:",
-      ...(remainingLines.length ? remainingLines : ["- 请重新读取 tasks.md 和证据摘要后继续"]),
+      ...(remainingLines.length ? remainingLines : ["- 请核查 runtime 任务清单、当前 workspace 状态和证据摘要后继续；只有已知存在时才读取 tasks.md"]),
       "- blockers:",
       ...(blockerLines.length ? blockerLines : ["- 命中计划执行安全轮次上限"]),
       "",
@@ -380,7 +384,7 @@ export function buildPlanMaxIterationsPauseNotice(
     "- recentProjectEvidence:",
     ...(evidenceLines.length ? evidenceLines : ["- No trusted project-source evidence yet"]),
     "- remainingTasks:",
-    ...(remainingLines.length ? remainingLines : ["- Reread tasks.md plus the evidence summary, then continue"]),
+    ...(remainingLines.length ? remainingLines : ["- Reconcile the runtime task list, current workspace state, and evidence summary, then continue; read tasks.md only if it is already known to exist"]),
     "- blockers:",
     ...(blockerLines.length ? blockerLines : ["- Hit the plan execution iteration safety limit"]),
     "",
@@ -499,8 +503,8 @@ export function buildPlanMaxIterationsResumePrompt(input: {
   const remainingText = remaining.length > 0
     ? remaining.map((task, index) => `${index + 1}. ${summarizeTask(task)}`).join("\n")
     : input.language === "zh"
-    ? "没有找到证据未满足的任务；请先核查 runtime 任务清单或 tasks.md 是否缺失、状态是否不可信。"
-    : "No task with unsatisfied evidence was found; first verify whether the runtime task list or tasks.md is missing or stale.";
+    ? "没有找到证据未满足的任务；请先核查 runtime 任务清单是否为空、已完成或状态不可信。tasks.md 是可选审计文件，不要为了确认是否存在而读取它。"
+    : "No task with unsatisfied evidence was found; first verify whether the runtime task list is empty, complete, or stale. tasks.md is optional; do not read it just to check existence.";
   const evidenceText = summarizePlanExecutionEvidence(input.evidenceLedger)
     .map((line) => `- ${line}`)
     .join("\n") || (input.language === "zh" ? "- 暂无可信项目源码证据" : "- No trusted project-source evidence yet");
@@ -517,8 +521,8 @@ export function buildPlanMaxIterationsResumePrompt(input: {
       input.hasTasksArtifact
         ? "先重新读取当前 workspace 状态和 `.MAIN/plans/tasks.md`，从第一个证据未满足的任务继续。"
         : input.tasks.length > 0
-        ? "当前已有 runtime 任务清单；先重新读取当前 workspace 状态，再从第一个证据未满足的任务继续。只有长任务、跨会话恢复或需要审计留档时才持久化 `.MAIN/plans/tasks.md`。"
-        : "先基于已批准的 design.md 或 bugfix.md 派生 runtime 任务清单；旧 requirements.md 只作为辅助上下文。只有长任务、跨会话恢复或需要审计留档时才生成 `.MAIN/plans/tasks.md`，再执行真实任务。",
+        ? "当前已有 runtime 任务清单；先重新读取当前 workspace 状态，再从第一个证据未满足的任务继续。只有长任务、跨会话恢复或需要审计留档时才持久化 `.MAIN/plans/tasks.md`；不要为了确认它是否存在而读取它。"
+        : "先基于已批准的 design.md 或 bugfix.md 派生 runtime 任务清单；旧 requirements.md 只作为辅助上下文。只有长任务、跨会话恢复或需要审计留档时才生成 `.MAIN/plans/tasks.md`；不要默认读取缺失的 tasks.md。",
       "不要重做已经满足证据的任务；如果存在 tasks.md，不要只修改 checkbox；不要重复计划说明；不要把 `.MAIN/plans` 当作用户源码证据。需要判断源码现状时，直接读取真实项目文件。",
       "",
       "Checkpoint:",
@@ -545,8 +549,8 @@ export function buildPlanMaxIterationsResumePrompt(input: {
     input.hasTasksArtifact
       ? "First reread current workspace state and `.MAIN/plans/tasks.md`, then continue from the first task whose evidence is not satisfied."
       : input.tasks.length > 0
-      ? "A runtime task list is already available; first reread current workspace state, then continue from the first task whose evidence is not satisfied. Persist `.MAIN/plans/tasks.md` only for long work, cross-session recovery, or audit-file needs."
-      : "First derive a runtime task list from the approved design.md or bugfix.md; use any legacy requirements.md only as supporting context. Generate `.MAIN/plans/tasks.md` only for long work, cross-session recovery, or audit-file needs, then execute real tasks.",
+      ? "A runtime task list is already available; first reread current workspace state, then continue from the first task whose evidence is not satisfied. Persist `.MAIN/plans/tasks.md` only for long work, cross-session recovery, or audit-file needs; do not read it just to check existence."
+      : "First derive a runtime task list from the approved design.md or bugfix.md; use any legacy requirements.md only as supporting context. Generate `.MAIN/plans/tasks.md` only for long work, cross-session recovery, or audit-file needs; do not read missing tasks.md by default.",
     "Do not redo tasks whose evidence is already satisfied. If tasks.md exists, do not only edit checkboxes. Do not restate the plan. Do not treat `.MAIN/plans` as project-source evidence; read real project files when source state matters.",
     "",
     "Checkpoint:",
