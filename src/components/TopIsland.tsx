@@ -3,6 +3,7 @@ import { IconChevronDown, IconChevronUp, IconColumns, IconFileText, IconLock, Ic
 import type { TurnProgressItem } from "../lib/turnProgress";
 import { buildPlanTaskEvidenceAudit, isPlanTaskAwaitingBrowserValidation, isPlanTaskAwaitingExternalValidation, type PlanExecutionEvidenceEntry, type PlanStage, type PlanTask, type ReplyOption } from "../lib/workflowModels";
 import type { PendingRunDecision, PendingRunDecisionChoice } from "../lib/runIntent";
+import { inferReplyOptionActionFromText } from "../lib/replyOptions";
 import MarkdownRenderer from "./MarkdownRenderer";
 
 // region: TopIsland 属性定义
@@ -45,7 +46,11 @@ interface TopIslandProps {
 // endregion
 
 function isApprovalActionOption(option: ReplyOption): boolean {
-  return option.action === "continue_readonly_once" || option.action === "allow_readonly_session";
+  return (
+    option.action === "continue_readonly_once" ||
+    option.action === "allow_readonly_session" ||
+    option.action === "approve_operation_once"
+  );
 }
 
 function getStageLabel(stage: PlanStage, language: "zh" | "en"): string {
@@ -302,9 +307,11 @@ const TopIsland = memo(function TopIsland({
   const submitCustomReply = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!normalizedCustomReply) return;
+    const inferredAction = inferReplyOptionActionFromText(normalizedCustomReply);
     onSelectReplyOption?.({
       label: normalizedCustomReply,
       value: normalizedCustomReply,
+      ...(inferredAction ? { action: inferredAction } : {}),
     });
     setCustomReplyText("");
   };

@@ -1321,8 +1321,35 @@ export default function App() {
     }
 
     const shouldReuseSourceTurn = !!sourceTurnId && !!sourceTurn;
-    const shouldExecuteFromQuickReply = optionAction === "execute_once" && sourceIntent !== "plan";
+    const shouldExecuteFromQuickReply =
+      (optionAction === "execute_once" || optionAction === "approve_operation_once") &&
+      sourceIntent !== "plan";
     const executeQuickReplyIntent = state.selectedMainModeKey === "game_studio" ? "studio_workflow" as const : "execute" as const;
+
+    if (optionAction === "cancel_operation") {
+      useAppStore.setState((s) => ({
+        ...(sourceTurnId ? { currentTurnId: sourceTurnId } : {}),
+        input: "",
+        contextMentions: [],
+        attachedFiles: [],
+        conversationTurns: sourceTurnId
+          ? s.conversationTurns.map((turn) =>
+              turn.id === sourceTurnId && turn.pendingOperationProposal
+                ? {
+                    ...turn,
+                    pendingOperationProposal: {
+                      ...turn.pendingOperationProposal,
+                      approvalStatus: "cancelled",
+                    },
+                    status: "done",
+                  }
+                : turn,
+            )
+          : s.conversationTurns,
+      }));
+      return;
+    }
+
     const sendOptions = shouldReuseSourceTurn
       ? {
           reuseCurrentTurn: true,
@@ -1351,6 +1378,21 @@ export default function App() {
       contextMentions: [],
       attachedFiles: [],
       ...(optionAction === "allow_readonly_session" ? { readOnlyAutoApproveForSession: true } : {}),
+      ...(optionAction === "adjust_plan" && sourceTurnId
+        ? {
+            conversationTurns: state.conversationTurns.map((turn) =>
+              turn.id === sourceTurnId && turn.pendingOperationProposal
+                ? {
+                    ...turn,
+                    pendingOperationProposal: {
+                      ...turn.pendingOperationProposal,
+                      approvalStatus: "adjusting",
+                    },
+                  }
+                : turn,
+            ),
+          }
+        : {}),
       ...(shouldExecuteFromQuickReply && sourceTurnId
         ? { currentTurnExecutionConsent: { turnId: sourceTurnId, granted: true } }
         : {}),

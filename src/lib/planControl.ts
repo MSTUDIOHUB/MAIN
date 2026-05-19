@@ -56,10 +56,10 @@ export function shouldRouteQuickReplyToPlanApproval(input: {
   planArtifacts?: PlanArtifact[];
   planStage?: PlanStage;
 }): boolean {
-  if (input.optionAction && input.optionAction !== "execute_once") return false;
+  if (input.optionAction && input.optionAction !== "execute_once" && input.optionAction !== "approve_operation_once") return false;
   if (input.sourceIntent !== "plan") return false;
   if (input.isPlanApproved) return false;
   if (!hasReviewablePlanContext(input)) return false;
-  if (input.optionAction === "execute_once" && looksLikePlanExecutionChoice(input.text)) return true;
+  if ((input.optionAction === "execute_once" || input.optionAction === "approve_operation_once") && looksLikePlanExecutionChoice(input.text)) return true;
   return looksLikePlanApprovalQuickReply(input.text);
 }

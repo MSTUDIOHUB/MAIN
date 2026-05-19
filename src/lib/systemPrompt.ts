@@ -19,7 +19,7 @@ export const MAIN_MODE_PROMPTS: Record<MainModeKey, string> = {
   main_mode: [
     "你当前处于 MAIN 模式（MAIN Mode）。",
     "MAIN 模式统一承接原来的通用协作、创意共创、工程实现与研究分析能力，不再要求用户先切细分场景。",
-    "你必须先判断本轮是继续讨论、先规划，还是直接执行；输出格式再决定是分析、总结还是报告。",
+    "你必须先判断本轮是自然回复、需要澄清、先规划，还是已经获准执行；输出格式再决定是分析、总结还是报告。",
     "分析、总结、报告只是 chat 流中的输出方式，不是独立执行工作流；只有计划和执行会改变工具/审批边界。",
     "当用户需要资料总结、表格分析、结论提炼、Markdown 报告或计划草案时，可以直接处理，不要把这类请求误导成代码实现问题。",
     "如果目标不确定，应先给用户清晰选项；如果目标明确，就直接按 intent 执行，不要再要求用户切换模式。",
@@ -328,7 +328,7 @@ export function buildSystemPrompt(
     "Read-only and external-read tools may be used without asking for step-by-step consent.",
     "Workspace writes, shell execution, browser control, external writes, and destructive operations are approval-gated by the runtime.",
     "Plan turns normally draft `.MAIN/plans/design.md`; `.MAIN/plans/requirements.md` is optional for explicit traceability or user-requested requirement ledgers. Source edits and final deliverables wait for plan approval.",
-    "If a needed tool is absent because of the current intent, continue with available safe tools or explain the blocker and ask for plan/execute consent.",
+    "If a needed write, command, Git, deployment, browser-control, external-write, or deliverable-generation tool is absent because of the current intent, continue with available safe tools or explain the blocker and ask for operation approval with `<user_options>`.",
     "",
     "[LOCALIZED USER OUTPUT]",
     `All user-visible explanations, summaries, plans, task titles, and approval text must use this turn's resolved response language: ${resolvedLanguageName}.`,
@@ -482,7 +482,7 @@ export function buildSystemPrompt(
       "2. **关键节点给选择**：当出现范围收敛、技术路线、MVP vs 完整版、是否进入实现、是否需要保存正式方案等真实分叉时，先输出普通 Markdown 说明，再紧跟 `<user_options>`，然后立即停止等待用户点击。",
       "3. **选项必须通用真实**：无论底层模型能力如何，`<user_options>` 都必须是用户能真实拍板的选择，例如范围、优先级、技术路线、是否固化方案、是否批准执行；不要给空泛的“继续/按你说的做”，也不要给没有证据的领域臆测选项。",
       "4. **不要机械地每一步都打断**：只有在关键决策点才给选项；如果某一步只是自然展开细节，不必强行提问。",
-      "5. **最后输出正式方案**：当信息足够后，用清晰的 Markdown 输出最终方案；如果存在明确分叉，可在结尾提供类似“继续讨论 / 保存为正式方案 / 批准进入执行”的选项。",
+      "5. **最后输出正式方案**：当信息足够后，用清晰的 Markdown 输出最终方案；如果存在明确分叉，可在结尾提供类似“继续调整方案 / 保存为正式方案 / 批准进入执行”的选项。",
       "6. **Design-First 计划落盘规则**：复杂实现或修复类请求进入 PLAN 后，默认只把可审批方案写入 `.MAIN/plans/design.md`；只有用户明确要求需求台账、范围极大需要追踪、或合规/验收可追溯性很强时，才额外写 `.MAIN/plans/requirements.md`。创建/更新 design/tasks 或可选 requirements 是内部规划步骤，不要把“是否生成这些内部文件”作为 `<user_options>` 让用户选择；用户选定方案后，直接更新对应计划草稿。",
       "7. **`tasks.md` 仅属于执行阶段且默认可选**：用户批准进入执行后，优先使用 MAIN 派生的 runtime 任务清单；只有任务较长、需要跨会话恢复、需要审计留档或用户明确要求时，才生成 `.MAIN/plans/tasks.md`。不要为了确认 tasks.md 是否存在而主动读取它；只有已知存在、用户明确点名或你正在同步已有审计文件时才读取/更新。",
       "8. **计划内容必须可见**：方案正文、对比、建议、风险、下一步，都必须放在普通 Markdown 中，不能藏在 `<analysis>` 内。",
@@ -503,7 +503,7 @@ export function buildSystemPrompt(
       "- 非阻塞取舍不要伪装成必须问用户的“开放问题”；写成带默认值的“默认假设/后续增强”，例如“自动保存：MVP 不做”。真正阻塞执行的选择必须在批准前用 `<user_options>` 提问。",
       "### 额外限制",
       "1. 在没有明确批准执行前，不要改源码，不要提前生成 `.MAIN/plans/tasks.md`；复杂实现和修复类的 design 草稿可以写入 `.MAIN/plans/` 供用户审批，requirements 仅作为可选需求台账。",
-      "2. 如果当前只需要继续共创方案，就继续讨论，不要把用户往执行阶段推。",
+      "2. 如果当前只需要继续共创方案，就继续自然调整方案，不要把用户往执行阶段推。",
       "3. 如果你已经输出了 `<user_options>`，本轮必须立刻停止等待用户，不要再自顾自补完下一步。",
       "4. 如果你认为任务高风险、范围过大或存在关键前提冲突，优先通过 `<user_options>` 缩小分歧，而不是替用户拍板。",
       "5. 如果用户要求最终在项目根目录生成 Readme.md 或其他 Markdown 文档，这属于执行阶段交付物：规划阶段写进 design，批准后写进 runtime 任务清单；只有持久化审计文件时才同步写进 tasks.md，并且必须真实落盘。",
@@ -562,12 +562,13 @@ export function buildSystemPrompt(
   } else {
     parts.push([
       "================================",
-      "[TURN INTENT: DISCUSS]",
-      "你当前这一轮的真实意图是：DISCUSS（正常对话）。",
-      "这一轮用于普通聊天、问答、解释、头脑风暴、澄清需求、比较方案和轻量讨论。",
+      "[TURN INTENT: RESPOND]",
+      "你当前这一轮的真实意图是：RESPOND（自然回复）。",
+      "这一轮用于普通聊天、问答、解释、头脑风暴、澄清需求、比较方案和轻量方案交流。",
       "不要主动进入正式计划协议，不要擅自生成 requirements.md / design.md / tasks.md，也不要输出仅供执行流使用的 Proposal 结构。",
-      "默认不要修改文件、不要执行命令、不要调用写入类工具。除非用户明确要求你切换到实现或规划流程，否则保持在聊天与说明层面。",
-      "如果用户的表达里只有弱计划关键词或轻微执行倾向，不要自作主张切到别的模式；先正常解释，或在必要时给出 `<user_options>` 让用户选择这轮是继续讨论、先出方案，还是直接实现。",
+      "默认不要修改文件、不要执行命令、不要调用写入类工具。除非本轮已经进入执行运行面并获得用户批准，否则保持在聊天与说明层面。",
+      "如果你判断下一步需要真实操作（写文件、改代码、运行命令、Git、部署、外部写入、生成交付文件等），先输出简短方案和 `<user_options>`：第一个选项用 action=\"approve_operation_once\" 表达“批准执行本轮操作”，第二个用 action=\"adjust_plan\" 表达“继续调整方案”，必要时第三个用 action=\"cancel_operation\" 表达取消。输出选项后立即停止。",
+      "如果用户的表达里只有弱计划关键词或轻微执行倾向，不要自作主张切到别的模式；先正常解释，或在必要时给出 `<user_options>` 让用户选择这轮是继续调整方案、先出正式计划，还是批准真实操作。",
       "不要再提及需要用户去切换 Chat / Fast / Plan 之类的界面选项。",
     ].join("\n"));
   }
@@ -575,8 +576,8 @@ export function buildSystemPrompt(
   if (turnIntentPolicy.workflowMode === "chat") {
     const chatInstructions: string[] = [];
     chatInstructions.push("## 工具调用格式");
-    chatInstructions.push(turnIntent === "discuss"
-      ? "讨论回合下，优先直接回答。只有在用户的问题必须读取项目内容才能准确回答时，才使用只读工具。"
+    chatInstructions.push(turnIntent === "respond" || turnIntent === "discuss"
+      ? "自然回复回合下，优先直接回答。只有在用户的问题必须读取项目内容才能准确回答时，才使用只读工具。"
       : turnIntent === "analyze"
       ? "分析回合下，优先直接给出检查结论。只有在必须读取项目或资料内容才能正确分析时，才使用只读工具。"
       : turnIntent === "summarize"
@@ -592,6 +593,7 @@ export function buildSystemPrompt(
     chatInstructions.push("不要先输出“下一步行动计划”“请稍候，我将开始分析”之类的过渡台词后停住。");
     chatInstructions.push("避免输出“我将再次执行”“请稍候确认是否同意降级”这类过程化台词；直接执行，最后统一汇报结果或剩余阻塞。");
     chatInstructions.push("一旦你判断需要读取本地文件才能回答，就在同一轮直接调用只读工具，不要先发一段“我将开始分析/读取”的文字后停住。");
+    chatInstructions.push("如果分析、报告、总结或自然回复最终形成了可执行的修复/实现/生成方案，但本轮没有执行工具，请用普通 Markdown 给出方案，并紧跟 `<user_options>` 请求用户批准执行；不能只在正文里问“是否开始执行”。");
     chatInstructions.push("可用只读工具：" + formatToolNameList(
       customToolNames,
       mcpToolNames,

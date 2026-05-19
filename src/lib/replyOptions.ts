@@ -12,7 +12,7 @@ const READONLY_PERMISSION_CUE_RE = /(?:是否|能否|可否|要不要|是否同�
 const READONLY_ACTION_RE = /(?:读取|查看|分析|检查|扫描|搜索|查询|浏览|梳理|提取|汇总|read|open|view|inspect|analy[sz]e|scan|search|query|review|summari[sz]e)/i;
 const READONLY_WRITE_EXCLUSION_RE = /(?:写入|修改|删除|创建|执行命令|运行命令|改动|更改|write|modify|delete|create|edit|run command|execute command)/i;
 const READONLY_TARGET_RE = /[`"“']([^`"“”']{2,160})[`"”']|([A-Za-z0-9_.\-\/\\]+\.[A-Za-z0-9]{1,12})/;
-const EXECUTE_REPLY_NEGATION_RE = /(?:不(?:要|用|进入|开始|继续)?执行|不运行|不部署|暂不执行|暂不运行|继续讨论|先确认|我来确认|don't execute|do not execute|do not run|don't run|not execute|not run|discuss first|confirm first)/i;
+const EXECUTE_REPLY_NEGATION_RE = /(?:不(?:要|用|进入|开始|继续)?执行|不运行|不部署|暂不执行|暂不运行|停止执行|结束执行|中止执行|仅查看|只查看|查看当前进度|继续讨论|先确认|我来确认|don't execute|do not execute|do not run|don't run|not execute|not run|stop execution|end execution|just view|view current progress|discuss first|confirm first)/i;
 const EXECUTE_REPLY_ACTION_RE = /(?:直接|开始|继续|立即|马上|现在)?(?:执行|运行|部署|发布|同步|上传|实现|处理|重构|完善|改造|开发|接入|集成|修复|修改|改动)(?:部署脚本|脚本|命令|deploy(?:\.sh)?|deployment script|command|控制器|系统|逻辑|功能|模块|bug|错误|问题)?|(?:deploy(?:\.sh)?|部署脚本|执行命令|运行命令)|\b(?:run|execute|deploy|ship|implement|refactor|complete|continue|integrate|build|fix|patch|modify)(?:\s+(?:the\s+)?)?(?:deploy(?:\.sh)?|deployment script|script|command|controller|system|logic|feature|module|bug|issue|error)?\b/i;
 const PLAN_ARTIFACT_PATH_RE = /\.MAIN[\/\\]plans[\/\\](?:requirements|design|bugfix|tasks)\.md/i;
 const PLAN_ARTIFACT_FILE_RE = /\b(?:requirements|design|bugfix|tasks)\.md\b/i;
@@ -23,15 +23,41 @@ const PLAN_SUMMARY_HEADING_RE = /(?:方案总结|需求规格|设计方案|关�
 const PLAN_SUMMARY_ITEM_RE = /^(?:\*\*)?(?:技术栈|核心玩法|交互控制|交付物|架构|游戏循环|渲染|碰撞检测|执行顺序|关键设计决策|需求规格|设计方案|文件|模块|验证方式|测试方案|范围|目标|验收标准)(?:\*\*)?\s*[:：]/i;
 const DIAGNOSTIC_STATEMENT_OPTION_RE = /(?:问题可能|可能(?:是|在|出在)|看起来|似乎|应该是|原因(?:可能)?|被(?:自动)?(?:引入|加载|调用|覆盖)|已经(?:存在|完成|失败)|没有(?:被|正确)|is likely|likely due to|probably|seems? like|appears? to|was automatically|has been|is already)/i;
 const ACTIONABLE_OPTION_RE = /(?:^方案\s*[A-Z0-9一二三四五六七八九十]|^option\s*[A-Z0-9]|先|直接|继续|开始|执行|运行|批准|确认|选择|使用|改用|采用|切换|修复|修改|实现|重构|完善|生成|创建|删除|保留|跳过|我来|请|proceed|continue|start|run|execute|approve|confirm|choose|use|switch|fix|modify|implement|refactor|create|delete|skip)/i;
+const OPERATION_APPROVAL_REPLY_RE = /(?:批准|允许|同意).{0,16}(?:执行|操作|修改|修复|运行|写入)|(?:approve|allow).{0,24}(?:operation|execution|changes?|write|run)/i;
+const EXECUTABLE_PROPOSAL_CUE_RE = /(?:修复方案|实现方案|执行方案|改造方案|重构方案|落地方案|方案建议|建议方案|方案如下|执行步骤|实施步骤|下一步(?:可以|建议)?(?:执行|修复|修改|实现|落地)|是否(?:现在|立刻|开始|按上述方案)?(?:执行|修复|修改|实现|落地)|是否需要(?:我|MAIN)?(?:开始|继续)?(?:执行|修复|修改|实现)|要不要(?:开始|按方案)?(?:执行|修复|修改|实现)|proposed fix|fix plan|implementation plan|execution plan|proposal|next steps?.{0,24}(?:implement|execute|apply|fix|patch)|do you want me to.{0,24}(?:start|implement|execute|apply|fix|patch)|should I.{0,24}(?:start|implement|execute|apply|fix|patch)|ready to execute)/i;
+const OPERATION_CUE_RE = /(?:写入|修改|改动|更改|删除|创建|生成(?:文件|交付物)?|执行命令|运行命令|运行测试|部署|发布|提交|推送|Git|修复|实现|重构|落地|write|modify|edit|delete|create|generate|run command|execute command|run tests?|deploy|publish|commit|push|git|fix|implement|refactor|patch|ship)/i;
 
 function normalizeOptionText(text: string): string {
   return text.replace(/\s+/g, " ").trim();
 }
 
+function rewriteExecutionModeChoice(text: string): string {
+  const normalized = normalizeOptionText(text);
+  if (!normalized) return "";
+
+  const zhMatch = normalized.match(/^(?:请)?(?:切换(?:到)?|进入)(?:执行模式|执行能力)(.*)$/i);
+  if (zhMatch) {
+    const suffix = normalizeOptionText(zhMatch[1] || "")
+      .replace(/^[,，:：;；\-\s]+/, "")
+      .replace(/^(?:并|来|以便|然后|继续)\s*/, "");
+    return suffix ? `开始执行${suffix}` : "开始执行";
+  }
+
+  const enMatch = normalized.match(/^(?:please\s+)?(?:switch(?:\s+to)?|enter)\s+(?:execution|execute)\s+mode\b(.*)$/i);
+  if (enMatch) {
+    const suffix = normalizeOptionText(enMatch[1] || "")
+      .replace(/^[,，:：;；\-\s]+/, "")
+      .replace(/^(?:and|then|to|continue)\s+/i, "");
+    return suffix ? `Start execution: ${suffix}` : "Start execution";
+  }
+
+  return normalized;
+}
+
 const OPTION_FILLER_PREFIX_RE = /^(?:下一步行动计划[:：]?\s*|请稍候[,，]?\s*|接下来(?:我)?(?:将|会)?\s*|我(?:将|会|先|现在|接下来)(?:继续)?\s*|I(?:'ll| will)\s+|Next action plan:?\s*|Please wait[, ]*\s*)/i;
 
 function normalizeReplyOptionLabel(text: string): string {
-  const cleaned = normalizeOptionText(text)
+  const cleaned = rewriteExecutionModeChoice(text)
     .replace(OPTION_FILLER_PREFIX_RE, "")
     .replace(/[。.!！？?]+$/, "");
   const converted = convertAssistantClauseToUserChoice(cleaned);
@@ -39,11 +65,11 @@ function normalizeReplyOptionLabel(text: string): string {
 }
 
 function normalizeReplyOptionValue(text: string): string {
-  const cleaned = normalizeOptionText(text)
+  const cleaned = rewriteExecutionModeChoice(text)
     .replace(OPTION_FILLER_PREFIX_RE, "")
     .replace(/^请选择[:：]?\s*/i, "");
   const converted = normalizeOptionText(convertAssistantClauseToUserChoice(cleaned));
-  if (/^请(?:先|直接|继续|进入|输出|总结|报告|按|使用|切换|选择|讨论|生成)/.test(converted)) {
+  if (/^请(?:先|直接|继续|进入|输出|总结|报告|按|使用|切换|选择|讨论|生成|开始|执行)/.test(converted)) {
     return converted.replace(/^请/, "");
   }
   return converted;
@@ -99,7 +125,10 @@ function normalizeReplyOptionAction(value: string | undefined): ReplyOption["act
   if (
     normalized === "continue_readonly_once" ||
     normalized === "allow_readonly_session" ||
-    normalized === "execute_once"
+    normalized === "execute_once" ||
+    normalized === "approve_operation_once" ||
+    normalized === "adjust_plan" ||
+    normalized === "cancel_operation"
   ) {
     return normalized;
   }
@@ -132,7 +161,12 @@ function looksLikeActionableReplyOption(text: string, source?: ReplyOption["sour
 
 function inferReplyOptionAction(label: string, value: string): ReplyOption["action"] | undefined {
   const combined = `${label}\n${value}`;
+  if (OPERATION_APPROVAL_REPLY_RE.test(combined)) return "approve_operation_once";
   return looksLikeExecuteReplyOption(combined) ? "execute_once" : undefined;
+}
+
+export function inferReplyOptionActionFromText(text: string): ReplyOption["action"] | undefined {
+  return inferReplyOptionAction(text, text);
 }
 
 function convertAssistantClauseToUserChoice(clause: string): string {
@@ -305,6 +339,48 @@ function inferReadOnlyPermissionOptions(
   );
 }
 
+function looksLikeExecutableProposalFollowUp(text: string): boolean {
+  const normalized = normalizeOptionText(text);
+  if (!normalized) return false;
+  if (READONLY_WRITE_EXCLUSION_RE.test(normalized) && READONLY_ACTION_RE.test(normalized) && !OPERATION_CUE_RE.test(normalized)) {
+    return false;
+  }
+  return EXECUTABLE_PROPOSAL_CUE_RE.test(normalized) && OPERATION_CUE_RE.test(normalized);
+}
+
+function inferProposalFollowUpOptions(
+  text: string,
+  replyOptions: ReplyOption[],
+  seenValues: Set<string>,
+) {
+  if (!looksLikeExecutableProposalFollowUp(text)) return;
+
+  addReplyOption(
+    replyOptions,
+    seenValues,
+    "批准执行本轮操作",
+    "我批准按上面的方案开始真实操作，请复用上一轮方案，不要重新规划，直接执行并验证。",
+    "approve_operation_once",
+    "proposal_follow_up",
+  );
+  addReplyOption(
+    replyOptions,
+    seenValues,
+    "继续调整方案",
+    "请继续调整上面的方案，暂不执行真实操作。",
+    "adjust_plan",
+    "proposal_follow_up",
+  );
+  addReplyOption(
+    replyOptions,
+    seenValues,
+    "取消操作",
+    "取消上面的执行操作，本轮到此为止。",
+    "cancel_operation",
+    "operation_approval",
+  );
+}
+
 export function hasReadOnlyPermissionReplyOptions(replyOptions: ReplyOption[]): boolean {
   return Array.isArray(replyOptions) && replyOptions.some((option) =>
     option.action === "continue_readonly_once" || option.action === "allow_readonly_session"
@@ -408,6 +484,10 @@ export function extractReplyOptions(text: string): {
   }
 
   if (replyOptions.length === 0) {
+    inferProposalFollowUpOptions(cleanText, replyOptions, seenValues);
+  }
+
+  if (replyOptions.length === 0) {
     inferReadOnlyPermissionOptions(cleanText, replyOptions, seenValues);
   }
 
@@ -443,8 +523,11 @@ export function shouldPauseForReplyOptions(params: {
   const hasExplicitOrPermissionOption = replyOptions.some((option) =>
     option.source === "explicit_user_options" ||
     option.source === "readonly_permission" ||
+    option.source === "proposal_follow_up" ||
+    option.source === "operation_approval" ||
     option.action === "continue_readonly_once" ||
-    option.action === "allow_readonly_session"
+    option.action === "allow_readonly_session" ||
+    option.action === "approve_operation_once"
   );
   if (finishReason === "length" && !hasExplicitOrPermissionOption) return false;
   if (forcePause) return true;

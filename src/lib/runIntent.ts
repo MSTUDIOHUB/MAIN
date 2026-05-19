@@ -3,6 +3,7 @@ import type { MainModeKey } from "./mainModes";
 
 export type LegacyWorkflowMode = "chat" | "edit" | "plan";
 export type ResolvedUserIntent =
+  | "respond"
   | "discuss"
   | "plan"
   | "execute"
@@ -143,19 +144,34 @@ export interface RunIntentPolicy {
 }
 
 const RUN_INTENT_POLICIES: Record<ResolvedUserIntent, RunIntentPolicy> = {
+  respond: {
+    intent: "respond",
+    workflowMode: "chat",
+    uiCategory: "discussion",
+    toolPolicy: "read_only",
+    requiresPlanApproval: false,
+    generatesPlanArtifacts: false,
+    allowsSourceWritesBeforePlanApproval: false,
+    label: { zh: "回复", en: "Respond" },
+    categoryLabel: { zh: "自然回复", en: "Natural Response" },
+    description: {
+      zh: "自然问答、解释、只读检查、澄清和方案交流；需要真实操作时先请求批准。",
+      en: "Natural answers, explanations, read-only inspection, clarification, and proposal discussion; ask before real operations.",
+    },
+  },
   discuss: {
     intent: "discuss",
     workflowMode: "chat",
     uiCategory: "discussion",
-    toolPolicy: "none",
+    toolPolicy: "read_only",
     requiresPlanApproval: false,
     generatesPlanArtifacts: false,
     allowsSourceWritesBeforePlanApproval: false,
-    label: { zh: "讨论", en: "Discuss" },
-    categoryLabel: { zh: "普通对话", en: "Conversation" },
+    label: { zh: "回复", en: "Respond" },
+    categoryLabel: { zh: "自然回复", en: "Natural Response" },
     description: {
-      zh: "正常问答、解释、头脑风暴和轻量需求澄清。",
-      en: "Normal Q&A, explanations, brainstorming, and lightweight clarification.",
+      zh: "旧会话兼容别名；新回合使用自然回复。",
+      en: "Legacy alias for older sessions; new turns use respond.",
     },
   },
   plan: {
@@ -263,6 +279,9 @@ const STRONG_PLAN_PATTERNS = [
 ];
 
 const STRONG_EXECUTE_PATTERNS = [
+  /^(?:执行|开始执行|继续执行)(?:修复|修改|处理|实现|改动|改造|重构|完善|部署|发布)/i,
+  /^(?:帮我|请|直接|现在)?(?:修复|解决|处理)(?:一下|下)?(?:这个|该|当前)?(?:问题|bug|错误|故障|异常|展示问题|显示问题|逻辑问题|功能问题|页面问题|组件问题)?/i,
+  /(?:帮我|请|直接|现在)?(?:修复|解决|改掉).{0,48}(?:问题|bug|错误|故障|异常|展示|显示|逻辑|功能|页面|组件|模块)/i,
   /(?:帮我|请|直接|现在)?(?:修改|改一下|改动|处理一下)(?:这个|该|当前)?(?:功能|逻辑|问题|模块|文件)?/i,
   /直接(?:改|做|实现|修|写|上手|处理)/i,
   /帮我(?:实现|修复|修改|改掉|补上|落地)/i,
@@ -413,7 +432,7 @@ const HIGH_RISK_PATTERNS: Array<{ key: string; patterns: RegExp[] }> = [
 
 const CONTINUATION_INTENTS = new Set<RunIntentControlAction>(["approve_plan", "resume_plan_execution"]);
 
-export type MainIntentShortcut = Exclude<ResolvedUserIntent, "discuss" | "studio_workflow">;
+export type MainIntentShortcut = Exclude<ResolvedUserIntent, "respond" | "discuss" | "execute" | "studio_workflow">;
 
 export interface MainIntentShortcutItem {
   intent: MainIntentShortcut;
@@ -804,10 +823,25 @@ function finalizeRunIntentResolution(
       parsedStudioCommand: context.parsedStudioCommand,
       source: context.parsedStudioCommand?.type === "workflow" ? "studio_slash" : "natural_language",
     });
+  const operationNeedsApproval =
+    commandDirective.requiresApproval === true &&
+    !resolution.needsDecision &&
+    !resolution.controlAction &&
+    resolution.intent !== "execute" &&
+    resolution.intent !== "studio_workflow" &&
+    resolution.intent !== "plan";
   return {
     ...resolution,
     commandDirective,
     requiresApproval: resolution.requiresApproval ?? commandDirective.requiresApproval ?? resolution.riskLevel === "high",
+    ...(operationNeedsApproval
+      ? {
+          needsDecision: true,
+          suggestedIntent: "execute" as const,
+          decisionOptions: ["execute", resolution.intent === "respond" || resolution.intent === "discuss" ? "respond" : resolution.intent, "respond"]
+            .filter((intent, index, array) => array.indexOf(intent) === index) as ResolvedUserIntent[],
+        }
+      : {}),
   };
 }
 
@@ -828,7 +862,7 @@ export function isMainIntentShortcutAllowedInMainMode(intent: MainIntentShortcut
 }
 
 export function getIntentPolicy(intent: ResolvedUserIntent): RunIntentPolicy {
-  return RUN_INTENT_POLICIES[intent] ?? RUN_INTENT_POLICIES.discuss;
+  return RUN_INTENT_POLICIES[intent] ?? RUN_INTENT_POLICIES.respond;
 }
 
 export function getRunIntentLabel(intent: ResolvedUserIntent, language: "zh" | "en" = "zh"): string {
@@ -886,11 +920,17 @@ export function parseMainDebugShortcut(input: string): MainDebugShortcut | null 
 
 function createOption(intent: ResolvedUserIntent, language: "zh" | "en"): PendingRunDecisionOption {
   const labels: Record<ResolvedUserIntent, { zh: string; en: string; valueZh: string; valueEn: string }> = {
+    respond: {
+      zh: "先自然回复/调整方案",
+      en: "Respond / Adjust First",
+      valueZh: "先继续自然回复或调整方案，不直接改动代码或运行命令",
+      valueEn: "Continue with a natural response or adjust the proposal first, without changing files or running commands.",
+    },
     discuss: {
-      zh: "继续讨论/只读分析",
-      en: "Discuss / Read-only",
-      valueZh: "先继续讨论或只做只读分析，不直接改动代码",
-      valueEn: "Continue discussion or read-only analysis first, without applying code changes yet.",
+      zh: "先自然回复/调整方案",
+      en: "Respond / Adjust First",
+      valueZh: "先继续自然回复或调整方案，不直接改动代码或运行命令",
+      valueEn: "Continue with a natural response or adjust the proposal first, without changing files or running commands.",
     },
     plan: {
       zh: "先生成 Plan（批准后执行）",
@@ -899,10 +939,10 @@ function createOption(intent: ResolvedUserIntent, language: "zh" | "en"): Pendin
       valueEn: "Create a reviewable plan first, then execute after approval.",
     },
     execute: {
-      zh: "直接执行修改",
-      en: "Execute Directly",
-      valueZh: "直接开始修改并验证结果，不先走完整 Plan",
-      valueEn: "Start implementing and validating now without a separate planning phase.",
+      zh: "批准执行本轮操作",
+      en: "Approve This Operation",
+      valueZh: "我批准本轮开始真实操作，请按当前需求执行并验证结果",
+      valueEn: "I approve real operations for this turn. Execute the current request and validate the result.",
     },
     analyze: {
       zh: "先做分析",
@@ -956,12 +996,12 @@ export function createPendingDecisionCopy(
   resolution: Pick<RunIntentResolution, "suggestedIntent" | "decisionOptions" | "riskLevel" | "reason">,
   language: "zh" | "en",
 ): { title: string; options: PendingRunDecisionOption[]; reason: string } {
-  const suggested = resolution.suggestedIntent ?? "discuss";
+  const suggested = resolution.suggestedIntent ?? "respond";
   const intents: ResolvedUserIntent[] = resolution.decisionOptions?.length
     ? resolution.decisionOptions
     : suggested === "report"
-    ? ["summarize", "report", "discuss"]
-    : ["plan", "execute", "discuss"];
+    ? ["summarize", "report", "respond"]
+    : ["execute", "respond", "plan"];
 
   const title = suggested === "report"
     ? localizeReason(
@@ -977,8 +1017,8 @@ export function createPendingDecisionCopy(
       )
     : localizeReason(
         language,
-        "这轮任务应该怎么处理？",
-        "How should MAIN handle this turn?",
+        "是否批准 MAIN 开始真实操作？",
+        "Approve MAIN to start real operations?",
       );
 
   return {
@@ -989,7 +1029,7 @@ export function createPendingDecisionCopy(
 }
 
 function isComposerSuggestibleIntent(intent: ResolvedUserIntent): intent is MainIntentShortcut {
-  return ["plan", "summarize", "report", "analyze", "execute"].includes(intent);
+  return ["plan", "summarize", "report", "analyze"].includes(intent);
 }
 
 export function resolveComposerIntentSuggestion(params: {
@@ -1079,7 +1119,7 @@ export function resolveRunIntentFromLegacyWorkflowMode(
     case "edit":
       return "execute";
     default:
-      return "discuss";
+      return "respond";
   }
 }
 
@@ -1092,7 +1132,7 @@ export function resolveConversationTurnIntent(
 
 /**
  * preflight 会额外触发一次模型请求。
- * 普通低风险讨论如果在发送前被它阻塞，会让按钮/回车看起来像“卡住”。
+ * 普通低风险自然回复如果在发送前被它阻塞，会让按钮/回车看起来像“卡住”。
  * 因此这里只让真正可能改变后续流程的低置信度请求进入阻塞 preflight。
  */
 export function shouldUseBlockingIntentPreflight(
@@ -1106,9 +1146,9 @@ export function shouldUseBlockingIntentPreflight(
   if (getIntentPolicy(resolution.intent).uiCategory === "output_style") return false;
 
   // region: 热路径保护
-  // 普通 discuss 已经会由主模型在系统提示里继续判断真实任务类型，
+  // 普通自然回复已经会由主模型在系统提示里继续判断真实任务类型，
   // 不值得为了一次额外 preflight 阻塞用户点击发送或回车。
-  if (resolution.intent === "discuss" && resolution.riskLevel === "low") {
+  if ((resolution.intent === "respond" || resolution.intent === "discuss") && resolution.riskLevel === "low") {
     return false;
   }
   // endregion
@@ -1185,8 +1225,8 @@ export function resolveTurnRunIntent(
 
   if (!normalizedInput) {
     return finalize({
-      intent: "discuss",
-      reason: localizeReason(language, "空输入默认按普通讨论处理。", "Empty input defaults to discuss."),
+      intent: "respond",
+      reason: localizeReason(language, "空输入默认按自然回复处理。", "Empty input defaults to natural response."),
       confidence: 0.5,
       bypassMainRouter: false,
       riskLevel: "low",
@@ -1258,61 +1298,79 @@ export function resolveTurnRunIntent(
 
   if (matchesAny(normalizedInput, STRONG_REPORT_PATTERNS)) {
     return finalize({
-      intent: "report",
+      intent: "respond",
       reason: localizeReason(
         language,
-        "检测到明确的报告输出请求，本轮会按报告模式处理。",
-        "Detected an explicit report request, so this turn will use report mode.",
+        "检测到报告输出语义，但未使用 /报告；本轮保持自然回复并让模型按请求组织内容。",
+        "Detected report wording without /report; this turn stays in natural response while following the requested format.",
       ),
-      confidence: 0.96,
+      confidence: 0.86,
       bypassMainRouter: false,
-      riskLevel: "medium",
+      riskLevel: "low",
     });
   }
 
   const hasStrongSummarizeSignal = matchesAny(normalizedInput, STRONG_SUMMARIZE_PATTERNS);
   const hasStrongExecuteSignal = matchesAny(normalizedInput, STRONG_EXECUTE_PATTERNS);
+  const hasStrongAnalyzeSignal = matchesAny(normalizedInput, STRONG_ANALYZE_PATTERNS);
 
   if (context.mainModeKey === "main_mode" && hasStrongSummarizeSignal && hasStrongExecuteSignal) {
     return finalize({
-      intent: "discuss",
+      intent: "respond",
       reason: localizeReason(
         language,
-        "同时检测到“总结”与“执行”强信号，本轮先让你确认意图（执行 / 总结 / 讨论），避免误判为强制总结。",
-        "Both summary and execution signals were detected, so this turn asks you to choose intent (execute / summarize / discuss) instead of forcing summary mode.",
+        "同时检测到总结与真实操作信号；真实操作需要先得到用户批准。",
+        "Detected both summary and real-operation signals; real operations require user approval first.",
       ),
       confidence: 0.9,
       bypassMainRouter: false,
       riskLevel: "medium",
       needsDecision: true,
       suggestedIntent: "execute",
-      decisionOptions: ["execute", "summarize", "discuss"],
+      decisionOptions: ["execute", "respond", "summarize"],
     });
   }
 
   if (hasStrongSummarizeSignal) {
     return finalize({
-      intent: "summarize",
+      intent: "respond",
       reason: localizeReason(
         language,
-        "检测到明确的总结请求，本轮会按总结模式处理。",
-        "Detected an explicit summary request, so this turn will use summary mode.",
+        "检测到总结语义，但未使用 /总结；本轮保持自然回复并按请求提炼内容。",
+        "Detected summary wording without /summarize; this turn stays in natural response while summarizing as requested.",
       ),
-      confidence: 0.94,
+      confidence: 0.86,
       bypassMainRouter: false,
       riskLevel: "low",
     });
   }
 
-  if (matchesAny(normalizedInput, STRONG_ANALYZE_PATTERNS)) {
+  if (hasStrongExecuteSignal && hasStrongAnalyzeSignal) {
     return finalize({
-      intent: "analyze",
+      intent: "respond",
       reason: localizeReason(
         language,
-        "检测到明确的分析/检查/验证请求，本轮会按只读分析模式处理。",
-        "Detected an explicit analysis/inspection/validation request, so this turn will use read-only analysis mode.",
+        "检测到修复/修改意图；真实操作需要先得到用户批准。",
+        "Detected an implementation request; real operations require user approval first.",
       ),
-      confidence: 0.95,
+      confidence: 0.94,
+      bypassMainRouter: false,
+      riskLevel: "medium",
+      needsDecision: true,
+      suggestedIntent: "execute",
+      decisionOptions: ["execute", "respond"],
+    });
+  }
+
+  if (hasStrongAnalyzeSignal) {
+    return finalize({
+      intent: "respond",
+      reason: localizeReason(
+        language,
+        "检测到分析/检查语义，但未使用 /分析；本轮保持自然回复并可进行必要的只读检查。",
+        "Detected analysis wording without /analyze; this turn stays in natural response and may use read-only inspection.",
+      ),
+      confidence: 0.86,
       bypassMainRouter: false,
       riskLevel: "low",
     });
@@ -1320,75 +1378,81 @@ export function resolveTurnRunIntent(
 
   if (matchesAny(normalizedInput, STRONG_PLAN_PATTERNS)) {
     return finalize({
-      intent: "plan",
+      intent: "respond",
       reason: localizeReason(
         language,
-        "检测到明确的方案/规划请求，本轮会直接进入计划阶段。",
-        "Detected an explicit planning/spec request, so this turn will enter plan mode directly.",
+        "检测到方案/规划语义，但未使用 /计划；本轮保持自然回复并在形成方案后跟踪是否执行。",
+        "Detected planning wording without /plan; this turn stays in natural response and will track execution follow-up if a proposal is produced.",
       ),
-      confidence: 0.96,
+      confidence: 0.86,
       bypassMainRouter: false,
-      riskLevel: "medium",
+      riskLevel: "low",
     });
   }
 
   const complexImplementationMatches = countPatternMatches(normalizedInput, COMPLEX_IMPLEMENTATION_PATTERNS);
   if (complexImplementationMatches >= 2) {
     return finalize({
-      intent: "plan",
+      intent: "respond",
       reason: localizeReason(
         language,
-        "检测到这是多文件/架构级实现请求，本轮会先生成可审批计划，再由用户批准后执行。",
-        "Detected a multi-file or architecture-level implementation request, so this turn will create a reviewable plan before execution.",
+        "检测到多文件/架构级实现请求；真实操作或正式计划都需要用户选择后继续。",
+        "Detected a multi-file or architecture-level implementation request; real operations or formal planning require the user to choose first.",
       ),
       confidence: 0.93,
       bypassMainRouter: false,
       riskLevel: "high",
+      needsDecision: true,
+      suggestedIntent: "plan",
+      decisionOptions: ["plan", "respond", "execute"],
     });
   }
 
   if (context.mainModeKey === "game_studio" && matchesAny(normalizedInput, GAME_STUDIO_EXECUTE_PATTERNS)) {
     return finalize({
-      intent: "studio_workflow",
+      intent: "respond",
       reason: localizeReason(
         language,
-        "检测到 Game Studio 中明确的实现/重构/完善请求，本轮会进入工作室执行链路。",
-        "Detected an explicit implementation/refactor/completion request inside Game Studio, so this turn will use the studio execution workflow.",
+        "检测到 Game Studio 中明确的实现/重构/完善请求；进入工作室执行链路前需要用户批准。",
+        "Detected an explicit implementation/refactor/completion request inside Game Studio; user approval is required before studio execution.",
       ),
       confidence: 0.9,
-      bypassMainRouter: true,
+      bypassMainRouter: false,
       riskLevel: "medium",
+      needsDecision: true,
+      suggestedIntent: "execute",
+      decisionOptions: ["execute", "respond"],
     });
   }
 
   if (hasStrongExecuteSignal) {
     return finalize({
-      intent: "execute",
+      intent: "respond",
       reason: localizeReason(
         language,
-        "检测到明确的直接执行请求，本轮会直接进入执行流。",
-        "Detected an explicit implementation request, so this turn will go straight to execution.",
+        "检测到明确的真实操作请求；开始操作前需要用户批准。",
+        "Detected a real-operation request; user approval is required before execution.",
       ),
       confidence: 0.94,
       bypassMainRouter: false,
       riskLevel: "medium",
+      needsDecision: true,
+      suggestedIntent: "execute",
+      decisionOptions: ["execute", "respond"],
     });
   }
 
   if (matchesAny(normalizedInput, WEAK_PLAN_PATTERNS)) {
     return finalize({
-      intent: "discuss",
+      intent: "respond",
       reason: localizeReason(
         language,
-        "这条消息里出现了方案或计划相关关键词，但目标还不够明确，MAIN 应该先让你确认这轮是继续讨论、先出方案，还是直接处理。",
-        "This message contains weak planning keywords, but the goal is still ambiguous. MAIN should confirm whether you want discussion, planning, or direct execution.",
+        "这条消息里出现了方案或计划相关关键词；未使用 /计划 时按自然回复处理。",
+        "This message contains planning keywords; without /plan it stays in natural response.",
       ),
       confidence: 0.7,
       bypassMainRouter: false,
-      riskLevel: "medium",
-      needsDecision: true,
-      suggestedIntent: "plan",
-      decisionOptions: ["plan", "execute", "discuss"],
+      riskLevel: "low",
     });
   }
 
@@ -1400,7 +1464,7 @@ export function resolveTurnRunIntent(
   }
   if (riskMatches >= 2) {
     return finalize({
-      intent: "execute",
+      intent: "respond",
       reason: localizeReason(
         language,
         "这条请求涉及较多阶段或系统，MAIN 建议先确认是否进入计划阶段，再决定是否直接实施。",
@@ -1411,7 +1475,7 @@ export function resolveTurnRunIntent(
       riskLevel: "high",
       needsDecision: true,
       suggestedIntent: "plan",
-      decisionOptions: ["plan", "execute", "discuss"],
+      decisionOptions: ["plan", "respond", "execute"],
     });
   }
 
@@ -1430,11 +1494,11 @@ export function resolveTurnRunIntent(
       });
     }
     return finalize({
-      intent: "discuss",
+      intent: "respond",
       reason: localizeReason(
         language,
-        "Game Studio 普通文本默认先按讨论处理，只有 slash 工作流默认直走执行。",
-        "Game Studio plain text defaults to discussion; only slash workflows go straight to execution.",
+        "Game Studio 普通文本默认按自然回复处理，只有 slash 工作流默认直走执行。",
+        "Game Studio plain text defaults to natural response; only slash workflows go straight to execution.",
       ),
       confidence: 0.84,
       bypassMainRouter: false,
@@ -1443,11 +1507,11 @@ export function resolveTurnRunIntent(
   }
 
   return finalize({
-    intent: "discuss",
+    intent: "respond",
     reason: localizeReason(
       language,
-      "没有命中明确的计划、执行、总结或报告信号，本轮先按普通讨论处理。",
-      "No strong planning, execution, summary, or report signal was detected, so this turn defaults to discussion.",
+      "没有命中主动斜杠流程，本轮按自然回复处理。",
+      "No explicit slash workflow was detected, so this turn defaults to natural response.",
     ),
     confidence: 0.74,
     bypassMainRouter: false,

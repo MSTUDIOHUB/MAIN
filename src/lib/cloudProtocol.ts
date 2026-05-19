@@ -63,6 +63,8 @@ export interface ProtocolChatMessage {
   content: string | ProtocolContentPart[];
   tool_calls?: ProtocolToolCall[];
   tool_call_id?: string;
+  reasoning_content?: string;
+  reasoning?: string;
 }
 
 export interface StreamedToolCallLike {
@@ -76,6 +78,8 @@ export interface StreamResultLike {
   content: string;
   toolCalls: StreamedToolCallLike[];
   finishReason: "stop" | "length" | "tool_calls" | null;
+  reasoningContent?: string;
+  reasoningField?: "reasoning_content" | "reasoning";
 }
 
 export interface OpenAiResponsesInputCandidate {

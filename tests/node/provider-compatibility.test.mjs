@@ -84,6 +84,10 @@ test("provider compatibility error helper matches weak OpenAI-compatible gateway
     true,
   );
   assert.equal(
+    isProviderCompatibilityErrorMessage('HTTP 400 Bad Request: {"error":{"message":"The `reasoning_content` in the thinking mode must be passed back to the API.","type":"invalid_request_error"}}'),
+    true,
+  );
+  assert.equal(
     isNativeToolCompatibilityErrorMessage('HTTP 400: Invalid "messages" in payload'),
     true,
   );
@@ -121,6 +125,7 @@ test("compatibility retry flattens multimodal and tool history into plain text",
     {
       role: "assistant",
       content: "我先检查文件。",
+      reasoning_content: "Need to inspect before answering.",
       tool_calls: [{
         id: "call_1",
         type: "function",
@@ -140,6 +145,7 @@ test("compatibility retry flattens multimodal and tool history into plain text",
   assert.match(messages[0].content, /Image omitted/);
   assert.equal(messages[1].role, "assistant");
   assert.equal(messages[1].content, "我先检查文件。");
+  assert.equal(messages[1].reasoning_content, undefined);
   assert.equal(messages[2].role, "user");
   assert.match(messages[2].content, /\[Tool result\]/);
 });

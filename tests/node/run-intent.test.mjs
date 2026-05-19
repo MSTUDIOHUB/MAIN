@@ -100,58 +100,77 @@ test("MAIN mode keys exclude legacy Task Center and migrate old value", () => {
   assert.equal(mapLegacyNexusModeToMainMode("task_center"), "main_mode");
 });
 
-test("explicit Chinese planning request resolves to plan", () => {
+test("plain Chinese planning wording stays natural without slash lock", () => {
   const result = resolveTurnRunIntent("先给我一个方案再实现", createContext());
-  assert.equal(result.intent, "plan");
+  assert.equal(result.intent, "respond");
   assert.equal(result.needsDecision, undefined);
 });
 
-test("explicit English implementation request resolves to execute", () => {
+test("plain English implementation request asks for operation approval", () => {
   const result = resolveTurnRunIntent("Please implement it directly and fix the bug", createContext());
-  assert.equal(result.intent, "execute");
-  assert.equal(result.needsDecision, undefined);
+  assert.equal(result.intent, "respond");
+  assert.equal(result.needsDecision, true);
+  assert.equal(result.suggestedIntent, "execute");
+  assert.deepEqual(result.decisionOptions, ["execute", "respond"]);
 });
 
-test("Chinese design based implementation request resolves to execute", () => {
+test("fix requests with analysis-domain nouns ask for operation approval", () => {
+  for (const input of [
+    "修复数据分析展示问题",
+    "执行修复",
+    "请修复当前数据分析页面显示问题",
+  ]) {
+    const result = resolveTurnRunIntent(input, createContext());
+    assert.equal(result.intent, "respond", input);
+    assert.equal(result.needsDecision, true, input);
+    assert.equal(result.suggestedIntent, "execute", input);
+  }
+});
+
+test("Chinese design based implementation request asks for operation approval", () => {
   const result = resolveTurnRunIntent("请根据设计方案 design.md 来完成修改", createContext());
-  assert.equal(result.intent, "execute");
-  assert.equal(result.needsDecision, undefined);
+  assert.equal(result.intent, "respond");
+  assert.equal(result.needsDecision, true);
+  assert.equal(result.suggestedIntent, "execute");
 });
 
-test("Git commit and push requests resolve to execute", () => {
+test("Git commit and push requests ask for operation approval", () => {
   for (const input of [
     "提交并推送",
     "帮我提交 git 并推送",
     "commit and push my changes",
   ]) {
     const result = resolveTurnRunIntent(input, createContext());
-    assert.equal(result.intent, "execute", input);
+    assert.equal(result.intent, "respond", input);
     assert.equal(result.commandDirective.kind, "git", input);
     assert.equal(result.commandDirective.action, "commit_push", input);
     assert.equal(result.requiresApproval, true, input);
-    assert.equal(result.needsDecision, undefined, input);
+    assert.equal(result.needsDecision, true, input);
+    assert.equal(result.suggestedIntent, "execute", input);
   }
 });
 
-test("Git status inspection resolves to execute for shell access", () => {
+test("Git status inspection asks before shell-backed Git access", () => {
   const result = resolveTurnRunIntent("先帮我查看 Git 状态和变更内容", createContext());
-  assert.equal(result.intent, "execute");
+  assert.equal(result.intent, "respond");
   assert.equal(result.commandDirective.kind, "git");
   assert.equal(result.commandDirective.action, "diff");
-  assert.equal(result.needsDecision, undefined);
+  assert.equal(result.needsDecision, true);
+  assert.equal(result.suggestedIntent, "execute");
 });
 
-test("deployment and server sync requests resolve to execute", () => {
+test("deployment and server sync requests ask for operation approval", () => {
   for (const input of [
     "将本地网站同步到服务器里",
     "直接执行部署脚本 deploy.sh",
     "run deployment script",
   ]) {
     const result = resolveTurnRunIntent(input, createContext());
-    assert.equal(result.intent, "execute", input);
+    assert.equal(result.intent, "respond", input);
     assert.equal(result.commandDirective.kind, "shell", input);
     assert.equal(result.commandDirective.requiresApproval, true, input);
-    assert.equal(result.needsDecision, undefined, input);
+    assert.equal(result.needsDecision, true, input);
+    assert.equal(result.suggestedIntent, "execute", input);
   }
 });
 
@@ -221,39 +240,40 @@ test("unity console diagnostic cue ignores explicit no-error phrasing", () => {
   assert.equal(inferCommandDirective("Unity 里没有报错，但蛇没有移动", "analyze").action, "unity_workflow");
 });
 
-test("complex multi-file generation routes to plan before execution", () => {
+test("complex multi-file generation asks for user choice before planning or execution", () => {
   const result = resolveTurnRunIntent(
     "生成一套游戏框架代码包括文件夹，实现《歧路旅人》CTB回合制战斗逻辑。",
     createContext(),
   );
-  assert.equal(result.intent, "plan");
-  assert.equal(result.needsDecision, undefined);
+  assert.equal(result.intent, "respond");
+  assert.equal(result.needsDecision, true);
+  assert.equal(result.suggestedIntent, "plan");
   assert.equal(result.riskLevel, "high");
 });
 
-test("explicit analysis requests resolve to analyze", () => {
+test("plain analysis requests stay natural unless slash locked", () => {
   const result = resolveTurnRunIntent("请仔细检查验证这段指令通信链路", createContext());
-  assert.equal(result.intent, "analyze");
+  assert.equal(result.intent, "respond");
   assert.equal(result.needsDecision, undefined);
 });
 
-test("analysis report requests still resolve to report", () => {
+test("analysis report wording stays natural unless slash locked", () => {
   const result = resolveTurnRunIntent("请整理成分析报告", createContext());
-  assert.equal(result.intent, "report");
+  assert.equal(result.intent, "respond");
 });
 
 test("mixed summarize and execute signals request an explicit intent decision", () => {
   const result = resolveTurnRunIntent("请先总结一下当前改动，然后 commit 并 push 到远程", createContext());
-  assert.equal(result.intent, "discuss");
+  assert.equal(result.intent, "respond");
   assert.equal(result.needsDecision, true);
   assert.equal(result.suggestedIntent, "execute");
-  assert.deepEqual(result.decisionOptions, ["execute", "summarize", "discuss"]);
+  assert.deepEqual(result.decisionOptions, ["execute", "respond", "summarize"]);
   assert.notEqual(result.intent, "summarize");
 });
 
-test("pure summarize request still resolves directly to summarize", () => {
+test("pure summarize wording stays natural unless slash locked", () => {
   const result = resolveTurnRunIntent("请总结一下这次排查结论", createContext());
-  assert.equal(result.intent, "summarize");
+  assert.equal(result.intent, "respond");
   assert.equal(result.needsDecision, undefined);
 });
 
@@ -282,23 +302,21 @@ test("plan and execute remain real workflow modes", () => {
   assert.equal(getIntentPolicy("execute").requiresPlanApproval, false);
 });
 
-test("weak plan keyword triggers a decision instead of forcing plan", () => {
+test("weak plan keyword stays natural instead of forcing plan", () => {
   const result = resolveTurnRunIntent("maybe we need a plan for this", createContext());
-  assert.equal(result.intent, "discuss");
-  assert.equal(result.needsDecision, true);
-  assert.equal(result.suggestedIntent, "plan");
+  assert.equal(result.intent, "respond");
+  assert.equal(result.needsDecision, undefined);
 });
 
 test("Chinese weak plan phrasing does not force plan mode", () => {
   const result = resolveTurnRunIntent("这个方案怎么样？", createContext());
-  assert.equal(result.intent, "discuss");
-  assert.equal(result.needsDecision, true);
-  assert.equal(result.suggestedIntent, "plan");
+  assert.equal(result.intent, "respond");
+  assert.equal(result.needsDecision, undefined);
 });
 
-test("ordinary analysis question defaults to discuss", () => {
+test("ordinary analysis question defaults to respond", () => {
   const result = resolveTurnRunIntent("帮我解释一下这个模块现在在做什么", createContext());
-  assert.equal(result.intent, "discuss");
+  assert.equal(result.intent, "respond");
   assert.equal(result.needsDecision, undefined);
 });
 
@@ -369,7 +387,7 @@ test("hidden MDEBUG shortcut parses without entering visible intent shortcuts", 
   assert.equal(parseMainDebugShortcut("/MDEBUGGER 反馈内容"), null);
 });
 
-test("composer suggestion keeps explicit slash intent as the default", () => {
+test("composer suggestion keeps explicit slash intent without semantic output-style override", () => {
   const suggestion = resolveComposerIntentSuggestion({
     input: "/计划 帮我总结这段内容",
     language: "zh",
@@ -382,9 +400,7 @@ test("composer suggestion keeps explicit slash intent as the default", () => {
   });
 
   assert.equal(parseMainIntentShortcut("/计划 帮我总结这段内容").intent, "plan");
-  assert.equal(suggestion.kind, "explicit_conflict");
-  assert.equal(suggestion.explicitIntent, "plan");
-  assert.equal(suggestion.intent, "summarize");
+  assert.equal(suggestion, null);
 });
 
 test("game studio suggestion never upgrades /plan to non-plan output styles", () => {
@@ -432,12 +448,12 @@ test("composer suggestion ignore and locked intent do not override explicit user
   );
 });
 
-test("ordinary low-risk discuss requests should not block on preflight", () => {
+test("ordinary low-risk respond requests should not block on preflight", () => {
   const result = resolveTurnRunIntent("帮我解释一下这个模块现在在做什么", createContext());
   assert.equal(shouldUseBlockingIntentPreflight(result, "main_mode"), false);
 });
 
-test("low-confidence non-discuss requests can still opt into blocking preflight", () => {
+test("low-confidence non-respond requests can still opt into blocking preflight", () => {
   assert.equal(
     shouldUseBlockingIntentPreflight(
       {
@@ -474,7 +490,7 @@ test("high-risk multi-step implementation suggests planning first", () => {
     "帮我从零搭建整个项目，包含前端后端、数据库 API、安装依赖和部署 pipeline",
     createContext(),
   );
-  assert.equal(result.intent, "execute");
+  assert.equal(result.intent, "respond");
   assert.equal(result.needsDecision, true);
   assert.equal(result.suggestedIntent, "plan");
   assert.equal(result.riskLevel, "high");
@@ -497,7 +513,7 @@ test("game studio workflow slash bypasses MAIN plan interception", () => {
   assert.equal(result.bypassMainRouter, true);
 });
 
-test("game studio explicit implementation text enters studio workflow", () => {
+test("game studio explicit implementation text asks before studio workflow execution", () => {
   for (const input of [
     "立即开始重构并完善",
     "继续实现 SnakeController",
@@ -510,19 +526,20 @@ test("game studio explicit implementation text enters studio workflow", () => {
         mainModeKey: "game_studio",
       }),
     );
-    assert.equal(result.intent, "studio_workflow", input);
-    assert.equal(result.bypassMainRouter, true, input);
+    assert.equal(result.intent, "respond", input);
+    assert.equal(result.needsDecision, true, input);
+    assert.equal(result.suggestedIntent, "execute", input);
   }
 });
 
-test("game studio ordinary explanatory text still defaults to discuss", () => {
+test("game studio ordinary explanatory text still defaults to respond", () => {
   const result = resolveTurnRunIntent(
     "帮我解释一下当前玩法思路",
     createContext({
       mainModeKey: "game_studio",
     }),
   );
-  assert.equal(result.intent, "discuss");
+  assert.equal(result.intent, "respond");
 });
 
 test("natural Chinese approval phrases advance an existing plan into execution", () => {
@@ -552,7 +569,7 @@ test("approval phrasing does not trigger plan approval without plan artifacts", 
   assert.notEqual(result.controlAction, "approve_plan");
 });
 
-test("ordinary direct execution without plan artifacts still resolves to execute", () => {
+test("ordinary direct execution without plan artifacts asks for operation approval", () => {
   const result = resolveTurnRunIntent(
     "现在就直接实现这个功能",
     createContext({
@@ -562,7 +579,9 @@ test("ordinary direct execution without plan artifacts still resolves to execute
     }),
   );
 
-  assert.equal(result.intent, "execute");
+  assert.equal(result.intent, "respond");
+  assert.equal(result.needsDecision, true);
+  assert.equal(result.suggestedIntent, "execute");
 });
 
 test("generic continuation phrases are recognized as previous-turn continuation", () => {

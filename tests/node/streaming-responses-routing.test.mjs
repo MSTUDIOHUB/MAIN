@@ -514,7 +514,76 @@ test("local Rust streams convert cumulative reasoning payloads into thinking del
   );
 
   assert.equal(result.content, "<thinking>ABC</thinking>done");
+  assert.equal(result.reasoningContent, "ABC");
+  assert.equal(result.reasoningField, "reasoning_content");
   assert.deepEqual(tokens, ["<thinking>", "A", "B", "C", "</thinking>", "done"]);
+});
+
+test("OpenAI-compatible chat replays assistant reasoning_content when the provider emitted it", async () => {
+  const listeners = new Map();
+  const listenMock = async (eventName, handler) => {
+    listeners.set(eventName, handler);
+    return () => listeners.delete(eventName);
+  };
+  const requests = [];
+  const { streamChatCompletion } = await loadStreamingModule(async (command, args) => {
+    assert.equal(command, "start_chat_stream");
+    const body = JSON.parse(args.body);
+    requests.push(body);
+    const streamId = args.streamId;
+    queueMicrotask(() => {
+      listeners.get("chat-stream-chunk")?.({
+        payload: {
+          stream_id: streamId,
+          chunk: `data: ${JSON.stringify({ choices: [{ delta: { content: "ok" }, finish_reason: "stop" }] })}\n\n`,
+        },
+      });
+      listeners.get("chat-stream-done")?.({
+        payload: {
+          stream_id: streamId,
+          status: "success",
+        },
+      });
+    });
+    return undefined;
+  }, listenMock);
+
+  const result = await streamChatCompletion(
+    [
+      { role: "user", content: "先读文件" },
+      {
+        role: "assistant",
+        content: "我先读取。",
+        reasoning_content: "Need to inspect the file before answering.",
+        tool_calls: [{
+          id: "call_1",
+          type: "function",
+          function: { name: "read_file", arguments: "{\"path\":\"src/App.tsx\"}" },
+        }],
+      },
+      { role: "tool", content: "ok", tool_call_id: "call_1" },
+    ],
+    {
+      baseUrl: "https://api.deepseek.com/v1",
+      apiKey: "test-key",
+      model: "deepseek-v4-pro",
+      apiProtocol: "openai",
+      apiFormat: "chat_completions",
+      provider: "OpenAI",
+      useRustProxy: true,
+    },
+    {
+      onToken: () => {},
+      onDone: () => {},
+      onError: (error) => { throw error; },
+    },
+  );
+
+  assert.equal(result.content, "ok");
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].messages[1].reasoning_content, "Need to inspect the file before answering.");
+  assert.equal(requests[0].messages[1].tool_calls[0].function.name, "read_file");
+  assert.equal(requests[0].messages[2].reasoning_content, undefined);
 });
 
 test("OpenAI Responses retries 524 failures with compact input while preserving reasoning effort", async () => {

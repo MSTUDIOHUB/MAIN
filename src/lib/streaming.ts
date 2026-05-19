@@ -73,6 +73,8 @@ interface ChatMessage {
   content: string | ContentPart[];
   tool_calls?: { id: string; type: "function"; function: { name: string; arguments: string } }[];
   tool_call_id?: string;
+  reasoning_content?: string;
+  reasoning?: string;
 }
 
 /** Flat connection params derived from AppConfig.local or AppConfig.cloud */
@@ -109,6 +111,8 @@ export interface StreamResult {
   content: string;
   toolCalls: StreamedToolCall[];
   finishReason: "stop" | "length" | "tool_calls" | null;
+  reasoningContent?: string;
+  reasoningField?: "reasoning_content" | "reasoning";
 }
 
 interface StreamCallbacks {
@@ -200,17 +204,38 @@ function extractTextLike(value: unknown): string {
 }
 
 type OpenAiCompatibleContentMode = "delta" | "cumulative" | "none";
+type OpenAiCompatibleReasoningField = "reasoning_content" | "reasoning" | "thinking" | "thought";
+
+function extractFirstTextField(
+  source: Record<string, unknown> | undefined,
+  fields: OpenAiCompatibleReasoningField[],
+): { text: string; field: OpenAiCompatibleReasoningField | null } {
+  if (!source) return { text: "", field: null };
+  for (const field of fields) {
+    const text = extractTextLike(source[field]);
+    if (text) return { text, field };
+  }
+  return { text: "", field: null };
+}
+
+function normalizeReasoningFieldForHistory(
+  field: OpenAiCompatibleReasoningField | null,
+): "reasoning_content" | "reasoning" | null {
+  if (field === "reasoning_content" || field === "reasoning") return field;
+  return null;
+}
 
 function extractOpenAiCompatibleDelta(payload: unknown): {
   content: string;
   contentMode: OpenAiCompatibleContentMode;
   reasoning: string;
   reasoningMode: OpenAiCompatibleContentMode;
+  reasoningField: "reasoning_content" | "reasoning" | null;
   finishReason: "stop" | "length" | "tool_calls" | null;
   toolCalls: unknown[];
 } {
   if (!payload || typeof payload !== "object") {
-    return { content: "", contentMode: "none", reasoning: "", reasoningMode: "none", finishReason: null, toolCalls: [] };
+    return { content: "", contentMode: "none", reasoning: "", reasoningMode: "none", reasoningField: null, finishReason: null, toolCalls: [] };
   }
 
   const root = payload as Record<string, unknown>;
@@ -226,10 +251,16 @@ function extractOpenAiCompatibleDelta(payload: unknown): {
   const messageContent = extractTextLike(message?.content ?? message?.text);
   const rootContent = extractTextLike(root.content ?? root.text ?? root.response);
   const content = deltaContent || messageContent || rootContent;
-  const deltaReasoning = extractTextLike(delta?.reasoning_content ?? delta?.reasoning ?? delta?.thinking ?? delta?.thought);
-  const messageReasoning = extractTextLike(message?.reasoning_content ?? message?.reasoning ?? message?.thinking ?? message?.thought);
-  const rootReasoning = extractTextLike(root.reasoning_content ?? root.reasoning ?? root.thinking ?? root.thought);
-  const reasoning = deltaReasoning || messageReasoning || rootReasoning;
+  const reasoningFields: OpenAiCompatibleReasoningField[] = ["reasoning_content", "reasoning", "thinking", "thought"];
+  const deltaReasoning = extractFirstTextField(delta, reasoningFields);
+  const messageReasoning = extractFirstTextField(message, reasoningFields);
+  const rootReasoning = extractFirstTextField(root, reasoningFields);
+  const reasoning = deltaReasoning.text || messageReasoning.text || rootReasoning.text;
+  const rawReasoningField = deltaReasoning.text
+    ? deltaReasoning.field
+    : messageReasoning.text
+      ? messageReasoning.field
+      : rootReasoning.field;
   const rawFinishReason = choice?.finish_reason ?? root.done_reason;
   const normalizedFinishReason = rawFinishReason === "length" || rawFinishReason === "tool_calls" || rawFinishReason === "stop"
     ? rawFinishReason
@@ -241,7 +272,8 @@ function extractOpenAiCompatibleDelta(payload: unknown): {
     content,
     contentMode: deltaContent ? "delta" : content ? "cumulative" : "none",
     reasoning,
-    reasoningMode: deltaReasoning ? "delta" : reasoning ? "cumulative" : "none",
+    reasoningMode: deltaReasoning.text ? "delta" : reasoning ? "cumulative" : "none",
+    reasoningField: normalizeReasoningFieldForHistory(rawReasoningField),
     finishReason: normalizedFinishReason,
     toolCalls: Array.isArray(source.tool_calls) ? source.tool_calls : [],
   };
@@ -290,9 +322,22 @@ function extractBase64Images(content: string | ContentPart[]): string[] {
     });
 }
 
+function messageReasoningForApi(m: ChatMessage): Record<string, string> {
+  if (m.role !== "assistant") return {};
+  const reasoningContent = typeof m.reasoning_content === "string" ? m.reasoning_content.trim() : "";
+  if (reasoningContent) return { reasoning_content: reasoningContent };
+  const reasoning = typeof m.reasoning === "string" ? m.reasoning.trim() : "";
+  return reasoning ? { reasoning } : {};
+}
+
 /** Map a ChatMessage to the provider-specific format for the API request body. */
-function mapMessageForApi(m: ChatMessage, isOllama: boolean): Record<string, unknown> {
+function mapMessageForApi(
+  m: ChatMessage,
+  isOllama: boolean,
+  options: { includeAssistantReasoning?: boolean } = {},
+): Record<string, unknown> {
   const isMultimodal = Array.isArray(m.content);
+  const assistantReasoning = options.includeAssistantReasoning ? messageReasoningForApi(m) : {};
 
   if (m.role === "tool") {
     return { role: "tool", content: extractTextContent(m.content), ...(m.tool_call_id ? { tool_call_id: m.tool_call_id } : {}) };
@@ -302,6 +347,7 @@ function mapMessageForApi(m: ChatMessage, isOllama: boolean): Record<string, unk
     return {
       role: "assistant",
       content: extractTextContent(m.content) || "",
+      ...assistantReasoning,
       tool_calls: m.tool_calls.map((tc) => ({
         id: tc.id, type: tc.type,
         function: {
@@ -326,11 +372,11 @@ function mapMessageForApi(m: ChatMessage, isOllama: boolean): Record<string, unk
   }
 
   if (isMultimodal && !hasImageContent(m.content)) {
-    return { role: m.role, content: extractTextContent(m.content) };
+    return { role: m.role, content: extractTextContent(m.content), ...assistantReasoning };
   }
 
   // OpenAI-compatible: pass content as-is (string or multimodal array)
-  return { role: m.role, content: typeof m.content === "string" ? m.content : m.content };
+  return { role: m.role, content: typeof m.content === "string" ? m.content : m.content, ...assistantReasoning };
 }
 
 function buildOllamaOptions(settings: StreamSettings, maxTokens: number): Record<string, unknown> {
@@ -494,6 +540,21 @@ function extractOpenAiChatCompletionFinishReason(payload: unknown): StreamResult
   if (raw === "length" || raw === "tool_calls" || raw === "stop") return raw;
   if (raw === "function_call") return "tool_calls";
   return "stop";
+}
+
+function extractOpenAiChatCompletionReasoning(payload: unknown): Pick<StreamResult, "reasoningContent" | "reasoningField"> {
+  if (!payload || typeof payload !== "object") return {};
+  const choices = (payload as { choices?: unknown }).choices;
+  const choice = Array.isArray(choices) ? choices[0] as { message?: unknown } | undefined : undefined;
+  const message = choice?.message && typeof choice.message === "object"
+    ? choice.message as Record<string, unknown>
+    : undefined;
+  const reasoningContent = extractTextLike(message?.reasoning_content);
+  if (reasoningContent) {
+    return { reasoningContent, reasoningField: "reasoning_content" };
+  }
+  const reasoning = extractTextLike(message?.reasoning);
+  return reasoning ? { reasoningContent: reasoning, reasoningField: "reasoning" } : {};
 }
 
 function buildGeminiRuntimeRequest(
@@ -716,6 +777,7 @@ async function requestOpenAiNonStreaming(
           messages: messages.map((message) => ({
             role: message.role === "tool" ? "user" : message.role,
             content: extractTextContent(message.content),
+            ...messageReasoningForApi(message),
           })),
           stream: false,
           ...(!minimalCompatibilityMode && tools && tools.length > 0 ? { tools: normalizeToolDefinitions(tools) } : {}),
@@ -734,6 +796,9 @@ async function requestOpenAiNonStreaming(
       : apiFormat === "chat_completions"
       ? extractOpenAiChatCompletionToolCalls(payload)
       : extractOpenAiResponsesToolCalls(payload);
+    const reasoning = !isGemini && apiFormat === "chat_completions"
+      ? extractOpenAiChatCompletionReasoning(payload)
+      : {};
     const result: StreamResult = {
       content,
       toolCalls,
@@ -742,6 +807,7 @@ async function requestOpenAiNonStreaming(
         : apiFormat === "chat_completions"
           ? extractOpenAiChatCompletionFinishReason(payload)
           : "stop",
+      ...reasoning,
     };
 
     if (content) onToken(content);
@@ -821,7 +887,7 @@ async function streamViaRustProxy(
         ? geminiRequest?.body ?? {}
       : {
           model: settings.model,
-          messages: messages.map((m) => mapMessageForApi(m, false)),
+          messages: messages.map((m) => mapMessageForApi(m, false, { includeAssistantReasoning: true })),
           stream: true,
           max_tokens: maxTokens,
           ...(settings.sendSamplingParameters === true && settings.temperature != null ? { temperature: settings.temperature } : {}),
@@ -886,6 +952,8 @@ async function streamViaRustProxy(
   let fullContent = "";
   let emittedOpenAiCompatibleText = "";
   let emittedOpenAiCompatibleReasoning = "";
+  let providerReasoningContent = "";
+  let providerReasoningField: StreamResult["reasoningField"] | null = null;
   let finishReason: "stop" | "length" | "tool_calls" | null = null;
   const toolCallsMap = new Map<number, StreamedToolCall>();
 
@@ -967,6 +1035,8 @@ async function streamViaRustProxy(
           emittedOpenAiCompatibleReasoning = resolvedReasoning.emittedText;
           const reasoningDelta = resolvedReasoning.delta;
           if (reasoningDelta && !reasoningGarbled) {
+            providerReasoningContent += reasoningDelta;
+            providerReasoningField = providerReasoningField ?? extracted.reasoningField;
             if (reasoningEmitted) {
               // Already verified as legitimate — emit directly into the
               // hidden reasoning block. Keep the final StreamResult tagged so
@@ -1193,6 +1263,12 @@ async function streamViaRustProxy(
               content: fullContent,
               toolCalls: finalizeStreamedToolCalls(toolCallsMap),
               finishReason,
+              ...(providerReasoningContent.trim()
+                ? {
+                    reasoningContent: providerReasoningContent,
+                    ...(providerReasoningField ? { reasoningField: providerReasoningField } : {}),
+                  }
+                : {}),
             };
         onDone(result);
         resolveResult?.(result);
@@ -1307,7 +1383,7 @@ export async function streamChatCompletion(
         ? geminiRequest?.body ?? {}
       : {
           model: settings.model,
-          messages: messages.map((m) => mapMessageForApi(m, false)),
+          messages: messages.map((m) => mapMessageForApi(m, false, { includeAssistantReasoning: true })),
           stream: true,
           max_tokens: maxTokens,
           ...(settings.sendSamplingParameters === true && settings.temperature != null ? { temperature: settings.temperature } : {}),
@@ -1392,6 +1468,8 @@ export async function streamChatCompletion(
   let fullContent = "";
   let emittedOpenAiCompatibleText = "";
   let emittedOpenAiCompatibleReasoning = "";
+  let providerReasoningContent = "";
+  let providerReasoningField: StreamResult["reasoningField"] | null = null;
 
   // Track finish_reason from the stream
   let finishReason: "stop" | "length" | "tool_calls" | null = null;
@@ -1484,6 +1562,8 @@ export async function streamChatCompletion(
             emittedOpenAiCompatibleReasoning = resolvedReasoning.emittedText;
             const reasoningDelta = resolvedReasoning.delta;
             if (reasoningDelta && !reasoningGarbled) {
+              providerReasoningContent += reasoningDelta;
+              providerReasoningField = providerReasoningField ?? extracted.reasoningField;
               if (reasoningEmitted) {
                 openReasoningBlock();
                 fullContent += reasoningDelta;
@@ -1584,6 +1664,12 @@ export async function streamChatCompletion(
         try {
           const json = JSON.parse(d);
           const extracted = extractOpenAiCompatibleDelta(json);
+          const resolvedReasoning = resolveOpenAiCompatibleReasoningDelta(extracted, emittedOpenAiCompatibleReasoning);
+          emittedOpenAiCompatibleReasoning = resolvedReasoning.emittedText;
+          if (resolvedReasoning.delta) {
+            providerReasoningContent += resolvedReasoning.delta;
+            providerReasoningField = providerReasoningField ?? extracted.reasoningField;
+          }
           const resolvedText = resolveOpenAiCompatibleTextDelta(extracted, emittedOpenAiCompatibleText);
           emittedOpenAiCompatibleText = resolvedText.emittedText;
           const contentDelta = resolvedText.delta;
@@ -1619,6 +1705,12 @@ export async function streamChatCompletion(
         content: fullContent,
         toolCalls: finalizeStreamedToolCalls(toolCallsMap),
         finishReason,
+        ...(providerReasoningContent.trim()
+          ? {
+              reasoningContent: providerReasoningContent,
+              ...(providerReasoningField ? { reasoningField: providerReasoningField } : {}),
+            }
+          : {}),
       };
 
   if (result.finishReason === "length") {

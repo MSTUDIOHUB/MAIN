@@ -30,6 +30,7 @@ const SESSION_AUTO_CREATE_SCENARIO = "session-auto-create";
 const CLOUD_TOOL_FALLBACK_SCENARIO = "cloud-tool-fallback";
 const REPLY_OPTIONS_TOOL_PAUSE_SCENARIO = "reply-options-tool-pause";
 const PLAN_APPROVAL_EXECUTE_TOOLS_SCENARIO = "plan-approval-execute-tools";
+const OPERATION_APPROVAL_NATURAL_FLOW_SCENARIO = "operation-approval-natural-flow";
 const EXECUTE_QUICK_REPLY_RUNTIME_SCENARIO = "execute-quick-reply-runtime";
 const GAME_STUDIO_EXECUTE_REPLY_SCENARIO = "game-studio-execute-reply-runtime";
 const UNITY_MCP_OPTIONS_PRIORITY_SCENARIO = "unity-mcp-options-priority";
@@ -489,8 +490,8 @@ function seedPlanQuickReplyApprovalScenario() {
             value: "批准执行：先运行诊断脚本，再根据结果修复字体加载",
           },
           {
-            label: "继续讨论，不进入执行",
-            value: "继续讨论，不进入执行",
+            label: "继续调整方案，不进入执行",
+            value: "继续调整方案，不进入执行",
           },
         ],
         streaming: false,
@@ -4326,12 +4327,16 @@ function seedCloudToolProtocolScenario(scenario: string) {
       );
     }
 
+    if (scenario === OPERATION_APPROVAL_NATURAL_FLOW_SCENARIO) {
+      return useAppStore.getState().sendMessage(text || "请修复这个问题。");
+    }
+
     if (scenario === UNITY_MCP_OPTIONS_PRIORITY_SCENARIO) {
       return useAppStore.getState().sendMessage(
         text || "请在 Unity 场景下先给我可点击选项。",
         undefined,
         {
-          resolvedIntent: "discuss",
+          resolvedIntent: "respond",
           skipIntentResolution: true,
           commandDirective: {
             kind: "unity",
@@ -4347,7 +4352,7 @@ function seedCloudToolProtocolScenario(scenario: string) {
         text || "请在 Unity 项目里先读取 src 目录定位脚本入口。",
         undefined,
         {
-          resolvedIntent: "discuss",
+          resolvedIntent: "respond",
           skipIntentResolution: true,
           commandDirective: {
             kind: "unity",
@@ -4363,7 +4368,7 @@ function seedCloudToolProtocolScenario(scenario: string) {
         text || "Unity 没有报错，但蛇没有自动移动，请先排查行为问题。",
         undefined,
         {
-          resolvedIntent: "discuss",
+          resolvedIntent: "respond",
           skipIntentResolution: true,
           commandDirective: {
             kind: "unity",
@@ -4378,7 +4383,7 @@ function seedCloudToolProtocolScenario(scenario: string) {
       text || "请读取 README.md 并告诉我是否包含 fallback-ok。",
       undefined,
       {
-        resolvedIntent: "discuss",
+        resolvedIntent: "respond",
         skipIntentResolution: true,
       },
     );
@@ -4404,6 +4409,14 @@ function seedCloudToolProtocolScenario(scenario: string) {
       planTasks: state.planTasks,
       currentTurnStatus: currentTurn?.status ?? null,
       currentTurnIntent: currentTurn?.intent ?? null,
+      pendingRunDecision: state.pendingRunDecision
+        ? {
+            kind: state.pendingRunDecision.kind,
+            suggestedIntent: state.pendingRunDecision.suggestedIntent,
+            optionIds: (state.pendingRunDecision.options || []).map((option) => option.id),
+            optionLabels: (state.pendingRunDecision.options || []).map((option) => option.label),
+          }
+        : null,
       conversationTurns: state.conversationTurns.length,
       taskFlowBlocks: state.taskFlow.length,
       taskFlowUserCount: state.taskFlow.filter((block) => block.type === "user").length,
@@ -4642,7 +4655,7 @@ function seedSessionAutoCreateScenario() {
 
   bridge.sendFirstMessage = () => {
     return useAppStore.getState().sendMessage("/agent writer", undefined, {
-      resolvedIntent: "discuss",
+      resolvedIntent: "respond",
       skipIntentResolution: true,
     });
   };
@@ -4978,7 +4991,7 @@ function seedUserContextPillsScenario() {
         id: turnId,
         userPrompt: "请结合 @ 文件、附件和截图检查逻辑。",
         title: "E2E User Context Pills",
-        intent: "discuss",
+        intent: "respond",
         mode: "chat",
         status: "done",
         summary: "已接收上下文。",
@@ -5238,6 +5251,10 @@ export function initializeE2EScenarios(): (() => void) | undefined {
 
   if (scenario === EXECUTE_QUICK_REPLY_RUNTIME_SCENARIO) {
     return seedCloudToolProtocolScenario(EXECUTE_QUICK_REPLY_RUNTIME_SCENARIO);
+  }
+
+  if (scenario === OPERATION_APPROVAL_NATURAL_FLOW_SCENARIO) {
+    return seedCloudToolProtocolScenario(OPERATION_APPROVAL_NATURAL_FLOW_SCENARIO);
   }
 
   if (scenario === GAME_STUDIO_EXECUTE_REPLY_SCENARIO) {

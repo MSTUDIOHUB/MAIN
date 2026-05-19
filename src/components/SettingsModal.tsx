@@ -1209,7 +1209,7 @@ function FeishuGuideModal({ t, language, onClose }: { t: any; language: "zh" | "
   const commands = isEn
     ? [
         "Plain text: run read-only analysis in the current MAIN workspace by default.",
-        "Describe tasks naturally; MAIN will infer discuss, plan, or execute intent. Use /plan only when you explicitly want a review-first plan flow.",
+        "Describe tasks naturally; MAIN will answer or ask for operation approval when real tools are needed. Use /plan only when you explicitly want a review-first plan flow.",
         "/status: show adapter, MAIN and workspace status.",
         "/stop: stop current generation and clear queued remote messages.",
         "Remote approvals appear as interactive cards. Use the card buttons to allow or reject tool actions.",
@@ -1218,7 +1218,7 @@ function FeishuGuideModal({ t, language, onClose }: { t: any; language: "zh" | "
       ]
     : [
         "普通文本：默认在 MAIN 当前工作区执行只读分析。",
-        "直接用自然语言描述任务，MAIN 会按语义判断是讨论、计划还是执行；只有你想明确走“先审阅方案”时再用 /计划。",
+        "直接用自然语言描述任务；MAIN 会自然回复，真正需要操作时会先请求批准。只有你想明确走“先审阅方案”时再用 /计划。",
         "/status：查看飞书适配器、MAIN 和工作区状态。",
         "/stop：停止当前生成，并清空远程队列。",
         "远程审批会以交互式卡片出现，请直接点击卡片按钮允许或拒绝工具执行。",

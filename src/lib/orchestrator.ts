@@ -581,6 +581,29 @@ export interface AgentMessage {
   content: string | ContentPart[];
   tool_calls?: ToolCallInMessage[];
   tool_call_id?: string;
+  reasoning_content?: string;
+  reasoning?: string;
+}
+
+function buildAssistantHistoryMessage(
+  content: string,
+  providerReasoning?: Pick<StreamResult, "reasoningContent" | "reasoningField"> | null,
+  extra: Partial<Pick<AgentMessage, "tool_calls">> = {},
+): AgentMessage {
+  const reasoningContent = typeof providerReasoning?.reasoningContent === "string"
+    ? providerReasoning.reasoningContent.trim()
+    : "";
+  const reasoningField = providerReasoning?.reasoningField === "reasoning" ? "reasoning" : "reasoning_content";
+  return {
+    role: "assistant",
+    content,
+    ...(reasoningContent
+      ? reasoningField === "reasoning"
+        ? { reasoning: reasoningContent }
+        : { reasoning_content: reasoningContent }
+      : {}),
+    ...extra,
+  };
 }
 
 function truncateForLog(value: string, maxLength = 96): string {
@@ -1415,6 +1438,33 @@ function looksLikePlanCompletionClaim(text: string): boolean {
     /(?:全部|所有|全[部都]?|已|已经).{0,24}(?:完成|满足|通过)|(?:任务|证据).{0,16}(?:全部|全都).{0,16}(?:完成|满足|通过)|\b\d+\s*\/\s*\d+\b.{0,24}(?:完成|complete|completed|done|satisfied|passed)/i.test(normalized) ||
     /(?:all|every).{0,40}(?:task|evidence|item).{0,40}(?:complete|completed|done|satisfied|passed)|(?:complete|completed|done|satisfied).{0,40}(?:all|every).{0,40}(?:task|evidence|item)/i.test(normalized)
   );
+}
+
+function looksLikeOperationCompletionClaim(text: string): boolean {
+  const normalized = String(text || "").replace(/\s+/g, " ").trim();
+  if (!normalized) return false;
+  const hasCompletionClaim =
+    /(?:已|已经|现已|刚刚|成功).{0,24}(?:修复|修改|实现|更新|写入|生成|执行|完成|验证|通过)|(?:修复|修改|实现|更新|写入|生成|执行|验证).{0,16}(?:完成|好了|成功|通过)|(?:done|fixed|implemented|patched|updated|completed|wrote|created|generated|ran|verified|passed)\b/i.test(normalized);
+  if (!hasCompletionClaim) return false;
+  const looksLikeProposalOnly =
+    /(?:方案|建议|计划|将会|可以|应该|准备|下一步|如果|待|需要用户|是否|proposal|plan|suggest|would|will|should|can|could|next step|ready to|once)/i.test(normalized) &&
+    !/(?:已|已经|成功|done|fixed|implemented|patched|updated|completed|verified|passed)\b/i.test(normalized);
+  return !looksLikeProposalOnly;
+}
+
+function buildExecuteCompletionEvidencePrompt(language: "zh" | "en", retryCount: number): string {
+  if (language === "en") {
+    return [
+      "The previous reply claimed the operation was complete, but MAIN has no real tool evidence for this execution turn.",
+      "Do not repeat the completion claim. Start real tool actions now: inspect the relevant files, write or patch files if needed, run the necessary command/verification, then summarize only after tool results exist.",
+      retryCount > 1 ? "This is a repeated failure. If you cannot perform the operation, stop and state the exact blocker instead of claiming success." : "",
+    ].filter(Boolean).join("\n");
+  }
+  return [
+    "上一条回复声称操作已完成，但 MAIN 没有看到本轮执行的真实工具证据。",
+    "不要重复完成声明。现在必须开始真实工具操作：读取相关文件，必要时写入或打补丁，运行必要命令/验证，然后只能基于工具结果总结。",
+    retryCount > 1 ? "这已经是重复失败。如果无法执行，请明确说明具体阻塞，不要声称成功。" : "",
+  ].filter(Boolean).join("\n");
 }
 
 function formatPlanAuditRemainingTasks(
@@ -4310,10 +4360,12 @@ export async function executeAgentLoop(
   let usedPlanClosureGuard = false;
   let usedPlanDesignClosurePrompt = false;
   let usedPlanReadOnlyConvergencePrompt = false;
+  let usedExecuteCompletionEvidencePrompt = false;
   let planReadOnlyConvergenceBatches = 0;
   let planReadOnlyConvergenceTools = 0;
   const attemptedPlanWriteTargets: string[] = [];
   let recentSuccessfulProjectWrite: { name: string; target: string } | null = null;
+  let sawExecuteOperationEvidence = false;
   let recoveringFromEmptyAssistantReplyAfterWrite = false;
   let lastAssistantTextForCheckpoint = "";
   const recentPlanToolActivity: PlanToolActivitySummary[] = [];
@@ -5229,10 +5281,18 @@ export async function executeAgentLoop(
     }
 
     const streamText = streamResult.content;
+    const providerReasoningForHistory =
+      typeof streamResult.reasoningContent === "string" && streamResult.reasoningContent.trim()
+        ? {
+            reasoningContent: streamResult.reasoningContent,
+            reasoningField: streamResult.reasoningField,
+          }
+        : null;
     logAgentEvent("stream_done", {
       iteration,
       finishReason: streamResult.finishReason || "unknown",
       contentChars: streamText.length,
+      providerReasoningChars: providerReasoningForHistory?.reasoningContent.length ?? 0,
       toolCalls: streamResult.toolCalls.length,
       elapsedMs: Date.now() - iterationRequestStartedAt,
       emptyResult: streamText.length === 0 && streamResult.toolCalls.length === 0,
@@ -5776,7 +5836,7 @@ export async function executeAgentLoop(
       }
 
       if (historyAssistantText.trim()) {
-        callbacks.appendMessage({ role: "assistant", content: historyAssistantText });
+        callbacks.appendMessage(buildAssistantHistoryMessage(historyAssistantText, providerReasoningForHistory));
       }
       callbacks.onStatusChange("running");
       callbacks.appendMessage({
@@ -5860,7 +5920,7 @@ export async function executeAgentLoop(
           planStage: currentPlanStageForReview,
         });
       }
-      callbacks.appendMessage({ role: "assistant", content: assistantHistoryText });
+      callbacks.appendMessage(buildAssistantHistoryMessage(assistantHistoryText, providerReasoningForHistory));
       callbacks.onStatusChange("idle");
       return;
     }
@@ -5971,13 +6031,58 @@ export async function executeAgentLoop(
     }
 
     if (effectiveToolCalls.length === 0) {
+        const isExecuteRuntimeWithoutEvidence =
+          workflowMode === "edit" ||
+          turnIntent === "execute" ||
+          runtimeIntent === "execute" ||
+          runtimeIntent === "studio_workflow";
+        const rejectedExecuteCompletionClaim =
+          isExecuteRuntimeWithoutEvidence &&
+          finalReplyOptions.length === 0 &&
+          !sawExecuteOperationEvidence &&
+          looksLikeOperationCompletionClaim(visibleAssistantText || userVisibleText);
+        if (rejectedExecuteCompletionClaim) {
+          callbacks.onStreamToken("__ESCALATION_RESET__:", assistantMsgId);
+          callbacks.onStatusChange("running");
+          consecutiveNoToolCount++;
+          logAgentEvent("execute_completion_claim_without_evidence", {
+            iteration,
+            consecutiveNoToolCount,
+            workflowMode,
+            turnIntent,
+            runtimeIntent,
+            visibleChars: (visibleAssistantText || userVisibleText).length,
+          });
+
+          if (usedExecuteCompletionEvidencePrompt || consecutiveNoToolCount >= MAX_NO_ACTION_RETRIES) {
+            logAgentEvent("loop_stop", {
+              reason: "execute_completion_claim_without_evidence",
+              iteration,
+              consecutiveNoToolCount,
+            });
+            callbacks.onNonActionableStop(
+              buildNonActionableStopMessage(callbacks.getPreferredLanguage(), "plain_text_execution"),
+              "no_action",
+            );
+            callbacks.onStatusChange("idle");
+            return;
+          }
+
+          usedExecuteCompletionEvidencePrompt = true;
+          callbacks.appendMessage({
+            role: "user",
+            content: buildExecuteCompletionEvidencePrompt(callbacks.getPreferredLanguage(), consecutiveNoToolCount),
+          });
+          continue;
+        }
+
         // ── Plan Mode Interception ────────────────────────────────
         // In Plan mode, only enter review when the model has either:
         // 1. submitted a valid top-level proposal payload, or
         // 2. finished writing spec artifacts up to a legacy ready_to_execute stage.
         // Ordinary summaries / progress notes stay in ChatArea only.
         if (workflowMode === "plan" && !callbacks.getIsPlanApproved() && (hasStructuredProposal || hasReviewablePlanArtifacts)) {
-          callbacks.appendMessage({ role: "assistant", content: assistantHistoryText });
+          callbacks.appendMessage(buildAssistantHistoryMessage(assistantHistoryText, providerReasoningForHistory));
           const approved = await waitForPlanApprovalIfNeeded();
           if (!approved) {
             // Aborted during plan review — preserve pending_review status
@@ -6044,7 +6149,7 @@ export async function executeAgentLoop(
           });
 
           if (materializedPlan.ok) {
-            callbacks.appendMessage({ role: "assistant", content: assistantHistoryText });
+            callbacks.appendMessage(buildAssistantHistoryMessage(assistantHistoryText, providerReasoningForHistory));
             logAgentEvent("plan_text_materialized", {
               iteration,
               path: materializedPlan.path,
@@ -6082,7 +6187,7 @@ export async function executeAgentLoop(
         }
 
         if (shouldMaterializeFallbackPlan) {
-          callbacks.appendMessage({ role: "assistant", content: assistantHistoryText });
+          callbacks.appendMessage(buildAssistantHistoryMessage(assistantHistoryText, providerReasoningForHistory));
 
           if (usedPlanRecoveryPrompt) {
             const closureResult = await tryClosePlanWithEvidence("plan_recovery_prompt_limit", {
@@ -6142,7 +6247,7 @@ export async function executeAgentLoop(
               iteration,
               consecutiveNoToolCount,
             });
-            callbacks.appendMessage({ role: "assistant", content: assistantHistoryText });
+            callbacks.appendMessage(buildAssistantHistoryMessage(assistantHistoryText, providerReasoningForHistory));
             callbacks.onNonActionableStop(
               buildNonActionableStopMessage(callbacks.getPreferredLanguage(), "incomplete_plan"),
               "incomplete_plan",
@@ -6475,7 +6580,7 @@ export async function executeAgentLoop(
             replyOptions: normalized.replyOptions.length,
             planStage: currentPlanStage,
           });
-          callbacks.appendMessage({ role: "assistant", content: assistantHistoryText });
+          callbacks.appendMessage(buildAssistantHistoryMessage(assistantHistoryText, providerReasoningForHistory));
           emitTurnEvent({
             type: "item.completed",
             threadId: eventThreadId,
@@ -6504,7 +6609,7 @@ export async function executeAgentLoop(
           visibleChars: normalized.visibleText.length,
           replyOptions: normalized.replyOptions.length,
         });
-        callbacks.appendMessage({ role: "assistant", content: assistantHistoryText });
+        callbacks.appendMessage(buildAssistantHistoryMessage(assistantHistoryText, providerReasoningForHistory));
         emitTurnEvent({
           type: "item.completed",
           threadId: eventThreadId,
@@ -6550,11 +6655,11 @@ export async function executeAgentLoop(
       },
     }));
 
-    callbacks.appendMessage({
-      role: "assistant",
-      content: historyAssistantText,
-      tool_calls: toolCallsForMsg,
-    });
+    callbacks.appendMessage(buildAssistantHistoryMessage(
+      historyAssistantText,
+      providerReasoningForHistory,
+      { tool_calls: toolCallsForMsg },
+    ));
 
     // Partition tool calls into auto-executable, local file read approvals,
     // spec file writes (auto-approved in Plan Mode), and review-gated tools.
@@ -7020,6 +7125,9 @@ export async function executeAgentLoop(
 
     for (const result of allResults) {
       if (result.isError) continue;
+      if (!PLAN_EXPLORATION_READ_ONLY_TOOLS.has(result.name)) {
+        sawExecuteOperationEvidence = true;
+      }
       const resultArgs = toolArgsByCallId.get(result.toolCallId) ?? {};
       const targetingEvidenceKey = getTaskTargetingEvidenceKey(result.name, resultArgs, result.target);
       if (targetingEvidenceKey) {
@@ -7043,10 +7151,12 @@ export async function executeAgentLoop(
           name: result.name,
           target: result.target,
         };
+        sawExecuteOperationEvidence = true;
         recoveringFromEmptyAssistantReplyAfterWrite = false;
         continue;
       }
       if (EXECUTION_VERIFICATION_TOOL_NAMES.has(result.name)) {
+        sawExecuteOperationEvidence = true;
         recentSuccessfulProjectWrite = null;
         recoveringFromEmptyAssistantReplyAfterWrite = false;
       }

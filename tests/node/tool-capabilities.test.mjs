@@ -133,6 +133,10 @@ test("intent filtering exposes read-only tools for chat and write/shell tools fo
   });
 
   assert.deepEqual(
+    filterToolDefinitionsForIntent(tools, "respond", registry).map((item) => item.function.name),
+    ["read_file", "web_search"],
+  );
+  assert.deepEqual(
     filterToolDefinitionsForIntent(tools, "discuss", registry).map((item) => item.function.name),
     ["read_file", "web_search"],
   );

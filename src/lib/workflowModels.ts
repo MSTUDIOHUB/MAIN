@@ -325,8 +325,18 @@ export interface ChangeEntry {
 export interface ReplyOption {
   label: string;
   value: string;
-  action?: "continue_readonly_once" | "allow_readonly_session" | "execute_once" | "adjust_plan";
-  source?: "explicit_user_options" | "inferred_binary" | "inferred_enumerated" | "readonly_permission";
+  action?: "continue_readonly_once" | "allow_readonly_session" | "execute_once" | "approve_operation_once" | "adjust_plan" | "cancel_operation";
+  source?: "explicit_user_options" | "inferred_binary" | "inferred_enumerated" | "readonly_permission" | "proposal_follow_up" | "operation_approval";
+}
+
+export interface PendingOperationProposal {
+  sourceTurnId: string;
+  proposalSummary: string;
+  operationTypes: Array<"file_write" | "command" | "git" | "external_write" | "deploy" | "deliverable" | "unknown">;
+  approvalStatus: "pending" | "approved" | "adjusting" | "cancelled";
+  evidenceStatus: "none" | "tool_called" | "changed" | "verified" | "blocked";
+  createdAt: number;
+  approvedAt?: number;
 }
 
 export type ConversationTurnStatus =
@@ -348,6 +358,7 @@ export interface ConversationTurn {
   title: string;
   intentSummary?: string;
   commandDirective?: CommandDirective | null;
+  pendingOperationProposal?: PendingOperationProposal;
   uiVisibility?: "visible" | "internal";
   parentPlanTurnId?: string;
   mode: LegacyWorkflowMode;
@@ -391,7 +402,7 @@ const TITLE_META_PREFIX_RE =
   /^(?:@\S+\s+)?(?:[A-Za-z][\w.-]{0,31}\s*@?\s*[:：-]\s*)?(?:(?:\d{2,4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2})\s+)?\d{1,2}:\d{2}(?::\d{2})?\s*/;
 const TITLE_INTENT_PREFIX_RE = /^(?:当前查看|viewing)\s*/i;
 const TITLE_MODE_PREFIX_RE =
-  /^(?:讨论|discuss|计划|plan|直接执行|execute|总结|summarize|报告|report|Game Studio 工作流|Game Studio Workflow)\s*[:：-]\s*/i;
+  /^(?:回复|respond|讨论|discuss|计划|plan|直接执行|execute|总结|summarize|报告|report|Game Studio 工作流|Game Studio Workflow)\s*[:：-]\s*/i;
 const TITLE_REASONING_LEAK_RE =
   /(?:thinking process|here'?s a thinking|chain of thought|reasoning process|analy(?:s|z)e user input|step\s*1\b|let'?s think|思考过程|分析用户输入|先分析|先思考)/i;
 const GENERIC_TURN_TITLE_RE = /^(?:新的任务|新任务|new task|turn decision|本轮决策|new conversation|新会话|new chat|新聊天)$/i;

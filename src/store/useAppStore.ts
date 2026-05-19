@@ -52,6 +52,7 @@ import {
   type ConversationTurn,
   type ConversationTurnStatus,
   type NormalizedStreamState,
+  type PendingOperationProposal,
   type PlanArtifact,
   type PlanExecutionEvidenceEntry,
   type PlanExecutionProgressSnapshot,
@@ -2451,7 +2452,8 @@ async function getWorkspaceTree(workspace: string): Promise<string> {
 }
 
 const RUN_INTENT_LABELS: Record<ResolvedRunIntent, { zh: string; en: string }> = {
-  discuss: { zh: "讨论", en: "Discuss" },
+  respond: { zh: "回复", en: "Respond" },
+  discuss: { zh: "回复", en: "Respond" },
   plan: { zh: "计划", en: "Plan" },
   execute: { zh: "直接执行", en: "Execute" },
   analyze: { zh: "分析", en: "Analyze" },
@@ -2461,6 +2463,7 @@ const RUN_INTENT_LABELS: Record<ResolvedRunIntent, { zh: string; en: string }> =
 };
 
 const RESOLVED_USER_INTENT_KEYS = new Set<ResolvedUserIntent>([
+  "respond",
   "discuss",
   "plan",
   "execute",
@@ -2703,7 +2706,8 @@ function turnHasToolBlocks(turnId: string, taskFlow: TaskBlock[]): boolean {
 function isContinuationEchoTurn(turn: ConversationTurn | null, taskFlow: TaskBlock[]): boolean {
   if (!turn) return false;
   if (turn.status !== "done") return false;
-  if (resolveConversationTurnIntent(turn) !== "discuss") return false;
+  const intent = resolveConversationTurnIntent(turn);
+  if (intent !== "respond" && intent !== "discuss") return false;
   if (!looksLikePreviousTurnContinuationInput(turn.userPrompt || "")) return false;
   return !turnHasToolBlocks(turn.id, taskFlow);
 }
@@ -2724,7 +2728,7 @@ function findPreviousTurnContinuationTarget(
 
   if (currentTurn && canResume(currentTurn)) return currentTurn;
 
-  // If a previous generic "continue" was misrouted into a completed discuss turn,
+  // If a previous generic "continue" was misrouted into a completed natural reply turn,
   // allow the next continuation to recover the latest genuinely unfinished turn.
   if (!isContinuationEchoTurn(currentTurn, taskFlow)) return null;
 
@@ -2754,6 +2758,101 @@ function getLastVisibleTurnAgentSummary(turnId: string, taskFlow: TaskBlock[]): 
     if (summary) return summary;
   }
   return "";
+}
+
+function hasOperationApprovalReplyOption(replyOptions: ReplyOption[]): boolean {
+  return replyOptions.some((option) =>
+    option.action === "approve_operation_once" ||
+    option.action === "execute_once" ||
+    option.source === "proposal_follow_up" ||
+    option.source === "operation_approval"
+  );
+}
+
+function inferPendingOperationTypes(
+  text: string,
+  directive?: CommandDirective | null,
+): PendingOperationProposal["operationTypes"] {
+  const normalized = String(text || "");
+  const types = new Set<PendingOperationProposal["operationTypes"][number]>();
+  if (directive?.kind === "file_modify") types.add("file_write");
+  if (directive?.kind === "shell" || /(?:执行命令|运行命令|运行测试|run command|execute command|run tests?)/i.test(normalized)) types.add("command");
+  if (directive?.kind === "git" || /\bgit\b|提交|推送|commit|push/i.test(normalized)) types.add("git");
+  if (directive?.kind === "studio" || directive?.kind === "unity" || /(?:外部写入|浏览器|Unity|MCP|external write|browser control)/i.test(normalized)) types.add("external_write");
+  if (/部署|发布|上线|deploy|publish|ship/i.test(normalized)) types.add("deploy");
+  if (/生成(?:文件|交付物|报告|文档)|写入|创建|generate (?:file|deliverable|report|document)|create (?:file|deliverable|report|document)/i.test(normalized)) types.add("deliverable");
+  if (/修改|改动|更改|修复|实现|重构|write|modify|edit|fix|implement|refactor|patch/i.test(normalized)) types.add("file_write");
+  return types.size > 0 ? [...types] : ["unknown"];
+}
+
+function buildPendingOperationProposal(params: {
+  sourceTurnId: string;
+  text: string;
+  replyOptions: ReplyOption[];
+  commandDirective?: CommandDirective | null;
+}): PendingOperationProposal | null {
+  if (!hasOperationApprovalReplyOption(params.replyOptions)) return null;
+  const summary = summarizeAssistantText(params.text, 180);
+  return {
+    sourceTurnId: params.sourceTurnId,
+    proposalSummary: summary,
+    operationTypes: inferPendingOperationTypes(params.text, params.commandDirective),
+    approvalStatus: "pending",
+    evidenceStatus: "none",
+    createdAt: Date.now(),
+  };
+}
+
+function applyOperationProposalChoice(
+  proposal: PendingOperationProposal | undefined,
+  action?: ReplyOption["action"],
+): PendingOperationProposal | undefined {
+  if (!proposal) return proposal;
+  if (action === "approve_operation_once" || action === "execute_once") {
+    return {
+      ...proposal,
+      approvalStatus: "approved",
+      approvedAt: Date.now(),
+    };
+  }
+  if (action === "adjust_plan") {
+    return {
+      ...proposal,
+      approvalStatus: "adjusting",
+    };
+  }
+  if (action === "cancel_operation") {
+    return {
+      ...proposal,
+      approvalStatus: "cancelled",
+    };
+  }
+  return proposal;
+}
+
+function buildOperationApprovalContinuationPrompt(params: {
+  language: "zh" | "en";
+  proposal?: PendingOperationProposal;
+  latestAssistantSummary?: string;
+  userChoice: string;
+}): string {
+  const summary = params.proposal?.proposalSummary || params.latestAssistantSummary || "";
+  if (params.language === "en") {
+    return [
+      "The user approved real operations for this turn.",
+      summary ? `Reuse the previous proposal summary exactly as execution context: ${summary}` : "Reuse the immediately preceding proposal in this turn as execution context.",
+      "Do not re-plan from scratch. Start the smallest necessary real tool actions now, then verify with actual tool results.",
+      "Do not claim the work is fixed or complete unless there is tool evidence, a file diff/write result, a command result, or an explicit blocker.",
+      `User approval message: ${params.userChoice}`,
+    ].join("\n");
+  }
+  return [
+    "用户已批准本轮真实操作。",
+    summary ? `请严格复用上一轮方案摘要作为执行上下文：${summary}` : "请复用本回合紧邻上一条方案作为执行上下文。",
+    "不要重新从零规划。现在开始调用最小必要的真实工具操作，然后用实际工具结果验证。",
+    "没有工具证据、文件 diff/写入结果、命令结果或明确阻塞时，不得声称已修复或已完成。",
+    `用户批准消息：${params.userChoice}`,
+  ].join("\n");
 }
 
 function buildTurnCompactionAssistantMessage(params: {
@@ -3172,6 +3271,12 @@ export function sanitizeAgentMessagesForPersist(messages: AgentMessage[]): Agent
       content,
       ...(message.tool_calls ? { tool_calls: message.tool_calls } : {}),
       ...(message.tool_call_id ? { tool_call_id: message.tool_call_id } : {}),
+      ...(typeof message.reasoning_content === "string" && message.reasoning_content.trim()
+        ? { reasoning_content: message.reasoning_content }
+        : {}),
+      ...(typeof message.reasoning === "string" && message.reasoning.trim()
+        ? { reasoning: message.reasoning }
+        : {}),
     };
   });
 }
@@ -4109,10 +4214,20 @@ export const useAppStore = create<AppState>()(
       systemLanguage: state.config.language === "en" ? "en" : "zh",
       fallbackLanguage: state.config.language === "en" ? "en" : "zh",
     });
+    const approvedExecutionIntent =
+      intentChoice === "execute" || intentChoice === "studio_workflow"
+        ? intentChoice
+        : null;
     set({ pendingRunDecision: null });
     runAfterNextPaint(() => {
       get().sendMessage(pending.originalInput, originalImages, {
         resolvedIntent: intentChoice,
+        ...(approvedExecutionIntent
+          ? {
+              runtimeIntentOverride: approvedExecutionIntent,
+              executionConsentGranted: true,
+            }
+          : {}),
         skipIntentResolution: true,
         intentSummary: buildRunIntentSummary({
           input: pending.originalInput,
@@ -5634,7 +5749,9 @@ export const useAppStore = create<AppState>()(
           ) || null
       : null;
     const shouldExecuteOnceFromReplyOption =
-      selectedAwaitingReplyOption?.action === "execute_once";
+      selectedAwaitingReplyOption?.action === "execute_once" ||
+      selectedAwaitingReplyOption?.action === "approve_operation_once";
+    const operationProposalChoiceAction = selectedAwaitingReplyOption?.action;
     const preservePlanState =
       options?.preservePlanState === true ||
       shouldContinuePlanIntent ||
@@ -5875,14 +5992,14 @@ export const useAppStore = create<AppState>()(
       source: "reuse_resolution" | "resolution",
       reason: string,
     ) => {
-      effectiveRunIntent = "discuss";
+      effectiveRunIntent = "respond";
       effectiveIntentSummary = buildRunIntentSummary({
         input: text,
-        intent: "discuss",
+        intent: "respond",
         language: preferredLanguage,
         reason,
       });
-      effectiveCommandDirective = inferCommandDirective(text, "discuss", {
+      effectiveCommandDirective = inferCommandDirective(text, "respond", {
         source: source === "reuse_resolution" ? "continuation" : "natural_language",
       });
       logStoreEvent("intent_decision_suppressed_for_same_input", {
@@ -6015,13 +6132,13 @@ export const useAppStore = create<AppState>()(
           applyDecisionSuppressedFallback(
             "reuse_resolution",
             preferredLanguage === "en"
-              ? "You ignored the same intent decision for this draft, so this turn continues in discuss mode without showing the popup again."
-              : "你刚刚忽略了同一草稿的意图确认，本轮先按讨论继续，不再重复弹窗。",
+              ? "You ignored the same intent decision for this draft, so this turn continues as a natural reply without showing the popup again."
+              : "你刚刚忽略了同一草稿的意图确认，本轮先按自然回复继续，不再重复弹窗。",
           );
         } else {
           const pendingCopy = createPendingDecisionCopy({
             suggestedIntent: "plan",
-            decisionOptions: ["plan", "execute", "discuss"],
+            decisionOptions: ["plan", "respond", "execute"],
             riskLevel: reuseResolution.riskLevel,
             reason: reuseResolution.reason,
           }, preferredLanguage);
@@ -6187,8 +6304,8 @@ export const useAppStore = create<AppState>()(
           applyDecisionSuppressedFallback(
             "resolution",
             preferredLanguage === "en"
-              ? "You ignored the same intent decision for this draft, so this turn continues in discuss mode without showing the popup again."
-              : "你刚刚忽略了同一草稿的意图确认，本轮先按讨论继续，不再重复弹窗。",
+              ? "You ignored the same intent decision for this draft, so this turn continues as a natural reply without showing the popup again."
+              : "你刚刚忽略了同一草稿的意图确认，本轮先按自然回复继续，不再重复弹窗。",
           );
         } else {
           const pendingCopy = createPendingDecisionCopy(resolution, preferredLanguage);
@@ -6959,6 +7076,7 @@ export const useAppStore = create<AppState>()(
                           intent: effectiveRunIntent,
                           intentSummary: turn.intentSummary || effectiveIntentSummary,
                           commandDirective: turn.commandDirective || effectiveCommandDirective || undefined,
+                          pendingOperationProposal: applyOperationProposalChoice(turn.pendingOperationProposal, operationProposalChoiceAction),
                           mode: effectiveWorkflowMode,
                           blockIds: turn.blockIds.includes(userBlock.id) ? turn.blockIds : [...turn.blockIds, userBlock.id],
                         }
@@ -7008,6 +7126,7 @@ export const useAppStore = create<AppState>()(
                     intent: effectiveRunIntent,
                     intentSummary: turn.intentSummary || effectiveIntentSummary,
                     commandDirective: turn.commandDirective || effectiveCommandDirective || undefined,
+                    pendingOperationProposal: applyOperationProposalChoice(turn.pendingOperationProposal, operationProposalChoiceAction),
                     mode: effectiveWorkflowMode,
                   }
 	                : turn
@@ -7389,6 +7508,25 @@ export const useAppStore = create<AppState>()(
               "",
               userContent,
             ].filter(Boolean).join("\n");
+      }
+
+      if (shouldExecuteOnceFromReplyOption && (effectiveRunIntent === "execute" || effectiveRunIntent === "studio_workflow")) {
+        const approvedProposal =
+          existingTurn?.pendingOperationProposal ||
+          currentTurn?.pendingOperationProposal ||
+          previousTurnContinuationTarget?.pendingOperationProposal;
+        const latestAssistantSummary = getLastVisibleTurnAgentSummary(turnId, sessionGet().taskFlow);
+        const approvalContinuationPrompt = buildOperationApprovalContinuationPrompt({
+          language: preferredLanguage === "en" ? "en" : "zh",
+          proposal: approvedProposal,
+          latestAssistantSummary,
+          userChoice: text.trim() || selectedChoiceText || "approved",
+        });
+        userContent = [
+          approvalContinuationPrompt,
+          "",
+          userContent,
+        ].join("\n");
       }
 
       if (currentMainModeKey === "game_studio") {
@@ -8506,6 +8644,25 @@ export const useAppStore = create<AppState>()(
             ? pickProcessAssistantText(cleanText, meta?.hiddenThought, language)
             : cleanText;
           const stateVisibleText = isProcessAssistantText ? "" : displayText;
+          const pendingOperationProposal = buildPendingOperationProposal({
+            sourceTurnId: turnId,
+            text: displayText,
+            replyOptions,
+            commandDirective: effectiveCommandDirective,
+          });
+          const markPendingOperationProposal = () => {
+            if (!pendingOperationProposal) return;
+            sessionSet((s) => ({
+              conversationTurns: s.conversationTurns.map((turn) =>
+                turn.id === turnId
+                  ? {
+                      ...turn,
+                      pendingOperationProposal: pendingOperationProposal,
+                    }
+                  : turn,
+              ),
+            }));
+          };
           const currentFlow = sessionGet().taskFlow;
           const latestBlock = [...currentFlow].reverse().find((block) =>
             block.turnId === turnId &&
@@ -8585,6 +8742,7 @@ export const useAppStore = create<AppState>()(
               ...(isProcessAssistantText ? { hiddenProcess: true } : {}),
               streaming: false,
             });
+            markPendingOperationProposal();
             return;
           }
 
@@ -8607,6 +8765,7 @@ export const useAppStore = create<AppState>()(
                 : t
             ),
           }));
+          markPendingOperationProposal();
         },
 
         onToolExecuting: (toolName, target, diffPreview, meta?: ToolLifecycleMeta) => {
@@ -8754,9 +8913,36 @@ export const useAppStore = create<AppState>()(
                 )
               : s.planExecutionEvidenceLedger;
             const evidenceChanged = nextEvidenceLedger !== s.planExecutionEvidenceLedger;
+            const nextOperationEvidenceStatus: PendingOperationProposal["evidenceStatus"] =
+              toolName === "run_command" ||
+              toolName === "execute_command" ||
+              toolName === "send_pty_input" ||
+              toolName === "read_pty_tail" ||
+              toolName === "read_pty_since" ||
+              toolName === "get_pty_status"
+                ? "verified"
+                : toolName === "write_file" ||
+                  toolName === "replace_in_file" ||
+                  toolName === "delete_workspace_path"
+                ? "changed"
+                : "tool_called";
 
             return {
               taskFlow: updated,
+              conversationTurns: s.conversationTurns.map((turn) =>
+                turn.id === turnId && turn.pendingOperationProposal
+                  ? {
+                      ...turn,
+                      pendingOperationProposal: {
+                        ...turn.pendingOperationProposal,
+                        evidenceStatus:
+                          turn.pendingOperationProposal.evidenceStatus === "verified"
+                            ? "verified"
+                            : nextOperationEvidenceStatus,
+                      },
+                    }
+                  : turn,
+              ),
               ...(evidenceChanged
                 ? {
                     planExecutionEvidenceLedger: nextEvidenceLedger,
@@ -8813,7 +8999,22 @@ export const useAppStore = create<AppState>()(
               ...(meta?.toolCallId ? { toolCallId: String(meta.toolCallId) } : {}),
               message: error,
             } as TaskBlock;
-            return { taskFlow: updated };
+            return {
+              taskFlow: updated,
+              conversationTurns: s.conversationTurns.map((turn) =>
+                turn.id === turnId && turn.pendingOperationProposal
+                  ? {
+                      ...turn,
+                      pendingOperationProposal: {
+                        ...turn.pendingOperationProposal,
+                        evidenceStatus: turn.pendingOperationProposal.evidenceStatus === "none"
+                          ? "blocked"
+                          : turn.pendingOperationProposal.evidenceStatus,
+                      },
+                    }
+                  : turn,
+              ),
+            };
           });
           emitLocalPlanExecutionProgress("tool_error", {
             currentTool: `${toolName}${target ? ` ${target}` : ""}`,

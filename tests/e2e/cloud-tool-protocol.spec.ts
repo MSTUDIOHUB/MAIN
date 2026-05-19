@@ -59,6 +59,23 @@ test.beforeEach(async ({ page }) => {
       if (cmd === "get_system_memory") return { total_gb: 32, available_gb: 24 };
       if (cmd === "set_workspace_root") return String(args?.path ?? "");
       if (cmd === "get_workspace_root") return "/tmp/e2e-cloud-tool-protocol";
+      if (cmd === "shell_permission_preflight") {
+        const command = String(args?.command ?? "");
+        return {
+          command,
+          decision: "allow",
+          source: "e2e",
+          segmentDecisions: [
+            {
+              command,
+              decision: "allow",
+              riskLevel: "low",
+            },
+          ],
+          riskLevel: "low",
+          requiresApproval: false,
+        };
+      }
       if (cmd === "list_project_sessions" || cmd === "rebuild_project_sessions_index") return [];
       if (cmd === "save_project_session") return args?.session ?? {};
       if (cmd === "load_project_session") return {};
@@ -303,6 +320,19 @@ test.beforeEach(async ({ page }) => {
           });
         }
 
+        if (scenario === "operation-approval-natural-flow") {
+          return JSON.stringify({
+            output_text: [
+              "我会按批准开始真实修复。",
+              "<tool_use>",
+              "<tool>write_file</tool>",
+              "<parameter name=\"path\">src/fix-proof.txt</parameter>",
+              "<parameter name=\"content\">fixed</parameter>",
+              "</tool_use>",
+            ].join("\n"),
+          });
+        }
+
         if (scenario === "game-studio-execute-reply-runtime") {
           if (body.includes("立即开始重构并完善")) {
             return JSON.stringify({
@@ -320,7 +350,7 @@ test.beforeEach(async ({ page }) => {
               "我需要确认是否进入执行能力继续。",
               "<user_options>",
               "<option>立即开始重构并完善</option>",
-              "<option>先继续讨论方案</option>",
+              "<option>先继续调整方案</option>",
               "</user_options>",
             ].join("\n"),
           });
@@ -882,7 +912,7 @@ test("unity no-error behavior route does not trigger forced read_console fallbac
     });
 });
 
-test("execute quick reply switches a discuss turn to execute runtime and keeps tool review", async ({ page }) => {
+test("execute quick reply switches a respond turn to execute runtime and keeps tool review", async ({ page }) => {
   await page.goto("/?e2eScenario=execute-quick-reply-runtime");
 
   const sent = await page.evaluate(() =>
@@ -920,6 +950,65 @@ test("execute quick reply switches a discuss turn to execute runtime and keeps t
       currentTurnIntent: "execute",
       agentStatus: "pending_review",
       hasExecuteToolBlock: true,
+    });
+});
+
+test("plain fix request shows operation approval before execute tools", async ({ page }) => {
+  await page.goto("/?e2eScenario=operation-approval-natural-flow");
+
+  const sent = await page.evaluate(() =>
+    (window as any).__CODELY_E2E__?.sendCloudMessage?.("请修复这个问题。"),
+  );
+  expect(sent).toBe(true);
+
+  await expect(page.getByTestId("top-island-pending-run-decision")).toBeVisible();
+  await expect(page.getByTestId("top-island-intent-option-execute")).toContainText("批准执行本轮操作");
+
+  await expect
+    .poll(async () =>
+      page.evaluate(() => {
+        const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+        const probe = (window as any).__CLOUD_TOOL_PROTOCOL_TEST__;
+        return {
+          pendingSuggestedIntent: snapshot?.pendingRunDecision?.suggestedIntent ?? null,
+          pendingOptionIds: snapshot?.pendingRunDecision?.optionIds ?? [],
+          requestCount: probe?.requests?.length ?? 0,
+        };
+      }),
+    )
+    .toEqual({
+      pendingSuggestedIntent: "execute",
+      pendingOptionIds: ["execute", "respond"],
+      requestCount: 0,
+    });
+
+  await page.getByTestId("top-island-intent-option-execute").click();
+
+  await expect
+    .poll(async () =>
+      page.evaluate(() => {
+        const probe = (window as any).__CLOUD_TOOL_PROTOCOL_TEST__;
+        const requests = probe?.requests || [];
+        const executionRequest = [...requests]
+          .reverse()
+          .find((request: any) => request.hasTools && String(request.body || "").includes("[TURN INTENT: EXECUTE]"));
+        if (!executionRequest) return null;
+        const parsed = JSON.parse(executionRequest.body || "{}");
+        const names = (parsed.tools || []).map((tool: any) => tool?.name || tool?.function?.name).filter(Boolean);
+        const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+        return {
+          hasWriteTool: names.includes("write_file"),
+          currentTurnIntent: snapshot?.currentTurnIntent,
+          agentStatus: snapshot?.agentStatus,
+          hasWriteToolBlock: (snapshot?.toolNames || []).includes("write_file"),
+        };
+      }),
+    )
+    .toEqual({
+      hasWriteTool: true,
+      currentTurnIntent: "execute",
+      agentStatus: "pending_review",
+      hasWriteToolBlock: true,
     });
 });
 

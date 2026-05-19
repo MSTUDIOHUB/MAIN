@@ -31,6 +31,8 @@ export interface CompatibilityMessage {
   content: string | CompatibilityContentPart[];
   tool_calls?: CompatibilityToolCall[];
   tool_call_id?: string;
+  reasoning_content?: string;
+  reasoning?: string;
 }
 
 export const PROVIDER_COMPATIBILITY_TAG = "[PROVIDER_COMPATIBILITY_MODE]";

@@ -14,6 +14,8 @@ export interface ContextMemoryMessage {
   content: string | ContextMemoryContentPart[];
   tool_calls?: unknown[];
   tool_call_id?: string;
+  reasoning_content?: string;
+  reasoning?: string;
 }
 
 export interface ContextMemorySource {

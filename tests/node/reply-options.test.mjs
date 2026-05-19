@@ -60,6 +60,7 @@ const {
   buildReadOnlyPermissionContinuationPrompt,
   extractReplyOptions,
   hasOnlyReadOnlyPermissionReplyOptions,
+  inferReplyOptionActionFromText,
   serializeAssistantReplyForHistory,
   shouldAutoContinueReadOnlyPermission,
   shouldPauseForReplyOptions,
@@ -402,7 +403,39 @@ test("extractReplyOptions marks explicit execution choices for runtime execute",
   assert.equal(fixChoice.replyOptions[1].action, undefined);
 });
 
-test("extractReplyOptions filters internal process or mode-switch pseudo options", () => {
+test("extractReplyOptions synthesizes operation approval for executable proposals", () => {
+  const result = extractReplyOptions(`
+## 修复方案
+
+我建议修改 \`src/lib/runIntent.ts\`，让普通请求先自然回复，并在需要真实操作时询问用户是否开始执行。
+
+是否开始执行这个修复方案？
+  `);
+
+  assert.equal(result.replyOptions.length, 3);
+  assert.equal(result.replyOptions[0].label, "批准执行本轮操作");
+  assert.equal(result.replyOptions[0].action, "approve_operation_once");
+  assert.equal(result.replyOptions[0].source, "proposal_follow_up");
+  assert.equal(result.replyOptions[1].action, "adjust_plan");
+  assert.equal(result.replyOptions[2].action, "cancel_operation");
+});
+
+test("shouldPauseForReplyOptions pauses for proposal follow-up even on length-safe paths", () => {
+  assert.equal(
+    shouldPauseForReplyOptions({
+      replyOptions: [
+        { label: "批准执行本轮操作", value: "我批准执行。", action: "approve_operation_once", source: "proposal_follow_up" },
+        { label: "继续调整方案", value: "请继续调整方案。", action: "adjust_plan", source: "proposal_follow_up" },
+      ],
+      toolCallCount: 0,
+      workflowMode: "chat",
+      finishReason: "stop",
+    }),
+    true,
+  );
+});
+
+test("extractReplyOptions converts execution mode switch options into user-facing execution choices", () => {
   const result = extractReplyOptions(`
 请选择下一步：
 
@@ -410,14 +443,19 @@ test("extractReplyOptions filters internal process or mode-switch pseudo options
 <option>切换到执行模式</option>
 <option>我要调用工具 read_file</option>
 <option>直接执行部署脚本 deploy.sh</option>
+<option>停止执行，仅查看当前进度</option>
 </user_options>
   `);
 
   assert.deepEqual(
     result.replyOptions.map((option) => option.value),
-    ["直接执行部署脚本 deploy.sh"],
+    ["开始执行", "直接执行部署脚本 deploy.sh", "停止执行，仅查看当前进度"],
   );
   assert.equal(result.replyOptions[0].action, "execute_once");
+  assert.equal(result.replyOptions[1].action, "execute_once");
+  assert.equal(result.replyOptions[2].action, undefined);
+  assert.equal(inferReplyOptionActionFromText("执行修复"), "execute_once");
+  assert.equal(inferReplyOptionActionFromText("停止执行，仅查看当前进度"), undefined);
 });
 
 test("read-only auto approval strips repeated permission prompts and builds continuation", () => {

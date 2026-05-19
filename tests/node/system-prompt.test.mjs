@@ -78,7 +78,7 @@ function createInstructionLayer(title, content, kind = "scoped_rule") {
   };
 }
 
-test("discuss intent still injects workspace instructions and templates", () => {
+test("respond intent still injects workspace instructions and templates", () => {
   const prompt = buildSystemPrompt(
     [],
     "/tmp/workspace",
@@ -110,7 +110,7 @@ test("discuss intent still injects workspace instructions and templates", () => 
     },
   );
 
-  assert.match(prompt, /\[TURN INTENT: DISCUSS\]/);
+  assert.match(prompt, /\[TURN INTENT: RESPOND\]/);
   assert.match(prompt, /\[WORKSPACE INSTRUCTIONS\]/);
   assert.match(prompt, /Rule content: auto fallback in chat mode\./);
   assert.match(prompt, /\[WORKSPACE TEMPLATES\]/);
@@ -301,7 +301,7 @@ test("system prompt tells the model to stop after emitting user options", () => 
   assert.match(prompt, /不要假装提问后又自己继续往下执行/);
 });
 
-test("discuss prompt no longer tells the user to switch Chat or Fast or Plan", () => {
+test("respond prompt no longer tells the user to switch Chat or Fast or Plan", () => {
   const prompt = buildSystemPrompt(
     [],
     "/tmp/workspace",
@@ -316,7 +316,9 @@ test("discuss prompt no longer tells the user to switch Chat or Fast or Plan", (
 
   assert.doesNotMatch(prompt, /切换到 Fast \/ Plan/);
   assert.doesNotMatch(prompt, /切换到工程实现 MAIN 场景/);
-  assert.match(prompt, /\[TURN INTENT: DISCUSS\]/);
+  assert.match(prompt, /\[TURN INTENT: RESPOND\]/);
+  assert.match(prompt, /批准执行本轮操作/);
+  assert.match(prompt, /action="approve_operation_once"/);
 });
 
 test("game studio prompt exposes protocol paths and sticky specialist context", () => {

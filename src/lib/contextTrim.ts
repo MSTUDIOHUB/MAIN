@@ -22,6 +22,8 @@ export interface TrimMessage {
   content: string | TrimContentPart[];
   tool_calls?: unknown[];
   tool_call_id?: string;
+  reasoning_content?: string;
+  reasoning?: string;
 }
 
 export interface TrimTextPart {
@@ -121,6 +123,14 @@ function estimateMessageTokens(msg: TrimMessage): number {
   if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
     tokens += estimateTokens(JSON.stringify(msg.tool_calls));
   }
+  if (msg.role === "assistant") {
+    if (typeof msg.reasoning_content === "string" && msg.reasoning_content) {
+      tokens += estimateTokens(msg.reasoning_content);
+    }
+    if (typeof msg.reasoning === "string" && msg.reasoning) {
+      tokens += estimateTokens(msg.reasoning);
+    }
+  }
   return tokens;
 }
 
@@ -180,6 +190,12 @@ export function computeContextTokenBreakdown(messages: TrimMessage[]): ContextTo
       breakdown.assistantVisible += text + overhead;
       if (message.tool_calls && Array.isArray(message.tool_calls)) {
         breakdown.assistantToolCalls += estimateTokens(JSON.stringify(message.tool_calls));
+      }
+      if (typeof message.reasoning_content === "string" && message.reasoning_content) {
+        breakdown.assistantVisible += estimateTokens(message.reasoning_content);
+      }
+      if (typeof message.reasoning === "string" && message.reasoning) {
+        breakdown.assistantVisible += estimateTokens(message.reasoning);
       }
     } else if (isContextCompressionMarker(message)) {
       breakdown.compressionMarker += text + overhead;
@@ -252,6 +268,8 @@ function messagesEqual(a: TrimMessage[], b: TrimMessage[]): boolean {
     return (
       msg.role === other.role &&
       msg.tool_call_id === other.tool_call_id &&
+      msg.reasoning_content === other.reasoning_content &&
+      msg.reasoning === other.reasoning &&
       contentEquals(msg.content, other.content) &&
       toolCallsEqual(msg.tool_calls, other.tool_calls)
     );
