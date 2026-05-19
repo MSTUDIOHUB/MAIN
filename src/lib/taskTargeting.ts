@@ -47,6 +47,7 @@ export interface TaskTargetingProfile {
   requiresDesignProtocol: boolean;
   designProtocolSatisfied: boolean;
   userStyleConfirmed: boolean;
+  tabularAnalysisSatisfied: boolean;
   rootSkeletonAlreadyRead: boolean;
   allowRootSkeleton: boolean;
   preferredReadTools: string[];
@@ -218,7 +219,10 @@ export function buildTaskTargetingProfile(input: BuildTaskTargetingProfileInput 
 
   if (explicitPaths.length > 0) addFacet(facets, "explicit_path");
   if (symbols.length > 0) addFacet(facets, "symbol_target");
-  if (tabularPaths.length > 0 || /(?:CSV|TSV|XLSX|Excel|表格|数据表|dataset|spreadsheet)/i.test(combinedText)) {
+  if (
+    tabularPaths.length > 0 ||
+    /(?:CSV|TSV|XLSX|Excel|表格|数据表|dataset|spreadsheet|导入数据|数据导入|趋势|图表|环比|同比|monthly compare|trend|chart)/i.test(combinedText)
+  ) {
     addFacet(facets, "tabular_data");
   }
   if (hasUiDesignCue(combinedText)) addFacet(facets, "ui_design");
@@ -228,6 +232,10 @@ export function buildTaskTargetingProfile(input: BuildTaskTargetingProfileInput 
   }
 
   const observedEvidence = (input.observedEvidence || []).map(normalizeEvidence);
+  const tabularAnalysisSatisfied = observedEvidence.some((entry) =>
+    entry.startsWith("tool:analyze_tabular_document") ||
+    entry.startsWith("tool:query_tabular_document")
+  );
   const userStyleConfirmed = hasExplicitStyleConfirmation(combinedText);
   const requiresDesignProtocol = facets.has("ui_design") && designProtocolPaths.length > 0;
   const designProtocolSatisfied =
@@ -263,6 +271,7 @@ export function buildTaskTargetingProfile(input: BuildTaskTargetingProfileInput 
     requiresDesignProtocol,
     designProtocolSatisfied,
     userStyleConfirmed,
+    tabularAnalysisSatisfied,
     rootSkeletonAlreadyRead,
     allowRootSkeleton,
     preferredReadTools,
@@ -329,7 +338,13 @@ export function shouldBlockToolCallForTargeting(input: TaskTargetingToolGateInpu
   const language = input.language === "en" ? "en" : "zh";
   const target = normalizeSlashPath(input.target || String(input.args.path || input.args.file_path || ""));
 
-  if (input.toolName === "read_file" && target && isTabularPath(target) && !hasWindowedReadArgs(input.args)) {
+  if (
+    input.toolName === "read_file" &&
+    target &&
+    isTabularPath(target) &&
+    !hasWindowedReadArgs(input.args) &&
+    !input.profile.tabularAnalysisSatisfied
+  ) {
     return {
       blocked: true,
       reason: "tabular_raw_read",

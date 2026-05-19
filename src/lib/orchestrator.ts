@@ -174,6 +174,7 @@ import {
   shouldBlockToolCallForTargeting,
   type TaskOrchestratorPhase,
 } from "./taskTargeting";
+import { shouldTriggerPlanReadOnlyConvergence } from "./planReadOnlyConvergence";
 
 // ── Spec file auto-approval helpers ────────────────────────────────
 
@@ -181,6 +182,22 @@ const PRE_APPROVAL_PLAN_FILE_NAMES = new Set(["requirements.md", "design.md"]);
 const EXECUTION_PLAN_FILE_NAMES = new Set(["requirements.md", "design.md", "tasks.md"]);
 const PLAN_ARTIFACT_MUTATION_TOOLS = new Set(["write_file", "replace_in_file"]);
 const PLAN_REPEAT_READ_LIMIT = 3;
+const PLAN_EXPLORATION_READ_ONLY_TOOLS = new Set([
+  "get_project_skeleton",
+  "list_directory",
+  "glob_search",
+  "grep_search",
+  "read_file",
+  "read_document",
+  "analyze_tabular_document",
+  "query_tabular_document",
+  "index_workspace_documents",
+  "get_file_outline",
+  "read_pty_buffer",
+  "read_pty_tail",
+  "read_pty_since",
+  "get_pty_status",
+]);
 const EXECUTION_VERIFICATION_TOOL_NAMES = new Set([
   "run_command",
   "execute_command",
@@ -201,6 +218,57 @@ function getMessageContentText(content: AgentMessage["content"]): string {
     .filter((part): part is TextContentPart => part.type === "text")
     .map((part) => part.text || "")
     .join("\n");
+}
+
+function buildPlanReadOnlyConvergencePrompt(language: "zh" | "en", batchCount: number, toolCount: number): string {
+  if (language === "en") {
+    return [
+      "PLAN_READONLY_CONVERGENCE: You have gathered enough read-only context for this planning turn.",
+      `Read-only exploration so far: ${batchCount} batch(es), ${toolCount} tool result(s).`,
+      "Stop broad rereading now. In the next response, do exactly one of these:",
+      "1. Condense the evidence into root causes, tradeoffs, and 2-4 `<user_options>` for the user to choose from.",
+      "2. If the direction is clear, create or update `.MAIN/plans/design.md` with a concise reviewable draft, then submit the formal Proposal.",
+      "3. If a blocker remains, name the blocker and the single missing fact needed; do not continue broad file exploration.",
+    ].join("\n");
+  }
+  return [
+    "PLAN_READONLY_CONVERGENCE: 当前规划回合已经收集了足够的只读上下文。",
+    `只读探索累计：${batchCount} 批，${toolCount} 个工具结果。`,
+    "下一步不要继续泛读文件。请只做以下其一：",
+    "1. 把已读证据收束成问题归因、方案取舍，并给出 2-4 个面向用户的 `<user_options>`。",
+    "2. 如果方向已经清楚，创建或更新 `.MAIN/plans/design.md` 精简可审批草案，然后提交正式 Proposal。",
+    "3. 如果仍有阻塞，只说明阻塞点和唯一缺失事实；不要继续大范围探索。",
+  ].join("\n");
+}
+
+function buildPlanReadOnlyConvergencePause(language: "zh" | "en", batchCount: number, toolCount: number): {
+  text: string;
+  options: ReplyOption[];
+} {
+  if (language === "en") {
+    return {
+      text: [
+        "MAIN has collected enough read-only context, but the model kept exploring instead of producing a plan.",
+        `Current exploration: ${batchCount} read-only batches, ${toolCount} tool results.`,
+        "Choose the next direction.",
+      ].join("\n"),
+      options: [
+        { label: "Generate the diagnosis plan", value: "Please stop exploring and generate the diagnosis, tradeoffs, and proposed plan from the evidence already gathered.", action: "adjust_plan" },
+        { label: "Continue read-only exploration once", value: "Continue one more targeted read-only exploration pass, then stop and summarize the plan.", action: "continue_readonly_once" },
+      ],
+    };
+  }
+  return {
+    text: [
+      "MAIN 已经收集了足够的只读上下文，但模型仍在继续探索，没有产出可审阅方案。",
+      `当前探索累计：${batchCount} 批只读工具，${toolCount} 个工具结果。`,
+      "请选择下一步方向。",
+    ].join("\n"),
+    options: [
+      { label: "生成归因方案", value: "请停止继续探索，直接基于已有证据生成问题归因、方案取舍和可审批计划。", action: "adjust_plan" },
+      { label: "再定向探索一次", value: "请再做一次定向只读探索，然后立刻停止并总结方案。", action: "continue_readonly_once" },
+    ],
+  };
 }
 
 function computeContextForceReason(input: {
@@ -578,7 +646,15 @@ export interface OrchestratorCallbacks {
   onStreamToken: (token: string, messageId: string) => void;
   onStreamDone: (fullText: string, messageId: string, truncated: boolean) => void;
   onThought: (thought: string) => void;
-  onAssistantFinalText: (text: string, replyOptions?: ReplyOption[], meta?: { hasToolCalls?: boolean; hiddenThought?: string }) => void;
+  onAssistantFinalText: (
+    text: string,
+    replyOptions?: ReplyOption[],
+    meta?: {
+      hasToolCalls?: boolean;
+      hiddenThought?: string;
+      toolCalls?: Array<{ name: string; target: string }>;
+    },
+  ) => void;
   onStatusChange: (status: "idle" | "running" | "pending_review" | "error") => void;
   onError: (error: string) => void;
   onNonActionableStop: (message: string, reason: "no_output" | "no_action" | "missing_tool_loop" | "incomplete_plan") => void;
@@ -591,6 +667,14 @@ export interface OrchestratorCallbacks {
   onExecuteMaxIterationsCheckpoint?: (checkpoint: PlanMaxIterationsCheckpoint) => boolean | Promise<boolean>;
   onTurnSummaryReady: (summary: string) => void;
   onExecutionDigestUpdate?: (summary: string) => void;
+  onTurnRuntimePhaseChanged?: (phase: {
+    id: string;
+    kind: "scope" | "context" | "diagnosis" | "implementation" | "validation";
+    title: string;
+    summary?: string;
+    domain?: string;
+    status?: "pending" | "running" | "done" | "failed";
+  }) => void;
   onTurnEvent?: (event: MainThreadEvent) => void;
   onHarnessRunUpdate?: (patch: Record<string, unknown>) => void;
   onInstructionsResolved: (resolved: ResolvedInstructionSet) => void;
@@ -4153,6 +4237,9 @@ export async function executeAgentLoop(
   let usedExecuteConvergencePrompt = false;
   let usedPlanClosureGuard = false;
   let usedPlanDesignClosurePrompt = false;
+  let usedPlanReadOnlyConvergencePrompt = false;
+  let planReadOnlyConvergenceBatches = 0;
+  let planReadOnlyConvergenceTools = 0;
   const attemptedPlanWriteTargets: string[] = [];
   let recentSuccessfulProjectWrite: { name: string; target: string } | null = null;
   let recoveringFromEmptyAssistantReplyAfterWrite = false;
@@ -5592,6 +5679,13 @@ export async function executeAgentLoop(
       callbacks.onAssistantFinalText(visibleAssistantText, finalReplyOptions, {
         hasToolCalls: effectiveToolCalls.length > 0,
         hiddenThought: normalized.hiddenThought,
+        toolCalls: effectiveToolCalls.map((call) => {
+          const args = parseToolCallArguments(call, workspace);
+          return {
+            name: call.name,
+            target: getToolTarget(call.name, args),
+          };
+        }),
       });
     }
 
@@ -6963,6 +7057,79 @@ export async function executeAgentLoop(
         role: "user",
         content: unityMcpFallbackPrompt,
       });
+    }
+
+    const successfulReadOnlyExplorationResults = allResults.filter((result) =>
+      !result.isError && PLAN_EXPLORATION_READ_ONLY_TOOLS.has(result.name)
+    );
+    const isUnapprovedPlanReadOnlyBatch =
+      workflowMode === "plan" &&
+      !callbacks.getIsPlanApproved() &&
+      allResults.length > 0 &&
+      successfulReadOnlyExplorationResults.length > 0 &&
+      allResults.every((result) => result.isError || PLAN_EXPLORATION_READ_ONLY_TOOLS.has(result.name));
+    const hasPlanDecisionOutput =
+      hasStructuredProposal ||
+      finalReplyOptions.length > 0 ||
+      isReviewablePlanStage(callbacks.getPlanStage()) ||
+      allResults.some(isSuccessfulPlanArtifactWriteResult);
+
+    if (isUnapprovedPlanReadOnlyBatch && !hasPlanDecisionOutput) {
+      planReadOnlyConvergenceBatches += 1;
+      planReadOnlyConvergenceTools += successfulReadOnlyExplorationResults.length;
+    } else if (!isUnapprovedPlanReadOnlyBatch || hasPlanDecisionOutput) {
+      planReadOnlyConvergenceBatches = 0;
+      planReadOnlyConvergenceTools = 0;
+    }
+
+    const shouldConvergeUnapprovedPlanReadOnly = shouldTriggerPlanReadOnlyConvergence({
+      isUnapprovedPlanReadOnlyBatch,
+      hasPlanDecisionOutput,
+      batchCount: planReadOnlyConvergenceBatches,
+      toolCount: planReadOnlyConvergenceTools,
+    });
+
+    if (shouldConvergeUnapprovedPlanReadOnly) {
+      const language = callbacks.getPreferredLanguage();
+      callbacks.onTurnRuntimePhaseChanged?.({
+        id: "diagnosis",
+        kind: "diagnosis",
+        title: language === "zh" ? "归因方案" : "Diagnosis",
+        summary: language === "zh"
+          ? "只读上下文已足够，下一步应收束证据并形成方案。"
+          : "Enough read-only context has been gathered; condense the evidence into a plan next.",
+        domain: "plan_convergence",
+        status: "running",
+      });
+      logAgentEvent("plan_readonly_convergence_threshold", {
+        iteration,
+        batches: planReadOnlyConvergenceBatches,
+        tools: planReadOnlyConvergenceTools,
+        promptAlreadyUsed: usedPlanReadOnlyConvergencePrompt,
+      });
+      if (!usedPlanReadOnlyConvergencePrompt) {
+        usedPlanReadOnlyConvergencePrompt = true;
+        callbacks.appendMessage({
+          role: "user",
+          content: buildPlanReadOnlyConvergencePrompt(
+            language,
+            planReadOnlyConvergenceBatches,
+            planReadOnlyConvergenceTools,
+          ),
+        });
+        continue;
+      }
+
+      const pause = buildPlanReadOnlyConvergencePause(
+        language,
+        planReadOnlyConvergenceBatches,
+        planReadOnlyConvergenceTools,
+      );
+      const historyText = serializeAssistantReplyForHistory(pause.text, pause.options);
+      callbacks.onAssistantFinalText(pause.text, pause.options, { hasToolCalls: false });
+      callbacks.appendMessage({ role: "assistant", content: historyText });
+      callbacks.onStatusChange("idle");
+      return;
     }
 
     if (workflowMode === "plan" && !callbacks.getIsPlanApproved() && allResults.some(isSuccessfulPlanArtifactWriteResult)) {

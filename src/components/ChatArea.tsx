@@ -1363,7 +1363,7 @@ function TurnProcessArchive({
               {language === "zh" ? `${archive.stepCount} 步` : `${archive.stepCount} step${archive.stepCount > 1 ? "s" : ""}`}
             </span>
           </span>
-          <span className="mt-1 block truncate text-[12px] text-[var(--surface-text-subtle)]">
+          <span className="mt-1 block whitespace-pre-wrap break-words text-[12px] leading-5 text-[var(--surface-text-subtle)]">
             {archive.summaryText || fallbackSummary}{previewText ? ` · ${previewText}` : ""}
           </span>
         </span>
@@ -1404,6 +1404,7 @@ function TurnProcessArchive({
 }
 
 function getArchiveStepLabel(step: TurnArchiveStep, language: "zh" | "en") {
+  if (step.phase?.title) return step.phase.title;
   if (language === "en") {
     if (step.kind === "message") return "Model note";
     if (step.kind === "discover") return "Scope";
@@ -1535,7 +1536,7 @@ function TurnArchiveStepCard({
             {step.intent}
           </span>
           {step.summary && (
-            <span data-testid="turn-archive-step-summary" className="mt-0.5 block truncate text-[11px] text-[var(--surface-text-subtle)]">
+            <span data-testid="turn-archive-step-summary" className="mt-0.5 block whitespace-pre-wrap break-words text-[11px] leading-4 text-[var(--surface-text-subtle)]">
               {step.summary}{shouldShowTargetSummary ? ` · ${targetText}${hiddenTargetCount ? ` +${hiddenTargetCount}` : ""}` : ""}
             </span>
           )}
@@ -1610,7 +1611,7 @@ function LiveTurnProcessTimeline({
               {language === "zh" ? `${model.stepCount} 步` : `${model.stepCount} step${model.stepCount > 1 ? "s" : ""}`}
             </span>
           </span>
-          <span className="mt-1 block truncate text-[12px] text-[var(--surface-text-subtle)]">{summary}</span>
+          <span className="mt-1 block whitespace-pre-wrap break-words text-[12px] leading-5 text-[var(--surface-text-subtle)]">{summary}</span>
         </span>
         <span className="inline-flex shrink-0 items-center gap-1.5 px-1 py-1 text-[10px] text-[var(--surface-text-muted)] transition-colors group-hover:text-[var(--surface-text)]">
           {expanded ? <IconChevronDown className="h-3.5 w-3.5" /> : <IconChevronRight className="h-3.5 w-3.5" />}

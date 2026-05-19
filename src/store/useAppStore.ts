@@ -126,6 +126,14 @@ import {
 import { buildToolDiffPreview, supportsToolDiffPreview } from "../lib/toolDiff";
 import { findToolLifecycleBlockIndex, type ToolLifecycleMeta } from "../lib/toolLifecycle";
 import { deriveToolIntentSummary } from "../lib/toolPresentation";
+import {
+  deriveTurnRuntimePhaseForText,
+  deriveTurnRuntimePhaseForTool,
+  makeTurnRuntimePhase,
+  normalizeTurnRuntimePhase,
+  withTurnRuntimePhaseStatus,
+  type TurnRuntimePhase,
+} from "../lib/turnPhase";
 import { buildPlanApprovalChoiceHint, normalizePlanApprovalChoice } from "../lib/planControl";
 import {
   PLAN_MAX_AUTO_RESUME_LIMIT,
@@ -925,6 +933,7 @@ export interface JobItem {
 interface TaskBlockBase {
   id: number;
   turnId?: string;
+  turnPhase?: TurnRuntimePhase;
 }
 
 export interface ToolDiffSnapshot {
@@ -2974,6 +2983,11 @@ function trimPersistedContextCompression(value: unknown): string | undefined {
     : `${text.slice(0, MAX_PERSISTED_CONTEXT_COMPRESSION_CHARS).trim()}…`;
 }
 
+function persistedTurnPhase(block: TaskBlock): { turnPhase?: TurnRuntimePhase } {
+  const turnPhase = normalizeTurnRuntimePhase(block.turnPhase);
+  return turnPhase ? { turnPhase } : {};
+}
+
 /** JSON.stringify wrapper that never throws — returns fallback on failure. */
 export function safeJsonStringify(value: unknown, fallback = "{}"): string {
   try {
@@ -2997,6 +3011,7 @@ export function sanitizeTaskBlocksForPersist(blocks: TaskBlock[]): TaskBlock[] {
         return {
           id: b.id,
           turnId: b.turnId,
+          ...persistedTurnPhase(b),
           type: "user" as const,
           content: String(b.content),
           ...(contextItems ? { contextItems } : {}),
@@ -3006,6 +3021,7 @@ export function sanitizeTaskBlocksForPersist(blocks: TaskBlock[]): TaskBlock[] {
         return {
           id: b.id,
           turnId: b.turnId,
+          ...persistedTurnPhase(b),
           type: "agent" as const,
           content: String(b.content),
           ...(b.hiddenProcess ? { hiddenProcess: true } : {}),
@@ -3024,12 +3040,13 @@ export function sanitizeTaskBlocksForPersist(blocks: TaskBlock[]): TaskBlock[] {
         return {
           id: b.id,
           turnId: b.turnId,
+          ...persistedTurnPhase(b),
           type: "thought" as const,
           content: compactThoughtContentForPersist(String(b.content)),
         };
       case "tool":
         return {
-          id: b.id, turnId: b.turnId, type: "tool" as const,
+          id: b.id, turnId: b.turnId, ...persistedTurnPhase(b), type: "tool" as const,
           toolName: String(b.toolName), target: String(b.target),
           status: String(b.status),
           toolStatus: b.toolStatus,
@@ -3055,6 +3072,7 @@ export function sanitizeTaskBlocksForPersist(blocks: TaskBlock[]): TaskBlock[] {
         return {
           id: b.id,
           turnId: b.turnId,
+          ...persistedTurnPhase(b),
           type: "system" as const,
           content: String(b.content),
           ...(b.icon ? { icon: String(b.icon) } : {}),
@@ -7658,6 +7676,34 @@ export const useAppStore = create<AppState>()(
       // tags during streaming and routes content to a ThoughtBlock instead of the
       // agent block. Prevents thinking content from briefly appearing as plain text.
       const thinkingInterceptor = new StreamingThinkingInterceptor();
+      const phaseLanguage = preferredLanguage === "en" ? "en" : "zh";
+      let currentTurnRuntimePhase = makeTurnRuntimePhase("scope", phaseLanguage);
+
+      const setCurrentTurnRuntimePhase = (phase?: TurnRuntimePhase) => {
+        const normalized = normalizeTurnRuntimePhase(phase, phaseLanguage);
+        if (normalized) currentTurnRuntimePhase = normalized;
+        return currentTurnRuntimePhase;
+      };
+
+      const phaseForTool = (
+        toolName: string,
+        target: string,
+        status: "running" | "done" | "failed" = "running",
+      ) => setCurrentTurnRuntimePhase(deriveTurnRuntimePhaseForTool({
+        toolName,
+        target,
+        language: phaseLanguage,
+        status,
+      }));
+
+      const phaseForProcessText = (text: string) => setCurrentTurnRuntimePhase(
+        deriveTurnRuntimePhaseForText(text, phaseLanguage, currentTurnRuntimePhase),
+      );
+
+      const attachRuntimePhase = <T extends TaskBlock>(block: T, phase?: TurnRuntimePhase): T => {
+        const normalized = normalizeTurnRuntimePhase(block.turnPhase || phase || currentTurnRuntimePhase, phaseLanguage);
+        return normalized ? { ...block, turnPhase: normalized } : block;
+      };
 
       // ── Turn-based thought deduplication state ──────────────────────────
       // Prevents triple repetition when reasoning is emitted via multiple paths.
@@ -7666,7 +7712,7 @@ export const useAppStore = create<AppState>()(
       // 将新产生的可视块自动挂到当前回合，避免聊天区之后再靠扫描推断归属。
       const appendTurnBlock = (block: TaskBlock) => {
         const targetTurnId = block.turnId && block.turnId !== turnId ? block.turnId : uiDisplayTurnId;
-        const blockWithTurn: TaskBlock = { ...block, turnId: targetTurnId };
+        const blockWithTurn: TaskBlock = attachRuntimePhase({ ...block, turnId: targetTurnId } as TaskBlock);
         if (blockWithTurn.type === "agent") {
           agentBlockIdsCreatedThisRun.add(blockWithTurn.id);
         }
@@ -7854,7 +7900,7 @@ export const useAppStore = create<AppState>()(
           let conversationTurns = s.conversationTurns;
 
           const appendBlock = (block: TaskBlock) => {
-            const blockWithTurn: TaskBlock = { ...block, turnId: block.turnId ?? turnId };
+            const blockWithTurn: TaskBlock = attachRuntimePhase({ ...block, turnId: block.turnId ?? turnId } as TaskBlock);
             taskFlow = [...taskFlow, blockWithTurn];
             conversationTurns = conversationTurns.map((turn) =>
               turn.id === turnId && !turn.blockIds.includes(blockWithTurn.id)
@@ -8447,6 +8493,15 @@ export const useAppStore = create<AppState>()(
             : "";
           const cleanText = text.trim() || fallbackText;
           const isProcessAssistantText = !!meta?.hasToolCalls && replyOptions.length === 0;
+          const processPhase = isProcessAssistantText
+            ? (() => {
+                const firstCall = meta?.toolCalls?.[0];
+                if (firstCall) {
+                  return phaseForTool(firstCall.name, firstCall.target || "", "running");
+                }
+                return phaseForProcessText(cleanText);
+              })()
+            : currentTurnRuntimePhase;
           const displayText = isProcessAssistantText
             ? pickProcessAssistantText(cleanText, meta?.hiddenThought, language)
             : cleanText;
@@ -8523,6 +8578,7 @@ export const useAppStore = create<AppState>()(
             appendTurnBlock({
               id: nextId(),
               turnId,
+              turnPhase: processPhase,
               type: "agent",
               content: displayText,
               ...(replyOptions.length > 0 ? { options: replyOptions } : {}),
@@ -8542,6 +8598,7 @@ export const useAppStore = create<AppState>()(
               t.id === latestBlock.id && t.type === "agent"
                 ? {
                     ...t,
+                    turnPhase: normalizeTurnRuntimePhase(t.turnPhase || processPhase, phaseLanguage),
                     content: displayText,
                     ...(replyOptions.length > 0 ? { options: replyOptions } : { options: undefined }),
                     ...(isProcessAssistantText ? { hiddenProcess: true } : { hiddenProcess: undefined }),
@@ -8557,6 +8614,7 @@ export const useAppStore = create<AppState>()(
           let shouldAttachDiff = false;
           const normalizedToolCallId = String(meta?.toolCallId || "").trim() || undefined;
           const language = sessionGet().config.language === "en" ? "en" : "zh";
+          const turnPhase = phaseForTool(toolName, target, "running");
           const intentSummary = deriveToolIntentSummary({
             toolName,
             target,
@@ -8588,6 +8646,7 @@ export const useAppStore = create<AppState>()(
                   toolStatus: "running",
                   status: "running",
                   ...(normalizedToolCallId ? { toolCallId: normalizedToolCallId } : {}),
+                  turnPhase: pendingTask.turnPhase || turnPhase,
                   intentSummary: pendingTask.intentSummary || intentSummary,
                   message: "Executing...",
                 };
@@ -8600,6 +8659,7 @@ export const useAppStore = create<AppState>()(
                 id: appendedBlockId,
                 turnId,
                 type: "tool",
+                turnPhase,
                 toolName,
                 target,
                 status: "running",
@@ -8671,6 +8731,11 @@ export const useAppStore = create<AppState>()(
               );
             updated[idx] = {
               ...updated[idx],
+              turnPhase: withTurnRuntimePhaseStatus(
+                (updated[idx] as Extract<TaskBlock, { type: "tool" }>).turnPhase || phaseForTool(toolName, target, "done"),
+                "done",
+                phaseLanguage,
+              ),
               toolStatus: "executed" as const,
               status: "done" as const,
               ...(meta?.toolCallId ? { toolCallId: String(meta.toolCallId) } : {}),
@@ -8738,6 +8803,11 @@ export const useAppStore = create<AppState>()(
             const updated = [...s.taskFlow];
             updated[idx] = {
               ...updated[idx],
+              turnPhase: withTurnRuntimePhaseStatus(
+                (updated[idx] as Extract<TaskBlock, { type: "tool" }>).turnPhase || phaseForTool(toolName, target, "failed"),
+                "failed",
+                phaseLanguage,
+              ),
               toolStatus: "failed" as const,
               status: "error" as const,
               ...(meta?.toolCallId ? { toolCallId: String(meta.toolCallId) } : {}),
@@ -9368,6 +9438,10 @@ export const useAppStore = create<AppState>()(
           sessionGet().setConversationTurnSummary(turnId, summarized);
         },
 
+        onTurnRuntimePhaseChanged: (phase) => {
+          setCurrentTurnRuntimePhase(normalizeTurnRuntimePhase(phase, phaseLanguage));
+        },
+
         onTurnEvent: (event) => {
           const mode = normalizeEventStreamMode(sessionGet().config.eventStreamMode);
           if (mode === "legacy") return;
@@ -9617,6 +9691,7 @@ export const useAppStore = create<AppState>()(
                   language,
                   toolStatus: "pending",
                 });
+                const turnPhase = phaseForTool(toolName, target, "running");
                 void (async () => {
                   const diff = isLocalFileReadApproval
                     ? undefined
@@ -9627,6 +9702,7 @@ export const useAppStore = create<AppState>()(
                   const block: TaskBlock = {
                     id: reviewTaskId,
                     turnId: uiDisplayTurnId,
+                    turnPhase,
                     type: "tool",
                     toolName,
                     target,
@@ -9639,7 +9715,7 @@ export const useAppStore = create<AppState>()(
                   };
 
                   sessionSet((s) => ({
-                    taskFlow: [...s.taskFlow, block],
+                    taskFlow: [...s.taskFlow, attachRuntimePhase(block, turnPhase)],
                     conversationTurns: s.conversationTurns.map((turn) =>
                       turn.id === uiDisplayTurnId && !turn.blockIds.includes(block.id)
                         ? { ...turn, blockIds: [...turn.blockIds, block.id] }
@@ -9672,6 +9748,7 @@ export const useAppStore = create<AppState>()(
               language,
               toolStatus: "pending",
             });
+            const turnPhase = phaseForTool(toolName, target, "running");
             void (async () => {
               const diff = isLocalFileReadApproval
                 ? undefined
@@ -9682,6 +9759,7 @@ export const useAppStore = create<AppState>()(
               const block: TaskBlock = {
                 id: reviewTaskId,
                 turnId: uiDisplayTurnId,
+                turnPhase,
                 type: "tool",
                 toolName,
                 target,
@@ -9694,7 +9772,7 @@ export const useAppStore = create<AppState>()(
               };
 
               sessionSet((s) => ({
-                taskFlow: [...s.taskFlow, block],
+                taskFlow: [...s.taskFlow, attachRuntimePhase(block, turnPhase)],
                 conversationTurns: s.conversationTurns.map((turn) =>
                   turn.id === uiDisplayTurnId && !turn.blockIds.includes(block.id)
                     ? { ...turn, blockIds: [...turn.blockIds, block.id] }

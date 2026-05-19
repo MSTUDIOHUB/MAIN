@@ -133,6 +133,7 @@ test("data analyst chat prompt tells the model to auto-fallback on read-only fai
   assert.match(prompt, /不要为了这种只读降级向用户申请批准/);
   assert.match(prompt, /不要停下来征求用户是否允许降级/);
   assert.match(prompt, /推荐回退顺序：`analyze_tabular_document` 全表概览 → `query_tabular_document` 结构化筛选\/聚合 → `read_document` 原始行窗口\/分页读取/);
+  assert.match(prompt, /确认列、日期、金额、课程字段和聚合口径/);
   assert.match(prompt, /避免输出“我将再次执行”“请稍候确认是否同意降级”这类过程化台词/);
   assert.match(prompt, /不要先输出“下一步行动计划”“请稍候，我将开始分析”之类的过渡台词后停住/);
   assert.match(prompt, /一旦你判断需要读取本地文件才能回答，就在同一轮直接调用只读工具/);

@@ -294,3 +294,93 @@ test("path-specific notes compare by strategy so same-purpose edits stay grouped
   assert.match(model.steps[0].summary, /2 次文件修改/);
   assert.deepEqual(model.steps[0].targets, ["src/main.js", "src/styles/main.css"]);
 });
+
+test("runtime phase metadata keeps stable titles and ignores changing process notes", () => {
+  const contextPhase = {
+    id: "context",
+    kind: "context",
+    title: "关键上下文",
+    summary: "读取主题、数据链路和布局相关实现，证据说明可以换行保留。",
+    domain: "theme_ui",
+    status: "running",
+  };
+  const model = buildLiveTurnProcessTimelineModel({
+    language: "zh",
+    blocks: [
+      { id: 1, type: "agent", turnPhase: contextPhase, content: "现在读取 ThemeStyles，确认主题变量。", hiddenProcess: true, streaming: false },
+      { id: 2, type: "tool", turnPhase: contextPhase, toolName: "read_file", target: "src/components/ThemeStyles.tsx", status: "done", toolStatus: "executed" },
+      { id: 3, type: "agent", turnPhase: contextPhase, content: "现在读取 App.css，确认 sidebar 硬编码。", hiddenProcess: true, streaming: false },
+      { id: 4, type: "tool", turnPhase: contextPhase, toolName: "read_file", target: "src/App.css", status: "done", toolStatus: "executed" },
+    ],
+  });
+
+  assert.equal(model.steps.length, 1);
+  assert.equal(model.steps[0].phase.title, "关键上下文");
+  assert.equal(model.steps[0].intent, "关键上下文");
+  assert.match(model.steps[0].summary, /证据说明可以换行保留/);
+  assert.doesNotMatch(model.steps[0].intent, /ThemeStyles|App\.css/);
+});
+
+test("runtime phase grouping splits large read-only batches at eight tool calls", () => {
+  const phase = {
+    id: "context",
+    kind: "context",
+    title: "关键上下文",
+    summary: "读取必要上下文。",
+    domain: "data_pipeline",
+    status: "running",
+  };
+  const blocks = Array.from({ length: 10 }, (_, index) => ({
+    id: index + 1,
+    type: "tool",
+    turnPhase: phase,
+    toolName: "read_file",
+    target: `src/data/file-${index + 1}.ts`,
+    status: "done",
+    toolStatus: "executed",
+  }));
+  const model = buildLiveTurnProcessTimelineModel({ language: "zh", blocks });
+
+  assert.equal(model.steps.length, 2);
+  assert.equal(model.steps[0].phase.title, "关键上下文");
+  assert.equal(model.steps[0].items.filter((item) => item.type === "tool").length, 8);
+  assert.equal(model.steps[1].items.filter((item) => item.type === "tool").length, 2);
+});
+
+test("runtime phase grouping separates target domains inside the same phase", () => {
+  const basePhase = {
+    id: "context",
+    kind: "context",
+    title: "关键上下文",
+    summary: "读取必要上下文。",
+    status: "running",
+  };
+  const model = buildLiveTurnProcessTimelineModel({
+    language: "zh",
+    blocks: [
+      {
+        id: 1,
+        type: "tool",
+        turnPhase: { ...basePhase, domain: "theme_ui" },
+        toolName: "read_file",
+        target: "src/components/ThemeStyles.tsx",
+        status: "done",
+        toolStatus: "executed",
+      },
+      {
+        id: 2,
+        type: "tool",
+        turnPhase: { ...basePhase, domain: "data_pipeline" },
+        toolName: "read_file",
+        target: "src/hooks/useCsvParser.ts",
+        status: "done",
+        toolStatus: "executed",
+      },
+    ],
+  });
+
+  assert.equal(model.steps.length, 2);
+  assert.deepEqual(model.steps.map((step) => step.phase.domain), ["theme_ui", "data_pipeline"]);
+  assert.equal(model.steps[0].intent, "关键上下文");
+  assert.equal(model.steps[1].intent, "关键上下文");
+});

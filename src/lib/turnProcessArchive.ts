@@ -4,6 +4,7 @@ import {
   deriveToolPhase,
   type ToolPresentationLanguage,
 } from "./toolPresentation";
+import { normalizeTurnRuntimePhase, type TurnRuntimePhase } from "./turnPhase";
 import { deriveThoughtDisplay } from "./thoughtDisplay";
 
 export type TurnArchiveStepKind = "thinking" | "discover" | "inspect" | "edit" | "command" | "verify" | "blocked" | "message";
@@ -20,6 +21,7 @@ export interface TurnArchiveStep {
   next: string;
   note: string;
   summary: string;
+  phase?: TurnRuntimePhase;
   targets: string[];
   items: any[];
   expandedByDefault: boolean;
@@ -514,6 +516,7 @@ function makeSummaryForStep(step: TurnArchiveStep, language: ToolPresentationLan
 function canMergeSteps(current: TurnArchiveStep | null, next: TurnArchiveStep, mergeAdjacent: boolean): boolean {
   if (!mergeAdjacent) return false;
   if (!current) return false;
+  if (current.phase || next.phase) return false;
   if (current.status !== next.status) return false;
   if (current.status === "failed" || current.status === "rejected") return false;
   if (isContextPhase(current.kind) && isContextPhase(next.kind)) return true;
@@ -633,12 +636,151 @@ function mergeStrategySteps(steps: TurnArchiveStep[], language: ToolPresentation
   return result;
 }
 
+const MAX_PHASE_TOOL_ITEMS = 8;
+
+function getPhaseKey(step: TurnArchiveStep): string {
+  const phase = step.phase;
+  if (!phase) return "";
+  return [phase.id, phase.domain || "general", step.kind].join(":");
+}
+
+function mergeStepStatus(left: TurnArchiveStepStatus, right: TurnArchiveStepStatus): TurnArchiveStepStatus {
+  if (left === "failed" || right === "failed") return "failed";
+  if (left === "rejected" || right === "rejected") return "rejected";
+  if (left === "running" || right === "running") return "running";
+  return "done";
+}
+
+function canMergePhasedStep(current: TurnArchiveStep | null, next: TurnArchiveStep): boolean {
+  if (!current || !current.phase || !next.phase) return false;
+  if (getPhaseKey(current) !== getPhaseKey(next)) return false;
+  if (current.status === "failed" || current.status === "rejected") return false;
+  const nextToolCount = countToolItems(next);
+  return nextToolCount === 0 || countToolItems(current) + nextToolCount <= MAX_PHASE_TOOL_ITEMS;
+}
+
+function attachPendingPhaseMessages(
+  step: TurnArchiveStep,
+  pendingMessages: TurnArchiveStep[],
+): TurnArchiveStep {
+  const matchingMessages = pendingMessages.filter((message) =>
+    message.phase?.id === step.phase?.id &&
+    (!message.phase?.domain || !step.phase?.domain || message.phase.domain === step.phase.domain)
+  );
+  if (matchingMessages.length === 0) return step;
+  const messageItems = matchingMessages.flatMap((message) => message.items);
+  return {
+    ...step,
+    items: [...messageItems, ...step.items],
+    sourceIndex: Math.min(step.sourceIndex, ...matchingMessages.map((message) => message.sourceIndex)),
+  };
+}
+
+function makeStandalonePhaseMessage(
+  messages: TurnArchiveStep[],
+  language: ToolPresentationLanguage,
+): TurnArchiveStep | null {
+  const first = messages[0];
+  if (!first?.phase) return null;
+  const phase = first.phase;
+  const items = messages.flatMap((message) => message.items);
+  return {
+    id: `turn-phase-${phase.id}-message-${first.id}`,
+    kind: "message",
+    status: "done",
+    intent: phase.title || defaultIntentForStep("message", language),
+    why: "",
+    action: "",
+    result: "",
+    next: "",
+    note: "",
+    summary: phase.summary || "",
+    phase,
+    targets: [],
+    items,
+    expandedByDefault: false,
+    sourceIndex: Math.min(...messages.map((message) => message.sourceIndex)),
+    sourceEndIndex: Math.max(...messages.map((message) => message.sourceEndIndex)),
+  };
+}
+
+function mergePhasedSteps(steps: TurnArchiveStep[], language: ToolPresentationLanguage): TurnArchiveStep[] {
+  const result: TurnArchiveStep[] = [];
+  let current: TurnArchiveStep | null = null;
+  let pendingMessages: TurnArchiveStep[] = [];
+
+  const flushCurrent = () => {
+    if (!current) return;
+    current.targets = uniqueTargets(current.items, language);
+    result.push(current);
+    current = null;
+  };
+
+  const flushPendingMessages = () => {
+    if (pendingMessages.length === 0) return;
+    const standalone = makeStandalonePhaseMessage(pendingMessages, language);
+    if (standalone) result.push(standalone);
+    pendingMessages = [];
+  };
+
+  for (const rawStep of steps) {
+    const step = rawStep.phase ? { ...rawStep, note: "" } : rawStep;
+    if (!step.phase) {
+      flushCurrent();
+      flushPendingMessages();
+      result.push(step);
+      continue;
+    }
+
+    if (step.kind === "message") {
+      pendingMessages.push(step);
+      continue;
+    }
+
+    const next = attachPendingPhaseMessages(step, pendingMessages);
+    const nextPhase = next.phase;
+    if (!nextPhase) {
+      flushCurrent();
+      result.push(next);
+      continue;
+    }
+    pendingMessages = pendingMessages.filter((message) =>
+      message.phase?.id !== step.phase?.id ||
+      (!!message.phase?.domain && !!step.phase?.domain && message.phase.domain !== step.phase.domain)
+    );
+
+    if (!canMergePhasedStep(current, next)) {
+      flushCurrent();
+    }
+
+    if (!current) {
+      current = {
+        ...next,
+        id: `turn-phase-${nextPhase.id}-${nextPhase.domain || "general"}-${next.kind}-${result.length + 1}`,
+        intent: nextPhase.title || next.intent,
+        summary: nextPhase.summary || next.summary,
+      };
+    } else {
+      current.items.push(...next.items);
+      current.targets = uniqueTargets(current.items, language);
+      current.status = mergeStepStatus(current.status, next.status);
+      current.expandedByDefault = current.expandedByDefault || next.expandedByDefault;
+      current.sourceEndIndex = next.sourceEndIndex;
+    }
+  }
+
+  flushCurrent();
+  flushPendingMessages();
+  return result;
+}
+
 function makeStep(input: {
   block: any;
   index: number;
   language: ToolPresentationLanguage;
 }): TurnArchiveStep {
   const { block, index, language } = input;
+  const phase = normalizeTurnRuntimePhase(block?.turnPhase, language);
   if (block.type === "thought") {
     return {
       id: `turn-archive-step-thinking-${block.id ?? index}`,
@@ -651,6 +793,7 @@ function makeStep(input: {
       next: "",
       note: extractReasoningNoteFromText(String(block.content || ""), language),
       summary: "",
+      ...(phase ? { phase } : {}),
       targets: [],
       items: [block],
       expandedByDefault: true,
@@ -674,6 +817,7 @@ function makeStep(input: {
       next: "",
       note: "",
       summary: "",
+      ...(phase ? { phase } : {}),
       targets: target ? [target] : [],
       items: [block],
       expandedByDefault: status === "failed" || status === "rejected",
@@ -697,6 +841,7 @@ function makeStep(input: {
     next: "",
     note,
     summary: "",
+    ...(phase ? { phase } : {}),
     targets: [],
     items: [sourceItem],
     expandedByDefault: false,
@@ -713,10 +858,14 @@ function finalizeStep(
 ): TurnArchiveStep {
   const targets = uniqueTargets(step.items, language);
   const kind = step.kind;
+  const phase = normalizeTurnRuntimePhase(step.phase, language);
   const fallbackIntent = isContextPhase(kind) && step.items.length > 1
     ? defaultIntentForStep(kind, language)
     : step.intent || defaultIntentForStep(kind, language);
-  const summary = makeSummaryForStep({ ...step, targets }, language);
+  const baseSummary = makeSummaryForStep({ ...step, targets }, language);
+  const summary = phase?.summary
+    ? `${phase.summary}${baseSummary ? `${language === "zh" ? " · " : " · "}${baseSummary}` : ""}`
+    : baseSummary;
   const narrative = defaultNarrativeForStep({ ...step, targets, summary }, language);
   const hasPersistedIntent = step.items.length === 1 && String(step.items[0]?.intentSummary || "").trim().length > 0;
   const note = step.note || (step.kind === "message" || step.kind === "thinking"
@@ -728,9 +877,10 @@ function finalizeStep(
         includeThoughts: includeThoughtNotes,
       })
     : "");
-  const intent = hasPersistedIntent ? fallbackIntent : makeNarrativeIntent({ ...step, targets, ...narrative, note, summary }, language);
+  const intent = phase?.title || (hasPersistedIntent ? fallbackIntent : makeNarrativeIntent({ ...step, targets, ...narrative, note, summary }, language));
   return {
     ...step,
+    ...(phase ? { phase } : {}),
     targets,
     ...narrative,
     note,
@@ -804,7 +954,10 @@ function buildModelFromSteps(input: {
   const includeThoughtNotes = input.includeThoughtNotes !== false;
   const mergeAdjacent = input.mergeAdjacent !== false;
   const sourceBlocks = input.sourceBlocks || input.blocks;
-  const strategySteps = mergeStrategySteps(input.steps, input.language);
+  const hasPhaseSteps = input.steps.some((step) => !!step.phase);
+  const strategySteps = hasPhaseSteps
+    ? mergePhasedSteps(input.steps, input.language)
+    : mergeStrategySteps(input.steps, input.language);
   const normalizedSteps: TurnArchiveStep[] = [];
   for (const next of strategySteps) {
     const current = normalizedSteps[normalizedSteps.length - 1] || null;
@@ -822,7 +975,7 @@ function buildModelFromSteps(input: {
   }
   const finalizedSteps = normalizedSteps
     .map((step) => finalizeStep(step, input.language, sourceBlocks, includeThoughtNotes))
-    .filter((step) => step.kind !== "message" || String(step.note || "").trim().length > 0);
+    .filter((step) => step.kind !== "message" || !!step.phase || String(step.note || "").trim().length > 0);
   const counts = makeCounts(finalizedSteps);
   const previewTargets: string[] = [];
   for (const step of finalizedSteps) {

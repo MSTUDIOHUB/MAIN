@@ -128,6 +128,33 @@ test("task targeting blocks raw read_file on tabular data but allows windowed ra
   assert.equal(windowed.blocked, false);
 });
 
+test("task targeting treats imported trend chart requests as tabular work", () => {
+  const profile = buildTaskTargetingProfile({
+    userPrompt: "导入数据后看不到趋势图、环比和图表分析结果。",
+  });
+
+  assert.equal(profile.facets.includes("tabular_data"), true);
+  assert.deepEqual(profile.preferredReadTools.slice(0, 2), ["analyze_tabular_document", "query_tabular_document"]);
+});
+
+test("task targeting allows full raw CSV reads after structured tabular evidence", () => {
+  const profile = buildTaskTargetingProfile({
+    userPrompt: "分析 orders.csv 里面的下单趋势。",
+    observedEvidence: ["tool:analyze_tabular_document:orders.csv"],
+  });
+
+  const raw = shouldBlockToolCallForTargeting({
+    profile,
+    toolName: "read_file",
+    args: { path: "orders.csv" },
+    target: "orders.csv",
+    language: "zh",
+  });
+
+  assert.equal(profile.tabularAnalysisSatisfied, true);
+  assert.equal(raw.blocked, false);
+});
+
 test("task targeting prefers scoped discovery and blocks broad root skeleton when paths or symbols exist", () => {
   const profile = buildTaskTargetingProfile({
     userPrompt: "修复 useTrendData 在 src/hooks/useTrendData.ts 里的回退逻辑。",
