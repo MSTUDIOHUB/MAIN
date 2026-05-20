@@ -190,6 +190,81 @@ test("local settings exposes tool protocol and resets endpoint/model/protocol on
   await expect(page.getByTestId("local-model-select")).toHaveValue("");
 });
 
+test("model runtime lock disables current model switching while allowing non-running cloud config edits", async ({ page }) => {
+  await page.goto("/?e2eScenario=cloud-settings-model-select");
+
+  await page.evaluate(() => {
+    (window as any).__CODELY_E2E__?.setCloudServers?.([
+      {
+        id: "demo-openai",
+        name: "Demo Gateway",
+        protocol: "openai",
+        provider: "OpenAI",
+        apiFormat: "responses",
+        endpoint: "https://demo-gateway.example/v1",
+        apiKey: "demo-key",
+        model: "gpt-active",
+        customHeaders: "",
+        reasoningEffort: "none",
+        disableResponseStorage: true,
+        toolProtocol: "auto",
+        auth: { mode: "api_key", status: "disconnected" },
+      },
+      {
+        id: "backup-openai",
+        name: "Backup Gateway",
+        protocol: "openai",
+        provider: "OpenAI",
+        apiFormat: "responses",
+        endpoint: "https://second-gateway.example/v1",
+        apiKey: "backup-key",
+        model: "second-alpha",
+        customHeaders: "",
+        reasoningEffort: "none",
+        disableResponseStorage: true,
+        toolProtocol: "auto",
+        auth: { mode: "api_key", status: "disconnected" },
+      },
+    ], "demo-openai");
+    (window as any).__CODELY_E2E__?.setModelRuntimeLock?.({
+      activeProfile: "cloud",
+      activeCloudServerId: "demo-openai",
+      status: "running",
+    });
+  });
+
+  await expect(page.getByTestId("model-runtime-lock-notice")).toBeVisible();
+  await expect(page.getByTestId("cloud-active-profile-button")).toBeDisabled();
+  await expect(page.getByTestId("cloud-lab-toggle")).toBeDisabled();
+  await expect(page.getByTestId("cloud-model-input")).toBeDisabled();
+  await expect(page.getByTestId("cloud-model-refresh")).toBeDisabled();
+  await expect(page.getByTestId("cloud-model-test")).toBeDisabled();
+  await expect(page.getByTestId("cloud-server-name-input")).toBeDisabled();
+
+  await page.getByTestId("settings-tab-local").click();
+  await expect(page.getByTestId("local-active-profile-button")).toBeDisabled();
+  await expect(page.getByTestId("local-provider-select")).toBeDisabled();
+  await expect(page.getByTestId("local-endpoint-input")).toBeDisabled();
+  await expect(page.getByTestId("local-model-select")).toBeDisabled();
+
+  await page.getByTestId("settings-tab-cloud").click();
+  await page.getByTestId("cloud-server-item").filter({ hasText: "Backup Gateway" }).click();
+  await expect(page.getByTestId("cloud-server-name-input")).toBeEnabled();
+  await expect(page.getByTestId("cloud-server-endpoint-input")).toBeEnabled();
+  await expect(page.getByTestId("cloud-model-input")).toBeEnabled();
+
+  await page.getByTestId("cloud-server-name-input").fill("Backup Edited");
+  await page.getByTestId("cloud-server-save").click();
+  await expect(page.getByText("已保存服务器配置")).toBeVisible();
+  await expect(page.getByTestId("cloud-server-item").filter({ hasText: "Backup Edited" })).toHaveCount(1);
+  await expect
+    .poll(async () => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().activeCloudServerId ?? null))
+    .toBe("demo-openai");
+  await expect
+    .poll(async () => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().activeCloudServerModel ?? null))
+    .toBe("gpt-active");
+});
+
 test("OpenAI experimental login shows status and refreshes Codex model candidates", async ({ page }) => {
   await page.goto("/?e2eScenario=cloud-settings-model-select");
   await page.evaluate(() => {
@@ -564,7 +639,7 @@ test("cloud settings can add, switch, refresh, and delete server configs", async
   const secondServer = page.getByTestId("cloud-server-item").filter({ hasText: "Second Gateway" });
   await secondServer.click();
   await expect(page.getByTestId("cloud-model-select")).toHaveValue("second-alpha");
-  await secondServer.locator("span[title='删除服务器']").click();
+  await secondServer.locator("button[title='删除服务器']").click();
 
   await expect(page.getByTestId("cloud-server-item")).toHaveCount(1);
   await expect(page.getByTestId("cloud-server-item")).toContainText("Demo Gateway");

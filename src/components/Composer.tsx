@@ -185,6 +185,7 @@ export default function Composer({
   onToggleAutoApprove,
   onHeightChange,
   activeSessionKey,
+  chatFontSize,
 }) {
   // ── Mention (file search) state ──
   const [showMentionMenu, setShowMentionMenu] = useState(false);
@@ -257,6 +258,7 @@ export default function Composer({
   const isMainMode = selectedMainModeKey === "main_mode";
   const isLightTheme = themeMode === "light";
   const isComposerSubmitting = isStreaming || isSubmitPending;
+  const resolvedComposerFontSize = Math.min(20, Math.max(10, Number(chatFontSize ?? useAppStore.getState().config.chatFontSize) || 13));
   const showExecutionProgress =
     planTasks.length > 0 &&
     (planStage === "ready_to_execute" || planStage === "executing" || planStage === "completed" || isPlanApproved);
@@ -1648,6 +1650,7 @@ export default function Composer({
               ref={handleTextareaRef}
               data-testid="composer-textarea"
               className="max-h-[36vh] min-h-[3.5rem] w-full bg-transparent border-none outline-none resize-none overflow-hidden text-[#e4e4e7] p-4 text-[13px] leading-relaxed placeholder:text-[#a1a1aa]"
+              style={{ fontSize: `${resolvedComposerFontSize}px` }}
               rows={activeDiffTask ? 1 : 2}
               placeholder={composerPlaceholder}
               value={draftInput}

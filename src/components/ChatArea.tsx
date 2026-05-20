@@ -15,7 +15,6 @@ import { hasPlanDraftPreview, hasStructuredPlanProposal } from "../lib/planPropo
 import { sanitizeAIOutput } from "../lib/sanitize";
 import {
   deriveThoughtDisplay,
-  normalizeThinkingPolicy,
   normalizeThoughtSummaryForCompare,
 } from "../lib/thoughtDisplay";
 import { deriveTurnProgressItems } from "../lib/turnProgress";
@@ -59,6 +58,28 @@ const TURN_STATUS_LABELS: Record<string, string> = {
 
 const AGENT_CONTENT_PREVIEW_CHARS = 60_000;
 const STREAMING_AGENT_CONTENT_PREVIEW_CHARS = 16_000;
+
+function resolveTurnProcessFontSize(chatFontSize: number): number {
+  const size = Number(chatFontSize) || 13;
+  return Math.min(18, Math.max(8, size - 2));
+}
+
+const TURN_PROCESS_FONT_REFERENCE_SIZE = 13;
+const TURN_PROCESS_FONT_STEPS = [9, 10, 10.5, 11, 12, 12.5, 13] as const;
+
+function getTurnProcessFontStyle(fontSize: number): React.CSSProperties {
+  const style = {
+    fontSize: `${fontSize}px`,
+    "--turn-process-font-size": `${fontSize}px`,
+  } as React.CSSProperties;
+
+  TURN_PROCESS_FONT_STEPS.forEach((step) => {
+    style[`--turn-process-font-${String(step).replace(".", "-")}px`] =
+      `${((fontSize * step) / TURN_PROCESS_FONT_REFERENCE_SIZE).toFixed(2)}px`;
+  });
+
+  return style;
+}
 
 function UserContextPillRow({
   items,
@@ -1061,6 +1082,7 @@ function TurnChangesCard({
   onOpenDiff,
   defaultExpanded = false,
   embedded = false,
+  chatFontSize,
 }: {
   entries: Array<{
     taskId: number;
@@ -1075,6 +1097,7 @@ function TurnChangesCard({
   onOpenDiff: (taskId: number) => void;
   defaultExpanded?: boolean;
   embedded?: boolean;
+  chatFontSize?: number;
 }) {
   const [expanded, setExpanded] = useState(defaultExpanded);
   if (entries.length === 0) return null;
@@ -1090,7 +1113,10 @@ function TurnChangesCard({
     : language === "zh" ? "展开" : "Expand";
 
   return (
-    <div className={`${embedded ? "" : "ml-9"} rounded-2xl border border-[#1d4ed8]/18 bg-[#060b14] px-4 py-3`}>
+    <div
+      className={`${embedded ? "" : "turn-process-font-scope ml-9"} rounded-2xl border border-[#1d4ed8]/18 bg-[#060b14] px-4 py-3`}
+      style={chatFontSize ? getTurnProcessFontStyle(chatFontSize) : undefined}
+    >
       <button
         type="button"
         data-testid="turn-changes-toggle"
@@ -1331,11 +1357,13 @@ function CompletedToolGroupCard({
 function TurnProcessArchive({
   archive,
   language,
+  chatFontSize,
   renderArchivedItem,
   onOpenDiff,
 }: {
   archive: ReturnType<typeof buildTurnProcessArchiveModel>;
   language: "zh" | "en";
+  chatFontSize: number;
   renderArchivedItem: (item: any) => React.ReactNode;
   onOpenDiff: (taskId: number) => void;
 }) {
@@ -1351,14 +1379,14 @@ function TurnProcessArchive({
     ? language === "zh" ? "收起过程" : "Collapse"
     : language === "zh" ? "展开过程" : "Expand";
   const containerClassName = expanded
-    ? "ml-9 rounded-xl px-1 py-2 ring-1 ring-inset ring-[color-mix(in_srgb,var(--accent-light)_50%,transparent)] transition-all duration-150"
-    : "ml-9 rounded-xl px-1 py-2 ring-1 ring-inset ring-[color-mix(in_srgb,var(--accent-light)_32%,transparent)] transition-all duration-150 hover:ring-[color-mix(in_srgb,var(--accent-light)_44%,transparent)]";
+    ? "turn-process-font-scope ml-9 rounded-xl px-1 py-2 ring-1 ring-inset ring-[color-mix(in_srgb,var(--accent-light)_50%,transparent)] transition-all duration-150"
+    : "turn-process-font-scope ml-9 rounded-xl px-1 py-2 ring-1 ring-inset ring-[color-mix(in_srgb,var(--accent-light)_32%,transparent)] transition-all duration-150 hover:ring-[color-mix(in_srgb,var(--accent-light)_44%,transparent)]";
 
   const thoughtSteps = archive.steps.filter((step) => step.kind === "thinking");
   const timelineSteps = archive.steps.filter((step) => step.kind !== "thinking");
 
   return (
-    <div className={containerClassName}>
+    <div className={containerClassName} style={getTurnProcessFontStyle(chatFontSize)}>
       <button
         type="button"
         data-testid="turn-process-archive-toggle"
@@ -1404,6 +1432,7 @@ function TurnProcessArchive({
                   key={step.id}
                   step={step}
                   language={language}
+                  chatFontSize={chatFontSize}
                   renderArchivedItem={renderArchivedItem}
                   onOpenDiff={onOpenDiff}
                 />
@@ -1492,12 +1521,14 @@ function ArchiveStepIcon({ step }: { step: TurnArchiveStep }) {
 function TurnArchiveStepCard({
   step,
   language,
+  chatFontSize,
   renderArchivedItem,
   onOpenDiff,
   variant = "archive",
 }: {
   step: TurnArchiveStep;
   language: "zh" | "en";
+  chatFontSize: number;
   renderArchivedItem: (item: any) => React.ReactNode;
   onOpenDiff: (taskId: number) => void;
   variant?: "archive" | "live";
@@ -1569,6 +1600,7 @@ function TurnArchiveStepCard({
               language={language}
               onOpenDiff={onOpenDiff}
               embedded
+              chatFontSize={chatFontSize}
             />
           ) : (
             detailItems.map((item: any, index: number) => (
@@ -1586,11 +1618,13 @@ function TurnArchiveStepCard({
 function LiveTurnProcessTimeline({
   model,
   language,
+  chatFontSize,
   renderLiveItem,
   onOpenDiff,
 }: {
   model: ReturnType<typeof buildLiveTurnProcessTimelineModel> | null;
   language: "zh" | "en";
+  chatFontSize: number;
   renderLiveItem: (item: any) => React.ReactNode;
   onOpenDiff: (taskId: number) => void;
 }) {
@@ -1605,7 +1639,8 @@ function LiveTurnProcessTimeline({
   return (
     <div
       data-testid="live-turn-process-timeline"
-      className="ml-9 rounded-xl px-1 py-2 ring-1 ring-inset ring-[color-mix(in_srgb,var(--accent-light)_32%,transparent)] transition-all duration-150"
+      className="turn-process-font-scope ml-9 rounded-xl px-1 py-2 ring-1 ring-inset ring-[color-mix(in_srgb,var(--accent-light)_32%,transparent)] transition-all duration-150"
+      style={getTurnProcessFontStyle(chatFontSize)}
     >
       <button
         type="button"
@@ -1638,6 +1673,7 @@ function LiveTurnProcessTimeline({
               key={step.id}
               step={step}
               language={language}
+              chatFontSize={chatFontSize}
               renderArchivedItem={renderLiveItem}
               onOpenDiff={onOpenDiff}
               variant="live"
@@ -1936,8 +1972,8 @@ export default function ChatArea({
   onQuickReply,
 }) {
   const language = config.language === "en" ? "en" : "zh";
-  const thinkingPolicy = normalizeThinkingPolicy(config.thinkingPolicy);
-  const shouldSuppressThoughtBlocks = thinkingPolicy === "action_only";
+  const resolvedChatFontSize = Math.min(20, Math.max(10, Number(config.chatFontSize) || 13));
+  const resolvedTurnProcessFontSize = resolveTurnProcessFontSize(resolvedChatFontSize);
   const copy = useMemo(() => ({
     planLabel: language === "zh" ? "计划" : "Plan",
     stopLabel: language === "zh" ? "停止" : "Stop",
@@ -2387,8 +2423,8 @@ export default function ChatArea({
                 data-testid="user-message-content"
                 className="whitespace-pre-wrap break-words leading-relaxed text-[#e4e4e7]"
                 style={{
-                  fontSize: `${config.chatFontSize ?? 13}px`,
-                  lineHeight: `${Math.max(22, Math.round((config.chatFontSize ?? 13) * 1.7))}px`,
+                  fontSize: `${resolvedChatFontSize}px`,
+                  lineHeight: `${Math.max(22, Math.round(resolvedChatFontSize * 1.7))}px`,
                 }}
               >
                 {block.content}
@@ -2426,7 +2462,7 @@ export default function ChatArea({
             >
               <MarkdownRenderer
                 content={block.content}
-                baseFontSize={config.chatFontSize ?? 13}
+                baseFontSize={resolvedChatFontSize}
                 sourceId={`system-${block.id}`}
               />
             </div>
@@ -2441,13 +2477,12 @@ export default function ChatArea({
     }
 
     if (block.type === "thought") {
-      if (shouldSuppressThoughtBlocks) return null;
       return (
         <ThoughtBlock
           key={`${block.id}-${index}`}
           block={block}
           language={language}
-          chatFontSize={config.chatFontSize ?? 13}
+          chatFontSize={resolvedChatFontSize}
         />
       );
     }
@@ -2496,11 +2531,11 @@ export default function ChatArea({
     if (block.type === "agent") {
       if (block.hiddenProcess && !block.streaming) return null;
       return (
-        <AgentContentBlock
+          <AgentContentBlock
           key={`${block.id}-${index}`}
           block={block}
           language={language}
-          chatFontSize={config.chatFontSize ?? 13}
+          chatFontSize={resolvedChatFontSize}
         />
       );
     }
@@ -2603,7 +2638,7 @@ export default function ChatArea({
           finalVisibleAgentIndex,
           language,
           includeThoughts: false,
-          includeThoughtNotes: !shouldSuppressThoughtBlocks,
+          includeThoughtNotes: true,
         })
       : null;
     const collapsedProcessCount = finalVisibleAgentBlock
@@ -2626,7 +2661,7 @@ export default function ChatArea({
     const toolExecutionSummary = buildToolExecutionSummary(blocks, language);
     const activeTurnActivity = getActiveTurnActivity(blocks, turn.status, language);
     const liveProcessTimeline = !shouldArchiveCompletedProcess
-      ? buildLiveTurnProcessTimelineModel({ blocks, language, includeThoughts: !shouldSuppressThoughtBlocks })
+      ? buildLiveTurnProcessTimelineModel({ blocks, language, includeThoughts: true })
       : null;
     const liveProcessBlockIds = new Set(
       (liveProcessTimeline?.blocks || [])
@@ -2649,7 +2684,7 @@ export default function ChatArea({
     };
     const latestThoughtBlock = getLatestThoughtBlock(blocks);
     const bottomThoughtSummary =
-      !shouldSuppressThoughtBlocks && turn.status !== "error" && latestThoughtBlock?.isStreaming
+      turn.status !== "error" && latestThoughtBlock?.isStreaming
         ? (() => {
             const summary = getThoughtSummaryText(latestThoughtBlock);
             return liveTimelineContainsProcessText(liveProcessTimeline, summary) ? "" : summary;
@@ -2802,6 +2837,7 @@ export default function ChatArea({
               totalExecutedEdits={totalExecutedEdits}
               language={language}
               onOpenDiff={openDiffForTask}
+              chatFontSize={resolvedTurnProcessFontSize}
             />
           )}
 
@@ -2832,6 +2868,7 @@ export default function ChatArea({
                     <TurnProcessArchive
                       archive={processArchive}
                       language={language}
+                      chatFontSize={resolvedTurnProcessFontSize}
                       renderArchivedItem={renderArchivedBlockItem}
                       onOpenDiff={openDiffForTask}
                     />
@@ -2844,6 +2881,7 @@ export default function ChatArea({
                     <LiveTurnProcessTimeline
                       model={liveProcessTimeline}
                       language={language}
+                      chatFontSize={resolvedTurnProcessFontSize}
                       renderLiveItem={renderBlockItem}
                       onOpenDiff={openDiffForTask}
                     />
@@ -2859,7 +2897,7 @@ export default function ChatArea({
               thoughtSummaryText={bottomThoughtSummary}
               isThinking={isBottomThoughtStreaming}
               language={language}
-              chatFontSize={config.chatFontSize ?? 13}
+              chatFontSize={resolvedChatFontSize}
             />
           )}
         </div>
@@ -2972,7 +3010,7 @@ export default function ChatArea({
           statusToneClass={getTurnStatusTone(topIslandTurnStatusKey || "awaiting_input")}
           language={language}
           themeMode={config.themeMode}
-          chatFontSize={config.chatFontSize ?? 13}
+          chatFontSize={resolvedChatFontSize}
           planTasks={shouldShowPinnedPlanTasks ? planTasks : []}
           planExecutionEvidenceLedger={shouldShowPinnedPlanTasks ? planExecutionEvidenceLedger : []}
           planStage={pinnedPlanTurn ? planStage : "idle"}
@@ -3088,6 +3126,7 @@ export default function ChatArea({
         onToggleAutoApprove={onToggleAutoApprove}
         activeSessionKey={activeSessionKey}
         onHeightChange={setComposerHeight}
+        chatFontSize={resolvedChatFontSize}
       />
       <UserImagePreviewModal
         item={previewImageItem}

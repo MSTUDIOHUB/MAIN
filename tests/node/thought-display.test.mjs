@@ -59,30 +59,12 @@ function loadTranspiledModuleSync(sourcePath) {
 
 const {
   deriveThoughtDisplay,
-  normalizeThinkingPolicy,
-  normalizeThinkingPolicyWithLegacy,
   normalizeThoughtSummaryForCompare,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/thoughtDisplay.ts"));
 
 function countOccurrences(text, needle) {
   return String(text || "").split(needle).length - 1;
 }
-
-test("thinking policy falls back to normal", () => {
-  assert.equal(normalizeThinkingPolicy("action_only"), "action_only");
-  assert.equal(normalizeThinkingPolicy("normal"), "normal");
-  assert.equal(normalizeThinkingPolicy("foo"), "normal");
-  assert.equal(normalizeThinkingPolicy(undefined), "normal");
-});
-
-test("legacy thought display mode migrates to thinking policy", () => {
-  assert.equal(normalizeThinkingPolicyWithLegacy("action_only", "summary"), "action_only");
-  assert.equal(normalizeThinkingPolicyWithLegacy("normal", "hidden"), "normal");
-  assert.equal(normalizeThinkingPolicyWithLegacy(undefined, "hidden"), "action_only");
-  assert.equal(normalizeThinkingPolicyWithLegacy(undefined, "summary"), "normal");
-  assert.equal(normalizeThinkingPolicyWithLegacy(undefined, "detailed"), "normal");
-  assert.equal(normalizeThinkingPolicyWithLegacy(undefined, "unknown"), "normal");
-});
 
 test("thought summary collapses repeated process loops", () => {
   const repeated = [
@@ -155,7 +137,7 @@ test("adaptive latest thought summary keeps a recent useful reasoning chain", ()
     "下一步会检查旧的 App.tsx 结构。",
     "我已经确认归档外层 ring 存在，所以视觉容器不是主要缺口。",
     "现在需要增强每一步意图，把为什么读取、做了什么、结果如何放到同一条时间线。",
-    "最后会补充回归测试，确保 action_only 隐藏 thought 但保留工具意图。",
+    "最后会补充回归测试，确保过程摘要保留工具意图。",
   ].join("\n"), {
     language: "zh",
     mode: "latest",

@@ -51,6 +51,33 @@ export default function ThemeStyles() {
       .theme-plan-progress {
         background: linear-gradient(90deg, var(--accent), var(--accent-light)) !important;
       }
+      .turn-process-font-scope {
+        font-size: var(--turn-process-font-size, 13px);
+      }
+      .turn-process-font-scope :where(button, input, textarea, select, summary, label) {
+        font-size: inherit;
+      }
+      .turn-process-font-scope .text-\\[9px\\] {
+        font-size: var(--turn-process-font-9px, 9px) !important;
+      }
+      .turn-process-font-scope .text-\\[10px\\] {
+        font-size: var(--turn-process-font-10px, 10px) !important;
+      }
+      .turn-process-font-scope .text-\\[10\\.5px\\] {
+        font-size: var(--turn-process-font-10-5px, 10.5px) !important;
+      }
+      .turn-process-font-scope .text-\\[11px\\] {
+        font-size: var(--turn-process-font-11px, 11px) !important;
+      }
+      .turn-process-font-scope .text-\\[12px\\] {
+        font-size: var(--turn-process-font-12px, 12px) !important;
+      }
+      .turn-process-font-scope .text-\\[12\\.5px\\] {
+        font-size: var(--turn-process-font-12-5px, 12.5px) !important;
+      }
+      .turn-process-font-scope .text-\\[13px\\] {
+        font-size: var(--turn-process-font-13px, 13px) !important;
+      }
       html[data-theme="light"] .theme-plan-surface {
         border-color: color-mix(in srgb, var(--accent-hover) 30%, #ffffff 70%) !important;
         background: color-mix(in srgb, var(--accent) 10%, #ffffff 90%) !important;

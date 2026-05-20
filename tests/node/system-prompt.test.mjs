@@ -176,7 +176,6 @@ test("system prompt separates display language from resolved response language",
     undefined,
     undefined,
     "english_core_localized_output",
-    "normal",
     ["read_file", "write_file"],
     null,
     undefined,
@@ -242,7 +241,6 @@ test("system prompt lists only intent-filtered tools when available names are pr
     undefined,
     undefined,
     "english_core_localized_output",
-    "normal",
     ["read_file", "write_file", "replace_in_file"],
   );
 
@@ -370,7 +368,6 @@ test("execute prompt forbids pseudo tool call placeholders", () => {
     },
     "studio_workflow",
     "english_core_localized_output",
-    "normal",
     ["read_file", "replace_in_file"],
   );
 
@@ -419,7 +416,6 @@ test("Unity MCP-first prompt explicitly prioritizes read_console over local scan
     undefined,
     "analyze",
     "english_core_localized_output",
-    "normal",
     ["read_console", "get_project_skeleton", "read_file"],
     { kind: "unity", action: "console_diagnostics" },
     {

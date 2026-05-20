@@ -61,6 +61,7 @@ const {
   buildPlanExplorationBudget,
   isStreamWatchdogTimeoutMessage,
   shouldAttemptPlanClosureGuard,
+  shouldDeferNoProgressStopToPlanReadOnlyConvergence,
   shouldUsePlanNoVisibleTokenWatchdog,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"));
 
@@ -195,6 +196,56 @@ test("plan closure guard runs before empty checkpoint when read-only evidence ex
       consecutiveEmptyResponseCount: 2,
       toolCallCount: 0,
       replyOptionCount: 0,
+    }),
+    false,
+  );
+});
+
+test("plan read-only batches defer no-progress pause to convergence guard", () => {
+  assert.equal(
+    shouldDeferNoProgressStopToPlanReadOnlyConvergence({
+      workflowMode: "plan",
+      isPlanApproved: false,
+      hasPlanDecisionOutput: false,
+      resultCount: 1,
+      successfulReadOnlyResultCount: 1,
+      nonReadOnlySuccessfulResultCount: 0,
+    }),
+    true,
+  );
+
+  assert.equal(
+    shouldDeferNoProgressStopToPlanReadOnlyConvergence({
+      workflowMode: "plan",
+      isPlanApproved: false,
+      hasPlanDecisionOutput: true,
+      resultCount: 1,
+      successfulReadOnlyResultCount: 1,
+      nonReadOnlySuccessfulResultCount: 0,
+    }),
+    false,
+  );
+
+  assert.equal(
+    shouldDeferNoProgressStopToPlanReadOnlyConvergence({
+      workflowMode: "edit",
+      isPlanApproved: false,
+      hasPlanDecisionOutput: false,
+      resultCount: 1,
+      successfulReadOnlyResultCount: 1,
+      nonReadOnlySuccessfulResultCount: 0,
+    }),
+    false,
+  );
+
+  assert.equal(
+    shouldDeferNoProgressStopToPlanReadOnlyConvergence({
+      workflowMode: "plan",
+      isPlanApproved: false,
+      hasPlanDecisionOutput: false,
+      resultCount: 2,
+      successfulReadOnlyResultCount: 1,
+      nonReadOnlySuccessfulResultCount: 1,
     }),
     false,
   );

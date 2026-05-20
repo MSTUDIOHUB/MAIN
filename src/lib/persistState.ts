@@ -23,6 +23,20 @@ export const LEGACY_RUNTIME_PERSIST_KEYS = [
   "input",
 ] as const;
 
+export const LEGACY_CONFIG_PERSIST_KEYS = [
+  "thinkingPolicy",
+  "thoughtDisplayMode",
+] as const;
+
+export function stripLegacyConfigFields(config: unknown): Record<string, unknown> | undefined {
+  if (!config || typeof config !== "object") return undefined;
+  const nextConfig = { ...(config as Record<string, unknown>) };
+  for (const key of LEGACY_CONFIG_PERSIST_KEYS) {
+    delete nextConfig[key];
+  }
+  return nextConfig;
+}
+
 function stripSessionDetailsForLocalPersist(session: any): any | null {
   if (session?.recordingDisabled && session?.storageStatus !== "temporary") return null;
   const { messages: _messages, runtimeSnapshot: _runtimeSnapshot, ...meta } = session || {};
@@ -63,12 +77,15 @@ export function stripLegacyRuntimeFieldsFromPersistedState(
       nextState.sessionsByWorkspace as Record<string, any[]>,
     );
   }
+  if (nextState.config) {
+    nextState.config = stripLegacyConfigFields(nextState.config);
+  }
   return nextState;
 }
 
 export function buildPersistedAppState(state: Record<string, any>): Record<string, unknown> {
   return {
-    config: state.config,
+    config: stripLegacyConfigFields(state.config),
     skills: state.skills,
     sessionsByWorkspace: stripSessionsByWorkspaceForLocalPersist(state.sessionsByWorkspace),
     workspaces: state.workspaces,

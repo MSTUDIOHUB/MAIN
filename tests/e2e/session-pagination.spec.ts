@@ -412,10 +412,15 @@ test("deleting the current empty third session restores the previous session and
     };
   });
 
-  page.on("dialog", (dialog) => dialog.accept());
   await page.goto("/");
 
   await page.getByTestId("session-delete-3003").click({ force: true });
+  await expect(page.getByTestId("delete-session-confirmation")).toBeVisible();
+  await expect(page.getByTestId("delete-session-confirmation")).toContainText("不可恢复");
+  await page.getByTestId("delete-session-cancel").click();
+  await expect(page.getByTestId("session-item-3003")).toContainText("Third Empty Session");
+  await page.getByTestId("session-delete-3003").click({ force: true });
+  await page.getByTestId("delete-session-confirm").click();
   await expect(page.getByText("Second answer survives delete")).toBeVisible({ timeout: 1500 });
   await page.waitForTimeout(1000);
   await expect(page.getByText("Second answer survives delete")).toBeVisible();
@@ -540,10 +545,15 @@ test("deleting the first visible current session selects the next visible sessio
     };
   });
 
-  page.on("dialog", (dialog) => dialog.accept());
   await page.goto("/");
 
   await page.getByTestId("session-delete-3101").click({ force: true });
+  await expect(page.getByTestId("delete-session-confirmation")).toBeVisible();
+  await expect(page.getByTestId("delete-session-confirmation")).toContainText("不可恢复");
+  await page.getByTestId("delete-session-cancel").click();
+  await expect(page.getByTestId("session-item-3101")).toContainText("First Visible Session");
+  await page.getByTestId("session-delete-3101").click({ force: true });
+  await page.getByTestId("delete-session-confirm").click();
   await expect(page.getByText("Next visible content")).toBeVisible();
   await expect(page.getByTestId("session-item-3102")).toContainText("Second Visible Session");
 });

@@ -1,5 +1,3 @@
-export type ThinkingPolicy = "normal" | "action_only";
-
 export interface ThoughtDisplayOptions {
   language?: "zh" | "en";
   maxSummaryLines?: number;
@@ -18,26 +16,6 @@ const ADAPTIVE_SUMMARY_LINES = 12;
 const ADAPTIVE_SUMMARY_CHAR_BUDGET = 1800;
 const SYNTHETIC_VISIBLE_CONCLUSION_ZH = "后台思考已折叠，模型尚未生成可见回复或可执行动作。";
 const SYNTHETIC_VISIBLE_CONCLUSION_RE = /后台思考已折叠[，,]\s*模型尚未生成可见回复或可执行动作。?/;
-
-export function normalizeThinkingPolicy(value: unknown): ThinkingPolicy {
-  return value === "action_only" ? "action_only" : "normal";
-}
-
-export function normalizeThinkingPolicyWithLegacy(
-  thinkingPolicyValue: unknown,
-  legacyThoughtDisplayModeValue: unknown,
-): ThinkingPolicy {
-  if (thinkingPolicyValue === "normal" || thinkingPolicyValue === "action_only") {
-    return thinkingPolicyValue;
-  }
-  if (legacyThoughtDisplayModeValue === "hidden") {
-    return "action_only";
-  }
-  if (legacyThoughtDisplayModeValue === "summary" || legacyThoughtDisplayModeValue === "detailed") {
-    return "normal";
-  }
-  return "normal";
-}
 
 function normalizeForCompare(text: string): string {
   return String(text || "")

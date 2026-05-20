@@ -798,7 +798,7 @@ function deriveStreamSettings(config: AppConfig): StreamSettings {
     tokenRef: config.cloudExperimentalLoginEnabled === true ? config.cloud.auth?.tokenRef : undefined,
     customHeaders: config.cloud.customHeaders || "",
     disableResponseStorage: config.cloud.disableResponseStorage ?? true,
-    reasoningEffort: config.thinkingPolicy === "action_only" ? "none" : (config.cloud.reasoningEffort ?? "none"),
+    reasoningEffort: config.cloud.reasoningEffort ?? "none",
     toolProtocol: normalizeCloudToolProtocol(config.cloud.toolProtocol),
     // Cloud profile should not inherit the local KV-cache/context limit.
     contextLimit: undefined,
@@ -2118,6 +2118,19 @@ export function shouldAttemptPlanClosureGuard(input: {
   if ((input.consecutiveEmptyResponseCount ?? 0) >= 2) return true;
   if (input.usedPlanRecoveryPrompt) return true;
   return typeof input.rejectedVisibleChars === "number" && input.rejectedVisibleChars > 0 && input.rejectedVisibleChars < 280;
+}
+
+export function shouldDeferNoProgressStopToPlanReadOnlyConvergence(input: {
+  workflowMode: "chat" | "edit" | "plan";
+  isPlanApproved: boolean;
+  hasPlanDecisionOutput: boolean;
+  resultCount: number;
+  successfulReadOnlyResultCount: number;
+  nonReadOnlySuccessfulResultCount: number;
+}): boolean {
+  if (input.workflowMode !== "plan" || input.isPlanApproved || input.hasPlanDecisionOutput) return false;
+  if (input.resultCount <= 0 || input.successfulReadOnlyResultCount <= 0) return false;
+  return input.nonReadOnlySuccessfulResultCount === 0;
 }
 
 export function buildPlanExplorationBudget(input: {
@@ -4199,7 +4212,6 @@ export async function executeAgentLoop(
       },
       runtimeIntent,
       config.promptLanguageStrategy,
-      config.thinkingPolicy ?? "normal",
       availableToolNameList,
       callbacks.getCommandDirective?.() ?? null,
       {
@@ -5325,7 +5337,7 @@ export async function executeAgentLoop(
     const normalizedBase = normalizeAssistantTurn(streamResult);
     const normalized = ensureVisibleConclusionWithPolicy(
       normalizedBase,
-      config.thinkingPolicy !== "action_only",
+      true,
     );
     if (isAssistantTurnEmpty(normalized)) {
       if (workflowMode === "plan" && !callbacks.getIsPlanApproved() && isReviewablePlanStage(callbacks.getPlanStage())) {
@@ -5762,7 +5774,7 @@ export async function executeAgentLoop(
       });
     }
 
-    if (effectiveToolCalls.length > 0 && !visibleAssistantText.trim() && config.thinkingPolicy !== "action_only") {
+    if (effectiveToolCalls.length > 0 && !visibleAssistantText.trim()) {
       const narration = buildToolActionNarration({
         calls: effectiveToolCalls,
         workspace,
@@ -5776,7 +5788,6 @@ export async function executeAgentLoop(
           iteration,
           workflowMode,
           turnIntent,
-          thinkingPolicy: config.thinkingPolicy,
           toolCalls: effectiveToolCalls.length,
           toolNames: effectiveToolCalls.map((call) => call.name).slice(0, 8),
         });
@@ -7223,6 +7234,26 @@ export async function executeAgentLoop(
       evidenceKeys: [...taskTargetingEvidence].slice(-8),
     });
 
+    const successfulReadOnlyExplorationResults = allResults.filter((result) =>
+      !result.isError && PLAN_EXPLORATION_READ_ONLY_TOOLS.has(result.name)
+    );
+    const nonReadOnlySuccessfulResultCount = allResults.filter((result) =>
+      !result.isError && !PLAN_EXPLORATION_READ_ONLY_TOOLS.has(result.name)
+    ).length;
+    const hasPlanDecisionOutput =
+      hasStructuredProposal ||
+      finalReplyOptions.length > 0 ||
+      isReviewablePlanStage(callbacks.getPlanStage()) ||
+      allResults.some(isSuccessfulPlanArtifactWriteResult);
+    const isUnapprovedPlanReadOnlyBatch = shouldDeferNoProgressStopToPlanReadOnlyConvergence({
+      workflowMode,
+      isPlanApproved: callbacks.getIsPlanApproved(),
+      hasPlanDecisionOutput,
+      resultCount: allResults.length,
+      successfulReadOnlyResultCount: successfulReadOnlyExplorationResults.length,
+      nonReadOnlySuccessfulResultCount,
+    });
+
     const noProgressBatchSignature = buildNoProgressBatchSignature(allResults);
     if (noProgressBatchSignature) {
       if (noProgressBatchSignature === lastNoProgressBatchSignature) {
@@ -7237,40 +7268,49 @@ export async function executeAgentLoop(
     }
 
     if (noProgressBatchRepeatCount >= MAX_NO_PROGRESS_LOOP_REPEATS) {
-      const remainingText = remainingTaskForDigest?.text || (
-        callbacks.getPreferredLanguage() === "zh"
-          ? "先重新核对当前目标与参数，再选择不同策略继续。"
-          : "Recheck current targets and parameters, then continue with a different strategy."
-      );
-      logAgentEvent("loop_stop", {
-        reason: "no_progress_batch_loop",
-        iteration,
-        repeats: noProgressBatchRepeatCount,
-      });
-      emitTaskOrchestratorPhase("PAUSED", {
-        reason: "no_progress_batch_loop",
-        iteration,
-        repeats: noProgressBatchRepeatCount,
-        remainingTask: remainingText,
-      });
-      callbacks.onNonActionableStop(
-        callbacks.getPreferredLanguage() === "zh"
-          ? [
-              "执行已暂停：连续多轮工具结果没有实质变化。",
-              "这通常意味着当前策略在原地重复，继续重试只会消耗上下文。",
-              "",
-              `建议下一步：${remainingText}`,
-            ].join("\n")
-          : [
-              "Execution paused: consecutive tool batches showed no material progress.",
-              "This usually means the current strategy is repeating in place and further retries will only consume context.",
-              "",
-              `Suggested next step: ${remainingText}`,
-            ].join("\n"),
-        "no_action",
-      );
-      callbacks.onStatusChange("idle");
-      return;
+      if (isUnapprovedPlanReadOnlyBatch) {
+        logAgentEvent("no_progress_deferred_to_plan_readonly_convergence", {
+          iteration,
+          repeats: noProgressBatchRepeatCount,
+          batches: planReadOnlyConvergenceBatches,
+          tools: planReadOnlyConvergenceTools,
+        });
+      } else {
+        const remainingText = remainingTaskForDigest?.text || (
+          callbacks.getPreferredLanguage() === "zh"
+            ? "先重新核对当前目标与参数，再选择不同策略继续。"
+            : "Recheck current targets and parameters, then continue with a different strategy."
+        );
+        logAgentEvent("loop_stop", {
+          reason: "no_progress_batch_loop",
+          iteration,
+          repeats: noProgressBatchRepeatCount,
+        });
+        emitTaskOrchestratorPhase("PAUSED", {
+          reason: "no_progress_batch_loop",
+          iteration,
+          repeats: noProgressBatchRepeatCount,
+          remainingTask: remainingText,
+        });
+        callbacks.onNonActionableStop(
+          callbacks.getPreferredLanguage() === "zh"
+            ? [
+                "执行已暂停：连续多轮工具结果没有实质变化。",
+                "这通常意味着当前策略在原地重复，继续重试只会消耗上下文。",
+                "",
+                `建议下一步：${remainingText}`,
+              ].join("\n")
+            : [
+                "Execution paused: consecutive tool batches showed no material progress.",
+                "This usually means the current strategy is repeating in place and further retries will only consume context.",
+                "",
+                `Suggested next step: ${remainingText}`,
+              ].join("\n"),
+          "no_action",
+        );
+        callbacks.onStatusChange("idle");
+        return;
+      }
     }
 
     for (const result of allResults) {
@@ -7319,21 +7359,6 @@ export async function executeAgentLoop(
         content: unityMcpFallbackPrompt,
       });
     }
-
-    const successfulReadOnlyExplorationResults = allResults.filter((result) =>
-      !result.isError && PLAN_EXPLORATION_READ_ONLY_TOOLS.has(result.name)
-    );
-    const isUnapprovedPlanReadOnlyBatch =
-      workflowMode === "plan" &&
-      !callbacks.getIsPlanApproved() &&
-      allResults.length > 0 &&
-      successfulReadOnlyExplorationResults.length > 0 &&
-      allResults.every((result) => result.isError || PLAN_EXPLORATION_READ_ONLY_TOOLS.has(result.name));
-    const hasPlanDecisionOutput =
-      hasStructuredProposal ||
-      finalReplyOptions.length > 0 ||
-      isReviewablePlanStage(callbacks.getPlanStage()) ||
-      allResults.some(isSuccessfulPlanArtifactWriteResult);
 
     if (isUnapprovedPlanReadOnlyBatch && !hasPlanDecisionOutput) {
       planReadOnlyConvergenceBatches += 1;

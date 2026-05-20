@@ -57,7 +57,6 @@ import {
   normalizeCloudAuth,
   normalizeCloudServerState,
 } from "../lib/cloudServers";
-import { normalizeThinkingPolicy } from "../lib/thoughtDisplay";
 import { APP_ICON_ASSETS, applyAppIconVariant, normalizeAppIconVariant, type AppIconVariant } from "../lib/appIcon";
 
 function buildCloudConnectionFingerprint(server: any, apiFormatOverride?: unknown, modelOverride?: unknown): string {
@@ -165,9 +164,6 @@ const SETTINGS_COPY = {
     responseLanguageSystemPreferred: "系统语言优先（显式指令可切换）",
     enabled: "已启用",
     disabled: "已关闭",
-    thinkingPolicyNormalDesc: "显示过滤后的关键过程说明。",
-    thinkingPolicyActionOnlyDesc: "不显示过程，仅保留结论与执行动作。",
-
     mcpServerTitle: "MCP 服务器",
     mcpScanTools: "扫描工具",
     mcpScanning: "扫描中...",
@@ -384,9 +380,6 @@ const SETTINGS_COPY = {
     responseLanguageSystemPreferred: "Prefer System Language (Explicit Override)",
     enabled: "Enabled",
     disabled: "Disabled",
-    thinkingPolicyNormalDesc: "Show filtered key process notes in the chat stream.",
-    thinkingPolicyActionOnlyDesc: "Hide process notes and keep only conclusions and actions.",
-
     mcpServerTitle: "MCP Servers",
     mcpScanTools: "Scan Tools",
     mcpScanning: "Scanning...",
@@ -1629,6 +1622,7 @@ export default function SettingsModal({
   lastUpdateCheckedAt = null,
   onCheckForUpdate,
   onInstallUpdate,
+  modelRuntimeLock,
 }: {
   isOpen: boolean;
   onClose: () => void;
@@ -1651,6 +1645,12 @@ export default function SettingsModal({
   lastUpdateCheckedAt?: number | null;
   onCheckForUpdate?: () => void;
   onInstallUpdate?: () => void;
+  modelRuntimeLock?: {
+    isLocked: boolean;
+    activeProfile?: "local" | "cloud";
+    activeCloudServerId?: string;
+    reason?: string;
+  };
 }) {
   const [availableModels, setAvailableModels] = useState([]);
   const [cloudModelsByServer, setCloudModelsByServer] = useState<Record<string, string[]>>({});
@@ -1689,11 +1689,11 @@ export default function SettingsModal({
     mcpServerTitle: t.mcpServers || SETTINGS_COPY[language].mcpServerTitle,
     mcpScanning: t.mcpScanning || SETTINGS_COPY[language].mcpScanning,
   };
-  const thinkingPolicy = normalizeThinkingPolicy(config.thinkingPolicy);
-  const thinkingPolicyOptions = [
-    { value: "normal", label: t.thinkingPolicyNormal, description: copy.thinkingPolicyNormalDesc },
-    { value: "action_only", label: t.thinkingPolicyActionOnly, description: copy.thinkingPolicyActionOnlyDesc },
-  ];
+  const isModelRuntimeLocked = modelRuntimeLock?.isLocked === true;
+  const modelRuntimeLockText = language === "zh"
+    ? "模型正在执行中，当前执行模型配置已锁定。"
+    : "A model run is active, so the current execution model is locked.";
+  const canChangeCurrentModel = !isModelRuntimeLocked;
   const appIconOptions: Array<{ value: AppIconVariant; label: string; src: string }> = [
     { value: "light", label: copy.appIconLight, src: APP_ICON_ASSETS.light },
     { value: "dark", label: copy.appIconDark, src: APP_ICON_ASSETS.dark },
@@ -1808,6 +1808,7 @@ export default function SettingsModal({
   }, [isOpen]);
 
   const handleProviderChange = (e) => {
+    if (!canChangeCurrentModel) return;
     const provider = e.target.value;
     skipNextLocalModelAutoPickRef.current = true;
     let endpoint = config.local.endpoint;
@@ -1842,6 +1843,10 @@ export default function SettingsModal({
   };
 
   const fetchModels = useCallback(async (endpointOverride?: string, providerOverride?: string) => {
+    if (!canChangeCurrentModel) {
+      setLocalFetchMsg({ text: modelRuntimeLockText, type: "error" });
+      return;
+    }
     setIsFetchingModels(true);
     setAvailableModels([]);
     setLocalFetchMsg(null);
@@ -1901,16 +1906,16 @@ export default function SettingsModal({
     skipNextLocalModelAutoPickRef.current = false;
     setLocalFetchMsg({ text: copy.localFetchError, type: 'error' });
     setIsFetchingModels(false);
-  }, [config, copy]);
+  }, [canChangeCurrentModel, config, copy, modelRuntimeLockText]);
 
   // Auto-fetch models when local tab opens
   useEffect(() => {
-    if (isOpen && settingsTab === 'local' && !hasAutoFetched.current) {
+    if (isOpen && settingsTab === 'local' && !hasAutoFetched.current && canChangeCurrentModel) {
       hasAutoFetched.current = true;
       fetchModels();
     }
     if (!isOpen) hasAutoFetched.current = false;
-  }, [isOpen, settingsTab]);
+  }, [canChangeCurrentModel, isOpen, settingsTab]);
 
   // Re-fetch when provider or endpoint changes
   const prevProvider = useRef(config.local.provider);
@@ -1919,11 +1924,11 @@ export default function SettingsModal({
     if (prevProvider.current !== config.local.provider || prevEndpoint.current !== config.local.endpoint) {
       prevProvider.current = config.local.provider;
       prevEndpoint.current = config.local.endpoint;
-      if (hasAutoFetched.current) {
+      if (hasAutoFetched.current && canChangeCurrentModel) {
         fetchModels(config.local.endpoint, config.local.provider);
       }
     }
-  }, [config.local.provider, config.local.endpoint]);
+  }, [canChangeCurrentModel, config.local.provider, config.local.endpoint, fetchModels]);
 
   const cloudServerState = useMemo(() => normalizeCloudServerState({
     cloud: config.cloud,
@@ -2001,6 +2006,15 @@ export default function SettingsModal({
   const activeCloudConnectionStatus = cloudConnectionStatus?.fingerprint === cloudConnectionFingerprint
     ? cloudConnectionStatus
     : null;
+  const lockedCloudServerId = modelRuntimeLock?.activeProfile === "cloud"
+    ? String(modelRuntimeLock.activeCloudServerId || "")
+    : "";
+  const isLockedCloudDraftServer = Boolean(
+    isModelRuntimeLocked &&
+    lockedCloudServerId &&
+    cloudDraftServer?.id === lockedCloudServerId,
+  );
+  const canEditCloudDraftServer = !isLockedCloudDraftServer;
 
   useEffect(() => {
     cloudDraftServerRef.current = cloudDraftServer;
@@ -2105,16 +2119,21 @@ export default function SettingsModal({
       const nextServers = exists
         ? state.cloudServers.map((item) => item.id === savedServer.id ? savedServer : item)
         : [...state.cloudServers, savedServer];
-      return commitCloudServers(nextServers, savedServer.id, prev);
+      return commitCloudServers(
+        nextServers,
+        isModelRuntimeLocked ? state.activeCloudServerId : savedServer.id,
+        prev,
+      );
     });
     setCloudDraftServer({ ...savedServer });
     setCloudDraftMode("saved");
     return savedServer;
-  }, [commitCloudServers, setConfig]);
+  }, [commitCloudServers, isModelRuntimeLocked, setConfig]);
 
   const confirmCloudModelSelection = useCallback((model, serverOverride = null) => {
     const sourceServer = serverOverride || cloudDraftServer;
     if (!sourceServer) return;
+    if (isLockedCloudDraftServer && sourceServer.id === cloudDraftServer?.id) return;
     const nextModel = String(model || "").trim();
     const nextServer = { ...sourceServer, model: nextModel };
 
@@ -2126,7 +2145,7 @@ export default function SettingsModal({
     if (canPersistServer) {
       persistCloudServer(nextServer);
     }
-  }, [cloudDraftServer, cloudServers, persistCloudServer]);
+  }, [cloudDraftServer, cloudServers, isLockedCloudDraftServer, persistCloudServer]);
 
   const serializeCloudServerForCompare = useCallback((server) => {
     if (!server) return "";
@@ -2154,6 +2173,7 @@ export default function SettingsModal({
     : serializeCloudServerForCompare(cloudDraftServer) !== serializeCloudServerForCompare(savedDraftSource);
   const canSaveCloudServer = Boolean(
     cloudDraftServer &&
+    canEditCloudDraftServer &&
     String(cloudDraftServer.name || "").trim() &&
     (cloudUsesOAuth || String(cloudDraftServer.endpoint || "").trim()),
   );
@@ -2165,14 +2185,16 @@ export default function SettingsModal({
     if (previousServerId && previousServerId !== serverId) {
       clearOpenAiProbeCache(previousServerId);
     }
-    setConfig((prev) => {
-      const state = normalizeCloudServerState({
-        cloud: prev.cloud,
-        cloudServers: prev.cloudServers,
-        activeCloudServerId: prev.activeCloudServerId,
+    if (!isModelRuntimeLocked) {
+      setConfig((prev) => {
+        const state = normalizeCloudServerState({
+          cloud: prev.cloud,
+          cloudServers: prev.cloudServers,
+          activeCloudServerId: prev.activeCloudServerId,
+        });
+        return commitCloudServers(state.cloudServers, serverId, prev);
       });
-      return commitCloudServers(state.cloudServers, serverId, prev);
-    });
+    }
     setCloudDraftServer({ ...targetServer });
     setCloudDraftMode("saved");
     setCloudFetchMsg(null);
@@ -2182,7 +2204,7 @@ export default function SettingsModal({
     setCloudAuthSession(null);
     setCloudConnectionStatus(null);
     setCloudModelInputMode((cloudModelsByServer[serverId] || []).length > 0 ? "select" : "manual");
-  }, [clearOpenAiProbeCache, cloudDraftServer?.id, cloudModelsByServer, cloudServers, commitCloudServers, setConfig]);
+  }, [clearOpenAiProbeCache, cloudDraftServer?.id, cloudModelsByServer, cloudServers, commitCloudServers, isModelRuntimeLocked, setConfig]);
 
   const addCloudServer = useCallback(() => {
     const nextDraft = makeBlankCloudServerDraft();
@@ -2199,6 +2221,10 @@ export default function SettingsModal({
 
   const saveCloudServer = useCallback(() => {
     if (!cloudDraftServer) return;
+    if (!canEditCloudDraftServer) {
+      setCloudSaveMsg({ text: modelRuntimeLockText, type: "error" });
+      return;
+    }
     const name = String(cloudDraftServer.name || "").trim();
     const endpoint = String(cloudDraftServer.endpoint || "").trim();
     if (!name || (!cloudUsesOAuth && !endpoint)) {
@@ -2212,9 +2238,13 @@ export default function SettingsModal({
     setCloudAuthSession(null);
     setCloudConnectionStatus(null);
     setCloudSaveMsg({ text: copy.cloudSaved, type: "success" });
-  }, [cloudDraftServer, cloudUsesOAuth, copy, persistCloudServer]);
+  }, [canEditCloudDraftServer, cloudDraftServer, cloudUsesOAuth, copy, modelRuntimeLockText, persistCloudServer]);
 
   const removeCloudServer = useCallback((serverId) => {
+    if (isModelRuntimeLocked && (serverId === activeCloudServerId || serverId === lockedCloudServerId)) {
+      setCloudSaveMsg({ text: modelRuntimeLockText, type: "error" });
+      return;
+    }
     if (cloudDraftMode === "new" && cloudDraftServer?.id === serverId) {
       setCloudDraftServer(savedActiveCloudServer ? { ...savedActiveCloudServer } : null);
       setCloudDraftMode(savedActiveCloudServer ? "saved" : null);
@@ -2260,10 +2290,10 @@ export default function SettingsModal({
     setCloudAuthSession(null);
     setCloudConnectionStatus(null);
     setCloudSaveMsg(null);
-  }, [clearOpenAiProbeCache, cloudDraftMode, cloudDraftServer, cloudModelsByServer, cloudServers, commitCloudServers, savedActiveCloudServer, setConfig]);
+  }, [activeCloudServerId, clearOpenAiProbeCache, cloudDraftMode, cloudDraftServer, cloudModelsByServer, cloudServers, commitCloudServers, isModelRuntimeLocked, lockedCloudServerId, modelRuntimeLockText, savedActiveCloudServer, setConfig]);
 
   const handleCloudProtocolChange = (e) => {
-    if (!cloudDraftServer) return;
+    if (!cloudDraftServer || !canEditCloudDraftServer) return;
     const nextProtocol = normalizeCloudProtocol(e.target.value);
     const nextEndpoint = defaultCloudEndpointForProtocol(nextProtocol);
     const currentEndpoint = draftCloudConfig.endpoint || "";
@@ -2286,7 +2316,7 @@ export default function SettingsModal({
   };
 
   const handleCloudApiFormatChange = (e) => {
-    if (cloudApiFormatLockedByOAuth) return;
+    if (cloudApiFormatLockedByOAuth || !canEditCloudDraftServer) return;
     const nextApiFormat = resolveEffectiveCloudApiFormat({
       protocol: cloudProtocol,
       apiFormat: e.target.value,
@@ -2298,7 +2328,7 @@ export default function SettingsModal({
   };
 
   const handleCloudAuthModeChange = useCallback((mode) => {
-    if (!cloudDraftServer) return;
+    if (!cloudDraftServer || !canEditCloudDraftServer) return;
     const nextMode = normalizeCloudAuthMode(mode);
     if (!cloudExperimentalLoginEnabled && nextMode !== "api_key") return;
     const protocolPatch = nextMode === "gemini_google_oauth"
@@ -2327,16 +2357,17 @@ export default function SettingsModal({
     setCloudAuthSession(null);
     setCloudProbeMsg(null);
     setCloudConnectionStatus(null);
-  }, [clearOpenAiProbeCache, cloudDraftServer, cloudExperimentalLoginEnabled, draftCloudConfig.apiKey, updateCloudDraftServer]);
+  }, [canEditCloudDraftServer, clearOpenAiProbeCache, cloudDraftServer, cloudExperimentalLoginEnabled, draftCloudConfig.apiKey, updateCloudDraftServer]);
 
   const updateCloudDraftAuth = useCallback((patch) => {
+    if (!canEditCloudDraftServer) return;
     const nextAuth = normalizeCloudAuth({
       ...cloudAuth,
       ...patch,
     }, normalizeCloudProtocol(cloudDraftServer?.protocol));
     updateCloudDraftServer({ auth: nextAuth }, { clearModels: true });
     setCloudConnectionStatus(null);
-  }, [cloudAuth, cloudDraftServer?.protocol, updateCloudDraftServer]);
+  }, [canEditCloudDraftServer, cloudAuth, cloudDraftServer?.protocol, updateCloudDraftServer]);
 
   const finishCloudAuthSession = useCallback(async (session) => {
     if (!session || !cloudDraftServer) return null;
@@ -2375,6 +2406,7 @@ export default function SettingsModal({
   }, [cloudAuthMode, cloudDraftServer, copy, updateCloudDraftAuth]);
 
   const beginCloudAuth = useCallback(async () => {
+    if (!canEditCloudDraftServer) return;
     if (!cloudExperimentalLoginEnabled || !cloudDraftServer || cloudAuthMode === "api_key" || cloudAuthBusy) return;
     setCloudAuthBusy(true);
     setCloudAuthMsg(null);
@@ -2409,9 +2441,10 @@ export default function SettingsModal({
     } finally {
       setCloudAuthBusy(false);
     }
-  }, [cloudAuthBusy, cloudAuthMode, cloudDraftServer, cloudExperimentalLoginEnabled, cloudProtocol, copy, finishCloudAuthSession]);
+  }, [canEditCloudDraftServer, cloudAuthBusy, cloudAuthMode, cloudDraftServer, cloudExperimentalLoginEnabled, cloudProtocol, copy, finishCloudAuthSession]);
 
   const logoutCloudAuth = useCallback(async () => {
+    if (!canEditCloudDraftServer) return;
     if (!cloudExperimentalLoginEnabled || !cloudDraftServer || cloudAuthMode === "api_key") return;
     setCloudAuthBusy(true);
     try {
@@ -2426,13 +2459,17 @@ export default function SettingsModal({
     } finally {
       setCloudAuthBusy(false);
     }
-  }, [clearOpenAiProbeCache, cloudAuth.tokenRef, cloudAuthMode, cloudDraftServer, cloudExperimentalLoginEnabled, copy, updateCloudDraftAuth]);
+  }, [canEditCloudDraftServer, clearOpenAiProbeCache, cloudAuth.tokenRef, cloudAuthMode, cloudDraftServer, cloudExperimentalLoginEnabled, copy, updateCloudDraftAuth]);
 
   const refreshCloudModels = useCallback(async (serverOverride = null) => {
     if (isFetchingCloudModels) return;
     const targetServer = serverOverride || cloudDraftServer;
     if (!targetServer) {
       setCloudFetchMsg({ text: copy.cloudSelectServerFirst, type: "error" });
+      return;
+    }
+    if (isModelRuntimeLocked && lockedCloudServerId && targetServer.id === lockedCloudServerId) {
+      setCloudFetchMsg({ text: modelRuntimeLockText, type: "error" });
       return;
     }
     const targetServerId = targetServer.id;
@@ -2568,10 +2605,14 @@ export default function SettingsModal({
     } finally {
       setIsFetchingCloudModels(false);
     }
-  }, [cloudDraftServer, cloudExperimentalLoginEnabled, cloudOpenAiLastGoodModelByServer, confirmCloudModelSelection, copy, isFetchingCloudModels, language]);
+  }, [cloudDraftServer, cloudExperimentalLoginEnabled, cloudOpenAiLastGoodModelByServer, confirmCloudModelSelection, copy, isFetchingCloudModels, isModelRuntimeLocked, language, lockedCloudServerId, modelRuntimeLockText]);
 
   const testCloudConnection = useCallback(async () => {
     if (isTestingCloudConnection) return;
+    if (isLockedCloudDraftServer) {
+      setCloudProbeMsg({ text: modelRuntimeLockText, type: "error" });
+      return;
+    }
 
     const endpoint = resolveCloudRuntimeEndpoint(draftCloudConfig, cloudProtocol, cloudAuthMode);
     const testModel = draftCloudConfig.model?.trim() || cloudAvailableModels[0] || "";
@@ -2877,8 +2918,10 @@ export default function SettingsModal({
     draftCloudConfig.model,
     draftCloudConfig.reasoningEffort,
     draftCloudConfig.toolProtocol,
+    isLockedCloudDraftServer,
     isTestingCloudConnection,
     language,
+    modelRuntimeLockText,
     updateCloudDraftServer,
   ]);
 
@@ -3184,6 +3227,7 @@ export default function SettingsModal({
                       <span className="text-[12px] font-mono theme-subtle-bg px-2 py-0.5 rounded border theme-subtle-border">{config.chatFontSize ?? 13} px</span>
                     </div>
                     <input
+                      data-testid="chat-font-size-slider"
                       type="range" min={10} max={20} step={1}
                       value={config.chatFontSize ?? 13}
                       onChange={(e) => setConfig({ ...config, chatFontSize: parseInt(e.target.value) })}
@@ -3195,35 +3239,6 @@ export default function SettingsModal({
                       <span className="absolute -translate-x-1/2" style={{ left: "60%" }}>16</span>
                       <span className="absolute right-0">20</span>
                     </div>
-                  </div>
-                </div>
-
-                {/* THINKING POLICY */}
-                <div className={`${settingsSectionRowClass} border-t border-[#27272a] pt-5`}>
-                  <div>
-                    <label className="block text-[13px] font-bold text-[#e4e4e7]">{t.thinkingPolicy}</label>
-                    <p className="mt-1.5 text-[12px] leading-relaxed text-[#a1a1aa]">{t.thinkingPolicyDesc}</p>
-                  </div>
-                  <div className={`${settingsControlColumnClass} grid gap-3 lg:grid-cols-2`}>
-                    {thinkingPolicyOptions.map((option) => {
-                      const selected = thinkingPolicy === option.value;
-                      return (
-                        <button
-                          key={option.value}
-                          type="button"
-                          data-testid={`thinking-policy-${option.value}`}
-                          aria-pressed={selected}
-                          onClick={() => setConfig({ ...config, thinkingPolicy: option.value })}
-                          className={settingsOptionButtonClass(selected, "min-h-[88px] rounded-lg p-3 text-left")}
-                        >
-                          <span className="flex items-start justify-between gap-3">
-                            <span className={`text-[13px] font-bold ${selected ? "theme-text" : "text-[#e4e4e7]"}`}>{option.label}</span>
-                            <span className={`mt-0.5 h-2.5 w-2.5 shrink-0 rounded-full border ${selected ? "theme-bg theme-glow border-transparent" : "border-[#52525b] bg-transparent"}`} />
-                          </span>
-                          <span className="mt-2 block text-[11.5px] leading-relaxed text-[#a1a1aa]">{option.description}</span>
-                        </button>
-                      );
-                    })}
                   </div>
                 </div>
 
@@ -3386,13 +3401,25 @@ export default function SettingsModal({
               <div className="space-y-6">
                 <div className="flex items-center justify-between">
                   <h3 className="text-[13px] font-bold text-[#a1a1aa] uppercase tracking-wider">{t.localSetup}</h3>
-                  <button onClick={() => setConfig({ ...config, activeProfile: 'local' })} aria-pressed={config.activeProfile === 'local'} className={settingsOptionButtonClass(config.activeProfile === 'local', "rounded px-2.5 py-1.5 text-[11px] font-bold uppercase tracking-wider")}>
+                  <button
+                    data-testid="local-active-profile-button"
+                    onClick={() => canChangeCurrentModel && setConfig({ ...config, activeProfile: 'local' })}
+                    disabled={!canChangeCurrentModel}
+                    aria-pressed={config.activeProfile === 'local'}
+                    title={!canChangeCurrentModel ? modelRuntimeLockText : undefined}
+                    className={settingsOptionButtonClass(config.activeProfile === 'local', "rounded px-2.5 py-1.5 text-[11px] font-bold uppercase tracking-wider disabled:cursor-not-allowed disabled:opacity-45")}
+                  >
                     {config.activeProfile === 'local' ? copy.activeProfile : copy.setAsActive}
                   </button>
                 </div>
+                {isModelRuntimeLocked && (
+                  <p data-testid="model-runtime-lock-notice" className="rounded-md border border-[#3f2f1f] bg-[#18110a] px-3 py-2 text-[11.5px] text-[#fbbf24]">
+                    {modelRuntimeLockText}
+                  </p>
+                )}
                 <div>
                   <label className="block text-[13px] font-bold text-[#e4e4e7] mb-2">{copy.providerEngine}</label>
-                  <select data-testid="local-provider-select" value={config.local.provider} onChange={handleProviderChange} className={settingsSelectClass}>
+                  <select data-testid="local-provider-select" value={config.local.provider} onChange={handleProviderChange} disabled={!canChangeCurrentModel} className={settingsSelectClass}>
                     <option value="LM Studio">LM Studio</option>
                     <option value="Ollama">Ollama</option>
                     <option value="OMLX">OMLX (MLX for Mac)</option>
@@ -3400,7 +3427,7 @@ export default function SettingsModal({
                 </div>
                 <div>
                   <label className="block text-[13px] font-bold text-[#e4e4e7] mb-2">{copy.apiEndpoint}</label>
-                  <input data-testid="local-endpoint-input" type="text" value={config.local.endpoint} onChange={(e) => setConfig({ ...config, local: { ...config.local, endpoint: e.target.value } })} className="w-full bg-[#000000] border border-[#27272a] rounded-md p-2.5 text-[14px] text-white focus:outline-none theme-ring font-mono" />
+                  <input data-testid="local-endpoint-input" type="text" value={config.local.endpoint} disabled={!canChangeCurrentModel} onChange={(e) => setConfig({ ...config, local: { ...config.local, endpoint: e.target.value } })} className="w-full bg-[#000000] border border-[#27272a] rounded-md p-2.5 text-[14px] text-white focus:outline-none theme-ring font-mono disabled:cursor-not-allowed disabled:opacity-60" />
                 </div>
                 {config.local.provider === "OMLX" && (
                   <div>
@@ -3408,9 +3435,10 @@ export default function SettingsModal({
                     <input
                       type="password"
                       value={config.local.apiKey || ""}
+                      disabled={!canChangeCurrentModel}
                       onChange={(e) => setConfig({ ...config, local: { ...config.local, apiKey: e.target.value } })}
                       placeholder={copy.noAuthPlaceholder}
-                      className="w-full bg-[#000000] border border-[#27272a] rounded-md p-2.5 text-[14px] text-white focus:outline-none theme-ring font-mono placeholder:text-[#3f3f46]"
+                      className="w-full bg-[#000000] border border-[#27272a] rounded-md p-2.5 text-[14px] text-white focus:outline-none theme-ring font-mono placeholder:text-[#3f3f46] disabled:cursor-not-allowed disabled:opacity-60"
                     />
                   </div>
                 )}
@@ -3438,6 +3466,7 @@ export default function SettingsModal({
                       <select
                         data-testid="local-tool-protocol-select"
                         value={normalizeLocalToolProtocol(config.local.toolProtocol, config.local.provider)}
+                        disabled={!canChangeCurrentModel}
                         onChange={(e) => setConfig({
                           ...config,
                           local: {
@@ -3462,7 +3491,7 @@ export default function SettingsModal({
                       data-testid="local-model-select"
                       value={config.local.model || ""}
                       onChange={(e) => setConfig({ ...config, local: { ...config.local, model: e.target.value } })}
-                      disabled={isFetchingModels}
+                      disabled={isFetchingModels || !canChangeCurrentModel}
                       className={`${settingsSelectClass} min-w-0 flex-1`}
                     >
                       {isFetchingModels ? (
@@ -3478,7 +3507,7 @@ export default function SettingsModal({
                     </select>
                     <button
                       onClick={() => fetchModels()}
-                      disabled={isFetchingModels}
+                      disabled={isFetchingModels || !canChangeCurrentModel}
                       className="px-3 py-2 text-[12px] font-bold bg-[#18181b] text-[#a1a1aa] hover:text-white border border-[#27272a] rounded-md transition-colors shrink-0 disabled:opacity-50"
                     >
                       {isFetchingModels ? copy.mcpScanning : copy.scanModels}
@@ -3540,8 +3569,10 @@ export default function SettingsModal({
                         role="switch"
                         aria-checked={cloudExperimentalLoginEnabled}
                         aria-label={`${copy.cloudLab} ${cloudExperimentalLoginEnabled ? copy.cloudLabOn : copy.cloudLabOff}`}
-                        onClick={() => setConfig((prev) => ({ ...prev, cloudExperimentalLoginEnabled: prev.cloudExperimentalLoginEnabled !== true }))}
-                        className={`relative inline-flex h-6 w-11 items-center rounded-full border p-0.5 transition-all duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-[#000000] ${
+                        disabled={!canChangeCurrentModel}
+                        title={!canChangeCurrentModel ? modelRuntimeLockText : copy.cloudLabDesc}
+                        onClick={() => canChangeCurrentModel && setConfig((prev) => ({ ...prev, cloudExperimentalLoginEnabled: prev.cloudExperimentalLoginEnabled !== true }))}
+                        className={`relative inline-flex h-6 w-11 items-center rounded-full border p-0.5 transition-all duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-[#000000] disabled:cursor-not-allowed disabled:opacity-45 ${
                           cloudExperimentalLoginEnabled ? "border-transparent shadow-[0_0_12px_var(--accent-subtle)]" : "border-[#3f3f46] bg-[#18181b]"
                         }`}
                         style={cloudExperimentalLoginEnabled ? { backgroundColor: "var(--accent)" } : undefined}
@@ -3553,11 +3584,23 @@ export default function SettingsModal({
                         />
                       </button>
                     </div>
-                    <button onClick={() => setConfig({ ...config, activeProfile: 'cloud' })} aria-pressed={config.activeProfile === 'cloud'} className={settingsOptionButtonClass(config.activeProfile === 'cloud', "rounded px-2.5 py-1.5 text-[11px] font-bold uppercase tracking-wider")}>
+                    <button
+                      data-testid="cloud-active-profile-button"
+                      onClick={() => canChangeCurrentModel && setConfig({ ...config, activeProfile: 'cloud' })}
+                      disabled={!canChangeCurrentModel}
+                      aria-pressed={config.activeProfile === 'cloud'}
+                      title={!canChangeCurrentModel ? modelRuntimeLockText : undefined}
+                      className={settingsOptionButtonClass(config.activeProfile === 'cloud', "rounded px-2.5 py-1.5 text-[11px] font-bold uppercase tracking-wider disabled:cursor-not-allowed disabled:opacity-45")}
+                    >
                       {config.activeProfile === 'cloud' ? copy.activeProfile : copy.setAsActive}
                     </button>
                   </div>
                 </div>
+                {isModelRuntimeLocked && (
+                  <p data-testid="model-runtime-lock-notice" className="rounded-md border border-[#3f2f1f] bg-[#18110a] px-3 py-2 text-[11.5px] text-[#fbbf24]">
+                    {modelRuntimeLockText}
+                  </p>
+                )}
 
                 <section data-testid="cloud-model-panel" className="rounded-lg border border-[#27272a] bg-[#000000] p-4">
                   {cloudDraftServer ? (
@@ -3574,6 +3617,7 @@ export default function SettingsModal({
                           <button
                             data-testid="cloud-model-mode-toggle"
                             onClick={() => {
+                              if (!canEditCloudDraftServer) return;
                               if (cloudModelInputMode === "manual") {
                                 const nextModel = cloudAvailableModels.includes(draftCloudConfig.model)
                                   ? draftCloudConfig.model
@@ -3584,7 +3628,8 @@ export default function SettingsModal({
                               }
                               setCloudModelInputMode("manual");
                             }}
-                            className={settingsOptionButtonClass(false, "rounded px-2.5 py-1.5 text-[11px] font-bold")}
+                            disabled={!canEditCloudDraftServer}
+                            className={settingsOptionButtonClass(false, "rounded px-2.5 py-1.5 text-[11px] font-bold disabled:cursor-not-allowed disabled:opacity-45")}
                           >
                             {cloudModelInputMode === "select" ? copy.manualInput : copy.dropdownSelect}
                           </button>
@@ -3596,7 +3641,7 @@ export default function SettingsModal({
                             data-testid="cloud-model-select"
                             value={draftCloudConfig.model || ""}
                             onChange={(e) => confirmCloudModelSelection(e.target.value)}
-                            disabled={isFetchingCloudModels}
+                            disabled={isFetchingCloudModels || !canEditCloudDraftServer}
                             className={`${settingsSelectClass} min-w-0 flex-1`}
                           >
                             {cloudAvailableModels.map((model) => (
@@ -3609,20 +3654,21 @@ export default function SettingsModal({
                             type="text"
                             value={draftCloudConfig.model || ""}
                             onChange={(e) => confirmCloudModelSelection(e.target.value)}
+                            disabled={!canEditCloudDraftServer}
                             placeholder={cloudModelPlaceholder}
-                            className="min-w-0 flex-1 rounded-md border border-[#27272a] bg-[#000000] p-2.5 font-mono text-[14px] text-white outline-none theme-ring placeholder:text-[#3f3f46]"
+                            className="min-w-0 flex-1 rounded-md border border-[#27272a] bg-[#000000] p-2.5 font-mono text-[14px] text-white outline-none theme-ring placeholder:text-[#3f3f46] disabled:cursor-not-allowed disabled:opacity-60"
                           />
                         )}
                         <button
                           data-testid="cloud-model-refresh"
                           onClick={() => refreshCloudModels()}
-                          disabled={isFetchingCloudModels}
+                          disabled={isFetchingCloudModels || !canEditCloudDraftServer}
                           className="shrink-0 rounded-md border border-[#27272a] bg-[#18181b] px-3 py-2 text-[12px] font-bold text-[#a1a1aa] transition-colors hover:text-white disabled:opacity-50"
                         >{isFetchingCloudModels ? copy.refreshing : copy.refresh}</button>
                         <button
                           data-testid="cloud-model-test"
                           onClick={testCloudConnection}
-                          disabled={isTestingCloudConnection}
+                          disabled={isTestingCloudConnection || !canEditCloudDraftServer}
                           className="shrink-0 rounded-md border border-[#27272a] bg-[#18181b] px-3 py-2 text-[12px] font-bold text-[#a1a1aa] transition-colors hover:text-white disabled:opacity-50"
                         >{isTestingCloudConnection ? copy.testing : copy.test}</button>
                       </div>
@@ -3691,6 +3737,8 @@ export default function SettingsModal({
                         visibleCloudServers.map((server) => {
                           const isSelectedServer = cloudDraftServer?.id === server.id;
                           const isActiveServer = server.id === activeCloudServerId;
+                          const isLockedRunningServer = isModelRuntimeLocked && lockedCloudServerId === server.id;
+                          const canRemoveServer = !(isModelRuntimeLocked && (isActiveServer || isLockedRunningServer));
                           const isUnsavedServer = cloudDraftMode === "new" && cloudDraftServer?.id === server.id && !cloudServers.some((saved) => saved.id === server.id);
                           return (
                             <div
@@ -3722,25 +3770,29 @@ export default function SettingsModal({
                                   </div>
                                   <div className="mt-1 truncate font-mono text-[10px] text-[#71717a]">{server.endpoint || copy.noEndpoint}</div>
                                 </div>
-                                <span
+                                <button
+                                  type="button"
                                   role="button"
                                   tabIndex={0}
                                   onClick={(e) => {
                                     e.stopPropagation();
+                                    if (!canRemoveServer) return;
                                     removeCloudServer(server.id);
                                   }}
                                   onKeyDown={(e) => {
                                     if (e.key === "Enter" || e.key === " ") {
                                       e.preventDefault();
                                       e.stopPropagation();
+                                      if (!canRemoveServer) return;
                                       removeCloudServer(server.id);
                                     }
                                   }}
-                                  className="mt-0.5 rounded p-1 text-[#71717a] opacity-0 transition-colors hover:bg-[#181111] hover:text-[#fca5a5] group-hover:opacity-100"
-                                  title={language === "zh" ? "删除服务器" : "Delete server"}
+                                  disabled={!canRemoveServer}
+                                  className="mt-0.5 rounded p-1 text-[#71717a] opacity-0 transition-colors hover:bg-[#181111] hover:text-[#fca5a5] disabled:cursor-not-allowed disabled:opacity-30 group-hover:opacity-100"
+                                  title={!canRemoveServer ? modelRuntimeLockText : language === "zh" ? "删除服务器" : "Delete server"}
                                 >
                                   <IconTrash className="h-3.5 w-3.5" />
-                                </span>
+                                </button>
                               </div>
                             </div>
                           );
@@ -3760,6 +3812,8 @@ export default function SettingsModal({
                             <p className={`mt-1 text-[11.5px] ${cloudSaveMsg.type === 'error' ? 'text-[#f48771]' : 'text-[#86d9a3]'}`}>{cloudSaveMsg.text}</p>
                           ) : hasCloudDraftChanges ? (
                             <p className="mt-1 text-[11.5px] text-[#facc15]">{copy.unsavedChanges}</p>
+                          ) : isLockedCloudDraftServer ? (
+                            <p className="mt-1 text-[11.5px] text-[#fbbf24]">{modelRuntimeLockText}</p>
                           ) : (
                             <p className="mt-1 text-[11.5px] text-[#71717a]">{copy.savedConfig}</p>
                           )}
@@ -3780,9 +3834,10 @@ export default function SettingsModal({
                             data-testid="cloud-server-name-input"
                             type="text"
                             value={cloudDraftServer.name ?? ""}
+                            disabled={!canEditCloudDraftServer}
                             onChange={(e) => updateCloudDraftServer({ name: e.target.value })}
                             placeholder={copy.cloudServerNamePlaceholder}
-                            className="w-full rounded-md border border-[#27272a] bg-[#000000] p-2.5 text-[14px] text-white outline-none theme-ring placeholder:text-[#3f3f46]"
+                            className="w-full rounded-md border border-[#27272a] bg-[#000000] p-2.5 text-[14px] text-white outline-none theme-ring placeholder:text-[#3f3f46] disabled:cursor-not-allowed disabled:opacity-60"
                           />
                         </div>
 
@@ -3802,7 +3857,8 @@ export default function SettingsModal({
                                 type="button"
                                 data-testid={`cloud-auth-mode-${item.mode}`}
                                 onClick={() => handleCloudAuthModeChange(item.mode)}
-                                className={settingsOptionButtonClass(cloudAuthMode === item.mode, "rounded-md px-3 py-2 text-[12px] font-bold")}
+                                disabled={!canEditCloudDraftServer}
+                                className={settingsOptionButtonClass(cloudAuthMode === item.mode, "rounded-md px-3 py-2 text-[12px] font-bold disabled:cursor-not-allowed disabled:opacity-45")}
                               >
                                 {item.label}
                               </button>
@@ -3851,7 +3907,7 @@ export default function SettingsModal({
                                   <button
                                     type="button"
                                     onClick={logoutCloudAuth}
-                                    disabled={cloudAuthBusy}
+                                    disabled={cloudAuthBusy || !canEditCloudDraftServer}
                                     className="rounded-md border border-[#27272a] bg-[#18181b] px-3 py-2 text-[12px] font-bold text-[#a1a1aa] transition-colors hover:text-white disabled:opacity-50"
                                   >
                                     {copy.logout}
@@ -3861,7 +3917,7 @@ export default function SettingsModal({
                                     type="button"
                                     data-testid="cloud-auth-login"
                                     onClick={beginCloudAuth}
-                                    disabled={cloudAuthBusy}
+                                    disabled={cloudAuthBusy || !canEditCloudDraftServer}
                                     className="rounded-md theme-bg theme-bg-hover px-3 py-2 text-[12px] font-bold text-white transition-colors disabled:opacity-50"
                                   >
                                     {cloudAuthBusy ? copy.loggingIn : copy.login}
@@ -3892,6 +3948,7 @@ export default function SettingsModal({
                           <select
                             value={cloudProtocol}
                             onChange={handleCloudProtocolChange}
+                            disabled={!canEditCloudDraftServer}
                             className={settingsSelectClass}
                           >
                             <option value="openai">OpenAI Compatible</option>
@@ -3907,7 +3964,7 @@ export default function SettingsModal({
                             data-testid="cloud-server-endpoint-input"
                             type="text"
                             value={draftCloudConfig.endpoint || ""}
-                            disabled={cloudAuthMode === "gemini_google_oauth"}
+                            disabled={cloudAuthMode === "gemini_google_oauth" || !canEditCloudDraftServer}
                             onChange={(e) => {
                               updateCloudDraftServer({ endpoint: e.target.value }, { clearModels: true });
                             }}
@@ -3924,11 +3981,12 @@ export default function SettingsModal({
                               data-testid="cloud-server-api-key-input"
                               type="password"
                               value={draftCloudConfig.apiKey || ""}
+                              disabled={!canEditCloudDraftServer}
                               onChange={(e) => {
                                 updateCloudDraftServer({ apiKey: e.target.value }, { clearModels: true });
                               }}
                               placeholder={cloudApiKeyPlaceholder}
-                              className="w-full rounded-md border border-[#27272a] bg-[#000000] p-2.5 font-mono text-[14px] text-white outline-none theme-ring placeholder:text-[#3f3f46]"
+                              className="w-full rounded-md border border-[#27272a] bg-[#000000] p-2.5 font-mono text-[14px] text-white outline-none theme-ring placeholder:text-[#3f3f46] disabled:cursor-not-allowed disabled:opacity-60"
                             />
                           </div>
                         )}
@@ -3957,7 +4015,7 @@ export default function SettingsModal({
                                   data-testid="cloud-api-format-select"
                                   value={cloudApiFormat}
                                   onChange={handleCloudApiFormatChange}
-                                  disabled={cloudApiFormatLockedByOAuth}
+                                  disabled={cloudApiFormatLockedByOAuth || !canEditCloudDraftServer}
                                   className={settingsSelectClass}
                                 >
                                   <option value="chat_completions">OpenAI Chat Completions</option>
@@ -3975,6 +4033,7 @@ export default function SettingsModal({
                               <select
                                 value={normalizeCloudToolProtocol(draftCloudConfig.toolProtocol)}
                                 onChange={(e) => updateCloudDraftServer({ toolProtocol: normalizeCloudToolProtocol(e.target.value) })}
+                                disabled={!canEditCloudDraftServer}
                                 className={settingsSelectClass}
                               >
                                 <option value="auto">Auto</option>
@@ -3991,6 +4050,7 @@ export default function SettingsModal({
                                   <select
                                     value={normalizeOpenAiReasoningEffort(draftCloudConfig.reasoningEffort)}
                                     onChange={(e) => updateCloudDraftServer({ reasoningEffort: normalizeOpenAiReasoningEffort(e.target.value) })}
+                                    disabled={!canEditCloudDraftServer}
                                     className={settingsSelectClass}
                                   >
                                     <option value="none">None</option>
@@ -4006,6 +4066,7 @@ export default function SettingsModal({
                                   <input
                                     type="checkbox"
                                     checked={draftCloudConfig.disableResponseStorage !== false}
+                                    disabled={!canEditCloudDraftServer}
                                     onChange={(e) => updateCloudDraftServer({ disableResponseStorage: e.target.checked })}
                                     className="mt-0.5"
                                   />
@@ -4024,11 +4085,12 @@ export default function SettingsModal({
                               <p className="mb-2 text-[11.5px] text-[#71717a]">{copy.additionalHeadersDesc} {language === "zh" ? "例如" : "For example"} {`{"HTTP-Referer":"https://example.com","X-Title":"MAIN"}`}</p>
                               <textarea
                                 value={draftCloudConfig.customHeaders || ""}
+                                disabled={!canEditCloudDraftServer}
                                 onChange={(e) => {
                                   updateCloudDraftServer({ customHeaders: e.target.value }, { clearModels: true });
                                 }}
                                 placeholder='{"HTTP-Referer":"https://example.com","X-Title":"MAIN"}'
-                                className="min-h-[92px] w-full resize-y rounded-md border border-[#27272a] bg-[#000000] p-2.5 font-mono text-[13px] text-white outline-none theme-ring placeholder:text-[#3f3f46]"
+                                className="min-h-[92px] w-full resize-y rounded-md border border-[#27272a] bg-[#000000] p-2.5 font-mono text-[13px] text-white outline-none theme-ring placeholder:text-[#3f3f46] disabled:cursor-not-allowed disabled:opacity-60"
                               />
                               {parsedCloudCustomHeaders.error ? (
                                 <p className="mt-2 text-[12px] text-[#f48771]">{parsedCloudCustomHeaders.error}</p>

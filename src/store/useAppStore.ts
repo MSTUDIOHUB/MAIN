@@ -165,6 +165,7 @@ import {
 import {
   LOCAL_PERSIST_SCHEMA_VERSION,
   buildPersistedAppState,
+  stripLegacyConfigFields,
   stripLegacyRuntimeFieldsFromPersistedState,
 } from "../lib/persistState";
 import {
@@ -260,9 +261,7 @@ import {
 import { applyShellCwd } from "../lib/toolExecutionContract";
 import {
   deriveThoughtDisplay,
-  normalizeThinkingPolicyWithLegacy,
   normalizeThoughtSummaryForCompare,
-  type ThinkingPolicy,
 } from "../lib/thoughtDisplay";
 import {
   canUpdateSeedSessionTitle,
@@ -452,10 +451,6 @@ export const translations = {
     themeDesc: "Choose your preferred editor highlight color.",
     chatFontSize: "Chat Font Size",
     chatFontSizeDesc: "Adjust the text size in the chat area (10–20 px).",
-    thinkingPolicy: "Thinking Policy",
-    thinkingPolicyDesc: "Choose whether to keep model process notes or force action-only responses.",
-    thinkingPolicyNormal: "Normal",
-    thinkingPolicyActionOnly: "Action-only",
     themeMode: "Appearance",
     themeModeDark: "Dark",
     themeModeBlack: "Black",
@@ -563,10 +558,6 @@ export const translations = {
     themeDesc: "选择你偏好的代码编辑器高亮色彩风格。",
     chatFontSize: "聊天区域文字大小",
     chatFontSizeDesc: "调整聊天区域的文字显示大小（10–20 px）。",
-    thinkingPolicy: "思考策略",
-    thinkingPolicyDesc: "选择保留模型过程说明，或强制仅输出结论与执行动作。",
-    thinkingPolicyNormal: "正常",
-    thinkingPolicyActionOnly: "仅结论/动作",
     themeMode: "外观模式",
     themeModeDark: "深色",
     themeModeBlack: "黑色",
@@ -875,7 +866,6 @@ export interface AppConfig {
   hooksEnabled: boolean;
   activeProfile: "local" | "cloud";
   chatFontSize: number;  // px, default 13
-  thinkingPolicy: ThinkingPolicy;
   sessionRecordingEnabled: boolean;
   debugRecordFullTurnProcess: boolean;
   eventStreamMode: EventStreamMode;
@@ -1354,7 +1344,6 @@ const defaultConfig: AppConfig = {
   hooksEnabled: true,
   activeProfile: "local",
   chatFontSize: 13,
-  thinkingPolicy: "normal",
   sessionRecordingEnabled: true,
   debugRecordFullTurnProcess: false,
   eventStreamMode: "dual",
@@ -5680,7 +5669,6 @@ export const useAppStore = create<AppState>()(
     const uiParentTurnId = requestedUiParentTurnId && state.conversationTurns.some((turn) => turn.id === requestedUiParentTurnId)
       ? requestedUiParentTurnId
       : null;
-    const suppressThoughtOutput = state.config.thinkingPolicy === "action_only";
     const mentionSnapshot = options?.contextMentionsSnapshot ?? state.contextMentions;
     const attachedFilesSnapshot = options?.attachedFilesSnapshot ?? state.attachedFiles;
     const remoteFeishu = options?.remoteFeishu;
@@ -5973,7 +5961,6 @@ export const useAppStore = create<AppState>()(
       attachedFiles: attachedFilesSnapshot.length,
       images: images?.length ?? 0,
       mainDebugShortcut: !!mainDebugShortcut,
-      suppressThoughtOutput,
     });
     const isLocalStudioCommand =
       parsedStudioCommand?.type === "agent" || parsedStudioCommand?.type === "auto";
@@ -7916,7 +7903,6 @@ export const useAppStore = create<AppState>()(
           contextLimit: latest.config.activeProfile === "cloud"
             ? null
             : latest.config.local.contextLimit,
-          thinkingPolicy: latest.config.thinkingPolicy,
           debugRecordFullTurnProcess: latest.config.debugRecordFullTurnProcess,
           rootCauseProbe: "No visible token yet. Check agent.llm_request_shape for prompt/tool/context size and store.stream_done for empty completion.",
         });
@@ -7949,11 +7935,6 @@ export const useAppStore = create<AppState>()(
 
         // Run through the thinking interceptor
         let { agent, thinking, thoughtStarted, thoughtEnded } = thinkingInterceptor.feed(chunk);
-        if (suppressThoughtOutput) {
-          thinking = "";
-          thoughtStarted = false;
-          thoughtEnded = false;
-        }
 
         const latestStateForDedupe = sessionGet();
         const nextInterceptorThought = thinking
@@ -8506,9 +8487,6 @@ export const useAppStore = create<AppState>()(
         },
 
         onThought: (thought) => {
-          if (suppressThoughtOutput) {
-            return;
-          }
           const duration = thoughtStartTime
             ? Math.round((Date.now() - thoughtStartTime) / 1000)
             : undefined;
@@ -10333,6 +10311,7 @@ export const useAppStore = create<AppState>()(
         taskCenterActiveTaskId: _legacyTaskCenterActiveTaskId,
         ...persistedStateWithoutTaskCenter
       } = persistedState;
+      const persistedConfig = stripLegacyConfigFields(persistedState.config) ?? {};
       const normalizedSessionsByWorkspace = normalizeSessionsByWorkspace(persistedState.sessionsByWorkspace);
       const hydratedCurrentWorkspace =
         typeof persistedState.currentWorkspace === "string"
@@ -10359,13 +10338,13 @@ export const useAppStore = create<AppState>()(
       const cloudState = normalizeCloudServerState({
         cloud: {
           ...current.config.cloud,
-          ...(persistedState.config?.cloud ?? {}),
+          ...((persistedConfig as any).cloud ?? {}),
         },
-        cloudServers: persistedState.config?.cloudServers,
-        activeCloudServerId: persistedState.config?.activeCloudServerId,
+        cloudServers: (persistedConfig as any).cloudServers,
+        activeCloudServerId: (persistedConfig as any).activeCloudServerId,
       });
       const localConfig = normalizeLocalConfig(
-        persistedState.config?.local,
+        (persistedConfig as any).local,
         current.config.local,
       );
       const hydratedTaskFlow = hasHydratedCurrentSession
@@ -10376,36 +10355,32 @@ export const useAppStore = create<AppState>()(
         ...persistedStateWithoutTaskCenter,
         config: {
           ...current.config,
-          ...(persistedState.config ?? {}),
-          responseLanguagePolicy: normalizeResponseLanguagePolicy(persistedState.config?.responseLanguagePolicy),
+          ...(persistedConfig as any),
+          responseLanguagePolicy: normalizeResponseLanguagePolicy((persistedConfig as any).responseLanguagePolicy),
           local: localConfig,
           cloud: cloudState.cloud,
           cloudServers: cloudState.cloudServers,
           activeCloudServerId: cloudState.activeCloudServerId,
-          cloudExperimentalLoginEnabled: persistedState.config?.cloudExperimentalLoginEnabled === true,
+          cloudExperimentalLoginEnabled: (persistedConfig as any).cloudExperimentalLoginEnabled === true,
           promptLanguageStrategy:
-            persistedState.config?.promptLanguageStrategy === "english_core_localized_output"
-              ? persistedState.config.promptLanguageStrategy
+            (persistedConfig as any).promptLanguageStrategy === "english_core_localized_output"
+              ? (persistedConfig as any).promptLanguageStrategy
               : current.config.promptLanguageStrategy,
-          thinkingPolicy: normalizeThinkingPolicyWithLegacy(
-            persistedState.config?.thinkingPolicy,
-            (persistedState.config as any)?.thoughtDisplayMode,
-          ),
-          themeMode: normalizeThemeMode(persistedState.config?.themeMode),
-          appIconVariant: normalizeAppIconVariant(persistedState.config?.appIconVariant),
-          toolPermissionPolicy: normalizeToolPermissionPolicy(persistedState.config?.toolPermissionPolicy),
-          mcpRouting: normalizeMcpRoutingConfig(persistedState.config?.mcpRouting),
-          sessionRecordingEnabled: persistedState.config?.sessionRecordingEnabled ?? current.config.sessionRecordingEnabled,
-          debugRecordFullTurnProcess: persistedState.config?.debugRecordFullTurnProcess === true,
+          themeMode: normalizeThemeMode((persistedConfig as any).themeMode),
+          appIconVariant: normalizeAppIconVariant((persistedConfig as any).appIconVariant),
+          toolPermissionPolicy: normalizeToolPermissionPolicy((persistedConfig as any).toolPermissionPolicy),
+          mcpRouting: normalizeMcpRoutingConfig((persistedConfig as any).mcpRouting),
+          sessionRecordingEnabled: (persistedConfig as any).sessionRecordingEnabled ?? current.config.sessionRecordingEnabled,
+          debugRecordFullTurnProcess: (persistedConfig as any).debugRecordFullTurnProcess === true,
           eventStreamMode: normalizeEventStreamMode(
-            persistedState.config?.eventStreamMode,
+            (persistedConfig as any).eventStreamMode,
             current.config.eventStreamMode,
           ),
           toolFeedbackFormat: normalizeToolFeedbackFormat(
-            persistedState.config?.toolFeedbackFormat,
+            (persistedConfig as any).toolFeedbackFormat,
             current.config.toolFeedbackFormat,
           ),
-          imAdapters: normalizeImAdaptersConfig(persistedState.config?.imAdapters),
+          imAdapters: normalizeImAdaptersConfig((persistedConfig as any).imAdapters),
         },
         sessionsByWorkspace: normalizedSessionsByWorkspace,
         mcpServers: normalizeMcpServers(persistedState.mcpServers),

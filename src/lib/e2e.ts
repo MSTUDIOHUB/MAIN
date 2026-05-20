@@ -15,7 +15,7 @@ const FEISHU_REMOTE_ANALYSIS_SCENARIO = "feishu-remote-analysis";
 const READ_CONTEXT_COLLAPSE_SCENARIO = "read-context-collapse";
 const READ_CONTEXT_INTERLEAVED_SCENARIO = "read-context-interleaved";
 const READ_CONTEXT_AGENT_SEGMENT_SCENARIO = "read-context-agent-segment";
-const THINKING_POLICY_SCENARIO = "thinking-policy";
+const PROCESS_DISPLAY_SCENARIO = "process-display";
 const GAME_STUDIO_ONBOARDING_SCENARIO = "game-studio-onboarding";
 const COMPOSER_MAIN_SHORTCUTS_SCENARIO = "composer-main-shortcuts";
 const GAME_STUDIO_PLAN_SHORTCUTS_SCENARIO = "game-studio-plan-shortcuts";
@@ -96,6 +96,30 @@ function bindCloudServerBridgeControls() {
         activeCloudServerId: activeServer?.id || "",
         ...(activeServer ? { cloud: activeServer } : {}),
       },
+    }));
+  };
+  bridge.setModelRuntimeLock = (options: {
+    activeProfile?: "local" | "cloud";
+    activeCloudServerId?: string;
+    status?: "running" | "pending_review";
+  } = {}) => {
+    const status = options.status === "pending_review" ? "pending_review" : "running";
+    useAppStore.setState((state) => ({
+      ...state,
+      config: {
+        ...state.config,
+        activeProfile: options.activeProfile || state.config.activeProfile,
+        activeCloudServerId: options.activeCloudServerId ?? state.config.activeCloudServerId,
+      },
+      agentStatus: status,
+      isGenerating: status === "running",
+    }));
+  };
+  bridge.clearModelRuntimeLock = () => {
+    useAppStore.setState((state) => ({
+      ...state,
+      agentStatus: "idle",
+      isGenerating: false,
     }));
   };
 }
@@ -195,15 +219,8 @@ function bindBridgeSnapshot(scenario: string) {
       agentMessageSummaries,
       selectedOptions: archivedOptionBlocks.map((block) => block.selectedOption).filter(Boolean),
       themeMode: state.config.themeMode,
-      thinkingPolicy: state.config.thinkingPolicy,
       seedCount: readSeedCount(scenario),
     };
-  };
-  bridge.setThinkingPolicy = (policy: "normal" | "action_only") => {
-    useAppStore.getState().setConfig((prev) => ({
-      ...prev,
-      thinkingPolicy: policy,
-    }));
   };
   bridge.setThemeMode = (mode: "light" | "dark" | "black") => {
     useAppStore.getState().setConfig((prev) => ({
@@ -1474,7 +1491,7 @@ function seedReadContextAgentSegmentScenario() {
   return cleanup;
 }
 
-function seedThinkingPolicyScenario() {
+function seedProcessDisplayScenario() {
   const bridge = getBridge();
   if (!bridge) return undefined;
 
@@ -1482,17 +1499,16 @@ function seedThinkingPolicyScenario() {
   bridge.savedDocuments = [];
   bridge.completed = true;
 
-  incrementSeedCount(THINKING_POLICY_SCENARIO);
+  incrementSeedCount(PROCESS_DISPLAY_SCENARIO);
 
   const now = Date.now();
-  const turnId = "e2e-thinking-policy-turn";
+  const turnId = "e2e-process-display-turn";
   const sessionId = 999018;
   const userBlockId = useAppStore.getState()._nextTaskId();
   const thoughtBlockId = useAppStore.getState()._nextTaskId();
   const latestThoughtBlockId = useAppStore.getState()._nextTaskId();
   const toolBlockId = useAppStore.getState()._nextTaskId();
   const agentBlockId = useAppStore.getState()._nextTaskId();
-  const thinkingPolicy = useAppStore.getState().config.thinkingPolicy || "normal";
 
   useAppStore.setState((state) => ({
     ...state,
@@ -1500,14 +1516,13 @@ function seedThinkingPolicyScenario() {
       ...state.config,
       language: "zh",
       workflowMode: "chat",
-      thinkingPolicy,
     },
-    currentWorkspace: "/tmp/e2e-thinking-policy",
+    currentWorkspace: "/tmp/e2e-process-display",
     sessionsByWorkspace: {
-      "/tmp/e2e-thinking-policy": [
+      "/tmp/e2e-process-display": [
         {
           id: sessionId,
-          title: "E2E Thinking Policy",
+          title: "E2E Process Display",
           date: new Date(now).toISOString(),
           active: true,
           messages: [],
@@ -1518,7 +1533,7 @@ function seedThinkingPolicyScenario() {
     selectedMainModeKey: "main_mode",
     selectedNexusModeKey: "nexus_general",
     taskFlow: [
-      { id: userBlockId, turnId, type: "user", content: "验证思考策略。" },
+      { id: userBlockId, turnId, type: "user", content: "验证过程显示。" },
       {
         id: thoughtBlockId,
         turnId,
@@ -1529,7 +1544,7 @@ function seedThinkingPolicyScenario() {
           "我需要先检查 SettingsModal 的通用设置区域。",
           "我需要先检查 SettingsModal 的通用设置区域。",
           "**检查范围**：`SettingsModal` 的通用设置区域。",
-          "下一步会把思考策略接入两档配置，并避免原始长文本刷屏。",
+          "下一步会确认过程显示始终按正常摘要处理，并避免原始长文本刷屏。",
           "由于似乎缓存，换一种方式。，使用来获取关键代码片段，，，，，，，，，整个 ...... 陷入了循环。。，，，，，所以我无法直接。",
           "```ts",
           "const noisy = true;",
@@ -1570,18 +1585,18 @@ function seedThinkingPolicyScenario() {
         id: agentBlockId,
         turnId,
         type: "agent",
-        content: "思考策略测试回复。",
+        content: "过程显示测试回复。",
         streaming: false,
       },
     ],
     conversationTurns: [
       {
         id: turnId,
-        userPrompt: "验证思考策略。",
-        title: "思考策略",
+        userPrompt: "验证过程显示。",
+        title: "过程显示",
         mode: "chat",
         status: "done",
-        summary: "已准备思考策略测试数据。",
+        summary: "已准备过程显示测试数据。",
         blockIds: [userBlockId, thoughtBlockId, latestThoughtBlockId, toolBlockId, agentBlockId],
         collapsed: false,
         createdAt: now,
@@ -1598,8 +1613,8 @@ function seedThinkingPolicyScenario() {
     selectedDiffTaskId: null,
   }));
 
-  bindBridgeSnapshot(THINKING_POLICY_SCENARIO);
-  appendBridgeEvent("seeded", { seedCount: readSeedCount(THINKING_POLICY_SCENARIO) });
+  bindBridgeSnapshot(PROCESS_DISPLAY_SCENARIO);
+  appendBridgeEvent("seeded", { seedCount: readSeedCount(PROCESS_DISPLAY_SCENARIO) });
 
   const cleanup = () => {
     bridge.initialized = false;
@@ -2922,7 +2937,6 @@ function seedGameStudioToolGroupScenario(status: "executing" | "awaiting_input")
       ...state.config,
       language: "zh",
       workflowMode: "edit",
-      thinkingPolicy: "normal",
     },
     selectedMainModeKey: "game_studio",
     selectedNexusModeKey: "nexus_game_studio",
@@ -5197,8 +5211,8 @@ export function initializeE2EScenarios(): (() => void) | undefined {
     return seedReadContextAgentSegmentScenario();
   }
 
-  if (scenario === THINKING_POLICY_SCENARIO) {
-    return seedThinkingPolicyScenario();
+  if (scenario === PROCESS_DISPLAY_SCENARIO) {
+    return seedProcessDisplayScenario();
   }
 
   if (scenario === GAME_STUDIO_ONBOARDING_SCENARIO) {
