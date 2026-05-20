@@ -93,11 +93,37 @@ function getLatestVisibleAgentTextForTurn(taskFlow: TaskBlock[], turnId?: string
   return "";
 }
 
-function appendPlanQuickReplyBlockedNotice(sourceTurnId: string | undefined, reason?: string): void {
+function archiveReplyOptionsForTurn(taskFlow: TaskBlock[], turnId: string | undefined, selectedOption?: string): TaskBlock[] {
+  if (!turnId) return taskFlow;
+  const selected = String(selectedOption || "").trim();
+  return taskFlow.map((block) =>
+    block.turnId === turnId &&
+    block.type === "agent" &&
+    Array.isArray(block.options) &&
+    block.options.length > 0
+      ? {
+          ...block,
+          options: undefined,
+          archivedAfterChoice: true,
+          ...(selected ? { selectedOption: selected } : {}),
+        }
+      : block,
+  );
+}
+
+function appendPlanQuickReplyBlockedNotice(sourceTurnId: string | undefined, reason?: string, selectedOption?: string): void {
   const state = useAppStore.getState();
   const language = state.config.language === "en" ? "en" : "zh";
   const turnId = sourceTurnId || state.currentTurnId || undefined;
   const blockId = state._nextTaskId();
+  const optionBlocks = turnId
+    ? state.taskFlow.filter((block) =>
+        block.turnId === turnId &&
+        block.type === "agent" &&
+        Array.isArray(block.options) &&
+        block.options.length > 0
+      ).length
+    : 0;
   const content = language === "en"
     ? `Plan approval was blocked because MAIN could not find or materialize a reviewable .MAIN/plans/design.md artifact${reason ? ` (${reason})` : ""}. Ask the model to update design.md, then approve the plan again.`
     : `已阻止计划批准：MAIN 没有找到可审批的 .MAIN/plans/design.md，也无法从上一条方案自动物化${reason ? `（${reason}）` : ""}。请先让模型更新 design.md，再批准执行。`;
@@ -105,6 +131,7 @@ function appendPlanQuickReplyBlockedNotice(sourceTurnId: string | undefined, rea
   appendDebugLog("warn", "ui.quickReply_plan_approval_blocked", {
     sourceTurnId: turnId ?? null,
     reason: reason ?? null,
+    archivedOptionBlocks: optionBlocks,
   });
 
   useAppStore.setState((s) => ({
@@ -113,7 +140,7 @@ function appendPlanQuickReplyBlockedNotice(sourceTurnId: string | undefined, rea
     attachedFiles: [],
     currentTurnExecutionConsent: { turnId: null, granted: false },
     taskFlow: [
-      ...s.taskFlow,
+      ...archiveReplyOptionsForTurn(s.taskFlow, turnId, selectedOption),
       {
         id: blockId,
         ...(turnId ? { turnId } : {}),
@@ -148,7 +175,7 @@ async function materializePlanQuickReplyAndApprove(params: {
   });
 
   if (!materialized.ok || !materialized.path || !materialized.content || !materialized.kind) {
-    appendPlanQuickReplyBlockedNotice(params.sourceTurnId, materialized.reason || "quality_gate");
+    appendPlanQuickReplyBlockedNotice(params.sourceTurnId, materialized.reason || "quality_gate", params.approvalText);
     return;
   }
 
@@ -180,6 +207,7 @@ async function materializePlanQuickReplyAndApprove(params: {
     appendPlanQuickReplyBlockedNotice(
       params.sourceTurnId,
       error instanceof Error ? error.message : String(error || "write_failed"),
+      params.approvalText,
     );
   }
 }
@@ -1503,7 +1531,7 @@ export default function App() {
     }
 
     if (planApprovalQuickReplyAction === "block_missing_plan_artifact") {
-      appendPlanQuickReplyBlockedNotice(sourceTurnId, sourcePlanMaterialization.reason || "missing_plan_artifact");
+      appendPlanQuickReplyBlockedNotice(sourceTurnId, sourcePlanMaterialization.reason || "missing_plan_artifact", text);
       return;
     }
 

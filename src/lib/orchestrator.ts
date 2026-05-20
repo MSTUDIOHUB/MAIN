@@ -5631,9 +5631,15 @@ export async function executeAgentLoop(
       workflowMode === "plan" &&
       !callbacks.getIsPlanApproved() &&
       hasOnlyPlanContinuationReplyOptions(normalized.replyOptions);
+    const suppressExecutableProposalOptionsForToolCalls =
+      effectiveToolCalls.length > 0 &&
+      workflowMode === "plan" &&
+      !callbacks.getIsPlanApproved() &&
+      hasExecutableProposalReplyOptions(normalized.replyOptions);
     const suppressNonDecisionReplyOptions =
       suppressReadOnlyPermissionOptions ||
-      suppressPlanContinuationReplyOptions;
+      suppressPlanContinuationReplyOptions ||
+      suppressExecutableProposalOptionsForToolCalls;
     const sourceVisibleText = normalizedBase.visibleText || normalized.visibleText;
     const normalizedVisibleTextForUser = suppressReadOnlyPermissionOptions
       ? stripReadOnlyPermissionPrompt(normalized.visibleText)
@@ -5714,6 +5720,16 @@ export async function executeAgentLoop(
         replyOptions: normalized.replyOptions.length,
         optionPreview: summarizeReplyOptionsForLog(normalized.replyOptions),
         visibleChars: normalized.visibleText.length,
+        workflowMode,
+        turnIntent,
+      });
+    }
+    if (suppressExecutableProposalOptionsForToolCalls) {
+      logAgentEvent("plan_executable_reply_options_ignored_for_tool_call", {
+        iteration,
+        toolCalls: effectiveToolCalls.length,
+        replyOptions: normalized.replyOptions.length,
+        optionPreview: summarizeReplyOptionsForLog(normalized.replyOptions),
         workflowMode,
         turnIntent,
       });

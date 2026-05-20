@@ -885,16 +885,13 @@ test("reply options pause before mixed XML tool calls and continue from the sour
     });
 });
 
-test("operation approval from a plan choice upgrades the reused turn to execute once", async ({ page }) => {
+test("plan executable reply options are ignored when the same turn has tool calls", async ({ page }) => {
   await page.goto("/?e2eScenario=plan-operation-approval-reuse");
 
   const sent = await page.evaluate(() =>
     (window as any).__CODELY_E2E__?.sendCloudMessage?.("请修复 CSV 导入后图表不显示。"),
   );
   expect(sent).toBe(true);
-
-  await expect(page.getByTestId("top-island-awaiting-choice")).toBeVisible();
-  await expect(page.getByTestId("top-island-reply-option-0")).toContainText("批准执行本轮操作");
 
   await expect
     .poll(async () =>
@@ -905,52 +902,21 @@ test("operation approval from a plan choice upgrades the reused turn to execute 
           status: snapshot?.currentTurnStatus,
           currentTurnIntent: snapshot?.currentTurnIntent,
           optionBlockCount: snapshot?.optionBlockCount,
-          readFileCalls: probe?.readFileCalls?.length ?? -1,
-        };
-      }),
-    )
-    .toEqual({
-      status: "awaiting_input",
-      currentTurnIntent: "plan",
-      optionBlockCount: 1,
-      readFileCalls: 0,
-    });
-
-  await page.getByTestId("top-island-reply-option-0").click();
-
-  await expect
-    .poll(async () =>
-      page.evaluate(() => {
-        const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
-        const probe = (window as any).__CLOUD_TOOL_PROTOCOL_TEST__;
-        const executionRequest = [...(probe?.requests || [])]
-          .reverse()
-          .find((request: any) =>
-            request.hasTools &&
-            String(request.body || "").includes("[TURN INTENT: EXECUTE]") &&
-            String(request.body || "").includes("我批准按上面的方案开始真实操作")
-          );
-        const parsed = executionRequest ? JSON.parse(executionRequest.body || "{}") : null;
-        const toolNames = (parsed?.tools || []).map((tool: any) => tool?.name || tool?.function?.name).filter(Boolean);
-        return {
-          currentTurnIntent: snapshot?.currentTurnIntent,
-          turns: snapshot?.conversationTurns,
           archivedOptionCount: snapshot?.archivedOptionCount,
-          optionBlockCount: snapshot?.optionBlockCount,
-          selectedOptions: snapshot?.selectedOptions,
           readFileCalls: probe?.readFileCalls ?? [],
-          executionRequestHasReadTool: toolNames.includes("read_file"),
+          hasFinalText: (snapshot?.agentTexts || []).some((text: string) =>
+            String(text || "").includes("已进入执行模式继续处理"),
+          ),
         };
       }),
     )
     .toEqual({
-      currentTurnIntent: "execute",
-      turns: 1,
-      archivedOptionCount: 1,
+      status: "stopped_no_action",
+      currentTurnIntent: "plan",
+      archivedOptionCount: 0,
       optionBlockCount: 0,
-      selectedOptions: ["我批准按上面的方案开始真实操作，请复用上一轮方案，不要重新规划，直接执行并验证"],
       readFileCalls: ["README.md"],
-      executionRequestHasReadTool: true,
+      hasFinalText: true,
     });
 });
 

@@ -572,6 +572,14 @@ export function shouldPauseForReplyOptions(params: {
   if (
     workflowMode === "plan" &&
     !isPlanApproved &&
+    toolCallCount > 0 &&
+    hasExecutableProposalReplyOptions(replyOptions)
+  ) {
+    return false;
+  }
+  if (
+    workflowMode === "plan" &&
+    !isPlanApproved &&
     !hasStructuredProposal &&
     !hasReadyPlanArtifacts &&
     toolCallCount === 0 &&
