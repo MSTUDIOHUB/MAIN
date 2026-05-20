@@ -102,6 +102,7 @@ const TOOL_REQUIRED_ARGUMENTS: Record<string, string> = {
   write_file: "path, content",
   replace_in_file: "path, search, replace",
   run_command: "command, cwd, description, timeout_ms?",
+  browser_evaluate: "url, actions?, checks?, wait_for_text?, screenshot?, timeout_ms?",
   execute_command: "command, cwd, description, wait_ms?, max_chars?",
   send_pty_input: "input, wait_ms?, max_chars?",
   read_pty_tail: "max_chars?, wait_ms?",
@@ -247,6 +248,7 @@ const WORKFLOW_BUILT_IN_TOOL_NAMES = [
   "replace_in_file",
   "write_file",
   "run_command",
+  "browser_evaluate",
   "execute_command",
   "send_pty_input",
 ];
@@ -628,6 +630,7 @@ export function buildSystemPrompt(
       "analyze_tabular_document",
       "query_tabular_document",
       "write_file",
+      "browser_evaluate",
     ]);
     tfl.push("## 工具调用格式");
     tfl.push("优先使用 native tool calling；如果当前模型只支持文本工具协议，则使用 XML 格式调用工具：");
@@ -665,6 +668,7 @@ export function buildSystemPrompt(
     addToolDescription("query_tabular_document", "- query_tabular_document: 对 CSV、TSV、XLSX 做结构化查询，支持筛选、选列、排序、分页、分组聚合。要回答计数、汇总、Top N、条件过滤等问题时优先用它。");
     addToolDescription("index_workspace_documents", "- index_workspace_documents: 扫描某个目录中的文档文件并生成索引摘要。适合先了解资料库，再决定进一步读取哪些文件。");
     addToolDescription("run_command", "- run_command: 同步执行一次性 shell 命令并等待完成，返回 stdout、stderr、exitCode、timedOut、durationMs。必须传 `description` 和工作区相对 `cwd`（根目录用 `.`），长命令设置 `timeout_ms`。运行测试、构建、Python 脚本、Git 状态检查/提交/推送等有限命令时优先使用它，并基于返回结果总结成功/失败；不要把它当作常规文件分页读取工具。");
+    addToolDescription("browser_evaluate", "- browser_evaluate: 打开本地 dev server 或工作区内 file:// 页面进行真实浏览器验证。必须传 `url`；可传 `actions`（逐行：click/fill/press/select_file/wait_for_selector/wait_for_text）和 `checks`（逐行：text/not_text/selector/not_selector/title/console/not_console/no_console_errors）。用于 UI/DOM/console 渲染验证；不要用 curl/grep/cat 替代它。");
     addToolDescription("execute_command", "- execute_command: 向集成 PTY 发送命令，适合开发服务器、watch 模式、交互式程序或需要保留终端上下文的命令。必须传 `description` 和工作区相对 `cwd`（根目录用 `.`），不要在 command 里用 `cd ... &&` 代替 cwd。可传 `wait_ms` 等待输出，默认 4000，最多 30000。它返回本次发送后的新增输出和 offset；后续用 read_pty_since/read_pty_tail/get_pty_status 继续检查。");
     addToolDescription("send_pty_input", "- send_pty_input: 向当前 PTY 前台进程发送原始输入，适合回答交互提示、输入 y/n、发送 Ctrl+C（input 使用 \\u0003）。可传 `wait_ms` 等待交互程序回显。");
     addToolDescription("read_pty_tail", "- read_pty_tail: 读取终端最近日志，适合快速查看错误栈或长任务尾部输出。命令还在跑且需要观察时，传 `wait_ms` 先等一小段时间再读。");
@@ -695,7 +699,7 @@ export function buildSystemPrompt(
       tfl.push("1. Atomic 任务直接实现，不要为了完成小改动而强行转去计划流。");
       tfl.push("2. 如果当前是在延续一个已批准的计划，则优先遵循当前 runtime 任务清单；不要为了确认 `.MAIN/plans/tasks.md` 是否存在而主动读取它；如果它已知存在，完成后再同步更新对应 checkbox 状态。");
       tfl.push("3. 只有在用户明确要求保存方案、当前回合本来就是计划落盘，或你正在继续一个已批准计划时，才写入 `.MAIN/plans/*.md`。");
-      tfl.push("4. 凡是需要 shell 的步骤，必须真实执行：一次性命令用 `run_command` 并检查 exitCode/stdout/stderr；长驻或交互式命令用 `execute_command`，随后调用 `read_pty_since`、`read_pty_tail` 或 `get_pty_status` 验证结果。命令调用必须带 `description` 和工作区相对 `cwd`（根目录用 `.`）；需要等待长任务输出时传 `wait_ms`，不要另跑 sleep。");
+      tfl.push("4. 凡是需要 shell 的步骤，必须真实执行：一次性命令用 `run_command` 并检查 exitCode/stdout/stderr；长驻或交互式命令用 `execute_command`，随后调用 `read_pty_since`、`read_pty_tail` 或 `get_pty_status` 验证结果。需要页面渲染、UI、DOM 或 console 验证时，优先用 `browser_evaluate` 打开真实本地页面并执行断言，不能用 curl/grep/cat 替代。命令调用必须带 `description` 和工作区相对 `cwd`（根目录用 `.`）；需要等待长任务输出时传 `wait_ms`，不要另跑 sleep。");
       tfl.push("5. 当用户要求 Git 提交、推送或“提交并推送”时，不要因为 PTY 未启动而声称无法执行；Git 是有限命令，优先用 `run_command` 依次检查 `git status`，必要时查看 `git diff --stat` / `git diff`，再按用户要求执行 `git add ...`、`git commit -m ...`、`git push`。如果没有变更、没有 remote、认证失败、upstream 未设置或 push 被拒绝，必须把 stdout/stderr/exitCode 如实反馈给用户并停止猜测。");
     }
     tfl.push("");

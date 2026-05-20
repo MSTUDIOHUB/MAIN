@@ -44,6 +44,7 @@ const BARE_TOOL_NAMES = new Set([
   "execute_command",
   "send_pty_input",
   "run_command",
+  "browser_evaluate",
   "read_pty_buffer",
   "read_pty_tail",
   "read_pty_since",
@@ -55,6 +56,7 @@ const TOOL_BODY_ARG_NAMES: Partial<Record<string, string>> = {
   execute_command: "command",
   send_pty_input: "input",
   run_command: "command",
+  browser_evaluate: "url",
   write_file: "content",
 };
 
@@ -68,6 +70,7 @@ const TOOL_POSITIONAL_ARG_NAMES: Partial<Record<string, string>> = {
   index_workspace_documents: "path",
   glob_search: "pattern",
   grep_search: "query",
+  browser_evaluate: "url",
 };
 
 function extractMatches(text: string, regex: RegExp): string[] {

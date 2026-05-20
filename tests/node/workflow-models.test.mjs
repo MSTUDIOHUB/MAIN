@@ -914,6 +914,23 @@ test("browser or Playwright evidence satisfies browser render validation", () =>
   assert.equal(isPlanTaskTrustedComplete(commandReconciled[0]), true);
 });
 
+test("failed browser validation does not satisfy browser render evidence", () => {
+  const parsed = extractPlanTasks("- [x] 手动测试：打开 test-sample.md，验证所有 Markdown 元素渲染正确");
+  const failedBrowserEvidence = createPlanExecutionEvidenceEntry({
+    toolName: "browser_evaluate",
+    target: "http://localhost:1421 markdown render smoke",
+    result: JSON.stringify({
+      ok: false,
+      assertions: [{ kind: "selector", value: ".preview h1", passed: false }],
+    }),
+  });
+  const reconciled = reconcilePlanTaskCompletion([], parsed, failedBrowserEvidence ? [failedBrowserEvidence] : []);
+
+  assert.equal(failedBrowserEvidence, null);
+  assert.equal(isPlanTaskTrustedComplete(reconciled[0]), false);
+  assert.equal(isPlanTaskAwaitingBrowserValidation(reconciled[0]), true);
+});
+
 test("Tauri runtime validation pauses as user/external validation instead of curl substitute", () => {
   const parsed = extractPlanTasks("- [x] 验证 Tauri open_file 文件选择器可以打开 test-sample.md");
   const viteEvidence = createPlanExecutionEvidenceEntry({

@@ -123,6 +123,10 @@ export function deriveToolTargetRole(input: {
     return language === "zh" ? "当前工作区" : "current workspace";
   }
 
+  if (toolName === "browser_evaluate") {
+    return language === "zh" ? `浏览器页面 \`${compactLine(target, 72)}\`` : `browser page \`${compactLine(target, 72)}\``;
+  }
+
   if (toolName === "run_command" || toolName === "execute_command") {
     if (VERIFY_COMMAND_RE.test(target)) {
       return language === "zh" ? `验证命令 \`${compactLine(target, 72)}\`` : `verification command \`${compactLine(target, 72)}\``;
@@ -493,6 +497,11 @@ export function summarizeToolObservation(input: {
       if (failed) return `Command output for ${role} contains a failure signal that needs follow-up.`;
       return `Command output for ${role} was captured for the next decision.`;
     }
+    if (input.toolName === "browser_evaluate") {
+      if (/"ok"\s*:\s*true/i.test(result) && !failed) return `Browser validation for ${role} passed.`;
+      if (failed || /"ok"\s*:\s*false/i.test(result)) return `Browser validation for ${role} reported a failure that needs follow-up.`;
+      return `Browser validation output for ${role} was captured for the next decision.`;
+    }
     if (input.toolName === "grep_search" || input.toolName === "glob_search") return `Search results narrowed the relevant evidence around ${role}.`;
     return `Read ${role} and captured the relevant context.`;
   }
@@ -504,6 +513,11 @@ export function summarizeToolObservation(input: {
     if (exitZero && !failed) return `${role}已成功退出，可作为验证通过证据。`;
     if (failed) return `${role}输出里包含失败信号，需要继续处理。`;
     return `已记录${role}的命令输出，用于判断下一步。`;
+  }
+  if (input.toolName === "browser_evaluate") {
+    if (/"ok"\s*:\s*true/i.test(result) && !failed) return `${role}的浏览器验证已通过。`;
+    if (failed || /"ok"\s*:\s*false/i.test(result)) return `${role}的浏览器验证返回失败信号，需要继续处理。`;
+    return `已记录${role}的浏览器验证结果，用于判断下一步。`;
   }
   if (input.toolName === "grep_search" || input.toolName === "glob_search") return `搜索结果已收窄 ${role} 的相关证据。`;
   return `已读取 ${role}，捕获了后续判断所需上下文。`;

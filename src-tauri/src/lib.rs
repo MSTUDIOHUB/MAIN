@@ -4686,6 +4686,132 @@ fn run_command(
 }
 
 #[tauri::command]
+fn browser_evaluate(
+    state: State<WorkspaceState>,
+    url: String,
+    actions: Option<String>,
+    checks: Option<String>,
+    wait_for_text: Option<String>,
+    wait_for_selector: Option<String>,
+    screenshot: Option<bool>,
+    fail_on_console_error: Option<bool>,
+    timeout_ms: Option<u64>,
+    workspace: Option<String>,
+) -> Result<Value, String> {
+    let workspace = resolve_workspace_root(&state, workspace)?;
+    let script_path = browser_validation_script_path();
+    if !script_path.exists() {
+        return Err(format!(
+            "browser_evaluate script not found: {}",
+            script_path.display()
+        ));
+    }
+    let node_path = resolve_node_executable().ok_or_else(|| {
+        "browser_evaluate requires Node.js so it can run the bundled Playwright validation runtime."
+            .to_string()
+    })?;
+
+    let timeout = Duration::from_millis(timeout_ms.unwrap_or(60_000).clamp(1_000, 180_000));
+    let payload = json!({
+        "url": url,
+        "actions": actions.unwrap_or_default(),
+        "checks": checks.unwrap_or_default(),
+        "waitForText": wait_for_text,
+        "waitForSelector": wait_for_selector,
+        "screenshot": screenshot.unwrap_or(false),
+        "failOnConsoleError": fail_on_console_error.unwrap_or(true),
+        "timeoutMs": timeout.as_millis() as u64,
+    });
+
+    let mut command = ProcessCommand::new(&node_path);
+    command
+        .arg(script_path)
+        .current_dir(&workspace)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    isolate_process_group(&mut command);
+
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("启动 browser_evaluate 失败: {e}"))?;
+
+    let stdout_handle = child
+        .stdout
+        .take()
+        .map(|stdout| thread::spawn(move || read_limited_pipe(stdout, COMMAND_OUTPUT_LIMIT_BYTES)));
+    let stderr_handle = child
+        .stderr
+        .take()
+        .map(|stderr| thread::spawn(move || read_limited_pipe(stderr, COMMAND_OUTPUT_LIMIT_BYTES)));
+
+    if let Some(stdin) = child.stdin.as_mut() {
+        let input = serde_json::to_string(&payload)
+            .map_err(|e| format!("序列化 browser_evaluate 输入失败: {e}"))?;
+        stdin
+            .write_all(input.as_bytes())
+            .map_err(|e| format!("写入 browser_evaluate 输入失败: {e}"))?;
+    }
+    let _ = child.stdin.take();
+
+    let started_at = Instant::now();
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if started_at.elapsed() >= timeout {
+                    timed_out = true;
+                    break terminate_timed_out_child(&mut child)?;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => return Err(format!("等待 browser_evaluate 结束失败: {e}")),
+        }
+    };
+
+    let stdout = join_captured_pipe(stdout_handle, "browser_evaluate stdout")?;
+    let stderr = join_captured_pipe(stderr_handle, "browser_evaluate stderr")?;
+    let stdout_text = stdout.text.trim();
+    let stderr_text = stderr.text.trim();
+
+    if timed_out {
+        return Err(format!(
+            "browser_evaluate timed out after {}ms{}",
+            timeout.as_millis(),
+            if stderr_text.is_empty() {
+                String::new()
+            } else {
+                format!(": {stderr_text}")
+            }
+        ));
+    }
+
+    if !status.success() {
+        return Err(format!(
+            "browser_evaluate exited with code {:?}. stdout: {} stderr: {}",
+            status.code(),
+            stdout_text,
+            stderr_text
+        ));
+    }
+
+    if stdout_text.is_empty() {
+        return Err(format!(
+            "browser_evaluate produced no JSON result{}",
+            if stderr_text.is_empty() {
+                String::new()
+            } else {
+                format!("; stderr: {stderr_text}")
+            }
+        ));
+    }
+
+    serde_json::from_str::<Value>(stdout_text)
+        .map_err(|e| format!("browser_evaluate returned invalid JSON: {e}; stdout: {stdout_text}"))
+}
+
+#[tauri::command]
 fn shell_permission_preflight(
     state: State<WorkspaceState>,
     command: String,
@@ -6076,7 +6202,8 @@ async fn prepare_cloud_auth_request(
         );
     } else if mode == "gemini_google_oauth" {
         let mut token = token;
-        let is_native_gemini = next_url.contains("generativelanguage.googleapis.com") || !next_url.contains("cloudcode-pa.googleapis.com");
+        let is_native_gemini = next_url.contains("generativelanguage.googleapis.com")
+            || !next_url.contains("cloudcode-pa.googleapis.com");
         if !is_native_gemini
             && token.project_id.is_none()
             && std::env::var("GOOGLE_CLOUD_PROJECT").ok().is_none()
@@ -7863,6 +7990,12 @@ fn feishu_project_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+fn browser_validation_script_path() -> PathBuf {
+    feishu_project_root()
+        .join("scripts")
+        .join("browser_evaluate.mjs")
+}
+
 fn feishu_sidecar_script_path() -> PathBuf {
     feishu_project_root()
         .join("scripts")
@@ -8557,6 +8690,7 @@ pub fn run() {
             clear_pty_buffer,
             get_pty_status,
             run_command,
+            browser_evaluate,
             shell_permission_preflight,
             build_repository_index,
             load_session_memory,

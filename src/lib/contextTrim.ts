@@ -491,7 +491,7 @@ function summarizeToolResult(message: TrimMessage, lookup: Map<string, ToolCallS
     return `${name}${baseTarget} (${status}, result hash ${contentHash})`;
   }
 
-  if (/execute_command|run_command|send_pty_input|read_pty_tail|read_pty_since|get_pty_status/i.test(name)) {
+  if (/execute_command|run_command|browser_evaluate|send_pty_input|read_pty_tail|read_pty_since|get_pty_status/i.test(name)) {
     const exitCode = content.match(/(?:exitCode|exit code|code)\D+(-?\d+)/i)?.[1];
     const command = readRecordString(args, ["command", "cmd"]);
     return `${name}${command ? ` ${compactTextLine(command, 120)}` : baseTarget}${exitCode ? ` (exit ${exitCode})` : ` (${content.length.toLocaleString()} chars, hash ${contentHash})`}`;

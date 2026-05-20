@@ -65,6 +65,25 @@ export function commandResultLooksSuccessful(toolName: string, result: string): 
   return !/\b(exit\s*code\s*[=:]\s*[1-9]\d*|command failed|error:)\b/i.test(result);
 }
 
+export function browserResultLooksSuccessful(result: string): boolean {
+  try {
+    const parsed = JSON.parse(result);
+    if (parsed && typeof parsed === "object") {
+      const record = parsed as Record<string, unknown>;
+      if (record.ok === false || record.success === false) return false;
+      if (typeof record.error === "string" && record.error.trim()) return false;
+      if (Array.isArray(record.assertions)) {
+        return !record.assertions.some((item) =>
+          item && typeof item === "object" && (item as Record<string, unknown>).passed === false
+        );
+      }
+    }
+  } catch {
+    // Some browser adapters return plain text; reject clear failure markers.
+  }
+  return !/(?:"ok"\s*:\s*false|"success"\s*:\s*false|browser validation failed|assertion failed|error:)/i.test(result);
+}
+
 export function isPlanExecutionEvidenceTool(toolName: string, target: string): boolean {
   if (NON_EXECUTION_EVIDENCE_TOOLS.has(toolName)) {
     return false;
@@ -137,6 +156,7 @@ export function createPlanExecutionEvidenceEntry(input: {
   }
 
   if (sourceToolLooksLikeBrowserAutomation(input.toolName)) {
+    if (!browserResultLooksSuccessful(input.result)) return null;
     const isScreenshot = /screenshot|snapshot|capture/i.test(input.toolName) || /screenshot|image|png|jpeg|webp/i.test(input.result);
     return {
       id: `evidence-${timestamp}-${Math.random().toString(36).slice(2, 8)}`,

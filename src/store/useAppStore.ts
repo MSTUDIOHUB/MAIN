@@ -9205,8 +9205,9 @@ export const useAppStore = create<AppState>()(
                 )
               : s.planExecutionEvidenceLedger;
             const evidenceChanged = nextEvidenceLedger !== s.planExecutionEvidenceLedger;
-            const nextOperationEvidenceStatus: PendingOperationProposal["evidenceStatus"] =
+          const nextOperationEvidenceStatus: PendingOperationProposal["evidenceStatus"] =
               toolName === "run_command" ||
+              toolName === "browser_evaluate" ||
               toolName === "execute_command" ||
               toolName === "send_pty_input" ||
               toolName === "read_pty_tail" ||
@@ -11015,6 +11016,13 @@ function stringifyFeishuPreviewValue(value: unknown): string {
 }
 
 function buildFeishuToolPreview(toolName: string, args: Record<string, unknown>): string {
+  if (toolName === "browser_evaluate") {
+    return [
+      `url: ${stringifyFeishuPreviewValue(args.url)}`,
+      args.actions ? `actions:\n${stringifyFeishuPreviewValue(args.actions)}` : "",
+      args.checks ? `checks:\n${stringifyFeishuPreviewValue(args.checks)}` : "",
+    ].filter(Boolean).join("\n\n");
+  }
   if (toolName === "run_command" || toolName === "execute_command") {
     return stringifyFeishuPreviewValue(args.command);
   }
@@ -11122,6 +11130,7 @@ function getToolTarget(name: string, args: Record<string, unknown>): string {
     case "execute_command": return (args.command as string) || "";
     case "send_pty_input":  return (args.input as string) || "terminal input";
     case "run_command":     return (args.command as string) || "";
+    case "browser_evaluate": return (args.url as string) || "";
     case "read_pty_buffer": return "terminal";
     case "read_pty_tail":   return "terminal tail";
     case "read_pty_since":  return `terminal @ ${args.offset ?? 0}`;

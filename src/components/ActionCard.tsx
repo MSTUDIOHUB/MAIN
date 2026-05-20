@@ -28,6 +28,7 @@ const TOOL_LABELS: Record<string, { verb: { zh: string; en: string }; icon: Reac
   execute_command:  { verb: { zh: "执行命令", en: "run command" }, icon: IconTerminal },
   send_pty_input:   { verb: { zh: "发送终端输入", en: "send terminal input" }, icon: IconTerminal },
   run_command:      { verb: { zh: "运行命令并等待", en: "run command and wait" }, icon: IconTerminal },
+  browser_evaluate: { verb: { zh: "浏览器验证", en: "validate in browser" }, icon: IconTerminal },
   read_pty_buffer:  { verb: { zh: "读取终端", en: "read terminal" }, icon: IconTerminal },
   read_pty_tail:    { verb: { zh: "读取终端尾部", en: "read terminal tail" }, icon: IconTerminal },
   read_pty_since:   { verb: { zh: "读取新增终端输出", en: "read new terminal output" }, icon: IconTerminal },

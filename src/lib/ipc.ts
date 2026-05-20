@@ -57,6 +57,35 @@ export interface TerminalCommandOutput {
   stderrTruncated: boolean;
 }
 
+export interface BrowserEvaluateInput {
+  url: string;
+  actions?: string;
+  checks?: string;
+  waitForText?: string;
+  waitForSelector?: string;
+  screenshot?: boolean;
+  failOnConsoleError?: boolean;
+  timeoutMs?: number;
+}
+
+export interface BrowserEvaluateResult {
+  ok: boolean;
+  url?: string;
+  finalUrl?: string;
+  status?: number | null;
+  title?: string;
+  actions?: Array<Record<string, unknown>>;
+  assertions?: Array<Record<string, unknown>>;
+  consoleMessages?: Array<Record<string, unknown>>;
+  consoleErrors?: string[];
+  pageErrors?: string[];
+  failedRequests?: string[];
+  screenshotPath?: string | null;
+  textPreview?: string;
+  durationMs?: number;
+  error?: string | null;
+}
+
 export type ShellPermissionDecisionKind = "allow" | "ask" | "deny";
 export type ShellPermissionRiskLevel = "low" | "medium" | "high" | "critical";
 
@@ -737,6 +766,23 @@ export function runCommand(
     timeoutMs,
     workspace,
     permissionApproval,
+  });
+}
+
+export function browserEvaluate(
+  input: BrowserEvaluateInput,
+  workspace?: string,
+): Promise<BrowserEvaluateResult> {
+  return invoke<BrowserEvaluateResult>("browser_evaluate", {
+    url: input.url,
+    actions: input.actions,
+    checks: input.checks,
+    waitForText: input.waitForText,
+    waitForSelector: input.waitForSelector,
+    screenshot: input.screenshot,
+    failOnConsoleError: input.failOnConsoleError,
+    timeoutMs: input.timeoutMs,
+    workspace,
   });
 }
 

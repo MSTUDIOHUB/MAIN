@@ -8,12 +8,16 @@ const NUMERIC_ARGUMENT_NAMES = new Set([
   "max_chars",
   "offset",
   "timeout_ms",
+  "timeoutMs",
   "wait_ms",
 ]);
 
 const BOOLEAN_ARGUMENT_NAMES = new Set([
   "append_newline",
   "__raw",
+  "screenshot",
+  "fail_on_console_error",
+  "failOnConsoleError",
 ]);
 
 const PATH_ARGUMENT_NAMES = new Set([

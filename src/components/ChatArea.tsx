@@ -735,7 +735,7 @@ const TOOL_SUMMARY_GROUPS = {
   read: new Set(["get_project_skeleton", "get_file_outline", "read_file", "read_document", "list_directory", "glob_search", "grep_search", "index_workspace_documents"]),
   table: new Set(["analyze_tabular_document", "query_tabular_document"]),
   edit: new Set(["replace_in_file", "write_file"]),
-  command: new Set(["execute_command", "send_pty_input", "run_command", "read_pty_buffer", "read_pty_tail", "read_pty_since", "get_pty_status", "clear_pty_buffer"]),
+  command: new Set(["execute_command", "send_pty_input", "run_command", "browser_evaluate", "read_pty_buffer", "read_pty_tail", "read_pty_since", "get_pty_status", "clear_pty_buffer"]),
 };
 
 const READ_CONTEXT_TOOL_NAMES = new Set([
@@ -992,7 +992,7 @@ function getActiveTurnActivity(blocks: any[], turnStatus: string, language: "zh"
     const target = String(runningTool.target || runningTool.toolName || "").split("/").pop() || runningTool.toolName;
     const tableTools = new Set(["analyze_tabular_document", "query_tabular_document"]);
     const readTools = new Set(["read_file", "read_document", "list_directory", "glob_search", "grep_search", "index_workspace_documents", "get_project_skeleton"]);
-    const commandTools = new Set(["execute_command", "run_command", "send_pty_input"]);
+    const commandTools = new Set(["execute_command", "run_command", "browser_evaluate", "send_pty_input"]);
     const toolName = String(runningTool.toolName || "");
     const prefix = language === "zh"
       ? completedToolCallCount > 0 ? `已完成 ${completedToolCallCount} 次，` : ""

@@ -20,6 +20,7 @@ import {
   readPtyBuffer,
   readPtyTail,
   readPtySince,
+  browserEvaluate,
   clearPtyBuffer,
   getPtyStatus,
   runCommand,
@@ -421,6 +422,25 @@ export async function executeTool(
         workspace,
         options.shellPermissionApproval,
       );
+    }
+
+    case "browser_evaluate": {
+      const url = parseOptionalString(args.url);
+      if (!url) throw new Error("Missing required parameter 'url'.");
+      return await browserEvaluate({
+        url,
+        actions: parseOptionalString(args.actions),
+        checks: parseOptionalString(args.checks),
+        waitForText: parseOptionalString(args.wait_for_text) ?? parseOptionalString(args.waitForText),
+        waitForSelector: parseOptionalString(args.wait_for_selector) ?? parseOptionalString(args.waitForSelector),
+        screenshot: args.screenshot === true || args.screenshot === "true",
+        failOnConsoleError:
+          args.fail_on_console_error === false || args.fail_on_console_error === "false" ||
+          args.failOnConsoleError === false || args.failOnConsoleError === "false"
+            ? false
+            : undefined,
+        timeoutMs: parseOptionalNumber(args.timeout_ms) ?? parseOptionalNumber(args.timeoutMs),
+      }, workspace);
     }
 
     case "get_project_skeleton": {

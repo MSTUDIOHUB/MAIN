@@ -251,6 +251,37 @@ test("approved plan execution allows source work when runtime tasks exist", () =
   assert.equal(shellRun.action, "review_required");
 });
 
+test("approved plan execution can route browser validation tools when runtime tasks exist", () => {
+  const browserRun = planRuntimeToolCall(createPlanInput({
+    workflowMode: "plan",
+    runtimeIntent: "execute",
+    isPlanApproved: true,
+    planTaskCount: 2,
+    availableToolNames: new Set(["read_file", "browser_evaluate"]),
+    capabilityRegistry: {
+      tools: {
+        browser_evaluate: {
+          name: "browser_evaluate",
+          source: "built_in",
+          risk: "browser_control",
+          autoExecutable: false,
+          enabled: true,
+        },
+      },
+      policy: defaultToolPolicy,
+    },
+    toolCall: {
+      id: "browser-with-runtime-tasks",
+      name: "browser_evaluate",
+      arguments: JSON.stringify({ url: "http://localhost:5173", checks: "selector: #root" }),
+    },
+    getToolTarget: (_name, args) => String(args.url || ""),
+  }));
+
+  assert.equal(browserRun.action, "review_required");
+  assert.equal(browserRun.target, "http://localhost:5173");
+});
+
 test("thread event helpers stamp schema, detect terminal events, and keep ring buffer", () => {
   const started = withEventSchema({
     type: "turn.started",

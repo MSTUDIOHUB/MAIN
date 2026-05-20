@@ -103,6 +103,7 @@ function buildProviderCompatibilityInstructionText(
     "- write_file: create or overwrite a workspace file. This is allowed when the user asks for implementation or file changes.",
     "- replace_in_file: edit an existing workspace file by exact text replacement. This is allowed when the user asks for implementation or file changes.",
     "- run_command: run workspace commands when needed for implementation or verification.",
+    "- browser_evaluate: validate local pages with Playwright DOM/console assertions when browser rendering evidence is required.",
     "Never claim that write tools or folder access are unavailable. If you need to modify files, emit XML tool calls instead of describing an imaginary patch.",
   ];
 

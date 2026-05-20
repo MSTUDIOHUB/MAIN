@@ -211,7 +211,7 @@ function isLikelyJsonLine(line: string): boolean {
 
 function isLikelyToolLogLine(line: string): boolean {
   return /^(?:tool|tool_call|function_call|call_|stdout|stderr|exit(?:code)?|status|args?|arguments|target|result)\b/i.test(line) ||
-    /^\[?(?:read_file|write_file|replace_in_file|execute_command|run_command|grep_search|glob_search|list_directory|send_pty_input)\b/i.test(line) ||
+    /^\[?(?:read_file|write_file|replace_in_file|execute_command|run_command|browser_evaluate|grep_search|glob_search|list_directory|send_pty_input)\b/i.test(line) ||
     /^<*\/?(?:tool_use|tool_call|function_call|tool|parameter|tool_response)\b/i.test(line) ||
     /\b(?:truncatedPreview|ANGEDUB|get_outline)\b/i.test(line);
 }

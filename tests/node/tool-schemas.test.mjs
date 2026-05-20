@@ -88,6 +88,20 @@ test("shell tool schemas require execution descriptions and expose cwd metadata"
   assert.ok(executeCommand.function.parameters.properties.max_chars);
 });
 
+test("browser validation schema exposes local Playwright checks", () => {
+  const tools = buildToolDefinitions([]);
+  const browserEvaluate = tools.find((tool) => tool.function.name === "browser_evaluate");
+
+  assert.ok(browserEvaluate);
+  assert.match(browserEvaluate.function.description, /Playwright/);
+  assert.match(browserEvaluate.function.description, /localhost/);
+  assert.deepEqual(browserEvaluate.function.parameters.required, ["url"]);
+  assert.ok(browserEvaluate.function.parameters.properties.actions);
+  assert.ok(browserEvaluate.function.parameters.properties.checks);
+  assert.ok(browserEvaluate.function.parameters.properties.wait_for_text);
+  assert.ok(browserEvaluate.function.parameters.properties.screenshot);
+});
+
 test("pty observation schemas expose wait controls", () => {
   const tools = buildToolDefinitions([]);
   const readSince = tools.find((tool) => tool.function.name === "read_pty_since");

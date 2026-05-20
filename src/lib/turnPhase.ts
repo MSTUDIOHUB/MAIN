@@ -88,7 +88,7 @@ export function deriveTurnPhaseDomain(toolName: string, target = ""): string {
   if (/csv|tsv|xlsx|excel|tabular|parser|upload|dragupload|dashboardstore|order|coursecleaner|数据|导入/.test(value)) return "data_pipeline";
   if (/chart|trend|monthly|compare|pie|heatmap|overview|buyer|dashboard|recharts|图表|趋势|环比/.test(value)) return "chart_rendering";
   if (/layout|topisland|composer|chatarea|time|header|title|grid|flex|遮挡/.test(value)) return "layout";
-  if (/test|build|lint|typecheck|playwright|vitest|jest|pytest|cargo/.test(value)) return "validation";
+  if (/test|build|lint|typecheck|playwright|browser_evaluate|vitest|jest|pytest|cargo/.test(value)) return "validation";
   if (/src\/|components\/|hooks\/|store\/|lib\//.test(value)) return "source";
   if (/pty|terminal|command|shell|run_command|execute_command/.test(value)) return "terminal";
   return "workspace";

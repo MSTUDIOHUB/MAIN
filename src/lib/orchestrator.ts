@@ -207,6 +207,7 @@ const PLAN_EXPLORATION_READ_ONLY_TOOLS = new Set([
 ]);
 const EXECUTION_VERIFICATION_TOOL_NAMES = new Set([
   "run_command",
+  "browser_evaluate",
   "execute_command",
   "send_pty_input",
   "read_pty_buffer",
@@ -936,6 +937,7 @@ function getToolTarget(name: string, args: Record<string, unknown>): string {
     case "execute_command": return (args.command as string) || "";
     case "send_pty_input":  return (args.input as string) || "terminal input";
     case "run_command":     return (args.command as string) || "";
+    case "browser_evaluate": return (args.url as string) || "";
     case "read_pty_buffer": return "terminal";
     case "read_pty_tail":   return "terminal tail";
     case "read_pty_since":  return `terminal @ ${args.offset ?? 0}`;
@@ -957,6 +959,7 @@ const MAX_NO_PROGRESS_LOOP_REPEATS = 3;
 const NO_PROGRESS_EXCLUDED_TOOLS = new Set([
   "execute_command",
   "send_pty_input",
+  "browser_evaluate",
   "read_pty_buffer",
   "read_pty_tail",
   "read_pty_since",
@@ -2973,7 +2976,7 @@ function getToolResultBudgets(name: string, cloudProfile: boolean): { modelChars
     if (name === "read_document" || name === "analyze_tabular_document" || name === "query_tabular_document") {
       return { modelChars: 7000, displayChars: 8000 };
     }
-    if (name === "run_command" || name === "execute_command") return { modelChars: 6000, displayChars: 8000 };
+    if (name === "run_command" || name === "execute_command" || name === "browser_evaluate") return { modelChars: 6000, displayChars: 8000 };
     return { modelChars: 6000, displayChars: 8000 };
   }
 
@@ -2981,7 +2984,7 @@ function getToolResultBudgets(name: string, cloudProfile: boolean): { modelChars
   if (name === "read_document" || name === "analyze_tabular_document" || name === "query_tabular_document") {
     return { modelChars: 16000, displayChars: 10000 };
   }
-  if (name === "run_command" || name === "execute_command") return { modelChars: 12000, displayChars: 10000 };
+  if (name === "run_command" || name === "execute_command" || name === "browser_evaluate") return { modelChars: 12000, displayChars: 10000 };
   return { modelChars: 12000, displayChars: 10000 };
 }
 

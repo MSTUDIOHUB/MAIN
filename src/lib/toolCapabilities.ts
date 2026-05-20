@@ -104,6 +104,7 @@ const READ_ONLY_BUILT_INS = new Set([
 
 const WORKSPACE_WRITE_BUILT_INS = new Set(["replace_in_file", "write_file"]);
 const SHELL_BUILT_INS = new Set(["run_command", "execute_command", "send_pty_input"]);
+const BROWSER_CONTROL_BUILT_INS = new Set(["browser_evaluate"]);
 const DESTRUCTIVE_BUILT_INS = new Set(["delete_workspace_path"]);
 
 const LOCAL_FILE_READ_BUILT_INS = new Set([
@@ -396,6 +397,7 @@ export function classifyBuiltInTool(name: string): ToolRiskLevel {
   if (READ_ONLY_BUILT_INS.has(name)) return "read_only";
   if (WORKSPACE_WRITE_BUILT_INS.has(name)) return "workspace_write";
   if (SHELL_BUILT_INS.has(name)) return "shell";
+  if (BROWSER_CONTROL_BUILT_INS.has(name)) return "browser_control";
   if (DESTRUCTIVE_BUILT_INS.has(name)) return "destructive";
   return "external_write";
 }
@@ -525,6 +527,7 @@ function deriveToolCategory(
   source: ToolSourceKind,
 ): string {
   const text = normalizeText(`${name} ${description || ""}`);
+  if (source === "built_in" && containsAny(text, BROWSER_TERMS)) return "browser";
   if (source === "mcp" && containsAny(text, BROWSER_TERMS)) return "browser";
   if (source === "mcp" && containsAny(text, GITHUB_TERMS)) return "github";
   if (source === "mcp" && containsAny(text, DATABASE_TERMS)) return "database";

@@ -319,6 +319,27 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     type: "function",
     function: {
+      name: "browser_evaluate",
+      description: "使用 Playwright 打开本地页面进行浏览器级验证，返回 DOM、console、网络失败、断言和可选截图证据。仅允许 localhost/127.0.0.1/[::1]/file://工作区内页面；用于计划执行阶段验证真实渲染，不能用 curl/grep/cat 替代。",
+      parameters: {
+        type: "object",
+        properties: {
+          url: { type: "string", description: "要打开的本地 URL，例如 http://localhost:5173 或工作区内 file:// 页面" },
+          actions: { type: "string", description: "可选，逐行 Playwright 动作 DSL：click: selector；fill: selector => text；press: selector => Enter；select_file: selector => relative/file.csv；wait_for_selector: selector；wait_for_text: text" },
+          checks: { type: "string", description: "可选，逐行断言 DSL：text: 文本；not_text: 文本；selector: CSS；not_selector: CSS；title: 文本；console: 文本；not_console: 文本；no_console_errors" },
+          wait_for_text: { type: "string", description: "可选，打开页面后等待正文中出现的文本" },
+          wait_for_selector: { type: "string", description: "可选，打开页面后等待出现的 CSS selector" },
+          screenshot: { type: "boolean", description: "可选，是否保存全页截图到 .MAIN/browser-validation/ 作为验证证据" },
+          fail_on_console_error: { type: "boolean", description: "可选，console error/pageerror 是否让验证失败，默认 true" },
+          timeout_ms: { type: "number", description: "可选，单次浏览器验证超时时间，默认 60000，最大 180000" },
+        },
+        required: ["url"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "read_pty_buffer",
       description: "读取当前 PTY 终端捕获缓冲区。兼容旧工具；如果只需要最近日志优先用 read_pty_tail，如果要读某次命令之后的新增内容优先用 read_pty_since。",
       parameters: {

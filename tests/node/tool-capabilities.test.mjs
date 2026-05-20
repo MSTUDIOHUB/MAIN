@@ -88,6 +88,7 @@ test("built-in tool risks separate read, write, shell, and destructive operation
   assert.equal(classifyBuiltInTool("read_file"), "read_only");
   assert.equal(classifyBuiltInTool("write_file"), "workspace_write");
   assert.equal(classifyBuiltInTool("run_command"), "shell");
+  assert.equal(classifyBuiltInTool("browser_evaluate"), "browser_control");
   assert.equal(classifyBuiltInTool("delete_workspace_path"), "destructive");
 });
 
@@ -172,6 +173,38 @@ test("execute intent exposes run_command for Git workflows", () => {
   const names = filterToolDefinitionsForIntent(tools, "execute", registry).map((item) => item.function.name);
   assert.ok(names.includes("run_command"));
   assert.ok(names.includes("execute_command"));
+});
+
+test("approved execution exposes browser validation while keeping it approval gated", () => {
+  const tools = [
+    tool("read_file", "Read a file"),
+    tool("write_file", "Write a file"),
+    tool("browser_evaluate", "Validate localhost UI with Playwright"),
+  ];
+  const registry = buildToolCapabilityRegistry({
+    toolDefinitions: tools,
+    policy: createDefaultToolPermissionPolicy(),
+  });
+
+  assert.equal(registry.tools.browser_evaluate.risk, "browser_control");
+  assert.equal(registry.tools.browser_evaluate.category, "browser");
+  assert.equal(isToolAutoExecutableForCall("browser_evaluate", { url: "http://localhost:5173" }, registry), false);
+  assert.deepEqual(
+    filterToolDefinitionsForIntent(tools, "respond", registry).map((item) => item.function.name),
+    ["read_file"],
+  );
+  assert.deepEqual(
+    filterToolDefinitionsForIntent(tools, "plan", registry).map((item) => item.function.name),
+    ["read_file", "write_file"],
+  );
+  assert.deepEqual(
+    filterToolDefinitionsForIntent(tools, "plan", registry, { planApproved: true }).map((item) => item.function.name),
+    ["read_file", "write_file", "browser_evaluate"],
+  );
+  assert.deepEqual(
+    filterToolDefinitionsForIntent(tools, "execute", registry).map((item) => item.function.name),
+    ["read_file", "write_file", "browser_evaluate"],
+  );
 });
 
 test("permission policy auto-executes only safe read classes by default", () => {
