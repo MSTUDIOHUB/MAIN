@@ -48,8 +48,7 @@ interface TopIslandProps {
 function isApprovalActionOption(option: ReplyOption): boolean {
   return (
     option.action === "continue_readonly_once" ||
-    option.action === "allow_readonly_session" ||
-    option.action === "approve_operation_once"
+    option.action === "allow_readonly_session"
   );
 }
 
@@ -241,10 +240,10 @@ const TopIsland = memo(function TopIsland({
       ? "直接在这里点选即可继续当前回合。"
       : "Choose an option here to continue the current turn.",
     choicesSectionTitle: language === "zh" ? "选择下一步" : "Choose the next step",
-    approvalActionsTitle: language === "zh" ? "执行批准动作" : "Execution Approval Actions",
+    approvalActionsTitle: language === "zh" ? "只读授权动作" : "Read-only Permission Actions",
     approvalActionsHint: language === "zh"
-      ? "以下属于执行授权动作，不是模型分叉提问选项。"
-      : "These are execution approval actions, not model decision branches.",
+      ? "这些只会允许读取、搜索和分析，不会直接执行写入修改。"
+      : "These only allow reading, searching, and analysis; they do not start write changes.",
     customChoicePlaceholder: language === "zh" ? "输入你的想法作为选项" : "Type your own choice",
     customChoiceSubmit: language === "zh" ? "确认" : "Confirm",
     executionConsentTitle: language === "zh" ? "允许开始执行本轮改动？" : "Allow this turn to start making changes?",

@@ -9,7 +9,7 @@ test.beforeEach(async ({ page }) => {
   });
 });
 
-test("game studio completed tool calls collapse into one group while keeping the latest running card", async ({ page }) => {
+test("game studio live steps show concise progress without nested action cards", async ({ page }) => {
   await page.goto("/?e2eScenario=game-studio-tool-group-collapse");
 
   await expect(page.getByTestId("thought-block")).toHaveCount(0);
@@ -20,13 +20,16 @@ test("game studio completed tool calls collapse into one group while keeping the
   await expect(steps.nth(1)).toContainText("核对 Main Camera 当前相机参数");
   await expect(steps.nth(2)).toContainText("读取控制脚本确认行为");
   await expect(steps.nth(3)).toContainText("继续调整 Main Camera 视角");
+  await expect(steps.nth(3)).toContainText("视角偏移 需要用工具结果确认后再继续");
+  await expect(steps.nth(3)).not.toContainText("因为：");
+  await expect(steps.nth(3)).not.toContainText("**视角偏移**");
+  expect(await steps.nth(3).getByTestId("turn-archive-step-intent").evaluate((node) => (node as HTMLElement).innerText.includes("\n视角偏移"))).toBe(true);
   await expect(steps.nth(3)).toContainText("进行中");
+  await expect(steps.nth(3).getByTestId("turn-archive-step-toggle")).toHaveCount(0);
   await expect(page.getByTestId("turn-activity-thought-summary")).toHaveCount(0);
   await expect(page.getByTestId("turn-activity-notice")).toContainText("已完成 3 次，当前调用工具：Main Camera");
   await expect(page.getByTestId("tool-status-label").filter({ hasText: "执行中" })).toHaveCount(0);
-
-  await steps.nth(3).getByTestId("turn-archive-step-toggle").click();
-  await expect(page.getByTestId("tool-status-label").filter({ hasText: "执行中" })).toHaveCount(1);
+  await expect(page.getByTestId("turn-archive-step-details")).toHaveCount(0);
 });
 
 test("game studio awaiting_input state does not keep showing running tool activity", async ({ page }) => {

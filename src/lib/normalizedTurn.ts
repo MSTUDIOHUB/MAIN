@@ -389,7 +389,9 @@ export function normalizeAssistantTurn(result: StreamResult): NormalizedStreamSt
   const protocolToolOptions = rawToolCalls.flatMap(extractReplyOptionsFromProtocolTool);
   const toolCalls = rawToolCalls.filter((call) => !isUserOptionsToolName(call.name));
   const parsedOptions = extractReplyOptions(parsed.cleanText || "");
-  const replyOptions = mergeReplyOptions(initialOptions.replyOptions, parsedOptions.replyOptions, protocolToolOptions);
+  const hasExplicitOptions = initialOptions.replyOptions.length > 0 || protocolToolOptions.length > 0;
+  const inferredOptions = hasExplicitOptions ? [] : parsedOptions.replyOptions;
+  const replyOptions = mergeReplyOptions(initialOptions.replyOptions, inferredOptions, protocolToolOptions);
   const hasExplicitUserChoiceRequest =
     initialOptions.hasExplicitUserOptionsTag ||
     rawToolCalls.some((call) => isUserOptionsToolName(call.name));

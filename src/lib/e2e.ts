@@ -875,6 +875,7 @@ function seedAwaitingChoiceMixedOptionsScenario() {
         streaming: false,
         options: [
           { label: "先确认代码主逻辑，再决定是否改动", value: "先确认代码主逻辑，再决定是否改动" },
+          { label: "我来确认类型，然后执行修复", value: "我来确认类型，然后执行修复", action: "approve_operation_once", source: "explicit_user_options" },
           { label: "先确认渲染层，再回头看业务逻辑", value: "先确认渲染层，再回头看业务逻辑" },
           { label: "继续当前只读读取", value: "请继续当前只读读取。", action: "continue_readonly_once" },
           { label: "当前会话只读步骤全部批准", value: "本会话只读读取、搜索和分析步骤全部允许。", action: "allow_readonly_session" },
@@ -2916,7 +2917,7 @@ function seedGameStudioToolGroupScenario(status: "executing" | "awaiting_input")
       status: "running",
       toolStatus: "running",
       message: "Executing...",
-      intentSummary: "继续调整 Main Camera 视角",
+      intentSummary: "继续调整 Main Camera 视角\n**视角偏移** 需要用工具结果确认后再继续。",
     });
   } else {
     taskFlow.push({

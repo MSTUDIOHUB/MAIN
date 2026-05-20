@@ -172,6 +172,20 @@ function compactLine(text: string, maxChars = 180): string {
   return `${normalized.slice(0, maxChars - 3).trim()}...`;
 }
 
+function compactMarkdownSnippet(text: string, maxChars = 180): string {
+  const normalized = String(text || "")
+    .replace(/\r\n/g, "\n")
+    .replace(/<\/?(?:analysis|thought|thinking|reasoning)(?:\s[^>]*)?>/gi, " ")
+    .replace(/\b(?:thought|analysis|thinking|reasoning)\b[:：]?/gi, " ")
+    .replace(/^(?:因为|原因|下一步|正在做|证据)\s*[:：]\s*/gm, "")
+    .replace(/[ \t]+/g, " ")
+    .replace(/[ \t]*\n[ \t]*/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  if (normalized.length <= maxChars) return normalized;
+  return `${normalized.slice(0, maxChars - 3).trim()}...`;
+}
+
 const PROCESS_NOTE_TARGET_RE = /`?(?:(?:\.{1,2}\/|\/)?(?:[\w@()[\]. -]+[\\/])+)?[\w@()[\]. -]+\.(?:tsx?|jsx?|mjs|cjs|css|scss|sass|html?|mdx?|json|ya?ml|toml|rs|lock|svg|png|jpe?g|gif|webp|ico|icns)`?/gi;
 
 function stripProcessNoteTargetNoise(text: string): string {
@@ -498,7 +512,7 @@ function makeNarrativeIntent(step: TurnArchiveStep, language: ToolPresentationLa
 }
 
 function resolveToolIntent(block: any, kind: TurnArchiveStepKind, language: ToolPresentationLanguage): string {
-  const persisted = String(block?.intentSummary || "").replace(/\s+/g, " ").trim();
+  const persisted = compactMarkdownSnippet(String(block?.intentSummary || ""), 260);
   if (persisted) return persisted;
   if (!isToolBlock(block)) return defaultIntentForStep(kind, language);
   return deriveToolIntentSummary({
@@ -929,11 +943,14 @@ function finalizeStep(
     : baseSummary;
   if (progressBlock) {
     const progressTitle = compactLine(String(progressBlock.title || step.intent || ""), 160);
-    const progressWhy = compactLine(String(progressBlock.why || step.why || ""), 220);
-    const progressAction = compactLine(String(progressBlock.action || step.action || ""), 220);
+    const progressWhy = compactMarkdownSnippet(String(progressBlock.why || step.why || ""), 220);
+    const progressAction = compactMarkdownSnippet(String(progressBlock.action || step.action || ""), 220);
     const progressEvidence = compactLine(String(progressBlock.evidence || step.result || ""), 220);
     const progressNext = compactLine(String(progressBlock.next || step.next || ""), 220);
-    const intentParts = [progressAction || progressTitle, progressWhy].filter(Boolean);
+    const intentParts = [
+      progressAction || progressTitle,
+      progressWhy,
+    ].filter(Boolean);
     return {
       ...step,
       ...(phase ? { phase } : {}),
@@ -943,7 +960,7 @@ function finalizeStep(
       result: progressEvidence,
       next: progressNext,
       note: progressWhy,
-      intent: compactLine(intentParts.join(language === "zh" ? " 因为：" : " Because: "), 260),
+      intent: compactMarkdownSnippet(intentParts.join("\n"), 260),
       summary,
     };
   }

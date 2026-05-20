@@ -22,6 +22,9 @@ const TOOL_VERB_LABELS: Record<string, { zh: string; en: string }> = {
   read_pty_since: { zh: "读取新增终端输出", en: "Read new terminal output" },
   get_pty_status: { zh: "检查终端状态", en: "Check terminal status" },
   clear_pty_buffer: { zh: "清空终端缓冲", en: "Clear terminal buffer" },
+  find_gameobjects: { zh: "查找场景对象", en: "Find game objects" },
+  manage_camera: { zh: "管理相机", en: "Manage camera" },
+  execute_code: { zh: "执行代码", en: "Execute code" },
   Error: { zh: "系统请求失败", en: "System request failed" },
 };
 
@@ -31,6 +34,7 @@ const DISCOVERY_TOOLS = new Set([
   "glob_search",
   "grep_search",
   "index_workspace_documents",
+  "find_gameobjects",
 ]);
 
 const INSPECTION_TOOLS = new Set([
@@ -39,6 +43,7 @@ const INSPECTION_TOOLS = new Set([
   "read_document",
   "analyze_tabular_document",
   "query_tabular_document",
+  "execute_code",
 ]);
 
 const EDIT_TOOLS = new Set(["replace_in_file", "write_file"]);
@@ -51,6 +56,7 @@ const COMMAND_TOOLS = new Set([
   "read_pty_since",
   "get_pty_status",
   "clear_pty_buffer",
+  "manage_camera",
 ]);
 
 const VERIFY_COMMAND_RE = /\b(?:test|build|lint|check|typecheck|tsc|playwright|vitest|jest|pytest|cargo\s+(?:test|check)|go\s+test)\b/i;

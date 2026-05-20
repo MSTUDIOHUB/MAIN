@@ -50,6 +50,7 @@ function loadTranspiledModuleSync(sourcePath) {
 
 const {
   buildToolProgressNarration,
+  progressNarrationToText,
   summarizeToolObservation,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/progressNarration.ts"));
 const {
@@ -100,6 +101,20 @@ test("run_command npm build narration explains verification criteria", () => {
   assert.match(progress.why, /退出码为 0/);
   assert.match(progress.evidence, /stdout\/stderr|退出码/);
   assert.match(progress.next, /验证结果/);
+});
+
+test("runtime progress narration does not echo prior progress or control tokens", () => {
+  const progress = buildToolProgressNarration({
+    toolName: "read_file",
+    target: "src/store/dashboardStore.ts",
+    language: "zh",
+    currentHypothesis: "正在读取 src/store/dashboardStore.ts。 thought 因此先检查 src/store/dashboardStore.ts，确认是否有代码证据。",
+  });
+  const text = progressNarrationToText(progress, "zh");
+
+  assert.doesNotMatch(progress.why, /thought|因为：|因此先检查/);
+  assert.doesNotMatch(text, /thought|因为：/);
+  assert.match(text, /正在读取|等待返回内容/);
 });
 
 test("contextual tool intent names the target role and hypothesis", () => {

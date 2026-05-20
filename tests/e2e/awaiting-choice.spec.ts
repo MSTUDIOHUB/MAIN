@@ -98,20 +98,23 @@ test("custom reply option continues within the same turn", async ({ page }) => {
   await expect(page.getByText(/已按你的选择继续/)).toBeVisible();
 });
 
-test("mixed choice options split approval actions and keep numbering for real choices", async ({ page }) => {
+test("mixed choice options keep execution choices together and split read-only permissions", async ({ page }) => {
   await page.goto("/?e2eScenario=awaiting-choice-mixed-options");
 
   await expect(page.getByTestId("top-island-awaiting-choice")).toBeVisible();
   await expect(page.getByTestId("top-island-reply-option-0")).toBeVisible();
   await expect(page.getByTestId("top-island-reply-option-1")).toBeVisible();
-  await expect(page.getByTestId("top-island-reply-option-2")).toHaveCount(0);
+  await expect(page.getByTestId("top-island-reply-option-2")).toBeVisible();
+  await expect(page.getByTestId("top-island-reply-option-3")).toHaveCount(0);
   await expect(page.getByTestId("top-island-reply-option-badge-0")).toHaveText("1.");
   await expect(page.getByTestId("top-island-reply-option-badge-1")).toHaveText("2.");
-  await expect(page.getByTestId("top-island-custom-reply-badge")).toHaveText("3.");
+  await expect(page.getByTestId("top-island-reply-option-badge-2")).toHaveText("3.");
+  await expect(page.getByTestId("top-island-reply-option-1")).toContainText("我来确认类型，然后执行修复");
+  await expect(page.getByTestId("top-island-custom-reply-badge")).toHaveText("4.");
 
   const approvalSection = page.getByTestId("top-island-approval-actions");
   await expect(approvalSection).toBeVisible();
-  await expect(approvalSection).toContainText("执行批准动作");
+  await expect(approvalSection).toContainText("只读授权动作");
   await expect(page.getByTestId("top-island-approval-option-0")).toContainText("继续当前只读读取");
   await expect(page.getByTestId("top-island-approval-option-1")).toContainText("当前会话只读步骤全部批准");
 

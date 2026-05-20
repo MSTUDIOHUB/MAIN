@@ -301,6 +301,33 @@ test("normalization marks explicit <user_options> tags even when tool calls coex
   assert.equal(normalized.toolCalls[0].name, "read_file");
 });
 
+test("normalization does not add proposal follow-up controls when explicit options exist", () => {
+  const normalized = normalizeAssistantTurn({
+    content: [
+      "建议先修复 dashboardStore.ts 的过滤逻辑。",
+      "",
+      "是否开始执行这个修复方案？",
+      "",
+      "<user_options>",
+      "<option action=\"approve_operation_once\">我来确认类型，然后执行修复</option>",
+      "<option action=\"adjust_plan\">调整方案：直接尝试修复 dashboardStore.ts</option>",
+      "</user_options>",
+    ].join("\n"),
+    toolCalls: [],
+    finishReason: "stop",
+  });
+
+  assert.equal(normalized.replyOptions.length, 2);
+  assert.deepEqual(
+    normalized.replyOptions.map((option) => option.source),
+    ["explicit_user_options", "explicit_user_options"],
+  );
+  assert.deepEqual(
+    normalized.replyOptions.map((option) => option.action),
+    ["approve_operation_once", "adjust_plan"],
+  );
+});
+
 test("normalization recovers malformed tool_use without leaking XML or becoming empty", () => {
   const normalized = normalizeAssistantTurn({
     content: [

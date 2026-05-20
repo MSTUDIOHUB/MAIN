@@ -58,6 +58,34 @@ function compactLine(text: string, maxChars = 180): string {
   return `${normalized.slice(0, maxChars - 3).trim()}...`;
 }
 
+function compactMarkdownSnippet(text: string, maxChars = 180): string {
+  const normalized = String(text || "")
+    .replace(/\r\n/g, "\n")
+    .replace(/<\/?(?:analysis|thought|thinking|reasoning)(?:\s[^>]*)?>/gi, " ")
+    .replace(/\b(?:thought|analysis|thinking|reasoning)\b[:：]?/gi, " ")
+    .replace(/^(?:因为|原因|下一步|正在做|证据)\s*[:：]\s*/gm, "")
+    .replace(/[ \t]+/g, " ")
+    .replace(/[ \t]*\n[ \t]*/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  if (normalized.length <= maxChars) return normalized;
+  return `${normalized.slice(0, maxChars - 3).trim()}...`;
+}
+
+function looksLikeProgressEcho(text: string): boolean {
+  const normalized = String(text || "").replace(/\s+/g, " ").trim();
+  if (!normalized) return false;
+  return (
+    /(?:正在|等待|已读取|已搜索|已记录|已确认|下一步|根据证据|用.*作为成功标准)/.test(normalized) &&
+    /(?:读取|搜索|修改|运行|验证|工具|返回|结果|证据)/.test(normalized)
+  );
+}
+
+function compactContextSnippet(text: string, maxChars = 180): string {
+  const normalized = compactMarkdownSnippet(text, maxChars);
+  return looksLikeProgressEcho(normalized) ? "" : normalized;
+}
+
 function compactGoal(goal: string, language: ToolPresentationLanguage): string {
   const normalized = compactLine(goal, language === "zh" ? 42 : 54);
   if (!normalized) return "";
@@ -179,8 +207,8 @@ function buildWhy(input: ToolProgressNarrationInput & {
 }): string {
   const { language, phase, progressPhase, role } = input;
   const goal = compactGoal(String(input.userGoal || ""), language);
-  const hypothesis = compactLine(String(input.currentHypothesis || ""), 150);
-  const observation = compactLine(String(input.previousObservation || ""), 150);
+  const hypothesis = compactContextSnippet(String(input.currentHypothesis || ""), 150);
+  const observation = compactContextSnippet(String(input.previousObservation || ""), 150);
   const target = String(input.target || "");
 
   if (language === "en") {
@@ -195,7 +223,7 @@ function buildWhy(input: ToolProgressNarrationInput & {
       if (/\btest|vitest|jest|playwright|pytest|go\s+test|cargo\s+test\b/i.test(target)) return "Use the test output as evidence that the affected behavior still passes.";
       return "Use command output as concrete evidence before claiming the work is complete.";
     }
-    if (hypothesis) return `${hypothesis} This step checks ${role} for code evidence before changing anything.`;
+    if (hypothesis) return `Current judgment points to ${hypothesis}. This step checks ${role} for evidence before changing anything.`;
     if (observation) return `The previous result showed ${observation}; this step narrows the next useful evidence in ${role}.`;
     return goal
       ? `The goal ${goal} depends on how ${role} currently works, so this step gathers that context first.`
@@ -213,7 +241,7 @@ function buildWhy(input: ToolProgressNarrationInput & {
     if (/\btest|vitest|jest|playwright|pytest|go\s+test|cargo\s+test\b/i.test(target)) return "用测试输出确认受影响行为仍然通过，而不是只依赖文字判断。";
     return "用命令输出作为真实反馈，确认是否可以继续总结或需要修复。";
   }
-  if (hypothesis) return `${hypothesis} 因此先检查 ${role}，确认是否有代码证据。`;
+  if (hypothesis) return `当前判断指向：${hypothesis}。先查看 ${role}，用代码证据确认后再继续。`;
   if (observation) return `前一步结果显示 ${observation}，所以继续在 ${role} 收窄证据。`;
   return goal
     ? `用户目标 ${goal} 依赖 ${role} 的当前实现，先确认上下文再修改。`
@@ -403,8 +431,8 @@ export function normalizeProgressNarration(progress: ProgressNarration): Progres
   return {
     phase,
     title: compactLine(progress.title, 120),
-    why: compactLine(progress.why, 240),
-    action: compactLine(progress.action, 220),
+    why: compactMarkdownSnippet(progress.why, 240),
+    action: compactMarkdownSnippet(progress.action, 220),
     evidence: compactLine(progress.evidence, 220),
     next: compactLine(progress.next, 220),
     targets: Array.from(new Set((progress.targets || []).map((target) => compactLine(target, 80)).filter(Boolean))).slice(0, 6),
@@ -416,13 +444,25 @@ export function normalizeProgressNarration(progress: ProgressNarration): Progres
 export function progressNarrationToText(progress: ProgressNarration, language: ToolPresentationLanguage = "zh"): string {
   const normalized = normalizeProgressNarration(progress);
   const lines = [
-    normalized.title,
-    normalized.why,
     normalized.action,
+    normalized.why,
     normalized.evidence,
     normalized.next,
   ].filter(Boolean);
-  return compactLine(lines.join(language === "en" ? " " : " "), 420);
+  const distinctLines: string[] = [];
+  for (const line of lines) {
+    const normalizedLine = compactMarkdownSnippet(line, 240);
+    if (!normalizedLine) continue;
+    const key = normalizedLine.replace(/\s+/g, " ").toLowerCase();
+    if (distinctLines.some((existing) => {
+      const existingKey = existing.replace(/\s+/g, " ").toLowerCase();
+      return existingKey.includes(key) || key.includes(existingKey);
+    })) {
+      continue;
+    }
+    distinctLines.push(normalizedLine);
+  }
+  return compactMarkdownSnippet(distinctLines.join(language === "en" ? " " : " "), 420);
 }
 
 export function summarizeToolObservation(input: {

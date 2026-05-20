@@ -1630,6 +1630,46 @@ function ArchiveStepIcon({ step }: { step: TurnArchiveStep }) {
   return <IconCheck className={`${className} text-[#10b981]`} />;
 }
 
+function renderCompactMarkdownInline(text: string, keyPrefix: string): React.ReactNode[] {
+  const nodes: React.ReactNode[] = [];
+  const tokenRe = /(\*\*[^*\n]+?\*\*|`[^`\n]+?`)/g;
+  let cursor = 0;
+  let match: RegExpExecArray | null;
+  let index = 0;
+
+  while ((match = tokenRe.exec(text)) !== null) {
+    if (match.index > cursor) nodes.push(text.slice(cursor, match.index));
+    const token = match[0] || "";
+    if (token.startsWith("**") && token.endsWith("**")) {
+      nodes.push(
+        <strong key={`${keyPrefix}-strong-${index}`} className="font-semibold text-[var(--surface-text)]">
+          {token.slice(2, -2)}
+        </strong>,
+      );
+    } else if (token.startsWith("`") && token.endsWith("`")) {
+      nodes.push(
+        <code key={`${keyPrefix}-code-${index}`} className="rounded border border-[var(--surface-border-soft)] bg-[color-mix(in_srgb,var(--accent)_10%,transparent)] px-1 py-[1px] font-mono text-[0.92em] text-[var(--surface-text)]">
+          {token.slice(1, -1)}
+        </code>,
+      );
+    }
+    cursor = match.index + token.length;
+    index += 1;
+  }
+
+  if (cursor < text.length) nodes.push(text.slice(cursor));
+  return nodes.length > 0 ? nodes : [text];
+}
+
+function renderCompactMarkdownText(text: string): React.ReactNode {
+  return String(text || "").replace(/\r\n/g, "\n").split("\n").map((line, lineIndex) => (
+    <React.Fragment key={`compact-md-line-${lineIndex}`}>
+      {lineIndex > 0 && <br />}
+      {renderCompactMarkdownInline(line, `compact-md-${lineIndex}`)}
+    </React.Fragment>
+  ));
+}
+
 function TurnArchiveStepCard({
   step,
   language,
@@ -1645,11 +1685,12 @@ function TurnArchiveStepCard({
   onOpenDiff: (taskId: number) => void;
   variant?: "archive" | "live";
 }) {
-  const [expanded, setExpanded] = useState(step.expandedByDefault);
+  const isLive = variant === "live";
+  const [expanded, setExpanded] = useState(!isLive && step.expandedByDefault);
   const { entries, totalExecutedEdits } = collectTurnChangeEntries(step.items);
   const hasChangeSummary = step.kind === "edit" && entries.length > 0;
   const detailItems = buildBlockRenderItems(step.items, false);
-  const isLive = variant === "live";
+  const canExpandDetails = !isLive && (hasChangeSummary || detailItems.length > 0);
   const toggleText = expanded
     ? isLive
       ? language === "zh" ? "收起操作" : "Hide actions"
@@ -1660,6 +1701,41 @@ function TurnArchiveStepCard({
   const targetText = step.targets.slice(0, 3).join(language === "zh" ? "、" : ", ");
   const hiddenTargetCount = Math.max(0, step.targets.length - 3);
   const shouldShowTargetSummary = targetText && !step.intent.includes(targetText);
+  const summaryText = step.summary
+    ? `${step.summary}${shouldShowTargetSummary ? ` · ${targetText}${hiddenTargetCount ? ` +${hiddenTargetCount}` : ""}` : ""}`
+    : "";
+  const headerContent = (
+    <>
+      <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center">
+        <ArchiveStepIcon step={step} />
+      </span>
+      <span className="min-w-0 flex-1">
+        <span className="flex min-w-0 flex-wrap items-center gap-1.5 text-[10px] font-medium text-[var(--surface-text-subtle)]">
+          <span data-testid="turn-archive-step-label" className="uppercase tracking-[0.12em]">
+            {getArchiveStepLabel(step, language)}
+          </span>
+          <span className="text-[var(--surface-text-subtle)]">·</span>
+          <span>
+            {getArchiveStepStatusLabel(step, language)}
+          </span>
+        </span>
+        <span data-testid="turn-archive-step-intent" className="mt-1 block whitespace-pre-wrap break-words text-[12.5px] font-medium leading-5 text-[var(--surface-text)]">
+          {renderCompactMarkdownText(step.intent)}
+        </span>
+        {summaryText && (
+          <span data-testid="turn-archive-step-summary" className="mt-0.5 block whitespace-pre-wrap break-words text-[11px] leading-4 text-[var(--surface-text-subtle)]">
+            {renderCompactMarkdownText(summaryText)}
+          </span>
+        )}
+      </span>
+      {canExpandDetails && (
+        <span className="inline-flex shrink-0 items-center gap-1.5 px-1 py-1 text-[10px] text-[var(--surface-text-muted)] transition-colors group-hover:text-[var(--surface-text)]">
+          {expanded ? <IconChevronDown className="h-3.5 w-3.5" /> : <IconChevronRight className="h-3.5 w-3.5" />}
+          {toggleText}
+        </span>
+      )}
+    </>
+  );
 
   return (
     <div
@@ -1668,42 +1744,23 @@ function TurnArchiveStepCard({
       data-status={step.status}
       className="border-t border-[var(--surface-border-soft)] py-2 first:border-t-0"
     >
-      <button
-        type="button"
-        data-testid="turn-archive-step-toggle"
-        aria-expanded={expanded}
-        onClick={() => setExpanded((value) => !value)}
-        className="group flex w-full min-w-0 items-start gap-3 rounded-lg px-1 py-1 text-left transition-colors hover:bg-[color-mix(in_srgb,var(--accent)_6%,transparent)]"
-      >
-        <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center">
-          <ArchiveStepIcon step={step} />
-        </span>
-        <span className="min-w-0 flex-1">
-          <span className="flex min-w-0 flex-wrap items-center gap-1.5 text-[10px] font-medium text-[var(--surface-text-subtle)]">
-            <span data-testid="turn-archive-step-label" className="uppercase tracking-[0.12em]">
-              {getArchiveStepLabel(step, language)}
-            </span>
-            <span className="text-[var(--surface-text-subtle)]">·</span>
-            <span>
-              {getArchiveStepStatusLabel(step, language)}
-            </span>
-          </span>
-          <span data-testid="turn-archive-step-intent" className="mt-1 block whitespace-pre-wrap text-[12.5px] font-medium leading-5 text-[var(--surface-text)]">
-            {step.intent}
-          </span>
-          {step.summary && (
-            <span data-testid="turn-archive-step-summary" className="mt-0.5 block whitespace-pre-wrap break-words text-[11px] leading-4 text-[var(--surface-text-subtle)]">
-              {step.summary}{shouldShowTargetSummary ? ` · ${targetText}${hiddenTargetCount ? ` +${hiddenTargetCount}` : ""}` : ""}
-            </span>
-          )}
-        </span>
-        <span className="inline-flex shrink-0 items-center gap-1.5 px-1 py-1 text-[10px] text-[var(--surface-text-muted)] transition-colors group-hover:text-[var(--surface-text)]">
-          {expanded ? <IconChevronDown className="h-3.5 w-3.5" /> : <IconChevronRight className="h-3.5 w-3.5" />}
-          {toggleText}
-        </span>
-      </button>
+      {canExpandDetails ? (
+        <button
+          type="button"
+          data-testid="turn-archive-step-toggle"
+          aria-expanded={expanded}
+          onClick={() => setExpanded((value) => !value)}
+          className="group flex w-full min-w-0 items-start gap-3 rounded-lg px-1 py-1 text-left transition-colors hover:bg-[color-mix(in_srgb,var(--accent)_6%,transparent)]"
+        >
+          {headerContent}
+        </button>
+      ) : (
+        <div className="flex w-full min-w-0 items-start gap-3 rounded-lg px-1 py-1 text-left">
+          {headerContent}
+        </div>
+      )}
 
-      {expanded && (
+      {canExpandDetails && expanded && (
         <div data-testid="turn-archive-step-details" className="mt-2 space-y-2 pl-8">
           {hasChangeSummary ? (
             <TurnChangesCard

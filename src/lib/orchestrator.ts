@@ -5825,8 +5825,8 @@ export async function executeAgentLoop(
       });
     }
 
-    if (effectiveToolCalls.length > 0 && !visibleAssistantText.trim()) {
-      const narration = buildToolActionNarration({
+    const toolActionNarration = effectiveToolCalls.length > 0
+      ? buildToolActionNarration({
         calls: effectiveToolCalls,
         workspace,
         language: callbacks.getPreferredLanguage(),
@@ -5834,19 +5834,20 @@ export async function executeAgentLoop(
         isPlanApproved: callbacks.getIsPlanApproved(),
         userGoal: latestUserPromptText,
         turnIntent,
-        currentHypothesis: lastAssistantTextForCheckpoint,
+        currentHypothesis: visibleAssistantText.trim() || lastAssistantTextForCheckpoint,
         previousObservation: recentToolActivity[recentToolActivity.length - 1]?.detail || "",
+      })
+      : null;
+    const runtimeNarrationInjected = effectiveToolCalls.length > 0 && !visibleAssistantText.trim() && !!toolActionNarration;
+    if (runtimeNarrationInjected && toolActionNarration) {
+      visibleAssistantText = progressNarrationToText(toolActionNarration, callbacks.getPreferredLanguage());
+      logAgentEvent("tool_action_narration_injected", {
+        iteration,
+        workflowMode,
+        turnIntent,
+        toolCalls: effectiveToolCalls.length,
+        toolNames: effectiveToolCalls.map((call) => call.name).slice(0, 8),
       });
-      if (narration) {
-        visibleAssistantText = progressNarrationToText(narration, callbacks.getPreferredLanguage());
-        logAgentEvent("tool_action_narration_injected", {
-          iteration,
-          workflowMode,
-          turnIntent,
-          toolCalls: effectiveToolCalls.length,
-          toolNames: effectiveToolCalls.map((call) => call.name).slice(0, 8),
-        });
-      }
     }
 
     if (effectiveToolCalls.length > 0 && containsToolUseBlock(streamText)) {
@@ -5861,7 +5862,7 @@ export async function executeAgentLoop(
     }
 
     const historyAssistantText = visibleAssistantText || "";
-    if (historyAssistantText.trim()) {
+    if (historyAssistantText.trim() && !runtimeNarrationInjected) {
       lastAssistantTextForCheckpoint = historyAssistantText;
     }
 
@@ -5878,17 +5879,7 @@ export async function executeAgentLoop(
         hasToolCalls: effectiveToolCalls.length > 0,
         visibility: effectiveToolCalls.length > 0 ? "user_progress" : undefined,
         progress: effectiveToolCalls.length > 0
-          ? buildToolActionNarration({
-              calls: effectiveToolCalls,
-              workspace,
-              language: callbacks.getPreferredLanguage(),
-              workflowMode,
-              isPlanApproved: callbacks.getIsPlanApproved(),
-              userGoal: latestUserPromptText,
-              turnIntent,
-              currentHypothesis: visibleAssistantText,
-              previousObservation: recentToolActivity[recentToolActivity.length - 1]?.detail || "",
-            }) || undefined
+          ? toolActionNarration || undefined
           : undefined,
         hiddenThought: normalized.hiddenThought,
         toolCalls: effectiveToolCalls.map((call) => {

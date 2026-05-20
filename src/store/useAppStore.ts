@@ -8776,7 +8776,7 @@ export const useAppStore = create<AppState>()(
               status: "running",
               source: "model",
               userGoal: getTurnUserGoal(currentFlowForProgress, turnId, displayText),
-              currentHypothesis: displayText,
+              currentHypothesis: metaVisibility === "user_progress" ? "" : displayText,
               previousObservation: getLatestTurnToolObservationText(currentFlowForProgress, turnId),
               turnIntent: effectiveRunIntent,
               workflowMode: sessionGet().config.workflowMode,
