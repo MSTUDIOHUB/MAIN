@@ -546,6 +546,91 @@ function PlanExecutionSystemNotice({ block, language }: { block: any; language: 
   );
 }
 
+function ProgressBlock({
+  block,
+  language,
+}: {
+  block: any;
+  language: "zh" | "en";
+}) {
+  const phase = String(block.phase || "investigating");
+  const status = String(block.status || "running");
+  const title = String(block.title || (language === "zh" ? "正在推进" : "Working"));
+  const why = String(block.why || "");
+  const action = String(block.action || "");
+  const evidence = String(block.evidence || "");
+  const next = String(block.next || "");
+  const targets = Array.isArray(block.targets) ? block.targets.filter(Boolean).slice(0, 3) : [];
+  const phaseLabel = language === "zh"
+    ? phase === "understanding" ? "理解目标"
+      : phase === "editing" ? "修改中"
+      : phase === "verifying" ? "验证中"
+      : phase === "blocked" ? "受阻"
+      : phase === "summarizing" ? "整理中"
+      : "调查中"
+    : phase === "understanding" ? "Understanding"
+      : phase === "editing" ? "Editing"
+      : phase === "verifying" ? "Verifying"
+      : phase === "blocked" ? "Blocked"
+      : phase === "summarizing" ? "Summarizing"
+      : "Investigating";
+  const statusLabel = language === "zh"
+    ? status === "done" ? "完成" : status === "failed" ? "失败" : "进行中"
+    : status === "done" ? "Done" : status === "failed" ? "Failed" : "Running";
+  const Icon = phase === "editing"
+    ? IconCode
+    : phase === "verifying"
+    ? IconTerminal
+    : phase === "blocked"
+    ? IconClose
+    : phase === "summarizing"
+    ? IconColumns
+    : IconFileText;
+  const statusClass = status === "failed"
+    ? "text-[#fb7185] border-[rgba(251,113,133,0.28)] bg-[rgba(251,113,133,0.08)]"
+    : status === "done"
+    ? "text-[#86efac] border-[rgba(52,211,153,0.22)] bg-[rgba(52,211,153,0.08)]"
+    : "text-[#93c5fd] border-[rgba(96,165,250,0.28)] bg-[rgba(96,165,250,0.1)]";
+
+  return (
+    <div data-testid="progress-block" data-phase={phase} data-status={status} className="ml-9 w-full max-w-[min(820px,calc(100%-2.25rem))]">
+      <div className="rounded-xl border border-[color-mix(in_srgb,var(--accent-light)_28%,transparent)] bg-[color-mix(in_srgb,var(--accent)_8%,#050505)] px-3.5 py-3 shadow-sm">
+        <div className="flex min-w-0 items-start gap-3">
+          <span className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-[rgba(96,165,250,0.18)] bg-[rgba(96,165,250,0.08)] text-[#93c5fd]">
+            {status === "running" ? (
+              <span className="h-2.5 w-2.5 rounded-full bg-[#60a5fa] shadow-[0_0_10px_rgba(96,165,250,0.75)] animate-pulse" />
+            ) : (
+              <Icon className="h-3.5 w-3.5" />
+            )}
+          </span>
+          <div className="min-w-0 flex-1">
+            <div className="flex min-w-0 flex-wrap items-center gap-2">
+              <span className="text-[10px] font-medium uppercase tracking-[0.16em] text-[#93c5fd]">{phaseLabel}</span>
+              <span className={`rounded-full border px-2 py-0.5 text-[10px] ${statusClass}`}>{statusLabel}</span>
+              {targets.length > 0 && (
+                <span className="min-w-0 truncate text-[10px] text-[var(--surface-text-muted)]">
+                  {targets.join(language === "zh" ? "、" : ", ")}
+                </span>
+              )}
+            </div>
+            <div className="mt-1 text-[13px] font-semibold leading-5 text-[var(--surface-text)]">{title}</div>
+            {why && (
+              <div data-testid="progress-why" className="mt-1 text-[12px] leading-5 text-[var(--surface-text-subtle)]">{why}</div>
+            )}
+            {(action || evidence || next) && (
+              <div className="mt-2 grid gap-1.5 text-[11px] leading-5 text-[var(--surface-text-subtle)]">
+                {action && <div><span className="text-[#93c5fd]">{language === "zh" ? "正在做：" : "Action: "}</span>{action}</div>}
+                {evidence && <div><span className="text-[#a5b4fc]">{language === "zh" ? "证据：" : "Evidence: "}</span>{evidence}</div>}
+                {next && <div><span className="text-[#86efac]">{language === "zh" ? "下一步：" : "Next: "}</span>{next}</div>}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function hasRenderableAgentContent(blocks: any[]) {
   return blocks.some((block) => hasRenderableAgentBlock(block));
 }
@@ -699,6 +784,7 @@ function isCompletedReadContextTool(block: any) {
 function isReadContextHardBoundary(block: any) {
   if (!block) return false;
   if (block.type === "user" || block.type === "jobList") return true;
+  if (block.type === "progress") return true;
   if (block.type === "agent") {
     if (block.hiddenProcess && !block.streaming) return false;
     return hasRenderableAgentBlock(block);
@@ -1177,6 +1263,9 @@ function ReadContextGroupCard({
   const previewTargets = targets.slice(0, 3).filter(Boolean);
   const hiddenCount = Math.max(0, targets.length - previewTargets.length);
   const previewText = previewTargets.join(language === "zh" ? "、" : ", ");
+  const previewPurpose = blocks
+    .map((block) => String(block.observationSummary || block.intentSummary || block.why || ""))
+    .find(Boolean);
   const title = language === "zh"
     ? `已读取 ${blocks.length} 项上下文`
     : `Read ${blocks.length} context item${blocks.length > 1 ? "s" : ""}`;
@@ -1203,6 +1292,11 @@ function ReadContextGroupCard({
         {previewText && (
           <span className="min-w-0 flex-1 truncate text-[11px] text-[#71717a]">
             · {previewText}{hiddenCount > 0 ? ` +${hiddenCount}` : ""}
+          </span>
+        )}
+        {previewPurpose && (
+          <span data-testid="read-context-group-summary" className="min-w-0 flex-1 truncate text-[11px] text-[#94a3b8]">
+            {previewPurpose}
           </span>
         )}
         <span className="shrink-0 rounded-full border border-[#27272a] bg-[#050507] px-2 py-0.5 text-[10px] text-[#a1a1aa]">
@@ -1240,6 +1334,11 @@ function ReadContextGroupCard({
                       {target}
                     </div>
                   )}
+                  {(block.observationSummary || block.intentSummary || block.why) && (
+                    <div data-testid="read-context-item-summary" className="truncate text-[10.5px] text-[#94a3b8]">
+                      {block.observationSummary || block.intentSummary || block.why}
+                    </div>
+                  )}
                 </div>
                 <span className="shrink-0 rounded-full border border-[rgba(52,211,153,0.18)] bg-[rgba(52,211,153,0.08)] px-1.5 py-0.5 text-[9px] text-[#86efac]">
                   {language === "zh" ? "完成" : "Done"}
@@ -1274,6 +1373,9 @@ function CompletedToolGroupCard({
     .map((block) => compactToolTarget(block.target, String(block.toolName || ""), language))
     .filter(Boolean);
   const hiddenCount = Math.max(0, toolBlocks.length - previewNames.length);
+  const previewPurpose = toolBlocks
+    .map((block) => String(block.observationSummary || block.intentSummary || block.why || ""))
+    .find(Boolean);
   const title = language === "zh"
     ? `已完成 ${toolBlocks.length} 次工具调用`
     : `${toolBlocks.length} completed tool call${toolBlocks.length > 1 ? "s" : ""}`;
@@ -1300,6 +1402,11 @@ function CompletedToolGroupCard({
         {previewNames.length > 0 && (
           <span className="min-w-0 flex-1 truncate text-[11px] text-[#71717a]">
             · {previewNames.join(language === "zh" ? "、" : ", ")}{hiddenCount > 0 ? ` +${hiddenCount}` : ""}
+          </span>
+        )}
+        {previewPurpose && (
+          <span data-testid="completed-tool-group-summary" className="min-w-0 flex-1 truncate text-[11px] text-[#94a3b8]">
+            {previewPurpose}
           </span>
         )}
         <span className="shrink-0 rounded-full border border-[#27272a] bg-[#050507] px-2 py-0.5 text-[10px] text-[#a1a1aa]">
@@ -1339,6 +1446,11 @@ function CompletedToolGroupCard({
                   {target !== displayTarget && (
                     <div className="truncate font-mono text-[10px] text-[#52525b]" title={target}>
                       {target}
+                    </div>
+                  )}
+                  {(block.observationSummary || block.intentSummary || block.why) && (
+                    <div data-testid="completed-tool-item-summary" className="truncate text-[10.5px] text-[#94a3b8]">
+                      {block.observationSummary || block.intentSummary || block.why}
                     </div>
                   )}
                 </div>
@@ -2487,6 +2599,14 @@ export default function ChatArea({
       );
     }
 
+    if (block.type === "progress") {
+      return (
+        <div key={`${block.id}-${index}`} className="flex w-full justify-start">
+          <ProgressBlock block={block} language={language} />
+        </div>
+      );
+    }
+
     if (block.type === "jobList") {
       return (
         <div key={`${block.id}-${index}`} className="flex w-full justify-start">
@@ -2517,6 +2637,10 @@ export default function ChatArea({
             message={block.message}
             diff={block.diff}
             shellPermissionDecision={block.shellPermissionDecision}
+            intentSummary={block.intentSummary}
+            why={block.why}
+            evidence={block.evidence}
+            observationSummary={block.observationSummary}
             onAllow={() => allowToolAction?.(block.id)}
             onAllowForSession={() => approvePendingReviewForSession?.()}
             onReject={() => rejectToolAction?.(block.id)}

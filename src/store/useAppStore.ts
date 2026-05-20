@@ -128,6 +128,15 @@ import { buildToolDiffPreview, supportsToolDiffPreview } from "../lib/toolDiff";
 import { findToolLifecycleBlockIndex, type ToolLifecycleMeta } from "../lib/toolLifecycle";
 import { deriveToolIntentSummary } from "../lib/toolPresentation";
 import {
+  buildToolProgressNarration,
+  normalizeProgressNarration,
+  progressNarrationToText,
+  summarizeToolObservation,
+  type ProgressNarration,
+  type ProgressNarrationSource,
+  type ProgressNarrationStatus,
+} from "../lib/progressNarration";
+import {
   deriveTurnRuntimePhaseForText,
   deriveTurnRuntimePhaseForTool,
   makeTurnRuntimePhase,
@@ -959,10 +968,21 @@ export interface DiffRevertResult {
   message: string;
 }
 
+export type AssistantTextVisibility = "user_progress" | "hidden_process";
+
+export type ProgressTaskBlock = TaskBlockBase & ProgressNarration & {
+  type: "progress";
+  toolCallId?: string;
+  toolCallIds?: string[];
+  toolName?: string;
+  target?: string;
+};
+
 export type TaskBlock =
   | (TaskBlockBase & { type: "user"; content: string; images?: string[]; contextItems?: UserContextItem[] })
-  | (TaskBlockBase & { type: "tool"; toolName: string; target: string; status: string; toolStatus: "pending" | "executed" | "rejected" | "running" | "failed"; toolCallId?: string; message?: string; diff?: ToolDiffSnapshot; shellPermissionDecision?: ShellPermissionDecision; revertStatus?: DiffRevertStatus; revertMessage?: string; intentSummary?: string })
-  | (TaskBlockBase & { type: "agent"; content: string; options?: ReplyOption[]; streaming?: boolean; hiddenProcess?: boolean; archivedAfterChoice?: boolean; selectedOption?: string })
+  | (TaskBlockBase & { type: "tool"; toolName: string; target: string; status: string; toolStatus: "pending" | "executed" | "rejected" | "running" | "failed"; toolCallId?: string; message?: string; diff?: ToolDiffSnapshot; shellPermissionDecision?: ShellPermissionDecision; revertStatus?: DiffRevertStatus; revertMessage?: string; intentSummary?: string; why?: string; evidence?: string; observationSummary?: string })
+  | (TaskBlockBase & { type: "agent"; content: string; options?: ReplyOption[]; streaming?: boolean; hiddenProcess?: boolean; visibility?: AssistantTextVisibility; archivedAfterChoice?: boolean; selectedOption?: string })
+  | ProgressTaskBlock
   | (TaskBlockBase & { type: "thought"; content: string; isStreaming?: boolean; duration?: number })
   | (TaskBlockBase & { type: "jobList"; jobs: JobItem[] })
   | (TaskBlockBase & {
@@ -2678,6 +2698,101 @@ function normalizeAgentContentForDedupe(content: string): string {
     .trim();
 }
 
+function compactProgressContextText(text: string, maxChars = 180): string {
+  const normalized = String(text || "").replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxChars) return normalized;
+  return `${normalized.slice(0, maxChars - 3).trim()}...`;
+}
+
+function getLatestTurnProgressStrategyText(blocks: TaskBlock[], turnId: string): string {
+  for (let index = blocks.length - 1; index >= 0; index -= 1) {
+    const block = blocks[index];
+    if (block.turnId !== turnId) continue;
+    if (block.type === "progress") {
+      const text = block.why || block.title || block.action;
+      if (text) return compactProgressContextText(text);
+    }
+    if (block.type === "agent" && (block.hiddenProcess || block.visibility === "user_progress")) {
+      const text = normalizeAgentContentForDedupe(block.content || "");
+      if (text) return compactProgressContextText(text);
+    }
+  }
+  return "";
+}
+
+function getLatestTurnToolObservationText(blocks: TaskBlock[], turnId: string): string {
+  for (let index = blocks.length - 1; index >= 0; index -= 1) {
+    const block = blocks[index];
+    if (block.turnId !== turnId || block.type !== "tool") continue;
+    const tool = block as Extract<TaskBlock, { type: "tool" }>;
+    const text = tool.observationSummary || tool.evidence || tool.message || tool.intentSummary || "";
+    if (text) return compactProgressContextText(text);
+  }
+  return "";
+}
+
+function getTurnUserGoal(blocks: TaskBlock[], turnId: string, fallback = ""): string {
+  const userBlock = blocks.find((block) => block.turnId === turnId && block.type === "user");
+  if (userBlock?.type === "user") return compactProgressContextText(userBlock.content || "", 240);
+  return compactProgressContextText(fallback, 240);
+}
+
+function progressBlockMatchesTool(block: Extract<TaskBlock, { type: "progress" }>, toolCallId?: string, toolName?: string, target?: string): boolean {
+  const normalizedToolCallId = String(toolCallId || "").trim();
+  if (normalizedToolCallId) {
+    if (String(block.toolCallId || "") === normalizedToolCallId) return true;
+    if (Array.isArray(block.toolCallIds) && block.toolCallIds.map(String).includes(normalizedToolCallId)) return true;
+  }
+  return !!toolName && block.toolName === toolName && String(block.target || "") === String(target || "");
+}
+
+function updateRelatedProgressBlocks(input: {
+  blocks: TaskBlock[];
+  turnId: string;
+  toolName: string;
+  target: string;
+  toolCallId?: string;
+  status: ProgressNarrationStatus;
+  source: ProgressNarrationSource;
+  evidence?: string;
+  next?: string;
+}): TaskBlock[] {
+  let matched = false;
+  const updated = input.blocks.map((block) => {
+    if (block.type !== "progress" || block.turnId !== input.turnId) return block;
+    if (!progressBlockMatchesTool(block, input.toolCallId, input.toolName, input.target)) return block;
+    matched = true;
+    return {
+      ...block,
+      status: input.status,
+      source: input.source,
+      ...(input.evidence ? { evidence: input.evidence } : {}),
+      ...(input.next ? { next: input.next } : {}),
+    };
+  });
+  if (matched) return updated;
+
+  const fallbackIdx = (() => {
+    for (let index = updated.length - 1; index >= 0; index -= 1) {
+      const block = updated[index];
+      if (block.type === "progress" && block.turnId === input.turnId && block.status === "running") return index;
+    }
+    return -1;
+  })();
+  if (fallbackIdx < 0) return updated;
+  const fallback = updated[fallbackIdx];
+  if (fallback.type !== "progress") return updated;
+  const next = [...updated];
+  next[fallbackIdx] = {
+    ...fallback,
+    status: input.status,
+    source: input.source,
+    ...(input.evidence ? { evidence: input.evidence } : {}),
+    ...(input.next ? { next: input.next } : {}),
+  };
+  return next;
+}
+
 function isContinuationPrompt(input: string): boolean {
   return looksLikePreviousTurnContinuationInput(input);
 }
@@ -3113,6 +3228,7 @@ export function sanitizeTaskBlocksForPersist(blocks: TaskBlock[]): TaskBlock[] {
           type: "agent" as const,
           content: String(b.content),
           ...(b.hiddenProcess ? { hiddenProcess: true } : {}),
+          ...(b.visibility ? { visibility: b.visibility } : {}),
           ...(b.archivedAfterChoice ? { archivedAfterChoice: true } : {}),
           ...(b.selectedOption ? { selectedOption: String(b.selectedOption) } : {}),
           ...(b.options && b.options.length > 0
@@ -3124,6 +3240,22 @@ export function sanitizeTaskBlocksForPersist(blocks: TaskBlock[]): TaskBlock[] {
               }
             : {}),
         };
+      case "progress": {
+        const progress = normalizeProgressNarration(b);
+        return {
+          id: b.id,
+          turnId: b.turnId,
+          ...persistedTurnPhase(b),
+          type: "progress" as const,
+          ...progress,
+          ...(b.toolCallId ? { toolCallId: String(b.toolCallId) } : {}),
+          ...(Array.isArray(b.toolCallIds) && b.toolCallIds.length > 0
+            ? { toolCallIds: b.toolCallIds.map((id) => String(id)).filter(Boolean).slice(0, 12) }
+            : {}),
+          ...(b.toolName ? { toolName: String(b.toolName) } : {}),
+          ...(b.target ? { target: String(b.target) } : {}),
+        };
+      }
       case "thought":
         return {
           id: b.id,
@@ -3141,6 +3273,9 @@ export function sanitizeTaskBlocksForPersist(blocks: TaskBlock[]): TaskBlock[] {
           ...(b.toolCallId ? { toolCallId: String(b.toolCallId) } : {}),
           ...(b.message ? { message: String(b.message) } : {}),
           ...(b.intentSummary ? { intentSummary: String(b.intentSummary).slice(0, 160) } : {}),
+          ...(b.why ? { why: String(b.why).slice(0, 240) } : {}),
+          ...(b.evidence ? { evidence: String(b.evidence).slice(0, 240) } : {}),
+          ...(b.observationSummary ? { observationSummary: String(b.observationSummary).slice(0, 240) } : {}),
           ...(b.shellPermissionDecision ? { shellPermissionDecision: b.shellPermissionDecision } : {}),
           ...(b.diff
             ? {
@@ -4826,7 +4961,7 @@ export const useAppStore = create<AppState>()(
     const state = get();
     set((s) => ({
       taskFlow: s.taskFlow.map((t) =>
-        t.id === id ? { ...t, status: "error", toolStatus: "rejected", message: "Changes rejected by user." } : t
+        t.id === id && t.type === "tool" ? { ...t, status: "error", toolStatus: "rejected", message: "Changes rejected by user." } : t
       ),
       showDiff: false,
     }));
@@ -8608,8 +8743,14 @@ export const useAppStore = create<AppState>()(
               : "请选择你希望我如何继续。"
             : "";
           const cleanText = text.trim() || fallbackText;
-          const isProcessAssistantText = !!meta?.hasToolCalls && replyOptions.length === 0;
-          const processPhase = isProcessAssistantText
+          const metaVisibility = meta?.visibility;
+          const hasToolCallsWithoutOptions = !!meta?.hasToolCalls && replyOptions.length === 0;
+          const isHiddenProcessText = metaVisibility === "hidden_process";
+          const isUserProgressText =
+            metaVisibility === "user_progress" ||
+            !!meta?.progress ||
+            (hasToolCallsWithoutOptions && metaVisibility !== "hidden_process");
+          const processPhase = (isHiddenProcessText || isUserProgressText)
             ? (() => {
                 const firstCall = meta?.toolCalls?.[0];
                 if (firstCall) {
@@ -8618,10 +8759,32 @@ export const useAppStore = create<AppState>()(
                 return phaseForProcessText(cleanText);
               })()
             : currentTurnRuntimePhase;
-          const displayText = isProcessAssistantText
+          const displayText = isHiddenProcessText
             ? pickProcessAssistantText(cleanText, meta?.hiddenThought, language)
             : cleanText;
-          const stateVisibleText = isProcessAssistantText ? "" : displayText;
+          const stateVisibleText = isHiddenProcessText ? "" : displayText;
+          const progressFromMeta = (() => {
+            if (!isUserProgressText) return null;
+            if (meta?.progress) return normalizeProgressNarration(meta.progress);
+            const firstCall = meta?.toolCalls?.[0];
+            if (!firstCall) return null;
+            const currentFlowForProgress = sessionGet().taskFlow;
+            return buildToolProgressNarration({
+              toolName: firstCall.name,
+              target: firstCall.target || "",
+              language,
+              status: "running",
+              source: "model",
+              userGoal: getTurnUserGoal(currentFlowForProgress, turnId, displayText),
+              currentHypothesis: displayText,
+              previousObservation: getLatestTurnToolObservationText(currentFlowForProgress, turnId),
+              turnIntent: effectiveRunIntent,
+              workflowMode: sessionGet().config.workflowMode,
+            });
+          })();
+          const progressDisplayText = progressFromMeta
+            ? progressNarrationToText(progressFromMeta, language)
+            : displayText;
           const pendingOperationProposal = buildPendingOperationProposal({
             sourceTurnId: turnId,
             text: displayText,
@@ -8658,7 +8821,47 @@ export const useAppStore = create<AppState>()(
             latestBlockId: latestBlock?.id ?? null,
             agentBlocksCreatedThisRun: agentBlockIdsCreatedThisRun.size,
             taskFlowBlocks: currentFlow.length,
+            visibility: metaVisibility || (isUserProgressText ? "user_progress" : null),
           });
+
+          if (progressFromMeta) {
+            const toolCallIds = (meta?.toolCalls || [])
+              .map((call) => String((call as any).id || "").trim())
+              .filter(Boolean);
+            const firstCall = meta?.toolCalls?.[0];
+            sessionSet((s) => ({
+              normalizedStreamState: {
+                ...s.normalizedStreamState,
+                visibleText: progressDisplayText,
+                replyOptions,
+              },
+              ...(latestBlock && latestBlock.type === "agent"
+                ? {
+                    taskFlow: s.taskFlow.filter((block) => block.id !== latestBlock.id),
+                    conversationTurns: s.conversationTurns.map((turn) =>
+                      turn.id === turnId
+                        ? { ...turn, blockIds: turn.blockIds.filter((blockId) => blockId !== latestBlock.id) }
+                        : turn
+                    ),
+                  }
+                : {}),
+            }));
+            if (latestBlock?.type === "agent") {
+              agentBlockIdsCreatedThisRun.delete(latestBlock.id);
+            }
+            appendTurnBlock({
+              id: nextId(),
+              turnId,
+              turnPhase: processPhase,
+              type: "progress",
+              ...progressFromMeta,
+              ...(toolCallIds[0] ? { toolCallId: toolCallIds[0] } : {}),
+              ...(toolCallIds.length > 0 ? { toolCallIds } : {}),
+              ...(firstCall?.name ? { toolName: firstCall.name } : {}),
+              ...(firstCall?.target ? { target: firstCall.target } : {}),
+            });
+            return;
+          }
 
           if (!displayText) {
             if (latestBlock && latestBlock.type === "agent" && latestBlock.turnId === turnId) {
@@ -8717,7 +8920,8 @@ export const useAppStore = create<AppState>()(
               type: "agent",
               content: displayText,
               ...(replyOptions.length > 0 ? { options: replyOptions } : {}),
-              ...(isProcessAssistantText ? { hiddenProcess: true } : {}),
+              ...(isHiddenProcessText ? { hiddenProcess: true, visibility: "hidden_process" as const } : {}),
+              ...(isUserProgressText ? { visibility: "user_progress" as const } : {}),
               streaming: false,
             });
             markPendingOperationProposal();
@@ -8737,7 +8941,8 @@ export const useAppStore = create<AppState>()(
                     turnPhase: normalizeTurnRuntimePhase(t.turnPhase || processPhase, phaseLanguage),
                     content: displayText,
                     ...(replyOptions.length > 0 ? { options: replyOptions } : { options: undefined }),
-                    ...(isProcessAssistantText ? { hiddenProcess: true } : { hiddenProcess: undefined }),
+                    ...(isHiddenProcessText ? { hiddenProcess: true, visibility: "hidden_process" as const } : { hiddenProcess: undefined }),
+                    ...(isUserProgressText ? { visibility: "user_progress" as const } : { visibility: undefined }),
                     streaming: false,
                   }
                 : t
@@ -8752,11 +8957,30 @@ export const useAppStore = create<AppState>()(
           const normalizedToolCallId = String(meta?.toolCallId || "").trim() || undefined;
           const language = sessionGet().config.language === "en" ? "en" : "zh";
           const turnPhase = phaseForTool(toolName, target, "running");
+          const flowBeforeTool = sessionGet().taskFlow;
+          const userGoal = getTurnUserGoal(flowBeforeTool, turnId);
+          const currentHypothesis = getLatestTurnProgressStrategyText(flowBeforeTool, turnId);
+          const previousObservation = getLatestTurnToolObservationText(flowBeforeTool, turnId);
+          const progress = buildToolProgressNarration({
+            toolName,
+            target,
+            language,
+            status: "running",
+            source: "runtime",
+            userGoal,
+            currentHypothesis,
+            previousObservation,
+            turnIntent: effectiveRunIntent,
+            workflowMode: sessionGet().config.workflowMode,
+          });
           const intentSummary = deriveToolIntentSummary({
             toolName,
             target,
             language,
             toolStatus: "running",
+            userGoal,
+            currentHypothesis,
+            previousObservation,
           });
           const isEphemeralPlanArtifactTool =
             (toolName === "write_file" || toolName === "replace_in_file") &&
@@ -8785,7 +9009,9 @@ export const useAppStore = create<AppState>()(
                   ...(normalizedToolCallId ? { toolCallId: normalizedToolCallId } : {}),
                   turnPhase: pendingTask.turnPhase || turnPhase,
                   intentSummary: pendingTask.intentSummary || intentSummary,
-                  message: "Executing...",
+                  why: pendingTask.why || progress.why,
+                  evidence: pendingTask.evidence || progress.evidence,
+                  message: progress.action,
                 };
               }
             } else {
@@ -8803,16 +9029,51 @@ export const useAppStore = create<AppState>()(
                 toolStatus: "running",
                 ...(normalizedToolCallId ? { toolCallId: normalizedToolCallId } : {}),
                 intentSummary,
-                message: "Executing...",
+                why: progress.why,
+                evidence: progress.evidence,
+                message: progress.action,
               });
+            }
+            const hasRelatedProgress = nextFlow.some((block) =>
+              block.type === "progress" &&
+              block.turnId === turnId &&
+              progressBlockMatchesTool(block, normalizedToolCallId, toolName, target)
+            );
+            if (!hasRelatedProgress) {
+              const progressBlockId = nextId();
+              const progressBlock: TaskBlock = {
+                id: progressBlockId,
+                turnId,
+                turnPhase,
+                type: "progress",
+                ...progress,
+                ...(normalizedToolCallId ? { toolCallId: normalizedToolCallId, toolCallIds: [normalizedToolCallId] } : {}),
+                toolName,
+                target,
+              };
+              const runningIdx = nextFlow.findIndex((block) => block.id === runningTaskId);
+              if (runningIdx >= 0) {
+                nextFlow.splice(runningIdx, 0, progressBlock);
+              } else {
+                nextFlow.push(progressBlock);
+              }
+              appendedBlockId = appendedBlockId == null ? progressBlockId : appendedBlockId;
             }
             return {
               taskFlow: nextFlow,
               conversationTurns: appendedBlockId == null
                 ? s.conversationTurns
                 : s.conversationTurns.map((turn) =>
-                    turn.id === turnId && !turn.blockIds.includes(appendedBlockId!)
-                      ? { ...turn, blockIds: [...turn.blockIds, appendedBlockId!] }
+                    turn.id === turnId
+                      ? {
+                          ...turn,
+                          blockIds: [
+                            ...turn.blockIds,
+                            ...nextFlow
+                              .filter((block) => block.turnId === turnId && !turn.blockIds.includes(block.id))
+                              .map((block) => block.id),
+                          ],
+                        }
                       : turn
                   ),
               showDiff: s.showDiff && s.rightPanelTab === "diff",
@@ -8840,6 +9101,7 @@ export const useAppStore = create<AppState>()(
         },
 
         onToolDone: (toolName, target, result, meta?: ToolLifecycleMeta) => {
+          const language = sessionGet().config.language === "en" ? "en" : "zh";
           const isEphemeralPlanArtifactTool =
             (toolName === "write_file" || toolName === "replace_in_file") &&
             isEphemeralPlanArtifactPath(target);
@@ -8866,6 +9128,27 @@ export const useAppStore = create<AppState>()(
                   previousBlock.diff.old === previousBlock.diff.new
                 )
               );
+            const observationSummary = summarizeToolObservation({
+              toolName,
+              target,
+              result,
+              language,
+              noOp: noOpWrite,
+            });
+            const doneProgress = buildToolProgressNarration({
+              toolName,
+              target,
+              language,
+              status: "done",
+              source: "tool_result",
+              userGoal: getTurnUserGoal(updated, turnId),
+              currentHypothesis: getLatestTurnProgressStrategyText(updated, turnId),
+              previousObservation: observationSummary,
+              result,
+              noOp: noOpWrite,
+              turnIntent: effectiveRunIntent,
+              workflowMode: sessionGet().config.workflowMode,
+            });
             updated[idx] = {
               ...updated[idx],
               turnPhase: withTurnRuntimePhaseStatus(
@@ -8876,6 +9159,9 @@ export const useAppStore = create<AppState>()(
               toolStatus: "executed" as const,
               status: "done" as const,
               ...(meta?.toolCallId ? { toolCallId: String(meta.toolCallId) } : {}),
+              why: (updated[idx] as Extract<TaskBlock, { type: "tool" }>).why || doneProgress.why,
+              evidence: doneProgress.evidence,
+              observationSummary,
               message: noOpWrite
                 ? "No file change: requested content matched the current file, so this did not advance plan evidence."
                 : result.length > 500 ? result.slice(0, 500) + "..." : result,
@@ -8905,8 +9191,20 @@ export const useAppStore = create<AppState>()(
                 ? "changed"
                 : "tool_called";
 
+            const nextTaskFlow = updateRelatedProgressBlocks({
+              blocks: updated,
+              turnId,
+              toolName,
+              target,
+              toolCallId: meta?.toolCallId ? String(meta.toolCallId) : undefined,
+              status: "done",
+              source: "tool_result",
+              evidence: observationSummary,
+              next: doneProgress.next,
+            });
+
             return {
-              taskFlow: updated,
+              taskFlow: nextTaskFlow,
               conversationTurns: s.conversationTurns.map((turn) =>
                 turn.id === turnId && turn.pendingOperationProposal
                   ? {
@@ -8954,6 +9252,7 @@ export const useAppStore = create<AppState>()(
         },
 
         onToolError: (toolName, target, error, meta?: ToolLifecycleMeta) => {
+          const language = sessionGet().config.language === "en" ? "en" : "zh";
           sessionSet((s) => {
             const idx = findToolLifecycleBlockIndex({
               taskFlow: s.taskFlow,
@@ -8965,6 +9264,22 @@ export const useAppStore = create<AppState>()(
             });
             if (idx === -1) return {};
             const updated = [...s.taskFlow];
+            const failedProgress = buildToolProgressNarration({
+              toolName,
+              target,
+              language,
+              status: "failed",
+              source: "tool_result",
+              userGoal: getTurnUserGoal(updated, turnId),
+              currentHypothesis: getLatestTurnProgressStrategyText(updated, turnId),
+              previousObservation: compactProgressContextText(error),
+              result: error,
+              turnIntent: effectiveRunIntent,
+              workflowMode: sessionGet().config.workflowMode,
+            });
+            const observationSummary = language === "en"
+              ? `Tool failed: ${compactProgressContextText(error, 180)}`
+              : `工具失败：${compactProgressContextText(error, 180)}`;
             updated[idx] = {
               ...updated[idx],
               turnPhase: withTurnRuntimePhaseStatus(
@@ -8975,10 +9290,24 @@ export const useAppStore = create<AppState>()(
               toolStatus: "failed" as const,
               status: "error" as const,
               ...(meta?.toolCallId ? { toolCallId: String(meta.toolCallId) } : {}),
+              why: (updated[idx] as Extract<TaskBlock, { type: "tool" }>).why || failedProgress.why,
+              evidence: failedProgress.evidence,
+              observationSummary,
               message: error,
             } as TaskBlock;
+            const nextTaskFlow = updateRelatedProgressBlocks({
+              blocks: updated,
+              turnId,
+              toolName,
+              target,
+              toolCallId: meta?.toolCallId ? String(meta.toolCallId) : undefined,
+              status: "failed",
+              source: "tool_result",
+              evidence: observationSummary,
+              next: failedProgress.next,
+            });
             return {
-              taskFlow: updated,
+              taskFlow: nextTaskFlow,
               conversationTurns: s.conversationTurns.map((turn) =>
                 turn.id === turnId && turn.pendingOperationProposal
                   ? {
@@ -9867,11 +10196,30 @@ export const useAppStore = create<AppState>()(
                 const toolName = toolCall.name;
                 const toolArgs = toolCall.arguments;
                 const target = getToolTarget(toolName, toolArgs);
+                const flowBeforeReview = sessionGet().taskFlow;
+                const userGoal = getTurnUserGoal(flowBeforeReview, uiDisplayTurnId);
+                const currentHypothesis = getLatestTurnProgressStrategyText(flowBeforeReview, uiDisplayTurnId);
+                const previousObservation = getLatestTurnToolObservationText(flowBeforeReview, uiDisplayTurnId);
+                const progress = buildToolProgressNarration({
+                  toolName,
+                  target,
+                  language,
+                  status: "running",
+                  source: "runtime",
+                  userGoal,
+                  currentHypothesis,
+                  previousObservation,
+                  turnIntent: effectiveRunIntent,
+                  workflowMode: sessionGet().config.workflowMode,
+                });
                 const intentSummary = deriveToolIntentSummary({
                   toolName,
                   target,
                   language,
                   toolStatus: "pending",
+                  userGoal,
+                  currentHypothesis,
+                  previousObservation,
                 });
                 const turnPhase = phaseForTool(toolName, target, "running");
                 void (async () => {
@@ -9891,6 +10239,8 @@ export const useAppStore = create<AppState>()(
                     status: "pending_review",
                     toolStatus: "pending",
                     intentSummary,
+                    why: progress.why,
+                    evidence: progress.evidence,
                     ...(shellReviewMessage ? { message: shellReviewMessage } : {}),
                     ...(shellPermissionDecision ? { shellPermissionDecision } : {}),
                     ...(diff ? { diff } : {}),
@@ -9924,11 +10274,30 @@ export const useAppStore = create<AppState>()(
             const toolName = toolCall.name;
             const toolArgs = toolCall.arguments;
             const target = getToolTarget(toolName, toolArgs);
+            const flowBeforeReview = sessionGet().taskFlow;
+            const userGoal = getTurnUserGoal(flowBeforeReview, uiDisplayTurnId);
+            const currentHypothesis = getLatestTurnProgressStrategyText(flowBeforeReview, uiDisplayTurnId);
+            const previousObservation = getLatestTurnToolObservationText(flowBeforeReview, uiDisplayTurnId);
+            const progress = buildToolProgressNarration({
+              toolName,
+              target,
+              language,
+              status: "running",
+              source: "runtime",
+              userGoal,
+              currentHypothesis,
+              previousObservation,
+              turnIntent: effectiveRunIntent,
+              workflowMode: sessionGet().config.workflowMode,
+            });
             const intentSummary = deriveToolIntentSummary({
               toolName,
               target,
               language,
               toolStatus: "pending",
+              userGoal,
+              currentHypothesis,
+              previousObservation,
             });
             const turnPhase = phaseForTool(toolName, target, "running");
             void (async () => {
@@ -9948,6 +10317,8 @@ export const useAppStore = create<AppState>()(
                 status: "pending_review",
                 toolStatus: "pending",
                 intentSummary,
+                why: progress.why,
+                evidence: progress.evidence,
                 ...(shellReviewMessage ? { message: shellReviewMessage } : {}),
                 ...(shellPermissionDecision ? { shellPermissionDecision } : {}),
                 ...(diff ? { diff } : {}),

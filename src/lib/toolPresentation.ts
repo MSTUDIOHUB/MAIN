@@ -142,16 +142,118 @@ function trimIntentSummary(text: string): string {
   return `${normalized.slice(0, 117).trim()}...`;
 }
 
+function compactContextText(text: string, maxChars = 72): string {
+  const normalized = String(text || "").replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxChars) return normalized;
+  return `${normalized.slice(0, maxChars - 3).trim()}...`;
+}
+
+function inferTargetRole(input: {
+  toolName: string;
+  target?: string;
+  targetRole?: string;
+  language: ToolPresentationLanguage;
+}): string {
+  const explicit = compactContextText(input.targetRole || "", 90);
+  if (explicit) return explicit;
+  const target = String(input.target || "").trim();
+  const compactTarget = compactToolPresentationTarget(target, input.toolName, input.language);
+  if (/ChatArea/i.test(target)) return input.language === "en" ? "ChatArea rendering logic" : "ChatArea 渲染逻辑";
+  if (/ActionCard/i.test(target)) return input.language === "en" ? "ActionCard tool-card UI" : "ActionCard 工具卡展示";
+  if (/useAppStore/i.test(target)) return input.language === "en" ? "message visibility state" : "消息可见性状态";
+  if (/orchestrator/i.test(target)) return input.language === "en" ? "agent orchestration flow" : "agent 编排流程";
+  if (/toolPresentation/i.test(target)) return input.language === "en" ? "tool intent copy" : "工具意图说明";
+  if (/systemPrompt/i.test(target)) return input.language === "en" ? "system prompt rules" : "系统提示规则";
+  if (/hiddenProcess/i.test(target)) return input.language === "en" ? "hiddenProcess visibility path" : "hiddenProcess 可见性链路";
+  return compactTarget;
+}
+
+function joinZhVerbObject(verb: string, object: string): string {
+  return /^[A-Za-z0-9_`]/.test(object) ? `${verb} ${object}` : `${verb}${object}`;
+}
+
+function deriveContextualToolIntent(input: {
+  phase: ToolExecutionPhase;
+  toolName: string;
+  target?: string;
+  language: ToolPresentationLanguage;
+  userGoal?: string;
+  currentHypothesis?: string;
+  previousObservation?: string;
+  targetRole?: string;
+}): string {
+  const role = inferTargetRole(input);
+  const hypothesis = compactContextText(input.currentHypothesis || "", 88);
+  const observation = compactContextText(input.previousObservation || "", 88);
+  const goal = compactContextText(input.userGoal || "", input.language === "en" ? 56 : 44);
+  const target = String(input.target || "");
+
+  if (input.language === "en") {
+    if (input.phase === "edit") {
+      return trimIntentSummary(goal
+        ? `Edit ${role} so the implementation matches the user goal: ${goal}.`
+        : `Edit ${role} where the relevant implementation has been confirmed.`);
+    }
+    if (input.phase === "verify") {
+      if (/npm\s+(?:run\s+)?build/i.test(target)) return "Run the build to confirm TypeScript/Vite accepts the changed code.";
+      if (/\btest|vitest|jest|playwright|pytest|go\s+test|cargo\s+test\b/i.test(target)) return "Run tests to confirm the changed behavior still passes.";
+      return `Run verification for ${role} and use the result as completion evidence.`;
+    }
+    if (input.phase === "command") return `Run the command for ${role} and use its output to decide the next step.`;
+    if (input.phase === "discover" || input.phase === "inspect") {
+      if (hypothesis) return trimIntentSummary(`Check ${role} to test the current hypothesis: ${hypothesis}`);
+      if (observation) return trimIntentSummary(`Read ${role} after the previous observation: ${observation}`);
+      if (goal) return trimIntentSummary(`Read ${role} because the user goal depends on how it currently works: ${goal}`);
+      return `Read ${role} and confirm the implementation details before changing anything.`;
+    }
+    return "";
+  }
+
+  if (input.phase === "edit") {
+    return trimIntentSummary(goal
+      ? `${joinZhVerbObject("修改", role)}，让实现对齐用户目标：${goal}。`
+      : `${joinZhVerbObject("修改", role)}，把已确认的方案落到代码里。`);
+  }
+  if (input.phase === "verify") {
+    if (/npm\s+(?:run\s+)?build/i.test(target)) return "运行构建，确认 TypeScript/Vite 能接受这次改动。";
+    if (/\btest|vitest|jest|playwright|pytest|go\s+test|cargo\s+test\b/i.test(target)) return "运行测试，确认受影响行为仍然通过。";
+    return `${joinZhVerbObject("验证", role)}，用结果作为完成或继续修复的证据。`;
+  }
+  if (input.phase === "command") return `${joinZhVerbObject("执行", role)}，根据输出决定下一步。`;
+  if (input.phase === "discover" || input.phase === "inspect") {
+    if (hypothesis) return trimIntentSummary(`${joinZhVerbObject("读取", role)}，确认当前判断是否成立：${hypothesis}`);
+    if (observation) return trimIntentSummary(`基于前一步观察继续${joinZhVerbObject("读取", role)}：${observation}`);
+    if (goal) return trimIntentSummary(`${joinZhVerbObject("读取", role)}，因为用户目标依赖它当前如何实现：${goal}`);
+    return `${joinZhVerbObject("读取", role)}，确认实现细节后再修改。`;
+  }
+  return "";
+}
+
 export function deriveToolIntentSummary(input: {
   toolName: string;
   target?: string;
   language?: ToolPresentationLanguage;
   status?: string;
   toolStatus?: string;
+  userGoal?: string;
+  currentHypothesis?: string;
+  previousObservation?: string;
+  targetRole?: string;
 }): string {
   const language = input.language || "zh";
   const phase = deriveToolPhase(input);
   const toolName = String(input.toolName || "");
+  const contextual = deriveContextualToolIntent({
+    phase,
+    toolName,
+    target: input.target,
+    language,
+    userGoal: input.userGoal,
+    currentHypothesis: input.currentHypothesis,
+    previousObservation: input.previousObservation,
+    targetRole: input.targetRole,
+  });
+  if (contextual) return trimIntentSummary(contextual);
 
   if (language === "en") {
     if (phase === "blocked") return "Preserve the blocked step and its reason so recovery is possible.";

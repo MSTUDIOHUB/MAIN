@@ -71,8 +71,13 @@ test("tool intent helpers derive stable phases without model metadata", () => {
   assert.equal(deriveToolPhase({ toolName: "read_file", target: "missing.ts", toolStatus: "failed" }), "blocked");
 
   assert.equal(
-    deriveToolIntentSummary({ toolName: "grep_search", target: "ChatArea", language: "zh" }),
-    "定位相关文件或符号，再收敛后续读取范围。",
+    deriveToolIntentSummary({
+      toolName: "grep_search",
+      target: "ChatArea",
+      language: "zh",
+      currentHypothesis: "确认是否是 hiddenProcess 导致说明不可见",
+    }),
+    "读取 ChatArea 渲染逻辑，确认当前判断是否成立：确认是否是 hiddenProcess 导致说明不可见",
   );
 });
 
@@ -167,6 +172,36 @@ test("model notes become the strategy text for the following tool step", () => {
   assert.equal(archive.steps[0].intent, note);
   assert.equal(archive.steps[0].items.length, 2);
   assert.match(archive.steps[0].summary, /src\/components\/ChatArea\.tsx/);
+});
+
+test("user-visible progress blocks are not treated as hidden process text", () => {
+  const progress = {
+    id: 2,
+    type: "progress",
+    phase: "investigating",
+    title: "读取 ChatArea 渲染逻辑",
+    why: "确认 hiddenProcess 是否导致公开说明不可见。",
+    action: "正在读取 ChatArea 渲染逻辑。",
+    evidence: "等待文件内容作为证据。",
+    next: "根据结果决定 store 与组件修改范围。",
+    targets: ["src/components/ChatArea.tsx"],
+    status: "running",
+    source: "runtime",
+  };
+  const model = buildLiveTurnProcessTimelineModel({
+    language: "zh",
+    blocks: [
+      progress,
+      { id: 3, type: "tool", toolName: "read_file", target: "src/components/ChatArea.tsx", status: "running", toolStatus: "running" },
+    ],
+  });
+
+  assert.equal(model.totalCount, 2);
+  assert.equal(model.steps.length, 1);
+  assert.equal(model.steps[0].kind, "inspect");
+  assert.match(model.steps[0].intent, /正在读取 ChatArea 渲染逻辑/);
+  assert.match(model.steps[0].intent, /hiddenProcess/);
+  assert.equal(model.steps[0].items[0].type, "progress");
 });
 
 test("live timeline groups repeated edits under one strategy until the next explicit note", () => {

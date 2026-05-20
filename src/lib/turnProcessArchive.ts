@@ -4,6 +4,7 @@ import {
   deriveToolPhase,
   type ToolPresentationLanguage,
 } from "./toolPresentation";
+import type { ProgressNarrationPhase } from "./progressNarration";
 import { normalizeTurnRuntimePhase, type TurnRuntimePhase } from "./turnPhase";
 import { deriveThoughtDisplay } from "./thoughtDisplay";
 
@@ -66,6 +67,10 @@ function isThoughtBlock(block: any): boolean {
   return block?.type === "thought" && String(block.content || "").trim().length > 0;
 }
 
+function isProgressBlock(block: any): boolean {
+  return block?.type === "progress";
+}
+
 function getLatestThoughtBlock(blocks: any[]): any | null {
   return [...blocks].reverse().find(isThoughtBlock) || null;
 }
@@ -80,12 +85,13 @@ function isProcessArchiveCandidate(block: any, finalVisibleAgentIndex: number, b
   if (block.type === "system") {
     return block.variant !== "context_compression" && block.variant !== "plan_execution_checkpoint";
   }
-  return block.type === "tool" || block.type === "thought" || block.type === "jobList" || block.type === "agent" || block.type === "system";
+  return block.type === "tool" || block.type === "progress" || block.type === "thought" || block.type === "jobList" || block.type === "agent" || block.type === "system";
 }
 
 function isLiveProcessCandidate(block: any): boolean {
   if (!block || block.type === "user" || block.type === "thought") return false;
   if (block.type === "agent") return block.hiddenProcess === true;
+  if (block.type === "progress") return true;
   if (block.type === "system") {
     return block.variant !== "context_compression" && block.variant !== "plan_execution_checkpoint";
   }
@@ -115,7 +121,27 @@ function getToolStepKind(block: any): TurnArchiveStepKind {
   return phase as TurnArchiveStepKind;
 }
 
+function getProgressStepKind(phase: ProgressNarrationPhase | string): TurnArchiveStepKind {
+  if (phase === "blocked") return "blocked";
+  if (phase === "editing") return "edit";
+  if (phase === "verifying") return "verify";
+  if (phase === "investigating") return "inspect";
+  if (phase === "understanding" || phase === "summarizing") return "message";
+  return "message";
+}
+
+function mapProgressStatus(block: any): TurnArchiveStepStatus {
+  const status = String(block?.status || "").toLowerCase();
+  if (status === "failed") return "failed";
+  if (status === "running") return "running";
+  return "done";
+}
+
 function compactTarget(block: any, language: ToolPresentationLanguage): string {
+  if (isProgressBlock(block)) {
+    const targets = Array.isArray(block.targets) ? block.targets : [];
+    return String(targets[0] || block.target || "").trim();
+  }
   if (!isToolBlock(block)) return "";
   return compactToolPresentationTarget(
     String(block.target || ""),
@@ -252,7 +278,8 @@ function noteMatchesStepKind(note: string, kind: TurnArchiveStepKind): boolean {
 }
 
 function getBlockResultLine(block: any): string {
-  return firstMeaningfulLine(String(block?.message || block?.summary || block?.resultPreview || block?.output || block?.content || ""));
+  if (isProgressBlock(block)) return firstMeaningfulLine(String(block.evidence || block.action || block.why || block.title || ""));
+  return firstMeaningfulLine(String(block?.observationSummary || block?.message || block?.summary || block?.resultPreview || block?.output || block?.content || ""));
 }
 
 function makeTargetSummary(targets: string[], language: ToolPresentationLanguage): string {
@@ -489,6 +516,14 @@ function makeSummaryForStep(step: TurnArchiveStep, language: ToolPresentationLan
   const hiddenCount = Math.max(0, targets.length - 3);
   const targetText = targets.slice(0, 3).join(language === "zh" ? "、" : ", ");
   const toolCount = blocks.filter(isToolBlock).length;
+  const progressBlock = blocks.find(isProgressBlock);
+
+  if (progressBlock) {
+    const action = firstMeaningfulLine(String(progressBlock.action || ""));
+    const evidence = firstMeaningfulLine(String(progressBlock.evidence || ""));
+    const base = action || evidence || String(progressBlock.title || "");
+    return compactLine(base, 180);
+  }
 
   if (step.kind === "thinking") {
     const first = firstMeaningfulLine(String(blocks[0]?.content || ""));
@@ -802,6 +837,31 @@ function makeStep(input: {
     };
   }
 
+  if (isProgressBlock(block)) {
+    const status = mapProgressStatus(block);
+    const kind = status === "failed" ? "blocked" : getProgressStepKind(String(block.phase || ""));
+    const targets = uniqueTargets([block], language);
+    const sourceItem = block && typeof block === "object" ? { ...block, sourceIndex: index } : block;
+    return {
+      id: `turn-archive-step-progress-${block.id ?? index}`,
+      kind,
+      status,
+      intent: compactLine(String(block.title || block.action || defaultIntentForStep(kind, language)), 220),
+      why: String(block.why || ""),
+      action: String(block.action || ""),
+      result: String(block.evidence || ""),
+      next: String(block.next || ""),
+      note: String(block.why || block.action || ""),
+      summary: String(block.action || block.evidence || ""),
+      ...(phase ? { phase } : {}),
+      targets,
+      items: [sourceItem],
+      expandedByDefault: status === "running" || status === "failed",
+      sourceIndex: index,
+      sourceEndIndex: index,
+    };
+  }
+
   if (isToolBlock(block)) {
     const status = mapToolStatus(block);
     const kind = status === "failed" || status === "rejected" ? "blocked" : getToolStepKind(block);
@@ -859,6 +919,7 @@ function finalizeStep(
   const targets = uniqueTargets(step.items, language);
   const kind = step.kind;
   const phase = normalizeTurnRuntimePhase(step.phase, language);
+  const progressBlock = step.items.find(isProgressBlock);
   const fallbackIntent = isContextPhase(kind) && step.items.length > 1
     ? defaultIntentForStep(kind, language)
     : step.intent || defaultIntentForStep(kind, language);
@@ -866,6 +927,26 @@ function finalizeStep(
   const summary = phase?.summary
     ? `${phase.summary}${baseSummary ? `${language === "zh" ? " · " : " · "}${baseSummary}` : ""}`
     : baseSummary;
+  if (progressBlock) {
+    const progressTitle = compactLine(String(progressBlock.title || step.intent || ""), 160);
+    const progressWhy = compactLine(String(progressBlock.why || step.why || ""), 220);
+    const progressAction = compactLine(String(progressBlock.action || step.action || ""), 220);
+    const progressEvidence = compactLine(String(progressBlock.evidence || step.result || ""), 220);
+    const progressNext = compactLine(String(progressBlock.next || step.next || ""), 220);
+    const intentParts = [progressAction || progressTitle, progressWhy].filter(Boolean);
+    return {
+      ...step,
+      ...(phase ? { phase } : {}),
+      targets,
+      why: progressWhy,
+      action: progressAction,
+      result: progressEvidence,
+      next: progressNext,
+      note: progressWhy,
+      intent: compactLine(intentParts.join(language === "zh" ? " 因为：" : " Because: "), 260),
+      summary,
+    };
+  }
   const narrative = defaultNarrativeForStep({ ...step, targets, summary }, language);
   const hasPersistedIntent = step.items.length === 1 && String(step.items[0]?.intentSummary || "").trim().length > 0;
   const note = step.note || (step.kind === "message" || step.kind === "thinking"

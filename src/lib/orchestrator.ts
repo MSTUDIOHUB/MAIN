@@ -168,6 +168,11 @@ import {
   materializePlanArtifactFromVisibleText,
 } from "./planMaterialization";
 import { formatToolPresentation } from "./toolPresentation";
+import {
+  buildToolCallsProgressNarration,
+  progressNarrationToText,
+  type ProgressNarration,
+} from "./progressNarration";
 import type { ShellPermissionApproval } from "./ipc";
 import {
   buildTaskTargetingProfile,
@@ -676,7 +681,9 @@ export interface OrchestratorCallbacks {
     meta?: {
       hasToolCalls?: boolean;
       hiddenThought?: string;
-      toolCalls?: Array<{ name: string; target: string }>;
+      visibility?: "user_progress" | "hidden_process";
+      progress?: ProgressNarration;
+      toolCalls?: Array<{ id?: string; name: string; target: string }>;
     },
   ) => void;
   onStatusChange: (status: "idle" | "running" | "pending_review" | "error") => void;
@@ -2542,15 +2549,19 @@ function parseToolCallArguments(tc: ToolCallToExecute, workspace?: string | null
   }
 }
 
-function buildToolActionNarration(input: {
+export function buildToolActionNarration(input: {
   calls: ToolCallToExecute[];
   workspace: string;
   language: "zh" | "en";
   workflowMode: "chat" | "edit" | "plan";
   isPlanApproved: boolean;
-}): string {
+  userGoal?: string;
+  turnIntent?: ResolvedUserIntent | string;
+  currentHypothesis?: string;
+  previousObservation?: string;
+}): ProgressNarration | null {
   const calls = input.calls.slice(0, 3);
-  if (calls.length === 0) return "";
+  if (calls.length === 0) return null;
 
   const presentations = calls.map((call) => {
     const args = parseToolCallArguments(call, input.workspace);
@@ -2589,20 +2600,60 @@ function buildToolActionNarration(input: {
     : "";
 
   if (input.workflowMode === "plan" && !input.isPlanApproved && hasDesignWrite) {
-    return input.language === "zh"
-      ? "我会把当前上下文整理成可审批的 `design.md` 草案，然后停下来等你审阅；如果技术栈、输出形式或范围需要调整，审批前仍可改。"
-      : "I will turn the current context into a reviewable `design.md` draft, then pause for your review; stack, output format, and scope can still be adjusted before approval.";
+    return {
+      phase: "summarizing",
+      title: input.language === "zh" ? "整理可审批方案" : "Draft reviewable plan",
+      why: input.language === "zh"
+        ? "当前还在计划审批前，源码不能提前修改；先把已确认上下文收束成 design.md，方便用户审阅范围和取舍。"
+        : "The turn is still before plan approval, so source edits wait; first consolidate the evidence into design.md for review.",
+      action: input.language === "zh"
+        ? "正在写入或更新 `.MAIN/plans/design.md` 草案。"
+        : "Writing or updating the `.MAIN/plans/design.md` draft.",
+      evidence: input.language === "zh"
+        ? "等待计划文件写入结果作为可审阅方案证据。"
+        : "Waiting for the plan-file write result as review evidence.",
+      next: input.language === "zh"
+        ? "方案草案准备好后停下来等待用户审批。"
+        : "Pause for user approval once the draft is ready.",
+      targets: presentations.map((item) => item.presentation.target).filter(Boolean),
+      status: "running",
+      source: "runtime",
+    };
   }
 
   if (input.workflowMode === "plan" && !input.isPlanApproved && hasReadOrAnalysis) {
-    return input.language === "zh"
-      ? `我会先做只读探索：${summaries}${suffix}。拿到证据后再决定是提问确认分叉，还是生成可审批设计草案。`
-      : `I will first gather read-only context: ${summaries}${suffix}. After that I will either ask for a decision or draft a reviewable design.`;
+    return {
+      phase: "investigating",
+      title: input.language === "zh" ? "先收集计划证据" : "Gather planning evidence first",
+      why: input.language === "zh"
+        ? "计划还没批准，需要先用只读证据确认范围，避免把猜测写进方案。"
+        : "The plan is not approved yet, so read-only evidence should narrow scope before drafting decisions.",
+      action: input.language === "zh"
+        ? `正在做只读探索：${summaries}${suffix}。`
+        : `Gathering read-only context: ${summaries}${suffix}.`,
+      evidence: input.language === "zh"
+        ? "等待读取、搜索或分析结果来支撑方案分叉。"
+        : "Waiting for read, search, or analysis results to support the plan branch.",
+      next: input.language === "zh"
+        ? "拿到证据后再决定提问确认，或生成可审批设计草案。"
+        : "Use the evidence to ask for a decision or draft a reviewable design.",
+      targets: presentations.map((item) => item.presentation.target).filter(Boolean),
+      status: "running",
+      source: "runtime",
+    };
   }
 
-  return input.language === "zh"
-    ? `我会执行下一步工具动作：${summaries}${suffix}。`
-    : `I will run the next tool action: ${summaries}${suffix}.`;
+  return buildToolCallsProgressNarration({
+    calls: presentations.map((item) => ({ name: item.name, target: item.target })),
+    language: input.language,
+    userGoal: input.userGoal,
+    turnIntent: input.turnIntent,
+    workflowMode: input.workflowMode,
+    currentHypothesis: input.currentHypothesis,
+    previousObservation: input.previousObservation,
+    status: "running",
+    source: "runtime",
+  });
 }
 
 function normalizeToolCallToExecute(
@@ -5781,9 +5832,13 @@ export async function executeAgentLoop(
         language: callbacks.getPreferredLanguage(),
         workflowMode,
         isPlanApproved: callbacks.getIsPlanApproved(),
+        userGoal: latestUserPromptText,
+        turnIntent,
+        currentHypothesis: lastAssistantTextForCheckpoint,
+        previousObservation: recentToolActivity[recentToolActivity.length - 1]?.detail || "",
       });
       if (narration) {
-        visibleAssistantText = narration;
+        visibleAssistantText = progressNarrationToText(narration, callbacks.getPreferredLanguage());
         logAgentEvent("tool_action_narration_injected", {
           iteration,
           workflowMode,
@@ -5821,10 +5876,25 @@ export async function executeAgentLoop(
     if (!shouldSuppressApprovedPlanNoToolText && (visibleAssistantText || finalReplyOptions.length > 0)) {
       callbacks.onAssistantFinalText(visibleAssistantText, finalReplyOptions, {
         hasToolCalls: effectiveToolCalls.length > 0,
+        visibility: effectiveToolCalls.length > 0 ? "user_progress" : undefined,
+        progress: effectiveToolCalls.length > 0
+          ? buildToolActionNarration({
+              calls: effectiveToolCalls,
+              workspace,
+              language: callbacks.getPreferredLanguage(),
+              workflowMode,
+              isPlanApproved: callbacks.getIsPlanApproved(),
+              userGoal: latestUserPromptText,
+              turnIntent,
+              currentHypothesis: visibleAssistantText,
+              previousObservation: recentToolActivity[recentToolActivity.length - 1]?.detail || "",
+            }) || undefined
+          : undefined,
         hiddenThought: normalized.hiddenThought,
         toolCalls: effectiveToolCalls.map((call) => {
           const args = parseToolCallArguments(call, workspace);
           return {
+            id: call.id,
             name: call.name,
             target: getToolTarget(call.name, args),
           };

@@ -274,6 +274,22 @@ test.beforeEach(async ({ page }) => {
           });
         }
 
+        if (scenario === "progress-narration-tool-flow") {
+          if (readFileCalls.includes("README.md")) {
+            return JSON.stringify({
+              output_text: "已确认 README.md 包含 fallback-ok，进度展示链路没有暴露原始工具协议。",
+            });
+          }
+          return JSON.stringify({
+            output_text: [
+              "<tool_use>",
+              "<tool>read_file</tool>",
+              "<parameter name=\"path\">README.md</parameter>",
+              "</tool_use>",
+            ].join("\n"),
+          });
+        }
+
         if (scenario === "reply-options-tool-pause") {
           if (body.includes("请采用保守方案继续")) {
             return JSON.stringify({
@@ -751,6 +767,30 @@ test("cloud Responses falls back from native tools to XML tools and reprompts to
       readFileCalls: ["README.md"],
       noToolRequestsInExpectedRange: true,
     });
+});
+
+test("tool flow shows progress narration without exposing raw protocol", async ({ page }) => {
+  await page.goto("/?e2eScenario=progress-narration-tool-flow");
+
+  const sent = await page.evaluate(() =>
+    (window as any).__CODELY_E2E__?.sendCloudMessage?.("请读取 README.md 并确认是否包含 fallback-ok。"),
+  );
+  expect(sent).toBe(true);
+
+  await expect(page.getByText("已确认 README.md 包含 fallback-ok")).toBeVisible();
+  await expect(page.locator("body")).not.toContainText("<tool_use>");
+  await expect(page.locator("body")).not.toContainText("\"toolName\"");
+  await expect(page.locator("body")).not.toContainText("<analysis>");
+  await expect(page.getByTestId("turn-process-archive-toggle")).toBeVisible();
+  await page.getByTestId("turn-process-archive-toggle").click();
+
+  const archiveStep = page.locator('[data-testid="turn-archive-step"][data-kind="inspect"]').first();
+  await expect(archiveStep).toContainText(/读取|正在读取/);
+  await expect(archiveStep).toContainText(/为什么|因为|目标|依赖|确认/);
+  await expect(archiveStep).toContainText("README.md");
+
+  await archiveStep.getByTestId("turn-archive-step-toggle").click();
+  await expect(page.getByTestId("read-context-group-summary").first()).toContainText(/已读取|捕获|确认/);
 });
 
 test("reply options pause before mixed XML tool calls and continue from the source turn", async ({ page }) => {

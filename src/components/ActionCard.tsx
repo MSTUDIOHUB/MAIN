@@ -57,6 +57,10 @@ interface ActionCardProps {
   message?: string;
   diff?: { old: string; new: string; path?: string };
   shellPermissionDecision?: { requiresApproval?: boolean };
+  intentSummary?: string;
+  why?: string;
+  evidence?: string;
+  observationSummary?: string;
   onAllow?: () => void;
   onAllowForSession?: () => void;
   onReject?: () => void;
@@ -110,7 +114,13 @@ function TerminalResultDetails({ presentation, language }) {
   );
 }
 
-export default function ActionCard({ blockId, toolName, target, toolStatus, message, diff, shellPermissionDecision, onAllow, onAllowForSession, onReject, autoApproveTools, onToggleAutoApprove, autoCollapse }: ActionCardProps) {
+function compactExplanation(text?: string, maxChars = 180) {
+  const normalized = String(text || "").replace(/\s+/g, " ").trim();
+  if (!normalized) return "";
+  return normalized.length <= maxChars ? normalized : `${normalized.slice(0, maxChars - 3).trim()}...`;
+}
+
+export default function ActionCard({ blockId, toolName, target, toolStatus, message, diff, shellPermissionDecision, intentSummary, why, evidence, observationSummary, onAllow, onAllowForSession, onReject, autoApproveTools, onToggleAutoApprove, autoCollapse }: ActionCardProps) {
   const language = useAppStore((s) => s.config.language);
   const activeProfile = useAppStore((s) => s.config.activeProfile);
   const setIsSettingsOpen = useAppStore((s) => s.setIsSettingsOpen);
@@ -163,6 +173,9 @@ export default function ActionCard({ blockId, toolName, target, toolStatus, mess
     () => (diff ? getDiffStats(diff.old, diff.new) : null),
     [diff?.new, diff?.old],
   );
+  const purposeText = compactExplanation(why || intentSummary);
+  const evidenceText = compactExplanation(isDone ? observationSummary || evidence : evidence, 220);
+  const collapsedDetailText = compactExplanation(isDone ? observationSummary || purposeText || evidence : purposeText || evidence, 220);
 
   // ── Collapsed summary row ──
   if (!expanded && isDone) {
@@ -176,6 +189,9 @@ export default function ActionCard({ blockId, toolName, target, toolStatus, mess
             <IconCode className="h-3.5 w-3.5 shrink-0 text-[#60a5fa]" />
             <span className="shrink-0 text-[#94a3b8]">{language === "zh" ? "已编辑" : "Edited"}</span>
             <span className="min-w-0 truncate font-semibold theme-text">{displayTarget}</span>
+            {collapsedDetailText && (
+              <span className="min-w-0 truncate text-[#94a3b8]">{collapsedDetailText}</span>
+            )}
             <span className="ml-auto shrink-0 text-[#10b981]">+{diffStats.added}</span>
             <span className="shrink-0 text-[#f87171]">-{diffStats.removed}</span>
             <span className="shrink-0 rounded-full border border-[rgba(52,211,153,0.18)] bg-[rgba(52,211,153,0.08)] px-1.5 py-0.5 text-[9px] text-[#86efac]">
@@ -195,10 +211,26 @@ export default function ActionCard({ blockId, toolName, target, toolStatus, mess
 
     if (isExecuted && COMPACT_DONE_TOOLS.has(toolName)) {
       return (
-        <div className="w-full ml-9 mt-1 mb-1 flex items-center gap-2 font-mono text-[10.5px] text-[#71717a]">
-          <IconCheck className="h-3 w-3 text-[#10b981]" />
-          <span className="shrink-0">{language === "zh" ? localizedVerb : localizedVerb}</span>
-          <span className="min-w-0 truncate text-[#a1a1aa]">{displayTarget}</span>
+        <div className="w-full ml-9 mt-1 mb-2">
+          <button
+            onClick={() => setExpanded(true)}
+            className="flex w-full min-w-0 items-start gap-2 rounded-md border border-[#1f2937]/70 bg-[#05070a] px-2.5 py-1.5 text-left text-[11px] text-[#a1a1aa] shadow-sm transition-colors hover:border-[#3f3f46] hover:text-[#e4e4e7]"
+          >
+            <IconCheck className="mt-0.5 h-3.5 w-3.5 shrink-0 text-[#10b981]" />
+            <span className="min-w-0 flex-1">
+              <span className="block min-w-0 truncate">
+                <span className="text-[#d4d4d8]">{localizedVerb}</span>
+                <span className="text-[#71717a]"> · </span>
+                <span className="font-semibold theme-text">{displayTarget}</span>
+              </span>
+              {collapsedDetailText && (
+                <span data-testid="tool-collapsed-summary" className="mt-0.5 block min-w-0 truncate text-[10.5px] leading-4 text-[#94a3b8]">
+                  {collapsedDetailText}
+                </span>
+              )}
+            </span>
+            <IconChevronRight className="mt-0.5 h-3.5 w-3.5 shrink-0 text-[#71717a]" />
+          </button>
         </div>
       );
     }
@@ -219,6 +251,11 @@ export default function ActionCard({ blockId, toolName, target, toolStatus, mess
                 : `${localizedVerb}: `}
             {!isSystemErrorCard && <span className="font-semibold">{displayTarget}</span>}
           </span>
+          {collapsedDetailText && (
+            <span data-testid="tool-collapsed-summary" className="min-w-0 truncate text-[#94a3b8]">
+              {collapsedDetailText}
+            </span>
+          )}
           <span
             className={`ml-auto shrink-0 rounded-full border px-1.5 py-0.5 text-[9px] ${
               isExecuted
@@ -331,6 +368,23 @@ export default function ActionCard({ blockId, toolName, target, toolStatus, mess
             )}
           </div>
         </div>
+
+        {(purposeText || evidenceText) && (
+          <div data-testid="tool-intent-summary" className="mt-3 rounded-lg border border-[rgba(96,165,250,0.18)] bg-[rgba(37,99,235,0.06)] px-3 py-2">
+            {purposeText && (
+              <div className="text-[12px] leading-5 text-[#dbeafe]">
+                <span className="font-medium text-[#93c5fd]">{language === "zh" ? "目的：" : "Purpose: "}</span>
+                {purposeText}
+              </div>
+            )}
+            {evidenceText && (
+              <div className={`${purposeText ? "mt-1" : ""} text-[11px] leading-5 text-[#a5b4fc]`}>
+                <span className="font-medium text-[#818cf8]">{isDone ? language === "zh" ? "结果：" : "Result: " : language === "zh" ? "证据：" : "Evidence: "}</span>
+                {evidenceText}
+              </div>
+            )}
+          </div>
+        )}
 
         {isSystemErrorCard && errorInfo && (
           <div className="mt-3 rounded-lg border border-[rgba(251,113,133,0.22)] bg-[rgba(251,113,133,0.06)] px-3 py-2">

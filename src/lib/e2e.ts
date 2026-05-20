@@ -43,6 +43,7 @@ const EXISTING_PLAN_FOLDER_EXECUTE_SCENARIO = "existing-plan-folder-execute";
 const APPROVED_PLAN_EXECUTION_NO_TOOL_SCENARIO = "approved-plan-execution-no-tool";
 const EXECUTE_MAX_ITERATIONS_CHECKPOINT_SCENARIO = "execute-max-iterations-checkpoint";
 const LOCAL_FILE_READ_APPROVAL_SCENARIO = "local-file-read-approval";
+const PROGRESS_NARRATION_TOOL_FLOW_SCENARIO = "progress-narration-tool-flow";
 const TOP_ISLAND_EXECUTION_PROGRESS_SCENARIO = "top-island-execution-progress";
 const TOP_ISLAND_PLAN_TASK_PROGRESS_SCENARIO = "top-island-plan-task-progress";
 const TOP_ISLAND_STRICT_EVIDENCE_PROGRESS_SCENARIO = "top-island-strict-evidence-progress";
@@ -4196,6 +4197,8 @@ function seedCloudToolProtocolScenario(scenario: string) {
     ? 999510
     : scenario === APPROVED_PLAN_EXECUTION_NO_TOOL_SCENARIO
     ? 999513
+    : scenario === PROGRESS_NARRATION_TOOL_FLOW_SCENARIO
+    ? 999514
     : 999502;
   const server = {
     id: `e2e-${scenario}-server`,
@@ -4258,6 +4261,8 @@ function seedCloudToolProtocolScenario(scenario: string) {
             ? "E2E Malformed Tool Use Plan"
             : scenario === APPROVED_PLAN_EXECUTION_NO_TOOL_SCENARIO
             ? "E2E Approved Plan No Tool"
+            : scenario === PROGRESS_NARRATION_TOOL_FLOW_SCENARIO
+            ? "E2E Progress Narration Tool Flow"
             : "E2E Reply Options Tool Pause",
           date: new Date(now).toISOString(),
           active: true,
@@ -5312,6 +5317,10 @@ export function initializeE2EScenarios(): (() => void) | undefined {
 
   if (scenario === LOCAL_FILE_READ_APPROVAL_SCENARIO) {
     return seedCloudToolProtocolScenario(LOCAL_FILE_READ_APPROVAL_SCENARIO);
+  }
+
+  if (scenario === PROGRESS_NARRATION_TOOL_FLOW_SCENARIO) {
+    return seedCloudToolProtocolScenario(PROGRESS_NARRATION_TOOL_FLOW_SCENARIO);
   }
 
   if (scenario === PLAN_APPROVAL_EXECUTE_TOOLS_SCENARIO) {

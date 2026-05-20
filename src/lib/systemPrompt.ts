@@ -178,6 +178,9 @@ export function buildToolProtocolCard(profile: ToolProtocolCardProfile): string 
         ? "需要工具时直接发起 native tool call；不要用正文写 `[Tool call: ...]`、`<tool_code>` 或伪 JSON。"
         : "When you need a tool, emit a native tool call directly; do not write `[Tool call: ...]`, `<tool_code>`, or pseudo JSON in prose.",
       language === "zh"
+        ? "native tool calling 允许在工具调用前输出 1-3 句用户可见公开进度说明：当前理解、为什么需要这步、用什么结果判断下一步。不要写原始推理链。"
+        : "With native tool calling, you may include 1-3 user-visible progress sentences before the tool call: current understanding, why this step is needed, and what result will guide the next step. Do not reveal chain-of-thought.",
+      language === "zh"
         ? "不需要工具时，直接输出用户可见 Markdown。"
         : "When no tool is needed, output user-visible Markdown directly.",
     ].join("\n");
@@ -191,6 +194,9 @@ export function buildToolProtocolCard(profile: ToolProtocolCardProfile): string 
     language === "zh"
       ? "需要工具时，下一条内容必须只包含一个完整 XML 工具块；不要在工具块前后写解释、过程句或占位文本。"
       : "When you need a tool, the next content must contain exactly one complete XML tool block; do not add explanation, process narration, or placeholders around it.",
+    language === "zh"
+      ? "XML 协议下不要为了说明进度而混排正文；运行时会根据工具名、目标和用户目标注入可见 progress narration。"
+      : "Under the XML protocol, do not mix progress prose with the tool block; the runtime will inject visible progress narration from the tool name, target, and user goal.",
     ...example,
     language === "zh"
       ? "禁止输出 `[Tool call: read_file]`、`Tool call: read_file`、`<tool_code>...</tool_code>`、`我要调用工具`。这些都不是可执行工具调用。"
@@ -389,8 +395,9 @@ export function buildSystemPrompt(
     "你的回复中，**只有 XML 标签之外的 Markdown 正文才会被用户看到**。",
     "- `<analysis>`、`<thought>`、`<thinking>`、`<reasoning>` 标签内的内容会进入折叠的后台过程块；用户默认看不到，也可能在设置中以过滤摘要查看。",
     "- 因此：你的分析、总结、结论、方案等所有需要用户看到的内容，**必须以普通 Markdown 文本的形式输出，绝不能放在任何 XML 标签内部**。",
-    "- 不要主动输出 `<analysis>` 过程句；如果底层模型或服务端产生 hidden reasoning，运行时会折叠为过程摘要。**禁止将任何分析正文、方案内容或最终结论写在 `<analysis>` 内**。",
-    "- 调用 native tools 时可以直接发出工具调用；界面会展示执行状态。只有在真正需要向用户说明判断、结果或阻塞时，才输出普通 Markdown。",
+    "- 允许输出用户可见的公开进度说明，但只能写安全摘要：当前理解、为什么做下一步、正在做什么、将用什么结果判断下一步。不要输出原始 chain-of-thought、逐步内心推理或私密评分。",
+    "- 不要主动输出 `<analysis>` 过程句；如果底层模型或服务端产生 hidden reasoning，运行时会折叠为过程摘要。**禁止将任何分析正文、方案内容、用户需要看到的解释或最终结论写在 `<analysis>`、`<thought>`、`<thinking>`、`<reasoning>` 内**。",
+    "- 调用 native tools 时可以直接发出工具调用；如需说明，可在工具调用前用 1-3 句普通 Markdown 写公开进度说明。XML 工具协议下工具块必须保持纯净，不要混排正文；界面会由 runtime 注入 progress narration。",
     "",
     "## 用户提问交互规则",
     "当你需要用户做选择、确认方向、补充信息或决定下一步时，不要只抛出开放式问题让用户自己打字。",
@@ -609,6 +616,7 @@ export function buildSystemPrompt(
     tfl.push("优先使用 native tool calling；如果当前模型只支持文本工具协议，则使用 XML 格式调用工具：");
     tfl.push("");
     tfl.push("需要工具时只输出完整工具调用，不要先写“我将读取/Let me check/I need to...”这类过程句：");
+    tfl.push("如果当前实际使用 native tool calling，可以用 1-3 句普通 Markdown 写公开进度说明；如果使用 XML 工具协议，工具块前后必须纯净，运行时会注入可见进度说明。");
     tfl.push("<tool_use>");
     tfl.push("<tool>工具名称</tool>");
     tfl.push(String.raw`<parameter name="参数名">参数值</parameter>`);
@@ -683,8 +691,8 @@ export function buildSystemPrompt(
     tfl.push("");
     tfl.push("### 🚫 强制响应格式");
     tfl.push("1. 所有用户需要看到的分析、方案、结论，都必须写在普通 Markdown 中。");
-    tfl.push("2. `<analysis>` 仅用于极简内心备注；不要把真正的方案正文藏进去。");
-    tfl.push("3. native tool calling 可以直接发出工具调用；如果需要解释判断、结果或阻塞，再用普通 Markdown 面向用户说明。");
+    tfl.push("2. `<analysis>` 仅用于极简内心备注；不要把真正的方案正文、结论、用户需要看到的解释或下一步计划藏进去。");
+    tfl.push("3. native tool calling 可以直接发出工具调用；如果需要解释判断、结果或阻塞，再用 1-3 句普通 Markdown 面向用户说明公开进度。XML 工具协议不混排正文，由 runtime 注入 progress narration。");
     tfl.push("4. 工具调用只能通过正式工具格式表达；不要在普通正文中泄露裸工具名、JSON 参数或命令调用痕迹。");
     tfl.push("5. 如果本轮只是解释、总结、继续讨论或提出选择，不要伪装成正式 Proposal。");
     tfl.push("");
