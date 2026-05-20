@@ -251,3 +251,47 @@ test("task targeting treats screenshots and provided files as scoped context", (
   });
   assert.equal(scopedSearch.blocked, false);
 });
+
+test("task targeting allows one shallow structure pass for screenshot-only bug reports", () => {
+  const profile = buildTaskTargetingProfile({
+    userPrompt: "截图里导入 CSV 后面板没有显示数据，请先确认问题原因。",
+    userContext: {
+      imageParts: 2,
+    },
+  });
+
+  assert.equal(profile.hasUserProvidedContext, true);
+  assert.equal(profile.hasOnlyVisualContext, true);
+  assert.equal(profile.facets.includes("tabular_data"), false);
+  assert.equal(profile.facets.includes("source_code"), true);
+  assert.equal(profile.facets.includes("ui_design"), true);
+  assert.equal(profile.allowRootSkeleton, true);
+
+  assert.equal(shouldBlockToolCallForTargeting({
+    profile,
+    toolName: "get_project_skeleton",
+    args: { depth: 2 },
+    language: "zh",
+  }).blocked, false);
+
+  assert.equal(shouldBlockToolCallForTargeting({
+    profile,
+    toolName: "list_directory",
+    args: { path: "." },
+    target: ".",
+    language: "zh",
+  }).blocked, false);
+
+  const afterStructure = buildTaskTargetingProfile({
+    userPrompt: "截图里导入 CSV 后面板没有显示数据，请先确认问题原因。",
+    userContext: { imageParts: 2 },
+    observedEvidence: ["tool:get_project_skeleton"],
+  });
+  assert.equal(shouldBlockToolCallForTargeting({
+    profile: afterStructure,
+    toolName: "list_directory",
+    args: { path: "." },
+    target: ".",
+    language: "zh",
+  }).reason, "provided_context_broad_directory");
+});

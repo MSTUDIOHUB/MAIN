@@ -51,6 +51,8 @@ export interface TaskTargetingProfile {
   attachedFilePaths: string[];
   imageParts: number;
   hasUserProvidedContext: boolean;
+  hasOnlyVisualContext: boolean;
+  rootDirectoryAlreadyListed: boolean;
   designProtocolPaths: string[];
   requiresDesignProtocol: boolean;
   designProtocolSatisfied: boolean;
@@ -145,11 +147,23 @@ function extractSymbols(text: string): string[] {
 }
 
 function hasUiDesignCue(text: string): boolean {
-  return /(?:UI|界面|页面|组件|样式|视觉|主题|布局|交互|设计|design|layout|style|theme|component|TopIsland)/i.test(text);
+  return /(?:UI|界面|页面|组件|面板|仪表盘|看板|卡片|表格视图|样式|视觉|主题|布局|交互|设计|design|layout|style|theme|component|panel|dashboard|TopIsland)/i.test(text);
 }
 
 function hasExplicitStyleConfirmation(text: string): boolean {
   return /(?:风格|样式|设计|UI|theme|style|design).{0,24}(?:确认|已定|按照|按|使用|采用|沿用|选定|confirmed|use|follow|apply)/i.test(text);
+}
+
+function hasImplementationOrBugCue(text: string): boolean {
+  return /(?:修复|修改|实现|改代码|源码|组件|页面|界面|面板|状态|store|hook|渲染|导入|上传|解析|显示|不能|无法|没有|报错|错误|异常|bug|fix|repair|implement|code|component|render|import|upload|parse|display|shown?|error|issue)/i.test(text);
+}
+
+function hasTabularAnalysisCue(text: string): boolean {
+  return /(?:分析|统计|汇总|聚合|筛选|查询|透视|画像|趋势|环比|同比|指标|报表|图表分析|analy[sz]e|aggregate|summari[sz]e|query|filter|pivot|metric|report|trend|monthly compare)/i.test(text);
+}
+
+function hasUiBugContextCue(text: string): boolean {
+  return /(?:修复|改代码|源码|代码|组件|页面|界面|面板|仪表盘|看板|状态|store|hook|渲染|报错|错误|异常|bug|fix|repair|code|component|page|panel|dashboard|render|state|error|issue)/i.test(text);
 }
 
 function isDesignProtocolSkill(skill: TaskTargetingSkillLike): boolean {
@@ -231,20 +245,27 @@ export function buildTaskTargetingProfile(input: BuildTaskTargetingProfileInput 
   const designProtocolPaths = collectDesignProtocolPaths(input.skills);
   const facets = new Set<TaskFacet>();
   const hasProvidedContext = hasTurnProvidedContext(userContext);
+  const hasOnlyVisualContext =
+    userContext.imageParts > 0 &&
+    userContext.mentionedFilePaths.length === 0 &&
+    userContext.attachedFilePaths.length === 0;
+  const implementationOrBugCue = hasImplementationOrBugCue(combinedText);
+  const tabularKeywordCue =
+    /(?:CSV|TSV|XLSX|Excel|表格|数据表|dataset|spreadsheet|导入数据|数据导入|趋势|图表|环比|同比|monthly compare|trend|chart)/i.test(combinedText);
+  const shouldTreatAsTabularData =
+    tabularPaths.length > 0 ||
+    (tabularKeywordCue && hasTabularAnalysisCue(combinedText) && !(implementationOrBugCue && hasUiBugContextCue(combinedText)));
 
   if (explicitPaths.length > 0) addFacet(facets, "explicit_path");
   if (symbols.length > 0) addFacet(facets, "symbol_target");
   if (hasProvidedContext) addFacet(facets, "provided_context");
   if (userContext.imageParts > 0) addFacet(facets, "visual_context");
-  if (
-    tabularPaths.length > 0 ||
-    /(?:CSV|TSV|XLSX|Excel|表格|数据表|dataset|spreadsheet|导入数据|数据导入|趋势|图表|环比|同比|monthly compare|trend|chart)/i.test(combinedText)
-  ) {
+  if (shouldTreatAsTabularData) {
     addFacet(facets, "tabular_data");
   }
   if (hasUiDesignCue(combinedText)) addFacet(facets, "ui_design");
   if (designProtocolPaths.length > 0) addFacet(facets, "protocol_design");
-  if (/\b(?:src|lib|components?|hooks?|store|class|function|接口|函数|源码|代码)\b/i.test(combinedText)) {
+  if (implementationOrBugCue || /\b(?:src|lib|components?|hooks?|store|class|function|接口|函数|源码|代码)\b/i.test(combinedText)) {
     addFacet(facets, "source_code");
   }
 
@@ -264,7 +285,7 @@ export function buildTaskTargetingProfile(input: BuildTaskTargetingProfileInput 
   const hasScopedTarget = explicitPaths.length > 0 || symbols.length > 0 || tabularPaths.length > 0;
   const allowRootSkeleton =
     !rootSkeletonAlreadyRead &&
-    !hasProvidedContext &&
+    (!hasProvidedContext || hasOnlyVisualContext) &&
     !hasScopedTarget &&
     !facets.has("tabular_data") &&
     !requiresDesignProtocol;
@@ -297,6 +318,8 @@ export function buildTaskTargetingProfile(input: BuildTaskTargetingProfileInput 
     attachedFilePaths: userContext.attachedFilePaths,
     imageParts: userContext.imageParts,
     hasUserProvidedContext: hasProvidedContext,
+    hasOnlyVisualContext,
+    rootDirectoryAlreadyListed,
     designProtocolPaths,
     requiresDesignProtocol,
     designProtocolSatisfied,
@@ -396,7 +419,7 @@ export function shouldBlockToolCallForTargeting(input: TaskTargetingToolGateInpu
         suggestedTools: input.profile.preferredReadTools,
       };
     }
-    if (input.profile.hasUserProvidedContext) {
+    if (input.profile.hasUserProvidedContext && !input.profile.allowRootSkeleton) {
       return {
         blocked: true,
         reason: "provided_context_broad_directory",
@@ -426,7 +449,13 @@ export function shouldBlockToolCallForTargeting(input: TaskTargetingToolGateInpu
   if (
     input.toolName === "list_directory" &&
     input.profile.hasUserProvidedContext &&
-    (!target || target === "." || target === "./")
+    (!target || target === "." || target === "./") &&
+    !(
+      input.profile.hasOnlyVisualContext &&
+      !input.profile.rootDirectoryAlreadyListed &&
+      !input.profile.rootSkeletonAlreadyRead &&
+      input.profile.allowRootSkeleton
+    )
   ) {
     return {
       blocked: true,

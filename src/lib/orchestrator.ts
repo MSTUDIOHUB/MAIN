@@ -182,7 +182,10 @@ import {
   shouldBlockToolCallForTargeting,
   type TaskOrchestratorPhase,
 } from "./taskTargeting";
-import { shouldTriggerPlanReadOnlyConvergence } from "./planReadOnlyConvergence";
+import {
+  shouldRedirectPlanToolsAfterReadOnlyConvergence,
+  shouldTriggerPlanReadOnlyConvergence,
+} from "./planReadOnlyConvergence";
 import {
   extractPrimaryUserRequestText,
   extractTurnInputContextSignalsFromMessages,
@@ -315,10 +318,41 @@ function buildPlanReadOnlyConvergencePause(
       "请选择下一步方向。",
     ].filter(Boolean).join("\n"),
     options: [
-      { label: hasProvidedContext ? "基于图片/文件生成方案" : "生成归因方案", value: hasProvidedContext ? "请停止泛读，先概括截图/文件中观察到的现象，再基于已有证据生成问题归因、方案取舍和可审批计划。" : "请停止继续探索，直接基于已有证据生成问题归因、方案取舍和可审批计划。", action: "adjust_plan" },
-      { label: "只定向查一个线索", value: hasProvidedContext ? "请只围绕截图/文件观察到的现象再做一次精确定向只读探索，然后立刻停止并总结方案。" : "请再做一次定向只读探索，然后立刻停止并总结方案。", action: "continue_readonly_once" },
+      { label: hasProvidedContext ? "先说明截图观察并生成归因方案" : "生成归因方案", value: hasProvidedContext ? "请停止泛读，先明确列出截图/文件中实际观察到的现象，再基于已有证据生成问题归因、方案取舍和可审批计划。" : "请停止继续探索，直接基于已有证据生成问题归因、方案取舍和可审批计划。", action: "adjust_plan" },
+      { label: "只补一个明确证据", value: hasProvidedContext ? "请只围绕截图/文件观察到的现象补充一个精确定向证据，然后立刻停止并生成归因方案。" : "请再做一次定向只读探索，然后立刻停止并总结方案。", action: "continue_readonly_once" },
     ],
   };
+}
+
+function buildPlanPostConvergenceToolRedirectPrompt(input: {
+  language: "zh" | "en";
+  toolNames: string[];
+  userContext?: TurnInputContextSignals;
+}): string {
+  const context = normalizeTurnInputContextSignals(input.userContext);
+  const toolList = input.toolNames.slice(0, 6).join(", ");
+  if (input.language === "en") {
+    return [
+      "PLAN_READONLY_CONVERGENCE_ENFORCED: Stop calling more read-only discovery tools.",
+      toolList ? `The attempted tool call(s) were blocked before execution: ${toolList}.` : "",
+      context.imageParts > 0
+        ? "First write a concrete 'Screenshot observations' section: visible UI/text/state, what the user is asking, and which code/state path it points to."
+        : "First restate the observed user-provided context and the actual user goal.",
+      "Then create or update `.MAIN/plans/design.md` with the diagnosis, evidence, affected files, implementation steps, and validation.",
+      "If one missing fact truly blocks the plan, ask exactly one concrete question with `<user_options>`; do not offer generic continue-reading options.",
+      "Allowed next actions: write/update `.MAIN/plans/design.md`, submit the formal Proposal, or ask one blocking user choice. Do not call get_project_skeleton, list_directory, glob_search, grep_search, read_file, or read_document again in the next response.",
+    ].filter(Boolean).join("\n");
+  }
+  return [
+    "PLAN_READONLY_CONVERGENCE_ENFORCED: 停止继续调用只读发现工具。",
+    toolList ? `刚才准备执行的工具已在执行前拦截：${toolList}。` : "",
+    context.imageParts > 0
+      ? "下一步必须先写出“截图观察到的现象”：图片中可见的 UI/文本/状态、用户真正要解决的问题，以及它指向的代码/状态链路。"
+      : "下一步必须先复述用户提供的上下文和真实目标。",
+    "随后创建或更新 `.MAIN/plans/design.md`，包含问题归因、已有证据、影响文件、实施步骤和验证方式。",
+    "如果确实只有一个缺失事实阻塞方案，只能提出一个具体问题并用 `<user_options>`；不要再给“继续查/继续分析”这类泛化选项。",
+    "下一条只允许：写/更新 `.MAIN/plans/design.md`、提交正式 Proposal，或询问一个真实阻塞选择。不要再次调用 get_project_skeleton、list_directory、glob_search、grep_search、read_file 或 read_document。",
+  ].filter(Boolean).join("\n");
 }
 
 function stripReasoningBlocksForEscalation(text: string): string {
@@ -4565,6 +4599,7 @@ export async function executeAgentLoop(
   let usedPlanClosureGuard = false;
   let usedPlanDesignClosurePrompt = false;
   let usedPlanReadOnlyConvergencePrompt = false;
+  let planPostConvergenceToolRedirectCount = 0;
   let usedExecuteCompletionEvidencePrompt = false;
   let usedExecuteReplanningEvidencePrompt = false;
   let planReadOnlyConvergenceBatches = 0;
@@ -6176,6 +6211,63 @@ export async function executeAgentLoop(
       });
     }
 
+    const shouldRedirectPostConvergenceToolCalls = shouldRedirectPlanToolsAfterReadOnlyConvergence({
+      workflowMode,
+      isPlanApproved: callbacks.getIsPlanApproved(),
+      convergencePromptAlreadyUsed: usedPlanReadOnlyConvergencePrompt,
+      hasPlanDecisionOutput: hasStructuredProposal || finalReplyOptions.length > 0 || hasReviewablePlanArtifacts,
+      toolNames: effectiveToolCalls.map((call) => call.name),
+    });
+    if (shouldRedirectPostConvergenceToolCalls) {
+      callbacks.onStreamToken("__ESCALATION_RESET__:", assistantMsgId);
+      logAgentEvent("plan_post_convergence_tool_redirect", {
+        iteration,
+        redirectCount: planPostConvergenceToolRedirectCount + 1,
+        toolNames: effectiveToolCalls.map((call) => call.name).slice(0, 8),
+        imageParts: turnInputContextSignals.imageParts,
+        mentionedFilePaths: turnInputContextSignals.mentionedFilePaths.length,
+        attachedFilePaths: turnInputContextSignals.attachedFilePaths.length,
+      });
+
+      if (planPostConvergenceToolRedirectCount >= 1) {
+        emitTaskOrchestratorPhase("PAUSED", {
+          reason: "post_convergence_readonly_tools_repeated",
+          iteration,
+          toolNames: effectiveToolCalls.map((call) => call.name).slice(0, 8),
+        });
+        callbacks.onNonActionableStop(
+          callbacks.getPreferredLanguage() === "zh"
+            ? [
+                "本轮已暂停：模型在收到收束指令后仍继续发起只读探索，没有生成可审批方案。",
+                "这说明当前模型没有按 Plan 流程收束。继续自动重试会浪费上下文。",
+                "",
+                "建议下一步：继续时请直接要求它先列出截图观察，再生成 `.MAIN/plans/design.md` 归因方案。",
+              ].join("\n")
+            : [
+                "This turn is paused: after the convergence instruction, the model still tried more read-only exploration instead of producing a reviewable plan.",
+                "Continuing automatically would waste context.",
+                "",
+                "Suggested next step: continue by requiring screenshot observations first, then a `.MAIN/plans/design.md` diagnosis plan.",
+              ].join("\n"),
+          "incomplete_plan",
+        );
+        callbacks.onStatusChange("idle");
+        return;
+      }
+
+      planPostConvergenceToolRedirectCount += 1;
+      callbacks.onStatusChange("running");
+      callbacks.appendMessage({
+        role: "user",
+        content: buildPlanPostConvergenceToolRedirectPrompt({
+          language: callbacks.getPreferredLanguage(),
+          toolNames: effectiveToolCalls.map((call) => call.name),
+          userContext: turnInputContextSignals,
+        }),
+      });
+      continue;
+    }
+
     // 4. Handle turn termination or continuation
     if (shouldPauseForUserChoice && !shouldSuppressApprovedPlanNoToolText) {
       logAgentEvent("reply_options_pause", {
@@ -6991,7 +7083,24 @@ export async function executeAgentLoop(
     let allResults: ToolExecutionResult[] = [];
 
     for (const tc of effectiveToolCalls) {
-      const toolArgs = parseToolCallArguments(tc, workspace);
+      let toolArgs = parseToolCallArguments(tc, workspace);
+      const targetingProfile = buildCurrentTaskTargetingProfile();
+      if (
+        tc.name === "get_project_skeleton" &&
+        targetingProfile.allowRootSkeleton &&
+        (toolArgs.depth == null || String(toolArgs.depth).trim() === "")
+      ) {
+        toolArgs = { ...toolArgs, depth: 2 };
+        tc.arguments = JSON.stringify(toolArgs);
+        logAgentEvent("task_targeting_tool_args_normalized", {
+          iteration,
+          tool: tc.name,
+          reason: "shallow_root_skeleton_default",
+          depth: 2,
+          imageParts: targetingProfile.imageParts,
+          hasUserProvidedContext: targetingProfile.hasUserProvidedContext,
+        });
+      }
       toolArgsByCallId.set(tc.id, toolArgs);
       const target = getToolTarget(tc.name, toolArgs);
       callbacks.onHarnessRunUpdate?.({
@@ -7035,7 +7144,6 @@ export async function executeAgentLoop(
         continue;
       }
 
-      const targetingProfile = buildCurrentTaskTargetingProfile();
       const targetingGate = shouldBlockToolCallForTargeting({
         profile: targetingProfile,
         toolName: tc.name,

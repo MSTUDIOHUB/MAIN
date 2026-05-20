@@ -54,6 +54,7 @@ function loadTranspiledModuleSync(sourcePath) {
 }
 
 const {
+  shouldRedirectPlanToolsAfterReadOnlyConvergence,
   shouldTriggerPlanReadOnlyConvergence,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planReadOnlyConvergence.ts"));
 
@@ -105,5 +106,39 @@ test("plan read-only convergence tightens when user supplied screenshots or file
     batchCount: 1,
     toolCount: 5,
     userContext: { mentionedFilePaths: ["src/App.tsx"] },
+  }), false);
+});
+
+test("post-convergence plan turns redirect more read-only tools before execution", () => {
+  assert.equal(shouldRedirectPlanToolsAfterReadOnlyConvergence({
+    workflowMode: "plan",
+    isPlanApproved: false,
+    convergencePromptAlreadyUsed: true,
+    hasPlanDecisionOutput: false,
+    toolNames: ["list_directory"],
+  }), true);
+
+  assert.equal(shouldRedirectPlanToolsAfterReadOnlyConvergence({
+    workflowMode: "plan",
+    isPlanApproved: false,
+    convergencePromptAlreadyUsed: true,
+    hasPlanDecisionOutput: true,
+    toolNames: ["list_directory"],
+  }), false);
+
+  assert.equal(shouldRedirectPlanToolsAfterReadOnlyConvergence({
+    workflowMode: "plan",
+    isPlanApproved: true,
+    convergencePromptAlreadyUsed: true,
+    hasPlanDecisionOutput: false,
+    toolNames: ["read_file"],
+  }), false);
+
+  assert.equal(shouldRedirectPlanToolsAfterReadOnlyConvergence({
+    workflowMode: "plan",
+    isPlanApproved: false,
+    convergencePromptAlreadyUsed: true,
+    hasPlanDecisionOutput: false,
+    toolNames: ["write_file"],
   }), false);
 });
