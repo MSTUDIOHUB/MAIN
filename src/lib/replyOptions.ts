@@ -412,6 +412,14 @@ export function hasOnlyReadOnlyPermissionReplyOptions(replyOptions: ReplyOption[
   );
 }
 
+export function hasExecutableProposalReplyOptions(replyOptions: ReplyOption[]): boolean {
+  return Array.isArray(replyOptions) && replyOptions.some((option) =>
+    option.source === "proposal_follow_up" ||
+    option.source === "operation_approval" ||
+    option.action === "approve_operation_once"
+  );
+}
+
 function looksLikePlanContinuationReplyOption(option: ReplyOption): boolean {
   const combined = normalizeOptionText(`${option.label || ""} ${option.value || ""}`);
   if (!combined) return false;
@@ -561,6 +569,16 @@ export function shouldPauseForReplyOptions(params: {
     option.action === "approve_operation_once"
   );
   if (finishReason === "length" && !hasLengthSafeOption) return false;
+  if (
+    workflowMode === "plan" &&
+    !isPlanApproved &&
+    !hasStructuredProposal &&
+    !hasReadyPlanArtifacts &&
+    toolCallCount === 0 &&
+    hasExecutableProposalReplyOptions(replyOptions)
+  ) {
+    return false;
+  }
   if (
     workflowMode === "plan" &&
     !isPlanApproved &&

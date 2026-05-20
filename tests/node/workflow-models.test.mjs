@@ -120,6 +120,7 @@ const {
 
 const {
   buildPlanApprovalChoiceHint,
+  resolvePlanApprovalQuickReplyAction,
   shouldRouteQuickReplyToPlanApproval,
 } = loadPlanControlModule();
 
@@ -312,6 +313,62 @@ test("plan approval quick reply routes through approvePlan control path", () => 
       planArtifacts: [],
     }),
     false,
+  );
+});
+
+test("plan approval quick reply resolves materialization and blocking branches", () => {
+  const designArtifact = { kind: "design", path: ".MAIN/plans/design.md", title: "Design", content: "# Design", updatedAt: 1 };
+
+  assert.equal(
+    resolvePlanApprovalQuickReplyAction({
+      text: "我批准按上面的方案开始真实操作，请复用上一轮方案，不要重新规划，直接执行并验证",
+      optionAction: "approve_operation_once",
+      sourceIntent: "plan",
+      isPlanApproved: false,
+      planStage: "design",
+      planArtifacts: [designArtifact],
+      sourceHasMaterializablePlan: false,
+    }),
+    "approve_existing_plan",
+  );
+
+  assert.equal(
+    resolvePlanApprovalQuickReplyAction({
+      text: "我批准按上面的方案开始真实操作，请复用上一轮方案，不要重新规划，直接执行并验证",
+      optionAction: "approve_operation_once",
+      sourceIntent: "plan",
+      isPlanApproved: false,
+      planStage: "idle",
+      planArtifacts: [],
+      sourceHasMaterializablePlan: true,
+    }),
+    "materialize_then_approve",
+  );
+
+  assert.equal(
+    resolvePlanApprovalQuickReplyAction({
+      text: "我批准按上面的方案开始真实操作，请复用上一轮方案，不要重新规划，直接执行并验证",
+      optionAction: "approve_operation_once",
+      sourceIntent: "plan",
+      isPlanApproved: false,
+      planStage: "idle",
+      planArtifacts: [],
+      sourceHasMaterializablePlan: false,
+    }),
+    "block_missing_plan_artifact",
+  );
+
+  assert.equal(
+    resolvePlanApprovalQuickReplyAction({
+      text: "我批准执行",
+      optionAction: "approve_operation_once",
+      sourceIntent: "execute",
+      isPlanApproved: false,
+      planStage: "idle",
+      planArtifacts: [],
+      sourceHasMaterializablePlan: true,
+    }),
+    "not_plan_approval",
   );
 });
 

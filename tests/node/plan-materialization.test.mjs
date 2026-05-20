@@ -53,7 +53,7 @@ function loadTranspiledModuleSync(sourcePath) {
   return module.exports;
 }
 
-const { composeReviewableDesignFromEvidence, materializePlanArtifactFromVisibleText } = loadTranspiledModuleSync(
+const { composeReviewableDesignFromEvidence, isMaterializablePlanLikeText, materializePlanArtifactFromVisibleText } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/planMaterialization.ts"),
 );
 
@@ -106,6 +106,80 @@ test("materializes valid visible design text into design.md artifact", () => {
   assert.equal(result.kind, "design");
   assert.equal(result.path, ".MAIN/plans/design.md");
   assert.match(result.content || "", /^# Proposed Plan/);
+});
+
+test("materializes Gemma-style markdown fix plan without structured proposal tags", () => {
+  const visibleText = [
+    "## 修复方案",
+    "",
+    "### 目标与约束",
+    "- 目标：修复 MAIN 计划审批链路，避免本地 Gemma4 输出普通方案后绕过 design.md。",
+    "- 约束：未批准前只能写 `.MAIN/plans/design.md`，不能修改业务源码。",
+    "",
+    "### 当前发现",
+    "- 日志显示 `hasStructuredProposal:false`，但系统合成了 approve_operation_once。",
+    "- Quick Reply 随后进入普通 execute/edit，`planStage` 仍是 idle。",
+    "",
+    "### 实施步骤",
+    "1. 修改 `src/lib/planMaterialization.ts`，支持普通 Markdown 方案自动物化。",
+    "2. 修改 `src/lib/orchestrator.ts`，在暂停审批前先尝试写入 `.MAIN/plans/design.md`。",
+    "3. 修改 `src/App.tsx`，让 Plan quick reply 走计划审批而不是普通执行。",
+    "",
+    "### 数据流与控制流",
+    "- 模型可见方案先经过物化质量门禁，再写入 design.md，随后进入 Plan Review。",
+    "- 用户批准后调用 approvePlan，生成 runtime 任务并进入 executing。",
+    "",
+    "### 风险与注意事项",
+    "- 低质量闲聊不能落盘，避免污染计划面板。",
+    "- 保留普通聊天的一次性操作审批，不影响轻量任务。",
+    "",
+    "### 验证方式",
+    "- 增加 Node 单测覆盖 Gemma4 普通方案和 quick reply 路由。",
+    "- 验证批准后仍可使用 Browser/Playwright 证据工具。",
+  ].join("\n");
+
+  const result = materializePlanArtifactFromVisibleText({ visibleText });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.path, ".MAIN/plans/design.md");
+  assert.equal(isMaterializablePlanLikeText(visibleText), true);
+});
+
+test("materializes Qwen-style plan and strips user option markup", () => {
+  const result = materializePlanArtifactFromVisibleText({
+    visibleText: [
+      "### 目标",
+      "- 修复 Qwen 在 Plan 模式下直接输出方案和选项时无法生成 design.md 的问题。",
+      "",
+      "### 方案",
+      "- 在 `src/lib/replyOptions.ts` 标记 proposal_follow_up 选项。",
+      "- 在 `src/lib/orchestrator.ts` 看到选项时先自动物化方案。",
+      "- 在 `src/lib/planControl.ts` 区分 approve_existing_plan 和 materialize_then_approve。",
+      "",
+      "### 执行顺序",
+      "1. 先补计划文本质量识别。",
+      "2. 再接 quick reply 路由。",
+      "3. 最后补测试和 Browser/Playwright 验证能力断言。",
+      "",
+      "### 数据流",
+      "- ChatArea 方案文本 -> materializePlanArtifactFromVisibleText -> `.MAIN/plans/design.md` -> approvePlan。",
+      "",
+      "### 风险与边界",
+      "- 不为 Qwen 或 Gemma4 写模型名分支，只按输出形态判断。",
+      "- 普通讨论仍留在聊天区，不强制落盘。",
+      "",
+      "### 验证方式",
+      "- 运行 `node --test tests/node/plan-materialization.test.mjs tests/node/reply-options.test.mjs`。",
+      "",
+      "<user_options>",
+      "<option action=\"approve_operation_once\" value=\"我批准按上面的方案开始真实操作，请复用上一轮方案，不要重新规划，直接执行并验证\">批准执行本轮操作</option>",
+      "<option action=\"adjust_plan\" value=\"继续调整上面的方案，暂不执行真实操作\">继续调整方案</option>",
+      "</user_options>",
+    ].join("\n"),
+  });
+
+  assert.equal(result.ok, true);
+  assert.doesNotMatch(result.content || "", /user_options|approve_operation_once/);
 });
 
 test("rejects low quality visible text instead of materializing a plan", () => {

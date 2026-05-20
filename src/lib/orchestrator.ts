@@ -41,6 +41,7 @@ import { ensureVisibleConclusionWithPolicy, isAssistantTurnEmpty, isSyntheticVis
 import { hasStructuredPlanProposal } from "./planProposal";
 import {
   buildReadOnlyPermissionContinuationPrompt,
+  hasExecutableProposalReplyOptions,
   hasOnlyReadOnlyPermissionReplyOptions,
   hasOnlyPlanContinuationReplyOptions,
   serializeAssistantReplyForHistory,
@@ -1485,6 +1486,18 @@ function looksLikeOperationCompletionClaim(text: string): boolean {
   return !looksLikeProposalOnly;
 }
 
+function looksLikeExecutionReplanningText(text: string): boolean {
+  const normalized = String(text || "").replace(/\s+/g, " ").trim();
+  if (normalized.length < 240) return false;
+  const hasPlanShape =
+    /(?:修复方案|实现方案|执行方案|实施步骤|下一步|计划|方案|建议|Proposal|Implementation Plan|Execution Plan|Next steps?)/i.test(normalized);
+  const hasFutureAction =
+    /(?:将|会|建议|可以|应该|需要|下一步|准备|开始|执行|修改|修复|实现|验证|will|would|should|can|could|need to|next|propose|recommend|start|execute|modify|fix|implement|verify)/i.test(normalized);
+  const hasConcreteWork =
+    /(?:src\/|\.tsx?|\.jsx?|\.py|\.rs|\.go|\.json|\.md|read_file|write_file|replace_in_file|run_command|browser_evaluate|文件|代码|接口|组件|测试|验证|file|code|component|test|validation)/i.test(normalized);
+  return hasPlanShape && hasFutureAction && hasConcreteWork && !looksLikeOperationCompletionClaim(normalized);
+}
+
 function buildExecuteCompletionEvidencePrompt(language: "zh" | "en", retryCount: number): string {
   if (language === "en") {
     return [
@@ -1497,6 +1510,21 @@ function buildExecuteCompletionEvidencePrompt(language: "zh" | "en", retryCount:
     "上一条回复声称操作已完成，但 MAIN 没有看到本轮执行的真实工具证据。",
     "不要重复完成声明。现在必须开始真实工具操作：读取相关文件，必要时写入或打补丁，运行必要命令/验证，然后只能基于工具结果总结。",
     retryCount > 1 ? "这已经是重复失败。如果无法执行，请明确说明具体阻塞，不要声称成功。" : "",
+  ].filter(Boolean).join("\n");
+}
+
+function buildExecuteReplanningEvidencePrompt(language: "zh" | "en", retryCount: number): string {
+  if (language === "en") {
+    return [
+      "The user already approved execution for this turn, but the previous reply produced another plan instead of real tool evidence.",
+      "Do not re-plan. Start the smallest necessary real tool action now: write/patch files, run a command, use Browser/Playwright validation, or pause with the exact blocker.",
+      retryCount > 1 ? "This is a repeated failure. Stop with a concrete blocker if no real action is possible." : "",
+    ].filter(Boolean).join("\n");
+  }
+  return [
+    "用户已经批准本轮执行，但上一条回复又输出了新的方案，没有产生真实工具证据。",
+    "不要重新规划。现在必须开始最小必要的真实工具动作：写入/替换文件、运行命令、调用 Browser/Playwright 验证，或明确暂停说明具体阻塞。",
+    retryCount > 1 ? "这已经是重复失败。如果无法真实执行，请直接给出具体阻塞，不要继续输出方案。" : "",
   ].filter(Boolean).join("\n");
 }
 
@@ -4466,6 +4494,7 @@ export async function executeAgentLoop(
   let usedPlanDesignClosurePrompt = false;
   let usedPlanReadOnlyConvergencePrompt = false;
   let usedExecuteCompletionEvidencePrompt = false;
+  let usedExecuteReplanningEvidencePrompt = false;
   let planReadOnlyConvergenceBatches = 0;
   let planReadOnlyConvergenceTools = 0;
   const attemptedPlanWriteTargets: string[] = [];
@@ -6004,6 +6033,10 @@ export async function executeAgentLoop(
     }
 
     const hasStructuredProposal = hasStructuredPlanProposal(streamText);
+    const hasExecutablePlanProposalOptions =
+      workflowMode === "plan" &&
+      !callbacks.getIsPlanApproved() &&
+      hasExecutableProposalReplyOptions(finalReplyOptions);
     const currentPlanStageForReview = callbacks.getPlanStage();
     const isApprovedPlanExecutionTurn =
       workflowMode === "plan" &&
@@ -6229,6 +6262,46 @@ export async function executeAgentLoop(
           continue;
         }
 
+        const rejectedExecuteReplanningText =
+          isExecuteRuntimeWithoutEvidence &&
+          finalReplyOptions.length === 0 &&
+          !sawExecuteOperationEvidence &&
+          looksLikeExecutionReplanningText(visibleAssistantText || userVisibleText);
+        if (rejectedExecuteReplanningText) {
+          callbacks.onStreamToken("__ESCALATION_RESET__:", assistantMsgId);
+          callbacks.onStatusChange("running");
+          consecutiveNoToolCount++;
+          logAgentEvent("execute_replanning_text_without_evidence", {
+            iteration,
+            consecutiveNoToolCount,
+            workflowMode,
+            turnIntent,
+            runtimeIntent,
+            visibleChars: (visibleAssistantText || userVisibleText).length,
+          });
+
+          if (usedExecuteReplanningEvidencePrompt || consecutiveNoToolCount >= MAX_NO_ACTION_RETRIES) {
+            logAgentEvent("loop_stop", {
+              reason: "execute_replanning_text_without_evidence",
+              iteration,
+              consecutiveNoToolCount,
+            });
+            callbacks.onNonActionableStop(
+              buildNonActionableStopMessage(callbacks.getPreferredLanguage(), "plain_text_execution"),
+              "no_action",
+            );
+            callbacks.onStatusChange("idle");
+            return;
+          }
+
+          usedExecuteReplanningEvidencePrompt = true;
+          callbacks.appendMessage({
+            role: "user",
+            content: buildExecuteReplanningEvidencePrompt(callbacks.getPreferredLanguage(), consecutiveNoToolCount),
+          });
+          continue;
+        }
+
         // ── Plan Mode Interception ────────────────────────────────
         // In Plan mode, only enter review when the model has either:
         // 1. submitted a valid top-level proposal payload, or
@@ -6274,16 +6347,17 @@ export async function executeAgentLoop(
           planningStillIncomplete &&
           hasMeaningfulSourcePlanText &&
           !hasReviewablePlanArtifacts &&
-          (sawPlanModeToolActivity || wasTruncated);
+          (sawPlanModeToolActivity || wasTruncated || hasExecutablePlanProposalOptions);
         const shouldTryPlanTextMaterialization =
           planningStillIncomplete &&
           hasMeaningfulSourcePlanText &&
           !hasReviewablePlanArtifacts &&
-          finalReplyOptions.length === 0 &&
+          (finalReplyOptions.length === 0 || hasExecutablePlanProposalOptions) &&
           !hasStructuredProposal &&
           (
             sawPlanModeToolActivity ||
             wasTruncated ||
+            hasExecutablePlanProposalOptions ||
             turnIntent === "plan" ||
             commandDirective?.action === "plan_file_change"
           );

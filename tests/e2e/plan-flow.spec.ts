@@ -6,6 +6,29 @@ test.beforeEach(async ({ page }) => {
       window.localStorage.clear();
       window.sessionStorage.setItem("__CODELY_E2E_STORAGE_RESET__", "1");
     }
+    const files = ((window as any).__PLAN_FLOW_E2E_FILES__ ??= {});
+    (window as any).__TAURI_EVENT_PLUGIN_INTERNALS__ ??= { unregisterListener: () => {} };
+    const internals = ((window as any).__TAURI_INTERNALS__ ??= {});
+    internals.metadata ??= {
+      currentWindow: { label: "main" },
+      currentWebview: { label: "main" },
+    };
+    internals.invoke = async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "plugin:event|listen") return 1;
+      if (cmd === "plugin:event|unlisten") return null;
+      if (cmd === "get_system_memory") return { total_gb: 32, available_gb: 24 };
+      if (cmd === "write_file") {
+        files[String(args?.path ?? "")] = String(args?.content ?? "");
+        return null;
+      }
+      if (cmd === "read_file") {
+        const path = String(args?.path ?? "");
+        if (Object.prototype.hasOwnProperty.call(files, path)) return files[path];
+        throw new Error(`ENOENT: ${path}`);
+      }
+      if (cmd === "get_file_metadata") return { path: String(args?.path ?? ""), sizeBytes: 1, modifiedMs: 1 };
+      return null;
+    };
   });
 });
 
@@ -215,3 +238,54 @@ test("plan approval quick reply approves instead of re-sending an unapproved pla
     )
     .toBe(true);
 });
+
+for (const scenario of ["plan-quick-reply-materialize-gemma", "plan-quick-reply-materialize-qwen"] as const) {
+  test(`${scenario} materializes visible plan before approval`, async ({ page }) => {
+    await page.goto(`/?e2eScenario=${scenario}`);
+
+    await expect(page.getByTestId("top-island-awaiting-choice")).toBeVisible();
+    await expect(page.getByTestId("top-island-reply-option-0")).toContainText("批准执行");
+
+    await page.getByTestId("top-island-reply-option-0").click();
+
+    await expect
+      .poll(async () =>
+        page.evaluate(() => {
+          const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+          return {
+            isPlanApproved: snapshot?.isPlanApproved,
+            planStage: snapshot?.planStage,
+            planArtifactPaths: snapshot?.planArtifactPaths || [],
+            taskFlowUserCount: snapshot?.taskFlowUserCount,
+          };
+        }),
+      )
+      .toEqual({
+        isPlanApproved: true,
+        planStage: "executing",
+        planArtifactPaths: [".MAIN/plans/design.md"],
+        taskFlowUserCount: 1,
+      });
+
+    await expect
+      .poll(async () =>
+        page.evaluate(() => {
+          const entries = JSON.parse(window.localStorage.getItem("main.debugLog.v1") || "[]");
+          return {
+            materialized: entries.some((entry: { source?: string }) =>
+              entry.source === "ui.quickReply_plan_materialized",
+            ),
+            bypassedExecute: entries.some((entry: { source?: string; message?: string }) =>
+              entry.source === "store.session_run_start" &&
+              String(entry.message || "").includes('"intent":"execute"') &&
+              String(entry.message || "").includes('"planStage":"idle"'),
+            ),
+          };
+        }),
+      )
+      .toEqual({
+        materialized: true,
+        bypassedExecute: false,
+      });
+  });
+}

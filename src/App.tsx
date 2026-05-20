@@ -41,6 +41,7 @@ import {
   saveProjectSession,
   setWorkspaceRoot as setWorkspaceRootIpc,
   canonicalizeWorkspacePath,
+  writeFile,
 } from "./lib/ipc";
 import {
   type AttachmentPickerResult,
@@ -53,10 +54,11 @@ import { normalizeStudioAgentKey } from "./lib/gameStudioCatalog";
 import { normalizeContextMemoryState } from "./lib/contextMemory";
 import { MAIN_MODE_KEYS, mapLegacyNexusModeToMainMode, mapMainModeToLegacyNexusMode } from "./lib/mainModes";
 import { resolveConversationTurnIntent } from "./lib/runIntent";
-import { shouldRouteQuickReplyToPlanApproval } from "./lib/planControl";
+import { resolvePlanApprovalQuickReplyAction } from "./lib/planControl";
+import { materializePlanArtifactFromVisibleText } from "./lib/planMaterialization";
 import { runAfterNextPaint } from "./lib/uiScheduling";
 import { checkForMainUpdate, installMainUpdate, type MainUpdateInfo, type MainUpdateProgress } from "./lib/updater";
-import { normalizeConversationDisplayTitle, type ReplyOption, type RightPanelTab } from "./lib/workflowModels";
+import { getPlanArtifactTitle, normalizeConversationDisplayTitle, type ReplyOption, type RightPanelTab } from "./lib/workflowModels";
 import { appendDebugLog } from "./lib/debugLog";
 import { applyAppIconVariant } from "./lib/appIcon";
 import { safeConfirm } from "./lib/safeConfirm";
@@ -78,6 +80,108 @@ function normalizeStoredRightPanelTab(value: unknown): RightPanelTab {
   return value === "diff" || value === "terminal" || value === "plan"
     ? value
     : "plan";
+}
+
+function getLatestVisibleAgentTextForTurn(taskFlow: TaskBlock[], turnId?: string | null): string {
+  if (!turnId) return "";
+  for (let index = taskFlow.length - 1; index >= 0; index--) {
+    const block = taskFlow[index];
+    if (block.turnId !== turnId || block.type !== "agent" || block.hiddenProcess) continue;
+    const content = String(block.content || "").trim();
+    if (content) return content;
+  }
+  return "";
+}
+
+function appendPlanQuickReplyBlockedNotice(sourceTurnId: string | undefined, reason?: string): void {
+  const state = useAppStore.getState();
+  const language = state.config.language === "en" ? "en" : "zh";
+  const turnId = sourceTurnId || state.currentTurnId || undefined;
+  const blockId = state._nextTaskId();
+  const content = language === "en"
+    ? `Plan approval was blocked because MAIN could not find or materialize a reviewable .MAIN/plans/design.md artifact${reason ? ` (${reason})` : ""}. Ask the model to update design.md, then approve the plan again.`
+    : `已阻止计划批准：MAIN 没有找到可审批的 .MAIN/plans/design.md，也无法从上一条方案自动物化${reason ? `（${reason}）` : ""}。请先让模型更新 design.md，再批准执行。`;
+
+  appendDebugLog("warn", "ui.quickReply_plan_approval_blocked", {
+    sourceTurnId: turnId ?? null,
+    reason: reason ?? null,
+  });
+
+  useAppStore.setState((s) => ({
+    input: "",
+    contextMentions: [],
+    attachedFiles: [],
+    currentTurnExecutionConsent: { turnId: null, granted: false },
+    taskFlow: [
+      ...s.taskFlow,
+      {
+        id: blockId,
+        ...(turnId ? { turnId } : {}),
+        type: "system",
+        content,
+        variant: "plan_quality_gate",
+      },
+    ],
+    conversationTurns: turnId
+      ? s.conversationTurns.map((turn) =>
+          turn.id === turnId
+            ? {
+                ...turn,
+                status: "awaiting_input",
+                blockIds: turn.blockIds.includes(blockId) ? turn.blockIds : [...turn.blockIds, blockId],
+              }
+            : turn,
+        )
+      : s.conversationTurns,
+  }));
+}
+
+async function materializePlanQuickReplyAndApprove(params: {
+  sourceTurnId?: string;
+  approvalText: string;
+  visiblePlanText: string;
+}): Promise<void> {
+  const state = useAppStore.getState();
+  const materialized = materializePlanArtifactFromVisibleText({
+    visibleText: params.visiblePlanText,
+    planStage: state.planStage,
+  });
+
+  if (!materialized.ok || !materialized.path || !materialized.content || !materialized.kind) {
+    appendPlanQuickReplyBlockedNotice(params.sourceTurnId, materialized.reason || "quality_gate");
+    return;
+  }
+
+  try {
+    await writeFile(materialized.path, materialized.content, state.currentWorkspace || undefined);
+    const latest = useAppStore.getState();
+    latest.upsertPlanArtifact({
+      kind: materialized.kind,
+      path: materialized.path,
+      title: getPlanArtifactTitle(materialized.kind, latest.config.language === "en" ? "en" : "zh"),
+      content: materialized.content,
+      updatedAt: Date.now(),
+    });
+    appendDebugLog("info", "ui.quickReply_plan_materialized", {
+      sourceTurnId: params.sourceTurnId ?? null,
+      path: materialized.path,
+      contentChars: materialized.content.length,
+    });
+    useAppStore.setState({
+      ...(params.sourceTurnId ? { currentTurnId: params.sourceTurnId } : {}),
+      input: "",
+      contextMentions: [],
+      attachedFiles: [],
+    });
+    runAfterNextPaint(() => {
+      useAppStore.getState().approvePlan(params.approvalText);
+    });
+  } catch (error) {
+    appendPlanQuickReplyBlockedNotice(
+      params.sourceTurnId,
+      error instanceof Error ? error.message : String(error || "write_failed"),
+    );
+  }
 }
 
 type MainUpdateStatus = "idle" | "checking" | "upToDate" | "available" | "downloading" | "installing" | "error";
@@ -1338,16 +1442,24 @@ export default function App() {
       ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId) || null
       : null;
     const sourceIntent = resolveConversationTurnIntent(sourceTurn);
-    const shouldApprovePlanFromQuickReply = shouldRouteQuickReplyToPlanApproval({
+    const sourceVisiblePlanText = getLatestVisibleAgentTextForTurn(state.taskFlow, sourceTurn?.id);
+    const sourcePlanMaterialization = sourceVisiblePlanText
+      ? materializePlanArtifactFromVisibleText({
+          visibleText: sourceVisiblePlanText,
+          planStage: state.planStage,
+        })
+      : { ok: false, reason: "missing_visible_plan" };
+    const planApprovalQuickReplyAction = resolvePlanApprovalQuickReplyAction({
       text,
       optionAction,
       sourceIntent,
       isPlanApproved: state.isPlanApproved,
       planArtifacts: state.planArtifacts,
       planStage: state.planStage,
+      sourceHasMaterializablePlan: sourcePlanMaterialization.ok,
     });
 
-    if (shouldApprovePlanFromQuickReply) {
+    if (planApprovalQuickReplyAction === "approve_existing_plan") {
       appendDebugLog("info", "ui.quickReply_plan_approval", {
         text,
         sourceTurnId,
@@ -1364,6 +1476,34 @@ export default function App() {
       runAfterNextPaint(() => {
         useAppStore.getState().approvePlan(text);
       });
+      return;
+    }
+
+    if (planApprovalQuickReplyAction === "materialize_then_approve") {
+      appendDebugLog("info", "ui.quickReply_plan_materialize_then_approve", {
+        text,
+        sourceTurnId,
+        currentTurnId: state.currentTurnId,
+        visiblePlanChars: sourceVisiblePlanText.length,
+      });
+      useAppStore.setState({
+        ...(sourceTurnId ? { currentTurnId: sourceTurnId } : {}),
+        input: "",
+        contextMentions: [],
+        attachedFiles: [],
+      });
+      runAfterNextPaint(() => {
+        void materializePlanQuickReplyAndApprove({
+          sourceTurnId,
+          approvalText: text,
+          visiblePlanText: sourceVisiblePlanText,
+        });
+      });
+      return;
+    }
+
+    if (planApprovalQuickReplyAction === "block_missing_plan_artifact") {
+      appendPlanQuickReplyBlockedNotice(sourceTurnId, sourcePlanMaterialization.reason || "missing_plan_artifact");
       return;
     }
 

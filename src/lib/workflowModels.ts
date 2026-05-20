@@ -1655,9 +1655,9 @@ export function validateActionableDesignArtifact(
   const hasTargetOrData =
     /(?:\.tsx?|\.jsx?|\.swift|\.py|\.rs|\.go|\.json|\.csv|\.tsv|\.xlsx|\.md|\/[A-Za-z0-9_.-]+|\\[A-Za-z0-9_.-]+)/i.test(raw) ||
     /(?:CSV|TSV|XLSX|字段|列|指标|数据|表格|column|metric|dataset|table)/i.test(raw);
-  const hasExecutionOrder = /(?:执行顺序|实施步骤|Execution Order|Implementation Steps|Plan of Work|\b1\.\s+)/i.test(raw);
+  const hasExecutionOrder = /(?:执行顺序|实施步骤|修复步骤|落地步骤|执行步骤|Implementation Steps|Execution Order|Plan of Work|\b1\.\s+)/i.test(raw);
   const hasValidation = /(?:验证方式|验收|测试|构建|Validation|Acceptance|Test|Build)/i.test(raw);
-  const hasRiskOrQuestion = /(?:风险|取舍|默认假设|后续增强|开放问题|不确定|Risk|Tradeoff|Assumption|Default|Follow-up|Enhancement|Open Question|Unknown)/i.test(raw);
+  const hasRiskOrQuestion = /(?:风险|取舍|约束|注意事项|边界|默认假设|后续增强|开放问题|不确定|Risk|Tradeoff|Constraint|Caveat|Boundary|Assumption|Default|Follow-up|Enhancement|Open Question|Unknown)/i.test(raw);
   const hasConcreteUserGoal = /(?:用户目标|目标|User Goal|Goal)/i.test(raw) && !/(?:最小可用闭环|smallest useful workflow).{0,80}(?:默认|first version)/i.test(raw);
 
   const signalCount = [

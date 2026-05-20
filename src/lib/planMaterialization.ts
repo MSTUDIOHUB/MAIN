@@ -14,8 +14,10 @@ export interface PlanMaterializationResult {
   reason?: string;
 }
 
-const PROTOCOL_NOISE_RE = /<\/?(?:tool_use|tool_call|function_call|tool|parameter|user_options|option)\b/i;
+const PROTOCOL_NOISE_RE = /<\/?(?:tool_use|tool_call|function_call|tool|parameter)\b/i;
 const PROPOSAL_MARKER_RE = /^\s*\[PROPOSAL START\]\s*$/gim;
+const USER_OPTIONS_BLOCK_RE = /<user_options>[\s\S]*?<\/user_options>/gi;
+const OPTION_BLOCK_RE = /<option\b[^>]*>[\s\S]*?<\/option>/gi;
 const TOOL_LOG_NOISE_RE =
   /Repeated read-only tool call skipped|Duplicate skip count|FILE_UNCHANGED_STUB|already called with identical arguments|后台思考已折叠|thinking process|chain of thought|ContextMemoryState|ContextState|MAIN TOOL FEEDBACK|tool call id|PLAN_REPEAT_READ_LIMIT|上一条\s*Plan\s*回复是空的/i;
 
@@ -48,12 +50,20 @@ const TOOL_LABELS_EN: Record<string, string> = {
 function countPlanShapeSignals(content: string): number {
   const headingCount = (content.match(/^#{1,3}\s+\S+/gm) || []).length;
   const bulletCount = (content.match(/^\s*(?:[-*]|\d+[.)、])\s+\S+/gm) || []).length;
-  const keywordCount = (content.match(/目标|约束|发现|方案|设计|执行|接口|文件|数据流|控制流|风险|验证|默认假设|后续增强|开放问题|Goal|Constraint|Finding|Approach|Design|Interface|File|Flow|Risk|Validation|Assumption|Default|Follow-up|Enhancement|Open question/gi) || []).length;
+  const keywordCount = (content.match(/目标|约束|发现|方案|设计|执行|实施|步骤|接口|文件|数据流|控制流|风险|验证|注意事项|边界|默认假设|后续增强|开放问题|Goal|Constraint|Finding|Approach|Design|Interface|File|Flow|Risk|Validation|Caveat|Boundary|Assumption|Default|Follow-up|Enhancement|Open question/gi) || []).length;
   return headingCount + Math.min(bulletCount, 6) + Math.min(keywordCount, 8);
 }
 
+function stripPlanChoiceMarkup(rawText: string): string {
+  return rawText
+    .replace(USER_OPTIONS_BLOCK_RE, "")
+    .replace(OPTION_BLOCK_RE, "")
+    .trim();
+}
+
 function normalizePlanContent(rawText: string): string {
-  const withoutProposalMarkers = rawText.replace(PROPOSAL_MARKER_RE, "").trim();
+  const withoutChoices = stripPlanChoiceMarkup(rawText);
+  const withoutProposalMarkers = withoutChoices.replace(PROPOSAL_MARKER_RE, "").trim();
   const strippedPlanJson = withoutProposalMarkers.replace(/<plan>[\s\S]*?<\/plan>/gi, "").trim();
   const sanitized = sanitizePlanArtifactContent(strippedPlanJson);
   if (/^#\s+/m.test(sanitized)) return sanitized;
@@ -131,7 +141,7 @@ export function materializePlanArtifactFromVisibleText(input: {
   planStage?: PlanStage | null;
   preferredKind?: MaterializablePlanKind | null;
 }): PlanMaterializationResult {
-  const raw = String(input.visibleText || "").trim();
+  const raw = stripPlanChoiceMarkup(String(input.visibleText || "").trim());
   if (!raw) return { ok: false, reason: "empty" };
   if (PROTOCOL_NOISE_RE.test(raw)) return { ok: false, reason: "protocol_noise" };
   if (raw.length < 280) return { ok: false, reason: "too_short" };
@@ -149,6 +159,10 @@ export function materializePlanArtifactFromVisibleText(input: {
     path: ".MAIN/plans/design.md",
     content,
   };
+}
+
+export function isMaterializablePlanLikeText(text: string): boolean {
+  return materializePlanArtifactFromVisibleText({ visibleText: text }).ok;
 }
 
 export function composeReviewableDesignFromEvidence(input: {

@@ -59,6 +59,7 @@ function loadTranspiledModuleSync(sourcePath) {
 const {
   buildReadOnlyPermissionContinuationPrompt,
   extractReplyOptions,
+  hasExecutableProposalReplyOptions,
   hasOnlyPlanContinuationReplyOptions,
   hasOnlyReadOnlyPermissionReplyOptions,
   inferReplyOptionActionFromText,
@@ -490,17 +491,32 @@ test("extractReplyOptions synthesizes operation approval for executable proposal
 });
 
 test("shouldPauseForReplyOptions pauses for proposal follow-up even on length-safe paths", () => {
+  const replyOptions = [
+    { label: "批准执行本轮操作", value: "我批准执行。", action: "approve_operation_once", source: "proposal_follow_up" },
+    { label: "继续调整方案", value: "请继续调整方案。", action: "adjust_plan", source: "proposal_follow_up" },
+  ];
+
+  assert.equal(hasExecutableProposalReplyOptions(replyOptions), true);
   assert.equal(
     shouldPauseForReplyOptions({
-      replyOptions: [
-        { label: "批准执行本轮操作", value: "我批准执行。", action: "approve_operation_once", source: "proposal_follow_up" },
-        { label: "继续调整方案", value: "请继续调整方案。", action: "adjust_plan", source: "proposal_follow_up" },
-      ],
+      replyOptions,
       toolCallCount: 0,
       workflowMode: "chat",
       finishReason: "stop",
     }),
     true,
+  );
+  assert.equal(
+    shouldPauseForReplyOptions({
+      replyOptions,
+      toolCallCount: 0,
+      workflowMode: "plan",
+      hasStructuredProposal: false,
+      hasReadyPlanArtifacts: false,
+      isPlanApproved: false,
+      finishReason: "stop",
+    }),
+    false,
   );
 });
 

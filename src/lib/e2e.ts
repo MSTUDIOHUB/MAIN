@@ -5,6 +5,8 @@ import type { NexusModeKey } from "./gameStudioCatalog";
 
 const PLAN_FLOW_SCENARIO = "plan-flow";
 const PLAN_QUICK_REPLY_APPROVAL_SCENARIO = "plan-quick-reply-approval";
+const PLAN_QUICK_REPLY_MATERIALIZE_GEMMA_SCENARIO = "plan-quick-reply-materialize-gemma";
+const PLAN_QUICK_REPLY_MATERIALIZE_QWEN_SCENARIO = "plan-quick-reply-materialize-qwen";
 const PLAN_RELOAD_RESUME_SCENARIO = "plan-reload-resume";
 const DIFF_RELOAD_SUMMARY_SCENARIO = "diff-reload-summary";
 const PLAN_REPLACE_REFRESH_SCENARIO = "plan-replace-refresh";
@@ -192,6 +194,7 @@ function bindBridgeSnapshot(scenario: string) {
       taskFlowBlocks: state.taskFlow.length,
       planStage: state.planStage,
       isPlanApproved: state.isPlanApproved,
+      planArtifactPaths: state.planArtifacts.map((artifact) => artifact.path),
       agentStatus: state.agentStatus,
       planTasks: state.planTasks,
       selectedDiffTaskId: state.selectedDiffTaskId,
@@ -564,6 +567,152 @@ function seedPlanQuickReplyApprovalScenario() {
   }));
 
   bindBridgeSnapshot(PLAN_QUICK_REPLY_APPROVAL_SCENARIO);
+
+  return () => {
+    bridge.initialized = false;
+  };
+}
+
+function seedPlanQuickReplyMaterializeScenario(modelStyle: "gemma" | "qwen") {
+  const bridge = getBridge();
+  if (!bridge) return undefined;
+
+  bridge.events = [{ type: "boot" }];
+  bridge.savedDocuments = [];
+  bridge.completed = false;
+
+  const turnId = `e2e-plan-quick-reply-materialize-${modelStyle}-turn`;
+  const workspace = `/tmp/e2e-plan-quick-reply-materialize-${modelStyle}`;
+  const now = Date.now();
+  const userBlockId = useAppStore.getState()._nextTaskId();
+  const agentBlockId = useAppStore.getState()._nextTaskId();
+  const agentContent = modelStyle === "gemma"
+    ? [
+        "## 修复方案",
+        "",
+        "### 目标与约束",
+        "- 目标：修复 MAIN Plan 模式中 Gemma4 普通方案没有落成 design.md 的问题。",
+        "- 约束：批准前只能写 `.MAIN/plans/design.md`，不能修改源码。",
+        "",
+        "### 当前发现",
+        "- `hasStructuredProposal:false` 时仍然出现 approve_operation_once。",
+        "- 用户点击批准后不应进入普通 execute/edit。",
+        "",
+        "### 实施步骤",
+        "1. 更新 `src/lib/planMaterialization.ts` 识别普通 Markdown 方案。",
+        "2. 更新 `src/lib/orchestrator.ts` 在暂停审批前先自动物化方案。",
+        "3. 更新 `src/App.tsx` 让 quick reply 进入 approvePlan。",
+        "",
+        "### 数据流与控制流",
+        "- ChatArea 方案文本 -> 自动写入 `.MAIN/plans/design.md` -> Plan Review -> approvePlan。",
+        "",
+        "### 风险与注意事项",
+        "- 低质量聊天不得落盘。",
+        "- 普通聊天的一次性执行审批继续保留。",
+        "",
+        "### 验证方式",
+        "- 点击批准后应看到 design.md、`isPlanApproved:true` 和 `planStage:executing`。",
+      ].join("\n")
+    : [
+        "### 目标",
+        "- 修复 Qwen 直接输出方案与选项时，计划文件没有落盘的问题。",
+        "",
+        "### 方案",
+        "- 修改 `src/lib/replyOptions.ts` 识别 proposal_follow_up。",
+        "- 修改 `src/lib/planControl.ts` 区分 materialize_then_approve。",
+        "- 修改 `src/App.tsx` 在批准前写入 `.MAIN/plans/design.md`。",
+        "",
+        "### 执行顺序",
+        "1. 先物化可见方案。",
+        "2. 再调用 approvePlan。",
+        "3. 最后进入 executing 并保留 Browser/Playwright 验证能力。",
+        "",
+        "### 数据流",
+        "- 可见 Qwen 方案 -> materializePlanArtifactFromVisibleText -> design.md -> approvePlan。",
+        "",
+        "### 风险与边界",
+        "- 不写模型名分支，只按输出形态判断。",
+        "- 物化失败时阻断执行。",
+        "",
+        "### 验证方式",
+        "- E2E 点击批准后必须生成 design.md 并进入执行状态。",
+      ].join("\n");
+
+  useAppStore.setState((state) => ({
+    ...state,
+    config: {
+      ...state.config,
+      language: "zh",
+      workflowMode: "plan",
+    },
+    currentWorkspace: workspace,
+    taskFlow: [
+      { id: userBlockId, turnId, type: "user", content: `请用 ${modelStyle} 风格先规划，批准后再执行。` },
+      {
+        id: agentBlockId,
+        turnId,
+        type: "agent",
+        content: agentContent,
+        options: [
+          {
+            label: "批准执行本轮操作",
+            value: "我批准按上面的方案开始真实操作，请复用上一轮方案，不要重新规划，直接执行并验证",
+            action: "approve_operation_once" as const,
+            source: "proposal_follow_up" as const,
+          },
+          {
+            label: "继续调整方案",
+            value: "继续调整上面的方案，暂不执行真实操作",
+            action: "adjust_plan" as const,
+            source: "proposal_follow_up" as const,
+          },
+        ],
+        streaming: false,
+      },
+    ],
+    conversationTurns: [
+      {
+        id: turnId,
+        userPrompt: `请用 ${modelStyle} 风格先规划，批准后再执行。`,
+        title: `${modelStyle} 计划物化 Quick Reply`,
+        mode: "plan",
+        intent: "plan",
+        status: "awaiting_input",
+        summary: "等待用户批准执行。",
+        blockIds: [userBlockId, agentBlockId],
+        collapsed: false,
+        createdAt: now,
+      },
+    ],
+    currentTurnId: turnId,
+    planArtifacts: [],
+    planTasks: [],
+    planExecutionEvidenceLedger: [],
+    planExecutionEvidenceCount: 0,
+    planStage: "idle",
+    isPlanApproved: false,
+    planApprovalChoice: null,
+    currentTurnExecutionConsent: { turnId: null, granted: false },
+    showPlanPanel: false,
+    showDiff: false,
+    showTerminal: false,
+    showFilePanel: false,
+    rightPanelTab: "plan",
+    agentStatus: "idle",
+    isGenerating: false,
+    abortController: null,
+    pendingReviewResolve: null,
+    pendingReviewTaskId: null,
+    pendingToolCall: null,
+    selectedDiffTaskId: null,
+    input: "",
+    attachedFiles: [],
+    contextMentions: [],
+  }));
+
+  bindBridgeSnapshot(modelStyle === "gemma"
+    ? PLAN_QUICK_REPLY_MATERIALIZE_GEMMA_SCENARIO
+    : PLAN_QUICK_REPLY_MATERIALIZE_QWEN_SCENARIO);
 
   return () => {
     bridge.initialized = false;
@@ -5193,6 +5342,14 @@ export function initializeE2EScenarios(): (() => void) | undefined {
 
   if (scenario === PLAN_QUICK_REPLY_APPROVAL_SCENARIO) {
     return seedPlanQuickReplyApprovalScenario();
+  }
+
+  if (scenario === PLAN_QUICK_REPLY_MATERIALIZE_GEMMA_SCENARIO) {
+    return seedPlanQuickReplyMaterializeScenario("gemma");
+  }
+
+  if (scenario === PLAN_QUICK_REPLY_MATERIALIZE_QWEN_SCENARIO) {
+    return seedPlanQuickReplyMaterializeScenario("qwen");
   }
 
   if (scenario === PLAN_RELOAD_RESUME_SCENARIO) {
