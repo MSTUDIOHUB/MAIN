@@ -27,8 +27,28 @@ function loadTranspiledModuleSync(sourcePath) {
   const module = { exports: {} };
   transpiledModuleCache.set(normalizedPath, module.exports);
   const localRequire = createRequire(normalizedPath);
+  const runtimeRequire = (specifier) => {
+    if (specifier.startsWith(".")) {
+      const basePath = path.resolve(path.dirname(normalizedPath), specifier);
+      const candidates = [
+        basePath,
+        `${basePath}.ts`,
+        `${basePath}.tsx`,
+        path.join(basePath, "index.ts"),
+      ];
+
+      for (const candidate of candidates) {
+        if (!fsSync.existsSync(candidate)) continue;
+        if (candidate.endsWith(".ts") || candidate.endsWith(".tsx")) {
+          return loadTranspiledModuleSync(candidate);
+        }
+      }
+    }
+
+    return localRequire(specifier);
+  };
   const factory = new Function("exports", "module", "require", transpiled);
-  factory(module.exports, module, localRequire);
+  factory(module.exports, module, runtimeRequire);
   transpiledModuleCache.set(normalizedPath, module.exports);
   return module.exports;
 }
@@ -59,5 +79,31 @@ test("plan read-only convergence does not trigger once decision output exists", 
     hasPlanDecisionOutput: true,
     batchCount: 8,
     toolCount: 40,
+  }), false);
+});
+
+test("plan read-only convergence tightens when user supplied screenshots or files", () => {
+  assert.equal(shouldTriggerPlanReadOnlyConvergence({
+    isUnapprovedPlanReadOnlyBatch: true,
+    hasPlanDecisionOutput: false,
+    batchCount: 2,
+    toolCount: 2,
+    userContext: { imageParts: 2 },
+  }), true);
+
+  assert.equal(shouldTriggerPlanReadOnlyConvergence({
+    isUnapprovedPlanReadOnlyBatch: true,
+    hasPlanDecisionOutput: false,
+    batchCount: 1,
+    toolCount: 6,
+    userContext: { attachedFilePaths: ["logs/main-debug.log"] },
+  }), true);
+
+  assert.equal(shouldTriggerPlanReadOnlyConvergence({
+    isUnapprovedPlanReadOnlyBatch: true,
+    hasPlanDecisionOutput: false,
+    batchCount: 1,
+    toolCount: 5,
+    userContext: { mentionedFilePaths: ["src/App.tsx"] },
   }), false);
 });

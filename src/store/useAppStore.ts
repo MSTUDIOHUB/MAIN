@@ -165,6 +165,12 @@ import {
   getAttachmentDisplayName,
   normalizeAttachedFile,
 } from "../lib/attachments";
+import {
+  buildSemanticMetadataContextLines,
+  buildTurnIntakeContextBlock,
+  normalizeTurnInputContextSignals,
+  type TurnInputContextSignals,
+} from "../lib/turnIntake";
 import { getFilePreviewStrategy } from "../lib/filePreviewStrategy";
 import {
   buildUserContextItems,
@@ -3049,11 +3055,27 @@ function compactCompletedTurnAgentMessages(params: {
   ];
 }
 
-function buildLocalTurnTitle(input: string, intent: ResolvedRunIntent, language: "zh" | "en"): string {
+function buildLocalTurnTitle(
+  input: string,
+  intent: ResolvedRunIntent,
+  language: "zh" | "en",
+  contextSignals?: TurnInputContextSignals,
+): string {
   const cleanedInput = summarizeUserPrompt(input, language === "en" ? 52 : 40);
   if (cleanedInput) return cleanedInput;
 
   const lowerInput = input.toLowerCase();
+  const context = normalizeTurnInputContextSignals(contextSignals);
+  if (context.imageParts > 0) {
+    if (intent === "plan") return language === "en" ? "Plan screenshot-based fix" : "基于截图制定修复方案";
+    if (intent === "analyze") return language === "en" ? "Analyze screenshot issue" : "分析截图中的问题";
+    return language === "en" ? "Review screenshot context" : "分析截图上下文";
+  }
+  if (context.mentionedFilePaths.length > 0 || context.attachedFilePaths.length > 0) {
+    const fileName = [...context.mentionedFilePaths, ...context.attachedFilePaths][0]?.split(/[\\/]/).pop() || "";
+    if (fileName) return language === "en" ? `Analyze ${fileName}` : `分析 ${fileName}`;
+    return language === "en" ? "Analyze provided files" : "分析提供的文件";
+  }
   const dataKeywords = /表格|excel|xlsx|csv|数据|用户画像|ltv|rfm|k-means|聚类|付费|注册|评论/i;
   if (dataKeywords.test(lowerInput)) {
     return language === "en" ? "Analyze user data" : "分析用户行为数据";
@@ -3153,13 +3175,27 @@ function normalizeSemanticTurnMetadata(
     input: string;
     intent: ResolvedRunIntent;
     language: "zh" | "en";
+    contextSignals?: TurnInputContextSignals;
   },
 ): SemanticTurnMetadata {
   const candidate = raw && typeof raw === "object" ? raw as Partial<SemanticTurnMetadata> : {};
+  const fallbackTitle = buildLocalTurnTitle(
+    fallback.input,
+    fallback.intent,
+    fallback.language,
+    normalizeTurnInputContextSignals(fallback.contextSignals),
+  );
+  const candidateTitle = typeof candidate.title === "string" ? candidate.title : "";
+  const titleSource =
+    candidateTitle &&
+    !looksLikeReasoningLeakTitle(candidateTitle) &&
+    !isGenericConversationTitle(candidateTitle)
+      ? candidateTitle
+      : fallbackTitle;
   const title = normalizeConversationDisplayTitle(
-    typeof candidate.title === "string" ? candidate.title : fallback.input,
+    titleSource,
     fallback.language === "en" ? 48 : 32,
-    fallback.language === "en" ? "New task" : "新的任务",
+    fallbackTitle || (fallback.language === "en" ? "New task" : "新的任务"),
   );
   const summary = normalizeIntentSummary(typeof candidate.summary === "string" ? candidate.summary : "");
   return {
@@ -6895,6 +6931,14 @@ export const useAppStore = create<AppState>()(
       : options?.turnIdOverride || `turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const uiDisplayTurnId = uiParentTurnId || turnId;
     const currentImages = images || [];
+    const turnInputContextSignals = normalizeTurnInputContextSignals({
+      imageParts: currentImages.length,
+      mentionedFilePaths: mentionSnapshot,
+      attachedFilePaths: attachedFilesSnapshot.map((file) => {
+        const attachment = normalizeAttachedFile(file);
+        return attachment.sourcePath || attachment.path;
+      }),
+    });
     const userContextItems = buildUserContextItems({
       contextMentions: mentionSnapshot,
       attachedFiles: attachedFilesSnapshot,
@@ -6913,7 +6957,7 @@ export const useAppStore = create<AppState>()(
       : "";
     const localTurnTitle = mainDebugShortcut
       ? "MDEBUG：用户反馈自修复"
-      : buildLocalTurnTitle(text, effectiveRunIntent, preferredLanguage);
+      : buildLocalTurnTitle(text, effectiveRunIntent, preferredLanguage, turnInputContextSignals);
     const turnTitle = normalizeConversationDisplayTitle(
       existingTitle || optionTitle || localTurnTitle,
       preferredLanguage === "en" ? 48 : 40,
@@ -7388,6 +7432,7 @@ export const useAppStore = create<AppState>()(
         intent: effectiveRunIntent,
         language: preferredLanguage,
         config: sessionGet().config,
+        contextSignals: turnInputContextSignals,
       }).then((metadata) => {
         if (!metadata) return;
 
@@ -7673,6 +7718,16 @@ export const useAppStore = create<AppState>()(
           "",
           userContent,
         ].join("\n");
+      }
+
+      const turnIntakeBlock = buildTurnIntakeContextBlock({
+        rawUserInput: text,
+        signals: turnInputContextSignals,
+        language: preferredLanguage === "en" ? "en" : "zh",
+        workflowMode: effectiveWorkflowMode,
+      });
+      if (turnIntakeBlock) {
+        userContent = `${turnIntakeBlock}\n\n${userContent}`;
       }
 
       if (currentMainModeKey === "game_studio") {
@@ -10863,6 +10918,7 @@ async function requestSemanticTurnMetadata(params: {
   intent: ResolvedRunIntent;
   language: "zh" | "en";
   config: AppConfig;
+  contextSignals?: TurnInputContextSignals;
 }): Promise<SemanticTurnMetadata | null> {
   try {
     const isCloud = params.config.activeProfile === "cloud";
@@ -10882,6 +10938,10 @@ async function requestSemanticTurnMetadata(params: {
     });
     const cloudTokenRef = cloudExperimentalLoginEnabled ? params.config.cloud.auth?.tokenRef : undefined;
     if (!model || (!endpoint && cloudAuthMode !== "gemini_google_oauth")) return null;
+    const contextLines = buildSemanticMetadataContextLines({
+      signals: params.contextSignals || {},
+      language: params.language,
+    });
 
     const msgs: Array<{ role: "system" | "user"; content: string }> = [
       {
@@ -10891,6 +10951,7 @@ async function requestSemanticTurnMetadata(params: {
           "Return strict JSON only. No markdown, no prose, no code fences.",
           "This is a tiny background UI-label task, not the main conversation.",
           "Infer the user's actual task intent from the raw input.",
+          "If image/file context is listed, use it to infer the task subject. Do not ignore screenshots, attachments, or @ files.",
           "Ignore usernames, timestamps, transcript prefixes, copied meta text, and reasoning-style wording.",
           "Generate:",
           "- title: short clean UI title for sidebar / TopIsland, plain text only, no quotes, no markdown, no intent prefix.",
@@ -10905,6 +10966,7 @@ async function requestSemanticTurnMetadata(params: {
         content: [
           `Resolved intent: ${params.intent}`,
           `Preferred language: ${params.language}`,
+          ...(contextLines.length > 0 ? ["Provided context:", ...contextLines] : []),
           `Raw user input: ${params.input.slice(0, 800)}`,
           "Return strict JSON now.",
         ].join("\n"),
@@ -10988,11 +11050,19 @@ async function requestSemanticTurnMetadata(params: {
     const parsedMetadata = jsonText
       ? JSON.parse(jsonText)
       : extractLooseSemanticTurnMetadata(rawText || "");
-    if (!parsedMetadata) return null;
+    if (!parsedMetadata) {
+      return normalizeSemanticTurnMetadata({}, {
+        input: params.input,
+        intent: params.intent,
+        language: params.language,
+        contextSignals: params.contextSignals,
+      });
+    }
     return normalizeSemanticTurnMetadata(parsedMetadata, {
       input: params.input,
       intent: params.intent,
       language: params.language,
+      contextSignals: params.contextSignals,
     });
   } catch {
     return null;

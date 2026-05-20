@@ -204,3 +204,50 @@ test("task targeting allows one shallow root skeleton only when there are no sco
     language: "zh",
   }).reason, "root_skeleton_already_read");
 });
+
+test("task targeting treats screenshots and provided files as scoped context", () => {
+  const profile = buildTaskTargetingProfile({
+    userPrompt: "查看截图，确认为什么批准按钮点了没反应。",
+    userContext: {
+      imageParts: 2,
+      mentionedFilePaths: ["src/components/PlanReviewBlock.tsx"],
+      attachedFilePaths: ["main-debug.log"],
+    },
+  });
+
+  assert.equal(profile.hasUserProvidedContext, true);
+  assert.equal(profile.imageParts, 2);
+  assert.ok(profile.facets.includes("provided_context"));
+  assert.ok(profile.facets.includes("visual_context"));
+  assert.equal(profile.allowRootSkeleton, false);
+  assert.ok(profile.explicitPaths.includes("src/components/PlanReviewBlock.tsx"));
+  assert.ok(profile.explicitPaths.includes("main-debug.log"));
+
+  const skeleton = shouldBlockToolCallForTargeting({
+    profile,
+    toolName: "get_project_skeleton",
+    args: { depth: 2 },
+    language: "zh",
+  });
+  assert.equal(skeleton.blocked, true);
+  assert.equal(skeleton.reason, "provided_context_broad_directory");
+
+  const rootList = shouldBlockToolCallForTargeting({
+    profile,
+    toolName: "list_directory",
+    args: { path: "." },
+    target: ".",
+    language: "zh",
+  });
+  assert.equal(rootList.blocked, true);
+  assert.equal(rootList.reason, "provided_context_broad_directory");
+
+  const scopedSearch = shouldBlockToolCallForTargeting({
+    profile,
+    toolName: "grep_search",
+    args: { query: "approvePlan", path: "src" },
+    target: "src",
+    language: "zh",
+  });
+  assert.equal(scopedSearch.blocked, false);
+});

@@ -1,4 +1,5 @@
 import { getProtocolPackageEntryPath } from "./protocolPackages";
+import { hasTurnProvidedContext, normalizeTurnInputContextSignals, type TurnInputContextLike } from "./turnIntake";
 import type { PlanArtifact } from "./workflowModels";
 
 export type TaskFacet =
@@ -7,7 +8,9 @@ export type TaskFacet =
   | "tabular_data"
   | "explicit_path"
   | "symbol_target"
-  | "protocol_design";
+  | "protocol_design"
+  | "provided_context"
+  | "visual_context";
 
 export type TaskOrchestratorPhase =
   | "INTAKE_PARSE"
@@ -23,6 +26,7 @@ export type TaskOrchestratorPhase =
 
 export type ExecutionGateReason =
   | "tabular_raw_read"
+  | "provided_context_broad_directory"
   | "root_skeleton_not_scoped"
   | "root_skeleton_too_deep"
   | "root_skeleton_already_read"
@@ -43,6 +47,10 @@ export interface TaskTargetingProfile {
   explicitPaths: string[];
   symbols: string[];
   tabularPaths: string[];
+  mentionedFilePaths: string[];
+  attachedFilePaths: string[];
+  imageParts: number;
+  hasUserProvidedContext: boolean;
   designProtocolPaths: string[];
   requiresDesignProtocol: boolean;
   designProtocolSatisfied: boolean;
@@ -61,6 +69,7 @@ export interface BuildTaskTargetingProfileInput {
   associatedPaths?: string[];
   skills?: TaskTargetingSkillLike[];
   observedEvidence?: string[];
+  userContext?: TurnInputContextLike;
 }
 
 export interface TaskTargetingToolGateInput {
@@ -204,21 +213,29 @@ function getToolDepth(args: Record<string, unknown>): number | null {
 }
 
 export function buildTaskTargetingProfile(input: BuildTaskTargetingProfileInput = {}): TaskTargetingProfile {
+  const userContext = normalizeTurnInputContextSignals(input.userContext);
   const combinedText = [
     input.userPrompt || "",
     ...(input.planArtifacts || []).map((artifact) => artifact.content || ""),
     ...(input.planTaskTexts || []),
     ...(input.associatedPaths || []),
+    ...userContext.mentionedFilePaths,
+    ...userContext.attachedFilePaths,
   ].join("\n");
   const explicitPaths = extractExplicitPaths(combinedText);
   for (const path of input.associatedPaths || []) pushUnique(explicitPaths, path);
+  for (const path of userContext.mentionedFilePaths) pushUnique(explicitPaths, path);
+  for (const path of userContext.attachedFilePaths) pushUnique(explicitPaths, path);
   const symbols = extractSymbols(combinedText);
   const tabularPaths = explicitPaths.filter(isTabularPath);
   const designProtocolPaths = collectDesignProtocolPaths(input.skills);
   const facets = new Set<TaskFacet>();
+  const hasProvidedContext = hasTurnProvidedContext(userContext);
 
   if (explicitPaths.length > 0) addFacet(facets, "explicit_path");
   if (symbols.length > 0) addFacet(facets, "symbol_target");
+  if (hasProvidedContext) addFacet(facets, "provided_context");
+  if (userContext.imageParts > 0) addFacet(facets, "visual_context");
   if (
     tabularPaths.length > 0 ||
     /(?:CSV|TSV|XLSX|Excel|表格|数据表|dataset|spreadsheet|导入数据|数据导入|趋势|图表|环比|同比|monthly compare|trend|chart)/i.test(combinedText)
@@ -243,9 +260,11 @@ export function buildTaskTargetingProfile(input: BuildTaskTargetingProfileInput 
     userStyleConfirmed ||
     evidenceHasDesignProtocolRead(observedEvidence, designProtocolPaths);
   const rootSkeletonAlreadyRead = observedEvidence.includes("tool:get_project_skeleton");
+  const rootDirectoryAlreadyListed = observedEvidence.includes("dir:.") || observedEvidence.includes("dir:");
   const hasScopedTarget = explicitPaths.length > 0 || symbols.length > 0 || tabularPaths.length > 0;
   const allowRootSkeleton =
     !rootSkeletonAlreadyRead &&
+    !hasProvidedContext &&
     !hasScopedTarget &&
     !facets.has("tabular_data") &&
     !requiresDesignProtocol;
@@ -254,10 +273,17 @@ export function buildTaskTargetingProfile(input: BuildTaskTargetingProfileInput 
     ? ["analyze_tabular_document", "query_tabular_document", "read_document"]
     : hasScopedTarget
     ? ["grep_search", "glob_search", "list_directory", "get_file_outline", "read_file"]
+    : hasProvidedContext
+    ? ["grep_search", "glob_search", "list_directory", "read_file", "get_file_outline"]
     : ["get_project_skeleton", "list_directory", "grep_search"];
 
   const reasons: string[] = [];
   if (hasScopedTarget) reasons.push("explicit target cues detected; prefer scoped search/read");
+  if (userContext.imageParts > 0) reasons.push("user provided image context; inspect screenshot observations before broad discovery");
+  if (hasProvidedContext && rootDirectoryAlreadyListed) reasons.push("root directory was already listed despite provided context; converge to targeted evidence");
+  if (userContext.mentionedFilePaths.length > 0 || userContext.attachedFilePaths.length > 0) {
+    reasons.push("user provided file context; prefer exact file paths before broad discovery");
+  }
   if (facets.has("tabular_data")) reasons.push("tabular data detected; prefer structured tabular tools");
   if (requiresDesignProtocol && !designProtocolSatisfied) reasons.push("design protocol must be read or style must be confirmed before UI writes");
   if (rootSkeletonAlreadyRead) reasons.push("root skeleton was already read in this session");
@@ -267,6 +293,10 @@ export function buildTaskTargetingProfile(input: BuildTaskTargetingProfileInput 
     explicitPaths,
     symbols,
     tabularPaths,
+    mentionedFilePaths: userContext.mentionedFilePaths,
+    attachedFilePaths: userContext.attachedFilePaths,
+    imageParts: userContext.imageParts,
+    hasUserProvidedContext: hasProvidedContext,
     designProtocolPaths,
     requiresDesignProtocol,
     designProtocolSatisfied,
@@ -305,6 +335,8 @@ function makeMessage(reason: ExecutionGateReason, language: "zh" | "en", target:
     switch (reason) {
       case "tabular_raw_read":
         return `TASK_TARGETING_BLOCKED: ${target} is tabular data. Use analyze_tabular_document or query_tabular_document first; use read_file only with a small window when raw rows are explicitly needed.`;
+      case "provided_context_broad_directory":
+        return "TASK_TARGETING_BLOCKED: the user already provided images, attachments, or @ files. First summarize that provided context and use targeted search/read based on the observed phenomenon instead of broad root directory discovery.";
       case "root_skeleton_not_scoped":
         return "TASK_TARGETING_BLOCKED: this task already has explicit paths or symbols. Use grep_search/glob_search/list_directory/read_file on the scoped target instead of reading the whole project skeleton.";
       case "root_skeleton_too_deep":
@@ -321,6 +353,8 @@ function makeMessage(reason: ExecutionGateReason, language: "zh" | "en", target:
   switch (reason) {
     case "tabular_raw_read":
       return `TASK_TARGETING_BLOCKED: ${target} 是表格数据。请先使用 analyze_tabular_document 或 query_tabular_document；只有明确需要原始行时，才用带窗口参数的 read_file。`;
+    case "provided_context_broad_directory":
+      return "TASK_TARGETING_BLOCKED: 用户已经提供图片、附件或 @ 文件。请先概括这些上下文中观察到的现象，并基于该现象做定向搜索/读取，不要从根目录大范围发现开始。";
     case "root_skeleton_not_scoped":
       return "TASK_TARGETING_BLOCKED: 当前任务已有明确路径或符号线索。请改用 grep_search/glob_search/list_directory/read_file 定向定位，不要读取整个项目骨架。";
     case "root_skeleton_too_deep":
@@ -362,6 +396,14 @@ export function shouldBlockToolCallForTargeting(input: TaskTargetingToolGateInpu
         suggestedTools: input.profile.preferredReadTools,
       };
     }
+    if (input.profile.hasUserProvidedContext) {
+      return {
+        blocked: true,
+        reason: "provided_context_broad_directory",
+        message: makeMessage("provided_context_broad_directory", language, target || "."),
+        suggestedTools: input.profile.preferredReadTools,
+      };
+    }
     if (!input.profile.allowRootSkeleton) {
       return {
         blocked: true,
@@ -379,6 +421,19 @@ export function shouldBlockToolCallForTargeting(input: TaskTargetingToolGateInpu
         suggestedTools: ["get_project_skeleton"],
       };
     }
+  }
+
+  if (
+    input.toolName === "list_directory" &&
+    input.profile.hasUserProvidedContext &&
+    (!target || target === "." || target === "./")
+  ) {
+    return {
+      blocked: true,
+      reason: "provided_context_broad_directory",
+      message: makeMessage("provided_context_broad_directory", language, target || "."),
+      suggestedTools: input.profile.preferredReadTools,
+    };
   }
 
   if (

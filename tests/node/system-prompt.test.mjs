@@ -452,3 +452,26 @@ test("Unity MCP-first prompt explicitly prioritizes read_console over local scan
   assert.match(prompt, /call read_console first/);
   assert.match(prompt, /prefer script_apply_edits/i);
 });
+
+test("system prompt prioritizes turn intake screenshots and attached context before broad discovery", () => {
+  const prompt = buildSystemPrompt(
+    [],
+    "/tmp/workspace",
+    "main_mode",
+    "",
+    [],
+    [],
+    "plan",
+    "zh",
+    null,
+    undefined,
+    "plan",
+    "english_core_localized_output",
+    ["read_file", "grep_search", "list_directory", "get_project_skeleton", "write_file"],
+  );
+
+  assert.match(prompt, /\[turn_intake\]/);
+  assert.match(prompt, /Codex App 式处理顺序/);
+  assert.match(prompt, /图片要先总结可见 UI\/文本\/状态\/异常/);
+  assert.match(prompt, /不要先读根目录或多个顶层目录/);
+});

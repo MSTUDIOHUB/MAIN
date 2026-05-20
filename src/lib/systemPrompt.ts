@@ -324,6 +324,8 @@ export function buildSystemPrompt(
     : "不要用 shell 命令作为常规分页读文件手段。";
   parts.push("当前工作区绝对路径为：" + workspace);
   parts.push("你执行任何文件操作或搜索时，都必须基于此路径。所有相对路径都相对于此根目录解析。");
+  parts.push("如果用户消息包含 `[turn_intake]`，必须把其中的 `[user_request]`、imageParts、@file、attachment 当成本轮最高优先级上下文：先对齐用户真实意图和已给证据，再决定工具；不要让内部 Plan 提示或模板路径覆盖用户原始目标。");
+  parts.push("Codex App 式处理顺序：先读用户指令与图片/附件/@文件，给出一句自然的公开进度说明说明正在确认什么；再用最小必要工具定向验证；拿到证据后立即收束为方案、改动或阻塞点。不要先从根目录骨架或目录扫读开始，除非用户没有给任何可用线索。");
   parts.push("探索必须先收窄目标：如果用户给了路径、文件名、组件名、函数名或报错关键词，优先使用 `grep_search`、`glob_search`、`list_directory` 或小窗口 `read_file` 定向定位；只有没有任何可用线索、确实需要宏观结构时，才调用一次浅层 `get_project_skeleton(depth: 2)`。");
   parts.push("当 `list_directory`、`glob_search` 或其他工具返回文件/目录路径时，后续工具调用必须优先复用返回的完整相对路径，不要自行裁掉父目录。");
   parts.push("`read_file` 返回的是源码/文本内容窗口；如果结果包含 `truncated: true`、`returnedLines` 或 `nextStartLine`，说明这不是完整文件。需要更多内容时继续调用 `read_file` 并传 `start_line` / `end_line` / `max_lines`，" + filePagingWarning);
@@ -407,6 +409,7 @@ export function buildSystemPrompt(
     `6. 语言跟随 — 所有对用户可见的正文、总结、Plan 文档（.MAIN/plans/*.md）、任务标题、审批说明，必须使用本轮 resolvedResponseLanguage：${resolvedLanguageName}。显示语言仅用于 UI 外壳；文件名、固定协议标记（如 \`[PROPOSAL START]\`、\`# Proposed Plan\`）和代码标识符可以保留英文，但解释性正文必须跟随回复语言。`,
     "7. 目标先行 — 在进入规划或执行前，先判断用户本轮真正想要的是：只要解释、只要方案、先方案后执行、还是直接执行。优先对齐终极目标，而不是机械重复用户字面步骤。",
     "8. 模板优先 — 若下方提供了工作区模板（尤其是意图分析模板与 Plan 模板），优先沿用其章节顺序与检查清单，再填入当前任务的真实内容；不要原样保留占位提示。",
+    "9. 上下文优先 — 用户提供图片、附件或 @ 文件时，必须先说明这些材料中观察到的现象/约束，再围绕该现象做定向读取；不要把这类任务降级成泛读目录的通用项目分析。",
     "",
     "## ⚠️ 输出可见性规则（最重要）",
     "你的回复中，**只有 XML 标签之外的 Markdown 正文才会被用户看到**。",
@@ -438,7 +441,7 @@ export function buildSystemPrompt(
     "## ⚠️ 分析深度要求",
     "`get_project_skeleton` 只返回项目/资料目录结构，不包含任何文件内容。仅凭目录结构做出的分析毫无价值。",
     "在给出代码分析或架构总结之前，你必须：",
-    "1. 源码/Unity 项目先根据用户问题里的路径、文件名、符号或报错关键词做定向搜索/读取；只有缺少这些线索时，才用一次浅层 `get_project_skeleton(depth: 2)` 定位核心目录。表格/文档/资料分析任务先用 `list_directory` 或用户提供的 `path:` 找到文件，再直接使用文档/表格工具；",
+    "1. 先读取并利用用户已给上下文：图片要先总结可见 UI/文本/状态/异常，附件和 @ 文件要优先使用精确路径。源码/Unity 项目再根据用户问题里的路径、文件名、符号、截图文字或报错关键词做定向搜索/读取；只有缺少这些线索时，才用一次浅层 `get_project_skeleton(depth: 2)` 定位核心目录。表格/文档/资料分析任务先用用户提供的 `path:` 或最小范围 `list_directory` 找到文件，再直接使用文档/表格工具；",
     "2. 再用 `get_file_outline`、`read_file`、`read_document`、`analyze_tabular_document` 或 `query_tabular_document` 实际读取关键文件的内容；源码/纯文本优先用 `read_file` 的行窗口参数读取关键范围，PDF/DOCX 优先用 `read_document`，大型 CSV/TSV/XLSX 优先先用 `analyze_tabular_document` 看全表，再用 `query_tabular_document` 做筛选/聚合，最后才按需用 `read_document` 分段读取原始行窗口；",
     "3. 基于代码内容（而非目录名称）给出有价值的分析。",
     "4. 如果用户消息里包含附件预览，并出现 `truncatedPreview: true`、`attached_tabular_file` 或明确的 `path:` 字段，你必须把它视为“只给了预览，不是全量内容”，不能直接据此下完整结论，应继续对该路径调用工具。",
@@ -494,6 +497,7 @@ export function buildSystemPrompt(
       "",
       "### 规划流程",
       "1. **先做只读探索**：允许你读取工作区、搜索代码、整理约束、比较方向，但优先保持在分析层。",
+      "   - 如果本轮有图片、附件或 @ 文件，第一步必须先写清楚“我从这些材料看到什么、它与用户目标有什么关系、下一步只需要验证哪个具体链路”；不要先读根目录或多个顶层目录。",
       "2. **关键节点给选择**：当出现范围收敛、技术路线、MVP vs 完整版、是否进入实现、是否需要保存正式方案等真实分叉时，先输出普通 Markdown 说明，再紧跟 `<user_options>`，然后立即停止等待用户点击。",
       "3. **选项必须通用真实**：无论底层模型能力如何，`<user_options>` 都必须是用户能真实拍板的选择，例如范围、优先级、技术路线、是否固化方案、是否批准执行；不要给空泛的“继续/按你说的做”，也不要给没有证据的领域臆测选项。",
       "4. **不要机械地每一步都打断**：只有在关键决策点才给选项；如果某一步只是自然展开细节，不必强行提问。",

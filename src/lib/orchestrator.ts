@@ -183,6 +183,13 @@ import {
   type TaskOrchestratorPhase,
 } from "./taskTargeting";
 import { shouldTriggerPlanReadOnlyConvergence } from "./planReadOnlyConvergence";
+import {
+  extractPrimaryUserRequestText,
+  extractTurnInputContextSignalsFromMessages,
+  hasTurnProvidedContext,
+  normalizeTurnInputContextSignals,
+  type TurnInputContextSignals,
+} from "./turnIntake";
 
 // ── Spec file auto-approval helpers ────────────────────────────────
 
@@ -229,41 +236,74 @@ function getMessageContentText(content: AgentMessage["content"]): string {
     .join("\n");
 }
 
-function buildPlanReadOnlyConvergencePrompt(language: "zh" | "en", batchCount: number, toolCount: number): string {
+export function buildPlanReadOnlyConvergencePrompt(
+  language: "zh" | "en",
+  batchCount: number,
+  toolCount: number,
+  userContext?: TurnInputContextSignals,
+): string {
+  const context = normalizeTurnInputContextSignals(userContext);
+  const hasProvidedContext = hasTurnProvidedContext(context);
   if (language === "en") {
     return [
       "PLAN_READONLY_CONVERGENCE: You have gathered enough read-only context for this planning turn.",
       `Read-only exploration so far: ${batchCount} batch(es), ${toolCount} tool result(s).`,
+      hasProvidedContext
+        ? `User-provided context exists: ${context.imageParts} image(s), ${context.mentionedFilePaths.length} @ file(s), ${context.attachedFilePaths.length} attachment(s). Treat it as primary evidence.`
+        : "",
+      context.imageParts > 0
+        ? "Before any more repository reads, the next response must include a concrete 'Screenshot observations' section that states what is visible in the provided image(s) and maps those observations to likely UI/state/code areas."
+        : "",
+      context.mentionedFilePaths.length > 0 || context.attachedFilePaths.length > 0
+        ? "Before any broad discovery, use the exact @ file or attachment paths as primary evidence and name what those files already show."
+        : "",
       "Stop broad rereading now. In the next response, create or update `.MAIN/plans/design.md` with a concise reviewable diagnosis plan, then submit the formal Proposal.",
       "The draft must include: root cause hypothesis, evidence already read, tradeoffs, affected files, implementation steps, and validation.",
       "Only use `<user_options>` if there is a real product/design decision the user must make before a plan can be written. Do not offer options that merely ask to continue reading, checking, analyzing, or verifying.",
       "If a blocker remains, name the blocker and the single missing fact needed; do not continue broad file exploration.",
-    ].join("\n");
+    ].filter(Boolean).join("\n");
   }
   return [
     "PLAN_READONLY_CONVERGENCE: 当前规划回合已经收集了足够的只读上下文。",
     `只读探索累计：${batchCount} 批，${toolCount} 个工具结果。`,
+    hasProvidedContext
+      ? `用户已提供上下文：${context.imageParts} 张图片、${context.mentionedFilePaths.length} 个 @ 文件、${context.attachedFilePaths.length} 个附件。必须把这些作为优先证据。`
+      : "",
+    context.imageParts > 0
+      ? "在继续读取仓库前，下一条必须先写出“截图观察到的现象”：具体说明图片中可见的 UI/状态/文本/异常，并把这些现象映射到可能的 UI、状态或代码区域。"
+      : "",
+    context.mentionedFilePaths.length > 0 || context.attachedFilePaths.length > 0
+      ? "在继续大范围发现前，必须优先使用 @ 文件或附件的精确路径作为主要证据，并说明这些文件已经证明了什么。"
+      : "",
     "下一步不要继续泛读文件。请创建或更新 `.MAIN/plans/design.md` 精简可审批诊断方案，然后提交正式 Proposal。",
     "草案必须包含：问题归因假设、已读证据、方案取舍、影响文件、实施步骤和验证方式。",
     "只有存在真实产品/设计分叉、必须由用户决定后才能写计划时，才允许使用 `<user_options>`；不要给出只是继续读取、检查、分析或验证的选项。",
     "如果仍有阻塞，只说明阻塞点和唯一缺失事实；不要继续大范围探索。",
-  ].join("\n");
+  ].filter(Boolean).join("\n");
 }
 
-function buildPlanReadOnlyConvergencePause(language: "zh" | "en", batchCount: number, toolCount: number): {
+function buildPlanReadOnlyConvergencePause(
+  language: "zh" | "en",
+  batchCount: number,
+  toolCount: number,
+  userContext?: TurnInputContextSignals,
+): {
   text: string;
   options: ReplyOption[];
 } {
+  const context = normalizeTurnInputContextSignals(userContext);
+  const hasProvidedContext = hasTurnProvidedContext(context);
   if (language === "en") {
     return {
       text: [
         "MAIN has collected enough read-only context, but the model kept exploring instead of producing a plan.",
         `Current exploration: ${batchCount} read-only batches, ${toolCount} tool results.`,
+        hasProvidedContext ? "The next step should start from the provided image/file context, not from another broad scan." : "",
         "Choose the next direction.",
-      ].join("\n"),
+      ].filter(Boolean).join("\n"),
       options: [
-        { label: "Generate the diagnosis plan", value: "Please stop exploring and generate the diagnosis, tradeoffs, and proposed plan from the evidence already gathered.", action: "adjust_plan" },
-        { label: "Continue read-only exploration once", value: "Continue one more targeted read-only exploration pass, then stop and summarize the plan.", action: "continue_readonly_once" },
+        { label: hasProvidedContext ? "Use provided context for the plan" : "Generate the diagnosis plan", value: hasProvidedContext ? "Please stop broad exploration, first summarize the screenshot/file observations, then generate the diagnosis, tradeoffs, and proposed plan from the evidence already gathered." : "Please stop exploring and generate the diagnosis, tradeoffs, and proposed plan from the evidence already gathered.", action: "adjust_plan" },
+        { label: "One targeted evidence pass", value: hasProvidedContext ? "Do one more tightly scoped read-only pass based only on the screenshot/file observations, then immediately stop and summarize the plan." : "Continue one more targeted read-only exploration pass, then stop and summarize the plan.", action: "continue_readonly_once" },
       ],
     };
   }
@@ -271,11 +311,12 @@ function buildPlanReadOnlyConvergencePause(language: "zh" | "en", batchCount: nu
     text: [
       "MAIN 已经收集了足够的只读上下文，但模型仍在继续探索，没有产出可审阅方案。",
       `当前探索累计：${batchCount} 批只读工具，${toolCount} 个工具结果。`,
+      hasProvidedContext ? "下一步应回到用户提供的图片/文件上下文，而不是继续泛读项目。" : "",
       "请选择下一步方向。",
-    ].join("\n"),
+    ].filter(Boolean).join("\n"),
     options: [
-      { label: "生成归因方案", value: "请停止继续探索，直接基于已有证据生成问题归因、方案取舍和可审批计划。", action: "adjust_plan" },
-      { label: "再定向探索一次", value: "请再做一次定向只读探索，然后立刻停止并总结方案。", action: "continue_readonly_once" },
+      { label: hasProvidedContext ? "基于图片/文件生成方案" : "生成归因方案", value: hasProvidedContext ? "请停止泛读，先概括截图/文件中观察到的现象，再基于已有证据生成问题归因、方案取舍和可审批计划。" : "请停止继续探索，直接基于已有证据生成问题归因、方案取舍和可审批计划。", action: "adjust_plan" },
+      { label: "只定向查一个线索", value: hasProvidedContext ? "请只围绕截图/文件观察到的现象再做一次精确定向只读探索，然后立刻停止并总结方案。" : "请再做一次定向只读探索，然后立刻停止并总结方案。", action: "continue_readonly_once" },
     ],
   };
 }
@@ -2622,6 +2663,7 @@ export function buildToolActionNarration(input: {
   turnIntent?: ResolvedUserIntent | string;
   currentHypothesis?: string;
   previousObservation?: string;
+  userContext?: TurnInputContextSignals;
 }): ProgressNarration | null {
   const calls = input.calls.slice(0, 3);
   if (calls.length === 0) return null;
@@ -2661,6 +2703,8 @@ export function buildToolActionNarration(input: {
   const suffix = extraCount > 0
     ? input.language === "zh" ? ` 等 ${input.calls.length} 个动作` : ` and ${extraCount} more action${extraCount === 1 ? "" : "s"}`
     : "";
+  const context = normalizeTurnInputContextSignals(input.userContext);
+  const hasProvidedContext = hasTurnProvidedContext(context);
 
   if (input.workflowMode === "plan" && !input.isPlanApproved && hasDesignWrite) {
     return {
@@ -2685,6 +2729,27 @@ export function buildToolActionNarration(input: {
   }
 
   if (input.workflowMode === "plan" && !input.isPlanApproved && hasReadOrAnalysis) {
+    if (hasProvidedContext) {
+      return {
+        phase: "understanding",
+        title: input.language === "zh" ? "先对齐用户上下文" : "Align provided context first",
+        why: input.language === "zh"
+          ? `用户已提供 ${context.imageParts} 张图片、${context.mentionedFilePaths.length} 个 @ 文件、${context.attachedFilePaths.length} 个附件。计划前要先确认这些证据指向的问题，避免从目录结构开始泛读。`
+          : `The user provided ${context.imageParts} image(s), ${context.mentionedFilePaths.length} @ file(s), and ${context.attachedFilePaths.length} attachment(s). Before drafting the plan, confirm what that evidence points to instead of starting from broad structure.`,
+        action: input.language === "zh"
+          ? `正在围绕用户提供的上下文做只读确认：${summaries}${suffix}。`
+          : `Checking the provided-context trail with read-only tools: ${summaries}${suffix}.`,
+        evidence: input.language === "zh"
+          ? "等待返回内容来判断截图/文件现象对应的具体代码或状态链路。"
+          : "Waiting for returned content to connect the screenshot/file observations to the concrete code or state path.",
+        next: input.language === "zh"
+          ? "确认现象和代码链路后，收束为可审批的 design.md 方案。"
+          : "Once the observed behavior is mapped to code, condense it into a reviewable design.md plan.",
+        targets: presentations.map((item) => item.presentation.target).filter(Boolean),
+        status: "running",
+        source: "runtime",
+      };
+    }
     return {
       phase: "investigating",
       title: input.language === "zh" ? "先收集计划证据" : "Gather planning evidence first",
@@ -4033,7 +4098,9 @@ export async function executeAgentLoop(
   const latestUserPrompt = [...initialMessages]
     .reverse()
     .find((message) => message.role === "user");
-  const latestUserPromptText = latestUserPrompt ? extractCompatibilityTextContent(latestUserPrompt.content) : "";
+  const latestUserPromptFullText = latestUserPrompt ? extractCompatibilityTextContent(latestUserPrompt.content) : "";
+  const latestUserPromptText = extractPrimaryUserRequestText(latestUserPromptFullText) || latestUserPromptFullText;
+  const turnInputContextSignals = extractTurnInputContextSignalsFromMessages(initialMessages);
   const commandDirective = callbacks.getCommandDirective?.() ?? null;
   const gameStudioUnityContext =
     callbacks.getMainModeKey() === "game_studio" &&
@@ -4253,6 +4320,7 @@ export async function executeAgentLoop(
     associatedPaths,
     skills,
     observedEvidence: [...taskTargetingEvidence],
+    userContext: turnInputContextSignals,
   });
   const initialTaskTargetingProfile = buildCurrentTaskTargetingProfile();
   emitTaskOrchestratorPhase("INTAKE_PARSE", {
@@ -4261,6 +4329,10 @@ export async function executeAgentLoop(
     symbols: initialTaskTargetingProfile.symbols.slice(0, 8),
     preferredReadTools: initialTaskTargetingProfile.preferredReadTools,
     allowRootSkeleton: initialTaskTargetingProfile.allowRootSkeleton,
+    imageParts: initialTaskTargetingProfile.imageParts,
+    mentionedFilePaths: initialTaskTargetingProfile.mentionedFilePaths.slice(0, 6),
+    attachedFilePaths: initialTaskTargetingProfile.attachedFilePaths.slice(0, 6),
+    hasUserProvidedContext: initialTaskTargetingProfile.hasUserProvidedContext,
     requiresDesignProtocol: initialTaskTargetingProfile.requiresDesignProtocol,
     designProtocolSatisfied: initialTaskTargetingProfile.designProtocolSatisfied,
   });
@@ -5961,6 +6033,7 @@ export async function executeAgentLoop(
         turnIntent,
         currentHypothesis: visibleAssistantText.trim() || lastAssistantTextForCheckpoint,
         previousObservation: recentToolActivity[recentToolActivity.length - 1]?.detail || "",
+        userContext: turnInputContextSignals,
       })
       : null;
     const runtimeNarrationInjected = effectiveToolCalls.length > 0 && !visibleAssistantText.trim() && !!toolActionNarration;
@@ -6987,6 +7060,8 @@ export async function executeAgentLoop(
           preferredReadTools: targetingProfile.preferredReadTools,
           explicitPaths: targetingProfile.explicitPaths.slice(0, 8),
           symbols: targetingProfile.symbols.slice(0, 8),
+          imageParts: targetingProfile.imageParts,
+          hasUserProvidedContext: targetingProfile.hasUserProvidedContext,
         });
         allResults.push({
           toolCallId: tc.id,
@@ -7605,6 +7680,7 @@ export async function executeAgentLoop(
       hasPlanDecisionOutput,
       batchCount: planReadOnlyConvergenceBatches,
       toolCount: planReadOnlyConvergenceTools,
+      userContext: turnInputContextSignals,
     });
 
     if (shouldConvergeUnapprovedPlanReadOnly) {
@@ -7623,6 +7699,9 @@ export async function executeAgentLoop(
         iteration,
         batches: planReadOnlyConvergenceBatches,
         tools: planReadOnlyConvergenceTools,
+        imageParts: turnInputContextSignals.imageParts,
+        mentionedFilePaths: turnInputContextSignals.mentionedFilePaths.length,
+        attachedFilePaths: turnInputContextSignals.attachedFilePaths.length,
         promptAlreadyUsed: usedPlanReadOnlyConvergencePrompt,
       });
       if (!usedPlanReadOnlyConvergencePrompt) {
@@ -7633,6 +7712,7 @@ export async function executeAgentLoop(
             language,
             planReadOnlyConvergenceBatches,
             planReadOnlyConvergenceTools,
+            turnInputContextSignals,
           ),
         });
         continue;
@@ -7642,6 +7722,7 @@ export async function executeAgentLoop(
         language,
         planReadOnlyConvergenceBatches,
         planReadOnlyConvergenceTools,
+        turnInputContextSignals,
       );
       const historyText = serializeAssistantReplyForHistory(pause.text, pause.options);
       callbacks.onAssistantFinalText(pause.text, pause.options, { hasToolCalls: false });
