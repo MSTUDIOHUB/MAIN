@@ -3570,10 +3570,29 @@ function ensureApprovedPlanRuntimeTasksForState(
   state: AppState,
   language: "zh" | "en",
 ): PlanTask[] {
+  const hasPersistedTasksArtifact = state.planArtifacts.some((artifact) => artifact.kind === "tasks");
   if (state.planTasks.length > 0) {
-    return normalizePlanTaskStatuses(state.planTasks, state.planExecutionEvidenceLedger, state.isPlanApproved);
+    const normalizedTasks = normalizePlanTaskStatuses(state.planTasks, state.planExecutionEvidenceLedger, state.isPlanApproved);
+    if (!hasPersistedTasksArtifact) {
+      const derivedRuntimeTasks = deriveRuntimePlanTasksFromArtifacts(state.planArtifacts, {
+        language,
+        maxTasks: 8,
+      });
+      if (derivedRuntimeTasks.length > 0) {
+        return reconcilePlanTaskCompletion(
+          normalizedTasks,
+          derivedRuntimeTasks,
+          state.planExecutionEvidenceLedger,
+          {
+            preserveMissing: false,
+            highlightNext: state.isPlanApproved && state.planExecutionEvidenceLedger.length > 0,
+          },
+        );
+      }
+    }
+    return normalizedTasks;
   }
-  if (state.planArtifacts.some((artifact) => artifact.kind === "tasks")) {
+  if (hasPersistedTasksArtifact) {
     return state.planTasks;
   }
   return deriveRuntimePlanTasksFromArtifacts(state.planArtifacts, {
@@ -5456,12 +5475,12 @@ export const useAppStore = create<AppState>()(
 
             if (language === "en") {
               return hasTasksArtifact
-              ? approvalChoiceHint + "The plan is approved. Continue directly from the current task list and execute the remaining items without repeating the plan. Do not read `.MAIN/plans/tasks.md` just to check whether it exists. If `.MAIN/plans/tasks.md` is already known to exist, keep it as an audit record: do not delete completed or previous task records, and only check an item off after real evidence exists for its file/command/deliverable/browser validation, or the item is explicitly pending user validation." + deliverableHint + runtimeTaskNotice + "\n\n" + buildPlanCommandExecutionHint(executionPlanTasks, "en")
+              ? approvalChoiceHint + "The plan is approved. Continue directly from the current task list and execute the remaining items without repeating the plan. Do not read `.MAIN/plans/tasks.md` just to check whether it exists. If a source file has already been read and another read only returns `FILE_UNCHANGED_STUB`, switch to writing/patching, inspect a different target, or pause with the exact blocker instead of rereading. If `.MAIN/plans/tasks.md` is already known to exist, keep it as an audit record: do not delete completed or previous task records, and only check an item off after real evidence exists for its file/command/deliverable/browser validation, or the item is explicitly pending user validation." + deliverableHint + runtimeTaskNotice + "\n\n" + buildPlanCommandExecutionHint(executionPlanTasks, "en")
                 : approvalChoiceHint + "The plan is approved. First derive a concise runtime task list from the approved design.md; generate `.MAIN/plans/tasks.md` only if the work is long, needs cross-session audit, or the user explicitly requested a durable task file. Do not read tasks.md just to check whether it exists. Then execute real work without repeating the plan. Task items should be concise and include lightweight evidence such as `evidence: file:src/app.ts` or `evidence: cmd:npm test` when there is a concrete deliverable." + deliverableHint;
             }
 
             return hasTasksArtifact
-              ? approvalChoiceHint + "计划已批准。请直接基于当前任务清单继续执行剩余任务，不要重复计划内容。不要为了确认 `.MAIN/plans/tasks.md` 是否存在而读取它；如果它已知存在，它是审计记录：不要删除已完成或旧任务记录；只有文件/命令/交付物/浏览器验证的真实证据满足，或该项明确待用户验证后，才能勾选对应任务。" + deliverableHint + runtimeTaskNotice + "\n\n" + buildPlanCommandExecutionHint(executionPlanTasks, "zh")
+              ? approvalChoiceHint + "计划已批准。请直接基于当前任务清单继续执行剩余任务，不要重复计划内容。不要为了确认 `.MAIN/plans/tasks.md` 是否存在而读取它；如果源码文件已经读过，再读只返回 `FILE_UNCHANGED_STUB`，请改为写入/替换、读取不同目标，或明确暂停说明阻塞，不要继续重复读取；如果它已知存在，它是审计记录：不要删除已完成或旧任务记录；只有文件/命令/交付物/浏览器验证的真实证据满足，或该项明确待用户验证后，才能勾选对应任务。" + deliverableHint + runtimeTaskNotice + "\n\n" + buildPlanCommandExecutionHint(executionPlanTasks, "zh")
               : approvalChoiceHint + "计划已批准。请先基于已批准的 design.md 派生精简 runtime 任务清单；只有任务较长、需要跨会话审计或用户明确要求持久任务文件时，才生成 `.MAIN/plans/tasks.md`。不要为了确认 tasks.md 是否存在而读取它。然后执行真实任务，不要重复计划内容。有明确交付物的任务请保留轻量证据标签，例如 `证据: file:src/app.ts` 或 `证据: cmd:npm test`。" + deliverableHint;
           })(),
           undefined,
@@ -6132,8 +6151,7 @@ export const useAppStore = create<AppState>()(
     if (
       shouldExecuteOnceFromReplyOption &&
       effectiveRunIntent !== "execute" &&
-      effectiveRunIntent !== "studio_workflow" &&
-      effectiveRunIntent !== "plan"
+      effectiveRunIntent !== "studio_workflow"
     ) {
       effectiveRunIntent = currentMainModeKey === "game_studio" ? "studio_workflow" : "execute";
       effectiveCommandDirective = effectiveCommandDirective || inferCommandDirective(text, effectiveRunIntent, {
@@ -6385,15 +6403,21 @@ export const useAppStore = create<AppState>()(
           }
 
           latest = get();
+          const resumePlanTasks = ensureApprovedPlanRuntimeTasksForState(latest, preferredLanguage);
+          if (resumePlanTasks.length > 0) {
+            set({ planTasks: resumePlanTasks });
+            latest = get();
+          }
           const hasTasksArtifact =
             (hydratedForExecution?.artifacts || latest.planArtifacts).some((artifact) => artifact.kind === "tasks") ||
+            resumePlanTasks.length > 0 ||
             (hydratedForExecution?.tasks || latest.planTasks).length > 0;
 
           get().sendMessage(
             buildTrustedPlanResumePrompt({
               language: preferredLanguage,
               hasTasksArtifact,
-              tasks: latest.planTasks,
+              tasks: resumePlanTasks.length > 0 ? resumePlanTasks : latest.planTasks,
               artifacts: latest.planArtifacts,
               evidenceLedger: latest.planExecutionEvidenceLedger,
             }),
@@ -8744,12 +8768,16 @@ export const useAppStore = create<AppState>()(
             : "";
           const cleanText = text.trim() || fallbackText;
           const metaVisibility = meta?.visibility;
-          const hasToolCallsWithoutOptions = !!meta?.hasToolCalls && replyOptions.length === 0;
-          const isHiddenProcessText = metaVisibility === "hidden_process";
+          const hasReplyOptions = replyOptions.length > 0;
+          const hasToolCallsWithoutOptions = !!meta?.hasToolCalls && !hasReplyOptions;
+          const isHiddenProcessText = !hasReplyOptions && metaVisibility === "hidden_process";
           const isUserProgressText =
-            metaVisibility === "user_progress" ||
-            !!meta?.progress ||
-            (hasToolCallsWithoutOptions && metaVisibility !== "hidden_process");
+            !hasReplyOptions &&
+            (
+              metaVisibility === "user_progress" ||
+              !!meta?.progress ||
+              (hasToolCallsWithoutOptions && metaVisibility !== "hidden_process")
+            );
           const processPhase = (isHiddenProcessText || isUserProgressText)
             ? (() => {
                 const firstCall = meta?.toolCalls?.[0];

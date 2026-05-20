@@ -1369,8 +1369,7 @@ export default function App() {
 
     const shouldReuseSourceTurn = !!sourceTurnId && !!sourceTurn;
     const shouldExecuteFromQuickReply =
-      (optionAction === "execute_once" || optionAction === "approve_operation_once") &&
-      sourceIntent !== "plan";
+      optionAction === "execute_once" || optionAction === "approve_operation_once";
     const executeQuickReplyIntent = state.selectedMainModeKey === "game_studio" ? "studio_workflow" as const : "execute" as const;
 
     if (optionAction === "cancel_operation") {

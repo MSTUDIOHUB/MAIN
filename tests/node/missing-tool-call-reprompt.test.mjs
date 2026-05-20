@@ -97,6 +97,22 @@ test("execute mode still reprompts generic text-only intent stubs", () => {
   assert.equal(kind, "generic");
 });
 
+test("execute mode reprompts Gemma-style prose that promises a tool call", () => {
+  const kind = resolveMissingToolCallRepromptKind({
+    workflowMode: "edit",
+    mainModeKey: "main_mode",
+    visibleText: [
+      "由于之前的 replace_in_file 失败（search_text 不匹配），我需要重新精确获取 filteredOrders 的源代码内容。",
+      "",
+      "我将通过 read_file 读取 src/store/dashboardStore.ts 的第 100 到 160 行，以获取准确的 get filteredOrders() 实现。",
+      "",
+      "正在重新获取 src/store/dashboardStore.ts 的关键代码段。",
+    ].join("\n"),
+  });
+
+  assert.equal(kind, "generic");
+});
+
 test("execute mode reprompts when model dumps code in chat instead of tools", () => {
   const codeBlock = `
 文件：Assets/Scripts/Battle/BattleUnit.cs

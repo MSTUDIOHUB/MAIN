@@ -2,7 +2,7 @@
 // 将不同模型、不同输出格式统一整理成前端可消费的标准结构。
 
 import { parseTextForTools } from "./textToolParser";
-import { extractReplyOptions } from "./replyOptions";
+import { extractReplyOptions, normalizeReplyOptionLabel, normalizeReplyOptionValue } from "./replyOptions";
 import { sanitizeAIOutput } from "./sanitize";
 import type { StreamResult } from "./streaming";
 import type { NormalizedStreamState, NormalizedToolCall, ReplyOption } from "./workflowModels";
@@ -19,6 +19,7 @@ export function isSyntheticVisibleConclusion(text: string): boolean {
 const REASONING_TAG_RE = /<(?:analysis|thought|thinking|reasoning)(?:\s[^>]*)?>([\s\S]*?)<\/(?:analysis|thought|thinking|reasoning)>/gi;
 const LEAKED_REASONING_MARKERS = [
   /^thinking\b/i,
+  /^thought\b/i,
   /^analysis\b/i,
   /^reasoning\b/i,
   /^思考[:：]?/i,
@@ -54,6 +55,15 @@ const LEAKED_REASONING_MARKERS = [
   /不需要调用工具/i,
   /^用户要求我/i,
   /^The user asked me/i,
+];
+
+const STRONG_REASONING_PRELUDE_MARKERS = [
+  /^thinking\b[:：]?/i,
+  /^thought\b[:：]?/i,
+  /^analysis\b[:：]?/i,
+  /^reasoning\b[:：]?/i,
+  /^思考[:：]?/i,
+  /^分析[:：]?/i,
 ];
 
 const CHOICE_CONTEXT_MARKERS = [
@@ -128,7 +138,9 @@ function extractLeakedReasoningPrelude(text: string): { leakedThought: string; v
     firstVisibleIdx = i + 1;
   }
 
-  if (leaked.length < 2) {
+  const firstLeakedIsStrongReasoningLabel = leaked.length > 0 &&
+    STRONG_REASONING_PRELUDE_MARKERS.some((pattern) => pattern.test(leaked[0] || ""));
+  if (leaked.length < 2 && !firstLeakedIsStrongReasoningLabel) {
     return { leakedThought: "", visibleText: text };
   }
 
@@ -363,8 +375,8 @@ function mergeReplyOptions(...groups: ReplyOption[][]): ReplyOption[] {
   const seen = new Set<string>();
   for (const group of groups) {
     for (const option of group) {
-      const value = normalizeReplyOptionText(option.value || option.label);
-      const label = normalizeReplyOptionText(option.label || option.value);
+      const value = normalizeReplyOptionValue(option.value || option.label);
+      const label = normalizeReplyOptionLabel(option.label || option.value);
       if (!value || seen.has(value)) continue;
       seen.add(value);
       merged.push({ label, value, ...(option.action ? { action: option.action } : {}), ...(option.source ? { source: option.source } : {}) });

@@ -115,6 +115,20 @@ export interface StreamResult {
   reasoningField?: "reasoning_content" | "reasoning";
 }
 
+const REASONING_ONLY_STREAM_GUARD_CHAR_LIMIT = 12_000;
+
+export function shouldStopReasoningOnlyStream(input: {
+  reasoningChars: number;
+  visibleChars: number;
+  toolCallCount: number;
+}): boolean {
+  return (
+    input.reasoningChars >= REASONING_ONLY_STREAM_GUARD_CHAR_LIMIT &&
+    input.visibleChars === 0 &&
+    input.toolCallCount === 0
+  );
+}
+
 interface StreamCallbacks {
   onToken: (token: string) => void;
   onDone: (result: StreamResult) => void;
@@ -954,6 +968,7 @@ async function streamViaRustProxy(
   let emittedOpenAiCompatibleReasoning = "";
   let providerReasoningContent = "";
   let providerReasoningField: StreamResult["reasoningField"] | null = null;
+  let visibleContentChars = 0;
   let finishReason: "stop" | "length" | "tool_calls" | null = null;
   const toolCallsMap = new Map<number, StreamedToolCall>();
 
@@ -992,6 +1007,53 @@ async function streamViaRustProxy(
     onToken("</thinking>");
   };
 
+  const buildCurrentOpenAiCompatibleResult = (): StreamResult => ({
+    content: fullContent,
+    toolCalls: finalizeStreamedToolCalls(toolCallsMap),
+    finishReason,
+    ...(providerReasoningContent.trim()
+      ? {
+          reasoningContent: providerReasoningContent,
+          ...(providerReasoningField ? { reasoningField: providerReasoningField } : {}),
+        }
+      : {}),
+  });
+
+  const stopReasoningOnlyRunaway = () => {
+    if (resolved || anthropicProcessor) return false;
+    if (!shouldStopReasoningOnlyStream({
+      reasoningChars: providerReasoningContent.length,
+      visibleChars: visibleContentChars,
+      toolCallCount: toolCallsMap.size,
+    })) {
+      return false;
+    }
+
+    resolved = true;
+    finishReason = "length";
+    closeReasoningBlock();
+    reasoningBuffer = "";
+    emitStreamingConsole(
+      "streaming",
+      "warn",
+      `Reasoning-only stream exceeded ${REASONING_ONLY_STREAM_GUARD_CHAR_LIMIT} chars without visible output or tool calls; cancelling stream.`,
+    );
+    callbacks.onLifecycle?.({
+      phase: "stream_cancelled",
+      streamId,
+      elapsedMs: Date.now() - streamStartedAt,
+      chunkCount: rustProxyChunkCount,
+      byteCount: rustProxyByteCount,
+      status: "reasoning_guard",
+    });
+    invoke("cancel_chat_stream").catch(() => {});
+    const result = buildCurrentOpenAiCompatibleResult();
+    onDone(result);
+    resolveResult?.(result);
+    cleanup();
+    return true;
+  };
+
   const processSseChunk = (rawChunk: string) => {
     if (anthropicProcessor) {
       anthropicProcessor.processChunk(rawChunk);
@@ -1010,7 +1072,11 @@ async function streamViaRustProxy(
           const json = JSON.parse(trimmed);
           if (json.done) { finishReason = "stop"; continue; }
           const contentDelta = json.message?.content ?? "";
-          if (contentDelta) { fullContent += contentDelta; onToken(contentDelta); }
+          if (contentDelta) {
+            fullContent += contentDelta;
+            if (contentDelta.trim()) visibleContentChars += contentDelta.length;
+            onToken(contentDelta);
+          }
         } catch { /* skip */ }
       }
     } else {
@@ -1083,6 +1149,7 @@ async function streamViaRustProxy(
             // Close reasoning block if we were in one
             closeReasoningBlock();
             fullContent += textDelta;
+            if (textDelta.trim()) visibleContentChars += textDelta.length;
             onToken(textDelta);
           }
 
@@ -1105,6 +1172,7 @@ async function streamViaRustProxy(
               }
             }
           }
+          if (stopReasoningOnlyRunaway()) return;
         } catch { /* skip */ }
       }
     }
@@ -1259,17 +1327,7 @@ async function streamViaRustProxy(
 
         const result: StreamResult = anthropicProcessor
           ? anthropicProcessor.getResult()
-          : {
-              content: fullContent,
-              toolCalls: finalizeStreamedToolCalls(toolCallsMap),
-              finishReason,
-              ...(providerReasoningContent.trim()
-                ? {
-                    reasoningContent: providerReasoningContent,
-                    ...(providerReasoningField ? { reasoningField: providerReasoningField } : {}),
-                  }
-                : {}),
-            };
+          : buildCurrentOpenAiCompatibleResult();
         onDone(result);
         resolveResult?.(result);
       }
@@ -1470,6 +1528,7 @@ export async function streamChatCompletion(
   let emittedOpenAiCompatibleReasoning = "";
   let providerReasoningContent = "";
   let providerReasoningField: StreamResult["reasoningField"] | null = null;
+  let visibleContentChars = 0;
 
   // Track finish_reason from the stream
   let finishReason: "stop" | "length" | "tool_calls" | null = null;
@@ -1498,6 +1557,18 @@ export async function streamChatCompletion(
 
   // Accumulate tool calls across deltas, keyed by index
   const toolCallsMap = new Map<number, StreamedToolCall>();
+
+  const buildCurrentOpenAiCompatibleResult = (): StreamResult => ({
+    content: fullContent,
+    toolCalls: finalizeStreamedToolCalls(toolCallsMap),
+    finishReason,
+    ...(providerReasoningContent.trim()
+      ? {
+          reasoningContent: providerReasoningContent,
+          ...(providerReasoningField ? { reasoningField: providerReasoningField } : {}),
+        }
+      : {}),
+  });
 
   try {
     while (true) {
@@ -1532,6 +1603,7 @@ export async function streamChatCompletion(
             const contentDelta = json.message?.content ?? "";
             if (contentDelta) {
               fullContent += contentDelta;
+              if (contentDelta.trim()) visibleContentChars += contentDelta.length;
               onToken(contentDelta);
             }
           } catch {
@@ -1599,6 +1671,7 @@ export async function streamChatCompletion(
               // Close reasoning block if we were in one
               closeReasoningBlock();
               fullContent += textDelta;
+              if (textDelta.trim()) visibleContentChars += textDelta.length;
               onToken(textDelta);
             }
 
@@ -1629,6 +1702,24 @@ export async function streamChatCompletion(
                 }
               }
             }
+            if (shouldStopReasoningOnlyStream({
+              reasoningChars: providerReasoningContent.length,
+              visibleChars: visibleContentChars,
+              toolCallCount: toolCallsMap.size,
+            })) {
+              finishReason = "length";
+              closeReasoningBlock();
+              reasoningBuffer = "";
+              emitStreamingConsole(
+                "streaming",
+                "warn",
+                `Reasoning-only stream exceeded ${REASONING_ONLY_STREAM_GUARD_CHAR_LIMIT} chars without visible output or tool calls; cancelling stream.`,
+              );
+              await reader.cancel().catch(() => {});
+              const result = buildCurrentOpenAiCompatibleResult();
+              onDone(result);
+              return result;
+            }
           } catch (e) {
             // Re-throw garbled-reasoning abort — must not be swallowed
             if (e && (e as any)._garbledAbort) throw e;
@@ -1651,6 +1742,7 @@ export async function streamChatCompletion(
         const json = JSON.parse(buffer.trim());
         if (json.message?.content) {
           fullContent += json.message.content;
+          if (json.message.content.trim()) visibleContentChars += json.message.content.length;
           onToken(json.message.content);
         }
       } catch { /* ignore */ }
@@ -1675,6 +1767,7 @@ export async function streamChatCompletion(
           const contentDelta = resolvedText.delta;
           if (contentDelta) {
             fullContent += contentDelta;
+            if (contentDelta.trim()) visibleContentChars += contentDelta.length;
             onToken(contentDelta);
           }
         } catch { /* ignore */ }
@@ -1701,17 +1794,7 @@ export async function streamChatCompletion(
 
   const result: StreamResult = anthropicProcessor
     ? anthropicProcessor.getResult()
-    : {
-        content: fullContent,
-        toolCalls: finalizeStreamedToolCalls(toolCallsMap),
-        finishReason,
-        ...(providerReasoningContent.trim()
-          ? {
-              reasoningContent: providerReasoningContent,
-              ...(providerReasoningField ? { reasoningField: providerReasoningField } : {}),
-            }
-          : {}),
-      };
+    : buildCurrentOpenAiCompatibleResult();
 
   if (result.finishReason === "length") {
     emitStreamingConsole("streaming", "warn", `Response truncated — finish_reason is "length". Consider increasing max_tokens.`);

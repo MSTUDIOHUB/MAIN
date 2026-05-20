@@ -733,6 +733,32 @@ test("runtime plan task derivation ignores status findings and tech-stack bullet
   assert.equal(tasks[0].evidence?.[0]?.value, "src/components/TopIsland.tsx");
 });
 
+test("runtime plan task derivation skips approved-plan diagnostic read loops", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([
+    {
+      kind: "design",
+      path: ".MAIN/plans/design.md",
+      title: "Design",
+      updatedAt: 1,
+      content: [
+        "# Design",
+        "",
+        "## 执行顺序",
+        "- 数据解析/映射错误：`src/hooks/useCsvParser.ts` 解析出的字段名与 Store/组件预期的字段名不匹配。",
+        "- 深度检查解析逻辑：读取 `src/hooks/useCsvParser.ts` 和 `src/store/dashboardStore.ts` 相关文件，确认字段映射关系。",
+        "- 修复 `src/hooks/useCsvParser.ts` 的字段映射，并同步更新 `src/types/order.ts`。",
+        "- 运行 `npm run build` 验证修复。",
+      ].join("\n"),
+    },
+  ], { language: "zh" });
+
+  assert.equal(tasks.some((task) => /深度检查|读取/.test(task.text)), false);
+  assert.equal(tasks.some((task) => /负责|字段名与 Store/.test(task.text)), false);
+  assert.equal(tasks.some((task) => task.evidence?.some((item) => item.kind === "file" && item.value === "src/hooks/useCsvParser.ts")), true);
+  assert.equal(tasks.some((task) => task.evidence?.some((item) => item.kind === "cmd" && item.value.includes("npm run build"))), true);
+  assert.equal(tasks.some((task) => task.evidence?.some((item) => item.value === "src/store/dashboardStore.ts")), false);
+});
+
 test("runtime plan task derivation requires concrete evidence instead of synthetic tool fallback", () => {
   const tasks = deriveRuntimePlanTasksFromArtifacts([
     {
@@ -1084,6 +1110,7 @@ test("approved plan execution no-tool recovery bypasses generic missing-tool sto
   assert.match(prompt, /已批准计划正在执行/);
   assert.match(prompt, /直接调用工具/);
   assert.match(prompt, /Browser\/Playwright/);
+  assert.match(prompt, /FILE_UNCHANGED_STUB/);
   assert.match(prompt, /src\/store\/useAppStore\.ts/);
   assert.doesNotMatch(prompt, /missing_tool_reprompt_limit|聊天失败/);
 });

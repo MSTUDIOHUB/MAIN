@@ -59,6 +59,7 @@ function loadTranspiledModuleSync(sourcePath) {
 const {
   buildReadOnlyPermissionContinuationPrompt,
   extractReplyOptions,
+  hasOnlyPlanContinuationReplyOptions,
   hasOnlyReadOnlyPermissionReplyOptions,
   inferReplyOptionActionFromText,
   serializeAssistantReplyForHistory,
@@ -195,6 +196,34 @@ test("shouldPauseForReplyOptions rejects inferred options on length truncation",
       finishReason: "length",
     }),
     true,
+  );
+
+  assert.equal(
+    shouldPauseForReplyOptions({
+      replyOptions: [
+        { label: "继续读取 useDashboardStore", value: "继续读取 useDashboardStore", action: "continue_readonly_once", source: "readonly_permission" },
+        { label: "当前会话只读步骤全部批准", value: "本会话只读读取、搜索和分析步骤全部允许", action: "allow_readonly_session", source: "readonly_permission" },
+      ],
+      toolCallCount: 0,
+      workflowMode: "plan",
+      finishReason: "length",
+    }),
+    false,
+  );
+
+  assert.equal(
+    shouldPauseForReplyOptions({
+      replyOptions: [
+        { label: "确认数据是否成功存入 Store", value: "请确认数据是否成功存入 Store", source: "explicit_user_options" },
+        { label: "确认数据是否能从 Store 正确读取并完成计算", value: "请确认数据是否能从 Store 正确读取并完成计算", source: "explicit_user_options" },
+        { label: "直接尝试分析现有的 CSV 文件格式，看是否与代码中的解析逻辑冲突", value: "直接尝试分析现有的 CSV 文件格式，看是否与代码中的解析逻辑冲突", source: "explicit_user_options" },
+      ],
+      toolCallCount: 0,
+      workflowMode: "plan",
+      forcePause: true,
+      finishReason: "stop",
+    }),
+    false,
   );
 });
 
@@ -401,6 +430,46 @@ test("extractReplyOptions marks explicit execution choices for runtime execute",
   `);
   assert.equal(fixChoice.replyOptions[0].action, "execute_once");
   assert.equal(fixChoice.replyOptions[1].action, undefined);
+});
+
+test("extractReplyOptions rewrites model-self diagnostic options into user instructions", () => {
+  const result = extractReplyOptions(`
+我需要确认下一步排查方向。
+
+<user_options>
+<option>我来确认数据是否成功存入 Store</option>
+<option>我来确认数据是否能从 Store 正确读取并完成计算</option>
+<option>直接尝试分析现有的 CSV 文件格式，看是否与代码中的解析逻辑冲突</option>
+</user_options>
+  `);
+
+  assert.deepEqual(
+    result.replyOptions.map((option) => option.label),
+    [
+      "确认数据是否成功存入 Store",
+      "确认数据是否能从 Store 正确读取并完成计算",
+      "直接尝试分析现有的 CSV 文件格式，看是否与代码中的解析逻辑冲突",
+    ],
+  );
+  assert.deepEqual(
+    result.replyOptions.map((option) => option.value),
+    [
+      "请确认数据是否成功存入 Store",
+      "请确认数据是否能从 Store 正确读取并完成计算",
+      "直接尝试分析现有的 CSV 文件格式，看是否与代码中的解析逻辑冲突",
+    ],
+  );
+  assert.equal(hasOnlyPlanContinuationReplyOptions(result.replyOptions), true);
+
+  const deferral = extractReplyOptions(`
+<user_options>
+<option value="我来确认无误再执行">我来确认无误再执行</option>
+</user_options>
+  `);
+
+  assert.equal(deferral.replyOptions[0].label, "我来确认无误再执行");
+  assert.equal(deferral.replyOptions[0].value, "我来确认无误再执行");
+  assert.equal(hasOnlyPlanContinuationReplyOptions(deferral.replyOptions), false);
 });
 
 test("extractReplyOptions synthesizes operation approval for executable proposals", () => {

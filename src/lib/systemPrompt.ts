@@ -58,6 +58,7 @@ export type ToolProtocolCardProfile = {
   model?: string | null;
   toolProtocol?: string | null;
   nativeToolsEnabled?: boolean;
+  modelProtocolNotes?: string[];
   workflowMode?: "chat" | "edit" | "plan";
   availableToolNames?: string[];
   language?: Lang;
@@ -167,6 +168,18 @@ export function buildToolProtocolCard(profile: ToolProtocolCardProfile): string 
     .join("/");
   const exampleTool = selectProtocolExampleTool(available);
   const example = buildXmlExample(exampleTool);
+  const modelNotes = (profile.modelProtocolNotes || [])
+    .map((note) => String(note || "").trim())
+    .filter(Boolean)
+    .slice(0, 4);
+  const modelNormalizationSection = modelNotes.length
+    ? [
+        language === "zh"
+          ? "模型格式归一化：不同模型可能把思考写成 `thought`/`thinking`/`reasoning` 字段或标签；这些都属于后台过程，不要放进用户可见正文。"
+          : "Model format normalization: different models may emit thinking as `thought`/`thinking`/`reasoning` fields or labels; treat these as hidden process, not user-visible body text.",
+        ...modelNotes.map((note) => `- ${note}`),
+      ]
+    : [];
 
   if (!usesXml && profile.nativeToolsEnabled) {
     return [
@@ -180,6 +193,7 @@ export function buildToolProtocolCard(profile: ToolProtocolCardProfile): string 
       language === "zh"
         ? "native tool calling 允许在工具调用前输出 1-3 句用户可见公开进度说明：当前理解、为什么需要这步、用什么结果判断下一步。不要写原始推理链。"
         : "With native tool calling, you may include 1-3 user-visible progress sentences before the tool call: current understanding, why this step is needed, and what result will guide the next step. Do not reveal chain-of-thought.",
+      ...modelNormalizationSection,
       language === "zh"
         ? "不需要工具时，直接输出用户可见 Markdown。"
         : "When no tool is needed, output user-visible Markdown directly.",
@@ -197,6 +211,7 @@ export function buildToolProtocolCard(profile: ToolProtocolCardProfile): string 
     language === "zh"
       ? "XML 协议下不要为了说明进度而混排正文；运行时会根据工具名、目标和用户目标注入可见 progress narration。"
       : "Under the XML protocol, do not mix progress prose with the tool block; the runtime will inject visible progress narration from the tool name, target, and user goal.",
+    ...modelNormalizationSection,
     ...example,
     language === "zh"
       ? "禁止输出 `[Tool call: read_file]`、`Tool call: read_file`、`<tool_code>...</tool_code>`、`我要调用工具`。这些都不是可执行工具调用。"
@@ -411,11 +426,12 @@ export function buildSystemPrompt(
     "1. 问题正文必须放在普通 Markdown 中，不能塞进 `<user_options>`。",
     "2. 默认给 2-4 个选项，尽量互斥、清晰、够具体。",
     "3. 每个 `<option>` 的文本都必须能直接作为用户点击后发回给你的下一条消息，不要写成残缺短语，也不要写成“是否……”这类问题句。",
-    "4. 面向用户提问时，用“我需要你确认下面方向”这类自然口吻；不要输出“需要用户拍板的选项”这种后台说明。",
-    "5. 如果你已经有推荐方案，把推荐项放在第一个。",
-    "6. 不需要用户决策时，不要滥用选项块。",
-    "7. 一旦你输出了 `<user_options>`，本轮就应立即停止并等待用户点击；不要在同一条回复里继续规划、继续思考下一步，或补一句“我将继续执行”。",
-    "8. 如果确实因为目标分叉、口径冲突、关键前提不明确而无法继续推进，应该输出普通 Markdown 问题 + `<user_options>`，然后等待；不要假装提问后又自己继续往下执行。",
+    "4. `<option>` 是用户点击后发回给你的消息：如果选项是让你继续调查、确认、读取、分析或执行，必须写成用户指令口吻（如“请确认数据是否写入 Store”“继续分析 CSV 解析逻辑”），不要写成模型自述的“我来确认/我来检查/我来分析”。只有当确实表示用户自己稍后去确认时，才可以使用“我来……”。",
+    "5. 面向用户提问时，用“我需要你确认下面方向”这类自然口吻；不要输出“需要用户拍板的选项”这种后台说明。",
+    "6. 如果你已经有推荐方案，把推荐项放在第一个。",
+    "7. 不需要用户决策时，不要滥用选项块。",
+    "8. 一旦你输出了 `<user_options>`，本轮就应立即停止并等待用户点击；不要在同一条回复里继续规划、继续思考下一步，或补一句“我将继续执行”。",
+    "9. 如果确实因为目标分叉、口径冲突、关键前提不明确而无法继续推进，应该输出普通 Markdown 问题 + `<user_options>`，然后等待；不要假装提问后又自己继续往下执行。",
     "",
     "## ⚠️ 分析深度要求",
     "`get_project_skeleton` 只返回项目/资料目录结构，不包含任何文件内容。仅凭目录结构做出的分析毫无价值。",

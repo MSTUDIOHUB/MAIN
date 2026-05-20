@@ -430,6 +430,8 @@ test("cloud tool protocol and model profile helpers normalize provider behavior"
 
   assert.equal(getModelInstructionProfile({ protocol: "anthropic", model: "claude-sonnet-4-5" }).provider, "anthropic");
   assert.equal(getModelInstructionProfile({ protocol: "openai", model: "qwen3-coder" }).reasoning, "tagged");
+  assert.equal(getModelInstructionProfile({ protocol: "openai", provider: "OMLX", model: "gemma-4-26b-a4b-it-8bit" }).provider, "gemma");
+  assert.equal(getModelInstructionProfile({ protocol: "openai", provider: "OMLX", model: "gemma-4-26b-a4b-it-8bit" }).reasoning, "tagged");
   assert.equal(getModelInstructionProfile({ protocol: "openai", model: "kimi-k2" }).toolProtocolPreference, "xml");
   assert.equal(getModelInstructionProfile({ protocol: "gemini", model: "gemini-2.5-pro" }).toolProtocolPreference, "xml");
 });
@@ -448,6 +450,15 @@ test("model protocol profile covers local and cloud providers", () => {
     model: "mlx-qwen",
     configuredToolProtocol: "auto",
   }).toolProtocol, "auto");
+
+  const localGemmaProfile = resolveModelProtocolProfile({
+    activeProfile: "local",
+    provider: "OMLX",
+    model: "gemma-4-26b-a4b-it-8bit",
+    configuredToolProtocol: "auto",
+  });
+  assert.equal(localGemmaProfile.reasoning, "tagged");
+  assert.equal(localGemmaProfile.notes.some((note) => /thought/.test(note)), true);
 
   assert.equal(resolveModelProtocolProfile({
     activeProfile: "cloud",

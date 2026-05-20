@@ -174,21 +174,20 @@ test("OpenAI ChatGPT OAuth forces responses endpoint even when apiFormat is chat
   assert.equal(invokeArgs[0].url, "https://api.openai.com/v1/responses");
 });
 
-test("Gemini OAuth cloud requests use Code Assist endpoint and token refs", async () => {
+test("Gemini OAuth cloud requests use native generateContent endpoint and token refs", async () => {
   const { streamChatCompletion } = await loadStreamingModule(async (command, args) => {
     assert.equal(command, "proxy_request");
     const body = JSON.parse(args.body);
-    assert.equal(args.url, "https://cloudcode-pa.googleapis.com/v1internal:generateContent");
+    assert.equal(args.url, "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent");
     assert.equal(args.authMode, "gemini_google_oauth");
     assert.equal(args.tokenRef, "gemini-login");
     assert.equal(args.headers.Authorization, undefined);
     assert.equal(args.headers["x-goog-api-key"], undefined);
-    assert.equal(body.model, "gemini-2.5-pro");
-    assert.equal(body.request.contents[0].parts[0].text, "你好");
-    assert.equal(body.request.generationConfig.maxOutputTokens > 0, true);
+    assert.equal(body.contents[0].parts[0].text, "你好");
+    assert.equal(body.generationConfig.maxOutputTokens > 0, true);
     assert.equal(body.temperature, undefined);
     assert.equal(body.top_p, undefined);
-    return JSON.stringify({ response: { candidates: [{ content: { parts: [{ text: "ok" }] } }] } });
+    return JSON.stringify({ candidates: [{ content: { parts: [{ text: "ok" }] } }] });
   });
 
   const result = await streamChatCompletion(
@@ -517,6 +516,57 @@ test("local Rust streams convert cumulative reasoning payloads into thinking del
   assert.equal(result.reasoningContent, "ABC");
   assert.equal(result.reasoningField, "reasoning_content");
   assert.deepEqual(tokens, ["<thinking>", "A", "B", "C", "</thinking>", "done"]);
+});
+
+test("local Rust streams stop reasoning-only runaway output", async () => {
+  const listeners = new Map();
+  const invokeCalls = [];
+  const listenMock = async (eventName, handler) => {
+    listeners.set(eventName, handler);
+    return () => listeners.delete(eventName);
+  };
+  const { streamChatCompletion } = await loadStreamingModule(async (command, args) => {
+    invokeCalls.push(command);
+    if (command === "cancel_chat_stream") return undefined;
+    assert.equal(command, "start_chat_stream");
+    const streamId = args.streamId;
+    queueMicrotask(() => {
+      listeners.get("chat-stream-chunk")?.({
+        payload: {
+          stream_id: streamId,
+          chunk: `data: ${JSON.stringify({ choices: [{ message: { reasoning_content: "loop ".repeat(3000) } }] })}\n\n`,
+        },
+      });
+    });
+    return undefined;
+  }, listenMock);
+
+  const tokens = [];
+  let doneCount = 0;
+  const result = await streamChatCompletion(
+    [{ role: "user", content: "继续" }],
+    {
+      baseUrl: "http://127.0.0.1:1234/v1",
+      apiKey: "not-needed",
+      model: "local-model",
+      provider: "LM Studio",
+      useRustProxy: true,
+    },
+    {
+      onToken: (token) => tokens.push(token),
+      onDone: () => { doneCount += 1; },
+      onError: (error) => { throw error; },
+    },
+  );
+
+  assert.equal(result.finishReason, "length");
+  assert.equal(result.toolCalls.length, 0);
+  assert.match(result.content, /^<thinking>/);
+  assert.equal(result.content.endsWith("</thinking>"), true);
+  assert.equal(result.reasoningContent.length > 12_000, true);
+  assert.deepEqual(invokeCalls, ["start_chat_stream", "cancel_chat_stream"]);
+  assert.equal(doneCount, 1);
+  assert.equal(tokens[0], "<thinking>");
 });
 
 test("OpenAI-compatible chat replays assistant reasoning_content when the provider emitted it", async () => {

@@ -29,6 +29,7 @@ const STREAM_ERROR_RECOVERY_SCENARIO = "stream-error-recovery";
 const SESSION_AUTO_CREATE_SCENARIO = "session-auto-create";
 const CLOUD_TOOL_FALLBACK_SCENARIO = "cloud-tool-fallback";
 const REPLY_OPTIONS_TOOL_PAUSE_SCENARIO = "reply-options-tool-pause";
+const PLAN_OPERATION_APPROVAL_REUSE_SCENARIO = "plan-operation-approval-reuse";
 const PLAN_APPROVAL_EXECUTE_TOOLS_SCENARIO = "plan-approval-execute-tools";
 const OPERATION_APPROVAL_NATURAL_FLOW_SCENARIO = "operation-approval-natural-flow";
 const EXECUTE_QUICK_REPLY_RUNTIME_SCENARIO = "execute-quick-reply-runtime";
@@ -4226,7 +4227,8 @@ function seedCloudToolProtocolScenario(scenario: string) {
       language: "zh",
       workflowMode:
         scenario === MALFORMED_TOOL_USE_PLAN_SCENARIO ||
-        scenario === APPROVED_PLAN_EXECUTION_NO_TOOL_SCENARIO
+        scenario === APPROVED_PLAN_EXECUTION_NO_TOOL_SCENARIO ||
+        scenario === PLAN_OPERATION_APPROVAL_REUSE_SCENARIO
           ? "plan"
           : "chat",
       activeProfile: "cloud",
@@ -4264,6 +4266,8 @@ function seedCloudToolProtocolScenario(scenario: string) {
             ? "E2E Approved Plan No Tool"
             : scenario === PROGRESS_NARRATION_TOOL_FLOW_SCENARIO
             ? "E2E Progress Narration Tool Flow"
+            : scenario === PLAN_OPERATION_APPROVAL_REUSE_SCENARIO
+            ? "E2E Plan Operation Approval Reuse"
             : "E2E Reply Options Tool Pause",
           date: new Date(now).toISOString(),
           active: true,
@@ -4351,6 +4355,17 @@ function seedCloudToolProtocolScenario(scenario: string) {
       return useAppStore.getState().sendMessage(text || "请修复这个问题。");
     }
 
+    if (scenario === PLAN_OPERATION_APPROVAL_REUSE_SCENARIO) {
+      return useAppStore.getState().sendMessage(
+        text || "请修复 CSV 导入后图表不显示。",
+        undefined,
+        {
+          resolvedIntent: "plan",
+          skipIntentResolution: true,
+        },
+      );
+    }
+
     if (scenario === UNITY_MCP_OPTIONS_PRIORITY_SCENARIO) {
       return useAppStore.getState().sendMessage(
         text || "请在 Unity 场景下先给我可点击选项。",
@@ -4417,6 +4432,7 @@ function seedCloudToolProtocolScenario(scenario: string) {
     const agentBlocks = state.taskFlow.filter((block) => block.type === "agent") as any[];
     const optionBlocks = agentBlocks.filter((block) => Array.isArray(block.options) && block.options.length > 0);
     const archivedOptionBlocks = agentBlocks.filter((block) => block.archivedAfterChoice);
+    const progressBlocks = state.taskFlow.filter((block) => block.type === "progress") as any[];
     const toolBlocks = state.taskFlow.filter((block) => block.type === "tool") as any[];
 
     return {
@@ -4443,6 +4459,7 @@ function seedCloudToolProtocolScenario(scenario: string) {
       agentTexts: agentBlocks.map((block) => block.content),
       optionBlockCount: optionBlocks.length,
       optionLabels: optionBlocks.flatMap((block) => (block.options || []).map((option: any) => option.label)),
+      progressBlockCount: progressBlocks.length,
       archivedOptionCount: archivedOptionBlocks.length,
       selectedOptions: archivedOptionBlocks.map((block) => block.selectedOption).filter(Boolean),
       toolNames: toolBlocks.map((block) => block.toolName),
@@ -5267,6 +5284,10 @@ export function initializeE2EScenarios(): (() => void) | undefined {
 
   if (scenario === REPLY_OPTIONS_TOOL_PAUSE_SCENARIO) {
     return seedCloudToolProtocolScenario(REPLY_OPTIONS_TOOL_PAUSE_SCENARIO);
+  }
+
+  if (scenario === PLAN_OPERATION_APPROVAL_REUSE_SCENARIO) {
+    return seedCloudToolProtocolScenario(PLAN_OPERATION_APPROVAL_REUSE_SCENARIO);
   }
 
   if (scenario === EXECUTE_QUICK_REPLY_RUNTIME_SCENARIO) {

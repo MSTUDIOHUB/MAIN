@@ -26,6 +26,9 @@ const ACTIONABLE_OPTION_RE = /(?:^方案\s*[A-Z0-9一二三四五六七八九十
 const OPERATION_APPROVAL_REPLY_RE = /(?:批准|允许|同意).{0,16}(?:执行|操作|修改|修复|运行|写入)|(?:approve|allow).{0,24}(?:operation|execution|changes?|write|run)/i;
 const EXECUTABLE_PROPOSAL_CUE_RE = /(?:修复方案|实现方案|执行方案|改造方案|重构方案|落地方案|方案建议|建议方案|方案如下|执行步骤|实施步骤|下一步(?:可以|建议)?(?:执行|修复|修改|实现|落地)|是否(?:现在|立刻|开始|按上述方案)?(?:执行|修复|修改|实现|落地)|是否需要(?:我|MAIN)?(?:开始|继续)?(?:执行|修复|修改|实现)|要不要(?:开始|按方案)?(?:执行|修复|修改|实现)|proposed fix|fix plan|implementation plan|execution plan|proposal|next steps?.{0,24}(?:implement|execute|apply|fix|patch)|do you want me to.{0,24}(?:start|implement|execute|apply|fix|patch)|should I.{0,24}(?:start|implement|execute|apply|fix|patch)|ready to execute)/i;
 const OPERATION_CUE_RE = /(?:写入|修改|改动|更改|删除|创建|生成(?:文件|交付物)?|执行命令|运行命令|运行测试|部署|发布|提交|推送|Git|修复|实现|重构|落地|write|modify|edit|delete|create|generate|run command|execute command|run tests?|deploy|publish|commit|push|git|fix|implement|refactor|patch|ship)/i;
+const PLAN_CONTINUATION_ACTION_RE = /^(?:请)?(?:先|继续|直接|再|尝试|立刻|马上|现在)?(?:我来)?(?:确认|检查|分析|读取|查看|定位|排查|验证|核对|梳理|搜索|查询|浏览|测试|尝试(?:确认|检查|分析|读取|查看|定位|排查|验证|核对)|check|verify|confirm|inspect|analy[sz]e|read|look into|debug|investigate|validate|search|query|test)/i;
+const PLAN_CONTINUATION_TECH_TARGET_RE = /(?:是否|能否|能不能|有没有|是否能|是否可以|成功|正确|读取|存入|计算|渲染|解析|冲突|代码|源码|文件|接口|组件|函数|状态|数据|日志|表格|Store|store|CSV|csv|src[\/\\]|[A-Za-z0-9_.\-\/\\]+\.[A-Za-z0-9]{1,12}|\bstate\b|\bdata\b|\bfile\b|\bcomponent\b|\bfunction\b|\binterface\b|\blog\b|\bparse\b|\brender\b|\bload\b|\bstore\b)/i;
+const PLAN_CONTINUATION_DECISION_RE = /(?:方案|设计|需求|范围|风格|体验|取舍|批准|执行|修复|修改|实现|生成|创建|采用|选择|保留|跳过|提交|部署|开始执行|product|design|requirement|scope|tradeoff|approve|execute|implement|fix|modify|create|choose|adopt|deploy)/i;
 
 function normalizeOptionText(text: string): string {
   return text.replace(/\s+/g, " ").trim();
@@ -55,20 +58,32 @@ function rewriteExecutionModeChoice(text: string): string {
 }
 
 const OPTION_FILLER_PREFIX_RE = /^(?:下一步行动计划[:：]?\s*|请稍候[,，]?\s*|接下来(?:我)?(?:将|会)?\s*|我(?:将|会|先|现在|接下来)(?:继续)?\s*|I(?:'ll| will)\s+|Next action plan:?\s*|Please wait[, ]*\s*)/i;
+const ASSISTANT_FIRST_PERSON_TECH_CONFIRM_RE = /^我来(确认.+(?:是否|能否|能不能|有没有|是否能|是否可以|成功|正确|读取|存入|计算|渲染|解析|Store|store|CSV|csv|代码|文件|接口|组件|函数|状态|数据).*)$/;
+const ASSISTANT_FIRST_PERSON_ACTION_RE = /^我来((?:检查|分析|读取|查看|定位|排查|验证).+)$/;
 
-function normalizeReplyOptionLabel(text: string): string {
+function rewriteAssistantFirstPersonAction(text: string): string {
+  const normalized = normalizeOptionText(text);
+  if (!normalized) return "";
+  const actionMatch = normalized.match(ASSISTANT_FIRST_PERSON_ACTION_RE);
+  if (actionMatch?.[1]) return `请${normalizeOptionText(actionMatch[1])}`;
+  const confirmMatch = normalized.match(ASSISTANT_FIRST_PERSON_TECH_CONFIRM_RE);
+  if (confirmMatch?.[1]) return `请${normalizeOptionText(confirmMatch[1])}`;
+  return normalized;
+}
+
+export function normalizeReplyOptionLabel(text: string): string {
   const cleaned = rewriteExecutionModeChoice(text)
     .replace(OPTION_FILLER_PREFIX_RE, "")
     .replace(/[。.!！？?]+$/, "");
-  const converted = convertAssistantClauseToUserChoice(cleaned);
+  const converted = rewriteAssistantFirstPersonAction(convertAssistantClauseToUserChoice(cleaned));
   return normalizeOptionText(converted.replace(/^请\s*/, ""));
 }
 
-function normalizeReplyOptionValue(text: string): string {
+export function normalizeReplyOptionValue(text: string): string {
   const cleaned = rewriteExecutionModeChoice(text)
     .replace(OPTION_FILLER_PREFIX_RE, "")
     .replace(/^请选择[:：]?\s*/i, "");
-  const converted = normalizeOptionText(convertAssistantClauseToUserChoice(cleaned));
+  const converted = normalizeOptionText(rewriteAssistantFirstPersonAction(convertAssistantClauseToUserChoice(cleaned)));
   if (/^请(?:先|直接|继续|进入|输出|总结|报告|按|使用|切换|选择|讨论|生成|开始|执行)/.test(converted)) {
     return converted.replace(/^请/, "");
   }
@@ -397,6 +412,25 @@ export function hasOnlyReadOnlyPermissionReplyOptions(replyOptions: ReplyOption[
   );
 }
 
+function looksLikePlanContinuationReplyOption(option: ReplyOption): boolean {
+  const combined = normalizeOptionText(`${option.label || ""} ${option.value || ""}`);
+  if (!combined) return false;
+  if (option.action && option.action !== "continue_readonly_once" && option.action !== "allow_readonly_session") return false;
+  if (option.source === "readonly_permission") return true;
+  if (!PLAN_CONTINUATION_ACTION_RE.test(combined)) return false;
+  if (!PLAN_CONTINUATION_TECH_TARGET_RE.test(combined)) return false;
+  if (PLAN_CONTINUATION_DECISION_RE.test(combined)) return false;
+  return true;
+}
+
+export function hasOnlyPlanContinuationReplyOptions(replyOptions: ReplyOption[]): boolean {
+  return (
+    Array.isArray(replyOptions) &&
+    replyOptions.length > 0 &&
+    replyOptions.every((option) => looksLikePlanContinuationReplyOption(option))
+  );
+}
+
 export function shouldAutoContinueReadOnlyPermission(params: {
   replyOptions: ReplyOption[];
   readOnlyAutoApproveForSession: boolean;
@@ -520,16 +554,23 @@ export function shouldPauseForReplyOptions(params: {
   } = params;
 
   if (!Array.isArray(replyOptions) || replyOptions.length === 0) return false;
-  const hasExplicitOrPermissionOption = replyOptions.some((option) =>
+  const hasLengthSafeOption = replyOptions.some((option) =>
     option.source === "explicit_user_options" ||
-    option.source === "readonly_permission" ||
     option.source === "proposal_follow_up" ||
     option.source === "operation_approval" ||
-    option.action === "continue_readonly_once" ||
-    option.action === "allow_readonly_session" ||
     option.action === "approve_operation_once"
   );
-  if (finishReason === "length" && !hasExplicitOrPermissionOption) return false;
+  if (finishReason === "length" && !hasLengthSafeOption) return false;
+  if (
+    workflowMode === "plan" &&
+    !isPlanApproved &&
+    !hasStructuredProposal &&
+    !hasReadyPlanArtifacts &&
+    toolCallCount === 0 &&
+    hasOnlyPlanContinuationReplyOptions(replyOptions)
+  ) {
+    return false;
+  }
   if (forcePause) return true;
   if (toolCallCount > 0 && workflowMode === "edit") return false;
 

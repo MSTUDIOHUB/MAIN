@@ -40,5 +40,27 @@ export default defineConfig(async () => ({
   },
   build: {
     chunkSizeWarningLimit: 5000,
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          const normalizedId = id.replace(/\\/g, "/");
+
+          if (normalizedId.includes("/src/gameStudioPack/")) {
+            return "game-studio-pack";
+          }
+
+          if (normalizedId.includes("/node_modules/@xterm/")) {
+            return "xterm";
+          }
+
+          if (
+            normalizedId.includes("/node_modules/react/") ||
+            normalizedId.includes("/node_modules/react-dom/")
+          ) {
+            return "react-vendor";
+          }
+        },
+      },
+    },
   },
 }));

@@ -59,6 +59,7 @@ function loadTranspiledModuleSync(sourcePath) {
 const {
   createStreamNoVisibleTokenTimeoutError,
   buildPlanExplorationBudget,
+  isReasoningDominatedLengthResult,
   isStreamWatchdogTimeoutMessage,
   shouldAttemptPlanClosureGuard,
   shouldDeferNoProgressStopToPlanReadOnlyConvergence,
@@ -71,6 +72,28 @@ test("classifies no-visible-token stream timeout as a plan watchdog timeout", ()
   assert.equal(error.code, "STREAM_NO_VISIBLE_TOKEN_TIMEOUT");
   assert.match(error.message, /no visible model output/);
   assert.equal(isStreamWatchdogTimeoutMessage(error.message), true);
+});
+
+test("detects reasoning-dominated length results before max output escalation", () => {
+  assert.equal(
+    isReasoningDominatedLengthResult({
+      content: `<thinking>${"需要继续分析。".repeat(500)}</thinking>`,
+      reasoningContent: "需要继续分析。".repeat(500),
+      finishReason: "length",
+      toolCalls: [],
+    }),
+    true,
+  );
+
+  assert.equal(
+    isReasoningDominatedLengthResult({
+      content: `<thinking>${"需要继续分析。".repeat(500)}</thinking>\n## Plan\n${"用户可见方案。".repeat(120)}`,
+      reasoningContent: "需要继续分析。".repeat(500),
+      finishReason: "length",
+      toolCalls: [],
+    }),
+    false,
+  );
 });
 
 test("keeps local pre-approval plan text protocol as notice-only", () => {

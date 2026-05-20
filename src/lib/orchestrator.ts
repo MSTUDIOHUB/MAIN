@@ -42,6 +42,7 @@ import { hasStructuredPlanProposal } from "./planProposal";
 import {
   buildReadOnlyPermissionContinuationPrompt,
   hasOnlyReadOnlyPermissionReplyOptions,
+  hasOnlyPlanContinuationReplyOptions,
   serializeAssistantReplyForHistory,
   shouldAutoContinueReadOnlyPermission as shouldAutoContinueReadOnlyPermissionState,
   shouldPauseForReplyOptions,
@@ -231,19 +232,19 @@ function buildPlanReadOnlyConvergencePrompt(language: "zh" | "en", batchCount: n
     return [
       "PLAN_READONLY_CONVERGENCE: You have gathered enough read-only context for this planning turn.",
       `Read-only exploration so far: ${batchCount} batch(es), ${toolCount} tool result(s).`,
-      "Stop broad rereading now. In the next response, do exactly one of these:",
-      "1. Condense the evidence into root causes, tradeoffs, and 2-4 `<user_options>` for the user to choose from.",
-      "2. If the direction is clear, create or update `.MAIN/plans/design.md` with a concise reviewable draft, then submit the formal Proposal.",
-      "3. If a blocker remains, name the blocker and the single missing fact needed; do not continue broad file exploration.",
+      "Stop broad rereading now. In the next response, create or update `.MAIN/plans/design.md` with a concise reviewable diagnosis plan, then submit the formal Proposal.",
+      "The draft must include: root cause hypothesis, evidence already read, tradeoffs, affected files, implementation steps, and validation.",
+      "Only use `<user_options>` if there is a real product/design decision the user must make before a plan can be written. Do not offer options that merely ask to continue reading, checking, analyzing, or verifying.",
+      "If a blocker remains, name the blocker and the single missing fact needed; do not continue broad file exploration.",
     ].join("\n");
   }
   return [
     "PLAN_READONLY_CONVERGENCE: 当前规划回合已经收集了足够的只读上下文。",
     `只读探索累计：${batchCount} 批，${toolCount} 个工具结果。`,
-    "下一步不要继续泛读文件。请只做以下其一：",
-    "1. 把已读证据收束成问题归因、方案取舍，并给出 2-4 个面向用户的 `<user_options>`。",
-    "2. 如果方向已经清楚，创建或更新 `.MAIN/plans/design.md` 精简可审批草案，然后提交正式 Proposal。",
-    "3. 如果仍有阻塞，只说明阻塞点和唯一缺失事实；不要继续大范围探索。",
+    "下一步不要继续泛读文件。请创建或更新 `.MAIN/plans/design.md` 精简可审批诊断方案，然后提交正式 Proposal。",
+    "草案必须包含：问题归因假设、已读证据、方案取舍、影响文件、实施步骤和验证方式。",
+    "只有存在真实产品/设计分叉、必须由用户决定后才能写计划时，才允许使用 `<user_options>`；不要给出只是继续读取、检查、分析或验证的选项。",
+    "如果仍有阻塞，只说明阻塞点和唯一缺失事实；不要继续大范围探索。",
   ].join("\n");
 }
 
@@ -275,6 +276,28 @@ function buildPlanReadOnlyConvergencePause(language: "zh" | "en", batchCount: nu
       { label: "再定向探索一次", value: "请再做一次定向只读探索，然后立刻停止并总结方案。", action: "continue_readonly_once" },
     ],
   };
+}
+
+function stripReasoningBlocksForEscalation(text: string): string {
+  return String(text || "")
+    .replace(/<(?:analysis|thought|thinking|reasoning)(?:\s[^>]*)?>[\s\S]*?<\/(?:analysis|thought|thinking|reasoning)>/gi, " ")
+    .replace(/<\/?(?:analysis|thought|thinking|reasoning)(?:\s[^>]*)?>/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+export function isReasoningDominatedLengthResult(
+  result: Pick<StreamResult, "content" | "finishReason" | "reasoningContent" | "toolCalls">,
+): boolean {
+  if (result.finishReason !== "length") return false;
+  if (Array.isArray(result.toolCalls) && result.toolCalls.length > 0) return false;
+
+  const reasoningChars = String(result.reasoningContent || "").trim().length;
+  if (reasoningChars < 1000) return false;
+
+  const visibleChars = stripReasoningBlocksForEscalation(result.content).length;
+  if (visibleChars <= 240) return true;
+  return visibleChars <= 600 && reasoningChars >= visibleChars * 6;
 }
 
 function computeContextForceReason(input: {
@@ -2042,8 +2065,8 @@ function buildApprovedPlanContinuationPrompt(callbacks: OrchestratorCallbacks): 
     approvalChoiceHint +
     (callbacks.getPlanTasks().length > 0
       ? language === "zh"
-        ? "计划已批准，现在进入执行阶段（EXECUTION MODE）。MAIN 已有 runtime 任务清单，TopIsland 会直接显示任务进度；不需要为了第一次源码写入强制创建或读取 `.MAIN/plans/tasks.md`。请按当前任务清单逐项执行，使用 <tool_use> 格式调用工具；只有任务较长、需要跨会话审计或用户明确要求留档时，才先把清单持久化到 tasks.md。不要为了确认 tasks.md 是否存在而读取它；只有它已知存在或你正在同步已有审计文件时，才读取/更新。任何需要 shell 的任务都必须在当前任务清单中保留精确命令并用反引号包裹。页面渲染验证必须使用 Browser/Playwright DOM 或截图证据，不能用 curl/grep/cat 代替；Tauri/人工验证不可自动完成时要暂停说明待用户验证。你可以正常修改项目源码文件，写入路径必须是项目中的正确位置，绝对不要将源码写入 `.MAIN/plans/` 或任何隐藏目录。只有全部任务都有真实文件/命令/交付物/浏览器证据满足，或剩余项明确待用户验证后，才能结束执行；如果 tasks.md 已存在，完成任务后再同步更新对应 checkbox。\n"
-        : "The plan is approved. You are now in EXECUTION MODE. MAIN already has a runtime task list, so TopIsland can show task progress without forcing creation or reads of `.MAIN/plans/tasks.md` before the first source write. Execute the current task list with tool calls; persist the list to tasks.md only when the work is long, cross-session, or explicitly needs an audit file. Do not read tasks.md just to check whether it exists; only read/update it when it is already known to exist or you are syncing an existing audit file. Any task that needs shell work must keep the exact command in the current task list using backticks. Rendered-page validation requires Browser/Playwright DOM or screenshot evidence; do not substitute curl/grep/cat. If Tauri or manual validation cannot be automated, pause and report pending user validation. You may now edit project source files, but write them to the proper project paths and never into `.MAIN/plans/` or hidden folders. Only stop when every task has satisfied real file/command/deliverable/browser evidence, or remaining items are explicitly pending user validation; if tasks.md exists, update the matching checkbox after evidence exists.\n"
+        ? "计划已批准，现在进入执行阶段（EXECUTION MODE）。MAIN 已有 runtime 任务清单，TopIsland 会直接显示任务进度；不需要为了第一次源码写入强制创建或读取 `.MAIN/plans/tasks.md`。请按当前任务清单逐项执行，使用 <tool_use> 格式调用工具；只有任务较长、需要跨会话审计或用户明确要求留档时，才先把清单持久化到 tasks.md。不要为了确认 tasks.md 是否存在而读取它；只有它已知存在或你正在同步已有审计文件时，才读取/更新。任何需要 shell 的任务都必须在当前任务清单中保留精确命令并用反引号包裹。如果某个源码文件已经读过，再读只返回 `FILE_UNCHANGED_STUB`，不要重复读取，必须转向 `replace_in_file`/`write_file`、读取不同目标，或明确暂停说明阻塞。页面渲染验证必须使用 Browser/Playwright DOM 或截图证据，不能用 curl/grep/cat 代替；Tauri/人工验证不可自动完成时要暂停说明待用户验证。你可以正常修改项目源码文件，写入路径必须是项目中的正确位置，绝对不要将源码写入 `.MAIN/plans/` 或任何隐藏目录。只有全部任务都有真实文件/命令/交付物/浏览器证据满足，或剩余项明确待用户验证后，才能结束执行；如果 tasks.md 已存在，完成任务后再同步更新对应 checkbox。\n"
+        : "The plan is approved. You are now in EXECUTION MODE. MAIN already has a runtime task list, so TopIsland can show task progress without forcing creation or reads of `.MAIN/plans/tasks.md` before the first source write. Execute the current task list with tool calls; persist the list to tasks.md only when the work is long, cross-session, or explicitly needs an audit file. Do not read tasks.md just to check whether it exists; only read/update it when it is already known to exist or you are syncing an existing audit file. Any task that needs shell work must keep the exact command in the current task list using backticks. If a source file has already been read and another read only returns `FILE_UNCHANGED_STUB`, do not reread it; switch to `replace_in_file`/`write_file`, inspect a different target, or pause with the exact blocker. Rendered-page validation requires Browser/Playwright DOM or screenshot evidence; do not substitute curl/grep/cat. If Tauri or manual validation cannot be automated, pause and report pending user validation. You may now edit project source files, but write them to the proper project paths and never into `.MAIN/plans/` or hidden folders. Only stop when every task has satisfied real file/command/deliverable/browser evidence, or remaining items are explicitly pending user validation; if tasks.md exists, update the matching checkbox after evidence exists.\n"
       : language === "zh"
       ? "计划已批准，现在进入执行阶段（EXECUTION MODE）。请先基于已批准的 design.md 派生精简 runtime 任务清单；只有任务较长、需要跨会话审计或用户明确要求留档时，才生成 `.MAIN/plans/tasks.md`。不要为了确认 tasks.md 是否存在而读取它。随后按任务逐项执行，使用 <tool_use> 格式调用工具。页面渲染验证必须使用 Browser/Playwright DOM 或截图证据；Tauri/人工验证不可自动完成时要暂停说明待用户验证。你可以正常修改项目源码文件，写入路径必须是项目中的正确位置，绝对不要将源码写入 `.MAIN/plans/` 或任何隐藏目录。只有全部任务都有真实文件/命令/交付物/浏览器证据满足，或剩余项明确待用户验证后，才能结束执行。\n"
       : "The plan is approved. You are now in EXECUTION MODE. First derive a concise runtime task list from the approved design.md; generate `.MAIN/plans/tasks.md` only when the work is long, cross-session, or explicitly needs an audit file. Do not read tasks.md just to check whether it exists. Then execute the tasks one by one using tool calls. Rendered-page validation requires Browser/Playwright DOM or screenshot evidence; if Tauri or manual validation cannot be automated, pause and report pending user validation. You may now edit project source files, but write them to the proper project paths and never into `.MAIN/plans/` or hidden folders. Only stop when every task has satisfied real file/command/deliverable/browser evidence, or remaining items are explicitly pending user validation.\n") +
@@ -2363,7 +2386,8 @@ async function fetchLLMStream(
     }
 
     // Check if the response was truncated and we can escalate
-    if (result.finishReason === "length" && escalationCount < MAX_ESCALATIONS) {
+    const skipReasoningDominatedEscalation = isReasoningDominatedLengthResult(result);
+    if (result.finishReason === "length" && escalationCount < MAX_ESCALATIONS && !skipReasoningDominatedEscalation) {
         const nextMaxTokens = escalateMaxTokens(currentMaxTokens, settings.contextLimit);
       if (nextMaxTokens !== null) {
         escalationCount++;
@@ -2379,6 +2403,14 @@ async function fetchLLMStream(
 
         continue; // Retry with higher max_tokens
       }
+    }
+    if (result.finishReason === "length" && skipReasoningDominatedEscalation && escalationCount < MAX_ESCALATIONS) {
+      logAgentEvent("max_output_escalation_skipped", {
+        reason: "reasoning_dominated_length",
+        contentChars: result.content.length,
+        reasoningChars: String(result.reasoningContent || "").length,
+        toolCalls: result.toolCalls.length,
+      });
     }
 
     const truncated = result.finishReason === "length";
@@ -4239,6 +4271,12 @@ export async function executeAgentLoop(
       callbacks.getGameStudioConfig?.()?.engineVersion ?? "",
       callbacks.getCommandDirective?.()?.kind ?? "none",
       callbacks.getCommandDirective?.()?.action ?? "",
+      config.activeProfile,
+      settings.provider || "",
+      settings.model || "",
+      modelProtocolProfile.providerFamily,
+      modelProtocolProfile.reasoning,
+      modelProtocolProfile.notes.join(","),
       availableToolNameList.join(","),
     ].join("|");
     if (systemPromptKey === appliedSystemPromptKey) return;
@@ -4287,6 +4325,7 @@ export async function executeAgentLoop(
           callbacks.getMessages(),
           compatibilityForcedAtStart,
         ),
+        modelProtocolNotes: modelProtocolProfile.notes,
       },
     );
     const currentMessages = callbacks.getMessages();
@@ -5545,8 +5584,26 @@ export async function executeAgentLoop(
     const suppressReadOnlyPermissionOptionsForToolCalls =
       effectiveToolCalls.length > 0 &&
       hasOnlyReadOnlyPermissionReplyOptions(normalized.replyOptions);
+    const suppressTruncatedReadOnlyPermissionOptions =
+      effectiveToolCalls.length === 0 &&
+      workflowMode === "plan" &&
+      !callbacks.getIsPlanApproved() &&
+      normalized.finishReason === "length" &&
+      hasOnlyReadOnlyPermissionReplyOptions(normalized.replyOptions);
+    const suppressReadOnlyPermissionOptions =
+      autoContinueReadOnlyPermission ||
+      suppressReadOnlyPermissionOptionsForToolCalls ||
+      suppressTruncatedReadOnlyPermissionOptions;
+    const suppressPlanContinuationReplyOptions =
+      effectiveToolCalls.length === 0 &&
+      workflowMode === "plan" &&
+      !callbacks.getIsPlanApproved() &&
+      hasOnlyPlanContinuationReplyOptions(normalized.replyOptions);
+    const suppressNonDecisionReplyOptions =
+      suppressReadOnlyPermissionOptions ||
+      suppressPlanContinuationReplyOptions;
     const sourceVisibleText = normalizedBase.visibleText || normalized.visibleText;
-    const normalizedVisibleTextForUser = autoContinueReadOnlyPermission || suppressReadOnlyPermissionOptionsForToolCalls
+    const normalizedVisibleTextForUser = suppressReadOnlyPermissionOptions
       ? stripReadOnlyPermissionPrompt(normalized.visibleText)
       : normalized.visibleText;
     const finalVisibleText = compactedProseCodeDump
@@ -5554,7 +5611,7 @@ export async function executeAgentLoop(
       : compactedIncompletePlanText
       ? buildPlanFallbackNotice(callbacks.getPreferredLanguage(), sourceVisibleText.length)
       : normalizedVisibleTextForUser;
-    const finalReplyOptions = compactedProseCodeDump || autoContinueReadOnlyPermission || suppressReadOnlyPermissionOptionsForToolCalls
+    const finalReplyOptions = compactedProseCodeDump || suppressNonDecisionReplyOptions
       ? []
       : normalized.replyOptions;
     let recoveredPseudoToolCall = false;
@@ -5605,6 +5662,26 @@ export async function executeAgentLoop(
         iteration,
         toolCalls: effectiveToolCalls.length,
         replyOptions: normalized.replyOptions.length,
+        workflowMode,
+        turnIntent,
+      });
+    }
+    if (suppressTruncatedReadOnlyPermissionOptions) {
+      logAgentEvent("truncated_readonly_permission_options_ignored", {
+        iteration,
+        replyOptions: normalized.replyOptions.length,
+        hiddenThoughtChars: normalized.hiddenThought.length,
+        visibleChars: normalized.visibleText.length,
+        workflowMode,
+        turnIntent,
+      });
+    }
+    if (suppressPlanContinuationReplyOptions) {
+      logAgentEvent("plan_continuation_reply_options_ignored", {
+        iteration,
+        replyOptions: normalized.replyOptions.length,
+        optionPreview: summarizeReplyOptionsForLog(normalized.replyOptions),
+        visibleChars: normalized.visibleText.length,
         workflowMode,
         turnIntent,
       });
@@ -5874,11 +5951,12 @@ export async function executeAgentLoop(
       callbacks.onThought(normalized.hiddenThought);
     }
 
+    const shouldRenderToolProgress = effectiveToolCalls.length > 0 && finalReplyOptions.length === 0;
     if (!shouldSuppressApprovedPlanNoToolText && (visibleAssistantText || finalReplyOptions.length > 0)) {
       callbacks.onAssistantFinalText(visibleAssistantText, finalReplyOptions, {
         hasToolCalls: effectiveToolCalls.length > 0,
-        visibility: effectiveToolCalls.length > 0 ? "user_progress" : undefined,
-        progress: effectiveToolCalls.length > 0
+        visibility: shouldRenderToolProgress ? "user_progress" : undefined,
+        progress: shouldRenderToolProgress
           ? toolActionNarration || undefined
           : undefined,
         hiddenThought: normalized.hiddenThought,
@@ -6601,8 +6679,8 @@ export async function executeAgentLoop(
                 : (approvedPlanMissingTasks
                     ? buildApprovedPlanContinuationPrompt(callbacks) + "\n\n"
                     : language === "zh"
-                    ? `${rejectedCompletionClaim ? "你刚才的完成声明没有通过可信证据审计；不要再输出完成总结，先继续真实执行。\n" : ""}继续执行当前任务清单中证据未满足的任务。不要重复计划说明，直接根据当前进度继续实现下一个任务；如果需要修改文件，继续使用工具调用。凡是任务里带有 shell 命令的，一次性命令优先用 run_command 并检查 exitCode/stdout/stderr；长驻或交互式命令用 execute_command 后再用 read_pty_since/read_pty_tail/get_pty_status 检查结果。完成当前任务后，必须先产生真实文件/命令/验证证据；如果 \`.MAIN/plans/tasks.md\` 已存在，再更新对应 checkbox 为 \`[x]\`。只有所有任务证据满足后才能结束。\n下一批优先任务：\n`
-                    : `${rejectedCompletionClaim ? "Your completion claim did not pass the trusted evidence audit; do not output a final summary yet, continue the real work first.\n" : ""}Continue executing tasks whose evidence is not satisfied in the current task list. Do not restate the plan; just move to the next task based on the current progress. If a task includes shell commands, prefer run_command for finite commands and inspect exitCode/stdout/stderr; use execute_command for long-running or interactive commands, then verify with read_pty_since/read_pty_tail/get_pty_status. After each task, produce real file/command/verification evidence; if \`.MAIN/plans/tasks.md\` exists, update the matching checkbox to \`[x]\`. Only stop when every task has satisfied evidence.\nNext priority tasks:\n`) +
+                    ? `${rejectedCompletionClaim ? "你刚才的完成声明没有通过可信证据审计；不要再输出完成总结，先继续真实执行。\n" : ""}继续执行当前任务清单中证据未满足的任务。不要重复计划说明，直接根据当前进度继续实现下一个任务；如果需要修改文件，继续使用工具调用；如果文件已读且再次读取只返回 \`FILE_UNCHANGED_STUB\`，不要继续重复读取，必须写入/替换、换目标，或明确暂停说明阻塞。凡是任务里带有 shell 命令的，一次性命令优先用 run_command 并检查 exitCode/stdout/stderr；长驻或交互式命令用 execute_command 后再用 read_pty_since/read_pty_tail/get_pty_status 检查结果。完成当前任务后，必须先产生真实文件/命令/验证证据；如果 \`.MAIN/plans/tasks.md\` 已存在，再更新对应 checkbox 为 \`[x]\`。只有所有任务证据满足后才能结束。\n下一批优先任务：\n`
+                    : `${rejectedCompletionClaim ? "Your completion claim did not pass the trusted evidence audit; do not output a final summary yet, continue the real work first.\n" : ""}Continue executing tasks whose evidence is not satisfied in the current task list. Do not restate the plan; just move to the next task based on the current progress. If a file has already been read and another read only returns \`FILE_UNCHANGED_STUB\`, do not keep rereading it: write/patch, choose another target, or pause with the exact blocker. If a task includes shell commands, prefer run_command for finite commands and inspect exitCode/stdout/stderr; use execute_command for long-running or interactive commands, then verify with read_pty_since/read_pty_tail/get_pty_status. After each task, produce real file/command/verification evidence; if \`.MAIN/plans/tasks.md\` exists, update the matching checkbox to \`[x]\`. Only stop when every task has satisfied evidence.\nNext priority tasks:\n`) +
                   remainingText +
                   "\n\n" +
                   buildPlanCommandExecutionHint(approvedPlanTasks, language),

@@ -1292,10 +1292,18 @@ export function extractPlanTasks(markdown: string): PlanTask[] {
 
 const RUNTIME_TASK_ACTION_RE =
   /(?:实现|修改|更新|新增|修复|补齐|调整|接入|生成|输出|执行|运行|验证|测试|检查|落地|implement|update|modify|fix|add|wire|generate|write|run|verify|test|check|validate)/i;
+const RUNTIME_TASK_MUTATION_RE =
+  /(?:实现|修改|更新|新增|修复|补齐|调整|接入|生成|输出|落地|创建|删除|替换|重构|保存|导出|implement|update|modify|fix|add|wire|generate|write|create|delete|replace|refactor|save|export)/i;
+const RUNTIME_TASK_VERIFICATION_RE =
+  /(?:执行|运行|验证|测试|验收|run|verify|test|validate|acceptance)/i;
+const RUNTIME_TASK_READ_ONLY_RE =
+  /(?:读取|查看|检查|确认|定位|分析|排查|梳理|调研|审查|理解|read|inspect|review|analy[sz]e|identify|investigate|check|confirm|understand)/i;
+const RUNTIME_TASK_FILE_ROLE_RE =
+  /(?:负责|用于|包含|当前|现有|可能|根因|原因|问题|错误|不匹配|responsible|handles|contains|current|existing|possible|root cause|finding|issue|mismatch)/i;
 const RUNTIME_TASK_SECTION_RE =
   /(?:执行|实施|任务|步骤|顺序|验证|验收|Execution|Implementation|Tasks|Steps|Order|Validation|Acceptance)/i;
 const RUNTIME_TASK_EXCLUDED_SECTION_RE =
-  /(?:当前状态|状态发现|现状|背景|问题分析|根因|技术栈|整体结构|关键改动|改动点|影响文件|涉及文件|设计思路|总体思路|Current State|Findings|Background|Root Cause|Tech Stack|Architecture|Changes|Files|Design Notes)/i;
+  /(?:当前状态|状态发现|现状|背景|问题分析|根因|技术栈|整体结构|关键改动|改动点|影响文件|涉及文件|数据流|控制流|设计思路|总体思路|Current State|Findings|Background|Root Cause|Tech Stack|Architecture|Changes|Files|Data Flow|Control Flow|Design Notes)/i;
 const RUNTIME_TASK_PLACEHOLDER_RE =
   /(?:使用方式|示例|建议|当前状态|状态发现|项目基于|技术栈|本设计要解决的问题|总体思路|为什么这样拆分|哪些部分保持不变|数据分析类任务|模块\s*\/\s*文件|状态\s*\/\s*数据流|交互\s*\/\s*UX|错误处理\s*\/\s*回退|允许修改的区域|暂不修改的区域|需要哪些测试|REQ-xxx|占位|TBD|TODO|\.\.\.)/i;
 
@@ -1306,6 +1314,32 @@ function stripMarkdownTaskLine(line: string): string {
     .replace(/\*\*/g, "")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function isRuntimeTaskActionableText(text: string): boolean {
+  const normalized = String(text || "");
+  if (!normalized.trim()) return false;
+
+  const commands = extractShellCommandsFromText(normalized);
+  if (commands.length > 0) return true;
+
+  const parsedEvidence = parsePlanTaskEvidenceLabel(normalized).evidence;
+  if (parsedEvidence.some((item) =>
+    item.kind === "cmd" ||
+    item.kind === "deliverable" ||
+    item.kind === "browser_dom" ||
+    item.kind === "browser_screenshot" ||
+    item.kind === "dev_server_url" ||
+    item.kind === "tauri_required" ||
+    item.kind === "manual_user_validation"
+  )) {
+    return true;
+  }
+
+  if (RUNTIME_TASK_MUTATION_RE.test(normalized)) return true;
+  if (RUNTIME_TASK_VERIFICATION_RE.test(normalized)) return true;
+  if (RUNTIME_TASK_READ_ONLY_RE.test(normalized) || RUNTIME_TASK_FILE_ROLE_RE.test(normalized)) return false;
+  return RUNTIME_TASK_ACTION_RE.test(normalized);
 }
 
 function collectRuntimeTaskCandidateLines(content: string): string[] {
@@ -1331,6 +1365,7 @@ function collectRuntimeTaskCandidateLines(content: string): string[] {
     if (text.length < 8 || text.length > 220) continue;
     if (RUNTIME_TASK_PLACEHOLDER_RE.test(text)) continue;
     if (/[:：]\s*$/.test(text)) continue;
+    if (!isRuntimeTaskActionableText(text)) continue;
 
     const hasEvidence = inferPlanTaskEvidence(text, extractShellCommandsFromText(text)).length > 0;
     if (!inUsefulSection && !hasEvidence && !RUNTIME_TASK_ACTION_RE.test(text)) continue;
@@ -1351,7 +1386,13 @@ function stripRuntimeExcludedSections(content: string): string {
       if (!inExcludedSection) kept.push(line);
       continue;
     }
-    if (!inExcludedSection) kept.push(line);
+    if (!inExcludedSection) {
+      if (/^\s*(?:[-*]\s+(?:\[[ xX]\]\s+)?|\d+[.)、:：-]\s+)/.test(line)) {
+        const text = stripMarkdownTaskLine(line);
+        if (text && !isRuntimeTaskActionableText(text)) continue;
+      }
+      kept.push(line);
+    }
   }
   return kept.join("\n");
 }

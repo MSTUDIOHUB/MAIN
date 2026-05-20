@@ -93,7 +93,7 @@ export interface OpenAiResponsesProbeRequestCandidate {
 }
 
 export interface ModelInstructionProfile {
-  provider: "openai" | "anthropic" | "qwen" | "deepseek" | "kimi" | "generic";
+  provider: "openai" | "anthropic" | "qwen" | "deepseek" | "kimi" | "gemma" | "generic";
   visibleLanguage: "follow_user" | "localized";
   reasoning: "native_hidden" | "tagged" | "none";
   toolProtocolPreference: CloudToolProtocol;
@@ -391,6 +391,20 @@ export function getModelInstructionProfile(input: {
       noiseRules: [
         "Treat reasoning_content as hidden thought.",
         "Suppress repeated XML tool tags from visible text.",
+      ],
+    };
+  }
+
+  if (/gemma/.test(haystack)) {
+    return {
+      provider: "gemma",
+      visibleLanguage: "localized",
+      reasoning: "tagged",
+      toolProtocolPreference: "auto",
+      noiseRules: [
+        "Treat `thought`, `thinking`, `reasoning`, and `reasoning_content` fields or labels as hidden thought.",
+        "Do not expose bare `thought:` prefixes in the assistant body.",
+        "If a tool is needed, emit the actual tool call instead of prose saying `I will use read_file`.",
       ],
     };
   }

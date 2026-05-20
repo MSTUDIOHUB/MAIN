@@ -227,6 +227,26 @@ test("tool protocol card uses native contract for native-capable providers", () 
   assert.doesNotMatch(card, /<tool_use>/);
 });
 
+test("tool protocol card adds model normalization notes for Gemma-style thought output", () => {
+  const card = buildToolProtocolCard({
+    activeProfile: "local",
+    provider: "OMLX",
+    model: "gemma-4-26b-a4b-it-8bit",
+    toolProtocol: "auto",
+    nativeToolsEnabled: true,
+    availableToolNames: ["read_file", "replace_in_file"],
+    language: "zh",
+    modelProtocolNotes: [
+      "Treat `thought`, `thinking`, `reasoning`, and `reasoning_content` fields or labels as hidden thought.",
+      "If a tool is needed, emit the actual tool call instead of prose saying `I will use read_file`.",
+    ],
+  });
+
+  assert.match(card, /模型格式归一化/);
+  assert.match(card, /`thought`\/`thinking`\/`reasoning`/);
+  assert.match(card, /actual tool call/);
+});
+
 test("system prompt lists only intent-filtered tools when available names are provided", () => {
   const prompt = buildSystemPrompt(
     [],
@@ -297,6 +317,8 @@ test("system prompt tells the model to stop after emitting user options", () => 
 
   assert.match(prompt, /一旦你输出了 `<user_options>`，本轮就应立即停止并等待用户点击/);
   assert.match(prompt, /不要假装提问后又自己继续往下执行/);
+  assert.match(prompt, /如果选项是让你继续调查、确认、读取、分析或执行，必须写成用户指令口吻/);
+  assert.match(prompt, /不要写成模型自述的“我来确认\/我来检查\/我来分析”/);
 });
 
 test("respond prompt no longer tells the user to switch Chat or Fast or Plan", () => {

@@ -311,6 +311,39 @@ test.beforeEach(async ({ page }) => {
           });
         }
 
+        if (scenario === "plan-operation-approval-reuse") {
+          if (readFileCalls.includes("README.md")) {
+            return JSON.stringify({
+              output_text: "已进入执行模式继续处理，没有再次请求操作审批。",
+            });
+          }
+          if (body.includes("我批准按上面的方案开始真实操作")) {
+            return JSON.stringify({
+              output_text: [
+                "我会复用刚才的方案直接执行验证。",
+                "<tool_use>",
+                "<tool>read_file</tool>",
+                "<parameter name=\"path\">README.md</parameter>",
+                "</tool_use>",
+              ].join("\n"),
+            });
+          }
+          return JSON.stringify({
+            output_text: [
+              "我会先定位 CSV 导入和图表渲染链路，然后执行修复。",
+              "<user_options>",
+              "<option action=\"approve_operation_once\" value=\"我批准按上面的方案开始真实操作，请复用上一轮方案，不要重新规划，直接执行并验证\">批准执行本轮操作</option>",
+              "<option action=\"adjust_plan\" value=\"继续调整上面的方案，暂不执行真实操作\">继续调整方案</option>",
+              "<option action=\"cancel_operation\" value=\"取消上面的执行操作，本轮到此为止\">取消操作</option>",
+              "</user_options>",
+              "<tool_use>",
+              "<tool>read_file</tool>",
+              "<parameter name=\"path\">README.md</parameter>",
+              "</tool_use>",
+            ].join("\n"),
+          });
+        }
+
         if (scenario === "execute-quick-reply-runtime") {
           if (body.includes("直接执行部署脚本 deploy.sh")) {
             return JSON.stringify({
@@ -812,6 +845,7 @@ test("reply options pause before mixed XML tool calls and continue from the sour
         return {
           status: snapshot?.currentTurnStatus,
           optionBlockCount: snapshot?.optionBlockCount,
+          progressBlockCount: snapshot?.progressBlockCount,
           readFileCalls: probe?.readFileCalls?.length ?? -1,
         };
       }),
@@ -819,6 +853,7 @@ test("reply options pause before mixed XML tool calls and continue from the sour
     .toEqual({
       status: "awaiting_input",
       optionBlockCount: 1,
+      progressBlockCount: 0,
       readFileCalls: 0,
     });
 
@@ -847,6 +882,75 @@ test("reply options pause before mixed XML tool calls and continue from the sour
       archivedOptionCount: 1,
       selectedOptions: ["请采用保守方案继续"],
       readFileCalls: 0,
+    });
+});
+
+test("operation approval from a plan choice upgrades the reused turn to execute once", async ({ page }) => {
+  await page.goto("/?e2eScenario=plan-operation-approval-reuse");
+
+  const sent = await page.evaluate(() =>
+    (window as any).__CODELY_E2E__?.sendCloudMessage?.("请修复 CSV 导入后图表不显示。"),
+  );
+  expect(sent).toBe(true);
+
+  await expect(page.getByTestId("top-island-awaiting-choice")).toBeVisible();
+  await expect(page.getByTestId("top-island-reply-option-0")).toContainText("批准执行本轮操作");
+
+  await expect
+    .poll(async () =>
+      page.evaluate(() => {
+        const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+        const probe = (window as any).__CLOUD_TOOL_PROTOCOL_TEST__;
+        return {
+          status: snapshot?.currentTurnStatus,
+          currentTurnIntent: snapshot?.currentTurnIntent,
+          optionBlockCount: snapshot?.optionBlockCount,
+          readFileCalls: probe?.readFileCalls?.length ?? -1,
+        };
+      }),
+    )
+    .toEqual({
+      status: "awaiting_input",
+      currentTurnIntent: "plan",
+      optionBlockCount: 1,
+      readFileCalls: 0,
+    });
+
+  await page.getByTestId("top-island-reply-option-0").click();
+
+  await expect
+    .poll(async () =>
+      page.evaluate(() => {
+        const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+        const probe = (window as any).__CLOUD_TOOL_PROTOCOL_TEST__;
+        const executionRequest = [...(probe?.requests || [])]
+          .reverse()
+          .find((request: any) =>
+            request.hasTools &&
+            String(request.body || "").includes("[TURN INTENT: EXECUTE]") &&
+            String(request.body || "").includes("我批准按上面的方案开始真实操作")
+          );
+        const parsed = executionRequest ? JSON.parse(executionRequest.body || "{}") : null;
+        const toolNames = (parsed?.tools || []).map((tool: any) => tool?.name || tool?.function?.name).filter(Boolean);
+        return {
+          currentTurnIntent: snapshot?.currentTurnIntent,
+          turns: snapshot?.conversationTurns,
+          archivedOptionCount: snapshot?.archivedOptionCount,
+          optionBlockCount: snapshot?.optionBlockCount,
+          selectedOptions: snapshot?.selectedOptions,
+          readFileCalls: probe?.readFileCalls ?? [],
+          executionRequestHasReadTool: toolNames.includes("read_file"),
+        };
+      }),
+    )
+    .toEqual({
+      currentTurnIntent: "execute",
+      turns: 1,
+      archivedOptionCount: 1,
+      optionBlockCount: 0,
+      selectedOptions: ["我批准按上面的方案开始真实操作，请复用上一轮方案，不要重新规划，直接执行并验证"],
+      readFileCalls: ["README.md"],
+      executionRequestHasReadTool: true,
     });
 });
 

@@ -159,6 +159,22 @@ test("normalization keeps ordinary process narration visible", () => {
   assert.equal(normalized.hiddenThought, "");
 });
 
+test("normalization hides Gemma-style bare thought prelude", () => {
+  const normalized = normalizeAssistantTurn({
+    content: [
+      "thought 由于之前的 replace_in_file 失败（search_text 不匹配），我需要重新精确获取 filteredOrders 的源代码内容。",
+      "",
+      "我将通过 read_file 读取 src/store/dashboardStore.ts 的第 100 到 160 行，以获取准确的 get filteredOrders() 实现。",
+    ].join("\n"),
+    toolCalls: [],
+    finishReason: "stop",
+  });
+
+  assert.doesNotMatch(normalized.visibleText, /^thought\b/i);
+  assert.match(normalized.visibleText, /我将通过 read_file 读取/);
+  assert.match(normalized.hiddenThought, /replace_in_file 失败/);
+});
+
 test("normalization hides leaked reasoning after a user-choice section", () => {
   const normalized = normalizeAssistantTurn({
     content: [
@@ -276,6 +292,35 @@ test("normalization ignores text tool_call user_options instead of executing it"
   );
   assert.doesNotMatch(normalized.visibleText, /tool_call/);
   assert.equal(normalized.hasExplicitUserChoiceRequest, true);
+});
+
+test("normalization rewrites native user_options model-self actions", () => {
+  const normalized = normalizeAssistantTurn({
+    content: "我需要你确认下一步排查方向。",
+    toolCalls: [
+      {
+        index: 0,
+        id: "call_user_options",
+        name: "user_options",
+        arguments: JSON.stringify({
+          options: [
+            "我来确认数据是否成功存入 Store",
+            { label: "我来确认数据是否能从 Store 正确读取并完成计算", value: "我来确认数据是否能从 Store 正确读取并完成计算" },
+          ],
+        }),
+      },
+    ],
+    finishReason: "tool_calls",
+  });
+
+  assert.deepEqual(
+    normalized.replyOptions.map((option) => option.label),
+    ["确认数据是否成功存入 Store", "确认数据是否能从 Store 正确读取并完成计算"],
+  );
+  assert.deepEqual(
+    normalized.replyOptions.map((option) => option.value),
+    ["请确认数据是否成功存入 Store", "请确认数据是否能从 Store 正确读取并完成计算"],
+  );
 });
 
 test("normalization marks explicit <user_options> tags even when tool calls coexist", () => {
