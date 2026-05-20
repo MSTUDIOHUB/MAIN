@@ -5143,7 +5143,7 @@ fn build_gemini_oauth_url(
         .append_pair("redirect_uri", redirect_uri)
         .append_pair(
             "scope",
-            "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile",
+            "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/generative-language https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile",
         )
         .append_pair("access_type", "offline")
         .append_pair("prompt", "consent")
@@ -6076,7 +6076,9 @@ async fn prepare_cloud_auth_request(
         );
     } else if mode == "gemini_google_oauth" {
         let mut token = token;
-        if token.project_id.is_none()
+        let is_native_gemini = next_url.contains("generativelanguage.googleapis.com") || !next_url.contains("cloudcode-pa.googleapis.com");
+        if !is_native_gemini
+            && token.project_id.is_none()
             && std::env::var("GOOGLE_CLOUD_PROJECT").ok().is_none()
             && std::env::var("GOOGLE_CLOUD_PROJECT_ID").ok().is_none()
         {
@@ -6098,15 +6100,19 @@ async fn prepare_cloud_auth_request(
             "Authorization".to_string(),
             format!("Bearer {}", token.access_token),
         );
-        next_url = GEMINI_CODE_ASSIST_ENDPOINT.to_string();
-        let project_id = std::env::var("GOOGLE_CLOUD_PROJECT")
-            .ok()
-            .or_else(|| std::env::var("GOOGLE_CLOUD_PROJECT_ID").ok())
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .or_else(|| token.project_id.clone());
-        if let Some(project_id) = project_id {
-            next_body = Some(project_id);
+        if is_native_gemini {
+            // Keep the original standard/native Gemini URL and pass the request body unchanged.
+        } else {
+            next_url = GEMINI_CODE_ASSIST_ENDPOINT.to_string();
+            let project_id = std::env::var("GOOGLE_CLOUD_PROJECT")
+                .ok()
+                .or_else(|| std::env::var("GOOGLE_CLOUD_PROJECT_ID").ok())
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .or_else(|| token.project_id.clone());
+            if let Some(project_id) = project_id {
+                next_body = Some(project_id);
+            }
         }
     }
 

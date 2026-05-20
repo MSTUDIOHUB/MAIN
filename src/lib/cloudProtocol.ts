@@ -1150,7 +1150,8 @@ export function buildGeminiCodeAssistRequestBody(options: BuildGeminiRequestOpti
 }
 
 export function buildGeminiGenerateContentUrl(endpoint: string, model: string, stream = false): string {
-  const base = buildCloudMessagesApiUrl(endpoint, "gemini");
+  const effectiveEndpoint = endpoint.trim() || "https://generativelanguage.googleapis.com";
+  const base = buildCloudMessagesApiUrl(effectiveEndpoint, "gemini");
   const cleanModel = model.replace(/^models\//, "").trim();
   const action = stream ? "streamGenerateContent" : "generateContent";
   return `${base}/models/${encodeURIComponent(cleanModel)}:${action}`;
@@ -1161,7 +1162,10 @@ export function buildGeminiRequestForAuthMode(
   options: BuildGeminiRequestOptions,
   authMode?: CloudAuthMode,
 ): { url: string; body: Record<string, unknown>; responseMode: "native" | "code_assist" } {
-  if (normalizeCloudAuthMode(authMode) === "gemini_google_oauth") {
+  const isCodeAssist =
+    normalizeCloudAuthMode(authMode) === "gemini_google_oauth" &&
+    (Boolean(options.projectId) || (!options.model.startsWith("gemini-") && !options.model.startsWith("models/gemini-")));
+  if (isCodeAssist) {
     return {
       url: GEMINI_CODE_ASSIST_ENDPOINT,
       body: buildGeminiCodeAssistRequestBody(options),

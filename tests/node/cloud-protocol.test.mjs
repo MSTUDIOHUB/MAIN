@@ -508,6 +508,16 @@ test("gemini helpers build native generateContent requests and extract text", ()
   assert.equal(oauthRequest.body.request.generationConfig.maxOutputTokens, 64);
   assert.equal(oauthRequest.body.request.generationConfig.temperature, undefined);
   assert.equal(oauthRequest.body.request.generationConfig.topP, undefined);
+
+  // New standard Gemini under OAuth test
+  const standardOauthRequest = buildGeminiRequestForAuthMode("", {
+    messages: [{ role: "user", content: "Say ok" }],
+    model: "models/gemini-2.5-pro",
+    maxTokens: 64,
+  }, "gemini_google_oauth");
+  assert.equal(standardOauthRequest.url, "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent");
+  assert.equal(standardOauthRequest.responseMode, "native");
+  assert.equal(standardOauthRequest.body.contents[0].parts[0].text, "Say ok");
 });
 
 test("cloud headers support Gemini API key and OAuth bearer modes", () => {
