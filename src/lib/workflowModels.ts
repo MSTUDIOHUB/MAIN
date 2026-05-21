@@ -254,6 +254,10 @@ export interface PlanExecutionProgressSnapshot {
   currentTool: string;
   latestEvidence: string;
   nextStep: string;
+  progressSignature?: string;
+  repeatedTargets?: string[];
+  lastEffectiveEvidenceAt?: number;
+  recoveryReason?: string;
   iteration: number;
   maxIterations: number;
   autoResumeCount: number;

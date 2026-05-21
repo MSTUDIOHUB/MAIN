@@ -67,6 +67,74 @@ function summarizeToolActivity(activity: PlanToolActivitySummary): string {
   return compactLine(`${activity.status}:${activity.name}${target}${detail}`);
 }
 
+function isCachedReadOnlyActivity(activity: PlanToolActivitySummary): boolean {
+  return /FILE_UNCHANGED_STUB|Repeated read-only tool call skipped/i.test(activity.detail || "");
+}
+
+function summarizeRepeatedTargets(activity: PlanToolActivitySummary[], limit = 4): string[] {
+  const counts = new Map<string, number>();
+  for (const item of activity) {
+    const key = normalizeMatchText(item.target || "");
+    if (!key) continue;
+    counts.set(key, (counts.get(key) || 0) + (isCachedReadOnlyActivity(item) ? 2 : 1));
+  }
+  return [...counts.entries()]
+    .filter(([, count]) => count >= 2)
+    .sort((a, b) => b[1] - a[1])
+    .map(([target]) => target)
+    .slice(0, limit);
+}
+
+export function buildPlanProgressSignatureFromToolActivity(
+  activity: PlanToolActivitySummary[],
+): string {
+  return activity
+    .slice(-6)
+    .map((item) => {
+      const cached = isCachedReadOnlyActivity(item) ? "cached" : "fresh";
+      return `${item.name}:${normalizeMatchText(item.target || "")}:${item.status}:${cached}`;
+    })
+    .join("|");
+}
+
+export function buildPlanNoProgressLoopPauseNotice(input: {
+  language: "zh" | "en";
+  repeats: number;
+  remainingTask?: string;
+  evidenceLedger: PlanExecutionEvidenceEntry[];
+  recentToolActivity: PlanToolActivitySummary[];
+  repeatedTargets?: string[];
+}): string {
+  const repeatedTargets = (input.repeatedTargets && input.repeatedTargets.length > 0)
+    ? input.repeatedTargets
+    : summarizeRepeatedTargets(input.recentToolActivity);
+  const evidence = summarizePlanExecutionEvidence(input.evidenceLedger, 4);
+  const recent = input.recentToolActivity.slice(-4).map(summarizeToolActivity);
+  const remainingTask = compactLine(input.remainingTask || (input.language === "zh" ? "继续未满足证据的任务" : "continue the task whose evidence is still missing"));
+
+  if (input.language === "zh") {
+    return [
+      "执行已暂停：连续重复探索，没有产生新的可用证据。",
+      `重复轮数：${input.repeats}`,
+      `重复目标：${repeatedTargets.length > 0 ? repeatedTargets.join("、") : "未定位到单一目标"}`,
+      `已确认的证据：${evidence.length > 0 ? evidence.join("；") : "暂无可用项目证据"}`,
+      `最近工具：${recent.length > 0 ? recent.join("；") : "暂无"}`,
+      `缺失证据：${remainingTask}`,
+      "建议恢复动作：不要继续读取同一文件；改为写入/替换、读取不同目标、运行命令验证、执行 Browser/Playwright 验证，或明确说明真实阻塞原因。",
+    ].join("\n");
+  }
+
+  return [
+    "Execution paused: repeated exploration did not produce new usable evidence.",
+    `Repeated batches: ${input.repeats}`,
+    `Repeated targets: ${repeatedTargets.length > 0 ? repeatedTargets.join(", ") : "no single target identified"}`,
+    `Confirmed evidence: ${evidence.length > 0 ? evidence.join("; ") : "no project evidence yet"}`,
+    `Recent tools: ${recent.length > 0 ? recent.join("; ") : "none"}`,
+    `Missing evidence: ${remainingTask}`,
+    "Suggested recovery: do not keep reading the same file; switch to patching, inspect a different target, run command validation, use Browser/Playwright validation, or state the concrete blocker.",
+  ].join("\n");
+}
+
 function normalizeMatchText(value: string): string {
   return String(value || "")
     .replace(/\\/g, "/")
@@ -216,14 +284,18 @@ function getPlanProgressStatusText(phase: PlanExecutionProgressPhase, language: 
     if (phase === "paused") return "计划已暂停，等待继续执行";
     if (phase === "completed") return "计划执行已完成";
     if (phase === "tool_error") return "计划执行遇到工具错误";
-    return "计划继续执行中";
+    if (phase === "tool_start") return "正在执行工具";
+    if (phase === "tool_done") return "工具结果已记录";
+    return "执行状态已更新";
   }
 
   if (phase === "auto_resume") return "Plan auto-resume in progress";
   if (phase === "paused") return "Plan paused, waiting to continue";
   if (phase === "completed") return "Plan execution completed";
   if (phase === "tool_error") return "Plan execution hit a tool error";
-  return "Plan execution continuing";
+  if (phase === "tool_start") return "Tool is running";
+  if (phase === "tool_done") return "Tool result recorded";
+  return "Execution status updated";
 }
 
 function getPlanProgressNextStep(
@@ -276,6 +348,10 @@ export function buildPlanExecutionProgressUpdate(input: {
   currentTool?: string;
   latestEvidence?: string;
   nextStep?: string;
+  progressSignature?: string;
+  repeatedTargets?: string[];
+  lastEffectiveEvidenceAt?: number;
+  recoveryReason?: string;
 }): PlanExecutionProgressUpdate {
   const audit = buildPlanTaskEvidenceAudit({
     tasks: input.tasks,
@@ -308,6 +384,12 @@ export function buildPlanExecutionProgressUpdate(input: {
     currentTool: compactLine(input.currentTool || recentTool || (input.language === "zh" ? "暂无工具调用" : "no tool call yet")),
     latestEvidence: compactLine(input.latestEvidence || recentEvidence || (input.language === "zh" ? "暂无项目源码证据" : "no project-source evidence yet")),
     nextStep: compactLine(input.nextStep || getPlanProgressNextStep(input.phase, remainingTask, input.language)),
+    ...(input.progressSignature ? { progressSignature: compactLine(input.progressSignature, 220) } : {}),
+    ...(input.repeatedTargets && input.repeatedTargets.length > 0
+      ? { repeatedTargets: input.repeatedTargets.map((target) => compactLine(target, 100)).filter(Boolean).slice(0, 8) }
+      : {}),
+    ...(input.lastEffectiveEvidenceAt ? { lastEffectiveEvidenceAt: Math.max(0, Number(input.lastEffectiveEvidenceAt) || 0) } : {}),
+    ...(input.recoveryReason ? { recoveryReason: compactLine(input.recoveryReason, 160) } : {}),
     iteration: Math.max(0, Number(input.iterationCount) || 0),
     maxIterations: Math.max(0, Number(input.maxIterations) || 0),
     autoResumeCount: Math.max(0, Number(input.autoResumeCount) || 0),
@@ -328,6 +410,13 @@ export function normalizePlanExecutionProgressSnapshot(input: {
     currentTool: compactLine(input.update.currentTool || previous?.currentTool || ""),
     latestEvidence: compactLine(input.update.latestEvidence || previous?.latestEvidence || ""),
     nextStep: compactLine(input.update.nextStep || previous?.nextStep || ""),
+    progressSignature: compactLine(input.update.progressSignature || previous?.progressSignature || "", 220) || undefined,
+    repeatedTargets: (input.update.repeatedTargets || previous?.repeatedTargets || [])
+      .map((target) => compactLine(target, 100))
+      .filter(Boolean)
+      .slice(0, 8),
+    lastEffectiveEvidenceAt: Math.max(0, Number(input.update.lastEffectiveEvidenceAt ?? previous?.lastEffectiveEvidenceAt) || 0) || undefined,
+    recoveryReason: compactLine(input.update.recoveryReason || previous?.recoveryReason || "", 160) || undefined,
     iteration: Math.max(0, Number(input.update.iteration ?? previous?.iteration) || 0),
     maxIterations: Math.max(0, Number(input.update.maxIterations ?? previous?.maxIterations) || 0),
     autoResumeCount: Math.max(0, Number(input.update.autoResumeCount ?? previous?.autoResumeCount) || 0),

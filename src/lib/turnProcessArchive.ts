@@ -25,9 +25,53 @@ export interface TurnArchiveStep {
   phase?: TurnRuntimePhase;
   targets: string[];
   items: any[];
+  activity?: ActivityCell;
   expandedByDefault: boolean;
   sourceIndex: number;
   sourceEndIndex: number;
+}
+
+export type ActivityCellKind =
+  | "exploring"
+  | "edit"
+  | "command"
+  | "browser"
+  | "plan"
+  | "approval"
+  | "blocked"
+  | "message"
+  | "thinking";
+
+export interface ActivityMetrics {
+  tools: number;
+  filesRead: number;
+  directoriesListed: number;
+  searches: number;
+  outlinesRead: number;
+  documentsRead: number;
+  tablesAnalyzed: number;
+  filesCreated: number;
+  filesEdited: number;
+  commandsRun: number;
+  browserValidations: number;
+  terminalReads: number;
+  blocked: number;
+  failed: number;
+  cached: number;
+}
+
+export interface ActivityCell {
+  kind: ActivityCellKind;
+  status: TurnArchiveStepStatus;
+  purposeKey: string;
+  label: string;
+  title: string;
+  summary: string;
+  targets: string[];
+  metrics: ActivityMetrics;
+  items: any[];
+  latestEvidence: string;
+  recoveryHint: string;
 }
 
 export interface TurnProcessArchiveCounts {
@@ -306,6 +350,346 @@ function makeTargetSummary(targets: string[], language: ToolPresentationLanguage
 
 function countToolItems(step: Pick<TurnArchiveStep, "items">): number {
   return step.items.filter(isToolBlock).length;
+}
+
+function emptyActivityMetrics(): ActivityMetrics {
+  return {
+    tools: 0,
+    filesRead: 0,
+    directoriesListed: 0,
+    searches: 0,
+    outlinesRead: 0,
+    documentsRead: 0,
+    tablesAnalyzed: 0,
+    filesCreated: 0,
+    filesEdited: 0,
+    commandsRun: 0,
+    browserValidations: 0,
+    terminalReads: 0,
+    blocked: 0,
+    failed: 0,
+    cached: 0,
+  };
+}
+
+const EXPLORING_TOOL_NAMES = new Set([
+  "get_project_skeleton",
+  "list_directory",
+  "glob_search",
+  "grep_search",
+  "read_file",
+  "read_document",
+  "analyze_tabular_document",
+  "query_tabular_document",
+  "index_workspace_documents",
+  "get_file_outline",
+]);
+
+const TERMINAL_READ_TOOL_NAMES = new Set([
+  "read_pty_buffer",
+  "read_pty_tail",
+  "read_pty_since",
+  "get_pty_status",
+  "clear_pty_buffer",
+]);
+
+function isExploringToolName(toolName: string): boolean {
+  return EXPLORING_TOOL_NAMES.has(toolName);
+}
+
+function isActivityCachedResult(block: any): boolean {
+  const text = [
+    block?.message,
+    block?.observationSummary,
+    block?.evidence,
+    block?.resultPreview,
+    block?.content,
+  ].map((value) => String(value || "")).join("\n");
+  return /FILE_UNCHANGED_STUB|Repeated read-only tool call skipped/i.test(text);
+}
+
+function classifyToolActivityKind(toolName: string, status: TurnArchiveStepStatus): ActivityCellKind {
+  if (status === "failed" || status === "rejected") {
+    return isExploringToolName(toolName) ? "exploring" : "blocked";
+  }
+  if (isExploringToolName(toolName)) return "exploring";
+  if (toolName === "browser_evaluate") return "browser";
+  if (toolName === "replace_in_file" || toolName === "write_file") return "edit";
+  if (toolName === "execute_command" || toolName === "run_command" || toolName === "send_pty_input" || TERMINAL_READ_TOOL_NAMES.has(toolName)) {
+    return "command";
+  }
+  return "message";
+}
+
+function classifyBlockActivityKind(block: any): ActivityCellKind {
+  if (isToolBlock(block)) {
+    const status = mapToolStatus(block);
+    return classifyToolActivityKind(String(block.toolName || ""), status);
+  }
+  if (isProgressBlock(block)) {
+    const toolName = String(block.toolName || "");
+    if (toolName) return classifyToolActivityKind(toolName, mapProgressStatus(block));
+    const phase = String(block.phase || "");
+    if (phase === "editing") return "edit";
+    if (phase === "verifying") return "command";
+    if (phase === "blocked") return "blocked";
+    return phase === "investigating" ? "exploring" : "message";
+  }
+  if (block?.type === "thought") return "thinking";
+  if (block?.type === "system") {
+    const variant = String(block.variant || "");
+    if (variant === "plan_execution_checkpoint" || variant === "execution_checkpoint") return "blocked";
+    if (variant === "plan_quality_gate") return "plan";
+    if (variant === "plan_execution_progress") return "message";
+  }
+  if (block?.type === "agent") {
+    const content = String(block.content || "");
+    if (/\[PROPOSAL START\]|#\s*Proposed Plan|<proposed_plan>|<plan[\s>]/i.test(content)) return "plan";
+    if (Array.isArray(block.options) && block.options.length > 0) return "approval";
+  }
+  return "message";
+}
+
+function addActivityMetricsFromBlock(metrics: ActivityMetrics, block: any): void {
+  if (!isToolBlock(block)) return;
+  const toolName = String(block.toolName || "");
+  metrics.tools += 1;
+  const status = mapToolStatus(block);
+  if (status === "failed") metrics.failed += 1;
+  if (status === "rejected" || status === "failed" || getToolStepKind(block) === "blocked") metrics.blocked += 1;
+  if (isActivityCachedResult(block)) metrics.cached += 1;
+
+  if (toolName === "read_file") metrics.filesRead += 1;
+  else if (toolName === "read_document") metrics.documentsRead += 1;
+  else if (toolName === "get_file_outline") metrics.outlinesRead += 1;
+  else if (toolName === "list_directory" || toolName === "get_project_skeleton" || toolName === "index_workspace_documents") metrics.directoriesListed += 1;
+  else if (toolName === "glob_search" || toolName === "grep_search") metrics.searches += 1;
+  else if (toolName === "analyze_tabular_document" || toolName === "query_tabular_document") metrics.tablesAnalyzed += 1;
+  else if (toolName === "browser_evaluate") metrics.browserValidations += 1;
+  else if (TERMINAL_READ_TOOL_NAMES.has(toolName)) metrics.terminalReads += 1;
+  else if (toolName === "execute_command" || toolName === "run_command" || toolName === "send_pty_input") metrics.commandsRun += 1;
+  else if (toolName === "write_file" || toolName === "replace_in_file") {
+    const diff = block.diff || {};
+    const existed = typeof diff.existed === "boolean" ? diff.existed : String(diff.old || "").length > 0;
+    if (toolName === "write_file" && !existed) metrics.filesCreated += 1;
+    else metrics.filesEdited += 1;
+  }
+}
+
+function addActivityMetrics(left: ActivityMetrics, right: ActivityMetrics): ActivityMetrics {
+  const next = emptyActivityMetrics();
+  for (const key of Object.keys(next) as Array<keyof ActivityMetrics>) {
+    next[key] = (left[key] || 0) + (right[key] || 0);
+  }
+  return next;
+}
+
+function mergeActivityStatus(left: TurnArchiveStepStatus, right: TurnArchiveStepStatus): TurnArchiveStepStatus {
+  if (left === "failed" || right === "failed") return "failed";
+  if (left === "rejected" || right === "rejected") return "rejected";
+  if (left === "running" || right === "running") return "running";
+  return "done";
+}
+
+function activityPurposeKey(kind: ActivityCellKind, block: any, language: ToolPresentationLanguage): string {
+  if (kind === "exploring") return "exploring";
+  if (kind === "browser") return "browser";
+  if (kind === "edit") return "edit";
+  if (kind === "command") {
+    const phase = normalizeTurnRuntimePhase(block?.turnPhase, language);
+    return `command:${phase?.domain || "general"}`;
+  }
+  if (kind === "plan") return "plan";
+  if (kind === "approval") return "approval";
+  if (kind === "blocked") return "blocked";
+  if (kind === "thinking") return "thinking";
+  return "message";
+}
+
+function countText(count: number, zhUnit: string, enSingular: string, enPlural: string, language: ToolPresentationLanguage): string {
+  if (count <= 0) return "";
+  return language === "zh"
+    ? `${count} ${zhUnit}`
+    : `${count} ${count === 1 ? enSingular : enPlural}`;
+}
+
+function makeActivityMetricParts(metrics: ActivityMetrics, language: ToolPresentationLanguage): string[] {
+  const parts: string[] = [];
+  const readCount = metrics.filesRead + metrics.documentsRead + metrics.outlinesRead + metrics.tablesAnalyzed;
+  if (readCount > 0) parts.push(countText(readCount, language === "zh" ? "个文件" : "file", "file", "files", language));
+  if (metrics.directoriesListed > 0) parts.push(countText(metrics.directoriesListed, language === "zh" ? "个目录" : "directory", "directory", "directories", language));
+  if (metrics.searches > 0) parts.push(countText(metrics.searches, language === "zh" ? "次搜索" : "search", "search", "searches", language));
+  if (metrics.filesCreated > 0) parts.push(language === "zh" ? `创建 ${metrics.filesCreated} 个文件` : countText(metrics.filesCreated, "", "created file", "created files", language));
+  if (metrics.filesEdited > 0) parts.push(language === "zh" ? `编辑 ${metrics.filesEdited} 个文件` : countText(metrics.filesEdited, "", "edited file", "edited files", language));
+  if (metrics.commandsRun > 0) parts.push(countText(metrics.commandsRun, language === "zh" ? "条命令" : "command", "command", "commands", language));
+  if (metrics.browserValidations > 0) parts.push(countText(metrics.browserValidations, language === "zh" ? "次浏览器验证" : "browser validation", "browser validation", "browser validations", language));
+  if (metrics.terminalReads > 0) parts.push(countText(metrics.terminalReads, language === "zh" ? "次终端读取" : "terminal read", "terminal read", "terminal reads", language));
+  if (metrics.cached > 0) parts.push(language === "zh" ? `${metrics.cached} 次复用缓存` : `${metrics.cached} cached reuse${metrics.cached === 1 ? "" : "s"}`);
+  return parts.filter(Boolean);
+}
+
+function activityVerb(kind: ActivityCellKind, status: TurnArchiveStepStatus, language: ToolPresentationLanguage): string {
+  const running = status === "running";
+  const failed = status === "failed" || status === "rejected";
+  if (language === "en") {
+    if (kind === "exploring") return failed ? "Exploration blocked" : running ? "Exploring" : "Explored";
+    if (kind === "edit") return failed ? "Edit blocked" : running ? "Editing" : "Edited";
+    if (kind === "browser") return failed ? "Browser validation blocked" : running ? "Validating in browser" : "Validated in browser";
+    if (kind === "command") return failed ? "Command blocked" : running ? "Running command" : "Ran";
+    if (kind === "plan") return running ? "Preparing plan" : "Proposed plan";
+    if (kind === "approval") return "Awaiting approval";
+    if (kind === "blocked") return "Paused";
+    if (kind === "thinking") return "Thinking";
+    return running ? "Working" : "Recorded";
+  }
+  if (kind === "exploring") return failed ? "探索受阻" : running ? "正在探索" : "已探索";
+  if (kind === "edit") return failed ? "编辑受阻" : running ? "正在编辑" : "已编辑";
+  if (kind === "browser") return failed ? "浏览器验证受阻" : running ? "正在浏览器验证" : "已执行浏览器验证";
+  if (kind === "command") return failed ? "命令受阻" : running ? "正在运行命令" : "已运行";
+  if (kind === "plan") return running ? "正在整理计划" : "已生成计划";
+  if (kind === "approval") return "等待审批";
+  if (kind === "blocked") return "已暂停";
+  if (kind === "thinking") return "正在思考";
+  return running ? "正在处理" : "已记录";
+}
+
+function makeActivitySummary(activity: Pick<ActivityCell, "kind" | "targets" | "metrics">, language: ToolPresentationLanguage): string {
+  const metricParts = makeActivityMetricParts(activity.metrics, language);
+  const targetSummary = makeTargetSummary(activity.targets, language);
+  if (activity.kind === "exploring" && targetSummary) {
+    const prefix = language === "zh" ? "目标：" : "Targets: ";
+    return compactLine(`${metricParts.join(language === "zh" ? "，" : ", ")}${metricParts.length ? " · " : ""}${prefix}${targetSummary}`, 220);
+  }
+  if (targetSummary && metricParts.length > 0) return compactLine(`${metricParts.join(language === "zh" ? "，" : ", ")} · ${targetSummary}`, 220);
+  if (metricParts.length > 0) return metricParts.join(language === "zh" ? "，" : ", ");
+  return targetSummary;
+}
+
+function makeActivityTitle(activity: Pick<ActivityCell, "kind" | "status" | "metrics">, language: ToolPresentationLanguage): string {
+  const verb = activityVerb(activity.kind, activity.status, language);
+  const metrics = activity.metrics;
+  if (activity.kind === "exploring") {
+    const count = metrics.filesRead + metrics.documentsRead + metrics.outlinesRead + metrics.tablesAnalyzed + metrics.directoriesListed + metrics.searches;
+    return count > 0 ? `${verb} ${makeActivityMetricParts(metrics, language).join(language === "zh" ? "，" : ", ")}` : verb;
+  }
+  if (activity.kind === "edit") {
+    if (language === "zh") {
+      if (metrics.filesCreated > 0 && metrics.filesEdited > 0) return `已创建 ${metrics.filesCreated} 个文件，已编辑 ${metrics.filesEdited} 个文件`;
+      if (metrics.filesCreated > 0) return `${activity.status === "running" ? "正在创建" : "已创建"} ${metrics.filesCreated} 个文件`;
+      if (metrics.filesEdited > 0) return `${activity.status === "running" ? "正在编辑" : "已编辑"} ${metrics.filesEdited} 个文件`;
+    }
+    const count = metrics.filesCreated + metrics.filesEdited;
+    if (count > 0) return `${verb} ${count} ${count === 1 ? "file" : "files"}`;
+  }
+  if (activity.kind === "command") {
+    const count = metrics.commandsRun + metrics.terminalReads;
+    if (count > 0) return language === "zh"
+      ? `${activity.status === "running" ? "正在运行" : "已运行"} ${count} 条命令/终端操作`
+      : `${verb} ${count} command${count === 1 ? "" : "s"}`;
+  }
+  if (activity.kind === "browser" && metrics.browserValidations > 0) {
+    return language === "zh"
+      ? `${activity.status === "running" ? "正在执行" : "已执行"} ${metrics.browserValidations} 次浏览器验证`
+      : `${verb} ${metrics.browserValidations} browser validation${metrics.browserValidations === 1 ? "" : "s"}`;
+  }
+  return verb;
+}
+
+function buildActivityCellFromItems(
+  items: any[],
+  language: ToolPresentationLanguage,
+  fallbackKind?: TurnArchiveStepKind,
+): ActivityCell {
+  const metrics = emptyActivityMetrics();
+  for (const item of items) addActivityMetricsFromBlock(metrics, item);
+  const firstKind = items.map(classifyBlockActivityKind).find((kind) => kind !== "message") ||
+    (fallbackKind === "thinking" ? "thinking" : fallbackKind === "blocked" ? "blocked" : "message");
+  const status = items.reduce<TurnArchiveStepStatus>((current, item) => {
+    if (isToolBlock(item)) return mergeActivityStatus(current, mapToolStatus(item));
+    if (isProgressBlock(item)) return mergeActivityStatus(current, mapProgressStatus(item));
+    return current;
+  }, "done");
+  const targets = uniqueTargets(items, language);
+  const latestEvidence = compactLine([...items].reverse().map(getBlockResultLine).find(Boolean) || "", 180);
+  const recoveryHint = compactLine(
+    [...items].reverse().map((item) => {
+      if (item?.type === "system" && /暂停|paused|Recovery|重复|no progress/i.test(String(item.content || ""))) return String(item.content || "");
+      return "";
+    }).find(Boolean) || "",
+    220,
+  );
+  const provisional: Pick<ActivityCell, "kind" | "status" | "metrics" | "targets"> = {
+    kind: firstKind,
+    status,
+    metrics,
+    targets,
+  };
+  const summary = makeActivitySummary(provisional, language);
+  return {
+    kind: firstKind,
+    status,
+    purposeKey: activityPurposeKey(firstKind, items.find(isToolBlock) || items[0] || {}, language),
+    label: activityVerb(firstKind, status, language),
+    title: makeActivityTitle(provisional, language),
+    summary,
+    targets,
+    metrics,
+    items,
+    latestEvidence,
+    recoveryHint,
+  };
+}
+
+function mergeActivityCells(left: ActivityCell, right: ActivityCell, language: ToolPresentationLanguage): ActivityCell {
+  const items = [...left.items, ...right.items];
+  const metrics = addActivityMetrics(left.metrics, right.metrics);
+  const targets = uniqueTargets(items, language);
+  const status = mergeActivityStatus(left.status, right.status);
+  const base: Pick<ActivityCell, "kind" | "status" | "metrics" | "targets"> = {
+    kind: left.kind,
+    status,
+    metrics,
+    targets,
+  };
+  return {
+    ...left,
+    status,
+    targets,
+    metrics,
+    items,
+    title: makeActivityTitle(base, language),
+    summary: makeActivitySummary(base, language),
+    latestEvidence: right.latestEvidence || left.latestEvidence,
+    recoveryHint: right.recoveryHint || left.recoveryHint,
+  };
+}
+
+function canMergeActivityCells(current: ActivityCell | null, next: ActivityCell): boolean {
+  if (!current) return false;
+  if (current.kind === "thinking" || next.kind === "thinking") return false;
+  if (current.kind === "message" || next.kind === "message") return false;
+  if (current.kind === "blocked" || next.kind === "blocked") return false;
+  if (current.kind === "exploring" && next.kind === "exploring") return true;
+  if (current.status === "failed" || current.status === "rejected") return false;
+  return current.purposeKey === next.purposeKey && current.kind === next.kind;
+}
+
+export function buildCodexActivityGroups(
+  blocks: any[],
+  language: ToolPresentationLanguage = "zh",
+): ActivityCell[] {
+  const groups: ActivityCell[] = [];
+  for (const block of blocks) {
+    if (!block || block.type === "user") continue;
+    const activity = buildActivityCellFromItems([block], normalizeLanguage(language));
+    const current = groups[groups.length - 1] || null;
+    if (canMergeActivityCells(current, activity)) {
+      groups[groups.length - 1] = mergeActivityCells(current!, activity, normalizeLanguage(language));
+    } else {
+      groups.push(activity);
+    }
+  }
+  return groups;
 }
 
 function defaultIntentForStep(kind: TurnArchiveStepKind, language: ToolPresentationLanguage): string {
@@ -685,11 +1069,12 @@ function mergeStrategySteps(steps: TurnArchiveStep[], language: ToolPresentation
   return result;
 }
 
-const MAX_PHASE_TOOL_ITEMS = 8;
+const MAX_PHASE_TOOL_ITEMS = Number.MAX_SAFE_INTEGER;
 
 function getPhaseKey(step: TurnArchiveStep): string {
   const phase = step.phase;
   if (!phase) return "";
+  if (isContextPhase(step.kind)) return [phase.id, "exploring", "exploring"].join(":");
   return [phase.id, phase.domain || "general", step.kind].join(":");
 }
 
@@ -821,6 +1206,41 @@ function mergePhasedSteps(steps: TurnArchiveStep[], language: ToolPresentationLa
   flushCurrent();
   flushPendingMessages();
   return result;
+}
+
+function attachActivityToStep(step: TurnArchiveStep, language: ToolPresentationLanguage): TurnArchiveStep {
+  return {
+    ...step,
+    activity: buildActivityCellFromItems(step.items, language, step.kind),
+  };
+}
+
+function canMergeCodexActivityStep(current: TurnArchiveStep | null, next: TurnArchiveStep): boolean {
+  if (!current?.activity || !next.activity) return false;
+  if (current.kind === "thinking" || next.kind === "thinking") return false;
+  if (current.kind === "message" || next.kind === "message") return false;
+  if (current.activity.kind === "exploring" && next.activity.kind === "exploring") return true;
+  if (current.status === "failed" || current.status === "rejected") return false;
+  if (next.status === "failed" || next.status === "rejected") return false;
+  return current.activity.kind === next.activity.kind && current.activity.purposeKey === next.activity.purposeKey;
+}
+
+function mergeCodexActivityStep(
+  current: TurnArchiveStep,
+  next: TurnArchiveStep,
+  language: ToolPresentationLanguage,
+): TurnArchiveStep {
+  const items = [...current.items, ...next.items];
+  const status = mergeStepStatus(current.status, next.status);
+  const merged: TurnArchiveStep = {
+    ...current,
+    status,
+    items,
+    targets: uniqueTargets(items, language),
+    expandedByDefault: current.expandedByDefault || next.expandedByDefault,
+    sourceEndIndex: next.sourceEndIndex,
+  };
+  return attachActivityToStep(merged, language);
 }
 
 function makeStep(input: {
@@ -1071,9 +1491,18 @@ function buildModelFromSteps(input: {
     }
     normalizedSteps.push(next);
   }
-  const finalizedSteps = normalizedSteps
-    .map((step) => finalizeStep(step, input.language, sourceBlocks, includeThoughtNotes))
+  const finalizedStepsWithActivity = normalizedSteps
+    .map((step) => attachActivityToStep(finalizeStep(step, input.language, sourceBlocks, includeThoughtNotes), input.language))
     .filter((step) => step.kind !== "message" || !!step.phase || String(step.note || "").trim().length > 0);
+  const finalizedSteps: TurnArchiveStep[] = [];
+  for (const step of finalizedStepsWithActivity) {
+    const current = finalizedSteps[finalizedSteps.length - 1] || null;
+    if (canMergeCodexActivityStep(current, step)) {
+      finalizedSteps[finalizedSteps.length - 1] = mergeCodexActivityStep(current!, step, input.language);
+      continue;
+    }
+    finalizedSteps.push(step);
+  }
   const counts = makeCounts(finalizedSteps);
   const previewTargets: string[] = [];
   for (const step of finalizedSteps) {

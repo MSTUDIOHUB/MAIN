@@ -58,6 +58,8 @@ const {
   buildExecuteMaxIterationsAutoResumeNotice,
   buildExecuteMaxIterationsPauseNotice,
   buildExecuteMaxIterationsResumePrompt,
+  buildPlanNoProgressLoopPauseNotice,
+  buildPlanProgressSignatureFromToolActivity,
   buildPlanExecutionProgressUpdate,
   buildPlanMaxIterationsCheckpoint,
   buildPlanMaxIterationsPauseNotice,
@@ -250,11 +252,58 @@ test("plan execution progress snapshot is structured and ignores internal plan e
   assert.match(snapshot.nextStep, /Add resume guard tests/);
   assert.doesNotMatch(snapshot.latestEvidence, /\.MAIN\/plans/);
   assert.match(text, /Tool done/);
-  assert.match(text, /Plan execution continuing/);
+  assert.match(text, /Tool result recorded/);
   assert.doesNotMatch(text, /Current task:/);
   assert.doesNotMatch(text, /Latest evidence:/);
   assert.doesNotMatch(text, /Current tool:/);
   assert.doesNotMatch(text, /Next:/);
+});
+
+test("no-progress loop notice names repeated target evidence gap and recovery action", () => {
+  const recentToolActivity = [
+    { name: "read_file", target: "src/store/dashboardStore.ts", status: "succeeded", detail: "FILE_UNCHANGED_STUB: src/store/dashboardStore.ts" },
+    { name: "read_file", target: "src/store/dashboardStore.ts", status: "succeeded", detail: "FILE_UNCHANGED_STUB: src/store/dashboardStore.ts" },
+    { name: "read_file", target: "src/store/dashboardStore.ts", status: "succeeded", detail: "FILE_UNCHANGED_STUB: src/store/dashboardStore.ts" },
+  ];
+  const notice = buildPlanNoProgressLoopPauseNotice({
+    language: "zh",
+    repeats: 3,
+    remainingTask: "测试所有页面和组件 [需要浏览器验证]",
+    evidenceLedger,
+    recentToolActivity,
+  });
+  const signature = buildPlanProgressSignatureFromToolActivity(recentToolActivity);
+
+  assert.match(notice, /连续重复探索/);
+  assert.match(notice, /src\/store\/dashboardstore\.ts/i);
+  assert.match(notice, /缺失证据：测试所有页面和组件/);
+  assert.match(notice, /Browser\/Playwright/);
+  assert.match(signature, /cached/);
+});
+
+test("plan progress snapshot carries no-progress recovery metadata", () => {
+  const update = buildPlanExecutionProgressUpdate({
+    language: "zh",
+    phase: "paused",
+    iterationCount: 8,
+    maxIterations: 50,
+    autoResumeCount: 0,
+    tasks,
+    evidenceLedger,
+    recentToolActivity: [{ name: "read_file", target: "src/store/dashboardStore.ts", status: "succeeded", detail: "FILE_UNCHANGED_STUB" }],
+    progressSignature: "read_file:src/store/dashboardStore.ts:succeeded:cached",
+    repeatedTargets: ["src/store/dashboardStore.ts"],
+    recoveryReason: "no_progress_batch_loop",
+  });
+  const snapshot = normalizePlanExecutionProgressSnapshot({
+    turnId: "turn-repeat",
+    update,
+    now: 456,
+  });
+
+  assert.equal(snapshot.recoveryReason, "no_progress_batch_loop");
+  assert.deepEqual(snapshot.repeatedTargets, ["src/store/dashboardStore.ts"]);
+  assert.match(snapshot.progressSignature, /cached/);
 });
 
 test("plan execution progress prefers active tool-matched task over broad first pending task", () => {

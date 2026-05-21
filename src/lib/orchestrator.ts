@@ -144,6 +144,8 @@ import { buildPlanApprovalChoiceHint } from "./planControl";
 import {
   buildPlanExecutionProgressUpdate,
   buildExecuteMaxIterationsPauseNotice,
+  buildPlanNoProgressLoopPauseNotice,
+  buildPlanProgressSignatureFromToolActivity,
   buildPlanMaxIterationsCheckpoint,
   buildPlanMaxIterationsPauseNotice,
   type PlanMaxIterationsCheckpoint,
@@ -788,7 +790,11 @@ export interface OrchestratorCallbacks {
   ) => void;
   onStatusChange: (status: "idle" | "running" | "pending_review" | "error") => void;
   onError: (error: string) => void;
-  onNonActionableStop: (message: string, reason: "no_output" | "no_action" | "missing_tool_loop" | "incomplete_plan") => void;
+  onNonActionableStop: (
+    message: string,
+    reason: "no_output" | "no_action" | "missing_tool_loop" | "incomplete_plan",
+    progress?: Partial<PlanExecutionProgressUpdate>,
+  ) => void;
   onPlanArtifactUpdated: (path: string, content: string, kind: "requirements" | "design" | "tasks" | "bugfix") => void;
   onPlanStageChanged: (stage: "idle" | "requirements" | "design" | "tasks" | "bugfix" | "ready_to_execute" | "executing" | "completed") => void;
   onPlanTasksUpdated: (content: string) => void;
@@ -7696,32 +7702,55 @@ export async function executeAgentLoop(
             ? "先重新核对当前目标与参数，再选择不同策略继续。"
             : "Recheck current targets and parameters, then continue with a different strategy."
         );
+        const language = callbacks.getPreferredLanguage();
+        const repeatedTargets = (() => {
+          const counts = new Map<string, number>();
+          for (const activity of recentPlanToolActivity.slice(-8)) {
+            const target = String(activity.target || "").trim();
+            if (!target) continue;
+            const cachedWeight = /FILE_UNCHANGED_STUB|Repeated read-only tool call skipped/i.test(activity.detail || "") ? 2 : 1;
+            counts.set(target, (counts.get(target) || 0) + cachedWeight);
+          }
+          return [...counts.entries()]
+            .filter(([, count]) => count >= 2)
+            .sort((a, b) => b[1] - a[1])
+            .map(([target]) => target)
+            .slice(0, 4);
+        })();
+        const progressSignature = buildPlanProgressSignatureFromToolActivity(recentPlanToolActivity) || noProgressBatchSignature;
+        const pauseNotice = buildPlanNoProgressLoopPauseNotice({
+          language,
+          repeats: noProgressBatchRepeatCount,
+          remainingTask: remainingText,
+          evidenceLedger: callbacks.getPlanExecutionEvidenceLedger(),
+          recentToolActivity: recentPlanToolActivity,
+          repeatedTargets,
+        });
         logAgentEvent("loop_stop", {
           reason: "no_progress_batch_loop",
           iteration,
           repeats: noProgressBatchRepeatCount,
+          repeatedTargets,
+          progressSignature: truncateForLog(progressSignature, 220),
         });
         emitTaskOrchestratorPhase("PAUSED", {
           reason: "no_progress_batch_loop",
           iteration,
           repeats: noProgressBatchRepeatCount,
           remainingTask: remainingText,
+          repeatedTargets,
         });
         callbacks.onNonActionableStop(
-          callbacks.getPreferredLanguage() === "zh"
-            ? [
-                "执行已暂停：连续多轮工具结果没有实质变化。",
-                "这通常意味着当前策略在原地重复，继续重试只会消耗上下文。",
-                "",
-                `建议下一步：${remainingText}`,
-              ].join("\n")
-            : [
-                "Execution paused: consecutive tool batches showed no material progress.",
-                "This usually means the current strategy is repeating in place and further retries will only consume context.",
-                "",
-                `Suggested next step: ${remainingText}`,
-              ].join("\n"),
+          pauseNotice,
           "no_action",
+          {
+            progressSignature,
+            repeatedTargets,
+            recoveryReason: "no_progress_batch_loop",
+            nextStep: language === "zh"
+              ? "换目标、改为写入/命令/浏览器验证，或说明真实阻塞"
+              : "switch target, patch/run/browser-verify, or state the real blocker",
+          },
         );
         callbacks.onStatusChange("idle");
         return;

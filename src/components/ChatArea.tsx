@@ -1558,6 +1558,7 @@ function TurnProcessArchive({
 }
 
 function getArchiveStepLabel(step: TurnArchiveStep, language: "zh" | "en") {
+  if (step.activity?.label) return step.activity.label;
   if (step.phase?.title) return step.phase.title;
   if (language === "en") {
     if (step.kind === "message") return "Model note";
@@ -1700,10 +1701,13 @@ function TurnArchiveStepCard({
       : language === "zh" ? "查看证据" : "Show evidence";
   const targetText = step.targets.slice(0, 3).join(language === "zh" ? "、" : ", ");
   const hiddenTargetCount = Math.max(0, step.targets.length - 3);
-  const shouldShowTargetSummary = targetText && !step.intent.includes(targetText);
-  const summaryText = step.summary
+  const primaryText = step.activity?.title || step.intent;
+  const activitySummary = step.activity?.summary || "";
+  const shouldShowTargetSummary = targetText && !primaryText.includes(targetText) && !activitySummary.includes(targetText);
+  const summaryText = activitySummary || (step.summary
     ? `${step.summary}${shouldShowTargetSummary ? ` · ${targetText}${hiddenTargetCount ? ` +${hiddenTargetCount}` : ""}` : ""}`
-    : "";
+    : "");
+  const latestEvidenceText = step.activity?.recoveryHint || "";
   const headerContent = (
     <>
       <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center">
@@ -1720,11 +1724,16 @@ function TurnArchiveStepCard({
           </span>
         </span>
         <span data-testid="turn-archive-step-intent" className="mt-1 block whitespace-pre-wrap break-words text-[12.5px] font-medium leading-5 text-[var(--surface-text)]">
-          {renderCompactMarkdownText(step.intent)}
+          {renderCompactMarkdownText(primaryText)}
         </span>
         {summaryText && (
           <span data-testid="turn-archive-step-summary" className="mt-0.5 block whitespace-pre-wrap break-words text-[11px] leading-4 text-[var(--surface-text-subtle)]">
             {renderCompactMarkdownText(summaryText)}
+          </span>
+        )}
+        {latestEvidenceText && (
+          <span data-testid="turn-archive-step-evidence" className="mt-0.5 block whitespace-pre-wrap break-words text-[10.5px] leading-4 text-[var(--surface-text-muted)]">
+            {renderCompactMarkdownText(latestEvidenceText)}
           </span>
         )}
       </span>

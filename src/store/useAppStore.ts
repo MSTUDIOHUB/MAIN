@@ -1733,6 +1733,12 @@ function normalizeStoredPlanExecutionProgressSnapshot(value: unknown): PlanExecu
       currentTool: String(snapshot.currentTool || ""),
       latestEvidence: String(snapshot.latestEvidence || ""),
       nextStep: String(snapshot.nextStep || ""),
+      progressSignature: String(snapshot.progressSignature || ""),
+      repeatedTargets: Array.isArray(snapshot.repeatedTargets)
+        ? snapshot.repeatedTargets.map((target) => String(target || "")).filter(Boolean)
+        : [],
+      lastEffectiveEvidenceAt: Math.max(0, Number(snapshot.lastEffectiveEvidenceAt) || 0),
+      recoveryReason: String(snapshot.recoveryReason || ""),
       iteration: Math.max(0, Number(snapshot.iteration) || 0),
       maxIterations: Math.max(0, Number(snapshot.maxIterations) || 0),
       autoResumeCount: Math.max(0, Number(snapshot.autoResumeCount) || 0),
@@ -8405,6 +8411,9 @@ export const useAppStore = create<AppState>()(
           currentTool: snapshot.currentTool,
           latestEvidence: snapshot.latestEvidence,
           nextStep: snapshot.nextStep,
+          progressSignature: snapshot.progressSignature || null,
+          repeatedTargets: snapshot.repeatedTargets || [],
+          recoveryReason: snapshot.recoveryReason || null,
           content,
         });
         sessionSet({ planExecutionProgressSnapshot: snapshot });
@@ -9646,7 +9655,7 @@ export const useAppStore = create<AppState>()(
           });
         },
 
-        onNonActionableStop: (message, reason) => {
+        onNonActionableStop: (message, reason, progress) => {
           terminalTurnStatusOverride = reason === "no_output"
             ? "stopped_no_output"
             : "stopped_no_action";
@@ -9672,13 +9681,12 @@ export const useAppStore = create<AppState>()(
               nextStep: sessionGet().config.language === "en"
                 ? "resume from the current workspace state"
                 : "基于当前 workspace 状态恢复执行",
+              ...progress,
             });
           }
           const language = sessionGet().config.language === "en" ? "en" : "zh";
-          const visibleMessage = isApprovedExecutionPause
-            ? language === "en"
-              ? "Plan execution paused. MAIN kept the current workspace state; use Resume Execution to continue from here."
-              : "计划执行已暂停。MAIN 已保留当前 workspace 状态；可使用 Resume Execution 从这里继续。"
+          const visibleMessage = isApprovedExecutionPause && message.trim()
+            ? `${message.trim()}\n\n${language === "en" ? "MAIN kept the current workspace state; use Resume Execution to continue from here." : "MAIN 已保留当前 workspace 状态；可使用 Resume Execution 从这里继续。"}`
             : message;
           const block: TaskBlock = {
             id: nextId(),

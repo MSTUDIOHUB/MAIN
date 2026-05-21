@@ -60,6 +60,7 @@ const {
 const {
   buildTurnProcessArchiveModel,
   buildLiveTurnProcessTimelineModel,
+  buildCodexActivityGroups,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/turnProcessArchive.ts"));
 
 test("tool intent helpers derive stable phases without model metadata", () => {
@@ -356,7 +357,7 @@ test("runtime phase metadata keeps stable titles and ignores changing process no
   assert.doesNotMatch(model.steps[0].intent, /ThemeStyles|App\.css/);
 });
 
-test("runtime phase grouping splits large read-only batches at eight tool calls", () => {
+test("runtime phase grouping keeps large read-only batches in one codex-style exploring cell", () => {
   const phase = {
     id: "context",
     kind: "context",
@@ -376,13 +377,14 @@ test("runtime phase grouping splits large read-only batches at eight tool calls"
   }));
   const model = buildLiveTurnProcessTimelineModel({ language: "zh", blocks });
 
-  assert.equal(model.steps.length, 2);
+  assert.equal(model.steps.length, 1);
   assert.equal(model.steps[0].phase.title, "关键上下文");
-  assert.equal(model.steps[0].items.filter((item) => item.type === "tool").length, 8);
-  assert.equal(model.steps[1].items.filter((item) => item.type === "tool").length, 2);
+  assert.equal(model.steps[0].items.filter((item) => item.type === "tool").length, 10);
+  assert.equal(model.steps[0].activity.kind, "exploring");
+  assert.match(model.steps[0].activity.title, /已探索/);
 });
 
-test("runtime phase grouping separates target domains inside the same phase", () => {
+test("runtime phase grouping keeps same-purpose exploration together across target domains", () => {
   const basePhase = {
     id: "context",
     kind: "context",
@@ -414,8 +416,47 @@ test("runtime phase grouping separates target domains inside the same phase", ()
     ],
   });
 
-  assert.equal(model.steps.length, 2);
-  assert.deepEqual(model.steps.map((step) => step.phase.domain), ["theme_ui", "data_pipeline"]);
+  assert.equal(model.steps.length, 1);
+  assert.equal(model.steps[0].activity.kind, "exploring");
+  assert.match(model.steps[0].activity.title, /2 个文件/);
+  assert.deepEqual(model.steps[0].targets, ["src/components/ThemeStyles.tsx", "src/hooks/useCsvParser.ts"]);
   assert.equal(model.steps[0].intent, "关键上下文");
-  assert.equal(model.steps[1].intent, "关键上下文");
+});
+
+test("codex activity groups merge read list and search into one exploring cell", () => {
+  const groups = buildCodexActivityGroups([
+    { id: 1, type: "tool", toolName: "read_file", target: "src/App.tsx", status: "done", toolStatus: "executed" },
+    { id: 2, type: "tool", toolName: "list_directory", target: "src/components", status: "done", toolStatus: "executed" },
+    { id: 3, type: "tool", toolName: "grep_search", target: "hiddenProcess", status: "done", toolStatus: "executed" },
+  ], "zh");
+
+  assert.equal(groups.length, 1);
+  assert.equal(groups[0].kind, "exploring");
+  assert.match(groups[0].title, /已探索/);
+  assert.match(groups[0].title, /1 个文件/);
+  assert.match(groups[0].title, /1 个目录/);
+  assert.match(groups[0].title, /1 次搜索/);
+});
+
+test("codex activity groups keep edits commands browser and failures separate", () => {
+  const groups = buildCodexActivityGroups([
+    {
+      id: 1,
+      type: "tool",
+      toolName: "replace_in_file",
+      target: "src/App.tsx",
+      status: "done",
+      toolStatus: "executed",
+      diff: { old: "a", new: "b", path: "src/App.tsx", existed: true },
+    },
+    { id: 2, type: "tool", toolName: "run_command", target: "npm test", status: "done", toolStatus: "executed" },
+    { id: 3, type: "tool", toolName: "browser_evaluate", target: "http://localhost:3000", status: "done", toolStatus: "executed" },
+    { id: 4, type: "tool", toolName: "read_file", target: "missing.ts", status: "error", toolStatus: "failed", message: "ENOENT" },
+  ], "zh");
+
+  assert.deepEqual(groups.map((group) => group.kind), ["edit", "command", "browser", "exploring"]);
+  assert.match(groups[0].title, /已编辑/);
+  assert.match(groups[1].title, /已运行/);
+  assert.match(groups[2].title, /浏览器验证/);
+  assert.equal(groups[3].status, "failed");
 });
