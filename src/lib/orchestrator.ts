@@ -179,6 +179,7 @@ import {
 } from "./turnEvents";
 import { normalizeToolCallForExecution } from "./toolCallNormalization";
 import {
+  composePlanArtifactFromEvidence,
   composeReviewablePlanFromEvidence,
   materializePlanArtifactFromVisibleText,
 } from "./planMaterialization";
@@ -1372,6 +1373,41 @@ function buildNoProgressBatchSignature(results: ToolExecutionResult[]): string {
     })
     .sort();
   return fragments.join("||");
+}
+
+function buildExecuteNoActionPauseMessage(input: {
+  language: "zh" | "en";
+  recentToolActivity: PlanToolActivitySummary[];
+  visibleText?: string;
+}): string {
+  const repeatedTargets = summarizeRepeatedPlanTargetsFromToolActivity(input.recentToolActivity);
+  const recent = input.recentToolActivity
+    .slice(-6)
+    .map((activity) => {
+      const target = activity.target ? ` ${activity.target}` : "";
+      const detail = activity.detail ? ` - ${activity.detail}` : "";
+      return `${activity.status}:${activity.name}${target}${detail}`;
+    })
+    .map((line) => truncateForLog(line, 180));
+  const visible = truncateForLog(input.visibleText || "", 220);
+
+  if (input.language === "zh") {
+    return [
+      "执行已暂停：模型已经读取/分析了上下文，但没有转向真实写入、命令验证或明确结论。",
+      repeatedTargets.length > 0 ? `重复目标：${repeatedTargets.join("、")}` : "",
+      recent.length > 0 ? `最近有效进展：\n${recent.map((line) => `- ${line}`).join("\n")}` : "",
+      visible ? `模型最后可见输出：${visible}` : "",
+      "恢复时不要继续重复读取相同文件；请基于已读内容直接写入/替换、运行验证命令，或说明阻塞在什么具体证据/权限/业务选择上。",
+    ].filter(Boolean).join("\n");
+  }
+
+  return [
+    "Execution paused: the model read/analyzed context but did not pivot to a real write, command validation, or clear conclusion.",
+    repeatedTargets.length > 0 ? `Repeated targets: ${repeatedTargets.join(", ")}` : "",
+    recent.length > 0 ? `Recent effective progress:\n${recent.map((line) => `- ${line}`).join("\n")}` : "",
+    visible ? `Last visible model output: ${visible}` : "",
+    "On resume, do not reread the same files. Use the cached context to patch/write, run validation, or state the concrete evidence/permission/business-choice blocker.",
+  ].filter(Boolean).join("\n");
 }
 
 function isCachedReadOnlyToolResult(result: ToolExecutionResult): boolean {
@@ -5338,6 +5374,51 @@ export async function executeAgentLoop(
 
     if (!shouldAttempt) return "not_attempted";
     if (usedPlanClosureGuard) {
+      const deterministicContent = composePlanArtifactFromEvidence({
+        ...closureInput,
+        language: callbacks.getPreferredLanguage(),
+      });
+      const materialized = materializePlanArtifactFromVisibleText({
+        visibleText: deterministicContent,
+        userGoal: closureInput.userGoal,
+        evidence: closureInput.evidence,
+        files: closureInput.files,
+        language: callbacks.getPreferredLanguage(),
+      });
+      if (materialized.ok) {
+        logAgentEvent("plan_closure_deterministic_materialization", {
+          trigger,
+          iteration,
+          evidenceCount,
+          fileCount: closureInput.files.length,
+          targetPath: materialized.path || ".MAIN/plans/plan.md",
+        });
+        const writeResult = await writeMaterializedPlanArtifact({
+          materialized,
+          workspace,
+          callbacks,
+          toolCallPrefix: "plan_closure_deterministic",
+        });
+        if (writeResult.ok) {
+          const reviewResult = await pauseForReviewablePlanArtifact("deterministic_plan_closure");
+          if (reviewResult === "approved_continue") return "approved_continue";
+          if (reviewResult === "stopped") return "stopped";
+        } else {
+          logAgentEvent("plan_closure_deterministic_write_failed", {
+            trigger,
+            iteration,
+            reason: writeResult.reason || "unknown",
+          });
+        }
+      } else {
+        logAgentEvent("plan_closure_deterministic_materialization_rejected", {
+          trigger,
+          iteration,
+          reason: materialized.reason || "unknown",
+          evidenceCount,
+          fileCount: closureInput.files.length,
+        });
+      }
       logAgentEvent("plan_closure_artifact_rejected", {
         trigger,
         iteration,
@@ -7734,6 +7815,37 @@ export async function executeAgentLoop(
             preservedVisibleText: hasMeaningfulVisibleText,
           });
           if (consecutiveNoToolCount >= MAX_NO_ACTION_RETRIES) {
+            if (
+              isExecuteRuntimeWithoutEvidence &&
+              recentToolActivity.length >= 3 &&
+              !sawExecuteOperationEvidence
+            ) {
+              const pauseMessage = buildExecuteNoActionPauseMessage({
+                language: callbacks.getPreferredLanguage(),
+                recentToolActivity,
+                visibleText: visibleAssistantText || userVisibleText,
+              });
+              logAgentEvent("loop_stop", {
+                reason: "execute_read_only_no_action_checkpoint",
+                iteration,
+                consecutiveNoToolCount,
+                recentToolActivity: recentToolActivity.length,
+                repeatedTargets: summarizeRepeatedPlanTargetsFromToolActivity(recentToolActivity),
+              });
+              callbacks.onNonActionableStop(
+                pauseMessage,
+                "no_action",
+                {
+                  repeatedTargets: summarizeRepeatedPlanTargetsFromToolActivity(recentToolActivity),
+                  recoveryReason: "execute_read_only_no_action_checkpoint",
+                  nextStep: callbacks.getPreferredLanguage() === "zh"
+                    ? "复用已读上下文，转向写入/验证/明确阻塞"
+                    : "reuse read context and pivot to write/verify/a concrete blocker",
+                },
+              );
+              callbacks.onStatusChange("idle");
+              return;
+            }
             logAgentEvent("loop_stop", {
               reason: "missing_tool_reprompt_limit",
               iteration,

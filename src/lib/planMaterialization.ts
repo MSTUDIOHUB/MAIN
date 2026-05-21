@@ -566,3 +566,85 @@ export function composeReviewablePlanFromEvidence(input: {
     "plan.md 必须包含：用户目标、截图/附件观察、已确认事实、证据引用、未验证假设、影响文件/接口、执行步骤、风险取舍和验证标准。真正阻塞执行的选择必须在批准前用 `<user_options>` 提问，不要伪装成计划尾部的开放问题。",
   ].filter(Boolean).join("\n");
 }
+
+export function composePlanArtifactFromEvidence(input: {
+  userGoal: string;
+  evidence: string[];
+  files?: string[];
+  constraints?: string[];
+  language?: "zh" | "en";
+}): string {
+  const language = input.language === "en" ? "en" : "zh";
+  const goal = compactPlanLine(input.userGoal, 420) || (
+    language === "zh"
+      ? "根据用户当前请求完成可审阅实现计划。"
+      : "Prepare a reviewable implementation plan for the current user request."
+  );
+  const evidence = uniqueCompactLines(input.evidence.map((item) => summarizeEvidenceLine(item, language)), 10, 220);
+  const files = uniqueCompactLines(input.files || [], 10, 160);
+  const constraints = uniqueCompactLines(input.constraints || [], 6, 200);
+  const affectedFiles = files.length > 0
+    ? files
+    : (language === "zh"
+      ? ["实施前通过定向读取确认具体源码路径；批准前不修改源码。"]
+      : ["Confirm concrete source paths with targeted reads before implementation; do not edit source before approval."]);
+  const evidenceLines = evidence.length > 0
+    ? evidence
+    : (language === "zh"
+      ? ["当前只有用户目标可用；执行前必须先补充定向读取证据。"]
+      : ["Only the user goal is currently available; targeted read evidence must be collected before implementation."]);
+
+  if (language === "en") {
+    return [
+      "# Plan",
+      formatCanonicalSection("User Goal", [goal]),
+      formatCanonicalSection("Screenshot / Attachment Observations", [
+        "No additional screenshot or attachment detail is trusted unless it appears in the provided context.",
+      ]),
+      formatCanonicalSection("Read Evidence", evidenceLines),
+      formatCanonicalSection("Confirmed Facts", evidenceLines.slice(0, 4).map((line) => `Confirmed relevant planning evidence: ${line}`)),
+      formatCanonicalSection("Unverified Hypotheses", [
+        "Implementation details not directly covered by the evidence must be verified with targeted reads before source edits.",
+      ]),
+      formatCanonicalSection("Affected Files", affectedFiles),
+      formatCanonicalSteps("Execution Steps", [
+        "Use the confirmed evidence to narrow the implementation target before editing source files.",
+        "Apply the smallest source changes that satisfy the user goal.",
+        "Verify the changed behavior with focused tests, build checks, or browser/desktop validation where appropriate.",
+      ]),
+      formatCanonicalSection("Risks / Tradeoffs", constraints.length > 0
+        ? constraints
+        : ["Do not treat repeated cached reads as new evidence; pivot to editing, verification, or an explicit blocker when progress stalls."]),
+      formatCanonicalSection("Validation Standards", [
+        "Run the focused validation command for the touched subsystem.",
+        "If UI behavior is affected, verify rendered behavior with browser or desktop evidence instead of text-only inspection.",
+      ]),
+    ].join("\n\n");
+  }
+
+  return [
+    "# 计划",
+    formatCanonicalSection("用户目标", [goal]),
+    formatCanonicalSection("截图/附件观察", [
+      "除非用户提供的上下文中已有明确细节，否则不信任额外截图或附件推断。",
+    ]),
+    formatCanonicalSection("已读证据", evidenceLines),
+    formatCanonicalSection("已确认事实", evidenceLines.slice(0, 4).map((line) => `已确认存在相关计划证据：${line}`)),
+    formatCanonicalSection("未验证假设", [
+      "证据没有直接覆盖的实现细节，必须在源码修改前通过定向读取确认。",
+    ]),
+    formatCanonicalSection("影响文件", affectedFiles),
+    formatCanonicalSteps("执行步骤", [
+      "基于已确认的证据先收窄实现目标，再修改源码。",
+      "实施满足用户目标的最小源码变更。",
+      "用聚焦测试、构建检查或浏览器/桌面验证确认行为达标。",
+    ]),
+    formatCanonicalSection("风险取舍", constraints.length > 0
+      ? constraints
+      : ["重复缓存读取不能算作新证据；进展停滞时必须转向写入、验证或明确阻塞。"]),
+    formatCanonicalSection("验证标准", [
+      "运行受影响子系统的聚焦验证命令。",
+      "如果影响 UI 行为，必须用浏览器或桌面运行证据验证渲染结果，不能只靠文本检查。",
+    ]),
+  ].join("\n\n");
+}

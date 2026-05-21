@@ -18,13 +18,11 @@ test("completed read tools collapse into one expandable context group", async ({
 
   const contextSteps = page.locator('[data-testid="turn-archive-step"][data-kind="discover"], [data-testid="turn-archive-step"][data-kind="inspect"]');
   await expect(contextSteps).toHaveCount(2);
-  await expect(contextSteps.nth(0)).toContainText("按同一上下文策略完成 10 次读取/搜索");
+  await expect(contextSteps.nth(0)).toContainText("10 个文件");
+  await expect(contextSteps.nth(0)).toContainText("项目骨架");
   await expect(contextSteps.nth(0)).not.toContainText("下一步读取最小必要上下文");
-  await expect(contextSteps.nth(0)).toContainText("10 次上下文操作");
-  await expect(contextSteps.nth(1)).toContainText("1 次上下文操作");
-  await expect(page.getByTestId("read-context-group")).toHaveCount(0);
-  await contextSteps.nth(0).getByTestId("turn-archive-step-toggle").click();
-
+  await expect(contextSteps.nth(0)).toContainText("文件不存在");
+  await expect(contextSteps.nth(1)).toContainText("1 个文件");
   const groups = page.getByTestId("read-context-group");
   await expect(groups).toHaveCount(1);
   const firstGroup = groups.nth(0);
@@ -48,6 +46,6 @@ test("completed read tools collapse into one expandable context group", async ({
 
   await contextSteps.nth(1).getByTestId("turn-archive-step-toggle").click();
   await expect(page.getByTestId("read-context-group").filter({ hasText: "已读取 1 项上下文" })).toBeVisible();
-  await expect(page.locator('[data-testid="turn-archive-step"][data-kind="blocked"]')).toContainText("MissingConfig.cs");
-  await expect(page.locator('[data-testid="turn-archive-step"][data-kind="edit"]')).toContainText("实施修改");
+  await expect(contextSteps.nth(0)).toContainText("MissingConfig.cs");
+  await expect(page.locator('[data-testid="turn-archive-step"][data-kind="edit"]')).toContainText("GeneratedBattleUnit.cs");
 });

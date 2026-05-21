@@ -9,28 +9,38 @@ test.beforeEach(async ({ page }) => {
   });
 });
 
-test("read/search tools stay grouped when interleaved with command cards", async ({ page }) => {
+test("read/search progress stays visible when interleaved with command cards", async ({ page }) => {
   await page.goto("/?e2eScenario=read-context-interleaved");
 
-  const groups = page.getByTestId("read-context-group");
-  await expect(groups).toHaveCount(1);
-  const group = groups.first();
-  await expect(group).toContainText("已读取 3 项上下文");
+  const ledger = page.getByTestId("effective-progress-ledger");
+  await expect(ledger).toBeVisible();
+  await expect(ledger).toContainText("5 条有效进展");
 
-  await expect(page.getByText("git status --short --branch")).toBeVisible();
-  await expect(page.getByText("npm run build -- --mode test")).toBeVisible();
+  const archiveToggle = page.getByTestId("turn-process-archive-toggle");
+  await expect(archiveToggle).toContainText("上下文 3");
+  await expect(archiveToggle).toContainText("验证 1");
+  await expect(archiveToggle).toContainText("命令 1");
+  await archiveToggle.click();
 
-  await group.click();
-  const details = page.getByTestId("read-context-group-details");
-  await expect(details).toBeVisible();
-  await expect(page.getByTestId("read-context-item")).toHaveCount(3);
-  await expect(details).toContainText("package.json");
-  await expect(details).toContainText("useAppStore.ts");
-  await expect(details).toContainText("*release*.md");
+  await expect(page.locator('[data-testid="turn-archive-step"]').filter({ hasText: "package.json" })).toBeVisible();
+  await expect(page.locator('[data-testid="turn-archive-step"]').filter({ hasText: "useAppStore.ts" })).toBeVisible();
+  await expect(page.locator('[data-testid="turn-archive-step"]').filter({ hasText: "*release*.md" })).toBeVisible();
+  await expect(page.locator('[data-testid="turn-archive-step"]').filter({ hasText: "git status --short --branch" })).toBeVisible();
+  await expect(page.locator('[data-testid="turn-archive-step"]').filter({ hasText: "npm run build -- --mode test" })).toBeVisible();
 });
 
-test("visible agent output splits read/search groups into separate segments", async ({ page }) => {
+test("visible agent output is preserved inside archived read/search evidence", async ({ page }) => {
   await page.goto("/?e2eScenario=read-context-agent-segment");
+
+  await expect(page.getByTestId("effective-progress-ledger")).toContainText("3 条有效进展");
+  await expect(page.getByText("第二段读取完成。")).toBeVisible();
+  await page.getByTestId("turn-process-archive-toggle").click();
+
+  const contextStep = page.locator('[data-testid="turn-archive-step"][data-kind="inspect"]').first();
+  await expect(contextStep).toContainText("ChatArea.tsx");
+  await expect(contextStep).toContainText("README.md");
+  await contextStep.getByTestId("turn-archive-step-toggle").click();
+  await expect(contextStep).toContainText("第一段读取完成，先输出阶段结论。");
 
   const groups = page.getByTestId("read-context-group");
   await expect(groups).toHaveCount(2);

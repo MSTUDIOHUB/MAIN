@@ -392,20 +392,29 @@ function toolActionForActivityTitle(block: any, language: ToolPresentationLangua
 }
 
 function makeActivityActionSummary(items: any[], language: ToolPresentationLanguage): string {
-  const actions: string[] = [];
-  const seen = new Set<string>();
+  const actions: Array<{ text: string; count: number }> = [];
+  const seen = new Map<string, number>();
   for (const item of items) {
     const action = toolActionForActivityTitle(item, language);
     if (!action) continue;
     const key = action.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    actions.push(action);
-    if (actions.length >= 3) break;
+    const existingIndex = seen.get(key);
+    if (existingIndex != null) {
+      actions[existingIndex].count += 1;
+      continue;
+    }
+    if (actions.length >= 3) continue;
+    seen.set(key, actions.length);
+    actions.push({ text: action, count: 1 });
   }
-  const extra = Math.max(0, items.filter((item) => isToolBlock(item) || isProgressBlock(item)).length - actions.length);
+  const visibleActionCount = actions.reduce((sum, action) => sum + action.count, 0);
+  const totalActionCount = items.filter((item) => isToolBlock(item) || isProgressBlock(item)).length;
+  const extra = Math.max(0, totalActionCount - visibleActionCount);
   if (actions.length === 0) return "";
-  return `${actions.join(language === "zh" ? "，" : ", ")}${extra > 0 ? (language === "zh" ? `，另 ${extra} 项` : `, +${extra}`) : ""}`;
+  const rendered = actions.map((action) =>
+    action.count > 1 ? `${action.text} x${action.count}` : action.text
+  );
+  return `${rendered.join(language === "zh" ? "，" : ", ")}${extra > 0 ? (language === "zh" ? `，另 ${extra} 项` : `, +${extra}`) : ""}`;
 }
 
 function countToolItems(step: Pick<TurnArchiveStep, "items">): number {
@@ -671,6 +680,58 @@ function makeActivityMetricParts(metrics: ActivityMetrics, language: ToolPresent
   return parts.filter(Boolean);
 }
 
+function makeExplorationRepeatParts(items: any[], language: ToolPresentationLanguage): string[] {
+  const counts = new Map<string, { target: string; count: number; cached: number }>();
+  for (const item of items) {
+    if (!isToolBlock(item) || !isExploringToolName(String(item.toolName || ""))) continue;
+    const target = compactTarget(item, language);
+    if (!target) continue;
+    const key = `${String(item.toolName || "")}:${target}`.toLowerCase();
+    const current = counts.get(key) || { target, count: 0, cached: 0 };
+    current.count += 1;
+    if (isActivityCachedResult(item)) current.cached += 1;
+    counts.set(key, current);
+  }
+  return [...counts.values()]
+    .filter((entry) => entry.count > 1 || entry.cached > 0)
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 4)
+    .map((entry) => {
+      if (language === "en") {
+        return `${entry.target} x${entry.count}${entry.cached ? ` (${entry.cached} cached)` : ""}`;
+      }
+      return `${entry.target} ×${entry.count}${entry.cached ? `（${entry.cached} 次缓存复用）` : ""}`;
+    });
+}
+
+function makeUniqueExplorationMetricParts(items: any[], metrics: ActivityMetrics, language: ToolPresentationLanguage): string[] {
+  const readTargets = new Set<string>();
+  const directoryTargets = new Set<string>();
+  let searches = 0;
+  let terminalReads = 0;
+  for (const item of items) {
+    if (!isToolBlock(item)) continue;
+    const toolName = String(item.toolName || "");
+    const target = compactTarget(item, language);
+    if (toolName === "read_file" || toolName === "read_document" || toolName === "get_file_outline" || toolName === "analyze_tabular_document" || toolName === "query_tabular_document") {
+      if (target) readTargets.add(target);
+    } else if (toolName === "list_directory" || toolName === "get_project_skeleton" || toolName === "index_workspace_documents") {
+      if (target) directoryTargets.add(target);
+    } else if (toolName === "glob_search" || toolName === "grep_search") {
+      searches += 1;
+    } else if (TERMINAL_READ_TOOL_NAMES.has(toolName)) {
+      terminalReads += 1;
+    }
+  }
+  const parts: string[] = [];
+  if (readTargets.size > 0) parts.push(countText(readTargets.size, language === "zh" ? "个文件" : "file", "file", "files", language));
+  if (directoryTargets.size > 0) parts.push(countText(directoryTargets.size, language === "zh" ? "个目录" : "directory", "directory", "directories", language));
+  if (searches > 0) parts.push(countText(searches, language === "zh" ? "次搜索" : "search", "search", "searches", language));
+  if (terminalReads > 0) parts.push(countText(terminalReads, language === "zh" ? "次终端读取" : "terminal read", "terminal read", "terminal reads", language));
+  if (metrics.cached > 0) parts.push(language === "zh" ? `${metrics.cached} 次复用缓存` : `${metrics.cached} cached reuse${metrics.cached === 1 ? "" : "s"}`);
+  return parts.length > 0 ? parts : makeActivityMetricParts(metrics, language);
+}
+
 function activityVerb(kind: ActivityCellKind, status: TurnArchiveStepStatus, language: ToolPresentationLanguage): string {
   const running = status === "running";
   const failed = status === "failed" || status === "rejected";
@@ -696,12 +757,24 @@ function activityVerb(kind: ActivityCellKind, status: TurnArchiveStepStatus, lan
   return running ? "正在处理" : "已记录";
 }
 
-function makeActivitySummary(activity: Pick<ActivityCell, "kind" | "targets" | "metrics">, language: ToolPresentationLanguage): string {
-  const metricParts = makeActivityMetricParts(activity.metrics, language);
+function makeActivitySummary(activity: Pick<ActivityCell, "kind" | "targets" | "metrics"> & { items?: any[] }, language: ToolPresentationLanguage): string {
+  const metricParts = activity.kind === "exploring" && activity.items
+    ? makeUniqueExplorationMetricParts(activity.items, activity.metrics, language)
+    : makeActivityMetricParts(activity.metrics, language);
   const targetSummary = makeTargetSummary(activity.targets, language);
+  const repeatParts = activity.kind === "exploring" && activity.items
+    ? makeExplorationRepeatParts(activity.items, language)
+    : [];
   if (activity.kind === "exploring" && targetSummary) {
     const prefix = language === "zh" ? "目标：" : "Targets: ";
-    return compactLine(`${metricParts.join(language === "zh" ? "，" : ", ")}${metricParts.length ? " · " : ""}${prefix}${targetSummary}`, 220);
+    const repeatText = repeatParts.length > 0
+      ? `${language === "zh" ? "重复：" : "Repeated: "}${repeatParts.join(language === "zh" ? "、" : ", ")}`
+      : "";
+    return compactLine([
+      metricParts.join(language === "zh" ? "，" : ", "),
+      repeatText,
+      `${prefix}${targetSummary}`,
+    ].filter(Boolean).join(" · "), 260);
   }
   if (targetSummary && metricParts.length > 0) return compactLine(`${metricParts.join(language === "zh" ? "，" : ", ")} · ${targetSummary}`, 220);
   if (metricParts.length > 0) return metricParts.join(language === "zh" ? "，" : ", ");
@@ -797,7 +870,7 @@ function buildActivityCellFromItems(
     metrics,
     targets,
   };
-  const summary = makeActivitySummary(provisional, language);
+  const summary = makeActivitySummary({ ...provisional, items }, language);
   if (planRuntimePhase) {
     const label = planRuntimeArchiveGroupLabel(planRuntimePhase, language);
     const planKind = planRuntimeArchiveKind(planRuntimePhase);
@@ -886,7 +959,7 @@ function mergeActivityCells(left: ActivityCell, right: ActivityCell, language: T
         })()
       : makeActivityTitle({ ...base, items }, language),
     summary: (() => {
-      const mergedSummary = makeActivitySummary(base, language);
+      const mergedSummary = makeActivitySummary({ ...base, items }, language);
       const evidence = compactLine(combinedEvidence, 180);
       const prefix = isPlanRuntime
         ? [left.summary, right.summary]

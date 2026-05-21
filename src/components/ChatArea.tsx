@@ -40,6 +40,7 @@ import { summarizePlanExecutionProgressSnapshot } from "../lib/planExecutionReco
 import { buildCompletedToolGroupRanges, countCompletedToolCalls } from "../lib/toolUiGrouping";
 import { compactToolPresentationTarget, getToolPresentationLabel } from "../lib/toolPresentation";
 import { buildLiveTurnProcessTimelineModel, buildTurnProcessArchiveModel, type TurnArchiveStep } from "../lib/turnProcessArchive";
+import { buildRuntimeProgressLedger, summarizeRuntimeProgressLedger } from "../lib/runtimeProgressLedger";
 import { getChatFeedbackStatusCopy, normalizeChatFeedbackStatus } from "../lib/chatFeedback";
 import type { UserContextItem } from "../lib/userContextItems";
 
@@ -1090,6 +1091,85 @@ function TurnActivityNotice({
   );
 }
 
+function EffectiveProgressLedgerCard({
+  items,
+  language,
+  chatFontSize,
+}: {
+  items: any[];
+  language: "zh" | "en";
+  chatFontSize: number;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const visibleItems = items.filter(Boolean);
+  if (visibleItems.length === 0) return null;
+  const latestItems = visibleItems.slice(-4);
+  const summary = summarizeRuntimeProgressLedger(visibleItems, language);
+  const title = language === "zh" ? "有效进展" : "Effective Progress";
+  const toggleText = expanded
+    ? language === "zh" ? "收起明细" : "Hide details"
+    : language === "zh" ? "展开明细" : "Show details";
+  return (
+    <div
+      data-testid="effective-progress-ledger"
+      className="turn-process-font-scope ml-9 rounded-xl border border-[rgba(96,165,250,0.2)] bg-[rgba(37,99,235,0.06)] px-3 py-2"
+      style={getTurnProcessFontStyle(chatFontSize)}
+    >
+      <button
+        type="button"
+        data-testid="effective-progress-ledger-toggle"
+        aria-expanded={expanded}
+        onClick={() => setExpanded((value) => !value)}
+        className="flex w-full min-w-0 items-start justify-between gap-3 text-left"
+      >
+        <span className="min-w-0 flex-1">
+          <span className="inline-flex items-center gap-2 text-[11px] uppercase tracking-[0.16em] text-[#93c5fd]">
+            <IconColumns className="h-3.5 w-3.5" />
+            {title}
+          </span>
+          <span className="mt-1 block whitespace-pre-wrap break-words text-[12px] leading-5 text-[var(--surface-text-subtle)]">
+            {summary}
+          </span>
+        </span>
+        <span className="inline-flex shrink-0 items-center gap-1.5 px-1 py-1 text-[10px] text-[var(--surface-text-muted)]">
+          {expanded ? <IconChevronDown className="h-3.5 w-3.5" /> : <IconChevronRight className="h-3.5 w-3.5" />}
+          {toggleText}
+        </span>
+      </button>
+      {expanded && (
+        <div data-testid="effective-progress-ledger-details" className="mt-2 space-y-1 border-t border-[rgba(147,197,253,0.14)] pt-2">
+          {latestItems.map((item) => (
+            <div
+              key={item.key}
+              data-testid="effective-progress-ledger-item"
+              className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-2 rounded-lg px-1.5 py-1 text-[11px]"
+            >
+              <span className={`mt-1 h-2 w-2 rounded-full ${
+                item.status === "failed" || item.status === "paused"
+                  ? "bg-[#f87171]"
+                  : item.status === "running"
+                  ? "bg-[#60a5fa] shadow-[0_0_8px_rgba(96,165,250,0.8)]"
+                  : "bg-[#10b981]"
+              }`} />
+              <span className="min-w-0">
+                <span className="block truncate font-medium text-[var(--surface-text)]">{item.title}</span>
+                {item.summary && (
+                  <span className="mt-0.5 block truncate text-[var(--surface-text-subtle)]">{item.summary}</span>
+                )}
+              </span>
+              {(item.repeatCount > 1 || item.cacheHits > 0) && (
+                <span className="shrink-0 rounded-full border border-[#334155] bg-[#0f172a] px-1.5 py-0.5 text-[9px] text-[#93c5fd]">
+                  x{item.repeatCount}{item.cacheHits ? ` / ${item.cacheHits} cached` : ""}
+                </span>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function formatThoughtDuration(duration: unknown, language: "zh" | "en"): string {
   const ms = Number(duration);
   if (!Number.isFinite(ms) || ms <= 0) return "";
@@ -1263,18 +1343,31 @@ function ReadContextGroupCard({
   language: "zh" | "en";
 }) {
   const [expanded, setExpanded] = useState(false);
-  const targets = blocks.map((block) =>
-    compactToolTarget(block.target, String(block.toolName || ""), language),
-  );
-  const previewTargets = targets.slice(0, 3).filter(Boolean);
-  const hiddenCount = Math.max(0, targets.length - previewTargets.length);
+  const entries = buildReadContextEntries(blocks, language);
+  const totalCount = blocks.length;
+  const uniqueCount = entries.length;
+  const duplicateCount = Math.max(0, totalCount - uniqueCount);
+  const cachedCount = entries.reduce((sum, entry) => sum + entry.cachedCount, 0);
+  const previewTargets = entries.map((entry) =>
+    entry.count > 1 ? `${entry.displayTarget} x${entry.count}` : entry.displayTarget
+  ).slice(0, 3).filter(Boolean);
+  const hiddenCount = Math.max(0, entries.length - previewTargets.length);
   const previewText = previewTargets.join(language === "zh" ? "、" : ", ");
-  const previewPurpose = blocks
-    .map((block) => String(block.observationSummary || block.intentSummary || block.why || ""))
+  const previewPurpose = entries
+    .map((entry) => entry.summary)
     .find(Boolean);
-  const title = language === "zh"
-    ? `已读取 ${blocks.length} 项上下文`
-    : `Read ${blocks.length} context item${blocks.length > 1 ? "s" : ""}`;
+  const title = duplicateCount > 0
+    ? language === "zh"
+      ? `已读取 ${uniqueCount} 项有效上下文（共 ${totalCount} 次）`
+      : `Read ${uniqueCount} effective context item${uniqueCount > 1 ? "s" : ""} (${totalCount} total)`
+    : language === "zh"
+    ? `已读取 ${totalCount} 项上下文`
+    : `Read ${totalCount} context item${totalCount > 1 ? "s" : ""}`;
+  const duplicateText = duplicateCount > 0
+    ? language === "zh"
+      ? `去重 ${duplicateCount} 次重复读取${cachedCount ? `，其中 ${cachedCount} 次为缓存复用` : ""}`
+      : `Deduped ${duplicateCount} repeated read${duplicateCount > 1 ? "s" : ""}${cachedCount ? `, ${cachedCount} cached` : ""}`
+    : "";
   const toggleText = expanded
     ? language === "zh" ? "收起" : "Collapse"
     : language === "zh" ? "展开" : "Expand";
@@ -1305,6 +1398,11 @@ function ReadContextGroupCard({
             {previewPurpose}
           </span>
         )}
+        {duplicateText && (
+          <span data-testid="read-context-group-dedupe" className="shrink-0 rounded-full border border-[rgba(96,165,250,0.22)] bg-[rgba(37,99,235,0.08)] px-2 py-0.5 text-[10px] text-[#93c5fd]">
+            {duplicateText}
+          </span>
+        )}
         <span className="shrink-0 rounded-full border border-[#27272a] bg-[#050507] px-2 py-0.5 text-[10px] text-[#a1a1aa]">
           {toggleText}
         </span>
@@ -1315,34 +1413,34 @@ function ReadContextGroupCard({
           data-testid="read-context-group-details"
           className="mt-2 space-y-1 rounded-xl border border-[#1f1f23] bg-[#050507] p-2"
         >
-          {blocks.map((block) => {
-            const toolName = String(block.toolName || "");
-            const label = getReadContextToolLabel(toolName, language);
-            const displayTarget = compactToolTarget(block.target, toolName, language);
-            const target = fullToolTarget(block.target, toolName, language);
-
+          {entries.map((entry) => {
             return (
               <div
-                key={block.id}
+                key={entry.key}
                 data-testid="read-context-item"
                 className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2 rounded-lg px-2 py-1.5 text-[11px] text-[#a1a1aa]"
               >
                 <IconCheck className="h-3 w-3 text-[#10b981]" />
                 <div className="min-w-0">
                   <div className="flex min-w-0 items-center gap-2">
-                    <span className="shrink-0 text-[#71717a]">{label}</span>
-                    <span className="min-w-0 truncate font-mono text-[#d4d4d8]" title={target}>
-                      {displayTarget}
+                    <span className="shrink-0 text-[#71717a]">{entry.label}</span>
+                    <span className="min-w-0 truncate font-mono text-[#d4d4d8]" title={entry.target}>
+                      {entry.displayTarget}
                     </span>
+                    {entry.count > 1 && (
+                      <span data-testid="read-context-item-repeat" className="shrink-0 rounded-full border border-[#334155] bg-[#0f172a] px-1.5 py-0.5 text-[9px] text-[#93c5fd]">
+                        x{entry.count}{entry.cachedCount ? ` / ${entry.cachedCount} cached` : ""}
+                      </span>
+                    )}
                   </div>
-                  {target !== displayTarget && (
-                    <div className="truncate font-mono text-[10px] text-[#52525b]" title={target}>
-                      {target}
+                  {entry.target !== entry.displayTarget && (
+                    <div className="truncate font-mono text-[10px] text-[#52525b]" title={entry.target}>
+                      {entry.target}
                     </div>
                   )}
-                  {(block.observationSummary || block.intentSummary || block.why) && (
+                  {entry.summary && (
                     <div data-testid="read-context-item-summary" className="truncate text-[10.5px] text-[#94a3b8]">
-                      {block.observationSummary || block.intentSummary || block.why}
+                      {entry.summary}
                     </div>
                   )}
                 </div>
@@ -1362,6 +1460,62 @@ function getCompletedToolGroupToolLabel(toolName: string, language: "zh" | "en")
   const labels = COMPLETED_TOOL_GROUP_LABELS[toolName];
   if (labels) return labels[language === "zh" ? "zh" : "en"];
   return getToolPresentationLabel(toolName, language);
+}
+
+function isCachedReadContextBlock(block: any) {
+  const text = [
+    block?.message,
+    block?.observationSummary,
+    block?.evidence,
+    block?.resultPreview,
+    block?.content,
+  ].map((value) => String(value || "")).join("\n");
+  return /FILE_UNCHANGED_STUB|Repeated read-only tool call skipped/i.test(text);
+}
+
+function buildReadContextEntries(blocks: any[], language: "zh" | "en") {
+  const entries: Array<{
+    key: string;
+    block: any;
+    blocks: any[];
+    count: number;
+    cachedCount: number;
+    label: string;
+    displayTarget: string;
+    target: string;
+    summary: string;
+  }> = [];
+  const byKey = new Map<string, (typeof entries)[number]>();
+  for (const block of blocks) {
+    const toolName = String(block.toolName || "");
+    const displayTarget = compactToolTarget(block.target, toolName, language);
+    const target = fullToolTarget(block.target, toolName, language);
+    const key = `${toolName}:${String(target || displayTarget).replace(/\\/g, "/").toLowerCase()}`;
+    const cached = isCachedReadContextBlock(block) ? 1 : 0;
+    const summary = String(block.observationSummary || block.intentSummary || block.why || "").trim();
+    const existing = byKey.get(key);
+    if (existing) {
+      existing.blocks.push(block);
+      existing.count += 1;
+      existing.cachedCount += cached;
+      if (summary && !existing.summary) existing.summary = summary;
+      continue;
+    }
+    const entry = {
+      key,
+      block,
+      blocks: [block],
+      count: 1,
+      cachedCount: cached,
+      label: getReadContextToolLabel(toolName, language),
+      displayTarget,
+      target,
+      summary,
+    };
+    byKey.set(key, entry);
+    entries.push(entry);
+  }
+  return entries;
 }
 
 function CompletedToolGroupCard({
@@ -2199,6 +2353,7 @@ export default function ChatArea({
     showTerminal,
     showFilePanel,
     rightPanelTab,
+    runtimeEvents,
     openRightPanelTab,
     openFileTreePanel,
     openDiffForTask,
@@ -2230,6 +2385,7 @@ export default function ChatArea({
     showTerminal: useAppStore((s) => s.showTerminal),
     showFilePanel: useAppStore((s) => s.showFilePanel),
     rightPanelTab: useAppStore((s) => s.rightPanelTab),
+    runtimeEvents: useAppStore((s) => s.runtimeEvents),
     openRightPanelTab: useAppStore((s) => s.openRightPanelTab),
     openFileTreePanel: useAppStore((s) => s.openFileTreePanel),
     openDiffForTask: useAppStore((s) => s.openDiffForTask),
@@ -2855,6 +3011,14 @@ export default function ChatArea({
       ? summarizePlanExecutionProgressSnapshot(turnProgressSnapshot, language)
       : "";
     const toolExecutionSummary = buildToolExecutionSummary(blocks, language);
+    const effectiveProgressLedger = buildRuntimeProgressLedger({
+      blocks,
+      events: runtimeEvents,
+      turnId: turn.id,
+      language,
+      maxItems: 12,
+    });
+    const effectiveProgressSummary = summarizeRuntimeProgressLedger(effectiveProgressLedger, language);
     const activeTurnActivity = getActiveTurnActivity(blocks, turn.status, language);
     const showReasoningDebug = config.reasoningDisplay !== "hidden";
     const liveProcessTimeline = !shouldArchiveCompletedProcess
@@ -3016,7 +3180,7 @@ export default function ChatArea({
               <TurnSummaryCard
                 turn={turn}
                 hiddenCount={(turn.status === "done" || turn.status === "completed_with_changes") ? collapsedProcessCount : hiddenCount}
-                fallbackSummary={planProgressSummary || finalAgentSummaryText || toolExecutionSummary}
+                fallbackSummary={planProgressSummary || finalAgentSummaryText || effectiveProgressSummary || toolExecutionSummary}
                 onOpenPlan={isPlanTurn && hasPlanPanelContent && hasPlanContent ? () => openRightPanelTab("plan") : undefined}
                 onExpand={() => toggleConversationTurnCollapsed(turn.id)}
                 embedded
@@ -3040,16 +3204,17 @@ export default function ChatArea({
 
           {!isTurnExpanded ? (
             null
-          ) : shouldPlanShortcutReplaceTurn({ isPlanTurn, hasCompletePlan, isPlanExecutionVisible }) ? (
-            <PlanShortcutCard
-              turn={turn}
-              hasPlanContent={hasPlanContent}
-              canOpenPlan={hasPlanPanelContent && hasPlanContent}
-              onOpenPlan={() => openRightPanelTab("plan")}
-              copy={copy}
-            />
           ) : (
             <>
+              {shouldPlanShortcutReplaceTurn({ isPlanTurn, hasCompletePlan, isPlanExecutionVisible }) && (
+                <PlanShortcutCard
+                  turn={turn}
+                  hasPlanContent={hasPlanContent}
+                  canOpenPlan={hasPlanPanelContent && hasPlanContent}
+                  onOpenPlan={() => openRightPanelTab("plan")}
+                  copy={copy}
+                />
+              )}
               {isPlanExecutionVisible && hasCompletePlan && (
                 <PlanShortcutCard
                   turn={turn}
@@ -3061,6 +3226,11 @@ export default function ChatArea({
               )}
               {shouldArchiveCompletedProcess ? (
                 <>
+                  <EffectiveProgressLedgerCard
+                    items={effectiveProgressLedger}
+                    language={language}
+                    chatFontSize={resolvedTurnProcessFontSize}
+                  />
                   {processArchive && processArchive.totalCount > 0 && (
                     <TurnProcessArchive
                       archive={processArchive}
@@ -3074,6 +3244,11 @@ export default function ChatArea({
                 </>
               ) : (
                 <>
+                  <EffectiveProgressLedgerCard
+                    items={effectiveProgressLedger}
+                    language={language}
+                    chatFontSize={resolvedTurnProcessFontSize}
+                  />
                   {liveProcessTimeline && liveProcessTimeline.totalCount > 0 && (
                     <LiveTurnProcessTimeline
                       model={liveProcessTimeline}

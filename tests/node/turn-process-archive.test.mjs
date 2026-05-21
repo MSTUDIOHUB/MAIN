@@ -470,6 +470,44 @@ test("codex activity groups include concrete result excerpts instead of generic 
   assert.match(groups[0].evidenceExcerpt, /dashboardStore/);
 });
 
+test("codex activity groups report repeated unchanged reads as one effective target", () => {
+  const groups = buildCodexActivityGroups([
+    {
+      id: 1,
+      type: "tool",
+      toolName: "read_file",
+      target: "src/store/dashboardStore.ts",
+      status: "done",
+      toolStatus: "executed",
+      observationSummary: "找到 CSV 导入后的 store 写入入口。",
+    },
+    {
+      id: 2,
+      type: "tool",
+      toolName: "read_file",
+      target: "src/store/dashboardStore.ts",
+      status: "done",
+      toolStatus: "executed",
+      message: "FILE_UNCHANGED_STUB: src/store/dashboardStore.ts",
+    },
+    {
+      id: 3,
+      type: "tool",
+      toolName: "read_file",
+      target: "src/store/dashboardStore.ts",
+      status: "done",
+      toolStatus: "executed",
+      message: "Repeated read-only tool call skipped: read_file target dashboardStore.ts",
+    },
+  ], "zh");
+
+  assert.equal(groups.length, 1);
+  assert.match(groups[0].title, /dashboardStore\.ts x3/);
+  assert.match(groups[0].summary, /1 个文件/);
+  assert.match(groups[0].summary, /重复：src\/store\/dashboardStore\.ts ×3/);
+  assert.match(groups[0].summary, /2 次缓存复用/);
+});
+
 test("codex activity groups keep edits commands browser and failures separate", () => {
   const groups = buildCodexActivityGroups([
     {

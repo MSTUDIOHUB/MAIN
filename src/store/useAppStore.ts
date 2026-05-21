@@ -1774,6 +1774,11 @@ function normalizeRuntimeEvents(value: unknown): MainThreadEvent[] {
     "path_alias_hit",
     "plan_state_hydrated",
     "harness.telemetry",
+    "progress.updated",
+    "plan.ready",
+    "approval.requested",
+    "run.paused",
+    "run.completed",
     "item.started",
     "item.updated",
     "item.completed",
@@ -7971,6 +7976,49 @@ export const useAppStore = create<AppState>()(
         );
       };
 
+      const emitRunEvent = (event: MainThreadEventInput) => {
+        if (normalizeEventStreamMode(sessionGet().config.eventStreamMode) === "legacy") return;
+        sessionSet((s) => ({
+          runtimeEvents: appendRuntimeEvent(s.runtimeEvents, withEventSchema(event)),
+        }));
+      };
+
+      const emitProgressRuntimeEvent = (
+        progress: ProgressNarration,
+        details: {
+          tool?: string;
+          target?: string;
+          dedupeKey?: string;
+          iteration?: number;
+          repeatCount?: number;
+        } = {},
+      ) => {
+        emitRunEvent({
+          type: "progress.updated",
+          threadId: runSessionKey,
+          turnId,
+          timestampMs: Date.now(),
+          progress: {
+            phase: progress.phase,
+            title: progress.title,
+            status: progress.status,
+            summary: progress.observedFact || progress.evidence || progress.action || progress.next || progress.why,
+            action: progress.action,
+            evidence: progress.evidence || progress.observedFact || progress.evidenceExcerpt,
+            next: progress.next,
+            target: details.target || progress.targets?.[0] || "",
+            tool: details.tool || "",
+            dedupeKey: details.dedupeKey || [
+              progress.phase,
+              details.tool || "",
+              details.target || progress.targets?.[0] || progress.title,
+            ].join(":"),
+            ...(details.iteration != null ? { iteration: details.iteration } : {}),
+            ...(details.repeatCount != null ? { repeatCount: details.repeatCount } : {}),
+          },
+        });
+      };
+
       const updateHarnessRunMarker = (patch: Partial<HarnessRunMarker> & Record<string, unknown>) => {
         const latest = sessionGet();
         const next = persistHarnessRunMarker({
@@ -8032,6 +8080,15 @@ export const useAppStore = create<AppState>()(
             latestTool: closed.latestTool,
             latestToolTarget: closed.latestToolTarget,
           });
+          if (status === "completed") {
+            emitRunEvent({
+              type: "run.completed",
+              threadId: runSessionKey,
+              turnId,
+              timestampMs: Date.now(),
+              summary: sessionGet().conversationTurns.find((item) => item.id === turnId)?.summary || "",
+            });
+          }
         }
       };
 
@@ -9078,6 +9135,15 @@ export const useAppStore = create<AppState>()(
               ...(firstCall?.name ? { toolName: firstCall.name } : {}),
               ...(firstCall?.target ? { target: firstCall.target } : {}),
             });
+            emitProgressRuntimeEvent(progressFromMeta, {
+              tool: firstCall?.name,
+              target: firstCall?.target,
+              dedupeKey: [
+                progressFromMeta.phase,
+                firstCall?.name || "model",
+                firstCall?.target || progressFromMeta.title,
+              ].join(":"),
+            });
             return;
           }
 
@@ -9207,6 +9273,11 @@ export const useAppStore = create<AppState>()(
           const isEphemeralPlanArtifactTool =
             (toolName === "write_file" || toolName === "replace_in_file") &&
             isEphemeralPlanArtifactPath(target);
+          emitProgressRuntimeEvent(progress, {
+            tool: toolName,
+            target,
+            dedupeKey: `${progress.phase}:${toolName}:${target}`,
+          });
 
           sessionSet((s) => {
             const pendingIdx = findToolLifecycleBlockIndex({
@@ -9327,6 +9398,7 @@ export const useAppStore = create<AppState>()(
           const isEphemeralPlanArtifactTool =
             (toolName === "write_file" || toolName === "replace_in_file") &&
             isEphemeralPlanArtifactPath(target);
+          let completedProgressForEvent = null as ProgressNarration | null;
           sessionSet((s) => {
             const idx = findToolLifecycleBlockIndex({
               taskFlow: s.taskFlow,
@@ -9372,6 +9444,7 @@ export const useAppStore = create<AppState>()(
               workflowMode: sessionGet().config.workflowMode,
               sourceToolCallIds: meta?.toolCallId ? [String(meta.toolCallId)] : [],
             });
+            completedProgressForEvent = doneProgress;
             updated[idx] = {
               ...updated[idx],
               turnPhase: withTurnRuntimePhaseStatus(
@@ -9460,6 +9533,14 @@ export const useAppStore = create<AppState>()(
                 : {}),
             };
           });
+          const completedProgressEventPayload = completedProgressForEvent;
+          if (completedProgressEventPayload) {
+            emitProgressRuntimeEvent(completedProgressEventPayload, {
+              tool: toolName,
+              target,
+              dedupeKey: `${completedProgressEventPayload.phase}:${toolName}:${target}`,
+            });
+          }
           if (!isEphemeralPlanArtifactTool) {
             emitLocalPlanExecutionProgress("tool_done", {
               currentTool: `${toolName}${target ? ` ${target}` : ""}`,
@@ -9481,6 +9562,7 @@ export const useAppStore = create<AppState>()(
 
         onToolError: (toolName, target, error, meta?: ToolLifecycleMeta) => {
           const language = sessionGet().config.language === "en" ? "en" : "zh";
+          let failedProgressForEvent = null as ProgressNarration | null;
           sessionSet((s) => {
             const idx = findToolLifecycleBlockIndex({
               taskFlow: s.taskFlow,
@@ -9506,6 +9588,7 @@ export const useAppStore = create<AppState>()(
               workflowMode: sessionGet().config.workflowMode,
               sourceToolCallIds: meta?.toolCallId ? [String(meta.toolCallId)] : [],
             });
+            failedProgressForEvent = failedProgress;
             const observationSummary = language === "en"
               ? `Tool failed: ${compactProgressContextText(error, 180)}`
               : `工具失败：${compactProgressContextText(error, 180)}`;
@@ -9558,6 +9641,14 @@ export const useAppStore = create<AppState>()(
               ),
             };
           });
+          const failedProgressEventPayload = failedProgressForEvent;
+          if (failedProgressEventPayload) {
+            emitProgressRuntimeEvent(failedProgressEventPayload, {
+              tool: toolName,
+              target,
+              dedupeKey: `${failedProgressEventPayload.phase}:${toolName}:${target}`,
+            });
+          }
           emitLocalPlanExecutionProgress("tool_error", {
             currentTool: `${toolName}${target ? ` ${target}` : ""}`,
             nextStep: sessionGet().config.language === "en"
@@ -9649,6 +9740,14 @@ export const useAppStore = create<AppState>()(
                   effectiveRunIntent,
                   planArtifacts: state.planArtifacts.length,
                   planStage: state.planStage,
+                });
+                emitRunEvent({
+                  type: "approval.requested",
+                  threadId: runSessionKey,
+                  turnId,
+                  timestampMs: Date.now(),
+                  reason: "plan_review",
+                  target: state.planArtifacts[0]?.path || ".MAIN/plans/plan.md",
                 });
                 emitLocalPlanExecutionProgress("waiting_review", {
                   nextStep: state.config.language === "en"
@@ -9830,6 +9929,22 @@ export const useAppStore = create<AppState>()(
           const visibleMessage = isApprovedExecutionPause && message.trim()
             ? `${message.trim()}\n\n${language === "en" ? "MAIN kept the current workspace state; use Resume Execution to continue from here." : "MAIN 已保留当前 workspace 状态；可使用 Resume Execution 从这里继续。"}`
             : message;
+          emitRunEvent({
+            type: "run.paused",
+            threadId: runSessionKey,
+            turnId,
+            timestampMs: Date.now(),
+            reason,
+            message: visibleMessage,
+            progress: {
+              phase: "blocked",
+              title: language === "en" ? "Run paused" : "运行已暂停",
+              status: "paused",
+              summary: visibleMessage,
+              next: progress?.nextStep || "",
+              dedupeKey: `pause:${reason}`,
+            },
+          });
           const block: TaskBlock = {
             id: nextId(),
             turnId,
@@ -9848,6 +9963,16 @@ export const useAppStore = create<AppState>()(
             kind,
             contentChars: content.length,
           });
+          if (kind === "plan") {
+            emitRunEvent({
+              type: "plan.ready",
+              threadId: runSessionKey,
+              turnId,
+              timestampMs: Date.now(),
+              path,
+              summary: summarizeAssistantText(content),
+            });
+          }
           const sanitized = sanitizePlanArtifactContent(content);
           const validation = validatePlanArtifactContent(sanitized, kind);
           if (!validation.ok) {

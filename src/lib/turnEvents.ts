@@ -23,6 +23,21 @@ export interface MainThreadHarnessTelemetry {
   details: Record<string, unknown>;
 }
 
+export interface MainThreadProgressUpdate {
+  phase: "understanding" | "investigating" | "editing" | "verifying" | "blocked" | "summarizing" | string;
+  title: string;
+  status: "running" | "done" | "failed" | "paused" | "completed" | string;
+  summary?: string;
+  action?: string;
+  evidence?: string;
+  next?: string;
+  target?: string;
+  tool?: string;
+  dedupeKey?: string;
+  repeatCount?: number;
+  iteration?: number;
+}
+
 export interface MainThreadItem {
   id: string;
   details: MainThreadItemDetails;
@@ -51,6 +66,11 @@ export type MainThreadEvent =
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "path_alias_hit"; threadId: string; turnId: string; timestampMs: number; tool: string; field: string; from: string; to: string; rule: string }
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "plan_state_hydrated"; threadId: string; turnId?: string; timestampMs: number; reason: string; taskCount: number; artifactPaths: string[] }
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "harness.telemetry"; threadId: string; turnId?: string; timestampMs: number; telemetry: MainThreadHarnessTelemetry }
+  | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "progress.updated"; threadId: string; turnId: string; timestampMs: number; progress: MainThreadProgressUpdate }
+  | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "plan.ready"; threadId: string; turnId: string; timestampMs: number; path?: string; summary?: string }
+  | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "approval.requested"; threadId: string; turnId: string; timestampMs: number; reason: string; target?: string }
+  | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "run.paused"; threadId: string; turnId: string; timestampMs: number; reason: string; message: string; progress?: MainThreadProgressUpdate }
+  | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "run.completed"; threadId: string; turnId: string; timestampMs: number; summary?: string }
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "item.started"; threadId: string; turnId: string; timestampMs: number; item: MainThreadItem }
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "item.updated"; threadId: string; turnId: string; timestampMs: number; item: MainThreadItem }
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "item.completed"; threadId: string; turnId: string; timestampMs: number; item: MainThreadItem }
