@@ -47,6 +47,7 @@ import {
   serializeAssistantReplyForHistory,
   shouldAutoContinueReadOnlyPermission as shouldAutoContinueReadOnlyPermissionState,
   shouldPauseForReplyOptions,
+  shouldRouteUnapprovedPlanReplyOptionsToArtifact,
   stripReadOnlyPermissionPrompt,
 } from "./replyOptions";
 import { buildToolDiffPreview, type ToolDiffPreview } from "./toolDiff";
@@ -190,6 +191,7 @@ import {
   type TaskOrchestratorPhase,
 } from "./taskTargeting";
 import {
+  assessPlanEvidenceReadiness,
   isPlanPostConvergenceArtifactToolName,
   shouldNarrowPlanToolsAfterReadOnlyConvergence,
   shouldRedirectPlanToolsAfterReadOnlyConvergence,
@@ -248,6 +250,15 @@ function getMessageContentText(content: AgentMessage["content"]): string {
     .join("\n");
 }
 
+function hasPlanUserContextObservation(messages: AgentMessage[], latestAssistantText = ""): boolean {
+  const assistantTexts = messages
+    .filter((message) => message.role === "assistant")
+    .map((message) => getMessageContentText(message.content))
+    .concat(latestAssistantText)
+    .join("\n");
+  return /(?:截图观察|从截图(?:中)?(?:我)?观察到|图片中可见|图\s*\d|screenshot observations|screenshot shows|image shows|visible in the provided image)/i.test(assistantTexts);
+}
+
 export function buildPlanReadOnlyConvergencePrompt(
   language: "zh" | "en",
   batchCount: number,
@@ -264,13 +275,14 @@ export function buildPlanReadOnlyConvergencePrompt(
         ? `User-provided context exists: ${context.imageParts} image(s), ${context.mentionedFilePaths.length} @ file(s), ${context.attachedFilePaths.length} attachment(s). Treat it as primary evidence.`
         : "",
       context.imageParts > 0
-        ? "Before any more repository reads, the next response must include a concrete 'Screenshot observations' section that states what is visible in the provided image(s) and maps those observations to likely UI/state/code areas."
+        ? "If you have not already done so, include a concrete 'Screenshot observations' section that states what is visible in the provided image(s) and maps those observations to likely UI/state/code areas."
         : "",
       context.mentionedFilePaths.length > 0 || context.attachedFilePaths.length > 0
         ? "Before any broad discovery, use the exact @ file or attachment paths as primary evidence and name what those files already show."
         : "",
-      "Stop broad rereading now. In the next response, create or update `.MAIN/plans/plan.md` with a concise reviewable diagnosis plan, then submit the formal Proposal.",
-      "The draft must include: root cause hypothesis, evidence already read, tradeoffs, affected files, implementation steps, and validation.",
+      "Stop broad rereading now. If the evidence is decision-complete, create or update `.MAIN/plans/plan.md` as the persisted equivalent of a Codex `<proposed_plan>` block, then submit the formal Proposal.",
+      "The draft must include: confirmed findings, unverified hypotheses, evidence already read, tradeoffs, affected files, implementation steps, and validation.",
+      "If one targeted read is still needed to confirm the root cause, perform only that read next; do not write a plan from guesses.",
       "Only use `<user_options>` if there is a real product/design decision the user must make before a plan can be written. Do not offer options that merely ask to continue reading, checking, analyzing, or verifying.",
       "If a blocker remains, name the blocker and the single missing fact needed; do not continue broad file exploration.",
     ].filter(Boolean).join("\n");
@@ -282,13 +294,14 @@ export function buildPlanReadOnlyConvergencePrompt(
       ? `用户已提供上下文：${context.imageParts} 张图片、${context.mentionedFilePaths.length} 个 @ 文件、${context.attachedFilePaths.length} 个附件。必须把这些作为优先证据。`
       : "",
     context.imageParts > 0
-      ? "在继续读取仓库前，下一条必须先写出“截图观察到的现象”：具体说明图片中可见的 UI/状态/文本/异常，并把这些现象映射到可能的 UI、状态或代码区域。"
+      ? "如果还没有写过，下一条必须先写出“截图观察到的现象”：具体说明图片中可见的 UI/状态/文本/异常，并把这些现象映射到可能的 UI、状态或代码区域。"
       : "",
     context.mentionedFilePaths.length > 0 || context.attachedFilePaths.length > 0
       ? "在继续大范围发现前，必须优先使用 @ 文件或附件的精确路径作为主要证据，并说明这些文件已经证明了什么。"
       : "",
-    "下一步不要继续泛读文件。请创建或更新 `.MAIN/plans/plan.md` 精简可审批诊断方案，然后提交正式 Proposal。",
-    "草案必须包含：问题归因假设、已读证据、方案取舍、影响文件、实施步骤和验证方式。",
+    "下一步不要继续泛读文件。如果证据已经足够，请创建或更新 `.MAIN/plans/plan.md`，把它作为 Codex `<proposed_plan>` 的持久化审批产物，然后提交正式 Proposal。",
+    "草案必须包含：已确认发现、未验证假设、已读证据、方案取舍、影响文件、实施步骤和验证方式。",
+    "如果仍缺一个定向读取才能确认根因，只允许补这个具体证据；不要把猜测写成计划。",
     "只有存在真实产品/设计分叉、必须由用户决定后才能写计划时，才允许使用 `<user_options>`；不要给出只是继续读取、检查、分析或验证的选项。",
     "如果仍有阻塞，只说明阻塞点和唯一缺失事实；不要继续大范围探索。",
   ].filter(Boolean).join("\n");
@@ -1677,6 +1690,25 @@ function buildExecuteReplanningEvidencePrompt(language: "zh" | "en", retryCount:
   ].filter(Boolean).join("\n");
 }
 
+function buildReadOnlyPermissionHardRecoveryPrompt(language: "zh" | "en", workflowMode: "chat" | "edit" | "plan"): string {
+  if (language === "en") {
+    return [
+      "The user already allowed read-only inspection for this session, but the previous turn still did not make useful tool progress.",
+      "Do not ask for permission again and do not narrate a future read.",
+      workflowMode === "plan"
+        ? "If the evidence is sufficient, write `.MAIN/plans/plan.md`; if one fact is still missing, call exactly one targeted read/search tool now. If the target was already cached, reuse the existing content instead of rereading it."
+        : "If you need evidence, call one targeted read/search tool now. If the target was already cached, reuse the existing content and move to the next real action: patch/write, run a finite command, browser validation, or state the exact blocker.",
+    ].join("\n");
+  }
+  return [
+    "用户已经允许本会话的只读检查，但上一轮仍没有产生有效工具进展。",
+    "不要再次询问许可，也不要只描述接下来要读取什么。",
+    workflowMode === "plan"
+      ? "如果证据已经足够，直接写入 `.MAIN/plans/plan.md`；如果只缺一个事实，现在只调用一次定向读取/搜索工具。目标已缓存时复用已有内容，不要重复读取。"
+      : "如果还需要证据，现在只调用一次定向读取/搜索工具。目标已缓存时复用已有内容，并进入下一个真实动作：写入/替换、运行有限命令、浏览器验证，或说明精确阻塞。",
+  ].join("\n");
+}
+
 function buildApprovedPlanNoProgressStrategySwitchPrompt(input: {
   language: "zh" | "en";
   remainingText: string;
@@ -2176,7 +2208,9 @@ function buildPlanRecoveryPrompt(callbacks: OrchestratorCallbacks, sourceText: s
       "",
       "Rules:",
       "- Do not copy tool logs, duplicate-call warnings, hidden thinking, raw source code, or truncation messages into plan files.",
-      "- `plan.md` is the default required approval artifact. It must include the user goal/constraints, current findings, proposed approach, affected files/interfaces, ordered implementation strategy, data/control flow, risks/tradeoffs, validation, and default assumptions/follow-up enhancements. For complex implementations, include one concise Mermaid diagram by default; skip diagrams for simple structures unless the user explicitly asks for one.",
+      "- `plan.md` is the default required approval artifact and the persisted equivalent of a Codex `<proposed_plan>` block.",
+      "- `plan.md` must include: user goal/constraints, screenshot/attachment observations when present, read evidence with paths/tool references, confirmed findings, unverified hypotheses, affected files/interfaces, ordered execution steps, risks/tradeoffs, and validation standards.",
+      "- Do not include console.log/debug-log suggestions, generalized CSS/store guesses, or probability claims as execution steps unless a cited evidence line supports them; otherwise place them under unverified hypotheses.",
       "- Non-blocking MVP tradeoffs must be written with explicit defaults as assumptions or follow-up enhancements. If a choice blocks execution, ask with `<user_options>` before approval and stop.",
       "- `requirements.md` is optional. Only create it when the user explicitly asks for a requirement ledger or when large/compliance-heavy scope needs traceability; it is never a prerequisite for approval.",
       "- If the plan direction is unclear, ask the user with `<user_options>` and stop. Do not invent a final plan.",
@@ -2191,7 +2225,9 @@ function buildPlanRecoveryPrompt(callbacks: OrchestratorCallbacks, sourceText: s
     "",
     "规则：",
     "- 不要把工具日志、重复调用提示、后台思考、原始源码或截断提示写进计划文件。",
-    "- `plan.md` 是默认必需的审批方案：必须包含用户目标/约束、当前发现、拟定方案、影响文件/接口、执行顺序、数据流/控制流、风险取舍、验证方式和默认假设/后续增强。复杂实现默认包含 1 个简短 Mermaid 图；简单结构不需要，除非用户明确要求生成图。",
+    "- `plan.md` 是默认必需的审批方案，也是 Codex `<proposed_plan>` 的持久化替代物。",
+    "- `plan.md` 必须包含：用户目标/约束、截图/附件观察（如存在）、带路径或工具引用的已读证据、已确认事实、真实发现、未验证假设、影响文件/接口、执行步骤、风险取舍和验证标准。",
+    "- 没有证据支撑时，不要把 console.log/调试日志建议、泛化 CSS/Store 猜测或概率判断写成执行步骤；只能放入未验证假设。",
     "- 非阻塞 MVP 取舍必须写成带默认值的默认假设或后续增强；真正阻塞执行的选择必须在批准前用 `<user_options>` 提问并停止。",
     "- `requirements.md` 是可选需求台账；只有用户明确要求、范围很大或需要合规/验收追踪时才生成，绝不是审批前置条件。",
     "- 如果设计方向不明确，使用 `<user_options>` 让用户选择并立刻停止；不要编造最终方案。",
@@ -2653,6 +2689,7 @@ interface ToolExecutionResult {
   isError: boolean;
   lifecycleState?: ToolLifecycleState;
   additionalContexts?: string[];
+  internalFeedback?: boolean;
 }
 
 interface PlanMaterializationResultForLoop {
@@ -2856,17 +2893,13 @@ export function buildToolActionNarration(input: {
       phase: "summarizing",
       title: input.language === "zh" ? "整理可审批方案" : "Draft reviewable plan",
       why: input.language === "zh"
-        ? "当前还在计划审批前，源码不能提前修改；先把已确认上下文收束成 plan.md，方便用户审阅范围和取舍。"
-        : "The turn is still before plan approval, so source edits wait; first consolidate the evidence into plan.md for review.",
+        ? "计划审批前只持久化方案，不提前修改源码。"
+        : "Before approval, persist the plan without editing source files.",
       action: input.language === "zh"
         ? "正在写入或更新 `.MAIN/plans/plan.md` 草案。"
         : "Writing or updating the `.MAIN/plans/plan.md` draft.",
-      evidence: input.language === "zh"
-        ? "等待计划文件写入结果作为可审阅方案证据。"
-        : "Waiting for the plan-file write result as review evidence.",
-      next: input.language === "zh"
-        ? "方案草案准备好后停下来等待用户审批。"
-        : "Pause for user approval once the draft is ready.",
+      evidence: "",
+      next: "",
       targets: presentations.map((item) => item.presentation.target).filter(Boolean),
       status: "running",
       source: "runtime",
@@ -2879,17 +2912,13 @@ export function buildToolActionNarration(input: {
         phase: "understanding",
         title: input.language === "zh" ? "先对齐用户上下文" : "Align provided context first",
         why: input.language === "zh"
-          ? `用户已提供 ${context.imageParts} 张图片、${context.mentionedFilePaths.length} 个 @ 文件、${context.attachedFilePaths.length} 个附件。计划前要先确认这些证据指向的问题，避免从目录结构开始泛读。`
-          : `The user provided ${context.imageParts} image(s), ${context.mentionedFilePaths.length} @ file(s), and ${context.attachedFilePaths.length} attachment(s). Before drafting the plan, confirm what that evidence points to instead of starting from broad structure.`,
+          ? `用户已提供 ${context.imageParts} 张图片、${context.mentionedFilePaths.length} 个 @ 文件、${context.attachedFilePaths.length} 个附件，先围绕这些证据收束。`
+          : `The user provided ${context.imageParts} image(s), ${context.mentionedFilePaths.length} @ file(s), and ${context.attachedFilePaths.length} attachment(s); ground the plan in that evidence first.`,
         action: input.language === "zh"
           ? `正在围绕用户提供的上下文做只读确认：${summaries}${suffix}。`
           : `Checking the provided-context trail with read-only tools: ${summaries}${suffix}.`,
-        evidence: input.language === "zh"
-          ? "等待返回内容来判断截图/文件现象对应的具体代码或状态链路。"
-          : "Waiting for returned content to connect the screenshot/file observations to the concrete code or state path.",
-        next: input.language === "zh"
-          ? "确认现象和代码链路后，收束为可审批的 plan.md 方案。"
-          : "Once the observed behavior is mapped to code, condense it into a reviewable plan.md plan.",
+        evidence: "",
+        next: "",
         targets: presentations.map((item) => item.presentation.target).filter(Boolean),
         status: "running",
         source: "runtime",
@@ -2899,17 +2928,13 @@ export function buildToolActionNarration(input: {
       phase: "investigating",
       title: input.language === "zh" ? "先收集计划证据" : "Gather planning evidence first",
       why: input.language === "zh"
-        ? "计划还没批准，需要先用只读证据确认范围，避免把猜测写进方案。"
-        : "The plan is not approved yet, so read-only evidence should narrow scope before drafting decisions.",
+        ? "计划未批准，先用只读证据确认范围。"
+        : "Use read-only evidence to narrow scope before approval.",
       action: input.language === "zh"
         ? `正在做只读探索：${summaries}${suffix}。`
         : `Gathering read-only context: ${summaries}${suffix}.`,
-      evidence: input.language === "zh"
-        ? "等待读取、搜索或分析结果来支撑方案分叉。"
-        : "Waiting for read, search, or analysis results to support the plan branch.",
-      next: input.language === "zh"
-        ? "拿到证据后再决定提问确认，或生成可审批 plan.md 草案。"
-        : "Use the evidence to ask for a decision or draft a reviewable plan.md.",
+      evidence: "",
+      next: "",
       targets: presentations.map((item) => item.presentation.target).filter(Boolean),
       status: "running",
       source: "runtime",
@@ -3793,11 +3818,20 @@ async function buildPlanArtifactMutationValidationError(
         tool: tc.name,
         reason: validation.reason || "quality_gate",
       });
+      const shouldUseInternalFeedback =
+        kind === "plan" &&
+        !callbacks.getIsPlanApproved();
       const message = language === "zh"
-        ? `PLAN_QUALITY_GATE: ${path} 被拦截，内容不像可审批的正式计划（${validation.reason || "质量不足"}）。请基于用户目标和已读源码重新生成 plan.md，或用 <user_options> 询问关键分叉；不要写入工具日志、后台思考、截断提示或原始代码片段。`
+        ? shouldUseInternalFeedback
+          ? `PLAN_NOT_READY: ${path} 没有写入。当前内容未达到 Codex 式可审批 plan.md（${validation.reason || "质量不足"}）。不要把猜测、调试日志建议或泛化方案写成计划；请补足截图/附件观察、已读证据、真实发现、未验证假设、影响文件、执行步骤和验证标准。如果关键事实不足，只做一个定向证据读取或提出一个具体阻塞问题。`
+          : `PLAN_QUALITY_GATE: ${path} 被拦截，内容不像可审批的正式计划（${validation.reason || "质量不足"}）。请基于用户目标和已读源码重新生成 plan.md，或用 <user_options> 询问关键分叉；不要写入工具日志、后台思考、截断提示或原始代码片段。`
+        : shouldUseInternalFeedback
+        ? `PLAN_NOT_READY: ${path} was not written. The content is not a Codex-style reviewable plan.md yet (${validation.reason || "quality gate"}). Do not turn guesses, debug-log advice, or generic proposals into the plan; add screenshot/attachment observations, read evidence, confirmed findings, unverified hypotheses, affected files, execution steps, and validation standards. If a key fact is missing, do exactly one targeted evidence read or ask one concrete blocking question.`
         : `PLAN_QUALITY_GATE: ${path} was rejected because it does not look like a reviewable plan artifact (${validation.reason || "quality gate"}). Regenerate plan.md from the user goal and inspected source, or ask the user with <user_options>; do not write tool logs, hidden thinking, truncation notices, or raw source snippets.`;
-      callbacks.onToolExecuting(tc.name, target, undefined, { toolCallId: tc.id });
-      callbacks.onToolError(tc.name, target, message, { toolCallId: tc.id });
+      if (!shouldUseInternalFeedback) {
+        callbacks.onToolExecuting(tc.name, target, undefined, { toolCallId: tc.id });
+        callbacks.onToolError(tc.name, target, message, { toolCallId: tc.id });
+      }
       return {
         toolCallId: tc.id,
         name: tc.name,
@@ -3805,6 +3839,7 @@ async function buildPlanArtifactMutationValidationError(
         content: `Error: ${message}`,
         isError: true,
         lifecycleState: "blocked",
+        ...(shouldUseInternalFeedback ? { internalFeedback: true, displayContent: "" } : {}),
       };
     }
   }
@@ -4741,6 +4776,7 @@ export async function executeAgentLoop(
   let planPostConvergenceToolRedirectCount = 0;
   let usedExecuteCompletionEvidencePrompt = false;
   let usedExecuteReplanningEvidencePrompt = false;
+  let usedReadOnlyPermissionHardRecoveryPrompt = false;
   let planReadOnlyConvergenceBatches = 0;
   let planReadOnlyConvergenceTools = 0;
   const attemptedPlanWriteTargets: string[] = [];
@@ -4755,6 +4791,7 @@ export async function executeAgentLoop(
   let approvedPlanNoProgressRecoveryAttempts = 0;
   let approvedPlanActionOnlyRecoveryActive = false;
   const rememberToolActivity = (targetList: PlanToolActivitySummary[], result: ToolExecutionResult) => {
+    if (result.internalFeedback) return;
     const detail = truncateForLog(result.displayContent || result.content || "", 120);
     targetList.push({
       name: result.name,
@@ -5085,6 +5122,14 @@ export async function executeAgentLoop(
       workflowMode,
       isPlanApproved: callbacks.getIsPlanApproved(),
       convergencePromptAlreadyUsed: usedPlanReadOnlyConvergencePrompt,
+      evidenceReadiness: assessPlanEvidenceReadiness({
+        userContext: turnInputContextSignals,
+        recentToolActivity: recentPlanToolActivity,
+        hasObservedUserContext: hasPlanUserContextObservation(
+          callbacks.getMessages() as AgentMessage[],
+          lastAssistantTextForCheckpoint,
+        ),
+      }).status,
     });
     const iterationAllTools = shouldUsePlanPostConvergenceArtifactTools
       ? baseIterationAllTools.filter((tool) => isPlanPostConvergenceArtifactToolName(tool.function.name))
@@ -6052,6 +6097,27 @@ export async function executeAgentLoop(
       suppressPlanContinuationReplyOptions ||
       suppressExecutableProposalOptionsForToolCalls;
     const sourceVisibleText = normalizedBase.visibleText || normalized.visibleText;
+    const hasStructuredProposal = hasStructuredPlanProposal(streamText);
+    const currentPlanStageForReview = callbacks.getPlanStage();
+    const isApprovedPlanExecutionTurn =
+      workflowMode === "plan" &&
+      callbacks.getIsPlanApproved() &&
+      currentPlanStageForReview === "executing";
+    const hasReadyPlanArtifacts = currentPlanStageForReview === "ready_to_execute";
+    const hasReviewablePlanArtifacts = isReviewablePlanStage(currentPlanStageForReview);
+    const rawFinalReplyOptions = compactedProseCodeDump || suppressNonDecisionReplyOptions
+      ? []
+      : normalized.replyOptions;
+    const planReplyOptionsRoutedToArtifact = shouldRouteUnapprovedPlanReplyOptionsToArtifact({
+      replyOptions: rawFinalReplyOptions,
+      workflowMode,
+      isPlanApproved: callbacks.getIsPlanApproved(),
+      hasStructuredProposal,
+      hasReadyPlanArtifacts,
+      hasReviewablePlanArtifacts,
+      sawPlanModeToolActivity,
+      visibleText: sourceVisibleText,
+    });
     const normalizedVisibleTextForUser = suppressReadOnlyPermissionOptions
       ? stripReadOnlyPermissionPrompt(normalized.visibleText)
       : normalized.visibleText;
@@ -6060,9 +6126,7 @@ export async function executeAgentLoop(
       : compactedIncompletePlanText
       ? buildPlanFallbackNotice(callbacks.getPreferredLanguage(), sourceVisibleText.length)
       : normalizedVisibleTextForUser;
-    const finalReplyOptions = compactedProseCodeDump || suppressNonDecisionReplyOptions
-      ? []
-      : normalized.replyOptions;
+    const finalReplyOptions = planReplyOptionsRoutedToArtifact ? [] : rawFinalReplyOptions;
     let recoveredPseudoToolCall = false;
     const pseudoToolNameCandidate =
       effectiveToolCalls.length === 0 &&
@@ -6141,6 +6205,17 @@ export async function executeAgentLoop(
         toolCalls: effectiveToolCalls.length,
         replyOptions: normalized.replyOptions.length,
         optionPreview: summarizeReplyOptionsForLog(normalized.replyOptions),
+        workflowMode,
+        turnIntent,
+      });
+    }
+    if (planReplyOptionsRoutedToArtifact) {
+      logAgentEvent("plan_reply_options_routed_to_artifact", {
+        iteration,
+        replyOptions: rawFinalReplyOptions.length,
+        optionPreview: summarizeReplyOptionsForLog(rawFinalReplyOptions),
+        sawPlanModeToolActivity,
+        visibleChars: sourceVisibleText.length,
         workflowMode,
         turnIntent,
       });
@@ -6388,11 +6463,18 @@ export async function executeAgentLoop(
     }
 
     if (effectiveToolCalls.length > 0 && containsToolUseBlock(streamText)) {
-      callbacks.onStreamToken("__ESCALATION_RESET__:", assistantMsgId);
+      const preserveScopedPlanVisibleText =
+        workflowMode === "plan" &&
+        !callbacks.getIsPlanApproved() &&
+        visibleAssistantText.trim().length > 0;
+      if (!preserveScopedPlanVisibleText) {
+        callbacks.onStreamToken("__ESCALATION_RESET__:", assistantMsgId);
+      }
       logAgentEvent("tool_protocol_stream_cleared", {
         iteration,
         toolCalls: effectiveToolCalls.length,
         narrationInjected: visibleAssistantText.trim().length > 0,
+        preservedVisibleText: preserveScopedPlanVisibleText,
         workflowMode,
         turnIntent,
       });
@@ -6440,8 +6522,34 @@ export async function executeAgentLoop(
         strippedVisibleChars: finalVisibleText.length,
       });
       if (consecutiveNoToolCount >= MAX_NO_ACTION_RETRIES) {
-        callbacks.onError("模型连续要求确认只读步骤，没有继续调用只读工具。已中止本轮，请重试或切换更稳定的模型。");
-        callbacks.onStatusChange("error");
+        logAgentEvent("readonly_permission_auto_continue_limit", {
+          iteration,
+          consecutiveNoToolCount,
+          workflowMode,
+          turnIntent,
+          runtimeIntent,
+          usedHardRecovery: usedReadOnlyPermissionHardRecoveryPrompt,
+        });
+        if (!usedReadOnlyPermissionHardRecoveryPrompt) {
+          usedReadOnlyPermissionHardRecoveryPrompt = true;
+          consecutiveNoToolCount = 0;
+          if (historyAssistantText.trim()) {
+            callbacks.appendMessage(buildAssistantHistoryMessage(historyAssistantText, providerReasoningForHistory));
+          }
+          callbacks.onStatusChange("running");
+          callbacks.appendMessage({
+            role: "user",
+            content: buildReadOnlyPermissionHardRecoveryPrompt(callbacks.getPreferredLanguage(), workflowMode),
+          });
+          continue;
+        }
+        callbacks.onNonActionableStop(
+          callbacks.getPreferredLanguage() === "zh"
+            ? "本轮已暂停：模型在只读许可已授予后仍没有产生有效工具动作。恢复时请直接使用一个未缓存的定向工具调用，或基于已缓存内容继续写入/验证。"
+            : "This turn is paused: after read-only permission was granted, the model still did not produce useful tool action. Resume with one uncached targeted tool call, or continue from cached content with write/validation.",
+          workflowMode === "plan" ? "incomplete_plan" : "no_action",
+        );
+        callbacks.onStatusChange("idle");
         return;
       }
 
@@ -6460,18 +6568,10 @@ export async function executeAgentLoop(
       sawPlanModeToolActivity = true;
     }
 
-    const hasStructuredProposal = hasStructuredPlanProposal(streamText);
     const hasExecutablePlanProposalOptions =
       workflowMode === "plan" &&
       !callbacks.getIsPlanApproved() &&
-      hasExecutableProposalReplyOptions(finalReplyOptions);
-    const currentPlanStageForReview = callbacks.getPlanStage();
-    const isApprovedPlanExecutionTurn =
-      workflowMode === "plan" &&
-      callbacks.getIsPlanApproved() &&
-      currentPlanStageForReview === "executing";
-    const hasReadyPlanArtifacts = currentPlanStageForReview === "ready_to_execute";
-    const hasReviewablePlanArtifacts = isReviewablePlanStage(currentPlanStageForReview);
+      hasExecutableProposalReplyOptions(rawFinalReplyOptions);
     const shouldPauseForUserChoice = shouldPauseForReplyOptions({
       replyOptions: finalReplyOptions,
       toolCallCount: effectiveToolCalls.length,
@@ -6515,12 +6615,21 @@ export async function executeAgentLoop(
       });
     }
 
+    const planEvidenceReadinessForRedirect = assessPlanEvidenceReadiness({
+      userContext: turnInputContextSignals,
+      recentToolActivity: recentPlanToolActivity,
+      hasObservedUserContext: hasPlanUserContextObservation(
+        callbacks.getMessages() as AgentMessage[],
+        lastAssistantTextForCheckpoint || visibleAssistantText,
+      ),
+    });
     const shouldRedirectPostConvergenceToolCalls = shouldRedirectPlanToolsAfterReadOnlyConvergence({
       workflowMode,
       isPlanApproved: callbacks.getIsPlanApproved(),
       convergencePromptAlreadyUsed: usedPlanReadOnlyConvergencePrompt,
       hasPlanDecisionOutput: hasStructuredProposal || finalReplyOptions.length > 0 || hasReviewablePlanArtifacts,
       toolNames: effectiveToolCalls.map((call) => call.name),
+      evidenceReadiness: planEvidenceReadinessForRedirect.status,
     });
     if (shouldRedirectPostConvergenceToolCalls) {
       if (hasMeaningfulVisibleText) {
@@ -6536,6 +6645,8 @@ export async function executeAgentLoop(
         mentionedFilePaths: turnInputContextSignals.mentionedFilePaths.length,
         attachedFilePaths: turnInputContextSignals.attachedFilePaths.length,
         preservedVisibleText: hasMeaningfulVisibleText,
+        evidenceReadiness: planEvidenceReadinessForRedirect.status,
+        evidenceReadinessReason: planEvidenceReadinessForRedirect.reason,
       });
       logAgentEvent("plan_unsupported_tool_call_suppressed", {
         iteration,
@@ -6543,6 +6654,8 @@ export async function executeAgentLoop(
         toolNames: effectiveToolCalls.map((call) => call.name).slice(0, 8),
         availableToolNames: Array.from(availableToolNames).slice(0, 12),
         preservedVisibleText: hasMeaningfulVisibleText,
+        evidenceReadiness: planEvidenceReadinessForRedirect.status,
+        evidenceReadinessReason: planEvidenceReadinessForRedirect.reason,
       });
 
       if (planPostConvergenceToolRedirectCount >= 1) {
@@ -6869,17 +6982,18 @@ export async function executeAgentLoop(
           planningStillIncomplete &&
           hasMeaningfulSourcePlanText &&
           !hasReviewablePlanArtifacts &&
-          (sawPlanModeToolActivity || wasTruncated || hasExecutablePlanProposalOptions);
+          (sawPlanModeToolActivity || wasTruncated || hasExecutablePlanProposalOptions || planReplyOptionsRoutedToArtifact);
         const shouldTryPlanTextMaterialization =
           planningStillIncomplete &&
           hasMeaningfulSourcePlanText &&
           !hasReviewablePlanArtifacts &&
-          (finalReplyOptions.length === 0 || hasExecutablePlanProposalOptions) &&
+          (finalReplyOptions.length === 0 || hasExecutablePlanProposalOptions || planReplyOptionsRoutedToArtifact) &&
           !hasStructuredProposal &&
           (
             sawPlanModeToolActivity ||
             wasTruncated ||
             hasExecutablePlanProposalOptions ||
+            planReplyOptionsRoutedToArtifact ||
             turnIntent === "plan" ||
             commandDirective?.action === "plan_file_change"
           );
@@ -7981,11 +8095,12 @@ export async function executeAgentLoop(
 
     allResults.forEach(rememberAnyToolActivity);
     const remainingTaskForDigest = callbacks.getPlanTasks().find((task) => !isPlanTaskTrustedComplete(task));
-    if (callbacks.onExecutionDigestUpdate && allResults.length > 0) {
+    const externalResultsForDigest = allResults.filter((result) => !result.internalFeedback);
+    if (callbacks.onExecutionDigestUpdate && externalResultsForDigest.length > 0) {
       const digest = buildExecutionDigest({
         language: callbacks.getPreferredLanguage(),
         turnIntent,
-        toolResults: allResults,
+        toolResults: externalResultsForDigest,
         remainingTask: remainingTaskForDigest?.text,
       });
       if (digest) callbacks.onExecutionDigestUpdate(digest);
@@ -8148,6 +8263,7 @@ export async function executeAgentLoop(
     for (const result of allResults) {
       const signature = toolFailureSignatures.get(result.toolCallId);
       if (!signature) continue;
+      if (result.internalFeedback) continue;
       if (result.isError) {
         failedToolCallCounts.set(signature, (failedToolCallCounts.get(signature) ?? 0) + 1);
       } else {
@@ -8163,6 +8279,7 @@ export async function executeAgentLoop(
         content: toolHistoryContent,
         tool_call_id: result.toolCallId,
       });
+      if (result.internalFeedback) continue;
       emitTurnEvent({
         type: "item.completed",
         threadId: eventThreadId,
@@ -8209,12 +8326,23 @@ export async function executeAgentLoop(
       planReadOnlyConvergenceTools = 0;
     }
 
+    const planEvidenceReadinessForConvergence = assessPlanEvidenceReadiness({
+      userContext: turnInputContextSignals,
+      recentToolActivity: recentPlanToolActivity,
+      hasObservedUserContext: hasPlanUserContextObservation(
+        callbacks.getMessages() as AgentMessage[],
+        lastAssistantTextForCheckpoint,
+      ),
+    });
     const shouldConvergeUnapprovedPlanReadOnly = shouldTriggerPlanReadOnlyConvergence({
       isUnapprovedPlanReadOnlyBatch,
       hasPlanDecisionOutput,
       batchCount: planReadOnlyConvergenceBatches,
       toolCount: planReadOnlyConvergenceTools,
       userContext: turnInputContextSignals,
+      recentToolActivity: recentPlanToolActivity,
+      hasObservedUserContext: planEvidenceReadinessForConvergence.status !== "needs_observation",
+      convergencePromptAlreadyUsed: usedPlanReadOnlyConvergencePrompt,
     });
 
     if (shouldConvergeUnapprovedPlanReadOnly) {
@@ -8224,8 +8352,8 @@ export async function executeAgentLoop(
         kind: "diagnosis",
         title: language === "zh" ? "归因方案" : "Diagnosis",
         summary: language === "zh"
-          ? "只读上下文已足够，下一步应收束证据并形成方案。"
-          : "Enough read-only context has been gathered; condense the evidence into a plan next.",
+          ? "已拿到定向证据；如果没有关键缺口，下一步应形成可审批计划。"
+          : "Targeted evidence is available; if no key gap remains, condense it into a reviewable plan.",
         domain: "plan_convergence",
         status: "running",
       });
@@ -8237,6 +8365,10 @@ export async function executeAgentLoop(
         mentionedFilePaths: turnInputContextSignals.mentionedFilePaths.length,
         attachedFilePaths: turnInputContextSignals.attachedFilePaths.length,
         promptAlreadyUsed: usedPlanReadOnlyConvergencePrompt,
+        evidenceReadiness: planEvidenceReadinessForConvergence.status,
+        evidenceReadinessReason: planEvidenceReadinessForConvergence.reason,
+        successfulTargetedReads: planEvidenceReadinessForConvergence.successfulTargetedReads,
+        successfulSearches: planEvidenceReadinessForConvergence.successfulSearches,
       });
       if (!usedPlanReadOnlyConvergencePrompt) {
         usedPlanReadOnlyConvergencePrompt = true;

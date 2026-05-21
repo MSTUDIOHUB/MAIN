@@ -833,6 +833,9 @@ export interface Session {
   title: string;
   date: string;
   active: boolean;
+  titleSource?: "default" | "local_seed" | "semantic" | "manual";
+  semanticTitleUpdatedAt?: number;
+  titleIntentSignature?: string;
   messages?: TaskBlock[];
   modelConfig?: SessionModelConfig;
   activeSkills?: string[];
@@ -2928,7 +2931,10 @@ function buildPendingOperationProposal(params: {
   text: string;
   replyOptions: ReplyOption[];
   commandDirective?: CommandDirective | null;
+  workflowMode?: AppConfig["workflowMode"];
+  isPlanApproved?: boolean;
 }): PendingOperationProposal | null {
+  if (params.workflowMode === "plan" && !params.isPlanApproved) return null;
   if (!hasOperationApprovalReplyOption(params.replyOptions)) return null;
   const summary = summarizeAssistantText(params.text, 180);
   return {
@@ -3089,11 +3095,14 @@ function buildLocalTurnTitle(
   language: "zh" | "en",
   contextSignals?: TurnInputContextSignals,
 ): string {
-  const cleanedInput = summarizeUserPrompt(input, language === "en" ? 52 : 40);
-  if (cleanedInput) return cleanedInput;
-
   const lowerInput = input.toLowerCase();
   const context = normalizeTurnInputContextSignals(contextSignals);
+  if (/(?:codex|plan mode|计划模式|\.main\/plans\/plan\.md|plan\.md|proposed_plan)/i.test(input)) {
+    return language === "en" ? "Codex-style planning flow" : "重构 Codex 式计划流程";
+  }
+  if (/(?:sidebar|侧边栏|会话).*(?:标题|title)|(?:标题|title).*(?:sidebar|侧边栏|会话)/i.test(input)) {
+    return language === "en" ? "Fix semantic session titles" : "修复会话语义标题";
+  }
   if (context.imageParts > 0) {
     if (intent === "plan") return language === "en" ? "Plan screenshot-based fix" : "基于截图制定修复方案";
     if (intent === "analyze") return language === "en" ? "Analyze screenshot issue" : "分析截图中的问题";
@@ -3108,11 +3117,28 @@ function buildLocalTurnTitle(
   if (dataKeywords.test(lowerInput)) {
     return language === "en" ? "Analyze user data" : "分析用户行为数据";
   }
+  const cleanedInput = summarizeUserPrompt(input, language === "en" ? 52 : 40);
+  if (cleanedInput) return cleanedInput;
   if (intent === "plan") return language === "en" ? "Create analysis plan" : "制定分析计划";
   if (intent === "report") return language === "en" ? "Generate report" : "生成分析报告";
   if (intent === "summarize") return language === "en" ? "Summarize materials" : "总结资料内容";
   if (intent === "analyze") return language === "en" ? "Analyze materials" : "分析资料内容";
   return language === "en" ? "New task" : "新的任务";
+}
+
+function buildTitleIntentSignature(
+  input: string,
+  intent: ResolvedRunIntent,
+  contextSignals?: TurnInputContextSignals,
+): string {
+  const context = normalizeTurnInputContextSignals(contextSignals);
+  return [
+    intent,
+    String(input || "").replace(/\s+/g, " ").trim().slice(0, 160),
+    `images:${context.imageParts}`,
+    `mentions:${context.mentionedFilePaths.slice(0, 3).join(",")}`,
+    `attachments:${context.attachedFilePaths.slice(0, 3).join(",")}`,
+  ].join("|");
 }
 
 function buildRunIntentSummary(params: {
@@ -6687,6 +6713,7 @@ export const useAppStore = create<AppState>()(
       const autoSession: Session = {
         id: autoSessionId,
         title: autoSessionTitle,
+        titleSource: "default",
         date: autoSessionDate,
         updatedAt: autoSessionDate,
         updatedAtMs: autoSessionId,
@@ -6957,6 +6984,11 @@ export const useAppStore = create<AppState>()(
       preferredLanguage === "en" ? 48 : 40,
       localTurnTitle,
     );
+    const titleIntentSignature = buildTitleIntentSignature(
+      text,
+      effectiveRunIntent,
+      turnInputContextSignals,
+    );
     const refreshedState = sessionGet();
     const activeSession = ensuredSessionId
       ? (refreshedState.sessionsByWorkspace[sessionScopeKey] || []).find((session) => session.id === ensuredSessionId)
@@ -7060,6 +7092,8 @@ export const useAppStore = create<AppState>()(
       if (!isHidden && shouldSeedSessionTitleForTurn && ensuredSessionId) {
         sessionGet().updateSession(sessionScopeKey, ensuredSessionId, {
           title: turnTitle,
+          titleSource: "local_seed",
+          titleIntentSignature,
           active: true,
           messages: sanitizeTaskBlocksForPersist(sessionGet().taskFlow),
           storageStatus: sessionGet().config.sessionRecordingEnabled ? "ok" : "temporary",
@@ -7403,6 +7437,8 @@ export const useAppStore = create<AppState>()(
     if (!isHidden && shouldSeedSessionTitleForTurn && ensuredSessionId) {
       sessionGet().updateSession(sessionScopeKey, ensuredSessionId, {
         title: turnTitle,
+        titleSource: "local_seed",
+        titleIntentSignature,
         active: true,
         messages: sanitizeTaskBlocksForPersist(sessionGet().taskFlow),
         storageStatus: sessionGet().config.sessionRecordingEnabled ? "ok" : "temporary",
@@ -7454,12 +7490,22 @@ export const useAppStore = create<AppState>()(
           intentSummary: metadata.summary,
         });
 
-        if (shouldSeedSessionTitleForTurn && expectedSessionId != null) {
+        if (expectedSessionId != null) {
           if (!canUpdateSeedSessionTitle({ session: latestSession, seededTitle: seededSessionTitleCandidate })) {
+            logStoreEvent("semantic_title_session_update_skipped", {
+              turnId,
+              sessionKey: runSessionKey,
+              workspace: runWorkspace || null,
+              reason: "session_title_not_auto_seed",
+              titleSource: latestSession?.titleSource || null,
+            });
             return;
           }
           latestState.updateSession(sessionScopeKey, expectedSessionId, {
             title: metadata.title,
+            titleSource: "semantic",
+            semanticTitleUpdatedAt: Date.now(),
+            titleIntentSignature,
             active: true,
           });
         }
@@ -8886,6 +8932,8 @@ export const useAppStore = create<AppState>()(
             text: displayText,
             replyOptions,
             commandDirective: effectiveCommandDirective,
+            workflowMode: effectiveWorkflowMode,
+            isPlanApproved: sessionGet().isPlanApproved,
           });
           const markPendingOperationProposal = () => {
             if (!pendingOperationProposal) return;

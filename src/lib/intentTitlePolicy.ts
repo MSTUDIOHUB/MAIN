@@ -1,7 +1,10 @@
 export interface SessionTitleSeedState {
   title?: string | null;
   messages?: unknown[] | null;
+  titleSource?: SessionTitleSource | string | null;
 }
+
+export type SessionTitleSource = "default" | "local_seed" | "semantic" | "manual";
 
 export interface SemanticTurnMetadataRequestGateInput {
   input: string;
@@ -54,7 +57,11 @@ export function isDefaultSeedSessionTitle(title: string): boolean {
 export function shouldSeedSessionTitle(session: SessionTitleSeedState | null | undefined): boolean {
   if (!session) return false;
   const title = String(session.title || "").trim();
+  const titleSource = String(session.titleSource || "").trim();
   if (!title || isDefaultSeedSessionTitle(title)) return true;
+  if (titleSource === "default") return true;
+  if (titleSource === "local_seed" && (session.messages?.length ?? 0) === 0) return true;
+  if (titleSource === "semantic" || titleSource === "manual") return false;
   return (session.messages?.length ?? 0) === 0;
 }
 
@@ -76,8 +83,11 @@ export function canUpdateSeedSessionTitle(params: {
   const session = params.session;
   if (!session) return false;
   const title = String(session.title || "").trim();
+  const titleSource = String(session.titleSource || "").trim();
   if (!title) return true;
   if (isDefaultSeedSessionTitle(title)) return true;
+  if (titleSource === "default" || titleSource === "local_seed") return true;
+  if (titleSource === "semantic" || titleSource === "manual") return false;
   return !!params.seededTitle && title === params.seededTitle;
 }
 

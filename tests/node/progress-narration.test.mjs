@@ -57,7 +57,7 @@ const {
   deriveToolIntentSummary,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/toolPresentation.ts"));
 
-test("read_file narration explains why the file is read", () => {
+test("read_file narration keeps the action and specific hypothesis without template filler", () => {
   const progress = buildToolProgressNarration({
     toolName: "read_file",
     target: "src/components/ChatArea.tsx",
@@ -69,11 +69,12 @@ test("read_file narration explains why the file is read", () => {
   assert.equal(progress.phase, "investigating");
   assert.match(progress.title, /读取 ChatArea 渲染逻辑/);
   assert.match(progress.why, /hiddenProcess/);
-  assert.match(progress.why, /代码证据|确认/);
-  assert.match(progress.evidence, /等待返回内容|搜索命中|元数据/);
+  assert.doesNotMatch(progress.why, /代码证据|确认后再继续|等待/);
+  assert.equal(progress.evidence, "");
+  assert.equal(progress.next, "");
 });
 
-test("replace_in_file narration explains why and what is being changed", () => {
+test("replace_in_file narration uses observed facts instead of generic why/evidence text", () => {
   const progress = buildToolProgressNarration({
     toolName: "replace_in_file",
     target: "src/store/useAppStore.ts",
@@ -84,11 +85,12 @@ test("replace_in_file narration explains why and what is being changed", () => {
 
   assert.equal(progress.phase, "editing");
   assert.match(progress.title, /修改消息状态与可见性逻辑/);
-  assert.match(progress.why, /用户目标|具体改动/);
-  assert.match(progress.evidence, /diff|写入结果/);
+  assert.match(progress.why, /onAssistantFinalText/);
+  assert.doesNotMatch(progress.why, /具体改动|负责/);
+  assert.equal(progress.evidence, "");
 });
 
-test("run_command npm build narration explains verification criteria", () => {
+test("run_command npm build narration keeps verification criteria without waiting/next templates", () => {
   const progress = buildToolProgressNarration({
     toolName: "run_command",
     target: "npm run build",
@@ -99,8 +101,8 @@ test("run_command npm build narration explains verification criteria", () => {
   assert.equal(progress.phase, "verifying");
   assert.match(progress.title, /验证命令/);
   assert.match(progress.why, /退出码为 0/);
-  assert.match(progress.evidence, /stdout\/stderr|退出码/);
-  assert.match(progress.next, /验证结果/);
+  assert.equal(progress.evidence, "");
+  assert.equal(progress.next, "");
 });
 
 test("runtime progress narration does not echo prior progress or control tokens", () => {
@@ -114,7 +116,8 @@ test("runtime progress narration does not echo prior progress or control tokens"
 
   assert.doesNotMatch(progress.why, /thought|因为：|因此先检查/);
   assert.doesNotMatch(text, /thought|因为：/);
-  assert.match(text, /正在读取|等待返回内容/);
+  assert.match(text, /正在读取/);
+  assert.doesNotMatch(text, /等待返回内容|下一步/);
 });
 
 test("contextual tool intent names the target role and hypothesis", () => {

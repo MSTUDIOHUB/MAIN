@@ -223,7 +223,7 @@ function buildWhy(input: ToolProgressNarrationInput & {
   language: ToolPresentationLanguage;
   role: string;
 }): string {
-  const { language, phase, progressPhase, role } = input;
+  const { language, phase, progressPhase } = input;
   const goal = compactGoal(String(input.userGoal || ""), language);
   const hypothesis = compactContextSnippet(String(input.currentHypothesis || ""), 150);
   const observation = compactContextSnippet(String(input.previousObservation || ""), 150);
@@ -232,38 +232,34 @@ function buildWhy(input: ToolProgressNarrationInput & {
   if (language === "en") {
     if (progressPhase === "blocked") return "Keep the real blocker visible so recovery starts from the failed step.";
     if (phase === "edit") {
-      return goal
-        ? `The requested goal ${goal} needs a concrete change in ${role}, so this step applies the focused edit.`
-        : `The relevant implementation has been identified, so this step applies the focused edit in ${role}.`;
+      if (observation) return `Observed: ${observation}`;
+      if (hypothesis) return `Checking: ${hypothesis}`;
+      return "";
     }
     if (progressPhase === "verifying") {
       if (/npm\s+(?:run\s+)?build/i.test(target)) return "Use the build result as the success signal: exit code 0 and no blocking TypeScript/Vite errors.";
       if (/\btest|vitest|jest|playwright|pytest|go\s+test|cargo\s+test\b/i.test(target)) return "Use the test output as evidence that the affected behavior still passes.";
       return "Use command output as concrete evidence before claiming the work is complete.";
     }
-    if (hypothesis) return `Current judgment points to ${hypothesis}. This step checks ${role} for evidence before changing anything.`;
-    if (observation) return `The previous result showed ${observation}; this step narrows the next useful evidence in ${role}.`;
-    return goal
-      ? `The goal ${goal} depends on how ${role} currently works.`
-      : "";
+    if (hypothesis) return `Checking: ${hypothesis}`;
+    if (observation) return `Observed: ${observation}`;
+    return goal ? `Goal: ${goal}` : "";
   }
 
   if (progressPhase === "blocked") return "保留真实受阻点，方便从失败步骤继续恢复。";
   if (phase === "edit") {
-    return goal
-      ? `用户目标 ${goal} 需要落到 ${role} 的具体改动，这一步负责实施最小必要修改。`
-      : `已经收敛到 ${role}，这一步负责把确认后的方案改进代码里。`;
+    if (observation) return `已观察：${observation}`;
+    if (hypothesis) return `待验证判断：${hypothesis}`;
+    return "";
   }
   if (progressPhase === "verifying") {
     if (/npm\s+(?:run\s+)?build/i.test(target)) return "用构建结果作为成功标准：命令退出码为 0，且没有阻塞性的 TypeScript/Vite 错误。";
     if (/\btest|vitest|jest|playwright|pytest|go\s+test|cargo\s+test\b/i.test(target)) return "用测试输出确认受影响行为仍然通过，而不是只依赖文字判断。";
     return "用命令输出作为真实反馈，确认是否可以继续总结或需要修复。";
   }
-  if (hypothesis) return `当前判断指向：${hypothesis}。先查看 ${role}，用代码证据确认后再继续。`;
-  if (observation) return `前一步结果显示 ${observation}，所以继续在 ${role} 收窄证据。`;
-  return goal
-    ? `用户目标 ${goal} 依赖 ${role} 的当前实现。`
-    : "";
+  if (hypothesis) return `待验证判断：${hypothesis}`;
+  if (observation) return `已观察：${observation}`;
+  return goal ? `目标：${goal}` : "";
 }
 
 function buildEvidence(input: {
@@ -288,14 +284,7 @@ function buildEvidence(input: {
       noOp: input.noOp,
     });
   }
-  if (language === "en") {
-    if (phase === "edit") return "Waiting for the write result or diff to confirm what changed.";
-    if (progressPhase === "verifying") return "Waiting for exit code, stdout, and stderr to judge success.";
-    return "Waiting for returned content, matches, or metadata to confirm the relevant facts.";
-  }
-  if (phase === "edit") return "等待写入结果或 diff，确认实际改动范围。";
-  if (progressPhase === "verifying") return "等待退出码、stdout/stderr 或测试摘要，用来判断是否通过。";
-  return "等待返回内容、搜索命中或元数据，用来确认相关事实。";
+  return "";
 }
 
 function buildNext(input: {
@@ -308,13 +297,9 @@ function buildNext(input: {
   if (status === "failed") {
     return language === "zh" ? "先根据失败原因调整目标、参数或方案，再继续。" : "Adjust the target, parameters, or approach before continuing.";
   }
-  if (language === "en") {
-    if (phase === "edit") return "Verify the touched behavior with the smallest relevant check.";
-    if (progressPhase === "verifying") return "Use the result to decide whether to fix another issue or summarize completion.";
-    return "";
-  }
-  if (phase === "edit") return "修改完成后，用最相关的检查验证受影响行为。";
-  if (progressPhase === "verifying") return "根据验证结果决定继续修复，还是总结完成情况。";
+  void language;
+  void phase;
+  void progressPhase;
   return "";
 }
 
@@ -498,10 +483,12 @@ export function progressNarrationToText(progress: ProgressNarration, language: T
   const normalized = normalizeProgressNarration(progress);
   const lines = [
     normalized.action,
+    normalized.observedFact,
+    normalized.evidenceExcerpt,
     normalized.why,
-    normalized.evidence,
-    normalized.next,
-  ].filter(Boolean);
+    normalized.status === "running" ? "" : normalized.evidence,
+    normalized.status === "failed" ? normalized.next : "",
+  ].filter((line): line is string => typeof line === "string" && line.trim().length > 0);
   const distinctLines: string[] = [];
   for (const line of lines) {
     const normalizedLine = compactMarkdownSnippet(line, 240);

@@ -132,6 +132,8 @@ test("session title seeding only applies in first-turn seed states", () => {
   assert.equal(shouldSeedSessionTitle({ title: "New Conversation", messages: [{ id: 2 }] }), true);
   assert.equal(shouldSeedSessionTitle({ title: "新聊天", messages: [{ id: 3 }] }), true);
   assert.equal(shouldSeedSessionTitle({ title: "自定义标题", messages: [] }), true);
+  assert.equal(shouldSeedSessionTitle({ title: "修复 Plan 流程", titleSource: "local_seed", messages: [] }), true);
+  assert.equal(shouldSeedSessionTitle({ title: "修复 Plan 流程", titleSource: "semantic", messages: [] }), false);
   assert.equal(shouldSeedSessionTitle({ title: "登录模块修复", messages: [{ id: 4 }] }), false);
 });
 
@@ -154,7 +156,23 @@ test("seeded sidebar title updates only while the seed title remains unchanged",
 
   assert.equal(
     canUpdateSeedSessionTitle({
+      session: { title: "模型原始占位", titleSource: "local_seed", messages: [{ id: 1 }] },
+      seededTitle: "其它占位",
+    }),
+    true,
+  );
+
+  assert.equal(
+    canUpdateSeedSessionTitle({
       session: { title: "用户手动改名" },
+      seededTitle: "占位标题",
+    }),
+    false,
+  );
+
+  assert.equal(
+    canUpdateSeedSessionTitle({
+      session: { title: "语义标题", titleSource: "semantic" },
       seededTitle: "占位标题",
     }),
     false,

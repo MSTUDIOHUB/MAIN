@@ -352,6 +352,62 @@ function makeTargetSummary(targets: string[], language: ToolPresentationLanguage
   return hiddenCount > 0 ? `${joined} +${hiddenCount}` : joined;
 }
 
+function compactActivityTargetForTitle(target: string, toolName = ""): string {
+  const normalized = String(target || "").replace(/[\\/]+$/g, "").trim();
+  if (!normalized) return "";
+  if (toolName === "grep_search" || toolName === "glob_search") {
+    return compactLine(normalized, 72);
+  }
+  const parts = normalized.split(/[\\/]/).filter(Boolean);
+  return compactLine(parts[parts.length - 1] || normalized, 56);
+}
+
+function toolActionForActivityTitle(block: any, language: ToolPresentationLanguage): string {
+  if (!isToolBlock(block) && !isProgressBlock(block)) return "";
+  const toolName = String(block.toolName || "");
+  const target = compactActivityTargetForTitle(String(block.target || compactTarget(block, language) || ""), toolName);
+  const rawTarget = target || (language === "zh" ? "目标" : "target");
+  if (language === "en") {
+    if (toolName === "grep_search" || toolName === "glob_search") return `searched ${rawTarget}`;
+    if (toolName === "read_file" || toolName === "read_document") return `read ${rawTarget}`;
+    if (toolName === "get_file_outline") return `outlined ${rawTarget}`;
+    if (toolName === "list_directory" || toolName === "get_project_skeleton") return `scanned ${rawTarget}`;
+    if (toolName === "analyze_tabular_document" || toolName === "query_tabular_document") return `analyzed ${rawTarget}`;
+    if (toolName === "write_file") return `wrote ${rawTarget}`;
+    if (toolName === "replace_in_file") return `edited ${rawTarget}`;
+    if (toolName === "run_command" || toolName === "execute_command") return `ran ${rawTarget}`;
+    if (toolName === "browser_evaluate") return `validated ${rawTarget}`;
+    return toolName ? `${toolName} ${rawTarget}` : "";
+  }
+  if (toolName === "grep_search" || toolName === "glob_search") return `搜索 ${rawTarget}`;
+  if (toolName === "read_file" || toolName === "read_document") return `读取 ${rawTarget}`;
+  if (toolName === "get_file_outline") return `查看结构 ${rawTarget}`;
+  if (toolName === "list_directory" || toolName === "get_project_skeleton") return `扫描 ${rawTarget}`;
+  if (toolName === "analyze_tabular_document" || toolName === "query_tabular_document") return `分析 ${rawTarget}`;
+  if (toolName === "write_file") return `写入 ${rawTarget}`;
+  if (toolName === "replace_in_file") return `编辑 ${rawTarget}`;
+  if (toolName === "run_command" || toolName === "execute_command") return `运行 ${rawTarget}`;
+  if (toolName === "browser_evaluate") return `验证 ${rawTarget}`;
+  return toolName ? `${toolName} ${rawTarget}` : "";
+}
+
+function makeActivityActionSummary(items: any[], language: ToolPresentationLanguage): string {
+  const actions: string[] = [];
+  const seen = new Set<string>();
+  for (const item of items) {
+    const action = toolActionForActivityTitle(item, language);
+    if (!action) continue;
+    const key = action.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    actions.push(action);
+    if (actions.length >= 3) break;
+  }
+  const extra = Math.max(0, items.filter((item) => isToolBlock(item) || isProgressBlock(item)).length - actions.length);
+  if (actions.length === 0) return "";
+  return `${actions.join(language === "zh" ? "，" : ", ")}${extra > 0 ? (language === "zh" ? `，另 ${extra} 项` : `, +${extra}`) : ""}`;
+}
+
 function countToolItems(step: Pick<TurnArchiveStep, "items">): number {
   return step.items.filter(isToolBlock).length;
 }
@@ -569,9 +625,18 @@ function makeActivitySummary(activity: Pick<ActivityCell, "kind" | "targets" | "
   return targetSummary;
 }
 
-function makeActivityTitle(activity: Pick<ActivityCell, "kind" | "status" | "metrics">, language: ToolPresentationLanguage): string {
+function makeActivityTitle(activity: Pick<ActivityCell, "kind" | "status" | "metrics"> & { items?: any[] }, language: ToolPresentationLanguage): string {
   const verb = activityVerb(activity.kind, activity.status, language);
   const metrics = activity.metrics;
+  const actionSummary = activity.items ? makeActivityActionSummary(activity.items, language) : "";
+  if (actionSummary) {
+    if (activity.kind === "exploring") {
+      return compactLine(`${verb}：${actionSummary}`, 150);
+    }
+    if (activity.kind === "edit" || activity.kind === "command" || activity.kind === "browser") {
+      return compactLine(`${verb}：${actionSummary}`, 150);
+    }
+  }
   if (activity.kind === "exploring") {
     const count = metrics.filesRead + metrics.documentsRead + metrics.outlinesRead + metrics.tablesAnalyzed + metrics.directoriesListed + metrics.searches;
     return count > 0 ? `${verb} ${makeActivityMetricParts(metrics, language).join(language === "zh" ? "，" : ", ")}` : verb;
@@ -654,8 +719,8 @@ function buildActivityCellFromItems(
     status,
     purposeKey: activityPurposeKey(firstKind, items.find(isToolBlock) || items[0] || {}, language),
     label: activityVerb(firstKind, status, language),
-    title: makeActivityTitle(provisional, language),
-    summary,
+    title: makeActivityTitle({ ...provisional, items }, language),
+    summary: latestEvidence ? compactLine(`${summary}${summary ? " · " : ""}${language === "zh" ? "结果：" : "Result: "}${latestEvidence}`, 240) : summary,
     targets,
     metrics,
     items,
@@ -673,6 +738,10 @@ function mergeActivityCells(left: ActivityCell, right: ActivityCell, language: T
   const metrics = addActivityMetrics(left.metrics, right.metrics);
   const targets = uniqueTargets(items, language);
   const status = mergeActivityStatus(left.status, right.status);
+  const combinedEvidence = [left.latestEvidence, right.latestEvidence]
+    .filter(Boolean)
+    .filter((value, index, array) => array.indexOf(value) === index)
+    .join(language === "zh" ? "；" : "; ");
   const base: Pick<ActivityCell, "kind" | "status" | "metrics" | "targets"> = {
     kind: left.kind,
     status,
@@ -685,11 +754,21 @@ function mergeActivityCells(left: ActivityCell, right: ActivityCell, language: T
     targets,
     metrics,
     items,
-    title: makeActivityTitle(base, language),
-    summary: makeActivitySummary(base, language),
-    latestEvidence: right.latestEvidence || left.latestEvidence,
+    title: makeActivityTitle({ ...base, items }, language),
+    summary: (() => {
+      const mergedSummary = makeActivitySummary(base, language);
+      const evidence = compactLine(combinedEvidence, 180);
+      return evidence ? compactLine(`${mergedSummary}${mergedSummary ? " · " : ""}${language === "zh" ? "结果：" : "Result: "}${evidence}`, 240) : mergedSummary;
+    })(),
+    latestEvidence: compactLine(combinedEvidence, 180) || right.latestEvidence || left.latestEvidence,
     recoveryHint: right.recoveryHint || left.recoveryHint,
-    evidenceExcerpt: right.evidenceExcerpt || left.evidenceExcerpt,
+    evidenceExcerpt: compactLine(
+      [left.evidenceExcerpt, right.evidenceExcerpt]
+        .filter(Boolean)
+        .filter((value, index, array) => array.indexOf(value) === index)
+        .join(language === "zh" ? "；" : "; "),
+      180,
+    ) || right.evidenceExcerpt || left.evidenceExcerpt,
     observedFact: right.observedFact || left.observedFact,
     hypothesisStatus: mergeActivityStatus(left.status, right.status) === "failed"
       ? "blocked"

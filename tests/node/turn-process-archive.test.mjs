@@ -418,7 +418,8 @@ test("runtime phase grouping keeps same-purpose exploration together across targ
 
   assert.equal(model.steps.length, 1);
   assert.equal(model.steps[0].activity.kind, "exploring");
-  assert.match(model.steps[0].activity.title, /2 个文件/);
+  assert.match(model.steps[0].activity.title, /读取 ThemeStyles\.tsx/);
+  assert.match(model.steps[0].activity.summary, /2 个文件/);
   assert.deepEqual(model.steps[0].targets, ["src/components/ThemeStyles.tsx", "src/hooks/useCsvParser.ts"]);
   assert.equal(model.steps[0].intent, "关键上下文");
 });
@@ -433,9 +434,40 @@ test("codex activity groups merge read list and search into one exploring cell",
   assert.equal(groups.length, 1);
   assert.equal(groups[0].kind, "exploring");
   assert.match(groups[0].title, /已探索/);
-  assert.match(groups[0].title, /1 个文件/);
-  assert.match(groups[0].title, /1 个目录/);
-  assert.match(groups[0].title, /1 次搜索/);
+  assert.match(groups[0].title, /读取 App\.tsx/);
+  assert.match(groups[0].title, /搜索 hiddenProcess/);
+  assert.match(groups[0].summary, /1 个文件/);
+  assert.match(groups[0].summary, /1 个目录/);
+  assert.match(groups[0].summary, /1 次搜索/);
+});
+
+test("codex activity groups include concrete result excerpts instead of generic exploration only", () => {
+  const groups = buildCodexActivityGroups([
+    {
+      id: 1,
+      type: "tool",
+      toolName: "grep_search",
+      target: "csv/import/loadData",
+      status: "done",
+      toolStatus: "executed",
+      observationSummary: "命中 useCsvParser 与 dashboardStore 的导入链路。",
+    },
+    {
+      id: 2,
+      type: "tool",
+      toolName: "read_file",
+      target: "src/hooks/useCsvParser.ts",
+      status: "done",
+      toolStatus: "executed",
+      resultPreview: "parseCsvRows maps uploaded rows into dashboard records.",
+    },
+  ], "zh");
+
+  assert.equal(groups.length, 1);
+  assert.match(groups[0].title, /搜索 csv\/import\/loadData/);
+  assert.match(groups[0].title, /读取 useCsvParser\.ts/);
+  assert.match(groups[0].summary, /useCsvParser 与 dashboardStore/);
+  assert.match(groups[0].evidenceExcerpt, /dashboardStore/);
 });
 
 test("codex activity groups keep edits commands browser and failures separate", () => {

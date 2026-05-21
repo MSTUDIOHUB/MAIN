@@ -66,6 +66,7 @@ const {
   serializeAssistantReplyForHistory,
   shouldAutoContinueReadOnlyPermission,
   shouldPauseForReplyOptions,
+  shouldRouteUnapprovedPlanReplyOptionsToArtifact,
   stripReadOnlyPermissionPrompt,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/replyOptions.ts"));
 
@@ -515,6 +516,83 @@ test("shouldPauseForReplyOptions pauses for proposal follow-up even on length-sa
       hasReadyPlanArtifacts: false,
       isPlanApproved: false,
       finishReason: "stop",
+    }),
+    false,
+  );
+});
+
+test("shouldRouteUnapprovedPlanReplyOptionsToArtifact suppresses premature implementation branches", () => {
+  const visibleText = [
+    "我已完成对现有代码库的初步调查。通过分析截图、数据流向及核心逻辑，我发现了导致数据无法显示以及深色模式不彻底的根本原因。",
+    "",
+    "### 核心问题诊断",
+    "- 现象：CSV 已成功加载，但指标和图表为空白。",
+    "- 根源分析：状态字段映射和深色模式变量覆盖需要基于证据继续收束。",
+    "",
+    "# Proposed Plan",
+    "### 阶段 1：修复数据链路",
+    "### 阶段 2：彻底重构深色模式",
+  ].join("\n");
+  const replyOptions = [
+    { label: "方案 A：优先修复数据问题", value: "方案 A：优先修复数据问题", source: "explicit_user_options" },
+    { label: "方案 B：同时进行数据和样式修复", value: "方案 B：同时进行数据和样式修复", source: "explicit_user_options" },
+    { label: "方案 C：仅修复深色模式问题", value: "方案 C：仅修复深色模式问题", source: "explicit_user_options" },
+  ];
+
+  assert.equal(
+    shouldRouteUnapprovedPlanReplyOptionsToArtifact({
+      replyOptions,
+      workflowMode: "plan",
+      isPlanApproved: false,
+      hasStructuredProposal: false,
+      hasReadyPlanArtifacts: false,
+      hasReviewablePlanArtifacts: false,
+      sawPlanModeToolActivity: true,
+      visibleText,
+    }),
+    true,
+  );
+
+  assert.equal(
+    shouldRouteUnapprovedPlanReplyOptionsToArtifact({
+      replyOptions,
+      workflowMode: "plan",
+      isPlanApproved: false,
+      hasStructuredProposal: false,
+      hasReadyPlanArtifacts: false,
+      hasReviewablePlanArtifacts: false,
+      sawPlanModeToolActivity: false,
+      visibleText,
+    }),
+    true,
+  );
+});
+
+test("shouldRouteUnapprovedPlanReplyOptionsToArtifact keeps genuine blocking plan choices", () => {
+  const replyOptions = [
+    { label: "方案A：完整框架优先，先搭好全部模块边界", value: "方案A：完整框架优先，先搭好全部模块边界", source: "explicit_user_options" },
+    { label: "方案B：战斗系统优先，先验证 CTB 核心循环", value: "方案B：战斗系统优先，先验证 CTB 核心循环", source: "explicit_user_options" },
+    { label: "方案C：最小可运行版本，验证后再扩展", value: "方案C：最小可运行版本，验证后再扩展", source: "explicit_user_options" },
+  ];
+
+  assert.equal(
+    shouldRouteUnapprovedPlanReplyOptionsToArtifact({
+      replyOptions,
+      workflowMode: "plan",
+      isPlanApproved: false,
+      sawPlanModeToolActivity: false,
+      visibleText: "请选择方案：",
+    }),
+    false,
+  );
+
+  assert.equal(
+    shouldRouteUnapprovedPlanReplyOptionsToArtifact({
+      replyOptions,
+      workflowMode: "plan",
+      isPlanApproved: false,
+      sawPlanModeToolActivity: true,
+      visibleText: "真正阻塞问题：必须由用户确认战斗系统范围后才能写 plan.md。请选择方案：",
     }),
     false,
   );
