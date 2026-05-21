@@ -176,8 +176,8 @@ function isInternalPlanProgressTarget(targetKey: string): boolean {
     : targetKey;
   return normalized === ".main/plans/requirements.md" ||
     normalized.endsWith("/.main/plans/requirements.md") ||
-    normalized === ".main/plans/design.md" ||
-    normalized.endsWith("/.main/plans/design.md") ||
+    normalized === ".main/plans/plan.md" ||
+    normalized.endsWith("/.main/plans/plan.md") ||
     normalized === ".main/plans/tasks.md" ||
     normalized.endsWith("/.main/plans/tasks.md");
 }

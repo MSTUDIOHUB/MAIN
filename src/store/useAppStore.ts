@@ -117,6 +117,7 @@ import {
   resolveEffectiveCloudApiFormat,
   normalizeLocalToolProtocol,
   type CloudToolProtocol,
+  type ReasoningDisplayMode,
 } from "../lib/cloudProtocol";
 import {
   createDefaultCloudConfig,
@@ -281,6 +282,7 @@ import {
 import {
   canUpdateSeedSessionTitle,
   isSemanticTurnMetadataCallbackCurrent,
+  parseIntentTitleCandidate,
   shouldRequestSemanticTurnMetadataForTurn,
   shouldSeedSessionTitle,
 } from "../lib/intentTitlePolicy";
@@ -883,6 +885,7 @@ export interface AppConfig {
   chatFontSize: number;  // px, default 13
   sessionRecordingEnabled: boolean;
   debugRecordFullTurnProcess: boolean;
+  reasoningDisplay: ReasoningDisplayMode;
   eventStreamMode: EventStreamMode;
   toolFeedbackFormat: ToolFeedbackFormat;
   local: LocalConfig;
@@ -1372,6 +1375,7 @@ const defaultConfig: AppConfig = {
   chatFontSize: 13,
   sessionRecordingEnabled: true,
   debugRecordFullTurnProcess: false,
+  reasoningDisplay: "hidden",
   eventStreamMode: "dual",
   toolFeedbackFormat: "envelope_v1",
   local: { provider: "OMLX", endpoint: "http://127.0.0.1:8080/v1", model: "", contextLimit: 16384, apiKey: "", toolProtocol: "auto" },
@@ -1555,6 +1559,12 @@ const DEFAULT_MCP_SERVERS: MCPServer[] = [
 
 function normalizeAppIconVariant(value: unknown): AppConfig["appIconVariant"] {
   return value === "light" ? "light" : "dark";
+}
+
+function normalizeReasoningDisplay(value: unknown, fallback: ReasoningDisplayMode = "hidden"): ReasoningDisplayMode {
+  return value === "debug_summary" || value === "raw_debug" || value === "hidden"
+    ? value
+    : fallback;
 }
 
 function normalizeMcpServers(servers: unknown): MCPServer[] {
@@ -2768,6 +2778,10 @@ function updateRelatedProgressBlocks(input: {
   source: ProgressNarrationSource;
   evidence?: string;
   next?: string;
+  evidenceExcerpt?: string;
+  observedFact?: string;
+  hypothesisStatus?: ProgressNarration["hypothesisStatus"];
+  sourceToolCallIds?: string[];
 }): TaskBlock[] {
   let matched = false;
   const updated = input.blocks.map((block) => {
@@ -2780,6 +2794,10 @@ function updateRelatedProgressBlocks(input: {
       source: input.source,
       ...(input.evidence ? { evidence: input.evidence } : {}),
       ...(input.next ? { next: input.next } : {}),
+      ...(input.evidenceExcerpt ? { evidenceExcerpt: input.evidenceExcerpt } : {}),
+      ...(input.observedFact ? { observedFact: input.observedFact } : {}),
+      ...(input.hypothesisStatus ? { hypothesisStatus: input.hypothesisStatus } : {}),
+      ...(input.sourceToolCallIds && input.sourceToolCallIds.length > 0 ? { sourceToolCallIds: input.sourceToolCallIds } : {}),
     };
   });
   if (matched) return updated;
@@ -2801,6 +2819,10 @@ function updateRelatedProgressBlocks(input: {
     source: input.source,
     ...(input.evidence ? { evidence: input.evidence } : {}),
     ...(input.next ? { next: input.next } : {}),
+    ...(input.evidenceExcerpt ? { evidenceExcerpt: input.evidenceExcerpt } : {}),
+    ...(input.observedFact ? { observedFact: input.observedFact } : {}),
+    ...(input.hypothesisStatus ? { hypothesisStatus: input.hypothesisStatus } : {}),
+    ...(input.sourceToolCallIds && input.sourceToolCallIds.length > 0 ? { sourceToolCallIds: input.sourceToolCallIds } : {}),
   };
   return next;
 }
@@ -3133,43 +3155,6 @@ function buildMainDebugPrompt(feedback: string): string {
 
 // region: 回合标题语义同步
 
-function stripJsonFence(text: string): string {
-  const trimmed = text.trim();
-  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  return fenced?.[1]?.trim() || trimmed;
-}
-
-function extractJsonObject(text: string): string | null {
-  const cleaned = stripJsonFence(text);
-  const start = cleaned.indexOf("{");
-  const end = cleaned.lastIndexOf("}");
-  if (start >= 0 && end > start) {
-    return cleaned.slice(start, end + 1);
-  }
-  return null;
-}
-
-function extractLooseSemanticTurnMetadata(text: string): Partial<SemanticTurnMetadata> | null {
-  const normalized = String(text || "")
-    .replace(/<think>[\s\S]*?<\/think>/gi, " ")
-    .replace(/<(?:analysis|thought|thinking|reasoning)(?:\s[^>]*)?>[\s\S]*?<\/(?:analysis|thought|thinking|reasoning)>/gi, " ")
-    .replace(/```[\s\S]*?```/g, " ")
-    .trim();
-  if (!normalized) return null;
-
-  const titleMatch = normalized.match(/(?:^|[\n,，])\s*(?:title|标题)\s*[:：]\s*["“”']?([^\n,"“”'}]+)["“”']?/i);
-  const summaryMatch = normalized.match(/(?:^|[\n,，])\s*(?:summary|摘要|总结)\s*[:：]\s*["“”']?([^\n"“”'}]+)["“”']?/i);
-  const title = titleMatch?.[1]?.trim();
-  const summary = summaryMatch?.[1]?.trim();
-  if (title || summary) return { title, summary };
-
-  const firstLine = normalized
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .find(Boolean);
-  return firstLine ? { title: firstLine } : null;
-}
-
 interface SemanticTurnMetadata {
   title: string;
   summary: string;
@@ -3466,7 +3451,7 @@ function detectRequestedRootMarkdownDeliverables(text: string): string[] {
     .map((match) => match[1])
     .filter(Boolean)
     .map((name) => name.replace(/^readme\.md$/i, "Readme.md"))
-    .filter((name) => !/^(?:requirements|design|tasks|bugfix)\.md$/i.test(name));
+    .filter((name) => !/^(?:plan|requirements|design|tasks|bugfix)\.md$/i.test(name));
 
   if (names.length === 0 && hasRootHint && /(?:md\s*文档|markdown|说明文档|总结.*文档|Readme|README)/i.test(source)) {
     names.push("Readme.md");
@@ -3507,6 +3492,9 @@ function derivePlanStageFromArtifacts(
   }
   if (artifactKinds.has("bugfix")) {
     return "bugfix";
+  }
+  if (artifactKinds.has("plan")) {
+    return "plan";
   }
   if (artifactKinds.has("design")) {
     return "design";
@@ -3647,8 +3635,8 @@ function formatPlanTaskListForPrompt(tasks: PlanTask[], language: "zh" | "en", l
   const visibleTasks = tasks.slice(0, limit);
   if (visibleTasks.length === 0) {
     return language === "zh"
-      ? "- 暂无 runtime 任务；请先从 design.md 生成可审计任务清单。"
-      : "- No runtime tasks yet; first derive an auditable task list from design.md.";
+      ? "- 暂无 runtime 任务；请先从 plan.md 生成可审计任务清单。"
+      : "- No runtime tasks yet; first derive an auditable task list from plan.md.";
   }
   return visibleTasks.map((task, index) => {
     const evidence = task.evidence?.map((item) => `${item.kind}:${item.value}`).join(", ") ||
@@ -3692,10 +3680,10 @@ function buildTrustedPlanResumePrompt(input: {
       input.hasTasksArtifact
         ? "从 `.MAIN/plans/tasks.md` 中选择证据未满足且与当前改动最相关的任务继续；顺序是执行参考，不是强制线性流程。只有真实写入/命令成功/验证证据满足后，才可以把任务视为完成。"
         : input.artifacts.length === 0
-        ? "先读取当前 workspace 的 `.MAIN/plans/design.md`；如果旧会话已存在 bugfix.md 或 requirements.md，可作为辅助上下文读取。不要默认读取 `.MAIN/plans/tasks.md`，除非它已在计划摘要中确认存在或用户明确要求。"
+        ? "先读取当前 workspace 的 `.MAIN/plans/plan.md`；如果旧会话已存在 bugfix.md 或 requirements.md，可作为辅助上下文读取。不要默认读取 `.MAIN/plans/tasks.md`，除非它已在计划摘要中确认存在或用户明确要求。"
         : input.tasks.length > 0
         ? "当前已恢复 runtime 任务清单；请选择证据未满足且与当前诊断最相关的任务直接执行，顺序是参考而不是强制。只有当任务较长、需要跨会话审计或用户要求留档时，才先把清单持久化到 `.MAIN/plans/tasks.md`；不要为了确认它是否存在而读取它。"
-        : "请先基于已批准的 design.md 派生 runtime 任务清单；只有长任务、跨会话恢复或需要审计留档时，才生成 `.MAIN/plans/tasks.md`；不要默认读取缺失的 tasks.md。然后执行真实任务。",
+        : "请先基于已批准的 plan.md 派生 runtime 任务清单；只有长任务、跨会话恢复或需要审计留档时，才生成 `.MAIN/plans/tasks.md`；不要默认读取缺失的 tasks.md。然后执行真实任务。",
       "不要重写已经满足证据的任务；如果存在 tasks.md，不要只修改 checkbox；不要重复计划说明。",
       "",
       "计划文件摘要：",
@@ -3714,10 +3702,10 @@ function buildTrustedPlanResumePrompt(input: {
     input.hasTasksArtifact
       ? "Continue with an evidence-unsatisfied task that best matches the current change; task order is guidance, not a forced linear path. Treat a task as complete only after real file-write, successful command, Browser/Playwright DOM/screenshot evidence, or explicit pending user validation exists."
       : input.artifacts.length === 0
-      ? "First read `.MAIN/plans/design.md` from the current workspace; if a legacy bugfix.md or requirements.md exists, use it only as supporting context. Do not read `.MAIN/plans/tasks.md` by default unless it is confirmed in the plan summary or the user explicitly asks for it."
+      ? "First read `.MAIN/plans/plan.md` from the current workspace; if a legacy bugfix.md or requirements.md exists, use it only as supporting context. Do not read `.MAIN/plans/tasks.md` by default unless it is confirmed in the plan summary or the user explicitly asks for it."
       : input.tasks.length > 0
       ? "A runtime task list is already available; choose the evidence-unsatisfied task that best matches the current diagnosis. Persist it to `.MAIN/plans/tasks.md` only when the task is long, cross-session, or explicitly needs an audit file; do not read it just to check existence."
-      : "First derive a runtime task list from the approved design.md. Generate `.MAIN/plans/tasks.md` only for long work, cross-session recovery, or audit-file needs; do not read missing tasks.md by default. Then execute real tasks.",
+      : "First derive a runtime task list from the approved plan.md. Generate `.MAIN/plans/tasks.md` only for long work, cross-session recovery, or audit-file needs; do not read missing tasks.md by default. Then execute real tasks.",
     "Do not redo tasks whose evidence is already satisfied. If tasks.md exists, do not only edit checkboxes. Do not restate the plan.",
     "",
     "Plan artifact summary:",
@@ -3828,8 +3816,8 @@ async function prepareAttachedFileForRead(
 }
 
 function hasReviewablePlanState(artifacts: PlanArtifact[], stage: PlanStage): boolean {
-  if (stage === "ready_to_execute" || stage === "design" || stage === "bugfix") return true;
-  return artifacts.some((artifact) => artifact.kind === "design" || artifact.kind === "bugfix");
+  if (stage === "ready_to_execute" || stage === "plan" || stage === "design" || stage === "bugfix") return true;
+  return artifacts.some((artifact) => artifact.kind === "plan" || artifact.kind === "design" || artifact.kind === "bugfix");
 }
 
 function blockHasVisibleAgentContent(block: TaskBlock): boolean {
@@ -3895,12 +3883,11 @@ function deriveIdleConversationTurnStatus(input: {
   return "done";
 }
 
-/** Helper to ensure Skill content uses standard <analysis> tags for cross-model consistency. */
+/** Helper to keep Skill content from teaching hidden-thinking tags as an output channel. */
 function normalizeSkillContent(content: string): string {
   if (!content) return content;
   return content
-    .replace(/<(thought|thinking|reasoning|analysis)>/gi, "<analysis>")
-    .replace(/<\/(thought|thinking|reasoning|analysis)>/gi, "<\/analysis>");
+    .replace(/<\/?(thought|thinking|reasoning|analysis)>/gi, "");
 }
 
 // ── The Store ─────────────────────────────────────────────────────────
@@ -3917,6 +3904,7 @@ export const useAppStore = create<AppState>()(
 	        ...nextConfig,
 	        eventStreamMode: normalizeEventStreamMode(nextConfig.eventStreamMode, s.config.eventStreamMode),
 	        toolFeedbackFormat: normalizeToolFeedbackFormat(nextConfig.toolFeedbackFormat, s.config.toolFeedbackFormat),
+	        reasoningDisplay: normalizeReasoningDisplay(nextConfig.reasoningDisplay, s.config.reasoningDisplay),
 	        local: normalizeLocalConfig(nextConfig.local, s.config.local),
 	      };
 	      const runtimeLaneKey = resolveRuntimeLaneKey(normalizedConfig);
@@ -5511,19 +5499,19 @@ export const useAppStore = create<AppState>()(
             const taskListText = formatPlanTaskListForPrompt(executionPlanTasks, language);
             const runtimeTaskNotice = derivedRuntimeTasks
               ? language === "en"
-                ? "\n\nMAIN already derived a runtime task list from the approved design, so you do not need to create `.MAIN/plans/tasks.md` before the first source write. Use this list as the execution source of truth; persist it to tasks.md only if the work becomes long, needs cross-session audit, or the user explicitly asks for an audit file:\n" + taskListText
+                ? "\n\nMAIN already derived a runtime task list from the approved plan, so you do not need to create `.MAIN/plans/tasks.md` before the first source write. Use this list as the execution source of truth; persist it to tasks.md only if the work becomes long, needs cross-session audit, or the user explicitly asks for an audit file:\n" + taskListText
                 : "\n\nMAIN 已经从批准后的 design 派生出 runtime 任务清单，因此第一次源码写入前不必先创建 `.MAIN/plans/tasks.md`。请把下面清单作为本轮执行事实来源；只有任务变长、需要跨会话审计或用户明确要求留档时，才持久化到 tasks.md：\n" + taskListText
               : "";
 
             if (language === "en") {
               return hasTasksArtifact
               ? approvalChoiceHint + "The plan is approved. Continue directly from the current task list and execute the remaining items without repeating the plan. Do not read `.MAIN/plans/tasks.md` just to check whether it exists. If a source file has already been read and another read only returns `FILE_UNCHANGED_STUB`, switch to writing/patching, inspect a different target, or pause with the exact blocker instead of rereading. If `.MAIN/plans/tasks.md` is already known to exist, keep it as an audit record: do not delete completed or previous task records, and only check an item off after real evidence exists for its file/command/deliverable/browser validation, or the item is explicitly pending user validation." + deliverableHint + runtimeTaskNotice + "\n\n" + buildPlanCommandExecutionHint(executionPlanTasks, "en")
-                : approvalChoiceHint + "The plan is approved. First derive a concise runtime task list from the approved design.md; generate `.MAIN/plans/tasks.md` only if the work is long, needs cross-session audit, or the user explicitly requested a durable task file. Do not read tasks.md just to check whether it exists. Then execute real work without repeating the plan. Task items should be concise and include lightweight evidence such as `evidence: file:src/app.ts` or `evidence: cmd:npm test` when there is a concrete deliverable." + deliverableHint;
+                : approvalChoiceHint + "The plan is approved. First derive a concise runtime task list from the approved plan.md; generate `.MAIN/plans/tasks.md` only if the work is long, needs cross-session audit, or the user explicitly requested a durable task file. Do not read tasks.md just to check whether it exists. Then execute real work without repeating the plan. Task items should be concise and include lightweight evidence such as `evidence: file:src/app.ts` or `evidence: cmd:npm test` when there is a concrete deliverable." + deliverableHint;
             }
 
             return hasTasksArtifact
               ? approvalChoiceHint + "计划已批准。请直接基于当前任务清单继续执行剩余任务，不要重复计划内容。不要为了确认 `.MAIN/plans/tasks.md` 是否存在而读取它；如果源码文件已经读过，再读只返回 `FILE_UNCHANGED_STUB`，请改为写入/替换、读取不同目标，或明确暂停说明阻塞，不要继续重复读取；如果它已知存在，它是审计记录：不要删除已完成或旧任务记录；只有文件/命令/交付物/浏览器验证的真实证据满足，或该项明确待用户验证后，才能勾选对应任务。" + deliverableHint + runtimeTaskNotice + "\n\n" + buildPlanCommandExecutionHint(executionPlanTasks, "zh")
-              : approvalChoiceHint + "计划已批准。请先基于已批准的 design.md 派生精简 runtime 任务清单；只有任务较长、需要跨会话审计或用户明确要求持久任务文件时，才生成 `.MAIN/plans/tasks.md`。不要为了确认 tasks.md 是否存在而读取它。然后执行真实任务，不要重复计划内容。有明确交付物的任务请保留轻量证据标签，例如 `证据: file:src/app.ts` 或 `证据: cmd:npm test`。" + deliverableHint;
+              : approvalChoiceHint + "计划已批准。请先基于已批准的 plan.md 派生精简 runtime 任务清单；只有任务较长、需要跨会话审计或用户明确要求持久任务文件时，才生成 `.MAIN/plans/tasks.md`。不要为了确认 tasks.md 是否存在而读取它。然后执行真实任务，不要重复计划内容。有明确交付物的任务请保留轻量证据标签，例如 `证据: file:src/app.ts` 或 `证据: cmd:npm test`。" + deliverableHint;
           })(),
           undefined,
           {
@@ -5539,8 +5527,8 @@ export const useAppStore = create<AppState>()(
             skipIntentResolution: true,
             turnTitle: language === "zh" ? "执行已批准计划" : "Execute Approved Plan",
             intentSummary: language === "zh"
-              ? "用户已批准计划，MAIN 将在新的执行回合中按 design.md 落地。"
-              : "The user approved the plan; MAIN will execute design.md in a new execution turn.",
+              ? "用户已批准计划，MAIN 将在新的执行回合中按 plan.md 落地。"
+              : "The user approved the plan; MAIN will execute plan.md in a new execution turn.",
           },
         );
       });
@@ -7631,15 +7619,15 @@ export const useAppStore = create<AppState>()(
           : "本轮处于 PLAN 模式。";
         userContent = preferredLanguage === "en"
           ? [
-              `${planModeLead} If the request is a complex implementation, call \`write_file\` or \`replace_in_file\` to create or update the concise reviewable plan draft in \`.MAIN/plans/design.md\` before asking for approval; create \`.MAIN/plans/requirements.md\` only when the user explicitly wants a requirement ledger or the scope needs traceability. Do not write project source files or tasks.md before approval.`,
-              "Creating or updating design.md is an automatic internal planning step, not a user choice. After the user picks a route, update the plan draft directly instead of asking whether to update internal plan documents.",
+              `${planModeLead} If the request is a complex implementation, call \`write_file\` or \`replace_in_file\` to create or update the concise reviewable plan draft in \`.MAIN/plans/plan.md\` before asking for approval; create \`.MAIN/plans/requirements.md\` only when the user explicitly wants a requirement ledger or the scope needs traceability. Do not write project source files or tasks.md before approval.`,
+              "Creating or updating plan.md is an automatic internal planning step, not a user choice. After the user picks a route, update the plan draft directly instead of asking whether to update internal plan documents.",
               "If it is only a discussion-style plan, keep the answer concise and use user options for real decisions.",
               "",
               userContent,
             ].join("\n")
           : [
-              `${planModeLead}如果这是复杂实现请求，请调用 \`write_file\` 或 \`replace_in_file\` 创建或更新可审批的精简计划草稿：默认写 \`.MAIN/plans/design.md\`；只有用户明确要求需求台账或范围需要追踪时，才额外写 \`.MAIN/plans/requirements.md\`。等待用户批准后再改源码；批准前不要生成 tasks.md。`,
-              "创建或更新 design.md 是自动的内部规划步骤，不是用户需要选择的下一步；用户选定方案后应直接更新计划草稿，不要再询问是否更新内部计划文件。",
+              `${planModeLead}如果这是复杂实现请求，请调用 \`write_file\` 或 \`replace_in_file\` 创建或更新可审批的精简计划草稿：默认写 \`.MAIN/plans/plan.md\`；只有用户明确要求需求台账或范围需要追踪时，才额外写 \`.MAIN/plans/requirements.md\`。等待用户批准后再改源码；批准前不要生成 tasks.md。`,
+              "创建或更新 plan.md 是自动的内部规划步骤，不是用户需要选择的下一步；用户选定方案后应直接更新计划草稿，不要再询问是否更新内部计划文件。",
               "如果只是讨论式方案，请保持简洁，并在真实分叉点用可点击选项让用户选择。",
               "",
               userContent,
@@ -7652,14 +7640,14 @@ export const useAppStore = create<AppState>()(
           ? [
               "Continue the previous PLAN turn. The user is asking to keep going, not to start a new discussion.",
               originalPlanPrompt ? `Original plan request: ${originalPlanPrompt}` : "Original plan request: use the current conversation context.",
-              "Produce real planning progress now. If key choices remain, summarize them briefly and use <user_options>; otherwise call `write_file` or `replace_in_file` to update `.MAIN/plans/design.md`, then provide the concise Proposal. Do not create requirements.md unless a requirement ledger is explicitly needed.",
+              "Produce real planning progress now. If key choices remain, summarize them briefly and use <user_options>; otherwise call `write_file` or `replace_in_file` to update `.MAIN/plans/plan.md`, then provide the concise Proposal. Do not create requirements.md unless a requirement ledger is explicitly needed.",
               "Keep any plan Markdown concise: review-summary style, no tutorial prose, no full code listings, no repeated background.",
               text.trim() ? `Latest user message: ${text.trim()}` : "Latest user message: continue",
             ].join("\n")
           : [
               "请继续上一轮 PLAN 回合。用户是在要求继续推进，不是开启新的普通讨论。",
               originalPlanPrompt ? `上一轮计划请求：${originalPlanPrompt}` : "上一轮计划请求：请依据当前对话上下文继续。",
-              "现在必须产生实际规划进展。如果仍有关键选择需要用户确认，就先简短归纳并用面向用户的口吻给出 <user_options>；否则调用 `write_file` 或 `replace_in_file` 更新 `.MAIN/plans/design.md`，再给出精简 Proposal。除非明确需要需求台账，否则不要生成 requirements.md。",
+              "现在必须产生实际规划进展。如果仍有关键选择需要用户确认，就先简短归纳并用面向用户的口吻给出 <user_options>；否则调用 `write_file` 或 `replace_in_file` 更新 `.MAIN/plans/plan.md`，再给出精简 Proposal。除非明确需要需求台账，否则不要生成 requirements.md。",
               "每个 <option> 必须是用户点击后会发送的完整选择，不要写成“是否……”问题句。",
               "所有计划 Markdown 都要精简成审阅摘要风格，不要写教程式长文、完整代码清单或重复背景。",
               text.trim() ? `用户最新消息：${text.trim()}` : "用户最新消息：继续",
@@ -8157,6 +8145,7 @@ export const useAppStore = create<AppState>()(
         let { agent, thinking, thoughtStarted, thoughtEnded } = thinkingInterceptor.feed(chunk);
 
         const latestStateForDedupe = sessionGet();
+        const shouldDisplayReasoningBlocks = latestStateForDedupe.config.reasoningDisplay !== "hidden";
         const nextInterceptorThought = thinking
           ? appendThoughtDelta(latestStateForDedupe.currentTurnState.interceptorThought, thinking)
           : latestStateForDedupe.currentTurnState.interceptorThought;
@@ -8165,7 +8154,7 @@ export const useAppStore = create<AppState>()(
         let thoughtIdToUpdate = currentThoughtBlockId;
         const thoughtDuration = thoughtStartTime ? Math.round((Date.now() - thoughtStartTime) / 1000) : undefined;
 
-        if (thoughtStarted) {
+        if (thoughtStarted && shouldDisplayReasoningBlocks) {
           thoughtStartTime = Date.now();
           // Keep one live thought cell per turn; the UI treats it as a replaceable
           // activity summary instead of a transcript of every reasoning fragment.
@@ -8191,8 +8180,11 @@ export const useAppStore = create<AppState>()(
         }
 
         let thoughtEndedId: number | null = null;
-        if (thoughtEnded && currentThoughtBlockId !== null) {
+        if (thoughtEnded && currentThoughtBlockId !== null && shouldDisplayReasoningBlocks) {
           thoughtEndedId = currentThoughtBlockId;
+          currentThoughtBlockId = null;
+          thoughtStartTime = null;
+        } else if (thoughtEnded && !shouldDisplayReasoningBlocks) {
           currentThoughtBlockId = null;
           thoughtStartTime = null;
         }
@@ -8248,7 +8240,7 @@ export const useAppStore = create<AppState>()(
             );
           };
 
-          if (thoughtIdToCreate !== null) {
+          if (shouldDisplayReasoningBlocks && thoughtIdToCreate !== null) {
             appendBlock({
               id: thoughtIdToCreate,
               turnId,
@@ -8256,7 +8248,7 @@ export const useAppStore = create<AppState>()(
               content: compactThoughtContent(currentInterceptorThoughtContent),
               isStreaming: true,
             });
-          } else if (thoughtIdToUpdate !== null && thinking) {
+          } else if (shouldDisplayReasoningBlocks && thoughtIdToUpdate !== null && thinking) {
             const tid = thoughtIdToUpdate;
             taskFlow = taskFlow.map((t) =>
               t.id === tid && t.type === "thought"
@@ -8265,7 +8257,7 @@ export const useAppStore = create<AppState>()(
             );
           }
 
-          if (thoughtEndedId !== null) {
+          if (shouldDisplayReasoningBlocks && thoughtEndedId !== null) {
             const tid = thoughtEndedId;
             taskFlow = taskFlow.map((t) =>
               t.id === tid && t.type === "thought"
@@ -8497,8 +8489,8 @@ export const useAppStore = create<AppState>()(
             executionTurnId,
             title: language === "zh" ? "执行已批准计划" : "Execute Approved Plan",
             intentSummary: language === "zh"
-              ? "用户已批准计划，MAIN 将在新的执行回合中按 design.md 落地。"
-              : "The user approved the plan; MAIN will execute design.md in a new execution turn.",
+              ? "用户已批准计划，MAIN 将在新的执行回合中按 plan.md 落地。"
+              : "The user approved the plan; MAIN will execute plan.md in a new execution turn.",
           };
           const progressSnapshot = normalizePlanExecutionProgressSnapshot({
             turnId: executionTurnId,
@@ -8512,8 +8504,8 @@ export const useAppStore = create<AppState>()(
               evidenceLedger: [],
               recentToolActivity: [],
               nextStep: language === "zh"
-                ? "开启新的执行回合并按已批准 design.md 执行"
-                : "start a new execution turn and follow the approved design.md",
+                ? "开启新的执行回合并按已批准 plan.md 执行"
+                : "start a new execution turn and follow the approved plan.md",
             }),
             previous: sessionGet().planExecutionProgressSnapshot,
             now: Date.now(),
@@ -8752,6 +8744,15 @@ export const useAppStore = create<AppState>()(
             }
           }));
 
+          if (sessionGet().config.reasoningDisplay === "hidden") {
+            logStoreEvent("reasoning_suppressed", {
+              turnId,
+              source: "normalized_hidden_thought",
+              chars: thought.length,
+            });
+            return;
+          }
+
           const currentFlow = sessionGet().taskFlow;
           // Find the last thought block in this turn (not just the very last block),
           // so that thought blocks can be merged even when tool blocks appear after them.
@@ -8872,6 +8873,9 @@ export const useAppStore = create<AppState>()(
               previousObservation: getLatestTurnToolObservationText(currentFlowForProgress, turnId),
               turnIntent: effectiveRunIntent,
               workflowMode: sessionGet().config.workflowMode,
+              sourceToolCallIds: (meta?.toolCalls || [])
+                .map((call) => String((call as any).id || "").trim())
+                .filter(Boolean),
             });
           })();
           const progressDisplayText = progressFromMeta
@@ -9064,6 +9068,7 @@ export const useAppStore = create<AppState>()(
             previousObservation,
             turnIntent: effectiveRunIntent,
             workflowMode: sessionGet().config.workflowMode,
+            sourceToolCallIds: normalizedToolCallId ? [normalizedToolCallId] : [],
           });
           const intentSummary = deriveToolIntentSummary({
             toolName,
@@ -9240,6 +9245,7 @@ export const useAppStore = create<AppState>()(
               noOp: noOpWrite,
               turnIntent: effectiveRunIntent,
               workflowMode: sessionGet().config.workflowMode,
+              sourceToolCallIds: meta?.toolCallId ? [String(meta.toolCallId)] : [],
             });
             updated[idx] = {
               ...updated[idx],
@@ -9294,6 +9300,10 @@ export const useAppStore = create<AppState>()(
               source: "tool_result",
               evidence: observationSummary,
               next: doneProgress.next,
+              evidenceExcerpt: doneProgress.evidenceExcerpt,
+              observedFact: doneProgress.observedFact,
+              hypothesisStatus: doneProgress.hypothesisStatus,
+              sourceToolCallIds: doneProgress.sourceToolCallIds,
             });
 
             return {
@@ -9369,6 +9379,7 @@ export const useAppStore = create<AppState>()(
               result: error,
               turnIntent: effectiveRunIntent,
               workflowMode: sessionGet().config.workflowMode,
+              sourceToolCallIds: meta?.toolCallId ? [String(meta.toolCallId)] : [],
             });
             const observationSummary = language === "en"
               ? `Tool failed: ${compactProgressContextText(error, 180)}`
@@ -9398,6 +9409,10 @@ export const useAppStore = create<AppState>()(
               source: "tool_result",
               evidence: observationSummary,
               next: failedProgress.next,
+              evidenceExcerpt: failedProgress.evidenceExcerpt,
+              observedFact: failedProgress.observedFact,
+              hypothesisStatus: failedProgress.hypothesisStatus,
+              sourceToolCallIds: failedProgress.sourceToolCallIds,
             });
             return {
               taskFlow: nextTaskFlow,
@@ -9494,7 +9509,7 @@ export const useAppStore = create<AppState>()(
               state.isPlanApproved &&
               state.planStage === "executing";
             if (hasPlanContext) {
-              logStoreEvent(isApprovedPlanExecution ? "tool_permission_review" : "plan_design_review", {
+              logStoreEvent(isApprovedPlanExecution ? "tool_permission_review" : "plan_review", {
                 turnId,
                 effectiveRunIntent,
                 planArtifacts: state.planArtifacts.length,
@@ -9723,8 +9738,8 @@ export const useAppStore = create<AppState>()(
                   ? `Task list rejected: ${path} is missing verifiable evidence labels (${reason}). MAIN will ask the model to regenerate \`.MAIN/plans/tasks.md\` with unchecked tasks and evidence labels such as \`evidence: file:src/App.tsx\`, \`evidence: cmd:npm test\`, or \`evidence: deliverable:REPORT.md\`.`
                   : `任务清单已被拦截：${path} 缺少可验证 evidence 标签（${reason}）。MAIN 会要求模型重新生成真实的 \`.MAIN/plans/tasks.md\`，每项保持未完成 checkbox，并补充类似 \`证据: file:src/App.tsx\`、\`证据: cmd:npm test\` 或 \`证据: deliverable:REPORT.md\` 的证据标签。`
                 : language === "en"
-                ? `Plan artifact rejected: ${path} does not look like a reviewable ${kind} document (${reason}). MAIN will ask the model to regenerate a real \`.MAIN/plans/design.md\` artifact, or request your decision.`
-                : `计划文件已被拦截：${path} 不像可审批的${getPlanArtifactTitle(kind, "zh")}（${reason}）。MAIN 会要求模型重新生成真实的 \`.MAIN/plans/design.md\`，或先向你确认关键分叉。`;
+                ? `Plan artifact rejected: ${path} does not look like a reviewable ${kind} document (${reason}). MAIN will ask the model to regenerate a real \`.MAIN/plans/plan.md\` artifact, or request your decision.`
+                : `计划文件已被拦截：${path} 不像可审批的${getPlanArtifactTitle(kind, "zh")}（${reason}）。MAIN 会要求模型重新生成真实的 \`.MAIN/plans/plan.md\`，或先向你确认关键分叉。`;
             appendTurnBlock({
               id: nextId(),
               turnId,
@@ -10843,6 +10858,10 @@ export const useAppStore = create<AppState>()(
             (persistedConfig as any).toolFeedbackFormat,
             current.config.toolFeedbackFormat,
           ),
+          reasoningDisplay: normalizeReasoningDisplay(
+            (persistedConfig as any).reasoningDisplay,
+            current.config.reasoningDisplay,
+          ),
           imAdapters: normalizeImAdaptersConfig((persistedConfig as any).imAdapters),
         },
         sessionsByWorkspace: normalizedSessionsByWorkspace,
@@ -11054,11 +11073,39 @@ async function requestSemanticTurnMetadata(params: {
           ? extractGeminiResponseText(j).trim()
           : extractOpenAiResponseText(j, cloudApiFormat).trim();
 
-    const jsonText = extractJsonObject(rawText || "");
-    const parsedMetadata = jsonText
-      ? JSON.parse(jsonText)
-      : extractLooseSemanticTurnMetadata(rawText || "");
+    const rawReasoningText = provider === "Ollama"
+      ? String(
+          j.message?.reasoning_content ||
+          j.message?.reasoning ||
+          j.message?.thinking ||
+          j.message?.thought ||
+          "",
+        ).trim()
+      : !isAnthropicCloud && !isGeminiCloud
+      ? String(
+          j.choices?.[0]?.message?.reasoning_content ||
+          j.choices?.[0]?.message?.reasoning ||
+          j.reasoning_content ||
+          j.reasoning ||
+          "",
+        ).trim()
+      : "";
+
+    const titleParse = parseIntentTitleCandidate({
+      content: rawText || "",
+      reasoning: rawReasoningText,
+    });
+    const parsedMetadata = titleParse.metadata;
     if (!parsedMetadata) {
+      if (!isCloud) {
+        logStoreEvent("semantic_title_local_fallback_used", {
+          provider,
+          model,
+          reason: titleParse.failureReason || "unparseable_title_output",
+          contentChars: String(rawText || "").length,
+          reasoningChars: rawReasoningText.length,
+        });
+      }
       return normalizeSemanticTurnMetadata({}, {
         input: params.input,
         intent: params.intent,

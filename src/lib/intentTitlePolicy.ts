@@ -28,6 +28,17 @@ export interface SemanticTurnMetadataCallbackGuardInput {
   session: SemanticTurnMetadataCallbackSession | null | undefined;
 }
 
+export interface IntentTitleCandidate {
+  title?: string;
+  summary?: string;
+}
+
+export interface IntentTitleParseResult {
+  metadata: IntentTitleCandidate | null;
+  source: "json" | "loose_key_value" | "first_line" | "reasoning_json" | "reasoning_loose_key_value" | "reasoning_first_line" | "none";
+  failureReason?: string;
+}
+
 const DEFAULT_SEEDED_SESSION_TITLES = new Set([
   "New Conversation",
   "新会话",
@@ -83,4 +94,92 @@ export function isSemanticTurnMetadataCallbackCurrent(
     return !!params.session && params.session.id === params.expectedSessionId;
   }
   return true;
+}
+
+function stripJsonFence(text: string): string {
+  const trimmed = String(text || "").trim();
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  return fenced?.[1]?.trim() || trimmed;
+}
+
+function extractJsonObject(text: string): string | null {
+  const cleaned = stripJsonFence(text);
+  const start = cleaned.indexOf("{");
+  const end = cleaned.lastIndexOf("}");
+  if (start >= 0 && end > start) {
+    return cleaned.slice(start, end + 1);
+  }
+  return null;
+}
+
+function cleanTitleModelText(text: string): string {
+  return String(text || "")
+    .replace(/<think>[\s\S]*?<\/think>/gi, " ")
+    .replace(/<(?:analysis|thought|thinking|reasoning)(?:\s[^>]*)?>[\s\S]*?<\/(?:analysis|thought|thinking|reasoning)>/gi, " ")
+    .replace(/<\/?(?:analysis|thought|thinking|reasoning|think)(?:\s[^>]*)?>/gi, " ")
+    .replace(/```[\s\S]*?```/g, (match) => stripJsonFence(match))
+    .trim();
+}
+
+function parseTitleJson(text: string): IntentTitleCandidate | null {
+  const jsonText = extractJsonObject(text);
+  if (!jsonText) return null;
+  try {
+    const parsed = JSON.parse(jsonText);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    const title = typeof parsed.title === "string" ? parsed.title.trim() : "";
+    const summary = typeof parsed.summary === "string" ? parsed.summary.trim() : "";
+    return title || summary ? { title, summary } : null;
+  } catch {
+    return null;
+  }
+}
+
+function parseLooseTitleText(text: string): { metadata: IntentTitleCandidate | null; source: "loose_key_value" | "first_line" | "none" } {
+  const normalized = cleanTitleModelText(text);
+  if (!normalized) return { metadata: null, source: "none" };
+
+  const titleMatch = normalized.match(/(?:^|[\n,，])\s*(?:title|标题)\s*[:：=]\s*["“”']?([^\n,"“”'}]+)["“”']?/i);
+  const summaryMatch = normalized.match(/(?:^|[\n,，])\s*(?:summary|摘要|总结)\s*[:：=]\s*["“”']?([^\n"“”'}]+)["“”']?/i);
+  const title = titleMatch?.[1]?.trim();
+  const summary = summaryMatch?.[1]?.trim();
+  if (title || summary) return { metadata: { title, summary }, source: "loose_key_value" };
+
+  const firstLine = normalized
+    .split(/\r?\n/)
+    .map((line) => line.replace(/^[-*#>\s]+/, "").trim())
+    .filter((line) => !/^(?:title|标题|summary|摘要|json)\b/i.test(line))
+    .find(Boolean);
+  return firstLine ? { metadata: { title: firstLine }, source: "first_line" } : { metadata: null, source: "none" };
+}
+
+export function parseIntentTitleCandidate(input: {
+  content?: string | null;
+  reasoning?: string | null;
+}): IntentTitleParseResult {
+  const content = String(input.content || "").trim();
+  const reasoning = String(input.reasoning || "").trim();
+
+  const json = parseTitleJson(content);
+  if (json) return { metadata: json, source: "json" };
+
+  const loose = parseLooseTitleText(content);
+  if (loose.metadata) return { metadata: loose.metadata, source: loose.source };
+
+  const reasoningJson = parseTitleJson(reasoning);
+  if (reasoningJson) return { metadata: reasoningJson, source: "reasoning_json" };
+
+  const reasoningLoose = parseLooseTitleText(reasoning);
+  if (reasoningLoose.metadata) {
+    return {
+      metadata: reasoningLoose.metadata,
+      source: reasoningLoose.source === "loose_key_value" ? "reasoning_loose_key_value" : "reasoning_first_line",
+    };
+  }
+
+  return {
+    metadata: null,
+    source: "none",
+    failureReason: !content && !reasoning ? "empty_model_output" : "unparseable_title_output",
+  };
 }

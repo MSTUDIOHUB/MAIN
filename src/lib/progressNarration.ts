@@ -28,6 +28,10 @@ export interface ProgressNarration {
   targets: string[];
   status: ProgressNarrationStatus;
   source: ProgressNarrationSource;
+  evidenceExcerpt?: string;
+  observedFact?: string;
+  hypothesisStatus?: "confirmed" | "unverified" | "blocked";
+  sourceToolCallIds?: string[];
 }
 
 export interface ToolProgressNarrationInput {
@@ -44,6 +48,10 @@ export interface ToolProgressNarrationInput {
   targetRole?: string;
   result?: string;
   noOp?: boolean;
+  evidenceExcerpt?: string;
+  observedFact?: string;
+  hypothesisStatus?: "confirmed" | "unverified" | "blocked";
+  sourceToolCallIds?: string[];
 }
 
 const VERIFY_COMMAND_RE = /\b(?:test|build|lint|check|typecheck|tsc|playwright|vitest|jest|pytest|cargo\s+(?:test|check)|go\s+test|npm\s+(?:run\s+)?(?:build|test|lint|check)|pnpm\s+(?:run\s+)?(?:build|test|lint|check)|yarn\s+(?:build|test|lint|check))\b/i;
@@ -84,6 +92,12 @@ function looksLikeProgressEcho(text: string): boolean {
 function compactContextSnippet(text: string, maxChars = 180): string {
   const normalized = compactMarkdownSnippet(text, maxChars);
   return looksLikeProgressEcho(normalized) ? "" : normalized;
+}
+
+function compactEvidenceExcerpt(text: string, maxChars = 220): string {
+  return compactMarkdownSnippet(text, maxChars)
+    .replace(/\b(?:exitCode|exit_code)\b["':\s]*/gi, "exit ")
+    .trim();
 }
 
 function compactGoal(goal: string, language: ToolPresentationLanguage): string {
@@ -230,8 +244,8 @@ function buildWhy(input: ToolProgressNarrationInput & {
     if (hypothesis) return `Current judgment points to ${hypothesis}. This step checks ${role} for evidence before changing anything.`;
     if (observation) return `The previous result showed ${observation}; this step narrows the next useful evidence in ${role}.`;
     return goal
-      ? `The goal ${goal} depends on how ${role} currently works, so this step gathers that context first.`
-      : `Read or search ${role} first so the next change is based on evidence instead of guesswork.`;
+      ? `The goal ${goal} depends on how ${role} currently works.`
+      : "";
   }
 
   if (progressPhase === "blocked") return "保留真实受阻点，方便从失败步骤继续恢复。";
@@ -248,8 +262,8 @@ function buildWhy(input: ToolProgressNarrationInput & {
   if (hypothesis) return `当前判断指向：${hypothesis}。先查看 ${role}，用代码证据确认后再继续。`;
   if (observation) return `前一步结果显示 ${observation}，所以继续在 ${role} 收窄证据。`;
   return goal
-    ? `用户目标 ${goal} 依赖 ${role} 的当前实现，先确认上下文再修改。`
-    : `先读取/搜索 ${role}，避免在不了解实现时猜测改动。`;
+    ? `用户目标 ${goal} 依赖 ${role} 的当前实现。`
+    : "";
 }
 
 function buildEvidence(input: {
@@ -297,11 +311,23 @@ function buildNext(input: {
   if (language === "en") {
     if (phase === "edit") return "Verify the touched behavior with the smallest relevant check.";
     if (progressPhase === "verifying") return "Use the result to decide whether to fix another issue or summarize completion.";
-    return "Use this evidence to choose the smallest safe edit or the next focused read.";
+    return "";
   }
   if (phase === "edit") return "修改完成后，用最相关的检查验证受影响行为。";
   if (progressPhase === "verifying") return "根据验证结果决定继续修复，还是总结完成情况。";
-  return "根据证据决定最小修改范围，或继续读取缺口上下文。";
+  return "";
+}
+
+function resolveHypothesisStatus(input: {
+  status: ProgressNarrationStatus;
+  phase: ToolExecutionPhase;
+  progressPhase: ProgressNarrationPhase;
+  explicit?: "confirmed" | "unverified" | "blocked";
+}): "confirmed" | "unverified" | "blocked" {
+  if (input.explicit) return input.explicit;
+  if (input.status === "failed" || input.progressPhase === "blocked") return "blocked";
+  if (input.status === "done") return "confirmed";
+  return "unverified";
 }
 
 function titleForTool(input: {
@@ -356,6 +382,23 @@ export function buildToolProgressNarration(input: ToolProgressNarrationInput): P
     targets: [compactToolPresentationTarget(target, input.toolName, language)].filter(Boolean),
     status,
     source: input.source || "runtime",
+    evidenceExcerpt: input.evidenceExcerpt || (input.result ? compactEvidenceExcerpt(input.result) : ""),
+    observedFact: input.observedFact || (status === "done"
+      ? summarizeToolObservation({
+          toolName: input.toolName,
+          target,
+          result: input.result || "",
+          language,
+          noOp: input.noOp,
+        })
+      : compactContextSnippet(String(input.previousObservation || input.currentHypothesis || ""), 180)),
+    hypothesisStatus: resolveHypothesisStatus({
+      status,
+      phase: toolPhase,
+      progressPhase,
+      explicit: input.hypothesisStatus,
+    }),
+    sourceToolCallIds: (input.sourceToolCallIds || []).map(String).filter(Boolean).slice(0, 12),
   });
 }
 
@@ -442,6 +485,12 @@ export function normalizeProgressNarration(progress: ProgressNarration): Progres
     targets: Array.from(new Set((progress.targets || []).map((target) => compactLine(target, 80)).filter(Boolean))).slice(0, 6),
     status,
     source,
+    evidenceExcerpt: compactMarkdownSnippet(progress.evidenceExcerpt || "", 220),
+    observedFact: compactMarkdownSnippet(progress.observedFact || "", 220),
+    hypothesisStatus: progress.hypothesisStatus === "confirmed" || progress.hypothesisStatus === "blocked"
+      ? progress.hypothesisStatus
+      : "unverified",
+    sourceToolCallIds: Array.from(new Set((progress.sourceToolCallIds || []).map((id) => String(id).trim()).filter(Boolean))).slice(0, 12),
   };
 }
 

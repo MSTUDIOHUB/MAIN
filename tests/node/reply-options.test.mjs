@@ -241,7 +241,7 @@ test("extractReplyOptions ignores plan summary bullets after proposal headings",
 - **交互控制**：方向键移动，空格暂停，回车/按钮重新开始
 - **交付物**：\`snake.html\` 单文件
 
-设计方案（design.md）
+执行计划（plan.md）
 
 1. 架构：单文件包含HTML/CSS/JS，Canvas渲染
 2. 游戏循环：\`setInterval\` 每150ms更新
@@ -258,7 +258,7 @@ test("extractReplyOptions filters internal plan artifact creation pseudo choices
 
 <user_options>
 <option>创建 \`.MAIN/plans/requirements.md\` - 精简的需求规格</option>
-<option>创建 \`.MAIN/plans/design.md\` - 精简的设计方案</option>
+<option>创建 \`.MAIN/plans/plan.md\` - 精简的执行计划</option>
 </user_options>
   `);
 
@@ -268,9 +268,9 @@ test("extractReplyOptions filters internal plan artifact creation pseudo choices
 选择下一步：
 
 <user_options>
-<option>基于方案C更新计划文档（requirements.md + design.md）</option>
+<option>基于方案C更新计划文档（requirements.md + plan.md）</option>
 <option>创建 requirements.md</option>
-<option>更新 design.md</option>
+<option>更新 plan.md</option>
 <option>生成计划文档</option>
 </user_options>
   `);
@@ -290,9 +290,9 @@ test("extractReplyOptions filters internal plan artifact creation pseudo choices
 
   const inferredMarkdownResult = extractReplyOptions(`
 下一步可以：
-1. 基于方案C更新计划文档（requirements.md + design.md）
+1. 基于方案C更新计划文档（requirements.md + plan.md）
 2. 创建 requirements.md
-3. 更新 design.md
+3. 更新 plan.md
   `);
 
   assert.equal(inferredMarkdownResult.replyOptions.length, 0);

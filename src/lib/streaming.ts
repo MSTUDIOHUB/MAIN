@@ -791,7 +791,6 @@ async function requestOpenAiNonStreaming(
           messages: messages.map((message) => ({
             role: message.role === "tool" ? "user" : message.role,
             content: extractTextContent(message.content),
-            ...messageReasoningForApi(message),
           })),
           stream: false,
           ...(!minimalCompatibilityMode && tools && tools.length > 0 ? { tools: normalizeToolDefinitions(tools) } : {}),
@@ -901,7 +900,7 @@ async function streamViaRustProxy(
         ? geminiRequest?.body ?? {}
       : {
           model: settings.model,
-          messages: messages.map((m) => mapMessageForApi(m, false, { includeAssistantReasoning: true })),
+          messages: messages.map((m) => mapMessageForApi(m, false)),
           stream: true,
           max_tokens: maxTokens,
           ...(settings.sendSamplingParameters === true && settings.temperature != null ? { temperature: settings.temperature } : {}),
@@ -996,15 +995,11 @@ async function streamViaRustProxy(
   const openReasoningBlock = () => {
     if (reasoningActive) return;
     reasoningActive = true;
-    fullContent += "<thinking>";
-    onToken("<thinking>");
   };
 
   const closeReasoningBlock = () => {
     if (!reasoningActive) return;
     reasoningActive = false;
-    fullContent += "</thinking>";
-    onToken("</thinking>");
   };
 
   const buildCurrentOpenAiCompatibleResult = (): StreamResult => ({
@@ -1104,12 +1099,7 @@ async function streamViaRustProxy(
             providerReasoningContent += reasoningDelta;
             providerReasoningField = providerReasoningField ?? extracted.reasoningField;
             if (reasoningEmitted) {
-              // Already verified as legitimate — emit directly into the
-              // hidden reasoning block. Keep the final StreamResult tagged so
-              // normalization does not promote reasoning into visible text.
               openReasoningBlock();
-              fullContent += reasoningDelta;
-              onToken(reasoningDelta);
             } else {
               // Accumulate in buffer until we can verify
               reasoningBuffer += reasoningDelta;
@@ -1117,8 +1107,6 @@ async function streamViaRustProxy(
                 // Content contains real characters — flush buffer + emit
                 reasoningEmitted = true;
                 openReasoningBlock();
-                fullContent += reasoningBuffer;
-                onToken(reasoningBuffer);
                 reasoningBuffer = "";
               } else if (reasoningBuffer.length > 20) {
                 // All '?' — the server cannot decode this model's thinking
@@ -1441,7 +1429,7 @@ export async function streamChatCompletion(
         ? geminiRequest?.body ?? {}
       : {
           model: settings.model,
-          messages: messages.map((m) => mapMessageForApi(m, false, { includeAssistantReasoning: true })),
+          messages: messages.map((m) => mapMessageForApi(m, false)),
           stream: true,
           max_tokens: maxTokens,
           ...(settings.sendSamplingParameters === true && settings.temperature != null ? { temperature: settings.temperature } : {}),
@@ -1544,15 +1532,11 @@ export async function streamChatCompletion(
   const openReasoningBlock = () => {
     if (reasoningActive) return;
     reasoningActive = true;
-    fullContent += "<thinking>";
-    onToken("<thinking>");
   };
 
   const closeReasoningBlock = () => {
     if (!reasoningActive) return;
     reasoningActive = false;
-    fullContent += "</thinking>";
-    onToken("</thinking>");
   };
 
   // Accumulate tool calls across deltas, keyed by index
@@ -1638,15 +1622,11 @@ export async function streamChatCompletion(
               providerReasoningField = providerReasoningField ?? extracted.reasoningField;
               if (reasoningEmitted) {
                 openReasoningBlock();
-                fullContent += reasoningDelta;
-                onToken(reasoningDelta);
               } else {
                 reasoningBuffer += reasoningDelta;
                 if (!isGarbled(reasoningBuffer)) {
                   reasoningEmitted = true;
                   openReasoningBlock();
-                  fullContent += reasoningBuffer;
-                  onToken(reasoningBuffer);
                   reasoningBuffer = "";
                 } else if (reasoningBuffer.length > 20) {
                   reasoningGarbled = true;

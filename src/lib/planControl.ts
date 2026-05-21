@@ -1,7 +1,7 @@
 import type { PlanArtifact, PlanStage, ReplyOption } from "./workflowModels";
 
-const REVIEWABLE_PLAN_STAGES = new Set<PlanStage>(["design", "bugfix", "ready_to_execute"]);
-const REVIEWABLE_PLAN_ARTIFACTS = new Set(["design", "bugfix", "tasks"]);
+const REVIEWABLE_PLAN_STAGES = new Set<PlanStage>(["plan", "design", "bugfix", "ready_to_execute"]);
+const REVIEWABLE_PLAN_ARTIFACTS = new Set(["plan", "design", "bugfix", "tasks"]);
 const PLAN_EXECUTION_CHOICE_RE = /(?:直接|开始|继续|立即|马上|现在)?(?:执行|运行|部署|发布|同步|上传)(?:.{0,24}(?:脚本|命令|deploy(?:\.sh)?|deployment|server|服务器|远程|生产|线上))?|\b(?:run|execute|deploy|publish|ship|sync)(?:.{0,24}(?:script|command|deploy(?:\.sh)?|deployment|server|remote|production))?\b/i;
 
 export type PlanApprovalQuickReplyAction =

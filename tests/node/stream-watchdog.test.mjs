@@ -60,6 +60,7 @@ const {
   createStreamNoVisibleTokenTimeoutError,
   buildPlanExplorationBudget,
   isReasoningDominatedLengthResult,
+  isReasoningDominatedNoActionResult,
   isStreamWatchdogTimeoutMessage,
   shouldAttemptPlanClosureGuard,
   shouldDeferNoProgressStopToPlanReadOnlyConvergence,
@@ -91,6 +92,26 @@ test("detects reasoning-dominated length results before max output escalation", 
       reasoningContent: "需要继续分析。".repeat(500),
       finishReason: "length",
       toolCalls: [],
+    }),
+    false,
+  );
+});
+
+test("detects reasoning-only no-action results even without length finish", () => {
+  assert.equal(
+    isReasoningDominatedNoActionResult({
+      content: "",
+      reasoningContent: "内部分析。".repeat(400),
+      toolCalls: [],
+    }),
+    true,
+  );
+
+  assert.equal(
+    isReasoningDominatedNoActionResult({
+      content: "我已经修好了。",
+      reasoningContent: "内部分析。".repeat(400),
+      toolCalls: [{ name: "write_file", arguments: "{}", id: "call_1" }],
     }),
     false,
   );
@@ -285,7 +306,7 @@ test("plan exploration budget redirects repeated broad reads to design closure",
       hasTabularEvidence: false,
     }),
     {
-      shouldRedirectToDesignClosure: true,
+      shouldRedirectToPlanClosure: true,
       reason: "repeated_broad_structure_read",
     },
   );
@@ -298,7 +319,7 @@ test("plan exploration budget redirects repeated broad reads to design closure",
       target: ".",
       duplicateCount: 2,
       hasTabularEvidence: true,
-    }).shouldRedirectToDesignClosure,
+    }).shouldRedirectToPlanClosure,
     false,
   );
 });
@@ -314,7 +335,7 @@ test("plan exploration budget redirects broad reads after enough read evidence",
       successfulReadEvidenceCount: 2,
     }),
     {
-      shouldRedirectToDesignClosure: true,
+      shouldRedirectToPlanClosure: true,
       reason: "sufficient_read_context_already_available",
     },
   );

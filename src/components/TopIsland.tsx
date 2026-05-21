@@ -55,8 +55,9 @@ function isApprovalActionOption(option: ReplyOption): boolean {
 function getStageLabel(stage: PlanStage, language: "zh" | "en"): string {
   const zh: Record<PlanStage, string> = {
     idle: "待生成",
+    plan: "计划",
     requirements: "需求",
-    design: "设计",
+    design: "历史计划",
     tasks: "任务",
     bugfix: "修复",
     ready_to_execute: "待执行",
@@ -65,8 +66,9 @@ function getStageLabel(stage: PlanStage, language: "zh" | "en"): string {
   };
   const en: Record<PlanStage, string> = {
     idle: "Idle",
+    plan: "Plan",
     requirements: "Requirements",
-    design: "Design",
+    design: "Legacy Plan",
     tasks: "Tasks",
     bugfix: "Bugfix",
     ready_to_execute: "Ready",

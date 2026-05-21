@@ -16,6 +16,49 @@ export type OpenAiApiFormat = "chat_completions" | "responses";
 export type OpenAiReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
 export type CloudToolProtocol = "auto" | "native" | "xml";
 export type CloudAuthMode = "api_key" | "openai_chatgpt_oauth" | "gemini_google_oauth";
+export type ModelReasoningMode = "disabled" | "passive_hidden" | "native_enabled";
+export type ReasoningDisplayMode = "hidden" | "debug_summary" | "raw_debug";
+export type ReasoningRequestMode = "auto" | "off" | "explicit";
+
+export interface ReasoningPolicy {
+  mode: ModelReasoningMode;
+  request: ReasoningRequestMode;
+  display: ReasoningDisplayMode;
+  replayInContext: boolean;
+  maxHiddenChars: number;
+}
+
+export function resolveReasoningPolicy(input: {
+  activeProfile?: "local" | "cloud";
+  requestedMode?: ModelReasoningMode | null;
+  reasoningRequest?: ReasoningRequestMode | null;
+  reasoningDisplay?: ReasoningDisplayMode | null;
+  reasoningEffort?: OpenAiReasoningEffort | null;
+} = {}): ReasoningPolicy {
+  const request = input.reasoningRequest === "explicit" || input.reasoningRequest === "auto"
+    ? input.reasoningRequest
+    : "off";
+  const display = input.reasoningDisplay === "debug_summary" || input.reasoningDisplay === "raw_debug"
+    ? input.reasoningDisplay
+    : "hidden";
+  const nativeRequested =
+    input.activeProfile === "cloud" &&
+    request !== "off" &&
+    !!input.reasoningEffort &&
+    input.reasoningEffort !== "none";
+  const mode = input.requestedMode === "native_enabled" || nativeRequested
+    ? "native_enabled"
+    : input.requestedMode === "disabled"
+    ? "disabled"
+    : "passive_hidden";
+  return {
+    mode,
+    request,
+    display,
+    replayInContext: mode === "native_enabled" && request === "explicit",
+    maxHiddenChars: display === "raw_debug" ? 36_000 : 8_000,
+  };
+}
 
 export const DEFAULT_ANTHROPIC_VERSION = "2023-06-01";
 export const OPENAI_CHATGPT_CODEX_ENDPOINT = "https://chatgpt.com/backend-api/codex/responses";
@@ -95,7 +138,7 @@ export interface OpenAiResponsesProbeRequestCandidate {
 export interface ModelInstructionProfile {
   provider: "openai" | "anthropic" | "qwen" | "deepseek" | "kimi" | "gemma" | "generic";
   visibleLanguage: "follow_user" | "localized";
-  reasoning: "native_hidden" | "tagged" | "none";
+  reasoning: ModelReasoningMode;
   toolProtocolPreference: CloudToolProtocol;
   noiseRules: string[];
 }
@@ -173,9 +216,6 @@ export interface AnthropicStreamProcessor {
   flush: () => void;
   getResult: () => StreamResultLike;
 }
-
-const ANTHROPIC_THINKING_TAG_OPEN = "<thinking>";
-const ANTHROPIC_THINKING_TAG_CLOSE = "</thinking>";
 
 function truncateText(value: string, maxChars: number): string {
   if (value.length <= maxChars) return value;
@@ -373,11 +413,11 @@ export function getModelInstructionProfile(input: {
     return {
       provider: "anthropic",
       visibleLanguage: "follow_user",
-      reasoning: "native_hidden",
+      reasoning: "passive_hidden",
       toolProtocolPreference: "native",
       noiseRules: [
-        "Map thinking deltas to the thought block, not the assistant body.",
-        "Hide repeated assistant prefaces and duplicate thought summaries.",
+        "Treat provider thinking deltas as hidden metadata, not assistant body text or progress evidence.",
+        "Keep visible replies to public progress, tool calls, or final answers.",
       ],
     };
   }
@@ -386,10 +426,10 @@ export function getModelInstructionProfile(input: {
     return {
       provider: "qwen",
       visibleLanguage: "localized",
-      reasoning: "tagged",
+      reasoning: "passive_hidden",
       toolProtocolPreference: "auto",
       noiseRules: [
-        "Treat reasoning_content as hidden thought.",
+        "Fold reasoning_content into hidden metadata; do not ask the model to output thinking tags.",
         "Suppress repeated XML tool tags from visible text.",
       ],
     };
@@ -399,11 +439,11 @@ export function getModelInstructionProfile(input: {
     return {
       provider: "gemma",
       visibleLanguage: "localized",
-      reasoning: "tagged",
+      reasoning: "passive_hidden",
       toolProtocolPreference: "auto",
       noiseRules: [
-        "Treat `thought`, `thinking`, `reasoning`, and `reasoning_content` fields or labels as hidden thought.",
-        "Do not expose bare `thought:` prefixes in the assistant body.",
+        "Fold `thought`, `thinking`, `reasoning`, and `reasoning_content` fields or labels into hidden metadata.",
+        "Do not expose bare `thought:` prefixes in the assistant body or use hidden tags as an action channel.",
         "If a tool is needed, emit the actual tool call instead of prose saying `I will use read_file`.",
       ],
     };
@@ -413,10 +453,10 @@ export function getModelInstructionProfile(input: {
     return {
       provider: "deepseek",
       visibleLanguage: "localized",
-      reasoning: "tagged",
+      reasoning: "passive_hidden",
       toolProtocolPreference: "auto",
       noiseRules: [
-        "Treat reasoning deltas as hidden thought.",
+        "Treat reasoning deltas as hidden metadata and do not replay them as context.",
         "Collapse duplicate assistant prefixes.",
       ],
     };
@@ -426,7 +466,7 @@ export function getModelInstructionProfile(input: {
     return {
       provider: "kimi",
       visibleLanguage: "localized",
-      reasoning: "none",
+      reasoning: "disabled",
       toolProtocolPreference: "xml",
       noiseRules: [
         "Prefer XML tools on gateways with weak function-calling compatibility.",
@@ -439,7 +479,7 @@ export function getModelInstructionProfile(input: {
     return {
       provider: "generic",
       visibleLanguage: "follow_user",
-      reasoning: "none",
+      reasoning: "disabled",
       toolProtocolPreference: "xml",
       noiseRules: [
         "Prefer XML tools for Gemini until native tool compatibility is explicitly enabled.",
@@ -451,11 +491,11 @@ export function getModelInstructionProfile(input: {
   return {
     provider: protocol === "openai" ? "openai" : "generic",
     visibleLanguage: "follow_user",
-    reasoning: protocol === "openai" ? "native_hidden" : "none",
+    reasoning: protocol === "openai" ? "passive_hidden" : "disabled",
     toolProtocolPreference: "auto",
     noiseRules: [
-      "Separate visible text, reasoning text, and tool calls before rendering.",
-      "Deduplicate repeated thought summaries and assistant prefixes.",
+      "Separate visible text, hidden reasoning metadata, and tool calls before rendering.",
+      "Do not treat hidden reasoning as completion or progress evidence.",
     ],
   };
 }
@@ -722,10 +762,9 @@ export function extractOpenAiResponseText(
   const contentText = extractTextFromOpenAiContentArray(content);
   if (contentText) return contentText;
 
-  // 部分 LM Studio / Qwen thinking 模型会把输出放在 reasoning 字段，
-  // content 则为空；这里保留为可提取文本，后续会折叠到思考块或生成摘要。
-  if (typeof msg.reasoning_content === "string") return `<thinking>${msg.reasoning_content}</thinking>`;
-  if (typeof msg.reasoning === "string") return `<thinking>${msg.reasoning}</thinking>`;
+  // Some local OpenAI-compatible servers return only reasoning fields with
+  // empty content. Hidden reasoning must stay metadata; callers extract it
+  // separately when the endpoint exposes structured fields.
   return "";
 }
 
@@ -1314,7 +1353,7 @@ export function createAnthropicStreamProcessor(onToken: (token: string) => void)
   let currentEvent: string | null = null;
   let currentDataLines: string[] = [];
   let fullContent = "";
-  let thinkingOpen = false;
+  let reasoningContent = "";
   let finishReason: StreamResultLike["finishReason"] = null;
 
   const toolCallsMap = new Map<number, StreamedToolCallLike>();
@@ -1361,35 +1400,18 @@ export function createAnthropicStreamProcessor(onToken: (token: string) => void)
         if (!delta || typeof delta !== "object") return;
 
         if (delta.type === "text_delta" && typeof delta.text === "string") {
-          if (thinkingOpen) {
-            thinkingOpen = false;
-            fullContent += ANTHROPIC_THINKING_TAG_CLOSE;
-            onToken(ANTHROPIC_THINKING_TAG_CLOSE);
-          }
           fullContent += delta.text;
           onToken(delta.text);
           return;
         }
 
         if (delta.type === "thinking_delta" && typeof delta.thinking === "string") {
-          if (!thinkingOpen) {
-            thinkingOpen = true;
-            fullContent += ANTHROPIC_THINKING_TAG_OPEN;
-            onToken(ANTHROPIC_THINKING_TAG_OPEN);
-          }
-          fullContent += delta.thinking;
-          onToken(delta.thinking);
+          reasoningContent += delta.thinking;
           return;
         }
 
         if (delta.type === "thinking_delta" && typeof delta.text === "string") {
-          if (!thinkingOpen) {
-            thinkingOpen = true;
-            fullContent += ANTHROPIC_THINKING_TAG_OPEN;
-            onToken(ANTHROPIC_THINKING_TAG_OPEN);
-          }
-          fullContent += delta.text;
-          onToken(delta.text);
+          reasoningContent += delta.text;
           return;
         }
 
@@ -1453,11 +1475,6 @@ export function createAnthropicStreamProcessor(onToken: (token: string) => void)
         buffer = "";
       }
       finalizePendingEvent();
-      if (thinkingOpen) {
-        thinkingOpen = false;
-        fullContent += ANTHROPIC_THINKING_TAG_CLOSE;
-        onToken(ANTHROPIC_THINKING_TAG_CLOSE);
-      }
 
       for (const [index, fallbackInput] of toolInputFallbacks.entries()) {
         const existing = toolCallsMap.get(index);
@@ -1474,6 +1491,9 @@ export function createAnthropicStreamProcessor(onToken: (token: string) => void)
         content: fullContent,
         toolCalls: finalizeStreamedToolCalls(toolCallsMap),
         finishReason,
+        ...(reasoningContent.trim()
+          ? { reasoningContent, reasoningField: "reasoning" as const }
+          : {}),
       };
     },
   };

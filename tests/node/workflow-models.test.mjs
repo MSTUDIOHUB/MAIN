@@ -107,7 +107,7 @@ const {
   resolvePinnedConversationTurn,
   shouldPlanShortcutReplaceTurn,
   summarizeUserPrompt,
-  validateActionableDesignArtifact,
+  validateActionablePlanArtifact,
   validatePlanArtifactContent,
 } = loadWorkflowModelsModule();
 
@@ -230,7 +230,7 @@ test("plan approval quick reply routes through approvePlan control path", () => 
       sourceIntent: "plan",
       isPlanApproved: false,
       planStage: "design",
-      planArtifacts: [{ kind: "design", path: ".MAIN/plans/design.md", title: "Design", content: "# Design", updatedAt: 1 }],
+      planArtifacts: [{ kind: "design", path: ".MAIN/plans/plan.md", title: "Plan", content: "# Plan", updatedAt: 1 }],
     }),
     true,
   );
@@ -241,7 +241,7 @@ test("plan approval quick reply routes through approvePlan control path", () => 
       sourceIntent: "plan",
       isPlanApproved: false,
       planStage: "design",
-      planArtifacts: [{ kind: "design", path: ".MAIN/plans/design.md", title: "Design", content: "# Design", updatedAt: 1 }],
+      planArtifacts: [{ kind: "design", path: ".MAIN/plans/plan.md", title: "Plan", content: "# Plan", updatedAt: 1 }],
     }),
     false,
   );
@@ -253,7 +253,7 @@ test("plan approval quick reply routes through approvePlan control path", () => 
       sourceIntent: "plan",
       isPlanApproved: false,
       planStage: "design",
-      planArtifacts: [{ kind: "design", path: ".MAIN/plans/design.md", title: "Design", content: "# Design", updatedAt: 1 }],
+      planArtifacts: [{ kind: "design", path: ".MAIN/plans/plan.md", title: "Plan", content: "# Plan", updatedAt: 1 }],
     }),
     true,
   );
@@ -265,7 +265,7 @@ test("plan approval quick reply routes through approvePlan control path", () => 
       sourceIntent: "plan",
       isPlanApproved: false,
       planStage: "design",
-      planArtifacts: [{ kind: "design", path: ".MAIN/plans/design.md", title: "Design", content: "# Design", updatedAt: 1 }],
+      planArtifacts: [{ kind: "design", path: ".MAIN/plans/plan.md", title: "Plan", content: "# Plan", updatedAt: 1 }],
     }),
     true,
   );
@@ -277,7 +277,7 @@ test("plan approval quick reply routes through approvePlan control path", () => 
       sourceIntent: "plan",
       isPlanApproved: false,
       planStage: "design",
-      planArtifacts: [{ kind: "design", path: ".MAIN/plans/design.md", title: "Design", content: "# Design", updatedAt: 1 }],
+      planArtifacts: [{ kind: "design", path: ".MAIN/plans/plan.md", title: "Plan", content: "# Plan", updatedAt: 1 }],
     }),
     false,
   );
@@ -288,7 +288,7 @@ test("plan approval quick reply routes through approvePlan control path", () => 
       sourceIntent: "execute",
       isPlanApproved: false,
       planStage: "design",
-      planArtifacts: [{ kind: "design", path: ".MAIN/plans/design.md", title: "Design", content: "# Design", updatedAt: 1 }],
+      planArtifacts: [{ kind: "design", path: ".MAIN/plans/plan.md", title: "Plan", content: "# Plan", updatedAt: 1 }],
     }),
     false,
   );
@@ -299,7 +299,7 @@ test("plan approval quick reply routes through approvePlan control path", () => 
       sourceIntent: "plan",
       isPlanApproved: true,
       planStage: "design",
-      planArtifacts: [{ kind: "design", path: ".MAIN/plans/design.md", title: "Design", content: "# Design", updatedAt: 1 }],
+      planArtifacts: [{ kind: "design", path: ".MAIN/plans/plan.md", title: "Plan", content: "# Plan", updatedAt: 1 }],
     }),
     false,
   );
@@ -317,7 +317,7 @@ test("plan approval quick reply routes through approvePlan control path", () => 
 });
 
 test("plan approval quick reply resolves materialization and blocking branches", () => {
-  const designArtifact = { kind: "design", path: ".MAIN/plans/design.md", title: "Design", content: "# Design", updatedAt: 1 };
+  const designArtifact = { kind: "design", path: ".MAIN/plans/plan.md", title: "Plan", content: "# Plan", updatedAt: 1 };
 
   assert.equal(
     resolvePlanApprovalQuickReplyAction({
@@ -745,11 +745,11 @@ test("runtime plan task derivation creates executable tasks without tasks.md", (
   const tasks = deriveRuntimePlanTasksFromArtifacts([
     {
       kind: "design",
-      path: ".MAIN/plans/design.md",
-      title: "Design",
+      path: ".MAIN/plans/plan.md",
+      title: "Plan",
       updatedAt: 1,
       content: [
-        "# Design",
+        "# Plan",
         "",
         "## 执行顺序",
         "- 更新 src/lib/runtimeTools.ts，让批准后的 runtime 任务清单可以解锁执行。",
@@ -768,14 +768,14 @@ test("runtime plan task derivation ignores status findings and tech-stack bullet
   const tasks = deriveRuntimePlanTasksFromArtifacts([
     {
       kind: "design",
-      path: ".MAIN/plans/design.md",
-      title: "Design",
+      path: ".MAIN/plans/plan.md",
+      title: "Plan",
       updatedAt: 1,
       content: [
-        "# Design",
+        "# Plan",
         "",
         "## 当前状态发现",
-        "- 项目基于 Tauri + React + TypeScript + Ant Design + ECharts。",
+        "- 项目基于 Tauri + React + TypeScript + Ant Plan + ECharts。",
         "- TopIsland 当前显示任务 7/8，但实际还在修复 1.1。",
         "",
         "## 执行顺序",
@@ -794,11 +794,11 @@ test("runtime plan task derivation skips approved-plan diagnostic read loops", (
   const tasks = deriveRuntimePlanTasksFromArtifacts([
     {
       kind: "design",
-      path: ".MAIN/plans/design.md",
-      title: "Design",
+      path: ".MAIN/plans/plan.md",
+      title: "Plan",
       updatedAt: 1,
       content: [
-        "# Design",
+        "# Plan",
         "",
         "## 执行顺序",
         "- 数据解析/映射错误：`src/hooks/useCsvParser.ts` 解析出的字段名与 Store/组件预期的字段名不匹配。",
@@ -820,10 +820,10 @@ test("runtime plan task derivation requires concrete evidence instead of synthet
   const tasks = deriveRuntimePlanTasksFromArtifacts([
     {
       kind: "design",
-      path: ".MAIN/plans/design.md",
-      title: "Design",
+      path: ".MAIN/plans/plan.md",
+      title: "Plan",
       updatedAt: 1,
-      content: "# Design\n\n## 执行顺序\n- 完成核心功能实现。\n- 验证实现结果是否可用。",
+      content: "# Plan\n\n## 执行顺序\n- 完成核心功能实现。\n- 验证实现结果是否可用。",
     },
   ], { language: "zh" });
 
@@ -1086,27 +1086,27 @@ test("validatePlanArtifactContent rejects fallback/log/thought/code fragments", 
   assert.equal(validatePlanArtifactContent("using System;\nnamespace Battle.Core { public class BattleUnit {} }", "requirements").ok, false);
 });
 
-test("validateActionableDesignArtifact rejects generic fallback design", () => {
+test("validateActionablePlanArtifact rejects generic fallback design", () => {
   const generic = [
-    "# Design",
+    "# Plan",
     "## 用户目标与约束",
     "- 用户目标：请生成一个方案。",
     "## 当前发现",
-    "- 已经获得只读上下文，足以先形成可审批的设计方案。",
+    "- 已经获得只读上下文，足以先形成可审批的执行计划。",
     "## 拟定方案",
     "- 围绕用户目标设计最小可用闭环：输入读取、数据校验、核心处理、结果展示或导出。",
     "## 影响文件与接口",
-    "- 审批产物：`.MAIN/plans/design.md`。",
+    "- 审批产物：`.MAIN/plans/plan.md`。",
     "## 执行顺序",
     "1. 确认输入结构。",
     "## 验证方式",
     "- 运行检查。",
   ].join("\n");
 
-  assert.equal(validateActionableDesignArtifact(generic).ok, false);
+  assert.equal(validateActionablePlanArtifact(generic).ok, false);
 });
 
-test("validatePlanArtifactContent accepts real requirements and design artifacts", () => {
+test("validatePlanArtifactContent accepts real requirements and plan artifacts", () => {
   const requirements = [
     "# 需求规格",
     "## 用户目标",
@@ -1121,7 +1121,7 @@ test("validatePlanArtifactContent accepts real requirements and design artifacts
     "- 每个完成步骤都有可见工具调用或文件写入证据。",
   ].join("\n");
   const design = [
-    "# 设计方案",
+    "# 执行计划",
     "## 影响文件",
     "- Scripts/Battle/Core/BattleUnit.cs",
     "- Scripts/Battle/Systems/BattleActionQueue.cs",
@@ -1223,7 +1223,7 @@ test("collectChangeEntries ignores ephemeral plan files but keeps source and bug
 
   assert.equal(result.totalExecutedEdits, 2);
   assert.equal(isEphemeralPlanArtifactPath(".MAIN/plans/requirements.md"), true);
-  assert.equal(isEphemeralPlanArtifactPath(".MAIN/plans/design.md"), true);
+  assert.equal(isEphemeralPlanArtifactPath(".MAIN/plans/plan.md"), true);
   assert.equal(isEphemeralPlanArtifactPath(".MAIN/plans/tasks.md"), true);
   assert.equal(isEphemeralPlanArtifactPath(".MAIN/plans/bugfix.md"), false);
   assert.equal(result.entries[0].target, "Scripts/Battle/Core/BattleUnit.cs");

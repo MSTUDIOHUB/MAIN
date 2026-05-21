@@ -72,6 +72,10 @@ export interface ActivityCell {
   items: any[];
   latestEvidence: string;
   recoveryHint: string;
+  evidenceExcerpt: string;
+  observedFact: string;
+  hypothesisStatus: "confirmed" | "unverified" | "blocked";
+  sourceToolCallIds: string[];
 }
 
 export interface TurnProcessArchiveCounts {
@@ -611,6 +615,26 @@ function buildActivityCellFromItems(
   }, "done");
   const targets = uniqueTargets(items, language);
   const latestEvidence = compactLine([...items].reverse().map(getBlockResultLine).find(Boolean) || "", 180);
+  const progressItem = [...items].reverse().find(isProgressBlock);
+  const observedFact = compactLine(
+    String(progressItem?.observedFact || progressItem?.evidence || latestEvidence || ""),
+    180,
+  );
+  const sourceToolCallIds = Array.from(new Set(items.flatMap((item) => {
+    const ids: string[] = [];
+    if (item?.toolCallId) ids.push(String(item.toolCallId));
+    if (Array.isArray(item?.toolCallIds)) ids.push(...item.toolCallIds.map(String));
+    if (Array.isArray(item?.sourceToolCallIds)) ids.push(...item.sourceToolCallIds.map(String));
+    return ids.map((id) => id.trim()).filter(Boolean);
+  }))).slice(0, 12);
+  const hypothesisStatus: ActivityCell["hypothesisStatus"] =
+    status === "failed" || status === "rejected"
+      ? "blocked"
+      : status === "done"
+      ? "confirmed"
+      : progressItem?.hypothesisStatus === "confirmed" || progressItem?.hypothesisStatus === "blocked"
+      ? progressItem.hypothesisStatus
+      : "unverified";
   const recoveryHint = compactLine(
     [...items].reverse().map((item) => {
       if (item?.type === "system" && /暂停|paused|Recovery|重复|no progress/i.test(String(item.content || ""))) return String(item.content || "");
@@ -637,6 +661,10 @@ function buildActivityCellFromItems(
     items,
     latestEvidence,
     recoveryHint,
+    evidenceExcerpt: compactLine(String(progressItem?.evidenceExcerpt || latestEvidence || ""), 180),
+    observedFact,
+    hypothesisStatus,
+    sourceToolCallIds,
   };
 }
 
@@ -661,6 +689,16 @@ function mergeActivityCells(left: ActivityCell, right: ActivityCell, language: T
     summary: makeActivitySummary(base, language),
     latestEvidence: right.latestEvidence || left.latestEvidence,
     recoveryHint: right.recoveryHint || left.recoveryHint,
+    evidenceExcerpt: right.evidenceExcerpt || left.evidenceExcerpt,
+    observedFact: right.observedFact || left.observedFact,
+    hypothesisStatus: mergeActivityStatus(left.status, right.status) === "failed"
+      ? "blocked"
+      : right.hypothesisStatus === "confirmed" || left.hypothesisStatus === "confirmed"
+      ? "confirmed"
+      : right.hypothesisStatus === "blocked" || left.hypothesisStatus === "blocked"
+      ? "blocked"
+      : "unverified",
+    sourceToolCallIds: Array.from(new Set([...left.sourceToolCallIds, ...right.sourceToolCallIds])).slice(0, 12),
   };
 }
 
@@ -1365,11 +1403,13 @@ function finalizeStep(
     const progressTitle = compactLine(String(progressBlock.title || step.intent || ""), 160);
     const progressWhy = compactMarkdownSnippet(String(progressBlock.why || step.why || ""), 220);
     const progressAction = compactMarkdownSnippet(String(progressBlock.action || step.action || ""), 220);
-    const progressEvidence = compactLine(String(progressBlock.evidence || step.result || ""), 220);
+    const progressObserved = compactLine(String(progressBlock.observedFact || ""), 220);
+    const progressExcerpt = compactLine(String(progressBlock.evidenceExcerpt || ""), 220);
+    const progressEvidence = compactLine(String(progressObserved || progressExcerpt || progressBlock.evidence || step.result || ""), 220);
     const progressNext = compactLine(String(progressBlock.next || step.next || ""), 220);
     const intentParts = [
       progressAction || progressTitle,
-      progressWhy,
+      progressObserved || progressWhy,
     ].filter(Boolean);
     return {
       ...step,

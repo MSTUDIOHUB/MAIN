@@ -119,6 +119,7 @@ export interface ResolveTurnRunIntentContext {
   hasPlanArtifacts: boolean;
   planStage:
     | "idle"
+    | "plan"
     | "requirements"
     | "design"
     | "tasks"

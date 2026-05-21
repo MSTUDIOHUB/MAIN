@@ -20,6 +20,36 @@ const PLAN_READ_ONLY_TOOL_NAMES = new Set([
   "read_pty_since",
   "get_pty_status",
 ]);
+const PLAN_POST_CONVERGENCE_ARTIFACT_TOOL_NAMES = new Set([
+  "write_file",
+  "replace_in_file",
+]);
+
+export function shouldNarrowPlanToolsAfterReadOnlyConvergence(input: {
+  workflowMode: "chat" | "edit" | "plan";
+  isPlanApproved: boolean;
+  convergencePromptAlreadyUsed: boolean;
+}): boolean {
+  return (
+    input.workflowMode === "plan" &&
+    !input.isPlanApproved &&
+    input.convergencePromptAlreadyUsed
+  );
+}
+
+export function isPlanPostConvergenceArtifactToolName(name: string): boolean {
+  return PLAN_POST_CONVERGENCE_ARTIFACT_TOOL_NAMES.has(name);
+}
+
+export function filterPlanToolNamesAfterReadOnlyConvergence(input: {
+  toolNames: string[];
+  workflowMode: "chat" | "edit" | "plan";
+  isPlanApproved: boolean;
+  convergencePromptAlreadyUsed: boolean;
+}): string[] {
+  if (!shouldNarrowPlanToolsAfterReadOnlyConvergence(input)) return input.toolNames;
+  return input.toolNames.filter(isPlanPostConvergenceArtifactToolName);
+}
 
 export function shouldTriggerPlanReadOnlyConvergence(input: {
   isUnapprovedPlanReadOnlyBatch: boolean;

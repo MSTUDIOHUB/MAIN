@@ -71,7 +71,7 @@ function buildTrustedResumePrompt(input: {
         ? "从 `.MAIN/plans/tasks.md` 中选择证据未满足且与当前改动最相关的任务继续；顺序是执行参考，不是强制线性流程。只有真实写入/命令成功/验证证据满足后，才可以把任务视为完成。"
         : input.tasks.length > 0
         ? "当前已有 runtime 任务清单；请选择证据未满足且与当前诊断最相关的任务直接执行，顺序是参考而不是强制。只有任务较长、需要跨会话审计或用户要求留档时，才先把清单持久化到 `.MAIN/plans/tasks.md`；不要为了确认它是否存在而读取它。"
-        : "请先基于已批准的 design.md 或 bugfix.md 派生 runtime 任务清单；只有长任务、跨会话恢复或需要审计留档时才生成 `.MAIN/plans/tasks.md`；不要默认读取缺失的 tasks.md。",
+        : "请先基于已批准的 plan.md 或 bugfix.md 派生 runtime 任务清单；只有长任务、跨会话恢复或需要审计留档时才生成 `.MAIN/plans/tasks.md`；不要默认读取缺失的 tasks.md。",
       "不要重写已经满足证据的任务；如果存在 tasks.md，不要只修改 checkbox；不要重复计划说明。",
       "",
       "计划文件摘要：",
@@ -91,7 +91,7 @@ function buildTrustedResumePrompt(input: {
       ? "Continue with an evidence-unsatisfied task that best matches the current change; task order is guidance, not a forced linear path. Treat a task as complete only after real file-write, successful command, Browser/Playwright DOM/screenshot evidence, or explicit pending user validation exists."
       : input.tasks.length > 0
       ? "A runtime task list is already available; choose the evidence-unsatisfied task that best matches the current diagnosis. Persist it to `.MAIN/plans/tasks.md` only when the task is long, cross-session, or explicitly needs an audit file; do not read it just to check existence."
-      : "First derive a runtime task list from the approved design.md or bugfix.md. Generate `.MAIN/plans/tasks.md` only for long work, cross-session recovery, or audit-file needs; do not read missing tasks.md by default.",
+      : "First derive a runtime task list from the approved plan.md or bugfix.md. Generate `.MAIN/plans/tasks.md` only for long work, cross-session recovery, or audit-file needs; do not read missing tasks.md by default.",
     "Do not redo tasks whose evidence is already satisfied. If tasks.md exists, do not only edit checkboxes. Do not restate the plan.",
     "",
     "Plan artifact summary:",
@@ -952,7 +952,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     return "";
   }, [latestPlanEntry]);
   const hasReviewablePlanArtifact = planArtifacts.some((artifact) =>
-    artifact.kind === "design" || artifact.kind === "bugfix" || artifact.kind === "tasks"
+    artifact.kind === "plan" || artifact.kind === "design" || artifact.kind === "bugfix" || artifact.kind === "tasks"
   );
   const hasReviewablePlanDraft =
     hasReviewablePlanArtifact ||
@@ -998,10 +998,10 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     sendMessage(
       language === "zh"
         ? isRequirementsStage
-          ? "已存在旧流程 requirements.md。请不要重复读取已读文件，直接基于已有上下文生成或更新 `.MAIN/plans/design.md`；如果设计方向不明确，用 `<user_options>` 给出用户可点击选择并停止。不要生成 tasks.md 或修改源码。"
+          ? "已存在旧流程 requirements.md。请不要重复读取已读文件，直接基于已有上下文生成或更新 `.MAIN/plans/plan.md`；如果计划方向不明确，用 `<user_options>` 给出用户可点击选择并停止。不要生成 tasks.md 或修改源码。"
           : "请基于当前已经生成的计划草案继续收敛，不要重复前文。优先补齐关键分叉点，并在需要用户确认时用面向用户的口吻给出可点击选项；如果已经足够清晰，就输出正式 Proposal 供用户确认。未经明确批准，不要提前生成执行用的 tasks.md。"
         : isRequirementsStage
-        ? "A legacy requirements.md exists. Do not reread files already in context; generate or update `.MAIN/plans/design.md` from the existing context. If the design direction is unclear, offer `<user_options>` and stop. Do not generate tasks.md or edit source files."
+        ? "A legacy requirements.md exists. Do not reread files already in context; generate or update `.MAIN/plans/plan.md` from the existing context. If the plan direction is unclear, offer `<user_options>` and stop. Do not generate tasks.md or edit source files."
         : "Continue refining the current plan draft without repeating earlier content. Use clickable options when a real decision is needed; once the plan is clear enough, produce the formal proposal for approval. Do not generate execution tasks.md before the user explicitly approves execution.",
       undefined,
       { hidden: true, reuseCurrentTurn: true, preservePlanState: true, resolvedIntent: "plan", skipIntentResolution: true },

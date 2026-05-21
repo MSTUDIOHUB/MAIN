@@ -26,7 +26,7 @@ export function buildPlanExecutionNoToolRecoveryPrompt(input: {
   if (input.language === "zh") {
     return [
       input.missingTasksArtifact
-        ? "已批准计划正在执行，但当前缺少可审计的任务清单。不要输出解释文字，下一步必须先从 design.md 派生 runtime 任务清单；只有长任务、跨会话恢复或需要审计留档时，才直接调用 `write_file` 创建 `.MAIN/plans/tasks.md`。"
+        ? "已批准计划正在执行，但当前缺少可审计的任务清单。不要输出解释文字，下一步必须先从 plan.md 派生 runtime 任务清单；只有长任务、跨会话恢复或需要审计留档时，才直接调用 `write_file` 创建 `.MAIN/plans/tasks.md`。"
         : "已批准计划正在执行，但上一步没有继续调用工具。不要输出进度说明或完成总结，下一步必须直接调用工具继续证据未满足且与当前诊断最相关的任务。",
       input.rejectedCompletionClaim
         ? "你刚才的完成声明没有通过可信证据审计；正文不会被当作完成证据。"
@@ -42,7 +42,7 @@ export function buildPlanExecutionNoToolRecoveryPrompt(input: {
 
   return [
     input.missingTasksArtifact
-      ? "An approved plan is executing, but no auditable task list exists. Do not output explanatory prose; next, derive a runtime task list from design.md. Call `write_file` to create `.MAIN/plans/tasks.md` only for long work, cross-session recovery, or explicit audit-file needs."
+      ? "An approved plan is executing, but no auditable task list exists. Do not output explanatory prose; next, derive a runtime task list from plan.md. Call `write_file` to create `.MAIN/plans/tasks.md` only for long work, cross-session recovery, or explicit audit-file needs."
       : "An approved plan is executing, but the previous step did not continue with a tool call. Do not output a progress note or final summary; next, directly call tools for the evidence-unsatisfied task that best matches the current diagnosis.",
     input.rejectedCompletionClaim
       ? "Your completion claim did not pass the trusted evidence audit; prose is not completion evidence."

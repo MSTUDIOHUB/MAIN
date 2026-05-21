@@ -100,7 +100,7 @@ function createPlanInput(overrides = {}) {
     planTaskCount: 0,
     getToolTarget: (_name, args) => String(args.path || args.command || ""),
     isPreApprovalPlanDraftWrite: (name, args) =>
-      name === "write_file" && String(args.path || "").replace(/\\/g, "/").toLowerCase().includes(".main/plans/design.md"),
+      name === "write_file" && String(args.path || "").replace(/\\/g, "/").toLowerCase().includes(".main/plans/plan.md"),
     isExecutionPlanArtifactWrite: (name, args) =>
       name === "write_file" && String(args.path || "").replace(/\\/g, "/").toLowerCase().includes(".main/plans/tasks.md"),
     isTasksPlanWrite: (name, args) =>
@@ -131,7 +131,7 @@ test("runtime tool planner classifies lifecycle actions and initial states", () 
   assert.equal(initialLifecycleStateForPlanAction(autoRead.action), "queued");
 
   const specAutoApproved = planRuntimeToolCall(createPlanInput({
-    toolCall: { id: "d", name: "write_file", arguments: JSON.stringify({ path: ".MAIN/plans/design.md", content: "# design" }) },
+    toolCall: { id: "d", name: "write_file", arguments: JSON.stringify({ path: ".MAIN/plans/plan.md", content: "# design" }) },
     workflowMode: "plan",
     runtimeIntent: "plan",
     isPlanApproved: false,
@@ -205,7 +205,7 @@ test("approved plan execution blocks shell and source writes until runtime tasks
     toolCall: {
       id: "plan-read-before-tasks",
       name: "read_file",
-      arguments: JSON.stringify({ path: ".MAIN/plans/design.md" }),
+      arguments: JSON.stringify({ path: ".MAIN/plans/plan.md" }),
     },
   }));
   assert.equal(planReadAllowed.action, "auto_execute");

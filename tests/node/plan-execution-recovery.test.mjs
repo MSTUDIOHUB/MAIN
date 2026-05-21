@@ -65,7 +65,9 @@ const {
   buildPlanMaxIterationsPauseNotice,
   buildPlanMaxIterationsResumePrompt,
   formatPlanExecutionProgressSnapshot,
+  isCachedReadOnlyPlanActivity,
   normalizePlanExecutionProgressSnapshot,
+  summarizeRepeatedPlanTargetsFromToolActivity,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planExecutionRecovery.ts"));
 
 const tasks = [
@@ -199,7 +201,7 @@ test("resume prompt does not tell the model to read missing optional tasks.md", 
     checkpoint,
     hasTasksArtifact: false,
     tasks,
-    artifacts: [{ kind: "design", path: ".MAIN/plans/design.md", title: "Design", content: "# Design\n\n方案", updatedAt: 1 }],
+    artifacts: [{ kind: "design", path: ".MAIN/plans/plan.md", title: "Design", content: "# Design\n\n方案", updatedAt: 1 }],
     evidenceLedger: [],
   });
 
@@ -279,6 +281,21 @@ test("no-progress loop notice names repeated target evidence gap and recovery ac
   assert.match(notice, /缺失证据：测试所有页面和组件/);
   assert.match(notice, /Browser\/Playwright/);
   assert.match(signature, /cached/);
+});
+
+test("cached read-only helpers identify repeated plan targets", () => {
+  const recentToolActivity = [
+    { name: "grep_search", target: "loadOrders", status: "succeeded", detail: "src/store/dashboardStore.ts:307" },
+    { name: "read_file", target: "src/store/dashboardStore.ts", status: "succeeded", detail: "FILE_UNCHANGED_STUB: src/store/dashboardStore.ts" },
+    { name: "read_file", target: "src/hooks/useChartData.ts", status: "succeeded", detail: "READ_FILE_RESULT path: src/hooks/useChartData.ts" },
+  ];
+
+  assert.equal(isCachedReadOnlyPlanActivity(recentToolActivity[1]), true);
+  assert.equal(isCachedReadOnlyPlanActivity(recentToolActivity[2]), false);
+  assert.deepEqual(
+    summarizeRepeatedPlanTargetsFromToolActivity(recentToolActivity),
+    ["src/store/dashboardstore.ts"],
+  );
 });
 
 test("plan progress snapshot carries no-progress recovery metadata", () => {

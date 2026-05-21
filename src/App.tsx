@@ -125,8 +125,8 @@ function appendPlanQuickReplyBlockedNotice(sourceTurnId: string | undefined, rea
       ).length
     : 0;
   const content = language === "en"
-    ? `Plan approval was blocked because MAIN could not find or materialize a reviewable .MAIN/plans/design.md artifact${reason ? ` (${reason})` : ""}. Ask the model to update design.md, then approve the plan again.`
-    : `已阻止计划批准：MAIN 没有找到可审批的 .MAIN/plans/design.md，也无法从上一条方案自动物化${reason ? `（${reason}）` : ""}。请先让模型更新 design.md，再批准执行。`;
+    ? `Plan approval was blocked because MAIN could not find or materialize a reviewable .MAIN/plans/plan.md artifact${reason ? ` (${reason})` : ""}. Ask the model to update plan.md, then approve the plan again.`
+    : `已阻止计划批准：MAIN 没有找到可审批的 .MAIN/plans/plan.md，也无法从上一条方案自动物化${reason ? `（${reason}）` : ""}。请先让模型更新 plan.md，再批准执行。`;
 
   appendDebugLog("warn", "ui.quickReply_plan_approval_blocked", {
     sourceTurnId: turnId ?? null,

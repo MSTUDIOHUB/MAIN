@@ -18,18 +18,20 @@ export interface HydratedPlanArtifacts {
 export type PlanArtifactReader = (path: string) => Promise<string>;
 
 export const PLAN_ARTIFACT_PATHS = [
+  ".MAIN/plans/plan.md",
   ".MAIN/plans/requirements.md",
-  ".MAIN/plans/design.md",
   ".MAIN/plans/tasks.md",
+  ".MAIN/plans/design.md",
   ".MAIN/plans/bugfix.md",
 ] as const;
 
 function artifactSortOrder(kind: PlanArtifactKind): number {
   switch (kind) {
-    case "requirements": return 0;
-    case "design": return 1;
+    case "plan": return 0;
+    case "requirements": return 1;
     case "tasks": return 2;
-    case "bugfix": return 3;
+    case "design": return 3;
+    case "bugfix": return 4;
     default: return 9;
   }
 }

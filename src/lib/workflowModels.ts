@@ -179,10 +179,11 @@ export function detectResponseLanguageMismatch(input: {
   };
 }
 
-export type PlanArtifactKind = "requirements" | "design" | "tasks" | "bugfix" | "summary";
+export type PlanArtifactKind = "plan" | "requirements" | "design" | "tasks" | "bugfix" | "summary";
 
 export type PlanStage =
   | "idle"
+  | "plan"
   | "requirements"
   | "design"
   | "tasks"
@@ -561,7 +562,16 @@ export function deriveVisibleConversationTurnStatus(params: {
     return baseStatus;
   }
 
-  if (!isPlanApproved && (agentStatus === "pending_review" || planStage === "ready_to_execute")) {
+  if (
+    !isPlanApproved &&
+    (
+      agentStatus === "pending_review" ||
+      planStage === "ready_to_execute" ||
+      planStage === "plan" ||
+      planStage === "design" ||
+      planStage === "bugfix"
+    )
+  ) {
     return "awaiting_approval";
   }
 
@@ -588,6 +598,7 @@ export function deriveVisibleConversationTurnStatus(params: {
 export function detectPlanArtifactKind(path: string): PlanArtifactKind | null {
   const normalized = path.replace(/\\/g, "/").toLowerCase();
   if (!normalized.includes(".main/plans/")) return null;
+  if (normalized.endsWith("plan.md")) return "plan";
   if (normalized.endsWith("requirements.md")) return "requirements";
   if (normalized.endsWith("design.md")) return "design";
   if (normalized.endsWith("tasks.md")) return "tasks";
@@ -597,7 +608,7 @@ export function detectPlanArtifactKind(path: string): PlanArtifactKind | null {
 
 export function isEphemeralPlanArtifactPath(path: string | undefined | null): boolean {
   const kind = detectPlanArtifactKind(String(path || ""));
-  return kind === "requirements" || kind === "design" || kind === "tasks";
+  return kind === "plan" || kind === "requirements" || kind === "tasks";
 }
 
 export function isPlanConversationTurn(turn: ConversationTurn | null | undefined): boolean {
@@ -609,6 +620,8 @@ export function isPlanConversationTurn(turn: ConversationTurn | null | undefined
  */
 export function planStageFromArtifactKind(kind: PlanArtifactKind): PlanStage {
   switch (kind) {
+    case "plan":
+      return "plan";
     case "requirements":
       return "requirements";
     case "design":
@@ -1476,7 +1489,7 @@ export function deriveRuntimePlanTasksFromArtifacts(
   const language = options.language === "en" ? "en" : "zh";
   const maxTasks = Math.max(2, Math.min(20, Number(options.maxTasks) || 8));
   const sourceArtifacts = artifacts.filter((artifact) =>
-    artifact.kind === "design" || artifact.kind === "bugfix" || artifact.kind === "requirements"
+    artifact.kind === "plan" || artifact.kind === "design" || artifact.kind === "bugfix" || artifact.kind === "requirements"
   );
   const combinedContent = sourceArtifacts.map((artifact) => artifact.content).join("\n\n");
   if (!combinedContent.trim()) return [];
@@ -1507,7 +1520,7 @@ export function deriveRuntimePlanTasksFromArtifacts(
     if (existingFileEvidence().has(normalizePlanEvidenceValue(fileRef))) continue;
     pushTask(makeRuntimeTaskFromEvidenceText(
       language === "en"
-        ? `Apply the approved design change for ${fileRef}`
+        ? `Apply the approved plan change for ${fileRef}`
         : `落实已批准方案中涉及 ${fileRef} 的改动`,
       { kind: "file", value: fileRef, inferred: true },
       language,
@@ -1600,6 +1613,9 @@ const PLAN_ARTIFACT_NOISE_PATTERNS: Array<{ pattern: RegExp; reason: string }> =
 function hasMeaningfulPlanSections(content: string, kind: PlanArtifactKind): boolean {
   const normalized = content.replace(/\s+/g, " ").trim();
   if (normalized.length < 120) return false;
+  if (kind === "plan") {
+    return /(用户目标|目标|截图|附件|观察|已确认|证据|真实发现|执行步骤|影响文件|验证标准|User Goal|Observed|Evidence|Confirmed|Findings|Execution|Files|Validation)/i.test(content);
+  }
   if (kind === "requirements") {
     return /(用户目标|目标|需求|范围|交付|验收|User Goal|Requirements|Scope|Deliverables|Acceptance)/i.test(content);
   }
@@ -1646,34 +1662,80 @@ export function validatePlanArtifactContent(
   return { ok: true };
 }
 
-export function validateActionableDesignArtifact(
+export function validateActionablePlanArtifact(
   content: string,
 ): PlanArtifactValidationResult {
-  const base = validatePlanArtifactContent(content, "design");
+  const base = validatePlanArtifactContent(content, "plan");
   if (!base.ok) return base;
 
   const raw = String(content || "").trim();
   if (/(?:最小可用闭环|smallest useful workflow|Use the inspected context as the source of truth|基于当前可用的只读证据|available read-only evidence)/i.test(raw)) {
-    return { ok: false, reason: "generic_fallback_design" };
+    return { ok: false, reason: "generic_fallback_plan" };
   }
+
   const hasTargetOrData =
     /(?:\.tsx?|\.jsx?|\.swift|\.py|\.rs|\.go|\.json|\.csv|\.tsv|\.xlsx|\.md|\/[A-Za-z0-9_.-]+|\\[A-Za-z0-9_.-]+)/i.test(raw) ||
-    /(?:CSV|TSV|XLSX|字段|列|指标|数据|表格|column|metric|dataset|table)/i.test(raw);
-  const hasExecutionOrder = /(?:执行顺序|实施步骤|修复步骤|落地步骤|执行步骤|Implementation Steps|Execution Order|Plan of Work|\b1\.\s+)/i.test(raw);
-  const hasValidation = /(?:验证方式|验收|测试|构建|Validation|Acceptance|Test|Build)/i.test(raw);
-  const hasRiskOrQuestion = /(?:风险|取舍|约束|注意事项|边界|默认假设|后续增强|开放问题|不确定|Risk|Tradeoff|Constraint|Caveat|Boundary|Assumption|Default|Follow-up|Enhancement|Open Question|Unknown)/i.test(raw);
+    /(?:CSV|TSV|XLSX|字段|列|指标|数据|表格|截图|附件|column|metric|dataset|table|screenshot|attachment)/i.test(raw);
+  const hasObservedEvidence = /(?:截图观察|附件观察|已确认事实|已读证据|证据引用|真实发现|Observed|Evidence|Confirmed|Findings)/i.test(raw);
+  const hasExecutionOrder = /(?:执行步骤|实施步骤|修复步骤|落地步骤|Execution Steps|Implementation Steps|Plan of Work|\b1\.\s+)/i.test(raw);
+  const hasValidation = /(?:验证标准|验证方式|验收|测试|构建|Validation|Acceptance|Test|Build)/i.test(raw);
   const hasConcreteUserGoal = /(?:用户目标|目标|User Goal|Goal)/i.test(raw) && !/(?:最小可用闭环|smallest useful workflow).{0,80}(?:默认|first version)/i.test(raw);
+  const hasScreenshotOrAttachmentObservation = /(?:截图\/附件观察|截图观察|附件观察|无截图|无附件|未提供截图|未提供附件|Screenshot|Attachment|Provided context|No screenshot|No attachment)/i.test(raw);
+  const hasReadEvidence = /(?:已读证据|证据引用|证据|Evidence|Read Evidence|References)/i.test(raw);
+  const hasRealFindings = /(?:真实发现|已确认事实|当前发现|Confirmed Facts|Findings|Observed Facts)/i.test(raw);
+  const hasUnverifiedHypotheses = /(?:未验证假设|待验证假设|Unverified Hypotheses|Unverified Assumptions)/i.test(raw);
+  const hasAffectedFiles = /(?:影响文件|影响接口|Affected Files|Affected Interfaces|Files\/Interfaces)/i.test(raw);
 
   const signalCount = [
     hasTargetOrData,
+    hasObservedEvidence,
     hasExecutionOrder,
     hasValidation,
-    hasRiskOrQuestion,
     hasConcreteUserGoal,
   ].filter(Boolean).length;
 
   if (signalCount < 4) {
-    return { ok: false, reason: "not_actionable_design" };
+    return { ok: false, reason: "insufficient_actionable_plan_signals" };
+  }
+
+  const missingRequiredSections = [
+    [hasConcreteUserGoal, "user_goal"],
+    [hasScreenshotOrAttachmentObservation, "screenshot_attachment_observations"],
+    [hasReadEvidence, "read_evidence"],
+    [hasRealFindings, "confirmed_findings"],
+    [hasUnverifiedHypotheses, "unverified_hypotheses"],
+    [hasExecutionOrder, "execution_steps"],
+    [hasAffectedFiles, "affected_files"],
+    [hasValidation, "validation"],
+  ]
+    .filter(([ok]) => !ok)
+    .map(([, name]) => name);
+  if (missingRequiredSections.length > 0) {
+    return { ok: false, reason: `missing_plan_required_sections:${missingRequiredSections.join(",")}` };
+  }
+
+  const unsupportedHypothesisLines = raw
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) =>
+      !/^#{1,6}\s+/.test(line) &&
+      /(?:假设|可能|高概率|中概率|低概率|probably|possibly|hypothesis|likely)/i.test(line) &&
+      !/(?:默认假设|未验证|待验证|需验证|证据|依据|观察|已读|default assumption|unverified|needs validation|evidence|observed)/i.test(line)
+    );
+  if (unsupportedHypothesisLines.length > 0) {
+    return { ok: false, reason: "unsupported_hypothesis_as_plan" };
+  }
+
+  const unsupportedDebugAdviceLines = raw
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) =>
+      !/^#{1,6}\s+/.test(line) &&
+      /(?:console\.log|debug\s+log|调试日志|打印日志|临时日志)/i.test(line) &&
+      !/(?:证据|依据|观察|已读|已确认|Evidence|Observed|Confirmed|Read)/i.test(line)
+    );
+  if (unsupportedDebugAdviceLines.length > 0) {
+    return { ok: false, reason: "unsupported_debug_log_advice" };
   }
 
   return { ok: true };
@@ -1747,6 +1809,8 @@ export function collectChangeEntries(
  */
 export function getPlanArtifactTitle(kind: PlanArtifactKind, language: "zh" | "en" = "zh"): string {
   switch (kind) {
+    case "plan":
+      return language === "zh" ? "执行计划" : "Plan";
     case "requirements":
       return language === "zh" ? "需求规格" : "Requirements";
     case "design":

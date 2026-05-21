@@ -54,6 +54,8 @@ function loadTranspiledModuleSync(sourcePath) {
 }
 
 const {
+  filterPlanToolNamesAfterReadOnlyConvergence,
+  shouldNarrowPlanToolsAfterReadOnlyConvergence,
   shouldRedirectPlanToolsAfterReadOnlyConvergence,
   shouldTriggerPlanReadOnlyConvergence,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planReadOnlyConvergence.ts"));
@@ -141,4 +143,41 @@ test("post-convergence plan turns redirect more read-only tools before execution
     hasPlanDecisionOutput: false,
     toolNames: ["write_file"],
   }), false);
+});
+
+test("post-convergence plan tool surface narrows to plan artifact materialization", () => {
+  assert.equal(shouldNarrowPlanToolsAfterReadOnlyConvergence({
+    workflowMode: "plan",
+    isPlanApproved: false,
+    convergencePromptAlreadyUsed: true,
+  }), true);
+
+  assert.deepEqual(filterPlanToolNamesAfterReadOnlyConvergence({
+    workflowMode: "plan",
+    isPlanApproved: false,
+    convergencePromptAlreadyUsed: true,
+    toolNames: [
+      "list_directory",
+      "glob_search",
+      "read_file",
+      "replace_in_file",
+      "write_file",
+      "get_project_skeleton",
+      "read_pty_tail",
+    ],
+  }), ["replace_in_file", "write_file"]);
+
+  assert.deepEqual(filterPlanToolNamesAfterReadOnlyConvergence({
+    workflowMode: "plan",
+    isPlanApproved: true,
+    convergencePromptAlreadyUsed: true,
+    toolNames: ["read_file", "write_file"],
+  }), ["read_file", "write_file"]);
+
+  assert.deepEqual(filterPlanToolNamesAfterReadOnlyConvergence({
+    workflowMode: "edit",
+    isPlanApproved: false,
+    convergencePromptAlreadyUsed: true,
+    toolNames: ["read_file", "write_file"],
+  }), ["read_file", "write_file"]);
 });

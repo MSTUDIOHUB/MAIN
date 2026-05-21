@@ -310,7 +310,7 @@ function seedPlanFlowScenario() {
   const artifacts = [
     {
       kind: "design" as const,
-      path: ".MAIN/plans/design.md",
+      path: ".MAIN/plans/plan.md",
       title: "Design",
       updatedAt: now - 1_000,
       content: "# Design\n\n- 目标：支持生成计划、保存方案、批准执行与最终收尾。\n- 右侧 Plan Workspace 负责展示方案与审批入口。\n- 保存成功后应明确反馈已保存。\n- 验证：批准后生成 tasks.md 并进入执行进度。\n",
@@ -351,7 +351,7 @@ function seedPlanFlowScenario() {
           "- 先生成可保存的 design 方案，再等待用户确认是否执行。",
           "",
           "## 执行策略",
-          "1. 先补齐 `design.md`。",
+          "1. 先补齐 `plan.md`。",
           "2. 用户可先保存方案留档。",
           "3. 只有在用户批准后，才生成 `.MAIN/plans/tasks.md` 并进入执行。",
           "",
@@ -537,7 +537,7 @@ function seedPlanQuickReplyApprovalScenario() {
     planArtifacts: [
       {
         kind: "design" as const,
-        path: ".MAIN/plans/design.md",
+        path: ".MAIN/plans/plan.md",
         title: "Design",
         updatedAt: now - 1_000,
         content: "# Design\n\n- 目标：修复字体加载诊断流程。\n- 方案：批准后先运行诊断，再根据结果修复字体加载。\n- 验证：根据 tasks.md 记录诊断命令和修复证据。\n",
@@ -591,8 +591,8 @@ function seedPlanQuickReplyMaterializeScenario(modelStyle: "gemma" | "qwen") {
         "## 修复方案",
         "",
         "### 目标与约束",
-        "- 目标：修复 MAIN Plan 模式中 Gemma4 普通方案没有落成 design.md 的问题。",
-        "- 约束：批准前只能写 `.MAIN/plans/design.md`，不能修改源码。",
+        "- 目标：修复 MAIN Plan 模式中 Gemma4 普通方案没有落成 plan.md 的问题。",
+        "- 约束：批准前只能写 `.MAIN/plans/plan.md`，不能修改源码。",
         "",
         "### 当前发现",
         "- `hasStructuredProposal:false` 时仍然出现 approve_operation_once。",
@@ -604,14 +604,14 @@ function seedPlanQuickReplyMaterializeScenario(modelStyle: "gemma" | "qwen") {
         "3. 更新 `src/App.tsx` 让 quick reply 进入 approvePlan。",
         "",
         "### 数据流与控制流",
-        "- ChatArea 方案文本 -> 自动写入 `.MAIN/plans/design.md` -> Plan Review -> approvePlan。",
+        "- ChatArea 方案文本 -> 自动写入 `.MAIN/plans/plan.md` -> Plan Review -> approvePlan。",
         "",
         "### 风险与注意事项",
         "- 低质量聊天不得落盘。",
         "- 普通聊天的一次性执行审批继续保留。",
         "",
         "### 验证方式",
-        "- 点击批准后应看到 design.md、`isPlanApproved:true` 和 `planStage:executing`。",
+        "- 点击批准后应看到 plan.md、`isPlanApproved:true` 和 `planStage:executing`。",
       ].join("\n")
     : [
         "### 目标",
@@ -620,7 +620,7 @@ function seedPlanQuickReplyMaterializeScenario(modelStyle: "gemma" | "qwen") {
         "### 方案",
         "- 修改 `src/lib/replyOptions.ts` 识别 proposal_follow_up。",
         "- 修改 `src/lib/planControl.ts` 区分 materialize_then_approve。",
-        "- 修改 `src/App.tsx` 在批准前写入 `.MAIN/plans/design.md`。",
+        "- 修改 `src/App.tsx` 在批准前写入 `.MAIN/plans/plan.md`。",
         "",
         "### 执行顺序",
         "1. 先物化可见方案。",
@@ -628,14 +628,14 @@ function seedPlanQuickReplyMaterializeScenario(modelStyle: "gemma" | "qwen") {
         "3. 最后进入 executing 并保留 Browser/Playwright 验证能力。",
         "",
         "### 数据流",
-        "- 可见 Qwen 方案 -> materializePlanArtifactFromVisibleText -> design.md -> approvePlan。",
+        "- 可见 Qwen 方案 -> materializePlanArtifactFromVisibleText -> plan.md -> approvePlan。",
         "",
         "### 风险与边界",
         "- 不写模型名分支，只按输出形态判断。",
         "- 物化失败时阻断执行。",
         "",
         "### 验证方式",
-        "- E2E 点击批准后必须生成 design.md 并进入执行状态。",
+        "- E2E 点击批准后必须生成 plan.md 并进入执行状态。",
       ].join("\n");
 
   useAppStore.setState((state) => ({
@@ -804,7 +804,7 @@ function seedPlanReloadResumeScenario() {
         },
         {
           kind: "design",
-          path: ".MAIN/plans/design.md",
+          path: ".MAIN/plans/plan.md",
           title: "Design",
           updatedAt: now - 2_000,
           content: "# Design\n\n- 页面重载后应恢复到原有 Plan 进度与会话内容。\n",
@@ -943,7 +943,7 @@ function seedAwaitingChoiceScenario() {
       },
       {
         kind: "design",
-        path: ".MAIN/plans/design.md",
+        path: ".MAIN/plans/plan.md",
         title: "Design",
         updatedAt: now - 1_000,
         content: "# Design\n\n- 选择完成后应继续同一回合，而不是新开一轮或直接丢失上下文。\n",
@@ -2053,7 +2053,7 @@ function seedPlanReplaceRefreshScenario() {
       },
       {
         kind: "design",
-        path: ".MAIN/plans/design.md",
+        path: ".MAIN/plans/plan.md",
         title: "Design",
         updatedAt: now - 2_000,
         content: "# Design\n\n- 任务进度以 tasks.md 为准，replace_in_file 也必须触发刷新。\n",
@@ -2847,7 +2847,7 @@ function seedTopIslandPanelStabilityScenario() {
     planArtifacts: [
       {
         kind: "design",
-        path: ".MAIN/plans/design.md",
+        path: ".MAIN/plans/plan.md",
         title: "Design",
         content: "# TopIsland 面板稳定设计\n\n> 计划高亮应跟随当前主题色。\n\n审批只更新 TopIsland 状态，不改动右侧面板。",
         updatedAt: now,
@@ -4174,7 +4174,7 @@ function seedLocalPlanSlowFirstTokenScenario() {
 
   bridge.sendCloudMessage = (text?: string) =>
     useAppStore.getState().sendMessage(
-      text || "请为慢首 token 的本地模型生成一个可审批设计方案。",
+      text || "请为慢首 token 的本地模型生成一个可审批执行计划。",
       undefined,
       {
         resolvedIntent: "plan",
@@ -4283,7 +4283,7 @@ function seedLocalPlanClosureGuardEmptyScenario() {
 
   bridge.sendCloudMessage = (text?: string) =>
     useAppStore.getState().sendMessage(
-      text || "请基于 orders.csv 生成一个数据分析自动化设计方案。",
+      text || "请基于 orders.csv 生成一个数据分析自动化执行计划。",
       undefined,
       {
         resolvedIntent: "plan",
@@ -4472,7 +4472,7 @@ function seedCloudToolProtocolScenario(scenario: string) {
   bridge.sendCloudMessage = (text?: string) => {
     if (scenario === MALFORMED_TOOL_USE_PLAN_SCENARIO) {
       return useAppStore.getState().sendMessage(
-        text || "请基于 orders.csv 生成一个数据分析自动化设计方案。",
+        text || "请基于 orders.csv 生成一个数据分析自动化执行计划。",
         undefined,
         {
           resolvedIntent: "plan",
@@ -4726,7 +4726,7 @@ function seedPlanApprovalExecuteToolsScenario() {
     planArtifacts: [
       {
         kind: "design" as const,
-        path: ".MAIN/plans/design.md",
+        path: ".MAIN/plans/plan.md",
         title: "Design",
         updatedAt: now - 1_000,
         content: "# Design\n\n- 目标：批准后应允许执行工具出现在运行时工具列表中。\n- 方案：Plan 回合保持 plan 身份，但批准后的 runtime intent 使用 execute。\n- 验证：下一轮请求包含 run_command 和写入工具能力。\n",
@@ -4923,7 +4923,7 @@ export function getE2EQuickReplyHandler(): ((text: string, sourceTurnId?: string
             id: agentBlockId,
             turnId,
             type: "agent",
-            content: `已收到调整建议：${replyText}。我会先更新 design.md，然后再次等待确认。`,
+            content: `已收到调整建议：${replyText}。我会先更新 plan.md，然后再次等待确认。`,
             streaming: false,
           },
         ],

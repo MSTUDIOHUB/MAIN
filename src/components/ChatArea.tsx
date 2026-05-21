@@ -559,6 +559,9 @@ function ProgressBlock({
   const why = String(block.why || "");
   const action = String(block.action || "");
   const evidence = String(block.evidence || "");
+  const evidenceExcerpt = String(block.evidenceExcerpt || "");
+  const observedFact = String(block.observedFact || "");
+  const hypothesisStatus = String(block.hypothesisStatus || "");
   const next = String(block.next || "");
   const targets = Array.isArray(block.targets) ? block.targets.filter(Boolean).slice(0, 3) : [];
   const phaseLabel = language === "zh"
@@ -617,10 +620,13 @@ function ProgressBlock({
             {why && (
               <div data-testid="progress-why" className="mt-1 text-[12px] leading-5 text-[var(--surface-text-subtle)]">{why}</div>
             )}
-            {(action || evidence || next) && (
+            {(action || observedFact || evidenceExcerpt || evidence || next) && (
               <div className="mt-2 grid gap-1.5 text-[11px] leading-5 text-[var(--surface-text-subtle)]">
-                {action && <div><span className="text-[#93c5fd]">{language === "zh" ? "正在做：" : "Action: "}</span>{action}</div>}
+                {action && <div><span className="text-[#93c5fd]">{language === "zh" ? "动作：" : "Action: "}</span>{action}</div>}
+                {observedFact && <div><span className="text-[#a5b4fc]">{language === "zh" ? "观察：" : "Observed: "}</span>{observedFact}</div>}
+                {evidenceExcerpt && <div><span className="text-[#c4b5fd]">{language === "zh" ? "证据摘录：" : "Evidence excerpt: "}</span>{evidenceExcerpt}</div>}
                 {evidence && <div><span className="text-[#a5b4fc]">{language === "zh" ? "证据：" : "Evidence: "}</span>{evidence}</div>}
+                {hypothesisStatus && <div><span className="text-[#fbbf24]">{language === "zh" ? "状态：" : "Status: "}</span>{hypothesisStatus}</div>}
                 {next && <div><span className="text-[#86efac]">{language === "zh" ? "下一步：" : "Next: "}</span>{next}</div>}
               </div>
             )}
@@ -2850,8 +2856,9 @@ export default function ChatArea({
       : "";
     const toolExecutionSummary = buildToolExecutionSummary(blocks, language);
     const activeTurnActivity = getActiveTurnActivity(blocks, turn.status, language);
+    const showReasoningDebug = config.reasoningDisplay !== "hidden";
     const liveProcessTimeline = !shouldArchiveCompletedProcess
-      ? buildLiveTurnProcessTimelineModel({ blocks, language, includeThoughts: true })
+      ? buildLiveTurnProcessTimelineModel({ blocks, language, includeThoughts: showReasoningDebug })
       : null;
     const liveProcessBlockIds = new Set(
       (liveProcessTimeline?.blocks || [])
@@ -2874,7 +2881,7 @@ export default function ChatArea({
     };
     const latestThoughtBlock = getLatestThoughtBlock(blocks);
     const bottomThoughtSummary =
-      turn.status !== "error" && latestThoughtBlock?.isStreaming
+      showReasoningDebug && turn.status !== "error" && latestThoughtBlock?.isStreaming
         ? (() => {
             const summary = getThoughtSummaryText(latestThoughtBlock);
             return liveTimelineContainsProcessText(liveProcessTimeline, summary) ? "" : summary;

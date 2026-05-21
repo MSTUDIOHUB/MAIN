@@ -83,6 +83,7 @@ const {
   extractOpenAiResponseText,
   mapMessagesForAnthropic,
   getModelInstructionProfile,
+  resolveReasoningPolicy,
   getDefaultLocalToolProtocol,
   normalizeCloudAuthMode,
   resolveEffectiveCloudApiFormat,
@@ -238,7 +239,7 @@ test("anthropic stream processor handles named SSE events and tool json deltas",
   assert.equal(result.toolCalls[0].arguments, "{\"path\":\"src/App.tsx\"}");
 });
 
-test("anthropic stream processor routes thinking delta through thinking tags", () => {
+test("anthropic stream processor stores thinking delta as hidden metadata", () => {
   const tokens = [];
   const processor = createAnthropicStreamProcessor((token) => tokens.push(token));
 
@@ -247,8 +248,10 @@ test("anthropic stream processor routes thinking delta through thinking tags", (
   processor.flush();
 
   const result = processor.getResult();
-  assert.deepEqual(tokens, ["<thinking>", "hidden", "</thinking>", "visible"]);
-  assert.equal(result.content, "<thinking>hidden</thinking>visible");
+  assert.deepEqual(tokens, ["visible"]);
+  assert.equal(result.content, "visible");
+  assert.equal(result.reasoningContent, "hidden");
+  assert.equal(result.reasoningField, "reasoning");
 });
 
 test("cloud helpers build protocol-specific endpoints and headers", () => {
@@ -429,11 +432,14 @@ test("cloud tool protocol and model profile helpers normalize provider behavior"
   assert.equal(normalizeLocalToolProtocol("xml", "OMLX"), "xml");
 
   assert.equal(getModelInstructionProfile({ protocol: "anthropic", model: "claude-sonnet-4-5" }).provider, "anthropic");
-  assert.equal(getModelInstructionProfile({ protocol: "openai", model: "qwen3-coder" }).reasoning, "tagged");
+  assert.equal(getModelInstructionProfile({ protocol: "openai", model: "qwen3-coder" }).reasoning, "passive_hidden");
   assert.equal(getModelInstructionProfile({ protocol: "openai", provider: "OMLX", model: "gemma-4-26b-a4b-it-8bit" }).provider, "gemma");
-  assert.equal(getModelInstructionProfile({ protocol: "openai", provider: "OMLX", model: "gemma-4-26b-a4b-it-8bit" }).reasoning, "tagged");
+  assert.equal(getModelInstructionProfile({ protocol: "openai", provider: "OMLX", model: "gemma-4-26b-a4b-it-8bit" }).reasoning, "passive_hidden");
   assert.equal(getModelInstructionProfile({ protocol: "openai", model: "kimi-k2" }).toolProtocolPreference, "xml");
   assert.equal(getModelInstructionProfile({ protocol: "gemini", model: "gemini-2.5-pro" }).toolProtocolPreference, "xml");
+  assert.equal(resolveReasoningPolicy({ activeProfile: "local", requestedMode: "passive_hidden" }).mode, "passive_hidden");
+  assert.equal(resolveReasoningPolicy({ activeProfile: "cloud", reasoningRequest: "auto", reasoningEffort: "high" }).mode, "native_enabled");
+  assert.equal(resolveReasoningPolicy({ activeProfile: "local", requestedMode: "passive_hidden" }).replayInContext, false);
 });
 
 test("model protocol profile covers local and cloud providers", () => {
@@ -457,8 +463,8 @@ test("model protocol profile covers local and cloud providers", () => {
     model: "gemma-4-26b-a4b-it-8bit",
     configuredToolProtocol: "auto",
   });
-  assert.equal(localGemmaProfile.reasoning, "tagged");
-  assert.equal(localGemmaProfile.notes.some((note) => /thought/.test(note)), true);
+  assert.equal(localGemmaProfile.reasoning, "passive_hidden");
+  assert.equal(localGemmaProfile.notes.some((note) => /hidden metadata/.test(note)), true);
 
   assert.equal(resolveModelProtocolProfile({
     activeProfile: "cloud",
@@ -769,4 +775,17 @@ test("openai response text extractor supports chat completions and responses pay
 
   assert.equal(chatText, "hello from chat");
   assert.equal(responsesText, "hello from responses");
+  assert.equal(
+    extractOpenAiResponseText({
+      choices: [
+        {
+          message: {
+            content: "",
+            reasoning_content: "hidden only",
+          },
+        },
+      ],
+    }, "chat_completions"),
+    "",
+  );
 });

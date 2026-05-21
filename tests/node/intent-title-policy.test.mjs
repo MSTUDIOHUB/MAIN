@@ -61,6 +61,7 @@ function loadIntentTitlePolicyModule() {
 const {
   canUpdateSeedSessionTitle,
   isSemanticTurnMetadataCallbackCurrent,
+  parseIntentTitleCandidate,
   shouldRequestSemanticTurnMetadataForTurn,
   shouldSeedSessionTitle,
 } = loadIntentTitlePolicyModule();
@@ -204,4 +205,37 @@ test("stale semantic title callbacks are dropped by turn/prompt/session guards",
     }),
     false,
   );
+});
+
+test("intent title parser accepts loose local model title output", () => {
+  const parsed = parseIntentTitleCandidate({
+    content: "标题：重写 Plan 流程\n摘要：将默认计划产物切换到 plan.md",
+  });
+
+  assert.equal(parsed.source, "loose_key_value");
+  assert.equal(parsed.metadata.title, "重写 Plan 流程");
+  assert.equal(parsed.metadata.summary, "将默认计划产物切换到 plan.md");
+});
+
+test("intent title parser falls back to reasoning-only local output", () => {
+  const parsed = parseIntentTitleCandidate({
+    content: "",
+    reasoning: '{"title":"修复标题同步","summary":"让 turn 和 session 共用同一标题结果"}',
+  });
+
+  assert.equal(parsed.source, "reasoning_json");
+  assert.equal(parsed.metadata.title, "修复标题同步");
+  assert.equal(parsed.metadata.summary, "让 turn 和 session 共用同一标题结果");
+});
+
+test("intent title parser can use a first-line title and reports failures", () => {
+  const firstLine = parseIntentTitleCandidate({
+    content: "Plan 审批链路收束\n更多解释文本",
+  });
+  const failed = parseIntentTitleCandidate({ content: "", reasoning: "" });
+
+  assert.equal(firstLine.source, "first_line");
+  assert.equal(firstLine.metadata.title, "Plan 审批链路收束");
+  assert.equal(failed.source, "none");
+  assert.equal(failed.failureReason, "empty_model_output");
 });

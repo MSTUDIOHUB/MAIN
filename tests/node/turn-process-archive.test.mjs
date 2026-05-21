@@ -216,10 +216,10 @@ test("live timeline groups repeated edits under one strategy until the next expl
         id: 2,
         type: "tool",
         toolName: "replace_in_file",
-        target: ".MAIN/plans/design.md",
+        target: ".MAIN/plans/plan.md",
         status: "done",
         toolStatus: "executed",
-        diff: { old: "a", new: "b", path: ".MAIN/plans/design.md" },
+        diff: { old: "a", new: "b", path: ".MAIN/plans/plan.md" },
       },
       { id: 3, type: "agent", content: firstNote, hiddenProcess: true, streaming: false },
       {
@@ -249,7 +249,7 @@ test("live timeline groups repeated edits under one strategy until the next expl
   assert.equal(model.steps[0].kind, "edit");
   assert.equal(model.steps[0].intent, firstNote);
   assert.match(model.steps[0].summary, /3 次文件修改/);
-  assert.deepEqual(model.steps[0].targets, [".MAIN/plans/design.md", "src/styles/main.css", "index.html"]);
+  assert.deepEqual(model.steps[0].targets, [".MAIN/plans/plan.md", "src/styles/main.css", "index.html"]);
   assert.equal(model.steps[1].kind, "verify");
   assert.equal(model.steps[1].intent, secondNote);
 });
@@ -263,10 +263,10 @@ test("thin repeated edit narrations collapse into one synthesized strategy row",
         id: 2,
         type: "tool",
         toolName: "replace_in_file",
-        target: ".MAIN/plans/design.md",
+        target: ".MAIN/plans/plan.md",
         status: "done",
         toolStatus: "executed",
-        diff: { old: "a", new: "b", path: ".MAIN/plans/design.md" },
+        diff: { old: "a", new: "b", path: ".MAIN/plans/plan.md" },
       },
       { id: 3, type: "agent", content: "按方案修改目标文件。", hiddenProcess: true, streaming: false },
       {
@@ -295,7 +295,7 @@ test("thin repeated edit narrations collapse into one synthesized strategy row",
   assert.equal(model.steps[0].kind, "edit");
   assert.match(model.steps[0].intent, /按同一修改策略完成 3 次文件修改/);
   assert.doesNotMatch(model.steps[0].intent, /按方案修改目标文件/);
-  assert.deepEqual(model.steps[0].targets, [".MAIN/plans/design.md", "src/styles/main.css", "index.html"]);
+  assert.deepEqual(model.steps[0].targets, [".MAIN/plans/plan.md", "src/styles/main.css", "index.html"]);
 });
 
 test("path-specific notes compare by strategy so same-purpose edits stay grouped", () => {

@@ -67,16 +67,16 @@ function summarizeToolActivity(activity: PlanToolActivitySummary): string {
   return compactLine(`${activity.status}:${activity.name}${target}${detail}`);
 }
 
-function isCachedReadOnlyActivity(activity: PlanToolActivitySummary): boolean {
+export function isCachedReadOnlyPlanActivity(activity: PlanToolActivitySummary): boolean {
   return /FILE_UNCHANGED_STUB|Repeated read-only tool call skipped/i.test(activity.detail || "");
 }
 
-function summarizeRepeatedTargets(activity: PlanToolActivitySummary[], limit = 4): string[] {
+export function summarizeRepeatedPlanTargetsFromToolActivity(activity: PlanToolActivitySummary[], limit = 4): string[] {
   const counts = new Map<string, number>();
   for (const item of activity) {
     const key = normalizeMatchText(item.target || "");
     if (!key) continue;
-    counts.set(key, (counts.get(key) || 0) + (isCachedReadOnlyActivity(item) ? 2 : 1));
+    counts.set(key, (counts.get(key) || 0) + (isCachedReadOnlyPlanActivity(item) ? 2 : 1));
   }
   return [...counts.entries()]
     .filter(([, count]) => count >= 2)
@@ -91,7 +91,7 @@ export function buildPlanProgressSignatureFromToolActivity(
   return activity
     .slice(-6)
     .map((item) => {
-      const cached = isCachedReadOnlyActivity(item) ? "cached" : "fresh";
+      const cached = isCachedReadOnlyPlanActivity(item) ? "cached" : "fresh";
       return `${item.name}:${normalizeMatchText(item.target || "")}:${item.status}:${cached}`;
     })
     .join("|");
@@ -107,7 +107,7 @@ export function buildPlanNoProgressLoopPauseNotice(input: {
 }): string {
   const repeatedTargets = (input.repeatedTargets && input.repeatedTargets.length > 0)
     ? input.repeatedTargets
-    : summarizeRepeatedTargets(input.recentToolActivity);
+    : summarizeRepeatedPlanTargetsFromToolActivity(input.recentToolActivity);
   const evidence = summarizePlanExecutionEvidence(input.evidenceLedger, 4);
   const recent = input.recentToolActivity.slice(-4).map(summarizeToolActivity);
   const remainingTask = compactLine(input.remainingTask || (input.language === "zh" ? "继续未满足证据的任务" : "continue the task whose evidence is still missing"));
@@ -722,7 +722,7 @@ export function buildPlanMaxIterationsResumePrompt(input: {
         ? "先重新读取当前 workspace 状态和 `.MAIN/plans/tasks.md`，选择证据未满足且与当前改动最相关的任务继续；顺序是参考，不是强制线性流程。"
         : input.tasks.length > 0
         ? "当前已有 runtime 任务清单；先重新读取当前 workspace 状态，再选择证据未满足且与当前诊断最相关的任务继续。只有长任务、跨会话恢复或需要审计留档时才持久化 `.MAIN/plans/tasks.md`；不要为了确认它是否存在而读取它。"
-        : "先基于已批准的 design.md 或 bugfix.md 派生 runtime 任务清单；旧 requirements.md 只作为辅助上下文。只有长任务、跨会话恢复或需要审计留档时才生成 `.MAIN/plans/tasks.md`；不要默认读取缺失的 tasks.md。",
+        : "先基于已批准的 plan.md 或 bugfix.md 派生 runtime 任务清单；旧 requirements.md 和 design.md 只作为历史辅助上下文。只有长任务、跨会话恢复或需要审计留档时才生成 `.MAIN/plans/tasks.md`；不要默认读取缺失的 tasks.md。",
       "不要重做已经满足证据的任务；如果存在 tasks.md，不要只修改 checkbox；不要重复计划说明；不要把 `.MAIN/plans` 当作用户源码证据。需要判断源码现状时，直接读取真实项目文件。",
       "",
       "Checkpoint:",
@@ -750,7 +750,7 @@ export function buildPlanMaxIterationsResumePrompt(input: {
       ? "First reread current workspace state and `.MAIN/plans/tasks.md`, then choose the evidence-unsatisfied task that best matches the current change; task order is guidance, not a forced linear path."
       : input.tasks.length > 0
       ? "A runtime task list is already available; first reread current workspace state, then choose the evidence-unsatisfied task that best matches the current diagnosis. Persist `.MAIN/plans/tasks.md` only for long work, cross-session recovery, or audit-file needs; do not read it just to check existence."
-      : "First derive a runtime task list from the approved design.md or bugfix.md; use any legacy requirements.md only as supporting context. Generate `.MAIN/plans/tasks.md` only for long work, cross-session recovery, or audit-file needs; do not read missing tasks.md by default.",
+      : "First derive a runtime task list from the approved plan.md or bugfix.md; use any legacy requirements.md/design.md only as supporting context. Generate `.MAIN/plans/tasks.md` only for long work, cross-session recovery, or audit-file needs; do not read missing tasks.md by default.",
     "Do not redo tasks whose evidence is already satisfied. If tasks.md exists, do not only edit checkboxes. Do not restate the plan. Do not treat `.MAIN/plans` as project-source evidence; read real project files when source state matters.",
     "",
     "Checkpoint:",

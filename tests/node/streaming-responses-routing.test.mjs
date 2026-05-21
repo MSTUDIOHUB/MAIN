@@ -461,7 +461,7 @@ test("local Rust streams convert cumulative text payloads into visible deltas", 
   assert.deepEqual(invokeCalls.map((call) => call.command), ["start_chat_stream"]);
 });
 
-test("local Rust streams convert cumulative reasoning payloads into thinking deltas", async () => {
+test("local Rust streams store cumulative reasoning payloads as hidden metadata", async () => {
   const listeners = new Map();
   const listenMock = async (eventName, handler) => {
     listeners.set(eventName, handler);
@@ -512,10 +512,10 @@ test("local Rust streams convert cumulative reasoning payloads into thinking del
     },
   );
 
-  assert.equal(result.content, "<thinking>ABC</thinking>done");
+  assert.equal(result.content, "done");
   assert.equal(result.reasoningContent, "ABC");
   assert.equal(result.reasoningField, "reasoning_content");
-  assert.deepEqual(tokens, ["<thinking>", "A", "B", "C", "</thinking>", "done"]);
+  assert.deepEqual(tokens, ["done"]);
 });
 
 test("local Rust streams stop reasoning-only runaway output", async () => {
@@ -561,15 +561,14 @@ test("local Rust streams stop reasoning-only runaway output", async () => {
 
   assert.equal(result.finishReason, "length");
   assert.equal(result.toolCalls.length, 0);
-  assert.match(result.content, /^<thinking>/);
-  assert.equal(result.content.endsWith("</thinking>"), true);
+  assert.equal(result.content, "");
   assert.equal(result.reasoningContent.length > 12_000, true);
   assert.deepEqual(invokeCalls, ["start_chat_stream", "cancel_chat_stream"]);
   assert.equal(doneCount, 1);
-  assert.equal(tokens[0], "<thinking>");
+  assert.deepEqual(tokens, []);
 });
 
-test("OpenAI-compatible chat replays assistant reasoning_content when the provider emitted it", async () => {
+test("OpenAI-compatible chat does not replay assistant reasoning_content by default", async () => {
   const listeners = new Map();
   const listenMock = async (eventName, handler) => {
     listeners.set(eventName, handler);
@@ -631,7 +630,7 @@ test("OpenAI-compatible chat replays assistant reasoning_content when the provid
 
   assert.equal(result.content, "ok");
   assert.equal(requests.length, 1);
-  assert.equal(requests[0].messages[1].reasoning_content, "Need to inspect the file before answering.");
+  assert.equal(requests[0].messages[1].reasoning_content, undefined);
   assert.equal(requests[0].messages[1].tool_calls[0].function.name, "read_file");
   assert.equal(requests[0].messages[2].reasoning_content, undefined);
 });

@@ -190,6 +190,8 @@ test("system prompt separates display language from resolved response language",
   assert.match(prompt, /resolvedResponseLanguage: en/);
   assert.match(prompt, /MUST use English/);
   assert.doesNotMatch(prompt, /<analysis>我需要先检查/);
+  assert.doesNotMatch(prompt, /<analysis>`? 仅用于极简内心备注/);
+  assert.match(prompt, /不要输出 `<analysis>`、`<thought>`、`<thinking>` 或 `<reasoning>`/);
   assert.match(prompt, /需要工具时只输出完整工具调用/);
 });
 
@@ -237,7 +239,7 @@ test("tool protocol card adds model normalization notes for Gemma-style thought 
     availableToolNames: ["read_file", "replace_in_file"],
     language: "zh",
     modelProtocolNotes: [
-      "Treat `thought`, `thinking`, `reasoning`, and `reasoning_content` fields or labels as hidden thought.",
+      "Fold `thought`, `thinking`, `reasoning`, and `reasoning_content` fields or labels into hidden metadata.",
       "If a tool is needed, emit the actual tool call instead of prose saying `I will use read_file`.",
     ],
   });
@@ -287,14 +289,17 @@ test("data analyst plan prompt uses interactive planning and analysis semantics"
   assert.match(prompt, /关键决策点用可点击选项引导用户/);
   assert.match(prompt, /选项必须通用真实/);
   assert.match(prompt, /用户能真实拍板的选择/);
-  assert.match(prompt, /Design-First 计划落盘规则/);
-  assert.match(prompt, /默认只把可审批方案写入 `\.MAIN\/plans\/design\.md`/);
-  assert.match(prompt, /`plan_file_change` 路由到 PLAN 后，必须把可审批草稿落到 `\.MAIN\/plans\/design\.md`/);
+  assert.match(prompt, /Plan-First 计划落盘规则/);
+  assert.match(prompt, /默认只把可审批方案写入 `\.MAIN\/plans\/plan\.md`/);
+  assert.match(prompt, /`plan_file_change` 路由到 PLAN 后，必须把可审批草稿落到 `\.MAIN\/plans\/plan\.md`/);
+  assert.match(prompt, /阶段 1 只读 grounding/);
+  assert.match(prompt, /阶段 2 归纳已确认事实\/未验证假设\/阻塞问题/);
+  assert.match(prompt, /decision-complete 的 `\.MAIN\/plans\/plan\.md`/);
   assert.match(prompt, /requirements\.md.*审批的前置条件/);
-  assert.match(prompt, /复杂实现默认包含 1 个简短 Mermaid 图/);
+  assert.match(prompt, /必须包含：用户目标、截图\/附件观察、已读证据、真实发现、未验证假设、执行步骤、影响文件、验证标准/);
   assert.match(prompt, /简单结构不需要，除非用户明确要求生成图/);
   assert.match(prompt, /数据分析\/报表类请求：规划阶段优先输出分析目标、数据范围、指标口径、报表结构、验证方式/);
-  assert.match(prompt, /复杂实现请求默认生成精简的 `\.MAIN\/plans\/design\.md` 草稿供审批/);
+  assert.match(prompt, /复杂实现请求默认生成精简的 `\.MAIN\/plans\/plan\.md` 草稿供审批/);
   assert.match(prompt, /批准执行前仍然不能写源码或生成 tasks\.md/);
   assert.match(prompt, /不要为了确认 tasks\.md 是否存在而主动读取/);
   assert.match(prompt, /批准后优先使用 MAIN runtime 任务清单/);
