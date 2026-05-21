@@ -232,6 +232,22 @@ export type PlanExecutionProgressPhase =
   | "paused"
   | "completed";
 
+export type PlanRuntimePhase =
+  | "grounding"
+  | "synthesis"
+  | "drafting"
+  | "needs_evidence"
+  | "needs_rewrite"
+  | "review_ready"
+  | "blocked";
+
+export type PlanArtifactRecoveryAction =
+  | "rewrite"
+  | "targeted_evidence"
+  | "ask_user"
+  | "auto_scaffold"
+  | "accept";
+
 export interface PlanTaskEvidence {
   kind: PlanTaskEvidenceKind;
   value: string;
@@ -314,6 +330,15 @@ export interface RuntimePlanTaskDerivationOptions {
 export interface PlanArtifactValidationResult {
   ok: boolean;
   reason?: string;
+  missingSections?: string[];
+  recoveryAction?: PlanArtifactRecoveryAction;
+  canAutoRepair?: boolean;
+}
+
+export interface PlanArtifactQualityResult extends PlanArtifactValidationResult {
+  missingSections: string[];
+  recoveryAction: PlanArtifactRecoveryAction;
+  canAutoRepair: boolean;
 }
 
 export interface ChangeEntry {
@@ -1628,6 +1653,183 @@ function hasMeaningfulPlanSections(content: string, kind: PlanArtifactKind): boo
   return true;
 }
 
+const PLAN_EVIDENCE_REQUIRED_SECTIONS = new Set([
+  "screenshot_attachment_observations",
+  "read_evidence",
+  "confirmed_findings",
+]);
+
+const PLAN_STRUCTURAL_REQUIRED_SECTIONS = new Set([
+  "user_goal",
+  "unverified_hypotheses",
+  "execution_steps",
+  "affected_files",
+  "validation",
+]);
+
+export function parseMissingPlanRequiredSections(reason?: string): string[] {
+  const match = String(reason || "").match(/^missing_plan_required_sections:(.+)$/i);
+  if (!match) return [];
+  return match[1]
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
+export function classifyPlanArtifactQualityResult(
+  result: PlanArtifactValidationResult,
+): PlanArtifactQualityResult {
+  if (result.ok) {
+    return {
+      ...result,
+      missingSections: [],
+      recoveryAction: "accept",
+      canAutoRepair: false,
+    };
+  }
+
+  const missingSections = result.missingSections?.length
+    ? result.missingSections
+    : parseMissingPlanRequiredSections(result.reason);
+  const reason = result.reason || "quality_gate";
+  const hasEvidenceGap = missingSections.some((section) => PLAN_EVIDENCE_REQUIRED_SECTIONS.has(section));
+  const hasOnlyStructuralGaps =
+    missingSections.length > 0 &&
+    missingSections.every((section) => PLAN_STRUCTURAL_REQUIRED_SECTIONS.has(section));
+
+  if (hasEvidenceGap) {
+    return {
+      ...result,
+      missingSections,
+      recoveryAction: "targeted_evidence",
+      canAutoRepair: false,
+    };
+  }
+
+  if (hasOnlyStructuralGaps) {
+    return {
+      ...result,
+      missingSections,
+      recoveryAction: "rewrite",
+      canAutoRepair: missingSections.every((section) =>
+        section === "user_goal" ||
+        section === "unverified_hypotheses" ||
+        section === "validation"
+      ),
+    };
+  }
+
+  if (/unsupported_(?:hypothesis|debug_log)_advice/i.test(reason)) {
+    return {
+      ...result,
+      missingSections,
+      recoveryAction: "rewrite",
+      canAutoRepair: true,
+    };
+  }
+
+  if (/generic_fallback_plan|insufficient_actionable_plan_signals|missing_plan_sections/i.test(reason)) {
+    return {
+      ...result,
+      missingSections,
+      recoveryAction: "auto_scaffold",
+      canAutoRepair: false,
+    };
+  }
+
+  return {
+    ...result,
+    missingSections,
+    recoveryAction: "rewrite",
+    canAutoRepair: false,
+  };
+}
+
+function detectPlanLanguage(content: string): "zh" | "en" {
+  return /[\u4e00-\u9fff]/.test(String(content || "")) ? "zh" : "en";
+}
+
+function insertPlanSectionAfterTitle(content: string, section: string): string {
+  const raw = String(content || "").trim();
+  const lines = raw.split(/\r?\n/);
+  const firstHeadingIndex = lines.findIndex((line) => /^#{1,2}\s+\S/.test(line.trim()));
+  if (firstHeadingIndex < 0) return `${section.trim()}\n\n${raw}`.trim();
+  const before = lines.slice(0, firstHeadingIndex + 1).join("\n").trimEnd();
+  const after = lines.slice(firstHeadingIndex + 1).join("\n").trimStart();
+  return `${before}\n\n${section.trim()}${after ? `\n\n${after}` : ""}`.trim();
+}
+
+export function repairActionablePlanArtifactContent(input: {
+  content: string;
+  userGoal?: string;
+  quality?: PlanArtifactQualityResult | PlanArtifactValidationResult;
+  language?: "zh" | "en";
+}): { content: string; repairedSections: string[] } {
+  const quality = input.quality
+    ? classifyPlanArtifactQualityResult(input.quality)
+    : validateActionablePlanArtifact(input.content);
+  if (quality.ok || !quality.canAutoRepair) {
+    return { content: input.content, repairedSections: [] };
+  }
+
+  const missingSections = quality.missingSections || [];
+  const allowed = new Set(["user_goal", "unverified_hypotheses", "validation"]);
+  if (!missingSections.every((section) => allowed.has(section))) {
+    return { content: input.content, repairedSections: [] };
+  }
+
+  const language = input.language || detectPlanLanguage(input.content);
+  const goal = String(input.userGoal || "").replace(/\s+/g, " ").trim();
+  let repaired = String(input.content || "").trim();
+  const repairedSections: string[] = [];
+
+  if (missingSections.includes("validation")) {
+    const section = language === "en"
+      ? "## Validation Standards\n- Run the focused tests, build, or manual checks named by the affected surface and record the result before execution is considered complete."
+      : "## 验证标准\n- 运行与受影响范围匹配的测试、构建或人工检查，并记录结果后才视为执行完成。";
+    repaired = `${repaired}\n\n${section}`.trim();
+    repairedSections.push("validation");
+  }
+
+  if (missingSections.includes("unverified_hypotheses")) {
+    const section = language === "en"
+      ? "## Unverified Hypotheses\n- No additional execution assumption is trusted yet; any new assumption found during implementation must be validated before it becomes a step."
+      : "## 未验证假设\n- 暂无可直接信任的额外执行假设；实施中出现的新推断必须先验证，再转成执行步骤。";
+    repaired = `${repaired}\n\n${section}`.trim();
+    repairedSections.push("unverified_hypotheses");
+  }
+
+  if (missingSections.includes("user_goal") && goal) {
+    const section = language === "en"
+      ? `## User Goal\n- ${goal}`
+      : `## 用户目标\n- ${goal}`;
+    repaired = insertPlanSectionAfterTitle(repaired, section);
+    repairedSections.push("user_goal");
+  }
+
+  return { content: repaired, repairedSections };
+}
+
+function hasGoalLikePlanTitle(content: string): boolean {
+  const firstHeading = String(content || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => /^#{1,2}\s+\S/.test(line));
+  if (!firstHeading) return false;
+  return (
+    /(?:计划|方案|修复|排查|诊断|改造|Plan|Fix|Repair|Diagnosis|Remediation)/i.test(firstHeading) &&
+    /(?:CSV|Dashboard|面板|数据|导入|显示|图表|指标|修复|排查|诊断|用户|bug|issue|problem|data|chart|metric)/i.test(firstHeading)
+  );
+}
+
+export function looksLikeSubstantivePlanAssistantText(text: string): boolean {
+  const raw = String(text || "").trim();
+  if (raw.length < 40) return false;
+  if (/^#{1,6}\s+\S/m.test(raw)) return true;
+  if (/^\s*\|.+\|\s*$/m.test(raw) && /\|\s*-{2,}/.test(raw)) return true;
+  return /(?:截图观察|附件观察|已读证据|证据引用|已确认事实|真实发现|未验证假设|阻塞问题|执行步骤|影响文件|验证标准|用户目标|Screenshot observations|Read evidence|Confirmed facts|Unverified hypotheses|Execution steps|Affected files|Validation)/i.test(raw);
+}
+
 export function validatePlanArtifactContent(
   content: string,
   kind: PlanArtifactKind,
@@ -1664,13 +1866,13 @@ export function validatePlanArtifactContent(
 
 export function validateActionablePlanArtifact(
   content: string,
-): PlanArtifactValidationResult {
+): PlanArtifactQualityResult {
   const base = validatePlanArtifactContent(content, "plan");
-  if (!base.ok) return base;
+  if (!base.ok) return classifyPlanArtifactQualityResult(base);
 
   const raw = String(content || "").trim();
   if (/(?:最小可用闭环|smallest useful workflow|Use the inspected context as the source of truth|基于当前可用的只读证据|available read-only evidence)/i.test(raw)) {
-    return { ok: false, reason: "generic_fallback_plan" };
+    return classifyPlanArtifactQualityResult({ ok: false, reason: "generic_fallback_plan" });
   }
 
   const hasTargetOrData =
@@ -1679,9 +1881,14 @@ export function validateActionablePlanArtifact(
   const hasObservedEvidence = /(?:截图观察|附件观察|已确认事实|已读证据|证据引用|真实发现|Observed|Evidence|Confirmed|Findings)/i.test(raw);
   const hasExecutionOrder = /(?:执行步骤|实施步骤|修复步骤|落地步骤|Execution Steps|Implementation Steps|Plan of Work|\b1\.\s+)/i.test(raw);
   const hasValidation = /(?:验证标准|验证方式|验收|测试|构建|Validation|Acceptance|Test|Build)/i.test(raw);
-  const hasConcreteUserGoal = /(?:用户目标|目标|User Goal|Goal)/i.test(raw) && !/(?:最小可用闭环|smallest useful workflow).{0,80}(?:默认|first version)/i.test(raw);
+  const hasConcreteUserGoal =
+    (
+      /(?:用户目标|目标|User Goal|Goal)/i.test(raw) ||
+      hasGoalLikePlanTitle(raw)
+    ) &&
+    !/(?:最小可用闭环|smallest useful workflow).{0,80}(?:默认|first version)/i.test(raw);
   const hasScreenshotOrAttachmentObservation = /(?:截图\/附件观察|截图观察|附件观察|无截图|无附件|未提供截图|未提供附件|Screenshot|Attachment|Provided context|No screenshot|No attachment)/i.test(raw);
-  const hasReadEvidence = /(?:已读证据|证据引用|证据|Evidence|Read Evidence|References)/i.test(raw);
+  const hasReadEvidence = /(?:已读证据|证据引用|Read Evidence|Evidence References|References)/i.test(raw);
   const hasRealFindings = /(?:真实发现|已确认事实|当前发现|Confirmed Facts|Findings|Observed Facts)/i.test(raw);
   const hasUnverifiedHypotheses = /(?:未验证假设|待验证假设|Unverified Hypotheses|Unverified Assumptions)/i.test(raw);
   const hasAffectedFiles = /(?:影响文件|影响接口|Affected Files|Affected Interfaces|Files\/Interfaces)/i.test(raw);
@@ -1695,10 +1902,10 @@ export function validateActionablePlanArtifact(
   ].filter(Boolean).length;
 
   if (signalCount < 4) {
-    return { ok: false, reason: "insufficient_actionable_plan_signals" };
+    return classifyPlanArtifactQualityResult({ ok: false, reason: "insufficient_actionable_plan_signals" });
   }
 
-  const missingRequiredSections = [
+  const missingRequiredSections = ([
     [hasConcreteUserGoal, "user_goal"],
     [hasScreenshotOrAttachmentObservation, "screenshot_attachment_observations"],
     [hasReadEvidence, "read_evidence"],
@@ -1707,11 +1914,15 @@ export function validateActionablePlanArtifact(
     [hasExecutionOrder, "execution_steps"],
     [hasAffectedFiles, "affected_files"],
     [hasValidation, "validation"],
-  ]
+  ] as Array<[boolean, string]>)
     .filter(([ok]) => !ok)
     .map(([, name]) => name);
   if (missingRequiredSections.length > 0) {
-    return { ok: false, reason: `missing_plan_required_sections:${missingRequiredSections.join(",")}` };
+    return classifyPlanArtifactQualityResult({
+      ok: false,
+      reason: `missing_plan_required_sections:${missingRequiredSections.join(",")}`,
+      missingSections: missingRequiredSections,
+    });
   }
 
   const unsupportedHypothesisLines = raw
@@ -1723,7 +1934,7 @@ export function validateActionablePlanArtifact(
       !/(?:默认假设|未验证|待验证|需验证|证据|依据|观察|已读|default assumption|unverified|needs validation|evidence|observed)/i.test(line)
     );
   if (unsupportedHypothesisLines.length > 0) {
-    return { ok: false, reason: "unsupported_hypothesis_as_plan" };
+    return classifyPlanArtifactQualityResult({ ok: false, reason: "unsupported_hypothesis_as_plan" });
   }
 
   const unsupportedDebugAdviceLines = raw
@@ -1735,10 +1946,10 @@ export function validateActionablePlanArtifact(
       !/(?:证据|依据|观察|已读|已确认|Evidence|Observed|Confirmed|Read)/i.test(line)
     );
   if (unsupportedDebugAdviceLines.length > 0) {
-    return { ok: false, reason: "unsupported_debug_log_advice" };
+    return classifyPlanArtifactQualityResult({ ok: false, reason: "unsupported_debug_log_advice" });
   }
 
-  return { ok: true };
+  return classifyPlanArtifactQualityResult({ ok: true });
 }
 
 export function collectChangeEntries(

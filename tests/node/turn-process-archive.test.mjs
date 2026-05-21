@@ -492,3 +492,77 @@ test("codex activity groups keep edits commands browser and failures separate", 
   assert.match(groups[2].title, /浏览器验证/);
   assert.equal(groups[3].status, "failed");
 });
+
+test("codex activity groups use fixed plan runtime labels and quality recovery reasons", () => {
+  const groups = buildCodexActivityGroups([
+    {
+      id: 1,
+      type: "progress",
+      phase: "investigating",
+      title: "Needs evidence",
+      why: "草稿缺少真实证据，临时开放一次定向只读补证（missing_plan_required_sections:read_evidence）。",
+      action: "",
+      evidence: "",
+      next: "",
+      targets: [],
+      status: "running",
+      source: "runtime",
+      turnPhase: {
+        id: "plan_needs_evidence",
+        kind: "context",
+        title: "Needs evidence",
+        summary: "草稿缺少真实证据，临时开放一次定向只读补证。",
+        domain: "plan_runtime",
+        status: "running",
+      },
+    },
+    {
+      id: 2,
+      type: "tool",
+      toolName: "read_file",
+      target: "src/lib/orchestrator.ts",
+      status: "done",
+      toolStatus: "executed",
+      observationSummary: "找到 PLAN_NOT_READY recoveryAction 分支。",
+      qualityGateReason: "missing_plan_required_sections:read_evidence",
+      turnPhase: {
+        id: "plan_needs_evidence",
+        kind: "context",
+        title: "Needs evidence",
+        summary: "草稿缺少真实证据，临时开放一次定向只读补证。",
+        domain: "plan_runtime",
+        status: "running",
+      },
+    },
+    {
+      id: 3,
+      type: "progress",
+      phase: "summarizing",
+      title: "Drafting",
+      why: "把证据收束为可审批 plan.md。",
+      action: "",
+      evidence: "",
+      next: "",
+      targets: [],
+      status: "running",
+      source: "runtime",
+      turnPhase: {
+        id: "plan_drafting",
+        kind: "diagnosis",
+        title: "Drafting",
+        summary: "把证据收束为可审批 plan.md。",
+        domain: "plan_runtime",
+        status: "running",
+      },
+    },
+  ], "zh");
+
+  assert.equal(groups.length, 2);
+  assert.equal(groups[0].label, "Needs evidence");
+  assert.match(groups[0].title, /Needs evidence/);
+  assert.match(groups[0].title, /读取 orchestrator\.ts/);
+  assert.match(groups[0].summary, /PLAN_NOT_READY|orchestrator/);
+  assert.match(groups[0].recoveryHint, /草稿需补证据/);
+  assert.match(groups[0].recoveryHint, /read_evidence/);
+  assert.equal(groups[1].label, "Drafting");
+});

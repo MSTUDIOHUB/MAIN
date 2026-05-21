@@ -49,6 +49,7 @@ function loadTranspiledModuleSync(sourcePath) {
 }
 
 const {
+  buildPlanReadOnlyProgressNarration,
   buildToolProgressNarration,
   progressNarrationToText,
   summarizeToolObservation,
@@ -143,4 +144,37 @@ test("tool observation summarizes hiddenProcess evidence", () => {
 
   assert.match(summary, /ChatArea 渲染逻辑/);
   assert.match(summary, /hiddenProcess/);
+});
+
+test("plan read-only narration names concrete evidence phase instead of image-count filler", () => {
+  const progress = buildPlanReadOnlyProgressNarration({
+    calls: [
+      { name: "read_file", target: "src/store/dashboardStore.ts" },
+      { name: "read_file", target: "src/hooks/useCsvParser.ts" },
+      { name: "read_file", target: "src/hooks/useChartData.ts" },
+    ],
+    language: "zh",
+    userContext: { imageParts: 2 },
+  });
+
+  assert.equal(progress.phase, "investigating");
+  assert.match(progress.title, /CSV 到面板的数据链路/);
+  assert.match(progress.why, /CSV 解析、Store 写入和聚合计算/);
+  assert.doesNotMatch(progress.why, /用户已提供 2 张图片/);
+  assert.match(progress.action, /dashboardStore\.ts/);
+});
+
+test("plan read-only narration separates dark theme grounding", () => {
+  const progress = buildPlanReadOnlyProgressNarration({
+    calls: [
+      { name: "grep_search", target: "dark|theme|深色" },
+      { name: "read_file", target: "src/index.css" },
+    ],
+    language: "zh",
+    userContext: { imageParts: 1 },
+  });
+
+  assert.match(progress.title, /深色主题|数据与界面入口/);
+  assert.doesNotMatch(progress.action, /只读探索/);
+  assert.match(progress.why, /plan\.md/);
 });

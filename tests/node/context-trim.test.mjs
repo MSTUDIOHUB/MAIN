@@ -57,6 +57,7 @@ function loadTranspiledModuleSync(sourcePath) {
 const {
   computeContextBudgets,
   computeContextTokenBreakdown,
+  compactToolResults,
   manageContext,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/contextTrim.ts"));
 
@@ -101,6 +102,40 @@ test("manageContext can persist token savings once the proactive trigger is cros
   assert.notEqual(result.messages[2].content, messages[1].content);
   assert.equal(result.microCompactionKind, "tool_results");
   assert.equal(result.microCompactedCount, 1);
+});
+
+test("compactToolResults summarizes read_file windows with meaningful savings", () => {
+  const source = [
+    "[MAIN_TOOL_FEEDBACK_V1]{\"version\":1,\"status\":\"completed\",\"tool\":\"read_file\",\"target\":\"src/store/dashboardStore.ts\",\"summary\":\"READ_FILE_RESULT path: src/store/dashboardStore.ts\"}",
+    "READ_FILE_RESULT",
+    "path: src/store/dashboardStore.ts",
+    "truncated: true",
+    "totalLines: 392",
+    "totalChars: 12439",
+    "returnedLines: 1-180",
+    "returnedChars: 6200",
+    "nextStartLine: 181",
+    "nextRead: read_file({\"path\":\"src/store/dashboardStore.ts\",\"start_line\":181,\"max_lines\":180})",
+    "note: read_file returns a bounded content window for large or ranged reads.",
+    "---CONTENT START---",
+    "import { create } from 'zustand';",
+    "export const useDashboardStore = create((set, get) => ({",
+    "  rawOrders: [],",
+    "  setOrders: (orders) => set({ rawOrders: orders }),",
+    ...Array.from({ length: 180 }, (_, index) => `  const filler${index} = "${"x".repeat(42)}";`),
+    "  get filteredOrders() { return get().rawOrders.filter(order => order.status === 'finished'); }",
+    "  get statusDistribution() { return get().filteredOrders.length; }",
+    "}));",
+    "---CONTENT END---",
+  ].join("\n");
+
+  const [compacted] = compactToolResults([{ role: "tool", content: source }], 700);
+
+  assert.ok(String(compacted.content).length < source.length - 2500);
+  assert.match(compacted.content, /READ_FILE_SUMMARY path: src\/store\/dashboardStore\.ts/);
+  assert.match(compacted.content, /COMPACTED SIGNAL LINES/);
+  assert.match(compacted.content, /filteredOrders|setOrders/);
+  assert.match(compacted.content, /\[compact: \d+ chars omitted from read_file content\]/);
 });
 
 test("manageContext trims down to a lower hysteresis target once the trigger is crossed", () => {

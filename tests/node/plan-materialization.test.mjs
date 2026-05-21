@@ -231,6 +231,152 @@ test("materializes Qwen-style plan and strips user option markup", () => {
   assert.doesNotMatch(result.content || "", /user_options|approve_operation_once/);
 });
 
+test("repairs visible plan text that has evidence but no explicit user goal section", () => {
+  const visibleText = [
+    "# 计划草稿",
+    "",
+    "## 截图/附件观察",
+    "- 用户提供了当前界面截图；需要修复 CSV 导入后仪表盘指标没有同步展示的问题。",
+    "",
+    "## 已读证据",
+    "- `src/store/dashboardStore.ts`：负责导入数据后的状态写入。",
+    "- `src/hooks/useChartData.ts`：负责把 store 数据映射到图表。",
+    "- `src/components/Dashboard/OverviewCards.tsx`：负责显示概览指标。",
+    "",
+    "## 真实发现",
+    "- CSV 导入路径与 Dashboard 展示路径之间缺少一致的数据刷新契约。",
+    "",
+    "## 未验证假设",
+    "- 未验证：OverviewCards 是否还依赖旧的缓存字段，需要在实施时通过测试确认。",
+    "",
+    "## 影响文件",
+    "- `src/store/dashboardStore.ts`",
+    "- `src/hooks/useChartData.ts`",
+    "- `src/components/Dashboard/OverviewCards.tsx`",
+    "",
+    "## 执行步骤",
+    "1. 统一 CSV 导入后的 store 更新入口。",
+    "2. 调整图表数据 hook，确保读取最新状态。",
+    "3. 更新概览指标组件并补充回归测试。",
+    "",
+    "## 验证标准",
+    "- 运行相关 Node/Vitest 测试，手动导入 CSV 并确认 Dashboard 指标更新。",
+  ].join("\n");
+
+  const result = materializePlanArtifactFromVisibleText({
+    visibleText,
+    userGoal: "修复 CSV 导入后 Dashboard 指标没有正确更新的问题。",
+  });
+
+  assert.equal(result.ok, true);
+  assert.match(result.content || "", /## 用户目标/);
+  assert.match(result.content || "", /修复 CSV 导入后 Dashboard 指标没有正确更新/);
+});
+
+test("canonicalizes Gemma-like Proposed Plan with nonstandard section names", () => {
+  const result = materializePlanArtifactFromVisibleText({
+    visibleText: [
+      "# Proposed Plan",
+      "",
+      "## Investigation Summary",
+      "- CSV 导入入口已经定位到上传组件，Dashboard 指标更新依赖 store 数据流。",
+      "- 需要避免把推测直接写成已执行事实。",
+      "",
+      "## Approach",
+      "- 对齐上传组件到 store 的数据写入契约。",
+      "- 让 Dashboard 指标读取导入后的最新状态。",
+      "- 补一个导入后概览指标刷新的回归测试。",
+      "",
+      "## Files",
+      "- `src/components/FileUploader/DragUpload.tsx`",
+      "- `src/store/dashboardStore.ts`",
+      "- `src/components/Dashboard/OverviewCards.tsx`",
+      "",
+      "## Validation",
+      "- 运行相关 Node/Vitest 测试。",
+      "- 手动导入 CSV，确认 Dashboard 指标刷新。",
+    ].join("\n"),
+    userGoal: "修复 CSV 导入后 Dashboard 指标没有正确更新的问题。",
+    evidence: [
+      "read_file src/components/FileUploader/DragUpload.tsx; excerpt=上传组件负责读取 CSV 文件并触发解析入口",
+      "read_file src/store/dashboardStore.ts; excerpt=store 保存 dashboard 指标和导入状态",
+    ],
+    recentToolActivity: [
+      {
+        name: "read_file",
+        target: "src/components/FileUploader/DragUpload.tsx",
+        status: "succeeded",
+        detail: "发现上传组件是 CSV 导入入口",
+      },
+    ],
+    turnContext: { imageParts: 2 },
+    language: "zh",
+  });
+
+  assert.equal(result.ok, true);
+  assert.match(result.content || "", /^# 计划/);
+  assert.match(result.content || "", /## 用户目标/);
+  assert.match(result.content || "", /## 截图\/附件观察/);
+  assert.match(result.content || "", /用户提供了 2 张图片/);
+  assert.match(result.content || "", /## 已读证据/);
+  assert.match(result.content || "", /## 已确认事实/);
+  assert.match(result.content || "", /src\/components\/FileUploader\/DragUpload\.tsx/);
+});
+
+test("canonicalizes missing confirmed facts from the evidence ledger", () => {
+  const result = materializePlanArtifactFromVisibleText({
+    visibleText: [
+      "# Proposed Plan",
+      "",
+      "## Goal",
+      "- Fix the plan artifact loop when a local model writes a non-standard proposal.",
+      "",
+      "## Implementation Plan",
+      "- Normalize the visible plan into MAIN's canonical plan sections.",
+      "- Write the canonical content to `.MAIN/plans/plan.md` before prompting the model again.",
+      "",
+      "## Affected Files",
+      "- `src/lib/planMaterialization.ts`",
+      "- `src/lib/orchestrator.ts`",
+      "",
+      "## Validation",
+      "- Run focused Node tests and the production build.",
+    ].join("\n"),
+    evidence: [
+      "read_file src/lib/planMaterialization.ts; excerpt=visible markdown plans are materialized before review",
+      "read_file src/lib/orchestrator.ts; excerpt=plan_text_materialization_rejected currently triggers recovery prompt",
+    ],
+    files: ["src/lib/planMaterialization.ts", "src/lib/orchestrator.ts"],
+    language: "en",
+  });
+
+  assert.equal(result.ok, true);
+  assert.match(result.content || "", /## Confirmed Facts/);
+  assert.match(result.content || "", /Confirmed relevant evidence exists/);
+  assert.match(result.content || "", /## Read Evidence/);
+});
+
+test("rejects tool-log noise instead of canonicalizing it", () => {
+  const result = materializePlanArtifactFromVisibleText({
+    visibleText: [
+      "# Proposed Plan",
+      "",
+      "MAIN TOOL FEEDBACK V1 {\"tool\":\"read_file\",\"status\":\"ok\"}",
+      "ContextMemoryState v1: lots of tool transcript data",
+      "Repeated read-only tool call skipped because already called with identical arguments.",
+      "",
+      "<user_options>",
+      "<option>批准执行</option>",
+      "</user_options>",
+    ].join("\n"),
+    userGoal: "修复计划循环。",
+    evidence: ["read_file src/lib/orchestrator.ts; excerpt=plan recovery prompt loop"],
+  });
+
+  assert.equal(result.ok, false);
+  assert.match(result.reason || "", /tool_log_noise|not_structured|quality_gate|too_short/);
+});
+
 test("rejects low quality visible text instead of materializing a plan", () => {
   const result = materializePlanArtifactFromVisibleText({
     visibleText: "好的，我会继续处理这个问题，稍后给出计划。",

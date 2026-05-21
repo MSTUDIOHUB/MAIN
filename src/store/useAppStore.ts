@@ -980,7 +980,7 @@ export interface DiffRevertResult {
   message: string;
 }
 
-export type AssistantTextVisibility = "user_progress" | "hidden_process";
+export type AssistantTextVisibility = "user_progress" | "hidden_process" | "substantive_plan_text";
 
 export type ProgressTaskBlock = TaskBlockBase & ProgressNarration & {
   type: "progress";
@@ -992,7 +992,7 @@ export type ProgressTaskBlock = TaskBlockBase & ProgressNarration & {
 
 export type TaskBlock =
   | (TaskBlockBase & { type: "user"; content: string; images?: string[]; contextItems?: UserContextItem[] })
-  | (TaskBlockBase & { type: "tool"; toolName: string; target: string; status: string; toolStatus: "pending" | "executed" | "rejected" | "running" | "failed"; toolCallId?: string; message?: string; diff?: ToolDiffSnapshot; shellPermissionDecision?: ShellPermissionDecision; revertStatus?: DiffRevertStatus; revertMessage?: string; intentSummary?: string; why?: string; evidence?: string; observationSummary?: string })
+  | (TaskBlockBase & { type: "tool"; toolName: string; target: string; status: string; toolStatus: "pending" | "executed" | "rejected" | "running" | "failed"; toolCallId?: string; message?: string; diff?: ToolDiffSnapshot; shellPermissionDecision?: ShellPermissionDecision; revertStatus?: DiffRevertStatus; revertMessage?: string; intentSummary?: string; why?: string; evidence?: string; observationSummary?: string; qualityGateReason?: string; planRecoveryReason?: string })
   | (TaskBlockBase & { type: "agent"; content: string; options?: ReplyOption[]; streaming?: boolean; hiddenProcess?: boolean; visibility?: AssistantTextVisibility; archivedAfterChoice?: boolean; selectedOption?: string })
   | ProgressTaskBlock
   | (TaskBlockBase & { type: "thought"; content: string; isStreaming?: boolean; duration?: number })
@@ -3329,6 +3329,8 @@ export function sanitizeTaskBlocksForPersist(blocks: TaskBlock[]): TaskBlock[] {
           ...(b.why ? { why: String(b.why).slice(0, 240) } : {}),
           ...(b.evidence ? { evidence: String(b.evidence).slice(0, 240) } : {}),
           ...(b.observationSummary ? { observationSummary: String(b.observationSummary).slice(0, 240) } : {}),
+          ...(b.qualityGateReason ? { qualityGateReason: String(b.qualityGateReason).slice(0, 180) } : {}),
+          ...(b.planRecoveryReason ? { planRecoveryReason: String(b.planRecoveryReason).slice(0, 180) } : {}),
           ...(b.shellPermissionDecision ? { shellPermissionDecision: b.shellPermissionDecision } : {}),
           ...(b.diff
             ? {
@@ -8064,16 +8066,28 @@ export const useAppStore = create<AppState>()(
         return currentTurnRuntimePhase;
       };
 
+      const getPlanRuntimePhaseForTool = (status: "running" | "done" | "failed") => {
+        const normalized = normalizeTurnRuntimePhase(currentTurnRuntimePhase, phaseLanguage);
+        if (
+          normalized?.domain === "plan_runtime" &&
+          sessionGet().config.workflowMode === "plan" &&
+          !sessionGet().isPlanApproved
+        ) {
+          return setCurrentTurnRuntimePhase(withTurnRuntimePhaseStatus(normalized, status, phaseLanguage));
+        }
+        return null;
+      };
+
       const phaseForTool = (
         toolName: string,
         target: string,
         status: "running" | "done" | "failed" = "running",
-      ) => setCurrentTurnRuntimePhase(deriveTurnRuntimePhaseForTool({
-        toolName,
-        target,
-        language: phaseLanguage,
-        status,
-      }));
+      ) => getPlanRuntimePhaseForTool(status) || setCurrentTurnRuntimePhase(deriveTurnRuntimePhaseForTool({
+          toolName,
+          target,
+          language: phaseLanguage,
+          status,
+        }));
 
       const phaseForProcessText = (text: string) => setCurrentTurnRuntimePhase(
         deriveTurnRuntimePhaseForText(text, phaseLanguage, currentTurnRuntimePhase),
@@ -8103,6 +8117,65 @@ export const useAppStore = create<AppState>()(
               : turn
           ),
         }));
+      };
+
+      const appendPlanRuntimePhaseProgress = (phase?: TurnRuntimePhase) => {
+        const normalized = normalizeTurnRuntimePhase(phase, phaseLanguage);
+        if (!normalized || normalized.domain !== "plan_runtime") return;
+        const progressPhase =
+          normalized.kind === "context" ? "investigating" :
+          normalized.kind === "validation" ? "verifying" :
+          normalized.kind === "implementation" ? "editing" :
+          normalized.kind === "diagnosis" ? "summarizing" :
+          "understanding";
+        const status = normalized.status === "failed"
+          ? "failed"
+          : normalized.status === "done"
+          ? "done"
+          : "running";
+        const progress = normalizeProgressNarration({
+          phase: progressPhase,
+          title: normalized.title,
+          why: normalized.summary || "",
+          action: "",
+          evidence: "",
+          next: "",
+          targets: [],
+          status,
+          source: "runtime",
+          hypothesisStatus: status === "done" ? "confirmed" : status === "failed" ? "blocked" : "unverified",
+        });
+        const latest = sessionGet().taskFlow
+          .slice()
+          .reverse()
+          .find((block) =>
+            block.turnId === uiDisplayTurnId &&
+            block.type === "progress" &&
+            block.turnPhase?.domain === "plan_runtime" &&
+            block.turnPhase?.id === normalized.id &&
+            !block.toolName
+          ) as ProgressTaskBlock | undefined;
+        if (latest) {
+          sessionSet((s) => ({
+            taskFlow: s.taskFlow.map((block) =>
+              block.id === latest.id && block.type === "progress"
+                ? {
+                    ...block,
+                    turnPhase: normalized,
+                    ...progress,
+                  }
+                : block
+            ),
+          }));
+          return;
+        }
+        appendTurnBlock({
+          id: nextId(),
+          turnId,
+          turnPhase: normalized,
+          type: "progress",
+          ...progress,
+        });
       };
 
       // ── Throttled streaming update ────────────────────────────────────
@@ -8882,12 +8955,13 @@ export const useAppStore = create<AppState>()(
           const hasReplyOptions = replyOptions.length > 0;
           const hasToolCallsWithoutOptions = !!meta?.hasToolCalls && !hasReplyOptions;
           const isHiddenProcessText = !hasReplyOptions && metaVisibility === "hidden_process";
+          const isSubstantivePlanText = !hasReplyOptions && metaVisibility === "substantive_plan_text";
           const isUserProgressText =
             !hasReplyOptions &&
             (
               metaVisibility === "user_progress" ||
               !!meta?.progress ||
-              (hasToolCallsWithoutOptions && metaVisibility !== "hidden_process")
+              (hasToolCallsWithoutOptions && !metaVisibility)
             );
           const processPhase = (isHiddenProcessText || isUserProgressText)
             ? (() => {
@@ -9065,6 +9139,7 @@ export const useAppStore = create<AppState>()(
               content: displayText,
               ...(replyOptions.length > 0 ? { options: replyOptions } : {}),
               ...(isHiddenProcessText ? { hiddenProcess: true, visibility: "hidden_process" as const } : {}),
+              ...(isSubstantivePlanText ? { visibility: "substantive_plan_text" as const } : {}),
               ...(isUserProgressText ? { visibility: "user_progress" as const } : {}),
               streaming: false,
             });
@@ -9086,7 +9161,9 @@ export const useAppStore = create<AppState>()(
                     content: displayText,
                     ...(replyOptions.length > 0 ? { options: replyOptions } : { options: undefined }),
                     ...(isHiddenProcessText ? { hiddenProcess: true, visibility: "hidden_process" as const } : { hiddenProcess: undefined }),
-                    ...(isUserProgressText ? { visibility: "user_progress" as const } : { visibility: undefined }),
+                    ...(isSubstantivePlanText
+                      ? { visibility: "substantive_plan_text" as const }
+                      : isUserProgressText ? { visibility: "user_progress" as const } : { visibility: undefined }),
                     streaming: false,
                   }
                 : t
@@ -9445,6 +9522,8 @@ export const useAppStore = create<AppState>()(
               why: (updated[idx] as Extract<TaskBlock, { type: "tool" }>).why || failedProgress.why,
               evidence: failedProgress.evidence,
               observationSummary,
+              ...(meta?.qualityGateReason ? { qualityGateReason: String(meta.qualityGateReason) } : {}),
+              ...(meta?.planRecoveryReason ? { planRecoveryReason: String(meta.planRecoveryReason) } : {}),
               message: error,
             } as TaskBlock;
             const nextTaskFlow = updateRelatedProgressBlocks({
@@ -10102,7 +10181,8 @@ export const useAppStore = create<AppState>()(
         },
 
         onTurnRuntimePhaseChanged: (phase) => {
-          setCurrentTurnRuntimePhase(normalizeTurnRuntimePhase(phase, phaseLanguage));
+          const normalized = setCurrentTurnRuntimePhase(normalizeTurnRuntimePhase(phase, phaseLanguage));
+          appendPlanRuntimePhaseProgress(normalized);
         },
 
         onTurnEvent: (event) => {
@@ -10177,7 +10257,7 @@ export const useAppStore = create<AppState>()(
           const label = reason === "reactive"
             ? `上下文溢出，已压缩背景，约 ${before.toLocaleString()} → ${after.toLocaleString()} tokens（释放 ${saved.toLocaleString()}）`
             : droppedMessageCount === 0 && microCompactedCount > 0
-              ? `长工具结果已压缩，约 ${before.toLocaleString()} → ${after.toLocaleString()} tokens（释放 ${saved.toLocaleString()}，保留任务记忆${topSourceSuffix}）`
+              ? `长工具结果已摘要化，约 ${before.toLocaleString()} → ${after.toLocaleString()} tokens（释放 ${saved.toLocaleString()}，保留路径、窗口和证据片段${topSourceSuffix}）`
               : `历史上下文已压缩，约 ${before.toLocaleString()} → ${after.toLocaleString()} tokens（释放 ${saved.toLocaleString()}，保留任务记忆）`;
           logStoreEvent("context_compressed", {
             turnId,

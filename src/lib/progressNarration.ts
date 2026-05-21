@@ -157,6 +157,19 @@ export function deriveToolTargetRole(input: {
   if (/turn-process-archive|turnprocessarchive/i.test(target)) return language === "zh" ? "过程归档时间线" : "process archive timeline";
   if (/progress/i.test(target)) return language === "zh" ? "进度展示逻辑" : "progress presentation logic";
   if (/hiddenprocess/i.test(target)) return language === "zh" ? "hiddenProcess 可见性链路" : "hiddenProcess visibility path";
+  if (/usecsvparser/i.test(target)) return language === "zh" ? "CSV 解析逻辑" : "CSV parsing path";
+  if (/dashboardstore/i.test(target)) return language === "zh" ? "Dashboard Store 聚合逻辑" : "dashboard store aggregation";
+  if (/usechartdata/i.test(target)) return language === "zh" ? "图表数据 Hook" : "chart data hook";
+  if (/types[\\/]order/i.test(target)) return language === "zh" ? "订单字段模型" : "order field model";
+  if (/fileuploader|dragupload/i.test(target)) return language === "zh" ? "CSV 导入入口" : "CSV upload entry";
+  if (/coursecleaner/i.test(target)) return language === "zh" ? "课程名称清洗逻辑" : "course-name cleanup logic";
+  if (/dateutils/i.test(target)) return language === "zh" ? "日期归一化逻辑" : "date normalization logic";
+  if (/overviewcards/i.test(target)) return language === "zh" ? "概览指标组件" : "overview metrics component";
+  if (/coursebarchart/i.test(target)) return language === "zh" ? "课程销售排行图表" : "course ranking chart";
+  if (/trendlinechart/i.test(target)) return language === "zh" ? "销售趋势图表" : "sales trend chart";
+  if (/monthlycomparechart/i.test(target)) return language === "zh" ? "月度环比图表" : "monthly comparison chart";
+  if (/statuspiechart/i.test(target)) return language === "zh" ? "订单状态图表" : "order status chart";
+  if (/index\.css|theme|dark|app\.tsx/i.test(target)) return language === "zh" ? "主题与布局入口" : "theme and layout entry";
   if (/tests?\//i.test(target) || /\.test\./i.test(target) || /\.spec\./i.test(target)) return language === "zh" ? `${base || "测试"} 回归测试` : `${base || "test"} regression test`;
   if (lowerTarget === "." || lowerTarget === "./") return language === "zh" ? "项目根目录" : "project root";
 
@@ -444,6 +457,114 @@ export function buildToolCallsProgressNarration(input: {
       ? `正在安排：${presentations.join("；")}${extra > 0 ? `，另有 ${extra} 个步骤` : ""}。`
       : `Preparing: ${presentations.join("; ")}${extra > 0 ? `, plus ${extra} more` : ""}.`,
     targets,
+  });
+}
+
+function inferPlanGroundingDomain(calls: Array<{ name: string; target?: string }>): "scope" | "data" | "chart" | "theme" | "mixed" | "source" {
+  const joined = calls.map((call) => `${call.name} ${call.target || ""}`).join(" ").toLowerCase();
+  const hasData = /csv|import|upload|usecsvparser|dashboardstore|order|coursecleaner|dateutils|raworders|filteredorders|paidamount|completedtime/.test(joined);
+  const hasChart = /overviewcards|coursebarchart|trendlinechart|monthlycomparechart|statuspiechart|timeheatmap|heatmap|echarts|buyeranalysis|components\/dashboard/.test(joined);
+  const hasTheme = /theme|dark|深色|index\.css|app\.tsx|configprovider|antd|color-|background/.test(joined);
+  const hasBroadScope = calls.some((call) => ["get_project_skeleton", "list_directory", "glob_search", "grep_search"].includes(call.name));
+  const domains = [hasData, hasChart, hasTheme].filter(Boolean).length;
+  if (domains > 1) return hasBroadScope ? "scope" : "mixed";
+  if (hasData) return "data";
+  if (hasChart) return "chart";
+  if (hasTheme) return "theme";
+  if (hasBroadScope) return "scope";
+  return "source";
+}
+
+function planGroundingTitle(domain: ReturnType<typeof inferPlanGroundingDomain>, language: ToolPresentationLanguage): string {
+  if (language === "en") {
+    if (domain === "data") return "Validate CSV to dashboard data flow";
+    if (domain === "chart") return "Validate chart rendering path";
+    if (domain === "theme") return "Validate dark-theme path";
+    if (domain === "mixed") return "Validate intersecting evidence";
+    if (domain === "scope") return "Locate data and UI entry points";
+    return "Read targeted planning evidence";
+  }
+  if (domain === "data") return "验证 CSV 到面板的数据链路";
+  if (domain === "chart") return "验证图表渲染链路";
+  if (domain === "theme") return "验证深色主题链路";
+  if (domain === "mixed") return "验证数据、图表与主题交界";
+  if (domain === "scope") return "定位数据与界面入口";
+  return "读取计划所需证据";
+}
+
+function planGroundingObject(domain: ReturnType<typeof inferPlanGroundingDomain>, language: ToolPresentationLanguage): string {
+  if (language === "en") {
+    if (domain === "data") return "the CSV parsing, store, and aggregation path";
+    if (domain === "chart") return "the chart components and data props";
+    if (domain === "theme") return "the theme variables and component styling path";
+    if (domain === "mixed") return "the boundary between data, chart rendering, and theme styling";
+    if (domain === "scope") return "the concrete files that match the visible symptoms";
+    return "the targeted implementation evidence";
+  }
+  if (domain === "data") return "CSV 解析、Store 写入和聚合计算";
+  if (domain === "chart") return "图表组件和数据入参";
+  if (domain === "theme") return "主题变量与组件样式覆盖";
+  if (domain === "mixed") return "数据、图表渲染和主题样式的交界处";
+  if (domain === "scope") return "与可见现象对应的具体入口文件";
+  return "当前实现证据";
+}
+
+export function buildPlanReadOnlyProgressNarration(input: {
+  calls: Array<{ name: string; target?: string }>;
+  language?: ToolPresentationLanguage;
+  userGoal?: string;
+  status?: ProgressNarrationStatus;
+  source?: ProgressNarrationSource;
+  userContext?: {
+    imageParts?: number;
+    mentionedFilePaths?: string[];
+    attachedFilePaths?: string[];
+  };
+}): ProgressNarration | null {
+  const calls = input.calls.filter((call) => call?.name).slice(0, 3);
+  if (calls.length === 0) return null;
+  const language = normalizeLanguage(input.language);
+  const domain = inferPlanGroundingDomain(calls);
+  const presentations = calls.map((call) =>
+    formatToolPresentation({ toolName: call.name, target: call.target, language }).summary
+  );
+  const extra = Math.max(0, input.calls.length - calls.length);
+  const targets = calls
+    .map((call) => compactToolPresentationTarget(call.target || "", call.name, language))
+    .filter(Boolean);
+  const imageParts = Math.max(0, Number(input.userContext?.imageParts || 0));
+  const mentioned = input.userContext?.mentionedFilePaths?.length || 0;
+  const attached = input.userContext?.attachedFilePaths?.length || 0;
+  const groundedObject = planGroundingObject(domain, language);
+  const title = planGroundingTitle(domain, language);
+  const status = input.status || "running";
+  const hasProvidedContext = imageParts > 0 || mentioned > 0 || attached > 0;
+  const contextWhy = language === "en"
+    ? hasProvidedContext
+      ? `Use the provided visual/file evidence as the starting point, then verify ${groundedObject} before drafting plan.md.`
+      : `Verify ${groundedObject} before drafting plan.md, so the plan is based on code evidence rather than guesses.`
+    : hasProvidedContext
+      ? `先以用户给出的图片/文件证据为起点，再核对${groundedObject}，避免 plan.md 变成猜测。`
+      : `先核对${groundedObject}，让 plan.md 基于代码证据而不是猜测。`;
+  const action = language === "en"
+    ? `Checking: ${presentations.join("; ")}${extra > 0 ? `, plus ${extra} more` : ""}.`
+    : `正在核对：${presentations.join("；")}${extra > 0 ? `，另有 ${extra} 个动作` : ""}。`;
+  return normalizeProgressNarration({
+    phase: domain === "scope" ? "understanding" : "investigating",
+    title,
+    why: contextWhy,
+    action,
+    evidence: "",
+    next: "",
+    targets,
+    status,
+    source: input.source || "runtime",
+    observedFact: hasProvidedContext
+      ? language === "en"
+        ? "Provided screenshots/files are treated as primary evidence for this planning turn."
+        : "本轮图片/文件上下文已作为计划的一等证据。"
+      : "",
+    hypothesisStatus: status === "done" ? "confirmed" : "unverified",
   });
 }
 

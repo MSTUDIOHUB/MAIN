@@ -1,5 +1,7 @@
 export interface ToolLifecycleMeta {
   toolCallId?: string | null;
+  qualityGateReason?: string | null;
+  planRecoveryReason?: string | null;
 }
 
 export interface ToolLifecycleBlock {

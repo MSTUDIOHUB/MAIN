@@ -596,10 +596,19 @@ function buildMicroCompactSummary(before: TrimMessage[], after: TrimMessage[], m
     if (typeof original.content !== "string" || typeof compacted.content !== "string") continue;
     if (original.content === compacted.content) continue;
 
-    const omittedMatch = compacted.content.match(/\.\.\.\[compact: (\d+) chars omitted\]/);
+    const omittedMatch = compacted.content.match(/\.\.\.\[compact: (\d+) chars omitted[^\]]*\]/);
     const omittedChars = omittedMatch?.[1] ?? "部分";
+    const omittedNumber = omittedMatch ? Number(omittedMatch[1]) : 0;
+    const savedChars = original.content.length - compacted.content.length;
+    if (omittedNumber > 0 && savedChars > 0 && omittedNumber < 256 && savedChars < original.content.length * 0.05) {
+      continue;
+    }
     if (original.role === "tool") {
-      summaries.push(`Tool result compacted: original ${original.content.length.toLocaleString()} chars, omitted ${omittedChars} chars.`);
+      const readPath = compacted.content.match(/^path:\s*(.+)$/m)?.[1]
+        || compacted.content.match(/^READ_FILE_SUMMARY\s+path:\s*(.+)$/m)?.[1]
+        || "";
+      const targetSuffix = readPath ? ` (${readPath.trim()})` : "";
+      summaries.push(`Tool result compacted${targetSuffix}: original ${original.content.length.toLocaleString()} chars, omitted ${omittedChars} chars.`);
     } else if (original.role === "assistant") {
       summaries.push(`Assistant reply compacted: original ${original.content.length.toLocaleString()} chars, omitted ${omittedChars} chars.`);
     }
@@ -815,10 +824,92 @@ export function trimMessagesToContextDetailed(
   return { messages: result, droppedMessages, removedCount, markerSummary, displaySummary };
 }
 
+function compactOneLine(text: string, maxChars = 180): string {
+  const normalized = String(text || "").replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxChars) return normalized;
+  return `${normalized.slice(0, maxChars - 3).trim()}...`;
+}
+
+function collectReadFileSignalLines(body: string, maxChars: number): string {
+  const signalRe = /\b(?:export|function|const|let|class|interface|type|return|if|for|while|useEffect|useMemo|rawOrders|filteredOrders|setOrders|load|csv|order|course|revenue|status|theme|dark|chart|echarts|paidAmount|completedTime|localStorage|ConfigProvider)\b/i;
+  const lines = body.split(/\r?\n/);
+  const picked: string[] = [];
+  let chars = 0;
+  for (let index = 0; index < lines.length; index += 1) {
+    const rawLine = lines[index] || "";
+    if (!signalRe.test(rawLine)) continue;
+    const line = `L${index + 1}: ${compactOneLine(rawLine, 180)}`;
+    if (picked.includes(line)) continue;
+    const nextChars = chars + line.length + 1;
+    if (nextChars > maxChars && picked.length > 0) break;
+    picked.push(line);
+    chars = nextChars;
+    if (picked.length >= 14) break;
+  }
+  return picked.join("\n");
+}
+
+function takeHead(text: string, maxChars: number): string {
+  const normalized = text.trim();
+  if (normalized.length <= maxChars) return normalized;
+  return normalized.slice(0, maxChars).trimEnd();
+}
+
+function takeTail(text: string, maxChars: number): string {
+  const normalized = text.trim();
+  if (normalized.length <= maxChars) return normalized;
+  return normalized.slice(-maxChars).trimStart();
+}
+
+function compactReadFileToolResultContent(content: string, maxToolResultTokens: number): string | null {
+  if (!/\bREAD_FILE_RESULT\b/.test(content) || !/---CONTENT START---/.test(content)) return null;
+
+  const startMarker = "---CONTENT START---";
+  const endMarker = "---CONTENT END---";
+  const startIndex = content.indexOf(startMarker);
+  if (startIndex < 0) return null;
+  const bodyStart = startIndex + startMarker.length;
+  const endIndex = content.indexOf(endMarker, bodyStart);
+  const beforeContent = content.slice(0, startIndex).trimEnd();
+  const body = (endIndex >= 0 ? content.slice(bodyStart, endIndex) : content.slice(bodyStart)).trim();
+  if (!body) return null;
+
+  const maxChars = Math.max(900, Math.floor(maxToolResultTokens * 2.5));
+  const excerptBudget = Math.max(700, Math.min(2200, Math.floor(maxChars * 0.48)));
+  const headBudget = Math.max(260, Math.floor(excerptBudget * 0.36));
+  const signalBudget = Math.max(260, Math.floor(excerptBudget * 0.34));
+  const tailBudget = Math.max(180, excerptBudget - headBudget - signalBudget);
+  const path = beforeContent.match(/^path:\s*(.+)$/m)?.[1]?.trim() || "unknown";
+  const metadataLines = beforeContent
+    .split(/\r?\n/)
+    .filter((line) =>
+      /^(?:\[MAIN_TOOL_FEEDBACK_V1\]|READ_FILE_RESULT|path:|truncated:|totalLines:|totalChars:|returnedLines:|returnedChars:|nextStartLine:|nextRead:|note:)/.test(line)
+    );
+  const metadata = metadataLines.join("\n") || beforeContent.slice(0, 900);
+  const head = takeHead(body, headBudget);
+  const signals = collectReadFileSignalLines(body, signalBudget);
+  const tail = takeTail(body, tailBudget);
+  const sections = [
+    metadata,
+    `READ_FILE_SUMMARY path: ${path}`,
+    "---COMPACTED CONTENT HEAD---",
+    head,
+    signals ? "---COMPACTED SIGNAL LINES---" : "",
+    signals,
+    tail && tail !== head ? "---COMPACTED CONTENT TAIL---" : "",
+    tail && tail !== head ? tail : "",
+  ].filter(Boolean);
+  let compacted = sections.join("\n");
+  const omittedChars = Math.max(0, content.length - compacted.length);
+  compacted += `\n\n...[compact: ${omittedChars} chars omitted from read_file content]`;
+  if (compacted.length >= content.length - 128) return null;
+  return compacted;
+}
+
 /**
  * Compact messages by summarizing tool results that are excessively long.
- * From claude-code-haha's "microcompact" pattern: truncate individual
- * tool results that exceed a per-result token budget.
+ * Read-file results keep structured metadata and evidence excerpts; other
+ * tool results fall back to bounded truncation.
  *
  * This is applied BEFORE trimMessagesToContext to reduce the total size
  * of messages before they're sent to the model.
@@ -833,6 +924,14 @@ export function compactToolResults(
 
     const tokens = estimateTokens(msg.content);
     if (tokens <= maxToolResultTokens) return msg;
+
+    const compactedReadFile = compactReadFileToolResultContent(msg.content, maxToolResultTokens);
+    if (compactedReadFile) {
+      return {
+        ...msg,
+        content: compactedReadFile,
+      };
+    }
 
     // Truncate the content
     const maxChars = maxToolResultTokens * 2.5; // reverse of estimateTokens

@@ -510,6 +510,89 @@ function classifyBlockActivityKind(block: any): ActivityCellKind {
   return "message";
 }
 
+type PlanRuntimeArchivePhase =
+  | "grounding"
+  | "synthesis"
+  | "drafting"
+  | "needs_evidence"
+  | "needs_rewrite"
+  | "review_ready"
+  | "blocked";
+
+const PLAN_RUNTIME_ARCHIVE_PHASES = new Set<string>([
+  "grounding",
+  "synthesis",
+  "drafting",
+  "needs_evidence",
+  "needs_rewrite",
+  "review_ready",
+  "blocked",
+]);
+
+function getPlanRuntimeArchivePhase(block: any): PlanRuntimeArchivePhase | "" {
+  const phase = block?.turnPhase;
+  if (!phase || phase.domain !== "plan_runtime") return "";
+  const id = String(phase.id || "").replace(/^plan_/, "");
+  return PLAN_RUNTIME_ARCHIVE_PHASES.has(id) ? id as PlanRuntimeArchivePhase : "";
+}
+
+function getFirstPlanRuntimeArchivePhase(items: any[]): PlanRuntimeArchivePhase | "" {
+  for (const item of items) {
+    const phase = getPlanRuntimeArchivePhase(item);
+    if (phase) return phase;
+  }
+  return "";
+}
+
+function planRuntimeArchiveGroupLabel(phase: PlanRuntimeArchivePhase, language: ToolPresentationLanguage): string {
+  if (language === "en") {
+    if (phase === "needs_evidence") return "Needs evidence";
+    if (phase === "review_ready") return "Review ready";
+    if (phase === "blocked") return "Blocked";
+    if (phase === "drafting" || phase === "needs_rewrite") return "Drafting";
+    return "Exploring";
+  }
+  if (phase === "needs_evidence") return "Needs evidence";
+  if (phase === "review_ready") return "Review ready";
+  if (phase === "blocked") return "Blocked";
+  if (phase === "drafting" || phase === "needs_rewrite") return "Drafting";
+  return "Exploring";
+}
+
+function planRuntimeArchiveKind(phase: PlanRuntimeArchivePhase): ActivityCellKind {
+  if (phase === "blocked") return "blocked";
+  if (phase === "review_ready" || phase === "drafting" || phase === "needs_rewrite") return "plan";
+  return "exploring";
+}
+
+function extractQualityGateReason(items: any[], language: ToolPresentationLanguage): string {
+  const rawReason = [...items].reverse().map((item) =>
+    String(item?.qualityGateReason || item?.planRecoveryReason || "")
+  ).find(Boolean) || "";
+  if (rawReason) {
+    return language === "zh" ? `质量门禁：${rawReason}` : `Quality gate: ${rawReason}`;
+  }
+  const systemText = [...items].reverse()
+    .filter((item) => item?.type === "system" && item?.variant === "plan_quality_gate")
+    .map((item) => firstMeaningfulLine(item.content))
+    .find(Boolean) || "";
+  return compactLine(systemText, 220);
+}
+
+function planRuntimeRecoveryHint(phase: PlanRuntimeArchivePhase, reason: string, language: ToolPresentationLanguage): string {
+  if (!reason) return "";
+  if (language === "en") {
+    if (phase === "needs_evidence") return `Draft needs evidence: ${reason}`;
+    if (phase === "needs_rewrite") return `Draft needs rewrite: ${reason}`;
+    if (phase === "blocked") return `Blocked: ${reason}`;
+    return reason;
+  }
+  if (phase === "needs_evidence") return `草稿需补证据：${reason}`;
+  if (phase === "needs_rewrite") return `草稿需补用户目标/结构：${reason}`;
+  if (phase === "blocked") return `已阻塞：${reason}`;
+  return reason;
+}
+
 function addActivityMetricsFromBlock(metrics: ActivityMetrics, block: any): void {
   if (!isToolBlock(block)) return;
   const toolName = String(block.toolName || "");
@@ -680,6 +763,7 @@ function buildActivityCellFromItems(
   }, "done");
   const targets = uniqueTargets(items, language);
   const latestEvidence = compactLine([...items].reverse().map(getBlockResultLine).find(Boolean) || "", 180);
+  const planRuntimePhase = getFirstPlanRuntimeArchivePhase(items);
   const progressItem = [...items].reverse().find(isProgressBlock);
   const observedFact = compactLine(
     String(progressItem?.observedFact || progressItem?.evidence || latestEvidence || ""),
@@ -714,6 +798,46 @@ function buildActivityCellFromItems(
     targets,
   };
   const summary = makeActivitySummary(provisional, language);
+  if (planRuntimePhase) {
+    const label = planRuntimeArchiveGroupLabel(planRuntimePhase, language);
+    const planKind = planRuntimeArchiveKind(planRuntimePhase);
+    const phaseSummary = compactLine(
+      items.map((item) => String(item?.turnPhase?.summary || "")).find(Boolean) ||
+      progressItem?.why ||
+      summary,
+      180,
+    );
+    const actionSummary = makeActivityActionSummary(items, language);
+    const qualityReason = extractQualityGateReason(items, language);
+    const evidence = latestEvidence ? compactLine(
+      `${summary}${summary ? " · " : ""}${language === "zh" ? "结果：" : "Result: "}${latestEvidence}`,
+      240,
+    ) : summary;
+    const combinedSummary = compactLine(
+      [phaseSummary, evidence]
+        .filter(Boolean)
+        .filter((value, index, array) => array.indexOf(value) === index)
+        .join(language === "zh" ? " · " : " · "),
+      260,
+    );
+    return {
+      kind: planKind,
+      status,
+      purposeKey: `plan_runtime:${label.toLowerCase().replace(/\s+/g, "_")}`,
+      label,
+      title: actionSummary ? compactLine(`${label}: ${actionSummary}`, 150) : label,
+      summary: combinedSummary,
+      targets,
+      metrics,
+      items,
+      latestEvidence,
+      recoveryHint: planRuntimeRecoveryHint(planRuntimePhase, qualityReason, language),
+      evidenceExcerpt: compactLine(String(progressItem?.evidenceExcerpt || latestEvidence || ""), 180),
+      observedFact,
+      hypothesisStatus,
+      sourceToolCallIds,
+    };
+  }
   return {
     kind: firstKind,
     status,
@@ -738,6 +862,7 @@ function mergeActivityCells(left: ActivityCell, right: ActivityCell, language: T
   const metrics = addActivityMetrics(left.metrics, right.metrics);
   const targets = uniqueTargets(items, language);
   const status = mergeActivityStatus(left.status, right.status);
+  const isPlanRuntime = left.purposeKey.startsWith("plan_runtime:");
   const combinedEvidence = [left.latestEvidence, right.latestEvidence]
     .filter(Boolean)
     .filter((value, index, array) => array.indexOf(value) === index)
@@ -754,11 +879,22 @@ function mergeActivityCells(left: ActivityCell, right: ActivityCell, language: T
     targets,
     metrics,
     items,
-    title: makeActivityTitle({ ...base, items }, language),
+    title: isPlanRuntime
+      ? (() => {
+          const actionSummary = makeActivityActionSummary(items, language);
+          return actionSummary ? compactLine(`${left.label}: ${actionSummary}`, 150) : left.label;
+        })()
+      : makeActivityTitle({ ...base, items }, language),
     summary: (() => {
       const mergedSummary = makeActivitySummary(base, language);
       const evidence = compactLine(combinedEvidence, 180);
-      return evidence ? compactLine(`${mergedSummary}${mergedSummary ? " · " : ""}${language === "zh" ? "结果：" : "Result: "}${evidence}`, 240) : mergedSummary;
+      const prefix = isPlanRuntime
+        ? [left.summary, right.summary]
+            .filter(Boolean)
+            .filter((value, index, array) => array.indexOf(value) === index)
+            .join(language === "zh" ? " · " : " · ")
+        : mergedSummary;
+      return evidence ? compactLine(`${prefix}${prefix ? " · " : ""}${language === "zh" ? "结果：" : "Result: "}${evidence}`, 260) : prefix;
     })(),
     latestEvidence: compactLine(combinedEvidence, 180) || right.latestEvidence || left.latestEvidence,
     recoveryHint: right.recoveryHint || left.recoveryHint,
@@ -786,6 +922,9 @@ function canMergeActivityCells(current: ActivityCell | null, next: ActivityCell)
   if (current.kind === "thinking" || next.kind === "thinking") return false;
   if (current.kind === "message" || next.kind === "message") return false;
   if (current.kind === "blocked" || next.kind === "blocked") return false;
+  if (current.purposeKey.startsWith("plan_runtime:") || next.purposeKey.startsWith("plan_runtime:")) {
+    return current.purposeKey === next.purposeKey;
+  }
   if (current.kind === "exploring" && next.kind === "exploring") return true;
   if (current.status === "failed" || current.status === "rejected") return false;
   return current.purposeKey === next.purposeKey && current.kind === next.kind;
