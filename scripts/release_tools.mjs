@@ -379,6 +379,7 @@ export async function buildUpdaterManifest({
   notes,
   appName = APP_NAME,
   existingManifestPath = "",
+  preserveExistingNotes = false,
   generatedAt = new Date(),
 }) {
   if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(updateRepo || "")) {
@@ -386,6 +387,7 @@ export async function buildUpdaterManifest({
   }
 
   const existingManifest = await readExistingManifest(existingManifestPath, version);
+  const manifestNotes = preserveExistingNotes && existingManifest?.notes ? existingManifest.notes : notes;
   const platforms = {
     ...(existingManifest?.platforms || {}),
   };
@@ -422,7 +424,7 @@ export async function buildUpdaterManifest({
   return {
     manifest: {
       version,
-      notes,
+      notes: manifestNotes,
       pub_date: generatedAt.toISOString().replace(/\.\d{3}Z$/, "Z"),
       platforms,
     },
@@ -438,6 +440,7 @@ export async function writeUpdaterManifest({
   outputPath = path.join(assetsDir, "latest.json"),
   appName = APP_NAME,
   existingManifestPath = "",
+  preserveExistingNotes = false,
   generatedAt,
 }) {
   const notes = await fs.readFile(notesPath, "utf8");
@@ -448,6 +451,7 @@ export async function writeUpdaterManifest({
     notes,
     appName,
     existingManifestPath,
+    preserveExistingNotes,
     generatedAt,
   });
 

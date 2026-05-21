@@ -21,7 +21,7 @@ npm run build:windows
 - `npm run icon:app` 会使用 `public/LogoM.png` 重新生成应用图标。
 - `npm run build:mac:unsigned` 用于本地验证未签名的 macOS 包。
 - `npm run build:mac` 用于正式签名的 macOS 包。
-- `npm run build:windows` 需要在 Windows 机器或 Windows CI 上执行。
+- `npm run build:windows` 需要在 Windows 机器或 Windows CI 上执行，并显式生成 Windows 11 x64 产物。
 
 默认产物位于 `src-tauri/target/release/bundle/`。
 
@@ -34,11 +34,11 @@ npm run build:windows
 Actions 额度用完时可以改走本地发布：
 
 ```bash
-npm run release:local:mac -- <version>
+npm run release:mac:upload -- <version>
 ```
 
-Windows 发布在 Windows VM 里执行：
+Windows 发布在 Windows VM 里执行；即使 VM 是 Windows ARM，产物也会按 `x86_64-pc-windows-msvc` 生成给 Windows 11 x64 使用：
 
 ```powershell
-npm run release:local:windows -- <version>
+npm run release:windows:x64 -- <version>
 ```

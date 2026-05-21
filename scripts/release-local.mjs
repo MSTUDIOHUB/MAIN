@@ -9,11 +9,15 @@ import { APP_NAME, parseAppVersion, syncReleaseVersions, writeUpdaterManifest } 
 
 const DEFAULT_RELEASE_REPO = "MSTUDIOHUB/MAIN-Releases";
 const DEFAULT_UPDATE_REPO = "MSTUDIOHUB/MAIN-UpdateFeed";
+const WINDOWS_X64_TARGET = "x86_64-pc-windows-msvc";
+const RELEASE_NOTES_FILE_NAME = "release_notes.md";
 
 function printHelp() {
   console.log(`Usage:
   npm run release:local:mac -- <version> [options]
   npm run release:local:windows -- <version> [options]
+  npm run release:mac:upload -- <version> [options]
+  npm run release:windows:x64 -- <version> [options]
   node scripts/release-local.mjs mac <version> [options]
   node scripts/release-local.mjs windows <version> [options]
 
@@ -28,11 +32,18 @@ Options:
   --signing-password-file <path>
                               Read TAURI_SIGNING_PRIVATE_KEY_PASSWORD from a local file.
   --no-merge-existing-latest  Do not merge an existing updater latest.json before upload.
+  --update-existing-notes     Update existing GitHub Release notes even for Windows uploads.
+  --keep-existing-notes       Keep existing GitHub Release notes and only upload assets.
   -h, --help                  Show this help message.
 
 Environment:
   TAURI_SIGNING_PRIVATE_KEY or TAURI_SIGNING_PRIVATE_KEY_PATH is required.
   TAURI_SIGNING_PRIVATE_KEY_PASSWORD is only required when the key has a password.
+
+Windows:
+  Windows release builds always target ${WINDOWS_X64_TARGET}, so running inside a Windows
+  ARM VM still produces packages for Windows 11 x64 users.
+  Install Visual Studio Build Tools with the C++ desktop and MSVC x64 toolchain in the VM.
 `);
 }
 
@@ -58,6 +69,7 @@ function parseArgs(argv) {
     mergeExistingLatest: true,
     signingKeyFile: "",
     signingPasswordFile: "",
+    releaseNotesMode: "auto",
     help: false,
   };
 
@@ -120,6 +132,16 @@ function parseArgs(argv) {
 
     if (arg === "--no-merge-existing-latest") {
       options.mergeExistingLatest = false;
+      continue;
+    }
+
+    if (arg === "--update-existing-notes") {
+      options.releaseNotesMode = "update";
+      continue;
+    }
+
+    if (arg === "--keep-existing-notes") {
+      options.releaseNotesMode = "keep";
       continue;
     }
 
@@ -537,6 +559,10 @@ function compressArchive(sourcePath, destinationPath, rootDir) {
   );
 }
 
+function windowsReleaseDir(rootDir) {
+  return path.join(rootDir, "src-tauri", "target", WINDOWS_X64_TARGET, "release");
+}
+
 async function listFilesRecursive(directoryPath) {
   const entries = await fs.readdir(directoryPath, { withFileTypes: true });
   const files = [];
@@ -554,9 +580,21 @@ async function listFilesRecursive(directoryPath) {
 }
 
 async function findLatestNsisInstaller(rootDir) {
-  const nsisDir = path.join(rootDir, "src-tauri", "target", "release", "bundle", "nsis");
-  if (!(await pathExists(nsisDir))) {
-    fail(`Missing Windows NSIS output directory: ${nsisDir}`);
+  const candidateDirs = [
+    path.join(windowsReleaseDir(rootDir), "bundle", "nsis"),
+    path.join(rootDir, "src-tauri", "target", "release", "bundle", "nsis"),
+  ];
+  let nsisDir = "";
+
+  for (const candidateDir of candidateDirs) {
+    if (await pathExists(candidateDir)) {
+      nsisDir = candidateDir;
+      break;
+    }
+  }
+
+  if (!nsisDir) {
+    fail(`Missing Windows NSIS output directory. Checked:\n${candidateDirs.join("\n")}`);
   }
 
   const files = await listFilesRecursive(nsisDir);
@@ -580,8 +618,21 @@ async function findLatestNsisInstaller(rootDir) {
 
 async function buildWindowsAssets({ rootDir, version, assetsDir, skipBuild }) {
   if (!skipBuild) {
-    run(npmCommand(), ["run", "build:windows:portable"], { cwd: rootDir });
-    run(npmCommand(), ["run", "tauri", "build", "--", "--bundles", "nsis"], { cwd: rootDir });
+    run("rustup", ["target", "add", WINDOWS_X64_TARGET], { cwd: rootDir });
+    run(
+      "powershell",
+      [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "scripts/build-windows-portable.ps1",
+        "-Target",
+        WINDOWS_X64_TARGET,
+      ],
+      { cwd: rootDir },
+    );
+    run(npmCommand(), ["run", "tauri", "build", "--", "--target", WINDOWS_X64_TARGET, "--bundles", "nsis"], { cwd: rootDir });
   }
 
   const portableExe = path.join(rootDir, "src-tauri", "target", "release", "portable", `${APP_NAME}-${version}-windows-portable.exe`);
@@ -609,12 +660,18 @@ function gitText(rootDir, args) {
 }
 
 async function writeReleaseNotes({ rootDir, version, outputPath }) {
+  const latestTag = gitText(rootDir, ["describe", "--tags", "--abbrev=0", "--match", "v[0-9]*"]);
+  const logRange = latestTag ? `${latestTag}..HEAD` : "-8";
+  const recentCommits = gitText(rootDir, ["log", "--pretty=format:%h %s", logRange]);
+  const changedSinceTag = latestTag
+    ? gitText(rootDir, ["diff", "--name-status", `${latestTag}..HEAD`])
+    : gitText(rootDir, ["show", "--name-status", "--format=", "--find-renames", "HEAD"]);
+  const workingTreeChanges = gitText(rootDir, ["status", "--short"]);
   const commitSha = gitText(rootDir, ["rev-parse", "--short", "HEAD"]);
   const commitSubject = gitText(rootDir, ["log", "-1", "--pretty=%s"]);
   const commitBody = gitText(rootDir, ["log", "-1", "--pretty=%b"]);
   const commitAuthor = gitText(rootDir, ["log", "-1", "--pretty=%an"]);
   const commitDate = gitText(rootDir, ["log", "-1", "--date=iso-strict", "--pretty=%cd"]);
-  const changedFiles = gitText(rootDir, ["show", "--name-status", "--format=", "--find-renames", "HEAD"]);
   const lines = [
     `# ${APP_NAME} ${version}`,
     "",
@@ -632,12 +689,26 @@ async function writeReleaseNotes({ rootDir, version, outputPath }) {
     commitSubject ? `- Summary: ${commitSubject}` : "",
   ].filter(Boolean);
 
+  if (latestTag || recentCommits) {
+    lines.push("", "### Recent changes", "");
+    if (latestTag) {
+      lines.push(`Changes since \`${latestTag}\`:`);
+    }
+    if (recentCommits) {
+      lines.push("", "```text", recentCommits, "```");
+    }
+  }
+
   if (commitBody) {
     lines.push("", "### Commit details", "", "```text", commitBody, "```");
   }
 
-  if (changedFiles) {
-    lines.push("", "### Changed files", "", "```text", changedFiles, "```");
+  if (changedSinceTag) {
+    lines.push("", "### Changed files", "", "```text", changedSinceTag, "```");
+  }
+
+  if (workingTreeChanges) {
+    lines.push("", "### Local release-time changes", "", "```text", workingTreeChanges, "```");
   }
 
   lines.push(
@@ -674,21 +745,26 @@ function releaseFlags(options) {
   return flags;
 }
 
-function createOrUpdateRelease({ tag, repo, title, notesPath, assetPaths, options }) {
+function createOrUpdateRelease({ tag, repo, title, notesPath, assetPaths, options, updateExistingNotes }) {
   if (releaseExists(tag, repo)) {
-    run("gh", [
-      "release",
-      "edit",
-      tag,
-      "--repo",
-      repo,
-      "--title",
-      title,
-      "--notes-file",
-      notesPath,
-      `--draft=${String(options.draft)}`,
-      `--prerelease=${String(options.prerelease)}`,
-    ]);
+    if (updateExistingNotes) {
+      run("gh", [
+        "release",
+        "edit",
+        tag,
+        "--repo",
+        repo,
+        "--title",
+        title,
+        "--notes-file",
+        notesPath,
+        `--draft=${String(options.draft)}`,
+        `--prerelease=${String(options.prerelease)}`,
+      ]);
+    } else {
+      console.log(`Keeping existing release notes for ${repo} ${tag}; uploading assets only.`);
+    }
+
     run("gh", ["release", "upload", tag, ...assetPaths, "--repo", repo, "--clobber"]);
     return;
   }
@@ -706,6 +782,16 @@ function createOrUpdateRelease({ tag, repo, title, notesPath, assetPaths, option
     notesPath,
     ...releaseFlags(options),
   ]);
+}
+
+function shouldUpdateExistingNotes(options) {
+  if (options.releaseNotesMode === "update") {
+    return true;
+  }
+  if (options.releaseNotesMode === "keep") {
+    return false;
+  }
+  return options.platform === "mac";
 }
 
 async function downloadExistingLatestJson({ tag, updateRepo, stageDir }) {
@@ -729,6 +815,7 @@ async function downloadExistingLatestJson({ tag, updateRepo, stageDir }) {
 async function publishAssets({ tag, stageDir, assetsDir, notesPath, options }) {
   ensureGhReady();
 
+  const updateExistingNotes = shouldUpdateExistingNotes(options);
   const existingManifestPath = options.mergeExistingLatest
     ? await downloadExistingLatestJson({ tag, updateRepo: options.updateRepo, stageDir })
     : "";
@@ -739,6 +826,7 @@ async function publishAssets({ tag, stageDir, assetsDir, notesPath, options }) {
     updateRepo: options.updateRepo,
     notesPath,
     existingManifestPath,
+    preserveExistingNotes: !updateExistingNotes,
   });
 
   const assetNames = await fs.readdir(assetsDir);
@@ -761,8 +849,9 @@ async function publishAssets({ tag, stageDir, assetsDir, notesPath, options }) {
     repo: options.releaseRepo,
     title: `${APP_NAME} ${options.version}`,
     notesPath,
-    assetPaths: downloadAssets,
+    assetPaths: updateExistingNotes ? [...downloadAssets, notesPath] : downloadAssets,
     options,
+    updateExistingNotes,
   });
   createOrUpdateRelease({
     tag,
@@ -771,6 +860,7 @@ async function publishAssets({ tag, stageDir, assetsDir, notesPath, options }) {
     notesPath,
     assetPaths: updaterAssets,
     options,
+    updateExistingNotes,
   });
 
   return manifestResult;
@@ -814,10 +904,13 @@ async function main() {
 
   const stageDir = path.join(rootDir, "release-output", "local", `v${options.version}`);
   const assetsDir = path.join(stageDir, "assets");
-  const notesPath = path.join(stageDir, "release-notes.md");
+  const notesPath = path.join(stageDir, RELEASE_NOTES_FILE_NAME);
   const tag = `v${options.version}`;
 
   console.log(`Preparing local ${options.platform} release for ${APP_NAME} ${options.version}...`);
+  if (options.platform === "windows") {
+    console.log(`- Windows build target: ${WINDOWS_X64_TARGET} (Windows 11 x64 compatible)`);
+  }
   const versionResult = await syncReleaseVersions({ rootDir, version: options.version });
   console.log(`- macOS bundleVersion: ${versionResult.macBundleVersion}`);
   console.log(`- Windows wix version: ${versionResult.windowsWixVersion}`);

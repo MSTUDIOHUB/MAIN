@@ -33,6 +33,7 @@ permissions:
 
 env:
   APP_NAME: MAIN
+  WINDOWS_TARGET: x86_64-pc-windows-msvc
 
 jobs:
   macos:
@@ -246,10 +247,11 @@ jobs:
         run: npm run release:bump -- $env:VERSION
 
       - name: Build Windows portable package
-        run: npm run build:windows:portable
+        shell: pwsh
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows-portable.ps1 -Target $env:WINDOWS_TARGET
 
       - name: Build Windows updater installer
-        run: npm run tauri build -- --bundles nsis
+        run: npm run tauri build -- --target $env:WINDOWS_TARGET --bundles nsis
 
       - name: Zip Windows portable package
         shell: pwsh
@@ -271,7 +273,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          $nsisDir = "src-tauri\target\release\bundle\nsis"
+          $nsisDir = "src-tauri\target\${env:WINDOWS_TARGET}\release\bundle\nsis"
           $artifact = Get-ChildItem -Path $nsisDir -Recurse -File -Filter "*.exe" |
             Where-Object { $_.Name -notlike "*.sig" } |
             Sort-Object LastWriteTime -Descending |
@@ -374,7 +376,7 @@ jobs:
             echo "## Privacy boundary"
             echo ""
             echo "This public release contains only packaged desktop binaries and a commit summary. Source code remains in the private MAIN repository."
-          } > release-assets/release-notes.md
+          } > release-assets/release_notes.md
 
           ls -lah release-assets
 
@@ -418,7 +420,7 @@ jobs:
 
           manifest = {
               "version": version,
-              "notes": (assets_dir / "release-notes.md").read_text(encoding="utf-8"),
+              "notes": (assets_dir / "release_notes.md").read_text(encoding="utf-8"),
               "pub_date": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
               "platforms": {
                   "darwin-x86_64": darwin_x86_64,
@@ -464,7 +466,7 @@ jobs:
             gh release edit "$tag" \
               --repo "$RELEASE_REPO" \
               --title "${APP_NAME} ${VERSION}" \
-              --notes-file release-assets/release-notes.md \
+              --notes-file release-assets/release_notes.md \
               --draft="${{ inputs.draft }}" \
               --prerelease="${{ inputs.prerelease }}"
 
@@ -474,14 +476,16 @@ jobs:
 
             gh release upload "$tag" \
               release-assets/*.zip \
+              release-assets/release_notes.md \
               --repo "$RELEASE_REPO" \
               --clobber
           else
             gh release create "$tag" \
               release-assets/*.zip \
+              release-assets/release_notes.md \
               --repo "$RELEASE_REPO" \
               --title "${APP_NAME} ${VERSION}" \
-              --notes-file release-assets/release-notes.md \
+              --notes-file release-assets/release_notes.md \
               "${create_flags[@]}"
           fi
 
@@ -489,7 +493,7 @@ jobs:
             gh release edit "$tag" \
               --repo "$UPDATE_REPO" \
               --title "${APP_NAME} Updater ${VERSION}" \
-              --notes-file release-assets/release-notes.md \
+              --notes-file release-assets/release_notes.md \
               --draft="${{ inputs.draft }}" \
               --prerelease="${{ inputs.prerelease }}"
 
@@ -508,6 +512,6 @@ jobs:
               release-assets/latest.json \
               --repo "$UPDATE_REPO" \
               --title "${APP_NAME} Updater ${VERSION}" \
-              --notes-file release-assets/release-notes.md \
+              --notes-file release-assets/release_notes.md \
               "${create_flags[@]}"
           fi

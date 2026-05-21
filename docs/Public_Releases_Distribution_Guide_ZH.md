@@ -70,6 +70,7 @@
 - `MAIN_<version>_macOS_universal.zip`
 - `MAIN_<version>_macOS_apple_silicon.zip`
 - `MAIN_<version>_windows_x64.zip`
+- `release_notes.md`
 
 发布到 `MAIN-UpdateFeed`（自动更新源）：
 
@@ -82,7 +83,7 @@
 不会上传 `src/`、`src-tauri/`、`dist/`、`target/` 这类源码或构建目录。
 Release Changelog 会自动写入私有 `MAIN` 仓库触发构建时的最后一次提交摘要、提交正文和变更文件列表，但不会公开源码 diff。
 
-其中 `MAIN-Releases` 只保留用户手动下载的 zip；`MAIN-UpdateFeed` 承担 Tauri updater 自动更新所需的 `updater_*`、`.sig` 和 `latest.json`。`latest.json` 只包含版本号、更新说明、下载 URL 和签名，不包含源码。
+其中 `MAIN-Releases` 只保留用户手动下载的 zip 和公开发布说明；`MAIN-UpdateFeed` 承担 Tauri updater 自动更新所需的 `updater_*`、`.sig` 和 `latest.json`。`latest.json` 只包含版本号、更新说明、下载 URL 和签名，不包含源码。
 
 ### 最快发布命令
 
@@ -136,7 +137,7 @@ export TAURI_SIGNING_PRIVATE_KEY_PASSWORD='<你的 updater 私钥密码，如果
 或者直接在命令里传：
 
 ```bash
-npm run release:local:mac -- 2.0.2 --signing-key-file "$HOME/.config/main/tauri-updater.key"
+npm run release:mac:upload -- 2.0.2 --signing-key-file "$HOME/.config/main/tauri-updater.key"
 ```
 
 如果你的 key 没有密码，只传 `--signing-key-file` 就够了。
@@ -144,7 +145,7 @@ npm run release:local:mac -- 2.0.2 --signing-key-file "$HOME/.config/main/tauri-
 然后执行：
 
 ```bash
-npm run release:local:mac -- 2.0.2
+npm run release:mac:upload -- 2.0.2
 ```
 
 第一次在本机打 universal 包前，如果缺少 Rust target，脚本会提示执行：
@@ -165,8 +166,9 @@ rustup target add aarch64-apple-darwin x86_64-apple-darwin
    - `MAIN_<version>_updater_darwin_x86_64.app.tar.gz.sig`
    - `MAIN_<version>_updater_darwin_aarch64.app.tar.gz`
    - `MAIN_<version>_updater_darwin_aarch64.app.tar.gz.sig`
-5. 生成 `latest.json`
-6. 上传到 `MAIN-Releases` 和 `MAIN-UpdateFeed`
+5. 基于最近提交和发布时的本地变更生成 `release_notes.md`
+6. 生成 `latest.json`
+7. 上传到 `MAIN-Releases` 和 `MAIN-UpdateFeed`
 
 本地暂存目录在：
 
@@ -177,28 +179,28 @@ release-output/local/v<version>/assets/
 如果只想生成文件、不上传：
 
 ```bash
-npm run release:local:mac -- 2.0.2 --no-upload
+npm run release:mac:upload -- 2.0.2 --no-upload
 ```
 
 如果已经打过包，只想重新整理、签 updater、生成 manifest、上传：
 
 ```bash
-npm run release:local:mac -- 2.0.2 --skip-build
+npm run release:mac:upload -- 2.0.2 --skip-build
 ```
 
 常用参数：
 
 ```bash
-npm run release:local:mac -- 2.0.2 --draft
-npm run release:local:mac -- 2.0.2 --prerelease
-npm run release:local:mac -- 2.0.2 --release-repo MSTUDIOHUB/MAIN-Releases --update-repo MSTUDIOHUB/MAIN-UpdateFeed
+npm run release:mac:upload -- 2.0.2 --draft
+npm run release:mac:upload -- 2.0.2 --prerelease
+npm run release:mac:upload -- 2.0.2 --release-repo MSTUDIOHUB/MAIN-Releases --update-repo MSTUDIOHUB/MAIN-UpdateFeed
 ```
 
-如果对应 tag 已经存在，脚本会更新 Release 文案并用 `--clobber` 覆盖同名附件；如果 tag 不存在，脚本会新建 Release。
+如果对应 tag 已经存在，Mac 脚本会更新 Release 文案、上传/覆盖 `release_notes.md`，并用 `--clobber` 覆盖同名附件；如果 tag 不存在，脚本会新建 Release。
 
 ### Windows：在 Windows 虚拟机里打包并上传
 
-Windows 正式发布建议在 Windows 虚拟机或 Windows 真机里跑。Tauri 官方文档说明：MSI 只能在 Windows 上生成；NSIS 从 macOS/Linux 交叉编译虽然可行，但有 caveats、维护成本更高，不如 VM 稳定。参考：`https://v2.tauri.app/distribute/windows-installer/`
+Windows 正式发布建议在 Windows 虚拟机或 Windows 真机里跑。脚本会显式构建 `x86_64-pc-windows-msvc`，所以即使你在 Mac 虚拟机里运行 Windows ARM，产物也是给 Windows 11 x64 用户运行的。Windows VM 里需要安装 Visual Studio Build Tools 的 C++ 桌面构建工具和 MSVC x64 工具链。Tauri 官方文档说明：MSI 只能在 Windows 上生成；NSIS 从 macOS/Linux 交叉编译虽然可行，但有 caveats、维护成本更高，不如 VM 稳定。参考：`https://v2.tauri.app/distribute/windows-installer/`
 
 在 Windows VM 里打开 PowerShell：
 
@@ -206,7 +208,7 @@ Windows 正式发布建议在 Windows 虚拟机或 Windows 真机里跑。Tauri 
 npm install
 $env:TAURI_SIGNING_PRIVATE_KEY = '<你的 updater 私钥内容>'
 $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = '<你的 updater 私钥密码>'
-npm run release:local:windows -- 2.0.2
+npm run release:windows:x64 -- 2.0.2
 ```
 
 如果私钥存在本机文件里，也可以用：
@@ -214,7 +216,7 @@ npm run release:local:windows -- 2.0.2
 ```powershell
 $env:TAURI_SIGNING_PRIVATE_KEY_PATH = "$env:USERPROFILE\.config\main\tauri-updater.key"
 $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = '<你的 updater 私钥密码>'
-npm run release:local:windows -- 2.0.2
+npm run release:windows:x64 -- 2.0.2
 ```
 
 这条命令会生成并上传：
@@ -224,20 +226,20 @@ npm run release:local:windows -- 2.0.2
 - `MAIN_<version>_updater_windows_x86_64.exe.sig`
 - `latest.json`
 
-如果 macOS Release 已经先上传过，Windows 命令会先下载现有 `latest.json`，再合并 Windows 平台 entries，避免覆盖 macOS 更新入口。反过来也一样：先跑 Windows、再跑 macOS 时，macOS 命令会合并已有 Windows entries。
+如果 macOS Release 已经先上传过，Windows 命令会先下载现有 `latest.json`，再合并 Windows 平台 entries，避免覆盖 macOS 更新入口。Windows 命令默认只上传 Windows 文件和合并后的 updater manifest，不改写 `MAIN-Releases` 里的发布说明；确实需要覆盖说明时再加 `--update-existing-notes`。反过来也一样：先跑 Windows、再跑 macOS 时，macOS 命令会合并已有 Windows entries。
 
 只生成、不上传：
 
 ```powershell
-npm run release:local:windows -- 2.0.2 --no-upload
+npm run release:windows:x64 -- 2.0.2 --no-upload
 ```
 
 ### 本地发布顺序建议
 
 如果这次要同时发布 macOS 和 Windows：
 
-1. 在 Mac 上执行 `npm run release:local:mac -- <version>`
-2. 在 Windows VM 里执行 `npm run release:local:windows -- <version>`
+1. 在 Mac 上执行 `npm run release:mac:upload -- <version>`
+2. 在 Windows VM 里执行 `npm run release:windows:x64 -- <version>`
 3. 打开 `https://github.com/MSTUDIOHUB/MAIN-UpdateFeed/releases/latest/download/latest.json`，确认里面同时有 `darwin-*` 和 `windows-*`
 4. 打开 `https://github.com/MSTUDIOHUB/MAIN-Releases/releases/latest`，确认三个用户下载 zip 都在
 

@@ -218,3 +218,50 @@ test("writeUpdaterManifest writes local updater entries and preserves existing p
     /https:\/\/github\.com\/mstudiohub\/MAIN-UpdateFeed\/releases\/download\/v1\.1\.1\/MAIN_1\.1\.1_updater_darwin_aarch64\.app\.tar\.gz/,
   );
 });
+
+test("writeUpdaterManifest can preserve existing notes for asset-only platform uploads", async () => {
+  const rootDir = await createTempWorkspace();
+  const version = "1.1.1";
+  const assetsDir = path.join(rootDir, "release-assets");
+  const notesPath = path.join(assetsDir, "release_notes.md");
+  const existingManifestPath = path.join(rootDir, "existing-latest.json");
+
+  await fs.mkdir(assetsDir, { recursive: true });
+  await fs.writeFile(notesPath, "# Windows upload notes\n");
+  await fs.writeFile(path.join(assetsDir, `MAIN_${version}_updater_windows_x86_64.exe`), "windows-updater");
+  await fs.writeFile(path.join(assetsDir, `MAIN_${version}_updater_windows_x86_64.exe.sig`), "windows-signature\n");
+  await fs.writeFile(
+    existingManifestPath,
+    `${JSON.stringify(
+      {
+        version,
+        notes: "# Mac release notes\n",
+        pub_date: "2026-01-01T00:00:00Z",
+        platforms: {
+          "darwin-aarch64": {
+            signature: "mac-signature",
+            url: `https://github.com/mstudiohub/MAIN-UpdateFeed/releases/download/v${version}/MAIN_${version}_updater_darwin_aarch64.app.tar.gz`,
+          },
+        },
+      },
+      null,
+      2,
+    )}\n`,
+  );
+
+  const result = await writeUpdaterManifest({
+    assetsDir,
+    version,
+    updateRepo: "mstudiohub/MAIN-UpdateFeed",
+    notesPath,
+    existingManifestPath,
+    preserveExistingNotes: true,
+  });
+
+  const manifest = JSON.parse(await fs.readFile(result.outputPath, "utf8"));
+
+  assert.equal(manifest.notes, "# Mac release notes\n");
+  assert.equal(manifest.platforms["darwin-aarch64"].signature, "mac-signature");
+  assert.equal(manifest.platforms["windows-x86_64"].signature, "windows-signature");
+  assert.equal(manifest.platforms["windows-x86_64-nsis"].signature, "windows-signature");
+});

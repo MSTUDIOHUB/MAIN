@@ -58,7 +58,7 @@ npm run release:desktop -- 1.5.5
 
 发布时会分仓库上传：
 
-- `MAIN-Releases`：只放用户下载 zip
+- `MAIN-Releases`：只放用户下载 zip 和 `release_notes.md`
 - `MAIN-UpdateFeed`：只放 updater feed（`latest.json + *_updater_* + .sig`）
 
 如果缺少 updater 签名 Secrets，workflow 会失败并提示补齐，避免发布一个无法自动更新的版本。
@@ -100,7 +100,7 @@ $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = '<你的 updater 私钥密码，如果
 ### macOS 本机发布
 
 ```bash
-npm run release:local:mac -- <version>
+npm run release:mac:upload -- <version>
 ```
 
 第一次在本机打 universal 包前，如果缺少 Rust target，脚本会提示执行：
@@ -118,6 +118,7 @@ rustup target add aarch64-apple-darwin x86_64-apple-darwin
 - `MAIN_<version>_updater_darwin_aarch64.app.tar.gz`
 - `MAIN_<version>_updater_darwin_aarch64.app.tar.gz.sig`
 - `latest.json`
+- `release_notes.md`（上传到 `MAIN-Releases`，并同步为 Release 正文）
 
 本地暂存目录：
 
@@ -128,16 +129,16 @@ release-output/local/v<version>/assets/
 只生成文件、不上传：
 
 ```bash
-npm run release:local:mac -- <version> --no-upload
+npm run release:mac:upload -- <version> --no-upload
 ```
 
 ### Windows 虚拟机发布
 
-Windows 正式发布建议在 Windows VM 或 Windows 真机里跑：
+Windows 正式发布建议在 Windows VM 或 Windows 真机里跑。脚本会显式使用 `x86_64-pc-windows-msvc`，所以即使你在 Mac 虚拟机里跑 Windows ARM，最终产物也是给 Windows 11 x64 用户运行的。Windows VM 里需要安装 Visual Studio Build Tools 的 C++ 桌面构建工具和 MSVC x64 工具链：
 
 ```powershell
 npm install
-npm run release:local:windows -- <version>
+npm run release:windows:x64 -- <version>
 ```
 
 这会生成并上传：
@@ -148,6 +149,8 @@ npm run release:local:windows -- <version>
 - `latest.json`
 
 如果另一个平台已经先上传过，脚本会下载并合并现有 `latest.json`，避免覆盖对方平台的自动更新入口。
+
+如果 macOS 已经先发布，Windows 命令默认只上传 Windows zip、Windows updater 和合并后的 `latest.json`，不会改写 `MAIN-Releases` 里现有的 Release 文案或 `release_notes.md`。确实需要覆盖现有说明时，再加 `--update-existing-notes`。
 
 Windows 不建议作为默认流程在 Mac 上交叉打包：Tauri 官方文档说明 MSI 只能在 Windows 上生成，NSIS 虽可从 macOS/Linux 交叉编译但限制较多。稳定发布优先用 Windows VM。
 
@@ -298,6 +301,8 @@ npm run build:windows:portable
 
 但目标电脑仍然需要 `Microsoft Edge WebView2 Runtime`。
 
+在 Windows ARM VM 里运行时，这条命令默认仍然构建 `x86_64-pc-windows-msvc`，不是 ARM64 包。
+
 ### 安装版
 
 如果你还要 NSIS / MSI：
@@ -308,8 +313,8 @@ npm run build:windows
 
 产物通常位于：
 
-- `src-tauri/target/release/bundle/nsis/`
-- `src-tauri/target/release/bundle/msi/`
+- `src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/`
+- `src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/`
 
 ## 对外发布前整理素材
 
