@@ -40,8 +40,14 @@ import { summarizePlanExecutionProgressSnapshot } from "../lib/planExecutionReco
 import { buildCompletedToolGroupRanges, countCompletedToolCalls } from "../lib/toolUiGrouping";
 import { compactToolPresentationTarget, getToolPresentationLabel } from "../lib/toolPresentation";
 import { buildLiveTurnProcessTimelineModel, buildTurnProcessArchiveModel, type TurnArchiveStep } from "../lib/turnProcessArchive";
-import { buildRuntimeProgressLedger, summarizeRuntimeProgressLedger } from "../lib/runtimeProgressLedger";
+import {
+  buildRuntimeProgressLedger,
+  buildRuntimeProgressProjection,
+  summarizeRuntimeProgressLedger,
+  type RuntimeProgressLedgerItem,
+} from "../lib/runtimeProgressLedger";
 import { getChatFeedbackStatusCopy, normalizeChatFeedbackStatus } from "../lib/chatFeedback";
+import { appendDebugLog } from "../lib/debugLog";
 import type { UserContextItem } from "../lib/userContextItems";
 
 const TURN_STATUS_LABELS: Record<string, string> = {
@@ -664,6 +670,89 @@ function getLastAgentSummaryText(blocks: any[]) {
   return summaryText.length > 700 ? `${summaryText.slice(0, 700).trim()}...` : summaryText;
 }
 
+function getAgentVisibleMarkdownText(block: any): string {
+  if (block?.type !== "agent") return "";
+  return parseMessageContent(getAgentPreviewContent(block.content))
+    .filter((seg) => seg.type === "text")
+    .map((seg) => sanitizeAIOutput(seg.content))
+    .filter(Boolean)
+    .join("\n\n")
+    .trim();
+}
+
+function normalizeTranscriptDedupeText(text: string): string {
+  return normalizeThoughtSummaryForCompare(
+    String(text || "")
+      .replace(/[`*_#[\]()]/g, " ")
+      .replace(/[。！？；，、,.!?;:：]/g, " ")
+  ).replace(/\s+/g, "");
+}
+
+function collectNearbyToolEchoText(blocks: any[], agentIndex: number): string {
+  const parts: string[] = [];
+  const collect = (start: number, step: number) => {
+    for (let idx = start; idx >= 0 && idx < blocks.length; idx += step) {
+      const block = blocks[idx];
+      if (!block || block.type === "thought" || block.type === "progress") continue;
+      if (block.type === "tool") {
+        parts.push(
+          String(block.observationSummary || ""),
+          String(block.intentSummary || ""),
+          String(block.why || ""),
+          String(block.message || ""),
+          compactToolTarget(block.target, String(block.toolName || ""), "zh"),
+          compactToolTarget(block.target, String(block.toolName || ""), "en"),
+          fullToolTarget(block.target, String(block.toolName || ""), "zh"),
+        );
+        continue;
+      }
+      break;
+    }
+  };
+  collect(agentIndex - 1, -1);
+  collect(agentIndex + 1, 1);
+  return parts.filter(Boolean).join("\n");
+}
+
+function extractPathishTokens(text: string): string[] {
+  const source = String(text || "");
+  const tokens = new Set<string>();
+  for (const match of source.matchAll(/[A-Za-z0-9_.@/-]+\.[A-Za-z0-9]{1,8}|[A-Za-z0-9_.@/-]*\/[A-Za-z0-9_.@/-]+/g)) {
+    const raw = String(match[0] || "").trim();
+    if (!raw || raw.length < 4) continue;
+    tokens.add(raw.toLowerCase());
+    const basename = raw.split(/[\\/]/).pop();
+    if (basename && basename.length >= 4) tokens.add(basename.toLowerCase());
+  }
+  return [...tokens];
+}
+
+function isThinToolNarration(text: string): boolean {
+  const normalized = String(text || "").replace(/\s+/g, "");
+  if (!normalized || normalized.length > 260) return false;
+  return /^(我(会|将|先|现在|正在|继续|已经|已)|接下来|现在|继续|已|正在).{0,40}(读取|查看|搜索|调查|执行|运行|调用|写入|修改|验证|整理|完成)/.test(normalized) ||
+    /(已读取|已搜索|已执行|读取完成|搜索完成|命令完成|工具调用完成|continuingto|i(?:'|’)llread|iread|readcomplete|runningcommand)/i.test(normalized);
+}
+
+function shouldSuppressAgentToolEcho(blocks: any[], agentIndex: number): boolean {
+  const block = blocks[agentIndex];
+  if (!block || block.type !== "agent" || block.streaming || block.hiddenProcess) return false;
+  const text = getAgentVisibleMarkdownText(block);
+  if (!text || text.length > 700) return false;
+  const nearbyToolText = collectNearbyToolEchoText(blocks, agentIndex);
+  if (!nearbyToolText) return false;
+  const agentNormalized = normalizeTranscriptDedupeText(text);
+  const toolNormalized = normalizeTranscriptDedupeText(nearbyToolText);
+  if (!agentNormalized || !toolNormalized) return false;
+  if (agentNormalized.length >= 24 && toolNormalized.includes(agentNormalized)) return true;
+  if (toolNormalized.length >= 24 && agentNormalized.includes(toolNormalized)) return true;
+  if (!isThinToolNarration(text)) return false;
+  const agentTokens = extractPathishTokens(text);
+  if (agentTokens.length === 0) return false;
+  const toolTextLower = nearbyToolText.toLowerCase();
+  return agentTokens.some((token) => toolTextLower.includes(token));
+}
+
 function hasGeneratedPlanContent(blocks: any[]) {
   return blocks.some((block) => {
     if (block.type === "tool") {
@@ -779,6 +868,10 @@ const COMPLETED_TOOL_GROUP_LABELS: Record<string, { zh: string; en: string }> = 
   refresh_unity: { zh: "刷新 Unity", en: "Refresh Unity" },
 };
 
+function isCommandLikeToolName(toolName: string) {
+  return TOOL_SUMMARY_GROUPS.command.has(toolName);
+}
+
 function isCompletedReadContextTool(block: any) {
   return (
     block?.type === "tool" &&
@@ -797,7 +890,7 @@ function isReadContextHardBoundary(block: any) {
     return hasRenderableAgentBlock(block);
   }
   if (block.type === "tool") {
-    if (block.toolStatus !== "pending") return false;
+    if (block.toolStatus !== "pending") return !isCompletedReadContextTool(block);
     return block.toolName !== "write_file" && block.toolName !== "replace_in_file";
   }
   return false;
@@ -985,8 +1078,8 @@ function shouldGroupPlanExecutionTools(input: {
       input.turnStatus === "error"
     );
   return {
-    enabled: isApprovedPlanExecution,
-    includeDiff: isApprovedPlanExecution,
+    enabled: input.turnIntent === "execute" || isApprovedPlanExecution,
+    includeDiff: input.turnIntent === "execute" || isApprovedPlanExecution,
     includeReadContextTools: isApprovedPlanExecution,
     minGroupSize: isApprovedPlanExecution ? 1 : 2,
   };
@@ -1048,6 +1141,7 @@ function TurnActivityNotice({
   isThinking,
   language,
   chatFontSize,
+  progressItems = [],
   text,
 }: {
   activityText?: string;
@@ -1055,14 +1149,37 @@ function TurnActivityNotice({
   isThinking?: boolean;
   language: "zh" | "en";
   chatFontSize: number;
+  progressItems?: RuntimeProgressLedgerItem[];
   text?: string;
 }) {
-  const resolvedActivityText = String(activityText ?? text ?? "").trim();
+  const [expanded, setExpanded] = useState(false);
+  const progressProjection = buildRuntimeProgressProjection(progressItems, language, 4);
+  const latestProgressLogKey = progressProjection.latest
+    ? `${progressProjection.latest.key}:${progressProjection.latest.status}:${progressProjection.latest.repeatCount}:${progressProjection.latest.lastSeenAt}`
+    : "";
+  const lastLoggedProgressKeyRef = useRef("");
+  useEffect(() => {
+    if (!latestProgressLogKey || lastLoggedProgressKeyRef.current === latestProgressLogKey) return;
+    lastLoggedProgressKeyRef.current = latestProgressLogKey;
+    appendDebugLog("info", "ui.progress_projection_updated", {
+      latestKey: progressProjection.latest?.key || "",
+      latestTitle: progressProjection.latest?.title || "",
+      latestStatus: progressProjection.latest?.status || "",
+      recentCount: progressProjection.recent.length,
+      summary: progressProjection.summary,
+    });
+  }, [latestProgressLogKey, progressProjection.latest, progressProjection.recent.length, progressProjection.summary]);
+  const resolvedActivityText = String(progressProjection.activityText || activityText || text || "").trim();
   const resolvedThoughtSummaryText = String(thoughtSummaryText || "").trim();
   if (!resolvedActivityText && !resolvedThoughtSummaryText) return null;
   const thoughtTitle = language === "zh"
     ? isThinking ? "正在整理思路" : "思考摘要"
     : isThinking ? "Thinking" : "Thinking summary";
+  const progressTitle = language === "zh" ? "有效进展" : "Effective Progress";
+  const canExpandProgress = progressProjection.recent.length > 1;
+  const toggleText = expanded
+    ? language === "zh" ? "收起" : "Hide"
+    : language === "zh" ? "最近 4 条" : "Recent 4";
   return (
     <div
       data-testid="turn-activity-notice"
@@ -1082,90 +1199,75 @@ function TurnActivityNotice({
         </div>
       )}
       {resolvedActivityText && (
-        <div className={`flex items-center gap-2 ${resolvedThoughtSummaryText ? "mt-2 border-t border-[rgba(147,197,253,0.14)] pt-2" : ""}`}>
-          <span className="h-2 w-2 rounded-full bg-[#60a5fa] shadow-[0_0_8px_rgba(96,165,250,0.8)] animate-pulse" />
-          <span>{resolvedActivityText}</span>
+        <div
+          data-testid="effective-progress-ledger"
+          className={`${resolvedThoughtSummaryText ? "mt-2 border-t border-[rgba(147,197,253,0.14)] pt-2" : ""}`}
+        >
+          <div className="flex min-w-0 items-start gap-2">
+            <span className="mt-1.5 h-2 w-2 shrink-0 rounded-full bg-[#60a5fa] shadow-[0_0_8px_rgba(96,165,250,0.8)] animate-pulse" />
+            <span className="min-w-0 flex-1">
+              <span className="mb-0.5 block font-mono text-[10.5px] uppercase tracking-[0.14em] text-[#93c5fd]">{progressTitle}</span>
+              <span className="block whitespace-pre-wrap break-words text-[12px] leading-5 text-[#bfdbfe]">{resolvedActivityText}</span>
+            </span>
+            {canExpandProgress && (
+              <button
+                type="button"
+                data-testid="effective-progress-ledger-toggle"
+                aria-expanded={expanded}
+                onClick={() => setExpanded((value) => !value)}
+                className="inline-flex shrink-0 items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] text-[#93c5fd] transition-colors hover:bg-[rgba(96,165,250,0.12)]"
+              >
+                {expanded ? <IconChevronDown className="h-3.5 w-3.5" /> : <IconChevronRight className="h-3.5 w-3.5" />}
+                {toggleText}
+              </button>
+            )}
+          </div>
+          {expanded && progressProjection.recent.length > 0 && (
+            <div className="mt-2 border-t border-[rgba(147,197,253,0.14)] pt-2">
+              <EffectiveProgressLedgerDetails items={progressProjection.recent} />
+            </div>
+          )}
         </div>
       )}
     </div>
   );
 }
 
-function EffectiveProgressLedgerCard({
+function EffectiveProgressLedgerDetails({
   items,
-  language,
-  chatFontSize,
 }: {
-  items: any[];
-  language: "zh" | "en";
-  chatFontSize: number;
+  items: RuntimeProgressLedgerItem[];
 }) {
-  const [expanded, setExpanded] = useState(false);
-  const visibleItems = items.filter(Boolean);
-  if (visibleItems.length === 0) return null;
-  const latestItems = visibleItems.slice(-4);
-  const summary = summarizeRuntimeProgressLedger(visibleItems, language);
-  const title = language === "zh" ? "有效进展" : "Effective Progress";
-  const toggleText = expanded
-    ? language === "zh" ? "收起明细" : "Hide details"
-    : language === "zh" ? "展开明细" : "Show details";
+  const latestItems = items.filter(Boolean).slice(-4);
+  if (latestItems.length === 0) return null;
   return (
-    <div
-      data-testid="effective-progress-ledger"
-      className="turn-process-font-scope ml-9 rounded-xl border border-[rgba(96,165,250,0.2)] bg-[rgba(37,99,235,0.06)] px-3 py-2"
-      style={getTurnProcessFontStyle(chatFontSize)}
-    >
-      <button
-        type="button"
-        data-testid="effective-progress-ledger-toggle"
-        aria-expanded={expanded}
-        onClick={() => setExpanded((value) => !value)}
-        className="flex w-full min-w-0 items-start justify-between gap-3 text-left"
-      >
-        <span className="min-w-0 flex-1">
-          <span className="inline-flex items-center gap-2 text-[11px] uppercase tracking-[0.16em] text-[#93c5fd]">
-            <IconColumns className="h-3.5 w-3.5" />
-            {title}
+    <div data-testid="effective-progress-ledger-details" className="space-y-1">
+      {latestItems.map((item) => (
+        <div
+          key={item.key}
+          data-testid="effective-progress-ledger-item"
+          className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-2 rounded-lg px-1.5 py-1 text-[11px]"
+        >
+          <span className={`mt-1 h-2 w-2 rounded-full ${
+            item.status === "failed" || item.status === "paused"
+              ? "bg-[#f87171]"
+              : item.status === "running"
+              ? "bg-[#60a5fa] shadow-[0_0_8px_rgba(96,165,250,0.8)]"
+              : "bg-[#10b981]"
+          }`} />
+          <span className="min-w-0">
+            <span className="block truncate font-medium text-[var(--surface-text)]">{item.title}</span>
+            {item.summary && (
+              <span className="mt-0.5 block truncate text-[var(--surface-text-subtle)]">{item.summary}</span>
+            )}
           </span>
-          <span className="mt-1 block whitespace-pre-wrap break-words text-[12px] leading-5 text-[var(--surface-text-subtle)]">
-            {summary}
-          </span>
-        </span>
-        <span className="inline-flex shrink-0 items-center gap-1.5 px-1 py-1 text-[10px] text-[var(--surface-text-muted)]">
-          {expanded ? <IconChevronDown className="h-3.5 w-3.5" /> : <IconChevronRight className="h-3.5 w-3.5" />}
-          {toggleText}
-        </span>
-      </button>
-      {expanded && (
-        <div data-testid="effective-progress-ledger-details" className="mt-2 space-y-1 border-t border-[rgba(147,197,253,0.14)] pt-2">
-          {latestItems.map((item) => (
-            <div
-              key={item.key}
-              data-testid="effective-progress-ledger-item"
-              className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-2 rounded-lg px-1.5 py-1 text-[11px]"
-            >
-              <span className={`mt-1 h-2 w-2 rounded-full ${
-                item.status === "failed" || item.status === "paused"
-                  ? "bg-[#f87171]"
-                  : item.status === "running"
-                  ? "bg-[#60a5fa] shadow-[0_0_8px_rgba(96,165,250,0.8)]"
-                  : "bg-[#10b981]"
-              }`} />
-              <span className="min-w-0">
-                <span className="block truncate font-medium text-[var(--surface-text)]">{item.title}</span>
-                {item.summary && (
-                  <span className="mt-0.5 block truncate text-[var(--surface-text-subtle)]">{item.summary}</span>
-                )}
-              </span>
-              {(item.repeatCount > 1 || item.cacheHits > 0) && (
-                <span className="shrink-0 rounded-full border border-[#334155] bg-[#0f172a] px-1.5 py-0.5 text-[9px] text-[#93c5fd]">
-                  x{item.repeatCount}{item.cacheHits ? ` / ${item.cacheHits} cached` : ""}
-                </span>
-              )}
-            </div>
-          ))}
+          {(item.repeatCount > 1 || item.cacheHits > 0) && (
+            <span className="shrink-0 rounded-full border border-[#334155] bg-[#0f172a] px-1.5 py-0.5 text-[9px] text-[#93c5fd]">
+              x{item.repeatCount}{item.cacheHits ? ` / ${item.cacheHits} cached` : ""}
+            </span>
+          )}
         </div>
-      )}
+      ))}
     </div>
   );
 }
@@ -1528,11 +1630,30 @@ function CompletedToolGroupCard({
   const [expanded, setExpanded] = useState(false);
   // Only consider tool blocks; thought blocks in the range are transparent.
   const toolBlocks = blocks.filter((block) => block.type === "tool");
-  const previewNames = toolBlocks
-    .slice(0, 3)
-    .map((block) => compactToolTarget(block.target, String(block.toolName || ""), language))
-    .filter(Boolean);
+  const commandBlocks = toolBlocks.filter((block) => isCommandLikeToolName(String(block.toolName || "")));
+  const nonCommandBlocks = toolBlocks.filter((block) => !isCommandLikeToolName(String(block.toolName || "")));
+  const previewNames = [
+    ...nonCommandBlocks.slice(0, 2).map((block) => compactToolTarget(block.target, String(block.toolName || ""), language)),
+    ...commandBlocks.slice(0, 1).map((block) => compactToolTarget(block.target, String(block.toolName || ""), language)),
+  ].filter(Boolean);
   const hiddenCount = Math.max(0, toolBlocks.length - previewNames.length);
+  const editCount = toolBlocks.filter((block) => TOOL_SUMMARY_GROUPS.edit.has(String(block.toolName || ""))).length;
+  const readCount = toolBlocks.filter((block) => TOOL_SUMMARY_GROUPS.read.has(String(block.toolName || ""))).length;
+  const tableCount = toolBlocks.filter((block) => TOOL_SUMMARY_GROUPS.table.has(String(block.toolName || ""))).length;
+  const commandCount = commandBlocks.length;
+  const typeSummaryParts: string[] = [];
+  if (language === "zh") {
+    if (editCount) typeSummaryParts.push(`修改 ${editCount} 个文件`);
+    if (readCount) typeSummaryParts.push(`读取/搜索 ${readCount} 项`);
+    if (tableCount) typeSummaryParts.push(`分析 ${tableCount} 次表格`);
+    if (commandCount) typeSummaryParts.push(`运行 ${commandCount} 条命令`);
+  } else {
+    if (editCount) typeSummaryParts.push(`${editCount} file edit${editCount > 1 ? "s" : ""}`);
+    if (readCount) typeSummaryParts.push(`${readCount} read/search operation${readCount > 1 ? "s" : ""}`);
+    if (tableCount) typeSummaryParts.push(`${tableCount} table operation${tableCount > 1 ? "s" : ""}`);
+    if (commandCount) typeSummaryParts.push(`${commandCount} command${commandCount > 1 ? "s" : ""}`);
+  }
+  const typeSummary = typeSummaryParts.join(language === "zh" ? "，" : ", ");
   const previewPurpose = toolBlocks
     .map((block) => String(block.observationSummary || block.intentSummary || block.why || ""))
     .find(Boolean);
@@ -1559,6 +1680,11 @@ function CompletedToolGroupCard({
         )}
         <IconCheck className="h-3.5 w-3.5 shrink-0 text-[#10b981]" />
         <span className="shrink-0 text-[12px] font-medium text-[#d4d4d8]">{title}</span>
+        {typeSummary && (
+          <span data-testid="completed-tool-group-type-summary" className="shrink-0 text-[11px] text-[#94a3b8]">
+            · {typeSummary}
+          </span>
+        )}
         {previewNames.length > 0 && (
           <span className="min-w-0 flex-1 truncate text-[11px] text-[#71717a]">
             · {previewNames.join(language === "zh" ? "、" : ", ")}{hiddenCount > 0 ? ` +${hiddenCount}` : ""}
@@ -1861,7 +1987,7 @@ function TurnArchiveStepCard({
       : language === "zh" ? "查看证据" : "Show evidence";
   const targetText = step.targets.slice(0, 3).join(language === "zh" ? "、" : ", ");
   const hiddenTargetCount = Math.max(0, step.targets.length - 3);
-  const primaryText = step.activity?.title || step.intent;
+  const primaryText = (isLive && step.intent) ? step.intent : step.activity?.title || step.intent;
   const activitySummary = step.activity?.summary || "";
   const shouldShowTargetSummary = targetText && !primaryText.includes(targetText) && !activitySummary.includes(targetText);
   const summaryText = activitySummary || (step.summary
@@ -1969,6 +2095,7 @@ function LiveTurnProcessTimeline({
   const [expanded, setExpanded] = useState(true);
   if (!model || model.totalCount === 0) return null;
   const title = language === "zh" ? "本轮步骤" : "Turn steps";
+  const stepCount = model.stepCount;
   const summary = model.summaryText || (language === "zh" ? "操作已按步骤折叠。" : "Actions are folded by step.");
   const toggleText = expanded
     ? language === "zh" ? "收起步骤" : "Collapse steps"
@@ -1994,7 +2121,7 @@ function LiveTurnProcessTimeline({
               {title}
             </span>
             <span className="text-[10px] text-[var(--surface-text-muted)]">
-              {language === "zh" ? `${model.stepCount} 步` : `${model.stepCount} step${model.stepCount > 1 ? "s" : ""}`}
+              {language === "zh" ? `${stepCount} 步` : `${stepCount} step${stepCount > 1 ? "s" : ""}`}
             </span>
           </span>
           <span className="mt-1 block whitespace-pre-wrap break-words text-[12px] leading-5 text-[var(--surface-text-subtle)]">{summary}</span>
@@ -2589,7 +2716,8 @@ export default function ChatArea({
     !!topIslandTurn &&
     topIslandTurnStatusKey === "executing";
   const isAwaitingInteractiveChoice =
-    topIslandTurnStatusKey === "awaiting_input" && topIslandReplyOptions.length > 0;
+    (topIslandTurnStatusKey === "awaiting_input" || topIslandTurnStatusKey === "awaiting_approval") &&
+    topIslandReplyOptions.length > 0;
   const shouldShowRunStatus = isStreaming || isAwaitingInteractiveChoice;
   const runStatusLabel = isStreaming
     ? copy.processingLabel
@@ -2828,11 +2956,7 @@ export default function ChatArea({
     }
 
     if (block.type === "progress") {
-      return (
-        <div key={`${block.id}-${index}`} className="flex w-full justify-start">
-          <ProgressBlock block={block} language={language} />
-        </div>
-      );
+      return null;
     }
 
     if (block.type === "jobList") {
@@ -2981,7 +3105,13 @@ export default function ChatArea({
           .find(({ block }) => !block.hiddenProcess && hasRenderableAgentBlock(block))?.idx ?? -1;
     const finalVisibleAgentBlock = finalVisibleAgentIndex >= 0 ? blocks[finalVisibleAgentIndex] : null;
     const isFinishedTurn = isFinishedTurnStatus(turn.status);
+    const showReasoningDebug = config.reasoningDisplay !== "hidden";
+    const shouldRenderLiveProcessTimeline =
+      turnIntent === "studio_workflow" ||
+      selectedMainModeKey === "game_studio";
+    const shouldRenderCompletedProcessArchive = shouldRenderLiveProcessTimeline;
     const shouldArchiveCompletedProcess =
+      shouldRenderCompletedProcessArchive &&
       isFinishedTurn &&
       finalVisibleAgentIndex >= 0;
     const processArchive = shouldArchiveCompletedProcess
@@ -3006,6 +3136,8 @@ export default function ChatArea({
       turn.status === "awaiting_approval" ||
       isPlanApproved;
     const hasCompletePlan = hasPlanContent && planTurnFinished;
+    const planShortcutVisible = shouldPlanShortcutReplaceTurn({ isPlanTurn, hasCompletePlan, isPlanExecutionVisible }) ||
+      (isPlanExecutionVisible && hasCompletePlan);
     const finalAgentSummaryText = getLastAgentSummaryText(blocks);
     const planProgressSummary = turnProgressSnapshot
       ? summarizePlanExecutionProgressSnapshot(turnProgressSnapshot, language)
@@ -3020,8 +3152,7 @@ export default function ChatArea({
     });
     const effectiveProgressSummary = summarizeRuntimeProgressLedger(effectiveProgressLedger, language);
     const activeTurnActivity = getActiveTurnActivity(blocks, turn.status, language);
-    const showReasoningDebug = config.reasoningDisplay !== "hidden";
-    const liveProcessTimeline = !shouldArchiveCompletedProcess
+    const liveProcessTimeline = !shouldArchiveCompletedProcess && shouldRenderLiveProcessTimeline
       ? buildLiveTurnProcessTimelineModel({ blocks, language, includeThoughts: showReasoningDebug })
       : null;
     const liveProcessBlockIds = new Set(
@@ -3054,6 +3185,7 @@ export default function ChatArea({
     const isBottomThoughtStreaming = !!latestThoughtBlock?.isStreaming;
     const renderTurnBlockItem = (item) => {
       if (item.kind !== "readContextGroup" && item.block?.type === "thought") return null;
+      if (item.kind === "block" && shouldSuppressAgentToolEcho(blocks, item.index)) return null;
 
       return renderBlockItem(item);
     };
@@ -3062,7 +3194,10 @@ export default function ChatArea({
       return renderBlockItem(item);
     };
     const isLiveProcessRenderItem = (item) => {
-      if (item.kind === "readContextGroup" || item.kind === "completedToolGroup") {
+      if (item.kind === "readContextGroup") {
+        return false;
+      }
+      if (item.kind === "completedToolGroup") {
         return item.blocks.every((block: any) => liveProcessBlockIds.has(block?.id));
       }
       return liveProcessBlockIds.has(item.block?.id);
@@ -3206,16 +3341,7 @@ export default function ChatArea({
             null
           ) : (
             <>
-              {shouldPlanShortcutReplaceTurn({ isPlanTurn, hasCompletePlan, isPlanExecutionVisible }) && (
-                <PlanShortcutCard
-                  turn={turn}
-                  hasPlanContent={hasPlanContent}
-                  canOpenPlan={hasPlanPanelContent && hasPlanContent}
-                  onOpenPlan={() => openRightPanelTab("plan")}
-                  copy={copy}
-                />
-              )}
-              {isPlanExecutionVisible && hasCompletePlan && (
+              {planShortcutVisible && (
                 <PlanShortcutCard
                   turn={turn}
                   hasPlanContent={hasPlanContent}
@@ -3226,11 +3352,6 @@ export default function ChatArea({
               )}
               {shouldArchiveCompletedProcess ? (
                 <>
-                  <EffectiveProgressLedgerCard
-                    items={effectiveProgressLedger}
-                    language={language}
-                    chatFontSize={resolvedTurnProcessFontSize}
-                  />
                   {processArchive && processArchive.totalCount > 0 && (
                     <TurnProcessArchive
                       archive={processArchive}
@@ -3244,11 +3365,6 @@ export default function ChatArea({
                 </>
               ) : (
                 <>
-                  <EffectiveProgressLedgerCard
-                    items={effectiveProgressLedger}
-                    language={language}
-                    chatFontSize={resolvedTurnProcessFontSize}
-                  />
                   {liveProcessTimeline && liveProcessTimeline.totalCount > 0 && (
                     <LiveTurnProcessTimeline
                       model={liveProcessTimeline}
@@ -3263,13 +3379,14 @@ export default function ChatArea({
               )}
             </>
           )}
-          {(activeTurnActivity || bottomThoughtSummary) && (
+          {(activeTurnActivity || bottomThoughtSummary || effectiveProgressLedger.length > 0) && (
             <TurnActivityNotice
               activityText={activeTurnActivity}
               thoughtSummaryText={bottomThoughtSummary}
               isThinking={isBottomThoughtStreaming}
               language={language}
               chatFontSize={resolvedChatFontSize}
+              progressItems={effectiveProgressLedger}
             />
           )}
         </div>
@@ -3388,7 +3505,7 @@ export default function ChatArea({
           planStage={pinnedPlanTurn ? planStage : "idle"}
           executionSteps={shouldShowPinnedPlanTasks ? [] : topIslandExecutionSteps}
           progressMode={shouldShowPinnedPlanTasks ? "plan" : "execution"}
-          isAwaitingChoice={topIslandTurnStatusKey === "awaiting_input"}
+          isAwaitingChoice={isAwaitingInteractiveChoice}
           replyOptions={topIslandReplyOptions}
           pendingRunDecision={pendingRunDecision}
           activeDiffTask={activeDiffTask}

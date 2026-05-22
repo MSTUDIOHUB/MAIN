@@ -182,6 +182,7 @@ import {
   composePlanArtifactFromEvidence,
   composeReviewablePlanFromEvidence,
   materializePlanArtifactFromVisibleText,
+  sanitizePlanEvidenceInput,
 } from "./planMaterialization";
 import { formatToolPresentation } from "./toolPresentation";
 import {
@@ -216,7 +217,7 @@ import {
 
 // ── Spec file auto-approval helpers ────────────────────────────────
 
-const PRE_APPROVAL_PLAN_FILE_NAMES = new Set(["requirements.md", "plan.md"]);
+const PRE_APPROVAL_PLAN_FILE_NAMES = new Set(["requirements.md", "plan.md", "design.md"]);
 const EXECUTION_PLAN_FILE_NAMES = new Set(["requirements.md", "plan.md", "tasks.md"]);
 const PLAN_ARTIFACT_MUTATION_TOOLS = new Set(["write_file", "replace_in_file"]);
 const PLAN_REPEAT_READ_LIMIT = 3;
@@ -1474,7 +1475,7 @@ function buildNonActionableStopMessage(language: "zh" | "en", reason: "no_output
       case "missing_tool_loop":
         return "模型连续输出说明或代码正文，但没有使用写入/读取工具，本轮已停止。聊天内容不会被当作已写入文件。";
       case "incomplete_plan":
-        return "模型没有生成可审批的计划草稿或计划文件，本轮已停止。请重新发送明确要求写入 `.MAIN/plans/plan.md` 的计划请求，或切换到直接执行。";
+        return "计划生成已暂停：模型输出的计划没有通过质量门，MAIN 也无法从当前干净证据物化出可审批的 `.MAIN/plans/plan.md`。请查看调试日志中的 `plan_evidence_sanitized` 与 `plan_quality_gate_recovery_decision`，优先补足缺失的源码证据或修复证据污染。";
       default:
         return "模型只输出了文字说明，没有产生真实工具调用或文件变更，本轮已停止。";
     }
@@ -1486,7 +1487,7 @@ function buildNonActionableStopMessage(language: "zh" | "en", reason: "no_output
     case "missing_tool_loop":
       return "The model kept producing prose or code in chat without using read/write tools, so this turn stopped. Chat text is not treated as written files.";
     case "incomplete_plan":
-      return "The model did not produce a reviewable plan draft or plan files, so this turn stopped. Send a clearer planning request that explicitly writes `.MAIN/plans/plan.md`, or switch to direct execution.";
+      return "Plan generation paused: the model's plan failed the quality gate, and MAIN could not materialize a reviewable `.MAIN/plans/plan.md` from the current clean evidence. Check `plan_evidence_sanitized` and `plan_quality_gate_recovery_decision` in the debug log, then add the missing source evidence or fix evidence pollution.";
     default:
       return "The model only produced prose and did not create real tool calls or file changes, so this turn stopped.";
   }
@@ -2399,6 +2400,8 @@ function collectPlanClosureMaterializationInput(
   evidence: string[];
   files: string[];
   constraints: string[];
+  sanitizer: ReturnType<typeof sanitizePlanEvidenceInput>["stats"];
+  sanitizerDropped: ReturnType<typeof sanitizePlanEvidenceInput>["dropped"];
 } {
   const memory = callbacks.getContextMemoryState?.() || null;
   const userGoal =
@@ -2424,12 +2427,74 @@ function collectPlanClosureMaterializationInput(
     : collectFallbackToolHighlights(callbacks, attemptedTargets)
       .filter((item) => !/Repeated read-only tool call skipped|Duplicate skip count|already called with identical arguments/i.test(item));
 
-  return {
+  const sanitized = sanitizePlanEvidenceInput({
     userGoal,
     evidence: [...evidenceFromMemory, ...evidenceFromActivity, ...fallbackHighlights],
     files,
     constraints,
+    language: callbacks.getPreferredLanguage(),
+    maxEvidence: 14,
+    maxFiles: 14,
+    maxConstraints: 8,
+  });
+
+  return {
+    userGoal: sanitized.userGoal,
+    evidence: sanitized.evidence,
+    files: sanitized.files,
+    constraints: sanitized.constraints,
+    sanitizer: sanitized.stats,
+    sanitizerDropped: sanitized.dropped,
   };
+}
+
+function hasGroundedPlanClosureEvidence(
+  input: ReturnType<typeof collectPlanClosureMaterializationInput>,
+  recentActivity: PlanToolActivitySummary[] = [],
+): boolean {
+  const hasNonPlanFile = input.files.some((file) => {
+    const target = String(file || "").trim();
+    return !!target && !isPlanArtifactPath(target);
+  });
+  if (hasNonPlanFile) return true;
+
+  const hasSuccessfulReadActivity = recentActivity.some((item) =>
+    item.status === "succeeded" &&
+    PLAN_EXPLORATION_READ_ONLY_TOOLS.has(item.name) &&
+    (!item.target || !isPlanArtifactPath(item.target))
+  );
+  if (hasSuccessfulReadActivity) return true;
+
+  return input.evidence.some((item) => {
+    const text = String(item || "").trim();
+    if (!text) return false;
+    if (/^(?:模型曾尝试修改|model attempted to modify)/i.test(text)) return false;
+    if (/\.MAIN\/plans\/plan\.md/i.test(text) && !/(?:read|读取|search|搜索|evidence|证据|confirmed|已确认)/i.test(text)) return false;
+    return true;
+  });
+}
+
+function resolvePlanClosureArtifactKind(
+  input: ReturnType<typeof collectPlanClosureMaterializationInput>,
+  currentStage: ReturnType<OrchestratorCallbacks["getPlanStage"]>,
+  recentActivity: PlanToolActivitySummary[] = [],
+): "plan" | "design" {
+  if (currentStage === "design") return "design";
+  const text = [
+    input.userGoal,
+    ...input.constraints,
+    ...input.evidence.slice(0, 6),
+  ].join("\n");
+  if (
+    /\.MAIN\/plans\/design\.md/i.test(text) ||
+    /(?:设计方案|设计文档|Design\s+(?:artifact|document|plan)|reviewable,\s*actionable\s*design)/i.test(text)
+  ) {
+    return "design";
+  }
+  if (hasSuccessfulTabularActivity(recentActivity) && /(?:\.csv|\.tsv|\.xlsx|表格|数据|tabular|spreadsheet)/i.test(text)) {
+    return "design";
+  }
+  return "plan";
 }
 
 function hasSuccessfulTabularActivity(recentActivity: PlanToolActivitySummary[]): boolean {
@@ -2671,10 +2736,14 @@ export function isStreamWatchdogTimeoutMessage(message: string): boolean {
   const normalized = String(message || "").toLowerCase();
   return (
     normalized.includes("stream_first_chunk_timeout") ||
+    normalized.includes("stream_idle_timeout") ||
     normalized.includes("stream_no_visible_token_timeout") ||
+    normalized.includes("stream_no_visible_progress_timeout") ||
     normalized.includes("first chunk timeout") ||
     normalized.includes("first response timeout") ||
     normalized.includes("没有返回首个流式 chunk") ||
+    normalized.includes("没有继续输出") ||
+    normalized.includes("首个流式 chunk") ||
     normalized.includes("长时间没有返回可见流式内容") ||
     normalized.includes("没有返回响应头")
   );
@@ -3018,7 +3087,7 @@ interface ToolExecutionResult {
 interface PlanMaterializationResultForLoop {
   ok: boolean;
   path?: string;
-  kind?: "plan";
+  kind?: "plan" | "design";
   content?: string;
   reason?: string;
   toolResult?: ToolExecutionResult;
@@ -3028,7 +3097,7 @@ async function writeMaterializedPlanArtifact(input: {
   materialized: {
     ok: boolean;
     path?: string;
-    kind?: "plan";
+    kind?: "plan" | "design";
     content?: string;
     reason?: string;
   };
@@ -3189,7 +3258,7 @@ export function buildToolActionNarration(input: {
 
   const hasPlanWrite = presentations.some((item) =>
     PLAN_ARTIFACT_MUTATION_TOOLS.has(item.name) &&
-    item.target.replace(/\\/g, "/").toLowerCase().endsWith(".main/plans/plan.md")
+    /\.(?:main|MAIN)\/plans\/(?:requirements|plan|design|bugfix)\.md$/i.test(item.target.replace(/\\/g, "/"))
   );
   const hasReadOrAnalysis = presentations.some((item) =>
     [
@@ -4438,6 +4507,36 @@ function logAgentEvent(event: string, data: Record<string, unknown> = {}) {
   }
 }
 
+function compactDiagnosticText(value: unknown, maxChars = 260): string {
+  const text = String(value ?? "")
+    .replace(/\[MAIN_TOOL_FEEDBACK_V1\]\{[^\n]*\}/g, "[tool-feedback-envelope]")
+    .replace(/"tool_call_id"\s*:\s*"[^"]*"/gi, "\"tool_call_id\":\"[redacted]\"")
+    .replace(/\btool_call_id\s*[:=]\s*[^\s,;}]+/gi, "tool_call_id=[redacted]")
+    .replace(/\bhash\s*[:=]\s*[a-f0-9]{6,}/gi, "hash=[redacted]")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!text) return "";
+  return text.length <= maxChars ? text : `${text.slice(0, maxChars).trim()}...`;
+}
+
+function collectDiagnosticNoiseIndicators(value: unknown): string[] {
+  const raw = String(value ?? "");
+  const indicators: string[] = [];
+  const checks: Array<[string, RegExp]> = [
+    ["tool_feedback_envelope", /\[MAIN_TOOL_FEEDBACK_V1\]|MAIN\s+TOOL\s+FEEDBACK/i],
+    ["tool_call_id", /\btool_call_id\b|\btool call id\b/i],
+    ["observed_status", /\bstatus\s*[:=]\s*observed\b/i],
+    ["hash_field", /\bhash\s*[:=]/i],
+    ["excerpt_field", /\bexcerpt\s*[:=]/i],
+    ["context_memory", /ContextMemoryState|ContextState/i],
+    ["xml_tool_markup", /<\/?(?:tool_use|tool_call|function_call|tool|parameter)\b/i],
+  ];
+  for (const [name, pattern] of checks) {
+    if (pattern.test(raw)) indicators.push(name);
+  }
+  return indicators;
+}
+
 function summarizeMessageContentForDiagnostics(content: AgentMessage["content"]): {
   chars: number;
   images: number;
@@ -4699,6 +4798,41 @@ export async function executeAgentLoop(
     turnId: eventTurnId,
     timestampMs: Date.now(),
   });
+  {
+    const language = callbacks.getPreferredLanguage();
+    const userGoal = compactDiagnosticText(getOriginalUserPromptForPlanFallback(callbacks), 220);
+    const hasImages = callbacks.getMessages().some((message) =>
+      Array.isArray(message.content) &&
+      message.content.some((part: any) => part?.type === "image_url" || part?.type === "input_image")
+    );
+    emitTurnEvent({
+      type: "progress.updated",
+      threadId: eventThreadId,
+      turnId: eventTurnId,
+      timestampMs: Date.now(),
+      progress: {
+        phase: "understanding",
+        title: language === "zh" ? "理解需求" : "Understanding request",
+        status: "running",
+        summary: hasImages
+          ? language === "zh"
+            ? "正在理解用户目标、截图内容和执行约束，随后再定向读取必要证据。"
+            : "Understanding the user goal, screenshots, and constraints before targeted evidence reads."
+          : language === "zh"
+          ? "正在理解用户目标、约束和安全边界，随后选择最小必要行动。"
+          : "Understanding the user goal, constraints, and safety boundary before choosing the smallest useful action.",
+        evidence: userGoal ? (language === "zh" ? `用户目标：${userGoal}` : `User goal: ${userGoal}`) : "",
+        next: workflowMode === "plan" && !callbacks.getIsPlanApproved()
+          ? language === "zh"
+            ? "先做只读证据收束；批准前只允许生成计划文件。"
+            : "First gather read-only evidence; before approval only plan artifacts may be written."
+          : language === "zh"
+          ? "进入定向上下文读取、执行或明确阻塞。"
+          : "Move into targeted context reads, execution, or a concrete blocker.",
+        dedupeKey: `understanding:${eventTurnId}`,
+      },
+    });
+  }
 
   logAgentEvent("runtime_settings", {
     baseUrl: settings.baseUrl,
@@ -5203,6 +5337,7 @@ export async function executeAgentLoop(
   let usedExecuteConvergencePrompt = false;
   let usedPlanClosureGuard = false;
   let usedPlanClosurePrompt = false;
+  let usedPlanDeterministicQualityClosure = false;
   let usedPlanReadOnlyConvergencePrompt = false;
   let planPostConvergenceToolRedirectCount = 0;
   let planRuntimePhase: PlanRuntimePhase = workflowMode === "plan" && !callbacks.getIsPlanApproved()
@@ -5325,6 +5460,15 @@ export async function executeAgentLoop(
       isPlanApproved: callbacks.getIsPlanApproved(),
       statusBeforeReview: callbacks.getStatus(),
     });
+    if (stage === "design") {
+      logAgentEvent("plan_design_review_ready_after_tool", {
+        trigger,
+        iteration,
+        planStage: stage,
+        isPlanApproved: callbacks.getIsPlanApproved(),
+        statusBeforeReview: callbacks.getStatus(),
+      });
+    }
     setPlanRuntimePhase("review_ready", "quality gate accepted", "done");
     callbacks.onAssistantFinalText(buildPlanReviewReadyMessage(language, stage));
     const approved = await waitForPlanApprovalIfNeeded();
@@ -5349,6 +5493,128 @@ export async function executeAgentLoop(
     return "approved_continue";
   }
 
+  async function materializePlanFromEvidenceForReview(trigger: string, details: {
+    qualityGateReason?: string;
+    qualityRejectCount?: number;
+  } = {}): Promise<"not_attempted" | "failed" | "stopped" | "approved_continue"> {
+    if (workflowMode !== "plan" || callbacks.getIsPlanApproved()) return "not_attempted";
+    if (isReviewablePlanStage(callbacks.getPlanStage())) {
+      const reviewResult = await pauseForReviewablePlanArtifact(trigger);
+      if (reviewResult === "approved_continue") return "approved_continue";
+      if (reviewResult === "stopped") return "stopped";
+    }
+
+    const closureInput = collectPlanClosureMaterializationInput(
+      callbacks,
+      recentPlanToolActivity,
+      attemptedPlanWriteTargets,
+    );
+    logAgentEvent("plan_evidence_sanitized", {
+      trigger,
+      iteration,
+      ...closureInput.sanitizer,
+      droppedPreview: closureInput.sanitizerDropped
+        .slice(0, 6)
+        .map((item) => ({
+          bucket: item.bucket,
+          reason: item.reason,
+          preview: compactDiagnosticText(item.preview, 140),
+        })),
+    });
+    if (!hasGroundedPlanClosureEvidence(closureInput, recentPlanToolActivity)) {
+      logAgentEvent("plan_deterministic_materialization_skipped", {
+        trigger,
+        reason: "missing_grounded_evidence",
+        evidenceCount: closureInput.evidence.length,
+        fileCount: closureInput.files.length,
+        qualityGateReason: details.qualityGateReason || "",
+        qualityRejectCount: details.qualityRejectCount || 0,
+      });
+      return "not_attempted";
+    }
+
+    const closureDiagnosticSource = [
+      ...closureInput.evidence,
+      ...closureInput.files,
+      closureInput.userGoal,
+    ].join("\n");
+    const evidencePreview = closureInput.evidence
+      .slice(0, 5)
+      .map((item) => compactDiagnosticText(item, 180))
+      .filter(Boolean);
+    logAgentEvent("plan_deterministic_materialization_attempt", {
+      trigger,
+      iteration,
+      evidenceCount: closureInput.evidence.length,
+      fileCount: closureInput.files.length,
+      filePreview: closureInput.files.slice(0, 8),
+      evidencePreview,
+      noiseIndicators: collectDiagnosticNoiseIndicators(closureDiagnosticSource),
+      qualityGateReason: details.qualityGateReason || "",
+      qualityRejectCount: details.qualityRejectCount || 0,
+    });
+
+    const deterministicContent = composePlanArtifactFromEvidence({
+      ...closureInput,
+      language: callbacks.getPreferredLanguage(),
+    });
+    const materialized = materializePlanArtifactFromVisibleText({
+      visibleText: deterministicContent,
+      preferredKind: "plan",
+      userGoal: closureInput.userGoal,
+      evidence: closureInput.evidence,
+      files: closureInput.files,
+      language: callbacks.getPreferredLanguage(),
+    });
+
+    if (!materialized.ok) {
+      logAgentEvent("plan_deterministic_materialization_rejected", {
+        trigger,
+        reason: materialized.reason || "unknown",
+        evidenceCount: closureInput.evidence.length,
+        fileCount: closureInput.files.length,
+        validationReason: materialized.reason || "unknown",
+        deterministicContentChars: deterministicContent.length,
+        deterministicContentPreview: compactDiagnosticText(deterministicContent, 420),
+        evidencePreview,
+        filePreview: closureInput.files.slice(0, 8),
+        noiseIndicators: collectDiagnosticNoiseIndicators(`${deterministicContent}\n${closureDiagnosticSource}`),
+        qualityGateReason: details.qualityGateReason || "",
+        qualityRejectCount: details.qualityRejectCount || 0,
+      });
+      return "failed";
+    }
+
+    logAgentEvent("plan_deterministic_materialization_success", {
+      trigger,
+      iteration,
+      evidenceCount: closureInput.evidence.length,
+      fileCount: closureInput.files.length,
+      targetPath: materialized.path || ".MAIN/plans/plan.md",
+      qualityGateReason: details.qualityGateReason || "",
+      qualityRejectCount: details.qualityRejectCount || 0,
+    });
+    const writeResult = await writeMaterializedPlanArtifact({
+      materialized,
+      workspace,
+      callbacks,
+      toolCallPrefix: "plan_deterministic",
+    });
+    if (!writeResult.ok) {
+      logAgentEvent("plan_deterministic_write_failed", {
+        trigger,
+        iteration,
+        reason: writeResult.reason || "unknown",
+      });
+      return "failed";
+    }
+
+    const reviewResult = await pauseForReviewablePlanArtifact(trigger);
+    if (reviewResult === "approved_continue") return "approved_continue";
+    if (reviewResult === "stopped") return "stopped";
+    return "failed";
+  }
+
   async function tryClosePlanWithEvidence(trigger: string, details: {
     consecutiveEmptyResponseCount?: number;
     rejectedVisibleChars?: number;
@@ -5363,6 +5629,8 @@ export async function executeAgentLoop(
     const evidenceCount = closureInput.evidence.length;
     const currentStage = callbacks.getPlanStage();
     const hasReviewablePlanArtifacts = isReviewablePlanStage(currentStage);
+    const closureKind = resolvePlanClosureArtifactKind(closureInput, currentStage, recentPlanToolActivity);
+    const targetPath = closureKind === "design" ? ".MAIN/plans/design.md" : ".MAIN/plans/plan.md";
     const shouldAttempt = shouldAttemptPlanClosureGuard({
       workflowMode,
       isPlanApproved: callbacks.getIsPlanApproved(),
@@ -5374,57 +5642,17 @@ export async function executeAgentLoop(
 
     if (!shouldAttempt) return "not_attempted";
     if (usedPlanClosureGuard) {
-      const deterministicContent = composePlanArtifactFromEvidence({
-        ...closureInput,
-        language: callbacks.getPreferredLanguage(),
-      });
-      const materialized = materializePlanArtifactFromVisibleText({
-        visibleText: deterministicContent,
-        userGoal: closureInput.userGoal,
-        evidence: closureInput.evidence,
-        files: closureInput.files,
-        language: callbacks.getPreferredLanguage(),
-      });
-      if (materialized.ok) {
-        logAgentEvent("plan_closure_deterministic_materialization", {
-          trigger,
-          iteration,
-          evidenceCount,
-          fileCount: closureInput.files.length,
-          targetPath: materialized.path || ".MAIN/plans/plan.md",
-        });
-        const writeResult = await writeMaterializedPlanArtifact({
-          materialized,
-          workspace,
-          callbacks,
-          toolCallPrefix: "plan_closure_deterministic",
-        });
-        if (writeResult.ok) {
-          const reviewResult = await pauseForReviewablePlanArtifact("deterministic_plan_closure");
-          if (reviewResult === "approved_continue") return "approved_continue";
-          if (reviewResult === "stopped") return "stopped";
-        } else {
-          logAgentEvent("plan_closure_deterministic_write_failed", {
-            trigger,
-            iteration,
-            reason: writeResult.reason || "unknown",
-          });
-        }
-      } else {
-        logAgentEvent("plan_closure_deterministic_materialization_rejected", {
-          trigger,
-          iteration,
-          reason: materialized.reason || "unknown",
-          evidenceCount,
-          fileCount: closureInput.files.length,
-        });
+      if (closureKind === "plan") {
+        const deterministicResult = await materializePlanFromEvidenceForReview("deterministic_plan_closure");
+        if (deterministicResult === "approved_continue") return "approved_continue";
+        if (deterministicResult === "stopped") return "stopped";
       }
       logAgentEvent("plan_closure_artifact_rejected", {
         trigger,
         iteration,
         reason: "design_closure_prompt_already_used",
         evidenceCount,
-        targetPath: ".MAIN/plans/plan.md",
+        targetPath,
       });
       return "failed";
     }
@@ -5435,15 +5663,19 @@ export async function executeAgentLoop(
       evidenceCount,
       fileCount: closureInput.files.length,
       constraintCount: closureInput.constraints.length,
-      targetPath: ".MAIN/plans/plan.md",
+      targetPath,
+      closureKind,
+      userGoalPreview: compactDiagnosticText(closureInput.userGoal, 160),
       planStage: currentStage,
     });
 
     if (!usedPlanClosurePrompt) {
       usedPlanClosureGuard = true;
       usedPlanClosurePrompt = true;
+      setPlanRuntimePhase("drafting", `${closureKind} closure prompt ready`);
       const prompt = composeReviewablePlanFromEvidence({
         ...closureInput,
+        kind: closureKind,
         language: callbacks.getPreferredLanguage(),
       });
       logAgentEvent("plan_closure_prompt", {
@@ -5451,8 +5683,17 @@ export async function executeAgentLoop(
         iteration,
         evidenceCount,
         fileCount: closureInput.files.length,
-        targetPath: ".MAIN/plans/plan.md",
+        targetPath,
       });
+      if (closureKind === "design") {
+        logAgentEvent("plan_design_closure_prompt", {
+          trigger,
+          iteration,
+          evidenceCount,
+          fileCount: closureInput.files.length,
+          targetPath,
+        });
+      }
       callbacks.onStatusChange("running");
       callbacks.appendMessage({
         role: "user",
@@ -8770,6 +9011,11 @@ export async function executeAgentLoop(
     });
     const wasPlanEvidenceRecoveryPhase = String(planRuntimePhase) === "needs_evidence";
     let pendingPlanRuntimeRecoveryPrompt: string | null = null;
+    let pendingPlanDeterministicQualityClosure: {
+      trigger: string;
+      qualityGateReason: string;
+      qualityRejectCount: number;
+    } | null = null;
     const planQualityRecoveryResults = allResults.filter((result) =>
       result.internalFeedback &&
       !!result.planRecoveryAction
@@ -8810,6 +9056,41 @@ export async function executeAgentLoop(
         }
       } else {
         setPlanRuntimePhase("needs_rewrite", planLastQualityGateReason);
+      }
+
+      const qualityClosureEvidence = collectPlanClosureMaterializationInput(
+        callbacks,
+        recentPlanToolActivity,
+        attemptedPlanWriteTargets,
+      );
+      const hasQualityClosureEvidence = hasGroundedPlanClosureEvidence(
+        qualityClosureEvidence,
+        recentPlanToolActivity,
+      );
+      const shouldDeterministicallyClosePlanAfterQualityGate =
+        !usedPlanDeterministicQualityClosure &&
+        latestQualityResult.planRecoveryAction !== "targeted_evidence" &&
+        planQualityRejectCount >= 1 &&
+        hasQualityClosureEvidence;
+      logAgentEvent("plan_quality_gate_recovery_decision", {
+        iteration,
+        qualityGateReason: planLastQualityGateReason,
+        qualityRejectCount: planQualityRejectCount,
+        recoveryAction: latestQualityResult.planRecoveryAction || "",
+        hasGroundedEvidence: hasQualityClosureEvidence,
+        deterministicClosure: shouldDeterministicallyClosePlanAfterQualityGate,
+        sanitizedEvidenceCount: qualityClosureEvidence.evidence.length,
+        sanitizedFileCount: qualityClosureEvidence.files.length,
+        sanitizerDropped: qualityClosureEvidence.sanitizer.dropped,
+        sanitizerDropReasons: qualityClosureEvidence.sanitizer.dropReasons,
+      });
+      if (shouldDeterministicallyClosePlanAfterQualityGate) {
+        pendingPlanRuntimeRecoveryPrompt = null;
+        pendingPlanDeterministicQualityClosure = {
+          trigger: "plan_quality_gate_repeated_rewrite",
+          qualityGateReason: planLastQualityGateReason,
+          qualityRejectCount: planQualityRejectCount,
+        };
       }
     }
 
@@ -9021,6 +9302,38 @@ export async function executeAgentLoop(
         content: pendingPlanRuntimeRecoveryPrompt,
       });
       continue;
+    }
+
+    if (pendingPlanDeterministicQualityClosure) {
+      usedPlanDeterministicQualityClosure = true;
+      const closureResult = await materializePlanFromEvidenceForReview(
+        pendingPlanDeterministicQualityClosure.trigger,
+        {
+          qualityGateReason: pendingPlanDeterministicQualityClosure.qualityGateReason,
+          qualityRejectCount: pendingPlanDeterministicQualityClosure.qualityRejectCount,
+        },
+      );
+      if (closureResult === "approved_continue") continue;
+      if (closureResult === "stopped") return;
+      if (closureResult === "failed") {
+        logAgentEvent("plan_quality_deterministic_closure_failed", {
+          iteration,
+          qualityGateReason: pendingPlanDeterministicQualityClosure.qualityGateReason,
+          qualityRejectCount: pendingPlanDeterministicQualityClosure.qualityRejectCount,
+        });
+        callbacks.onNonActionableStop(
+          buildNonActionableStopMessage(callbacks.getPreferredLanguage(), "incomplete_plan"),
+          "incomplete_plan",
+          {
+            recoveryReason: "plan_quality_deterministic_closure_failed",
+            nextStep: callbacks.getPreferredLanguage() === "zh"
+              ? "检查计划证据账本和质量门禁，避免继续重复写同一个 plan.md"
+              : "inspect the plan evidence ledger and quality gate instead of repeatedly writing the same plan.md",
+          },
+        );
+        callbacks.onStatusChange("idle");
+        return;
+      }
     }
 
     if (approvedPlanNoProgressDecision) {

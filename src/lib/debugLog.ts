@@ -169,6 +169,36 @@ function formatEntry(entry: DebugLogEntry): string {
   return `[${entry.timestamp}] [${entry.level}] [${entry.source}] ${entry.message}`;
 }
 
+function isRoutineDebugEntry(entry: DebugLogEntry): boolean {
+  if (entry.level === "warn" || entry.level === "error") return false;
+  const source = String(entry.source || "");
+  const message = String(entry.message || "");
+
+  if (
+    source === "store.append_agent_message" ||
+    source === "store.replace_agent_messages" ||
+    source === "stream_chunk_progress" ||
+    source === "harness.chunk_progress" ||
+    source === "store.stream_first_token"
+  ) {
+    return true;
+  }
+
+  if (source === "store.status_change" && /"status":"running"/i.test(message)) {
+    return true;
+  }
+
+  if (source === "streamViaRustProxy" && /invoking start_chat_stream/i.test(message)) {
+    return true;
+  }
+
+  if (source === "start_chat_stream" && /^first_chunk\b/i.test(message)) {
+    return true;
+  }
+
+  return false;
+}
+
 function elapsedSinceBootMs() {
   const now = typeof performance !== "undefined" ? performance.now() : Date.now();
   return Math.round(now - DEBUG_LOG_BOOT_TIME);
@@ -263,6 +293,8 @@ export function appendDebugLog(
     message: normalizeMessage(message),
   };
 
+  if (isRoutineDebugEntry(entry)) return;
+
   appendLocalEntry(entry);
 
   if (options.persistToRust === false) return;
@@ -353,12 +385,15 @@ export function installDebugLogCapture() {
   });
 
   void listen<DebugLogEntry>("main-debug-log", (event) => {
-    appendLocalEntry({
+    const entry = {
       timestamp: String(event.payload.timestamp || toIsoTimestamp()),
       level: (event.payload.level as DebugLogLevel) || "info",
       source: event.payload.source || "rust",
       message: normalizeMessage(event.payload.message || ""),
-    });
+    };
+    if (!isRoutineDebugEntry(entry)) {
+      appendLocalEntry(entry);
+    }
   })
     .then((unlisten) => {
       rustLogUnlisten = unlisten;

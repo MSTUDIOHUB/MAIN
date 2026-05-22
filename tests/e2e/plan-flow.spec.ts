@@ -263,7 +263,7 @@ for (const scenario of ["plan-quick-reply-materialize-gemma", "plan-quick-reply-
       .toEqual({
         isPlanApproved: true,
         planStage: "executing",
-        planArtifactPaths: [".MAIN/plans/design.md"],
+        planArtifactPaths: [".MAIN/plans/plan.md"],
         taskFlowUserCount: 1,
       });
 

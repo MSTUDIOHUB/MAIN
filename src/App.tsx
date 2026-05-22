@@ -169,9 +169,18 @@ async function materializePlanQuickReplyAndApprove(params: {
   visiblePlanText: string;
 }): Promise<void> {
   const state = useAppStore.getState();
+  const sourceTurn = params.sourceTurnId
+    ? state.conversationTurns.find((turn) => turn.id === params.sourceTurnId) || null
+    : null;
   const materialized = materializePlanArtifactFromVisibleText({
     visibleText: params.visiblePlanText,
     planStage: state.planStage,
+    userGoal: sourceTurn?.userPrompt || "",
+    evidence: [
+      state.config.language === "en"
+        ? "The user explicitly approved the visible plan text in ChatArea; materialize that reviewed text before execution."
+        : "用户已在聊天区明确批准当前可见方案；先将这份已审阅文本物化为计划文件再进入执行。",
+    ],
   });
 
   if (!materialized.ok || !materialized.path || !materialized.content || !materialized.kind) {
@@ -1475,6 +1484,12 @@ export default function App() {
       ? materializePlanArtifactFromVisibleText({
           visibleText: sourceVisiblePlanText,
           planStage: state.planStage,
+          userGoal: sourceTurn?.userPrompt || "",
+          evidence: [
+            state.config.language === "en"
+              ? "The user can approve this visible plan text from ChatArea; use it as review evidence for quick-reply materialization."
+              : "用户可以从聊天区批准这份可见方案；将其作为 quick reply 物化的审阅证据。",
+          ],
         })
       : { ok: false, reason: "missing_visible_plan" };
     const planApprovalQuickReplyAction = resolvePlanApprovalQuickReplyAction({

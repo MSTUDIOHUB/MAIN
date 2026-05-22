@@ -53,9 +53,18 @@ function loadTranspiledModuleSync(sourcePath) {
   return module.exports;
 }
 
-const { composeReviewablePlanFromEvidence, isMaterializablePlanLikeText, materializePlanArtifactFromVisibleText } = loadTranspiledModuleSync(
+const {
+  composePlanArtifactFromEvidence,
+  composeReviewablePlanFromEvidence,
+  isMaterializablePlanLikeText,
+  materializePlanArtifactFromVisibleText,
+  sanitizePlanEvidenceInput,
+} = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/planMaterialization.ts"),
 );
+const {
+  validateActionablePlanArtifact,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/workflowModels.ts"));
 
 test("materializes valid visible plan text into plan.md artifact", () => {
   const result = materializePlanArtifactFromVisibleText({
@@ -464,4 +473,127 @@ test("composes strict plan closure prompt from evidence without tool logs", () =
   assert.match(prompt, /课程名称/);
   assert.doesNotMatch(prompt, /MAIN TOOL FEEDBACK/);
   assert.doesNotMatch(prompt, /ContextMemoryState v1/);
+});
+
+test("composes deterministic reviewable plan artifact after repeated quality rejects", () => {
+  const content = composePlanArtifactFromEvidence({
+    userGoal: "修复 CSV 导入后 Dashboard 指标没有正确更新的问题。",
+    evidence: [
+      "read_file src/store/dashboardStore.ts; excerpt=store 保存 dashboard 指标和导入状态",
+      "read_file src/hooks/useCsvParser.ts; excerpt=解析 CSV 行并返回记录",
+      "read_file src/hooks/useChartData.ts; excerpt=映射图表数据",
+    ],
+    files: [
+      "src/store/dashboardStore.ts",
+      "src/hooks/useCsvParser.ts",
+      "src/hooks/useChartData.ts",
+    ],
+    constraints: ["批准前不修改源码。"],
+    language: "zh",
+  });
+
+  assert.equal(validateActionablePlanArtifact(content).ok, true);
+  assert.match(content, /## 已读证据/);
+  assert.match(content, /dashboardStore\.ts/);
+  assert.doesNotMatch(content, /MAIN TOOL FEEDBACK|ContextMemoryState|RecoveryDetails/);
+});
+
+test("composes deterministic plan artifact from real tool feedback without leaking envelopes", () => {
+  const content = composePlanArtifactFromEvidence({
+    userGoal: "修复 CSV 导入后 Dashboard 指标没有正确更新的问题。",
+    evidence: [
+      `[MAIN_TOOL_FEEDBACK_V1]{"version":1,"status":"completed","tool_call_id":"call_a","tool":"read_file","target":"src/store/dashboardStore.ts","summary":"status=observed hash=abc123 excerpt=store 保存 dashboard 指标和导入状态"}\nraw file body omitted`,
+      "read_file; src/hooks/useCsvParser.ts; status=observed hash=def456 excerpt=解析 CSV 行并返回记录",
+      "tool=read_file target=src/hooks/useChartData.ts status=observed hash=ghi789 excerpt=映射图表数据",
+    ],
+    files: [
+      "src/store/dashboardStore.ts",
+      "src/hooks/useCsvParser.ts",
+      "src/hooks/useChartData.ts",
+    ],
+    constraints: ["批准前不修改源码。"],
+    language: "zh",
+  });
+
+  assert.equal(validateActionablePlanArtifact(content).ok, true);
+  assert.match(content, /已读取文件：src\/store\/dashboardStore\.ts/);
+  assert.match(content, /useCsvParser\.ts/);
+  assert.match(content, /useChartData\.ts/);
+  assert.doesNotMatch(content, /MAIN_TOOL_FEEDBACK|tool_call_id|status=observed|hash=|excerpt=/);
+});
+
+test("sanitizes repeated quality-gate evidence before deterministic plan materialization", () => {
+  const sanitized = sanitizePlanEvidenceInput({
+    userGoal: "修复 ChatArea 有效进展和计划生成流程。",
+    evidence: [
+      "read_file src/App.tsx; status=observed; 6,604 chars; hash=yvpop5; summary=READ_FILE_RESULT path: src/App.tsx truncated: true totalLines: 292 returnedLines: 1-180",
+      "write_file .MAIN/plans/plan.md; status=failed; 303 chars; hash=1lazvvo; summary=Error: PLAN NOT READY: .MAIN/plans/plan.md 没有写入。",
+      "...[ContextMemory truncated to fit request budget]",
+      "get_project_skeleton get_project_skeleton; status=failed; summary=Error: TASK_TARGETING_BLOCKED",
+      "glob_search **/*.ts; status=observed; exit=439376; summary=[\"node_modules/@ant-design/colors/es/generate.d.ts\",\"src/App.ts\"]",
+      `[MAIN_TOOL_FEEDBACK_V1]{"version":1,"status":"completed","tool_call_id":"call_a","tool":"read_file","target":"src/components/ChatArea.tsx","summary":"status=observed hash=abc123 excerpt=ChatArea renders progress blocks"}\nREAD_FILE_RESULT path: src/components/ChatArea.tsx`,
+    ],
+    files: [
+      "src/App.tsx via read_file; hash=yvpop5; 6,604 chars",
+      ".MAIN/plans/plan.md via write_file; hash=1lazvvo; 303 chars",
+      "...[ContextMemory truncated to fit request budget]",
+      "src/components/ChatArea.tsx",
+    ],
+    constraints: ["批准前不修改源码。", "ContextMemoryState v1: noisy"],
+    language: "zh",
+  });
+
+  assert.deepEqual(sanitized.files.sort(), ["src/App.tsx", "src/components/ChatArea.tsx"].sort());
+  assert.equal(sanitized.evidence.length, 2);
+  assert.match(sanitized.evidence.join("\n"), /read_file src\/App\.tsx/);
+  assert.match(sanitized.evidence.join("\n"), /read_file src\/components\/ChatArea\.tsx/);
+  assert.doesNotMatch(sanitized.evidence.join("\n"), /PLAN NOT READY|ContextMemory|hash=|status=|READ_FILE_RESULT|TASK_TARGETING_BLOCKED|\*\*\/\*\.ts|node_modules/);
+  assert.equal(sanitized.stats.dropReasons.plan_artifact_tool_log, 1);
+  assert.ok(sanitized.stats.dropped >= 3);
+
+  const content = composePlanArtifactFromEvidence({
+    userGoal: sanitized.userGoal,
+    evidence: sanitized.evidence,
+    files: sanitized.files,
+    constraints: sanitized.constraints,
+    language: "zh",
+  });
+
+  assert.equal(validateActionablePlanArtifact(content).ok, true);
+  assert.doesNotMatch(content, /PLAN NOT READY|ContextMemory|hash=|status=|READ_FILE_RESULT|TASK_TARGETING_BLOCKED/);
+});
+
+test("materializes explicit design text to design.md", () => {
+  const result = materializePlanArtifactFromVisibleText({
+    visibleText: [
+      "# Design",
+      "",
+      "## 用户目标与约束",
+      "- 目标：基于 orders.csv 设计课程销售分析自动化流程。",
+      "- 约束：批准前只写 `.MAIN/plans/design.md`，不生成 tasks.md。",
+      "",
+      "## 当前发现",
+      "- 已读取课程名称样例，确认 CSV 可通过表格工具查询。",
+      "",
+      "## 方案",
+      "- 识别字段、校验金额和时间格式，再生成课程维度销售摘要。",
+      "",
+      "## 影响文件与接口",
+      "- 计划文件：`.MAIN/plans/design.md`。",
+      "",
+      "## 执行顺序",
+      "1. 明确字段映射。",
+      "2. 设计聚合指标。",
+      "3. 审批后再生成任务清单。",
+      "",
+      "## 数据流与验证",
+      "- 数据流：CSV 输入 -> 表格查询 -> 指标汇总 -> 报表草稿。",
+      "- 验证：抽样核对课程名称、订单数和金额聚合结果。",
+    ].join("\n"),
+    language: "zh",
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.kind, "design");
+  assert.equal(result.path, ".MAIN/plans/design.md");
 });

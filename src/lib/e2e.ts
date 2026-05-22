@@ -17,6 +17,7 @@ const FEISHU_REMOTE_ANALYSIS_SCENARIO = "feishu-remote-analysis";
 const READ_CONTEXT_COLLAPSE_SCENARIO = "read-context-collapse";
 const READ_CONTEXT_INTERLEAVED_SCENARIO = "read-context-interleaved";
 const READ_CONTEXT_AGENT_SEGMENT_SCENARIO = "read-context-agent-segment";
+const READ_CONTEXT_PERSISTENT_PROGRESS_SCENARIO = "read-context-persistent-progress";
 const PROCESS_DISPLAY_SCENARIO = "process-display";
 const GAME_STUDIO_ONBOARDING_SCENARIO = "game-studio-onboarding";
 const COMPOSER_MAIN_SHORTCUTS_SCENARIO = "composer-main-shortcuts";
@@ -1634,6 +1635,178 @@ function seedReadContextAgentSegmentScenario() {
 
   bindBridgeSnapshot(READ_CONTEXT_AGENT_SEGMENT_SCENARIO);
   appendBridgeEvent("seeded", { seedCount: readSeedCount(READ_CONTEXT_AGENT_SEGMENT_SCENARIO) });
+
+  const cleanup = () => {
+    bridge.initialized = false;
+  };
+
+  bridge.cleanup = cleanup;
+  return cleanup;
+}
+
+function seedReadContextPersistentProgressScenario() {
+  const bridge = getBridge();
+  if (!bridge) return undefined;
+
+  bridge.events = [{ type: "boot" }];
+  bridge.savedDocuments = [];
+  bridge.completed = true;
+
+  const planTurnId = "e2e-read-context-persistent-plan-turn";
+  const followupTurnId = "e2e-read-context-persistent-followup-turn";
+  const sessionId = 999028;
+  const now = Date.now();
+  const nextId = () => useAppStore.getState()._nextTaskId();
+  const planUserBlockId = nextId();
+  const readOneBlockId = nextId();
+  const duplicateReadBlockId = nextId();
+  const readTwoBlockId = nextId();
+  const planWriteBlockId = nextId();
+  const planAgentBlockId = nextId();
+  const followupUserBlockId = nextId();
+  const followupAgentBlockId = nextId();
+  const taskFlow: any[] = [
+    {
+      id: planUserBlockId,
+      turnId: planTurnId,
+      type: "user" as const,
+      content: "先读取关键文件并生成可审批计划，批准前不要改源码。",
+    },
+    {
+      id: readOneBlockId,
+      turnId: planTurnId,
+      type: "tool" as const,
+      toolName: "read_file",
+      target: "src/store/dashboardStore.ts",
+      status: "done",
+      toolStatus: "executed" as const,
+      observationSummary: "确认 Dashboard 指标和导入状态入口。",
+      message: "OK",
+    },
+    {
+      id: duplicateReadBlockId,
+      turnId: planTurnId,
+      type: "tool" as const,
+      toolName: "read_file",
+      target: "src/store/dashboardStore.ts",
+      status: "done",
+      toolStatus: "executed" as const,
+      message: "FILE_UNCHANGED_STUB: src/store/dashboardStore.ts",
+    },
+    {
+      id: readTwoBlockId,
+      turnId: planTurnId,
+      type: "tool" as const,
+      toolName: "read_file",
+      target: "src/hooks/useCsvParser.ts",
+      status: "done",
+      toolStatus: "executed" as const,
+      observationSummary: "确认 CSV 解析输出记录结构。",
+      message: "OK",
+    },
+    {
+      id: planWriteBlockId,
+      turnId: planTurnId,
+      type: "tool" as const,
+      toolName: "write_file",
+      target: ".MAIN/plans/plan.md",
+      status: "done",
+      toolStatus: "executed" as const,
+      message: "Wrote .MAIN/plans/plan.md",
+    },
+    {
+      id: planAgentBlockId,
+      turnId: planTurnId,
+      type: "agent" as const,
+      content: "我已经生成了可审批计划文件 .MAIN/plans/plan.md，现在停在审批阶段。请审阅右侧计划面板，确认后再进入执行。",
+      streaming: false,
+    },
+    {
+      id: followupUserBlockId,
+      turnId: followupTurnId,
+      type: "user" as const,
+      content: "这是一条后续消息，用来确认上一轮进展不会被刷新掉。",
+    },
+    {
+      id: followupAgentBlockId,
+      turnId: followupTurnId,
+      type: "agent" as const,
+      content: "后续消息已显示；上一轮有效进展应仍保留在 ChatArea 正文中。",
+      streaming: false,
+    },
+  ];
+
+  useAppStore.setState((state) => ({
+    ...state,
+    config: {
+      ...state.config,
+      language: "zh",
+      workflowMode: "plan",
+    },
+    currentWorkspace: "/tmp/e2e-read-context-persistent-progress",
+    sessionsByWorkspace: {
+      "/tmp/e2e-read-context-persistent-progress": [
+        {
+          id: sessionId,
+          title: "E2E Read Context Persistent Progress",
+          date: new Date(now).toISOString(),
+          active: true,
+          messages: [],
+        },
+      ],
+    },
+    currentSessionId: sessionId,
+    taskFlow,
+    conversationTurns: [
+      {
+        id: planTurnId,
+        userPrompt: "先读取关键文件并生成可审批计划，批准前不要改源码。",
+        title: "计划进展保留",
+        mode: "plan" as const,
+        intent: "plan" as const,
+        status: "awaiting_approval" as const,
+        summary: "已生成计划并等待审批。",
+        blockIds: [planUserBlockId, readOneBlockId, duplicateReadBlockId, readTwoBlockId, planWriteBlockId, planAgentBlockId],
+        collapsed: false,
+        createdAt: now,
+      },
+      {
+        id: followupTurnId,
+        userPrompt: "这是一条后续消息，用来确认上一轮进展不会被刷新掉。",
+        title: "后续消息",
+        mode: "chat" as const,
+        intent: "respond" as const,
+        status: "done" as const,
+        summary: "确认上一轮进展仍保留。",
+        blockIds: [followupUserBlockId, followupAgentBlockId],
+        collapsed: false,
+        createdAt: now + 1,
+      },
+    ],
+    currentTurnId: followupTurnId,
+    planStage: "ready_to_execute",
+    isPlanApproved: false,
+    planArtifacts: [
+      {
+        kind: "design" as const,
+        path: ".MAIN/plans/plan.md",
+        title: "Plan",
+        updatedAt: now,
+        content: "# 计划\n\n## 用户目标\n- 先读取关键文件并生成可审批计划，批准前不要改源码。\n\n## 已读证据\n- src/store/dashboardStore.ts\n- src/hooks/useCsvParser.ts\n\n## 执行步骤\n1. 基于已读证据收窄修改点。\n2. 批准后实施最小源码变更。\n\n## 验证标准\n- 运行聚焦测试并确认 Dashboard 指标更新。",
+      },
+    ],
+    planTasks: [],
+    planExecutionEvidenceLedger: [],
+    agentStatus: "idle",
+    isGenerating: false,
+    showPlanPanel: false,
+    showDiff: false,
+    showTerminal: false,
+    showFilePanel: false,
+  }));
+
+  bindBridgeSnapshot(READ_CONTEXT_PERSISTENT_PROGRESS_SCENARIO);
+  appendBridgeEvent("seeded", { seedCount: readSeedCount(READ_CONTEXT_PERSISTENT_PROGRESS_SCENARIO) });
 
   const cleanup = () => {
     bridge.initialized = false;
@@ -4298,6 +4471,19 @@ function seedLocalPlanClosureGuardEmptyScenario() {
       : null;
     const agentBlocks = state.taskFlow.filter((block) => block.type === "agent") as any[];
     const thoughtBlocks = state.taskFlow.filter((block) => block.type === "thought") as any[];
+    const progressBlocks = state.taskFlow.filter((block) => block.type === "progress") as any[];
+    const progressTexts = progressBlocks.map((block) =>
+      [
+        block.title,
+        block.why,
+        block.action,
+        block.evidence,
+        block.next,
+        ...(Array.isArray(block.targets) ? block.targets : []),
+      ]
+        .filter(Boolean)
+        .join(" "),
+    );
     return {
       agentStatus: state.agentStatus,
       isGenerating: state.isGenerating,
@@ -4305,7 +4491,7 @@ function seedLocalPlanClosureGuardEmptyScenario() {
       planArtifactPaths: state.planArtifacts.map((artifact) => artifact.path),
       currentTurnStatus: currentTurn?.status ?? null,
       agentTexts: agentBlocks.map((block) => block.content),
-      thoughtTexts: thoughtBlocks.map((block) => block.content),
+      thoughtTexts: [...thoughtBlocks.map((block) => block.content), ...progressTexts],
       seedCount: readSeedCount(PLAN_CLOSURE_GUARD_EMPTY_SCENARIO),
     };
   };
@@ -5389,6 +5575,10 @@ export function initializeE2EScenarios(): (() => void) | undefined {
 
   if (scenario === READ_CONTEXT_AGENT_SEGMENT_SCENARIO) {
     return seedReadContextAgentSegmentScenario();
+  }
+
+  if (scenario === READ_CONTEXT_PERSISTENT_PROGRESS_SCENARIO) {
+    return seedReadContextPersistentProgressScenario();
   }
 
   if (scenario === PROCESS_DISPLAY_SCENARIO) {

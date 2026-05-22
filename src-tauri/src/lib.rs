@@ -54,7 +54,7 @@ const MODEL_REQUEST_TIMEOUT_SECS: u64 = 30 * 60;
 const STREAM_READ_TIMEOUT_SECS: u64 = 15 * 60;
 const STREAM_FIRST_RESPONSE_TIMEOUT_SECS: u64 = 180;
 const STREAM_FIRST_CHUNK_TIMEOUT_SECS: u64 = 180;
-const STREAM_PROGRESS_LOG_INTERVAL_SECS: u64 = 15;
+const STREAM_IDLE_CHUNK_TIMEOUT_SECS: u64 = 180;
 const READ_FILE_WINDOW_DEFAULT_MAX_LINES: usize = 180;
 const READ_FILE_WINDOW_MAX_LINES: usize = 600;
 const READ_FILE_WINDOW_DEFAULT_MAX_CHARS: usize = 6_800;
@@ -6341,6 +6341,23 @@ async fn proxy_request(
                 if let Some(stream) = json.get("stream").and_then(Value::as_bool) {
                     debug_parts.push(format!("stream={stream}"));
                 }
+                if let Some(tools) = json.get("tools").and_then(Value::as_array) {
+                    debug_parts.push(format!("tools_len={}", tools.len()));
+                }
+                if let Some(tool_choice) = json.get("tool_choice") {
+                    if let Some(tool_choice_str) = tool_choice.as_str() {
+                        debug_parts.push(format!("tool_choice={tool_choice_str}"));
+                    } else {
+                        debug_parts.push("tool_choice=object".to_string());
+                    }
+                }
+                if let Some(max_tokens) = json
+                    .get("max_tokens")
+                    .or_else(|| json.get("max_completion_tokens"))
+                    .and_then(Value::as_i64)
+                {
+                    debug_parts.push(format!("max_tokens={max_tokens}"));
+                }
                 if let Some(store) = json.get("store").and_then(Value::as_bool) {
                     debug_parts.push(format!("store={store}"));
                 }
@@ -6815,7 +6832,11 @@ async fn start_chat_stream(
         || url.contains("/v1internal:generateContent");
 
     if is_model_request {
-        let mut debug_parts = vec![format!("method=POST"), format!("url={}", url)];
+        let mut debug_parts = vec![
+            format!("stream_id={}", stream_id),
+            format!("method=POST"),
+            format!("url={}", url),
+        ];
         if let Ok(body_json) = serde_json::from_str::<Value>(&body) {
             if let Some(model) = body_json.get("model").and_then(|v| v.as_str()) {
                 debug_parts.push(format!("model={}", model));
@@ -6833,14 +6854,25 @@ async fn start_chat_stream(
             if let Some(stream) = body_json.get("stream").and_then(|v| v.as_bool()) {
                 debug_parts.push(format!("stream={}", stream));
             }
+            if let Some(tools) = body_json.get("tools").and_then(|v| v.as_array()) {
+                debug_parts.push(format!("tools_len={}", tools.len()));
+            }
+            if let Some(tool_choice) = body_json.get("tool_choice") {
+                if let Some(tool_choice_str) = tool_choice.as_str() {
+                    debug_parts.push(format!("tool_choice={}", tool_choice_str));
+                } else {
+                    debug_parts.push("tool_choice=object".to_string());
+                }
+            }
+            if let Some(max_tokens) = body_json
+                .get("max_tokens")
+                .or_else(|| body_json.get("max_completion_tokens"))
+                .and_then(|v| v.as_i64())
+            {
+                debug_parts.push(format!("max_tokens={}", max_tokens));
+            }
         }
         record_debug_log(&app, "info", "start_chat_stream", debug_parts.join(" "));
-        record_debug_log(
-            &app,
-            "info",
-            "stream_started",
-            format!("stream_id={} url={}", stream_id, url),
-        );
     }
 
     let client = reqwest::Client::builder()
@@ -6967,7 +6999,6 @@ async fn start_chat_stream(
     let mut utf8_tail: Vec<u8> = Vec::new();
     let mut chunk_count: usize = 0;
     let mut byte_count: usize = 0;
-    let mut last_progress_log_at = Instant::now();
 
     loop {
         let (chunk_abort_handle, chunk_abort_registration) =
@@ -6981,6 +7012,7 @@ async fn start_chat_stream(
             .await
             {
                 Err(_) => {
+                    set_stream_abort_handle(None);
                     abort_active_stream_request();
                     STREAM_CANCEL.store(true, std::sync::atomic::Ordering::Relaxed);
                     record_debug_log(
@@ -7033,10 +7065,47 @@ async fn start_chat_stream(
                 }
             }
         } else {
-            match futures_util::future::Abortable::new(stream.next(), chunk_abort_registration)
-                .await
+            match tokio::time::timeout(
+                Duration::from_secs(STREAM_IDLE_CHUNK_TIMEOUT_SECS),
+                futures_util::future::Abortable::new(stream.next(), chunk_abort_registration),
+            )
+            .await
             {
                 Err(_) => {
+                    abort_active_stream_request();
+                    STREAM_CANCEL.store(true, std::sync::atomic::Ordering::Relaxed);
+                    record_debug_log(
+                        &app,
+                        "warn",
+                        "stream_idle_timeout",
+                        format!(
+                            "stream_id={} url={} timeout_secs={} chunks={} bytes={} elapsed_ms={}",
+                            stream_id,
+                            url,
+                            STREAM_IDLE_CHUNK_TIMEOUT_SECS,
+                            chunk_count,
+                            byte_count,
+                            stream_started_at.elapsed().as_millis(),
+                        ),
+                    );
+                    record_debug_log(
+                        &app,
+                        "info",
+                        "stream_cancelled_by_watchdog",
+                        format!("phase=after_first_chunk stream_id={} url={}", stream_id, url),
+                    );
+                    emit_chat_stream_done(
+                        &app,
+                        &stream_id,
+                        "error",
+                        Some(format!(
+                            "STREAM_IDLE_TIMEOUT: 模型已返回首个流式 chunk，但 {} 秒内没有继续输出，本轮已暂停。",
+                            STREAM_IDLE_CHUNK_TIMEOUT_SECS,
+                        )),
+                    );
+                    return Ok(());
+                }
+                Ok(Err(_)) => {
                     set_stream_abort_handle(None);
                     record_debug_log(
                         &app,
@@ -7054,7 +7123,7 @@ async fn start_chat_stream(
                     emit_chat_stream_done(&app, &stream_id, "cancelled", None);
                     return Ok(());
                 }
-                Ok(item) => {
+                Ok(Ok(item)) => {
                     set_stream_abort_handle(None);
                     item
                 }
@@ -7085,41 +7154,8 @@ async fn start_chat_stream(
 
         match chunk_result {
             Ok(bytes) => {
-                if chunk_count == 0 {
-                    record_debug_log(
-                        &app,
-                        "info",
-                        "start_chat_stream",
-                        format!(
-                            "first_chunk url={} bytes={} elapsed_ms={}",
-                            url,
-                            bytes.len(),
-                            stream_started_at.elapsed().as_millis(),
-                        ),
-                    );
-                }
                 chunk_count += 1;
                 byte_count += bytes.len();
-                if is_model_request
-                    && last_progress_log_at.elapsed()
-                        >= Duration::from_secs(STREAM_PROGRESS_LOG_INTERVAL_SECS)
-                {
-                    last_progress_log_at = Instant::now();
-                    record_debug_log(
-                        &app,
-                        "info",
-                        "stream_chunk_progress",
-                        format!(
-                            "stream_id={} url={} chunks={} bytes={} elapsed_ms={}",
-                            stream_id,
-                            url,
-                            chunk_count,
-                            byte_count,
-                            stream_started_at.elapsed().as_millis(),
-                        ),
-                    );
-                }
-
                 // Prepend any leftover bytes from the previous chunk
                 let mut combined = Vec::with_capacity(utf8_tail.len() + bytes.len());
                 combined.extend_from_slice(&utf8_tail);

@@ -2,6 +2,7 @@ import {
   compactToolPresentationTarget,
   deriveToolIntentSummary,
   deriveToolPhase,
+  getToolPresentationLabel,
   type ToolPresentationLanguage,
 } from "./toolPresentation";
 import type { ProgressNarrationPhase } from "./progressNarration";
@@ -452,6 +453,18 @@ const EXPLORING_TOOL_NAMES = new Set([
   "query_tabular_document",
   "index_workspace_documents",
   "get_file_outline",
+]);
+
+const GAME_STUDIO_ACTIVITY_TOOL_NAMES = new Set([
+  "find_gameobjects",
+  "find_in_file",
+  "execute_code",
+  "script_apply_edits",
+  "manage_camera",
+  "manage_gameobject",
+  "manage_components",
+  "manage_scene",
+  "refresh_unity",
 ]);
 
 const TERMINAL_READ_TOOL_NAMES = new Set([
@@ -1188,6 +1201,11 @@ function makeNarrativeIntent(step: TurnArchiveStep, language: ToolPresentationLa
   const targets = makeTargetSummary(step.targets, language);
   const toolCount = countToolItems(step);
   const failed = step.status === "failed" || step.status === "rejected" || step.kind === "blocked";
+  const firstToolIntent = step.items
+    .filter(isToolBlock)
+    .map((item) => compactLine(String(item.intentSummary || ""), 220))
+    .find(Boolean);
+  if (firstToolIntent && toolCount === 1) return firstToolIntent;
   if (language === "en") {
     if (step.kind === "edit" && toolCount > 1) {
       return compactLine(`Apply one edit strategy across ${toolCount} file changes${targets ? `: ${targets}` : ""}.`, 220);
@@ -1548,6 +1566,12 @@ function canMergeCodexActivityStep(current: TurnArchiveStep | null, next: TurnAr
   if (!current?.activity || !next.activity) return false;
   if (current.kind === "thinking" || next.kind === "thinking") return false;
   if (current.kind === "message" || next.kind === "message") return false;
+  if (
+    current.items.some((item) => GAME_STUDIO_ACTIVITY_TOOL_NAMES.has(String(item?.toolName || ""))) ||
+    next.items.some((item) => GAME_STUDIO_ACTIVITY_TOOL_NAMES.has(String(item?.toolName || "")))
+  ) {
+    return false;
+  }
   if (current.activity.kind === "exploring" && next.activity.kind === "exploring") return true;
   if (current.status === "failed" || current.status === "rejected") return false;
   if (next.status === "failed" || next.status === "rejected") return false;
@@ -1629,17 +1653,18 @@ function makeStep(input: {
     const status = mapToolStatus(block);
     const kind = status === "failed" || status === "rejected" ? "blocked" : getToolStepKind(block);
     const target = compactTarget(block, language);
+    const isGameStudioTool = GAME_STUDIO_ACTIVITY_TOOL_NAMES.has(String(block.toolName || ""));
     return {
       id: `turn-archive-step-${kind}-${block.id ?? index}`,
-      kind,
+      kind: isGameStudioTool && kind === "message" ? "command" : kind,
       status,
-      intent: resolveToolIntent(block, kind, language),
+      intent: resolveToolIntent(block, isGameStudioTool && kind === "message" ? "command" : kind, language),
       why: "",
       action: "",
       result: "",
       next: "",
       note: "",
-      summary: "",
+      summary: isGameStudioTool ? getToolPresentationLabel(String(block.toolName || ""), language) : "",
       ...(phase ? { phase } : {}),
       targets: target ? [target] : [],
       items: [block],
@@ -1680,12 +1705,8 @@ function finalizeStep(
   includeThoughtNotes: boolean,
 ): TurnArchiveStep {
   const targets = uniqueTargets(step.items, language);
-  const kind = step.kind;
   const phase = normalizeTurnRuntimePhase(step.phase, language);
   const progressBlock = step.items.find(isProgressBlock);
-  const fallbackIntent = isContextPhase(kind) && step.items.length > 1
-    ? defaultIntentForStep(kind, language)
-    : step.intent || defaultIntentForStep(kind, language);
   const baseSummary = makeSummaryForStep({ ...step, targets }, language);
   const summary = phase?.summary
     ? `${phase.summary}${baseSummary ? `${language === "zh" ? " · " : " · "}${baseSummary}` : ""}`
@@ -1716,7 +1737,8 @@ function finalizeStep(
     };
   }
   const narrative = defaultNarrativeForStep({ ...step, targets, summary }, language);
-  const hasPersistedIntent = step.items.length === 1 && String(step.items[0]?.intentSummary || "").trim().length > 0;
+  const persistedIntent = step.items.length === 1 ? compactLine(String(step.items[0]?.intentSummary || ""), 220) : "";
+  const hasPersistedIntent = persistedIntent.length > 0;
   const note = step.note || (step.kind === "message" || step.kind === "thinking"
     ? findNearestReasoningNote({
         sourceBlocks,
@@ -1726,7 +1748,7 @@ function finalizeStep(
         includeThoughts: includeThoughtNotes,
       })
     : "");
-  const intent = phase?.title || (hasPersistedIntent ? fallbackIntent : makeNarrativeIntent({ ...step, targets, ...narrative, note, summary }, language));
+  const intent = phase?.title || (hasPersistedIntent ? persistedIntent : makeNarrativeIntent({ ...step, targets, ...narrative, note, summary }, language));
   return {
     ...step,
     ...(phase ? { phase } : {}),

@@ -116,6 +116,7 @@ export interface StreamResult {
 }
 
 const REASONING_ONLY_STREAM_GUARD_CHAR_LIMIT = 12_000;
+const STREAM_NO_VISIBLE_PROGRESS_TIMEOUT_MS = 180_000;
 
 export function shouldStopReasoningOnlyStream(input: {
   reasoningChars: number;
@@ -124,6 +125,18 @@ export function shouldStopReasoningOnlyStream(input: {
 }): boolean {
   return (
     input.reasoningChars >= REASONING_ONLY_STREAM_GUARD_CHAR_LIMIT &&
+    input.visibleChars === 0 &&
+    input.toolCallCount === 0
+  );
+}
+
+export function shouldStopNoVisibleStreamStall(input: {
+  elapsedMs: number;
+  visibleChars: number;
+  toolCallCount: number;
+}): boolean {
+  return (
+    input.elapsedMs >= STREAM_NO_VISIBLE_PROGRESS_TIMEOUT_MS &&
     input.visibleChars === 0 &&
     input.toolCallCount === 0
   );
@@ -1049,6 +1062,45 @@ async function streamViaRustProxy(
     return true;
   };
 
+  const stopNoVisibleProgressStall = () => {
+    if (resolved || anthropicProcessor) return false;
+    const elapsedMs = Date.now() - streamStartedAt;
+    if (!shouldStopNoVisibleStreamStall({
+      elapsedMs,
+      visibleChars: visibleContentChars,
+      toolCallCount: toolCallsMap.size,
+    })) {
+      return false;
+    }
+
+    resolved = true;
+    finishReason = "length";
+    closeReasoningBlock();
+    reasoningBuffer = "";
+    const message = `STREAM_NO_VISIBLE_PROGRESS_TIMEOUT: model stream produced chunks for ${elapsedMs}ms without visible output or tool calls.`;
+    emitStreamingConsole(
+      "streaming",
+      "warn",
+      "Stream produced chunks but no visible content or tool calls; cancelling.",
+      { elapsedMs, chunkCount: rustProxyChunkCount, byteCount: rustProxyByteCount },
+    );
+    callbacks.onLifecycle?.({
+      phase: "stream_error",
+      streamId,
+      elapsedMs,
+      chunkCount: rustProxyChunkCount,
+      byteCount: rustProxyByteCount,
+      status: "no_visible_progress_timeout",
+      error: message,
+    });
+    invoke("cancel_chat_stream").catch(() => {});
+    const error = new Error(message);
+    onError(error);
+    rejectResult?.(error);
+    cleanup();
+    return true;
+  };
+
   const processSseChunk = (rawChunk: string) => {
     if (anthropicProcessor) {
       anthropicProcessor.processChunk(rawChunk);
@@ -1161,6 +1213,7 @@ async function streamViaRustProxy(
             }
           }
           if (stopReasoningOnlyRunaway()) return;
+          if (stopNoVisibleProgressStall()) return;
         } catch { /* skip */ }
       }
     }
@@ -1342,12 +1395,7 @@ async function streamViaRustProxy(
     });
   }, 5_000);
 
-  // Now safe to start the stream — listeners are fully registered
-  emitStreamingConsole("streamViaRustProxy", "info", "invoking start_chat_stream", {
-    url: apiUrl,
-    model: settings.model,
-    headerKeys: Object.keys(headers),
-  });
+  // Now safe to start the stream: listeners are fully registered before Rust emits chunks.
   invoke("start_chat_stream", {
     streamId,
     url: apiUrl,

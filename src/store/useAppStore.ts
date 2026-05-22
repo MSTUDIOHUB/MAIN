@@ -7951,6 +7951,8 @@ export const useAppStore = create<AppState>()(
         streamStatus: "run_started",
         streamChunkCount: 0,
         streamByteCount: 0,
+        streamElapsedMs: null,
+        streamLifecycleStatus: null,
         lastStreamError: null,
         startedAt: Date.now(),
         updatedAt: Date.now(),
@@ -8038,6 +8040,7 @@ export const useAppStore = create<AppState>()(
         if (
           streamStatus === "stream_started" ||
           streamStatus === "first_chunk" ||
+          streamStatus === "chunk_progress" ||
           streamStatus === "no_chunk_progress_warning" ||
           streamStatus === "stream_done" ||
           streamStatus === "stream_error" ||
@@ -8054,6 +8057,8 @@ export const useAppStore = create<AppState>()(
             latestTool: next.latestTool,
             latestToolTarget: next.latestToolTarget,
             lastStreamError: next.lastStreamError,
+            streamElapsedMs: next.streamElapsedMs,
+            streamLifecycleStatus: next.streamLifecycleStatus,
           });
         }
       };
@@ -8234,6 +8239,84 @@ export const useAppStore = create<AppState>()(
           ...progress,
         });
       };
+
+      let understandingProgressBlockId: number | null = null;
+      let understandingProgressClosed = false;
+      const buildUnderstandingProgress = (status: "running" | "done" = "running") => {
+        const hasImages = currentImages.length > 0;
+        const hasContextItems = turnInputContextSignals.mentionedFilePaths.length > 0 || turnInputContextSignals.attachedFilePaths.length > 0;
+        const contextText = hasImages
+          ? phaseLanguage === "zh"
+            ? `用户提供了 ${currentImages.length} 张图片；先理解截图、约束和预期行为。`
+            : `The user provided ${currentImages.length} image(s); first understand the screenshots, constraints, and expected behavior.`
+          : hasContextItems
+          ? phaseLanguage === "zh"
+            ? "用户提供了上下文文件或引用；先确认这些材料与目标的关系。"
+            : "The user provided contextual files or references; first map them to the request."
+          : phaseLanguage === "zh"
+          ? "先确认用户目标、约束和安全边界。"
+          : "First confirm the user goal, constraints, and safety boundary.";
+        const next = effectiveRunIntent === "plan"
+          ? phaseLanguage === "zh"
+            ? "随后只做定向读取与证据收束，批准前只写计划文件。"
+            : "Next, use targeted reads and evidence synthesis; before approval only plan artifacts may be written."
+          : effectiveRunIntent === "execute" || effectiveRunIntent === "studio_workflow"
+          ? phaseLanguage === "zh"
+            ? "随后读取最小必要上下文，再执行真实操作或明确说明阻塞。"
+            : "Next, read the minimum necessary context, then act or state a concrete blocker."
+          : phaseLanguage === "zh"
+          ? "随后基于上下文给出直接答复。"
+          : "Next, answer directly from the available context.";
+        return normalizeProgressNarration({
+          phase: "understanding",
+          title: phaseLanguage === "zh" ? "理解需求" : "Understanding request",
+          why: effectiveIntentSummary || contextText,
+          action: contextText,
+          evidence: hasImages || hasContextItems ? contextText : "",
+          next,
+          targets: [],
+          status,
+          source: "runtime",
+          hypothesisStatus: status === "done" ? "confirmed" : "unverified",
+        });
+      };
+      const appendUnderstandingProgress = () => {
+        if (isHidden && !createVisibleTurnForHiddenMessage) return;
+        const progress = buildUnderstandingProgress("running");
+        const blockId = nextId();
+        understandingProgressBlockId = blockId;
+        appendTurnBlock({
+          id: blockId,
+          turnId,
+          turnPhase: makeTurnRuntimePhase("scope", phaseLanguage, { status: "running" }),
+          type: "progress",
+          ...progress,
+        });
+        emitProgressRuntimeEvent(progress, {
+          dedupeKey: `understanding:${turnId}`,
+        });
+      };
+      const closeUnderstandingProgress = () => {
+        if (understandingProgressClosed || understandingProgressBlockId == null) return;
+        understandingProgressClosed = true;
+        const progress = buildUnderstandingProgress("done");
+        const blockId = understandingProgressBlockId;
+        sessionSet((s) => ({
+          taskFlow: s.taskFlow.map((block) =>
+            block.id === blockId && block.type === "progress"
+              ? {
+                  ...block,
+                  ...progress,
+                  turnPhase: makeTurnRuntimePhase("scope", phaseLanguage, { status: "done" }),
+                }
+              : block
+          ),
+        }));
+        emitProgressRuntimeEvent(progress, {
+          dedupeKey: `understanding:${turnId}`,
+        });
+      };
+      appendUnderstandingProgress();
 
       // ── Throttled streaming update ────────────────────────────────────
       // Buffer incoming tokens and flush at a modest cadence. A fixed cadence
@@ -9011,6 +9094,9 @@ export const useAppStore = create<AppState>()(
           const metaVisibility = meta?.visibility;
           const hasReplyOptions = replyOptions.length > 0;
           const hasToolCallsWithoutOptions = !!meta?.hasToolCalls && !hasReplyOptions;
+          if (!hasToolCallsWithoutOptions && meta?.visibility !== "user_progress") {
+            closeUnderstandingProgress();
+          }
           const isHiddenProcessText = !hasReplyOptions && metaVisibility === "hidden_process";
           const isSubstantivePlanText = !hasReplyOptions && metaVisibility === "substantive_plan_text";
           const isUserProgressText =
@@ -9239,6 +9325,7 @@ export const useAppStore = create<AppState>()(
         },
 
         onToolExecuting: (toolName, target, diffPreview, meta?: ToolLifecycleMeta) => {
+          closeUnderstandingProgress();
           let runningTaskId: number | null = null;
           let shouldAttachDiff = false;
           const normalizedToolCallId = String(meta?.toolCallId || "").trim() || undefined;

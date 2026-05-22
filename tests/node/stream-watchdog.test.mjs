@@ -75,6 +75,20 @@ test("classifies no-visible-token stream timeout as a plan watchdog timeout", ()
   assert.equal(isStreamWatchdogTimeoutMessage(error.message), true);
 });
 
+test("classifies post-first-chunk idle stream timeout as a plan watchdog timeout", () => {
+  assert.equal(
+    isStreamWatchdogTimeoutMessage("STREAM_IDLE_TIMEOUT: 模型已返回首个流式 chunk，但 180 秒内没有继续输出，本轮已暂停。"),
+    true,
+  );
+});
+
+test("classifies chunk trickle without visible progress as a plan watchdog timeout", () => {
+  assert.equal(
+    isStreamWatchdogTimeoutMessage("STREAM_NO_VISIBLE_PROGRESS_TIMEOUT: model stream produced chunks for 180000ms without visible output or tool calls."),
+    true,
+  );
+});
+
 test("detects reasoning-dominated length results before max output escalation", () => {
   assert.equal(
     isReasoningDominatedLengthResult({

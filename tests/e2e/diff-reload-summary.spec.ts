@@ -111,39 +111,28 @@ test("diff summary stays folded by default and remains clickable after reload", 
   await page.goto("/?e2eScenario=diff-reload-summary");
 
   await expect(page.getByText("3 个变更文件")).toBeVisible();
-  await expect(page.getByTestId("turn-changes-toggle")).toHaveCount(0);
+  await expect(page.getByTestId("turn-changes-toggle")).toHaveAttribute("aria-expanded", "false");
   await expect(page.getByTestId("turn-change-entry")).toHaveCount(0);
-  await expect(page.getByTestId("turn-process-archive-toggle")).toBeVisible();
   await expect(page.getByText("已编辑")).toHaveCount(0);
-  await expect(page.getByText("npm test -- --runInBand")).toHaveCount(0);
+  const toolGroup = page.getByTestId("completed-tool-group").first();
+  await expect(toolGroup).toBeVisible();
+  await expect(toolGroup).toContainText("已完成 4 次工具调用");
+  await expect(toolGroup).toContainText("npm test -- --runInBand");
   await expect(page.getByText("已完成三个文件的修改，你可以在摘要卡中查看每个文件的 Diff。")).toBeVisible();
   await expect
     .poll(async () =>
       page.evaluate(() => {
-        const archive = document.querySelector('[data-testid="turn-process-archive-toggle"]');
+        const changes = document.querySelector('[data-testid="turn-changes-toggle"]');
+        const tools = document.querySelector('[data-testid="completed-tool-group"]');
         const conclusion = Array.from(document.querySelectorAll(".chat-agent-content"))
           .find((node) => node.textContent?.includes("已完成三个文件的修改"));
-        if (!archive || !conclusion) return false;
-        return archive.getBoundingClientRect().top < conclusion.getBoundingClientRect().top;
+        if (!changes || !tools || !conclusion) return false;
+        return changes.getBoundingClientRect().top < tools.getBoundingClientRect().top &&
+          tools.getBoundingClientRect().top < conclusion.getBoundingClientRect().top;
       }),
     )
     .toBe(true);
 
-  await page.getByTestId("turn-process-archive-toggle").click();
-  await expect(page.getByTestId("turn-process-archive-details")).toBeVisible();
-  const editStep = page.locator('[data-testid="turn-archive-step"][data-kind="edit"]');
-  const verifyStep = page.locator('[data-testid="turn-archive-step"][data-kind="verify"]');
-  await expect(editStep).toContainText("实施修改");
-  await expect(editStep).toContainText("按同一修改策略完成 3 次文件修改");
-  await expect(editStep).not.toContainText("结果：");
-  await expect(editStep).not.toContainText("下一步：继续验证");
-  await expect(verifyStep).toContainText("运行验证");
-  await expect(verifyStep).toContainText("验证受影响行为");
-  await expect(verifyStep).toContainText("npm test -- --runInBand");
-  await expect(page.getByTestId("turn-changes-toggle")).toHaveCount(0);
-
-  await editStep.getByTestId("turn-archive-step-toggle").click();
-  await expect(page.getByTestId("turn-changes-toggle")).toHaveAttribute("aria-expanded", "false");
   await page.getByTestId("turn-changes-toggle").click();
   await expect(page.getByTestId("turn-change-entry").filter({ hasText: "main.ts" })).toBeVisible();
   await expect(page.getByTestId("turn-change-entry").filter({ hasText: "helper.ts" })).toBeVisible();
@@ -171,14 +160,9 @@ test("diff summary stays folded by default and remains clickable after reload", 
   await page.reload();
 
   await expect(page.getByText("3 个变更文件")).toBeVisible();
-  await expect(page.getByTestId("turn-changes-toggle")).toHaveCount(0);
+  await expect(page.getByTestId("turn-changes-toggle")).toHaveAttribute("aria-expanded", "false");
   await expect(page.getByTestId("turn-change-entry")).toHaveCount(0);
 
-  await page.getByTestId("turn-process-archive-toggle").click();
-  const restoredEditStep = page.locator('[data-testid="turn-archive-step"][data-kind="edit"]');
-  await expect(restoredEditStep).toContainText("实施修改");
-  await restoredEditStep.getByTestId("turn-archive-step-toggle").click();
-  await expect(page.getByTestId("turn-changes-toggle")).toHaveAttribute("aria-expanded", "false");
   await page.getByTestId("turn-changes-toggle").click();
   await page.getByTestId("turn-change-entry").filter({ hasText: "main.ts" }).click();
   await expect(page.getByTestId("diff-panel-title")).toContainText("src/main.ts");
@@ -190,8 +174,6 @@ test("diff summary stays folded by default and remains clickable after reload", 
 test("diff panel reverts one file with confirmation and updates the summary", async ({ page }) => {
   await page.goto("/?e2eScenario=diff-reload-summary");
 
-  await page.getByTestId("turn-process-archive-toggle").click();
-  await page.locator('[data-testid="turn-archive-step"][data-kind="edit"]').getByTestId("turn-archive-step-toggle").click();
   await page.getByTestId("turn-changes-toggle").click();
   await page.getByTestId("turn-change-entry").filter({ hasText: "main.ts" }).click();
   await expect(page.getByTestId("diff-panel-title")).toContainText("src/main.ts");
@@ -217,8 +199,6 @@ test("diff panel reverts one file with confirmation and updates the summary", as
 test("diff panel reverts all files and deletes files created by the AI", async ({ page }) => {
   await page.goto("/?e2eScenario=diff-reload-summary");
 
-  await page.getByTestId("turn-process-archive-toggle").click();
-  await page.locator('[data-testid="turn-archive-step"][data-kind="edit"]').getByTestId("turn-archive-step-toggle").click();
   await page.getByTestId("turn-changes-toggle").click();
   await page.getByTestId("turn-change-entry").filter({ hasText: "helper.ts" }).click();
   await expect(page.getByTestId("diff-panel-title")).toContainText("src/utils/helper.ts");
@@ -251,8 +231,6 @@ test("diff panel reverts all files and deletes files created by the AI", async (
 test("diff revert refuses to overwrite later user edits", async ({ page }) => {
   await page.goto("/?e2eScenario=diff-reload-summary");
 
-  await page.getByTestId("turn-process-archive-toggle").click();
-  await page.locator('[data-testid="turn-archive-step"][data-kind="edit"]').getByTestId("turn-archive-step-toggle").click();
   await page.getByTestId("turn-changes-toggle").click();
   await page.getByTestId("turn-change-entry").filter({ hasText: "helper.ts" }).click();
   await page.evaluate(() => {

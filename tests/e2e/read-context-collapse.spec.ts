@@ -12,20 +12,15 @@ test.beforeEach(async ({ page }) => {
 test("completed read tools collapse into one expandable context group", async ({ page }) => {
   await page.goto("/?e2eScenario=read-context-collapse");
 
-  await expect(page.getByTestId("turn-process-archive-toggle")).toBeVisible();
-  await expect(page.getByTestId("read-context-group")).toHaveCount(0);
-  await page.getByTestId("turn-process-archive-toggle").click();
+  await expect(page.getByTestId("turn-process-archive-toggle")).toHaveCount(0);
+  await expect(page.getByTestId("progress-block")).toHaveCount(0);
+  await expect(page.getByText("已读取核心战斗上下文，失败项和写入项需要保持单独展示。")).toBeVisible();
+  await expect(page.getByText("补充读取了 README 作为单项上下文，用于校验单项也能折叠。")).toBeVisible();
 
-  const contextSteps = page.locator('[data-testid="turn-archive-step"][data-kind="discover"], [data-testid="turn-archive-step"][data-kind="inspect"]');
-  await expect(contextSteps).toHaveCount(2);
-  await expect(contextSteps.nth(0)).toContainText("10 个文件");
-  await expect(contextSteps.nth(0)).toContainText("项目骨架");
-  await expect(contextSteps.nth(0)).not.toContainText("下一步读取最小必要上下文");
-  await expect(contextSteps.nth(0)).toContainText("文件不存在");
-  await expect(contextSteps.nth(1)).toContainText("1 个文件");
   const groups = page.getByTestId("read-context-group");
-  await expect(groups).toHaveCount(1);
+  await expect(groups).toHaveCount(2);
   const firstGroup = groups.nth(0);
+  const secondGroup = groups.nth(1);
 
   await expect(firstGroup).toBeVisible();
   await expect(firstGroup).toContainText("已读取 10 项上下文");
@@ -44,8 +39,8 @@ test("completed read tools collapse into one expandable context group", async ({
   await firstGroup.click();
   await expect(page.getByTestId("read-context-group-details")).toHaveCount(0);
 
-  await contextSteps.nth(1).getByTestId("turn-archive-step-toggle").click();
-  await expect(page.getByTestId("read-context-group").filter({ hasText: "已读取 1 项上下文" })).toBeVisible();
-  await expect(contextSteps.nth(0)).toContainText("MissingConfig.cs");
-  await expect(page.locator('[data-testid="turn-archive-step"][data-kind="edit"]')).toContainText("GeneratedBattleUnit.cs");
+  await expect(secondGroup).toContainText("已读取 1 项上下文");
+  await expect(secondGroup).toContainText("README.md");
+  await expect(page.getByText("MissingConfig.cs")).toBeVisible();
+  await expect(page.getByText("GeneratedBattleUnit.cs")).toBeVisible();
 });

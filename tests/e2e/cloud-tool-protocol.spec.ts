@@ -814,15 +814,9 @@ test("tool flow shows progress narration without exposing raw protocol", async (
   await expect(page.locator("body")).not.toContainText("<tool_use>");
   await expect(page.locator("body")).not.toContainText("\"toolName\"");
   await expect(page.locator("body")).not.toContainText("<analysis>");
-  await expect(page.getByTestId("turn-process-archive-toggle")).toBeVisible();
-  await page.getByTestId("turn-process-archive-toggle").click();
-
-  const archiveStep = page.locator('[data-testid="turn-archive-step"][data-kind="inspect"]').first();
-  await expect(archiveStep).toContainText(/读取|正在读取/);
-  await expect(archiveStep).toContainText(/为什么|因为|目标|依赖|确认/);
-  await expect(archiveStep).toContainText("README.md");
-
-  await archiveStep.getByTestId("turn-archive-step-toggle").click();
+  await expect(page.getByTestId("turn-process-archive-toggle")).toHaveCount(0);
+  await expect(page.getByTestId("read-context-group")).toContainText("README.md");
+  await page.getByTestId("read-context-group").first().click();
   await expect(page.getByTestId("read-context-group-summary").first()).toContainText(/已读取|捕获|确认/);
 });
 

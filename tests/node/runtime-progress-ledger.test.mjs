@@ -50,6 +50,7 @@ function loadTranspiledModuleSync(sourcePath) {
 
 const {
   buildRuntimeProgressLedger,
+  buildRuntimeProgressProjection,
   summarizeRuntimeProgressLedger,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/runtimeProgressLedger.ts"));
 const {
@@ -141,3 +142,72 @@ test("runtime progress ledger merges structured progress events with legacy bloc
   assert.match(items[0].summary, /定位 CSV|找到导入入口/);
 });
 
+test("runtime progress ledger exposes model stream idle warnings without duplicating them", () => {
+  const events = [
+    withEventSchema({
+      type: "harness.telemetry",
+      threadId: "thread-a",
+      turnId: "turn-a",
+      timestampMs: 10,
+      telemetry: {
+        name: "no_chunk_progress_warning",
+        details: {
+          activeStreamId: "stream-a",
+          streamElapsedMs: 45_000,
+          streamChunkCount: 1,
+          streamByteCount: 14,
+        },
+      },
+    }),
+    withEventSchema({
+      type: "harness.telemetry",
+      threadId: "thread-a",
+      turnId: "turn-a",
+      timestampMs: 55,
+      telemetry: {
+        name: "no_chunk_progress_warning",
+        details: {
+          activeStreamId: "stream-a",
+          streamElapsedMs: 90_000,
+          streamChunkCount: 1,
+          streamByteCount: 14,
+        },
+      },
+    }),
+  ];
+
+  const items = buildRuntimeProgressLedger({ events, turnId: "turn-a", language: "zh" });
+
+  assert.equal(items.length, 1);
+  assert.equal(items[0].repeatCount, 2);
+  assert.match(items[0].title, /等待模型继续输出/);
+  assert.match(items[0].summary, /90 秒/);
+});
+
+test("runtime progress projection keeps latest status and only recent four details", () => {
+  const events = Array.from({ length: 6 }, (_, index) => withEventSchema({
+    type: "progress.updated",
+    threadId: "thread-a",
+    turnId: "turn-a",
+    timestampMs: 10 + index,
+    progress: {
+      phase: index === 0 ? "understanding" : "investigating",
+      title: index === 0 ? "理解需求" : `读取目标 ${index}`,
+      status: index < 5 ? "done" : "running",
+      summary: index === 0 ? "已确认用户目标和约束。" : `正在处理第 ${index} 个目标。`,
+      target: index === 0 ? "" : `src/file-${index}.ts`,
+      tool: index === 0 ? "" : "read_file",
+      dedupeKey: index === 0 ? "understanding:turn-a" : `read:${index}`,
+    },
+  }));
+
+  const items = buildRuntimeProgressLedger({ events, turnId: "turn-a", language: "zh", maxItems: 12 });
+  const projection = buildRuntimeProgressProjection(items, "zh", 4);
+
+  assert.equal(projection.latest.title, "读取目标 5");
+  assert.equal(projection.latest.status, "running");
+  assert.equal(projection.recent.length, 4);
+  assert.equal(projection.recent[0].target, "src/file-2.ts");
+  assert.match(projection.activityText, /读取目标 5/);
+  assert.match(projection.activityText, /第 5 个目标/);
+});

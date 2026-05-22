@@ -17,6 +17,13 @@ export interface RuntimeProgressLedgerItem {
   lastSeenAt: number;
 }
 
+export interface RuntimeProgressProjection {
+  latest: RuntimeProgressLedgerItem | null;
+  recent: RuntimeProgressLedgerItem[];
+  summary: string;
+  activityText: string;
+}
+
 function compactLine(value: unknown, maxChars = 220): string {
   const text = String(value ?? "").replace(/\s+/g, " ").trim();
   if (!text) return "";
@@ -164,6 +171,59 @@ function itemFromProgressEvent(
   };
 }
 
+function itemFromHarnessTelemetry(
+  event: MainThreadEvent,
+  language: RuntimeProgressLanguage,
+): Omit<RuntimeProgressLedgerItem, "repeatCount" | "cacheHits"> & { repeatCount?: number; cacheHits?: number } | null {
+  if (event.type !== "harness.telemetry") return null;
+  const name = String(event.telemetry?.name || "");
+  if (name !== "no_chunk_progress_warning" && name !== "stream_error" && name !== "stream_cancelled") {
+    return null;
+  }
+  const details = event.telemetry?.details || {};
+  const streamId = compactLine(details.activeStreamId || "", 96);
+  const elapsedMs = Math.max(0, Number(details.streamElapsedMs) || 0);
+  const seconds = elapsedMs > 0 ? Math.round(elapsedMs / 1000) : null;
+  const error = compactLine(details.lastStreamError || "", 180);
+  const status: RuntimeProgressStatus =
+    name === "stream_error" ? "failed" :
+    name === "stream_cancelled" ? "paused" :
+    "running";
+  const title = language === "en"
+    ? name === "stream_error"
+      ? "Model stream error"
+      : name === "stream_cancelled"
+      ? "Model stream cancelled"
+      : "Waiting for model output"
+    : name === "stream_error"
+    ? "模型流错误"
+    : name === "stream_cancelled"
+    ? "模型流已取消"
+    : "等待模型继续输出";
+  const summary = language === "en"
+    ? name === "stream_error"
+      ? `The model stream ended with an error${error ? `: ${error}` : "."}`
+      : name === "stream_cancelled"
+      ? "The current model stream was cancelled."
+      : `Received the first stream chunk, but no newer chunk has arrived${seconds ? ` for ${seconds}s` : ""}. MAIN is waiting and will pause if the stream stays idle.`
+    : name === "stream_error"
+    ? `模型流以错误结束${error ? `：${error}` : "。"}`
+    : name === "stream_cancelled"
+    ? "当前模型流已取消。"
+    : `已收到首个流式 chunk，但${seconds ? ` ${seconds} 秒内` : ""}没有新的输出；MAIN 正在等待，持续空闲会暂停本轮。`;
+  return {
+    key: `model-stream:${streamId || String((event as any).turnId || "") || name}`,
+    phase: "blocked",
+    title,
+    status,
+    summary: compactLine(summary, 260),
+    target: "",
+    tool: "",
+    firstSeenAt: event.timestampMs,
+    lastSeenAt: event.timestampMs,
+  };
+}
+
 function itemFromBlock(
   block: any,
   index: number,
@@ -262,6 +322,9 @@ export function buildRuntimeProgressLedger(input: {
           lastSeenAt: event.timestampMs,
         });
       }
+    } else if (event.type === "harness.telemetry") {
+      const item = itemFromHarnessTelemetry(event, language);
+      if (item) addItem(byKey, item);
     }
   }
   const items = [...byKey.values()]
@@ -300,4 +363,41 @@ export function summarizeRuntimeProgressLedger(
     repeated.length ? `重复目标：${repeated.join("、")}` : "",
     latestText ? `最新：${latestText}` : "",
   ].filter(Boolean).join("；");
+}
+
+export function buildRuntimeProgressProjection(
+  items: RuntimeProgressLedgerItem[],
+  language: RuntimeProgressLanguage = "zh",
+  maxRecent = 4,
+): RuntimeProgressProjection {
+  const normalizedLanguage = normalizeLanguage(language);
+  const ordered = [...items].sort((a, b) => {
+    const lastDiff = a.lastSeenAt - b.lastSeenAt;
+    return lastDiff !== 0 ? lastDiff : a.firstSeenAt - b.firstSeenAt;
+  });
+  const latest = ordered[ordered.length - 1] || null;
+  const recent = ordered.slice(-Math.max(1, maxRecent));
+  const summary = summarizeRuntimeProgressLedger(items, normalizedLanguage);
+  if (!latest) {
+    return { latest: null, recent: [], summary: "", activityText: "" };
+  }
+  const repeatedText = latest.repeatCount > 1
+    ? normalizedLanguage === "zh"
+      ? `（重复 ${latest.repeatCount} 次${latest.cacheHits ? `，缓存复用 ${latest.cacheHits} 次` : ""}）`
+      : ` (${latest.repeatCount}x${latest.cacheHits ? `, ${latest.cacheHits} cached` : ""})`
+    : latest.cacheHits > 0
+    ? normalizedLanguage === "zh"
+      ? `（缓存复用 ${latest.cacheHits} 次）`
+      : ` (${latest.cacheHits} cached)`
+    : "";
+  const detail = latest.summary && latest.summary !== latest.title ? latest.summary : "";
+  const activityText = detail
+    ? `${latest.title}${repeatedText} · ${detail}`
+    : `${latest.title}${repeatedText}`;
+  return {
+    latest,
+    recent,
+    summary,
+    activityText,
+  };
 }

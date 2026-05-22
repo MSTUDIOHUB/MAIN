@@ -25,35 +25,27 @@ test("process display ignores legacy hidden policy and keeps process text hierar
   await page.goto("/?e2eScenario=process-display");
 
   await expect(page.getByTestId("thought-block")).toHaveCount(0);
-  await expect(page.getByTestId("turn-activity-notice")).toHaveCount(0);
+  await expect(page.getByTestId("turn-activity-notice")).toBeVisible();
+  await expect(page.getByTestId("effective-progress-ledger")).toContainText("ChatArea.tsx");
   await expect(page.getByTestId("turn-activity-thought-summary")).toHaveCount(0);
-  await expect(page.getByTestId("turn-process-archive-toggle")).toBeVisible();
-  await page.getByTestId("turn-process-archive-toggle").click();
+  await expect(page.getByTestId("turn-process-archive-toggle")).toHaveCount(0);
+  await expect(page.getByText("过程显示测试回复。")).toBeVisible();
+  const readGroup = page.getByTestId("read-context-group").first();
+  await expect(readGroup).toBeVisible();
+  await expect(readGroup).toContainText("ChatArea.tsx");
 
-  const inspectStep = page.locator('[data-testid="turn-archive-step"][data-kind="inspect"]');
-  await expect(inspectStep).toContainText("收集上下文");
-  await expect(inspectStep).toContainText("核对必要上下文");
-  await expect(inspectStep).toContainText("ChatArea.tsx");
-  await expect(inspectStep).not.toContainText("避免原始长文本刷屏");
-
-  const initialArchiveToggleFontSize = await page.getByTestId("turn-process-archive-toggle").evaluate((element) =>
+  const initialReadGroupFontSize = await readGroup.evaluate((element) =>
     Number.parseFloat(window.getComputedStyle(element).fontSize),
   );
-  const initialArchiveStepFontSize = await inspectStep.first().evaluate((element) =>
-    Number.parseFloat(window.getComputedStyle(element).fontSize),
-  );
-  const initialArchiveStepLabelFontSize = await inspectStep.getByTestId("turn-archive-step-label").first().evaluate((element) =>
-    Number.parseFloat(window.getComputedStyle(element).fontSize),
-  );
-  const initialArchiveStepIntentFontSize = await inspectStep.getByTestId("turn-archive-step-intent").first().evaluate((element) =>
+  const initialAgentFontSize = await page.locator(".chat-agent-content").first().evaluate((element) =>
     Number.parseFloat(window.getComputedStyle(element).fontSize),
   );
   const initialComposerFontSize = await page.getByTestId("composer-textarea").evaluate((element) =>
     Number.parseFloat(window.getComputedStyle(element).fontSize),
   );
-  expect(initialArchiveToggleFontSize).toBeLessThan(initialComposerFontSize);
-  expect(initialArchiveStepIntentFontSize).toBeLessThan(initialComposerFontSize);
-  expect(initialArchiveStepLabelFontSize).toBeLessThan(initialArchiveStepIntentFontSize);
+  expect(initialReadGroupFontSize).toBeGreaterThanOrEqual(initialComposerFontSize);
+  expect(initialReadGroupFontSize - initialComposerFontSize).toBeLessThanOrEqual(1);
+  expect(initialAgentFontSize).toBe(initialComposerFontSize);
 
   await page.getByTestId("model-settings-button").click();
   await page.getByTestId("settings-tab-general").click();
@@ -68,43 +60,30 @@ test("process display ignores legacy hidden policy and keeps process text hierar
   await expect(page.getByText("18 px")).toBeVisible();
   await page.getByTestId("settings-close").click();
   await expect.poll(async () =>
-    inspectStep.first().evaluate((element) =>
+    page.locator(".chat-agent-content").first().evaluate((element) =>
       Number.parseFloat(window.getComputedStyle(element).fontSize),
     ),
-  ).toBeGreaterThan(initialArchiveStepFontSize + 4);
+  ).toBeGreaterThan(initialAgentFontSize + 4);
 
-  const archiveToggleFontSize = await page.getByTestId("turn-process-archive-toggle").evaluate((element) =>
+  const readGroupFontSize = await readGroup.evaluate((element) =>
     Number.parseFloat(window.getComputedStyle(element).fontSize),
   );
-  const archiveStepFontSize = await inspectStep.first().evaluate((element) =>
-    Number.parseFloat(window.getComputedStyle(element).fontSize),
-  );
-  const archiveStepLabelFontSize = await inspectStep.getByTestId("turn-archive-step-label").first().evaluate((element) =>
-    Number.parseFloat(window.getComputedStyle(element).fontSize),
-  );
-  const archiveStepIntentFontSize = await inspectStep.getByTestId("turn-archive-step-intent").first().evaluate((element) =>
+  const agentFontSize = await page.locator(".chat-agent-content").first().evaluate((element) =>
     Number.parseFloat(window.getComputedStyle(element).fontSize),
   );
   const composerFontSize = await page.getByTestId("composer-textarea").evaluate((element) =>
     Number.parseFloat(window.getComputedStyle(element).fontSize),
   );
 
-  expect(archiveToggleFontSize).toBeGreaterThan(initialArchiveToggleFontSize + 2);
-  expect(archiveStepFontSize).toBeGreaterThan(initialArchiveStepFontSize + 2);
-  expect(archiveStepLabelFontSize).toBeGreaterThan(initialArchiveStepLabelFontSize + 2);
-  expect(archiveStepIntentFontSize).toBeGreaterThan(initialArchiveStepIntentFontSize + 2);
+  expect(Math.abs(readGroupFontSize - initialReadGroupFontSize)).toBeLessThanOrEqual(0.5);
+  expect(agentFontSize).toBeGreaterThan(initialAgentFontSize + 4);
   expect(composerFontSize).toBeGreaterThan(initialComposerFontSize + 2);
-  expect(archiveToggleFontSize).toBeLessThan(composerFontSize);
-  expect(archiveStepFontSize).toBeLessThan(composerFontSize);
-  expect(archiveStepIntentFontSize).toBeLessThan(composerFontSize);
-  expect(archiveStepLabelFontSize).toBeLessThan(archiveStepIntentFontSize);
-  expect(composerFontSize - archiveStepFontSize).toBeGreaterThan(0.5);
-  expect(composerFontSize - archiveStepFontSize).toBeLessThan(3);
+  expect(agentFontSize).toBe(composerFontSize);
+  expect(readGroupFontSize).toBeLessThan(composerFontSize);
 
   await page.reload();
-  await expect(page.getByTestId("turn-process-archive-toggle")).toBeVisible();
-  await page.getByTestId("turn-process-archive-toggle").click();
-  await expect(inspectStep).toContainText("核对必要上下文");
-  await expect(inspectStep).toContainText("ChatArea.tsx");
+  await expect(page.getByTestId("turn-process-archive-toggle")).toHaveCount(0);
+  await expect(page.getByTestId("read-context-group")).toContainText("ChatArea.tsx");
+  await expect(page.getByText("过程显示测试回复。")).toBeVisible();
   await expect(page.getByTestId("thinking-policy-action_only")).toHaveCount(0);
 });

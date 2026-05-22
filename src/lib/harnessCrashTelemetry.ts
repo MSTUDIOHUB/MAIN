@@ -28,6 +28,8 @@ export interface HarnessRunMarker {
   streamStatus: string | null;
   streamChunkCount: number;
   streamByteCount: number;
+  streamElapsedMs: number | null;
+  streamLifecycleStatus: string | null;
   lastStreamError: string | null;
   startedAt: number;
   updatedAt: number;
@@ -121,6 +123,8 @@ export function normalizeHarnessRunMarker(value: unknown): HarnessRunMarker | nu
     streamStatus: typeof record.streamStatus === "string" ? record.streamStatus : null,
     streamChunkCount: Math.max(0, Number(record.streamChunkCount) || 0),
     streamByteCount: Math.max(0, Number(record.streamByteCount) || 0),
+    streamElapsedMs: Number.isFinite(Number(record.streamElapsedMs)) ? Math.max(0, Number(record.streamElapsedMs)) : null,
+    streamLifecycleStatus: typeof record.streamLifecycleStatus === "string" ? record.streamLifecycleStatus : null,
     lastStreamError: typeof record.lastStreamError === "string" ? record.lastStreamError : null,
     startedAt: Math.max(0, Number(record.startedAt) || Date.now()),
     updatedAt: Math.max(0, Number(record.updatedAt) || Date.now()),
@@ -166,6 +170,8 @@ export function closeHarnessRunMarker(
     turnId: next.turnId,
     iteration: next.iteration,
     streamStatus: next.streamStatus,
+    streamElapsedMs: next.streamElapsedMs,
+    streamLifecycleStatus: next.streamLifecycleStatus,
   });
   return next;
 }
@@ -212,6 +218,8 @@ export function markHarnessInstanceStarted(): HarnessUncleanRestartDiagnostic | 
       streamStatus: previousRun.streamStatus,
       streamChunkCount: previousRun.streamChunkCount,
       streamByteCount: previousRun.streamByteCount,
+      streamElapsedMs: previousRun.streamElapsedMs,
+      streamLifecycleStatus: previousRun.streamLifecycleStatus,
       latestTool: previousRun.latestTool,
       latestToolTarget: previousRun.latestToolTarget,
       updatedAt: previousRun.updatedAt,

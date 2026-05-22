@@ -23,11 +23,12 @@ test("game studio live steps show concise progress without nested action cards",
   await expect(steps.nth(3)).toContainText("视角偏移 需要用工具结果确认后再继续");
   await expect(steps.nth(3)).not.toContainText("因为：");
   await expect(steps.nth(3)).not.toContainText("**视角偏移**");
-  expect(await steps.nth(3).getByTestId("turn-archive-step-intent").evaluate((node) => (node as HTMLElement).innerText.includes("\n视角偏移"))).toBe(true);
+  await expect(steps.nth(3).getByTestId("turn-archive-step-intent")).toContainText("视角偏移");
   await expect(steps.nth(3)).toContainText("进行中");
   await expect(steps.nth(3).getByTestId("turn-archive-step-toggle")).toHaveCount(0);
   await expect(page.getByTestId("turn-activity-thought-summary")).toHaveCount(0);
-  await expect(page.getByTestId("turn-activity-notice")).toContainText("已完成 3 次，当前调用工具：Main Camera");
+  await expect(page.getByTestId("turn-activity-notice")).toContainText("正在调用 manage_camera");
+  await expect(page.getByTestId("turn-activity-notice")).toContainText("重复 2 次");
   await expect(page.getByTestId("tool-status-label").filter({ hasText: "执行中" })).toHaveCount(0);
   await expect(page.getByTestId("turn-archive-step-details")).toHaveCount(0);
 });
@@ -37,6 +38,7 @@ test("game studio awaiting_input state does not keep showing running tool activi
 
   await expect(page.getByTestId("live-turn-process-timeline")).toBeVisible();
   await expect(page.getByTestId("turn-activity-thought-summary")).toHaveCount(0);
-  await expect(page.getByTestId("turn-activity-notice")).toHaveCount(0);
+  await expect(page.getByTestId("turn-activity-notice")).toBeVisible();
+  await expect(page.getByTestId("turn-activity-notice")).toContainText("已调用 execute_code");
   await expect(page.getByText("正在调用工具")).toHaveCount(0);
 });

@@ -1,12 +1,14 @@
 import { sanitizePlanArtifactContent } from "./sanitize";
+import { parseToolFeedbackEnvelope } from "./toolFeedbackEnvelope";
 import {
   repairActionablePlanArtifactContent,
   validateActionablePlanArtifact,
+  validatePlanArtifactContent,
   type PlanStage,
 } from "./workflowModels";
 import { normalizeTurnInputContextSignals, type TurnInputContextLike } from "./turnIntake";
 
-export type MaterializablePlanKind = "plan";
+export type MaterializablePlanKind = "plan" | "design";
 
 export interface PlanMaterializationResult {
   ok: boolean;
@@ -23,12 +25,54 @@ interface PlanMaterializationToolActivityLike {
   detail?: string;
 }
 
+export interface PlanEvidenceSanitizerDrop {
+  bucket: "evidence" | "files" | "constraints";
+  reason: string;
+  preview: string;
+}
+
+export interface SanitizedPlanEvidenceInput {
+  userGoal: string;
+  evidence: string[];
+  files: string[];
+  constraints: string[];
+  dropped: PlanEvidenceSanitizerDrop[];
+  stats: {
+    inputEvidence: number;
+    keptEvidence: number;
+    inputFiles: number;
+    keptFiles: number;
+    inputConstraints: number;
+    keptConstraints: number;
+    dropped: number;
+    dropReasons: Record<string, number>;
+  };
+}
+
 const PROTOCOL_NOISE_RE = /<\/?(?:tool_use|tool_call|function_call|tool|parameter)\b/i;
 const PROPOSAL_MARKER_RE = /^\s*\[PROPOSAL START\]\s*$/gim;
 const USER_OPTIONS_BLOCK_RE = /^\s*<user_options>\s*$[\s\S]*?^\s*<\/user_options>\s*$/gim;
 const OPTION_BLOCK_RE = /<option\b[^>]*>[\s\S]*?<\/option>/gi;
 const TOOL_LOG_NOISE_RE =
   /Repeated read-only tool call skipped|Duplicate skip count|FILE_UNCHANGED_STUB|already called with identical arguments|后台思考已折叠|thinking process|chain of thought|ContextMemoryState|ContextState|MAIN TOOL FEEDBACK|tool call id|PLAN_REPEAT_READ_LIMIT|上一条\s*Plan\s*回复是空的/i;
+const PLAN_ARTIFACT_PATH_RE = /(?:^|[\\/\s])\.MAIN[\\/]plans[\\/]/i;
+const RAW_TOOL_RESULT_NOISE_RE =
+  /\bREAD_FILE_RESULT\b|\bContextMemory(?:State)?\b|\bContextState\b|\breturnedLines\b|\btotalLines\b|\btotalChars\b|\bPLAN NOT READY\b|\bTASK_TARGETING_BLOCKED\b|\bstatus\s*[:=]\s*(?:failed|blocked|rejected)\b/i;
+const TOOL_META_FIELD_RE =
+  /\b(?:status|hash|exit|tool_call_id|toolCallId|returnedLines|totalLines|totalChars|truncated)\s*[:=]\s*[^;\n,}]+/gi;
+const SEMANTIC_EVIDENCE_TOOLS = new Set([
+  "analyze_tabular_document",
+  "query_tabular_document",
+  "get_project_skeleton",
+  "list_directory",
+  "read_file",
+  "read_document",
+  "get_file_outline",
+  "grep_search",
+  "glob_search",
+  "index_workspace_documents",
+]);
+const PATH_LIKE_RE = /\b(?:src|app|lib|components|tests|pages|hooks|store|styles|assets|public|server|client|packages|apps|docs|scripts|config|\.MAIN)\/[A-Za-z0-9_./@-]+\b/g;
 
 const TOOL_LABELS_ZH: Record<string, string> = {
   analyze_tabular_document: "已分析表格数据",
@@ -145,6 +189,265 @@ function uniquePlanItems(values: unknown[], maxItems: number, maxChars = 220): s
     if (result.length >= maxItems) break;
   }
   return result;
+}
+
+function compactSanitizerPreview(value: unknown, maxChars = 180): string {
+  const text = String(value ?? "").replace(/\s+/g, " ").trim();
+  if (!text) return "";
+  return text.length <= maxChars ? text : `${text.slice(0, maxChars).trim()}...`;
+}
+
+function noteSanitizerDrop(
+  dropped: PlanEvidenceSanitizerDrop[],
+  bucket: PlanEvidenceSanitizerDrop["bucket"],
+  reason: string,
+  value: unknown,
+): void {
+  dropped.push({
+    bucket,
+    reason,
+    preview: compactSanitizerPreview(value),
+  });
+}
+
+function isPlanArtifactPath(value: unknown): boolean {
+  return PLAN_ARTIFACT_PATH_RE.test(String(value || "").replace(/\\/g, "/"));
+}
+
+function stripToolMetaFields(value: string): string {
+  return value
+    .replace(TOOL_META_FIELD_RE, " ")
+    .replace(/\bREAD_FILE_RESULT\b/gi, " ")
+    .replace(/\bpath\s*:\s*/gi, " ")
+    .replace(/\b\d[\d,]*\s+chars\b/gi, " ")
+    .replace(/\b(?:summary|excerpt)\s*[:=]\s*;?\s*/gi, " ")
+    .replace(/(?:^|[\s;])(?:true|false|null)(?=$|[\s;])/gi, " ")
+    .replace(/^[\s;:,.|]+/, "")
+    .replace(/[{}[\]"]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function normalizePathLikeCandidate(value: unknown): string {
+  const raw = String(value || "")
+    .replace(/\\/g, "/")
+    .replace(/^[`'"]+|[`'"]+$/g, "")
+    .trim();
+  if (!raw || isPlanArtifactPath(raw)) return "";
+  if (/ContextMemory|ContextState|\[ContextMemory|^\.\.\.\[/i.test(raw)) return "";
+
+  const direct = raw
+    .split(/\s+via\s+|\s*;\s*|\s+hash\s*[:=]|\s+status\s*[:=]/i)[0]
+    .replace(/^\s*(?:path|target)\s*[:=]\s*/i, "")
+    .replace(/^[`'"]+|[`'"]+$/g, "")
+    .trim();
+  if (
+    direct &&
+    !isPlanArtifactPath(direct) &&
+    /^(?:\.?\/)?[A-Za-z0-9_@./-]+\.(?:tsx?|jsx?|swift|py|rs|go|json|csv|tsv|xlsx|md|css|scss|html|toml|yaml|yml)$/i.test(direct)
+  ) {
+    return direct.replace(/^\.\//, "");
+  }
+
+  const pathMatch = raw.match(PATH_LIKE_RE);
+  const candidate = pathMatch?.find((item) => !isPlanArtifactPath(item)) || "";
+  return candidate.replace(/^\.\//, "");
+}
+
+function normalizeSemanticToolEvidence(input: {
+  tool: string;
+  target: string;
+  detail?: string;
+  status?: string;
+}): string {
+  const tool = String(input.tool || "").trim();
+  if (!SEMANTIC_EVIDENCE_TOOLS.has(tool)) return "";
+  const status = String(input.status || "").trim().toLowerCase();
+  if (/failed|blocked|rejected|declined/.test(status)) return "";
+  const rawTarget = String(input.target || "").trim();
+  if (/^\*\*\/\*\.(?:tsx?|jsx?)$/i.test(rawTarget)) return "";
+  const target = normalizePathLikeCandidate(rawTarget) || compactPlanLine(rawTarget, 120);
+  if (!target || isPlanArtifactPath(target)) return "";
+  if (/^\*\*\/\*\.(?:tsx?|jsx?)$/i.test(target) || (/^\*\*\//.test(rawTarget) && /node_modules/i.test(String(input.detail || "")))) {
+    return "";
+  }
+  const detail = stripToolMetaFields(String(input.detail || ""))
+    .replace(/\b(?:node_modules|dist|build)\/[A-Za-z0-9_./@-]+/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const cleanDetail = compactPlanLine(detail, 160);
+  return [tool, target].filter(Boolean).join(" ") + (cleanDetail ? `; excerpt=${cleanDetail}` : "");
+}
+
+function sanitizeEvidenceLine(value: unknown, language: "zh" | "en"): { value: string; reason?: string } {
+  const raw = String(value || "").trim();
+  if (!raw) return { value: "", reason: "empty" };
+  if (PROTOCOL_NOISE_RE.test(raw)) return { value: "", reason: "protocol_noise" };
+  if (/ContextMemory|ContextState|\[ContextMemory/i.test(raw)) return { value: "", reason: "context_memory" };
+
+  const envelope = parseToolFeedbackEnvelope(raw);
+  if (envelope) {
+    const status = envelope.envelope.status;
+    if (status !== "completed" && status !== "cached" && status !== "no_op") {
+      return { value: "", reason: "tool_failed" };
+    }
+    const normalized = normalizeSemanticToolEvidence({
+      tool: envelope.envelope.tool,
+      target: envelope.envelope.target,
+      detail: envelope.envelope.summary,
+      status,
+    });
+    return normalized ? { value: normalized } : { value: "", reason: "non_semantic_tool" };
+  }
+
+  if (
+    isPlanArtifactPath(raw) &&
+    /(?:write_file|replace_in_file|PLAN NOT READY|status\s*[:=]\s*(?:failed|blocked|rejected))/i.test(raw)
+  ) {
+    return { value: "", reason: "plan_artifact_tool_log" };
+  }
+  if (/Repeated read-only tool call skipped|Duplicate skip count|FILE_UNCHANGED_STUB|already called with identical arguments/i.test(raw)) {
+    return { value: "", reason: "repeated_read_noise" };
+  }
+
+  const statusMatch = raw.match(/\bstatus\s*[:=]\s*([a-z_]+)/i);
+  const semicolonToolEvidence = raw.match(/^\s*([a-z_][a-z0-9_]*)\s*(?:;|\s+)\s*([^;\n]{1,220})(?:\s*;\s*([\s\S]{1,420}))?/i);
+  if (semicolonToolEvidence) {
+    const normalized = normalizeSemanticToolEvidence({
+      tool: semicolonToolEvidence[1] || "",
+      target: semicolonToolEvidence[2] || "",
+      detail: semicolonToolEvidence[3] || "",
+      status: statusMatch?.[1] || "",
+    });
+    if (normalized) return { value: normalized };
+    if (SEMANTIC_EVIDENCE_TOOLS.has(semicolonToolEvidence[1] || "")) {
+      return { value: "", reason: /failed|blocked|rejected/i.test(statusMatch?.[1] || "") ? "tool_failed" : "non_semantic_tool" };
+    }
+  }
+
+  const keyedToolName =
+    raw.match(/\btool\s*[:=]\s*([a-z_][a-z0-9_]*)/i)?.[1] ||
+    raw.match(/\bname\s*[:=]\s*([a-z_][a-z0-9_]*)/i)?.[1] ||
+    "";
+  const keyedTarget =
+    raw.match(/\btarget\s*[:=]\s*([^;\n,}]{1,220})/i)?.[1] ||
+    raw.match(/\bpath\s*[:=]\s*([^;\n,}]{1,220})/i)?.[1] ||
+    "";
+  if (keyedToolName && keyedTarget) {
+    const normalized = normalizeSemanticToolEvidence({
+      tool: keyedToolName,
+      target: keyedTarget,
+      detail: raw.match(/\b(?:summary|excerpt)\s*[:=]\s*([^;\n}]{1,260})/i)?.[1] || "",
+      status: statusMatch?.[1] || "",
+    });
+    return normalized ? { value: normalized } : { value: "", reason: "non_semantic_tool" };
+  }
+
+  if (RAW_TOOL_RESULT_NOISE_RE.test(raw)) {
+    const path = normalizePathLikeCandidate(raw);
+    if (path && !/status\s*[:=]\s*(?:failed|blocked|rejected)/i.test(raw)) {
+      return { value: language === "zh" ? `已读取文件：${path}` : `Read file: ${path}` };
+    }
+    return { value: "", reason: "raw_tool_result" };
+  }
+
+  const clean = compactPlanLine(stripToolMetaFields(raw), 200);
+  if (!clean) return { value: "", reason: "tool_log_noise" };
+  if (/^(?:\]|\.\.\.|\[|\{|\})$/.test(clean)) return { value: "", reason: "syntax_fragment" };
+  return { value: clean };
+}
+
+export function sanitizePlanEvidenceInput(input: {
+  userGoal?: string;
+  evidence?: unknown[];
+  files?: unknown[];
+  constraints?: unknown[];
+  language?: "zh" | "en";
+  maxEvidence?: number;
+  maxFiles?: number;
+  maxConstraints?: number;
+}): SanitizedPlanEvidenceInput {
+  const language = input.language === "en" ? "en" : "zh";
+  const dropped: PlanEvidenceSanitizerDrop[] = [];
+  const dropReasons: Record<string, number> = {};
+  const addDrop = (bucket: PlanEvidenceSanitizerDrop["bucket"], reason: string, value: unknown) => {
+    noteSanitizerDrop(dropped, bucket, reason, value);
+    dropReasons[reason] = (dropReasons[reason] || 0) + 1;
+  };
+  const unique = (values: string[], maxItems: number, maxChars: number) => {
+    const seen = new Set<string>();
+    const result: string[] = [];
+    for (const value of values) {
+      const normalized = sanitizePlanArtifactContent(String(value || ""))
+        .replace(/\s+/g, " ")
+        .trim();
+      const compacted = normalized.length <= maxChars ? normalized : `${normalized.slice(0, maxChars).trim()}...`;
+      if (!compacted) continue;
+      const key = compacted.toLowerCase().replace(/\s+/g, " ");
+      if (seen.has(key)) continue;
+      seen.add(key);
+      result.push(compacted);
+      if (result.length >= maxItems) break;
+    }
+    return result;
+  };
+
+  const evidence: string[] = [];
+  for (const item of input.evidence || []) {
+    const sanitized = sanitizeEvidenceLine(item, language);
+    if (sanitized.value) {
+      evidence.push(sanitized.value);
+    } else {
+      addDrop("evidence", sanitized.reason || "empty", item);
+    }
+  }
+
+  const files: string[] = [];
+  for (const item of input.files || []) {
+    const path = normalizePathLikeCandidate(item);
+    if (path) {
+      files.push(path);
+    } else {
+      addDrop("files", isPlanArtifactPath(item) ? "plan_artifact_path" : "non_path", item);
+    }
+  }
+  for (const item of evidence) {
+    const path = normalizePathLikeCandidate(item);
+    if (path) files.push(path);
+  }
+
+  const constraints: string[] = [];
+  for (const item of input.constraints || []) {
+    const clean = cleanPlanItem(item, 220);
+    if (clean && !RAW_TOOL_RESULT_NOISE_RE.test(clean) && !PROTOCOL_NOISE_RE.test(clean)) {
+      constraints.push(clean);
+    } else {
+      addDrop("constraints", "constraint_noise", item);
+    }
+  }
+
+  const cleanUserGoal = compactPlanLine(input.userGoal || "", 600);
+  const cleanEvidence = unique(evidence, Math.max(1, Number(input.maxEvidence) || 12), 220);
+  const cleanFiles = unique(files, Math.max(1, Number(input.maxFiles) || 12), 180);
+  const cleanConstraints = unique(constraints, Math.max(1, Number(input.maxConstraints) || 6), 220);
+
+  return {
+    userGoal: cleanUserGoal,
+    evidence: cleanEvidence,
+    files: cleanFiles,
+    constraints: cleanConstraints,
+    dropped,
+    stats: {
+      inputEvidence: (input.evidence || []).length,
+      keptEvidence: cleanEvidence.length,
+      inputFiles: (input.files || []).length,
+      keptFiles: cleanFiles.length,
+      inputConstraints: (input.constraints || []).length,
+      keptConstraints: cleanConstraints.length,
+      dropped: dropped.length,
+      dropReasons,
+    },
+  };
 }
 
 interface ParsedPlanSection {
@@ -403,12 +706,85 @@ export function canonicalizePlanArtifactContent(input: {
 
 function summarizeEvidenceLine(value: string, language: "zh" | "en"): string {
   const raw = String(value || "");
+  const labels = language === "zh" ? TOOL_LABELS_ZH : TOOL_LABELS_EN;
+  const extractFeedbackField = (field: string, maxChars: number): string => {
+    const escapedField = field.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const quoted = raw.match(new RegExp(`\\b${escapedField}["']?\\s*[:=]\\s*(?:"([^"]{1,${maxChars}})"|'([^']{1,${maxChars}})')`, "i"));
+    if (quoted) return quoted[1] || quoted[2] || "";
+    const unquoted = raw.match(new RegExp(`\\b${escapedField}["']?\\s*[:=]\\s*([^\\s,;}]{1,${maxChars}})`, "i"));
+    return unquoted?.[1] || "";
+  };
+  const extractFeedbackTextField = (field: string, maxChars: number): string => {
+    const escapedField = field.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const quoted = raw.match(new RegExp(`\\b${escapedField}["']?\\s*[:=]\\s*(?:"([^"]{1,${maxChars}})"|'([^']{1,${maxChars}})')`, "i"));
+    if (quoted) return quoted[1] || quoted[2] || "";
+    const unquoted = raw.match(new RegExp(`\\b${escapedField}["']?\\s*[:=]\\s*([^\\n}]{1,${maxChars}})`, "i"))?.[1] || "";
+    return unquoted
+      .replace(/\s+\b(?:status|hash|tool_call_id|toolCallId|target|path|tool|name)\s*[:=][\s\S]*$/i, "")
+      .replace(/[;,]\s*$/, "")
+      .trim();
+  };
+  const formatToolEvidence = (toolName: string, targetValue: string, detailValue = "") => {
+    const label = labels[toolName];
+    const target = compactPlanLine(targetValue, 96);
+    if (!label || !target) return "";
+    const explicitDetail =
+      detailValue.match(/\bexcerpt\s*[:=]\s*([^;\n,}]{1,180})/i)?.[1] ||
+      detailValue.match(/\bsummary\s*[:=]\s*([^;\n,}]{1,180})/i)?.[1] ||
+      "";
+    const detail = compactPlanLine(
+      (explicitDetail || detailValue)
+        .replace(/\b(?:status|hash|tool_call_id|toolCallId)\s*[:=]\s*[^;\n,}]+/gi, " ")
+        .replace(/\bexcerpt\s*[:=]\s*/gi, language === "zh" ? "片段：" : "excerpt: ")
+        .replace(/\bsummary\s*[:=]\s*/gi, language === "zh" ? "摘要：" : "summary: "),
+      120,
+    );
+    const connector = language === "zh" ? "；发现：" : "; found: ";
+    return `${label}${language === "zh" ? "：" : ": "}${target}${detail ? `${connector}${detail}` : ""}`;
+  };
+
+  const envelope = parseToolFeedbackEnvelope(raw);
+  if (envelope) {
+    const summarized = formatToolEvidence(
+      envelope.envelope.tool || "",
+      envelope.envelope.target || "",
+      envelope.envelope.summary || "",
+    );
+    if (summarized) return summarized;
+  }
+
+  const semicolonToolEvidence = raw.match(/^\s*([a-z_][a-z0-9_]*)\s*;\s*([^;\n]{1,160})(?:\s*;\s*([\s\S]{1,240}))?/i);
+  if (semicolonToolEvidence) {
+    const summarized = formatToolEvidence(
+      semicolonToolEvidence[1] || "",
+      semicolonToolEvidence[2] || "",
+      semicolonToolEvidence[3] || "",
+    );
+    if (summarized) return summarized;
+  }
+
+  const keyedToolName =
+    extractFeedbackField("tool", 80).match(/^[a-z_][a-z0-9_]*$/i)?.[0] ||
+    extractFeedbackField("name", 80).match(/^[a-z_][a-z0-9_]*$/i)?.[0] ||
+    "";
+  const keyedTarget =
+    extractFeedbackField("target", 180) ||
+    extractFeedbackField("path", 180) ||
+    "";
+  if (keyedToolName && keyedTarget) {
+    const keyedDetail =
+      extractFeedbackTextField("excerpt", 180) ||
+      extractFeedbackTextField("summary", 180) ||
+      "";
+    const summarized = formatToolEvidence(keyedToolName, keyedTarget, keyedDetail);
+    if (summarized) return summarized;
+  }
+
   const toolEvidence = raw.match(/^\s*([a-z_][a-z0-9_]*)\s+([^;\n]{1,160})(?:[\s\S]*?\bexcerpt=([^;\n]{1,180}))?/i);
   if (toolEvidence) {
     const toolName = toolEvidence[1] || "";
     const target = compactPlanLine(toolEvidence[2] || "", 96);
     const excerpt = compactPlanLine(toolEvidence[3] || "", 120);
-    const labels = language === "zh" ? TOOL_LABELS_ZH : TOOL_LABELS_EN;
     const label = labels[toolName];
     if (label && target) {
       const connector = language === "zh" ? "；发现：" : "; found: ";
@@ -440,6 +816,33 @@ function formatBullets(values: string[], fallback: string): string {
     : `- ${fallback}`;
 }
 
+function resolveMaterializationKind(input: {
+  raw: string;
+  planStage?: PlanStage | null;
+  preferredKind?: MaterializablePlanKind | null;
+}): MaterializablePlanKind {
+  if (input.preferredKind === "design") return "design";
+  if (input.preferredKind === "plan") return "plan";
+  if (input.planStage === "design") return "design";
+  if (
+    /^\s*#\s*(?:Design\b|设计)/im.test(input.raw) ||
+    /\.MAIN\/plans\/design\.md/i.test(input.raw) ||
+    /(?:正式设计方案|设计文档|reviewable,\s*actionable\s*design)/i.test(input.raw)
+  ) {
+    return "design";
+  }
+  return "plan";
+}
+
+function normalizeDesignContent(rawText: string, language: "zh" | "en"): string {
+  const withoutChoices = stripPlanChoiceMarkup(rawText);
+  const withoutProposalMarkers = withoutChoices.replace(PROPOSAL_MARKER_RE, "").trim();
+  const strippedPlanJson = withoutProposalMarkers.replace(/<plan>[\s\S]*?<\/plan>/gi, "").trim();
+  const sanitized = sanitizePlanArtifactContent(strippedPlanJson);
+  if (/^#\s+/m.test(sanitized)) return sanitized;
+  return `${language === "zh" ? "# 设计方案" : "# Design"}\n\n${sanitized}`;
+}
+
 export function materializePlanArtifactFromVisibleText(input: {
   visibleText: string;
   planStage?: PlanStage | null;
@@ -457,7 +860,29 @@ export function materializePlanArtifactFromVisibleText(input: {
   if (TOOL_LOG_NOISE_RE.test(raw)) return { ok: false, reason: "tool_log_noise" };
   if (raw.length < 280) return { ok: false, reason: "too_short" };
 
-  const kind: MaterializablePlanKind = "plan";
+  const language = detectMaterializationLanguage({
+    content: raw,
+    userGoal: input.userGoal,
+    language: input.language,
+  });
+  const kind = resolveMaterializationKind({
+    raw,
+    planStage: input.planStage,
+    preferredKind: input.preferredKind,
+  });
+  if (kind === "design") {
+    const content = normalizeDesignContent(raw, language);
+    if (countPlanShapeSignals(content) < 4) return { ok: false, reason: "not_structured" };
+    const validation = validatePlanArtifactContent(content, "design");
+    if (!validation.ok) return { ok: false, reason: validation.reason || "quality_gate" };
+    return {
+      ok: true,
+      kind,
+      path: ".MAIN/plans/design.md",
+      content,
+    };
+  }
+
   let content = normalizePlanContent(raw);
   if (countPlanShapeSignals(content) < 5) return { ok: false, reason: "not_structured" };
 
@@ -516,54 +941,68 @@ export function composeReviewablePlanFromEvidence(input: {
   evidence: string[];
   files?: string[];
   constraints?: string[];
+  kind?: MaterializablePlanKind;
   language?: "zh" | "en";
 }): string {
   const language = input.language === "en" ? "en" : "zh";
-  const goal = compactPlanLine(input.userGoal, 420);
-  const evidence = uniqueCompactLines(input.evidence.map((item) => summarizeEvidenceLine(item, language)), 10, 220);
-  const files = uniqueCompactLines(input.files || [], 10, 160);
-  const constraints = uniqueCompactLines(input.constraints || [], 6, 200);
+  const sanitized = sanitizePlanEvidenceInput({
+    userGoal: input.userGoal,
+    evidence: input.evidence,
+    files: input.files,
+    constraints: input.constraints,
+    language,
+  });
+  const kind = input.kind === "design" ? "design" : "plan";
+  const targetPath = kind === "design" ? ".MAIN/plans/design.md" : ".MAIN/plans/plan.md";
+  const goal = compactPlanLine(sanitized.userGoal || input.userGoal, 420);
+  const evidence = uniqueCompactLines(sanitized.evidence.map((item) => summarizeEvidenceLine(item, language)), 10, 220);
+  const files = uniqueCompactLines(sanitized.files, 10, 160);
+  const constraints = uniqueCompactLines(sanitized.constraints, 6, 200);
 
   if (language === "en") {
     return [
       "You already have read-only evidence. Do not repeat directory scans or broad context reads.",
-      "Generate a reviewable, actionable plan now.",
+      kind === "design"
+        ? "Generate a reviewable, actionable design now."
+        : "Generate a reviewable, actionable plan now.",
       "",
       "Hard requirements:",
-      "- Use English for all visible prose and `.MAIN/plans/plan.md` content.",
-      "- Prefer a single `write_file` tool call that writes `.MAIN/plans/plan.md`.",
+      `- Use English for all visible prose and \`${targetPath}\` content.`,
+      `- Prefer a single \`write_file\` tool call that writes \`${targetPath}\`.`,
       "- Do not create `tasks.md`; do not modify source or deliverable files before approval.",
-      "- Do not include tool logs, ContextMemoryState, XML, raw JSON envelopes, or recovery prompts in the plan.",
+      "- Do not include tool logs, ContextMemoryState, XML, raw JSON envelopes, or recovery prompts in the artifact.",
       "- Separate confirmed facts from unverified hypotheses. Do not write probability guesses as execution steps unless an evidence line supports them.",
-      "- If a critical business choice is genuinely missing, ask with `<user_options>` instead of writing a generic plan.",
+      `- If a critical business choice is genuinely missing, ask with \`<user_options>\` instead of writing a generic ${kind}.`,
       "",
       `User goal: ${goal}`,
       evidence.length ? `Evidence:\n${formatBullets(evidence, "Read-only evidence is available.")}` : "",
       files.length ? `Relevant paths:\n${formatBullets(files, "No path summary available.")}` : "",
       constraints.length ? `Constraints:\n${formatBullets(constraints, "No extra constraints.")}` : "",
       "",
-      "The plan must include: user goal, screenshot/attachment observations when present, confirmed facts, evidence references, unverified hypotheses, affected files/interfaces, execution steps, risks/tradeoffs, and validation standards. If a critical choice blocks execution, ask with `<user_options>` before approval instead of burying it as an open question.",
+      `${targetPath} must include: user goal, screenshot/attachment observations when present, confirmed facts, evidence references, unverified hypotheses, affected files/interfaces, execution steps, risks/tradeoffs, and validation standards. If a critical choice blocks execution, ask with \`<user_options>\` before approval instead of burying it as an open question.`,
     ].filter(Boolean).join("\n");
   }
 
   return [
     "你已经获得只读证据。不要重复扫描目录或泛读上下文。",
-    "现在生成可审阅、可执行的正式计划。",
+    kind === "design"
+      ? "现在生成可审阅、可执行的正式设计方案。"
+      : "现在生成可审阅、可执行的正式计划。",
     "",
     "硬性要求：",
-    "- 所有可见正文和 `.MAIN/plans/plan.md` 内容必须使用简体中文。",
-    "- 优先只调用一次 `write_file`，写入 `.MAIN/plans/plan.md`。",
+    `- 所有可见正文和 \`${targetPath}\` 内容必须使用简体中文。`,
+    `- 优先只调用一次 \`write_file\`，写入 \`${targetPath}\`。`,
     "- 批准前不要生成 `tasks.md`，不要修改源码或最终交付文件。",
-    "- 计划中禁止出现工具日志、ContextMemoryState、XML、原始 JSON envelope、恢复提示。",
+    "- 文档中禁止出现工具日志、ContextMemoryState、XML、原始 JSON envelope、恢复提示。",
     "- 必须区分已确认事实和未验证假设。没有证据支撑的概率判断不能写成执行步骤。",
-    "- 如果确实缺少关键业务选择，用 `<user_options>` 提问，不要写泛化模板计划。",
+    `- 如果确实缺少关键业务选择，用 \`<user_options>\` 提问，不要写泛化模板${kind === "design" ? "设计" : "计划"}。`,
     "",
     `用户目标：${goal}`,
     evidence.length ? `已获得证据：\n${formatBullets(evidence, "已有只读证据。")}` : "",
     files.length ? `相关路径：\n${formatBullets(files, "暂无路径摘要。")}` : "",
     constraints.length ? `约束：\n${formatBullets(constraints, "暂无额外约束。")}` : "",
     "",
-    "plan.md 必须包含：用户目标、截图/附件观察、已确认事实、证据引用、未验证假设、影响文件/接口、执行步骤、风险取舍和验证标准。真正阻塞执行的选择必须在批准前用 `<user_options>` 提问，不要伪装成计划尾部的开放问题。",
+    `${targetPath} 必须包含：用户目标、截图/附件观察、已确认事实、证据引用、未验证假设、影响文件/接口、执行步骤、风险取舍和验证标准。真正阻塞执行的选择必须在批准前用 \`<user_options>\` 提问，不要伪装成计划尾部的开放问题。`,
   ].filter(Boolean).join("\n");
 }
 
@@ -575,14 +1014,21 @@ export function composePlanArtifactFromEvidence(input: {
   language?: "zh" | "en";
 }): string {
   const language = input.language === "en" ? "en" : "zh";
-  const goal = compactPlanLine(input.userGoal, 420) || (
+  const sanitized = sanitizePlanEvidenceInput({
+    userGoal: input.userGoal,
+    evidence: input.evidence,
+    files: input.files,
+    constraints: input.constraints,
+    language,
+  });
+  const goal = compactPlanLine(sanitized.userGoal || input.userGoal, 420) || (
     language === "zh"
       ? "根据用户当前请求完成可审阅实现计划。"
       : "Prepare a reviewable implementation plan for the current user request."
   );
-  const evidence = uniqueCompactLines(input.evidence.map((item) => summarizeEvidenceLine(item, language)), 10, 220);
-  const files = uniqueCompactLines(input.files || [], 10, 160);
-  const constraints = uniqueCompactLines(input.constraints || [], 6, 200);
+  const evidence = uniqueCompactLines(sanitized.evidence.map((item) => summarizeEvidenceLine(item, language)), 10, 220);
+  const files = uniqueCompactLines(sanitized.files, 10, 160);
+  const constraints = uniqueCompactLines(sanitized.constraints, 6, 200);
   const affectedFiles = files.length > 0
     ? files
     : (language === "zh"
