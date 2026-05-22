@@ -2594,7 +2594,9 @@ function buildPlanRecoveryPrompt(callbacks: OrchestratorCallbacks, sourceText: s
       "Rules:",
       "- Do not copy tool logs, duplicate-call warnings, hidden thinking, raw source code, or truncation messages into plan files.",
       "- `plan.md` is the default required approval artifact and the persisted equivalent of a Codex `<proposed_plan>` block.",
-      "- `plan.md` must include: user goal/constraints, screenshot/attachment observations when present, read evidence with paths/tool references, confirmed findings, unverified hypotheses, affected files/interfaces, ordered execution steps, risks/tradeoffs, and validation standards.",
+      "- `plan.md` must use the Codex app handoff shape: title, Summary, Key Changes / Implementation Changes, Public APIs / Interfaces / Types, Test Plan, and Assumptions / Defaults.",
+      "- Screenshot/attachment observations, read evidence, and confirmed facts belong in the concise Summary only when real; do not inflate them into empty audit sections.",
+      "- Every implementation change must point to concrete files, interfaces, data flow, commands, validation, or an explicit default. If public APIs/interfaces/types do not change, say that explicitly.",
       "- Do not include console.log/debug-log suggestions, generalized CSS/store guesses, or probability claims as execution steps unless a cited evidence line supports them; otherwise place them under unverified hypotheses.",
       "- Non-blocking MVP tradeoffs must be written with explicit defaults as assumptions or follow-up enhancements. If a choice blocks execution, ask with `<user_options>` before approval and stop.",
       "- `requirements.md` is optional. Only create it when the user explicitly asks for a requirement ledger or when large/compliance-heavy scope needs traceability; it is never a prerequisite for approval.",
@@ -2611,7 +2613,9 @@ function buildPlanRecoveryPrompt(callbacks: OrchestratorCallbacks, sourceText: s
     "规则：",
     "- 不要把工具日志、重复调用提示、后台思考、原始源码或截断提示写进计划文件。",
     "- `plan.md` 是默认必需的审批方案，也是 Codex `<proposed_plan>` 的持久化替代物。",
-    "- `plan.md` 必须包含：用户目标/约束、截图/附件观察（如存在）、带路径或工具引用的已读证据、已确认事实、真实发现、未验证假设、影响文件/接口、执行步骤、风险取舍和验证标准。",
+    "- `plan.md` 必须使用 Codex app 交接计划结构：标题、摘要、关键实现改动、公共 API/接口/类型、测试方案、假设与默认值。",
+    "- 截图/附件观察、已读证据和已确认事实只在确有内容时放进精简摘要，不要撑成空洞审计章节。",
+    "- 每个关键实现改动必须指向具体文件、接口、数据流、命令、验证方式或明确默认假设；如果公共 API/接口/类型不变，必须显式写明。",
     "- 没有证据支撑时，不要把 console.log/调试日志建议、泛化 CSS/Store 猜测或概率判断写成执行步骤；只能放入未验证假设。",
     "- 非阻塞 MVP 取舍必须写成带默认值的默认假设或后续增强；真正阻塞执行的选择必须在批准前用 `<user_options>` 提问并停止。",
     "- `requirements.md` 是可选需求台账；只有用户明确要求、范围很大或需要合规/验收追踪时才生成，绝不是审批前置条件。",
@@ -4310,10 +4314,10 @@ async function buildPlanArtifactMutationValidationError(
         : "";
       const message = language === "zh"
         ? shouldUseInternalFeedback
-          ? `PLAN_NOT_READY: ${path} 没有写入。当前内容未达到 Codex 式可审批 plan.md（${validation.reason || "质量不足"}；recovery=${recoveryAction};${missingHint}）。不要把猜测、调试日志建议或泛化方案写成计划；请补足截图/附件观察、已读证据、真实发现、未验证假设、影响文件、执行步骤和验证标准。${recoveryHintZh}`
+          ? `PLAN_NOT_READY: ${path} 没有写入。当前内容未达到 Codex App 式可审批 plan.md（${validation.reason || "质量不足"}；recovery=${recoveryAction};${missingHint}）。不要把猜测、调试日志建议或泛化步骤写成计划；请改为标题、摘要、关键实现改动、公共 API/接口/类型、测试方案、假设与默认值，并确保每个改动有具体文件/接口/数据流/命令/验证依据。${recoveryHintZh}`
           : `PLAN_QUALITY_GATE: ${path} 被拦截，内容不像可审批的正式计划（${validation.reason || "质量不足"}）。请基于用户目标和已读源码重新生成 plan.md，或用 <user_options> 询问关键分叉；不要写入工具日志、后台思考、截断提示或原始代码片段。`
         : shouldUseInternalFeedback
-        ? `PLAN_NOT_READY: ${path} was not written. The content is not a Codex-style reviewable plan.md yet (${validation.reason || "quality gate"}; recovery=${recoveryAction};${missingHint}). Do not turn guesses, debug-log advice, or generic proposals into the plan; add screenshot/attachment observations, read evidence, confirmed findings, unverified hypotheses, affected files, execution steps, and validation standards. ${recoveryHintEn}`
+        ? `PLAN_NOT_READY: ${path} was not written. The content is not a Codex app-style reviewable plan.md yet (${validation.reason || "quality gate"}; recovery=${recoveryAction};${missingHint}). Do not turn guesses, debug-log advice, or generic steps into the plan; use title, Summary, Key Changes / Implementation Changes, Public APIs / Interfaces / Types, Test Plan, and Assumptions / Defaults, with each change grounded in concrete files, interfaces, data flow, commands, or validation. ${recoveryHintEn}`
         : `PLAN_QUALITY_GATE: ${path} was rejected because it does not look like a reviewable plan artifact (${validation.reason || "quality gate"}). Regenerate plan.md from the user goal and inspected source, or ask the user with <user_options>; do not write tool logs, hidden thinking, truncation notices, or raw source snippets.`;
       if (!shouldUseInternalFeedback) {
         callbacks.onToolExecuting(tc.name, target, undefined, { toolCallId: tc.id });
@@ -7597,13 +7601,14 @@ export async function executeAgentLoop(
         };
         if (approvedPlanNoProgressRecoveryAttempts < MAX_APPROVED_PLAN_NO_PROGRESS_RECOVERY_ATTEMPTS) {
           continueApprovedPlanWithStrategySwitch(recoveryInput);
+          continue;
         } else {
           pauseApprovedPlanNoProgressLoop({
             ...recoveryInput,
             repeats: Math.max(1, consecutiveNoToolCount),
           });
+          return;
         }
-        return;
       }
 
       logAgentEvent("plan_execution_no_tool_reprompt", {
@@ -9339,10 +9344,11 @@ export async function executeAgentLoop(
     if (approvedPlanNoProgressDecision) {
       if (approvedPlanNoProgressDecision.action === "recover") {
         continueApprovedPlanWithStrategySwitch(approvedPlanNoProgressDecision);
+        continue;
       } else {
         pauseApprovedPlanNoProgressLoop(approvedPlanNoProgressDecision);
+        return;
       }
-      return;
     }
 
     if (isUnapprovedPlanReadOnlyBatch && !hasPlanDecisionOutput) {

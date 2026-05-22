@@ -324,11 +324,12 @@ test("canonicalizes Gemma-like Proposed Plan with nonstandard section names", ()
 
   assert.equal(result.ok, true);
   assert.match(result.content || "", /^# 计划/);
-  assert.match(result.content || "", /## 用户目标/);
-  assert.match(result.content || "", /## 截图\/附件观察/);
+  assert.match(result.content || "", /## 摘要/);
   assert.match(result.content || "", /用户提供了 2 张图片/);
-  assert.match(result.content || "", /## 已读证据/);
-  assert.match(result.content || "", /## 已确认事实/);
+  assert.match(result.content || "", /## 关键改动/);
+  assert.match(result.content || "", /## 公共 API \/ 接口 \/ 类型/);
+  assert.match(result.content || "", /## 测试方案/);
+  assert.match(result.content || "", /## 假设与默认值/);
   assert.match(result.content || "", /src\/components\/FileUploader\/DragUpload\.tsx/);
 });
 
@@ -360,9 +361,12 @@ test("canonicalizes missing confirmed facts from the evidence ledger", () => {
   });
 
   assert.equal(result.ok, true);
-  assert.match(result.content || "", /## Confirmed Facts/);
-  assert.match(result.content || "", /Confirmed relevant evidence exists/);
-  assert.match(result.content || "", /## Read Evidence/);
+  assert.match(result.content || "", /## Summary/);
+  assert.match(result.content || "", /Read file: src\/lib\/planMaterialization\.ts/);
+  assert.match(result.content || "", /## Key Changes/);
+  assert.match(result.content || "", /## Public APIs \/ Interfaces \/ Types/);
+  assert.match(result.content || "", /## Test Plan/);
+  assert.match(result.content || "", /## Assumptions \/ Defaults/);
 });
 
 test("rejects tool-log noise instead of canonicalizing it", () => {
@@ -454,7 +458,9 @@ test("materializes MVP defaults without requiring open questions", () => {
 
   assert.equal(result.ok, true);
   assert.equal(result.path, ".MAIN/plans/plan.md");
-  assert.match(result.content || "", /默认假设与后续增强/);
+  assert.match(result.content || "", /## 假设与默认值/);
+  assert.match(result.content || "", /自动保存历史版本：MVP 不做/);
+  assert.match(result.content || "", /权限策略编辑 UI：后续增强/);
 });
 
 test("composes strict plan closure prompt from evidence without tool logs", () => {
@@ -493,7 +499,11 @@ test("composes deterministic reviewable plan artifact after repeated quality rej
   });
 
   assert.equal(validateActionablePlanArtifact(content).ok, true);
-  assert.match(content, /## 已读证据/);
+  assert.match(content, /## 摘要/);
+  assert.match(content, /## 关键改动/);
+  assert.match(content, /## 公共 API \/ 接口 \/ 类型/);
+  assert.match(content, /## 测试方案/);
+  assert.match(content, /## 假设与默认值/);
   assert.match(content, /dashboardStore\.ts/);
   assert.doesNotMatch(content, /MAIN TOOL FEEDBACK|ContextMemoryState|RecoveryDetails/);
 });
@@ -517,6 +527,7 @@ test("composes deterministic plan artifact from real tool feedback without leaki
 
   assert.equal(validateActionablePlanArtifact(content).ok, true);
   assert.match(content, /已读取文件：src\/store\/dashboardStore\.ts/);
+  assert.match(content, /无公共 API|公共 API/);
   assert.match(content, /useCsvParser\.ts/);
   assert.match(content, /useChartData\.ts/);
   assert.doesNotMatch(content, /MAIN_TOOL_FEEDBACK|tool_call_id|status=observed|hash=|excerpt=/);
@@ -561,6 +572,64 @@ test("sanitizes repeated quality-gate evidence before deterministic plan materia
 
   assert.equal(validateActionablePlanArtifact(content).ok, true);
   assert.doesNotMatch(content, /PLAN NOT READY|ContextMemory|hash=|status=|READ_FILE_RESULT|TASK_TARGETING_BLOCKED/);
+});
+
+test("rejects generic ten-section fallback plan as non-Codex handoff", () => {
+  const content = [
+    "# 计划",
+    "",
+    "## 用户目标",
+    "- 修复 ChatArea 有效进展和计划生成流程。",
+    "",
+    "## 截图/附件观察",
+    "- 除非用户提供的上下文中已有明确细节，否则不信任额外截图或附件推断。",
+    "",
+    "## 已读证据",
+    "- 已读取文件：src/App.tsx",
+    "- 已读取文件：src/components/ChatArea.tsx",
+    "",
+    "## 已确认事实",
+    "- 已确认存在相关计划证据：已读取文件：src/App.tsx",
+    "",
+    "## 未验证假设",
+    "- 证据没有直接覆盖的实现细节，必须在源码修改前通过定向读取确认。",
+    "",
+    "## 影响文件",
+    "- src/App.tsx",
+    "- src/components/ChatArea.tsx",
+    "",
+    "## 执行步骤",
+    "1. 基于已确认的证据先收窄实现目标，再修改源码。",
+    "2. 实施满足用户目标的最小源码变更。",
+    "3. 用聚焦测试、构建检查或浏览器/桌面验证确认行为达标。",
+    "",
+    "## 风险取舍",
+    "- 重复缓存读取不能算作新证据。",
+    "",
+    "## 验证标准",
+    "- 运行受影响子系统的聚焦验证命令。",
+  ].join("\n");
+
+  const validation = validateActionablePlanArtifact(content);
+  assert.equal(validation.ok, false);
+  assert.equal(validation.reason, "generic_fallback_plan");
+});
+
+test("deterministic materialization refuses insufficient evidence", () => {
+  const content = composePlanArtifactFromEvidence({
+    userGoal: "修复计划审批流程。",
+    evidence: [],
+    files: [],
+    constraints: [],
+    language: "zh",
+  });
+  const result = materializePlanArtifactFromVisibleText({
+    visibleText: content,
+    language: "zh",
+  });
+
+  assert.equal(result.ok, false);
+  assert.match(result.reason || "", /quality_gate|insufficient|missing|too_short|not_structured/);
 });
 
 test("materializes explicit design text to design.md", () => {

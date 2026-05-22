@@ -133,7 +133,8 @@ test("data analyst chat prompt tells the model to auto-fallback on read-only fai
   assert.match(prompt, /不要为了这种只读降级向用户申请批准/);
   assert.match(prompt, /不要停下来征求用户是否允许降级/);
   assert.match(prompt, /推荐回退顺序：`analyze_tabular_document` 全表概览 → `query_tabular_document` 结构化筛选\/聚合 → `read_document` 原始行窗口\/分页读取/);
-  assert.match(prompt, /确认列、日期、金额、课程字段和聚合口径/);
+  assert.match(prompt, /确认表结构、关键字段、数据类型、时间\/数值\/分类维度、缺失值和聚合口径/);
+  assert.doesNotMatch(prompt, /金额、课程字段|课程字段/);
   assert.match(prompt, /避免输出“我将再次执行”“请稍候确认是否同意降级”这类过程化台词/);
   assert.match(prompt, /不要先输出“下一步行动计划”“请稍候，我将开始分析”之类的过渡台词后停住/);
   assert.match(prompt, /一旦你判断需要读取本地文件才能回答，就在同一轮直接调用只读工具/);
@@ -158,6 +159,7 @@ test("system prompt uses English core tool protocol with localized output strate
   assert.match(prompt, /\[LOCALIZED USER OUTPUT\]/);
   assert.match(prompt, /resolvedResponseLanguage/);
   assert.match(prompt, /Any user-visible pre-tool narration must also use the resolved target language/);
+  assert.doesNotMatch(prompt, /[⚠🚫]/);
   assert.doesNotMatch(prompt, /在执行文件读取、搜索、修改、构建、测试等操作前，必须先用普通 Markdown 输出一句/);
   assert.doesNotMatch(prompt, /调用工具前，先用普通 Markdown 写一句用户可见的操作说明/);
 });
@@ -195,6 +197,35 @@ test("system prompt separates display language from resolved response language",
   assert.match(prompt, /需要工具时只输出完整工具调用/);
 });
 
+test("English system prompt uses domain-neutral tabular guidance", () => {
+  const prompt = buildSystemPrompt(
+    [],
+    "/tmp/workspace",
+    "main_mode",
+    "",
+    [],
+    [],
+    "plan",
+    "en",
+    null,
+    undefined,
+    undefined,
+    "english_core_localized_output",
+    ["read_file", "analyze_tabular_document", "query_tabular_document"],
+    null,
+    undefined,
+    {
+      displayLanguage: "en",
+      resolvedResponseLanguage: "en",
+    },
+  );
+
+  assert.match(prompt, /Data analysis\/reporting requests: during planning/);
+  assert.match(prompt, /confirm table structure, key fields, data types, temporal\/numeric\/categorical dimensions, missing values, and aggregation semantics/);
+  assert.match(prompt, /Continue analyzing the tabular parsing path/);
+  assert.doesNotMatch(prompt, /amount|course|orders\.csv|written to Store|CSV parsing/i);
+});
+
 test("tool protocol card gives compact XML instructions for local text tools", () => {
   const card = buildToolProtocolCard({
     activeProfile: "local",
@@ -210,8 +241,25 @@ test("tool protocol card gives compact XML instructions for local text tools", (
   assert.match(card, /protocol: xml-text/);
   assert.match(card, /<tool_use>/);
   assert.match(card, /<parameter name="path">/);
+  assert.doesNotMatch(card, /orders\.csv/);
   assert.match(card, /禁止输出 `\[Tool call: read_file\]`/);
   assert.doesNotMatch(card, /run_command\(command/);
+});
+
+test("English tabular XML example avoids domain-specific sample names", () => {
+  const card = buildToolProtocolCard({
+    activeProfile: "local",
+    provider: "Ollama",
+    toolProtocol: "xml",
+    nativeToolsEnabled: false,
+    workflowMode: "plan",
+    availableToolNames: ["analyze_tabular_document"],
+    language: "en",
+  });
+
+  assert.match(card, /<tool>analyze_tabular_document<\/tool>/);
+  assert.match(card, /<parameter name="path">data\.csv<\/parameter>/);
+  assert.doesNotMatch(card, /orders\.csv|amount|course/i);
 });
 
 test("tool protocol card uses native contract for native-capable providers", () => {
@@ -293,12 +341,15 @@ test("data analyst plan prompt uses interactive planning and analysis semantics"
   assert.match(prompt, /默认只把可审批方案写入 `\.MAIN\/plans\/plan\.md`/);
   assert.match(prompt, /`plan_file_change` 路由到 PLAN 后，必须把可审批草稿落到 `\.MAIN\/plans\/plan\.md`/);
   assert.match(prompt, /阶段 1 只读 grounding/);
-  assert.match(prompt, /阶段 2 归纳已确认事实\/未验证假设\/阻塞问题/);
+  assert.match(prompt, /阶段 2 收敛关键事实\/取舍\/默认值/);
   assert.match(prompt, /decision-complete 的 `\.MAIN\/plans\/plan\.md`/);
   assert.match(prompt, /requirements\.md.*审批的前置条件/);
-  assert.match(prompt, /必须包含：用户目标、截图\/附件观察、已读证据、真实发现、未验证假设、执行步骤、影响文件、验证标准/);
+  assert.match(prompt, /必须包含标题、摘要、关键实现改动、公共 API\/接口\/类型变化、测试方案、假设与默认值/);
+  assert.match(prompt, /每个关键实现改动必须能落到具体文件、接口、数据流、命令、验证方式或明确默认假设/);
   assert.match(prompt, /简单结构不需要，除非用户明确要求生成图/);
-  assert.match(prompt, /数据分析\/报表类请求：规划阶段优先输出分析目标、数据范围、指标口径、报表结构、验证方式/);
+  assert.match(prompt, /数据分析\/报表类请求：规划阶段优先输出分析目标、数据范围、指标定义、产物形态、分析方法与验证方式/);
+  assert.match(prompt, /确认表结构、关键字段、数据类型、时间\/数值\/分类维度、缺失值和聚合口径/);
+  assert.doesNotMatch(prompt, /金额、课程字段|课程字段|orders\.csv|数据是否写入 Store|CSV 解析逻辑/);
   assert.match(prompt, /复杂实现请求默认生成精简的 `\.MAIN\/plans\/plan\.md` 草稿供审批/);
   assert.match(prompt, /批准执行前仍然不能写源码或生成 tasks\.md/);
   assert.match(prompt, /不要为了确认 tasks\.md 是否存在而主动读取/);

@@ -128,7 +128,7 @@ function buildXmlExample(toolName: string): string[] {
     return [
       "<tool_use>",
       "<tool>analyze_tabular_document</tool>",
-      "<parameter name=\"path\">orders.csv</parameter>",
+      "<parameter name=\"path\">data.csv</parameter>",
       "</tool_use>",
     ];
   }
@@ -309,6 +309,18 @@ export function buildSystemPrompt(
   const resolvedLanguageName = languageName(resolvedResponseLanguage);
   const turnIntent = turnIntentOverride ?? resolveRunIntentFromLegacyWorkflowMode(workflowMode ?? "chat");
   const turnIntentPolicy = getIntentPolicy(turnIntent);
+  const userOptionInstruction = resolvedResponseLanguage === "en"
+    ? "4. `<option>` is sent back as the user's next message: if the option asks you to continue investigating, confirming, reading, analyzing, or executing, write it as a user instruction (for example, \"Please confirm whether the imported result reached the target state\" or \"Continue analyzing the tabular parsing path\"), not as model self-talk such as \"I will check\" or \"I will analyze\". Use \"I will...\" only when the option truly means the user will do something later."
+    : "4. `<option>` 是用户点击后发回给你的消息：如果选项是让你继续调查、确认、读取、分析或执行，必须写成用户指令口吻（如“请确认导入结果是否写入目标状态”“继续分析表格解析逻辑”），不要写成模型自述的“我来确认/我来检查/我来分析”。只有当确实表示用户自己稍后去确认时，才可以使用“我来……”。";
+  const tabularPlanSemanticsInstruction = resolvedResponseLanguage === "en"
+    ? "- Data analysis/reporting requests: during planning, prioritize the analysis goal, data scope, metric definitions, artifact shape, analysis method, and validation approach. For CSV/TSV/XLSX, imported data, time series, charts, or aggregate reporting, first use `analyze_tabular_document` / `query_tabular_document` to confirm table structure, key fields, data types, temporal/numeric/categorical dimensions, missing values, and aggregation semantics before deciding whether source-code reads are needed. Only materialize `plan.md` when the user explicitly asks to save a plan, generate report files, or run automation; add optional `requirements.md` only when needed."
+    : "- 数据分析/报表类请求：规划阶段优先输出分析目标、数据范围、指标定义、产物形态、分析方法与验证方式；涉及 CSV/TSV/XLSX、导入数据、时间序列、图表或聚合统计时，先用 `analyze_tabular_document` / `query_tabular_document` 确认表结构、关键字段、数据类型、时间/数值/分类维度、缺失值和聚合口径，再决定是否需要读取源码实现；只有用户明确要求保存计划、生成报表文件或执行自动化时，才落成 `plan.md`，必要时再附加可选 `requirements.md`。";
+  const tabularChatGroundingInstruction = resolvedResponseLanguage === "en"
+    ? "For CSV/TSV/XLSX, imported data, time series, charts, or aggregate reporting, first confirm table structure, key fields, data types, temporal/numeric/categorical dimensions, missing values, and aggregation semantics before giving conclusions or reading source code."
+    : "涉及 CSV/TSV/XLSX、导入数据、时间序列、图表或聚合统计时，先确认表结构、关键字段、数据类型、时间/数值/分类维度、缺失值和聚合口径，再给结论或读取源码实现。";
+  const tabularWorkflowPlanInstruction = resolvedResponseLanguage === "en"
+    ? "7. If the task is closer to reporting, summarization, or research analysis, the planning artifact should describe the analysis goal, data scope, metric definitions, artifact shape, method, and validation approach instead of defaulting to a software engineering plan. For CSV/TSV/XLSX, imported data, time series, charts, or aggregate reporting, first use `analyze_tabular_document` / `query_tabular_document` to confirm table structure, key fields, data types, temporal/numeric/categorical dimensions, missing values, and aggregation semantics before deciding whether source-code reads are needed."
+    : "7. 如果任务更像报告、总结或研究分析，规划产物应表达分析目标、数据范围、指标定义、产物形态、方法与验证方案，而不是默认套用代码工程计划。涉及 CSV/TSV/XLSX、导入数据、时间序列、图表或聚合统计时，先用 `analyze_tabular_document` / `query_tabular_document` 确认表结构、关键字段、数据类型、时间/数值/分类维度、缺失值和聚合口径，再决定是否需要读取源码实现。";
   const protocolCard = buildToolProtocolCard({
     ...toolProtocolProfile,
     workflowMode,
@@ -411,7 +423,7 @@ export function buildSystemPrompt(
     "8. 模板优先 — 若下方提供了工作区模板（尤其是意图分析模板与 Plan 模板），优先沿用其章节顺序与检查清单，再填入当前任务的真实内容；不要原样保留占位提示。",
     "9. 上下文优先 — 用户提供图片、附件或 @ 文件时，必须先说明这些材料中观察到的现象/约束，再围绕该现象做定向读取；不要把这类任务降级成泛读目录的通用项目分析。",
     "",
-    "## ⚠️ 输出可见性规则（最重要）",
+    "## 输出可见性规则（最重要）",
     "你的回复中，用户需要看到的内容必须是普通 Markdown 正文或正式工具调用。",
     "- 不要输出 `<analysis>`、`<thought>`、`<thinking>`、`<reasoning>` 等 hidden thinking 标签；这些不是计划、结论或行动通道。",
     "- 你的分析摘要、总结、结论、方案等所有需要用户看到的内容，**必须以普通 Markdown 文本的形式输出**。",
@@ -431,14 +443,14 @@ export function buildSystemPrompt(
     "1. 问题正文必须放在普通 Markdown 中，不能塞进 `<user_options>`。",
     "2. 默认给 2-4 个选项，尽量互斥、清晰、够具体。",
     "3. 每个 `<option>` 的文本都必须能直接作为用户点击后发回给你的下一条消息，不要写成残缺短语，也不要写成“是否……”这类问题句。",
-    "4. `<option>` 是用户点击后发回给你的消息：如果选项是让你继续调查、确认、读取、分析或执行，必须写成用户指令口吻（如“请确认数据是否写入 Store”“继续分析 CSV 解析逻辑”），不要写成模型自述的“我来确认/我来检查/我来分析”。只有当确实表示用户自己稍后去确认时，才可以使用“我来……”。",
+    userOptionInstruction,
     "5. 面向用户提问时，用“我需要你确认下面方向”这类自然口吻；不要输出“需要用户拍板的选项”这种后台说明。",
     "6. 如果你已经有推荐方案，把推荐项放在第一个。",
     "7. 不需要用户决策时，不要滥用选项块。",
     "8. 一旦你输出了 `<user_options>`，本轮就应立即停止并等待用户点击；不要在同一条回复里继续规划、继续思考下一步，或补一句“我将继续执行”。",
     "9. 如果确实因为目标分叉、口径冲突、关键前提不明确而无法继续推进，应该输出普通 Markdown 问题 + `<user_options>`，然后等待；不要假装提问后又自己继续往下执行。",
     "",
-    "## ⚠️ 分析深度要求",
+    "## 分析深度要求",
     "`get_project_skeleton` 只返回项目/资料目录结构，不包含任何文件内容。仅凭目录结构做出的分析毫无价值。",
     "在给出代码分析或架构总结之前，你必须：",
     "1. 先读取并利用用户已给上下文：图片要先总结可见 UI/文本/状态/异常，附件和 @ 文件要优先使用精确路径。源码/Unity 项目再根据用户问题里的路径、文件名、符号、截图文字或报错关键词做定向搜索/读取；只有缺少这些线索时，才用一次浅层 `get_project_skeleton(depth: 2)` 定位核心目录。表格/文档/资料分析任务先用用户提供的 `path:` 或最小范围 `list_directory` 找到文件，再直接使用文档/表格工具；",
@@ -489,7 +501,7 @@ export function buildSystemPrompt(
       "你当前这一轮的真实意图是：PLAN（交互式规划）。",
       "",
       "## PLAN 回合核心规则",
-      "PLAN 是一个 Codex 风格的三阶段回合：阶段 1 只读 grounding，阶段 2 归纳已确认事实/未验证假设/阻塞问题，阶段 3 生成 decision-complete 的 `.MAIN/plans/plan.md` 供审批。",
+      "PLAN 是一个 Codex App 风格的三阶段回合：阶段 1 只读 grounding，阶段 2 收敛关键事实/取舍/默认值，阶段 3 生成 decision-complete 的 `.MAIN/plans/plan.md` 供审批。",
       "当本轮是复杂实现请求被路由到 PLAN 时，目标不是长篇聊天，而是先生成可审阅的精简计划草稿，并在右侧计划面板等待用户批准后再执行。",
       "你应该参考 Codex 风格的 plan mode：在关键决策点用可点击选项引导用户，而不是一次性替用户走完整个实施链路。",
       "只要方案还没有真正收敛，就优先通过短摘要 + `<user_options>` 征询用户想法；不要用长篇计划文档替用户做完所有选择。",
@@ -509,8 +521,10 @@ export function buildSystemPrompt(
       "9. **不能空转**：当用户说“继续/继续生成/接着来”时，必须延续上一轮 PLAN 目标并产出实际计划内容；不要只回复“好的，我继续”或把它降级成普通讨论。",
       "",
       "### 计划文档精简规则",
-      "计划产物必须像给人审阅的执行摘要，不要写成教程、长篇背景说明或实现手册。",
-      "- `plan.md`：建议 60-120 行，是默认且唯一必需的用户审批方案；必须包含：用户目标、截图/附件观察、已读证据、真实发现、未验证假设、执行步骤、影响文件、验证标准。复杂实现可包含 1 个简短 Mermaid 图帮助审阅，简单结构不需要，除非用户明确要求生成图；方向不明确或存在阻塞性选择时，先用普通 Markdown 说明并紧跟 `<user_options>`，然后停止等待用户，不要把阻塞问题伪装成计划尾部开放问题。",
+      "计划产物必须像 Codex App 的可交接执行计划：短、可审阅、decision-complete，可直接交给另一个工程师实现；不要写成教程、长篇背景说明或实现手册。",
+      "- `plan.md`：默认且唯一必需的用户审批方案；必须包含标题、摘要、关键实现改动、公共 API/接口/类型变化、测试方案、假设与默认值。截图/附件观察、已读证据、已确认事实只在确有内容时放进摘要，不要撑成空洞章节。复杂实现可包含 1 个简短 Mermaid 图帮助审阅，简单结构不需要，除非用户明确要求生成图；方向不明确或存在阻塞性选择时，先用普通 Markdown 说明并紧跟 `<user_options>`，然后停止等待用户，不要把阻塞问题伪装成计划尾部开放问题。",
+      "- 如果公共 API、接口或类型不变化，必须显式写“无公共 API/接口/类型变化”或等价说明；不要省略这个判断。",
+      "- 每个关键实现改动必须能落到具体文件、接口、数据流、命令、验证方式或明确默认假设；不要只写“收窄目标、做最小变更、运行验证”这类通用步骤。",
       "- `requirements.md`：可选需求台账，建议 40-80 行；仅在用户明确要求、范围很大、需要合规/验收追踪时生成。它不能替代 plan.md，也不是审批的前置条件。",
       "- `tasks.md`：执行阶段的可选持久审计账本，建议 8-20 个 checkbox，每项一句话；需要命令时把精确命令放进同一行反引号里。短任务可以只使用 runtime 任务清单；一旦生成 tasks.md，它就是审计记录，不能删除已完成或旧任务，只能勾选、追加或保留“已完成任务”区块。",
       "- Proposal：只做一页审阅摘要，优先使用短段落、表格和 bullet；不要复制 plan.md 或可选 requirements 的全文。",
@@ -519,7 +533,7 @@ export function buildSystemPrompt(
       "### 方案产物语义",
       "- 功能/重构类请求：最终正式方案默认由 `plan.md` 表达；可选 `requirements.md` 只做需求台账兼容/追踪。批准执行后优先使用 runtime 任务清单，必要时才补 `tasks.md`。",
       "- 修复类请求：最终正式方案也由 `plan.md` 表达；代码修改必须等批准执行后再通过执行工具完成，批准后优先使用 runtime 任务清单，必要时才补 `tasks.md`。",
-      "- 数据分析/报表类请求：规划阶段优先输出分析目标、数据范围、指标口径、报表结构、验证方式；涉及 CSV/TSV/XLSX、导入数据、趋势、图表、环比时，先用 `analyze_tabular_document` / `query_tabular_document` 确认列、日期、金额、课程字段和聚合口径，再读取源码实现；只有用户明确要求保存或执行自动化时，才落成 `plan.md`，必要时再附加可选 `requirements.md`。",
+      tabularPlanSemanticsInstruction,
       "- 非阻塞取舍不要伪装成必须问用户的“开放问题”；写成带默认值的“默认假设/后续增强”，例如“自动保存：MVP 不做”。真正阻塞执行的选择必须在批准前用 `<user_options>` 提问。",
       "### 额外限制",
       "1. 在没有明确批准执行前，不要改源码，不要提前生成 `.MAIN/plans/tasks.md`；复杂实现和修复类只能把可审批草稿写入 `.MAIN/plans/plan.md`，requirements 仅作为可选需求台账。",
@@ -532,7 +546,7 @@ export function buildSystemPrompt(
       "### 探索范式",
       "1. 优先根据路径、文件名、符号或报错关键词使用 `grep_search`、`glob_search`、`list_directory` 定向发现；没有线索时才使用一次 `get_project_skeleton(depth: 2)` 获取浅层宏观骨架。",
       "2. 根据定向发现结果快速锁定核心业务目录，再使用 `get_file_outline`、`read_file`、`read_document`、`analyze_tabular_document` 或 `query_tabular_document` 深入读取关键文件。",
-      "3. ⚠️ `get_project_skeleton` 只返回目录结构，不包含代码内容。仅凭目录结构做出的分析没有价值。你必须进一步读取实际文件内容后才能给出有意义的结论。",
+      "3. 注意：`get_project_skeleton` 只返回目录结构，不包含代码内容。仅凭目录结构做出的分析没有价值。你必须进一步读取实际文件内容后才能给出有意义的结论。",
       "",
       "### 正式方案输出要求",
       "当你认为已经收敛到可交付方案时，可以输出正式 Proposal。Proposal 应该是用户可读、可审阅、可继续讨论的方案正文。",
@@ -608,7 +622,7 @@ export function buildSystemPrompt(
     chatInstructions.push("只读读取、搜索、查看、查询、分析本身不需要逐步征求用户同意；除非存在业务口径冲突或真实分叉，否则不要问“是否同意我读取下一个文件”。");
     chatInstructions.push("如果 `analyze_tabular_document`、`query_tabular_document`、`read_document` 中某个只读工具失败，不要停下来征求用户是否允许降级；应在同一轮自动改用其他只读工具继续。");
     chatInstructions.push("推荐回退顺序：`analyze_tabular_document` 全表概览 → `query_tabular_document` 结构化筛选/聚合 → `read_document` 原始行窗口/分页读取；可按问题类型调整，但必须继续推进。");
-    chatInstructions.push("涉及 CSV/TSV/XLSX、导入数据、趋势、图表、环比时，先确认列、日期、金额、课程字段和聚合口径，再给结论或读取源码实现。");
+    chatInstructions.push(tabularChatGroundingInstruction);
     chatInstructions.push("只有在文件不存在、指标定义或业务口径冲突、或所有只读路径都无法支持当前问题时，才向用户解释 blocker。");
     chatInstructions.push("不要先输出“下一步行动计划”“请稍候，我将开始分析”之类的过渡台词后停住。");
     chatInstructions.push("避免输出“我将再次执行”“请稍候确认是否同意降级”这类过程化台词；直接执行，最后统一汇报结果或剩余阻塞。");
@@ -648,7 +662,7 @@ export function buildSystemPrompt(
     tfl.push("</tool_use>");
     tfl.push("禁止输出 `[Tool call: ...]`、`Tool call: read_file`、`<tool_code>...</tool_code>`、`我要调用工具` 这类占位文本；这些不是可执行工具调用，会被视为协议错误。需要工具时必须输出完整 `<tool_use>`，并补齐必填参数。");
     tfl.push("");
-    tfl.push(`⚠️ 需要用户看到的分析、总结、方案必须以普通 Markdown 输出，并使用 ${resolvedLanguageName}；不要放进 XML 分析标签或 hidden reasoning。`);
+    tfl.push(`重要：需要用户看到的分析、总结、方案必须以普通 Markdown 输出，并使用 ${resolvedLanguageName}；不要放进 XML 分析标签或 hidden reasoning。`);
     tfl.push("");
     tfl.push("可用的工具：" + formatToolNameList(
       customToolNames,
@@ -696,9 +710,9 @@ export function buildSystemPrompt(
       tfl.push("4. 当方案已经成熟且你准备提交正式审核时，再使用 `[PROPOSAL START]`、`# Proposed Plan` 与合法 `<plan>` JSON。");
       tfl.push("5. 修复类复杂请求也用 `.MAIN/plans/plan.md` 表达；批准执行前仍然不能写源码或生成 tasks.md。");
       tfl.push("6. `.MAIN/plans/tasks.md` 只属于执行阶段；未经明确批准，不要提前生成。批准后优先使用 MAIN runtime 任务清单，只有长任务、跨会话恢复或需要审计留档时才持久化 tasks.md；不要为了确认它是否存在而主动读取。");
-      tfl.push("7. 如果任务更像报告、总结或研究分析，规划产物应表达分析目标、数据范围、指标口径、方法与验证方案，而不是默认套用代码工程计划。涉及 CSV/TSV/XLSX、导入数据、趋势、图表、环比时，先用 `analyze_tabular_document` / `query_tabular_document` 确认列、日期、金额、课程字段和聚合口径，再读取源码实现。");
+      tfl.push(tabularWorkflowPlanInstruction);
       tfl.push("8. 如果用户要求根目录 Readme.md 或其他 Markdown 文档，把它作为批准后的最终交付物写入 runtime 任务清单；只有持久化审计文件时才同步写进 tasks.md，规划阶段只记录这个验收要求。");
-      tfl.push("9. 计划 Markdown 必须精简：plan.md 60-120 行；可选 requirements.md 40-80 行；如果确需持久化 tasks.md，保持 8-20 个 checkbox。不要写教程式长文、完整代码清单或重复背景。");
+      tfl.push("9. 计划 Markdown 必须精简并对齐 Codex App：plan.md 默认包含标题、摘要、关键实现改动、公共 API/接口/类型、测试方案、假设与默认值；可选 requirements.md 40-80 行；如果确需持久化 tasks.md，保持 8-20 个 checkbox。不要写教程式长文、完整代码清单或重复背景。");
     } else {
       tfl.push("当前回合是直接实现回合：");
       tfl.push("1. Atomic 任务直接实现，不要为了完成小改动而强行转去计划流。");
@@ -715,7 +729,7 @@ export function buildSystemPrompt(
     tfl.push("3. 再根据任务类型选择性读取 fileMatch / auto 领域文件。");
     tfl.push("4. 严格遵守 Steering 文件中的项目级规范；这些规范优先级高于通用建议。");
     tfl.push("");
-    tfl.push("### 🚫 强制响应格式");
+    tfl.push("### 强制响应格式");
     tfl.push("1. 所有用户需要看到的分析、方案、结论，都必须写在普通 Markdown 中。");
     tfl.push("2. 不要输出 `<analysis>`、`<thought>`、`<thinking>` 或 `<reasoning>` hidden thinking 标签；不要把真正的方案正文、结论、用户需要看到的解释或下一步计划藏进去。");
     tfl.push("3. native tool calling 可以直接发出工具调用；如果需要解释判断、结果或阻塞，再用 1-3 句普通 Markdown 面向用户说明公开进度。XML 工具协议不混排正文，由 runtime 注入 progress narration。");

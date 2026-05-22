@@ -1343,9 +1343,9 @@ const RUNTIME_TASK_READ_ONLY_RE =
 const RUNTIME_TASK_FILE_ROLE_RE =
   /(?:负责|用于|包含|当前|现有|可能|根因|原因|问题|错误|不匹配|responsible|handles|contains|current|existing|possible|root cause|finding|issue|mismatch)/i;
 const RUNTIME_TASK_SECTION_RE =
-  /(?:执行|实施|任务|步骤|顺序|验证|验收|Execution|Implementation|Tasks|Steps|Order|Validation|Acceptance)/i;
+  /(?:关键改动|实现改动|改动|执行|实施|任务|步骤|顺序|验证|验收|Key Changes|Implementation Changes|Changes|Execution|Implementation|Tasks|Steps|Order|Validation|Acceptance)/i;
 const RUNTIME_TASK_EXCLUDED_SECTION_RE =
-  /(?:当前状态|状态发现|现状|背景|问题分析|根因|技术栈|整体结构|关键改动|改动点|影响文件|涉及文件|数据流|控制流|设计思路|总体思路|Current State|Findings|Background|Root Cause|Tech Stack|Architecture|Changes|Files|Data Flow|Control Flow|Design Notes)/i;
+  /(?:当前状态|状态发现|现状|背景|问题分析|根因|技术栈|整体结构|影响文件|涉及文件|公共\s*API|接口|类型|数据流|控制流|设计思路|总体思路|Current State|Findings|Background|Root Cause|Tech Stack|Architecture|Public APIs|Interfaces|Types|Files|Data Flow|Control Flow|Design Notes)/i;
 const RUNTIME_TASK_PLACEHOLDER_RE =
   /(?:使用方式|示例|建议|当前状态|状态发现|项目基于|技术栈|本设计要解决的问题|总体思路|为什么这样拆分|哪些部分保持不变|数据分析类任务|模块\s*\/\s*文件|状态\s*\/\s*数据流|交互\s*\/\s*UX|错误处理\s*\/\s*回退|允许修改的区域|暂不修改的区域|需要哪些测试|REQ-xxx|占位|TBD|TODO|\.\.\.)/i;
 
@@ -1639,7 +1639,7 @@ function hasMeaningfulPlanSections(content: string, kind: PlanArtifactKind): boo
   const normalized = content.replace(/\s+/g, " ").trim();
   if (normalized.length < 120) return false;
   if (kind === "plan") {
-    return /(用户目标|目标|截图|附件|观察|已确认|证据|真实发现|执行步骤|影响文件|验证标准|User Goal|Observed|Evidence|Confirmed|Findings|Execution|Files|Validation)/i.test(content);
+    return /(摘要|关键改动|实现改动|公共\s*API|接口|类型|测试方案|测试场景|假设|默认值|用户目标|目标|截图|附件|观察|已确认|证据|真实发现|执行步骤|影响文件|验证标准|Summary|Key Changes|Implementation Changes|Public APIs|Interfaces|Types|Test Plan|Assumptions|Defaults|User Goal|Observed|Evidence|Confirmed|Findings|Execution|Files|Validation)/i.test(content);
   }
   if (kind === "requirements") {
     return /(用户目标|目标|需求|范围|交付|验收|User Goal|Requirements|Scope|Deliverables|Acceptance)/i.test(content);
@@ -1657,13 +1657,18 @@ const PLAN_EVIDENCE_REQUIRED_SECTIONS = new Set([
   "screenshot_attachment_observations",
   "read_evidence",
   "confirmed_findings",
+  "summary",
 ]);
 
 const PLAN_STRUCTURAL_REQUIRED_SECTIONS = new Set([
   "user_goal",
+  "key_changes",
+  "public_interfaces",
   "unverified_hypotheses",
   "execution_steps",
   "affected_files",
+  "test_plan",
+  "assumptions_defaults",
   "validation",
 ]);
 
@@ -1714,6 +1719,7 @@ export function classifyPlanArtifactQualityResult(
       canAutoRepair: missingSections.every((section) =>
         section === "user_goal" ||
         section === "unverified_hypotheses" ||
+        section === "assumptions_defaults" ||
         section === "validation"
       ),
     };
@@ -1773,7 +1779,7 @@ export function repairActionablePlanArtifactContent(input: {
   }
 
   const missingSections = quality.missingSections || [];
-  const allowed = new Set(["user_goal", "unverified_hypotheses", "validation"]);
+  const allowed = new Set(["user_goal", "unverified_hypotheses", "assumptions_defaults", "validation"]);
   if (!missingSections.every((section) => allowed.has(section))) {
     return { content: input.content, repairedSections: [] };
   }
@@ -1797,6 +1803,14 @@ export function repairActionablePlanArtifactContent(input: {
       : "## 未验证假设\n- 暂无可直接信任的额外执行假设；实施中出现的新推断必须先验证，再转成执行步骤。";
     repaired = `${repaired}\n\n${section}`.trim();
     repairedSections.push("unverified_hypotheses");
+  }
+
+  if (missingSections.includes("assumptions_defaults")) {
+    const section = language === "en"
+      ? "## Assumptions / Defaults\n- Default to the smallest implementation that satisfies the approved goal; pause for user input if a new blocking product or API choice appears."
+      : "## 假设与默认值\n- 默认实施满足已批准目标的最小变更；如果执行中出现新的阻塞性产品或 API 选择，先暂停让用户确认。";
+    repaired = `${repaired}\n\n${section}`.trim();
+    repairedSections.push("assumptions_defaults");
   }
 
   if (missingSections.includes("user_goal") && goal) {
@@ -1871,7 +1885,7 @@ export function validateActionablePlanArtifact(
   if (!base.ok) return classifyPlanArtifactQualityResult(base);
 
   const raw = String(content || "").trim();
-  if (/(?:最小可用闭环|smallest useful workflow|Use the inspected context as the source of truth|基于当前可用的只读证据|available read-only evidence)/i.test(raw)) {
+  if (/(?:最小可用闭环|smallest useful workflow|Use the inspected context as the source of truth|基于当前可用的只读证据|available read-only evidence|基于已确认的证据先收窄实现目标|实施满足用户目标的最小源码变更|Use the confirmed evidence to narrow the implementation target|Apply the smallest source changes that satisfy the user goal)/i.test(raw)) {
     return classifyPlanArtifactQualityResult({ ok: false, reason: "generic_fallback_plan" });
   }
 
@@ -1892,29 +1906,53 @@ export function validateActionablePlanArtifact(
   const hasRealFindings = /(?:真实发现|已确认事实|当前发现|Confirmed Facts|Findings|Observed Facts)/i.test(raw);
   const hasUnverifiedHypotheses = /(?:未验证假设|待验证假设|Unverified Hypotheses|Unverified Assumptions)/i.test(raw);
   const hasAffectedFiles = /(?:影响文件|影响接口|Affected Files|Affected Interfaces|Files\/Interfaces)/i.test(raw);
+  const hasSummary = /(?:^|\n)\s*#{1,6}\s*(?:摘要|Summary)/i.test(raw);
+  const hasKeyChanges = /(?:^|\n)\s*#{1,6}\s*(?:关键改动|关键实现改动|实现改动|Key Changes|Implementation Changes)/i.test(raw);
+  const hasPublicInterfacesSection =
+    /(?:^|\n)\s*#{1,6}\s*(?:公共\s*API\s*\/\s*接口\s*\/\s*类型|公共\s*API|接口|类型|Public APIs?\s*\/\s*Interfaces?\s*\/\s*Types?|Public APIs?|Interfaces?|Types?)/i.test(raw);
+  const hasExplicitPublicInterfaceDisposition =
+    /(?:无公共\s*API|无.*(?:接口|类型)变化|不(?:新增|改变|修改).*(?:公共\s*API|接口|类型)|保持.*(?:公共\s*API|接口|类型).*不变|No public API|No interface changes?|No type changes?|No public interface changes?|Public API.*unchanged|interfaces?.*unchanged|types?.*unchanged)/i.test(raw) ||
+    /(?:公共\s*API|接口|类型|Public APIs?|Interfaces?|Types?).{0,120}(?:新增|修改|变化|保持|不变|added|modified|changed|unchanged|preserved)/i.test(raw);
+  const hasTestPlan = /(?:^|\n)\s*#{1,6}\s*(?:测试方案|测试计划|测试场景|验证方案|Test Plan|Testing|Tests?)/i.test(raw);
+  const hasAssumptionsDefaults = /(?:^|\n)\s*#{1,6}\s*(?:假设与默认值|默认假设|假设|默认值|Assumptions(?:\s*\/\s*Defaults)?|Defaults)/i.test(raw);
+  const hasConcreteChangeSignal =
+    /(?:修改|更新|新增|修复|补齐|调整|接入|生成|实现|重构|保持|不改变|不新增|验证|运行|modify|update|add|fix|adjust|wire|generate|implement|refactor|preserve|unchanged|run|verify)/i.test(raw) &&
+    hasTargetOrData;
+  const usesCodexPlanContract =
+    hasSummary || hasKeyChanges || hasPublicInterfacesSection || hasTestPlan || hasAssumptionsDefaults;
 
   const signalCount = [
     hasTargetOrData,
     hasObservedEvidence,
-    hasExecutionOrder,
+    hasExecutionOrder || hasKeyChanges,
     hasValidation,
     hasConcreteUserGoal,
+    hasConcreteChangeSignal,
   ].filter(Boolean).length;
 
   if (signalCount < 4) {
     return classifyPlanArtifactQualityResult({ ok: false, reason: "insufficient_actionable_plan_signals" });
   }
 
-  const missingRequiredSections = ([
-    [hasConcreteUserGoal, "user_goal"],
-    [hasScreenshotOrAttachmentObservation, "screenshot_attachment_observations"],
-    [hasReadEvidence, "read_evidence"],
-    [hasRealFindings, "confirmed_findings"],
-    [hasUnverifiedHypotheses, "unverified_hypotheses"],
-    [hasExecutionOrder, "execution_steps"],
-    [hasAffectedFiles, "affected_files"],
-    [hasValidation, "validation"],
-  ] as Array<[boolean, string]>)
+  const missingRequiredSections = (usesCodexPlanContract
+    ? ([
+        [hasConcreteUserGoal, "user_goal"],
+        [hasSummary, "summary"],
+        [hasKeyChanges && hasConcreteChangeSignal, "key_changes"],
+        [hasPublicInterfacesSection && hasExplicitPublicInterfaceDisposition, "public_interfaces"],
+        [hasTestPlan && hasValidation, "test_plan"],
+        [hasAssumptionsDefaults, "assumptions_defaults"],
+      ] as Array<[boolean, string]>)
+    : ([
+        [hasConcreteUserGoal, "user_goal"],
+        [hasScreenshotOrAttachmentObservation, "screenshot_attachment_observations"],
+        [hasReadEvidence, "read_evidence"],
+        [hasRealFindings, "confirmed_findings"],
+        [hasUnverifiedHypotheses, "unverified_hypotheses"],
+        [hasExecutionOrder, "execution_steps"],
+        [hasAffectedFiles, "affected_files"],
+        [hasValidation, "validation"],
+      ] as Array<[boolean, string]>))
     .filter(([ok]) => !ok)
     .map(([, name]) => name);
   if (missingRequiredSections.length > 0) {

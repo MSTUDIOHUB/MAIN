@@ -7674,6 +7674,7 @@ export const useAppStore = create<AppState>()(
           ? [
               `${planModeLead} If the request is a complex implementation, call \`write_file\` or \`replace_in_file\` to create or update the concise reviewable plan draft in \`.MAIN/plans/plan.md\` before asking for approval; create \`.MAIN/plans/requirements.md\` only when the user explicitly wants a requirement ledger or the scope needs traceability. Do not write project source files or tasks.md before approval.`,
               "Creating or updating plan.md is an automatic internal planning step, not a user choice. After the user picks a route, update the plan draft directly instead of asking whether to update internal plan documents.",
+              "The plan.md draft must follow the Codex app handoff shape: title, Summary, Key Changes / Implementation Changes, Public APIs / Interfaces / Types, Test Plan, and Assumptions / Defaults.",
               "If it is only a discussion-style plan, keep the answer concise and use user options for real decisions.",
               "",
               userContent,
@@ -7681,6 +7682,7 @@ export const useAppStore = create<AppState>()(
           : [
               `${planModeLead}如果这是复杂实现请求，请调用 \`write_file\` 或 \`replace_in_file\` 创建或更新可审批的精简计划草稿：默认写 \`.MAIN/plans/plan.md\`；只有用户明确要求需求台账或范围需要追踪时，才额外写 \`.MAIN/plans/requirements.md\`。等待用户批准后再改源码；批准前不要生成 tasks.md。`,
               "创建或更新 plan.md 是自动的内部规划步骤，不是用户需要选择的下一步；用户选定方案后应直接更新计划草稿，不要再询问是否更新内部计划文件。",
+              "plan.md 草稿必须对齐 Codex app 的交接计划结构：标题、摘要、关键实现改动、公共 API/接口/类型、测试方案、假设与默认值。",
               "如果只是讨论式方案，请保持简洁，并在真实分叉点用可点击选项让用户选择。",
               "",
               userContent,
@@ -7702,7 +7704,7 @@ export const useAppStore = create<AppState>()(
               originalPlanPrompt ? `上一轮计划请求：${originalPlanPrompt}` : "上一轮计划请求：请依据当前对话上下文继续。",
               "现在必须产生实际规划进展。如果仍有关键选择需要用户确认，就先简短归纳并用面向用户的口吻给出 <user_options>；否则调用 `write_file` 或 `replace_in_file` 更新 `.MAIN/plans/plan.md`，再给出精简 Proposal。除非明确需要需求台账，否则不要生成 requirements.md。",
               "每个 <option> 必须是用户点击后会发送的完整选择，不要写成“是否……”问题句。",
-              "所有计划 Markdown 都要精简成审阅摘要风格，不要写教程式长文、完整代码清单或重复背景。",
+              "所有计划 Markdown 都要精简成 Codex app 交接计划风格：标题、摘要、关键实现改动、公共 API/接口/类型、测试方案、假设与默认值；不要写教程式长文、完整代码清单或重复背景。",
               text.trim() ? `用户最新消息：${text.trim()}` : "用户最新消息：继续",
             ].join("\n");
       }

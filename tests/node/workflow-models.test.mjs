@@ -816,6 +816,40 @@ test("runtime plan task derivation skips approved-plan diagnostic read loops", (
   assert.equal(tasks.some((task) => task.evidence?.some((item) => item.value === "src/store/dashboardStore.ts")), false);
 });
 
+test("runtime plan task derivation accepts Codex-style key changes", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([
+    {
+      kind: "plan",
+      path: ".MAIN/plans/plan.md",
+      title: "Plan",
+      updatedAt: 1,
+      content: [
+        "# 计划",
+        "",
+        "## 摘要",
+        "- 用户目标：修复批准后执行回合过早完成的问题。",
+        "",
+        "## 关键改动",
+        "- 更新 `src/lib/orchestrator.ts`，让 read-only strategy switch 追加恢复提示后继续下一轮执行。",
+        "- 更新 `src/lib/workflowModels.ts`，让 Plan.md 质量门接受 Codex-style 章节。",
+        "",
+        "## 公共 API / 接口 / 类型",
+        "- 无公共 API、接口或类型变化。",
+        "",
+        "## 测试方案",
+        "- 运行 `node --test tests/node/workflow-models.test.mjs`。",
+        "",
+        "## 假设与默认值",
+        "- 默认不修改 ChatArea 新样式。",
+      ].join("\n"),
+    },
+  ], { language: "zh" });
+
+  assert.equal(tasks.some((task) => task.evidence?.some((item) => item.kind === "file" && item.value === "src/lib/orchestrator.ts")), true);
+  assert.equal(tasks.some((task) => task.evidence?.some((item) => item.kind === "file" && item.value === "src/lib/workflowModels.ts")), true);
+  assert.equal(tasks.some((task) => task.evidence?.some((item) => item.kind === "cmd" && item.value.includes("workflow-models"))), true);
+});
+
 test("runtime plan task derivation requires concrete evidence instead of synthetic tool fallback", () => {
   const tasks = deriveRuntimePlanTasksFromArtifacts([
     {

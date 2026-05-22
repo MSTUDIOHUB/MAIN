@@ -298,6 +298,22 @@ test("cached read-only helpers identify repeated plan targets", () => {
   );
 });
 
+test("approved plan strategy switch continues the agent loop after recovery prompt", () => {
+  const orchestratorSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator.ts"),
+    "utf8",
+  );
+
+  assert.match(
+    orchestratorSource,
+    /if\s*\(\s*truncatedAfterCachedReadOnly\s*\)\s*{[\s\S]*?continueApprovedPlanWithStrategySwitch\(recoveryInput\);\s*continue;/,
+  );
+  assert.match(
+    orchestratorSource,
+    /if\s*\(\s*approvedPlanNoProgressDecision\s*\)\s*{[\s\S]*?approvedPlanNoProgressDecision\.action\s*===\s*"recover"[\s\S]*?continueApprovedPlanWithStrategySwitch\(approvedPlanNoProgressDecision\);\s*continue;/,
+  );
+});
+
 test("plan progress snapshot carries no-progress recovery metadata", () => {
   const update = buildPlanExecutionProgressUpdate({
     language: "zh",

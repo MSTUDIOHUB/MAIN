@@ -544,12 +544,121 @@ function buildProvidedContextObservation(input: {
     : "No screenshot or attachment was provided; the plan is based on the user goal and read evidence.";
 }
 
-function formatCanonicalSection(title: string, lines: string[]): string {
+function formatCodexPlanSection(title: string, lines: string[]): string {
   return [`## ${title}`, ...lines.map((line) => `- ${line}`)].join("\n");
 }
 
-function formatCanonicalSteps(title: string, lines: string[]): string {
-  return [`## ${title}`, ...lines.map((line, index) => `${index + 1}. ${line}`)].join("\n");
+function extractInlineCommands(values: string[], maxItems = 4): string[] {
+  const seen = new Set<string>();
+  const commands: string[] = [];
+  for (const value of values) {
+    for (const match of String(value || "").matchAll(/`([^`\n]{2,160})`/g)) {
+      const command = String(match[1] || "").trim();
+      if (!command || seen.has(command.toLowerCase())) continue;
+      if (!/(?:npm|pnpm|yarn|node|cargo|pytest|python|go test|bun|vitest|playwright|tsc|build|test|lint)/i.test(command)) continue;
+      seen.add(command.toLowerCase());
+      commands.push(command);
+      if (commands.length >= maxItems) return commands;
+    }
+  }
+  return commands;
+}
+
+function buildCodexStylePlanArtifact(input: {
+  userGoal: string;
+  evidence: string[];
+  files: string[];
+  constraints: string[];
+  language: "zh" | "en";
+}): string {
+  const goal = compactPlanLine(input.userGoal, 420);
+  const evidence = uniqueCompactLines(input.evidence, 8, 220);
+  const files = uniqueCompactLines(input.files, 8, 160);
+  const constraints = uniqueCompactLines(input.constraints, 5, 200);
+  const commands = extractInlineCommands([...evidence, ...constraints]);
+  const hasGroundedEvidence = evidence.length > 0 && (files.length > 0 || /CSV|TSV|XLSX|字段|列|指标|数据|表格|dataset|table|metric|column/i.test(`${goal}\n${evidence.join("\n")}`));
+
+  if (!hasGroundedEvidence) {
+    return input.language === "en"
+      ? [
+          "# Plan",
+          "## Summary",
+          `- User goal: ${goal || "Prepare a reviewable implementation plan."}`,
+          "- Insufficient targeted evidence exists to produce a decision-complete Codex-style plan.",
+          "## Key Changes",
+          "- Blocked: collect concrete source, data, command, or interface evidence before writing an approved plan.",
+        ].join("\n\n")
+      : [
+          "# 计划",
+          "## 摘要",
+          `- 用户目标：${goal || "生成可审批实现计划。"}`,
+          "- 当前定向证据不足，不能生成 decision-complete 的 Codex-style Plan.md。",
+          "## 关键改动",
+          "- 阻塞：需要先补充具体源码、数据、命令或接口证据，再写入可审批计划。",
+        ].join("\n\n");
+  }
+
+  if (input.language === "en") {
+    const scope = files.length > 0 ? files.map((file) => `\`${file}\``).join(", ") : "the confirmed data/reporting surface";
+    const changes = files.length > 0
+      ? files.slice(0, 6).map((file, index) =>
+          `Update \`${file}\` for the approved goal; grounding evidence: ${evidence[index] || evidence[0]}.`
+        )
+      : [`Implement the approved data/reporting change using the confirmed evidence: ${evidence[0]}.`];
+    return [
+      "# Plan",
+      formatCodexPlanSection("Summary", [
+        `User goal: ${goal}`,
+        `Grounding evidence covers ${scope}.`,
+        evidence[0] ? `Most relevant evidence: ${evidence[0]}.` : "No additional evidence summary is trusted.",
+      ]),
+      formatCodexPlanSection("Key Changes", changes),
+      formatCodexPlanSection("Public APIs / Interfaces / Types", [
+        "No public API, interface, or type change is planned by default; if implementation proves one is required, pause before widening scope.",
+      ]),
+      formatCodexPlanSection("Test Plan", commands.length > 0
+        ? commands.map((command) => `Run \`${command}\` and inspect exit status/output.`)
+        : [
+            "Run the focused test, build, or browser/desktop validation for the touched subsystem and record the result.",
+          ]),
+      formatCodexPlanSection("Assumptions / Defaults", constraints.length > 0
+        ? constraints
+        : [
+            "Default to the smallest implementation that satisfies the approved goal.",
+            "Do not trust new assumptions discovered during implementation until a targeted read or validation confirms them.",
+          ]),
+    ].join("\n\n");
+  }
+
+  const scope = files.length > 0 ? files.map((file) => `\`${file}\``).join("、") : "已确认的数据/报表链路";
+  const changes = files.length > 0
+    ? files.slice(0, 6).map((file, index) =>
+        `更新 \`${file}\` 以落实已批准目标；依据证据：${evidence[index] || evidence[0]}。`
+      )
+    : [`基于已确认的证据实施数据/报表改动：${evidence[0]}。`];
+  return [
+    "# 计划",
+    formatCodexPlanSection("摘要", [
+      `用户目标：${goal}`,
+      `定向证据已覆盖：${scope}。`,
+      evidence[0] ? `最相关证据：${evidence[0]}。` : "暂无可额外信任的证据摘要。",
+    ]),
+    formatCodexPlanSection("关键改动", changes),
+    formatCodexPlanSection("公共 API / 接口 / 类型", [
+      "默认不新增或修改公共 API、接口或类型；如果执行中证明必须扩大接口范围，先暂停确认。",
+    ]),
+    formatCodexPlanSection("测试方案", commands.length > 0
+      ? commands.map((command) => `运行 \`${command}\` 并检查退出码与输出。`)
+      : [
+          "运行受影响子系统的聚焦测试、构建检查或浏览器/桌面验证，并记录结果。",
+        ]),
+    formatCodexPlanSection("假设与默认值", constraints.length > 0
+      ? constraints
+      : [
+          "默认实施满足已批准目标的最小变更。",
+          "执行中新发现的假设必须先通过定向读取或验证确认，不能直接当成事实。",
+        ]),
+  ].join("\n\n");
 }
 
 export function canonicalizePlanArtifactContent(input: {
@@ -609,12 +718,6 @@ export function canonicalizePlanArtifactContent(input: {
   const visibleFindingLines = collectLinesFromSections(sections, [
     /(?:已确认|真实发现|当前发现|发现|调查摘要|分析|Investigation Summary|Analysis|Confirmed|Findings|Current State|Observation)/i,
   ], 8);
-  const confirmedLines = uniquePlanItems([
-    ...visibleFindingLines.filter((line) => !isSpeculativePlanLine(line)),
-    ...evidenceLines.slice(0, 4).map((line) =>
-      language === "zh" ? `已确认存在相关证据：${line}` : `Confirmed relevant evidence exists: ${line}`
-    ),
-  ], 6);
   const hypothesisLines = uniquePlanItems([
     ...collectLinesFromSections(sections, [
       /(?:未验证|假设|待确认|风险|注意|边界|Unverified|Hypotheses|Assumptions|Unknowns|Risks|Caveats)/i,
@@ -655,52 +758,55 @@ export function canonicalizePlanArtifactContent(input: {
   }
   if (evidenceLines.length === 0 && providedContextCount === 0) return null;
 
+  const summaryLines = uniquePlanItems([
+    ...goalLines.map((line) => language === "zh" ? `用户目标：${line}` : `User goal: ${line}`),
+    ...evidenceLines.slice(0, 3),
+    ...(screenshotLines.length > 0
+      ? screenshotLines.slice(0, 2)
+      : [buildProvidedContextObservation({ turnContext: input.turnContext, language })]),
+  ], 6);
+  const keyChangeLines = uniquePlanItems([
+    ...stepLines,
+    ...fileLines.slice(0, 4).map((file) =>
+      language === "zh"
+        ? `围绕 \`${file}\` 落实已批准目标。`
+        : `Apply the approved change around \`${file}\`.`
+    ),
+  ], 8);
+  const assumptionLines = uniquePlanItems([
+    ...hypothesisLines,
+    ...riskLines,
+    language === "zh"
+      ? "默认保持未点名的公共 API、接口和类型不变。"
+      : "Default to preserving public APIs, interfaces, and types that are not explicitly named.",
+  ], 6);
+  const apiLines = collectLinesFromSections(sections, [
+    /(?:公共|接口|类型|API|Public|Interface|Types?)/i,
+  ], 4);
+  const resolvedApiLines = apiLines.length > 0
+    ? apiLines
+    : [language === "zh"
+      ? "无公共 API、接口或类型变化；如果执行中证明必须改变，先暂停确认。"
+      : "No public API, interface, or type change is planned; pause if implementation proves one is required."];
+
   if (language === "en") {
     return [
       "# Plan",
-      formatCanonicalSection("User Goal", goalLines),
-      formatCanonicalSection("Screenshot / Attachment Observations", screenshotLines.length > 0
-        ? screenshotLines
-        : [buildProvidedContextObservation({ turnContext: input.turnContext, language })]),
-      formatCanonicalSection("Read Evidence", evidenceLines),
-      formatCanonicalSection("Confirmed Facts", confirmedLines.length > 0
-        ? confirmedLines
-        : evidenceLines.slice(0, 3).map((line) => `Confirmed evidence: ${line}`)),
-      formatCanonicalSection("Unverified Hypotheses", hypothesisLines.length > 0
-        ? hypothesisLines
-        : ["No additional execution assumption is trusted until validated during implementation."]),
-      formatCanonicalSection("Affected Files", fileLines.length > 0
-        ? fileLines
-        : ["To be confirmed by targeted implementation reads before source changes."]),
-      formatCanonicalSteps("Execution Steps", stepLines),
-      formatCanonicalSection("Risks / Tradeoffs", riskLines.length > 0
-        ? riskLines
-        : ["Do not treat unverified assumptions as implementation facts."]),
-      formatCanonicalSection("Validation Standards", validationLines),
+      formatCodexPlanSection("Summary", summaryLines),
+      formatCodexPlanSection("Key Changes", keyChangeLines),
+      formatCodexPlanSection("Public APIs / Interfaces / Types", resolvedApiLines),
+      formatCodexPlanSection("Test Plan", validationLines),
+      formatCodexPlanSection("Assumptions / Defaults", assumptionLines),
     ].join("\n\n");
   }
 
   return [
     "# 计划",
-    formatCanonicalSection("用户目标", goalLines),
-    formatCanonicalSection("截图/附件观察", screenshotLines.length > 0
-      ? screenshotLines
-      : [buildProvidedContextObservation({ turnContext: input.turnContext, language })]),
-    formatCanonicalSection("已读证据", evidenceLines),
-    formatCanonicalSection("已确认事实", confirmedLines.length > 0
-      ? confirmedLines
-      : evidenceLines.slice(0, 3).map((line) => `已确认存在相关证据：${line}`)),
-    formatCanonicalSection("未验证假设", hypothesisLines.length > 0
-      ? hypothesisLines
-      : ["未验证：暂无可直接信任的额外执行假设；实施中出现的新推断必须先验证。"]),
-    formatCanonicalSection("影响文件", fileLines.length > 0
-      ? fileLines
-      : ["待执行前通过定向读取确认具体源码路径；批准前不修改未确认文件。"]),
-    formatCanonicalSteps("执行步骤", stepLines),
-    formatCanonicalSection("风险取舍", riskLines.length > 0
-      ? riskLines
-      : ["不要把未验证假设当成已确认事实执行。"]),
-    formatCanonicalSection("验证标准", validationLines),
+    formatCodexPlanSection("摘要", summaryLines),
+    formatCodexPlanSection("关键改动", keyChangeLines),
+    formatCodexPlanSection("公共 API / 接口 / 类型", resolvedApiLines),
+    formatCodexPlanSection("测试方案", validationLines),
+    formatCodexPlanSection("假设与默认值", assumptionLines),
   ].join("\n\n");
 }
 
@@ -979,7 +1085,7 @@ export function composeReviewablePlanFromEvidence(input: {
       files.length ? `Relevant paths:\n${formatBullets(files, "No path summary available.")}` : "",
       constraints.length ? `Constraints:\n${formatBullets(constraints, "No extra constraints.")}` : "",
       "",
-      `${targetPath} must include: user goal, screenshot/attachment observations when present, confirmed facts, evidence references, unverified hypotheses, affected files/interfaces, execution steps, risks/tradeoffs, and validation standards. If a critical choice blocks execution, ask with \`<user_options>\` before approval instead of burying it as an open question.`,
+      `${targetPath} must use the Codex app plan shape: title, Summary, Key Changes or Implementation Changes, Public APIs / Interfaces / Types, Test Plan, and Assumptions / Defaults. Mention screenshot/attachment observations, read evidence, and confirmed facts inside the concise summary only when they are real. If a critical choice blocks execution, ask with \`<user_options>\` before approval instead of burying it as an open question.`,
     ].filter(Boolean).join("\n");
   }
 
@@ -1002,7 +1108,7 @@ export function composeReviewablePlanFromEvidence(input: {
     files.length ? `相关路径：\n${formatBullets(files, "暂无路径摘要。")}` : "",
     constraints.length ? `约束：\n${formatBullets(constraints, "暂无额外约束。")}` : "",
     "",
-    `${targetPath} 必须包含：用户目标、截图/附件观察、已确认事实、证据引用、未验证假设、影响文件/接口、执行步骤、风险取舍和验证标准。真正阻塞执行的选择必须在批准前用 \`<user_options>\` 提问，不要伪装成计划尾部的开放问题。`,
+    `${targetPath} 必须使用 Codex app 计划结构：标题、摘要、关键实现改动、公共 API/接口/类型、测试方案、假设与默认值。截图/附件观察、已读证据和已确认事实只在确有内容时放进精简摘要，不要撑成空洞章节。真正阻塞执行的选择必须在批准前用 \`<user_options>\` 提问，不要伪装成计划尾部的开放问题。`,
   ].filter(Boolean).join("\n");
 }
 
@@ -1021,76 +1127,11 @@ export function composePlanArtifactFromEvidence(input: {
     constraints: input.constraints,
     language,
   });
-  const goal = compactPlanLine(sanitized.userGoal || input.userGoal, 420) || (
-    language === "zh"
-      ? "根据用户当前请求完成可审阅实现计划。"
-      : "Prepare a reviewable implementation plan for the current user request."
-  );
-  const evidence = uniqueCompactLines(sanitized.evidence.map((item) => summarizeEvidenceLine(item, language)), 10, 220);
-  const files = uniqueCompactLines(sanitized.files, 10, 160);
-  const constraints = uniqueCompactLines(sanitized.constraints, 6, 200);
-  const affectedFiles = files.length > 0
-    ? files
-    : (language === "zh"
-      ? ["实施前通过定向读取确认具体源码路径；批准前不修改源码。"]
-      : ["Confirm concrete source paths with targeted reads before implementation; do not edit source before approval."]);
-  const evidenceLines = evidence.length > 0
-    ? evidence
-    : (language === "zh"
-      ? ["当前只有用户目标可用；执行前必须先补充定向读取证据。"]
-      : ["Only the user goal is currently available; targeted read evidence must be collected before implementation."]);
-
-  if (language === "en") {
-    return [
-      "# Plan",
-      formatCanonicalSection("User Goal", [goal]),
-      formatCanonicalSection("Screenshot / Attachment Observations", [
-        "No additional screenshot or attachment detail is trusted unless it appears in the provided context.",
-      ]),
-      formatCanonicalSection("Read Evidence", evidenceLines),
-      formatCanonicalSection("Confirmed Facts", evidenceLines.slice(0, 4).map((line) => `Confirmed relevant planning evidence: ${line}`)),
-      formatCanonicalSection("Unverified Hypotheses", [
-        "Implementation details not directly covered by the evidence must be verified with targeted reads before source edits.",
-      ]),
-      formatCanonicalSection("Affected Files", affectedFiles),
-      formatCanonicalSteps("Execution Steps", [
-        "Use the confirmed evidence to narrow the implementation target before editing source files.",
-        "Apply the smallest source changes that satisfy the user goal.",
-        "Verify the changed behavior with focused tests, build checks, or browser/desktop validation where appropriate.",
-      ]),
-      formatCanonicalSection("Risks / Tradeoffs", constraints.length > 0
-        ? constraints
-        : ["Do not treat repeated cached reads as new evidence; pivot to editing, verification, or an explicit blocker when progress stalls."]),
-      formatCanonicalSection("Validation Standards", [
-        "Run the focused validation command for the touched subsystem.",
-        "If UI behavior is affected, verify rendered behavior with browser or desktop evidence instead of text-only inspection.",
-      ]),
-    ].join("\n\n");
-  }
-
-  return [
-    "# 计划",
-    formatCanonicalSection("用户目标", [goal]),
-    formatCanonicalSection("截图/附件观察", [
-      "除非用户提供的上下文中已有明确细节，否则不信任额外截图或附件推断。",
-    ]),
-    formatCanonicalSection("已读证据", evidenceLines),
-    formatCanonicalSection("已确认事实", evidenceLines.slice(0, 4).map((line) => `已确认存在相关计划证据：${line}`)),
-    formatCanonicalSection("未验证假设", [
-      "证据没有直接覆盖的实现细节，必须在源码修改前通过定向读取确认。",
-    ]),
-    formatCanonicalSection("影响文件", affectedFiles),
-    formatCanonicalSteps("执行步骤", [
-      "基于已确认的证据先收窄实现目标，再修改源码。",
-      "实施满足用户目标的最小源码变更。",
-      "用聚焦测试、构建检查或浏览器/桌面验证确认行为达标。",
-    ]),
-    formatCanonicalSection("风险取舍", constraints.length > 0
-      ? constraints
-      : ["重复缓存读取不能算作新证据；进展停滞时必须转向写入、验证或明确阻塞。"]),
-    formatCanonicalSection("验证标准", [
-      "运行受影响子系统的聚焦验证命令。",
-      "如果影响 UI 行为，必须用浏览器或桌面运行证据验证渲染结果，不能只靠文本检查。",
-    ]),
-  ].join("\n\n");
+  return buildCodexStylePlanArtifact({
+    userGoal: sanitized.userGoal || input.userGoal,
+    evidence: sanitized.evidence.map((item) => summarizeEvidenceLine(item, language)),
+    files: sanitized.files,
+    constraints: sanitized.constraints,
+    language,
+  });
 }
