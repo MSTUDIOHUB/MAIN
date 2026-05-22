@@ -339,6 +339,7 @@ export function summarizeRuntimeProgressLedger(
 ): string {
   if (items.length === 0) return "";
   const normalizedLanguage = normalizeLanguage(language);
+  const effectiveItems = items.filter((item) => item.status !== "paused");
   const repeated = items
     .filter((item) => item.repeatCount > 1 || item.cacheHits > 0)
     .slice(-3)
@@ -352,16 +353,22 @@ export function summarizeRuntimeProgressLedger(
   const latest = items[items.length - 1];
   const latestText = latest.summary || latest.title;
   if (normalizedLanguage === "en") {
+    if (latest.status === "paused" && effectiveItems.length === 0) {
+      return latestText ? `paused: ${latestText}` : "paused";
+    }
     return [
-      `${items.length} effective progress item${items.length > 1 ? "s" : ""}`,
+      `${effectiveItems.length} effective progress item${effectiveItems.length === 1 ? "" : "s"}`,
       repeated.length ? `repeated: ${repeated.join(", ")}` : "",
-      latestText ? `latest: ${latestText}` : "",
+      latestText ? `${latest.status === "paused" ? "paused" : "latest"}: ${latestText}` : "",
     ].filter(Boolean).join("; ");
   }
+  if (latest.status === "paused" && effectiveItems.length === 0) {
+    return latestText ? `已暂停：${latestText}` : "已暂停";
+  }
   return [
-    `${items.length} 条有效进展`,
+    `${effectiveItems.length} 条有效进展`,
     repeated.length ? `重复目标：${repeated.join("、")}` : "",
-    latestText ? `最新：${latestText}` : "",
+    latestText ? `${latest.status === "paused" ? "已暂停" : "最新"}：${latestText}` : "",
   ].filter(Boolean).join("；");
 }
 

@@ -52,11 +52,6 @@ const PLAN_TARGETED_EVIDENCE_TOOL_NAMES = new Set([
   "read_pty_buffer",
   "get_pty_status",
 ]);
-const PLAN_POST_CONVERGENCE_ARTIFACT_TOOL_NAMES = new Set([
-  "write_file",
-  "replace_in_file",
-]);
-
 export function isPlanReadOnlyToolName(name: string): boolean {
   return PLAN_READ_ONLY_TOOL_NAMES.has(String(name || ""));
 }
@@ -65,8 +60,14 @@ function isPlanRuntimeReadOnlyPhase(phase?: PlanRuntimePhase): boolean {
   return phase === "grounding" || phase === "synthesis" || phase === "needs_evidence";
 }
 
-function isPlanRuntimeDraftingPhase(phase?: PlanRuntimePhase): boolean {
-  return phase === "drafting" || phase === "needs_rewrite";
+function isPlanRuntimeFinalizationPhase(phase?: PlanRuntimePhase): boolean {
+  return (
+    phase === "synthesis" ||
+    phase === "drafting" ||
+    phase === "needs_rewrite" ||
+    phase === "review_ready" ||
+    phase === "blocked"
+  );
 }
 
 function isPlanEvidenceRecoveryPhase(phase?: PlanRuntimePhase): boolean {
@@ -172,14 +173,14 @@ export function shouldNarrowPlanToolsAfterReadOnlyConvergence(input: {
   planRuntimePhase?: PlanRuntimePhase;
 }): boolean {
   if (input.workflowMode !== "plan" || input.isPlanApproved) return false;
-  if (isPlanRuntimeDraftingPhase(input.planRuntimePhase)) return true;
+  if (isPlanRuntimeFinalizationPhase(input.planRuntimePhase)) return true;
   if (isPlanEvidenceRecoveryPhase(input.planRuntimePhase)) return false;
   if (!input.convergencePromptAlreadyUsed) return false;
   return input.evidenceReadiness === "ready_for_plan" || input.evidenceReadiness === "blocked_user_choice";
 }
 
-export function isPlanPostConvergenceArtifactToolName(name: string): boolean {
-  return PLAN_POST_CONVERGENCE_ARTIFACT_TOOL_NAMES.has(name);
+export function isPlanPostConvergenceArtifactToolName(_name: string): boolean {
+  return false;
 }
 
 export function filterPlanToolNamesAfterReadOnlyConvergence(input: {
@@ -191,7 +192,7 @@ export function filterPlanToolNamesAfterReadOnlyConvergence(input: {
   planRuntimePhase?: PlanRuntimePhase;
 }): string[] {
   if (!shouldNarrowPlanToolsAfterReadOnlyConvergence(input)) return input.toolNames;
-  return input.toolNames.filter(isPlanPostConvergenceArtifactToolName);
+  return [];
 }
 
 export function filterPlanToolNamesForRuntimePhase(input: {
@@ -206,10 +207,7 @@ export function filterPlanToolNamesForRuntimePhase(input: {
   if (isPlanRuntimeReadOnlyPhase(input.planRuntimePhase)) {
     return input.toolNames.filter(isPlanReadOnlyToolName);
   }
-  if (isPlanRuntimeDraftingPhase(input.planRuntimePhase)) {
-    return input.toolNames.filter(isPlanPostConvergenceArtifactToolName);
-  }
-  if (input.planRuntimePhase === "review_ready" || input.planRuntimePhase === "blocked") {
+  if (isPlanRuntimeFinalizationPhase(input.planRuntimePhase)) {
     return [];
   }
   return input.toolNames;
@@ -260,10 +258,11 @@ export function shouldRedirectPlanToolsAfterReadOnlyConvergence(input: {
   if (input.workflowMode !== "plan" || input.isPlanApproved) return false;
   if (isPlanEvidenceRecoveryPhase(input.planRuntimePhase)) return false;
   if (input.hasPlanDecisionOutput) return false;
-  const isDraftingPhase = isPlanRuntimeDraftingPhase(input.planRuntimePhase);
-  if (!input.convergencePromptAlreadyUsed && !isDraftingPhase) return false;
+  const isFinalizationPhase = isPlanRuntimeFinalizationPhase(input.planRuntimePhase);
+  if (isFinalizationPhase) return input.toolNames.length > 0;
+  if (!input.convergencePromptAlreadyUsed) return false;
   if (input.evidenceReadiness !== "ready_for_plan" && input.evidenceReadiness !== "blocked_user_choice") {
-    return isDraftingPhase && input.toolNames.some((name) => PLAN_READ_ONLY_TOOL_NAMES.has(name));
+    return false;
   }
   return input.toolNames.some((name) => PLAN_READ_ONLY_TOOL_NAMES.has(name));
 }

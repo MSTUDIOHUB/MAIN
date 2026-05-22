@@ -171,7 +171,9 @@ test("nonstandard proposed plan canonicalizes before quality recovery loops", ()
 
   assert.equal(materialized.ok, true);
   assert.equal(validateActionablePlanArtifact(materialized.content || "").ok, true);
-  assert.match(materialized.content || "", /## 截图\/附件观察/);
+  assert.match(materialized.content || "", /## 摘要/);
+  assert.match(materialized.content || "", /## 关键改动/);
+  assert.match(materialized.content || "", /## 公共 API \/ 接口 \/ 类型/);
   assert.match(materialized.content || "", /用户提供了 2 张图片/);
   assert.doesNotMatch(materialized.content || "", /excerpt=/);
 });

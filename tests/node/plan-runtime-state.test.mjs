@@ -53,10 +53,14 @@ function loadTranspiledModuleSync(sourcePath) {
 }
 
 const {
+  buildPlanEvidenceBlockedPauseMessage,
+  buildPlanTargetedEvidenceRecoveryPrompt,
   filterPlanToolNamesForRuntimePhase,
-  filterPlanToolNamesAfterReadOnlyConvergence,
+  resolvePlanNoActionRecovery,
+  resolvePlanSuppressedToolRecovery,
   shouldRedirectPlanToolsAfterReadOnlyConvergence,
-} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planReadOnlyConvergence.ts"));
+  shouldSuppressPlanTruncationWarning,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planRuntime.ts"));
 
 const allPlanTools = [
   "get_project_skeleton",
@@ -87,7 +91,7 @@ test("plan runtime phases scope the tool surface", () => {
     workflowMode: "plan",
     isPlanApproved: false,
     planRuntimePhase: "drafting",
-  }), ["write_file", "replace_in_file"]);
+  }), []);
 
   assert.deepEqual(filterPlanToolNamesForRuntimePhase({
     toolNames: allPlanTools,
@@ -97,7 +101,7 @@ test("plan runtime phases scope the tool surface", () => {
   }), []);
 });
 
-test("needs_rewrite remains write-only even before the old convergence prompt", () => {
+test("needs_rewrite closes the tool surface before the old convergence prompt", () => {
   assert.equal(shouldRedirectPlanToolsAfterReadOnlyConvergence({
     workflowMode: "plan",
     isPlanApproved: false,
@@ -108,14 +112,12 @@ test("needs_rewrite remains write-only even before the old convergence prompt", 
     planRuntimePhase: "needs_rewrite",
   }), true);
 
-  assert.deepEqual(filterPlanToolNamesAfterReadOnlyConvergence({
+  assert.deepEqual(filterPlanToolNamesForRuntimePhase({
     workflowMode: "plan",
     isPlanApproved: false,
-    convergencePromptAlreadyUsed: false,
-    evidenceReadiness: "needs_targeted_read",
     planRuntimePhase: "needs_rewrite",
     toolNames: allPlanTools,
-  }), ["write_file", "replace_in_file"]);
+  }), []);
 });
 
 test("needs_evidence reopens read-only tools after convergence", () => {
@@ -127,5 +129,84 @@ test("needs_evidence reopens read-only tools after convergence", () => {
     toolNames: ["read_file"],
     evidenceReadiness: "ready_for_plan",
     planRuntimePhase: "needs_evidence",
+  }), false);
+});
+
+test("ready evidence closes reasoning-only and suppressed tools through deterministic materialization", () => {
+  assert.deepEqual(resolvePlanNoActionRecovery({
+    workflowMode: "plan",
+    isPlanApproved: false,
+    reasoningOnly: true,
+    evidenceReadiness: "ready_for_plan",
+    targetedRecoveryPasses: 0,
+  }), {
+    action: "deterministic_materialization",
+    reason: "evidence_ready_for_plan",
+  });
+
+  assert.deepEqual(resolvePlanSuppressedToolRecovery({
+    workflowMode: "plan",
+    isPlanApproved: false,
+    evidenceReadiness: "ready_for_plan",
+    targetedRecoveryPasses: 0,
+  }), {
+    action: "deterministic_materialization",
+    reason: "suppressed_tool_after_ready_evidence",
+  });
+});
+
+test("insufficient plan evidence allows one targeted recovery pass then pauses", () => {
+  assert.deepEqual(resolvePlanNoActionRecovery({
+    workflowMode: "plan",
+    isPlanApproved: false,
+    reasoningOnly: true,
+    evidenceReadiness: "needs_targeted_read",
+    targetedRecoveryPasses: 0,
+  }), {
+    action: "targeted_evidence",
+    reason: "needs_targeted_read",
+  });
+
+  assert.deepEqual(resolvePlanNoActionRecovery({
+    workflowMode: "plan",
+    isPlanApproved: false,
+    reasoningOnly: true,
+    evidenceReadiness: "needs_targeted_read",
+    targetedRecoveryPasses: 1,
+  }), {
+    action: "pause_blocked",
+    reason: "needs_targeted_read",
+  });
+
+  assert.match(buildPlanTargetedEvidenceRecoveryPrompt({
+    language: "en",
+    reason: "needs_targeted_read",
+  }), /exactly one tightly scoped read-only evidence pass/);
+  assert.match(buildPlanEvidenceBlockedPauseMessage({
+    language: "en",
+    reason: "needs_targeted_read",
+  }), /one targeted evidence recovery pass was already used/);
+});
+
+test("hidden-only plan length suppresses the generic truncation warning only before approval", () => {
+  assert.equal(shouldSuppressPlanTruncationWarning({
+    workflowMode: "plan",
+    isPlanApproved: false,
+    finishReason: "length",
+    reasoningOnly: true,
+  }), true);
+
+  assert.equal(shouldSuppressPlanTruncationWarning({
+    workflowMode: "plan",
+    isPlanApproved: true,
+    finishReason: "length",
+    reasoningOnly: true,
+  }), false);
+
+  assert.equal(shouldSuppressPlanTruncationWarning({
+    workflowMode: "edit",
+    isPlanApproved: false,
+    finishReason: "length",
+    reasoningOnly: true,
   }), false);
 });

@@ -130,6 +130,87 @@ test("materializes valid visible plan text into plan.md artifact", () => {
   assert.match(result.content || "", /^# Proposed Plan/);
 });
 
+test("materializes Codex-style proposed_plan blocks without requiring write tools", () => {
+  const result = materializePlanArtifactFromVisibleText({
+    visibleText: [
+      "<proposed_plan>",
+      "# Plan",
+      "",
+      "## Summary",
+      "- User goal: refactor MAIN Plan mode so a reviewable plan can be produced from visible text.",
+      "- Grounding evidence covers `src/lib/orchestrator.ts` and `src/lib/planMaterialization.ts`.",
+      "",
+      "## Key Changes",
+      "- Update `src/lib/orchestrator.ts` so hidden-only reasoning length closes through deterministic materialization.",
+      "- Update `src/lib/planMaterialization.ts` to accept visible proposed plan text.",
+      "- Preserve `.MAIN/plans/plan.md` as the runtime materialized approval artifact.",
+      "",
+      "## Public APIs / Interfaces / Types",
+      "- No public API, interface, or type changes; this only changes internal plan runtime behavior.",
+      "",
+      "## Test Plan",
+      "- Run `node --test tests/node/plan-runtime-state.test.mjs tests/node/plan-materialization.test.mjs`.",
+      "- Run `npm run build` after focused tests pass.",
+      "",
+      "## Assumptions / Defaults",
+      "- Default to runtime materialization instead of asking the model to call write_file.",
+      "- If evidence is insufficient, reopen only one targeted read-only pass before pausing.",
+      "</proposed_plan>",
+    ].join("\n"),
+    userGoal: "Refactor MAIN Plan mode.",
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.kind, "plan");
+  assert.equal(result.path, ".MAIN/plans/plan.md");
+  assert.doesNotMatch(result.content || "", /<\/?proposed_plan>/i);
+});
+
+test("canonicalizes OMLX proposed_plan with verification steps and assumptions", () => {
+  const result = materializePlanArtifactFromVisibleText({
+    visibleText: [
+      "<proposed_plan>",
+      "# Proposed Plan: 验证 OMLX 本地模型 Plan 请求落地",
+      "",
+      "## 摘要",
+      "基于已确认的 `src/lib/planMaterialization.ts` 和 `src/lib/planRuntime.ts` 代码，以及 63 个通过的测试，Codex-style Plan flow refactor 已落地。本计划旨在通过构造真实 Plan 请求，验证 OMLX 本地模型能否正确触发 `<proposed_plan>` 解析并物化为 `.MAIN/plans/plan.md`。",
+      "",
+      "## 关键验证步骤",
+      "1. **构造模拟请求**：生成包含 `<proposed_plan>` 标签的 Markdown 内容，模拟 OMLX 模型输出。",
+      "2. **执行解析流程**：调用 `planMaterialization.ts` 中的核心解析函数，或运行集成测试模拟完整 Plan 流程。",
+      "3. **验证物化结果**：检查 `.MAIN/plans/plan.md` 是否生成，内容是否包含预期的标题、摘要、关键实现改动等。",
+      "4. **检查边界情况**：验证非 `<proposed_plan>` 格式是否按预期处理。",
+      "",
+      "## 测试方案",
+      "- 运行 `node --test` 指定 Plan 解析 suite，确认现有单元测试覆盖 `<proposed_plan>` 解析逻辑。",
+      "- 手动触发一次 Plan 流程，观察控制台日志和文件生成情况。",
+      "",
+      "## 公共 API/接口/类型变化",
+      "无公共 API/接口/类型变化（仅验证现有逻辑）。",
+      "",
+      "## 假设与默认值",
+      "- 假设 OMLX 本地模型输出格式符合 `<proposed_plan>` 规范。",
+      "- 假设工作区权限允许写入 `.MAIN/plans/` 目录。",
+      "</proposed_plan>",
+    ].join("\n"),
+    userGoal: "检查 Codex-style Plan flow refactor 是否完成落地，并用 OMLX 本地模型验证真实 Plan 请求是否能进入可审阅方案。",
+    evidence: [
+      "read_file src/lib/orchestrator.ts; excerpt=Plan runtime 会按 phase 收窄工具面",
+      "read_file src/lib/planRuntime.ts; excerpt=reasoning-only 在证据 ready 时走 deterministic_materialization",
+      "read_file src/lib/planMaterialization.ts; excerpt=支持 proposed_plan 物化到 plan.md",
+      "cmd:node --test Plan suite passed",
+      "cmd:npm run build passed",
+    ],
+    files: ["src/lib/orchestrator.ts", "src/lib/planRuntime.ts", "src/lib/planMaterialization.ts"],
+    language: "zh",
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.path, ".MAIN/plans/plan.md");
+  assert.match(result.content || "", /## 关键改动/);
+  assert.match(result.content || "", /## 假设与默认值/);
+});
+
 test("materializes Gemma-style markdown fix plan without structured proposal tags", () => {
   const visibleText = [
     "## 修复方案",

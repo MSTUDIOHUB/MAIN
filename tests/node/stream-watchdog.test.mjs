@@ -66,6 +66,9 @@ const {
   shouldDeferNoProgressStopToPlanReadOnlyConvergence,
   shouldUsePlanNoVisibleTokenWatchdog,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"));
+const {
+  shouldSuppressPlanTruncationWarning,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planRuntime.ts"));
 
 test("classifies no-visible-token stream timeout as a plan watchdog timeout", () => {
   const error = createStreamNoVisibleTokenTimeoutError(125_000, "plan:preapproval_xml_tools");
@@ -109,6 +112,22 @@ test("detects reasoning-dominated length results before max output escalation", 
     }),
     false,
   );
+});
+
+test("suppresses generic truncation warning for hidden-only unapproved plan length", () => {
+  assert.equal(shouldSuppressPlanTruncationWarning({
+    workflowMode: "plan",
+    isPlanApproved: false,
+    finishReason: "length",
+    reasoningOnly: true,
+  }), true);
+
+  assert.equal(shouldSuppressPlanTruncationWarning({
+    workflowMode: "plan",
+    isPlanApproved: false,
+    finishReason: "length",
+    reasoningOnly: false,
+  }), false);
 });
 
 test("detects reasoning-only no-action results even without length finish", () => {

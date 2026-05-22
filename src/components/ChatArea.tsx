@@ -536,8 +536,12 @@ function ContextCompressionNotice({ block, language }: { block: any; language: "
 
 function PlanExecutionSystemNotice({ block, language }: { block: any; language: "zh" | "en" }) {
   const isCheckpoint = block.variant === "plan_execution_checkpoint";
+  const progressPhase = String(block.planExecutionProgress?.phase || "");
+  const isPaused = progressPhase === "paused" || /已暂停|paused/i.test(String(block.content || ""));
   const title = isCheckpoint
     ? language === "zh" ? "计划执行检查点" : "Plan Execution Checkpoint"
+    : isPaused
+    ? language === "zh" ? "计划执行已暂停" : "Plan Execution Paused"
     : language === "zh" ? "计划执行进度" : "Plan Execution Progress";
   const tone = isCheckpoint
     ? "theme-plan-surface theme-plan-text"
@@ -1175,7 +1179,9 @@ function TurnActivityNotice({
   const thoughtTitle = language === "zh"
     ? isThinking ? "正在整理思路" : "思考摘要"
     : isThinking ? "Thinking" : "Thinking summary";
-  const progressTitle = language === "zh" ? "有效进展" : "Effective Progress";
+  const progressTitle = progressProjection.latest?.status === "paused"
+    ? language === "zh" ? "已暂停" : "Paused"
+    : language === "zh" ? "有效进展" : "Effective Progress";
   const canExpandProgress = progressProjection.recent.length > 1;
   const toggleText = expanded
     ? language === "zh" ? "收起" : "Hide"

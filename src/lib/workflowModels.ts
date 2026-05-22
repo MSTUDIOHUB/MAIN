@@ -1963,14 +1963,25 @@ export function validateActionablePlanArtifact(
     });
   }
 
-  const unsupportedHypothesisLines = raw
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) =>
-      !/^#{1,6}\s+/.test(line) &&
+  const unsupportedHypothesisLines: string[] = [];
+  let currentPlanQualityHeading = "";
+  for (const rawLine of raw.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    const heading = line.match(/^#{1,6}\s+(.+?)\s*$/);
+    if (heading) {
+      currentPlanQualityHeading = heading[1] || "";
+      continue;
+    }
+    const inAssumptionSection = /(?:未验证假设|待验证假设|假设与默认值|默认假设|假设|默认值|Unverified|Hypotheses|Assumptions|Defaults)/i
+      .test(currentPlanQualityHeading);
+    if (
+      !inAssumptionSection &&
       /(?:假设|可能|高概率|中概率|低概率|probably|possibly|hypothesis|likely)/i.test(line) &&
       !/(?:默认假设|未验证|待验证|需验证|证据|依据|观察|已读|default assumption|unverified|needs validation|evidence|observed)/i.test(line)
-    );
+    ) {
+      unsupportedHypothesisLines.push(line);
+    }
+  }
   if (unsupportedHypothesisLines.length > 0) {
     return classifyPlanArtifactQualityResult({ ok: false, reason: "unsupported_hypothesis_as_plan" });
   }

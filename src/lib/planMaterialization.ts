@@ -51,6 +51,8 @@ export interface SanitizedPlanEvidenceInput {
 
 const PROTOCOL_NOISE_RE = /<\/?(?:tool_use|tool_call|function_call|tool|parameter)\b/i;
 const PROPOSAL_MARKER_RE = /^\s*\[PROPOSAL START\]\s*$/gim;
+const PROPOSED_PLAN_BLOCK_RE = /<proposed_plan(?:\s[^>]*)?>([\s\S]*?)<\/proposed_plan>/i;
+const PROPOSED_PLAN_TAG_RE = /<\/?proposed_plan(?:\s[^>]*)?>/gi;
 const USER_OPTIONS_BLOCK_RE = /^\s*<user_options>\s*$[\s\S]*?^\s*<\/user_options>\s*$/gim;
 const OPTION_BLOCK_RE = /<option\b[^>]*>[\s\S]*?<\/option>/gi;
 const TOOL_LOG_NOISE_RE =
@@ -125,8 +127,14 @@ function stripPlanChoiceMarkup(rawText: string): string {
     .trim();
 }
 
+function unwrapProposedPlanMarkup(rawText: string): string {
+  const match = rawText.match(PROPOSED_PLAN_BLOCK_RE);
+  if (match?.[1]?.trim()) return match[1].trim();
+  return rawText.replace(PROPOSED_PLAN_TAG_RE, "").trim();
+}
+
 function normalizePlanContent(rawText: string): string {
-  const withoutChoices = stripPlanChoiceMarkup(rawText);
+  const withoutChoices = unwrapProposedPlanMarkup(stripPlanChoiceMarkup(rawText));
   const withoutProposalMarkers = withoutChoices.replace(PROPOSAL_MARKER_RE, "").trim();
   const strippedPlanJson = withoutProposalMarkers.replace(/<plan>[\s\S]*?<\/plan>/gi, "").trim();
   const sanitized = sanitizePlanArtifactContent(strippedPlanJson);
@@ -941,7 +949,7 @@ function resolveMaterializationKind(input: {
 }
 
 function normalizeDesignContent(rawText: string, language: "zh" | "en"): string {
-  const withoutChoices = stripPlanChoiceMarkup(rawText);
+  const withoutChoices = unwrapProposedPlanMarkup(stripPlanChoiceMarkup(rawText));
   const withoutProposalMarkers = withoutChoices.replace(PROPOSAL_MARKER_RE, "").trim();
   const strippedPlanJson = withoutProposalMarkers.replace(/<plan>[\s\S]*?<\/plan>/gi, "").trim();
   const sanitized = sanitizePlanArtifactContent(strippedPlanJson);
@@ -1074,8 +1082,8 @@ export function composeReviewablePlanFromEvidence(input: {
       "",
       "Hard requirements:",
       `- Use English for all visible prose and \`${targetPath}\` content.`,
-      `- Prefer a single \`write_file\` tool call that writes \`${targetPath}\`.`,
-      "- Do not create `tasks.md`; do not modify source or deliverable files before approval.",
+      `- Output visible Markdown, preferably wrapped in \`<proposed_plan>\`; MAIN will materialize it into \`${targetPath}\`.`,
+      "- Do not call `write_file` or `replace_in_file` just to finish planning. Do not create `tasks.md`; do not modify source or deliverable files before approval.",
       "- Do not include tool logs, ContextMemoryState, XML, raw JSON envelopes, or recovery prompts in the artifact.",
       "- Separate confirmed facts from unverified hypotheses. Do not write probability guesses as execution steps unless an evidence line supports them.",
       `- If a critical business choice is genuinely missing, ask with \`<user_options>\` instead of writing a generic ${kind}.`,
@@ -1097,8 +1105,8 @@ export function composeReviewablePlanFromEvidence(input: {
     "",
     "硬性要求：",
     `- 所有可见正文和 \`${targetPath}\` 内容必须使用简体中文。`,
-    `- 优先只调用一次 \`write_file\`，写入 \`${targetPath}\`。`,
-    "- 批准前不要生成 `tasks.md`，不要修改源码或最终交付文件。",
+    `- 输出可见 Markdown，优先包在 \`<proposed_plan>\` 中；MAIN 会把它物化为 \`${targetPath}\`。`,
+    "- 不要为了完成规划而调用 `write_file` 或 `replace_in_file`。批准前不要生成 `tasks.md`，不要修改源码或最终交付文件。",
     "- 文档中禁止出现工具日志、ContextMemoryState、XML、原始 JSON envelope、恢复提示。",
     "- 必须区分已确认事实和未验证假设。没有证据支撑的概率判断不能写成执行步骤。",
     `- 如果确实缺少关键业务选择，用 \`<user_options>\` 提问，不要写泛化模板${kind === "design" ? "设计" : "计划"}。`,
