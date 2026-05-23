@@ -694,12 +694,22 @@ function TableBlock({
   };
 
   return (
-    <div className="group/table relative my-4 overflow-x-auto rounded-2xl border border-[#1f1f23] bg-[#09090b]">
+    <div
+      data-testid="markdown-table"
+      className="group/table relative my-4 overflow-x-auto rounded-lg border"
+      style={{ borderColor: "var(--surface-border)", backgroundColor: "var(--surface-2)", color: "var(--surface-text)" }}
+    >
       <div className="absolute right-2 top-2 z-10 opacity-0 transition-opacity group-hover/table:opacity-100">
         <button
           type="button"
           onClick={copyTable}
-          className="rounded-md border border-[#27272a] bg-[#09090b] px-2 py-1 text-[10px] text-[#a1a1aa] shadow-sm transition-colors hover:bg-[#18181b] hover:text-[#f5f5f5]"
+          data-testid="markdown-table-copy"
+          className="rounded-md border px-2 py-1 text-[10px] shadow-sm transition-colors"
+          style={{
+            borderColor: "var(--surface-border)",
+            backgroundColor: "var(--surface-2)",
+            color: "var(--surface-text-muted)",
+          }}
         >
           {copyLabel}
         </button>
@@ -743,9 +753,15 @@ const MarkdownRenderer = memo(function MarkdownRenderer({
     table: ({ children, node }: any) => (
       <TableBlock node={node} source={normalized} baseFontSize={baseFontSize}>{children}</TableBlock>
     ),
-    thead: ({ children }: any) => <thead className="bg-[#121216] text-[#f5f5f5]">{children}</thead>,
-    th: ({ children }: any) => <th className="border-b border-[#1f1f23] px-4 py-3 text-left font-semibold">{children}</th>,
-    td: ({ children }: any) => <td className="border-b border-[#1f1f23] px-4 py-3 align-top text-[#d4d4d8]">{children}</td>,
+    thead: ({ children }: any) => (
+      <thead style={{ backgroundColor: "var(--surface-3)", color: "var(--surface-text-strong)" }}>{children}</thead>
+    ),
+    th: ({ children }: any) => (
+      <th className="border-b px-4 py-3 text-left font-semibold" style={{ borderColor: "var(--surface-border)" }}>{children}</th>
+    ),
+    td: ({ children }: any) => (
+      <td className="border-b px-4 py-3 align-top" style={{ borderColor: "var(--surface-border-soft)", color: "var(--surface-text)" }}>{children}</td>
+    ),
     strong: ({ children }: any) => <strong className="font-semibold text-white">{children}</strong>,
     em: ({ children }: any) => <em className="theme-plan-text italic">{children}</em>,
     sup: ({ children }: any) => <sup className="rounded-full bg-[var(--accent-subtle)] px-1 text-[0.75em] theme-text">{children}</sup>,

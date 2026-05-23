@@ -14,6 +14,9 @@ test("plan panel refreshes when tasks.md is updated through replace_in_file", as
 
   await expect(page.getByTestId("plan-stage-badge")).toContainText("执行中");
   await expect(page.getByText("任务 1/3")).toBeVisible();
+  await expect(page.getByTestId("markdown-table").locator("table")).toBeVisible();
+  await expect(page.getByRole("columnheader", { name: "验证项" })).toBeVisible();
+  await expect(page.getByRole("cell", { name: "PlanPanel 表格" })).toBeVisible();
   await expect(page.getByText("保存方案供用户留档（已完成）")).toHaveCount(0);
 
   await expect
@@ -48,4 +51,40 @@ test("plan panel refreshes when tasks.md is updated through replace_in_file", as
 
   await expect(page.getByText("任务 2/3")).toBeVisible();
   await expect(page.getByText("保存方案供用户留档（已完成）").first()).toBeVisible();
+});
+
+test("plan panel markdown tables stay visible across light dark and black themes", async ({ page }) => {
+  await page.goto("/?e2eScenario=plan-replace-refresh");
+
+  for (const theme of ["light", "dark", "black"]) {
+    await page.evaluate((nextTheme) => (window as any).__CODELY_E2E__?.setThemeMode?.(nextTheme), theme);
+    await expect
+      .poll(async () => page.evaluate(() => document.documentElement.getAttribute("data-theme")))
+      .toBe(theme);
+
+    const table = page.getByTestId("markdown-table");
+    await expect(table.locator("table")).toBeVisible();
+    await expect(page.getByRole("columnheader", { name: "验证项" })).toBeVisible();
+    await expect(page.getByRole("cell", { name: "PlanPanel 表格" })).toBeVisible();
+
+    const colors = await table.evaluate((element) => {
+      const cell = element.querySelector("td");
+      const header = element.querySelector("th");
+      const wrapperStyle = window.getComputedStyle(element);
+      const cellStyle = cell ? window.getComputedStyle(cell) : null;
+      const headerStyle = header ? window.getComputedStyle(header) : null;
+      return {
+        wrapperBorder: wrapperStyle.borderTopColor,
+        wrapperBg: wrapperStyle.backgroundColor,
+        cellColor: cellStyle?.color || "",
+        headerColor: headerStyle?.color || "",
+        scrollsHorizontally: element.scrollWidth >= element.clientWidth,
+      };
+    });
+
+    expect(colors.wrapperBorder).not.toBe("rgba(0, 0, 0, 0)");
+    expect(colors.wrapperBg).not.toBe("rgba(0, 0, 0, 0)");
+    expect(colors.cellColor).not.toBe("");
+    expect(colors.headerColor).not.toBe("");
+  }
 });

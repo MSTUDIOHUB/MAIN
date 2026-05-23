@@ -1,0 +1,265 @@
+export type ExecuteRecoveryMode =
+  | "normal"
+  | "action_plus_targeting"
+  | "patch_recovery_read"
+  | "action_only";
+
+export interface ExecuteRecoveryActivityLike {
+  name?: string;
+  status?: string;
+  target?: string;
+  detail?: string;
+}
+
+export interface ExecuteRecoveryResultLike {
+  name?: string;
+  target?: string;
+  content?: string;
+  displayContent?: string;
+  isError?: boolean;
+  internalFeedback?: boolean;
+}
+
+export const EXECUTE_RECOVERY_TARGETING_TOOLS = new Set([
+  "grep_search",
+  "get_file_outline",
+  "read_pty_buffer",
+  "read_pty_tail",
+  "read_pty_since",
+  "get_pty_status",
+]);
+
+export const EXECUTE_RECOVERY_PATCH_READ_TOOLS = new Set([
+  "read_file",
+]);
+
+export function normalizeExecuteRecoveryMode(value: unknown): ExecuteRecoveryMode {
+  return value === "action_plus_targeting" ||
+    value === "patch_recovery_read" ||
+    value === "action_only" ||
+    value === "normal"
+    ? value
+    : "normal";
+}
+
+export function isExecutePatchMismatchRecoveryActivity(activity: ExecuteRecoveryActivityLike): boolean {
+  if (activity.name !== "replace_in_file" || activity.status !== "failed") return false;
+  return /(?:search_text|not\s+found|no\s+match|mismatch|不一致|未匹配|未找到|patch)/i.test(activity.detail || "");
+}
+
+export function shouldAllowExecuteRecoveryFileRead(
+  recentActivity: ExecuteRecoveryActivityLike[],
+): boolean {
+  const recent = recentActivity.slice(-6);
+  let latestPatchMismatchIndex = -1;
+  let latestFileReadIndex = -1;
+  for (let index = 0; index < recent.length; index += 1) {
+    const activity = recent[index];
+    if (isExecutePatchMismatchRecoveryActivity(activity)) latestPatchMismatchIndex = index;
+    if (activity.name === "read_file") latestFileReadIndex = index;
+  }
+  return latestPatchMismatchIndex >= 0 && latestPatchMismatchIndex > latestFileReadIndex;
+}
+
+export function isExecuteRecoveryToolName(
+  name: string,
+  readOnlyTools: Set<string>,
+  options: {
+    mode?: ExecuteRecoveryMode;
+    allowFileRead?: boolean;
+  } = {},
+): boolean {
+  const mode = normalizeExecuteRecoveryMode(options.mode);
+  if (mode === "normal") return true;
+  if (!readOnlyTools.has(name)) return true;
+  if (mode === "action_only") return false;
+  if (EXECUTE_RECOVERY_TARGETING_TOOLS.has(name)) return true;
+  return Boolean(
+    (mode === "patch_recovery_read" || options.allowFileRead) &&
+    EXECUTE_RECOVERY_PATCH_READ_TOOLS.has(name)
+  );
+}
+
+export function describeExecuteRecoveryToolSurface(
+  mode: ExecuteRecoveryMode,
+  allowFileRead = false,
+): string {
+  const normalized = normalizeExecuteRecoveryMode(mode);
+  if (normalized === "normal") return "normal";
+  if (normalized === "action_only") return "action_only";
+  if (normalized === "patch_recovery_read" || allowFileRead) return "action_plus_patch_file_read";
+  return "action_plus_targeting";
+}
+
+export function countRecentReadOnlyActivities(
+  recentActivity: ExecuteRecoveryActivityLike[],
+  readOnlyTools: Set<string>,
+): number {
+  return recentActivity
+    .filter((activity) => activity.status === "succeeded" && readOnlyTools.has(String(activity.name || "")))
+    .length;
+}
+
+export function summarizeRepeatedExecuteTargets(
+  recentActivity: ExecuteRecoveryActivityLike[],
+  maxTargets = 4,
+): string[] {
+  const counts = new Map<string, number>();
+  for (const activity of recentActivity) {
+    const target = String(activity.target || "").trim();
+    if (!target) continue;
+    const cachedWeight = /FILE_UNCHANGED_STUB|Repeated read-only tool call skipped/i.test(activity.detail || "") ? 2 : 1;
+    counts.set(target, (counts.get(target) || 0) + cachedWeight);
+  }
+  return [...counts.entries()]
+    .filter(([, count]) => count >= 2)
+    .sort((a, b) => b[1] - a[1])
+    .map(([target]) => target)
+    .slice(0, maxTargets);
+}
+
+export function isExecuteReadOnlyOnlyBatch(
+  results: ExecuteRecoveryResultLike[],
+  readOnlyTools: Set<string>,
+): boolean {
+  const visibleResults = results.filter((result) => !result.internalFeedback);
+  return visibleResults.length > 0 && visibleResults.every((result) => readOnlyTools.has(String(result.name || "")));
+}
+
+export function countExecuteBatchToolContentChars(results: ExecuteRecoveryResultLike[]): number {
+  return results.reduce((sum, result) => {
+    if (result.internalFeedback) return sum;
+    return sum + String(result.displayContent || result.content || "").length;
+  }, 0);
+}
+
+export function resolveExecuteReadOnlyRecoveryTrigger(input: {
+  results: ExecuteRecoveryResultLike[];
+  recentActivity: ExecuteRecoveryActivityLike[];
+  readOnlyTools: Set<string>;
+  sawExecuteOperationEvidence: boolean;
+  noProgressBatchRepeatCount?: number;
+  currentBatchToolChars?: number;
+  minReadOnlyActivities?: number;
+  maxNoProgressReadOnlyRepeats?: number;
+  maxReadOnlyToolChars?: number;
+}): { shouldRecover: boolean; reason: string; readOnlyActivityCount: number; batchToolChars: number } {
+  const readOnlyActivityCount = countRecentReadOnlyActivities(input.recentActivity, input.readOnlyTools);
+  const batchToolChars = input.currentBatchToolChars ?? countExecuteBatchToolContentChars(input.results);
+  if (input.sawExecuteOperationEvidence) {
+    return { shouldRecover: false, reason: "", readOnlyActivityCount, batchToolChars };
+  }
+  if (!isExecuteReadOnlyOnlyBatch(input.results, input.readOnlyTools)) {
+    return { shouldRecover: false, reason: "", readOnlyActivityCount, batchToolChars };
+  }
+
+  const repeatLimit = input.maxNoProgressReadOnlyRepeats ?? 2;
+  if ((input.noProgressBatchRepeatCount ?? 0) >= repeatLimit) {
+    return { shouldRecover: true, reason: "execute_no_progress_read_only_batch", readOnlyActivityCount, batchToolChars };
+  }
+
+  const readLimit = input.minReadOnlyActivities ?? 8;
+  if (readOnlyActivityCount >= readLimit) {
+    return { shouldRecover: true, reason: "execute_read_only_budget_exhausted", readOnlyActivityCount, batchToolChars };
+  }
+
+  const charLimit = input.maxReadOnlyToolChars ?? 30_000;
+  if (batchToolChars >= charLimit) {
+    return { shouldRecover: true, reason: "execute_read_only_tool_chars_exhausted", readOnlyActivityCount, batchToolChars };
+  }
+
+  const hasCachedRead = input.results.some((result) =>
+    !result.isError &&
+    /FILE_UNCHANGED_STUB|Repeated read-only tool call skipped/i.test(String(result.displayContent || result.content || ""))
+  );
+  if (hasCachedRead) {
+    return { shouldRecover: true, reason: "execute_cached_read_only_batch", readOnlyActivityCount, batchToolChars };
+  }
+
+  return { shouldRecover: false, reason: "", readOnlyActivityCount, batchToolChars };
+}
+
+export function buildExecuteRecoveryPrompt(input: {
+  language: "zh" | "en";
+  reason: string;
+  mode: ExecuteRecoveryMode;
+  repeatedTargets?: string[];
+  recentActivity?: ExecuteRecoveryActivityLike[];
+  allowFileRead?: boolean;
+}): string {
+  const surface = describeExecuteRecoveryToolSurface(input.mode, input.allowFileRead);
+  const repeatedTargets = input.repeatedTargets?.length
+    ? input.repeatedTargets.join(input.language === "zh" ? "、" : ", ")
+    : input.language === "zh" ? "最近已读目标" : "recently read targets";
+  const recent = (input.recentActivity || [])
+    .slice(-5)
+    .map((activity) => [activity.status, activity.name, activity.target, activity.detail].filter(Boolean).join(" "))
+    .join(input.language === "zh" ? "；" : "; ");
+
+  if (input.language === "en") {
+    return [
+      "EXECUTE_RECOVERY: The current Execute turn has spent its read-only budget without producing write, command, or browser validation evidence.",
+      `Recovery reason: ${input.reason || "read_only_no_action"}.`,
+      `Recovery tool surface: ${surface}.`,
+      `Repeated/known targets: ${repeatedTargets}.`,
+      recent ? `Recent tool activity: ${recent}.` : "",
+      input.allowFileRead
+        ? "A single targeted `read_file` is available only to repair a failed `replace_in_file`/patch mismatch; after that, patch, run a finite command, use browser validation, or state the exact blocker."
+        : "Broad reads are temporarily withheld. Reuse the cached context and take the next concrete action: `replace_in_file`/`write_file`, run a finite command, use browser validation, or state the exact blocker.",
+      "Do not start a new broad scan, do not reread the same files, and do not output another plan instead of action.",
+    ].filter(Boolean).join("\n");
+  }
+
+  return [
+    "EXECUTE_RECOVERY: 当前 Execute 回合已经耗尽只读预算，但还没有产生写入、命令或浏览器验证证据。",
+    `恢复原因：${input.reason || "read_only_no_action"}。`,
+    `恢复工具面：${surface}。`,
+    `重复/已知目标：${repeatedTargets}。`,
+    recent ? `最近工具活动：${recent}。` : "",
+    input.allowFileRead
+      ? "现在只开放一次定向 `read_file` 来修复失败的 `replace_in_file` / patch mismatch；随后必须改为写入、运行有限命令、浏览器验证，或说明精确阻塞。"
+      : "宽泛读取工具已临时收起。请复用已缓存上下文，执行下一个具体动作：`replace_in_file` / `write_file`、运行有限命令、浏览器验证，或说明精确阻塞。",
+    "不要开启新一轮泛读，不要重复读取同一批文件，也不要用新的方案文档替代执行动作。",
+  ].filter(Boolean).join("\n");
+}
+
+export function buildExecuteNoProgressLoopPauseNotice(input: {
+  language: "zh" | "en";
+  repeats: number;
+  remainingTask: string;
+  recentActivity: ExecuteRecoveryActivityLike[];
+  repeatedTargets?: string[];
+}): string {
+  const repeatedTargets = input.repeatedTargets?.length
+    ? input.repeatedTargets
+    : summarizeRepeatedExecuteTargets(input.recentActivity);
+  const recent = input.recentActivity
+    .slice(-8)
+    .map((activity) => {
+      const target = activity.target ? ` ${activity.target}` : "";
+      const detail = activity.detail ? ` - ${activity.detail}` : "";
+      return `- ${activity.status || "unknown"}:${activity.name || "tool"}${target}${detail}`;
+    });
+
+  if (input.language === "en") {
+    return [
+      "Execution paused: repeated read-only exploration did not produce a write, command, browser validation, or concrete blocker.",
+      `Repeat count: ${input.repeats}`,
+      repeatedTargets.length ? `Repeated targets: ${repeatedTargets.join(", ")}` : "Repeated targets: none isolated",
+      "Recent tools:",
+      ...(recent.length ? recent : ["- none"]),
+      `Missing progress: ${input.remainingTask}`,
+      "Resume by using cached context to patch/write, run a finite validation command, use browser validation, or state the exact blocker.",
+    ].join("\n");
+  }
+
+  return [
+    "执行已暂停：连续重复只读探索，但没有产生写入、命令、浏览器验证或具体阻塞。",
+    `重复轮数：${input.repeats}`,
+    repeatedTargets.length ? `重复目标：${repeatedTargets.join("、")}` : "重复目标：未定位到单一目标",
+    "最近工具：",
+    ...(recent.length ? recent : ["- 暂无"]),
+    `缺失进展：${input.remainingTask}`,
+    "恢复时请复用已读上下文，直接写入/替换、运行有限验证命令、执行浏览器验证，或说明精确阻塞。",
+  ].join("\n");
+}

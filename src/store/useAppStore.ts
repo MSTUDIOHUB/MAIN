@@ -4,6 +4,7 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import { executeAgentLoop, type AgentMessage, type OrchestratorCallbacks, type ReviewDecision, type ContentPart } from "../lib/orchestrator";
+import type { ExecuteRecoveryMode } from "../lib/executeRecoveryTools";
 import {
   analyzeTabularDocument,
   deleteChatTempPath,
@@ -1004,7 +1005,7 @@ export type TaskBlock =
       variant?: "context_compression" | "plan_quality_gate" | "plan_execution_progress" | "plan_execution_checkpoint" | "execution_checkpoint" | "game_studio_local_markdown";
       planExecutionProgress?: PlanExecutionProgressSnapshot;
       contextCompression?: {
-        reason: "proactive" | "reactive";
+        reason: "proactive" | "reactive" | "execute_recovery";
         droppedCount: number;
         tokenCountBefore: number;
         tokenCountAfter: number;
@@ -1308,6 +1309,7 @@ interface AppState {
       preservePlanState?: boolean;
       resolvedIntent?: ResolvedUserIntent;
       runtimeIntentOverride?: ResolvedUserIntent;
+      forceExecuteRecoveryMode?: ExecuteRecoveryMode;
       commandDirective?: CommandDirective | null;
       executionConsentGranted?: boolean;
       skipIntentResolution?: boolean;
@@ -5853,6 +5855,7 @@ export const useAppStore = create<AppState>()(
     preservePlanState?: boolean;
     resolvedIntent?: ResolvedRunIntent;
     runtimeIntentOverride?: ResolvedRunIntent;
+    forceExecuteRecoveryMode?: ExecuteRecoveryMode;
     commandDirective?: CommandDirective | null;
     executionConsentGranted?: boolean;
     skipIntentResolution?: boolean;
@@ -8729,6 +8732,7 @@ export const useAppStore = create<AppState>()(
         onHookBlocked: (_event, _reason, _record) => { /* UI feedback placeholder */ },
         getCurrentRunIntent: () => sessionGet().getCurrentRunIntent(),
         getRuntimeRunIntent: () => runtimeRunIntent,
+        getForcedExecuteRecoveryMode: () => options?.forceExecuteRecoveryMode ?? null,
         getCommandDirective: () => effectiveCommandDirective,
         getWorkflowMode: () => getIntentPolicy(sessionGet().getCurrentRunIntent()).workflowMode,
         getIsPlanApproved: () => sessionGet().isPlanApproved,
@@ -10289,6 +10293,7 @@ export const useAppStore = create<AppState>()(
         },
 
         onExecuteMaxIterationsCheckpoint: (checkpoint: PlanMaxIterationsCheckpoint) => {
+          terminalTurnStatusOverride = "stopped_no_action";
           const language = sessionGet().preferredResponseLanguage || sessionGet().config.language;
           const currentCount = Math.max(0, Number(sessionGet().planAutoResumeCount) || 0);
           const shouldAutoResume = currentCount < PLAN_MAX_AUTO_RESUME_LIMIT;
@@ -10373,6 +10378,7 @@ export const useAppStore = create<AppState>()(
                 preservePlanState: true,
                 resolvedIntent: "execute",
                 runtimeIntentOverride: "execute",
+                forceExecuteRecoveryMode: "action_plus_targeting",
                 executionConsentGranted: true,
                 skipIntentResolution: true,
                 turnTitle: language === "zh" ? "执行自动恢复" : "Execution Auto-Resume",

@@ -68,9 +68,65 @@ function transformOutsideFencedCode(content: string, transform: (chunk: string) 
   return result;
 }
 
+function isMarkdownTableSeparatorLine(line: string): boolean {
+  const text = String(line || "").trim();
+  if (!text.startsWith("|") || !text.endsWith("|")) return false;
+  const cells = text
+    .slice(1, -1)
+    .split("|")
+    .map((cell) => cell.trim());
+  return cells.length >= 2 && cells.every((cell) => /^:?-{3,}:?$/.test(cell));
+}
+
+function isBulletPrefixedMarkdownTableLine(line: string): boolean {
+  return /^\s*[-*+]\s+\|.*\|\s*$/.test(String(line || ""));
+}
+
+function stripBulletFromMarkdownTableLine(line: string): string {
+  return String(line || "").replace(/^(\s*)[-*+]\s+(\|.*\|\s*)$/, "$1$2");
+}
+
+function repairBulletPrefixedMarkdownTables(content: string): string {
+  const lines = String(content || "").split(/\r?\n/);
+  const repaired: string[] = [];
+
+  for (let index = 0; index < lines.length;) {
+    if (!isBulletPrefixedMarkdownTableLine(lines[index])) {
+      repaired.push(lines[index]);
+      index += 1;
+      continue;
+    }
+
+    const start = index;
+    const tableLines: string[] = [];
+    while (index < lines.length && isBulletPrefixedMarkdownTableLine(lines[index])) {
+      tableLines.push(stripBulletFromMarkdownTableLine(lines[index]).trim());
+      index += 1;
+    }
+
+    const hasSeparator = tableLines.some(isMarkdownTableSeparatorLine);
+    if (tableLines.length >= 2 && hasSeparator) {
+      if (repaired.length > 0 && repaired[repaired.length - 1].trim() !== "" && !/^#{1,6}\s+/.test(repaired[repaired.length - 1].trim())) {
+        repaired.push("");
+      }
+      repaired.push(...tableLines);
+      if (index < lines.length && lines[index].trim() !== "") {
+        repaired.push("");
+      }
+      continue;
+    }
+
+    repaired.push(...lines.slice(start, index));
+  }
+
+  return repaired.join("\n");
+}
+
 export function normalizeMarkdownForDisplay(content: string): string {
   const transformed = transformOutsideFencedCode(String(content || ""), (chunk) =>
-    transformCjkSoftBreaks(transformMathOutsideCode(stripUnsafeMarkdownHtml(chunk))),
+    repairBulletPrefixedMarkdownTables(
+      transformCjkSoftBreaks(transformMathOutsideCode(stripUnsafeMarkdownHtml(chunk))),
+    ),
   );
 
   return transformed

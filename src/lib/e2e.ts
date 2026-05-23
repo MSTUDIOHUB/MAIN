@@ -2165,6 +2165,10 @@ function seedPlanReplaceRefreshScenario() {
   const initialTasksContent = [
     "# Tasks",
     "",
+    "| 验证项 | 期望 |",
+    "| --- | --- |",
+    "| PlanPanel 表格 | light / dark / black 下都渲染为真实表格 |",
+    "",
     "- [x] 补齐计划文档与需求说明 — 证据: file:plan-output.md",
     "- [ ] 保存方案供用户留档 — 证据: file:saved-plan.md",
     "- [ ] 批准执行并完成最终收尾 — 证据: file:final-summary.md",
@@ -2284,6 +2288,10 @@ function seedPlanReplaceRefreshScenario() {
   const replacePlanTasks = async () => {
     const updatedTasksContent = [
       "# Tasks",
+      "",
+      "| 验证项 | 期望 |",
+      "| --- | --- |",
+      "| PlanPanel 表格 | light / dark / black 下都渲染为真实表格 |",
       "",
       "- [x] 补齐计划文档与需求说明 — 证据: file:plan-output.md",
       "- [x] 保存方案供用户留档（已完成） — 证据: file:saved-plan.md",

@@ -23,7 +23,7 @@ import {
 } from "./streaming";
 import { buildToolDefinitions, skillNameToToolName, type ToolDefinition } from "./toolSchemas";
 import { executeTool } from "./toolExecutor";
-import { computeContextBudgets, estimateTokens, manageContext } from "./contextTrim";
+import { compactContextForExecuteRecovery, computeContextBudgets, estimateTokens, manageContext } from "./contextTrim";
 import type { ContextMemoryState } from "./contextMemory";
 import { clampContextLimitToReported } from "./contextWindow";
 import { generateId } from "./utils";
@@ -163,6 +163,22 @@ import {
   type PlanToolActivitySummary,
 } from "./planExecutionRecovery";
 import {
+  describeApprovedPlanRecoveryToolSurface,
+  isApprovedPlanRecoveryToolName,
+  shouldAllowApprovedPlanRecoveryFileRead,
+} from "./approvedPlanRecoveryTools";
+import {
+  buildExecuteNoProgressLoopPauseNotice,
+  buildExecuteRecoveryPrompt,
+  describeExecuteRecoveryToolSurface,
+  isExecuteRecoveryToolName,
+  normalizeExecuteRecoveryMode,
+  resolveExecuteReadOnlyRecoveryTrigger,
+  shouldAllowExecuteRecoveryFileRead,
+  summarizeRepeatedExecuteTargets,
+  type ExecuteRecoveryMode,
+} from "./executeRecoveryTools";
+import {
   buildPlanExecutionNoToolRecoveryPrompt,
 } from "./planExecutionNoTool";
 import { validateShellToolContract } from "./toolExecutionContract";
@@ -183,6 +199,7 @@ import {
   composeReviewablePlanFromEvidence,
   materializePlanArtifactFromVisibleText,
   sanitizePlanEvidenceInput,
+  type PlanMaterializationSource,
 } from "./planMaterialization";
 import { formatToolPresentation } from "./toolPresentation";
 import {
@@ -1067,6 +1084,7 @@ export interface OrchestratorCallbacks {
   // Planning & Management
   getCurrentRunIntent: () => ResolvedUserIntent;
   getRuntimeRunIntent?: () => ResolvedUserIntent;
+  getForcedExecuteRecoveryMode?: () => ExecuteRecoveryMode | null;
   getCommandDirective?: () => CommandDirective | null;
   getWorkflowMode: () => "chat" | "edit" | "plan";
   getIsPlanApproved: () => boolean;
@@ -1158,7 +1176,7 @@ export interface OrchestratorCallbacks {
         total: number;
       };
     },
-    reason: "proactive" | "reactive",
+    reason: "proactive" | "reactive" | "execute_recovery",
   ) => void;
 
   // Tool execution UI feedback
@@ -1434,9 +1452,12 @@ function isCachedReadOnlyToolResult(result: ToolExecutionResult): boolean {
   );
 }
 
-function isApprovedPlanActionTool(tool: ToolDefinition): boolean {
+function isApprovedPlanRecoveryTool(
+  tool: ToolDefinition,
+  options: { allowFileRead?: boolean } = {},
+): boolean {
   const name = tool.function.name;
-  return !PLAN_EXPLORATION_READ_ONLY_TOOLS.has(name);
+  return isApprovedPlanRecoveryToolName(name, PLAN_EXPLORATION_READ_ONLY_TOOLS, options);
 }
 
 function looksLikeProseCodeDump(text: string): boolean {
@@ -1571,7 +1592,7 @@ function buildReasoningDominatedRecoveryPrompt(language: "zh" | "en", workflowMo
         ].join("\n")
       : [
           "The previous model turn produced only hidden reasoning metadata and no executable action.",
-          "Continue now with one concrete action: call the next necessary tool, edit/verify the target, or give a concise user-visible blocker. Do not output hidden thinking tags.",
+          "Continue now with one concrete action: patch/write, run a finite command, use browser validation, or give a concise user-visible blocker. Broad reads may be temporarily withheld; reuse the cached context instead of rereading the same files. Do not output hidden thinking tags.",
         ].join("\n");
   }
 
@@ -1583,7 +1604,7 @@ function buildReasoningDominatedRecoveryPrompt(language: "zh" | "en", workflowMo
       ].join("\n")
     : [
         "上一轮模型只产生了后台 reasoning 元数据，没有可执行动作。",
-        "现在必须执行一个真实动作：调用下一步必要工具、修改/验证目标，或用普通 Markdown 给出精确阻塞点。不要输出 hidden thinking 标签。",
+        "现在必须执行一个真实动作：写入/替换、运行有限命令、浏览器验证，或用普通 Markdown 给出精确阻塞点。宽泛读取工具可能会被临时收起；请复用已缓存上下文，不要重复读同一批文件。不要输出 hidden thinking 标签。",
       ].join("\n");
 }
 
@@ -1611,13 +1632,15 @@ function buildExecuteConvergencePrompt(language: "zh" | "en", iteration: number,
   return language === "zh"
     ? [
         `本轮 Execute 已进行 ${iteration}/${maxIterations} 轮工具循环，接近安全边界。`,
+        "MAIN 会临时收窄工具面：宽泛读取会被收起，只保留写入、命令、浏览器验证和少量定向定位工具。",
         "请先根据已有工具结果判断任务是否已经完成：如果完成，直接输出最终总结并停止，不要再调用工具。",
-        "如果仍未完成，只调用一个最小必要的下一步工具；不要重复读取、重复验证或继续改同一个目标而没有新证据。",
+        "如果仍未完成，只调用一个最小必要的下一步动作工具；不要重复读取、重复验证或继续改同一个目标而没有新证据。",
       ].join("\n")
     : [
         `This Execute turn has reached ${iteration}/${maxIterations} tool-loop iterations and is approaching the safety boundary.`,
+        "MAIN will temporarily narrow the tool surface: broad reads are withheld, leaving write, command, browser validation, and lightweight targeting tools.",
         "First decide from existing tool results whether the task is already complete. If it is complete, output the final summary and stop without more tools.",
-      "If it is not complete, call exactly one smallest necessary next tool. Do not repeat reads, repeat validation, or keep editing the same target without new evidence.",
+      "If it is not complete, call exactly one smallest necessary action tool. Do not repeat reads, repeat validation, or keep editing the same target without new evidence.",
     ].join("\n");
 }
 
@@ -2047,6 +2070,7 @@ function buildApprovedPlanNoProgressStrategySwitchPrompt(input: {
   remainingText: string;
   repeatedTargets: string[];
   recentToolActivity: PlanToolActivitySummary[];
+  allowFileRead?: boolean;
 }): string {
   const repeatedTargets = input.repeatedTargets.length > 0
     ? input.repeatedTargets.join(input.language === "zh" ? "、" : ", ")
@@ -2063,8 +2087,10 @@ function buildApprovedPlanNoProgressStrategySwitchPrompt(input: {
       `Repeated/known targets: ${repeatedTargets}`,
       recent ? `Recent tool evidence: ${recent}` : "",
       `Unsatisfied task: ${input.remainingText}`,
-      "For the next response, MAIN is narrowing the tool surface to action tools. Use `replace_in_file`/`write_file`, run a command, use Browser/Playwright validation, or state the exact blocker if no real action is possible.",
-      "Do not call read/list/search again for the same target.",
+      input.allowFileRead
+        ? "For the next response, MAIN keeps action tools plus one patch-recovery file read available. Use that read only to repair a failed `replace_in_file`, then patch or validate."
+        : "For the next response, MAIN keeps action tools plus lightweight targeting tools available. Use `replace_in_file`/`write_file`, run a command, use Browser/Playwright validation, or state the exact blocker if no real action is possible.",
+      "Do not call read/list/search again for the same cached target. `read_file` is withheld in cached-read recovery until a failed `replace_in_file`/patch needs exact current content.",
     ].filter(Boolean).join("\n");
   }
 
@@ -2074,8 +2100,10 @@ function buildApprovedPlanNoProgressStrategySwitchPrompt(input: {
     `重复/已知目标：${repeatedTargets}`,
     recent ? `最近工具证据：${recent}` : "",
     `证据未满足任务：${input.remainingText}`,
-    "下一轮 MAIN 会临时收窄为行动工具。请直接使用 `replace_in_file`/`write_file` 修改，运行命令，执行 Browser/Playwright 验证，或说明无法真实行动的具体阻塞。",
-    "不要再次对同一目标调用 read/list/search。",
+    input.allowFileRead
+      ? "下一轮 MAIN 会临时保留行动工具和一次 patch 恢复用文件读取。该读取只用于修复 failed `replace_in_file`，随后必须写入或验证。"
+      : "下一轮 MAIN 会临时保留行动工具和轻量定位工具。请优先使用 `replace_in_file`/`write_file` 修改，运行命令，执行 Browser/Playwright 验证，或说明无法真实行动的具体阻塞。",
+    "不要再次对同一缓存目标调用 read/list/search；cached-read 恢复阶段会先收起 `read_file`，只有 failed `replace_in_file`/patch 需要精确当前内容时才重新开放。",
   ].filter(Boolean).join("\n");
 }
 
@@ -3109,6 +3137,7 @@ interface PlanMaterializationResultForLoop {
   kind?: "plan" | "design";
   content?: string;
   reason?: string;
+  source?: PlanMaterializationSource;
   toolResult?: ToolExecutionResult;
 }
 
@@ -3119,6 +3148,7 @@ async function writeMaterializedPlanArtifact(input: {
     kind?: "plan" | "design";
     content?: string;
     reason?: string;
+    source?: PlanMaterializationSource;
   };
   workspace: string;
   callbacks: OrchestratorCallbacks;
@@ -3163,6 +3193,7 @@ async function writeMaterializedPlanArtifact(input: {
       path: materialized.path,
       kind: materialized.kind,
       content: materialized.content,
+      source: materialized.source,
       toolResult: {
         toolCallId,
         name: "write_file",
@@ -3181,6 +3212,7 @@ async function writeMaterializedPlanArtifact(input: {
       path: materialized.path,
       kind: materialized.kind,
       content: materialized.content,
+      source: materialized.source,
       reason: message,
       toolResult: {
         toolCallId,
@@ -5384,6 +5416,45 @@ export async function executeAgentLoop(
   let noProgressBatchRepeatCount = 0;
   let approvedPlanNoProgressRecoveryAttempts = 0;
   let approvedPlanActionOnlyRecoveryActive = false;
+  let executeRecoveryMode: ExecuteRecoveryMode =
+    workflowMode === "edit"
+      ? normalizeExecuteRecoveryMode(callbacks.getForcedExecuteRecoveryMode?.())
+      : "normal";
+  let executeRecoveryReason = executeRecoveryMode === "normal" ? "" : "forced_execute_recovery";
+  let executeRecoveryAttempts = executeRecoveryMode === "normal" ? 0 : 1;
+  const activateExecuteRecovery = (
+    mode: Exclude<ExecuteRecoveryMode, "normal">,
+    reason: string,
+    context: Record<string, unknown> = {},
+  ) => {
+    const normalizedMode = normalizeExecuteRecoveryMode(mode) as Exclude<ExecuteRecoveryMode, "normal">;
+    executeRecoveryAttempts += 1;
+    executeRecoveryMode = normalizedMode;
+    executeRecoveryReason = reason;
+    logAgentEvent("execute_recovery_activated", {
+      iteration,
+      executeRecoveryMode,
+      executeRecoveryAttempts,
+      reason,
+      recoveryToolSurface: describeExecuteRecoveryToolSurface(
+        executeRecoveryMode,
+        shouldAllowExecuteRecoveryFileRead(recentToolActivity),
+      ),
+      ...context,
+    });
+  };
+  const clearExecuteRecovery = (reason: string) => {
+    if (executeRecoveryMode === "normal") return;
+    logAgentEvent("execute_recovery_cleared", {
+      iteration,
+      previousMode: executeRecoveryMode,
+      executeRecoveryAttempts,
+      reason,
+    });
+    executeRecoveryMode = "normal";
+    executeRecoveryReason = "";
+    executeRecoveryAttempts = 0;
+  };
   const rememberToolActivity = (targetList: PlanToolActivitySummary[], result: ToolExecutionResult) => {
     if (result.internalFeedback) return;
     const detail = truncateForLog(result.displayContent || result.content || "", 120);
@@ -5581,6 +5652,7 @@ export async function executeAgentLoop(
     const materialized = materializePlanArtifactFromVisibleText({
       visibleText: deterministicContent,
       preferredKind: "plan",
+      sourceHint: "deterministic_evidence",
       userGoal: closureInput.userGoal,
       evidence: closureInput.evidence,
       files: closureInput.files,
@@ -5611,6 +5683,7 @@ export async function executeAgentLoop(
       evidenceCount: closureInput.evidence.length,
       fileCount: closureInput.files.length,
       targetPath: materialized.path || ".MAIN/plans/plan.md",
+      planArtifactSource: materialized.source || "deterministic_evidence",
       qualityGateReason: details.qualityGateReason || "",
       qualityRejectCount: details.qualityRejectCount || 0,
     });
@@ -5808,6 +5881,7 @@ export async function executeAgentLoop(
     const language = callbacks.getPreferredLanguage();
     const repeatedTargets = summarizeRepeatedPlanTargetsFromToolActivity(recentPlanToolActivity);
     const progressSignature = buildPlanProgressSignatureFromToolActivity(recentPlanToolActivity);
+    const allowFileRead = shouldAllowApprovedPlanRecoveryFileRead(recentPlanToolActivity);
     approvedPlanNoProgressRecoveryAttempts += 1;
     approvedPlanActionOnlyRecoveryActive = true;
     logAgentEvent("plan_execution_strategy_switch_reprompt", {
@@ -5816,6 +5890,7 @@ export async function executeAgentLoop(
       attempts: approvedPlanNoProgressRecoveryAttempts,
       repeatedTargets,
       progressSignature: truncateForLog(progressSignature, 220),
+      recoveryToolSurface: describeApprovedPlanRecoveryToolSurface(allowFileRead),
       ...(input.logContext || {}),
     });
     emitTaskOrchestratorPhase("EXECUTE_STEP", {
@@ -5829,8 +5904,8 @@ export async function executeAgentLoop(
       repeatedTargets,
       recoveryReason: input.reason,
       nextStep: language === "zh"
-        ? "下一轮临时收窄为写入/命令/浏览器验证工具，继续完成证据未满足任务"
-        : "next turn is narrowed to write/command/browser tools to complete unsatisfied evidence",
+        ? "下一轮临时收窄为行动工具加定位工具；避免重复缓存读取，优先写入/命令/浏览器验证"
+        : "next turn is narrowed to action tools plus targeting tools; avoid cached rereads and prioritize patching, commands, or browser validation",
     });
     callbacks.onStatusChange("running");
     callbacks.appendMessage({
@@ -5840,6 +5915,7 @@ export async function executeAgentLoop(
         remainingText: input.remainingText,
         repeatedTargets,
         recentToolActivity: recentPlanToolActivity,
+        allowFileRead,
       }),
     });
   };
@@ -5886,12 +5962,43 @@ export async function executeAgentLoop(
     callbacks.startNewTurn();
     const runtimeIntent = resolveRuntimeIntent();
     const rawIterationAllTools = resolveAllToolsForRuntime(runtimeIntent);
+    const allowApprovedPlanRecoveryFileRead = shouldAllowApprovedPlanRecoveryFileRead(recentPlanToolActivity);
+    const isExecuteRecoveryEligible =
+      workflowMode === "edit" &&
+      runtimeIntent === "execute" &&
+      executeRecoveryMode !== "normal";
+    const allowExecuteRecoveryFileRead = shouldAllowExecuteRecoveryFileRead(recentToolActivity);
+    const recoveryIterationAllTools = isExecuteRecoveryEligible
+      ? rawIterationAllTools.filter((tool) => isExecuteRecoveryToolName(
+          tool.function.name,
+          PLAN_EXPLORATION_READ_ONLY_TOOLS,
+          {
+            mode: executeRecoveryMode,
+            allowFileRead: allowExecuteRecoveryFileRead,
+          },
+        ))
+      : rawIterationAllTools;
+    if (isExecuteRecoveryEligible && recoveryIterationAllTools.length !== rawIterationAllTools.length) {
+      logAgentEvent("execute_recovery_tool_scope_applied", {
+        iteration,
+        executeRecoveryMode,
+        executeRecoveryReason,
+        executeRecoveryAttempts,
+        allowFileRead: allowExecuteRecoveryFileRead,
+        recoveryToolSurface: describeExecuteRecoveryToolSurface(executeRecoveryMode, allowExecuteRecoveryFileRead),
+        rawTools: rawIterationAllTools.map((tool) => tool.function.name).slice(0, 24),
+        scopedTools: recoveryIterationAllTools.map((tool) => tool.function.name),
+        removedToolCount: Math.max(0, rawIterationAllTools.length - recoveryIterationAllTools.length),
+      });
+    }
     const baseIterationAllTools =
       approvedPlanActionOnlyRecoveryActive &&
       workflowMode === "plan" &&
       callbacks.getIsPlanApproved()
-        ? rawIterationAllTools.filter(isApprovedPlanActionTool)
-        : rawIterationAllTools;
+        ? recoveryIterationAllTools.filter((tool) => isApprovedPlanRecoveryTool(tool, {
+            allowFileRead: allowApprovedPlanRecoveryFileRead,
+          }))
+        : recoveryIterationAllTools;
     const phaseScopedIterationAllTools = filterPlanRuntimeToolDefinitionsForPhase({
       tools: baseIterationAllTools,
       workflowMode,
@@ -5940,7 +6047,60 @@ export async function executeAgentLoop(
     );
     const llmTools = !forceXmlTools ? iterationAllTools : [];
     const cloudResponsesCompact = isCloudProfile && config.cloud.apiFormat === "responses";
-    if (snapshotContextLimit != null || cloudResponsesCompact) {
+    let executeRecoveryContextAlreadyCompacted = false;
+    if (isExecuteRecoveryEligible) {
+      const recoveryMessagesBefore = callbacks.getMessages().length;
+      const recoveryManagedResult = compactContextForExecuteRecovery(
+        callbacks.getMessages(),
+        {
+          previousMemoryState: callbacks.getContextMemoryState?.() || null,
+          turnId: callbacks.getCurrentTurnId?.() || eventTurnId,
+          maxMessages: 36,
+          maxToolResultMessages: 12,
+          maxToolChars: 12_000,
+          maxToolCallGroups: 6,
+          maxToolResultTokens: 360,
+          latestUserMessages: 2,
+        },
+      );
+      callbacks.onContextMemoryBuilt?.(recoveryManagedResult.memoryState, recoveryManagedResult.memoryPacket);
+      managedAgentMessages = recoveryManagedResult.messages as AgentMessage[];
+      if (recoveryManagedResult.changed) {
+        callbacks.replaceMessages(managedAgentMessages);
+        callbacks.onContextCompress({
+          droppedCount: recoveryManagedResult.droppedCount,
+          droppedMessageCount: recoveryManagedResult.droppedMessageCount,
+          tokenCountBefore: recoveryManagedResult.tokenCountBefore,
+          tokenCountAfter: recoveryManagedResult.tokenCountAfter,
+          tokenReduction: recoveryManagedResult.tokenReduction,
+          compressedContext: recoveryManagedResult.compressedContext,
+          displaySummary: recoveryManagedResult.displaySummary,
+          memoryPacket: recoveryManagedResult.memoryPacket,
+          microCompactionKind: recoveryManagedResult.microCompactionKind,
+          microCompactedCount: recoveryManagedResult.microCompactedCount,
+          tokenBreakdown: recoveryManagedResult.tokenBreakdownBefore,
+        }, "execute_recovery");
+      }
+      executeRecoveryContextAlreadyCompacted = true;
+      logAgentEvent("execute_recovery_context_compacted", {
+        iteration,
+        executeRecoveryMode,
+        executeRecoveryReason,
+        messagesBefore: recoveryMessagesBefore,
+        messagesAfter: managedAgentMessages.length,
+        droppedMessageCount: recoveryManagedResult.droppedMessageCount,
+        tokenBefore: Math.round(recoveryManagedResult.tokenCountBefore),
+        tokenAfter: Math.round(recoveryManagedResult.tokenCountAfter),
+        toolResultMessagesAfter: managedAgentMessages.filter((message) => message.role === "tool").length,
+        toolCharsAfter: managedAgentMessages.reduce((sum, message) =>
+          message.role === "tool" && typeof message.content === "string"
+            ? sum + message.content.length
+            : sum,
+        0),
+        recoveryToolSurface: describeExecuteRecoveryToolSurface(executeRecoveryMode, allowExecuteRecoveryFileRead),
+      });
+    }
+    if (!executeRecoveryContextAlreadyCompacted && (snapshotContextLimit != null || cloudResponsesCompact)) {
       const contextLimit = snapshotContextLimit ?? 32768;
       const effectiveContextLimit = computeManagedContextLimit(contextLimit, llmTools);
       const { inputBudget, outputBudget } = computeContextBudgets(effectiveContextLimit);
@@ -6108,6 +6268,9 @@ export async function executeAgentLoop(
         toolProtocol: effectiveToolProtocol,
         nativeToolsEnabled: !forceXmlTools,
         compatibilityOverride: !!providerCompatibilityOverride,
+        executeRecoveryMode,
+        executeRecoveryReason,
+        recoveryToolSurface: describeExecuteRecoveryToolSurface(executeRecoveryMode, allowExecuteRecoveryFileRead),
         messages: summarizeMessagesForDiagnostics(messagesForLLM),
         managedMessages: summarizeMessagesForDiagnostics(managedAgentMessages),
         allTools: summarizeToolsForDiagnostics(iterationAllTools),
@@ -6815,6 +6978,20 @@ export async function executeAgentLoop(
         );
         callbacks.onStatusChange("idle");
         return;
+      }
+      if (workflowMode === "plan" && callbacks.getIsPlanApproved()) {
+        approvedPlanActionOnlyRecoveryActive = true;
+        logAgentEvent("approved_plan_reasoning_recovery_tool_surface", {
+          iteration,
+          recoveryToolSurface: "action_plus_targeting_reads",
+          allowFileRead: false,
+        });
+      } else if (workflowMode === "edit" && resolveRuntimeIntent() === "execute") {
+        activateExecuteRecovery("action_plus_targeting", "reasoning_dominated_recovery", {
+          consecutiveReasoningDominatedCount,
+          contentChars: streamResult.content.length,
+          reasoningChars: String(streamResult.reasoningContent || "").length,
+        });
       }
       callbacks.onStatusChange("running");
       callbacks.appendMessage({
@@ -7983,6 +8160,7 @@ export async function executeAgentLoop(
               path: materializedProposal.path || "",
               kind: materializedProposal.kind || "",
               reason: materializedProposal.reason || "",
+              planArtifactSource: materializedProposal.source || "",
               visibleChars: (sourceVisibleText || streamText).length,
             });
             hasMaterializedStructuredProposal = materializedProposal.ok;
@@ -8068,6 +8246,7 @@ export async function executeAgentLoop(
               iteration,
               path: materializedPlan.path,
               kind: materializedPlan.kind,
+              planArtifactSource: materializedPlan.source || "",
               visibleChars: sourceVisibleText.length,
               sawPlanModeToolActivity,
               wasTruncated,
@@ -9233,6 +9412,9 @@ export async function executeAgentLoop(
       approvedPlanActionOnlyRecoveryActive = false;
       approvedPlanNoProgressRecoveryAttempts = 0;
     }
+    if (workflowMode === "edit" && nonReadOnlySuccessfulResultCount > 0) {
+      clearExecuteRecovery("action_evidence_observed");
+    }
     const hasPlanDecisionOutput =
       hasStructuredProposal ||
       finalReplyOptions.length > 0 ||
@@ -9248,6 +9430,13 @@ export async function executeAgentLoop(
     });
     const wasPlanEvidenceRecoveryPhase = String(planRuntimePhase) === "needs_evidence";
     let pendingPlanRuntimeRecoveryPrompt: string | null = null;
+    let pendingExecuteRecoveryPrompt: string | null = null;
+    let pendingExecuteNoProgressPause: {
+      notice: string;
+      repeatedTargets: string[];
+      progressSignature: string;
+      reason: string;
+    } | null = null;
     let pendingPlanDeterministicQualityClosure: {
       trigger: string;
       qualityGateReason: string;
@@ -9377,6 +9566,59 @@ export async function executeAgentLoop(
       noProgressBatchRepeatCount = 0;
     }
 
+    const executeReadOnlyRecovery =
+      workflowMode === "edit" && runtimeIntent === "execute"
+        ? resolveExecuteReadOnlyRecoveryTrigger({
+            results: allResults,
+            recentActivity: recentToolActivity,
+            readOnlyTools: PLAN_EXPLORATION_READ_ONLY_TOOLS,
+            sawExecuteOperationEvidence,
+            noProgressBatchRepeatCount,
+            minReadOnlyActivities: 8,
+            maxNoProgressReadOnlyRepeats: 2,
+            maxReadOnlyToolChars: 30_000,
+          })
+        : { shouldRecover: false, reason: "", readOnlyActivityCount: 0, batchToolChars: 0 };
+    if (executeReadOnlyRecovery.shouldRecover) {
+      const language = callbacks.getPreferredLanguage();
+      const repeatedTargets = summarizeRepeatedExecuteTargets(recentToolActivity.slice(-12));
+      const allowFileRead = shouldAllowExecuteRecoveryFileRead(recentToolActivity);
+      if (executeRecoveryAttempts < 2) {
+        const nextMode: Exclude<ExecuteRecoveryMode, "normal"> = allowFileRead
+          ? "patch_recovery_read"
+          : "action_plus_targeting";
+        activateExecuteRecovery(nextMode, executeReadOnlyRecovery.reason, {
+          readOnlyActivityCount: executeReadOnlyRecovery.readOnlyActivityCount,
+          batchToolChars: executeReadOnlyRecovery.batchToolChars,
+          repeatedTargets,
+        });
+        pendingExecuteRecoveryPrompt = buildExecuteRecoveryPrompt({
+          language,
+          reason: executeReadOnlyRecovery.reason,
+          mode: nextMode,
+          repeatedTargets,
+          recentActivity: recentToolActivity,
+          allowFileRead,
+        });
+      } else {
+        const remainingText = callbacks.getPreferredLanguage() === "zh"
+          ? "执行恢复后仍只有只读探索，没有写入、命令或浏览器验证证据。"
+          : "execute recovery still produced read-only exploration without write, command, or browser validation evidence";
+        pendingExecuteNoProgressPause = {
+          notice: buildExecuteNoProgressLoopPauseNotice({
+            language,
+            repeats: Math.max(1, noProgressBatchRepeatCount),
+            remainingTask: remainingText,
+            recentActivity: recentToolActivity,
+            repeatedTargets,
+          }),
+          repeatedTargets,
+          progressSignature: buildPlanProgressSignatureFromToolActivity(recentToolActivity) || noProgressBatchSignature,
+          reason: executeReadOnlyRecovery.reason,
+        };
+      }
+    }
+
     const approvedPlanCachedReadOnlyBatch =
       workflowMode === "plan" &&
       callbacks.getIsPlanApproved() &&
@@ -9423,6 +9665,62 @@ export async function executeAgentLoop(
           batches: planReadOnlyConvergenceBatches,
           tools: planReadOnlyConvergenceTools,
         });
+      } else if (workflowMode === "edit" && runtimeIntent === "execute" && pendingExecuteRecoveryPrompt) {
+        logAgentEvent("execute_no_progress_deferred_to_recovery", {
+          iteration,
+          repeats: noProgressBatchRepeatCount,
+          executeRecoveryMode,
+          executeRecoveryReason,
+        });
+      } else if (workflowMode === "edit" && runtimeIntent === "execute") {
+        const language = callbacks.getPreferredLanguage();
+        const repeatedTargets = pendingExecuteNoProgressPause?.repeatedTargets.length
+          ? pendingExecuteNoProgressPause.repeatedTargets
+          : summarizeRepeatedExecuteTargets(recentToolActivity.slice(-12));
+        const progressSignature =
+          pendingExecuteNoProgressPause?.progressSignature ||
+          buildPlanProgressSignatureFromToolActivity(recentToolActivity) ||
+          noProgressBatchSignature;
+        const pauseNotice = pendingExecuteNoProgressPause?.notice || buildExecuteNoProgressLoopPauseNotice({
+          language,
+          repeats: noProgressBatchRepeatCount,
+          remainingTask: language === "zh"
+            ? "先停止重复读取，改为写入、命令验证、浏览器验证，或说明真实阻塞。"
+            : "stop repeated reads and pivot to patch/write, command validation, browser validation, or the real blocker",
+          recentActivity: recentToolActivity,
+          repeatedTargets,
+        });
+        logAgentEvent("loop_stop", {
+          reason: "execute_no_progress_batch_loop",
+          iteration,
+          repeats: noProgressBatchRepeatCount,
+          repeatedTargets,
+          progressSignature: truncateForLog(progressSignature, 220),
+          recoveryReason: pendingExecuteNoProgressPause?.reason || "",
+        });
+        emitTaskOrchestratorPhase("PAUSED", {
+          reason: "execute_no_progress_batch_loop",
+          iteration,
+          repeats: noProgressBatchRepeatCount,
+          remainingTask: language === "zh"
+            ? "复用已读上下文，改为执行动作或说明真实阻塞。"
+            : "reuse read context, take action, or state the real blocker",
+          repeatedTargets,
+        });
+        callbacks.onNonActionableStop(
+          pauseNotice,
+          "no_action",
+          {
+            progressSignature,
+            repeatedTargets,
+            recoveryReason: "execute_no_progress_batch_loop",
+            nextStep: language === "zh"
+              ? "复用已读上下文，转向写入/命令/浏览器验证，或说明真实阻塞"
+              : "reuse cached context and pivot to patch/run/browser validation, or state the real blocker",
+          },
+        );
+        callbacks.onStatusChange("idle");
+        return;
       } else {
         const remainingText = remainingTaskForDigest?.text || (
           callbacks.getPreferredLanguage() === "zh"
@@ -9531,6 +9829,30 @@ export async function executeAgentLoop(
         role: "user",
         content: unityMcpFallbackPrompt,
       });
+    }
+    if (pendingExecuteRecoveryPrompt) {
+      callbacks.onStatusChange("running");
+      callbacks.appendMessage({
+        role: "user",
+        content: pendingExecuteRecoveryPrompt,
+      });
+      continue;
+    }
+    if (pendingExecuteNoProgressPause) {
+      callbacks.onNonActionableStop(
+        pendingExecuteNoProgressPause.notice,
+        "no_action",
+        {
+          progressSignature: pendingExecuteNoProgressPause.progressSignature,
+          repeatedTargets: pendingExecuteNoProgressPause.repeatedTargets,
+          recoveryReason: pendingExecuteNoProgressPause.reason,
+          nextStep: callbacks.getPreferredLanguage() === "zh"
+            ? "复用已读上下文，转向写入/命令/浏览器验证，或说明真实阻塞"
+            : "reuse cached context and pivot to patch/run/browser validation, or state the real blocker",
+        },
+      );
+      callbacks.onStatusChange("idle");
+      return;
     }
     if (pendingPlanRuntimeRecoveryPrompt) {
       callbacks.onStatusChange("running");
@@ -9824,7 +10146,14 @@ export async function executeAgentLoop(
         iteration,
         maxIterations: effectiveMaxIterations,
         recentToolActivity: recentToolActivity.length,
+        executeRecoveryMode,
       });
+      if (workflowMode === "edit" && runtimeIntent === "execute") {
+        activateExecuteRecovery("action_plus_targeting", "execute_convergence_prompt", {
+          maxIterations: effectiveMaxIterations,
+          recentToolActivity: recentToolActivity.length,
+        });
+      }
       callbacks.appendMessage({
         role: "user",
         content: buildExecuteConvergencePrompt(callbacks.getPreferredLanguage(), iteration, effectiveMaxIterations),
@@ -9891,14 +10220,19 @@ export async function executeAgentLoop(
       iteration: effectiveMaxIterations,
       autoResumeCount: checkpoint.autoResumeCount,
       recentToolActivity: checkpoint.recentToolActivity.length,
+      sawExecuteOperationEvidence,
+      executeRecoveryMode,
     });
-    callbacks.onStatusChange("idle");
     const handled = await callbacks.onExecuteMaxIterationsCheckpoint?.(checkpoint);
-    if (handled) return;
+    if (handled) {
+      callbacks.onStatusChange("idle");
+      return;
+    }
     callbacks.onNonActionableStop(
       buildExecuteMaxIterationsPauseNotice(checkpoint, callbacks.getPreferredLanguage()),
       "no_action",
     );
+    callbacks.onStatusChange("idle");
     return;
   }
 

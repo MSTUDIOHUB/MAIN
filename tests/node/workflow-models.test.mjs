@@ -850,6 +850,36 @@ test("runtime plan task derivation accepts Codex-style key changes", () => {
   assert.equal(tasks.some((task) => task.evidence?.some((item) => item.kind === "cmd" && item.value.includes("workflow-models"))), true);
 });
 
+test("runtime plan task derivation skips malformed markdown table rows", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([
+    {
+      kind: "plan",
+      path: ".MAIN/plans/plan.md",
+      title: "Plan",
+      updatedAt: 1,
+      content: [
+        "# 计划",
+        "",
+        "## 关键改动",
+        "- | 取舍点 | 选择 | 理由 |",
+        "- |--------|------|------|",
+        "- | 深色模式方案 | 使用 CSS 变量 + 主题切换 | 可维护性好，支持动态切换 |",
+        "- | 数据修复范围 | 先修复数据绑定，再优化 UI | 核心问题是数据不显示 |",
+        "- 更新 `src/store/dashboardStore.ts`，修复导入数据后的统计来源。",
+        "- 更新 `src/App.tsx`，补齐深色模式 token。",
+        "",
+        "## 测试方案",
+        "- 运行 `npm run build`。",
+      ].join("\n"),
+    },
+  ], { language: "zh" });
+
+  assert.equal(tasks.some((task) => /数据修复范围|深色模式方案|取舍点/.test(task.text)), false);
+  assert.equal(tasks.some((task) => task.evidence?.some((item) => item.kind === "file" && item.value === "src/store/dashboardStore.ts")), true);
+  assert.equal(tasks.some((task) => task.evidence?.some((item) => item.kind === "file" && item.value === "src/App.tsx")), true);
+  assert.equal(tasks.some((task) => task.evidence?.some((item) => item.kind === "cmd" && item.value.includes("npm run build"))), true);
+});
+
 test("runtime plan task derivation requires concrete evidence instead of synthetic tool fallback", () => {
   const tasks = deriveRuntimePlanTasksFromArtifacts([
     {

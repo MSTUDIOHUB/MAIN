@@ -9,6 +9,10 @@ import {
 import { normalizeTurnInputContextSignals, type TurnInputContextLike } from "./turnIntake";
 
 export type MaterializablePlanKind = "plan" | "design";
+export type PlanMaterializationSource =
+  | "visible_plan"
+  | "canonicalized_visible_plan"
+  | "deterministic_evidence";
 
 export interface PlanMaterializationResult {
   ok: boolean;
@@ -16,6 +20,7 @@ export interface PlanMaterializationResult {
   path?: string;
   content?: string;
   reason?: string;
+  source?: PlanMaterializationSource;
 }
 
 interface PlanMaterializationToolActivityLike {
@@ -62,6 +67,8 @@ const RAW_TOOL_RESULT_NOISE_RE =
   /\bREAD_FILE_RESULT\b|\bContextMemory(?:State)?\b|\bContextState\b|\breturnedLines\b|\btotalLines\b|\btotalChars\b|\bPLAN NOT READY\b|\bTASK_TARGETING_BLOCKED\b|\bstatus\s*[:=]\s*(?:failed|blocked|rejected)\b/i;
 const TOOL_META_FIELD_RE =
   /\b(?:status|hash|exit|tool_call_id|toolCallId|returnedLines|totalLines|totalChars|truncated)\s*[:=]\s*[^;\n,}]+/gi;
+const FORMAL_PLAN_OUTLINE_HEADING_RE =
+  /^(?:正式计划|修复计划|根因分析|原因分析|问题\s*[0-9一二三四五六七八九十]+|可能根因|根因|原因|修复方案|实施方案|落地方案|影响文件|相关文件|验证方式|验证标准|测试方案|公共\s*API|接口|类型|假设与默认值|默认假设|未验证假设|风险|注意事项|摘要|总结|Formal Plan|Repair Plan|Root Cause|Likely Root Cause|Issue\s*\d+|Fix Plan|Implementation Plan|Affected Files|Validation|Test Plan|Assumptions|Defaults)(?:\s*[：:].*)?$/i;
 const SEMANTIC_EVIDENCE_TOOLS = new Set([
   "analyze_tabular_document",
   "query_tabular_document",
@@ -105,8 +112,9 @@ const TOOL_LABELS_EN: Record<string, string> = {
 function countPlanShapeSignals(content: string): number {
   const headingCount = (content.match(/^#{1,3}\s+\S+/gm) || []).length;
   const bulletCount = (content.match(/^\s*(?:[-*]|\d+[.)、])\s+\S+/gm) || []).length;
-  const keywordCount = (content.match(/目标|约束|截图|附件|观察|已确认|事实|证据|发现|方案|计划|设计|执行|实施|步骤|接口|文件|数据流|控制流|风险|验证|验证标准|注意事项|边界|默认假设|未验证假设|后续增强|开放问题|Goal|Constraint|Screenshot|Attachment|Observation|Confirmed|Evidence|Finding|Approach|Plan|Design|Interface|File|Flow|Risk|Validation|Caveat|Boundary|Assumption|Default|Follow-up|Enhancement|Open question/gi) || []).length;
-  return headingCount + Math.min(bulletCount, 6) + Math.min(keywordCount, 8);
+  const outlineHeadingCount = countFormalPlanOutlineHeadings(content);
+  const keywordCount = (content.match(/目标|约束|截图|附件|观察|已确认|事实|证据|发现|根因|原因|问题|修复计划|修复方案|方案|计划|设计|执行|实施|步骤|接口|文件|数据流|控制流|风险|验证|验证标准|注意事项|边界|默认假设|未验证假设|后续增强|开放问题|Goal|Constraint|Screenshot|Attachment|Observation|Confirmed|Evidence|Finding|Root Cause|Issue|Approach|Plan|Design|Interface|File|Flow|Risk|Validation|Caveat|Boundary|Assumption|Default|Follow-up|Enhancement|Open question/gi) || []).length;
+  return headingCount + Math.min(outlineHeadingCount, 4) + Math.min(bulletCount, 6) + Math.min(keywordCount, 8);
 }
 
 function detectMaterializationLanguage(input: {
@@ -163,7 +171,9 @@ function stripPlanListMarker(line: string): string {
 }
 
 function cleanPlanItem(value: unknown, maxChars = 220): string {
-  const text = compactPlanLine(stripPlanListMarker(String(value ?? "")), maxChars);
+  const stripped = stripPlanListMarker(String(value ?? ""));
+  if (/^\s*-{3,}\s*$/.test(stripped)) return "";
+  const text = compactPlanLine(stripped, maxChars);
   if (!text) return "";
   if (/^(?:批准|取消|继续调整|开始调查|Approve|Cancel|Continue|Adjust)\b/i.test(text)) return "";
   return text;
@@ -463,17 +473,34 @@ interface ParsedPlanSection {
   body: string;
 }
 
+function matchPlanOutlineHeading(line: string): string {
+  const trimmed = String(line || "").trim();
+  if (!trimmed || trimmed.length > 120) return "";
+  if (/^\s*(?:[-*+]|\d+[.)、])\s+/.test(trimmed)) return "";
+  const colonDetail = trimmed.match(/^(.+?)[：:]\s*(.+)$/);
+  if (colonDetail && (colonDetail[2] || "").trim().length > 36) return "";
+  return FORMAL_PLAN_OUTLINE_HEADING_RE.test(trimmed) ? trimmed : "";
+}
+
+function countFormalPlanOutlineHeadings(content: string): number {
+  return String(content || "")
+    .split(/\r?\n/)
+    .filter((line) => matchPlanOutlineHeading(line))
+    .length;
+}
+
 function parsePlanSections(content: string): ParsedPlanSection[] {
   const sections: ParsedPlanSection[] = [];
   let title = "";
   let body: string[] = [];
   for (const line of String(content || "").split(/\r?\n/)) {
     const heading = line.match(/^\s*#{1,6}\s+(.+?)\s*$/);
-    if (heading) {
+    const outlineHeading = heading ? "" : matchPlanOutlineHeading(line);
+    if (heading || outlineHeading) {
       if (title || body.join("\n").trim()) {
         sections.push({ title, body: body.join("\n") });
       }
-      title = heading[1] || "";
+      title = heading?.[1] || outlineHeading;
       body = [];
     } else {
       body.push(line);
@@ -483,6 +510,19 @@ function parsePlanSections(content: string): ParsedPlanSection[] {
     sections.push({ title, body: body.join("\n") });
   }
   return sections;
+}
+
+function collectSectionTitles(
+  sections: ParsedPlanSection[],
+  patterns: RegExp[],
+  maxItems: number,
+): string[] {
+  return uniquePlanItems(
+    sections
+      .map((section) => section.title)
+      .filter((title) => patterns.some((pattern) => pattern.test(title))),
+    maxItems,
+  );
 }
 
 function collectLinesFromSections(
@@ -552,8 +592,46 @@ function buildProvidedContextObservation(input: {
     : "No screenshot or attachment was provided; the plan is based on the user goal and read evidence.";
 }
 
+function isMarkdownTableRowLine(line: string): boolean {
+  const text = String(line || "").trim();
+  return text.startsWith("|") && text.endsWith("|") && text.slice(1, -1).includes("|");
+}
+
+function isMarkdownTableSeparatorLine(line: string): boolean {
+  const text = String(line || "").trim();
+  if (!isMarkdownTableRowLine(text)) return false;
+  const cells = text
+    .slice(1, -1)
+    .split("|")
+    .map((cell) => cell.trim());
+  return cells.length >= 2 && cells.every((cell) => /^:?-{3,}:?$/.test(cell));
+}
+
 function formatCodexPlanSection(title: string, lines: string[]): string {
-  return [`## ${title}`, ...lines.map((line) => `- ${line}`)].join("\n");
+  const output = [`## ${title}`];
+  for (let index = 0; index < lines.length;) {
+    const line = lines[index];
+    if (!isMarkdownTableRowLine(line)) {
+      output.push(`- ${line}`);
+      index += 1;
+      continue;
+    }
+
+    const tableLines: string[] = [];
+    while (index < lines.length && isMarkdownTableRowLine(lines[index])) {
+      tableLines.push(lines[index].trim());
+      index += 1;
+    }
+
+    if (tableLines.length >= 2 && tableLines.some(isMarkdownTableSeparatorLine)) {
+      if (output.length > 1 && output[output.length - 1] !== "") output.push("");
+      output.push(...tableLines);
+      if (index < lines.length) output.push("");
+    } else {
+      output.push(...tableLines.map((tableLine) => `- ${tableLine}`));
+    }
+  }
+  return output.join("\n").replace(/\n{3,}/g, "\n\n");
 }
 
 function extractInlineCommands(values: string[], maxItems = 4): string[] {
@@ -693,8 +771,11 @@ export function canonicalizePlanArtifactContent(input: {
 
   const goalLines = uniquePlanItems([
     input.userGoal,
+    ...collectSectionTitles(sections, [
+      /(?:正式计划|修复计划|用户目标|目标|需求|问题|Goal|Objective|User Request|Problem|Issue)/i,
+    ], 3),
     ...collectLinesFromSections(sections, [
-      /(?:用户目标|目标|需求|问题|Goal|Objective|User Request|Problem)/i,
+      /(?:正式计划|修复计划|用户目标|目标|需求|问题|Goal|Objective|User Request|Problem|Issue)/i,
     ], 3),
     !/^(?:Plan|Proposed Plan|计划|计划草稿|修复方案)$/i.test(title) ? title : "",
   ], 3);
@@ -723,15 +804,20 @@ export function canonicalizePlanArtifactContent(input: {
       : "",
   ], 10);
 
-  const visibleFindingLines = collectLinesFromSections(sections, [
-    /(?:已确认|真实发现|当前发现|发现|调查摘要|分析|Investigation Summary|Analysis|Confirmed|Findings|Current State|Observation)/i,
+  const visibleFindingLines = uniquePlanItems([
+    ...collectSectionTitles(sections, [
+      /(?:已确认|真实发现|当前发现|发现|调查摘要|分析|根因|原因|问题|Investigation Summary|Analysis|Root Cause|Confirmed|Findings|Current State|Observation|Issue)/i,
+    ], 6),
+    ...collectLinesFromSections(sections, [
+      /(?:已确认|真实发现|当前发现|发现|调查摘要|分析|根因|原因|问题|Investigation Summary|Analysis|Root Cause|Confirmed|Findings|Current State|Observation|Issue)/i,
+    ], 8),
   ], 8);
   const hypothesisLines = uniquePlanItems([
     ...collectLinesFromSections(sections, [
-      /(?:未验证|假设|待确认|风险|注意|边界|Unverified|Hypotheses|Assumptions|Unknowns|Risks|Caveats)/i,
-    ], 6),
+      /(?:未验证|假设|待确认|可能|根因|原因|问题|风险|注意|边界|Unverified|Hypotheses|Assumptions|Unknowns|Risks|Caveats|Root Cause|Likely|Issue)/i,
+    ], 8),
     ...visibleFindingLines.filter(isSpeculativePlanLine),
-  ], 5);
+  ], 6);
   const fileLines = uniquePlanItems([
     ...(input.files || []),
     ...(input.recentToolActivity || []).map((activity) => activity.target || ""),
@@ -789,8 +875,11 @@ export function canonicalizePlanArtifactContent(input: {
       : "Default to preserving public APIs, interfaces, and types that are not explicitly named.",
   ], 6);
   const apiLines = collectLinesFromSections(sections, [
-    /(?:公共|接口|类型|API|Public|Interface|Types?)/i,
-  ], 4);
+    /(?:公共\s*API|接口(?:变化|变更)?|类型(?:变化|变更)?|API|Public|Interface|Types?)/i,
+  ], 4).filter((line) =>
+    /(?:无|不|保持|新增|修改|变化|变更|No|unchanged|changed|added|modified|preserved)/i.test(line) &&
+    !/`[^`]+\.(?:tsx?|jsx?|rs|py|go|json|md|css|scss|html)`/.test(line)
+  );
   const resolvedApiLines = apiLines.length > 0
     ? apiLines
     : [language === "zh"
@@ -961,6 +1050,7 @@ export function materializePlanArtifactFromVisibleText(input: {
   visibleText: string;
   planStage?: PlanStage | null;
   preferredKind?: MaterializablePlanKind | null;
+  sourceHint?: PlanMaterializationSource;
   userGoal?: string;
   evidence?: string[];
   files?: string[];
@@ -994,10 +1084,12 @@ export function materializePlanArtifactFromVisibleText(input: {
       kind,
       path: ".MAIN/plans/design.md",
       content,
+      source: input.sourceHint || "visible_plan",
     };
   }
 
   let content = normalizePlanContent(raw);
+  let source: PlanMaterializationSource = input.sourceHint || "visible_plan";
   if (countPlanShapeSignals(content) < 5) return { ok: false, reason: "not_structured" };
 
   let validation = validateActionablePlanArtifact(content);
@@ -1033,6 +1125,9 @@ export function materializePlanArtifactFromVisibleText(input: {
       if (canonicalValidation.ok) {
         content = canonical;
         validation = canonicalValidation;
+        source = input.sourceHint === "deterministic_evidence"
+          ? "deterministic_evidence"
+          : "canonicalized_visible_plan";
       }
     }
   }
@@ -1043,6 +1138,7 @@ export function materializePlanArtifactFromVisibleText(input: {
     kind,
     path: ".MAIN/plans/plan.md",
     content,
+    source,
   };
 }
 

@@ -1358,9 +1358,16 @@ function stripMarkdownTaskLine(line: string): string {
     .trim();
 }
 
+function isMarkdownTableSyntaxLine(line: string): boolean {
+  const text = stripMarkdownTaskLine(line);
+  if (!text.startsWith("|") || !text.endsWith("|")) return false;
+  return text.slice(1, -1).includes("|");
+}
+
 function isRuntimeTaskActionableText(text: string): boolean {
   const normalized = String(text || "");
   if (!normalized.trim()) return false;
+  if (isMarkdownTableSyntaxLine(normalized)) return false;
 
   const commands = extractShellCommandsFromText(normalized);
   if (commands.length > 0) return true;
@@ -1403,8 +1410,10 @@ function collectRuntimeTaskCandidateLines(content: string): string[] {
 
     if (inExcludedSection) continue;
     if (!/^\s*(?:[-*]\s+(?:\[[ xX]\]\s+)?|\d+[.)、:：-]\s+)/.test(line)) continue;
+    if (isMarkdownTableSyntaxLine(line)) continue;
     const text = stripMarkdownTaskLine(line);
     if (text.length < 8 || text.length > 220) continue;
+    if (isMarkdownTableSyntaxLine(text)) continue;
     if (RUNTIME_TASK_PLACEHOLDER_RE.test(text)) continue;
     if (/[:：]\s*$/.test(text)) continue;
     if (!isRuntimeTaskActionableText(text)) continue;
@@ -1431,6 +1440,7 @@ function stripRuntimeExcludedSections(content: string): string {
     if (!inExcludedSection) {
       if (/^\s*(?:[-*]\s+(?:\[[ xX]\]\s+)?|\d+[.)、:：-]\s+)/.test(line)) {
         const text = stripMarkdownTaskLine(line);
+        if (isMarkdownTableSyntaxLine(text)) continue;
         if (text && !isRuntimeTaskActionableText(text)) continue;
       }
       kept.push(line);
@@ -1457,6 +1467,7 @@ function collectPlanFileReferences(content: string): string[] {
 function makeRuntimeTask(text: string, language: "zh" | "en"): PlanTask | null {
   const clean = stripMarkdownTaskLine(text);
   if (!clean) return null;
+  if (isMarkdownTableSyntaxLine(clean)) return null;
 
   const parsedEvidence = parsePlanTaskEvidenceLabel(clean);
   const taskText = parsedEvidence.text || clean;

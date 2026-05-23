@@ -414,6 +414,64 @@ test("canonicalizes Gemma-like Proposed Plan with nonstandard section names", ()
   assert.match(result.content || "", /src\/components\/FileUploader\/DragUpload\.tsx/);
 });
 
+test("canonicalizes Chinese formal repair plan with likely root causes", () => {
+  const result = materializePlanArtifactFromVisibleText({
+    visibleText: [
+      "正式计划：修复计划：数据不显示 + 深色模式",
+      "",
+      "根因分析",
+      "问题 1：数据不显示",
+      "可能根因：CSV 数据已经被 useChartData 解析，但 dashboardStore 聚合指标时没有把最新 dataset 同步到概览状态。",
+      "",
+      "修复方案",
+      "- 修改 `src/store/dashboardStore.ts`，让导入后的 records 写入 dashboard 统计源，并保持空数据兜底。",
+      "- 检查 `src/hooks/useChartData.ts` 到 store 的数据流，避免组件只读取旧缓存。",
+      "",
+      "问题 2：深色模式",
+      "可能根因：`src/App.tsx` 只切换了基础 theme token，表格、卡片和图表区域仍使用浅色背景。",
+      "",
+      "修复方案",
+      "- 更新 `src/App.tsx` 的 dark token 与页面容器 class，补齐卡片、表格、筛选控件和图表容器的深色变量。",
+      "- 保持现有 ThemeType 和 localStorage key 不变。",
+      "| 取舍点 | 选择 | 理由 |",
+      "|--------|------|------|",
+      "| 深色模式方案 | 使用 CSS 变量 + 主题切换 | 可维护性好，支持动态切换 |",
+      "| 数据修复范围 | 先修复数据绑定，再优化 UI | 核心问题是数据不显示 |",
+      "---",
+      "",
+      "影响文件",
+      "- `src/store/dashboardStore.ts`",
+      "- `src/hooks/useChartData.ts`",
+      "- `src/App.tsx`",
+      "",
+      "验证方式",
+      "- 运行 `npm run build`。",
+      "- 导入示例 CSV，确认概览指标、图表和表格数据显示。",
+      "- 切换 light/dark 模式，确认深色模式下文字、背景和边框对比正常。",
+    ].join("\n"),
+    userGoal: "修复数据不显示和深色模式问题。",
+    evidence: [
+      "read_file src/store/dashboardStore.ts; excerpt=dashboard store aggregates imported rows into overview metrics",
+      "read_file src/hooks/useChartData.ts; excerpt=hook prepares chart data from imported records",
+      "grep_search src/App.tsx; excerpt=type ThemeType = 'light' | 'dark'",
+    ],
+    files: ["src/store/dashboardStore.ts", "src/hooks/useChartData.ts", "src/App.tsx"],
+    language: "zh",
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.path, ".MAIN/plans/plan.md");
+  assert.equal(result.source, "canonicalized_visible_plan");
+  assert.match(result.content || "", /^# 计划/);
+  assert.match(result.content || "", /## 假设与默认值/);
+  assert.match(result.content || "", /可能根因/);
+  assert.match(result.content || "", /src\/store\/dashboardStore\.ts/);
+  assert.match(result.content || "", /\n\| 取舍点 \| 选择 \| 理由 \|/);
+  assert.doesNotMatch(result.content || "", /- \| 取舍点/);
+  assert.doesNotMatch(result.content || "", /- ---/);
+  assert.doesNotMatch(result.content || "", /最小源码变更|最小可用闭环/);
+});
+
 test("canonicalizes missing confirmed facts from the evidence ledger", () => {
   const result = materializePlanArtifactFromVisibleText({
     visibleText: [

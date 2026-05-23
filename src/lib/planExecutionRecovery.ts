@@ -599,11 +599,11 @@ export function buildExecuteMaxIterationsAutoResumeNotice(
   return language === "zh"
     ? [
         `执行达到 ${checkpoint.maxIterations} 轮安全边界，MAIN 已保存恢复点并自动开启 1 次恢复上下文。`,
-        "接下来会先基于当前 workspace 状态收束，避免重复同一批工具操作。",
+        "接下来会复用检查点与压缩记忆，并临时收窄工具面，避免重复同一批读取操作。",
       ].join("\n")
     : [
         `Execution reached the ${checkpoint.maxIterations}-iteration safety boundary. MAIN saved a recovery checkpoint and will auto-resume once in a fresh context.`,
-        "The recovery context will first reconcile current workspace state to avoid repeating the same tool chain.",
+        "The recovery context will reuse the checkpoint plus compact memory and temporarily narrow tools to avoid repeating the same reads.",
       ].join("\n");
 }
 
@@ -628,7 +628,7 @@ export function buildExecuteMaxIterationsPauseNotice(
       "- blockers:",
       ...(blockerLines.length ? blockerLines : ["- 命中执行安全轮次上限"]),
       "",
-      "下一步：点击或发送 Resume Execution / 继续执行，MAIN 会开启新的恢复上下文，先核查当前状态，再只执行最小必要的后续工具调用。",
+      "下一步：点击或发送 Resume Execution / 继续执行，MAIN 会开启新的恢复上下文，复用检查点并收窄只读工具，只执行最小必要的后续动作。",
     ].filter(Boolean).join("\n");
   }
 
@@ -645,7 +645,7 @@ export function buildExecuteMaxIterationsPauseNotice(
     "- blockers:",
     ...(blockerLines.length ? blockerLines : ["- Hit the execution iteration safety limit"]),
     "",
-    "Next: click or send Resume Execution so MAIN starts a fresh recovery context, checks current state first, and runs only the minimum necessary next tool call.",
+    "Next: click or send Resume Execution so MAIN starts a fresh recovery context, reuses the checkpoint, narrows read-only tools, and runs only the minimum necessary next action.",
   ].filter(Boolean).join("\n");
 }
 
@@ -660,8 +660,9 @@ export function buildExecuteMaxIterationsResumePrompt(input: {
   if (input.language === "zh") {
     return [
       "请在新的恢复上下文中继续上一轮执行任务。这是 MAIN 在普通 Execute 25 轮安全边界后的自动恢复，只允许继续真实未完成工作。",
-      "先核查当前 workspace 状态和最近工具结果；如果任务已经完成，直接输出最终总结并停止，不要再调用工具。",
-      "如果仍需工具，只选择一个最小必要的下一步工具调用；不要重复读取或重复执行最近已经有结果的同一批操作。",
+      "复用下面的检查点、最近工具结果和压缩记忆；如果任务已经完成，直接输出最终总结并停止，不要再调用工具。",
+      "如果仍需工具，只选择一个最小必要的下一步动作：写入/替换、运行有限命令、浏览器验证，或说明精确阻塞。不要重复读取最近已有结果的同一批文件。",
+      "MAIN 会临时收窄宽泛读取工具；只有 patch mismatch 需要精确当前内容时才做一次定向读取。",
       "",
       "Checkpoint:",
       `- iterationBoundary: ${input.checkpoint.iterationCount}/${input.checkpoint.maxIterations}`,
@@ -674,8 +675,9 @@ export function buildExecuteMaxIterationsResumePrompt(input: {
 
   return [
     "Continue the previous execute task in a fresh recovery context. This is MAIN's automatic recovery after the normal Execute 25-iteration safety boundary; only continue real unfinished work.",
-    "First reconcile current workspace state and recent tool results. If the task is complete, output the final summary and stop without more tools.",
-    "If another tool is still needed, choose exactly one smallest necessary next tool call. Do not repeat the same reads or commands that already have results.",
+    "Reuse the checkpoint, recent tool results, and compact memory below. If the task is complete, output the final summary and stop without more tools.",
+    "If another tool is still needed, choose exactly one smallest necessary action: patch/write, run a finite command, use browser validation, or state the exact blocker. Do not repeat the same reads that already have results.",
+    "MAIN will temporarily narrow broad read tools; do a targeted file read only when a patch mismatch requires exact current content.",
     "",
     "Checkpoint:",
     `- iterationBoundary: ${input.checkpoint.iterationCount}/${input.checkpoint.maxIterations}`,

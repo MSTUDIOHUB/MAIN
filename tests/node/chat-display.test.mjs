@@ -121,6 +121,36 @@ test("markdown table copies as tsv without separator rows", () => {
   assert.equal(tsv, "文件\t状态\nsrc/App.tsx\t已读\na|b\tdone");
 });
 
+test("markdown display preserves regular GFM tables for PlanPanel rendering", () => {
+  const normalized = normalizeMarkdownForDisplay([
+    "## 验证矩阵",
+    "",
+    "| 模式 | 期望 |",
+    "| --- | --- |",
+    "| dark | 表格文字可见 |",
+    "| light | 表格边框可见 |",
+  ].join("\n"));
+
+  assert.match(normalized, /\| 模式 \| 期望 \|/);
+  assert.match(normalized, /\| dark \| 表格文字可见 \|/);
+  assert.doesNotMatch(normalized, /- \| 模式/);
+});
+
+test("markdown display repairs bullet-prefixed GFM tables", () => {
+  const normalized = normalizeMarkdownForDisplay([
+    "## 关键改动",
+    "- | 取舍点 | 选择 | 理由 |",
+    "- |--------|------|------|",
+    "- | 深色模式方案 | 使用 CSS 变量 + 主题切换 | 可维护性好 |",
+    "- 普通列表项保留为列表。",
+  ].join("\n"));
+
+  assert.match(normalized, /\n\| 取舍点 \| 选择 \| 理由 \|/);
+  assert.match(normalized, /\n\|--------\|------\|------\|/);
+  assert.doesNotMatch(normalized, /- \| 取舍点/);
+  assert.match(normalized, /- 普通列表项保留为列表。/);
+});
+
 test("sanitize output removes raw protocols and complete reasoning blocks", () => {
   const raw = [
     "可见正文",

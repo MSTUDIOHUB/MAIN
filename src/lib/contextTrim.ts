@@ -1000,6 +1000,15 @@ export interface ManageContextOptions {
   now?: number;
 }
 
+export interface ExecuteRecoveryContextCompactOptions extends ManageContextOptions {
+  maxMessages?: number;
+  maxToolResultMessages?: number;
+  maxToolChars?: number;
+  maxToolCallGroups?: number;
+  maxToolResultTokens?: number;
+  latestUserMessages?: number;
+}
+
 /**
  * Full context management pipeline.
  * Applies compaction then trimming, matching claude-code-haha's layered approach:
@@ -1112,6 +1121,256 @@ export function manageContext(
     memoryState,
     memoryPacket,
     microCompactionKind,
+    microCompactedCount,
+  };
+}
+
+function getToolCallIdsFromMessage(message: TrimMessage): string[] {
+  if (message.role !== "assistant" || !Array.isArray(message.tool_calls)) return [];
+  return message.tool_calls
+    .map((toolCall) => {
+      const candidate = toolCall as { id?: unknown };
+      return typeof candidate.id === "string" ? candidate.id : "";
+    })
+    .filter(Boolean);
+}
+
+function sumToolContentChars(messages: TrimMessage[], indices: Iterable<number>): number {
+  let total = 0;
+  for (const index of indices) {
+    const message = messages[index];
+    if (message?.role !== "tool" || typeof message.content !== "string") continue;
+    total += message.content.length;
+  }
+  return total;
+}
+
+function collectRecentCompleteToolGroupIndices(input: {
+  messages: TrimMessage[];
+  maxGroups: number;
+  maxToolResults: number;
+  maxToolChars: number;
+}): Set<number> {
+  const groups: Array<{ indices: number[]; toolCount: number; toolChars: number; lastIndex: number }> = [];
+
+  for (let index = 0; index < input.messages.length; index += 1) {
+    const message = input.messages[index];
+    const toolCallIds = getToolCallIdsFromMessage(message);
+    if (toolCallIds.length === 0) continue;
+
+    const expected = new Set(toolCallIds);
+    const groupIndices = [index];
+    let toolCount = 0;
+    let toolChars = 0;
+    let lastIndex = index;
+    for (let scan = index + 1; scan < input.messages.length; scan += 1) {
+      const candidate = input.messages[scan];
+      if (!candidate) continue;
+      if (candidate.role === "assistant" && getToolCallIdsFromMessage(candidate).length > 0) break;
+      if (candidate.role !== "tool" || !candidate.tool_call_id || !expected.has(candidate.tool_call_id)) continue;
+      groupIndices.push(scan);
+      toolCount += 1;
+      toolChars += typeof candidate.content === "string" ? candidate.content.length : 0;
+      lastIndex = scan;
+    }
+
+    if (toolCount === 0) continue;
+    groups.push({ indices: groupIndices, toolCount, toolChars, lastIndex });
+  }
+
+  const keep = new Set<number>();
+  let keptGroups = 0;
+  let keptToolResults = 0;
+  let keptToolChars = 0;
+  for (const group of groups.sort((a, b) => b.lastIndex - a.lastIndex)) {
+    if (keptGroups >= input.maxGroups) break;
+    const wouldExceedResults = keptToolResults + group.toolCount > input.maxToolResults;
+    const wouldExceedChars = keptToolChars + group.toolChars > input.maxToolChars;
+    if (keptGroups > 0 && (wouldExceedResults || wouldExceedChars)) continue;
+    for (const index of group.indices) keep.add(index);
+    keptGroups += 1;
+    keptToolResults += group.toolCount;
+    keptToolChars += group.toolChars;
+  }
+
+  return keep;
+}
+
+function collectLatestUserMessageIndices(messages: TrimMessage[], maxItems: number): Set<number> {
+  const keep = new Set<number>();
+  for (let index = messages.length - 1; index >= 0 && keep.size < maxItems; index -= 1) {
+    const message = messages[index];
+    if (message?.role !== "user" || isContextMemoryMessage(message)) continue;
+    keep.add(index);
+  }
+  return keep;
+}
+
+function trimKeptIndicesToMessageLimit(indices: Set<number>, messages: TrimMessage[], maxMessages: number): Set<number> {
+  if (indices.size <= maxMessages) return indices;
+  const systemIndices = [...indices].filter((index) => messages[index]?.role === "system");
+  const userIndices = [...indices].filter((index) => messages[index]?.role === "user").sort((a, b) => b - a);
+  const remaining = [...indices]
+    .filter((index) => messages[index]?.role !== "system" && messages[index]?.role !== "user")
+    .sort((a, b) => b - a);
+  const next = new Set<number>();
+  for (const index of systemIndices) next.add(index);
+  for (const index of userIndices) {
+    if (next.size >= maxMessages) break;
+    next.add(index);
+  }
+  for (const index of remaining) {
+    if (next.size >= maxMessages) break;
+    next.add(index);
+  }
+  return next;
+}
+
+function normalizeKeptToolPairs(indices: Set<number>, messages: TrimMessage[]): Set<number> {
+  const next = new Set(indices);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const index of [...next]) {
+      const message = messages[index];
+      if (!message) {
+        next.delete(index);
+        changed = true;
+        continue;
+      }
+      if (message.role === "assistant") {
+        const ids = getToolCallIdsFromMessage(message);
+        if (ids.length === 0) continue;
+        const hasAllResults = ids.every((id) =>
+          [...next].some((candidateIndex) => {
+            const candidate = messages[candidateIndex];
+            return candidate?.role === "tool" && candidate.tool_call_id === id;
+          })
+        );
+        if (hasAllResults) continue;
+        next.delete(index);
+        for (const candidateIndex of [...next]) {
+          const candidate = messages[candidateIndex];
+          if (candidate?.role === "tool" && candidate.tool_call_id && ids.includes(candidate.tool_call_id)) {
+            next.delete(candidateIndex);
+          }
+        }
+        changed = true;
+        continue;
+      }
+      if (message.role === "tool" && message.tool_call_id) {
+        const hasParent = [...next].some((candidateIndex) =>
+          getToolCallIdsFromMessage(messages[candidateIndex]).includes(message.tool_call_id || "")
+        );
+        if (!hasParent) {
+          next.delete(index);
+          changed = true;
+        }
+      }
+    }
+  }
+  return next;
+}
+
+export function compactContextForExecuteRecovery(
+  messages: TrimMessage[],
+  options: ExecuteRecoveryContextCompactOptions = {},
+): ManageContextResult {
+  const maxMessages = Math.max(8, options.maxMessages ?? 36);
+  const maxToolResultMessages = Math.max(1, options.maxToolResultMessages ?? 12);
+  const maxToolChars = Math.max(1000, options.maxToolChars ?? 12_000);
+  const maxToolCallGroups = Math.max(1, options.maxToolCallGroups ?? 6);
+  const latestUserMessages = Math.max(1, options.latestUserMessages ?? 2);
+  const maxToolResultTokens = Math.max(120, options.maxToolResultTokens ?? 360);
+
+  const memoryState = buildContextMemoryState(messages, {
+    previous: options.previousMemoryState,
+    turnId: options.turnId,
+    now: options.now,
+  });
+  const memoryPacket = formatContextMemoryPacket(memoryState);
+  const withoutMemory = messages.filter((message) => !isContextMemoryMessage(message));
+  const compacted = compactToolResults(withoutMemory, maxToolResultTokens);
+  const tokenCountBefore = estimateMessagesTokens(messages);
+  const tokenBreakdownBefore = computeContextTokenBreakdown(messages);
+
+  const keepIndices = new Set<number>();
+  if (compacted[0]?.role === "system") keepIndices.add(0);
+  for (const index of collectLatestUserMessageIndices(compacted, latestUserMessages)) keepIndices.add(index);
+  for (const index of collectRecentCompleteToolGroupIndices({
+    messages: compacted,
+    maxGroups: maxToolCallGroups,
+    maxToolResults: maxToolResultMessages,
+    maxToolChars,
+  })) {
+    keepIndices.add(index);
+  }
+
+  let boundedKeepIndices = normalizeKeptToolPairs(
+    trimKeptIndicesToMessageLimit(keepIndices, compacted, Math.max(1, maxMessages - 1)),
+    compacted,
+  );
+  while (sumToolContentChars(compacted, boundedKeepIndices) > maxToolChars && boundedKeepIndices.size > 1) {
+    const oldestToolIndex = [...boundedKeepIndices]
+      .filter((index) => compacted[index]?.role === "tool")
+      .sort((a, b) => a - b)[0];
+    if (oldestToolIndex == null) break;
+    const toolCallId = compacted[oldestToolIndex]?.tool_call_id;
+    boundedKeepIndices.delete(oldestToolIndex);
+    if (toolCallId) {
+      for (const index of [...boundedKeepIndices]) {
+        const ids = getToolCallIdsFromMessage(compacted[index]);
+        if (ids.includes(toolCallId)) boundedKeepIndices.delete(index);
+      }
+    }
+    boundedKeepIndices = normalizeKeptToolPairs(boundedKeepIndices, compacted);
+  }
+
+  const keptMessages = [...boundedKeepIndices]
+    .sort((a, b) => a - b)
+    .map((index) => compacted[index])
+    .filter(Boolean);
+  const withMemory = injectContextMemoryMessage(keptMessages as TrimMessage[], memoryState) as TrimMessage[];
+  const finalMessages = withMemory.length > maxMessages
+    ? trimMessagesToContextDetailed(withMemory, estimateMessagesTokens(withMemory), 0).messages.slice(0, maxMessages)
+    : withMemory;
+
+  const tokenCountAfter = estimateMessagesTokens(finalMessages);
+  const tokenBreakdownAfter = computeContextTokenBreakdown(finalMessages);
+  const droppedMessageCount = Math.max(0, messages.length - finalMessages.length);
+  const toolCharsAfter = sumToolContentChars(finalMessages, finalMessages.map((_message, index) => index));
+  const displaySummary = [
+    `Execute recovery context compacted: kept ${finalMessages.length}/${messages.length} messages.`,
+    `Tool results retained: ${finalMessages.filter((message) => message.role === "tool").length}; tool chars retained: ${toolCharsAfter.toLocaleString()}.`,
+    "Older transcript is represented by ContextState memory to prevent read-loop replay.",
+  ].join("\n");
+
+  let microCompactedCount = 0;
+  for (let index = 0; index < Math.min(withoutMemory.length, compacted.length); index += 1) {
+    const before = withoutMemory[index];
+    const after = compacted[index];
+    if (before?.role === "tool" && after?.role === "tool" && typeof before.content === "string" && typeof after.content === "string" && before.content !== after.content) {
+      microCompactedCount += 1;
+    }
+  }
+
+  return {
+    messages: finalMessages,
+    droppedCount: droppedMessageCount,
+    droppedMessageCount,
+    changed: !messagesEqual(messages, finalMessages),
+    tokenCountBefore,
+    tokenCountAfter,
+    tokenReduction: Math.max(0, tokenCountBefore - tokenCountAfter),
+    tokenBreakdownBefore,
+    tokenBreakdownAfter,
+    retainedTokenBreakdown: tokenBreakdownAfter,
+    budgets: computeContextBudgets(Math.max(tokenCountBefore, tokenCountAfter), 0),
+    compressedContext: displaySummary,
+    displaySummary,
+    memoryState,
+    memoryPacket,
+    microCompactionKind: microCompactedCount > 0 ? "tool_results" : "none",
     microCompactedCount,
   };
 }

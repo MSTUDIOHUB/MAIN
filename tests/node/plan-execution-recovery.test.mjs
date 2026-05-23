@@ -70,6 +70,12 @@ const {
   summarizeRepeatedPlanTargetsFromToolActivity,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planExecutionRecovery.ts"));
 
+const {
+  describeApprovedPlanRecoveryToolSurface,
+  isApprovedPlanRecoveryToolName,
+  shouldAllowApprovedPlanRecoveryFileRead,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/approvedPlanRecoveryTools.ts"));
+
 const tasks = [
   {
     id: "1",
@@ -312,6 +318,85 @@ test("approved plan strategy switch continues the agent loop after recovery prom
     orchestratorSource,
     /if\s*\(\s*approvedPlanNoProgressDecision\s*\)\s*{[\s\S]*?approvedPlanNoProgressDecision\.action\s*===\s*"recover"[\s\S]*?continueApprovedPlanWithStrategySwitch\(approvedPlanNoProgressDecision\);\s*continue;/,
   );
+});
+
+test("approved plan no-progress recovery narrows cached reads but keeps patch recovery", () => {
+  const orchestratorSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator.ts"),
+    "utf8",
+  );
+  const readOnlyTools = new Set([
+    "get_project_skeleton",
+    "list_directory",
+    "glob_search",
+    "grep_search",
+    "read_file",
+    "get_file_outline",
+    "read_pty_buffer",
+    "get_pty_status",
+  ]);
+  const fullToolNames = [
+    "list_directory",
+    "glob_search",
+    "grep_search",
+    "read_file",
+    "replace_in_file",
+    "write_file",
+    "run_command",
+    "browser_evaluate",
+    "get_file_outline",
+    "get_pty_status",
+  ];
+
+  const cachedReadRecoveryTools = fullToolNames.filter((name) =>
+    isApprovedPlanRecoveryToolName(name, readOnlyTools, { allowFileRead: false })
+  );
+  const patchRecoveryTools = fullToolNames.filter((name) =>
+    isApprovedPlanRecoveryToolName(name, readOnlyTools, { allowFileRead: true })
+  );
+
+  assert.deepEqual(cachedReadRecoveryTools, [
+    "grep_search",
+    "replace_in_file",
+    "write_file",
+    "run_command",
+    "browser_evaluate",
+    "get_file_outline",
+    "get_pty_status",
+  ]);
+  assert.equal(patchRecoveryTools.includes("read_file"), true);
+  assert.equal(patchRecoveryTools.includes("list_directory"), false);
+  assert.equal(
+    shouldAllowApprovedPlanRecoveryFileRead([
+      { name: "read_file", target: "src/App.tsx", status: "succeeded", detail: "FILE_UNCHANGED_STUB" },
+    ]),
+    false,
+  );
+  assert.equal(
+    shouldAllowApprovedPlanRecoveryFileRead([
+      { name: "replace_in_file", target: "src/App.tsx", status: "failed", detail: "search_text 与文件内容不一致，未执行写入。" },
+    ]),
+    true,
+  );
+  assert.equal(
+    shouldAllowApprovedPlanRecoveryFileRead([
+      { name: "replace_in_file", target: "src/App.tsx", status: "failed", detail: "search_text 与文件内容不一致，未执行写入。" },
+      { name: "read_file", target: "src/App.tsx", status: "succeeded", detail: "READ_FILE_RESULT" },
+    ]),
+    false,
+  );
+  assert.equal(describeApprovedPlanRecoveryToolSurface(false), "action_plus_targeting_reads");
+  assert.equal(describeApprovedPlanRecoveryToolSurface(true), "action_plus_patch_file_read");
+  assert.match(
+    orchestratorSource,
+    /recoveryIterationAllTools\.filter\(\(tool\)\s*=>\s*isApprovedPlanRecoveryTool\(tool,[\s\S]*allowFileRead: allowApprovedPlanRecoveryFileRead/,
+  );
+  assert.doesNotMatch(
+    orchestratorSource,
+    /rawIterationAllTools\.filter\(isApprovedPlanActionTool\)/,
+  );
+  assert.match(orchestratorSource, /read_file` is withheld/);
+  assert.match(orchestratorSource, /failed `replace_in_file`/);
 });
 
 test("plan progress snapshot carries no-progress recovery metadata", () => {
