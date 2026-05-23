@@ -7,6 +7,7 @@ export interface ApprovedPlanRecoveryActivityLike {
 export const APPROVED_PLAN_RECOVERY_TARGETING_TOOLS = new Set([
   "grep_search",
   "get_file_outline",
+  "read_file",
   "read_pty_buffer",
   "read_pty_tail",
   "read_pty_since",

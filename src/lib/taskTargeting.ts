@@ -81,6 +81,7 @@ export interface TaskTargetingToolGateInput {
   target?: string;
   availableToolNames?: Set<string>;
   language?: "zh" | "en";
+  allowApprovedPlanDesignWrite?: boolean;
 }
 
 export interface TaskTargetingToolGateResult {
@@ -470,7 +471,8 @@ export function shouldBlockToolCallForTargeting(input: TaskTargetingToolGateInpu
     target &&
     isUiSourcePath(target) &&
     input.profile.requiresDesignProtocol &&
-    !input.profile.designProtocolSatisfied
+    !input.profile.designProtocolSatisfied &&
+    !input.allowApprovedPlanDesignWrite
   ) {
     return {
       blocked: true,

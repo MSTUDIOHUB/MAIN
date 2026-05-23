@@ -107,6 +107,7 @@ test("execute recovery tool surface removes broad reads but keeps action and tar
 
   assert.deepEqual(scoped, [
     "grep_search",
+    "read_file",
     "get_file_outline",
     "replace_in_file",
     "write_file",
@@ -169,7 +170,7 @@ test("read-only budget triggers execute recovery before max iterations", () => {
     repeatedTargets: summarizeRepeatedExecuteTargets(recent),
     recentActivity: recent,
   });
-  assert.match(prompt, /宽泛读取工具已临时收起/);
+  assert.match(prompt, /定向 `read_file`、`grep_search` 和 outline 仍可用/);
   assert.match(prompt, /write_file|replace_in_file/);
 });
 

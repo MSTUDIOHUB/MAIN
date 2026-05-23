@@ -320,7 +320,7 @@ test("approved plan strategy switch continues the agent loop after recovery prom
   );
 });
 
-test("approved plan no-progress recovery narrows cached reads but keeps patch recovery", () => {
+test("approved plan no-progress recovery keeps targeted reads without broad discovery", () => {
   const orchestratorSource = fsSync.readFileSync(
     path.join(workspaceRoot, "src/lib/orchestrator.ts"),
     "utf8",
@@ -357,6 +357,7 @@ test("approved plan no-progress recovery narrows cached reads but keeps patch re
 
   assert.deepEqual(cachedReadRecoveryTools, [
     "grep_search",
+    "read_file",
     "replace_in_file",
     "write_file",
     "run_command",
@@ -395,8 +396,8 @@ test("approved plan no-progress recovery narrows cached reads but keeps patch re
     orchestratorSource,
     /rawIterationAllTools\.filter\(isApprovedPlanActionTool\)/,
   );
-  assert.match(orchestratorSource, /read_file` is withheld/);
-  assert.match(orchestratorSource, /failed `replace_in_file`/);
+  assert.match(orchestratorSource, /targeted `read_file`/);
+  assert.match(orchestratorSource, /exact current content/);
 });
 
 test("plan progress snapshot carries no-progress recovery metadata", () => {

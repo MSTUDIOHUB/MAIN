@@ -894,6 +894,30 @@ test("runtime plan task derivation requires concrete evidence instead of synthet
   assert.deepEqual(tasks, []);
 });
 
+test("runtime plan task derivation does not create generic tasks from file references only", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([
+    {
+      kind: "plan",
+      path: ".MAIN/plans/plan.md",
+      title: "Plan",
+      updatedAt: 1,
+      content: [
+        "# 计划",
+        "",
+        "## 摘要",
+        "- 用户目标：修复 CSV 导入。",
+        "- 定向证据已覆盖：`src/hooks/useCsvParser.ts`、`cn_tutorial_orders_by_creator_20260512.csv`。",
+        "",
+        "## 已读证据",
+        "- `src/hooks/useCsvParser.ts` 负责解析。",
+        "- `cn_tutorial_orders_by_creator_20260512.csv` 是样例数据。",
+      ].join("\n"),
+    },
+  ], { language: "zh" });
+
+  assert.deepEqual(tasks, []);
+});
+
 test("generic workspace_write and project_change evidence do not complete unrelated tasks", () => {
   const parsed = [
     {
@@ -1168,6 +1192,27 @@ test("validateActionablePlanArtifact rejects generic fallback design", () => {
   ].join("\n");
 
   assert.equal(validateActionablePlanArtifact(generic).ok, false);
+});
+
+test("validateActionablePlanArtifact rejects empty goals and approved-goal filler", () => {
+  const bad = [
+    "# 计划",
+    "## 摘要",
+    "- 用户目标：",
+    "- 定向证据已覆盖：`src/hooks/useCsvParser.ts`。",
+    "## 关键改动",
+    "- 更新 `src/hooks/useCsvParser.ts` 以落实已批准目标；依据证据：read_file src/hooks/useCsvParser.ts。",
+    "## 公共 API / 接口 / 类型",
+    "- 无公共 API、接口或类型变化。",
+    "## 测试方案",
+    "- 运行 `npm run build`。",
+    "## 假设与默认值",
+    "- 默认保持未点名接口不变。",
+  ].join("\n");
+
+  const result = validateActionablePlanArtifact(bad);
+  assert.equal(result.ok, false);
+  assert.match(result.reason || "", /empty_user_goal|generic_approved_goal_plan/);
 });
 
 test("validatePlanArtifactContent accepts real requirements and plan artifacts", () => {

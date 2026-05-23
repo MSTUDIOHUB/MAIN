@@ -55,10 +55,18 @@ const XML_TAG_ONLY_RE =
 const RAW_TOOL_BLOCK_RE =
   /<(?:tool_call|function_call)(?:\s[^>]*)?>[\s\S]*?<\/(?:tool_call|function_call)>/gi;
 
+const PROPOSED_PLAN_TAG_RE = /<\/?proposed_plan(?:\s[^>]*)?>/gi;
+const PROPOSAL_MARKER_LINE_RE =
+  /^\s*\[\s*(?:PROPOSAL(?:[_\s-]*(?:START|BEGIN|END|STOP))?|START[_\s-]*PROPOSAL|END[_\s-]*PROPOSAL)\s*\]?\s*$/i;
+const USER_OPTIONS_TAG_LINE_RE = /^\s*<\/?\s*user_options\b[^>]*>?\s*$/i;
+const OPTION_TAG_LINE_RE = /^\s*<\/?\s*option\b[^>]*>?\s*$/i;
+
 const RESIDUAL_TOOL_LINE_RE =
   new RegExp(`^\\s*</?(?:tool(?:[_\\s-]?(?:call|use))?|function(?:[_\\s-]?call)?|parameter|name|get_project_skeleton|get_file_outline|list_directory|read_file|read_document|analyze_tabular_document|query_tabular_document|index_workspace_documents|glob_search|grep_search|replace_in_file|write_file|execute_command|send_pty_input|run_command|browser_evaluate|read_pty_buffer|read_pty_tail|read_pty_since|get_pty_status|clear_pty_buffer)\\b[^>]*>?[\\s|]*$`, "i");
 const RESIDUAL_PARAMETER_FRAGMENT_LINE_RE =
   /^\s*(?:<\/?parameter(?:\s+name=|[a-z0-9_ -]*["']?\s*>?)|parameter\s+name=)/i;
+const RESIDUAL_BARE_TOOL_CALL_LINE_RE =
+  new RegExp(`^\\s*(?:${TOOL_TAG_NAME_SOURCE})(?:\\s*\\(|\\s+(?:\\{|["']|[a-z_][a-z0-9_]*\\s*=|[A-Za-z0-9_.@-]+[\\\\/][^\\s]+)).*$`, "i");
 
 const RESIDUAL_SYMBOL_ONLY_RE = /^[|>]+$/;
 const SPECIAL_STOP_TOKEN_LINE_RE =
@@ -81,6 +89,83 @@ export interface ExtractedToolCall {
 export function stripPlanBlocks(text: string): string {
   if (!text) return "";
   return text.replace(/<(?:plan|jobList)>[\s\S]*?<\/(?:plan|jobList)>/gi, "");
+}
+
+function stripXmlProtocolBlock(text: string, tag: string): string {
+  if (!text) return "";
+
+  const lower = text.toLowerCase();
+  const openPrefix = `<${tag.toLowerCase()}`;
+  const closeToken = `</${tag.toLowerCase()}>`;
+  let result = "";
+  let i = 0;
+
+  while (i < text.length) {
+    const openIdx = lower.indexOf(openPrefix, i);
+    if (openIdx === -1) {
+      result += text.slice(i);
+      break;
+    }
+
+    const nextChar = lower[openIdx + openPrefix.length] || "";
+    if (/[a-z0-9_-]/i.test(nextChar)) {
+      result += text.slice(i, openIdx + openPrefix.length);
+      i = openIdx + openPrefix.length;
+      continue;
+    }
+
+    const lineStart = Math.max(text.lastIndexOf("\n", openIdx - 1) + 1, 0);
+    if (text.slice(lineStart, openIdx).trim() !== "") {
+      result += text.slice(i, openIdx + openPrefix.length);
+      i = openIdx + openPrefix.length;
+      continue;
+    }
+
+    result += text.slice(i, openIdx);
+    const openEnd = text.indexOf(">", openIdx);
+    if (openEnd === -1) {
+      break;
+    }
+
+    const closeIdx = lower.indexOf(closeToken, openEnd + 1);
+    if (closeIdx === -1) {
+      break;
+    }
+
+    i = closeIdx + closeToken.length;
+  }
+
+  return result;
+}
+
+export function stripUserOptionsProtocol(text: string): string {
+  if (!text) return "";
+
+  let out = stripXmlProtocolBlock(text, "user_options");
+  out = stripXmlProtocolBlock(out, "option");
+  out = out
+    .split(/\r?\n/)
+    .filter((line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return true;
+      if (USER_OPTIONS_TAG_LINE_RE.test(trimmed)) return false;
+      if (OPTION_TAG_LINE_RE.test(trimmed)) return false;
+      return true;
+    })
+    .join("\n");
+  return out.replace(/<\/?\s*(?:user_options|option)\b[^>\n]*>/gi, "");
+}
+
+export function stripModelProtocolMarkers(text: string): string {
+  if (!text) return "";
+
+  let out = stripUserOptionsProtocol(text);
+  out = out.replace(PROPOSED_PLAN_TAG_RE, "");
+  out = out
+    .split(/\r?\n/)
+    .filter((line) => !PROPOSAL_MARKER_LINE_RE.test(line.trim()))
+    .join("\n");
+  return out;
 }
 
 function isReasoningTagStart(lowerText: string, index: number, tag: string): boolean {
@@ -218,6 +303,7 @@ export function stripResidualToolFragments(text: string): string {
       if (RESIDUAL_PARAMETER_FRAGMENT_LINE_RE.test(trimmed)) return false;
       if (/^\s*[a-z_][a-z0-9_]*\s*=\s*[^,\s]+?\s*$/i.test(trimmed) && /^(?:path|max_lines|maxBytes|max_bytes|depth|start_line|end_line|query|pattern|command|cwd|description|timeout_ms)\s*=/i.test(trimmed)) return false;
       if (RESIDUAL_TOOL_LINE_RE.test(trimmed)) return false;
+      if (RESIDUAL_BARE_TOOL_CALL_LINE_RE.test(trimmed)) return false;
       if (RESIDUAL_SYMBOL_ONLY_RE.test(trimmed)) return false;
       return true;
     })
@@ -260,12 +346,12 @@ export function normalizeModelNoise(text: string): string {
 
 export function sanitizePlanArtifactContent(text: string): string {
   if (!text) return "";
-  return normalizeModelNoise(text).replace(/\n{4,}/g, "\n\n\n").trim();
+  return normalizeModelNoise(stripModelProtocolMarkers(text)).replace(/\n{4,}/g, "\n\n\n").trim();
 }
 
 export function sanitizeAIOutput(text: string): string {
   if (!text) return "";
-  let out = stripPlanBlocks(text);
+  let out = stripModelProtocolMarkers(stripPlanBlocks(text));
   out = stripReasoningBlocks(out);
   out = stripRawToolCallBlocks(out);
   out = extractToolCalls(out).cleanText;
@@ -274,6 +360,24 @@ export function sanitizeAIOutput(text: string): string {
   out = stripResidualToolFragments(out);
   out = stripSpecialStopTokens(out);
   out = normalizeModelNoise(out);
+  out = out.replace(/\n{3,}/g, "\n\n");
+  return out.trim();
+}
+
+export function sanitizeVisibleAssistantText(text: string): string {
+  return sanitizeAIOutput(text);
+}
+
+export function sanitizeAssistantDisplayContent(text: string): string {
+  if (!text) return "";
+  let out = stripModelProtocolMarkers(text);
+  out = stripReasoningBlocks(out);
+  out = stripRawToolCallBlocks(out);
+  out = extractToolCalls(out).cleanText;
+  out = stripAnsi(out);
+  out = stripSpecialStopTokens(out);
+  out = normalizeModelNoise(out);
+  out = stripResidualToolFragments(out);
   out = out.replace(/\n{3,}/g, "\n\n");
   return out.trim();
 }

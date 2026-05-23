@@ -127,7 +127,9 @@ test("materializes valid visible plan text into plan.md artifact", () => {
   assert.equal(result.ok, true);
   assert.equal(result.kind, "plan");
   assert.equal(result.path, ".MAIN/plans/plan.md");
-  assert.match(result.content || "", /^# Proposed Plan/);
+  assert.match(result.content || "", /^# (?:Proposed Plan|计划)/);
+  assert.match(result.content || "", /## (?:关键改动|Key Changes|拟定方案)/);
+  assert.doesNotMatch(result.content || "", /用户目标：用户目标与约束|用户目标：开放问题/);
 });
 
 test("materializes Codex-style proposed_plan blocks without requiring write tools", () => {
@@ -319,6 +321,56 @@ test("materializes Qwen-style plan and strips user option markup", () => {
 
   assert.equal(result.ok, true);
   assert.doesNotMatch(result.content || "", /user_options|approve_operation_once/);
+});
+
+test("materializes Gemma4 proposal plan with tables without leaking protocol markers", () => {
+  const result = materializePlanArtifactFromVisibleText({
+    visibleText: [
+      "[PROPOSAL START]",
+      "## 修复计划：数据不显示 + 深色模式",
+      "",
+      "### 用户目标",
+      "- 修复 CSV 导入后数据不显示，并保证深色模式下计划表格正常渲染。",
+      "",
+      "### 摘要",
+      "- 已确认 CSV 导入后的字段映射与 UI 展示字段不一致，深色模式表格样式也需要统一。",
+      "",
+      "### 根因分析",
+      "- `src/App.tsx` 上传入口缺少中文 CSV 键名到标准字段的映射。",
+      "- PlanPanel 表格必须保留 GFM table，而不是被改写成普通任务列表。",
+      "",
+      "### 关键实现改动",
+      "- 在导入链路增加字段映射，确保 CSV 中文键名进入标准订单字段。",
+      "- 在 Markdown 渲染链路保持 GFM 表格语法，并验证 PlanPanel artifact/preview 两条路径。",
+      "",
+      "### 影响文件",
+      "| 文件 | 改动 |",
+      "| --- | --- |",
+      "| src/App.tsx | 增加数据映射并接入上传流程 |",
+      "| src/components/PlanPanel.tsx | 验证 Markdown 表格渲染 |",
+      "",
+      "### Public APIs / Interfaces / Types",
+      "- 无公共 API、接口或类型变化；仅新增内部映射 helper 和渲染回归测试。",
+      "",
+      "### Test Plan",
+      "- 运行 focused node 测试。",
+      "- 用浏览器确认 PlanPanel table 可见。",
+      "",
+      "### 假设与默认值",
+      "- 保留现有交互结构，只修复数据映射和渲染。",
+      "",
+      "<user_options>",
+      "<option action=\"approve_operation_once\" value=\"批准执行\">批准执行</option>",
+      "</user_options>",
+      "[PROPOSAL END]",
+    ].join("\n"),
+  });
+
+  assert.equal(result.ok, true);
+  assert.ok(["visible_plan", "canonicalized_visible_plan"].includes(result.source || ""));
+  assert.match(result.content || "", /\| 文件 \| 改动 \|/);
+  assert.match(result.content || "", /\| src\/App\.tsx \| 增加数据映射并接入上传流程 \|/);
+  assert.doesNotMatch(result.content || "", /PROPOSAL|user_options|<option|approve_operation_once/i);
 });
 
 test("repairs visible plan text that has evidence but no explicit user goal section", () => {
@@ -698,7 +750,8 @@ test("sanitizes repeated quality-gate evidence before deterministic plan materia
   assert.match(sanitized.evidence.join("\n"), /read_file src\/App\.tsx/);
   assert.match(sanitized.evidence.join("\n"), /read_file src\/components\/ChatArea\.tsx/);
   assert.doesNotMatch(sanitized.evidence.join("\n"), /PLAN NOT READY|ContextMemory|hash=|status=|READ_FILE_RESULT|TASK_TARGETING_BLOCKED|\*\*\/\*\.ts|node_modules/);
-  assert.equal(sanitized.stats.dropReasons.plan_artifact_tool_log, 1);
+  assert.equal(sanitized.stats.dropReasons.plan_artifact_evidence, 1);
+  assert.equal(sanitized.stats.dropReasons.plan_artifact_path, 1);
   assert.ok(sanitized.stats.dropped >= 3);
 
   const content = composePlanArtifactFromEvidence({
@@ -710,7 +763,109 @@ test("sanitizes repeated quality-gate evidence before deterministic plan materia
   });
 
   assert.equal(validateActionablePlanArtifact(content).ok, true);
+  assert.doesNotMatch(content, /落实已批准目标|approved goal/i);
   assert.doesNotMatch(content, /PLAN NOT READY|ContextMemory|hash=|status=|READ_FILE_RESULT|TASK_TARGETING_BLOCKED/);
+});
+
+test("deterministic materialization extracts the real goal from turn intake wrappers", () => {
+  const wrappedGoal = [
+    "[turn_intake]",
+    "workflowMode: plan",
+    "imageParts: 2",
+    "mentionedFiles: 0",
+    "attachedFiles: 0",
+    "priority: 先理解用户真实指令和用户提供的上下文，再决定是否探索仓库。",
+    "[user_request]",
+    "请根据截图修复 Dashboard 数据不显示和计划生成失败的问题。",
+    "[/user_request]",
+    "[/turn_intake]",
+    "",
+    "本轮处于 PLAN 模式。如果这是复杂实现请求，请先收集只读证据，再输出精简可见的 `<proposed_plan>`。",
+  ].join("\n");
+
+  const sanitized = sanitizePlanEvidenceInput({
+    userGoal: wrappedGoal,
+    evidence: [
+      "read_file src/App.tsx; excerpt=src/App.tsx",
+      "read_file src/main.tsx; excerpt=src/main.tsx",
+      "read_file src/index.css; excerpt=src/index.css",
+      "list_directory src/components; excerpt=src/components/Dashboard/ , src/components/DataTable/ , src/components/FileUploader/",
+    ],
+    files: [
+      "src/App.tsx",
+      "src/main.tsx",
+      "src/index.css",
+      "src/components/Dashboard/index.tsx",
+    ],
+    constraints: ["批准前不修改源码。"],
+    language: "zh",
+  });
+
+  assert.equal(sanitized.userGoal, "请根据截图修复 Dashboard 数据不显示和计划生成失败的问题。");
+
+  const content = composePlanArtifactFromEvidence({
+    userGoal: wrappedGoal,
+    evidence: sanitized.evidence,
+    files: sanitized.files,
+    constraints: sanitized.constraints,
+    language: "zh",
+  });
+
+  assert.equal(validateActionablePlanArtifact(content).ok, true);
+  assert.match(content, /Dashboard 数据不显示和计划生成失败/);
+  assert.doesNotMatch(content, /用户目标为空|turn_intake|PLAN 模式|proposed_plan/);
+});
+
+test("drops MAIN plan artifact self references from deterministic evidence", () => {
+  const sanitized = sanitizePlanEvidenceInput({
+    userGoal: "修复 CSV 导入解析后仪表盘没有更新的问题。",
+    evidence: [
+      "grep_search csv; status=observed; summary=MAIN/plans/plan.md:7:- 数据失效原因：读取 cn_tutorial_orders_by_creator_20260512.csv 后字段不匹配",
+      "read_file src/hooks/useCsvParser.ts; status=observed; excerpt=解析 CSV 行并返回订单记录",
+      "read_file src/store/dashboardStore.ts; status=observed; excerpt=导入后更新 dashboard 指标",
+    ],
+    files: [
+      "MAIN/plans/plan.md",
+      "src/hooks/useCsvParser.ts",
+      "src/store/dashboardStore.ts",
+    ],
+    language: "zh",
+  });
+
+  assert.equal(sanitized.stats.dropReasons.plan_artifact_evidence, 1);
+  assert.equal(sanitized.stats.dropReasons.plan_artifact_path, 1);
+  assert.doesNotMatch([...sanitized.evidence, ...sanitized.files].join("\n"), /MAIN\/plans\/plan\.md/i);
+
+  const content = composePlanArtifactFromEvidence({
+    userGoal: sanitized.userGoal,
+    evidence: sanitized.evidence,
+    files: sanitized.files,
+    constraints: [],
+    language: "zh",
+  });
+
+  assert.equal(validateActionablePlanArtifact(content).ok, true);
+  assert.doesNotMatch(content, /MAIN\/plans\/plan\.md|落实已批准目标/);
+  assert.match(content, /useCsvParser\.ts/);
+  assert.match(content, /dashboardStore\.ts/);
+});
+
+test("deterministic materialization rejects empty user goals instead of inventing generic targets", () => {
+  const content = composePlanArtifactFromEvidence({
+    userGoal: "",
+    evidence: [
+      "read_file src/hooks/useCsvParser.ts; status=observed; excerpt=解析 CSV 行并返回记录",
+      "read_file src/store/dashboardStore.ts; status=observed; excerpt=保存导入状态",
+    ],
+    files: ["src/hooks/useCsvParser.ts", "src/store/dashboardStore.ts"],
+    constraints: [],
+    language: "zh",
+  });
+
+  const validation = validateActionablePlanArtifact(content);
+  assert.equal(validation.ok, false);
+  assert.doesNotMatch(content, /以落实已批准目标|落实已批准方案|approved goal/i);
+  assert.doesNotMatch(content, /用户目标：\s*生成可审批实现计划/);
 });
 
 test("rejects generic ten-section fallback plan as non-Codex handoff", () => {

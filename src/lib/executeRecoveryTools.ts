@@ -23,6 +23,7 @@ export interface ExecuteRecoveryResultLike {
 export const EXECUTE_RECOVERY_TARGETING_TOOLS = new Set([
   "grep_search",
   "get_file_outline",
+  "read_file",
   "read_pty_buffer",
   "read_pty_tail",
   "read_pty_since",
@@ -204,8 +205,8 @@ export function buildExecuteRecoveryPrompt(input: {
       `Repeated/known targets: ${repeatedTargets}.`,
       recent ? `Recent tool activity: ${recent}.` : "",
       input.allowFileRead
-        ? "A single targeted `read_file` is available only to repair a failed `replace_in_file`/patch mismatch; after that, patch, run a finite command, use browser validation, or state the exact blocker."
-        : "Broad reads are temporarily withheld. Reuse the cached context and take the next concrete action: `replace_in_file`/`write_file`, run a finite command, use browser validation, or state the exact blocker.",
+        ? "A targeted `read_file` is available to repair exact-content or patch mismatch problems; after that, patch, run a finite command, use browser validation, or state the exact blocker."
+        : "Targeted `read_file`, `grep_search`, and outlines remain available, but broad repeated reads are not the recovery path. Reuse cached context and take the next concrete action: `replace_in_file`/`write_file`, run a finite command, use browser validation, or state the exact blocker.",
       "Do not start a new broad scan, do not reread the same files, and do not output another plan instead of action.",
     ].filter(Boolean).join("\n");
   }
@@ -217,8 +218,8 @@ export function buildExecuteRecoveryPrompt(input: {
     `重复/已知目标：${repeatedTargets}。`,
     recent ? `最近工具活动：${recent}。` : "",
     input.allowFileRead
-      ? "现在只开放一次定向 `read_file` 来修复失败的 `replace_in_file` / patch mismatch；随后必须改为写入、运行有限命令、浏览器验证，或说明精确阻塞。"
-      : "宽泛读取工具已临时收起。请复用已缓存上下文，执行下一个具体动作：`replace_in_file` / `write_file`、运行有限命令、浏览器验证，或说明精确阻塞。",
+      ? "现在可使用定向 `read_file` 来修复精确内容或 patch mismatch；随后必须改为写入、运行有限命令、浏览器验证，或说明精确阻塞。"
+      : "定向 `read_file`、`grep_search` 和 outline 仍可用，但恢复路径不是重复泛读。请复用已缓存上下文，执行下一个具体动作：`replace_in_file` / `write_file`、运行有限命令、浏览器验证，或说明精确阻塞。",
     "不要开启新一轮泛读，不要重复读取同一批文件，也不要用新的方案文档替代执行动作。",
   ].filter(Boolean).join("\n");
 }

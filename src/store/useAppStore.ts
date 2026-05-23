@@ -127,6 +127,7 @@ import {
   type CloudServerConfig,
 } from "../lib/cloudServers";
 import { buildToolDiffPreview, supportsToolDiffPreview } from "../lib/toolDiff";
+import { resolveStreamingAssistantDisplay } from "../lib/streamDisplayPolicy";
 import { findToolLifecycleBlockIndex, type ToolLifecycleMeta } from "../lib/toolLifecycle";
 import { deriveToolIntentSummary } from "../lib/toolPresentation";
 import {
@@ -3770,8 +3771,11 @@ async function hydrateExistingPlanArtifactsForWorkspace(
       const fileName = path.split("/").pop()?.toLowerCase() || "";
       return fileNames.has(fileName);
     });
+    if (availablePaths.length === 0) {
+      availablePaths = [...PLAN_ARTIFACT_PATHS];
+    }
   } catch {
-    availablePaths = [];
+    availablePaths = [...PLAN_ARTIFACT_PATHS];
   }
 
   return hydratePlanArtifactsFromReader(
@@ -8321,12 +8325,27 @@ export const useAppStore = create<AppState>()(
           dedupeKey: `understanding:${turnId}`,
         });
       };
+      const discardUnderstandingProgress = () => {
+        if (understandingProgressClosed || understandingProgressBlockId == null) return;
+        understandingProgressClosed = true;
+        const blockId = understandingProgressBlockId;
+        understandingProgressBlockId = null;
+        sessionSet((s) => ({
+          taskFlow: s.taskFlow.filter((block) => block.id !== blockId),
+          conversationTurns: s.conversationTurns.map((turn) =>
+            turn.id === turnId
+              ? { ...turn, blockIds: turn.blockIds.filter((id) => id !== blockId) }
+              : turn
+          ),
+        }));
+      };
       appendUnderstandingProgress();
 
       // ── Throttled streaming update ────────────────────────────────────
       // Buffer incoming tokens and flush at a modest cadence. A fixed cadence
       // keeps scrolling and timers responsive during long reasoning streams.
       let tokenBuffer = "";
+      let streamingAssistantDisplayBuffer = "";
       let flushTimerHandle: ReturnType<typeof setTimeout> | null = null;
       const STREAMING_UI_FLUSH_INTERVAL_MS = 90;
       let firstStreamTokenAt: number | null = null;
@@ -8478,6 +8497,27 @@ export const useAppStore = create<AppState>()(
           }
 
           if (agentContent) {
+            const displayCandidate = streamingAssistantDisplayBuffer + agentContent;
+            const displayDecision = resolveStreamingAssistantDisplay({
+              text: displayCandidate,
+              language: phaseLanguage,
+              workflowMode: sessionGet().config.workflowMode,
+              runIntent: effectiveRunIntent,
+              hasVisibleAgentBlock: currentStreamingBlockId !== null,
+            });
+            if (displayDecision.action === "show") {
+              agentContent = displayDecision.text;
+              streamingAssistantDisplayBuffer = "";
+            } else if (displayDecision.action === "buffer") {
+              streamingAssistantDisplayBuffer = displayDecision.bufferText || displayCandidate;
+              agentContent = "";
+            } else {
+              streamingAssistantDisplayBuffer = "";
+              agentContent = "";
+            }
+          }
+
+          if (agentContent) {
             if (currentStreamingBlockId === null) {
               agentBlockIdToCreate = nextId();
               currentStreamingBlockId = agentBlockIdToCreate;
@@ -8570,7 +8610,25 @@ export const useAppStore = create<AppState>()(
           flushBuffer();
         }
 
-        const { agent: remainingAgent } = thinkingInterceptor.flush();
+        let { agent: remainingAgent } = thinkingInterceptor.flush();
+        if (remainingAgent) {
+          const displayCandidate = streamingAssistantDisplayBuffer + remainingAgent;
+          const displayDecision = resolveStreamingAssistantDisplay({
+            text: displayCandidate,
+            language: phaseLanguage,
+            workflowMode: sessionGet().config.workflowMode,
+            runIntent: effectiveRunIntent,
+            hasVisibleAgentBlock: currentStreamingBlockId !== null,
+          });
+          if (displayDecision.action === "show") {
+            remainingAgent = displayDecision.text;
+          } else {
+            remainingAgent = "";
+          }
+          streamingAssistantDisplayBuffer = "";
+        } else {
+          streamingAssistantDisplayBuffer = "";
+        }
         if (remainingAgent) {
           if (currentStreamingBlockId === null) {
             const blockId = nextId();
@@ -8897,6 +8955,7 @@ export const useAppStore = create<AppState>()(
             firstStreamTokenAt = null;
             streamTokenCount = 0;
             streamTextChars = 0;
+            streamingAssistantDisplayBuffer = "";
             // Reset the streaming block content for retry
             if (currentStreamingBlockId !== null) {
               const blockId = currentStreamingBlockId;
@@ -9106,7 +9165,9 @@ export const useAppStore = create<AppState>()(
           const metaVisibility = meta?.visibility;
           const hasReplyOptions = replyOptions.length > 0;
           const hasToolCallsWithoutOptions = !!meta?.hasToolCalls && !hasReplyOptions;
-          if (!hasToolCallsWithoutOptions && meta?.visibility !== "user_progress") {
+          if (hasReplyOptions) {
+            discardUnderstandingProgress();
+          } else if (!hasToolCallsWithoutOptions && meta?.visibility !== "user_progress") {
             closeUnderstandingProgress();
           }
           const isHiddenProcessText = !hasReplyOptions && metaVisibility === "hidden_process";
@@ -9202,25 +9263,66 @@ export const useAppStore = create<AppState>()(
               .map((call) => String((call as any).id || "").trim())
               .filter(Boolean);
             const firstCall = meta?.toolCalls?.[0];
-            sessionSet((s) => ({
-              normalizedStreamState: {
-                ...s.normalizedStreamState,
-                visibleText: progressDisplayText,
-                replyOptions,
-              },
-              ...(latestBlock && latestBlock.type === "agent"
-                ? {
-                    taskFlow: s.taskFlow.filter((block) => block.id !== latestBlock.id),
-                    conversationTurns: s.conversationTurns.map((turn) =>
-                      turn.id === turnId
-                        ? { ...turn, blockIds: turn.blockIds.filter((blockId) => blockId !== latestBlock.id) }
-                        : turn
-                    ),
-                  }
-                : {}),
-            }));
-            if (latestBlock?.type === "agent") {
-              agentBlockIdsCreatedThisRun.delete(latestBlock.id);
+            const preserveAssistantProgressText =
+              meta?.preserveAssistantText === true &&
+              displayText.trim().length > 0;
+            if (preserveAssistantProgressText && latestBlock?.type === "agent") {
+              sessionSet((s) => ({
+                normalizedStreamState: {
+                  ...s.normalizedStreamState,
+                  visibleText: stateVisibleText,
+                  replyOptions,
+                },
+                conversationTurns: s.conversationTurns.map((turn) =>
+                  turn.id === turnId && !turn.blockIds.includes(latestBlock.id)
+                    ? { ...turn, blockIds: [...turn.blockIds, latestBlock.id] }
+                    : turn
+                ),
+                taskFlow: s.taskFlow.map((block) =>
+                  block.id === latestBlock.id && block.type === "agent"
+                    ? {
+                        ...block,
+                        turnPhase: normalizeTurnRuntimePhase(block.turnPhase || processPhase, phaseLanguage),
+                        content: displayText,
+                        options: undefined,
+                        hiddenProcess: undefined,
+                        visibility: undefined,
+                        streaming: false,
+                      }
+                    : block
+                ),
+              }));
+            } else {
+              sessionSet((s) => ({
+                normalizedStreamState: {
+                  ...s.normalizedStreamState,
+                  visibleText: preserveAssistantProgressText ? stateVisibleText : progressDisplayText,
+                  replyOptions,
+                },
+                ...(latestBlock && latestBlock.type === "agent"
+                  ? {
+                      taskFlow: s.taskFlow.filter((block) => block.id !== latestBlock.id),
+                      conversationTurns: s.conversationTurns.map((turn) =>
+                        turn.id === turnId
+                          ? { ...turn, blockIds: turn.blockIds.filter((blockId) => blockId !== latestBlock.id) }
+                          : turn
+                      ),
+                    }
+                  : {}),
+              }));
+              if (latestBlock?.type === "agent") {
+                agentBlockIdsCreatedThisRun.delete(latestBlock.id);
+              }
+              if (preserveAssistantProgressText) {
+                appendTurnBlock({
+                  id: nextId(),
+                  turnId,
+                  turnPhase: processPhase,
+                  type: "agent",
+                  content: displayText,
+                  streaming: false,
+                });
+              }
             }
             appendTurnBlock({
               id: nextId(),
@@ -9317,6 +9419,11 @@ export const useAppStore = create<AppState>()(
               visibleText: stateVisibleText,
               replyOptions,
             },
+            conversationTurns: s.conversationTurns.map((turn) =>
+              turn.id === turnId && !turn.blockIds.includes(latestBlock.id)
+                ? { ...turn, blockIds: [...turn.blockIds, latestBlock.id] }
+                : turn
+            ),
             taskFlow: s.taskFlow.map((t) =>
               t.id === latestBlock.id && t.type === "agent"
                 ? {

@@ -771,10 +771,28 @@ export function normalizePlanEvidenceValue(value: string): string {
     .toLowerCase();
 }
 
-const INTERNAL_PLAN_EVIDENCE_RE = /(?:^|[\\/])\.main[\\/]plans[\\/]/i;
+const INTERNAL_PLAN_EVIDENCE_RE = /(?:^|[\\/])\.?main[\\/]plans[\\/]/i;
 
 function isInternalPlanEvidenceValue(value: string | undefined | null): boolean {
   return INTERNAL_PLAN_EVIDENCE_RE.test(String(value || "").replace(/\\/g, "/").toLowerCase());
+}
+
+function planEvidenceSectionsContainInternalPlanArtifacts(content: string): boolean {
+  let inEvidenceSection = false;
+  for (const rawLine of String(content || "").split(/\r?\n/)) {
+    const heading = rawLine.match(/^\s*#{1,6}\s+(.+?)\s*$/);
+    if (heading) {
+      const title = heading[1] || "";
+      inEvidenceSection =
+        /(?:已读证据|证据引用|Read Evidence|Evidence References|References)/i.test(title) &&
+        !/(?:验证|测试|Validation|Test|Testing)/i.test(title);
+      continue;
+    }
+    if (inEvidenceSection && isInternalPlanEvidenceValue(rawLine)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function normalizeCommandEvidenceValue(value: string): string {
@@ -1449,21 +1467,6 @@ function stripRuntimeExcludedSections(content: string): string {
   return kept.join("\n");
 }
 
-function collectPlanFileReferences(content: string): string[] {
-  const refs: string[] = [];
-  const seen = new Set<string>();
-  for (const matched of String(content || "").matchAll(PLAN_TASK_FILE_REF_RE)) {
-    const value = String(matched[1] || "").replace(/\\/g, "/").trim();
-    if (!isLikelyWorkspaceFileReference(value)) continue;
-    if (!value || isInternalPlanEvidenceValue(value)) continue;
-    const key = normalizePlanEvidenceValue(value);
-    if (!key || seen.has(key)) continue;
-    seen.add(key);
-    refs.push(value);
-  }
-  return refs;
-}
-
 function makeRuntimeTask(text: string, language: "zh" | "en"): PlanTask | null {
   const clean = stripMarkdownTaskLine(text);
   if (!clean) return null;
@@ -1543,24 +1546,6 @@ export function deriveRuntimePlanTasksFromArtifacts(
 
   for (const line of collectRuntimeTaskCandidateLines(combinedContent)) {
     pushTask(makeRuntimeTask(line, language));
-    if (tasks.length >= maxTasks) return tasks;
-  }
-
-  const existingFileEvidence = () => new Set(tasks.flatMap((task) =>
-    (task.evidence || [])
-      .filter((item) => item.kind === "file" || item.kind === "deliverable")
-      .map((item) => normalizePlanEvidenceValue(item.value))
-      .filter(Boolean)
-  ));
-  for (const fileRef of collectPlanFileReferences(runtimeRelevantContent).slice(0, Math.max(1, maxTasks - tasks.length))) {
-    if (existingFileEvidence().has(normalizePlanEvidenceValue(fileRef))) continue;
-    pushTask(makeRuntimeTaskFromEvidenceText(
-      language === "en"
-        ? `Apply the approved plan change for ${fileRef}`
-        : `落实已批准方案中涉及 ${fileRef} 的改动`,
-      { kind: "file", value: fileRef, inferred: true },
-      language,
-    ));
     if (tasks.length >= maxTasks) return tasks;
   }
 
@@ -1818,8 +1803,8 @@ export function repairActionablePlanArtifactContent(input: {
 
   if (missingSections.includes("assumptions_defaults")) {
     const section = language === "en"
-      ? "## Assumptions / Defaults\n- Default to the smallest implementation that satisfies the approved goal; pause for user input if a new blocking product or API choice appears."
-      : "## 假设与默认值\n- 默认实施满足已批准目标的最小变更；如果执行中出现新的阻塞性产品或 API 选择，先暂停让用户确认。";
+      ? "## Assumptions / Defaults\n- Default to the smallest implementation that satisfies the user goal; pause for user input if a new blocking product or API choice appears."
+      : "## 假设与默认值\n- 默认实施满足用户目标的最小变更；如果执行中出现新的阻塞性产品或 API 选择，先暂停让用户确认。";
     repaired = `${repaired}\n\n${section}`.trim();
     repairedSections.push("assumptions_defaults");
   }
@@ -1898,6 +1883,15 @@ export function validateActionablePlanArtifact(
   const raw = String(content || "").trim();
   if (/(?:最小可用闭环|smallest useful workflow|Use the inspected context as the source of truth|基于当前可用的只读证据|available read-only evidence|基于已确认的证据先收窄实现目标|实施满足用户目标的最小源码变更|Use the confirmed evidence to narrow the implementation target|Apply the smallest source changes that satisfy the user goal)/i.test(raw)) {
     return classifyPlanArtifactQualityResult({ ok: false, reason: "generic_fallback_plan" });
+  }
+  if (/(?:^|\n)\s*(?:[-*]\s*)?(?:用户目标|User goal)\s*[:：]\s*(?:$|\n)/i.test(raw)) {
+    return classifyPlanArtifactQualityResult({ ok: false, reason: "empty_user_goal" });
+  }
+  if (/(?:以落实已批准目标|落实已批准方案中涉及|Apply the approved plan change|for the approved goal)/i.test(raw)) {
+    return classifyPlanArtifactQualityResult({ ok: false, reason: "generic_approved_goal_plan" });
+  }
+  if (planEvidenceSectionsContainInternalPlanArtifacts(raw)) {
+    return classifyPlanArtifactQualityResult({ ok: false, reason: "internal_plan_artifact_evidence" });
   }
 
   const hasTargetOrData =

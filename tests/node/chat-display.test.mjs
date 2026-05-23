@@ -69,8 +69,18 @@ const {
 
 const {
   sanitizeAIOutput,
+  sanitizeAssistantDisplayContent,
+  sanitizeVisibleAssistantText,
   stripReasoningBlocks,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/sanitize.ts"));
+
+const {
+  normalizeAssistantTurn,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/normalizedTurn.ts"));
+
+const {
+  resolveStreamingAssistantDisplay,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/streamDisplayPolicy.ts"));
 
 test("markdown display strips unsafe html and normalizes math and alerts", () => {
   const normalized = normalizeMarkdownForDisplay([
@@ -165,6 +175,97 @@ test("sanitize output removes raw protocols and complete reasoning blocks", () =
   assert.doesNotMatch(cleaned, /thinking|原始思考|tool_call|tool_use|read_file|secret|endoftext/i);
   assert.equal(stripReasoningBlocks("<thought>hidden</thought>visible"), "visible");
   assert.equal(sanitizeAIOutput("可见\n<thinking>仍在流式思考"), "可见");
+});
+
+test("Gemma4 proposal markers and user options are protocol, not chat text", () => {
+  const raw = [
+    "[PROPOSAL START]",
+    "# 修复计划",
+    "",
+    "| 问题 | 修复 |",
+    "| --- | --- |",
+    "| 数据不显示 | 增加 CSV 字段映射 |",
+    "",
+    "<user_options>",
+    "<option action=\"approve_operation_once\" value=\"批准执行\">批准执行</option>",
+    "</user_options>",
+    "<tool_use>",
+    "<tool>read_file</tool>",
+    "<parameter name=\"path\">src/App.tsx</parameter>",
+    "</tool_use>",
+    "[PROPOSAL END]",
+  ].join("\n");
+
+  const display = sanitizeAssistantDisplayContent(raw);
+  const visible = sanitizeVisibleAssistantText(raw);
+  for (const cleaned of [display, visible]) {
+    assert.match(cleaned, /# 修复计划/);
+    assert.match(cleaned, /\| 问题 \| 修复 \|/);
+    assert.doesNotMatch(cleaned, /PROPOSAL|user_options|<option|tool_use|<tool>|read_file|src\/App\.tsx/i);
+  }
+
+  const normalized = normalizeAssistantTurn({
+    content: raw,
+    toolCalls: [],
+    finishReason: "stop",
+  });
+  assert.match(normalized.visibleText, /# 修复计划/);
+  assert.doesNotMatch(normalized.visibleText, /PROPOSAL|user_options|tool_use|read_file/i);
+  assert.equal(normalized.replyOptions.length, 1);
+  assert.equal(normalized.toolCalls.length, 1);
+  assert.equal(normalized.toolCalls[0].name, "read_file");
+});
+
+test("streaming display policy buffers short protocol/noise tokens in plan execution", () => {
+  const odd = resolveStreamingAssistantDisplay({
+    text: "कल",
+    language: "zh",
+    workflowMode: "plan",
+    runIntent: "plan",
+  });
+  assert.equal(odd.action, "buffer");
+  assert.equal(odd.text, "");
+
+  const protocol = resolveStreamingAssistantDisplay({
+    text: "<user_options>\n<option>批准</option>",
+    language: "zh",
+    workflowMode: "plan",
+    runIntent: "plan",
+  });
+  assert.equal(protocol.action, "buffer");
+  assert.equal(protocol.text, "");
+
+  const plan = resolveStreamingAssistantDisplay({
+    text: "[PROPOSAL START]\n# 修复计划\n\n- 修复 CSV 字段映射。",
+    language: "zh",
+    workflowMode: "plan",
+    runIntent: "plan",
+  });
+  assert.equal(plan.action, "show");
+  assert.match(plan.text, /# 修复计划/);
+  assert.doesNotMatch(plan.text, /PROPOSAL/);
+
+  const continuation = resolveStreamingAssistantDisplay({
+    text: " world",
+    language: "en",
+    workflowMode: "chat",
+    runIntent: "chat",
+    hasVisibleAgentBlock: true,
+  });
+  assert.equal(continuation.action, "show");
+  assert.equal(continuation.text, " world");
+});
+
+test("streaming display policy preserves normal markdown tables", () => {
+  const decision = resolveStreamingAssistantDisplay({
+    text: "| 文件 | 状态 |\n| --- | --- |\n| src/App.tsx | 已读 |",
+    language: "zh",
+    workflowMode: "plan",
+    runIntent: "plan",
+  });
+
+  assert.equal(decision.action, "show");
+  assert.match(decision.text, /\| 文件 \| 状态 \|/);
 });
 
 test("chat feedback normalizes statuses and classifies common errors", () => {

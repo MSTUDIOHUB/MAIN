@@ -3,7 +3,7 @@
 
 import { parseTextForTools } from "./textToolParser";
 import { extractReplyOptions, normalizeReplyOptionLabel, normalizeReplyOptionValue } from "./replyOptions";
-import { sanitizeAIOutput } from "./sanitize";
+import { sanitizeVisibleAssistantText } from "./sanitize";
 import type { StreamResult } from "./streaming";
 import type { NormalizedStreamState, NormalizedToolCall, ReplyOption } from "./workflowModels";
 
@@ -408,7 +408,7 @@ export function normalizeAssistantTurn(result: StreamResult): NormalizedStreamSt
     initialOptions.hasExplicitUserOptionsTag ||
     rawToolCalls.some((call) => isUserOptionsToolName(call.name));
   const textWithoutOptions = parsedOptions.cleanText;
-  const preSanitizedVisible = collapseRepeatedParagraphLoops(sanitizeAIOutput(textWithoutOptions))
+  const preSanitizedVisible = collapseRepeatedParagraphLoops(sanitizeVisibleAssistantText(textWithoutOptions))
     .replace(/\n{3,}/g, "\n\n")
     .trim();
   const leakedPrelude = extractLeakedReasoningPrelude(preSanitizedVisible);

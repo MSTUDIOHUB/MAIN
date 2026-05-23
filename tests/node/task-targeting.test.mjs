@@ -86,6 +86,16 @@ test("task targeting blocks UI source writes until DESIGN protocol is read or st
   assert.equal(blocked.blocked, true);
   assert.equal(blocked.reason, "design_protocol_required");
 
+  const approvedPlanExecution = shouldBlockToolCallForTargeting({
+    profile,
+    toolName: "replace_in_file",
+    args: { path: "src/components/TopIsland.tsx" },
+    target: "src/components/TopIsland.tsx",
+    language: "zh",
+    allowApprovedPlanDesignWrite: true,
+  });
+  assert.equal(approvedPlanExecution.blocked, false);
+
   const satisfied = buildTaskTargetingProfile({
     userPrompt: "请按照当前 Skill 修改 TopIsland 的 UI 样式。",
     skills: [designSkill],

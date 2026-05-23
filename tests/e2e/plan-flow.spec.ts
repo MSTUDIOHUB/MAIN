@@ -35,6 +35,9 @@ test.beforeEach(async ({ page }) => {
 test("TopIsland plan adjustment input can be clicked, focused, and submitted", async ({ page }) => {
   await page.goto("/?e2eScenario=plan-flow");
 
+  await expect(page.locator("body")).not.toContainText("[PROPOSAL START]");
+  await expect(page.locator("body")).not.toContainText("<user_options>");
+  await expect(page.locator("body")).not.toContainText("<tool_use>");
   await expect(page.getByTestId("plan-save-button")).toBeVisible();
   await page.getByTestId("plan-save-button").click();
   await expect(page.getByTestId("plan-save-button")).toHaveAttribute("data-save-state", "saved");

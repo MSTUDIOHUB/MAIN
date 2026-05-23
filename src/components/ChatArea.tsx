@@ -12,7 +12,7 @@ import { resolveAutoScrollState } from "../lib/chatScroll";
 import { getDiffStats } from "../lib/diff";
 import { parseMessageContent } from "../lib/messageParser";
 import { hasPlanDraftPreview, hasStructuredPlanProposal } from "../lib/planProposal";
-import { sanitizeAIOutput } from "../lib/sanitize";
+import { sanitizeAIOutput, sanitizeAssistantDisplayContent, sanitizeVisibleAssistantText } from "../lib/sanitize";
 import {
   deriveThoughtDisplay,
   normalizeThoughtSummaryForCompare,
@@ -232,7 +232,7 @@ function getDisplayAgentContent(content: string, showFull: boolean, previewChars
 }
 
 function getAgentPreviewContent(content: string) {
-  return getDisplayAgentContent(content, false).content;
+  return getDisplayAgentContent(sanitizeAssistantDisplayContent(content), false).content;
 }
 
 function getAgentInspectableContent(content: string) {
@@ -735,6 +735,12 @@ function extractPathishTokens(text: string): string[] {
 function isThinToolNarration(text: string): boolean {
   const normalized = String(text || "").replace(/\s+/g, "");
   if (!normalized || normalized.length > 260) return false;
+  if (
+    /(?:确认|證實|证实|包含|不包含|发现|結果|结果|结论|原因|问题|修复|验证通过|验证失败)/.test(normalized) ||
+    /\b(?:contains?|does not contain|found|result|conclusion|verified|verification|fixed|failed|passed)\b/i.test(text)
+  ) {
+    return false;
+  }
   return /^(我(会|将|先|现在|正在|继续|已经|已)|接下来|现在|继续|已|正在).{0,40}(读取|查看|搜索|调查|执行|运行|调用|写入|修改|验证|整理|完成)/.test(normalized) ||
     /(已读取|已搜索|已执行|读取完成|搜索完成|命令完成|工具调用完成|continuingto|i(?:'|’)llread|iread|readcomplete|runningcommand)/i.test(normalized);
 }
@@ -2177,23 +2183,24 @@ function AgentContentBlock({
   chatFontSize: number;
 }) {
   const rawContent = String(block.content || "");
+  const displaySourceContent = useMemo(() => sanitizeAssistantDisplayContent(rawContent), [rawContent]);
   const previewLimit = block.streaming ? STREAMING_AGENT_CONTENT_PREVIEW_CHARS : AGENT_CONTENT_PREVIEW_CHARS;
-  const isLongContent = rawContent.length > previewLimit;
+  const isLongContent = displaySourceContent.length > previewLimit;
   const [showFullLongContent, setShowFullLongContent] = useState(false);
   const [isArchivedExpanded, setIsArchivedExpanded] = useState(false);
-  const displayContent = getDisplayAgentContent(rawContent, isLongContent && showFullLongContent && !block.streaming, previewLimit);
-  const streamingText = block.streaming ? sanitizeAIOutput(displayContent.content) : "";
+  const displayContent = getDisplayAgentContent(displaySourceContent, isLongContent && showFullLongContent && !block.streaming, previewLimit);
+  const streamingText = block.streaming ? sanitizeVisibleAssistantText(displayContent.content) : "";
   const segments = useMemo(
     () => block.streaming ? [] : parseMessageContent(displayContent.content),
     [block.streaming, displayContent.content],
   );
   const hasVisibleContent =
     (block.streaming && streamingText.length > 0) ||
-    segments.some((seg) => (seg.type === "text" ? sanitizeAIOutput(seg.content).length > 0 : true)) ||
+    segments.some((seg) => (seg.type === "text" ? sanitizeVisibleAssistantText(seg.content).length > 0 : true)) ||
     isLongContent;
   const archivedPreviewText = useMemo(() => segments
       .filter((seg) => seg.type === "text")
-      .map((seg) => sanitizeAIOutput(seg.content))
+      .map((seg) => sanitizeVisibleAssistantText(seg.content))
       .filter(Boolean)
       .join(" ")
       .replace(/\s+/g, " ")
@@ -2203,8 +2210,8 @@ function AgentContentBlock({
 
   if (!hasVisibleContent) return null;
 
-  const previewCharCount = Math.min(rawContent.length, previewLimit).toLocaleString();
-  const totalCharCount = rawContent.length.toLocaleString();
+  const previewCharCount = Math.min(displaySourceContent.length, previewLimit).toLocaleString();
+  const totalCharCount = displaySourceContent.length.toLocaleString();
   const isArchivedAfterChoice = block.archivedAfterChoice && !block.streaming;
   const archivedTitle = language === "zh" ? "已保留上一步反馈" : "Previous reply kept";
   const archivedAction = language === "zh" ? "展开回看" : "Expand";
@@ -2286,7 +2293,7 @@ function AgentContentBlock({
             if (seg.type === "plan") {
               return <JobListCard key={`${block.id}-plan-${segIdx}`} jobs={seg.jobs} />;
             }
-            const cleanText = sanitizeAIOutput(seg.content);
+            const cleanText = sanitizeVisibleAssistantText(seg.content);
             if (!cleanText) return null;
             return (
               <MarkdownRenderer

@@ -28,6 +28,7 @@ const CLOUD_STATUS_ACTIVE_SERVER_MODEL_SCENARIO = "cloud-status-active-server-mo
 const STREAMING_TIMER_SCENARIO = "streaming-timer";
 const STREAMING_RESPONSIVENESS_SCENARIO = "streaming-responsiveness";
 const LOCAL_PLAN_SLOW_FIRST_TOKEN_SCENARIO = "local-plan-slow-first-token";
+const REAL_OMLX_PLAN_FLOW_SCENARIO = "real-omlx-plan-flow";
 const STREAM_ERROR_RECOVERY_SCENARIO = "stream-error-recovery";
 const SESSION_AUTO_CREATE_SCENARIO = "session-auto-create";
 const CLOUD_TOOL_FALLBACK_SCENARIO = "cloud-tool-fallback";
@@ -4315,6 +4316,8 @@ function seedLocalPlanSlowFirstTokenScenario() {
     },
     currentWorkspace: workspace,
     selectedWorkspace: workspace,
+    workspaces: [{ path: workspace, name: "E2E Local Plan Slow First Token", addedAt: now, lastActiveAt: now }],
+    activeSessionByWorkspace: { [workspace]: sessionId },
     sessionsByWorkspace: {
       [workspace]: [
         {
@@ -4376,6 +4379,150 @@ function seedLocalPlanSlowFirstTokenScenario() {
       currentTurnStatus: currentTurn?.status ?? null,
       systemTexts: (state.taskFlow.filter((block) => block.type === "system") as any[]).map((block) => block.content),
       seedCount: readSeedCount(LOCAL_PLAN_SLOW_FIRST_TOKEN_SCENARIO),
+    };
+  };
+
+  const cleanup = () => {
+    bridge.initialized = false;
+  };
+
+  bridge.cleanup = cleanup;
+  return cleanup;
+}
+
+function seedRealOmlxPlanFlowScenario() {
+  const bridge = getBridge();
+  if (!bridge) return undefined;
+
+  bridge.events = [{ type: "boot" }];
+  bridge.savedDocuments = [];
+  bridge.completed = false;
+
+  incrementSeedCount(REAL_OMLX_PLAN_FLOW_SCENARIO);
+
+  const params = new URLSearchParams(window.location.search);
+  const model = params.get("model") || "gemma-4-26b-a4b-it-8bit";
+  const workspace = `/tmp/e2e-real-omlx-${model.replace(/[^a-z0-9_-]+/gi, "-").toLowerCase()}`;
+  const sessionId = model.includes("Qwen") ? 999522 : 999521;
+  const now = Date.now();
+
+  useAppStore.setState((state) => ({
+    ...state,
+    config: {
+      ...state.config,
+      language: "zh",
+      workflowMode: "plan",
+      activeProfile: "local",
+      local: {
+        ...state.config.local,
+        provider: "OMLX",
+        endpoint: "http://127.0.0.1:8000/v1",
+        model,
+        apiKey: "mmnn",
+        contextLimit: 32768,
+        toolProtocol: "auto",
+      },
+      workspace,
+      instructionsEnabled: false,
+      hooksEnabled: false,
+      sessionRecordingEnabled: false,
+    },
+    currentWorkspace: workspace,
+    selectedWorkspace: workspace,
+    sessionsByWorkspace: {
+      [workspace]: [
+        {
+          id: sessionId,
+          title: `E2E Real OMLX ${model}`,
+          date: new Date(now).toISOString(),
+          active: true,
+          storageStatus: "temporary",
+          recordingDisabled: true,
+          messages: [],
+        },
+      ],
+    },
+    currentSessionId: sessionId,
+    selectedMainModeKey: "main_mode",
+    selectedNexusModeKey: "nexus_general",
+    taskFlow: [],
+    agentMessages: [],
+    conversationTurns: [],
+    currentTurnId: null,
+    input: "",
+    attachedFiles: [],
+    contextMentions: [],
+    planArtifacts: [],
+    planTasks: [],
+    planExecutionEvidenceLedger: [],
+    planExecutionEvidenceCount: 0,
+    planStage: "idle",
+    isPlanApproved: false,
+    readOnlyAutoApproveForSession: true,
+    autoApproveTools: true,
+    autoApproveToolScopes: ["workspace_write", "shell"],
+    isGenerating: false,
+    agentStatus: "idle",
+    elapsedTime: 0,
+    showPlanPanel: true,
+    showTerminal: false,
+    showFilePanel: false,
+    showDiff: false,
+    selectedDiffTaskId: null,
+  }));
+
+  bridge.sendCloudMessage = (text?: string) =>
+    useAppStore.getState().sendMessage(
+      text || "请修复 src/hooks/useCsvParser.ts，让 CSV creator 字段正确映射为 Dashboard 使用的 creatorName。先生成可审批计划，批准后真实修改并验证。",
+      undefined,
+      {
+        resolvedIntent: "plan",
+        skipIntentResolution: true,
+      },
+    );
+
+  bridge.approvePlan = () => {
+    useAppStore.getState().approvePlan("批准执行");
+  };
+
+  bridge.getSnapshot = () => {
+    const state = useAppStore.getState();
+    const currentTurn = state.currentTurnId
+      ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId) || null
+      : null;
+    const agentTexts = (state.taskFlow.filter((block) => block.type === "agent") as any[]).map((block) => block.content);
+    const toolBlocks = (state.taskFlow.filter((block) => block.type === "tool") as any[]).map((block) => ({
+      name: block.toolName,
+      target: block.target,
+      status: block.status,
+      error: block.error,
+    }));
+    return {
+      model,
+      agentStatus: state.agentStatus,
+      isGenerating: state.isGenerating,
+      planStage: state.planStage,
+      isPlanApproved: state.isPlanApproved,
+      planArtifacts: state.planArtifacts.map((artifact) => ({
+        path: artifact.path,
+        title: artifact.title,
+        content: artifact.content,
+      })),
+      planTasks: state.planTasks,
+      currentTurnStatus: currentTurn?.status ?? null,
+      agentTexts,
+      toolBlocks,
+      taskFlowTypes: state.taskFlow.map((block) => block.type),
+      taskFlowPreview: state.taskFlow.map((block: any) => ({
+        type: block.type,
+        title: block.title || "",
+        content: String(block.content || block.error || "").slice(0, 800),
+        toolName: block.toolName || "",
+        target: block.target || "",
+        status: block.status || "",
+      })),
+      debugTail: ((window as any).__REAL_OMLX_DEBUG_LOGS__ || []).slice(-80),
+      seedCount: readSeedCount(REAL_OMLX_PLAN_FLOW_SCENARIO),
     };
   };
 
@@ -4799,6 +4946,13 @@ function seedCloudToolProtocolScenario(scenario: string) {
       conversationTurns: state.conversationTurns.length,
       taskFlowBlocks: state.taskFlow.length,
       taskFlowUserCount: state.taskFlow.filter((block) => block.type === "user").length,
+      currentTurnBlockIds: currentTurn?.blockIds || [],
+      taskBlockSummaries: state.taskFlow.map((block: any) => ({
+        id: block.id,
+        turnId: block.turnId,
+        type: block.type,
+        content: typeof block.content === "string" ? block.content.slice(0, 120) : "",
+      })),
       agentTexts: agentBlocks.map((block) => block.content),
       optionBlockCount: optionBlocks.length,
       optionLabels: optionBlocks.flatMap((block) => (block.options || []).map((option: any) => option.label)),
@@ -5627,6 +5781,10 @@ export function initializeE2EScenarios(): (() => void) | undefined {
 
   if (scenario === LOCAL_PLAN_SLOW_FIRST_TOKEN_SCENARIO) {
     return seedLocalPlanSlowFirstTokenScenario();
+  }
+
+  if (scenario === REAL_OMLX_PLAN_FLOW_SCENARIO) {
+    return seedRealOmlxPlanFlowScenario();
   }
 
   if (scenario === STREAM_ERROR_RECOVERY_SCENARIO) {

@@ -51,6 +51,7 @@ import {
   stripReadOnlyPermissionPrompt,
 } from "./replyOptions";
 import { buildToolDiffPreview, type ToolDiffPreview } from "./toolDiff";
+import { preflightWorkspaceMutation } from "./workspaceMutationPreflight";
 import { syncPlanArtifactAfterToolSuccess } from "./planArtifactSync";
 import {
   buildReadFileWindowContinuationGuidance,
@@ -1118,6 +1119,7 @@ export interface OrchestratorCallbacks {
       hasToolCalls?: boolean;
       hiddenThought?: string;
       visibility?: "user_progress" | "hidden_process" | "substantive_plan_text";
+      preserveAssistantText?: boolean;
       progress?: ProgressNarration;
       toolCalls?: Array<{ id?: string; name: string; target: string }>;
     },
@@ -2088,9 +2090,9 @@ function buildApprovedPlanNoProgressStrategySwitchPrompt(input: {
       recent ? `Recent tool evidence: ${recent}` : "",
       `Unsatisfied task: ${input.remainingText}`,
       input.allowFileRead
-        ? "For the next response, MAIN keeps action tools plus one patch-recovery file read available. Use that read only to repair a failed `replace_in_file`, then patch or validate."
-        : "For the next response, MAIN keeps action tools plus lightweight targeting tools available. Use `replace_in_file`/`write_file`, run a command, use Browser/Playwright validation, or state the exact blocker if no real action is possible.",
-      "Do not call read/list/search again for the same cached target. `read_file` is withheld in cached-read recovery until a failed `replace_in_file`/patch needs exact current content.",
+        ? "For the next response, MAIN keeps action tools plus targeted file reads available for exact-content or patch recovery. Use one only when needed, then patch or validate."
+        : "For the next response, MAIN keeps action tools plus targeted `read_file`, search, outline, and PTY status tools available. Use `replace_in_file`/`write_file`, run a command, use Browser/Playwright validation, or state the exact blocker if no real action is possible.",
+      "Do not call read/list/search again for the same cached target. If exact current content is needed, perform one targeted read and immediately continue with patching or validation.",
     ].filter(Boolean).join("\n");
   }
 
@@ -2101,9 +2103,9 @@ function buildApprovedPlanNoProgressStrategySwitchPrompt(input: {
     recent ? `最近工具证据：${recent}` : "",
     `证据未满足任务：${input.remainingText}`,
     input.allowFileRead
-      ? "下一轮 MAIN 会临时保留行动工具和一次 patch 恢复用文件读取。该读取只用于修复 failed `replace_in_file`，随后必须写入或验证。"
-      : "下一轮 MAIN 会临时保留行动工具和轻量定位工具。请优先使用 `replace_in_file`/`write_file` 修改，运行命令，执行 Browser/Playwright 验证，或说明无法真实行动的具体阻塞。",
-    "不要再次对同一缓存目标调用 read/list/search；cached-read 恢复阶段会先收起 `read_file`，只有 failed `replace_in_file`/patch 需要精确当前内容时才重新开放。",
+      ? "下一轮 MAIN 会保留行动工具和定向文件读取，用于精确内容或 patch 恢复。只在需要时读一次，随后必须写入或验证。"
+      : "下一轮 MAIN 会保留行动工具、定向 `read_file`、搜索、outline 和 PTY 状态工具。请优先使用 `replace_in_file`/`write_file` 修改，运行命令，执行 Browser/Playwright 验证，或说明无法真实行动的具体阻塞。",
+    "不要再次对同一缓存目标调用 read/list/search；如果确实需要精确当前内容，只做一次定向读取，然后立即继续 patch 或验证。",
   ].filter(Boolean).join("\n");
 }
 
@@ -2352,7 +2354,11 @@ function isPlanControlUserPrompt(text: string): boolean {
 function getOriginalUserPromptForPlanFallback(callbacks: OrchestratorCallbacks): string {
   const userMessages = callbacks.getMessages()
     .filter((message) => message.role === "user")
-    .map((message) => stripControlPromptForPlanFallback(extractCompatibilityTextContent(message.content)))
+    .map((message) => {
+      const raw = extractCompatibilityTextContent(message.content);
+      const primary = extractPrimaryUserRequestText(raw);
+      return stripControlPromptForPlanFallback(primary || raw);
+    })
     .filter(Boolean);
   return userMessages.find((text) => !isPlanControlUserPrompt(text)) || userMessages[0] || "";
 }
@@ -2435,6 +2441,7 @@ function collectPlanClosureMaterializationInput(
   callbacks: OrchestratorCallbacks,
   recentActivity: PlanToolActivitySummary[] = [],
   attemptedTargets: string[] = [],
+  fallbackUserGoal = "",
 ): {
   userGoal: string;
   evidence: string[];
@@ -2445,8 +2452,13 @@ function collectPlanClosureMaterializationInput(
 } {
   const memory = callbacks.getContextMemoryState?.() || null;
   const userGoal =
+    stripControlPromptForPlanFallback(extractPrimaryUserRequestText(fallbackUserGoal) || fallbackUserGoal) ||
     getOriginalUserPromptForPlanFallback(callbacks) ||
-    stripControlPromptForPlanFallback(memory?.latestUserRequest?.text || "");
+    stripControlPromptForPlanFallback(
+      extractPrimaryUserRequestText(memory?.latestUserRequest?.text || "") ||
+      memory?.latestUserRequest?.text ||
+      "",
+    );
   const constraints = collectContextMemoryTexts(memory?.constraints, 5);
   const files = [
     ...collectContextMemoryTexts(
@@ -2492,6 +2504,8 @@ function hasGroundedPlanClosureEvidence(
   input: ReturnType<typeof collectPlanClosureMaterializationInput>,
   recentActivity: PlanToolActivitySummary[] = [],
 ): boolean {
+  if (!hasRelevantPlanClosureEvidence(input, recentActivity)) return false;
+
   const hasNonPlanFile = input.files.some((file) => {
     const target = String(file || "").trim();
     return !!target && !isPlanArtifactPath(target);
@@ -2512,6 +2526,161 @@ function hasGroundedPlanClosureEvidence(
     if (/\.MAIN\/plans\/plan\.md/i.test(text) && !/(?:read|读取|search|搜索|evidence|证据|confirmed|已确认)/i.test(text)) return false;
     return true;
   });
+}
+
+function normalizePlanEvidencePath(value: string): string {
+  return value
+    .replace(/\\/g, "/")
+    .replace(/^\.?\//, "")
+    .trim()
+    .toLowerCase();
+}
+
+function isDocumentationEvidenceFile(value: string): boolean {
+  return /\.(?:md|mdx|txt|rst)$/i.test(normalizePlanEvidencePath(value));
+}
+
+function isImplementationEvidenceFile(value: string): boolean {
+  const normalized = normalizePlanEvidencePath(value);
+  if (!normalized || isPlanArtifactPath(normalized)) return false;
+  if (isDocumentationEvidenceFile(normalized)) return false;
+  return /^(?:src|app|lib|components|pages|hooks|store|styles|server|client|packages|apps|tests|scripts)\//i.test(normalized) ||
+    /\.(?:tsx?|jsx?|swift|py|rs|go|json|csv|tsv|xlsx|css|scss|html|toml|ya?ml|log)$/i.test(normalized);
+}
+
+function goalMentionsDocumentation(goal: string): boolean {
+  return /\b(?:readme|docs?|documentation|markdown|mdx?)\b|(?:文档|说明|README|读我|说明文档)/i.test(goal);
+}
+
+const PLAN_GOAL_STOPWORDS = new Set([
+  "please",
+  "fix",
+  "repair",
+  "issue",
+  "problem",
+  "plan",
+  "approve",
+  "approved",
+  "execute",
+  "execution",
+  "verify",
+  "validation",
+  "true",
+  "real",
+  "file",
+  "files",
+  "change",
+  "changes",
+  "update",
+  "修改",
+  "修复",
+  "问题",
+  "计划",
+  "批准",
+  "执行",
+  "验证",
+  "真实",
+  "文件",
+]);
+
+const PLAN_GOAL_DOMAIN_TERMS = [
+  "csv",
+  "tsv",
+  "xlsx",
+  "dashboard",
+  "creator",
+  "creatorname",
+  "parser",
+  "parse",
+  "chart",
+  "graph",
+  "import",
+  "export",
+  "table",
+  "dark",
+  "theme",
+  "log",
+  "图表",
+  "图形",
+  "数据",
+  "导入",
+  "导出",
+  "解析",
+  "字段",
+  "仪表盘",
+  "面板",
+  "显示",
+  "表格",
+  "截图",
+  "日志",
+  "质量门",
+  "审批",
+  "深色",
+  "样式",
+  "订单",
+];
+
+function extractGoalRelevanceHints(goal: string): string[] {
+  const source = String(goal || "");
+  const lower = source.toLowerCase();
+  const hints = new Set<string>();
+  for (const match of lower.matchAll(/[a-z][a-z0-9_-]{2,}/g)) {
+    const token = match[0];
+    if (!PLAN_GOAL_STOPWORDS.has(token)) hints.add(token);
+  }
+  for (const term of PLAN_GOAL_DOMAIN_TERMS) {
+    if (lower.includes(term.toLowerCase())) hints.add(term.toLowerCase());
+  }
+  return [...hints].filter((item) => item.length >= 2).slice(0, 12);
+}
+
+function extractExplicitGoalPaths(goal: string): string[] {
+  return Array.from(String(goal || "").matchAll(/\b[A-Za-z0-9_@./-]+\.(?:tsx?|jsx?|swift|py|rs|go|json|csv|tsv|xlsx|mdx?|css|scss|html|toml|ya?ml|log)\b/g))
+    .map((match) => normalizePlanEvidencePath(match[0]))
+    .filter(Boolean);
+}
+
+function hasRelevantPlanClosureEvidence(
+  input: ReturnType<typeof collectPlanClosureMaterializationInput>,
+  recentActivity: PlanToolActivitySummary[] = [],
+): boolean {
+  const goal = String(input.userGoal || "").trim();
+  if (!goal) return false;
+
+  const files = [
+    ...input.files,
+    ...recentActivity.map((item) => item.target || ""),
+  ]
+    .map((item) => normalizePlanEvidencePath(String(item || "")))
+    .filter((item) => item && !isPlanArtifactPath(item));
+
+  const evidenceText = [
+    ...input.evidence,
+    ...input.constraints,
+    ...recentActivity.map((item) => [item.name, item.target, item.detail].filter(Boolean).join(" ")),
+    ...files,
+  ].join("\n").toLowerCase();
+
+  const explicitPaths = extractExplicitGoalPaths(goal);
+  if (explicitPaths.length > 0) {
+    return explicitPaths.some((goalPath) =>
+      files.some((file) =>
+        file === goalPath ||
+        file.endsWith(`/${goalPath}`) ||
+        file.endsWith(`/${goalPath.split("/").pop() || goalPath}`)
+      ) ||
+      evidenceText.includes(goalPath)
+    );
+  }
+
+  const hints = extractGoalRelevanceHints(goal);
+  if (hints.some((hint) => evidenceText.includes(hint))) return true;
+
+  const docOnly = files.length > 0 && files.every(isDocumentationEvidenceFile);
+  if (docOnly && !goalMentionsDocumentation(goal)) return false;
+
+  const sourceEvidenceCount = files.filter(isImplementationEvidenceFile).length;
+  return sourceEvidenceCount >= 2 && input.evidence.length >= 2;
 }
 
 function resolvePlanClosureArtifactKind(
@@ -2568,8 +2737,14 @@ function buildPlanClosurePromptFromEvidence(
   callbacks: OrchestratorCallbacks,
   recentActivity: PlanToolActivitySummary[] = [],
   attemptedTargets: string[] = [],
+  fallbackUserGoal = "",
 ): string {
-  const closureInput = collectPlanClosureMaterializationInput(callbacks, recentActivity, attemptedTargets);
+  const closureInput = collectPlanClosureMaterializationInput(
+    callbacks,
+    recentActivity,
+    attemptedTargets,
+    fallbackUserGoal,
+  );
   return composeReviewablePlanFromEvidence({
     ...closureInput,
     language: callbacks.getPreferredLanguage(),
@@ -4058,6 +4233,7 @@ async function autoMaterializePlanArtifactFromVisibleText(input: {
   visibleText: string;
   workspace: string;
   callbacks: OrchestratorCallbacks;
+  userGoal?: string;
   recentToolActivity?: PlanToolActivitySummary[];
   attemptedTargets?: string[];
   turnContext?: TurnInputContextSignals;
@@ -4066,6 +4242,7 @@ async function autoMaterializePlanArtifactFromVisibleText(input: {
     input.callbacks,
     input.recentToolActivity || [],
     input.attemptedTargets || [],
+    input.userGoal || "",
   );
   const materialized = materializePlanArtifactFromVisibleText({
     visibleText: input.visibleText,
@@ -4485,6 +4662,28 @@ async function executeWriteToolWithReview(
   }
 
   const target = getToolTarget(tc.name, toolArgs);
+  const mutationPreflight = await preflightWorkspaceMutation({
+    toolName: tc.name,
+    args: toolArgs,
+    language: callbacks.getPreferredLanguage(),
+    readFile: async (path) => String(await executeTool("read_file", { path, __raw: true }, workspace, callbacks.getSessionKey()) ?? ""),
+  });
+  if (!mutationPreflight.ok) {
+    logAgentEvent("workspace_mutation_preflight_blocked", {
+      tool: tc.name,
+      target,
+      reason: mutationPreflight.reason,
+    });
+    return {
+      toolCallId: tc.id,
+      name: tc.name,
+      target,
+      content: `Error: ${mutationPreflight.message || "MUTATION_PREFLIGHT_BLOCKED"}`,
+      isError: true,
+      lifecycleState: "blocked",
+    };
+  }
+
   callbacks.onStatusChange("pending_review");
 
   let decision: ReviewDecision;
@@ -5599,6 +5798,7 @@ export async function executeAgentLoop(
       callbacks,
       recentPlanToolActivity,
       attemptedPlanWriteTargets,
+      latestUserPromptText,
     );
     logAgentEvent("plan_evidence_sanitized", {
       trigger,
@@ -5718,6 +5918,7 @@ export async function executeAgentLoop(
       callbacks,
       recentPlanToolActivity,
       attemptedPlanWriteTargets,
+      latestUserPromptText,
     );
     const evidenceCount = closureInput.evidence.length;
     const currentStage = callbacks.getPlanStage();
@@ -5904,8 +6105,8 @@ export async function executeAgentLoop(
       repeatedTargets,
       recoveryReason: input.reason,
       nextStep: language === "zh"
-        ? "下一轮临时收窄为行动工具加定位工具；避免重复缓存读取，优先写入/命令/浏览器验证"
-        : "next turn is narrowed to action tools plus targeting tools; avoid cached rereads and prioritize patching, commands, or browser validation",
+        ? "下一轮保留行动工具和定向恢复读取；避免重复缓存目标，优先写入/命令/浏览器验证"
+        : "next turn keeps action tools and targeted recovery reads; avoid cached rereads and prioritize patching, commands, or browser validation",
     });
     callbacks.onStatusChange("running");
     callbacks.appendMessage({
@@ -7176,17 +7377,22 @@ export async function executeAgentLoop(
       workflowMode === "plan" &&
       !callbacks.getIsPlanApproved() &&
       hasExecutableProposalReplyOptions(normalized.replyOptions);
-    const suppressNonDecisionReplyOptions =
-      suppressReadOnlyPermissionOptions ||
-      suppressPlanContinuationReplyOptions ||
-      suppressExecutableProposalOptionsForToolCalls;
-    const sourceVisibleText = normalizedBase.visibleText || normalized.visibleText;
-    const hasStructuredProposal = hasStructuredPlanProposal(streamText);
     const currentPlanStageForReview = callbacks.getPlanStage();
     const isApprovedPlanExecutionTurn =
       workflowMode === "plan" &&
       callbacks.getIsPlanApproved() &&
       currentPlanStageForReview === "executing";
+    const suppressApprovedPlanExecutionReplyOptions =
+      effectiveToolCalls.length === 0 &&
+      isApprovedPlanExecutionTurn &&
+      normalized.replyOptions.length > 0;
+    const suppressNonDecisionReplyOptions =
+      suppressReadOnlyPermissionOptions ||
+      suppressPlanContinuationReplyOptions ||
+      suppressExecutableProposalOptionsForToolCalls ||
+      suppressApprovedPlanExecutionReplyOptions;
+    const sourceVisibleText = normalizedBase.visibleText || normalized.visibleText;
+    const hasStructuredProposal = hasStructuredPlanProposal(streamText);
     const hasReadyPlanArtifacts = currentPlanStageForReview === "ready_to_execute";
     const hasReviewablePlanArtifacts = isReviewablePlanStage(currentPlanStageForReview);
     const rawFinalReplyOptions = compactedProseCodeDump || suppressNonDecisionReplyOptions
@@ -7291,6 +7497,18 @@ export async function executeAgentLoop(
         optionPreview: summarizeReplyOptionsForLog(normalized.replyOptions),
         workflowMode,
         turnIntent,
+      });
+    }
+    if (suppressApprovedPlanExecutionReplyOptions) {
+      logAgentEvent("approved_plan_execution_reply_options_ignored", {
+        iteration,
+        replyOptions: normalized.replyOptions.length,
+        optionPreview: summarizeReplyOptionsForLog(normalized.replyOptions),
+        visibleChars: normalized.visibleText.length,
+        workflowMode,
+        turnIntent,
+        runtimeIntent,
+        planStage: currentPlanStageForReview,
       });
     }
     if (planReplyOptionsRoutedToArtifact) {
@@ -7520,8 +7738,18 @@ export async function executeAgentLoop(
       });
     }
 
-    const unsupportedToolCalls = effectiveToolCalls.filter((call) => !availableToolNames.has(call.name));
-    const progressEligibleToolCalls = effectiveToolCalls.filter((call) => availableToolNames.has(call.name));
+    const isAllowedUnapprovedPlanDraftMutationCall = (call: ToolCallToExecute) =>
+      workflowMode === "plan" &&
+      !callbacks.getIsPlanApproved() &&
+      isPreApprovalPlanDraftWrite(call.name, parseToolCallArguments(call, workspace));
+    const unsupportedToolCalls = effectiveToolCalls.filter((call) =>
+      !availableToolNames.has(call.name) &&
+      !isAllowedUnapprovedPlanDraftMutationCall(call)
+    );
+    const progressEligibleToolCalls = effectiveToolCalls.filter((call) =>
+      availableToolNames.has(call.name) ||
+      isAllowedUnapprovedPlanDraftMutationCall(call)
+    );
     const hasSuppressedUnsupportedPlanToolCalls =
       workflowMode === "plan" &&
       !callbacks.getIsPlanApproved() &&
@@ -7601,12 +7829,19 @@ export async function executeAgentLoop(
       progressEligibleToolCalls.length > 0 &&
       finalReplyOptions.length === 0 &&
       !hasSubstantivePlanAssistantText;
+    const shouldPreserveApprovedExecutionText =
+      shouldRenderToolProgress &&
+      workflowMode === "plan" &&
+      callbacks.getIsPlanApproved() &&
+      !runtimeNarrationInjected &&
+      visibleAssistantText.trim().length > 0;
     if (!shouldSuppressApprovedPlanNoToolText && (visibleAssistantText || finalReplyOptions.length > 0)) {
       callbacks.onAssistantFinalText(visibleAssistantText, finalReplyOptions, {
         hasToolCalls: effectiveToolCalls.length > 0,
         visibility: hasSubstantivePlanAssistantText
           ? "substantive_plan_text"
           : shouldRenderToolProgress ? "user_progress" : undefined,
+        preserveAssistantText: shouldPreserveApprovedExecutionText,
         progress: shouldRenderToolProgress
           ? toolActionNarration || undefined
           : undefined,
@@ -7737,7 +7972,9 @@ export async function executeAgentLoop(
       isPlanApproved: callbacks.getIsPlanApproved(),
       convergencePromptAlreadyUsed: usedPlanReadOnlyConvergencePrompt,
       hasPlanDecisionOutput: hasStructuredProposal || finalReplyOptions.length > 0 || hasReviewablePlanArtifacts,
-      toolNames: effectiveToolCalls.map((call) => call.name),
+      toolNames: effectiveToolCalls
+        .filter((call) => !isAllowedUnapprovedPlanDraftMutationCall(call))
+        .map((call) => call.name),
       evidenceReadiness: planEvidenceReadinessForRedirect.status,
       planRuntimePhase,
     });
@@ -8150,6 +8387,7 @@ export async function executeAgentLoop(
               visibleText: sourceVisibleText || streamText,
               workspace,
               callbacks,
+              userGoal: latestUserPromptText,
               recentToolActivity: recentPlanToolActivity,
               attemptedTargets: attemptedPlanWriteTargets,
               turnContext: turnInputContextSignals,
@@ -8234,6 +8472,7 @@ export async function executeAgentLoop(
             visibleText: sourceVisibleText,
             workspace,
             callbacks,
+            userGoal: latestUserPromptText,
             recentToolActivity: recentPlanToolActivity,
             attemptedTargets: attemptedPlanWriteTargets,
             turnContext: turnInputContextSignals,
@@ -8844,7 +9083,11 @@ export async function executeAgentLoop(
         continue;
       }
 
-      if (!availableToolNames.has(tc.name)) {
+      const isAllowedPlanDraftMutation =
+        workflowMode === "plan" &&
+        !callbacks.getIsPlanApproved() &&
+        isPreApprovalPlanDraftWrite(tc.name, toolArgs);
+      if (!availableToolNames.has(tc.name) && !isAllowedPlanDraftMutation) {
         const isUnapprovedPlanContext = workflowMode === "plan" && !callbacks.getIsPlanApproved();
         const message = planUnsupportedToolFeedbackMessage({
           language: callbacks.getPreferredLanguage(),
@@ -8888,6 +9131,10 @@ export async function executeAgentLoop(
         target,
         availableToolNames,
         language: callbacks.getPreferredLanguage(),
+        allowApprovedPlanDesignWrite:
+          workflowMode === "plan" &&
+          callbacks.getIsPlanApproved() &&
+          runtimeIntent === "execute",
       });
       if (targetingGate.blocked) {
         const message = targetingGate.message || (
@@ -8920,10 +9167,13 @@ export async function executeAgentLoop(
       }
 
       const approvedLocalFileReadPaths = callbacks.getApprovedLocalFileReadPaths();
+      const effectiveAvailableToolNames = isAllowedPlanDraftMutation
+        ? new Set([...availableToolNames, tc.name])
+        : availableToolNames;
       const planned = planRuntimeToolCall({
         toolCall: tc,
         workspace,
-        availableToolNames,
+        availableToolNames: effectiveAvailableToolNames,
         capabilityRegistry: toolCapabilityRegistry,
         toolPermissionPolicy: config.toolPermissionPolicy,
         approvedLocalFileReadPaths,
@@ -9007,7 +9257,7 @@ export async function executeAgentLoop(
             }
             const baseStub = buildFileUnchangedStub(fileReadState);
             const closurePrompt = shouldPushPlanReadLimit
-              ? `\n\n${buildPlanClosurePromptFromEvidence(callbacks, recentPlanToolActivity, attemptedPlanWriteTargets)}`
+              ? `\n\n${buildPlanClosurePromptFromEvidence(callbacks, recentPlanToolActivity, attemptedPlanWriteTargets, latestUserPromptText)}`
               : "";
             const content = shouldPushPlanReadLimit
               ? appendPlanRepeatReadLimitGuidance(
@@ -9123,7 +9373,7 @@ export async function executeAgentLoop(
           }
           const duplicateContent = formatCachedReadOnlyToolResult(tc.name, target, cached, duplicateCount);
           const closurePrompt = shouldPushPlanReadLimit
-            ? `\n\n${buildPlanClosurePromptFromEvidence(callbacks, recentPlanToolActivity, attemptedPlanWriteTargets)}`
+            ? `\n\n${buildPlanClosurePromptFromEvidence(callbacks, recentPlanToolActivity, attemptedPlanWriteTargets, latestUserPromptText)}`
             : "";
           allResults.push({
             toolCallId: tc.id,
@@ -9488,6 +9738,7 @@ export async function executeAgentLoop(
         callbacks,
         recentPlanToolActivity,
         attemptedPlanWriteTargets,
+        latestUserPromptText,
       );
       const hasQualityClosureEvidence = hasGroundedPlanClosureEvidence(
         qualityClosureEvidence,

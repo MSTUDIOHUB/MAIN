@@ -1,4 +1,4 @@
-import { sanitizePlanArtifactContent } from "./sanitize";
+import { sanitizePlanArtifactContent, stripUserOptionsProtocol } from "./sanitize";
 import { parseToolFeedbackEnvelope } from "./toolFeedbackEnvelope";
 import {
   repairActionablePlanArtifactContent,
@@ -6,7 +6,7 @@ import {
   validatePlanArtifactContent,
   type PlanStage,
 } from "./workflowModels";
-import { normalizeTurnInputContextSignals, type TurnInputContextLike } from "./turnIntake";
+import { extractPrimaryUserRequestText, normalizeTurnInputContextSignals, type TurnInputContextLike } from "./turnIntake";
 
 export type MaterializablePlanKind = "plan" | "design";
 export type PlanMaterializationSource =
@@ -55,14 +55,14 @@ export interface SanitizedPlanEvidenceInput {
 }
 
 const PROTOCOL_NOISE_RE = /<\/?(?:tool_use|tool_call|function_call|tool|parameter)\b/i;
-const PROPOSAL_MARKER_RE = /^\s*\[PROPOSAL START\]\s*$/gim;
+const PROPOSAL_MARKER_RE = /^\s*\[\s*(?:PROPOSAL(?:[_\s-]*(?:START|BEGIN|END|STOP))?|START[_\s-]*PROPOSAL|END[_\s-]*PROPOSAL)\s*\]?\s*$/gim;
 const PROPOSED_PLAN_BLOCK_RE = /<proposed_plan(?:\s[^>]*)?>([\s\S]*?)<\/proposed_plan>/i;
 const PROPOSED_PLAN_TAG_RE = /<\/?proposed_plan(?:\s[^>]*)?>/gi;
 const USER_OPTIONS_BLOCK_RE = /^\s*<user_options>\s*$[\s\S]*?^\s*<\/user_options>\s*$/gim;
 const OPTION_BLOCK_RE = /<option\b[^>]*>[\s\S]*?<\/option>/gi;
 const TOOL_LOG_NOISE_RE =
   /Repeated read-only tool call skipped|Duplicate skip count|FILE_UNCHANGED_STUB|already called with identical arguments|后台思考已折叠|thinking process|chain of thought|ContextMemoryState|ContextState|MAIN TOOL FEEDBACK|tool call id|PLAN_REPEAT_READ_LIMIT|上一条\s*Plan\s*回复是空的/i;
-const PLAN_ARTIFACT_PATH_RE = /(?:^|[\\/\s])\.MAIN[\\/]plans[\\/]/i;
+const PLAN_ARTIFACT_PATH_RE = /(?:^|[\\/\s`"'(:=])\.?MAIN[\\/]plans[\\/]/i;
 const RAW_TOOL_RESULT_NOISE_RE =
   /\bREAD_FILE_RESULT\b|\bContextMemory(?:State)?\b|\bContextState\b|\breturnedLines\b|\btotalLines\b|\btotalChars\b|\bPLAN NOT READY\b|\bTASK_TARGETING_BLOCKED\b|\bstatus\s*[:=]\s*(?:failed|blocked|rejected)\b/i;
 const TOOL_META_FIELD_RE =
@@ -81,7 +81,11 @@ const SEMANTIC_EVIDENCE_TOOLS = new Set([
   "glob_search",
   "index_workspace_documents",
 ]);
-const PATH_LIKE_RE = /\b(?:src|app|lib|components|tests|pages|hooks|store|styles|assets|public|server|client|packages|apps|docs|scripts|config|\.MAIN)\/[A-Za-z0-9_./@-]+\b/g;
+const PATH_LIKE_RE = /\b(?:src|app|lib|components|tests|pages|hooks|store|styles|assets|public|server|client|packages|apps|docs|scripts|config|\.?MAIN)\/[A-Za-z0-9_./@-]+\b/g;
+const ACTIONABLE_PLAN_FILE_RE =
+  /^(?:\.?\/)?[A-Za-z0-9_@./-]+\.(?:tsx?|jsx?|swift|py|rs|go|json|csv|tsv|xlsx|md|css|scss|html|toml|yaml|yml)$/i;
+const PLAN_EVIDENCE_REFERENCE_RE =
+  /(?:^|[\s`"'(:=])\.?MAIN[\\/]plans[\\/](?:plan|requirements|tasks|design)\.md\b/i;
 
 const TOOL_LABELS_ZH: Record<string, string> = {
   analyze_tabular_document: "已分析表格数据",
@@ -127,10 +131,10 @@ function detectMaterializationLanguage(input: {
 }
 
 function stripPlanChoiceMarkup(rawText: string): string {
-  return rawText
+  return stripUserOptionsProtocol(rawText)
     .replace(USER_OPTIONS_BLOCK_RE, "")
     .replace(OPTION_BLOCK_RE, "")
-    .replace(/<\/?\s*user_options\s*>/gi, "user options")
+    .replace(/<\/?\s*user_options\s*>/gi, "")
     .replace(/<\/?\s*option\b[^>]*>/gi, "")
     .trim();
 }
@@ -232,6 +236,16 @@ function isPlanArtifactPath(value: unknown): boolean {
   return PLAN_ARTIFACT_PATH_RE.test(String(value || "").replace(/\\/g, "/"));
 }
 
+function isInternalPlanEvidenceText(value: unknown): boolean {
+  return PLAN_EVIDENCE_REFERENCE_RE.test(String(value || "").replace(/\\/g, "/"));
+}
+
+function isActionablePlanFile(value: unknown): boolean {
+  const normalized = String(value || "").replace(/\\/g, "/").trim();
+  if (!normalized || isPlanArtifactPath(normalized)) return false;
+  return ACTIONABLE_PLAN_FILE_RE.test(normalized);
+}
+
 function stripToolMetaFields(value: string): string {
   return value
     .replace(TOOL_META_FIELD_RE, " ")
@@ -251,7 +265,7 @@ function normalizePathLikeCandidate(value: unknown): string {
     .replace(/\\/g, "/")
     .replace(/^[`'"]+|[`'"]+$/g, "")
     .trim();
-  if (!raw || isPlanArtifactPath(raw)) return "";
+  if (!raw || isPlanArtifactPath(raw) || isInternalPlanEvidenceText(raw)) return "";
   if (/ContextMemory|ContextState|\[ContextMemory|^\.\.\.\[/i.test(raw)) return "";
 
   const direct = raw
@@ -262,13 +276,14 @@ function normalizePathLikeCandidate(value: unknown): string {
   if (
     direct &&
     !isPlanArtifactPath(direct) &&
-    /^(?:\.?\/)?[A-Za-z0-9_@./-]+\.(?:tsx?|jsx?|swift|py|rs|go|json|csv|tsv|xlsx|md|css|scss|html|toml|yaml|yml)$/i.test(direct)
+    !isInternalPlanEvidenceText(direct) &&
+    ACTIONABLE_PLAN_FILE_RE.test(direct)
   ) {
     return direct.replace(/^\.\//, "");
   }
 
   const pathMatch = raw.match(PATH_LIKE_RE);
-  const candidate = pathMatch?.find((item) => !isPlanArtifactPath(item)) || "";
+  const candidate = pathMatch?.find((item) => !isPlanArtifactPath(item) && !isInternalPlanEvidenceText(item)) || "";
   return candidate.replace(/^\.\//, "");
 }
 
@@ -293,6 +308,7 @@ function normalizeSemanticToolEvidence(input: {
     .replace(/\b(?:node_modules|dist|build)\/[A-Za-z0-9_./@-]+/gi, " ")
     .replace(/\s+/g, " ")
     .trim();
+  if (isInternalPlanEvidenceText(detail)) return "";
   const cleanDetail = compactPlanLine(detail, 160);
   return [tool, target].filter(Boolean).join(" ") + (cleanDetail ? `; excerpt=${cleanDetail}` : "");
 }
@@ -302,6 +318,7 @@ function sanitizeEvidenceLine(value: unknown, language: "zh" | "en"): { value: s
   if (!raw) return { value: "", reason: "empty" };
   if (PROTOCOL_NOISE_RE.test(raw)) return { value: "", reason: "protocol_noise" };
   if (/ContextMemory|ContextState|\[ContextMemory/i.test(raw)) return { value: "", reason: "context_memory" };
+  if (isInternalPlanEvidenceText(raw)) return { value: "", reason: "plan_artifact_evidence" };
 
   const envelope = parseToolFeedbackEnvelope(raw);
   if (envelope) {
@@ -444,7 +461,8 @@ export function sanitizePlanEvidenceInput(input: {
     }
   }
 
-  const cleanUserGoal = compactPlanLine(input.userGoal || "", 600);
+  const primaryUserGoal = extractPrimaryUserRequestText(String(input.userGoal || ""));
+  const cleanUserGoal = compactPlanLine(primaryUserGoal || input.userGoal || "", 600);
   const cleanEvidence = unique(evidence, Math.max(1, Number(input.maxEvidence) || 12), 220);
   const cleanFiles = unique(files, Math.max(1, Number(input.maxFiles) || 12), 180);
   const cleanConstraints = unique(constraints, Math.max(1, Number(input.maxConstraints) || 6), 220);
@@ -650,6 +668,38 @@ function extractInlineCommands(values: string[], maxItems = 4): string[] {
   return commands;
 }
 
+function buildInsufficientEvidencePlan(input: { goal: string; language: "zh" | "en" }): string {
+  if (input.language === "en") {
+    const summary = input.goal
+      ? [`User goal: ${input.goal}`, "Insufficient targeted evidence exists to produce a decision-complete Codex-style plan."]
+      : ["Blocked: the user goal is empty, so a reviewable implementation target cannot be derived."];
+    return [
+      "# Plan",
+      formatCodexPlanSection("Summary", summary),
+      formatCodexPlanSection("Key Changes", [
+        "Blocked: collect concrete source, data, command, or interface evidence before writing an approved plan.",
+      ]),
+    ].join("\n\n");
+  }
+
+  const summary = input.goal
+    ? [`用户目标：${input.goal}`, "当前定向证据不足，不能生成 decision-complete 的 Codex-style Plan.md。"]
+    : ["阻塞：用户目标为空，无法派生可审批的具体修复目标。"];
+  return [
+    "# 计划",
+    formatCodexPlanSection("摘要", summary),
+    formatCodexPlanSection("关键改动", [
+      "阻塞：需要先补充具体源码、数据、命令或接口证据，再写入可审批计划。",
+    ]),
+  ].join("\n\n");
+}
+
+function summarizeGoalForPlanChange(goal: string, language: "zh" | "en"): string {
+  const compact = compactPlanLine(goal, language === "zh" ? 42 : 56);
+  if (!compact) return language === "zh" ? "用户请求" : "the user request";
+  return compact.replace(/[。.!?？；;:：]\s*$/, "");
+}
+
 function buildCodexStylePlanArtifact(input: {
   userGoal: string;
   evidence: string[];
@@ -659,38 +709,25 @@ function buildCodexStylePlanArtifact(input: {
 }): string {
   const goal = compactPlanLine(input.userGoal, 420);
   const evidence = uniqueCompactLines(input.evidence, 8, 220);
-  const files = uniqueCompactLines(input.files, 8, 160);
+  const files = uniqueCompactLines(input.files, 8, 160).filter(isActionablePlanFile);
   const constraints = uniqueCompactLines(input.constraints, 5, 200);
   const commands = extractInlineCommands([...evidence, ...constraints]);
-  const hasGroundedEvidence = evidence.length > 0 && (files.length > 0 || /CSV|TSV|XLSX|字段|列|指标|数据|表格|dataset|table|metric|column/i.test(`${goal}\n${evidence.join("\n")}`));
+  const hasGroundedEvidence = Boolean(goal) &&
+    evidence.length > 0 &&
+    (files.length > 0 || /CSV|TSV|XLSX|字段|列|指标|数据|表格|dataset|table|metric|column/i.test(`${goal}\n${evidence.join("\n")}`));
 
   if (!hasGroundedEvidence) {
-    return input.language === "en"
-      ? [
-          "# Plan",
-          "## Summary",
-          `- User goal: ${goal || "Prepare a reviewable implementation plan."}`,
-          "- Insufficient targeted evidence exists to produce a decision-complete Codex-style plan.",
-          "## Key Changes",
-          "- Blocked: collect concrete source, data, command, or interface evidence before writing an approved plan.",
-        ].join("\n\n")
-      : [
-          "# 计划",
-          "## 摘要",
-          `- 用户目标：${goal || "生成可审批实现计划。"}`,
-          "- 当前定向证据不足，不能生成 decision-complete 的 Codex-style Plan.md。",
-          "## 关键改动",
-          "- 阻塞：需要先补充具体源码、数据、命令或接口证据，再写入可审批计划。",
-        ].join("\n\n");
+    return buildInsufficientEvidencePlan({ goal, language: input.language });
   }
 
   if (input.language === "en") {
     const scope = files.length > 0 ? files.map((file) => `\`${file}\``).join(", ") : "the confirmed data/reporting surface";
+    const goalSummary = summarizeGoalForPlanChange(goal, "en");
     const changes = files.length > 0
       ? files.slice(0, 6).map((file, index) =>
-          `Update \`${file}\` for the approved goal; grounding evidence: ${evidence[index] || evidence[0]}.`
+          `Implement the smallest verified change in \`${file}\` for ${goalSummary}; confirm the exact edit from evidence before writing. Grounding evidence: ${evidence[index] || evidence[0]}.`
         )
-      : [`Implement the approved data/reporting change using the confirmed evidence: ${evidence[0]}.`];
+      : [`Implement the confirmed data/reporting change for ${goalSummary} using the inspected evidence: ${evidence[0]}.`];
     return [
       "# Plan",
       formatCodexPlanSection("Summary", [
@@ -708,20 +745,21 @@ function buildCodexStylePlanArtifact(input: {
             "Run the focused test, build, or browser/desktop validation for the touched subsystem and record the result.",
           ]),
       formatCodexPlanSection("Assumptions / Defaults", constraints.length > 0
-        ? constraints
-        : [
-            "Default to the smallest implementation that satisfies the approved goal.",
-            "Do not trust new assumptions discovered during implementation until a targeted read or validation confirms them.",
-          ]),
+      ? constraints
+      : [
+          "Default to the smallest implementation that satisfies the user goal.",
+          "Do not trust new assumptions discovered during implementation until a targeted read or validation confirms them.",
+        ]),
     ].join("\n\n");
   }
 
   const scope = files.length > 0 ? files.map((file) => `\`${file}\``).join("、") : "已确认的数据/报表链路";
+  const goalSummary = summarizeGoalForPlanChange(goal, "zh");
   const changes = files.length > 0
     ? files.slice(0, 6).map((file, index) =>
-        `更新 \`${file}\` 以落实已批准目标；依据证据：${evidence[index] || evidence[0]}。`
+        `在 \`${file}\` 中实施与“${goalSummary}”直接相关的最小改动；写入前先用证据确认具体字段、状态或接口。依据证据：${evidence[index] || evidence[0]}。`
       )
-    : [`基于已确认的证据实施数据/报表改动：${evidence[0]}。`];
+    : [`基于已确认的证据实施与“${goalSummary}”相关的数据/报表改动：${evidence[0]}。`];
   return [
     "# 计划",
     formatCodexPlanSection("摘要", [
@@ -769,15 +807,19 @@ export function canonicalizePlanArtifactContent(input: {
   const providedContextCount =
     context.imageParts + context.mentionedFilePaths.length + context.attachedFilePaths.length;
 
+  const explicitInputGoal = compactPlanLine(input.userGoal, 420);
+  const goalSectionTitles = explicitInputGoal ? [] : collectSectionTitles(sections, [
+    /(?:正式计划|修复计划|用户目标|目标|需求|问题|Goal|Objective|User Request|Problem|Issue)/i,
+  ], 3).filter((line) =>
+    !/^(?:用户目标(?:与约束)?|目标|需求|问题|Goal|Objective|User Request|Problem|Issue)$/i.test(line.trim())
+  );
   const goalLines = uniquePlanItems([
-    input.userGoal,
-    ...collectSectionTitles(sections, [
+    explicitInputGoal,
+    ...(explicitInputGoal ? [] : collectLinesFromSections(sections, [
       /(?:正式计划|修复计划|用户目标|目标|需求|问题|Goal|Objective|User Request|Problem|Issue)/i,
-    ], 3),
-    ...collectLinesFromSections(sections, [
-      /(?:正式计划|修复计划|用户目标|目标|需求|问题|Goal|Objective|User Request|Problem|Issue)/i,
-    ], 3),
-    !/^(?:Plan|Proposed Plan|计划|计划草稿|修复方案)$/i.test(title) ? title : "",
+    ], 3)),
+    ...(explicitInputGoal ? [] : goalSectionTitles),
+    !explicitInputGoal && !/^(?:Plan|Proposed Plan|计划|计划草稿|修复方案)$/i.test(title) ? title : "",
   ], 3);
   const screenshotLines = collectLinesFromSections(sections, [
     /(?:截图|附件|图片|视觉|观察|Screenshot|Attachment|Visual|Provided Context|Observation)/i,
@@ -863,8 +905,8 @@ export function canonicalizePlanArtifactContent(input: {
     ...stepLines,
     ...fileLines.slice(0, 4).map((file) =>
       language === "zh"
-        ? `围绕 \`${file}\` 落实已批准目标。`
-        : `Apply the approved change around \`${file}\`.`
+        ? `围绕 \`${file}\` 执行与用户目标直接相关的最小改动。`
+        : `Apply the smallest user-goal-specific change around \`${file}\`.`
     ),
   ], 8);
   const assumptionLines = uniquePlanItems([

@@ -1439,7 +1439,7 @@ test("approved plan execution no-tool replies use execution checkpoint path", as
     });
 });
 
-test("ordinary execute max iterations creates a recovery checkpoint instead of an error card", async ({ page }) => {
+test("ordinary execute repeated read-only loops create a recovery pause instead of an error card", async ({ page }) => {
   test.setTimeout(45_000);
   await page.goto("/?e2eScenario=execute-max-iterations-checkpoint");
 
@@ -1454,18 +1454,20 @@ test("ordinary execute max iterations creates a recovery checkpoint instead of a
         const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
         const systemTexts = snapshot?.systemTexts || [];
         return {
-          hasRecoveryCheckpoint: systemTexts.some((text: string) => /安全边界|恢复点/.test(text)),
-          hasPauseAfterAutoResume: systemTexts.some((text: string) => /执行已暂停|Execution paused/.test(text)),
-          autoResumeCount: snapshot?.planAutoResumeCount ?? 0,
+          hasRecoverablePause: systemTexts.some((text: string) => /执行已暂停|Execution paused/.test(text)),
+          hasReadOnlyRecoveryGuidance: systemTexts.some((text: string) =>
+            /重复只读|复用已读上下文|read-only|reuse read context/i.test(text),
+          ),
+          currentTurnStatus: snapshot?.currentTurnStatus,
           hasErrorTool: (snapshot?.toolNames || []).includes("Error"),
         };
       }),
       { timeout: 35_000 },
     )
     .toEqual({
-      hasRecoveryCheckpoint: true,
-      hasPauseAfterAutoResume: true,
-      autoResumeCount: 1,
+      hasRecoverablePause: true,
+      hasReadOnlyRecoveryGuidance: true,
+      currentTurnStatus: "stopped_no_action",
       hasErrorTool: false,
     });
 });
