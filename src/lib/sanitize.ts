@@ -35,8 +35,14 @@ const TOOL_TAG_NAME_SOURCE = [
   "index_workspace_documents",
   "glob_search",
   "grep_search",
+  "repo_map_status",
+  "repo_map_search",
+  "repo_map_context",
+  "repo_map_files",
+  "repo_map_impact",
   "replace_in_file",
   "write_file",
+  "apply_patch",
   "execute_command",
   "send_pty_input",
   "run_command",
@@ -62,7 +68,7 @@ const USER_OPTIONS_TAG_LINE_RE = /^\s*<\/?\s*user_options\b[^>]*>?\s*$/i;
 const OPTION_TAG_LINE_RE = /^\s*<\/?\s*option\b[^>]*>?\s*$/i;
 
 const RESIDUAL_TOOL_LINE_RE =
-  new RegExp(`^\\s*</?(?:tool(?:[_\\s-]?(?:call|use))?|function(?:[_\\s-]?call)?|parameter|name|get_project_skeleton|get_file_outline|list_directory|read_file|read_document|analyze_tabular_document|query_tabular_document|index_workspace_documents|glob_search|grep_search|replace_in_file|write_file|execute_command|send_pty_input|run_command|browser_evaluate|read_pty_buffer|read_pty_tail|read_pty_since|get_pty_status|clear_pty_buffer)\\b[^>]*>?[\\s|]*$`, "i");
+  new RegExp(`^\\s*</?(?:tool(?:[_\\s-]?(?:call|use))?|function(?:[_\\s-]?call)?|parameter|name|get_project_skeleton|get_file_outline|list_directory|read_file|read_document|analyze_tabular_document|query_tabular_document|index_workspace_documents|glob_search|grep_search|repo_map_status|repo_map_search|repo_map_context|repo_map_files|repo_map_impact|replace_in_file|write_file|apply_patch|execute_command|send_pty_input|run_command|browser_evaluate|read_pty_buffer|read_pty_tail|read_pty_since|get_pty_status|clear_pty_buffer)\\b[^>]*>?[\\s|]*$`, "i");
 const RESIDUAL_PARAMETER_FRAGMENT_LINE_RE =
   /^\s*(?:<\/?parameter(?:\s+name=|[a-z0-9_ -]*["']?\s*>?)|parameter\s+name=)/i;
 const RESIDUAL_BARE_TOOL_CALL_LINE_RE =
@@ -310,7 +316,7 @@ export function stripResidualToolFragments(text: string): string {
     .join("\n");
 
   return withoutResidualProtocolLines
-    .replace(/<\/?\s*(?:tool(?:[_\s-]?(?:call|use))?|function(?:[_\s-]?call)?|parameter[a-z0-9_]*|name|get_project_skeleton|get_file_outline|list_directory|read_file|read_document|analyze_tabular_document|query_tabular_document|index_workspace_documents|glob_search|grep_search|replace_in_file|write_file|execute_command|send_pty_input|run_command|browser_evaluate|read_pty_buffer|read_pty_tail|read_pty_since|get_pty_status|clear_pty_buffer)\b[^>\n]*>/gi, "");
+    .replace(/<\/?\s*(?:tool(?:[_\s-]?(?:call|use))?|function(?:[_\s-]?call)?|parameter[a-z0-9_]*|name|get_project_skeleton|get_file_outline|list_directory|read_file|read_document|analyze_tabular_document|query_tabular_document|index_workspace_documents|glob_search|grep_search|repo_map_status|repo_map_search|repo_map_context|repo_map_files|repo_map_impact|replace_in_file|write_file|apply_patch|execute_command|send_pty_input|run_command|browser_evaluate|read_pty_buffer|read_pty_tail|read_pty_since|get_pty_status|clear_pty_buffer)\b[^>\n]*>/gi, "");
 }
 
 export function stripSpecialStopTokens(text: string): string {

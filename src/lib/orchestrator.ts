@@ -52,6 +52,7 @@ import {
 } from "./replyOptions";
 import { buildToolDiffPreview, type ToolDiffPreview } from "./toolDiff";
 import { preflightWorkspaceMutation } from "./workspaceMutationPreflight";
+import { summarizeApplyPatchTarget } from "./applyPatchTool";
 import { syncPlanArtifactAfterToolSuccess } from "./planArtifactSync";
 import {
   buildReadFileWindowContinuationGuidance,
@@ -165,6 +166,7 @@ import {
 } from "./planExecutionRecovery";
 import {
   describeApprovedPlanRecoveryToolSurface,
+  isApprovedPlanCachedReadOnlyNoProgressBatch,
   isApprovedPlanRecoveryToolName,
   shouldAllowApprovedPlanRecoveryFileRead,
 } from "./approvedPlanRecoveryTools";
@@ -242,13 +244,18 @@ import {
 
 const PRE_APPROVAL_PLAN_FILE_NAMES = new Set(["requirements.md", "plan.md", "design.md"]);
 const EXECUTION_PLAN_FILE_NAMES = new Set(["requirements.md", "plan.md", "tasks.md"]);
-const PLAN_ARTIFACT_MUTATION_TOOLS = new Set(["write_file", "replace_in_file"]);
+const PLAN_ARTIFACT_MUTATION_TOOLS = new Set(["write_file", "replace_in_file", "apply_patch"]);
 const PLAN_REPEAT_READ_LIMIT = 3;
 const PLAN_EXPLORATION_READ_ONLY_TOOLS = new Set([
   "get_project_skeleton",
   "list_directory",
   "glob_search",
   "grep_search",
+  "repo_map_status",
+  "repo_map_search",
+  "repo_map_context",
+  "repo_map_files",
+  "repo_map_impact",
   "read_file",
   "read_document",
   "analyze_tabular_document",
@@ -889,7 +896,7 @@ function rememberReadBeforeModifyEvidence(
     evidence.add(`dir:${normalizeEvidencePath(dir) || "."}`);
     return;
   }
-  if (name === "get_project_skeleton" || name === "glob_search" || name === "grep_search") {
+  if (name === "get_project_skeleton" || name === "glob_search" || name === "grep_search" || name.startsWith("repo_map_")) {
     evidence.add("workspace:structure");
     return;
   }
@@ -1352,6 +1359,11 @@ function getToolTarget(name: string, args: Record<string, unknown>): string {
     case "index_workspace_documents": return (args.path as string) || ".";
     case "glob_search":     return (args.pattern as string) || "";
     case "grep_search":     return (args.query as string) || "";
+    case "repo_map_search": return (args.query as string) || "";
+    case "repo_map_context": return (args.task as string) || "repo map context";
+    case "repo_map_files": return (args.filter as string) || "repo map files";
+    case "repo_map_impact": return (args.target as string) || "";
+    case "repo_map_status": return "repo map";
     case "execute_command": return (args.command as string) || "";
     case "send_pty_input":  return (args.input as string) || "terminal input";
     case "run_command":     return (args.command as string) || "";
@@ -1363,6 +1375,7 @@ function getToolTarget(name: string, args: Record<string, unknown>): string {
     case "clear_pty_buffer": return "terminal buffer";
     case "replace_in_file": return (args.path as string) || "";
     case "write_file":      return (args.path as string) || "";
+    case "apply_patch":     return summarizeApplyPatchTarget((args.patch as string) || "") || "workspace patch";
     default:                return (args.input as string) || name;
   }
 }
@@ -1443,17 +1456,6 @@ function buildExecuteNoActionPauseMessage(input: {
   ].filter(Boolean).join("\n");
 }
 
-function isCachedReadOnlyToolResult(result: ToolExecutionResult): boolean {
-  return (
-    !result.isError &&
-    PLAN_EXPLORATION_READ_ONLY_TOOLS.has(result.name) &&
-    (
-      result.content.includes(FILE_UNCHANGED_STUB) ||
-      /Repeated read-only tool call skipped:/i.test(result.content)
-    )
-  );
-}
-
 function isApprovedPlanRecoveryTool(
   tool: ToolDefinition,
   options: { allowFileRead?: boolean } = {},
@@ -1498,8 +1500,8 @@ function shouldCompactProseCodeDump(input: {
 function buildProseCodeDumpNotice(language: "zh" | "en", charCount: number): string {
   const formatted = charCount.toLocaleString();
   return language === "zh"
-    ? `模型刚才把约 ${formatted} 个字符的代码作为聊天正文输出了，但没有通过写入工具落到真实文件。为避免界面卡死，我已将这段超长正文收起；接下来会强制它改用 \`write_file\` / \`replace_in_file\` 写入项目文件。`
-    : `The model just produced about ${formatted} characters of code as chat text instead of writing real files. To keep the UI responsive, I compacted that oversized reply and will force the next step to use \`write_file\` / \`replace_in_file\` for actual project files.`;
+    ? `模型刚才把约 ${formatted} 个字符的代码作为聊天正文输出了，但没有通过写入工具落到真实文件。为避免界面卡死，我已将这段超长正文收起；接下来会强制它改用 \`apply_patch\` / \`write_file\` / \`replace_in_file\` 写入项目文件。`
+    : `The model just produced about ${formatted} characters of code as chat text instead of writing real files. To keep the UI responsive, I compacted that oversized reply and will force the next step to use \`apply_patch\` / \`write_file\` / \`replace_in_file\` for actual project files.`;
 }
 
 function buildNonActionableStopMessage(language: "zh" | "en", reason: "no_output" | "missing_tool_loop" | "incomplete_plan" | "plain_text_execution"): string {
@@ -2091,7 +2093,7 @@ function buildApprovedPlanNoProgressStrategySwitchPrompt(input: {
       `Unsatisfied task: ${input.remainingText}`,
       input.allowFileRead
         ? "For the next response, MAIN keeps action tools plus targeted file reads available for exact-content or patch recovery. Use one only when needed, then patch or validate."
-        : "For the next response, MAIN keeps action tools plus targeted `read_file`, search, outline, and PTY status tools available. Use `replace_in_file`/`write_file`, run a command, use Browser/Playwright validation, or state the exact blocker if no real action is possible.",
+        : "For the next response, MAIN keeps action tools plus patch-recovery `read_file` only when a patch mismatch just happened. Use `apply_patch`/`replace_in_file`/`write_file`, run a command, use Browser/Playwright validation, or state the exact blocker if no real action is possible.",
       "Do not call read/list/search again for the same cached target. If exact current content is needed, perform one targeted read and immediately continue with patching or validation.",
     ].filter(Boolean).join("\n");
   }
@@ -2104,7 +2106,7 @@ function buildApprovedPlanNoProgressStrategySwitchPrompt(input: {
     `证据未满足任务：${input.remainingText}`,
     input.allowFileRead
       ? "下一轮 MAIN 会保留行动工具和定向文件读取，用于精确内容或 patch 恢复。只在需要时读一次，随后必须写入或验证。"
-      : "下一轮 MAIN 会保留行动工具、定向 `read_file`、搜索、outline 和 PTY 状态工具。请优先使用 `replace_in_file`/`write_file` 修改，运行命令，执行 Browser/Playwright 验证，或说明无法真实行动的具体阻塞。",
+      : "下一轮 MAIN 会保留行动工具；只有刚发生 patch 不匹配时才开放一次定向 `read_file`。请优先使用 `apply_patch` / `replace_in_file` / `write_file` 修改，运行命令，执行 Browser/Playwright 验证，或说明无法真实行动的具体阻塞。",
     "不要再次对同一缓存目标调用 read/list/search；如果确实需要精确当前内容，只做一次定向读取，然后立即继续 patch 或验证。",
   ].filter(Boolean).join("\n");
 }
@@ -2922,8 +2924,8 @@ function buildApprovedPlanContinuationPrompt(callbacks: OrchestratorCallbacks): 
     approvalChoiceHint +
     (callbacks.getPlanTasks().length > 0
       ? language === "zh"
-        ? "计划已批准，现在进入执行阶段（EXECUTION MODE）。MAIN 已有 runtime 任务清单，TopIsland 会直接显示任务进度；不需要为了第一次源码写入强制创建或读取 `.MAIN/plans/tasks.md`。请按当前任务清单逐项执行，使用 <tool_use> 格式调用工具；只有任务较长、需要跨会话审计或用户明确要求留档时，才先把清单持久化到 tasks.md。不要为了确认 tasks.md 是否存在而读取它；只有它已知存在或你正在同步已有审计文件时，才读取/更新。任何需要 shell 的任务都必须在当前任务清单中保留精确命令并用反引号包裹。如果某个源码文件已经读过，再读只返回 `FILE_UNCHANGED_STUB`，不要重复读取，必须转向 `replace_in_file`/`write_file`、读取不同目标，或明确暂停说明阻塞。页面渲染验证必须使用 Browser/Playwright DOM 或截图证据，不能用 curl/grep/cat 代替；Tauri/人工验证不可自动完成时要暂停说明待用户验证。你可以正常修改项目源码文件，写入路径必须是项目中的正确位置，绝对不要将源码写入 `.MAIN/plans/` 或任何隐藏目录。只有全部任务都有真实文件/命令/交付物/浏览器证据满足，或剩余项明确待用户验证后，才能结束执行；如果 tasks.md 已存在，完成任务后再同步更新对应 checkbox。\n"
-        : "The plan is approved. You are now in EXECUTION MODE. MAIN already has a runtime task list, so TopIsland can show task progress without forcing creation or reads of `.MAIN/plans/tasks.md` before the first source write. Execute the current task list with tool calls; persist the list to tasks.md only when the work is long, cross-session, or explicitly needs an audit file. Do not read tasks.md just to check whether it exists; only read/update it when it is already known to exist or you are syncing an existing audit file. Any task that needs shell work must keep the exact command in the current task list using backticks. If a source file has already been read and another read only returns `FILE_UNCHANGED_STUB`, do not reread it; switch to `replace_in_file`/`write_file`, inspect a different target, or pause with the exact blocker. Rendered-page validation requires Browser/Playwright DOM or screenshot evidence; do not substitute curl/grep/cat. If Tauri or manual validation cannot be automated, pause and report pending user validation. You may now edit project source files, but write them to the proper project paths and never into `.MAIN/plans/` or hidden folders. Only stop when every task has satisfied real file/command/deliverable/browser evidence, or remaining items are explicitly pending user validation; if tasks.md exists, update the matching checkbox after evidence exists.\n"
+        ? "计划已批准，现在进入执行阶段（EXECUTION MODE）。MAIN 已有 runtime 任务清单，TopIsland 会直接显示任务进度；不需要为了第一次源码写入强制创建或读取 `.MAIN/plans/tasks.md`。请按当前任务清单逐项执行，使用 <tool_use> 格式调用工具；只有任务较长、需要跨会话审计或用户明确要求留档时，才先把清单持久化到 tasks.md。不要为了确认 tasks.md 是否存在而读取它；只有它已知存在或你正在同步已有审计文件时，才读取/更新。任何需要 shell 的任务都必须在当前任务清单中保留精确命令并用反引号包裹。如果某个源码文件已经读过，再读只返回 `FILE_UNCHANGED_STUB`，不要重复读取，必须转向 `apply_patch`/`replace_in_file`/`write_file`、运行验证、读取不同目标，或明确暂停说明阻塞。页面渲染验证必须使用 Browser/Playwright DOM 或截图证据，不能用 curl/grep/cat 代替；Tauri/人工验证不可自动完成时要暂停说明待用户验证。你可以正常修改项目源码文件，写入路径必须是项目中的正确位置，绝对不要将源码写入 `.MAIN/plans/` 或任何隐藏目录。只有全部任务都有真实文件/命令/交付物/浏览器证据满足，或剩余项明确待用户验证后，才能结束执行；如果 tasks.md 已存在，完成任务后再同步更新对应 checkbox。\n"
+        : "The plan is approved. You are now in EXECUTION MODE. MAIN already has a runtime task list, so TopIsland can show task progress without forcing creation or reads of `.MAIN/plans/tasks.md` before the first source write. Execute the current task list with tool calls; persist the list to tasks.md only when the work is long, cross-session, or explicitly needs an audit file. Do not read tasks.md just to check whether it exists; only read/update it when it is already known to exist or you are syncing an existing audit file. Any task that needs shell work must keep the exact command in the current task list using backticks. If a source file has already been read and another read only returns `FILE_UNCHANGED_STUB`, do not reread it; switch to `apply_patch`/`replace_in_file`/`write_file`, run validation, inspect a different target, or pause with the exact blocker. Rendered-page validation requires Browser/Playwright DOM or screenshot evidence; do not substitute curl/grep/cat. If Tauri or manual validation cannot be automated, pause and report pending user validation. You may now edit project source files, but write them to the proper project paths and never into `.MAIN/plans/` or hidden folders. Only stop when every task has satisfied real file/command/deliverable/browser evidence, or remaining items are explicitly pending user validation; if tasks.md exists, update the matching checkbox after evidence exists.\n"
       : language === "zh"
       ? "计划已批准，现在进入执行阶段（EXECUTION MODE）。请先基于已批准的 plan.md 派生精简 runtime 任务清单；只有任务较长、需要跨会话审计或用户明确要求留档时，才生成 `.MAIN/plans/tasks.md`。不要为了确认 tasks.md 是否存在而读取它。随后按任务逐项执行，使用 <tool_use> 格式调用工具。页面渲染验证必须使用 Browser/Playwright DOM 或截图证据；Tauri/人工验证不可自动完成时要暂停说明待用户验证。你可以正常修改项目源码文件，写入路径必须是项目中的正确位置，绝对不要将源码写入 `.MAIN/plans/` 或任何隐藏目录。只有全部任务都有真实文件/命令/交付物/浏览器证据满足，或剩余项明确待用户验证后，才能结束执行。\n"
       : "The plan is approved. You are now in EXECUTION MODE. First derive a concise runtime task list from the approved plan.md; generate `.MAIN/plans/tasks.md` only when the work is long, cross-session, or explicitly needs an audit file. Do not read tasks.md just to check whether it exists. Then execute the tasks one by one using tool calls. Rendered-page validation requires Browser/Playwright DOM or screenshot evidence; if Tauri or manual validation cannot be automated, pause and report pending user validation. You may now edit project source files, but write them to the proper project paths and never into `.MAIN/plans/` or hidden folders. Only stop when every task has satisfied real file/command/deliverable/browser evidence, or remaining items are explicitly pending user validation.\n") +
@@ -8519,6 +8521,12 @@ export async function executeAgentLoop(
         }
 
         if (shouldMaterializeFallbackPlan) {
+          if (sourceVisibleText.trim()) {
+            callbacks.onAssistantFinalText(sourceVisibleText, [], {
+              hasToolCalls: false,
+              visibility: "substantive_plan_text",
+            });
+          }
           callbacks.appendMessage(buildAssistantHistoryMessage(assistantHistoryText, providerReasoningForHistory));
 
           if (usedPlanRecoveryPrompt) {
@@ -9873,10 +9881,11 @@ export async function executeAgentLoop(
     const approvedPlanCachedReadOnlyBatch =
       workflowMode === "plan" &&
       callbacks.getIsPlanApproved() &&
-      allResults.length > 0 &&
-      allResults.every((result) => PLAN_EXPLORATION_READ_ONLY_TOOLS.has(result.name)) &&
-      successfulReadOnlyExplorationResults.some(isCachedReadOnlyToolResult) &&
-      !sawExecuteOperationEvidence;
+      isApprovedPlanCachedReadOnlyNoProgressBatch({
+        results: allResults,
+        readOnlyTools: PLAN_EXPLORATION_READ_ONLY_TOOLS,
+        sawExecutionEvidence: sawExecuteOperationEvidence,
+      });
     let approvedPlanNoProgressDecision: {
       action: "recover" | "pause";
       reason: string;

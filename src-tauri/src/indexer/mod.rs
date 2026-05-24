@@ -17,6 +17,7 @@ pub struct RepositoryIndex {
     pub generated_at_ms: u64,
     pub symbols: Vec<SymbolEntry>,
     pub imports: Vec<ImportEdge>,
+    pub calls: Vec<CallEdge>,
     pub dependencies: Vec<DependencyEdge>,
     pub embeddings: Vec<EmbeddingRecord>,
 }
@@ -37,6 +38,14 @@ pub struct ImportEdge {
     pub from: String,
     pub to: String,
     pub kind: String,
+    pub line: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallEdge {
+    pub from: String,
+    pub symbol: String,
     pub line: usize,
 }
 
@@ -82,6 +91,7 @@ impl RepositoryIndexer {
             .join(".MAIN")
             .join("index")
             .join("repository_index.json");
+        let repo_map_path = self.root.join(".MAIN").join("index").join("repo_map.db");
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
@@ -92,6 +102,11 @@ impl RepositoryIndexer {
         tokio::fs::write(&path, json)
             .await
             .map_err(|error| format!("写入 repository index 失败 {}: {error}", path.display()))?;
+        let repo_map_json = serde_json::to_vec(&index)
+            .map_err(|error| format!("序列化 repo_map 失败: {error}"))?;
+        tokio::fs::write(&repo_map_path, repo_map_json)
+            .await
+            .map_err(|error| format!("写入 repo_map 失败 {}: {error}", repo_map_path.display()))?;
         Ok((index, path))
     }
 }
@@ -102,6 +117,7 @@ fn build_repository_index_sync(root: &Path) -> Result<RepositoryIndex, String> {
         .map_err(|error| format!("解析 repository root 失败 {}: {error}", root.display()))?;
     let mut symbols = Vec::new();
     let mut imports = Vec::new();
+    let mut calls = Vec::new();
     let mut dependencies = Vec::new();
     let mut embeddings = Vec::new();
 
@@ -132,6 +148,7 @@ fn build_repository_index_sync(root: &Path) -> Result<RepositoryIndex, String> {
 
         symbols.extend(extract_symbols(&relative, path, &content));
         imports.extend(extract_imports(&relative, path, &content));
+        calls.extend(extract_calls(&relative, path, &content));
         dependencies.extend(extract_dependencies(&relative, path, &content));
         if should_embed_file(path) {
             embeddings.push(EmbeddingRecord {
@@ -148,6 +165,7 @@ fn build_repository_index_sync(root: &Path) -> Result<RepositoryIndex, String> {
         generated_at_ms: now_millis(),
         symbols,
         imports,
+        calls,
         dependencies,
         embeddings,
     })
@@ -312,6 +330,48 @@ fn extract_imports(relative: &str, path: &Path, content: &str) -> Vec<ImportEdge
     edges
 }
 
+fn extract_calls(relative: &str, path: &Path, content: &str) -> Vec<CallEdge> {
+    let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
+        return Vec::new();
+    };
+    if !matches!(
+        extension,
+        "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "rs" | "py"
+    ) {
+        return Vec::new();
+    }
+
+    let call_regex = Regex::new(r"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\(")
+        .expect("static call regex must compile");
+    let skip: HashSet<&str> = [
+        "if", "for", "while", "switch", "catch", "function", "return", "typeof", "sizeof",
+        "match", "loop", "async", "await", "def", "class", "new",
+    ]
+    .into_iter()
+    .collect();
+    let mut edges = Vec::new();
+    for (line_index, line) in content.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") || trimmed.starts_with('#') || trimmed.starts_with('*') {
+            continue;
+        }
+        for capture in call_regex.captures_iter(line) {
+            let Some(symbol) = capture.get(1).map(|value| value.as_str()) else {
+                continue;
+            };
+            if skip.contains(symbol) {
+                continue;
+            }
+            edges.push(CallEdge {
+                from: relative.to_string(),
+                symbol: symbol.to_string(),
+                line: line_index + 1,
+            });
+        }
+    }
+    edges
+}
+
 fn extract_dependencies(relative: &str, path: &Path, content: &str) -> Vec<DependencyEdge> {
     match path.file_name().and_then(|name| name.to_str()) {
         Some("package.json") => extract_package_json_dependencies(relative, content),
@@ -464,6 +524,7 @@ mod tests {
                 .iter()
                 .any(|symbol| symbol.name == "AgentRuntime"));
             assert!(index.imports.iter().any(|edge| edge.to == "crate::runtime"));
+            assert!(index.calls.iter().any(|edge| edge.symbol == "run_agent"));
             assert!(index
                 .dependencies
                 .iter()

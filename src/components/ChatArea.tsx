@@ -839,9 +839,9 @@ function collectTurnChangeEntries(blocks: any[]) {
 }
 
 const TOOL_SUMMARY_GROUPS = {
-  read: new Set(["get_project_skeleton", "get_file_outline", "read_file", "read_document", "list_directory", "glob_search", "grep_search", "index_workspace_documents"]),
+  read: new Set(["get_project_skeleton", "get_file_outline", "read_file", "read_document", "list_directory", "glob_search", "grep_search", "repo_map_status", "repo_map_search", "repo_map_context", "repo_map_files", "repo_map_impact", "index_workspace_documents"]),
   table: new Set(["analyze_tabular_document", "query_tabular_document"]),
-  edit: new Set(["replace_in_file", "write_file"]),
+  edit: new Set(["replace_in_file", "write_file", "apply_patch"]),
   command: new Set(["execute_command", "send_pty_input", "run_command", "browser_evaluate", "read_pty_buffer", "read_pty_tail", "read_pty_since", "get_pty_status", "clear_pty_buffer"]),
 };
 
@@ -853,6 +853,11 @@ const READ_CONTEXT_TOOL_NAMES = new Set([
   "list_directory",
   "glob_search",
   "grep_search",
+  "repo_map_status",
+  "repo_map_search",
+  "repo_map_context",
+  "repo_map_files",
+  "repo_map_impact",
   "index_workspace_documents",
 ]);
 
@@ -864,6 +869,11 @@ const READ_CONTEXT_TOOL_LABELS: Record<string, { zh: string; en: string }> = {
   list_directory: { zh: "扫描目录", en: "Scan directory" },
   glob_search: { zh: "搜索文件", en: "Search files" },
   grep_search: { zh: "搜索内容", en: "Search content" },
+  repo_map_status: { zh: "检查代码图谱", en: "Check repo map" },
+  repo_map_search: { zh: "搜索代码图谱", en: "Search repo map" },
+  repo_map_context: { zh: "读取代码图谱", en: "Read repo map" },
+  repo_map_files: { zh: "查看代码图谱文件", en: "Inspect repo-map files" },
+  repo_map_impact: { zh: "分析影响范围", en: "Analyze impact" },
   index_workspace_documents: { zh: "索引文档", en: "Index documents" },
 };
 
@@ -902,7 +912,7 @@ function isReadContextHardBoundary(block: any) {
   }
   if (block.type === "tool") {
     if (block.toolStatus !== "pending") return !isCompletedReadContextTool(block);
-    return block.toolName !== "write_file" && block.toolName !== "replace_in_file";
+    return block.toolName !== "write_file" && block.toolName !== "replace_in_file" && block.toolName !== "apply_patch";
   }
   return false;
 }
@@ -1102,7 +1112,7 @@ function getActiveTurnActivity(blocks: any[], turnStatus: string, language: "zh"
   if (runningTool) {
     const target = String(runningTool.target || runningTool.toolName || "").split("/").pop() || runningTool.toolName;
     const tableTools = new Set(["analyze_tabular_document", "query_tabular_document"]);
-    const readTools = new Set(["read_file", "read_document", "list_directory", "glob_search", "grep_search", "index_workspace_documents", "get_project_skeleton"]);
+    const readTools = new Set(["read_file", "read_document", "list_directory", "glob_search", "grep_search", "repo_map_status", "repo_map_search", "repo_map_context", "repo_map_files", "repo_map_impact", "index_workspace_documents", "get_project_skeleton"]);
     const commandTools = new Set(["execute_command", "run_command", "browser_evaluate", "send_pty_input"]);
     const toolName = String(runningTool.toolName || "");
     const prefix = language === "zh"
@@ -2984,10 +2994,10 @@ export default function ChatArea({
     if (block.type === "tool") {
       const shouldHidePendingTool =
         block.toolStatus === "pending" &&
-        (block.toolName === "write_file" || block.toolName === "replace_in_file");
+        (block.toolName === "write_file" || block.toolName === "replace_in_file" || block.toolName === "apply_patch");
       if (shouldHidePendingTool) return null;
       if (
-        (block.toolName === "write_file" || block.toolName === "replace_in_file") &&
+        (block.toolName === "write_file" || block.toolName === "replace_in_file" || block.toolName === "apply_patch") &&
         isEphemeralPlanArtifactPath(block.target)
       ) {
         return null;

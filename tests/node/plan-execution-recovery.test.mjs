@@ -72,6 +72,7 @@ const {
 
 const {
   describeApprovedPlanRecoveryToolSurface,
+  isApprovedPlanCachedReadOnlyNoProgressBatch,
   isApprovedPlanRecoveryToolName,
   shouldAllowApprovedPlanRecoveryFileRead,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/approvedPlanRecoveryTools.ts"));
@@ -340,6 +341,7 @@ test("approved plan no-progress recovery keeps targeted reads without broad disc
     "glob_search",
     "grep_search",
     "read_file",
+    "apply_patch",
     "replace_in_file",
     "write_file",
     "run_command",
@@ -356,14 +358,11 @@ test("approved plan no-progress recovery keeps targeted reads without broad disc
   );
 
   assert.deepEqual(cachedReadRecoveryTools, [
-    "grep_search",
-    "read_file",
+    "apply_patch",
     "replace_in_file",
     "write_file",
     "run_command",
     "browser_evaluate",
-    "get_file_outline",
-    "get_pty_status",
   ]);
   assert.equal(patchRecoveryTools.includes("read_file"), true);
   assert.equal(patchRecoveryTools.includes("list_directory"), false);
@@ -386,8 +385,28 @@ test("approved plan no-progress recovery keeps targeted reads without broad disc
     ]),
     false,
   );
-  assert.equal(describeApprovedPlanRecoveryToolSurface(false), "action_plus_targeting_reads");
+  assert.equal(describeApprovedPlanRecoveryToolSurface(false), "action_only");
   assert.equal(describeApprovedPlanRecoveryToolSurface(true), "action_plus_patch_file_read");
+  assert.equal(
+    isApprovedPlanCachedReadOnlyNoProgressBatch({
+      readOnlyTools,
+      results: [
+        { name: "read_file", isError: false, detail: "FILE_UNCHANGED_STUB: src/App.tsx" },
+        { name: "read_file", isError: false, detail: "READ_FILE_RESULT path: src/index.css" },
+      ],
+    }),
+    false,
+  );
+  assert.equal(
+    isApprovedPlanCachedReadOnlyNoProgressBatch({
+      readOnlyTools,
+      results: [
+        { name: "read_file", isError: false, detail: "FILE_UNCHANGED_STUB: src/App.tsx" },
+        { name: "read_file", isError: false, content: "Repeated read-only tool call skipped: src/hooks/useCsvParser.ts" },
+      ],
+    }),
+    true,
+  );
   assert.match(
     orchestratorSource,
     /recoveryIterationAllTools\.filter\(\(tool\)\s*=>\s*isApprovedPlanRecoveryTool\(tool,[\s\S]*allowFileRead: allowApprovedPlanRecoveryFileRead/,
@@ -396,7 +415,7 @@ test("approved plan no-progress recovery keeps targeted reads without broad disc
     orchestratorSource,
     /rawIterationAllTools\.filter\(isApprovedPlanActionTool\)/,
   );
-  assert.match(orchestratorSource, /targeted `read_file`/);
+  assert.match(orchestratorSource, /patch-recovery `read_file` only/);
   assert.match(orchestratorSource, /exact current content/);
 });
 

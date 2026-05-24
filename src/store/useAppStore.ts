@@ -337,7 +337,7 @@ function resolveSessionAutoApproveScopeForToolCall(toolCall: {
   risk?: string;
 }): SessionAutoApproveScope | null {
   if (toolCall.risk === "local_file_read") return null;
-  if (toolCall.name === "write_file" || toolCall.name === "replace_in_file") return "workspace_write";
+  if (toolCall.name === "write_file" || toolCall.name === "replace_in_file" || toolCall.name === "apply_patch") return "workspace_write";
   if (toolCall.name === "run_command" || toolCall.name === "execute_command" || toolCall.name === "send_pty_input") return "shell";
   return null;
 }
@@ -3503,7 +3503,7 @@ function hasRootMarkdownDeliverableEvidence(blocks: TaskBlock[], requestedDocs: 
     const lowerName = docName.toLowerCase();
     return blocks.some((block) => {
       if (block.type !== "tool" || block.toolStatus !== "executed") return false;
-      if (block.toolName !== "write_file" && block.toolName !== "replace_in_file") return false;
+      if (block.toolName !== "write_file" && block.toolName !== "replace_in_file" && block.toolName !== "apply_patch") return false;
       const normalizedTarget = String(block.target || "").replace(/\\/g, "/").toLowerCase();
       if (!normalizedTarget || normalizedTarget.includes(".main/plans/")) return false;
       return normalizedTarget === lowerName || normalizedTarget.endsWith(`/${lowerName}`);
@@ -9477,7 +9477,7 @@ export const useAppStore = create<AppState>()(
             previousObservation,
           });
           const isEphemeralPlanArtifactTool =
-            (toolName === "write_file" || toolName === "replace_in_file") &&
+            (toolName === "write_file" || toolName === "replace_in_file" || toolName === "apply_patch") &&
             isEphemeralPlanArtifactPath(target);
           emitProgressRuntimeEvent(progress, {
             tool: toolName,
@@ -9602,7 +9602,7 @@ export const useAppStore = create<AppState>()(
         onToolDone: (toolName, target, result, meta?: ToolLifecycleMeta) => {
           const language = sessionGet().config.language === "en" ? "en" : "zh";
           const isEphemeralPlanArtifactTool =
-            (toolName === "write_file" || toolName === "replace_in_file") &&
+            (toolName === "write_file" || toolName === "replace_in_file" || toolName === "apply_patch") &&
             isEphemeralPlanArtifactPath(target);
           let completedProgressForEvent = null as ProgressNarration | null;
           sessionSet((s) => {
@@ -9619,7 +9619,7 @@ export const useAppStore = create<AppState>()(
             const previousBlock = updated[idx];
             const resultNoOp = /"noOp"\s*:\s*true/.test(result);
             const noOpWrite =
-              toolName === "write_file" &&
+                  toolName === "write_file" &&
               (
                 resultNoOp ||
                 (
@@ -9690,6 +9690,7 @@ export const useAppStore = create<AppState>()(
                 ? "verified"
                 : toolName === "write_file" ||
                   toolName === "replace_in_file" ||
+                  toolName === "apply_patch" ||
                   toolName === "delete_workspace_path"
                 ? "changed"
                 : "tool_called";
@@ -9758,6 +9759,7 @@ export const useAppStore = create<AppState>()(
           if (
             toolName === "write_file" ||
             toolName === "replace_in_file" ||
+            toolName === "apply_patch" ||
             toolName === "execute_command" ||
             toolName === "delete_workspace_path"
           ) {
@@ -10691,7 +10693,7 @@ export const useAppStore = create<AppState>()(
             return { action: "accept" };
           }
           const isEphemeralPlanArtifactTool =
-            (toolCall.name === "write_file" || toolCall.name === "replace_in_file") &&
+            (toolCall.name === "write_file" || toolCall.name === "replace_in_file" || toolCall.name === "apply_patch") &&
             isEphemeralPlanArtifactPath(toolTarget);
           if (isEphemeralPlanArtifactTool) {
             return { action: "accept" };
@@ -11633,6 +11635,9 @@ function buildFeishuToolPreview(toolName: string, args: Record<string, unknown>)
       stringifyFeishuPreviewValue(args.newText ?? args.new_text),
     ].join("\n");
   }
+  if (toolName === "apply_patch") {
+    return stringifyFeishuPreviewValue(args.patch);
+  }
   const serialized = stringifyFeishuPreviewValue(args);
   return serialized && serialized !== "{}" ? serialized : getToolTarget(toolName, args);
 }
@@ -11713,6 +11718,11 @@ function getToolTarget(name: string, args: Record<string, unknown>): string {
     case "index_workspace_documents": return (args.path as string) || ".";
     case "glob_search":     return (args.pattern as string) || "";
     case "grep_search":     return (args.query as string) || "";
+    case "repo_map_search": return (args.query as string) || "";
+    case "repo_map_context": return (args.task as string) || "repo map context";
+    case "repo_map_files": return (args.filter as string) || "repo map files";
+    case "repo_map_impact": return (args.target as string) || "";
+    case "repo_map_status": return "repo map";
     case "execute_command": return (args.command as string) || "";
     case "send_pty_input":  return (args.input as string) || "terminal input";
     case "run_command":     return (args.command as string) || "";
@@ -11724,6 +11734,7 @@ function getToolTarget(name: string, args: Record<string, unknown>): string {
     case "clear_pty_buffer": return "terminal buffer";
     case "replace_in_file": return (args.path as string) || "";
     case "write_file":      return (args.path as string) || "";
+    case "apply_patch":     return "workspace patch";
     default:                return "";
   }
 }

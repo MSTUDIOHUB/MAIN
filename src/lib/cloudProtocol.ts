@@ -925,7 +925,7 @@ export function compactCloudResponsesInstructions(instructions: string | undefin
     /当前工作区|相对路径|workspace|工作区/i,
     /M Studio|Unity|游戏开发|教程|中文|Region|注释/i,
     /工具调用格式|tool_use|<tool>|parameter|XML/i,
-    /write_file|replace_in_file|run_command|browser_evaluate|read_file|list_directory|get_project_skeleton|glob_search|grep_search/i,
+    /write_file|replace_in_file|apply_patch|run_command|browser_evaluate|read_file|list_directory|get_project_skeleton|glob_search|grep_search|repo_map_search|repo_map_context/i,
     /不要声称.*没有写入|写入工具可用|文件访问|工作区权限/i,
     /TURN INTENT|USER INTENT|执行|修复|实现|计划|报告/i,
     /AGENTS|WORKSPACE INSTRUCTIONS|rules|instructions/i,
@@ -934,7 +934,7 @@ export function compactCloudResponsesInstructions(instructions: string | undefin
     "[Cloud Compact Instructions]",
     "Use concise responses and prefer small tool-driven steps to avoid cloud gateway timeouts.",
     "Tool access is available through XML <tool_use> calls. Workspace read/write tools are available when the user asks for implementation.",
-    "Available key tools: get_project_skeleton, list_directory, read_file, glob_search, grep_search, write_file, replace_in_file, run_command, browser_evaluate.",
+    "Available key tools: repo_map_search, repo_map_context, get_project_skeleton, list_directory, read_file, glob_search, grep_search, apply_patch, write_file, replace_in_file, run_command, browser_evaluate.",
     "Never claim write tools or folder access are unavailable; emit XML tool calls instead.",
   ];
 

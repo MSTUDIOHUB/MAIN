@@ -126,6 +126,7 @@ export interface RepositoryIndex {
   generatedAtMs: number;
   symbols: SymbolEntry[];
   imports: ImportEdge[];
+  calls?: CallEdge[];
   dependencies: DependencyEdge[];
   embeddings: EmbeddingRecord[];
 }
@@ -142,6 +143,12 @@ export interface ImportEdge {
   from: string;
   to: string;
   kind: string;
+  line: number;
+}
+
+export interface CallEdge {
+  from: string;
+  symbol: string;
   line: number;
 }
 

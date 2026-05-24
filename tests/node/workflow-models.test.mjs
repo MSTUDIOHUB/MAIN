@@ -1194,6 +1194,50 @@ test("validateActionablePlanArtifact rejects generic fallback design", () => {
   assert.equal(validateActionablePlanArtifact(generic).ok, false);
 });
 
+test("validateActionablePlanArtifact rejects directory-search grounded generic implementation plan", () => {
+  const generic = [
+    "# 计划",
+    "## 摘要",
+    "- 用户目标：修复 CSV 导入后 Dashboard 数据不显示。",
+    "- 定向证据已覆盖：`src/hooks/useCsvParser.ts`、`src/store/dashboardStore.ts`。",
+    "- 最相关证据：已搜索文件：/ .{ts,tsx,vue}。",
+    "## 关键改动",
+    "- 在 `src/hooks/useCsvParser.ts` 中实施与“修复 CSV 导入后 Dashboard 数据不显示”直接相关的最小改动；写入前先用证据确认具体字段、状态或接口。依据证据：已搜索文件：/ .{ts,tsx,vue}。",
+    "- 在 `src/store/dashboardStore.ts` 中实施与“修复 CSV 导入后 Dashboard 数据不显示”直接相关的最小改动；写入前先用证据确认具体字段、状态或接口。依据证据：已查看目录：src/hooks。",
+    "## 公共 API / 接口 / 类型",
+    "- 默认不新增公共 API。",
+    "## 测试方案",
+    "- 运行受影响子系统验证。",
+    "## 假设与默认值",
+    "- 默认最小变更。",
+  ].join("\n");
+  const result = validateActionablePlanArtifact(generic);
+
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "generic_fallback_plan");
+});
+
+test("validateActionablePlanArtifact rejects file-only smallest-change filler", () => {
+  const generic = [
+    "# 计划",
+    "## 摘要",
+    "- 用户目标：修复 CSV 导入后 Dashboard 数据不显示。",
+    "- 最相关证据：已读取文件：src/hooks/useCsvParser.ts。",
+    "## 关键改动",
+    "- 围绕 `src/hooks/useCsvParser.ts` 执行与用户目标直接相关的最小改动。",
+    "## 公共 API / 接口 / 类型",
+    "- 默认不新增公共 API。",
+    "## 测试方案",
+    "- 运行受影响子系统验证。",
+    "## 假设与默认值",
+    "- 默认最小变更。",
+  ].join("\n");
+  const result = validateActionablePlanArtifact(generic);
+
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "generic_fallback_plan");
+});
+
 test("validateActionablePlanArtifact rejects empty goals and approved-goal filler", () => {
   const bad = [
     "# 计划",

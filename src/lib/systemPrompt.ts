@@ -99,8 +99,14 @@ const TOOL_REQUIRED_ARGUMENTS: Record<string, string> = {
   index_workspace_documents: "path",
   glob_search: "pattern",
   grep_search: "query, path?",
+  repo_map_status: "",
+  repo_map_search: "query, kind?, limit?",
+  repo_map_context: "task, max_nodes?",
+  repo_map_files: "filter?, max_depth?, limit?",
+  repo_map_impact: "target, depth?",
   write_file: "path, content",
   replace_in_file: "path, search, replace",
+  apply_patch: "patch",
   run_command: "command, cwd, description, timeout_ms?",
   browser_evaluate: "url, actions?, checks?, wait_for_text?, screenshot?, timeout_ms?",
   execute_command: "command, cwd, description, wait_ms?, max_chars?",
@@ -236,6 +242,11 @@ const READ_ONLY_BUILT_IN_TOOL_NAMES = [
   "index_workspace_documents",
   "glob_search",
   "grep_search",
+  "repo_map_status",
+  "repo_map_search",
+  "repo_map_context",
+  "repo_map_files",
+  "repo_map_impact",
   "read_pty_buffer",
   "read_pty_tail",
   "read_pty_since",
@@ -245,6 +256,7 @@ const READ_ONLY_BUILT_IN_TOOL_NAMES = [
 
 const WORKFLOW_BUILT_IN_TOOL_NAMES = [
   ...READ_ONLY_BUILT_IN_TOOL_NAMES,
+  "apply_patch",
   "replace_in_file",
   "write_file",
   "run_command",
@@ -648,7 +660,10 @@ export function buildSystemPrompt(
       "read_document",
       "analyze_tabular_document",
       "query_tabular_document",
+      "repo_map_search",
+      "repo_map_context",
       "write_file",
+      "apply_patch",
       "browser_evaluate",
     ]);
     tfl.push("## 工具调用格式");
@@ -673,8 +688,8 @@ export function buildSystemPrompt(
     if (turnIntent === "plan") {
       tfl.push("当前是未批准的计划回合时，优先使用只读证据工具；证据足够后直接输出可见 `<proposed_plan>` 或正式 Proposal。MAIN runtime 会把可见计划物化为 `.MAIN/plans/plan.md`，不要为了完成规划而强制调用 `write_file` / `replace_in_file`。");
     } else {
-      tfl.push("当用户要求实现、修复、生成文件或修改项目时，写入工具可用：必须直接用 XML 调用 `write_file` 或 `replace_in_file`，不要声称当前环境没有写入能力。所有文件访问都以当前工作区为根目录。目录检查优先用 `grep_search`、`glob_search`、`list_directory` 定向定位；只有无线索时才用一次浅层 `get_project_skeleton(depth: 2)`。");
-      tfl.push("实现/生成类任务禁止在聊天区输出完整项目代码或大段 Markdown 代码清单；必须把代码通过 `write_file` / `replace_in_file` 落到真实文件。多文件任务每轮优先只写/改 1-3 个文件，先建立最小可运行骨架，再逐步补齐。");
+      tfl.push("当用户要求实现、修复、生成文件或修改项目时，写入工具可用：优先用 `apply_patch`，也可用 `write_file` 或 `replace_in_file`；不要声称当前环境没有写入能力。所有文件访问都以当前工作区为根目录。目录检查优先用 `repo_map_search` / `repo_map_context`、`grep_search`、`glob_search`、`list_directory` 定向定位；只有无线索时才用一次浅层 `get_project_skeleton(depth: 2)`。");
+      tfl.push("实现/生成类任务禁止在聊天区输出完整项目代码或大段 Markdown 代码清单；必须把代码通过 `apply_patch` / `write_file` / `replace_in_file` 落到真实文件。多文件任务每轮优先只写/改 1-3 个文件，先建立最小可运行骨架，再逐步补齐。");
     }
     tfl.push("");
     tfl.push("### 工具说明：");
@@ -685,11 +700,17 @@ export function buildSystemPrompt(
     addToolDescription("get_project_skeleton", "- get_project_skeleton: (depth?: number) 极速获取项目宏观骨架。仅在没有明确路径/文件名/符号线索时作为一次浅层发现使用，建议 depth: 2；拿到结构后必须转向定向搜索或读取。");
     addToolDescription("get_file_outline", "- get_file_outline: (path: string) 提取 C# 文件的类型定义和 public/protected 成员签名，剔除函数体。用于理解类的接口和耦合关系，无需读取完整源码。");
     addToolDescription("list_directory", "- list_directory: 列出特定目录内容。优先用于用户给出目录、文件附近路径，或通过搜索结果锁定目标后的定向检查。");
+    addToolDescription("repo_map_search", "- repo_map_search: MAIN 内置代码图谱搜索。优先用符号/组件/函数/文件名定位源码，返回文件、行号、签名，不返回大段源码。");
+    addToolDescription("repo_map_context", "- repo_map_context: 根据任务从内置代码图谱生成小型上下文包，包含相关文件、符号、行号和关系摘要；拿到行号后再用小窗口 read_file。");
+    addToolDescription("repo_map_impact", "- repo_map_impact: 根据符号或文件估算影响范围和测试候选，适合修改后决定验证目标。");
     addToolDescription("read_file", "- read_file: 读取源码、Markdown、JSON、纯文本等可直接按文本处理的文件窗口。支持 start_line/end_line/max_lines；大文件会返回 truncated、returnedLines、nextStartLine。遇到报错行号时读附近窗口；" + (shellToolsAvailable ? "不要用 run_command/cat/sed/head/tail 作为常规文件分页工具。" : "不要用 shell 命令作为常规文件分页工具。"));
     addToolDescription("read_document", "- read_document: 读取 PDF、DOCX、XLSX、CSV、TSV 等文档内容，返回提取文本和来源元数据（页码、sheet、单元格范围等）；对表格文件可结合 `row_offset` / `max_rows` 做分段读取。");
     addToolDescription("analyze_tabular_document", "- analyze_tabular_document: 对 CSV、TSV、XLSX 等大表格做全表统计分析，返回总行数、列概况、缺失值、数值统计和样本行。处理大型表格时优先用它，而不是盲目把整张表塞进上下文。");
     addToolDescription("query_tabular_document", "- query_tabular_document: 对 CSV、TSV、XLSX 做结构化查询，支持筛选、选列、排序、分页、分组聚合。要回答计数、汇总、Top N、条件过滤等问题时优先用它。");
     addToolDescription("index_workspace_documents", "- index_workspace_documents: 扫描某个目录中的文档文件并生成索引摘要。适合先了解资料库，再决定进一步读取哪些文件。");
+    addToolDescription("apply_patch", "- apply_patch: 用补丁真实修改工作区文件。优先使用 Codex 风格 `*** Begin Patch` / `*** End Patch` 与 `*** Update File:`、`*** Add File:`、`*** Delete File:`；也兼容常见 `--- a/file` / `+++ b/file` unified diff。上下文必须来自当前文件内容。");
+    addToolDescription("replace_in_file", "- replace_in_file: 精确替换单个文件中的旧文本。只有 search_text 与当前文件完全一致时才会写入；不匹配时只允许定向读取一次当前内容再重试。");
+    addToolDescription("write_file", "- write_file: 完整创建或覆盖文件。适合新文件或全文件重写；已有文件同内容写入会被视为无效进展。");
     addToolDescription("run_command", "- run_command: 同步执行一次性 shell 命令并等待完成，返回 stdout、stderr、exitCode、timedOut、durationMs。必须传 `description` 和工作区相对 `cwd`（根目录用 `.`），长命令设置 `timeout_ms`。运行测试、构建、Python 脚本、Git 状态检查/提交/推送等有限命令时优先使用它，并基于返回结果总结成功/失败；不要把它当作常规文件分页读取工具。");
     addToolDescription("browser_evaluate", "- browser_evaluate: 打开本地 dev server 或工作区内 file:// 页面进行真实浏览器验证。必须传 `url`；可传 `actions`（逐行：click/fill/press/select_file/wait_for_selector/wait_for_text）和 `checks`（逐行：text/not_text/selector/not_selector/title/console/not_console/no_console_errors）。用于 UI/DOM/console 渲染验证；不要用 curl/grep/cat 替代它。");
     addToolDescription("execute_command", "- execute_command: 向集成 PTY 发送命令，适合开发服务器、watch 模式、交互式程序或需要保留终端上下文的命令。必须传 `description` 和工作区相对 `cwd`（根目录用 `.`），不要在 command 里用 `cd ... &&` 代替 cwd。可传 `wait_ms` 等待输出，默认 4000，最多 30000。它返回本次发送后的新增输出和 offset；后续用 read_pty_since/read_pty_tail/get_pty_status 继续检查。");

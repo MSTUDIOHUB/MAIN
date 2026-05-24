@@ -1884,6 +1884,16 @@ export function validateActionablePlanArtifact(
   if (/(?:最小可用闭环|smallest useful workflow|Use the inspected context as the source of truth|基于当前可用的只读证据|available read-only evidence|基于已确认的证据先收窄实现目标|实施满足用户目标的最小源码变更|Use the confirmed evidence to narrow the implementation target|Apply the smallest source changes that satisfy the user goal)/i.test(raw)) {
     return classifyPlanArtifactQualityResult({ ok: false, reason: "generic_fallback_plan" });
   }
+  if (/(?:直接相关的最小改动；写入前先用证据确认具体字段、状态或接口|smallest verified change .*confirm the exact edit from evidence before writing)/i.test(raw)) {
+    return classifyPlanArtifactQualityResult({ ok: false, reason: "generic_fallback_plan" });
+  }
+  if (/(?:围绕\s*`?[^`\n]+`?\s*执行与用户目标直接相关的最小改动|Apply the smallest user-goal-specific change around)/i.test(raw)) {
+    return classifyPlanArtifactQualityResult({ ok: false, reason: "generic_fallback_plan" });
+  }
+  const discoveryGroundingCount = (raw.match(/(?:依据证据|Grounding evidence)\s*[:：]\s*(?:已搜索文件|已查看目录|已查看项目结构|Searched files|Listed directory|Inspected project structure)/gi) || []).length;
+  if (discoveryGroundingCount >= 2) {
+    return classifyPlanArtifactQualityResult({ ok: false, reason: "generic_fallback_plan" });
+  }
   if (/(?:^|\n)\s*(?:[-*]\s*)?(?:用户目标|User goal)\s*[:：]\s*(?:$|\n)/i.test(raw)) {
     return classifyPlanArtifactQualityResult({ ok: false, reason: "empty_user_goal" });
   }
@@ -2024,7 +2034,7 @@ export function collectChangeEntries(
 
   blocks.forEach((block, order) => {
     if (block.type !== "tool" || block.toolStatus !== "executed" || !block.diff) return;
-    if (block.toolName !== "write_file" && block.toolName !== "replace_in_file") return;
+    if (block.toolName !== "write_file" && block.toolName !== "replace_in_file" && block.toolName !== "apply_patch") return;
     if (block.revertStatus === "reverted") return;
 
     const target = String(block.target || block.diff.path || block.toolName || "");

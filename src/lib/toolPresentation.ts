@@ -7,6 +7,11 @@ const TOOL_VERB_LABELS: Record<string, { zh: string; en: string }> = {
   get_file_outline: { zh: "读取文件结构", en: "Read file outline" },
   glob_search: { zh: "搜索文件", en: "Search files" },
   grep_search: { zh: "搜索内容", en: "Search content" },
+  repo_map_status: { zh: "检查代码图谱", en: "Check repo map" },
+  repo_map_search: { zh: "搜索代码图谱", en: "Search repo map" },
+  repo_map_context: { zh: "读取代码图谱上下文", en: "Read repo-map context" },
+  repo_map_files: { zh: "查看代码图谱文件", en: "Inspect repo-map files" },
+  repo_map_impact: { zh: "分析影响范围", en: "Analyze impact" },
   read_file: { zh: "读取文件", en: "Read file" },
   read_document: { zh: "读取文档", en: "Read document" },
   analyze_tabular_document: { zh: "分析表格", en: "Analyze table" },
@@ -14,6 +19,7 @@ const TOOL_VERB_LABELS: Record<string, { zh: string; en: string }> = {
   index_workspace_documents: { zh: "索引文档", en: "Index documents" },
   replace_in_file: { zh: "修改文件", en: "Edit file" },
   write_file: { zh: "写入文件", en: "Write file" },
+  apply_patch: { zh: "应用补丁", en: "Apply patch" },
   execute_command: { zh: "执行命令", en: "Run command" },
   run_command: { zh: "运行命令", en: "Run command" },
   browser_evaluate: { zh: "浏览器验证", en: "Validate in browser" },
@@ -34,6 +40,11 @@ const DISCOVERY_TOOLS = new Set([
   "list_directory",
   "glob_search",
   "grep_search",
+  "repo_map_status",
+  "repo_map_search",
+  "repo_map_context",
+  "repo_map_files",
+  "repo_map_impact",
   "index_workspace_documents",
   "find_gameobjects",
 ]);
@@ -47,7 +58,7 @@ const INSPECTION_TOOLS = new Set([
   "execute_code",
 ]);
 
-const EDIT_TOOLS = new Set(["replace_in_file", "write_file"]);
+const EDIT_TOOLS = new Set(["replace_in_file", "write_file", "apply_patch"]);
 const COMMAND_TOOLS = new Set([
   "execute_command",
   "run_command",

@@ -1,5 +1,6 @@
 import { getChatTempRoot, readChatTempFile, readFile } from "./ipc";
 import { isChatAttachmentPath } from "./attachments";
+import { previewApplyPatch, summarizeApplyPatchTarget } from "./applyPatchTool";
 
 export interface ToolDiffPreview {
   old: string;
@@ -10,7 +11,7 @@ export interface ToolDiffPreview {
 }
 
 export function supportsToolDiffPreview(toolName: string): boolean {
-  return toolName === "write_file" || toolName === "replace_in_file";
+  return toolName === "write_file" || toolName === "replace_in_file" || toolName === "apply_patch";
 }
 
 interface ToolDiffPreviewContext {
@@ -79,6 +80,38 @@ export async function buildToolDiffPreview(
       new: typeof toolArgs.content === "string" ? toolArgs.content : "",
       ...(path ? { path } : {}),
       existed,
+      fullFile: true,
+    };
+  }
+
+  if (toolName === "apply_patch") {
+    const patch = typeof toolArgs.patch === "string" ? toolArgs.patch : "";
+    if (!patch.trim()) return undefined;
+    const preview = await previewApplyPatch(patch, (path) => readPreviewFile(path, context));
+    if (!preview.ok || preview.changes.length === 0) {
+      return {
+        old: "",
+        new: patch,
+        path: summarizeApplyPatchTarget(patch) || "workspace patch",
+        existed: false,
+        fullFile: false,
+      };
+    }
+    if (preview.changes.length === 1) {
+      const change = preview.changes[0];
+      return {
+        old: change.oldContent,
+        new: change.newContent,
+        path: change.path,
+        existed: change.existed,
+        fullFile: true,
+      };
+    }
+    return {
+      old: preview.changes.map((change) => `--- ${change.path}\n${change.oldContent}`).join("\n"),
+      new: preview.changes.map((change) => `+++ ${change.path}\n${change.newContent}`).join("\n"),
+      path: summarizeApplyPatchTarget(patch),
+      existed: true,
       fullFile: true,
     };
   }

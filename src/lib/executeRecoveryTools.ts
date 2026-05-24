@@ -23,7 +23,6 @@ export interface ExecuteRecoveryResultLike {
 export const EXECUTE_RECOVERY_TARGETING_TOOLS = new Set([
   "grep_search",
   "get_file_outline",
-  "read_file",
   "read_pty_buffer",
   "read_pty_tail",
   "read_pty_since",
@@ -74,7 +73,7 @@ export function isExecuteRecoveryToolName(
   if (mode === "normal") return true;
   if (!readOnlyTools.has(name)) return true;
   if (mode === "action_only") return false;
-  if (EXECUTE_RECOVERY_TARGETING_TOOLS.has(name)) return true;
+  if (mode === "action_plus_targeting" && EXECUTE_RECOVERY_TARGETING_TOOLS.has(name)) return true;
   return Boolean(
     (mode === "patch_recovery_read" || options.allowFileRead) &&
     EXECUTE_RECOVERY_PATCH_READ_TOOLS.has(name)
@@ -206,7 +205,7 @@ export function buildExecuteRecoveryPrompt(input: {
       recent ? `Recent tool activity: ${recent}.` : "",
       input.allowFileRead
         ? "A targeted `read_file` is available to repair exact-content or patch mismatch problems; after that, patch, run a finite command, use browser validation, or state the exact blocker."
-        : "Targeted `read_file`, `grep_search`, and outlines remain available, but broad repeated reads are not the recovery path. Reuse cached context and take the next concrete action: `replace_in_file`/`write_file`, run a finite command, use browser validation, or state the exact blocker.",
+        : "No `read_file` is available in this recovery step. Reuse cached context and take the next concrete action: `apply_patch`/`replace_in_file`/`write_file`, run a finite command, use browser validation, or state the exact blocker.",
       "Do not start a new broad scan, do not reread the same files, and do not output another plan instead of action.",
     ].filter(Boolean).join("\n");
   }
@@ -219,7 +218,7 @@ export function buildExecuteRecoveryPrompt(input: {
     recent ? `最近工具活动：${recent}。` : "",
     input.allowFileRead
       ? "现在可使用定向 `read_file` 来修复精确内容或 patch mismatch；随后必须改为写入、运行有限命令、浏览器验证，或说明精确阻塞。"
-      : "定向 `read_file`、`grep_search` 和 outline 仍可用，但恢复路径不是重复泛读。请复用已缓存上下文，执行下一个具体动作：`replace_in_file` / `write_file`、运行有限命令、浏览器验证，或说明精确阻塞。",
+      : "这个恢复步骤不再开放 `read_file`。请复用已缓存上下文，执行下一个具体动作：`apply_patch` / `replace_in_file` / `write_file`、运行有限命令、浏览器验证，或说明精确阻塞。",
     "不要开启新一轮泛读，不要重复读取同一批文件，也不要用新的方案文档替代执行动作。",
   ].filter(Boolean).join("\n");
 }

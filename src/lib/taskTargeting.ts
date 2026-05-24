@@ -294,10 +294,10 @@ export function buildTaskTargetingProfile(input: BuildTaskTargetingProfileInput 
   const preferredReadTools = facets.has("tabular_data")
     ? ["analyze_tabular_document", "query_tabular_document", "read_document"]
     : hasScopedTarget
-    ? ["grep_search", "glob_search", "list_directory", "get_file_outline", "read_file"]
+    ? ["repo_map_search", "repo_map_context", "grep_search", "glob_search", "list_directory", "get_file_outline", "read_file"]
     : hasProvidedContext
-    ? ["grep_search", "glob_search", "list_directory", "read_file", "get_file_outline"]
-    : ["get_project_skeleton", "list_directory", "grep_search"];
+    ? ["repo_map_context", "repo_map_search", "grep_search", "glob_search", "list_directory", "read_file", "get_file_outline"]
+    : ["repo_map_files", "repo_map_search", "get_project_skeleton", "list_directory", "grep_search"];
 
   const reasons: string[] = [];
   if (hasScopedTarget) reasons.push("explicit target cues detected; prefer scoped search/read");
@@ -339,6 +339,7 @@ export function getTaskTargetingEvidenceKey(
   target?: string,
 ): string | null {
   if (toolName === "get_project_skeleton") return "tool:get_project_skeleton";
+  if (toolName.startsWith("repo_map_")) return `tool:${toolName}`;
   if (toolName === "read_file" || toolName === "read_document" || toolName === "get_file_outline") {
     const path = String(args.path || args.file_path || target || "").trim();
     return path ? `path:${normalizeSlashPath(path)}` : null;
@@ -467,7 +468,7 @@ export function shouldBlockToolCallForTargeting(input: TaskTargetingToolGateInpu
   }
 
   if (
-    (input.toolName === "write_file" || input.toolName === "replace_in_file") &&
+    (input.toolName === "write_file" || input.toolName === "replace_in_file" || input.toolName === "apply_patch") &&
     target &&
     isUiSourcePath(target) &&
     input.profile.requiresDesignProtocol &&

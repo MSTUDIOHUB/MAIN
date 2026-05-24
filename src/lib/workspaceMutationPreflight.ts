@@ -1,10 +1,13 @@
+import { previewApplyPatch } from "./applyPatchTool";
+
 export type WorkspaceMutationPreflightReason =
   | "not_applicable"
   | "missing_content"
   | "read_failed"
   | "search_text_mismatch"
   | "empty_change"
-  | "identical_content";
+  | "identical_content"
+  | "invalid_patch";
 
 export interface WorkspaceMutationPreflightResult {
   ok: boolean;
@@ -42,6 +45,8 @@ function buildMessage(input: {
         return `MUTATION_PREFLIGHT_BLOCKED: ${input.toolName} would not change ${input.path}. Do not ask for approval; provide a real edit, run validation, or explain the blocker.`;
       case "identical_content":
         return `MUTATION_PREFLIGHT_BLOCKED: write_file content is identical to ${input.path}. Do not ask for approval; choose a real edit, validation, or a blocker report.`;
+      case "invalid_patch":
+        return `MUTATION_PREFLIGHT_BLOCKED: apply_patch is invalid or would not apply (${input.detail || "invalid patch"}). Do not ask for approval; read the exact target once if needed, then retry with a valid patch.`;
     }
   }
 
@@ -56,6 +61,8 @@ function buildMessage(input: {
       return `MUTATION_PREFLIGHT_BLOCKED: ${input.toolName} 不会改变 ${input.path}。不要请求用户审批；请给出真实改动、执行验证或说明阻塞。`;
     case "identical_content":
       return `MUTATION_PREFLIGHT_BLOCKED: write_file 内容与 ${input.path} 完全相同。不要请求用户审批；请改为真实改动、验证或阻塞说明。`;
+    case "invalid_patch":
+      return `MUTATION_PREFLIGHT_BLOCKED: apply_patch 无效或无法应用（${input.detail || "无效 patch"}）。不要请求用户审批；必要时只定向读取一次目标，然后用有效 patch 重试。`;
   }
 }
 
@@ -80,8 +87,26 @@ export async function preflightWorkspaceMutation(
   const toolName = String(input.toolName || "");
   const path = asText(input.args.path).trim();
 
-  if (toolName !== "replace_in_file" && toolName !== "write_file") {
+  if (toolName !== "replace_in_file" && toolName !== "write_file" && toolName !== "apply_patch") {
     return { ok: true, reason: "not_applicable" };
+  }
+
+  if (toolName === "apply_patch") {
+    const patch = input.args.patch;
+    if (typeof patch !== "string" || !patch.trim()) {
+      return blocked({ reason: "missing_content", toolName, path: "patch", language });
+    }
+    const preview = await previewApplyPatch(patch, input.readFile);
+    if (!preview.ok) {
+      return blocked({
+        reason: "invalid_patch",
+        toolName,
+        path: preview.changes[0]?.path || "patch",
+        language,
+        detail: preview.error,
+      });
+    }
+    return { ok: true };
   }
 
   if (toolName === "write_file") {

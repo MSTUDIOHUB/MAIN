@@ -45,6 +45,8 @@ import {
 import { applyShellCwd } from "./toolExecutionContract";
 import { formatDirectoryNodesForTool } from "./workspacePaths";
 import { formatReadFileWindowForModel, formatReadFileWindowPayloadForModel } from "./readFileWindow";
+import { applyWorkspacePatch, summarizeApplyPatchTarget } from "./applyPatchTool";
+import { repoMapContext, repoMapFiles, repoMapImpact, repoMapSearch, repoMapStatus } from "./repoMapTools";
 
 /** Delay helper for waiting on PTY output after a command. */
 function sleep(ms: number): Promise<void> {
@@ -316,6 +318,21 @@ export async function executeTool(
       return await grepSearch(query, path, workspace);
     }
 
+    case "repo_map_status":
+      return await repoMapStatus(workspace);
+
+    case "repo_map_search":
+      return await repoMapSearch(args, workspace);
+
+    case "repo_map_context":
+      return await repoMapContext(args, workspace);
+
+    case "repo_map_files":
+      return await repoMapFiles(args, workspace);
+
+    case "repo_map_impact":
+      return await repoMapImpact(args, workspace);
+
     case "execute_command": {
       const command = applyShellCwd((args.command as string) || "", args);
       if (!command) throw new Error("Missing required parameter 'command'.");
@@ -517,6 +534,43 @@ export async function executeTool(
       }
       await writeFile(writePath, writeContent, workspace);
       return JSON.stringify({ success: true, message: `File ${writePath} written successfully.` });
+    }
+
+    case "apply_patch": {
+      const patch = (args.patch as string) || "";
+      if (!patch.trim()) throw new Error("Missing required parameter 'patch'.");
+      const readPatchFile = async (path: string) => {
+        return shouldUseChatTempStorage(workspace, sessionKey)
+          ? await readChatTempFile(sessionKey!, path)
+          : await readFile(path, workspace);
+      };
+      const writePatchFile = async (path: string, content: string) => {
+        if (shouldUseChatTempStorage(workspace, sessionKey)) {
+          await writeChatTempFile(sessionKey!, path, content);
+        } else {
+          await writeFile(path, content, workspace);
+        }
+      };
+      const deletePatchPath = async (path: string) => {
+        if (shouldUseChatTempStorage(workspace, sessionKey)) {
+          await deleteChatTempPath(sessionKey!, path);
+        } else {
+          await deleteWorkspacePath(path, workspace);
+        }
+      };
+      const result = await applyWorkspacePatch(patch, {
+        readFile: readPatchFile,
+        writeFile: writePatchFile,
+        deletePath: deletePatchPath,
+      });
+      if (!result.ok) {
+        throw new Error(result.error || "apply_patch failed.");
+      }
+      return JSON.stringify({
+        success: true,
+        message: `Patch applied to ${summarizeApplyPatchTarget(patch) || "workspace"}.`,
+        changedFiles: result.changes.map((change) => change.path),
+      });
     }
 
     case "delete_workspace_path": {

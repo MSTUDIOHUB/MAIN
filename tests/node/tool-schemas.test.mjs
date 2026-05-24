@@ -102,6 +102,19 @@ test("browser validation schema exposes local Playwright checks", () => {
   assert.ok(browserEvaluate.function.parameters.properties.screenshot);
 });
 
+test("repo_map and apply_patch schemas are exposed for built-in code intelligence and edits", () => {
+  const tools = buildToolDefinitions([]);
+  const names = new Set(tools.map((tool) => tool.function.name));
+  assert.equal(names.has("repo_map_search"), true);
+  assert.equal(names.has("repo_map_context"), true);
+  assert.equal(names.has("repo_map_impact"), true);
+  assert.equal(names.has("apply_patch"), true);
+
+  const applyPatch = tools.find((tool) => tool.function.name === "apply_patch");
+  assert.deepEqual(applyPatch.function.parameters.required, ["patch"]);
+  assert.match(applyPatch.function.description, /Codex/);
+});
+
 test("pty observation schemas expose wait controls", () => {
   const tools = buildToolDefinitions([]);
   const readSince = tools.find((tool) => tool.function.name === "read_pty_since");

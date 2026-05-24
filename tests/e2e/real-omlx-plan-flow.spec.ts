@@ -1,16 +1,117 @@
 import { expect, test } from "@playwright/test";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 
 const runRealOmlx = process.env.MAIN_REAL_OMLX_E2E === "1";
 const models = (process.env.OMLX_MODELS || "gemma-4-26b-a4b-it-8bit,Qwen3.6-35B-A3B-6bit")
   .split(",")
   .map((item) => item.trim())
   .filter(Boolean);
+const realOmlxRequest =
+  process.env.REAL_OMLX_REQUEST ||
+  "请修复 src/hooks/useCsvParser.ts，让 CSV creator 字段正确映射为 Dashboard 使用的 creatorName。先生成可审批计划，批准后真实修改并验证。";
+const expectAgentExplanation = process.env.REAL_OMLX_EXPECT_AGENT_TEXT === "1";
 const forbiddenChatNoise = /<tool_use>|<user_options>|\[PROPOSAL START\]|append_debug_log|ContextMemoryState|MAIN TOOL FEEDBACK|^\s*कल\s*$/m;
 
 test.describe.configure({ timeout: 600_000 });
 test.skip(!runRealOmlx, "Set MAIN_REAL_OMLX_E2E=1 to run real local OMLX plan-flow validation.");
 
 test.beforeEach(async ({ page }) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "e2e-real-omlx-"));
+  (page as any).__realOmlxWorkspace = workspace;
+  const seedFiles: Record<string, string> = {
+    "src/hooks/useCsvParser.ts": [
+      "export interface CsvOrder {",
+      "  creator?: string;",
+      "  creatorName?: string;",
+      "}",
+      "",
+      "export function normalizeCsvOrder(row: Record<string, string>): CsvOrder {",
+      "  return {",
+      "    creator: row.creator || row['创建者'] || '',",
+      "  };",
+      "}",
+      "",
+    ].join("\n"),
+    "src/store/dashboardStore.ts": "export const creatorField = 'creatorName';\n",
+    "src/hooks/useChartData.ts": [
+      "import type { CsvOrder } from './useCsvParser';",
+      "export function buildCourseRanking(orders: CsvOrder[]) {",
+      "  return orders.map((order) => ({ name: order.creatorName || order.creator || 'unknown', amount: 1 }));",
+      "}",
+    ].join("\n"),
+    "src/types/order.ts": "export interface Order { creatorName: string; amount: number; status?: string; }\n",
+    "src/App.tsx": "export function App() { return <main className=\"app-shell\"><section className=\"dashboard-panel\" /></main>; }\n",
+    "src/index.css": [
+      ":root { color-scheme: light; background: #ffffff; color: #111827; }",
+      "[data-theme='dark'] { color-scheme: dark; background: #ffffff; color: #e5e7eb; }",
+      ".dashboard-panel { background: #ffffff; border: 1px solid #e5e7eb; }",
+    ].join("\n"),
+    "src/components/Dashboard/CourseBarChart.tsx": "export function CourseBarChart() { return <div data-chart=\"course\" />; }\n",
+    "src/components/Dashboard/TrendLineChart.tsx": "export function TrendLineChart() { return <div data-chart=\"trend\" />; }\n",
+    "src/components/Dashboard/StatusPieChart.tsx": "export function StatusPieChart() { return <div data-chart=\"status\" />; }\n",
+    "src/components/FileUploader/DragUpload.tsx": "export function DragUpload() { return <input type=\"file\" />; }\n",
+    "cn_tutorial_orders_by_creator_20260512.csv": "creator,amount\nalice,12\n",
+  };
+  for (const [relative, content] of Object.entries(seedFiles)) {
+    const absolute = path.join(workspace, relative);
+    await fs.mkdir(path.dirname(absolute), { recursive: true });
+    await fs.writeFile(absolute, content, "utf8");
+  }
+
+  const resolveDiskPath = (rawPath: string) => {
+    const normalized = String(rawPath || ".")
+      .replace(workspace, "")
+      .replace(/^[/\\]+/, "")
+      .replace(/\\/g, "/");
+    return path.join(workspace, normalized || ".");
+  };
+
+  await page.exposeFunction("__MAIN_E2E_DISK_READ", async (rawPath: string) => {
+    return await fs.readFile(resolveDiskPath(rawPath), "utf8");
+  });
+  await page.exposeFunction("__MAIN_E2E_DISK_WRITE", async (rawPath: string, content: string) => {
+    const absolute = resolveDiskPath(rawPath);
+    await fs.mkdir(path.dirname(absolute), { recursive: true });
+    await fs.writeFile(absolute, content, "utf8");
+    return null;
+  });
+  await page.exposeFunction("__MAIN_E2E_DISK_METADATA", async (rawPath: string) => {
+    const absolute = resolveDiskPath(rawPath);
+    const stat = await fs.stat(absolute);
+    return { path: rawPath, sizeBytes: stat.size, modifiedMs: stat.mtimeMs };
+  });
+  await page.exposeFunction("__MAIN_E2E_DISK_GLOB", async () => {
+    const output: string[] = [];
+    const walk = async (dir: string) => {
+      const entries = await fs.readdir(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        const absolute = path.join(dir, entry.name);
+        const relative = path.relative(workspace, absolute).replace(/\\/g, "/");
+        if (entry.isDirectory()) {
+          await walk(absolute);
+        } else {
+          output.push(relative);
+        }
+      }
+    };
+    await walk(workspace);
+    return output;
+  });
+  await page.exposeFunction("__MAIN_E2E_DISK_LIST", async (rawPath: string) => {
+    const absolute = resolveDiskPath(rawPath);
+    const entries = await fs.readdir(absolute, { withFileTypes: true });
+    return entries.map((entry) => {
+      const child = path.join(absolute, entry.name);
+      return {
+        name: entry.name,
+        path: path.relative(workspace, child).replace(/\\/g, "/"),
+        is_dir: entry.isDirectory(),
+      };
+    });
+  });
+
   await page.exposeFunction("__MAIN_E2E_PROXY_REQUEST", async (args: Record<string, unknown>) => {
     const url = String(args.url || "");
     const response = await fetch(url, {
@@ -73,37 +174,16 @@ test.beforeEach(async ({ page }) => {
     return text;
   });
 
-  await page.addInitScript(() => {
-    const workspace = "/tmp/e2e-real-omlx";
+  await page.addInitScript(({ workspace }) => {
     const debugEntries = ((window as any).__REAL_OMLX_DEBUG_LOGS__ ??= []);
     let streamCancelled = false;
-    const files = ((window as any).__REAL_OMLX_FILES__ ??= {
-      "src/hooks/useCsvParser.ts": [
-        "export interface CsvOrder {",
-        "  creator?: string;",
-        "  creatorName?: string;",
-        "}",
-        "",
-        "export function normalizeCsvOrder(row: Record<string, string>): CsvOrder {",
-        "  return {",
-        "    creator: row.creator || row['创建者'] || '',",
-        "  };",
-        "}",
-        "",
-      ].join("\n"),
-      "src/store/dashboardStore.ts": "export const creatorField = 'creatorName';\n",
-      "cn_tutorial_orders_by_creator_20260512.csv": "creator,amount\nalice,12\n",
-    });
-    const readText = (path: string) => {
-      const normalized = path.replace(`${workspace}/`, "").replace(/^\/tmp\/e2e-real-omlx-[^/]+\//, "");
-      if (Object.prototype.hasOwnProperty.call(files, normalized)) return files[normalized];
-      if (Object.prototype.hasOwnProperty.call(files, path)) return files[path];
-      throw new Error(`ENOENT: ${path}`);
+    const readText = async (path: string) => {
+      return await (window as any).__MAIN_E2E_DISK_READ(path);
     };
-    const writeText = (path: string, content: string) => {
-      const normalized = path.replace(`${workspace}/`, "").replace(/^\/tmp\/e2e-real-omlx-[^/]+\//, "");
-      files[normalized] = content;
+    const writeText = async (path: string, content: string) => {
+      await (window as any).__MAIN_E2E_DISK_WRITE(path, content);
     };
+    (window as any).__REAL_OMLX_WORKSPACE__ = workspace;
 
     (window as any).__TAURI_EVENT_PLUGIN_INTERNALS__ ??= { unregisterListener: () => {} };
     const callbacks = new Map<number, unknown>();
@@ -188,15 +268,32 @@ test.beforeEach(async ({ page }) => {
         return [
           ".",
           "├── src",
+          "│   ├── components",
+          "│   │   ├── Dashboard",
+          "│   │   │   ├── CourseBarChart.tsx",
+          "│   │   │   ├── StatusPieChart.tsx",
+          "│   │   │   └── TrendLineChart.tsx",
+          "│   │   └── FileUploader",
+          "│   │       └── DragUpload.tsx",
           "│   ├── hooks",
+          "│   │   ├── useChartData.ts",
           "│   │   └── useCsvParser.ts",
           "│   └── store",
           "│       └── dashboardStore.ts",
+          "│   ├── App.tsx",
+          "│   ├── index.css",
+          "│   └── types",
+          "│       └── order.ts",
           "└── cn_tutorial_orders_by_creator_20260512.csv",
         ].join("\n");
       }
       if (cmd === "list_directory") {
         const path = String(args?.path || ".");
+        try {
+          return await (window as any).__MAIN_E2E_DISK_LIST(path === workspace ? "." : path);
+        } catch {
+          // Fall back to the deterministic fixture structure below.
+        }
         if (path === "." || path.includes("e2e-real-omlx")) {
           return [
             { name: "src", path: "src", is_dir: true },
@@ -205,27 +302,95 @@ test.beforeEach(async ({ page }) => {
         }
         if (path === "src") {
           return [
+            { name: "components", path: "src/components", is_dir: true },
             { name: "hooks", path: "src/hooks", is_dir: true },
             { name: "store", path: "src/store", is_dir: true },
+            { name: "types", path: "src/types", is_dir: true },
+            { name: "App.tsx", path: "src/App.tsx", is_dir: false },
+            { name: "index.css", path: "src/index.css", is_dir: false },
           ];
         }
+        if (path === "src/components") {
+          return [
+            { name: "Dashboard", path: "src/components/Dashboard", is_dir: true },
+            { name: "FileUploader", path: "src/components/FileUploader", is_dir: true },
+          ];
+        }
+        if (path === "src/components/Dashboard") {
+          return [
+            { name: "CourseBarChart.tsx", path: "src/components/Dashboard/CourseBarChart.tsx", is_dir: false },
+            { name: "TrendLineChart.tsx", path: "src/components/Dashboard/TrendLineChart.tsx", is_dir: false },
+            { name: "StatusPieChart.tsx", path: "src/components/Dashboard/StatusPieChart.tsx", is_dir: false },
+          ];
+        }
+        if (path === "src/components/FileUploader") {
+          return [{ name: "DragUpload.tsx", path: "src/components/FileUploader/DragUpload.tsx", is_dir: false }];
+        }
         if (path === "src/hooks") {
-          return [{ name: "useCsvParser.ts", path: "src/hooks/useCsvParser.ts", is_dir: false }];
+          return [
+            { name: "useChartData.ts", path: "src/hooks/useChartData.ts", is_dir: false },
+            { name: "useCsvParser.ts", path: "src/hooks/useCsvParser.ts", is_dir: false },
+          ];
+        }
+        if (path === "src/store") {
+          return [{ name: "dashboardStore.ts", path: "src/store/dashboardStore.ts", is_dir: false }];
+        }
+        if (path === "src/types") {
+          return [{ name: "order.ts", path: "src/types/order.ts", is_dir: false }];
         }
         return [];
       }
-      if (cmd === "glob_search") return Object.keys(files).filter((path) => path.endsWith(".ts") || path.endsWith(".csv"));
+      if (cmd === "glob_search") return (await (window as any).__MAIN_E2E_DISK_GLOB()).filter((path: string) => /\.(?:ts|tsx|css|csv)$/.test(path));
       if (cmd === "grep_search") {
         const query = String(args?.query || args?.pattern || "");
-        return Object.entries(files)
+        const filePaths = await (window as any).__MAIN_E2E_DISK_GLOB();
+        const entries = await Promise.all(filePaths.map(async (filePath: string) => [filePath, await readText(filePath)] as const));
+        return entries
           .filter(([, content]) => !query || String(content).includes(query))
           .map(([path, content]) => `${path}:1:${String(content).split("\n")[0]}`)
           .join("\n");
       }
-      if (cmd === "read_file") return readText(String(args?.path || ""));
+      if (cmd === "build_repository_index") {
+        const filePaths = await (window as any).__MAIN_E2E_DISK_GLOB();
+        const sourceFiles = filePaths.filter((filePath: string) => /\.(?:ts|tsx|js|jsx|css)$/.test(filePath));
+        const symbols: Array<Record<string, unknown>> = [];
+        const imports: Array<Record<string, unknown>> = [];
+        const calls: Array<Record<string, unknown>> = [];
+        for (const filePath of sourceFiles) {
+          const content = await readText(filePath);
+          const lines = String(content).split(/\r?\n/);
+          lines.forEach((line, index) => {
+            const symbol = line.match(/\b(?:export\s+)?(?:function|const|interface|type|class)\s+([A-Za-z_$][A-Za-z0-9_$]*)/);
+            if (symbol) {
+              symbols.push({
+                name: symbol[1],
+                kind: line.includes("interface") ? "interface" : line.includes("type") ? "type" : line.includes("class") ? "class" : line.includes("function") ? "function" : "constant",
+                file: filePath,
+                line: index + 1,
+                signature: line.trim(),
+              });
+            }
+            const imported = line.match(/from\s+['"]([^'"]+)['"]/);
+            if (imported) imports.push({ from: filePath, to: imported[1], kind: "import", line: index + 1 });
+            for (const call of line.matchAll(/\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\(/g)) {
+              calls.push({ from: filePath, symbol: call[1], line: index + 1 });
+            }
+          });
+        }
+        return {
+          root: workspace,
+          generatedAtMs: Date.now(),
+          symbols,
+          imports,
+          calls,
+          dependencies: [],
+          embeddings: [],
+        };
+      }
+      if (cmd === "read_file") return await readText(String(args?.path || ""));
       if (cmd === "read_file_window") {
         const path = String(args?.path || "");
-        const content = readText(path);
+        const content = await readText(path);
         return {
           path,
           content,
@@ -244,7 +409,7 @@ test.beforeEach(async ({ page }) => {
           documentType: "csv",
           title: null,
           sourceName: path,
-          content: readText(path),
+          content: await readText(path),
           truncated: false,
           metadata: {},
         };
@@ -278,10 +443,10 @@ test.beforeEach(async ({ page }) => {
       }
       if (cmd === "get_file_metadata") {
         const path = String(args?.path || "");
-        return { path, sizeBytes: readText(path).length, modifiedMs: Date.now() };
+        return await (window as any).__MAIN_E2E_DISK_METADATA(path);
       }
       if (cmd === "write_file") {
-        writeText(String(args?.path || ""), String(args?.content || ""));
+        await writeText(String(args?.path || ""), String(args?.content || ""));
         return null;
       }
       if (cmd === "shell_permission_preflight") {
@@ -290,11 +455,12 @@ test.beforeEach(async ({ page }) => {
       if (cmd === "run_command") return "ok";
       return null;
     };
-  });
+  }, { workspace });
 });
 
 for (const model of models) {
   test(`real OMLX MAIN plan/approve/execute closes with ${model}`, async ({ page }) => {
+    const workspace = (page as any).__realOmlxWorkspace as string;
     page.on("console", (message) => {
       const text = message.text();
       if (text.includes("[real-omlx-invoke] append_debug_log")) return;
@@ -305,7 +471,7 @@ for (const model of models) {
     });
     await page.goto(`/?e2eScenario=real-omlx-plan-flow&model=${encodeURIComponent(model)}`);
 
-    await page.evaluate(() => (window as any).__CODELY_E2E__?.sendCloudMessage?.());
+    await page.evaluate((text) => (window as any).__CODELY_E2E__?.sendCloudMessage?.(text), realOmlxRequest);
 
     await expect
       .poll(async () => {
@@ -324,23 +490,27 @@ for (const model of models) {
     expect(plan).toMatch(/useCsvParser\.ts|CSV|creator/);
     expect(plan).not.toMatch(/用户目标：\s*(?:\n|$)/);
     expect(plan).not.toMatch(/以落实已批准目标|落实已批准方案中涉及|Apply the approved plan change/i);
+    expect(plan).not.toMatch(/直接相关的最小改动|写入前先用证据确认|依据证据：已搜索文件|依据证据：已查看目录/i);
     expect(plan).not.toMatch(/(?:已读证据|证据引用|Read Evidence)[\s\S]{0,800}\.MAIN\/plans\/plan\.md/i);
     const planSnapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
     const planChatText = JSON.stringify(planSnapshot?.taskFlowPreview || []);
     console.log(`[real-omlx-chat-plan:${model}] ${planChatText.slice(0, 1200).replace(/\s+/g, " ")}`);
     expect(planChatText).toMatch(/read_file|list_directory|读取|计划|CSV|useCsvParser|creator/i);
     expect(planChatText).not.toMatch(forbiddenChatNoise);
+    if (expectAgentExplanation) {
+      expect((planSnapshot?.agentTexts || []).join("\n")).toMatch(/问题|分析|修复|Dashboard|CSV|深色|creator/i);
+    }
 
     await page.evaluate(() => (window as any).__CODELY_E2E__?.approvePlan?.());
 
     await expect
       .poll(async () => {
         const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
-        const parser = await page.evaluate(() => (window as any).__REAL_OMLX_FILES__?.["src/hooks/useCsvParser.ts"] || "");
+        const parser = await fs.readFile(path.join(workspace, "src/hooks/useCsvParser.ts"), "utf8");
         return {
           status: snapshot?.agentStatus,
           approved: snapshot?.isPlanApproved,
-          hasCreatorName: /creatorName/.test(parser),
+          hasCreatorName: /creatorName\s*:/.test(parser),
           hasToolFailureCard: (snapshot?.toolBlocks || []).some((block: { status?: string; error?: string }) =>
             block.status === "failed" && /search_text|content|空变更|identical/i.test(String(block.error || "")),
           ),
@@ -352,12 +522,29 @@ for (const model of models) {
         hasToolFailureCard: false,
       });
 
+    const parserOnDisk = await fs.readFile(path.join(workspace, "src/hooks/useCsvParser.ts"), "utf8");
+    expect(parserOnDisk).toMatch(/creatorName\s*:/);
+    expect(parserOnDisk).not.toEqual([
+      "export interface CsvOrder {",
+      "  creator?: string;",
+      "  creatorName?: string;",
+      "}",
+      "",
+      "export function normalizeCsvOrder(row: Record<string, string>): CsvOrder {",
+      "  return {",
+      "    creator: row.creator || row['创建者'] || '',",
+      "  };",
+      "}",
+      "",
+    ].join("\n"));
+
     const bodyText = await page.locator("body").innerText();
     const executionSnapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
     const executionChatText = JSON.stringify(executionSnapshot?.taskFlowPreview || []);
     console.log(`[real-omlx-chat-execute:${model}] ${executionChatText.slice(0, 1200).replace(/\s+/g, " ")}`);
-    expect(executionChatText).toMatch(/write_file|replace_in_file|run_command|已完成|creatorName|useCsvParser/i);
+    expect(executionChatText).toMatch(/apply_patch|write_file|replace_in_file|run_command|已完成|creatorName|useCsvParser/i);
     expect(executionChatText).not.toMatch(forbiddenChatNoise);
+    expect(JSON.stringify(executionSnapshot?.debugTail || [])).not.toMatch(/no_progress_cached_read_only_batch|store\.non_actionable_stop/i);
     expect(bodyText).not.toMatch(forbiddenChatNoise);
   });
 }

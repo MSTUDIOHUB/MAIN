@@ -54,6 +54,7 @@ function loadTranspiledModuleSync(sourcePath) {
 }
 
 const {
+  canonicalizePlanArtifactContent,
   composePlanArtifactFromEvidence,
   composeReviewablePlanFromEvidence,
   isMaterializablePlanLikeText,
@@ -722,6 +723,88 @@ test("composes deterministic plan artifact from real tool feedback without leaki
   assert.match(content, /useCsvParser\.ts/);
   assert.match(content, /useChartData\.ts/);
   assert.doesNotMatch(content, /MAIN_TOOL_FEEDBACK|tool_call_id|status=observed|hash=|excerpt=/);
+});
+
+test("deterministic plan uses concrete read evidence instead of broad search grounding", () => {
+  const content = composePlanArtifactFromEvidence({
+    userGoal: "修复 CSV 导入后 Dashboard 数据不显示，并彻底改善深色模式。",
+    evidence: [
+      "glob_search / .{ts,tsx,vue}",
+      "list_directory src/hooks; excerpt=src/hooks/useChartData.ts , src/hooks/useCsvParser.ts",
+      "read_file src/hooks/useCsvParser.ts; excerpt=解析 CSV 行并返回订单记录",
+      "read_file src/store/dashboardStore.ts; excerpt=导入后更新 dashboard 指标",
+      "read_file src/index.css; excerpt=定义主题变量和布局背景",
+    ],
+    files: [
+      "src/hooks/useCsvParser.ts",
+      "src/store/dashboardStore.ts",
+      "src/index.css",
+    ],
+    constraints: ["批准前不修改源码。"],
+    language: "zh",
+  });
+
+  assert.equal(validateActionablePlanArtifact(content).ok, true);
+  assert.match(content, /CSV 列名到订单字段映射/);
+  assert.match(content, /导入数据进入 Dashboard 状态/);
+  assert.match(content, /深色模式表面|主题 token/);
+  assert.doesNotMatch(content, /直接相关的最小改动|写入前先用证据确认/);
+  assert.doesNotMatch(content, /依据证据：已搜索文件|依据证据：已查看目录/);
+});
+
+test("canonicalization rejects plans grounded only by broad discovery evidence", () => {
+  const content = canonicalizePlanArtifactContent({
+    userGoal: "修复 CSV 导入后 Dashboard 数据不显示，并彻底改善深色模式。",
+    content: [
+      "# 计划",
+      "",
+      "## 摘要",
+      "- 用户目标：修复 CSV 导入后 Dashboard 数据不显示。",
+      "- 已搜索文件：**/*.{ts,tsx,vue} 命中 src/hooks/useCsvParser.ts。",
+      "",
+      "## 影响文件",
+      "- src/hooks/useCsvParser.ts",
+      "",
+      "## 执行步骤",
+      "1. 修改 CSV 导入逻辑。",
+      "",
+      "## 验证标准",
+      "- 运行浏览器验证 Dashboard 数据显示。",
+    ].join("\n"),
+    language: "zh",
+  });
+
+  assert.equal(content, null);
+});
+
+test("canonicalization replaces file-only generic changes with evidence-grounded changes", () => {
+  const content = canonicalizePlanArtifactContent({
+    userGoal: "修复 CSV 导入后 Dashboard 数据不显示，并彻底改善深色模式。",
+    content: [
+      "# 计划",
+      "",
+      "## 摘要",
+      "- 用户目标：修复 CSV 导入后 Dashboard 数据不显示，并彻底改善深色模式。",
+      "- 已读取文件：src/hooks/useCsvParser.ts；解析 CSV 行并返回订单记录。",
+      "- 已读取文件：src/index.css；定义主题变量和布局背景。",
+      "",
+      "## 影响文件",
+      "- src/hooks/useCsvParser.ts",
+      "- src/index.css",
+      "",
+      "## 执行步骤",
+      "1. 按已确认文件修改实现。",
+      "",
+      "## 验证标准",
+      "- 运行聚焦测试和浏览器验证。",
+    ].join("\n"),
+    language: "zh",
+  });
+
+  assert.ok(content);
+  assert.match(content, /CSV 列名到订单字段映射/);
+  assert.match(content, /深色模式表面|主题 token/);
+  assert.doesNotMatch(content, /围绕 `[^`]+` 执行与用户目标直接相关的最小改动/);
 });
 
 test("sanitizes repeated quality-gate evidence before deterministic plan materialization", () => {

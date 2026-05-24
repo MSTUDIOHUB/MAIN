@@ -1,5 +1,18 @@
 #!/usr/bin/env node
 
+import { execFile as execFileCallback } from "node:child_process";
+import crypto from "node:crypto";
+import fs from "node:fs/promises";
+import fsSync from "node:fs";
+import { createRequire } from "node:module";
+import os from "node:os";
+import path from "node:path";
+import { promisify } from "node:util";
+
+import ts from "typescript";
+
+const execFile = promisify(execFileCallback);
+const workspaceRoot = process.cwd();
 const endpoint = (process.env.OMLX_BASE_URL || "http://127.0.0.1:8000/v1").replace(/\/+$/, "");
 const apiKey = process.env.OMLX_API_KEY || "mmnn";
 const models = (process.env.OMLX_MODELS || "gemma-4-26b-a4b-it-8bit,Qwen3.6-35B-A3B-6bit")
@@ -13,7 +26,89 @@ const headers = {
   "x-api-key": apiKey,
 };
 
+const transpiledModuleCache = new Map();
+
+function loadTranspiledModuleSync(sourcePath) {
+  const normalizedPath = path.resolve(sourcePath);
+  if (transpiledModuleCache.has(normalizedPath)) {
+    return transpiledModuleCache.get(normalizedPath);
+  }
+
+  const source = fsSync.readFileSync(normalizedPath, "utf8");
+  const transpiled = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2020,
+    },
+    fileName: normalizedPath,
+  }).outputText;
+
+  const module = { exports: {} };
+  transpiledModuleCache.set(normalizedPath, module.exports);
+  const localRequire = createRequire(normalizedPath);
+  const runtimeRequire = (specifier) => {
+    if (specifier.startsWith(".")) {
+      const basePath = path.resolve(path.dirname(normalizedPath), specifier);
+      const candidates = [
+        basePath,
+        `${basePath}.ts`,
+        `${basePath}.tsx`,
+        path.join(basePath, "index.ts"),
+      ];
+
+      for (const candidate of candidates) {
+        if (!fsSync.existsSync(candidate)) continue;
+        if (candidate.endsWith(".ts") || candidate.endsWith(".tsx")) {
+          return loadTranspiledModuleSync(candidate);
+        }
+      }
+    }
+    return localRequire(specifier);
+  };
+
+  const factory = new Function("exports", "module", "require", transpiled);
+  factory(module.exports, module, runtimeRequire);
+  transpiledModuleCache.set(normalizedPath, module.exports);
+  return module.exports;
+}
+
+const {
+  applyWorkspacePatch,
+  previewApplyPatch,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/applyPatchTool.ts"));
+
 const tools = [
+  {
+    type: "function",
+    function: {
+      name: "repo_map_search",
+      description: "Search MAIN built-in repo map for symbols/files/line numbers.",
+      parameters: {
+        type: "object",
+        required: ["query"],
+        properties: {
+          query: { type: "string" },
+          kind: { type: "string" },
+          limit: { type: "number" },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "repo_map_context",
+      description: "Build compact repo-map context for a task without reading whole files.",
+      parameters: {
+        type: "object",
+        required: ["task"],
+        properties: {
+          task: { type: "string" },
+          max_nodes: { type: "number" },
+        },
+      },
+    },
+  },
   {
     type: "function",
     function: {
@@ -39,6 +134,20 @@ const tools = [
         properties: {
           query: { type: "string" },
           path: { type: "string" },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "apply_patch",
+      description: "Apply a Codex-style patch after approval.",
+      parameters: {
+        type: "object",
+        required: ["patch"],
+        properties: {
+          patch: { type: "string" },
         },
       },
     },
@@ -83,19 +192,46 @@ function fail(message, detail = {}) {
 }
 
 async function requestJson(path, init = {}) {
-  const response = await fetch(`${endpoint}${path}`, {
-    ...init,
-    headers: { ...headers, ...(init.headers || {}) },
-  });
-  const text = await response.text();
+  const requestHeaders = { ...headers, ...(init.headers || {}) };
+  const args = [
+    "-sS",
+    "-w",
+    "\n__HTTP_STATUS__:%{http_code}",
+  ];
+  if (init.method) args.push("-X", init.method);
+  for (const [name, value] of Object.entries(requestHeaders)) {
+    args.push("-H", `${name}: ${value}`);
+  }
+  if (init.body !== undefined) {
+    args.push("--data-binary", String(init.body));
+  }
+  args.push(`${endpoint}${path}`);
+
+  let stdout;
+  try {
+    ({ stdout } = await execFile("curl", args, { maxBuffer: 30 * 1024 * 1024 }));
+  } catch (error) {
+    fail(`curl request failed for ${path}`, {
+      stderr: String(error.stderr || ""),
+      stdout: String(error.stdout || "").slice(0, 500),
+      message: error.message,
+    });
+  }
+  const marker = "\n__HTTP_STATUS__:";
+  const markerIndex = stdout.lastIndexOf(marker);
+  if (markerIndex < 0) {
+    fail(`Missing HTTP status from ${path}`, { stdout: stdout.slice(0, 500) });
+  }
+  const text = stdout.slice(0, markerIndex);
+  const status = Number(stdout.slice(markerIndex + marker.length).trim());
   let json = null;
   try {
     json = text ? JSON.parse(text) : null;
   } catch {
-    fail(`Non-JSON response from ${path}`, { status: response.status, text: text.slice(0, 500) });
+    fail(`Non-JSON response from ${path}`, { status, text: text.slice(0, 500) });
   }
-  if (!response.ok) {
-    fail(`HTTP ${response.status} from ${path}`, { json });
+  if (status < 200 || status >= 300) {
+    fail(`HTTP ${status} from ${path}`, { json });
   }
   return json;
 }
@@ -142,8 +278,15 @@ function validateToolCalls(model, probeName, toolCalls, { forbidMutation = false
   for (const call of toolCalls || []) {
     const name = call?.function?.name || call?.name || "";
     const args = parseToolArgs(call?.function?.arguments || call?.arguments);
-    if (forbidMutation && (name === "write_file" || name === "replace_in_file")) {
+    if (forbidMutation && (name === "write_file" || name === "replace_in_file" || name === "apply_patch")) {
       fail(`${model} ${probeName} attempted mutation during plan probe`, { name, args });
+    }
+    if (name === "apply_patch") {
+      const isCodexPatch = typeof args.patch === "string" && /\*\*\* Begin Patch[\s\S]*\*\*\* End Patch/.test(args.patch);
+      const isUnifiedDiff = typeof args.patch === "string" && /^---\s+\S+[\s\S]*^\+\+\+\s+\S+[\s\S]*^@@/m.test(args.patch);
+      if (!isCodexPatch && !isUnifiedDiff) {
+        fail(`${model} ${probeName} emitted malformed apply_patch`, { args });
+      }
     }
     if (name === "write_file" && typeof args.content !== "string") {
       fail(`${model} ${probeName} emitted write_file without content`, { args });
@@ -175,6 +318,357 @@ async function chat(model, messages, { maxTokens = 900 } = {}) {
 
 function firstMessage(json) {
   return json?.choices?.[0]?.message || {};
+}
+
+function sha256(text) {
+  return crypto.createHash("sha256").update(text).digest("hex");
+}
+
+function safeWorkspacePath(root, relativePath) {
+  const normalized = String(relativePath || "").replaceAll("\\", "/").replace(/^\/+/, "");
+  if (!normalized || normalized.includes("\0") || normalized.split("/").includes("..")) {
+    throw new Error(`Unsafe workspace path: ${relativePath}`);
+  }
+  const absolute = path.resolve(root, normalized);
+  const rootWithSep = path.resolve(root) + path.sep;
+  if (absolute !== path.resolve(root) && !absolute.startsWith(rootWithSep)) {
+    throw new Error(`Path escapes workspace: ${relativePath}`);
+  }
+  return { normalized, absolute };
+}
+
+async function seedDiskWorkspace(model) {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), `main-omlx-${model.replace(/[^a-z0-9_-]+/gi, "-").toLowerCase()}-`));
+  await fs.mkdir(path.join(root, "src/hooks"), { recursive: true });
+  await fs.mkdir(path.join(root, "src/store"), { recursive: true });
+  await fs.mkdir(path.join(root, ".MAIN/index"), { recursive: true });
+  const parser = [
+    "export interface RawCourseOrder {",
+    "  creator?: string;",
+    "  creator_name?: string;",
+    "  '创建人'?: string;",
+    "  sales?: string;",
+    "}",
+    "",
+    "export interface CourseOrder {",
+    "  creatorName: string;",
+    "  amount: number;",
+    "}",
+    "",
+    "export function parseCourseOrders(rows: RawCourseOrder[]): CourseOrder[] {",
+    "  return rows.map((row) => ({",
+    "    creatorName: \"\",",
+    "    amount: Number(row.sales || 0),",
+    "  }));",
+    "}",
+    "",
+  ].join("\n");
+  const store = [
+    "import type { CourseOrder } from '../hooks/useCsvParser';",
+    "",
+    "export function summarizeCreators(rows: CourseOrder[]): string[] {",
+    "  return rows.map((row) => row.creatorName).filter(Boolean);",
+    "}",
+    "",
+  ].join("\n");
+  await fs.writeFile(path.join(root, "src/hooks/useCsvParser.ts"), parser, "utf8");
+  await fs.writeFile(path.join(root, "src/store/dashboardStore.ts"), store, "utf8");
+  await fs.writeFile(path.join(root, ".MAIN/index/repo_map.db"), JSON.stringify({
+    files: ["src/hooks/useCsvParser.ts", "src/store/dashboardStore.ts"],
+    symbols: [
+      { name: "parseCourseOrders", kind: "function", path: "src/hooks/useCsvParser.ts", line: 13 },
+      { name: "CourseOrder", kind: "interface", path: "src/hooks/useCsvParser.ts", line: 8 },
+      { name: "summarizeCreators", kind: "function", path: "src/store/dashboardStore.ts", line: 3 },
+    ],
+    calls: [
+      { from: "summarizeCreators", to: "creatorName", from_path: "src/store/dashboardStore.ts", to_path: "src/hooks/useCsvParser.ts" },
+    ],
+  }), "utf8");
+  return {
+    root,
+    target: "src/hooks/useCsvParser.ts",
+    original: parser,
+    originalHash: sha256(parser),
+  };
+}
+
+async function readWorkspaceFile(root, relativePath) {
+  const { absolute } = safeWorkspacePath(root, relativePath);
+  return fs.readFile(absolute, "utf8");
+}
+
+async function writeWorkspaceFile(root, relativePath, content) {
+  const { absolute } = safeWorkspacePath(root, relativePath);
+  await fs.mkdir(path.dirname(absolute), { recursive: true });
+  await fs.writeFile(absolute, content, "utf8");
+}
+
+async function executeWorkspaceTool(workspace, call) {
+  const name = call.name;
+  const args = call.args || {};
+  if (name === "repo_map_search") {
+    const query = String(args.query || "").toLowerCase();
+    return JSON.stringify({
+      status: "ok",
+      results: [
+        { path: "src/hooks/useCsvParser.ts", symbol: "parseCourseOrders", kind: "function", line: 13 },
+        { path: "src/store/dashboardStore.ts", symbol: "summarizeCreators", kind: "function", line: 3 },
+      ].filter((item) =>
+        !query ||
+        item.path.toLowerCase().includes(query) ||
+        item.symbol.toLowerCase().includes(query) ||
+        "creator csv course order parser".includes(query)
+      ),
+    });
+  }
+  if (name === "repo_map_context") {
+    return JSON.stringify({
+      status: "ok",
+      task: args.task || "",
+      files: [
+        { path: "src/hooks/useCsvParser.ts", reason: "parseCourseOrders maps CSV rows into CourseOrder.creatorName", lineRange: "13-17" },
+        { path: "src/store/dashboardStore.ts", reason: "dashboard consumes CourseOrder.creatorName", lineRange: "3-4" },
+      ],
+    });
+  }
+  if (name === "grep_search") {
+    const query = String(args.query || "");
+    const files = ["src/hooks/useCsvParser.ts", "src/store/dashboardStore.ts"];
+    const matches = [];
+    for (const file of files) {
+      const text = await readWorkspaceFile(workspace.root, file);
+      text.split(/\r?\n/).forEach((line, index) => {
+        if (!query || line.includes(query)) matches.push(`${file}:${index + 1}:${line}`);
+      });
+    }
+    return matches.slice(0, 20).join("\n") || "NO_MATCHES";
+  }
+  if (name === "read_file") {
+    const file = String(args.path || "");
+    return `READ_FILE_RESULT path: ${file}\n---CONTENT START---\n${await readWorkspaceFile(workspace.root, file)}---CONTENT END---`;
+  }
+  if (name === "replace_in_file") {
+    const file = String(args.path || "");
+    const searchText = String(args.search_text || "");
+    const replaceText = String(args.replace_text || "");
+    if (!file || !searchText || searchText === replaceText) {
+      throw new Error("invalid replace_in_file arguments");
+    }
+    const current = await readWorkspaceFile(workspace.root, file);
+    if (!current.includes(searchText)) {
+      throw new Error("search_text mismatch; write not performed");
+    }
+    const next = current.replace(searchText, replaceText);
+    if (next === current) throw new Error("empty replacement");
+    await writeWorkspaceFile(workspace.root, file, next);
+    return `WRITE_OK replace_in_file ${file} sha256=${sha256(next)}`;
+  }
+  if (name === "write_file") {
+    const file = String(args.path || "");
+    if (typeof args.content !== "string" || !args.content) {
+      throw new Error("write_file missing content");
+    }
+    const current = await readWorkspaceFile(workspace.root, file).catch(() => "");
+    if (current === args.content) throw new Error("write_file no-op identical content");
+    await writeWorkspaceFile(workspace.root, file, args.content);
+    return `WRITE_OK write_file ${file} sha256=${sha256(args.content)}`;
+  }
+  if (name === "apply_patch") {
+    if (typeof args.patch !== "string") throw new Error("apply_patch missing patch");
+    const preview = await previewApplyPatch(args.patch, async (file) => readWorkspaceFile(workspace.root, file));
+    if (!preview.ok) throw new Error(preview.error || "invalid patch");
+    const result = await applyWorkspacePatch(args.patch, {
+      readFile: async (file) => readWorkspaceFile(workspace.root, file),
+      writeFile: async (file, content) => writeWorkspaceFile(workspace.root, file, content),
+      deleteFile: async (file) => {
+        const { absolute } = safeWorkspacePath(workspace.root, file);
+        await fs.unlink(absolute);
+      },
+    });
+    if (!result.ok) throw new Error(result.error || "apply_patch failed");
+    return `WRITE_OK apply_patch ${result.changes.map((change) => change.path).join(", ")} sha256=${sha256(await readWorkspaceFile(workspace.root, workspace.target))}`;
+  }
+  throw new Error(`Unsupported tool in disk validation: ${name}`);
+}
+
+function makeToolCall(name, args, id = `text_call_${Math.random().toString(16).slice(2)}`) {
+  return { id, name, args };
+}
+
+function extractTextToolCalls(content) {
+  const text = String(content || "");
+  const calls = [];
+  const xmlPattern = /<tool_use\b[^>]*>([\s\S]*?)<\/tool_use>/gi;
+  let xmlMatch;
+  while ((xmlMatch = xmlPattern.exec(text))) {
+    const body = xmlMatch[1];
+    const name = body.match(/<tool>\s*([\w.-]+)\s*<\/tool>/i)?.[1] ||
+      body.match(/<name>\s*([\w.-]+)\s*<\/name>/i)?.[1];
+    if (!name) continue;
+    const args = {};
+    const parameterPattern = /<parameter\s+name=["']([^"']+)["']\s*>([\s\S]*?)<\/parameter>/gi;
+    let parameterMatch;
+    while ((parameterMatch = parameterPattern.exec(body))) {
+      args[parameterMatch[1]] = parameterMatch[2].trim();
+    }
+    calls.push(makeToolCall(name, args));
+  }
+
+  const patchMatch = text.match(/\*\*\* Begin Patch[\s\S]*?\*\*\* End Patch/);
+  if (patchMatch && !calls.some((call) => call.name === "apply_patch")) {
+    calls.push(makeToolCall("apply_patch", { patch: patchMatch[0] }));
+  }
+
+  for (const fnName of ["apply_patch", "replace_in_file", "write_file", "read_file", "repo_map_search", "repo_map_context", "grep_search"]) {
+    const pattern = new RegExp(`${fnName}\\s*\\(\\s*({[\\s\\S]*?})\\s*\\)`, "i");
+    const match = text.match(pattern);
+    if (!match) continue;
+    try {
+      calls.push(makeToolCall(fnName, JSON.parse(match[1])));
+    } catch {
+      // Ignore malformed text-call JSON; the recovery loop will reprompt.
+    }
+  }
+  return calls;
+}
+
+function extractToolCalls(message) {
+  const native = (message.tool_calls || [])
+    .map((call, index) => makeToolCall(
+      call?.function?.name || call?.name || "",
+      parseToolArgs(call?.function?.arguments || call?.arguments),
+      call?.id || `native_call_${index}`,
+    ))
+    .filter((call) => call.name);
+  if (native.length > 0) return { native: true, calls: native };
+  return { native: false, calls: extractTextToolCalls(message.content) };
+}
+
+function isDiskWriteSatisfied(content) {
+  const text = String(content || "");
+  return (
+    /creatorName\s*:\s*(?!["'`]\s*["'`])/.test(text) &&
+    /row\.(?:creator|creator_name)|row\[['"]创建人['"]\]/.test(text)
+  );
+}
+
+async function runDiskWriteProbe(model) {
+  const workspace = await seedDiskWorkspace(model);
+  const messages = [
+    {
+      role: "system",
+      content: [
+        "You are MAIN approved Execute mode running inside a temporary workspace.",
+        "Use tool calls to make real disk changes. Prefer `apply_patch`; `replace_in_file` and `write_file` are available when appropriate.",
+        "Do not output full replacement files in chat. Do not claim success until a write tool reports WRITE_OK.",
+        "Use repo_map tools for structure and avoid rereading files already supplied in evidence unless exact current content is needed after a patch mismatch.",
+      ].join("\n"),
+    },
+    {
+      role: "user",
+      content: [
+        "Approved task: fix CSV creator mapping in `src/hooks/useCsvParser.ts`.",
+        "Confirmed evidence digest:",
+        "- repo_map_context: `parseCourseOrders` in src/hooks/useCsvParser.ts lines 13-17 maps rows into CourseOrder.",
+        "- Dashboard store consumes `CourseOrder.creatorName`; blank creatorName breaks creator ranking.",
+        "Current exact target snippet:",
+        "```ts",
+        "export function parseCourseOrders(rows: RawCourseOrder[]): CourseOrder[] {",
+        "  return rows.map((row) => ({",
+        "    creatorName: \"\",",
+        "    amount: Number(row.sales || 0),",
+        "  }));",
+        "}",
+        "```",
+        "Required change: set `creatorName` from `row.creator_name || row.creator || row['创建人'] || 'Unknown'` while preserving amount.",
+        "Now execute. The next assistant response should call `apply_patch` or another write tool.",
+      ].join("\n"),
+    },
+  ];
+  const toolSequence = [];
+  const visibleTexts = [];
+  let nativeToolMessagesSupported = true;
+
+  for (let step = 0; step < 6; step += 1) {
+    const json = await chat(model, messages, { maxTokens: 1200 });
+    const message = firstMessage(json);
+    const content = message.content || "";
+    if (content) {
+      visibleTexts.push(content.slice(0, 1000));
+      validateNoProtocolNoise(model, `disk-write-step-${step}`, content.replace(/\*\*\* Begin Patch[\s\S]*?\*\*\* End Patch/g, ""));
+    }
+    validateToolCalls(model, `disk-write-step-${step}`, message.tool_calls);
+
+    const extracted = extractToolCalls(message);
+    if (extracted.calls.length === 0) {
+      messages.push({ role: "assistant", content: content || "" });
+      messages.push({
+        role: "user",
+        content: "MAIN did not receive a tool call. Continue now with exactly one write tool call: apply_patch, replace_in_file, or write_file. Do not explain.",
+      });
+      continue;
+    }
+
+    if (extracted.native && nativeToolMessagesSupported) {
+      messages.push({
+        role: "assistant",
+        content: content || null,
+        tool_calls: extracted.calls.map((call) => ({
+          id: call.id,
+          type: "function",
+          function: {
+            name: call.name,
+            arguments: JSON.stringify(call.args || {}),
+          },
+        })),
+      });
+    } else {
+      messages.push({ role: "assistant", content: content || `[tool calls: ${extracted.calls.map((call) => call.name).join(", ")}]` });
+    }
+
+    for (const call of extracted.calls) {
+      toolSequence.push(call.name);
+      let resultContent;
+      try {
+        resultContent = await executeWorkspaceTool(workspace, call);
+      } catch (error) {
+        resultContent = `TOOL_ERROR ${call.name}: ${error.message}`;
+      }
+      if (extracted.native && nativeToolMessagesSupported) {
+        messages.push({ role: "tool", tool_call_id: call.id, content: resultContent });
+      } else {
+        messages.push({ role: "user", content: `TOOL RESULT for ${call.name}:\n${resultContent}` });
+      }
+    }
+
+    const current = await readWorkspaceFile(workspace.root, workspace.target);
+    if (current !== workspace.original && isDiskWriteSatisfied(current)) {
+      return {
+        workspace: workspace.root,
+        target: workspace.target,
+        originalHash: workspace.originalHash,
+        finalHash: sha256(current),
+        toolSequence,
+        finalExcerpt: current.split(/\r?\n/).slice(12, 18).join("\n"),
+        visibleTexts: visibleTexts.slice(-2),
+      };
+    }
+
+    messages.push({
+      role: "user",
+      content: "The file has not passed verification yet. Use cached context and issue a concrete write tool call now.",
+    });
+  }
+
+  const finalText = await readWorkspaceFile(workspace.root, workspace.target);
+  fail(`${model} did not complete real disk write validation`, {
+    workspace: workspace.root,
+    target: workspace.target,
+    toolSequence,
+    finalHash: sha256(finalText),
+    finalText,
+    visibleTexts,
+  });
 }
 
 async function runPlanProbe(model) {
@@ -251,7 +745,8 @@ async function main() {
   for (const model of models) {
     const plan = await runPlanProbe(model);
     const recovery = await runExecutionRecoveryProbe(model);
-    results.push({ model, plan, recovery });
+    const diskWrite = await runDiskWriteProbe(model);
+    results.push({ model, plan, recovery, diskWrite });
   }
 
   console.log(JSON.stringify({

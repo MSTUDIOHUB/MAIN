@@ -481,11 +481,11 @@ function summarizeToolResult(message: TrimMessage, lookup: Map<string, ToolCallS
   const contentHash = stableHash(content).slice(0, 8);
   const baseTarget = target ? ` ${compactTextLine(target, 120)}` : "";
 
-  if (/read_file|get_file_outline|grep_search|glob_search|list_directory/i.test(name)) {
+  if (/read_file|get_file_outline|grep_search|glob_search|list_directory|repo_map_/i.test(name)) {
     return `${name}${baseTarget} (${content.length.toLocaleString()} chars, hash ${contentHash})`;
   }
 
-  if (/write_file|replace_in_file|delete_workspace_path/i.test(name)) {
+  if (/write_file|replace_in_file|apply_patch|delete_workspace_path/i.test(name)) {
     const noOp = /"noOp"\s*:\s*true|No file change|matched the current file/i.test(content);
     const status = /error|failed|rejected/i.test(content) ? "failed" : noOp ? "no-op" : "changed";
     return `${name}${baseTarget} (${status}, result hash ${contentHash})`;

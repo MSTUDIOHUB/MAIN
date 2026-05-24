@@ -139,6 +139,80 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     type: "function",
     function: {
+      name: "repo_map_status",
+      description: "检查 MAIN 内置代码图谱索引状态。返回索引文件数量、符号数量、导入/调用关系数量和是否需要刷新。开箱即用，不依赖外部 codegraph 命令。",
+      parameters: {
+        type: "object",
+        properties: {},
+        required: [],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "repo_map_search",
+      description: "在 MAIN 内置代码图谱中按符号名、签名、文件路径搜索。优先用于定位相关源码，返回路径、行号、符号类型和短签名，不返回大段源码。",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "符号、函数、组件、文件名或关键词" },
+          kind: { type: "string", description: "可选，限制符号类型，如 function,class,interface,type,constant" },
+          limit: { type: "number", description: "最多返回多少项，默认 12" },
+        },
+        required: ["query"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "repo_map_context",
+      description: "根据任务描述从 MAIN 内置代码图谱组装小型上下文包。返回相关文件、符号、行号、导入/调用关系摘要；不会读取完整源码。",
+      parameters: {
+        type: "object",
+        properties: {
+          task: { type: "string", description: "当前要理解或修改的问题描述" },
+          max_nodes: { type: "number", description: "最多返回多少个相关节点，默认 16" },
+        },
+        required: ["task"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "repo_map_files",
+      description: "从 MAIN 内置代码图谱返回项目文件结构摘要。适合替代大范围目录扫描，默认只返回源码/测试/配置文件路径和符号数量。",
+      parameters: {
+        type: "object",
+        properties: {
+          filter: { type: "string", description: "可选，按路径或扩展名过滤" },
+          max_depth: { type: "number", description: "可选，最大目录深度" },
+          limit: { type: "number", description: "最多返回多少个文件，默认 80" },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "repo_map_impact",
+      description: "基于 MAIN 内置代码图谱估算修改某个符号或文件会影响哪些文件。返回导入者、被导入文件和相关测试候选。",
+      parameters: {
+        type: "object",
+        properties: {
+          target: { type: "string", description: "符号名或文件路径" },
+          depth: { type: "number", description: "影响关系遍历深度，默认 2" },
+        },
+        required: ["target"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "read_file",
       description: "读取源码、Markdown、JSON、日志、纯文本等文件的内容窗口。工作区外的本机绝对路径会先请求用户授权，授权后通过临时附件副本读取。大文件不会伪装成完整内容，会返回 truncated、totalLines、totalChars、returnedLines、nextStartLine 等元数据；需要后续内容时继续用 start_line/end_line/max_lines 读取指定行区间。遇到 TypeScript/测试报错行号时，优先读取报错行附近窗口，不要全量读取大文件，也不要用 run_command 分段分页读文件。",
       parameters: {
@@ -258,6 +332,20 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
           content: { type: "string", description: "完整的文件内容" },
         },
         required: ["path", "content"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "apply_patch",
+      description: "使用 Codex 风格补丁修改工作区文件，也兼容常见 ---/+++ unified diff。适合多处精确编辑，比 replace_in_file 更稳；触发 UI 审查并展示 diff。",
+      parameters: {
+        type: "object",
+        properties: {
+          patch: { type: "string", description: "补丁文本，优先使用 *** Begin Patch / *** End Patch；也可使用 --- a/file +++ b/file 的 unified diff" },
+        },
+        required: ["patch"],
       },
     },
   },

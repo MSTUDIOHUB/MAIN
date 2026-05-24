@@ -133,6 +133,7 @@ export function deriveToolTargetRole(input: {
 
   if (!target) {
     if (toolName === "get_project_skeleton") return language === "zh" ? "项目结构" : "project structure";
+    if (toolName.startsWith("repo_map_")) return language === "zh" ? "代码图谱" : "repo map";
     if (toolName.includes("pty")) return language === "zh" ? "终端状态" : "terminal state";
     return language === "zh" ? "当前工作区" : "current workspace";
   }
@@ -191,7 +192,7 @@ function progressPhaseForTool(phase: ToolExecutionPhase, target: string): Progre
 
 function localizedActionVerb(toolName: string, phase: ToolExecutionPhase, language: ToolPresentationLanguage): string {
   if (language === "en") {
-    if (toolName === "grep_search" || toolName === "glob_search") return "search";
+    if (toolName === "grep_search" || toolName === "glob_search" || toolName.startsWith("repo_map_")) return "search";
     if (phase === "discover") return "scan";
     if (phase === "inspect") return "read";
     if (phase === "edit") return "edit";
@@ -200,7 +201,7 @@ function localizedActionVerb(toolName: string, phase: ToolExecutionPhase, langua
     if (phase === "blocked") return "preserve";
     return "process";
   }
-  if (toolName === "grep_search" || toolName === "glob_search") return "搜索";
+  if (toolName === "grep_search" || toolName === "glob_search" || toolName.startsWith("repo_map_")) return "搜索";
   if (phase === "discover") return "扫描";
   if (phase === "inspect") return "读取";
   if (phase === "edit") return "修改";
@@ -648,7 +649,7 @@ export function summarizeToolObservation(input: {
   if (language === "en") {
     if (input.noOp) return "No file change was needed because the target already matched the requested content.";
     if (hasHiddenProcess) return `Confirmed ${role} contains hiddenProcess-related visibility logic.`;
-    if (input.toolName === "replace_in_file" || input.toolName === "write_file") return `Recorded the file change for ${role}; the diff is available as evidence.`;
+    if (input.toolName === "replace_in_file" || input.toolName === "write_file" || input.toolName === "apply_patch") return `Recorded the file change for ${role}; the diff is available as evidence.`;
     if (input.toolName === "run_command" || input.toolName === "execute_command") {
       if (exitZero && !failed) return `Verification command for ${role} exited successfully.`;
       if (failed) return `Command output for ${role} contains a failure signal that needs follow-up.`;
@@ -659,13 +660,13 @@ export function summarizeToolObservation(input: {
       if (failed || /"ok"\s*:\s*false/i.test(result)) return `Browser validation for ${role} reported a failure that needs follow-up.`;
       return `Browser validation output for ${role} was captured for the next decision.`;
     }
-    if (input.toolName === "grep_search" || input.toolName === "glob_search") return `Search results narrowed the relevant evidence around ${role}.`;
+    if (input.toolName === "grep_search" || input.toolName === "glob_search" || input.toolName.startsWith("repo_map_")) return `Search results narrowed the relevant evidence around ${role}.`;
     return `Read ${role} and captured the relevant context.`;
   }
 
   if (input.noOp) return "目标内容已经匹配，本次没有产生文件改动。";
   if (hasHiddenProcess) return `已确认 ${role} 包含 hiddenProcess 相关可见性逻辑。`;
-  if (input.toolName === "replace_in_file" || input.toolName === "write_file") return `已记录 ${role} 的文件改动，diff 可作为证据。`;
+  if (input.toolName === "replace_in_file" || input.toolName === "write_file" || input.toolName === "apply_patch") return `已记录 ${role} 的文件改动，diff 可作为证据。`;
   if (input.toolName === "run_command" || input.toolName === "execute_command") {
     if (exitZero && !failed) return `${role}已成功退出，可作为验证通过证据。`;
     if (failed) return `${role}输出里包含失败信号，需要继续处理。`;
@@ -676,6 +677,6 @@ export function summarizeToolObservation(input: {
     if (failed || /"ok"\s*:\s*false/i.test(result)) return `${role}的浏览器验证返回失败信号，需要继续处理。`;
     return `已记录${role}的浏览器验证结果，用于判断下一步。`;
   }
-  if (input.toolName === "grep_search" || input.toolName === "glob_search") return `搜索结果已收窄 ${role} 的相关证据。`;
+  if (input.toolName === "grep_search" || input.toolName === "glob_search" || input.toolName.startsWith("repo_map_")) return `搜索结果已收窄 ${role} 的相关证据。`;
   return `已读取 ${role}，捕获了后续判断所需上下文。`;
 }

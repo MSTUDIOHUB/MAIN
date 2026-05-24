@@ -7,6 +7,11 @@ const NON_EXECUTION_EVIDENCE_TOOLS = new Set([
   "list_directory",
   "glob_search",
   "grep_search",
+  "repo_map_status",
+  "repo_map_search",
+  "repo_map_context",
+  "repo_map_files",
+  "repo_map_impact",
   "read_file",
   "read_document",
   "analyze_tabular_document",
@@ -130,7 +135,7 @@ export function createPlanExecutionEvidenceEntry(input: {
   if (!target || input.noOp || isPlanArtifactPath(target)) return null;
 
   const timestamp = Date.now();
-  if (input.toolName === "write_file" || input.toolName === "replace_in_file" || input.toolName === "delete_workspace_path") {
+  if (input.toolName === "write_file" || input.toolName === "replace_in_file" || input.toolName === "apply_patch" || input.toolName === "delete_workspace_path") {
     return {
       id: `evidence-${timestamp}-${Math.random().toString(36).slice(2, 8)}`,
       kind: "file",

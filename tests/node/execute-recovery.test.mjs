@@ -93,6 +93,7 @@ test("execute recovery tool surface removes broad reads but keeps action and tar
     "read_document",
     "index_workspace_documents",
     "get_file_outline",
+    "apply_patch",
     "replace_in_file",
     "write_file",
     "execute_command",
@@ -107,8 +108,8 @@ test("execute recovery tool surface removes broad reads but keeps action and tar
 
   assert.deepEqual(scoped, [
     "grep_search",
-    "read_file",
     "get_file_outline",
+    "apply_patch",
     "replace_in_file",
     "write_file",
     "execute_command",
@@ -170,8 +171,8 @@ test("read-only budget triggers execute recovery before max iterations", () => {
     repeatedTargets: summarizeRepeatedExecuteTargets(recent),
     recentActivity: recent,
   });
-  assert.match(prompt, /定向 `read_file`、`grep_search` 和 outline 仍可用/);
-  assert.match(prompt, /write_file|replace_in_file/);
+  assert.match(prompt, /不再开放 `read_file`/);
+  assert.match(prompt, /apply_patch|write_file|replace_in_file/);
 });
 
 test("execute no-progress pause reports edit-mode recent tools instead of empty plan activity", () => {

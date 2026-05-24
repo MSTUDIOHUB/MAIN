@@ -356,7 +356,7 @@ function makeTargetSummary(targets: string[], language: ToolPresentationLanguage
 function compactActivityTargetForTitle(target: string, toolName = ""): string {
   const normalized = String(target || "").replace(/[\\/]+$/g, "").trim();
   if (!normalized) return "";
-  if (toolName === "grep_search" || toolName === "glob_search") {
+  if (toolName === "grep_search" || toolName === "glob_search" || toolName.startsWith("repo_map_")) {
     return compactLine(normalized, 72);
   }
   const parts = normalized.split(/[\\/]/).filter(Boolean);
@@ -375,18 +375,18 @@ function toolActionForActivityTitle(block: any, language: ToolPresentationLangua
     if (toolName === "list_directory" || toolName === "get_project_skeleton") return `scanned ${rawTarget}`;
     if (toolName === "analyze_tabular_document" || toolName === "query_tabular_document") return `analyzed ${rawTarget}`;
     if (toolName === "write_file") return `wrote ${rawTarget}`;
-    if (toolName === "replace_in_file") return `edited ${rawTarget}`;
+    if (toolName === "replace_in_file" || toolName === "apply_patch") return `edited ${rawTarget}`;
     if (toolName === "run_command" || toolName === "execute_command") return `ran ${rawTarget}`;
     if (toolName === "browser_evaluate") return `validated ${rawTarget}`;
     return toolName ? `${toolName} ${rawTarget}` : "";
   }
-  if (toolName === "grep_search" || toolName === "glob_search") return `搜索 ${rawTarget}`;
+  if (toolName === "grep_search" || toolName === "glob_search" || toolName.startsWith("repo_map_")) return `搜索 ${rawTarget}`;
   if (toolName === "read_file" || toolName === "read_document") return `读取 ${rawTarget}`;
   if (toolName === "get_file_outline") return `查看结构 ${rawTarget}`;
   if (toolName === "list_directory" || toolName === "get_project_skeleton") return `扫描 ${rawTarget}`;
   if (toolName === "analyze_tabular_document" || toolName === "query_tabular_document") return `分析 ${rawTarget}`;
   if (toolName === "write_file") return `写入 ${rawTarget}`;
-  if (toolName === "replace_in_file") return `编辑 ${rawTarget}`;
+  if (toolName === "replace_in_file" || toolName === "apply_patch") return `编辑 ${rawTarget}`;
   if (toolName === "run_command" || toolName === "execute_command") return `运行 ${rawTarget}`;
   if (toolName === "browser_evaluate") return `验证 ${rawTarget}`;
   return toolName ? `${toolName} ${rawTarget}` : "";
@@ -447,6 +447,11 @@ const EXPLORING_TOOL_NAMES = new Set([
   "list_directory",
   "glob_search",
   "grep_search",
+  "repo_map_status",
+  "repo_map_search",
+  "repo_map_context",
+  "repo_map_files",
+  "repo_map_impact",
   "read_file",
   "read_document",
   "analyze_tabular_document",
@@ -496,7 +501,7 @@ function classifyToolActivityKind(toolName: string, status: TurnArchiveStepStatu
   }
   if (isExploringToolName(toolName)) return "exploring";
   if (toolName === "browser_evaluate") return "browser";
-  if (toolName === "replace_in_file" || toolName === "write_file") return "edit";
+  if (toolName === "replace_in_file" || toolName === "write_file" || toolName === "apply_patch") return "edit";
   if (toolName === "execute_command" || toolName === "run_command" || toolName === "send_pty_input" || TERMINAL_READ_TOOL_NAMES.has(toolName)) {
     return "command";
   }
@@ -628,12 +633,12 @@ function addActivityMetricsFromBlock(metrics: ActivityMetrics, block: any): void
   else if (toolName === "read_document") metrics.documentsRead += 1;
   else if (toolName === "get_file_outline") metrics.outlinesRead += 1;
   else if (toolName === "list_directory" || toolName === "get_project_skeleton" || toolName === "index_workspace_documents") metrics.directoriesListed += 1;
-  else if (toolName === "glob_search" || toolName === "grep_search") metrics.searches += 1;
+  else if (toolName === "glob_search" || toolName === "grep_search" || toolName.startsWith("repo_map_")) metrics.searches += 1;
   else if (toolName === "analyze_tabular_document" || toolName === "query_tabular_document") metrics.tablesAnalyzed += 1;
   else if (toolName === "browser_evaluate") metrics.browserValidations += 1;
   else if (TERMINAL_READ_TOOL_NAMES.has(toolName)) metrics.terminalReads += 1;
   else if (toolName === "execute_command" || toolName === "run_command" || toolName === "send_pty_input") metrics.commandsRun += 1;
-  else if (toolName === "write_file" || toolName === "replace_in_file") {
+  else if (toolName === "write_file" || toolName === "replace_in_file" || toolName === "apply_patch") {
     const diff = block.diff || {};
     const existed = typeof diff.existed === "boolean" ? diff.existed : String(diff.old || "").length > 0;
     if (toolName === "write_file" && !existed) metrics.filesCreated += 1;

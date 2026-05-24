@@ -113,6 +113,15 @@ const TOOL_LABELS_EN: Record<string, string> = {
   index_workspace_documents: "Indexed workspace documents",
 };
 
+const BROAD_DISCOVERY_EVIDENCE_RE =
+  /^(?:(?:glob_search|list_directory|get_project_skeleton|index_workspace_documents)\b|(?:已搜索文件|已查看目录|已查看项目结构|已索引工作区文档)(?:[:：\s]|$)|(?:Searched files|Listed directory|Inspected project structure|Indexed workspace documents)\b)/i;
+const CONCRETE_PLAN_EVIDENCE_RE =
+  /^(?:(?:read_file|read_document|get_file_outline|grep_search|analyze_tabular_document|query_tabular_document)\b|(?:已读取文件|已读取文档|已查看文件结构|已搜索文本|已分析表格数据|已查询表格数据)(?:[:：\s]|$)|(?:Read file|Read document|Inspected file outline|Searched text|Analyzed tabular data|Queried tabular data)\b)/i;
+const CSV_DASHBOARD_GOAL_RE =
+  /(?:CSV|导入|creator|course|课程|销售|排行|趋势|环比|订单|状态|Dashboard|面板|图表|指标|数据|field|column|chart|metric|order|status)/i;
+const DARK_THEME_GOAL_RE =
+  /(?:深色|暗色|dark\s*mode|theme|主题|白色底|background|contrast|palette)/i;
+
 function countPlanShapeSignals(content: string): number {
   const headingCount = (content.match(/^#{1,3}\s+\S+/gm) || []).length;
   const bulletCount = (content.match(/^\s*(?:[-*]|\d+[.)、])\s+\S+/gm) || []).length;
@@ -244,6 +253,36 @@ function isActionablePlanFile(value: unknown): boolean {
   const normalized = String(value || "").replace(/\\/g, "/").trim();
   if (!normalized || isPlanArtifactPath(normalized)) return false;
   return ACTIONABLE_PLAN_FILE_RE.test(normalized);
+}
+
+function baseNameForPlanPath(value: string): string {
+  return String(value || "").replace(/\\/g, "/").split("/").filter(Boolean).pop() || "";
+}
+
+function isBroadDiscoveryEvidence(value: string): boolean {
+  return BROAD_DISCOVERY_EVIDENCE_RE.test(String(value || "").trim());
+}
+
+function isConcretePlanEvidence(value: string): boolean {
+  const text = String(value || "").trim();
+  return CONCRETE_PLAN_EVIDENCE_RE.test(text) && !isBroadDiscoveryEvidence(text);
+}
+
+function evidenceMentionsFile(evidence: string, file: string): boolean {
+  const normalizedEvidence = String(evidence || "").replace(/\\/g, "/").toLowerCase();
+  const normalizedFile = String(file || "").replace(/\\/g, "/").toLowerCase();
+  const basename = baseNameForPlanPath(normalizedFile).toLowerCase();
+  return Boolean(
+    normalizedFile &&
+    (
+      normalizedEvidence.includes(normalizedFile) ||
+      (basename.length > 4 && normalizedEvidence.includes(basename))
+    )
+  );
+}
+
+function pickEvidenceForFile(evidence: string[], file: string): string {
+  return evidence.find((item) => evidenceMentionsFile(item, file)) || evidence[0] || "";
 }
 
 function stripToolMetaFields(value: string): string {
@@ -700,6 +739,49 @@ function summarizeGoalForPlanChange(goal: string, language: "zh" | "en"): string
   return compact.replace(/[。.!?？；;:：]\s*$/, "");
 }
 
+function buildDeterministicChangeLine(input: {
+  file: string;
+  goal: string;
+  evidence: string;
+  language: "zh" | "en";
+}): string {
+  const file = input.file;
+  const lowerFile = file.toLowerCase();
+  const goalAndFile = `${input.goal}\n${file}`;
+  const evidence = input.evidence || (
+    input.language === "zh" ? "已读项目证据确认该文件在影响范围内" : "read project evidence confirms this file is in scope"
+  );
+  if (input.language === "en") {
+    if (CSV_DASHBOARD_GOAL_RE.test(goalAndFile) && /usecsvparser/.test(lowerFile)) {
+      return `Fix CSV column-to-order-field mapping in \`${file}\` so Dashboard-required fields such as creator/course/date/status/amount are not dropped. Grounding evidence: ${evidence}.`;
+    }
+    if (CSV_DASHBOARD_GOAL_RE.test(goalAndFile) && /dashboardstore/.test(lowerFile)) {
+      return `Fix the imported-data path in \`${file}\` so Dashboard metrics and charts consume the uploaded CSV data instead of stale/default state. Grounding evidence: ${evidence}.`;
+    }
+    if (CSV_DASHBOARD_GOAL_RE.test(goalAndFile) && /usechartdata|dashboard|chart/.test(lowerFile)) {
+      return `Align chart data derivation in \`${file}\` with the imported order records for rankings, trends, month-over-month metrics, and order status. Grounding evidence: ${evidence}.`;
+    }
+    if (DARK_THEME_GOAL_RE.test(goalAndFile) && /app\.tsx|index\.css|theme|style|dashboard|component/.test(lowerFile)) {
+      return `Update \`${file}\` to use coherent dark-theme surfaces, tokens, and chart/container contrast instead of light backgrounds with isolated dark boxes. Grounding evidence: ${evidence}.`;
+    }
+    return `Update \`${file}\` at the confirmed implementation boundary for the user goal, then verify the affected behavior with the focused check. Grounding evidence: ${evidence}.`;
+  }
+
+  if (CSV_DASHBOARD_GOAL_RE.test(goalAndFile) && /usecsvparser/.test(lowerFile)) {
+    return `修复 \`${file}\` 的 CSV 列名到订单字段映射，确保 creator、course、date、status、amount 等 Dashboard 所需字段不会在导入时丢失。依据证据：${evidence}。`;
+  }
+  if (CSV_DASHBOARD_GOAL_RE.test(goalAndFile) && /dashboardstore/.test(lowerFile)) {
+    return `修复 \`${file}\` 中导入数据进入 Dashboard 状态与统计源的链路，确保课程排行、销售趋势、月度环比和订单状态读取上传后的真实数据。依据证据：${evidence}。`;
+  }
+  if (CSV_DASHBOARD_GOAL_RE.test(goalAndFile) && /usechartdata|dashboard|chart/.test(lowerFile)) {
+    return `调整 \`${file}\` 的图表数据派生，让排行、趋势、环比和状态图表与导入后的订单记录保持一致。依据证据：${evidence}。`;
+  }
+  if (DARK_THEME_GOAL_RE.test(goalAndFile) && /app\.tsx|index\.css|theme|style|dashboard|component/.test(lowerFile)) {
+    return `更新 \`${file}\` 的深色模式表面、主题 token、图表/容器对比度，避免白底页面上局部套深色框的割裂显示。依据证据：${evidence}。`;
+  }
+  return `更新 \`${file}\` 中已确认影响用户目标的字段、状态或界面处理，并用聚焦验证确认行为变化。依据证据：${evidence}。`;
+}
+
 function buildCodexStylePlanArtifact(input: {
   userGoal: string;
   evidence: string[];
@@ -708,25 +790,38 @@ function buildCodexStylePlanArtifact(input: {
   language: "zh" | "en";
 }): string {
   const goal = compactPlanLine(input.userGoal, 420);
-  const evidence = uniqueCompactLines(input.evidence, 8, 220);
-  const files = uniqueCompactLines(input.files, 8, 160).filter(isActionablePlanFile);
+  const rawEvidence = uniqueCompactLines(input.evidence, 10, 220);
+  const concreteEvidence = rawEvidence.filter(isConcretePlanEvidence);
+  const evidence = (concreteEvidence.length > 0
+    ? concreteEvidence
+    : rawEvidence.filter((item) => !isBroadDiscoveryEvidence(item))
+  ).slice(0, 8);
+  const rawFiles = uniqueCompactLines(input.files, 10, 160).filter(isActionablePlanFile);
+  const filesWithConcreteEvidence = rawFiles.filter((file) =>
+    evidence.some((item) => evidenceMentionsFile(item, file))
+  );
+  const files = (filesWithConcreteEvidence.length > 0 ? filesWithConcreteEvidence : rawFiles).slice(0, 8);
   const constraints = uniqueCompactLines(input.constraints, 5, 200);
   const commands = extractInlineCommands([...evidence, ...constraints]);
   const hasGroundedEvidence = Boolean(goal) &&
     evidence.length > 0 &&
+    concreteEvidence.length > 0 &&
     (files.length > 0 || /CSV|TSV|XLSX|字段|列|指标|数据|表格|dataset|table|metric|column/i.test(`${goal}\n${evidence.join("\n")}`));
 
   if (!hasGroundedEvidence) {
     return buildInsufficientEvidencePlan({ goal, language: input.language });
   }
+  const goalSummary = summarizeGoalForPlanChange(goal, input.language);
 
   if (input.language === "en") {
     const scope = files.length > 0 ? files.map((file) => `\`${file}\``).join(", ") : "the confirmed data/reporting surface";
-    const goalSummary = summarizeGoalForPlanChange(goal, "en");
     const changes = files.length > 0
-      ? files.slice(0, 6).map((file, index) =>
-          `Implement the smallest verified change in \`${file}\` for ${goalSummary}; confirm the exact edit from evidence before writing. Grounding evidence: ${evidence[index] || evidence[0]}.`
-        )
+      ? files.slice(0, 6).map((file) => buildDeterministicChangeLine({
+          file,
+          goal,
+          evidence: pickEvidenceForFile(evidence, file),
+          language: "en",
+        }))
       : [`Implement the confirmed data/reporting change for ${goalSummary} using the inspected evidence: ${evidence[0]}.`];
     return [
       "# Plan",
@@ -754,11 +849,13 @@ function buildCodexStylePlanArtifact(input: {
   }
 
   const scope = files.length > 0 ? files.map((file) => `\`${file}\``).join("、") : "已确认的数据/报表链路";
-  const goalSummary = summarizeGoalForPlanChange(goal, "zh");
   const changes = files.length > 0
-    ? files.slice(0, 6).map((file, index) =>
-        `在 \`${file}\` 中实施与“${goalSummary}”直接相关的最小改动；写入前先用证据确认具体字段、状态或接口。依据证据：${evidence[index] || evidence[0]}。`
-      )
+    ? files.slice(0, 6).map((file) => buildDeterministicChangeLine({
+        file,
+        goal,
+        evidence: pickEvidenceForFile(evidence, file),
+        language: "zh",
+      }))
     : [`基于已确认的证据实施与“${goalSummary}”相关的数据/报表改动：${evidence[0]}。`];
   return [
     "# 计划",
@@ -827,6 +924,10 @@ export function canonicalizePlanArtifactContent(input: {
   const visibleEvidenceLines = collectLinesFromSections(sections, [
     /(?:已读证据|证据引用|证据|读取|调查|Evidence|References|Read Evidence|Context Read)/i,
   ], 6);
+  const inlineEvidenceLines = uniquePlanItems(raw.split(/\r?\n/).filter((line) => {
+    const cleaned = cleanPlanItem(line);
+    return isConcretePlanEvidence(cleaned) || isBroadDiscoveryEvidence(cleaned);
+  }), 8);
   const activityEvidence = uniquePlanItems(
     (input.recentToolActivity || [])
       .map(summarizeToolActivityForEvidence)
@@ -841,10 +942,12 @@ export function canonicalizePlanArtifactContent(input: {
     ...externalEvidence,
     ...activityEvidence,
     ...visibleEvidenceLines,
+    ...inlineEvidenceLines,
     providedContextCount > 0
       ? buildProvidedContextObservation({ turnContext: input.turnContext, language })
       : "",
   ], 10);
+  const concreteEvidenceLines = evidenceLines.filter(isConcretePlanEvidence);
 
   const visibleFindingLines = uniquePlanItems([
     ...collectSectionTitles(sections, [
@@ -868,11 +971,20 @@ export function canonicalizePlanArtifactContent(input: {
     ], 8),
     ...collectPathLikePlanItems(raw),
   ], 10, 160);
+  if (
+    fileLines.some(isActionablePlanFile) &&
+    concreteEvidenceLines.length === 0 &&
+    evidenceLines.some(isBroadDiscoveryEvidence)
+  ) {
+    return null;
+  }
   const stepLines = uniquePlanItems([
     ...collectLinesFromSections(sections, [
       /(?:执行|实施|方案|计划|步骤|修复|落地|Approach|Implementation|Plan of Work|Plan|Steps|Fix)/i,
     ], 8),
-  ], 8);
+  ], 8).filter((line) =>
+    !/(?:与用户目标直接相关的最小改动|smallest user-goal-specific change|落实已批准目标|approved goal)/i.test(line)
+  );
   const riskLines = uniquePlanItems([
     ...collectLinesFromSections(sections, [
       /(?:风险|取舍|注意|边界|默认|后续|Risks|Tradeoffs|Caveats|Boundary|Default|Follow-up)/i,
@@ -901,14 +1013,25 @@ export function canonicalizePlanArtifactContent(input: {
       ? screenshotLines.slice(0, 2)
       : [buildProvidedContextObservation({ turnContext: input.turnContext, language })]),
   ], 6);
+  const goalForChanges = goalLines[0] || explicitInputGoal || input.userGoal || "";
+  const fileChangeEvidence = concreteEvidenceLines.length > 0
+    ? concreteEvidenceLines
+    : evidenceLines.filter((line) => !isBroadDiscoveryEvidence(line));
+  const fileDerivedChangeLines = fileLines.slice(0, 4).flatMap((file) => {
+    const grounding = pickEvidenceForFile(fileChangeEvidence, file);
+    if (!grounding) return [];
+    return [buildDeterministicChangeLine({
+      file,
+      goal: goalForChanges,
+      evidence: grounding,
+      language,
+    })];
+  });
   const keyChangeLines = uniquePlanItems([
     ...stepLines,
-    ...fileLines.slice(0, 4).map((file) =>
-      language === "zh"
-        ? `围绕 \`${file}\` 执行与用户目标直接相关的最小改动。`
-        : `Apply the smallest user-goal-specific change around \`${file}\`.`
-    ),
+    ...fileDerivedChangeLines,
   ], 8);
+  if (keyChangeLines.length === 0) return null;
   const assumptionLines = uniquePlanItems([
     ...hypothesisLines,
     ...riskLines,

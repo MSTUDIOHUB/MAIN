@@ -39,8 +39,14 @@ const BARE_TOOL_NAMES = new Set([
   "index_workspace_documents",
   "glob_search",
   "grep_search",
+  "repo_map_status",
+  "repo_map_search",
+  "repo_map_context",
+  "repo_map_files",
+  "repo_map_impact",
   "replace_in_file",
   "write_file",
+  "apply_patch",
   "execute_command",
   "send_pty_input",
   "run_command",
@@ -58,6 +64,7 @@ const TOOL_BODY_ARG_NAMES: Partial<Record<string, string>> = {
   run_command: "command",
   browser_evaluate: "url",
   write_file: "content",
+  apply_patch: "patch",
 };
 
 const TOOL_POSITIONAL_ARG_NAMES: Partial<Record<string, string>> = {
@@ -70,6 +77,10 @@ const TOOL_POSITIONAL_ARG_NAMES: Partial<Record<string, string>> = {
   index_workspace_documents: "path",
   glob_search: "pattern",
   grep_search: "query",
+  repo_map_search: "query",
+  repo_map_context: "task",
+  repo_map_files: "filter",
+  repo_map_impact: "target",
   browser_evaluate: "url",
 };
 

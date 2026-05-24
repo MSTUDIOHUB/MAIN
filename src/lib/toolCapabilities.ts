@@ -93,6 +93,11 @@ const READ_ONLY_BUILT_INS = new Set([
   "index_workspace_documents",
   "glob_search",
   "grep_search",
+  "repo_map_status",
+  "repo_map_search",
+  "repo_map_context",
+  "repo_map_files",
+  "repo_map_impact",
   "read_pty_buffer",
   "read_pty_tail",
   "read_pty_since",
@@ -102,7 +107,7 @@ const READ_ONLY_BUILT_INS = new Set([
   "get_file_outline",
 ]);
 
-const WORKSPACE_WRITE_BUILT_INS = new Set(["replace_in_file", "write_file"]);
+const WORKSPACE_WRITE_BUILT_INS = new Set(["replace_in_file", "write_file", "apply_patch"]);
 const SHELL_BUILT_INS = new Set(["run_command", "execute_command", "send_pty_input"]);
 const BROWSER_CONTROL_BUILT_INS = new Set(["browser_evaluate"]);
 const DESTRUCTIVE_BUILT_INS = new Set(["delete_workspace_path"]);

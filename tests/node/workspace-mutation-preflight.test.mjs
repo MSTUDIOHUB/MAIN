@@ -134,3 +134,25 @@ test("write_file preflight blocks missing or identical content", async () => {
 
   assert.equal(create.ok, true);
 });
+
+test("apply_patch preflight blocks invalid, no-op, and mismatched patches before review", async () => {
+  const invalid = await preflightWorkspaceMutation({
+    toolName: "apply_patch",
+    args: { patch: "*** Begin Patch\n*** Update File: src/App.tsx\n@@\n-old\n+new\n*** End Patch" },
+    language: "en",
+    readFile: async () => "current\n",
+  });
+
+  assert.equal(invalid.ok, false);
+  assert.equal(invalid.reason, "invalid_patch");
+  assert.match(invalid.message || "", /Do not ask for approval/);
+
+  const valid = await preflightWorkspaceMutation({
+    toolName: "apply_patch",
+    args: { patch: "*** Begin Patch\n*** Update File: src/App.tsx\n@@\n-current\n+updated\n*** End Patch" },
+    language: "zh",
+    readFile: async () => "current\n",
+  });
+
+  assert.equal(valid.ok, true);
+});

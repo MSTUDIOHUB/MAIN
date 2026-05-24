@@ -62,10 +62,10 @@ function toolFamily(tool: string): string {
   if (/^(?:read_file|read_document|get_file_outline|analyze_tabular_document|query_tabular_document)$/i.test(tool)) {
     return "read";
   }
-  if (/^(?:list_directory|get_project_skeleton|glob_search|grep_search|index_workspace_documents)$/i.test(tool)) {
+  if (/^(?:list_directory|get_project_skeleton|glob_search|grep_search|repo_map_status|repo_map_search|repo_map_context|repo_map_files|repo_map_impact|index_workspace_documents)$/i.test(tool)) {
     return "search";
   }
-  if (/^(?:write_file|replace_in_file|delete_workspace_path)$/i.test(tool)) return "edit";
+  if (/^(?:write_file|replace_in_file|apply_patch|delete_workspace_path)$/i.test(tool)) return "edit";
   if (/^(?:run_command|execute_command|send_pty_input|read_pty_|get_pty_status|clear_pty_buffer)/i.test(tool)) return "command";
   if (/browser/i.test(tool)) return "browser";
   return tool || "progress";
