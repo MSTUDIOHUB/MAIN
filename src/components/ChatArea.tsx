@@ -770,6 +770,42 @@ function isTransparentToolNarrationBlock(block: any): boolean {
   return futureToolNarration || isThinToolNarration(text);
 }
 
+function shouldSuppressAgentAsExplanation(block: any, index: number, blocks: any[], turnIntent: string): boolean {
+  if (!block || block.type !== "agent" || block.hiddenProcess) return false;
+  
+  const isToolIntent = turnIntent !== "respond" && turnIntent !== "discuss";
+  if (!isToolIntent) return false;
+
+  const text = getAgentVisibleMarkdownText(block);
+  const content = String(text || "").trim();
+  if (!content) return true;
+
+  // 1. Followed by a tool block in the turn
+  const followedByTool = blocks.slice(index + 1).some(b => b.type === "tool");
+  if (followedByTool) return true;
+
+  // 2. First agent block in a tool-intent turn
+  const agentBlocks = blocks.filter(b => b.type === "agent");
+  const isFirstAgentBlock = agentBlocks.indexOf(block) === 0;
+  if (isFirstAgentBlock) return true;
+
+  // 3. Thin narration
+  if (isThinModelToolNarration(content) || isThinToolNarration(text)) return true;
+
+  // 4. Streaming and not substantive feedback (planning/intent explanation)
+  if (block.streaming) {
+    const isSubstantive = isSubstantiveModelFeedback(content);
+    if (!isSubstantive) {
+      return true;
+    }
+  }
+
+  // 5. Check if isTransparentToolNarrationBlock matches it
+  if (isTransparentToolNarrationBlock(block)) return true;
+
+  return false;
+}
+
 function hasGeneratedPlanContent(blocks: any[]) {
   return blocks.some((block) => {
     if (block.type === "tool") {
@@ -2666,6 +2702,8 @@ export default function ChatArea({
   const [shouldRenderTopIsland, setShouldRenderTopIsland] = useState(false);
   const [isTopIslandVisible, setIsTopIslandVisible] = useState(false);
   const [previewImageItem, setPreviewImageItem] = useState<UserContextItem | null>(null);
+  const [persistedExplanation, setPersistedExplanation] = useState("");
+  const lastTurnIdRef = useRef<string | undefined>(undefined);
   // endregion
 
   useEffect(() => {
@@ -2818,6 +2856,23 @@ export default function ChatArea({
     }
     return "";
   }, [isStreaming, agentStatus, activeTurn, blocksByTurnId]);
+
+  useEffect(() => {
+    const isRunActive = isStreaming || agentStatus === "running" || (activeTurn && activeTurn.status === "executing");
+    
+    if (activeTurn?.id !== lastTurnIdRef.current) {
+      lastTurnIdRef.current = activeTurn?.id;
+      setPersistedExplanation("");
+      return;
+    }
+
+    if (!isRunActive) {
+      setPersistedExplanation("");
+    } else if (explanationText) {
+      setPersistedExplanation(explanationText);
+    }
+  }, [explanationText, isStreaming, agentStatus, activeTurn]);
+
   const hasPlanPanelContent = useMemo(() => {
     if (planArtifacts.length > 0) return true;
 
@@ -3327,10 +3382,19 @@ export default function ChatArea({
           })()
         : "";
     const isBottomThoughtStreaming = !!latestThoughtBlock?.isStreaming;
+    const isActiveRunningTurn = activeTurn?.id === turn.id &&
+      (isStreaming || agentStatus === "running" || turn.status === "executing");
     const renderTurnBlockItem = (item) => {
       if (item.kind !== "readContextGroup" && item.kind !== "operationCluster" && item.block?.type === "thought") return null;
-      if (item.kind === "block" && isTransparentToolNarrationBlock(item.block)) {
-        return null;
+      if (item.kind === "block") {
+        if (isActiveRunningTurn) {
+          // Active running turn: suppress all intermediate explanations → capsule shows them
+          const isExplanation = shouldSuppressAgentAsExplanation(item.block, item.index, blocks, turnIntent);
+          if (isExplanation) return null;
+        } else {
+          // Finished turns: use original transparent narration filter
+          if (isTransparentToolNarrationBlock(item.block)) return null;
+        }
       }
       if (item.kind === "block" && shouldSuppressAgentToolEcho(blocks, item.index)) return null;
 
@@ -3338,6 +3402,7 @@ export default function ChatArea({
     };
     const renderArchivedBlockItem = (item) => {
       if (item.kind !== "readContextGroup" && item.kind !== "operationCluster" && item.block?.type === "thought") return null;
+      // Archived items are always from finished turns — use original filter
       if (item.kind === "block" && isTransparentToolNarrationBlock(item.block)) return null;
       return renderBlockItem(item);
     };
@@ -3742,11 +3807,11 @@ export default function ChatArea({
         className="absolute left-6 right-6 z-30 pointer-events-none flex justify-center transition-all duration-300 ease-out"
         style={{
           bottom: `calc(env(safe-area-inset-bottom, 0px) + 1.5rem + ${composerHeight}px + 12px)`,
-          opacity: explanationText ? 1 : 0,
-          transform: explanationText ? 'translateY(0)' : 'translateY(8px)',
+          opacity: persistedExplanation ? 1 : 0,
+          transform: persistedExplanation ? 'translateY(0)' : 'translateY(8px)',
         }}
       >
-        {explanationText && (
+        {persistedExplanation && (
           <div 
             className="agent-explanation-capsule w-full max-w-3xl"
             style={{
@@ -3755,7 +3820,7 @@ export default function ChatArea({
             }}
           >
             <span className="line-clamp-2 text-ellipsis overflow-hidden">
-              {explanationText}
+              {persistedExplanation}
             </span>
           </div>
         )}

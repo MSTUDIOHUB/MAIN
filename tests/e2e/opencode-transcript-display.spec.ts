@@ -18,7 +18,7 @@ test("realistic plan prompt renders as opencode-style narrative plus operation c
   }, prompt);
 
   await expect(page.getByText(prompt)).toBeVisible();
-  await expect(page.getByText("我会先整体理解项目结构，然后读取 ChatArea、工具分组和 Plan runtime 的关键链路。")).toBeVisible();
+  await expect(page.getByText("我会先整体理解项目结构，然后读取 ChatArea、工具分组和 Plan runtime 的关键链路。")).toHaveCount(0);
   await expect(page.getByText("让我继续读取关键文件来确认渲染结构。")).toHaveCount(0);
   await expect(page.getByText("从已读取的文件中，我发现显示层需要先生成 operation cluster")).toBeVisible();
 
