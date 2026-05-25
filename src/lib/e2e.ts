@@ -17,6 +17,7 @@ const FEISHU_REMOTE_ANALYSIS_SCENARIO = "feishu-remote-analysis";
 const READ_CONTEXT_COLLAPSE_SCENARIO = "read-context-collapse";
 const READ_CONTEXT_INTERLEAVED_SCENARIO = "read-context-interleaved";
 const READ_CONTEXT_AGENT_SEGMENT_SCENARIO = "read-context-agent-segment";
+const READ_CONTEXT_THIN_NARRATION_SCENARIO = "read-context-thin-narration";
 const READ_CONTEXT_PERSISTENT_PROGRESS_SCENARIO = "read-context-persistent-progress";
 const PROCESS_DISPLAY_SCENARIO = "process-display";
 const GAME_STUDIO_ONBOARDING_SCENARIO = "game-studio-onboarding";
@@ -185,6 +186,7 @@ function bindBridgeSnapshot(scenario: string) {
         title: turn.title,
         status: turn.status,
         intent: turn.intent,
+        displayIntent: turn.displayIntent || turn.intent,
         parentPlanTurnId: turn.parentPlanTurnId || null,
         uiVisibility: turn.uiVisibility || "visible",
         blockCount: turn.blockIds.length,
@@ -211,6 +213,7 @@ function bindBridgeSnapshot(scenario: string) {
       currentTurnTitle: currentTurn?.title ?? null,
       currentTurnStatus: currentTurn?.status ?? null,
       currentTurnIntent: currentTurn?.intent ?? null,
+      currentTurnDisplayIntent: currentTurn?.displayIntent ?? currentTurn?.intent ?? null,
       currentTurnParentPlanTurnId: currentTurn?.parentPlanTurnId ?? null,
       conversationTurns: state.conversationTurns.length,
       visibleConversationTurns,
@@ -1636,6 +1639,134 @@ function seedReadContextAgentSegmentScenario() {
 
   bindBridgeSnapshot(READ_CONTEXT_AGENT_SEGMENT_SCENARIO);
   appendBridgeEvent("seeded", { seedCount: readSeedCount(READ_CONTEXT_AGENT_SEGMENT_SCENARIO) });
+
+  const cleanup = () => {
+    bridge.initialized = false;
+  };
+
+  bridge.cleanup = cleanup;
+  return cleanup;
+}
+
+function seedReadContextThinNarrationScenario() {
+  const bridge = getBridge();
+  if (!bridge) return undefined;
+
+  bridge.events = [{ type: "boot" }];
+  bridge.savedDocuments = [];
+  bridge.completed = true;
+
+  const turnId = "e2e-read-context-thin-narration-turn";
+  const sessionId = 999029;
+  const now = Date.now();
+  const nextId = () => useAppStore.getState()._nextTaskId();
+  const userBlockId = nextId();
+  const taskFlow: any[] = [
+    { id: userBlockId, turnId, type: "user" as const, content: "根据截图说明问题，然后继续读取三个关键文件。" },
+    {
+      id: nextId(),
+      turnId,
+      type: "agent" as const,
+      content: [
+        "根据截图观察到的现象：",
+        "",
+        "图1（深色模式）：左侧导航是深色背景，右侧订单列表表格可见，但整体视觉像是白色背景简单反色。",
+        "",
+        "核心问题映射：CSV 数据已加载，但面板统计和图表未渲染，需要检查数据解析、状态管理和图表绑定。",
+      ].join("\n"),
+      streaming: false,
+    },
+    {
+      id: nextId(),
+      turnId,
+      type: "agent" as const,
+      content: "让我继续读取关键文件来确认问题根因。",
+      streaming: false,
+    },
+    {
+      id: nextId(),
+      turnId,
+      type: "tool" as const,
+      toolName: "read_file",
+      target: "src/App.tsx",
+      status: "done",
+      toolStatus: "executed" as const,
+      message: "OK",
+    },
+    {
+      id: nextId(),
+      turnId,
+      type: "tool" as const,
+      toolName: "read_file",
+      target: "src/components/Dashboard/OverviewCards.tsx",
+      status: "done",
+      toolStatus: "executed" as const,
+      message: "OK",
+    },
+    {
+      id: nextId(),
+      turnId,
+      type: "tool" as const,
+      toolName: "read_file",
+      target: "src/components/Dashboard/CourseBarChart.tsx",
+      status: "done",
+      toolStatus: "executed" as const,
+      message: "OK",
+    },
+    {
+      id: nextId(),
+      turnId,
+      type: "agent" as const,
+      content: "让我继续读取关键文件来确认问题根因。",
+      streaming: false,
+    },
+  ];
+
+  useAppStore.setState((state) => ({
+    ...state,
+    config: {
+      ...state.config,
+      language: "zh",
+      workflowMode: "edit",
+    },
+    currentWorkspace: "/tmp/e2e-read-context-thin-narration",
+    sessionsByWorkspace: {
+      "/tmp/e2e-read-context-thin-narration": [
+        {
+          id: sessionId,
+          title: "E2E Thin Read Narration",
+          date: new Date(now).toISOString(),
+          active: true,
+          messages: [],
+        },
+      ],
+    },
+    currentSessionId: sessionId,
+    taskFlow,
+    conversationTurns: [
+      {
+        id: turnId,
+        userPrompt: "根据截图说明问题，然后继续读取三个关键文件。",
+        title: "读取叙述透明折叠",
+        mode: "edit" as const,
+        status: "done" as const,
+        summary: "薄工具叙述不打断读取折叠。",
+        blockIds: taskFlow.map((block) => block.id),
+        collapsed: false,
+        createdAt: now,
+      },
+    ],
+    currentTurnId: turnId,
+    agentStatus: "idle",
+    isGenerating: false,
+    showPlanPanel: false,
+    showDiff: false,
+    showTerminal: false,
+    showFilePanel: false,
+  }));
+
+  bindBridgeSnapshot(READ_CONTEXT_THIN_NARRATION_SCENARIO);
+  appendBridgeEvent("seeded", { seedCount: readSeedCount(READ_CONTEXT_THIN_NARRATION_SCENARIO) });
 
   const cleanup = () => {
     bridge.initialized = false;
@@ -3563,6 +3694,12 @@ function seedComposerMainShortcutsScenario() {
       currentTurnIntent: state.currentTurnId
         ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId)?.intent ?? null
         : null,
+      currentTurnDisplayIntent: state.currentTurnId
+        ? (() => {
+            const turn = state.conversationTurns.find((candidate) => candidate.id === state.currentTurnId);
+            return turn?.displayIntent ?? turn?.intent ?? null;
+          })()
+        : null,
       currentTurnTitle: state.currentTurnId
         ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId)?.title ?? null
         : null,
@@ -3646,6 +3783,12 @@ function seedGameStudioPlanShortcutsScenario() {
       lockedComposerIntent: state.lockedComposerIntent,
       currentTurnIntent: state.currentTurnId
         ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId)?.intent ?? null
+        : null,
+      currentTurnDisplayIntent: state.currentTurnId
+        ? (() => {
+            const turn = state.conversationTurns.find((candidate) => candidate.id === state.currentTurnId);
+            return turn?.displayIntent ?? turn?.intent ?? null;
+          })()
         : null,
       currentTurnTitle: state.currentTurnId
         ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId)?.title ?? null
@@ -4935,6 +5078,7 @@ function seedCloudToolProtocolScenario(scenario: string) {
       planTasks: state.planTasks,
       currentTurnStatus: currentTurn?.status ?? null,
       currentTurnIntent: currentTurn?.intent ?? null,
+      currentTurnDisplayIntent: currentTurn?.displayIntent ?? currentTurn?.intent ?? null,
       pendingRunDecision: state.pendingRunDecision
         ? {
             kind: state.pendingRunDecision.kind,
@@ -5737,6 +5881,10 @@ export function initializeE2EScenarios(): (() => void) | undefined {
 
   if (scenario === READ_CONTEXT_AGENT_SEGMENT_SCENARIO) {
     return seedReadContextAgentSegmentScenario();
+  }
+
+  if (scenario === READ_CONTEXT_THIN_NARRATION_SCENARIO) {
+    return seedReadContextThinNarrationScenario();
   }
 
   if (scenario === READ_CONTEXT_PERSISTENT_PROGRESS_SCENARIO) {

@@ -7,6 +7,23 @@ export interface RecentTargetToolCall {
   name: string;
   targetKey: string;
   family: "edit" | "verify" | "other";
+  outcome?: TargetProgressOutcome;
+  reason?: string;
+}
+
+export type TargetProgressOutcome =
+  | "succeeded"
+  | "failed"
+  | "blocked"
+  | "no_change"
+  | "declined"
+  | "unknown";
+
+export interface TargetProgressEvent {
+  name: string;
+  target: string;
+  outcome?: TargetProgressOutcome;
+  reason?: string;
 }
 
 export interface RepeatLoopCheck {
@@ -187,6 +204,19 @@ export function registerTargetProgressForLoopGuard(
   name: string,
   target: string,
 ): TargetProgressLoopCheck {
+  return registerTargetProgressEventForLoopGuard(history, {
+    name,
+    target,
+    outcome: "failed",
+  });
+}
+
+export function registerTargetProgressEventForLoopGuard(
+  history: RecentTargetToolCall[],
+  event: TargetProgressEvent,
+): TargetProgressLoopCheck {
+  const name = event.name;
+  const target = event.target;
   const family = getToolProgressFamily(name, target);
   const targetKey = normalizeTargetKey(target);
   const threshold = targetKey.startsWith("shell-write:") ? 3 : family === "edit" ? 4 : 5;
@@ -196,7 +226,24 @@ export function registerTargetProgressForLoopGuard(
     return { repeated: false, threshold, targetKey, signature, family };
   }
 
-  history.push({ name, targetKey, family });
+  const outcome: TargetProgressOutcome = event.outcome || "unknown";
+  if (outcome === "succeeded") {
+    for (let index = history.length - 1; index >= 0; index -= 1) {
+      const call = history[index];
+      if (call.family === family && call.targetKey === targetKey) {
+        history.splice(index, 1);
+      }
+    }
+    return { repeated: false, threshold, targetKey, signature, family };
+  }
+
+  history.push({
+    name,
+    targetKey,
+    family,
+    outcome,
+    reason: event.reason,
+  });
   if (history.length > threshold + 3) history.shift();
 
   if (history.length >= threshold) {
@@ -222,7 +269,7 @@ export function formatTargetProgressLoopRecoveryMessage(
   const shellWriteHint = target.startsWith("shell-write:")
     ? " This shell-write target has already failed to make progress; inspect the current file state and switch to a file tool or an existing asset helper instead of trying another shell writer."
     : "";
-  return `Progress guard: ${label} tools have targeted "${displayTarget}" ${threshold}+ times without an intervening different target. Reconcile the latest result already in context, decide whether the task is complete, and only call a different smallest-necessary next tool if real evidence is still missing.${shellWriteHint}`;
+  return `Progress guard: ${label} tools have targeted "${displayTarget}" ${threshold}+ times without a successful write, real diff, or verification result. Reconcile the latest result already in context, inspect current workspace state if needed, then patch/verify the smallest necessary target or state the exact blocker.${shellWriteHint}`;
 }
 
 export function formatRepeatLoopRecoveryMessage(

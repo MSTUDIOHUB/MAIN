@@ -30,6 +30,14 @@ interface PlanMaterializationToolActivityLike {
   detail?: string;
 }
 
+export interface PlanEvidenceRecord {
+  tool: string;
+  target: string;
+  status: string;
+  summary?: string;
+  hash?: string;
+}
+
 export interface PlanEvidenceSanitizerDrop {
   bucket: "evidence" | "files" | "constraints";
   reason: string;
@@ -45,6 +53,8 @@ export interface SanitizedPlanEvidenceInput {
   stats: {
     inputEvidence: number;
     keptEvidence: number;
+    inputStructuredEvidence: number;
+    keptStructuredEvidence: number;
     inputFiles: number;
     keptFiles: number;
     inputConstraints: number;
@@ -392,6 +402,17 @@ function normalizeSemanticToolEvidence(input: {
   return [tool, target].filter(Boolean).join(" ") + (cleanDetail ? `; excerpt=${cleanDetail}` : "");
 }
 
+export function formatPlanEvidenceRecord(record: PlanEvidenceRecord, language: "zh" | "en" = "zh"): string {
+  const normalized = normalizeSemanticToolEvidence({
+    tool: record.tool,
+    target: record.target,
+    status: record.status,
+    detail: record.summary,
+  });
+  if (!normalized) return "";
+  return summarizeEvidenceLine(normalized, language);
+}
+
 function sanitizeEvidenceLine(value: unknown, language: "zh" | "en"): { value: string; reason?: string } {
   const raw = String(value || "").trim();
   if (!raw) return { value: "", reason: "empty" };
@@ -475,6 +496,7 @@ function sanitizeEvidenceLine(value: unknown, language: "zh" | "en"): { value: s
 export function sanitizePlanEvidenceInput(input: {
   userGoal?: string;
   evidence?: unknown[];
+  evidenceRecords?: PlanEvidenceRecord[];
   files?: unknown[];
   constraints?: unknown[];
   language?: "zh" | "en";
@@ -508,6 +530,16 @@ export function sanitizePlanEvidenceInput(input: {
   };
 
   const evidence: string[] = [];
+  let keptStructuredEvidence = 0;
+  for (const record of input.evidenceRecords || []) {
+    const formatted = formatPlanEvidenceRecord(record, language);
+    if (formatted) {
+      keptStructuredEvidence += 1;
+      evidence.push(formatted);
+    } else {
+      addDrop("evidence", "non_semantic_structured_tool", record);
+    }
+  }
   for (const item of input.evidence || []) {
     const sanitized = sanitizeEvidenceLine(item, language);
     if (sanitized.value) {
@@ -559,8 +591,10 @@ export function sanitizePlanEvidenceInput(input: {
     constraints: cleanConstraints,
     dropped,
     stats: {
-      inputEvidence: (input.evidence || []).length,
+      inputEvidence: (input.evidence || []).length + (input.evidenceRecords || []).length,
       keptEvidence: cleanEvidence.length,
+      inputStructuredEvidence: (input.evidenceRecords || []).length,
+      keptStructuredEvidence,
       inputFiles: (input.files || []).length,
       keptFiles: cleanFiles.length,
       inputConstraints: (input.constraints || []).length,
@@ -933,6 +967,7 @@ export function canonicalizePlanArtifactContent(input: {
   content: string;
   userGoal?: string;
   evidence?: string[];
+  evidenceRecords?: PlanEvidenceRecord[];
   files?: string[];
   recentToolActivity?: PlanMaterializationToolActivityLike[];
   turnContext?: TurnInputContextLike | null;
@@ -981,11 +1016,17 @@ export function canonicalizePlanArtifactContent(input: {
       .map((item) => summarizeEvidenceLine(item, language)),
     8,
   );
+  const structuredEvidence = uniquePlanItems(
+    (input.evidenceRecords || [])
+      .map((record) => formatPlanEvidenceRecord(record, language)),
+    8,
+  );
   const externalEvidence = uniquePlanItems(
     (input.evidence || []).map((item) => summarizeEvidenceLine(item, language)),
     8,
   );
   const evidenceLines = uniquePlanItems([
+    ...structuredEvidence,
     ...externalEvidence,
     ...activityEvidence,
     ...visibleEvidenceLines,
@@ -1265,6 +1306,7 @@ export function materializePlanArtifactFromVisibleText(input: {
   sourceHint?: PlanMaterializationSource;
   userGoal?: string;
   evidence?: string[];
+  evidenceRecords?: PlanEvidenceRecord[];
   files?: string[];
   recentToolActivity?: PlanMaterializationToolActivityLike[];
   turnContext?: TurnInputContextLike | null;
@@ -1327,6 +1369,7 @@ export function materializePlanArtifactFromVisibleText(input: {
       content,
       userGoal: input.userGoal,
       evidence: input.evidence,
+      evidenceRecords: input.evidenceRecords,
       files: input.files,
       recentToolActivity: input.recentToolActivity,
       turnContext: input.turnContext,
@@ -1361,6 +1404,7 @@ export function isMaterializablePlanLikeText(text: string): boolean {
 export function composeReviewablePlanFromEvidence(input: {
   userGoal: string;
   evidence: string[];
+  evidenceRecords?: PlanEvidenceRecord[];
   files?: string[];
   constraints?: string[];
   kind?: MaterializablePlanKind;
@@ -1370,6 +1414,7 @@ export function composeReviewablePlanFromEvidence(input: {
   const sanitized = sanitizePlanEvidenceInput({
     userGoal: input.userGoal,
     evidence: input.evidence,
+    evidenceRecords: input.evidenceRecords,
     files: input.files,
     constraints: input.constraints,
     language,
@@ -1431,6 +1476,7 @@ export function composeReviewablePlanFromEvidence(input: {
 export function composePlanArtifactFromEvidence(input: {
   userGoal: string;
   evidence: string[];
+  evidenceRecords?: PlanEvidenceRecord[];
   files?: string[];
   constraints?: string[];
   language?: "zh" | "en";
@@ -1439,6 +1485,7 @@ export function composePlanArtifactFromEvidence(input: {
   const sanitized = sanitizePlanEvidenceInput({
     userGoal: input.userGoal,
     evidence: input.evidence,
+    evidenceRecords: input.evidenceRecords,
     files: input.files,
     constraints: input.constraints,
     language,

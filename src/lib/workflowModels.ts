@@ -393,6 +393,7 @@ export interface ConversationTurn {
   parentPlanTurnId?: string;
   mode: LegacyWorkflowMode;
   intent?: ResolvedRunIntent;
+  displayIntent?: ResolvedRunIntent;
   status: ConversationTurnStatus;
   summary: string;
   blockIds: number[];

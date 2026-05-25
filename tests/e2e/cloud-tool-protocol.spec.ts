@@ -1492,6 +1492,7 @@ test("approved plan resumes with execute runtime tools while preserving plan tur
           hasWrite: names.includes("write_file") && names.includes("replace_in_file"),
           hasShell: names.includes("run_command") && names.includes("execute_command"),
           currentTurnIntent: snapshot?.currentTurnIntent,
+          currentTurnDisplayIntent: snapshot?.currentTurnDisplayIntent,
           isPlanApproved: snapshot?.isPlanApproved,
         };
       }),
@@ -1500,6 +1501,7 @@ test("approved plan resumes with execute runtime tools while preserving plan tur
       hasWrite: true,
       hasShell: true,
       currentTurnIntent: "plan",
+      currentTurnDisplayIntent: "execute",
       isPlanApproved: true,
     });
 

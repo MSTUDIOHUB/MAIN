@@ -33,6 +33,7 @@ const {
   formatTargetProgressLoopRecoveryMessage,
   getShellMutationTargetForLoopGuard,
   isReadOnlyShellInspectionToolCall,
+  registerTargetProgressEventForLoopGuard,
   registerTargetProgressForLoopGuard,
   registerToolCallForRepeatGuard,
 } = await loadRepetitionGuardModule();
@@ -139,6 +140,56 @@ test("target progress guard catches repeated edits to the same target even with 
   const recovery = formatTargetProgressLoopRecoveryMessage(result.family, result.targetKey, result.threshold);
   assert.match(recovery, /Progress guard/);
   assert.match(recovery, /src\/app\.tsx/);
+});
+
+test("target progress guard resets a failed target chain after a successful write", () => {
+  const history = [];
+
+  for (let i = 0; i < 3; i += 1) {
+    const result = registerTargetProgressEventForLoopGuard(history, {
+      name: "replace_in_file",
+      target: "src/App.tsx",
+      outcome: "blocked",
+      reason: "search_text_mismatch",
+    });
+    assert.equal(result.repeated, false);
+  }
+
+  const success = registerTargetProgressEventForLoopGuard(history, {
+    name: "apply_patch",
+    target: "src/App.tsx",
+    outcome: "succeeded",
+  });
+  assert.equal(success.repeated, false);
+
+  const nextFailure = registerTargetProgressEventForLoopGuard(history, {
+    name: "replace_in_file",
+    target: "src/App.tsx",
+    outcome: "blocked",
+    reason: "search_text_mismatch",
+  });
+  assert.equal(nextFailure.repeated, false);
+});
+
+test("target progress guard counts only non-progress outcomes for the same edit target", () => {
+  const history = [];
+  let result = null;
+
+  for (let i = 0; i < 4; i += 1) {
+    result = registerTargetProgressEventForLoopGuard(history, {
+      name: i % 2 === 0 ? "replace_in_file" : "apply_patch",
+      target: "src/utils/analysisUtils.ts",
+      outcome: i === 1 ? "no_change" : "blocked",
+      reason: i === 1 ? "empty_change" : "search_text_mismatch",
+    });
+  }
+
+  assert.equal(result.repeated, true);
+  assert.equal(result.family, "edit");
+  assert.match(
+    formatTargetProgressLoopRecoveryMessage(result.family, result.targetKey, result.threshold),
+    /successful write, real diff, or verification result/,
+  );
 });
 
 test("target progress guard ignores internal plan task bookkeeping", () => {

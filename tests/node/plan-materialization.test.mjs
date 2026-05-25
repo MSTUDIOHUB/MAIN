@@ -850,6 +850,56 @@ test("read_file_window evidence is concrete enough for real UI plan materializat
   assert.doesNotMatch(content, /依据证据：已查看项目结构/);
 });
 
+test("structured plan evidence records materialize without leaking failed tool logs", () => {
+  const sanitized = sanitizePlanEvidenceInput({
+    userGoal: "修复 CSV 导入后 Dashboard 数据不显示，并改善深色模式。",
+    evidenceRecords: [
+      {
+        tool: "read_file",
+        target: "src/store/dashboardStore.ts",
+        status: "succeeded",
+        summary: "loadOrders 聚合导入订单并刷新 Dashboard 指标",
+        hash: "abc123",
+      },
+      {
+        tool: "read_file_window",
+        target: "src/index.css",
+        status: "succeeded",
+        summary: "[data-theme='dark'] 定义背景、卡片和文字颜色变量",
+        hash: "def456",
+      },
+      {
+        tool: "write_file",
+        target: ".MAIN/plans/plan.md",
+        status: "failed",
+        summary: "PLAN NOT READY",
+        hash: "bad",
+      },
+    ],
+    files: ["src/store/dashboardStore.ts", "src/index.css"],
+    constraints: ["批准前不修改源码。"],
+    language: "zh",
+  });
+
+  assert.equal(sanitized.stats.inputStructuredEvidence, 3);
+  assert.equal(sanitized.stats.keptStructuredEvidence, 2);
+  assert.equal(sanitized.stats.dropReasons.non_semantic_structured_tool, 1);
+  assert.match(sanitized.evidence.join("\n"), /dashboardStore\.ts/);
+  assert.match(sanitized.evidence.join("\n"), /index\.css/);
+  assert.doesNotMatch(sanitized.evidence.join("\n"), /PLAN NOT READY|hash=|write_file/);
+
+  const content = composePlanArtifactFromEvidence({
+    userGoal: sanitized.userGoal,
+    evidence: sanitized.evidence,
+    files: sanitized.files,
+    constraints: sanitized.constraints,
+    language: "zh",
+  });
+  assert.equal(validateActionablePlanArtifact(content).ok, true);
+  assert.match(content, /dashboardStore\.ts/);
+  assert.match(content, /index\.css/);
+});
+
 test("sanitizer drops broad extension-only glob evidence from plan grounding", () => {
   const sanitized = sanitizePlanEvidenceInput({
     userGoal: "修复 CSV 导入后 Dashboard 数据不显示。",

@@ -6651,6 +6651,10 @@ export const useAppStore = create<AppState>()(
       (shouldExecuteOnceFromReplyOption && effectiveRunIntent !== "plan"
         ? currentMainModeKey === "game_studio" ? "studio_workflow" : "execute"
         : effectiveRunIntent);
+    const effectiveDisplayIntent: ResolvedRunIntent =
+      effectiveRunIntent === "plan" && runtimeRunIntent === "execute"
+        ? "execute"
+        : effectiveRunIntent;
     const shouldGrantExecutionConsentForTurn =
       options?.executionConsentGranted === true ||
       shouldExecuteOnceFromReplyOption;
@@ -7064,6 +7068,7 @@ export const useAppStore = create<AppState>()(
                 ? {
                     ...turn,
                     status: "done",
+                    displayIntent: effectiveDisplayIntent,
                     intentSummary: turn.intentSummary || effectiveIntentSummary,
                     commandDirective: turn.commandDirective || effectiveCommandDirective || undefined,
                     blockIds: [...turn.blockIds, ...(userBlock ? [userBlock.id] : []), systemBlock.id].filter(
@@ -7083,6 +7088,7 @@ export const useAppStore = create<AppState>()(
                 ...(parentPlanTurnId ? { parentPlanTurnId } : {}),
                 mode: effectiveWorkflowMode,
                 intent: effectiveRunIntent,
+                displayIntent: effectiveDisplayIntent,
                 status: "done",
                 summary: systemContent,
                 blockIds: [...(userBlock ? [userBlock.id] : []), systemBlock.id],
@@ -7306,6 +7312,7 @@ export const useAppStore = create<AppState>()(
                           ...turn,
                           status: initialTurnStatus,
                           intent: effectiveRunIntent,
+                          displayIntent: effectiveDisplayIntent,
                           intentSummary: turn.intentSummary || effectiveIntentSummary,
                           commandDirective: turn.commandDirective || effectiveCommandDirective || undefined,
                           pendingOperationProposal: applyOperationProposalChoice(turn.pendingOperationProposal, operationProposalChoiceAction),
@@ -7324,6 +7331,7 @@ export const useAppStore = create<AppState>()(
                       commandDirective: effectiveCommandDirective || undefined,
                       mode: effectiveWorkflowMode,
                       intent: effectiveRunIntent,
+                      displayIntent: effectiveDisplayIntent,
                       status: initialTurnStatus,
                       summary: "",
                       blockIds: [userBlock.id],
@@ -7356,6 +7364,7 @@ export const useAppStore = create<AppState>()(
                     ...turn,
                     status: initialTurnStatus,
                     intent: effectiveRunIntent,
+                    displayIntent: effectiveDisplayIntent,
                     intentSummary: turn.intentSummary || effectiveIntentSummary,
                     commandDirective: turn.commandDirective || effectiveCommandDirective || undefined,
                     pendingOperationProposal: applyOperationProposalChoice(turn.pendingOperationProposal, operationProposalChoiceAction),
@@ -7368,7 +7377,7 @@ export const useAppStore = create<AppState>()(
 		            conversationTurns: [
 		              ...markParentPlanTurnDoneForExecution(autoCollapsePreviousTurnForNewTurn(s.conversationTurns).map((turn) =>
                     uiParentTurnId && turn.id === uiParentTurnId
-                      ? { ...turn, status: initialTurnStatus, intent: turn.intent || effectiveRunIntent }
+                      ? { ...turn, status: initialTurnStatus, intent: turn.intent || effectiveRunIntent, displayIntent: turn.displayIntent || effectiveDisplayIntent }
                       : turn,
                   )),
 		              {
@@ -7381,6 +7390,7 @@ export const useAppStore = create<AppState>()(
                 ...(parentPlanTurnId ? { parentPlanTurnId } : {}),
                 mode: effectiveWorkflowMode,
 	                intent: effectiveRunIntent,
+	                displayIntent: effectiveDisplayIntent,
 	                status: initialTurnStatus,
 	                summary: "",
 	                blockIds: [],

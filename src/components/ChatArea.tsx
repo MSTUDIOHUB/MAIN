@@ -741,7 +741,7 @@ function isThinToolNarration(text: string): boolean {
   ) {
     return false;
   }
-  return /^(我(会|将|先|现在|正在|继续|已经|已)|接下来|现在|继续|已|正在).{0,40}(读取|查看|搜索|调查|执行|运行|调用|写入|修改|验证|整理|完成)/.test(normalized) ||
+  return /^(我(会|将|先|现在|正在|继续|已经|已)|让我|接下来|现在|继续|已|正在).{0,40}(读取|查看|搜索|调查|执行|运行|调用|写入|修改|验证|整理|完成)/.test(normalized) ||
     /(已读取|已搜索|已执行|读取完成|搜索完成|命令完成|工具调用完成|continuingto|i(?:'|’)llread|iread|readcomplete|runningcommand)/i.test(normalized);
 }
 
@@ -762,6 +762,16 @@ function shouldSuppressAgentToolEcho(blocks: any[], agentIndex: number): boolean
   if (agentTokens.length === 0) return false;
   const toolTextLower = nearbyToolText.toLowerCase();
   return agentTokens.some((token) => toolTextLower.includes(token));
+}
+
+function isTransparentToolNarrationBlock(block: any): boolean {
+  if (!block || block.type !== "agent" || block.streaming || block.hiddenProcess) return false;
+  const text = getAgentVisibleMarkdownText(block);
+  const normalized = String(text || "").replace(/\s+/g, "");
+  if (/完成|已读取|已搜索|已执行|readcomplete|searchcomplete|commandcomplete/i.test(normalized)) return false;
+  const futureToolNarration =
+    /^(?:我(?:会|将|先|现在|正在|继续)|让我|接下来|现在|继续|正在).{0,60}(?:读取|查看|搜索|调查|执行|运行|调用|验证|整理)/.test(normalized);
+  return futureToolNarration || isThinToolNarration(text);
 }
 
 function hasGeneratedPlanContent(blocks: any[]) {
@@ -908,6 +918,7 @@ function isReadContextHardBoundary(block: any) {
   if (block.type === "progress") return true;
   if (block.type === "agent") {
     if (block.hiddenProcess && !block.streaming) return false;
+    if (isTransparentToolNarrationBlock(block)) return false;
     return hasRenderableAgentBlock(block);
   }
   if (block.type === "tool") {
@@ -971,7 +982,7 @@ function buildBlockRenderItems(
     // Map from grouping index to the original block index.
     const toolBlockEntries: Array<{ block: any; originalIndex: number }> = [];
     for (let i = 0; i < blocks.length; i++) {
-      if (blocks[i].type !== "thought") {
+      if (blocks[i].type !== "thought" && !isTransparentToolNarrationBlock(blocks[i])) {
         toolBlockEntries.push({ block: blocks[i], originalIndex: i });
       }
     }
@@ -3082,8 +3093,9 @@ export default function ChatArea({
     const turn: ConversationTurn = entry.turn;
     const blocks = entry.blocks;
     const turnIntent = resolveConversationTurnIntent(turn);
-    const turnIntentPolicy = getIntentPolicy(turnIntent);
-    const turnIntentLabel = turnIntentPolicy.intent === turnIntent
+    const displayTurnIntent = turn.displayIntent || turnIntent;
+    const turnIntentPolicy = getIntentPolicy(displayTurnIntent);
+    const turnIntentLabel = turnIntentPolicy.intent === displayTurnIntent
       ? (language === "en" ? turnIntentPolicy.label.en : turnIntentPolicy.label.zh)
       : (language === "zh" ? "任务" : "Task");
     const isPlanTurn = turnIntent === "plan";
@@ -3209,12 +3221,14 @@ export default function ChatArea({
     const isBottomThoughtStreaming = !!latestThoughtBlock?.isStreaming;
     const renderTurnBlockItem = (item) => {
       if (item.kind !== "readContextGroup" && item.block?.type === "thought") return null;
+      if (item.kind === "block" && isTransparentToolNarrationBlock(item.block)) return null;
       if (item.kind === "block" && shouldSuppressAgentToolEcho(blocks, item.index)) return null;
 
       return renderBlockItem(item);
     };
     const renderArchivedBlockItem = (item) => {
       if (item.kind !== "readContextGroup" && item.block?.type === "thought") return null;
+      if (item.kind === "block" && isTransparentToolNarrationBlock(item.block)) return null;
       return renderBlockItem(item);
     };
     const isLiveProcessRenderItem = (item) => {
@@ -3301,7 +3315,7 @@ export default function ChatArea({
           >
             <div className="min-w-0 flex flex-wrap items-center gap-2">
               {turnIntentLabel && (
-                <span data-testid={`turn-intent-badge-${turnIntent}`} className={`rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-[0.16em] ${isPlanTurn ? "theme-plan-pill" : turnIntent === "execute" ? "border-[rgba(96,165,250,0.25)] bg-[rgba(96,165,250,0.12)] text-[#93c5fd]" : "border-[rgba(52,211,153,0.22)] bg-[rgba(52,211,153,0.1)] text-[#86efac]"}`}>
+                <span data-testid={`turn-intent-badge-${displayTurnIntent}`} className={`rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-[0.16em] ${displayTurnIntent === "plan" ? "theme-plan-pill" : displayTurnIntent === "execute" ? "border-[rgba(96,165,250,0.25)] bg-[rgba(96,165,250,0.12)] text-[#93c5fd]" : "border-[rgba(52,211,153,0.22)] bg-[rgba(52,211,153,0.1)] text-[#86efac]"}`}>
                   {turnIntentLabel}
                 </span>
               )}

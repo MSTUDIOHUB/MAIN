@@ -54,3 +54,6 @@ objc2 = "0.6.4"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSApplication", "NSImage", "NSResponder", "NSWorkspace", "std"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSData", "NSString", "std"] }
 security-framework = "3.7.0"
+
+[target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
+tauri-plugin-window-state = "2.4.1"

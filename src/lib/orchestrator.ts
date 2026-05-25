@@ -114,8 +114,9 @@ import {
   formatTargetProgressLoopRecoveryMessage,
   getShellMutationTargetForLoopGuard,
   isReadOnlyShellInspectionToolCall,
-  registerTargetProgressForLoopGuard,
+  registerTargetProgressEventForLoopGuard,
   registerToolCallForRepeatGuard,
+  type TargetProgressOutcome,
 } from "./repetitionGuard";
 import {
   buildToolCapabilityRegistry,
@@ -205,6 +206,7 @@ import {
   composeReviewablePlanFromEvidence,
   materializePlanArtifactFromVisibleText,
   sanitizePlanEvidenceInput,
+  type PlanEvidenceRecord,
   type PlanMaterializationSource,
 } from "./planMaterialization";
 import { formatToolPresentation } from "./toolPresentation";
@@ -2514,6 +2516,7 @@ function collectPlanClosureMaterializationInput(
 ): {
   userGoal: string;
   evidence: string[];
+  evidenceRecords: PlanEvidenceRecord[];
   files: string[];
   constraints: string[];
   sanitizer: ReturnType<typeof sanitizePlanEvidenceInput>["stats"];
@@ -2543,6 +2546,19 @@ function collectPlanClosureMaterializationInput(
   const evidenceFromActivity = recentActivity
     .filter((item) => item.status === "succeeded")
     .map((item) => [item.name, item.target, item.detail].filter(Boolean).join("; "));
+  const evidenceRecords: PlanEvidenceRecord[] = recentActivity
+    .filter((item) => item.status === "succeeded")
+    .map((item) => {
+      const summary = item.detail || "";
+      const hashInput = [item.name, item.target, summary].filter(Boolean).join("\n");
+      return {
+        tool: item.name,
+        target: item.target,
+        status: "succeeded",
+        ...(summary ? { summary } : {}),
+        hash: stableProgressHash(hashInput),
+      };
+    });
   const fallbackHighlights = evidenceFromMemory.length > 0 || evidenceFromActivity.length > 0
     ? []
     : collectFallbackToolHighlights(callbacks, attemptedTargets)
@@ -2551,6 +2567,7 @@ function collectPlanClosureMaterializationInput(
   const sanitized = sanitizePlanEvidenceInput({
     userGoal,
     evidence: [...evidenceFromMemory, ...evidenceFromActivity, ...fallbackHighlights],
+    evidenceRecords,
     files,
     constraints,
     language: callbacks.getPreferredLanguage(),
@@ -2562,6 +2579,7 @@ function collectPlanClosureMaterializationInput(
   return {
     userGoal: sanitized.userGoal,
     evidence: sanitized.evidence,
+    evidenceRecords,
     files: sanitized.files,
     constraints: sanitized.constraints,
     sanitizer: sanitized.stats,
@@ -3376,6 +3394,43 @@ interface ToolExecutionResult {
   qualityGateReason?: string;
   planRecoveryAction?: PlanArtifactRecoveryAction;
   missingPlanSections?: string[];
+}
+
+function getToolResultDiagnosticText(result?: ToolExecutionResult): string {
+  if (!result) return "";
+  return [
+    result.content,
+    result.displayContent,
+    result.qualityGateReason,
+    result.lifecycleState,
+  ].filter(Boolean).join("\n");
+}
+
+function targetProgressOutcomeForToolResult(result?: ToolExecutionResult): TargetProgressOutcome {
+  if (!result) return "failed";
+  const diagnostic = getToolResultDiagnosticText(result);
+  if (/FILE_UNCHANGED_STUB|empty_change|invalid_patch|identical_content|no changes|no-op|nothing to (?:change|patch|write)/i.test(diagnostic)) {
+    return "no_change";
+  }
+  if (/search_text_mismatch|MUTATION_PREFLIGHT_BLOCKED|patch.*(?:mismatch|failed to apply)|replacement text was not found/i.test(diagnostic)) {
+    return "blocked";
+  }
+  if (result.lifecycleState === "declined") return "declined";
+  if (result.lifecycleState === "blocked") return "blocked";
+  if (!result.isError) return "succeeded";
+  return "failed";
+}
+
+function targetProgressReasonForToolResult(result?: ToolExecutionResult): string {
+  const diagnostic = getToolResultDiagnosticText(result)
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!diagnostic) return "missing_result";
+  const reason =
+    diagnostic.match(/\b(?:reason|error|status)\s*[:=]\s*([^.;\n]{1,100})/i)?.[1] ||
+    diagnostic.match(/\b(search_text_mismatch|empty_change|invalid_patch|identical_content|MUTATION_PREFLIGHT_BLOCKED|FILE_UNCHANGED_STUB)\b/i)?.[1] ||
+    diagnostic.slice(0, 120);
+  return reason.trim();
 }
 
 interface PlanMaterializationResultForLoop {
@@ -4321,6 +4376,7 @@ async function autoMaterializePlanArtifactFromVisibleText(input: {
     planStage: input.callbacks.getPlanStage(),
     userGoal: closureInput.userGoal || getOriginalUserPromptForPlanFallback(input.callbacks),
     evidence: closureInput.evidence,
+    evidenceRecords: closureInput.evidenceRecords,
     files: closureInput.files,
     recentToolActivity: input.recentToolActivity,
     turnContext: input.turnContext,
@@ -4527,6 +4583,7 @@ async function buildPlanArtifactMutationValidationError(
         planStage: callbacks.getPlanStage(),
         userGoal: closureInput.userGoal || getOriginalUserPromptForPlanFallback(callbacks),
         evidence: closureInput.evidence,
+        evidenceRecords: closureInput.evidenceRecords,
         files: closureInput.files,
         recentToolActivity: options.recentToolActivity,
         turnContext: options.turnContext,
@@ -5878,6 +5935,7 @@ export async function executeAgentLoop(
     logAgentEvent("plan_evidence_sanitized", {
       trigger,
       iteration,
+      structuredEvidenceCount: closureInput.evidenceRecords.length,
       ...closureInput.sanitizer,
       droppedPreview: closureInput.sanitizerDropped
         .slice(0, 6)
@@ -5892,6 +5950,7 @@ export async function executeAgentLoop(
         trigger,
         reason: "missing_grounded_evidence",
         evidenceCount: closureInput.evidence.length,
+        structuredEvidenceCount: closureInput.evidenceRecords.length,
         fileCount: closureInput.files.length,
         qualityGateReason: details.qualityGateReason || "",
         qualityRejectCount: details.qualityRejectCount || 0,
@@ -5912,6 +5971,7 @@ export async function executeAgentLoop(
       trigger,
       iteration,
       evidenceCount: closureInput.evidence.length,
+      structuredEvidenceCount: closureInput.evidenceRecords.length,
       fileCount: closureInput.files.length,
       filePreview: closureInput.files.slice(0, 8),
       evidencePreview,
@@ -5930,6 +5990,7 @@ export async function executeAgentLoop(
       sourceHint: "deterministic_evidence",
       userGoal: closureInput.userGoal,
       evidence: closureInput.evidence,
+      evidenceRecords: closureInput.evidenceRecords,
       files: closureInput.files,
       language: callbacks.getPreferredLanguage(),
     });
@@ -5939,6 +6000,7 @@ export async function executeAgentLoop(
         trigger,
         reason: materialized.reason || "unknown",
         evidenceCount: closureInput.evidence.length,
+        structuredEvidenceCount: closureInput.evidenceRecords.length,
         fileCount: closureInput.files.length,
         validationReason: materialized.reason || "unknown",
         deterministicContentChars: deterministicContent.length,
@@ -5956,6 +6018,7 @@ export async function executeAgentLoop(
       trigger,
       iteration,
       evidenceCount: closureInput.evidence.length,
+      structuredEvidenceCount: closureInput.evidenceRecords.length,
       fileCount: closureInput.files.length,
       targetPath: materialized.path || ".MAIN/plans/plan.md",
       planArtifactSource: materialized.source || "deterministic_evidence",
@@ -6030,6 +6093,7 @@ export async function executeAgentLoop(
       trigger,
       iteration,
       evidenceCount,
+      structuredEvidenceCount: closureInput.evidenceRecords.length,
       fileCount: closureInput.files.length,
       constraintCount: closureInput.constraints.length,
       targetPath,
@@ -6051,6 +6115,7 @@ export async function executeAgentLoop(
         trigger,
         iteration,
         evidenceCount,
+        structuredEvidenceCount: closureInput.evidenceRecords.length,
         fileCount: closureInput.files.length,
         targetPath,
       });
@@ -6240,7 +6305,7 @@ export async function executeAgentLoop(
     const rawIterationAllTools = resolveAllToolsForRuntime(runtimeIntent);
     const allowApprovedPlanRecoveryFileRead = shouldAllowApprovedPlanRecoveryFileRead(recentPlanToolActivity);
     const isExecuteRecoveryEligible =
-      workflowMode === "edit" &&
+      (workflowMode === "edit" || (workflowMode === "plan" && callbacks.getIsPlanApproved())) &&
       runtimeIntent === "execute" &&
       executeRecoveryMode !== "normal";
     const allowExecuteRecoveryFileRead = shouldAllowExecuteRecoveryFileRead(recentToolActivity);
@@ -9973,19 +10038,25 @@ export async function executeAgentLoop(
         qualityClosureEvidence,
         recentPlanToolActivity,
       );
+      const hasStructuredQualityClosureEvidence = qualityClosureEvidence.evidenceRecords.length > 0;
       const shouldDeterministicallyClosePlanAfterQualityGate =
         !usedPlanDeterministicQualityClosure &&
-        latestQualityResult.planRecoveryAction !== "targeted_evidence" &&
         planQualityRejectCount >= 1 &&
-        hasQualityClosureEvidence;
+        hasQualityClosureEvidence &&
+        (
+          latestQualityResult.planRecoveryAction !== "targeted_evidence" ||
+          hasStructuredQualityClosureEvidence
+        );
       logAgentEvent("plan_quality_gate_recovery_decision", {
         iteration,
         qualityGateReason: planLastQualityGateReason,
         qualityRejectCount: planQualityRejectCount,
         recoveryAction: latestQualityResult.planRecoveryAction || "",
         hasGroundedEvidence: hasQualityClosureEvidence,
+        hasStructuredEvidence: hasStructuredQualityClosureEvidence,
         deterministicClosure: shouldDeterministicallyClosePlanAfterQualityGate,
         sanitizedEvidenceCount: qualityClosureEvidence.evidence.length,
+        structuredEvidenceCount: qualityClosureEvidence.evidenceRecords.length,
         sanitizedFileCount: qualityClosureEvidence.files.length,
         sanitizerDropped: qualityClosureEvidence.sanitizer.dropped,
         sanitizerDropReasons: qualityClosureEvidence.sanitizer.dropReasons,
@@ -10623,10 +10694,19 @@ export async function executeAgentLoop(
 
     let recoveredTargetProgressLoop = false;
     if (!recoveredReadOnlyRepeat) {
+      const resultByToolCallId = new Map(allResults.map((result) => [result.toolCallId, result]));
       for (const tc of effectiveToolCalls) {
         const toolArgs = parseToolCallArguments(tc, workspace);
         const target = getShellMutationTargetForLoopGuard(tc.name, toolArgs) || getToolTarget(tc.name, toolArgs);
-        const progressCheck = registerTargetProgressForLoopGuard(recentTargetToolCalls, tc.name, target);
+        const toolResult = resultByToolCallId.get(tc.id);
+        const outcome = targetProgressOutcomeForToolResult(toolResult);
+        const reason = targetProgressReasonForToolResult(toolResult);
+        const progressCheck = registerTargetProgressEventForLoopGuard(recentTargetToolCalls, {
+          name: tc.name,
+          target,
+          outcome,
+          reason,
+        });
         if (!progressCheck.repeated) continue;
 
         const recoveryMessage = formatTargetProgressLoopRecoveryMessage(
@@ -10634,6 +10714,30 @@ export async function executeAgentLoop(
           target || progressCheck.targetKey,
           progressCheck.threshold,
         );
+        const isExecuteTargetRecoveryEligible =
+          runtimeIntent === "execute" &&
+          progressCheck.family === "edit" &&
+          (workflowMode === "edit" || (workflowMode === "plan" && callbacks.getIsPlanApproved())) &&
+          (outcome === "blocked" || outcome === "failed" || outcome === "no_change");
+        const displayTarget = String(target || progressCheck.targetKey || "").replace(/^shell-write:/, "");
+        const appendExecuteTargetRecoveryPrompt = (mode: Exclude<ExecuteRecoveryMode, "normal">, recoveryReason: string) => {
+          activateExecuteRecovery(mode, recoveryReason, {
+            target: displayTarget,
+            outcome,
+            reason,
+          });
+          callbacks.appendMessage({
+            role: "user",
+            content: buildExecuteRecoveryPrompt({
+              language: callbacks.getPreferredLanguage(),
+              reason: recoveryReason,
+              mode,
+              repeatedTargets: displayTarget ? [displayTarget] : summarizeRepeatedExecuteTargets(recentToolActivity.slice(-12)),
+              recentActivity: recentToolActivity,
+              allowFileRead: mode === "patch_recovery_read",
+            }),
+          });
+        };
         if (!targetProgressGuardRecoveredSignatures.has(progressCheck.signature)) {
           targetProgressGuardRecoveredSignatures.add(progressCheck.signature);
           recentTargetToolCalls.length = 0;
@@ -10642,6 +10746,21 @@ export async function executeAgentLoop(
             role: "system",
             content: `[System: ${recoveryMessage}]`,
           });
+          if (isExecuteTargetRecoveryEligible && executeRecoveryAttempts < 2) {
+            appendExecuteTargetRecoveryPrompt("patch_recovery_read", "target_progress_patch_mismatch");
+          }
+          recoveredTargetProgressLoop = true;
+          break;
+        }
+
+        if (isExecuteTargetRecoveryEligible && executeRecoveryAttempts < 3) {
+          recentTargetToolCalls.length = 0;
+          callbacks.onToolError(tc.name, target, recoveryMessage, { toolCallId: tc.id });
+          callbacks.appendMessage({
+            role: "system",
+            content: `[System: ${recoveryMessage}]`,
+          });
+          appendExecuteTargetRecoveryPrompt("action_plus_targeting", "target_progress_no_diff_chain");
           recoveredTargetProgressLoop = true;
           break;
         }

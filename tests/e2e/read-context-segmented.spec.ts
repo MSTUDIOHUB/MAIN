@@ -74,6 +74,27 @@ test("visible agent output remains in transcript between folded read/search grou
   await expect(page.getByTestId("read-context-item")).toHaveCount(1);
 });
 
+test("thin read narration becomes transparent while the substantive model explanation stays visible", async ({ page }) => {
+  await page.goto("/?e2eScenario=read-context-thin-narration");
+
+  await expect(page.getByText("根据截图观察到的现象：")).toBeVisible();
+  await expect(page.getByText("核心问题映射：CSV 数据已加载")).toBeVisible();
+  await expect(page.getByText("让我继续读取关键文件来确认问题根因。")).toHaveCount(0);
+
+  const groups = page.getByTestId("read-context-group");
+  await expect(groups).toHaveCount(1);
+  const group = groups.first();
+  await expect(group).toContainText("已读取 3 项上下文");
+  await expect(group).toContainText("App.tsx");
+  await expect(group).toContainText("OverviewCards.tsx");
+  await expect(group).toContainText("CourseBarChart.tsx");
+
+  await group.click();
+  const details = page.getByTestId("read-context-group-details");
+  await expect(details).toBeVisible();
+  await expect(page.getByTestId("read-context-item")).toHaveCount(3);
+});
+
 test("effective progress stays in ChatArea after plan card and follow-up messages", async ({ page }) => {
   await page.goto("/?e2eScenario=read-context-persistent-progress");
 
