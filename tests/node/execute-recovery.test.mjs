@@ -244,6 +244,8 @@ test("orchestrator wires execute convergence and max-iteration recovery before i
 
   assert.match(source, /execute_recovery_tool_scope_applied/);
   assert.match(source, /execute_recovery_context_compacted/);
+  assert.match(source, /isExecuteRecoveryEligible && contextForceForManagement\?\.shouldForce/);
+  assert.match(source, /execute_recovery_context_skipped/);
   assert.match(source, /activateExecuteRecovery\("action_plus_targeting", "execute_convergence_prompt"/);
   assert.match(source, /executeRecoveryAttempts \+= 1/);
   assert.doesNotMatch(source, /executeRecoveryReason !== reason/);

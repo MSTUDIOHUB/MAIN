@@ -5937,11 +5937,10 @@ export const useAppStore = create<AppState>()(
       options?.reuseCurrentTurn !== true &&
       !!currentTurn &&
       (currentTurn.status === "awaiting_input" || currentTurnHasReplyOptions);
-    const reusableTurnId = shouldContinuePreviousTurnIntent
-      ? previousTurnContinuationTarget?.id ?? null
-      : state.currentTurnId;
+    const shouldExplicitlyReuseCurrentTurn = options?.reuseCurrentTurn === true;
+    const reusableTurnId = state.currentTurnId;
     const reuseCurrentTurn =
-      (options?.reuseCurrentTurn === true || shouldAutoResumeChoiceTurn || shouldContinuePlanIntent || shouldContinuePreviousTurnIntent) &&
+      (shouldExplicitlyReuseCurrentTurn || shouldAutoResumeChoiceTurn || shouldContinuePlanIntent) &&
       !!reusableTurnId;
     const isInternalTurn = isHidden && !reuseCurrentTurn && !createVisibleTurnForHiddenMessage;
     const shouldReuseExistingTurnIntent =
@@ -6167,6 +6166,7 @@ export const useAppStore = create<AppState>()(
       textChars: text.length,
       isHidden,
       reuseCurrentTurn,
+      shouldExplicitlyReuseCurrentTurn,
       shouldAutoResumeChoiceTurn,
       shouldReuseExistingTurnIntent,
       skipIntentResolution: options?.skipIntentResolution === true,
@@ -8775,6 +8775,14 @@ export const useAppStore = create<AppState>()(
           }
         | null = null;
 
+      const enterRealPendingReviewState = () => {
+        sessionSet({ agentStatus: "pending_review", isGenerating: false });
+        sessionGet().setConversationTurnStatus(turnId, "awaiting_approval");
+        if (uiDisplayTurnId !== turnId) {
+          sessionGet().setConversationTurnStatus(uiDisplayTurnId, "awaiting_approval");
+        }
+      };
+
       const callbacks: OrchestratorCallbacks = {
         getMessages: () => sessionGet().agentMessages,
         getConfig: () => ({ ...sessionGet().config, workspace: runWorkspace }),
@@ -10727,6 +10735,7 @@ export const useAppStore = create<AppState>()(
             !planExecutionAlreadyApproved
           ) {
             return new Promise<ReviewDecision>((resolve) => {
+              enterRealPendingReviewState();
               sessionSet({
                 pendingRunDecision: {
                   kind: "execution_consent",
@@ -10772,6 +10781,7 @@ export const useAppStore = create<AppState>()(
               }
 
               return new Promise<ReviewDecision>((resolve) => {
+                enterRealPendingReviewState();
                 const reviewTaskId = nextId();
                 const toolName = toolCall.name;
                 const toolArgs = toolCall.arguments;
@@ -10850,6 +10860,7 @@ export const useAppStore = create<AppState>()(
 
           // ── Normal review path ──
           return new Promise((resolve) => {
+            enterRealPendingReviewState();
             const reviewTaskId = nextId();
             const toolName = toolCall.name;
             const toolArgs = toolCall.arguments;

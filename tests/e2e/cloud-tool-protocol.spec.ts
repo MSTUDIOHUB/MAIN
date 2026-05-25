@@ -563,6 +563,23 @@ test.beforeEach(async ({ page }) => {
           });
         }
 
+        if (scenario === "ordinary-continue-new-turn") {
+          if (readFileCalls.includes("README.md")) {
+            return JSON.stringify({
+              output_text: "已在新回合继续处理旧任务上下文。",
+            });
+          }
+          return JSON.stringify({
+            output_text: [
+              "我会从上一轮暂停点继续，并先复核 README。",
+              "<tool_use>",
+              "<tool>read_file</tool>",
+              "<parameter name=\"path\">README.md</parameter>",
+              "</tool_use>",
+            ].join("\n"),
+          });
+        }
+
         if (scenario === "execute-max-iterations-checkpoint") {
           return JSON.stringify({
             output_text: [
@@ -1436,6 +1453,72 @@ test("approved plan execution no-tool replies use execution checkpoint path", as
       hasExecutionReprompt: true,
       stoppedGeneric: false,
       hasCheckpoint: true,
+    });
+});
+
+test("ordinary continue after stopped execute turn starts a new visible turn", async ({ page }) => {
+  await page.goto("/?e2eScenario=ordinary-continue-new-turn");
+
+  const previousTurnId = "e2e-ordinary-continue-previous-turn";
+  await expect
+    .poll(async () =>
+      page.evaluate((turnId) => {
+        const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+        const previousTurn = snapshot?.visibleConversationTurns?.find((turn: any) => turn.id === turnId);
+        return {
+          conversationTurns: snapshot?.conversationTurns,
+          currentTurnId: snapshot?.currentTurnId,
+          previousStatus: previousTurn?.status,
+          previousBlockCount: previousTurn?.blockCount,
+        };
+      }, previousTurnId),
+    )
+    .toEqual({
+      conversationTurns: 1,
+      currentTurnId: previousTurnId,
+      previousStatus: "stopped_no_action",
+      previousBlockCount: 3,
+    });
+
+  const sent = await page.evaluate(() =>
+    (window as any).__CODELY_E2E__?.sendCloudMessage?.("继续"),
+  );
+  expect(sent).toBe(true);
+
+  await expect
+    .poll(async () =>
+      page.evaluate((turnId) => {
+        const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+        const turns = snapshot?.visibleConversationTurns || [];
+        const previousTurn = turns.find((turn: any) => turn.id === turnId);
+        const newTurn = turns.find((turn: any) => turn.id !== turnId);
+        const userBlocks = (snapshot?.taskBlockSummaries || []).filter((block: any) => block.type === "user");
+        return {
+          conversationTurns: snapshot?.conversationTurns,
+          currentTurnIsNew: snapshot?.currentTurnId !== turnId,
+          previousBlockCount: previousTurn?.blockCount,
+          newTurnIntent: newTurn?.intent,
+          continueUserOnNewTurn: userBlocks.filter((block: any) =>
+            block.turnId !== turnId && block.content === "继续"
+          ).length,
+          continueUserOnPreviousTurn: userBlocks.filter((block: any) =>
+            block.turnId === turnId && block.content === "继续"
+          ).length,
+          hasFinalText: (snapshot?.agentTexts || []).some((text: string) =>
+            String(text || "").includes("已在新回合继续处理旧任务上下文")
+          ),
+        };
+      }, previousTurnId),
+      { timeout: 20_000 },
+    )
+    .toEqual({
+      conversationTurns: 2,
+      currentTurnIsNew: true,
+      previousBlockCount: 3,
+      newTurnIntent: "execute",
+      continueUserOnNewTurn: 1,
+      continueUserOnPreviousTurn: 0,
+      hasFinalText: true,
     });
 });
 

@@ -516,31 +516,7 @@ html[data-theme="light"] #root {
 [data-theme="light"] ::-webkit-scrollbar-thumb:hover { background: #71717a; }
 
 /* ── Agent Explanation Capsule Styles ── */
-@keyframes capsule-glow {
-  0%, 100% {
-    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45), 
-                0 0 0 1.5px var(--accent-subtle-border, rgba(147, 51, 234, 0.35)),
-                0 0 8px var(--accent-subtle, rgba(147, 51, 234, 0.15));
-  }
-  50% {
-    box-shadow: 0 8px 36px rgba(0, 0, 0, 0.55), 
-                0 0 0 2px var(--accent, #9333ea),
-                0 0 16px var(--accent-subtle, rgba(147, 51, 234, 0.4));
-  }
-}
-
-@keyframes capsule-glow-light {
-  0%, 100% {
-    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.05), 
-                0 0 0 1.5px var(--accent-subtle-border, rgba(147, 51, 234, 0.2));
-  }
-  50% {
-    box-shadow: 0 8px 26px rgba(0, 0, 0, 0.08), 
-                0 0 0 2px var(--accent, #9333ea);
-  }
-}
-
-@keyframes voice-wave-slow {
+@keyframes capsule-fill-flow {
   0% { background-position: 0% 50%; }
   50% { background-position: 100% 50%; }
   100% { background-position: 0% 50%; }
@@ -548,44 +524,78 @@ html[data-theme="light"] #root {
 
 .agent-explanation-capsule {
   pointer-events: auto;
+  position: relative;
+  overflow: hidden;
   display: flex;
   align-items: center;
   justify-content: center;
   padding: 0.65em 1.5em;
   border-radius: 9999px;
   border: 1.5px solid var(--accent, #9333ea);
-  /* Liquid dynamic background with highly transparent elements & core accent colors */
-  background: linear-gradient(135deg, 
-    color-mix(in srgb, var(--accent, #9333ea) 18%, rgba(10, 10, 12, 0.4)),
-    color-mix(in srgb, var(--accent-light, #a855f7) 22%, rgba(10, 10, 12, 0.4)),
-    rgba(10, 10, 12, 0.55),
-    color-mix(in srgb, var(--accent, #9333ea) 16%, rgba(10, 10, 12, 0.4))
-  );
-  background-size: 300% 300%;
-  /* Ultra-slow flow animation and subtle glowing pulses */
-  animation: voice-wave-slow 18s ease infinite, capsule-glow 3s ease-in-out infinite;
+  background: rgba(10, 10, 12, 0.62);
   backdrop-filter: blur(16px);
   color: #ffffff;
   font-weight: 500;
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5), 
+              0 0 0 1px var(--accent-subtle-border, rgba(147, 51, 234, 0.28)),
+              0 0 12px var(--accent-subtle, rgba(147, 51, 234, 0.18)),
               inset 0 1px 1px rgba(255, 255, 255, 0.1);
-  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-  letter-spacing: 0.02em;
+  transition: opacity 0.3s cubic-bezier(0.4, 0, 0.2, 1), transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  letter-spacing: 0;
   text-align: center;
+}
+
+.agent-explanation-capsule::before {
+  content: "";
+  position: absolute;
+  inset: 1px;
+  z-index: 0;
+  border-radius: inherit;
+  background: linear-gradient(135deg,
+    color-mix(in srgb, var(--accent, #9333ea) 24%, transparent),
+    color-mix(in srgb, var(--accent-light, #a855f7) 28%, transparent),
+    rgba(10, 10, 12, 0.14),
+    color-mix(in srgb, var(--accent, #9333ea) 20%, transparent)
+  );
+  background-size: 300% 300%;
+  animation: capsule-fill-flow 18s ease infinite;
+}
+
+.agent-explanation-capsule > span {
+  position: relative;
+  z-index: 1;
 }
 
 /* Light Mode Overrides */
 html[data-theme="light"] .agent-explanation-capsule {
   border-color: var(--accent, #9333ea);
-  background: linear-gradient(135deg, 
-    color-mix(in srgb, var(--accent, #9333ea) 6%, rgba(255, 255, 255, 0.55)),
-    color-mix(in srgb, var(--accent-light, #a855f7) 8%, rgba(255, 255, 255, 0.5)),
-    rgba(255, 255, 255, 0.65),
-    color-mix(in srgb, var(--accent, #9333ea) 5%, rgba(255, 255, 255, 0.55))
-  );
-  background-size: 300% 300%;
+  background: rgba(255, 255, 255, 0.68);
   color: var(--accent-hover, #7e22ce);
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.06), 
+              0 0 0 1px var(--accent-subtle-border, rgba(147, 51, 234, 0.18)),
               inset 0 1px 1px rgba(255, 255, 255, 0.6);
-  animation: voice-wave-slow 18s ease infinite, capsule-glow-light 3s ease-in-out infinite;
+}
+
+html[data-theme="light"] .agent-explanation-capsule::before {
+  background: linear-gradient(135deg,
+    color-mix(in srgb, var(--accent, #9333ea) 8%, transparent),
+    color-mix(in srgb, var(--accent-light, #a855f7) 10%, transparent),
+    rgba(255, 255, 255, 0.2),
+    color-mix(in srgb, var(--accent, #9333ea) 7%, transparent)
+  );
+  background-size: 300% 300%;
+}
+
+html[data-theme="black"] .agent-explanation-capsule {
+  background: rgba(0, 0, 0, 0.7);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.58),
+              0 0 0 1px var(--accent-subtle-border, rgba(147, 51, 234, 0.3)),
+              0 0 12px var(--accent-subtle, rgba(147, 51, 234, 0.2)),
+              inset 0 1px 1px rgba(255, 255, 255, 0.08);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .agent-explanation-capsule::before {
+    animation: none;
+  }
 }

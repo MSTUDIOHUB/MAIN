@@ -49,6 +49,7 @@ const PLAN_CLOSURE_GUARD_EMPTY_SCENARIO = "plan-closure-guard-empty";
 const EXISTING_PLAN_FOLDER_EXECUTE_SCENARIO = "existing-plan-folder-execute";
 const APPROVED_PLAN_EXECUTION_NO_TOOL_SCENARIO = "approved-plan-execution-no-tool";
 const EXECUTE_MAX_ITERATIONS_CHECKPOINT_SCENARIO = "execute-max-iterations-checkpoint";
+const ORDINARY_CONTINUE_NEW_TURN_SCENARIO = "ordinary-continue-new-turn";
 const LOCAL_FILE_READ_APPROVAL_SCENARIO = "local-file-read-approval";
 const PROGRESS_NARRATION_TOOL_FLOW_SCENARIO = "progress-narration-tool-flow";
 const TOP_ISLAND_EXECUTION_PROGRESS_SCENARIO = "top-island-execution-progress";
@@ -1476,7 +1477,7 @@ function seedReadContextInterleavedScenario() {
       id: useAppStore.getState()._nextTaskId(),
       turnId,
       type: "agent" as const,
-      content: "读取与命令交错完成，继续保持命令卡独立显示。",
+      content: "读取与命令交错完成，命令步骤已折叠保留。",
       streaming: false,
     },
   ];
@@ -4987,6 +4988,61 @@ function seedCloudToolProtocolScenario(scenario: string) {
 
   const now = Date.now();
   const workspace = `/tmp/e2e-${scenario}`;
+  const ordinaryContinueSeed = scenario === ORDINARY_CONTINUE_NEW_TURN_SCENARIO
+    ? (() => {
+        const turnId = "e2e-ordinary-continue-previous-turn";
+        const userBlockId = useAppStore.getState()._nextTaskId();
+        const toolBlockId = useAppStore.getState()._nextTaskId();
+        const agentBlockId = useAppStore.getState()._nextTaskId();
+        return {
+          turnId,
+          taskFlow: [
+            {
+              id: userBlockId,
+              turnId,
+              type: "user" as const,
+              content: "请修复 README 检查链路并验证。",
+            },
+            {
+              id: toolBlockId,
+              turnId,
+              type: "tool" as const,
+              toolName: "read_file",
+              target: "README.md",
+              status: "done",
+              toolStatus: "executed" as const,
+              message: "已读取 README.md，下一步尚未完成。",
+            },
+            {
+              id: agentBlockId,
+              turnId,
+              type: "agent" as const,
+              content: "我已经定位到 README 检查链路，但还没完成后续处理。",
+              streaming: false,
+            },
+          ],
+          agentMessages: [
+            { role: "user" as const, content: "请修复 README 检查链路并验证。" },
+            { role: "assistant" as const, content: "我已经定位到 README 检查链路，但还没完成后续处理。" },
+          ],
+          conversationTurns: [
+            {
+              id: turnId,
+              userPrompt: "请修复 README 检查链路并验证。",
+              title: "README 检查链路修复",
+              mode: "chat" as const,
+              intent: "execute" as const,
+              displayIntent: "execute" as const,
+              status: "stopped_no_action" as const,
+              summary: "上一轮已停止，等待用户继续。",
+              blockIds: [userBlockId, toolBlockId, agentBlockId],
+              collapsed: false,
+              createdAt: now - 1_000,
+            },
+          ],
+        };
+      })()
+    : null;
   const sessionId = scenario === CLOUD_TOOL_FALLBACK_SCENARIO
     ? 999501
     : scenario === GAME_STUDIO_EXECUTE_REPLY_SCENARIO
@@ -5007,6 +5063,8 @@ function seedCloudToolProtocolScenario(scenario: string) {
     ? 999513
     : scenario === PROGRESS_NARRATION_TOOL_FLOW_SCENARIO
     ? 999514
+    : scenario === ORDINARY_CONTINUE_NEW_TURN_SCENARIO
+    ? 999515
     : 999502;
   const server = {
     id: `e2e-${scenario}-server`,
@@ -5072,6 +5130,8 @@ function seedCloudToolProtocolScenario(scenario: string) {
             ? "E2E Approved Plan No Tool"
             : scenario === PROGRESS_NARRATION_TOOL_FLOW_SCENARIO
             ? "E2E Progress Narration Tool Flow"
+            : scenario === ORDINARY_CONTINUE_NEW_TURN_SCENARIO
+            ? "E2E Ordinary Continue New Turn"
             : scenario === PLAN_OPERATION_APPROVAL_REUSE_SCENARIO
             ? "E2E Plan Operation Approval Reuse"
             : "E2E Reply Options Tool Pause",
@@ -5096,10 +5156,10 @@ function seedCloudToolProtocolScenario(scenario: string) {
         scenario === UNITY_NO_ERROR_ROUTING_SCENARIO
         ? "nexus_game_studio"
         : "nexus_general",
-    taskFlow: [],
-    agentMessages: [],
-    conversationTurns: [],
-    currentTurnId: null,
+    taskFlow: ordinaryContinueSeed?.taskFlow ?? [],
+    agentMessages: ordinaryContinueSeed?.agentMessages ?? [],
+    conversationTurns: ordinaryContinueSeed?.conversationTurns ?? [],
+    currentTurnId: ordinaryContinueSeed?.turnId ?? null,
     input: "",
     attachedFiles: [],
     contextMentions: [],
@@ -5127,6 +5187,10 @@ function seedCloudToolProtocolScenario(scenario: string) {
   }));
 
   bridge.sendCloudMessage = (text?: string) => {
+    if (scenario === ORDINARY_CONTINUE_NEW_TURN_SCENARIO) {
+      return useAppStore.getState().sendMessage(text || "继续");
+    }
+
     if (scenario === MALFORMED_TOOL_USE_PLAN_SCENARIO) {
       return useAppStore.getState().sendMessage(
         text || "请基于 orders.csv 生成一个数据分析自动化执行计划。",
@@ -5235,6 +5299,16 @@ function seedCloudToolProtocolScenario(scenario: string) {
     const currentTurn = state.currentTurnId
       ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId) || null
       : null;
+    const visibleConversationTurns = state.conversationTurns
+      .filter((turn) => turn.uiVisibility !== "internal")
+      .map((turn) => ({
+        id: turn.id,
+        title: turn.title,
+        status: turn.status,
+        intent: turn.intent,
+        displayIntent: turn.displayIntent || turn.intent,
+        blockCount: turn.blockIds.length,
+      }));
     const agentBlocks = state.taskFlow.filter((block) => block.type === "agent") as any[];
     const optionBlocks = agentBlocks.filter((block) => Array.isArray(block.options) && block.options.length > 0);
     const archivedOptionBlocks = agentBlocks.filter((block) => block.archivedAfterChoice);
@@ -5249,6 +5323,7 @@ function seedCloudToolProtocolScenario(scenario: string) {
       planAutoResumeCount: state.planAutoResumeCount,
       planArtifactPaths: state.planArtifacts.map((artifact) => artifact.path),
       planTasks: state.planTasks,
+      currentTurnId: currentTurn?.id ?? null,
       currentTurnStatus: currentTurn?.status ?? null,
       currentTurnIntent: currentTurn?.intent ?? null,
       currentTurnDisplayIntent: currentTurn?.displayIntent ?? currentTurn?.intent ?? null,
@@ -5261,6 +5336,7 @@ function seedCloudToolProtocolScenario(scenario: string) {
           }
         : null,
       conversationTurns: state.conversationTurns.length,
+      visibleConversationTurns,
       taskFlowBlocks: state.taskFlow.length,
       taskFlowUserCount: state.taskFlow.filter((block) => block.type === "user").length,
       currentTurnBlockIds: currentTurn?.blockIds || [],
@@ -6173,6 +6249,10 @@ export function initializeE2EScenarios(): (() => void) | undefined {
 
   if (scenario === EXECUTE_MAX_ITERATIONS_CHECKPOINT_SCENARIO) {
     return seedCloudToolProtocolScenario(EXECUTE_MAX_ITERATIONS_CHECKPOINT_SCENARIO);
+  }
+
+  if (scenario === ORDINARY_CONTINUE_NEW_TURN_SCENARIO) {
+    return seedCloudToolProtocolScenario(ORDINARY_CONTINUE_NEW_TURN_SCENARIO);
   }
 
   if (scenario === LOCAL_FILE_READ_APPROVAL_SCENARIO) {

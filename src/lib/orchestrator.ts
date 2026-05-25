@@ -23,7 +23,7 @@ import {
 } from "./streaming";
 import { buildToolDefinitions, skillNameToToolName, type ToolDefinition } from "./toolSchemas";
 import { executeTool } from "./toolExecutor";
-import { compactContextForExecuteRecovery, computeContextBudgets, estimateTokens, manageContext } from "./contextTrim";
+import { compactContextForExecuteRecovery, computeContextBudgets, estimateMessagesTokens, estimateTokens, manageContext } from "./contextTrim";
 import type { ContextMemoryState } from "./contextMemory";
 import { clampContextLimitToReported } from "./contextWindow";
 import { generateId } from "./utils";
@@ -282,6 +282,8 @@ const EXECUTION_VERIFICATION_TOOL_NAMES = new Set([
   "read_pty_since",
   "get_pty_status",
 ]);
+
+const EDIT_PROGRESS_TOOL_NAMES = new Set(["write_file", "replace_in_file", "apply_patch"]);
 const FORCE_CONTEXT_TEXT_CHARS = 60_000;
 const FORCE_CONTEXT_TOOL_RESULT_CHARS = 35_000;
 const FORCE_CONTEXT_TOOL_MESSAGE_COUNT = 12;
@@ -747,7 +749,17 @@ function computeContextForceReason(input: {
   iteration: number;
   workflowMode: "chat" | "edit" | "plan";
   isPlanApproved: boolean;
-}): { shouldForce: boolean; reason: string | null; textChars: number; toolChars: number; toolMessages: number } {
+  inputBudget?: number;
+  proactiveTriggerBudget?: number;
+}): {
+  shouldForce: boolean;
+  reason: string | null;
+  textChars: number;
+  toolChars: number;
+  toolMessages: number;
+  estimatedTokens: number;
+  tokenPressure: number;
+} {
   let textChars = 0;
   let toolChars = 0;
   let toolMessages = 0;
@@ -760,24 +772,49 @@ function computeContextForceReason(input: {
     }
   }
 
-  if (textChars >= FORCE_CONTEXT_TEXT_CHARS) {
-    return { shouldForce: true, reason: "text_chars_threshold", textChars, toolChars, toolMessages };
+  const estimatedTokens = estimateMessagesTokens(input.messages);
+  const fallbackInputBudget = Math.max(2048, Math.ceil((textChars + 1) / 3));
+  const inputBudget = Math.max(1, Math.floor(input.inputBudget || fallbackInputBudget));
+  const triggerBudget = Math.max(1, Math.floor(input.proactiveTriggerBudget || inputBudget * 0.92));
+  const tokenPressure = estimatedTokens / triggerBudget;
+  const scaledTextChars = Math.max(FORCE_CONTEXT_TEXT_CHARS, Math.floor(triggerBudget * 3.2));
+  const scaledToolChars = Math.max(FORCE_CONTEXT_TOOL_RESULT_CHARS, Math.floor(triggerBudget * 2.4));
+
+  const result = (shouldForce: boolean, reason: string | null) => ({
+    shouldForce,
+    reason,
+    textChars,
+    toolChars,
+    toolMessages,
+    estimatedTokens,
+    tokenPressure,
+  });
+
+  if (estimatedTokens >= triggerBudget) {
+    return result(true, "token_budget_threshold");
   }
-  if (toolChars >= FORCE_CONTEXT_TOOL_RESULT_CHARS) {
-    return { shouldForce: true, reason: "tool_chars_threshold", textChars, toolChars, toolMessages };
+  if (textChars >= scaledTextChars && tokenPressure >= 0.65) {
+    return result(true, "text_chars_threshold");
   }
-  if (toolMessages >= FORCE_CONTEXT_TOOL_MESSAGE_COUNT) {
-    return { shouldForce: true, reason: "tool_message_threshold", textChars, toolChars, toolMessages };
+  if (toolChars >= scaledToolChars && tokenPressure >= 0.65) {
+    return result(true, "tool_chars_threshold");
+  }
+  if (toolMessages >= FORCE_CONTEXT_TOOL_MESSAGE_COUNT * 2 && tokenPressure >= 0.6) {
+    return result(true, "tool_message_threshold");
+  }
+  if (toolMessages >= FORCE_CONTEXT_TOOL_MESSAGE_COUNT && tokenPressure >= 0.8) {
+    return result(true, "tool_message_threshold");
   }
   if (
     input.workflowMode === "plan" &&
     input.isPlanApproved &&
     input.iteration > 1 &&
-    input.iteration % FORCE_CONTEXT_TOOL_LOOP_INTERVAL === 0
+    input.iteration % FORCE_CONTEXT_TOOL_LOOP_INTERVAL === 0 &&
+    (tokenPressure >= 0.55 || toolChars >= Math.floor(scaledToolChars * 0.75))
   ) {
-    return { shouldForce: true, reason: "approved_plan_loop_interval", textChars, toolChars, toolMessages };
+    return result(true, "approved_plan_loop_interval");
   }
-  return { shouldForce: false, reason: null, textChars, toolChars, toolMessages };
+  return result(false, null);
 }
 
 function getSessionTaskTargetingEvidence(sessionKey: string): Set<string> {
@@ -4454,7 +4491,6 @@ async function executeLocalFileReadToolWithReview(
   hooksConfig: Awaited<ReturnType<typeof loadHooksConfig>>,
 ): Promise<ToolExecutionResult> {
   const target = getToolTarget(tc.name, toolArgs);
-  callbacks.onStatusChange("pending_review");
 
   let decision: ReviewDecision;
   try {
@@ -4835,8 +4871,6 @@ async function executeWriteToolWithReview(
       lifecycleState: "blocked",
     };
   }
-
-  callbacks.onStatusChange("pending_review");
 
   let decision: ReviewDecision;
   try {
@@ -5763,6 +5797,7 @@ export async function executeAgentLoop(
   let lastAssistantTextForCheckpoint = "";
   const recentPlanToolActivity: PlanToolActivitySummary[] = [];
   const recentToolActivity: PlanToolActivitySummary[] = [];
+  const successfulEditTargetsSinceVerification = new Map<string, number>();
   let lastNoProgressBatchSignature = "";
   let noProgressBatchRepeatCount = 0;
   let approvedPlanNoProgressRecoveryAttempts = 0;
@@ -5821,6 +5856,18 @@ export async function executeAgentLoop(
   };
   const rememberPlanToolActivity = (result: ToolExecutionResult) => rememberToolActivity(recentPlanToolActivity, result);
   const rememberAnyToolActivity = (result: ToolExecutionResult) => rememberToolActivity(recentToolActivity, result);
+  const normalizeLoopGuardTarget = (target: string) => String(target || "")
+    .replace(/^shell-write:/, "")
+    .replace(/\\/g, "/")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+  const isEditProgressResult = (result: ToolExecutionResult) =>
+    EDIT_PROGRESS_TOOL_NAMES.has(result.name) || String(result.target || "").startsWith("shell-write:");
+  const isVerificationEvidenceResult = (result: ToolExecutionResult) =>
+    !result.isError &&
+    !result.internalFeedback &&
+    EXECUTION_VERIFICATION_TOOL_NAMES.has(result.name);
   const setPlanRuntimePhase = (
     phase: PlanRuntimePhase,
     reason?: string,
@@ -6434,8 +6481,25 @@ export async function executeAgentLoop(
     );
     const llmTools = !forceXmlTools ? iterationAllTools : [];
     const cloudResponsesCompact = isCloudProfile && config.cloud.apiFormat === "responses";
+    const contextLimitForManagement = snapshotContextLimit ?? (cloudResponsesCompact ? 32768 : null);
+    const effectiveContextLimitForManagement = contextLimitForManagement != null
+      ? computeManagedContextLimit(contextLimitForManagement, llmTools)
+      : null;
+    const contextBudgetsForManagement = effectiveContextLimitForManagement != null
+      ? computeContextBudgets(effectiveContextLimitForManagement)
+      : null;
+    const contextForceForManagement = contextBudgetsForManagement
+      ? computeContextForceReason({
+          messages: callbacks.getMessages() as AgentMessage[],
+          iteration,
+          workflowMode,
+          isPlanApproved: callbacks.getIsPlanApproved(),
+          inputBudget: contextBudgetsForManagement.inputBudget,
+          proactiveTriggerBudget: contextBudgetsForManagement.proactiveTriggerBudget,
+        })
+      : null;
     let executeRecoveryContextAlreadyCompacted = false;
-    if (isExecuteRecoveryEligible) {
+    if (isExecuteRecoveryEligible && contextForceForManagement?.shouldForce) {
       const recoveryMessagesBefore = callbacks.getMessages().length;
       const recoveryManagedResult = compactContextForExecuteRecovery(
         callbacks.getMessages(),
@@ -6473,6 +6537,9 @@ export async function executeAgentLoop(
         iteration,
         executeRecoveryMode,
         executeRecoveryReason,
+        forceReason: contextForceForManagement.reason,
+        estimatedTokens: Math.round(contextForceForManagement.estimatedTokens),
+        tokenPressure: Number(contextForceForManagement.tokenPressure.toFixed(3)),
         messagesBefore: recoveryMessagesBefore,
         messagesAfter: managedAgentMessages.length,
         droppedMessageCount: recoveryManagedResult.droppedMessageCount,
@@ -6486,17 +6553,32 @@ export async function executeAgentLoop(
         0),
         recoveryToolSurface: describeExecuteRecoveryToolSurface(executeRecoveryMode, allowExecuteRecoveryFileRead),
       });
-    }
-    if (!executeRecoveryContextAlreadyCompacted && (snapshotContextLimit != null || cloudResponsesCompact)) {
-      const contextLimit = snapshotContextLimit ?? 32768;
-      const effectiveContextLimit = computeManagedContextLimit(contextLimit, llmTools);
-      const { inputBudget, outputBudget } = computeContextBudgets(effectiveContextLimit);
-      const contextForce = computeContextForceReason({
-        messages: callbacks.getMessages() as AgentMessage[],
+    } else if (isExecuteRecoveryEligible) {
+      logAgentEvent("execute_recovery_context_skipped", {
         iteration,
-        workflowMode,
-        isPlanApproved: callbacks.getIsPlanApproved(),
+        executeRecoveryMode,
+        executeRecoveryReason,
+        reason: "below_context_threshold",
+        estimatedTokens: contextForceForManagement
+          ? Math.round(contextForceForManagement.estimatedTokens)
+          : null,
+        tokenPressure: contextForceForManagement
+          ? Number(contextForceForManagement.tokenPressure.toFixed(3))
+          : null,
+        proactiveTriggerBudget: contextBudgetsForManagement?.proactiveTriggerBudget ?? null,
+        recoveryToolSurface: describeExecuteRecoveryToolSurface(executeRecoveryMode, allowExecuteRecoveryFileRead),
       });
+    }
+    if (
+      !executeRecoveryContextAlreadyCompacted &&
+      effectiveContextLimitForManagement != null &&
+      contextBudgetsForManagement &&
+      contextForceForManagement
+    ) {
+      const effectiveContextLimit = effectiveContextLimitForManagement;
+      const contextBudgets = contextBudgetsForManagement;
+      const { inputBudget, outputBudget } = contextBudgets;
+      const contextForce = contextForceForManagement;
       const isUnapprovedPlanContext = workflowMode === "plan" && !callbacks.getIsPlanApproved();
       const forcedContextToolBudget = contextForce.shouldForce
         ? callbacks.getIsPlanApproved()
@@ -6589,6 +6671,8 @@ export async function executeAgentLoop(
         textChars: contextForce.textChars,
         toolChars: contextForce.toolChars,
         toolMessages: contextForce.toolMessages,
+        estimatedTokens: Math.round(contextForce.estimatedTokens),
+        tokenPressure: Number(contextForce.tokenPressure.toFixed(3)),
       });
     }
 
@@ -10439,6 +10523,49 @@ export async function executeAgentLoop(
         role: "user",
         content: unityMcpFallbackPrompt,
       });
+    }
+    if (allResults.some(isVerificationEvidenceResult)) {
+      successfulEditTargetsSinceVerification.clear();
+    }
+    for (const result of allResults) {
+      if (result.isError || result.internalFeedback || !isEditProgressResult(result)) continue;
+      const targetKey = normalizeLoopGuardTarget(result.target);
+      if (!targetKey) continue;
+      const count = (successfulEditTargetsSinceVerification.get(targetKey) || 0) + 1;
+      successfulEditTargetsSinceVerification.set(targetKey, count);
+      if (count < 3) continue;
+
+      const displayTarget = String(result.target || targetKey).replace(/^shell-write:/, "");
+      const language = callbacks.getPreferredLanguage();
+      logAgentEvent("loop_stop", {
+        reason: "repeat_edit_target_without_validation",
+        iteration,
+        target: displayTarget,
+        editCount: count,
+      });
+      callbacks.onNonActionableStop(
+        language === "zh"
+          ? [
+              "执行已暂停：同一回合连续修改同一目标，但期间没有新的验证证据。",
+              `重复目标：${displayTarget}`,
+              "继续前请先运行测试、命令或浏览器验证；如果无法验证，请说明真实阻塞并给出当前状态。",
+            ].join("\n")
+          : [
+              "Execution paused: this turn kept editing the same target without fresh validation evidence.",
+              `Repeated target: ${displayTarget}`,
+              "Before continuing, run a test, command, or browser validation; if validation is blocked, state the blocker and current status.",
+            ].join("\n"),
+        "no_action",
+        {
+          repeatedTargets: [displayTarget],
+          recoveryReason: "repeat_edit_target_without_validation",
+          nextStep: language === "zh"
+            ? "先验证当前目标，再决定继续修改、换目标或总结"
+            : "validate this target before editing it again, switching targets, or summarizing",
+        },
+      );
+      callbacks.onStatusChange("idle");
+      return;
     }
     if (pendingExecuteRecoveryPrompt) {
       callbacks.onStatusChange("running");

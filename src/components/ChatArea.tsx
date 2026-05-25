@@ -1077,7 +1077,7 @@ function shouldGroupPlanExecutionTools(input: {
     enabled: input.turnIntent === "execute" || isApprovedPlanExecution,
     includeDiff: input.turnIntent === "execute" || isApprovedPlanExecution,
     includeReadContextTools: isApprovedPlanExecution,
-    minGroupSize: isApprovedPlanExecution ? 1 : 2,
+    minGroupSize: input.turnIntent === "execute" || isApprovedPlanExecution ? 1 : 2,
     splitProjectStructureExplore: input.isPlanTurn && !input.isPlanApproved,
   };
 }
@@ -2223,7 +2223,7 @@ function LiveTurnProcessTimeline({
   renderLiveItem: (item: any) => React.ReactNode;
   onOpenDiff: (taskId: number) => void;
 }) {
-  const [expanded, setExpanded] = useState(true);
+  const [expanded, setExpanded] = useState(false);
   if (!model || model.totalCount === 0) return null;
   const title = language === "zh" ? "本轮步骤" : "Turn steps";
   const stepCount = model.stepCount;
@@ -2819,12 +2819,35 @@ export default function ChatArea({
     return deriveTurnProgressItems(topIslandTurnBlocks, language);
   }, [language, topIslandTurn, topIslandTurnBlocks]);
   const composerPaddingBottom = composerHeight + 32;
+  const capsuleTurn = topIslandTurn || activeTurn;
+  const capsuleTurnBlocks = capsuleTurn ? blocksByTurnId.byTurnId.get(capsuleTurn.id) || [] : [];
+  const capsuleIsRunActive =
+    !!capsuleTurn &&
+    (
+      isStreaming ||
+      agentStatus === "running" ||
+      agentStatus === "pending_review" ||
+      capsuleTurn.status === "executing"
+    );
+  const capsuleProgressLedger = useMemo(() => {
+    if (!capsuleTurn || !capsuleIsRunActive) return [];
+    return buildRuntimeProgressLedger({
+      blocks: capsuleTurnBlocks,
+      events: runtimeEvents,
+      turnId: capsuleTurn.id,
+      language,
+      maxItems: 12,
+    });
+  }, [capsuleIsRunActive, capsuleTurn, capsuleTurnBlocks, language, runtimeEvents]);
+  const capsuleProgressProjection = useMemo(
+    () => buildRuntimeProgressProjection(capsuleProgressLedger, language, 4),
+    [capsuleProgressLedger, language],
+  );
   const explanationText = useMemo(() => {
-    const isRunActive = isStreaming || agentStatus === "running" || (activeTurn && activeTurn.status === "executing");
-    if (!isRunActive || !activeTurn) return "";
-    
-    const activeTurnBlocks = blocksByTurnId.byTurnId.get(activeTurn.id) || [];
-    const turnIntent = resolveConversationTurnIntent(activeTurn);
+    if (!capsuleIsRunActive || !capsuleTurn) return "";
+
+    const activeTurnBlocks = capsuleTurnBlocks;
+    const turnIntent = resolveConversationTurnIntent(capsuleTurn);
     const isToolIntent = turnIntent !== "respond" && turnIntent !== "discuss";
     
     for (let i = activeTurnBlocks.length - 1; i >= 0; i--) {
@@ -2855,23 +2878,31 @@ export default function ChatArea({
       }
     }
     return "";
-  }, [isStreaming, agentStatus, activeTurn, blocksByTurnId]);
+  }, [capsuleIsRunActive, capsuleTurn, capsuleTurnBlocks]);
+
+  const capsuleActivityText = useMemo(() => {
+    if (!capsuleIsRunActive || !capsuleTurn) return "";
+    const projected = String(capsuleProgressProjection.activityText || "").trim();
+    if (projected) return projected;
+    const activity = getActiveTurnActivity(capsuleTurnBlocks, capsuleTurn.status, language);
+    if (activity) return activity;
+    return explanationText;
+  }, [capsuleIsRunActive, capsuleProgressProjection.activityText, capsuleTurn, capsuleTurnBlocks, explanationText, language]);
 
   useEffect(() => {
-    const isRunActive = isStreaming || agentStatus === "running" || (activeTurn && activeTurn.status === "executing");
-    
-    if (activeTurn?.id !== lastTurnIdRef.current) {
-      lastTurnIdRef.current = activeTurn?.id;
-      setPersistedExplanation("");
-      return;
+    const turnChanged = capsuleTurn?.id !== lastTurnIdRef.current;
+    if (turnChanged) {
+      lastTurnIdRef.current = capsuleTurn?.id;
     }
 
-    if (!isRunActive) {
+    if (!capsuleIsRunActive) {
       setPersistedExplanation("");
-    } else if (explanationText) {
-      setPersistedExplanation(explanationText);
+    } else if (capsuleActivityText) {
+      setPersistedExplanation(capsuleActivityText);
+    } else if (turnChanged) {
+      setPersistedExplanation("");
     }
-  }, [explanationText, isStreaming, agentStatus, activeTurn]);
+  }, [capsuleActivityText, capsuleIsRunActive, capsuleTurn]);
 
   const hasPlanPanelContent = useMemo(() => {
     if (planArtifacts.length > 0) return true;
@@ -3382,17 +3413,21 @@ export default function ChatArea({
           })()
         : "";
     const isBottomThoughtStreaming = !!latestThoughtBlock?.isStreaming;
-    const isActiveRunningTurn = activeTurn?.id === turn.id &&
-      (isStreaming || agentStatus === "running" || turn.status === "executing");
+    const isActiveRunningTurn = capsuleTurn?.id === turn.id && capsuleIsRunActive;
+    const shouldRouteActivityNoticeToCapsule = isActiveRunningTurn && !!capsuleActivityText;
+    const shouldShowTurnActivityNotice =
+      turn.status !== "error" &&
+      !shouldRouteActivityNoticeToCapsule &&
+      (activeTurnActivity || bottomThoughtSummary || effectiveProgressLedger.length > 0);
     const renderTurnBlockItem = (item) => {
       if (item.kind !== "readContextGroup" && item.kind !== "operationCluster" && item.block?.type === "thought") return null;
       if (item.kind === "block") {
         if (isActiveRunningTurn) {
-          // Active running turn: suppress all intermediate explanations → capsule shows them
+          // Active running turn routes intermediate explanations into the capsule.
           const isExplanation = shouldSuppressAgentAsExplanation(item.block, item.index, blocks, turnIntent);
           if (isExplanation) return null;
+          if (item.block?.type === "tool" && item.block?.toolStatus === "running") return null;
         } else {
-          // Finished turns: use original transparent narration filter
           if (isTransparentToolNarrationBlock(item.block)) return null;
         }
       }
@@ -3402,7 +3437,6 @@ export default function ChatArea({
     };
     const renderArchivedBlockItem = (item) => {
       if (item.kind !== "readContextGroup" && item.kind !== "operationCluster" && item.block?.type === "thought") return null;
-      // Archived items are always from finished turns — use original filter
       if (item.kind === "block" && isTransparentToolNarrationBlock(item.block)) return null;
       return renderBlockItem(item);
     };
@@ -3595,7 +3629,7 @@ export default function ChatArea({
               )}
             </>
           )}
-          {(activeTurnActivity || bottomThoughtSummary || effectiveProgressLedger.length > 0) && (
+          {shouldShowTurnActivityNotice && (
             <TurnActivityNotice
               activityText={activeTurnActivity}
               thoughtSummaryText={bottomThoughtSummary}
@@ -3802,21 +3836,22 @@ export default function ChatArea({
         <div ref={endOfFlowRef} />
       </div>
 
-      {/* Floating Capsule for Agent Tool Explanations */}
+      {/* Agent tool explanation capsule */}
       <div
         className="absolute left-6 right-6 z-30 pointer-events-none flex justify-center transition-all duration-300 ease-out"
         style={{
           bottom: `calc(env(safe-area-inset-bottom, 0px) + 1.5rem + ${composerHeight}px + 12px)`,
           opacity: persistedExplanation ? 1 : 0,
-          transform: persistedExplanation ? 'translateY(0)' : 'translateY(8px)',
+          transform: persistedExplanation ? "translateY(0)" : "translateY(8px)",
         }}
       >
         {persistedExplanation && (
-          <div 
+          <div
+            data-testid="agent-explanation-capsule"
             className="agent-explanation-capsule w-full max-w-3xl"
             style={{
               fontSize: `${Math.max(11, resolvedChatFontSize - 1)}px`,
-              lineHeight: `${Math.max(16, Math.round((resolvedChatFontSize - 1) * 1.5))}px`
+              lineHeight: `${Math.max(16, Math.round((resolvedChatFontSize - 1) * 1.5))}px`,
             }}
           >
             <span className="line-clamp-2 text-ellipsis overflow-hidden">

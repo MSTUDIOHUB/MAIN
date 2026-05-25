@@ -14,6 +14,36 @@ test("game studio live steps show concise progress without nested action cards",
 
   await expect(page.getByTestId("thought-block")).toHaveCount(0);
   await expect(page.getByTestId("live-turn-process-timeline")).toBeVisible();
+  const liveToggle = page.getByTestId("live-turn-process-toggle");
+  await expect(liveToggle).toHaveAttribute("aria-expanded", "false");
+  const capsule = page.getByTestId("agent-explanation-capsule");
+  await expect(capsule).toContainText("manage_camera");
+  await expect(capsule).toContainText("重复 2 次");
+  const capsuleStyleBefore = await capsule.evaluate((element) => {
+    const style = getComputedStyle(element);
+    const fill = getComputedStyle(element, "::before");
+    return {
+      animationName: style.animationName,
+      border: style.border,
+      boxShadow: style.boxShadow,
+      fillAnimationName: fill.animationName,
+    };
+  });
+  expect(capsuleStyleBefore.animationName).toBe("none");
+  expect(capsuleStyleBefore.fillAnimationName).toContain("capsule-fill-flow");
+  await page.waitForTimeout(250);
+  const capsuleStyleAfter = await capsule.evaluate((element) => {
+    const style = getComputedStyle(element);
+    return {
+      border: style.border,
+      boxShadow: style.boxShadow,
+    };
+  });
+  expect(capsuleStyleAfter.border).toBe(capsuleStyleBefore.border);
+  expect(capsuleStyleAfter.boxShadow).toBe(capsuleStyleBefore.boxShadow);
+  await expect(page.getByTestId("turn-activity-notice")).toHaveCount(0);
+  await liveToggle.click();
+
   const steps = page.getByTestId("live-turn-step");
   await expect(steps).toHaveCount(4);
   await expect(steps.nth(0)).toContainText("定位 Main Camera 对象");
@@ -27,8 +57,6 @@ test("game studio live steps show concise progress without nested action cards",
   await expect(steps.nth(3)).toContainText("进行中");
   await expect(steps.nth(3).getByTestId("turn-archive-step-toggle")).toHaveCount(0);
   await expect(page.getByTestId("turn-activity-thought-summary")).toHaveCount(0);
-  await expect(page.getByTestId("turn-activity-notice")).toContainText("正在调用 manage_camera");
-  await expect(page.getByTestId("turn-activity-notice")).toContainText("重复 2 次");
   await expect(page.getByTestId("tool-status-label").filter({ hasText: "执行中" })).toHaveCount(0);
   await expect(page.getByTestId("turn-archive-step-details")).toHaveCount(0);
 });

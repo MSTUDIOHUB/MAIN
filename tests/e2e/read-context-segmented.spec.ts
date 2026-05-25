@@ -9,7 +9,7 @@ test.beforeEach(async ({ page }) => {
   });
 });
 
-test("read/search progress stays visible when interleaved with command cards", async ({ page }) => {
+test("read/search progress stays visible when interleaved with folded command steps", async ({ page }) => {
   await page.goto("/?e2eScenario=read-context-interleaved");
 
   const ledger = page.getByTestId("turn-activity-notice").first().getByTestId("effective-progress-ledger");
@@ -20,13 +20,13 @@ test("read/search progress stays visible when interleaved with command cards", a
   await expect(page.getByTestId("turn-process-archive-toggle")).toHaveCount(0);
   await expect(page.getByTestId("progress-block")).toHaveCount(0);
   await expect(page.getByTestId("read-context-group")).toHaveCount(3);
-  await expect(page.getByTestId("completed-tool-group")).toHaveCount(0);
+  await expect(page.getByTestId("completed-tool-group")).toHaveCount(2);
   await expect(page.getByTestId("read-context-group").filter({ hasText: "package.json" })).toBeVisible();
   await expect(page.getByTestId("read-context-group").filter({ hasText: "useAppStore.ts" })).toBeVisible();
   await expect(page.getByTestId("read-context-group").filter({ hasText: "*release*.md" })).toBeVisible();
-  await expect(page.getByText("git status --short --branch")).toBeVisible();
-  await expect(page.getByText("npm run build -- --mode test")).toBeVisible();
-  await expect(page.getByText("读取与命令交错完成，继续保持命令卡独立显示。")).toBeVisible();
+  await expect(page.getByTestId("completed-tool-group").filter({ hasText: "git status --short --branch" })).toBeVisible();
+  await expect(page.getByTestId("completed-tool-group").filter({ hasText: "npm run build -- --mode test" })).toBeVisible();
+  await expect(page.getByText("读取与命令交错完成，命令步骤已折叠保留。")).toBeVisible();
 });
 
 test("visible agent output remains in transcript between folded read/search groups", async ({ page }) => {
