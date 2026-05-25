@@ -126,6 +126,35 @@ test("previewApplyPatch accepts common unified diff patches from local models", 
   assert.equal(summarizeApplyPatchTarget(patch), "src/hooks/useCsvParser.ts");
 });
 
+test("previewApplyPatch accepts unified diff wrapped in apply_patch markers", async () => {
+  const files = new Map([["src/hooks/useCsvParser.ts", [
+    "export function normalizeCsvOrder(row) {",
+    "  return {",
+    "    creator: row.creator || '',",
+    "  };",
+    "}",
+    "",
+  ].join("\n")]]);
+  const patch = [
+    "*** Begin Patch",
+    "--- a/src/hooks/useCsvParser.ts",
+    "+++ b/src/hooks/useCsvParser.ts",
+    "@@ -1,6 +1,7 @@",
+    " export function normalizeCsvOrder(row) {",
+    "   return {",
+    "     creator: row.creator || '',",
+    "+    creatorName: row.creator || '',",
+    "   };",
+    " }",
+    "*** End Patch",
+  ].join("\n");
+
+  const preview = await previewApplyPatch(patch, async (file) => files.get(file));
+
+  assert.equal(preview.ok, true);
+  assert.match(preview.changes[0].newContent, /creatorName/);
+});
+
 test("applyWorkspacePatch writes real staged changes through the provided IO", async () => {
   const files = new Map([["src/App.tsx", "const title = \"old\";\n"]]);
   const result = await applyWorkspacePatch(

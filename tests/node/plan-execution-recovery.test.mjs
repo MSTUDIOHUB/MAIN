@@ -72,9 +72,12 @@ const {
 
 const {
   describeApprovedPlanRecoveryToolSurface,
+  describeApprovedPlanSourceEditFirstToolSurface,
   isApprovedPlanCachedReadOnlyNoProgressBatch,
   isApprovedPlanRecoveryToolName,
+  isApprovedPlanSourceEditFirstToolName,
   shouldAllowApprovedPlanRecoveryFileRead,
+  shouldBypassApprovedPlanReadCacheForPatchRecovery,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/approvedPlanRecoveryTools.ts"));
 
 const tasks = [
@@ -380,9 +383,27 @@ test("approved plan no-progress recovery keeps targeted reads without broad disc
   );
   assert.equal(
     shouldAllowApprovedPlanRecoveryFileRead([
+      { name: "apply_patch", target: "src/hooks/useCsvParser.ts", status: "failed", detail: "Unsupported apply_patch line: --- a/src/hooks/useCsvParser.ts" },
+    ]),
+    true,
+  );
+  assert.equal(
+    shouldAllowApprovedPlanRecoveryFileRead([
       { name: "replace_in_file", target: "src/App.tsx", status: "failed", detail: "search_text 与文件内容不一致，未执行写入。" },
       { name: "read_file", target: "src/App.tsx", status: "succeeded", detail: "READ_FILE_RESULT" },
     ]),
+    false,
+  );
+  assert.equal(
+    shouldBypassApprovedPlanReadCacheForPatchRecovery({ toolName: "read_file", allowFileRead: true }),
+    true,
+  );
+  assert.equal(
+    shouldBypassApprovedPlanReadCacheForPatchRecovery({ toolName: "read_file", allowFileRead: false }),
+    false,
+  );
+  assert.equal(
+    shouldBypassApprovedPlanReadCacheForPatchRecovery({ toolName: "grep_search", allowFileRead: true }),
     false,
   );
   assert.equal(describeApprovedPlanRecoveryToolSurface(false), "action_only");
@@ -417,6 +438,57 @@ test("approved plan no-progress recovery keeps targeted reads without broad disc
   );
   assert.match(orchestratorSource, /patch-recovery `read_file` only/);
   assert.match(orchestratorSource, /exact current content/);
+  assert.match(orchestratorSource, /approved_plan_patch_recovery_read_cache_bypass/);
+  assert.match(orchestratorSource, /bypassApprovedPlanPatchRecoveryReadCache/);
+});
+
+test("approved plan source edit first surface blocks validation before first write", () => {
+  assert.equal(isApprovedPlanSourceEditFirstToolName("apply_patch"), true);
+  assert.equal(isApprovedPlanSourceEditFirstToolName("replace_in_file"), true);
+  assert.equal(isApprovedPlanSourceEditFirstToolName("write_file"), true);
+  assert.equal(isApprovedPlanSourceEditFirstToolName("run_command"), false);
+  assert.equal(isApprovedPlanSourceEditFirstToolName("browser_evaluate"), false);
+  assert.equal(isApprovedPlanSourceEditFirstToolName("read_file"), false);
+  assert.equal(isApprovedPlanSourceEditFirstToolName("read_file", { allowFileRead: true }), true);
+  assert.equal(describeApprovedPlanSourceEditFirstToolSurface(false), "source_edit_only");
+  assert.equal(describeApprovedPlanSourceEditFirstToolSurface(true), "source_edit_plus_patch_file_read");
+
+  const orchestratorSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8");
+  assert.match(orchestratorSource, /approvedPlanNeedsSourceEditBeforeValidation/);
+  assert.match(orchestratorSource, /approved_plan_source_edit_first_tool_scope_applied/);
+});
+
+test("approved plan browser validation repeats are reused or paused without agent error", () => {
+  const orchestratorSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator.ts"),
+    "utf8",
+  );
+
+  assert.match(orchestratorSource, /approvedPlanBrowserValidationCache/);
+  assert.match(orchestratorSource, /approved_plan_browser_validation_reused/);
+  assert.match(orchestratorSource, /approved_plan_repeated_browser_validation/);
+  assert.doesNotMatch(
+    orchestratorSource,
+    /tc\.name === "browser_evaluate"[\s\S]{0,600}callbacks\.onStatusChange\("error"\)/,
+  );
+});
+
+test("approved plan no-tool prose is preserved unless it is a rejected completion claim", () => {
+  const orchestratorSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator.ts"),
+    "utf8",
+  );
+
+  assert.match(orchestratorSource, /shouldHideApprovedPlanNoToolText/);
+  assert.match(orchestratorSource, /preservedVisibleText:\s*!shouldHideApprovedPlanNoToolText/);
+  assert.match(
+    orchestratorSource,
+    /if\s*\(\s*!shouldHideApprovedPlanNoToolText\s*\)\s*{[\s\S]*?callbacks\.onTurnSummaryReady\(visibleAssistantText\)/,
+  );
+  assert.match(
+    orchestratorSource,
+    /if\s*\(\s*!shouldHideApprovedPlanNoToolText && \(visibleAssistantText \|\| finalReplyOptions\.length > 0\)\)\s*{/,
+  );
 });
 
 test("plan progress snapshot carries no-progress recovery metadata", () => {

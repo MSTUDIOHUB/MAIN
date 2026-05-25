@@ -3,7 +3,7 @@ import { hasTurnProvidedContext, normalizeTurnInputContextSignals, type TurnInpu
 
 export const PLAN_READONLY_CONVERGENCE_BATCH_LIMIT = 3;
 export const PLAN_READONLY_CONVERGENCE_TOOL_LIMIT = 12;
-export const PLAN_CONTEXT_READONLY_CONVERGENCE_BATCH_LIMIT = 2;
+export const PLAN_CONTEXT_READONLY_CONVERGENCE_BATCH_LIMIT = 1;
 export const PLAN_CONTEXT_READONLY_CONVERGENCE_TOOL_LIMIT = 6;
 export type PlanEvidenceReadiness =
   | "needs_observation"
@@ -184,6 +184,7 @@ export function shouldNarrowPlanToolsAfterReadOnlyConvergence(input: {
   if (isPlanRuntimeFinalizationPhase(input.planRuntimePhase)) return true;
   if (isPlanEvidenceRecoveryPhase(input.planRuntimePhase)) return false;
   if (!input.convergencePromptAlreadyUsed) return false;
+  if (input.evidenceReadiness === "needs_targeted_read") return true;
   return input.evidenceReadiness === "ready_for_plan" || input.evidenceReadiness === "blocked_user_choice";
 }
 
@@ -200,6 +201,9 @@ export function filterPlanToolNamesAfterReadOnlyConvergence(input: {
   planRuntimePhase?: PlanRuntimePhase;
 }): string[] {
   if (!shouldNarrowPlanToolsAfterReadOnlyConvergence(input)) return input.toolNames;
+  if (input.evidenceReadiness === "needs_targeted_read") {
+    return input.toolNames.filter((name) => PLAN_TARGETED_EVIDENCE_TOOL_NAMES.has(name));
+  }
   return [];
 }
 
@@ -245,6 +249,13 @@ export function shouldTriggerPlanReadOnlyConvergence(input: {
     recentToolActivity: input.recentToolActivity,
     hasObservedUserContext: input.hasObservedUserContext,
   });
+  if (
+    readiness.status === "needs_targeted_read" &&
+    readiness.successfulSearches > 0 &&
+    input.batchCount >= 1
+  ) {
+    return true;
+  }
   if (readiness.status !== "ready_for_plan" && readiness.status !== "blocked_user_choice") {
     return false;
   }
@@ -269,6 +280,12 @@ export function shouldRedirectPlanToolsAfterReadOnlyConvergence(input: {
   const isFinalizationPhase = isPlanRuntimeFinalizationPhase(input.planRuntimePhase);
   if (isFinalizationPhase) return input.toolNames.length > 0;
   if (!input.convergencePromptAlreadyUsed) return false;
+  if (input.evidenceReadiness === "needs_targeted_read") {
+    return input.toolNames.some((name) =>
+      PLAN_READ_ONLY_TOOL_NAMES.has(name) &&
+      !PLAN_TARGETED_EVIDENCE_TOOL_NAMES.has(name)
+    );
+  }
   if (input.evidenceReadiness !== "ready_for_plan" && input.evidenceReadiness !== "blocked_user_choice") {
     return false;
   }

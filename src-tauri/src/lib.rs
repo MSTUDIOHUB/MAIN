@@ -7978,28 +7978,37 @@ fn delete_chat_temp_path(session_key: String, path: String) -> Result<(), String
     Ok(())
 }
 
-/// Delete all spec files (requirements.md, design.md, tasks.md, bugfix.md)
+const PLAN_FILE_NAMES: [&str; 5] = [
+    "plan.md",
+    "requirements.md",
+    "design.md",
+    "tasks.md",
+    "bugfix.md",
+];
+
+fn delete_plan_files_in_dir(plans_dir: &Path) -> Result<(), String> {
+    if !plans_dir.exists() {
+        return Ok(());
+    }
+
+    for name in &PLAN_FILE_NAMES {
+        let file_path = plans_dir.join(name);
+        if file_path.exists() && file_path.is_file() {
+            fs::remove_file(&file_path)
+                .map_err(|e| format!("删除计划文件 {:?} 失败: {e}", file_path))?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Delete all plan files (plan.md, requirements.md, design.md, tasks.md, bugfix.md)
 /// from the `.MAIN/plans/` directory when the user explicitly requests cleanup.
 #[tauri::command]
 fn delete_plan_files(state: State<WorkspaceState>) -> Result<(), String> {
     let workspace = state.get_root()?;
     let plans_dir = workspace.join(".MAIN").join("plans");
-
-    if !plans_dir.exists() {
-        return Ok(());
-    }
-
-    let spec_names = ["requirements.md", "design.md", "tasks.md", "bugfix.md"];
-
-    for name in &spec_names {
-        let file_path = plans_dir.join(name);
-        if file_path.exists() && file_path.is_file() {
-            fs::remove_file(&file_path)
-                .map_err(|e| format!("删除规格文件 {:?} 失败: {e}", file_path))?;
-        }
-    }
-
-    Ok(())
+    delete_plan_files_in_dir(&plans_dir)
 }
 
 // endregion
@@ -8804,7 +8813,7 @@ mod tests {
         compare_file_nodes, is_supported_attachment_path, is_valid_git_branch_name,
         looks_long_running_shell_command, merge_json_rows_by_id, parse_git_branch_line,
         parse_git_numstat, parse_git_porcelain_entries, parse_git_porcelain_status,
-        read_session_transcript_with_fallback, resolve_existing_path,
+        read_session_transcript_with_fallback, delete_plan_files_in_dir, resolve_existing_path,
         resolve_open_file_external_path, resolve_session_transcript_to_write, resolve_write_path,
         should_hide_list_directory_entry, should_skip_recursive_search_dir, validate_pty_input,
         write_json_atomic, write_jsonl_atomic, FileNode, SessionTranscript,
@@ -8822,6 +8831,24 @@ mod tests {
         let root = std::env::temp_dir().join(format!("main-workspace-{name}-{unique}"));
         fs::create_dir_all(&root).unwrap();
         root.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn delete_plan_files_in_dir_removes_plan_md_and_legacy_artifacts() {
+        let workspace = make_temp_workspace("plan-cleanup");
+        let plans_dir = workspace.join(".MAIN").join("plans");
+        fs::create_dir_all(&plans_dir).unwrap();
+        for name in ["plan.md", "requirements.md", "design.md", "tasks.md", "bugfix.md"] {
+            fs::write(plans_dir.join(name), "# plan").unwrap();
+        }
+        fs::write(plans_dir.join("notes.md"), "# keep").unwrap();
+
+        delete_plan_files_in_dir(&plans_dir).unwrap();
+
+        for name in ["plan.md", "requirements.md", "design.md", "tasks.md", "bugfix.md"] {
+            assert!(!plans_dir.join(name).exists(), "{name} should be deleted");
+        }
+        assert!(plans_dir.join("notes.md").exists());
     }
 
     #[test]

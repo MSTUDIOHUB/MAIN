@@ -700,6 +700,62 @@ test("composes deterministic reviewable plan artifact after repeated quality rej
   assert.doesNotMatch(content, /MAIN TOOL FEEDBACK|ContextMemoryState|RecoveryDetails/);
 });
 
+test("deterministic closure drops runtime plan instructions from assumptions", () => {
+  const userGoal = [
+    "修复一些问题：",
+    "1、核心问题时：手动导入csv数据后不能够在面板上显示对应的数据内容，包括课程销售排行，销售趋势，月度环比分析，订单状态等真实信息。",
+    "2、深色模式仍然有很多问题，看起来只是在白色底背景上将一些框体改成了深色而已，请彻底改变深色模式等显示方式。",
+  ].join("\n");
+
+  const sanitized = sanitizePlanEvidenceInput({
+    userGoal,
+    evidence: [
+      "grep_search src; excerpt=src/types/order.ts:71:// 订单状态分布 src/components/Dashboard/StatusPieChart.tsx:138: <Card title=订单状态与支付方式",
+      "grep_search src; excerpt=src/App.tsx:29:type ThemeType = 'light' | 'dark'; src/App.tsx:31:const THEME_KEY = 'dashboard-theme'",
+      "grep_search dark|theme|深色|mode; excerpt=src/App.tsx:29:type ThemeType = 'light' | 'dark'",
+      "read_file src/store/dashboardStore.ts; excerpt=Dashboard Store 聚合导入订单并计算指标",
+      "read_file src/hooks/useChartData.ts; excerpt=图表数据从订单记录派生排行、趋势和状态分布",
+      "read_file src/components/Dashboard/OverviewCards.tsx; excerpt=概览指标组件渲染 Dashboard 数据",
+      "read_file src/components/Dashboard/CourseBarChart.tsx; excerpt=课程销售排行图表读取课程聚合数据",
+    ],
+    files: [
+      "src/store/dashboardStore.ts",
+      "src/hooks/useChartData.ts",
+      "src/components/Dashboard/OverviewCards.tsx",
+      "src/components/Dashboard/CourseBarChart.tsx",
+      "src/App.tsx",
+      "src/types/order.ts",
+    ],
+    constraints: [
+      "如果确实缺少关键业务选择，用 `<user_options>` 提问，不要写泛化模板计划。",
+      "tsx 约束：可见计划必须对齐 Codex app 的交接计划结构。",
+      "如果 imageParts 0，必须先说明从截图观察到的现象。",
+      "创建 plan.md 是 runtime 的职责，模型不要直接调用 write_file。",
+      "批准前不修改源码。",
+    ],
+    language: "zh",
+  });
+
+  assert.equal(sanitized.stats.dropReasons.control_prompt, 4);
+  assert.deepEqual(sanitized.constraints, ["批准前不修改源码。"]);
+
+  const content = composePlanArtifactFromEvidence({
+    userGoal: sanitized.userGoal,
+    evidence: sanitized.evidence,
+    files: sanitized.files,
+    constraints: sanitized.constraints,
+    language: "zh",
+  });
+
+  const validation = validateActionablePlanArtifact(content);
+  assert.equal(validation.ok, true, validation.reason || "");
+  assert.match(content, /dashboardStore\.ts/);
+  assert.match(content, /useChartData\.ts/);
+  assert.match(content, /CourseBarChart\.tsx/);
+  assert.match(content, /深色模式表面|主题 token/);
+  assert.doesNotMatch(content, /如果确实缺少关键业务选择|tsx 约束|imageParts|创建 plan\.md 是 runtime|user_options|excerpt=/i);
+});
+
 test("composes deterministic plan artifact from real tool feedback without leaking envelopes", () => {
   const content = composePlanArtifactFromEvidence({
     userGoal: "修复 CSV 导入后 Dashboard 指标没有正确更新的问题。",
@@ -750,6 +806,67 @@ test("deterministic plan uses concrete read evidence instead of broad search gro
   assert.match(content, /深色模式表面|主题 token/);
   assert.doesNotMatch(content, /直接相关的最小改动|写入前先用证据确认/);
   assert.doesNotMatch(content, /依据证据：已搜索文件|依据证据：已查看目录/);
+});
+
+test("read_file_window evidence is concrete enough for real UI plan materialization", () => {
+  const sanitized = sanitizePlanEvidenceInput({
+    userGoal: "修复 CSV 导入后 Dashboard 数据不显示，并彻底改善深色模式。",
+    evidence: [
+      "get_project_skeleton src; excerpt=src/hooks/useCsvParser.ts, src/store/dashboardStore.ts",
+      "read_file_window src/hooks/useCsvParser.ts; excerpt=mapCsvRow 读取 creator_name、course_name、paid_at 字段并返回 OrderRecord",
+      "read_file_window src/store/dashboardStore.ts; excerpt=loadOrders 负责把导入记录写入 dashboard 状态并计算指标",
+      "read_file_window src/components/Dashboard/CourseBarChart.tsx; excerpt=课程销售排行图表从 courseSalesData 渲染真实课程销售额",
+      "read_file_window src/index.css; excerpt=:root 与 [data-theme='dark'] 定义背景、卡片和文字颜色变量",
+      "analyze_tabular_document cn_tutorial_orders_by_creator_20260512.csv; excerpt=creator_name, course_name, order_status, paid_amount, paid_at",
+    ],
+    files: [
+      "src/hooks/useCsvParser.ts",
+      "src/store/dashboardStore.ts",
+      "src/components/Dashboard/CourseBarChart.tsx",
+      "src/index.css",
+      "cn_tutorial_orders_by_creator_20260512.csv",
+    ],
+    constraints: ["批准前不修改源码。"],
+    language: "zh",
+  });
+
+  assert.equal(sanitized.stats.dropReasons.non_semantic_tool || 0, 0);
+  assert.ok(sanitized.evidence.some((line) => /read_file_window src\/hooks\/useCsvParser\.ts/.test(line)));
+
+  const content = composePlanArtifactFromEvidence({
+    userGoal: sanitized.userGoal,
+    evidence: sanitized.evidence,
+    files: sanitized.files,
+    constraints: sanitized.constraints,
+    language: "zh",
+  });
+
+  const validation = validateActionablePlanArtifact(content);
+  assert.equal(validation.ok, true, validation.reason || "");
+  assert.match(content, /useCsvParser\.ts/);
+  assert.match(content, /dashboardStore\.ts/);
+  assert.match(content, /CourseBarChart\.tsx/);
+  assert.match(content, /index\.css/);
+  assert.doesNotMatch(content, /依据证据：已查看项目结构/);
+});
+
+test("sanitizer drops broad extension-only glob evidence from plan grounding", () => {
+  const sanitized = sanitizePlanEvidenceInput({
+    userGoal: "修复 CSV 导入后 Dashboard 数据不显示。",
+    evidence: [
+      "glob_search **/*.vue; status=observed; excerpt=[]",
+      "glob_search **/*.scss; status=observed; excerpt=[]",
+      "read_file_window src/store/dashboardStore.ts; excerpt=loadOrders 聚合导入订单并刷新 Dashboard 指标",
+      "read_file_window src/hooks/useCsvParser.ts; excerpt=parseCsvRow 负责把 CSV 列映射为订单记录",
+    ],
+    files: ["src/store/dashboardStore.ts", "src/hooks/useCsvParser.ts"],
+    constraints: [],
+    language: "zh",
+  });
+
+  assert.equal(sanitized.stats.dropReasons.non_semantic_tool, 2);
+  assert.equal(sanitized.evidence.some((line) => /glob_search/.test(line)), false);
+  assert.equal(sanitized.evidence.filter((line) => /read_file_window/.test(line)).length, 2);
 });
 
 test("canonicalization rejects plans grounded only by broad discovery evidence", () => {
@@ -869,9 +986,9 @@ test("deterministic materialization extracts the real goal from turn intake wrap
   const sanitized = sanitizePlanEvidenceInput({
     userGoal: wrappedGoal,
     evidence: [
-      "read_file src/App.tsx; excerpt=src/App.tsx",
-      "read_file src/main.tsx; excerpt=src/main.tsx",
-      "read_file src/index.css; excerpt=src/index.css",
+      "read_file src/App.tsx; excerpt=App wires Dashboard upload state and renders main dashboard shell",
+      "read_file src/main.tsx; excerpt=main mounts React root and imports global styles",
+      "read_file src/index.css; excerpt=defines theme variables and page background tokens",
       "list_directory src/components; excerpt=src/components/Dashboard/ , src/components/DataTable/ , src/components/FileUploader/",
     ],
     files: [

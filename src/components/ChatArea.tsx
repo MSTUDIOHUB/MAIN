@@ -343,12 +343,12 @@ function ContextCompressionNotice({ block, language }: { block: any; language: "
   const topSourceLabel = String(stats.topTokenSource?.label || "").trim();
   const topSourceTokens = Number(stats.topTokenSource?.tokens || 0);
   const title = language === "zh"
-    ? isExecuteRecovery ? "执行恢复上下文已收束" : isReactive ? "上下文溢出保护" : isMicroOnly ? (microKind === "tool_results" ? "长工具结果已压缩" : "长内容已整理") : "历史上下文已压缩"
-    : isExecuteRecovery ? "Execution recovery context compacted" : isReactive ? "Context overflow guard" : isMicroOnly ? (microKind === "tool_results" ? "Long tool results compacted" : "Long content compacted") : "History context compressed";
+    ? isExecuteRecovery ? "执行恢复上下文已收束" : isReactive ? "上下文溢出保护" : isMicroOnly ? "上下文已整理" : "历史上下文已压缩"
+    : isExecuteRecovery ? "Execution recovery context compacted" : isReactive ? "Context overflow guard" : isMicroOnly ? "Context organized" : "History context compressed";
   const compactLabel = language === "zh" ? "查看" : "View";
   const toolResultExplanation = language === "zh"
-    ? "这不是某个工具执行失败，而是 MAIN 在请求模型前把历史 tool result 做了上下文压缩；原始工具卡片仍在对话记录中，模型侧只保留必要摘要和最新结果。"
-    : "This is not a tool failure. MAIN compacted historical tool results before the model request; the original tool cards remain in the conversation while the model receives the necessary summary and newest results.";
+    ? "这不是工具失败。MAIN 在请求模型前整理历史工具结果；原始工具卡片仍保留在对话里，模型侧只接收必要摘要和最新结果。"
+    : "This is not a tool failure. MAIN organized historical tool results before the model request; original tool cards remain in the conversation while the model receives the necessary summary and newest results.";
   const defaultBodyText = language === "zh"
     ? microKind === "tool_results"
       ? toolResultExplanation

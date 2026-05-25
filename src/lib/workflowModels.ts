@@ -1363,7 +1363,7 @@ const RUNTIME_TASK_FILE_ROLE_RE =
 const RUNTIME_TASK_SECTION_RE =
   /(?:关键改动|实现改动|改动|执行|实施|任务|步骤|顺序|验证|验收|Key Changes|Implementation Changes|Changes|Execution|Implementation|Tasks|Steps|Order|Validation|Acceptance)/i;
 const RUNTIME_TASK_EXCLUDED_SECTION_RE =
-  /(?:当前状态|状态发现|现状|背景|问题分析|根因|技术栈|整体结构|影响文件|涉及文件|公共\s*API|接口|类型|数据流|控制流|设计思路|总体思路|Current State|Findings|Background|Root Cause|Tech Stack|Architecture|Public APIs|Interfaces|Types|Files|Data Flow|Control Flow|Design Notes)/i;
+  /(?:用户目标|目标|摘要|概要|当前状态|状态发现|现状|背景|问题分析|根因|技术栈|整体结构|影响文件|涉及文件|证据|已读证据|最相关证据|假设|默认值|公共\s*API|接口|类型|数据流|控制流|设计思路|总体思路|User Goals?|Goals?|Summary|Overview|Current State|Findings|Background|Root Cause|Tech Stack|Architecture|Evidence|Read Evidence|Most Relevant Evidence|Assumptions|Defaults|Public APIs|Interfaces|Types|Files|Data Flow|Control Flow|Design Notes)/i;
 const RUNTIME_TASK_PLACEHOLDER_RE =
   /(?:使用方式|示例|建议|当前状态|状态发现|项目基于|技术栈|本设计要解决的问题|总体思路|为什么这样拆分|哪些部分保持不变|数据分析类任务|模块\s*\/\s*文件|状态\s*\/\s*数据流|交互\s*\/\s*UX|错误处理\s*\/\s*回退|允许修改的区域|暂不修改的区域|需要哪些测试|REQ-xxx|占位|TBD|TODO|\.\.\.)/i;
 
@@ -1433,10 +1433,10 @@ function collectRuntimeTaskCandidateLines(content: string): string[] {
     if (text.length < 8 || text.length > 220) continue;
     if (isMarkdownTableSyntaxLine(text)) continue;
     if (RUNTIME_TASK_PLACEHOLDER_RE.test(text)) continue;
-    if (/[:：]\s*$/.test(text)) continue;
+    const evidence = inferPlanTaskEvidence(text, extractShellCommandsFromText(text));
+    if (/[:：]\s*$/.test(text) && (evidence.length === 0 || !RUNTIME_TASK_MUTATION_RE.test(text))) continue;
     if (!isRuntimeTaskActionableText(text)) continue;
-
-    const hasEvidence = inferPlanTaskEvidence(text, extractShellCommandsFromText(text)).length > 0;
+    const hasEvidence = evidence.length > 0;
     if (!inUsefulSection && !hasEvidence && !RUNTIME_TASK_ACTION_RE.test(text)) continue;
     candidates.push(text);
   }
@@ -1881,6 +1881,15 @@ export function validateActionablePlanArtifact(
   if (!base.ok) return classifyPlanArtifactQualityResult(base);
 
   const raw = String(content || "").trim();
+  if (/(?:如果确实缺少关键业务选择，用\s*提问|tsx\s*约束|imageParts\s*[0-9]|turn_intake|可见计划必须对齐|创建\s*plan\.md\s*是\s*runtime|本轮处于\s*PLAN\s*模式)/i.test(raw)) {
+    return classifyPlanArtifactQualityResult({ ok: false, reason: "prompt_leakage_in_plan" });
+  }
+  if (/(?:最相关证据|Most relevant evidence)\s*[:：]\s*(?:已搜索文本|Searched text)\s*[:：]\s*\./i.test(raw)) {
+    return classifyPlanArtifactQualityResult({ ok: false, reason: "noisy_search_evidence" });
+  }
+  if (/(?:最相关证据|Most relevant evidence).{0,260}(?:package-lock\.json|package\.json|<title\b|index\.html:\d+:\s*<title)/is.test(raw)) {
+    return classifyPlanArtifactQualityResult({ ok: false, reason: "noisy_search_evidence" });
+  }
   if (/(?:最小可用闭环|smallest useful workflow|Use the inspected context as the source of truth|基于当前可用的只读证据|available read-only evidence|基于已确认的证据先收窄实现目标|实施满足用户目标的最小源码变更|Use the confirmed evidence to narrow the implementation target|Apply the smallest source changes that satisfy the user goal)/i.test(raw)) {
     return classifyPlanArtifactQualityResult({ ok: false, reason: "generic_fallback_plan" });
   }
@@ -1893,6 +1902,10 @@ export function validateActionablePlanArtifact(
   const discoveryGroundingCount = (raw.match(/(?:依据证据|Grounding evidence)\s*[:：]\s*(?:已搜索文件|已查看目录|已查看项目结构|Searched files|Listed directory|Inspected project structure)/gi) || []).length;
   if (discoveryGroundingCount >= 2) {
     return classifyPlanArtifactQualityResult({ ok: false, reason: "generic_fallback_plan" });
+  }
+  const weakPathEchoGroundingCount = (raw.match(/(?:依据证据|Grounding evidence)\s*[:：]\s*(?:已读取文件|Read file)\s*[:：]\s*([A-Za-z0-9_@./-]+\.[A-Za-z0-9]+)\s*[;；]\s*(?:发现|found)\s*[:：]\s*\1/gi) || []).length;
+  if (weakPathEchoGroundingCount >= 2) {
+    return classifyPlanArtifactQualityResult({ ok: false, reason: "weak_path_echo_evidence" });
   }
   if (/(?:^|\n)\s*(?:[-*]\s*)?(?:用户目标|User goal)\s*[:：]\s*(?:$|\n)/i.test(raw)) {
     return classifyPlanArtifactQualityResult({ ok: false, reason: "empty_user_goal" });

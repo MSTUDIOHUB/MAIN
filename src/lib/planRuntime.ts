@@ -37,6 +37,21 @@ function hasReadyPlanEvidence(status?: PlanEvidenceReadiness): boolean {
   return status === "ready_for_plan" || status === "blocked_user_choice";
 }
 
+const PLAN_TARGETED_EVIDENCE_TOOL_NAMES = new Set([
+  "read_file",
+  "read_document",
+  "analyze_tabular_document",
+  "query_tabular_document",
+  "get_file_outline",
+  "repo_map_search",
+  "repo_map_context",
+  "repo_map_impact",
+  "read_pty_tail",
+  "read_pty_since",
+  "read_pty_buffer",
+  "get_pty_status",
+]);
+
 export function filterPlanToolNamesForRuntimePhase(input: {
   toolNames: string[];
   workflowMode: PlanRuntimeMode;
@@ -45,6 +60,9 @@ export function filterPlanToolNamesForRuntimePhase(input: {
 }): string[] {
   if (input.workflowMode !== "plan" || input.isPlanApproved || !input.planRuntimePhase) {
     return input.toolNames;
+  }
+  if (input.planRuntimePhase === "needs_evidence") {
+    return input.toolNames.filter((name) => PLAN_TARGETED_EVIDENCE_TOOL_NAMES.has(name));
   }
   if (isPlanRuntimeReadOnlyPhase(input.planRuntimePhase)) {
     return input.toolNames.filter(isPlanReadOnlyToolName);

@@ -191,49 +191,78 @@ function fail(message, detail = {}) {
   throw error;
 }
 
-async function requestJson(path, init = {}) {
+async function requestJson(routePath, init = {}) {
   const requestHeaders = { ...headers, ...(init.headers || {}) };
-  const args = [
-    "-sS",
-    "-w",
-    "\n__HTTP_STATUS__:%{http_code}",
-  ];
-  if (init.method) args.push("-X", init.method);
-  for (const [name, value] of Object.entries(requestHeaders)) {
-    args.push("-H", `${name}: ${value}`);
-  }
-  if (init.body !== undefined) {
-    args.push("--data-binary", String(init.body));
-  }
-  args.push(`${endpoint}${path}`);
+  const requestUrl = `${endpoint}${routePath}`;
+  const requestBody = init.body !== undefined ? String(init.body) : undefined;
+  const parseResponseJson = (status, text) => {
+    let json = null;
+    try {
+      json = text ? JSON.parse(text) : null;
+    } catch {
+      fail(`Non-JSON response from ${routePath}`, { status, text: text.slice(0, 500) });
+    }
+    if (status < 200 || status >= 300) {
+      fail(`HTTP ${status} from ${routePath}`, { json });
+    }
+    return json;
+  };
+  const requestViaCurl = async (cause) => {
+    const args = [
+      "-sS",
+      "-w",
+      "\n__HTTP_STATUS__:%{http_code}",
+    ];
+    if (init.method) args.push("-X", init.method);
+    for (const [name, value] of Object.entries(requestHeaders)) {
+      args.push("-H", `${name}: ${value}`);
+    }
+    if (requestBody !== undefined) {
+      args.push("--data-binary", requestBody);
+    }
+    args.push(requestUrl);
 
-  let stdout;
+    let stdout;
+    try {
+      ({ stdout } = await execFile("curl", args, { maxBuffer: 30 * 1024 * 1024 }));
+    } catch (error) {
+      fail(`request failed for ${routePath}`, {
+        message: error.message,
+        cause,
+        curlStderr: String(error.stderr || ""),
+        curlStdout: String(error.stdout || "").slice(0, 500),
+      });
+    }
+    const marker = "\n__HTTP_STATUS__:";
+    const markerIndex = stdout.lastIndexOf(marker);
+    if (markerIndex < 0) {
+      fail(`Missing HTTP status from ${routePath}`, { stdout: stdout.slice(0, 500), cause });
+    }
+    const text = stdout.slice(0, markerIndex);
+    const status = Number(stdout.slice(markerIndex + marker.length).trim());
+    return parseResponseJson(status, text);
+  };
+
+  let response;
   try {
-    ({ stdout } = await execFile("curl", args, { maxBuffer: 30 * 1024 * 1024 }));
+    response = await fetch(requestUrl, {
+      method: init.method || "GET",
+      headers: requestHeaders,
+      body: requestBody,
+    });
   } catch (error) {
-    fail(`curl request failed for ${path}`, {
-      stderr: String(error.stderr || ""),
-      stdout: String(error.stdout || "").slice(0, 500),
+    const cause = error.cause ? String(error.cause.message || error.cause) : error.message;
+    if (error.cause?.code === "EPERM" || /EPERM|operation not permitted/i.test(cause)) {
+      return await requestViaCurl(cause);
+    }
+    fail(`request failed for ${routePath}`, {
       message: error.message,
+      cause,
+      code: error.cause?.code,
     });
   }
-  const marker = "\n__HTTP_STATUS__:";
-  const markerIndex = stdout.lastIndexOf(marker);
-  if (markerIndex < 0) {
-    fail(`Missing HTTP status from ${path}`, { stdout: stdout.slice(0, 500) });
-  }
-  const text = stdout.slice(0, markerIndex);
-  const status = Number(stdout.slice(markerIndex + marker.length).trim());
-  let json = null;
-  try {
-    json = text ? JSON.parse(text) : null;
-  } catch {
-    fail(`Non-JSON response from ${path}`, { status, text: text.slice(0, 500) });
-  }
-  if (status < 200 || status >= 300) {
-    fail(`HTTP ${status} from ${path}`, { json });
-  }
-  return json;
+  const text = await response.text();
+  return parseResponseJson(response.status, text);
 }
 
 function parseToolArgs(raw) {

@@ -69,7 +69,16 @@ function looksLikeUnifiedDiff(lines: string[], index: number): boolean {
 
 function normalizeUnifiedDiffToApplyPatch(raw: string): string {
   const lines = raw.replace(/\r\n/g, "\n").split("\n");
-  if (lines.some((line) => line.trim() === "*** Begin Patch")) return raw;
+  if (lines.some((line) => line.trim() === "*** Begin Patch")) {
+    const begin = lines.findIndex((line) => line.trim() === "*** Begin Patch");
+    const end = lines.findIndex((line) => line.trim() === "*** End Patch");
+    const body = end > begin ? lines.slice(begin + 1, end).join("\n") : raw;
+    const bodyLines = body.split("\n");
+    if (bodyLines.some((_, index) => looksLikeUnifiedDiff(bodyLines, index))) {
+      return normalizeUnifiedDiffToApplyPatch(body);
+    }
+    return raw;
+  }
   if (!lines.some((_, index) => looksLikeUnifiedDiff(lines, index))) return raw;
 
   const output: string[] = ["*** Begin Patch"];

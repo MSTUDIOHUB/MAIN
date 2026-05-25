@@ -25,9 +25,16 @@ export const APPROVED_PLAN_PATCH_RECOVERY_READ_TOOLS = new Set([
   "read_file",
 ]);
 
+export const APPROVED_PLAN_SOURCE_EDIT_TOOLS = new Set([
+  "apply_patch",
+  "replace_in_file",
+  "write_file",
+]);
+
 export function isPatchMismatchRecoveryActivity(activity: ApprovedPlanRecoveryActivityLike): boolean {
-  if (activity.name !== "replace_in_file" || activity.status !== "failed") return false;
-  return /(?:search_text|not\s+found|no\s+match|mismatch|不一致|未匹配|未找到|patch)/i.test(activity.detail || "");
+  if (activity.status !== "failed") return false;
+  if (activity.name !== "replace_in_file" && activity.name !== "apply_patch") return false;
+  return /(?:search_text|not\s+found|no\s+match|mismatch|不一致|未匹配|未找到|patch|unsupported apply_patch|invalid patch|上下文)/i.test(activity.detail || "");
 }
 
 function isCachedReadOnlyResult(result: ApprovedPlanToolResultLike): boolean {
@@ -68,6 +75,13 @@ export function shouldAllowApprovedPlanRecoveryFileRead(
   return latestPatchMismatchIndex >= 0 && latestPatchMismatchIndex > latestFileReadIndex;
 }
 
+export function shouldBypassApprovedPlanReadCacheForPatchRecovery(input: {
+  toolName: string;
+  allowFileRead: boolean;
+}): boolean {
+  return input.toolName === "read_file" && input.allowFileRead;
+}
+
 export function isApprovedPlanRecoveryToolName(
   name: string,
   readOnlyTools: Set<string>,
@@ -77,6 +91,18 @@ export function isApprovedPlanRecoveryToolName(
   return Boolean(options.allowFileRead && APPROVED_PLAN_PATCH_RECOVERY_READ_TOOLS.has(name));
 }
 
+export function isApprovedPlanSourceEditFirstToolName(
+  name: string,
+  options: { allowFileRead?: boolean } = {},
+): boolean {
+  if (APPROVED_PLAN_SOURCE_EDIT_TOOLS.has(name)) return true;
+  return Boolean(options.allowFileRead && APPROVED_PLAN_PATCH_RECOVERY_READ_TOOLS.has(name));
+}
+
 export function describeApprovedPlanRecoveryToolSurface(allowFileRead: boolean): string {
   return allowFileRead ? "action_plus_patch_file_read" : "action_only";
+}
+
+export function describeApprovedPlanSourceEditFirstToolSurface(allowFileRead: boolean): string {
+  return allowFileRead ? "source_edit_plus_patch_file_read" : "source_edit_only";
 }

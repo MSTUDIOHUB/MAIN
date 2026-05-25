@@ -477,7 +477,7 @@ export const translations = {
     switchPersona: "Switch Persona",
     switchMainMode: "MAIN Mode",
     runMode: "Run Mode",
-    main_mode: "MAIN Mode",
+    main_mode: "MAIN",
     game_studio: "Game Studio",
     nexus_general: "General Collaboration",
     nexus_create: "Creative Co-Creation",
@@ -584,7 +584,7 @@ export const translations = {
     switchPersona: "切换执行角色",
     switchMainMode: "MAIN 模式",
     runMode: "工作方式",
-    main_mode: "MAIN 模式",
+    main_mode: "MAIN",
     game_studio: "游戏工作室",
     nexus_general: "通用协作",
     nexus_create: "创意共创",
@@ -7679,7 +7679,7 @@ export const useAppStore = create<AppState>()(
           : "本轮处于 PLAN 模式。";
         userContent = preferredLanguage === "en"
           ? [
-              `${planModeLead} If the request is a complex implementation, gather read-only evidence first, then output a concise visible \`<proposed_plan>\` or Codex-style Proposal for approval; MAIN will materialize it into \`.MAIN/plans/plan.md\`. Create \`.MAIN/plans/requirements.md\` only when the user explicitly wants a requirement ledger or the scope needs traceability. Do not write project source files or tasks.md before approval.`,
+              `${planModeLead} If the request is a complex implementation, gather read-only evidence first, then output a concise visible \`<proposed_plan>\` or Codex-style Proposal for approval; MAIN will materialize it into \`.MAIN/plans/plan.md\`. For debug-log, screenshot, repeated-failure, or cross-module repairs, you may also keep a short staged ledger: \`requirements.md\` for user goals/acceptance and \`design.md\` for evidence-backed diagnosis. Do not write project source files or tasks.md before approval.`,
               "Creating plan.md is an automatic runtime materialization step, not a user choice and not something the model must force through write_file before approval.",
               "The visible plan must follow the Codex app handoff shape: title, Summary, Key Changes / Implementation Changes, Public APIs / Interfaces / Types, Test Plan, and Assumptions / Defaults.",
               "If it is only a discussion-style plan, keep the answer concise and use user options for real decisions.",
@@ -7687,7 +7687,7 @@ export const useAppStore = create<AppState>()(
               userContent,
             ].join("\n")
           : [
-              `${planModeLead}如果这是复杂实现请求，请先收集只读证据，再输出精简可见的 \`<proposed_plan>\` 或 Codex-style Proposal 供审批；MAIN 会把它物化为 \`.MAIN/plans/plan.md\`。只有用户明确要求需求台账或范围需要追踪时，才额外生成 \`.MAIN/plans/requirements.md\`。等待用户批准后再改源码；批准前不要生成 tasks.md。`,
+              `${planModeLead}如果这是复杂实现请求，请先收集只读证据，再输出精简可见的 \`<proposed_plan>\` 或 Codex-style Proposal 供审批；MAIN 会把它物化为 \`.MAIN/plans/plan.md\`。遇到调试日志、截图、反复失败或跨模块修复时，可以同时保留简短 staged ledger：\`requirements.md\` 写用户目标/验收，\`design.md\` 写证据归因/取舍。等待用户批准后再改源码；批准前不要生成 tasks.md。`,
               "创建 plan.md 是 runtime 自动物化步骤，不是用户需要选择的下一步，也不是模型必须在审批前强制通过 write_file 完成的动作。",
               "可见计划必须对齐 Codex app 的交接计划结构：标题、摘要、关键实现改动、公共 API/接口/类型、测试方案、假设与默认值。",
               "如果只是讨论式方案，请保持简洁，并在真实分叉点用可点击选项让用户选择。",
@@ -7702,14 +7702,14 @@ export const useAppStore = create<AppState>()(
           ? [
               "Continue the previous PLAN turn. The user is asking to keep going, not to start a new discussion.",
               originalPlanPrompt ? `Original plan request: ${originalPlanPrompt}` : "Original plan request: use the current conversation context.",
-              "Produce real planning progress now. If key choices remain, summarize them briefly and use <user_options>; otherwise output a concise visible `<proposed_plan>` or Proposal. MAIN will materialize `.MAIN/plans/plan.md`. Do not create requirements.md unless a requirement ledger is explicitly needed.",
+              "Produce real planning progress now. If key choices remain, summarize them briefly and use <user_options>; otherwise output a concise visible `<proposed_plan>` or Proposal. MAIN will materialize `.MAIN/plans/plan.md`. Use requirements/design only as a short staged ledger for complex evidence tracking.",
               "Keep any plan Markdown concise: review-summary style, no tutorial prose, no full code listings, no repeated background.",
               text.trim() ? `Latest user message: ${text.trim()}` : "Latest user message: continue",
             ].join("\n")
           : [
               "请继续上一轮 PLAN 回合。用户是在要求继续推进，不是开启新的普通讨论。",
               originalPlanPrompt ? `上一轮计划请求：${originalPlanPrompt}` : "上一轮计划请求：请依据当前对话上下文继续。",
-              "现在必须产生实际规划进展。如果仍有关键选择需要用户确认，就先简短归纳并用面向用户的口吻给出 <user_options>；否则输出精简可见的 `<proposed_plan>` 或 Proposal。MAIN 会物化 `.MAIN/plans/plan.md`。除非明确需要需求台账，否则不要生成 requirements.md。",
+              "现在必须产生实际规划进展。如果仍有关键选择需要用户确认，就先简短归纳并用面向用户的口吻给出 <user_options>；否则输出精简可见的 `<proposed_plan>` 或 Proposal。MAIN 会物化 `.MAIN/plans/plan.md`。requirements/design 只作为复杂证据追踪的简短 staged ledger。",
               "每个 <option> 必须是用户点击后会发送的完整选择，不要写成“是否……”问题句。",
               "所有计划 Markdown 都要精简成 Codex app 交接计划风格：标题、摘要、关键实现改动、公共 API/接口/类型、测试方案、假设与默认值；不要写教程式长文、完整代码清单或重复背景。",
               text.trim() ? `用户最新消息：${text.trim()}` : "用户最新消息：继续",
@@ -10592,7 +10592,7 @@ export const useAppStore = create<AppState>()(
           const label = reason === "reactive"
             ? `上下文溢出，已压缩背景，约 ${before.toLocaleString()} → ${after.toLocaleString()} tokens（释放 ${saved.toLocaleString()}）`
             : droppedMessageCount === 0 && microCompactedCount > 0
-              ? `长工具结果已摘要化，约 ${before.toLocaleString()} → ${after.toLocaleString()} tokens（释放 ${saved.toLocaleString()}，保留路径、窗口和证据片段${topSourceSuffix}）`
+              ? `上下文已整理，约 ${before.toLocaleString()} → ${after.toLocaleString()} tokens（释放 ${saved.toLocaleString()}，保留路径、窗口和证据摘要${topSourceSuffix}）`
               : `历史上下文已压缩，约 ${before.toLocaleString()} → ${after.toLocaleString()} tokens（释放 ${saved.toLocaleString()}，保留任务记忆）`;
           logStoreEvent("context_compressed", {
             turnId,

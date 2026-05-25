@@ -42,8 +42,8 @@ import { hasStructuredPlanProposal } from "./planProposal";
 import {
   buildReadOnlyPermissionContinuationPrompt,
   hasExecutableProposalReplyOptions,
+  hasOnlyNonBlockingPlanReplyOptions,
   hasOnlyReadOnlyPermissionReplyOptions,
-  hasOnlyPlanContinuationReplyOptions,
   serializeAssistantReplyForHistory,
   shouldAutoContinueReadOnlyPermission as shouldAutoContinueReadOnlyPermissionState,
   shouldPauseForReplyOptions,
@@ -166,8 +166,11 @@ import {
 } from "./planExecutionRecovery";
 import {
   describeApprovedPlanRecoveryToolSurface,
+  describeApprovedPlanSourceEditFirstToolSurface,
   isApprovedPlanCachedReadOnlyNoProgressBatch,
   isApprovedPlanRecoveryToolName,
+  isApprovedPlanSourceEditFirstToolName,
+  shouldBypassApprovedPlanReadCacheForPatchRecovery,
   shouldAllowApprovedPlanRecoveryFileRead,
 } from "./approvedPlanRecoveryTools";
 import {
@@ -309,7 +312,7 @@ export function buildPlanReadOnlyConvergencePrompt(
   const hasProvidedContext = hasTurnProvidedContext(context);
   if (language === "en") {
     return [
-      "PLAN_READONLY_CONVERGENCE: You have gathered enough read-only context for this planning turn.",
+      "PLAN_READONLY_CONVERGENCE: The broad discovery budget for this planning turn has been reached, or enough targeted evidence is already available.",
       `Read-only exploration so far: ${batchCount} batch(es), ${toolCount} tool result(s).`,
       hasProvidedContext
         ? `User-provided context exists: ${context.imageParts} image(s), ${context.mentionedFilePaths.length} @ file(s), ${context.attachedFilePaths.length} attachment(s). Treat it as primary evidence.`
@@ -320,7 +323,7 @@ export function buildPlanReadOnlyConvergencePrompt(
       context.mentionedFilePaths.length > 0 || context.attachedFilePaths.length > 0
         ? "Before any broad discovery, use the exact @ file or attachment paths as primary evidence and name what those files already show."
         : "",
-      "Stop broad rereading now. If the evidence is decision-complete, output a concise visible `<proposed_plan>` block or Codex-style Proposal; MAIN will materialize it into `.MAIN/plans/plan.md` for review.",
+      "Stop broad rereading now. If targeted source/data evidence is still missing, call exactly one specific read/search tool for the missing file, symbol, or dataset, then stop. If the evidence is decision-complete, output a concise visible `<proposed_plan>` block or Codex-style Proposal; MAIN will materialize it into `.MAIN/plans/plan.md` for review.",
       "The draft must include: confirmed findings, unverified hypotheses, evidence already read, tradeoffs, affected files, implementation steps, and validation.",
       "Only use `<user_options>` if there is a real product/design decision the user must make before a plan can be written. Do not offer options that merely ask to continue reading, checking, analyzing, or verifying.",
       "If a blocker remains, name the blocker and the single missing fact needed; do not continue broad file exploration.",
@@ -328,7 +331,7 @@ export function buildPlanReadOnlyConvergencePrompt(
     ].filter(Boolean).join("\n");
   }
   return [
-    "PLAN_READONLY_CONVERGENCE: 当前规划回合已经收集了足够的只读上下文。",
+    "PLAN_READONLY_CONVERGENCE: 当前规划回合已经达到宽泛发现预算，或已经具备足够的定向证据。",
     `只读探索累计：${batchCount} 批，${toolCount} 个工具结果。`,
     hasProvidedContext
       ? `用户已提供上下文：${context.imageParts} 张图片、${context.mentionedFilePaths.length} 个 @ 文件、${context.attachedFilePaths.length} 个附件。必须把这些作为优先证据。`
@@ -339,7 +342,7 @@ export function buildPlanReadOnlyConvergencePrompt(
     context.mentionedFilePaths.length > 0 || context.attachedFilePaths.length > 0
       ? "在继续大范围发现前，必须优先使用 @ 文件或附件的精确路径作为主要证据，并说明这些文件已经证明了什么。"
       : "",
-    "下一步不要继续泛读文件。如果证据已经足够，请直接输出精简可见的 `<proposed_plan>` 或 Codex-style Proposal；MAIN 会把它物化为 `.MAIN/plans/plan.md` 供审批。",
+    "下一步不要继续泛读文件。如果还缺源码/数据定向证据，只能围绕缺失的文件、符号或数据集调用一次具体读取/搜索工具，然后停止；如果证据已经足够，请直接输出精简可见的 `<proposed_plan>` 或 Codex-style Proposal；MAIN 会把它物化为 `.MAIN/plans/plan.md` 供审批。",
     "草案必须包含：已确认发现、未验证假设、已读证据、方案取舍、影响文件、实施步骤和验证方式。",
     "只有存在真实产品/设计分叉、必须由用户决定后才能写计划时，才允许使用 `<user_options>`；不要给出只是继续读取、检查、分析或验证的选项。",
     "如果仍有阻塞，只说明阻塞点和唯一缺失事实；不要继续大范围探索。",
@@ -1464,6 +1467,49 @@ function isApprovedPlanRecoveryTool(
   return isApprovedPlanRecoveryToolName(name, PLAN_EXPLORATION_READ_ONLY_TOOLS, options);
 }
 
+function isApprovedPlanSourceEditFirstTool(
+  tool: ToolDefinition,
+  options: { allowFileRead?: boolean } = {},
+): boolean {
+  return isApprovedPlanSourceEditFirstToolName(tool.function.name, options);
+}
+
+function isSourceFileEvidencePath(value: string): boolean {
+  const normalized = String(value || "").replace(/\\/g, "/").trim();
+  return /^(?:src|app|lib|components|hooks|store|styles|utils|pages|server|client|packages|apps)\//i.test(normalized) &&
+    /\.(?:tsx?|jsx?|css|scss|json|py|rs|go|swift|vue|svelte)$/i.test(normalized) &&
+    !/\.MAIN\/plans\//i.test(normalized);
+}
+
+function approvedPlanNeedsSourceEditBeforeValidation(
+  tasks: PlanTask[],
+  evidenceLedger: PlanExecutionEvidenceEntry[],
+): boolean {
+  if (!Array.isArray(tasks) || tasks.length === 0) return false;
+  const hasSourceWriteEvidence = (evidenceLedger || []).some((entry) =>
+    entry.kind === "file" &&
+    /^(?:apply_patch|replace_in_file|write_file)$/.test(entry.sourceTool || "") &&
+    isSourceFileEvidencePath(entry.value || entry.target || "")
+  );
+  if (hasSourceWriteEvidence) return false;
+
+  const audit = buildPlanTaskEvidenceAudit({
+    tasks,
+    evidenceLedger,
+    preserveMissing: true,
+    highlightNext: true,
+  });
+  return audit.remainingTasks.some((task) => {
+    const evidencePaths = (task.evidence || [])
+      .filter((item) => item.kind === "file")
+      .map((item) => item.value);
+    const text = task.text || "";
+    return evidencePaths.some(isSourceFileEvidencePath) ||
+      /(?:修改|更新|新增|修复|重写|实现|调整|接入|补齐|edit|modify|update|add|fix|rewrite|implement|patch)\b/i.test(text) &&
+        /(?:src|app|lib|components|hooks|store|styles|utils|pages|server|client|packages|apps)\//i.test(text);
+  });
+}
+
 function looksLikeProseCodeDump(text: string): boolean {
   const content = text.trim();
   if (content.length < PROSE_CODE_DUMP_MIN_CHARS) return false;
@@ -2111,6 +2157,21 @@ function buildApprovedPlanNoProgressStrategySwitchPrompt(input: {
   ].filter(Boolean).join("\n");
 }
 
+function buildApprovedPlanSourceEditFirstPrompt(language: "zh" | "en"): string {
+  if (language === "en") {
+    return [
+      "Approved execution must start with real project action, not another exploration loop.",
+      "If the approved plan includes a source-file edit, the next tool call should be `apply_patch`, `replace_in_file`, or `write_file` against the named source file.",
+      "Do not read `.MAIN/plans/plan.md` again, and do not use `run_command`/`cat`/`head`/`grep`/`rg` to page source files before the first project write. Validation commands are for after the write.",
+    ].join("\n");
+  }
+  return [
+    "批准后的执行必须从真实项目动作开始，不能再次进入探索循环。",
+    "如果已批准计划包含源码修改，下一次工具调用应直接对命名源码文件使用 `apply_patch`、`replace_in_file` 或 `write_file`。",
+    "不要再次读取 `.MAIN/plans/plan.md`，也不要在第一次项目写入前用 `run_command`/`cat`/`head`/`grep`/`rg` 分页读取源码；验证命令应在写入之后再运行。",
+  ].join("\n");
+}
+
 function formatPlanAuditRemainingTasks(
   audit: PlanTaskEvidenceAudit,
   language: "zh" | "en",
@@ -2347,6 +2408,12 @@ function stripControlPromptForPlanFallback(text: string): string {
     .trim();
 }
 
+function isPlanRuntimeInstructionMemory(text: string): boolean {
+  return /(?:本轮处于\s*PLAN\s*模式|This turn is in PLAN mode|上一条\s*Plan\s*回复|previous Plan reply|PLAN_REPEAT_READ_LIMIT|PLAN_QUALITY_GATE|如果确实缺少关键业务选择|critical business choice|真正阻塞执行的选择|plan direction is unclear|用\s*`?\s*<?user_options>?\s*`?\s*提问|ask with\s*`?\s*<?user_options>?|可见计划必须|visible\s+`?<proposed_plan>`|创建\s*plan\.md\s*是\s*runtime|MAIN\s+runtime\s+会物化|物化为\s*`?\.MAIN\/plans\/plan\.md|Codex app\s*计划结构|Codex app plan shape|tsx\s*约束|imageParts\s*[0-9]|turn_intake|不要重复扫描目录|Do not repeat directory scans|不要为了完成规划而调用|Do not call\s+`?(?:write_file|replace_in_file)`?\s+just to finish planning)/i.test(
+    String(text || "").replace(/\\/g, "/"),
+  );
+}
+
 function isPlanControlUserPrompt(text: string): boolean {
   return /^(?:上一条规划内容过长|当前规划还没有进入可执行阶段|计划已批准|请继续上一轮 PLAN|The previous planning reply was too long|The current plan has not reached|The plan is approved|Continue the previous PLAN turn)/i.test(
     String(text || "").trim(),
@@ -2429,7 +2496,7 @@ function collectContextMemoryTexts(
   const seen = new Set<string>();
   for (const entry of entries || []) {
     const text = stripControlPromptForPlanFallback(entry?.text || "");
-    if (!text) continue;
+    if (!text || isPlanRuntimeInstructionMemory(text)) continue;
     const key = text.toLowerCase().replace(/\s+/g, " ");
     if (seen.has(key)) continue;
     seen.add(key);
@@ -2914,6 +2981,7 @@ function buildApprovedPlanContinuationPrompt(callbacks: OrchestratorCallbacks): 
   const approvalChoiceHint = buildPlanApprovalChoiceHint(callbacks.getPlanApprovalChoice(), language);
   const requestedDocs = detectRequestedRootMarkdownDeliverables(getOriginalUserPromptForPlanFallback(callbacks));
   const runtimeTaskList = formatPlanTasksForContinuationPrompt(callbacks.getPlanTasks(), language);
+  const sourceEditFirstPrompt = buildApprovedPlanSourceEditFirstPrompt(language);
   const deliverableHint = requestedDocs.length > 0
     ? language === "zh"
       ? `6. 用户明确要求最终文档：${requestedDocs.map((name) => `项目根目录 \`${name}\``).join("、")}。必须把它写进当前任务清单；如果持久化 tasks.md，也作为最后交付步骤，并在计划完成前真实写入。\n`
@@ -2931,6 +2999,8 @@ function buildApprovedPlanContinuationPrompt(callbacks: OrchestratorCallbacks): 
       : "The plan is approved. You are now in EXECUTION MODE. First derive a concise runtime task list from the approved plan.md; generate `.MAIN/plans/tasks.md` only when the work is long, cross-session, or explicitly needs an audit file. Do not read tasks.md just to check whether it exists. Then execute the tasks one by one using tool calls. Rendered-page validation requires Browser/Playwright DOM or screenshot evidence; if Tauri or manual validation cannot be automated, pause and report pending user validation. You may now edit project source files, but write them to the proper project paths and never into `.MAIN/plans/` or hidden folders. Only stop when every task has satisfied real file/command/deliverable/browser evidence, or remaining items are explicitly pending user validation.\n") +
     deliverableHint +
     (runtimeTaskList ? "\n" + runtimeTaskList + "\n" : "") +
+    "\n" +
+    sourceEditFirstPrompt +
     "\n" +
     buildPlanCommandExecutionHint(callbacks.getPlanTasks(), language)
   );
@@ -5616,7 +5686,7 @@ export async function executeAgentLoop(
   let lastNoProgressBatchSignature = "";
   let noProgressBatchRepeatCount = 0;
   let approvedPlanNoProgressRecoveryAttempts = 0;
-  let approvedPlanActionOnlyRecoveryActive = false;
+  let approvedPlanActionOnlyRecoveryActive = workflowMode === "plan" && callbacks.getIsPlanApproved();
   let executeRecoveryMode: ExecuteRecoveryMode =
     workflowMode === "edit"
       ? normalizeExecuteRecoveryMode(callbacks.getForcedExecuteRecoveryMode?.())
@@ -5707,6 +5777,7 @@ export async function executeAgentLoop(
   const targetProgressGuardRecoveredSignatures = new Set<string>();
   const failedToolCallCounts = new Map<string, number>();
   const readOnlyResultCache = new Map<string, CachedReadOnlyToolResult>();
+  const approvedPlanBrowserValidationCache = new Map<string, ToolExecutionResult>();
   const readOnlyDuplicateSkipCounts = new Map<string, number>();
   const fileReadStates = getSessionFileReadStates(callbacks.getSessionKey());
 
@@ -5772,6 +5843,8 @@ export async function executeAgentLoop(
     }
 
     callbacks.onPlanStageChanged("executing");
+    approvedPlanActionOnlyRecoveryActive = true;
+    approvedPlanNoProgressRecoveryAttempts = 0;
     const continuationPrompt = buildApprovedPlanContinuationPrompt(callbacks);
     if (callbacks.onApprovedPlanHandoff) {
       callbacks.onApprovedPlanHandoff(continuationPrompt);
@@ -6194,14 +6267,37 @@ export async function executeAgentLoop(
         removedToolCount: Math.max(0, rawIterationAllTools.length - recoveryIterationAllTools.length),
       });
     }
-    const baseIterationAllTools =
-      approvedPlanActionOnlyRecoveryActive &&
+    const approvedPlanSourceEditFirstActive =
       workflowMode === "plan" &&
-      callbacks.getIsPlanApproved()
+      callbacks.getIsPlanApproved() &&
+      approvedPlanNeedsSourceEditBeforeValidation(
+        callbacks.getPlanTasks(),
+        callbacks.getPlanExecutionEvidenceLedger(),
+      );
+    const baseIterationAllTools =
+      approvedPlanSourceEditFirstActive
+        ? recoveryIterationAllTools.filter((tool) => isApprovedPlanSourceEditFirstTool(tool, {
+            allowFileRead: allowApprovedPlanRecoveryFileRead,
+          }))
+        : approvedPlanActionOnlyRecoveryActive &&
+          workflowMode === "plan" &&
+          callbacks.getIsPlanApproved()
         ? recoveryIterationAllTools.filter((tool) => isApprovedPlanRecoveryTool(tool, {
             allowFileRead: allowApprovedPlanRecoveryFileRead,
           }))
         : recoveryIterationAllTools;
+    if (approvedPlanSourceEditFirstActive && baseIterationAllTools.length !== recoveryIterationAllTools.length) {
+      logAgentEvent("approved_plan_source_edit_first_tool_scope_applied", {
+        iteration,
+        allowFileRead: allowApprovedPlanRecoveryFileRead,
+        recoveryToolSurface: describeApprovedPlanSourceEditFirstToolSurface(allowApprovedPlanRecoveryFileRead),
+        rawTools: recoveryIterationAllTools.map((tool) => tool.function.name).slice(0, 24),
+        scopedTools: baseIterationAllTools.map((tool) => tool.function.name),
+        removedToolCount: Math.max(0, recoveryIterationAllTools.length - baseIterationAllTools.length),
+        taskCount: callbacks.getPlanTasks().length,
+        evidenceCount: callbacks.getPlanExecutionEvidenceLedger().length,
+      });
+    }
     const phaseScopedIterationAllTools = filterPlanRuntimeToolDefinitionsForPhase({
       tools: baseIterationAllTools,
       workflowMode,
@@ -7373,7 +7469,7 @@ export async function executeAgentLoop(
       effectiveToolCalls.length === 0 &&
       workflowMode === "plan" &&
       !callbacks.getIsPlanApproved() &&
-      hasOnlyPlanContinuationReplyOptions(normalized.replyOptions);
+      hasOnlyNonBlockingPlanReplyOptions(normalized.replyOptions);
     const suppressExecutableProposalOptionsForToolCalls =
       effectiveToolCalls.length > 0 &&
       workflowMode === "plan" &&
@@ -7674,9 +7770,13 @@ export async function executeAgentLoop(
       approvedPlanMissingTasksForNoTool || hasRemainingApprovedPlanTasksForNoTool;
     const rejectedCompletionClaim =
       shouldSuppressApprovedPlanNoToolText && looksLikePlanCompletionClaim(userVisibleText);
+    const shouldHideApprovedPlanNoToolText =
+      shouldSuppressApprovedPlanNoToolText && rejectedCompletionClaim;
 
     if (shouldSuppressApprovedPlanNoToolText && (userVisibleText.trim() || finalReplyOptions.length > 0)) {
-      callbacks.onStreamToken("__ESCALATION_RESET__:", assistantMsgId);
+      if (shouldHideApprovedPlanNoToolText) {
+        callbacks.onStreamToken("__ESCALATION_RESET__:", assistantMsgId);
+      }
       logAgentEvent(rejectedCompletionClaim ? "plan_completion_claim_rejected" : "plan_no_tool_text_suppressed", {
         iteration,
         completionClaimRejected: rejectedCompletionClaim,
@@ -7684,6 +7784,7 @@ export async function executeAgentLoop(
         auditTotal: approvedPlanAuditForNoTool?.totalCount ?? 0,
         remaining: approvedPlanAuditForNoTool?.remainingTasks.length ?? 0,
         visibleChars: userVisibleText.length,
+        preservedVisibleText: !shouldHideApprovedPlanNoToolText,
       });
     }
 
@@ -7819,7 +7920,35 @@ export async function executeAgentLoop(
       lastAssistantTextForCheckpoint = historyAssistantText;
     }
 
-    if (!shouldSuppressApprovedPlanNoToolText) {
+    const autoContinueNonBlockingPlanChoices =
+      suppressPlanContinuationReplyOptions &&
+      effectiveToolCalls.length === 0 &&
+      workflowMode === "plan" &&
+      !callbacks.getIsPlanApproved();
+    if (autoContinueNonBlockingPlanChoices) {
+      logAgentEvent("plan_non_blocking_choice_auto_continue", {
+        iteration,
+        replyOptions: normalized.replyOptions.length,
+        optionPreview: summarizeReplyOptionsForLog(normalized.replyOptions),
+        visibleChars: normalized.visibleText.length,
+        workflowMode,
+        turnIntent,
+      });
+      const nonBlockingHistoryText = serializeAssistantReplyForHistory(historyAssistantText, []);
+      if (nonBlockingHistoryText.trim()) {
+        callbacks.appendMessage(buildAssistantHistoryMessage(nonBlockingHistoryText, providerReasoningForHistory));
+      }
+      callbacks.onStatusChange("running");
+      callbacks.appendMessage({
+        role: "user",
+        content: callbacks.getPreferredLanguage() === "zh"
+          ? "MAIN 已将刚才的非阻塞计划选项视为继续规划许可：不要再询问是否开始探索或是否提供路径；请立即调用一个最具体的只读工具读取/搜索缺失证据。如果证据已经足够，直接输出可见 `<proposed_plan>`。"
+          : "MAIN treated the previous non-blocking plan options as permission to continue planning: do not ask whether to start exploration or provide paths again; immediately call one specific read/search tool for the missing evidence. If evidence is sufficient, output a visible `<proposed_plan>`.",
+      });
+      continue;
+    }
+
+    if (!shouldHideApprovedPlanNoToolText) {
       callbacks.onTurnSummaryReady(visibleAssistantText);
     }
 
@@ -7837,12 +7966,12 @@ export async function executeAgentLoop(
       callbacks.getIsPlanApproved() &&
       !runtimeNarrationInjected &&
       visibleAssistantText.trim().length > 0;
-    if (!shouldSuppressApprovedPlanNoToolText && (visibleAssistantText || finalReplyOptions.length > 0)) {
+    if (!shouldHideApprovedPlanNoToolText && (visibleAssistantText || finalReplyOptions.length > 0)) {
       callbacks.onAssistantFinalText(visibleAssistantText, finalReplyOptions, {
         hasToolCalls: effectiveToolCalls.length > 0,
         visibility: hasSubstantivePlanAssistantText
           ? "substantive_plan_text"
-          : shouldRenderToolProgress ? "user_progress" : undefined,
+          : shouldRenderToolProgress || shouldSuppressApprovedPlanNoToolText ? "user_progress" : undefined,
         preserveAssistantText: shouldPreserveApprovedExecutionText,
         progress: shouldRenderToolProgress
           ? toolActionNarration || undefined
@@ -9174,6 +9303,39 @@ export async function executeAgentLoop(
         continue;
       }
 
+      if (
+        workflowMode === "plan" &&
+        callbacks.getIsPlanApproved() &&
+        approvedPlanActionOnlyRecoveryActive &&
+        isReadOnlyShellInspectionToolCall(tc.name, toolArgs)
+      ) {
+        const message = callbacks.getPreferredLanguage() === "zh"
+          ? [
+              "APPROVED_PLAN_SHELL_READ_BLOCKED: 已批准计划的执行阶段不能在首次项目写入前用 shell 分页读取源码。",
+              "请复用已批准 plan.md 和已确认的源码证据，直接使用 `apply_patch`、`replace_in_file` 或 `write_file` 修改目标源码文件；写入后再运行验证命令。",
+            ].join("\n")
+          : [
+              "APPROVED_PLAN_SHELL_READ_BLOCKED: approved plan execution must not page source files through shell before the first project write.",
+              "Reuse the approved plan and confirmed source evidence, then call `apply_patch`, `replace_in_file`, or `write_file` against the target source file. Run validation commands after the write.",
+            ].join("\n");
+        callbacks.onToolError(tc.name, target, message, { toolCallId: tc.id });
+        logAgentEvent("approved_plan_shell_read_blocked", {
+          iteration,
+          tool: tc.name,
+          target,
+          actionOnly: approvedPlanActionOnlyRecoveryActive,
+        });
+        allResults.push({
+          toolCallId: tc.id,
+          name: tc.name,
+          target,
+          content: `Error: ${message}`,
+          isError: true,
+          lifecycleState: "blocked",
+        });
+        continue;
+      }
+
       const approvedLocalFileReadPaths = callbacks.getApprovedLocalFileReadPaths();
       const effectiveAvailableToolNames = isAllowedPlanDraftMutation
         ? new Set([...availableToolNames, tc.name])
@@ -9227,8 +9389,27 @@ export async function executeAgentLoop(
             ? buildFileReadSignature(fileReadMetadata?.path ?? toolArgs.path, effectiveToolArgs)
             : "";
         let fileReadState = fileReadSignature ? fileReadStates.get(fileReadSignature) : undefined;
+        const bypassApprovedPlanPatchRecoveryReadCache =
+          workflowMode === "plan" &&
+          callbacks.getIsPlanApproved() &&
+          runtimeIntent === "execute" &&
+          shouldBypassApprovedPlanReadCacheForPatchRecovery({
+            toolName: tc.name,
+            allowFileRead: allowApprovedPlanRecoveryFileRead,
+          });
+        if (bypassApprovedPlanPatchRecoveryReadCache) {
+          logAgentEvent("approved_plan_patch_recovery_read_cache_bypass", {
+            iteration,
+            target,
+            recentActivity: recentPlanToolActivity.slice(-4).map((activity) => ({
+              name: activity.name,
+              target: activity.target,
+              status: activity.status,
+            })),
+          });
+        }
 
-        if (fileReadState) {
+        if (fileReadState && !bypassApprovedPlanPatchRecoveryReadCache) {
           const metadata = fileReadMetadata ?? await readFileMetadataIfAvailable(fileReadState.path, workspace);
           const unchanged =
             metadata != null &&
@@ -9286,7 +9467,12 @@ export async function executeAgentLoop(
           }
         }
 
-        if (tc.name === "read_file" && typeof toolArgs.path === "string" && fileReadMetadata) {
+        if (
+          tc.name === "read_file" &&
+          typeof toolArgs.path === "string" &&
+          fileReadMetadata &&
+          !bypassApprovedPlanPatchRecoveryReadCache
+        ) {
           const coverage = getReadFileCoverageForPath({
             states: fileReadStates,
             path: toolArgs.path,
@@ -9353,7 +9539,7 @@ export async function executeAgentLoop(
           }
         }
 
-        if (cached || queuedReadOnlySignatures.has(signature)) {
+        if (!bypassApprovedPlanPatchRecoveryReadCache && (cached || queuedReadOnlySignatures.has(signature))) {
           const duplicateCount = (readOnlyDuplicateSkipCounts.get(signature) ?? 0) + 1;
           readOnlyDuplicateSkipCounts.set(signature, duplicateCount);
           const planBudget = buildPlanExplorationBudget({
@@ -9429,6 +9615,36 @@ export async function executeAgentLoop(
           lifecycleState: "blocked",
         });
       } else {
+        const reviewSignature = buildRepeatLoopSignature(tc.name, buildRepeatLoopArgsKey(toolArgs));
+        const cachedBrowserValidation =
+          workflowMode === "plan" &&
+          callbacks.getIsPlanApproved() &&
+          runtimeIntent === "execute" &&
+          tc.name === "browser_evaluate"
+            ? approvedPlanBrowserValidationCache.get(reviewSignature)
+            : undefined;
+        if (cachedBrowserValidation) {
+          logAgentEvent("approved_plan_browser_validation_reused", {
+            iteration,
+            target,
+            signature: truncateForLog(reviewSignature, 180),
+          });
+          allResults.push({
+            toolCallId: tc.id,
+            name: tc.name,
+            target,
+            content: [
+              `REUSED_BROWSER_VALIDATION: identical browser_evaluate for ${target || "the same target"} already succeeded in this execution turn.`,
+              "Reuse the previous browser/DOM result and continue with the next unverified task or final summary.",
+              "",
+              truncateToolContent(cachedBrowserValidation.content || cachedBrowserValidation.displayContent || "", 4000),
+            ].filter(Boolean).join("\n"),
+            displayContent: `REUSED_BROWSER_VALIDATION: ${target || cachedBrowserValidation.target || "browser_evaluate"}`,
+            isError: false,
+            lifecycleState: "completed",
+          });
+          continue;
+        }
         writeCalls.push({ id: tc.id, name: tc.name, arguments: tc.arguments });
       }
     }
@@ -9551,6 +9767,11 @@ export async function executeAgentLoop(
         },
       );
       allResults.push(result);
+      if (tc.name === "browser_evaluate" && !result.isError) {
+        const toolArgs = parseToolCallArguments(tc, workspace);
+        const signature = buildRepeatLoopSignature(tc.name, buildRepeatLoopArgsKey(toolArgs));
+        approvedPlanBrowserValidationCache.set(signature, result);
+      }
 
       // Check if the loop was aborted during user review
       if (abortController.signal.aborted) {
@@ -10194,7 +10415,13 @@ export async function executeAgentLoop(
 
     if (shouldConvergeUnapprovedPlanReadOnly) {
       const language = callbacks.getPreferredLanguage();
-      setPlanRuntimePhase("synthesis", "targeted evidence ready");
+      const convergencePhase = planEvidenceReadinessForConvergence.status === "needs_targeted_read"
+        ? "needs_evidence"
+        : "synthesis";
+      const convergenceReason = planEvidenceReadinessForConvergence.status === "needs_targeted_read"
+        ? planEvidenceReadinessForConvergence.reason
+        : "targeted evidence ready";
+      setPlanRuntimePhase(convergencePhase, convergenceReason);
       logAgentEvent("plan_readonly_convergence_threshold", {
         iteration,
         batches: planReadOnlyConvergenceBatches,
@@ -10210,7 +10437,10 @@ export async function executeAgentLoop(
       });
       if (!usedPlanReadOnlyConvergencePrompt) {
         usedPlanReadOnlyConvergencePrompt = true;
-        setPlanRuntimePhase("drafting", "targeted evidence ready");
+        setPlanRuntimePhase(
+          planEvidenceReadinessForConvergence.status === "needs_targeted_read" ? "needs_evidence" : "drafting",
+          convergenceReason,
+        );
         callbacks.appendMessage({
           role: "user",
           content: buildPlanReadOnlyConvergencePrompt(
@@ -10300,6 +10530,56 @@ export async function executeAgentLoop(
         });
         recoveredReadOnlyRepeat = true;
         break;
+      }
+
+      if (workflowMode === "plan" && callbacks.getIsPlanApproved() && tc.name === "browser_evaluate") {
+        const recoveryMessage = formatRepeatLoopRecoveryMessage(tc.name, target, repeatCheck.threshold);
+        if (!repeatGuardRecoveredSignatures.has(repeatCheck.signature)) {
+          repeatGuardRecoveredSignatures.add(repeatCheck.signature);
+          recentToolCalls.length = 0;
+          callbacks.onToolError(tc.name, target, recoveryMessage, { toolCallId: tc.id });
+          callbacks.appendMessage({
+            role: "system",
+            content: `[System: ${recoveryMessage}]`,
+          });
+          recoveredReadOnlyRepeat = true;
+          break;
+        }
+
+        const language = callbacks.getPreferredLanguage();
+        const repeatedTargets = target ? [target] : summarizeRepeatedPlanTargetsFromToolActivity(recentPlanToolActivity);
+        const progressSignature = buildPlanProgressSignatureFromToolActivity(recentPlanToolActivity);
+        const notice = language === "zh"
+          ? [
+              "执行已暂停：浏览器验证重复调用同一目标，没有产生新的执行证据。",
+              `重复目标：${repeatedTargets.join("、") || "未定位到单一目标"}`,
+              "MAIN 已保留最近一次 Browser/Playwright 结果；继续时请复用已有验证，改为下一个任务、命令验证、源码修正或最终总结。",
+            ].join("\n")
+          : [
+              "Execution paused: browser validation repeated the same target without new evidence.",
+              `Repeated target: ${repeatedTargets.join(", ") || "no single target identified"}`,
+              "MAIN kept the latest Browser/Playwright result; on resume, reuse it and move to the next task, command validation, source edit, or final summary.",
+            ].join("\n");
+        logAgentEvent("loop_stop", {
+          reason: "approved_plan_repeated_browser_validation",
+          iteration,
+          target,
+          progressSignature: truncateForLog(progressSignature, 220),
+        });
+        callbacks.onNonActionableStop(
+          notice,
+          "no_action",
+          {
+            progressSignature,
+            repeatedTargets,
+            recoveryReason: "approved_plan_repeated_browser_validation",
+            nextStep: language === "zh"
+              ? "复用已有浏览器结果，转向下一个任务、命令验证、源码修正或最终总结"
+              : "reuse the browser result and move to the next task, command validation, source edit, or final summary",
+          },
+        );
+        callbacks.onStatusChange("idle");
+        return;
       }
 
       const fatalMessage = formatRepeatLoopFatalMessage(tc.name, target, repeatCheck.threshold);

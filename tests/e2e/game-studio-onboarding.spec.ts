@@ -143,6 +143,8 @@ test("main focus picker uses clean selected and neutral item colors in light mod
 
   const selectedItem = page.getByTestId("main-focus-option-game_studio");
   const neutralItem = page.getByTestId("main-focus-option-main_mode");
+  await expect(neutralItem).toContainText("MAIN");
+  await expect(neutralItem).not.toContainText("MAIN 模式");
 
   const selectedBackground = await selectedItem.evaluate((node) => getComputedStyle(node).backgroundColor);
   const neutralTitleColor = await neutralItem.evaluate(

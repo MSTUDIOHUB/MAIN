@@ -26,12 +26,13 @@ const ACTIONABLE_OPTION_RE = /(?:^方案\s*[A-Z0-9一二三四五六七八九十
 const OPERATION_APPROVAL_REPLY_RE = /(?:批准|允许|同意).{0,16}(?:执行|操作|修改|修复|运行|写入)|(?:approve|allow).{0,24}(?:operation|execution|changes?|write|run)/i;
 const EXECUTABLE_PROPOSAL_CUE_RE = /(?:修复方案|实现方案|执行方案|改造方案|重构方案|落地方案|方案建议|建议方案|方案如下|执行步骤|实施步骤|下一步(?:可以|建议)?(?:执行|修复|修改|实现|落地)|是否(?:现在|立刻|开始|按上述方案)?(?:执行|修复|修改|实现|落地)|是否需要(?:我|MAIN)?(?:开始|继续)?(?:执行|修复|修改|实现)|要不要(?:开始|按方案)?(?:执行|修复|修改|实现)|proposed fix|fix plan|implementation plan|execution plan|proposal|next steps?.{0,24}(?:implement|execute|apply|fix|patch)|do you want me to.{0,24}(?:start|implement|execute|apply|fix|patch)|should I.{0,24}(?:start|implement|execute|apply|fix|patch)|ready to execute)/i;
 const OPERATION_CUE_RE = /(?:写入|修改|改动|更改|删除|创建|生成(?:文件|交付物)?|执行命令|运行命令|运行测试|部署|发布|提交|推送|Git|修复|实现|重构|落地|write|modify|edit|delete|create|generate|run command|execute command|run tests?|deploy|publish|commit|push|git|fix|implement|refactor|patch|ship)/i;
-const PLAN_CONTINUATION_ACTION_RE = /^(?:请)?(?:先|继续|直接|再|尝试|立刻|马上|现在)?(?:我来)?(?:确认|检查|分析|读取|查看|定位|排查|验证|核对|梳理|搜索|查询|浏览|测试|尝试(?:确认|检查|分析|读取|查看|定位|排查|验证|核对)|check|verify|confirm|inspect|analy[sz]e|read|look into|debug|investigate|validate|search|query|test)/i;
+const PLAN_CONTINUATION_ACTION_RE = /^(?:请)?(?:先|继续|直接|再|尝试|开始|立刻|马上|现在)?(?:我来)?(?:开始(?:探索|调查|搜索|读取|分析|检查)?|确认|检查|分析|读取|查看|定位|排查|验证|核对|梳理|搜索|查询|浏览|测试|探索|调查|尝试(?:确认|检查|分析|读取|查看|定位|排查|验证|核对|探索|调查)|check|verify|confirm|inspect|analy[sz]e|read|look into|debug|investigate|validate|search|query|test|explore)/i;
 const PLAN_CONTINUATION_TECH_TARGET_RE = /(?:是否|能否|能不能|有没有|是否能|是否可以|成功|正确|读取|存入|计算|渲染|解析|冲突|代码|源码|文件|接口|组件|函数|状态|数据|日志|表格|Store|store|CSV|csv|src[\/\\]|[A-Za-z0-9_.\-\/\\]+\.[A-Za-z0-9]{1,12}|\bstate\b|\bdata\b|\bfile\b|\bcomponent\b|\bfunction\b|\binterface\b|\blog\b|\bparse\b|\brender\b|\bload\b|\bstore\b)/i;
 const PLAN_CONTINUATION_DECISION_RE = /(?:方案|设计|需求|范围|风格|体验|取舍|批准|执行|修复|修改|实现|生成|创建|采用|选择|保留|跳过|提交|部署|开始执行|product|design|requirement|scope|tradeoff|approve|execute|implement|fix|modify|create|choose|adopt|deploy)/i;
-const PREMATURE_PLAN_ARTIFACT_TEXT_RE = /(?:#\s*Proposed Plan|Proposed Plan|核心问题诊断|根源分析|执行路线图|修复方案|实现方案|重构方案|拟定方案|实施步骤|执行步骤|阶段\s*\d|影响文件|验证方式|Data Integrity|Dark Mode Refactor|Implementation Plan|Execution Plan|Root Cause|Validation)/i;
+const OPTIONAL_PLAN_CONTEXT_OPTION_RE = /(?:提供|补充|告诉|输入|粘贴|发(?:给)?我|provide|share|tell|paste).{0,40}(?:关键)?(?:文件路径|路径|文件|组件名|组件|函数名|模块名|类名|symbol|path|file|component|function|module|class)/i;
+const PREMATURE_PLAN_ARTIFACT_TEXT_RE = /(?:#\s*Proposed Plan|Proposed Plan|核心问题诊断|根源分析|执行路线图|修复方案|实现方案|实施方案|重构方案|拟定方案|实施步骤|执行步骤|阶段\s*\d|影响文件|验证方式|Data Integrity|Dark Mode Refactor|Implementation Plan|Execution Plan|Root Cause|Validation)/i;
 const BLOCKING_PLAN_DECISION_TEXT_RE = /(?:真正阻塞|阻塞问题|必须(?:由)?用户(?:确认|选择|拍板)|需要用户(?:确认|选择|拍板)|缺少关键(?:业务|产品|设计|范围|验收)选择|请确认以下关键点|before (?:I|we) can (?:write|finalize|proceed)|blocking question|blocking decision|need you to choose|must choose)/i;
-const PLAN_ROUTE_OPTION_RE = /(?:^方案\s*[A-Z0-9一二三四五六七八九十]|^option\s*[A-Z0-9]|优先|同时|仅|只|先|直接|继续|开始|完整|最小|MVP|修复|修改|实现|重构|完善|执行|落地|proceed|continue|start|fix|modify|implement|refactor|execute|mvp)/i;
+const PLAN_ROUTE_OPTION_RE = /(?:^方案\s*[A-Z0-9一二三四五六七八九十]|^option\s*[A-Z0-9]|优先|同时|并行|全部|两个|两项|仅|只|先|直接|继续|开始|完整|最小|MVP|修复|修改|实现|重构|完善|执行|落地|proceed|continue|start|fix|modify|implement|refactor|execute|both|parallel|all|mvp)/i;
 
 function normalizeOptionText(text: string): string {
   return text.replace(/\s+/g, " ").trim();
@@ -471,11 +472,32 @@ function looksLikePlanContinuationReplyOption(option: ReplyOption): boolean {
   return true;
 }
 
+function looksLikeOptionalPlanContextReplyOption(option: ReplyOption): boolean {
+  const combined = normalizeOptionText(`${option.label || ""} ${option.value || ""}`);
+  if (!combined) return false;
+  if (!OPTIONAL_PLAN_CONTEXT_OPTION_RE.test(combined)) return false;
+  if (BLOCKING_PLAN_DECISION_TEXT_RE.test(combined)) return false;
+  if (OPERATION_CUE_RE.test(combined) && !READONLY_ACTION_RE.test(combined)) return false;
+  return true;
+}
+
 export function hasOnlyPlanContinuationReplyOptions(replyOptions: ReplyOption[]): boolean {
   return (
     Array.isArray(replyOptions) &&
     replyOptions.length > 0 &&
     replyOptions.every((option) => looksLikePlanContinuationReplyOption(option))
+  );
+}
+
+export function hasOnlyNonBlockingPlanReplyOptions(replyOptions: ReplyOption[]): boolean {
+  return (
+    Array.isArray(replyOptions) &&
+    replyOptions.length > 0 &&
+    replyOptions.every((option) =>
+      looksLikePlanContinuationReplyOption(option) ||
+      looksLikeOptionalPlanContextReplyOption(option)
+    ) &&
+    replyOptions.some((option) => looksLikePlanContinuationReplyOption(option))
   );
 }
 
@@ -633,7 +655,7 @@ export function shouldPauseForReplyOptions(params: {
     !hasStructuredProposal &&
     !hasReadyPlanArtifacts &&
     toolCallCount === 0 &&
-    hasOnlyPlanContinuationReplyOptions(replyOptions)
+    hasOnlyNonBlockingPlanReplyOptions(replyOptions)
   ) {
     return false;
   }

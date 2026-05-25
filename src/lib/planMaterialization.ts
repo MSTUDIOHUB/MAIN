@@ -65,8 +65,10 @@ const TOOL_LOG_NOISE_RE =
 const PLAN_ARTIFACT_PATH_RE = /(?:^|[\\/\s`"'(:=])\.?MAIN[\\/]plans[\\/]/i;
 const RAW_TOOL_RESULT_NOISE_RE =
   /\bREAD_FILE_RESULT\b|\bContextMemory(?:State)?\b|\bContextState\b|\breturnedLines\b|\btotalLines\b|\btotalChars\b|\bPLAN NOT READY\b|\bTASK_TARGETING_BLOCKED\b|\bstatus\s*[:=]\s*(?:failed|blocked|rejected)\b/i;
+const PLAN_PROMPT_INSTRUCTION_RE =
+  /(?:本轮处于\s*PLAN\s*模式|This turn is in PLAN mode|上一条\s*Plan\s*回复|previous Plan reply|PLAN_REPEAT_READ_LIMIT|PLAN_QUALITY_GATE|如果确实缺少关键业务选择|critical business choice|真正阻塞执行的选择|plan direction is unclear|用\s*`?\s*<?user_options>?\s*`?\s*提问|ask with\s*`?\s*<?user_options>?|可见计划必须|visible\s+`?<proposed_plan>`|创建\s*\/?更新?\s*(?:staged\s+ledger|requirements\.md|design\.md|tasks\.md)|创建\s*plan\.md\s*是\s*runtime|MAIN\s+runtime\s+会物化|物化为\s*`?\.MAIN\/plans\/plan\.md|Codex app\s*计划结构|Codex app plan shape|tsx\s*约束|imageParts\s*[0-9]|turn_intake|不要重复扫描目录|Do not repeat directory scans|不要为了完成规划而调用|Do not call\s+`?(?:write_file|replace_in_file)`?\s+just to finish planning)/i;
 const TOOL_META_FIELD_RE =
-  /\b(?:status|hash|exit|tool_call_id|toolCallId|returnedLines|totalLines|totalChars|truncated)\s*[:=]\s*[^;\n,}]+/gi;
+  /\b(?:status|hash|exit|tool_call_id|toolCallId|returnedLines|totalLines|totalChars|truncated)\s*[:=]\s*[^\s;\n,}]+/gi;
 const FORMAL_PLAN_OUTLINE_HEADING_RE =
   /^(?:正式计划|修复计划|根因分析|原因分析|问题\s*[0-9一二三四五六七八九十]+|可能根因|根因|原因|修复方案|实施方案|落地方案|影响文件|相关文件|验证方式|验证标准|测试方案|公共\s*API|接口|类型|假设与默认值|默认假设|未验证假设|风险|注意事项|摘要|总结|Formal Plan|Repair Plan|Root Cause|Likely Root Cause|Issue\s*\d+|Fix Plan|Implementation Plan|Affected Files|Validation|Test Plan|Assumptions|Defaults)(?:\s*[：:].*)?$/i;
 const SEMANTIC_EVIDENCE_TOOLS = new Set([
@@ -75,6 +77,7 @@ const SEMANTIC_EVIDENCE_TOOLS = new Set([
   "get_project_skeleton",
   "list_directory",
   "read_file",
+  "read_file_window",
   "read_document",
   "get_file_outline",
   "grep_search",
@@ -93,6 +96,7 @@ const TOOL_LABELS_ZH: Record<string, string> = {
   get_project_skeleton: "已查看项目结构",
   list_directory: "已查看目录",
   read_file: "已读取文件",
+  read_file_window: "已读取文件窗口",
   read_document: "已读取文档",
   get_file_outline: "已查看文件结构",
   grep_search: "已搜索文本",
@@ -106,6 +110,7 @@ const TOOL_LABELS_EN: Record<string, string> = {
   get_project_skeleton: "Inspected project structure",
   list_directory: "Listed directory",
   read_file: "Read file",
+  read_file_window: "Read file window",
   read_document: "Read document",
   get_file_outline: "Inspected file outline",
   grep_search: "Searched text",
@@ -116,11 +121,19 @@ const TOOL_LABELS_EN: Record<string, string> = {
 const BROAD_DISCOVERY_EVIDENCE_RE =
   /^(?:(?:glob_search|list_directory|get_project_skeleton|index_workspace_documents)\b|(?:已搜索文件|已查看目录|已查看项目结构|已索引工作区文档)(?:[:：\s]|$)|(?:Searched files|Listed directory|Inspected project structure|Indexed workspace documents)\b)/i;
 const CONCRETE_PLAN_EVIDENCE_RE =
-  /^(?:(?:read_file|read_document|get_file_outline|grep_search|analyze_tabular_document|query_tabular_document)\b|(?:已读取文件|已读取文档|已查看文件结构|已搜索文本|已分析表格数据|已查询表格数据)(?:[:：\s]|$)|(?:Read file|Read document|Inspected file outline|Searched text|Analyzed tabular data|Queried tabular data)\b)/i;
+  /^(?:(?:read_file|read_file_window|read_document|get_file_outline|grep_search|analyze_tabular_document|query_tabular_document)\b|(?:已读取文件|已读取文件窗口|已读取文档|已查看文件结构|已搜索文本|已分析表格数据|已查询表格数据)(?:[:：\s]|$)|(?:Read file|Read file window|Read document|Inspected file outline|Searched text|Analyzed tabular data|Queried tabular data)\b)/i;
 const CSV_DASHBOARD_GOAL_RE =
   /(?:CSV|导入|creator|course|课程|销售|排行|趋势|环比|订单|状态|Dashboard|面板|图表|指标|数据|field|column|chart|metric|order|status)/i;
 const DARK_THEME_GOAL_RE =
   /(?:深色|暗色|dark\s*mode|theme|主题|白色底|background|contrast|palette)/i;
+const BROAD_OR_NOISY_SEARCH_TARGET_RE =
+  /^(?:\.|\.\/|\/|\*+|\*\*\/\*\.[A-Za-z0-9_*{}.,-]+|\*\.[A-Za-z0-9_*{}.,-]+|get_project_skeleton|[\s.*{}()[\]|,+-]+)$/i;
+const TOOL_DETAIL_NON_EVIDENCE_RE =
+  /(?:package-lock\.json|package\.json|node_modules|dist\/|build\/|<title\b|index\.html:\d+:\s*<title)/i;
+const TOOL_DETAIL_HAS_SOURCE_SIGNAL_RE =
+  /\b(?:src|app|lib|components|hooks|store|styles|utils|tests|pages|server|client|packages|apps)\/[A-Za-z0-9_./@-]+|\b(?:function|const|let|class|interface|type|export|import|use[A-Z][A-Za-z0-9_]*|loadOrders|parse|map|chart|dashboard|theme|dark|CSV|字段|列|指标|订单|图表|状态|趋势|环比)\b/i;
+const PATH_ECHO_EVIDENCE_RE =
+  /(?:已读取文件|Read file)\s*[:：]\s*([A-Za-z0-9_@./-]+\.[A-Za-z0-9]+)(?:\s*[;；]\s*(?:发现|found)\s*[:：]\s*\1)?\s*$/i;
 
 function countPlanShapeSignals(content: string): number {
   const headingCount = (content.match(/^#{1,3}\s+\S+/gm) || []).length;
@@ -249,6 +262,10 @@ function isInternalPlanEvidenceText(value: unknown): boolean {
   return PLAN_EVIDENCE_REFERENCE_RE.test(String(value || "").replace(/\\/g, "/"));
 }
 
+function isPlanPromptInstructionText(value: unknown): boolean {
+  return PLAN_PROMPT_INSTRUCTION_RE.test(String(value || "").replace(/\\/g, "/"));
+}
+
 function isActionablePlanFile(value: unknown): boolean {
   const normalized = String(value || "").replace(/\\/g, "/").trim();
   if (!normalized || isPlanArtifactPath(normalized)) return false;
@@ -266,6 +283,24 @@ function isBroadDiscoveryEvidence(value: string): boolean {
 function isConcretePlanEvidence(value: string): boolean {
   const text = String(value || "").trim();
   return CONCRETE_PLAN_EVIDENCE_RE.test(text) && !isBroadDiscoveryEvidence(text);
+}
+
+function isPathEchoEvidence(value: string): boolean {
+  const text = String(value || "").replace(/`/g, "").trim();
+  const rawTool = text.match(/^(?:read_file|read_file_window|read_document|get_file_outline)\s+([A-Za-z0-9_@./-]+\.[A-Za-z0-9]+)(?:\s*;\s*excerpt\s*=\s*\1)?$/i);
+  if (rawTool) return true;
+  const localized = text.match(PATH_ECHO_EVIDENCE_RE);
+  if (localized) return true;
+  const excerptEcho = text.match(/^(?:已读取文件|Read file)\s*[:：]\s*([A-Za-z0-9_@./-]+\.[A-Za-z0-9]+)\s*[;；]\s*(?:发现|found)\s*[:：]\s*([A-Za-z0-9_@./-]+\.[A-Za-z0-9]+)\.?$/i);
+  return Boolean(excerptEcho && excerptEcho[1] === excerptEcho[2]);
+}
+
+function isMeaningfulConcretePlanEvidence(value: string): boolean {
+  const text = String(value || "").trim();
+  if (!isConcretePlanEvidence(text)) return false;
+  if (isPathEchoEvidence(text)) return false;
+  if (TOOL_DETAIL_NON_EVIDENCE_RE.test(text) && !TOOL_DETAIL_HAS_SOURCE_SIGNAL_RE.test(text)) return false;
+  return true;
 }
 
 function evidenceMentionsFile(evidence: string, file: string): boolean {
@@ -338,8 +373,10 @@ function normalizeSemanticToolEvidence(input: {
   if (/failed|blocked|rejected|declined/.test(status)) return "";
   const rawTarget = String(input.target || "").trim();
   if (/^\*\*\/\*\.(?:tsx?|jsx?)$/i.test(rawTarget)) return "";
+  if (BROAD_OR_NOISY_SEARCH_TARGET_RE.test(rawTarget)) return "";
   const target = normalizePathLikeCandidate(rawTarget) || compactPlanLine(rawTarget, 120);
   if (!target || isPlanArtifactPath(target)) return "";
+  if (BROAD_OR_NOISY_SEARCH_TARGET_RE.test(target)) return "";
   if (/^\*\*\/\*\.(?:tsx?|jsx?)$/i.test(target) || (/^\*\*\//.test(rawTarget) && /node_modules/i.test(String(input.detail || "")))) {
     return "";
   }
@@ -349,6 +386,9 @@ function normalizeSemanticToolEvidence(input: {
     .trim();
   if (isInternalPlanEvidenceText(detail)) return "";
   const cleanDetail = compactPlanLine(detail, 160);
+  if (tool === "grep_search" && cleanDetail && TOOL_DETAIL_NON_EVIDENCE_RE.test(cleanDetail) && !TOOL_DETAIL_HAS_SOURCE_SIGNAL_RE.test(cleanDetail)) {
+    return "";
+  }
   return [tool, target].filter(Boolean).join(" ") + (cleanDetail ? `; excerpt=${cleanDetail}` : "");
 }
 
@@ -358,6 +398,7 @@ function sanitizeEvidenceLine(value: unknown, language: "zh" | "en"): { value: s
   if (PROTOCOL_NOISE_RE.test(raw)) return { value: "", reason: "protocol_noise" };
   if (/ContextMemory|ContextState|\[ContextMemory/i.test(raw)) return { value: "", reason: "context_memory" };
   if (isInternalPlanEvidenceText(raw)) return { value: "", reason: "plan_artifact_evidence" };
+  if (isPlanPromptInstructionText(raw)) return { value: "", reason: "control_prompt" };
 
   const envelope = parseToolFeedbackEnvelope(raw);
   if (envelope) {
@@ -493,10 +534,15 @@ export function sanitizePlanEvidenceInput(input: {
   const constraints: string[] = [];
   for (const item of input.constraints || []) {
     const clean = cleanPlanItem(item, 220);
-    if (clean && !RAW_TOOL_RESULT_NOISE_RE.test(clean) && !PROTOCOL_NOISE_RE.test(clean)) {
+    if (
+      clean &&
+      !RAW_TOOL_RESULT_NOISE_RE.test(clean) &&
+      !PROTOCOL_NOISE_RE.test(clean) &&
+      !isPlanPromptInstructionText(clean)
+    ) {
       constraints.push(clean);
     } else {
-      addDrop("constraints", "constraint_noise", item);
+      addDrop("constraints", isPlanPromptInstructionText(item) ? "control_prompt" : "constraint_noise", item);
     }
   }
 
@@ -792,8 +838,9 @@ function buildCodexStylePlanArtifact(input: {
   const goal = compactPlanLine(input.userGoal, 420);
   const rawEvidence = uniqueCompactLines(input.evidence, 10, 220);
   const concreteEvidence = rawEvidence.filter(isConcretePlanEvidence);
-  const evidence = (concreteEvidence.length > 0
-    ? concreteEvidence
+  const meaningfulConcreteEvidence = concreteEvidence.filter(isMeaningfulConcretePlanEvidence);
+  const evidence = (meaningfulConcreteEvidence.length > 0
+    ? meaningfulConcreteEvidence
     : rawEvidence.filter((item) => !isBroadDiscoveryEvidence(item))
   ).slice(0, 8);
   const rawFiles = uniqueCompactLines(input.files, 10, 160).filter(isActionablePlanFile);
@@ -805,7 +852,7 @@ function buildCodexStylePlanArtifact(input: {
   const commands = extractInlineCommands([...evidence, ...constraints]);
   const hasGroundedEvidence = Boolean(goal) &&
     evidence.length > 0 &&
-    concreteEvidence.length > 0 &&
+    meaningfulConcreteEvidence.length > 0 &&
     (files.length > 0 || /CSV|TSV|XLSX|字段|列|指标|数据|表格|dataset|table|metric|column/i.test(`${goal}\n${evidence.join("\n")}`));
 
   if (!hasGroundedEvidence) {

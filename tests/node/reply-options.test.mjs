@@ -60,6 +60,7 @@ const {
   buildReadOnlyPermissionContinuationPrompt,
   extractReplyOptions,
   hasExecutableProposalReplyOptions,
+  hasOnlyNonBlockingPlanReplyOptions,
   hasOnlyPlanContinuationReplyOptions,
   hasOnlyReadOnlyPermissionReplyOptions,
   inferReplyOptionActionFromText,
@@ -568,6 +569,37 @@ test("shouldRouteUnapprovedPlanReplyOptionsToArtifact suppresses premature imple
   );
 });
 
+test("shouldRouteUnapprovedPlanReplyOptionsToArtifact treats combined priority choices as plan content", () => {
+  const visibleText = [
+    "我已读取关键数据流和主题入口，下面给出实施方案预览。",
+    "",
+    "### 实施方案预览",
+    "- 数据链路：修复 CSV 字段映射、Store 聚合和图表渲染。",
+    "- 深色模式：统一主题 token、背景、卡片和图表颜色。",
+    "",
+    "请选择下一步：",
+  ].join("\n");
+  const replyOptions = [
+    { label: "优先修复数据链路（从解析到 Store 再到组件渲染）", value: "优先修复数据链路（从解析到 Store 再到组件渲染）", source: "explicit_user_options" },
+    { label: "优先重构深色模式（从全局样式到组件适配）", value: "优先重构深色模式（从全局样式到组件适配）", source: "explicit_user_options" },
+    { label: "两个任务并行推进", value: "两个任务并行推进", source: "explicit_user_options" },
+  ];
+
+  assert.equal(
+    shouldRouteUnapprovedPlanReplyOptionsToArtifact({
+      replyOptions,
+      workflowMode: "plan",
+      isPlanApproved: false,
+      hasStructuredProposal: false,
+      hasReadyPlanArtifacts: false,
+      hasReviewablePlanArtifacts: false,
+      sawPlanModeToolActivity: true,
+      visibleText,
+    }),
+    true,
+  );
+});
+
 test("shouldRouteUnapprovedPlanReplyOptionsToArtifact keeps genuine blocking plan choices", () => {
   const replyOptions = [
     { label: "方案A：完整框架优先，先搭好全部模块边界", value: "方案A：完整框架优先，先搭好全部模块边界", source: "explicit_user_options" },
@@ -655,6 +687,32 @@ test("extractReplyOptions converts execution mode switch options into user-facin
   assert.equal(result.replyOptions[2].action, undefined);
   assert.equal(inferReplyOptionActionFromText("执行修复"), "execute_once");
   assert.equal(inferReplyOptionActionFromText("停止执行，仅查看当前进度"), undefined);
+});
+
+test("non-blocking plan exploration choices do not pause Plan mode", () => {
+  const result = extractReplyOptions(`
+为了更高效地开始，我需要先确认您的项目技术栈或已知的关键模块。
+
+<user_options>
+<option>直接开始探索（我会先从搜索 CSV 导入逻辑开始）</option>
+<option>提供一些关键文件路径/组件名（如果您已知的话）</option>
+</user_options>
+  `);
+
+  assert.equal(hasOnlyNonBlockingPlanReplyOptions(result.replyOptions), true);
+  assert.equal(
+    shouldPauseForReplyOptions({
+      replyOptions: result.replyOptions,
+      toolCallCount: 0,
+      workflowMode: "plan",
+      hasStructuredProposal: false,
+      hasReadyPlanArtifacts: false,
+      isPlanApproved: false,
+      forcePause: true,
+      finishReason: "stop",
+    }),
+    false,
+  );
 });
 
 test("read-only auto approval strips repeated permission prompts and builds continuation", () => {

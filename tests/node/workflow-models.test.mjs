@@ -850,6 +850,39 @@ test("runtime plan task derivation accepts Codex-style key changes", () => {
   assert.equal(tasks.some((task) => task.evidence?.some((item) => item.kind === "cmd" && item.value.includes("workflow-models"))), true);
 });
 
+test("runtime plan task derivation skips goals and diagnosis from OMLX plan prose", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([
+    {
+      kind: "plan",
+      path: ".MAIN/plans/plan.md",
+      title: "Plan",
+      updatedAt: 1,
+      content: [
+        "# Proposed Plan",
+        "",
+        "## 用户目标",
+        "- 请修复 src/hooks/useCsvParser.ts，让 CSV creator 字段正确映射为 Dashboard 使用的 creatorName。先生成可审批计划，批准后真实修改并验证。",
+        "",
+        "## 问题分析",
+        "- 数据源差异：`src/hooks/useCsvParser.ts` 中的 `normalizeCsvOrder` 函数目前仅将 CSV 中的 `creator` 字段映射到了 `creator` 属性上。",
+        "",
+        "## 关键实现改动",
+        "- 修改 `src/hooks/useCsvParser.ts`:",
+        "  - 更新 `normalizeCsvOrder` 函数。",
+        "  - 在返回的 `CsvOrder` 对象中，将 `creator` 的值同步赋值给 `creatorName`。",
+        "",
+        "## 测试方案",
+        "- 运行 `node --test tests/node/workflow-models.test.mjs`。",
+      ].join("\n"),
+    },
+  ], { language: "zh" });
+
+  assert.equal(tasks.some((task) => /请修复|用户目标|数据源差异|目前仅将/.test(task.text)), false);
+  assert.equal(tasks.some((task) => /修改.*useCsvParser\.ts/.test(task.text)), true);
+  assert.equal(tasks.some((task) => task.evidence?.some((item) => item.kind === "file" && item.value === "src/hooks/useCsvParser.ts")), true);
+  assert.equal(tasks.some((task) => task.evidence?.some((item) => item.kind === "cmd" && item.value.includes("workflow-models"))), true);
+});
+
 test("runtime plan task derivation skips malformed markdown table rows", () => {
   const tasks = deriveRuntimePlanTasksFromArtifacts([
     {
@@ -1238,6 +1271,37 @@ test("validateActionablePlanArtifact rejects file-only smallest-change filler", 
   assert.equal(result.reason, "generic_fallback_plan");
 });
 
+test("validateActionablePlanArtifact rejects prompt-leaked noisy fallback plan from debug log", () => {
+  const bad = [
+    "# 计划",
+    "",
+    "## 摘要",
+    "- 用户目标：修复 CSV 导入后 Dashboard 数据不显示，并彻底改善深色模式。",
+    "- 定向证据已覆盖：`src/App.tsx`、`src/store/dashboardStore.ts`、`src/components/FileUploader/DragUpload.tsx`。",
+    "- 最相关证据：已搜索文本：.；发现：index.html:6: <title 课程销售 Dashboard</title package-lock.json:2: name : sales-dashboard。",
+    "",
+    "## 关键改动",
+    "- 更新 `src/App.tsx` 的深色模式表面、主题 token、图表/容器对比度。依据证据：已读取文件：src/App.tsx；发现：src/App.tsx。",
+    "- 修复 `src/store/dashboardStore.ts` 中导入数据进入 Dashboard 状态与统计源的链路。依据证据：已读取文件：src/store/dashboardStore.ts；发现：src/store/dashboardStore.ts。",
+    "- 更新 `src/components/FileUploader/DragUpload.tsx` 的深色模式表面、主题 token、图表/容器对比度。依据证据：已读取文件：src/components/FileUploader/DragUpload.tsx；发现：src/components/FileUploader/DragUpload.tsx。",
+    "",
+    "## 公共 API / 接口 / 类型",
+    "- 默认不新增或修改公共 API、接口或类型。",
+    "",
+    "## 测试方案",
+    "- 运行受影响子系统的聚焦测试、构建检查或浏览器/桌面验证，并记录结果。",
+    "",
+    "## 假设与默认值",
+    "- 如果确实缺少关键业务选择，用 提问，不要写泛化模板计划。",
+    "- tsx 约束：可见计划必须对齐 Codex app 的交接计划结构。",
+    "- 如果 imageParts 0，必须先说明从截图观察到的现象。",
+  ].join("\n");
+
+  const result = validateActionablePlanArtifact(bad);
+  assert.equal(result.ok, false);
+  assert.match(result.reason || "", /prompt_leakage_in_plan|noisy_search_evidence|weak_path_echo_evidence/);
+});
+
 test("validateActionablePlanArtifact rejects empty goals and approved-goal filler", () => {
   const bad = [
     "# 计划",
@@ -1335,9 +1399,10 @@ test("approved plan execution no-tool recovery bypasses generic missing-tool sto
     commandHint: "命令提示",
   });
   assert.match(prompt, /已批准计划正在执行/);
-  assert.match(prompt, /直接调用工具/);
+  assert.match(prompt, /真实工具调用/);
+  assert.match(prompt, /apply_patch/);
   assert.match(prompt, /Browser\/Playwright/);
-  assert.match(prompt, /FILE_UNCHANGED_STUB/);
+  assert.match(prompt, /不匹配/);
   assert.match(prompt, /src\/store\/useAppStore\.ts/);
   assert.doesNotMatch(prompt, /missing_tool_reprompt_limit|聊天失败/);
 });

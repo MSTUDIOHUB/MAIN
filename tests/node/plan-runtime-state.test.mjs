@@ -84,7 +84,7 @@ test("plan runtime phases scope the tool surface", () => {
     workflowMode: "plan",
     isPlanApproved: false,
     planRuntimePhase: "needs_evidence",
-  }), ["get_project_skeleton", "grep_search", "read_file"]);
+  }), ["read_file"]);
 
   assert.deepEqual(filterPlanToolNamesForRuntimePhase({
     toolNames: allPlanTools,

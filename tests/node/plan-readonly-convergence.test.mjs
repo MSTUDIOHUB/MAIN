@@ -110,16 +110,16 @@ test("plan evidence readiness requires observed user context and targeted reads"
   );
 });
 
-test("plan read-only convergence triggers only after targeted evidence is ready", () => {
+test("plan read-only convergence stops broad discovery before targeted evidence loops", () => {
   assert.equal(shouldTriggerPlanReadOnlyConvergence({
     isUnapprovedPlanReadOnlyBatch: true,
     hasPlanDecisionOutput: false,
-    batchCount: 3,
-    toolCount: 12,
+    batchCount: 1,
+    toolCount: 1,
     recentToolActivity: [
       { name: "grep_search", target: "csv/import/loadData", status: "succeeded" },
     ],
-  }), false);
+  }), true);
 
   assert.equal(shouldTriggerPlanReadOnlyConvergence({
     isUnapprovedPlanReadOnlyBatch: true,
@@ -223,7 +223,7 @@ test("plan read-only convergence tightens when user supplied screenshots or file
     recentToolActivity: [
       { name: "grep_search", target: "App", status: "succeeded" },
     ],
-  }), false);
+  }), true);
 });
 
 test("post-convergence plan turns redirect more read-only tools before execution", () => {
@@ -279,10 +279,19 @@ test("post-convergence plan turns redirect more read-only tools before execution
     hasPlanDecisionOutput: false,
     toolNames: ["list_directory"],
     evidenceReadiness: "needs_targeted_read",
+  }), true);
+
+  assert.equal(shouldRedirectPlanToolsAfterReadOnlyConvergence({
+    workflowMode: "plan",
+    isPlanApproved: false,
+    convergencePromptAlreadyUsed: true,
+    hasPlanDecisionOutput: false,
+    toolNames: ["read_file"],
+    evidenceReadiness: "needs_targeted_read",
   }), false);
 });
 
-test("post-convergence plan tool surface narrows after evidence is ready", () => {
+test("post-convergence plan tool surface narrows to targeted evidence or final drafting", () => {
   assert.equal(shouldNarrowPlanToolsAfterReadOnlyConvergence({
     workflowMode: "plan",
     isPlanApproved: false,
@@ -295,7 +304,7 @@ test("post-convergence plan tool surface narrows after evidence is ready", () =>
     isPlanApproved: false,
     convergencePromptAlreadyUsed: true,
     evidenceReadiness: "needs_targeted_read",
-  }), false);
+  }), true);
 
   assert.deepEqual(filterPlanToolNamesAfterReadOnlyConvergence({
     workflowMode: "plan",
@@ -312,6 +321,22 @@ test("post-convergence plan tool surface narrows after evidence is ready", () =>
       "read_pty_tail",
     ],
   }), []);
+
+  assert.deepEqual(filterPlanToolNamesAfterReadOnlyConvergence({
+    workflowMode: "plan",
+    isPlanApproved: false,
+    convergencePromptAlreadyUsed: true,
+    evidenceReadiness: "needs_targeted_read",
+    toolNames: [
+      "list_directory",
+      "grep_search",
+      "read_file",
+      "repo_map_context",
+      "replace_in_file",
+      "write_file",
+      "get_project_skeleton",
+    ],
+  }), ["read_file", "repo_map_context"]);
 
   assert.deepEqual(filterPlanToolNamesAfterReadOnlyConvergence({
     workflowMode: "plan",
