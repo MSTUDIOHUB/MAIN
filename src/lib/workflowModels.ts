@@ -1628,7 +1628,7 @@ const PLAN_ARTIFACT_NOISE_PATTERNS: Array<{ pattern: RegExp; reason: string }> =
   { pattern: /自动生成的兜底草稿|兜底设计|Auto-generated fallback draft|fallback plan|MAIN\s+将可用输出收束|condensed the usable output/i, reason: "fallback_notice" },
   { pattern: /Repeated read-only tool call skipped|Duplicate skip count|FILE_UNCHANGED_STUB|already called with identical arguments|MAIN TOOL FEEDBACK|tool call id|status=observed|hash=[a-z0-9]+|excerpt=/i, reason: "tool_log" },
   { pattern: /ContextMemoryState|ContextState|\[System:\s*Context|Latest user request:|plan_empty_response_checkpoint|上一条\s*Plan\s*回复是空的|PLAN_REPEAT_READ_LIMIT/i, reason: "control_context" },
-  { pattern: /后台思考已折叠|thinking process|chain of thought|<\/thinking>|<\/analysis>|让我(?:先|再)|但是等等|我认为/i, reason: "reasoning_leak" },
+  { pattern: /后台思考已折叠|thinking process|chain of thought|<\/thinking>|<\/analysis>|但是等等/i, reason: "reasoning_leak" },
   { pattern: /回复被截断|maximum token|max token|finish_reason.*length/i, reason: "truncation_log" },
   { pattern: /\busing\s+System\s*;|namespace\s+[A-Za-z0-9_.]+\s*\{|public\s+(?:class|enum|struct|interface)\s+[A-Za-z0-9_]+/i, reason: "raw_source_code" },
 ];
@@ -1718,7 +1718,9 @@ export function classifyPlanArtifactQualityResult(
         section === "user_goal" ||
         section === "unverified_hypotheses" ||
         section === "assumptions_defaults" ||
-        section === "validation"
+        section === "validation" ||
+        section === "test_plan" ||
+        section === "public_interfaces"
       ),
     };
   }
@@ -1777,7 +1779,14 @@ export function repairActionablePlanArtifactContent(input: {
   }
 
   const missingSections = quality.missingSections || [];
-  const allowed = new Set(["user_goal", "unverified_hypotheses", "assumptions_defaults", "validation"]);
+  const allowed = new Set([
+    "user_goal",
+    "unverified_hypotheses",
+    "assumptions_defaults",
+    "validation",
+    "test_plan",
+    "public_interfaces"
+  ]);
   if (!missingSections.every((section) => allowed.has(section))) {
     return { content: input.content, repairedSections: [] };
   }
@@ -1787,12 +1796,21 @@ export function repairActionablePlanArtifactContent(input: {
   let repaired = String(input.content || "").trim();
   const repairedSections: string[] = [];
 
-  if (missingSections.includes("validation")) {
+  if (missingSections.includes("validation") || missingSections.includes("test_plan")) {
+    const isTestPlan = missingSections.includes("test_plan");
     const section = language === "en"
-      ? "## Validation Standards\n- Run the focused tests, build, or manual checks named by the affected surface and record the result before execution is considered complete."
-      : "## 验证标准\n- 运行与受影响范围匹配的测试、构建或人工检查，并记录结果后才视为执行完成。";
+      ? (isTestPlan ? "## Test Plan\n- Run the focused tests, build, or manual checks named by the affected surface and record the result before execution is considered complete." : "## Validation Standards\n- Run the focused tests, build, or manual checks named by the affected surface and record the result before execution is considered complete.")
+      : (isTestPlan ? "## 测试方案\n- 运行与受影响范围匹配的测试、构建或人工检查，并记录结果后才视为执行完成。" : "## 验证标准\n- 运行与受影响范围匹配的测试、构建或人工检查，并记录结果后才视为执行完成。");
     repaired = `${repaired}\n\n${section}`.trim();
-    repairedSections.push("validation");
+    repairedSections.push(isTestPlan ? "test_plan" : "validation");
+  }
+
+  if (missingSections.includes("public_interfaces")) {
+    const section = language === "en"
+      ? "## Public APIs / Interfaces / Types\n- No public API, interface, or type change is planned; preserve existing definitions."
+      : "## 公共 API / 接口 / 类型\n- 无公共 API/接口/类型变化；保持现有定义不变。";
+    repaired = `${repaired}\n\n${section}`.trim();
+    repairedSections.push("public_interfaces");
   }
 
   if (missingSections.includes("unverified_hypotheses")) {

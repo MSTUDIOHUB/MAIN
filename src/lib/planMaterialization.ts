@@ -186,14 +186,16 @@ function normalizePlanContent(rawText: string): string {
   return `# Plan\n\n${sanitized}`;
 }
 
-function compactPlanLine(value: unknown, maxChars = 180): string {
-  const text = sanitizePlanArtifactContent(String(value ?? ""))
-    .replace(/```[\s\S]*?```/g, " ")
+function compactPlanLine(value: unknown, maxChars = 180, preserveFormatting = false): string {
+  let text = sanitizePlanArtifactContent(String(value ?? ""))
     .replace(/<tool_use[\s\S]*?(?:<\/tool_use>|$)/gi, " ")
-    .replace(/<\/?(?:tool_use|tool_call|function_call|tool|parameter|user_options|option)\b[^>]*>/gi, " ")
-    .replace(/[#>*_`~]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+    .replace(/<\/?(?:tool_use|tool_call|function_call|tool|parameter|user_options|option)\b[^>]*>/gi, " ");
+  if (!preserveFormatting) {
+    text = text
+      .replace(/```[\s\S]*?```/g, " ")
+      .replace(/[#>*_`~]/g, " ");
+  }
+  text = text.replace(/\s+/g, " ").trim();
   if (!text || TOOL_LOG_NOISE_RE.test(text) || PROTOCOL_NOISE_RE.test(text)) return "";
   return text.length <= maxChars ? text : `${text.slice(0, maxChars).trim()}...`;
 }
@@ -206,20 +208,20 @@ function stripPlanListMarker(line: string): string {
     .trim();
 }
 
-function cleanPlanItem(value: unknown, maxChars = 220): string {
+function cleanPlanItem(value: unknown, maxChars = 220, preserveFormatting = false): string {
   const stripped = stripPlanListMarker(String(value ?? ""));
   if (/^\s*-{3,}\s*$/.test(stripped)) return "";
-  const text = compactPlanLine(stripped, maxChars);
+  const text = compactPlanLine(stripped, maxChars, preserveFormatting);
   if (!text) return "";
   if (/^(?:批准|取消|继续调整|开始调查|Approve|Cancel|Continue|Adjust)\b/i.test(text)) return "";
   return text;
 }
 
-function uniqueCompactLines(values: unknown[], maxItems: number, maxChars = 180): string[] {
+function uniqueCompactLines(values: unknown[], maxItems: number, maxChars = 180, preserveFormatting = false): string[] {
   const seen = new Set<string>();
   const result: string[] = [];
   for (const value of values) {
-    const line = compactPlanLine(value, maxChars);
+    const line = compactPlanLine(value, maxChars, preserveFormatting);
     if (!line) continue;
     const key = line.toLowerCase();
     if (seen.has(key)) continue;
@@ -230,11 +232,11 @@ function uniqueCompactLines(values: unknown[], maxItems: number, maxChars = 180)
   return result;
 }
 
-function uniquePlanItems(values: unknown[], maxItems: number, maxChars = 220): string[] {
+function uniquePlanItems(values: unknown[], maxItems: number, maxChars = 220, preserveFormatting = false): string[] {
   const seen = new Set<string>();
   const result: string[] = [];
   for (const value of values) {
-    const line = cleanPlanItem(value, maxChars);
+    const line = cleanPlanItem(value, maxChars, preserveFormatting);
     if (!line) continue;
     const key = line.toLowerCase().replace(/\s+/g, " ");
     if (seen.has(key)) continue;
@@ -659,6 +661,8 @@ function collectSectionTitles(
       .map((section) => section.title)
       .filter((title) => patterns.some((pattern) => pattern.test(title))),
     maxItems,
+    1000,
+    true,
   );
 }
 
@@ -666,13 +670,15 @@ function collectLinesFromSections(
   sections: ParsedPlanSection[],
   patterns: RegExp[],
   maxItems: number,
+  maxChars = 220,
+  preserveFormatting = false,
 ): string[] {
   const values: string[] = [];
   for (const section of sections) {
     if (!patterns.some((pattern) => pattern.test(section.title))) continue;
     values.push(...section.body.split(/\r?\n/));
   }
-  return uniquePlanItems(values, maxItems);
+  return uniquePlanItems(values, maxItems, maxChars, preserveFormatting);
 }
 
 function collectPathLikePlanItems(content: string, maxItems = 8): string[] {
@@ -986,7 +992,7 @@ export function canonicalizePlanArtifactContent(input: {
   const providedContextCount =
     context.imageParts + context.mentionedFilePaths.length + context.attachedFilePaths.length;
 
-  const explicitInputGoal = compactPlanLine(input.userGoal, 420);
+  const explicitInputGoal = compactPlanLine(input.userGoal, 420, true);
   const goalSectionTitles = explicitInputGoal ? [] : collectSectionTitles(sections, [
     /(?:正式计划|修复计划|用户目标|目标|需求|问题|Goal|Objective|User Request|Problem|Issue)/i,
   ], 3).filter((line) =>
@@ -996,34 +1002,40 @@ export function canonicalizePlanArtifactContent(input: {
     explicitInputGoal,
     ...(explicitInputGoal ? [] : collectLinesFromSections(sections, [
       /(?:正式计划|修复计划|用户目标|目标|需求|问题|Goal|Objective|User Request|Problem|Issue)/i,
-    ], 3)),
+    ], 3, 2000, true)),
     ...(explicitInputGoal ? [] : goalSectionTitles),
     !explicitInputGoal && !/^(?:Plan|Proposed Plan|计划|计划草稿|修复方案)$/i.test(title) ? title : "",
-  ], 3);
+  ], 3, 2000, true);
   const screenshotLines = collectLinesFromSections(sections, [
     /(?:截图|附件|图片|视觉|观察|Screenshot|Attachment|Visual|Provided Context|Observation)/i,
-  ], 4);
+  ], 4, 2000, true);
   const visibleEvidenceLines = collectLinesFromSections(sections, [
     /(?:已读证据|证据引用|证据|读取|调查|Evidence|References|Read Evidence|Context Read)/i,
-  ], 6);
+  ], 6, 2000, true);
   const inlineEvidenceLines = uniquePlanItems(raw.split(/\r?\n/).filter((line) => {
-    const cleaned = cleanPlanItem(line);
+    const cleaned = cleanPlanItem(line, 2000, true);
     return isConcretePlanEvidence(cleaned) || isBroadDiscoveryEvidence(cleaned);
-  }), 8);
+  }), 8, 2000, true);
   const activityEvidence = uniquePlanItems(
     (input.recentToolActivity || [])
       .map(summarizeToolActivityForEvidence)
       .map((item) => summarizeEvidenceLine(item, language)),
     8,
+    2000,
+    true
   );
   const structuredEvidence = uniquePlanItems(
     (input.evidenceRecords || [])
       .map((record) => formatPlanEvidenceRecord(record, language)),
     8,
+    2000,
+    true
   );
   const externalEvidence = uniquePlanItems(
     (input.evidence || []).map((item) => summarizeEvidenceLine(item, language)),
     8,
+    2000,
+    true
   );
   const evidenceLines = uniquePlanItems([
     ...structuredEvidence,
@@ -1034,7 +1046,7 @@ export function canonicalizePlanArtifactContent(input: {
     providedContextCount > 0
       ? buildProvidedContextObservation({ turnContext: input.turnContext, language })
       : "",
-  ], 10);
+  ], 10, 2000, true);
   const concreteEvidenceLines = evidenceLines.filter(isConcretePlanEvidence);
 
   const visibleFindingLines = uniquePlanItems([
@@ -1043,22 +1055,22 @@ export function canonicalizePlanArtifactContent(input: {
     ], 6),
     ...collectLinesFromSections(sections, [
       /(?:已确认|真实发现|当前发现|发现|调查摘要|分析|根因|原因|问题|Investigation Summary|Analysis|Root Cause|Confirmed|Findings|Current State|Observation|Issue)/i,
-    ], 8),
-  ], 8);
+    ], 8, 2000, true),
+  ], 8, 2000, true);
   const hypothesisLines = uniquePlanItems([
     ...collectLinesFromSections(sections, [
       /(?:未验证|假设|待确认|可能|根因|原因|问题|风险|注意|边界|Unverified|Hypotheses|Assumptions|Unknowns|Risks|Caveats|Root Cause|Likely|Issue)/i,
-    ], 8),
+    ], 8, 2000, true),
     ...visibleFindingLines.filter(isSpeculativePlanLine),
-  ], 6);
+  ], 6, 2000, true);
   const fileLines = uniquePlanItems([
     ...(input.files || []),
     ...(input.recentToolActivity || []).map((activity) => activity.target || ""),
     ...collectLinesFromSections(sections, [
       /(?:影响文件|相关文件|文件|接口|组件|Affected|Files|Interfaces|Components|Paths)/i,
-    ], 8),
+    ], 8, 1000, true),
     ...collectPathLikePlanItems(raw),
-  ], 10, 160);
+  ], 10, 1000, true);
   if (
     fileLines.some(isActionablePlanFile) &&
     concreteEvidenceLines.length === 0 &&
@@ -1069,18 +1081,18 @@ export function canonicalizePlanArtifactContent(input: {
   const stepLines = uniquePlanItems([
     ...collectLinesFromSections(sections, [
       /(?:执行|实施|方案|计划|步骤|修复|落地|Approach|Implementation|Plan of Work|Plan|Steps|Fix)/i,
-    ], 8),
-  ], 8).filter((line) =>
+    ], 8, 4000, true),
+  ], 8, 4000, true).filter((line) =>
     !/(?:与用户目标直接相关的最小改动|smallest user-goal-specific change|落实已批准目标|approved goal)/i.test(line)
   );
   const riskLines = uniquePlanItems([
     ...collectLinesFromSections(sections, [
       /(?:风险|取舍|注意|边界|默认|后续|Risks|Tradeoffs|Caveats|Boundary|Default|Follow-up)/i,
-    ], 5),
-  ], 5);
+    ], 5, 2000, true),
+  ], 5, 2000, true);
   const validationLines = collectLinesFromSections(sections, [
     /(?:验证|测试|构建|验收|Validation|Testing|Acceptance|Build|Checks)/i,
-  ], 5);
+  ], 5, 4000, true);
 
   const hasRequiredSignals = [
     goalLines.length > 0,
@@ -1100,7 +1112,7 @@ export function canonicalizePlanArtifactContent(input: {
     ...(screenshotLines.length > 0
       ? screenshotLines.slice(0, 2)
       : [buildProvidedContextObservation({ turnContext: input.turnContext, language })]),
-  ], 6);
+  ], 6, 2000, true);
   const goalForChanges = goalLines[0] || explicitInputGoal || input.userGoal || "";
   const fileChangeEvidence = concreteEvidenceLines.length > 0
     ? concreteEvidenceLines
@@ -1118,7 +1130,7 @@ export function canonicalizePlanArtifactContent(input: {
   const keyChangeLines = uniquePlanItems([
     ...stepLines,
     ...fileDerivedChangeLines,
-  ], 8);
+  ], 8, 4000, true);
   if (keyChangeLines.length === 0) return null;
   const assumptionLines = uniquePlanItems([
     ...hypothesisLines,
@@ -1126,10 +1138,10 @@ export function canonicalizePlanArtifactContent(input: {
     language === "zh"
       ? "默认保持未点名的公共 API、接口和类型不变。"
       : "Default to preserving public APIs, interfaces, and types that are not explicitly named.",
-  ], 6);
+  ], 6, 2000, true);
   const apiLines = collectLinesFromSections(sections, [
     /(?:公共\s*API|接口(?:变化|变更)?|类型(?:变化|变更)?|API|Public|Interface|Types?)/i,
-  ], 4).filter((line) =>
+  ], 4, 2000, true).filter((line) =>
     /(?:无|不|保持|新增|修改|变化|变更|No|unchanged|changed|added|modified|preserved)/i.test(line) &&
     !/`[^`]+\.(?:tsx?|jsx?|rs|py|go|json|md|css|scss|html)`/.test(line)
   );
@@ -1283,7 +1295,8 @@ function resolveMaterializationKind(input: {
   if (
     /^\s*#\s*(?:Design\b|设计)/im.test(input.raw) ||
     /\.MAIN\/plans\/design\.md/i.test(input.raw) ||
-    /(?:正式设计方案|设计文档|reviewable,\s*actionable\s*design)/i.test(input.raw)
+    /(?:正式设计方案|设计文档|reviewable,\s*actionable\s*design)/i.test(input.raw) ||
+    /(?:框架设计|架构设计|接口设计|代码框架|类图|游戏开发|game\s*dev|architecture|framework|class\s*structure|class\s*diagram)/i.test(input.raw)
   ) {
     return "design";
   }

@@ -1477,6 +1477,7 @@ function isApprovedPlanRecoveryTool(
   options: { allowFileRead?: boolean } = {},
 ): boolean {
   const name = tool.function.name;
+  if (name === "read_file") return true;
   return isApprovedPlanRecoveryToolName(name, PLAN_EXPLORATION_READ_ONLY_TOOLS, options);
 }
 
@@ -1484,6 +1485,7 @@ function isApprovedPlanSourceEditFirstTool(
   tool: ToolDefinition,
   options: { allowFileRead?: boolean } = {},
 ): boolean {
+  if (tool.function.name === "read_file") return true;
   return isApprovedPlanSourceEditFirstToolName(tool.function.name, options);
 }
 
@@ -2794,7 +2796,8 @@ function resolvePlanClosureArtifactKind(
   ].join("\n");
   if (
     /\.MAIN\/plans\/design\.md/i.test(text) ||
-    /(?:设计方案|设计文档|Design\s+(?:artifact|document|plan)|reviewable,\s*actionable\s*design)/i.test(text)
+    /(?:设计方案|设计文档|Design\s+(?:artifact|document|plan)|reviewable,\s*actionable\s*design)/i.test(text) ||
+    /(?:框架设计|架构设计|接口设计|代码框架|类图|游戏开发|game\s*dev|architecture|framework|class\s*structure|class\s*diagram)/i.test(text)
   ) {
     return "design";
   }

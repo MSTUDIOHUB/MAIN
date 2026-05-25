@@ -1210,3 +1210,72 @@ test("materializes explicit design text to design.md", () => {
   assert.equal(result.kind, "design");
   assert.equal(result.path, ".MAIN/plans/design.md");
 });
+
+test("canonicalization preserves long detailed lines and markdown formatting in salvaged plans", () => {
+  const longStep = "1. **修改核心控制流**：在 `src/lib/orchestrator.ts` 中找到 `waitForPlanApprovalIfNeeded` 函数并调整轮询逻辑，增加针对 `abortController.signal` 中断信号的优雅降级。为了避免审批中多次触发重试，我们在这一步保留原始模型返回的全部细节，并保证反引号如 `read_file` 能够正确在 plan.md 渲染，字数需要超过三百个字符以验证我们没有做任何截断。为此我们在这里继续增加更多的无意义中文字符串来填充长度，以保证在 JavaScript 的 String.length 计算中其数值能毫无悬念地稳稳超过三百个字符。填充填充填充填充填充填充填充填充填充填充填充填充填充。";
+  assert.ok(longStep.length > 300);
+
+  const result = materializePlanArtifactFromVisibleText({
+    visibleText: [
+      "# Proposed Plan",
+      "",
+      "## Goal",
+      "- 验证长文本行及 Markdown 格式在 canonicalize 时能够被完美保留，不发生任何截断或产生省略号。",
+      "",
+      "## Implementation Plan",
+      longStep,
+      "",
+      "## Affected Files",
+      "- `src/lib/orchestrator.ts`",
+      "",
+      "## Validation",
+      "- 运行 `node --test` 并确认没有任何截断发生。",
+    ].join("\n"),
+    evidence: [
+      "read_file src/lib/orchestrator.ts; excerpt=waitForPlanApprovalIfNeeded",
+    ],
+    files: ["src/lib/orchestrator.ts"],
+    language: "zh",
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.path, ".MAIN/plans/plan.md");
+  // The content must contain the exact long step with formatting and WITHOUT truncation/ellipses!
+  assert.match(result.content || "", /src\/lib\/orchestrator\.ts/);
+  assert.match(result.content || "", /waitForPlanApprovalIfNeeded/);
+  assert.match(result.content || "", /优雅降级/);
+  // Verify backticks are preserved!
+  assert.match(result.content || "", /`src\/lib\/orchestrator\.ts`/);
+  assert.match(result.content || "", /`read_file`/);
+  // Verify bold format is preserved!
+  assert.match(result.content || "", /\*\*修改核心控制流\*\*/);
+  // Verify it's not truncated with ellipses!
+  assert.doesNotMatch(result.content || "", /优雅降级\.\.\./);
+});
+
+test("auto-detects framework design and game dev keywords to route to design.md kind", () => {
+  const result = materializePlanArtifactFromVisibleText({
+    visibleText: [
+      "# 游戏开发框架设计方案",
+      "",
+      "## 目标与约束",
+      "- 目标：基于 Unity/C# 设计游戏实体的 Component-Based 架构与数据流契约。",
+      "- 约束：确保类图关系和实体更新在单线程下高吞吐执行，同时为了满足方案物化的最低长度限制，我们需要在这里写下更多关于系统设计的详细内容。我们需要确保本方案描述非常清晰并且超过两百八十个字符以避免被质量门禁判断为过短。",
+      "",
+      "## 方案",
+      "- 设计 EntityMgr 类，维护 Active 实体链表。为各个组件提供类结构设计，支持多态 and 静态分析，支持多维度的数据流转换与性能优化机制。",
+      "",
+      "## 影响文件",
+      "- 计划文件：`.MAIN/plans/design.md`。",
+      "",
+      "## 执行顺序",
+      "1. 明确 C# 接口设计并进行多端同步验证。",
+      "2. 画出 UML 类图结构以方便团队成员进行协作开发与后续的代码评审工作。",
+    ].join("\n"),
+    language: "zh",
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.kind, "design");
+  assert.equal(result.path, ".MAIN/plans/design.md");
+});

@@ -210,3 +210,46 @@ test("generic fallback plan escalates to auto scaffold", () => {
   assert.equal(result.ok, false);
   assert.equal(result.recoveryAction, "auto_scaffold");
 });
+
+test("missing public_interfaces and test_plan sections can be auto-repaired", () => {
+  const plan = [
+    "# CSV Dashboard 修复计划",
+    "",
+    "## 用户目标",
+    "- 修复 CSV 导入后 Dashboard 指标没有正确更新的问题",
+    "",
+    "## 已读证据",
+    "- read_file src/App.tsx；发现入口逻辑缺少刷新调用",
+    "- read_file src/store/dashboardStore.ts；确认 store 状态管理正确",
+    "",
+    "## 摘要",
+    "- 修复 DragUpload 组件在 CSV 导入完成后没有触发 Dashboard 数据刷新的问题",
+    "",
+    "## 关键改动",
+    "- 修改 src/App.tsx 补充导入完成后的 store 刷新逻辑",
+    "- 更新 src/components/FileUploader/DragUpload.tsx 添加回调",
+    "",
+    "## 假设与默认值",
+    "- 默认保持现有 CSV 解析逻辑不变，仅补充刷新调用",
+  ].join("\n");
+
+  const initial = validateActionablePlanArtifact(plan);
+  assert.equal(initial.ok, false);
+  assert.equal(initial.recoveryAction, "rewrite");
+  assert.equal(initial.canAutoRepair, true);
+  assert.ok(initial.missingSections.includes("public_interfaces"));
+  assert.ok(initial.missingSections.includes("test_plan"));
+
+  const repaired = repairActionablePlanArtifactContent({
+    content: plan,
+    userGoal: "重构计划质量门禁",
+    quality: initial,
+    language: "zh",
+  });
+
+  assert.ok(repaired.repairedSections.includes("public_interfaces"));
+  assert.ok(repaired.repairedSections.includes("test_plan"));
+  assert.equal(validateActionablePlanArtifact(repaired.content).ok, true);
+  assert.match(repaired.content, /## 公共 API \/ 接口 \/ 类型/);
+  assert.match(repaired.content, /## 测试方案/);
+});
