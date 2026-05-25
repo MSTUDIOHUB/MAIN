@@ -458,6 +458,12 @@ function planRuntimePhasePresentation(
 ): { kind: "scope" | "context" | "diagnosis" | "implementation" | "validation"; title: string; summary: string } {
   const suffix = reason ? (language === "zh" ? `（${reason}）` : ` (${reason})`) : "";
   switch (phase) {
+    case "explore_structure":
+      return {
+        kind: "scope",
+        title: language === "zh" ? "Explore" : "Explore",
+        summary: language === "zh" ? `探索项目结构${suffix}` : `Explore project structure${suffix}`,
+      };
     case "grounding":
       return {
         kind: "context",
@@ -683,12 +689,17 @@ function planUnsupportedToolFeedbackMessage(input: {
   if (input.workflowMode === "plan" && !input.isPlanApproved) {
     const phase = input.planRuntimePhase || "grounding";
     const readOnly = isPlanReadOnlyToolName(input.toolName);
+    if (phase === "explore_structure" && input.toolName !== "get_project_skeleton") {
+      return input.language === "zh"
+        ? `PLAN_EXPLORE_STRUCTURE_TOOL_BLOCKED: 当前是 Explore project structure 阶段，只允许一次浅层 get_project_skeleton(depth: 2)。完成项目结构探索后再进入定向读取。`
+        : `PLAN_EXPLORE_STRUCTURE_TOOL_BLOCKED: The current phase is Explore project structure, so only one shallow get_project_skeleton(depth: 2) call is available. Targeted reads open after the structure pass.`;
+    }
     if (phase === "drafting" || phase === "synthesis" || phase === "needs_rewrite" || phase === "review_ready" || phase === "blocked") {
       return input.language === "zh"
         ? `PLAN_DRAFTING_TOOL_BLOCKED: 当前处于 ${phase} 阶段，不需要工具来完成计划。不要继续调用 ${input.toolName}；请基于已有证据输出可见 <proposed_plan>，MAIN 会物化为 .MAIN/plans/plan.md。`
         : `PLAN_DRAFTING_TOOL_BLOCKED: The current phase is ${phase}, so no tool call is needed to finish planning. Do not call ${input.toolName}; output a visible <proposed_plan> from existing evidence and MAIN will materialize .MAIN/plans/plan.md.`;
     }
-    if ((phase === "grounding" || phase === "needs_evidence") && !readOnly) {
+    if ((phase === "grounding" || phase === "needs_evidence" || phase === "explore_structure") && !readOnly) {
       return input.language === "zh"
         ? `PLAN_GROUNDING_TOOL_BLOCKED: 当前处于 ${phase} 阶段，只允许截图/附件观察和最小定向只读证据工具。不要调用 ${input.toolName}；先补足事实，再进入 plan.md 草稿。`
         : `PLAN_GROUNDING_TOOL_BLOCKED: The current phase is ${phase}, so only observation and minimal read-only evidence tools are available. Do not call ${input.toolName}; gather facts first, then draft plan.md.`;
@@ -5720,7 +5731,7 @@ export async function executeAgentLoop(
   let usedPlanReadOnlyConvergencePrompt = false;
   let planPostConvergenceToolRedirectCount = 0;
   let planRuntimePhase: PlanRuntimePhase = workflowMode === "plan" && !callbacks.getIsPlanApproved()
-    ? "grounding"
+    ? "explore_structure"
     : "drafting";
   let planQualityRejectCount = 0;
   let planLastQualityGateReason = "";
@@ -6287,7 +6298,7 @@ export async function executeAgentLoop(
   });
   emitPlanExecutionProgress("starting");
   if (workflowMode === "plan" && !callbacks.getIsPlanApproved()) {
-    setPlanRuntimePhase("grounding", "start");
+    setPlanRuntimePhase("explore_structure", "start");
   }
 
   while (iteration < effectiveMaxIterations) {
@@ -9242,17 +9253,26 @@ export async function executeAgentLoop(
     for (const tc of effectiveToolCalls) {
       let toolArgs = parseToolCallArguments(tc, workspace);
       const targetingProfile = buildCurrentTaskTargetingProfile();
+      const isPlanStructureExploreTool =
+        workflowMode === "plan" &&
+        !callbacks.getIsPlanApproved() &&
+        planRuntimePhase === "explore_structure" &&
+        tc.name === "get_project_skeleton";
       if (
         tc.name === "get_project_skeleton" &&
-        targetingProfile.allowRootSkeleton &&
-        (toolArgs.depth == null || String(toolArgs.depth).trim() === "")
+        (targetingProfile.allowRootSkeleton || isPlanStructureExploreTool) &&
+        (
+          toolArgs.depth == null ||
+          String(toolArgs.depth).trim() === "" ||
+          Number(toolArgs.depth) > 2
+        )
       ) {
         toolArgs = { ...toolArgs, depth: 2 };
         tc.arguments = JSON.stringify(toolArgs);
         logAgentEvent("task_targeting_tool_args_normalized", {
           iteration,
           tool: tc.name,
-          reason: "shallow_root_skeleton_default",
+          reason: isPlanStructureExploreTool ? "plan_explore_structure_depth_clamp" : "shallow_root_skeleton_default",
           depth: 2,
           imageParts: targetingProfile.imageParts,
           hasUserProvidedContext: targetingProfile.hasUserProvidedContext,
@@ -9326,18 +9346,20 @@ export async function executeAgentLoop(
         continue;
       }
 
-      const targetingGate = shouldBlockToolCallForTargeting({
-        profile: targetingProfile,
-        toolName: tc.name,
-        args: toolArgs,
-        target,
-        availableToolNames,
-        language: callbacks.getPreferredLanguage(),
-        allowApprovedPlanDesignWrite:
-          workflowMode === "plan" &&
-          callbacks.getIsPlanApproved() &&
-          runtimeIntent === "execute",
-      });
+      const targetingGate = isPlanStructureExploreTool
+        ? { blocked: false }
+        : shouldBlockToolCallForTargeting({
+            profile: targetingProfile,
+            toolName: tc.name,
+            args: toolArgs,
+            target,
+            availableToolNames,
+            language: callbacks.getPreferredLanguage(),
+            allowApprovedPlanDesignWrite:
+              workflowMode === "plan" &&
+              callbacks.getIsPlanApproved() &&
+              runtimeIntent === "execute",
+          });
       if (targetingGate.blocked) {
         const message = targetingGate.message || (
           callbacks.getPreferredLanguage() === "zh"
@@ -9938,6 +9960,24 @@ export async function executeAgentLoop(
 
     if (workflowMode === "plan") {
       allResults.forEach(rememberPlanToolActivity);
+    }
+    if (
+      workflowMode === "plan" &&
+      !callbacks.getIsPlanApproved() &&
+      planRuntimePhase === "explore_structure" &&
+      allResults.some((result) => result.name === "get_project_skeleton" && !result.internalFeedback)
+    ) {
+      const structureSucceeded = allResults.some((result) =>
+        result.name === "get_project_skeleton" &&
+        !result.internalFeedback &&
+        !result.isError
+      );
+      if (structureSucceeded) {
+        setPlanRuntimePhase("explore_structure", "project structure explored", "done");
+        setPlanRuntimePhase("grounding", "after project structure");
+      } else {
+        setPlanRuntimePhase("grounding", "project structure unavailable; continue targeted grounding");
+      }
     }
     emitTaskOrchestratorPhase("EVIDENCE_RECONCILE", {
       iteration,

@@ -233,6 +233,7 @@ export type PlanExecutionProgressPhase =
   | "completed";
 
 export type PlanRuntimePhase =
+  | "explore_structure"
   | "grounding"
   | "synthesis"
   | "drafting"

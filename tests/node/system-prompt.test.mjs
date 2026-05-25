@@ -339,6 +339,8 @@ test("data analyst plan prompt uses interactive planning and analysis semantics"
   assert.match(prompt, /用户能真实拍板的选择/);
   assert.match(prompt, /Plan-First 计划物化规则/);
   assert.match(prompt, /默认先输出可审批方案/);
+  assert.match(prompt, /Explore 首步/);
+  assert.match(prompt, /阶段 0 用一次浅层 `get_project_skeleton\(depth: 2\)`/);
   assert.match(prompt, /requirements\.md` 记录用户目标\/验收，`design\.md` 记录证据归因\/取舍/);
   assert.match(prompt, /`plan_file_change` 路由到 PLAN 后，必须输出可审批的可见计划/);
   assert.match(prompt, /阶段 1 只读 grounding/);
@@ -553,5 +555,5 @@ test("system prompt prioritizes turn intake screenshots and attached context bef
   assert.match(prompt, /\[turn_intake\]/);
   assert.match(prompt, /Codex App 式处理顺序/);
   assert.match(prompt, /图片要先总结可见 UI\/文本\/状态\/异常/);
-  assert.match(prompt, /不要先读根目录或多个顶层目录/);
+  assert.match(prompt, /项目结构探索只建立地图，不替代这些上下文观察/);
 });

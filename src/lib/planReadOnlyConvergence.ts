@@ -65,7 +65,7 @@ export function isPlanReadOnlyToolName(name: string): boolean {
 }
 
 function isPlanRuntimeReadOnlyPhase(phase?: PlanRuntimePhase): boolean {
-  return phase === "grounding" || phase === "synthesis" || phase === "needs_evidence";
+  return phase === "explore_structure" || phase === "grounding" || phase === "synthesis" || phase === "needs_evidence";
 }
 
 function isPlanRuntimeFinalizationPhase(phase?: PlanRuntimePhase): boolean {
@@ -215,6 +215,9 @@ export function filterPlanToolNamesForRuntimePhase(input: {
 }): string[] {
   if (input.workflowMode !== "plan" || input.isPlanApproved || !input.planRuntimePhase) {
     return input.toolNames;
+  }
+  if (input.planRuntimePhase === "explore_structure") {
+    return input.toolNames.filter((name) => name === "get_project_skeleton");
   }
   if (isPlanRuntimeReadOnlyPhase(input.planRuntimePhase)) {
     return input.toolNames.filter(isPlanReadOnlyToolName);

@@ -16,7 +16,7 @@ export interface PlanFinalizationRecoveryDecision {
 }
 
 function isPlanRuntimeReadOnlyPhase(phase?: PlanRuntimePhase): boolean {
-  return phase === "grounding" || phase === "needs_evidence";
+  return phase === "explore_structure" || phase === "grounding" || phase === "needs_evidence";
 }
 
 function isPlanRuntimeFinalizationPhase(phase?: PlanRuntimePhase): boolean {
@@ -52,6 +52,10 @@ const PLAN_TARGETED_EVIDENCE_TOOL_NAMES = new Set([
   "get_pty_status",
 ]);
 
+const PLAN_STRUCTURE_EXPLORATION_TOOL_NAMES = new Set([
+  "get_project_skeleton",
+]);
+
 export function filterPlanToolNamesForRuntimePhase(input: {
   toolNames: string[];
   workflowMode: PlanRuntimeMode;
@@ -60,6 +64,9 @@ export function filterPlanToolNamesForRuntimePhase(input: {
 }): string[] {
   if (input.workflowMode !== "plan" || input.isPlanApproved || !input.planRuntimePhase) {
     return input.toolNames;
+  }
+  if (input.planRuntimePhase === "explore_structure") {
+    return input.toolNames.filter((name) => PLAN_STRUCTURE_EXPLORATION_TOOL_NAMES.has(name));
   }
   if (input.planRuntimePhase === "needs_evidence") {
     return input.toolNames.filter((name) => PLAN_TARGETED_EVIDENCE_TOOL_NAMES.has(name));

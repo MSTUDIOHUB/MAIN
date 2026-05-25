@@ -37,7 +37,12 @@ import {
 } from "../lib/workflowModels";
 import { getIntentPolicy, resolveConversationTurnIntent } from "../lib/runIntent";
 import { summarizePlanExecutionProgressSnapshot } from "../lib/planExecutionRecovery";
-import { buildCompletedToolGroupRanges, countCompletedToolCalls } from "../lib/toolUiGrouping";
+import {
+  buildChatRenderSegments,
+  countCompletedToolCalls,
+  type ChatOperationCluster,
+} from "../lib/toolUiGrouping";
+import { isThinModelToolNarration } from "../lib/modelFeedbackDedupe";
 import { compactToolPresentationTarget, getToolPresentationLabel } from "../lib/toolPresentation";
 import { buildLiveTurnProcessTimelineModel, buildTurnProcessArchiveModel, type TurnArchiveStep } from "../lib/turnProcessArchive";
 import {
@@ -733,16 +738,7 @@ function extractPathishTokens(text: string): string[] {
 }
 
 function isThinToolNarration(text: string): boolean {
-  const normalized = String(text || "").replace(/\s+/g, "");
-  if (!normalized || normalized.length > 260) return false;
-  if (
-    /(?:确认|證實|证实|包含|不包含|发现|結果|结果|结论|原因|问题|修复|验证通过|验证失败)/.test(normalized) ||
-    /\b(?:contains?|does not contain|found|result|conclusion|verified|verification|fixed|failed|passed)\b/i.test(text)
-  ) {
-    return false;
-  }
-  return /^(我(会|将|先|现在|正在|继续|已经|已)|让我|接下来|现在|继续|已|正在).{0,40}(读取|查看|搜索|调查|执行|运行|调用|写入|修改|验证|整理|完成)/.test(normalized) ||
-    /(已读取|已搜索|已执行|读取完成|搜索完成|命令完成|工具调用完成|continuingto|i(?:'|’)llread|iread|readcomplete|runningcommand)/i.test(normalized);
+  return isThinModelToolNarration(text);
 }
 
 function shouldSuppressAgentToolEcho(blocks: any[], agentIndex: number): boolean {
@@ -961,88 +957,20 @@ function buildBlockRenderItems(
     includeDiff?: boolean;
     includeReadContextTools?: boolean;
     minGroupSize?: number;
+    splitProjectStructureExplore?: boolean;
   } = false,
+  language: "zh" | "en" = "zh",
 ) {
   const completedToolGroupingConfig =
     typeof enableCompletedToolGrouping === "object"
       ? enableCompletedToolGrouping
       : { enabled: enableCompletedToolGrouping };
-  const shouldGroupCompletedTools = completedToolGroupingConfig.enabled === true;
-  const items: Array<
-    | { kind: "block"; block: any; index: number }
-    | { kind: "readContextGroup"; blocks: any[]; index: number }
-    | { kind: "completedToolGroup"; blocks: any[]; index: number }
-  > = [];
-  let activeReadContextGroup: { kind: "readContextGroup"; blocks: any[]; index: number } | null = null;
-
-  // Build tool group ranges ignoring thought blocks, so that thought blocks
-  // interleaved between tool calls do not prevent grouping.
-  const completedToolGroupRangesByStart = new Map<number, { startIndex: number; endIndex: number }>();
-  if (shouldGroupCompletedTools) {
-    // Map from grouping index to the original block index.
-    const toolBlockEntries: Array<{ block: any; originalIndex: number }> = [];
-    for (let i = 0; i < blocks.length; i++) {
-      if (blocks[i].type !== "thought" && !isTransparentToolNarrationBlock(blocks[i])) {
-        toolBlockEntries.push({ block: blocks[i], originalIndex: i });
-      }
-    }
-    const toolOnlyBlocks = toolBlockEntries.map((e) => e.block);
-    const ranges = buildCompletedToolGroupRanges({
-      blocks: toolOnlyBlocks,
-      excludedToolNames: completedToolGroupingConfig.includeReadContextTools ? undefined : READ_CONTEXT_TOOL_NAMES,
-      includeDiff: completedToolGroupingConfig.includeDiff,
-      minGroupSize: completedToolGroupingConfig.minGroupSize,
-    });
-    for (const range of ranges) {
-      const startOriginalIndex = toolBlockEntries[range.startIndex].originalIndex;
-      const endOriginalIndex = toolBlockEntries[range.endIndex].originalIndex;
-      completedToolGroupRangesByStart.set(startOriginalIndex, { startIndex: startOriginalIndex, endIndex: endOriginalIndex });
-    }
-  }
-
-  for (let index = 0; index < blocks.length; index += 1) {
-    const block = blocks[index];
-    const completedToolGroupRange = completedToolGroupRangesByStart.get(index);
-    if (completedToolGroupRange) {
-      activeReadContextGroup = null;
-      const groupedWindow = blocks.slice(completedToolGroupRange.startIndex, completedToolGroupRange.endIndex + 1);
-      items.push({
-        kind: "completedToolGroup",
-        blocks: groupedWindow.filter((windowBlock) => windowBlock.type === "tool"),
-        index,
-      });
-      groupedWindow.forEach((windowBlock, offset) => {
-        if (windowBlock.type === "thought") {
-          items.push({ kind: "block", block: windowBlock, index: completedToolGroupRange.startIndex + offset });
-        }
-      });
-      index = completedToolGroupRange.endIndex;
-      continue;
-    }
-
-    if (isCompletedReadContextTool(block)) {
-      if (!activeReadContextGroup) {
-        activeReadContextGroup = { kind: "readContextGroup", blocks: [block], index };
-        items.push(activeReadContextGroup);
-      } else {
-        activeReadContextGroup.blocks.push(block);
-      }
-      continue;
-    }
-
-    if (!includeUser && block?.type === "user") {
-      activeReadContextGroup = null;
-      continue;
-    }
-
-    if (isReadContextHardBoundary(block)) {
-      activeReadContextGroup = null;
-    }
-
-    items.push({ kind: "block", block, index });
-  }
-
-  return items;
+  return buildChatRenderSegments({
+    blocks,
+    includeUser,
+    language,
+    completedToolGrouping: completedToolGroupingConfig,
+  });
 }
 
 function buildToolExecutionSummary(blocks: any[], language: "zh" | "en") {
@@ -1114,6 +1042,7 @@ function shouldGroupPlanExecutionTools(input: {
     includeDiff: input.turnIntent === "execute" || isApprovedPlanExecution,
     includeReadContextTools: isApprovedPlanExecution,
     minGroupSize: isApprovedPlanExecution ? 1 : 2,
+    splitProjectStructureExplore: input.isPlanTurn && !input.isPlanApproved,
   };
 }
 
@@ -1786,6 +1715,138 @@ function CompletedToolGroupCard({
   );
 }
 
+function getOperationClusterTone(kind: ChatOperationCluster["kind"]) {
+  if (kind === "edit") return "text-[#93c5fd]";
+  if (kind === "command" || kind === "verify") return "text-[#c4b5fd]";
+  if (kind === "explore") return "text-[#fbbf24]";
+  return "text-[#34d399]";
+}
+
+function ChatOperationClusterBlock({
+  cluster,
+  language,
+}: {
+  cluster: ChatOperationCluster;
+  language: "zh" | "en";
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const toneClass = getOperationClusterTone(cluster.kind);
+  const toggleText = expanded
+    ? language === "zh" ? "收起" : "Collapse"
+    : language === "zh" ? "展开" : "Expand";
+  const duplicateText = cluster.duplicateCount > 0
+    ? language === "zh"
+      ? `去重 ${cluster.duplicateCount} 次重复读取${cluster.cachedCount ? `，其中 ${cluster.cachedCount} 次为缓存复用` : ""}`
+      : `Deduped ${cluster.duplicateCount} repeated read${cluster.duplicateCount > 1 ? "s" : ""}${cluster.cachedCount ? `, ${cluster.cachedCount} cached` : ""}`
+    : "";
+  const buttonLegacyTestId = cluster.legacyTestId;
+  const detailsLegacyTestId = cluster.legacyTestId === "read-context-group"
+    ? "read-context-group-details"
+    : cluster.legacyTestId === "completed-tool-group"
+    ? "completed-tool-group-details"
+    : undefined;
+  const itemLegacyTestId = cluster.legacyTestId === "read-context-group"
+    ? "read-context-item"
+    : cluster.legacyTestId === "completed-tool-group"
+    ? "completed-tool-group-item"
+    : undefined;
+
+  return (
+    <div
+      data-testid="chat-operation-cluster"
+      data-kind={cluster.kind}
+      className="ml-9 max-w-[calc(100%-2.25rem)] min-w-0"
+    >
+      <button
+        type="button"
+        data-testid={buttonLegacyTestId}
+        aria-expanded={expanded}
+        onClick={() => setExpanded((value) => !value)}
+        className="group flex w-full min-w-0 items-center gap-2 rounded-lg px-1.5 py-1.5 text-left transition-colors hover:bg-[color-mix(in_srgb,var(--accent)_6%,transparent)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-transparent"
+      >
+        {expanded ? (
+          <IconChevronDown className="h-3.5 w-3.5 shrink-0 text-[var(--surface-text-muted)]" />
+        ) : (
+          <IconChevronRight className="h-3.5 w-3.5 shrink-0 text-[var(--surface-text-muted)]" />
+        )}
+        <IconCheck className={`h-3.5 w-3.5 shrink-0 ${toneClass}`} />
+        <span className="shrink-0 text-[13px] font-semibold text-[var(--surface-text)]">{cluster.title}</span>
+        {cluster.countSummary && (
+          <span data-testid="chat-operation-count-summary" className="shrink-0 text-[12px] text-[var(--surface-text-subtle)]">
+            · {language === "zh" ? `已探索 ${cluster.countSummary}` : cluster.countSummary}
+          </span>
+        )}
+        {cluster.previewText && (
+          <span className="min-w-0 flex-1 truncate text-[12px] text-[var(--surface-text-muted)]">
+            · {cluster.previewText}
+          </span>
+        )}
+        {cluster.purposeSummary && (
+          <span data-testid="chat-operation-summary" className="hidden min-w-0 flex-1 truncate text-[11px] text-[var(--surface-text-subtle)] lg:block">
+            {cluster.purposeSummary}
+          </span>
+        )}
+        {duplicateText && (
+          <span data-testid="read-context-group-dedupe" className="shrink-0 rounded-full border border-[rgba(96,165,250,0.22)] bg-[rgba(37,99,235,0.08)] px-2 py-0.5 text-[10px] text-[#93c5fd]">
+            {duplicateText}
+          </span>
+        )}
+        <span className="shrink-0 rounded-full border border-[var(--surface-border-soft)] px-2 py-0.5 text-[10px] text-[var(--surface-text-muted)]">
+          {toggleText}
+        </span>
+      </button>
+
+      {expanded && (
+        <div
+          data-testid="chat-operation-cluster-details"
+          className="ml-6 mt-1.5 space-y-1 border-l border-[var(--surface-border-soft)] pl-3"
+        >
+          {detailsLegacyTestId && (
+            <div data-testid={detailsLegacyTestId} className="space-y-1">
+              {cluster.items.map((item) => (
+                <div
+                  key={item.key}
+                  data-testid={itemLegacyTestId}
+                  data-kind={item.kind}
+                  className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2 rounded-md px-1.5 py-1 text-[12px] text-[var(--surface-text-subtle)]"
+                >
+                  <IconCheck className={`h-3 w-3 ${getOperationClusterTone(item.kind)}`} />
+                  <div className="min-w-0">
+                    <div className="flex min-w-0 items-center gap-2">
+                      <span className="shrink-0 font-semibold text-[var(--surface-text)]">{item.label}</span>
+                      <span className="min-w-0 truncate font-mono text-[var(--surface-text-subtle)]" title={item.target}>
+                        {item.displayTarget}
+                      </span>
+                      {item.count > 1 && (
+                        <span data-testid="read-context-item-repeat" className="shrink-0 rounded-full border border-[var(--surface-border-soft)] px-1.5 py-0.5 text-[9px] text-[#93c5fd]">
+                          x{item.count}{item.cachedCount ? ` / ${item.cachedCount} cached` : ""}
+                        </span>
+                      )}
+                    </div>
+                    {item.target !== item.displayTarget && (
+                      <div className="truncate font-mono text-[10px] text-[var(--surface-text-muted)]" title={item.target}>
+                        {item.target}
+                      </div>
+                    )}
+                    {item.summary && (
+                      <div data-testid={cluster.legacyTestId === "read-context-group" ? "read-context-item-summary" : "completed-tool-item-summary"} className="truncate text-[10.5px] text-[var(--surface-text-muted)]">
+                        {item.summary}
+                      </div>
+                    )}
+                  </div>
+                  <span className="shrink-0 rounded-full border border-[rgba(52,211,153,0.18)] bg-[rgba(52,211,153,0.08)] px-1.5 py-0.5 text-[9px] text-[#86efac]">
+                    {language === "zh" ? "完成" : "Done"}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function TurnProcessArchive({
   archive,
   language,
@@ -1850,7 +1911,7 @@ function TurnProcessArchive({
         <div data-testid="turn-process-archive-details" className="mt-2 space-y-3 px-2">
           {thoughtSteps.map((step) => (
             <div key={step.id} data-testid="turn-archive-thought-step">
-              {buildBlockRenderItems(step.items, false).map((item: any, index: number) => (
+              {buildBlockRenderItems(step.items, false, false, language).map((item: any, index: number) => (
                 <React.Fragment key={`archived-thought-${item.block?.id ?? item.blocks?.[0]?.id ?? index}-${index}`}>
                   {renderArchivedItem(item)}
                 </React.Fragment>
@@ -2010,7 +2071,7 @@ function TurnArchiveStepCard({
   const [expanded, setExpanded] = useState(!isLive && step.expandedByDefault);
   const { entries, totalExecutedEdits } = collectTurnChangeEntries(step.items);
   const hasChangeSummary = step.kind === "edit" && entries.length > 0;
-  const detailItems = buildBlockRenderItems(step.items, false);
+  const detailItems = buildBlockRenderItems(step.items, false, false, language);
   const canExpandDetails = !isLive && (hasChangeSummary || detailItems.length > 0);
   const toggleText = expanded
     ? isLive
@@ -3055,6 +3116,15 @@ export default function ChatArea({
   };
 
   const renderBlockItem = (item) => {
+    if (item.kind === "operationCluster") {
+      return (
+        <ChatOperationClusterBlock
+          key={item.cluster.id}
+          cluster={item.cluster}
+          language={language}
+        />
+      );
+    }
     if (item.kind === "readContextGroup") {
       const firstId = item.blocks[0]?.id ?? item.index;
       const lastId = item.blocks[item.blocks.length - 1]?.id ?? item.index;
@@ -3085,7 +3155,7 @@ export default function ChatArea({
     if (!entry.turn) {
       return (
         <div key={`legacy-${index}`} className="space-y-4">
-          {buildBlockRenderItems(entry.blocks).map(renderBlockItem)}
+          {buildBlockRenderItems(entry.blocks, true, false, language).map(renderBlockItem)}
         </div>
       );
     }
@@ -3220,18 +3290,29 @@ export default function ChatArea({
         : "";
     const isBottomThoughtStreaming = !!latestThoughtBlock?.isStreaming;
     const renderTurnBlockItem = (item) => {
-      if (item.kind !== "readContextGroup" && item.block?.type === "thought") return null;
-      if (item.kind === "block" && isTransparentToolNarrationBlock(item.block)) return null;
+      if (item.kind !== "readContextGroup" && item.kind !== "operationCluster" && item.block?.type === "thought") return null;
+      if (item.kind === "block" && isTransparentToolNarrationBlock(item.block)) {
+        const hasPriorVisibleAgentNarrative = blocks.some((candidate, candidateIndex) =>
+          candidateIndex < item.index &&
+          candidate?.type === "agent" &&
+          !candidate.hiddenProcess &&
+          hasRenderableAgentBlock(candidate)
+        );
+        if (hasPriorVisibleAgentNarrative) return null;
+      }
       if (item.kind === "block" && shouldSuppressAgentToolEcho(blocks, item.index)) return null;
 
       return renderBlockItem(item);
     };
     const renderArchivedBlockItem = (item) => {
-      if (item.kind !== "readContextGroup" && item.block?.type === "thought") return null;
+      if (item.kind !== "readContextGroup" && item.kind !== "operationCluster" && item.block?.type === "thought") return null;
       if (item.kind === "block" && isTransparentToolNarrationBlock(item.block)) return null;
       return renderBlockItem(item);
     };
     const isLiveProcessRenderItem = (item) => {
+      if (item.kind === "operationCluster") {
+        return item.cluster.blocks.every((block: any) => liveProcessBlockIds.has(block?.id));
+      }
       if (item.kind === "readContextGroup") {
         return false;
       }
@@ -3412,7 +3493,7 @@ export default function ChatArea({
                       onOpenDiff={openDiffForTask}
                     />
                   )}
-                  {buildBlockRenderItems(blocks, false, enableCompletedToolGrouping).map(renderLiveRemainderItem)}
+                  {buildBlockRenderItems(blocks, false, enableCompletedToolGrouping, language).map(renderLiveRemainderItem)}
                 </>
               )}
             </>

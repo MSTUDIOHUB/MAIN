@@ -19,6 +19,7 @@ const READ_CONTEXT_INTERLEAVED_SCENARIO = "read-context-interleaved";
 const READ_CONTEXT_AGENT_SEGMENT_SCENARIO = "read-context-agent-segment";
 const READ_CONTEXT_THIN_NARRATION_SCENARIO = "read-context-thin-narration";
 const READ_CONTEXT_PERSISTENT_PROGRESS_SCENARIO = "read-context-persistent-progress";
+const OPENCODE_TRANSCRIPT_DISPLAY_SCENARIO = "opencode-transcript-display";
 const PROCESS_DISPLAY_SCENARIO = "process-display";
 const GAME_STUDIO_ONBOARDING_SCENARIO = "game-studio-onboarding";
 const COMPOSER_MAIN_SHORTCUTS_SCENARIO = "composer-main-shortcuts";
@@ -1939,6 +1940,178 @@ function seedReadContextPersistentProgressScenario() {
 
   bindBridgeSnapshot(READ_CONTEXT_PERSISTENT_PROGRESS_SCENARIO);
   appendBridgeEvent("seeded", { seedCount: readSeedCount(READ_CONTEXT_PERSISTENT_PROGRESS_SCENARIO) });
+
+  const cleanup = () => {
+    bridge.initialized = false;
+  };
+
+  bridge.cleanup = cleanup;
+  return cleanup;
+}
+
+function seedOpencodeTranscriptDisplayScenario() {
+  const bridge = getBridge();
+  if (!bridge) return undefined;
+
+  bridge.events = [{ type: "boot" }];
+  bridge.savedDocuments = [];
+  bridge.completed = false;
+
+  const workspace = "/tmp/e2e-opencode-transcript-display";
+  const sessionId = 999041;
+  const now = Date.now();
+
+  useAppStore.setState((state) => ({
+    ...state,
+    config: {
+      ...state.config,
+      language: "zh",
+      workflowMode: "plan",
+    },
+    currentWorkspace: workspace,
+    sessionsByWorkspace: {
+      [workspace]: [
+        {
+          id: sessionId,
+          title: "E2E opencode transcript display",
+          date: new Date(now).toISOString(),
+          active: true,
+          messages: [],
+        },
+      ],
+    },
+    currentSessionId: sessionId,
+    taskFlow: [],
+    conversationTurns: [],
+    currentTurnId: null,
+    agentStatus: "idle",
+    isGenerating: false,
+    isPlanApproved: false,
+    planStage: "idle",
+    showPlanPanel: false,
+    showDiff: false,
+    showTerminal: false,
+    showFilePanel: false,
+  }));
+
+  bridge.sendOpencodeTranscriptTestContent = (text: string) => {
+    const state = useAppStore.getState();
+    const turnId = "e2e-opencode-transcript-turn";
+    const createdAt = Date.now();
+    const nextId = () => useAppStore.getState()._nextTaskId();
+    const taskFlow: any[] = [
+      {
+        id: nextId(),
+        turnId,
+        type: "user" as const,
+        content: text,
+      },
+      {
+        id: nextId(),
+        turnId,
+        type: "agent" as const,
+        content: "我会先整体理解项目结构，然后读取 ChatArea、工具分组和 Plan runtime 的关键链路。",
+        streaming: false,
+      },
+      {
+        id: nextId(),
+        turnId,
+        type: "tool" as const,
+        toolName: "get_project_skeleton",
+        target: "",
+        status: "done",
+        toolStatus: "executed" as const,
+        message: "src/, tests/, src-tauri/",
+        observationSummary: "捕获项目结构入口。",
+      },
+      {
+        id: nextId(),
+        turnId,
+        type: "agent" as const,
+        content: "让我继续读取关键文件来确认渲染结构。",
+        streaming: false,
+      },
+      {
+        id: nextId(),
+        turnId,
+        type: "tool" as const,
+        toolName: "read_file",
+        target: "src/components/ChatArea.tsx",
+        status: "done",
+        toolStatus: "executed" as const,
+        message: "OK",
+        observationSummary: "读取 ChatArea 渲染入口。",
+      },
+      {
+        id: nextId(),
+        turnId,
+        type: "tool" as const,
+        toolName: "read_file",
+        target: "src/lib/toolUiGrouping.ts",
+        status: "done",
+        toolStatus: "executed" as const,
+        message: "OK",
+        observationSummary: "读取工具 UI 分组逻辑。",
+      },
+      {
+        id: nextId(),
+        turnId,
+        type: "tool" as const,
+        toolName: "read_file",
+        target: "src/lib/planRuntime.ts",
+        status: "done",
+        toolStatus: "executed" as const,
+        message: "OK",
+        observationSummary: "读取 Plan runtime 阶段逻辑。",
+      },
+      {
+        id: nextId(),
+        turnId,
+        type: "agent" as const,
+        content: "让我继续读取关键文件来确认渲染结构。",
+        streaming: false,
+      },
+      {
+        id: nextId(),
+        turnId,
+        type: "agent" as const,
+        content: "从已读取的文件中，我发现显示层需要先生成 operation cluster，再交给 ChatArea 渲染；Plan 模式也需要先进入 Explore 项目结构阶段。",
+        streaming: false,
+      },
+    ];
+
+    useAppStore.setState((current) => ({
+      ...current,
+      taskFlow,
+      conversationTurns: [
+        {
+          id: turnId,
+          userPrompt: text,
+          title: "opencode transcript 渲染回归",
+          mode: "plan" as const,
+          status: "done" as const,
+          summary: "已验证 opencode 风格 transcript 渲染。",
+          blockIds: taskFlow.map((block) => block.id),
+          collapsed: false,
+          createdAt,
+        },
+      ],
+      currentTurnId: turnId,
+      agentStatus: "idle",
+      isGenerating: false,
+      currentWorkspace: workspace,
+      currentSessionId: sessionId,
+    }));
+    appendBridgeEvent("sent_opencode_transcript_test", { text });
+    return {
+      taskFlowBlocks: taskFlow.length,
+      turnId,
+      previousTurns: state.conversationTurns.length,
+    };
+  };
+
+  bindBridgeSnapshot(OPENCODE_TRANSCRIPT_DISPLAY_SCENARIO);
+  appendBridgeEvent("seeded", { seedCount: readSeedCount(OPENCODE_TRANSCRIPT_DISPLAY_SCENARIO) });
 
   const cleanup = () => {
     bridge.initialized = false;
@@ -5889,6 +6062,10 @@ export function initializeE2EScenarios(): (() => void) | undefined {
 
   if (scenario === READ_CONTEXT_PERSISTENT_PROGRESS_SCENARIO) {
     return seedReadContextPersistentProgressScenario();
+  }
+
+  if (scenario === OPENCODE_TRANSCRIPT_DISPLAY_SCENARIO) {
+    return seedOpencodeTranscriptDisplayScenario();
   }
 
   if (scenario === PROCESS_DISPLAY_SCENARIO) {
