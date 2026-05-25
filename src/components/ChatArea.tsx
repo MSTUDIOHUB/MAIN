@@ -42,7 +42,7 @@ import {
   countCompletedToolCalls,
   type ChatOperationCluster,
 } from "../lib/toolUiGrouping";
-import { isThinModelToolNarration } from "../lib/modelFeedbackDedupe";
+import { isThinModelToolNarration, isSubstantiveModelFeedback } from "../lib/modelFeedbackDedupe";
 import { compactToolPresentationTarget, getToolPresentationLabel } from "../lib/toolPresentation";
 import { buildLiveTurnProcessTimelineModel, buildTurnProcessArchiveModel, type TurnArchiveStep } from "../lib/turnProcessArchive";
 import {
@@ -2781,6 +2781,36 @@ export default function ChatArea({
     return deriveTurnProgressItems(topIslandTurnBlocks, language);
   }, [language, topIslandTurn, topIslandTurnBlocks]);
   const composerPaddingBottom = composerHeight + 32;
+  const explanationText = useMemo(() => {
+    if (!isStreaming || !activeTurn) return "";
+    const activeTurnBlocks = blocksByTurnId.byTurnId.get(activeTurn.id) || [];
+    
+    for (let i = activeTurnBlocks.length - 1; i >= 0; i--) {
+      const block = activeTurnBlocks[i];
+      if (block.type === "agent") {
+        const text = getAgentVisibleMarkdownText(block);
+        const content = String(text || "").trim();
+        if (!content) continue;
+        
+        const followedByTool = activeTurnBlocks.slice(i + 1).some(b => b.type === "tool");
+        if (followedByTool) {
+          return content;
+        }
+        
+        if (block.streaming) {
+          const isSubstantive = isSubstantiveModelFeedback(content);
+          if (!isSubstantive) {
+            return content;
+          }
+        } else {
+          if (isTransparentToolNarrationBlock({ ...block, streaming: false })) {
+            return content;
+          }
+        }
+      }
+    }
+    return "";
+  }, [isStreaming, activeTurn, blocksByTurnId]);
   const hasPlanPanelContent = useMemo(() => {
     if (planArtifacts.length > 0) return true;
 
@@ -3703,6 +3733,30 @@ export default function ChatArea({
           </div>
         )}
         <div ref={endOfFlowRef} />
+      </div>
+
+      {/* Floating Capsule for Agent Tool Explanations */}
+      <div
+        className="absolute left-6 right-6 z-30 pointer-events-none flex justify-center transition-all duration-300 ease-out"
+        style={{
+          bottom: `calc(env(safe-area-inset-bottom, 0px) + 1.5rem + ${composerHeight}px + 12px)`,
+          opacity: explanationText ? 1 : 0,
+          transform: explanationText ? 'translateY(0)' : 'translateY(8px)',
+        }}
+      >
+        {explanationText && (
+          <div 
+            className="agent-explanation-capsule w-full max-w-3xl"
+            style={{
+              fontSize: `${Math.max(11, resolvedChatFontSize - 1)}px`,
+              lineHeight: `${Math.max(16, Math.round((resolvedChatFontSize - 1) * 1.5))}px`
+            }}
+          >
+            <span className="line-clamp-2 text-ellipsis overflow-hidden">
+              {explanationText}
+            </span>
+          </div>
+        )}
       </div>
 
       <Composer

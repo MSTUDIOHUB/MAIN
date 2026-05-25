@@ -7246,7 +7246,7 @@ fn cancel_chat_stream() -> Result<(), String> {
 
 // region: get_file_outline C# 符号提取
 
-/// Lightweight regex-based C# symbol extractor.
+/// Lightweight regex-based C#/multi-language symbol extractor.
 /// Produces an "interface-first" outline: type declarations + public/protected
 /// members, with method bodies stripped.
 #[tauri::command]
@@ -7264,14 +7264,348 @@ fn get_file_outline(
         .unwrap_or_default()
         .to_lowercase();
 
-    if ext != "cs" {
-        return Err("get_file_outline 仅支持 .cs 文件".to_string());
-    }
-
     let source = fs::read_to_string(&real_path).map_err(|e| format!("无法读取文件: {e}"))?;
 
-    Ok(extract_csharp_outline(&source))
+    if ext == "cs" {
+        Ok(extract_csharp_outline(&source))
+    } else {
+        Ok(extract_generic_outline(&source, &ext))
+    }
 }
+
+fn extract_generic_outline(source: &str, ext: &str) -> String {
+    match ext {
+        "ts" | "tsx" | "js" | "jsx" => extract_typescript_outline(source),
+        "rs" => extract_rust_outline(source),
+        "py" => extract_python_outline(source),
+        "go" => extract_go_outline(source),
+        _ => extract_fallback_outline(source),
+    }
+}
+
+fn extract_typescript_outline(source: &str) -> String {
+    let mut outline = String::new();
+    let mut brace_depth: i32 = 0;
+    let mut type_depth: i32 = -1;
+    let mut in_type_body = false;
+    let mut current_type_kind = String::new();
+
+    let re_decl = Regex::new(
+        r"(?i)^\s*(export\s+(?:default\s+)?)?(class|interface|type|enum|function|const|let|var)\s+([A-Za-z_]\w*)"
+    ).unwrap();
+
+    let re_method = Regex::new(
+        r"^\s*(?:[A-Za-z_]\w*\s+)*([A-Za-z_]\w*)\s*\([^)]*\)"
+    ).unwrap();
+
+    let re_property = Regex::new(
+        r"^\s*(?:[A-Za-z_]\w*\s+)*([A-Za-z_]\w*)\s*(\??:|=)"
+    ).unwrap();
+
+    let mut in_block_comment = false;
+
+    for line in source.lines() {
+        let trimmed = line.trim();
+
+        if in_block_comment {
+            if trimmed.contains("*/") {
+                in_block_comment = false;
+            }
+            continue;
+        }
+        if trimmed.starts_with("/*") {
+            if !trimmed.contains("*/") {
+                in_block_comment = true;
+            }
+            continue;
+        }
+
+        if trimmed.is_empty() || trimmed.starts_with("//") {
+            continue;
+        }
+
+        let opens = trimmed.chars().filter(|c| *c == '{').count() as i32;
+        let closes = trimmed.chars().filter(|c| *c == '}').count() as i32;
+
+        let start_depth = brace_depth;
+
+        if start_depth == 0 || (start_depth == 1 && opens > 0 && closes == 0 && !in_type_body) {
+            if let Some(caps) = re_decl.captures(trimmed) {
+                let kind = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+                
+                let decl_line = match trimmed.find('{') {
+                    Some(idx) => trimmed[..idx].trim().to_string(),
+                    None => trimmed.to_string(),
+                };
+                outline.push_str(&format!("{}\n", decl_line));
+
+                current_type_kind = kind.to_lowercase();
+                type_depth = start_depth;
+                in_type_body = true;
+                brace_depth += opens - closes;
+                continue;
+            }
+        }
+
+        if in_type_body && start_depth == type_depth + 1 {
+            if current_type_kind == "class" || current_type_kind == "interface" {
+                if !trimmed.contains("private ") && !trimmed.contains("internal ") {
+                    if let Some(caps) = re_method.captures(trimmed) {
+                        let method_name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                        if method_name != "if" && method_name != "for" && method_name != "while" && method_name != "switch" {
+                            let sig_line = match trimmed.find('{') {
+                                Some(idx) => trimmed[..idx].trim().to_string(),
+                                None => trimmed.to_string(),
+                            };
+                            outline.push_str(&format!("  {}\n", sig_line));
+                        }
+                    } else if let Some(caps) = re_property.captures(trimmed) {
+                        let prop_name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                        if prop_name != "return" {
+                            outline.push_str(&format!("  {}\n", trimmed));
+                        }
+                    }
+                }
+            } else if current_type_kind == "enum" {
+                if !trimmed.starts_with('}') {
+                    outline.push_str(&format!("  {}\n", trimmed));
+                }
+            }
+        }
+
+        brace_depth += opens - closes;
+
+        if in_type_body && brace_depth <= type_depth {
+            in_type_body = false;
+            current_type_kind.clear();
+            outline.push('\n');
+        }
+    }
+
+    if outline.is_empty() {
+        outline.push_str("(No class/interface/type declarations found)\n");
+    }
+    outline
+}
+
+fn extract_rust_outline(source: &str) -> String {
+    let mut outline = String::new();
+    let mut brace_depth: i32 = 0;
+    let mut type_depth: i32 = -1;
+    let mut in_type_body = false;
+    let mut current_type_kind = String::new();
+
+    let re_decl = Regex::new(
+        r"^\s*(pub(?:\([^)]+\))?\s+)?(struct|enum|trait|impl|fn|const|type|macro_rules!)\b"
+    ).unwrap();
+
+    let re_rust_method = Regex::new(
+        r"^\s*(pub(?:\([^)]+\))?\s+)?(async\s+)?fn\s+([A-Za-z_]\w*)"
+    ).unwrap();
+
+    let re_rust_field = Regex::new(
+        r"^\s*pub(?:\([^)]+\))?\s+([A-Za-z_]\w*)\s*:"
+    ).unwrap();
+
+    let mut in_block_comment = false;
+
+    for line in source.lines() {
+        let trimmed = line.trim();
+
+        if in_block_comment {
+            if trimmed.contains("*/") {
+                in_block_comment = false;
+            }
+            continue;
+        }
+        if trimmed.starts_with("/*") {
+            if !trimmed.contains("*/") {
+                in_block_comment = true;
+            }
+            continue;
+        }
+
+        if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with("#[") {
+            continue;
+        }
+
+        let opens = trimmed.chars().filter(|c| *c == '{').count() as i32;
+        let closes = trimmed.chars().filter(|c| *c == '}').count() as i32;
+
+        let start_depth = brace_depth;
+
+        if start_depth == 0 || (start_depth == 1 && opens > 0 && closes == 0 && !in_type_body) {
+            if let Some(caps) = re_decl.captures(trimmed) {
+                let kind = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+                
+                let decl_line = match trimmed.find('{') {
+                    Some(idx) => trimmed[..idx].trim().to_string(),
+                    None => trimmed.to_string(),
+                };
+                outline.push_str(&format!("{}\n", decl_line));
+
+                current_type_kind = kind.to_string();
+                type_depth = start_depth;
+                in_type_body = true;
+                brace_depth += opens - closes;
+                continue;
+            }
+        }
+
+        if in_type_body && start_depth == type_depth + 1 {
+            if current_type_kind == "impl" || current_type_kind == "trait" {
+                if let Some(_) = re_rust_method.captures(trimmed) {
+                    if current_type_kind == "trait" || trimmed.starts_with("pub ") || trimmed.starts_with("pub(") {
+                        let sig_line = match trimmed.find('{') {
+                            Some(idx) => trimmed[..idx].trim().to_string(),
+                            None => trimmed.to_string(),
+                        };
+                        outline.push_str(&format!("  {}\n", sig_line));
+                    }
+                }
+            } else if current_type_kind == "struct" {
+                if let Some(_) = re_rust_field.captures(trimmed) {
+                    outline.push_str(&format!("  {}\n", trimmed));
+                }
+            } else if current_type_kind == "enum" {
+                if !trimmed.starts_with('}') && !trimmed.is_empty() {
+                    outline.push_str(&format!("  {}\n", trimmed));
+                }
+            }
+        }
+
+        brace_depth += opens - closes;
+
+        if in_type_body && brace_depth <= type_depth {
+            in_type_body = false;
+            current_type_kind.clear();
+            outline.push('\n');
+        }
+    }
+
+    if outline.is_empty() {
+        outline.push_str("(No struct/enum/trait/impl/fn declarations found)\n");
+    }
+    outline
+}
+
+fn extract_python_outline(source: &str) -> String {
+    let mut outline = String::new();
+
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        if trimmed.starts_with("def ") || trimmed.starts_with("class ") {
+            let leading_spaces = line.len() - line.trim_start().len();
+            if leading_spaces <= 4 {
+                outline.push_str(&format!("{}{}\n", " ".repeat(leading_spaces), trimmed));
+            }
+        }
+    }
+
+    if outline.is_empty() {
+        outline.push_str("(No class or function definitions found)\n");
+    }
+    outline
+}
+
+fn extract_go_outline(source: &str) -> String {
+    let mut outline = String::new();
+    let mut brace_depth: i32 = 0;
+    let mut type_depth: i32 = -1;
+    let mut in_type_body = false;
+    let mut current_type_kind = String::new();
+
+    let re_decl = Regex::new(
+        r"^\s*(type\s+([A-Za-z_]\w*)\s+(struct|interface)|func\s+(?:\([^)]+\)\s+)?([A-Za-z_]\w*)\s*\()"
+    ).unwrap();
+
+    for line in source.lines() {
+        let trimmed = line.trim();
+
+        if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with("/*") {
+            continue;
+        }
+
+        let opens = trimmed.chars().filter(|c| *c == '{').count() as i32;
+        let closes = trimmed.chars().filter(|c| *c == '}').count() as i32;
+
+        let start_depth = brace_depth;
+
+        if start_depth == 0 || (start_depth == 1 && opens > 0 && closes == 0 && !in_type_body) {
+            if let Some(caps) = re_decl.captures(trimmed) {
+                let _name = caps.get(2).or(caps.get(4)).map(|m| m.as_str()).unwrap_or("");
+                let kind = caps.get(3).map(|m| m.as_str()).unwrap_or("func");
+
+                let decl_line = match trimmed.find('{') {
+                    Some(idx) => trimmed[..idx].trim().to_string(),
+                    None => trimmed.to_string(),
+                };
+                outline.push_str(&format!("{}\n", decl_line));
+
+                if kind == "struct" || kind == "interface" {
+                    current_type_kind = kind.to_string();
+                    type_depth = start_depth;
+                    in_type_body = true;
+                }
+                brace_depth += opens - closes;
+                continue;
+            }
+        }
+
+        if in_type_body && start_depth == type_depth + 1 {
+            if !trimmed.starts_with('}') && !trimmed.is_empty() {
+                outline.push_str(&format!("  {}\n", trimmed));
+            }
+        }
+
+        brace_depth += opens - closes;
+
+        if in_type_body && brace_depth <= type_depth {
+            in_type_body = false;
+            current_type_kind.clear();
+            outline.push('\n');
+        }
+    }
+
+    if outline.is_empty() {
+        outline.push_str("(No type or func declarations found)\n");
+    }
+    outline
+}
+
+fn extract_fallback_outline(source: &str) -> String {
+    let mut outline = String::new();
+    let re_fallback = Regex::new(
+        r"(?i)^\s*(public|protected|private|export|pub)?\s*(class|struct|interface|enum|fn|function|def|func|void|int|string|var|let|const)\s+([A-Za-z_]\w*)"
+    ).unwrap();
+
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with('#') || trimmed.starts_with("/*") {
+            continue;
+        }
+
+        if let Some(_) = re_fallback.captures(trimmed) {
+            if trimmed.len() < 120 {
+                let display_line = match trimmed.find('{') {
+                    Some(idx) => trimmed[..idx].trim().to_string(),
+                    None => trimmed.to_string(),
+                };
+                outline.push_str(&format!("{}\n", display_line));
+            }
+        }
+    }
+
+    if outline.is_empty() {
+        outline.push_str("(No recognizable declarations found)\n");
+    }
+    outline
+}
+
 
 fn extract_csharp_outline(source: &str) -> String {
     let mut outline = String::new();
@@ -7307,8 +7641,10 @@ fn extract_csharp_outline(source: &str) -> String {
         let opens = trimmed.chars().filter(|c| *c == '{').count() as i32;
         let closes = trimmed.chars().filter(|c| *c == '}').count() as i32;
 
+        let start_depth = brace_depth;
+
         // At depth 0: look for type declarations
-        if brace_depth == 0 || (brace_depth == 1 && opens > 0 && closes == 0 && !in_type_body) {
+        if start_depth == 0 || (start_depth == 1 && opens > 0 && closes == 0 && !in_type_body) {
             if let Some(caps) = re_type.captures(trimmed) {
                 let access = caps.get(1).map(|m| m.as_str()).unwrap_or("internal");
                 let modifier = caps.get(2).map(|m| m.as_str()).unwrap_or("");
@@ -7329,14 +7665,41 @@ fn extract_csharp_outline(source: &str) -> String {
                     format!(" : {}", inherits)
                 };
                 outline.push_str(&format!(
-                    "{} {}{}{}{}\n",
+                    "{} {}{} {}{}\n",
                     access, mod_str, kind, name, inherit_str
                 ));
 
-                type_depth = brace_depth;
+                type_depth = start_depth;
                 in_type_body = true;
                 brace_depth += opens - closes;
                 continue;
+            }
+        }
+
+        // Inside a type body at depth 1 (relative to type)
+        if in_type_body && start_depth == type_depth + 1 {
+            // Enums: extract members
+            if current_type_kind == "enum" {
+                if let Some(caps) = re_enum_member.captures(trimmed) {
+                    let member = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                    if !member.is_empty() && member != "get" && member != "set" {
+                        outline.push_str(&format!("  {}\n", member));
+                    }
+                }
+            } else {
+                // Properties
+                if let Some(caps) = re_property.captures(trimmed) {
+                    let access = caps.get(1).map(|m| m.as_str()).unwrap_or("public");
+                    let prop_name = caps.get(2).map(|m| m.as_str()).unwrap_or("?");
+                    let sig = extract_property_signature(trimmed, access, prop_name);
+                    outline.push_str(&format!("  {}\n", sig));
+                } else if let Some(caps) = re_method.captures(trimmed) {
+                    // Methods
+                    let access = caps.get(1).map(|m| m.as_str()).unwrap_or("public");
+                    let method_name = caps.get(2).map(|m| m.as_str()).unwrap_or("?");
+                    let sig = extract_method_signature(trimmed, access, method_name);
+                    outline.push_str(&format!("  {}\n", sig));
+                }
             }
         }
 
@@ -7347,40 +7710,6 @@ fn extract_csharp_outline(source: &str) -> String {
             in_type_body = false;
             current_type_kind.clear();
             outline.push('\n');
-        }
-
-        // Inside a type body at depth 1 (relative to type)
-        if in_type_body && brace_depth == type_depth + 1 {
-            // Enums: extract members
-            if current_type_kind == "enum" {
-                if let Some(caps) = re_enum_member.captures(trimmed) {
-                    let member = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                    if !member.is_empty() && member != "get" && member != "set" {
-                        outline.push_str(&format!("  {}\n", member));
-                    }
-                }
-                continue;
-            }
-
-            // Properties
-            if let Some(caps) = re_property.captures(trimmed) {
-                let access = caps.get(1).map(|m| m.as_str()).unwrap_or("public");
-                let prop_name = caps.get(2).map(|m| m.as_str()).unwrap_or("?");
-                // Reconstruct the type from the line
-                let sig = extract_property_signature(trimmed, access, prop_name);
-                outline.push_str(&format!("  {}\n", sig));
-                continue;
-            }
-
-            // Methods
-            if let Some(caps) = re_method.captures(trimmed) {
-                let access = caps.get(1).map(|m| m.as_str()).unwrap_or("public");
-                let method_name = caps.get(2).map(|m| m.as_str()).unwrap_or("?");
-                // Reconstruct the full signature from the line
-                let sig = extract_method_signature(trimmed, access, method_name);
-                outline.push_str(&format!("  {}\n", sig));
-                continue;
-            }
         }
     }
 
@@ -7431,7 +7760,7 @@ fn extract_method_signature(line: &str, access: &str, name: &str) -> String {
         format!("{} ", modifier_strs.join(" "))
     };
 
-    format!("{} {}{}{}{}", access, mod_str, return_type, name, params)
+    format!("{} {}{} {}{}", access, mod_str, return_type, name, params)
 }
 
 /// Extract a clean property signature from a line of C# source.
@@ -7463,7 +7792,7 @@ fn extract_property_signature(line: &str, access: &str, name: &str) -> String {
         _ => "",
     };
 
-    format!("{} {}{}{}{}", access, mod_str, type_name, name, accessors)
+    format!("{} {}{} {}{}", access, mod_str, type_name, name, accessors)
 }
 
 // endregion
@@ -9324,5 +9653,122 @@ mod tests {
         assert!(!is_valid_git_branch_name("feature/@{bad"));
         assert!(!is_valid_git_branch_name("feature.lock"));
         assert!(!is_valid_git_branch_name("HEAD"));
+    }
+
+    #[test]
+    fn test_extract_csharp_outline_works() {
+        let source = r#"
+            using System;
+            namespace Test {
+                public class MyClass : IDisposable {
+                    public int MyProperty { get; set; }
+                    private string _field;
+                    protected void MyMethod(int x, string y) {
+                        // impl
+                    }
+                }
+            }
+        "#;
+        let outline = super::extract_csharp_outline(source);
+        println!("CS OUTLINE:\n{}", outline);
+        assert!(outline.contains("public class MyClass : IDisposable"));
+        assert!(outline.contains("  public int MyProperty { get; set; }"));
+        assert!(outline.contains("  protected void MyMethod(int x, string y)"));
+        assert!(!outline.contains("_field"));
+    }
+
+    #[test]
+    fn test_extract_typescript_outline_works() {
+        let source = r#"
+            export default class Component extends Base {
+                public static isReady = true;
+                private _internal = 123;
+                async render(element: string) {
+                    console.log("hello");
+                }
+            }
+            export interface IService {
+                name: string;
+                run(): Promise<void>;
+            }
+        "#;
+        let outline = super::extract_generic_outline(source, "ts");
+        assert!(outline.contains("export default class Component extends Base"));
+        assert!(outline.contains("  public static isReady = true;"));
+        assert!(outline.contains("  async render(element: string)"));
+        assert!(outline.contains("export interface IService"));
+        assert!(outline.contains("  name: string;"));
+        assert!(outline.contains("  run(): Promise<void>;"));
+        assert!(!outline.contains("_internal"));
+    }
+
+    #[test]
+    fn test_extract_rust_outline_works() {
+        let source = r#"
+            pub struct MyStruct {
+                pub id: u64,
+                secret: String,
+            }
+            pub enum State {
+                Active,
+                Inactive,
+            }
+            impl MyStruct {
+                pub fn new(id: u64) -> Self {
+                    MyStruct { id, secret: String::new() }
+                }
+                fn private_helper(&self) {}
+            }
+        "#;
+        let outline = super::extract_generic_outline(source, "rs");
+        assert!(outline.contains("pub struct MyStruct"));
+        assert!(outline.contains("  pub id: u64,"));
+        assert!(outline.contains("pub enum State"));
+        assert!(outline.contains("  Active,"));
+        assert!(outline.contains("impl MyStruct"));
+        assert!(outline.contains("  pub fn new(id: u64) -> Self"));
+        assert!(!outline.contains("secret: String"));
+        assert!(!outline.contains("private_helper"));
+    }
+
+    #[test]
+    fn test_extract_python_outline_works() {
+        let source = r#"
+class MyPythonClass:
+    def __init__(self, val):
+        self.val = val
+    def get_val(self):
+        return self.val
+
+def global_function(x):
+    return x * 2
+"#;
+        let outline = super::extract_generic_outline(source, "py");
+        assert!(outline.contains("class MyPythonClass:"));
+        assert!(outline.contains("    def __init__(self, val):"));
+        assert!(outline.contains("    def get_val(self):"));
+        assert!(outline.contains("def global_function(x):"));
+    }
+
+    #[test]
+    fn test_extract_go_outline_works() {
+        let source = r#"
+            package main
+            type Service interface {
+                Start() error
+            }
+            type serviceImpl struct {
+                name string
+            }
+            func NewService(name string) Service {
+                return &serviceImpl{name: name}
+            }
+        "#;
+        let outline = super::extract_generic_outline(source, "go");
+        assert!(outline.contains("type Service interface"));
+        assert!(outline.contains("  Start() error"));
+        assert!(outline.contains("type serviceImpl struct"));
+        assert!(outline.contains("  name string"));
+        assert!(outline.contains("func NewService(name string) Service"));
     }
 }
