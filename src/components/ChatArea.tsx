@@ -761,7 +761,7 @@ function shouldSuppressAgentToolEcho(blocks: any[], agentIndex: number): boolean
 }
 
 function isTransparentToolNarrationBlock(block: any): boolean {
-  if (!block || block.type !== "agent" || block.streaming || block.hiddenProcess) return false;
+  if (!block || block.type !== "agent" || block.hiddenProcess) return false;
   const text = getAgentVisibleMarkdownText(block);
   const normalized = String(text || "").replace(/\s+/g, "");
   if (/完成|已读取|已搜索|已执行|readcomplete|searchcomplete|commandcomplete/i.test(normalized)) return false;
@@ -2782,8 +2782,12 @@ export default function ChatArea({
   }, [language, topIslandTurn, topIslandTurnBlocks]);
   const composerPaddingBottom = composerHeight + 32;
   const explanationText = useMemo(() => {
-    if (!isStreaming || !activeTurn) return "";
+    const isRunActive = isStreaming || agentStatus === "running" || (activeTurn && activeTurn.status === "executing");
+    if (!isRunActive || !activeTurn) return "";
+    
     const activeTurnBlocks = blocksByTurnId.byTurnId.get(activeTurn.id) || [];
+    const turnIntent = resolveConversationTurnIntent(activeTurn);
+    const isToolIntent = turnIntent !== "respond" && turnIntent !== "discuss";
     
     for (let i = activeTurnBlocks.length - 1; i >= 0; i--) {
       const block = activeTurnBlocks[i];
@@ -2797,20 +2801,23 @@ export default function ChatArea({
           return content;
         }
         
+        const isFirstAgentBlock = activeTurnBlocks.filter(b => b.type === "agent").indexOf(block) === 0;
+        const thinNarration = isThinModelToolNarration(content);
+        
+        if ((isFirstAgentBlock && isToolIntent) || thinNarration) {
+          return content;
+        }
+        
         if (block.streaming) {
           const isSubstantive = isSubstantiveModelFeedback(content);
           if (!isSubstantive) {
-            return content;
-          }
-        } else {
-          if (isTransparentToolNarrationBlock({ ...block, streaming: false })) {
             return content;
           }
         }
       }
     }
     return "";
-  }, [isStreaming, activeTurn, blocksByTurnId]);
+  }, [isStreaming, agentStatus, activeTurn, blocksByTurnId]);
   const hasPlanPanelContent = useMemo(() => {
     if (planArtifacts.length > 0) return true;
 
@@ -3198,6 +3205,7 @@ export default function ChatArea({
     const turnIntentLabel = turnIntentPolicy.intent === displayTurnIntent
       ? (language === "en" ? turnIntentPolicy.label.en : turnIntentPolicy.label.zh)
       : (language === "zh" ? "任务" : "Task");
+    const shouldShowIntentBadge = displayTurnIntent === "plan" || displayTurnIntent === "studio_workflow";
     const isPlanTurn = turnIntent === "plan";
     const turnProgressSnapshot =
       planExecutionProgressSnapshot?.turnId === turn.id
@@ -3322,13 +3330,7 @@ export default function ChatArea({
     const renderTurnBlockItem = (item) => {
       if (item.kind !== "readContextGroup" && item.kind !== "operationCluster" && item.block?.type === "thought") return null;
       if (item.kind === "block" && isTransparentToolNarrationBlock(item.block)) {
-        const hasPriorVisibleAgentNarrative = blocks.some((candidate, candidateIndex) =>
-          candidateIndex < item.index &&
-          candidate?.type === "agent" &&
-          !candidate.hiddenProcess &&
-          hasRenderableAgentBlock(candidate)
-        );
-        if (hasPriorVisibleAgentNarrative) return null;
+        return null;
       }
       if (item.kind === "block" && shouldSuppressAgentToolEcho(blocks, item.index)) return null;
 
@@ -3425,8 +3427,8 @@ export default function ChatArea({
             style={collapsedTurnHeaderStyle}
           >
             <div className="min-w-0 flex flex-wrap items-center gap-2">
-              {turnIntentLabel && (
-                <span data-testid={`turn-intent-badge-${displayTurnIntent}`} className={`rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-[0.16em] ${displayTurnIntent === "plan" ? "theme-plan-pill" : displayTurnIntent === "execute" ? "border-[rgba(96,165,250,0.25)] bg-[rgba(96,165,250,0.12)] text-[#93c5fd]" : "border-[rgba(52,211,153,0.22)] bg-[rgba(52,211,153,0.1)] text-[#86efac]"}`}>
+              {shouldShowIntentBadge && turnIntentLabel && (
+                <span data-testid={`turn-intent-badge-${displayTurnIntent}`} className={`rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-[0.16em] ${displayTurnIntent === "plan" ? "theme-plan-pill" : "border-[rgba(52,211,153,0.22)] bg-[rgba(52,211,153,0.1)] text-[#86efac]"}`}>
                   {turnIntentLabel}
                 </span>
               )}

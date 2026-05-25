@@ -1405,8 +1405,8 @@ const MAX_NO_ACTION_RETRIES = 2;
 const PLAN_EXPLORATION_REPEAT_READ_LIMIT = 1;
 const EXECUTE_CONVERGENCE_PROMPT_RATIO = 0.72;
 const PLAN_EXECUTE_CONVERGENCE_PROMPT_RATIO = 0.24;
-const MAX_NO_PROGRESS_LOOP_REPEATS = 3;
-const MAX_APPROVED_PLAN_NO_PROGRESS_RECOVERY_ATTEMPTS = 1;
+const MAX_NO_PROGRESS_LOOP_REPEATS = 5;
+const MAX_APPROVED_PLAN_NO_PROGRESS_RECOVERY_ATTEMPTS = 2;
 const NO_PROGRESS_EXCLUDED_TOOLS = new Set([
   "execute_command",
   "send_pty_input",
@@ -9508,7 +9508,10 @@ export async function executeAgentLoop(
           });
         }
 
-        if (fileReadState && !bypassApprovedPlanPatchRecoveryReadCache) {
+        const fileReadDuplicateCount = fileReadSignature ? (readOnlyDuplicateSkipCounts.get(fileReadSignature) ?? 0) : 0;
+        const bypassFileReadCacheDueToRepeat = fileReadDuplicateCount >= 2;
+
+        if (fileReadState && !bypassApprovedPlanPatchRecoveryReadCache && !bypassFileReadCacheDueToRepeat) {
           const metadata = fileReadMetadata ?? await readFileMetadataIfAvailable(fileReadState.path, workspace);
           const unchanged =
             metadata != null &&
@@ -9638,7 +9641,10 @@ export async function executeAgentLoop(
           }
         }
 
-        if (!bypassApprovedPlanPatchRecoveryReadCache && (cached || queuedReadOnlySignatures.has(signature))) {
+        const signatureDuplicateCount = readOnlyDuplicateSkipCounts.get(signature) ?? 0;
+        const bypassCacheDueToRepeat = signatureDuplicateCount >= 2;
+
+        if (!bypassApprovedPlanPatchRecoveryReadCache && !bypassCacheDueToRepeat && (cached || queuedReadOnlySignatures.has(signature))) {
           const duplicateCount = (readOnlyDuplicateSkipCounts.get(signature) ?? 0) + 1;
           readOnlyDuplicateSkipCounts.set(signature, duplicateCount);
           const planBudget = buildPlanExplorationBudget({

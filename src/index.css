@@ -518,24 +518,24 @@ html[data-theme="light"] #root {
 /* ── Agent Explanation Capsule Styles ── */
 @keyframes capsule-glow {
   0%, 100% {
-    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.4), 
-                0 0 0 1.5px var(--accent-subtle-border, rgba(147, 51, 234, 0.3)),
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45), 
+                0 0 0 1.5px var(--accent-subtle-border, rgba(147, 51, 234, 0.35)),
                 0 0 8px var(--accent-subtle, rgba(147, 51, 234, 0.15));
   }
   50% {
-    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5), 
+    box-shadow: 0 8px 36px rgba(0, 0, 0, 0.55), 
                 0 0 0 2px var(--accent, #9333ea),
-                0 0 16px var(--accent-subtle, rgba(147, 51, 234, 0.35));
+                0 0 16px var(--accent-subtle, rgba(147, 51, 234, 0.4));
   }
 }
 
 @keyframes capsule-glow-light {
   0%, 100% {
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.06), 
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.05), 
                 0 0 0 1.5px var(--accent-subtle-border, rgba(147, 51, 234, 0.2));
   }
   50% {
-    box-shadow: 0 4px 18px rgba(0, 0, 0, 0.1), 
+    box-shadow: 0 8px 26px rgba(0, 0, 0, 0.08), 
                 0 0 0 2px var(--accent, #9333ea);
   }
 }
@@ -554,18 +554,21 @@ html[data-theme="light"] #root {
   padding: 0.65em 1.5em;
   border-radius: 9999px;
   border: 1.5px solid var(--accent, #9333ea);
+  /* Liquid dynamic background with highly transparent elements & core accent colors */
   background: linear-gradient(135deg, 
-    color-mix(in srgb, var(--accent, #9333ea) 75%, transparent),
-    color-mix(in srgb, var(--accent-hover, #7e22ce) 80%, transparent),
-    color-mix(in srgb, var(--accent-light, #a855f7) 70%, transparent),
-    color-mix(in srgb, var(--accent, #9333ea) 75%, transparent)
+    color-mix(in srgb, var(--accent, #9333ea) 18%, rgba(10, 10, 12, 0.4)),
+    color-mix(in srgb, var(--accent-light, #a855f7) 22%, rgba(10, 10, 12, 0.4)),
+    rgba(10, 10, 12, 0.55),
+    color-mix(in srgb, var(--accent, #9333ea) 16%, rgba(10, 10, 12, 0.4))
   );
   background-size: 300% 300%;
-  animation: voice-wave-slow 8s ease infinite, capsule-glow 3s ease-in-out infinite;
-  backdrop-filter: blur(12px);
+  /* Ultra-slow flow animation and subtle glowing pulses */
+  animation: voice-wave-slow 18s ease infinite, capsule-glow 3s ease-in-out infinite;
+  backdrop-filter: blur(16px);
   color: #ffffff;
   font-weight: 500;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5), 
+              inset 0 1px 1px rgba(255, 255, 255, 0.1);
   transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
   letter-spacing: 0.02em;
   text-align: center;
@@ -575,14 +578,14 @@ html[data-theme="light"] #root {
 html[data-theme="light"] .agent-explanation-capsule {
   border-color: var(--accent, #9333ea);
   background: linear-gradient(135deg, 
-    color-mix(in srgb, var(--accent, #9333ea) 8%, #ffffff 92%),
-    color-mix(in srgb, var(--accent-hover, #7e22ce) 12%, #ffffff 88%),
-    color-mix(in srgb, var(--accent-light, #a855f7) 6%, #ffffff 94%),
-    color-mix(in srgb, var(--accent, #9333ea) 8%, #ffffff 92%)
+    color-mix(in srgb, var(--accent, #9333ea) 6%, rgba(255, 255, 255, 0.55)),
+    color-mix(in srgb, var(--accent-light, #a855f7) 8%, rgba(255, 255, 255, 0.5)),
+    rgba(255, 255, 255, 0.65),
+    color-mix(in srgb, var(--accent, #9333ea) 5%, rgba(255, 255, 255, 0.55))
   );
   background-size: 300% 300%;
   color: var(--accent-hover, #7e22ce);
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.08), 
-              0 0 0 1.5px rgba(147, 51, 234, 0.15);
-  animation: voice-wave-slow 8s ease infinite, capsule-glow-light 3s ease-in-out infinite;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.06), 
+              inset 0 1px 1px rgba(255, 255, 255, 0.6);
+  animation: voice-wave-slow 18s ease infinite, capsule-glow-light 3s ease-in-out infinite;
 }
