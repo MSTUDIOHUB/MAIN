@@ -721,18 +721,21 @@ function stripReasoningBlocksForEscalation(text: string): string {
 
 export function isReasoningDominatedLengthResult(
   result: Pick<StreamResult, "content" | "finishReason" | "reasoningContent" | "toolCalls">,
+  isLocal?: boolean,
 ): boolean {
   if (result.finishReason !== "length") return false;
-  return isReasoningDominatedNoActionResult(result);
+  return isReasoningDominatedNoActionResult(result, isLocal);
 }
 
 export function isReasoningDominatedNoActionResult(
   result: Pick<StreamResult, "content" | "reasoningContent" | "toolCalls">,
+  isLocal?: boolean,
 ): boolean {
   if (Array.isArray(result.toolCalls) && result.toolCalls.length > 0) return false;
 
   const reasoningChars = String(result.reasoningContent || "").trim().length;
-  if (reasoningChars < 1000) return false;
+  const threshold = isLocal ? 8000 : 1000;
+  if (reasoningChars < threshold) return false;
 
   const visibleChars = stripReasoningBlocksForEscalation(result.content).length;
   if (visibleChars <= 240) return true;
@@ -3351,7 +3354,13 @@ async function fetchLLMStream(
     }
 
     // Check if the response was truncated and we can escalate
-    const skipReasoningDominatedEscalation = isReasoningDominatedLengthResult(result);
+    const isLocal = settings.provider === "Ollama" || settings.provider === "LM Studio" || settings.provider === "OMLX" ||
+      String(settings.baseUrl || "").toLowerCase().includes("localhost") ||
+      String(settings.baseUrl || "").toLowerCase().includes("127.0.0.1") ||
+      String(settings.baseUrl || "").toLowerCase().includes("::1") ||
+      String(settings.baseUrl || "").toLowerCase().includes("ollama") ||
+      String(settings.baseUrl || "").toLowerCase().includes(":11434");
+    const skipReasoningDominatedEscalation = isReasoningDominatedLengthResult(result, isLocal);
     if (result.finishReason === "length" && escalationCount < MAX_ESCALATIONS && !skipReasoningDominatedEscalation) {
         const nextMaxTokens = escalateMaxTokens(currentMaxTokens, settings.contextLimit);
       if (nextMaxTokens !== null) {

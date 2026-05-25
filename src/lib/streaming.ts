@@ -118,13 +118,23 @@ export interface StreamResult {
 const REASONING_ONLY_STREAM_GUARD_CHAR_LIMIT = 12_000;
 const STREAM_NO_VISIBLE_PROGRESS_TIMEOUT_MS = 180_000;
 
+export function isLocalProfile(settings: StreamSettings): boolean {
+  if (settings.provider === "Ollama" || settings.provider === "LM Studio" || settings.provider === "OMLX") return true;
+  const url = String(settings.baseUrl || "").toLowerCase();
+  return url.includes("localhost") || url.includes("127.0.0.1") || url.includes("::1") || url.includes("ollama") || url.includes(":11434");
+}
+
 export function shouldStopReasoningOnlyStream(input: {
   reasoningChars: number;
   visibleChars: number;
   toolCallCount: number;
+  settings?: StreamSettings;
 }): boolean {
+  const limit = input.settings && isLocalProfile(input.settings)
+    ? 96_000
+    : REASONING_ONLY_STREAM_GUARD_CHAR_LIMIT;
   return (
-    input.reasoningChars >= REASONING_ONLY_STREAM_GUARD_CHAR_LIMIT &&
+    input.reasoningChars >= limit &&
     input.visibleChars === 0 &&
     input.toolCallCount === 0
   );
@@ -1033,6 +1043,7 @@ async function streamViaRustProxy(
       reasoningChars: providerReasoningContent.length,
       visibleChars: visibleContentChars,
       toolCallCount: toolCallsMap.size,
+      settings,
     })) {
       return false;
     }
@@ -1041,10 +1052,11 @@ async function streamViaRustProxy(
     finishReason = "length";
     closeReasoningBlock();
     reasoningBuffer = "";
+    const dynamicLimit = isLocalProfile(settings) ? 96_000 : REASONING_ONLY_STREAM_GUARD_CHAR_LIMIT;
     emitStreamingConsole(
       "streaming",
       "warn",
-      `Reasoning-only stream exceeded ${REASONING_ONLY_STREAM_GUARD_CHAR_LIMIT} chars without visible output or tool calls; cancelling stream.`,
+      `Reasoning-only stream exceeded ${dynamicLimit} chars without visible output or tool calls; cancelling stream.`,
     );
     callbacks.onLifecycle?.({
       phase: "stream_cancelled",
@@ -1734,14 +1746,16 @@ export async function streamChatCompletion(
               reasoningChars: providerReasoningContent.length,
               visibleChars: visibleContentChars,
               toolCallCount: toolCallsMap.size,
+              settings,
             })) {
               finishReason = "length";
               closeReasoningBlock();
               reasoningBuffer = "";
+              const dynamicLimit = isLocalProfile(settings) ? 96_000 : REASONING_ONLY_STREAM_GUARD_CHAR_LIMIT;
               emitStreamingConsole(
                 "streaming",
                 "warn",
-                `Reasoning-only stream exceeded ${REASONING_ONLY_STREAM_GUARD_CHAR_LIMIT} chars without visible output or tool calls; cancelling stream.`,
+                `Reasoning-only stream exceeded ${dynamicLimit} chars without visible output or tool calls; cancelling stream.`,
               );
               await reader.cancel().catch(() => {});
               const result = buildCurrentOpenAiCompatibleResult();

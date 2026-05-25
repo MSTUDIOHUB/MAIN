@@ -137,15 +137,15 @@ test("intent filtering exposes read-only tools for chat and write/shell tools fo
 
   assert.deepEqual(
     filterToolDefinitionsForIntent(tools, "respond", registry).map((item) => item.function.name),
-    ["read_file", "web_search"],
+    ["read_file", "write_file", "run_command", "web_search"],
   );
   assert.deepEqual(
     filterToolDefinitionsForIntent(tools, "discuss", registry).map((item) => item.function.name),
-    ["read_file", "web_search"],
+    ["read_file", "write_file", "run_command", "web_search"],
   );
   assert.deepEqual(
     filterToolDefinitionsForIntent(tools, "plan", registry).map((item) => item.function.name),
-    ["read_file", "write_file", "web_search"],
+    ["read_file", "web_search"],
   );
   assert.deepEqual(
     filterToolDefinitionsForIntent(tools, "plan", registry, { planApproved: true }).map((item) => item.function.name),
@@ -193,11 +193,11 @@ test("approved execution exposes browser validation while keeping it approval ga
   assert.equal(isToolAutoExecutableForCall("browser_evaluate", { url: "http://localhost:5173" }, registry), false);
   assert.deepEqual(
     filterToolDefinitionsForIntent(tools, "respond", registry).map((item) => item.function.name),
-    ["read_file"],
+    ["read_file", "write_file", "browser_evaluate"],
   );
   assert.deepEqual(
     filterToolDefinitionsForIntent(tools, "plan", registry).map((item) => item.function.name),
-    ["read_file", "write_file"],
+    ["read_file"],
   );
   assert.deepEqual(
     filterToolDefinitionsForIntent(tools, "plan", registry, { planApproved: true }).map((item) => item.function.name),

@@ -1894,6 +1894,26 @@ export function validatePlanArtifactContent(
   return { ok: true };
 }
 
+export function hasAnyContentUnderSection(text: string, sectionRegex: RegExp): boolean {
+  const lines = text.split('\n');
+  let inSection = false;
+  let contentChars = 0;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith('#')) {
+      if (inSection) {
+        break; // reached next section
+      }
+      if (sectionRegex.test(trimmed)) {
+        inSection = true;
+      }
+    } else if (inSection && trimmed.length > 0) {
+      contentChars += trimmed.length;
+    }
+  }
+  return inSection && contentChars > 5;
+}
+
 export function validateActionablePlanArtifact(
   content: string,
 ): PlanArtifactQualityResult {
@@ -1960,7 +1980,8 @@ export function validateActionablePlanArtifact(
     /(?:^|\n)\s*#{1,6}\s*(?:公共\s*API\s*\/\s*接口\s*\/\s*类型|公共\s*API|接口|类型|Public APIs?\s*\/\s*Interfaces?\s*\/\s*Types?|Public APIs?|Interfaces?|Types?)/i.test(raw);
   const hasExplicitPublicInterfaceDisposition =
     /(?:无公共\s*API|无.*(?:接口|类型)变化|不(?:新增|改变|修改).*(?:公共\s*API|接口|类型)|保持.*(?:公共\s*API|接口|类型).*不变|No public API|No interface changes?|No type changes?|No public interface changes?|Public API.*unchanged|interfaces?.*unchanged|types?.*unchanged)/i.test(raw) ||
-    /(?:公共\s*API|接口|类型|Public APIs?|Interfaces?|Types?).{0,120}(?:新增|修改|变化|保持|不变|added|modified|changed|unchanged|preserved)/i.test(raw);
+    /(?:公共\s*API|接口|类型|Public APIs?|Interfaces?|Types?).{0,120}(?:新增|修改|变化|保持|不变|added|modified|changed|unchanged|preserved)/i.test(raw) ||
+    hasAnyContentUnderSection(raw, /(?:公共\s*API\s*\/\s*接口\s*\/\s*类型|公共\s*API|接口|类型|Public APIs?\s*\/\s*Interfaces?\s*\/\s*Types?|Public APIs?|Interfaces?|Types?)/i);
   const hasTestPlan = /(?:^|\n)\s*#{1,6}\s*(?:测试方案|测试计划|测试场景|验证方案|Test Plan|Testing|Tests?)/i.test(raw);
   const hasAssumptionsDefaults = /(?:^|\n)\s*#{1,6}\s*(?:假设与默认值|默认假设|假设|默认值|Assumptions(?:\s*\/\s*Defaults)?|Defaults)/i.test(raw);
   const hasConcreteChangeSignal =

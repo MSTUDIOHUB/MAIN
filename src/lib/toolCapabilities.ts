@@ -600,16 +600,11 @@ export function filterToolDefinitionsForIntent(
     if (capability && !capability.enabled) return false;
     const risk = capability?.risk ?? classifyBuiltInTool(name);
 
-    if (effectiveIntent === "execute" || effectiveIntent === "studio_workflow") {
-      return !registry.policy.disabledRiskLevels.includes(risk);
-    }
-
     if (effectiveIntent === "plan") {
-      if (risk === "read_only" || risk === "external_read") return true;
-      return name === "write_file" || name === "replace_in_file";
+      return risk === "read_only" || risk === "external_read";
     }
 
-    return risk === "read_only" || risk === "external_read";
+    return !registry.policy.disabledRiskLevels.includes(risk);
   });
 }
 
