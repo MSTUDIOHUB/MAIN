@@ -56,9 +56,91 @@ import { summarizeApplyPatchTarget } from "./applyPatchTool";
 import { syncPlanArtifactAfterToolSuccess } from "./planArtifactSync";
 import {
   buildReadFileWindowContinuationGuidance,
-  extractReadFileWindowMetadata,
   planReadFileWindowCoverage,
 } from "./readFileWindow";
+import {
+  FILE_UNCHANGED_STUB,
+  buildFileReadSignature,
+  buildFileUnchangedStub,
+  buildOptionalTasksMdMissingResult,
+  formatReadFileWindowCoverageStub,
+  formatReadFileWindowNarrowedNote,
+  getReadFileCoverageForPath,
+  getSessionFileReadStates,
+  hashString,
+  isMissingOptionalTasksMdReadError,
+  isOptionalTasksMdRead,
+  pruneFileReadStates,
+} from "./orchestrator/fileReadCache";
+import {
+  buildExecuteNoActionPauseMessage,
+  buildLanguageMismatchRecoveryPrompt,
+  buildMalformedToolUseRecoveryPrompt,
+  buildPseudoToolCallRecoveryPrompt,
+  buildReasoningDominatedPauseMessage,
+  buildReasoningDominatedRecoveryPrompt,
+  buildToolProtocolDoomLoopStopMessage,
+  buildToolUnavailableRecoveryPrompt,
+  choosePseudoToolRecovery,
+  containsToolNameParameterFallback,
+  containsToolUseBlock,
+  extractPseudoToolCallName,
+  extractUserMentionedFilePathsFromMessages,
+  isReasoningDominatedLengthResult,
+  isReasoningDominatedNoActionResult,
+  looksLikeNonStandardToolCallFormat,
+  looksLikePseudoToolCallPlaceholder,
+  looksLikeToolUnavailableClaim,
+  shouldRecoverLanguageMismatchTurn,
+  summarizeProtocolFragmentForLog,
+} from "./orchestrator/agentRecovery";
+import {
+  UNITY_FALLBACK_RECOVERY_READ_ONLY_TOOL_NAMES,
+  annotateUnityEditToolDescriptions,
+  buildUnityApplyTextPolicyBlockedMessage,
+  extractMcpCallFailureCategory,
+  isUnityCommandDirective,
+  isUnityConsoleDiagnosticsDirective,
+  isUnityExecutionContext,
+  isUnityLikelyServer,
+  isUnityScriptWriteToolCall,
+  resolveUnityScriptPathFromArgs,
+  shouldRepromptBeforeUnityConsoleFallback,
+  shouldTriggerUnityMcpFirstIterationFallback,
+} from "./orchestrator/unityDiagnostics";
+import {
+  buildPlanAutoScaffoldPrompt,
+  buildPlanEvidenceRecoveryBlockedPrompt,
+  buildPlanEvidenceRecoveryClosurePrompt,
+  buildPlanFallbackNotice,
+  buildPlanPostConvergenceToolRedirectPrompt,
+  buildPlanReadOnlyConvergencePause,
+  buildPlanReadOnlyConvergencePrompt,
+  buildPlanRecoveryPromptFromContext,
+  buildPlanStreamTimeoutPauseMessage,
+  countSuccessfulPlanReadEvidence,
+  hasGroundedPlanClosureEvidence,
+  hasSuccessfulTabularActivity,
+  planRuntimePhasePresentation,
+  resolvePlanClosureArtifactKind,
+} from "./orchestrator/planOrchestration";
+
+export {
+  extractPseudoToolCallName,
+  isReasoningDominatedLengthResult,
+  isReasoningDominatedNoActionResult,
+  looksLikeNonStandardToolCallFormat,
+  looksLikePseudoToolCallPlaceholder,
+  recoverPseudoToolCallFromContext,
+  shouldRecoverLanguageMismatchTurn,
+} from "./orchestrator/agentRecovery";
+export {
+  shouldRepromptBeforeUnityConsoleFallback,
+  shouldTriggerUnityMcpFirstIterationFallback,
+} from "./orchestrator/unityDiagnostics";
+export {
+  buildPlanReadOnlyConvergencePrompt,
+} from "./orchestrator/planOrchestration";
 import {
   initialLifecycleStateForPlanAction,
   planRuntimeToolCall,
@@ -67,7 +149,6 @@ import {
 import type { AppConfig, Skill } from "../store/useAppStore";
 import {
   buildPlanTaskEvidenceAudit,
-  detectResponseLanguageMismatch,
   detectPlanArtifactKind,
   extractPlanTasks,
   findDroppedPlanTasks,
@@ -240,7 +321,6 @@ import {
 import {
   extractPrimaryUserRequestText,
   extractTurnInputContextSignalsFromMessages,
-  hasTurnProvidedContext,
   normalizeTurnInputContextSignals,
   type TurnInputContextSignals,
 } from "./turnIntake";
@@ -306,363 +386,6 @@ function hasPlanUserContextObservation(messages: AgentMessage[], latestAssistant
   return /(?:截图观察|从截图(?:中)?(?:我)?观察到|图片中可见|图\s*\d|screenshot observations|screenshot shows|image shows|visible in the provided image)/i.test(assistantTexts);
 }
 
-export function buildPlanReadOnlyConvergencePrompt(
-  language: "zh" | "en",
-  batchCount: number,
-  toolCount: number,
-  userContext?: TurnInputContextSignals,
-): string {
-  const context = normalizeTurnInputContextSignals(userContext);
-  const hasProvidedContext = hasTurnProvidedContext(context);
-  if (language === "en") {
-    return [
-      "PLAN_READONLY_CONVERGENCE: The broad discovery budget for this planning turn has been reached, or enough targeted evidence is already available.",
-      `Read-only exploration so far: ${batchCount} batch(es), ${toolCount} tool result(s).`,
-      hasProvidedContext
-        ? `User-provided context exists: ${context.imageParts} image(s), ${context.mentionedFilePaths.length} @ file(s), ${context.attachedFilePaths.length} attachment(s). Treat it as primary evidence.`
-        : "",
-      context.imageParts > 0
-        ? "If you have not already done so, include a concrete 'Screenshot observations' section that states what is visible in the provided image(s) and maps those observations to likely UI/state/code areas."
-        : "",
-      context.mentionedFilePaths.length > 0 || context.attachedFilePaths.length > 0
-        ? "Before any broad discovery, use the exact @ file or attachment paths as primary evidence and name what those files already show."
-        : "",
-      "Stop broad rereading now. If targeted source/data evidence is still missing, call exactly one specific read/search tool for the missing file, symbol, or dataset, then stop. If the evidence is decision-complete, output a concise visible `<proposed_plan>` block or Codex-style Proposal; MAIN will materialize it into `.MAIN/plans/plan.md` for review.",
-      "The draft must include: confirmed findings, unverified hypotheses, evidence already read, tradeoffs, affected files, implementation steps, and validation.",
-      "Only use `<user_options>` if there is a real product/design decision the user must make before a plan can be written. Do not offer options that merely ask to continue reading, checking, analyzing, or verifying.",
-      "If a blocker remains, name the blocker and the single missing fact needed; do not continue broad file exploration.",
-      "Do not call write_file or replace_in_file just to finish planning.",
-    ].filter(Boolean).join("\n");
-  }
-  return [
-    "PLAN_READONLY_CONVERGENCE: 当前规划回合已经达到宽泛发现预算，或已经具备足够的定向证据。",
-    `只读探索累计：${batchCount} 批，${toolCount} 个工具结果。`,
-    hasProvidedContext
-      ? `用户已提供上下文：${context.imageParts} 张图片、${context.mentionedFilePaths.length} 个 @ 文件、${context.attachedFilePaths.length} 个附件。必须把这些作为优先证据。`
-      : "",
-    context.imageParts > 0
-      ? "如果还没有写过，下一条必须先写出“截图观察到的现象”：具体说明图片中可见的 UI/状态/文本/异常，并把这些现象映射到可能的 UI、状态或代码区域。"
-      : "",
-    context.mentionedFilePaths.length > 0 || context.attachedFilePaths.length > 0
-      ? "在继续大范围发现前，必须优先使用 @ 文件或附件的精确路径作为主要证据，并说明这些文件已经证明了什么。"
-      : "",
-    "下一步不要继续泛读文件。如果还缺源码/数据定向证据，只能围绕缺失的文件、符号或数据集调用一次具体读取/搜索工具，然后停止；如果证据已经足够，请直接输出精简可见的 `<proposed_plan>` 或 Codex-style Proposal；MAIN 会把它物化为 `.MAIN/plans/plan.md` 供审批。",
-    "草案必须包含：已确认发现、未验证假设、已读证据、方案取舍、影响文件、实施步骤和验证方式。",
-    "只有存在真实产品/设计分叉、必须由用户决定后才能写计划时，才允许使用 `<user_options>`；不要给出只是继续读取、检查、分析或验证的选项。",
-    "如果仍有阻塞，只说明阻塞点和唯一缺失事实；不要继续大范围探索。",
-    "不要为了完成规划而调用 write_file 或 replace_in_file。",
-  ].filter(Boolean).join("\n");
-}
-
-function buildPlanReadOnlyConvergencePause(
-  language: "zh" | "en",
-  batchCount: number,
-  toolCount: number,
-  userContext?: TurnInputContextSignals,
-): {
-  text: string;
-  options: ReplyOption[];
-} {
-  const context = normalizeTurnInputContextSignals(userContext);
-  const hasProvidedContext = hasTurnProvidedContext(context);
-  if (language === "en") {
-    return {
-      text: [
-        "MAIN has collected enough read-only context, but the model kept exploring instead of producing a plan.",
-        `Current exploration: ${batchCount} read-only batches, ${toolCount} tool results.`,
-        hasProvidedContext ? "The next step should start from the provided image/file context, not from another broad scan." : "",
-        "Choose the next direction.",
-      ].filter(Boolean).join("\n"),
-      options: [
-        { label: hasProvidedContext ? "Use provided context for the plan" : "Generate the diagnosis plan", value: hasProvidedContext ? "Please stop broad exploration, first summarize the screenshot/file observations, then generate the diagnosis, tradeoffs, and proposed plan from the evidence already gathered." : "Please stop exploring and generate the diagnosis, tradeoffs, and proposed plan from the evidence already gathered.", action: "adjust_plan" },
-        { label: "One targeted evidence pass", value: hasProvidedContext ? "Do one more tightly scoped read-only pass based only on the screenshot/file observations, then immediately stop and summarize the plan." : "Continue one more targeted read-only exploration pass, then stop and summarize the plan.", action: "continue_readonly_once" },
-      ],
-    };
-  }
-  return {
-    text: [
-      "MAIN 已经收集了足够的只读上下文，但模型仍在继续探索，没有产出可审阅方案。",
-      `当前探索累计：${batchCount} 批只读工具，${toolCount} 个工具结果。`,
-      hasProvidedContext ? "下一步应回到用户提供的图片/文件上下文，而不是继续泛读项目。" : "",
-      "请选择下一步方向。",
-    ].filter(Boolean).join("\n"),
-    options: [
-      { label: hasProvidedContext ? "先说明截图观察并生成归因方案" : "生成归因方案", value: hasProvidedContext ? "请停止泛读，先明确列出截图/文件中实际观察到的现象，再基于已有证据生成问题归因、方案取舍和可审批计划。" : "请停止继续探索，直接基于已有证据生成问题归因、方案取舍和可审批计划。", action: "adjust_plan" },
-      { label: "只补一个明确证据", value: hasProvidedContext ? "请只围绕截图/文件观察到的现象补充一个精确定向证据，然后立刻停止并生成归因方案。" : "请再做一次定向只读探索，然后立刻停止并总结方案。", action: "continue_readonly_once" },
-    ],
-  };
-}
-
-function buildPlanPostConvergenceToolRedirectPrompt(input: {
-  language: "zh" | "en";
-  toolNames: string[];
-  userContext?: TurnInputContextSignals;
-  phase?: PlanRuntimePhase;
-  qualityGateReason?: string;
-  missingSections?: string[];
-  rejectCount?: number;
-}): string {
-  const context = normalizeTurnInputContextSignals(input.userContext);
-  const toolList = input.toolNames.slice(0, 6).join(", ");
-  const missing = (input.missingSections || []).filter(Boolean).join(", ");
-  const reason = input.qualityGateReason || (missing ? `missing:${missing}` : "");
-  const phase = input.phase || "drafting";
-  if (phase === "needs_rewrite") {
-    if (input.language === "en") {
-      return [
-        "PLAN_NEEDS_REWRITE: The last visible plan draft was structurally incomplete, but this is not a reason to read more files.",
-        toolList ? `The attempted read-only tool call(s) were suppressed before execution: ${toolList}.` : "",
-        reason ? `Quality gate reason: ${reason}.` : "",
-        "Rewrite the visible `<proposed_plan>` now. Add the missing user goal/sections from the user request and the evidence already in the transcript; MAIN will materialize it into `.MAIN/plans/plan.md`.",
-        "Do not call read-only tools in the next response unless MAIN explicitly reopens evidence recovery.",
-        "Do not call write_file or replace_in_file just to finish planning.",
-      ].filter(Boolean).join("\n");
-    }
-    return [
-      "PLAN_NEEDS_REWRITE: 上一个可见计划草稿只是结构不完整，这不是继续读文件的理由。",
-      toolList ? `刚才的只读工具已在执行前静默拦截：${toolList}。` : "",
-      reason ? `质量门禁原因：${reason}。` : "",
-      "现在直接重写可见 `<proposed_plan>`：把用户目标和缺失章节补齐，证据只使用当前对话里已经观察/读取到的内容；MAIN 会把它物化为 `.MAIN/plans/plan.md`。",
-      "下一条不要再调用只读工具；除非 MAIN 明确进入补证据阶段。",
-      "不要为了完成规划而调用 write_file 或 replace_in_file。",
-    ].filter(Boolean).join("\n");
-  }
-  if (input.language === "en") {
-    return [
-      "PLAN_READONLY_CONVERGENCE_ENFORCED: Stop calling more read-only discovery tools.",
-      toolList ? `The attempted tool call(s) were blocked before execution: ${toolList}.` : "",
-      reason ? `Current plan quality gate reason: ${reason}.` : "",
-      context.imageParts > 0
-        ? "First write a concrete 'Screenshot observations' section: visible UI/text/state, what the user is asking, and which code/state path it points to."
-        : "First restate the observed user-provided context and the actual user goal.",
-      "Then output a concise visible `<proposed_plan>` with the diagnosis, evidence, affected files, implementation steps, and validation. MAIN will materialize it into `.MAIN/plans/plan.md`.",
-      "If one missing fact truly blocks the plan, ask exactly one concrete question with `<user_options>`; do not offer generic continue-reading options.",
-      "Allowed next actions: visible `<proposed_plan>`, formal Proposal, or one blocking user choice. Do not call get_project_skeleton, list_directory, glob_search, grep_search, read_file, read_document, write_file, or replace_in_file again in the next response.",
-    ].filter(Boolean).join("\n");
-  }
-  return [
-    "PLAN_READONLY_CONVERGENCE_ENFORCED: 停止继续调用只读发现工具。",
-    toolList ? `刚才准备执行的工具已在执行前拦截：${toolList}。` : "",
-    reason ? `当前计划质量门禁原因：${reason}。` : "",
-    context.imageParts > 0
-      ? "下一步必须先写出“截图观察到的现象”：图片中可见的 UI/文本/状态、用户真正要解决的问题，以及它指向的代码/状态链路。"
-      : "下一步必须先复述用户提供的上下文和真实目标。",
-    "随后输出精简可见的 `<proposed_plan>`，包含问题归因、已有证据、影响文件、实施步骤和验证方式；MAIN 会把它物化为 `.MAIN/plans/plan.md`。",
-    "如果确实只有一个缺失事实阻塞方案，只能提出一个具体问题并用 `<user_options>`；不要再给“继续查/继续分析”这类泛化选项。",
-    "下一条只允许：可见 `<proposed_plan>`、正式 Proposal，或询问一个真实阻塞选择。不要再次调用 get_project_skeleton、list_directory、glob_search、grep_search、read_file、read_document、write_file 或 replace_in_file。",
-  ].filter(Boolean).join("\n");
-}
-
-function planRuntimePhasePresentation(
-  phase: PlanRuntimePhase,
-  language: "zh" | "en",
-  reason?: string,
-): { kind: "scope" | "context" | "diagnosis" | "implementation" | "validation"; title: string; summary: string } {
-  const suffix = reason ? (language === "zh" ? `（${reason}）` : ` (${reason})`) : "";
-  switch (phase) {
-    case "explore_structure":
-      return {
-        kind: "scope",
-        title: language === "zh" ? "Explore" : "Explore",
-        summary: language === "zh" ? `探索项目结构${suffix}` : `Explore project structure${suffix}`,
-      };
-    case "grounding":
-      return {
-        kind: "context",
-        title: language === "zh" ? "Exploring" : "Exploring",
-        summary: language === "zh" ? `先确认截图、附件和最小源码证据${suffix}` : `Ground screenshots, attachments, and minimal source evidence${suffix}`,
-      };
-    case "synthesis":
-      return {
-        kind: "diagnosis",
-        title: language === "zh" ? "Synthesis" : "Synthesis",
-        summary: language === "zh" ? `归纳已确认事实、未验证假设和阻塞点${suffix}` : `Summarize confirmed facts, hypotheses, and blockers${suffix}`,
-      };
-    case "drafting":
-      return {
-        kind: "diagnosis",
-        title: language === "zh" ? "Drafting" : "Drafting",
-        summary: language === "zh" ? `把证据收束为可见审批方案${suffix}` : `Condense evidence into a reviewable visible plan${suffix}`,
-      };
-    case "needs_evidence":
-      return {
-        kind: "context",
-        title: language === "zh" ? "Needs evidence" : "Needs evidence",
-        summary: language === "zh" ? `草稿缺少真实证据，临时开放一次定向只读补证${suffix}` : `The draft needs evidence; reopen one targeted read-only pass${suffix}`,
-      };
-    case "needs_rewrite":
-      return {
-        kind: "diagnosis",
-        title: language === "zh" ? "Needs rewrite" : "Needs rewrite",
-        summary: language === "zh" ? `草稿结构不完整，直接重写可见方案${suffix}` : `The draft is structurally incomplete; rewrite the visible plan${suffix}`,
-      };
-    case "review_ready":
-      return {
-        kind: "validation",
-        title: language === "zh" ? "Review ready" : "Review ready",
-        summary: language === "zh" ? `plan.md 已通过质量门禁，等待审批${suffix}` : `plan.md passed the quality gate and is ready for review${suffix}`,
-      };
-    case "blocked":
-      return {
-        kind: "diagnosis",
-        title: language === "zh" ? "Blocked" : "Blocked",
-        summary: language === "zh" ? `需要一个真实阻塞问题或用户选择${suffix}` : `Needs a real blocker or user decision${suffix}`,
-      };
-  }
-}
-
-function formatPlanQualityReason(input: {
-  reason?: string;
-  missingSections?: string[];
-  language: "zh" | "en";
-}): string {
-  const missing = (input.missingSections || []).filter(Boolean).join(", ");
-  const reason = input.reason || (missing ? `missing:${missing}` : "");
-  if (!reason) return "";
-  return input.language === "zh" ? `质量门禁：${reason}` : `quality gate: ${reason}`;
-}
-
-function summarizeRecentPlanEvidenceForPrompt(
-  recentToolActivity: PlanToolActivitySummary[],
-  language: "zh" | "en",
-): string {
-  const rows = recentToolActivity
-    .filter((activity) => String(activity.status || "") === "succeeded")
-    .slice(-8)
-    .map((activity) => {
-      const target = activity.target ? ` ${activity.target}` : "";
-      const detail = activity.detail ? ` -> ${activity.detail}` : "";
-      return `- ${activity.name || "tool"}${target}${detail}`;
-    });
-  if (rows.length === 0) {
-    return language === "zh" ? "- 暂无成功工具证据；只能引用截图/附件和用户原始目标。" : "- No successful tool evidence yet; cite screenshots/attachments and the user goal only.";
-  }
-  return rows.join("\n");
-}
-
-function buildPlanAutoScaffoldPrompt(input: {
-  language: "zh" | "en";
-  latestUserPromptText: string;
-  recentToolActivity: PlanToolActivitySummary[];
-  qualityGateReason?: string;
-  missingSections?: string[];
-}): string {
-  const reason = formatPlanQualityReason({
-    reason: input.qualityGateReason,
-    missingSections: input.missingSections,
-    language: input.language,
-  });
-  const evidence = summarizeRecentPlanEvidenceForPrompt(input.recentToolActivity, input.language);
-  if (input.language === "en") {
-    return [
-      "PLAN_AUTO_SCAFFOLD: Two low-quality plan drafts were rejected. Stop branching and rewrite a visible `<proposed_plan>` using this scaffold. MAIN will materialize it into `.MAIN/plans/plan.md`.",
-      reason,
-      "",
-      "Required scaffold:",
-      "# Plan",
-      "## User Goal",
-      input.latestUserPromptText || "- Restate the user's concrete request from the conversation.",
-      "## Screenshot / Attachment Observations",
-      "- List only visible or provided facts. If none were provided, write `No screenshot/attachment was provided`.",
-      "## Read Evidence",
-      evidence,
-      "## Confirmed Findings",
-      "- Convert only the evidence above into confirmed facts.",
-      "## Unverified Hypotheses",
-      "- Mark every remaining assumption as unverified; do not execute from it until validated.",
-      "## Execution Steps",
-      "1. Decision-complete implementation step.",
-      "## Affected Files",
-      "- path or interface",
-      "## Validation Standards",
-      "- Exact test/build/manual validation that would prove the fix.",
-      "",
-      "Output this scaffold as visible Markdown now. Do not call read-only, write_file, or replace_in_file tools unless MAIN has reopened evidence recovery.",
-    ].filter(Boolean).join("\n");
-  }
-  return [
-    "PLAN_AUTO_SCAFFOLD: 连续两个低质量 plan 草稿被拒绝。停止分叉，按下面脚手架重写可见 `<proposed_plan>`；MAIN 会把它物化为 `.MAIN/plans/plan.md`。",
-    reason,
-    "",
-    "必须使用的脚手架：",
-    "# 计划",
-    "## 用户目标",
-    input.latestUserPromptText || "- 从对话中复述用户的具体请求。",
-    "## 截图/附件观察",
-    "- 只列可见或已提供事实；如果没有截图/附件，写 `未提供截图/附件`。",
-    "## 已读证据",
-    evidence,
-    "## 已确认事实",
-    "- 只能把上面的证据转成已确认事实。",
-    "## 未验证假设",
-    "- 所有剩余推断都标为未验证；不能把它当作执行依据。",
-    "## 执行步骤",
-    "1. 写 decision-complete 的实施步骤。",
-    "## 影响文件",
-    "- path 或接口名。",
-    "## 验证标准",
-    "- 能证明修复成立的测试/构建/人工验证。",
-    "",
-    "现在把这个脚手架作为可见 Markdown 输出。除非 MAIN 已重新开放补证据，否则不要调用只读、write_file 或 replace_in_file 工具。",
-  ].filter(Boolean).join("\n");
-}
-
-function buildPlanEvidenceRecoveryClosurePrompt(input: {
-  language: "zh" | "en";
-  recentToolActivity: PlanToolActivitySummary[];
-  qualityGateReason?: string;
-  missingSections?: string[];
-}): string {
-  const reason = formatPlanQualityReason({
-    reason: input.qualityGateReason,
-    missingSections: input.missingSections,
-    language: input.language,
-  });
-  const evidence = summarizeRecentPlanEvidenceForPrompt(input.recentToolActivity, input.language);
-  if (input.language === "en") {
-    return [
-      "PLAN_EVIDENCE_RECOVERY_COMPLETE: The targeted evidence pass is complete.",
-      reason,
-      "Use the new evidence below and output a concise visible `<proposed_plan>` now; do not start another broad exploration pass. MAIN will materialize it into `.MAIN/plans/plan.md`.",
-      evidence,
-    ].filter(Boolean).join("\n");
-  }
-  return [
-    "PLAN_EVIDENCE_RECOVERY_COMPLETE: 定向补证已经完成。",
-    reason,
-    "现在用下面的新证据输出精简可见的 `<proposed_plan>`；不要开启新一轮泛读。MAIN 会把它物化为 `.MAIN/plans/plan.md`。",
-    evidence,
-  ].filter(Boolean).join("\n");
-}
-
-function buildPlanEvidenceRecoveryBlockedPrompt(input: {
-  language: "zh" | "en";
-  recentToolActivity: PlanToolActivitySummary[];
-  qualityGateReason?: string;
-  missingSections?: string[];
-}): string {
-  const reason = formatPlanQualityReason({
-    reason: input.qualityGateReason,
-    missingSections: input.missingSections,
-    language: input.language,
-  });
-  const evidence = summarizeRecentPlanEvidenceForPrompt(input.recentToolActivity, input.language);
-  if (input.language === "en") {
-    return [
-      "PLAN_EVIDENCE_RECOVERY_BLOCKED: The one targeted evidence pass did not produce usable evidence.",
-      reason,
-      "Do not keep calling read-only tools. Either output a visible `<proposed_plan>` using only confirmed evidence below, or state the single real blocker as a user-visible question.",
-      evidence,
-    ].filter(Boolean).join("\n");
-  }
-  return [
-    "PLAN_EVIDENCE_RECOVERY_BLOCKED: 这一次定向补证没有得到可用证据。",
-    reason,
-    "不要继续调用只读工具。要么只基于下面已确认的证据输出可见 `<proposed_plan>`，要么把唯一真实阻塞点作为可见问题告诉用户。",
-    evidence,
-  ].filter(Boolean).join("\n");
-}
-
 function filterPlanRuntimeToolDefinitionsForPhase(input: {
   tools: ToolDefinition[];
   workflowMode: "chat" | "edit" | "plan";
@@ -711,37 +434,6 @@ function planUnsupportedToolFeedbackMessage(input: {
   return input.language === "zh"
     ? `工具 "${input.toolName}" 当前没有暴露给 ${input.runtimeIntent} 运行意图。请使用本轮可用工具；如果这是已批准计划的执行步骤，请继续按执行阶段恢复。`
     : `Tool "${input.toolName}" is not exposed for the current ${input.runtimeIntent} runtime intent. Use an available tool; if this is approved plan execution, continue from the execution stage.`;
-}
-
-function stripReasoningBlocksForEscalation(text: string): string {
-  return String(text || "")
-    .replace(/<(?:analysis|thought|thinking|reasoning)(?:\s[^>]*)?>[\s\S]*?<\/(?:analysis|thought|thinking|reasoning)>/gi, " ")
-    .replace(/<\/?(?:analysis|thought|thinking|reasoning)(?:\s[^>]*)?>/gi, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-export function isReasoningDominatedLengthResult(
-  result: Pick<StreamResult, "content" | "finishReason" | "reasoningContent" | "toolCalls">,
-  isLocal?: boolean,
-): boolean {
-  if (result.finishReason !== "length") return false;
-  return isReasoningDominatedNoActionResult(result, isLocal);
-}
-
-export function isReasoningDominatedNoActionResult(
-  result: Pick<StreamResult, "content" | "reasoningContent" | "toolCalls">,
-  isLocal?: boolean,
-): boolean {
-  if (Array.isArray(result.toolCalls) && result.toolCalls.length > 0) return false;
-
-  const reasoningChars = String(result.reasoningContent || "").trim().length;
-  const threshold = isLocal ? 8000 : 1000;
-  if (reasoningChars < threshold) return false;
-
-  const visibleChars = stripReasoningBlocksForEscalation(result.content).length;
-  if (visibleChars <= 240) return true;
-  return visibleChars <= 600 && reasoningChars >= visibleChars * 6;
 }
 
 function computeContextForceReason(input: {
@@ -870,30 +562,6 @@ function isEphemeralPlanArtifactMutation(name: string, args: Record<string, unkn
 
 function isPlanArtifactPath(path: string): boolean {
   return path.replace(/\\/g, "/").toLowerCase().includes(".main/plans/");
-}
-
-function isOptionalTasksMdRead(toolName: string, target: string): boolean {
-  if (toolName !== "read_file") return false;
-  const normalized = target.replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase();
-  return normalized === ".main/plans/tasks.md" || normalized.endsWith("/.main/plans/tasks.md");
-}
-
-function isMissingOptionalTasksMdReadError(errorMessage: string): boolean {
-  return /no such file or directory|os error 2|路径不存在|无法访问/i.test(errorMessage);
-}
-
-function buildOptionalTasksMdMissingResult(language: "zh" | "en", target: string): string {
-  return language === "zh"
-    ? [
-        `OPTIONAL_TASKS_MD_NOT_PRESENT path: ${target || ".MAIN/plans/tasks.md"}`,
-        "`tasks.md` 是可选审计文件，当前不存在也不阻塞执行。",
-        "请直接使用 MAIN 提供的 runtime 任务清单和已批准的 plan.md；不要再为了确认是否存在而重复读取 `.MAIN/plans/tasks.md`。",
-      ].join("\n")
-    : [
-        `OPTIONAL_TASKS_MD_NOT_PRESENT path: ${target || ".MAIN/plans/tasks.md"}`,
-        "`tasks.md` is an optional audit file; it is not required for execution.",
-        "Use MAIN's runtime task list and the approved plan.md instead; do not reread `.MAIN/plans/tasks.md` just to check existence.",
-      ].join("\n");
 }
 
 function isProjectSourceWriteResult(result: ToolExecutionResult): boolean {
@@ -1477,41 +1145,6 @@ function buildNoProgressBatchSignature(results: ToolExecutionResult[]): string {
   return fragments.join("||");
 }
 
-function buildExecuteNoActionPauseMessage(input: {
-  language: "zh" | "en";
-  recentToolActivity: PlanToolActivitySummary[];
-  visibleText?: string;
-}): string {
-  const repeatedTargets = summarizeRepeatedPlanTargetsFromToolActivity(input.recentToolActivity);
-  const recent = input.recentToolActivity
-    .slice(-6)
-    .map((activity) => {
-      const target = activity.target ? ` ${activity.target}` : "";
-      const detail = activity.detail ? ` - ${activity.detail}` : "";
-      return `${activity.status}:${activity.name}${target}${detail}`;
-    })
-    .map((line) => truncateForLog(line, 180));
-  const visible = truncateForLog(input.visibleText || "", 220);
-
-  if (input.language === "zh") {
-    return [
-      "执行已暂停：模型已经读取/分析了上下文，但没有转向真实写入、命令验证或明确结论。",
-      repeatedTargets.length > 0 ? `重复目标：${repeatedTargets.join("、")}` : "",
-      recent.length > 0 ? `最近有效进展：\n${recent.map((line) => `- ${line}`).join("\n")}` : "",
-      visible ? `模型最后可见输出：${visible}` : "",
-      "恢复时不要继续重复读取相同文件；请基于已读内容直接写入/替换、运行验证命令，或说明阻塞在什么具体证据/权限/业务选择上。",
-    ].filter(Boolean).join("\n");
-  }
-
-  return [
-    "Execution paused: the model read/analyzed context but did not pivot to a real write, command validation, or clear conclusion.",
-    repeatedTargets.length > 0 ? `Repeated targets: ${repeatedTargets.join(", ")}` : "",
-    recent.length > 0 ? `Recent effective progress:\n${recent.map((line) => `- ${line}`).join("\n")}` : "",
-    visible ? `Last visible model output: ${visible}` : "",
-    "On resume, do not reread the same files. Use the cached context to patch/write, run validation, or state the concrete evidence/permission/business-choice blocker.",
-  ].filter(Boolean).join("\n");
-}
-
 function isApprovedPlanRecoveryTool(
   tool: ToolDefinition,
   options: { allowFileRead?: boolean } = {},
@@ -1687,52 +1320,6 @@ function buildHiddenThoughtOnlyContinuationPrompt(language: "zh" | "en", consecu
       ].join("\n");
 }
 
-function buildReasoningDominatedRecoveryPrompt(language: "zh" | "en", workflowMode: "chat" | "edit" | "plan"): string {
-  if (language === "en") {
-    return workflowMode === "plan"
-      ? [
-          "The previous model turn produced only hidden reasoning metadata and no tool call, user-visible answer, or plan artifact.",
-          "Hidden reasoning is not progress. Continue now with one concrete action: call the next necessary tool, create/update the reviewable plan artifact, or state the exact blocker in user-visible Markdown.",
-          "Do not output hidden thinking tags or another plan-shaped internal monologue.",
-        ].join("\n")
-      : [
-          "The previous model turn produced only hidden reasoning metadata and no executable action.",
-          "Continue now with one concrete action: patch/write, run a finite command, use browser validation, or give a concise user-visible blocker. Broad reads may be temporarily withheld; reuse the cached context instead of rereading the same files. Do not output hidden thinking tags.",
-        ].join("\n");
-  }
-
-  return workflowMode === "plan"
-    ? [
-        "上一轮模型只产生了后台 reasoning 元数据，没有工具调用、用户可见结论或可审批计划文件。",
-        "后台思考不算进展。现在必须执行一个真实动作：调用下一步必要工具、生成/更新可审批计划文件，或用普通 Markdown 说明精确阻塞点。",
-        "不要再输出 hidden thinking 标签，也不要继续写内部独白式方案。",
-      ].join("\n")
-    : [
-        "上一轮模型只产生了后台 reasoning 元数据，没有可执行动作。",
-        "现在必须执行一个真实动作：写入/替换、运行有限命令、浏览器验证，或用普通 Markdown 给出精确阻塞点。宽泛读取工具可能会被临时收起；请复用已缓存上下文，不要重复读同一批文件。不要输出 hidden thinking 标签。",
-      ].join("\n");
-}
-
-function buildReasoningDominatedPauseMessage(language: "zh" | "en", workflowMode: "chat" | "edit" | "plan"): string {
-  if (language === "en") {
-    return [
-      "Paused: the model repeatedly returned hidden reasoning without tools or visible progress.",
-      workflowMode === "plan"
-        ? "A Plan run must advance through a reviewable artifact, tool evidence, edits, commands, browser validation, or an explicit blocker."
-        : "A run must advance through a user-visible answer, tool evidence, edits, commands, validation, or an explicit blocker.",
-      "Resume after switching to a concrete action target or a model/profile that does not emit reasoning-only completions.",
-    ].join("\n\n");
-  }
-
-  return [
-    "已暂停：模型连续返回后台 reasoning，但没有工具调用或可见进展。",
-    workflowMode === "plan"
-      ? "Plan 流程必须通过可审批计划文件、工具证据、编辑、命令、浏览器验证或明确阻塞点推进。"
-      : "执行流程必须通过用户可见结论、工具证据、编辑、命令、验证或明确阻塞点推进。",
-    "恢复前建议先切到具体动作目标，或换用不会持续输出 reasoning-only 的模型/配置。",
-  ].join("\n\n");
-}
-
 function buildExecuteConvergencePrompt(language: "zh" | "en", iteration: number, maxIterations: number): string {
   return language === "zh"
     ? [
@@ -1747,345 +1334,6 @@ function buildExecuteConvergencePrompt(language: "zh" | "en", iteration: number,
         "First decide from existing tool results whether the task is already complete. If it is complete, output the final summary and stop without more tools.",
       "If it is not complete, call exactly one smallest necessary action tool. Do not repeat reads, repeat validation, or keep editing the same target without new evidence.",
     ].join("\n");
-}
-
-function buildLanguageMismatchRecoveryPrompt(language: "zh" | "en"): string {
-  return language === "zh"
-    ? [
-        "上一条可见回复语言与本轮目标语言不一致。",
-        "不要解释语言策略，也不要复述过程。",
-        "请基于已完成的上下文与证据，重新输出同等结论，并且必须使用简体中文。",
-      ].join("\n")
-    : [
-        "The previous visible reply used the wrong language for this turn.",
-        "Do not explain language policy and do not repeat process narration.",
-      "Using the existing context and evidence, restate the same conclusion in English.",
-      ].join("\n");
-}
-
-export function shouldRecoverLanguageMismatchTurn(input: {
-  text: string;
-  targetLanguage: "zh" | "en";
-  suppressedByPlanGuard: boolean;
-  toolCallCount: number;
-  alreadyRetried: boolean;
-}): {
-  action: "recover_once" | "hide_text_continue" | "pass";
-  shouldRecover: boolean;
-  exhausted: boolean;
-  hideTextForToolCall: boolean;
-  mismatch: boolean;
-  detectedLanguage: "zh" | "en" | null;
-  hanCount: number;
-  latinLetters: number;
-  latinWords: number;
-} {
-  const mismatch = detectResponseLanguageMismatch({
-    text: input.text,
-    targetLanguage: input.targetLanguage,
-  });
-  const hasActionableMismatch =
-    !input.suppressedByPlanGuard &&
-    input.text.trim().length > 0 &&
-    mismatch.mismatch;
-  const hideTextForToolCall =
-    hasActionableMismatch &&
-    input.toolCallCount > 0;
-  const shouldRecover =
-    hasActionableMismatch &&
-    input.toolCallCount === 0 &&
-    !input.alreadyRetried;
-  const exhausted =
-    hasActionableMismatch &&
-    input.alreadyRetried &&
-    input.toolCallCount === 0;
-  return {
-    action: shouldRecover ? "recover_once" : hideTextForToolCall ? "hide_text_continue" : "pass",
-    shouldRecover,
-    exhausted,
-    hideTextForToolCall,
-    mismatch: mismatch.mismatch,
-    detectedLanguage: mismatch.detectedLanguage,
-    hanCount: mismatch.hanCount,
-    latinLetters: mismatch.latinLetters,
-    latinWords: mismatch.latinWords,
-  };
-}
-
-const PSEUDO_TOOL_CALL_RE = /(?:^|\n)\s*(?:\[(?:Tool call|tool_call|工具调用)\s*:\s*([a-z_][a-z0-9_]*)\s*\]|(?:Tool call|tool_call|工具调用)\s*:\s*([a-z_][a-z0-9_]*))\s*$/im;
-const NON_STANDARD_TOOL_WRAPPER_RE = /<tool_code(?:\s[^>]*)?>[\s\S]*?<\/tool_code>/i;
-const TABULAR_FILE_RE = /\.(?:csv|tsv|xlsx|xls|xlsm)$/i;
-const UNITY_FALLBACK_RECOVERY_READ_ONLY_TOOL_NAMES = new Set([
-  "list_directory",
-  "get_project_skeleton",
-  "glob_search",
-  "grep_search",
-  "read_file",
-  "get_file_outline",
-  "read_document",
-  "analyze_tabular_document",
-  "query_tabular_document",
-  "index_workspace_documents",
-  "unity_docs",
-  "unity_reflect",
-  "find_gameobjects",
-  "find_in_file",
-  "read_console",
-]);
-
-export function extractPseudoToolCallName(text: string): string | null {
-  const content = String(text || "");
-  if (!content.trim()) return null;
-  if (/<tool_use>|<tool_call|<function_call/i.test(content)) return null;
-  const match = content.match(PSEUDO_TOOL_CALL_RE);
-  const name = String(match?.[1] || match?.[2] || "").trim();
-  return name || null;
-}
-
-export function looksLikePseudoToolCallPlaceholder(text: string): boolean {
-  return extractPseudoToolCallName(text) != null;
-}
-
-export function looksLikeNonStandardToolCallFormat(text: string): boolean {
-  const content = String(text || "");
-  if (!content.trim()) return false;
-  if (/<tool_use>|<tool_call|<function_call/i.test(content)) return false;
-  return NON_STANDARD_TOOL_WRAPPER_RE.test(content);
-}
-
-export function buildPseudoToolCallRecoveryPrompt(language: "zh" | "en", workflowMode: "chat" | "edit" | "plan"): string {
-  const modeText = workflowMode === "chat" ? "read-only/discussion" : workflowMode === "plan" ? "plan" : "execute";
-  return language === "zh"
-    ? [
-        "你刚才输出了非标准工具格式（如 `[Tool call: ...]` 或 `<tool_code>...</tool_code>`），它不是可执行工具调用，MAIN 不能据此执行工具。",
-        "如果你需要工具，必须立即用正式 XML 工具协议重发，并补齐所有必填参数：",
-        "<tool_use>",
-        "<tool>read_file</tool>",
-        "<parameter name=\"path\">相对 workspace 的文件路径</parameter>",
-        "</tool_use>",
-        `当前运行阶段：${modeText}。不要再输出 \`[Tool call: ...]\`、\`<tool_code>...</tool_code>\`，也不要只描述“我要调用工具”。如果缺少路径或参数，请先用可用的只读工具获取上下文，或直接用可见正文说明缺口。`,
-      ].join("\n")
-    : [
-        "You just emitted a non-standard tool format (for example `[Tool call: ...]` or `<tool_code>...</tool_code>`). That is not an executable tool call, so MAIN cannot run a tool from it.",
-        "If you need a tool, immediately resend it using the formal XML tool protocol with all required parameters:",
-        "<tool_use>",
-        "<tool>read_file</tool>",
-        "<parameter name=\"path\">workspace-relative file path</parameter>",
-        "</tool_use>",
-        `Current workflow mode: ${modeText}. Do not output \`[Tool call: ...]\`, \`<tool_code>...</tool_code>\`, or merely describe that you will call a tool. If a path or argument is missing, use an available read-only tool to gather context or explain the gap in visible text.`,
-      ].join("\n");
-}
-
-function buildToolProtocolDoomLoopStopMessage(language: "zh" | "en", toolName?: string | null): string {
-  const tool = toolName ? ` ${toolName}` : "";
-  return language === "zh"
-    ? `模型连续输出不可执行的伪工具调用${tool}，没有补齐正式 XML 参数。MAIN 已停止本轮以避免继续堆叠恢复提示。你可以继续当前任务，MAIN 会保留已读取的上下文；建议下一条明确指定文件路径或让 MAIN 先读取 @ 文件。`
-    : `The model repeatedly emitted a non-executable pseudo tool call${tool} without valid XML parameters. MAIN stopped this turn to avoid piling on more recovery prompts. You can continue the task; MAIN kept the context already read. For the next message, specify the file path or ask MAIN to read the @ file first.`;
-}
-
-function containsToolUseBlock(text: string): boolean {
-  return /<tool_use\b/i.test(String(text || ""));
-}
-
-function containsToolNameParameterFallback(text: string): boolean {
-  return /<tool_use\b[\s\S]*?<parameter\s+name=["'](?:tool|name|function)["']/i.test(String(text || ""));
-}
-
-function summarizeProtocolFragmentForLog(text: string): string {
-  return String(text || "")
-    .replace(/```[\s\S]*?```/g, "[code block]")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 180);
-}
-
-function extractUserMentionedFilePathsFromMessages(messages: AgentMessage[]): string[] {
-  const paths: string[] = [];
-  const seen = new Set<string>();
-  for (const message of messages) {
-    if (message.role !== "user" || typeof message.content !== "string") continue;
-    const markerIndex = message.content.indexOf("[user_mentioned_files]");
-    if (markerIndex < 0) continue;
-    const section = message.content
-      .slice(markerIndex)
-      .split(/\n\[[a-z_]+(?:_[a-z_]+)*\]/i)[0] || "";
-    const pathRe = /^path:\s*(.+?)\s*$/gmi;
-    let match: RegExpExecArray | null;
-    while ((match = pathRe.exec(section)) !== null) {
-      const value = String(match[1] || "").trim();
-      if (!value || seen.has(value)) continue;
-      seen.add(value);
-      paths.push(value);
-    }
-  }
-  return paths;
-}
-
-function choosePseudoToolRecovery(input: {
-  pseudoToolName: string | null;
-  availableToolNames: Set<string>;
-  mentionedPaths: string[];
-  workflowMode: "chat" | "edit" | "plan";
-  turnIntent: ResolvedUserIntent;
-}): {
-  call: { id: string; name: string; arguments: string } | null;
-  requestedToolName: string | null;
-  recoveredToolName: string | null;
-  reason: string;
-  mentionedPathCount: number;
-  argumentKeys: string[];
-} {
-  const requestedToolName = String(input.pseudoToolName || "").trim();
-  if (!requestedToolName) {
-    return {
-      call: null,
-      requestedToolName: null,
-      recoveredToolName: null,
-      reason: "no_pseudo_tool_name",
-      mentionedPathCount: input.mentionedPaths.length,
-      argumentKeys: [],
-    };
-  }
-  if (!input.availableToolNames.has(requestedToolName)) {
-    return {
-      call: null,
-      requestedToolName,
-      recoveredToolName: null,
-      reason: "tool_not_available",
-      mentionedPathCount: input.mentionedPaths.length,
-      argumentKeys: [],
-    };
-  }
-
-  if (requestedToolName === "get_project_skeleton" || requestedToolName === "get_pty_status" || requestedToolName === "clear_pty_buffer") {
-    return {
-      call: {
-        id: `pseudo_recovered_${generateId()}`,
-        name: requestedToolName,
-        arguments: JSON.stringify({}),
-      },
-      requestedToolName,
-      recoveredToolName: requestedToolName,
-      reason: "no_required_arguments",
-      mentionedPathCount: input.mentionedPaths.length,
-      argumentKeys: [],
-    };
-  }
-
-  const uniqueMentionedPath = input.mentionedPaths.length === 1 ? input.mentionedPaths[0] : "";
-  if (!uniqueMentionedPath) {
-    return {
-      call: null,
-      requestedToolName,
-      recoveredToolName: null,
-      reason: input.mentionedPaths.length > 1 ? "ambiguous_mentioned_paths" : "missing_required_path",
-      mentionedPathCount: input.mentionedPaths.length,
-      argumentKeys: [],
-    };
-  }
-
-  const isTabular = TABULAR_FILE_RE.test(uniqueMentionedPath);
-  const shouldPreferTabularAnalysis =
-    requestedToolName === "read_file" &&
-    isTabular &&
-    input.availableToolNames.has("analyze_tabular_document") &&
-    (input.workflowMode === "plan" || input.turnIntent === "analyze" || input.turnIntent === "report" || input.turnIntent === "summarize");
-  const recoveredToolName = shouldPreferTabularAnalysis ? "analyze_tabular_document" : requestedToolName;
-  if (!input.availableToolNames.has(recoveredToolName)) {
-    return {
-      call: null,
-      requestedToolName,
-      recoveredToolName: null,
-      reason: "recovered_tool_not_available",
-      mentionedPathCount: input.mentionedPaths.length,
-      argumentKeys: [],
-    };
-  }
-
-  const pathOnlyTools = new Set([
-    "read_file",
-    "read_document",
-    "analyze_tabular_document",
-    "get_file_outline",
-    "list_directory",
-    "index_workspace_documents",
-  ]);
-  if (!pathOnlyTools.has(recoveredToolName)) {
-    return {
-      call: null,
-      requestedToolName,
-      recoveredToolName: null,
-      reason: "tool_requires_uninferrable_arguments",
-      mentionedPathCount: input.mentionedPaths.length,
-      argumentKeys: [],
-    };
-  }
-
-  const args = { path: uniqueMentionedPath };
-  return {
-    call: {
-      id: `pseudo_recovered_${generateId()}`,
-      name: recoveredToolName,
-      arguments: JSON.stringify(args),
-    },
-    requestedToolName,
-    recoveredToolName,
-    reason: shouldPreferTabularAnalysis ? "unique_tabular_mention" : "unique_mentioned_path",
-    mentionedPathCount: input.mentionedPaths.length,
-    argumentKeys: Object.keys(args),
-  };
-}
-
-export function recoverPseudoToolCallFromContext(input: {
-  text: string;
-  availableToolNames: Set<string> | string[];
-  mentionedPaths: string[];
-  workflowMode: "chat" | "edit" | "plan";
-  turnIntent: ResolvedUserIntent;
-}): ReturnType<typeof choosePseudoToolRecovery> {
-  return choosePseudoToolRecovery({
-    pseudoToolName: extractPseudoToolCallName(input.text),
-    availableToolNames: input.availableToolNames instanceof Set
-      ? input.availableToolNames
-      : new Set(input.availableToolNames),
-    mentionedPaths: input.mentionedPaths,
-    workflowMode: input.workflowMode,
-    turnIntent: input.turnIntent,
-  });
-}
-
-function buildMalformedToolUseRecoveryPrompt(language: "zh" | "en"): string {
-  if (language === "en") {
-    return [
-      "Your previous reply contained a `<tool_use>` block, but MAIN could not parse it as an executable tool call.",
-      "Continue with exactly one valid XML tool call now. Use this shape:",
-      "<tool_use>",
-      "<tool>query_tabular_document</tool>",
-      "<parameter name=\"path\">path/to/file.csv</parameter>",
-      "<parameter name=\"query\">SQL or natural-language query</parameter>",
-      "</tool_use>",
-      "Do not put the tool name inside `<parameter name=\"tool\">`, and do not output prose around the tool call.",
-    ].join("\n");
-  }
-
-  return [
-    "上一条回复包含 `<tool_use>`，但 MAIN 没能解析成可执行工具调用。",
-    "现在请只输出一个合法 XML 工具调用，格式如下：",
-    "<tool_use>",
-    "<tool>query_tabular_document</tool>",
-    "<parameter name=\"path\">path/to/file.csv</parameter>",
-    "<parameter name=\"query\">SQL 或自然语言查询</parameter>",
-    "</tool_use>",
-    "不要把工具名写进 `<parameter name=\"tool\">`，也不要在工具调用前后输出说明文字。",
-  ].join("\n");
-}
-
-export function shouldRepromptBeforeUnityConsoleFallback(input: {
-  readConsoleCalled: boolean;
-  hasSuccessfulReadOnlyActivity: boolean;
-  repromptAlreadyIssued: boolean;
-}): boolean {
-  return !input.readConsoleCalled && input.hasSuccessfulReadOnlyActivity && !input.repromptAlreadyIssued;
 }
 
 function looksLikePlanCompletionClaim(text: string): boolean {
@@ -2400,57 +1648,6 @@ function resolveApprovedPlanValidationBoundary(input: {
   return "none";
 }
 
-function buildPlanFallbackNotice(language: "zh" | "en", sourceChars: number): string {
-  const formatted = sourceChars.toLocaleString();
-  return language === "zh"
-    ? `模型刚才输出了约 ${formatted} 个字符的规划正文，但还没有形成可审批计划。MAIN 会先尝试把可见方案物化为 \`.MAIN/plans/plan.md\`，或用可点击选项确认关键分叉；不会把工具日志或截断内容强行写成计划。`
-    : `The model produced about ${formatted} characters of planning text but did not create a reviewable plan. MAIN will try to materialize the visible plan into \`.MAIN/plans/plan.md\`, or ask for the key decision first; tool logs and truncated text will not be forced into plan files.`;
-}
-
-function looksLikeToolUnavailableClaim(text: string): boolean {
-  const normalized = String(text || "").replace(/\s+/g, " ").trim().toLowerCase();
-  if (!normalized) return false;
-  const toolClaim =
-    /没有(?:可用|可以调用|能调用|任何)?(?:的)?工具/.test(normalized) ||
-    /无法(?:访问|读取|查看|打开|调用|使用).*(?:文件|目录|工作区|工具|本地)/.test(normalized) ||
-    /不能(?:访问|读取|查看|打开|调用|使用).*(?:文件|目录|工作区|工具|本地)/.test(normalized) ||
-    /(?:no|without|lack|lacks|do not have|don't have|cannot|can't|unable to).{0,80}(?:tool|function|file|folder|filesystem|workspace|local)/i.test(normalized) ||
-    /(?:tool|function|file|folder|filesystem|workspace|local).{0,80}(?:unavailable|not available|not accessible|unsupported|disabled)/i.test(normalized);
-  return toolClaim;
-}
-
-function buildToolUnavailableRecoveryPrompt(language: "zh" | "en", workflowMode: "chat" | "edit" | "plan"): string {
-  const writeAllowed = workflowMode === "chat"
-    ? language === "zh"
-      ? "当前是聊天回合，除非用户明确要求实现或修改，先只使用只读工具。"
-      : "This is a chat turn, so use read-only tools unless the user explicitly asked for implementation or edits."
-    : language === "zh"
-    ? "如果用户要求实现、修复或计划落盘，可以使用写入/执行工具。"
-    : "If the user asked for implementation, fixes, or plan artifacts, write/execute tools are available.";
-
-  return language === "zh"
-    ? [
-        "上一条回复把云端原生 function tools 不可用误解成 MAIN 没有工具。请纠正：MAIN 内置工具可通过 XML `<tool_use>` 调用。",
-        "不要再声称无法访问工作区、文件或工具；如果需要上下文，请立即调用合适的 XML 工具。",
-        writeAllowed,
-        "可用示例：",
-        "<tool_use>",
-        "<tool>read_file</tool>",
-        "<parameter name=\"path\">README.md</parameter>",
-        "</tool_use>",
-      ].join("\n")
-    : [
-        "The previous reply confused native function-tools support with MAIN tool availability. Correct this: MAIN built-in tools are available through XML `<tool_use>` calls.",
-        "Do not claim that workspace files or tools are unavailable; if context is needed, immediately call the appropriate XML tool.",
-        writeAllowed,
-        "Example:",
-        "<tool_use>",
-        "<tool>read_file</tool>",
-        "<parameter name=\"path\">README.md</parameter>",
-        "</tool_use>",
-      ].join("\n");
-}
-
 function stripControlPromptForPlanFallback(text: string): string {
   return String(text || "")
     .replace(/^本轮处于 PLAN 模式。[\s\S]*?\n\n/i, "")
@@ -2640,240 +1837,6 @@ function collectPlanClosureMaterializationInput(
   };
 }
 
-function hasGroundedPlanClosureEvidence(
-  input: ReturnType<typeof collectPlanClosureMaterializationInput>,
-  recentActivity: PlanToolActivitySummary[] = [],
-): boolean {
-  if (!hasRelevantPlanClosureEvidence(input, recentActivity)) return false;
-
-  const hasNonPlanFile = input.files.some((file) => {
-    const target = String(file || "").trim();
-    return !!target && !isPlanArtifactPath(target);
-  });
-  if (hasNonPlanFile) return true;
-
-  const hasSuccessfulReadActivity = recentActivity.some((item) =>
-    item.status === "succeeded" &&
-    PLAN_EXPLORATION_READ_ONLY_TOOLS.has(item.name) &&
-    (!item.target || !isPlanArtifactPath(item.target))
-  );
-  if (hasSuccessfulReadActivity) return true;
-
-  return input.evidence.some((item) => {
-    const text = String(item || "").trim();
-    if (!text) return false;
-    if (/^(?:模型曾尝试修改|model attempted to modify)/i.test(text)) return false;
-    if (/\.MAIN\/plans\/plan\.md/i.test(text) && !/(?:read|读取|search|搜索|evidence|证据|confirmed|已确认)/i.test(text)) return false;
-    return true;
-  });
-}
-
-function normalizePlanEvidencePath(value: string): string {
-  return value
-    .replace(/\\/g, "/")
-    .replace(/^\.?\//, "")
-    .trim()
-    .toLowerCase();
-}
-
-function isDocumentationEvidenceFile(value: string): boolean {
-  return /\.(?:md|mdx|txt|rst)$/i.test(normalizePlanEvidencePath(value));
-}
-
-function isImplementationEvidenceFile(value: string): boolean {
-  const normalized = normalizePlanEvidencePath(value);
-  if (!normalized || isPlanArtifactPath(normalized)) return false;
-  if (isDocumentationEvidenceFile(normalized)) return false;
-  return /^(?:src|app|lib|components|pages|hooks|store|styles|server|client|packages|apps|tests|scripts)\//i.test(normalized) ||
-    /\.(?:tsx?|jsx?|swift|py|rs|go|json|csv|tsv|xlsx|css|scss|html|toml|ya?ml|log)$/i.test(normalized);
-}
-
-function goalMentionsDocumentation(goal: string): boolean {
-  return /\b(?:readme|docs?|documentation|markdown|mdx?)\b|(?:文档|说明|README|读我|说明文档)/i.test(goal);
-}
-
-const PLAN_GOAL_STOPWORDS = new Set([
-  "please",
-  "fix",
-  "repair",
-  "issue",
-  "problem",
-  "plan",
-  "approve",
-  "approved",
-  "execute",
-  "execution",
-  "verify",
-  "validation",
-  "true",
-  "real",
-  "file",
-  "files",
-  "change",
-  "changes",
-  "update",
-  "修改",
-  "修复",
-  "问题",
-  "计划",
-  "批准",
-  "执行",
-  "验证",
-  "真实",
-  "文件",
-]);
-
-const PLAN_GOAL_DOMAIN_TERMS = [
-  "csv",
-  "tsv",
-  "xlsx",
-  "dashboard",
-  "creator",
-  "creatorname",
-  "parser",
-  "parse",
-  "chart",
-  "graph",
-  "import",
-  "export",
-  "table",
-  "dark",
-  "theme",
-  "log",
-  "图表",
-  "图形",
-  "数据",
-  "导入",
-  "导出",
-  "解析",
-  "字段",
-  "仪表盘",
-  "面板",
-  "显示",
-  "表格",
-  "截图",
-  "日志",
-  "质量门",
-  "审批",
-  "深色",
-  "样式",
-  "订单",
-];
-
-function extractGoalRelevanceHints(goal: string): string[] {
-  const source = String(goal || "");
-  const lower = source.toLowerCase();
-  const hints = new Set<string>();
-  for (const match of lower.matchAll(/[a-z][a-z0-9_-]{2,}/g)) {
-    const token = match[0];
-    if (!PLAN_GOAL_STOPWORDS.has(token)) hints.add(token);
-  }
-  for (const term of PLAN_GOAL_DOMAIN_TERMS) {
-    if (lower.includes(term.toLowerCase())) hints.add(term.toLowerCase());
-  }
-  return [...hints].filter((item) => item.length >= 2).slice(0, 12);
-}
-
-function extractExplicitGoalPaths(goal: string): string[] {
-  return Array.from(String(goal || "").matchAll(/\b[A-Za-z0-9_@./-]+\.(?:tsx?|jsx?|swift|py|rs|go|json|csv|tsv|xlsx|mdx?|css|scss|html|toml|ya?ml|log)\b/g))
-    .map((match) => normalizePlanEvidencePath(match[0]))
-    .filter(Boolean);
-}
-
-function hasRelevantPlanClosureEvidence(
-  input: ReturnType<typeof collectPlanClosureMaterializationInput>,
-  recentActivity: PlanToolActivitySummary[] = [],
-): boolean {
-  const goal = String(input.userGoal || "").trim();
-  if (!goal) return false;
-
-  const files = [
-    ...input.files,
-    ...recentActivity.map((item) => item.target || ""),
-  ]
-    .map((item) => normalizePlanEvidencePath(String(item || "")))
-    .filter((item) => item && !isPlanArtifactPath(item));
-
-  const evidenceText = [
-    ...input.evidence,
-    ...input.constraints,
-    ...recentActivity.map((item) => [item.name, item.target, item.detail].filter(Boolean).join(" ")),
-    ...files,
-  ].join("\n").toLowerCase();
-
-  const explicitPaths = extractExplicitGoalPaths(goal);
-  if (explicitPaths.length > 0) {
-    return explicitPaths.some((goalPath) =>
-      files.some((file) =>
-        file === goalPath ||
-        file.endsWith(`/${goalPath}`) ||
-        file.endsWith(`/${goalPath.split("/").pop() || goalPath}`)
-      ) ||
-      evidenceText.includes(goalPath)
-    );
-  }
-
-  const hints = extractGoalRelevanceHints(goal);
-  if (hints.some((hint) => evidenceText.includes(hint))) return true;
-
-  const docOnly = files.length > 0 && files.every(isDocumentationEvidenceFile);
-  if (docOnly && !goalMentionsDocumentation(goal)) return false;
-
-  const sourceEvidenceCount = files.filter(isImplementationEvidenceFile).length;
-  return sourceEvidenceCount >= 2 && input.evidence.length >= 2;
-}
-
-function resolvePlanClosureArtifactKind(
-  input: ReturnType<typeof collectPlanClosureMaterializationInput>,
-  currentStage: ReturnType<OrchestratorCallbacks["getPlanStage"]>,
-  recentActivity: PlanToolActivitySummary[] = [],
-): "plan" | "design" {
-  if (currentStage === "design") return "design";
-  const text = [
-    input.userGoal,
-    ...input.constraints,
-    ...input.evidence.slice(0, 6),
-  ].join("\n");
-  if (
-    /\.MAIN\/plans\/design\.md/i.test(text) ||
-    /(?:设计方案|设计文档|Design\s+(?:artifact|document|plan)|reviewable,\s*actionable\s*design)/i.test(text) ||
-    /(?:框架设计|架构设计|接口设计|代码框架|类图|游戏开发|game\s*dev|architecture|framework|class\s*structure|class\s*diagram)/i.test(text)
-  ) {
-    return "design";
-  }
-  if (hasSuccessfulTabularActivity(recentActivity) && /(?:\.csv|\.tsv|\.xlsx|表格|数据|tabular|spreadsheet)/i.test(text)) {
-    return "design";
-  }
-  return "plan";
-}
-
-function hasSuccessfulTabularActivity(recentActivity: PlanToolActivitySummary[]): boolean {
-  return recentActivity.some((item) =>
-    item.status === "succeeded" &&
-    (item.name === "analyze_tabular_document" || item.name === "query_tabular_document")
-  );
-}
-
-function countSuccessfulPlanReadEvidence(recentActivity: PlanToolActivitySummary[]): number {
-  const evidenceTools = new Set([
-    "get_project_skeleton",
-    "list_directory",
-    "read_file",
-    "get_file_outline",
-    "read_document",
-    "analyze_tabular_document",
-    "query_tabular_document",
-    "glob_search",
-    "grep_search",
-  ]);
-  const signatures = new Set<string>();
-  for (const item of recentActivity) {
-    if (item.status !== "succeeded" || !evidenceTools.has(item.name)) continue;
-    signatures.add([item.name, item.target || "", item.detail || ""].join("|"));
-  }
-  return signatures.size;
-}
-
 function buildPlanClosurePromptFromEvidence(
   callbacks: OrchestratorCallbacks,
   recentActivity: PlanToolActivitySummary[] = [],
@@ -2892,92 +1855,16 @@ function buildPlanClosurePromptFromEvidence(
   });
 }
 
-function collectFallbackPlanBullets(sourceText: string, fallbackPrompt: string, maxBullets = 8): string[] {
-  const source = stripControlPromptForPlanFallback(sourceText)
-    .replace(/[#>*_`~]/g, " ")
-    .replace(/(?:[，,。.\-_]\s*){24,}/g, " ")
-    .trim();
-  const candidates = source
-    .split(/\n+|(?<=[。！？.!?])\s+/)
-    .map((line) => line.replace(/^\s*(?:[-*]|\d+[.)、])\s*/, "").trim())
-    .filter((line) =>
-      line.length >= 8 &&
-      line.length <= 180 &&
-      !/^(?:让我|但是等等|不过等等|我认为|实际上|用户说|之前的消息|But wait|I think|Actually|The user says)/i.test(line) &&
-      !/<\/?(?:user_options|option|plan)\b/i.test(line),
-    );
-
-  const bullets: string[] = [];
-  const seen = new Set<string>();
-  for (const candidate of candidates) {
-    const key = candidate.toLowerCase().replace(/\s+/g, " ");
-    if (seen.has(key)) continue;
-    seen.add(key);
-    bullets.push(candidate);
-    if (bullets.length >= maxBullets) break;
-  }
-
-  if (bullets.length > 0) return bullets;
-  const fallback = stripControlPromptForPlanFallback(fallbackPrompt);
-  return fallback
-    ? [fallback.length > 160 ? `${fallback.slice(0, 160).trim()}...` : fallback]
-    : [];
-}
-
 function buildPlanRecoveryPrompt(callbacks: OrchestratorCallbacks, sourceText: string, attemptedTargets: string[] = []): string {
-  const language = callbacks.getPreferredLanguage();
-  const userPrompt = getOriginalUserPromptForPlanFallback(callbacks);
   const toolHighlights = collectFallbackToolHighlights(callbacks, attemptedTargets)
     .filter((item) => !/Repeated read-only tool call skipped|Duplicate skip count|already called with identical arguments/i.test(item))
     .slice(0, 6);
-  const bullets = collectFallbackPlanBullets(sourceText, userPrompt, 6);
-  const contextSummary = [
-    userPrompt ? (language === "zh" ? `用户原始目标：${userPrompt}` : `Original user goal: ${userPrompt}`) : "",
-    bullets.length > 0
-      ? (language === "zh" ? `可用规划要点：\n${bullets.map((item) => `- ${item}`).join("\n")}` : `Useful planning points:\n${bullets.map((item) => `- ${item}`).join("\n")}`)
-      : "",
-    toolHighlights.length > 0
-      ? (language === "zh" ? `已读取/尝试的上下文：\n${toolHighlights.map((item) => `- ${item}`).join("\n")}` : `Context already read/tried:\n${toolHighlights.map((item) => `- ${item}`).join("\n")}`)
-      : "",
-  ].filter(Boolean).join("\n\n");
-
-  if (language === "en") {
-    return [
-      "The previous planning output did not produce a valid reviewable plan. Regenerate the plan correctly now.",
-      "",
-      contextSummary,
-      "",
-      "Rules:",
-      "- Do not copy tool logs, duplicate-call warnings, hidden thinking, raw source code, or truncation messages into plan files.",
-      "- A visible `<proposed_plan>` is enough; MAIN will materialize it into the default approval artifact `.MAIN/plans/plan.md`.",
-      "- `plan.md` must use the Codex app handoff shape: title, Summary, Key Changes / Implementation Changes, Public APIs / Interfaces / Types, Test Plan, and Assumptions / Defaults.",
-      "- Screenshot/attachment observations, read evidence, and confirmed facts belong in the concise Summary only when real; do not inflate them into empty audit sections.",
-      "- Every implementation change must point to concrete files, interfaces, data flow, commands, validation, or an explicit default. If public APIs/interfaces/types do not change, say that explicitly.",
-      "- Do not include console.log/debug-log suggestions, generalized CSS/store guesses, or probability claims as execution steps unless a cited evidence line supports them; otherwise place them under unverified hypotheses.",
-      "- Non-blocking MVP tradeoffs must be written with explicit defaults as assumptions or follow-up enhancements. If a choice blocks execution, ask with `<user_options>` before approval and stop.",
-      "- `requirements.md` is optional. Only create it when the user explicitly asks for a requirement ledger or when large/compliance-heavy scope needs traceability; it is never a prerequisite for approval.",
-      "- If the plan direction is unclear, ask the user with `<user_options>` and stop. Do not invent a final plan.",
-      "- If the direction is clear, output a concise visible `<proposed_plan>` or normal Proposal for approval. Do not call `write_file` / `replace_in_file` just to finish planning, and do not generate `tasks.md` before approval.",
-    ].filter(Boolean).join("\n");
-  }
-
-  return [
-    "上一轮规划没有产出有效的可审批计划。现在请重新生成真正的计划。",
-    "",
-    contextSummary,
-    "",
-    "规则：",
-    "- 不要把工具日志、重复调用提示、后台思考、原始源码或截断提示写进计划文件。",
-    "- 可见 `<proposed_plan>` 就足够；MAIN 会把它物化为默认审批产物 `.MAIN/plans/plan.md`。",
-    "- `plan.md` 必须使用 Codex app 交接计划结构：标题、摘要、关键实现改动、公共 API/接口/类型、测试方案、假设与默认值。",
-    "- 截图/附件观察、已读证据和已确认事实只在确有内容时放进精简摘要，不要撑成空洞审计章节。",
-    "- 每个关键实现改动必须指向具体文件、接口、数据流、命令、验证方式或明确默认假设；如果公共 API/接口/类型不变，必须显式写明。",
-    "- 没有证据支撑时，不要把 console.log/调试日志建议、泛化 CSS/Store 猜测或概率判断写成执行步骤；只能放入未验证假设。",
-    "- 非阻塞 MVP 取舍必须写成带默认值的默认假设或后续增强；真正阻塞执行的选择必须在批准前用 `<user_options>` 提问并停止。",
-    "- `requirements.md` 是可选需求台账；只有用户明确要求、范围很大或需要合规/验收追踪时才生成，绝不是审批前置条件。",
-    "- 如果设计方向不明确，使用 `<user_options>` 让用户选择并立刻停止；不要编造最终方案。",
-    "- 如果方向已经明确，直接输出精简可见 `<proposed_plan>` 或正常 Proposal 等待审批。不要为了完成规划而调用 `write_file` / `replace_in_file`，批准前不要生成 `tasks.md`。",
-  ].filter(Boolean).join("\n");
+  return buildPlanRecoveryPromptFromContext({
+    language: callbacks.getPreferredLanguage(),
+    userPrompt: getOriginalUserPromptForPlanFallback(callbacks),
+    sourceText,
+    toolHighlights,
+  });
 }
 
 function isReviewablePlanStage(stage: ReturnType<OrchestratorCallbacks["getPlanStage"]>): boolean {
@@ -3206,20 +2093,6 @@ export function buildPlanExplorationBudget(input: {
     };
   }
   return { shouldRedirectToPlanClosure: false, reason: null };
-}
-
-function buildPlanStreamTimeoutPauseMessage(
-  language: "zh" | "en",
-  stage: ReturnType<OrchestratorCallbacks["getPlanStage"]>,
-): string {
-  if (language === "en") {
-    return stage === "requirements"
-      ? "requirements.md has been generated, but the model did not return the next design step in time. This planning turn is paused; continue with plan.md when ready."
-      : "The model did not return the next planning step in time. This planning turn is paused and can be continued.";
-  }
-  return stage === "requirements"
-    ? "已生成 requirements.md，但模型长时间没有返回下一步执行计划。本轮已暂停，你可以继续生成 plan.md。"
-    : "模型长时间没有返回下一步规划内容，本轮已暂停，可以继续当前计划阶段。";
 }
 
 async function runLifecycleHooks(
@@ -3595,41 +2468,6 @@ interface CachedReadOnlyToolResult {
   content: string;
 }
 
-interface FileReadState {
-  signature: string;
-  path: string;
-  argsKey: string;
-  contentHash: string;
-  contentLength: number;
-  sizeBytes: number;
-  modifiedMs: number;
-  modelContent: string;
-  updatedAt: number;
-}
-
-const FILE_UNCHANGED_STUB = "FILE_UNCHANGED_STUB";
-const MAX_FILE_READ_STATES_PER_SESSION = 240;
-const sessionFileReadStates = new Map<string, Map<string, FileReadState>>();
-
-function getSessionFileReadStates(sessionKey: string): Map<string, FileReadState> {
-  const key = sessionKey || "default";
-  let states = sessionFileReadStates.get(key);
-  if (!states) {
-    states = new Map<string, FileReadState>();
-    sessionFileReadStates.set(key, states);
-  }
-  return states;
-}
-
-function pruneFileReadStates(states: Map<string, FileReadState>): void {
-  if (states.size <= MAX_FILE_READ_STATES_PER_SESSION) return;
-  const staleKeys = [...states.entries()]
-    .sort((a, b) => a[1].updatedAt - b[1].updatedAt)
-    .slice(0, states.size - MAX_FILE_READ_STATES_PER_SESSION)
-    .map(([key]) => key);
-  staleKeys.forEach((key) => states.delete(key));
-}
-
 function parseToolCallArguments(tc: ToolCallToExecute, workspace?: string | null): Record<string, unknown> {
   try {
     const parsed = JSON.parse(tc.arguments);
@@ -3787,118 +2625,6 @@ function truncateToolContent(content: string, maxChars: number): string {
   return content.slice(0, maxChars) + `\n...[truncated, ${content.length - maxChars} chars omitted]`;
 }
 
-function hashString(input: string): string {
-  let hash = 2166136261;
-  for (let index = 0; index < input.length; index++) {
-    hash ^= input.charCodeAt(index);
-    hash = Math.imul(hash, 16777619);
-  }
-  return (hash >>> 0).toString(16);
-}
-
-function buildFileReadSignature(path: string, args: Record<string, unknown>): string {
-  const argsKey = buildRepeatLoopArgsKey(
-    Object.fromEntries(
-      Object.entries(args)
-        .filter(([key]) => key !== "path")
-        .filter(([_, value]) => value !== undefined && value !== null && value !== ""),
-    ),
-  );
-  return `read_file::${path}::${argsKey}`;
-}
-
-function buildFileUnchangedStub(state: FileReadState): string {
-  const readFileWindow = extractReadFileWindowMetadata(state.modelContent);
-  if (readFileWindow?.truncated) {
-    return [
-      `${FILE_UNCHANGED_STUB}: "${state.path}" has already been read with the same range/options, and the file is unchanged.`,
-      `Previous read window: lines ${readFileWindow.returnedStartLine}-${readFileWindow.returnedEndLine} of ${readFileWindow.totalLines}, ${state.contentLength.toLocaleString()} result chars, file size ${state.sizeBytes.toLocaleString()} bytes, modified ${state.modifiedMs}, hash ${state.contentHash}.`,
-      readFileWindow.nextStartLine
-        ? `This was not the whole file. Next: call read_file with start_line=${readFileWindow.nextStartLine} and max_lines to continue, or use start_line/end_line around the exact error line.`
-        : "This was not the whole file. Next: call read_file with a different start_line/end_line/max_lines range around the exact line you need.",
-      "Do not use run_command merely to page file contents; run_command is for tests, builds, diagnostics, and other shell work.",
-    ].join("\n");
-  }
-
-  return [
-    `${FILE_UNCHANGED_STUB}: "${state.path}" has already been read with the same range/options, and the content is unchanged.`,
-    `Previous read: ${state.contentLength.toLocaleString()} chars, file size ${state.sizeBytes.toLocaleString()} bytes, modified ${state.modifiedMs}, hash ${state.contentHash}.`,
-    "Reuse the earlier file content already in context. Do not call read_file for this same file/range again unless you have reason to believe it changed.",
-    "Next: inspect a different file, use get_file_outline/grep_search for a narrower question, or continue the implementation/answer from the cached content.",
-  ].join("\n");
-}
-
-function formatReadFileWindowCoverageStub(
-  path: string,
-  plan: ReturnType<typeof planReadFileWindowCoverage>,
-): string {
-  const covered = plan.coveredRanges
-    .map((range) => `${range.startLine}-${range.endLine}`)
-    .join(", ");
-  return [
-    `${FILE_UNCHANGED_STUB}: "${path}" requested lines ${plan.original.startLine}-${plan.original.endLine}, but that window is already covered by unchanged earlier read_file results.`,
-    covered ? `Covered read windows already in context: ${covered}.` : "",
-    "Reuse the earlier source already in context instead of rereading the same lines.",
-    "Next: continue the implementation, use get_file_outline/grep_search for a narrower question, or request only a missing line range.",
-  ].filter(Boolean).join("\n");
-}
-
-function formatReadFileWindowNarrowedNote(
-  path: string,
-  plan: ReturnType<typeof planReadFileWindowCoverage>,
-): string {
-  const suggested = plan.suggestedRange;
-  if (!suggested) return "";
-  const covered = plan.coveredRanges
-    .map((range) => `${range.startLine}-${range.endLine}`)
-    .join(", ");
-  return [
-    `READ_FILE_WINDOW_NARROWED: "${path}" was requested as lines ${plan.original.startLine}-${plan.original.endLine}, overlapping unchanged lines already in context.`,
-    covered ? `Existing windows: ${covered}.` : "",
-    `MAIN returned only the missing window ${suggested.startLine}-${suggested.endLine} to avoid duplicating tool-result context.`,
-  ].filter(Boolean).join("\n");
-}
-
-function getReadFileCoverageForPath(input: {
-  states: Map<string, FileReadState>;
-  path: string;
-  metadata: { path: string; sizeBytes: number; modifiedMs: number } | null;
-  currentSignature: string;
-}): {
-  fullFileState: FileReadState | null;
-  ranges: Array<{ startLine: number; endLine: number }>;
-  totalLines: number;
-} {
-  const normalizedPath = normalizePathLike(input.metadata?.path || input.path).toLowerCase();
-  const ranges: Array<{ startLine: number; endLine: number }> = [];
-  let fullFileState: FileReadState | null = null;
-  let totalLines = 0;
-
-  for (const [signature, state] of input.states.entries()) {
-    if (signature === input.currentSignature) continue;
-    if (normalizePathLike(state.path).toLowerCase() !== normalizedPath) continue;
-    if (
-      input.metadata &&
-      (state.sizeBytes !== input.metadata.sizeBytes || state.modifiedMs !== input.metadata.modifiedMs)
-    ) {
-      continue;
-    }
-
-    const windowMetadata = extractReadFileWindowMetadata(state.modelContent);
-    if (windowMetadata) {
-      totalLines = Math.max(totalLines, windowMetadata.totalLines);
-      ranges.push({
-        startLine: windowMetadata.returnedStartLine,
-        endLine: windowMetadata.returnedEndLine,
-      });
-    } else if (!fullFileState) {
-      fullFileState = state;
-    }
-  }
-
-  return { fullFileState, ranges, totalLines };
-}
-
 async function readFileMetadataIfAvailable(path: string, workspace?: string): Promise<{ path: string; sizeBytes: number; modifiedMs: number } | null> {
   try {
     const metadata = await getFileMetadata(path, workspace);
@@ -3914,14 +2640,6 @@ async function readFileMetadataIfAvailable(path: string, workspace?: string): Pr
 
 function normalizePathLike(value: string): string {
   return String(value || "").trim().replace(/\\/g, "/").replace(/\/+/g, "/");
-}
-
-function resolveUnityScriptPathFromArgs(args: Record<string, unknown>): string | null {
-  const folder = typeof args.path === "string" ? normalizePathLike(args.path) : "";
-  const name = typeof args.name === "string" ? String(args.name).trim() : "";
-  if (!folder || !name) return null;
-  const fileName = name.endsWith(".cs") ? name : `${name}.cs`;
-  return normalizePathLike(`${folder.replace(/\/+$/, "")}/${fileName}`);
 }
 
 function resolveMutationVerificationPath(name: string, args: Record<string, unknown>): string | null {
@@ -5051,86 +3769,6 @@ function summarizeToolsForDiagnostics(tools: ToolDefinition[]): Record<string, u
     schemaChars,
     estimatedSchemaTokens: Math.ceil(schemaChars / 4),
   };
-}
-
-function isUnityCommandDirective(commandDirective?: CommandDirective | null): boolean {
-  return commandDirective?.kind === "unity";
-}
-
-function isUnityConsoleDiagnosticsDirective(commandDirective?: CommandDirective | null): boolean {
-  return commandDirective?.kind === "unity" && commandDirective?.action === "console_diagnostics";
-}
-
-export function shouldTriggerUnityMcpFirstIterationFallback(input: {
-  toolCallCount: number;
-  replyOptionCount: number;
-  unityMcpFirstPhaseActive: boolean;
-  unityMcpFirstIterationPending: boolean;
-}): boolean {
-  return (
-    input.toolCallCount === 0 &&
-    input.replyOptionCount === 0 &&
-    input.unityMcpFirstPhaseActive &&
-    input.unityMcpFirstIterationPending
-  );
-}
-
-function isUnityLikelyServer(server: MCPServer): boolean {
-  return /unity/i.test(`${server.name} ${server.url}`);
-}
-
-function extractMcpCallFailureCategory(content: string): string | null {
-  const match = content.match(/MCP_CALL_FAILURE\[([^[\]]+)\]/i);
-  return match ? match[1].toLowerCase() : null;
-}
-
-function isUnityExecutionContext(callbacks: OrchestratorCallbacks): boolean {
-  const commandDirective = callbacks.getCommandDirective?.() ?? null;
-  const gameStudioUnityContext =
-    callbacks.getMainModeKey() === "game_studio" &&
-    callbacks.getGameStudioConfig?.()?.engine === "unity";
-  return isUnityCommandDirective(commandDirective) || gameStudioUnityContext;
-}
-
-function isUnityScriptEditToolName(name: string): boolean {
-  return name === "script_apply_edits" || name === "apply_text_edits";
-}
-
-function isUnityScriptWriteToolCall(name: string, args: Record<string, unknown>): boolean {
-  if (isUnityScriptEditToolName(name)) return true;
-  if (name === "create_script" || name === "delete_script") return true;
-  if (name !== "manage_script") return false;
-  const action = typeof args.action === "string" ? args.action.trim().toLowerCase() : "";
-  return action === "create" || action === "delete";
-}
-
-function buildUnityApplyTextPolicyBlockedMessage(language: "zh" | "en"): string {
-  return language === "zh"
-    ? "UNITY_EDIT_POLICY_BLOCKED: apply_text_edits 仅允许用于“精确补丁”（必须提供 uri、完整坐标 edits，以及 precondition_sha/ precondition_sha256）。当前参数不满足约束。请改用 script_apply_edits，或先读取文件并补全精确坐标与 precondition 后重试。"
-    : "UNITY_EDIT_POLICY_BLOCKED: apply_text_edits is allowed only for precise patches (uri + full coordinate edits + precondition_sha/precondition_sha256). The current arguments are non-compliant. Use script_apply_edits instead, or read the file and retry with exact coordinates and precondition.";
-}
-
-function annotateUnityEditToolDescriptions(tools: MCPTool[], enabled: boolean): MCPTool[] {
-  if (!enabled) return tools;
-  return tools.map((tool) => {
-    if (tool.name === "script_apply_edits") {
-      const guidance = "Unity policy: preferred tool for C# method/class edits.";
-      if ((tool.description || "").includes(guidance)) return tool;
-      return {
-        ...tool,
-        description: `${tool.description || ""}${tool.description ? " " : ""}${guidance}`.trim(),
-      };
-    }
-    if (tool.name === "apply_text_edits") {
-      const guidance = "Unity policy: only for precise coordinate patches with precondition SHA.";
-      if ((tool.description || "").includes(guidance)) return tool;
-      return {
-        ...tool,
-        description: `${tool.description || ""}${tool.description ? " " : ""}${guidance}`.trim(),
-      };
-    }
-    return tool;
-  });
 }
 
 /**
@@ -9604,6 +8242,23 @@ export async function executeAgentLoop(
 
           if (!unchanged) {
             fileReadStates.delete(fileReadSignature);
+            logAgentEvent("file_read_cache_invalidated", {
+              iteration,
+              target: target || fileReadState.path,
+              reason: metadata ? "metadata_changed" : "metadata_unavailable",
+              signature: truncateForLog(fileReadSignature, 180),
+              previous: {
+                sizeBytes: fileReadState.sizeBytes,
+                modifiedMs: fileReadState.modifiedMs,
+                contentHash: fileReadState.contentHash,
+              },
+              current: metadata
+                ? {
+                    sizeBytes: metadata.sizeBytes,
+                    modifiedMs: metadata.modifiedMs,
+                  }
+                : null,
+            });
           } else {
             const duplicateCount = (readOnlyDuplicateSkipCounts.get(fileReadSignature) ?? 0) + 1;
             readOnlyDuplicateSkipCounts.set(fileReadSignature, duplicateCount);
@@ -9630,6 +8285,16 @@ export async function executeAgentLoop(
                 reason: planBudget.reason || "duplicate_file_read",
               });
             }
+            logAgentEvent("file_read_cache_hit", {
+              iteration,
+              target: target || fileReadState.path,
+              decision: shouldPushPlanReadLimit ? "unchanged_stub_with_plan_redirect" : "unchanged_stub",
+              signature: truncateForLog(fileReadSignature, 180),
+              duplicateCount,
+              sizeBytes: fileReadState.sizeBytes,
+              modifiedMs: fileReadState.modifiedMs,
+              contentHash: fileReadState.contentHash,
+            });
             const baseStub = buildFileUnchangedStub(fileReadState);
             const closurePrompt = shouldPushPlanReadLimit
               ? `\n\n${buildPlanClosurePromptFromEvidence(callbacks, recentPlanToolActivity, attemptedPlanWriteTargets, latestUserPromptText)}`
@@ -9669,6 +8334,16 @@ export async function executeAgentLoop(
             const duplicateCount = (readOnlyDuplicateSkipCounts.get(coverage.fullFileState.signature) ?? 0) + 1;
             readOnlyDuplicateSkipCounts.set(coverage.fullFileState.signature, duplicateCount);
             const content = buildFileUnchangedStub(coverage.fullFileState);
+            logAgentEvent("file_read_cache_hit", {
+              iteration,
+              target: target || coverage.fullFileState.path,
+              decision: "full_file_covers_requested_read",
+              signature: truncateForLog(coverage.fullFileState.signature, 180),
+              duplicateCount,
+              sizeBytes: coverage.fullFileState.sizeBytes,
+              modifiedMs: coverage.fullFileState.modifiedMs,
+              contentHash: coverage.fullFileState.contentHash,
+            });
             allResults.push({
               toolCallId: tc.id,
               name: tc.name,
@@ -9690,6 +8365,15 @@ export async function executeAgentLoop(
               const duplicateCount = (readOnlyDuplicateSkipCounts.get(fileReadSignature || signature) ?? 0) + 1;
               readOnlyDuplicateSkipCounts.set(fileReadSignature || signature, duplicateCount);
               const content = formatReadFileWindowCoverageStub(fileReadMetadata.path, resolvedCoveragePlan);
+              logAgentEvent("file_read_cache_hit", {
+                iteration,
+                target: target || fileReadMetadata.path,
+                decision: "window_fully_covered",
+                signature: truncateForLog(fileReadSignature || signature, 180),
+                duplicateCount,
+                requested: resolvedCoveragePlan.original,
+                coveredRanges: resolvedCoveragePlan.coveredRanges,
+              });
               allResults.push({
                 toolCallId: tc.id,
                 name: tc.name,
@@ -9708,9 +8392,26 @@ export async function executeAgentLoop(
               fileReadState = fileReadStates.get(fileReadSignature);
               const note = formatReadFileWindowNarrowedNote(fileReadMetadata.path, resolvedCoveragePlan);
               if (note) readFileWindowNarrowedNotes.set(tc.id, note);
+              logAgentEvent("file_read_cache_window_narrowed", {
+                iteration,
+                target: target || fileReadMetadata.path,
+                original: resolvedCoveragePlan.original,
+                suggestedRange: resolvedCoveragePlan.suggestedRange,
+                coveredRanges: resolvedCoveragePlan.coveredRanges,
+                newSignature: truncateForLog(fileReadSignature, 180),
+              });
               if (fileReadState) {
                 readFileWindowNarrowedNotes.delete(tc.id);
                 const content = buildFileUnchangedStub(fileReadState);
+                logAgentEvent("file_read_cache_hit", {
+                  iteration,
+                  target: target || fileReadState.path,
+                  decision: "narrowed_window_already_cached",
+                  signature: truncateForLog(fileReadSignature, 180),
+                  sizeBytes: fileReadState.sizeBytes,
+                  modifiedMs: fileReadState.modifiedMs,
+                  contentHash: fileReadState.contentHash,
+                });
                 allResults.push({
                   toolCallId: tc.id,
                   name: tc.name,
@@ -9894,6 +8595,17 @@ export async function executeAgentLoop(
               updatedAt: Date.now(),
             });
             pruneFileReadStates(fileReadStates);
+            logAgentEvent("file_read_cache_stored", {
+              iteration,
+              target: result.target || metadata.path,
+              signature: truncateForLog(fileReadSignature, 180),
+              reason: previous ? "content_or_metadata_changed" : "new_read",
+              cacheSize: fileReadStates.size,
+              sizeBytes: metadata.sizeBytes,
+              modifiedMs: metadata.modifiedMs,
+              contentChars: result.content.length,
+              contentHash,
+            });
           }
           readOnlyDuplicateSkipCounts.delete(fileReadSignature);
         }
