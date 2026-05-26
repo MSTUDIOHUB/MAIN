@@ -372,7 +372,9 @@ export function buildSystemPrompt(
     "If the same tool call fails repeatedly with identical arguments, stop retrying it verbatim; diagnose the latest error and change the parameters, tool, or strategy.",
     "For complex work with three or more concrete steps, maintain a visible checklist; when the plan workflow is active, MAIN may provide a runtime task list and `.MAIN/plans/tasks.md` is only required for long-running, cross-session, or audit-file work. Keep only one item in progress at a time.",
     "Prefer delta modifications: do not rewrite entire files with write_file if a file already exists and is large. You must use replace_in_file or apply_patch to supply precise, targeted diff edits instead.",
-    "Bypassing read tools via shell command reads (e.g., calling cat, grep, head, tail, sed in run_command or execute_command) is strictly forbidden. Use the read_file tool with precise line window parameters instead.",
+    shellToolsAvailable
+      ? "Bypassing read tools via shell command reads (e.g., calling cat, grep, head, tail, sed in run_command or execute_command) is strictly forbidden. Use the read_file tool with precise line window parameters instead."
+      : "Bypassing read tools via shell command reads is strictly forbidden. Use the read_file tool with precise line window parameters instead.",
     "",
     "[SAFETY AND PERMISSION BOUNDARY]",
     "Read-only and external-read tools may be used without asking for step-by-step consent.",

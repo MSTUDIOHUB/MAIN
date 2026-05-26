@@ -216,6 +216,7 @@ import {
   detectGameDevelopmentIntent,
   type GameDevelopmentIntentSignal,
 } from "../lib/gameDevelopmentIntent";
+import { isConversationalFirstPersonNarration } from "../lib/capsuleStagingHelper";
 import {
   createPendingDecisionCopy,
   getIntentPolicy,
@@ -983,6 +984,13 @@ export interface DiffRevertResult {
 }
 
 export type AssistantTextVisibility = "user_progress" | "hidden_process" | "substantive_plan_text";
+type CapsuleExplanationSource = "model";
+type CapsuleExplanationState = {
+  turnId: string;
+  text: string;
+  updatedAt: number;
+  source: CapsuleExplanationSource;
+} | null;
 
 export type ProgressTaskBlock = TaskBlockBase & ProgressNarration & {
   type: "progress";
@@ -1347,6 +1355,7 @@ interface AppState {
     interceptorThought: string;
     lastReportedThought: string;
     lastReportedAssistantText: string;
+    capsuleExplanation: CapsuleExplanationState;
     turnId: string;
   };
   startNewTurn: () => void;
@@ -1668,6 +1677,7 @@ function createDefaultCurrentTurnState() {
     interceptorThought: "",
     lastReportedThought: "",
     lastReportedAssistantText: "",
+    capsuleExplanation: null,
     turnId: "",
   };
 }
@@ -2729,6 +2739,11 @@ function normalizeAgentContentForDedupe(content: string): string {
     .replace(/<\/?(?:analysis|thought|thinking|reasoning)(?:\s[^>]*)?>/gi, " ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function normalizeCapsuleExplanationCandidate(content: string): string {
+  const normalized = normalizeAgentContentForDedupe(content);
+  return isConversationalFirstPersonNarration(normalized) ? normalized : "";
 }
 
 function compactProgressContextText(text: string, maxChars = 180): string {
@@ -9210,6 +9225,25 @@ export const useAppStore = create<AppState>()(
             ? pickProcessAssistantText(cleanText, meta?.hiddenThought, language)
             : cleanText;
           const stateVisibleText = isHiddenProcessText ? "" : displayText;
+          const capsuleExplanationText = normalizeCapsuleExplanationCandidate(displayText);
+          if (
+            capsuleExplanationText &&
+            metaVisibility === "user_progress" &&
+            meta?.capsuleCandidate === true &&
+            meta?.modelAuthored !== false
+          ) {
+            sessionSet((s) => ({
+              currentTurnState: {
+                ...s.currentTurnState,
+                capsuleExplanation: {
+                  turnId,
+                  text: capsuleExplanationText,
+                  updatedAt: Date.now(),
+                  source: "model",
+                },
+              },
+            }));
+          }
           const progressFromMeta = (() => {
             if (!isUserProgressText) return null;
             if (meta?.progress) return normalizeProgressNarration(meta.progress);

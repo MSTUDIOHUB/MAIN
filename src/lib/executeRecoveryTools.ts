@@ -133,7 +133,7 @@ export function countExecuteBatchToolContentChars(results: ExecuteRecoveryResult
   }, 0);
 }
 
-export function resolveExecuteReadOnlyRecoveryTrigger(input: {
+export function resolveReadOnlyNoProgressTrigger(input: {
   results: ExecuteRecoveryResultLike[];
   recentActivity: ExecuteRecoveryActivityLike[];
   readOnlyTools: Set<string>;
@@ -141,6 +141,7 @@ export function resolveExecuteReadOnlyRecoveryTrigger(input: {
   noProgressBatchRepeatCount?: number;
   currentBatchToolChars?: number;
   minReadOnlyActivities?: number;
+  minCachedReadOnlyActivities?: number;
   maxNoProgressReadOnlyRepeats?: number;
   maxReadOnlyToolChars?: number;
 }): { shouldRecover: boolean; reason: string; readOnlyActivityCount: number; batchToolChars: number } {
@@ -155,28 +156,33 @@ export function resolveExecuteReadOnlyRecoveryTrigger(input: {
 
   const repeatLimit = input.maxNoProgressReadOnlyRepeats ?? 2;
   if ((input.noProgressBatchRepeatCount ?? 0) >= repeatLimit) {
-    return { shouldRecover: true, reason: "execute_no_progress_read_only_batch", readOnlyActivityCount, batchToolChars };
+    return { shouldRecover: true, reason: "read_only_no_progress", readOnlyActivityCount, batchToolChars };
   }
 
   const readLimit = input.minReadOnlyActivities ?? 8;
   if (readOnlyActivityCount >= readLimit) {
-    return { shouldRecover: true, reason: "execute_read_only_budget_exhausted", readOnlyActivityCount, batchToolChars };
+    return { shouldRecover: true, reason: "read_only_budget_exhausted", readOnlyActivityCount, batchToolChars };
   }
 
   const charLimit = input.maxReadOnlyToolChars ?? 30_000;
   if (batchToolChars >= charLimit) {
-    return { shouldRecover: true, reason: "execute_read_only_tool_chars_exhausted", readOnlyActivityCount, batchToolChars };
+    return { shouldRecover: true, reason: "read_only_tool_chars_exhausted", readOnlyActivityCount, batchToolChars };
   }
 
   const hasCachedRead = input.results.some((result) =>
     !result.isError &&
     /FILE_UNCHANGED_STUB|Repeated read-only tool call skipped/i.test(String(result.displayContent || result.content || ""))
   );
-  if (hasCachedRead) {
-    return { shouldRecover: true, reason: "execute_cached_read_only_batch", readOnlyActivityCount, batchToolChars };
+  const cachedReadLimit = input.minCachedReadOnlyActivities ?? 0;
+  if (hasCachedRead && readOnlyActivityCount >= cachedReadLimit) {
+    return { shouldRecover: true, reason: "repeated_cached_read", readOnlyActivityCount, batchToolChars };
   }
 
   return { shouldRecover: false, reason: "", readOnlyActivityCount, batchToolChars };
+}
+
+export function resolveExecuteReadOnlyRecoveryTrigger(input: Parameters<typeof resolveReadOnlyNoProgressTrigger>[0]) {
+  return resolveReadOnlyNoProgressTrigger(input);
 }
 
 export function buildExecuteRecoveryPrompt(input: {
@@ -229,6 +235,7 @@ export function buildExecuteNoProgressLoopPauseNotice(input: {
   remainingTask: string;
   recentActivity: ExecuteRecoveryActivityLike[];
   repeatedTargets?: string[];
+  scope?: "execute" | "chat";
 }): string {
   const repeatedTargets = input.repeatedTargets?.length
     ? input.repeatedTargets
@@ -243,23 +250,31 @@ export function buildExecuteNoProgressLoopPauseNotice(input: {
 
   if (input.language === "en") {
     return [
-      "Execution paused: repeated read-only exploration did not produce a write, command, browser validation, or concrete blocker.",
+      input.scope === "chat"
+        ? "Chat turn paused: repeated read-only exploration did not produce a final answer or concrete blocker."
+        : "Execution paused: repeated read-only exploration did not produce a write, command, browser validation, or concrete blocker.",
       `Repeat count: ${input.repeats}`,
       repeatedTargets.length ? `Repeated targets: ${repeatedTargets.join(", ")}` : "Repeated targets: none isolated",
       "Recent tools:",
       ...(recent.length ? recent : ["- none"]),
       `Missing progress: ${input.remainingTask}`,
-      "Resume by using cached context to patch/write, run a finite validation command, use browser validation, or state the exact blocker.",
+      input.scope === "chat"
+        ? "Resume by using cached context to answer directly, switch to a different target, or state the exact blocker."
+        : "Resume by using cached context to patch/write, run a finite validation command, use browser validation, or state the exact blocker.",
     ].join("\n");
   }
 
   return [
-    "执行已暂停：连续重复只读探索，但没有产生写入、命令、浏览器验证或具体阻塞。",
+    input.scope === "chat"
+      ? "对话已暂停：连续重复只读探索，但没有产出最终回答或具体阻塞。"
+      : "执行已暂停：连续重复只读探索，但没有产生写入、命令、浏览器验证或具体阻塞。",
     `重复轮数：${input.repeats}`,
     repeatedTargets.length ? `重复目标：${repeatedTargets.join("、")}` : "重复目标：未定位到单一目标",
     "最近工具：",
     ...(recent.length ? recent : ["- 暂无"]),
     `缺失进展：${input.remainingTask}`,
-    "恢复时请复用已读上下文，直接写入/替换、运行有限验证命令、执行浏览器验证，或说明精确阻塞。",
+    input.scope === "chat"
+      ? "恢复时请复用已读上下文，直接回答、换一个明确目标，或说明精确阻塞。"
+      : "恢复时请复用已读上下文，直接写入/替换、运行有限验证命令、执行浏览器验证，或说明精确阻塞。",
   ].join("\n");
 }

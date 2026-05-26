@@ -831,10 +831,12 @@ test("tool flow shows progress narration without exposing raw protocol", async (
   await expect(page.locator("body")).not.toContainText("<tool_use>");
   await expect(page.locator("body")).not.toContainText("\"toolName\"");
   await expect(page.locator("body")).not.toContainText("<analysis>");
-  await expect(page.getByTestId("turn-process-archive-toggle")).toHaveCount(0);
-  await expect(page.getByTestId("read-context-group")).toContainText("README.md");
-  await page.getByTestId("read-context-group").first().click();
-  await expect(page.getByTestId("read-context-group-summary").first()).toContainText(/已读取|捕获|确认/);
+  const archiveToggle = page.getByTestId("turn-process-archive-toggle");
+  await expect(archiveToggle).toBeVisible();
+  await expect(archiveToggle).toHaveAttribute("aria-expanded", "false");
+  await archiveToggle.click();
+  await expect(page.getByTestId("turn-archive-step").filter({ hasText: "README.md" })).toBeVisible();
+  await expect(page.getByTestId("read-context-group-summary")).toHaveCount(0);
 });
 
 test("reply options pause before mixed XML tool calls and continue from the source turn", async ({ page }) => {

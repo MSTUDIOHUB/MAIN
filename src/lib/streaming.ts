@@ -95,7 +95,7 @@ export interface StreamSettings {
   toolProtocol?: CloudToolProtocol;
   contextLimit?: number; // total context window for the model (used to calculate max_tokens)
   provider?: string;    // "Ollama" | "LM Studio" | "OMLX" | "OpenAI" — controls SSE format
-  useRustProxy?: boolean; // Route through Rust backend to bypass CORS (for cloud endpoints)
+  useRustProxy?: boolean; // Route through Rust backend to bypass WebView/CORS transport limits.
 }
 
 /** A tool call accumulated from streaming deltas. */
@@ -491,6 +491,17 @@ function shouldRetryRustStreamAsNonStreaming(settings: StreamSettings, errorMess
     !isAnthropicProvider(settings) &&
     !isOpenAiResponsesApi(settings) &&
     isRecoverableRustStreamReadError(errorMessage)
+  );
+}
+
+function isRecoverableFrontendTransportError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err || "");
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes("load failed") ||
+    normalized.includes("failed to fetch") ||
+    normalized.includes("networkerror") ||
+    normalized.includes("network request failed")
   );
 }
 
@@ -1535,6 +1546,27 @@ export async function streamChatCompletion(
     if ((err as Error).name === "AbortError") {
       onError(toError(err, "Aborted"));
       throw err;
+    }
+    if (isLocalProfile(settings) && isRecoverableFrontendTransportError(err)) {
+      const normalizedError = toError(err, "Request failed.");
+      emitStreamingConsole("streaming", "warn", "frontend stream transport failed; retrying through Rust proxy", {
+        url: apiUrl,
+        model: settings.model,
+        error: normalizedError.message,
+      });
+      callbacks.onLifecycle?.({
+        phase: "stream_error",
+        status: "frontend_transport_retry_rust_proxy",
+        error: normalizedError.message,
+      });
+      return streamViaRustProxy(
+        messages,
+        { ...settings, useRustProxy: true },
+        callbacks,
+        signal,
+        tools,
+        maxTokensOverride,
+      );
     }
     const normalizedError = toError(err, "Request failed.");
     onError(normalizedError);

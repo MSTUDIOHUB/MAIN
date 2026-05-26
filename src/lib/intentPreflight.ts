@@ -11,6 +11,7 @@ import {
 import type { MainModeKey } from "./mainModes";
 import type { AppConfig } from "../store/useAppStore";
 import { normalizeConversationDisplayTitle } from "./workflowModels";
+import { shouldUseRustProxyForLocalProvider } from "./localProviderRouting";
 
 type PreflightConfig = Pick<AppConfig, "activeProfile" | "local" | "cloud" | "cloudExperimentalLoginEnabled">;
 
@@ -27,7 +28,6 @@ const ALLOWED_INTENTS = new Set<ResolvedUserIntent>([
 
 function deriveStreamSettings(config: PreflightConfig): StreamSettings {
   if (config.activeProfile === "local") {
-    const isOllama = config.local.provider === "Ollama";
     return {
       baseUrl: config.local.endpoint,
       apiKey: config.local.apiKey || "not-needed",
@@ -38,8 +38,8 @@ function deriveStreamSettings(config: PreflightConfig): StreamSettings {
       provider: config.local.provider,
       toolProtocol: normalizeLocalToolProtocol(config.local.toolProtocol, config.local.provider),
       // LM Studio / OMLX 的本地请求也走 Tauri 后端，避免 WebView 的
-      // “Load Failed” 网络错误；Ollama 继续使用原生前端流式接口。
-      useRustProxy: !isOllama,
+      // “Load Failed” 网络错误；Ollama /v1 也走后端代理。
+      useRustProxy: shouldUseRustProxyForLocalProvider(config.local.provider, config.local.endpoint),
     };
   }
   const cloudAuthMode = config.cloudExperimentalLoginEnabled === true ? config.cloud.auth?.mode ?? "api_key" : "api_key";

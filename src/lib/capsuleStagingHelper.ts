@@ -5,9 +5,22 @@
 /**
  * 校验一段文本是否为符合 Capsule 路由要求的拟人对话式第一人称意图说明
  */
+export function isIdleCapsuleNarration(text: string): boolean {
+  const raw = String(text || "").replace(/\s+/g, " ").trim();
+  if (!raw) return false;
+  return (
+    /等待(?:您|你)?(?:的)?(?:下一步)?(?:指令|命令)/.test(raw) ||
+    /随时准备(?:开始|继续)?(?:新的)?(?:探索|修改|工作)/.test(raw) ||
+    /await(?:ing)?\s+(?:your\s+)?(?:next\s+)?(?:instruction|instructions|command|commands)/i.test(raw) ||
+    /ready\s+to\s+begin\s+(?:new\s+)?(?:exploration|modification|modifications|changes|work)/i.test(raw) ||
+    /ready\s+for\s+(?:your\s+)?(?:next\s+)?(?:instruction|instructions|command|commands)/i.test(raw)
+  );
+}
+
 export function isConversationalFirstPersonNarration(text: string): boolean {
   const raw = String(text || "").trim();
   if (!raw) return false;
+  if (isIdleCapsuleNarration(raw)) return false;
 
   // 1. 过滤大型结构化块，防止大段普通聊天的回复渲染到小 Capsule 中
   if (
@@ -199,8 +212,6 @@ export function deriveDynamicFirstPersonText(
       : "I am writing a detailed progress explanation and next steps analysis for you...";
   }
 
-  // 5. 默认拟人静默等待
-  return isZh
-    ? "我正在等待您的下一步指令，随时准备开始新的探索或修改..."
-    : "I am awaiting your next instructions, ready to begin new exploration or modifications...";
+  // 5. 无明确运行信号时保持静默，避免把 idle 状态误当成模型反馈。
+  return "";
 }

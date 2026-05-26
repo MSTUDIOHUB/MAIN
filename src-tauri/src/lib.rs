@@ -6294,6 +6294,7 @@ async fn proxy_request(
     let is_model_request = url.contains("/v1/chat/completions")
         || url.contains("/v1/responses")
         || url.contains("/v1/messages")
+        || url.contains("/api/chat")
         || url.contains("/backend-api/codex/responses")
         || url.contains("/v1internal:generateContent");
     let request_timeout_secs = if meth == "POST" && is_model_request {
@@ -6828,6 +6829,7 @@ async fn start_chat_stream(
     let is_model_request = url.contains("/v1/chat/completions")
         || url.contains("/v1/responses")
         || url.contains("/v1/messages")
+        || url.contains("/api/chat")
         || url.contains("/backend-api/codex/responses")
         || url.contains("/v1internal:generateContent");
 

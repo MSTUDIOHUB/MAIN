@@ -59,9 +59,17 @@ const {
   describeExecuteRecoveryToolSurface,
   isExecuteRecoveryToolName,
   resolveExecuteReadOnlyRecoveryTrigger,
+  resolveReadOnlyNoProgressTrigger,
   shouldAllowExecuteRecoveryFileRead,
   summarizeRepeatedExecuteTargets,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/executeRecoveryTools.ts"));
+
+const {
+  buildEmptyModelResponsePauseNotice,
+  buildMaxStepsFinalTextPrompt,
+  resolveAgentLoopMaxIterations,
+  shouldUseMaxStepsFinalTextOnly,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/agentLoopSafety.ts"));
 
 const {
   compactContextForExecuteRecovery,
@@ -175,6 +183,96 @@ test("read-only budget triggers execute recovery before max iterations", () => {
   assert.match(prompt, /apply_patch|write_file|replace_in_file/);
 });
 
+test("chat read-only no-progress pauses before the generic max-iteration boundary", () => {
+  const recent = [
+    { name: "read_file", status: "succeeded", target: "src/App.tsx", detail: "READ_FILE_RESULT" },
+    { name: "read_file", status: "succeeded", target: "src/App.tsx", detail: "FILE_UNCHANGED_STUB: src/App.tsx" },
+    { name: "grep_search", status: "succeeded", target: "onFileLoaded", detail: "5 matches" },
+  ];
+  const decision = resolveReadOnlyNoProgressTrigger({
+    results: [{ name: "read_file", target: "src/App.tsx", content: "FILE_UNCHANGED_STUB", isError: false }],
+    recentActivity: recent,
+    readOnlyTools,
+    sawExecuteOperationEvidence: false,
+    noProgressBatchRepeatCount: 1,
+    minReadOnlyActivities: 6,
+    minCachedReadOnlyActivities: 3,
+  });
+
+  assert.equal(decision.shouldRecover, true);
+  assert.equal(decision.reason, "repeated_cached_read");
+
+  const notice = buildExecuteNoProgressLoopPauseNotice({
+    language: "zh",
+    scope: "chat",
+    repeats: 1,
+    remainingTask: "只有只读探索，没有最终回答。",
+    recentActivity: recent,
+  });
+  assert.match(notice, /对话已暂停/);
+  assert.match(notice, /直接回答/);
+});
+
+test("agent loop iteration limits are mode-specific and configurable", () => {
+  assert.equal(resolveAgentLoopMaxIterations({
+    workflowMode: "chat",
+    runtimeIntent: "respond",
+    isPlanApproved: false,
+  }), 25);
+  assert.equal(resolveAgentLoopMaxIterations({
+    workflowMode: "plan",
+    runtimeIntent: "execute",
+    isPlanApproved: true,
+  }), 50);
+  assert.equal(resolveAgentLoopMaxIterations({
+    workflowMode: "chat",
+    runtimeIntent: "respond",
+    isPlanApproved: false,
+    limits: { chatRespond: 12 },
+  }), 12);
+});
+
+test("max-steps final text prompt disables tools for chat final boundary", () => {
+  assert.equal(shouldUseMaxStepsFinalTextOnly({
+    workflowMode: "chat",
+    runtimeIntent: "respond",
+    isPlanApproved: false,
+    iteration: 25,
+    maxIterations: 25,
+    alreadyPrompted: false,
+  }), true);
+  assert.equal(shouldUseMaxStepsFinalTextOnly({
+    workflowMode: "plan",
+    runtimeIntent: "execute",
+    isPlanApproved: true,
+    iteration: 50,
+    maxIterations: 50,
+    alreadyPrompted: false,
+  }), false);
+
+  const prompt = buildMaxStepsFinalTextPrompt({
+    language: "en",
+    iteration: 25,
+    maxIterations: 25,
+    repeatedTargets: ["src/App.tsx"],
+  });
+  assert.match(prompt, /MAX_STEPS_FINAL_TEXT/);
+  assert.match(prompt, /Do not make any tool calls/);
+  assert.match(prompt, /what remains unfinished/);
+});
+
+test("empty model response pause explains local-model empty completion instead of waiting for max iterations", () => {
+  const notice = buildEmptyModelResponsePauseNotice({
+    language: "zh",
+    emptyResponses: 2,
+    repeatedTargets: ["src/App.tsx"],
+    localProfile: true,
+  });
+  assert.match(notice, /2 次空响应/);
+  assert.match(notice, /本地模型/);
+  assert.match(notice, /src\/App\.tsx/);
+});
+
 test("execute no-progress pause reports edit-mode recent tools instead of empty plan activity", () => {
   const recent = [
     { name: "grep_search", status: "succeeded", target: "rawOrders", detail: "8 matches" },
@@ -249,6 +347,11 @@ test("orchestrator wires execute convergence and max-iteration recovery before i
   assert.match(source, /activateExecuteRecovery\("action_plus_targeting", "execute_convergence_prompt"/);
   assert.match(source, /executeRecoveryAttempts \+= 1/);
   assert.doesNotMatch(source, /executeRecoveryReason !== reason/);
+  assert.match(source, /resolveAgentLoopMaxIterations/);
+  assert.match(source, /buildMaxStepsFinalTextPrompt/);
+  assert.match(source, /recoveryReason: "max_iterations_boundary"/);
+  assert.match(source, /normalizeNoProgressResultContent/);
+  assert.match(source, /resolveReadOnlyNoProgressTrigger/);
 
   const callbackIndex = source.indexOf("const handled = await callbacks.onExecuteMaxIterationsCheckpoint?.(checkpoint);");
   const idleIndex = source.indexOf("callbacks.onStatusChange(\"idle\");", callbackIndex);

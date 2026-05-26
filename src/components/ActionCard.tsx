@@ -187,7 +187,6 @@ export default function ActionCard({ blockId, toolName, target, toolStatus, mess
   );
   const purposeText = compactExplanation(why || intentSummary);
   const evidenceText = compactExplanation(isDone ? observationSummary || evidence : evidence, 220);
-  const collapsedDetailText = compactExplanation(isDone ? observationSummary || purposeText || evidence : purposeText || evidence, 220);
 
   // ── Collapsed summary row ──
   if (!expanded && isDone) {
@@ -201,9 +200,6 @@ export default function ActionCard({ blockId, toolName, target, toolStatus, mess
             <IconCode className="h-3.5 w-3.5 shrink-0 text-[#60a5fa]" />
             <span className="shrink-0 text-[#94a3b8]">{language === "zh" ? "已编辑" : "Edited"}</span>
             <span className="min-w-0 truncate font-semibold theme-text">{displayTarget}</span>
-            {collapsedDetailText && (
-              <span className="min-w-0 truncate text-[#94a3b8]">{collapsedDetailText}</span>
-            )}
             <span className="ml-auto shrink-0 text-[#10b981]">+{diffStats.added}</span>
             <span className="shrink-0 text-[#f87171]">-{diffStats.removed}</span>
             <span className="shrink-0 rounded-full border border-[rgba(52,211,153,0.18)] bg-[rgba(52,211,153,0.08)] px-1.5 py-0.5 text-[9px] text-[#86efac]">
@@ -235,11 +231,6 @@ export default function ActionCard({ blockId, toolName, target, toolStatus, mess
                 <span className="text-[#71717a]"> · </span>
                 <span className="font-semibold theme-text">{displayTarget}</span>
               </span>
-              {collapsedDetailText && (
-                <span data-testid="tool-collapsed-summary" className="mt-0.5 block min-w-0 truncate text-[10.5px] leading-4 text-[#94a3b8]">
-                  {collapsedDetailText}
-                </span>
-              )}
             </span>
             <IconChevronRight className="mt-0.5 h-3.5 w-3.5 shrink-0 text-[#71717a]" />
           </button>
@@ -263,11 +254,6 @@ export default function ActionCard({ blockId, toolName, target, toolStatus, mess
                 : `${localizedVerb}: `}
             {!isSystemErrorCard && <span className="font-semibold">{displayTarget}</span>}
           </span>
-          {collapsedDetailText && (
-            <span data-testid="tool-collapsed-summary" className="min-w-0 truncate text-[#94a3b8]">
-              {collapsedDetailText}
-            </span>
-          )}
           <span
             className={`ml-auto shrink-0 rounded-full border px-1.5 py-0.5 text-[9px] ${
               isExecuted

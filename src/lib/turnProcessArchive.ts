@@ -144,7 +144,11 @@ function isLiveProcessCandidate(block: any): boolean {
   if (block.type === "system") {
     return block.variant !== "context_compression" && block.variant !== "plan_execution_checkpoint";
   }
-  return block.type === "tool" || block.type === "jobList" || block.type === "system";
+  if (block.type === "tool") {
+    const status = String(block.toolStatus || block.status || "").toLowerCase();
+    return status === "executed" || status === "running";
+  }
+  return block.type === "jobList" || block.type === "system";
 }
 
 function mapToolStatus(block: any): TurnArchiveStepStatus {

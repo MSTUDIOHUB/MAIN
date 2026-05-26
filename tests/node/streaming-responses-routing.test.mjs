@@ -401,6 +401,88 @@ test("local Rust stream read errors fall back to a non-streaming request", async
   assert.deepEqual(invokeCalls.map((call) => call.command), ["start_chat_stream", "proxy_request"]);
 });
 
+test("Ollama frontend Load failed retries through the Rust stream proxy", async () => {
+  const listeners = new Map();
+  const invokeCalls = [];
+  const listenMock = async (eventName, handler) => {
+    listeners.set(eventName, handler);
+    return () => listeners.delete(eventName);
+  };
+  const { streamChatCompletion } = await loadStreamingModule(async (command, args) => {
+    invokeCalls.push({ command, args });
+    assert.equal(command, "start_chat_stream");
+    assert.equal(args.url, "http://127.0.0.1:11434/api/chat");
+    const body = JSON.parse(args.body);
+    assert.equal(body.model, "gemma4:31b-mlx");
+    assert.equal(body.stream, true);
+    assert.equal(args.headers.Authorization, undefined);
+    const streamId = args.streamId;
+    queueMicrotask(() => {
+      listeners.get("chat-stream-chunk")?.({
+        payload: {
+          stream_id: streamId,
+          chunk: "{\"message\":{\"content\":\"pong\"},\"done\":false}\n",
+        },
+      });
+      listeners.get("chat-stream-chunk")?.({
+        payload: {
+          stream_id: streamId,
+          chunk: "{\"done\":true}\n",
+        },
+      });
+      listeners.get("chat-stream-done")?.({
+        payload: {
+          stream_id: streamId,
+          status: "ok",
+          error: null,
+        },
+      });
+    });
+    return undefined;
+  }, listenMock);
+
+  const originalFetch = globalThis.fetch;
+  const fetchUrls = [];
+  globalThis.fetch = async (url) => {
+    fetchUrls.push(String(url));
+    throw new TypeError("Load failed");
+  };
+
+  const tokens = [];
+  const errors = [];
+  const lifecycle = [];
+  let doneCount = 0;
+  try {
+    const result = await streamChatCompletion(
+      [{ role: "user", content: "ping" }],
+      {
+        baseUrl: "http://127.0.0.1:11434/v1",
+        apiKey: "not-needed",
+        model: "gemma4:31b-mlx",
+        provider: "Ollama",
+        useRustProxy: false,
+      },
+      {
+        onToken: (token) => tokens.push(token),
+        onDone: () => { doneCount += 1; },
+        onError: (error) => { errors.push(error.message); },
+        onLifecycle: (event) => { lifecycle.push(event); },
+      },
+    );
+
+    assert.equal(result.content, "pong");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.deepEqual(fetchUrls, ["http://127.0.0.1:11434/api/chat"]);
+  assert.deepEqual(tokens, ["pong"]);
+  assert.deepEqual(errors, []);
+  assert.equal(doneCount, 1);
+  assert.deepEqual(invokeCalls.map((call) => call.command), ["start_chat_stream"]);
+  assert.equal(lifecycle.some((event) => event.status === "frontend_transport_retry_rust_proxy"), true);
+});
+
 test("local Rust streams convert cumulative text payloads into visible deltas", async () => {
   const listeners = new Map();
   const invokeCalls = [];

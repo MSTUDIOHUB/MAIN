@@ -263,6 +263,7 @@ import {
   isExecuteRecoveryToolName,
   normalizeExecuteRecoveryMode,
   resolveExecuteReadOnlyRecoveryTrigger,
+  resolveReadOnlyNoProgressTrigger,
   shouldAllowExecuteRecoveryFileRead,
   summarizeRepeatedExecuteTargets,
   type ExecuteRecoveryMode,
@@ -299,6 +300,15 @@ import {
   progressNarrationToText,
   type ProgressNarration,
 } from "./progressNarration";
+import {
+  buildEmptyModelResponsePauseNotice,
+  buildMaxStepsFinalTextPrompt,
+  buildMaxStepsToolCallIgnoredNotice,
+  resolveAgentLoopMaxIterations,
+  shouldUseMaxStepsFinalTextOnly,
+  type AgentLoopIterationLimits,
+} from "./agentLoopSafety";
+import { shouldUseRustProxyForLocalProvider } from "./localProviderRouting";
 import type { ShellPermissionApproval } from "./ipc";
 import {
   buildTaskTargetingProfile,
@@ -965,6 +975,8 @@ export interface OrchestratorCallbacks {
       hiddenThought?: string;
       visibility?: "user_progress" | "hidden_process" | "substantive_plan_text";
       preserveAssistantText?: boolean;
+      capsuleCandidate?: boolean;
+      modelAuthored?: boolean;
       progress?: ProgressNarration;
       toolCalls?: Array<{ id?: string; name: string; target: string }>;
     },
@@ -1060,7 +1072,6 @@ export interface OrchestratorCallbacks {
 
 function deriveStreamSettings(config: AppConfig): StreamSettings {
   if (config.activeProfile === "local") {
-    const isOllama = config.local.provider === "Ollama";
     const toolProtocol = normalizeLocalToolProtocol(config.local.toolProtocol, config.local.provider);
     return {
       baseUrl: config.local.endpoint,
@@ -1073,8 +1084,8 @@ function deriveStreamSettings(config: AppConfig): StreamSettings {
       toolProtocol,
       // LM Studio / OMLX 的本地流式接口在桌面 WebView 中可能触发
       // “Load Failed”，统一交给 Tauri 后端请求，避开 WebView 限制。
-      // Ollama 保留前端直连，因为它使用原生 /api/chat 流格式。
-      useRustProxy: !isOllama,
+      // Ollama 原生端点保留前端直连；配置成 /v1 时也走后端代理。
+      useRustProxy: shouldUseRustProxyForLocalProvider(config.local.provider, config.local.endpoint),
     };
   }
   const cloudAuthMode = config.cloudExperimentalLoginEnabled === true ? config.cloud.auth?.mode ?? "api_key" : "api_key";
@@ -1246,13 +1257,23 @@ function stableProgressHash(input: string): string {
   return (hash >>> 0).toString(36);
 }
 
+function normalizeNoProgressResultContent(result: ToolExecutionResult): string {
+  const raw = String(result.content || "");
+  if (!PLAN_EXPLORATION_READ_ONLY_TOOLS.has(result.name)) return raw;
+  return raw
+    .replace(/Duplicate skip count in this run:\s*\d+\./gi, "Duplicate skip count in this run: [n].")
+    .replace(/duplicateCount\s*[:=]\s*\d+/gi, "duplicateCount=[n]")
+    .replace(/Previous read:\s*[\d,]+\s+chars/gi, "Previous read: [n] chars")
+    .replace(/Previous read window:\s*lines\s+\d+-\d+\s+of\s+\d+,\s*[\d,]+\s+result chars/gi, "Previous read window: lines [range] of [n], [n] result chars");
+}
+
 function buildNoProgressBatchSignature(results: ToolExecutionResult[]): string {
   const usable = results.filter((result) => !result.isError);
   if (usable.length === 0) return "";
   if (usable.every((result) => NO_PROGRESS_EXCLUDED_TOOLS.has(result.name))) return "";
   const fragments = usable
     .map((result) => {
-      const contentHash = stableProgressHash(result.content || "");
+      const contentHash = stableProgressHash(normalizeNoProgressResultContent(result));
       return `${result.name}::${result.target || ""}::${contentHash}`;
     })
     .sort();
@@ -3791,8 +3812,6 @@ async function executeWriteToolWithReview(
 
 // ── The Loop ──────────────────────────────────────────────────────
 
-const MAX_ITERATIONS = 25;
-const MAX_ITERATIONS_PLAN_EXECUTION = 50;
 const MAX_RECENT_PLAN_TOOL_ACTIVITY = 12;
 const CONCISE_PLAN_ARTIFACT_HINT_ZH =
   "计划文档必须精简：plan.md 60-120 行；可选 requirements.md 40-80 行；如确需持久化 tasks.md，保持 8-20 个 checkbox。不要写教程式长文、完整代码清单或重复背景。Proposal 只做一页审阅摘要。";
@@ -4506,7 +4525,9 @@ export async function executeAgentLoop(
   let iteration = 0;
   let consecutiveNoToolCount = 0;
   let consecutiveEmptyResponseCount = 0;
+  let emptyResponseCountThisTurn = 0;
   let consecutiveReasoningDominatedCount = 0;
+  let usedMaxStepsFinalTextPrompt = false;
   let currentMaxTokens: number | undefined; // undefined = use default
   const getMaxOutputEscalations = () =>
     workflowMode === "plan" && !callbacks.getIsPlanApproved()
@@ -5042,9 +5063,15 @@ export async function executeAgentLoop(
     return "failed";
   }
 
-  const effectiveMaxIterations = workflowMode === "plan"
-    ? MAX_ITERATIONS_PLAN_EXECUTION
-    : MAX_ITERATIONS;
+  const agentLoopConfig = config as AppConfig & {
+    agentLoop?: { iterationLimits?: AgentLoopIterationLimits | null } | null;
+  };
+  const effectiveMaxIterations = resolveAgentLoopMaxIterations({
+    workflowMode,
+    runtimeIntent: resolveRuntimeIntent(),
+    isPlanApproved: callbacks.getIsPlanApproved(),
+    limits: agentLoopConfig.agentLoop?.iterationLimits ?? null,
+  });
   const emitPlanExecutionProgress = (
     phase: PlanExecutionProgressPhase,
     overrides: Partial<PlanExecutionProgressUpdate> = {},
@@ -5236,6 +5263,13 @@ export async function executeAgentLoop(
     builtinAndSkillTools: Math.max(0, loopStartTools.length - mcpTools.length),
     activeProfile: config.activeProfile,
     provider: settings.provider || "unknown",
+    maxIterations: effectiveMaxIterations,
+    iterationLimitSource: {
+      chatRespond: agentLoopConfig.agentLoop?.iterationLimits?.chatRespond ?? null,
+      editExecute: agentLoopConfig.agentLoop?.iterationLimits?.editExecute ?? null,
+      planDraft: agentLoopConfig.agentLoop?.iterationLimits?.planDraft ?? null,
+      planExecution: agentLoopConfig.agentLoop?.iterationLimits?.planExecution ?? null,
+    },
     nativeToolsEnabled: !shouldUseXmlToolProtocol(
       config,
       settings,
@@ -5265,7 +5299,25 @@ export async function executeAgentLoop(
     // ── Pre-LLM Turn Preparation ──
     callbacks.startNewTurn();
     const runtimeIntent = resolveRuntimeIntent();
-    const rawIterationAllTools = resolveAllToolsForRuntime(runtimeIntent);
+    const finalTextOnlyStep = shouldUseMaxStepsFinalTextOnly({
+      workflowMode,
+      runtimeIntent,
+      isPlanApproved: callbacks.getIsPlanApproved(),
+      iteration,
+      maxIterations: effectiveMaxIterations,
+      alreadyPrompted: usedMaxStepsFinalTextPrompt,
+    });
+    if (finalTextOnlyStep) {
+      usedMaxStepsFinalTextPrompt = true;
+      logAgentEvent("max_steps_final_text_prompt", {
+        iteration,
+        maxIterations: effectiveMaxIterations,
+        workflowMode,
+        runtimeIntent,
+        repeatedTargets: summarizeRepeatedExecuteTargets(recentToolActivity.slice(-12)),
+      });
+    }
+    const rawIterationAllTools = finalTextOnlyStep ? [] : resolveAllToolsForRuntime(runtimeIntent);
     const allowApprovedPlanRecoveryFileRead = shouldAllowApprovedPlanRecoveryFileRead(recentPlanToolActivity);
     const isExecuteRecoveryEligible =
       (workflowMode === "edit" || (workflowMode === "plan" && callbacks.getIsPlanApproved())) &&
@@ -5606,12 +5658,23 @@ export async function executeAgentLoop(
     });
 
     try {
-      const messagesForLLM = prepareMessagesForToolProtocol(
+      const protocolMessagesForLLM = prepareMessagesForToolProtocol(
         managedAgentMessages,
         config,
         settings,
         providerCompatibilityOverride,
       );
+      const finalTextOnlyPrompt = finalTextOnlyStep
+        ? buildMaxStepsFinalTextPrompt({
+            language: callbacks.getPreferredLanguage(),
+            iteration,
+            maxIterations: effectiveMaxIterations,
+            repeatedTargets: summarizeRepeatedExecuteTargets(recentToolActivity.slice(-12)),
+          })
+        : "";
+      const messagesForLLM = finalTextOnlyPrompt
+        ? [...protocolMessagesForLLM, { role: "user" as const, content: finalTextOnlyPrompt }]
+        : protocolMessagesForLLM;
       const streamWatchdogOptions = getPlanStreamWatchdogOptions(llmTools.length) ?? {};
       logAgentEvent("llm_request_shape", {
         iteration,
@@ -5635,6 +5698,7 @@ export async function executeAgentLoop(
         executeRecoveryMode,
         executeRecoveryReason,
         recoveryToolSurface: describeExecuteRecoveryToolSurface(executeRecoveryMode, allowExecuteRecoveryFileRead),
+        finalTextOnlyStep,
         messages: summarizeMessagesForDiagnostics(messagesForLLM),
         managedMessages: summarizeMessagesForDiagnostics(managedAgentMessages),
         allTools: summarizeToolsForDiagnostics(iterationAllTools),
@@ -6420,6 +6484,39 @@ export async function executeAgentLoop(
       }
 
       consecutiveEmptyResponseCount++;
+      emptyResponseCountThisTurn++;
+      if (
+        workflowMode === "chat" &&
+        runtimeIntent === "respond" &&
+        emptyResponseCountThisTurn >= 2
+      ) {
+        const repeatedTargets = summarizeRepeatedExecuteTargets(recentToolActivity.slice(-12));
+        logAgentEvent("loop_stop", {
+          reason: "empty_model_response",
+          iteration,
+          consecutiveEmptyResponseCount,
+          emptyResponseCountThisTurn,
+          repeatedTargets,
+        });
+        callbacks.onNonActionableStop(
+          buildEmptyModelResponsePauseNotice({
+            language: callbacks.getPreferredLanguage(),
+            emptyResponses: emptyResponseCountThisTurn,
+            repeatedTargets,
+            localProfile: config.activeProfile === "local",
+          }),
+          "no_output",
+          {
+            repeatedTargets,
+            recoveryReason: "empty_model_response",
+            nextStep: callbacks.getPreferredLanguage() === "zh"
+              ? "复用已读上下文，要求直接总结、换目标或说明具体阻塞"
+              : "reuse cached context and ask for a direct summary, a different target, or the concrete blocker",
+          },
+        );
+        callbacks.onStatusChange("idle");
+        return;
+      }
       if (workflowMode === "plan" && !callbacks.getIsPlanApproved()) {
         if (consecutiveEmptyResponseCount >= 2) {
           const closureResult = await tryClosePlanWithEvidence("empty_response_checkpoint", {
@@ -6457,12 +6554,31 @@ export async function executeAgentLoop(
         continue;
       }
       if (consecutiveEmptyResponseCount >= 3) {
-        callbacks.onError(
-          isCloudProfile
-            ? "云端模型连续返回空响应，当前网关兼容性可能不稳定。请新建一个纯文本会话再试，或切换到兼容性更好的 OpenAI 协议网关。"
-            : "模型连续返回空响应，没有产生可见正文或工具调用。请重试，或切换到更稳定的本地模型。",
+        const repeatedTargets = summarizeRepeatedExecuteTargets(recentToolActivity.slice(-12));
+        logAgentEvent("loop_stop", {
+          reason: "empty_model_response",
+          iteration,
+          consecutiveEmptyResponseCount,
+          emptyResponseCountThisTurn,
+          repeatedTargets,
+        });
+        callbacks.onNonActionableStop(
+          buildEmptyModelResponsePauseNotice({
+            language: callbacks.getPreferredLanguage(),
+            emptyResponses: consecutiveEmptyResponseCount,
+            repeatedTargets,
+            localProfile: config.activeProfile === "local",
+          }),
+          "no_output",
+          {
+            repeatedTargets,
+            recoveryReason: "empty_model_response",
+            nextStep: callbacks.getPreferredLanguage() === "zh"
+              ? "复用已读上下文，要求直接总结、换目标或说明具体阻塞"
+              : "reuse cached context and ask for a direct summary, a different target, or the concrete blocker",
+          },
         );
-        callbacks.onStatusChange("error");
+        callbacks.onStatusChange("idle");
         return;
       }
 
@@ -6515,6 +6631,61 @@ export async function executeAgentLoop(
         workflowMode,
         turnIntent,
       });
+    }
+    if (finalTextOnlyStep && effectiveToolCalls.length > 0) {
+      callbacks.onStreamToken("__ESCALATION_RESET__:", assistantMsgId);
+      const finalText = normalized.visibleText.trim();
+      const repeatedTargets = summarizeRepeatedExecuteTargets(recentToolActivity.slice(-12));
+      logAgentEvent("max_steps_tool_calls_ignored", {
+        iteration,
+        maxIterations: effectiveMaxIterations,
+        toolCalls: effectiveToolCalls.length,
+        toolNames: effectiveToolCalls.map((call) => call.name).slice(0, 8),
+        visibleChars: finalText.length,
+        repeatedTargets,
+      });
+      if (finalText) {
+        callbacks.onAssistantFinalText(finalText, [], {
+          hasToolCalls: false,
+          modelAuthored: true,
+        });
+        const assistantHistoryText = serializeAssistantReplyForHistory(finalText, []);
+        callbacks.appendMessage(buildAssistantHistoryMessage(assistantHistoryText, providerReasoningForHistory));
+        emitTurnEvent({
+          type: "item.completed",
+          threadId: eventThreadId,
+          turnId: eventTurnId,
+          timestampMs: Date.now(),
+          item: {
+            id: assistantMsgId,
+            details: {
+              type: "agent_message",
+              text: assistantHistoryText,
+            },
+          } as MainThreadItem,
+        });
+        callbacks.onStatusChange("idle");
+        emitTurnCompletedEvent();
+        return;
+      }
+      callbacks.onNonActionableStop(
+        buildMaxStepsToolCallIgnoredNotice({
+          language: callbacks.getPreferredLanguage(),
+          iteration,
+          maxIterations: effectiveMaxIterations,
+          repeatedTargets,
+        }),
+        "no_action",
+        {
+          repeatedTargets,
+          recoveryReason: "max_iterations_boundary",
+          nextStep: callbacks.getPreferredLanguage() === "zh"
+            ? "复用已读上下文，直接总结、换目标或说明具体阻塞"
+            : "reuse cached context, summarize directly, switch targets, or state the concrete blocker",
+        },
+      );
+      callbacks.onStatusChange("idle");
+      return;
     }
 
     const compactedProseCodeDump = shouldCompactProseCodeDump({
@@ -7059,6 +7230,8 @@ export async function executeAgentLoop(
           ? "substantive_plan_text"
           : shouldRenderToolProgress || shouldSuppressApprovedPlanNoToolText ? "user_progress" : undefined,
         preserveAssistantText: shouldPreserveApprovedExecutionText,
+        capsuleCandidate: shouldRenderToolProgress && !runtimeNarrationInjected && visibleAssistantText.trim().length > 0,
+        modelAuthored: !runtimeNarrationInjected,
         progress: shouldRenderToolProgress
           ? toolActionNarration || undefined
           : undefined,
@@ -8518,10 +8691,7 @@ export async function executeAgentLoop(
           });
         }
 
-        const fileReadDuplicateCount = fileReadSignature ? (readOnlyDuplicateSkipCounts.get(fileReadSignature) ?? 0) : 0;
-        const bypassFileReadCacheDueToRepeat = fileReadDuplicateCount >= 2;
-
-        if (fileReadState && !bypassApprovedPlanPatchRecoveryReadCache && !bypassFileReadCacheDueToRepeat) {
+        if (fileReadState && !bypassApprovedPlanPatchRecoveryReadCache) {
           const metadata = fileReadMetadata ?? await readFileMetadataIfAvailable(fileReadState.path, workspace);
           const unchanged =
             metadata != null &&
@@ -8714,10 +8884,7 @@ export async function executeAgentLoop(
           }
         }
 
-        const signatureDuplicateCount = readOnlyDuplicateSkipCounts.get(signature) ?? 0;
-        const bypassCacheDueToRepeat = signatureDuplicateCount >= 2;
-
-        if (!bypassApprovedPlanPatchRecoveryReadCache && !bypassCacheDueToRepeat && (cached || queuedReadOnlySignatures.has(signature))) {
+        if (!bypassApprovedPlanPatchRecoveryReadCache && (cached || queuedReadOnlySignatures.has(signature))) {
           const duplicateCount = (readOnlyDuplicateSkipCounts.get(signature) ?? 0) + 1;
           readOnlyDuplicateSkipCounts.set(signature, duplicateCount);
           const planBudget = buildPlanExplorationBudget({
@@ -9310,6 +9477,59 @@ export async function executeAgentLoop(
           reason: executeReadOnlyRecovery.reason,
         };
       }
+    }
+
+    const chatReadOnlyNoProgress =
+      workflowMode === "chat" && runtimeIntent === "respond"
+        ? resolveReadOnlyNoProgressTrigger({
+            results: allResults,
+            recentActivity: recentToolActivity,
+            readOnlyTools: PLAN_EXPLORATION_READ_ONLY_TOOLS,
+            sawExecuteOperationEvidence: false,
+            noProgressBatchRepeatCount,
+            minReadOnlyActivities: 6,
+            minCachedReadOnlyActivities: 3,
+            maxNoProgressReadOnlyRepeats: 2,
+            maxReadOnlyToolChars: 24_000,
+          })
+        : { shouldRecover: false, reason: "", readOnlyActivityCount: 0, batchToolChars: 0 };
+    if (chatReadOnlyNoProgress.shouldRecover) {
+      const language = callbacks.getPreferredLanguage();
+      const repeatedTargets = summarizeRepeatedExecuteTargets(recentToolActivity.slice(-12));
+      const progressSignature = buildPlanProgressSignatureFromToolActivity(recentToolActivity) || noProgressBatchSignature;
+      const nextStep = language === "zh"
+        ? "复用已读上下文，直接回答、换目标或说明具体阻塞"
+        : "reuse cached context to answer directly, switch targets, or state the concrete blocker";
+      logAgentEvent("loop_stop", {
+        reason: chatReadOnlyNoProgress.reason,
+        iteration,
+        repeats: noProgressBatchRepeatCount,
+        readOnlyActivityCount: chatReadOnlyNoProgress.readOnlyActivityCount,
+        batchToolChars: chatReadOnlyNoProgress.batchToolChars,
+        repeatedTargets,
+        progressSignature: truncateForLog(progressSignature, 220),
+      });
+      callbacks.onNonActionableStop(
+        buildExecuteNoProgressLoopPauseNotice({
+          language,
+          scope: "chat",
+          repeats: Math.max(1, noProgressBatchRepeatCount),
+          remainingTask: language === "zh"
+            ? "当前对话回合只有只读探索，没有产出最终回答或具体阻塞。"
+            : "the chat turn produced only read-only exploration, not a final answer or concrete blocker",
+          recentActivity: recentToolActivity,
+          repeatedTargets,
+        }),
+        "no_action",
+        {
+          progressSignature,
+          repeatedTargets,
+          recoveryReason: chatReadOnlyNoProgress.reason,
+          nextStep,
+        },
+      );
+      callbacks.onStatusChange("idle");
+      return;
     }
 
     const approvedPlanCachedReadOnlyBatch =
@@ -10092,11 +10312,29 @@ export async function executeAgentLoop(
     return;
   }
 
+  const repeatedTargets = summarizeRepeatedExecuteTargets(recentToolActivity.slice(-12));
+  const progressSignature = buildPlanProgressSignatureFromToolActivity(recentToolActivity);
+  logAgentEvent("loop_stop", {
+    reason: "max_iterations_boundary",
+    iteration: effectiveMaxIterations,
+    workflowMode,
+    runtimeIntent: resolveRuntimeIntent(),
+    repeatedTargets,
+    progressSignature: truncateForLog(progressSignature, 220),
+  });
   callbacks.onNonActionableStop(
     callbacks.getPreferredLanguage() === "zh"
       ? `本轮达到 ${effectiveMaxIterations} 轮安全边界，已停止在可恢复状态。`
       : `This turn reached the ${effectiveMaxIterations}-iteration safety boundary and stopped in a recoverable state.`,
     "no_action",
+    {
+      progressSignature,
+      repeatedTargets,
+      recoveryReason: "max_iterations_boundary",
+      nextStep: callbacks.getPreferredLanguage() === "zh"
+        ? "复用已读上下文，直接总结、换目标或说明具体阻塞"
+        : "reuse cached context, summarize directly, switch targets, or state the concrete blocker",
+    },
   );
   callbacks.onStatusChange("idle");
   emitTurnCompletedEvent();

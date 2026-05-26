@@ -43,7 +43,7 @@ import {
   type ChatOperationCluster,
 } from "../lib/toolUiGrouping";
 import { isThinModelToolNarration, isSubstantiveModelFeedback } from "../lib/modelFeedbackDedupe";
-import { isConversationalFirstPersonNarration, deriveDynamicFirstPersonText } from "../lib/capsuleStagingHelper";
+import { isConversationalFirstPersonNarration, deriveDynamicFirstPersonText, isIdleCapsuleNarration } from "../lib/capsuleStagingHelper";
 import { compactToolPresentationTarget, getToolPresentationLabel } from "../lib/toolPresentation";
 import { buildLiveTurnProcessTimelineModel, buildTurnProcessArchiveModel, type TurnArchiveStep } from "../lib/turnProcessArchive";
 import {
@@ -689,6 +689,18 @@ function getAgentVisibleMarkdownText(block: any): string {
     .filter(Boolean)
     .join("\n\n")
     .trim();
+}
+
+function normalizeCapsuleExplanationText(text: string): string {
+  const content = String(text || "").trim();
+  if (!content || isIdleCapsuleNarration(content)) return "";
+  return isConversationalFirstPersonNarration(content) ? content : "";
+}
+
+function normalizeCapsuleProgressText(text: string): string {
+  const content = String(text || "").trim();
+  if (!content || isIdleCapsuleNarration(content)) return "";
+  return content;
 }
 
 function normalizeTranscriptDedupeText(text: string): string {
@@ -1506,9 +1518,6 @@ function ReadContextGroupCard({
   ).slice(0, 3).filter(Boolean);
   const hiddenCount = Math.max(0, entries.length - previewTargets.length);
   const previewText = previewTargets.join(language === "zh" ? "、" : ", ");
-  const previewPurpose = entries
-    .map((entry) => entry.summary)
-    .find(Boolean);
   const title = duplicateCount > 0
     ? language === "zh"
       ? `已读取 ${uniqueCount} 项有效上下文（共 ${totalCount} 次）`
@@ -1544,11 +1553,6 @@ function ReadContextGroupCard({
         {previewText && (
           <span className="min-w-0 flex-1 truncate text-[11px] text-[#71717a]">
             · {previewText}{hiddenCount > 0 ? ` +${hiddenCount}` : ""}
-          </span>
-        )}
-        {previewPurpose && (
-          <span data-testid="read-context-group-summary" className="min-w-0 flex-1 truncate text-[11px] text-[#94a3b8]">
-            {previewPurpose}
           </span>
         )}
         {duplicateText && (
@@ -1705,9 +1709,6 @@ function CompletedToolGroupCard({
     if (commandCount) typeSummaryParts.push(`${commandCount} command${commandCount > 1 ? "s" : ""}`);
   }
   const typeSummary = typeSummaryParts.join(language === "zh" ? "，" : ", ");
-  const previewPurpose = toolBlocks
-    .map((block) => String(block.observationSummary || block.intentSummary || block.why || ""))
-    .find(Boolean);
   const title = language === "zh"
     ? `已完成 ${toolBlocks.length} 次工具调用`
     : `${toolBlocks.length} completed tool call${toolBlocks.length > 1 ? "s" : ""}`;
@@ -1739,11 +1740,6 @@ function CompletedToolGroupCard({
         {previewNames.length > 0 && (
           <span className="min-w-0 flex-1 truncate text-[11px] text-[#71717a]">
             · {previewNames.join(language === "zh" ? "、" : ", ")}{hiddenCount > 0 ? ` +${hiddenCount}` : ""}
-          </span>
-        )}
-        {previewPurpose && (
-          <span data-testid="completed-tool-group-summary" className="min-w-0 flex-1 truncate text-[11px] text-[#94a3b8]">
-            {previewPurpose}
           </span>
         )}
         <span className="shrink-0 rounded-full border border-[#27272a] bg-[#050507] px-2 py-0.5 text-[10px] text-[#a1a1aa]">
@@ -1867,11 +1863,6 @@ function ChatOperationClusterBlock({
         {cluster.previewText && (
           <span className="min-w-0 flex-1 truncate text-[12px] text-[var(--surface-text-muted)]">
             · {cluster.previewText}
-          </span>
-        )}
-        {cluster.purposeSummary && (
-          <span data-testid="chat-operation-summary" className="hidden min-w-0 flex-1 truncate text-[11px] text-[var(--surface-text-subtle)] lg:block">
-            {cluster.purposeSummary}
           </span>
         )}
         {duplicateText && (
@@ -2690,6 +2681,7 @@ export default function ChatArea({
     rejectPlan,
     rejectPlanAndDeleteFiles,
     agentStatus,
+    capsuleExplanationState,
     pendingRunDecision,
     resolvePendingRunDecision,
     dismissPendingRunDecision,
@@ -2722,6 +2714,7 @@ export default function ChatArea({
     rejectPlan: useAppStore((s) => s.rejectPlan),
     rejectPlanAndDeleteFiles: useAppStore((s) => s.rejectPlanAndDeleteFiles),
     agentStatus: useAppStore((s) => s.agentStatus),
+    capsuleExplanationState: useAppStore((s) => s.currentTurnState.capsuleExplanation),
     pendingRunDecision: useAppStore((s) => s.pendingRunDecision),
     resolvePendingRunDecision: useAppStore((s) => s.resolvePendingRunDecision),
     dismissPendingRunDecision: useAppStore((s) => s.dismissPendingRunDecision),
@@ -2914,15 +2907,19 @@ export default function ChatArea({
         const content = String(text || "").trim();
         if (!content) continue;
         
-        // Route rich conversational first-person staging explanations into the capsule
-        const thinNarration = isConversationalFirstPersonNarration(content);
-        if (thinNarration) {
-          return content;
-        }
+        // Route rich conversational first-person staging explanations into the capsule.
+        const capsuleText = normalizeCapsuleExplanationText(content);
+        if (capsuleText) return capsuleText;
       }
     }
     return "";
   }, [capsuleIsRunActive, capsuleTurnBlocks]);
+
+  const cachedCapsuleExplanation = useMemo(() => {
+    if (!capsuleIsRunActive || !capsuleTurn) return "";
+    if (capsuleExplanationState?.turnId !== capsuleTurn.id) return "";
+    return normalizeCapsuleExplanationText(capsuleExplanationState.text);
+  }, [capsuleExplanationState, capsuleIsRunActive, capsuleTurn]);
 
   useEffect(() => {
     if (!capsuleTurn) {
@@ -2942,10 +2939,13 @@ export default function ChatArea({
 
   const capsuleActivityText = useMemo(() => {
     if (!capsuleIsRunActive || !capsuleTurn) return "";
+    if (cachedCapsuleExplanation) return cachedCapsuleExplanation;
     if (activeTurnExplanation) return activeTurnExplanation;
     if (explanationText) return explanationText;
-    return deriveDynamicFirstPersonText(capsuleTurn, capsuleTurnBlocks, agentStatus, language);
-  }, [capsuleIsRunActive, capsuleTurn, capsuleTurnBlocks, activeTurnExplanation, explanationText, agentStatus, language]);
+    const progressText = normalizeCapsuleProgressText(capsuleProgressProjection.activityText);
+    if (progressText) return progressText;
+    return normalizeCapsuleProgressText(deriveDynamicFirstPersonText(capsuleTurn, capsuleTurnBlocks, agentStatus, language));
+  }, [capsuleIsRunActive, capsuleTurn, cachedCapsuleExplanation, activeTurnExplanation, explanationText, capsuleProgressProjection.activityText, capsuleTurnBlocks, agentStatus, language]);
 
   useEffect(() => {
     const turnChanged = capsuleTurn?.id !== lastTurnIdRef.current;
@@ -3394,9 +3394,20 @@ export default function ChatArea({
     const finalVisibleAgentBlock = finalVisibleAgentIndex >= 0 ? blocks[finalVisibleAgentIndex] : null;
     const isFinishedTurn = isFinishedTurnStatus(turn.status);
     const showReasoningDebug = config.reasoningDisplay !== "hidden";
-    const shouldRenderLiveProcessTimeline =
-      turnIntent === "studio_workflow" ||
-      selectedMainModeKey === "game_studio";
+    const hasFoldableProcessBlocks = blocks.some((block) => {
+      if (!block || block.type === "user" || block.type === "thought") return false;
+      if (block.type === "agent") return block.hiddenProcess === true;
+      if (block.type === "progress" || block.type === "jobList") return true;
+      if (block.type === "system") {
+        return block.variant !== "context_compression" && block.variant !== "plan_execution_checkpoint";
+      }
+      if (block.type === "tool") {
+        const status = String(block.toolStatus || block.status || "").toLowerCase();
+        return status === "executed" || status === "running";
+      }
+      return false;
+    });
+    const shouldRenderLiveProcessTimeline = hasFoldableProcessBlocks;
     const shouldRenderCompletedProcessArchive = shouldRenderLiveProcessTimeline;
     const shouldArchiveCompletedProcess =
       shouldRenderCompletedProcessArchive &&

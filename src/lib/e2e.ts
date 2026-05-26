@@ -59,6 +59,8 @@ const TOP_ISLAND_PENDING_TOOL_REVIEW_SCENARIO = "top-island-pending-tool-review"
 const TOP_ISLAND_PANEL_STABILITY_SCENARIO = "top-island-panel-stability";
 const GAME_STUDIO_TOOL_GROUP_COLLAPSE_SCENARIO = "game-studio-tool-group-collapse";
 const GAME_STUDIO_AWAITING_CHOICE_SCENARIO = "game-studio-awaiting-choice";
+const CAPSULE_MODEL_EXPLANATION_SCENARIO = "capsule-model-explanation";
+const CAPSULE_PROGRESS_ONLY_SCENARIO = "capsule-progress-only";
 const SIDEBAR_REMOVE_LAST_WORKSPACE_SCENARIO = "sidebar-remove-last-workspace";
 const USER_CONTEXT_PILLS_SCENARIO = "user-context-pills";
 const E2E_SEED_COUNT_PREFIX = "__CODELY_E2E_SEED_COUNT__:";
@@ -3632,6 +3634,136 @@ function seedGameStudioToolGroupScenario(status: "executing" | "awaiting_input")
   return cleanup;
 }
 
+function seedCapsuleProcessScenario(kind: "model" | "progress") {
+  const bridge = getBridge();
+  if (!bridge) return undefined;
+
+  bridge.events = [{ type: "boot" }];
+  bridge.savedDocuments = [];
+  bridge.completed = false;
+
+  const workspace = kind === "model"
+    ? "/tmp/e2e-capsule-model-explanation"
+    : "/tmp/e2e-capsule-progress-only";
+  const sessionId = kind === "model" ? 999613 : 999614;
+  const now = Date.now();
+  const turnId = kind === "model"
+    ? "e2e-capsule-model-explanation-turn"
+    : "e2e-capsule-progress-only-turn";
+  const userBlockId = useAppStore.getState()._nextTaskId();
+  const readToolId = useAppStore.getState()._nextTaskId();
+  const commandToolId = useAppStore.getState()._nextTaskId();
+  const runningToolId = useAppStore.getState()._nextTaskId();
+  const capsuleText = "我会保留这条模型说明，并在工具执行时继续围绕 capsule 链路排查。";
+  const taskFlow: any[] = [
+    { id: userBlockId, turnId, type: "user" as const, content: "继续排查 capsule 和工具折叠。" },
+    {
+      id: readToolId,
+      turnId,
+      type: "tool" as const,
+      toolName: "read_file",
+      target: "src/components/ChatArea.tsx",
+      status: "done",
+      toolStatus: "executed" as const,
+      message: "OK",
+      intentSummary: "确认 capsule 渲染链路",
+      observationSummary: "找到 ChatArea 中 capsule 的显示优先级。",
+    },
+    {
+      id: commandToolId,
+      turnId,
+      type: "tool" as const,
+      toolName: "run_command",
+      target: "npm run test:workflow-assets",
+      status: "done",
+      toolStatus: "executed" as const,
+      message: "OK",
+      intentSummary: "运行回归测试确认折叠状态",
+      observationSummary: "验证命令已完成。",
+    },
+    {
+      id: runningToolId,
+      turnId,
+      type: "tool" as const,
+      toolName: "grep_search",
+      target: "src/components/ChatArea.tsx",
+      status: "running",
+      toolStatus: "running" as const,
+      message: "Searching...",
+      intentSummary: "继续确认 capsule 不会被工具调用冲刷",
+    },
+  ];
+
+  useAppStore.setState((state) => ({
+    ...state,
+    config: {
+      ...state.config,
+      language: "zh",
+      workflowMode: "edit",
+    },
+    selectedMainModeKey: "main_mode",
+    selectedNexusModeKey: "nexus_general",
+    currentWorkspace: workspace,
+    sessionsByWorkspace: {
+      [workspace]: [
+        {
+          id: sessionId,
+          title: kind === "model" ? "E2E Capsule Model Explanation" : "E2E Capsule Progress Only",
+          date: new Date(now).toISOString(),
+          active: true,
+          messages: [],
+        },
+      ],
+    },
+    currentSessionId: sessionId,
+    taskFlow,
+    conversationTurns: [
+      {
+        id: turnId,
+        userPrompt: "继续排查 capsule 和工具折叠。",
+        title: kind === "model" ? "Capsule 模型说明缓存" : "Capsule 工具进度兜底",
+        mode: "edit",
+        intent: "execute",
+        status: "executing",
+        summary: "工具调用进行中。",
+        blockIds: taskFlow.map((block) => block.id),
+        collapsed: false,
+        createdAt: now,
+      },
+    ],
+    currentTurnId: turnId,
+    currentTurnState: {
+      interceptorHandled: false,
+      interceptorThought: "",
+      lastReportedThought: "",
+      lastReportedAssistantText: "",
+      capsuleExplanation: kind === "model"
+        ? { turnId, text: capsuleText, updatedAt: now, source: "model" as const }
+        : null,
+      turnId,
+    },
+    agentStatus: "running",
+    isGenerating: true,
+    showPlanPanel: false,
+    showDiff: false,
+    showTerminal: false,
+    showFilePanel: false,
+  }));
+
+  bindBridgeSnapshot(
+    kind === "model"
+      ? CAPSULE_MODEL_EXPLANATION_SCENARIO
+      : CAPSULE_PROGRESS_ONLY_SCENARIO,
+  );
+
+  const cleanup = () => {
+    bridge.initialized = false;
+  };
+
+  bridge.cleanup = cleanup;
+  return cleanup;
+}
+
 function seedGameStudioOnboardingScenario() {
   const bridge = getBridge();
   if (!bridge) return undefined;
@@ -6297,6 +6429,14 @@ export function initializeE2EScenarios(): (() => void) | undefined {
 
   if (scenario === GAME_STUDIO_AWAITING_CHOICE_SCENARIO) {
     return seedGameStudioToolGroupScenario("awaiting_input");
+  }
+
+  if (scenario === CAPSULE_MODEL_EXPLANATION_SCENARIO) {
+    return seedCapsuleProcessScenario("model");
+  }
+
+  if (scenario === CAPSULE_PROGRESS_ONLY_SCENARIO) {
+    return seedCapsuleProcessScenario("progress");
   }
 
   if (scenario === USER_CONTEXT_PILLS_SCENARIO) {

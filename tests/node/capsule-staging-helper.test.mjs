@@ -29,6 +29,7 @@ function loadTranspiledModuleSync(sourcePath) {
 
 const {
   isConversationalFirstPersonNarration,
+  isIdleCapsuleNarration,
   deriveDynamicFirstPersonText,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/capsuleStagingHelper.ts"));
 
@@ -44,6 +45,14 @@ test("isConversationalFirstPersonNarration validations", () => {
   assert.equal(isConversationalFirstPersonNarration("```typescript\nconst a = 1;\n```"), false); // Code block
   assert.equal(isConversationalFirstPersonNarration("| 字段 | 类型 |\n| --- | --- |\n| creator | string |"), false); // Table
   assert.equal(isConversationalFirstPersonNarration("a".repeat(400)), false); // Too long
+  assert.equal(isConversationalFirstPersonNarration("我正在等待您的下一步指令，随时准备开始新的探索或修改..."), false);
+  assert.equal(isConversationalFirstPersonNarration("I am awaiting your next instructions, ready to begin new exploration or modifications..."), false);
+});
+
+test("idle capsule narration is rejected explicitly", () => {
+  assert.equal(isIdleCapsuleNarration("我正在等待您的下一步指令，随时准备开始新的探索或修改..."), true);
+  assert.equal(isIdleCapsuleNarration("I am awaiting your next instructions, ready to begin new exploration or modifications..."), true);
+  assert.equal(isIdleCapsuleNarration("我为您提供了几种解决方案，正在等待您的选择。"), false);
 });
 
 test("deriveDynamicFirstPersonText - Tool execution phase (Dynamic Intent summaries)", () => {
@@ -115,6 +124,14 @@ test("deriveDynamicFirstPersonText - Awaiting Input Options", () => {
 
   const resultZh = deriveDynamicFirstPersonText(turn, blocks, "running", "zh");
   assert.equal(resultZh, "我为您提供了几种解决方案，正在等待您的选择，这将决定我接下来的修改与优化方向...");
+});
+
+test("deriveDynamicFirstPersonText - silent when no active signal exists", () => {
+  const resultZh = deriveDynamicFirstPersonText({ id: "turn-1", status: "executing" }, [], "running", "zh");
+  assert.equal(resultZh, "");
+
+  const resultEn = deriveDynamicFirstPersonText({ id: "turn-1", status: "executing" }, [], "running", "en");
+  assert.equal(resultEn, "");
 });
 
 test("deriveDynamicFirstPersonText - Streaming Thoughts", () => {
