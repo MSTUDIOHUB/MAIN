@@ -38,7 +38,7 @@ export function isPatchMismatchRecoveryActivity(activity: ApprovedPlanRecoveryAc
 }
 
 function isCachedReadOnlyResult(result: ApprovedPlanToolResultLike): boolean {
-  return /FILE_UNCHANGED_STUB|Repeated read-only tool call skipped/i.test([
+  return /FILE_UNCHANGED_STUB|Repeated read-only tool call skipped|READ_FILE_REPEAT_LIMIT/i.test([
     result.detail,
     result.displayContent,
     result.content,

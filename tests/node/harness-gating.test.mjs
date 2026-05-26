@@ -76,7 +76,9 @@ function createMockCallbacks(options = {}) {
     getSessionKey: () => "mock-session",
     getMessages: () => options.messages || [],
     onToolExecuting: () => {},
+    onToolDone: () => {},
     onToolError: () => {},
+    onDebugEvent: () => {},
     ...options,
   };
 }
@@ -101,7 +103,7 @@ test("buildShellReadValidationError blocks command starting with cat/head/tail/s
   assert.equal(okLs, null);
 });
 
-test("buildLoopDetectionValidationError blocks repetitive tool calls on the same file path", () => {
+test("buildLoopDetectionValidationError blocks repetitive writes on the same file path", () => {
   const readCall = {
     id: "call_read_1",
     function: {
@@ -130,7 +132,7 @@ test("buildLoopDetectionValidationError blocks repetitive tool calls on the same
   ];
 
   const callbacks = createMockCallbacks({ messages });
-  const tc = { id: "call_read_new", name: "read_file" };
+  const tc = { id: "call_write_new", name: "write_file" };
 
   const err = buildLoopDetectionValidationError(tc, { path: "src/App.tsx" }, callbacks);
   const ok = buildLoopDetectionValidationError(tc, { path: "src/Chart.tsx" }, callbacks);
@@ -139,6 +141,112 @@ test("buildLoopDetectionValidationError blocks repetitive tool calls on the same
   assert.equal(err.isError, true);
   assert.match(err.content, /LOOP_DETECTED/);
   assert.equal(ok, null);
+});
+
+test("buildLoopDetectionValidationError returns clear non-error guidance for repeated read_file", () => {
+  const debugEvents = [];
+  const doneEvents = [];
+  const readCall = (id) => ({
+    id,
+    function: {
+      name: "read_file",
+      arguments: JSON.stringify({ path: "src/App.tsx" }),
+    },
+  });
+  const messages = [
+    { role: "user", content: "modify App" },
+    { role: "assistant", tool_calls: [readCall("call_read_1")] },
+    { role: "tool", tool_call_id: "call_read_1", content: "ok" },
+    { role: "assistant", tool_calls: [readCall("call_read_2")] },
+    { role: "tool", tool_call_id: "call_read_2", content: "ok" },
+    { role: "assistant", tool_calls: [readCall("call_read_3")] },
+    { role: "tool", tool_call_id: "call_read_3", content: "ok" },
+    { role: "assistant", tool_calls: [readCall("call_read_4")] },
+    { role: "tool", tool_call_id: "call_read_4", content: "ok" },
+    { role: "assistant", tool_calls: [readCall("call_read_5")] },
+  ];
+
+  const callbacks = createMockCallbacks({
+    messages,
+    onToolDone: (...args) => doneEvents.push(args),
+    onDebugEvent: (event, data) => debugEvents.push({ event, data }),
+  });
+  const result = buildLoopDetectionValidationError(
+    { id: "call_read_new", name: "read_file" },
+    { path: "src/App.tsx" },
+    callbacks,
+  );
+
+  assert.ok(result);
+  assert.equal(result.isError, false);
+  assert.equal(result.lifecycleState, "completed");
+  assert.match(result.content, /READ_FILE_REPEAT_LIMIT/);
+  assert.equal(doneEvents.length, 1);
+  assert.equal(debugEvents[0].event, "agent.tool_preflight_blocked");
+  assert.equal(debugEvents[0].data.reason, "read_file_repeat_limit");
+});
+
+test("loop detection ignores repeated reads before the latest user message", () => {
+  const readCall = (id) => ({
+    id,
+    function: {
+      name: "read_file",
+      arguments: JSON.stringify({ path: "src/App.tsx" }),
+    },
+  });
+  const messages = [
+    { role: "user", content: "old turn" },
+    { role: "assistant", tool_calls: [readCall("old_1")] },
+    { role: "tool", tool_call_id: "old_1", content: "ok" },
+    { role: "assistant", tool_calls: [readCall("old_2"), readCall("old_3"), readCall("old_4")] },
+    { role: "tool", tool_call_id: "old_2", content: "ok" },
+    { role: "tool", tool_call_id: "old_3", content: "ok" },
+    { role: "tool", tool_call_id: "old_4", content: "ok" },
+    { role: "assistant", tool_calls: [readCall("old_5")] },
+    { role: "user", content: "继续执行" },
+  ];
+
+  const result = buildLoopDetectionValidationError(
+    { id: "call_read_new", name: "read_file" },
+    { path: "src/App.tsx" },
+    createMockCallbacks({ messages }),
+  );
+
+  assert.equal(result, null);
+});
+
+test("post-write verification read is allowed once after repeated same-file activity", () => {
+  const call = (id, name) => ({
+    id,
+    function: {
+      name,
+      arguments: JSON.stringify(name === "read_file"
+        ? { path: "src/App.tsx" }
+        : { path: "src/App.tsx", content: "new" }),
+    },
+  });
+  const messages = [
+    { role: "user", content: "edit App" },
+    { role: "assistant", tool_calls: [call("read_1", "read_file"), call("read_2", "read_file")] },
+    { role: "tool", tool_call_id: "read_1", content: "ok" },
+    { role: "tool", tool_call_id: "read_2", content: "ok" },
+    { role: "assistant", tool_calls: [call("write_1", "write_file")] },
+    { role: "tool", tool_call_id: "write_1", content: "success" },
+    { role: "assistant", tool_calls: [call("read_3", "read_file"), call("read_4", "read_file")] },
+    { role: "tool", tool_call_id: "read_3", content: "ok" },
+    { role: "tool", tool_call_id: "read_4", content: "ok" },
+    { role: "assistant", tool_calls: [call("write_2", "replace_in_file")] },
+    { role: "tool", tool_call_id: "write_2", content: "success" },
+    { role: "assistant", tool_calls: [call("verify_read", "read_file")] },
+  ];
+
+  const result = buildLoopDetectionValidationError(
+    { id: "verify_read", name: "read_file" },
+    { path: "src/App.tsx" },
+    createMockCallbacks({ messages }),
+  );
+
+  assert.equal(result, null);
 });
 
 test("buildReadBeforeModifyValidationError blocks write_file when file exists and is >8KB", async () => {
@@ -167,4 +275,3 @@ test("buildReadBeforeModifyValidationError blocks write_file when file exists an
   assert.ok(okSmall);
   assert.match(okSmall.content, /READ_BEFORE_MODIFY_BLOCKED/);
 });
-

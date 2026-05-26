@@ -602,6 +602,13 @@ test("continuation resumes an unfinished execute turn", () => {
   );
 });
 
+test("store marks aborted idle turns as resumable before deriving completed_with_changes", () => {
+  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/store/useAppStore.ts"), "utf8");
+
+  assert.match(source, /const statusOverride =\s*status === "idle" && abortCtrl\.signal\.aborted\s*\?\s*"stopped_no_action"/);
+  assert.match(source, /override: statusOverride/);
+});
+
 test("continuation does not hijack completed or missing turns", () => {
   assert.equal(
     shouldContinuePreviousTurnFromInput("继续", {

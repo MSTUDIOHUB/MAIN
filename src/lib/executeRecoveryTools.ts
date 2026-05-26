@@ -108,7 +108,7 @@ export function summarizeRepeatedExecuteTargets(
   for (const activity of recentActivity) {
     const target = String(activity.target || "").trim();
     if (!target) continue;
-    const cachedWeight = /FILE_UNCHANGED_STUB|Repeated read-only tool call skipped/i.test(activity.detail || "") ? 2 : 1;
+    const cachedWeight = /FILE_UNCHANGED_STUB|Repeated read-only tool call skipped|READ_FILE_REPEAT_LIMIT/i.test(activity.detail || "") ? 2 : 1;
     counts.set(target, (counts.get(target) || 0) + cachedWeight);
   }
   return [...counts.entries()]
@@ -171,7 +171,7 @@ export function resolveReadOnlyNoProgressTrigger(input: {
 
   const visibleResults = input.results.filter((result) => !result.internalFeedback && !result.isError);
   const allSuccessfulReadsAreCached = visibleResults.length > 0 && visibleResults.every((result) =>
-    /FILE_UNCHANGED_STUB|Repeated read-only tool call skipped/i.test(String(result.displayContent || result.content || ""))
+    /FILE_UNCHANGED_STUB|Repeated read-only tool call skipped|READ_FILE_REPEAT_LIMIT/i.test(String(result.displayContent || result.content || ""))
   );
   const cachedReadLimit = input.minCachedReadOnlyActivities ?? 0;
   if (allSuccessfulReadsAreCached && readOnlyActivityCount >= cachedReadLimit) {

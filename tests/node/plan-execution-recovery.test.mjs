@@ -324,6 +324,30 @@ test("approved plan strategy switch continues the agent loop after recovery prom
   );
 });
 
+test("approved plan execution starts with the normal execute tool surface", () => {
+  const orchestratorSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator.ts"),
+    "utf8",
+  );
+
+  assert.match(
+    orchestratorSource,
+    /let\s+approvedPlanActionOnlyRecoveryActive\s*=\s*false;/,
+  );
+  assert.match(
+    orchestratorSource,
+    /callbacks\.onPlanStageChanged\("executing"\);\s*approvedPlanActionOnlyRecoveryActive\s*=\s*false;/,
+  );
+  assert.match(
+    orchestratorSource,
+    /const\s+continueApprovedPlanWithStrategySwitch[\s\S]*?approvedPlanActionOnlyRecoveryActive\s*=\s*true;/,
+  );
+  assert.doesNotMatch(
+    orchestratorSource,
+    /let\s+approvedPlanActionOnlyRecoveryActive\s*=\s*workflowMode\s*===\s*"plan"\s*&&\s*callbacks\.getIsPlanApproved\(\)/,
+  );
+});
+
 test("approved plan no-progress recovery keeps targeted reads without broad discovery", () => {
   const orchestratorSource = fsSync.readFileSync(
     path.join(workspaceRoot, "src/lib/orchestrator.ts"),
@@ -569,4 +593,34 @@ test("plan execution progress shows current action when first pending task is to
 
   assert.match(update.currentTask, /当前动作：/);
   assert.match(update.currentTask, /src\/App\.tsx/);
+});
+
+test("ChatArea renders live approved-plan progress snapshots in expanded turns", () => {
+  const chatAreaSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/components/ChatArea.tsx"),
+    "utf8",
+  );
+
+  assert.match(chatAreaSource, /formatPlanExecutionProgressSnapshot/);
+  assert.match(
+    chatAreaSource,
+    /block\.variant\s*===\s*"plan_execution_progress"[\s\S]*?<PlanExecutionSystemNotice/,
+  );
+  assert.match(chatAreaSource, /const\s+livePlanProgressBlock\s*=/);
+  assert.match(chatAreaSource, /planExecutionProgress:\s*turnProgressSnapshot/);
+  assert.match(chatAreaSource, /data-testid=\{block\.variant\}/);
+});
+
+test("approved-plan stream heartbeats update visible plan progress", () => {
+  const storeSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/store/useAppStore.ts"),
+    "utf8",
+  );
+
+  assert.match(storeSource, /const\s+emitPlanStreamHeartbeat\s*=/);
+  assert.match(storeSource, /streamStatus\s*!==\s*"chunk_progress"/);
+  assert.match(storeSource, /streamStatus\s*!==\s*"no_chunk_progress_warning"/);
+  assert.match(storeSource, /emitLocalPlanExecutionProgress\("running"/);
+  assert.match(storeSource, /ChatArea 会持续显示流式进度/);
+  assert.match(storeSource, /emitPlanStreamHeartbeat\(markerPatch\)/);
 });

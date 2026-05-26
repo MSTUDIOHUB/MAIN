@@ -68,7 +68,7 @@ function summarizeToolActivity(activity: PlanToolActivitySummary): string {
 }
 
 export function isCachedReadOnlyPlanActivity(activity: PlanToolActivitySummary): boolean {
-  return /FILE_UNCHANGED_STUB|Repeated read-only tool call skipped/i.test(activity.detail || "");
+  return /FILE_UNCHANGED_STUB|Repeated read-only tool call skipped|READ_FILE_REPEAT_LIMIT/i.test(activity.detail || "");
 }
 
 export function summarizeRepeatedPlanTargetsFromToolActivity(activity: PlanToolActivitySummary[], limit = 4): string[] {

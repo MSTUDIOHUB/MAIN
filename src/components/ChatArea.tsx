@@ -9,9 +9,7 @@ import MarkdownRenderer from "./MarkdownRenderer";
 import StreamingCursor from "./StreamingCursor";
 import TopIsland from "./TopIsland";
 import { resolveAutoScrollState } from "../lib/chatScroll";
-import { getDiffStats } from "../lib/diff";
 import { parseMessageContent } from "../lib/messageParser";
-import { hasPlanDraftPreview, hasStructuredPlanProposal } from "../lib/planProposal";
 import { sanitizeAIOutput, sanitizeAssistantDisplayContent, sanitizeVisibleAssistantText } from "../lib/sanitize";
 import {
   deriveThoughtDisplay,
@@ -20,7 +18,6 @@ import {
 import { deriveTurnProgressItems } from "../lib/turnProgress";
 import { useAppStore } from "../store/useAppStore";
 import {
-  collectChangeEntries,
   buildPlanTaskEvidenceAudit,
   deriveVisibleConversationTurnStatus,
   isGenericConversationTitle,
@@ -36,15 +33,12 @@ import {
   type ReplyOption,
 } from "../lib/workflowModels";
 import { getIntentPolicy, resolveConversationTurnIntent } from "../lib/runIntent";
-import { summarizePlanExecutionProgressSnapshot } from "../lib/planExecutionRecovery";
+import { formatPlanExecutionProgressSnapshot, summarizePlanExecutionProgressSnapshot } from "../lib/planExecutionRecovery";
 import {
-  buildChatRenderSegments,
   countCompletedToolCalls,
   type ChatOperationCluster,
 } from "../lib/toolUiGrouping";
-import { isThinModelToolNarration, isSubstantiveModelFeedback } from "../lib/modelFeedbackDedupe";
-import { isConversationalFirstPersonNarration, deriveDynamicFirstPersonText, isIdleCapsuleNarration } from "../lib/capsuleStagingHelper";
-import { compactToolPresentationTarget, getToolPresentationLabel } from "../lib/toolPresentation";
+import { deriveDynamicFirstPersonText, isConversationalFirstPersonNarration } from "../lib/capsuleStagingHelper";
 import { buildLiveTurnProcessTimelineModel, buildTurnProcessArchiveModel, type TurnArchiveStep } from "../lib/turnProcessArchive";
 import {
   buildRuntimeProgressLedger,
@@ -55,6 +49,39 @@ import {
 import { getChatFeedbackStatusCopy, normalizeChatFeedbackStatus } from "../lib/chatFeedback";
 import { appendDebugLog } from "../lib/debugLog";
 import type { UserContextItem } from "../lib/userContextItems";
+import {
+  AGENT_CONTENT_PREVIEW_CHARS,
+  STREAMING_AGENT_CONTENT_PREVIEW_CHARS,
+  formatTokenCount,
+  getDisplayAgentContent,
+  normalizeCapsuleExplanationText,
+  normalizeCapsuleProgressText,
+  normalizeTranscriptDedupeText,
+} from "../lib/chat/chatContentPreview";
+import {
+  getAgentVisibleMarkdownText,
+  getLastAgentSummaryText,
+  hasGeneratedPlanContent,
+  hasRenderableAgentBlock,
+  isTransparentToolNarrationBlock,
+  shouldSuppressAgentAsExplanation,
+  shouldSuppressAgentToolEcho,
+} from "../lib/chat/chatBlockVisibility";
+import {
+  buildBlockRenderItems,
+  buildReadContextEntries,
+  collectTurnChangeEntries,
+} from "../lib/chat/chatRenderItems";
+import {
+  TOOL_SUMMARY_GROUPS,
+  buildToolExecutionSummary,
+  compactToolTarget,
+  fullToolTarget,
+  getCompletedToolGroupToolLabel,
+  getOperationClusterTone,
+  isCommandLikeToolName,
+  shouldGroupPlanExecutionTools,
+} from "../lib/chat/chatToolSummary";
 
 const TURN_STATUS_LABELS: Record<string, string> = {
   planning: "Planning",
@@ -68,9 +95,6 @@ const TURN_STATUS_LABELS: Record<string, string> = {
   done: "Done",
   error: "Error",
 };
-
-const AGENT_CONTENT_PREVIEW_CHARS = 60_000;
-const STREAMING_AGENT_CONTENT_PREVIEW_CHARS = 16_000;
 
 function resolveTurnProcessFontSize(chatFontSize: number): number {
   const size = Number(chatFontSize) || 13;
@@ -224,29 +248,6 @@ function UserImagePreviewModal({
   );
 }
 
-function getDisplayAgentContent(content: string, showFull: boolean, previewChars = AGENT_CONTENT_PREVIEW_CHARS) {
-  const raw = String(content || "");
-  if (showFull || raw.length <= previewChars) {
-    return { content: raw, truncated: false, hiddenChars: 0 };
-  }
-
-  return {
-    content: raw.slice(0, previewChars),
-    truncated: true,
-    hiddenChars: raw.length - previewChars,
-  };
-}
-
-function getAgentPreviewContent(content: string) {
-  return getDisplayAgentContent(sanitizeAssistantDisplayContent(content), false).content;
-}
-
-function getAgentInspectableContent(content: string) {
-  const raw = String(content || "");
-  if (raw.length <= AGENT_CONTENT_PREVIEW_CHARS) return raw;
-  return `${raw.slice(0, AGENT_CONTENT_PREVIEW_CHARS)}\n\n${raw.slice(-20_000)}`;
-}
-
 function getTurnStatusTone(status: string): string {
   switch (status) {
     case "planning":
@@ -328,10 +329,6 @@ function TurnSummaryCard({
       </div>
     </div>
   );
-}
-
-function formatTokenCount(value: number | undefined) {
-  return Math.max(0, Math.round(Number(value) || 0)).toLocaleString();
 }
 
 function ContextCompressionNotice({ block, language }: { block: any; language: "zh" | "en" }) {
@@ -543,6 +540,7 @@ function ContextCompressionNotice({ block, language }: { block: any; language: "
 
 function PlanExecutionSystemNotice({ block, language }: { block: any; language: "zh" | "en" }) {
   const isCheckpoint = block.variant === "plan_execution_checkpoint";
+  const progress = block.planExecutionProgress || null;
   const progressPhase = String(block.planExecutionProgress?.phase || "");
   const isPaused = progressPhase === "paused" || /已暂停|paused/i.test(String(block.content || ""));
   const title = isCheckpoint
@@ -553,12 +551,42 @@ function PlanExecutionSystemNotice({ block, language }: { block: any; language: 
   const tone = isCheckpoint
     ? "theme-plan-surface theme-plan-text"
     : "theme-plan-surface theme-plan-text";
+  const details = progress
+    ? [
+        { label: language === "zh" ? "当前任务" : "Task", value: progress.currentTask },
+        { label: language === "zh" ? "当前动作" : "Action", value: progress.currentTool },
+        { label: language === "zh" ? "最新证据" : "Evidence", value: progress.latestEvidence },
+        { label: language === "zh" ? "下一步" : "Next", value: progress.nextStep },
+      ].filter((item) => String(item.value || "").trim())
+    : [];
+  const repeatedTargets = Array.isArray(progress?.repeatedTargets)
+    ? progress.repeatedTargets.filter(Boolean).slice(0, 4)
+    : [];
+  const recoveryReason = String(progress?.recoveryReason || "").trim();
 
   return (
     <div className="flex w-full justify-center">
       <div data-testid={block.variant} className={`max-w-[min(760px,92%)] rounded-lg border px-3 py-2 text-left ${tone}`}>
         <div className="text-[11px] font-medium uppercase tracking-[0.14em] text-[#a1a1aa]">{title}</div>
         <div className="mt-1 whitespace-pre-wrap break-words text-[12px] leading-5 text-[#e4e4e7]">{String(block.content || "")}</div>
+        {details.length > 0 && (
+          <div className="mt-2 space-y-1 border-t border-[rgba(161,161,170,0.16)] pt-2 text-[11px] leading-4 text-[#a1a1aa]">
+            {details.map((item) => (
+              <div key={item.label} className="grid grid-cols-[72px_minmax(0,1fr)] gap-2">
+                <span className="shrink-0 text-[#71717a]">{item.label}</span>
+                <span className="min-w-0 break-words text-[#d4d4d8]">{String(item.value || "")}</span>
+              </div>
+            ))}
+            {(repeatedTargets.length > 0 || recoveryReason) && (
+              <div className="grid grid-cols-[72px_minmax(0,1fr)] gap-2">
+                <span className="shrink-0 text-[#71717a]">{language === "zh" ? "恢复信息" : "Recovery"}</span>
+                <span className="min-w-0 break-words text-[#d4d4d8]">
+                  {[recoveryReason, repeatedTargets.length > 0 ? repeatedTargets.join(", ") : ""].filter(Boolean).join(" · ")}
+                </span>
+              </div>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -655,182 +683,6 @@ function ProgressBlock({
   );
 }
 
-function hasRenderableAgentContent(blocks: any[]) {
-  return blocks.some((block) => hasRenderableAgentBlock(block));
-}
-
-function hasRenderableAgentBlock(block: any) {
-  if (block.type !== "agent") return false;
-  if (Array.isArray(block.options) && block.options.length > 0) return true;
-  const segments = parseMessageContent(getAgentPreviewContent(block.content));
-  return segments.some((seg) => seg.type === "text" && sanitizeAIOutput(seg.content).length > 0);
-}
-
-function getLastAgentSummaryText(blocks: any[]) {
-  const agentBlock = [...blocks]
-    .reverse()
-    .find((block) => block.type === "agent" && !block.hiddenProcess && hasRenderableAgentBlock(block));
-  if (!agentBlock) return "";
-  const summaryText = parseMessageContent(getAgentPreviewContent(agentBlock.content))
-    .filter((seg) => seg.type === "text")
-    .map((seg) => sanitizeAIOutput(seg.content))
-    .filter(Boolean)
-    .join("\n\n")
-    .trim();
-
-  return summaryText.length > 700 ? `${summaryText.slice(0, 700).trim()}...` : summaryText;
-}
-
-function getAgentVisibleMarkdownText(block: any): string {
-  if (block?.type !== "agent") return "";
-  return parseMessageContent(getAgentPreviewContent(block.content))
-    .filter((seg) => seg.type === "text")
-    .map((seg) => sanitizeAIOutput(seg.content))
-    .filter(Boolean)
-    .join("\n\n")
-    .trim();
-}
-
-function normalizeCapsuleExplanationText(text: string): string {
-  const content = String(text || "").trim();
-  if (!content || isIdleCapsuleNarration(content)) return "";
-  return isConversationalFirstPersonNarration(content) ? content : "";
-}
-
-function normalizeCapsuleProgressText(text: string): string {
-  const content = String(text || "").trim();
-  if (!content || isIdleCapsuleNarration(content)) return "";
-  return content;
-}
-
-function normalizeTranscriptDedupeText(text: string): string {
-  return normalizeThoughtSummaryForCompare(
-    String(text || "")
-      .replace(/[`*_#[\]()]/g, " ")
-      .replace(/[。！？；，、,.!?;:：]/g, " ")
-  ).replace(/\s+/g, "");
-}
-
-function collectNearbyToolEchoText(blocks: any[], agentIndex: number): string {
-  const parts: string[] = [];
-  const collect = (start: number, step: number) => {
-    for (let idx = start; idx >= 0 && idx < blocks.length; idx += step) {
-      const block = blocks[idx];
-      if (!block || block.type === "thought" || block.type === "progress") continue;
-      if (block.type === "tool") {
-        parts.push(
-          String(block.observationSummary || ""),
-          String(block.intentSummary || ""),
-          String(block.why || ""),
-          String(block.message || ""),
-          compactToolTarget(block.target, String(block.toolName || ""), "zh"),
-          compactToolTarget(block.target, String(block.toolName || ""), "en"),
-          fullToolTarget(block.target, String(block.toolName || ""), "zh"),
-        );
-        continue;
-      }
-      break;
-    }
-  };
-  collect(agentIndex - 1, -1);
-  collect(agentIndex + 1, 1);
-  return parts.filter(Boolean).join("\n");
-}
-
-function extractPathishTokens(text: string): string[] {
-  const source = String(text || "");
-  const tokens = new Set<string>();
-  for (const match of source.matchAll(/[A-Za-z0-9_.@/-]+\.[A-Za-z0-9]{1,8}|[A-Za-z0-9_.@/-]*\/[A-Za-z0-9_.@/-]+/g)) {
-    const raw = String(match[0] || "").trim();
-    if (!raw || raw.length < 4) continue;
-    tokens.add(raw.toLowerCase());
-    const basename = raw.split(/[\\/]/).pop();
-    if (basename && basename.length >= 4) tokens.add(basename.toLowerCase());
-  }
-  return [...tokens];
-}
-
-function isThinToolNarration(text: string): boolean {
-  return isThinModelToolNarration(text);
-}
-
-function shouldSuppressAgentToolEcho(blocks: any[], agentIndex: number): boolean {
-  const block = blocks[agentIndex];
-  if (!block || block.type !== "agent" || block.streaming || block.hiddenProcess) return false;
-  const text = getAgentVisibleMarkdownText(block);
-  if (!text || text.length > 700) return false;
-  const nearbyToolText = collectNearbyToolEchoText(blocks, agentIndex);
-  if (!nearbyToolText) return false;
-  const agentNormalized = normalizeTranscriptDedupeText(text);
-  const toolNormalized = normalizeTranscriptDedupeText(nearbyToolText);
-  if (!agentNormalized || !toolNormalized) return false;
-  if (agentNormalized.length >= 24 && toolNormalized.includes(agentNormalized)) return true;
-  if (toolNormalized.length >= 24 && agentNormalized.includes(toolNormalized)) return true;
-  if (!isThinToolNarration(text)) return false;
-  const agentTokens = extractPathishTokens(text);
-  if (agentTokens.length === 0) return false;
-  const toolTextLower = nearbyToolText.toLowerCase();
-  return agentTokens.some((token) => toolTextLower.includes(token));
-}
-
-function isTransparentToolNarrationBlock(block: any): boolean {
-  if (!block || block.type !== "agent" || block.hiddenProcess) return false;
-  const text = getAgentVisibleMarkdownText(block);
-  const normalized = String(text || "").replace(/\s+/g, "");
-  if (/完成|已读取|已搜索|已执行|readcomplete|searchcomplete|commandcomplete/i.test(normalized)) return false;
-  const futureToolNarration =
-    /^(?:我(?:会|将|先|现在|正在|继续)|让我|接下来|现在|继续|正在).{0,60}(?:读取|查看|搜索|调查|执行|运行|调用|验证|整理)/.test(normalized);
-  return futureToolNarration || isThinToolNarration(text);
-}
-
-function shouldSuppressAgentAsExplanation(block: any, index: number, blocks: any[], turnIntent: string): boolean {
-  if (!block || block.type !== "agent" || block.hiddenProcess) return false;
-  
-  const isToolIntent = turnIntent !== "respond" && turnIntent !== "discuss";
-  if (!isToolIntent) return false;
-
-  const text = getAgentVisibleMarkdownText(block);
-  const content = String(text || "").trim();
-  if (!content) return true;
-
-  // 1. Followed by a tool block in the turn
-  const followedByTool = blocks.slice(index + 1).some(b => b.type === "tool");
-  if (followedByTool) return true;
-
-  // 2. First agent block in a tool-intent turn
-  const agentBlocks = blocks.filter(b => b.type === "agent");
-  const isFirstAgentBlock = agentBlocks.indexOf(block) === 0;
-  if (isFirstAgentBlock) return true;
-
-  // 3. Thin narration
-  if (isThinModelToolNarration(content) || isThinToolNarration(text)) return true;
-
-  // 4. Streaming and not substantive feedback (planning/intent explanation)
-  if (block.streaming) {
-    const isSubstantive = isSubstantiveModelFeedback(content);
-    if (!isSubstantive) {
-      return true;
-    }
-  }
-
-  // 5. Check if isTransparentToolNarrationBlock matches it
-  if (isTransparentToolNarrationBlock(block)) return true;
-
-  return false;
-}
-
-function hasGeneratedPlanContent(blocks: any[]) {
-  return blocks.some((block) => {
-    if (block.type === "tool") {
-      return /\.main\/plans\//i.test(String(block.target || ""));
-    }
-
-    if (block.type !== "agent") return false;
-    const raw = getAgentInspectableContent(block.content);
-    return hasStructuredPlanProposal(raw) || hasPlanDraftPreview(raw);
-  });
-}
-
 function PlanShortcutCard({
   turn,
   hasPlanContent,
@@ -889,210 +741,12 @@ function PlanShortcutCard({
   );
 }
 
-function collectTurnChangeEntries(blocks: any[]) {
-  return collectChangeEntries(blocks, getDiffStats);
-}
-
-const TOOL_SUMMARY_GROUPS = {
-  read: new Set(["get_project_skeleton", "get_file_outline", "read_file", "read_document", "list_directory", "glob_search", "grep_search", "repo_map_status", "repo_map_search", "repo_map_context", "repo_map_files", "repo_map_impact", "index_workspace_documents"]),
-  table: new Set(["analyze_tabular_document", "query_tabular_document"]),
-  edit: new Set(["replace_in_file", "write_file", "apply_patch"]),
-  command: new Set(["execute_command", "send_pty_input", "run_command", "browser_evaluate", "read_pty_buffer", "read_pty_tail", "read_pty_since", "get_pty_status", "clear_pty_buffer"]),
-};
-
-const READ_CONTEXT_TOOL_NAMES = new Set([
-  "get_project_skeleton",
-  "get_file_outline",
-  "read_file",
-  "read_document",
-  "list_directory",
-  "glob_search",
-  "grep_search",
-  "repo_map_status",
-  "repo_map_search",
-  "repo_map_context",
-  "repo_map_files",
-  "repo_map_impact",
-  "index_workspace_documents",
-]);
-
-const READ_CONTEXT_TOOL_LABELS: Record<string, { zh: string; en: string }> = {
-  get_project_skeleton: { zh: "扫描项目", en: "Scan project" },
-  get_file_outline: { zh: "读取结构", en: "Read outline" },
-  read_file: { zh: "读取文件", en: "Read file" },
-  read_document: { zh: "读取文档", en: "Read document" },
-  list_directory: { zh: "扫描目录", en: "Scan directory" },
-  glob_search: { zh: "搜索文件", en: "Search files" },
-  grep_search: { zh: "搜索内容", en: "Search content" },
-  repo_map_status: { zh: "检查代码图谱", en: "Check repo map" },
-  repo_map_search: { zh: "搜索代码图谱", en: "Search repo map" },
-  repo_map_context: { zh: "读取代码图谱", en: "Read repo map" },
-  repo_map_files: { zh: "查看代码图谱文件", en: "Inspect repo-map files" },
-  repo_map_impact: { zh: "分析影响范围", en: "Analyze impact" },
-  index_workspace_documents: { zh: "索引文档", en: "Index documents" },
-};
-
-const COMPLETED_TOOL_GROUP_LABELS: Record<string, { zh: string; en: string }> = {
-  find_gameobjects: { zh: "查找对象", en: "Find objects" },
-  find_in_file: { zh: "文件搜索", en: "Search file" },
-  execute_code: { zh: "执行代码", en: "Execute code" },
-  script_apply_edits: { zh: "脚本编辑", en: "Script edits" },
-  manage_camera: { zh: "相机管理", en: "Manage camera" },
-  manage_gameobject: { zh: "对象管理", en: "Manage object" },
-  manage_components: { zh: "组件管理", en: "Manage components" },
-  manage_scene: { zh: "场景管理", en: "Manage scene" },
-  refresh_unity: { zh: "刷新 Unity", en: "Refresh Unity" },
-};
-
-function isCommandLikeToolName(toolName: string) {
-  return TOOL_SUMMARY_GROUPS.command.has(toolName);
-}
-
-function isCompletedReadContextTool(block: any) {
-  return (
-    block?.type === "tool" &&
-    block.toolStatus === "executed" &&
-    !block.diff &&
-    READ_CONTEXT_TOOL_NAMES.has(String(block.toolName || ""))
-  );
-}
-
-function isReadContextHardBoundary(block: any) {
-  if (!block) return false;
-  if (block.type === "user" || block.type === "jobList") return true;
-  if (block.type === "progress") return true;
-  if (block.type === "agent") {
-    if (block.hiddenProcess && !block.streaming) return false;
-    if (isTransparentToolNarrationBlock(block)) return false;
-    return hasRenderableAgentBlock(block);
-  }
-  if (block.type === "tool") {
-    if (block.toolStatus !== "pending") return !isCompletedReadContextTool(block);
-    return block.toolName !== "write_file" && block.toolName !== "replace_in_file" && block.toolName !== "apply_patch";
-  }
-  return false;
-}
-
-function compactToolTarget(rawTarget: string, toolName: string, language: "zh" | "en") {
-  return compactToolPresentationTarget(rawTarget, toolName, language);
-}
-
-function fullToolTarget(rawTarget: string, toolName: string, language: "zh" | "en") {
-  const target = String(rawTarget || "").trim();
-  if (target) return target;
-  if (toolName === "get_project_skeleton") return language === "zh" ? "项目骨架" : "Project skeleton";
-  return language === "zh" ? "当前工作区" : "Current workspace";
-}
-
-function getReadContextToolLabel(toolName: string, language: "zh" | "en") {
-  const labels = READ_CONTEXT_TOOL_LABELS[toolName];
-  if (labels) return labels[language === "zh" ? "zh" : "en"];
-  return getToolPresentationLabel(toolName, language);
-}
-
 function isFinishedTurnStatus(status: string) {
   return status === "done" || status === "completed_with_changes";
 }
 
 function getLatestThoughtBlock(blocks: any[]) {
   return [...blocks].reverse().find((block) => block?.type === "thought" && String(block.content || "").trim());
-}
-
-function buildBlockRenderItems(
-  blocks: any[],
-  includeUser = true,
-  enableCompletedToolGrouping: boolean | {
-    enabled?: boolean;
-    includeDiff?: boolean;
-    includeReadContextTools?: boolean;
-    minGroupSize?: number;
-    splitProjectStructureExplore?: boolean;
-  } = false,
-  language: "zh" | "en" = "zh",
-) {
-  const completedToolGroupingConfig =
-    typeof enableCompletedToolGrouping === "object"
-      ? enableCompletedToolGrouping
-      : { enabled: enableCompletedToolGrouping };
-  return buildChatRenderSegments({
-    blocks,
-    includeUser,
-    language,
-    completedToolGrouping: completedToolGroupingConfig,
-  });
-}
-
-function buildToolExecutionSummary(blocks: any[], language: "zh" | "en") {
-  const counts = { read: 0, table: 0, edit: 0, command: 0, failed: 0, other: 0 };
-
-  blocks.forEach((block) => {
-    if (block.type !== "tool") return;
-    if (block.toolStatus === "failed") {
-      counts.failed += 1;
-      return;
-    }
-    if (block.toolStatus !== "executed" && block.toolStatus !== "running") return;
-    const toolName = String(block.toolName || "");
-    if (TOOL_SUMMARY_GROUPS.read.has(toolName)) counts.read += 1;
-    else if (TOOL_SUMMARY_GROUPS.table.has(toolName)) counts.table += 1;
-    else if (TOOL_SUMMARY_GROUPS.edit.has(toolName)) counts.edit += 1;
-    else if (TOOL_SUMMARY_GROUPS.command.has(toolName)) counts.command += 1;
-    else counts.other += 1;
-  });
-
-  const parts: string[] = [];
-  if (language === "zh") {
-    if (counts.table) parts.push(`分析/查询 ${counts.table} 次表格`);
-    if (counts.read) parts.push(`读取/搜索 ${counts.read} 次资料`);
-    if (counts.edit) parts.push(`修改 ${counts.edit} 次文件`);
-    if (counts.command) parts.push(`执行 ${counts.command} 次命令`);
-    if (counts.other) parts.push(`调用 ${counts.other} 次工具`);
-    if (counts.failed) parts.push(`${counts.failed} 次请求失败`);
-    return parts.length > 0 ? `本轮已${parts.join("，")}。` : "本轮过程已折叠，结论会优先保留在这里。";
-  }
-
-  if (counts.table) parts.push(`${counts.table} table operation(s)`);
-  if (counts.read) parts.push(`${counts.read} read/search operation(s)`);
-  if (counts.edit) parts.push(`${counts.edit} file edit(s)`);
-  if (counts.command) parts.push(`${counts.command} command operation(s)`);
-  if (counts.other) parts.push(`${counts.other} tool call(s)`);
-  if (counts.failed) parts.push(`${counts.failed} failed request(s)`);
-  return parts.length > 0 ? `This turn completed ${parts.join(", ")}.` : "This turn is collapsed. The conclusion is kept here first.";
-}
-
-function shouldGroupPlanExecutionTools(input: {
-  turnIntent: string;
-  isPlanTurn: boolean;
-  isPlanApproved: boolean;
-  planStage: string;
-  turnStatus?: string;
-  isPlanExecutionVisible: boolean;
-}) {
-  if (input.turnIntent === "studio_workflow") {
-    return {
-      enabled: true,
-      includeDiff: false,
-      includeReadContextTools: false,
-      minGroupSize: 2,
-    };
-  }
-  const isApprovedPlanExecution =
-    input.isPlanTurn &&
-    (
-      input.isPlanApproved ||
-      input.planStage === "executing" ||
-      input.isPlanExecutionVisible ||
-      input.turnStatus === "executing" ||
-      input.turnStatus === "stopped_no_action" ||
-      input.turnStatus === "error"
-    );
-  return {
-    enabled: input.turnIntent === "execute" || isApprovedPlanExecution,
-    includeDiff: input.turnIntent === "execute" || isApprovedPlanExecution,
-    includeReadContextTools: isApprovedPlanExecution,
-    minGroupSize: input.turnIntent === "execute" || isApprovedPlanExecution ? 1 : 2,
-    splitProjectStructureExplore: input.isPlanTurn && !input.isPlanApproved,
-  };
 }
 
 function getActiveTurnActivity(blocks: any[], turnStatus: string, language: "zh" | "en") {
@@ -1613,68 +1267,6 @@ function ReadContextGroupCard({
   );
 }
 
-function getCompletedToolGroupToolLabel(toolName: string, language: "zh" | "en") {
-  const labels = COMPLETED_TOOL_GROUP_LABELS[toolName];
-  if (labels) return labels[language === "zh" ? "zh" : "en"];
-  return getToolPresentationLabel(toolName, language);
-}
-
-function isCachedReadContextBlock(block: any) {
-  const text = [
-    block?.message,
-    block?.observationSummary,
-    block?.evidence,
-    block?.resultPreview,
-    block?.content,
-  ].map((value) => String(value || "")).join("\n");
-  return /FILE_UNCHANGED_STUB|Repeated read-only tool call skipped/i.test(text);
-}
-
-function buildReadContextEntries(blocks: any[], language: "zh" | "en") {
-  const entries: Array<{
-    key: string;
-    block: any;
-    blocks: any[];
-    count: number;
-    cachedCount: number;
-    label: string;
-    displayTarget: string;
-    target: string;
-    summary: string;
-  }> = [];
-  const byKey = new Map<string, (typeof entries)[number]>();
-  for (const block of blocks) {
-    const toolName = String(block.toolName || "");
-    const displayTarget = compactToolTarget(block.target, toolName, language);
-    const target = fullToolTarget(block.target, toolName, language);
-    const key = `${toolName}:${String(target || displayTarget).replace(/\\/g, "/").toLowerCase()}`;
-    const cached = isCachedReadContextBlock(block) ? 1 : 0;
-    const summary = String(block.observationSummary || block.intentSummary || block.why || "").trim();
-    const existing = byKey.get(key);
-    if (existing) {
-      existing.blocks.push(block);
-      existing.count += 1;
-      existing.cachedCount += cached;
-      if (summary && !existing.summary) existing.summary = summary;
-      continue;
-    }
-    const entry = {
-      key,
-      block,
-      blocks: [block],
-      count: 1,
-      cachedCount: cached,
-      label: getReadContextToolLabel(toolName, language),
-      displayTarget,
-      target,
-      summary,
-    };
-    byKey.set(key, entry);
-    entries.push(entry);
-  }
-  return entries;
-}
-
 function CompletedToolGroupCard({
   blocks,
   language,
@@ -1797,13 +1389,6 @@ function CompletedToolGroupCard({
       )}
     </div>
   );
-}
-
-function getOperationClusterTone(kind: ChatOperationCluster["kind"]) {
-  if (kind === "edit") return "text-[#93c5fd]";
-  if (kind === "command" || kind === "verify") return "text-[#c4b5fd]";
-  if (kind === "explore") return "text-[#fbbf24]";
-  return "text-[#34d399]";
 }
 
 function ChatOperationClusterBlock({
@@ -3193,7 +2778,7 @@ export default function ChatArea({
         return <ContextCompressionNotice key={`${block.id}-${index}`} block={block} language={language} />;
       }
       if (block.variant === "plan_execution_progress") {
-        return null;
+        return <PlanExecutionSystemNotice key={`${block.id}-${index}`} block={block} language={language} />;
       }
       if (block.variant === "plan_execution_checkpoint") {
         return <PlanExecutionSystemNotice key={`${block.id}-${index}`} block={block} language={language} />;
@@ -3444,6 +3029,22 @@ export default function ChatArea({
     const planProgressSummary = turnProgressSnapshot
       ? summarizePlanExecutionProgressSnapshot(turnProgressSnapshot, language)
       : "";
+    const planProgressBody = turnProgressSnapshot
+      ? formatPlanExecutionProgressSnapshot(turnProgressSnapshot, language)
+      : "";
+    const hasInlinePlanProgressBlock = blocks.some(
+      (block) => block.type === "system" && block.variant === "plan_execution_progress",
+    );
+    const livePlanProgressBlock =
+      isTurnExpanded && isPlanExecutionVisible && turnProgressSnapshot && planProgressBody && !hasInlinePlanProgressBlock
+        ? {
+            id: `${turn.id}-live-plan-progress`,
+            type: "system",
+            variant: "plan_execution_progress",
+            content: planProgressBody,
+            planExecutionProgress: turnProgressSnapshot,
+          }
+        : null;
     const toolExecutionSummary = buildToolExecutionSummary(blocks, language);
     const effectiveProgressLedger = buildRuntimeProgressLedger({
       blocks,
@@ -3699,6 +3300,13 @@ export default function ChatArea({
 
         <div className={`${isTurnExpanded ? "mt-4 " : ""}space-y-4`}>
           {isTurnExpanded && userBlock ? renderBlock(userBlock, 0) : null}
+          {livePlanProgressBlock ? (
+            <PlanExecutionSystemNotice
+              key={`${turn.id}-live-plan-progress`}
+              block={livePlanProgressBlock}
+              language={language}
+            />
+          ) : null}
           {isTurnExpanded && shouldShowTurnChanges && !shouldArchiveCompletedProcess && (
             <TurnChangesCard
               entries={turnChangeEntries}

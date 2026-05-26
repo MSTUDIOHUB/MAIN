@@ -8780,6 +8780,71 @@ export const useAppStore = create<AppState>()(
           ...overrides,
         });
       };
+      const emitPlanStreamHeartbeat = (patch: Partial<HarnessRunMarker> & Record<string, unknown>) => {
+        const streamStatus = typeof patch.streamStatus === "string" ? patch.streamStatus : "";
+        if (
+          streamStatus !== "stream_started" &&
+          streamStatus !== "first_chunk" &&
+          streamStatus !== "chunk_progress" &&
+          streamStatus !== "no_chunk_progress_warning"
+        ) {
+          return;
+        }
+        const latest = sessionGet();
+        if (effectiveRunIntent !== "plan" || !latest.isPlanApproved) return;
+
+        const language = latest.preferredResponseLanguage || latest.config.language;
+        const zh = language !== "en";
+        const marker = harnessRunMarker;
+        const previous = latest.planExecutionProgressSnapshot;
+        const elapsedSeconds =
+          typeof marker.streamElapsedMs === "number" && Number.isFinite(marker.streamElapsedMs)
+            ? Math.max(0, Math.round(marker.streamElapsedMs / 1000))
+            : null;
+        const chunks = Math.max(0, Number(marker.streamChunkCount) || 0);
+        const target = marker.latestToolTarget || marker.latestTool || "";
+        const statusText = zh
+          ? streamStatus === "stream_started"
+            ? "等待模型输出"
+            : streamStatus === "first_chunk"
+            ? "模型已开始输出"
+            : streamStatus === "chunk_progress"
+            ? "模型生成中"
+            : "模型输出等待较久"
+          : streamStatus === "stream_started"
+          ? "Waiting for model output"
+          : streamStatus === "first_chunk"
+          ? "Model output started"
+          : streamStatus === "chunk_progress"
+          ? "Model generating"
+          : "Model output is delayed";
+        const currentTool = [
+          statusText,
+          chunks > 0 ? (zh ? `chunks ${chunks}` : `${chunks} chunks`) : "",
+          elapsedSeconds != null ? (zh ? `${elapsedSeconds}s` : `${elapsedSeconds}s elapsed`) : "",
+          target ? target : "",
+        ].filter(Boolean).join(" · ");
+
+        emitLocalPlanExecutionProgress("running", {
+          iteration: marker.iteration || previous?.iteration || 0,
+          maxIterations: marker.maxIterations || previous?.maxIterations || PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS,
+          currentTask: previous?.currentTask,
+          currentTool,
+          latestEvidence: previous?.latestEvidence,
+          nextStep: streamStatus === "no_chunk_progress_warning"
+            ? zh
+              ? "模型仍在流式生成但间隔偏长；可继续等待，或停止后查看日志与恢复点"
+              : "model is still streaming with a long gap; keep waiting or stop and inspect logs/recovery details"
+            : zh
+            ? "模型仍在生成；ChatArea 会持续显示流式进度"
+            : "model is still generating; ChatArea will keep showing stream progress",
+          progressSignature: previous?.progressSignature,
+          repeatedTargets: previous?.repeatedTargets,
+          recoveryReason: streamStatus === "no_chunk_progress_warning"
+            ? "stream_no_chunk_progress"
+            : previous?.recoveryReason,
+        });
+      };
       let approvedPlanHandoff:
         | {
             prompt: string;
@@ -8971,7 +9036,21 @@ export const useAppStore = create<AppState>()(
           });
         },
         onHarnessRunUpdate: (patch) => {
-          updateHarnessRunMarker(patch as Partial<HarnessRunMarker> & Record<string, unknown>);
+          const markerPatch = patch as Partial<HarnessRunMarker> & Record<string, unknown>;
+          updateHarnessRunMarker(markerPatch);
+          emitPlanStreamHeartbeat(markerPatch);
+        },
+        onDebugEvent: (event, data = {}) => {
+          try {
+            appendDebugLog("info", event, {
+              turnId,
+              sessionKey: runSessionKey,
+              workspace: runWorkspace || null,
+              ...data,
+            });
+          } catch {
+            // Diagnostics must never affect user workflows.
+          }
         },
 
         onStreamToken: (token, _msgId) => {
@@ -9822,6 +9901,15 @@ export const useAppStore = create<AppState>()(
 
         onToolError: (toolName, target, error, meta?: ToolLifecycleMeta) => {
           const language = sessionGet().config.language === "en" ? "en" : "zh";
+          logStoreEvent("tool_error", {
+            turnId,
+            toolName,
+            target: target || null,
+            toolCallId: meta?.toolCallId ? String(meta.toolCallId) : null,
+            error: compactProgressContextText(error, 500),
+            qualityGateReason: meta?.qualityGateReason || null,
+            planRecoveryReason: meta?.planRecoveryReason || null,
+          });
           let failedProgressForEvent = null as ProgressNarration | null;
           sessionSet((s) => {
             const idx = findToolLifecycleBlockIndex({
@@ -10034,6 +10122,10 @@ export const useAppStore = create<AppState>()(
               effectiveRunIntent === "plan" &&
               current.isPlanApproved &&
               current.planStage === "executing";
+            const statusOverride =
+              status === "idle" && abortCtrl.signal.aborted
+                ? "stopped_no_action"
+                : terminalTurnStatusOverride;
             const nextTurnStatus: ConversationTurnStatus =
               status === "error"
                 ? "error"
@@ -10048,7 +10140,7 @@ export const useAppStore = create<AppState>()(
                     planExecutionEvidenceCount: current.planExecutionEvidenceCount,
                     replyOptionCount: current.normalizedStreamState.replyOptions.length,
                     taskFlow: current.taskFlow,
-                    override: terminalTurnStatusOverride,
+                    override: statusOverride,
                   })
                 : status === "pending_review"
                 ? isApprovedPlanExecution ? "executing" : "awaiting_approval"

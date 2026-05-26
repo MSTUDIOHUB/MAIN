@@ -358,3 +358,13 @@ test("orchestrator wires execute convergence and max-iteration recovery before i
   assert.equal(callbackIndex > 0, true);
   assert.equal(idleIndex > callbackIndex, true);
 });
+
+test("orchestrator evidence reconcile logs failed tool summaries", () => {
+  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8");
+
+  assert.match(source, /failedEvidenceResults/);
+  assert.match(source, /firstFailureReason/);
+  assert.match(source, /firstFailureLifecycleState/);
+  assert.match(source, /firstFailureTool/);
+  assert.match(source, /firstFailureTarget/);
+});

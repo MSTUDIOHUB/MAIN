@@ -577,6 +577,29 @@ function isPlanArtifactPath(path: string): boolean {
   return path.replace(/\\/g, "/").toLowerCase().includes(".main/plans/");
 }
 
+function emitToolPreflightBlocked(
+  callbacks: OrchestratorCallbacks,
+  input: {
+    reason: string;
+    tool: string;
+    target: string;
+    message: string;
+    toolCallId?: string;
+    lifecycleState?: ToolLifecycleState;
+  },
+): void {
+  const payload = {
+    reason: input.reason,
+    tool: input.tool,
+    target: input.target || null,
+    message: compactDiagnosticText(input.message),
+    toolCallId: input.toolCallId || null,
+    lifecycleState: input.lifecycleState || "blocked",
+  };
+  logAgentEvent("tool_preflight_blocked", payload);
+  callbacks.onDebugEvent?.("agent.tool_preflight_blocked", payload);
+}
+
 function isProjectSourceWriteResult(result: ToolExecutionResult): boolean {
   return (
     !result.isError &&
@@ -684,6 +707,14 @@ export async function buildReadBeforeModifyValidationError(
       ? `WRITE_FILE_GATE_BLOCKED: 文件 ${path} 已存在且体量较大 (大小: ${(metadata.sizeBytes / 1024).toFixed(1)}KB)。为节省关键上下文 Token 预算，禁止全量 write_file 重写现有大文件。你必须改用 replace_in_file 或 apply_patch 提交精确的局部 diff 修改。`
       : `WRITE_FILE_GATE_BLOCKED: The file ${path} already exists and is large (${(metadata.sizeBytes / 1024).toFixed(1)}KB). To conserve context token budget, full-text write_file is blocked for large existing files. You MUST use replace_in_file or apply_patch to supply a precise diff.`;
     callbacks.onToolExecuting(tc.name, target, undefined, { toolCallId: tc.id });
+    emitToolPreflightBlocked(callbacks, {
+      reason: "write_file_gate_blocked",
+      tool: tc.name,
+      target,
+      message,
+      toolCallId: tc.id,
+      lifecycleState: "blocked",
+    });
     callbacks.onToolError(tc.name, target, message, { toolCallId: tc.id });
     return {
       toolCallId: tc.id,
@@ -707,6 +738,14 @@ export async function buildReadBeforeModifyValidationError(
     ? `READ_BEFORE_MODIFY_BLOCKED: Read ${path} before modifying it. Call read_file or get_file_outline first, then retry the write.`
     : `READ_BEFORE_MODIFY_BLOCKED: Inspect the target directory or project structure before creating ${path}. Call get_project_skeleton or list_directory first, then retry the write.`;
   callbacks.onToolExecuting(tc.name, target, undefined, { toolCallId: tc.id });
+  emitToolPreflightBlocked(callbacks, {
+    reason: "read_before_modify_blocked",
+    tool: tc.name,
+    target,
+    message,
+    toolCallId: tc.id,
+    lifecycleState: "blocked",
+  });
   callbacks.onToolError(tc.name, target, message, { toolCallId: tc.id });
   return {
     toolCallId: tc.id,
@@ -738,6 +777,14 @@ export function buildShellReadValidationError(
       : `SHELL_READ_FORBIDDEN: Reading files via terminal commands (${command}) is disabled to prevent context overload. Please use the built-in read_file tool with start_line / max_lines for paged reading.`;
     const target = getToolTarget(tc.name, args);
     callbacks.onToolExecuting(tc.name, target, undefined, { toolCallId: tc.id });
+    emitToolPreflightBlocked(callbacks, {
+      reason: "shell_read_forbidden",
+      tool: tc.name,
+      target,
+      message,
+      toolCallId: tc.id,
+      lifecycleState: "blocked",
+    });
     callbacks.onToolError(tc.name, target, message, { toolCallId: tc.id });
     return {
       toolCallId: tc.id,
@@ -765,19 +812,44 @@ export function buildLoopDetectionValidationError(
   if (!path) return null;
 
   const messages = callbacks.getMessages();
-  let repetitions = 0;
-
+  const currentTurnMessages: AgentMessage[] = [];
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i];
+    if (msg.role === "user") break;
+    currentTurnMessages.unshift(msg);
+  }
+
+  const successfulToolResultsByCallId = new Map<string, boolean>();
+  for (const msg of currentTurnMessages) {
+    if (msg.role !== "tool") continue;
+    const toolCallId = typeof (msg as { tool_call_id?: unknown }).tool_call_id === "string"
+      ? String((msg as { tool_call_id?: unknown }).tool_call_id)
+      : "";
+    if (!toolCallId) continue;
+    const content = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content ?? "");
+    successfulToolResultsByCallId.set(
+      toolCallId,
+      !/^\s*Error:|"\s*status\s*"\s*:\s*"(?:failed|blocked|declined)"|"\s*isError\s*"\s*:\s*true|LOOP_DETECTED|REPEATED_FAILURE_BLOCKED/i.test(content),
+    );
+  }
+
+  const samePathCalls: Array<{ name: string; id?: string; order: number; successful: boolean }> = [];
+  currentTurnMessages.forEach((msg, order) => {
     if (msg.role === "assistant" && Array.isArray(msg.tool_calls)) {
       for (const call of msg.tool_calls) {
-        const c = call as { function?: { name?: string; arguments?: string } };
+        const c = call as { id?: string; function?: { name?: string; arguments?: string } };
         if (c.function?.name === "write_file" || c.function?.name === "replace_in_file" || c.function?.name === "read_file") {
+          if (c.id === tc.id) continue;
           try {
             const parsed = JSON.parse(c.function.arguments || "{}");
-            const parsedPath = (parsed.path || parsed.TargetFile || "").trim();
+            const parsedPath = String(parsed.path || parsed.TargetFile || "").trim();
             if (parsedPath === path) {
-              repetitions++;
+              samePathCalls.push({
+                name: c.function.name,
+                id: c.id,
+                order,
+                successful: c.id ? successfulToolResultsByCallId.get(c.id) !== false : true,
+              });
             }
           } catch {
             // Ignore malformed JSON
@@ -785,16 +857,65 @@ export function buildLoopDetectionValidationError(
         }
       }
     }
-    if (repetitions >= 6) break;
-  }
+  });
 
+  const repetitions = samePathCalls.length;
   if (repetitions >= 5) {
+    const target = getToolTarget(tc.name, args);
+    if (tc.name === "read_file") {
+      const successfulMutations = samePathCalls
+        .filter((call) => (call.name === "write_file" || call.name === "replace_in_file") && call.successful);
+      const latestSuccessfulMutation = successfulMutations[successfulMutations.length - 1];
+      const readsAfterLatestMutation = latestSuccessfulMutation
+        ? samePathCalls.filter((call) => call.name === "read_file" && call.order > latestSuccessfulMutation.order).length
+        : Number.POSITIVE_INFINITY;
+      if (latestSuccessfulMutation && readsAfterLatestMutation === 0) return null;
+
+      const language = callbacks.getPreferredLanguage();
+      const message = language === "zh"
+        ? [
+            `READ_FILE_REPEAT_LIMIT: ${path} 已在当前回合被重复读取/修改多次，本次 read_file 不再重新读取。`,
+            "read_file 仍可用；请复用已有缓存内容，或改用 start_line/end_line/max_lines 精确读取缺失窗口，或使用 grep_search/get_file_outline 定位后继续。",
+            "如果已有上下文不足以继续，请在正文中说明缺失信息和阻塞点。",
+          ].join("\n")
+        : [
+            `READ_FILE_REPEAT_LIMIT: ${path} has already been read/edited repeatedly in this turn, so this read_file call was not re-run.`,
+            "read_file is still available; reuse cached content, narrow the next request with start_line/end_line/max_lines, or use grep_search/get_file_outline before continuing.",
+            "If the available context is insufficient, explain the missing information and blocker in prose.",
+          ].join("\n");
+      callbacks.onToolExecuting(tc.name, target, undefined, { toolCallId: tc.id });
+      emitToolPreflightBlocked(callbacks, {
+        reason: "read_file_repeat_limit",
+        tool: tc.name,
+        target,
+        message,
+        toolCallId: tc.id,
+        lifecycleState: "completed",
+      });
+      callbacks.onToolDone(tc.name, target, message, { toolCallId: tc.id });
+      return {
+        toolCallId: tc.id,
+        name: tc.name,
+        target,
+        content: message,
+        isError: false,
+        lifecycleState: "completed",
+      };
+    }
+
     const language = callbacks.getPreferredLanguage();
     const message = language === "zh"
       ? `LOOP_DETECTED: 检测到你在文件 ${path} 上执行了多次重复的读取/修改操作。为防止死循环，本次调用已拦截。请暂停并在正文中解释为什么之前的改动未能成功应用（如编译错误或环境问题），然后使用 <user_options> 请用户确认方向。`
       : `LOOP_DETECTED: Detected multiple repetitive read/write operations on ${path}. To prevent an infinite execution loop, this call has been blocked. Please pause and explain in prose why previous edits failed (e.g. build errors or environment issues), then use <user_options> to ask the user for guidance.`;
-    const target = getToolTarget(tc.name, args);
     callbacks.onToolExecuting(tc.name, target, undefined, { toolCallId: tc.id });
+    emitToolPreflightBlocked(callbacks, {
+      reason: "loop_detected",
+      tool: tc.name,
+      target,
+      message,
+      toolCallId: tc.id,
+      lifecycleState: "blocked",
+    });
     callbacks.onToolError(tc.name, target, message, { toolCallId: tc.id });
     return {
       toolCallId: tc.id,
@@ -957,6 +1078,7 @@ export interface OrchestratorCallbacks {
   shouldForceXmlForProviderCompatibility?: () => boolean;
   onProviderCompatibilityFallback?: (reason: string) => void;
   onProviderNativeToolSuccess?: () => void;
+  onDebugEvent?: (event: string, data?: Record<string, unknown>) => void;
 
   // UI updates
   onStreamToken: (token: string, messageId: string) => void;
@@ -2478,10 +2600,14 @@ function getToolResultDiagnosticText(result?: ToolExecutionResult): string {
   ].filter(Boolean).join("\n");
 }
 
+function isReadFileRepeatLimitResult(result: ToolExecutionResult): boolean {
+  return result.name === "read_file" && /^READ_FILE_REPEAT_LIMIT\b/i.test(result.content || "");
+}
+
 function targetProgressOutcomeForToolResult(result?: ToolExecutionResult): TargetProgressOutcome {
   if (!result) return "failed";
   const diagnostic = getToolResultDiagnosticText(result);
-  if (/FILE_UNCHANGED_STUB|empty_change|invalid_patch|identical_content|no changes|no-op|nothing to (?:change|patch|write)/i.test(diagnostic)) {
+  if (/FILE_UNCHANGED_STUB|READ_FILE_REPEAT_LIMIT|empty_change|invalid_patch|identical_content|no changes|no-op|nothing to (?:change|patch|write)/i.test(diagnostic)) {
     return "no_change";
   }
   if (/search_text_mismatch|MUTATION_PREFLIGHT_BLOCKED|patch.*(?:mismatch|failed to apply)|replacement text was not found/i.test(diagnostic)) {
@@ -2500,7 +2626,7 @@ function targetProgressReasonForToolResult(result?: ToolExecutionResult): string
   if (!diagnostic) return "missing_result";
   const reason =
     diagnostic.match(/\b(?:reason|error|status)\s*[:=]\s*([^.;\n]{1,100})/i)?.[1] ||
-    diagnostic.match(/\b(search_text_mismatch|empty_change|invalid_patch|identical_content|MUTATION_PREFLIGHT_BLOCKED|FILE_UNCHANGED_STUB)\b/i)?.[1] ||
+    diagnostic.match(/\b(search_text_mismatch|empty_change|invalid_patch|identical_content|MUTATION_PREFLIGHT_BLOCKED|FILE_UNCHANGED_STUB|READ_FILE_REPEAT_LIMIT)\b/i)?.[1] ||
     diagnostic.slice(0, 120);
   return reason.trim();
 }
@@ -2888,7 +3014,7 @@ function inferLifecycleStateFromToolResult(result: ToolExecutionResult): ToolLif
   if (result.lifecycleState) return result.lifecycleState;
   if (!result.isError) {
     if (/"noOp"\s*:\s*true/.test(result.content || "")) return "completed";
-    if (result.content.includes(FILE_UNCHANGED_STUB) || /Repeated read-only tool call skipped:/i.test(result.content)) {
+    if (result.content.includes(FILE_UNCHANGED_STUB) || /Repeated read-only tool call skipped:|READ_FILE_REPEAT_LIMIT/i.test(result.content)) {
       return "completed";
     }
     return "completed";
@@ -2911,7 +3037,7 @@ function buildToolResultHistoryContent(result: ToolExecutionResult): string {
   const isNoEffectMutation = /NO_EFFECT_MUTATION/i.test(result.content || "");
   const isCachedReuse =
     result.content.includes(FILE_UNCHANGED_STUB) ||
-    /Repeated read-only tool call skipped:/i.test(result.content);
+    /Repeated read-only tool call skipped:|READ_FILE_REPEAT_LIMIT/i.test(result.content);
   const status: ToolFeedbackStatus =
     lifecycleState === "declined"
       ? "declined"
@@ -4611,7 +4737,7 @@ export async function executeAgentLoop(
   let lastNoProgressBatchSignature = "";
   let noProgressBatchRepeatCount = 0;
   let approvedPlanNoProgressRecoveryAttempts = 0;
-  let approvedPlanActionOnlyRecoveryActive = workflowMode === "plan" && callbacks.getIsPlanApproved();
+  let approvedPlanActionOnlyRecoveryActive = false;
   let executeRecoveryMode: ExecuteRecoveryMode =
     workflowMode === "edit"
       ? normalizeExecuteRecoveryMode(callbacks.getForcedExecuteRecoveryMode?.())
@@ -4787,7 +4913,7 @@ export async function executeAgentLoop(
     }
 
     callbacks.onPlanStageChanged("executing");
-    approvedPlanActionOnlyRecoveryActive = true;
+    approvedPlanActionOnlyRecoveryActive = false;
     approvedPlanNoProgressRecoveryAttempts = 0;
     const continuationPrompt = buildApprovedPlanContinuationPrompt(callbacks);
     if (callbacks.onApprovedPlanHandoff) {
@@ -8520,6 +8646,14 @@ export async function executeAgentLoop(
         const message = callbacks.getPreferredLanguage() === "zh"
           ? `REPEATED_FAILURE_BLOCKED: ${tc.name}${target ? ` (${target})` : ""} 已用相同参数连续失败。请先诊断最近错误，改变参数或换一条策略，不要原样重试。`
           : `REPEATED_FAILURE_BLOCKED: ${tc.name}${target ? ` (${target})` : ""} has failed repeatedly with identical arguments. Diagnose the latest error and change arguments or strategy before retrying.`;
+        emitToolPreflightBlocked(callbacks, {
+          reason: "repeated_failure_blocked",
+          tool: tc.name,
+          target,
+          message,
+          toolCallId: tc.id,
+          lifecycleState: "blocked",
+        });
         callbacks.onToolError(tc.name, target, message, { toolCallId: tc.id });
         allResults.push({
           toolCallId: tc.id,
@@ -9042,16 +9176,17 @@ export async function executeAgentLoop(
       );
       const normalizedReadResults: ToolExecutionResult[] = [];
       for (const result of readResults) {
+        const readFileRepeatLimitResult = isReadFileRepeatLimitResult(result);
         const narrowedNote = readFileWindowNarrowedNotes.get(result.toolCallId);
         const resultForModel = narrowedNote && !result.isError
           ? {
               ...result,
               content: `${narrowedNote}\n\n${result.content}`,
               displayContent: result.displayContent || `${narrowedNote}\n\n${result.content}`,
-            }
+          }
           : result;
         const signature = readOnlyCallSignatures.get(result.toolCallId);
-        if (signature && !result.isError) {
+        if (signature && !result.isError && !readFileRepeatLimitResult) {
           readOnlyResultCache.set(signature, {
             name: result.name,
             target: result.target,
@@ -9060,7 +9195,7 @@ export async function executeAgentLoop(
           readOnlyDuplicateSkipCounts.delete(signature);
         }
         const fileReadSignature = readOnlyCallSignatures.get(`${result.toolCallId}:file_read`);
-        if (fileReadSignature && result.name === "read_file" && !result.isError) {
+        if (fileReadSignature && result.name === "read_file" && !result.isError && !readFileRepeatLimitResult) {
           const parsedCall = readOnlyCalls.find((call) => call.id === result.toolCallId);
           const args = parsedCall ? parseToolCallArguments(parsedCall, workspace) : {};
           const path = typeof args.path === "string" ? args.path : result.target;
@@ -9280,10 +9415,25 @@ export async function executeAgentLoop(
         setPlanRuntimePhase("grounding", "project structure unavailable; continue targeted grounding");
       }
     }
+    const failedEvidenceResults = allResults.filter((result) => !result.internalFeedback && result.isError);
+    const firstFailedEvidenceResult = failedEvidenceResults[0];
+    const firstFailedEvidenceLifecycleState = firstFailedEvidenceResult
+      ? inferLifecycleStateFromToolResult(firstFailedEvidenceResult)
+      : null;
     emitTaskOrchestratorPhase("EVIDENCE_RECONCILE", {
       iteration,
       results: allResults.length,
       successfulResults: allResults.filter((result) => !result.isError).length,
+      failedResults: failedEvidenceResults.length,
+      firstFailureReason: firstFailedEvidenceResult
+        ? compactDiagnosticText(targetProgressReasonForToolResult(firstFailedEvidenceResult))
+        : null,
+      firstFailureTool: firstFailedEvidenceResult?.name ?? null,
+      firstFailureTarget: firstFailedEvidenceResult?.target ?? null,
+      firstFailureLifecycleState: firstFailedEvidenceLifecycleState,
+      tool: firstFailedEvidenceResult?.name ?? null,
+      target: firstFailedEvidenceResult?.target ?? null,
+      lifecycleState: firstFailedEvidenceLifecycleState,
       evidenceKeys: [...taskTargetingEvidence].slice(-8),
     });
 
@@ -9679,7 +9829,7 @@ export async function executeAgentLoop(
           for (const activity of recentPlanToolActivity.slice(-8)) {
             const target = String(activity.target || "").trim();
             if (!target) continue;
-            const cachedWeight = /FILE_UNCHANGED_STUB|Repeated read-only tool call skipped/i.test(activity.detail || "") ? 2 : 1;
+            const cachedWeight = /FILE_UNCHANGED_STUB|Repeated read-only tool call skipped|READ_FILE_REPEAT_LIMIT/i.test(activity.detail || "") ? 2 : 1;
             counts.set(target, (counts.get(target) || 0) + cachedWeight);
           }
           return [...counts.entries()]

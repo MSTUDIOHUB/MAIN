@@ -82,6 +82,22 @@ const {
   resolveStreamingAssistantDisplay,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/streamDisplayPolicy.ts"));
 
+const {
+  getDisplayAgentContent,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/chat/chatContentPreview.ts"));
+
+const {
+  shouldSuppressAgentToolEcho,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/chat/chatBlockVisibility.ts"));
+
+const {
+  buildReadContextEntries,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/chat/chatRenderItems.ts"));
+
+const {
+  buildToolExecutionSummary,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/chat/chatToolSummary.ts"));
+
 test("markdown display strips unsafe html and normalizes math and alerts", () => {
   const normalized = normalizeMarkdownForDisplay([
     "第一行",
@@ -159,6 +175,71 @@ test("markdown display repairs bullet-prefixed GFM tables", () => {
   assert.match(normalized, /\n\|--------\|------\|------\|/);
   assert.doesNotMatch(normalized, /- \| 取舍点/);
   assert.match(normalized, /- 普通列表项保留为列表。/);
+});
+
+test("chat content preview returns bounded agent text with truncation metadata", () => {
+  const preview = getDisplayAgentContent("abcdef", false, 3);
+
+  assert.equal(preview.content, "abc");
+  assert.equal(preview.truncated, true);
+  assert.equal(preview.hiddenChars, 3);
+  assert.deepEqual(getDisplayAgentContent("abcdef", true, 3), {
+    content: "abcdef",
+    truncated: false,
+    hiddenChars: 0,
+  });
+});
+
+test("chat visibility suppresses thin agent echoes of nearby tool output", () => {
+  const blocks = [
+    {
+      type: "tool",
+      toolName: "read_file",
+      toolStatus: "executed",
+      target: "src/components/ChatArea.tsx",
+      observationSummary: "Read complete src/components/ChatArea.tsx for context.",
+    },
+    {
+      type: "agent",
+      content: "Read complete src/components/ChatArea.tsx for context.",
+    },
+  ];
+
+  assert.equal(shouldSuppressAgentToolEcho(blocks, 1), true);
+});
+
+test("chat render helpers dedupe read context entries and track cached reads", () => {
+  const entries = buildReadContextEntries([
+    {
+      type: "tool",
+      toolName: "read_file",
+      target: "src/App.tsx",
+      observationSummary: "Opened app file",
+    },
+    {
+      type: "tool",
+      toolName: "read_file",
+      target: "src/App.tsx",
+      observationSummary: "FILE_UNCHANGED_STUB",
+    },
+  ], "en");
+
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].count, 2);
+  assert.equal(entries[0].cachedCount, 1);
+  assert.equal(entries[0].label, "Read file");
+});
+
+test("chat tool summary keeps read edit and failure counts", () => {
+  const summary = buildToolExecutionSummary([
+    { type: "tool", toolName: "read_file", toolStatus: "executed" },
+    { type: "tool", toolName: "write_file", toolStatus: "running" },
+    { type: "tool", toolName: "grep_search", toolStatus: "failed" },
+  ], "zh");
+
+  assert.match(summary, /读取\/搜索 1 次资料/);
+  assert.match(summary, /修改 1 次文件/);
+  assert.match(summary, /1 次请求失败/);
 });
 
 test("sanitize output removes raw protocols and complete reasoning blocks", () => {
