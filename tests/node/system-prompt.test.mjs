@@ -557,3 +557,25 @@ test("system prompt prioritizes turn intake screenshots and attached context bef
   assert.match(prompt, /图片要先总结可见 UI\/文本\/状态\/异常/);
   assert.match(prompt, /项目结构探索只建立地图，不替代这些上下文观察/);
 });
+
+test("execute prompt enforces strict immediate tool execution constraints", () => {
+  const prompt = buildSystemPrompt(
+    [],
+    "/tmp/workspace",
+    "main_mode",
+    "",
+    [],
+    [],
+    "edit",
+    "zh",
+    null,
+    undefined,
+    "execute",
+  );
+
+  assert.match(prompt, /【必须立即行动，禁止在正文输出纯文字规划或步骤描述】/);
+  assert.match(prompt, /绝对禁止输出类似“我接下来的计划是：”/);
+  assert.match(prompt, /必须立刻发起真实工具调用/);
+  assert.match(prompt, /【绝对禁止只说不做】/);
+});
+

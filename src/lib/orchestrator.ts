@@ -2115,6 +2115,8 @@ const PLAN_NO_VISIBLE_TOKEN_TIMEOUT_MS = 125_000;
 interface FetchLLMStreamOptions {
   noVisibleTokenTimeoutMs?: number;
   noVisibleTokenTimeoutLabel?: string;
+  workflowMode?: string;
+  runtimeIntent?: string;
 }
 
 export function isStreamWatchdogTimeoutMessage(message: string): boolean {
@@ -2406,7 +2408,9 @@ async function fetchLLMStream(
       String(settings.baseUrl || "").toLowerCase().includes("ollama") ||
       String(settings.baseUrl || "").toLowerCase().includes(":11434");
     const skipReasoningDominatedEscalation = isReasoningDominatedLengthResult(result, isLocal);
-    if (result.finishReason === "length" && escalationCount < MAX_ESCALATIONS && !skipReasoningDominatedEscalation) {
+    const isChat = options.workflowMode === "chat" || options.runtimeIntent === "respond";
+    const allowEscalation = !(isChat && currentMaxTokens >= 4096);
+    if (result.finishReason === "length" && escalationCount < MAX_ESCALATIONS && !skipReasoningDominatedEscalation && allowEscalation) {
         const nextMaxTokens = escalateMaxTokens(currentMaxTokens, settings.contextLimit);
       if (nextMaxTokens !== null) {
         escalationCount++;
@@ -5722,7 +5726,11 @@ export async function executeAgentLoop(
         llmTools,
         currentMaxTokens,
         maxOutputEscalations,
-        streamWatchdogOptions,
+        {
+          ...streamWatchdogOptions,
+          workflowMode,
+          runtimeIntent,
+        },
       );
       if (llmTools.length > 0) {
         callbacks.onProviderNativeToolSuccess?.();
@@ -5849,7 +5857,11 @@ export async function executeAgentLoop(
             llmTools,
             aggressiveOutputBudget,
             1,
-            getPlanStreamWatchdogOptions(llmTools.length),
+            {
+              ...getPlanStreamWatchdogOptions(llmTools.length),
+              workflowMode,
+              runtimeIntent,
+            },
           );
           if (llmTools.length > 0) {
             callbacks.onProviderNativeToolSuccess?.();
@@ -5937,7 +5949,11 @@ export async function executeAgentLoop(
               llmTools,
               emergencyOutputBudget,
               0,
-              getPlanStreamWatchdogOptions(llmTools.length),
+              {
+                ...getPlanStreamWatchdogOptions(llmTools.length),
+                workflowMode,
+                runtimeIntent,
+              },
             );
             if (llmTools.length > 0) {
               callbacks.onProviderNativeToolSuccess?.();
@@ -6036,7 +6052,11 @@ export async function executeAgentLoop(
             llmTools,
             cloudReactiveOutputBudget,
             1,
-            getPlanStreamWatchdogOptions(llmTools.length),
+            {
+              ...getPlanStreamWatchdogOptions(llmTools.length),
+              workflowMode,
+              runtimeIntent,
+            },
           );
           if (llmTools.length > 0) {
             callbacks.onProviderNativeToolSuccess?.();
@@ -6103,7 +6123,11 @@ export async function executeAgentLoop(
             [],
             currentMaxTokens,
             maxOutputEscalations,
-            getPlanStreamWatchdogOptions(0),
+            {
+              ...getPlanStreamWatchdogOptions(0),
+              workflowMode,
+              runtimeIntent,
+            },
           );
         } catch (retryErr) {
           if ((retryErr as Error).name === "AbortError") {
@@ -6150,7 +6174,11 @@ export async function executeAgentLoop(
                 [],
                 currentMaxTokens,
                 maxOutputEscalations,
-                getPlanStreamWatchdogOptions(0),
+                {
+                  ...getPlanStreamWatchdogOptions(0),
+                  workflowMode,
+                  runtimeIntent,
+                },
               );
             } catch (finalErr) {
               if ((finalErr as Error).name === "AbortError") {
@@ -6191,7 +6219,11 @@ export async function executeAgentLoop(
                   [],
                   currentMaxTokens,
                   maxOutputEscalations,
-                  getPlanStreamWatchdogOptions(0),
+                  {
+                    ...getPlanStreamWatchdogOptions(0),
+                    workflowMode,
+                    runtimeIntent,
+                  },
                 );
               } catch (lastErr) {
                 if ((lastErr as Error).name === "AbortError") {
@@ -9487,10 +9519,10 @@ export async function executeAgentLoop(
             readOnlyTools: PLAN_EXPLORATION_READ_ONLY_TOOLS,
             sawExecuteOperationEvidence: false,
             noProgressBatchRepeatCount,
-            minReadOnlyActivities: 6,
-            minCachedReadOnlyActivities: 3,
-            maxNoProgressReadOnlyRepeats: 2,
-            maxReadOnlyToolChars: 24_000,
+            minReadOnlyActivities: 16,
+            minCachedReadOnlyActivities: 6,
+            maxNoProgressReadOnlyRepeats: 3,
+            maxReadOnlyToolChars: 48_000,
           })
         : { shouldRecover: false, reason: "", readOnlyActivityCount: 0, batchToolChars: 0 };
     if (chatReadOnlyNoProgress.shouldRecover) {

@@ -441,11 +441,12 @@ export function buildSystemPrompt(
     "",
     "## 输出可见性规则（最重要）",
     "你的回复中，用户需要看到的内容必须是普通 Markdown 正文或正式工具调用。",
+    "- **【绝对禁止倾倒完整代码清单】**：绝对禁止在回复中输出已被读取的完整文件或长达数百行的代码。在正文中说明或引用代码时，必须且只能提取 5-15 行的极简核心关键片段；绝不允许用长篇大论的原样代码重复铺陈，防止引发回复截断与自循环死循环。",
     "- 不要输出 `<analysis>`、`<thought>`、`<thinking>`、`<reasoning>` 等 hidden thinking 标签；这些不是计划、结论或行动通道。",
     "- 你的分析摘要、总结、结论、方案等所有需要用户看到的内容，**必须以普通 Markdown 文本的形式输出**。",
     "- 允许输出用户可见的公开进度说明，但只能写安全摘要：当前理解、为什么做下一步、正在做什么、将用什么结果判断下一步。不要输出原始 chain-of-thought、逐步内心推理或私密评分。",
     "- 公开进度说明要像 Codex App 一样自然、短、可读：用 1-3 句说明“我正在做什么、这一步用于确认什么、拿到什么结果后继续”。不要写生硬字段名或标签（如“因为：”“下一步：”“thought:”），不要把前一条进度说明复述成新的理由。",
-    "- 如果底层模型或服务端产生 hidden reasoning 字段，运行时会把它作为调试元数据折叠处理；它不算完成证据，也不会替代工具调用、计划文件或用户可见结论。",
+    "- 如果底层模型或服务端产生 hidden reasoning 字段，运行时会接收并作为调试元数据折叠处理；它不算完成证据，也不会替代工具调用、计划文件或用户可见结论。",
     "- 调用 native tools 时可以直接发出工具调用；如需说明，可在工具调用前用 1-3 句普通 Markdown 写公开进度说明。XML 工具协议下工具块必须保持纯净，不要混排正文；界面会由 runtime 注入 progress narration。",
     "",
     "## 用户提问交互规则",
@@ -582,6 +583,10 @@ export function buildSystemPrompt(
       turnIntent === "studio_workflow"
         ? "直接按 MAIN GAME STUDIO 的协议、命令与专家体系继续执行，不要改回普通 MAIN 流程。"
         : "直接完成实现、修复、修改、落地与验证，不要强制回到计划流。",
+      "【必须立即行动，禁止在正文输出纯文字规划或步骤描述】",
+      "1. 绝对禁止输出类似“我接下来的计划是：”、“第一步、第二步”、“我需要先确认……”等纯文字排查或修改步骤。禁止输出长篇排查思路或分析文字。",
+      "2. 必须立刻发起真实工具调用（如 grep_search、read_file、list_directory、write_file、apply_patch、replace_in_file 等）。如果你需要了解项目结构、查找报错或寻找问题，请【立刻发起工具调用】去检索，绝对不要用中文或英文纯文本来告诉用户你要去检查什么。",
+      "3. 违反本条规定（即只输出排查/修改步骤说明而不发起工具调用）会导致系统判定你“空转”从而强制中断并暂停你的运行（Run Paused）。",
       "如果任务中途暴露出真正的高风险分叉或关键前提冲突，应暂停并用 `<user_options>` 给出 2-3 个明确选项，而不是偷偷改走计划协议。",
       "不要再提示用户切换旧的前台模式；这些已经不是用户需要手动选择的开关。",
     ].join("\n"));
@@ -752,6 +757,7 @@ export function buildSystemPrompt(
       tfl.push("3. 只有在用户明确要求保存方案、当前回合本来就是计划落盘，或你正在继续一个已批准计划时，才写入 `.MAIN/plans/*.md`。");
       tfl.push("4. 凡是需要 shell 的步骤，必须真实执行：一次性命令用 `run_command` 并检查 exitCode/stdout/stderr；长驻或交互式命令用 `execute_command`，随后调用 `read_pty_since`、`read_pty_tail` 或 `get_pty_status` 验证结果。需要页面渲染、UI、DOM 或 console 验证时，优先用 `browser_evaluate` 打开真实本地页面并执行断言，不能用 curl/grep/cat 替代。命令调用必须带 `description` 和工作区相对 `cwd`（根目录用 `.`）；需要等待长任务输出时传 `wait_ms`，不要另跑 sleep。");
       tfl.push("5. 当用户要求 Git 提交、推送或“提交并推送”时，不要因为 PTY 未启动而声称无法执行；Git 是有限命令，优先用 `run_command` 依次检查 `git status`，必要时查看 `git diff --stat` / `git diff`，再按用户要求执行 `git add ...`、`git commit -m ...`、`git push`。如果没有变更、没有 remote、认证失败、upstream 未设置或 push 被拒绝，必须把 stdout/stderr/exitCode 如实反馈给用户并停止猜测。");
+      tfl.push("6. 【绝对禁止只说不做】任何以自然语言输出的“排查说明”、“寻找方案”、“我想先确认”等内容，若无实际工具调用配合，都是违规行为。如果你需要检查，立刻调用 grep_search、read_file 等只读工具；如果你需要修改，立刻调用 apply_patch 或其他写入工具。必须通过当前或下一条消息的工具调用发出你的动作，不得用纯文本解释代替工具执行。");
     }
     tfl.push("");
     tfl.push("### Steering 发现规则（Steering Discovery）");

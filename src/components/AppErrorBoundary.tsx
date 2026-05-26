@@ -102,36 +102,77 @@ export default class AppErrorBoundary extends React.Component<React.PropsWithChi
         };
 
     return (
-      <div className="flex h-screen w-full items-center justify-center bg-[#050505] px-6 text-[#e4e4e7]">
-        <div className="w-full max-w-3xl rounded-lg border border-[#27272a] bg-[#09090b] p-6 shadow-2xl">
-          <div className="text-[11px] font-semibold uppercase tracking-[0.22em] text-[#71717a]">
+      <div
+        className="flex h-screen w-full items-center justify-center px-6 transition-colors duration-200"
+        style={{
+          backgroundColor: "var(--surface-0)",
+          color: "var(--surface-text-strong)",
+        }}
+      >
+        <div
+          className="w-full max-w-3xl rounded-lg border p-6 shadow-2xl transition-colors duration-200"
+          style={{
+            borderColor: "var(--surface-border)",
+            backgroundColor: "var(--surface-2)",
+          }}
+        >
+          <div
+            className="text-[11px] font-semibold uppercase tracking-[0.22em]"
+            style={{ color: "var(--surface-text-subtle)" }}
+          >
             {copy.debug}
           </div>
-          <h1 className="mt-2 text-xl font-semibold text-white">{copy.title}</h1>
-          <p className="mt-2 text-[13px] leading-6 text-[#a1a1aa]">
+          <h1 className="mt-2 text-xl font-semibold" style={{ color: "var(--surface-text-strong)" }}>
+            {copy.title}
+          </h1>
+          <p className="mt-2 text-[13px] leading-6" style={{ color: "var(--surface-text-muted)" }}>
             {copy.desc}
           </p>
 
-          <div className="mt-4 rounded-md border border-[#3f3f46] bg-[#000000] p-3 font-mono text-[12px] text-[#fca5a5]">
+          <div
+            className="mt-4 rounded-md border p-3 font-mono text-[12px] break-all font-semibold"
+            style={{
+              borderColor: "rgba(239, 68, 68, 0.4)",
+              backgroundColor: "color-mix(in srgb, var(--surface-1) 85%, #fee2e2)",
+              color: "#dc2626",
+            }}
+          >
             {this.state.message || copy.unknownError}
           </div>
 
           <div className="mt-4 flex gap-2">
             <button
               onClick={() => window.location.reload()}
-              className="rounded-md border border-[#27272a] bg-[#18181b] px-3 py-2 text-[12px] font-semibold text-[#e4e4e7] transition-colors hover:border-[#3f3f46]"
+              className="rounded-md border px-3 py-2 text-[12px] font-semibold transition-all hover:opacity-85 active:scale-[0.98]"
+              style={{
+                borderColor: "var(--surface-border)",
+                backgroundColor: "var(--surface-3)",
+                color: "var(--surface-text-strong)",
+              }}
             >
               {copy.reload}
             </button>
             <button
               onClick={this.handleCopy}
-              className="rounded-md border border-[#3f3f46] bg-[#27272a] px-3 py-2 text-[12px] font-semibold text-white transition-colors hover:bg-[#3f3f46]"
+              className="rounded-md border px-3 py-2 text-[12px] font-semibold transition-all hover:opacity-85 active:scale-[0.98]"
+              style={{
+                borderColor: "var(--surface-border)",
+                backgroundColor: "var(--surface-4)",
+                color: "var(--surface-text-strong)",
+              }}
             >
               {this.state.copied ? copy.copied : copy.copyLog}
             </button>
           </div>
 
-          <pre className="mt-4 max-h-[280px] overflow-auto whitespace-pre-wrap rounded-md border border-[#18181b] bg-[#000000] p-3 font-mono text-[11px] leading-5 text-[#a1a1aa]">
+          <pre
+            className="mt-4 max-h-[280px] overflow-auto whitespace-pre-wrap rounded-md border p-3 font-mono text-[11px] leading-5 transition-colors duration-200"
+            style={{
+              borderColor: "var(--surface-border-soft)",
+              backgroundColor: "var(--surface-1)",
+              color: "var(--surface-text)",
+            }}
+          >
             {this.state.logText || this.state.stack || copy.noLog}
           </pre>
         </div>

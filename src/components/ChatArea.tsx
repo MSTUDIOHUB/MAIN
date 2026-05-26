@@ -2164,7 +2164,7 @@ function TurnArchiveStepCard({
   const { entries, totalExecutedEdits } = collectTurnChangeEntries(step.items);
   const hasChangeSummary = step.kind === "edit" && entries.length > 0;
   const detailItems = buildBlockRenderItems(step.items, false, false, language);
-  const canExpandDetails = !isLive && (hasChangeSummary || detailItems.length > 0);
+  const canExpandDetails = hasChangeSummary || detailItems.length > 0;
   const toggleText = expanded
     ? isLive
       ? language === "zh" ? "收起操作" : "Hide actions"
@@ -2979,15 +2979,18 @@ export default function ChatArea({
       pinnedPlanTurn?.status === "awaiting_approval" ||
       planStage === "ready_to_execute"
     );
+  const topIslandTurnStatusKey = topIslandTurnVisibleStatus || topIslandTurn?.status || null;
   const topIslandReplyOptions = useMemo(() => {
+    if (topIslandTurnStatusKey !== "awaiting_input" && topIslandTurnStatusKey !== "awaiting_approval") {
+      return [];
+    }
     const latestOptionBlock = [...topIslandTurnBlocks].reverse().find((block) =>
       block.type === "agent" &&
       Array.isArray(block.options) &&
       block.options.length > 0,
     );
     return latestOptionBlock?.options || [];
-  }, [topIslandTurnBlocks]);
-  const topIslandTurnStatusKey = topIslandTurnVisibleStatus || topIslandTurn?.status || null;
+  }, [topIslandTurnBlocks, topIslandTurnStatusKey]);
   const topIslandIsRunActive =
     agentStatus === "running" &&
     !!topIslandTurn &&

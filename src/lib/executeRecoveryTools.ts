@@ -169,12 +169,12 @@ export function resolveReadOnlyNoProgressTrigger(input: {
     return { shouldRecover: true, reason: "read_only_tool_chars_exhausted", readOnlyActivityCount, batchToolChars };
   }
 
-  const hasCachedRead = input.results.some((result) =>
-    !result.isError &&
+  const visibleResults = input.results.filter((result) => !result.internalFeedback && !result.isError);
+  const allSuccessfulReadsAreCached = visibleResults.length > 0 && visibleResults.every((result) =>
     /FILE_UNCHANGED_STUB|Repeated read-only tool call skipped/i.test(String(result.displayContent || result.content || ""))
   );
   const cachedReadLimit = input.minCachedReadOnlyActivities ?? 0;
-  if (hasCachedRead && readOnlyActivityCount >= cachedReadLimit) {
+  if (allSuccessfulReadsAreCached && readOnlyActivityCount >= cachedReadLimit) {
     return { shouldRecover: true, reason: "repeated_cached_read", readOnlyActivityCount, batchToolChars };
   }
 

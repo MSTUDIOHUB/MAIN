@@ -144,7 +144,11 @@ export function shouldStopNoVisibleStreamStall(input: {
   elapsedMs: number;
   visibleChars: number;
   toolCallCount: number;
+  reasoningChars?: number;
 }): boolean {
+  if (input.reasoningChars && input.reasoningChars > 0) {
+    return false;
+  }
   return (
     input.elapsedMs >= STREAM_NO_VISIBLE_PROGRESS_TIMEOUT_MS &&
     input.visibleChars === 0 &&
@@ -1092,6 +1096,7 @@ async function streamViaRustProxy(
       elapsedMs,
       visibleChars: visibleContentChars,
       toolCallCount: toolCallsMap.size,
+      reasoningChars: providerReasoningContent.length,
     })) {
       return false;
     }
