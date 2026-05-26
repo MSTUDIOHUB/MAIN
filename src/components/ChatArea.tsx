@@ -2847,8 +2847,6 @@ export default function ChatArea({
     if (!capsuleIsRunActive || !capsuleTurn) return "";
 
     const activeTurnBlocks = capsuleTurnBlocks;
-    const turnIntent = resolveConversationTurnIntent(capsuleTurn);
-    const isToolIntent = turnIntent !== "respond" && turnIntent !== "discuss";
     
     for (let i = activeTurnBlocks.length - 1; i >= 0; i--) {
       const block = activeTurnBlocks[i];
@@ -2857,36 +2855,25 @@ export default function ChatArea({
         const content = String(text || "").trim();
         if (!content) continue;
         
-        const followedByTool = activeTurnBlocks.slice(i + 1).some(b => b.type === "tool");
-        if (followedByTool) {
-          return content;
-        }
-        
-        const isFirstAgentBlock = activeTurnBlocks.filter(b => b.type === "agent").indexOf(block) === 0;
+        // Only route thin tool narrations (status/action updates) to the capsule.
+        // Substantive chat replies, plan summaries, or final conclusions should stay in the ChatArea.
         const thinNarration = isThinModelToolNarration(content);
-        
-        if ((isFirstAgentBlock && isToolIntent) || thinNarration) {
+        if (thinNarration) {
           return content;
-        }
-        
-        if (block.streaming) {
-          const isSubstantive = isSubstantiveModelFeedback(content);
-          if (!isSubstantive) {
-            return content;
-          }
         }
       }
     }
     return "";
-  }, [capsuleIsRunActive, capsuleTurn, capsuleTurnBlocks]);
+  }, [capsuleIsRunActive, capsuleTurnBlocks]);
 
   const capsuleActivityText = useMemo(() => {
     if (!capsuleIsRunActive || !capsuleTurn) return "";
+    if (explanationText) return explanationText;
     const projected = String(capsuleProgressProjection.activityText || "").trim();
     if (projected) return projected;
     const activity = getActiveTurnActivity(capsuleTurnBlocks, capsuleTurn.status, language);
     if (activity) return activity;
-    return explanationText;
+    return "";
   }, [capsuleIsRunActive, capsuleProgressProjection.activityText, capsuleTurn, capsuleTurnBlocks, explanationText, language]);
 
   useEffect(() => {
@@ -3854,7 +3841,7 @@ export default function ChatArea({
               lineHeight: `${Math.max(16, Math.round((resolvedChatFontSize - 1) * 1.5))}px`,
             }}
           >
-            <span className="line-clamp-2 text-ellipsis overflow-hidden">
+            <span className="whitespace-pre-wrap break-words text-center">
               {persistedExplanation}
             </span>
           </div>

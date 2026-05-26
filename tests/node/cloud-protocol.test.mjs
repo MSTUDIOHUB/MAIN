@@ -92,44 +92,47 @@ const {
   parseCloudCustomHeaders,
 } = await loadCloudProtocolModule();
 
-function loadOrchestratorModule() {
-  const sourcePath = path.join(workspaceRoot, "src/lib/orchestrator.ts");
-  const source = require("node:fs").readFileSync(sourcePath, "utf8");
+const orchestratorModuleCache = new Map();
+
+function loadOrchestratorTsModule(sourcePath) {
+  const normalizedPath = path.resolve(sourcePath);
+  if (orchestratorModuleCache.has(normalizedPath)) {
+    return orchestratorModuleCache.get(normalizedPath);
+  }
+
+  const fsSync = require("node:fs");
+  const source = fsSync.readFileSync(normalizedPath, "utf8");
   const transpiled = ts.transpileModule(source, {
     compilerOptions: {
       module: ts.ModuleKind.CommonJS,
       target: ts.ScriptTarget.ES2020,
     },
-    fileName: sourcePath,
+    fileName: normalizedPath,
   }).outputText;
   const module = { exports: {} };
-  const localRequire = createRequire(sourcePath);
+  orchestratorModuleCache.set(normalizedPath, module.exports);
+  const localRequire = createRequire(normalizedPath);
   const runtimeRequire = (specifier) => {
     if (specifier === "@tauri-apps/api/core") return { invoke: async () => "" };
     if (specifier === "@tauri-apps/api/event") return { listen: async () => () => {} };
     if (specifier.startsWith(".")) {
-      const basePath = path.resolve(path.dirname(sourcePath), specifier);
+      const basePath = path.resolve(path.dirname(normalizedPath), specifier);
       for (const candidate of [basePath, `${basePath}.ts`, `${basePath}.tsx`, path.join(basePath, "index.ts")]) {
-        if (!require("node:fs").existsSync(candidate)) continue;
+        if (!fsSync.existsSync(candidate)) continue;
         if (candidate.endsWith(".ts") || candidate.endsWith(".tsx")) {
-          const nestedSource = require("node:fs").readFileSync(candidate, "utf8");
-          const nestedTranspiled = ts.transpileModule(nestedSource, {
-            compilerOptions: {
-              module: ts.ModuleKind.CommonJS,
-              target: ts.ScriptTarget.ES2020,
-            },
-            fileName: candidate,
-          }).outputText;
-          const nestedModule = { exports: {} };
-          new Function("exports", "module", "require", nestedTranspiled)(nestedModule.exports, nestedModule, runtimeRequire);
-          return nestedModule.exports;
+          return loadOrchestratorTsModule(candidate);
         }
       }
     }
     return localRequire(specifier);
   };
   new Function("exports", "module", "require", transpiled)(module.exports, module, runtimeRequire);
+  orchestratorModuleCache.set(normalizedPath, module.exports);
   return module.exports;
+}
+
+function loadOrchestratorModule() {
+  return loadOrchestratorTsModule(path.join(workspaceRoot, "src/lib/orchestrator.ts"));
 }
 
 const { resolveModelProtocolProfile } = loadOrchestratorModule();

@@ -1406,6 +1406,7 @@ async function streamViaRustProxy(
       status: "waiting_for_chunk",
     });
   }, 5_000);
+  (noProgressInterval as ReturnType<typeof setInterval> & { unref?: () => void }).unref?.();
 
   // Now safe to start the stream: listeners are fully registered before Rust emits chunks.
   invoke("start_chat_stream", {

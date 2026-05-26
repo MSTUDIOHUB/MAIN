@@ -98,14 +98,14 @@ test("plan runtime phases scope the tool surface", () => {
     workflowMode: "plan",
     isPlanApproved: false,
     planRuntimePhase: "drafting",
-  }), []);
+  }), ["write_file", "replace_in_file"]);
 
   assert.deepEqual(filterPlanToolNamesForRuntimePhase({
     toolNames: allPlanTools,
     workflowMode: "plan",
     isPlanApproved: false,
     planRuntimePhase: "review_ready",
-  }), []);
+  }), ["write_file", "replace_in_file"]);
 });
 
 test("needs_rewrite closes the tool surface before the old convergence prompt", () => {
@@ -124,7 +124,7 @@ test("needs_rewrite closes the tool surface before the old convergence prompt", 
     isPlanApproved: false,
     planRuntimePhase: "needs_rewrite",
     toolNames: allPlanTools,
-  }), []);
+  }), ["write_file", "replace_in_file"]);
 });
 
 test("needs_evidence reopens read-only tools after convergence", () => {

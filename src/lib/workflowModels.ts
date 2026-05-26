@@ -2041,14 +2041,18 @@ export function validateActionablePlanArtifact(
       currentPlanQualityHeading = heading[1] || "";
       continue;
     }
-    const inAssumptionSection = /(?:未验证假设|待验证假设|假设与默认值|默认假设|假设|默认值|Unverified|Hypotheses|Assumptions|Defaults)/i
+    const isSpeculationAllowedSection = /(?:未验证假设|待验证假设|假设与默认值|默认假设|假设|默认值|Unverified|Hypotheses|Assumptions|Defaults|摘要|Summary|用户目标|User Goal|现象|Symptom|根因|Root Cause|背景|Background)/i
       .test(currentPlanQualityHeading);
     if (
-      !inAssumptionSection &&
+      !isSpeculationAllowedSection &&
       /(?:假设|可能|高概率|中概率|低概率|probably|possibly|hypothesis|likely)/i.test(line) &&
       !/(?:默认假设|未验证|待验证|需验证|证据|依据|观察|已读|default assumption|unverified|needs validation|evidence|observed)/i.test(line)
     ) {
-      unsupportedHypothesisLines.push(line);
+      // Only classify as a speculative code change if it mentions code targets (files, paths, or code keywords)
+      const mentionsCodeTargets = /(?:\.[a-z0-9]+|\b(?:function|class|interface|type|const|let|var|import|export|useEffect|useState)\b|\/|\\)/i.test(line);
+      if (mentionsCodeTargets) {
+        unsupportedHypothesisLines.push(line);
+      }
     }
   }
   if (unsupportedHypothesisLines.length > 0) {

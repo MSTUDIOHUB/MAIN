@@ -320,7 +320,7 @@ test("post-convergence plan tool surface narrows to targeted evidence or final d
       "get_project_skeleton",
       "read_pty_tail",
     ],
-  }), []);
+  }), ["replace_in_file", "write_file"]);
 
   assert.deepEqual(filterPlanToolNamesAfterReadOnlyConvergence({
     workflowMode: "plan",

@@ -7689,17 +7689,17 @@ export const useAppStore = create<AppState>()(
           : "本轮处于 PLAN 模式。";
         userContent = preferredLanguage === "en"
           ? [
-              `${planModeLead} If the request is a complex implementation, gather read-only evidence first, then output a concise visible \`<proposed_plan>\` or Codex-style Proposal for approval; MAIN will materialize it into \`.MAIN/plans/plan.md\`. For debug-log, screenshot, repeated-failure, or cross-module repairs, you may also keep a short staged ledger: \`requirements.md\` for user goals/acceptance and \`design.md\` for evidence-backed diagnosis. Do not write project source files or tasks.md before approval.`,
-              "Creating plan.md is an automatic runtime materialization step, not a user choice and not something the model must force through write_file before approval.",
-              "The visible plan must follow the Codex app handoff shape: title, Summary, Key Changes / Implementation Changes, Public APIs / Interfaces / Types, Test Plan, and Assumptions / Defaults.",
+              `${planModeLead} If the request is a complex implementation, gather read-only evidence first, then create or update the reviewable plan at \`.MAIN/plans/plan.md\` with \`write_file\` or \`replace_in_file\`. This is the only allowed write before approval. For debug-log, screenshot, repeated-failure, or cross-module repairs, you may also keep a short staged ledger: \`requirements.md\` for user goals/acceptance and \`design.md\` for evidence-backed diagnosis. Do not write project source files or tasks.md before approval.`,
+              "Follow the opencode-style plan file workflow: if a plan file already exists, edit it incrementally; otherwise create it. Keep exploring read-only evidence until the plan is decision-complete.",
+              "The plan file must follow the Codex app handoff shape: title, Summary, Key Changes / Implementation Changes, Public APIs / Interfaces / Types, Test Plan, and Assumptions / Defaults.",
               "If it is only a discussion-style plan, keep the answer concise and use user options for real decisions.",
               "",
               userContent,
             ].join("\n")
           : [
-              `${planModeLead}如果这是复杂实现请求，请先收集只读证据，再输出精简可见的 \`<proposed_plan>\` 或 Codex-style Proposal 供审批；MAIN 会把它物化为 \`.MAIN/plans/plan.md\`。遇到调试日志、截图、反复失败或跨模块修复时，可以同时保留简短 staged ledger：\`requirements.md\` 写用户目标/验收，\`design.md\` 写证据归因/取舍。等待用户批准后再改源码；批准前不要生成 tasks.md。`,
-              "创建 plan.md 是 runtime 自动物化步骤，不是用户需要选择的下一步，也不是模型必须在审批前强制通过 write_file 完成的动作。",
-              "可见计划必须对齐 Codex app 的交接计划结构：标题、摘要、关键实现改动、公共 API/接口/类型、测试方案、假设与默认值。",
+              `${planModeLead}如果这是复杂实现请求，请先收集只读证据，再用 \`write_file\` 或 \`replace_in_file\` 创建/更新可审批计划文件 \`.MAIN/plans/plan.md\`；这是批准前唯一允许的写入。遇到调试日志、截图、反复失败或跨模块修复时，可以同时保留简短 staged ledger：\`requirements.md\` 写用户目标/验收，\`design.md\` 写证据归因/取舍。等待用户批准后再改源码；批准前不要生成 tasks.md。`,
+              "严格按 opencode 风格的计划文件流程：如果 plan.md 已存在就增量编辑，否则创建完整计划；只读证据足够且计划 decision-complete 后再停在审批。",
+              "plan.md 必须对齐 Codex app 的交接计划结构：标题、摘要、关键实现改动、公共 API/接口/类型、测试方案、假设与默认值。",
               "如果只是讨论式方案，请保持简洁，并在真实分叉点用可点击选项让用户选择。",
               "",
               userContent,
@@ -7712,16 +7712,16 @@ export const useAppStore = create<AppState>()(
           ? [
               "Continue the previous PLAN turn. The user is asking to keep going, not to start a new discussion.",
               originalPlanPrompt ? `Original plan request: ${originalPlanPrompt}` : "Original plan request: use the current conversation context.",
-              "Produce real planning progress now. If key choices remain, summarize them briefly and use <user_options>; otherwise output a concise visible `<proposed_plan>` or Proposal. MAIN will materialize `.MAIN/plans/plan.md`. Use requirements/design only as a short staged ledger for complex evidence tracking.",
-              "Keep any plan Markdown concise: review-summary style, no tutorial prose, no full code listings, no repeated background.",
+              "Produce real planning progress now. If key choices remain, summarize them briefly and use <user_options>; otherwise create or update `.MAIN/plans/plan.md` with the decision-complete plan. Use requirements/design only as a short staged ledger for complex evidence tracking.",
+              "Keep plan.md concise: review-summary style, no tutorial prose, no full code listings, no repeated background.",
               text.trim() ? `Latest user message: ${text.trim()}` : "Latest user message: continue",
             ].join("\n")
           : [
               "请继续上一轮 PLAN 回合。用户是在要求继续推进，不是开启新的普通讨论。",
               originalPlanPrompt ? `上一轮计划请求：${originalPlanPrompt}` : "上一轮计划请求：请依据当前对话上下文继续。",
-              "现在必须产生实际规划进展。如果仍有关键选择需要用户确认，就先简短归纳并用面向用户的口吻给出 <user_options>；否则输出精简可见的 `<proposed_plan>` 或 Proposal。MAIN 会物化 `.MAIN/plans/plan.md`。requirements/design 只作为复杂证据追踪的简短 staged ledger。",
+              "现在必须产生实际规划进展。如果仍有关键选择需要用户确认，就先简短归纳并用面向用户的口吻给出 <user_options>；否则创建/更新 decision-complete 的 `.MAIN/plans/plan.md`。requirements/design 只作为复杂证据追踪的简短 staged ledger。",
               "每个 <option> 必须是用户点击后会发送的完整选择，不要写成“是否……”问题句。",
-              "所有计划 Markdown 都要精简成 Codex app 交接计划风格：标题、摘要、关键实现改动、公共 API/接口/类型、测试方案、假设与默认值；不要写教程式长文、完整代码清单或重复背景。",
+              "plan.md 要精简成 Codex app 交接计划风格：标题、摘要、关键实现改动、公共 API/接口/类型、测试方案、假设与默认值；不要写教程式长文、完整代码清单或重复背景。",
               text.trim() ? `用户最新消息：${text.trim()}` : "用户最新消息：继续",
             ].join("\n");
       }
@@ -10216,8 +10216,8 @@ export const useAppStore = create<AppState>()(
                   ? `Task list rejected: ${path} is missing verifiable evidence labels (${reason}). MAIN will ask the model to regenerate \`.MAIN/plans/tasks.md\` with unchecked tasks and evidence labels such as \`evidence: file:src/App.tsx\`, \`evidence: cmd:npm test\`, or \`evidence: deliverable:REPORT.md\`.`
                   : `任务清单已被拦截：${path} 缺少可验证 evidence 标签（${reason}）。MAIN 会要求模型重新生成真实的 \`.MAIN/plans/tasks.md\`，每项保持未完成 checkbox，并补充类似 \`证据: file:src/App.tsx\`、\`证据: cmd:npm test\` 或 \`证据: deliverable:REPORT.md\` 的证据标签。`
                 : language === "en"
-                ? `Plan artifact rejected: ${path} does not look like a reviewable ${kind} document (${reason}). MAIN will ask the model to regenerate a visible plan that can be materialized into \`.MAIN/plans/plan.md\`, or request your decision.`
-                : `计划文件已被拦截：${path} 不像可审批的${getPlanArtifactTitle(kind, "zh")}（${reason}）。MAIN 会要求模型重新生成可见计划并物化为 \`.MAIN/plans/plan.md\`，或先向你确认关键分叉。`;
+                ? `Plan artifact rejected: ${path} does not look like a reviewable ${kind} document (${reason}). MAIN will ask the model to rewrite \`.MAIN/plans/plan.md\`, or request your decision.`
+                : `计划文件已被拦截：${path} 不像可审批的${getPlanArtifactTitle(kind, "zh")}（${reason}）。MAIN 会要求模型重写 \`.MAIN/plans/plan.md\`，或先向你确认关键分叉。`;
             appendTurnBlock({
               id: nextId(),
               turnId,

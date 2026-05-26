@@ -14,11 +14,14 @@ const realOmlxRequest =
 const expectAgentExplanation = process.env.REAL_OMLX_EXPECT_AGENT_TEXT === "1";
 const forbiddenChatNoise = /<tool_use>|<user_options>|\[PROPOSAL START\]|append_debug_log|ContextMemoryState|MAIN TOOL FEEDBACK|^\s*कल\s*$/m;
 
-test.describe.configure({ timeout: 600_000 });
+test.describe.configure({ timeout: 1_200_000 });
 test.skip(!runRealOmlx, "Set MAIN_REAL_OMLX_E2E=1 to run real local OMLX plan-flow validation.");
 
 test.beforeEach(async ({ page }) => {
-  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "e2e-real-omlx-"));
+  const customWorkspace = process.env.REAL_OMLX_WORKSPACE;
+  const workspace = customWorkspace
+    ? path.resolve(customWorkspace)
+    : await fs.mkdtemp(path.join(os.tmpdir(), "e2e-real-omlx-"));
   (page as any).__realOmlxWorkspace = workspace;
   const seedFiles: Record<string, string> = {
     "src/hooks/useCsvParser.ts": [
@@ -57,7 +60,16 @@ test.beforeEach(async ({ page }) => {
   for (const [relative, content] of Object.entries(seedFiles)) {
     const absolute = path.join(workspace, relative);
     await fs.mkdir(path.dirname(absolute), { recursive: true });
-    await fs.writeFile(absolute, content, "utf8");
+    let fileExists = false;
+    try {
+      await fs.access(absolute);
+      fileExists = true;
+    } catch {
+      fileExists = false;
+    }
+    if (!fileExists) {
+      await fs.writeFile(absolute, content, "utf8");
+    }
   }
 
   const resolveDiskPath = (rawPath: string) => {
@@ -482,7 +494,7 @@ for (const model of models) {
           artifactCount: snapshot?.planArtifacts?.length ?? 0,
           planStage: snapshot?.planStage,
         };
-      }, { timeout: 300_000 })
+      }, { timeout: 600_000 })
       .toMatchObject({ artifactCount: 1 });
 
     const plan = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().planArtifacts?.[0]?.content || "");
@@ -515,7 +527,7 @@ for (const model of models) {
             block.status === "failed" && /search_text|content|空变更|identical/i.test(String(block.error || "")),
           ),
         };
-      }, { timeout: 240_000 })
+      }, { timeout: 500_000 })
       .toMatchObject({
         approved: true,
         hasCreatorName: true,

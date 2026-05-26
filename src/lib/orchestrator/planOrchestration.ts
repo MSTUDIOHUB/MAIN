@@ -41,11 +41,11 @@ export function buildPlanReadOnlyConvergencePrompt(
       context.mentionedFilePaths.length > 0 || context.attachedFilePaths.length > 0
         ? "Before any broad discovery, use the exact @ file or attachment paths as primary evidence and name what those files already show."
         : "",
-      "Stop broad rereading now. If targeted source/data evidence is still missing, call exactly one specific read/search tool for the missing file, symbol, or dataset, then stop. If the evidence is decision-complete, output a concise visible `<proposed_plan>` block or Codex-style Proposal; MAIN will materialize it into `.MAIN/plans/plan.md` for review.",
-      "The draft must include: confirmed findings, unverified hypotheses, evidence already read, tradeoffs, affected files, implementation steps, and validation.",
+      "Stop broad rereading now. If targeted source/data evidence is still missing, call exactly one specific read/search tool for the missing file, symbol, or dataset, then stop. If the evidence is decision-complete, create or update `.MAIN/plans/plan.md` with `write_file` or `replace_in_file`; this is the only write allowed before approval.",
+      "The plan file must include: confirmed findings, unverified hypotheses, evidence already read, tradeoffs, affected files, implementation steps, and validation.",
       "Only use `<user_options>` if there is a real product/design decision the user must make before a plan can be written. Do not offer options that merely ask to continue reading, checking, analyzing, or verifying.",
       "If a blocker remains, name the blocker and the single missing fact needed; do not continue broad file exploration.",
-      "Do not call write_file or replace_in_file just to finish planning.",
+      "Do not edit source files or `tasks.md` before approval.",
     ].filter(Boolean).join("\n");
   }
   return [
@@ -60,11 +60,11 @@ export function buildPlanReadOnlyConvergencePrompt(
     context.mentionedFilePaths.length > 0 || context.attachedFilePaths.length > 0
       ? "在继续大范围发现前，必须优先使用 @ 文件或附件的精确路径作为主要证据，并说明这些文件已经证明了什么。"
       : "",
-    "下一步不要继续泛读文件。如果还缺源码/数据定向证据，只能围绕缺失的文件、符号或数据集调用一次具体读取/搜索工具，然后停止；如果证据已经足够，请直接输出精简可见的 `<proposed_plan>` 或 Codex-style Proposal；MAIN 会把它物化为 `.MAIN/plans/plan.md` 供审批。",
-    "草案必须包含：已确认发现、未验证假设、已读证据、方案取舍、影响文件、实施步骤和验证方式。",
+    "下一步不要继续泛读文件。如果还缺源码/数据定向证据，只能围绕缺失的文件、符号或数据集调用一次具体读取/搜索工具，然后停止；如果证据已经足够，请用 `write_file` 或 `replace_in_file` 创建/更新 `.MAIN/plans/plan.md`；这是批准前唯一允许的写入。",
+    "计划文件必须包含：已确认发现、未验证假设、已读证据、方案取舍、影响文件、实施步骤和验证方式。",
     "只有存在真实产品/设计分叉、必须由用户决定后才能写计划时，才允许使用 `<user_options>`；不要给出只是继续读取、检查、分析或验证的选项。",
     "如果仍有阻塞，只说明阻塞点和唯一缺失事实；不要继续大范围探索。",
-    "不要为了完成规划而调用 write_file 或 replace_in_file。",
+    "批准前不要修改源码或生成 `tasks.md`。",
   ].filter(Boolean).join("\n");
 }
 
@@ -127,18 +127,18 @@ export function buildPlanPostConvergenceToolRedirectPrompt(input: {
         "PLAN_NEEDS_REWRITE: The last visible plan draft was structurally incomplete, but this is not a reason to read more files.",
         toolList ? `The attempted read-only tool call(s) were suppressed before execution: ${toolList}.` : "",
         reason ? `Quality gate reason: ${reason}.` : "",
-        "Rewrite the visible `<proposed_plan>` now. Add the missing user goal/sections from the user request and the evidence already in the transcript; MAIN will materialize it into `.MAIN/plans/plan.md`.",
+        "Rewrite `.MAIN/plans/plan.md` now with `write_file` or `replace_in_file`. Add the missing user goal/sections from the user request and the evidence already in the transcript.",
         "Do not call read-only tools in the next response unless MAIN explicitly reopens evidence recovery.",
-        "Do not call write_file or replace_in_file just to finish planning.",
+        "Do not edit source files or `tasks.md` before approval.",
       ].filter(Boolean).join("\n");
     }
     return [
       "PLAN_NEEDS_REWRITE: 上一个可见计划草稿只是结构不完整，这不是继续读文件的理由。",
       toolList ? `刚才的只读工具已在执行前静默拦截：${toolList}。` : "",
       reason ? `质量门禁原因：${reason}。` : "",
-      "现在直接重写可见 `<proposed_plan>`：把用户目标和缺失章节补齐，证据只使用当前对话里已经观察/读取到的内容；MAIN 会把它物化为 `.MAIN/plans/plan.md`。",
+      "现在直接用 `write_file` 或 `replace_in_file` 重写 `.MAIN/plans/plan.md`：把用户目标和缺失章节补齐，证据只使用当前对话里已经观察/读取到的内容。",
       "下一条不要再调用只读工具；除非 MAIN 明确进入补证据阶段。",
-      "不要为了完成规划而调用 write_file 或 replace_in_file。",
+      "批准前不要修改源码或生成 `tasks.md`。",
     ].filter(Boolean).join("\n");
   }
   if (input.language === "en") {
@@ -149,9 +149,9 @@ export function buildPlanPostConvergenceToolRedirectPrompt(input: {
       context.imageParts > 0
         ? "First write a concrete 'Screenshot observations' section: visible UI/text/state, what the user is asking, and which code/state path it points to."
         : "First restate the observed user-provided context and the actual user goal.",
-      "Then output a concise visible `<proposed_plan>` with the diagnosis, evidence, affected files, implementation steps, and validation. MAIN will materialize it into `.MAIN/plans/plan.md`.",
+      "Then create or update `.MAIN/plans/plan.md` with `write_file` or `replace_in_file`, including the diagnosis, evidence, affected files, implementation steps, and validation.",
       "If one missing fact truly blocks the plan, ask exactly one concrete question with `<user_options>`; do not offer generic continue-reading options.",
-      "Allowed next actions: visible `<proposed_plan>`, formal Proposal, or one blocking user choice. Do not call get_project_skeleton, list_directory, glob_search, grep_search, read_file, read_document, write_file, or replace_in_file again in the next response.",
+      "Allowed next actions: write/update `.MAIN/plans/plan.md`, or ask one blocking user choice. Do not call get_project_skeleton, list_directory, glob_search, grep_search, read_file, or read_document again in the next response.",
     ].filter(Boolean).join("\n");
   }
   return [
@@ -161,9 +161,9 @@ export function buildPlanPostConvergenceToolRedirectPrompt(input: {
     context.imageParts > 0
       ? "下一步必须先写出“截图观察到的现象”：图片中可见的 UI/文本/状态、用户真正要解决的问题，以及它指向的代码/状态链路。"
       : "下一步必须先复述用户提供的上下文和真实目标。",
-    "随后输出精简可见的 `<proposed_plan>`，包含问题归因、已有证据、影响文件、实施步骤和验证方式；MAIN 会把它物化为 `.MAIN/plans/plan.md`。",
+    "随后用 `write_file` 或 `replace_in_file` 创建/更新 `.MAIN/plans/plan.md`，包含问题归因、已有证据、影响文件、实施步骤和验证方式。",
     "如果确实只有一个缺失事实阻塞方案，只能提出一个具体问题并用 `<user_options>`；不要再给“继续查/继续分析”这类泛化选项。",
-    "下一条只允许：可见 `<proposed_plan>`、正式 Proposal，或询问一个真实阻塞选择。不要再次调用 get_project_skeleton、list_directory、glob_search、grep_search、read_file、read_document、write_file 或 replace_in_file。",
+    "下一条只允许：写入/更新 `.MAIN/plans/plan.md`，或询问一个真实阻塞选择。不要再次调用 get_project_skeleton、list_directory、glob_search、grep_search、read_file 或 read_document。",
   ].filter(Boolean).join("\n");
 }
 
@@ -240,7 +240,7 @@ export function buildPlanAutoScaffoldPrompt(input: {
   const evidence = summarizeRecentPlanEvidenceForPrompt(input.recentToolActivity, input.language);
   if (input.language === "en") {
     return [
-      "PLAN_AUTO_SCAFFOLD: Two low-quality plan drafts were rejected. Stop branching and rewrite a visible `<proposed_plan>` using this scaffold. MAIN will materialize it into `.MAIN/plans/plan.md`.",
+      "PLAN_AUTO_SCAFFOLD: Two low-quality plan drafts were rejected. Stop branching and rewrite `.MAIN/plans/plan.md` using this scaffold. This is the only allowed pre-approval write.",
       reason,
       "",
       "Required scaffold:",
@@ -262,11 +262,11 @@ export function buildPlanAutoScaffoldPrompt(input: {
       "## Validation Standards",
       "- Exact test/build/manual validation that would prove the fix.",
       "",
-      "Output this scaffold as visible Markdown now. Do not call read-only, write_file, or replace_in_file tools unless MAIN has reopened evidence recovery.",
+      "Write this scaffold to `.MAIN/plans/plan.md` now with `write_file` or `replace_in_file`. Do not call read-only tools unless MAIN has reopened evidence recovery.",
     ].filter(Boolean).join("\n");
   }
   return [
-    "PLAN_AUTO_SCAFFOLD: 连续两个低质量 plan 草稿被拒绝。停止分叉，按下面脚手架重写可见 `<proposed_plan>`；MAIN 会把它物化为 `.MAIN/plans/plan.md`。",
+    "PLAN_AUTO_SCAFFOLD: 连续两个低质量 plan 草稿被拒绝。停止分叉，按下面脚手架重写 `.MAIN/plans/plan.md`；这是批准前唯一允许的写入。",
     reason,
     "",
     "必须使用的脚手架：",
@@ -288,7 +288,7 @@ export function buildPlanAutoScaffoldPrompt(input: {
     "## 验证标准",
     "- 能证明修复成立的测试/构建/人工验证。",
     "",
-    "现在把这个脚手架作为可见 Markdown 输出。除非 MAIN 已重新开放补证据，否则不要调用只读、write_file 或 replace_in_file 工具。",
+    "现在用 `write_file` 或 `replace_in_file` 把这个脚手架写入 `.MAIN/plans/plan.md`。除非 MAIN 已重新开放补证据，否则不要调用只读工具。",
   ].filter(Boolean).join("\n");
 }
 
@@ -308,14 +308,14 @@ export function buildPlanEvidenceRecoveryClosurePrompt(input: {
     return [
       "PLAN_EVIDENCE_RECOVERY_COMPLETE: The targeted evidence pass is complete.",
       reason,
-      "Use the new evidence below and output a concise visible `<proposed_plan>` now; do not start another broad exploration pass. MAIN will materialize it into `.MAIN/plans/plan.md`.",
+      "Use the new evidence below and create or update `.MAIN/plans/plan.md` now with `write_file` or `replace_in_file`; do not start another broad exploration pass.",
       evidence,
     ].filter(Boolean).join("\n");
   }
   return [
     "PLAN_EVIDENCE_RECOVERY_COMPLETE: 定向补证已经完成。",
     reason,
-    "现在用下面的新证据输出精简可见的 `<proposed_plan>`；不要开启新一轮泛读。MAIN 会把它物化为 `.MAIN/plans/plan.md`。",
+    "现在用下面的新证据通过 `write_file` 或 `replace_in_file` 创建/更新 `.MAIN/plans/plan.md`；不要开启新一轮泛读。",
     evidence,
   ].filter(Boolean).join("\n");
 }
@@ -336,14 +336,14 @@ export function buildPlanEvidenceRecoveryBlockedPrompt(input: {
     return [
       "PLAN_EVIDENCE_RECOVERY_BLOCKED: The one targeted evidence pass did not produce usable evidence.",
       reason,
-      "Do not keep calling read-only tools. Either output a visible `<proposed_plan>` using only confirmed evidence below, or state the single real blocker as a user-visible question.",
+      "Do not keep calling read-only tools. Either write `.MAIN/plans/plan.md` using only confirmed evidence below, or state the single real blocker as a user-visible question.",
       evidence,
     ].filter(Boolean).join("\n");
   }
   return [
     "PLAN_EVIDENCE_RECOVERY_BLOCKED: 这一次定向补证没有得到可用证据。",
     reason,
-    "不要继续调用只读工具。要么只基于下面已确认的证据输出可见 `<proposed_plan>`，要么把唯一真实阻塞点作为可见问题告诉用户。",
+    "不要继续调用只读工具。要么只基于下面已确认的证据写入 `.MAIN/plans/plan.md`，要么把唯一真实阻塞点作为可见问题告诉用户。",
     evidence,
   ].filter(Boolean).join("\n");
 }
@@ -351,8 +351,8 @@ export function buildPlanEvidenceRecoveryBlockedPrompt(input: {
 export function buildPlanFallbackNotice(language: Language, sourceChars: number): string {
   const formatted = sourceChars.toLocaleString();
   return language === "zh"
-    ? `模型刚才输出了约 ${formatted} 个字符的规划正文，但还没有形成可审批计划。MAIN 会先尝试把可见方案物化为 \`.MAIN/plans/plan.md\`，或用可点击选项确认关键分叉；不会把工具日志或截断内容强行写成计划。`
-    : `The model produced about ${formatted} characters of planning text but did not create a reviewable plan. MAIN will try to materialize the visible plan into \`.MAIN/plans/plan.md\`, or ask for the key decision first; tool logs and truncated text will not be forced into plan files.`;
+    ? `模型刚才输出了约 ${formatted} 个字符的规划正文，但还没有写入可审批 \`.MAIN/plans/plan.md\`。MAIN 会要求模型按计划文件重写，或用可点击选项确认关键分叉；不会把工具日志或截断内容强行写成计划。`
+    : `The model produced about ${formatted} characters of planning text but did not write a reviewable \`.MAIN/plans/plan.md\`. MAIN will ask the model to rewrite the plan file, or ask for the key decision first; tool logs and truncated text will not be forced into plan files.`;
 }
 
 export function buildPlanStreamTimeoutPauseMessage(
@@ -505,7 +505,7 @@ export function buildPlanRecoveryPromptFromContext(input: {
       "",
       "Rules:",
       "- Do not copy tool logs, duplicate-call warnings, hidden thinking, raw source code, or truncation messages into plan files.",
-      "- A visible `<proposed_plan>` is enough; MAIN will materialize it into the default approval artifact `.MAIN/plans/plan.md`.",
+      "- Create or update the default approval artifact `.MAIN/plans/plan.md` directly with `write_file` or `replace_in_file`; this is the only pre-approval write.",
       "- `plan.md` must use the Codex app handoff shape: title, Summary, Key Changes / Implementation Changes, Public APIs / Interfaces / Types, Test Plan, and Assumptions / Defaults.",
       "- Screenshot/attachment observations, read evidence, and confirmed facts belong in the concise Summary only when real; do not inflate them into empty audit sections.",
       "- Every implementation change must point to concrete files, interfaces, data flow, commands, validation, or an explicit default. If public APIs/interfaces/types do not change, say that explicitly.",
@@ -513,7 +513,7 @@ export function buildPlanRecoveryPromptFromContext(input: {
       "- Non-blocking MVP tradeoffs must be written with explicit defaults as assumptions or follow-up enhancements. If a choice blocks execution, ask with `<user_options>` before approval and stop.",
       "- `requirements.md` is optional. Only create it when the user explicitly asks for a requirement ledger or when large/compliance-heavy scope needs traceability; it is never a prerequisite for approval.",
       "- If the plan direction is unclear, ask the user with `<user_options>` and stop. Do not invent a final plan.",
-      "- If the direction is clear, output a concise visible `<proposed_plan>` or normal Proposal for approval. Do not call `write_file` / `replace_in_file` just to finish planning, and do not generate `tasks.md` before approval.",
+      "- If the direction is clear, write a concise `.MAIN/plans/plan.md` for approval. Do not generate `tasks.md` or edit source files before approval.",
     ].filter(Boolean).join("\n");
   }
 
@@ -524,7 +524,7 @@ export function buildPlanRecoveryPromptFromContext(input: {
     "",
     "规则：",
     "- 不要把工具日志、重复调用提示、后台思考、原始源码或截断提示写进计划文件。",
-    "- 可见 `<proposed_plan>` 就足够；MAIN 会把它物化为默认审批产物 `.MAIN/plans/plan.md`。",
+    "- 直接用 `write_file` 或 `replace_in_file` 创建/更新默认审批产物 `.MAIN/plans/plan.md`；这是批准前唯一允许的写入。",
     "- `plan.md` 必须使用 Codex app 交接计划结构：标题、摘要、关键实现改动、公共 API/接口/类型、测试方案、假设与默认值。",
     "- 截图/附件观察、已读证据和已确认事实只在确有内容时放进精简摘要，不要撑成空洞审计章节。",
     "- 每个关键实现改动必须指向具体文件、接口、数据流、命令、验证方式或明确默认假设；如果公共 API/接口/类型不变，必须显式写明。",
@@ -532,7 +532,7 @@ export function buildPlanRecoveryPromptFromContext(input: {
     "- 非阻塞 MVP 取舍必须写成带默认值的默认假设或后续增强；真正阻塞执行的选择必须在批准前用 `<user_options>` 提问并停止。",
     "- `requirements.md` 是可选需求台账；只有用户明确要求、范围很大或需要合规/验收追踪时才生成，绝不是审批前置条件。",
     "- 如果设计方向不明确，使用 `<user_options>` 让用户选择并立刻停止；不要编造最终方案。",
-    "- 如果方向已经明确，直接输出精简可见 `<proposed_plan>` 或正常 Proposal 等待审批。不要为了完成规划而调用 `write_file` / `replace_in_file`，批准前不要生成 `tasks.md`。",
+    "- 如果方向已经明确，直接写入精简 `.MAIN/plans/plan.md` 等待审批。批准前不要生成 `tasks.md`，不要修改源码。",
   ].filter(Boolean).join("\n");
 }
 

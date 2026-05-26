@@ -534,7 +534,7 @@ test("local Rust streams stop reasoning-only runaway output", async () => {
       listeners.get("chat-stream-chunk")?.({
         payload: {
           stream_id: streamId,
-          chunk: `data: ${JSON.stringify({ choices: [{ message: { reasoning_content: "loop ".repeat(3000) } }] })}\n\n`,
+          chunk: `data: ${JSON.stringify({ choices: [{ message: { reasoning_content: "loop ".repeat(22_000) } }] })}\n\n`,
         },
       });
     });

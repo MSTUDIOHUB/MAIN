@@ -337,15 +337,15 @@ test("data analyst plan prompt uses interactive planning and analysis semantics"
   assert.match(prompt, /关键决策点用可点击选项引导用户/);
   assert.match(prompt, /选项必须通用真实/);
   assert.match(prompt, /用户能真实拍板的选择/);
-  assert.match(prompt, /Plan-First 计划物化规则/);
-  assert.match(prompt, /默认先输出可审批方案/);
-  assert.match(prompt, /Explore 首步/);
-  assert.match(prompt, /阶段 0 用一次浅层 `get_project_skeleton\(depth: 2\)`/);
-  assert.match(prompt, /requirements\.md` 记录用户目标\/验收，`design\.md` 记录证据归因\/取舍/);
-  assert.match(prompt, /`plan_file_change` 路由到 PLAN 后，必须输出可审批的可见计划/);
+  assert.match(prompt, /opencode 风格的计划文件工作流/);
+  assert.match(prompt, /先生成可审阅的计划文件/);
+  assert.match(prompt, /阶段 0：Explore project structure/);
+  assert.match(prompt, /只开放一次浅层 `get_project_skeleton\(depth: 2\)`/);
+  assert.match(prompt, /requirements\.md` 仅记录用户目标\/验收，`design\.md` 仅记录证据归因\/取舍/);
+  assert.match(prompt, /`plan_file_change` 路由到 PLAN 后，必须写入可审批的 `\.MAIN\/plans\/plan\.md`/);
   assert.match(prompt, /阶段 1 只读 grounding/);
   assert.match(prompt, /阶段 2 收敛关键事实\/取舍\/默认值/);
-  assert.match(prompt, /decision-complete 的可见 `<proposed_plan>`/);
+  assert.match(prompt, /最后写入正式计划/);
   assert.match(prompt, /requirements\.md.*审批的前置条件/);
   assert.match(prompt, /必须包含标题、摘要、关键实现改动、公共 API\/接口\/类型变化、测试方案、假设与默认值/);
   assert.match(prompt, /每个关键实现改动必须能落到具体文件、接口、数据流、命令、验证方式或明确默认假设/);
@@ -353,7 +353,7 @@ test("data analyst plan prompt uses interactive planning and analysis semantics"
   assert.match(prompt, /数据分析\/报表类请求：规划阶段优先输出分析目标、数据范围、指标定义、产物形态、分析方法与验证方式/);
   assert.match(prompt, /确认表结构、关键字段、数据类型、时间\/数值\/分类维度、缺失值和聚合口径/);
   assert.doesNotMatch(prompt, /金额、课程字段|课程字段|orders\.csv|数据是否写入 Store|CSV 解析逻辑/);
-  assert.match(prompt, /复杂实现请求默认输出精简可见 `<proposed_plan>` 或正式 Proposal 供审批/);
+  assert.match(prompt, /复杂实现请求默认用 `write_file` \/ `replace_in_file` 写入 `\.MAIN\/plans\/plan\.md` 供审批/);
   assert.match(prompt, /批准执行前仍然不能写源码或生成 tasks\.md/);
   assert.match(prompt, /不要为了确认 tasks\.md 是否存在而主动读取/);
   assert.match(prompt, /批准后优先使用 MAIN runtime 任务清单/);
@@ -361,7 +361,7 @@ test("data analyst plan prompt uses interactive planning and analysis semantics"
   assert.doesNotMatch(prompt, /未经明确要求就把内容落到 `\.MAIN\/plans\/\*\.md`/);
 });
 
-test("plan prompt does not require pre-approval write_file to finish planning", () => {
+test("plan prompt prefers pre-approval plan.md writes for complex planning", () => {
   const prompt = buildSystemPrompt(
     [],
     "/tmp/workspace",
@@ -378,10 +378,10 @@ test("plan prompt does not require pre-approval write_file to finish planning", 
     ["read_file", "write_file", "replace_in_file"],
   );
 
-  assert.match(prompt, /MAIN runtime 会物化为 `\.MAIN\/plans\/plan\.md`/);
-  assert.match(prompt, /不要为了完成规划而强制调用 `write_file` \/ `replace_in_file`/);
-  assert.doesNotMatch(prompt, /必须调用 `write_file` 或 `replace_in_file` 创建\/更新精简的 `\.MAIN\/plans\/plan\.md`/);
-  assert.doesNotMatch(prompt, /call `write_file` or `replace_in_file` to create or update/);
+  assert.match(prompt, /正式审批首选写入 `\.MAIN\/plans\/plan\.md`/);
+  assert.match(prompt, /证据足够后用 `write_file` 或 `replace_in_file` 创建\/更新 `\.MAIN\/plans\/plan\.md`/);
+  assert.match(prompt, /批准前唯一允许的写入是 `\.MAIN\/plans\/` 下的计划产物/);
+  assert.doesNotMatch(prompt, /MAIN runtime 会物化为 `\.MAIN\/plans\/plan\.md`/);
 });
 
 test("system prompt tells the model to stop after emitting user options", () => {

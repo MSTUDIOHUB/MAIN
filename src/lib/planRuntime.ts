@@ -56,6 +56,15 @@ const PLAN_STRUCTURE_EXPLORATION_TOOL_NAMES = new Set([
   "get_project_skeleton",
 ]);
 
+const PLAN_DRAFT_WRITE_TOOL_NAMES = new Set([
+  "write_file",
+  "replace_in_file",
+]);
+
+export function isPlanDraftWriteToolName(name: string): boolean {
+  return PLAN_DRAFT_WRITE_TOOL_NAMES.has(String(name || ""));
+}
+
 export function filterPlanToolNamesForRuntimePhase(input: {
   toolNames: string[];
   workflowMode: PlanRuntimeMode;
@@ -75,7 +84,7 @@ export function filterPlanToolNamesForRuntimePhase(input: {
     return input.toolNames.filter(isPlanReadOnlyToolName);
   }
   if (isPlanRuntimeFinalizationPhase(input.planRuntimePhase)) {
-    return [];
+    return input.toolNames.filter(isPlanDraftWriteToolName);
   }
   return input.toolNames;
 }

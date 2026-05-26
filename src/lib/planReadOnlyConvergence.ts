@@ -60,8 +60,17 @@ const PLAN_TARGETED_EVIDENCE_TOOL_NAMES = new Set([
   "read_pty_buffer",
   "get_pty_status",
 ]);
+const PLAN_DRAFT_WRITE_TOOL_NAMES = new Set([
+  "write_file",
+  "replace_in_file",
+]);
+
 export function isPlanReadOnlyToolName(name: string): boolean {
   return PLAN_READ_ONLY_TOOL_NAMES.has(String(name || ""));
+}
+
+export function isPlanPostConvergenceArtifactToolName(name: string): boolean {
+  return PLAN_DRAFT_WRITE_TOOL_NAMES.has(String(name || ""));
 }
 
 function isPlanRuntimeReadOnlyPhase(phase?: PlanRuntimePhase): boolean {
@@ -188,10 +197,6 @@ export function shouldNarrowPlanToolsAfterReadOnlyConvergence(input: {
   return input.evidenceReadiness === "ready_for_plan" || input.evidenceReadiness === "blocked_user_choice";
 }
 
-export function isPlanPostConvergenceArtifactToolName(_name: string): boolean {
-  return false;
-}
-
 export function filterPlanToolNamesAfterReadOnlyConvergence(input: {
   toolNames: string[];
   workflowMode: "chat" | "edit" | "plan";
@@ -204,7 +209,7 @@ export function filterPlanToolNamesAfterReadOnlyConvergence(input: {
   if (input.evidenceReadiness === "needs_targeted_read") {
     return input.toolNames.filter((name) => PLAN_TARGETED_EVIDENCE_TOOL_NAMES.has(name));
   }
-  return [];
+  return input.toolNames.filter(isPlanPostConvergenceArtifactToolName);
 }
 
 export function filterPlanToolNamesForRuntimePhase(input: {
@@ -223,7 +228,7 @@ export function filterPlanToolNamesForRuntimePhase(input: {
     return input.toolNames.filter(isPlanReadOnlyToolName);
   }
   if (isPlanRuntimeFinalizationPhase(input.planRuntimePhase)) {
-    return [];
+    return input.toolNames.filter(isPlanPostConvergenceArtifactToolName);
   }
   return input.toolNames;
 }
