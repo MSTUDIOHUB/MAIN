@@ -974,6 +974,73 @@ export function compactAssistantMessages(
   });
 }
 
+/**
+ * Locate and replace obsolete read results with lightweight stubs once a file has been successfully mutated.
+ */
+export function activeMemoryReclamation(messages: TrimMessage[]): TrimMessage[] {
+  const toolCallMap = new Map<string, { name: string; path: string }>();
+  const successfulMutations = new Set<string>();
+
+  // 1. Build a map of tool call IDs to tool name and target path.
+  for (const msg of messages) {
+    if (msg.role === "assistant" && Array.isArray(msg.tool_calls)) {
+      for (const tc of msg.tool_calls) {
+        const call = tc as { id?: string; function?: { name?: string; arguments?: string } };
+        if (call.id && call.function?.name && call.function.arguments) {
+          try {
+            const parsed = JSON.parse(call.function.arguments);
+            const name = call.function.name;
+            let path = "";
+            if (typeof parsed.path === "string") {
+              path = parsed.path.trim();
+            } else if (typeof parsed.TargetFile === "string") {
+              path = parsed.TargetFile.trim();
+            }
+            if (path) {
+              toolCallMap.set(call.id, { name, path });
+            }
+          } catch {
+            // Ignore JSON parsing issues
+          }
+        }
+      }
+    }
+  }
+
+  // 2. Identify successfully mutated paths.
+  for (const msg of messages) {
+    if (msg.role === "tool" && msg.tool_call_id && typeof msg.content === "string") {
+      const callInfo = toolCallMap.get(msg.tool_call_id);
+      if (callInfo && (callInfo.name === "write_file" || callInfo.name === "replace_in_file")) {
+        const isSuccess = /success|written successfully|updated successfully|already matched/i.test(msg.content);
+        if (isSuccess && callInfo.path) {
+          successfulMutations.add(callInfo.path);
+        }
+      }
+    }
+  }
+
+  if (successfulMutations.size === 0) {
+    return messages;
+  }
+
+  // 3. Prune historical tool read contents for successfully mutated paths.
+  return messages.map((msg) => {
+    if (msg.role === "tool" && msg.tool_call_id && typeof msg.content === "string") {
+      const callInfo = toolCallMap.get(msg.tool_call_id);
+      if (callInfo && callInfo.name === "read_file" && callInfo.path && successfulMutations.has(callInfo.path)) {
+        if (msg.content.length > 200) {
+          return {
+            ...msg,
+            content: `[System: Historical read content of ${callInfo.path} removed; file was successfully mutated in a later turn]`,
+          };
+        }
+      }
+    }
+    return msg;
+  });
+}
+
 export interface ManageContextResult {
   messages: TrimMessage[];
   droppedCount: number;
@@ -1025,14 +1092,15 @@ export function manageContext(
   forceManage: boolean = false,
   options: ManageContextOptions = {},
 ): ManageContextResult {
+  const reclaimedMessages = activeMemoryReclamation(messages);
   const budgets = computeContextBudgets(contextLimit, reservedForOutput);
-  const memoryState = buildContextMemoryState(messages, {
+  const memoryState = buildContextMemoryState(reclaimedMessages, {
     previous: options.previousMemoryState,
     turnId: options.turnId,
     now: options.now,
   });
   const memoryPacket = formatContextMemoryPacket(memoryState);
-  const messagesWithMemory = injectContextMemoryMessage(messages, memoryState) as TrimMessage[];
+  const messagesWithMemory = injectContextMemoryMessage(reclaimedMessages, memoryState) as TrimMessage[];
   const tokenCountBefore = estimateMessagesTokens(messagesWithMemory);
   const tokenBreakdownBefore = computeContextTokenBreakdown(messagesWithMemory);
   const shouldManage = forceManage || tokenCountBefore > budgets.proactiveTriggerBudget;

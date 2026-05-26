@@ -43,6 +43,7 @@ import {
   type ChatOperationCluster,
 } from "../lib/toolUiGrouping";
 import { isThinModelToolNarration, isSubstantiveModelFeedback } from "../lib/modelFeedbackDedupe";
+import { isConversationalFirstPersonNarration, deriveDynamicFirstPersonText } from "../lib/capsuleStagingHelper";
 import { compactToolPresentationTarget, getToolPresentationLabel } from "../lib/toolPresentation";
 import { buildLiveTurnProcessTimelineModel, buildTurnProcessArchiveModel, type TurnArchiveStep } from "../lib/turnProcessArchive";
 import {
@@ -1348,6 +1349,57 @@ function ThoughtBlock({
   );
 }
 
+function TurnIntentHistoryCard({
+  explanations,
+  language,
+  chatFontSize,
+}: {
+  explanations: string[];
+  language: "zh" | "en";
+  chatFontSize: number;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  if (explanations.length === 0) return null;
+
+  const title = language === "zh" ? "行动意图历史" : "Action Intent History";
+  const count = explanations.length;
+
+  return (
+    <div 
+      className="ml-9 mt-2 rounded-xl border border-[var(--surface-border-soft)] bg-[color-mix(in_srgb,var(--surface-1)_60%,transparent)] px-3 py-2 transition-all"
+      style={{ fontSize: `${chatFontSize}px` }}
+    >
+      <button
+        type="button"
+        onClick={() => setExpanded((prev) => !prev)}
+        className="group flex w-full items-center justify-between text-[11px] text-[var(--surface-text-muted)] hover:text-[var(--surface-text)]"
+      >
+        <span className="flex items-center gap-2 font-medium">
+          <IconFileText className="h-3.5 w-3.5 text-[var(--accent-light)]" />
+          <span>{title}</span>
+          <span className="text-[10px] opacity-75 font-normal">
+            {language === "zh" ? `${count} 条记录` : `${count} record${count > 1 ? "s" : ""}`}
+          </span>
+        </span>
+        <span className="inline-flex items-center gap-1.5 text-[10px] text-[var(--surface-text-muted)] group-hover:text-[var(--surface-text)]">
+          {expanded ? <IconChevronDown className="h-3.5 w-3.5" /> : <IconChevronRight className="h-3.5 w-3.5" />}
+          {expanded ? (language === "zh" ? "收起" : "Hide") : (language === "zh" ? "展开" : "Expand")}
+        </span>
+      </button>
+
+      {expanded && (
+        <div className="mt-2.5 space-y-2 border-t border-[var(--surface-border-soft)] pt-2 pl-5 text-[12px] leading-5 text-[var(--surface-text-subtle)]">
+          {explanations.map((exp, idx) => (
+            <div key={idx} className="relative before:absolute before:-left-3.5 before:top-2 before:h-1.5 before:w-1.5 before:rounded-full before:bg-[var(--accent-light)]/60">
+              {renderCompactMarkdownText(exp)}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function TurnChangesCard({
   entries,
   totalExecutedEdits,
@@ -2080,12 +2132,25 @@ function renderCompactMarkdownInline(text: string, keyPrefix: string): React.Rea
 }
 
 function renderCompactMarkdownText(text: string): React.ReactNode {
-  return String(text || "").replace(/\r\n/g, "\n").split("\n").map((line, lineIndex) => (
-    <React.Fragment key={`compact-md-line-${lineIndex}`}>
-      {lineIndex > 0 && <br />}
-      {renderCompactMarkdownInline(line, `compact-md-${lineIndex}`)}
-    </React.Fragment>
-  ));
+  return String(text || "").replace(/\r\n/g, "\n").split("\n").map((line, lineIndex) => {
+    const headerMatch = line.match(/^(#{1,6})\s+(.+)$/);
+    if (headerMatch) {
+      const level = headerMatch[1].length;
+      const content = headerMatch[2];
+      const sizeClass = level === 1 ? "text-lg font-bold" : level === 2 ? "text-base font-semibold" : "text-sm font-semibold";
+      return (
+        <span key={`compact-md-line-${lineIndex}`} className={`block ${sizeClass} text-[var(--surface-text-strong)] my-1`}>
+          {renderCompactMarkdownInline(content, `compact-md-${lineIndex}`)}
+        </span>
+      );
+    }
+    return (
+      <React.Fragment key={`compact-md-line-${lineIndex}`}>
+        {lineIndex > 0 && <br />}
+        {renderCompactMarkdownInline(line, `compact-md-${lineIndex}`)}
+      </React.Fragment>
+    );
+  });
 }
 
 function TurnArchiveStepCard({
@@ -2143,16 +2208,6 @@ function TurnArchiveStepCard({
         <span data-testid="turn-archive-step-intent" className="mt-1 block whitespace-pre-wrap break-words text-[12.5px] font-medium leading-5 text-[var(--surface-text)]">
           {renderCompactMarkdownText(primaryText)}
         </span>
-        {summaryText && (
-          <span data-testid="turn-archive-step-summary" className="mt-0.5 block whitespace-pre-wrap break-words text-[11px] leading-4 text-[var(--surface-text-subtle)]">
-            {renderCompactMarkdownText(summaryText)}
-          </span>
-        )}
-        {latestEvidenceText && (
-          <span data-testid="turn-archive-step-evidence" className="mt-0.5 block whitespace-pre-wrap break-words text-[10.5px] leading-4 text-[var(--surface-text-muted)]">
-            {renderCompactMarkdownText(latestEvidenceText)}
-          </span>
-        )}
       </span>
       {canExpandDetails && (
         <span className="inline-flex shrink-0 items-center gap-1.5 px-1 py-1 text-[10px] text-[var(--surface-text-muted)] transition-colors group-hover:text-[var(--surface-text)]">
@@ -2843,6 +2898,10 @@ export default function ChatArea({
     () => buildRuntimeProgressProjection(capsuleProgressLedger, language, 4),
     [capsuleProgressLedger, language],
   );
+  // 缓存并锁死当前轮次下模型输出的最新的非空第一人称说明，防止被工具调用瞬间冲刷掉
+  const [activeTurnExplanation, setActiveTurnExplanation] = useState<string>("");
+  const activeTurnExplanationRef = useRef<string | null>(null);
+
   const explanationText = useMemo(() => {
     if (!capsuleIsRunActive || !capsuleTurn) return "";
 
@@ -2855,9 +2914,8 @@ export default function ChatArea({
         const content = String(text || "").trim();
         if (!content) continue;
         
-        // Only route thin tool narrations (status/action updates) to the capsule.
-        // Substantive chat replies, plan summaries, or final conclusions should stay in the ChatArea.
-        const thinNarration = isThinModelToolNarration(content);
+        // Route rich conversational first-person staging explanations into the capsule
+        const thinNarration = isConversationalFirstPersonNarration(content);
         if (thinNarration) {
           return content;
         }
@@ -2866,15 +2924,28 @@ export default function ChatArea({
     return "";
   }, [capsuleIsRunActive, capsuleTurnBlocks]);
 
+  useEffect(() => {
+    if (!capsuleTurn) {
+      setActiveTurnExplanation("");
+      activeTurnExplanationRef.current = null;
+      return;
+    }
+    const turnChanged = capsuleTurn.id !== activeTurnExplanationRef.current;
+    if (turnChanged) {
+      activeTurnExplanationRef.current = capsuleTurn.id;
+      setActiveTurnExplanation(""); // 轮次变更时彻底重置
+    }
+    if (explanationText) {
+      setActiveTurnExplanation(explanationText); // 仅在有新的非空模型说明时更新
+    }
+  }, [explanationText, capsuleTurn]);
+
   const capsuleActivityText = useMemo(() => {
     if (!capsuleIsRunActive || !capsuleTurn) return "";
+    if (activeTurnExplanation) return activeTurnExplanation;
     if (explanationText) return explanationText;
-    const projected = String(capsuleProgressProjection.activityText || "").trim();
-    if (projected) return projected;
-    const activity = getActiveTurnActivity(capsuleTurnBlocks, capsuleTurn.status, language);
-    if (activity) return activity;
-    return "";
-  }, [capsuleIsRunActive, capsuleProgressProjection.activityText, capsuleTurn, capsuleTurnBlocks, explanationText, language]);
+    return deriveDynamicFirstPersonText(capsuleTurn, capsuleTurnBlocks, agentStatus, language);
+  }, [capsuleIsRunActive, capsuleTurn, capsuleTurnBlocks, activeTurnExplanation, explanationText, agentStatus, language]);
 
   useEffect(() => {
     const turnChanged = capsuleTurn?.id !== lastTurnIdRef.current;
@@ -3406,6 +3477,36 @@ export default function ChatArea({
       turn.status !== "error" &&
       !shouldRouteActivityNoticeToCapsule &&
       (activeTurnActivity || bottomThoughtSummary || effectiveProgressLedger.length > 0);
+    const isTurnCompletedOrStopped =
+      turn.status === "done" ||
+      turn.status === "completed_with_changes" ||
+      turn.status === "stopped_no_action" ||
+      turn.status === "stopped_no_output" ||
+      turn.status === "error" ||
+      turn.status === "awaiting_approval" ||
+      turn.status === "awaiting_input";
+
+    const intentHistoryExplanations = useMemo(() => {
+      if (!isTurnCompletedOrStopped) return [];
+
+      const list: string[] = [];
+      const seen = new Set<string>();
+      for (const block of blocks) {
+        if (block.type === "agent") {
+          const text = getAgentVisibleMarkdownText(block);
+          const content = String(text || "").trim();
+          if (content && isConversationalFirstPersonNarration(content)) {
+            const normalized = normalizeTranscriptDedupeText(content);
+            if (!seen.has(normalized)) {
+              seen.add(normalized);
+              list.push(content);
+            }
+          }
+        }
+      }
+      return list;
+    }, [blocks, isTurnCompletedOrStopped]);
+
     const renderTurnBlockItem = (item) => {
       if (item.kind !== "readContextGroup" && item.kind !== "operationCluster" && item.block?.type === "thought") return null;
       if (item.kind === "block") {
@@ -3417,6 +3518,15 @@ export default function ChatArea({
         } else {
           if (isTransparentToolNarrationBlock(item.block)) return null;
         }
+
+        // Hide conversational first-person explanations from message flow if completed/stopped,
+        // since they are collapsed in the TurnIntentHistoryCard.
+        if (isTurnCompletedOrStopped && item.block?.type === "agent") {
+          const text = getAgentVisibleMarkdownText(item.block);
+          if (isConversationalFirstPersonNarration(text)) {
+            return null;
+          }
+        }
       }
       if (item.kind === "block" && shouldSuppressAgentToolEcho(blocks, item.index)) return null;
 
@@ -3424,7 +3534,18 @@ export default function ChatArea({
     };
     const renderArchivedBlockItem = (item) => {
       if (item.kind !== "readContextGroup" && item.kind !== "operationCluster" && item.block?.type === "thought") return null;
-      if (item.kind === "block" && isTransparentToolNarrationBlock(item.block)) return null;
+      if (item.kind === "block") {
+        if (isTransparentToolNarrationBlock(item.block)) return null;
+
+        // Hide conversational first-person explanations from message flow if completed/stopped,
+        // since they are collapsed in the TurnIntentHistoryCard.
+        if (isTurnCompletedOrStopped && item.block?.type === "agent") {
+          const text = getAgentVisibleMarkdownText(item.block);
+          if (isConversationalFirstPersonNarration(text)) {
+            return null;
+          }
+        }
+      }
       return renderBlockItem(item);
     };
     const isLiveProcessRenderItem = (item) => {
@@ -3598,7 +3719,13 @@ export default function ChatArea({
                       onOpenDiff={openDiffForTask}
                     />
                   )}
-                  {finalVisibleAgentBlock && renderBlock(finalVisibleAgentBlock, finalVisibleAgentIndex)}
+                  {finalVisibleAgentBlock && (() => {
+                    const text = getAgentVisibleMarkdownText(finalVisibleAgentBlock);
+                    if (isTurnCompletedOrStopped && isConversationalFirstPersonNarration(text)) {
+                      return null;
+                    }
+                    return renderBlock(finalVisibleAgentBlock, finalVisibleAgentIndex);
+                  })()}
                 </>
               ) : (
                 <>
@@ -3624,6 +3751,13 @@ export default function ChatArea({
               language={language}
               chatFontSize={resolvedChatFontSize}
               progressItems={effectiveProgressLedger}
+            />
+          )}
+          {isTurnExpanded && intentHistoryExplanations.length > 0 && (
+            <TurnIntentHistoryCard
+              explanations={intentHistoryExplanations}
+              language={language}
+              chatFontSize={resolvedTurnProcessFontSize}
             />
           )}
         </div>
@@ -3841,8 +3975,8 @@ export default function ChatArea({
               lineHeight: `${Math.max(16, Math.round((resolvedChatFontSize - 1) * 1.5))}px`,
             }}
           >
-            <span className="whitespace-pre-wrap break-words text-center">
-              {persistedExplanation}
+            <span className="whitespace-pre-wrap break-words text-center block w-full">
+              {renderCompactMarkdownText(persistedExplanation)}
             </span>
           </div>
         )}

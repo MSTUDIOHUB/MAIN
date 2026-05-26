@@ -59,6 +59,7 @@ const {
   computeContextTokenBreakdown,
   compactToolResults,
   manageContext,
+  activeMemoryReclamation,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/contextTrim.ts"));
 
 test("computeContextBudgets reserves a smaller, capped output budget for long contexts", () => {
@@ -307,3 +308,38 @@ test("computeContextTokenBreakdown reports tool results as the largest source", 
   assert.match(result.topSourceLabel, /tool results/);
   assert.ok(result.topSourceTokens > result.user);
 });
+
+test("activeMemoryReclamation prunes historical reads once a successful mutation occurs", () => {
+  const readCall = {
+    id: "call_read_1",
+    function: {
+      name: "read_file",
+      arguments: JSON.stringify({ path: "src/components/Chart.tsx" }),
+    },
+  };
+  const writeCall = {
+    id: "call_write_1",
+    function: {
+      name: "write_file",
+      arguments: JSON.stringify({ path: "src/components/Chart.tsx", content: "new content" }),
+    },
+  };
+
+  const messages = [
+    { role: "system", content: "system prompt" },
+    { role: "user", content: "please update the chart component" },
+    { role: "assistant", content: "", tool_calls: [readCall] },
+    { role: "tool", tool_call_id: "call_read_1", content: "old content ".repeat(100) },
+    { role: "assistant", content: "", tool_calls: [writeCall] },
+    { role: "tool", tool_call_id: "call_write_1", content: '{"success":true,"message":"File src/components/Chart.tsx written successfully."}' },
+  ];
+
+  const result = activeMemoryReclamation(messages);
+
+  assert.equal(result.length, messages.length);
+  // The first read tool result content must be replaced by a stub
+  assert.match(result[3].content, /removed; file was successfully mutated/);
+  // The write tool result must remain unchanged
+  assert.match(result[5].content, /written successfully/);
+});
+

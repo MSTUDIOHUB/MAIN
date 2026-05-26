@@ -635,7 +635,7 @@ function rememberReadBeforeModifyEvidence(
   }
 }
 
-async function buildReadBeforeModifyValidationError(
+export async function buildReadBeforeModifyValidationError(
   tc: ToolCallToExecute,
   args: Record<string, unknown>,
   workspace: string,
@@ -650,6 +650,7 @@ async function buildReadBeforeModifyValidationError(
   const path = typeof args.path === "string" ? args.path : "";
   if (!path || isPlanArtifactPath(path)) return null;
 
+  const target = getToolTarget(tc.name, args);
   const normalizedPath = normalizeEvidencePath(path);
   const evidence = getSessionReadBeforeModifyEvidence(callbacks.getSessionKey());
   if (callbacks.getWorkspaceTree().trim()) {
@@ -659,14 +660,33 @@ async function buildReadBeforeModifyValidationError(
   const hasParentRead = evidence.has(`dir:${getParentEvidencePath(path)}`) || evidence.has("workspace:structure");
 
   let existingFile = tc.name === "replace_in_file";
+  let metadata: { path: string; sizeBytes: number; modifiedMs: number } | null = null;
   if (tc.name === "write_file") {
-    existingFile = !!(await readFileMetadataIfAvailable(path, workspace));
+    metadata = await readFileMetadataIfAvailable(path, workspace);
+    existingFile = !!metadata;
+  }
+
+  // 1. Write File Size-Gate Check
+  if (tc.name === "write_file" && metadata && metadata.sizeBytes > 8192) {
+    const language = callbacks.getPreferredLanguage();
+    const message = language === "zh"
+      ? `WRITE_FILE_GATE_BLOCKED: 文件 ${path} 已存在且体量较大 (大小: ${(metadata.sizeBytes / 1024).toFixed(1)}KB)。为节省关键上下文 Token 预算，禁止全量 write_file 重写现有大文件。你必须改用 replace_in_file 或 apply_patch 提交精确的局部 diff 修改。`
+      : `WRITE_FILE_GATE_BLOCKED: The file ${path} already exists and is large (${(metadata.sizeBytes / 1024).toFixed(1)}KB). To conserve context token budget, full-text write_file is blocked for large existing files. You MUST use replace_in_file or apply_patch to supply a precise diff.`;
+    callbacks.onToolExecuting(tc.name, target, undefined, { toolCallId: tc.id });
+    callbacks.onToolError(tc.name, target, message, { toolCallId: tc.id });
+    return {
+      toolCallId: tc.id,
+      name: tc.name,
+      target,
+      content: `Error: ${message}`,
+      isError: true,
+      lifecycleState: "blocked",
+    };
   }
 
   if (!existingFile && hasParentRead) return null;
   if (hasExactRead) return null;
 
-  const target = getToolTarget(tc.name, args);
   const language = callbacks.getPreferredLanguage();
   const message = language === "zh"
     ? existingFile
@@ -685,6 +705,97 @@ async function buildReadBeforeModifyValidationError(
     isError: true,
     lifecycleState: "blocked",
   };
+}
+
+/**
+ * Intercept and block file reads via shell commands to prevent context flooding.
+ */
+export function buildShellReadValidationError(
+  tc: ToolCallToExecute,
+  args: Record<string, unknown>,
+  callbacks: OrchestratorCallbacks,
+): ToolExecutionResult | null {
+  if (tc.name !== "run_command" && tc.name !== "execute_command") return null;
+  const command = typeof args.command === "string" ? args.command.trim() : "";
+  if (!command) return null;
+
+  const isShellRead = /^(?:cat|head|tail|sed)\b/.test(command) || /\b(?:cat|head|tail)\s+[^&|>;]+/.test(command);
+  if (isShellRead) {
+    const language = callbacks.getPreferredLanguage();
+    const message = language === "zh"
+      ? `SHELL_READ_FORBIDDEN: 禁止通过终端命令 (${command}) 直接读取文件内容以防止上下文过载。请改用内置的 read_file 工具并指定 start_line / max_lines 参数进行分页定向读取。`
+      : `SHELL_READ_FORBIDDEN: Reading files via terminal commands (${command}) is disabled to prevent context overload. Please use the built-in read_file tool with start_line / max_lines for paged reading.`;
+    const target = getToolTarget(tc.name, args);
+    callbacks.onToolExecuting(tc.name, target, undefined, { toolCallId: tc.id });
+    callbacks.onToolError(tc.name, target, message, { toolCallId: tc.id });
+    return {
+      toolCallId: tc.id,
+      name: tc.name,
+      target,
+      content: `Error: ${message}`,
+      isError: true,
+      lifecycleState: "blocked",
+    };
+  }
+  return null;
+}
+
+/**
+ * Detect repetitive read/write loops on the same file path and enforce a circuit-breaker.
+ */
+export function buildLoopDetectionValidationError(
+  tc: ToolCallToExecute,
+  args: Record<string, unknown>,
+  callbacks: OrchestratorCallbacks,
+): ToolExecutionResult | null {
+  if (tc.name !== "write_file" && tc.name !== "replace_in_file" && tc.name !== "read_file") return null;
+
+  const path = typeof args.path === "string" ? args.path.trim() : "";
+  if (!path) return null;
+
+  const messages = callbacks.getMessages();
+  let repetitions = 0;
+
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (msg.role === "assistant" && Array.isArray(msg.tool_calls)) {
+      for (const call of msg.tool_calls) {
+        const c = call as { function?: { name?: string; arguments?: string } };
+        if (c.function?.name === "write_file" || c.function?.name === "replace_in_file" || c.function?.name === "read_file") {
+          try {
+            const parsed = JSON.parse(c.function.arguments || "{}");
+            const parsedPath = (parsed.path || parsed.TargetFile || "").trim();
+            if (parsedPath === path) {
+              repetitions++;
+            }
+          } catch {
+            // Ignore malformed JSON
+          }
+        }
+      }
+    }
+    if (repetitions >= 6) break;
+  }
+
+  if (repetitions >= 5) {
+    const language = callbacks.getPreferredLanguage();
+    const message = language === "zh"
+      ? `LOOP_DETECTED: 检测到你在文件 ${path} 上执行了多次重复的读取/修改操作。为防止死循环，本次调用已拦截。请暂停并在正文中解释为什么之前的改动未能成功应用（如编译错误或环境问题），然后使用 <user_options> 请用户确认方向。`
+      : `LOOP_DETECTED: Detected multiple repetitive read/write operations on ${path}. To prevent an infinite execution loop, this call has been blocked. Please pause and explain in prose why previous edits failed (e.g. build errors or environment issues), then use <user_options> to ask the user for guidance.`;
+    const target = getToolTarget(tc.name, args);
+    callbacks.onToolExecuting(tc.name, target, undefined, { toolCallId: tc.id });
+    callbacks.onToolError(tc.name, target, message, { toolCallId: tc.id });
+    return {
+      toolCallId: tc.id,
+      name: tc.name,
+      target,
+      content: `Error: ${message}`,
+      isError: true,
+      lifecycleState: "blocked",
+    };
+  }
+
+  return null;
 }
 
 // ── Tool argument validation ────────────────────────────────────────
@@ -2930,6 +3041,24 @@ async function executeToolCallWithLifecycle(
   );
   if (planArtifactValidationError) {
     return planArtifactValidationError;
+  }
+
+  const shellReadValidationError = buildShellReadValidationError(
+    tc,
+    resolvedArgs,
+    callbacks,
+  );
+  if (shellReadValidationError) {
+    return shellReadValidationError;
+  }
+
+  const loopDetectionValidationError = buildLoopDetectionValidationError(
+    tc,
+    resolvedArgs,
+    callbacks,
+  );
+  if (loopDetectionValidationError) {
+    return loopDetectionValidationError;
   }
 
   const readBeforeModifyValidationError = await buildReadBeforeModifyValidationError(
