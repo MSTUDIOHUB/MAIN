@@ -3486,7 +3486,7 @@ export default function ChatArea({
       turn.status === "awaiting_approval" ||
       turn.status === "awaiting_input";
 
-    const intentHistoryExplanations = useMemo(() => {
+    const intentHistoryExplanations = (() => {
       if (!isTurnCompletedOrStopped) return [];
 
       const list: string[] = [];
@@ -3505,7 +3505,7 @@ export default function ChatArea({
         }
       }
       return list;
-    }, [blocks, isTurnCompletedOrStopped]);
+    })();
 
     const renderTurnBlockItem = (item) => {
       if (item.kind !== "readContextGroup" && item.kind !== "operationCluster" && item.block?.type === "thought") return null;
@@ -3966,20 +3966,23 @@ export default function ChatArea({
           transform: persistedExplanation ? "translateY(0)" : "translateY(8px)",
         }}
       >
-        {persistedExplanation && (
-          <div
-            data-testid="agent-explanation-capsule"
-            className="agent-explanation-capsule w-full max-w-3xl"
-            style={{
-              fontSize: `${Math.max(11, resolvedChatFontSize - 1)}px`,
-              lineHeight: `${Math.max(16, Math.round((resolvedChatFontSize - 1) * 1.5))}px`,
-            }}
-          >
-            <span className="whitespace-pre-wrap break-words text-center block w-full">
-              {renderCompactMarkdownText(persistedExplanation)}
-            </span>
-          </div>
-        )}
+        {persistedExplanation && (() => {
+          const isRich = persistedExplanation.includes("#") || persistedExplanation.includes("\n");
+          return (
+            <div
+              data-testid="agent-explanation-capsule"
+              className={`agent-explanation-capsule w-full max-w-3xl ${isRich ? "flex-col !items-start !justify-start !rounded-2xl !p-5" : ""}`}
+              style={{
+                fontSize: `${Math.max(11, resolvedChatFontSize - 1)}px`,
+                lineHeight: `${Math.max(16, Math.round((resolvedChatFontSize - 1) * 1.5))}px`,
+              }}
+            >
+              <span className={`whitespace-pre-wrap break-words block w-full ${isRich ? "text-left" : "text-center"}`}>
+                {renderCompactMarkdownText(persistedExplanation)}
+              </span>
+            </div>
+          );
+        })()}
       </div>
 
       <Composer

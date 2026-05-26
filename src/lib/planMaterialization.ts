@@ -144,6 +144,13 @@ const TOOL_DETAIL_HAS_SOURCE_SIGNAL_RE =
   /\b(?:src|app|lib|components|hooks|store|styles|utils|tests|pages|server|client|packages|apps)\/[A-Za-z0-9_./@-]+|\b(?:function|const|let|class|interface|type|export|import|use[A-Z][A-Za-z0-9_]*|loadOrders|parse|map|chart|dashboard|theme|dark|CSV|字段|列|指标|订单|图表|状态|趋势|环比)\b/i;
 const PATH_ECHO_EVIDENCE_RE =
   /(?:已读取文件|Read file)\s*[:：]\s*([A-Za-z0-9_@./-]+\.[A-Za-z0-9]+)(?:\s*[;；]\s*(?:发现|found)\s*[:：]\s*\1)?\s*$/i;
+const READ_FILE_RESULT_RE = /\bREAD_FILE_RESULT\b/i;
+const READ_FILE_CONTENT_START = "---CONTENT START---";
+const READ_FILE_CONTENT_END = "---CONTENT END---";
+const READ_FILE_METADATA_LINE_RE =
+  /^(?:\[MAIN_TOOL_FEEDBACK_V1\].*|READ_FILE_RESULT|path\s*:.*|truncated\s*:.*|totalLines\s*:.*|totalChars\s*:.*|returnedLines\s*:.*|returnedChars\s*:.*|nextStartLine\s*:.*|nextRead\s*:.*|note\s*:.*|---CONTENT (?:START|END)---|\.\.\.\[compact:.*)$/i;
+const PLAN_EVIDENCE_SOURCE_SIGNAL_RE =
+  /\b(?:import|export|function|const|let|class|interface|type|return|if|else|for|while|switch|case|try|catch|useEffect|useMemo|useState|props|state|set[A-Z][A-Za-z0-9_]*|load[A-Z]?[A-Za-z0-9_]*|parse[A-Z]?[A-Za-z0-9_]*|map|filter|reduce|render|csv|order|course|creator|amount|status|trend|metric|dashboard|chart|theme|dark|background|token|localStorage)\b|(?:字段|列名|订单|课程|销售|金额|状态|图表|趋势|环比|主题|深色|暗色|背景|指标)/i;
 
 function countPlanShapeSignals(content: string): number {
   const headingCount = (content.match(/^#{1,3}\s+\S+/gm) || []).length;
@@ -301,10 +308,14 @@ function isPathEchoEvidence(value: string): boolean {
   const text = String(value || "").replace(/`/g, "").trim();
   const rawTool = text.match(/^(?:read_file|read_file_window|read_document|get_file_outline)\s+([A-Za-z0-9_@./-]+\.[A-Za-z0-9]+)(?:\s*;\s*excerpt\s*=\s*\1)?$/i);
   if (rawTool) return true;
+  const rawToolWithEchoDetail = text.match(/^(?:read_file|read_file_window|read_document|get_file_outline)\s+([A-Za-z0-9_@./-]+\.[A-Za-z0-9]+)\s*;\s*(?:excerpt|summary)\s*=\s*([^\n]+)$/i);
+  if (rawToolWithEchoDetail && evidenceDetailLooksLikePathEcho(rawToolWithEchoDetail[2] || "", rawToolWithEchoDetail[1] || "")) return true;
   const localized = text.match(PATH_ECHO_EVIDENCE_RE);
   if (localized) return true;
   const excerptEcho = text.match(/^(?:已读取文件|Read file)\s*[:：]\s*([A-Za-z0-9_@./-]+\.[A-Za-z0-9]+)\s*[;；]\s*(?:发现|found)\s*[:：]\s*([A-Za-z0-9_@./-]+\.[A-Za-z0-9]+)\.?$/i);
-  return Boolean(excerptEcho && excerptEcho[1] === excerptEcho[2]);
+  if (excerptEcho && excerptEcho[1] === excerptEcho[2]) return true;
+  const localizedWithEchoDetail = text.match(/^(?:已读取文件|Read file)\s*[:：]\s*([A-Za-z0-9_@./-]+\.[A-Za-z0-9]+)\s*[;；]\s*(?:发现|found)\s*[:：]\s*([^\n]+)$/i);
+  return Boolean(localizedWithEchoDetail && evidenceDetailLooksLikePathEcho(localizedWithEchoDetail[2] || "", localizedWithEchoDetail[1] || ""));
 }
 
 function isMeaningfulConcretePlanEvidence(value: string): boolean {
@@ -330,6 +341,109 @@ function evidenceMentionsFile(evidence: string, file: string): boolean {
 
 function pickEvidenceForFile(evidence: string[], file: string): string {
   return evidence.find((item) => evidenceMentionsFile(item, file)) || evidence[0] || "";
+}
+
+function extractDelimitedReadFileBody(value: string): string {
+  const raw = String(value || "");
+  const startIndex = raw.indexOf(READ_FILE_CONTENT_START);
+  if (startIndex >= 0) {
+    const bodyStart = startIndex + READ_FILE_CONTENT_START.length;
+    const endIndex = raw.indexOf(READ_FILE_CONTENT_END, bodyStart);
+    return (endIndex >= 0 ? raw.slice(bodyStart, endIndex) : raw.slice(bodyStart)).trim();
+  }
+  if (!READ_FILE_RESULT_RE.test(raw)) return "";
+  const lines = raw.split(/\r?\n/);
+  const contentLines = lines.filter((line) => {
+    const trimmed = line.trim();
+    if (!trimmed) return false;
+    return !READ_FILE_METADATA_LINE_RE.test(trimmed);
+  });
+  if (contentLines.length === lines.length) return "";
+  return contentLines.join("\n").trim();
+}
+
+function compactPlanEvidenceSourceLine(line: string, index: number): string {
+  const compacted = compactPlanLine(line, 150, true)
+    .replace(/^\s*(?:\d+[:|]\s*)?/, "")
+    .trim();
+  if (!compacted) return "";
+  return `L${index + 1}: ${compacted}`;
+}
+
+function collectPlanEvidenceSourceSignals(body: string, maxChars: number): string {
+  const lines = String(body || "").split(/\r?\n/);
+  const picked: string[] = [];
+  let chars = 0;
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index] || "";
+    if (!PLAN_EVIDENCE_SOURCE_SIGNAL_RE.test(line)) continue;
+    const compacted = compactPlanEvidenceSourceLine(line, index);
+    if (!compacted || picked.includes(compacted)) continue;
+    const nextChars = chars + compacted.length + 1;
+    if (nextChars > maxChars && picked.length > 0) break;
+    picked.push(compacted);
+    chars = nextChars;
+    if (picked.length >= 6) break;
+  }
+  if (picked.length > 0) return picked.join(" ");
+
+  const fallback = lines
+    .map((line, index) => compactPlanEvidenceSourceLine(line, index))
+    .filter(Boolean)
+    .slice(0, 3)
+    .join(" ");
+  return compactPlanLine(fallback, maxChars, true);
+}
+
+function stripReadFileMetadataText(value: string): string {
+  if (!READ_FILE_RESULT_RE.test(value)) return value;
+  const body = extractDelimitedReadFileBody(value);
+  if (!body) return "";
+  return collectPlanEvidenceSourceSignals(body, 220);
+}
+
+function evidenceDetailLooksLikePathEcho(detail: string, target: string): boolean {
+  const normalizedDetail = String(detail || "")
+    .replace(/[`"'，。；;:：|]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+  const normalizedTarget = String(target || "")
+    .replace(/\\/g, "/")
+    .replace(/[`"'，。；;:：|]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+  if (!normalizedDetail || !normalizedTarget) return false;
+  if (normalizedDetail === normalizedTarget) return true;
+  return normalizedDetail.startsWith(`${normalizedTarget} `);
+}
+
+export function summarizePlanEvidenceDetail(input: {
+  tool?: string;
+  target?: string;
+  content?: string;
+  maxChars?: number;
+}): string {
+  const maxChars = Math.max(80, input.maxChars || 180);
+  const raw = String(input.content || "").trim();
+  if (!raw) return "";
+  const parsedFeedback = parseToolFeedbackEnvelope(raw);
+  const source = parsedFeedback ? (parsedFeedback.body || parsedFeedback.envelope.summary || "") : raw;
+  const target = normalizePathLikeCandidate(input.target || parsedFeedback?.envelope.target || "");
+
+  const withoutReadMetadata = stripReadFileMetadataText(source);
+  const stripped = withoutReadMetadata || (!READ_FILE_RESULT_RE.test(source) ? source : "");
+  if (!stripped) return "";
+
+  const detail = stripToolMetaFields(stripped)
+    .replace(/\b(?:node_modules|dist|build)\/[A-Za-z0-9_./@-]+/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const cleanDetail = compactPlanLine(detail, maxChars, true);
+  if (!cleanDetail) return "";
+  if (evidenceDetailLooksLikePathEcho(cleanDetail, target)) return "";
+  return cleanDetail;
 }
 
 function stripToolMetaFields(value: string): string {
@@ -392,12 +506,17 @@ function normalizeSemanticToolEvidence(input: {
   if (/^\*\*\/\*\.(?:tsx?|jsx?)$/i.test(target) || (/^\*\*\//.test(rawTarget) && /node_modules/i.test(String(input.detail || "")))) {
     return "";
   }
-  const detail = stripToolMetaFields(String(input.detail || ""))
-    .replace(/\b(?:node_modules|dist|build)\/[A-Za-z0-9_./@-]+/gi, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+  const detail = summarizePlanEvidenceDetail({
+    tool,
+    target,
+    content: String(input.detail || ""),
+    maxChars: 180,
+  });
   if (isInternalPlanEvidenceText(detail)) return "";
   const cleanDetail = compactPlanLine(detail, 160);
+  if (/^(?:read_file|read_file_window|read_document|get_file_outline)$/i.test(tool) && !cleanDetail) {
+    return "";
+  }
   if (tool === "grep_search" && cleanDetail && TOOL_DETAIL_NON_EVIDENCE_RE.test(cleanDetail) && !TOOL_DETAIL_HAS_SOURCE_SIGNAL_RE.test(cleanDetail)) {
     return "";
   }
@@ -459,6 +578,9 @@ function sanitizeEvidenceLine(value: unknown, language: "zh" | "en"): { value: s
     });
     if (normalized) return { value: normalized };
     if (SEMANTIC_EVIDENCE_TOOLS.has(semicolonToolEvidence[1] || "")) {
+      if (READ_FILE_RESULT_RE.test(semicolonToolEvidence[3] || raw)) {
+        return { value: "", reason: "raw_read_file_metadata" };
+      }
       return { value: "", reason: /failed|blocked|rejected/i.test(statusMatch?.[1] || "") ? "tool_failed" : "non_semantic_tool" };
     }
   }
@@ -478,7 +600,22 @@ function sanitizeEvidenceLine(value: unknown, language: "zh" | "en"): { value: s
       detail: raw.match(/\b(?:summary|excerpt)\s*[:=]\s*([^;\n}]{1,260})/i)?.[1] || "",
       status: statusMatch?.[1] || "",
     });
+    if (!normalized && READ_FILE_RESULT_RE.test(raw)) return { value: "", reason: "raw_read_file_metadata" };
     return normalized ? { value: normalized } : { value: "", reason: "non_semantic_tool" };
+  }
+
+  if (READ_FILE_RESULT_RE.test(raw)) {
+    const path = normalizePathLikeCandidate(raw);
+    const detail = summarizePlanEvidenceDetail({
+      tool: "read_file",
+      target: path,
+      content: raw,
+      maxChars: 180,
+    });
+    if (path && detail && !/status\s*[:=]\s*(?:failed|blocked|rejected)/i.test(raw)) {
+      return { value: `read_file ${path}; excerpt=${detail}` };
+    }
+    return { value: "", reason: "raw_read_file_metadata" };
   }
 
   if (RAW_TOOL_RESULT_NOISE_RE.test(raw)) {
@@ -492,6 +629,7 @@ function sanitizeEvidenceLine(value: unknown, language: "zh" | "en"): { value: s
   const clean = compactPlanLine(stripToolMetaFields(raw), 200);
   if (!clean) return { value: "", reason: "tool_log_noise" };
   if (/^(?:\]|\.\.\.|\[|\{|\})$/.test(clean)) return { value: "", reason: "syntax_fragment" };
+  if (isPathEchoEvidence(clean)) return { value: "", reason: "path_echo_evidence" };
   return { value: clean };
 }
 
@@ -703,7 +841,12 @@ function summarizeToolActivityForEvidence(activity: PlanMaterializationToolActiv
     ? rawTool
     : cleanPlanItem(rawTool, 40).replace(/\s+/g, "_");
   const target = cleanPlanItem(activity.target, 120);
-  const detail = cleanPlanItem(activity.detail, 160);
+  const detail = summarizePlanEvidenceDetail({
+    tool,
+    target,
+    content: activity.detail || "",
+    maxChars: 180,
+  }) || (READ_FILE_RESULT_RE.test(String(activity.detail || "")) ? "" : cleanPlanItem(activity.detail, 160));
   if (!tool && !target && !detail) return "";
   return [tool, target].filter(Boolean).join(" ") + (detail ? `; excerpt=${detail}` : "");
 }

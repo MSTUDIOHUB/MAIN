@@ -288,6 +288,7 @@ import {
   composeReviewablePlanFromEvidence,
   materializePlanArtifactFromVisibleText,
   sanitizePlanEvidenceInput,
+  summarizePlanEvidenceDetail,
   type PlanEvidenceRecord,
   type PlanMaterializationSource,
 } from "./planMaterialization";
@@ -4568,6 +4569,7 @@ export async function executeAgentLoop(
   let planEvidenceRecoveryPasses = 0;
   let planReasoningOnlyRecoveryPasses = 0;
   let planAutoScaffoldPromptIssued = false;
+  let planDeterministicClosureEvidenceRecoveryIssued = false;
   let usedExecuteCompletionEvidencePrompt = false;
   let usedExecuteReplanningEvidencePrompt = false;
   let usedReadOnlyPermissionHardRecoveryPrompt = false;
@@ -4626,7 +4628,14 @@ export async function executeAgentLoop(
   };
   const rememberToolActivity = (targetList: PlanToolActivitySummary[], result: ToolExecutionResult) => {
     if (result.internalFeedback) return;
-    const detail = truncateForLog(result.displayContent || result.content || "", 120);
+    const rawDetail = result.displayContent || result.content || "";
+    const planEvidenceDetail = summarizePlanEvidenceDetail({
+      tool: result.name,
+      target: result.target,
+      content: rawDetail,
+      maxChars: 220,
+    });
+    const detail = planEvidenceDetail || (/\bREAD_FILE_RESULT\b/i.test(rawDetail) ? "" : truncateForLog(rawDetail, 120));
     targetList.push({
       name: result.name,
       target: result.target,
@@ -4768,6 +4777,26 @@ export async function executeAgentLoop(
     return "approved_continue";
   }
 
+  const buildDeterministicClosureEvidenceRecoveryPrompt = (reason: string): string => {
+    const language = callbacks.getPreferredLanguage();
+    if (language === "en") {
+      return [
+        "PLAN_DETERMINISTIC_CLOSURE_NEEDS_EVIDENCE: MAIN could not materialize a reviewable plan from clean evidence.",
+        reason ? `Failure reason: ${reason}.` : "",
+        "Do exactly one targeted read/search for the missing source or data fact. Prefer the specific file, symbol, or dataset already implicated by the user request.",
+        "After that single tool result, stop exploring and produce a concise `<proposed_plan>` for `.MAIN/plans/plan.md`.",
+        "Do not call broad directory scans, do not edit source files, and do not create `tasks.md` before approval.",
+      ].filter(Boolean).join("\n");
+    }
+    return [
+      "PLAN_DETERMINISTIC_CLOSURE_NEEDS_EVIDENCE: MAIN 无法从清洗后的证据物化可审批计划。",
+      reason ? `失败原因：${reason}。` : "",
+      "下一步只做一次定向读取/搜索，补齐缺失的源码或数据事实。优先读取用户目标已经指向的具体文件、符号或数据集。",
+      "拿到这一次工具结果后，停止探索，直接输出精简 `<proposed_plan>`，用于 `.MAIN/plans/plan.md`。",
+      "不要再泛扫目录；批准前不要修改源码，也不要创建 `tasks.md`。",
+    ].filter(Boolean).join("\n");
+  };
+
   async function materializePlanFromEvidenceForReview(trigger: string, details: {
     qualityGateReason?: string;
     qualityRejectCount?: number;
@@ -4798,7 +4827,28 @@ export async function executeAgentLoop(
           preview: compactDiagnosticText(item.preview, 140),
         })),
     });
-    if (!hasGroundedPlanClosureEvidence(closureInput, recentPlanToolActivity)) {
+    const hasClosureGroundedEvidence = hasGroundedPlanClosureEvidence(closureInput, recentPlanToolActivity);
+    const hasStructuredClosureEvidence = closureInput.evidenceRecords.length > 0;
+    const logDeterministicClosureDecision = (reason: string, deterministicClosure: boolean) => {
+      logAgentEvent("plan_quality_gate_recovery_decision", {
+        trigger,
+        iteration,
+        qualityGateReason: details.qualityGateReason || reason || "deterministic_closure",
+        qualityRejectCount: details.qualityRejectCount || planQualityRejectCount,
+        recoveryAction: "deterministic_closure",
+        hasGroundedEvidence: hasClosureGroundedEvidence,
+        hasStructuredEvidence: hasStructuredClosureEvidence,
+        deterministicClosure,
+        deterministicClosureReason: reason,
+        sanitizedEvidenceCount: closureInput.evidence.length,
+        structuredEvidenceCount: closureInput.evidenceRecords.length,
+        sanitizedFileCount: closureInput.files.length,
+        sanitizerDropped: closureInput.sanitizer.dropped,
+        sanitizerDropReasons: closureInput.sanitizer.dropReasons,
+      });
+    };
+    if (!hasClosureGroundedEvidence) {
+      logDeterministicClosureDecision("missing_grounded_evidence", false);
       logAgentEvent("plan_deterministic_materialization_skipped", {
         trigger,
         reason: "missing_grounded_evidence",
@@ -4849,6 +4899,7 @@ export async function executeAgentLoop(
     });
 
     if (!materialized.ok) {
+      logDeterministicClosureDecision(materialized.reason || "quality_gate", false);
       logAgentEvent("plan_deterministic_materialization_rejected", {
         trigger,
         reason: materialized.reason || "unknown",
@@ -7706,6 +7757,18 @@ export async function executeAgentLoop(
                 iteration,
                 visibleChars: sourceVisibleText.length,
               });
+              if (!planDeterministicClosureEvidenceRecoveryIssued && planEvidenceRecoveryPasses < 1) {
+                planDeterministicClosureEvidenceRecoveryIssued = true;
+                setPlanRuntimePhase("needs_evidence", "deterministic closure failed");
+                callbacks.onStatusChange("running");
+                callbacks.appendMessage({
+                  role: "user",
+                  content: buildDeterministicClosureEvidenceRecoveryPrompt(
+                    planLastQualityGateReason || "deterministic closure failed",
+                  ),
+                });
+                continue;
+              }
             }
             logAgentEvent("loop_stop", {
               reason: "plan_recovery_prompt_limit",
@@ -9554,6 +9617,18 @@ export async function executeAgentLoop(
           qualityGateReason: pendingPlanDeterministicQualityClosure.qualityGateReason,
           qualityRejectCount: pendingPlanDeterministicQualityClosure.qualityRejectCount,
         });
+        if (!planDeterministicClosureEvidenceRecoveryIssued && planEvidenceRecoveryPasses < 1) {
+          planDeterministicClosureEvidenceRecoveryIssued = true;
+          setPlanRuntimePhase("needs_evidence", "quality deterministic closure failed");
+          callbacks.onStatusChange("running");
+          callbacks.appendMessage({
+            role: "user",
+            content: buildDeterministicClosureEvidenceRecoveryPrompt(
+              pendingPlanDeterministicQualityClosure.qualityGateReason || "quality deterministic closure failed",
+            ),
+          });
+          continue;
+        }
         callbacks.onNonActionableStop(
           buildNonActionableStopMessage(callbacks.getPreferredLanguage(), "incomplete_plan"),
           "incomplete_plan",

@@ -60,6 +60,7 @@ const {
   isMaterializablePlanLikeText,
   materializePlanArtifactFromVisibleText,
   sanitizePlanEvidenceInput,
+  summarizePlanEvidenceDetail,
 } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/planMaterialization.ts"),
 );
@@ -996,10 +997,11 @@ test("sanitizes repeated quality-gate evidence before deterministic plan materia
   });
 
   assert.deepEqual(sanitized.files.sort(), ["src/App.tsx", "src/components/ChatArea.tsx"].sort());
-  assert.equal(sanitized.evidence.length, 2);
-  assert.match(sanitized.evidence.join("\n"), /read_file src\/App\.tsx/);
+  assert.equal(sanitized.evidence.length, 1);
+  assert.doesNotMatch(sanitized.evidence.join("\n"), /read_file src\/App\.tsx/);
   assert.match(sanitized.evidence.join("\n"), /read_file src\/components\/ChatArea\.tsx/);
   assert.doesNotMatch(sanitized.evidence.join("\n"), /PLAN NOT READY|ContextMemory|hash=|status=|READ_FILE_RESULT|TASK_TARGETING_BLOCKED|\*\*\/\*\.ts|node_modules/);
+  assert.equal(sanitized.stats.dropReasons.raw_read_file_metadata, 1);
   assert.equal(sanitized.stats.dropReasons.plan_artifact_evidence, 1);
   assert.equal(sanitized.stats.dropReasons.plan_artifact_path, 1);
   assert.ok(sanitized.stats.dropped >= 3);
@@ -1015,6 +1017,91 @@ test("sanitizes repeated quality-gate evidence before deterministic plan materia
   assert.equal(validateActionablePlanArtifact(content).ok, true);
   assert.doesNotMatch(content, /落实已批准目标|approved goal/i);
   assert.doesNotMatch(content, /PLAN NOT READY|ContextMemory|hash=|status=|READ_FILE_RESULT|TASK_TARGETING_BLOCKED/);
+});
+
+test("read_file window metadata is stripped before deterministic plan evidence", () => {
+  const rawReadResult = [
+    "READ_FILE_RESULT",
+    "path: src/components/Dashboard/CourseBarChart.tsx",
+    "truncated: false",
+    "totalLines: 8",
+    "totalChars: 312",
+    "returnedLines: 1-8",
+    "returnedChars: 312",
+    "---CONTENT START---",
+    "export function CourseBarChart({ courseSalesData }) {",
+    "  const chartRows = courseSalesData.map((item) => ({ name: item.courseName, value: item.salesAmount }));",
+    "  return <BarChart data={chartRows} />;",
+    "}",
+    "---CONTENT END---",
+  ].join("\n");
+
+  const detail = summarizePlanEvidenceDetail({
+    tool: "read_file",
+    target: "src/components/Dashboard/CourseBarChart.tsx",
+    content: rawReadResult,
+  });
+  assert.match(detail, /CourseBarChart|courseSalesData|chartRows/);
+  assert.doesNotMatch(detail, /READ_FILE_RESULT|totalLines|returnedLines|path:/);
+
+  const sanitized = sanitizePlanEvidenceInput({
+    userGoal: "修复 CSV 导入后 Dashboard 图表不显示真实课程销售排行。",
+    evidence: [
+      `read_file src/components/Dashboard/CourseBarChart.tsx; status=observed; ${rawReadResult}`,
+      "read_file src/store/dashboardStore.ts; excerpt=loadOrders 聚合导入订单并刷新 Dashboard 指标",
+    ],
+    files: [
+      "src/components/Dashboard/CourseBarChart.tsx",
+      "src/store/dashboardStore.ts",
+    ],
+    language: "zh",
+  });
+
+  assert.match(sanitized.evidence.join("\n"), /CourseBarChart\.tsx/);
+  assert.match(sanitized.evidence.join("\n"), /courseSalesData|chartRows|loadOrders/);
+  assert.doesNotMatch(sanitized.evidence.join("\n"), /READ_FILE_RESULT|totalLines|returnedLines|hash=|status=/);
+
+  const content = composePlanArtifactFromEvidence({
+    userGoal: sanitized.userGoal,
+    evidence: sanitized.evidence,
+    files: sanitized.files,
+    constraints: [],
+    language: "zh",
+  });
+  const validation = validateActionablePlanArtifact(content);
+  assert.equal(validation.ok, true, validation.reason || "");
+  assert.doesNotMatch(content, /weak_path_echo_evidence|READ_FILE_RESULT|totalLines|returnedLines|hash=|status=/);
+});
+
+test("metadata-only read evidence cannot produce a reviewable deterministic plan", () => {
+  const sanitized = sanitizePlanEvidenceInput({
+    userGoal: "修复 CSV 导入后 Dashboard 数据不显示。",
+    evidence: [
+      "read_file src/components/FileUploader/DragUpload.tsx; status=observed; summary=READ_FILE_RESULT path: src/components/FileUploader/DragUpload.tsx truncated: false totalLines: 114 returnedLines: 1-114",
+      "list_directory src/components/Dashboard; excerpt=src/components/Dashboard/CourseBarChart.tsx src/components/Dashboard/TrendLineChart.tsx",
+      "grep_search csv; status=observed; summary=MAIN/plans/plan.md:7:- 旧计划里的 CSV 推断",
+    ],
+    files: [
+      "src/components/FileUploader/DragUpload.tsx",
+      ".MAIN/plans/plan.md",
+    ],
+    language: "zh",
+  });
+
+  assert.equal(sanitized.stats.dropReasons.raw_read_file_metadata, 1);
+  assert.equal(sanitized.stats.dropReasons.plan_artifact_evidence, 1);
+  assert.doesNotMatch(sanitized.evidence.join("\n"), /DragUpload\.tsx.*发现|READ_FILE_RESULT|MAIN\/plans\/plan\.md/);
+
+  const content = composePlanArtifactFromEvidence({
+    userGoal: sanitized.userGoal,
+    evidence: sanitized.evidence,
+    files: sanitized.files,
+    constraints: [],
+    language: "zh",
+  });
+  const validation = validateActionablePlanArtifact(content);
+  assert.equal(validation.ok, false);
+  assert.match(validation.reason || "", /missing_plan_sections|missing_plan_required_sections|insufficient_actionable_plan_signals|generic_fallback_plan/);
 });
 
 test("deterministic materialization extracts the real goal from turn intake wrappers", () => {
