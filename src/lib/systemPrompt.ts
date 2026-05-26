@@ -32,6 +32,11 @@ export const MAIN_MODE_PROMPTS: Record<MainModeKey, string> = {
     "不要把 49 个专家误解为 49 套全局人格；它们只是 Game Studio 模式下的二级专家层，由 MAIN 的中枢路由驱动。",
     "面对空工作区时，优先帮助用户完成概念启动、引擎选择、GDD/GTD/任务结构搭建和协作协议落地，而不是假设项目已经存在。",
   ].join("\n"),
+  image_studio: [
+    "你当前处于 MAIN 场景：图像工作室（Image Studio）。",
+    "图像工作室应由独立图片运行时处理，不应进入普通 LLM 工具执行、权限审批或代码代理流程。",
+    "如果这段提示意外进入模型请求，应简短说明需要回到图像工作室界面配置图像引擎，而不要执行命令或调用工具。",
+  ].join("\n"),
 };
 
 export type GameStudioPromptContext = {

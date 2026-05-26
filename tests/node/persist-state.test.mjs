@@ -100,6 +100,32 @@ test("buildPersistedAppState keeps lightweight config/session metadata only", ()
     currentSessionId: 1,
     selectedMainModeKey: "main_mode",
     selectedNexusModeKey: "nexus_general",
+    imageStudio: {
+      config: {
+        engine: "hidream_http",
+        endpoint: "http://127.0.0.1:7860",
+        defaultSize: { width: 1024, height: 1024 },
+        aspectRatio: "1:1",
+        steps: 28,
+        guidanceScale: 5,
+        seedMode: "random",
+        seed: 32,
+        outputDirectory: "",
+      },
+      status: {
+        state: "unknown",
+        message: "not checked",
+        capabilities: {
+          textToImage: true,
+          imageToImage: true,
+          progressPreview: true,
+          cudaRequired: true,
+        },
+      },
+      setupGuideOpen: false,
+      activeJobId: null,
+      activeStreamId: null,
+    },
     activeStudioAgentKey: "studio_auto",
     gameStudioInitialized: true,
     preferredResponseLanguage: "zh",
@@ -124,6 +150,7 @@ test("buildPersistedAppState keeps lightweight config/session metadata only", ()
     Object.prototype.hasOwnProperty.call(persisted.sessionsByWorkspace["/repo"][0], "messages"),
     false,
   );
+  assert.equal(persisted.imageStudio?.config?.endpoint, "http://127.0.0.1:7860");
 });
 
 test("stripLegacyRuntimeFieldsFromPersistedState removes heavy runtime keys and stale session payloads", () => {

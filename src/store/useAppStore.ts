@@ -7,6 +7,7 @@ import { executeAgentLoop, type AgentMessage, type OrchestratorCallbacks, type R
 import type { ExecuteRecoveryMode } from "../lib/executeRecoveryTools";
 import {
   analyzeTabularDocument,
+  cancelImageStudioJob,
   deleteChatTempPath,
   deletePlanFiles,
   deleteWorkspacePath,
@@ -246,6 +247,22 @@ import {
 } from "../lib/planStateHydration";
 import { PLAN_ARTIFACT_PATHS, hydratePlanArtifactsFromReader } from "../lib/planArtifactHydration";
 import { mapLegacyNexusModeToMainMode, mapMainModeToLegacyNexusMode, type MainModeKey } from "../lib/mainModes";
+import {
+  buildImageGenerationParams,
+  checkImageStudioEngineStatus,
+  createDefaultImageStudioRuntime,
+  createInitialImageProgress,
+  normalizeImageStudioConfig,
+  normalizeImageStudioRuntime,
+  persistGeneratedImage,
+  startHiDreamGeneration,
+  streamHiDreamGeneration,
+  type ImageGenerationBlockPayload,
+  type ImageGenerationParams,
+  type ImageStudioConfig,
+  type ImageStudioEngineStatus,
+  type ImageStudioRuntime,
+} from "../lib/imageStudio";
 import { runIntentPreflight } from "../lib/intentPreflight";
 import { runAfterNextPaint } from "../lib/uiScheduling";
 import {
@@ -480,6 +497,7 @@ export const translations = {
     runMode: "Run Mode",
     main_mode: "MAIN",
     game_studio: "Game Studio",
+    image_studio: "Image Studio",
     nexus_general: "General Collaboration",
     nexus_create: "Creative Co-Creation",
     nexus_build: "Engineering Delivery",
@@ -587,6 +605,7 @@ export const translations = {
     runMode: "工作方式",
     main_mode: "MAIN",
     game_studio: "游戏工作室",
+    image_studio: "图像工作室",
     nexus_general: "通用协作",
     nexus_create: "创意共创",
     nexus_build: "工程实现",
@@ -766,6 +785,7 @@ export interface SessionRuntimeSnapshot {
   currentTurnId: string | null;
   selectedMainModeKey: MainModeKey;
   selectedNexusModeKey: NexusModeKey;
+  imageStudio?: ImageStudioRuntime;
   activeStudioAgentKey: StudioAgentKey;
   gameStudioInitialized: boolean;
   pendingSlashCommand: PendingSlashCommand | null;
@@ -1004,6 +1024,7 @@ export type TaskBlock =
   | (TaskBlockBase & { type: "user"; content: string; images?: string[]; contextItems?: UserContextItem[] })
   | (TaskBlockBase & { type: "tool"; toolName: string; target: string; status: string; toolStatus: "pending" | "executed" | "rejected" | "running" | "failed"; toolCallId?: string; message?: string; diff?: ToolDiffSnapshot; shellPermissionDecision?: ShellPermissionDecision; revertStatus?: DiffRevertStatus; revertMessage?: string; intentSummary?: string; why?: string; evidence?: string; observationSummary?: string; qualityGateReason?: string; planRecoveryReason?: string })
   | (TaskBlockBase & { type: "agent"; content: string; options?: ReplyOption[]; streaming?: boolean; hiddenProcess?: boolean; visibility?: AssistantTextVisibility; archivedAfterChoice?: boolean; selectedOption?: string })
+  | (TaskBlockBase & ImageGenerationBlockPayload)
   | ProgressTaskBlock
   | (TaskBlockBase & { type: "thought"; content: string; isStreaming?: boolean; duration?: number })
   | (TaskBlockBase & { type: "jobList"; jobs: JobItem[] })
@@ -1118,6 +1139,7 @@ interface AppState {
   pendingRunDecision: PendingRunDecision | null;
   dismissedPendingDecisionInputKey: string | null;
   executionConsentPolicy: ExecutionConsentPolicy;
+  imageStudio: ImageStudioRuntime;
   setInput: (v: string, options?: { preserveLockedComposerIntent?: boolean }) => void;
   setPreferredResponseLanguage: (lang: Lang) => void;
   setContextMentions: (v: string[]) => void;
@@ -1139,6 +1161,11 @@ interface AppState {
       | "approve_thread"
       | "cancel",
   ) => void;
+  setImageStudioConfig: (patch: Partial<ImageStudioConfig>) => void;
+  setImageStudioStatus: (status: Partial<ImageStudioEngineStatus>) => void;
+  setImageStudioSetupGuideOpen: (value: boolean) => void;
+  checkImageStudioEngine: () => Promise<ImageStudioEngineStatus>;
+  runImageStudioGeneration: (text: string, images?: string[]) => boolean;
   refreshGameStudioWorkspaceState: () => Promise<void>;
   initializeGameStudioWorkspace: () => Promise<void>;
   removeGameStudioWorkspace: () => Promise<void>;
@@ -1846,6 +1873,7 @@ function normalizeSessionRuntimeSnapshot(
     currentTurnId: snapshot.currentTurnId ?? null,
     selectedMainModeKey,
     selectedNexusModeKey: mapMainModeToLegacyNexusMode(selectedMainModeKey),
+    imageStudio: normalizeImageStudioRuntime(snapshot.imageStudio),
     activeStudioAgentKey: normalizeStudioAgentKey(snapshot.activeStudioAgentKey),
     gameStudioInitialized: snapshot.gameStudioInitialized === true,
     pendingSlashCommand: normalizePendingSlashCommand(snapshot.pendingSlashCommand),
@@ -1888,6 +1916,7 @@ const sessionRuntimeKeys = [
   "currentTurnId",
   "selectedMainModeKey",
   "selectedNexusModeKey",
+  "imageStudio",
   "activeStudioAgentKey",
   "gameStudioInitialized",
   "pendingSlashCommand",
@@ -1988,6 +2017,7 @@ function createSessionRuntimeFromState(state: Partial<AppState>): SessionRuntime
     currentTurnId: state.currentTurnId ?? null,
     selectedMainModeKey,
     selectedNexusModeKey: mapMainModeToLegacyNexusMode(selectedMainModeKey),
+    imageStudio: normalizeImageStudioRuntime(state.imageStudio),
     activeStudioAgentKey: normalizeStudioAgentKey(state.activeStudioAgentKey),
     gameStudioInitialized: state.gameStudioInitialized === true,
     pendingSlashCommand: normalizePendingSlashCommand(state.pendingSlashCommand),
@@ -2463,6 +2493,7 @@ class StreamingThinkingInterceptor {
 // ── Task ID counter ───────────────────────────────────────────────────
 
 let taskIdCounter = 100; // Start high to avoid collision with mock data
+let activeImageStudioStreamCleanup: (() => void) | null = null;
 
 export function syncTaskIdCounterFromBlocks(blocks: TaskBlock[]): void {
   const maxId = blocks.reduce((highest, block) => Math.max(highest, Number(block.id) || 0), 0);
@@ -3316,6 +3347,21 @@ export function sanitizeTaskBlocksForPersist(blocks: TaskBlock[]): TaskBlock[] {
               }
             : {}),
         };
+      case "imageGeneration":
+        return {
+          id: b.id,
+          turnId: b.turnId,
+          ...persistedTurnPhase(b),
+          type: "imageGeneration" as const,
+          status: b.status,
+          prompt: String(b.prompt || ""),
+          params: b.params,
+          progress: b.progress,
+          ...(b.outputPath ? { outputPath: String(b.outputPath) } : {}),
+          ...(b.jobId ? { jobId: String(b.jobId) } : {}),
+          ...(b.streamId ? { streamId: String(b.streamId) } : {}),
+          ...(b.error ? { error: String(b.error) } : {}),
+        };
       case "progress": {
         const progress = normalizeProgressNarration(b);
         return {
@@ -3983,6 +4029,40 @@ export const useAppStore = create<AppState>()(
   setGenerating: (value, ctrl = null) => set({ isGenerating: value, abortController: ctrl }),
   stopGeneration: () => {
     const currentTurnId = get().currentTurnId;
+    if (get().selectedMainModeKey === "image_studio" || get().imageStudio.activeStreamId) {
+      activeImageStudioStreamCleanup?.();
+      activeImageStudioStreamCleanup = null;
+      void cancelImageStudioJob().catch(() => {});
+      set((s) => ({
+        isGenerating: false,
+        abortController: null,
+        agentStatus: "idle",
+        imageStudio: {
+          ...s.imageStudio,
+          activeJobId: null,
+          activeStreamId: null,
+        },
+        taskFlow: s.taskFlow.map((block) =>
+          block.turnId === currentTurnId && block.type === "imageGeneration" && block.status === "running"
+            ? {
+                ...block,
+                status: "canceled" as const,
+                progress: {
+                  ...block.progress,
+                  stage: "canceled" as const,
+                  message: s.config.language === "en" ? "Canceled" : "已取消",
+                },
+              }
+            : block,
+        ),
+        conversationTurns: currentTurnId
+          ? s.conversationTurns.map((turn) =>
+              turn.id === currentTurnId ? { ...turn, status: "stopped_no_action" as const } : turn
+            )
+          : s.conversationTurns,
+      }));
+      return;
+    }
     get().abortController?.abort();
     invoke("cancel_proxy_request").catch(() => {});
     invoke("cancel_chat_stream").catch(() => {});
@@ -4213,6 +4293,7 @@ export const useAppStore = create<AppState>()(
   pendingRunDecision: null,
   dismissedPendingDecisionInputKey: null,
   executionConsentPolicy: "ask_per_turn",
+  imageStudio: createDefaultImageStudioRuntime(),
   setInput: (v, options) => set((s) => {
     const currentInputKey = normalizePendingDecisionInputKey(s.input);
     const nextInputKey = normalizePendingDecisionInputKey(v);
@@ -4464,6 +4545,415 @@ export const useAppStore = create<AppState>()(
         }),
       });
     });
+  },
+  setImageStudioConfig: (patch) =>
+    set((s) => ({
+      imageStudio: {
+        ...s.imageStudio,
+        config: normalizeImageStudioConfig({
+          ...s.imageStudio.config,
+          ...patch,
+          defaultSize: patch.defaultSize
+            ? { ...s.imageStudio.config.defaultSize, ...patch.defaultSize }
+            : s.imageStudio.config.defaultSize,
+        }),
+      },
+    })),
+  setImageStudioStatus: (status) =>
+    set((s) => ({
+      imageStudio: {
+        ...s.imageStudio,
+        status: {
+          ...s.imageStudio.status,
+          ...status,
+          capabilities: {
+            ...s.imageStudio.status.capabilities,
+            ...(status.capabilities || {}),
+          },
+        },
+      },
+    })),
+  setImageStudioSetupGuideOpen: (value) =>
+    set((s) => ({
+      imageStudio: {
+        ...s.imageStudio,
+        setupGuideOpen: value,
+      },
+    })),
+  checkImageStudioEngine: async () => {
+    const config = get().imageStudio.config;
+    const status = await checkImageStudioEngineStatus(config);
+    set((s) => ({
+      imageStudio: {
+        ...s.imageStudio,
+        status,
+        setupGuideOpen: status.state === "ready" ? false : s.imageStudio.setupGuideOpen,
+      },
+    }));
+    return status;
+  },
+  runImageStudioGeneration: (text, images) => {
+    const prompt = String(text || "").trim();
+    if (!prompt && (!images || images.length === 0)) return false;
+    if (get().isGenerating) return false;
+
+    const state = get();
+    const language = state.config.language === "en" ? "en" : "zh";
+    const sessionScopeKey = resolveSessionWorkspaceKey(state.currentWorkspace);
+    let ensuredSessionId = state.currentSessionId;
+    const workspaceSessions = state.sessionsByWorkspace[sessionScopeKey] || [];
+    const hasValidCurrentSession =
+      ensuredSessionId != null &&
+      workspaceSessions.some((session) => session.id === ensuredSessionId);
+
+    if (!hasValidCurrentSession) {
+      const autoSessionId = Date.now();
+      const autoSessionDate = new Date(autoSessionId).toISOString();
+      const autoSession: Session = {
+        id: autoSessionId,
+        title: language === "en" ? "Image Studio" : "图像工作室",
+        titleSource: "default",
+        date: autoSessionDate,
+        updatedAt: autoSessionDate,
+        updatedAtMs: autoSessionId,
+        active: true,
+        storageStatus: "temporary",
+        recordingDisabled: !state.config.sessionRecordingEnabled,
+        messages: [],
+      };
+      set((s) => ({
+        sessionsByWorkspace: {
+          ...s.sessionsByWorkspace,
+          [sessionScopeKey]: [
+            autoSession,
+            ...(s.sessionsByWorkspace[sessionScopeKey] || []).map((session) => ({
+              ...session,
+              active: false,
+            })),
+          ],
+        },
+        currentSessionId: autoSessionId,
+      }));
+      ensuredSessionId = autoSessionId;
+    }
+
+    const runSessionKey = resolveSessionRuntimeKey(sessionScopeKey, ensuredSessionId)!;
+    const issuedAt = Date.now();
+    const issuedAtIso = new Date(issuedAt).toISOString();
+    const turnId = `image-turn-${issuedAt}-${Math.random().toString(36).slice(2, 8)}`;
+    const userBlockId = get()._nextTaskId();
+    const generationBlockId = get()._nextTaskId();
+    const params: ImageGenerationParams = buildImageGenerationParams(state.imageStudio.config);
+    const turnTitle = normalizeConversationDisplayTitle(
+      prompt,
+      language === "en" ? 48 : 40,
+      language === "en" ? "Image generation" : "图像生成",
+    );
+    const userBlock: TaskBlock = {
+      id: userBlockId,
+      turnId,
+      type: "user",
+      content: prompt,
+      ...(images && images.length > 0 ? { images } : {}),
+    };
+    const generationBlock: TaskBlock = {
+      id: generationBlockId,
+      turnId,
+      type: "imageGeneration",
+      status: "queued",
+      prompt,
+      params,
+      progress: createInitialImageProgress(),
+    };
+
+    const persistSession = () => {
+      const latest = get();
+      if (!ensuredSessionId) return;
+      latest.updateSession(sessionScopeKey, ensuredSessionId, {
+        updatedAt: new Date().toISOString(),
+        updatedAtMs: Date.now(),
+        active: true,
+        messages: sanitizeTaskBlocksForPersist(latest.taskFlow),
+        storageStatus: latest.config.sessionRecordingEnabled ? "ok" : "temporary",
+        recordingDisabled: !latest.config.sessionRecordingEnabled,
+        runtimeSnapshot: normalizeSessionRuntimeSnapshot({
+          runtimeEventSchemaVersion: 1,
+          runtimeEvents: latest.runtimeEvents,
+          harnessRunMarker: latest.harnessRunMarker,
+          taskFlow: latest.taskFlow,
+          agentMessages: latest.agentMessages,
+          contextMemoryState: latest.contextMemoryState,
+          contextMemoryStateByRuntimeKey: latest.contextMemoryStateByRuntimeKey,
+          providerCompatibilityByRuntimeKey: latest.providerCompatibilityByRuntimeKey,
+          conversationTurns: latest.conversationTurns,
+          currentTurnId: latest.currentTurnId,
+          selectedMainModeKey: latest.selectedMainModeKey,
+          selectedNexusModeKey: latest.selectedNexusModeKey,
+          imageStudio: latest.imageStudio,
+          activeStudioAgentKey: latest.activeStudioAgentKey,
+          gameStudioInitialized: latest.gameStudioInitialized,
+          pendingSlashCommand: latest.pendingSlashCommand,
+          planArtifacts: latest.planArtifacts,
+          planTasks: latest.planTasks,
+          planExecutionEvidenceLedger: latest.planExecutionEvidenceLedger,
+          planExecutionEvidenceCount: latest.planExecutionEvidenceCount,
+          planAutoResumeCount: latest.planAutoResumeCount,
+          planExecutionProgressSnapshot: latest.planExecutionProgressSnapshot,
+          planStage: latest.planStage,
+          isPlanApproved: latest.isPlanApproved,
+          showPlanPanel: latest.showPlanPanel,
+          showDiff: latest.showDiff,
+          showTerminal: latest.showTerminal,
+          showFilePanel: latest.showFilePanel,
+          rightPanelTab: latest.rightPanelTab,
+          selectedDiffTaskId: latest.selectedDiffTaskId,
+        }),
+      });
+    };
+
+    set((s) => ({
+      taskFlow: [...s.taskFlow, userBlock, generationBlock],
+      conversationTurns: [
+        ...s.conversationTurns.map((turn) => turn.collapsed ? turn : { ...turn, collapsed: true }),
+        {
+          id: turnId,
+          userPrompt: prompt,
+          title: turnTitle,
+          intentSummary: language === "en" ? "Generate an image in Image Studio." : "在图像工作室中生成图片。",
+          mode: "chat",
+          intent: "respond",
+          displayIntent: "respond",
+          status: "executing",
+          summary: "",
+          blockIds: [userBlockId, generationBlockId],
+          collapsed: false,
+          createdAt: Date.now(),
+        },
+      ],
+      currentTurnId: turnId,
+      input: "",
+      contextMentions: [],
+      attachedFiles: [],
+      selectedMainModeKey: "image_studio",
+      selectedNexusModeKey: "nexus_general",
+      lockedComposerIntent: null,
+      pendingRunDecision: null,
+      isGenerating: true,
+      agentStatus: "idle",
+      elapsedTime: 0,
+      imageStudio: {
+        ...s.imageStudio,
+        activeJobId: null,
+        activeStreamId: null,
+      },
+    }));
+
+    if (ensuredSessionId) {
+      get().updateSession(sessionScopeKey, ensuredSessionId, {
+        title: turnTitle,
+        titleSource: "local_seed",
+        titleIntentSignature: `image:${prompt.slice(0, 120)}`,
+        updatedAt: issuedAtIso,
+        updatedAtMs: issuedAt,
+        active: true,
+      });
+    }
+    persistSession();
+
+    const updateGenerationBlock = (patch: Partial<Extract<TaskBlock, { type: "imageGeneration" }>>) => {
+      set((s) => ({
+        taskFlow: s.taskFlow.map((block) =>
+          block.id === generationBlockId && block.type === "imageGeneration"
+            ? { ...block, ...patch }
+            : block,
+        ),
+      }));
+    };
+    const finishTurn = (status: ConversationTurnStatus, summary: string) => {
+      set((s) => ({
+        isGenerating: false,
+        abortController: null,
+        agentStatus: "idle",
+        imageStudio: {
+          ...s.imageStudio,
+          activeJobId: null,
+          activeStreamId: null,
+        },
+        conversationTurns: s.conversationTurns.map((turn) =>
+          turn.id === turnId ? { ...turn, status, summary } : turn
+        ),
+      }));
+      persistSession();
+    };
+
+    void (async () => {
+      let finished = false;
+      const completeOnce = async (result: { imageUrl?: string; error?: string; canceled?: boolean }) => {
+        if (finished) return;
+        finished = true;
+        activeImageStudioStreamCleanup?.();
+        activeImageStudioStreamCleanup = null;
+
+        if (result.canceled) {
+          updateGenerationBlock({
+            status: "canceled",
+            progress: {
+              stage: "canceled",
+              step: 0,
+              total: 0,
+              percent: 0,
+              message: language === "en" ? "Canceled" : "已取消",
+            },
+          });
+          finishTurn("stopped_no_action", language === "en" ? "Image generation canceled." : "图片生成已取消。");
+          return;
+        }
+
+        if (result.error || !result.imageUrl) {
+          const message = result.error || (language === "en" ? "No image was returned." : "未返回图片。");
+          updateGenerationBlock({
+            status: "error",
+            error: message,
+            progress: {
+              stage: "error",
+              step: 0,
+              total: 0,
+              percent: 0,
+              message,
+            },
+          });
+          set((s) => ({
+            imageStudio: {
+              ...s.imageStudio,
+              setupGuideOpen: true,
+            },
+          }));
+          finishTurn("error", message);
+          return;
+        }
+
+        updateGenerationBlock({
+          status: "running",
+          imageUrl: result.imageUrl,
+          progress: {
+            stage: "saving",
+            step: params.steps,
+            total: params.steps,
+            percent: 98,
+            message: language === "en" ? "Saving output" : "正在保存图片",
+          },
+        });
+        let outputPath = "";
+        try {
+          outputPath = await persistGeneratedImage({ sessionKey: runSessionKey, prompt, imageUrl: result.imageUrl });
+        } catch (error) {
+          appendDebugLog("warn", "image_studio_save_output_failed", {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+        updateGenerationBlock({
+          status: "completed",
+          imageUrl: result.imageUrl,
+          ...(outputPath ? { outputPath } : {}),
+          progress: {
+            stage: "done",
+            step: params.steps,
+            total: params.steps,
+            percent: 100,
+            message: language === "en" ? "Done" : "已完成",
+          },
+        });
+        finishTurn("done", language === "en" ? "Image generated." : "图片已生成。");
+      };
+
+      try {
+        updateGenerationBlock({
+          status: "running",
+          progress: {
+            stage: "starting",
+            step: 0,
+            total: params.steps,
+            percent: 2,
+            message: language === "en" ? "Checking image engine" : "正在检查图像引擎",
+          },
+        });
+        const status = await checkImageStudioEngineStatus(state.imageStudio.config);
+        set((s) => ({
+          imageStudio: {
+            ...s.imageStudio,
+            status,
+            setupGuideOpen: status.state === "ready" ? s.imageStudio.setupGuideOpen : true,
+          },
+        }));
+        if (status.state !== "ready") {
+          await completeOnce({
+            error: status.message || (language === "en" ? "Image engine is not ready." : "图像引擎未就绪。"),
+          });
+          return;
+        }
+
+        updateGenerationBlock({
+          progress: {
+            stage: "starting",
+            step: 0,
+            total: params.steps,
+            percent: 5,
+            message: language === "en" ? "Starting HiDream job" : "正在启动 HiDream 任务",
+          },
+        });
+        const started = await startHiDreamGeneration({
+          prompt,
+          config: state.imageStudio.config,
+          generationParams: params,
+          referenceImages: images,
+        });
+        const streamId = `image-studio-${turnId}`;
+        updateGenerationBlock({
+          jobId: started.jobId,
+          streamId,
+          progress: {
+            stage: "generating",
+            step: 0,
+            total: params.steps,
+            percent: 8,
+            message: language === "en" ? "Generating" : "正在生成",
+          },
+        });
+        set((s) => ({
+          imageStudio: {
+            ...s.imageStudio,
+            activeJobId: started.jobId,
+            activeStreamId: streamId,
+          },
+        }));
+
+        activeImageStudioStreamCleanup = await streamHiDreamGeneration({
+          config: state.imageStudio.config,
+          jobId: started.jobId,
+          streamId,
+          onProgress: (progress) => {
+            updateGenerationBlock({
+              progress: {
+                ...progress,
+                message: language === "en"
+                  ? progress.message
+                  : progress.total > 0
+                  ? `正在生成 ${progress.step}/${progress.total}`
+                  : "正在生成",
+              },
+              ...(progress.previewUrl ? { previewUrl: progress.previewUrl } : {}),
+            });
+          },
+          onDone: completeOnce,
+        });
+      } catch (error) {
+        await completeOnce({
+          error: error instanceof Error ? error.message : String(error || "Image generation failed."),
+        });
+      }
+    })();
+
+    return true;
   },
   refreshGameStudioWorkspaceState: async () => {
     if (!get().currentWorkspace.trim()) {
@@ -5271,6 +5761,7 @@ export const useAppStore = create<AppState>()(
       currentSessionId: null,
       selectedMainModeKey: "main_mode",
       selectedNexusModeKey: "nexus_general",
+      imageStudio: createDefaultImageStudioRuntime(),
       taskFlow: [],
       runtimeEvents: [],
       agentMessages: [],
@@ -5898,6 +6389,9 @@ export const useAppStore = create<AppState>()(
       workspace: state.currentWorkspace || null,
       activeProfile: state.config.activeProfile,
     });
+    if (options?.hidden !== true && state.selectedMainModeKey === "image_studio") {
+      return get().runImageStudioGeneration(text, images);
+    }
     const isHidden = options?.hidden === true;
     const createVisibleTurnForHiddenMessage = isHidden && options?.createVisibleTurnForHiddenMessage === true;
     const parentPlanTurnId =
@@ -7146,6 +7640,7 @@ export const useAppStore = create<AppState>()(
             currentTurnId: sessionGet().currentTurnId,
             selectedMainModeKey: sessionGet().selectedMainModeKey,
             selectedNexusModeKey: sessionGet().selectedNexusModeKey,
+            imageStudio: sessionGet().imageStudio,
             activeStudioAgentKey: sessionGet().activeStudioAgentKey,
             gameStudioInitialized: sessionGet().gameStudioInitialized,
             pendingSlashCommand: sessionGet().pendingSlashCommand,
@@ -11169,6 +11664,7 @@ export const useAppStore = create<AppState>()(
               currentTurnId: s.currentTurnId,
               selectedMainModeKey: s.selectedMainModeKey,
               selectedNexusModeKey: s.selectedNexusModeKey,
+              imageStudio: s.imageStudio,
               activeStudioAgentKey: s.activeStudioAgentKey,
               gameStudioInitialized: s.gameStudioInitialized,
               pendingSlashCommand: s.pendingSlashCommand,
@@ -11501,6 +11997,7 @@ export const useAppStore = create<AppState>()(
         selectedWorkspace: persistedState.selectedWorkspace || persistedState.currentWorkspace || current.selectedWorkspace,
         selectedMainModeKey,
         selectedNexusModeKey: mapMainModeToLegacyNexusMode(selectedMainModeKey),
+        imageStudio: normalizeImageStudioRuntime(persistedState.imageStudio),
         activeStudioAgentKey: normalizeStudioAgentKey(persistedState.activeStudioAgentKey),
         gameStudioInitialized: persistedState.gameStudioInitialized === true,
         pendingSlashCommand: hasHydratedCurrentSession

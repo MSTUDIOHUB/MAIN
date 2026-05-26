@@ -53,6 +53,7 @@ import {
 import { normalizeStudioAgentKey } from "./lib/gameStudioCatalog";
 import { normalizeContextMemoryState } from "./lib/contextMemory";
 import { MAIN_MODE_KEYS, mapLegacyNexusModeToMainMode, mapMainModeToLegacyNexusMode } from "./lib/mainModes";
+import { createDefaultImageStudioRuntime, normalizeImageStudioRuntime } from "./lib/imageStudio";
 import { resolveConversationTurnIntent } from "./lib/runIntent";
 import { resolvePlanApprovalQuickReplyAction } from "./lib/planControl";
 import { materializePlanArtifactFromVisibleText } from "./lib/planMaterialization";
@@ -265,6 +266,7 @@ function buildSessionRuntimeSnapshotFromState(state: any) {
     currentTurnId: state.currentTurnId ?? null,
     selectedMainModeKey: state.selectedMainModeKey,
     selectedNexusModeKey: state.selectedNexusModeKey,
+    imageStudio: normalizeImageStudioRuntime(state.imageStudio),
     activeStudioAgentKey: state.activeStudioAgentKey,
     gameStudioInitialized: state.gameStudioInitialized,
     pendingSlashCommand: state.pendingSlashCommand ?? null,
@@ -492,6 +494,7 @@ function stableRuntimeSignature(value: unknown): string {
     currentTurnId: snapshot.currentTurnId ?? null,
     selectedMainModeKey: snapshot.selectedMainModeKey ?? null,
     selectedNexusModeKey: snapshot.selectedNexusModeKey ?? null,
+    imageStudio: compactTextSignature(JSON.stringify(snapshot.imageStudio || null)),
     activeStudioAgentKey: snapshot.activeStudioAgentKey ?? null,
     pendingSlashCommand: snapshot.pendingSlashCommand ?? null,
     planArtifacts: compactJsonListSignature(snapshot.planArtifacts),
@@ -669,6 +672,7 @@ function buildPagedRuntimePatch(entry: SessionTranscriptCacheEntry, fallbackStat
           entry.runtimeSnapshot?.selectedAgentKey,
       ),
     ),
+    imageStudio: normalizeImageStudioRuntime(entry.runtimeSnapshot?.imageStudio ?? fallbackState.imageStudio),
     activeStudioAgentKey: normalizeStudioAgentKey(entry.runtimeSnapshot?.activeStudioAgentKey ?? fallbackState.activeStudioAgentKey),
     gameStudioInitialized: entry.runtimeSnapshot?.gameStudioInitialized === true || fallbackState.gameStudioInitialized,
     pendingSlashCommand: entry.runtimeSnapshot?.pendingSlashCommand ?? null,
@@ -2014,6 +2018,7 @@ export default function App() {
       taskFlow: [],
       selectedMainModeKey: "main_mode",
       selectedNexusModeKey: "nexus_general",
+      imageStudio: useAppStore.getState().imageStudio || createDefaultImageStudioRuntime(),
       activeStudioAgentKey: useAppStore.getState().activeStudioAgentKey,
       gameStudioInitialized: useAppStore.getState().gameStudioInitialized,
       pendingSlashCommand: null,

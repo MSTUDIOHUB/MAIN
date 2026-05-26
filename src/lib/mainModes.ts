@@ -1,10 +1,11 @@
 import { resolveLegacyNexusModeKey, type NexusModeKey } from "./gameStudioCatalog";
 
-export const MAIN_MODE_KEYS = ["main_mode", "game_studio"] as const;
+export const MAIN_MODE_KEYS = ["main_mode", "game_studio", "image_studio"] as const;
 
 export type MainModeKey = (typeof MAIN_MODE_KEYS)[number];
 
 export function mapLegacyNexusModeToMainMode(value: string | null | undefined): MainModeKey {
+  if (value === "image_studio") return "image_studio";
   const normalized = resolveLegacyNexusModeKey(value);
   return normalized === "nexus_game_studio" ? "game_studio" : "main_mode";
 }
@@ -15,4 +16,8 @@ export function mapMainModeToLegacyNexusMode(mode: MainModeKey): NexusModeKey {
 
 export function isGameStudioMainMode(mode: MainModeKey): boolean {
   return mode === "game_studio";
+}
+
+export function isImageStudioMainMode(mode: MainModeKey): boolean {
+  return mode === "image_studio";
 }

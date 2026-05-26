@@ -499,6 +499,38 @@ export interface AttachmentIngestResult {
   sizeBytes: number;
 }
 
+export interface ImageStudioEngineCheckResult {
+  ready: boolean;
+  message: string;
+  capabilities?: Record<string, unknown>;
+}
+
+export interface ImageStudioProxyRequestInput {
+  endpoint: string;
+  path: string;
+  method: "GET" | "POST" | "DELETE";
+  body?: string;
+  streamId?: string;
+}
+
+export interface ImageStudioProxyResponse {
+  status: number;
+  ok: boolean;
+  body: string;
+  contentType?: string | null;
+}
+
+export interface ImageStudioStreamChunkPayload {
+  streamId: string;
+  chunk: string;
+}
+
+export interface ImageStudioStreamDonePayload {
+  streamId: string;
+  status: "ok" | "error" | "cancelled";
+  error?: string | null;
+}
+
 // endregion
 
 // region: 文件与搜索命令
@@ -571,6 +603,41 @@ export function ingestAttachmentBytes(sessionKey: string, fileName: string, byte
 
 export function readAttachmentImageDataUrl(sourcePath: string): Promise<string> {
   return invoke<string>("read_attachment_image_data_url", { sourcePath });
+}
+
+export function checkImageStudioEngine(config: { engine: string; endpoint: string }): Promise<ImageStudioEngineCheckResult> {
+  return invoke<ImageStudioEngineCheckResult>("check_image_studio_engine", {
+    engine: config.engine,
+    endpoint: config.endpoint,
+  });
+}
+
+export function proxyImageStudioRequest(input: ImageStudioProxyRequestInput): Promise<ImageStudioProxyResponse> {
+  return invoke<ImageStudioProxyResponse>("proxy_image_studio_request", input as unknown as Record<string, unknown>);
+}
+
+export function cancelImageStudioJob(): Promise<void> {
+  return invoke<void>("cancel_image_studio_job");
+}
+
+export function saveImageStudioOutput(sessionKey: string, fileName: string, dataUrl: string): Promise<string> {
+  return invoke<string>("save_image_studio_output", { sessionKey, fileName, dataUrl });
+}
+
+export function openImageStudioOutput(path: string): Promise<OpenFileExternalResult> {
+  return invoke<OpenFileExternalResult>("open_image_studio_output", { path });
+}
+
+export function listenImageStudioStreamChunk(
+  handler: (payload: ImageStudioStreamChunkPayload) => void,
+): Promise<UnlistenFn> {
+  return listen<ImageStudioStreamChunkPayload>("image-studio-stream-chunk", (event) => handler(event.payload));
+}
+
+export function listenImageStudioStreamDone(
+  handler: (payload: ImageStudioStreamDonePayload) => void,
+): Promise<UnlistenFn> {
+  return listen<ImageStudioStreamDonePayload>("image-studio-stream-done", (event) => handler(event.payload));
 }
 
 export function deleteWorkspacePath(path: string, workspace?: string): Promise<void> {

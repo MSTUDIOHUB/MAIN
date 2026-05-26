@@ -1,9 +1,10 @@
 // @ts-nocheck
 import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { IconAt, IconCheck, IconChevronDown, IconChevronRight, IconClose, IconCloud, IconCode, IconColumns, IconFile, IconFileText, IconFolder, IconImageIcon, IconLogoM, IconStop, IconTerminal } from "./Icons";
+import { IconAt, IconCheck, IconChevronDown, IconChevronRight, IconClose, IconCloud, IconCode, IconColumns, IconFile, IconFileText, IconFolder, IconImageIcon, IconLogoM, IconSettings, IconStop, IconTerminal, IconZap } from "./Icons";
 import ActionCard from "./ActionCard";
 import Composer from "./Composer";
+import ImageGenerationCard from "./ImageGenerationCard";
 import JobListCard from "./JobListCard";
 import MarkdownRenderer from "./MarkdownRenderer";
 import StreamingCursor from "./StreamingCursor";
@@ -2270,6 +2271,9 @@ export default function ChatArea({
     pendingRunDecision,
     resolvePendingRunDecision,
     dismissPendingRunDecision,
+    imageStudio,
+    setImageStudioSetupGuideOpen,
+    checkImageStudioEngine,
   } = {
     showDiff: useAppStore((s) => s.showDiff),
     showPlanPanel: useAppStore((s) => s.showPlanPanel),
@@ -2303,7 +2307,11 @@ export default function ChatArea({
     pendingRunDecision: useAppStore((s) => s.pendingRunDecision),
     resolvePendingRunDecision: useAppStore((s) => s.resolvePendingRunDecision),
     dismissPendingRunDecision: useAppStore((s) => s.dismissPendingRunDecision),
+    imageStudio: useAppStore((s) => s.imageStudio),
+    setImageStudioSetupGuideOpen: useAppStore((s) => s.setImageStudioSetupGuideOpen),
+    checkImageStudioEngine: useAppStore((s) => s.checkImageStudioEngine),
   };
+  const isImageStudioMode = selectedMainModeKey === "image_studio";
   const isGlobalChat = !currentWorkspace;
   const emptyStatePrompts = language === "zh"
     ? [
@@ -2822,6 +2830,18 @@ export default function ChatArea({
 
     if (block.type === "progress") {
       return null;
+    }
+
+    if (block.type === "imageGeneration") {
+      return (
+        <div key={`${block.id}-${index}`} className="flex w-full justify-start">
+          <ImageGenerationCard
+            block={block}
+            language={language}
+            onRegenerate={(prompt) => onSendMessage?.(prompt)}
+          />
+        </div>
+      );
     }
 
     if (block.type === "jobList") {
@@ -3394,8 +3414,20 @@ export default function ChatArea({
   return (
     <div className="relative flex min-w-0 flex-1 flex-col bg-[#000000]">
       <div className="h-[48px] shrink-0 border-b border-[#27272a] bg-[#000000] px-4 flex items-center justify-between select-none" data-tauri-drag-region>
-        <button data-testid="model-settings-button" onClick={() => { setSettingsTab(config.activeProfile === "cloud" ? "cloud" : "local"); setIsSettingsOpen(true); }} className="flex min-w-0 items-center gap-2 rounded-md border border-[#27272a] bg-[#09090b] px-2.5 py-1.5 text-xs font-medium text-[#e4e4e7] transition-colors hover:bg-[#18181b]" style={{ height: 28 }}>
-          {config.activeProfile === "local" ? (
+        <button data-testid={isImageStudioMode ? "image-studio-settings-button" : "model-settings-button"} onClick={() => {
+          if (isImageStudioMode) {
+            setImageStudioSetupGuideOpen(true);
+            return;
+          }
+          setSettingsTab(config.activeProfile === "cloud" ? "cloud" : "local");
+          setIsSettingsOpen(true);
+        }} className="flex min-w-0 items-center gap-2 rounded-md border border-[#27272a] bg-[#09090b] px-2.5 py-1.5 text-xs font-medium text-[#e4e4e7] transition-colors hover:bg-[#18181b]" style={{ height: 28 }}>
+          {isImageStudioMode ? (
+            <>
+              <span className={`h-1.5 w-1.5 rounded-full ${imageStudio.status.state === "ready" ? "bg-green-500 shadow-[0_0_5px_#22c55e]" : isStreaming ? "bg-amber-400 shadow-[0_0_5px_#fbbf24] animate-pulse" : "bg-zinc-500"}`} />
+              {language === "en" ? "Image Engine" : "图像引擎"}: <span className="max-w-[180px] truncate font-normal text-[#a1a1aa]">{imageStudio.config.endpoint}</span>
+            </>
+          ) : config.activeProfile === "local" ? (
             <>
               <span className={`h-1.5 w-1.5 rounded-full ${isStreaming ? "bg-amber-400 shadow-[0_0_5px_#fbbf24] animate-pulse" : "bg-green-500 shadow-[0_0_5px_#22c55e]"}`} />
               {config.local.provider}: <span className="max-w-[150px] truncate font-normal text-[#a1a1aa]">{config.local.model || copy.modelUnselected}</span>
@@ -3530,17 +3562,111 @@ export default function ChatArea({
       >
 
         {groupedTurns.length === 0 ? (
-          <div
-            data-testid="chat-empty-state"
-            className="flex h-full items-center justify-center select-none pointer-events-none"
-          >
-            <div className="flex items-center gap-[4px] opacity-20">
-              <IconLogoM className="w-[72px] h-[72px] theme-text drop-shadow-[0_0_24px_var(--accent-subtle)]" />
-              <span className="text-[#e4e4e7] text-[48px] font-black tracking-[0.3em] leading-none" style={{ fontFamily: 'var(--font-sans)' }}>
-                AIN
-              </span>
+          isImageStudioMode ? (
+            <div
+              data-testid="image-studio-empty-state"
+              className="flex min-h-full items-center justify-center pb-12"
+            >
+              <div className="w-full max-w-5xl">
+                <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2 text-[16px] font-semibold text-[#f4f4f5]">
+                      <IconImageIcon className="h-4 w-4 text-[var(--accent-light)]" />
+                      {language === "en" ? "Image Studio" : "图像工作室"}
+                    </div>
+                    <div className="mt-1 text-[12px] text-[#a1a1aa]">
+                      {language === "en"
+                        ? "Independent image generation workspace. Normal MAIN chats keep using their own local model pipeline."
+                        : "独立的图像生成工作台。普通 MAIN 会话仍然走原来的本地模型与指令执行链路。"}
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      data-testid="image-studio-empty-check-engine"
+                      onClick={() => void checkImageStudioEngine()}
+                      className="inline-flex h-8 items-center gap-2 rounded-md border border-[#27272a] bg-[#09090b] px-3 text-[11px] text-[#d4d4d8] transition-colors hover:bg-[#18181b] hover:text-white"
+                    >
+                      <IconZap className="h-3.5 w-3.5 text-[var(--accent-light)]" />
+                      {language === "en" ? "Check Engine" : "检测引擎"}
+                    </button>
+                    <button
+                      type="button"
+                      data-testid="image-studio-empty-open-setup"
+                      onClick={() => setImageStudioSetupGuideOpen(true)}
+                      className="inline-flex h-8 items-center gap-2 rounded-md border border-[var(--accent-subtle-border)] bg-[var(--accent-subtle)] px-3 text-[11px] font-semibold text-[var(--accent-light)] transition-colors hover:border-[var(--accent)]"
+                    >
+                      <IconSettings className="h-3.5 w-3.5" />
+                      {language === "en" ? "Setup" : "设置"}
+                    </button>
+                  </div>
+                </div>
+
+                <div className="grid gap-3 md:grid-cols-[minmax(260px,0.8fr)_minmax(300px,1.2fr)]">
+                  <div className="rounded-lg border border-[#27272a] bg-[#09090b] p-4">
+                    <div className="mb-3 text-[11px] font-semibold uppercase tracking-[0.16em] text-[#71717a]">
+                      {language === "en" ? "Engine" : "引擎状态"}
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className={`h-2 w-2 rounded-full ${imageStudio.status.state === "ready" ? "bg-emerald-400" : imageStudio.status.state === "error" ? "bg-red-400" : "bg-zinc-500"}`} />
+                      <span className="text-[13px] font-semibold text-[#e4e4e7]">
+                        {imageStudio.status.state === "ready"
+                          ? (language === "en" ? "Ready" : "已就绪")
+                          : (language === "en" ? "Not connected" : "未连接")}
+                      </span>
+                    </div>
+                    <div className="mt-2 break-words text-[12px] leading-relaxed text-[#a1a1aa]">
+                      {imageStudio.status.message}
+                    </div>
+                    <div className="mt-4 grid grid-cols-2 gap-2 text-[11px] text-[#a1a1aa]">
+                      <span className="rounded-md border border-[#27272a] bg-[#050507] px-2 py-1">{imageStudio.config.aspectRatio}</span>
+                      <span className="rounded-md border border-[#27272a] bg-[#050507] px-2 py-1">{imageStudio.config.steps} steps</span>
+                      <span className="rounded-md border border-[#27272a] bg-[#050507] px-2 py-1">CFG {imageStudio.config.guidanceScale}</span>
+                      <span className="truncate rounded-md border border-[#27272a] bg-[#050507] px-2 py-1">{imageStudio.config.endpoint}</span>
+                    </div>
+                  </div>
+
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    {[
+                      language === "en"
+                        ? "A quiet product photo of a titanium desk lamp on smoked glass, softbox lighting"
+                        : "钛金属桌灯放在烟灰玻璃桌面上的安静产品照，柔和棚拍光",
+                      language === "en"
+                        ? "A cinematic mountain observatory above a sea of clouds, dawn, ultra detailed"
+                        : "云海之上的电影感山顶天文台，黎明，超细节",
+                      language === "en"
+                        ? "A minimalist interface concept for a future music workstation, precise panels"
+                        : "未来音乐工作站的极简界面概念图，精密面板",
+                      language === "en"
+                        ? "A hand-painted botanical study of luminous glass flowers, ink and watercolor"
+                        : "发光玻璃花朵的手绘植物学研究，墨线与水彩",
+                    ].map((prompt) => (
+                      <button
+                        key={prompt}
+                        type="button"
+                        onClick={() => onSendMessage?.(prompt)}
+                        className="min-h-[92px] rounded-lg border border-[#27272a] bg-[#09090b] p-3 text-left text-[12px] leading-relaxed text-[#d4d4d8] transition-colors hover:border-[var(--accent-subtle-border)] hover:bg-[#131316]"
+                      >
+                        {prompt}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
             </div>
-          </div>
+          ) : (
+            <div
+              data-testid="chat-empty-state"
+              className="flex h-full items-center justify-center select-none pointer-events-none"
+            >
+              <div className="flex items-center gap-[4px] opacity-20">
+                <IconLogoM className="w-[72px] h-[72px] theme-text drop-shadow-[0_0_24px_var(--accent-subtle)]" />
+                <span className="text-[#e4e4e7] text-[48px] font-black tracking-[0.3em] leading-none" style={{ fontFamily: 'var(--font-sans)' }}>
+                  AIN
+                </span>
+              </div>
+            </div>
+          )
         ) : (
           <div className="space-y-5">
             {onLoadOlderSessionHistory && (

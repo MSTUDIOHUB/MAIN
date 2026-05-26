@@ -1,6 +1,7 @@
 // @ts-nocheck
 import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
-import { IconAt, IconFile, IconClose, IconChevronUp, IconArrowUp, IconPlus, IconCode, IconChevronUp as IconChevronUpIcon, IconSearch, IconStop } from "./Icons";
+import { IconAt, IconFile, IconClose, IconChevronUp, IconArrowUp, IconPlus, IconCode, IconChevronUp as IconChevronUpIcon, IconImageIcon, IconRefresh, IconSearch, IconSettings, IconStop, IconZap } from "./Icons";
+import ImageStudioSetupModal from "./ImageStudioSetupModal";
 import { getAllWorkspaceFiles, fuzzyFilterFiles } from "../utils/fsUtils";
 import { compressImage, getImageFilesFromClipboard, processImageFile } from "../utils/imageUtils";
 import { estimateTokens } from "../lib/contextTrim";
@@ -240,6 +241,10 @@ export default function Composer({
   const conversationTurns = useAppStore((s) => s.conversationTurns);
   const lockedComposerIntent = useAppStore((s) => s.lockedComposerIntent);
   const setLockedComposerIntent = useAppStore((s) => s.setLockedComposerIntent);
+  const imageStudio = useAppStore((s) => s.imageStudio);
+  const setImageStudioConfig = useAppStore((s) => s.setImageStudioConfig);
+  const setImageStudioSetupGuideOpen = useAppStore((s) => s.setImageStudioSetupGuideOpen);
+  const checkImageStudioEngine = useAppStore((s) => s.checkImageStudioEngine);
   const [draftInput, setDraftInput] = useState(storeInput);
   const [debouncedInput, setDebouncedInput] = useState(storeInput);
   const slashCatalog = useMemo(
@@ -256,6 +261,7 @@ export default function Composer({
   );
   const isGameStudioMode = selectedMainModeKey === "game_studio";
   const isMainMode = selectedMainModeKey === "main_mode";
+  const isImageStudioMode = selectedMainModeKey === "image_studio";
   const isLightTheme = themeMode === "light";
   const isComposerSubmitting = isStreaming || isSubmitPending;
   const resolvedComposerFontSize = Math.min(20, Math.max(10, Number(chatFontSize ?? useAppStore.getState().config.chatFontSize) || 13));
@@ -293,6 +299,9 @@ export default function Composer({
     game_studio: language === "en"
       ? "Run MAIN GAME STUDIO workflows and specialists, with /plan available for large changes."
       : "运行 MAIN GAME STUDIO 工作流与专业 Agent，并支持用 /plan 进入计划流。",
+    image_studio: language === "en"
+      ? "Generate images through an independent HiDream/HTTP engine without entering the LLM agent loop."
+      : "通过独立的 HiDream/HTTP 图像引擎生成图片，不进入大语言模型 Agent 执行链路。",
   };
   const mentionSearchLabel = mentionQuery
     ? (language === "en" ? `Search: ${mentionQuery}` : `搜索：${mentionQuery}`)
@@ -491,6 +500,43 @@ export default function Composer({
         : "先把 `/brainstorm` 写成草稿，再在输入框里补充概念、支柱体验和目标受众。",
     },
   ] as const;
+  const imageStudioAspectOptions = ["1:1", "3:4", "4:3", "16:9", "9:16"] as const;
+  const imageStudioStatusLabel = imageStudio.status.state === "ready"
+    ? (language === "en" ? "Ready" : "已就绪")
+    : imageStudio.status.state === "error"
+    ? (language === "en" ? "Error" : "错误")
+    : (language === "en" ? "Setup" : "设置");
+  const imageStudioStatusDotClass = imageStudio.status.state === "ready"
+    ? "bg-emerald-400 shadow-[0_0_5px_#34d399]"
+    : imageStudio.status.state === "error"
+    ? "bg-red-400 shadow-[0_0_5px_#f87171]"
+    : "bg-zinc-500";
+  const imageStudioPanelStyle = isLightTheme
+    ? {
+        borderColor: "var(--accent-subtle-border)",
+        backgroundColor: "#ffffff",
+      }
+    : {
+        borderColor: "var(--accent-subtle-border)",
+        backgroundColor: themeMode === "black" ? "#000000" : "#09090b",
+      };
+  const imageStudioFieldStyle = isLightTheme
+    ? {
+        borderColor: "#d4d4d8",
+        backgroundColor: "#f8fafc",
+        color: "#111827",
+      }
+    : {
+        borderColor: "#27272a",
+        backgroundColor: "#050507",
+        color: "#e4e4e7",
+      };
+  const imageStudioMutedStyle = {
+    color: isLightTheme ? "#52525b" : "#a1a1aa",
+  };
+  const handleCheckImageStudioEngine = useCallback(() => {
+    void checkImageStudioEngine();
+  }, [checkImageStudioEngine]);
 
   // Debounce input for token estimation (300ms)
   useEffect(() => {
@@ -543,6 +589,7 @@ export default function Composer({
     const previousMode = previousMainModeRef.current;
     const previousWorkspace = previousWorkspaceRef.current;
     const enteredGameStudio = isGameStudioMode && previousMode !== "game_studio";
+    const enteredImageStudio = isImageStudioMode && previousMode !== "image_studio";
     const changedWorkspaceInGameStudio = isGameStudioMode && Boolean(currentWorkspace) && previousWorkspace !== currentWorkspace;
 
     if ((enteredGameStudio || changedWorkspaceInGameStudio) && currentWorkspace) {
@@ -556,9 +603,13 @@ export default function Composer({
       }));
     }
 
+    if (enteredImageStudio && imageStudio.status.state !== "ready") {
+      setImageStudioSetupGuideOpen(true);
+    }
+
     previousMainModeRef.current = selectedMainModeKey;
     previousWorkspaceRef.current = currentWorkspace;
-  }, [currentWorkspace, currentWorkspaceOnboardingKey, isGameStudioMode, selectedMainModeKey]);
+  }, [currentWorkspace, currentWorkspaceOnboardingKey, imageStudio.status.state, isGameStudioMode, isImageStudioMode, selectedMainModeKey, setImageStudioSetupGuideOpen]);
 
   const currentTokens = useMemo(() => {
     const historyTokens = estimateAgentMessagesTokens(agentMessages);
@@ -781,6 +832,15 @@ export default function Composer({
     closeSlashMenu();
   }, [closeSlashMenu, isGameStudioMode, isMainMode]);
 
+  useEffect(() => {
+    if (!isImageStudioMode) return;
+    closeMentionMenu();
+    closeSlashMenu();
+    setContextMentions([]);
+    setAttachedFiles([]);
+    setLockedComposerIntent(null);
+  }, [closeMentionMenu, closeSlashMenu, isImageStudioMode, setAttachedFiles, setContextMentions, setLockedComposerIntent]);
+
   // ── Image paste handler ──
   const handlePaste = useCallback(async (e: React.ClipboardEvent) => {
     const imageFiles = getImageFilesFromClipboard(e.nativeEvent);
@@ -935,6 +995,7 @@ export default function Composer({
 
   // ── Insert @ from the @ button click ──
   const handleAtButtonClick = () => {
+    if (isImageStudioMode) return;
     const ta = textareaRef.current;
     if (!ta) return;
     ta.focus();
@@ -1177,7 +1238,7 @@ export default function Composer({
     if (isMainMode && parseMainDebugShortcut(value)) {
       slashAnchorRef.current = -1;
       closeSlashMenu();
-    } else if ((isGameStudioMode || isMainMode) && slashSession) {
+    } else if (!isImageStudioMode && (isGameStudioMode || isMainMode) && slashSession) {
       slashAnchorRef.current = slashSession.anchor;
       setSlashQuery(slashSession.query);
       setShowSlashMenu(true);
@@ -1186,7 +1247,7 @@ export default function Composer({
     }
 
     // Find the last @ before cursor
-    const lastAtIndex = textBeforeCursor.lastIndexOf("@");
+    const lastAtIndex = isImageStudioMode ? -1 : textBeforeCursor.lastIndexOf("@");
     if (lastAtIndex !== -1) {
       const charBefore = lastAtIndex > 0 ? textBeforeCursor[lastAtIndex - 1] : " ";
       const textAfterAt = textBeforeCursor.slice(lastAtIndex + 1);
@@ -1258,6 +1319,7 @@ export default function Composer({
     const justFinishedComposition = Date.now() - compositionEndedAtRef.current < 140;
     const isImeKeyInput = isComposingRef.current || nativeEvent.isComposing || e.keyCode === 229 || justFinishedComposition;
     if (
+      !isImageStudioMode &&
       (isMainMode || isGameStudioMode) &&
       !activeDiffTask &&
       e.key === "Tab" &&
@@ -1355,6 +1417,8 @@ export default function Composer({
   const displayName = (path: any) => normalizeAttachedFile(path).displayName || String(path).split("/").pop() || String(path);
   const composerPlaceholder = activeDiffTask
     ? "..."
+    : isImageStudioMode
+    ? (language === "en" ? "Describe the image you want to generate..." : "描述你想生成的图片...")
     : isGameStudioMode
     ? (language === "en" ? "Ask the studio, or type / for plan, workflows, and specialists..." : "询问工作室中枢，或输入 / 打开计划入口、工作流和专家面板...")
     : language === "en"
@@ -1381,17 +1445,18 @@ export default function Composer({
   // endregion
 
   return (
-    <div
-      className="absolute left-6 right-6 z-20 pointer-events-none flex justify-center"
-      style={{ bottom: "calc(env(safe-area-inset-bottom, 0px) + 1.5rem)" }}
-    >
+    <>
       <div
-        ref={composerShellRef}
-        className={`w-full max-w-3xl flex flex-col relative pointer-events-auto transition-all ${isDragOver ? 'ring-2 ring-[var(--accent)] ring-offset-2 ring-offset-[#000000]' : ''}`}
-        onDragOver={handleDragOver}
-        onDragLeave={handleDragLeave}
-        onDrop={handleDrop}
+        className="absolute left-6 right-6 z-20 pointer-events-none flex justify-center"
+        style={{ bottom: "calc(env(safe-area-inset-bottom, 0px) + 1.5rem)" }}
       >
+        <div
+          ref={composerShellRef}
+          className={`w-full max-w-3xl flex flex-col relative pointer-events-auto transition-all ${isDragOver ? 'ring-2 ring-[var(--accent)] ring-offset-2 ring-offset-[#000000]' : ''}`}
+          onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
+          onDrop={handleDrop}
+        >
         {false && showExecutionProgress && (
           <ExecutionProgressCard
             tasks={planTasks}
@@ -1537,7 +1602,7 @@ export default function Composer({
           </div>
         )}
 
-        {suggestedComposerIntent && suggestedComposerIntentLabel && !activeDiffTask && !isStreaming && (
+        {suggestedComposerIntent && suggestedComposerIntentLabel && !isImageStudioMode && !activeDiffTask && !isStreaming && (
           <div className="relative z-30 mb-2 flex justify-center px-3">
             <div className="flex max-w-full items-center justify-between gap-3 rounded-full border border-[#27272a] bg-[#050507] px-3 py-2 text-[11px] text-[#d4d4d8]">
               <span className="truncate">
@@ -1584,7 +1649,7 @@ export default function Composer({
           </div>
         )}
 
-        <div className={`bg-[#09090b] border border-[#27272a] transition-all flex flex-col relative z-20 ${activeDiffTask ? 'rounded-b-xl border-t-0' : 'rounded-xl'} ${isStreaming ? 'border-[#3f3f46]' : 'focus-within:border-[#3f3f46]'}`}>
+        <div className={`bg-[#09090b] border border-[#27272a] transition-all flex flex-col relative z-20 ${activeDiffTask ? 'rounded-b-xl border-t-0' : 'rounded-xl'} ${isStreaming ? 'border-[#3f3f46]' : 'focus-within:border-[#3f3f46]'}`} style={isImageStudioMode ? imageStudioPanelStyle : undefined}>
 
           {attachmentNotice && (
             <div className="flex items-center justify-between gap-3 px-4 pt-3 text-[11px] text-[#fbbf24]">
@@ -1600,8 +1665,131 @@ export default function Composer({
             </div>
           )}
 
+          {isImageStudioMode && (
+            <div data-testid="image-studio-controls" className="border-b px-3 py-3" style={{ borderColor: isLightTheme ? "#e4e4e7" : "#27272a" }}>
+              <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                <div className="flex min-w-0 items-center gap-2">
+                  <div className="flex h-7 w-7 items-center justify-center rounded-md border border-[var(--accent-subtle-border)] bg-[var(--accent-subtle)] text-[var(--accent-light)]">
+                    <IconImageIcon className="h-3.5 w-3.5" />
+                  </div>
+                  <div className="min-w-0">
+                    <div className="text-[12px] font-semibold" style={{ color: isLightTheme ? "#18181b" : "#f4f4f5" }}>
+                      {language === "en" ? "Image Studio" : "图像工作室"}
+                    </div>
+                    <div className="truncate text-[10px]" style={imageStudioMutedStyle}>{imageStudio.config.endpoint}</div>
+                  </div>
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={handleCheckImageStudioEngine}
+                    className="inline-flex h-7 items-center gap-1.5 rounded-md border px-2.5 text-[10px] transition-colors hover:bg-[#18181b]"
+                    style={{ borderColor: isLightTheme ? "#d4d4d8" : "#27272a", color: isLightTheme ? "#374151" : "#d4d4d8" }}
+                    title={language === "en" ? "Check image engine" : "检测图像引擎"}
+                  >
+                    <span className={`h-1.5 w-1.5 rounded-full ${imageStudioStatusDotClass}`} />
+                    {imageStudioStatusLabel}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setImageStudioSetupGuideOpen(true)}
+                    className="inline-flex h-7 items-center gap-1.5 rounded-md border border-[var(--accent-subtle-border)] px-2.5 text-[10px] font-semibold text-[var(--accent-light)] transition-colors hover:bg-[var(--accent-subtle)]"
+                    title={language === "en" ? "Image Studio setup" : "图像工作室设置"}
+                  >
+                    <IconSettings className="h-3.5 w-3.5" />
+                    {language === "en" ? "Setup" : "设置"}
+                  </button>
+                </div>
+              </div>
+
+              <div className="grid gap-3 md:grid-cols-[minmax(180px,1fr)_minmax(220px,1.2fr)_minmax(160px,0.9fr)]">
+                <div>
+                  <div className="mb-1 text-[10px] font-semibold uppercase tracking-[0.14em]" style={imageStudioMutedStyle}>
+                    {language === "en" ? "Aspect" : "比例"}
+                  </div>
+                  <div className="grid grid-cols-5 gap-1">
+                    {imageStudioAspectOptions.map((ratio) => (
+                      <button
+                        key={ratio}
+                        type="button"
+                        onClick={() => setImageStudioConfig({ aspectRatio: ratio })}
+                        className="h-7 rounded-md border text-[10px] font-semibold transition-colors"
+                        style={{
+                          borderColor: imageStudio.config.aspectRatio === ratio ? "var(--accent)" : (isLightTheme ? "#d4d4d8" : "#27272a"),
+                          backgroundColor: imageStudio.config.aspectRatio === ratio ? "var(--accent-subtle)" : (isLightTheme ? "#f8fafc" : "#050507"),
+                          color: imageStudio.config.aspectRatio === ratio ? (isLightTheme ? "var(--accent-hover)" : "var(--accent-light)") : (isLightTheme ? "#374151" : "#a1a1aa"),
+                        }}
+                      >
+                        {ratio}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <label className="min-w-0">
+                    <span className="mb-1 block text-[10px] font-semibold uppercase tracking-[0.14em]" style={imageStudioMutedStyle}>
+                      {language === "en" ? "Steps" : "步数"} · {imageStudio.config.steps}
+                    </span>
+                    <input
+                      type="range"
+                      min="1"
+                      max="80"
+                      step="1"
+                      value={imageStudio.config.steps}
+                      onChange={(event) => setImageStudioConfig({ steps: Number(event.target.value) })}
+                      className="w-full accent-[var(--accent)]"
+                    />
+                  </label>
+                  <label className="min-w-0">
+                    <span className="mb-1 block text-[10px] font-semibold uppercase tracking-[0.14em]" style={imageStudioMutedStyle}>
+                      CFG · {imageStudio.config.guidanceScale}
+                    </span>
+                    <input
+                      type="range"
+                      min="0"
+                      max="20"
+                      step="0.5"
+                      value={imageStudio.config.guidanceScale}
+                      onChange={(event) => setImageStudioConfig({ guidanceScale: Number(event.target.value) })}
+                      className="w-full accent-[var(--accent)]"
+                    />
+                  </label>
+                </div>
+
+                <div>
+                  <div className="mb-1 text-[10px] font-semibold uppercase tracking-[0.14em]" style={imageStudioMutedStyle}>Seed</div>
+                  <div className="grid grid-cols-[auto_1fr] gap-1">
+                    <button
+                      type="button"
+                      onClick={() => setImageStudioConfig({ seedMode: imageStudio.config.seedMode === "fixed" ? "random" : "fixed" })}
+                      className="h-8 rounded-md border px-2 text-[10px] font-semibold transition-colors"
+                      style={{
+                        borderColor: imageStudio.config.seedMode === "fixed" ? "var(--accent)" : (isLightTheme ? "#d4d4d8" : "#27272a"),
+                        backgroundColor: imageStudio.config.seedMode === "fixed" ? "var(--accent-subtle)" : (isLightTheme ? "#f8fafc" : "#050507"),
+                        color: imageStudio.config.seedMode === "fixed" ? (isLightTheme ? "var(--accent-hover)" : "var(--accent-light)") : (isLightTheme ? "#374151" : "#a1a1aa"),
+                      }}
+                    >
+                      {imageStudio.config.seedMode === "fixed" ? (language === "en" ? "Fixed" : "固定") : (language === "en" ? "Random" : "随机")}
+                    </button>
+                    <input
+                      type="number"
+                      min="0"
+                      max="2147483647"
+                      value={imageStudio.config.seed}
+                      disabled={imageStudio.config.seedMode !== "fixed"}
+                      onChange={(event) => setImageStudioConfig({ seed: Number(event.target.value) })}
+                      className="h-8 min-w-0 rounded-md border px-2 text-[11px] outline-none disabled:opacity-45"
+                      style={imageStudioFieldStyle}
+                    />
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
           {/* Attached files tags */}
-          {attachedFiles.length > 0 && (
+          {!isImageStudioMode && attachedFiles.length > 0 && (
             <div className="flex flex-wrap gap-2 px-4 pt-3">
               {attachedFiles.map((filePath: any) => (
                 <div key={attachmentIdentity(filePath)} className="flex items-center gap-1.5 bg-[#000000] border border-[var(--accent-subtle-border,#27272a)] text-[var(--accent-light,#a855f7)] text-[11px] font-mono px-2 py-1 rounded-md">
@@ -1613,7 +1801,7 @@ export default function Composer({
           )}
 
           {/* Context mentions (@-mentions) tags */}
-          {contextMentions.length > 0 && (
+          {!isImageStudioMode && contextMentions.length > 0 && (
             <div className={`flex flex-wrap gap-2 px-4 ${attachedFiles.length > 0 ? 'pt-2' : 'pt-3'}`}>
               {contextMentions.map((mention: string) => (
                 <div key={mention} className="flex items-center gap-1.5 bg-[#000000] border border-[#27272a] text-[#e4e4e7] text-[11px] font-mono px-2 py-1 rounded-md">
@@ -1892,7 +2080,12 @@ export default function Composer({
 
               {/* Context Usage Indicator */}
               <div className="flex items-center gap-1.5 text-[#71717a] font-mono text-[11px] font-semibold select-none">
-                {activeProfile === "cloud" ? (
+                {isImageStudioMode ? (
+                  <div className="flex items-center gap-1.5 ml-0.5" title={language === "en" ? "Image Studio bypasses LLM context and tool execution" : "图像工作室不占用 LLM 上下文，也不进入工具执行"}>
+                    <IconZap className="h-3.5 w-3.5 text-[var(--accent-light)]" />
+                    <span>{imageStudio.config.steps} steps</span>
+                  </div>
+                ) : activeProfile === "cloud" ? (
                   <div className="flex items-center gap-1.5 ml-0.5" title={cloudTokenTitle}>
                     <span className="inline-block h-1.5 w-1.5 rounded-full bg-[#60a5fa]" />
                     <span>{cloudTokenLabel}</span>
@@ -1997,26 +2190,38 @@ export default function Composer({
               )}
 
               {/* @ Mention button — inserts @ and opens the same menu */}
-              <button
-                onClick={handleAtButtonClick}
-                className={`panel-tab-icon-button flex h-7 w-7 shrink-0 items-center justify-center rounded-[7px] p-0 transition-all duration-150 ${showMentionMenu ? "is-active" : ""}`}
-                title={language === "en" ? "Reference file" : "引用文件"}
-              >
-                <IconAt className="w-3.5 h-3.5" />
-              </button>
+              {!isImageStudioMode && (
+                <>
+                  <button
+                    onClick={handleAtButtonClick}
+                    className={`panel-tab-icon-button flex h-7 w-7 shrink-0 items-center justify-center rounded-[7px] p-0 transition-all duration-150 ${showMentionMenu ? "is-active" : ""}`}
+                    title={language === "en" ? "Reference file" : "引用文件"}
+                  >
+                    <IconAt className="w-3.5 h-3.5" />
+                  </button>
 
-              {/* + Attach file button */}
-              <button
-                onClick={handleAttachButtonClick}
-                className="panel-tab-icon-button flex h-7 w-7 shrink-0 items-center justify-center rounded-[7px] p-0 transition-all duration-150"
-                title={language === "en" ? "Attach file" : "附加文件"}
-              >
-                <IconPlus className="w-4 h-4" />
-              </button>
+                  <button
+                    onClick={handleAttachButtonClick}
+                    className="panel-tab-icon-button flex h-7 w-7 shrink-0 items-center justify-center rounded-[7px] p-0 transition-all duration-150"
+                    title={language === "en" ? "Attach file" : "附加文件"}
+                  >
+                    <IconPlus className="w-4 h-4" />
+                  </button>
+                </>
+              )}
+              {isImageStudioMode && (
+                <button
+                  onClick={handleAttachButtonClick}
+                  className="panel-tab-icon-button flex h-7 w-7 shrink-0 items-center justify-center rounded-[7px] p-0 transition-all duration-150"
+                  title={language === "en" ? "Add reference image" : "添加参考图"}
+                >
+                  <IconImageIcon className="w-3.5 h-3.5" />
+                </button>
+              )}
             </div>
 
             <div className="flex items-center gap-2">
-              {lockedComposerIntentLabel && !activeDiffTask && !isStreaming && (
+              {lockedComposerIntentLabel && !isImageStudioMode && !activeDiffTask && !isStreaming && (
                 <button
                   type="button"
                   onClick={() => setLockedComposerIntent(null)}
@@ -2053,7 +2258,9 @@ export default function Composer({
             </div>
           </div>
         </div>
+        </div>
       </div>
-    </div>
+      <ImageStudioSetupModal />
+    </>
   );
 }

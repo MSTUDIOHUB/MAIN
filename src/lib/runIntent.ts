@@ -859,6 +859,7 @@ export function getMainIntentShortcuts(
 
 export function isMainIntentShortcutAllowedInMainMode(intent: MainIntentShortcut, mainModeKey: MainModeKey): boolean {
   if (mainModeKey === "game_studio") return intent === "plan";
+  if (mainModeKey === "image_studio") return false;
   return true;
 }
 

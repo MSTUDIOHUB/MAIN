@@ -95,6 +95,7 @@ export function buildPersistedAppState(state: Record<string, any>): Record<strin
     currentSessionId: state.currentSessionId,
     selectedMainModeKey: state.selectedMainModeKey,
     selectedNexusModeKey: state.selectedNexusModeKey,
+    imageStudio: state.imageStudio,
     activeStudioAgentKey: state.activeStudioAgentKey,
     gameStudioInitialized: state.gameStudioInitialized,
     preferredResponseLanguage: state.preferredResponseLanguage,

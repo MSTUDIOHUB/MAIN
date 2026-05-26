@@ -10,7 +10,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpListener;
+use std::net::{IpAddr, TcpListener};
 use std::path::{Component, Path, PathBuf};
 use std::process::{
     Child as ProcessChild, ChildStdin, Command as ProcessCommand, ExitStatus, Stdio,
@@ -1599,6 +1599,47 @@ struct ProxyDetailedResponse {
     body: String,
     content_type: Option<String>,
     headers: std::collections::HashMap<String, String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImageStudioEngineCapabilities {
+    text_to_image: bool,
+    image_to_image: bool,
+    progress_preview: bool,
+    cuda_required: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImageStudioEngineCheckResult {
+    ready: bool,
+    message: String,
+    capabilities: ImageStudioEngineCapabilities,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImageStudioProxyResponse {
+    status: u16,
+    ok: bool,
+    body: String,
+    content_type: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImageStudioStreamChunkPayload {
+    stream_id: String,
+    chunk: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImageStudioStreamDonePayload {
+    stream_id: String,
+    status: String,
+    error: Option<String>,
 }
 
 // region: grep 辅助
@@ -6757,6 +6798,448 @@ fn cancel_proxy_request() -> Result<(), String> {
 
 // endregion
 
+// region: 图像工作室 HTTP 代理
+
+static IMAGE_STUDIO_STREAM_CANCEL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static IMAGE_STUDIO_STREAM_ABORT: std::sync::Mutex<Option<futures_util::future::AbortHandle>> =
+    std::sync::Mutex::new(None);
+
+fn image_studio_default_capabilities() -> ImageStudioEngineCapabilities {
+    ImageStudioEngineCapabilities {
+        text_to_image: true,
+        image_to_image: true,
+        progress_preview: true,
+        cuda_required: true,
+    }
+}
+
+fn set_image_studio_abort_handle(handle: Option<futures_util::future::AbortHandle>) {
+    if let Ok(mut slot) = IMAGE_STUDIO_STREAM_ABORT.lock() {
+        *slot = handle;
+    }
+}
+
+fn abort_active_image_studio_request() {
+    if let Ok(mut slot) = IMAGE_STUDIO_STREAM_ABORT.lock() {
+        if let Some(handle) = slot.take() {
+            handle.abort();
+        }
+    }
+}
+
+fn emit_image_studio_stream_done(
+    app: &AppHandle,
+    stream_id: &str,
+    status: &str,
+    error: Option<String>,
+) {
+    let _ = app.emit(
+        "image-studio-stream-done",
+        ImageStudioStreamDonePayload {
+            stream_id: stream_id.to_string(),
+            status: status.to_string(),
+            error,
+        },
+    );
+}
+
+fn is_allowed_image_studio_host(host: &str) -> bool {
+    let normalized = host.trim().trim_matches(['[', ']']).to_ascii_lowercase();
+    if normalized == "localhost" {
+        return true;
+    }
+    match normalized.parse::<IpAddr>() {
+        Ok(IpAddr::V4(addr)) => {
+            addr.is_loopback()
+                || addr.is_private()
+                || addr.is_link_local()
+        }
+        Ok(IpAddr::V6(addr)) => {
+            addr.is_loopback()
+                || addr.is_unique_local()
+                || addr.is_unicast_link_local()
+        }
+        Err(_) => false,
+    }
+}
+
+fn validate_image_studio_endpoint(endpoint: &str) -> Result<url::Url, String> {
+    let trimmed = endpoint.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err("图像工作室 endpoint 不能为空".to_string());
+    }
+    let parsed = url::Url::parse(trimmed).map_err(|e| format!("图像工作室 endpoint 无效: {e}"))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        _ => return Err("图像工作室 endpoint 仅支持 http/https".to_string()),
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("图像工作室 endpoint 不允许包含用户名或密码".to_string());
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "图像工作室 endpoint 缺少主机名".to_string())?;
+    if !is_allowed_image_studio_host(host) {
+        return Err("图像工作室 endpoint 只允许 localhost、127.0.0.1、::1 或私有局域网 IP".to_string());
+    }
+    Ok(parsed)
+}
+
+fn build_image_studio_url(endpoint: &str, request_path: &str) -> Result<url::Url, String> {
+    let mut base = validate_image_studio_endpoint(endpoint)?;
+    let path = request_path.trim();
+    if !path.starts_with('/') {
+        return Err("图像工作室请求路径必须以 / 开头".to_string());
+    }
+    if path.contains("://") || path.contains('\\') || path.contains('\0') {
+        return Err("图像工作室请求路径非法".to_string());
+    }
+    if path.split('/').any(|part| part == "..") {
+        return Err("图像工作室请求路径不允许包含 ..".to_string());
+    }
+    base.set_path(path);
+    base.set_query(None);
+    base.set_fragment(None);
+    Ok(base)
+}
+
+#[tauri::command]
+async fn check_image_studio_engine(
+    engine: String,
+    endpoint: String,
+) -> Result<ImageStudioEngineCheckResult, String> {
+    if engine.trim() != "hidream_http" {
+        return Err("Unsupported Image Studio engine.".to_string());
+    }
+    let url = build_image_studio_url(&endpoint, "/")?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .connect_timeout(Duration::from_secs(3))
+        .build()
+        .map_err(|e| format!("创建图像工作室 HTTP 客户端失败: {e}"))?;
+
+    match client.get(url.clone()).send().await {
+        Ok(response) => {
+            let status = response.status();
+            let ready = !status.is_server_error();
+            Ok(ImageStudioEngineCheckResult {
+                ready,
+                message: if ready {
+                    format!("HiDream HTTP service is reachable at {}.", url)
+                } else {
+                    format!("HiDream HTTP service returned HTTP {}.", status)
+                },
+                capabilities: image_studio_default_capabilities(),
+            })
+        }
+        Err(error) => Ok(ImageStudioEngineCheckResult {
+            ready: false,
+            message: if error.is_connect() {
+                "未连接到图像引擎，请确认 HiDream/ComfyUI HTTP 服务已启动。".to_string()
+            } else if error.is_timeout() {
+                "图像引擎健康检查超时。".to_string()
+            } else {
+                format!("图像引擎健康检查失败: {error}")
+            },
+            capabilities: image_studio_default_capabilities(),
+        }),
+    }
+}
+
+#[tauri::command]
+async fn proxy_image_studio_request(
+    app: AppHandle,
+    endpoint: String,
+    path: String,
+    method: String,
+    body: Option<String>,
+    stream_id: Option<String>,
+) -> Result<ImageStudioProxyResponse, String> {
+    let meth = method.trim().to_ascii_uppercase();
+    let url = build_image_studio_url(&endpoint, &path)?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(MODEL_REQUEST_TIMEOUT_SECS))
+        .read_timeout(Duration::from_secs(STREAM_READ_TIMEOUT_SECS))
+        .connect_timeout(Duration::from_secs(HTTP_CONNECT_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| format!("创建图像工作室 HTTP 客户端失败: {e}"))?;
+
+    let mut req = match meth.as_str() {
+        "GET" => client.get(url.clone()),
+        "POST" => client.post(url.clone()),
+        "DELETE" => client.delete(url.clone()),
+        _ => return Err(format!("Unsupported Image Studio HTTP method: {meth}")),
+    };
+
+    if meth == "POST" {
+        req = req.header("Content-Type", "application/json");
+    }
+    if stream_id.is_some() {
+        req = req.header("Accept", "text/event-stream");
+    }
+    let req = if let Some(body_str) = body {
+        req.body(body_str)
+    } else {
+        req
+    };
+
+    if meth == "GET" {
+        if let Some(stream_id) = stream_id.filter(|value| !value.trim().is_empty()) {
+            return stream_image_studio_response(app, stream_id, url.to_string(), req).await;
+        }
+    }
+
+    let response = req
+        .send()
+        .await
+        .map_err(|e| format!("图像工作室请求失败: {e}"))?;
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("读取图像工作室响应失败: {e}"))?;
+
+    Ok(ImageStudioProxyResponse {
+        status: status.as_u16(),
+        ok: status.is_success(),
+        body,
+        content_type,
+    })
+}
+
+async fn stream_image_studio_response(
+    app: AppHandle,
+    stream_id: String,
+    _url: String,
+    req: reqwest::RequestBuilder,
+) -> Result<ImageStudioProxyResponse, String> {
+    use futures_util::StreamExt;
+
+    IMAGE_STUDIO_STREAM_CANCEL.store(false, std::sync::atomic::Ordering::Relaxed);
+    set_image_studio_abort_handle(None);
+
+    let (send_abort_handle, send_abort_registration) =
+        futures_util::future::AbortHandle::new_pair();
+    set_image_studio_abort_handle(Some(send_abort_handle));
+    let response_result = futures_util::future::Abortable::new(req.send(), send_abort_registration)
+        .await;
+    set_image_studio_abort_handle(None);
+
+    let response = match response_result {
+        Err(_) => {
+            emit_image_studio_stream_done(&app, &stream_id, "cancelled", None);
+            return Ok(ImageStudioProxyResponse {
+                status: 499,
+                ok: false,
+                body: String::new(),
+                content_type: None,
+            });
+        }
+        Ok(result) => result.map_err(|e| format!("启动图像工作室流失败: {e}"))?,
+    };
+
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    if !status.is_success() {
+        let error_body = response.text().await.unwrap_or_default();
+        return Err(format!(
+            "HTTP {}: {}",
+            status,
+            error_body.chars().take(500).collect::<String>()
+        ));
+    }
+
+    let status_code = status.as_u16();
+    let mut stream = response.bytes_stream();
+    let mut utf8_tail: Vec<u8> = Vec::new();
+
+    loop {
+        let (chunk_abort_handle, chunk_abort_registration) =
+            futures_util::future::AbortHandle::new_pair();
+        set_image_studio_abort_handle(Some(chunk_abort_handle));
+        let next_chunk = futures_util::future::Abortable::new(stream.next(), chunk_abort_registration).await;
+        set_image_studio_abort_handle(None);
+
+        let item = match next_chunk {
+            Err(_) => {
+                emit_image_studio_stream_done(&app, &stream_id, "cancelled", None);
+                return Ok(ImageStudioProxyResponse {
+                    status: 499,
+                    ok: false,
+                    body: String::new(),
+                    content_type,
+                });
+            }
+            Ok(item) => item,
+        };
+
+        let Some(chunk_result) = item else {
+            break;
+        };
+
+        if IMAGE_STUDIO_STREAM_CANCEL.load(std::sync::atomic::Ordering::Relaxed) {
+            emit_image_studio_stream_done(&app, &stream_id, "cancelled", None);
+            return Ok(ImageStudioProxyResponse {
+                status: 499,
+                ok: false,
+                body: String::new(),
+                content_type,
+            });
+        }
+
+        match chunk_result {
+            Ok(bytes) => {
+                let mut combined = Vec::with_capacity(utf8_tail.len() + bytes.len());
+                combined.extend_from_slice(&utf8_tail);
+                utf8_tail.clear();
+                combined.extend_from_slice(&bytes);
+                let text = match std::str::from_utf8(&combined) {
+                    Ok(value) => value.to_string(),
+                    Err(error) => {
+                        let valid_up_to = error.valid_up_to();
+                        if valid_up_to == 0 {
+                            utf8_tail = combined;
+                            continue;
+                        }
+                        utf8_tail = combined[valid_up_to..].to_vec();
+                        std::str::from_utf8(&combined[..valid_up_to])
+                            .unwrap_or("")
+                            .to_string()
+                    }
+                };
+                if !text.is_empty() {
+                    let _ = app.emit(
+                        "image-studio-stream-chunk",
+                        ImageStudioStreamChunkPayload {
+                            stream_id: stream_id.clone(),
+                            chunk: text,
+                        },
+                    );
+                }
+            }
+            Err(error) => {
+                emit_image_studio_stream_done(
+                    &app,
+                    &stream_id,
+                    "error",
+                    Some(format!("图像流读取失败: {error}")),
+                );
+                return Ok(ImageStudioProxyResponse {
+                    status: status_code,
+                    ok: false,
+                    body: String::new(),
+                    content_type,
+                });
+            }
+        }
+    }
+
+    set_image_studio_abort_handle(None);
+    emit_image_studio_stream_done(&app, &stream_id, "ok", None);
+    Ok(ImageStudioProxyResponse {
+        status: status_code,
+        ok: true,
+        body: String::new(),
+        content_type,
+    })
+}
+
+#[tauri::command]
+fn cancel_image_studio_job() -> Result<(), String> {
+    IMAGE_STUDIO_STREAM_CANCEL.store(true, std::sync::atomic::Ordering::Relaxed);
+    abort_active_image_studio_request();
+    Ok(())
+}
+
+fn decode_image_studio_data_url(data_url: &str) -> Result<Vec<u8>, String> {
+    let trimmed = data_url.trim();
+    let comma_index = trimmed
+        .find(',')
+        .ok_or_else(|| "图像输出必须是 data URL".to_string())?;
+    let header = trimmed[..comma_index].to_ascii_lowercase();
+    if !header.starts_with("data:image/") || !header.contains(";base64") {
+        return Err("图像输出必须是 base64 图片 data URL".to_string());
+    }
+    base64::engine::general_purpose::STANDARD
+        .decode(trimmed[comma_index + 1..].trim())
+        .map_err(|e| format!("解析图像输出失败: {e}"))
+}
+
+fn normalize_image_studio_output_file_name(file_name: &str) -> String {
+    let safe_name = sanitize_attachment_filename(file_name);
+    let lower = safe_name.to_ascii_lowercase();
+    if lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+        safe_name
+    } else {
+        format!("{safe_name}.png")
+    }
+}
+
+#[tauri::command]
+fn save_image_studio_output(
+    session_key: String,
+    file_name: String,
+    data_url: String,
+) -> Result<String, String> {
+    let bytes = decode_image_studio_data_url(&data_url)?;
+    let workspace = ensure_chat_temp_root(&session_key)?;
+    let safe_name = normalize_image_studio_output_file_name(&file_name);
+    let relative_path = format!("image-studio/{safe_name}");
+    let real_path = resolve_write_path(&relative_path, &workspace)?;
+    if let Some(parent) = real_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("创建图像输出目录失败: {e}"))?;
+    }
+    fs::write(&real_path, &bytes).map_err(|e| format!("保存图像输出失败: {e}"))?;
+    Ok(real_path.to_string_lossy().to_string())
+}
+
+fn image_studio_temp_sessions_root() -> PathBuf {
+    std::env::temp_dir()
+        .join("MAIN")
+        .join(".tmp")
+        .join("chat-sessions")
+}
+
+#[tauri::command]
+fn open_image_studio_output(
+    app: AppHandle,
+    path: String,
+) -> Result<OpenFileExternalResult, String> {
+    let raw = PathBuf::from(path.trim());
+    let real_path = raw
+        .canonicalize()
+        .map_err(|e| format!("图像输出路径不存在或无法访问: {e}"))?;
+    if !real_path.is_file() {
+        return Err("图像输出目标不是文件".to_string());
+    }
+    let temp_root = image_studio_temp_sessions_root()
+        .canonicalize()
+        .map_err(|e| format!("无法解析图像输出根目录: {e}"))?;
+    if !real_path.starts_with(&temp_root) {
+        return Err("只能打开 MAIN 图像工作室保存的输出文件".to_string());
+    }
+    let open_path = real_path.to_string_lossy().to_string();
+    app.opener()
+        .open_path(open_path.clone(), None::<&str>)
+        .map_err(|e| format!("无法使用系统默认应用打开图像：{e}"))?;
+    Ok(OpenFileExternalResult {
+        path: open_path,
+        opened: true,
+    })
+}
+
+// endregion
+
 // region: 流式聊天代理 (Cloud SSE Proxy)
 
 /// Global cancellation token for the active chat stream.
@@ -9097,6 +9580,11 @@ pub fn run() {
             proxy_request,
             proxy_request_detailed,
             cancel_proxy_request,
+            check_image_studio_engine,
+            proxy_image_studio_request,
+            cancel_image_studio_job,
+            save_image_studio_output,
+            open_image_studio_output,
             start_chat_stream,
             cancel_chat_stream,
             read_document,

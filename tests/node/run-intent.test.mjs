@@ -96,8 +96,9 @@ function createContext(overrides = {}) {
 }
 
 test("MAIN mode keys exclude legacy Task Center and migrate old value", () => {
-  assert.deepEqual([...MAIN_MODE_KEYS], ["main_mode", "game_studio"]);
+  assert.deepEqual([...MAIN_MODE_KEYS], ["main_mode", "game_studio", "image_studio"]);
   assert.equal(mapLegacyNexusModeToMainMode("task_center"), "main_mode");
+  assert.equal(mapLegacyNexusModeToMainMode("image_studio"), "image_studio");
 });
 
 test("plain Chinese planning wording stays natural without slash lock", () => {
