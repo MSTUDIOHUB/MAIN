@@ -68,6 +68,7 @@ const {
   shouldAutoContinueReadOnlyPermission,
   shouldPauseForReplyOptions,
   shouldRouteUnapprovedPlanReplyOptionsToArtifact,
+  shouldSuppressApprovedPlanExecutionReplyOptions,
   stripReadOnlyPermissionPrompt,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/replyOptions.ts"));
 
@@ -660,6 +661,52 @@ test("shouldPauseForReplyOptions lets unapproved plan tool calls run before prop
       hasStructuredProposal: false,
       hasReadyPlanArtifacts: false,
       isPlanApproved: false,
+      finishReason: "tool_calls",
+    }),
+    false,
+  );
+});
+
+test("approved plan execution suppresses stale approval options while tool calls continue", () => {
+  const replyOptions = [
+    {
+      label: "批准执行本轮操作",
+      value: "我批准按上面的方案开始真实操作，请复用上一轮方案，不要重新规划，直接执行并验证。",
+      action: "approve_operation_once",
+      source: "proposal_follow_up",
+    },
+    {
+      label: "继续调整方案",
+      value: "请继续调整上面的方案，暂不执行真实操作。",
+      action: "adjust_plan",
+      source: "proposal_follow_up",
+    },
+    {
+      label: "取消操作",
+      value: "取消上面的执行操作，本轮到此为止。",
+      action: "cancel_operation",
+      source: "operation_approval",
+    },
+  ];
+
+  assert.equal(
+    shouldSuppressApprovedPlanExecutionReplyOptions({
+      replyOptions,
+      workflowMode: "plan",
+      isPlanApproved: true,
+      planStage: "executing",
+    }),
+    true,
+  );
+
+  assert.equal(
+    shouldPauseForReplyOptions({
+      replyOptions: [],
+      toolCallCount: 6,
+      workflowMode: "plan",
+      hasStructuredProposal: false,
+      hasReadyPlanArtifacts: false,
+      isPlanApproved: true,
       finishReason: "tool_calls",
     }),
     false,

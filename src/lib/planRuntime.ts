@@ -6,7 +6,6 @@ export type PlanRuntimeMode = "chat" | "edit" | "plan";
 
 export type PlanFinalizationRecoveryAction =
   | "ignore"
-  | "deterministic_materialization"
   | "targeted_evidence"
   | "pause_blocked";
 
@@ -132,13 +131,20 @@ export function resolvePlanNoActionRecovery(input: {
   if (input.workflowMode !== "plan" || input.isPlanApproved || !input.reasoningOnly) {
     return { action: "ignore", reason: "not_unapproved_plan_reasoning_only" };
   }
-  if (hasReadyPlanEvidence(input.evidenceReadiness)) {
-    return { action: "deterministic_materialization", reason: "evidence_ready_for_plan" };
-  }
   if (input.targetedRecoveryPasses < 1) {
-    return { action: "targeted_evidence", reason: input.evidenceReadiness || "insufficient_evidence" };
+    return {
+      action: "targeted_evidence",
+      reason: hasReadyPlanEvidence(input.evidenceReadiness)
+        ? "ready_evidence_missing_visible_plan"
+        : input.evidenceReadiness || "insufficient_evidence",
+    };
   }
-  return { action: "pause_blocked", reason: input.evidenceReadiness || "insufficient_evidence_after_recovery" };
+  return {
+    action: "pause_blocked",
+    reason: hasReadyPlanEvidence(input.evidenceReadiness)
+      ? "ready_evidence_missing_visible_plan_after_recovery"
+      : input.evidenceReadiness || "insufficient_evidence_after_recovery",
+  };
 }
 
 export function resolvePlanSuppressedToolRecovery(input: {
@@ -150,13 +156,20 @@ export function resolvePlanSuppressedToolRecovery(input: {
   if (input.workflowMode !== "plan" || input.isPlanApproved) {
     return { action: "ignore", reason: "not_unapproved_plan" };
   }
-  if (hasReadyPlanEvidence(input.evidenceReadiness)) {
-    return { action: "deterministic_materialization", reason: "suppressed_tool_after_ready_evidence" };
-  }
   if (input.targetedRecoveryPasses < 1) {
-    return { action: "targeted_evidence", reason: input.evidenceReadiness || "insufficient_evidence" };
+    return {
+      action: "targeted_evidence",
+      reason: hasReadyPlanEvidence(input.evidenceReadiness)
+        ? "suppressed_tool_ready_evidence_missing_visible_plan"
+        : input.evidenceReadiness || "insufficient_evidence",
+    };
   }
-  return { action: "pause_blocked", reason: input.evidenceReadiness || "insufficient_evidence_after_recovery" };
+  return {
+    action: "pause_blocked",
+    reason: hasReadyPlanEvidence(input.evidenceReadiness)
+      ? "suppressed_tool_ready_evidence_missing_visible_plan_after_recovery"
+      : input.evidenceReadiness || "insufficient_evidence_after_recovery",
+  };
 }
 
 export function shouldSuppressPlanTruncationWarning(input: {
@@ -182,16 +195,16 @@ export function buildPlanTargetedEvidenceRecoveryPrompt(input: {
       "PLAN_TARGETED_EVIDENCE_RECOVERY: The previous planning turn ended in hidden reasoning without a reviewable plan.",
       input.reason ? `Evidence readiness: ${input.reason}.` : "",
       "Do exactly one tightly scoped read-only evidence pass now. Prefer the most specific file/path/symbol from the user request or the latest evidence.",
-      "After that single read/search result, stop exploring and produce a concise visible `<proposed_plan>` or Codex-style Proposal. MAIN will materialize it into `.MAIN/plans/plan.md` for review.",
-      "Do not call write_file or replace_in_file just to finish planning.",
+      "After that single read/search result, stop exploring and produce or update a concise reviewable plan. If plan write tools are available, write `.MAIN/plans/plan.md`; otherwise output visible `<proposed_plan>`.",
+      "Do not ask for approval again and do not modify source or deliverable files before approval.",
     ].filter(Boolean).join("\n");
   }
   return [
     "PLAN_TARGETED_EVIDENCE_RECOVERY: 上一条计划回复只有隐藏推理，没有形成可审批计划。",
     input.reason ? `证据状态：${input.reason}。` : "",
     "现在只做一次精确定向的只读补证。优先读取用户请求或已有证据里最具体的文件、路径或符号。",
-    "拿到这一次读取/搜索结果后，停止探索，直接输出精简可见的 `<proposed_plan>` 或 Codex-style Proposal；MAIN 会把它物化为 `.MAIN/plans/plan.md` 供审批。",
-    "不要为了完成规划而调用 write_file 或 replace_in_file。",
+    "拿到这一次读取/搜索结果后，停止探索并生成或更新精简可审批计划；如果本轮有计划写入工具，写入 `.MAIN/plans/plan.md`，否则输出可见 `<proposed_plan>`。",
+    "不要再次询问是否批准，也不要在批准前修改源码或最终交付文件。",
   ].filter(Boolean).join("\n");
 }
 
@@ -203,12 +216,12 @@ export function buildPlanEvidenceBlockedPauseMessage(input: {
     return [
       "Plan generation paused: one targeted evidence recovery pass was already used, but the evidence is still not sufficient for a reviewable plan.",
       input.reason ? `Current blocker: ${input.reason}.` : "",
-      "Resume with a concrete missing file/path/fact, or provide the key decision needed before MAIN can produce `.MAIN/plans/plan.md`.",
+      "MAIN did not synthesize a fallback plan. Resume with a concrete missing file/path/fact, or provide the key decision needed before the model can produce `.MAIN/plans/plan.md`.",
     ].filter(Boolean).join("\n");
   }
   return [
     "计划生成已暂停：已经使用过一次定向补证，但证据仍不足以生成可审批计划。",
     input.reason ? `当前阻塞：${input.reason}。` : "",
-    "继续时请给出具体缺失的文件/路径/事实，或提供生成 `.MAIN/plans/plan.md` 前必须确定的关键选择。",
+    "MAIN 不会再自动拼接兜底计划。继续时请给出具体缺失的文件/路径/事实，或提供模型生成 `.MAIN/plans/plan.md` 前必须确定的关键选择。",
   ].filter(Boolean).join("\n");
 }

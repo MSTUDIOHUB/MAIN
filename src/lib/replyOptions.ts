@@ -424,6 +424,20 @@ export function hasExecutableProposalReplyOptions(replyOptions: ReplyOption[]): 
   );
 }
 
+export function shouldSuppressApprovedPlanExecutionReplyOptions(params: {
+  replyOptions: ReplyOption[];
+  workflowMode: "chat" | "edit" | "plan";
+  isPlanApproved?: boolean;
+  planStage?: string | null;
+}): boolean {
+  return (
+    params.workflowMode === "plan" &&
+    params.isPlanApproved === true &&
+    params.planStage === "executing" &&
+    hasExecutableProposalReplyOptions(params.replyOptions)
+  );
+}
+
 export function shouldRouteUnapprovedPlanReplyOptionsToArtifact(params: {
   replyOptions: ReplyOption[];
   workflowMode: "chat" | "edit" | "plan";

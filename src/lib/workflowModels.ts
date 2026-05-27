@@ -1947,6 +1947,22 @@ export function validateActionablePlanArtifact(
   if (weakPathEchoGroundingCount >= 2) {
     return classifyPlanArtifactQualityResult({ ok: false, reason: "weak_path_echo_evidence" });
   }
+  const importOnlyEvidenceCount = (raw.match(/(?:发现|found)\s*[:：]\s*(?:L\d+\s*[:：]\s*)?\s*import\s+[^;\n]+;?/gi) || []).length;
+  if (importOnlyEvidenceCount >= 1) {
+    return classifyPlanArtifactQualityResult({ ok: false, reason: "import_only_evidence" });
+  }
+  const genericThemeTokenChangeCount = (raw.match(/(?:更新|调整|改造|优化|modify|update|adjust)[^。\n]*(?:深色模式表面|主题\s*token|theme\s*tokens?|dark\s+mode\s+surface|图表\/容器对比度|chart\/container contrast)/gi) || []).length;
+  if (genericThemeTokenChangeCount >= 2) {
+    return classifyPlanArtifactQualityResult({ ok: false, reason: "generic_theme_token_plan" });
+  }
+  const hasPlaceholderValidationPlan =
+    /(?:运行受影响子系统的聚焦测试、构建检查或浏览器\/桌面验证|Run the focused test, build, or browser\/desktop validation for the touched subsystem)/i.test(raw);
+  if (
+    hasPlaceholderValidationPlan &&
+    (importOnlyEvidenceCount >= 1 || weakPathEchoGroundingCount >= 2 || genericThemeTokenChangeCount >= 2)
+  ) {
+    return classifyPlanArtifactQualityResult({ ok: false, reason: "placeholder_validation_plan" });
+  }
   if (/(?:^|\n)\s*(?:[-*]\s*)?(?:用户目标|User goal)\s*[:：]\s*(?:$|\n)/i.test(raw)) {
     return classifyPlanArtifactQualityResult({ ok: false, reason: "empty_user_goal" });
   }

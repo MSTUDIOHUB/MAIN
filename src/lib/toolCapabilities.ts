@@ -51,6 +51,8 @@ export interface ToolIntentFilterOptions {
   planApproved?: boolean;
 }
 
+const PLAN_DRAFT_WRITE_TOOL_NAMES = new Set(["write_file", "replace_in_file"]);
+
 export interface McpRoutingConfig {
   enabled: boolean;
   threshold: number;
@@ -601,6 +603,7 @@ export function filterToolDefinitionsForIntent(
     const risk = capability?.risk ?? classifyBuiltInTool(name);
 
     if (effectiveIntent === "plan") {
+      if (PLAN_DRAFT_WRITE_TOOL_NAMES.has(name)) return true;
       return risk === "read_only" || risk === "external_read";
     }
 

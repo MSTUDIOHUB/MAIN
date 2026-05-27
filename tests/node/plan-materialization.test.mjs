@@ -200,7 +200,7 @@ test("canonicalizes OMLX proposed_plan with verification steps and assumptions",
     userGoal: "检查 Codex-style Plan flow refactor 是否完成落地，并用 OMLX 本地模型验证真实 Plan 请求是否能进入可审阅方案。",
     evidence: [
       "read_file src/lib/orchestrator.ts; excerpt=Plan runtime 会按 phase 收窄工具面",
-      "read_file src/lib/planRuntime.ts; excerpt=reasoning-only 在证据 ready 时走 deterministic_materialization",
+      "read_file src/lib/planRuntime.ts; excerpt=reasoning-only 在证据 ready 时要求模型生成 plan.md",
       "read_file src/lib/planMaterialization.ts; excerpt=支持 proposed_plan 物化到 plan.md",
       "cmd:node --test Plan suite passed",
       "cmd:npm run build passed",
@@ -1261,6 +1261,38 @@ test("deterministic materialization refuses insufficient evidence", () => {
 
   assert.equal(result.ok, false);
   assert.match(result.reason || "", /quality_gate|insufficient|missing|too_short|not_structured/);
+});
+
+test("materialization rejects import-only weak fallback plan from debug log", () => {
+  const content = [
+    "# 计划",
+    "",
+    "## 摘要",
+    "- 用户目标：修复手动导入 CSV 后 Dashboard 数据不显示，并彻底改善深色模式。",
+    "- 定向证据已覆盖：`src/App.tsx`、`src/components/FileUploader/DragUpload.tsx`。",
+    "- 最相关证据：已读取文件：src/App.tsx；发现：L1: import React, { useState, useEffect } from 'react';。",
+    "",
+    "## 关键改动",
+    "- 更新 `src/App.tsx` 的深色模式表面、主题 token、图表/容器对比度。依据证据：已读取文件：src/App.tsx；发现：L1: import React, { useState, useEffect } from 'react';。",
+    "- 更新 `src/components/FileUploader/DragUpload.tsx` 的深色模式表面、主题 token、图表/容器对比度。依据证据：已读取文件：src/components/FileUploader/DragUpload.tsx；发现：L1: import { InboxOutlined } from '@ant-design/icons';。",
+    "",
+    "## 公共 API / 接口 / 类型",
+    "- 默认不新增或修改公共 API、接口或类型。",
+    "",
+    "## 测试方案",
+    "- 运行受影响子系统的聚焦测试、构建检查或浏览器/桌面验证，并记录结果。",
+    "",
+    "## 假设与默认值",
+    "- 默认保持现有数据结构不变。",
+  ].join("\n");
+
+  const result = materializePlanArtifactFromVisibleText({
+    visibleText: content,
+    language: "zh",
+  });
+
+  assert.equal(result.ok, false);
+  assert.match(result.reason || "", /import_only_evidence|generic_theme_token_plan|placeholder_validation_plan/);
 });
 
 test("materializes explicit design text to design.md", () => {

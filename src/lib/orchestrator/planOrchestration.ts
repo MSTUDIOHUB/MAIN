@@ -511,7 +511,6 @@ export function buildPlanRecoveryPromptFromContext(input: {
       "- Every implementation change must point to concrete files, interfaces, data flow, commands, validation, or an explicit default. If public APIs/interfaces/types do not change, say that explicitly.",
       "- Do not include console.log/debug-log suggestions, generalized CSS/store guesses, or probability claims as execution steps unless a cited evidence line supports them; otherwise place them under unverified hypotheses.",
       "- Non-blocking MVP tradeoffs must be written with explicit defaults as assumptions or follow-up enhancements. If a choice blocks execution, ask with `<user_options>` before approval and stop.",
-      "- `requirements.md` is optional. Only create it when the user explicitly asks for a requirement ledger or when large/compliance-heavy scope needs traceability; it is never a prerequisite for approval.",
       "- If the plan direction is unclear, ask the user with `<user_options>` and stop. Do not invent a final plan.",
       "- If the direction is clear, write a concise `.MAIN/plans/plan.md` for approval. Do not generate `tasks.md` or edit source files before approval.",
     ].filter(Boolean).join("\n");
@@ -530,7 +529,6 @@ export function buildPlanRecoveryPromptFromContext(input: {
     "- 每个关键实现改动必须指向具体文件、接口、数据流、命令、验证方式或明确默认假设；如果公共 API/接口/类型不变，必须显式写明。",
     "- 没有证据支撑时，不要把 console.log/调试日志建议、泛化 CSS/Store 猜测或概率判断写成执行步骤；只能放入未验证假设。",
     "- 非阻塞 MVP 取舍必须写成带默认值的默认假设或后续增强；真正阻塞执行的选择必须在批准前用 `<user_options>` 提问并停止。",
-    "- `requirements.md` 是可选需求台账；只有用户明确要求、范围很大或需要合规/验收追踪时才生成，绝不是审批前置条件。",
     "- 如果设计方向不明确，使用 `<user_options>` 让用户选择并立刻停止；不要编造最终方案。",
     "- 如果方向已经明确，直接写入精简 `.MAIN/plans/plan.md` 等待审批。批准前不要生成 `tasks.md`，不要修改源码。",
   ].filter(Boolean).join("\n");

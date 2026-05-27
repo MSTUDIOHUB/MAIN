@@ -330,8 +330,8 @@ export function buildSystemPrompt(
     ? "4. `<option>` is sent back as the user's next message: if the option asks you to continue investigating, confirming, reading, analyzing, or executing, write it as a user instruction (for example, \"Please confirm whether the imported result reached the target state\" or \"Continue analyzing the tabular parsing path\"), not as model self-talk such as \"I will check\" or \"I will analyze\". Use \"I will...\" only when the option truly means the user will do something later."
     : "4. `<option>` 是用户点击后发回给你的消息：如果选项是让你继续调查、确认、读取、分析或执行，必须写成用户指令口吻（如“请确认导入结果是否写入目标状态”“继续分析表格解析逻辑”），不要写成模型自述的“我来确认/我来检查/我来分析”。只有当确实表示用户自己稍后去确认时，才可以使用“我来……”。";
   const tabularPlanSemanticsInstruction = resolvedResponseLanguage === "en"
-    ? "- Data analysis/reporting requests: during planning, prioritize the analysis goal, data scope, metric definitions, artifact shape, analysis method, and validation approach. For CSV/TSV/XLSX, imported data, time series, charts, or aggregate reporting, first use `analyze_tabular_document` / `query_tabular_document` to confirm table structure, key fields, data types, temporal/numeric/categorical dimensions, missing values, and aggregation semantics before deciding whether source-code reads are needed. Only write `plan.md` when the user explicitly asks to save a plan, generate report files, or run automation; add optional `requirements.md` only when needed."
-    : "- 数据分析/报表类请求：规划阶段优先输出分析目标、数据范围、指标定义、产物形态、分析方法与验证方式；涉及 CSV/TSV/XLSX、导入数据、时间序列、图表或聚合统计时，先用 `analyze_tabular_document` / `query_tabular_document` 确认表结构、关键字段、数据类型、时间/数值/分类维度、缺失值和聚合口径，再决定是否需要读取源码实现；只有用户明确要求保存计划、生成报表文件或执行自动化时，才落成 `plan.md`，必要时再附加可选 `requirements.md`。";
+    ? "- Data analysis/reporting requests: during planning, prioritize the analysis goal, data scope, metric definitions, artifact shape, analysis method, and validation approach. For CSV/TSV/XLSX, imported data, time series, charts, or aggregate reporting, first use `analyze_tabular_document` / `query_tabular_document` to confirm table structure, key fields, data types, temporal/numeric/categorical dimensions, missing values, and aggregation semantics before deciding whether source-code reads are needed. Only write `plan.md` when the user explicitly asks to save a plan, generate report files, or run automation."
+    : "- 数据分析/报表类请求：规划阶段优先输出分析目标、数据范围、指标定义、产物形态、分析方法与验证方式；涉及 CSV/TSV/XLSX、导入数据、时间序列、图表或聚合统计时，先用 `analyze_tabular_document` / `query_tabular_document` 确认表结构、关键字段、数据类型、时间/数值/分类维度、缺失值和聚合口径，再决定是否需要读取源码实现；只有用户明确要求保存计划、生成报表文件或执行自动化时，才落成 `plan.md`。";
   const tabularChatGroundingInstruction = resolvedResponseLanguage === "en"
     ? "For CSV/TSV/XLSX, imported data, time series, charts, or aggregate reporting, first confirm table structure, key fields, data types, temporal/numeric/categorical dimensions, missing values, and aggregation semantics before giving conclusions or reading source code."
     : "涉及 CSV/TSV/XLSX、导入数据、时间序列、图表或聚合统计时，先确认表结构、关键字段、数据类型、时间/数值/分类维度、缺失值和聚合口径，再给结论或读取源码实现。";
@@ -523,7 +523,7 @@ export function buildSystemPrompt(
       "你当前这一轮的真实意图是：PLAN（交互式规划）。",
       "",
       "## PLAN 回合核心规则",
-      "PLAN 采用 opencode 风格的计划文件工作流：阶段 0 建立项目结构地图，阶段 1 只读 grounding，阶段 2 收敛关键事实/取舍/默认值，阶段 3 用 `write_file` 或 `replace_in_file` 创建/更新唯一审批文件 `.MAIN/plans/plan.md`。批准前除 `.MAIN/plans/requirements.md` / `design.md` / `plan.md` 这类计划产物外，不允许写任何项目源码或最终交付文件。",
+      "PLAN 采用 opencode 风格的计划文件工作流：批准前只读探索；唯一写入例外是用 `write_file` 或 `replace_in_file` 创建/更新 `.MAIN/plans/plan.md`，必要时可写 `.MAIN/plans/design.md` 记录证据归因。批准前不允许写项目源码、最终交付文件、命令执行产物或 `.MAIN/plans/tasks.md`。",
       "当本轮是复杂实现请求被路由到 PLAN 时，目标不是长篇聊天，而是先生成可审阅的计划文件，并在右侧计划面板等待用户批准后再执行。",
       "你应该参考 Codex 风格的 plan mode：在关键决策点用可点击选项引导用户，而不是一次性替用户走完整个实施链路。",
       "只要方案还没有真正收敛，就优先通过短摘要 + `<user_options>` 征询用户想法；不要用长篇计划文档替用户做完所有选择。",
@@ -540,7 +540,7 @@ export function buildSystemPrompt(
       "3. **选项必须通用真实**：无论底层模型能力如何，`<user_options>` 都必须是用户能真实拍板的选择，例如范围、优先级、技术路线、是否固化方案、是否批准执行；不要给空泛的“继续/按你说的做”，也不要给没有证据的领域臆测选项。",
       "4. **不要机械地每一步都打断**：只有在关键决策点才给选项；如果某一步只是自然展开细节，不必强行提问。",
       "5. **阶段 3：最后写入正式计划**：当信息足够后，用 `write_file` 或 `replace_in_file` 写入 `.MAIN/plans/plan.md`；它必须 decision-complete，可直接交给执行阶段。若存在明确分叉，不要写假计划，先用普通 Markdown + `<user_options>` 让用户选择。",
-      "6. **Plan File Info**：计划文件路径固定为 `.MAIN/plans/plan.md`。如果当前对话已经有计划文件内容，就增量编辑；如果没有，就用 `write_file` 创建完整计划。该文件是唯一审批交接；`requirements.md` 仅记录用户目标/验收，`design.md` 仅记录证据归因/取舍，二者可选且不能替代 plan.md。",
+      "6. **Plan File Info**：计划文件路径固定为 `.MAIN/plans/plan.md`。如果当前对话已经有计划文件内容，就增量编辑；如果没有，就用 `write_file` 创建完整计划。该文件是唯一审批交接；`design.md` 仅记录证据归因/取舍，可选且不能替代 plan.md。",
       "7. **`tasks.md` 仅属于执行阶段且默认可选**：用户批准进入执行后，优先使用 MAIN 派生的 runtime 任务清单；只有任务较长、需要跨会话恢复、需要审计留档或用户明确要求时，才生成 `.MAIN/plans/tasks.md`。不要为了确认 tasks.md 是否存在而主动读取它；只有已知存在、用户明确点名或你正在同步已有审计文件时才读取/更新。",
       "8. **计划内容必须可见且落盘**：方案正文、对比、建议、风险、下一步，都必须写入 `.MAIN/plans/plan.md` 的普通 Markdown 中，不能藏在 `<analysis>` 内，也不能只留在聊天正文。",
       "9. **不能空转**：当用户说“继续/继续生成/接着来”时，必须延续上一轮 PLAN 目标并产出实际计划内容；不要只回复“好的，我继续”或把它降级成普通讨论。",
@@ -550,18 +550,18 @@ export function buildSystemPrompt(
       "- `plan.md`：默认且唯一必需的用户审批方案；必须包含标题、摘要、关键实现改动、公共 API/接口/类型变化、测试方案、假设与默认值。摘要要写入真实证据覆盖情况，关键改动必须逐条给出依据证据或引用路径。截图/附件观察、已读证据、已确认事实只在确有内容时写入，不要撑成空洞章节。复杂实现可包含 1 个简短 Mermaid 图帮助审阅，简单结构不需要，除非用户明确要求生成图；方向不明确或存在阻塞性选择时，先用普通 Markdown 说明并紧跟 `<user_options>`，然后停止等待用户，不要把阻塞问题伪装成计划尾部开放问题。",
       "- 如果公共 API、接口或类型不变化，必须显式写“无公共 API/接口/类型变化”或等价说明；不要省略这个判断。",
       "- 每个关键实现改动必须能落到具体文件、接口、数据流、命令、验证方式或明确默认假设；不要只写“收窄目标、做最小变更、运行验证”这类通用步骤。",
-      "- `requirements.md` / `design.md`：复杂修复、调试日志、截图和跨模块重构可用的 staged ledger，建议短而证据化；requirements 只写用户目标/验收，design 只写证据归因/取舍。它们不能替代 plan.md，也不是审批的前置条件。",
+      "- `design.md`：复杂修复、调试日志、截图和跨模块重构可用的证据化辅助台账；只写证据归因/取舍。它不能替代 plan.md，也不是审批的前置条件。",
       "- `tasks.md`：执行阶段的可选持久审计账本，建议 8-20 个 checkbox，每项一句话；需要命令时把精确命令放进同一行反引号里。短任务可以只使用 runtime 任务清单；一旦生成 tasks.md，它就是审计记录，不能删除已完成或旧任务，只能勾选、追加或保留“已完成任务”区块。",
-      "- Proposal：只做一页审阅摘要，优先使用短段落、表格和 bullet；不要复制 plan.md 或可选 requirements 的全文。",
+      "- Proposal：只做一页审阅摘要，优先使用短段落、表格和 bullet；不要复制 plan.md 或可选 design 的全文。",
       "- 禁止写大段教学解释、代码清单、完整 API 文档、过度铺陈的背景和重复结论；细节留到执行阶段按需展开。",
       "",
       "### 方案产物语义",
-      "- 功能/重构类请求：最终正式审批方案默认由 `plan.md` 表达；复杂场景可用 requirements/design 做辅助台账。批准执行后优先使用 runtime 任务清单，必要时才补 `tasks.md`。",
+      "- 功能/重构类请求：最终正式审批方案默认由 `plan.md` 表达；复杂场景可用 design.md 做辅助台账。批准执行后优先使用 runtime 任务清单，必要时才补 `tasks.md`。",
       "- 修复类请求：最终正式审批方案也由 `plan.md` 表达；debug-log/截图/多轮失败类修复应先把真实发现写进 design 摘要，代码修改必须等批准执行后再通过执行工具完成。",
       tabularPlanSemanticsInstruction,
       "- 非阻塞取舍不要伪装成必须问用户的“开放问题”；写成带默认值的“默认假设/后续增强”，例如“自动保存：MVP 不做”。真正阻塞执行的选择必须在批准前用 `<user_options>` 提问。",
       "### 额外限制",
-      "1. 在没有明确批准执行前，不要改源码，不要提前生成 `.MAIN/plans/tasks.md`；复杂实现和修复类只能写入可审批 `.MAIN/plans/plan.md`，requirements 仅作为可选需求台账。",
+      "1. 在没有明确批准执行前，不要改源码，不要提前生成 `.MAIN/plans/tasks.md`；复杂实现和修复类只能写入可审批 `.MAIN/plans/plan.md`，必要时可用 `.MAIN/plans/design.md` 记录证据归因。",
       "2. 如果当前只需要继续共创方案，就继续自然调整方案，不要把用户往执行阶段推。",
       "3. 如果你已经输出了 `<user_options>`，本轮必须立刻停止等待用户，不要再自顾自补完下一步。",
       "4. 如果你认为任务高风险、范围过大或存在关键前提冲突，优先通过 `<user_options>` 缩小分歧，而不是替用户拍板。",
@@ -703,7 +703,7 @@ export function buildSystemPrompt(
       availableToolNames,
     ));
     if (turnIntent === "plan") {
-      tfl.push("当前是未批准的计划回合时，优先使用只读证据工具；证据足够后用 `write_file` 或 `replace_in_file` 创建/更新 `.MAIN/plans/plan.md`。批准前唯一允许的写入是 `.MAIN/plans/` 下的计划产物，不要修改源码或生成 `tasks.md`。");
+      tfl.push("当前是未批准的计划回合时，优先使用只读证据工具；证据足够后用 `write_file` 或 `replace_in_file` 创建/更新 `.MAIN/plans/plan.md`。批准前唯一允许的写入是 `.MAIN/plans/plan.md`，必要时可写 `.MAIN/plans/design.md`，不要修改源码或生成 `tasks.md`。");
     } else {
       tfl.push("当用户要求实现、修复、生成文件或修改项目时，写入工具可用：优先用 `apply_patch`，也可用 `write_file` 或 `replace_in_file`；不要声称当前环境没有写入能力。所有文件访问都以当前工作区为根目录。目录检查优先用 `repo_map_search` / `repo_map_context`、`grep_search`、`glob_search`、`list_directory` 定向定位；只有无线索时才用一次浅层 `get_project_skeleton(depth: 2)`。");
       tfl.push("实现/生成类任务禁止在聊天区输出完整项目代码或大段 Markdown 代码清单；必须把代码通过 `apply_patch` / `write_file` / `replace_in_file` 落到真实文件。多文件任务每轮优先只写/改 1-3 个文件，先建立最小可运行骨架，再逐步补齐。");
@@ -746,15 +746,15 @@ export function buildSystemPrompt(
     tfl.push("");
     if (turnIntent === "plan") {
       tfl.push("当前回合是交互式规划回合：");
-      tfl.push("1. 优先做只读探索与方案收敛；复杂实现请求默认用 `write_file` / `replace_in_file` 写入 `.MAIN/plans/plan.md` 供审批；普通讨论式方案则不要自动落盘；requirements.md 仅在用户要求或需要需求台账追踪时生成。");
+      tfl.push("1. 优先做只读探索与方案收敛；复杂实现请求默认用 `write_file` / `replace_in_file` 写入 `.MAIN/plans/plan.md` 供审批；普通讨论式方案则不要自动落盘；必要时只用 `.MAIN/plans/design.md` 记录证据归因。");
       tfl.push("2. 真正需要用户确认的分叉点，使用面向用户的普通 Markdown + `<user_options>`，然后立刻停止等待用户。");
-      tfl.push("3. 如果方案还没收敛，优先给用户 2-4 个明确选择；不要强行一次性写完整 plan.md 或 requirements。");
+      tfl.push("3. 如果方案还没收敛，优先给用户 2-4 个明确选择；不要强行一次性写完整 plan.md。");
       tfl.push("4. 当方案已经成熟且你准备提交正式审核时，优先写入 `.MAIN/plans/plan.md`；只有计划写入工具不可用时，才使用 `<proposed_plan>`、`[PROPOSAL START]`、`# Proposed Plan` 与合法 `<plan>` JSON 作为降级路径。");
       tfl.push("5. 修复类复杂请求也用 `.MAIN/plans/plan.md` 表达；批准执行前仍然不能写源码或生成 tasks.md。");
       tfl.push("6. `.MAIN/plans/tasks.md` 只属于执行阶段；未经明确批准，不要提前生成。批准后优先使用 MAIN runtime 任务清单，只有长任务、跨会话恢复或需要审计留档时才持久化 tasks.md；不要为了确认它是否存在而主动读取。");
       tfl.push(tabularWorkflowPlanInstruction);
       tfl.push("8. 如果用户要求根目录 Readme.md 或其他 Markdown 文档，把它作为批准后的最终交付物写入 runtime 任务清单；只有持久化审计文件时才同步写进 tasks.md，规划阶段只记录这个验收要求。");
-      tfl.push("9. 计划 Markdown 必须精简并对齐 Codex App：默认包含标题、摘要、关键实现改动、公共 API/接口/类型、测试方案、假设与默认值；可选 requirements.md 40-80 行；如果确需持久化 tasks.md，保持 8-20 个 checkbox。不要写教程式长文、完整代码清单或重复背景。");
+      tfl.push("9. 计划 Markdown 必须精简并对齐 Codex App：默认包含标题、摘要、关键实现改动、公共 API/接口/类型、测试方案、假设与默认值；如果确需持久化 tasks.md，保持 8-20 个 checkbox。不要写教程式长文、完整代码清单或重复背景。");
     } else {
       tfl.push("当前回合是直接实现回合：");
       tfl.push("1. Atomic 任务直接实现，不要为了完成小改动而强行转去计划流。");

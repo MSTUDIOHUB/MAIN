@@ -341,12 +341,12 @@ test("data analyst plan prompt uses interactive planning and analysis semantics"
   assert.match(prompt, /先生成可审阅的计划文件/);
   assert.match(prompt, /阶段 0：Explore project structure/);
   assert.match(prompt, /只开放一次浅层 `get_project_skeleton\(depth: 2\)`/);
-  assert.match(prompt, /requirements\.md` 仅记录用户目标\/验收，`design\.md` 仅记录证据归因\/取舍/);
+  assert.match(prompt, /`design\.md` 仅记录证据归因\/取舍/);
   assert.match(prompt, /`plan_file_change` 路由到 PLAN 后，必须写入可审批的 `\.MAIN\/plans\/plan\.md`/);
-  assert.match(prompt, /阶段 1 只读 grounding/);
-  assert.match(prompt, /阶段 2 收敛关键事实\/取舍\/默认值/);
+  assert.match(prompt, /阶段 1[：:]只读 grounding/);
+  assert.match(prompt, /阶段 2[：:]事实收束/);
   assert.match(prompt, /最后写入正式计划/);
-  assert.match(prompt, /requirements\.md.*审批的前置条件/);
+  assert.match(prompt, /design\.md.*审批的前置条件/);
   assert.match(prompt, /必须包含标题、摘要、关键实现改动、公共 API\/接口\/类型变化、测试方案、假设与默认值/);
   assert.match(prompt, /每个关键实现改动必须能落到具体文件、接口、数据流、命令、验证方式或明确默认假设/);
   assert.match(prompt, /简单结构不需要，除非用户明确要求生成图/);
@@ -380,7 +380,7 @@ test("plan prompt prefers pre-approval plan.md writes for complex planning", () 
 
   assert.match(prompt, /正式审批首选写入 `\.MAIN\/plans\/plan\.md`/);
   assert.match(prompt, /证据足够后用 `write_file` 或 `replace_in_file` 创建\/更新 `\.MAIN\/plans\/plan\.md`/);
-  assert.match(prompt, /批准前唯一允许的写入是 `\.MAIN\/plans\/` 下的计划产物/);
+  assert.match(prompt, /批准前唯一允许的写入是 `\.MAIN\/plans\/plan\.md`/);
   assert.doesNotMatch(prompt, /MAIN runtime 会物化为 `\.MAIN\/plans\/plan\.md`/);
 });
 
@@ -578,4 +578,3 @@ test("execute prompt enforces strict immediate tool execution constraints", () =
   assert.match(prompt, /必须立刻发起真实工具调用/);
   assert.match(prompt, /【绝对禁止只说不做】/);
 });
-

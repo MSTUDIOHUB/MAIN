@@ -139,7 +139,7 @@ test("needs_evidence reopens read-only tools after convergence", () => {
   }), false);
 });
 
-test("ready evidence closes reasoning-only and suppressed tools through deterministic materialization", () => {
+test("ready evidence gets one model-authored plan recovery pass instead of fallback materialization", () => {
   assert.deepEqual(resolvePlanNoActionRecovery({
     workflowMode: "plan",
     isPlanApproved: false,
@@ -147,8 +147,8 @@ test("ready evidence closes reasoning-only and suppressed tools through determin
     evidenceReadiness: "ready_for_plan",
     targetedRecoveryPasses: 0,
   }), {
-    action: "deterministic_materialization",
-    reason: "evidence_ready_for_plan",
+    action: "targeted_evidence",
+    reason: "ready_evidence_missing_visible_plan",
   });
 
   assert.deepEqual(resolvePlanSuppressedToolRecovery({
@@ -157,8 +157,19 @@ test("ready evidence closes reasoning-only and suppressed tools through determin
     evidenceReadiness: "ready_for_plan",
     targetedRecoveryPasses: 0,
   }), {
-    action: "deterministic_materialization",
-    reason: "suppressed_tool_after_ready_evidence",
+    action: "targeted_evidence",
+    reason: "suppressed_tool_ready_evidence_missing_visible_plan",
+  });
+
+  assert.deepEqual(resolvePlanNoActionRecovery({
+    workflowMode: "plan",
+    isPlanApproved: false,
+    reasoningOnly: true,
+    evidenceReadiness: "ready_for_plan",
+    targetedRecoveryPasses: 1,
+  }), {
+    action: "pause_blocked",
+    reason: "ready_evidence_missing_visible_plan_after_recovery",
   });
 });
 

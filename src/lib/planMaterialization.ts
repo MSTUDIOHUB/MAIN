@@ -1519,7 +1519,7 @@ export function materializePlanArtifactFromVisibleText(input: {
   }
   if (
     !validation.ok &&
-    !/generic_fallback_plan|unsupported_debug_log_advice/i.test(validation.reason || "")
+    !/generic_fallback_plan|unsupported_debug_log_advice|weak_path_echo_evidence|import_only_evidence|generic_theme_token_plan|placeholder_validation_plan/i.test(validation.reason || "")
   ) {
     const canonical = canonicalizePlanArtifactContent({
       content,
