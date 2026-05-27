@@ -823,6 +823,7 @@ export interface CloudResponsesMessageCompactionOptions {
   contextMemoryState?: ContextMemoryState | null;
   maxInputMessages?: number;
   targetInputTokens?: number;
+  aggressive?: boolean;
 }
 
 function truncateTextForCloud(value: string, maxChars: number): string {
@@ -830,13 +831,22 @@ function truncateTextForCloud(value: string, maxChars: number): string {
   return `${value.slice(0, maxChars)}\n...[truncated ${value.length - maxChars} chars for faster cloud response]`;
 }
 
-function compactProtocolMessageForCloud(message: ProtocolChatMessage): ProtocolChatMessage {
+function compactProtocolMessageForCloud(
+  message: ProtocolChatMessage,
+  options: Pick<CloudResponsesMessageCompactionOptions, "aggressive"> = {},
+): ProtocolChatMessage {
   const text = extractTextContent(message.content);
-  const maxChars = message.role === "tool"
-    ? 2200
-    : message.role === "assistant"
-      ? 1200
-      : 2200;
+  const maxChars = options.aggressive
+    ? message.role === "tool"
+      ? 900
+      : message.role === "assistant"
+        ? 700
+        : 1000
+    : message.role === "tool"
+      ? 2200
+      : message.role === "assistant"
+        ? 1200
+        : 2200;
 
   return {
     ...message,
@@ -849,15 +859,16 @@ function buildCloudMemoryMessage(
   messages: ProtocolChatMessage[],
   options: CloudResponsesMessageCompactionOptions = {},
 ): ProtocolChatMessage | null {
+  const maxPacketChars = options.aggressive ? 1800 : 3200;
   const explicitPacket = options.contextMemoryState
-    ? formatContextMemoryPacket(options.contextMemoryState, 3200)
+    ? formatContextMemoryPacket(options.contextMemoryState, maxPacketChars)
     : "";
   const existingMemoryMessage = [...messages].reverse().find((message) => isContextMemoryMessage(message));
   const existingPacket = existingMemoryMessage
     ? contextMemoryContentToText(existingMemoryMessage.content)
     : "";
-  const packet = existingPacket || formatContextMemoryPacket(buildContextMemoryState(messages), 3200);
-  const effectivePacket = explicitPacket || packet;
+  const packet = existingPacket || formatContextMemoryPacket(buildContextMemoryState(messages), maxPacketChars);
+  const effectivePacket = truncateTextForCloud(explicitPacket || packet, maxPacketChars);
   return effectivePacket ? { role: "user", content: effectivePacket } : null;
 }
 
@@ -865,22 +876,28 @@ export function compactCloudResponsesMessages(
   messages: ProtocolChatMessage[],
   options: CloudResponsesMessageCompactionOptions = {},
 ): ProtocolChatMessage[] {
+  const aggressive = options.aggressive === true;
   const systemMessages = messages.filter((message) => message.role === "system");
   const memoryMessage = buildCloudMemoryMessage(messages, options);
   const conversationMessages = messages.filter((message) => message.role !== "system" && !isContextMemoryMessage(message));
   const maxInputMessages = Math.max(
-    6,
+    aggressive ? 4 : 6,
     options.maxInputMessages ||
-      Math.min(18, Math.max(10, Math.floor((options.targetInputTokens || 9000) / 700))),
+      (aggressive
+        ? Math.min(8, Math.max(5, Math.floor((options.targetInputTokens || 6000) / 900)))
+        : Math.min(18, Math.max(10, Math.floor((options.targetInputTokens || 9000) / 700)))),
   );
   const reservedForMemoryAndSummary = (memoryMessage ? 1 : 0) + 1;
-  const keepTail = Math.max(4, Math.min(CLOUD_RESPONSES_MESSAGE_KEEP_TAIL, maxInputMessages - reservedForMemoryAndSummary));
+  const keepTail = Math.max(
+    aggressive ? 3 : 4,
+    Math.min(aggressive ? 4 : CLOUD_RESPONSES_MESSAGE_KEEP_TAIL, maxInputMessages - reservedForMemoryAndSummary),
+  );
 
   if (conversationMessages.length <= keepTail + 2) {
     return [
       ...systemMessages,
       ...(memoryMessage ? [memoryMessage] : []),
-      ...conversationMessages.map(compactProtocolMessageForCloud),
+      ...conversationMessages.map((message) => compactProtocolMessageForCloud(message, { aggressive })),
     ];
   }
 
@@ -895,9 +912,9 @@ export function compactCloudResponsesMessages(
         /目标|必须|不要|错误|失败|next|todo|must|error|failed|path|file/i.test(text)
       );
     })
-    .slice(-10)
+    .slice(aggressive ? -6 : -10)
     .map((message, index) => {
-      const text = truncateTextForCloud(extractTextContent(message.content).replace(/\s+/g, " ").trim(), 260);
+      const text = truncateTextForCloud(extractTextContent(message.content).replace(/\s+/g, " ").trim(), aggressive ? 180 : 260);
       return `${index + 1}. ${labelForResponsesTranscript(message.role)}: ${text}`;
     })
     .join("\n");
@@ -912,13 +929,17 @@ export function compactCloudResponsesMessages(
         summary,
       ].filter(Boolean).join("\n"),
     },
-    ...recent.map(compactProtocolMessageForCloud),
+    ...recent.map((message) => compactProtocolMessageForCloud(message, { aggressive })),
   ];
 }
 
-export function compactCloudResponsesInstructions(instructions: string | undefined): string | undefined {
+export function compactCloudResponsesInstructions(
+  instructions: string | undefined,
+  options: Pick<CloudResponsesMessageCompactionOptions, "aggressive"> = {},
+): string | undefined {
   if (!instructions) return undefined;
-  if (instructions.length <= CLOUD_RESPONSES_INSTRUCTION_MAX_CHARS) return instructions;
+  const maxChars = options.aggressive ? 3000 : CLOUD_RESPONSES_INSTRUCTION_MAX_CHARS;
+  if (!options.aggressive && instructions.length <= maxChars) return instructions;
 
   const lines = instructions.split(/\r?\n/);
   const keepPatterns = [
@@ -930,13 +951,20 @@ export function compactCloudResponsesInstructions(instructions: string | undefin
     /TURN INTENT|USER INTENT|执行|修复|实现|计划|报告/i,
     /AGENTS|WORKSPACE INSTRUCTIONS|rules|instructions/i,
   ];
-  const requiredToolReminder = [
-    "[Cloud Compact Instructions]",
-    "Use concise responses and prefer small tool-driven steps to avoid cloud gateway timeouts.",
-    "Tool access is available through XML <tool_use> calls. Workspace read/write tools are available when the user asks for implementation.",
-    "Available key tools: repo_map_search, repo_map_context, get_project_skeleton, list_directory, read_file, glob_search, grep_search, apply_patch, write_file, replace_in_file, run_command, browser_evaluate.",
-    "Never claim write tools or folder access are unavailable; emit XML tool calls instead.",
-  ];
+  const requiredToolReminder = options.aggressive
+    ? [
+        "[Cloud Gateway Compact Instructions]",
+        "Answer using the compact transcript and ContextState only; keep output short to avoid gateway timeouts.",
+        "Tool access is available through XML <tool_use> calls. Use XML tools instead of saying files or write access are unavailable.",
+        "Key XML tools: read_file, grep_search, glob_search, write_file, replace_in_file, run_command.",
+      ]
+    : [
+        "[Cloud Compact Instructions]",
+        "Use concise responses and prefer small tool-driven steps to avoid cloud gateway timeouts.",
+        "Tool access is available through XML <tool_use> calls. Workspace read/write tools are available when the user asks for implementation.",
+        "Available key tools: repo_map_search, repo_map_context, get_project_skeleton, list_directory, read_file, glob_search, grep_search, apply_patch, write_file, replace_in_file, run_command, browser_evaluate.",
+        "Never claim write tools or folder access are unavailable; emit XML tool calls instead.",
+      ];
 
   const keptLines: string[] = [];
   const seen = new Set<string>();
@@ -958,7 +986,7 @@ export function compactCloudResponsesInstructions(instructions: string | undefin
     `[Cloud compacted ${instructions.length} chars of system instructions to reduce 524 timeout risk.]`,
   ].join("\n");
 
-  return truncateTextForCloud(compact, CLOUD_RESPONSES_INSTRUCTION_MAX_CHARS);
+  return truncateTextForCloud(compact, maxChars);
 }
 
 export function buildOpenAiResponsesInputCandidates(
@@ -1002,9 +1030,10 @@ export function extractOpenAiResponsesInstructions(
 export function buildOpenAiResponsesRequestExtras(options?: {
   disableResponseStorage?: boolean;
   reasoningEffort?: unknown;
+  stream?: boolean;
 }): Record<string, unknown> {
   const extras: Record<string, unknown> = {
-    stream: false,
+    stream: options?.stream === true,
   };
 
   if (options?.disableResponseStorage) {
@@ -1026,19 +1055,22 @@ export function buildOpenAiResponsesRequestCandidates(options: {
   disableResponseStorage?: boolean;
   reasoningEffort?: unknown;
   compact?: boolean;
+  compactionMode?: "standard" | "aggressive";
   includeTools?: boolean;
   contextMemoryState?: ContextMemoryState | null;
   targetInputTokens?: number;
 }): OpenAiResponsesProbeRequestCandidate[] {
+  const aggressive = options.compactionMode === "aggressive";
   const protocolMessages = options.compact
     ? compactCloudResponsesMessages(options.messages, {
         contextMemoryState: options.contextMemoryState,
         targetInputTokens: options.targetInputTokens,
+        aggressive,
       })
     : options.messages;
   const rawInstructions = extractOpenAiResponsesInstructions(protocolMessages);
   const instructions = options.compact
-    ? compactCloudResponsesInstructions(rawInstructions)
+    ? compactCloudResponsesInstructions(rawInstructions, { aggressive })
     : rawInstructions;
   const tools = options.includeTools === false ? [] : convertOpenAiToolsToResponses(options.tools);
 
@@ -1102,6 +1134,7 @@ export function ensureOpenAiChatGptCodexRequestBody(
   options: {
     userPromptId?: string;
     instructions?: string;
+    includeUserPromptId?: boolean;
   } = {},
 ): Record<string, unknown> {
   const rawInstructions = typeof options.instructions === "string" && options.instructions.trim()
@@ -1115,9 +1148,11 @@ export function ensureOpenAiChatGptCodexRequestBody(
     instructions,
     stream: true,
     store: false,
-    ...(typeof body.user_prompt_id === "string" && body.user_prompt_id.trim()
+    ...(options.includeUserPromptId === false
       ? {}
-      : { user_prompt_id: options.userPromptId || OPENAI_CHATGPT_PROBE_USER_PROMPT_ID }),
+      : typeof body.user_prompt_id === "string" && body.user_prompt_id.trim()
+        ? {}
+        : { user_prompt_id: options.userPromptId || OPENAI_CHATGPT_PROBE_USER_PROMPT_ID }),
   };
 }
 

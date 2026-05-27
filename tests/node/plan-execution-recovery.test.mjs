@@ -80,6 +80,10 @@ const {
   shouldBypassApprovedPlanReadCacheForPatchRecovery,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/approvedPlanRecoveryTools.ts"));
 
+const {
+  buildFileUnchangedReplayContent,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/fileReadCache.ts"));
+
 const tasks = [
   {
     id: "1",
@@ -324,6 +328,31 @@ test("approved plan strategy switch continues the agent loop after recovery prom
   );
 });
 
+test("approved execution repeated cached reads replay prior content after the first stub", () => {
+  const replay = buildFileUnchangedReplayContent({
+    signature: "read_file::src/App.tsx::[]",
+    path: "src/App.tsx",
+    argsKey: "[]",
+    contentHash: "abc123",
+    contentLength: 42,
+    sizeBytes: 42,
+    modifiedMs: 123,
+    modelContent: "L1: import React from 'react';",
+    updatedAt: 1,
+  }, 2);
+  const orchestratorSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator.ts"),
+    "utf8",
+  );
+
+  assert.match(replay, /CACHED_FILE_REPLAY/);
+  assert.match(replay, /L1: import React/);
+  assert.match(
+    orchestratorSource,
+    /replayApprovedExecutionRead[\s\S]*duplicateCount\s*>=\s*2[\s\S]*buildFileUnchangedReplayContent/,
+  );
+});
+
 test("approved plan execution starts with the normal execute tool surface", () => {
   const orchestratorSource = fsSync.readFileSync(
     path.join(workspaceRoot, "src/lib/orchestrator.ts"),
@@ -372,6 +401,8 @@ test("approved plan no-progress recovery keeps targeted reads without broad disc
     "replace_in_file",
     "write_file",
     "run_command",
+    "execute_command",
+    "send_pty_input",
     "browser_evaluate",
     "get_file_outline",
     "get_pty_status",
@@ -389,8 +420,10 @@ test("approved plan no-progress recovery keeps targeted reads without broad disc
     "replace_in_file",
     "write_file",
     "run_command",
+    "execute_command",
     "browser_evaluate",
   ]);
+  assert.equal(cachedReadRecoveryTools.includes("send_pty_input"), false);
   assert.equal(patchRecoveryTools.includes("read_file"), true);
   assert.equal(patchRecoveryTools.includes("list_directory"), false);
   assert.equal(
@@ -456,6 +489,8 @@ test("approved plan no-progress recovery keeps targeted reads without broad disc
     orchestratorSource,
     /recoveryIterationAllTools\.filter\(\(tool\)\s*=>\s*isApprovedPlanRecoveryTool\(tool,[\s\S]*allowFileRead: allowApprovedPlanRecoveryFileRead/,
   );
+  assert.match(orchestratorSource, /approvedPlanNoToolRecoveryFileReadActive/);
+  assert.match(orchestratorSource, /approved_plan_no_tool_recovery_tool_surface/);
   assert.doesNotMatch(
     orchestratorSource,
     /rawIterationAllTools\.filter\(isApprovedPlanActionTool\)/,
@@ -513,6 +548,20 @@ test("approved plan no-tool prose is preserved unless it is a rejected completio
     orchestratorSource,
     /if\s*\(\s*!shouldHideApprovedPlanNoToolText && \(visibleAssistantText \|\| finalReplyOptions\.length > 0\)\)\s*{/,
   );
+});
+
+test("approved plan no-tool checkpoint reports protocol failure and available tools", () => {
+  const orchestratorSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator.ts"),
+    "utf8",
+  );
+
+  assert.match(orchestratorSource, /formatApprovedPlanNoToolAvailableTools/);
+  assert.match(orchestratorSource, /暂停原因不是工具缺失/);
+  assert.match(orchestratorSource, /模型没有按执行协议调用工具/);
+  assert.match(orchestratorSource, /Array\.from\(availableToolNames\)/);
+  assert.match(orchestratorSource, /validationBoundary === "browser_prompt"[\s\S]*buildBrowserValidationContinuationPrompt/);
+  assert.match(orchestratorSource, /validationBoundary === "pause_external_validation"[\s\S]*buildApprovedPlanValidationPendingMessage/);
 });
 
 test("plan progress snapshot carries no-progress recovery metadata", () => {

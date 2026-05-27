@@ -848,15 +848,21 @@ function commandEvidenceMatches(expectedRaw: string, actualRaw: string): boolean
 }
 
 const VALIDATION_ACTION_RE =
-  /(?:验证|测试|检查|验收|确认|打开|预览|渲染|显示|截图|verify|test|check|validate|render|preview|open|screenshot)/i;
+  /(?:验证|测试|检查|验收|确认|打开|预览|渲染|显示|截图|启动|verify|test|check|validate|render|preview|open|screenshot|start|serve)/i;
 const BROWSER_VALIDATION_RE =
-  /(?:浏览器|页面|前端|UI|DOM|截图|可视|视觉|渲染|预览|localhost|127\.0\.0\.1|Playwright|Cypress|Puppeteer|browser|page|frontend|screenshot|render|preview|DOM)/i;
+  /(?:浏览器|页面|前端|UI|DOM|截图|可视|可见|视觉|渲染|预览|图表|显示|颜色|深色|浅色|主题切换|localhost|127\.0\.0\.1|Playwright|Cypress|Puppeteer|browser|page|frontend|screenshot|render|preview|DOM)/i;
 const MARKDOWN_VIEWER_VALIDATION_RE =
   /(?:Markdown|md|test-sample\.md|mermaid|代码块|表格|脚注|标题|preview|预览|渲染)/i;
 const TAURI_VALIDATION_RE =
   /(?:Tauri|invoke\(['"`](?:open_file|save_file|save_file_as)|open_file|save_file|文件选择|文件对话框|系统浏览器|桌面|窗口|原生|desktop|file\s+dialog|native|system integration)/i;
 const MANUAL_VALIDATION_RE =
   /(?:手动|人工|用户(?:自己)?|你自己|自行|肉眼|确认|manual|human|user confirmation|user validation|visually inspect)/i;
+const SOURCE_MUTATION_TASK_RE =
+  /(?:实现|修改|更新|新增|添加|修复|补齐|调整|接入|集成|生成|输出|落地|创建|删除|替换|重构|保存|导出|防御性编程|implement|update|modify|fix|add|wire|integrate|generate|write|create|delete|replace|refactor|save|export)/i;
+const PRIMARY_VALIDATION_TASK_RE =
+  /(?:^\s*(?:手动测试|自动测试|视觉回归|回归测试|测试|验证|验收|检查|打开|预览|截图)(?:\s|[:：]|$)|^\s*(?:run|verify|test|validate|check|visual regression|screenshot)\b|[:：]\s*(?:验证|测试|检查|验收|确认)|[:：]\s*(?:verify|test|validate|check)\b)/i;
+const CODE_IDENTIFIER_REF_RE =
+  /`([A-Za-z_$][\w$]*)`|(?:^|[\s（(【\[{:：，,])((?:use[A-Z][A-Za-z0-9_]*|[a-z][A-Za-z0-9_]*Store))(?=$|[\s）)】\]}，,。.;；:：])/g;
 
 function inferValidationTaskEvidence(text: string, commands: string[] = []): PlanTaskEvidence[] {
   const normalized = String(text || "");
@@ -880,7 +886,7 @@ function inferValidationTaskEvidence(text: string, commands: string[] = []): Pla
     return parsed ? [parsed] : [];
   }
 
-  if (/\b(?:localhost|127\.0\.0\.1|dev server|服务|端口|port)\b/i.test(normalized)) {
+  if (/(?:localhost|127\.0\.0\.1|\bdev server\b|开发服务器|服务器|服务|端口|\bport\b)/i.test(normalized)) {
     const parsed = makePlanTaskEvidence("dev_server_url", "dev server reachable", true);
     return parsed ? [parsed] : [];
   }
@@ -973,6 +979,32 @@ function makePlanTaskEvidence(
   return { kind, value: clean, ...(inferred ? { inferred: true } : {}) };
 }
 
+function inferSourcePathFromCodeIdentifier(identifier: string): string | null {
+  const clean = String(identifier || "").trim();
+  if (!/^[A-Za-z_$][\w$]*$/.test(clean)) return null;
+  if (/^[a-z][A-Za-z0-9_]*Store$/.test(clean)) return `src/store/${clean}.ts`;
+  if (/^use[A-Z][A-Za-z0-9_]*$/.test(clean)) return `src/hooks/${clean}.ts`;
+  return null;
+}
+
+function inferSourceEvidenceFromCodeIdentifiers(text: string): PlanTaskEvidence[] {
+  const evidence: PlanTaskEvidence[] = [];
+  for (const matched of String(text || "").matchAll(CODE_IDENTIFIER_REF_RE)) {
+    const identifier = matched[1] || matched[2] || "";
+    const sourcePath = inferSourcePathFromCodeIdentifier(identifier);
+    if (!sourcePath) continue;
+    const parsed = makePlanTaskEvidence("file", sourcePath, true);
+    if (parsed) evidence.push(parsed);
+  }
+  return dedupePlanTaskEvidence(evidence);
+}
+
+function isLikelySourceMutationTask(text: string): boolean {
+  const normalized = String(text || "");
+  if (!SOURCE_MUTATION_TASK_RE.test(normalized)) return false;
+  return !PRIMARY_VALIDATION_TASK_RE.test(normalized);
+}
+
 function dedupePlanTaskEvidence(evidence: PlanTaskEvidence[]): PlanTaskEvidence[] {
   const seen = new Set<string>();
   const deduped: PlanTaskEvidence[] = [];
@@ -1011,16 +1043,30 @@ export function inferPlanTaskEvidence(text: string, commands: string[] = []): Pl
     if (parsed) evidence.push(parsed);
   }
 
+  const fileEvidence: PlanTaskEvidence[] = [];
+  for (const matched of String(text || "").matchAll(PLAN_TASK_FILE_REF_RE)) {
+    if (!isLikelyWorkspaceFileReference(matched[1] || "")) continue;
+    const parsed = makePlanTaskEvidence("file", matched[1] || "", true);
+    if (parsed) fileEvidence.push(parsed);
+  }
+
+  if (isLikelySourceMutationTask(text)) {
+    const sourceEvidence = dedupePlanTaskEvidence([
+      ...fileEvidence,
+      ...inferSourceEvidenceFromCodeIdentifiers(text),
+    ]);
+    if (sourceEvidence.length > 0) {
+      return dedupePlanTaskEvidence([...evidence, ...sourceEvidence]);
+    }
+    return dedupePlanTaskEvidence(evidence);
+  }
+
   const validationEvidence = inferValidationTaskEvidence(text, commands);
   if (validationEvidence.length > 0) {
     return dedupePlanTaskEvidence(validationEvidence);
   }
 
-  for (const matched of String(text || "").matchAll(PLAN_TASK_FILE_REF_RE)) {
-    if (!isLikelyWorkspaceFileReference(matched[1] || "")) continue;
-    const parsed = makePlanTaskEvidence("file", matched[1] || "", true);
-    if (parsed) evidence.push(parsed);
-  }
+  evidence.push(...fileEvidence);
 
   return dedupePlanTaskEvidence(evidence);
 }
@@ -1316,8 +1362,17 @@ export function extractPlanTasks(markdown: string): PlanTask[] {
 
   const tasks: PlanTask[] = [];
   const lines = markdown.split(/\r?\n/);
+  let currentHeadingEvidence: PlanTaskEvidence[] = [];
 
   for (const line of lines) {
+    const heading = line.match(/^\s*#{1,6}\s+(.+)$/);
+    if (heading) {
+      const headingText = stripMarkdownTaskLine(heading[1] || "");
+      currentHeadingEvidence = inferPlanTaskEvidence(headingText, extractShellCommandsFromText(headingText))
+        .filter((item) => item.kind === "file" || item.kind === "deliverable");
+      continue;
+    }
+
     const matched = line.match(/^\s*[-*]\s+\[([ xX])\]\s+(.+)$/);
     if (!matched) continue;
 
@@ -1330,7 +1385,18 @@ export function extractPlanTasks(markdown: string): PlanTask[] {
     const inferredEvidence = parsedEvidence.evidence.length > 0
       ? []
       : inferPlanTaskEvidence(text, commands);
-    const evidence = dedupePlanTaskEvidence([...parsedEvidence.evidence, ...inferredEvidence]);
+    const inheritedHeadingEvidence =
+      parsedEvidence.evidence.length === 0 &&
+      inferredEvidence.length === 0 &&
+      currentHeadingEvidence.length > 0 &&
+      isLikelySourceMutationTask(text)
+        ? currentHeadingEvidence
+        : [];
+    const evidence = dedupePlanTaskEvidence([
+      ...parsedEvidence.evidence,
+      ...inferredEvidence,
+      ...inheritedHeadingEvidence,
+    ]);
     const claimedStatus: PlanTaskStatus = matched[1].toLowerCase() === "x" ? "completed" : "pending";
 
     tasks.push({
@@ -1353,9 +1419,9 @@ export function extractPlanTasks(markdown: string): PlanTask[] {
 }
 
 const RUNTIME_TASK_ACTION_RE =
-  /(?:实现|修改|更新|新增|修复|补齐|调整|接入|生成|输出|执行|运行|验证|测试|检查|落地|implement|update|modify|fix|add|wire|generate|write|run|verify|test|check|validate)/i;
+  /(?:实现|修改|更新|新增|添加|修复|补齐|调整|接入|集成|生成|输出|执行|运行|验证|测试|检查|落地|implement|update|modify|fix|add|wire|integrate|generate|write|run|verify|test|check|validate)/i;
 const RUNTIME_TASK_MUTATION_RE =
-  /(?:实现|修改|更新|新增|修复|补齐|调整|接入|生成|输出|落地|创建|删除|替换|重构|保存|导出|implement|update|modify|fix|add|wire|generate|write|create|delete|replace|refactor|save|export)/i;
+  /(?:实现|修改|更新|新增|添加|修复|补齐|调整|接入|集成|生成|输出|落地|创建|删除|替换|重构|保存|导出|implement|update|modify|fix|add|wire|integrate|generate|write|create|delete|replace|refactor|save|export)/i;
 const RUNTIME_TASK_VERIFICATION_RE =
   /(?:执行|运行|验证|测试|验收|run|verify|test|validate|acceptance)/i;
 const RUNTIME_TASK_READ_ONLY_RE =
@@ -1523,6 +1589,71 @@ function makeRuntimeTaskFromEvidenceText(
   };
 }
 
+function splitMarkdownTableRow(line: string): string[] | null {
+  const trimmed = String(line || "").trim();
+  if (!trimmed.startsWith("|") || !trimmed.endsWith("|")) return null;
+  const cells = trimmed
+    .slice(1, -1)
+    .split("|")
+    .map((cell) => cell.trim());
+  if (cells.length < 2) return null;
+  if (cells.every((cell) => /^:?-{2,}:?$/.test(cell))) return null;
+  return cells;
+}
+
+function extractWorkspaceFileReferencesFromText(text: string): string[] {
+  const refs: string[] = [];
+  for (const matched of String(text || "").matchAll(PLAN_TASK_FILE_REF_RE)) {
+    const value = matched[1] || "";
+    if (!isLikelyWorkspaceFileReference(value)) continue;
+    if (isInternalPlanEvidenceValue(value)) continue;
+    refs.push(value);
+  }
+  return refs;
+}
+
+function collectRuntimeTaskTableTasks(
+  content: string,
+  language: "zh" | "en",
+): PlanTask[] {
+  const tasks: PlanTask[] = [];
+  const seen = new Set<string>();
+
+  for (const line of String(content || "").split(/\r?\n/)) {
+    const cells = splitMarkdownTableRow(line);
+    if (!cells) continue;
+
+    const filePath = extractWorkspaceFileReferencesFromText(cells[0] || "")[0];
+    if (!filePath) continue;
+
+    const rowText = cells.join(" ");
+    if (/(?:可选|optional|if needed|必要时|如需|若需要)/i.test(rowText)) continue;
+
+    const actionCell = (cells[1] || "").replace(/\*\*/g, "").trim();
+    const detail = cells.slice(2).join(" ").replace(/\*\*/g, "").trim();
+    if (!RUNTIME_TASK_MUTATION_RE.test(`${actionCell} ${detail}`)) continue;
+
+    const evidence = makePlanTaskEvidence("file", filePath, true);
+    if (!evidence) continue;
+
+    const verb = actionCell && !/^(?:改动类型|type|kind)$/i.test(actionCell)
+      ? actionCell
+      : language === "en"
+        ? "Modify"
+        : "修改";
+    const taskText = detail
+      ? `${verb} ${filePath}：${detail}`
+      : `${verb} ${filePath}`;
+    const task = makeRuntimeTaskFromEvidenceText(taskText, evidence, language);
+    const key = getPlanTaskIdentity(task);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    tasks.push(task);
+  }
+
+  return tasks;
+}
+
 export function deriveRuntimePlanTasksFromArtifacts(
   artifacts: PlanArtifact[],
   options: RuntimePlanTaskDerivationOptions = {},
@@ -1545,6 +1676,11 @@ export function deriveRuntimePlanTasksFromArtifacts(
     seen.add(key);
     tasks.push(task);
   };
+
+  for (const task of collectRuntimeTaskTableTasks(runtimeRelevantContent, language)) {
+    pushTask(task);
+    if (tasks.length >= maxTasks) return tasks;
+  }
 
   for (const line of collectRuntimeTaskCandidateLines(combinedContent)) {
     pushTask(makeRuntimeTask(line, language));

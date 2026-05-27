@@ -5,7 +5,6 @@ import {
   buildGeminiRequestForAuthMode,
   buildOpenAiResponsesInputCandidates,
   buildOpenAiResponsesRequestExtras,
-  ensureOpenAiChatGptCodexRequestBody,
   extractAnthropicResponseText,
   extractGeminiResponseText,
   extractOpenAiResponsesInstructions,
@@ -277,7 +276,7 @@ async function requestModelCommitMessage(params: GenerateGitCommitMessageParams)
   } else {
     url = buildCloudMessagesApiUrl(endpoint, "openai", cloudApiFormat);
     body = cloudApiFormat === "responses"
-      ? ensureOpenAiChatGptCodexRequestBody({
+      ? {
           model,
           ...(extractOpenAiResponsesInstructions(messages) ? { instructions: extractOpenAiResponsesInstructions(messages) } : {}),
           input: buildOpenAiResponsesInputCandidates(messages)[0].input,
@@ -285,7 +284,8 @@ async function requestModelCommitMessage(params: GenerateGitCommitMessageParams)
             disableResponseStorage: params.config.cloud?.disableResponseStorage,
             reasoningEffort: "none",
           }),
-        }, { userPromptId: "main-commit-message" })
+          ...(cloudAuthMode === "openai_chatgpt_oauth" ? { user_prompt_id: "main-commit-message" } : {}),
+        }
       : { model, messages, stream: false, max_tokens: 80 };
     headers = buildCloudHeaders("openai", isCloud ? params.config.cloud?.apiKey || "" : params.config.local?.apiKey || "", true, isCloud ? params.config.cloud?.customHeaders : undefined, cloudAuthMode);
   }

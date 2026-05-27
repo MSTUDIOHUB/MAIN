@@ -31,6 +31,13 @@ export const APPROVED_PLAN_SOURCE_EDIT_TOOLS = new Set([
   "write_file",
 ]);
 
+export const APPROVED_PLAN_ACTION_RECOVERY_TOOLS = new Set([
+  ...APPROVED_PLAN_SOURCE_EDIT_TOOLS,
+  "run_command",
+  "execute_command",
+  "browser_evaluate",
+]);
+
 export function isPatchMismatchRecoveryActivity(activity: ApprovedPlanRecoveryActivityLike): boolean {
   if (activity.status !== "failed") return false;
   if (activity.name !== "replace_in_file" && activity.name !== "apply_patch") return false;
@@ -87,7 +94,8 @@ export function isApprovedPlanRecoveryToolName(
   readOnlyTools: Set<string>,
   options: { allowFileRead?: boolean } = {},
 ): boolean {
-  if (!readOnlyTools.has(name)) return true;
+  void readOnlyTools;
+  if (APPROVED_PLAN_ACTION_RECOVERY_TOOLS.has(name)) return true;
   return Boolean(options.allowFileRead && APPROVED_PLAN_PATCH_RECOVERY_READ_TOOLS.has(name));
 }
 

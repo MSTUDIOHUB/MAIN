@@ -107,6 +107,14 @@ export function buildFileUnchangedStub(state: FileReadState): string {
   ].join("\n");
 }
 
+export function buildFileUnchangedReplayContent(state: FileReadState, duplicateCount: number): string {
+  return [
+    `CACHED_FILE_REPLAY: "${state.path}" is unchanged, but MAIN is replaying the previous read because approved execution requested this same file/range again (duplicate ${duplicateCount}).`,
+    "Use the source content below now. Do not call read_file for this same file/range again unless the file changes.",
+    state.modelContent,
+  ].join("\n\n");
+}
+
 export function formatReadFileWindowCoverageStub(
   path: string,
   plan: ReadFileWindowCoveragePlan,

@@ -62,6 +62,7 @@ test("OpenAI Responses cloud requests use the non-streaming Rust proxy path", as
     assert.equal(args.url, "https://www.aiwanwu.cc/v1/responses");
     assert.equal(body.stream, false);
     assert.equal(body.model, "gpt-5.4");
+    assert.equal(body.user_prompt_id, undefined);
     assert.equal(Array.isArray(body.input), true);
     return JSON.stringify({ output_text: "ok" });
   });
@@ -90,6 +91,79 @@ test("OpenAI Responses cloud requests use the non-streaming Rust proxy path", as
   assert.deepEqual(tokens, ["ok"]);
   assert.equal(doneCount, 1);
   assert.equal(requests[0].reasoning.effort, "xhigh");
+});
+
+test("OpenAI Responses gateway timeouts retry with aggressive transcript fallback", async () => {
+  const requests = [];
+  const { streamChatCompletion } = await loadStreamingModule(async (command, args) => {
+    assert.equal(command, "proxy_request");
+    const body = JSON.parse(args.body);
+    requests.push(body);
+    if (requests.length === 1) {
+      throw new Error("HTTP 504: Gateway Time-out");
+    }
+    return JSON.stringify({ output_text: "fallback ok" });
+  });
+
+  const longChunk = "important context ".repeat(420);
+  const result = await streamChatCompletion(
+    [
+      {
+        role: "system",
+        content: [
+          "当前工作区绝对路径为：/tmp/project",
+          "工具调用格式必须使用可用工具。",
+          "write_file replace_in_file read_file grep_search glob_search run_command",
+          "filler ".repeat(1200),
+        ].join("\n"),
+      },
+      ...Array.from({ length: 18 }, (_, index) => ({
+        role: index % 3 === 0 ? "tool" : index % 2 === 0 ? "user" : "assistant",
+        content: `message ${index} ${longChunk}`,
+      })),
+      { role: "user", content: "请继续完成计划文件。" },
+    ],
+    {
+      baseUrl: "https://www.aiwanwu.cc/v1",
+      apiKey: "test-key",
+      model: "gpt-5.5",
+      apiProtocol: "openai",
+      apiFormat: "responses",
+      useRustProxy: true,
+      reasoningEffort: "xhigh",
+      disableResponseStorage: true,
+      contextLimit: 32768,
+    },
+    {
+      onToken: () => {},
+      onDone: () => {},
+      onError: (error) => { throw error; },
+    },
+    undefined,
+    [{
+      type: "function",
+      function: {
+        name: "write_file",
+        description: "Write a file",
+        parameters: { type: "object", properties: { path: { type: "string" }, content: { type: "string" } }, required: ["path", "content"] },
+      },
+    }],
+  );
+
+  assert.equal(result.content, "fallback ok");
+  assert.equal(requests.length, 2);
+  assert.equal(Array.isArray(requests[0].input), true);
+  assert.equal(requests[0].tools[0].name, "write_file");
+  assert.deepEqual(requests[0].reasoning, { effort: "xhigh" });
+
+  assert.equal(typeof requests[1].input, "string");
+  assert.equal(requests[1].tools, undefined);
+  assert.equal(requests[1].reasoning, undefined);
+  assert.equal(requests[1].user_prompt_id, undefined);
+  assert.equal(requests[1].store, false);
+  assert.match(requests[1].instructions, /Cloud Gateway Compact Instructions/);
+  assert.ok(requests[1].instructions.length <= 3100);
+  assert.ok(requests[1].input.length < 12000);
 });
 
 test("OpenAI ChatGPT OAuth cloud requests pass token references to the Rust proxy without sampling params", async () => {
@@ -717,7 +791,7 @@ test("OpenAI-compatible chat does not replay assistant reasoning_content by defa
   assert.equal(requests[0].messages[2].reasoning_content, undefined);
 });
 
-test("OpenAI Responses retries 524 failures with compact input while preserving reasoning effort", async () => {
+test("OpenAI Responses retries 524 failures with aggressive compact input without reasoning", async () => {
   const requests = [];
   const { streamChatCompletion } = await loadStreamingModule(async (_command, args) => {
     const body = JSON.parse(args.body);
@@ -749,7 +823,8 @@ test("OpenAI Responses retries 524 failures with compact input while preserving 
   assert.equal(result.content, "ok after fallback");
   assert.equal(requests.length, 2);
   assert.equal(requests[0].reasoning.effort, "xhigh");
-  assert.equal(requests[1].reasoning.effort, "xhigh");
+  assert.equal(requests[1].reasoning, undefined);
+  assert.equal(requests[1].tools, undefined);
   assert.equal(typeof requests[1].input, "string");
 });
 
@@ -785,7 +860,8 @@ test("OpenAI Responses retries 502 upstream failures with compact input", async 
   assert.equal(result.content, "ok after upstream fallback");
   assert.equal(requests.length, 2);
   assert.equal(requests[0].reasoning.effort, "xhigh");
-  assert.equal(requests[1].reasoning.effort, "xhigh");
+  assert.equal(requests[1].reasoning, undefined);
+  assert.equal(requests[1].tools, undefined);
   assert.equal(typeof requests[1].input, "string");
 });
 
@@ -922,7 +998,8 @@ test("OpenAI Responses stops after one compact retry when 524 persists", async (
 
   assert.equal(requests.length, 2);
   assert.equal(requests[0].reasoning.effort, "xhigh");
-  assert.equal(requests[1].reasoning.effort, "xhigh");
+  assert.equal(requests[1].reasoning, undefined);
+  assert.equal(requests[1].tools, undefined);
   assert.equal(typeof requests[1].input, "string");
 });
 // #endregion

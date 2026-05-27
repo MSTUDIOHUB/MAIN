@@ -720,6 +720,7 @@ async function requestOpenAiNonStreaming(
         signal,
       );
     } else if (apiFormat === "responses") {
+      const shouldIncludeTools = !minimalCompatibilityMode && shouldSendNativeTools(settings);
       const requestCandidates = buildOpenAiResponsesRequestCandidates({
         messages: messages as ProtocolChatMessage[],
         model: settings.model,
@@ -727,21 +728,23 @@ async function requestOpenAiNonStreaming(
         disableResponseStorage: settings.disableResponseStorage,
         reasoningEffort: settings.reasoningEffort,
         compact: true,
-        includeTools: !minimalCompatibilityMode && shouldSendNativeTools(settings),
+        includeTools: shouldIncludeTools,
         targetInputTokens: settings.contextLimit
           ? computeContextBudgets(settings.contextLimit, maxTokens).inputBudget
           : undefined,
       });
-      const responseTools = !minimalCompatibilityMode && shouldSendNativeTools(settings) && tools && tools.length > 0
+      const responseTools = shouldIncludeTools && tools && tools.length > 0
         ? tools
         : [];
       let lastCompatibilityError: Error | null = null;
       let sawRetryableGatewayError = false;
-      let gatewayRetryUsed = false;
+      let gatewayCompactCandidates: ReturnType<typeof buildOpenAiResponsesRequestCandidates> | null = null;
+      let gatewayCompactTranscriptCandidate: (typeof requestCandidates)[number] | null = null;
       let sawEmptyResponseCandidate = false;
       let lastEmptyResponseMode: string | null = null;
 
-      for (const candidate of requestCandidates) {
+      for (let candidateIndex = 0; candidateIndex < requestCandidates.length; candidateIndex += 1) {
+        const candidate = requestCandidates[candidateIndex];
         if (signal?.aborted) throw createAbortError();
         if (sawRetryableGatewayError && candidate.mode === "input_text_array") {
           continue;
@@ -791,18 +794,36 @@ async function requestOpenAiNonStreaming(
           }
           const isRetryableGatewayError = isRetryableCloudErrorMessage(errMsg);
           if (isRetryableGatewayError) {
+            if (gatewayCompactTranscriptCandidate && candidate === gatewayCompactTranscriptCandidate) {
+              throw lastCompatibilityError;
+            }
             sawRetryableGatewayError = true;
-            if (candidate.mode !== "transcript_text" && !gatewayRetryUsed) {
-              if (signal?.aborted) throw createAbortError();
-              gatewayRetryUsed = true;
+            if (!gatewayCompactCandidates) {
+              gatewayCompactCandidates = buildOpenAiResponsesRequestCandidates({
+                messages: messages as ProtocolChatMessage[],
+                model: settings.model,
+                disableResponseStorage: settings.disableResponseStorage,
+                reasoningEffort: "none",
+                compact: true,
+                compactionMode: "aggressive",
+                includeTools: false,
+                targetInputTokens: settings.contextLimit
+                  ? Math.min(6000, computeContextBudgets(settings.contextLimit, maxTokens).inputBudget)
+                  : 6000,
+              });
+              const compactTranscriptCandidate = gatewayCompactCandidates.find((item) => item.mode === "transcript_text");
+              if (compactTranscriptCandidate) {
+                gatewayCompactTranscriptCandidate = compactTranscriptCandidate;
+                requestCandidates.splice(candidateIndex + 1, 0, compactTranscriptCandidate);
+              }
               emitStreamingConsole(
                 "streaming",
                 "warn",
-                `OpenAI responses retryable gateway failure with ${candidate.mode}; retrying same reasoning effort with compact transcript input`,
+                `OpenAI responses retryable gateway failure with ${candidate.mode}; retrying with aggressive compact transcript input`,
                 errMsg,
               );
-              continue;
             }
+            continue;
           }
           if (!isProviderCompatibilityErrorMessage(errMsg)) {
             throw lastCompatibilityError;

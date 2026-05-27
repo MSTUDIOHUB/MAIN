@@ -816,6 +816,130 @@ test("runtime plan task derivation skips approved-plan diagnostic read loops", (
   assert.equal(tasks.some((task) => task.evidence?.some((item) => item.value === "src/store/dashboardStore.ts")), false);
 });
 
+test("runtime task inference treats source mutations with render wording as file evidence", () => {
+  const parsed = extractPlanTasks(
+    "- [ ] Store 安全更新：在 `dashboardStore` 中增加数据写入前的校验逻辑，防止非法数据进入状态池导致后续渲染崩溃。",
+  );
+
+  assert.equal(parsed.length, 1);
+  assert.equal(parsed[0].evidence?.[0]?.kind, "file");
+  assert.equal(parsed[0].evidence?.[0]?.value, "src/store/dashboardStore.ts");
+  assert.notEqual(parsed[0].evidenceStatus, "requires_browser_validation");
+
+  const reconciled = reconcilePlanTaskCompletion([], parsed, []);
+  assert.equal(reconciled[0].evidenceStatus, "missing");
+  assert.equal(isPlanTaskAwaitingBrowserValidation(reconciled[0]), false);
+});
+
+test("runtime task derivation keeps browser evidence for real UI validation tasks", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([
+    {
+      kind: "plan",
+      path: ".MAIN/plans/plan.md",
+      title: "Plan",
+      updatedAt: 1,
+      content: [
+        "# Proposed Plan",
+        "",
+        "## 关键实现改动",
+        "- **Store 安全更新**：在 `dashboardStore` 中增加数据写入前的校验逻辑，防止非法数据进入状态池导致后续渲染崩溃。",
+        "",
+        "## 测试方案",
+        "- **数据同步闭环验证**：验证导入 → Store 更新 → 面板 UI 刷新 → 数据内容正确性的全链路。",
+        "- **视觉回归测试**：在深色/浅色模式下分别对比所有面板组件的背景色、文字颜色是否符合预期。",
+      ].join("\n"),
+    },
+  ], { language: "zh" });
+  const storeTask = tasks.find((task) => /Store 安全更新/.test(task.text));
+  const syncTask = tasks.find((task) => /数据同步闭环验证/.test(task.text));
+  const visualTask = tasks.find((task) => /视觉回归测试/.test(task.text));
+
+  assert.equal(storeTask?.evidence?.[0]?.kind, "file");
+  assert.equal(storeTask?.evidence?.[0]?.value, "src/store/dashboardStore.ts");
+  assert.equal(syncTask?.evidence?.[0]?.kind, "browser_dom");
+  assert.equal(visualTask?.evidence?.[0]?.kind, "browser_dom");
+});
+
+test("runtime plan task derivation accepts Qwen-style file change tables", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([
+    {
+      kind: "plan",
+      path: ".MAIN/plans/plan.md",
+      title: "Plan",
+      updatedAt: 1,
+      content: [
+        "# 修复计划：CSV 导入数据不显示、深色模式、导入界面消失",
+        "",
+        "## 关键实现改动",
+        "### 改动 1：修复所有 ECharts 图表组件的 CSS 变量解析",
+        "**涉及文件（5 个）：**",
+        "- `src/components/Dashboard/TrendLineChart.tsx`",
+        "- `src/components/Dashboard/CourseBarChart.tsx`",
+        "- `src/components/Dashboard/MonthlyCompareChart.tsx`",
+        "- `src/components/Dashboard/StatusPieChart.tsx`",
+        "- `src/components/Dashboard/TimeHeatmap.tsx`",
+        "",
+        "**改动内容：**",
+        "1. 在每个图表组件的 `useEffect` 中调用 `resolveEChartsTheme(option)`。",
+        "2. 在主题切换时重新解析并更新图表。",
+        "",
+        "## 测试方案",
+        "- 浏览器验证 CSV 导入后数据正常显示。",
+        "- 浏览器验证主题切换正常。",
+        "",
+        "## 文件变更清单",
+        "| 文件 | 改动类型 | 说明 |",
+        "|------|----------|------|",
+        "| `src/components/Dashboard/TrendLineChart.tsx` | 修改 | 集成 `resolveEChartsTheme`，添加主题监听 |",
+        "| `src/components/Dashboard/CourseBarChart.tsx` | 修改 | 集成 `resolveEChartsTheme`，添加主题监听 |",
+        "| `src/components/Dashboard/MonthlyCompareChart.tsx` | 修改 | 集成 `resolveEChartsTheme`，添加主题监听 |",
+        "| `src/components/Dashboard/StatusPieChart.tsx` | 修改 | 集成 `resolveEChartsTheme`，修复饼图边框深色适配，添加主题监听 |",
+        "| `src/components/Dashboard/TimeHeatmap.tsx` | 修改 | 集成 `resolveEChartsTheme`，修复热力图颜色深色适配，添加主题监听 |",
+        "| `src/utils/colorUtils.ts` | 可选增强 | 如果现有 `resolveEChartsTheme()` 覆盖不足，补充更多属性匹配规则 |",
+      ].join("\n"),
+    },
+  ], { language: "zh", maxTasks: 10 });
+
+  for (const expectedPath of [
+    "src/components/Dashboard/TrendLineChart.tsx",
+    "src/components/Dashboard/CourseBarChart.tsx",
+    "src/components/Dashboard/MonthlyCompareChart.tsx",
+    "src/components/Dashboard/StatusPieChart.tsx",
+    "src/components/Dashboard/TimeHeatmap.tsx",
+  ]) {
+    assert.equal(
+      tasks.some((task) => task.evidence?.some((item) => item.kind === "file" && item.value === expectedPath)),
+      true,
+      expectedPath,
+    );
+  }
+  assert.equal(tasks.some((task) => task.evidence?.some((item) => item.value === "src/utils/colorUtils.ts")), false);
+  assert.equal(tasks.some((task) => task.evidence?.some((item) => item.kind === "browser_dom")), true);
+});
+
+test("tasks artifact parsing inherits file evidence from file section headings", () => {
+  const markdown = [
+    "# 任务清单",
+    "",
+    "## 1. 修改 TrendLineChart.tsx",
+    "- [ ] 集成 `resolveEChartsTheme` 解析 CSS 变量",
+    "- [ ] 添加主题切换监听",
+    "",
+    "## 2. 启动开发服务器并浏览器验证",
+    "- [ ] 启动开发服务器",
+    "- [ ] 浏览器验证 CSV 导入后数据正常显示",
+  ].join("\n");
+  const parsed = extractPlanTasks(markdown);
+
+  assert.equal(validatePlanArtifactContent(markdown, "tasks").ok, true);
+  assert.equal(parsed.length, 4);
+  assert.equal(parsed[0].evidence?.[0]?.kind, "file");
+  assert.equal(parsed[0].evidence?.[0]?.value, "TrendLineChart.tsx");
+  assert.equal(parsed[1].evidence?.[0]?.kind, "file");
+  assert.equal(parsed[2].evidence?.[0]?.kind, "dev_server_url");
+  assert.equal(parsed[3].evidence?.[0]?.kind, "browser_dom");
+});
+
 test("runtime plan task derivation accepts Codex-style key changes", () => {
   const tasks = deriveRuntimePlanTasksFromArtifacts([
     {
@@ -1426,11 +1550,13 @@ test("approved plan execution no-tool recovery bypasses generic missing-tool sto
     remainingText: audit.blockedReasons.join("\n"),
     commandHint: "命令提示",
   });
+  assert.match(prompt, /TOOL_ONLY_RECOVERY/);
   assert.match(prompt, /已批准计划正在执行/);
-  assert.match(prompt, /真实工具调用/);
+  assert.match(prompt, /真实 `<tool_use>`/);
+  assert.match(prompt, /read_file/);
   assert.match(prompt, /apply_patch/);
-  assert.match(prompt, /Browser\/Playwright/);
-  assert.match(prompt, /不匹配/);
+  assert.match(prompt, /browser_evaluate/);
+  assert.match(prompt, /完成任务前必须先产生真实工具证据/);
   assert.match(prompt, /src\/store\/useAppStore\.ts/);
   assert.doesNotMatch(prompt, /missing_tool_reprompt_limit|聊天失败/);
 });

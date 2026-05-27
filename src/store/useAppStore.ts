@@ -106,7 +106,6 @@ import {
   buildGeminiRequestForAuthMode,
   buildOpenAiResponsesInputCandidates,
   buildOpenAiResponsesRequestExtras,
-  ensureOpenAiChatGptCodexRequestBody,
   extractOpenAiResponsesInstructions,
   extractGeminiResponseText,
   extractOpenAiResponseText,
@@ -12167,7 +12166,7 @@ async function requestSemanticTurnMetadata(params: {
     } else {
       url = buildCloudMessagesApiUrl(endpoint, "openai", cloudApiFormat);
       body = cloudApiFormat === "responses"
-        ? ensureOpenAiChatGptCodexRequestBody({
+        ? {
             model,
             ...(extractOpenAiResponsesInstructions(msgs as Array<{ role: "system" | "user"; content: string }>) ? {
               instructions: extractOpenAiResponsesInstructions(msgs as Array<{ role: "system" | "user"; content: string }>),
@@ -12177,7 +12176,8 @@ async function requestSemanticTurnMetadata(params: {
               disableResponseStorage: params.config.cloud.disableResponseStorage,
               reasoningEffort: "none",
             }),
-          }, { userPromptId: "main-turn-metadata" })
+            ...(cloudAuthMode === "openai_chatgpt_oauth" ? { user_prompt_id: "main-turn-metadata" } : {}),
+          }
         : { model, messages: msgs, stream: false, max_tokens: 120 };
       headers = buildCloudHeaders("openai", ac.apiKey, true, params.config.cloud.customHeaders, cloudAuthMode);
     }

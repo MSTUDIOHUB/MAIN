@@ -62,6 +62,7 @@ import {
 import {
   FILE_UNCHANGED_STUB,
   buildFileReadSignature,
+  buildFileUnchangedReplayContent,
   buildFileUnchangedStub,
   buildOptionalTasksMdMissingResult,
   formatReadFileWindowCoverageStub,
@@ -1748,18 +1749,41 @@ function formatPlanAuditRemainingTasks(
   return lines.length > 0 ? lines.join("\n") : fallback;
 }
 
+function formatApprovedPlanNoToolAvailableTools(
+  language: "zh" | "en",
+  toolNames?: Iterable<string> | null,
+): string {
+  if (!toolNames) return "";
+  const available = new Set(Array.from(toolNames).map((name) => String(name || "")));
+  const preferred = [
+    "read_file",
+    "apply_patch",
+    "replace_in_file",
+    "write_file",
+    "run_command",
+    "execute_command",
+    "browser_evaluate",
+  ].filter((name) => available.has(name));
+  if (preferred.length === 0) return "";
+  return language === "zh"
+    ? `本轮已开放关键工具：${preferred.map((name) => `\`${name}\``).join("、")}。暂停原因不是工具缺失，而是模型没有按执行协议调用工具。`
+    : `Key tools were available this turn: ${preferred.map((name) => `\`${name}\``).join(", ")}. This pause is not caused by missing tools; the model did not follow the execution protocol and call one.`;
+}
+
 function buildApprovedPlanNoToolPauseMessage(
   language: "zh" | "en",
   remainingText: string,
   consecutiveNoToolCount: number,
   audit?: PlanTaskEvidenceAudit,
   completionClaimRejected = false,
+  availableToolNames?: Iterable<string> | null,
 ): string {
   const auditLine = audit && audit.totalCount > 0
     ? language === "zh"
       ? `可信审计进度：${audit.completedCount}/${audit.totalCount}`
       : `Trusted audit progress: ${audit.completedCount}/${audit.totalCount}`
     : "";
+  const availableToolsLine = formatApprovedPlanNoToolAvailableTools(language, availableToolNames);
 
   return language === "zh"
     ? [
@@ -1770,6 +1794,7 @@ function buildApprovedPlanNoToolPauseMessage(
           : `原因：模型连续 ${consecutiveNoToolCount} 次提前停止，返回了正文但没有继续调用工具；当前任务清单仍有证据未满足的任务。`,
         "已保留当前 workspace、工具结果和任务证据，不会把这次正文当作完成证据。",
         ...(auditLine ? [auditLine] : []),
+        ...(availableToolsLine ? [availableToolsLine] : []),
         "",
         "未完成任务：",
         remainingText,
@@ -1790,6 +1815,7 @@ function buildApprovedPlanNoToolPauseMessage(
           : `Reason: the model stopped early ${consecutiveNoToolCount} time(s), returned prose, and did not continue with tool calls while the current task list still has unsatisfied evidence.`,
         "MAIN preserved the current workspace, tool results, and evidence ledger. This prose is not treated as completion evidence.",
         ...(auditLine ? [auditLine] : []),
+        ...(availableToolsLine ? [availableToolsLine] : []),
         "",
         "Remaining tasks:",
         remainingText,
@@ -4719,6 +4745,7 @@ export async function executeAgentLoop(
   let noProgressBatchRepeatCount = 0;
   let approvedPlanNoProgressRecoveryAttempts = 0;
   let approvedPlanActionOnlyRecoveryActive = false;
+  let approvedPlanNoToolRecoveryFileReadActive = false;
   let executeRecoveryMode: ExecuteRecoveryMode =
     workflowMode === "edit"
       ? normalizeExecuteRecoveryMode(callbacks.getForcedExecuteRecoveryMode?.())
@@ -5271,7 +5298,9 @@ export async function executeAgentLoop(
       });
     }
     const rawIterationAllTools = finalTextOnlyStep ? [] : resolveAllToolsForRuntime(runtimeIntent);
-    const allowApprovedPlanRecoveryFileRead = shouldAllowApprovedPlanRecoveryFileRead(recentPlanToolActivity);
+    const allowApprovedPlanRecoveryFileRead =
+      approvedPlanNoToolRecoveryFileReadActive ||
+      shouldAllowApprovedPlanRecoveryFileRead(recentPlanToolActivity);
     const isExecuteRecoveryEligible =
       (workflowMode === "edit" || (workflowMode === "plan" && callbacks.getIsPlanApproved())) &&
       runtimeIntent === "execute" &&
@@ -7538,6 +7567,14 @@ export async function executeAgentLoop(
         auditTotal: approvedPlanAuditForNoTool?.totalCount ?? 0,
         remaining: approvedPlanAuditForNoTool?.remainingTasks.length ?? 0,
       });
+      approvedPlanActionOnlyRecoveryActive = true;
+      approvedPlanNoToolRecoveryFileReadActive = true;
+      logAgentEvent("approved_plan_no_tool_recovery_tool_surface", {
+        iteration,
+        allowFileRead: true,
+        recoveryToolSurface: describeApprovedPlanRecoveryToolSurface(true),
+        availableTools: Array.from(availableToolNames).slice(0, 24),
+      });
 
       if (consecutiveNoToolCount >= MAX_NO_ACTION_RETRIES) {
         logAgentEvent("loop_stop", {
@@ -7560,6 +7597,7 @@ export async function executeAgentLoop(
             consecutiveNoToolCount,
             approvedPlanAuditForNoTool || undefined,
             rejectedCompletionClaim,
+            Array.from(availableToolNames),
           ),
           "incomplete_plan",
         );
@@ -8188,6 +8226,7 @@ export async function executeAgentLoop(
                 consecutiveNoToolCount,
                 approvedPlanAudit || undefined,
                 rejectedCompletionClaim,
+                Array.from(availableToolNames),
               ),
               "incomplete_plan",
             );
@@ -8664,7 +8703,16 @@ export async function executeAgentLoop(
               modifiedMs: fileReadState.modifiedMs,
               contentHash: fileReadState.contentHash,
             });
-            const baseStub = buildFileUnchangedStub(fileReadState);
+            const replayApprovedExecutionRead =
+              workflowMode === "plan" &&
+              callbacks.getIsPlanApproved() &&
+              runtimeIntent === "execute" &&
+              tc.name === "read_file" &&
+              duplicateCount >= 2 &&
+              !shouldPushPlanReadLimit;
+            const baseStub = replayApprovedExecutionRead
+              ? buildFileUnchangedReplayContent(fileReadState, duplicateCount)
+              : buildFileUnchangedStub(fileReadState);
             const closurePrompt = shouldPushPlanReadLimit
               ? `\n\n${buildPlanClosurePromptFromEvidence(callbacks, recentPlanToolActivity, attemptedPlanWriteTargets, latestUserPromptText)}`
               : "";
@@ -9188,8 +9236,17 @@ export async function executeAgentLoop(
     const nonReadOnlySuccessfulResultCount = allResults.filter((result) =>
       !result.isError && !PLAN_EXPLORATION_READ_ONLY_TOOLS.has(result.name)
     ).length;
+    if (
+      workflowMode === "plan" &&
+      callbacks.getIsPlanApproved() &&
+      approvedPlanNoToolRecoveryFileReadActive &&
+      allResults.some((result) => result.name === "read_file")
+    ) {
+      approvedPlanNoToolRecoveryFileReadActive = false;
+    }
     if (workflowMode === "plan" && callbacks.getIsPlanApproved() && nonReadOnlySuccessfulResultCount > 0) {
       approvedPlanActionOnlyRecoveryActive = false;
+      approvedPlanNoToolRecoveryFileReadActive = false;
       approvedPlanNoProgressRecoveryAttempts = 0;
     }
     if (workflowMode === "edit" && nonReadOnlySuccessfulResultCount > 0) {

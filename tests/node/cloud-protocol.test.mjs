@@ -612,6 +612,12 @@ test("ChatGPT OAuth Codex request helper adds required stream instructions and s
   assert.equal(typeof body.instructions, "string");
   assert.equal(body.instructions.length > 0, true);
   assert.equal(body.user_prompt_id, "main-cloud-test");
+
+  const apiKeyCompatibleBody = ensureOpenAiChatGptCodexRequestBody({
+    model: "gpt-5.4-mini",
+    input: "ok",
+  }, { includeUserPromptId: false });
+  assert.equal(apiKeyCompatibleBody.user_prompt_id, undefined);
 });
 
 test("Responses SSE parser aggregates output text deltas", () => {
@@ -740,6 +746,44 @@ test("responses compact transcript fallback keeps pinned ContextState memory", (
   assert.equal(typeof transcript?.body.input, "string");
   assert.match(String(transcript?.body.input || ""), /ContextMemoryState v1/);
   assert.match(String(transcript?.body.input || ""), /continue Game Studio task/);
+});
+
+test("responses aggressive compact mode builds a small no-tool gateway fallback", () => {
+  const messages = [
+    {
+      role: "system",
+      content: [
+        "当前工作区绝对路径为：/tmp/workspace",
+        "工具调用格式 XML <tool_use> write_file replace_in_file read_file grep_search glob_search run_command",
+        "不要声称当前环境没有写入能力。",
+        "low priority filler ".repeat(1000),
+      ].join("\n"),
+    },
+    ...Array.from({ length: 22 }, (_, index) => ({
+      role: index % 3 === 0 ? "tool" : index % 2 === 0 ? "user" : "assistant",
+      content: `message ${index} ${"x".repeat(1800)}`,
+    })),
+    { role: "user", content: "请写入 .MAIN/plans/plan.md" },
+  ];
+
+  const candidates = buildOpenAiResponsesRequestCandidates({
+    messages,
+    model: "gpt-5.5",
+    compact: true,
+    compactionMode: "aggressive",
+    includeTools: false,
+    disableResponseStorage: true,
+    reasoningEffort: "none",
+    targetInputTokens: 6000,
+  });
+  const transcript = candidates.find((candidate) => candidate.mode === "transcript_text");
+
+  assert.equal(transcript?.body.tools, undefined);
+  assert.equal(transcript?.body.reasoning, undefined);
+  assert.equal(transcript?.body.store, false);
+  assert.match(String(transcript?.body.instructions || ""), /Cloud Gateway Compact Instructions/);
+  assert.ok(String(transcript?.body.instructions || "").length <= 3100);
+  assert.ok(String(transcript?.body.input || "").length < 12000);
 });
 
 test("anthropic response text extractor joins text content blocks", () => {
