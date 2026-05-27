@@ -211,6 +211,7 @@ function run(command, args, options = {}) {
     encoding: "utf8",
     env: options.env,
     stdio: options.stdio || "inherit",
+    shell: process.platform === "win32",
   });
 
   if (result.error) {
