@@ -206,12 +206,13 @@ function validateOptions(options) {
 }
 
 function run(command, args, options = {}) {
+  const isBatch = typeof command === "string" && (command.endsWith(".cmd") || command.endsWith(".bat"));
   const result = spawnSync(command, args, {
     cwd: options.cwd,
     encoding: "utf8",
     env: options.env,
     stdio: options.stdio || "inherit",
-    shell: process.platform === "win32",
+    shell: isBatch,
   });
 
   if (result.error) {
