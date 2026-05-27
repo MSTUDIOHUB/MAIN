@@ -2070,6 +2070,9 @@ export default function App() {
       mode: "empty",
       elapsedMs: Math.round(performance.now() - startedAt),
     });
+    if (scopeKey !== GLOBAL_CHAT_KEY) {
+      hydrateWorkspacePlanForEmptySession("empty_session_restore");
+    }
     if (target?.storageStatus !== "ok") {
       useAppStore.getState().saveCurrentRuntimeToSession();
     }
@@ -2135,6 +2138,7 @@ export default function App() {
           showFilePanel: false,
           rightPanelTab: "plan",
         });
+        hydrateWorkspacePlanForEmptySession("workspace_open_empty");
       }
     } catch (error) {
       console.error("Failed to open workspace path:", error);
@@ -2179,6 +2183,19 @@ export default function App() {
       showTerminal: false,
       showFilePanel: false,
       rightPanelTab: "plan",
+    });
+  }, []);
+
+  const hydrateWorkspacePlanForEmptySession = useCallback((reason: string) => {
+    const state = useAppStore.getState();
+    if (!state.currentWorkspace.trim()) return;
+    void state.ensurePlanArtifactsHydratedForWorkspace({
+      reason,
+      promoteTasksToExecuting: true,
+    }).then((hydrated) => {
+      if (hydrated) {
+        useAppStore.getState().saveCurrentRuntimeToSession();
+      }
     });
   }, []);
 
@@ -2291,6 +2308,7 @@ export default function App() {
     sessionRecoveryAttemptRef.current = "";
     lastSessionRuntimeSignatureRef.current = "";
     resetToEmptyChatView();
+    if (!isGlobalChat) hydrateWorkspacePlanForEmptySession("new_session");
   };
 
   const handleSelectSession = async (scopeKey: string, id: number) => {

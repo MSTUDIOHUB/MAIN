@@ -751,13 +751,17 @@ function seedPlanReloadResumeScenario() {
   const workspace = "/tmp/e2e-plan-reload";
   const sessionId = 999002;
   const now = Date.now();
+  const hasExistingState = hasReloadResumeState(workspace, sessionId);
+  const hadSeededBefore = readSeedCount(PLAN_RELOAD_RESUME_SCENARIO) > 0;
 
-  if (!hasReloadResumeState(workspace, sessionId)) {
+  if (!hasExistingState) {
     const turnId = "e2e-plan-reload-turn";
     const userBlockId = useAppStore.getState()._nextTaskId();
     const agentBlockId = useAppStore.getState()._nextTaskId();
 
-    incrementSeedCount(PLAN_RELOAD_RESUME_SCENARIO);
+    if (!hadSeededBefore) {
+      incrementSeedCount(PLAN_RELOAD_RESUME_SCENARIO);
+    }
 
     useAppStore.setState((state) => ({
       ...state,
@@ -865,7 +869,9 @@ function seedPlanReloadResumeScenario() {
       contextMentions: [],
     }));
 
-    appendBridgeEvent("seeded", { seedCount: readSeedCount(PLAN_RELOAD_RESUME_SCENARIO) });
+    appendBridgeEvent(hadSeededBefore ? "restored" : "seeded", {
+      seedCount: readSeedCount(PLAN_RELOAD_RESUME_SCENARIO),
+    });
   } else {
     appendBridgeEvent("restored", { seedCount: readSeedCount(PLAN_RELOAD_RESUME_SCENARIO) });
   }

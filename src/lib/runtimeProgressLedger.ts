@@ -75,6 +75,25 @@ function isCachedText(value: unknown): boolean {
   return /FILE_UNCHANGED_STUB|Repeated read-only tool call skipped/i.test(String(value || ""));
 }
 
+function compactPauseSummary(value: unknown, language: RuntimeProgressLanguage): string {
+  const lines = String(value || "")
+    .split(/\r?\n/)
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+  if (lines.length === 0) return "";
+
+  const lead = lines.find((line) => /暂停|paused/i.test(line)) || lines[0];
+  const recovery = lines.find((line) =>
+    language === "zh"
+      ? /建议恢复动作|下一步|可使用 Resume Execution|可从.*恢复执行/.test(line)
+      : /suggested recovery|next|resume execution|continue from/i.test(line)
+  );
+  const summary = recovery && recovery !== lead
+    ? `${lead} ${recovery}`
+    : lead;
+  return compactLine(summary, 220);
+}
+
 function titleForTool(tool: string, target: string, status: RuntimeProgressStatus, language: RuntimeProgressLanguage): string {
   const family = toolFamily(tool);
   const name = compactTarget(target) || (language === "zh" ? "当前工作区" : "current workspace");
@@ -153,14 +172,18 @@ function itemFromProgressEvent(
 ): Omit<RuntimeProgressLedgerItem, "repeatCount" | "cacheHits"> & { repeatCount?: number; cacheHits?: number } | null {
   const target = normalizeTarget(progress.target || "");
   const tool = String(progress.tool || "").trim();
-  const title = compactLine(progress.title || titleForTool(tool, target, normalizeStatus(progress.status), language), 160);
+  const status = normalizeStatus(progress.status);
+  const title = compactLine(progress.title || titleForTool(tool, target, status, language), 160);
   if (!title && !target && !tool) return null;
-  const summary = compactLine(progress.summary || progress.evidence || progress.action || progress.next || "", 220);
+  const rawSummary = progress.summary || progress.evidence || progress.action || progress.next || "";
+  const summary = status === "paused"
+    ? compactPauseSummary(rawSummary || progress.next || title, language)
+    : compactLine(rawSummary, 220);
   return {
     key: keyForProgress({ phase: progress.phase, title, target, tool, dedupeKey: progress.dedupeKey }),
     phase: String(progress.phase || ""),
     title,
-    status: normalizeStatus(progress.status),
+    status,
     summary,
     target,
     tool,
@@ -267,7 +290,7 @@ function itemFromBlock(
     };
   }
   if (block?.type === "system" && /暂停|paused|missing_tool_loop|no progress|重复/i.test(String(block.content || ""))) {
-    const summary = compactLine(block.content, 260);
+    const summary = compactPauseSummary(block.content, language);
     return {
       key: `pause:${summary.slice(0, 80).toLowerCase()}`,
       phase: "blocked",

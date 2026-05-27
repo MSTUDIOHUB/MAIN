@@ -28,8 +28,11 @@ const STUDIO_EXECUTION_HYDRATION_COMMAND_SET = new Set<StudioWorkflowCommandSlug
 
 const RESUME_PLAN_SEMANTIC_PATTERNS = [
   /(?:继续|恢复|接着).{0,20}(?:执行|计划|任务)/i,
+  /(?:继续|恢复|接着).{0,20}(?:完成|推进|落地).{0,20}(?:计划方案|计划|方案|任务)/i,
+  /(?:把|将).{0,8}(?:计划方案|计划|方案|剩余任务).{0,20}(?:继续|接着).{0,20}(?:做完|完成|执行|落地)/i,
   /(?:继续|恢复).{0,24}(?:plan|tasks?|execution)/i,
   /\b(?:resume|continue)\b.{0,24}\b(?:plan|task list|execution)\b/i,
+  /\b(?:resume|continue|finish)\b.{0,32}\b(?:plan|plan execution|planned tasks)\b/i,
 ];
 
 function looksLikeResumePlanSemantic(input: string): boolean {

@@ -988,11 +988,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     hasActivePlanContext &&
     isPlanApproved &&
     planStage === "executing" &&
-    (agentStatus === "idle" || agentStatus === "error") &&
-    (
-      !buildPlanTaskEvidenceAudit({ tasks: planTasks, evidenceLedger: planExecutionEvidenceLedger }).allTrustedComplete ||
-      !planArtifacts.some((artifact) => artifact.kind === "tasks")
-    );
+    (agentStatus === "idle" || agentStatus === "error");
   const handleContinuePlanning = () => {
     const isRequirementsStage = planStage === "requirements";
     sendMessage(
@@ -1032,6 +1028,8 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
         reuseCurrentTurn: false,
         preservePlanState: true,
         resolvedIntent: "plan",
+        runtimeIntentOverride: "execute",
+        executionConsentGranted: true,
         skipIntentResolution: true,
         turnTitle: language === "zh" ? "计划执行恢复" : "Plan Execution Resume",
         intentSummary: language === "zh"

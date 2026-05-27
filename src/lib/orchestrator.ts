@@ -1407,16 +1407,13 @@ function isApprovedPlanRecoveryTool(
   tool: ToolDefinition,
   options: { allowFileRead?: boolean } = {},
 ): boolean {
-  const name = tool.function.name;
-  if (name === "read_file") return true;
-  return isApprovedPlanRecoveryToolName(name, PLAN_EXPLORATION_READ_ONLY_TOOLS, options);
+  return isApprovedPlanRecoveryToolName(tool.function.name, PLAN_EXPLORATION_READ_ONLY_TOOLS, options);
 }
 
 function isApprovedPlanSourceEditFirstTool(
   tool: ToolDefinition,
   options: { allowFileRead?: boolean } = {},
 ): boolean {
-  if (tool.function.name === "read_file") return true;
   return isApprovedPlanSourceEditFirstToolName(tool.function.name, options);
 }
 

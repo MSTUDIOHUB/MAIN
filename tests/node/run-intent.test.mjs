@@ -186,6 +186,34 @@ test("existing .MAIN/plans execution request resolves to approved plan resume", 
   assert.equal(result.needsDecision, undefined);
 });
 
+test("natural plan continuation wording resolves to approved plan resume", () => {
+  for (const input of [
+    "继续完成计划方案",
+    "继续完成计划",
+    "继续执行计划",
+    "把方案继续做完",
+  ]) {
+    const result = resolveTurnRunIntent(input, createContext());
+    assert.equal(looksLikeExistingPlanExecutionRequest(input), true, input);
+    assert.equal(result.intent, "plan", input);
+    assert.equal(result.controlAction, "resume_plan_execution", input);
+    assert.equal(result.commandDirective.kind, "plan_resume", input);
+  }
+});
+
+test("plan discussion wording stays natural response", () => {
+  for (const input of [
+    "这个方案怎么样？",
+    "解释一下这个方案",
+    "分析这个方案",
+  ]) {
+    const result = resolveTurnRunIntent(input, createContext());
+    assert.equal(looksLikeExistingPlanExecutionRequest(input), false, input);
+    assert.equal(result.intent, "respond", input);
+    assert.equal(result.controlAction, undefined, input);
+  }
+});
+
 test("design based implementation request approves an existing plan", () => {
   const result = resolveTurnRunIntent(
     "请根据设计方案 design.md 来完成修改",

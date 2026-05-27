@@ -227,6 +227,7 @@ import {
   resolveConversationTurnIntent,
   resolveRunIntentFromLegacyWorkflowMode,
   resolveTurnRunIntent,
+  isResumablePreviousTurnStatus,
   parseMainDebugShortcut,
   parseMainIntentShortcutForMode,
   isMainIntentShortcutAllowedInMainMode,
@@ -239,6 +240,7 @@ import {
   type PendingRunDecisionChoice,
   type ResolvedUserIntent,
   type ResolvedRunIntent,
+  type RunIntentResolution,
 } from "../lib/runIntent";
 import {
   resolvePlanStateHydrationReason,
@@ -1103,6 +1105,8 @@ interface AppState {
   clearGitDiffPreview: () => void;
   setRightPanelTab: (tab: RightPanelTab) => void;
   openRightPanelTab: (tab: RightPanelTab) => void;
+  ensurePlanArtifactsHydratedForWorkspace: (options?: { openPanel?: boolean; reason?: string; promoteTasksToExecuting?: boolean }) => Promise<boolean>;
+  openPlanWorkspacePanel: () => Promise<boolean>;
   closeRightPanel: () => void;
   setRightPanelWidth: (w: number) => void;
   setSidebarWidth: (w: number) => void;
@@ -2936,6 +2940,107 @@ function findPreviousTurnContinuationTarget(
   return null;
 }
 
+const PLAN_ARTIFACT_REFERENCE_RE = /(?:^|[\\/])\.MAIN[\\/ ]*plans[\\/ ][^\s"'`)]*\.md|\.MAIN[\\/ ]*plans|\.main[\\/ ]*plans|tasks\.md|plan\.md|bugfix\.md|design\.md|requirements\.md/i;
+const PLAN_EXECUTION_CONTEXT_RE = /执行已批准计划|计划执行|已批准计划|执行回合|计划执行恢复|剩余任务|未完成任务|可信执行证据|继续执行|resume execution|plan execution|execute approved plan|remaining tasks/i;
+
+function collectPlanResumeContextText(turn: ConversationTurn | null, taskFlow: TaskBlock[]): string {
+  if (!turn) return "";
+  const parts: string[] = [
+    turn.userPrompt || "",
+    turn.title || "",
+    turn.intentSummary || "",
+    turn.summary || "",
+  ];
+  let collectedChars = parts.reduce((count, part) => count + part.length, 0);
+
+  const appendValue = (value: unknown, depth = 0) => {
+    if (value == null || depth > 2 || collectedChars > 12_000) return;
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+      const text = String(value).replace(/\s+/g, " ").trim();
+      if (text) {
+        const clipped = text.slice(0, Math.max(0, 12_000 - collectedChars));
+        if (clipped) {
+          parts.push(clipped);
+          collectedChars += clipped.length;
+        }
+      }
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value.slice(0, 8)) appendValue(item, depth + 1);
+      return;
+    }
+    if (typeof value === "object") {
+      const record = value as Record<string, unknown>;
+      for (const key of [
+        "path",
+        "sourcePath",
+        "displayName",
+        "content",
+        "message",
+        "target",
+        "title",
+        "summary",
+        "intentSummary",
+        "evidence",
+        "why",
+        "next",
+        "action",
+        "contextItems",
+        "attachedFiles",
+        "images",
+      ]) {
+        appendValue(record[key], depth + 1);
+      }
+    }
+  };
+
+  for (const block of taskFlow) {
+    if (block.turnId !== turn.id) continue;
+    appendValue(block);
+  }
+
+  return parts.join("\n");
+}
+
+function turnSuggestsPlanExecutionResume(turn: ConversationTurn | null, taskFlow: TaskBlock[]): boolean {
+  if (!turn) return false;
+  const intent = resolveConversationTurnIntent(turn);
+  const contextText = collectPlanResumeContextText(turn, taskFlow);
+  if (looksLikeExistingPlanExecutionRequest(contextText)) return true;
+
+  if (intent === "plan") {
+    return isResumablePreviousTurnStatus(turn.status) && PLAN_EXECUTION_CONTEXT_RE.test(contextText);
+  }
+
+  return (
+    isResumablePreviousTurnStatus(turn.status) &&
+    PLAN_ARTIFACT_REFERENCE_RE.test(contextText) &&
+    PLAN_EXECUTION_CONTEXT_RE.test(contextText)
+  );
+}
+
+function findPlanExecutionResumeContinuationTarget(
+  input: string,
+  currentTurn: ConversationTurn | null,
+  conversationTurns: ConversationTurn[],
+  taskFlow: TaskBlock[],
+): ConversationTurn | null {
+  if (!looksLikePreviousTurnContinuationInput(input)) return null;
+  if (currentTurn && turnSuggestsPlanExecutionResume(currentTurn, taskFlow)) return currentTurn;
+
+  let inspected = 0;
+  for (let index = conversationTurns.length - 1; index >= 0; index--) {
+    const turn = conversationTurns[index];
+    if (turn.id === currentTurn?.id) continue;
+    inspected += 1;
+    if (inspected > 4) break;
+    if (turnSuggestsPlanExecutionResume(turn, taskFlow)) return turn;
+  }
+
+  return null;
+}
+
 function getLastTurnToolSummary(turnId: string, taskFlow: TaskBlock[]): string {
   for (let index = taskFlow.length - 1; index >= 0; index--) {
     const block = taskFlow[index];
@@ -3821,12 +3926,26 @@ async function hydrateExistingPlanArtifactsForWorkspace(
   language: "zh" | "en",
 ) {
   let availablePaths: string[] = [];
+  const actualPathByCanonicalPath = new Map<string, string>();
   try {
     const entries = await listDirectory(".MAIN/plans", workspace || undefined);
+    const expectedByFileName = new Map(
+      PLAN_ARTIFACT_PATHS.map((path) => [path.split("/").pop()?.toLowerCase() || "", path]),
+    );
     const fileNames = new Set(
       entries
         .filter((entry) => !entry.is_dir)
-        .map((entry) => entry.name.toLowerCase()),
+        .map((entry) => {
+          const fileName = entry.name.toLowerCase();
+          const expectedPath = expectedByFileName.get(fileName);
+          if (expectedPath) {
+            actualPathByCanonicalPath.set(
+              expectedPath.replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase(),
+              `.MAIN/plans/${entry.name}`,
+            );
+          }
+          return fileName;
+        }),
     );
     availablePaths = PLAN_ARTIFACT_PATHS.filter((path) => {
       const fileName = path.split("/").pop()?.toLowerCase() || "";
@@ -3840,7 +3959,10 @@ async function hydrateExistingPlanArtifactsForWorkspace(
   }
 
   return hydratePlanArtifactsFromReader(
-    (path) => readFile(path, workspace || undefined),
+    (path) => {
+      const canonicalPath = path.replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase();
+      return readFile(actualPathByCanonicalPath.get(canonicalPath) || path, workspace || undefined);
+    },
     language,
     Date.now(),
     { availablePaths },
@@ -4118,12 +4240,13 @@ export const useAppStore = create<AppState>()(
     showTerminal: v ? false : get().showTerminal,
     rightPanelTab: v ? "diff" : get().rightPanelTab,
   }),
-  setShowPlanPanel: (v) => set({
-    showPlanPanel: v,
-    showDiff: v ? false : get().showDiff,
-    showTerminal: v ? false : get().showTerminal,
-    rightPanelTab: v ? "plan" : get().rightPanelTab,
-  }),
+  setShowPlanPanel: (v) => {
+    if (v) {
+      void get().openPlanWorkspacePanel();
+      return;
+    }
+    set({ showPlanPanel: false });
+  },
   setShowTerminal: (v) => set({
     showTerminal: v,
     showPlanPanel: v ? false : get().showPlanPanel,
@@ -4243,12 +4366,116 @@ export const useAppStore = create<AppState>()(
     });
   },
   clearGitDiffPreview: () => set({ gitDiffPreview: null }),
-  setRightPanelTab: (tab) => set({
-    rightPanelTab: tab,
-    showPlanPanel: tab === "plan",
-    showDiff: tab === "diff",
-    showTerminal: tab === "terminal",
-  }),
+  ensurePlanArtifactsHydratedForWorkspace: async (options = {}) => {
+    const state = get();
+    const language = state.config.language === "en" ? "en" : "zh";
+    const alreadyHasPlanState =
+      state.planArtifacts.length > 0 ||
+      state.planTasks.length > 0 ||
+      state.planStage !== "idle";
+
+    const openPanelPatch = options.openPanel
+      ? {
+          showPlanPanel: true,
+          showDiff: false,
+          showTerminal: false,
+          rightPanelTab: "plan" as const,
+        }
+      : {};
+
+    if (alreadyHasPlanState) {
+      if (options.openPanel) set(openPanelPatch);
+      return true;
+    }
+
+    if (!state.currentWorkspace.trim()) {
+      if (options.openPanel) set(openPanelPatch);
+      return false;
+    }
+
+    let hydrated: Awaited<ReturnType<typeof hydrateExistingPlanArtifactsForWorkspace>> | null = null;
+    try {
+      hydrated = await hydrateExistingPlanArtifactsForWorkspace(state.currentWorkspace, language);
+    } catch {
+      hydrated = null;
+    }
+
+    const hasHydratedData = !!hydrated && (hydrated.artifacts.length > 0 || hydrated.tasks.length > 0);
+    if (!hydrated || !hasHydratedData) {
+      if (options.openPanel) set(openPanelPatch);
+      logStoreEvent("plan_workspace_hydration_empty", {
+        workspace: state.currentWorkspace || null,
+        reason: options.reason || "open_plan_panel",
+      });
+      return false;
+    }
+    const hydratedPlan = hydrated;
+
+    set((s) => {
+      const liveAlreadyHasPlanState =
+        s.planArtifacts.length > 0 ||
+        s.planTasks.length > 0 ||
+        s.planStage !== "idle";
+      if (liveAlreadyHasPlanState) return openPanelPatch;
+
+      const nextStage = derivePlanStageFromArtifacts(
+        hydratedPlan.artifacts,
+        hydratedPlan.tasks,
+        s.isPlanApproved,
+        s.planStage,
+      );
+      const shouldPromoteHydratedTasksToExecuting =
+        options.promoteTasksToExecuting === true &&
+        hydratedPlan.hasTasksArtifact &&
+        hydratedPlan.tasks.length > 0;
+      const threadId =
+        resolveSessionRuntimeKey(resolveSessionWorkspaceKey(s.currentWorkspace), s.currentSessionId) ||
+        "default";
+      const nextEvent = withEventSchema({
+        type: "plan_state_hydrated",
+        threadId,
+        turnId: s.currentTurnId || undefined,
+        timestampMs: Date.now(),
+        reason: options.reason || "open_plan_panel",
+        taskCount: hydratedPlan.tasks.length,
+        artifactPaths: hydratedPlan.artifacts.map((artifact) => artifact.path),
+      });
+
+      return {
+        planArtifacts: hydratedPlan.artifacts,
+        planTasks: hydratedPlan.tasks,
+        isPlanApproved: shouldPromoteHydratedTasksToExecuting || s.isPlanApproved,
+        planStage: shouldPromoteHydratedTasksToExecuting ? "executing" : nextStage,
+        ...openPanelPatch,
+        runtimeEvents: appendRuntimeEvent(s.runtimeEvents, nextEvent),
+      };
+    });
+    logStoreEvent("plan_workspace_hydrated_for_panel", {
+      workspace: state.currentWorkspace || null,
+      reason: options.reason || "open_plan_panel",
+      artifacts: hydratedPlan.artifacts.map((artifact) => artifact.path),
+      taskCount: hydratedPlan.tasks.length,
+      promotedToExecuting: options.promoteTasksToExecuting === true && hydratedPlan.hasTasksArtifact && hydratedPlan.tasks.length > 0,
+    });
+    return true;
+  },
+  openPlanWorkspacePanel: async () =>
+    get().ensurePlanArtifactsHydratedForWorkspace({
+      openPanel: true,
+      reason: "open_plan_panel",
+    }),
+  setRightPanelTab: (tab) => {
+    if (tab === "plan") {
+      void get().openPlanWorkspacePanel();
+      return;
+    }
+    set({
+      rightPanelTab: tab,
+      showPlanPanel: false,
+      showDiff: tab === "diff",
+      showTerminal: tab === "terminal",
+    });
+  },
   openRightPanelTab: (tab) => get().setRightPanelTab(tab),
   closeRightPanel: () => set({ showPlanPanel: false, showDiff: false, showTerminal: false }),
   setRightPanelWidth: (w) => set({ rightPanelWidth: w }),
@@ -6450,13 +6677,31 @@ export const useAppStore = create<AppState>()(
     const currentTurnIntent = resolveConversationTurnIntent(currentTurn);
     const currentMainModeKey = state.selectedMainModeKey;
     const hasPlanArtifacts = state.planArtifacts.length > 0 || state.planStage !== "idle";
+    const hasApprovedOrExecutingPlanState =
+      hasPlanArtifacts &&
+      (state.isPlanApproved || state.planStage === "executing");
+    const planExecutionResumeContinuationTarget =
+      !isHidden && currentMainModeKey === "main_mode"
+        ? findPlanExecutionResumeContinuationTarget(text, currentTurn, state.conversationTurns, state.taskFlow)
+        : null;
+    const shouldRouteContinuationToPlanResume =
+      !isHidden &&
+      !options?.skipIntentResolution &&
+      !options?.resolvedIntent &&
+      looksLikePreviousTurnContinuationInput(text) &&
+      (
+        hasApprovedOrExecutingPlanState ||
+        !!planExecutionResumeContinuationTarget
+      );
     const shouldContinuePlanIntent =
       !isHidden &&
+      !shouldRouteContinuationToPlanResume &&
       currentTurnIntent === "plan" &&
       isContinuationPrompt(text) &&
       (state.planStage !== "completed" || state.planArtifacts.length === 0);
     const shouldAllowPreviousTurnContinuation =
       !isHidden &&
+      !shouldRouteContinuationToPlanResume &&
       !shouldContinuePlanIntent &&
       (
         currentMainModeKey === "main_mode" ||
@@ -6715,6 +6960,8 @@ export const useAppStore = create<AppState>()(
       previousTurnContinuationTargetId: previousTurnContinuationTarget?.id ?? null,
       previousTurnContinuationIntent,
       shouldContinuePreviousTurnIntent,
+      shouldRouteContinuationToPlanResume,
+      planExecutionResumeContinuationTargetId: planExecutionResumeContinuationTarget?.id ?? null,
       selectedMainModeKey: currentMainModeKey,
       taskFlowBlocks: state.taskFlow.length,
       agentMessages: state.agentMessages.length,
@@ -6927,15 +7174,30 @@ export const useAppStore = create<AppState>()(
     }
 
     if (!isHidden && !mainDebugShortcut && !lockedComposerIntent && !shouldContinuePlanIntent && !shouldContinuePreviousTurnIntent && !shouldReuseExistingTurnIntent && !options?.skipIntentResolution && !options?.resolvedIntent) {
-      const resolution = resolveTurnRunIntent(text, {
-        language: preferredLanguage,
-        mainModeKey: currentMainModeKey,
-        parsedStudioCommand,
-        hasPlanArtifacts,
-        planStage: state.planStage,
-        isPlanApproved: state.isPlanApproved,
-        previousTurnIntent: currentTurnIntent,
-      });
+      const resolution: RunIntentResolution = shouldRouteContinuationToPlanResume
+        ? {
+            intent: "plan" as const,
+            reason: preferredLanguage === "en"
+              ? "Continuation input is attached to an approved/executing or recently misrouted plan context, so MAIN resumes plan execution instead of ordinary chat."
+              : "短继续指令关联到已批准/执行中计划或上一轮误路由的计划上下文，因此恢复计划执行而不是普通聊天续跑。",
+            confidence: 0.95,
+            bypassMainRouter: false,
+            riskLevel: "low" as const,
+            controlAction: "resume_plan_execution" as const,
+            commandDirective: inferCommandDirective(text, "plan", {
+              source: "continuation",
+              controlAction: "resume_plan_execution",
+            }),
+          }
+        : resolveTurnRunIntent(text, {
+            language: preferredLanguage,
+            mainModeKey: currentMainModeKey,
+            parsedStudioCommand,
+            hasPlanArtifacts,
+            planStage: state.planStage,
+            isPlanApproved: state.isPlanApproved,
+            previousTurnIntent: currentTurnIntent,
+          });
       effectiveIntentSummary = buildRunIntentSummary({
         input: text,
         intent: resolution.intent,
@@ -6965,7 +7227,9 @@ export const useAppStore = create<AppState>()(
           pendingRunDecision: null,
         });
         void (async () => {
-          const shouldHydrateExistingPlan = looksLikeExistingPlanExecutionRequest(text);
+          const shouldHydrateExistingPlan =
+            looksLikeExistingPlanExecutionRequest(text) ||
+            shouldRouteContinuationToPlanResume;
           let latest = get();
           let hydratedForExecution:
             | Awaited<ReturnType<typeof hydrateExistingPlanArtifactsForWorkspace>>
@@ -7033,7 +7297,7 @@ export const useAppStore = create<AppState>()(
             {
               hidden: true,
               reuseCurrentTurn: false,
-              uiParentTurnId: state.currentTurnId || undefined,
+              uiParentTurnId: planExecutionResumeContinuationTarget?.id || state.currentTurnId || undefined,
               preservePlanState: true,
               resolvedIntent: "plan",
               runtimeIntentOverride: "execute",
@@ -7468,6 +7732,12 @@ export const useAppStore = create<AppState>()(
         showDiff: tab === "diff",
         showTerminal: tab === "terminal",
       });
+    const sessionOpenPlanWorkspacePanel = async () => {
+      sessionOpenRightPanelTab("plan");
+      const live = get();
+      const runtime = live.runtimeBySessionKey[runSessionKey] || createSessionRuntimeFromState(live);
+      return runtime.planArtifacts.length > 0 || runtime.planTasks.length > 0 || runtime.planStage !== "idle";
+    };
     const sessionGet = (): AppState => {
       const live = get();
       const runtime = live.runtimeBySessionKey[runSessionKey] || createSessionRuntimeFromState(live);
@@ -7483,6 +7753,8 @@ export const useAppStore = create<AppState>()(
         setNormalizedStreamState: (streamState: NormalizedStreamState) => sessionSet({ normalizedStreamState: streamState }),
         openRightPanelTab: sessionOpenRightPanelTab,
         setRightPanelTab: sessionOpenRightPanelTab,
+        ensurePlanArtifactsHydratedForWorkspace: sessionOpenPlanWorkspacePanel,
+        openPlanWorkspacePanel: sessionOpenPlanWorkspacePanel,
         closeRightPanel: () => sessionSet({ showPlanPanel: false, showDiff: false, showTerminal: false }),
         startNewTurn: () =>
           sessionSet({
@@ -10816,7 +11088,15 @@ export const useAppStore = create<AppState>()(
               phase: "blocked",
               title: language === "en" ? "Run paused" : "运行已暂停",
               status: "paused",
-              summary: visibleMessage,
+              summary: progress?.nextStep || (
+                isApprovedExecutionPause
+                  ? language === "en"
+                    ? "Workspace state is preserved; resume execution from the current task context."
+                    : "已保留 workspace 状态，可从当前任务上下文恢复执行。"
+                  : language === "en"
+                  ? "The run paused before producing an actionable result."
+                  : "本轮在产生可执行结果前已暂停。"
+              ),
               next: progress?.nextStep || "",
               dedupeKey: `pause:${reason}`,
             },

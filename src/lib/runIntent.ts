@@ -371,8 +371,12 @@ const APPROVE_PLAN_PATTERNS = [
 
 const RESUME_PLAN_PATTERNS = [
   /继续执行(?:剩余任务)?/i,
+  /(?:继续|恢复|接着).{0,16}(?:完成|执行|推进|落地).{0,16}(?:计划方案|计划|方案|任务)/i,
+  /(?:继续|恢复|接着).{0,16}(?:计划方案|计划|方案).{0,16}(?:执行|落地|做完|完成)/i,
+  /(?:把|将).{0,8}(?:计划方案|计划|方案|剩余任务).{0,16}(?:继续|接着).{0,16}(?:做完|完成|执行|落地)/i,
   /continue plan/i,
   /continue execution/i,
+  /(?:resume|continue|finish).{0,32}(?:plan|plan execution|planned tasks)/i,
   /resume execution/i,
   /继续把(?:剩余)?任务做完/i,
 ];
@@ -381,7 +385,11 @@ const EXISTING_PLAN_EXECUTION_PATTERNS = [
   /(?:根据|按照|按).{0,24}(?:\.MAIN[\\/ ]*plans|\.main[\\/ ]*plans|plans\s*(?:文件夹|目录|folder)|计划(?:文件夹|目录)|tasks\.md|\.MAIN[\\/ ]*plans[\\/ ]*tasks\.md).{0,80}(?:完成|执行|继续|落地|处理|实现|推进)/i,
   /(?:完成|执行|继续|落地|处理|实现|推进).{0,60}(?:\.MAIN[\\/ ]*plans|\.main[\\/ ]*plans|plans\s*(?:文件夹|目录|folder)|计划任务|任务清单|tasks\.md)/i,
   /(?:执行|继续|完成).{0,24}(?:计划任务|计划中的任务|任务清单|执行方案和任务|方案和任务)/i,
+  /(?:继续|恢复|接着).{0,16}(?:完成|执行|推进|落地).{0,16}(?:计划方案|计划任务|计划中的任务|计划|方案)/i,
+  /(?:继续|恢复|接着).{0,16}(?:计划方案|计划任务|计划|方案).{0,16}(?:执行|落地|做完|完成)/i,
+  /(?:把|将).{0,8}(?:计划方案|计划任务|计划|方案|剩余任务).{0,16}(?:继续|接着).{0,16}(?:做完|完成|执行|落地)/i,
   /\b(?:execute|resume|continue|finish).{0,40}(?:\.MAIN[\\/ ]*plans|tasks\.md|plan tasks|task list)\b/i,
+  /\b(?:resume|continue|finish).{0,32}(?:the )?(?:approved )?(?:plan|plan execution|planned tasks)\b/i,
 ];
 
 const PREVIOUS_TURN_CONTINUATION_PATTERNS = [

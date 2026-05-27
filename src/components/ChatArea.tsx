@@ -299,7 +299,7 @@ function TurnSummaryCard({
   const cleanTurnSummary = sanitizeAIOutput(turn.summary || "");
   const summaryText = (looksLikeReasoningLeakTitle(cleanTurnSummary) ? "" : cleanTurnSummary) || sanitizeAIOutput(fallbackSummary || "") || copy.collapsedSummary;
   const shellClass = embedded
-    ? "px-1 py-1"
+    ? "rounded-none bg-transparent px-1 py-1"
     : "rounded-2xl border border-[#1f1f23] bg-[#09090b] px-4 py-3";
 
   return (
@@ -2734,14 +2734,13 @@ export default function ChatArea({
       return;
     }
 
-    if (tab === "plan" && !hasPlanPanelContent) return;
     if (tab === "file") {
       if (!currentWorkspace) return;
       openFileTreePanel();
       return;
     }
     openRightPanelTab(tab);
-  }, [closeFilePanel, closeRightPanel, currentWorkspace, hasPlanPanelContent, openFileTreePanel, openRightPanelTab, rightPanelTab, showDiff, showFilePanel, showPlanPanel, showTerminal]);
+  }, [closeFilePanel, closeRightPanel, currentWorkspace, openFileTreePanel, openRightPanelTab, rightPanelTab, showDiff, showFilePanel, showPlanPanel, showTerminal]);
 
   const renderBlock = (block, index) => {
     if (block.type === "user") {
@@ -3386,7 +3385,7 @@ export default function ChatArea({
               )}
             </>
           )}
-          {shouldShowTurnActivityNotice && (
+          {isTurnExpanded && shouldShowTurnActivityNotice && (
             <TurnActivityNotice
               activityText={activeTurnActivity}
               thoughtSummaryText={bottomThoughtSummary}

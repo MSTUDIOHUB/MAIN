@@ -211,3 +211,41 @@ test("runtime progress projection keeps latest status and only recent four detai
   assert.match(projection.activityText, /读取目标 5/);
   assert.match(projection.activityText, /第 5 个目标/);
 });
+
+test("runtime pause projection hides raw repeated read diagnostics", () => {
+  const event = withEventSchema({
+    type: "run.paused",
+    threadId: "thread-a",
+    turnId: "turn-a",
+    timestampMs: 10,
+    reason: "no_action",
+    message: [
+      "执行已暂停：连续重复探索，没有产生新的可用证据。",
+      "重复轮数：3",
+      "最近工具：succeeded:read_file src/components/Dashboard/TrendLineChart.tsx - FILE_UNCHANGED_STUB: src/components/Dashboard/TrendLineChart.tsx",
+      "建议恢复动作：不要继续读取同一文件；改为写入/替换、运行命令验证，或说明真实阻塞原因。",
+    ].join("\n"),
+    progress: {
+      phase: "blocked",
+      title: "运行已暂停",
+      status: "paused",
+      summary: "基于当前 workspace 状态恢复执行",
+      next: "基于当前 workspace 状态恢复执行",
+      dedupeKey: "pause:no_action",
+    },
+  });
+  const block = {
+    id: 1,
+    turnId: "turn-a",
+    type: "system",
+    content: event.message,
+  };
+
+  const items = buildRuntimeProgressLedger({ blocks: [block], events: [event], turnId: "turn-a", language: "zh" });
+  const projection = buildRuntimeProgressProjection(items, "zh", 4);
+
+  assert.match(projection.activityText, /运行已暂停/);
+  assert.doesNotMatch(projection.activityText, /FILE_UNCHANGED_STUB/);
+  assert.doesNotMatch(projection.activityText, /succeeded:read_file/);
+  assert.doesNotMatch(projection.summary, /FILE_UNCHANGED_STUB/);
+});

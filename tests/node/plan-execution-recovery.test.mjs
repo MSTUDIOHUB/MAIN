@@ -489,6 +489,14 @@ test("approved plan no-progress recovery keeps targeted reads without broad disc
     orchestratorSource,
     /recoveryIterationAllTools\.filter\(\(tool\)\s*=>\s*isApprovedPlanRecoveryTool\(tool,[\s\S]*allowFileRead: allowApprovedPlanRecoveryFileRead/,
   );
+  assert.doesNotMatch(
+    orchestratorSource,
+    /function\s+isApprovedPlanRecoveryTool[\s\S]*?if\s*\(\s*name\s*===\s*"read_file"\s*\)\s*return\s+true;/,
+  );
+  assert.doesNotMatch(
+    orchestratorSource,
+    /function\s+isApprovedPlanSourceEditFirstTool[\s\S]*?if\s*\(\s*tool\.function\.name\s*===\s*"read_file"\s*\)\s*return\s+true;/,
+  );
   assert.match(orchestratorSource, /approvedPlanNoToolRecoveryFileReadActive/);
   assert.match(orchestratorSource, /approved_plan_no_tool_recovery_tool_surface/);
   assert.doesNotMatch(
