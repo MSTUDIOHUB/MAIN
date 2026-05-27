@@ -2312,6 +2312,7 @@ export default function ChatArea({
     checkImageStudioEngine: useAppStore((s) => s.checkImageStudioEngine),
   };
   const isImageStudioMode = selectedMainModeKey === "image_studio";
+  const isHuggingFaceImageEngine = imageStudio.config.engine === "huggingface_space";
   const isGlobalChat = !currentWorkspace;
   const emptyStatePrompts = language === "zh"
     ? [
@@ -3619,9 +3620,10 @@ export default function ChatArea({
                       {imageStudio.status.message}
                     </div>
                     <div className="mt-4 grid grid-cols-2 gap-2 text-[11px] text-[#a1a1aa]">
+                      <span className="rounded-md border border-[#27272a] bg-[#050507] px-2 py-1">{isHuggingFaceImageEngine ? "HF Space" : "HiDream HTTP"}</span>
                       <span className="rounded-md border border-[#27272a] bg-[#050507] px-2 py-1">{imageStudio.config.aspectRatio}</span>
-                      <span className="rounded-md border border-[#27272a] bg-[#050507] px-2 py-1">{imageStudio.config.steps} steps</span>
-                      <span className="rounded-md border border-[#27272a] bg-[#050507] px-2 py-1">CFG {imageStudio.config.guidanceScale}</span>
+                      <span className="rounded-md border border-[#27272a] bg-[#050507] px-2 py-1">{isHuggingFaceImageEngine ? `Refine ${imageStudio.config.promptRefine ? "On" : "Off"}` : `${imageStudio.config.steps} steps`}</span>
+                      <span className="rounded-md border border-[#27272a] bg-[#050507] px-2 py-1">{isHuggingFaceImageEngine ? "Hosted" : `CFG ${imageStudio.config.guidanceScale}`}</span>
                       <span className="truncate rounded-md border border-[#27272a] bg-[#050507] px-2 py-1">{imageStudio.config.endpoint}</span>
                     </div>
                   </div>

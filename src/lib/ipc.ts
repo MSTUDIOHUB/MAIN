@@ -506,6 +506,7 @@ export interface ImageStudioEngineCheckResult {
 }
 
 export interface ImageStudioProxyRequestInput {
+  engine?: string;
   endpoint: string;
   path: string;
   method: "GET" | "POST" | "DELETE";
@@ -622,6 +623,10 @@ export function cancelImageStudioJob(): Promise<void> {
 
 export function saveImageStudioOutput(sessionKey: string, fileName: string, dataUrl: string): Promise<string> {
   return invoke<string>("save_image_studio_output", { sessionKey, fileName, dataUrl });
+}
+
+export function saveImageStudioRemoteOutput(sessionKey: string, fileName: string, imageUrl: string): Promise<string> {
+  return invoke<string>("save_image_studio_remote_output", { sessionKey, fileName, imageUrl });
 }
 
 export function openImageStudioOutput(path: string): Promise<OpenFileExternalResult> {

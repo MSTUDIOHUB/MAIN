@@ -52,6 +52,7 @@ export default function ImageGenerationCard({
   const imageUrl = block.imageUrl || restoredImageUrl || block.previewUrl || "";
   const isFinished = block.status === "completed";
   const isError = block.status === "error";
+  const isHosted = block.params?.engine === "huggingface_space";
   const shellStyle = {
     backgroundColor: isLight ? "#ffffff" : "#09090b",
     borderColor: isLight ? "#d4d4d8" : "#27272a",
@@ -93,10 +94,10 @@ export default function ImageGenerationCard({
           <div>
             <div className="mb-1 text-[10px] font-semibold uppercase tracking-[0.16em]" style={mutedStyle}>{copy.params}</div>
             <div className="grid grid-cols-2 gap-2 text-[11px]" style={mutedStyle}>
-              <span className="rounded-md border px-2 py-1" style={panelStyle}>{block.params?.width} x {block.params?.height}</span>
-              <span className="rounded-md border px-2 py-1" style={panelStyle}>Seed {block.params?.seed}</span>
-              <span className="rounded-md border px-2 py-1" style={panelStyle}>Steps {block.params?.steps}</span>
-              <span className="rounded-md border px-2 py-1" style={panelStyle}>CFG {block.params?.guidanceScale}</span>
+              <span className="rounded-md border px-2 py-1" style={panelStyle}>{isHosted ? "HF Space" : `${block.params?.width} x ${block.params?.height}`}</span>
+              <span className="rounded-md border px-2 py-1" style={panelStyle}>Seed {block.params?.seedMode === "random" ? "Random" : block.params?.seed}</span>
+              <span className="rounded-md border px-2 py-1" style={panelStyle}>{block.params?.aspectRatio}</span>
+              <span className="rounded-md border px-2 py-1" style={panelStyle}>{isHosted ? `Refine ${block.params?.promptRefine ? "On" : "Off"}` : `CFG ${block.params?.guidanceScale}`}</span>
             </div>
           </div>
           {block.error && (

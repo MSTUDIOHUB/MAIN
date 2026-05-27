@@ -1608,6 +1608,7 @@ struct ImageStudioEngineCapabilities {
     image_to_image: bool,
     progress_preview: bool,
     cuda_required: bool,
+    cloud_hosted: bool,
 }
 
 #[derive(Serialize)]
@@ -6805,12 +6806,22 @@ static IMAGE_STUDIO_STREAM_CANCEL: std::sync::atomic::AtomicBool =
 static IMAGE_STUDIO_STREAM_ABORT: std::sync::Mutex<Option<futures_util::future::AbortHandle>> =
     std::sync::Mutex::new(None);
 
-fn image_studio_default_capabilities() -> ImageStudioEngineCapabilities {
+fn normalize_image_studio_engine(engine: &str) -> Result<&'static str, String> {
+    match engine.trim() {
+        "huggingface_space" => Ok("huggingface_space"),
+        "hidream_http" => Ok("hidream_http"),
+        _ => Err("Unsupported Image Studio engine.".to_string()),
+    }
+}
+
+fn image_studio_default_capabilities(engine: &str) -> ImageStudioEngineCapabilities {
+    let hosted = engine == "huggingface_space";
     ImageStudioEngineCapabilities {
         text_to_image: true,
-        image_to_image: true,
-        progress_preview: true,
-        cuda_required: true,
+        image_to_image: !hosted,
+        progress_preview: !hosted,
+        cuda_required: !hosted,
+        cloud_hosted: hosted,
     }
 }
 
@@ -6864,7 +6875,13 @@ fn is_allowed_image_studio_host(host: &str) -> bool {
     }
 }
 
-fn validate_image_studio_endpoint(endpoint: &str) -> Result<url::Url, String> {
+fn is_allowed_hugging_face_space_host(host: &str) -> bool {
+    host.trim()
+        .trim_matches(['[', ']'])
+        .eq_ignore_ascii_case("hidream-ai-hidream-o1-image-dev.hf.space")
+}
+
+fn validate_image_studio_endpoint_for_engine(engine: &str, endpoint: &str) -> Result<url::Url, String> {
     let trimmed = endpoint.trim().trim_end_matches('/');
     if trimmed.is_empty() {
         return Err("图像工作室 endpoint 不能为空".to_string());
@@ -6880,14 +6897,21 @@ fn validate_image_studio_endpoint(endpoint: &str) -> Result<url::Url, String> {
     let host = parsed
         .host_str()
         .ok_or_else(|| "图像工作室 endpoint 缺少主机名".to_string())?;
-    if !is_allowed_image_studio_host(host) {
+    if engine == "huggingface_space" {
+        if parsed.scheme() != "https" {
+            return Err("Hugging Face Space endpoint 必须使用 https".to_string());
+        }
+        if !is_allowed_hugging_face_space_host(host) {
+            return Err("Hugging Face Space endpoint 仅允许 HiDream-O1-Image-Dev 官方 Space".to_string());
+        }
+    } else if !is_allowed_image_studio_host(host) {
         return Err("图像工作室 endpoint 只允许 localhost、127.0.0.1、::1 或私有局域网 IP".to_string());
     }
     Ok(parsed)
 }
 
-fn build_image_studio_url(endpoint: &str, request_path: &str) -> Result<url::Url, String> {
-    let mut base = validate_image_studio_endpoint(endpoint)?;
+fn build_image_studio_url(engine: &str, endpoint: &str, request_path: &str) -> Result<url::Url, String> {
+    let mut base = validate_image_studio_endpoint_for_engine(engine, endpoint)?;
     let path = request_path.trim();
     if !path.starts_with('/') {
         return Err("图像工作室请求路径必须以 / 开头".to_string());
@@ -6909,10 +6933,9 @@ async fn check_image_studio_engine(
     engine: String,
     endpoint: String,
 ) -> Result<ImageStudioEngineCheckResult, String> {
-    if engine.trim() != "hidream_http" {
-        return Err("Unsupported Image Studio engine.".to_string());
-    }
-    let url = build_image_studio_url(&endpoint, "/")?;
+    let engine_kind = normalize_image_studio_engine(&engine)?;
+    let health_path = if engine_kind == "huggingface_space" { "/config" } else { "/" };
+    let url = build_image_studio_url(engine_kind, &endpoint, health_path)?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .connect_timeout(Duration::from_secs(3))
@@ -6926,23 +6949,31 @@ async fn check_image_studio_engine(
             Ok(ImageStudioEngineCheckResult {
                 ready,
                 message: if ready {
-                    format!("HiDream HTTP service is reachable at {}.", url)
+                    if engine_kind == "huggingface_space" {
+                        "Hugging Face HiDream Space is reachable and ready for hosted generation.".to_string()
+                    } else {
+                        format!("HiDream HTTP service is reachable at {}.", url)
+                    }
                 } else {
-                    format!("HiDream HTTP service returned HTTP {}.", status)
+                    format!("Image Studio engine returned HTTP {}.", status)
                 },
-                capabilities: image_studio_default_capabilities(),
+                capabilities: image_studio_default_capabilities(engine_kind),
             })
         }
         Err(error) => Ok(ImageStudioEngineCheckResult {
             ready: false,
             message: if error.is_connect() {
-                "未连接到图像引擎，请确认 HiDream/ComfyUI HTTP 服务已启动。".to_string()
+                if engine_kind == "huggingface_space" {
+                    "无法连接 Hugging Face Space，请检查网络或稍后重试。".to_string()
+                } else {
+                    "未连接到图像引擎，请确认 HiDream/ComfyUI HTTP 服务已启动。".to_string()
+                }
             } else if error.is_timeout() {
                 "图像引擎健康检查超时。".to_string()
             } else {
                 format!("图像引擎健康检查失败: {error}")
             },
-            capabilities: image_studio_default_capabilities(),
+            capabilities: image_studio_default_capabilities(engine_kind),
         }),
     }
 }
@@ -6950,14 +6981,16 @@ async fn check_image_studio_engine(
 #[tauri::command]
 async fn proxy_image_studio_request(
     app: AppHandle,
+    engine: Option<String>,
     endpoint: String,
     path: String,
     method: String,
     body: Option<String>,
     stream_id: Option<String>,
 ) -> Result<ImageStudioProxyResponse, String> {
+    let engine_kind = normalize_image_studio_engine(engine.as_deref().unwrap_or("hidream_http"))?;
     let meth = method.trim().to_ascii_uppercase();
-    let url = build_image_studio_url(&endpoint, &path)?;
+    let url = build_image_studio_url(engine_kind, &endpoint, &path)?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(MODEL_REQUEST_TIMEOUT_SECS))
         .read_timeout(Duration::from_secs(STREAM_READ_TIMEOUT_SECS))
@@ -7185,6 +7218,22 @@ fn normalize_image_studio_output_file_name(file_name: &str) -> String {
     }
 }
 
+fn save_image_studio_output_bytes(
+    session_key: &str,
+    file_name: &str,
+    bytes: &[u8],
+) -> Result<String, String> {
+    let workspace = ensure_chat_temp_root(session_key)?;
+    let safe_name = normalize_image_studio_output_file_name(file_name);
+    let relative_path = format!("image-studio/{safe_name}");
+    let real_path = resolve_write_path(&relative_path, &workspace)?;
+    if let Some(parent) = real_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("创建图像输出目录失败: {e}"))?;
+    }
+    fs::write(&real_path, bytes).map_err(|e| format!("保存图像输出失败: {e}"))?;
+    Ok(real_path.to_string_lossy().to_string())
+}
+
 #[tauri::command]
 fn save_image_studio_output(
     session_key: String,
@@ -7192,15 +7241,67 @@ fn save_image_studio_output(
     data_url: String,
 ) -> Result<String, String> {
     let bytes = decode_image_studio_data_url(&data_url)?;
-    let workspace = ensure_chat_temp_root(&session_key)?;
-    let safe_name = normalize_image_studio_output_file_name(&file_name);
-    let relative_path = format!("image-studio/{safe_name}");
-    let real_path = resolve_write_path(&relative_path, &workspace)?;
-    if let Some(parent) = real_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("创建图像输出目录失败: {e}"))?;
+    save_image_studio_output_bytes(&session_key, &file_name, &bytes)
+}
+
+fn validate_image_studio_remote_image_url(image_url: &str) -> Result<url::Url, String> {
+    let parsed = url::Url::parse(image_url.trim())
+        .map_err(|e| format!("图像输出 URL 无效: {e}"))?;
+    if parsed.scheme() != "https" {
+        return Err("远程图像输出只允许 https URL".to_string());
     }
-    fs::write(&real_path, &bytes).map_err(|e| format!("保存图像输出失败: {e}"))?;
-    Ok(real_path.to_string_lossy().to_string())
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("远程图像输出 URL 不允许包含用户名或密码".to_string());
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "远程图像输出 URL 缺少主机名".to_string())?;
+    if !is_allowed_hugging_face_space_host(host) {
+        return Err("远程图像输出只允许 HiDream Hugging Face Space 文件 URL".to_string());
+    }
+    if !parsed.path().starts_with("/gradio_api/file=") {
+        return Err("远程图像输出 URL 不是受支持的 Gradio 文件地址".to_string());
+    }
+    Ok(parsed)
+}
+
+#[tauri::command]
+async fn save_image_studio_remote_output(
+    session_key: String,
+    file_name: String,
+    image_url: String,
+) -> Result<String, String> {
+    let url = validate_image_studio_remote_image_url(&image_url)?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .connect_timeout(Duration::from_secs(HTTP_CONNECT_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| format!("创建远程图像下载客户端失败: {e}"))?;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("下载远程图像失败: {e}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("下载远程图像失败: HTTP {status}"));
+    }
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    if !content_type.to_ascii_lowercase().starts_with("image/") {
+        return Err("远程输出不是图片内容".to_string());
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| format!("读取远程图像失败: {e}"))?;
+    if bytes.len() > 64 * 1024 * 1024 {
+        return Err("远程图像超过 64MB，未保存。".to_string());
+    }
+    save_image_studio_output_bytes(&session_key, &file_name, &bytes)
 }
 
 fn image_studio_temp_sessions_root() -> PathBuf {
@@ -9584,6 +9685,7 @@ pub fn run() {
             proxy_image_studio_request,
             cancel_image_studio_job,
             save_image_studio_output,
+            save_image_studio_remote_output,
             open_image_studio_output,
             start_chat_stream,
             cancel_chat_stream,

@@ -102,12 +102,13 @@ test("buildPersistedAppState keeps lightweight config/session metadata only", ()
     selectedNexusModeKey: "nexus_general",
     imageStudio: {
       config: {
-        engine: "hidream_http",
-        endpoint: "http://127.0.0.1:7860",
+        engine: "huggingface_space",
+        endpoint: "https://hidream-ai-hidream-o1-image-dev.hf.space",
         defaultSize: { width: 1024, height: 1024 },
         aspectRatio: "1:1",
         steps: 28,
-        guidanceScale: 5,
+        guidanceScale: 0,
+        promptRefine: true,
         seedMode: "random",
         seed: 32,
         outputDirectory: "",
@@ -150,7 +151,7 @@ test("buildPersistedAppState keeps lightweight config/session metadata only", ()
     Object.prototype.hasOwnProperty.call(persisted.sessionsByWorkspace["/repo"][0], "messages"),
     false,
   );
-  assert.equal(persisted.imageStudio?.config?.endpoint, "http://127.0.0.1:7860");
+  assert.equal(persisted.imageStudio?.config?.endpoint, "https://hidream-ai-hidream-o1-image-dev.hf.space");
 });
 
 test("stripLegacyRuntimeFieldsFromPersistedState removes heavy runtime keys and stale session payloads", () => {

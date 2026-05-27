@@ -252,11 +252,12 @@ import {
   checkImageStudioEngineStatus,
   createDefaultImageStudioRuntime,
   createInitialImageProgress,
+  getDefaultImageStudioEndpoint,
   normalizeImageStudioConfig,
   normalizeImageStudioRuntime,
   persistGeneratedImage,
-  startHiDreamGeneration,
-  streamHiDreamGeneration,
+  startImageStudioGeneration,
+  streamImageStudioGeneration,
   type ImageGenerationBlockPayload,
   type ImageGenerationParams,
   type ImageStudioConfig,
@@ -4553,6 +4554,9 @@ export const useAppStore = create<AppState>()(
         config: normalizeImageStudioConfig({
           ...s.imageStudio.config,
           ...patch,
+          endpoint: patch.engine && !Object.prototype.hasOwnProperty.call(patch, "endpoint")
+            ? getDefaultImageStudioEndpoint(patch.engine)
+            : patch.endpoint ?? s.imageStudio.config.endpoint,
           defaultSize: patch.defaultSize
             ? { ...s.imageStudio.config.defaultSize, ...patch.defaultSize }
             : s.imageStudio.config.defaultSize,
@@ -4898,10 +4902,12 @@ export const useAppStore = create<AppState>()(
             step: 0,
             total: params.steps,
             percent: 5,
-            message: language === "en" ? "Starting HiDream job" : "正在启动 HiDream 任务",
+            message: state.imageStudio.config.engine === "huggingface_space"
+              ? (language === "en" ? "Submitting to Hugging Face Space" : "正在提交到 Hugging Face Space")
+              : (language === "en" ? "Starting HiDream job" : "正在启动 HiDream 任务"),
           },
         });
-        const started = await startHiDreamGeneration({
+        const started = await startImageStudioGeneration({
           prompt,
           config: state.imageStudio.config,
           generationParams: params,
@@ -4927,7 +4933,7 @@ export const useAppStore = create<AppState>()(
           },
         }));
 
-        activeImageStudioStreamCleanup = await streamHiDreamGeneration({
+        activeImageStudioStreamCleanup = await streamImageStudioGeneration({
           config: state.imageStudio.config,
           jobId: started.jobId,
           streamId,

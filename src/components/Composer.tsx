@@ -500,7 +500,11 @@ export default function Composer({
         : "先把 `/brainstorm` 写成草稿，再在输入框里补充概念、支柱体验和目标受众。",
     },
   ] as const;
-  const imageStudioAspectOptions = ["1:1", "3:4", "4:3", "16:9", "9:16"] as const;
+  const imageStudioAspectOptions = ["1:1", "4:3", "3:4", "16:9", "9:16", "3:2", "2:3", "21:9", "9:21", "9:7", "7:9"] as const;
+  const isHuggingFaceImageEngine = imageStudio.config.engine === "huggingface_space";
+  const imageStudioEngineLabel = isHuggingFaceImageEngine
+    ? "Hugging Face Space"
+    : "HiDream HTTP";
   const imageStudioStatusLabel = imageStudio.status.state === "ready"
     ? (language === "en" ? "Ready" : "已就绪")
     : imageStudio.status.state === "error"
@@ -1676,7 +1680,7 @@ export default function Composer({
                     <div className="text-[12px] font-semibold" style={{ color: isLightTheme ? "#18181b" : "#f4f4f5" }}>
                       {language === "en" ? "Image Studio" : "图像工作室"}
                     </div>
-                    <div className="truncate text-[10px]" style={imageStudioMutedStyle}>{imageStudio.config.endpoint}</div>
+                    <div className="truncate text-[10px]" style={imageStudioMutedStyle}>{imageStudioEngineLabel} · {imageStudio.config.endpoint}</div>
                   </div>
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
@@ -1702,12 +1706,12 @@ export default function Composer({
                 </div>
               </div>
 
-              <div className="grid gap-3 md:grid-cols-[minmax(180px,1fr)_minmax(220px,1.2fr)_minmax(160px,0.9fr)]">
+              <div className={`grid gap-3 ${isHuggingFaceImageEngine ? "md:grid-cols-[minmax(240px,1.2fr)_minmax(180px,0.8fr)_minmax(180px,0.8fr)]" : "md:grid-cols-[minmax(180px,1fr)_minmax(220px,1.2fr)_minmax(160px,0.9fr)]"}`}>
                 <div>
                   <div className="mb-1 text-[10px] font-semibold uppercase tracking-[0.14em]" style={imageStudioMutedStyle}>
                     {language === "en" ? "Aspect" : "比例"}
                   </div>
-                  <div className="grid grid-cols-5 gap-1">
+                  <div className="grid grid-cols-4 gap-1 sm:grid-cols-6">
                     {imageStudioAspectOptions.map((ratio) => (
                       <button
                         key={ratio}
@@ -1726,36 +1730,54 @@ export default function Composer({
                   </div>
                 </div>
 
-                <div className="grid grid-cols-2 gap-3">
-                  <label className="min-w-0">
-                    <span className="mb-1 block text-[10px] font-semibold uppercase tracking-[0.14em]" style={imageStudioMutedStyle}>
-                      {language === "en" ? "Steps" : "步数"} · {imageStudio.config.steps}
-                    </span>
-                    <input
-                      type="range"
-                      min="1"
-                      max="80"
-                      step="1"
-                      value={imageStudio.config.steps}
-                      onChange={(event) => setImageStudioConfig({ steps: Number(event.target.value) })}
-                      className="w-full accent-[var(--accent)]"
-                    />
-                  </label>
-                  <label className="min-w-0">
-                    <span className="mb-1 block text-[10px] font-semibold uppercase tracking-[0.14em]" style={imageStudioMutedStyle}>
-                      CFG · {imageStudio.config.guidanceScale}
-                    </span>
-                    <input
-                      type="range"
-                      min="0"
-                      max="20"
-                      step="0.5"
-                      value={imageStudio.config.guidanceScale}
-                      onChange={(event) => setImageStudioConfig({ guidanceScale: Number(event.target.value) })}
-                      className="w-full accent-[var(--accent)]"
-                    />
-                  </label>
-                </div>
+                {isHuggingFaceImageEngine ? (
+                  <div>
+                    <div className="mb-1 text-[10px] font-semibold uppercase tracking-[0.14em]" style={imageStudioMutedStyle}>Prompt Refine</div>
+                    <button
+                      type="button"
+                      onClick={() => setImageStudioConfig({ promptRefine: !imageStudio.config.promptRefine })}
+                      className="h-8 w-full rounded-md border px-2 text-[10px] font-semibold transition-colors"
+                      style={{
+                        borderColor: imageStudio.config.promptRefine ? "var(--accent)" : (isLightTheme ? "#d4d4d8" : "#27272a"),
+                        backgroundColor: imageStudio.config.promptRefine ? "var(--accent-subtle)" : (isLightTheme ? "#f8fafc" : "#050507"),
+                        color: imageStudio.config.promptRefine ? (isLightTheme ? "var(--accent-hover)" : "var(--accent-light)") : (isLightTheme ? "#374151" : "#a1a1aa"),
+                      }}
+                    >
+                      {imageStudio.config.promptRefine ? (language === "en" ? "On" : "开启") : (language === "en" ? "Off" : "关闭")}
+                    </button>
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-2 gap-3">
+                    <label className="min-w-0">
+                      <span className="mb-1 block text-[10px] font-semibold uppercase tracking-[0.14em]" style={imageStudioMutedStyle}>
+                        {language === "en" ? "Steps" : "步数"} · {imageStudio.config.steps}
+                      </span>
+                      <input
+                        type="range"
+                        min="1"
+                        max="80"
+                        step="1"
+                        value={imageStudio.config.steps}
+                        onChange={(event) => setImageStudioConfig({ steps: Number(event.target.value) })}
+                        className="w-full accent-[var(--accent)]"
+                      />
+                    </label>
+                    <label className="min-w-0">
+                      <span className="mb-1 block text-[10px] font-semibold uppercase tracking-[0.14em]" style={imageStudioMutedStyle}>
+                        CFG · {imageStudio.config.guidanceScale}
+                      </span>
+                      <input
+                        type="range"
+                        min="0"
+                        max="20"
+                        step="0.5"
+                        value={imageStudio.config.guidanceScale}
+                        onChange={(event) => setImageStudioConfig({ guidanceScale: Number(event.target.value) })}
+                        className="w-full accent-[var(--accent)]"
+                      />
+                    </label>
+                  </div>
+                )}
 
                 <div>
                   <div className="mb-1 text-[10px] font-semibold uppercase tracking-[0.14em]" style={imageStudioMutedStyle}>Seed</div>
@@ -2083,7 +2105,7 @@ export default function Composer({
                 {isImageStudioMode ? (
                   <div className="flex items-center gap-1.5 ml-0.5" title={language === "en" ? "Image Studio bypasses LLM context and tool execution" : "图像工作室不占用 LLM 上下文，也不进入工具执行"}>
                     <IconZap className="h-3.5 w-3.5 text-[var(--accent-light)]" />
-                    <span>{imageStudio.config.steps} steps</span>
+                    <span>{isHuggingFaceImageEngine ? "HF Space" : `${imageStudio.config.steps} steps`}</span>
                   </div>
                 ) : activeProfile === "cloud" ? (
                   <div className="flex items-center gap-1.5 ml-0.5" title={cloudTokenTitle}>
