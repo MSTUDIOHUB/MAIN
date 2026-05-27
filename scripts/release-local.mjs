@@ -497,7 +497,8 @@ function validateMacUpdaterArchive({ rootDir, archivePath, appName }) {
 
 async function signUpdaterArtifact(rootDir, artifactPath) {
   await fs.rm(`${artifactPath}.sig`, { force: true });
-  run("npx", ["tauri", "signer", "sign", artifactPath], { cwd: rootDir });
+  const tauriCliPath = path.join(rootDir, "node_modules", "@tauri-apps/cli", "tauri.js");
+  run(process.execPath, [tauriCliPath, "signer", "sign", artifactPath], { cwd: rootDir });
 }
 
 async function buildMacAssets({ rootDir, version, assetsDir, skipBuild }) {
