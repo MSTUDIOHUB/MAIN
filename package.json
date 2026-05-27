@@ -9,7 +9,7 @@
     "lint": "tsc --noEmit",
     "preview": "vite preview",
     "tauri": "tauri",
-    "icon:app": "npx tauri icon public/LogoM_app.svg --output src-tauri/icons",
+    "icon:app": "node scripts/generate-icons.mjs",
     "build:desktop": "npm run tauri build",
     "build:mac": "npm run tauri build -- --bundles app,dmg",
     "build:mac:unsigned": "npm run tauri build -- --bundles app,dmg --no-sign",

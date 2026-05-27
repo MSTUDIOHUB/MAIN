@@ -270,7 +270,13 @@ function resolveLocalPath(rootDir, filePath) {
 }
 
 function signingKeyPath(options, rootDir) {
-  const keyFile = options.signingKeyFile || process.env.TAURI_SIGNING_PRIVATE_KEY_PATH || "";
+  let keyFile = options.signingKeyFile || process.env.TAURI_SIGNING_PRIVATE_KEY_PATH || "";
+  if (!keyFile) {
+    const homeDir = process.env.HOME || process.env.USERPROFILE || "";
+    if (homeDir) {
+      keyFile = path.join(homeDir, ".config", "main", "tauri-updater.key");
+    }
+  }
   return resolveLocalPath(rootDir, keyFile);
 }
 
