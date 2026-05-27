@@ -3426,7 +3426,7 @@ export default function ChatArea({
           {isImageStudioMode ? (
             <>
               <span className={`h-1.5 w-1.5 rounded-full ${imageStudio.status.state === "ready" ? "bg-green-500 shadow-[0_0_5px_#22c55e]" : isStreaming ? "bg-amber-400 shadow-[0_0_5px_#fbbf24] animate-pulse" : "bg-zinc-500"}`} />
-              {language === "en" ? "Image Engine" : "图像引擎"}: <span className="max-w-[180px] truncate font-normal text-[#a1a1aa]">{imageStudio.config.endpoint}</span>
+              {language === "en" ? "Image Engine" : "图像引擎"}: <span className="max-w-[180px] truncate font-normal text-[#a1a1aa]">{isHuggingFaceImageEngine ? (language === "en" ? "Online" : "在线") : imageStudio.config.endpoint}</span>
             </>
           ) : config.activeProfile === "local" ? (
             <>

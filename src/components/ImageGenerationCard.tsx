@@ -16,6 +16,31 @@ export default function ImageGenerationCard({
   const [restoredImageUrl, setRestoredImageUrl] = useState("");
   const themeMode = useAppStore((s) => s.config.themeMode);
   const isLight = themeMode === "light";
+  const imageStudio = useAppStore((s) => s.imageStudio);
+  const isHosted = block.params?.engine === "huggingface_space";
+
+  const [editablePrompt, setEditablePrompt] = useState(block.prompt || "");
+
+  useEffect(() => {
+    setEditablePrompt(block.prompt || "");
+  }, [block.prompt]);
+
+  const [cooldownSec, setCooldownSec] = useState(0);
+
+  useEffect(() => {
+    if (!isHosted || !imageStudio.cooldownUntil) {
+      setCooldownSec(0);
+      return;
+    }
+    const interval = setInterval(() => {
+      const remaining = Math.max(0, Math.ceil((imageStudio.cooldownUntil - Date.now()) / 1000));
+      setCooldownSec(remaining);
+      if (remaining === 0) {
+        clearInterval(interval);
+      }
+    }, 200);
+    return () => clearInterval(interval);
+  }, [isHosted, imageStudio.cooldownUntil]);
   const copy = useMemo(() => ({
     queued: language === "en" ? "Queued" : "排队中",
     running: language === "en" ? "Generating" : "生成中",
@@ -52,7 +77,6 @@ export default function ImageGenerationCard({
   const imageUrl = block.imageUrl || restoredImageUrl || block.previewUrl || "";
   const isFinished = block.status === "completed";
   const isError = block.status === "error";
-  const isHosted = block.params?.engine === "huggingface_space";
   const shellStyle = {
     backgroundColor: isLight ? "#ffffff" : "#09090b",
     borderColor: isLight ? "#d4d4d8" : "#27272a",
@@ -87,9 +111,23 @@ export default function ImageGenerationCard({
         <div className="space-y-3">
           <div>
             <div className="mb-1 text-[10px] font-semibold uppercase tracking-[0.16em]" style={mutedStyle}>{copy.prompt}</div>
-            <div className="whitespace-pre-wrap break-words rounded-md border p-3 text-[12px] leading-relaxed" style={{ ...panelStyle, color: isLight ? "#111827" : "#d4d4d8" }}>
-              {block.prompt}
-            </div>
+            {isFinished || isError || block.status === "canceled" ? (
+              <textarea
+                value={editablePrompt}
+                onChange={(e) => setEditablePrompt(e.target.value)}
+                className="w-full resize-y rounded-md border p-3 text-[12px] leading-relaxed outline-none focus:border-[var(--accent)]"
+                style={{
+                  ...panelStyle,
+                  color: isLight ? "#111827" : "#d4d4d8",
+                  minHeight: "80px",
+                }}
+                rows={3}
+              />
+            ) : (
+              <div className="whitespace-pre-wrap break-words rounded-md border p-3 text-[12px] leading-relaxed" style={{ ...panelStyle, color: isLight ? "#111827" : "#d4d4d8" }}>
+                {block.prompt}
+              </div>
+            )}
           </div>
           <div>
             <div className="mb-1 text-[10px] font-semibold uppercase tracking-[0.16em]" style={mutedStyle}>{copy.params}</div>
@@ -129,11 +167,14 @@ export default function ImageGenerationCard({
             {onRegenerate && (
               <button
                 type="button"
-                onClick={() => onRegenerate(block.prompt)}
-                className="inline-flex h-8 items-center gap-1.5 rounded-md border border-[var(--accent-subtle-border)] px-3 text-[11px] text-[var(--accent-light)] transition-colors hover:bg-[var(--accent-subtle)]"
+                disabled={cooldownSec > 0}
+                onClick={() => onRegenerate(editablePrompt)}
+                className="inline-flex h-8 items-center gap-1.5 rounded-md border border-[var(--accent-subtle-border)] px-3 text-[11px] text-[var(--accent-light)] transition-colors hover:bg-[var(--accent-subtle)] disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 <IconRefresh className="h-3.5 w-3.5" />
-                {copy.regenerate}
+                {cooldownSec > 0 
+                  ? (language === "en" ? `Cooldown ${cooldownSec}s` : `冷却中 ${cooldownSec}秒`)
+                  : copy.regenerate}
               </button>
             )}
           </div>

@@ -505,6 +505,23 @@ export default function Composer({
   const imageStudioEngineLabel = isHuggingFaceImageEngine
     ? "Hugging Face Space"
     : "HiDream HTTP";
+
+  const [cooldownSec, setCooldownSec] = useState(0);
+
+  useEffect(() => {
+    if (!isImageStudioMode || !isHuggingFaceImageEngine || !imageStudio.cooldownUntil) {
+      setCooldownSec(0);
+      return;
+    }
+    const interval = setInterval(() => {
+      const remaining = Math.max(0, Math.ceil((imageStudio.cooldownUntil - Date.now()) / 1000));
+      setCooldownSec(remaining);
+      if (remaining === 0) {
+        clearInterval(interval);
+      }
+    }, 200);
+    return () => clearInterval(interval);
+  }, [isImageStudioMode, isHuggingFaceImageEngine, imageStudio.cooldownUntil]);
   const imageStudioStatusLabel = imageStudio.status.state === "ready"
     ? (language === "en" ? "Ready" : "已就绪")
     : imageStudio.status.state === "error"
@@ -1680,7 +1697,11 @@ export default function Composer({
                     <div className="text-[12px] font-semibold" style={{ color: isLightTheme ? "#18181b" : "#f4f4f5" }}>
                       {language === "en" ? "Image Studio" : "图像工作室"}
                     </div>
-                    <div className="truncate text-[10px]" style={imageStudioMutedStyle}>{imageStudioEngineLabel} · {imageStudio.config.endpoint}</div>
+                    <div className="truncate text-[10px]" style={imageStudioMutedStyle}>
+                      {isHuggingFaceImageEngine 
+                        ? (language === "en" ? "Online" : "在线") 
+                        : `${imageStudioEngineLabel} · ${imageStudio.config.endpoint}`}
+                    </div>
                   </div>
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
@@ -2269,11 +2290,15 @@ export default function Composer({
                 ) : (
                   <button
                     data-testid="composer-send-button"
-                    disabled={isComposerSubmitting || (!draftInput.trim() && contextMentions.length === 0 && attachedFiles.length === 0 && pendingImages.length === 0)}
+                    disabled={isComposerSubmitting || cooldownSec > 0 || (!draftInput.trim() && contextMentions.length === 0 && attachedFiles.length === 0 && pendingImages.length === 0)}
                     onClick={handleSubmitComposerMessage}
                     className="bg-[#09090b] border border-[#27272a] text-[#a1a1aa] hover:bg-white hover:text-black w-8 h-8 flex items-center justify-center rounded-md transition-colors disabled:opacity-50 shadow-sm"
                   >
-                    <IconArrowUp className="w-4 h-4" />
+                    {cooldownSec > 0 ? (
+                      <span className="text-[10px] font-semibold text-amber-500 tabular-nums">{cooldownSec}s</span>
+                    ) : (
+                      <IconArrowUp className="w-4 h-4" />
+                    )}
                   </button>
                 )
               )}

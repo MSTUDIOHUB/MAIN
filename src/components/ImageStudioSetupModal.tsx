@@ -118,8 +118,8 @@ export default function ImageStudioSetupModal() {
 
   return createPortal(
     <div className="fixed inset-0 z-[120] flex items-center justify-center bg-black/55 px-4 py-6 backdrop-blur-sm">
-      <div className="w-full max-w-3xl overflow-hidden rounded-xl border shadow-2xl" style={panelStyle} role="dialog" aria-modal="true">
-        <div className="flex items-start justify-between gap-4 border-b px-5 py-4" style={{ borderColor: panelStyle.borderColor }}>
+      <div className="w-full max-w-3xl flex flex-col max-h-[80vh] overflow-hidden rounded-xl border shadow-2xl" style={panelStyle} role="dialog" aria-modal="true">
+        <div className="flex flex-shrink-0 items-start justify-between gap-4 border-b px-5 py-4" style={{ borderColor: panelStyle.borderColor }}>
           <div className="min-w-0">
             <div className="flex items-center gap-2">
               <div className="flex h-8 w-8 items-center justify-center rounded-md border border-[var(--accent-subtle-border)] bg-[var(--accent-subtle)] text-[var(--accent-light)]">
@@ -144,8 +144,8 @@ export default function ImageStudioSetupModal() {
           </button>
         </div>
 
-        <div className="grid gap-0 md:grid-cols-[13rem_1fr]">
-          <div className="border-b p-3 md:border-b-0 md:border-r" style={{ borderColor: panelStyle.borderColor }}>
+        <div className="grid gap-0 md:grid-cols-[13rem_1fr] flex-1 overflow-hidden">
+          <div className="border-b p-3 md:border-b-0 md:border-r overflow-y-auto" style={{ borderColor: panelStyle.borderColor }}>
             {[
               ["detect", copy.detect, IconRefresh],
               ["connect", copy.connect, IconSettings],
@@ -167,34 +167,36 @@ export default function ImageStudioSetupModal() {
             ))}
           </div>
 
-          <div className="space-y-4 p-5">
-            <div className="rounded-lg border p-3" style={{ borderColor: panelStyle.borderColor, backgroundColor: isLight ? "#f8fafc" : "#050507" }}>
-              <div className="mb-2 text-[11px] font-semibold uppercase tracking-[0.14em]" style={mutedStyle}>{copy.engine}</div>
-              <div className="grid gap-2 sm:grid-cols-2">
-                {[
-                  ["huggingface_space", copy.hfEngine, copy.hfEngineDesc],
-                  ["hidream_http", copy.localEngine, copy.localEngineDesc],
-                ].map(([engine, label, desc]) => {
-                  const selected = imageStudio.config.engine === engine;
-                  return (
-                    <button
-                      key={engine}
-                      type="button"
-                      onClick={() => setEngine(engine as ImageStudioEngineKey)}
-                      className="rounded-md border p-3 text-left transition-colors"
-                      style={{
-                        borderColor: selected ? "var(--accent)" : panelStyle.borderColor,
-                        backgroundColor: selected ? "var(--accent-subtle)" : (isLight ? "#ffffff" : "#09090b"),
-                        color: selected ? (isLight ? "var(--accent-hover)" : "var(--accent-light)") : undefined,
-                      }}
-                    >
-                      <div className="text-[12px] font-semibold">{label}</div>
-                      <div className="mt-1 text-[11px] leading-relaxed" style={selected ? undefined : mutedStyle}>{desc}</div>
-                    </button>
-                  );
-                })}
+          <div className="space-y-4 p-5 overflow-y-auto">
+            {tab !== "manual" && (
+              <div className="rounded-lg border p-3" style={{ borderColor: panelStyle.borderColor, backgroundColor: isLight ? "#f8fafc" : "#050507" }}>
+                <div className="mb-2 text-[11px] font-semibold uppercase tracking-[0.14em]" style={mutedStyle}>{copy.engine}</div>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  {[
+                    ["huggingface_space", copy.hfEngine, copy.hfEngineDesc],
+                    ["hidream_http", copy.localEngine, copy.localEngineDesc],
+                  ].map(([engine, label, desc]) => {
+                    const selected = imageStudio.config.engine === engine;
+                    return (
+                      <button
+                        key={engine}
+                        type="button"
+                        onClick={() => setEngine(engine as ImageStudioEngineKey)}
+                        className="rounded-md border p-3 text-left transition-colors"
+                        style={{
+                          borderColor: selected ? "var(--accent)" : panelStyle.borderColor,
+                          backgroundColor: selected ? "var(--accent-subtle)" : (isLight ? "#ffffff" : "#09090b"),
+                          color: selected ? (isLight ? "var(--accent-hover)" : "var(--accent-light)") : undefined,
+                        }}
+                      >
+                        <div className="text-[12px] font-semibold">{label}</div>
+                        <div className="mt-1 text-[11px] leading-relaxed" style={selected ? undefined : mutedStyle}>{desc}</div>
+                      </button>
+                    );
+                  })}
+                </div>
               </div>
-            </div>
+            )}
 
             {tab === "detect" && (
               <div className="space-y-4">

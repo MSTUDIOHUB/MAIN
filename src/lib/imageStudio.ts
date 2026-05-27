@@ -46,6 +46,7 @@ export interface ImageStudioRuntime {
   setupGuideOpen: boolean;
   activeJobId: string | null;
   activeStreamId: string | null;
+  cooldownUntil?: number;
 }
 
 export interface ImageGenerationParams {
@@ -132,6 +133,7 @@ export function createDefaultImageStudioRuntime(): ImageStudioRuntime {
     setupGuideOpen: false,
     activeJobId: null,
     activeStreamId: null,
+    cooldownUntil: 0,
   };
 }
 
@@ -184,6 +186,7 @@ export function normalizeImageStudioRuntime(input: unknown): ImageStudioRuntime 
     setupGuideOpen: raw.setupGuideOpen === true,
     activeJobId: typeof raw.activeJobId === "string" ? raw.activeJobId : null,
     activeStreamId: typeof raw.activeStreamId === "string" ? raw.activeStreamId : null,
+    cooldownUntil: typeof raw.cooldownUntil === "number" ? raw.cooldownUntil : 0,
   };
 }
 

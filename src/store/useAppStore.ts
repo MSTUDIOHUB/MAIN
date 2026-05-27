@@ -4602,6 +4602,28 @@ export const useAppStore = create<AppState>()(
     if (get().isGenerating) return false;
 
     const state = get();
+    if (state.imageStudio.config.engine === "huggingface_space") {
+      const now = Date.now();
+      const cooldownUntil = state.imageStudio.cooldownUntil || 0;
+      if (now < cooldownUntil) {
+        const remainingSec = Math.ceil((cooldownUntil - now) / 1000);
+        const errMsg = state.config.language === "en"
+          ? `Hugging Face generation is cooling down. Please wait ${remainingSec}s.`
+          : `Hugging Face 在线生成冷却中，请等待 ${remainingSec} 秒。`;
+        set((s) => ({
+          imageStudio: {
+            ...s.imageStudio,
+            status: {
+              ...s.imageStudio.status,
+              state: "error",
+              message: errMsg,
+            },
+          },
+        }));
+        return false;
+      }
+    }
+
     const language = state.config.language === "en" ? "en" : "zh";
     const sessionScopeKey = resolveSessionWorkspaceKey(state.currentWorkspace);
     let ensuredSessionId = state.currentSessionId;
@@ -4774,6 +4796,7 @@ export const useAppStore = create<AppState>()(
       }));
     };
     const finishTurn = (status: ConversationTurnStatus, summary: string) => {
+      const isHF = get().imageStudio.config.engine === "huggingface_space";
       set((s) => ({
         isGenerating: false,
         abortController: null,
@@ -4782,6 +4805,7 @@ export const useAppStore = create<AppState>()(
           ...s.imageStudio,
           activeJobId: null,
           activeStreamId: null,
+          ...(isHF ? { cooldownUntil: Date.now() + 15000 } : {}),
         },
         conversationTurns: s.conversationTurns.map((turn) =>
           turn.id === turnId ? { ...turn, status, summary } : turn
