@@ -19,10 +19,10 @@ if (process.platform === "win32") {
 }
 
 console.log("> tsc");
-const tscResult = spawnSync("tsc", [], {
+const tscBin = path.join(rootDir, "node_modules", "typescript", "bin", "tsc");
+const tscResult = spawnSync(process.execPath, [tscBin], {
   cwd: rootDir,
   env,
-  shell: true,
   stdio: "inherit",
 });
 
@@ -32,10 +32,10 @@ if (tscResult.status !== 0) {
 }
 
 console.log("> vite build");
-const viteResult = spawnSync("vite", ["build"], {
+const viteBin = path.join(rootDir, "node_modules", "vite", "bin", "vite.js");
+const viteResult = spawnSync(process.execPath, [viteBin, "build"], {
   cwd: rootDir,
   env,
-  shell: true,
   stdio: "inherit",
 });
 
