@@ -8,12 +8,13 @@ const rootDir = path.resolve(__dirname, "..");
 const inputIcon = path.join(rootDir, "public", "LogoM_app.svg");
 const outputDir = path.join(rootDir, "src-tauri", "icons");
 
-const npx = process.platform === "win32" ? "npx.cmd" : "npx";
+const tauriCliPath = path.join(rootDir, "node_modules", "@tauri-apps/cli", "tauri.js");
 
 console.log(`Generating app icons from: ${inputIcon}`);
 console.log(`Output directory: ${outputDir}`);
+console.log(`Running Tauri CLI via: ${process.execPath} ${tauriCliPath}`);
 
-const result = spawnSync(npx, ["tauri", "icon", inputIcon, "--output", outputDir], {
+const result = spawnSync(process.execPath, [tauriCliPath, "icon", inputIcon, "--output", outputDir], {
   cwd: rootDir,
   stdio: "inherit",
 });
