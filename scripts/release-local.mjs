@@ -297,6 +297,10 @@ async function loadSigningEnvironment(options, rootDir) {
   if (process.env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD === undefined) {
     process.env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD = "";
   }
+
+  if (process.env.TAURI_SIGNING_PRIVATE_KEY) {
+    delete process.env.TAURI_SIGNING_PRIVATE_KEY_PATH;
+  }
 }
 
 async function ensureUpdaterPublicKeyMatches(options, rootDir) {
