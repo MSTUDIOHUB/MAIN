@@ -81,6 +81,7 @@ import {
   resolveTurnResponseLanguage,
   summarizeAssistantText,
   summarizeUserPrompt,
+  syncPlanTaskCheckboxesFromTrustedTasks,
   validatePlanArtifactContent,
 } from "../lib/workflowModels";
 import {
@@ -1290,6 +1291,7 @@ interface AppState {
   upsertPlanArtifact: (artifact: PlanArtifact) => void;
   clearPlanArtifacts: () => void;
   deletePersistedPlanFiles: () => Promise<void>;
+  deleteBrowserValidationArtifacts: () => Promise<void>;
   setPlanTasks: (tasks: PlanTask[]) => void;
   setNormalizedStreamState: (state: NormalizedStreamState) => void;
   approvePlan: (approvalChoice?: string) => void;
@@ -6191,6 +6193,22 @@ export const useAppStore = create<AppState>()(
       get().bumpWorkspaceContentVersion();
     }
   },
+  deleteBrowserValidationArtifacts: async () => {
+    const state = get();
+    const sessionKey = !state.currentWorkspace.trim()
+      ? resolveGlobalChatSessionKey(state.currentSessionId)
+      : null;
+    try {
+      if (sessionKey) {
+        await deleteChatTempPath(sessionKey, ".MAIN/browser-validation");
+      } else {
+        await deleteWorkspacePath(".MAIN/browser-validation", state.currentWorkspace || undefined);
+      }
+    } finally {
+      invalidateWorkspaceTreeCache();
+      get().bumpWorkspaceContentVersion();
+    }
+  },
   setPlanTasks: (tasks) => set((s) => ({
     planTasks: reconcilePlanTaskCompletion(
       s.planTasks,
@@ -7296,6 +7314,7 @@ export const useAppStore = create<AppState>()(
             undefined,
             {
               hidden: true,
+              createVisibleTurnForHiddenMessage: true,
               reuseCurrentTurn: false,
               uiParentTurnId: planExecutionResumeContinuationTarget?.id || state.currentTurnId || undefined,
               preservePlanState: true,
@@ -10531,6 +10550,7 @@ export const useAppStore = create<AppState>()(
           const isEphemeralPlanArtifactTool =
             (toolName === "write_file" || toolName === "replace_in_file" || toolName === "apply_patch") &&
             isEphemeralPlanArtifactPath(target);
+          let tasksArtifactSyncRequest: { path: string; content: string } | null = null;
           let completedProgressForEvent = null as ProgressNarration | null;
           sessionSet((s) => {
             const idx = findToolLifecycleBlockIndex({
@@ -10637,6 +10657,44 @@ export const useAppStore = create<AppState>()(
               hypothesisStatus: doneProgress.hypothesisStatus,
               sourceToolCallIds: doneProgress.sourceToolCallIds,
             });
+            const normalizedPlanTasks = evidenceChanged
+              ? normalizePlanTaskStatuses(
+                  s.planTasks,
+                  nextEvidenceLedger,
+                  true,
+                )
+              : s.planTasks;
+            let nextPlanArtifacts = s.planArtifacts;
+            if (evidenceChanged) {
+              const tasksArtifact = s.planArtifacts.find((artifact) => artifact.kind === "tasks");
+              if (tasksArtifact) {
+                const syncedContent = syncPlanTaskCheckboxesFromTrustedTasks(
+                  tasksArtifact.content,
+                  normalizedPlanTasks,
+                );
+                if (syncedContent !== tasksArtifact.content) {
+                  const syncedArtifact = {
+                    ...tasksArtifact,
+                    content: syncedContent,
+                    updatedAt: Date.now(),
+                  };
+                  nextPlanArtifacts = s.planArtifacts
+                    .map((artifact) => artifact.path === tasksArtifact.path ? syncedArtifact : artifact)
+                    .sort((a, b) => a.updatedAt - b.updatedAt);
+                  tasksArtifactSyncRequest = {
+                    path: tasksArtifact.path,
+                    content: syncedContent,
+                  };
+                  logStoreEvent("plan_tasks_checkbox_sync_scheduled", {
+                    turnId,
+                    path: tasksArtifact.path,
+                    evidenceCount: nextEvidenceLedger.length,
+                    completedTasks: normalizedPlanTasks.filter((task) => task.status === "completed").length,
+                    totalTasks: normalizedPlanTasks.length,
+                  });
+                }
+              }
+            }
 
             return {
               taskFlow: nextTaskFlow,
@@ -10658,15 +10716,31 @@ export const useAppStore = create<AppState>()(
                 ? {
                     planExecutionEvidenceLedger: nextEvidenceLedger,
                     planExecutionEvidenceCount: nextEvidenceLedger.length,
-                    planTasks: normalizePlanTaskStatuses(
-                      s.planTasks,
-                      nextEvidenceLedger,
-                      true,
-                    ),
+                    planTasks: normalizedPlanTasks,
+                    ...(nextPlanArtifacts !== s.planArtifacts ? { planArtifacts: nextPlanArtifacts } : {}),
                   }
                 : {}),
             };
           });
+          const syncRequest = tasksArtifactSyncRequest as { path: string; content: string } | null;
+          if (syncRequest) {
+            void writeFile(
+              syncRequest.path,
+              syncRequest.content,
+              runWorkspace || undefined,
+            ).then(() => {
+              logStoreEvent("plan_tasks_checkbox_synced", {
+                turnId,
+                path: syncRequest.path,
+              });
+            }).catch((error) => {
+              logStoreEvent("plan_tasks_checkbox_sync_failed", {
+                turnId,
+                path: syncRequest.path,
+                error: error instanceof Error ? error.message : String(error),
+              });
+            });
+          }
           const completedProgressEventPayload = completedProgressForEvent;
           if (completedProgressEventPayload) {
             emitProgressRuntimeEvent(completedProgressEventPayload, {

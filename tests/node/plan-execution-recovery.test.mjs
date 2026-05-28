@@ -540,6 +540,22 @@ test("approved plan browser validation repeats are reused or paused without agen
   );
 });
 
+test("approved plan repeated edits route to validation recovery before pausing", () => {
+  const orchestratorSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator.ts"),
+    "utf8",
+  );
+
+  assert.match(orchestratorSource, /repeatedEditValidationRecoveryAttempts/);
+  assert.match(orchestratorSource, /activateExecuteRecovery\("validation_only",\s*"repeat_edit_target_without_validation"/);
+  assert.match(orchestratorSource, /buildExecuteValidationRecoveryPrompt/);
+  assert.match(orchestratorSource, /repeat_edit_target_validation_recovery/);
+  assert.match(
+    orchestratorSource,
+    /validationRecoveryAttempts:\s*repeatedEditValidationRecoveryAttempts/,
+  );
+});
+
 test("approved plan no-tool prose is preserved unless it is a rejected completion claim", () => {
   const orchestratorSource = fsSync.readFileSync(
     path.join(workspaceRoot, "src/lib/orchestrator.ts"),

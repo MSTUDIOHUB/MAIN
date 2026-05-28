@@ -107,6 +107,7 @@ const {
   resolvePinnedConversationTurn,
   shouldPlanShortcutReplaceTurn,
   summarizeUserPrompt,
+  syncPlanTaskCheckboxesFromTrustedTasks,
   validateActionablePlanArtifact,
   validatePlanArtifactContent,
 } = loadWorkflowModelsModule();
@@ -673,6 +674,28 @@ test("reconcilePlanTaskCompletion only completes tasks with matching execution e
   assert.equal(snakeTask.status, "completed");
   assert.equal(readmeTask.status, "in_progress");
   assert.equal(readmeTask.evidenceStatus, "missing");
+});
+
+test("syncPlanTaskCheckboxesFromTrustedTasks mirrors trusted evidence without trusting claims", () => {
+  const markdown = [
+    "# Tasks",
+    "- [ ] 实现 snake.py — 证据: file:snake.py",
+    "- [x] 创建 README.md — 证据: file:README.md",
+  ].join("\n");
+  const parsed = extractPlanTasks(markdown);
+  const trustedTasks = reconcilePlanTaskCompletion([], parsed, [{
+    id: "evidence-1",
+    kind: "file",
+    value: "snake.py",
+    target: "snake.py",
+    sourceTool: "write_file",
+    createdAt: 1,
+  }]);
+
+  const synced = syncPlanTaskCheckboxesFromTrustedTasks(markdown, trustedTasks);
+
+  assert.match(synced, /- \[x\] 实现 snake\.py/);
+  assert.match(synced, /- \[ \] 创建 README\.md/);
 });
 
 test("plan evidence ignores plan-file writes and identical write_file no-ops", () => {

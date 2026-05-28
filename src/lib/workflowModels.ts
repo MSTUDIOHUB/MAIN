@@ -1338,6 +1338,36 @@ export function buildPlanTaskEvidenceAudit(input: {
   };
 }
 
+export function syncPlanTaskCheckboxesFromTrustedTasks(
+  markdown: string,
+  trustedTasks: PlanTask[],
+): string {
+  if (!String(markdown || "").trim() || trustedTasks.length === 0) return markdown;
+
+  const tasksById = new Map(trustedTasks.map((task) => [task.id, task]));
+  const tasksByIdentity = new Map(trustedTasks.map((task) => [getPlanTaskIdentity(task), task]));
+  let changed = false;
+  const nextLines = markdown.split(/\r?\n/).map((line) => {
+    const matched = line.match(/^(\s*[-*]\s+\[)([ xX])(\]\s+.+)$/);
+    if (!matched) return line;
+
+    const parsedTask = extractPlanTasks(line)[0];
+    if (!parsedTask) return line;
+
+    const trusted =
+      tasksById.get(parsedTask.id) ||
+      tasksByIdentity.get(getPlanTaskIdentity(parsedTask));
+    if (!trusted) return line;
+
+    const nextMark = isPlanTaskTrustedComplete(trusted) ? "x" : " ";
+    if ((matched[2] || " ").toLowerCase() === nextMark) return line;
+    changed = true;
+    return `${matched[1]}${nextMark}${matched[3]}`;
+  });
+
+  return changed ? nextLines.join("\n") : markdown;
+}
+
 export function getPendingPlanTaskCommandFocus(
   tasks: PlanTask[],
   maxTasks = 3,

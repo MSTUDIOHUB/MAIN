@@ -880,6 +880,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     rejectPlanAndDeleteFiles,
     sendMessage,
     deletePersistedPlanFiles,
+    deleteBrowserValidationArtifacts,
     agentStatus,
     config,
     isPlanApproved,
@@ -904,6 +905,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     rejectPlanAndDeleteFiles: useAppStore((s) => s.rejectPlanAndDeleteFiles),
     sendMessage: useAppStore((s) => s.sendMessage),
     deletePersistedPlanFiles: useAppStore((s) => s.deletePersistedPlanFiles),
+    deleteBrowserValidationArtifacts: useAppStore((s) => s.deleteBrowserValidationArtifacts),
     agentStatus: useAppStore((s) => s.agentStatus),
     config: useAppStore((s) => s.config),
     isPlanApproved: useAppStore((s) => s.isPlanApproved),
@@ -1025,6 +1027,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
       undefined,
       {
         hidden: true,
+        createVisibleTurnForHiddenMessage: true,
         reuseCurrentTurn: false,
         preservePlanState: true,
         resolvedIntent: "plan",
@@ -1162,6 +1165,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
               fallbackTitle={latestPlanTurn?.title}
               fallbackUpdatedAt={latestPlanTurn?.createdAt}
               onDeletePlanFiles={deletePersistedPlanFiles}
+              onDeleteBrowserValidationFiles={deleteBrowserValidationArtifacts}
               onContinuePlanning={handleContinuePlanning}
               onResumeExecution={handleResumeExecution}
               onSaveDocument={handleSavePlanDocument}

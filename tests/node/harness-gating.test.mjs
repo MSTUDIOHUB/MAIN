@@ -103,6 +103,25 @@ test("buildShellReadValidationError blocks command starting with cat/head/tail/s
   assert.equal(okLs, null);
 });
 
+test("orchestrator reports shell-read misuse before shell metadata errors", () => {
+  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8");
+  const shellReadIndex = source.indexOf("const shellReadValidationErrorBeforeContract = buildShellReadValidationError");
+  const contractIndex = source.indexOf("const validationError = validateToolExecutionContract");
+
+  assert.ok(shellReadIndex > 0);
+  assert.ok(contractIndex > 0);
+  assert.ok(shellReadIndex < contractIndex);
+});
+
+test("plan artifact quality gate only validates mutation tools", () => {
+  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8");
+
+  assert.match(
+    source,
+    /if \(kind && kind !== "tasks" && PLAN_ARTIFACT_MUTATION_TOOLS\.has\(tc\.name\)\)/,
+  );
+});
+
 test("buildLoopDetectionValidationError blocks repetitive writes on the same file path", () => {
   const readCall = {
     id: "call_read_1",

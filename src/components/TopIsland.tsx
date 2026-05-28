@@ -203,10 +203,10 @@ const TopIsland = memo(function TopIsland({
   // endregion
   const completedCount = progressItems.filter((item) => item.complete).length;
   const progress = progressItems.length > 0 ? Math.round((completedCount / progressItems.length) * 100) : 0;
-  const currentPlanTaskId = useMemo(() => {
-    if (activeProgressMode !== "plan") return null;
-    const firstIncomplete = auditedPlanTasks.find((task) => !(task.evidenceStatus === "satisfied" && task.status === "completed")) || auditedPlanTasks[auditedPlanTasks.length - 1];
-    return firstIncomplete?.id || null;
+  const currentPlanTaskIndex = useMemo(() => {
+    if (activeProgressMode !== "plan" || auditedPlanTasks.length === 0) return -1;
+    const firstIncompleteIndex = auditedPlanTasks.findIndex((task) => !(task.evidenceStatus === "satisfied" && task.status === "completed"));
+    return firstIncompleteIndex >= 0 ? firstIncompleteIndex : auditedPlanTasks.length - 1;
   }, [activeProgressMode, auditedPlanTasks]);
   const visibleTasks = shouldCompactTasksForReview ? [] : progressItems;
 
@@ -284,6 +284,16 @@ const TopIsland = memo(function TopIsland({
     : isBlackTheme
     ? "bg-[rgba(255,255,255,0.025)] border-[#17171c]"
     : "bg-[rgba(255,255,255,0.04)] border-[#1f1f23]";
+  const taskRowClass = themeMode === "light"
+    ? "border-[rgba(15,23,42,0.10)] bg-[rgba(255,255,255,0.68)]"
+    : isBlackTheme
+    ? "border-[#202026] bg-[#030304]"
+    : "border-[#202026] bg-[#09090b]";
+  const currentTaskRowClass = themeMode === "light"
+    ? "border-[color-mix(in_srgb,var(--accent-hover)_48%,rgba(15,23,42,0.12))] bg-[rgba(255,255,255,0.68)] shadow-[inset_3px_0_0_color-mix(in_srgb,var(--accent-hover)_72%,transparent)]"
+    : isBlackTheme
+    ? "border-[color-mix(in_srgb,var(--accent-light)_46%,#202026)] bg-[#030304] shadow-[inset_3px_0_0_color-mix(in_srgb,var(--accent-light)_72%,transparent)]"
+    : "border-[color-mix(in_srgb,var(--accent-light)_46%,#202026)] bg-[#09090b] shadow-[inset_3px_0_0_color-mix(in_srgb,var(--accent-light)_72%,transparent)]";
   const normalizedCustomReply = customReplyText.replace(/\s+/g, " ").trim();
   const normalizedPlanAdjustment = planAdjustmentText.replace(/\s+/g, " ").trim();
   const showChoicePromptContent = !isChoicePromptManuallyCollapsed;
@@ -562,15 +572,13 @@ const TopIsland = memo(function TopIsland({
                 {!shouldCompactTasksForReview && (
                 <div className="mt-3 max-h-[220px] space-y-2 overflow-y-auto pr-1">
                   {visibleTasks.map((task, index) => {
-                    const isCurrentPlanTask = activeProgressMode === "plan" && task.id === currentPlanTaskId && !task.complete;
+                    const isCurrentPlanTask = activeProgressMode === "plan" && index === currentPlanTaskIndex && !task.complete;
                     return (
                       <div
-                        key={task.id}
+                        key={`${task.id}-${index}`}
                         data-testid={isCurrentPlanTask ? "top-island-current-plan-task" : undefined}
-                        className={`flex items-start gap-3 rounded-xl px-3 py-2 ${
-                          isCurrentPlanTask
-                            ? "theme-plan-surface border"
-                            : "bg-[rgba(0,0,0,0.18)]"
+                        className={`flex items-start gap-3 rounded-xl border px-3 py-2 transition-colors ${
+                          isCurrentPlanTask ? currentTaskRowClass : taskRowClass
                         }`}
                       >
                         <span

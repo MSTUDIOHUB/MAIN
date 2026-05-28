@@ -212,6 +212,48 @@ test("runtime progress projection keeps latest status and only recent four detai
   assert.match(projection.activityText, /第 5 个目标/);
 });
 
+test("runtime progress projection lets later browser validation success clear stale failure", () => {
+  const events = [
+    withEventSchema({
+      type: "progress.updated",
+      threadId: "thread-a",
+      turnId: "turn-a",
+      timestampMs: 10,
+      progress: {
+        phase: "verifying",
+        title: "验证浏览器页面 `http://127.0.0.1:1420/`",
+        status: "failed",
+        summary: "browser_evaluate timed out after 60000ms",
+        target: "http://127.0.0.1:1420/",
+        tool: "browser_evaluate",
+      },
+    }),
+    withEventSchema({
+      type: "progress.updated",
+      threadId: "thread-a",
+      turnId: "turn-a",
+      timestampMs: 20,
+      progress: {
+        phase: "verifying",
+        title: "验证浏览器页面 `http://127.0.0.1:1420/`",
+        status: "done",
+        summary: "浏览器验证已通过。",
+        target: "http://127.0.0.1:1420/",
+        tool: "browser_evaluate",
+      },
+    }),
+  ];
+
+  const items = buildRuntimeProgressLedger({ events, turnId: "turn-a", language: "zh", maxItems: 12 });
+  const projection = buildRuntimeProgressProjection(items, "zh", 4);
+
+  assert.equal(items.length, 1);
+  assert.equal(items[0].status, "done");
+  assert.equal(projection.latest.status, "done");
+  assert.doesNotMatch(projection.activityText, /timed out/);
+  assert.match(projection.activityText, /浏览器验证已通过/);
+});
+
 test("runtime pause projection hides raw repeated read diagnostics", () => {
   const event = withEventSchema({
     type: "run.paused",

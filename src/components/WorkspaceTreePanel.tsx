@@ -177,6 +177,7 @@ export default function WorkspaceTreePanel({
 }: WorkspaceTreePanelProps) {
   const storeOpenFileViewer = useAppStore((s) => s.openFileViewer);
   const deletePersistedPlanFiles = useAppStore((s) => s.deletePersistedPlanFiles);
+  const deleteBrowserValidationArtifacts = useAppStore((s) => s.deleteBrowserValidationArtifacts);
   const workspaceContentVersion = useAppStore((s) => s.workspaceContentVersion);
   const themeMode = useAppStore((s) => s.config.themeMode);
   const [treeNodesByPath, setTreeNodesByPath] = useState<Record<string, FileNode[]>>({});
@@ -201,6 +202,7 @@ export default function WorkspaceTreePanel({
     empty: language === "en" ? "No files to display." : "暂无可显示文件。",
     refresh: language === "en" ? "Refresh" : "刷新",
     clearPlans: language === "en" ? "Clear Plans" : "清理计划文件",
+    clearBrowserValidation: language === "en" ? "Clear Validation Shots" : "清理验证截图",
     close: language === "en" ? "Close file tree" : "关闭文件树",
   }), [language]);
   const isBlackTheme = themeMode === "black";
@@ -383,7 +385,7 @@ export default function WorkspaceTreePanel({
       </div>
       )}
 
-      <div className="flex shrink-0 items-center gap-2 border-b border-[#27272a] px-3 py-2">
+      <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-[#27272a] px-3 py-2">
         <button
           onClick={() => void refreshLoadedDirectories()}
           className="rounded-md border border-[#27272a] bg-[#000000] px-2.5 py-1 text-[11px] text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#e4e4e7]"
@@ -395,6 +397,12 @@ export default function WorkspaceTreePanel({
           className="rounded-md border border-[#27272a] bg-[#000000] px-2.5 py-1 text-[11px] text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#e4e4e7]"
         >
           {copy.clearPlans}
+        </button>
+        <button
+          onClick={() => void deleteBrowserValidationArtifacts()}
+          className="rounded-md border border-[#27272a] bg-[#000000] px-2.5 py-1 text-[11px] text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#e4e4e7]"
+        >
+          {copy.clearBrowserValidation}
         </button>
       </div>
 

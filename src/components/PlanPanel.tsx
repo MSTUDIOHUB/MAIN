@@ -22,6 +22,7 @@ interface PlanPanelProps {
   fallbackTitle?: string;
   fallbackUpdatedAt?: number;
   onDeletePlanFiles?: () => void;
+  onDeleteBrowserValidationFiles?: () => void;
   onContinuePlanning?: () => void;
   onResumeExecution?: () => void;
   onSaveDocument?: (document: { title: string; suggestedFileName: string; content: string; sourcePath?: string }) => Promise<boolean> | boolean;
@@ -50,6 +51,7 @@ const COPY = {
     rejectAndKeepPlan: "拒绝并保留",
     rejectAndDeletePlan: "拒绝并删除",
     deletePlanFiles: "删除计划文件",
+    deleteBrowserValidationFiles: "清理验证截图",
     approvePlan: "确认方案并继续执行",
     continuePlanning: "继续生成正式计划",
     resumeExecution: "继续执行剩余任务",
@@ -103,6 +105,7 @@ const COPY = {
     rejectAndKeepPlan: "Reject And Keep",
     rejectAndDeletePlan: "Reject And Delete",
     deletePlanFiles: "Delete Plan Files",
+    deleteBrowserValidationFiles: "Clear Validation Shots",
     approvePlan: "Approve Plan And Continue",
     continuePlanning: "Continue Planning",
     resumeExecution: "Resume Execution",
@@ -173,6 +176,7 @@ export default function PlanPanel({
   fallbackTitle,
   fallbackUpdatedAt,
   onDeletePlanFiles,
+  onDeleteBrowserValidationFiles,
   onContinuePlanning,
   onResumeExecution,
   onSaveDocument,
@@ -581,8 +585,18 @@ export default function PlanPanel({
               )}
             </div>
           ) : (
-            <div className="text-[11px] text-[#71717a]">
-              {copy.approvalRunningHint}
+            <div className="flex items-center justify-between gap-3">
+              <div className="text-[11px] text-[#71717a]">
+                {copy.approvalRunningHint}
+              </div>
+              {onDeleteBrowserValidationFiles && (
+                <button
+                  onClick={onDeleteBrowserValidationFiles}
+                  className="shrink-0 rounded-lg border border-[#3f3f46] bg-[#09090b] px-4 py-2 text-[12px] font-medium text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#f5f5f5]"
+                >
+                  {copy.deleteBrowserValidationFiles}
+                </button>
+              )}
             </div>
           )}
         </div>

@@ -143,6 +143,7 @@ test("plan panel keeps resume action available for paused approved execution", (
   assert.doesNotMatch(source, /canResumeExecution[\s\S]*?allTrustedComplete/);
   assert.match(source, /runtimeIntentOverride:\s*"execute"/);
   assert.match(source, /executionConsentGranted:\s*true/);
+  assert.match(source, /createVisibleTurnForHiddenMessage:\s*true/);
 });
 
 test("new empty workspace sessions hydrate persisted plan tasks into resumable execution state", () => {
@@ -153,6 +154,7 @@ test("new empty workspace sessions hydrate persisted plan tasks into resumable e
   assert.match(storeSource, /options\.promoteTasksToExecuting === true[\s\S]*?hydratedPlan\.hasTasksArtifact[\s\S]*?hydratedPlan\.tasks\.length > 0/);
   assert.match(storeSource, /isPlanApproved:\s*shouldPromoteHydratedTasksToExecuting \|\| s\.isPlanApproved/);
   assert.match(storeSource, /planStage:\s*shouldPromoteHydratedTasksToExecuting \? "executing" : nextStage/);
+  assert.match(storeSource, /controlAction === "resume_plan_execution"[\s\S]*?createVisibleTurnForHiddenMessage:\s*true/);
 
   assert.match(appSource, /hydrateWorkspacePlanForEmptySession\("new_session"\)/);
   assert.match(appSource, /promoteTasksToExecuting:\s*true/);

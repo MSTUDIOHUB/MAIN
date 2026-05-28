@@ -261,6 +261,7 @@ import {
 import {
   buildExecuteNoProgressLoopPauseNotice,
   buildExecuteRecoveryPrompt,
+  buildExecuteValidationRecoveryPrompt,
   describeExecuteRecoveryToolSurface,
   isExecuteRecoveryToolName,
   normalizeExecuteRecoveryMode,
@@ -3135,6 +3136,15 @@ async function executeToolCallWithLifecycle(
     };
   }
 
+  const shellReadValidationErrorBeforeContract = buildShellReadValidationError(
+    tc,
+    toolArgs,
+    callbacks,
+  );
+  if (shellReadValidationErrorBeforeContract) {
+    return shellReadValidationErrorBeforeContract;
+  }
+
   // Validate required parameters before execution
   const validationError = validateToolExecutionContract(tc.name, toolArgs, allTools);
   if (validationError) {
@@ -3216,15 +3226,6 @@ async function executeToolCallWithLifecycle(
   );
   if (planArtifactValidationError) {
     return planArtifactValidationError;
-  }
-
-  const shellReadValidationError = buildShellReadValidationError(
-    tc,
-    resolvedArgs,
-    callbacks,
-  );
-  if (shellReadValidationError) {
-    return shellReadValidationError;
   }
 
   const loopDetectionValidationError = buildLoopDetectionValidationError(
@@ -3377,7 +3378,7 @@ async function executeToolCallWithLifecycle(
 
     const path = typeof resolvedArgs.path === "string" ? resolvedArgs.path : "";
     const kind = path ? detectPlanArtifactKind(path) : null;
-    if (kind && kind !== "tasks") {
+    if (kind && kind !== "tasks" && PLAN_ARTIFACT_MUTATION_TOOLS.has(tc.name)) {
       const nextContent = typeof resolvedArgs.content === "string" ? resolvedArgs.content : "";
       const validation = kind === "plan"
         ? validateActionablePlanArtifact(nextContent)
@@ -4743,6 +4744,7 @@ export async function executeAgentLoop(
   let approvedPlanNoProgressRecoveryAttempts = 0;
   let approvedPlanActionOnlyRecoveryActive = false;
   let approvedPlanNoToolRecoveryFileReadActive = false;
+  let repeatedEditValidationRecoveryAttempts = 0;
   let executeRecoveryMode: ExecuteRecoveryMode =
     workflowMode === "edit"
       ? normalizeExecuteRecoveryMode(callbacks.getForcedExecuteRecoveryMode?.())
@@ -5303,6 +5305,8 @@ export async function executeAgentLoop(
       runtimeIntent === "execute" &&
       executeRecoveryMode !== "normal";
     const allowExecuteRecoveryFileRead = shouldAllowExecuteRecoveryFileRead(recentToolActivity);
+    const effectiveExecuteRecoveryFileRead =
+      executeRecoveryMode === "patch_recovery_read" || allowExecuteRecoveryFileRead;
     const recoveryIterationAllTools = isExecuteRecoveryEligible
       ? rawIterationAllTools.filter((tool) => isExecuteRecoveryToolName(
           tool.function.name,
@@ -5319,8 +5323,9 @@ export async function executeAgentLoop(
         executeRecoveryMode,
         executeRecoveryReason,
         executeRecoveryAttempts,
-        allowFileRead: allowExecuteRecoveryFileRead,
-        recoveryToolSurface: describeExecuteRecoveryToolSurface(executeRecoveryMode, allowExecuteRecoveryFileRead),
+        allowFileRead: effectiveExecuteRecoveryFileRead,
+        adaptiveFileReadAllowed: allowExecuteRecoveryFileRead,
+        recoveryToolSurface: describeExecuteRecoveryToolSurface(executeRecoveryMode, effectiveExecuteRecoveryFileRead),
         rawTools: rawIterationAllTools.map((tool) => tool.function.name).slice(0, 24),
         scopedTools: recoveryIterationAllTools.map((tool) => tool.function.name),
         removedToolCount: Math.max(0, rawIterationAllTools.length - recoveryIterationAllTools.length),
@@ -9725,7 +9730,9 @@ export async function executeAgentLoop(
     }
     if (allResults.some(isVerificationEvidenceResult)) {
       successfulEditTargetsSinceVerification.clear();
+      repeatedEditValidationRecoveryAttempts = 0;
     }
+    let pendingRepeatedEditValidationRecoveryPrompt: string | null = null;
     for (const result of allResults) {
       if (result.isError || result.internalFeedback || !isEditProgressResult(result)) continue;
       const targetKey = normalizeLoopGuardTarget(result.target);
@@ -9736,11 +9743,53 @@ export async function executeAgentLoop(
 
       const displayTarget = String(result.target || targetKey).replace(/^shell-write:/, "");
       const language = callbacks.getPreferredLanguage();
+      const availableValidationTools = Array.from(availableToolNames)
+        .filter((name) => EXECUTION_VERIFICATION_TOOL_NAMES.has(name))
+        .filter((name) => name !== "send_pty_input" && name !== "clear_pty_buffer");
+      const canAttemptValidationRecovery =
+        runtimeIntent === "execute" &&
+        (workflowMode === "edit" || (workflowMode === "plan" && callbacks.getIsPlanApproved())) &&
+        repeatedEditValidationRecoveryAttempts < 1 &&
+        availableValidationTools.length > 0;
+      if (canAttemptValidationRecovery) {
+        repeatedEditValidationRecoveryAttempts += 1;
+        activateExecuteRecovery("validation_only", "repeat_edit_target_without_validation", {
+          target: displayTarget,
+          editCount: count,
+          validationTools: availableValidationTools,
+        });
+        logAgentEvent("repeat_edit_target_validation_recovery", {
+          iteration,
+          target: displayTarget,
+          editCount: count,
+          attempts: repeatedEditValidationRecoveryAttempts,
+          validationTools: availableValidationTools,
+        });
+        emitPlanExecutionProgress("running", {
+          repeatedTargets: [displayTarget],
+          recoveryReason: "repeat_edit_target_without_validation",
+          nextStep: language === "zh"
+            ? "同一目标已连续修改；下一轮强制先运行命令或浏览器验证"
+            : "same target was edited repeatedly; next turn must run command or browser validation first",
+        });
+        callbacks.onStatusChange("running");
+        pendingRepeatedEditValidationRecoveryPrompt = buildExecuteValidationRecoveryPrompt({
+          language,
+          reason: "repeat_edit_target_without_validation",
+          target: displayTarget,
+          editCount: count,
+          recentActivity: recentToolActivity,
+          availableValidationTools,
+        });
+        break;
+      }
       logAgentEvent("loop_stop", {
         reason: "repeat_edit_target_without_validation",
         iteration,
         target: displayTarget,
         editCount: count,
+        validationRecoveryAttempts: repeatedEditValidationRecoveryAttempts,
+        validationTools: availableValidationTools,
       });
       callbacks.onNonActionableStop(
         language === "zh"
@@ -9765,6 +9814,13 @@ export async function executeAgentLoop(
       );
       callbacks.onStatusChange("idle");
       return;
+    }
+    if (pendingRepeatedEditValidationRecoveryPrompt) {
+      callbacks.appendMessage({
+        role: "user",
+        content: pendingRepeatedEditValidationRecoveryPrompt,
+      });
+      continue;
     }
     if (pendingExecuteRecoveryPrompt) {
       callbacks.onStatusChange("running");

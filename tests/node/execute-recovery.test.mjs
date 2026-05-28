@@ -56,7 +56,9 @@ function loadTranspiledModuleSync(sourcePath) {
 const {
   buildExecuteNoProgressLoopPauseNotice,
   buildExecuteRecoveryPrompt,
+  buildExecuteValidationRecoveryPrompt,
   describeExecuteRecoveryToolSurface,
+  isExecutePatchMismatchRecoveryActivity,
   isExecuteRecoveryToolName,
   resolveExecuteReadOnlyRecoveryTrigger,
   resolveReadOnlyNoProgressTrigger,
@@ -129,12 +131,55 @@ test("execute recovery tool surface removes broad reads but keeps action and tar
   assert.equal(describeExecuteRecoveryToolSurface("action_plus_targeting"), "action_plus_targeting");
 });
 
+test("repeat-edit validation recovery exposes only validation tools and forbids more edits", () => {
+  assert.equal(isExecuteRecoveryToolName("run_command", readOnlyTools, {
+    mode: "validation_only",
+  }), true);
+  assert.equal(isExecuteRecoveryToolName("browser_evaluate", readOnlyTools, {
+    mode: "validation_only",
+  }), true);
+  assert.equal(isExecuteRecoveryToolName("replace_in_file", readOnlyTools, {
+    mode: "validation_only",
+  }), false);
+  assert.equal(isExecuteRecoveryToolName("read_file", readOnlyTools, {
+    mode: "validation_only",
+  }), false);
+  assert.equal(describeExecuteRecoveryToolSurface("validation_only"), "validation_only");
+
+  const prompt = buildExecuteValidationRecoveryPrompt({
+    language: "zh",
+    reason: "repeat_edit_target_without_validation",
+    target: "src/components/Dashboard/CourseBarChart.tsx",
+    editCount: 3,
+    availableValidationTools: ["run_command", "browser_evaluate"],
+  });
+  assert.match(prompt, /连续修改同一目标/);
+  assert.match(prompt, /必须只调用一个验证工具/);
+  assert.match(prompt, /不要继续编辑文件/);
+});
+
 test("patch mismatch recovery opens one targeted read_file path", () => {
   const recent = [
     { name: "replace_in_file", status: "failed", target: "src/App.tsx", detail: "search_text not found" },
   ];
 
+  assert.equal(isExecutePatchMismatchRecoveryActivity(recent[0]), true);
+  assert.equal(
+    isExecutePatchMismatchRecoveryActivity({
+      name: "apply_patch",
+      status: "failed",
+      target: "src/App.tsx",
+      detail: "Patch context was not found in src/App.tsx",
+    }),
+    true,
+  );
   assert.equal(shouldAllowExecuteRecoveryFileRead(recent), true);
+  assert.equal(
+    shouldAllowExecuteRecoveryFileRead([
+      { name: "apply_patch", status: "failed", target: "src/App.tsx", detail: "Patch context was not found" },
+    ]),
+    true,
+  );
   assert.equal(isExecuteRecoveryToolName("read_file", readOnlyTools, {
     mode: "patch_recovery_read",
     allowFileRead: true,
@@ -151,6 +196,16 @@ test("patch mismatch recovery opens one targeted read_file path", () => {
     ]),
     false,
   );
+
+  const prompt = buildExecuteRecoveryPrompt({
+    language: "zh",
+    reason: "target_progress_patch_mismatch",
+    mode: "patch_recovery_read",
+    repeatedTargets: ["src/App.tsx"],
+    recentActivity: recent,
+  });
+  assert.match(prompt, /上下文与当前文件不匹配/);
+  assert.match(prompt, /不要继续重试基于旧上下文的 `apply_patch`/);
 });
 
 test("read-only budget triggers execute recovery before max iterations", () => {
@@ -341,6 +396,8 @@ test("orchestrator wires execute convergence and max-iteration recovery before i
   const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8");
 
   assert.match(source, /execute_recovery_tool_scope_applied/);
+  assert.match(source, /const effectiveExecuteRecoveryFileRead =[\s\S]*executeRecoveryMode === "patch_recovery_read" \|\| allowExecuteRecoveryFileRead/);
+  assert.match(source, /adaptiveFileReadAllowed: allowExecuteRecoveryFileRead/);
   assert.match(source, /execute_recovery_context_compacted/);
   assert.match(source, /isExecuteRecoveryEligible && contextForceForManagement\?\.shouldForce/);
   assert.match(source, /execute_recovery_context_skipped/);

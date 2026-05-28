@@ -130,14 +130,6 @@ function keyForProgress(input: {
   return `progress:${String(input.phase || "").toLowerCase()}:${compactLine(input.title || "", 120).toLowerCase()}`;
 }
 
-function mergeStatus(left: RuntimeProgressStatus, right: RuntimeProgressStatus): RuntimeProgressStatus {
-  if (right === "failed" || left === "failed") return "failed";
-  if (right === "paused" || left === "paused") return "paused";
-  if (right === "running") return "running";
-  if (right === "completed" || left === "completed") return "completed";
-  return "done";
-}
-
 function addItem(
   map: Map<string, RuntimeProgressLedgerItem>,
   item: Omit<RuntimeProgressLedgerItem, "repeatCount" | "cacheHits"> & {
@@ -154,12 +146,21 @@ function addItem(
     });
     return;
   }
-  existing.status = mergeStatus(existing.status, item.status);
-  existing.title = item.title || existing.title;
-  existing.summary = item.summary || existing.summary;
-  existing.target = item.target || existing.target;
-  existing.tool = item.tool || existing.tool;
-  existing.phase = item.phase || existing.phase;
+  const incomingIsAtLeastAsFresh = item.lastSeenAt >= existing.lastSeenAt;
+  if (incomingIsAtLeastAsFresh) {
+    existing.status = item.status;
+    existing.title = item.title || existing.title;
+    existing.summary = item.summary || existing.summary;
+    existing.target = item.target || existing.target;
+    existing.tool = item.tool || existing.tool;
+    existing.phase = item.phase || existing.phase;
+  } else {
+    existing.title = existing.title || item.title;
+    existing.summary = existing.summary || item.summary;
+    existing.target = existing.target || item.target;
+    existing.tool = existing.tool || item.tool;
+    existing.phase = existing.phase || item.phase;
+  }
   existing.repeatCount += Math.max(1, item.repeatCount || 1);
   existing.cacheHits += Math.max(0, item.cacheHits || 0);
   existing.lastSeenAt = Math.max(existing.lastSeenAt, item.lastSeenAt);

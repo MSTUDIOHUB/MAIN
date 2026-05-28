@@ -2,6 +2,7 @@ export type ExecuteRecoveryMode =
   | "normal"
   | "action_plus_targeting"
   | "patch_recovery_read"
+  | "validation_only"
   | "action_only";
 
 export interface ExecuteRecoveryActivityLike {
@@ -33,9 +34,22 @@ export const EXECUTE_RECOVERY_PATCH_READ_TOOLS = new Set([
   "read_file",
 ]);
 
+export const EXECUTE_RECOVERY_VALIDATION_TOOLS = new Set([
+  "run_command",
+  "execute_command",
+  "browser_evaluate",
+  "send_pty_input",
+  "read_pty_buffer",
+  "read_pty_tail",
+  "read_pty_since",
+  "get_pty_status",
+  "clear_pty_buffer",
+]);
+
 export function normalizeExecuteRecoveryMode(value: unknown): ExecuteRecoveryMode {
   return value === "action_plus_targeting" ||
     value === "patch_recovery_read" ||
+    value === "validation_only" ||
     value === "action_only" ||
     value === "normal"
     ? value
@@ -43,7 +57,7 @@ export function normalizeExecuteRecoveryMode(value: unknown): ExecuteRecoveryMod
 }
 
 export function isExecutePatchMismatchRecoveryActivity(activity: ExecuteRecoveryActivityLike): boolean {
-  if (activity.name !== "replace_in_file" || activity.status !== "failed") return false;
+  if ((activity.name !== "replace_in_file" && activity.name !== "apply_patch") || activity.status !== "failed") return false;
   return /(?:search_text|not\s+found|no\s+match|mismatch|不一致|未匹配|未找到|patch)/i.test(activity.detail || "");
 }
 
@@ -71,6 +85,7 @@ export function isExecuteRecoveryToolName(
 ): boolean {
   const mode = normalizeExecuteRecoveryMode(options.mode);
   if (mode === "normal") return true;
+  if (mode === "validation_only") return EXECUTE_RECOVERY_VALIDATION_TOOLS.has(name);
   if (!readOnlyTools.has(name)) return true;
   if (mode === "action_only") return false;
   if (mode === "action_plus_targeting" && EXECUTE_RECOVERY_TARGETING_TOOLS.has(name)) return true;
@@ -86,6 +101,7 @@ export function describeExecuteRecoveryToolSurface(
 ): string {
   const normalized = normalizeExecuteRecoveryMode(mode);
   if (normalized === "normal") return "normal";
+  if (normalized === "validation_only") return "validation_only";
   if (normalized === "action_only") return "action_only";
   if (normalized === "patch_recovery_read" || allowFileRead) return "action_plus_patch_file_read";
   return "action_plus_targeting";
@@ -194,6 +210,9 @@ export function buildExecuteRecoveryPrompt(input: {
   allowFileRead?: boolean;
 }): string {
   const surface = describeExecuteRecoveryToolSurface(input.mode, input.allowFileRead);
+  const isPatchMismatchRecovery =
+    input.mode === "patch_recovery_read" ||
+    /patch|mismatch|target_progress_patch_mismatch|search_text|not\s+found/i.test(input.reason || "");
   const repeatedTargets = input.repeatedTargets?.length
     ? input.repeatedTargets.join(input.language === "zh" ? "、" : ", ")
     : input.language === "zh" ? "最近已读目标" : "recently read targets";
@@ -204,12 +223,16 @@ export function buildExecuteRecoveryPrompt(input: {
 
   if (input.language === "en") {
     return [
-      "EXECUTE_RECOVERY: The current Execute turn has spent its read-only budget without producing write, command, or browser validation evidence.",
+      isPatchMismatchRecovery
+        ? "EXECUTE_RECOVERY: The last edit failed because the patch or replacement context did not match the current file."
+        : "EXECUTE_RECOVERY: The current Execute turn has spent its read-only budget without producing write, command, or browser validation evidence.",
       `Recovery reason: ${input.reason || "read_only_no_action"}.`,
       `Recovery tool surface: ${surface}.`,
       `Repeated/known targets: ${repeatedTargets}.`,
       recent ? `Recent tool activity: ${recent}.` : "",
-      input.allowFileRead
+      isPatchMismatchRecovery
+        ? "Use one targeted `read_file` only if needed, then base the next edit on text copied from that latest result. Prefer `replace_in_file` for a small exact replacement, or run validation / browser checks if the target already satisfies the task. Do not retry an `apply_patch` built from stale context."
+        : input.allowFileRead
         ? "A targeted `read_file` is available to repair exact-content or patch mismatch problems; after that, patch, run a finite command, use browser validation, or state the exact blocker."
         : "No `read_file` is available in this recovery step. Reuse cached context and take the next concrete action: `apply_patch`/`replace_in_file`/`write_file`, run a finite command, use browser validation, or state the exact blocker.",
       "Do not start a new broad scan, do not reread the same files, and do not output another plan instead of action.",
@@ -217,15 +240,59 @@ export function buildExecuteRecoveryPrompt(input: {
   }
 
   return [
-    "EXECUTE_RECOVERY: 当前 Execute 回合已经耗尽只读预算，但还没有产生写入、命令或浏览器验证证据。",
+    isPatchMismatchRecovery
+      ? "EXECUTE_RECOVERY: 上一次编辑失败，因为 patch 或替换上下文与当前文件不匹配。"
+      : "EXECUTE_RECOVERY: 当前 Execute 回合已经耗尽只读预算，但还没有产生写入、命令或浏览器验证证据。",
     `恢复原因：${input.reason || "read_only_no_action"}。`,
     `恢复工具面：${surface}。`,
     `重复/已知目标：${repeatedTargets}。`,
     recent ? `最近工具活动：${recent}。` : "",
-    input.allowFileRead
+    isPatchMismatchRecovery
+      ? "只在必要时使用一次定向 `read_file`，下一次编辑必须基于最新结果中复制出来的真实文本。小范围修改优先用 `replace_in_file` 精确替换；如果目标已经满足任务，转向命令/浏览器验证。不要继续重试基于旧上下文的 `apply_patch`。"
+      : input.allowFileRead
       ? "现在可使用定向 `read_file` 来修复精确内容或 patch mismatch；随后必须改为写入、运行有限命令、浏览器验证，或说明精确阻塞。"
       : "这个恢复步骤不再开放 `read_file`。请复用已缓存上下文，执行下一个具体动作：`apply_patch` / `replace_in_file` / `write_file`、运行有限命令、浏览器验证，或说明精确阻塞。",
     "不要开启新一轮泛读，不要重复读取同一批文件，也不要用新的方案文档替代执行动作。",
+  ].filter(Boolean).join("\n");
+}
+
+export function buildExecuteValidationRecoveryPrompt(input: {
+  language: "zh" | "en";
+  reason: string;
+  target: string;
+  editCount: number;
+  recentActivity?: ExecuteRecoveryActivityLike[];
+  availableValidationTools?: string[];
+}): string {
+  const tools = (input.availableValidationTools || [])
+    .filter(Boolean)
+    .map((name) => `\`${name}\``)
+    .join(input.language === "zh" ? "、" : ", ");
+  const recent = (input.recentActivity || [])
+    .slice(-5)
+    .map((activity) => [activity.status, activity.name, activity.target, activity.detail].filter(Boolean).join(" "))
+    .join(input.language === "zh" ? "；" : "; ");
+
+  if (input.language === "en") {
+    return [
+      "EXECUTE_RECOVERY: The approved Plan edited the same target repeatedly without fresh validation evidence.",
+      `Recovery reason: ${input.reason}.`,
+      `Repeated target: ${input.target || "unknown target"} (${input.editCount} edits since the last validation).`,
+      tools ? `Available validation tools: ${tools}.` : "",
+      recent ? `Recent tool activity: ${recent}.` : "",
+      "Next response must call exactly one validation tool, preferably `run_command` for a finite build/test/lint command or `browser_evaluate` for DOM/screenshot validation.",
+      "Do not edit files, do not reread files, and do not summarize completion until the validation tool returns. If automated validation is impossible, state the exact blocker without claiming the task is complete.",
+    ].filter(Boolean).join("\n");
+  }
+
+  return [
+    "EXECUTE_RECOVERY: 已批准 Plan 连续修改同一目标，但期间没有新的验证证据。",
+    `恢复原因：${input.reason}。`,
+    `重复目标：${input.target || "未知目标"}（距上次验证后已修改 ${input.editCount} 次）。`,
+    tools ? `本轮可用验证工具：${tools}。` : "",
+    recent ? `最近工具活动：${recent}。` : "",
+    "下一条回复必须只调用一个验证工具；有限的构建/测试/lint 优先用 `run_command`，页面 DOM/截图验证用 `browser_evaluate`。",
+    "不要继续编辑文件，不要重新读取文件，也不要在验证工具返回前总结完成。如果无法自动验证，请说明精确阻塞，不能声称任务完成。",
   ].filter(Boolean).join("\n");
 }
 
