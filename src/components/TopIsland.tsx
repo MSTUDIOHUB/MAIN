@@ -53,8 +53,11 @@ function isApprovalActionOption(option: ReplyOption): boolean {
 }
 
 function getDisplayReplyOptionLabel(option: ReplyOption, language: "zh" | "en"): string {
-  if (option.action === "approve_operation_once" || option.action === "execute_once") {
+  if (option.action === "approve_operation_once") {
     return language === "zh" ? "批准执行本轮方案" : "Approve And Run This Plan";
+  }
+  if (option.action === "execute_once") {
+    return option.label || option.value || (language === "zh" ? "直接执行本轮" : "Run This Choice");
   }
   if (option.action === "adjust_plan") {
     return language === "zh" ? "继续调整方案" : "Keep Adjusting The Plan";
@@ -269,8 +272,8 @@ const TopIsland = memo(function TopIsland({
     customChoiceSubmit: language === "zh" ? "确认" : "Confirm",
     executionConsentTitle: language === "zh" ? "允许开始执行本轮改动？" : "Allow this turn to start making changes?",
     executionConsentHint: language === "zh"
-      ? "这是本轮第一次真实写入/命令动作。确认后 MAIN 会继续；开启自动审查会在本会话自动批准文件修改、命令和本地读取。"
-      : "This is the first real write/command action in this turn. MAIN continues after confirmation; Auto Review approves file changes, commands, and local reads in this session.",
+      ? "这是本轮第一次真实写入/命令动作。确认后 MAIN 会继续；开启自动审查会在本会话自动批准文件修改、命令、本地读取和浏览器验证。"
+      : "This is the first real write/command action in this turn. MAIN continues after confirmation; Auto Review approves file changes, commands, local reads, and browser validation in this session.",
     approveExecuteOnce: language === "zh" ? "直接执行本轮" : "Run This Turn",
     approveThread: language === "zh" ? "开启自动审查并执行" : "Auto Review And Run",
     dismiss: language === "zh" ? "取消/继续调整" : "Cancel / Adjust",
@@ -291,8 +294,8 @@ const TopIsland = memo(function TopIsland({
       ? "批准当前回合继续执行；后续审批仍按设置处理。"
       : "Allows this turn to continue; later reviews follow your settings.",
     autoReviewInfo: language === "zh"
-      ? "开启后本会话会自动批准文件修改、终端命令和本地文件读取。"
-      : "When enabled, MAIN auto-approves file changes, shell commands, and local file reads in this session.",
+      ? "开启后本会话会自动批准文件修改、终端命令、本地文件读取和浏览器验证。"
+      : "When enabled, MAIN auto-approves file changes, shell commands, local file reads, and browser validation in this session.",
     autoValidation: language === "zh" ? "自动验证" : "Auto validation",
     userValidation: language === "zh" ? "待用户验证" : "User validation",
     taskSummary: activeProgressMode === "execution"

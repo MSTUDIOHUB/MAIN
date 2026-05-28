@@ -421,6 +421,10 @@ test("respond prompt no longer tells the user to switch Chat or Fast or Plan", (
   assert.match(prompt, /\[TURN INTENT: RESPOND\]/);
   assert.match(prompt, /批准执行本轮操作/);
   assert.match(prompt, /action="approve_operation_once"/);
+  assert.match(prompt, /未获批准时不要调用 replace_in_file、write_file、execute_command/);
+  assert.match(prompt, /运行时已经把本轮升级到 execute 能力/);
+  assert.match(prompt, /如果不确定用户到底是要继续讨论\/调整方案，还是要进入真实执行/);
+  assert.doesNotMatch(prompt, /不要调用 replace_in_file、write_file、execute_command 等写入或执行工具。/);
 });
 
 test("game studio prompt exposes protocol paths and sticky specialist context", () => {

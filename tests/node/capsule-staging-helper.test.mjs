@@ -42,6 +42,9 @@ test("isConversationalFirstPersonNarration validations", () => {
 
   // Should reject large or structured contents
   assert.equal(isConversationalFirstPersonNarration("### 实施步骤与长计划列表\n1. 修改文件\n2. 编译测试\n3. 提交审核"), false); // Too structured/long
+  assert.equal(isConversationalFirstPersonNarration("我观察到这是一个典型的错误，通常发生在以下场景：\n1"), false); // Incomplete list digit marker during streaming
+  assert.equal(isConversationalFirstPersonNarration("我正在分析以下几点：\n-"), false); // Incomplete list bullet marker during streaming
+  assert.equal(isConversationalFirstPersonNarration("准备进行以下修改：\n* "), false); // Incomplete list star marker during streaming
   assert.equal(isConversationalFirstPersonNarration("```typescript\nconst a = 1;\n```"), false); // Code block
   assert.equal(isConversationalFirstPersonNarration("| 字段 | 类型 |\n| --- | --- |\n| creator | string |"), false); // Table
   assert.equal(isConversationalFirstPersonNarration("a".repeat(400)), false); // Too long

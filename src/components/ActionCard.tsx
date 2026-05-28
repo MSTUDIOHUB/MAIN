@@ -421,8 +421,8 @@ export default function ActionCard({ blockId, toolName, target, toolStatus, mess
                   {toolName === "read_file" || toolName === "read_document" || toolName === "analyze_tabular_document" || toolName === "query_tabular_document"
                     ? language === "zh" ? "允许后，本会话内不再重复询问这个文件" : "After allowing, this file will stay approved for this session"
                   : language === "zh"
-                    ? "本会话内自动允许后续写入与命令（高风险仍逐项审查）"
-                    : "Auto-allow writes and commands in this session (high-risk still reviewed per step)"}
+                    ? "本会话内自动允许后续写入、命令和浏览器验证（高风险仍逐项审查）"
+                    : "Auto-allow writes, commands, and browser validation in this session (high-risk still reviewed per step)"}
                 </span>
               </label>
             </div>

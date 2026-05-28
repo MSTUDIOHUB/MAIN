@@ -629,9 +629,9 @@ export function buildSystemPrompt(
       "你当前这一轮的真实意图是：RESPOND（自然回复）。",
       "这一轮用于普通聊天、问答、解释、头脑风暴、澄清需求、比较方案和轻量方案交流。",
       "不要主动进入正式计划协议，不要擅自生成 requirements.md / plan.md / tasks.md，也不要输出仅供执行流使用的 Proposal 结构。",
-      "默认不要修改文件、不要执行命令、不要调用写入类工具。除非本轮已经进入执行运行面并获得用户批准，否则保持在聊天与说明层面。",
+      "默认不要修改文件、不要执行命令、不要调用写入类工具；如果本轮运行面已经是 EXECUTE、用户已通过批准选项进入执行，或工具审批卡随后批准了具体操作，则可以按批准范围使用写入、命令、浏览器等真实操作工具。",
       "如果你判断下一步需要真实操作（写文件、改代码、运行命令、Git、部署、外部写入、生成交付文件等），先输出简短方案和 `<user_options>`：第一个选项用 action=\"approve_operation_once\" 表达“批准执行本轮操作”，第二个用 action=\"adjust_plan\" 表达“继续调整方案”，必要时第三个用 action=\"cancel_operation\" 表达取消。输出选项后立即停止。",
-      "如果用户的表达里只有弱计划关键词或轻微执行倾向，不要自作主张切到别的模式；先正常解释，或在必要时给出 `<user_options>` 让用户选择这轮是继续调整方案、先出正式计划，还是批准真实操作。",
+      "如果不确定用户到底是要继续讨论/调整方案，还是要进入真实执行，不要自作主张；必须给出 `<user_options>` 让用户选择这轮是继续调整方案、先出正式计划，还是批准真实操作。",
       "不要再提及需要用户去切换 Chat / Fast / Plan 之类的界面选项。",
     ].join("\n"));
   }
@@ -640,7 +640,7 @@ export function buildSystemPrompt(
     const chatInstructions: string[] = [];
     chatInstructions.push("## 工具调用格式");
     chatInstructions.push(turnIntent === "respond" || turnIntent === "discuss"
-      ? "自然回复回合下，优先直接回答。只有在用户的问题必须读取项目内容才能准确回答时，才使用只读工具。"
+      ? "自然回复回合下，优先直接回答。只有在用户的问题必须读取项目内容才能准确回答时，才使用只读工具；如果用户明确批准本轮执行，或运行时已经把本轮升级到 execute 能力，可使用当前工具列表中的写入/命令/浏览器工具，并接受运行时审批约束。"
       : turnIntent === "analyze"
       ? "分析回合下，优先直接给出检查结论。只有在必须读取项目或资料内容才能正确分析时，才使用只读工具。"
       : turnIntent === "summarize"
@@ -656,14 +656,14 @@ export function buildSystemPrompt(
     chatInstructions.push("不要先输出“下一步行动计划”“请稍候，我将开始分析”之类的过渡台词后停住。");
     chatInstructions.push("避免输出“我将再次执行”“请稍候确认是否同意降级”这类过程化台词；直接执行，最后统一汇报结果或剩余阻塞。");
     chatInstructions.push("一旦你判断需要读取本地文件才能回答，就在同一轮直接调用只读工具，不要先发一段“我将开始分析/读取”的文字后停住。");
-    chatInstructions.push("如果分析、报告、总结或自然回复最终形成了可执行的修复/实现/生成方案，但本轮没有执行工具，请用普通 Markdown 给出方案，并紧跟 `<user_options>` 请求用户批准执行；不能只在正文里问“是否开始执行”。");
+    chatInstructions.push("如果分析、报告、总结或自然回复最终形成了可执行的修复/实现/生成方案，但本轮尚未获得执行批准，请用普通 Markdown 给出方案，并紧跟 `<user_options>` 请求用户批准执行；不能只在正文里问“是否开始执行”。");
     chatInstructions.push("可用只读工具：" + formatToolNameList(
       customToolNames,
       mcpToolNames,
       READ_ONLY_BUILT_IN_TOOL_NAMES,
       availableToolNames,
     ));
-    chatInstructions.push("不要调用 replace_in_file、write_file、execute_command 等写入或执行工具。");
+    chatInstructions.push("未获批准时不要调用 replace_in_file、write_file、execute_command 等写入或执行工具；一旦本轮已获用户批准或运行时明确处于 execute 能力，按当前暴露工具和审批结果执行。");
     parts.push(chatInstructions.join("\n"));
   } else {
     const tfl: string[] = [];

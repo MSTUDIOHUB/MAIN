@@ -2502,11 +2502,11 @@ export default function ChatArea({
     [capsuleProgressLedger, language],
   );
   // 缓存并锁死当前轮次下模型输出的最新的非空第一人称说明，防止被工具调用瞬间冲刷掉
-  const [activeTurnExplanation, setActiveTurnExplanation] = useState<string>("");
+  const [activeTurnExplanation, setActiveTurnExplanation] = useState<{ text: string; blockId: string | null }>({ text: "", blockId: null });
   const activeTurnExplanationRef = useRef<string | null>(null);
 
-  const explanationText = useMemo(() => {
-    if (!capsuleIsRunActive || !capsuleTurn) return "";
+  const explanationInfo = useMemo(() => {
+    if (!capsuleIsRunActive || !capsuleTurn) return { text: "", blockId: null };
 
     const activeTurnBlocks = capsuleTurnBlocks;
     
@@ -2519,10 +2519,13 @@ export default function ChatArea({
         
         // Route rich conversational first-person staging explanations into the capsule.
         const capsuleText = normalizeCapsuleExplanationText(content);
-        if (capsuleText) return capsuleText;
+        return {
+          text: capsuleText || "",
+          blockId: block.id || null
+        };
       }
     }
-    return "";
+    return { text: "", blockId: null };
   }, [capsuleIsRunActive, capsuleTurnBlocks]);
 
   const cachedCapsuleExplanation = useMemo(() => {
@@ -2533,29 +2536,33 @@ export default function ChatArea({
 
   useEffect(() => {
     if (!capsuleTurn) {
-      setActiveTurnExplanation("");
+      setActiveTurnExplanation({ text: "", blockId: null });
       activeTurnExplanationRef.current = null;
       return;
     }
     const turnChanged = capsuleTurn.id !== activeTurnExplanationRef.current;
     if (turnChanged) {
       activeTurnExplanationRef.current = capsuleTurn.id;
-      setActiveTurnExplanation(""); // 轮次变更时彻底重置
+      setActiveTurnExplanation({ text: "", blockId: null }); // 轮次变更时彻底重置
     }
-    if (explanationText) {
-      setActiveTurnExplanation(explanationText); // 仅在有新的非空模型说明时更新
+    if (explanationInfo.text) {
+      setActiveTurnExplanation({ text: explanationInfo.text, blockId: explanationInfo.blockId }); // 仅在有新的非空模型说明时更新
+    } else if (explanationInfo.blockId && activeTurnExplanation.blockId === explanationInfo.blockId) {
+      // 如果当前最新 agent 块的 ID 与缓存的块 ID 相同，但其 text 为空（即它不再通过 first-person 校验，例如长回答、列表、代码块等），
+      // 则清除缓存，防止显示已截断或不合规的中间内容，并让 capsule 优雅回退到动态工具/心流状态。
+      setActiveTurnExplanation({ text: "", blockId: explanationInfo.blockId });
     }
-  }, [explanationText, capsuleTurn]);
+  }, [explanationInfo, capsuleTurn, activeTurnExplanation.blockId]);
 
   const capsuleActivityText = useMemo(() => {
     if (!capsuleIsRunActive || !capsuleTurn) return "";
     if (cachedCapsuleExplanation) return cachedCapsuleExplanation;
-    if (activeTurnExplanation) return activeTurnExplanation;
-    if (explanationText) return explanationText;
+    if (activeTurnExplanation.text) return activeTurnExplanation.text;
+    if (explanationInfo.text) return explanationInfo.text;
     const progressText = normalizeCapsuleProgressText(capsuleProgressProjection.activityText);
     if (progressText) return progressText;
     return normalizeCapsuleProgressText(deriveDynamicFirstPersonText(capsuleTurn, capsuleTurnBlocks, agentStatus, language));
-  }, [capsuleIsRunActive, capsuleTurn, cachedCapsuleExplanation, activeTurnExplanation, explanationText, capsuleProgressProjection.activityText, capsuleTurnBlocks, agentStatus, language]);
+  }, [capsuleIsRunActive, capsuleTurn, cachedCapsuleExplanation, activeTurnExplanation.text, explanationInfo.text, capsuleProgressProjection.activityText, capsuleTurnBlocks, agentStatus, language]);
 
   useEffect(() => {
     const turnChanged = capsuleTurn?.id !== lastTurnIdRef.current;
@@ -3453,7 +3460,12 @@ export default function ChatArea({
                   {hasProposalCheckpoint && proposalCheckpointBlock && (
                     <>
                       <TurnPhaseDivider key={`${turn.id}-archived-phase-analysis`} label={phaseLabels.analysis} />
-                      {renderBlock(proposalCheckpointBlock, proposalBlockIndex)}
+                      <AgentContentBlock
+                        key={`${proposalCheckpointBlock.id}-${proposalBlockIndex}-archived-proposal`}
+                        block={{ ...proposalCheckpointBlock, archivedAfterChoice: false }}
+                        language={language}
+                        chatFontSize={resolvedChatFontSize}
+                      />
                     </>
                   )}
                   {hasProposalCheckpoint && proposalApprovalBlock && (

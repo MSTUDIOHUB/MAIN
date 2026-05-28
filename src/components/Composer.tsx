@@ -1,6 +1,6 @@
 // @ts-nocheck
 import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
-import { IconAt, IconFile, IconClose, IconChevronUp, IconArrowUp, IconPlus, IconCode, IconChevronUp as IconChevronUpIcon, IconImageIcon, IconRefresh, IconSearch, IconSettings, IconStop, IconZap, IconInfo } from "./Icons";
+import { IconAt, IconFile, IconClose, IconChevronUp, IconArrowUp, IconPlus, IconCode, IconChevronUp as IconChevronUpIcon, IconImageIcon, IconRefresh, IconSearch, IconSettings, IconStop, IconZap, IconInfo, IconTrash } from "./Icons";
 import ImageStudioSetupModal from "./ImageStudioSetupModal";
 import { getAllWorkspaceFiles, fuzzyFilterFiles } from "../utils/fsUtils";
 import { compressImage, getImageFilesFromClipboard, processImageFile } from "../utils/imageUtils";
@@ -326,14 +326,28 @@ export default function Composer({
   const guidanceStatusLabel = language === "en" ? "Guidance" : "已引导";
   const guidanceButtonLabel = language === "en" ? "Guide" : "引导";
   const guidanceButtonTitle = language === "en"
-    ? "Inject this text into the current run at the next model iteration."
-    : "把当前输入注入当前运行的下一次模型迭代，不中断本轮执行。";
+    ? "Move this queued message into the current run at the next model iteration."
+    : "把这条已排队指令注入当前运行的下一次模型迭代，不中断本轮执行。";
   const queueButtonTitle = language === "en"
     ? "Queue this message and send it automatically after the current run stops."
     : "将当前输入排队，当前模型停止后自动发送。";
   const autoReviewTitle = language === "en"
-    ? "Auto Review: approve tool requests in this session, including file changes, commands, and local file reads."
-    : "自动审查：本会话内自动批准工具请求，包括文件修改、终端命令和本地文件读取。";
+    ? "Auto Review: approve tool requests in this session, including file changes, commands, local file reads, and browser validation."
+    : "自动审查：本会话内自动批准工具请求，包括文件修改、终端命令、本地文件读取和浏览器验证。";
+  const autoReviewLockedTitle = language === "en"
+    ? "Auto Review is active for this run and can be changed after the run stops."
+    : "自动审查已在本轮执行中启用，执行停止后才能关闭。";
+  const hasDraftPayload =
+    draftInput.trim().length > 0 ||
+    contextMentions.length > 0 ||
+    attachedFiles.length > 0 ||
+    pendingImages.length > 0;
+  const streamingPrimaryQueuesMessage = isStreaming && hasDraftPayload;
+  const queuedMessagePreview = queuedUserMessage?.text?.trim() || (queuedUserMessage ? (language === "en" ? "Attachment message" : "含附件消息") : "");
+  const activeGuidancePreview = activeGuidance?.text?.trim() || "";
+  const queuedCanGuide = Boolean(queuedUserMessage?.text?.trim()) && isStreaming;
+  const autoReviewToggleDisabled = Boolean(autoApproveTools && isStreaming);
+  const autoReviewButtonTitle = autoReviewToggleDisabled ? autoReviewLockedTitle : autoReviewTitle;
   const nonPackFiles = useMemo(
     () => allFiles.filter((path) => !path.startsWith(".MAIN/") && !path.startsWith(".protocols/")),
     [allFiles],
@@ -1201,6 +1215,22 @@ export default function Composer({
     }
   };
 
+  const handleToggleAutoReview = useCallback(() => {
+    if (!onToggleAutoApprove) return;
+    if (autoApproveTools && isStreaming) return;
+    const nextValue = !autoApproveTools;
+    if (nextValue) {
+      const confirmed = safeConfirm(
+        language === "en"
+          ? "Turn on Auto Review for this session? MAIN will automatically approve file changes, terminal commands, local file reads, and browser validation while the session is active."
+          : "要为本会话开启自动审查吗？开启后 MAIN 会自动批准文件修改、终端命令、本地文件读取和浏览器验证。",
+        { source: "Composer", action: "toggle_auto_review" },
+      );
+      if (!confirmed) return;
+    }
+    onToggleAutoApprove(nextValue);
+  }, [autoApproveTools, isStreaming, language, onToggleAutoApprove]);
+
   const handleSubmitComposerMessage = useCallback(() => {
     const textToSend = draftInput;
     const hasPayload =
@@ -1220,6 +1250,9 @@ export default function Composer({
       });
       closeSlashMenu();
       setDraftInput("");
+      setStoreInput("");
+      setContextMentions([]);
+      setAttachedFiles([]);
       setPendingImages([]);
       return;
     }
@@ -1230,7 +1263,6 @@ export default function Composer({
       markStudioOnboardingUsed();
     }
     closeSlashMenu();
-    setStoreInput(textToSend, { preserveLockedComposerIntent: true });
     const didSend = onSendMessage(textToSend, pendingImages);
     if (didSend === false) {
       submitPendingRef.current = false;
@@ -1238,17 +1270,18 @@ export default function Composer({
       return;
     }
     setDraftInput("");
+    setStoreInput("", { preserveLockedComposerIntent: true });
     setPendingImages([]);
-  }, [attachedFiles, closeSlashMenu, contextMentions, draftInput, isGameStudioMode, isStreaming, markStudioOnboardingUsed, onSendMessage, pendingImages, queueUserMessage, setStoreInput]);
+  }, [attachedFiles, closeSlashMenu, contextMentions, draftInput, isGameStudioMode, isStreaming, markStudioOnboardingUsed, onSendMessage, pendingImages, queueUserMessage, setAttachedFiles, setContextMentions, setStoreInput]);
 
-  const handleGuideCurrentRun = useCallback(() => {
-    const guidance = draftInput.trim();
+  const handleGuideQueuedMessage = useCallback(() => {
+    const guidance = queuedUserMessage?.text?.trim() || "";
     if (!guidance || !isStreaming) return;
     setActiveGuidance(guidance, currentTurnId);
+    clearQueuedUserMessage();
     closeSlashMenu();
-    setDraftInput("");
     setStoreInput("");
-  }, [closeSlashMenu, currentTurnId, draftInput, isStreaming, setActiveGuidance, setStoreInput]);
+  }, [clearQueuedUserMessage, closeSlashMenu, currentTurnId, isStreaming, queuedUserMessage, setActiveGuidance, setStoreInput]);
 
   // ── Handle textarea change (detect @ typing) ──
   const resizeTextarea = useCallback(() => {
@@ -1710,46 +1743,6 @@ export default function Composer({
           </div>
         )}
 
-        {!isImageStudioMode && (queuedUserMessage || activeGuidance || (isStreaming && onToggleAutoApprove)) && (
-          <div className="relative z-30 mb-2 flex flex-wrap items-center justify-center gap-2 px-3">
-            {queuedUserMessage && (
-              <div data-testid="composer-queued-message" className="flex max-w-full items-center gap-2 rounded-full border border-[rgba(96,165,250,0.28)] bg-[rgba(37,99,235,0.10)] px-3 py-1.5 text-[11px] text-[#bfdbfe]">
-                <span className="font-semibold">{queuedStatusLabel}</span>
-                <span className="max-w-[18rem] truncate text-[#dbeafe]">{queuedUserMessage.text || (language === "en" ? "Attachment message" : "含附件消息")}</span>
-                <button type="button" onClick={clearQueuedUserMessage} className="text-[#93c5fd] hover:text-white" title={language === "en" ? "Cancel queued message" : "取消排队"}>
-                  <IconClose className="h-3 w-3" />
-                </button>
-              </div>
-            )}
-            {activeGuidance && (
-              <div data-testid="composer-active-guidance" className="flex max-w-full items-center gap-2 rounded-full border border-[rgba(52,211,153,0.28)] bg-[rgba(16,185,129,0.10)] px-3 py-1.5 text-[11px] text-[#bbf7d0]">
-                <span className="font-semibold">{guidanceStatusLabel}</span>
-                <span className="max-w-[18rem] truncate text-[#dcfce7]">{activeGuidance.text}</span>
-                <button type="button" onClick={clearActiveGuidance} className="text-[#86efac] hover:text-white" title={language === "en" ? "Undo guidance" : "撤销引导"}>
-                  <IconClose className="h-3 w-3" />
-                </button>
-              </div>
-            )}
-            {isStreaming && onToggleAutoApprove && (
-              <button
-                type="button"
-                data-testid="composer-auto-review-toggle"
-                onClick={() => onToggleAutoApprove(!autoApproveTools)}
-                className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-[11px] font-semibold transition-colors ${
-                  autoApproveTools
-                    ? "border-[rgba(52,211,153,0.34)] bg-[rgba(16,185,129,0.12)] text-[#bbf7d0]"
-                    : "border-[#34343b] bg-[#050507] text-[#d4d4d8] hover:border-[var(--accent)]"
-                }`}
-                title={autoReviewTitle}
-              >
-                <span className={`h-1.5 w-1.5 rounded-full ${autoApproveTools ? "bg-emerald-400" : "bg-[#71717a]"}`} />
-                {language === "en" ? "Auto Review" : "自动审查"}
-                <IconInfo className="h-3 w-3 opacity-75" />
-              </button>
-            )}
-          </div>
-        )}
-
         <div className={`bg-[#09090b] border border-[#27272a] transition-all flex flex-col relative z-20 ${activeDiffTask ? 'rounded-b-xl border-t-0' : 'rounded-xl'} ${isStreaming ? 'border-[#3f3f46]' : 'focus-within:border-[#3f3f46]'}`} style={isImageStudioMode ? imageStudioPanelStyle : undefined}>
 
           {attachmentNotice && (
@@ -2197,6 +2190,62 @@ export default function Composer({
             )}
           </div>
 
+          {!isImageStudioMode && (queuedUserMessage || activeGuidance) && (
+            <div className="border-t border-[#27272a] bg-[#070709] px-3 py-2">
+              {queuedUserMessage && (
+                <div
+                  data-testid="composer-queued-message"
+                  className="flex min-h-9 items-center gap-2 rounded-md border border-[rgba(96,165,250,0.24)] bg-[rgba(37,99,235,0.08)] px-3 py-2 text-[11px] text-[#dbeafe] shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]"
+                >
+                  <div className="min-w-0 flex-1">
+                    <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-[#93c5fd]">{queuedStatusLabel}</div>
+                    <div className="mt-0.5 truncate text-[12px] leading-snug text-[#e0f2fe]">{queuedMessagePreview}</div>
+                  </div>
+                  <div className="flex shrink-0 items-center gap-1.5">
+                    <button
+                      type="button"
+                      data-testid="composer-guidance-button"
+                      onClick={handleGuideQueuedMessage}
+                      disabled={!queuedCanGuide}
+                      className="inline-flex h-7 items-center gap-1.5 rounded-md border border-[rgba(52,211,153,0.30)] bg-[rgba(16,185,129,0.10)] px-2.5 text-[11px] font-semibold text-[#bbf7d0] transition-colors hover:bg-[rgba(16,185,129,0.18)] disabled:cursor-not-allowed disabled:opacity-45"
+                      title={guidanceButtonTitle}
+                    >
+                      <IconZap className="h-3.5 w-3.5" />
+                      {guidanceButtonLabel}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={clearQueuedUserMessage}
+                      className="flex h-7 w-7 items-center justify-center rounded-md border border-[#34343b] bg-[#050507] text-[#a1a1aa] transition-colors hover:border-[#52525b] hover:text-white"
+                      title={language === "en" ? "Delete queued message" : "删除这条排队指令"}
+                    >
+                      <IconTrash className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                </div>
+              )}
+              {activeGuidance && (
+                <div
+                  data-testid="composer-active-guidance"
+                  className={`${queuedUserMessage ? "mt-2" : ""} flex min-h-9 items-center gap-2 rounded-md border border-[rgba(52,211,153,0.24)] bg-[rgba(16,185,129,0.08)] px-3 py-2 text-[11px] text-[#bbf7d0] shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]`}
+                >
+                  <div className="min-w-0 flex-1">
+                    <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-[#86efac]">{guidanceStatusLabel}</div>
+                    <div className="mt-0.5 truncate text-[12px] leading-snug text-[#dcfce7]">{activeGuidancePreview}</div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={clearActiveGuidance}
+                    className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-[#34343b] bg-[#050507] text-[#a1a1aa] transition-colors hover:border-[#52525b] hover:text-white"
+                    title={language === "en" ? "Undo guidance" : "撤销引导"}
+                  >
+                    <IconTrash className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
           <div className="flex items-center justify-between gap-3 px-3 py-2.5 bg-[#09090b] rounded-b-xl border-t border-[#27272a]">
             <div className="relative flex min-w-0 flex-wrap items-center gap-2">
 
@@ -2331,6 +2380,24 @@ export default function Composer({
                   </button>
                 </>
               )}
+              {!isImageStudioMode && onToggleAutoApprove && (
+                <button
+                  type="button"
+                  data-testid="composer-auto-review-toggle"
+                  onClick={handleToggleAutoReview}
+                  disabled={autoReviewToggleDisabled}
+                  className={`inline-flex h-7 shrink-0 items-center gap-1.5 rounded-[7px] border px-2.5 text-[11px] font-semibold transition-colors disabled:cursor-not-allowed ${
+                    autoApproveTools
+                      ? "border-[rgba(52,211,153,0.32)] bg-[rgba(16,185,129,0.12)] text-[#bbf7d0] disabled:opacity-75"
+                      : "border-[#34343b] bg-[#050507] text-[#d4d4d8] hover:border-[var(--accent)] hover:text-white"
+                  }`}
+                  title={autoReviewButtonTitle}
+                >
+                  <span className={`h-1.5 w-1.5 rounded-full ${autoApproveTools ? "bg-emerald-400" : "bg-[#71717a]"}`} />
+                  {language === "en" ? "Auto Review" : "自动审查"}
+                  <IconInfo className="h-3.5 w-3.5 opacity-75" />
+                </button>
+              )}
               {isImageStudioMode && (
                 <button
                   onClick={handleAttachButtonClick}
@@ -2360,35 +2427,19 @@ export default function Composer({
               {/* Send / Stop button */}
               {!activeDiffTask && (
                 isStreaming ? (
-                  <>
-                    <button
-                      type="button"
-                      data-testid="composer-guidance-button"
-                      onClick={handleGuideCurrentRun}
-                      disabled={!draftInput.trim()}
-                      className="inline-flex h-8 items-center gap-1.5 rounded-md border border-[rgba(52,211,153,0.26)] bg-[#09090b] px-2.5 text-[11px] font-semibold text-[#bbf7d0] shadow-sm transition-colors hover:bg-[rgba(16,185,129,0.12)] disabled:cursor-not-allowed disabled:opacity-45"
-                      title={guidanceButtonTitle}
-                    >
-                      <IconZap className="h-3.5 w-3.5" />
-                      {guidanceButtonLabel}
-                    </button>
-                    <button
-                      data-testid="composer-send-button"
-                      disabled={isSubmitPending || cooldownSec > 0 || (!draftInput.trim() && contextMentions.length === 0 && attachedFiles.length === 0 && pendingImages.length === 0)}
-                      onClick={handleSubmitComposerMessage}
-                      className="bg-[#09090b] border border-[#27272a] text-[#d4d4d8] hover:bg-white hover:text-black w-8 h-8 flex items-center justify-center rounded-md transition-colors disabled:opacity-50 shadow-sm"
-                      title={queueButtonTitle}
-                    >
-                      <IconArrowUp className="w-4 h-4" />
-                    </button>
-                    <button
-                      onClick={onStopGeneration}
-                      className="bg-[#09090b] border border-[#7f1d1d] text-[#f48771] hover:bg-[#7f1d1d] hover:text-white w-8 h-8 flex items-center justify-center rounded-md transition-colors shadow-sm"
-                      title={language === "en" ? "Stop current run" : "停止当前执行"}
-                    >
-                      <IconStop className="w-4 h-4" />
-                    </button>
-                  </>
+                  <button
+                    data-testid={streamingPrimaryQueuesMessage ? "composer-send-button" : "composer-stop-button"}
+                    disabled={streamingPrimaryQueuesMessage ? (isSubmitPending || cooldownSec > 0) : false}
+                    onClick={streamingPrimaryQueuesMessage ? handleSubmitComposerMessage : onStopGeneration}
+                    className={`flex h-8 w-8 items-center justify-center rounded-md border shadow-sm transition-colors disabled:opacity-50 ${
+                      streamingPrimaryQueuesMessage
+                        ? "border-[#27272a] bg-[#09090b] text-[#d4d4d8] hover:bg-white hover:text-black"
+                        : "border-[#7f1d1d] bg-[#09090b] text-[#f48771] hover:bg-[#7f1d1d] hover:text-white"
+                    }`}
+                    title={streamingPrimaryQueuesMessage ? queueButtonTitle : (language === "en" ? "Stop current run" : "停止当前执行")}
+                  >
+                    {streamingPrimaryQueuesMessage ? <IconArrowUp className="w-4 h-4" /> : <IconStop className="w-4 h-4" />}
+                  </button>
                 ) : (
                   <button
                     data-testid="composer-send-button"

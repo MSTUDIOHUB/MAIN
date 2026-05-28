@@ -329,10 +329,10 @@ function normalizePendingDecisionInputKey(input: string): string {
     .toLowerCase();
 }
 
-type SessionAutoApproveScope = "workspace_write" | "shell" | "local_file_read";
+type SessionAutoApproveScope = "workspace_write" | "shell" | "local_file_read" | "browser_control";
 
-const SESSION_AUTO_APPROVE_SCOPE_SET = new Set<SessionAutoApproveScope>(["workspace_write", "shell", "local_file_read"]);
-const DEFAULT_SESSION_AUTO_APPROVE_SCOPES: SessionAutoApproveScope[] = ["workspace_write", "shell", "local_file_read"];
+const SESSION_AUTO_APPROVE_SCOPE_SET = new Set<SessionAutoApproveScope>(["workspace_write", "shell", "local_file_read", "browser_control"]);
+const DEFAULT_SESSION_AUTO_APPROVE_SCOPES: SessionAutoApproveScope[] = ["workspace_write", "shell", "local_file_read", "browser_control"];
 
 function normalizeSessionAutoApproveScopes(value: unknown): SessionAutoApproveScope[] {
   if (!Array.isArray(value)) return [];
@@ -360,6 +360,7 @@ function resolveSessionAutoApproveScopeForToolCall(toolCall: {
   if (toolCall.risk === "local_file_read") return "local_file_read";
   if (toolCall.name === "write_file" || toolCall.name === "replace_in_file" || toolCall.name === "apply_patch") return "workspace_write";
   if (toolCall.name === "run_command" || toolCall.name === "execute_command" || toolCall.name === "send_pty_input") return "shell";
+  if (toolCall.risk === "browser_control" || toolCall.name === "browser_evaluate") return "browser_control";
   return null;
 }
 
@@ -6493,9 +6494,18 @@ export const useAppStore = create<AppState>()(
   activeGuidance: null,
   pendingRunDecisionResolver: null,
   setAutoApproveTools: (v) =>
-    set({
-      autoApproveTools: v,
-      autoApproveToolScopes: v ? buildSessionAutoApproveScopes(true) : [],
+    set((s) => {
+      if (!v && s.autoApproveTools && (s.isGenerating || s.agentStatus === "running" || s.agentStatus === "pending_review")) {
+        logStoreEvent("auto_review_disable_blocked", {
+          agentStatus: s.agentStatus,
+          isGenerating: s.isGenerating,
+        });
+        return {};
+      }
+      return {
+        autoApproveTools: v,
+        autoApproveToolScopes: v ? buildSessionAutoApproveScopes(true) : [],
+      };
     }),
   setReadOnlyAutoApproveForSession: (v) => set({ readOnlyAutoApproveForSession: v }),
   queueUserMessage: (text, images, options) => {
@@ -6511,9 +6521,6 @@ export const useAppStore = create<AppState>()(
     if (!queued) return;
     set({
       queuedUserMessage: queued,
-      input: text,
-      contextMentions: queued.contextMentions || [],
-      attachedFiles: queued.attachedFiles || [],
     });
     logStoreEvent("queued_user_message_set", {
       chars: queued.text.length,

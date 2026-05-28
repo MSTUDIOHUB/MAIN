@@ -28,6 +28,7 @@ const CLOUD_SETTINGS_MODEL_SELECT_SCENARIO = "cloud-settings-model-select";
 const CLOUD_SETTINGS_EMPTY_SCENARIO = "cloud-settings-empty";
 const CLOUD_STATUS_ACTIVE_SERVER_MODEL_SCENARIO = "cloud-status-active-server-model";
 const STREAMING_TIMER_SCENARIO = "streaming-timer";
+const COMPOSER_RUNNING_GUIDANCE_SCENARIO = "composer-running-guidance";
 const STREAMING_RESPONSIVENESS_SCENARIO = "streaming-responsiveness";
 const LOCAL_PLAN_SLOW_FIRST_TOKEN_SCENARIO = "local-plan-slow-first-token";
 const REAL_OMLX_PLAN_FLOW_SCENARIO = "real-omlx-plan-flow";
@@ -204,6 +205,11 @@ function bindBridgeSnapshot(scenario: string) {
       isPlanApproved: state.isPlanApproved,
       planArtifactPaths: state.planArtifacts.map((artifact) => artifact.path),
       agentStatus: state.agentStatus,
+      isGenerating: state.isGenerating,
+      input: state.input,
+      queuedUserMessage: state.queuedUserMessage,
+      activeGuidance: state.activeGuidance,
+      autoApproveTools: state.autoApproveTools,
       planTasks: state.planTasks,
       selectedDiffTaskId: state.selectedDiffTaskId,
       showPlanPanel: state.showPlanPanel,
@@ -4484,6 +4490,91 @@ function seedStreamingTimerScenario() {
   return cleanup;
 }
 
+function seedComposerRunningGuidanceScenario() {
+  const bridge = getBridge();
+  if (!bridge) return undefined;
+
+  bridge.events = [{ type: "boot" }];
+  bridge.savedDocuments = [];
+  bridge.completed = false;
+
+  incrementSeedCount(COMPOSER_RUNNING_GUIDANCE_SCENARIO);
+
+  const now = Date.now();
+  const turnId = "e2e-composer-running-guidance-turn";
+  const userBlockId = useAppStore.getState()._nextTaskId();
+
+  useAppStore.setState((state) => ({
+    ...state,
+    config: {
+      ...state.config,
+      language: "zh",
+      workflowMode: "chat",
+    },
+    currentWorkspace: "/tmp/e2e-composer-running-guidance",
+    selectedWorkspace: "/tmp/e2e-composer-running-guidance",
+    sessionsByWorkspace: {
+      "/tmp/e2e-composer-running-guidance": [
+        {
+          id: 999011,
+          title: "E2E Composer Running Guidance",
+          date: new Date(now).toISOString(),
+          active: true,
+          messages: [],
+        },
+      ],
+    },
+    currentSessionId: 999011,
+    selectedMainModeKey: "main_mode",
+    selectedNexusModeKey: "nexus_general",
+    taskFlow: [
+      { id: userBlockId, turnId, type: "user", content: "请检查运行中输入体验。" },
+    ],
+    conversationTurns: [
+      {
+        id: turnId,
+        userPrompt: "请检查运行中输入体验。",
+        title: "运行中输入体验",
+        mode: "chat",
+        status: "executing",
+        summary: "",
+        blockIds: [userBlockId],
+        collapsed: false,
+        createdAt: now,
+      },
+    ],
+    currentTurnId: turnId,
+    input: "",
+    attachedFiles: [],
+    contextMentions: [],
+    queuedUserMessage: null,
+    activeGuidance: null,
+    autoApproveTools: false,
+    autoApproveToolScopes: [],
+    elapsedTime: 0,
+    isGenerating: true,
+    agentStatus: "running",
+    abortController: new AbortController(),
+    showDiff: false,
+    showPlanPanel: false,
+    showTerminal: false,
+    showFilePanel: false,
+    selectedDiffTaskId: null,
+  }));
+
+  bindBridgeSnapshot(COMPOSER_RUNNING_GUIDANCE_SCENARIO);
+
+  const cleanup = () => {
+    const latest = useAppStore.getState();
+    latest.abortController?.abort();
+    useAppStore.setState({ abortController: null });
+    bridge.initialized = false;
+  };
+
+  bridge.cleanup = cleanup;
+  return cleanup;
+}
+
 function seedStreamingResponsivenessScenario() {
   const bridge = getBridge();
   if (!bridge) return undefined;
@@ -6312,6 +6403,10 @@ export function initializeE2EScenarios(): (() => void) | undefined {
 
   if (scenario === STREAMING_TIMER_SCENARIO) {
     return seedStreamingTimerScenario();
+  }
+
+  if (scenario === COMPOSER_RUNNING_GUIDANCE_SCENARIO) {
+    return seedComposerRunningGuidanceScenario();
   }
 
   if (scenario === STREAMING_RESPONSIVENESS_SCENARIO) {

@@ -26,7 +26,7 @@ export function isConversationalFirstPersonNarration(text: string): boolean {
   if (
     raw.includes("```") || // 排除大型代码块
     raw.includes("|") ||   // 排除 markdown 表格
-    /\n\s*(?:\d+\.|\*|-)\s+/.test(raw) || // 排除多行列表结构
+    /\n\s*(?:\d+\.?|\*|-)(?:\s+|$)/.test(raw) || // 排除多行列表结构或流式未完结列表标志
     raw.length > 350       // 限制字符长度在 350 字以内，保证 Capsule 排版舒适
   ) {
     return false;

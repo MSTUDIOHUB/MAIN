@@ -156,6 +156,27 @@ test("runtime tool planner classifies lifecycle actions and initial states", () 
   }));
   assert.equal(reviewRequired.action, "review_required");
   assert.equal(initialLifecycleStateForPlanAction(reviewRequired.action), "awaiting_review");
+
+  const browserReview = planRuntimeToolCall(createPlanInput({
+    toolCall: { id: "g", name: "browser_evaluate", arguments: JSON.stringify({ url: "http://127.0.0.1:5173" }) },
+    availableToolNames: new Set(["read_file", "browser_evaluate"]),
+    capabilityRegistry: {
+      tools: {
+        browser_evaluate: {
+          name: "browser_evaluate",
+          source: "built_in",
+          category: "browser",
+          risk: "browser_control",
+          autoExecutable: false,
+          approvalRequired: true,
+          enabled: true,
+        },
+      },
+      policy: defaultToolPolicy,
+    },
+  }));
+  assert.equal(browserReview.action, "review_required");
+  assert.equal(browserReview.risk, "browser_control");
 });
 
 test("approved plan execution blocks shell and source writes until runtime tasks exist", () => {

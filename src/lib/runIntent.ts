@@ -281,6 +281,7 @@ const STRONG_PLAN_PATTERNS = [
 
 const STRONG_EXECUTE_PATTERNS = [
   /^(?:执行|开始执行|继续执行)(?:修复|修改|处理|实现|改动|改造|重构|完善|部署|发布)/i,
+  /(?:找到|定位|找出|排查|诊断|分析|检查).{0,40}(?:问题|bug|错误|异常|故障|原因|root cause).{0,80}(?:修复|解决|修改|改掉|处理)/i,
   /^(?:帮我|请|直接|现在)?(?:修复|解决|处理)(?:一下|下)?(?:这个|该|当前)?(?:问题|bug|错误|故障|异常|展示问题|显示问题|逻辑问题|功能问题|页面问题|组件问题)?/i,
   /(?:帮我|请|直接|现在)?(?:修复|解决|改掉).{0,48}(?:问题|bug|错误|故障|异常|展示|显示|逻辑|功能|页面|组件|模块)/i,
   /(?:帮我|请|直接|现在)?(?:修改|改一下|改动|处理一下)(?:这个|该|当前)?(?:功能|逻辑|问题|模块|文件)?/i,
@@ -1357,18 +1358,15 @@ export function resolveTurnRunIntent(
 
   if (hasStrongExecuteSignal && hasStrongAnalyzeSignal) {
     return finalize({
-      intent: "respond",
+      intent: "execute",
       reason: localizeReason(
         language,
-        "检测到修复/修改意图；真实操作需要先得到用户批准。",
-        "Detected an implementation request; real operations require user approval first.",
+        "检测到“先定位/分析问题，再修复”的明确执行语义；本轮直接进入可写入与验证的执行链路。",
+        "Detected an explicit find/analyze-then-fix request, so this turn goes directly into the execution-capable workflow.",
       ),
       confidence: 0.94,
       bypassMainRouter: false,
       riskLevel: "medium",
-      needsDecision: true,
-      suggestedIntent: "execute",
-      decisionOptions: ["execute", "respond"],
     });
   }
 
@@ -1420,35 +1418,29 @@ export function resolveTurnRunIntent(
 
   if (context.mainModeKey === "game_studio" && matchesAny(normalizedInput, GAME_STUDIO_EXECUTE_PATTERNS)) {
     return finalize({
-      intent: "respond",
+      intent: "execute",
       reason: localizeReason(
         language,
-        "检测到 Game Studio 中明确的实现/重构/完善请求；进入工作室执行链路前需要用户批准。",
-        "Detected an explicit implementation/refactor/completion request inside Game Studio; user approval is required before studio execution.",
+        "检测到 Game Studio 中明确的实现、重构或完善请求；本轮直接进入可写入与验证的执行链路。",
+        "Detected an explicit implementation, refactor, or completion request inside Game Studio, so this turn goes directly into the execution-capable workflow.",
       ),
       confidence: 0.9,
       bypassMainRouter: false,
       riskLevel: "medium",
-      needsDecision: true,
-      suggestedIntent: "execute",
-      decisionOptions: ["execute", "respond"],
     });
   }
 
   if (hasStrongExecuteSignal) {
     return finalize({
-      intent: "respond",
+      intent: "execute",
       reason: localizeReason(
         language,
-        "检测到明确的真实操作请求；开始操作前需要用户批准。",
-        "Detected a real-operation request; user approval is required before execution.",
+        "检测到明确的修复、实现或真实操作请求；本轮直接进入可写入与验证的执行链路。",
+        "Detected an explicit fix, implementation, or real-operation request, so this turn goes directly into the execution-capable workflow.",
       ),
       confidence: 0.94,
       bypassMainRouter: false,
       riskLevel: "medium",
-      needsDecision: true,
-      suggestedIntent: "execute",
-      decisionOptions: ["execute", "respond"],
     });
   }
 

@@ -89,6 +89,77 @@ export function buildMaxStepsFinalTextPrompt(input: {
   ].filter(Boolean).join("\n");
 }
 
+export function buildChatFinalSynthesisPrompt(input: {
+  language: "zh" | "en";
+  reason: string;
+  iteration: number;
+  repeatedTargets?: string[];
+  recentActivity?: Array<{
+    name?: string;
+    status?: string;
+    target?: string;
+    detail?: string;
+  }>;
+}): string {
+  const repeatedTargets = input.repeatedTargets?.filter(Boolean) || [];
+  const recent = (input.recentActivity || [])
+    .slice(-8)
+    .map((activity) => {
+      const target = activity.target ? ` ${activity.target}` : "";
+      const detail = activity.detail ? ` - ${String(activity.detail).slice(0, 180)}` : "";
+      return `- ${activity.status || "unknown"}:${activity.name || "tool"}${target}${detail}`;
+    });
+
+  if (input.language === "zh") {
+    return [
+      "CHAT_FINAL_SYNTHESIS: 本轮对话已经进入收束回答模式。",
+      `触发原因：${input.reason || "需要基于已有证据直接回答"}。`,
+      `当前轮次：${input.iteration}。工具已关闭；直到用户下一条输入前都不要再调用任何工具。`,
+      repeatedTargets.length ? `重复/已知目标：${repeatedTargets.join("、")}。` : "",
+      recent.length ? "最近已获得的工具证据：" : "",
+      ...recent,
+      "严格要求：",
+      "1. 只输出面向用户的 Markdown 正文，不要输出 `<tool_use>`、JSON 工具调用、隐藏思考或新的行动承诺。",
+      "2. 直接回答用户最初的问题；如果日志/文件证据已经足够，给出判断和原因。",
+      "3. 如果证据不足，明确说明还缺什么以及为什么不能继续自动判断；不要再尝试读取补证。",
+      "4. 使用用户要求的语言作答。",
+    ].filter(Boolean).join("\n");
+  }
+
+  return [
+    "CHAT_FINAL_SYNTHESIS: This chat turn is now in final-answer synthesis mode.",
+    `Trigger reason: ${input.reason || "answer from existing evidence"}.`,
+    `Current iteration: ${input.iteration}. Tools are disabled until the next user input.`,
+    repeatedTargets.length ? `Repeated/known targets: ${repeatedTargets.join(", ")}.` : "",
+    recent.length ? "Recent evidence already gathered:" : "",
+    ...recent,
+    "Strict requirements:",
+    "1. Output user-visible Markdown text only. Do not output `<tool_use>`, JSON tool calls, hidden reasoning, or new promises to act.",
+    "2. Answer the user's original question directly; if the logs/files are sufficient, state the conclusion and why.",
+    "3. If evidence is insufficient, state the exact gap and why automation cannot decide further; do not read more to fill it.",
+    "4. Use the user's requested response language.",
+  ].filter(Boolean).join("\n");
+}
+
+export function shouldTriggerChatFinalSynthesis(input: {
+  workflowMode: "chat" | "edit" | "plan";
+  runtimeIntent: "respond" | "execute" | string;
+  finishReason?: string | null;
+  wasLanguageMismatchRecovery?: boolean;
+  languageMismatchAlreadyRetried?: boolean;
+  toolCallCount?: number;
+  visibleChars?: number;
+  recentReadOnlyActivityCount?: number;
+  consecutiveNoToolCount?: number;
+}): boolean {
+  if (input.workflowMode !== "chat" || input.runtimeIntent !== "respond") return false;
+  if ((input.toolCallCount || 0) > 0) return false;
+  if (input.wasLanguageMismatchRecovery && input.languageMismatchAlreadyRetried) return true;
+  if (input.finishReason === "length") return true;
+  if ((input.consecutiveNoToolCount || 0) >= 1 && (input.recentReadOnlyActivityCount || 0) >= 6) return true;
+  return false;
+}
+
 export function buildMaxStepsToolCallIgnoredNotice(input: {
   language: "zh" | "en";
   iteration: number;

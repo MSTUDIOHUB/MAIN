@@ -107,32 +107,35 @@ test("plain Chinese planning wording stays natural without slash lock", () => {
   assert.equal(result.needsDecision, undefined);
 });
 
-test("plain English implementation request asks for operation approval", () => {
+test("plain English implementation request enters execute workflow", () => {
   const result = resolveTurnRunIntent("Please implement it directly and fix the bug", createContext());
-  assert.equal(result.intent, "respond");
-  assert.equal(result.needsDecision, true);
-  assert.equal(result.suggestedIntent, "execute");
-  assert.deepEqual(result.decisionOptions, ["execute", "respond"]);
+  assert.equal(result.intent, "execute");
+  assert.equal(result.commandDirective.kind, "file_modify");
+  assert.equal(result.commandDirective.requiresApproval, true);
+  assert.equal(result.needsDecision, undefined);
 });
 
-test("fix requests with analysis-domain nouns ask for operation approval", () => {
+test("fix requests with analysis-domain nouns enter execute workflow", () => {
   for (const input of [
     "修复数据分析展示问题",
     "执行修复",
     "请修复当前数据分析页面显示问题",
+    "找到问题进行修复",
   ]) {
     const result = resolveTurnRunIntent(input, createContext());
-    assert.equal(result.intent, "respond", input);
-    assert.equal(result.needsDecision, true, input);
-    assert.equal(result.suggestedIntent, "execute", input);
+    assert.equal(result.intent, "execute", input);
+    assert.equal(result.commandDirective.kind, "file_modify", input);
+    assert.equal(result.commandDirective.requiresApproval, true, input);
+    assert.equal(result.needsDecision, undefined, input);
   }
 });
 
-test("Chinese design based implementation request asks for operation approval", () => {
+test("Chinese design based implementation request enters execute workflow", () => {
   const result = resolveTurnRunIntent("请根据设计方案 design.md 来完成修改", createContext());
-  assert.equal(result.intent, "respond");
-  assert.equal(result.needsDecision, true);
-  assert.equal(result.suggestedIntent, "execute");
+  assert.equal(result.intent, "execute");
+  assert.equal(result.commandDirective.kind, "file_modify");
+  assert.equal(result.commandDirective.requiresApproval, true);
+  assert.equal(result.needsDecision, undefined);
 });
 
 test("Git commit and push requests ask for operation approval", () => {
@@ -142,22 +145,21 @@ test("Git commit and push requests ask for operation approval", () => {
     "commit and push my changes",
   ]) {
     const result = resolveTurnRunIntent(input, createContext());
-    assert.equal(result.intent, "respond", input);
+    assert.equal(result.intent, "execute", input);
     assert.equal(result.commandDirective.kind, "git", input);
     assert.equal(result.commandDirective.action, "commit_push", input);
     assert.equal(result.requiresApproval, true, input);
-    assert.equal(result.needsDecision, true, input);
-    assert.equal(result.suggestedIntent, "execute", input);
+    assert.equal(result.needsDecision, undefined, input);
   }
 });
 
-test("Git status inspection asks before shell-backed Git access", () => {
+test("Git status inspection enters execute workflow with git approval metadata", () => {
   const result = resolveTurnRunIntent("先帮我查看 Git 状态和变更内容", createContext());
-  assert.equal(result.intent, "respond");
+  assert.equal(result.intent, "execute");
   assert.equal(result.commandDirective.kind, "git");
   assert.equal(result.commandDirective.action, "diff");
-  assert.equal(result.needsDecision, true);
-  assert.equal(result.suggestedIntent, "execute");
+  assert.equal(result.commandDirective.requiresApproval, true);
+  assert.equal(result.needsDecision, undefined);
 });
 
 test("deployment and server sync requests ask for operation approval", () => {
@@ -167,11 +169,10 @@ test("deployment and server sync requests ask for operation approval", () => {
     "run deployment script",
   ]) {
     const result = resolveTurnRunIntent(input, createContext());
-    assert.equal(result.intent, "respond", input);
+    assert.equal(result.intent, "execute", input);
     assert.equal(result.commandDirective.kind, "shell", input);
     assert.equal(result.commandDirective.requiresApproval, true, input);
-    assert.equal(result.needsDecision, true, input);
-    assert.equal(result.suggestedIntent, "execute", input);
+    assert.equal(result.needsDecision, undefined, input);
   }
 });
 
@@ -542,7 +543,7 @@ test("game studio workflow slash bypasses MAIN plan interception", () => {
   assert.equal(result.bypassMainRouter, true);
 });
 
-test("game studio explicit implementation text asks before studio workflow execution", () => {
+test("game studio explicit implementation text enters execute workflow", () => {
   for (const input of [
     "立即开始重构并完善",
     "继续实现 SnakeController",
@@ -555,9 +556,8 @@ test("game studio explicit implementation text asks before studio workflow execu
         mainModeKey: "game_studio",
       }),
     );
-    assert.equal(result.intent, "respond", input);
-    assert.equal(result.needsDecision, true, input);
-    assert.equal(result.suggestedIntent, "execute", input);
+    assert.equal(result.intent, "execute", input);
+    assert.equal(result.needsDecision, undefined, input);
   }
 });
 
@@ -598,7 +598,7 @@ test("approval phrasing does not trigger plan approval without plan artifacts", 
   assert.notEqual(result.controlAction, "approve_plan");
 });
 
-test("ordinary direct execution without plan artifacts asks for operation approval", () => {
+test("ordinary direct execution without plan artifacts enters execute workflow", () => {
   const result = resolveTurnRunIntent(
     "现在就直接实现这个功能",
     createContext({
@@ -608,9 +608,10 @@ test("ordinary direct execution without plan artifacts asks for operation approv
     }),
   );
 
-  assert.equal(result.intent, "respond");
-  assert.equal(result.needsDecision, true);
-  assert.equal(result.suggestedIntent, "execute");
+  assert.equal(result.intent, "execute");
+  assert.equal(result.commandDirective.kind, "file_modify");
+  assert.equal(result.commandDirective.requiresApproval, true);
+  assert.equal(result.needsDecision, undefined);
 });
 
 test("generic continuation phrases are recognized as previous-turn continuation", () => {

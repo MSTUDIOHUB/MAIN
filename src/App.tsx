@@ -1434,11 +1434,15 @@ export default function App() {
 
     if (state.isGenerating || state.agentStatus === "running" || state.agentStatus === "pending_review") {
       appendDebugLog("warn", "ui.sendMessage", {
-        phase: "blocked_busy",
+        phase: "queued_busy",
         agentStatus: state.agentStatus,
         isGenerating: state.isGenerating,
       });
-      return false;
+      state.queueUserMessage(text, images, {
+        contextMentions: contextMentionsSnapshot,
+        attachedFiles: attachedFilesSnapshot,
+      });
+      return true;
     }
 
     appendDebugLog("info", "ui.sendMessage", {

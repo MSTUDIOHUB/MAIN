@@ -303,10 +303,12 @@ import {
   type ProgressNarration,
 } from "./progressNarration";
 import {
+  buildChatFinalSynthesisPrompt,
   buildEmptyModelResponsePauseNotice,
   buildMaxStepsFinalTextPrompt,
   buildMaxStepsToolCallIgnoredNotice,
   resolveAgentLoopMaxIterations,
+  shouldTriggerChatFinalSynthesis,
   shouldUseMaxStepsFinalTextOnly,
   type AgentLoopIterationLimits,
 } from "./agentLoopSafety";
@@ -383,6 +385,12 @@ const FORCE_CONTEXT_TEXT_CHARS = 60_000;
 const FORCE_CONTEXT_TOOL_RESULT_CHARS = 35_000;
 const FORCE_CONTEXT_TOOL_MESSAGE_COUNT = 12;
 const FORCE_CONTEXT_TOOL_LOOP_INTERVAL = 6;
+const CHAT_REPAIR_REQUEST_RE =
+  /(?:找到|定位|排查|分析|检查|诊断|找出).{0,40}(?:问题|bug|错误|异常|故障|原因|root cause).{0,80}(?:修复|解决|修改|改掉|处理)|(?:修复|解决|修改|改掉|处理).{0,80}(?:问题|bug|错误|异常|故障)|\b(?:find|locate|diagnose|investigate|analy[sz]e).{0,60}(?:issue|bug|error|problem|root cause).{0,80}(?:fix|repair|patch|resolve)|\b(?:fix|repair|patch|resolve).{0,60}(?:issue|bug|error|problem)\b/i;
+
+function looksLikeRepairExecutionRequest(text: string): boolean {
+  return CHAT_REPAIR_REQUEST_RE.test(String(text || "").replace(/\s+/g, " ").trim());
+}
 
 function getMessageContentText(content: AgentMessage["content"]): string {
   if (typeof content === "string") return content;
@@ -1240,7 +1248,7 @@ export interface OrchestratorCallbacks {
   requestReview: (toolCall: {
     name: string;
     arguments: Record<string, unknown>;
-    risk?: "local_file_read";
+    risk?: "local_file_read" | "browser_control";
     localFileReadPath?: string;
   }) => Promise<ReviewDecision>;
 }
@@ -3970,7 +3978,12 @@ async function executeWriteToolWithReview(
 
   let decision: ReviewDecision;
   try {
-    decision = await callbacks.requestReview({ name: tc.name, arguments: toolArgs });
+    const browserRisk = tc.name === "browser_evaluate" ? "browser_control" : undefined;
+    decision = await callbacks.requestReview({
+      name: tc.name,
+      arguments: toolArgs,
+      ...(browserRisk ? { risk: browserRisk } : {}),
+    });
   } catch {
     callbacks.onStatusChange("idle");
     return {
@@ -4304,6 +4317,7 @@ export async function executeAgentLoop(
     .find((message) => message.role === "user");
   const latestUserPromptFullText = latestUserPrompt ? extractCompatibilityTextContent(latestUserPrompt.content) : "";
   const latestUserPromptText = extractPrimaryUserRequestText(latestUserPromptFullText) || latestUserPromptFullText;
+  const repairExecutionRequestInChat = workflowMode === "chat" && looksLikeRepairExecutionRequest(latestUserPromptText);
   const turnInputContextSignals = extractTurnInputContextSignalsFromMessages(initialMessages);
   const commandDirective = callbacks.getCommandDirective?.() ?? null;
   const gameStudioUnityContext =
@@ -4721,6 +4735,9 @@ export async function executeAgentLoop(
   let emptyResponseCountThisTurn = 0;
   let consecutiveReasoningDominatedCount = 0;
   let usedMaxStepsFinalTextPrompt = false;
+  let chatFinalSynthesisActive = false;
+  let chatFinalSynthesisReason = "";
+  let usedChatFinalSynthesisPrompt = false;
   let currentMaxTokens: number | undefined; // undefined = use default
   const getMaxOutputEscalations = () =>
     workflowMode === "plan" && !callbacks.getIsPlanApproved()
@@ -4826,6 +4843,22 @@ export async function executeAgentLoop(
         executeRecoveryMode,
         shouldAllowExecuteRecoveryFileRead(recentToolActivity),
       ),
+      ...context,
+    });
+  };
+  const activateChatFinalSynthesis = (
+    reason: string,
+    context: Record<string, unknown> = {},
+  ) => {
+    if (chatFinalSynthesisActive) return;
+    chatFinalSynthesisActive = true;
+    chatFinalSynthesisReason = reason || "chat_final_synthesis";
+    currentMaxTokens = Math.min(currentMaxTokens ?? 2048, 2048);
+    logAgentEvent("chat_final_synthesis_activated", {
+      iteration,
+      reason: chatFinalSynthesisReason,
+      recentToolActivity: recentToolActivity.length,
+      repeatedTargets: summarizeRepeatedExecuteTargets(recentToolActivity.slice(-12)),
       ...context,
     });
   };
@@ -5353,7 +5386,9 @@ export async function executeAgentLoop(
         repeatedTargets: summarizeRepeatedExecuteTargets(recentToolActivity.slice(-12)),
       });
     }
-    const rawIterationAllTools = finalTextOnlyStep ? [] : resolveAllToolsForRuntime(runtimeIntent);
+    const rawIterationAllTools = finalTextOnlyStep || chatFinalSynthesisActive
+      ? []
+      : resolveAllToolsForRuntime(runtimeIntent);
     const allowApprovedPlanRecoveryFileRead =
       approvedPlanNoToolRecoveryFileReadActive ||
       shouldAllowApprovedPlanRecoveryFileRead(recentPlanToolActivity);
@@ -5731,9 +5766,22 @@ export async function executeAgentLoop(
             repeatedTargets: summarizeRepeatedExecuteTargets(recentToolActivity.slice(-12)),
           })
         : "";
-      const messagesForLLM = finalTextOnlyPrompt
-        ? [...protocolMessagesForLLM, { role: "user" as const, content: finalTextOnlyPrompt }]
+      const chatFinalSynthesisPrompt = chatFinalSynthesisActive && !usedChatFinalSynthesisPrompt
+        ? buildChatFinalSynthesisPrompt({
+            language: callbacks.getPreferredLanguage(),
+            reason: chatFinalSynthesisReason,
+            iteration,
+            repeatedTargets: summarizeRepeatedExecuteTargets(recentToolActivity.slice(-12)),
+            recentActivity: recentToolActivity,
+          })
+        : "";
+      const recoveryPromptForLLM = finalTextOnlyPrompt || chatFinalSynthesisPrompt;
+      const messagesForLLM = recoveryPromptForLLM
+        ? [...protocolMessagesForLLM, { role: "user" as const, content: recoveryPromptForLLM }]
         : protocolMessagesForLLM;
+      if (chatFinalSynthesisPrompt) {
+        usedChatFinalSynthesisPrompt = true;
+      }
       const streamWatchdogOptions = getPlanStreamWatchdogOptions(llmTools.length) ?? {};
       logAgentEvent("llm_request_shape", {
         iteration,
@@ -5758,6 +5806,8 @@ export async function executeAgentLoop(
         executeRecoveryReason,
         recoveryToolSurface: describeExecuteRecoveryToolSurface(executeRecoveryMode, allowExecuteRecoveryFileRead),
         finalTextOnlyStep,
+        chatFinalSynthesisActive,
+        chatFinalSynthesisReason,
         messages: summarizeMessagesForDiagnostics(messagesForLLM),
         managedMessages: summarizeMessagesForDiagnostics(managedAgentMessages),
         allTools: summarizeToolsForDiagnostics(iterationAllTools),
@@ -6678,18 +6728,46 @@ export async function executeAgentLoop(
         turnIntent,
       });
     }
-    if (finalTextOnlyStep && effectiveToolCalls.length > 0) {
+    if ((finalTextOnlyStep || chatFinalSynthesisActive) && effectiveToolCalls.length > 0) {
       callbacks.onStreamToken("__ESCALATION_RESET__:", assistantMsgId);
       const finalText = normalized.visibleText.trim();
       const repeatedTargets = summarizeRepeatedExecuteTargets(recentToolActivity.slice(-12));
-      logAgentEvent("max_steps_tool_calls_ignored", {
+      const shouldPauseUnresolvedChatRepair =
+        chatFinalSynthesisActive &&
+        repairExecutionRequestInChat &&
+        runtimeIntent === "respond";
+      logAgentEvent(chatFinalSynthesisActive ? "chat_final_synthesis_tool_calls_ignored" : "max_steps_tool_calls_ignored", {
         iteration,
         maxIterations: effectiveMaxIterations,
+        reason: chatFinalSynthesisReason,
         toolCalls: effectiveToolCalls.length,
         toolNames: effectiveToolCalls.map((call) => call.name).slice(0, 8),
         visibleChars: finalText.length,
         repeatedTargets,
+        unresolvedRepairRequest: shouldPauseUnresolvedChatRepair,
       });
+      if (shouldPauseUnresolvedChatRepair) {
+        const language = callbacks.getPreferredLanguage();
+        const pauseMessage = buildExecuteNoProgressLoopPauseNotice({
+          language,
+          scope: "chat",
+          repeats: Math.max(1, noProgressBatchRepeatCount),
+          remainingTask: language === "zh"
+            ? "用户要求找到问题并修复，但本轮仍停留在重复只读探索，没有产生真实修改、验证或明确阻塞。请继续时按执行意图恢复，基于已读上下文直接修改/验证，或说明缺少哪个关键输入。"
+            : "The user asked to find and fix the issue, but this turn stayed in repeated read-only exploration without a real change, validation, or concrete blocker. Resume as an execution intent: patch/validate from cached context, or state the exact missing input.",
+          recentActivity: recentToolActivity,
+          repeatedTargets,
+        });
+        callbacks.onNonActionableStop(pauseMessage, "no_action", {
+          phase: "paused",
+          nextStep: language === "zh"
+            ? "继续时应进入执行能力，复用已读证据直接修复或给出精确阻塞。"
+            : "Resume with execution capabilities, reuse cached evidence, and patch or state the exact blocker.",
+          repeatedTargets,
+        });
+        callbacks.onStatusChange("idle");
+        return;
+      }
       if (finalText) {
         callbacks.onAssistantFinalText(finalText, [], {
           hasToolCalls: false,
@@ -6715,16 +6793,30 @@ export async function executeAgentLoop(
         return;
       }
       callbacks.onNonActionableStop(
-        buildMaxStepsToolCallIgnoredNotice({
-          language: callbacks.getPreferredLanguage(),
-          iteration,
-          maxIterations: effectiveMaxIterations,
-          repeatedTargets,
-        }),
+        chatFinalSynthesisActive
+          ? callbacks.getPreferredLanguage() === "zh"
+            ? [
+                "本轮已进入收束回答模式，但模型仍尝试继续调用工具。",
+                "MAIN 已忽略这些工具调用并停止，避免继续扩大同一轮循环。",
+                repeatedTargets.length ? `重复目标：${repeatedTargets.join("、")}` : "重复目标：未定位到单一目标",
+                "下一步：请继续时要求基于已读上下文直接总结，或明确新的执行目标。",
+              ].join("\n")
+            : [
+                "This turn entered final-answer synthesis mode, but the model still attempted tool calls.",
+                "MAIN ignored those calls and stopped to avoid extending the same turn loop.",
+                repeatedTargets.length ? `Repeated targets: ${repeatedTargets.join(", ")}` : "Repeated targets: none isolated",
+                "Next: resume by asking for a direct summary from existing context, or provide a new execution target.",
+              ].join("\n")
+          : buildMaxStepsToolCallIgnoredNotice({
+              language: callbacks.getPreferredLanguage(),
+              iteration,
+              maxIterations: effectiveMaxIterations,
+              repeatedTargets,
+            }),
         "no_action",
         {
           repeatedTargets,
-          recoveryReason: "max_iterations_boundary",
+          recoveryReason: chatFinalSynthesisActive ? "chat_final_synthesis_tool_call" : "max_iterations_boundary",
           nextStep: callbacks.getPreferredLanguage() === "zh"
             ? "复用已读上下文，直接总结、换目标或说明具体阻塞"
             : "reuse cached context, summarize directly, switch targets, or state the concrete blocker",
@@ -6962,6 +7054,33 @@ export async function executeAgentLoop(
       });
     }
 
+    const recentReadOnlyActivityCountForChat = recentToolActivity.filter((activity) =>
+      activity.status === "succeeded" && PLAN_EXPLORATION_READ_ONLY_TOOLS.has(activity.name || "")
+    ).length;
+    if (
+      !chatFinalSynthesisActive &&
+      shouldTriggerChatFinalSynthesis({
+        workflowMode,
+        runtimeIntent,
+        finishReason: normalized.finishReason,
+        toolCallCount: effectiveToolCalls.length,
+        visibleChars: userVisibleText.length,
+        recentReadOnlyActivityCount: recentReadOnlyActivityCountForChat,
+        consecutiveNoToolCount,
+      })
+    ) {
+      activateChatFinalSynthesis("length_no_tool_chat", {
+        finishReason: normalized.finishReason || "unknown",
+        visibleChars: userVisibleText.length,
+        hiddenThoughtChars: normalized.hiddenThought.length,
+        replyOptions: finalReplyOptions.length,
+        recentReadOnlyActivityCount: recentReadOnlyActivityCountForChat,
+      });
+      callbacks.onStreamToken("__ESCALATION_RESET__:", assistantMsgId);
+      callbacks.onStatusChange("running");
+      continue;
+    }
+
     const shouldRecoverToolUnavailableClaim =
       isCloudProfile &&
       iterationAllTools.length > 0 &&
@@ -7099,8 +7218,31 @@ export async function executeAgentLoop(
       targetLanguage: callbacks.getPreferredLanguage(),
       suppressedByPlanGuard: shouldSuppressApprovedPlanNoToolText,
       toolCallCount: effectiveToolCalls.length,
-      alreadyRetried: usedLanguageMismatchRecoveryPrompt,
+      alreadyRetried: usedLanguageMismatchRecoveryPrompt || chatFinalSynthesisActive,
     });
+
+    if (
+      languageMismatchDecision.exhausted &&
+      !chatFinalSynthesisActive &&
+      shouldTriggerChatFinalSynthesis({
+        workflowMode,
+        runtimeIntent,
+        wasLanguageMismatchRecovery: true,
+        languageMismatchAlreadyRetried: true,
+        toolCallCount: effectiveToolCalls.length,
+        visibleChars: userVisibleText.length,
+        recentReadOnlyActivityCount: recentReadOnlyActivityCountForChat,
+        consecutiveNoToolCount,
+      })
+    ) {
+      activateChatFinalSynthesis("language_mismatch_after_retry", {
+        detectedLanguage: languageMismatchDecision.detectedLanguage,
+        visibleChars: userVisibleText.length,
+      });
+      callbacks.onStreamToken("__ESCALATION_RESET__:", assistantMsgId);
+      callbacks.onStatusChange("running");
+      continue;
+    }
 
     if (languageMismatchDecision.action === "recover_once") {
       usedLanguageMismatchRecoveryPrompt = true;
@@ -9553,13 +9695,52 @@ export async function executeAgentLoop(
           })
         : { shouldRecover: false, reason: "", readOnlyActivityCount: 0, batchToolChars: 0 };
     if (chatReadOnlyNoProgress.shouldRecover) {
-      const language = callbacks.getPreferredLanguage();
       const repeatedTargets = summarizeRepeatedExecuteTargets(recentToolActivity.slice(-12));
       const progressSignature = buildPlanProgressSignatureFromToolActivity(recentToolActivity) || noProgressBatchSignature;
-      const nextStep = language === "zh"
-        ? "复用已读上下文，直接回答、换目标或说明具体阻塞"
-        : "reuse cached context to answer directly, switch targets, or state the concrete blocker";
-      logAgentEvent("loop_stop", {
+      if (repairExecutionRequestInChat) {
+        logAgentEvent("chat_repair_readonly_no_progress_paused", {
+          reason: chatReadOnlyNoProgress.reason,
+          iteration,
+          repeats: noProgressBatchRepeatCount,
+          readOnlyActivityCount: chatReadOnlyNoProgress.readOnlyActivityCount,
+          batchToolChars: chatReadOnlyNoProgress.batchToolChars,
+          repeatedTargets,
+          progressSignature: truncateForLog(progressSignature, 220),
+          userPromptPreview: truncateForLog(latestUserPromptText, 180),
+        });
+        const language = callbacks.getPreferredLanguage();
+        callbacks.onNonActionableStop(
+          buildExecuteNoProgressLoopPauseNotice({
+            language,
+            scope: "chat",
+            repeats: Math.max(1, noProgressBatchRepeatCount),
+            remainingTask: language === "zh"
+              ? "用户目标是找到问题并修复；当前回合只完成了只读排查，没有进入写入、命令验证、浏览器验证或明确阻塞。请继续时按执行意图恢复，而不是再输出普通总结。"
+              : "The user's goal is to find and fix the issue; this turn only completed read-only investigation and did not reach a write, command validation, browser validation, or concrete blocker. Resume as execution instead of ending with a plain summary.",
+            recentActivity: recentToolActivity,
+            repeatedTargets,
+          }),
+          "no_action",
+          {
+            phase: "paused",
+            nextStep: language === "zh"
+              ? "继续时应进入执行能力，基于已读证据直接修复/验证，或说明精确阻塞。"
+              : "Resume with execution capabilities and patch/validate from cached evidence, or state the exact blocker.",
+            repeatedTargets,
+            progressSignature,
+          },
+        );
+        callbacks.onStatusChange("idle");
+        return;
+      }
+      activateChatFinalSynthesis(chatReadOnlyNoProgress.reason, {
+        repeats: noProgressBatchRepeatCount,
+        readOnlyActivityCount: chatReadOnlyNoProgress.readOnlyActivityCount,
+        batchToolChars: chatReadOnlyNoProgress.batchToolChars,
+        repeatedTargets,
+        progressSignature: truncateForLog(progressSignature, 220),
+      });
+      logAgentEvent("chat_readonly_no_progress_final_synthesis", {
         reason: chatReadOnlyNoProgress.reason,
         iteration,
         repeats: noProgressBatchRepeatCount,
@@ -9568,27 +9749,8 @@ export async function executeAgentLoop(
         repeatedTargets,
         progressSignature: truncateForLog(progressSignature, 220),
       });
-      callbacks.onNonActionableStop(
-        buildExecuteNoProgressLoopPauseNotice({
-          language,
-          scope: "chat",
-          repeats: Math.max(1, noProgressBatchRepeatCount),
-          remainingTask: language === "zh"
-            ? "当前对话回合只有只读探索，没有产出最终回答或具体阻塞。"
-            : "the chat turn produced only read-only exploration, not a final answer or concrete blocker",
-          recentActivity: recentToolActivity,
-          repeatedTargets,
-        }),
-        "no_action",
-        {
-          progressSignature,
-          repeatedTargets,
-          recoveryReason: chatReadOnlyNoProgress.reason,
-          nextStep,
-        },
-      );
-      callbacks.onStatusChange("idle");
-      return;
+      callbacks.onStatusChange("running");
+      continue;
     }
 
     const approvedPlanCachedReadOnlyBatch =

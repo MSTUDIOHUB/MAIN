@@ -67,9 +67,11 @@ const {
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/executeRecoveryTools.ts"));
 
 const {
+  buildChatFinalSynthesisPrompt,
   buildEmptyModelResponsePauseNotice,
   buildMaxStepsFinalTextPrompt,
   resolveAgentLoopMaxIterations,
+  shouldTriggerChatFinalSynthesis,
   shouldUseMaxStepsFinalTextOnly,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/agentLoopSafety.ts"));
 
@@ -238,7 +240,7 @@ test("read-only budget triggers execute recovery before max iterations", () => {
   assert.match(prompt, /apply_patch|write_file|replace_in_file/);
 });
 
-test("chat read-only no-progress pauses before the generic max-iteration boundary", () => {
+test("chat read-only no-progress is eligible for final synthesis before max iterations", () => {
   const recent = [
     { name: "read_file", status: "succeeded", target: "src/App.tsx", detail: "READ_FILE_RESULT" },
     { name: "read_file", status: "succeeded", target: "src/App.tsx", detail: "FILE_UNCHANGED_STUB: src/App.tsx" },
@@ -256,6 +258,13 @@ test("chat read-only no-progress pauses before the generic max-iteration boundar
 
   assert.equal(decision.shouldRecover, true);
   assert.equal(decision.reason, "repeated_cached_read");
+  assert.equal(shouldTriggerChatFinalSynthesis({
+    workflowMode: "chat",
+    runtimeIntent: "respond",
+    toolCallCount: 0,
+    recentReadOnlyActivityCount: 6,
+    consecutiveNoToolCount: 1,
+  }), true);
 
   const notice = buildExecuteNoProgressLoopPauseNotice({
     language: "zh",
@@ -266,6 +275,51 @@ test("chat read-only no-progress pauses before the generic max-iteration boundar
   });
   assert.match(notice, /对话已暂停/);
   assert.match(notice, /直接回答/);
+});
+
+test("chat final synthesis prompt disables tools only for recovery synthesis", () => {
+  const prompt = buildChatFinalSynthesisPrompt({
+    language: "zh",
+    reason: "length_no_tool_chat",
+    iteration: 7,
+    repeatedTargets: ["src/lib/orchestrator.ts"],
+    recentActivity: [
+      { name: "read_file", status: "succeeded", target: "src/lib/orchestrator.ts", detail: "READ_FILE_RESULT" },
+    ],
+  });
+
+  assert.match(prompt, /CHAT_FINAL_SYNTHESIS/);
+  assert.match(prompt, /工具已关闭/);
+  assert.match(prompt, /不要输出 `<tool_use>`/);
+  assert.match(prompt, /src\/lib\/orchestrator\.ts/);
+});
+
+test("chat final synthesis trigger is scoped to respond recovery loops", () => {
+  assert.equal(shouldTriggerChatFinalSynthesis({
+    workflowMode: "chat",
+    runtimeIntent: "respond",
+    finishReason: "length",
+    toolCallCount: 0,
+  }), true);
+  assert.equal(shouldTriggerChatFinalSynthesis({
+    workflowMode: "chat",
+    runtimeIntent: "respond",
+    wasLanguageMismatchRecovery: true,
+    languageMismatchAlreadyRetried: true,
+    toolCallCount: 0,
+  }), true);
+  assert.equal(shouldTriggerChatFinalSynthesis({
+    workflowMode: "chat",
+    runtimeIntent: "respond",
+    finishReason: "length",
+    toolCallCount: 1,
+  }), false);
+  assert.equal(shouldTriggerChatFinalSynthesis({
+    workflowMode: "edit",
+    runtimeIntent: "execute",
+    finishReason: "length",
+    toolCallCount: 0,
+  }), false);
 });
 
 test("agent loop iteration limits are mode-specific and configurable", () => {
@@ -409,6 +463,13 @@ test("orchestrator wires execute convergence and max-iteration recovery before i
   assert.match(source, /recoveryReason: "max_iterations_boundary"/);
   assert.match(source, /normalizeNoProgressResultContent/);
   assert.match(source, /resolveReadOnlyNoProgressTrigger/);
+  assert.match(source, /buildChatFinalSynthesisPrompt/);
+  assert.match(source, /chat_final_synthesis_activated/);
+  assert.match(source, /chat_readonly_no_progress_final_synthesis/);
+  assert.match(source, /chat_final_synthesis_tool_calls_ignored/);
+  assert.match(source, /looksLikeRepairExecutionRequest/);
+  assert.match(source, /chat_repair_readonly_no_progress_paused/);
+  assert.match(source, /unresolvedRepairRequest/);
 
   const callbackIndex = source.indexOf("const handled = await callbacks.onExecuteMaxIterationsCheckpoint?.(checkpoint);");
   const idleIndex = source.indexOf("callbacks.onStatusChange(\"idle\");", callbackIndex);

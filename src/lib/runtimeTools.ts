@@ -1,6 +1,7 @@
 import type { ResolvedUserIntent } from "./runIntent";
 import {
   classifyBuiltInTool,
+  getToolRiskLevelForCall,
   getLocalFileReadPathForToolCall,
   isLocalFileReadApproved,
   isToolAutoExecutableForCall,
@@ -61,6 +62,7 @@ export interface RuntimeToolPlanResult {
   action: RuntimeToolPlanAction;
   toolArgs: Record<string, unknown>;
   target: string;
+  risk?: "local_file_read" | "browser_control";
   localFileReadPath?: string;
   reason?: "pre_approval_source_write" | "pre_approval_tasks" | "missing_tasks_before_source";
 }
@@ -148,6 +150,15 @@ export function initialLifecycleStateForPlanAction(action: RuntimeToolPlanAction
 export function planRuntimeToolCall(input: PlanRuntimeToolCallInput): RuntimeToolPlanResult {
   const toolArgs = parseToolCallArguments(input.toolCall, input.workspace);
   const target = input.getToolTarget(input.toolCall.name, toolArgs);
+  const risk = getToolRiskLevelForCall(
+    input.toolCall.name,
+    toolArgs,
+    input.capabilityRegistry,
+    {
+      workspace: input.workspace,
+      approvedLocalFileReadPaths: input.approvedLocalFileReadPaths,
+    },
+  );
 
   if (!input.availableToolNames.has(input.toolCall.name)) {
     return {
@@ -196,6 +207,7 @@ export function planRuntimeToolCall(input: PlanRuntimeToolCallInput): RuntimeToo
       action: "local_file_read_review",
       toolArgs,
       target,
+      risk: "local_file_read",
       localFileReadPath,
     };
   }
@@ -247,6 +259,16 @@ export function planRuntimeToolCall(input: PlanRuntimeToolCallInput): RuntimeToo
       toolArgs,
       target,
       reason,
+    };
+  }
+
+  if (risk === "browser_control") {
+    return {
+      action: "review_required",
+      toolArgs,
+      target,
+      risk: "browser_control",
+      localFileReadPath,
     };
   }
 

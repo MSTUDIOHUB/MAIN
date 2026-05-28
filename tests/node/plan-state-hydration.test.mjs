@@ -134,6 +134,7 @@ test("collapsed turns keep effective progress inside the expanded view", () => {
 
   assert.match(source, /\{isTurnExpanded && shouldShowTurnActivityNotice && \(/);
   assert.match(source, /rounded-none bg-transparent px-1 py-1/);
+  assert.match(source, /archived-phase-analysis[\s\S]*archivedAfterChoice: false/);
 });
 
 test("plan panel keeps resume action available for paused approved execution", () => {
