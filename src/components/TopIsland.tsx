@@ -1,5 +1,5 @@
 import { memo, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
-import { IconChevronDown, IconChevronUp, IconColumns, IconFileText, IconLock, IconUnlock } from "./Icons";
+import { IconChevronDown, IconChevronUp, IconColumns, IconFileText, IconInfo, IconLock, IconUnlock } from "./Icons";
 import type { TurnProgressItem } from "../lib/turnProgress";
 import { buildPlanTaskEvidenceAudit, isPlanTaskAwaitingBrowserValidation, isPlanTaskAwaitingExternalValidation, type PlanExecutionEvidenceEntry, type PlanStage, type PlanTask, type ReplyOption } from "../lib/workflowModels";
 import type { PendingRunDecision, PendingRunDecisionChoice } from "../lib/runIntent";
@@ -50,6 +50,25 @@ function isApprovalActionOption(option: ReplyOption): boolean {
     option.action === "continue_readonly_once" ||
     option.action === "allow_readonly_session"
   );
+}
+
+function getDisplayReplyOptionLabel(option: ReplyOption, language: "zh" | "en"): string {
+  if (option.action === "approve_operation_once" || option.action === "execute_once") {
+    return language === "zh" ? "批准执行本轮方案" : "Approve And Run This Plan";
+  }
+  if (option.action === "adjust_plan") {
+    return language === "zh" ? "继续调整方案" : "Keep Adjusting The Plan";
+  }
+  if (option.action === "cancel_operation") {
+    return language === "zh" ? "取消本轮操作" : "Cancel This Operation";
+  }
+  if (option.action === "continue_readonly_once") {
+    return language === "zh" ? "继续当前只读读取" : "Continue This Read";
+  }
+  if (option.action === "allow_readonly_session") {
+    return language === "zh" ? "当前会话只读步骤全部批准" : "Allow Read-Only Steps In Session";
+  }
+  return option.label || option.value || "";
 }
 
 function getStageLabel(stage: PlanStage, language: "zh" | "en"): string {
@@ -218,8 +237,8 @@ const TopIsland = memo(function TopIsland({
     openPlan: language === "zh" ? "查看计划" : "Open Plan",
     openDiff: language === "zh" ? "查看变更" : "Open Diff",
     accept: language === "zh" ? "接受" : "Accept",
-    approveDiffOnce: language === "zh" ? "单次批准" : "Approve Once",
-    approveDiffSession: language === "zh" ? "当前会话全部允许" : "Allow All In Session",
+    approveDiffOnce: language === "zh" ? "批准此工具请求" : "Approve This Request",
+    approveDiffSession: language === "zh" ? "开启自动审查并批准" : "Turn On Auto Review",
     reject: language === "zh" ? "拒绝" : "Reject",
     rejectAndKeepPlan: language === "zh" ? "拒绝并保留" : "Reject And Keep",
     rejectAndDeletePlan: language === "zh" ? "拒绝并删除" : "Reject And Delete",
@@ -250,12 +269,30 @@ const TopIsland = memo(function TopIsland({
     customChoiceSubmit: language === "zh" ? "确认" : "Confirm",
     executionConsentTitle: language === "zh" ? "允许开始执行本轮改动？" : "Allow this turn to start making changes?",
     executionConsentHint: language === "zh"
-      ? "这是本轮第一次真实写入/命令动作。确认后 MAIN 会继续；高风险操作仍逐项审查。"
-      : "This is the first real write/command action in this turn. MAIN continues after confirmation; high-risk actions still require per-step review.",
-    approveExecuteOnce: language === "zh" ? "仅本轮执行" : "Allow This Turn",
-    approveThread: language === "zh" ? "本会话自动允许写入与命令" : "Auto-Allow Writes & Commands",
-    dismiss: language === "zh" ? "取消" : "Cancel",
+      ? "这是本轮第一次真实写入/命令动作。确认后 MAIN 会继续；开启自动审查会在本会话自动批准文件修改、命令和本地读取。"
+      : "This is the first real write/command action in this turn. MAIN continues after confirmation; Auto Review approves file changes, commands, and local reads in this session.",
+    approveExecuteOnce: language === "zh" ? "直接执行本轮" : "Run This Turn",
+    approveThread: language === "zh" ? "开启自动审查并执行" : "Auto Review And Run",
+    dismiss: language === "zh" ? "取消/继续调整" : "Cancel / Adjust",
     cancelTurn: language === "zh" ? "结束本轮" : "End This Turn",
+    intentOptionInfo: language === "zh"
+      ? "选择后 MAIN 会按这个意图重新处理当前输入。"
+      : "Selecting this tells MAIN which intent to use for the current input.",
+    replyOptionInfo: language === "zh"
+      ? "选择后会把该选项作为用户回复发回当前回合。"
+      : "Selecting this sends the option back as your reply for this turn.",
+    readonlyOnceInfo: language === "zh"
+      ? "只批准这一次只读读取、搜索或分析请求。"
+      : "Approves only this read/search/analysis request.",
+    readonlySessionInfo: language === "zh"
+      ? "本会话后续只读读取、搜索和分析会自动继续。"
+      : "Allows later read/search/analysis steps in this session.",
+    executeOnceInfo: language === "zh"
+      ? "批准当前回合继续执行；后续审批仍按设置处理。"
+      : "Allows this turn to continue; later reviews follow your settings.",
+    autoReviewInfo: language === "zh"
+      ? "开启后本会话会自动批准文件修改、终端命令和本地文件读取。"
+      : "When enabled, MAIN auto-approves file changes, shell commands, and local file reads in this session.",
     autoValidation: language === "zh" ? "自动验证" : "Auto validation",
     userValidation: language === "zh" ? "待用户验证" : "User validation",
     taskSummary: activeProgressMode === "execution"
@@ -309,6 +346,7 @@ const TopIsland = memo(function TopIsland({
   const choiceOptionButtonClass = "top-island-choice-option w-full min-w-0 rounded-xl border px-3 py-2.5 text-left transition-all duration-150";
   const choiceNumberClass = "top-island-choice-number w-7 shrink-0 text-right font-semibold transition-colors duration-150";
   const approvalOptionButtonClass = "top-island-approval-option w-full rounded-xl border px-3 py-2.5 text-left transition-all duration-150";
+  const infoIconClass = themeMode === "light" ? "text-[#64748b] hover:text-[#111827]" : "text-[#71717a] hover:text-[#f5f5f5]";
   const neutralActionButtonClass = themeMode === "light"
     ? "rounded-xl border border-[rgba(15,23,42,0.14)] bg-[rgba(255,255,255,0.72)] text-[#334155] transition-all duration-150 hover:border-[var(--accent)] hover:bg-[var(--accent-subtle)] hover:text-[#111827]"
     : isBlackTheme
@@ -482,13 +520,18 @@ const TopIsland = memo(function TopIsland({
                             ? "theme-plan-button"
                             : "border-[#3f3f46] bg-[#09090b] text-[#a1a1aa] hover:bg-[#18181b] hover:text-[#f5f5f5]"
                         }`}
+                        title={copy.autoReviewInfo}
                       >
-                        {copy.approveThread}
+                        <span className="inline-flex items-center gap-1.5">
+                          {copy.approveThread}
+                          <IconInfo className="h-3.5 w-3.5 opacity-75" />
+                        </span>
                       </button>
                       <button
                         data-testid="top-island-approve-once"
                         onClick={() => onResolvePendingRunDecision?.("approve_once")}
                         className="theme-plan-primary rounded-lg px-4 py-2 text-[12px] font-semibold"
+                        title={copy.executeOnceInfo}
                       >
                         {copy.approveExecuteOnce}
                       </button>
@@ -507,9 +550,13 @@ const TopIsland = memo(function TopIsland({
                               onClick={() => onResolvePendingRunDecision?.(option.id)}
                               className={choiceOptionButtonClass}
                               style={choiceTextStyle}
+                              title={copy.intentOptionInfo}
                             >
                               <span className="min-w-0 break-words">{option.label}</span>
                             </button>
+                            <span className={`shrink-0 ${infoIconClass}`} title={copy.intentOptionInfo} aria-label={copy.intentOptionInfo}>
+                              <IconInfo className="h-4 w-4" />
+                            </span>
                           </div>
                         ))}
                       </div>
@@ -646,9 +693,13 @@ const TopIsland = memo(function TopIsland({
                                 onClick={() => onSelectReplyOption?.(option)}
                                 className={choiceOptionButtonClass}
                                 style={choiceTextStyle}
+                                title={copy.replyOptionInfo}
                               >
-                                <span className="min-w-0 break-words">{option.label}</span>
+                                <span className="min-w-0 break-words">{getDisplayReplyOptionLabel(option, language)}</span>
                               </button>
+                              <span className={`shrink-0 ${infoIconClass}`} title={copy.replyOptionInfo} aria-label={copy.replyOptionInfo}>
+                                <IconInfo className="h-4 w-4" />
+                              </span>
                             </div>
                           ))}
                         </div>
@@ -669,8 +720,12 @@ const TopIsland = memo(function TopIsland({
                               onClick={() => onSelectReplyOption?.(option)}
                               className={approvalOptionButtonClass}
                               style={choiceTextStyle}
+                              title={option.action === "allow_readonly_session" ? copy.readonlySessionInfo : copy.readonlyOnceInfo}
                             >
-                              {option.label}
+                              <span className="inline-flex min-w-0 items-center gap-2">
+                                <span className="min-w-0 break-words">{getDisplayReplyOptionLabel(option, language)}</span>
+                                <IconInfo className="h-4 w-4 opacity-75" />
+                              </span>
                             </button>
                           ))}
                         </div>
@@ -750,13 +805,18 @@ const TopIsland = memo(function TopIsland({
                             ? "theme-plan-button"
                             : "border-[#3f3f46] bg-[#09090b] text-[#a1a1aa] hover:bg-[#18181b] hover:text-[#f5f5f5]"
                         }`}
+                        title={copy.autoReviewInfo}
                       >
-                        {copy.approveDiffSession}
+                        <span className="inline-flex items-center gap-1.5">
+                          {copy.approveDiffSession}
+                          <IconInfo className="h-3.5 w-3.5 opacity-75" />
+                        </span>
                       </button>
                       <button
                         data-testid="top-island-tool-approve-once"
                         onClick={() => onApproveDiffOnce?.()}
                         className="theme-plan-primary rounded-lg px-4 py-2 text-[12px] font-semibold"
+                        title={copy.executeOnceInfo}
                       >
                         {copy.approveDiffOnce}
                       </button>

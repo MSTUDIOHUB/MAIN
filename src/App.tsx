@@ -106,6 +106,12 @@ function archiveReplyOptionsForTurn(taskFlow: TaskBlock[], turnId: string | unde
           ...block,
           options: undefined,
           archivedAfterChoice: true,
+          archivedProposal: block.options.some((option: any) =>
+            option?.action === "approve_operation_once" ||
+            option?.action === "execute_once" ||
+            option?.source === "proposal_follow_up" ||
+            option?.source === "operation_approval"
+          ) || undefined,
           ...(selected ? { selectedOption: selected } : {}),
         }
       : block,
@@ -283,6 +289,10 @@ function buildSessionRuntimeSnapshotFromState(state: any) {
     showFilePanel: state.showFilePanel === true,
     rightPanelTab: normalizeStoredRightPanelTab(state.rightPanelTab),
     selectedDiffTaskId: state.selectedDiffTaskId ?? null,
+    autoApproveTools: state.autoApproveTools === true,
+    autoApproveToolScopes: state.autoApproveToolScopes || [],
+    queuedUserMessage: state.queuedUserMessage ?? null,
+    activeGuidance: state.activeGuidance ?? null,
   };
 }
 

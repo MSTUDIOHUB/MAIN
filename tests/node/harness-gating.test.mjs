@@ -62,6 +62,7 @@ function loadTranspiledModuleSync(sourcePath) {
 
 const {
   buildShellReadValidationError,
+  isShellFileReadCommand,
   buildLoopDetectionValidationError,
   buildReadBeforeModifyValidationError,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"));
@@ -92,6 +93,8 @@ test("buildShellReadValidationError blocks command starting with cat/head/tail/s
   const errCat = buildShellReadValidationError(tcRun, { command: "cat src/App.tsx" }, callbacks);
   const errHead = buildShellReadValidationError(tcRun, { command: "head -n 20 src/App.tsx" }, callbacks);
   const errSed = buildShellReadValidationError(tcRun, { command: "sed -i 's/a/b/g' src/App.tsx" }, callbacks);
+  const errCdSed = buildShellReadValidationError(tcExec, { command: "cd /tmp/project && sed -n '270,310p' src/App.tsx" }, callbacks);
+  const errCdCatPipe = buildShellReadValidationError(tcExec, { command: "cd /tmp/project && cat -n src/App.tsx | grep -A 15 rawOrders" }, callbacks);
   const okLs = buildShellReadValidationError(tcRun, { command: "ls -la" }, callbacks);
 
   assert.ok(errCat);
@@ -100,7 +103,16 @@ test("buildShellReadValidationError blocks command starting with cat/head/tail/s
 
   assert.ok(errHead);
   assert.ok(errSed);
+  assert.ok(errCdSed);
+  assert.ok(errCdCatPipe);
   assert.equal(okLs, null);
+});
+
+test("isShellFileReadCommand detects read commands after directory changes", () => {
+  assert.equal(isShellFileReadCommand("cd /tmp/project && sed -n '1,20p' src/App.tsx"), true);
+  assert.equal(isShellFileReadCommand("FOO=1 command head -n 5 package.json"), true);
+  assert.equal(isShellFileReadCommand("cd /tmp/project && npm run build"), false);
+  assert.equal(isShellFileReadCommand("grep -n \"loadOrders\" src/App.tsx"), false);
 });
 
 test("orchestrator reports shell-read misuse before shell metadata errors", () => {

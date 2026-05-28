@@ -446,6 +446,15 @@ function planUnsupportedToolFeedbackMessage(input: {
     }
   }
 
+  if (input.toolName === "read_file" && !input.availableToolNames.includes("read_file")) {
+    const alternatives = ["grep_search", "get_file_outline", "get_project_skeleton", "glob_search"]
+      .filter((name) => input.availableToolNames.includes(name));
+    const alternativesText = alternatives.length > 0 ? alternatives.join(", ") : input.language === "zh" ? "已缓存上下文" : "cached context";
+    return input.language === "zh"
+      ? `READ_FILE_NOT_AVAILABLE_IN_RECOVERY: read_file 在当前 ${input.runtimeIntent} 恢复步骤没有开放。请不要改用 shell/cat/sed/head/tail 读取文件；改用 ${alternativesText}，或直接基于已有缓存上下文进入 patch/验证/最终说明。`
+      : `READ_FILE_NOT_AVAILABLE_IN_RECOVERY: read_file is not exposed in the current ${input.runtimeIntent} recovery step. Do not switch to shell/cat/sed/head/tail file reads; use ${alternativesText}, or proceed from cached context to patching, validation, or the final answer.`;
+  }
+
   return input.language === "zh"
     ? `工具 "${input.toolName}" 当前没有暴露给 ${input.runtimeIntent} 运行意图。请使用本轮可用工具；如果这是已批准计划的执行步骤，请继续按执行阶段恢复。`
     : `Tool "${input.toolName}" is not exposed for the current ${input.runtimeIntent} runtime intent. Use an available tool; if this is approved plan execution, continue from the execution stage.`;
@@ -660,6 +669,16 @@ function rememberReadBeforeModifyEvidence(
   }
   if (name === "get_project_skeleton" || name === "glob_search" || name === "grep_search" || name.startsWith("repo_map_")) {
     evidence.add("workspace:structure");
+    if (name === "grep_search") {
+      const text = `${result.content || ""}\n${result.displayContent || ""}`;
+      const fileMatches = text.matchAll(/(?:^|\n)\s*([^\n:]+?\.(?:ts|tsx|js|jsx|rs|py|go|css|scss|html|json|md|toml|yaml|yml|cs|cpp|c|h|hpp|java|kt|swift|vue|svelte))(?::\d+)?(?::|\s|$)/gi);
+      for (const match of fileMatches) {
+        const filePath = String(match[1] || "").trim();
+        if (filePath && !filePath.includes(" ")) {
+          evidence.add(`file:${normalizeEvidencePath(filePath)}`);
+        }
+      }
+    }
     return;
   }
   if (isReadOnlyShellInspectionToolCall(name, args)) {
@@ -762,6 +781,37 @@ export async function buildReadBeforeModifyValidationError(
 /**
  * Intercept and block file reads via shell commands to prevent context flooding.
  */
+function normalizeShellReadSegment(segment: string): string {
+  return String(segment || "")
+    .trim()
+    .replace(/^\(\s*/, "")
+    .replace(/\s*\)$/, "")
+    .replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\S+)\s+)+/, "")
+    .replace(/^(?:command|builtin)\s+/, "")
+    .trim();
+}
+
+function isDirectoryOnlyShellSegment(segment: string): boolean {
+  return /^(?:cd|pushd|popd)\b/i.test(segment);
+}
+
+function isShellFileReadSegment(segment: string): boolean {
+  const normalized = normalizeShellReadSegment(segment);
+  if (!normalized || isDirectoryOnlyShellSegment(normalized)) return false;
+  return /^(?:cat|head|tail|sed)\b/i.test(normalized) ||
+    /\b(?:cat|head|tail)\s+[^&|>;]+/i.test(normalized);
+}
+
+export function isShellFileReadCommand(command: string): boolean {
+  const raw = String(command || "").trim();
+  if (!raw) return false;
+  return raw
+    .split(/\s*(?:&&|\|\||;|\|)\s*/g)
+    .map(normalizeShellReadSegment)
+    .filter(Boolean)
+    .some(isShellFileReadSegment);
+}
+
 export function buildShellReadValidationError(
   tc: ToolCallToExecute,
   args: Record<string, unknown>,
@@ -771,12 +821,12 @@ export function buildShellReadValidationError(
   const command = typeof args.command === "string" ? args.command.trim() : "";
   if (!command) return null;
 
-  const isShellRead = /^(?:cat|head|tail|sed)\b/.test(command) || /\b(?:cat|head|tail)\s+[^&|>;]+/.test(command);
+  const isShellRead = isShellFileReadCommand(command);
   if (isShellRead) {
     const language = callbacks.getPreferredLanguage();
     const message = language === "zh"
-      ? `SHELL_READ_FORBIDDEN: 禁止通过终端命令 (${command}) 直接读取文件内容以防止上下文过载。请改用内置的 read_file 工具并指定 start_line / max_lines 参数进行分页定向读取。`
-      : `SHELL_READ_FORBIDDEN: Reading files via terminal commands (${command}) is disabled to prevent context overload. Please use the built-in read_file tool with start_line / max_lines for paged reading.`;
+      ? `SHELL_READ_FORBIDDEN: 禁止通过终端命令 (${command}) 直接读取文件内容以防止上下文过载。read_file 可用时请使用 read_file + start_line/max_lines；恢复模式未开放 read_file 时，请使用 grep_search/get_file_outline 或基于已有缓存直接 patch/验证/最终说明，不要改用 cat/sed/head/tail 绕行。`
+      : `SHELL_READ_FORBIDDEN: Reading files via terminal commands (${command}) is disabled to prevent context overload. Use read_file with start_line/max_lines when available; if recovery mode has not exposed read_file, use grep_search/get_file_outline or proceed from cached context to patching, validation, or the final answer instead of cat/sed/head/tail.`;
     const target = getToolTarget(tc.name, args);
     callbacks.onToolExecuting(tc.name, target, undefined, { toolCallId: tc.id });
     emitToolPreflightBlocked(callbacks, {
@@ -877,13 +927,15 @@ export function buildLoopDetectionValidationError(
       const message = language === "zh"
         ? [
             `READ_FILE_REPEAT_LIMIT: ${path} 已在当前回合被重复读取/修改多次，本次 read_file 不再重新读取。`,
-            "read_file 仍可用；请复用已有缓存内容，或改用 start_line/end_line/max_lines 精确读取缺失窗口，或使用 grep_search/get_file_outline 定位后继续。",
-            "如果已有上下文不足以继续，请在正文中说明缺失信息和阻塞点。",
+            "请复用已有缓存内容；read_file 仍开放时，只能改用 start_line/end_line/max_lines 读取真正缺失的窗口。",
+            "如果本轮工具面已经关闭 read_file，请改用 grep_search/get_file_outline，或基于已有上下文直接 patch/验证/最终说明；不要用 shell cat/sed/head/tail 绕过。",
+            "如果已有上下文不足以继续，请在正文中说明缺失信息和阻塞点，不要原样重试。",
           ].join("\n")
         : [
             `READ_FILE_REPEAT_LIMIT: ${path} has already been read/edited repeatedly in this turn, so this read_file call was not re-run.`,
-            "read_file is still available; reuse cached content, narrow the next request with start_line/end_line/max_lines, or use grep_search/get_file_outline before continuing.",
-            "If the available context is insufficient, explain the missing information and blocker in prose.",
+            "Reuse cached content; when read_file is still exposed, only narrow the next request with start_line/end_line/max_lines for a genuinely missing window.",
+            "If the current tool surface has closed read_file, switch to grep_search/get_file_outline, or proceed from existing context to patching, validation, or the final answer; do not bypass this with shell cat/sed/head/tail.",
+            "If the available context is insufficient, explain the missing information and blocker in prose instead of retrying the same call.",
           ].join("\n");
       callbacks.onToolExecuting(tc.name, target, undefined, { toolCallId: tc.id });
       emitToolPreflightBlocked(callbacks, {
@@ -1075,6 +1127,7 @@ export interface OrchestratorCallbacks {
   getPlanExecutionEvidenceLedger: () => PlanExecutionEvidenceEntry[];
   getPlanAutoResumeCount?: () => number;
   getStatus: () => "idle" | "running" | "pending_review" | "error";
+  consumeActiveGuidance?: () => { id: string; text: string; turnId: string | null } | null;
   startNewTurn: () => void;
   getContextMemoryState?: () => ContextMemoryState | null;
   shouldForceXmlForProviderCompatibility?: () => boolean;
@@ -1582,13 +1635,17 @@ function buildExecuteConvergencePrompt(language: "zh" | "en", iteration: number,
         `本轮 Execute 已进行 ${iteration}/${maxIterations} 轮工具循环，接近安全边界。`,
         "MAIN 会临时收窄工具面：宽泛读取会被收起，只保留写入、命令、浏览器验证和少量定向定位工具。",
         "请先根据已有工具结果判断任务是否已经完成：如果完成，直接输出最终总结并停止，不要再调用工具。",
-        "如果仍未完成，只调用一个最小必要的下一步动作工具；不要重复读取、重复验证或继续改同一个目标而没有新证据。",
+        "如果 read_file 当前不可用，不要继续请求 read_file，也不要改用 cat/sed/head/tail 通过 shell 读取文件。",
+        "如果 grep_search/get_file_outline 已经给出足够定位信息，请直接用 replace_in_file/apply_patch 做最小修改，或运行一次验证命令；否则只调用一个最小必要的定位工具。",
+        "不要重复读取、重复验证或继续改同一个目标而没有新证据。",
       ].join("\n")
     : [
         `This Execute turn has reached ${iteration}/${maxIterations} tool-loop iterations and is approaching the safety boundary.`,
         "MAIN will temporarily narrow the tool surface: broad reads are withheld, leaving write, command, browser validation, and lightweight targeting tools.",
         "First decide from existing tool results whether the task is already complete. If it is complete, output the final summary and stop without more tools.",
-      "If it is not complete, call exactly one smallest necessary action tool. Do not repeat reads, repeat validation, or keep editing the same target without new evidence.",
+        "If read_file is unavailable, do not keep requesting read_file and do not switch to cat/sed/head/tail shell file reads.",
+        "If grep_search/get_file_outline already provide enough location context, directly apply the smallest replace_in_file/apply_patch edit or run one validation command; otherwise call exactly one smallest necessary targeting tool.",
+        "Do not repeat reads, repeat validation, or keep editing the same target without new evidence.",
     ].join("\n");
 }
 
@@ -5602,6 +5659,24 @@ export async function executeAgentLoop(
         toolMessages: contextForce.toolMessages,
         estimatedTokens: Math.round(contextForce.estimatedTokens),
         tokenPressure: Number(contextForce.tokenPressure.toFixed(3)),
+      });
+    }
+
+    const activeGuidance = callbacks.consumeActiveGuidance?.();
+    if (activeGuidance?.text?.trim()) {
+      const guidanceText = activeGuidance.text.trim();
+      const guidanceMessage: AgentMessage = {
+        role: "user",
+        content: callbacks.getPreferredLanguage() === "en"
+          ? `Runtime guidance from the user for the current run. Treat this as high-priority direction for the next step without restarting the task:\n\n${guidanceText}`
+          : `用户在当前执行中追加的运行引导。请把它作为下一步的高优先级方向，不要重启任务：\n\n${guidanceText}`,
+      };
+      managedAgentMessages = [...managedAgentMessages, guidanceMessage];
+      callbacks.appendMessage(guidanceMessage);
+      logAgentEvent("runtime_guidance_injected", {
+        iteration,
+        guidanceId: activeGuidance.id,
+        chars: guidanceText.length,
       });
     }
 
@@ -9997,7 +10072,12 @@ export async function executeAgentLoop(
 
       const target = getToolTarget(tc.name, toolArgs);
       if (repeatGuardReadOnly && (readOnlyShellInspection || !repeatGuardRecoveredSignatures.has(repeatCheck.signature))) {
-        const recoveryMessage = formatRepeatLoopRecoveryMessage(tc.name, target, repeatCheck.threshold);
+        const recoveryMessage = formatRepeatLoopRecoveryMessage(
+          tc.name,
+          target,
+          repeatCheck.threshold,
+          availableToolNames,
+        );
         if (!readOnlyShellInspection) {
           repeatGuardRecoveredSignatures.add(repeatCheck.signature);
         }
@@ -10012,7 +10092,12 @@ export async function executeAgentLoop(
       }
 
       if (workflowMode === "plan" && callbacks.getIsPlanApproved() && tc.name === "browser_evaluate") {
-        const recoveryMessage = formatRepeatLoopRecoveryMessage(tc.name, target, repeatCheck.threshold);
+        const recoveryMessage = formatRepeatLoopRecoveryMessage(
+          tc.name,
+          target,
+          repeatCheck.threshold,
+          availableToolNames,
+        );
         if (!repeatGuardRecoveredSignatures.has(repeatCheck.signature)) {
           repeatGuardRecoveredSignatures.add(repeatCheck.signature);
           recentToolCalls.length = 0;

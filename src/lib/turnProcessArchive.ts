@@ -131,6 +131,7 @@ function isFinalConclusionBlock(block: any, finalVisibleAgentIndex: number, bloc
 function isProcessArchiveCandidate(block: any, finalVisibleAgentIndex: number, blockIndex: number): boolean {
   if (!block || block.type === "user") return false;
   if (isFinalConclusionBlock(block, finalVisibleAgentIndex, blockIndex)) return false;
+  if (block.type === "agent" && block.archivedProposal) return false;
   if (block.type === "system") {
     return block.variant !== "context_compression" && block.variant !== "plan_execution_checkpoint";
   }

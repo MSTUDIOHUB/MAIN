@@ -141,7 +141,7 @@ body,
 .top-island-choice-option {
   border-color: var(--accent-subtle-border, rgba(147, 51, 234, 0.3));
   background-color: var(--accent-subtle, rgba(147, 51, 234, 0.15));
-  color: var(--accent-light, #a855f7);
+  color: #f5f5f5;
 }
 
 .top-island-choice-option:hover {
@@ -154,7 +154,7 @@ body,
 .top-island-approval-option {
   border-color: color-mix(in srgb, var(--accent, #9333ea) 28%, transparent);
   background-color: color-mix(in srgb, var(--accent, #9333ea) 8%, transparent);
-  color: color-mix(in srgb, var(--accent-light, #a855f7) 70%, #d4d4d8 30%);
+  color: #e4e4e7;
 }
 
 .top-island-approval-option:hover {
@@ -194,25 +194,25 @@ html[data-theme="light"] .group:hover .top-island-choice-number {
 }
 
 html[data-theme="light"] .top-island-choice-option {
-  color: color-mix(in srgb, var(--accent-hover, #7e22ce), #111827 24%);
+  color: #111827;
   background-color: color-mix(in srgb, var(--accent, #9333ea) 12%, #ffffff 88%);
   border-color: color-mix(in srgb, var(--accent, #9333ea) 30%, #ffffff 70%);
 }
 
 html[data-theme="light"] .top-island-choice-option:hover {
-  color: color-mix(in srgb, var(--accent-hover, #7e22ce), #111827 12%);
+  color: #111827;
   background-color: color-mix(in srgb, var(--accent, #9333ea) 20%, #ffffff 80%);
   border-color: color-mix(in srgb, var(--accent-hover, #7e22ce) 70%, #ffffff 30%);
 }
 
 html[data-theme="light"] .top-island-approval-option {
-  color: color-mix(in srgb, var(--accent-hover, #7e22ce), #334155 42%);
+  color: #111827;
   background-color: color-mix(in srgb, var(--accent, #9333ea) 7%, #ffffff 93%);
   border-color: color-mix(in srgb, var(--accent, #9333ea) 20%, #cbd5e1 80%);
 }
 
 html[data-theme="light"] .top-island-approval-option:hover {
-  color: color-mix(in srgb, var(--accent-hover, #7e22ce), #111827 16%);
+  color: #111827;
   background-color: color-mix(in srgb, var(--accent, #9333ea) 14%, #ffffff 86%);
   border-color: color-mix(in srgb, var(--accent-hover, #7e22ce) 66%, #ffffff 34%);
 }

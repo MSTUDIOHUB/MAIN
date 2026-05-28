@@ -276,9 +276,16 @@ export function formatRepeatLoopRecoveryMessage(
   name: string,
   target: string,
   threshold: number,
+  availableToolNames?: Iterable<string> | null,
 ): string {
   const suffix = target ? ` (target: "${target}")` : "";
-  return `Repeat guard: read-only tool "${name}" was called with identical arguments ${threshold}+ times${suffix}. Reuse the latest result already in context and switch to a more specific tool such as get_project_skeleton, glob_search, grep_search, get_file_outline, or read_file.`;
+  const available = availableToolNames ? new Set(Array.from(availableToolNames)) : null;
+  const candidates = ["grep_search", "get_file_outline", "get_project_skeleton", "glob_search", "read_file"];
+  const suggestions = candidates.filter((toolName) => !available || available.has(toolName));
+  const suggestionText = suggestions.length > 0
+    ? suggestions.join(", ")
+    : "cached context, patch/validation tools, or a final blocker";
+  return `Repeat guard: read-only tool "${name}" was called with identical arguments ${threshold}+ times${suffix}. Reuse the latest result already in context; do not retry the same read or use shell file reads as a workaround. Switch to an available alternative (${suggestionText}), or proceed directly to patch, validation, finish, or state the exact blocker.`;
 }
 
 export function formatRepeatLoopFatalMessage(

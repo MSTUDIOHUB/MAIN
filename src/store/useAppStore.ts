@@ -329,10 +329,10 @@ function normalizePendingDecisionInputKey(input: string): string {
     .toLowerCase();
 }
 
-type SessionAutoApproveScope = "workspace_write" | "shell";
+type SessionAutoApproveScope = "workspace_write" | "shell" | "local_file_read";
 
-const SESSION_AUTO_APPROVE_SCOPE_SET = new Set<SessionAutoApproveScope>(["workspace_write", "shell"]);
-const DEFAULT_SESSION_AUTO_APPROVE_SCOPES: SessionAutoApproveScope[] = ["workspace_write", "shell"];
+const SESSION_AUTO_APPROVE_SCOPE_SET = new Set<SessionAutoApproveScope>(["workspace_write", "shell", "local_file_read"]);
+const DEFAULT_SESSION_AUTO_APPROVE_SCOPES: SessionAutoApproveScope[] = ["workspace_write", "shell", "local_file_read"];
 
 function normalizeSessionAutoApproveScopes(value: unknown): SessionAutoApproveScope[] {
   if (!Array.isArray(value)) return [];
@@ -357,7 +357,7 @@ function resolveSessionAutoApproveScopeForToolCall(toolCall: {
   name: string;
   risk?: string;
 }): SessionAutoApproveScope | null {
-  if (toolCall.risk === "local_file_read") return null;
+  if (toolCall.risk === "local_file_read") return "local_file_read";
   if (toolCall.name === "write_file" || toolCall.name === "replace_in_file" || toolCall.name === "apply_patch") return "workspace_write";
   if (toolCall.name === "run_command" || toolCall.name === "execute_command" || toolCall.name === "send_pty_input") return "shell";
   return null;
@@ -775,6 +775,24 @@ export interface ProviderCompatibilityRuntimeLaneState {
   lastFallbackAt: number;
 }
 
+export interface QueuedUserMessage {
+  id: string;
+  text: string;
+  images?: string[];
+  contextMentions?: string[];
+  attachedFiles?: AttachedFile[];
+  createdAt: number;
+  status: "queued";
+}
+
+export interface ActiveGuidance {
+  id: string;
+  text: string;
+  turnId: string | null;
+  createdAt: number;
+  consumedAt?: number | null;
+}
+
 export interface SessionRuntimeSnapshot {
   runtimeEventSchemaVersion?: number;
   runtimeEvents?: MainThreadEvent[];
@@ -813,6 +831,8 @@ export interface SessionRuntimeSnapshot {
   autoApproveTools?: boolean;
   autoApproveToolScopes?: SessionAutoApproveScope[];
   approvedShellPermissionRules?: string[];
+  queuedUserMessage?: QueuedUserMessage | null;
+  activeGuidance?: ActiveGuidance | null;
 }
 
 export interface SessionRuntimeState extends SessionRuntimeSnapshot {
@@ -830,6 +850,8 @@ export interface SessionRuntimeState extends SessionRuntimeSnapshot {
   approvedLocalFileReadPaths: string[];
   approvedShellPermissionRules: string[];
   readOnlyAutoApproveForSession: boolean;
+  queuedUserMessage: QueuedUserMessage | null;
+  activeGuidance: ActiveGuidance | null;
   planApprovalChoice: string | null;
   normalizedStreamState: NormalizedStreamState;
   currentTurnState: AppState["currentTurnState"];
@@ -1026,7 +1048,7 @@ export type ProgressTaskBlock = TaskBlockBase & ProgressNarration & {
 export type TaskBlock =
   | (TaskBlockBase & { type: "user"; content: string; images?: string[]; contextItems?: UserContextItem[] })
   | (TaskBlockBase & { type: "tool"; toolName: string; target: string; status: string; toolStatus: "pending" | "executed" | "rejected" | "running" | "failed"; toolCallId?: string; message?: string; diff?: ToolDiffSnapshot; shellPermissionDecision?: ShellPermissionDecision; revertStatus?: DiffRevertStatus; revertMessage?: string; intentSummary?: string; why?: string; evidence?: string; observationSummary?: string; qualityGateReason?: string; planRecoveryReason?: string })
-  | (TaskBlockBase & { type: "agent"; content: string; options?: ReplyOption[]; streaming?: boolean; hiddenProcess?: boolean; visibility?: AssistantTextVisibility; archivedAfterChoice?: boolean; selectedOption?: string })
+  | (TaskBlockBase & { type: "agent"; content: string; options?: ReplyOption[]; streaming?: boolean; hiddenProcess?: boolean; visibility?: AssistantTextVisibility; archivedAfterChoice?: boolean; archivedProposal?: boolean; selectedOption?: string })
   | (TaskBlockBase & ImageGenerationBlockPayload)
   | ProgressTaskBlock
   | (TaskBlockBase & { type: "thought"; content: string; isStreaming?: boolean; duration?: number })
@@ -1323,11 +1345,22 @@ interface AppState {
   approvedLocalFileReadPaths: string[];
   approvedShellPermissionRules: string[];
   readOnlyAutoApproveForSession: boolean;
+  queuedUserMessage: QueuedUserMessage | null;
+  activeGuidance: ActiveGuidance | null;
   pendingRunDecisionResolver:
     | ((choice: "approve_once" | "approve_thread" | "cancel") => void)
     | null;
   setAutoApproveTools: (v: boolean) => void;
   setReadOnlyAutoApproveForSession: (v: boolean) => void;
+  queueUserMessage: (
+    text: string,
+    images?: string[],
+    options?: { contextMentions?: string[]; attachedFiles?: AttachedFile[] },
+  ) => void;
+  clearQueuedUserMessage: () => void;
+  setActiveGuidance: (text: string, turnId?: string | null) => void;
+  clearActiveGuidance: () => void;
+  consumeActiveGuidance: (turnId?: string | null) => ActiveGuidance | null;
   setAgentStatus: (s: AgentStatus) => void;
   resolveReview: (action: "accept" | "reject") => void;
   allowToolAction: (taskId: number) => void;
@@ -1864,6 +1897,8 @@ function normalizeSessionRuntimeSnapshot(
     : [];
   const taskFlow = sanitizeTaskBlocksForPersist(snapshot.taskFlow || []);
   const normalizedContextMemoryState = normalizeContextMemoryState(snapshot.contextMemoryState);
+  const queuedUserMessage = normalizeQueuedUserMessage(snapshot.queuedUserMessage);
+  const activeGuidance = normalizeActiveGuidance(snapshot.activeGuidance);
   return {
     runtimeEventSchemaVersion: Math.max(1, Number(snapshot.runtimeEventSchemaVersion) || 1),
     runtimeEvents: normalizeRuntimeEvents(snapshot.runtimeEvents),
@@ -1906,6 +1941,47 @@ function normalizeSessionRuntimeSnapshot(
     approvedShellPermissionRules: Array.isArray(snapshot.approvedShellPermissionRules)
       ? snapshot.approvedShellPermissionRules.filter((rule): rule is string => typeof rule === "string" && rule.trim().length > 0)
       : [],
+    queuedUserMessage,
+    activeGuidance,
+  };
+}
+
+function normalizeQueuedUserMessage(value: unknown): QueuedUserMessage | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Partial<QueuedUserMessage>;
+  const text = String(record.text || "").trim();
+  const images = Array.isArray(record.images)
+    ? record.images.filter((image): image is string => typeof image === "string" && image.trim().length > 0)
+    : [];
+  const contextMentions = Array.isArray(record.contextMentions)
+    ? record.contextMentions.filter((path): path is string => typeof path === "string" && path.trim().length > 0)
+    : [];
+  const attachedFiles = Array.isArray(record.attachedFiles)
+    ? record.attachedFiles.map((file) => normalizeAttachedFile(file)).filter((file) => file.path || file.sourcePath || file.displayName)
+    : [];
+  if (!text && images.length === 0 && contextMentions.length === 0 && attachedFiles.length === 0) return null;
+  return {
+    id: typeof record.id === "string" && record.id.trim() ? record.id : `queued-${Date.now()}`,
+    text,
+    ...(images.length > 0 ? { images } : {}),
+    ...(contextMentions.length > 0 ? { contextMentions } : {}),
+    ...(attachedFiles.length > 0 ? { attachedFiles } : {}),
+    createdAt: Number.isFinite(Number(record.createdAt)) ? Number(record.createdAt) : Date.now(),
+    status: "queued",
+  };
+}
+
+function normalizeActiveGuidance(value: unknown): ActiveGuidance | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Partial<ActiveGuidance>;
+  const text = String(record.text || "").trim();
+  if (!text) return null;
+  return {
+    id: typeof record.id === "string" && record.id.trim() ? record.id : `guidance-${Date.now()}`,
+    text,
+    turnId: typeof record.turnId === "string" ? record.turnId : null,
+    createdAt: Number.isFinite(Number(record.createdAt)) ? Number(record.createdAt) : Date.now(),
+    consumedAt: Number.isFinite(Number(record.consumedAt)) ? Number(record.consumedAt) : null,
   };
 }
 
@@ -1954,6 +2030,8 @@ const sessionRuntimeKeys = [
   "approvedLocalFileReadPaths",
   "approvedShellPermissionRules",
   "readOnlyAutoApproveForSession",
+  "queuedUserMessage",
+  "activeGuidance",
   "normalizedStreamState",
   "currentTurnState",
   "isGenerating",
@@ -2061,6 +2139,8 @@ function createSessionRuntimeFromState(state: Partial<AppState>): SessionRuntime
       ? state.approvedShellPermissionRules.filter((rule): rule is string => typeof rule === "string" && rule.trim().length > 0)
       : [],
     readOnlyAutoApproveForSession: state.readOnlyAutoApproveForSession === true,
+    queuedUserMessage: normalizeQueuedUserMessage(state.queuedUserMessage),
+    activeGuidance: normalizeActiveGuidance(state.activeGuidance),
     normalizedStreamState: state.normalizedStreamState || defaultNormalizedStreamState,
     currentTurnState: state.currentTurnState || createDefaultCurrentTurnState(),
     isGenerating: state.isGenerating === true,
@@ -3444,6 +3524,7 @@ export function sanitizeTaskBlocksForPersist(blocks: TaskBlock[]): TaskBlock[] {
           ...(b.hiddenProcess ? { hiddenProcess: true } : {}),
           ...(b.visibility ? { visibility: b.visibility } : {}),
           ...(b.archivedAfterChoice ? { archivedAfterChoice: true } : {}),
+          ...(b.archivedProposal ? { archivedProposal: true } : {}),
           ...(b.selectedOption ? { selectedOption: String(b.selectedOption) } : {}),
           ...(b.options && b.options.length > 0
             ? {
@@ -4961,6 +5042,10 @@ export const useAppStore = create<AppState>()(
           showFilePanel: latest.showFilePanel,
           rightPanelTab: latest.rightPanelTab,
           selectedDiffTaskId: latest.selectedDiffTaskId,
+          autoApproveTools: latest.autoApproveTools,
+          autoApproveToolScopes: latest.autoApproveToolScopes,
+          queuedUserMessage: latest.queuedUserMessage,
+          activeGuidance: latest.activeGuidance,
         }),
       });
     };
@@ -5618,6 +5703,8 @@ export const useAppStore = create<AppState>()(
         approvedLocalFileReadPaths: [],
         approvedShellPermissionRules: [],
         readOnlyAutoApproveForSession: false,
+        queuedUserMessage: null,
+        activeGuidance: null,
         showWorkspaceTreePanel: false,
       }));
       void get().refreshInstructionAndHookState();
@@ -5654,6 +5741,8 @@ export const useAppStore = create<AppState>()(
         approvedLocalFileReadPaths: [],
         approvedShellPermissionRules: [],
         readOnlyAutoApproveForSession: false,
+        queuedUserMessage: null,
+        activeGuidance: null,
       };
     });
     // Register the workspace as a trusted root in the Rust backend before tools run.
@@ -5744,6 +5833,8 @@ export const useAppStore = create<AppState>()(
               approvedLocalFileReadPaths: [],
               approvedShellPermissionRules: [],
               readOnlyAutoApproveForSession: false,
+              queuedUserMessage: null,
+              activeGuidance: null,
             }
           : {}),
       };
@@ -5790,6 +5881,7 @@ export const useAppStore = create<AppState>()(
       ...(s.currentSessionId !== id ? { readOnlyAutoApproveForSession: false } : {}),
       ...(s.currentSessionId !== id ? { approvedLocalFileReadPaths: [] } : {}),
       ...(s.currentSessionId !== id ? { approvedShellPermissionRules: [] } : {}),
+      ...(s.currentSessionId !== id ? { queuedUserMessage: null, activeGuidance: null } : {}),
     })),
 
   // Task Flow — now starts empty (no more mock data)
@@ -5981,6 +6073,8 @@ export const useAppStore = create<AppState>()(
         approvedLocalFileReadPaths: [],
         approvedShellPermissionRules: [],
         readOnlyAutoApproveForSession: false,
+        queuedUserMessage: null,
+        activeGuidance: null,
         planArtifacts: [],
         planTasks: [],
         planExecutionEvidenceLedger: [],
@@ -6042,6 +6136,8 @@ export const useAppStore = create<AppState>()(
       approvedLocalFileReadPaths: [],
       approvedShellPermissionRules: [],
       readOnlyAutoApproveForSession: false,
+      queuedUserMessage: null,
+      activeGuidance: null,
       resolvedInstructionSet: null,
       instructionSources: [],
       loadedHookDefinitions: defaultHookDefinitions,
@@ -6393,6 +6489,8 @@ export const useAppStore = create<AppState>()(
   approvedShellPermissionRules: [],
   readOnlyAutoApproveForSession: false,
   currentTurnExecutionConsent: { turnId: null, granted: false },
+  queuedUserMessage: null,
+  activeGuidance: null,
   pendingRunDecisionResolver: null,
   setAutoApproveTools: (v) =>
     set({
@@ -6400,6 +6498,68 @@ export const useAppStore = create<AppState>()(
       autoApproveToolScopes: v ? buildSessionAutoApproveScopes(true) : [],
     }),
   setReadOnlyAutoApproveForSession: (v) => set({ readOnlyAutoApproveForSession: v }),
+  queueUserMessage: (text, images, options) => {
+    const queued = normalizeQueuedUserMessage({
+      id: `queued-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      text,
+      images,
+      contextMentions: options?.contextMentions,
+      attachedFiles: options?.attachedFiles,
+      createdAt: Date.now(),
+      status: "queued",
+    });
+    if (!queued) return;
+    set({
+      queuedUserMessage: queued,
+      input: text,
+      contextMentions: queued.contextMentions || [],
+      attachedFiles: queued.attachedFiles || [],
+    });
+    logStoreEvent("queued_user_message_set", {
+      chars: queued.text.length,
+      images: queued.images?.length || 0,
+      contextMentions: queued.contextMentions?.length || 0,
+      attachedFiles: queued.attachedFiles?.length || 0,
+    });
+  },
+  clearQueuedUserMessage: () => {
+    set({ queuedUserMessage: null });
+    logStoreEvent("queued_user_message_cleared");
+  },
+  setActiveGuidance: (text, turnId) => {
+    const guidance = normalizeActiveGuidance({
+      id: `guidance-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      text,
+      turnId: turnId ?? get().currentTurnId ?? null,
+      createdAt: Date.now(),
+      consumedAt: null,
+    });
+    if (!guidance) return;
+    set({ activeGuidance: guidance, input: "" });
+    logStoreEvent("active_guidance_set", {
+      turnId: guidance.turnId,
+      chars: guidance.text.length,
+    });
+  },
+  clearActiveGuidance: () => {
+    set({ activeGuidance: null });
+    logStoreEvent("active_guidance_cleared");
+  },
+  consumeActiveGuidance: (turnId) => {
+    const state = get();
+    const guidance = normalizeActiveGuidance(state.activeGuidance);
+    if (!guidance) return null;
+    const requestedTurnId = turnId ?? state.currentTurnId ?? null;
+    if (guidance.consumedAt) return null;
+    if (guidance.turnId && requestedTurnId && guidance.turnId !== requestedTurnId) return null;
+    const consumed = { ...guidance, consumedAt: Date.now() };
+    set({ activeGuidance: null });
+    logStoreEvent("active_guidance_consumed", {
+      turnId: requestedTurnId,
+      chars: consumed.text.length,
+    });
+    return consumed;
+  },
   setAgentStatus: (s) => set({ agentStatus: s }),
   resolveReview: (action) => {
     const state = get();
@@ -6564,6 +6724,8 @@ export const useAppStore = create<AppState>()(
       approvedLocalFileReadPaths: [],
       approvedShellPermissionRules: [],
       readOnlyAutoApproveForSession: false,
+      queuedUserMessage: null,
+      activeGuidance: null,
       currentTurnExecutionConsent: { turnId: null, granted: false },
       planArtifacts: [],
       planTasks: [],
@@ -7507,7 +7669,11 @@ export const useAppStore = create<AppState>()(
     }
 
     if (state.isGenerating) {
-      logStoreEvent("send_blocked", { reason: "generation_in_progress" });
+      get().queueUserMessage(text, images, {
+        contextMentions: mentionSnapshot,
+        attachedFiles: attachedFilesSnapshot.map((file) => normalizeAttachedFile(file)),
+      });
+      logStoreEvent("send_queued", { reason: "generation_in_progress" });
       return false;
     }
 
@@ -7530,7 +7696,11 @@ export const useAppStore = create<AppState>()(
         // Re-check after state reset
         if (!text.trim() && (!images || images.length === 0) && !hasSupplementalInput) return false;
       } else {
-        logStoreEvent("send_blocked", {
+        get().queueUserMessage(text, images, {
+          contextMentions: mentionSnapshot,
+          attachedFiles: attachedFilesSnapshot.map((file) => normalizeAttachedFile(file)),
+        });
+        logStoreEvent("send_queued", {
           reason: "agent_running_or_pending_review",
           agentStatus: state.agentStatus,
         });
@@ -7978,6 +8148,10 @@ export const useAppStore = create<AppState>()(
             showFilePanel: sessionGet().showFilePanel,
             rightPanelTab: sessionGet().rightPanelTab,
             selectedDiffTaskId: sessionGet().selectedDiffTaskId,
+            autoApproveTools: sessionGet().autoApproveTools,
+            autoApproveToolScopes: sessionGet().autoApproveToolScopes,
+            queuedUserMessage: sessionGet().queuedUserMessage,
+            activeGuidance: sessionGet().activeGuidance,
           }),
         });
       }
@@ -8127,6 +8301,7 @@ export const useAppStore = create<AppState>()(
                         ...block,
                         options: undefined,
                         archivedAfterChoice: true,
+                        ...(hasOperationApprovalReplyOption(block.options) ? { archivedProposal: true } : {}),
                         ...(selectedChoiceText ? { selectedOption: selectedChoiceText } : {}),
                       }
                     : block,
@@ -8183,6 +8358,7 @@ export const useAppStore = create<AppState>()(
                         ...block,
                         options: undefined,
                         archivedAfterChoice: true,
+                        ...(hasOperationApprovalReplyOption(block.options) ? { archivedProposal: true } : {}),
                         ...(selectedChoiceText ? { selectedOption: selectedChoiceText } : {}),
                       }
                     : block,
@@ -9715,6 +9891,7 @@ export const useAppStore = create<AppState>()(
         getPlanExecutionEvidenceLedger: () => sessionGet().planExecutionEvidenceLedger,
         getPlanAutoResumeCount: () => sessionGet().planAutoResumeCount,
         getStatus: () => sessionGet().agentStatus,
+        consumeActiveGuidance: () => sessionGet().consumeActiveGuidance(turnId),
         startNewTurn: () => sessionGet().startNewTurn(),
         onApprovedPlanHandoff: (prompt) => {
           const language = sessionGet().config.language === "en" ? "en" : "zh";
@@ -11702,16 +11879,29 @@ export const useAppStore = create<AppState>()(
             : undefined;
           const autoApproveScopes = normalizeSessionAutoApproveScopes(sessionGet().autoApproveToolScopes);
           // ── Auto-approve path ──
-          // External local file reads always require first-use approval, even
-          // when the session-wide command auto-approval toggle is enabled.
           if (sessionShellPermissionApproval) {
             return { action: "accept", shellPermissionApproval: sessionShellPermissionApproval };
           }
           if (
-            !isLocalFileReadApproval &&
-            !shellRequiresApproval &&
             shouldSessionAutoApproveToolCall(toolCall, autoApproveScopes)
           ) {
+            logStoreEvent("tool_auto_approved", {
+              turnId,
+              toolName: toolCall.name,
+              target: toolTarget,
+              scope: resolveSessionAutoApproveScopeForToolCall(toolCall),
+              localFileRead: isLocalFileReadApproval,
+              shellRequiresApproval,
+            });
+            if (shellPermissionDecision?.requiresApproval) {
+              return {
+                action: "accept",
+                shellPermissionApproval: buildShellPermissionApproval(shellPermissionDecision, "session"),
+              };
+            }
+            if (isLocalFileReadApproval && toolCall.localFileReadPath) {
+              return { action: "accept", grantLocalFileReadPath: toolCall.localFileReadPath };
+            }
             return { action: "accept" };
           }
           const isEphemeralPlanArtifactTool =
@@ -11777,10 +11967,17 @@ export const useAppStore = create<AppState>()(
                 return { action: "accept", shellPermissionApproval: latestShellApproval } as ReviewDecision;
               }
               if (
-                !isLocalFileReadApproval &&
-                !shellRequiresApproval &&
                 shouldSessionAutoApproveToolCall(toolCall, latestScopes)
               ) {
+                if (shellPermissionDecision?.requiresApproval) {
+                  return {
+                    action: "accept",
+                    shellPermissionApproval: buildShellPermissionApproval(shellPermissionDecision, "session"),
+                  } as ReviewDecision;
+                }
+                if (isLocalFileReadApproval && toolCall.localFileReadPath) {
+                  return { action: "accept", grantLocalFileReadPath: toolCall.localFileReadPath } as ReviewDecision;
+                }
                 return { action: "accept" } as ReviewDecision;
               }
 
@@ -12008,6 +12205,7 @@ export const useAppStore = create<AppState>()(
         sessionSet({ pendingSlashCommand: null, elapsedTime: getElapsedSeconds() });
 
         let latestState = sessionGet();
+        const queuedAfterRun = normalizeQueuedUserMessage(latestState.queuedUserMessage);
         if (!latestState.config.debugRecordFullTurnProcess) {
           const completedTurn = latestState.conversationTurns.find((turn) => turn.id === turnId);
           const completedTurnSummary = String(completedTurn?.summary || "").trim();
@@ -12065,6 +12263,10 @@ export const useAppStore = create<AppState>()(
               showFilePanel: s.showFilePanel,
               rightPanelTab: s.rightPanelTab,
               selectedDiffTaskId: s.selectedDiffTaskId,
+              autoApproveTools: s.autoApproveTools,
+              autoApproveToolScopes: s.autoApproveToolScopes,
+              queuedUserMessage: s.queuedUserMessage,
+              activeGuidance: s.activeGuidance,
               }),
             });
           }
@@ -12121,6 +12323,45 @@ export const useAppStore = create<AppState>()(
                 skipIntentResolution: true,
                 turnTitle: handoff.title,
                 intentSummary: handoff.intentSummary,
+              });
+            });
+          } else if (queuedAfterRun) {
+            sessionSet({
+              queuedUserMessage: null,
+              input: "",
+              contextMentions: [],
+              attachedFiles: [],
+            });
+            runAfterNextPaint(() => {
+              const latest = get();
+              const latestSessionKey = resolveSessionRuntimeKey(
+                resolveSessionWorkspaceKey(latest.currentWorkspace),
+                latest.currentSessionId,
+              );
+              if (latestSessionKey !== runSessionKey) {
+                logStoreEvent("queued_user_message_skipped", {
+                  reason: "session_changed",
+                  expectedSessionKey: runSessionKey,
+                  latestSessionKey,
+                });
+                return;
+              }
+              if (latest.isGenerating || latest.agentStatus === "running" || latest.agentStatus === "pending_review") {
+                logStoreEvent("queued_user_message_skipped", {
+                  reason: "agent_busy",
+                  agentStatus: latest.agentStatus,
+                });
+                return;
+              }
+              logStoreEvent("queued_user_message_sending", {
+                chars: queuedAfterRun.text.length,
+                images: queuedAfterRun.images?.length || 0,
+                contextMentions: queuedAfterRun.contextMentions?.length || 0,
+                attachedFiles: queuedAfterRun.attachedFiles?.length || 0,
+              });
+              latest.sendMessage(queuedAfterRun.text, queuedAfterRun.images, {
+                contextMentionsSnapshot: queuedAfterRun.contextMentions || [],
+                attachedFilesSnapshot: queuedAfterRun.attachedFiles || [],
               });
             });
           }

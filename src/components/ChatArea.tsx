@@ -1067,6 +1067,17 @@ function TurnIntentHistoryCard({
   );
 }
 
+function TurnPhaseDivider({ label }: { label: string }) {
+  return (
+    <div data-testid="turn-phase-divider" className="ml-9 flex items-center gap-3 py-1">
+      <span className="shrink-0 rounded-full border border-[var(--surface-border-soft)] bg-[var(--surface-1)] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-[var(--surface-text-muted)]">
+        {label}
+      </span>
+      <span className="h-px min-w-0 flex-1 bg-[color-mix(in_srgb,var(--accent)_32%,transparent)]" />
+    </div>
+  );
+}
+
 function TurnChangesCard({
   entries,
   totalExecutedEdits,
@@ -1963,9 +1974,14 @@ function AgentContentBlock({
   const previewCharCount = Math.min(displaySourceContent.length, previewLimit).toLocaleString();
   const totalCharCount = displaySourceContent.length.toLocaleString();
   const isArchivedAfterChoice = block.archivedAfterChoice && !block.streaming;
-  const archivedTitle = language === "zh" ? "已保留上一步反馈" : "Previous reply kept";
+  const isArchivedProposal = !!block.archivedProposal;
+  const archivedTitle = isArchivedProposal
+    ? language === "zh" ? "已批准方案" : "Approved Proposal"
+    : language === "zh" ? "已保留上一步反馈" : "Previous reply kept";
   const archivedAction = language === "zh" ? "展开回看" : "Expand";
-  const archivedCollapse = language === "zh" ? "收起反馈" : "Collapse";
+  const archivedCollapse = isArchivedProposal
+    ? language === "zh" ? "收起方案" : "Collapse Proposal"
+    : language === "zh" ? "收起反馈" : "Collapse";
   const selectedOptionText = String(block.selectedOption || "").trim();
   const archivedPreview = archivedPreviewText.length > 150
     ? `${archivedPreviewText.slice(0, 150).trim()}...`
@@ -2585,6 +2601,19 @@ export default function ChatArea({
     );
     return latestOptionBlock?.options || [];
   }, [topIslandTurnBlocks, topIslandTurnStatusKey]);
+  const topIslandHasPendingProposalCheckpoint = useMemo(() => {
+    if (!topIslandTurn || topIslandTurnStatusKey !== "awaiting_input") return false;
+    return [...topIslandTurnBlocks].reverse().some((block) =>
+      block.type === "agent" &&
+      Array.isArray(block.options) &&
+      block.options.some((option: ReplyOption) =>
+        option?.action === "approve_operation_once" ||
+        option?.action === "execute_once" ||
+        option?.source === "proposal_follow_up" ||
+        option?.source === "operation_approval"
+      )
+    );
+  }, [topIslandTurn, topIslandTurnBlocks, topIslandTurnStatusKey]);
   const topIslandIsRunActive =
     agentStatus === "running" &&
     !!topIslandTurn &&
@@ -2595,6 +2624,8 @@ export default function ChatArea({
   const shouldShowRunStatus = isStreaming || isAwaitingInteractiveChoice;
   const runStatusLabel = isStreaming
     ? copy.processingLabel
+    : topIslandHasPendingProposalCheckpoint
+    ? language === "zh" ? "待确认方案..." : "Proposal checkpoint..."
     : language === "zh" ? "等待选择..." : "Awaiting choice...";
   const topIslandHasChoiceContext =
     topIslandReplyOptions.length > 0 ||
@@ -3199,6 +3230,73 @@ export default function ChatArea({
       if (isLiveProcessRenderItem(item)) return null;
       return renderTurnBlockItem(item);
     };
+    const isExecutionPhaseBlock = (block: any) => {
+      if (!block || block.type === "user") return false;
+      if (block.type === "agent") {
+        return block.hiddenProcess === true ||
+          block.visibility === "user_progress" ||
+          block.turnPhase?.domain === "tool";
+      }
+      return block.type === "tool" ||
+        block.type === "progress" ||
+        block.type === "jobList" ||
+        (block.type === "system" &&
+          block.variant !== "context_compression" &&
+          block.variant !== "plan_execution_checkpoint");
+    };
+    const phaseLabels = {
+      analysis: language === "zh" ? "分析与方案" : "Analysis & Proposal",
+      approval: language === "zh" ? "用户批准" : "User Approval",
+      execution: language === "zh" ? "执行与验证" : "Execution & Validation",
+    };
+    const proposalBlockIndex = blocks.findIndex((block) => block.type === "agent" && block.archivedProposal);
+    const hasProposalCheckpoint = proposalBlockIndex >= 0;
+    const approvalBlockIndex = hasProposalCheckpoint
+      ? blocks.findIndex((block, blockIndex) => blockIndex > proposalBlockIndex && block.type === "user")
+      : -1;
+    const executionBlockIndex = hasProposalCheckpoint
+      ? blocks.findIndex((block, blockIndex) =>
+          blockIndex > Math.max(proposalBlockIndex, approvalBlockIndex) &&
+          isExecutionPhaseBlock(block)
+        )
+      : -1;
+    const renderTurnPhaseDividersBeforeItem = (() => {
+      const inserted = new Set<string>();
+      return (item: any) => {
+        if (!hasProposalCheckpoint) return [];
+        const indexForPhase = item.kind === "operationCluster"
+          ? item.index
+          : item.kind === "completedToolGroup" || item.kind === "readContextGroup"
+          ? item.index ?? blocks.findIndex((block) => block.id === item.blocks?.[0]?.id)
+          : item.index;
+        const keys: string[] = [];
+        if (!inserted.has("analysis") && indexForPhase >= proposalBlockIndex) keys.push("analysis");
+        if (approvalBlockIndex >= 0 && !inserted.has("approval") && indexForPhase >= approvalBlockIndex) keys.push("approval");
+        if (executionBlockIndex >= 0 && !inserted.has("execution") && indexForPhase >= executionBlockIndex) keys.push("execution");
+        keys.forEach((key) => inserted.add(key));
+        return keys.map((key) => (
+          <TurnPhaseDivider key={`${turn.id}-phase-${key}`} label={phaseLabels[key]} />
+        ));
+      };
+    })();
+    const renderTurnRemainderWithPhases = (item) => {
+      if (item.kind === "block" && userBlock && item.block?.id === userBlock.id) return null;
+      const rendered = renderLiveRemainderItem(item);
+      if (!rendered) return null;
+      const dividers = renderTurnPhaseDividersBeforeItem(item);
+      if (dividers.length === 0) return rendered;
+      const renderedKey = React.isValidElement(rendered)
+        ? rendered.key ?? `item-${item.index}`
+        : `item-${item.index}`;
+      return (
+        <React.Fragment key={`phase-wrap-${turn.id}-${renderedKey}`}>
+          {dividers}
+          {rendered}
+        </React.Fragment>
+      );
+    };
+    const proposalCheckpointBlock = hasProposalCheckpoint ? blocks[proposalBlockIndex] : null;
+    const proposalApprovalBlock = approvalBlockIndex >= 0 ? blocks[approvalBlockIndex] : null;
     const displayTitleFallback = turn.userPrompt
       ? normalizeConversationDisplayTitle(
           turn.userPrompt,
@@ -3352,6 +3450,21 @@ export default function ChatArea({
               )}
               {shouldArchiveCompletedProcess ? (
                 <>
+                  {hasProposalCheckpoint && proposalCheckpointBlock && (
+                    <>
+                      <TurnPhaseDivider key={`${turn.id}-archived-phase-analysis`} label={phaseLabels.analysis} />
+                      {renderBlock(proposalCheckpointBlock, proposalBlockIndex)}
+                    </>
+                  )}
+                  {hasProposalCheckpoint && proposalApprovalBlock && (
+                    <>
+                      <TurnPhaseDivider key={`${turn.id}-archived-phase-approval`} label={phaseLabels.approval} />
+                      {renderBlock(proposalApprovalBlock, approvalBlockIndex)}
+                    </>
+                  )}
+                  {hasProposalCheckpoint && processArchive && processArchive.totalCount > 0 && (
+                    <TurnPhaseDivider key={`${turn.id}-archived-phase-execution`} label={phaseLabels.execution} />
+                  )}
                   {processArchive && processArchive.totalCount > 0 && (
                     <TurnProcessArchive
                       archive={processArchive}
@@ -3380,7 +3493,7 @@ export default function ChatArea({
                       onOpenDiff={openDiffForTask}
                     />
                   )}
-                  {buildBlockRenderItems(blocks, false, enableCompletedToolGrouping, language).map(renderLiveRemainderItem)}
+                  {buildBlockRenderItems(blocks, true, enableCompletedToolGrouping, language).map(renderTurnRemainderWithPhases)}
                 </>
               )}
             </>
