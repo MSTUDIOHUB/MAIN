@@ -3908,9 +3908,12 @@ export default function ChatArea({
                     </div>
 
                     {isRich && (
-                      <div className="w-full text-left overflow-y-auto max-h-[30vh] pr-1">
-                        {renderCompactMarkdownText(persistedExplanation)}
-                      </div>
+                      <>
+                        <div className="w-full text-left pr-1">
+                          {renderCompactMarkdownText(persistedExplanation)}
+                        </div>
+                        <div className="h-5 shrink-0 w-full" />
+                      </>
                     )}
                   </div>
                 )}

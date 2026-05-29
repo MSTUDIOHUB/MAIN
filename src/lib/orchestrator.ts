@@ -2622,7 +2622,13 @@ async function fetchLLMStream(
     const skipReasoningDominatedEscalation = isReasoningDominatedLengthResult(result, isLocal);
     const isChat = options.workflowMode === "chat" || options.runtimeIntent === "respond";
     const allowEscalation = !(isChat && currentMaxTokens >= 4096);
-    if (result.finishReason === "length" && escalationCount < MAX_ESCALATIONS && !skipReasoningDominatedEscalation && allowEscalation) {
+    const hasToolCalls = Array.isArray(result.toolCalls) && result.toolCalls.length > 0;
+    const shouldEscalate = result.finishReason === "length" &&
+      escalationCount < MAX_ESCALATIONS &&
+      !skipReasoningDominatedEscalation &&
+      allowEscalation &&
+      (!isLocal || hasToolCalls);
+    if (shouldEscalate) {
         const nextMaxTokens = escalateMaxTokens(currentMaxTokens, settings.contextLimit);
       if (nextMaxTokens !== null) {
         escalationCount++;

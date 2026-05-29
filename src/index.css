@@ -543,6 +543,11 @@ html[data-theme="light"] #root {
   transition: opacity 0.3s cubic-bezier(0.4, 0, 0.2, 1), transform 0.3s cubic-bezier(0.4, 0, 0.2, 1), width 0.35s cubic-bezier(0.4, 0, 0.2, 1), height 0.35s cubic-bezier(0.4, 0, 0.2, 1), max-width 0.35s cubic-bezier(0.4, 0, 0.2, 1), max-height 0.35s cubic-bezier(0.4, 0, 0.2, 1), padding 0.35s cubic-bezier(0.4, 0, 0.2, 1), border-radius 0.35s cubic-bezier(0.4, 0, 0.2, 1);
   letter-spacing: 0;
   text-align: center;
+  scrollbar-width: none; /* Firefox */
+}
+
+.agent-explanation-capsule::-webkit-scrollbar {
+  display: none !important; /* Chrome, Safari, Opera */
 }
 
 .agent-explanation-capsule::before {
