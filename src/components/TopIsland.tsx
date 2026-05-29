@@ -277,7 +277,7 @@ const TopIsland = memo(function TopIsland({
     approveExecuteOnce: language === "zh" ? "直接执行本轮" : "Run This Turn",
     approveThread: language === "zh" ? "开启自动审查并执行" : "Auto Review And Run",
     dismiss: language === "zh" ? "取消/继续调整" : "Cancel / Adjust",
-    cancelTurn: language === "zh" ? "结束本轮" : "End This Turn",
+    cancelTurn: language === "zh" ? "结束本轮（这会让回合停止）" : "End Round (This will stop the current turn)",
     intentOptionInfo: language === "zh"
       ? "选择后 MAIN 会按这个意图重新处理当前输入。"
       : "Selecting this tells MAIN which intent to use for the current input.",
@@ -349,7 +349,6 @@ const TopIsland = memo(function TopIsland({
   const choiceOptionButtonClass = "top-island-choice-option w-full min-w-0 rounded-xl border px-3 py-2.5 text-left transition-all duration-150";
   const choiceNumberClass = "top-island-choice-number w-7 shrink-0 text-right font-semibold transition-colors duration-150";
   const approvalOptionButtonClass = "top-island-approval-option w-full rounded-xl border px-3 py-2.5 text-left transition-all duration-150";
-  const infoIconClass = themeMode === "light" ? "text-[#64748b] hover:text-[#111827]" : "text-[#71717a] hover:text-[#f5f5f5]";
   const neutralActionButtonClass = themeMode === "light"
     ? "rounded-xl border border-[rgba(15,23,42,0.14)] bg-[rgba(255,255,255,0.72)] text-[#334155] transition-all duration-150 hover:border-[var(--accent)] hover:bg-[var(--accent-subtle)] hover:text-[#111827]"
     : isBlackTheme
@@ -557,9 +556,6 @@ const TopIsland = memo(function TopIsland({
                             >
                               <span className="min-w-0 break-words">{option.label}</span>
                             </button>
-                            <span className={`shrink-0 ${infoIconClass}`} title={copy.intentOptionInfo} aria-label={copy.intentOptionInfo}>
-                              <IconInfo className="h-4 w-4" />
-                            </span>
                           </div>
                         ))}
                       </div>
@@ -700,9 +696,6 @@ const TopIsland = memo(function TopIsland({
                               >
                                 <span className="min-w-0 break-words">{getDisplayReplyOptionLabel(option, language)}</span>
                               </button>
-                              <span className={`shrink-0 ${infoIconClass}`} title={copy.replyOptionInfo} aria-label={copy.replyOptionInfo}>
-                                <IconInfo className="h-4 w-4" />
-                              </span>
                             </div>
                           ))}
                         </div>
@@ -762,7 +755,7 @@ const TopIsland = memo(function TopIsland({
                     </form>
                     <button
                       onClick={onCancelTurn}
-                      className={`${neutralActionButtonClass} w-full px-3 py-2.5 text-left`}
+                      className="w-full px-3 py-2.5 text-center rounded-xl border border-[rgba(239,68,68,0.4)] bg-[rgba(239,68,68,0.08)] text-[#ef4444] transition-all duration-150 hover:border-[#ef4444] hover:bg-[rgba(239,68,68,0.16)] hover:text-[#f87171]"
                       style={choiceTextStyle}
                     >
                       {copy.cancelTurn}

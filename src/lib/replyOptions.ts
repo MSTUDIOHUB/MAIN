@@ -3,8 +3,8 @@ import type { ReplyOption } from "./workflowModels";
 const USER_OPTIONS_BLOCK_RE = /<user_options>([\s\S]*?)<\/user_options>/gi;
 const OPTION_RE = /<option\b([^>]*)>([\s\S]*?)<\/option>/gi;
 const OPTION_ATTR_RE = /\b(label|value|text|title|action)\s*=\s*"([^"]*)"/gi;
-const DECISION_CUE_RE = /(?:请选择|请确认|请告诉我|请说明|你可以选择|可选方案|备选方案|选项|选择下一步|下一步可以|选一个|选一项|任选其一|从下面.*选|options?|choices?|would you like|do you want|please choose|please confirm|choose one|pick one|select one)/i;
-const ENUMERATED_DECISION_CUE_RE = /(?:请选择|请确认|选一个|选一项|任选其一|从下面.*选|please choose|please confirm|choose one|pick one|select one)/i;
+const DECISION_CUE_RE = /(?:请选择|请确认|请告诉我|请说明|请问|需要您|希望|基于哪个|是：|是否(?:需要|希望|应该)?|你可以选择|可选方案|备选方案|选项|选择下一步|下一步可以|选一个|选一项|任选其一|从下面.*选|options?|choices?|would you like|do you want|please choose|please confirm|choose one|pick one|select one)/i;
+const ENUMERATED_DECISION_CUE_RE = /(?:请选择|请确认|请告诉我|请说明|请问|需要您|希望|基于哪个|是：|是否(?:需要|希望|应该)?|选一个|选一项|任选其一|从下面.*选|options?|choices?|please choose|please confirm|choose one|pick one|select one)/i;
 const ENUM_OPTION_RE = /^\s*(?:[-*]|(?:\d+|[A-Za-z])[\.\)、:：])\s+(.+?)\s*$/;
 const BINARY_SEPARATOR_RE = /\s*(?:，|,)?\s*(或者|还是|或是|\bor\b)\s*/i;
 const ENUMERATED_LINE_RE = /^\s*(?:[-*]|(?:\d+|[A-Za-z])[\.\)、:：])\s+/;
@@ -33,6 +33,8 @@ const OPTIONAL_PLAN_CONTEXT_OPTION_RE = /(?:提供|补充|告诉|输入|粘贴|�
 const PREMATURE_PLAN_ARTIFACT_TEXT_RE = /(?:#\s*Proposed Plan|Proposed Plan|核心问题诊断|根源分析|执行路线图|修复方案|实现方案|实施方案|重构方案|拟定方案|实施步骤|执行步骤|阶段\s*\d|影响文件|验证方式|Data Integrity|Dark Mode Refactor|Implementation Plan|Execution Plan|Root Cause|Validation)/i;
 const BLOCKING_PLAN_DECISION_TEXT_RE = /(?:真正阻塞|阻塞问题|必须(?:由)?用户(?:确认|选择|拍板)|需要用户(?:确认|选择|拍板)|缺少关键(?:业务|产品|设计|范围|验收)选择|请确认以下关键点|before (?:I|we) can (?:write|finalize|proceed)|blocking question|blocking decision|need you to choose|must choose)/i;
 const PLAN_ROUTE_OPTION_RE = /(?:^方案\s*[A-Z0-9一二三四五六七八九十]|^option\s*[A-Z0-9]|优先|同时|并行|全部|两个|两项|仅|只|先|直接|继续|开始|完整|最小|MVP|修复|修改|实现|重构|完善|执行|落地|proceed|continue|start|fix|modify|implement|refactor|execute|both|parallel|all|mvp)/i;
+
+const OPEN_ENDED_QUESTION_RE = /(?:哪个|什么|哪里|怎么|为什么|为何|怎样|如何|\b(?:what|which|where|why|how|who)\b)/i;
 
 function normalizeOptionText(text: string): string {
   return text.replace(/\s+/g, " ").trim();
@@ -172,6 +174,14 @@ function looksLikeActionableReplyOption(text: string, source?: ReplyOption["sour
   const normalized = normalizeOptionText(text);
   if (!normalized) return false;
   if (source === "readonly_permission") return true;
+  if (source === "inferred_enumerated" || source === "inferred_binary") {
+    if (OPEN_ENDED_QUESTION_RE.test(normalized)) return false;
+    if (looksLikeInternalPlanArtifactStep(normalized) || looksLikePlanSummaryItem(normalized)) {
+      return false;
+    }
+    if (looksLikeDiagnosticStatementOption(normalized)) return false;
+    return true;
+  }
   if (looksLikeExecuteReplyOption(normalized)) return true;
   if (looksLikeDiagnosticStatementOption(normalized)) return false;
   if (ACTIONABLE_OPTION_RE.test(normalized)) return true;
@@ -207,8 +217,11 @@ function convertAssistantClauseToUserChoice(clause: string): string {
   }
 
   normalized = normalized
-    .replace(/^(?:您|你)?(?:想|希望|要)?(?:让我|要我|叫我)/, "")
-    .replace(/^(?:您|你)?是否希望我/, "")
+    .replace(/[呢吧吗]+$/, "")
+    .replace(/^(?:您|你)?(?:是否)?(?:想|希望|要|需要)?(?:让我|要我|叫我|我们|我来)/, "")
+    .replace(/^(?:您|你)(?:想|希望|要|需要)(?:我)?/, "")
+    .replace(/^(?:您|你|我们|我来)/, "")
+    .replace(/^(?:您|你)?是否希望(?:我们|我|我来)?/, "")
     .replace(/^(?:是否需要|是否要|要不要|是否)/, "")
     .replace(/^(?:Would you like me to|Do you want me to)\s+/i, "")
     .replace(/^(?:Please let me know whether you want me to)\s+/i, "")
@@ -256,7 +269,14 @@ function inferReplyOptionsFromEnumeratedChoices(
         continue;
       }
       const body = normalizeOptionText(matched[1] || "");
-      if (!body || /[？?]$/.test(body) || /是否/.test(body)) {
+      const hasBinarySeparatorInMiddle = (
+        (body.includes("还是") && body.indexOf("还是") > 1) ||
+        (body.includes("或者") && body.indexOf("或者") > 1) ||
+        (body.includes("或是") && body.indexOf("或是") > 1) ||
+        (/\b(or)\b/i.test(body) && body.search(/\b(or)\b/i) > 1)
+      );
+      const isABQuestion = (/是否|想让|希望/i.test(body) || /[？?]$/.test(body)) && hasBinarySeparatorInMiddle;
+      if (!body || isABQuestion) {
         inferred.length = 0;
         break;
       }
@@ -314,6 +334,7 @@ function inferReplyOptionsFromBinaryChoice(
 function looksLikeReadOnlyPermissionPrompt(text: string): boolean {
   const normalized = normalizeOptionText(text);
   if (!normalized) return false;
+  if (OPEN_ENDED_QUESTION_RE.test(normalized)) return false;
   if (READONLY_WRITE_EXCLUSION_RE.test(normalized)) return false;
   return READONLY_PERMISSION_CUE_RE.test(normalized) && READONLY_ACTION_RE.test(normalized);
 }

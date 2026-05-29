@@ -540,14 +540,40 @@ html[data-theme="light"] #root {
               0 0 0 1px var(--accent-subtle-border, rgba(147, 51, 234, 0.28)),
               0 0 12px var(--accent-subtle, rgba(147, 51, 234, 0.18)),
               inset 0 1px 1px rgba(255, 255, 255, 0.1);
-  transition: opacity 0.3s cubic-bezier(0.4, 0, 0.2, 1), transform 0.3s cubic-bezier(0.4, 0, 0.2, 1), width 0.35s cubic-bezier(0.4, 0, 0.2, 1), height 0.35s cubic-bezier(0.4, 0, 0.2, 1), max-width 0.35s cubic-bezier(0.4, 0, 0.2, 1), max-height 0.35s cubic-bezier(0.4, 0, 0.2, 1), padding 0.35s cubic-bezier(0.4, 0, 0.2, 1), border-radius 0.35s cubic-bezier(0.4, 0, 0.2, 1);
+  transition: opacity 0.3s cubic-bezier(0.4, 0, 0.2, 1), transform 0.3s cubic-bezier(0.4, 0, 0.2, 1), width 0.35s cubic-bezier(0.4, 0, 0.2, 1), max-width 0.35s cubic-bezier(0.4, 0, 0.2, 1), padding 0.35s cubic-bezier(0.4, 0, 0.2, 1), border-radius 0.35s cubic-bezier(0.4, 0, 0.2, 1);
   letter-spacing: 0;
   text-align: center;
-  scrollbar-width: none; /* Firefox */
 }
 
-.agent-explanation-capsule::-webkit-scrollbar {
-  display: none !important; /* Chrome, Safari, Opera */
+.agent-explanation-scroll-container {
+  width: 100%;
+  max-height: 100%;
+  overflow-y: auto;
+  overflow-x: hidden;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  z-index: 10;
+  scrollbar-width: thin; /* Firefox */
+  scrollbar-color: var(--accent-light, #a855f7) transparent;
+}
+
+.agent-explanation-scroll-container::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+
+.agent-explanation-scroll-container::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.agent-explanation-scroll-container::-webkit-scrollbar-thumb {
+  background: var(--accent-light, #a855f7);
+  border-radius: 9999px;
+}
+
+.agent-explanation-scroll-container::-webkit-scrollbar-thumb:hover {
+  background: var(--accent, #9333ea);
 }
 
 .agent-explanation-capsule::before {

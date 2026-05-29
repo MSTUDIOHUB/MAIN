@@ -3872,7 +3872,7 @@ export default function ChatArea({
                   fontSize: `${Math.max(11, resolvedChatFontSize - 1)}px`,
                   lineHeight: `${Math.max(16, Math.round((resolvedChatFontSize - 1) * 1.5))}px`,
                   maxHeight: !isCapsuleCollapsed && chatAreaHeight ? `${chatAreaHeight * 0.4}px` : undefined,
-                  overflowY: !isCapsuleCollapsed ? "auto" : "hidden",
+                  overflowY: "hidden",
                 }}
                 onClick={isCapsuleCollapsed ? () => setIsCapsuleCollapsed(false) : undefined}
                 title={isCapsuleCollapsed ? (language === "zh" ? "点击展开" : "Click to expand") : undefined}
@@ -3882,39 +3882,41 @@ export default function ChatArea({
                     <IconLogoM className="h-5 w-5 theme-text pointer-events-none" />
                   </div>
                 ) : (
-                  <div className={`relative z-10 flex w-full ${isRich ? "flex-col items-start gap-3" : "items-center"}`}>
-                    <div className="flex items-center w-full justify-between border-b border-[#27272a]/60 pb-2 mb-1" style={!isRich ? { borderBottom: "none", paddingBottom: 0, marginBottom: 0 } : undefined}>
-                      <div className="flex items-center min-w-0 flex-1">
-                        <div className="shrink-0 mr-2.5 flex items-center justify-center h-6 w-6 rounded-full border border-[var(--accent-subtle-border)] bg-[var(--accent-subtle)] shadow-[0_0_6px_var(--accent-subtle)]">
-                          <IconLogoM className="h-3.5 w-3.5 theme-text pointer-events-none" />
+                  <div className="agent-explanation-scroll-container">
+                    <div className={`relative z-10 flex w-full ${isRich ? "flex-col items-start gap-3" : "items-center"}`}>
+                      <div className="flex items-center w-full justify-between border-b border-[#27272a]/60 pb-2 mb-1" style={!isRich ? { borderBottom: "none", paddingBottom: 0, marginBottom: 0 } : undefined}>
+                        <div className="flex items-center min-w-0 flex-1">
+                          <div className="shrink-0 mr-2.5 flex items-center justify-center h-6 w-6 rounded-full border border-[var(--accent-subtle-border)] bg-[var(--accent-subtle)] shadow-[0_0_6px_var(--accent-subtle)]">
+                            <IconLogoM className="h-3.5 w-3.5 theme-text pointer-events-none" />
+                          </div>
+                          <span className={`whitespace-pre-wrap break-words min-w-0 block flex-1 ${isRich ? "text-left font-semibold text-[var(--accent-light)]" : "text-left text-white"}`}>
+                            {!isRich ? renderCompactMarkdownText(persistedExplanation) : (language === "zh" ? "MAIN 的实时心流" : "MAIN's Flow")}
+                          </span>
                         </div>
-                        <span className={`whitespace-pre-wrap break-words min-w-0 block flex-1 ${isRich ? "text-left font-semibold text-[var(--accent-light)]" : "text-left text-white"}`}>
-                          {!isRich ? renderCompactMarkdownText(persistedExplanation) : (language === "zh" ? "MAIN 的实时心流" : "MAIN's Flow")}
-                        </span>
+                        
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setIsCapsuleCollapsed(true);
+                          }}
+                          title={language === "zh" ? "隐藏" : "Hide"}
+                          className="shrink-0 ml-3 flex items-center justify-center p-1.5 rounded-md border border-[var(--accent-subtle-border)] bg-[color-mix(in_srgb,var(--accent)_10%,transparent)] text-[var(--accent-light)] transition-all hover:bg-[var(--accent)] hover:text-white hover:border-transparent active:scale-95 cursor-pointer"
+                        >
+                          <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 01-1.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21" />
+                          </svg>
+                        </button>
                       </div>
-                      
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setIsCapsuleCollapsed(true);
-                        }}
-                        title={language === "zh" ? "隐藏" : "Hide"}
-                        className="shrink-0 ml-3 flex items-center justify-center p-1.5 rounded-md border border-[var(--accent-subtle-border)] bg-[color-mix(in_srgb,var(--accent)_10%,transparent)] text-[var(--accent-light)] transition-all hover:bg-[var(--accent)] hover:text-white hover:border-transparent active:scale-95 cursor-pointer"
-                      >
-                        <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 01-1.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21" />
-                        </svg>
-                      </button>
-                    </div>
 
-                    {isRich && (
-                      <>
-                        <div className="w-full text-left pr-1">
-                          {renderCompactMarkdownText(persistedExplanation)}
-                        </div>
-                        <div className="h-5 shrink-0 w-full" />
-                      </>
-                    )}
+                      {isRich && (
+                        <>
+                          <div className="w-full text-left pr-1">
+                            {renderCompactMarkdownText(persistedExplanation)}
+                          </div>
+                          <div className="h-5 shrink-0 w-full" />
+                        </>
+                      )}
+                    </div>
                   </div>
                 )}
               </div>

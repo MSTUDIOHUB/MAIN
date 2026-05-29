@@ -36,7 +36,6 @@ import {
   persistHarnessRunMarker,
   type HarnessRunMarker,
 } from "../lib/harnessCrashTelemetry";
-import { formatWorkspaceTree } from "../lib/systemPrompt";
 import { normalizeContextMemoryState, type ContextMemoryState } from "../lib/contextMemory";
 import { setMcpToolServerMap, type MCPServer, type MCPTool } from "../lib/mcpClient";
 import { sanitizePlanArtifactContent } from "../lib/sanitize";
@@ -2623,8 +2622,8 @@ async function getWorkspaceTree(workspace: string): Promise<string> {
   }
 
   try {
-    const entries = await invoke<Array<{ name: string; is_dir: boolean }>>("list_directory", { path: workspace, workspace });
-    workspaceTreeCache = formatWorkspaceTree(entries.map((entry) => ({ name: entry.name, isDirectory: entry.is_dir })));
+    const skeleton = await invoke<string>("get_project_skeleton", { depth: 3, workspace });
+    workspaceTreeCache = skeleton;
     workspaceTreeCacheKey = workspace;
     workspaceTreeCacheVersion = workspaceContentVersion;
     return workspaceTreeCache;

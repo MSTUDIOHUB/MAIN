@@ -811,3 +811,43 @@ test("read-only permission option classifier only matches synthetic permission c
     false,
   );
 });
+
+test("extractReplyOptions infers natural language questions from local models like Gemma 4 under a cue", () => {
+  const result = extractReplyOptions(`
+请问您希望图表上的“销售额”应该基于哪个字段的最终支付金额？是：
+
+1. "支付金额(¥)" 字段（这是订单的最终支付金额）？
+2. 还是需要基于（"价格(¥)" - "优惠价(¥)"）的差值来计算？
+3. 对于状态为 "closed" 的订单，是否应该将其计入当期销售额？
+  `);
+
+  assert.equal(result.replyOptions.length, 3);
+  assert.equal(result.replyOptions[0].value, '"支付金额(¥)" 字段（这是订单的最终支付金额）');
+  assert.equal(result.replyOptions[1].value, '还是需要基于（"价格(¥)" - "优惠价(¥)"）的差值来计算');
+  assert.equal(result.replyOptions[2].value, '对于状态为 "closed" 的订单，是否应该将其计入当期销售额');
+});
+
+test("extractReplyOptions rejects open-ended binary questions as choices", () => {
+  const result1 = extractReplyOptions(`
+您希望我们从哪个字段开始讨论噪音词语，还是您想进行下一步操作呢？
+  `);
+  assert.equal(result1.replyOptions.length, 0);
+
+  const result2 = extractReplyOptions(`
+请问我们需要我读取哪个目录，还是您有其他需要我做的工作？
+  `);
+  assert.equal(result2.replyOptions.length, 0);
+});
+
+test("convertAssistantClauseToUserChoice converts Gemma pronouns and preserves first person actions", () => {
+  const result = extractReplyOptions(`
+请选择下一步：
+
+1. 我要分析销售额数据
+2. 直接执行部署脚本 deploy.sh
+  `);
+
+  assert.equal(result.replyOptions.length, 2);
+  assert.equal(result.replyOptions[0].value, "我要分析销售额数据");
+  assert.equal(result.replyOptions[1].value, "直接执行部署脚本 deploy.sh");
+});

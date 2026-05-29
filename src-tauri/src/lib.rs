@@ -4311,6 +4311,77 @@ fn directory_contains_asmdef(dir: &Path, current: usize, probe_depth: usize) -> 
     false
 }
 
+struct TreeNode {
+    name: String,
+    is_dir: bool,
+    children: std::collections::BTreeMap<String, TreeNode>,
+}
+
+impl TreeNode {
+    fn new(name: String, is_dir: bool) -> Self {
+        Self {
+            name,
+            is_dir,
+            children: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn insert_path(&mut self, parts: &[&str], index: usize) {
+        if index >= parts.len() {
+            return;
+        }
+        let part = parts[index];
+        let is_last = index == parts.len() - 1;
+        let child = self.children.entry(part.to_string()).or_insert_with(|| {
+            TreeNode::new(part.to_string(), !is_last)
+        });
+        if !is_last {
+            child.is_dir = true;
+            child.insert_path(parts, index + 1);
+        }
+    }
+
+    fn render(&self, depth: usize, max_depth: usize, output: &mut String) {
+        if depth > 0 {
+            let indent = "  ".repeat(depth - 1);
+            if self.is_dir {
+                output.push_str(&format!("{}{}/\n", indent, self.name));
+            } else {
+                output.push_str(&format!("{}{}\n", indent, self.name));
+            }
+        }
+        if depth >= max_depth && self.is_dir {
+            let file_count = self.count_files_recursive();
+            if file_count > 0 {
+                let indent = "  ".repeat(depth);
+                output.push_str(&format!("{}[... +{} files]\n", indent, file_count));
+            }
+            return;
+        }
+        let mut child_nodes: Vec<&TreeNode> = self.children.values().collect();
+        child_nodes.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            _ => a.name.cmp(&b.name),
+        });
+        for child in child_nodes {
+            child.render(depth + 1, max_depth, output);
+        }
+    }
+
+    fn count_files_recursive(&self) -> usize {
+        let mut count = 0;
+        for child in self.children.values() {
+            if child.is_dir {
+                count += child.count_files_recursive();
+            } else {
+                count += 1;
+            }
+        }
+        count
+    }
+}
+
 #[tauri::command]
 fn get_project_skeleton(
     state: State<WorkspaceState>,
@@ -4325,7 +4396,31 @@ fn get_project_skeleton(
     };
     let mut tree = String::new();
 
-    build_skeleton_tree(&workspace, 0, max_depth, 0, &mut tree);
+    // 1. Try Git Index first
+    let mut git_success = false;
+    let timeout = Duration::from_millis(5000);
+    if let Ok(output) = run_git_process(&workspace, &["ls-files"], timeout) {
+        if output.success {
+            let mut root = TreeNode::new("".to_string(), true);
+            for line in output.stdout.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let parts: Vec<&str> = line.split(|c| c == '/' || c == '\\').filter(|s| !s.is_empty()).collect();
+                if !parts.is_empty() {
+                    root.insert_path(&parts, 0);
+                }
+            }
+            root.render(0, max_depth, &mut tree);
+            git_success = true;
+        }
+    }
+
+    // 2. Fall back to Native Walker if not a Git repo or Git fails
+    if !git_success {
+        build_skeleton_tree(&workspace, 0, max_depth, 0, &mut tree);
+    }
 
     // Safety: Prevent insane out-of-control project trees from blowing up token count
     if tree.len() > 32000 {
