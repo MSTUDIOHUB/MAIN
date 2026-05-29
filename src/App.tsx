@@ -2568,7 +2568,30 @@ export default function App() {
       return false;
     }
 
-    ensureFeishuRemoteSession(message);
+    const linkedSessionId = state.feishuLinkedSessionId;
+    const scopeKey = resolveSessionWorkspaceKey(state.currentWorkspace);
+    const sessions = state.sessionsByWorkspace[scopeKey] || [];
+    const isLinkedSessionValid = linkedSessionId && sessions.some((s: any) => s.id === linkedSessionId);
+
+    if (isLinkedSessionValid) {
+      if (state.currentSessionId !== linkedSessionId) {
+        if (state.currentSessionId) {
+          state.updateSession(scopeKey, state.currentSessionId, {
+            messages: sanitizeTaskBlocksForPersist(state.taskFlow),
+            active: false,
+          });
+        }
+        for (const session of sessions) {
+          if (session.active) state.updateSession(scopeKey, session.id, { active: false });
+        }
+        state.updateSession(scopeKey, linkedSessionId!, { active: true });
+        state.setCurrentSessionId(linkedSessionId!);
+        const target = sessions.find((s: any) => s.id === linkedSessionId);
+        if (target) void restoreSessionState(target, linkedSessionId!, scopeKey);
+      }
+    } else {
+      ensureFeishuRemoteSession(message);
+    }
     void sendFeishuText(
       message,
       state.config.language === "en" ? "MAIN received the remote task and started processing." : "MAIN 已收到远程任务，开始处理。",
@@ -2641,6 +2664,9 @@ export default function App() {
     if (event.action === "approve") {
       state.allowToolAction(result.approval.taskId);
       patchFeishuApprovalCard(event.messageId, result.approval, "approved", event.userName);
+    } else if (event.action === "approve_session") {
+      state.approvePendingReviewForSession();
+      patchFeishuApprovalCard(event.messageId, result.approval, "approved", event.userName);
     } else {
       state.rejectToolAction(result.approval.taskId);
       patchFeishuApprovalCard(event.messageId, result.approval, "rejected", event.userName);
@@ -2670,8 +2696,12 @@ export default function App() {
       return;
     }
 
-    if (command.kind === "approve" || command.kind === "reject") {
-      const approval = state.resolvePendingFeishuApproval(message.userId, command.code, command.kind);
+    if (command.kind === "approve" || command.kind === "approve_session" || command.kind === "reject") {
+      const approval = state.resolvePendingFeishuApproval(
+        message.userId,
+        command.code,
+        command.kind === "reject" ? "reject" : "approve"
+      );
       if (!approval) {
         void sendFeishuText(
           message,
@@ -2683,11 +2713,124 @@ export default function App() {
         state.allowToolAction(approval.taskId);
         patchFeishuApprovalCard(approval.cardMessageId, approval, "approved", message.userName);
         void sendFeishuText(message, state.config.language === "en" ? "Approved." : "已允许执行。");
+      } else if (command.kind === "approve_session") {
+        state.approvePendingReviewForSession();
+        patchFeishuApprovalCard(approval.cardMessageId, approval, "approved", message.userName);
+        void sendFeishuText(message, state.config.language === "en" ? "Always approved." : "已全部批准（允许本会话）。");
       } else {
         state.rejectToolAction(approval.taskId);
         patchFeishuApprovalCard(approval.cardMessageId, approval, "rejected", message.userName);
         void sendFeishuText(message, state.config.language === "en" ? "Rejected." : "已拒绝执行。");
       }
+      return;
+    }
+
+    if (command.kind === "help") {
+      const isEn = state.config.language === "en";
+      const helpText = isEn
+        ? [
+            "📋 **MAIN Feishu Remote Control Commands**",
+            "",
+            "• `/status` - View current work and adapter status",
+            "• `/stop` - Stop current task and clear the remote queue",
+            "• `/help` - Show this help message",
+            "• `/new` (or `/reset`) - Create a fresh dedicated session and archive history",
+            "• `/follow` - Link Feishu remote to the currently active desktop session",
+            "• `/approve <code>` - Allow the pending execution once",
+            "• `/always_allow <code>` (or `/approve_session <code>`) - Always allow/approve all for this session",
+            "• `/reject <code>` - Reject the pending execution",
+            "",
+            "💡 *Tip: You can send any descriptive task to start remote execution/analysis directly in the current workspace.*",
+          ].join("\n")
+        : [
+            "📋 **MAIN 飞书远程控制命令指南**",
+            "",
+            "• `/status` - 查看当前 MAIN 的工作状态与适配器连接",
+            "• `/stop` - 停止当前生成并清空远程待执行队列",
+            "• `/help` - 获取此命令帮助指南",
+            "• `/new` (或 `/reset`) - 开辟并激活全新飞书会话，并将旧会话归档",
+            "• `/follow` - 关联并锁定当前桌面端的活跃会话，开启离座双向追踪",
+            "• `/approve <code>` - 允许本次挂起的工具/脚本执行",
+            "• `/always_allow <code>` (或 `/approve_session <code>`) - 全部批准/允许本会话内的所有工具执行",
+            "• `/reject <code>` - 拒绝本次挂起的工具执行",
+            "",
+            "💡 *提示：您可以直接发送任何自然语言任务，机器人将在当前工作区为您启动远程分析或执行。*"
+          ].join("\n");
+      void sendFeishuText(message, helpText);
+      return;
+    }
+
+    if (command.kind === "new") {
+      const workspace = state.currentWorkspace;
+      if (!workspace) {
+        void sendFeishuText(
+          message,
+          state.config.language === "en" ? "No workspace open." : "未打开工作区。",
+        );
+        return;
+      }
+      const scopeKey = resolveSessionWorkspaceKey(workspace);
+      const title = createFeishuRemoteSessionTitle(message);
+      const sessions = state.sessionsByWorkspace[scopeKey] || [];
+      const target = sessions.find((session: any) => session.title === title) || null;
+
+      if (target) {
+        const timeStr = new Date().toLocaleTimeString(state.config.language === "en" ? "en-US" : "zh-CN", {
+          hour: "2-digit",
+          minute: "2-digit",
+          hour12: false,
+        });
+        const dateStr = new Date().toLocaleDateString(state.config.language === "en" ? "en-US" : "zh-CN", {
+          month: "2-digit",
+          day: "2-digit",
+        });
+        const archiveSuffix = state.config.language === "en"
+          ? ` (Archived ${dateStr} ${timeStr})`
+          : ` (归档 ${dateStr} ${timeStr})`;
+        state.updateSession(scopeKey, target.id, {
+          title: `${title}${archiveSuffix}`,
+          active: false,
+        });
+      }
+
+      state.setFeishuLinkedSession(null, null);
+
+      const responseText = state.config.language === "en"
+        ? "Successfully created a fresh remote conversation. Previous history archived."
+        : "已成功为您开辟并激活全新飞书会话，接下来的指令将使用干净的上下文运行！";
+      void sendFeishuText(message, responseText);
+      return;
+    }
+
+    if (command.kind === "follow") {
+      const currentSessionId = state.currentSessionId;
+      if (!currentSessionId || !state.currentWorkspace) {
+        void sendFeishuText(
+          message,
+          state.config.language === "en"
+            ? "MAIN has no active session open in the current workspace."
+            : "MAIN 当前在工作区中没有打开任何活动会话，无法进行关注。",
+        );
+        return;
+      }
+
+      const scopeKey = resolveSessionWorkspaceKey(state.currentWorkspace);
+      const sessions = state.sessionsByWorkspace[scopeKey] || [];
+      const currentSession = sessions.find((s: any) => s.id === currentSessionId);
+      const sessionTitle = currentSession?.title || "Unknown Session";
+
+      state.setFeishuLinkedSession(currentSessionId, {
+        adapter: "feishu",
+        chatId: message.chatId,
+        userId: message.userId,
+        userName: message.userName,
+        messageId: message.messageId,
+      });
+
+      const successText = state.config.language === "en"
+        ? `Successfully linked to desktop active session: 【${sessionTitle}】.\nCommands sent from Feishu will now execute in this session, and any execution updates will be streamed to you in real-time!`
+        : `已成功关联当前桌面端活动会话：【${sessionTitle}】。\n您接下来在飞书发送的消息将被直接发送到该会话中执行，且该会话的后续执行状态将实时同步至飞书！`;
+      void sendFeishuText(message, successText);
       return;
     }
 

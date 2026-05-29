@@ -169,6 +169,21 @@ export function detectResponseLanguageMismatch(input: {
     };
   }
 
+  // If the target language is Chinese ("zh"), and the response has Chinese characters (at least 4),
+  // then we should NEVER treat it as a mismatch, even if the natural language detector classified it as "en"
+  // due to a high density of English filenames, tools, or code terms.
+  const isTargetZhButHasZhSignal = input.targetLanguage === "zh" && signal.hanCount >= 4;
+  if (isTargetZhButHasZhSignal) {
+    return {
+      mismatch: false,
+      hasEnoughSignal: true,
+      detectedLanguage: "zh",
+      hanCount: signal.hanCount,
+      latinLetters: signal.latinLetters,
+      latinWords: signal.latinWords,
+    };
+  }
+
   return {
     mismatch: signal.detectedLanguage !== input.targetLanguage,
     hasEnoughSignal: true,

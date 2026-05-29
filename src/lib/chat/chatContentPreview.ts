@@ -39,7 +39,11 @@ export function formatTokenCount(value: number | undefined) {
 export function normalizeCapsuleExplanationText(text: string): string {
   const content = String(text || "").trim();
   if (!content || isIdleCapsuleNarration(content)) return "";
-  return isConversationalFirstPersonNarration(content) ? content : "";
+  if (!isConversationalFirstPersonNarration(content)) return "";
+
+  // 消除流式输出中可能出现的尾部不完整列表标志（如换行符加数字或减号等，例如 \n1 或 \n-），
+  // 避免在胶囊中显示被截断的残余部分，确保每次渲染在视觉上都是一个完整的句子。
+  return content.replace(/\n\s*(?:\d+\.?|\*|-)?\s*$/, "");
 }
 
 export function normalizeCapsuleProgressText(text: string): string {

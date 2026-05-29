@@ -88,7 +88,7 @@ function parseCardActionValue(value) {
   const action = safeText(record.action);
   const approvalId = safeText(record.approvalId);
   const nonce = safeText(record.nonce);
-  if (action !== "approve" && action !== "reject") return null;
+  if (action !== "approve" && action !== "approve_session" && action !== "reject") return null;
   if (!approvalId || !nonce) return null;
   return { action, approvalId, nonce };
 }

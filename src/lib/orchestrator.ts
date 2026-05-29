@@ -334,6 +334,7 @@ import {
   resolvePlanSuppressedToolRecovery,
   shouldClosePlanToolSurfaceAfterReadOnlyConvergence,
   shouldRedirectPlanToolsAfterReadOnlyConvergence,
+  MAX_PLAN_EVIDENCE_RECOVERY_PASSES,
 } from "./planRuntime";
 import {
   extractPrimaryUserRequestText,
@@ -8090,7 +8091,7 @@ export async function executeAgentLoop(
                 iteration,
                 visibleChars: sourceVisibleText.length,
               });
-              if (!planClosureEvidenceRecoveryIssued && planEvidenceRecoveryPasses < 1) {
+              if (!planClosureEvidenceRecoveryIssued && planEvidenceRecoveryPasses < MAX_PLAN_EVIDENCE_RECOVERY_PASSES) {
                 planClosureEvidenceRecoveryIssued = true;
                 setPlanRuntimePhase("needs_evidence", "plan closure failed");
                 callbacks.onStatusChange("running");
@@ -8841,22 +8842,28 @@ export async function executeAgentLoop(
             : "";
         let fileReadState = fileReadSignature ? fileReadStates.get(fileReadSignature) : undefined;
         const bypassApprovedPlanPatchRecoveryReadCache =
-          workflowMode === "plan" &&
-          callbacks.getIsPlanApproved() &&
-          runtimeIntent === "execute" &&
-          shouldBypassApprovedPlanReadCacheForPatchRecovery({
-            toolName: tc.name,
-            allowFileRead: allowApprovedPlanRecoveryFileRead,
-          });
+          (workflowMode === "plan" &&
+            callbacks.getIsPlanApproved() &&
+            runtimeIntent === "execute" &&
+            shouldBypassApprovedPlanReadCacheForPatchRecovery({
+              toolName: tc.name,
+              allowFileRead: allowApprovedPlanRecoveryFileRead,
+            })) ||
+          (workflowMode === "edit" &&
+            runtimeIntent === "execute" &&
+            tc.name === "read_file" &&
+            effectiveExecuteRecoveryFileRead);
         if (bypassApprovedPlanPatchRecoveryReadCache) {
           logAgentEvent("approved_plan_patch_recovery_read_cache_bypass", {
             iteration,
             target,
-            recentActivity: recentPlanToolActivity.slice(-4).map((activity) => ({
-              name: activity.name,
-              target: activity.target,
-              status: activity.status,
-            })),
+            recentActivity: (workflowMode === "plan" ? recentPlanToolActivity : recentToolActivity)
+              .slice(-4)
+              .map((activity) => ({
+                name: activity.name,
+                target: activity.target,
+                status: activity.status,
+              })),
           });
         }
 
@@ -9511,12 +9518,12 @@ export async function executeAgentLoop(
         evidenceRecoveryPasses: planEvidenceRecoveryPasses,
       });
 
-      if (latestQualityResult.planRecoveryAction === "targeted_evidence" && planEvidenceRecoveryPasses < 1) {
+      if (latestQualityResult.planRecoveryAction === "targeted_evidence" && planEvidenceRecoveryPasses < MAX_PLAN_EVIDENCE_RECOVERY_PASSES) {
         setPlanRuntimePhase("needs_evidence", planLastQualityGateReason);
       } else if (
         latestQualityResult.planRecoveryAction === "auto_scaffold" ||
         planQualityRejectCount >= 2 ||
-        (latestQualityResult.planRecoveryAction === "targeted_evidence" && planEvidenceRecoveryPasses >= 1)
+        (latestQualityResult.planRecoveryAction === "targeted_evidence" && planEvidenceRecoveryPasses >= MAX_PLAN_EVIDENCE_RECOVERY_PASSES)
       ) {
         if (!planAutoScaffoldPromptIssued) {
           planAutoScaffoldPromptIssued = true;
@@ -9550,7 +9557,7 @@ export async function executeAgentLoop(
         planQualityRejectCount >= 1 &&
         hasQualityClosureEvidence &&
         !planClosureEvidenceRecoveryIssued &&
-        planEvidenceRecoveryPasses < 1 &&
+        planEvidenceRecoveryPasses < MAX_PLAN_EVIDENCE_RECOVERY_PASSES &&
         (
           latestQualityResult.planRecoveryAction !== "targeted_evidence" ||
           hasStructuredQualityClosureEvidence
@@ -9636,6 +9643,7 @@ export async function executeAgentLoop(
             sawExecuteOperationEvidence,
             noProgressBatchRepeatCount,
             minReadOnlyActivities: 8,
+            minCachedReadOnlyActivities: 3,
             maxNoProgressReadOnlyRepeats: 2,
             maxReadOnlyToolChars: 30_000,
           })

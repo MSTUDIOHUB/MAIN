@@ -73,12 +73,17 @@ export function isReasoningDominatedNoActionResult(
   if (Array.isArray(result.toolCalls) && result.toolCalls.length > 0) return false;
 
   const reasoningChars = String(result.reasoningContent || "").trim().length;
-  const threshold = isLocal ? 8000 : 1000;
-  if (reasoningChars < threshold) return false;
-
   const visibleChars = stripReasoningBlocksForEscalation(result.content).length;
+
+  // Count reasoning blocks embedded within visible content (e.g. <thought>...</thought>)
+  const embeddedReasoningChars = Math.max(0, String(result.content || "").length - visibleChars);
+  const totalReasoningChars = reasoningChars + embeddedReasoningChars;
+
+  const threshold = isLocal ? 8000 : 1000;
+  if (totalReasoningChars < threshold) return false;
+
   if (visibleChars <= 240) return true;
-  return visibleChars <= 600 && reasoningChars >= visibleChars * 6;
+  return visibleChars <= 600 && totalReasoningChars >= visibleChars * 6;
 }
 
 export function buildReasoningDominatedRecoveryPrompt(language: "zh" | "en", workflowMode: WorkflowMode): string {

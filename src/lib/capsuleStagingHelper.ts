@@ -22,15 +22,7 @@ export function isConversationalFirstPersonNarration(text: string): boolean {
   if (!raw) return false;
   if (isIdleCapsuleNarration(raw)) return false;
 
-  // 1. 过滤大型结构化块，防止大段普通聊天的回复渲染到小 Capsule 中
-  if (
-    raw.includes("```") || // 排除大型代码块
-    raw.includes("|") ||   // 排除 markdown 表格
-    /\n\s*(?:\d+\.?|\*|-)(?:\s+|$)/.test(raw) || // 排除多行列表结构或流式未完结列表标志
-    raw.length > 350       // 限制字符长度在 350 字以内，保证 Capsule 排版舒适
-  ) {
-    return false;
-  }
+
 
   // 2. 检查是否具备典型的第一人称意图、计划或动作引导特征
   const hasFirstPersonZh = /(?:我|正在|接下来|为了|准备|计划|先进行|等待|请确认|我已)/.test(raw);

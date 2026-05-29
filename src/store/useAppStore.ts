@@ -1229,6 +1229,9 @@ interface AppState {
     action: FeishuApprovalAction;
   }) => FeishuApprovalProcessResult;
   setFeishuApprovalCardMessageId: (approvalId: string, messageId: string) => void;
+  feishuLinkedSessionId: number | null;
+  feishuLinkedContext: FeishuRemoteContext | null;
+  setFeishuLinkedSession: (sessionId: number | null, context: FeishuRemoteContext | null) => void;
 
   // Skills CRUD
   skills: Skill[];
@@ -3023,7 +3026,6 @@ function findPreviousTurnContinuationTarget(
   return null;
 }
 
-const PLAN_ARTIFACT_REFERENCE_RE = /(?:^|[\\/])\.MAIN[\\/ ]*plans[\\/ ][^\s"'`)]*\.md|\.MAIN[\\/ ]*plans|\.main[\\/ ]*plans|tasks\.md|plan\.md|bugfix\.md|design\.md|requirements\.md/i;
 const PLAN_EXECUTION_CONTEXT_RE = /执行已批准计划|计划执行|已批准计划|执行回合|计划执行恢复|剩余任务|未完成任务|可信执行证据|继续执行|resume execution|plan execution|execute approved plan|remaining tasks/i;
 
 function collectPlanResumeContextText(turn: ConversationTurn | null, taskFlow: TaskBlock[]): string {
@@ -3096,11 +3098,9 @@ function turnSuggestsPlanExecutionResume(turn: ConversationTurn | null, taskFlow
     return isResumablePreviousTurnStatus(turn.status) && PLAN_EXECUTION_CONTEXT_RE.test(contextText);
   }
 
-  return (
-    isResumablePreviousTurnStatus(turn.status) &&
-    PLAN_ARTIFACT_REFERENCE_RE.test(contextText) &&
-    PLAN_EXECUTION_CONTEXT_RE.test(contextText)
-  );
+  // If the intent is not "plan", do not match plan execution resume unless the user's turn explicitly requested it,
+  // to avoid misrouting generic "continue" inputs in normal execution/chat turns.
+  return false;
 }
 
 function findPlanExecutionResumeContinuationTarget(
@@ -5523,6 +5523,9 @@ export const useAppStore = create<AppState>()(
       ),
     }));
   },
+  feishuLinkedSessionId: null,
+  feishuLinkedContext: null,
+  setFeishuLinkedSession: (sessionId, context) => set({ feishuLinkedSessionId: sessionId, feishuLinkedContext: context }),
 
   skills: defaultSkills,
   setSkills: (v) => set({ skills: v }),
@@ -6847,7 +6850,11 @@ export const useAppStore = create<AppState>()(
       : null;
     const mentionSnapshot = options?.contextMentionsSnapshot ?? state.contextMentions;
     const attachedFilesSnapshot = options?.attachedFilesSnapshot ?? state.attachedFiles;
-    const remoteFeishu = options?.remoteFeishu;
+    const remoteFeishu = options?.remoteFeishu || (
+      state.feishuLinkedSessionId === state.currentSessionId && state.feishuLinkedContext
+        ? state.feishuLinkedContext
+        : undefined
+    );
     const hasSupplementalInput = mentionSnapshot.length > 0 || attachedFilesSnapshot.length > 0;
     const currentTurn = state.currentTurnId
       ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId) || null
@@ -12968,19 +12975,42 @@ function extractFeishuTurnReply(blocks: TaskBlock[], turnId: string, fallback: s
   const latestAgent = [...turnBlocks]
     .reverse()
     .find((block): block is Extract<TaskBlock, { type: "agent" }> => block.type === "agent" && !!block.content?.trim());
-  if (latestAgent?.content?.trim()) return summarizeAssistantText(latestAgent.content).slice(0, 1800);
 
-  const latestSystem = [...turnBlocks]
-    .reverse()
-    .find((block): block is Extract<TaskBlock, { type: "system" }> => block.type === "system" && !!block.content?.trim());
-  if (latestSystem?.content?.trim()) return summarizeAssistantText(latestSystem.content).slice(0, 1800);
+  const state = useAppStore.getState();
+  const capsuleText = state.currentTurnState?.capsuleExplanation?.turnId === turnId
+    ? state.currentTurnState.capsuleExplanation.text
+    : "";
 
-  const latestToolError = [...turnBlocks]
-    .reverse()
-    .find((block): block is Extract<TaskBlock, { type: "tool" }> => block.type === "tool" && block.toolStatus === "failed" && !!block.message?.trim());
-  if (latestToolError?.message?.trim()) return latestToolError.message.slice(0, 1800);
+  let replyText = "";
+  if (latestAgent?.content?.trim()) {
+    replyText = latestAgent.content.trim();
+  } else {
+    const latestSystem = [...turnBlocks]
+      .reverse()
+      .find((block): block is Extract<TaskBlock, { type: "system" }> => block.type === "system" && !!block.content?.trim());
+    if (latestSystem?.content?.trim()) {
+      replyText = latestSystem.content.trim();
+    } else {
+      const latestToolError = [...turnBlocks]
+        .reverse()
+        .find((block): block is Extract<TaskBlock, { type: "tool" }> => block.type === "tool" && block.toolStatus === "failed" && !!block.message?.trim());
+      if (latestToolError?.message?.trim()) {
+        replyText = latestToolError.message.trim();
+      }
+    }
+  }
 
-  return fallback;
+  if (!replyText) {
+    replyText = fallback;
+  }
+
+  if (capsuleText) {
+    const isEn = state.config.language === "en";
+    const header = isEn ? "🤖 Agent Intent Summary:\n" : "🤖 智能助手意图摘要：\n";
+    return `${header}${capsuleText}\n\n${replyText}`.slice(0, 3500);
+  }
+
+  return replyText.slice(0, 3500);
 }
 
 /** Derive a human-readable target from tool arguments (for Action Card display). */

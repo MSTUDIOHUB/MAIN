@@ -121,6 +121,8 @@ export function shouldRedirectPlanToolsAfterReadOnlyConvergence(input: {
   return input.toolNames.some(isPlanReadOnlyToolName);
 }
 
+export const MAX_PLAN_EVIDENCE_RECOVERY_PASSES = 2;
+
 export function resolvePlanNoActionRecovery(input: {
   workflowMode: PlanRuntimeMode;
   isPlanApproved: boolean;
@@ -131,7 +133,7 @@ export function resolvePlanNoActionRecovery(input: {
   if (input.workflowMode !== "plan" || input.isPlanApproved || !input.reasoningOnly) {
     return { action: "ignore", reason: "not_unapproved_plan_reasoning_only" };
   }
-  if (input.targetedRecoveryPasses < 1) {
+  if (input.targetedRecoveryPasses < MAX_PLAN_EVIDENCE_RECOVERY_PASSES) {
     return {
       action: "targeted_evidence",
       reason: hasReadyPlanEvidence(input.evidenceReadiness)
@@ -156,7 +158,7 @@ export function resolvePlanSuppressedToolRecovery(input: {
   if (input.workflowMode !== "plan" || input.isPlanApproved) {
     return { action: "ignore", reason: "not_unapproved_plan" };
   }
-  if (input.targetedRecoveryPasses < 1) {
+  if (input.targetedRecoveryPasses < MAX_PLAN_EVIDENCE_RECOVERY_PASSES) {
     return {
       action: "targeted_evidence",
       reason: hasReadyPlanEvidence(input.evidenceReadiness)
@@ -194,16 +196,16 @@ export function buildPlanTargetedEvidenceRecoveryPrompt(input: {
     return [
       "PLAN_TARGETED_EVIDENCE_RECOVERY: The previous planning turn ended in hidden reasoning without a reviewable plan.",
       input.reason ? `Evidence readiness: ${input.reason}.` : "",
-      "Do exactly one tightly scoped read-only evidence pass now. Prefer the most specific file/path/symbol from the user request or the latest evidence.",
-      "After that single read/search result, stop exploring and produce or update a concise reviewable plan. If plan write tools are available, write `.MAIN/plans/plan.md`; otherwise output visible `<proposed_plan>`.",
+      "Do tightly scoped read-only evidence pass(es) now. Prefer the most specific file/path/symbol from the user request or the latest evidence.",
+      "After the read/search result, stop exploring and produce or update a concise reviewable plan. If plan write tools are available, write `.MAIN/plans/plan.md`; otherwise output visible `<proposed_plan>`.",
       "Do not ask for approval again and do not modify source or deliverable files before approval.",
     ].filter(Boolean).join("\n");
   }
   return [
     "PLAN_TARGETED_EVIDENCE_RECOVERY: 上一条计划回复只有隐藏推理，没有形成可审批计划。",
     input.reason ? `证据状态：${input.reason}。` : "",
-    "现在只做一次精确定向的只读补证。优先读取用户请求或已有证据里最具体的文件、路径或符号。",
-    "拿到这一次读取/搜索结果后，停止探索并生成或更新精简可审批计划；如果本轮有计划写入工具，写入 `.MAIN/plans/plan.md`，否则输出可见 `<proposed_plan>`。",
+    "现在只做精确定向的只读补证。优先读取用户请求或已有证据里最具体的文件、路径或符号。",
+    "拿到读取/搜索结果后，停止探索并生成或更新精简可审批计划；如果本轮有计划写入工具，写入 `.MAIN/plans/plan.md`，否则输出可见 `<proposed_plan>`。",
     "不要再次询问是否批准，也不要在批准前修改源码或最终交付文件。",
   ].filter(Boolean).join("\n");
 }
@@ -214,13 +216,13 @@ export function buildPlanEvidenceBlockedPauseMessage(input: {
 }): string {
   if (input.language === "en") {
     return [
-      "Plan generation paused: one targeted evidence recovery pass was already used, but the evidence is still not sufficient for a reviewable plan.",
+      "Plan generation paused: targeted evidence recovery passes were already used, but the evidence is still not sufficient for a reviewable plan.",
       input.reason ? `Current blocker: ${input.reason}.` : "",
       "MAIN did not synthesize a fallback plan. Resume with a concrete missing file/path/fact, or provide the key decision needed before the model can produce `.MAIN/plans/plan.md`.",
     ].filter(Boolean).join("\n");
   }
   return [
-    "计划生成已暂停：已经使用过一次定向补证，但证据仍不足以生成可审批计划。",
+    "计划生成已暂停：已经使用过定向补证，但证据仍不足以生成可审批计划。",
     input.reason ? `当前阻塞：${input.reason}。` : "",
     "MAIN 不会再自动拼接兜底计划。继续时请给出具体缺失的文件/路径/事实，或提供模型生成 `.MAIN/plans/plan.md` 前必须确定的关键选择。",
   ].filter(Boolean).join("\n");

@@ -112,6 +112,17 @@ test("detects reasoning-dominated length results before max output escalation", 
     }),
     false,
   );
+
+  // New test case for embedded thinking blocks (e.g. Qwen on OMLX)
+  assert.equal(
+    isReasoningDominatedLengthResult({
+      content: `<thinking>${"需要继续分析。".repeat(500)}</thinking>`,
+      reasoningContent: "",
+      finishReason: "length",
+      toolCalls: [],
+    }),
+    true,
+  );
 });
 
 test("suppresses generic truncation warning for hidden-only unapproved plan length", () => {

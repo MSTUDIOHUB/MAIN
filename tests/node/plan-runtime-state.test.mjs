@@ -168,12 +168,23 @@ test("ready evidence gets one model-authored plan recovery pass instead of fallb
     evidenceReadiness: "ready_for_plan",
     targetedRecoveryPasses: 1,
   }), {
+    action: "targeted_evidence",
+    reason: "ready_evidence_missing_visible_plan",
+  });
+
+  assert.deepEqual(resolvePlanNoActionRecovery({
+    workflowMode: "plan",
+    isPlanApproved: false,
+    reasoningOnly: true,
+    evidenceReadiness: "ready_for_plan",
+    targetedRecoveryPasses: 2,
+  }), {
     action: "pause_blocked",
     reason: "ready_evidence_missing_visible_plan_after_recovery",
   });
 });
 
-test("insufficient plan evidence allows one targeted recovery pass then pauses", () => {
+test("insufficient plan evidence allows targeted recovery passes then pauses", () => {
   assert.deepEqual(resolvePlanNoActionRecovery({
     workflowMode: "plan",
     isPlanApproved: false,
@@ -192,6 +203,17 @@ test("insufficient plan evidence allows one targeted recovery pass then pauses",
     evidenceReadiness: "needs_targeted_read",
     targetedRecoveryPasses: 1,
   }), {
+    action: "targeted_evidence",
+    reason: "needs_targeted_read",
+  });
+
+  assert.deepEqual(resolvePlanNoActionRecovery({
+    workflowMode: "plan",
+    isPlanApproved: false,
+    reasoningOnly: true,
+    evidenceReadiness: "needs_targeted_read",
+    targetedRecoveryPasses: 2,
+  }), {
     action: "pause_blocked",
     reason: "needs_targeted_read",
   });
@@ -199,11 +221,11 @@ test("insufficient plan evidence allows one targeted recovery pass then pauses",
   assert.match(buildPlanTargetedEvidenceRecoveryPrompt({
     language: "en",
     reason: "needs_targeted_read",
-  }), /exactly one tightly scoped read-only evidence pass/);
+  }), /tightly scoped read-only evidence pass/);
   assert.match(buildPlanEvidenceBlockedPauseMessage({
     language: "en",
     reason: "needs_targeted_read",
-  }), /one targeted evidence recovery pass was already used/);
+  }), /evidence recovery passes were already used/);
 });
 
 test("hidden-only plan length suppresses the generic truncation warning only before approval", () => {

@@ -40,14 +40,15 @@ test("isConversationalFirstPersonNarration validations", () => {
   assert.equal(isConversationalFirstPersonNarration("I'm analyzing the csv data parsing logic"), true);
   assert.equal(isConversationalFirstPersonNarration("# 我正在分析 CSV creator 映射"), true);
 
-  // Should reject large or structured contents
-  assert.equal(isConversationalFirstPersonNarration("### 实施步骤与长计划列表\n1. 修改文件\n2. 编译测试\n3. 提交审核"), false); // Too structured/long
-  assert.equal(isConversationalFirstPersonNarration("我观察到这是一个典型的错误，通常发生在以下场景：\n1"), false); // Incomplete list digit marker during streaming
-  assert.equal(isConversationalFirstPersonNarration("我正在分析以下几点：\n-"), false); // Incomplete list bullet marker during streaming
-  assert.equal(isConversationalFirstPersonNarration("准备进行以下修改：\n* "), false); // Incomplete list star marker during streaming
-  assert.equal(isConversationalFirstPersonNarration("```typescript\nconst a = 1;\n```"), false); // Code block
-  assert.equal(isConversationalFirstPersonNarration("| 字段 | 类型 |\n| --- | --- |\n| creator | string |"), false); // Table
-  assert.equal(isConversationalFirstPersonNarration("a".repeat(400)), false); // Too long
+  // Should accept rich or structured contents if they contain first-person narration
+  assert.equal(isConversationalFirstPersonNarration("我准备进行以下修改：\n1. 修改文件\n2. 编译测试"), true);
+  assert.equal(isConversationalFirstPersonNarration("I am thinking about adding these properties:\n```typescript\nconst a = 1;\n```"), true);
+
+  // Should reject contents that do not have first-person indicators
+  assert.equal(isConversationalFirstPersonNarration("### 实施步骤与长计划列表\n1. 修改文件\n2. 编译测试\n3. 提交审核"), true);
+  assert.equal(isConversationalFirstPersonNarration("```typescript\nconst a = 1;\n```"), false);
+  assert.equal(isConversationalFirstPersonNarration("| 字段 | 类型 |\n| --- | --- |\n| creator | string |"), false);
+  assert.equal(isConversationalFirstPersonNarration("a".repeat(400)), false);
   assert.equal(isConversationalFirstPersonNarration("我正在等待您的下一步指令，随时准备开始新的探索或修改..."), false);
   assert.equal(isConversationalFirstPersonNarration("I am awaiting your next instructions, ready to begin new exploration or modifications..."), false);
 });

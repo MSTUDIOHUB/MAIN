@@ -59,7 +59,7 @@ export interface FeishuInboundMessage {
   timestamp?: number;
 }
 
-export type FeishuApprovalAction = "approve" | "reject";
+export type FeishuApprovalAction = "approve" | "approve_session" | "reject";
 export type FeishuApprovalStatus = "pending" | "approved" | "rejected" | "expired";
 
 export interface FeishuCardActionEvent {
@@ -101,10 +101,14 @@ export type FeishuAdapterEvent =
 
 export type FeishuTextCommand =
   | { kind: "approve"; code: string }
+  | { kind: "approve_session"; code: string }
   | { kind: "reject"; code: string }
   | { kind: "pair"; code: string }
   | { kind: "status" }
   | { kind: "stop" }
+  | { kind: "help" }
+  | { kind: "new" }
+  | { kind: "follow" }
   | { kind: "message"; text: string };
 
 export interface FeishuRemoteIntentOverride {
@@ -297,16 +301,20 @@ export function upsertFeishuPairingRequest(
 
 export function parseFeishuTextCommand(input: string): FeishuTextCommand {
   const text = input.trim();
-  const match = text.match(/^\/(approve|reject|pair)\s+([A-Za-z0-9_-]{4,16})$/i);
+  const match = text.match(/^\/(approve|reject|pair|approve_session|always_allow)\s+([A-Za-z0-9_-]{4,16})$/i);
   if (match) {
     const action = match[1].toLowerCase();
     const code = match[2].trim();
     if (action === "approve") return { kind: "approve", code };
     if (action === "reject") return { kind: "reject", code };
+    if (action === "approve_session" || action === "always_allow") return { kind: "approve_session", code };
     return { kind: "pair", code };
   }
   if (/^\/status$/i.test(text)) return { kind: "status" };
   if (/^\/stop$/i.test(text)) return { kind: "stop" };
+  if (/^\/help$/i.test(text)) return { kind: "help" };
+  if (/^\/(new|reset)$/i.test(text)) return { kind: "new" };
+  if (/^\/follow$/i.test(text)) return { kind: "follow" };
   return { kind: "message", text };
 }
 
@@ -333,9 +341,9 @@ export function parseFeishuApprovalCardActionValue(value: unknown):
   const action = String(record.action || "").trim();
   const approvalId = String(record.approvalId || "").trim();
   const nonce = String(record.nonce || "").trim();
-  if (action !== "approve" && action !== "reject") return null;
+  if (action !== "approve" && action !== "approve_session" && action !== "reject") return null;
   if (!approvalId || !nonce) return null;
-  return { action, approvalId, nonce };
+  return { action: action as FeishuApprovalAction, approvalId, nonce };
 }
 
 export function resolveFeishuApprovalAction<T extends FeishuApprovalRecord>(
@@ -441,6 +449,20 @@ export function buildFeishuApprovalCard(input: BuildFeishuApprovalCardInput): Fe
           value: {
             mainAction: "feishu_approval",
             action: "approve",
+            approvalId: input.approvalId,
+            nonce: input.nonce,
+          },
+        },
+        {
+          tag: "button",
+          text: {
+            tag: "plain_text",
+            content: isEn ? "Always allow" : "全部批准",
+          },
+          type: "default",
+          value: {
+            mainAction: "feishu_approval",
+            action: "approve_session",
             approvalId: input.approvalId,
             nonce: input.nonce,
           },

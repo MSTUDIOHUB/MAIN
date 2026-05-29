@@ -209,6 +209,12 @@ test("response language mismatch detection ignores code-heavy text and catches r
     targetLanguage: "zh",
   });
   assert.equal(aligned.mismatch, false);
+
+  const mixedCodeTerms = detectResponseLanguageMismatch({
+    text: "我读取 `src/components/Dashboard/CourseBarChart.tsx` 确认图表数据。",
+    targetLanguage: "zh",
+  });
+  assert.equal(mixedCodeTerms.mismatch, false);
 });
 
 test("normalizeConversationDisplayTitle strips speaker timestamps from transcript-style prompts", () => {

@@ -486,3 +486,20 @@ test("orchestrator evidence reconcile logs failed tool summaries", () => {
   assert.match(source, /firstFailureTool/);
   assert.match(source, /firstFailureTarget/);
 });
+
+test("execute recovery does not trigger on a single cached read when minCachedReadOnlyActivities is set", () => {
+  const recent = [
+    { name: "read_file", status: "succeeded", target: "src/App.tsx", detail: "FILE_UNCHANGED_STUB: src/App.tsx" }
+  ];
+  const decision = resolveExecuteReadOnlyRecoveryTrigger({
+    results: [{ name: "read_file", target: "src/App.tsx", content: "FILE_UNCHANGED_STUB", isError: false }],
+    recentActivity: recent,
+    readOnlyTools,
+    sawExecuteOperationEvidence: false,
+    noProgressBatchRepeatCount: 1,
+    minCachedReadOnlyActivities: 3,
+  });
+
+  assert.equal(decision.shouldRecover, false);
+});
+

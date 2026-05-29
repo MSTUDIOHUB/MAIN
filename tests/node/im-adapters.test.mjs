@@ -91,10 +91,16 @@ test("normalizes Feishu adapter config with fixed v1 policy defaults", () => {
 
 test("parses Feishu private-chat commands", () => {
   assert.deepEqual(parseFeishuTextCommand("/approve ABC123"), { kind: "approve", code: "ABC123" });
+  assert.deepEqual(parseFeishuTextCommand("/always_allow ABC123"), { kind: "approve_session", code: "ABC123" });
+  assert.deepEqual(parseFeishuTextCommand("/approve_session XYZ456"), { kind: "approve_session", code: "XYZ456" });
   assert.deepEqual(parseFeishuTextCommand("/reject xyz9"), { kind: "reject", code: "xyz9" });
   assert.deepEqual(parseFeishuTextCommand("/pair 123456"), { kind: "pair", code: "123456" });
   assert.deepEqual(parseFeishuTextCommand("/status"), { kind: "status" });
   assert.deepEqual(parseFeishuTextCommand("/stop"), { kind: "stop" });
+  assert.deepEqual(parseFeishuTextCommand("/help"), { kind: "help" });
+  assert.deepEqual(parseFeishuTextCommand("/new"), { kind: "new" });
+  assert.deepEqual(parseFeishuTextCommand("/reset"), { kind: "new" });
+  assert.deepEqual(parseFeishuTextCommand("/follow"), { kind: "follow" });
   assert.deepEqual(parseFeishuTextCommand("帮我执行任务"), { kind: "message", text: "帮我执行任务" });
 });
 
@@ -173,6 +179,11 @@ test("parses Feishu approval card action payloads", () => {
   };
   assert.deepEqual(parseFeishuApprovalCardActionValue(payload), {
     action: "approve",
+    approvalId: "apv_1",
+    nonce: "nonce_1",
+  });
+  assert.deepEqual(parseFeishuApprovalCardActionValue({ ...payload, action: "approve_session" }), {
+    action: "approve_session",
     approvalId: "apv_1",
     nonce: "nonce_1",
   });
