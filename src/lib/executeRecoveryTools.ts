@@ -67,12 +67,20 @@ export function shouldAllowExecuteRecoveryFileRead(
   const recent = recentActivity.slice(-6);
   let latestPatchMismatchIndex = -1;
   let latestFileReadIndex = -1;
+  let latestTargetingIndex = -1;
   for (let index = 0; index < recent.length; index += 1) {
     const activity = recent[index];
     if (isExecutePatchMismatchRecoveryActivity(activity)) latestPatchMismatchIndex = index;
     if (activity.name === "read_file") latestFileReadIndex = index;
+    if (activity.name === "grep_search" || activity.name === "get_file_outline") latestTargetingIndex = index;
   }
-  return latestPatchMismatchIndex >= 0 && latestPatchMismatchIndex > latestFileReadIndex;
+  if (latestPatchMismatchIndex >= 0 && latestPatchMismatchIndex > latestFileReadIndex) {
+    return true;
+  }
+  if (latestTargetingIndex >= 0 && latestTargetingIndex > latestFileReadIndex) {
+    return true;
+  }
+  return false;
 }
 
 export function isExecuteRecoveryToolName(

@@ -64,6 +64,7 @@ import { appendDebugLog } from "./lib/debugLog";
 import { applyAppIconVariant } from "./lib/appIcon";
 import { safeConfirm } from "./lib/safeConfirm";
 import {
+  buildFeishuMarkdownCard,
   createFeishuPairedUserFromMessage,
   createFeishuPairingRequest,
   createFeishuRemoteSessionTitle,
@@ -2756,7 +2757,15 @@ export default function App() {
             "",
             "💡 *提示：您可以直接发送任何自然语言任务，机器人将在当前工作区为您启动远程分析或执行。*"
           ].join("\n");
-      void sendFeishuText(message, helpText);
+      const title = isEn ? "MAIN Command Guide" : "MAIN 飞书命令指南";
+      const card = buildFeishuMarkdownCard(title, helpText, "blue");
+      void invoke("send_feishu_card", {
+        chatId: message.chatId,
+        userId: message.userId,
+        openId: message.userId,
+        messageId: message.messageId,
+        card,
+      }).catch(() => {});
       return;
     }
 

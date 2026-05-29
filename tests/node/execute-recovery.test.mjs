@@ -503,3 +503,11 @@ test("execute recovery does not trigger on a single cached read when minCachedRe
   assert.equal(decision.shouldRecover, false);
 });
 
+test("targeting search recovery opens read_file path to see context", () => {
+  const recent = [
+    { name: "grep_search", status: "succeeded", target: "Order", detail: "Order" },
+  ];
+  assert.equal(shouldAllowExecuteRecoveryFileRead(recent), true);
+});
+
+

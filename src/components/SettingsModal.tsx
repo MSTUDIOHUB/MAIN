@@ -1946,7 +1946,7 @@ export default function SettingsModal({
   const parsedCloudCustomHeaders = parseCloudCustomHeaders(draftCloudConfig.customHeaders || "");
   const cloudAuth = normalizeCloudAuth(draftCloudConfig.auth, cloudProtocol);
   const rawCloudAuthMode = normalizeCloudAuthMode(cloudAuth.mode);
-  const cloudExperimentalLoginEnabled = config.cloudExperimentalLoginEnabled === true;
+  const cloudExperimentalLoginEnabled = false;
   const cloudAuthMode = cloudExperimentalLoginEnabled ? rawCloudAuthMode : "api_key";
   const cloudApiFormat = resolveEffectiveCloudApiFormat({
     protocol: cloudProtocol,
@@ -3274,6 +3274,39 @@ export default function SettingsModal({
                     </button>
                   </div>
                 </div>
+
+                {/* CAPSULE FUNCTION ENABLE/DISABLE */}
+                <div className={`${settingsSectionRowClass} border-t border-[#27272a] pt-5`}>
+                  <div>
+                    <span className="block text-[13px] font-bold text-[#e4e4e7]">{t.enableCapsule}</span>
+                    <span className="mt-1.5 block text-[12px] leading-relaxed text-[#a1a1aa]">{t.enableCapsuleDesc}</span>
+                  </div>
+                  <div className={`${settingsControlColumnClass} flex items-center justify-between rounded-lg border border-[#27272a] bg-[#000000] px-4 py-3`}>
+                    <span className={`min-w-0 text-[12px] font-bold ${config.enableCapsule !== false ? "theme-text" : "text-[#a1a1aa]"}`}>
+                      {config.enableCapsule !== false ? copy.enabled : copy.disabled}
+                    </span>
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={config.enableCapsule !== false}
+                      data-testid="enable-capsule-switch"
+                      aria-label={t.enableCapsule}
+                      onClick={() => setConfig({ ...config, enableCapsule: !(config.enableCapsule !== false) })}
+                      className={`relative inline-flex h-6 w-11 items-center rounded-full border p-0.5 transition-all duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-[#000000] ${
+                        config.enableCapsule !== false
+                          ? "border-transparent shadow-[0_0_12px_var(--accent-subtle)]"
+                          : "border-[#3f3f46] bg-[#18181b]"
+                      }`}
+                      style={config.enableCapsule !== false ? { backgroundColor: "var(--accent)" } : undefined}
+                    >
+                      <span
+                        className={`block h-5 w-5 rounded-full bg-white shadow-sm transition-transform duration-200 ${
+                          config.enableCapsule !== false ? "translate-x-5" : "translate-x-0"
+                        }`}
+                      />
+                    </button>
+                  </div>
+                </div>
               </div>
             )}
 
@@ -3560,30 +3593,6 @@ export default function SettingsModal({
                     <p className="mt-1 text-[11.5px] text-[#71717a]">{copy.cloudDesc}</p>
                   </div>
                   <div className="flex flex-wrap items-center gap-2">
-                    <div title={copy.cloudLabDesc} className="flex items-center gap-2 rounded-md border border-[#27272a] bg-[#000000] px-2.5 py-1.5 text-[11px] text-[#a1a1aa]">
-                      <span className="font-bold uppercase tracking-wider">{copy.cloudLab}</span>
-                      <span className="text-[#71717a]">{cloudExperimentalLoginEnabled ? copy.cloudLabOn : copy.cloudLabOff}</span>
-                      <button
-                        data-testid="cloud-lab-toggle"
-                        type="button"
-                        role="switch"
-                        aria-checked={cloudExperimentalLoginEnabled}
-                        aria-label={`${copy.cloudLab} ${cloudExperimentalLoginEnabled ? copy.cloudLabOn : copy.cloudLabOff}`}
-                        disabled={!canChangeCurrentModel}
-                        title={!canChangeCurrentModel ? modelRuntimeLockText : copy.cloudLabDesc}
-                        onClick={() => canChangeCurrentModel && setConfig((prev) => ({ ...prev, cloudExperimentalLoginEnabled: prev.cloudExperimentalLoginEnabled !== true }))}
-                        className={`relative inline-flex h-6 w-11 items-center rounded-full border p-0.5 transition-all duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-[#000000] disabled:cursor-not-allowed disabled:opacity-45 ${
-                          cloudExperimentalLoginEnabled ? "border-transparent shadow-[0_0_12px_var(--accent-subtle)]" : "border-[#3f3f46] bg-[#18181b]"
-                        }`}
-                        style={cloudExperimentalLoginEnabled ? { backgroundColor: "var(--accent)" } : undefined}
-                      >
-                        <span
-                          className={`block h-5 w-5 rounded-full bg-white shadow-sm transition-transform duration-200 ${
-                            cloudExperimentalLoginEnabled ? "translate-x-5" : "translate-x-0"
-                          }`}
-                        />
-                      </button>
-                    </div>
                     <button
                       data-testid="cloud-active-profile-button"
                       onClick={() => canChangeCurrentModel && setConfig({ ...config, activeProfile: 'cloud' })}

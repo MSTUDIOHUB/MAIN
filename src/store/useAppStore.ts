@@ -271,6 +271,7 @@ import { runAfterNextPaint } from "../lib/uiScheduling";
 import {
   FEISHU_APPROVAL_TTL_MS,
   buildFeishuApprovalCard,
+  buildFeishuMarkdownCard,
   createFeishuApprovalId,
   createFeishuApprovalNonce,
   createDefaultFeishuAdapterRuntimeStatus,
@@ -536,6 +537,8 @@ export const translations = {
     hooksEnabled: "Enable lifecycle hooks",
     sessionRecording: "Record project sessions",
     sessionRecordingDesc: "Save full conversations in MAIN app data so project history can be restored without writing chat logs into .MAIN.",
+    enableCapsule: "Enable execution capsule",
+    enableCapsuleDesc: "When enabled, dynamic agent execution status and brief descriptions are displayed in a floating capsule. When disabled, these statuses are permanently displayed directly in the chat message area.",
     refreshRules: "Refresh rules",
     instructionSources: "Resolved instruction sources",
     hookConfig: "Loaded hook definitions",
@@ -644,6 +647,8 @@ export const translations = {
     hooksEnabled: "启用生命周期 Hooks",
     sessionRecording: "记录项目会话",
     sessionRecordingDesc: "将完整对话保存到 MAIN 应用数据目录，方便恢复项目历史，但不会把聊天流水写进 .MAIN。",
+    enableCapsule: "启用执行胶囊 (Capsule)",
+    enableCapsuleDesc: "开启时，智能助手的动态执行进度与简要说明将在浮动胶囊中显示；关闭时，这些执行过程中的状态与说明将永久直接显示在聊天消息区域中。",
     refreshRules: "刷新规则",
     instructionSources: "已解析的指令来源",
     hookConfig: "已加载 Hook 定义",
@@ -947,6 +952,7 @@ export interface AppConfig {
   cloudExperimentalLoginEnabled: boolean;
   imAdapters: ImAdaptersConfig;
   workspace: string;
+  enableCapsule: boolean;
 }
 
 export type AgentStatus = "idle" | "running" | "pending_review" | "error";
@@ -1427,8 +1433,9 @@ interface AppState {
     lastReportedAssistantText: string;
     capsuleExplanation: CapsuleExplanationState;
     turnId: string;
+    remoteFeishu?: FeishuRemoteContext | null;
   };
-  startNewTurn: () => void;
+  startNewTurn: (remoteFeishu?: FeishuRemoteContext | null) => void;
   getCurrentRunIntent: () => ResolvedUserIntent;
 }
 
@@ -1470,6 +1477,7 @@ const defaultConfig: AppConfig = {
   cloudExperimentalLoginEnabled: false,
   imAdapters: createDefaultImAdaptersConfig(),
   workspace: "",
+  enableCapsule: true,
 };
 
 function normalizeLocalConfig(
@@ -1535,7 +1543,7 @@ function resolveRuntimeLaneKey(config: Partial<AppConfig> | null | undefined): s
 
   const cloudProtocolInput =
     typeof config?.cloud?.protocol === "string" ? config.cloud.protocol : "openai";
-  const cloudExperimentalLoginEnabled = config?.cloudExperimentalLoginEnabled === true;
+  const cloudExperimentalLoginEnabled = false;
   const cloudAuthMode = cloudExperimentalLoginEnabled
     ? config?.cloud?.auth?.mode ?? "api_key"
     : "api_key";
@@ -1749,6 +1757,7 @@ function createDefaultCurrentTurnState() {
     lastReportedAssistantText: "",
     capsuleExplanation: null,
     turnId: "",
+    remoteFeishu: null as FeishuRemoteContext | null,
   };
 }
 
@@ -5395,11 +5404,12 @@ export const useAppStore = create<AppState>()(
         turn.id === turnId ? { ...turn, collapsed: !turn.collapsed } : turn
       ),
     })),
-  startNewTurn: () => {
+  startNewTurn: (remoteFeishu) => {
     set(() => ({
       currentTurnState: {
         ...createDefaultCurrentTurnState(),
         turnId: Date.now().toString(),
+        ...(remoteFeishu ? { remoteFeishu } : {}),
       }
     }));
   },
@@ -7959,11 +7969,12 @@ export const useAppStore = create<AppState>()(
         ensurePlanArtifactsHydratedForWorkspace: sessionOpenPlanWorkspacePanel,
         openPlanWorkspacePanel: sessionOpenPlanWorkspacePanel,
         closeRightPanel: () => sessionSet({ showPlanPanel: false, showDiff: false, showTerminal: false }),
-        startNewTurn: () =>
+        startNewTurn: (remoteFeishu) =>
           sessionSet({
             currentTurnState: {
               ...createDefaultCurrentTurnState(),
               turnId: Date.now().toString(),
+              ...(remoteFeishu ? { remoteFeishu } : {}),
             },
           }),
         getCurrentRunIntent: () => {
@@ -9906,7 +9917,7 @@ export const useAppStore = create<AppState>()(
         getPlanAutoResumeCount: () => sessionGet().planAutoResumeCount,
         getStatus: () => sessionGet().agentStatus,
         consumeActiveGuidance: () => sessionGet().consumeActiveGuidance(turnId),
-        startNewTurn: () => sessionGet().startNewTurn(),
+        startNewTurn: () => sessionGet().startNewTurn(remoteFeishu),
         onApprovedPlanHandoff: (prompt) => {
           const language = sessionGet().config.language === "en" ? "en" : "zh";
           const executionTurnId = `turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -10328,6 +10339,19 @@ export const useAppStore = create<AppState>()(
                 },
               },
             }));
+            const state = sessionGet();
+            const remote = state.currentTurnState?.remoteFeishu;
+            if (remote) {
+              const header = state.config.language === "en" ? "🤖 Agent Status Update" : "🤖 智能助手动态进度";
+              const card = buildFeishuMarkdownCard(header, capsuleExplanationText, "blue");
+              void invoke("send_feishu_card", {
+                chatId: remote.chatId,
+                userId: remote.userId,
+                openId: remote.userId,
+                messageId: remote.messageId,
+                card,
+              }).catch(() => {});
+            }
           }
           const progressFromMeta = (() => {
             if (!isUserProgressText) return null;
@@ -11251,12 +11275,19 @@ export const useAppStore = create<AppState>()(
                 ? (language === "en" ? "MAIN stopped with an error." : "MAIN 执行时遇到错误。")
                 : (language === "en" ? "MAIN finished this remote task." : "MAIN 已完成这次远程任务。");
               const reply = extractFeishuTurnReply(sessionGet().taskFlow, turnId, fallback);
-              void invoke("send_feishu_message", {
+
+              const title = status === "error"
+                ? (language === "en" ? "MAIN Stopped with Error" : "MAIN 执行发生错误")
+                : (language === "en" ? "MAIN Task Completed" : "MAIN 任务执行已完成");
+              const cardColor = status === "error" ? "red" : "green";
+              const card = buildFeishuMarkdownCard(title, reply, cardColor);
+
+              void invoke("send_feishu_card", {
                 chatId: remoteFeishu.chatId,
                 userId: remoteFeishu.userId,
                 openId: remoteFeishu.userId,
                 messageId: remoteFeishu.messageId,
-                text: reply,
+                card,
               }).catch((error) => {
                 logStoreEvent("feishu_final_reply_failed", {
                   error: error instanceof Error ? error.message : String(error),
@@ -12583,7 +12614,7 @@ export const useAppStore = create<AppState>()(
           cloud: cloudState.cloud,
           cloudServers: cloudState.cloudServers,
           activeCloudServerId: cloudState.activeCloudServerId,
-          cloudExperimentalLoginEnabled: (persistedConfig as any).cloudExperimentalLoginEnabled === true,
+          cloudExperimentalLoginEnabled: false,
           promptLanguageStrategy:
             (persistedConfig as any).promptLanguageStrategy === "english_core_localized_output"
               ? (persistedConfig as any).promptLanguageStrategy
@@ -12593,6 +12624,7 @@ export const useAppStore = create<AppState>()(
           toolPermissionPolicy: normalizeToolPermissionPolicy((persistedConfig as any).toolPermissionPolicy),
           mcpRouting: normalizeMcpRoutingConfig((persistedConfig as any).mcpRouting),
           sessionRecordingEnabled: (persistedConfig as any).sessionRecordingEnabled ?? current.config.sessionRecordingEnabled,
+          enableCapsule: (persistedConfig as any).enableCapsule !== false,
           debugRecordFullTurnProcess: (persistedConfig as any).debugRecordFullTurnProcess === true,
           eventStreamMode: normalizeEventStreamMode(
             (persistedConfig as any).eventStreamMode,
@@ -12699,7 +12731,7 @@ async function requestSemanticTurnMetadata(params: {
     const model = ac.model;
     const provider = isCloud ? params.config.cloud.provider : params.config.local.provider;
     const cloudProtocol = normalizeCloudProtocol(isCloud ? params.config.cloud.protocol : "openai");
-    const cloudExperimentalLoginEnabled = isCloud && params.config.cloudExperimentalLoginEnabled === true;
+    const cloudExperimentalLoginEnabled = false;
     const cloudAuthMode = isCloud && cloudExperimentalLoginEnabled
       ? params.config.cloud.auth?.mode ?? "api_key"
       : "api_key";

@@ -486,6 +486,7 @@ export function buildFeishuApprovalCard(input: BuildFeishuApprovalCardInput): Fe
   }
 
   return {
+    schema: "2.0",
     config: {
       wide_screen_mode: true,
       update_multi: true,
@@ -535,6 +536,28 @@ export function createFeishuRemoteSessionTitle(user: FeishuPairedUser | FeishuIn
   const name = "name" in user ? user.name : user.userName;
   const fallback = "openId" in user ? user.openId : user.userId;
   return `[Feishu] ${name || fallback}`;
+}
+
+export function buildFeishuMarkdownCard(title: string, content: string, templateColor = "blue"): FeishuInteractiveCard {
+  return {
+    schema: "2.0",
+    config: {
+      wide_screen_mode: true,
+    },
+    header: {
+      template: templateColor,
+      title: {
+        tag: "plain_text",
+        content: title,
+      },
+    },
+    elements: [
+      {
+        tag: "markdown",
+        content: content,
+      },
+    ],
+  };
 }
 
 // endregion

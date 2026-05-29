@@ -54,6 +54,7 @@ function loadTranspiledModuleSync(sourcePath) {
 const {
   FEISHU_APPROVAL_TTL_MS,
   buildFeishuApprovalCard,
+  buildFeishuMarkdownCard,
   createFeishuPairingRequest,
   normalizeImAdaptersConfig,
   parseFeishuApprovalCardActionValue,
@@ -223,3 +224,13 @@ test("validates Feishu approval action identity, nonce, expiry and single-use st
   assert.equal(resolveFeishuApprovalAction([pending], baseRequest, 3000).reason, "expired");
   assert.equal(resolveFeishuApprovalAction([{ ...pending, status: "approved" }], baseRequest, 1000).reason, "already_resolved");
 });
+
+test("builds Feishu markdown card with wide screen config and custom template color", () => {
+  const card = buildFeishuMarkdownCard("Test Title", "Test Content", "purple");
+  assert.equal(card.config.wide_screen_mode, true);
+  assert.equal(card.header.template, "purple");
+  assert.equal(card.header.title.content, "Test Title");
+  assert.equal(card.elements[0].tag, "markdown");
+  assert.equal(card.elements[0].content, "Test Content");
+});
+

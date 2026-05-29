@@ -2361,8 +2361,21 @@ export default function ChatArea({
   const [isTopIslandVisible, setIsTopIslandVisible] = useState(false);
   const [previewImageItem, setPreviewImageItem] = useState<UserContextItem | null>(null);
   const [persistedExplanation, setPersistedExplanation] = useState("");
+  const [chatAreaHeight, setChatAreaHeight] = useState(0);
+  const [isCapsuleCollapsed, setIsCapsuleCollapsed] = useState(false);
   const lastTurnIdRef = useRef<string | undefined>(undefined);
   // endregion
+
+  useEffect(() => {
+    if (!chatContainerRef.current) return;
+    const resizeObserver = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        setChatAreaHeight(entry.contentRect.height);
+      }
+    });
+    resizeObserver.observe(chatContainerRef.current);
+    return () => resizeObserver.disconnect();
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -2572,10 +2585,15 @@ export default function ChatArea({
 
     if (!capsuleIsRunActive) {
       setPersistedExplanation("");
+      setIsCapsuleCollapsed(false);
     } else if (capsuleActivityText) {
       setPersistedExplanation(capsuleActivityText);
+      if (turnChanged) {
+        setIsCapsuleCollapsed(false);
+      }
     } else if (turnChanged) {
       setPersistedExplanation("");
+      setIsCapsuleCollapsed(false);
     }
   }, [capsuleActivityText, capsuleIsRunActive, capsuleTurn]);
 
@@ -3185,16 +3203,18 @@ export default function ChatArea({
       if (item.kind === "block") {
         if (isActiveRunningTurn) {
           // Active running turn routes intermediate explanations into the capsule.
-          const isExplanation = shouldSuppressAgentAsExplanation(item.block, item.index, blocks, turnIntent);
-          if (isExplanation) return null;
+          if (config.enableCapsule !== false) {
+            const isExplanation = shouldSuppressAgentAsExplanation(item.block, item.index, blocks, turnIntent);
+            if (isExplanation) return null;
+          }
           if (item.block?.type === "tool" && item.block?.toolStatus === "running") return null;
         } else {
-          if (isTransparentToolNarrationBlock(item.block)) return null;
+          if (config.enableCapsule !== false && isTransparentToolNarrationBlock(item.block)) return null;
         }
 
         // Hide conversational first-person explanations from message flow if completed/stopped,
         // since they are collapsed in the TurnIntentHistoryCard.
-        if (isTurnCompletedOrStopped && item.block?.type === "agent") {
+        if (config.enableCapsule !== false && isTurnCompletedOrStopped && item.block?.type === "agent") {
           const text = getAgentVisibleMarkdownText(item.block);
           if (isConversationalFirstPersonNarration(text)) {
             return null;
@@ -3208,11 +3228,11 @@ export default function ChatArea({
     const renderArchivedBlockItem = (item) => {
       if (item.kind !== "readContextGroup" && item.kind !== "operationCluster" && item.block?.type === "thought") return null;
       if (item.kind === "block") {
-        if (isTransparentToolNarrationBlock(item.block)) return null;
+        if (config.enableCapsule !== false && isTransparentToolNarrationBlock(item.block)) return null;
 
         // Hide conversational first-person explanations from message flow if completed/stopped,
         // since they are collapsed in the TurnIntentHistoryCard.
-        if (isTurnCompletedOrStopped && item.block?.type === "agent") {
+        if (config.enableCapsule !== false && isTurnCompletedOrStopped && item.block?.type === "agent") {
           const text = getAgentVisibleMarkdownText(item.block);
           if (isConversationalFirstPersonNarration(text)) {
             return null;
@@ -3832,32 +3852,73 @@ export default function ChatArea({
       </div>
 
       {/* Agent tool explanation capsule */}
-      <div
-        className="absolute left-6 right-6 z-30 pointer-events-none flex justify-center transition-all duration-300 ease-out"
-        style={{
-          bottom: `calc(env(safe-area-inset-bottom, 0px) + 1.5rem + ${composerHeight}px + 12px)`,
-          opacity: persistedExplanation ? 1 : 0,
-          transform: persistedExplanation ? "translateY(0)" : "translateY(8px)",
-        }}
-      >
-        {persistedExplanation && (() => {
-          const isRich = persistedExplanation.includes("#") || persistedExplanation.includes("\n");
-          return (
-            <div
-              data-testid="agent-explanation-capsule"
-              className={`agent-explanation-capsule w-full max-w-3xl ${isRich ? "flex-col !items-start !justify-start !rounded-2xl !p-5" : ""}`}
-              style={{
-                fontSize: `${Math.max(11, resolvedChatFontSize - 1)}px`,
-                lineHeight: `${Math.max(16, Math.round((resolvedChatFontSize - 1) * 1.5))}px`,
-              }}
-            >
-              <span className={`whitespace-pre-wrap break-words block w-full ${isRich ? "text-left" : "text-center"}`}>
-                {renderCompactMarkdownText(persistedExplanation)}
-              </span>
-            </div>
-          );
-        })()}
-      </div>
+      {config.enableCapsule !== false && persistedExplanation && (
+        <div
+          className="absolute left-6 right-6 z-30 pointer-events-none flex transition-all duration-300 ease-out"
+          style={{
+            bottom: `calc(env(safe-area-inset-bottom, 0px) + 1.5rem + ${composerHeight}px + 12px)`,
+            opacity: persistedExplanation ? 1 : 0,
+            transform: persistedExplanation ? "translateY(0)" : "translateY(8px)",
+            justifyContent: isCapsuleCollapsed ? "flex-start" : "center",
+          }}
+        >
+          {(() => {
+            const isRich = persistedExplanation.includes("#") || persistedExplanation.includes("\n");
+            return (
+              <div
+                data-testid="agent-explanation-capsule"
+                className={`agent-explanation-capsule ${isCapsuleCollapsed ? "collapsed-ring cursor-pointer" : "w-full max-w-3xl flex items-center justify-between"} ${!isCapsuleCollapsed && isRich ? "flex-col !items-start !justify-start !rounded-2xl !p-5" : ""}`}
+                style={{
+                  fontSize: `${Math.max(11, resolvedChatFontSize - 1)}px`,
+                  lineHeight: `${Math.max(16, Math.round((resolvedChatFontSize - 1) * 1.5))}px`,
+                  maxHeight: !isCapsuleCollapsed && chatAreaHeight ? `${chatAreaHeight * 0.4}px` : undefined,
+                  overflowY: !isCapsuleCollapsed ? "auto" : "hidden",
+                }}
+                onClick={isCapsuleCollapsed ? () => setIsCapsuleCollapsed(false) : undefined}
+                title={isCapsuleCollapsed ? (language === "zh" ? "点击展开" : "Click to expand") : undefined}
+              >
+                {isCapsuleCollapsed ? (
+                  <div className="flex items-center justify-center w-full h-full animate-pulse">
+                    <IconLogoM className="h-5 w-5 theme-text pointer-events-none" />
+                  </div>
+                ) : (
+                  <div className={`relative z-10 flex w-full ${isRich ? "flex-col items-start gap-3" : "items-center"}`}>
+                    <div className="flex items-center w-full justify-between border-b border-[#27272a]/60 pb-2 mb-1" style={!isRich ? { borderBottom: "none", paddingBottom: 0, marginBottom: 0 } : undefined}>
+                      <div className="flex items-center min-w-0 flex-1">
+                        <div className="shrink-0 mr-2.5 flex items-center justify-center h-6 w-6 rounded-full border border-[var(--accent-subtle-border)] bg-[var(--accent-subtle)] shadow-[0_0_6px_var(--accent-subtle)]">
+                          <IconLogoM className="h-3.5 w-3.5 theme-text pointer-events-none" />
+                        </div>
+                        <span className={`whitespace-pre-wrap break-words min-w-0 block flex-1 ${isRich ? "text-left font-semibold text-[var(--accent-light)]" : "text-left text-white"}`}>
+                          {!isRich ? renderCompactMarkdownText(persistedExplanation) : (language === "zh" ? "MAIN 的实时心流" : "MAIN's Flow")}
+                        </span>
+                      </div>
+                      
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setIsCapsuleCollapsed(true);
+                        }}
+                        title={language === "zh" ? "隐藏" : "Hide"}
+                        className="shrink-0 ml-3 flex items-center justify-center p-1.5 rounded-md border border-[var(--accent-subtle-border)] bg-[color-mix(in_srgb,var(--accent)_10%,transparent)] text-[var(--accent-light)] transition-all hover:bg-[var(--accent)] hover:text-white hover:border-transparent active:scale-95 cursor-pointer"
+                      >
+                        <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 01-1.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21" />
+                        </svg>
+                      </button>
+                    </div>
+
+                    {isRich && (
+                      <div className="w-full text-left overflow-y-auto max-h-[30vh] pr-1">
+                        {renderCompactMarkdownText(persistedExplanation)}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })()}
+        </div>
+      )}
 
       <Composer
         contextMentions={contextMentions}

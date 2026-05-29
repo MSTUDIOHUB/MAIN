@@ -5517,7 +5517,9 @@ export async function executeAgentLoop(
           workflowMode,
           isPlanApproved: callbacks.getIsPlanApproved(),
           inputBudget: contextBudgetsForManagement.inputBudget,
-          proactiveTriggerBudget: contextBudgetsForManagement.proactiveTriggerBudget,
+          proactiveTriggerBudget: isExecuteRecoveryEligible
+            ? Math.min(16000, contextBudgetsForManagement.proactiveTriggerBudget)
+            : contextBudgetsForManagement.proactiveTriggerBudget,
         })
       : null;
     let executeRecoveryContextAlreadyCompacted = false;
@@ -9642,8 +9644,8 @@ export async function executeAgentLoop(
             readOnlyTools: PLAN_EXPLORATION_READ_ONLY_TOOLS,
             sawExecuteOperationEvidence,
             noProgressBatchRepeatCount,
-            minReadOnlyActivities: 8,
-            minCachedReadOnlyActivities: 3,
+            minReadOnlyActivities: executeRecoveryMode === "normal" ? 8 : Infinity,
+            minCachedReadOnlyActivities: executeRecoveryMode === "normal" ? 3 : Infinity,
             maxNoProgressReadOnlyRepeats: 2,
             maxReadOnlyToolChars: 30_000,
           })
