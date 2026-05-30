@@ -5130,7 +5130,7 @@ export const useAppStore = create<AppState>()(
           ...(isHF ? { cooldownUntil: Date.now() + 15000 } : {}),
         },
         conversationTurns: s.conversationTurns.map((turn) =>
-          turn.id === turnId ? { ...turn, status, summary } : turn
+          turn.id === turnId ? { ...turn, status, summary, elapsedTime: turn.elapsedTime || s.elapsedTime || 0 } : turn
         ),
       }));
       persistSession();
@@ -5387,6 +5387,7 @@ export const useAppStore = create<AppState>()(
                 status === "awaiting_approval" || status === "awaiting_input" || status === "error"
                   ? false
                   : turn.collapsed,
+              elapsedTime: turn.elapsedTime || s.elapsedTime || 0,
             }
           : turn
       ),
@@ -7860,6 +7861,7 @@ export const useAppStore = create<AppState>()(
                   status === "awaiting_approval" || status === "awaiting_input" || status === "error"
                     ? false
                     : turn.collapsed,
+                elapsedTime: turn.elapsedTime || s.elapsedTime || 0,
               }
             : turn,
         ),
@@ -11147,6 +11149,7 @@ export const useAppStore = create<AppState>()(
             agentStatus: status,
             // Timer only runs during active generation, NOT during plan review
             isGenerating: status === "running",
+            ...(status === "pending_review" ? { abortController: abortCtrl } : {}),
           });
           if (status === "pending_review") {
             const state = sessionGet();

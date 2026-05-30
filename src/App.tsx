@@ -1621,25 +1621,42 @@ export default function App() {
         }
       : undefined;
 
+    if (optionAction === "adjust_plan") {
+      state.abortController?.abort();
+    }
+
     useAppStore.setState({
       ...(shouldReuseSourceTurn ? { currentTurnId: sourceTurnId } : {}),
       input: "",
       contextMentions: [],
       attachedFiles: [],
       ...(optionAction === "allow_readonly_session" ? { readOnlyAutoApproveForSession: true } : {}),
-      ...(optionAction === "adjust_plan" && sourceTurnId
+      ...(optionAction === "adjust_plan"
         ? {
-            conversationTurns: state.conversationTurns.map((turn) =>
-              turn.id === sourceTurnId && turn.pendingOperationProposal
-                ? {
-                    ...turn,
-                    pendingOperationProposal: {
-                      ...turn.pendingOperationProposal,
-                      approvalStatus: "adjusting",
-                    },
-                  }
-                : turn,
-            ),
+            agentStatus: "idle" as const,
+            isGenerating: false,
+            abortController: null,
+            isPlanApproved: false,
+            planApprovalChoice: null,
+            planExecutionEvidenceLedger: [],
+            planExecutionEvidenceCount: 0,
+            planAutoResumeCount: 0,
+            planExecutionProgressSnapshot: null,
+            ...(sourceTurnId
+              ? {
+                  conversationTurns: state.conversationTurns.map((turn) =>
+                    turn.id === sourceTurnId && turn.pendingOperationProposal
+                      ? {
+                          ...turn,
+                          pendingOperationProposal: {
+                            ...turn.pendingOperationProposal,
+                            approvalStatus: "adjusting",
+                          },
+                        }
+                      : turn,
+                  ),
+                }
+              : {}),
           }
         : {}),
       ...(shouldExecuteFromQuickReply && sourceTurnId

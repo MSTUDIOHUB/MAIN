@@ -54,22 +54,22 @@ function isApprovalActionOption(option: ReplyOption): boolean {
 
 function getDisplayReplyOptionLabel(option: ReplyOption, language: "zh" | "en"): string {
   if (option.action === "approve_operation_once") {
-    return language === "zh" ? "批准执行本轮方案" : "Approve And Run This Plan";
+    return option.label || option.value || (language === "zh" ? "批准执行本轮方案" : "Approve And Run This Plan");
   }
   if (option.action === "execute_once") {
     return option.label || option.value || (language === "zh" ? "直接执行本轮" : "Run This Choice");
   }
   if (option.action === "adjust_plan") {
-    return language === "zh" ? "继续调整方案" : "Keep Adjusting The Plan";
+    return option.label || option.value || (language === "zh" ? "继续调整方案" : "Keep Adjusting The Plan");
   }
   if (option.action === "cancel_operation") {
-    return language === "zh" ? "取消本轮操作" : "Cancel This Operation";
+    return option.label || option.value || (language === "zh" ? "取消本轮操作" : "Cancel This Operation");
   }
   if (option.action === "continue_readonly_once") {
-    return language === "zh" ? "继续当前只读读取" : "Continue This Read";
+    return option.label || option.value || (language === "zh" ? "继续当前只读读取" : "Continue This Read");
   }
   if (option.action === "allow_readonly_session") {
-    return language === "zh" ? "当前会话只读步骤全部批准" : "Allow Read-Only Steps In Session";
+    return option.label || option.value || (language === "zh" ? "当前会话只读步骤全部批准" : "Allow Read-Only Steps In Session");
   }
   return option.label || option.value || "";
 }
@@ -98,6 +98,31 @@ function getStageLabel(stage: PlanStage, language: "zh" | "en"): string {
     completed: "Completed",
   };
   return (language === "zh" ? zh : en)[stage];
+}
+
+function renderFormattedLabel(text: string): React.ReactNode {
+  if (!text) return "";
+  const parts = text.split(/(\*\*[^*]+\*\*|`[^`]+`)/g);
+  return parts.map((part, index) => {
+    if (part.startsWith("**") && part.endsWith("**")) {
+      return (
+        <strong key={index} className="font-bold text-white">
+          {part.slice(2, -2)}
+        </strong>
+      );
+    }
+    if (part.startsWith("`") && part.endsWith("`")) {
+      return (
+        <code
+          key={index}
+          className="rounded border border-[rgba(255,255,255,0.15)] bg-[rgba(255,255,255,0.06)] px-1.5 py-0.5 font-mono text-[0.9em] text-[#fbbf24]"
+        >
+          {part.slice(1, -1)}
+        </code>
+      );
+    }
+    return part;
+  });
 }
 
 const TopIsland = memo(function TopIsland({
@@ -142,6 +167,92 @@ const TopIsland = memo(function TopIsland({
   const [customReplyText, setCustomReplyText] = useState("");
   const [planAdjustmentText, setPlanAdjustmentText] = useState("");
   const shellRef = useRef<HTMLDivElement | null>(null);
+
+  const [activeTabIdx, setActiveTabIdx] = useState(0);
+  const [tabSelections, setTabSelections] = useState<Record<string, string[]>>({});
+  const [tabWriteIns, setTabWriteIns] = useState<Record<string, string>>({});
+
+  const tabGroups = useMemo(() => {
+    const hasTabPrefix = replyOptions.some(opt => /^\[([^\]]+)\]/.test(opt.label));
+    if (!hasTabPrefix) return null;
+
+    const groupsMap: Record<string, { category: string; cleanCategory: string; isMulti: boolean; options: ReplyOption[] }> = {};
+    
+    replyOptions.forEach(opt => {
+      const match = opt.label.match(/^\[([^\]]+)\]\s*(.*)$/);
+      if (match) {
+        const fullCategory = match[1].trim();
+        const cleanLabel = match[2].trim();
+        const isMulti = /\((?:多选|multi|checkbox|multiple)\)/i.test(fullCategory);
+        const cleanCategory = fullCategory.replace(/\((?:多选|multi|checkbox|multiple)\)/gi, "").trim();
+        
+        if (!groupsMap[cleanCategory]) {
+          groupsMap[cleanCategory] = {
+            category: fullCategory,
+            cleanCategory,
+            isMulti,
+            options: [],
+          };
+        }
+        groupsMap[cleanCategory].options.push({
+          ...opt,
+          label: cleanLabel,
+        });
+      } else {
+        const cleanCategory = language === "zh" ? "其他" : "Other";
+        if (!groupsMap[cleanCategory]) {
+          groupsMap[cleanCategory] = {
+            category: cleanCategory,
+            cleanCategory,
+            isMulti: false,
+            options: [],
+          };
+        }
+        groupsMap[cleanCategory].options.push(opt);
+      }
+    });
+    
+    return Object.values(groupsMap);
+  }, [replyOptions, language]);
+
+  useEffect(() => {
+    setActiveTabIdx(0);
+    setTabSelections({});
+    setTabWriteIns({});
+  }, [replyOptions]);
+
+  const handleTabbedSubmit = () => {
+    if (!tabGroups) return;
+    const responses: string[] = [];
+    
+    tabGroups.forEach(group => {
+      const selectedValues = tabSelections[group.cleanCategory] || [];
+      const writeInText = tabWriteIns[group.cleanCategory]?.trim();
+      const parts: string[] = [];
+      if (selectedValues.length > 0) {
+        parts.push(selectedValues.join(", "));
+      }
+      if (writeInText) {
+        parts.push(`Other: ${writeInText}`);
+      }
+      if (parts.length > 0) {
+        responses.push(`[${group.cleanCategory}] ${parts.join(" | ")}`);
+      }
+    });
+
+    if (responses.length === 0) return;
+
+    const summaryLabel = responses.map(r => r.replace(/^\[([^\]]+)\]\s*/, "$1: ")).join(" | ");
+    const finalValue = language === "zh"
+      ? `已确认以下规格选择：\n${responses.map(r => `- ${r}`).join("\n")}`
+      : `Confirmed the following selections:\n${responses.map(r => `- ${r}`).join("\n")}`;
+
+    onSelectReplyOption?.({
+      label: summaryLabel,
+      value: finalValue,
+      action: "execute_once",
+    });
+  };
 
   const realChoiceOptions = useMemo(
     () => replyOptions.filter((option) => !isApprovalActionOption(option)),
@@ -284,6 +395,9 @@ const TopIsland = memo(function TopIsland({
     replyOptionInfo: language === "zh"
       ? "选择后会把该选项作为用户回复发回当前回合。"
       : "Selecting this sends the option back as your reply for this turn.",
+    approveOperationInfo: language === "zh"
+      ? "选择此项将批准执行本轮模型提出的全部修改与优化方案。"
+      : "Selecting this approves the execution of all proposed code modifications and optimization plans.",
     readonlyOnceInfo: language === "zh"
       ? "只批准这一次只读读取、搜索或分析请求。"
       : "Approves only this read/search/analysis request.",
@@ -676,30 +790,151 @@ const TopIsland = memo(function TopIsland({
                 {hasReplyOptions && (
                   <div className="mt-3 flex flex-col gap-3">
                     {hasRealChoiceOptions && (
-                      <div>
-                        <div className={`font-medium uppercase tracking-[0.14em] ${secondaryText}`} style={choiceSectionStyle}>
-                          {copy.choicesSectionTitle}
-                        </div>
-                        <div className="mt-2 space-y-2">
-                          {realChoiceOptions.map((option, index) => (
-                            <div
-                              key={`${option.value}-${index}`}
-                              className="group flex min-w-0 items-center gap-2"
-                            >
-                              <span data-testid={`top-island-reply-option-badge-${index}`} className={choiceNumberClass} style={choiceTextStyle}>{index + 1}.</span>
+                      tabGroups ? (
+                        <div className="space-y-3">
+                          {/* Category Tab Bar */}
+                          <div className="flex gap-1.5 border-b border-[rgba(255,255,255,0.06)] pb-2 overflow-x-auto select-none pointer-events-auto">
+                            {tabGroups.map((group, idx) => (
                               <button
-                                data-testid={`top-island-reply-option-${index}`}
-                                onClick={() => onSelectReplyOption?.(option)}
-                                className={choiceOptionButtonClass}
-                                style={choiceTextStyle}
-                                title={copy.replyOptionInfo}
+                                key={group.cleanCategory}
+                                type="button"
+                                onClick={() => setActiveTabIdx(idx)}
+                                className={`px-3 py-1 text-[11px] font-semibold rounded-lg border transition-colors whitespace-nowrap ${
+                                  activeTabIdx === idx
+                                    ? "border-[var(--accent)] bg-[var(--accent-subtle)] text-[var(--accent-light)]"
+                                    : "border-[#27272a] bg-[#09090b] text-[#a1a1aa] hover:bg-[#18181b] hover:text-[#f5f5f5]"
+                                }`}
                               >
-                                <span className="min-w-0 break-words">{getDisplayReplyOptionLabel(option, language)}</span>
+                                {group.cleanCategory}
+                                {(tabSelections[group.cleanCategory]?.length > 0 || tabWriteIns[group.cleanCategory]?.trim()) && (
+                                  <span className="ml-1 text-[9px] bg-[var(--accent)] text-[var(--accent-contrast)] px-1 rounded-full">✓</span>
+                                )}
                               </button>
-                            </div>
-                          ))}
+                            ))}
+                          </div>
+
+                          {/* Selected Category Content */}
+                          {tabGroups[activeTabIdx] && (() => {
+                            const activeGroup = tabGroups[activeTabIdx];
+                            return (
+                              <div className="mt-3 space-y-2 pointer-events-auto">
+                                <div className="space-y-2">
+                                  {activeGroup.options.map((option, optionIdx) => {
+                                    const isSelected = (tabSelections[activeGroup.cleanCategory] || []).includes(option.value);
+                                    return (
+                                      <button
+                                        key={`${option.value}-${optionIdx}`}
+                                        type="button"
+                                        onClick={() => {
+                                          setTabSelections(prev => {
+                                            const current = prev[activeGroup.cleanCategory] || [];
+                                            let next: string[];
+                                            if (activeGroup.isMulti) {
+                                              next = current.includes(option.value)
+                                                ? current.filter(v => v !== option.value)
+                                                : [...current, option.value];
+                                            } else {
+                                              next = [option.value];
+                                            }
+                                            return { ...prev, [activeGroup.cleanCategory]: next };
+                                          });
+                                        }}
+                                        className={`w-full text-left rounded-xl border px-3.5 py-3 flex items-center gap-3 transition-all duration-150 ${
+                                          isSelected
+                                            ? "border-[var(--accent)] bg-[var(--accent-subtle)] shadow-[0_2px_8px_rgba(var(--accent-rgb),0.1)]"
+                                            : "border-[#202026] bg-[#09090b] text-[#c4c4cc] hover:border-[#2d2d35] hover:bg-[#131316]"
+                                        }`}
+                                      >
+                                        <span
+                                          className={`h-4.5 w-4.5 shrink-0 border flex items-center justify-center transition-colors ${
+                                            activeGroup.isMulti ? "rounded" : "rounded-full"
+                                          } ${
+                                            isSelected
+                                              ? "border-[var(--accent)] bg-[var(--accent)] text-[var(--accent-contrast)]"
+                                              : "border-[#3f3f46] bg-transparent text-transparent"
+                                          }`}
+                                        >
+                                          {isSelected && (
+                                            <svg className="h-3 w-3" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                                              <path d="M2.5 6L5 8.5L9.5 3.5" />
+                                            </svg>
+                                          )}
+                                        </span>
+                                        <span className="text-[12px] font-medium leading-relaxed select-none">
+                                          {renderFormattedLabel(option.label)}
+                                        </span>
+                                      </button>
+                                    );
+                                  })}
+                                </div>
+
+                                {/* Custom Text Write-in per tab */}
+                                <div className="flex items-center gap-2 mt-2 pt-2 border-t border-[rgba(255,255,255,0.04)]">
+                                  <span className="text-[11px] font-medium text-[#71717a] shrink-0 w-10 text-right select-none">Other:</span>
+                                  <input
+                                    type="text"
+                                    value={tabWriteIns[activeGroup.cleanCategory] || ""}
+                                    onChange={(e) => {
+                                      const val = e.target.value;
+                                      setTabWriteIns(prev => ({ ...prev, [activeGroup.cleanCategory]: val }));
+                                    }}
+                                    placeholder={copy.customChoicePlaceholder}
+                                    className="min-w-0 flex-1 rounded-xl border border-[#202026] bg-[#09090b] px-3 py-2 text-[12px] text-[#f5f5f5] placeholder-[#71717a] outline-none transition-all focus:border-[var(--accent)]"
+                                  />
+                                </div>
+
+                                {/* Composite Submission buttons at bottom */}
+                                <div className="mt-4 pt-3 border-t border-[rgba(255,255,255,0.06)] flex items-center justify-between gap-3">
+                                  <button
+                                    onClick={onCancelTurn}
+                                    type="button"
+                                    className="px-4 py-2 rounded-xl border border-[rgba(239,68,68,0.4)] bg-[rgba(239,68,68,0.08)] text-[#ef4444] transition-all duration-150 hover:border-[#ef4444] hover:bg-[rgba(239,68,68,0.16)] hover:text-[#f87171] text-[12px] font-semibold"
+                                  >
+                                    {copy.cancelTurn}
+                                  </button>
+                                  <button
+                                    onClick={handleTabbedSubmit}
+                                    type="button"
+                                    className="theme-plan-primary px-5 py-2 rounded-xl text-[12px] font-semibold flex items-center gap-1.5"
+                                  >
+                                    <span>{language === "zh" ? "提交选择" : "Submit Answers"}</span>
+                                  </button>
+                                </div>
+                              </div>
+                            );
+                          })()}
                         </div>
-                      </div>
+                      ) : (
+                        <div>
+                          <div className={`font-medium uppercase tracking-[0.14em] ${secondaryText}`} style={choiceSectionStyle}>
+                            {copy.choicesSectionTitle}
+                          </div>
+                          <div className="mt-2 space-y-2">
+                            {realChoiceOptions.map((option, index) => (
+                              <div
+                                key={`${option.value}-${index}`}
+                                className="group flex min-w-0 items-center gap-2"
+                              >
+                                <span data-testid={`top-island-reply-option-badge-${index}`} className={choiceNumberClass} style={choiceTextStyle}>{index + 1}.</span>
+                                <button
+                                  data-testid={`top-island-reply-option-${index}`}
+                                  onClick={() => onSelectReplyOption?.(option)}
+                                  className={choiceOptionButtonClass}
+                                  style={choiceTextStyle}
+                                  title={option.action === "approve_operation_once" ? copy.approveOperationInfo : copy.replyOptionInfo}
+                                >
+                                  <div className="flex items-center justify-between gap-2">
+                                    <span className="min-w-0 break-words">{renderFormattedLabel(getDisplayReplyOptionLabel(option, language))}</span>
+                                    {option.action === "approve_operation_once" && (
+                                      <IconInfo className="h-4 w-4 shrink-0 opacity-75" />
+                                    )}
+                                  </div>
+                                </button>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )
                     )}
 
                     {hasApprovalActionOptions && (
@@ -719,7 +954,7 @@ const TopIsland = memo(function TopIsland({
                               title={option.action === "allow_readonly_session" ? copy.readonlySessionInfo : copy.readonlyOnceInfo}
                             >
                               <span className="inline-flex min-w-0 items-center gap-2">
-                                <span className="min-w-0 break-words">{getDisplayReplyOptionLabel(option, language)}</span>
+                                <span className="min-w-0 break-words">{renderFormattedLabel(getDisplayReplyOptionLabel(option, language))}</span>
                                 <IconInfo className="h-4 w-4 opacity-75" />
                               </span>
                             </button>
@@ -728,38 +963,42 @@ const TopIsland = memo(function TopIsland({
                       </div>
                     )}
 
-                    <form onSubmit={submitCustomReply} data-testid="top-island-custom-reply-row" className="group flex min-w-0 items-center gap-2">
-                      <span data-testid="top-island-custom-reply-badge" className={choiceNumberClass} style={choiceTextStyle}>{customChoiceNumber}.</span>
-                      <div className="min-w-0 flex-1">
-                        <div className="flex min-w-0 items-center gap-2">
-                          <input
-                            data-testid="top-island-custom-reply-input"
-                            value={customReplyText}
-                            onChange={(event) => setCustomReplyText(event.target.value)}
-                            placeholder={copy.customChoicePlaceholder}
-                            className="top-island-choice-input min-w-0 flex-1 rounded-xl border px-3 py-2.5 outline-none transition-all"
-                            style={choiceTextStyle}
-                          />
-                          <button
-                            type="submit"
-                            data-testid="top-island-custom-reply-submit"
-                            disabled={!normalizedCustomReply || !onSelectReplyOption}
-                            className={`theme-plan-primary shrink-0 rounded-xl px-3 py-2.5 text-[12px] font-semibold transition-opacity ${
-                              normalizedCustomReply && onSelectReplyOption ? "opacity-100" : "cursor-not-allowed opacity-40"
-                            }`}
-                          >
-                            {copy.customChoiceSubmit}
-                          </button>
+                    {!tabGroups && (
+                      <form onSubmit={submitCustomReply} data-testid="top-island-custom-reply-row" className="group flex min-w-0 items-center gap-2">
+                        <span data-testid="top-island-custom-reply-badge" className={choiceNumberClass} style={choiceTextStyle}>{customChoiceNumber}.</span>
+                        <div className="min-w-0 flex-1">
+                          <div className="flex min-w-0 items-center gap-2">
+                            <input
+                              data-testid="top-island-custom-reply-input"
+                              value={customReplyText}
+                              onChange={(event) => setCustomReplyText(event.target.value)}
+                              placeholder={copy.customChoicePlaceholder}
+                              className="top-island-choice-input min-w-0 flex-1 rounded-xl border px-3 py-2.5 outline-none transition-all"
+                              style={choiceTextStyle}
+                            />
+                            <button
+                              type="submit"
+                              data-testid="top-island-custom-reply-submit"
+                              disabled={!normalizedCustomReply || !onSelectReplyOption}
+                              className={`theme-plan-primary shrink-0 rounded-xl px-3 py-2.5 text-[12px] font-semibold transition-opacity ${
+                                normalizedCustomReply && onSelectReplyOption ? "opacity-100" : "cursor-not-allowed opacity-40"
+                              }`}
+                            >
+                              {copy.customChoiceSubmit}
+                            </button>
+                          </div>
                         </div>
-                      </div>
-                    </form>
-                    <button
-                      onClick={onCancelTurn}
-                      className="w-full px-3 py-2.5 text-center rounded-xl border border-[rgba(239,68,68,0.4)] bg-[rgba(239,68,68,0.08)] text-[#ef4444] transition-all duration-150 hover:border-[#ef4444] hover:bg-[rgba(239,68,68,0.16)] hover:text-[#f87171]"
-                      style={choiceTextStyle}
-                    >
-                      {copy.cancelTurn}
-                    </button>
+                      </form>
+                    )}
+                    {!tabGroups && (
+                      <button
+                        onClick={onCancelTurn}
+                        className="w-full px-3 py-2.5 text-center rounded-xl border border-[rgba(239,68,68,0.4)] bg-[rgba(239,68,68,0.08)] text-[#ef4444] transition-all duration-150 hover:border-[#ef4444] hover:bg-[rgba(239,68,68,0.16)] hover:text-[#f87171]"
+                        style={choiceTextStyle}
+                      >
+                        {copy.cancelTurn}
+                      </button>
+                    )}
                   </div>
                 )}
               </div>

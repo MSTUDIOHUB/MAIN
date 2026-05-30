@@ -345,7 +345,7 @@ export default function Composer({
   const streamingPrimaryQueuesMessage = isStreaming && hasDraftPayload;
   const queuedMessagePreview = queuedUserMessage?.text?.trim() || (queuedUserMessage ? (language === "en" ? "Attachment message" : "含附件消息") : "");
   const activeGuidancePreview = activeGuidance?.text?.trim() || "";
-  const queuedCanGuide = Boolean(queuedUserMessage?.text?.trim()) && isStreaming;
+  const queuedCanGuide = Boolean(queuedUserMessage?.text?.trim());
   const autoReviewToggleDisabled = Boolean(autoApproveTools && isStreaming);
   const autoReviewButtonTitle = autoReviewToggleDisabled ? autoReviewLockedTitle : autoReviewTitle;
   const nonPackFiles = useMemo(
@@ -1276,12 +1276,35 @@ export default function Composer({
 
   const handleGuideQueuedMessage = useCallback(() => {
     const guidance = queuedUserMessage?.text?.trim() || "";
-    if (!guidance || !isStreaming) return;
-    setActiveGuidance(guidance, currentTurnId);
-    clearQueuedUserMessage();
-    closeSlashMenu();
-    setStoreInput("");
-  }, [clearQueuedUserMessage, closeSlashMenu, currentTurnId, isStreaming, queuedUserMessage, setActiveGuidance, setStoreInput]);
+    if (!guidance) return;
+
+    const appState = useAppStore.getState();
+    if (appState.agentStatus === "pending_review") {
+      appState.abortController?.abort();
+      useAppStore.setState({
+        agentStatus: "idle",
+        isGenerating: false,
+        abortController: null,
+        isPlanApproved: false,
+        planApprovalChoice: null,
+        planExecutionEvidenceLedger: [],
+        planExecutionEvidenceCount: 0,
+        planAutoResumeCount: 0,
+        planExecutionProgressSnapshot: null,
+      });
+    }
+
+    if (isStreaming) {
+      setActiveGuidance(guidance, currentTurnId);
+      clearQueuedUserMessage();
+      closeSlashMenu();
+      setStoreInput("");
+    } else {
+      clearQueuedUserMessage();
+      closeSlashMenu();
+      onSendMessage(guidance, queuedUserMessage.images || []);
+    }
+  }, [clearQueuedUserMessage, closeSlashMenu, currentTurnId, isStreaming, queuedUserMessage, setActiveGuidance, setStoreInput, onSendMessage]);
 
   // ── Handle textarea change (detect @ typing) ──
   const resizeTextarea = useCallback(() => {

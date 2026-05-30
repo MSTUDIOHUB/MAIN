@@ -2179,6 +2179,44 @@ const RunStatusTimer = memo(function RunStatusTimer({
   );
 });
 
+const TurnTimer = memo(function TurnTimer({
+  turnId,
+  status,
+  isStreaming,
+  currentTurnId,
+  savedElapsedTime,
+  isLightThemeMode,
+}: {
+  turnId: string;
+  status: string;
+  isStreaming: boolean;
+  currentTurnId: string | null;
+  savedElapsedTime?: number;
+  isLightThemeMode: boolean;
+}) {
+  const storeElapsedTime = useAppStore((s) => s.elapsedTime);
+  const isActive = turnId === currentTurnId && (isStreaming || status === "executing" || status === "planning");
+  const timeToShow = isActive ? storeElapsedTime : (savedElapsedTime || 0);
+  if (timeToShow <= 0 && !isActive) return null;
+
+  const minutes = Math.floor(timeToShow / 60);
+  const seconds = timeToShow % 60;
+  const timeString = minutes > 0 ? `${minutes}m${seconds}s` : `${seconds}s`;
+
+  return (
+    <span className={`rounded-full border px-2 py-0.5 text-[10px] flex items-center gap-1.5 ${
+      isActive 
+        ? "border-[rgba(251,191,36,0.25)] bg-[rgba(251,191,36,0.12)] text-[#fbbf24]" 
+        : isLightThemeMode
+        ? "border-[#d4d4d8] bg-[#f4f4f5] text-[#71717a]"
+        : "border-[#27272a] bg-[#09090b] text-[#a1a1aa]"
+    }`}>
+      {isActive && <span className="h-1.5 w-1.5 rounded-full bg-[#fbbf24] animate-pulse" />}
+      {timeString}
+    </span>
+  );
+});
+
 export default function ChatArea({
   taskFlow,
   t,
@@ -3182,8 +3220,12 @@ export default function ChatArea({
 
       const list: string[] = [];
       const seen = new Set<string>();
-      for (const block of blocks) {
+      blocks.forEach((block, idx) => {
         if (block.type === "agent") {
+          const hasOptions = block.options && block.options.length > 0;
+          const isFinalBlock = idx === finalVisibleAgentIndex;
+          if (hasOptions || isFinalBlock) return;
+
           const text = getAgentVisibleMarkdownText(block);
           const content = String(text || "").trim();
           if (content && isConversationalFirstPersonNarration(content)) {
@@ -3194,7 +3236,7 @@ export default function ChatArea({
             }
           }
         }
-      }
+      });
       return list;
     })();
 
@@ -3217,7 +3259,11 @@ export default function ChatArea({
         if (config.enableCapsule !== false && isTurnCompletedOrStopped && item.block?.type === "agent") {
           const text = getAgentVisibleMarkdownText(item.block);
           if (isConversationalFirstPersonNarration(text)) {
-            return null;
+            const hasOptions = item.block.options && item.block.options.length > 0;
+            const isFinalBlock = item.index === finalVisibleAgentIndex;
+            if (!hasOptions && !isFinalBlock) {
+              return null;
+            }
           }
         }
       }
@@ -3235,7 +3281,11 @@ export default function ChatArea({
         if (config.enableCapsule !== false && isTurnCompletedOrStopped && item.block?.type === "agent") {
           const text = getAgentVisibleMarkdownText(item.block);
           if (isConversationalFirstPersonNarration(text)) {
-            return null;
+            const hasOptions = item.block.options && item.block.options.length > 0;
+            const isFinalBlock = item.index === finalVisibleAgentIndex;
+            if (!hasOptions && !isFinalBlock) {
+              return null;
+            }
           }
         }
       }
@@ -3402,6 +3452,14 @@ export default function ChatArea({
               <span className={`rounded-full border px-2 py-0.5 text-[10px] ${getTurnStatusTone(turn.status)}`}>
                 {copy.turnStatusLabels[turn.status] || turn.status}
               </span>
+              <TurnTimer
+                turnId={turn.id}
+                status={turn.status}
+                isStreaming={isStreaming}
+                currentTurnId={currentTurnId}
+                savedElapsedTime={turn.elapsedTime}
+                isLightThemeMode={isLightThemeMode}
+              />
               {shouldShowTurnChanges && (
                 <span className="rounded-full border border-[rgba(37,99,235,0.25)] bg-[rgba(37,99,235,0.12)] px-2 py-0.5 text-[10px] text-[#93c5fd]">
                   {language === "zh" ? `${turnChangeEntries.length} 个变更文件` : `${turnChangeEntries.length} changed file${turnChangeEntries.length > 1 ? "s" : ""}`}
@@ -3509,7 +3567,10 @@ export default function ChatArea({
                   {finalVisibleAgentBlock && (() => {
                     const text = getAgentVisibleMarkdownText(finalVisibleAgentBlock);
                     if (isTurnCompletedOrStopped && isConversationalFirstPersonNarration(text)) {
-                      return null;
+                      const hasOptions = finalVisibleAgentBlock.options && finalVisibleAgentBlock.options.length > 0;
+                      if (!hasOptions) {
+                        return null;
+                      }
                     }
                     return renderBlock(finalVisibleAgentBlock, finalVisibleAgentIndex);
                   })()}
@@ -3585,20 +3646,9 @@ export default function ChatArea({
         </button>
 
         <div className="flex min-w-0 items-center gap-2 overflow-x-auto">
-          {shouldShowRunStatus && (
-            <RunStatusTimer
-              activeSessionKey={activeSessionKey}
-              isStreaming={isStreaming}
-              label={runStatusLabel}
-            />
-          )}
 
-          {shouldShowRunStatus && (
-            <button onClick={onStopGeneration} className="flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-[4px] border border-[#27272a] bg-[#09090b] px-3 py-1 text-[10px] font-medium text-[#f48771] transition-colors hover:bg-[#18181b] hover:text-red-400" style={{ height: 28 }}>
-              <IconStop className="h-3.5 w-3.5" />
-              {copy.stopLabel}
-            </button>
-          )}
+
+
 
           {hasPlanPanelContent && (
             <button

@@ -22,7 +22,9 @@ export function isConversationalFirstPersonNarration(text: string): boolean {
   if (!raw) return false;
   if (isIdleCapsuleNarration(raw)) return false;
 
-
+  // 如果包含富文本结构或长度过长，说明是正式结论/回答，不作为可收拢隐藏的第一人称中间进度叙述
+  if (raw.length > 300) return false;
+  if (/#|```|\||-\s+\[[ x]\]/i.test(raw)) return false;
 
   // 2. 检查是否具备典型的第一人称意图、计划或动作引导特征
   const hasFirstPersonZh = /(?:我|正在|接下来|为了|准备|计划|先进行|等待|请确认|我已)/.test(raw);

@@ -415,6 +415,7 @@ export interface ConversationTurn {
   blockIds: number[];
   collapsed: boolean;
   createdAt: number;
+  elapsedTime?: number;
 }
 
 export function shouldPlanShortcutReplaceTurn(input: {
