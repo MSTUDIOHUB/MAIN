@@ -3160,13 +3160,16 @@ export default function ChatArea({
           }
         : null;
     const toolExecutionSummary = buildToolExecutionSummary(blocks, language);
-    const effectiveProgressLedger = buildRuntimeProgressLedger({
-      blocks,
-      events: runtimeEvents,
-      turnId: turn.id,
-      language,
-      maxItems: 12,
-    });
+    const isChatIntent = turnIntent === "respond" || turnIntent === "discuss";
+    const effectiveProgressLedger = isChatIntent
+      ? []
+      : buildRuntimeProgressLedger({
+          blocks,
+          events: runtimeEvents,
+          turnId: turn.id,
+          language,
+          maxItems: 12,
+        });
     const effectiveProgressSummary = summarizeRuntimeProgressLedger(effectiveProgressLedger, language);
     const activeTurnActivity = getActiveTurnActivity(blocks, turn.status, language);
     const liveProcessTimeline = !shouldArchiveCompletedProcess && shouldRenderLiveProcessTimeline
@@ -3205,7 +3208,7 @@ export default function ChatArea({
     const shouldShowTurnActivityNotice =
       turn.status !== "error" &&
       !shouldRouteActivityNoticeToCapsule &&
-      (activeTurnActivity || bottomThoughtSummary || effectiveProgressLedger.length > 0);
+      ((isChatIntent ? false : !!activeTurnActivity) || bottomThoughtSummary || effectiveProgressLedger.length > 0);
     const isTurnCompletedOrStopped =
       turn.status === "done" ||
       turn.status === "completed_with_changes" ||
@@ -3593,7 +3596,7 @@ export default function ChatArea({
           )}
           {isTurnExpanded && shouldShowTurnActivityNotice && (
             <TurnActivityNotice
-              activityText={activeTurnActivity}
+              activityText={isChatIntent ? undefined : (shouldRouteActivityNoticeToCapsule ? undefined : activeTurnActivity)}
               thoughtSummaryText={bottomThoughtSummary}
               isThinking={isBottomThoughtStreaming}
               language={language}

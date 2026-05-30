@@ -4250,7 +4250,7 @@ export async function executeAgentLoop(
     turnId: eventTurnId,
     timestampMs: Date.now(),
   });
-  {
+  if (turnIntent !== "respond" && turnIntent !== "discuss") {
     const language = callbacks.getPreferredLanguage();
     const userGoal = compactDiagnosticText(getOriginalUserPromptForPlanFallback(callbacks), 220);
     const hasImages = callbacks.getMessages().some((message) =>

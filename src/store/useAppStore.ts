@@ -254,6 +254,8 @@ import {
   PROVIDER_COMPATIBILITY_FORCE_XML_TTL_MS,
   PROVIDER_COMPATIBILITY_NATIVE_RECOVERY_SUCCESS_STREAK,
 } from "./slices/configSlice";
+import { StreamingThinkingInterceptor } from "../lib/chat/StreamingThinkingInterceptor";
+import { StreamingCadenceBuffer } from "../lib/chat/streamBuffer";
 import {
   createWorkspaceSlice,
   normalizePendingDecisionInputKey,
@@ -2080,7 +2082,6 @@ function normalizeSessionsByWorkspace(
 // instead of the agent block. Prevents thinking content from briefly
 // appearing as plain text in the chat during streaming.
 
-const THINKING_TAG_NAMES = new Set(["thinking", "thought", "analysis", "reasoning"]);
 const MAX_VISIBLE_THOUGHT_CHARS = 36_000;
 
 function normalizeThoughtTextForCompare(text: string): string {
@@ -2315,122 +2316,6 @@ function appendThoughtDelta(existing: string, incoming: string): string {
 
   const overlap = findSuffixPrefixOverlap(current, delta);
   return compactThoughtContent(current + (overlap > 0 ? delta.slice(overlap) : delta));
-}
-
-class StreamingThinkingInterceptor {
-  private buffer = "";          // raw token accumulation for tag detection
-  private inThinking = false;   // currently inside a thinking tag?
-  private pendingClose = "";    // partial closing tag being accumulated
-  private thinkingContent = ""; // accumulated content inside the thinking tag
-
-  /** Feed a new token; returns { agent, thinking } with the split content. */
-  feed(token: string): { agent: string; thinking: string; thoughtStarted: boolean; thoughtEnded: boolean } {
-    let agent = "";
-    let thinking = "";
-    let thoughtStarted = false;
-    let thoughtEnded = false;
-
-    for (const ch of token) {
-      if (this.inThinking) {
-        // ── Inside a thinking block ──
-        // Accumulate into pendingClose buffer for closing tag detection.
-        // Only flush when we're certain it can't form a closing tag.
-        this.pendingClose += ch;
-
-        // Try to match a complete closing tag
-        const closeRe = new RegExp(`^<\\/(${[...THINKING_TAG_NAMES].join("|")})>\\s*$`, "i");
-        const m = this.pendingClose.match(closeRe);
-        if (m) {
-          // Full closing tag found — end thinking mode
-          this.inThinking = false;
-          this.pendingClose = "";
-          thoughtEnded = true;
-          continue;
-        }
-
-        // If the buffer can't possibly form a closing tag anymore, flush as thinking content
-        // A potential closing tag looks like: </word> with optional trailing whitespace
-        const couldBeCloseTag = /^<\/[a-zA-Z]*>?\s*$/.test(this.pendingClose);
-        if (!couldBeCloseTag || this.pendingClose.length > 30) {
-          thinking += this.pendingClose;
-          this.thinkingContent += this.pendingClose;
-          this.pendingClose = "";
-        }
-        // Otherwise keep buffering — it might still become a closing tag
-      } else {
-        // ── Normal mode — detect opening tags ──
-        this.buffer += ch;
-
-        // Check if buffer forms a complete opening tag
-        const openMatch = this.buffer.match(/^(<(?:thinking|thought|analysis|reasoning)(?:\s[^>]*)?>)([\s\S]*)/i);
-        if (openMatch) {
-          // Switch to thinking mode
-          this.inThinking = true;
-          this.buffer = "";
-          this.thinkingContent = "";
-          thoughtStarted = true;
-          // Any content after the tag is thinking content
-          if (openMatch[2]) {
-            thinking += openMatch[2];
-            this.thinkingContent += openMatch[2];
-          }
-          continue;
-        }
-
-        // If buffer can't possibly form a tag anymore, flush it as agent content
-        // A potential tag starts with '<' and contains only alpha chars so far
-        if (this.buffer.length > 0) {
-          const couldBeTag = /^<[a-zA-Z]*$/.test(this.buffer) ||
-                             /^<[a-zA-Z]+\s*$/.test(this.buffer) ||
-                             /^<[a-zA-Z]+[^>]*$/.test(this.buffer);
-          if (!couldBeTag || this.buffer.length > 30) {
-            agent += this.buffer;
-            this.buffer = "";
-          }
-          // Otherwise keep buffering — it might become a tag
-        }
-      }
-    }
-
-    return { agent, thinking, thoughtStarted, thoughtEnded };
-  }
-
-  /** Get the accumulated thinking content so far. */
-  getThinkingContent(): string { return this.thinkingContent; }
-
-  /** Flush any remaining buffer (call at stream end). */
-  flush(): { agent: string; thinking: string; thoughtEnded: boolean } {
-    let agent = "";
-    let thinking = "";
-    let thoughtEnded = false;
-
-    if (this.inThinking) {
-      // Unclosed thinking tag — treat remaining as thinking content and close
-      if (this.pendingClose) {
-        this.thinkingContent += this.pendingClose;
-        this.pendingClose = "";
-      }
-      thinking = ""; // no new content, but signal that the thought ended
-      thoughtEnded = true;
-      this.inThinking = false;
-    }
-
-    // Flush any remaining agent buffer
-    if (this.buffer) {
-      agent = this.buffer;
-      this.buffer = "";
-    }
-
-    return { agent, thinking, thoughtEnded };
-  }
-
-  /** Reset state for reuse. */
-  reset() {
-    this.buffer = "";
-    this.inThinking = false;
-    this.pendingClose = "";
-    this.thinkingContent = "";
-  }
 }
 
 // ── Task ID counter ───────────────────────────────────────────────────
@@ -8968,6 +8853,172 @@ export const useAppStore = create<AppState>()(
           status,
         }));
 
+      const streamBuffer = new StreamingCadenceBuffer({
+        interceptor: thinkingInterceptor,
+        flushIntervalMs: 90,
+        onFlush: ({ agentDelta, thinkingDelta, thoughtStarted, thoughtEnded }) => {
+          const latestStateForDedupe = sessionGet();
+          const shouldDisplayReasoningBlocks = latestStateForDedupe.config.reasoningDisplay !== "hidden";
+          const nextInterceptorThought = thinkingDelta
+            ? appendThoughtDelta(latestStateForDedupe.currentTurnState.interceptorThought, thinkingDelta)
+            : latestStateForDedupe.currentTurnState.interceptorThought;
+          const currentInterceptorThoughtContent = thinkingInterceptor.getThinkingContent() || thinkingDelta;
+          let thoughtIdToCreate: number | null = null;
+          let thoughtIdToUpdate = currentThoughtBlockId;
+          const thoughtDuration = thoughtStartTime ? Math.round((Date.now() - thoughtStartTime) / 1000) : undefined;
+ 
+          if (thoughtStarted && shouldDisplayReasoningBlocks) {
+            thoughtStartTime = Date.now();
+            const existingThoughtBlock = sessionGet().taskFlow
+              .filter((b) => b.turnId === turnId)
+              .reverse()
+              .find((b) => b.type === "thought");
+            if (existingThoughtBlock && !existingThoughtBlock.isStreaming) {
+              thoughtIdToCreate = null;
+              currentThoughtBlockId = existingThoughtBlock.id;
+              thoughtIdToUpdate = existingThoughtBlock.id;
+            } else if (existingThoughtBlock && existingThoughtBlock.isStreaming) {
+              thoughtIdToCreate = null;
+              currentThoughtBlockId = existingThoughtBlock.id;
+              thoughtIdToUpdate = existingThoughtBlock.id;
+            } else {
+              thoughtIdToCreate = nextId();
+              currentThoughtBlockId = thoughtIdToCreate;
+              thoughtIdToUpdate = thoughtIdToCreate;
+            }
+          }
+ 
+          let thoughtEndedId: number | null = null;
+          if (thoughtEnded && currentThoughtBlockId !== null && shouldDisplayReasoningBlocks) {
+            thoughtEndedId = currentThoughtBlockId;
+            currentThoughtBlockId = null;
+            thoughtStartTime = null;
+          } else if (thoughtEnded && !shouldDisplayReasoningBlocks) {
+            currentThoughtBlockId = null;
+            thoughtStartTime = null;
+          }
+ 
+          // ── Handle agent content ──
+          let agentContent = agentDelta;
+          let agentBlockIdToCreate: number | null = null;
+          let agentBlockIdToAppend: number | null = null;
+ 
+          if (agentContent) {
+            if (nextInterceptorThought && currentStreamingBlockId === null) {
+              const normThought = nextInterceptorThought.trim().toLowerCase().replace(/\s+/g, ' ');
+              const normAgent = agentContent.trim().toLowerCase().replace(/\s+/g, ' ');
+ 
+              if (normAgent.startsWith(normThought) || normThought.includes(normAgent)) {
+                const overlapLen = nextInterceptorThought.trim().length;
+                const possibleClean = agentContent.trim().slice(overlapLen).trim();
+                if (!possibleClean) {
+                  agentContent = "";
+                } else {
+                  agentContent = possibleClean;
+                }
+              }
+            }
+ 
+            if (agentContent) {
+              const displayCandidate = streamingAssistantDisplayBuffer + agentContent;
+              const displayDecision = resolveStreamingAssistantDisplay({
+                text: displayCandidate,
+                language: phaseLanguage,
+                workflowMode: sessionGet().config.workflowMode,
+                runIntent: effectiveRunIntent,
+                hasVisibleAgentBlock: currentStreamingBlockId !== null,
+              });
+              if (displayDecision.action === "show") {
+                agentContent = displayDecision.text;
+                streamingAssistantDisplayBuffer = "";
+              } else if (displayDecision.action === "buffer") {
+                streamingAssistantDisplayBuffer = displayDecision.bufferText || displayCandidate;
+                agentContent = "";
+              } else {
+                streamingAssistantDisplayBuffer = "";
+                agentContent = "";
+              }
+            }
+ 
+            if (agentContent) {
+              if (currentStreamingBlockId === null) {
+                agentBlockIdToCreate = nextId();
+                currentStreamingBlockId = agentBlockIdToCreate;
+                agentBlockIdsCreatedThisRun.add(agentBlockIdToCreate);
+              } else {
+                agentBlockIdToAppend = currentStreamingBlockId;
+              }
+            }
+          }
+ 
+          if (!thinkingDelta && !thoughtStarted && !thoughtEndedId && !agentContent) return;
+ 
+          sessionSet((s) => {
+            let taskFlow = s.taskFlow;
+            let conversationTurns = s.conversationTurns;
+ 
+            const appendBlock = (block: TaskBlock) => {
+              const blockWithTurn: TaskBlock = attachRuntimePhase({ ...block, turnId: block.turnId ?? turnId } as TaskBlock);
+              taskFlow = [...taskFlow, blockWithTurn];
+              conversationTurns = conversationTurns.map((turn) =>
+                turn.id === turnId && !turn.blockIds.includes(blockWithTurn.id)
+                  ? { ...turn, blockIds: [...turn.blockIds, blockWithTurn.id] }
+                  : turn
+              );
+            };
+ 
+            if (shouldDisplayReasoningBlocks && thoughtIdToCreate !== null) {
+              appendBlock({
+                id: thoughtIdToCreate,
+                turnId,
+                type: "thought",
+                content: compactThoughtContent(currentInterceptorThoughtContent),
+                isStreaming: true,
+              });
+            } else if (shouldDisplayReasoningBlocks && thoughtIdToUpdate !== null && thinkingDelta) {
+              const tid = thoughtIdToUpdate;
+              taskFlow = taskFlow.map((t) =>
+                t.id === tid && t.type === "thought"
+                  ? { ...t, content: compactThoughtContent(currentInterceptorThoughtContent), isStreaming: true }
+                  : t
+              );
+            }
+ 
+            if (shouldDisplayReasoningBlocks && thoughtEndedId !== null) {
+              const tid = thoughtEndedId;
+              taskFlow = taskFlow.map((t) =>
+                t.id === tid && t.type === "thought"
+                  ? { ...t, content: compactThoughtContentForPersist((t as Extract<TaskBlock, { type: "thought" }>).content), isStreaming: false, duration: thoughtDuration }
+                  : t
+              );
+            }
+ 
+            if (agentBlockIdToCreate !== null && agentContent) {
+              appendBlock({ id: agentBlockIdToCreate, turnId, type: "agent", content: agentContent, streaming: true });
+            } else if (agentBlockIdToAppend !== null && agentContent) {
+              const blockId = agentBlockIdToAppend;
+              taskFlow = taskFlow.map((t) =>
+                t.id === blockId && t.type === "agent"
+                  ? { ...t, content: (t as Extract<TaskBlock, { type: "agent" }>).content + agentContent }
+                  : t
+              );
+            }
+ 
+            return {
+              taskFlow,
+              conversationTurns,
+              currentTurnState: {
+                ...s.currentTurnState,
+                interceptorHandled: s.currentTurnState.interceptorHandled || thoughtStarted,
+                interceptorThought: nextInterceptorThought,
+              },
+            };
+          });
+        }
+      });
+
+
+
       const phaseForProcessText = (text: string) => setCurrentTurnRuntimePhase(
         deriveTurnRuntimePhaseForText(text, phaseLanguage, currentTurnRuntimePhase),
       );
@@ -9081,9 +9132,11 @@ export const useAppStore = create<AppState>()(
           ? phaseLanguage === "zh"
             ? "随后读取最小必要上下文，再执行真实操作或明确说明阻塞。"
             : "Next, read the minimum necessary context, then act or state a concrete blocker."
-          : phaseLanguage === "zh"
-          ? "随后基于上下文给出直接答复。"
-          : "Next, answer directly from the available context.";
+          : effectiveRunIntent === "respond" || effectiveRunIntent === "discuss"
+          ? phaseLanguage === "zh"
+            ? "随后基于上下文给出直接答复。"
+            : "Next, answer directly from the available context."
+          : "";
         return normalizeProgressNarration({
           phase: "understanding",
           title: phaseLanguage === "zh" ? "理解需求" : "Understanding request",
@@ -9147,18 +9200,14 @@ export const useAppStore = create<AppState>()(
           ),
         }));
       };
-      // 纯对话模式（respond）下初始不塞入机械的进度卡片，让对话更自然温暖
-      if (effectiveRunIntent !== "respond") {
+      // 纯对话模式（respond/discuss）下初始不塞入机械的进度卡片，让对话更自然温暖
+      if (effectiveRunIntent !== "respond" && effectiveRunIntent !== "discuss") {
         appendUnderstandingProgress();
       }
 
       // ── Throttled streaming update ────────────────────────────────────
-      // Buffer incoming tokens and flush at a modest cadence. A fixed cadence
-      // keeps scrolling and timers responsive during long reasoning streams.
-      let tokenBuffer = "";
       let streamingAssistantDisplayBuffer = "";
-      let flushTimerHandle: ReturnType<typeof setTimeout> | null = null;
-      const STREAMING_UI_FLUSH_INTERVAL_MS = 90;
+
       let firstStreamTokenAt: number | null = null;
       let streamTokenCount = 0;
       let streamTextChars = 0;
@@ -9228,10 +9277,8 @@ export const useAppStore = create<AppState>()(
         }
       }, 120_000);
 
-      const flushBuffer = () => {
-        const chunk = tokenBuffer;
-        tokenBuffer = "";
-        flushTimerHandle = null;
+      /* const old_unused_flushBuffer = () => {
+        const chunk = "";
 
         if (!chunk) return;
 
@@ -9404,22 +9451,14 @@ export const useAppStore = create<AppState>()(
         });
       };
 
-      const scheduleFlush = () => {
-        if (flushTimerHandle === null) {
-          flushTimerHandle = setTimeout(flushBuffer, STREAMING_UI_FLUSH_INTERVAL_MS);
-        }
-      };
+      const old_scheduleFlush = () => {
+        // no-op
+      }; */
 
       // region: 流式块收尾
       const finalizeStreamingUi = () => {
-        if (flushTimerHandle !== null) {
-          clearTimeout(flushTimerHandle);
-          flushTimerHandle = null;
-        }
+        streamBuffer.flush();
         clearNoFirstTokenNoticeTimer();
-        if (tokenBuffer) {
-          flushBuffer();
-        }
 
         let { agent: remainingAgent } = thinkingInterceptor.flush();
         if (remainingAgent) {
@@ -9846,11 +9885,11 @@ export const useAppStore = create<AppState>()(
             logStoreEvent("stream_reset", {
               turnId,
               currentStreamingBlockId,
-              tokenBufferChars: tokenBuffer.length,
+              tokenBufferChars: 0,
               agentBlocksCreatedThisRun: agentBlockIdsCreatedThisRun.size,
               taskFlowBlocks: sessionGet().taskFlow.length,
             });
-            tokenBuffer = "";
+            streamBuffer.reset();
             firstStreamTokenAt = null;
             streamTokenCount = 0;
             streamTextChars = 0;
@@ -9885,8 +9924,7 @@ export const useAppStore = create<AppState>()(
           }
           streamTokenCount++;
           streamTextChars += token.length;
-          tokenBuffer += token;
-          scheduleFlush();
+          streamBuffer.append(token);
         },
 
         onStreamDone: (_fullText, _msgId, truncated, meta) => {
