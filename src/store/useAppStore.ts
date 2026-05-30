@@ -114,14 +114,11 @@ import {
   buildCloudMessagesApiUrl,
   extractAnthropicResponseText,
   normalizeCloudProtocol,
-  normalizeCloudToolProtocol,
   resolveEffectiveCloudApiFormat,
-  normalizeLocalToolProtocol,
   type CloudToolProtocol,
   type ReasoningDisplayMode,
 } from "../lib/cloudProtocol";
 import {
-  createDefaultCloudConfig,
   normalizeCloudServerState,
   type CloudProfileConfig,
   type CloudServerConfig,
@@ -195,7 +192,6 @@ import {
   loadGameStudioConfig,
   removeGameStudioWorkspaceAssets,
   resolveGameStudioHelpTarget,
-  setGameStudioActiveAgent,
   setGameStudioEngineConfig,
 } from "../lib/gameStudioPack";
 import {
@@ -204,7 +200,6 @@ import {
   parseSetupEngineArgs,
   normalizeStudioAgentKey,
   parseGameStudioSlashCommand,
-  resolveLegacyNexusModeKey,
   type StudioWorkflowCommandSlug,
   type NexusModeKey,
   type PendingSlashCommand,
@@ -249,6 +244,22 @@ import {
 import { PLAN_ARTIFACT_PATHS, hydratePlanArtifactsFromReader } from "../lib/planArtifactHydration";
 import { mapLegacyNexusModeToMainMode, mapMainModeToLegacyNexusMode, type MainModeKey } from "../lib/mainModes";
 import {
+  createConfigSlice,
+  defaultConfig,
+  resolveRuntimeLaneKey,
+  normalizeReasoningDisplay,
+  normalizeLocalConfig,
+  normalizeContextMemoryStateByRuntimeKey,
+  resolveContextMemoryStateForRuntimeLane,
+  PROVIDER_COMPATIBILITY_FORCE_XML_TTL_MS,
+  PROVIDER_COMPATIBILITY_NATIVE_RECOVERY_SUCCESS_STREAK,
+} from "./slices/configSlice";
+import {
+  createWorkspaceSlice,
+  normalizePendingDecisionInputKey,
+  normalizeStoredRightPanelTab,
+} from "./slices/workspaceSlice";
+import {
   buildImageGenerationParams,
   checkImageStudioEngineStatus,
   createDefaultImageStudioRuntime,
@@ -274,7 +285,6 @@ import {
   createFeishuApprovalId,
   createFeishuApprovalNonce,
   createDefaultFeishuAdapterRuntimeStatus,
-  createDefaultImAdaptersConfig,
   normalizeImAdaptersConfig,
   resolveFeishuApprovalAction,
   upsertFeishuPairingRequest,
@@ -287,8 +297,6 @@ import {
   type ImAdaptersConfig,
 } from "../lib/imAdapters";
 import {
-  createDefaultMcpRoutingConfig,
-  createDefaultToolPermissionPolicy,
   isLocalFileReadApproved,
   normalizeLocalFileReadPath,
   normalizeMcpRoutingConfig,
@@ -322,12 +330,7 @@ function nowMs() {
   return typeof performance !== "undefined" ? performance.now() : Date.now();
 }
 
-function normalizePendingDecisionInputKey(input: string): string {
-  return String(input || "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .toLowerCase();
-}
+
 
 type SessionAutoApproveScope = "workspace_write" | "shell" | "local_file_read" | "browser_control";
 
@@ -1446,159 +1449,7 @@ export const MOCK_LOCAL_MODELS: Record<string, string[]> = {
   "OMLX":      ["mlx-community/Qwen2.5-32B-Instruct", "mlx-community/Meta-Llama-3-8B-Instruct", "mlx-community/Phi-3-mini"],
 };
 
-// ── Default Values ────────────────────────────────────────────────────
 
-const defaultCloudState = normalizeCloudServerState({ cloud: createDefaultCloudConfig() });
-
-const defaultConfig: AppConfig = {
-  language: "zh",
-  responseLanguagePolicy: "follow_input_language",
-  theme: "purple",
-  themeMode: "dark",
-  appIconVariant: "dark",
-  workflowMode: "chat",
-  promptLanguageStrategy: "english_core_localized_output",
-  toolPermissionPolicy: createDefaultToolPermissionPolicy(),
-  mcpRouting: createDefaultMcpRoutingConfig(),
-  instructionsEnabled: true,
-  hooksEnabled: true,
-  activeProfile: "local",
-  chatFontSize: 13,
-  sessionRecordingEnabled: true,
-  debugRecordFullTurnProcess: false,
-  reasoningDisplay: "hidden",
-  eventStreamMode: "dual",
-  toolFeedbackFormat: "envelope_v1",
-  local: { provider: "OMLX", endpoint: "http://127.0.0.1:8080/v1", model: "", contextLimit: 16384, apiKey: "", toolProtocol: "auto" },
-  cloud: defaultCloudState.cloud,
-  cloudServers: defaultCloudState.cloudServers,
-  activeCloudServerId: defaultCloudState.activeCloudServerId,
-  cloudExperimentalLoginEnabled: false,
-  imAdapters: createDefaultImAdaptersConfig(),
-  workspace: "",
-  enableCapsule: true,
-};
-
-function normalizeLocalConfig(
-  input?: Partial<LocalConfig> | null,
-  fallback: LocalConfig = defaultConfig.local,
-): LocalConfig {
-  const provider = typeof input?.provider === "string" && input.provider.trim()
-    ? input.provider
-    : fallback.provider;
-  const endpoint = typeof input?.endpoint === "string" ? input.endpoint : fallback.endpoint;
-  const model = typeof input?.model === "string" ? input.model : fallback.model;
-  const contextLimit = typeof input?.contextLimit === "number" && Number.isFinite(input.contextLimit)
-    ? input.contextLimit
-    : fallback.contextLimit;
-  const apiKey = typeof input?.apiKey === "string" ? input.apiKey : fallback.apiKey;
-  const hasStoredToolProtocol = !!input && Object.prototype.hasOwnProperty.call(input, "toolProtocol");
-
-  return {
-    provider,
-    endpoint,
-    model,
-    contextLimit,
-    apiKey,
-    toolProtocol: normalizeLocalToolProtocol(
-      hasStoredToolProtocol ? input?.toolProtocol : undefined,
-      provider,
-    ),
-  };
-}
-
-const PROVIDER_COMPATIBILITY_FORCE_XML_TTL_MS = 12 * 60 * 1000;
-const PROVIDER_COMPATIBILITY_NATIVE_RECOVERY_SUCCESS_STREAK = 2;
-
-function normalizeRuntimeLaneToken(value: unknown): string {
-  const compacted = String(value ?? "")
-    .trim()
-    .toLowerCase()
-    .replace(/[|\s]+/g, "_");
-  return compacted || "-";
-}
-
-function resolveRuntimeLaneKey(config: Partial<AppConfig> | null | undefined): string {
-  const activeProfile = config?.activeProfile === "cloud" ? "cloud" : "local";
-  if (activeProfile === "local") {
-    const localProvider =
-      typeof config?.local?.provider === "string" && config.local.provider.trim()
-        ? config.local.provider
-        : defaultConfig.local.provider;
-    const localModel =
-      typeof config?.local?.model === "string" && config.local.model.trim()
-        ? config.local.model
-        : defaultConfig.local.model;
-    const localToolProtocol = normalizeLocalToolProtocol(config?.local?.toolProtocol, localProvider);
-    return [
-      "profile=local",
-      `provider=${normalizeRuntimeLaneToken(localProvider)}`,
-      `model=${normalizeRuntimeLaneToken(localModel)}`,
-      `tool=${normalizeRuntimeLaneToken(localToolProtocol)}`,
-      "protocol=local",
-      "api_format=chat_completions",
-    ].join("|");
-  }
-
-  const cloudProtocolInput =
-    typeof config?.cloud?.protocol === "string" ? config.cloud.protocol : "openai";
-  const cloudExperimentalLoginEnabled = false;
-  const cloudAuthMode = cloudExperimentalLoginEnabled
-    ? config?.cloud?.auth?.mode ?? "api_key"
-    : "api_key";
-  const cloudApiFormat = resolveEffectiveCloudApiFormat({
-    protocol: cloudProtocolInput,
-    apiFormat:
-      typeof config?.cloud?.apiFormat === "string"
-        ? config.cloud.apiFormat
-        : "chat_completions",
-    authMode: cloudAuthMode,
-  });
-  const cloudProvider =
-    typeof config?.cloud?.provider === "string" && config.cloud.provider.trim()
-      ? config.cloud.provider
-      : defaultConfig.cloud.provider;
-  const cloudModel =
-    typeof config?.cloud?.model === "string" && config.cloud.model.trim()
-      ? config.cloud.model
-      : defaultConfig.cloud.model;
-  const cloudToolProtocol = normalizeCloudToolProtocol(config?.cloud?.toolProtocol);
-  const cloudProtocol = normalizeCloudProtocol(cloudProtocolInput);
-  return [
-    "profile=cloud",
-    `provider=${normalizeRuntimeLaneToken(cloudProvider)}`,
-    `model=${normalizeRuntimeLaneToken(cloudModel)}`,
-    `tool=${normalizeRuntimeLaneToken(cloudToolProtocol)}`,
-    `protocol=${normalizeRuntimeLaneToken(cloudProtocol)}`,
-    `api_format=${normalizeRuntimeLaneToken(cloudApiFormat)}`,
-    `auth=${normalizeRuntimeLaneToken(cloudAuthMode)}`,
-  ].join("|");
-}
-
-function normalizeContextMemoryStateByRuntimeKey(value: unknown): Record<string, ContextMemoryState | null> {
-  if (!value || typeof value !== "object") return {};
-  const normalized: Record<string, ContextMemoryState | null> = {};
-  for (const [rawLaneKey, laneState] of Object.entries(value as Record<string, unknown>)) {
-    const laneKey = String(rawLaneKey || "").trim();
-    if (!laneKey) continue;
-    const normalizedState = normalizeContextMemoryState(laneState);
-    if (normalizedState) normalized[laneKey] = normalizedState;
-  }
-  return normalized;
-}
-
-function resolveContextMemoryStateForRuntimeLane(
-  laneKey: string,
-  laneMap: Record<string, ContextMemoryState | null> | null | undefined,
-  legacyState: ContextMemoryState | null | undefined,
-): ContextMemoryState | null {
-  const normalizedLaneMap = normalizeContextMemoryStateByRuntimeKey(laneMap);
-  const laneState = normalizeContextMemoryState(normalizedLaneMap[laneKey]);
-  if (laneState) return laneState;
-  return Object.keys(normalizedLaneMap).length === 0
-    ? normalizeContextMemoryState(legacyState)
-    : null;
-}
 
 function upsertContextMemoryStateForRuntimeLane(
   laneMap: Record<string, ContextMemoryState | null> | null | undefined,
@@ -1653,11 +1504,7 @@ function normalizeAppIconVariant(value: unknown): AppConfig["appIconVariant"] {
   return value === "light" ? "light" : "dark";
 }
 
-function normalizeReasoningDisplay(value: unknown, fallback: ReasoningDisplayMode = "hidden"): ReasoningDisplayMode {
-  return value === "debug_summary" || value === "raw_debug" || value === "hidden"
-    ? value
-    : fallback;
-}
+
 
 function normalizeMcpServers(servers: unknown): MCPServer[] {
   if (!Array.isArray(servers)) return DEFAULT_MCP_SERVERS;
@@ -1820,9 +1667,7 @@ export function normalizeInterruptedConversationTurnsForRestore(
   });
 }
 
-function normalizeStoredRightPanelTab(value: unknown): RightPanelTab {
-  return value === "diff" || value === "terminal" ? value : "plan";
-}
+
 
 function normalizeStoredPlanExecutionProgressSnapshot(value: unknown): PlanExecutionProgressSnapshot | null {
   const snapshot = value as Partial<PlanExecutionProgressSnapshot> | null | undefined;
@@ -4209,28 +4054,8 @@ function normalizeSkillContent(content: string): string {
 export const useAppStore = create<AppState>()(
   persist(
     (set, get) => ({
-	  // Config
-	  config: defaultConfig,
-	  setConfig: (patch) =>
-	    set((s) => {
-	      const nextConfig = typeof patch === "function" ? patch(s.config) : { ...s.config, ...patch };
-	      const normalizedConfig: AppConfig = {
-	        ...nextConfig,
-	        eventStreamMode: normalizeEventStreamMode(nextConfig.eventStreamMode, s.config.eventStreamMode),
-	        toolFeedbackFormat: normalizeToolFeedbackFormat(nextConfig.toolFeedbackFormat, s.config.toolFeedbackFormat),
-	        reasoningDisplay: normalizeReasoningDisplay(nextConfig.reasoningDisplay, s.config.reasoningDisplay),
-	        local: normalizeLocalConfig(nextConfig.local, s.config.local),
-	      };
-	      const runtimeLaneKey = resolveRuntimeLaneKey(normalizedConfig);
-	      return {
-	        config: normalizedConfig,
-	        contextMemoryState: resolveContextMemoryStateForRuntimeLane(
-	          runtimeLaneKey,
-	          s.contextMemoryStateByRuntimeKey,
-	          s.contextMemoryState,
-	        ),
-	      };
-	    }),
+      // Config Slice
+      ...createConfigSlice(set, get),
 
   // Chat
   messages: [],
@@ -4575,14 +4400,10 @@ export const useAppStore = create<AppState>()(
   setSidebarWidth: (w) => set({ sidebarWidth: Math.max(180, Math.min(450, w)) }),
   showWorkspaceTreePanel: false,
   workspaceTreePanelWidth: 320,
-  workspaceContentVersion: 0,
   setShowWorkspaceTreePanel: (v) => set({ showWorkspaceTreePanel: v }),
   toggleWorkspaceTreePanel: () => set((s) => ({ showWorkspaceTreePanel: !s.showWorkspaceTreePanel })),
   setWorkspaceTreePanelWidth: (w) => set({ workspaceTreePanelWidth: Math.max(220, Math.min(520, w)) }),
-  bumpWorkspaceContentVersion: () =>
-    set((s) => ({
-      workspaceContentVersion: s.workspaceContentVersion + 1,
-    })),
+
 
   // Modals
   isSettingsOpen: false,
@@ -4598,69 +4419,14 @@ export const useAppStore = create<AppState>()(
   setShowFilePicker: (v) => set({ showFilePicker: v }),
   setShowAgentPicker: (v) => set({ showAgentPicker: v }),
 
-  // Composer
-  input: "",
-  preferredResponseLanguage: "zh",
-  contextMentions: [],
-  attachedFiles: [],
-  selectedMainModeKey: "main_mode",
-  selectedNexusModeKey: "nexus_general",
-  activeStudioAgentKey: "studio_auto",
-  gameStudioInitialized: false,
-  pendingSlashCommand: null,
-  lockedComposerIntent: null,
-  pendingRunDecision: null,
-  dismissedPendingDecisionInputKey: null,
-  executionConsentPolicy: "ask_per_turn",
-  imageStudio: createDefaultImageStudioRuntime(),
-  setInput: (v, options) => set((s) => {
-    const currentInputKey = normalizePendingDecisionInputKey(s.input);
-    const nextInputKey = normalizePendingDecisionInputKey(v);
-    return {
-      input: v,
-      ...(v.trim().length === 0 && !options?.preserveLockedComposerIntent ? { lockedComposerIntent: null } : {}),
-      ...(s.dismissedPendingDecisionInputKey && currentInputKey !== nextInputKey
-        ? { dismissedPendingDecisionInputKey: null }
-        : {}),
-    };
-  }),
-  setPreferredResponseLanguage: (lang) => set({ preferredResponseLanguage: lang }),
-  setContextMentions: (v) => set({ contextMentions: v }),
-  addMention: (file) =>
-    set((s) =>
-      s.contextMentions.includes(file) ? {} : { contextMentions: [...s.contextMentions, file], showFilePicker: false }
-    ),
-  removeMention: (file) =>
-    set((s) => ({ contextMentions: s.contextMentions.filter((f) => f !== file) })),
-  setAttachedFiles: (v) => set({ attachedFiles: v.map((file) => normalizeAttachedFile(file)) }),
-  setSelectedMainModeKey: (key) => set((s) => ({
-    selectedMainModeKey: key,
-    selectedNexusModeKey: mapMainModeToLegacyNexusMode(key),
-    lockedComposerIntent: null,
-    rightPanelTab: normalizeStoredRightPanelTab(s.rightPanelTab),
-  })),
-  setSelectedNexusModeKey: (key) => {
-    const resolved = resolveLegacyNexusModeKey(key);
-    const selectedMainModeKey = mapLegacyNexusModeToMainMode(resolved);
-    set({
-      selectedMainModeKey,
-      selectedNexusModeKey: mapMainModeToLegacyNexusMode(selectedMainModeKey),
-    });
-  },
-  setActiveStudioAgentKey: async (key, options) => {
-    const normalized = normalizeStudioAgentKey(key);
-    set({ activeStudioAgentKey: normalized });
-    if (options?.persistToWorkspace && get().gameStudioInitialized) {
-      try {
-        await setGameStudioActiveAgent(normalized);
-      } catch {
-        // Ignore workspace persistence failures here; in-memory state still updates.
-      }
-    }
-  },
-  setGameStudioInitialized: (value) => set({ gameStudioInitialized: value }),
-  setPendingSlashCommand: (command) => set({ pendingSlashCommand: command }),
-  setLockedComposerIntent: (intent) => set({ lockedComposerIntent: intent }),
+      // Workspace Slice
+      ...createWorkspaceSlice(set, get),
+      pendingSlashCommand: null,
+      lockedComposerIntent: null,
+      pendingRunDecision: null,
+      dismissedPendingDecisionInputKey: null,
+      executionConsentPolicy: "ask_per_turn" as ExecutionConsentPolicy,
+      imageStudio: createDefaultImageStudioRuntime(),
   dismissPendingRunDecision: () =>
     set((s) => {
       const dismissedKey =
@@ -9381,7 +9147,10 @@ export const useAppStore = create<AppState>()(
           ),
         }));
       };
-      appendUnderstandingProgress();
+      // 纯对话模式（respond）下初始不塞入机械的进度卡片，让对话更自然温暖
+      if (effectiveRunIntent !== "respond") {
+        appendUnderstandingProgress();
+      }
 
       // ── Throttled streaming update ────────────────────────────────────
       // Buffer incoming tokens and flush at a modest cadence. A fixed cadence
