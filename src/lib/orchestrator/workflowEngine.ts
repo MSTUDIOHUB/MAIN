@@ -814,22 +814,35 @@ export class WorkflowEngine {
                 : t
             );
           } else {
-            const blockId = s._nextTaskId();
-            const blockWithTurn = attachRuntimePhase({
-              id: blockId,
-              turnId,
-              type: "agent",
-              content: visibleText,
-              streaming: false,
-              options: replyOptions,
-            } as TaskBlock);
+            const existingAgentBlock = [...taskFlow]
+              .reverse()
+              .find((block) => block.turnId === turnId && block.type === "agent");
 
-            taskFlow = [...taskFlow, blockWithTurn];
-            conversationTurns = conversationTurns.map((turn: any) =>
-              turn.id === turnId && !turn.blockIds.includes(blockId)
-                ? { ...turn, blockIds: [...turn.blockIds, blockId] }
-                : turn
-            );
+            if (existingAgentBlock) {
+              const blockId = existingAgentBlock.id;
+              taskFlow = taskFlow.map((t: any) =>
+                t.id === blockId && t.type === "agent"
+                  ? { ...t, content: visibleText, streaming: false, options: replyOptions }
+                  : t
+              );
+            } else {
+              const blockId = s._nextTaskId();
+              const blockWithTurn = attachRuntimePhase({
+                id: blockId,
+                turnId,
+                type: "agent",
+                content: visibleText,
+                streaming: false,
+                options: replyOptions,
+              } as TaskBlock);
+
+              taskFlow = [...taskFlow, blockWithTurn];
+              conversationTurns = conversationTurns.map((turn: any) =>
+                turn.id === turnId && !turn.blockIds.includes(blockId)
+                  ? { ...turn, blockIds: [...turn.blockIds, blockId] }
+                  : turn
+              );
+            }
           }
 
           // Complete executing status in turns

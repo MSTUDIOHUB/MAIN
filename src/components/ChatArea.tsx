@@ -3047,6 +3047,7 @@ export default function ChatArea({
     const blocks = entry.blocks;
     const turnIntent = resolveConversationTurnIntent(turn);
     const displayTurnIntent = turn.displayIntent || turnIntent;
+    const isChatIntent = turnIntent === "respond" || turnIntent === "discuss";
     const turnIntentPolicy = getIntentPolicy(displayTurnIntent);
     const turnIntentLabel = turnIntentPolicy.intent === displayTurnIntent
       ? (language === "en" ? turnIntentPolicy.label.en : turnIntentPolicy.label.zh)
@@ -3109,7 +3110,7 @@ export default function ChatArea({
       }
       return false;
     });
-    const shouldRenderLiveProcessTimeline = hasFoldableProcessBlocks;
+    const shouldRenderLiveProcessTimeline = hasFoldableProcessBlocks && !isChatIntent;
     const shouldRenderCompletedProcessArchive = shouldRenderLiveProcessTimeline;
     const shouldArchiveCompletedProcess =
       shouldRenderCompletedProcessArchive &&
@@ -3160,7 +3161,6 @@ export default function ChatArea({
           }
         : null;
     const toolExecutionSummary = buildToolExecutionSummary(blocks, language);
-    const isChatIntent = turnIntent === "respond" || turnIntent === "discuss";
     const effectiveProgressLedger = isChatIntent
       ? []
       : buildRuntimeProgressLedger({
@@ -3219,7 +3219,7 @@ export default function ChatArea({
       turn.status === "awaiting_input";
 
     const intentHistoryExplanations = (() => {
-      if (!isTurnCompletedOrStopped) return [];
+      if (!isTurnCompletedOrStopped || isChatIntent) return [];
 
       const list: string[] = [];
       const seen = new Set<string>();
@@ -3259,7 +3259,7 @@ export default function ChatArea({
 
         // Hide conversational first-person explanations from message flow if completed/stopped,
         // since they are collapsed in the TurnIntentHistoryCard.
-        if (config.enableCapsule !== false && isTurnCompletedOrStopped && item.block?.type === "agent") {
+        if (config.enableCapsule !== false && isTurnCompletedOrStopped && item.block?.type === "agent" && !isChatIntent) {
           const text = getAgentVisibleMarkdownText(item.block);
           if (isConversationalFirstPersonNarration(text)) {
             const hasOptions = item.block.options && item.block.options.length > 0;
@@ -3281,7 +3281,7 @@ export default function ChatArea({
 
         // Hide conversational first-person explanations from message flow if completed/stopped,
         // since they are collapsed in the TurnIntentHistoryCard.
-        if (config.enableCapsule !== false && isTurnCompletedOrStopped && item.block?.type === "agent") {
+        if (config.enableCapsule !== false && isTurnCompletedOrStopped && item.block?.type === "agent" && !isChatIntent) {
           const text = getAgentVisibleMarkdownText(item.block);
           if (isConversationalFirstPersonNarration(text)) {
             const hasOptions = item.block.options && item.block.options.length > 0;
@@ -3569,7 +3569,7 @@ export default function ChatArea({
                   )}
                   {finalVisibleAgentBlock && (() => {
                     const text = getAgentVisibleMarkdownText(finalVisibleAgentBlock);
-                    if (isTurnCompletedOrStopped && isConversationalFirstPersonNarration(text)) {
+                    if (isTurnCompletedOrStopped && isConversationalFirstPersonNarration(text) && !isChatIntent) {
                       const hasOptions = finalVisibleAgentBlock.options && finalVisibleAgentBlock.options.length > 0;
                       if (!hasOptions) {
                         return null;
