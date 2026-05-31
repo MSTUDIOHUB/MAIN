@@ -24,6 +24,7 @@ clean_xattrs \
   "$ROOT_DIR/src-tauri/icons"
 
 npm run icon:app
+cargo clean -p tauri-app --manifest-path "$ROOT_DIR/src-tauri/Cargo.toml"
 npm run tauri build -- --bundles app --no-sign
 
 BUNDLE_EXECUTABLE_NAME="$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP_PATH/Contents/Info.plist")"

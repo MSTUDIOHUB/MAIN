@@ -514,6 +514,7 @@ async function buildMacAssets({ rootDir, version, assetsDir, skipBuild }) {
 
   if (!skipBuild) {
     ensureRustTargets(rootDir, ["aarch64-apple-darwin", "x86_64-apple-darwin"]);
+    run("cargo", ["clean", "-p", "tauri-app", "--manifest-path", path.join(rootDir, "src-tauri", "Cargo.toml")], { cwd: rootDir });
     run(npmCommand(), ["run", "icon:app"], { cwd: rootDir });
     buildMacTarget(rootDir, "universal-apple-darwin");
     buildMacTarget(rootDir, "aarch64-apple-darwin");
@@ -632,6 +633,7 @@ async function findLatestNsisInstaller(rootDir) {
 async function buildWindowsAssets({ rootDir, version, assetsDir, skipBuild }) {
   if (!skipBuild) {
     run("rustup", ["target", "add", WINDOWS_X64_TARGET], { cwd: rootDir });
+    run("cargo", ["clean", "-p", "tauri-app", "--manifest-path", path.join(rootDir, "src-tauri", "Cargo.toml")], { cwd: rootDir });
     run(
       "powershell",
       [

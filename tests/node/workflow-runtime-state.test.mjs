@@ -1,0 +1,35 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import fsSync from "node:fs";
+import path from "node:path";
+
+const workspaceRoot = process.cwd();
+
+test("assistant progress before tool calls keeps the run active", () => {
+  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"), "utf8");
+
+  assert.match(source, /const hasToolCalls = meta\?\.hasToolCalls === true;/);
+  assert.match(
+    source,
+    /if \(hasToolCalls\) \{\s*return \{\s*taskFlow,\s*conversationTurns,\s*agentStatus: s\.agentStatus === "pending_review" \? "pending_review" : "running",\s*isGenerating: true,\s*\};\s*\}/s,
+  );
+  assert.doesNotMatch(
+    source,
+    /if \(hasToolCalls\)[\s\S]{0,240}abortController: null/,
+    "tool-call progress must not clear the abort controller",
+  );
+  assert.match(
+    source,
+    /if \(hasToolCalls\) \{\s*nextStreamingBlockId = null;\s*\}/,
+    "tool-call progress should close the current assistant block so the final answer starts cleanly",
+  );
+});
+
+test("tool execution reasserts running state for stop button and timer", () => {
+  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"), "utf8");
+
+  assert.match(
+    source,
+    /onToolExecuting:[\s\S]*?sessionSet\(\(s: any\) => \(\{\s*agentStatus: s\.agentStatus === "pending_review" \? "pending_review" : "running",\s*isGenerating: true,\s*\}\)\);[\s\S]*?appendTurnBlock\(/,
+  );
+});

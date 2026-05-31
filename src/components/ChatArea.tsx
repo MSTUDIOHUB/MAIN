@@ -104,6 +104,7 @@ function resolveTurnProcessFontSize(chatFontSize: number): number {
 
 const TURN_PROCESS_FONT_REFERENCE_SIZE = 13;
 const TURN_PROCESS_FONT_STEPS = [9, 10, 10.5, 11, 12, 12.5, 13] as const;
+const EMPTY_CHAT_BLOCKS: any[] = [];
 
 function getTurnProcessFontStyle(fontSize: number): React.CSSProperties {
   const style = {
@@ -2499,7 +2500,7 @@ export default function ChatArea({
     if (!topIslandTurn) return null;
     return groupedTurns.find((entry) => entry.turn?.id === topIslandTurn.id) || null;
   }, [groupedTurns, topIslandTurn]);
-  const topIslandTurnBlocks = topIslandTurnEntry?.blocks || [];
+  const topIslandTurnBlocks = topIslandTurnEntry?.blocks || EMPTY_CHAT_BLOCKS;
   const pinnedPlanTurn = pinnedTurn && isPlanConversationTurn(pinnedTurn)
     ? pinnedTurn
     : null;
@@ -2529,7 +2530,9 @@ export default function ChatArea({
   }, [language, topIslandTurn, topIslandTurnBlocks]);
   const composerPaddingBottom = composerHeight + 32;
   const capsuleTurn = topIslandTurn || activeTurn;
-  const capsuleTurnBlocks = capsuleTurn ? blocksByTurnId.byTurnId.get(capsuleTurn.id) || [] : [];
+  const capsuleTurnBlocks = capsuleTurn
+    ? blocksByTurnId.byTurnId.get(capsuleTurn.id) || EMPTY_CHAT_BLOCKS
+    : EMPTY_CHAT_BLOCKS;
   const capsuleIsRunActive =
     !!capsuleTurn &&
     (
@@ -2587,21 +2590,37 @@ export default function ChatArea({
 
   useEffect(() => {
     if (!capsuleTurn) {
-      setActiveTurnExplanation({ text: "", blockId: null });
       activeTurnExplanationRef.current = null;
+      setActiveTurnExplanation((current) => (
+        current.text || current.blockId !== null
+          ? { text: "", blockId: null }
+          : current
+      ));
       return;
     }
     const turnChanged = capsuleTurn.id !== activeTurnExplanationRef.current;
     if (turnChanged) {
       activeTurnExplanationRef.current = capsuleTurn.id;
-      setActiveTurnExplanation({ text: "", blockId: null }); // 轮次变更时彻底重置
+      setActiveTurnExplanation((current) => (
+        current.text || current.blockId !== null
+          ? { text: "", blockId: null }
+          : current
+      )); // 轮次变更时彻底重置
     }
     if (explanationInfo.text) {
-      setActiveTurnExplanation({ text: explanationInfo.text, blockId: explanationInfo.blockId }); // 仅在有新的非空模型说明时更新
+      setActiveTurnExplanation((current) => (
+        current.text !== explanationInfo.text || current.blockId !== explanationInfo.blockId
+          ? { text: explanationInfo.text, blockId: explanationInfo.blockId }
+          : current
+      )); // 仅在有新的非空模型说明时更新
     } else if (explanationInfo.blockId && activeTurnExplanation.blockId === explanationInfo.blockId) {
       // 如果当前最新 agent 块的 ID 与缓存的块 ID 相同，但其 text 为空（即它不再通过 first-person 校验，例如长回答、列表、代码块等），
       // 则清除缓存，防止显示已截断或不合规的中间内容，并让 capsule 优雅回退到动态工具/心流状态。
-      setActiveTurnExplanation({ text: "", blockId: explanationInfo.blockId });
+      setActiveTurnExplanation((current) => (
+        current.text || current.blockId !== explanationInfo.blockId
+          ? { text: "", blockId: explanationInfo.blockId }
+          : current
+      ));
     }
   }, [explanationInfo, capsuleTurn, activeTurnExplanation.blockId]);
 

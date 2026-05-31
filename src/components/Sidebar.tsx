@@ -192,7 +192,8 @@ export default function Sidebar({
   const [generatingCommitMessage, setGeneratingCommitMessage] = useState(false);
   const [gitMenuCachedTime, setGitMenuCachedTime] = useState<number | null>(null);
   const openGitDiffPreview = useAppStore((s) => s.openGitDiffPreview);
-  const activeWorkspace = selectedWorkspace || currentWorkspace;
+  const workspaceExpansionTarget = currentWorkspace || selectedWorkspace;
+  const activeWorkspace = currentWorkspace;
 
   const workspaceEntries = useMemo(() => {
     const seen = new Set<string>();
@@ -229,11 +230,11 @@ export default function Sidebar({
   }, []);
 
   useEffect(() => {
-    if (!activeWorkspace) return;
+    if (!workspaceExpansionTarget) return;
     setExpandedWorkspaces((prev) => (
-      activeWorkspace in prev ? prev : { ...prev, [activeWorkspace]: true }
+      workspaceExpansionTarget in prev ? prev : { ...prev, [workspaceExpansionTarget]: true }
     ));
-  }, [activeWorkspace]);
+  }, [workspaceExpansionTarget]);
 
   useEffect(() => {
     const paths = workspacePathsKey.split("\n").filter(Boolean);
@@ -831,7 +832,10 @@ export default function Sidebar({
                           className="flex min-w-0 flex-1 items-center gap-2 text-left"
                           title={workspacePath}
                         >
-                          <IconFolder className={`h-4 w-4 shrink-0 ${isActiveWorkspace ? "theme-text" : "text-[#71717a]"}`} />
+                          <IconFolder
+                            data-testid="sidebar-workspace-icon"
+                            className={`h-4 w-4 shrink-0 ${isActiveWorkspace ? "theme-text" : "text-[#71717a]"}`}
+                          />
                           <span className="sidebar-label truncate text-[13px] font-medium text-[#e4e4e7]">
                             {workspaceName}
                           </span>
@@ -914,6 +918,7 @@ export default function Sidebar({
             <div className="max-h-52 overflow-y-auto pr-1">
               <div className="space-y-0.5">
                 <button
+                  data-testid="sidebar-global-chat-row"
                   onClick={() => {
                     onOpenGlobalChat?.();
                     setChatExpanded((value) => (currentWorkspace ? true : !value));
@@ -927,7 +932,10 @@ export default function Sidebar({
                   ) : (
                     <IconChevronRight className="h-3.5 w-3.5 shrink-0 text-[#71717a]" />
                   )}
-                  <IconChat className={`h-4 w-4 shrink-0 ${!currentWorkspace ? "theme-text" : "text-[#71717a]"}`} />
+                  <IconChat
+                    data-testid="sidebar-global-chat-icon"
+                    className={`h-4 w-4 shrink-0 ${!currentWorkspace ? "theme-text" : "text-[#71717a]"}`}
+                  />
                   <span className="sidebar-label truncate text-[13px] font-medium text-[#e4e4e7]">
                     {chatLabel}
                   </span>

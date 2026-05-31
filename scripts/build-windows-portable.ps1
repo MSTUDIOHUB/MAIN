@@ -28,6 +28,7 @@ if (!$SkipIcon) {
   npm run icon:app
 }
 
+cargo clean -p tauri-app --manifest-path "$rootDir\src-tauri\Cargo.toml"
 npm run tauri build -- --target $Target --no-bundle
 
 if (!(Test-Path $sourceExe)) {

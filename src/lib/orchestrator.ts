@@ -342,6 +342,10 @@ import {
   normalizeTurnInputContextSignals,
   type TurnInputContextSignals,
 } from "./turnIntake";
+import {
+  buildRequiredWebResearchQuery,
+  shouldRequireWebResearchForPrompt,
+} from "./webResearchGuard";
 
 // ── Spec file auto-approval helpers ────────────────────────────────
 
@@ -6940,6 +6944,7 @@ export async function executeAgentLoop(
       : normalizedVisibleTextForUser;
     const finalReplyOptions = planReplyOptionsRoutedToArtifact ? [] : rawFinalReplyOptions;
     let recoveredPseudoToolCall = false;
+    let injectedRequiredWebResearchCall = false;
     const pseudoToolNameCandidate =
       effectiveToolCalls.length === 0 &&
       finalReplyOptions.length === 0 &&
@@ -6981,6 +6986,38 @@ export async function executeAgentLoop(
           turnIntent,
         });
       }
+    }
+    const shouldInjectRequiredWebResearchCall =
+      webSearchEnabled &&
+      workflowMode === "chat" &&
+      runtimeIntent === "respond" &&
+      effectiveToolCalls.length === 0 &&
+      finalReplyOptions.length === 0 &&
+      availableToolNames.has("web_search") &&
+      shouldRequireWebResearchForPrompt(latestUserPromptText) &&
+      !recentToolActivity.some((activity) => WEB_RESEARCH_TOOL_NAMES.has(activity.name || ""));
+    if (shouldInjectRequiredWebResearchCall) {
+      injectedRequiredWebResearchCall = true;
+      const query = buildRequiredWebResearchQuery(latestUserPromptText);
+      effectiveToolCalls = [{
+        id: `call_${generateId()}`,
+        name: "web_search",
+        arguments: JSON.stringify({
+          query,
+          provider: callbacks.getWebSearchProvider?.() || "duckduckgo",
+          max_results: 5,
+        }),
+      }];
+      callbacks.onStreamToken("__ESCALATION_RESET__:", assistantMsgId);
+      logAgentEvent("web_research_required_tool_injected", {
+        iteration,
+        workflowMode,
+        turnIntent,
+        runtimeIntent,
+        query: truncateForLog(query, 180),
+        provider: callbacks.getWebSearchProvider?.() || "duckduckgo",
+        visibleChars: finalVisibleText.length,
+      });
     }
     if (suppressReadOnlyPermissionOptionsForToolCalls) {
       logAgentEvent("readonly_permission_options_ignored_for_tool_call", {
@@ -7291,6 +7328,9 @@ export async function executeAgentLoop(
     }
 
     let visibleAssistantText = userVisibleText;
+    if (injectedRequiredWebResearchCall) {
+      visibleAssistantText = "";
+    }
     if (languageMismatchDecision.action === "hide_text_continue") {
       callbacks.onStreamToken("__ESCALATION_RESET__:", assistantMsgId);
       visibleAssistantText = "";

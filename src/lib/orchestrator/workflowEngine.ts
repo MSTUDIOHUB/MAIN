@@ -735,6 +735,7 @@ export class WorkflowEngine {
       },
 
       onAssistantFinalText: (text: any, replyOptions: any[] = [], meta: any) => {
+        const hasToolCalls = meta?.hasToolCalls === true;
         const language = sessionGet().config.language === "en" ? "en" : "zh";
         const fallbackText = replyOptions.length > 0
           ? language === "en"
@@ -749,8 +750,9 @@ export class WorkflowEngine {
           language,
         });
 
-        // Resolve Feishu adaptive card sending
-        if (remoteFeishu) {
+        // Resolve Feishu adaptive card sending. Text emitted before a tool call is
+        // progress, not completion, so remote replies wait for the final answer.
+        if (remoteFeishu && !hasToolCalls) {
           const cardTitle = sessionGet().config.language === "en" ? "Task Complete" : "任务处理完成";
           const displaySummary = pickProcessAssistantText(
             text,
@@ -806,8 +808,11 @@ export class WorkflowEngine {
         sessionSet((s: any) => {
           let taskFlow = s.taskFlow;
           let conversationTurns = s.conversationTurns;
+          let nextStreamingBlockId = context.currentStreamingBlockId;
 
-          // Merge final answer block
+          // Merge answer/progress block. When this text precedes tool calls, close
+          // the visible block but keep the overall run active for tool execution
+          // and the next model iteration.
           if (context.currentStreamingBlockId !== null) {
             const blockId = context.currentStreamingBlockId;
             taskFlow = taskFlow.map((t: any) =>
@@ -815,6 +820,9 @@ export class WorkflowEngine {
                 ? { ...t, content: visibleText, streaming: false, options: replyOptions }
                 : t
             );
+            if (hasToolCalls) {
+              nextStreamingBlockId = null;
+            }
           } else {
             const existingAgentBlock = [...taskFlow]
               .reverse()
@@ -847,21 +855,37 @@ export class WorkflowEngine {
             }
           }
 
-          // Complete executing status in turns
+          context.currentStreamingBlockId = nextStreamingBlockId;
+
           conversationTurns = conversationTurns.map((turn: any) =>
             turn.id === turnId
-              ? {
-                  ...turn,
-                  status: turn.status === "awaiting_approval" || turn.status === "done" ? turn.status : "done",
-                  summary: normalizedFinal,
-                }
+              ? hasToolCalls
+                ? {
+                    ...turn,
+                    status: turn.status === "awaiting_approval" ? turn.status : "executing",
+                    summary: normalizedFinal || turn.summary,
+                  }
+                : {
+                    ...turn,
+                    status: turn.status === "awaiting_approval" || turn.status === "done" ? turn.status : "done",
+                    summary: normalizedFinal,
+                  }
               : turn
           );
+
+          if (hasToolCalls) {
+            return {
+              taskFlow,
+              conversationTurns,
+              agentStatus: s.agentStatus === "pending_review" ? "pending_review" : "running",
+              isGenerating: true,
+            };
+          }
 
           return {
             taskFlow,
             conversationTurns,
-            agentStatus: s.agentStatus === "pending_review" ? "pending_review" : "done",
+            agentStatus: s.agentStatus === "pending_review" ? "pending_review" : "idle",
             isGenerating: false,
             abortController: null,
           };
@@ -909,6 +933,10 @@ export class WorkflowEngine {
         }
 
         const blockId = sessionGet()._nextTaskId();
+        sessionSet((s: any) => ({
+          agentStatus: s.agentStatus === "pending_review" ? "pending_review" : "running",
+          isGenerating: true,
+        }));
         appendTurnBlock({
           id: blockId,
           turnId,

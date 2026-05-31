@@ -654,7 +654,7 @@ export function buildSystemPrompt(
     chatInstructions.push("不要为了这种只读降级向用户申请批准；如果某个只读工具不兼容，就直接换另一条只读路径继续。");
     chatInstructions.push("只读读取、搜索、查看、查询、分析本身不需要逐步征求用户同意；除非存在业务口径冲突或真实分叉，否则不要问“是否同意我读取下一个文件”。");
     if (isToolNameAvailable("web_search", availableToolNames) || isToolNameAvailable("web_fetch", availableToolNames)) {
-      chatInstructions.push("网络搜索已开启：遇到最新信息、网页/GitHub 链接、外部文档或需要验证的实时事实，优先使用 `web_search` / `web_fetch`；最终结论必须带来源 URL。不要把模型记忆伪装成联网结果。");
+      chatInstructions.push("网络搜索已开启：遇到最新信息、网页/GitHub 链接、外部文档、版本/发布断言或需要验证的实时事实，优先使用 `web_search` / `web_fetch`；最终结论必须带来源 URL。不要把模型记忆伪装成联网结果，也不要在未联网取证时直接否定用户看到的最新版本/发布信息。");
     }
     chatInstructions.push("如果 `analyze_tabular_document`、`query_tabular_document`、`read_document` 中某个只读工具失败，不要停下来征求用户是否允许降级；应在同一轮自动改用其他只读工具继续。");
     chatInstructions.push("推荐回退顺序：`analyze_tabular_document` 全表概览 → `query_tabular_document` 结构化筛选/聚合 → `read_document` 原始行窗口/分页读取；可按问题类型调整，但必须继续推进。");
@@ -712,7 +712,7 @@ export function buildSystemPrompt(
       availableToolNames,
     ));
     if (isToolNameAvailable("web_search", availableToolNames) || isToolNameAvailable("web_fetch", availableToolNames)) {
-      tfl.push("网络搜索已开启：涉及最新信息、外部网页/文档、GitHub URL、第三方 API 文档或必须验证的公开事实时，优先用 `web_search` / `web_fetch` 获取证据；最终结论必须包含来源 URL。不要把模型记忆当作联网结果。");
+      tfl.push("网络搜索已开启：涉及最新信息、外部网页/文档、GitHub URL、版本/发布断言、第三方 API 文档或必须验证的公开事实时，优先用 `web_search` / `web_fetch` 获取证据；最终结论必须包含来源 URL。不要把模型记忆当作联网结果，也不要在未联网取证时直接否定用户看到的最新版本/发布信息。");
     }
     if (turnIntent === "plan") {
       tfl.push("当前是未批准的计划回合时，优先使用只读证据工具；证据足够后用 `write_file` 或 `replace_in_file` 创建/更新 `.MAIN/plans/plan.md`。批准前唯一允许的写入是 `.MAIN/plans/plan.md`，必要时可写 `.MAIN/plans/design.md`，不要修改源码或生成 `tasks.md`。");

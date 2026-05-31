@@ -146,33 +146,41 @@ async function findMatchesInDirectory(directoryPath, regex) {
 
 export async function collectPublicReleaseArtifacts({ rootDir, version, appName = APP_NAME }) {
   const escapedVersion = escapeRegex(version);
+  const POSSIBLE_TARGETS = [
+    "release",
+    "x86_64-pc-windows-msvc/release",
+    "universal-apple-darwin/release",
+    "aarch64-apple-darwin/release",
+    "x86_64-apple-darwin/release",
+  ];
+
   const specs = [
     {
       id: "mac-share-zip",
       label: "macOS unsigned share zip",
-      exactPath: path.join(rootDir, "src-tauri", "target", "release", "bundle", "macos", `${appName}-${version}-macOS-unsigned-share.zip`),
+      relativeExactPath: path.join("bundle", "macos", `${appName}-${version}-macOS-unsigned-share.zip`),
     },
     {
       id: "mac-dmg",
       label: "macOS dmg",
-      directoryPath: path.join(rootDir, "src-tauri", "target", "release", "bundle", "dmg"),
+      relativeDirectoryPath: path.join("bundle", "dmg"),
       regex: new RegExp(`^${escapeRegex(appName)}_${escapedVersion}_.+\\.dmg$`, "i"),
     },
     {
       id: "windows-portable",
       label: "Windows portable exe",
-      exactPath: path.join(rootDir, "src-tauri", "target", "release", "portable", `${appName}-${version}-windows-portable.exe`),
+      relativeExactPath: path.join("portable", `${appName}-${version}-windows-portable.exe`),
     },
     {
       id: "windows-nsis",
       label: "Windows NSIS installer",
-      directoryPath: path.join(rootDir, "src-tauri", "target", "release", "bundle", "nsis"),
+      relativeDirectoryPath: path.join("bundle", "nsis"),
       regex: new RegExp(`^${escapeRegex(appName)}_${escapedVersion}_.+\\.exe$`, "i"),
     },
     {
       id: "windows-msi",
       label: "Windows MSI installer",
-      directoryPath: path.join(rootDir, "src-tauri", "target", "release", "bundle", "msi"),
+      relativeDirectoryPath: path.join("bundle", "msi"),
       regex: new RegExp(`^${escapeRegex(appName)}_${escapedVersion}_.+\\.msi$`, "i"),
     },
   ];
@@ -180,26 +188,58 @@ export async function collectPublicReleaseArtifacts({ rootDir, version, appName 
   const artifacts = [];
 
   for (const spec of specs) {
-    if (spec.exactPath && (await pathExists(spec.exactPath))) {
-      artifacts.push({
-        id: spec.id,
-        label: spec.label,
-        sourcePath: spec.exactPath,
-        fileName: path.basename(spec.exactPath),
-      });
-      continue;
-    }
-
-    if (spec.directoryPath && spec.regex) {
-      const matches = await findMatchesInDirectory(spec.directoryPath, spec.regex);
-      matches.forEach((matchPath) => {
+    if (spec.relativeExactPath) {
+      const candidates = [];
+      for (const target of POSSIBLE_TARGETS) {
+        const fullPath = path.join(rootDir, "src-tauri", "target", target, spec.relativeExactPath);
+        if (await pathExists(fullPath)) {
+          const stat = await fs.stat(fullPath);
+          candidates.push({ fullPath, mtimeMs: stat.mtimeMs });
+        }
+      }
+      if (candidates.length > 0) {
+        candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
         artifacts.push({
           id: spec.id,
           label: spec.label,
-          sourcePath: matchPath,
-          fileName: path.basename(matchPath),
+          sourcePath: candidates[0].fullPath,
+          fileName: path.basename(candidates[0].fullPath),
         });
-      });
+      }
+      continue;
+    }
+
+    if (spec.relativeDirectoryPath && spec.regex) {
+      const basenameToArtifact = new Map();
+      for (const target of POSSIBLE_TARGETS) {
+        const dirPath = path.join(rootDir, "src-tauri", "target", target, spec.relativeDirectoryPath);
+        if (!(await pathExists(dirPath))) {
+          continue;
+        }
+        const matches = await findMatchesInDirectory(dirPath, spec.regex);
+        for (const matchPath of matches) {
+          const fileName = path.basename(matchPath);
+          const stat = await fs.stat(matchPath);
+          const existing = basenameToArtifact.get(fileName);
+          if (!existing || stat.mtimeMs > existing.mtimeMs) {
+            basenameToArtifact.set(fileName, {
+              id: spec.id,
+              label: spec.label,
+              sourcePath: matchPath,
+              fileName,
+              mtimeMs: stat.mtimeMs,
+            });
+          }
+        }
+      }
+      for (const artifact of basenameToArtifact.values()) {
+        artifacts.push({
+          id: artifact.id,
+          label: artifact.label,
+          sourcePath: artifact.sourcePath,
+          fileName: artifact.fileName,
+        });
+      }
     }
   }
 
