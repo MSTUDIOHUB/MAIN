@@ -115,6 +115,21 @@ test("repo_map and apply_patch schemas are exposed for built-in code intelligenc
   assert.match(applyPatch.function.description, /Codex/);
 });
 
+test("web search schemas expose free external read tools", () => {
+  const tools = buildToolDefinitions([]);
+  const webSearch = tools.find((tool) => tool.function.name === "web_search");
+  const webFetch = tools.find((tool) => tool.function.name === "web_fetch");
+
+  assert.ok(webSearch);
+  assert.ok(webFetch);
+  assert.deepEqual(webSearch.function.parameters.required, ["query"]);
+  assert.ok(webSearch.function.parameters.properties.provider);
+  assert.ok(webSearch.function.parameters.properties.max_results);
+  assert.deepEqual(webFetch.function.parameters.required, ["url"]);
+  assert.ok(webFetch.function.parameters.properties.max_chars);
+  assert.match(webFetch.function.description, /GitHub/);
+});
+
 test("pty observation schemas expose wait controls", () => {
   const tools = buildToolDefinitions([]);
   const readSince = tools.find((tool) => tool.function.name === "read_pty_since");

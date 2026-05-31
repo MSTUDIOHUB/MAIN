@@ -532,6 +532,36 @@ export interface ImageStudioStreamDonePayload {
   error?: string | null;
 }
 
+export type WebSearchProvider = "duckduckgo" | "bing" | "baidu";
+
+export interface WebSearchResultItem {
+  title: string;
+  url: string;
+  snippet: string;
+  source: string;
+}
+
+export interface WebSearchResponse {
+  query: string;
+  provider: string;
+  results: WebSearchResultItem[];
+  truncated: boolean;
+  sourceUrl: string;
+  fallbackProvider?: string;
+  fallbackReason?: string;
+}
+
+export interface WebFetchResponse {
+  url: string;
+  finalUrl: string;
+  title: string;
+  content: string;
+  contentType: string;
+  charCount: number;
+  truncated: boolean;
+  source: string;
+}
+
 // endregion
 
 // region: 文件与搜索命令
@@ -556,6 +586,18 @@ export function readFileWindow(
     maxLines,
     maxChars,
   });
+}
+
+export function webSearch(
+  query: string,
+  provider?: WebSearchProvider | string,
+  maxResults?: number,
+): Promise<WebSearchResponse> {
+  return invoke<WebSearchResponse>("web_search", { query, provider, maxResults });
+}
+
+export function webFetch(url: string, maxChars?: number): Promise<WebFetchResponse> {
+  return invoke<WebFetchResponse>("web_fetch", { url, maxChars });
 }
 
 export function getFileMetadata(path: string, workspace?: string): Promise<FileMetadata> {

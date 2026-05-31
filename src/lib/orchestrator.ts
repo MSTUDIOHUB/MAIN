@@ -354,6 +354,8 @@ const PLAN_EXPLORATION_READ_ONLY_TOOLS = new Set([
   "list_directory",
   "glob_search",
   "grep_search",
+  "web_search",
+  "web_fetch",
   "repo_map_status",
   "repo_map_search",
   "repo_map_context",
@@ -370,6 +372,7 @@ const PLAN_EXPLORATION_READ_ONLY_TOOLS = new Set([
   "read_pty_since",
   "get_pty_status",
 ]);
+const WEB_RESEARCH_TOOL_NAMES = new Set(["web_search", "web_fetch"]);
 const EXECUTION_VERIFICATION_TOOL_NAMES = new Set([
   "run_command",
   "browser_evaluate",
@@ -1116,6 +1119,8 @@ export interface OrchestratorCallbacks {
   getWorkspaceTree: () => string;
   getMcpServers: () => MCPServer[];
   getMcpDiscoveredTools: () => MCPTool[];
+  getWebSearchEnabled?: () => boolean;
+  getWebSearchProvider?: () => string;
   getAssociatedPaths: () => string[];
   getSessionKey: () => string;
   getCurrentTurnId?: () => string | null;
@@ -1394,6 +1399,8 @@ function getToolTarget(name: string, args: Record<string, unknown>): string {
     case "index_workspace_documents": return (args.path as string) || ".";
     case "glob_search":     return (args.pattern as string) || "";
     case "grep_search":     return (args.query as string) || "";
+    case "web_search":      return (args.query as string) || "web search";
+    case "web_fetch":       return (args.url as string) || "";
     case "repo_map_search": return (args.query as string) || "";
     case "repo_map_context": return (args.task as string) || "repo map context";
     case "repo_map_files": return (args.filter as string) || "repo map files";
@@ -3260,13 +3267,20 @@ async function executeToolCallWithLifecycle(
       }));
     }
   }
-  const resolvedArgs =
+  const baseResolvedArgs =
     tc.name === "read_file" && typeof compatArgs.path === "string"
       ? {
           ...compatArgs,
           path: resolveProtocolPackageReadPath(compatArgs.path, callbacks.getSkills(), workspace),
         }
       : compatArgs;
+  const resolvedArgs =
+    tc.name === "web_search" && typeof baseResolvedArgs.provider !== "string"
+      ? {
+          ...baseResolvedArgs,
+          provider: callbacks.getWebSearchProvider?.() || "duckduckgo",
+        }
+      : baseResolvedArgs;
   const target = getToolTarget(tc.name, resolvedArgs);
 
   if (preHookResult.blocked) {
@@ -4429,7 +4443,10 @@ export async function executeAgentLoop(
   logAgentEvent("mcp_routing", { ...mcpRoutingResult.telemetry });
 
   // Build intent-scoped tool definitions: built-ins + active skills + routed MCP tools.
-  const routedToolDefinitions = buildToolDefinitions(skills, mcpTools);
+  const webSearchEnabled = callbacks.getWebSearchEnabled?.() === true;
+  const routedToolDefinitions = buildToolDefinitions(skills, mcpTools).filter((tool) =>
+    webSearchEnabled || !WEB_RESEARCH_TOOL_NAMES.has(tool.function.name)
+  );
   const toolCapabilityRegistry = buildToolCapabilityRegistry({
     toolDefinitions: routedToolDefinitions,
     skills,

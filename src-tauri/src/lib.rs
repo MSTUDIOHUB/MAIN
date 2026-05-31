@@ -38,6 +38,7 @@ pub mod memory;
 pub mod planner;
 pub mod runtime;
 pub mod task_graph;
+pub mod web_search;
 
 // region: 全局常量与状态
 
@@ -9737,6 +9738,8 @@ pub fn run() {
             export_text_file,
             glob_search,
             grep_search,
+            web_search::web_search,
+            web_search::web_fetch,
             spawn_pty,
             resize_pty,
             write_pty,

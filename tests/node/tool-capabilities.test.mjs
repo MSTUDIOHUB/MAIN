@@ -89,6 +89,8 @@ test("built-in tool risks separate read, write, shell, and destructive operation
   assert.equal(classifyBuiltInTool("write_file"), "workspace_write");
   assert.equal(classifyBuiltInTool("apply_patch"), "workspace_write");
   assert.equal(classifyBuiltInTool("repo_map_search"), "read_only");
+  assert.equal(classifyBuiltInTool("web_search"), "external_read");
+  assert.equal(classifyBuiltInTool("web_fetch"), "external_read");
   assert.equal(classifyBuiltInTool("run_command"), "shell");
   assert.equal(classifyBuiltInTool("browser_evaluate"), "browser_control");
   assert.equal(classifyBuiltInTool("delete_workspace_path"), "destructive");
@@ -229,6 +231,8 @@ test("permission policy auto-executes only safe read classes by default", () => 
 
   assert.equal(isToolAutoExecutableForCall("read_file", {}, registry), true);
   assert.equal(isToolAutoExecutableForCall("web_search", {}, registry), true);
+  assert.equal(registry.tools.web_search.risk, "external_read");
+  assert.equal(registry.tools.web_search.category, "research");
   assert.equal(isToolAutoExecutableForCall("write_file", {}, registry), false);
   assert.equal(isToolAutoExecutableForCall("browser_click", {}, registry), false);
 });

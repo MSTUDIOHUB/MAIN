@@ -715,6 +715,12 @@ export interface ActiveGuidance {
   consumedAt?: number | null;
 }
 
+export type WebSearchProvider = "duckduckgo" | "bing" | "baidu";
+
+function normalizeWebSearchProvider(value: unknown): WebSearchProvider {
+  return value === "bing" || value === "baidu" ? value : "duckduckgo";
+}
+
 export interface SessionRuntimeSnapshot {
   runtimeEventSchemaVersion?: number;
   runtimeEvents?: MainThreadEvent[];
@@ -752,6 +758,8 @@ export interface SessionRuntimeSnapshot {
   transcriptTotalTurns?: number;
   autoApproveTools?: boolean;
   autoApproveToolScopes?: SessionAutoApproveScope[];
+  webSearchEnabled?: boolean;
+  webSearchProvider?: WebSearchProvider;
   approvedShellPermissionRules?: string[];
   queuedUserMessage?: QueuedUserMessage | null;
   activeGuidance?: ActiveGuidance | null;
@@ -768,6 +776,8 @@ export interface SessionRuntimeState extends SessionRuntimeSnapshot {
     | ((choice: "approve_once" | "approve_thread" | "cancel") => void)
     | null;
   autoApproveTools: boolean;
+  webSearchEnabled: boolean;
+  webSearchProvider: WebSearchProvider;
   currentTurnExecutionConsent: { turnId: string | null; granted: boolean };
   approvedLocalFileReadPaths: string[];
   approvedShellPermissionRules: string[];
@@ -1267,6 +1277,8 @@ export interface AppState {
   } | null;
   autoApproveTools: boolean;
   autoApproveToolScopes: SessionAutoApproveScope[];
+  webSearchEnabled: boolean;
+  webSearchProvider: WebSearchProvider;
   currentTurnExecutionConsent: { turnId: string | null; granted: boolean };
   approvedLocalFileReadPaths: string[];
   approvedShellPermissionRules: string[];
@@ -1277,6 +1289,8 @@ export interface AppState {
     | ((choice: "approve_once" | "approve_thread" | "cancel") => void)
     | null;
   setAutoApproveTools: (v: boolean) => void;
+  setWebSearchEnabled: (v: boolean) => void;
+  setWebSearchProvider: (provider: WebSearchProvider) => void;
   setReadOnlyAutoApproveForSession: (v: boolean) => void;
   queueUserMessage: (
     text: string,
@@ -1698,6 +1712,8 @@ export function normalizeSessionRuntimeSnapshot(
     transcriptTotalTurns: Math.max(0, Number(snapshot.transcriptTotalTurns) || 0),
     autoApproveTools: effectiveAutoApproveToolScopes.length > 0,
     autoApproveToolScopes: effectiveAutoApproveToolScopes,
+    webSearchEnabled: snapshot.webSearchEnabled === true,
+    webSearchProvider: normalizeWebSearchProvider(snapshot.webSearchProvider),
     approvedShellPermissionRules: Array.isArray(snapshot.approvedShellPermissionRules)
       ? snapshot.approvedShellPermissionRules.filter((rule): rule is string => typeof rule === "string" && rule.trim().length > 0)
       : [],
@@ -1786,6 +1802,8 @@ const sessionRuntimeKeys = [
   "pendingRunDecisionResolver",
   "autoApproveTools",
   "autoApproveToolScopes",
+  "webSearchEnabled",
+  "webSearchProvider",
   "currentTurnExecutionConsent",
   "approvedLocalFileReadPaths",
   "approvedShellPermissionRules",
@@ -1891,6 +1909,8 @@ function createSessionRuntimeFromState(state: Partial<AppState>): SessionRuntime
     pendingRunDecisionResolver: state.pendingRunDecisionResolver ?? null,
     autoApproveTools: normalizedAutoApproveToolScopes.length > 0,
     autoApproveToolScopes: normalizedAutoApproveToolScopes,
+    webSearchEnabled: state.webSearchEnabled === true,
+    webSearchProvider: normalizeWebSearchProvider(state.webSearchProvider),
     currentTurnExecutionConsent: state.currentTurnExecutionConsent || { turnId: null, granted: false },
     approvedLocalFileReadPaths: Array.isArray(state.approvedLocalFileReadPaths)
       ? state.approvedLocalFileReadPaths.filter((path): path is string => typeof path === "string" && path.trim().length > 0)
@@ -4381,6 +4401,8 @@ export const useAppStore = create<AppState>()(
           selectedDiffTaskId: latest.selectedDiffTaskId,
           autoApproveTools: latest.autoApproveTools,
           autoApproveToolScopes: latest.autoApproveToolScopes,
+          webSearchEnabled: latest.webSearchEnabled,
+          webSearchProvider: latest.webSearchProvider,
           queuedUserMessage: latest.queuedUserMessage,
           activeGuidance: latest.activeGuidance,
         }),
@@ -5042,6 +5064,8 @@ export const useAppStore = create<AppState>()(
         sessionHookCache: [],
         autoApproveTools: false,
         autoApproveToolScopes: [],
+        webSearchEnabled: false,
+        webSearchProvider: "duckduckgo",
         approvedLocalFileReadPaths: [],
         approvedShellPermissionRules: [],
         readOnlyAutoApproveForSession: false,
@@ -5080,6 +5104,8 @@ export const useAppStore = create<AppState>()(
         sessionHookCache: [],
         autoApproveTools: false,
         autoApproveToolScopes: [],
+        webSearchEnabled: false,
+        webSearchProvider: "duckduckgo",
         approvedLocalFileReadPaths: [],
         approvedShellPermissionRules: [],
         readOnlyAutoApproveForSession: false,
@@ -5172,6 +5198,8 @@ export const useAppStore = create<AppState>()(
           ? {
               autoApproveTools: false,
               autoApproveToolScopes: [],
+              webSearchEnabled: false,
+              webSearchProvider: "duckduckgo",
               approvedLocalFileReadPaths: [],
               approvedShellPermissionRules: [],
               readOnlyAutoApproveForSession: false,
@@ -5220,6 +5248,7 @@ export const useAppStore = create<AppState>()(
         [resolveSessionWorkspaceKey(s.currentWorkspace)]: id,
       },
       ...(s.currentSessionId !== id ? { autoApproveTools: false, autoApproveToolScopes: [] } : {}),
+      ...(s.currentSessionId !== id ? { webSearchEnabled: false, webSearchProvider: "duckduckgo" } : {}),
       ...(s.currentSessionId !== id ? { readOnlyAutoApproveForSession: false } : {}),
       ...(s.currentSessionId !== id ? { approvedLocalFileReadPaths: [] } : {}),
       ...(s.currentSessionId !== id ? { approvedShellPermissionRules: [] } : {}),
@@ -5412,6 +5441,8 @@ export const useAppStore = create<AppState>()(
         currentTurnExecutionConsent: { turnId: null, granted: false },
         autoApproveTools: false,
         autoApproveToolScopes: [],
+        webSearchEnabled: false,
+        webSearchProvider: "duckduckgo",
         approvedLocalFileReadPaths: [],
         approvedShellPermissionRules: [],
         readOnlyAutoApproveForSession: false,
@@ -5475,6 +5506,8 @@ export const useAppStore = create<AppState>()(
       currentTurnExecutionConsent: { turnId: null, granted: false },
       autoApproveTools: false,
       autoApproveToolScopes: [],
+      webSearchEnabled: false,
+      webSearchProvider: "duckduckgo",
       approvedLocalFileReadPaths: [],
       approvedShellPermissionRules: [],
       readOnlyAutoApproveForSession: false,
@@ -5827,6 +5860,8 @@ export const useAppStore = create<AppState>()(
   pendingToolCall: null,
   autoApproveTools: false,
   autoApproveToolScopes: [],
+  webSearchEnabled: false,
+  webSearchProvider: "duckduckgo",
   approvedLocalFileReadPaths: [],
   approvedShellPermissionRules: [],
   readOnlyAutoApproveForSession: false,
@@ -5848,6 +5883,8 @@ export const useAppStore = create<AppState>()(
         autoApproveToolScopes: v ? buildSessionAutoApproveScopes(true) : [],
       };
     }),
+  setWebSearchEnabled: (v) => set({ webSearchEnabled: v }),
+  setWebSearchProvider: (provider) => set({ webSearchProvider: normalizeWebSearchProvider(provider) }),
   setReadOnlyAutoApproveForSession: (v) => set({ readOnlyAutoApproveForSession: v }),
   queueUserMessage: (text, images, options) => {
     const queued = normalizeQueuedUserMessage({
@@ -6069,6 +6106,8 @@ export const useAppStore = create<AppState>()(
       pendingFeishuApprovals: [],
       autoApproveTools: false,
       autoApproveToolScopes: [],
+      webSearchEnabled: false,
+      webSearchProvider: "duckduckgo",
       approvedLocalFileReadPaths: [],
       approvedShellPermissionRules: [],
       readOnlyAutoApproveForSession: false,
@@ -7098,6 +7137,8 @@ export const useAppStore = create<AppState>()(
         currentSessionId: autoSessionId,
         autoApproveTools: false,
         autoApproveToolScopes: [],
+        webSearchEnabled: false,
+        webSearchProvider: "duckduckgo",
         approvedLocalFileReadPaths: [],
         approvedShellPermissionRules: [],
         readOnlyAutoApproveForSession: false,
@@ -7504,6 +7545,8 @@ export const useAppStore = create<AppState>()(
             selectedDiffTaskId: sessionGet().selectedDiffTaskId,
             autoApproveTools: sessionGet().autoApproveTools,
             autoApproveToolScopes: sessionGet().autoApproveToolScopes,
+            webSearchEnabled: sessionGet().webSearchEnabled,
+            webSearchProvider: sessionGet().webSearchProvider,
             queuedUserMessage: sessionGet().queuedUserMessage,
             activeGuidance: sessionGet().activeGuidance,
           }),
@@ -8917,6 +8960,10 @@ export const useAppStore = create<AppState>()(
         pendingToolCall: null,
         autoApproveTools: false,
         autoApproveToolScopes: [],
+        webSearchEnabled: hasHydratedCurrentSession ? persistedState.webSearchEnabled === true : false,
+        webSearchProvider: hasHydratedCurrentSession
+          ? normalizeWebSearchProvider(persistedState.webSearchProvider)
+          : "duckduckgo",
         readOnlyAutoApproveForSession: false,
         pendingRunDecision: null,
         pendingRunDecisionResolver: null,
@@ -9186,5 +9233,3 @@ export type { AttachedFile };
 // emitLocalPlanExecutionProgress("running"
 // ChatArea 会持续显示流式进度
 // emitPlanStreamHeartbeat(markerPatch)
-
-

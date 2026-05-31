@@ -139,6 +139,37 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     type: "function",
     function: {
+      name: "web_search",
+      description: "在公共网络上搜索当前、外部或网页相关信息。仅在用户开启网络后可用；返回标题、URL、摘要和来源。回答必须引用返回的来源 URL。",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "搜索关键词或问题" },
+          provider: { type: "string", description: "可选搜索源：duckduckgo、bing、baidu。默认 duckduckgo" },
+          max_results: { type: "number", description: "最多返回多少条结果，默认 5，最多 8" },
+        },
+        required: ["query"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "web_fetch",
+      description: "读取指定 HTTP/HTTPS 网页正文。GitHub repo/blob/tree/raw 链接会优先走公开 GitHub API 或 raw 内容解析。仅在用户开启网络后可用；回答必须引用来源 URL。",
+      parameters: {
+        type: "object",
+        properties: {
+          url: { type: "string", description: "要读取的 HTTP/HTTPS URL" },
+          max_chars: { type: "number", description: "最多返回多少字符，默认 12000，最多 30000" },
+        },
+        required: ["url"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "repo_map_status",
       description: "检查 MAIN 内置代码图谱索引状态。返回索引文件数量、符号数量、导入/调用关系数量和是否需要刷新。开箱即用，不依赖外部 codegraph 命令。",
       parameters: {

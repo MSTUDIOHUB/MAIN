@@ -139,6 +139,7 @@ const READ_OPERATION_TOOL_NAMES = new Set([
   "get_file_outline",
   "read_file",
   "read_document",
+  "web_fetch",
   "repo_map_context",
   "repo_map_impact",
   "index_workspace_documents",
@@ -147,6 +148,7 @@ const READ_OPERATION_TOOL_NAMES = new Set([
 const SEARCH_OPERATION_TOOL_NAMES = new Set([
   "glob_search",
   "grep_search",
+  "web_search",
   "repo_map_search",
 ]);
 

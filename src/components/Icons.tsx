@@ -17,6 +17,7 @@ export const IconImageIcon = createIcon(<><rect x="3" y="3" width="18" height="1
 export const IconAgent = createIcon(<path d="M12 2a2 2 0 0 1 2 2c0 1.1-.9 2-2 2s-2-.9-2-2a2 2 0 0 1 2-2zm0 6c2.67 0 8 1.34 8 4v2H4v-2c0-2.66 5.33-4 8-4z" />);
 export const IconChat = createIcon(<><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" /></>);
 export const IconCloud = createIcon(<path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z" />);
+export const IconGlobe = createIcon(<><circle cx="12" cy="12" r="10" /><line x1="2" y1="12" x2="22" y2="12" /><path d="M12 2a15.3 15.3 0 0 1 0 20" /><path d="M12 2a15.3 15.3 0 0 0 0 20" /></>);
 export const IconChevronUp = createIcon(<polyline points="18 15 12 9 6 15" />);
 export const IconChevronDown = createIcon(<polyline points="6 9 12 15 18 9" />);
 export const IconChevronRight = createIcon(<polyline points="9 18 15 12 9 6" />);

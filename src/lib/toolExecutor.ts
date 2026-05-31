@@ -29,6 +29,8 @@ import {
   readFile,
   readFileWindow,
   readDocument,
+  webFetch,
+  webSearch,
   writeChatTempFile,
   writeFile,
   type ShellPermissionApproval,
@@ -316,6 +318,22 @@ export async function executeTool(
       const query = args.query as string;
       const path = (args.path as string) || ".";
       return await grepSearch(query, path, workspace);
+    }
+
+    case "web_search": {
+      const query = parseOptionalString(args.query);
+      if (!query) throw new Error("Missing required parameter 'query'.");
+      return await webSearch(
+        query,
+        parseOptionalString(args.provider),
+        parseOptionalNumber(args.max_results ?? args.maxResults),
+      );
+    }
+
+    case "web_fetch": {
+      const url = parseOptionalString(args.url);
+      if (!url) throw new Error("Missing required parameter 'url'.");
+      return await webFetch(url, parseOptionalNumber(args.max_chars ?? args.maxChars));
     }
 
     case "repo_map_status":

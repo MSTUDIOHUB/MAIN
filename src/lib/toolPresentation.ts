@@ -7,6 +7,8 @@ const TOOL_VERB_LABELS: Record<string, { zh: string; en: string }> = {
   get_file_outline: { zh: "读取文件结构", en: "Read file outline" },
   glob_search: { zh: "搜索文件", en: "Search files" },
   grep_search: { zh: "搜索内容", en: "Search content" },
+  web_search: { zh: "搜索网络", en: "Search web" },
+  web_fetch: { zh: "读取网页", en: "Read web page" },
   repo_map_status: { zh: "检查代码图谱", en: "Check repo map" },
   repo_map_search: { zh: "搜索代码图谱", en: "Search repo map" },
   repo_map_context: { zh: "读取代码图谱上下文", en: "Read repo-map context" },
@@ -40,6 +42,7 @@ const DISCOVERY_TOOLS = new Set([
   "list_directory",
   "glob_search",
   "grep_search",
+  "web_search",
   "repo_map_status",
   "repo_map_search",
   "repo_map_context",
@@ -55,6 +58,7 @@ const INSPECTION_TOOLS = new Set([
   "read_document",
   "analyze_tabular_document",
   "query_tabular_document",
+  "web_fetch",
   "execute_code",
 ]);
 

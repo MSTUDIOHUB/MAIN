@@ -140,6 +140,43 @@ test("data analyst chat prompt tells the model to auto-fallback on read-only fai
   assert.match(prompt, /一旦你判断需要读取本地文件才能回答，就在同一轮直接调用只读工具/);
 });
 
+test("system prompt only adds web-search guidance when web tools are available", () => {
+  const withoutWeb = buildSystemPrompt(
+    [],
+    "/tmp/workspace",
+    "main_mode",
+    "",
+    [],
+    [],
+    "chat",
+    "zh",
+    null,
+    undefined,
+    undefined,
+    "english_core_localized_output",
+    ["read_file", "grep_search"],
+  );
+  const withWeb = buildSystemPrompt(
+    [],
+    "/tmp/workspace",
+    "main_mode",
+    "",
+    [],
+    [],
+    "chat",
+    "zh",
+    null,
+    undefined,
+    undefined,
+    "english_core_localized_output",
+    ["read_file", "grep_search", "web_search", "web_fetch"],
+  );
+
+  assert.doesNotMatch(withoutWeb, /网络搜索已开启/);
+  assert.match(withWeb, /网络搜索已开启/);
+  assert.match(withWeb, /来源 URL/);
+});
+
 test("system prompt uses English core tool protocol with localized output strategy", () => {
   const prompt = buildSystemPrompt(
     [],

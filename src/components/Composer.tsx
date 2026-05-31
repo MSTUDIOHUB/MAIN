@@ -1,6 +1,6 @@
 // @ts-nocheck
 import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
-import { IconAt, IconFile, IconClose, IconChevronUp, IconArrowUp, IconPlus, IconCode, IconChevronUp as IconChevronUpIcon, IconImageIcon, IconRefresh, IconSearch, IconSettings, IconStop, IconZap, IconInfo, IconTrash } from "./Icons";
+import { IconAt, IconFile, IconClose, IconChevronUp, IconArrowUp, IconPlus, IconCode, IconChevronUp as IconChevronUpIcon, IconImageIcon, IconRefresh, IconSearch, IconSettings, IconStop, IconZap, IconTrash, IconGlobe, IconShield } from "./Icons";
 import ImageStudioSetupModal from "./ImageStudioSetupModal";
 import { getAllWorkspaceFiles, fuzzyFilterFiles } from "../utils/fsUtils";
 import { compressImage, getImageFilesFromClipboard, processImageFile } from "../utils/imageUtils";
@@ -197,6 +197,7 @@ export default function Composer({
   const [slashQuery, setSlashQuery] = useState("");
   const [highlightedSlashIndex, setHighlightedSlashIndex] = useState(0);
   const [hoveredMainFocusModeKey, setHoveredMainFocusModeKey] = useState<string | null>(null);
+  const [showWebSearchPanel, setShowWebSearchPanel] = useState(false);
   const [allFiles, setAllFiles] = useState<string[]>([]);
   const [isFilesLoading, setIsFilesLoading] = useState(false);
   const [dismissedStudioOnboardingByWorkspace, setDismissedStudioOnboardingByWorkspace] = useState<Record<string, boolean>>({});
@@ -211,6 +212,7 @@ export default function Composer({
   const mentionDropRef = useRef<HTMLDivElement>(null);
   const slashMenuRef = useRef<HTMLDivElement>(null);
   const mainFocusPickerRef = useRef<HTMLDivElement>(null);
+  const webSearchPanelRef = useRef<HTMLDivElement>(null);
   const composerShellRef = useRef<HTMLDivElement>(null);
   const slashAnchorRef = useRef(-1);
   const previousMainModeRef = useRef(selectedMainModeKey);
@@ -252,6 +254,10 @@ export default function Composer({
   const setImageStudioConfig = useAppStore((s) => s.setImageStudioConfig);
   const setImageStudioSetupGuideOpen = useAppStore((s) => s.setImageStudioSetupGuideOpen);
   const checkImageStudioEngine = useAppStore((s) => s.checkImageStudioEngine);
+  const webSearchEnabled = useAppStore((s) => s.webSearchEnabled);
+  const webSearchProvider = useAppStore((s) => s.webSearchProvider);
+  const setWebSearchEnabled = useAppStore((s) => s.setWebSearchEnabled);
+  const setWebSearchProvider = useAppStore((s) => s.setWebSearchProvider);
   const [draftInput, setDraftInput] = useState(storeInput);
   const [debouncedInput, setDebouncedInput] = useState(storeInput);
   const slashCatalog = useMemo(
@@ -348,6 +354,31 @@ export default function Composer({
   const queuedCanGuide = Boolean(queuedUserMessage?.text?.trim());
   const autoReviewToggleDisabled = Boolean(autoApproveTools && isStreaming);
   const autoReviewButtonTitle = autoReviewToggleDisabled ? autoReviewLockedTitle : autoReviewTitle;
+  const webSearchProviderOptions = useMemo(
+    () => [
+      {
+        id: "duckduckgo",
+        label: "DuckDuckGo",
+        detail: language === "en" ? "Free web results" : "免费网页结果",
+      },
+      {
+        id: "bing",
+        label: "Bing",
+        detail: language === "en" ? "Free web compatibility source" : "免费网页兼容源",
+      },
+      {
+        id: "baidu",
+        label: "Baidu",
+        detail: language === "en" ? "Chinese web compatibility source" : "中文网页兼容源",
+      },
+    ],
+    [language],
+  );
+  const activeWebSearchProviderLabel =
+    webSearchProviderOptions.find((item) => item.id === webSearchProvider)?.label || "DuckDuckGo";
+  const webSearchButtonTitle = webSearchEnabled
+    ? `${language === "en" ? "Web search enabled" : "网络搜索已开启"}: ${activeWebSearchProviderLabel}`
+    : "开启后允许模型在网络上搜索答案";
   const nonPackFiles = useMemo(
     () => allFiles.filter((path) => !path.startsWith(".MAIN/") && !path.startsWith(".protocols/")),
     [allFiles],
@@ -877,10 +908,13 @@ export default function Composer({
         setShowAgentPicker(false);
         setHoveredMainFocusModeKey(null);
       }
+      if (showWebSearchPanel && webSearchPanelRef.current && !webSearchPanelRef.current.contains(target)) {
+        setShowWebSearchPanel(false);
+      }
     };
     document.addEventListener("mousedown", handleClick);
     return () => document.removeEventListener("mousedown", handleClick);
-  }, [closeMentionMenu, closeSlashMenu, setShowAgentPicker, showAgentPicker]);
+  }, [closeMentionMenu, closeSlashMenu, setShowAgentPicker, showAgentPicker, showWebSearchPanel]);
 
   useEffect(() => {
     if (isGameStudioMode || isMainMode) return;
@@ -891,6 +925,7 @@ export default function Composer({
     if (!isImageStudioMode) return;
     closeMentionMenu();
     closeSlashMenu();
+    setShowWebSearchPanel(false);
     setContextMentions([]);
     setAttachedFiles([]);
     setLockedComposerIntent(null);
@@ -1230,6 +1265,18 @@ export default function Composer({
     }
     onToggleAutoApprove(nextValue);
   }, [autoApproveTools, isStreaming, language, onToggleAutoApprove]);
+
+  const handleToggleWebSearch = useCallback(() => {
+    const nextValue = !webSearchEnabled;
+    setWebSearchEnabled(nextValue);
+    setShowWebSearchPanel(true);
+  }, [setWebSearchEnabled, webSearchEnabled]);
+
+  const handleSelectWebSearchProvider = useCallback((provider) => {
+    setWebSearchProvider(provider);
+    setWebSearchEnabled(true);
+    setShowWebSearchPanel(false);
+  }, [setWebSearchEnabled, setWebSearchProvider]);
 
   const handleSubmitComposerMessage = useCallback(() => {
     const textToSend = draftInput;
@@ -2401,6 +2448,78 @@ export default function Composer({
                   >
                     <IconPlus className="w-4 h-4" />
                   </button>
+
+                  <div className="relative" ref={webSearchPanelRef}>
+                    <button
+                      type="button"
+                      data-testid="composer-web-search-toggle"
+                      onClick={handleToggleWebSearch}
+                      className={`panel-tab-icon-button flex h-7 w-7 shrink-0 items-center justify-center rounded-[7px] p-0 transition-all duration-150 ${webSearchEnabled ? "is-active" : ""}`}
+                      title={webSearchButtonTitle}
+                      aria-pressed={webSearchEnabled}
+                    >
+                      <IconGlobe className="w-4 h-4" />
+                    </button>
+                    {showWebSearchPanel && (
+                      <div
+                        className={`absolute bottom-[calc(100%+10px)] left-0 z-50 w-[300px] overflow-hidden rounded-xl border shadow-2xl ${
+                          isLightTheme
+                            ? "border-[#d4d4d8] bg-white text-[#18181b] shadow-[0_20px_60px_rgba(15,23,42,0.18)]"
+                            : "border-[#27272a] bg-[#18181b] text-[#f4f4f5] shadow-[0_20px_60px_rgba(0,0,0,0.45)]"
+                        }`}
+                      >
+                        <div className={`border-b px-3 py-2 text-[11px] font-semibold ${isLightTheme ? "border-[#e4e4e7] text-[#52525b]" : "border-[#27272a] text-[#a1a1aa]"}`}>
+                          {language === "en" ? "Web Search" : "网络搜索"}
+                        </div>
+                        <div className="p-1.5">
+                          {webSearchProviderOptions.map((option) => {
+                            const selected = webSearchProvider === option.id;
+                            return (
+                              <button
+                                key={option.id}
+                                type="button"
+                                onClick={() => handleSelectWebSearchProvider(option.id)}
+                                className={`flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left transition-colors ${
+                                  selected
+                                    ? isLightTheme
+                                      ? "bg-[var(--accent-subtle)] text-[var(--accent-hover)]"
+                                      : "bg-[rgba(255,255,255,0.08)] text-white"
+                                    : isLightTheme
+                                    ? "text-[#374151] hover:bg-[#f4f4f5]"
+                                    : "text-[#d4d4d8] hover:bg-[#27272a]"
+                                }`}
+                              >
+                                <IconGlobe className={`h-4 w-4 ${selected ? "" : "opacity-70"}`} />
+                                <span className="min-w-0 flex-1">
+                                  <span className="block truncate text-[13px] font-semibold">{option.label}</span>
+                                  <span className={`block truncate text-[11px] ${selected ? "opacity-75" : isLightTheme ? "text-[#71717a]" : "text-[#71717a]"}`}>
+                                    {option.detail}
+                                  </span>
+                                </span>
+                                <span className={`text-[11px] ${selected ? "opacity-90" : "opacity-50"}`}>
+                                  {language === "en" ? "Free" : "免费"}
+                                </span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setWebSearchEnabled(false);
+                            setShowWebSearchPanel(false);
+                          }}
+                          className={`w-full border-t px-3 py-2 text-left text-[12px] transition-colors ${
+                            isLightTheme
+                              ? "border-[#e4e4e7] text-[#71717a] hover:bg-[#f4f4f5]"
+                              : "border-[#27272a] text-[#a1a1aa] hover:bg-[#27272a]"
+                          }`}
+                        >
+                          {language === "en" ? "Turn off web search" : "关闭网络搜索"}
+                        </button>
+                      </div>
+                    )}
+                  </div>
                 </>
               )}
               {!isImageStudioMode && onToggleAutoApprove && (
@@ -2409,16 +2528,11 @@ export default function Composer({
                   data-testid="composer-auto-review-toggle"
                   onClick={handleToggleAutoReview}
                   disabled={autoReviewToggleDisabled}
-                  className={`inline-flex h-7 shrink-0 items-center gap-1.5 rounded-[7px] border px-2.5 text-[11px] font-semibold transition-colors disabled:cursor-not-allowed ${
-                    autoApproveTools
-                      ? "border-[rgba(52,211,153,0.32)] bg-[rgba(16,185,129,0.12)] text-[#bbf7d0] disabled:opacity-75"
-                      : "border-[#34343b] bg-[#050507] text-[#d4d4d8] hover:border-[var(--accent)] hover:text-white"
-                  }`}
+                  className={`panel-tab-icon-button flex h-7 w-7 shrink-0 items-center justify-center rounded-[7px] p-0 transition-all duration-150 disabled:cursor-not-allowed disabled:opacity-70 ${autoApproveTools ? "is-active" : ""}`}
                   title={autoReviewButtonTitle}
+                  aria-pressed={autoApproveTools}
                 >
-                  <span className={`h-1.5 w-1.5 rounded-full ${autoApproveTools ? "bg-emerald-400" : "bg-[#71717a]"}`} />
-                  {language === "en" ? "Auto Review" : "自动审查"}
-                  <IconInfo className="h-3.5 w-3.5 opacity-75" />
+                  <IconShield className="h-4 w-4" />
                 </button>
               )}
               {isImageStudioMode && (

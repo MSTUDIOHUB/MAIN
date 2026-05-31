@@ -274,6 +274,8 @@ export class WorkflowEngine {
       getWorkspaceTree: () => workspaceTree || "",
       getMcpServers: () => sessionGet().mcpServers,
       getMcpDiscoveredTools: () => sessionGet().mcpDiscoveredTools,
+      getWebSearchEnabled: () => sessionGet().webSearchEnabled === true,
+      getWebSearchProvider: () => sessionGet().webSearchProvider || "duckduckgo",
       getAssociatedPaths: () => sessionGet().resolvedInstructionSet?.associatedPaths ?? [],
       getSessionKey: () => runSessionKey,
       getCurrentTurnId: () => turnId,
