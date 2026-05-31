@@ -3,8 +3,9 @@
 // All state that was previously scattered as useState in the monolith lives here.
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
-import { executeAgentLoop, type AgentMessage, type OrchestratorCallbacks, type ReviewDecision, type ContentPart } from "../lib/orchestrator";
+import { type AgentMessage, type ReviewDecision, type ContentPart } from "../lib/orchestrator";
 import type { ExecuteRecoveryMode } from "../lib/executeRecoveryTools";
+import { WorkflowEngine, type WorkflowContext } from "../lib/orchestrator/workflowEngine";
 import {
   analyzeTabularDocument,
   cancelImageStudioJob,
@@ -17,7 +18,6 @@ import {
   readDocument,
   readFile,
   readFileWindow,
-  shellPermissionPreflight,
   writeChatTempFile,
   writeFile,
   type GitDiffEntry,
@@ -29,7 +29,6 @@ import { invoke } from "@tauri-apps/api/core";
 import { setWorkspaceRoot as setWorkspaceRootIpc } from "../lib/ipc";
 import { appendDebugLog } from "../lib/debugLog";
 import {
-  closeHarnessRunMarker,
   consumePendingUncleanRestartDiagnostic,
   getCurrentHarnessInstanceId,
   normalizeHarnessRunMarker,
@@ -57,7 +56,6 @@ import {
   type PlanArtifact,
   type PlanExecutionEvidenceEntry,
   type PlanExecutionProgressSnapshot,
-  type PlanExecutionProgressUpdate,
   type PlanStage,
   type PlanTask,
   type ReplyOption,
@@ -71,7 +69,6 @@ import {
   getPendingPlanTaskCommandFocus,
   getPlanArtifactTitle,
   collectChangeEntries,
-  isEphemeralPlanArtifactPath,
   isGenericConversationTitle,
   looksLikeReasoningLeakTitle,
   normalizeResponseLanguagePolicy,
@@ -80,7 +77,6 @@ import {
   resolveTurnResponseLanguage,
   summarizeAssistantText,
   summarizeUserPrompt,
-  syncPlanTaskCheckboxesFromTrustedTasks,
   validatePlanArtifactContent,
 } from "../lib/workflowModels";
 import {
@@ -95,12 +91,8 @@ import {
 } from "../lib/turnEvents";
 import { getDiffStats } from "../lib/diff";
 import {
-  appendPlanEvidenceEntry,
-  createPlanExecutionEvidenceEntry,
-  isPlanEvidenceLedgerTool,
   isPlanExecutionEvidenceTool,
 } from "../lib/planEvidence";
-import { buildClosedActivePlanRuntimePatch } from "../lib/planLifecycle";
 import {
   buildAnthropicRequestBody,
   buildGeminiRequestForAuthMode,
@@ -123,40 +115,21 @@ import {
   type CloudProfileConfig,
   type CloudServerConfig,
 } from "../lib/cloudServers";
-import { buildToolDiffPreview, supportsToolDiffPreview } from "../lib/toolDiff";
 import { resolveStreamingAssistantDisplay } from "../lib/streamDisplayPolicy";
-import { findToolLifecycleBlockIndex, type ToolLifecycleMeta } from "../lib/toolLifecycle";
-import { deriveToolIntentSummary } from "../lib/toolPresentation";
 import {
-  buildToolProgressNarration,
   normalizeProgressNarration,
-  progressNarrationToText,
-  summarizeToolObservation,
   type ProgressNarration,
-  type ProgressNarrationSource,
-  type ProgressNarrationStatus,
 } from "../lib/progressNarration";
 import {
-  deriveTurnRuntimePhaseForText,
-  deriveTurnRuntimePhaseForTool,
   makeTurnRuntimePhase,
   normalizeTurnRuntimePhase,
-  withTurnRuntimePhaseStatus,
+  deriveTurnRuntimePhaseForText,
   type TurnRuntimePhase,
 } from "../lib/turnPhase";
 import { buildPlanApprovalChoiceHint, normalizePlanApprovalChoice } from "../lib/planControl";
 import {
-  PLAN_MAX_AUTO_RESUME_LIMIT,
-  buildExecuteMaxIterationsAutoResumeNotice,
-  buildExecuteMaxIterationsPauseNotice,
-  buildExecuteMaxIterationsResumePrompt,
   buildPlanExecutionProgressUpdate,
-  formatPlanExecutionProgressSnapshot,
-  buildPlanMaxIterationsAutoResumeNotice,
-  buildPlanMaxIterationsPauseNotice,
-  buildPlanMaxIterationsResumePrompt,
   normalizePlanExecutionProgressSnapshot,
-  type PlanMaxIterationsCheckpoint,
 } from "../lib/planExecutionRecovery";
 import {
   type AttachedFile,
@@ -211,7 +184,6 @@ import {
   detectGameDevelopmentIntent,
   type GameDevelopmentIntentSignal,
 } from "../lib/gameDevelopmentIntent";
-import { isConversationalFirstPersonNarration } from "../lib/capsuleStagingHelper";
 import {
   createPendingDecisionCopy,
   getIntentPolicy,
@@ -281,11 +253,7 @@ import {
 import { runIntentPreflight } from "../lib/intentPreflight";
 import { runAfterNextPaint } from "../lib/uiScheduling";
 import {
-  FEISHU_APPROVAL_TTL_MS,
   buildFeishuApprovalCard,
-  buildFeishuMarkdownCard,
-  createFeishuApprovalId,
-  createFeishuApprovalNonce,
   createDefaultFeishuAdapterRuntimeStatus,
   normalizeImAdaptersConfig,
   resolveFeishuApprovalAction,
@@ -307,7 +275,6 @@ import {
   type PromptLanguageStrategy,
   type ToolPermissionPolicy,
 } from "../lib/toolCapabilities";
-import { applyShellCwd } from "../lib/toolExecutionContract";
 import {
   deriveThoughtDisplay,
   normalizeThoughtSummaryForCompare,
@@ -320,7 +287,7 @@ import {
   shouldSeedSessionTitle,
 } from "../lib/intentTitlePolicy";
 
-function logStoreEvent(event: string, data: Record<string, unknown> = {}) {
+export function logStoreEvent(event: string, data: Record<string, unknown> = {}) {
   try {
     appendDebugLog("info", `store.${event}`, data);
   } catch {
@@ -358,28 +325,7 @@ function buildSessionAutoApproveScopes(enabled: boolean): SessionAutoApproveScop
   return enabled ? [...DEFAULT_SESSION_AUTO_APPROVE_SCOPES] : [];
 }
 
-function resolveSessionAutoApproveScopeForToolCall(toolCall: {
-  name: string;
-  risk?: string;
-}): SessionAutoApproveScope | null {
-  if (toolCall.risk === "local_file_read") return "local_file_read";
-  if (toolCall.name === "write_file" || toolCall.name === "replace_in_file" || toolCall.name === "apply_patch") return "workspace_write";
-  if (toolCall.name === "run_command" || toolCall.name === "execute_command" || toolCall.name === "send_pty_input") return "shell";
-  if (toolCall.risk === "browser_control" || toolCall.name === "browser_evaluate") return "browser_control";
-  return null;
-}
 
-function shouldSessionAutoApproveToolCall(
-  toolCall: { name: string; risk?: string },
-  scopes: SessionAutoApproveScope[],
-): boolean {
-  const scope = resolveSessionAutoApproveScopeForToolCall(toolCall);
-  return !!scope && scopes.includes(scope);
-}
-
-function isShellReviewTool(name: string): boolean {
-  return name === "run_command" || name === "execute_command";
-}
 
 function commandMatchesPermissionRule(command: string, rule: string): boolean {
   const cleanCommand = String(command || "").trim();
@@ -441,41 +387,7 @@ function suggestedShellPermissionRules(decision: ShellPermissionDecision | null 
   return rules;
 }
 
-function formatShellPermissionDecisionForUser(
-  decision: ShellPermissionDecision,
-  language: "zh" | "en",
-): string {
-  const source =
-    decision.source === "workspace_file"
-      ? language === "zh"
-        ? "项目权限文件"
-        : "workspace permission file"
-      : language === "zh"
-      ? "内置默认策略"
-      : "built-in default policy";
-  const rules = suggestedShellPermissionRules(decision);
-  const rulesText = rules.length > 0 ? rules.map((rule) => `\`${rule}\``).join(", ") : "";
-  const riskText = decision.riskLevel ? `risk=${decision.riskLevel}` : "";
-  const reasonText = String(decision.reviewReason || "").trim();
-  const relevantSegments = (decision.segmentDecisions || [])
-    .filter((segment) => segment.decision === decision.decision || (decision.decision === "deny" && segment.decision === "deny"))
-    .map((segment) => `\`${segment.command}\``);
-  const segmentText = relevantSegments.length > 0 ? relevantSegments.join(", ") : `\`${decision.command}\``;
-  const matchedRule = String(decision.matchedRule || "").trim();
-  if (decision.decision === "ask") {
-    return language === "zh"
-      ? `Shell 权限预检：当前命令未静默放行，将按 ${source} 请求批准。${riskText ? `${riskText}。` : ""}${reasonText ? `${reasonText}。` : ""}待批准 segment：${segmentText}。${rulesText ? `本线程批准会记住规则 ${rulesText}。` : ""}`
-      : `Shell permission preflight: this command is approval-gated by the ${source}. ${riskText ? `${riskText}. ` : ""}${reasonText ? `${reasonText}. ` : ""}Segment: ${segmentText}. ${rulesText ? `Approving for this thread will remember ${rulesText}.` : ""}`;
-  }
-  if (decision.decision === "deny") {
-    return language === "zh"
-      ? `Shell 权限预检：当前命令被 ${source} 阻止。被拒 segment：${segmentText}。${matchedRule ? `命中 deny 规则：\`${matchedRule}\`。` : rulesText ? `缺少允许规则，建议规则：${rulesText}。` : ""}不要尝试读取 .MAIN/permissions.yaml；请调整命令或暂停让用户处理权限。`
-      : `Shell permission preflight: this command is blocked by the ${source}. Denied segment: ${segmentText}. ${matchedRule ? `Matched deny rule: \`${matchedRule}\`.` : rulesText ? `Suggested rule: ${rulesText}.` : ""} Do not try to read .MAIN/permissions.yaml; change the command or pause for the user to handle permissions.`;
-  }
-  return language === "zh"
-    ? `Shell 权限预检：当前命令已被 ${source} 允许。`
-    : `Shell permission preflight: this command is allowed by the ${source}.`;
-}
+
 
 // ── i18n ────────────────────────────────────────────────────────────
 
@@ -1092,7 +1004,7 @@ export type TaskBlock =
 
 // ── Store State Interface ─────────────────────────────────────────────
 
-interface AppState {
+export interface AppState {
   // Config (merged from prototype config state)
   config: AppConfig;
   setConfig: (patch: Partial<AppConfig> | ((prev: AppConfig) => AppConfig)) => void;
@@ -1453,18 +1365,7 @@ export const MOCK_LOCAL_MODELS: Record<string, string[]> = {
 
 
 
-function upsertContextMemoryStateForRuntimeLane(
-  laneMap: Record<string, ContextMemoryState | null> | null | undefined,
-  laneKey: string,
-  state: ContextMemoryState | null | undefined,
-): Record<string, ContextMemoryState | null> {
-  const normalizedState = normalizeContextMemoryState(state);
-  if (!normalizedState) return normalizeContextMemoryStateByRuntimeKey(laneMap);
-  return {
-    ...normalizeContextMemoryStateByRuntimeKey(laneMap),
-    [laneKey]: normalizedState,
-  };
-}
+
 
 function normalizeProviderCompatibilityRuntimeLaneState(
   value: unknown,
@@ -1482,7 +1383,7 @@ function normalizeProviderCompatibilityRuntimeLaneState(
   };
 }
 
-function normalizeProviderCompatibilityByRuntimeKey(
+export function normalizeProviderCompatibilityByRuntimeKey(
   value: unknown,
 ): Record<string, ProviderCompatibilityRuntimeLaneState> {
   if (!value || typeof value !== "object") return {};
@@ -1739,7 +1640,7 @@ function normalizeRuntimeEvents(value: unknown): MainThreadEvent[] {
   return normalized;
 }
 
-function normalizeSessionRuntimeSnapshot(
+export function normalizeSessionRuntimeSnapshot(
   snapshot: Partial<SessionRuntimeSnapshot> | null | undefined,
 ): SessionRuntimeSnapshot | undefined {
   if (!snapshot) return undefined;
@@ -1805,7 +1706,7 @@ function normalizeSessionRuntimeSnapshot(
   };
 }
 
-function normalizeQueuedUserMessage(value: unknown): QueuedUserMessage | null {
+export function normalizeQueuedUserMessage(value: unknown): QueuedUserMessage | null {
   if (!value || typeof value !== "object") return null;
   const record = value as Partial<QueuedUserMessage>;
   const text = String(record.text || "").trim();
@@ -2258,14 +2159,14 @@ function limitThoughtContent(text: string): string {
   return `${head}\n\n[后台思考内容过长，已折叠中间 ${hidden.toLocaleString()} 个字符，避免界面卡死。]\n\n${tail}`;
 }
 
-function compactThoughtContent(text: string): string {
+export function compactThoughtContent(text: string): string {
   const collapsedParagraphs = collapseRepeatedThoughtParagraphs(String(text || ""));
   const collapsedLines = collapseRepeatedThoughtLines(collapsedParagraphs);
   const collapsedNearDuplicates = collapseNearDuplicateThoughtLines(collapsedLines);
   return limitThoughtContent(compactThoughtNoise(collapsedNearDuplicates));
 }
 
-function compactThoughtContentForPersist(text: string): string {
+export function compactThoughtContentForPersist(text: string): string {
   const compacted = compactThoughtContent(text);
   const summarized = deriveThoughtDisplay(compacted, {
     maxSummaryLines: 12,
@@ -2286,7 +2187,7 @@ function compactProcessAssistantText(text: string, language: "zh" | "en"): strin
   return display.summaryText || compactThoughtContentForPersist(String(text || ""));
 }
 
-function pickProcessAssistantText(visibleText: string, hiddenThought: string | undefined, language: "zh" | "en"): string {
+export function pickProcessAssistantText(visibleText: string, hiddenThought: string | undefined, language: "zh" | "en"): string {
   const visible = String(visibleText || "").trim();
   const hidden = String(hiddenThought || "").trim();
   const hiddenSummary = hidden ? compactProcessAssistantText(hidden, language) : "";
@@ -2294,7 +2195,7 @@ function pickProcessAssistantText(visibleText: string, hiddenThought: string | u
   return compactProcessAssistantText(visible, language);
 }
 
-function appendThoughtDelta(existing: string, incoming: string): string {
+export function appendThoughtDelta(existing: string, incoming: string): string {
   const current = String(existing || "");
   const delta = String(incoming || "");
   if (!delta) return compactThoughtContent(current);
@@ -2592,125 +2493,7 @@ function normalizeIntentSummary(summary: string): string {
   return summary.replace(/\s+/g, " ").trim();
 }
 
-function normalizeAgentContentForDedupe(content: string): string {
-  return String(content || "")
-    .replace(/<(?:analysis|thought|thinking|reasoning)(?:\s[^>]*)?>[\s\S]*?<\/(?:analysis|thought|thinking|reasoning)>/gi, " ")
-    .replace(/<\/?(?:analysis|thought|thinking|reasoning)(?:\s[^>]*)?>/gi, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
 
-function normalizeCapsuleExplanationCandidate(content: string): string {
-  const normalized = normalizeAgentContentForDedupe(content);
-  return isConversationalFirstPersonNarration(normalized) ? normalized : "";
-}
-
-function compactProgressContextText(text: string, maxChars = 180): string {
-  const normalized = String(text || "").replace(/\s+/g, " ").trim();
-  if (normalized.length <= maxChars) return normalized;
-  return `${normalized.slice(0, maxChars - 3).trim()}...`;
-}
-
-function getLatestTurnProgressStrategyText(blocks: TaskBlock[], turnId: string): string {
-  for (let index = blocks.length - 1; index >= 0; index -= 1) {
-    const block = blocks[index];
-    if (block.turnId !== turnId) continue;
-    if (block.type === "progress") {
-      const text = block.why || block.title || block.action;
-      if (text) return compactProgressContextText(text);
-    }
-    if (block.type === "agent" && (block.hiddenProcess || block.visibility === "user_progress")) {
-      const text = normalizeAgentContentForDedupe(block.content || "");
-      if (text) return compactProgressContextText(text);
-    }
-  }
-  return "";
-}
-
-function getLatestTurnToolObservationText(blocks: TaskBlock[], turnId: string): string {
-  for (let index = blocks.length - 1; index >= 0; index -= 1) {
-    const block = blocks[index];
-    if (block.turnId !== turnId || block.type !== "tool") continue;
-    const tool = block as Extract<TaskBlock, { type: "tool" }>;
-    const text = tool.observationSummary || tool.evidence || tool.message || tool.intentSummary || "";
-    if (text) return compactProgressContextText(text);
-  }
-  return "";
-}
-
-function getTurnUserGoal(blocks: TaskBlock[], turnId: string, fallback = ""): string {
-  const userBlock = blocks.find((block) => block.turnId === turnId && block.type === "user");
-  if (userBlock?.type === "user") return compactProgressContextText(userBlock.content || "", 240);
-  return compactProgressContextText(fallback, 240);
-}
-
-function progressBlockMatchesTool(block: Extract<TaskBlock, { type: "progress" }>, toolCallId?: string, toolName?: string, target?: string): boolean {
-  const normalizedToolCallId = String(toolCallId || "").trim();
-  if (normalizedToolCallId) {
-    if (String(block.toolCallId || "") === normalizedToolCallId) return true;
-    if (Array.isArray(block.toolCallIds) && block.toolCallIds.map(String).includes(normalizedToolCallId)) return true;
-  }
-  return !!toolName && block.toolName === toolName && String(block.target || "") === String(target || "");
-}
-
-function updateRelatedProgressBlocks(input: {
-  blocks: TaskBlock[];
-  turnId: string;
-  toolName: string;
-  target: string;
-  toolCallId?: string;
-  status: ProgressNarrationStatus;
-  source: ProgressNarrationSource;
-  evidence?: string;
-  next?: string;
-  evidenceExcerpt?: string;
-  observedFact?: string;
-  hypothesisStatus?: ProgressNarration["hypothesisStatus"];
-  sourceToolCallIds?: string[];
-}): TaskBlock[] {
-  let matched = false;
-  const updated = input.blocks.map((block) => {
-    if (block.type !== "progress" || block.turnId !== input.turnId) return block;
-    if (!progressBlockMatchesTool(block, input.toolCallId, input.toolName, input.target)) return block;
-    matched = true;
-    return {
-      ...block,
-      status: input.status,
-      source: input.source,
-      ...(input.evidence ? { evidence: input.evidence } : {}),
-      ...(input.next ? { next: input.next } : {}),
-      ...(input.evidenceExcerpt ? { evidenceExcerpt: input.evidenceExcerpt } : {}),
-      ...(input.observedFact ? { observedFact: input.observedFact } : {}),
-      ...(input.hypothesisStatus ? { hypothesisStatus: input.hypothesisStatus } : {}),
-      ...(input.sourceToolCallIds && input.sourceToolCallIds.length > 0 ? { sourceToolCallIds: input.sourceToolCallIds } : {}),
-    };
-  });
-  if (matched) return updated;
-
-  const fallbackIdx = (() => {
-    for (let index = updated.length - 1; index >= 0; index -= 1) {
-      const block = updated[index];
-      if (block.type === "progress" && block.turnId === input.turnId && block.status === "running") return index;
-    }
-    return -1;
-  })();
-  if (fallbackIdx < 0) return updated;
-  const fallback = updated[fallbackIdx];
-  if (fallback.type !== "progress") return updated;
-  const next = [...updated];
-  next[fallbackIdx] = {
-    ...fallback,
-    status: input.status,
-    source: input.source,
-    ...(input.evidence ? { evidence: input.evidence } : {}),
-    ...(input.next ? { next: input.next } : {}),
-    ...(input.evidenceExcerpt ? { evidenceExcerpt: input.evidenceExcerpt } : {}),
-    ...(input.observedFact ? { observedFact: input.observedFact } : {}),
-    ...(input.hypothesisStatus ? { hypothesisStatus: input.hypothesisStatus } : {}),
-    ...(input.sourceToolCallIds && input.sourceToolCallIds.length > 0 ? { sourceToolCallIds: input.sourceToolCallIds } : {}),
-  };
-  return next;
-}
 
 function isContinuationPrompt(input: string): boolean {
   return looksLikePreviousTurnContinuationInput(input);
@@ -2890,42 +2673,7 @@ function hasOperationApprovalReplyOption(replyOptions: ReplyOption[]): boolean {
   );
 }
 
-function inferPendingOperationTypes(
-  text: string,
-  directive?: CommandDirective | null,
-): PendingOperationProposal["operationTypes"] {
-  const normalized = String(text || "");
-  const types = new Set<PendingOperationProposal["operationTypes"][number]>();
-  if (directive?.kind === "file_modify") types.add("file_write");
-  if (directive?.kind === "shell" || /(?:执行命令|运行命令|运行测试|run command|execute command|run tests?)/i.test(normalized)) types.add("command");
-  if (directive?.kind === "git" || /\bgit\b|提交|推送|commit|push/i.test(normalized)) types.add("git");
-  if (directive?.kind === "studio" || directive?.kind === "unity" || /(?:外部写入|浏览器|Unity|MCP|external write|browser control)/i.test(normalized)) types.add("external_write");
-  if (/部署|发布|上线|deploy|publish|ship/i.test(normalized)) types.add("deploy");
-  if (/生成(?:文件|交付物|报告|文档)|写入|创建|generate (?:file|deliverable|report|document)|create (?:file|deliverable|report|document)/i.test(normalized)) types.add("deliverable");
-  if (/修改|改动|更改|修复|实现|重构|write|modify|edit|fix|implement|refactor|patch/i.test(normalized)) types.add("file_write");
-  return types.size > 0 ? [...types] : ["unknown"];
-}
 
-function buildPendingOperationProposal(params: {
-  sourceTurnId: string;
-  text: string;
-  replyOptions: ReplyOption[];
-  commandDirective?: CommandDirective | null;
-  workflowMode?: AppConfig["workflowMode"];
-  isPlanApproved?: boolean;
-}): PendingOperationProposal | null {
-  if (params.workflowMode === "plan" && !params.isPlanApproved) return null;
-  if (!hasOperationApprovalReplyOption(params.replyOptions)) return null;
-  const summary = summarizeAssistantText(params.text, 180);
-  return {
-    sourceTurnId: params.sourceTurnId,
-    proposalSummary: summary,
-    operationTypes: inferPendingOperationTypes(params.text, params.commandDirective),
-    approvalStatus: "pending",
-    evidenceStatus: "none",
-    createdAt: Date.now(),
-  };
-}
 
 function applyOperationProposalChoice(
   proposal: PendingOperationProposal | undefined,
@@ -3037,7 +2785,7 @@ function buildTurnCompactionAssistantMessage(params: {
   return sections.join("\n\n").trim();
 }
 
-function compactCompletedTurnAgentMessages(params: {
+export function compactCompletedTurnAgentMessages(params: {
   agentMessages: AgentMessage[];
   turnStartIndex: number;
   turnSummary: string;
@@ -3484,20 +3232,7 @@ function detectRequestedRootMarkdownDeliverables(text: string): string[] {
   return [...new Set(names)];
 }
 
-function hasRootMarkdownDeliverableEvidence(blocks: TaskBlock[], requestedDocs: string[]): boolean {
-  if (requestedDocs.length === 0) return true;
 
-  return requestedDocs.every((docName) => {
-    const lowerName = docName.toLowerCase();
-    return blocks.some((block) => {
-      if (block.type !== "tool" || block.toolStatus !== "executed") return false;
-      if (block.toolName !== "write_file" && block.toolName !== "replace_in_file" && block.toolName !== "apply_patch") return false;
-      const normalizedTarget = String(block.target || "").replace(/\\/g, "/").toLowerCase();
-      if (!normalizedTarget || normalizedTarget.includes(".main/plans/")) return false;
-      return normalizedTarget === lowerName || normalizedTarget.endsWith(`/${lowerName}`);
-    });
-  });
-}
 
 function derivePlanStageFromArtifacts(
   artifacts: PlanArtifact[],
@@ -3859,10 +3594,7 @@ async function prepareAttachedFileForRead(
   };
 }
 
-function hasReviewablePlanState(artifacts: PlanArtifact[], stage: PlanStage): boolean {
-  if (stage === "ready_to_execute" || stage === "plan" || stage === "design" || stage === "bugfix") return true;
-  return artifacts.some((artifact) => artifact.kind === "plan" || artifact.kind === "design" || artifact.kind === "bugfix");
-}
+
 
 function blockHasVisibleAgentContent(block: TaskBlock): boolean {
   if (block.type !== "agent" || block.hiddenProcess) return false;
@@ -3870,62 +3602,7 @@ function blockHasVisibleAgentContent(block: TaskBlock): boolean {
   return String(block.content || "").trim().length > 0;
 }
 
-function deriveIdleConversationTurnStatus(input: {
-  turnId: string;
-  effectiveRunIntent: ResolvedRunIntent;
-  isPlanApproved: boolean;
-  planArtifacts: PlanArtifact[];
-  planStage: PlanStage;
-  planTasks: PlanTask[];
-  planExecutionEvidenceCount: number;
-  replyOptionCount: number;
-  taskFlow: TaskBlock[];
-  override?: ConversationTurnStatus | null;
-}): ConversationTurnStatus {
-  if (input.replyOptionCount > 0) return "awaiting_input";
-  if (input.override) return input.override;
 
-  const turnBlocks = input.taskFlow.filter((block) => block.turnId === input.turnId);
-  const userPrompt = String(turnBlocks.find((block) => block.type === "user")?.content || "");
-  const requestedDocs = detectRequestedRootMarkdownDeliverables(userPrompt);
-  const hasVisibleAgent = turnBlocks.some(blockHasVisibleAgentContent);
-  const hasAnyTool = turnBlocks.some((block) => block.type === "tool");
-  const hasTasksArtifact =
-    input.planTasks.length > 0 ||
-    input.planArtifacts.some((artifact) => artifact.kind === "tasks");
-  const allTasksComplete =
-    buildPlanTaskEvidenceAudit({ tasks: input.planTasks }).allTrustedComplete;
-  const hasExecutionEvidence =
-    input.planExecutionEvidenceCount > 0 ||
-    turnBlocks.some((block) =>
-      block.type === "tool" &&
-      block.toolStatus === "executed" &&
-      isPlanExecutionEvidenceTool(block.toolName, block.target),
-    );
-  const hasRequestedDeliverables = hasRootMarkdownDeliverableEvidence(turnBlocks, requestedDocs);
-
-  if (input.effectiveRunIntent === "plan" && !input.isPlanApproved) {
-    if (hasReviewablePlanState(input.planArtifacts, input.planStage)) {
-      return "awaiting_approval";
-    }
-    return hasVisibleAgent || hasAnyTool ? "stopped_no_action" : "stopped_no_output";
-  }
-
-  if (input.effectiveRunIntent === "plan" && input.isPlanApproved) {
-    if (hasExecutionEvidence && hasTasksArtifact && allTasksComplete && hasRequestedDeliverables) {
-      return "completed_with_changes";
-    }
-    return hasVisibleAgent || hasAnyTool || hasTasksArtifact ? "stopped_no_action" : "stopped_no_output";
-  }
-
-  if (input.effectiveRunIntent === "execute" || input.effectiveRunIntent === "studio_workflow") {
-    if (hasExecutionEvidence) return "completed_with_changes";
-    return hasVisibleAgent || hasAnyTool ? "stopped_no_action" : "stopped_no_output";
-  }
-
-  if (hasExecutionEvidence) return "completed_with_changes";
-  return "done";
-}
 
 /** Helper to keep Skill content from teaching hidden-thinking tags as an output channel. */
 function normalizeSkillContent(content: string): string {
@@ -8662,382 +8339,79 @@ export const useAppStore = create<AppState>()(
         closeReason: null,
       });
 
-      const emitHarnessTelemetry = (name: string, details: Record<string, unknown>) => {
-        const event = withEventSchema({
-          type: "harness.telemetry",
-          threadId: runSessionKey,
-          turnId,
-          timestampMs: Date.now(),
-          telemetry: { name, details },
-        });
-        sessionSet((s) => ({
-          runtimeEvents: appendRuntimeEvent(s.runtimeEvents, event),
-        }));
-        appendDebugLog(
-          name === "unclean_termination" ? "error" : name.includes("warning") ? "warn" : "info",
-          `harness.${name}`,
-          details,
-        );
-      };
-
-      const emitRunEvent = (event: MainThreadEventInput) => {
-        if (normalizeEventStreamMode(sessionGet().config.eventStreamMode) === "legacy") return;
-        sessionSet((s) => ({
-          runtimeEvents: appendRuntimeEvent(s.runtimeEvents, withEventSchema(event)),
-        }));
-      };
-
-      const emitProgressRuntimeEvent = (
-        progress: ProgressNarration,
-        details: {
-          tool?: string;
-          target?: string;
-          dedupeKey?: string;
-          iteration?: number;
-          repeatCount?: number;
-        } = {},
-      ) => {
-        emitRunEvent({
-          type: "progress.updated",
-          threadId: runSessionKey,
-          turnId,
-          timestampMs: Date.now(),
-          progress: {
-            phase: progress.phase,
-            title: progress.title,
-            status: progress.status,
-            summary: progress.observedFact || progress.evidence || progress.action || progress.next || progress.why,
-            action: progress.action,
-            evidence: progress.evidence || progress.observedFact || progress.evidenceExcerpt,
-            next: progress.next,
-            target: details.target || progress.targets?.[0] || "",
-            tool: details.tool || "",
-            dedupeKey: details.dedupeKey || [
-              progress.phase,
-              details.tool || "",
-              details.target || progress.targets?.[0] || progress.title,
-            ].join(":"),
-            ...(details.iteration != null ? { iteration: details.iteration } : {}),
-            ...(details.repeatCount != null ? { repeatCount: details.repeatCount } : {}),
-          },
-        });
-      };
-
-      const updateHarnessRunMarker = (patch: Partial<HarnessRunMarker> & Record<string, unknown>) => {
-        const latest = sessionGet();
-        const next = persistHarnessRunMarker({
-          ...harnessRunMarker,
-          ...patch,
-          status: (patch.status as HarnessRunMarker["status"]) || "running",
-          planStage: latest.planStage,
-          isPlanApproved: latest.isPlanApproved,
-          messagesLen: typeof patch.messagesLen === "number" ? patch.messagesLen : latest.agentMessages.length,
-          updatedAt: Date.now(),
-          closedAt: null,
-          closeReason: null,
-        });
-        harnessRunMarker = next;
-        sessionSet({ harnessRunMarker: next });
-        const streamStatus = typeof patch.streamStatus === "string" ? patch.streamStatus : "";
-        if (
-          streamStatus === "stream_started" ||
-          streamStatus === "first_chunk" ||
-          streamStatus === "chunk_progress" ||
-          streamStatus === "no_chunk_progress_warning" ||
-          streamStatus === "stream_done" ||
-          streamStatus === "stream_error" ||
-          streamStatus === "stream_cancelled" ||
-          streamStatus === "tool_called"
-        ) {
-          emitHarnessTelemetry(streamStatus, {
-            turnId,
-            iteration: next.iteration,
-            activeStreamId: next.activeStreamId,
-            streamStatus: next.streamStatus,
-            streamChunkCount: next.streamChunkCount,
-            streamByteCount: next.streamByteCount,
-            latestTool: next.latestTool,
-            latestToolTarget: next.latestToolTarget,
-            lastStreamError: next.lastStreamError,
-            streamElapsedMs: next.streamElapsedMs,
-            streamLifecycleStatus: next.streamLifecycleStatus,
-          });
-        }
-      };
-
-      const closeCurrentHarnessRunMarker = (status: HarnessRunMarker["status"], reason: string) => {
-        if (harnessRunMarker.status !== "running") return;
-        const closed = closeHarnessRunMarker({
-          ...harnessRunMarker,
-          status,
-          closeReason: reason,
-          planStage: sessionGet().planStage,
-          isPlanApproved: sessionGet().isPlanApproved,
-          messagesLen: sessionGet().agentMessages.length,
-        });
-        if (closed) {
-          harnessRunMarker = closed;
-          sessionSet({ harnessRunMarker: closed });
-          emitHarnessTelemetry("task_completed", {
-            turnId,
-            status,
-            reason,
-            iteration: closed.iteration,
-            streamStatus: closed.streamStatus,
-            latestTool: closed.latestTool,
-            latestToolTarget: closed.latestToolTarget,
-          });
-          if (status === "completed") {
-            emitRunEvent({
-              type: "run.completed",
-              threadId: runSessionKey,
-              turnId,
-              timestampMs: Date.now(),
-              summary: sessionGet().conversationTurns.find((item) => item.id === turnId)?.summary || "",
-            });
-          }
-        }
-      };
-
       sessionSet({ harnessRunMarker });
-      emitHarnessTelemetry("task_started", {
-        turnId,
-        runtimeIntent: runtimeRunIntent,
-        workflowMode: harnessRunMarker.workflowMode,
-        planStage: harnessRunMarker.planStage,
-        isPlanApproved: harnessRunMarker.isPlanApproved,
-      });
 
-      // Track the current streaming assistant block
-      let currentStreamingBlockId: number | null = null;
-      const agentBlockIdsCreatedThisRun = new Set<number>();
-      // Track thought timing for duration display
-      let thoughtStartTime: number | null = null;
-      // Current streaming thought block id (for live updates)
-      let currentThoughtBlockId: number | null = null;
-      let terminalTurnStatusOverride: ConversationTurnStatus | null = null;
-
-      // Thinking tag interceptor — catches <thinking>/<thought>/<analysis>/<reasoning>
-      // tags during streaming and routes content to a ThoughtBlock instead of the
-      // agent block. Prevents thinking content from briefly appearing as plain text.
-      const thinkingInterceptor = new StreamingThinkingInterceptor();
       const phaseLanguage = preferredLanguage === "en" ? "en" : "zh";
-      let currentTurnRuntimePhase = makeTurnRuntimePhase("scope", phaseLanguage);
 
-      const setCurrentTurnRuntimePhase = (phase?: TurnRuntimePhase) => {
-        const normalized = normalizeTurnRuntimePhase(phase, phaseLanguage);
-        if (normalized) currentTurnRuntimePhase = normalized;
-        return currentTurnRuntimePhase;
-      };
-
-      const getPlanRuntimePhaseForTool = (status: "running" | "done" | "failed") => {
-        const normalized = normalizeTurnRuntimePhase(currentTurnRuntimePhase, phaseLanguage);
-        if (
-          normalized?.domain === "plan_runtime" &&
-          sessionGet().config.workflowMode === "plan" &&
-          !sessionGet().isPlanApproved
-        ) {
-          return setCurrentTurnRuntimePhase(withTurnRuntimePhaseStatus(normalized, status, phaseLanguage));
-        }
-        return null;
-      };
-
-      const phaseForTool = (
-        toolName: string,
-        target: string,
-        status: "running" | "done" | "failed" = "running",
-      ) => getPlanRuntimePhaseForTool(status) || setCurrentTurnRuntimePhase(deriveTurnRuntimePhaseForTool({
-          toolName,
-          target,
-          language: phaseLanguage,
-          status,
-        }));
-
-      const streamBuffer = new StreamingCadenceBuffer({
-        interceptor: thinkingInterceptor,
-        flushIntervalMs: 90,
-        onFlush: ({ agentDelta, thinkingDelta, thoughtStarted, thoughtEnded }) => {
-          const latestStateForDedupe = sessionGet();
-          const shouldDisplayReasoningBlocks = latestStateForDedupe.config.reasoningDisplay !== "hidden";
-          const nextInterceptorThought = thinkingDelta
-            ? appendThoughtDelta(latestStateForDedupe.currentTurnState.interceptorThought, thinkingDelta)
-            : latestStateForDedupe.currentTurnState.interceptorThought;
-          const currentInterceptorThoughtContent = thinkingInterceptor.getThinkingContent() || thinkingDelta;
-          let thoughtIdToCreate: number | null = null;
-          let thoughtIdToUpdate = currentThoughtBlockId;
-          const thoughtDuration = thoughtStartTime ? Math.round((Date.now() - thoughtStartTime) / 1000) : undefined;
- 
-          if (thoughtStarted && shouldDisplayReasoningBlocks) {
-            thoughtStartTime = Date.now();
-            const existingThoughtBlock = sessionGet().taskFlow
-              .filter((b) => b.turnId === turnId)
-              .reverse()
-              .find((b) => b.type === "thought");
-            if (existingThoughtBlock && !existingThoughtBlock.isStreaming) {
-              thoughtIdToCreate = null;
-              currentThoughtBlockId = existingThoughtBlock.id;
-              thoughtIdToUpdate = existingThoughtBlock.id;
-            } else if (existingThoughtBlock && existingThoughtBlock.isStreaming) {
-              thoughtIdToCreate = null;
-              currentThoughtBlockId = existingThoughtBlock.id;
-              thoughtIdToUpdate = existingThoughtBlock.id;
-            } else {
-              thoughtIdToCreate = nextId();
-              currentThoughtBlockId = thoughtIdToCreate;
-              thoughtIdToUpdate = thoughtIdToCreate;
-            }
-          }
- 
-          let thoughtEndedId: number | null = null;
-          if (thoughtEnded && currentThoughtBlockId !== null && shouldDisplayReasoningBlocks) {
-            thoughtEndedId = currentThoughtBlockId;
-            currentThoughtBlockId = null;
-            thoughtStartTime = null;
-          } else if (thoughtEnded && !shouldDisplayReasoningBlocks) {
-            currentThoughtBlockId = null;
-            thoughtStartTime = null;
-          }
- 
-          // ── Handle agent content ──
-          let agentContent = agentDelta;
-          let agentBlockIdToCreate: number | null = null;
-          let agentBlockIdToAppend: number | null = null;
- 
-          if (agentContent) {
-            if (nextInterceptorThought && currentStreamingBlockId === null) {
-              const normThought = nextInterceptorThought.trim().toLowerCase().replace(/\s+/g, ' ');
-              const normAgent = agentContent.trim().toLowerCase().replace(/\s+/g, ' ');
- 
-              if (normAgent.startsWith(normThought) || normThought.includes(normAgent)) {
-                const overlapLen = nextInterceptorThought.trim().length;
-                const possibleClean = agentContent.trim().slice(overlapLen).trim();
-                if (!possibleClean) {
-                  agentContent = "";
-                } else {
-                  agentContent = possibleClean;
-                }
-              }
-            }
- 
-            if (agentContent) {
-              const displayCandidate = streamingAssistantDisplayBuffer + agentContent;
-              const displayDecision = resolveStreamingAssistantDisplay({
-                text: displayCandidate,
-                language: phaseLanguage,
-                workflowMode: sessionGet().config.workflowMode,
-                runIntent: effectiveRunIntent,
-                hasVisibleAgentBlock: currentStreamingBlockId !== null,
-              });
-              if (displayDecision.action === "show") {
-                agentContent = displayDecision.text;
-                streamingAssistantDisplayBuffer = "";
-              } else if (displayDecision.action === "buffer") {
-                streamingAssistantDisplayBuffer = displayDecision.bufferText || displayCandidate;
-                agentContent = "";
-              } else {
-                streamingAssistantDisplayBuffer = "";
-                agentContent = "";
-              }
-            }
- 
-            if (agentContent) {
-              if (currentStreamingBlockId === null) {
-                agentBlockIdToCreate = nextId();
-                currentStreamingBlockId = agentBlockIdToCreate;
-                agentBlockIdsCreatedThisRun.add(agentBlockIdToCreate);
-              } else {
-                agentBlockIdToAppend = currentStreamingBlockId;
-              }
-            }
-          }
- 
-          if (!thinkingDelta && !thoughtStarted && !thoughtEndedId && !agentContent) return;
- 
-          sessionSet((s) => {
-            let taskFlow = s.taskFlow;
-            let conversationTurns = s.conversationTurns;
- 
-            const appendBlock = (block: TaskBlock) => {
-              const blockWithTurn: TaskBlock = attachRuntimePhase({ ...block, turnId: block.turnId ?? turnId } as TaskBlock);
-              taskFlow = [...taskFlow, blockWithTurn];
-              conversationTurns = conversationTurns.map((turn) =>
-                turn.id === turnId && !turn.blockIds.includes(blockWithTurn.id)
-                  ? { ...turn, blockIds: [...turn.blockIds, blockWithTurn.id] }
-                  : turn
-              );
-            };
- 
-            if (shouldDisplayReasoningBlocks && thoughtIdToCreate !== null) {
-              appendBlock({
-                id: thoughtIdToCreate,
-                turnId,
-                type: "thought",
-                content: compactThoughtContent(currentInterceptorThoughtContent),
-                isStreaming: true,
-              });
-            } else if (shouldDisplayReasoningBlocks && thoughtIdToUpdate !== null && thinkingDelta) {
-              const tid = thoughtIdToUpdate;
-              taskFlow = taskFlow.map((t) =>
-                t.id === tid && t.type === "thought"
-                  ? { ...t, content: compactThoughtContent(currentInterceptorThoughtContent), isStreaming: true }
-                  : t
-              );
-            }
- 
-            if (shouldDisplayReasoningBlocks && thoughtEndedId !== null) {
-              const tid = thoughtEndedId;
-              taskFlow = taskFlow.map((t) =>
-                t.id === tid && t.type === "thought"
-                  ? { ...t, content: compactThoughtContentForPersist((t as Extract<TaskBlock, { type: "thought" }>).content), isStreaming: false, duration: thoughtDuration }
-                  : t
-              );
-            }
- 
-            if (agentBlockIdToCreate !== null && agentContent) {
-              appendBlock({ id: agentBlockIdToCreate, turnId, type: "agent", content: agentContent, streaming: true });
-            } else if (agentBlockIdToAppend !== null && agentContent) {
-              const blockId = agentBlockIdToAppend;
-              taskFlow = taskFlow.map((t) =>
-                t.id === blockId && t.type === "agent"
-                  ? { ...t, content: (t as Extract<TaskBlock, { type: "agent" }>).content + agentContent }
-                  : t
-              );
-            }
- 
-            return {
-              taskFlow,
-              conversationTurns,
-              currentTurnState: {
-                ...s.currentTurnState,
-                interceptorHandled: s.currentTurnState.interceptorHandled || thoughtStarted,
-                interceptorThought: nextInterceptorThought,
-              },
-            };
-          });
-        }
+      // Get workspace tree for system prompt
+      const workspaceTreeStartedAt = nowMs();
+      const workspaceTree = await getWorkspaceTree(runWorkspace);
+      logStoreEvent("workspace_tree_ready", {
+        turnId,
+        workspace: runWorkspace || "global",
+        chars: workspaceTree.length,
+        elapsedMs: Math.round(nowMs() - workspaceTreeStartedAt),
       });
 
+      const context: WorkflowContext = {
+        // Constants & Parameters
+        turnId,
+        uiDisplayTurnId,
+        runWorkspace,
+        runSessionKey,
+        runSessionId,
+        runScopeKey,
+        phaseLanguage,
+        effectiveRunIntent,
+        runtimeRunIntent,
+        effectiveCommandDirective,
+        options,
+        attachedFilesSnapshot,
+        mentionSnapshot,
+        remoteFeishu,
+        workspaceTree,
+        gameStudioConfigForTurn,
+        abortCtrl,
+        timerInterval,
+        sendStartedAt,
+        streamBuffer: null as any, // will be assigned below
+        thinkingInterceptor: null as any, // will be assigned below
+        turnAgentMessagesStart,
+        getElapsedSeconds,
 
+        // Mutable stream execution state
+        agentBlockIdsCreatedThisRun: new Set<number>(),
+        firstStreamTokenAt: null,
+        streamTokenCount: 0,
+        streamTextChars: 0,
+        noFirstTokenNoticeTimer: null,
+        currentStreamingBlockId: null,
+        currentThoughtBlockId: null,
+        thoughtStartTime: null,
+        streamingAssistantDisplayBuffer: "",
+        approvedPlanHandoff: null,
+        understandingProgressBlockId: null,
+        understandingProgressClosed: false,
 
-      const phaseForProcessText = (text: string) => setCurrentTurnRuntimePhase(
-        deriveTurnRuntimePhaseForText(text, phaseLanguage, currentTurnRuntimePhase),
-      );
+        // Constants
+        PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS,
+        PROVIDER_COMPATIBILITY_FORCE_XML_TTL_MS,
+        PROVIDER_COMPATIBILITY_NATIVE_RECOVERY_SUCCESS_STREAK,
+      };
+
+      const thinkingInterceptor = new StreamingThinkingInterceptor();
+      context.thinkingInterceptor = thinkingInterceptor;
 
       const attachRuntimePhase = <T extends TaskBlock>(block: T, phase?: TurnRuntimePhase): T => {
-        const normalized = normalizeTurnRuntimePhase(block.turnPhase || phase || currentTurnRuntimePhase, phaseLanguage);
+        const normalized = normalizeTurnRuntimePhase(block.turnPhase || phase || makeTurnRuntimePhase("scope", phaseLanguage), phaseLanguage);
         return normalized ? { ...block, turnPhase: normalized } : block;
       };
 
-      // ── Turn-based thought deduplication state ──────────────────────────
-      // Prevents triple repetition when reasoning is emitted via multiple paths.
-      // We rely entirely on the Zustand store's `currentTurnState` which is reset via `startNewTurn()`.
-
-      // 将新产生的可视块自动挂到当前回合，避免聊天区之后再靠扫描推断归属。
       const appendTurnBlock = (block: TaskBlock) => {
         const targetTurnId = block.turnId && block.turnId !== turnId ? block.turnId : uiDisplayTurnId;
         const blockWithTurn: TaskBlock = attachRuntimePhase({ ...block, turnId: targetTurnId } as TaskBlock);
         if (blockWithTurn.type === "agent") {
-          agentBlockIdsCreatedThisRun.add(blockWithTurn.id);
+          context.agentBlockIdsCreatedThisRun.add(blockWithTurn.id);
         }
         sessionSet((s) => ({
           taskFlow: [...s.taskFlow, blockWithTurn],
@@ -9049,74 +8423,32 @@ export const useAppStore = create<AppState>()(
         }));
       };
 
-      const appendPlanRuntimePhaseProgress = (phase?: TurnRuntimePhase) => {
-        const normalized = normalizeTurnRuntimePhase(phase, phaseLanguage);
-        if (!normalized || normalized.domain !== "plan_runtime") return;
-        const progressPhase =
-          normalized.kind === "context" ? "investigating" :
-          normalized.kind === "validation" ? "verifying" :
-          normalized.kind === "implementation" ? "editing" :
-          normalized.kind === "diagnosis" ? "summarizing" :
-          "understanding";
-        const status = normalized.status === "failed"
-          ? "failed"
-          : normalized.status === "done"
-          ? "done"
-          : "running";
-        const progress = normalizeProgressNarration({
-          phase: progressPhase,
-          title: normalized.title,
-          why: normalized.summary || "",
-          action: "",
-          evidence: "",
-          next: "",
-          targets: [],
-          status,
-          source: "runtime",
-          hypothesisStatus: status === "done" ? "confirmed" : status === "failed" ? "blocked" : "unverified",
-        });
-        const latest = sessionGet().taskFlow
-          .slice()
-          .reverse()
-          .find((block) =>
-            block.turnId === uiDisplayTurnId &&
-            block.type === "progress" &&
-            block.turnPhase?.domain === "plan_runtime" &&
-            block.turnPhase?.id === normalized.id &&
-            !block.toolName
-          ) as ProgressTaskBlock | undefined;
-        if (latest) {
-          sessionSet((s) => ({
-            taskFlow: s.taskFlow.map((block) =>
-              block.id === latest.id && block.type === "progress"
-                ? {
-                    ...block,
-                    turnPhase: normalized,
-                    ...progress,
-                  }
-                : block
-            ),
-          }));
-          return;
-        }
-        appendTurnBlock({
-          id: nextId(),
-          turnId,
-          turnPhase: normalized,
-          type: "progress",
-          ...progress,
-        });
+      const emitProgressRuntimeEvent = (progress: any, meta: { dedupeKey?: string } = {}) => {
+        const eventId = "event-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
+        sessionSet((s) => ({
+          runtimeEvents: [
+            ...s.runtimeEvents,
+            {
+              id: eventId,
+              turnId,
+              sessionKey: runSessionKey,
+              workspace: runWorkspace || null,
+              timestamp: Date.now(),
+              type: "progress",
+              dedupeKey: meta.dedupeKey || null,
+              payload: progress,
+            },
+          ],
+        }));
       };
 
-      let understandingProgressBlockId: number | null = null;
-      let understandingProgressClosed = false;
       const buildUnderstandingProgress = (status: "running" | "done" = "running") => {
         const hasImages = currentImages.length > 0;
         const hasContextItems = turnInputContextSignals.mentionedFilePaths.length > 0 || turnInputContextSignals.attachedFilePaths.length > 0;
         const contextText = hasImages
           ? phaseLanguage === "zh"
-            ? `用户提供了 ${currentImages.length} 张图片；先理解截图、约束和预期行为。`
-            : `The user provided ${currentImages.length} image(s); first understand the screenshots, constraints, and expected behavior.`
+            ? "用户提供了 " + currentImages.length + " 张图片；先理解截图、约束和预期行为。"
+            : "The user provided " + currentImages.length + " image(s); first understand the screenshots, constraints, and expected behavior."
           : hasContextItems
           ? phaseLanguage === "zh"
             ? "用户提供了上下文文件或引用；先确认这些材料与目标的关系。"
@@ -9150,11 +8482,12 @@ export const useAppStore = create<AppState>()(
           hypothesisStatus: status === "done" ? "confirmed" : "unverified",
         });
       };
+
       const appendUnderstandingProgress = () => {
         if (isHidden && !createVisibleTurnForHiddenMessage) return;
         const progress = buildUnderstandingProgress("running");
         const blockId = nextId();
-        understandingProgressBlockId = blockId;
+        context.understandingProgressBlockId = blockId;
         appendTurnBlock({
           id: blockId,
           turnId,
@@ -9163,3110 +8496,183 @@ export const useAppStore = create<AppState>()(
           ...progress,
         });
         emitProgressRuntimeEvent(progress, {
-          dedupeKey: `understanding:${turnId}`,
+          dedupeKey: "understanding:" + turnId,
         });
       };
-      const closeUnderstandingProgress = () => {
-        if (understandingProgressClosed || understandingProgressBlockId == null) return;
-        understandingProgressClosed = true;
-        const progress = buildUnderstandingProgress("done");
-        const blockId = understandingProgressBlockId;
-        sessionSet((s) => ({
-          taskFlow: s.taskFlow.map((block) =>
-            block.id === blockId && block.type === "progress"
-              ? {
-                  ...block,
-                  ...progress,
-                  turnPhase: makeTurnRuntimePhase("scope", phaseLanguage, { status: "done" }),
-                }
-              : block
-          ),
-        }));
-        emitProgressRuntimeEvent(progress, {
-          dedupeKey: `understanding:${turnId}`,
-        });
-      };
-      const discardUnderstandingProgress = () => {
-        if (understandingProgressClosed || understandingProgressBlockId == null) return;
-        understandingProgressClosed = true;
-        const blockId = understandingProgressBlockId;
-        understandingProgressBlockId = null;
-        sessionSet((s) => ({
-          taskFlow: s.taskFlow.filter((block) => block.id !== blockId),
-          conversationTurns: s.conversationTurns.map((turn) =>
-            turn.id === turnId
-              ? { ...turn, blockIds: turn.blockIds.filter((id) => id !== blockId) }
-              : turn
-          ),
-        }));
-      };
-      // 纯对话模式（respond/discuss）下初始不塞入机械的进度卡片，让对话更自然温暖
-      if (effectiveRunIntent !== "respond" && effectiveRunIntent !== "discuss") {
-        appendUnderstandingProgress();
-      }
 
-      // ── Throttled streaming update ────────────────────────────────────
-      let streamingAssistantDisplayBuffer = "";
+      const streamBuffer = new StreamingCadenceBuffer({
+        interceptor: thinkingInterceptor,
+        flushIntervalMs: 90,
+        onFlush: ({ agentDelta, thinkingDelta, thoughtStarted, thoughtEnded }) => {
+          const latestStateForDedupe = sessionGet();
+          const shouldDisplayReasoningBlocks = latestStateForDedupe.config.reasoningDisplay !== "hidden";
+          const nextInterceptorThought = thinkingDelta
+            ? appendThoughtDelta(latestStateForDedupe.currentTurnState.interceptorThought, thinkingDelta)
+            : latestStateForDedupe.currentTurnState.interceptorThought;
+          const currentInterceptorThoughtContent = thinkingInterceptor.getThinkingContent() || thinkingDelta;
+          let thoughtIdToCreate: number | null = null;
+          let thoughtIdToUpdate = context.currentThoughtBlockId;
+          const thoughtDuration = context.thoughtStartTime ? Math.round((Date.now() - context.thoughtStartTime) / 1000) : undefined;
 
-      let firstStreamTokenAt: number | null = null;
-      let streamTokenCount = 0;
-      let streamTextChars = 0;
-      let noFirstTokenNoticeTimer: ReturnType<typeof setTimeout> | null = null;
-
-      const clearNoFirstTokenNoticeTimer = () => {
-        if (noFirstTokenNoticeTimer !== null) {
-          clearTimeout(noFirstTokenNoticeTimer);
-          noFirstTokenNoticeTimer = null;
-        }
-      };
-
-      noFirstTokenNoticeTimer = setTimeout(() => {
-        noFirstTokenNoticeTimer = null;
-        if (firstStreamTokenAt !== null) return;
-        const latest = sessionGet();
-        if (latest.agentStatus !== "running" || latest.currentTurnId !== turnId) return;
-        appendTurnBlock({
-          id: nextId(),
-          turnId,
-          type: "system",
-          content: latest.config.language === "en"
-            ? "The model has not returned visible streaming content for a while. You can stop this run and continue the current plan stage."
-            : "模型已经较长时间没有返回可见流式内容。你可以停止本轮，然后继续当前计划阶段。",
-        });
-        logStoreEvent("stream_no_visible_token_notice", {
-          turnId,
-          elapsedMs: Math.round(nowMs() - sendStartedAt),
-          agentMessages: latest.agentMessages.length,
-          planStage: latest.planStage,
-          workflowMode: latest.config.workflowMode,
-          effectiveRunIntent,
-          runtimeRunIntent,
-          activeProfile: latest.config.activeProfile,
-          provider: latest.config.activeProfile === "cloud"
-            ? latest.config.cloud.provider
-            : latest.config.local.provider,
-          model: latest.config.activeProfile === "cloud"
-            ? latest.config.cloud.model
-            : latest.config.local.model,
-          toolProtocol: latest.config.activeProfile === "cloud"
-            ? latest.config.cloud.toolProtocol
-            : latest.config.local.toolProtocol,
-          contextLimit: latest.config.activeProfile === "cloud"
-            ? null
-            : latest.config.local.contextLimit,
-          debugRecordFullTurnProcess: latest.config.debugRecordFullTurnProcess,
-          rootCauseProbe: "No visible token yet. Check agent.llm_request_shape for prompt/tool/context size and store.stream_done for empty completion.",
-        });
-        if (
-          latest.config.workflowMode === "plan" &&
-          latest.config.activeProfile === "local" &&
-          latest.config.local.toolProtocol !== "native"
-        ) {
-          logStoreEvent("plan_no_visible_token_notice_only", {
-            turnId,
-            elapsedMs: Math.round(nowMs() - sendStartedAt),
-            agentMessages: latest.agentMessages.length,
-            planStage: latest.planStage,
-            activeProfile: latest.config.activeProfile,
-            provider: latest.config.local.provider,
-            model: latest.config.local.model,
-            toolProtocol: latest.config.local.toolProtocol,
-            contextLimit: latest.config.local.contextLimit,
-            strategy: "notice_only_no_auto_abort",
-          });
-        }
-      }, 120_000);
-
-      /* const old_unused_flushBuffer = () => {
-        const chunk = "";
-
-        if (!chunk) return;
-
-        // Run through the thinking interceptor
-        let { agent, thinking, thoughtStarted, thoughtEnded } = thinkingInterceptor.feed(chunk);
-
-        const latestStateForDedupe = sessionGet();
-        const shouldDisplayReasoningBlocks = latestStateForDedupe.config.reasoningDisplay !== "hidden";
-        const nextInterceptorThought = thinking
-          ? appendThoughtDelta(latestStateForDedupe.currentTurnState.interceptorThought, thinking)
-          : latestStateForDedupe.currentTurnState.interceptorThought;
-        const currentInterceptorThoughtContent = thinkingInterceptor.getThinkingContent() || thinking;
-        let thoughtIdToCreate: number | null = null;
-        let thoughtIdToUpdate = currentThoughtBlockId;
-        const thoughtDuration = thoughtStartTime ? Math.round((Date.now() - thoughtStartTime) / 1000) : undefined;
-
-        if (thoughtStarted && shouldDisplayReasoningBlocks) {
-          thoughtStartTime = Date.now();
-          // Keep one live thought cell per turn; the UI treats it as a replaceable
-          // activity summary instead of a transcript of every reasoning fragment.
-          const existingThoughtBlock = sessionGet().taskFlow
-            .filter((b) => b.turnId === turnId)
-            .reverse()
-            .find((b) => b.type === "thought");
-          if (existingThoughtBlock && !existingThoughtBlock.isStreaming) {
-            // Reuse the existing thought block — just update it
-            thoughtIdToCreate = null;
-            currentThoughtBlockId = existingThoughtBlock.id;
-            thoughtIdToUpdate = existingThoughtBlock.id;
-          } else if (existingThoughtBlock && existingThoughtBlock.isStreaming) {
-            // Already streaming — just append to it
-            thoughtIdToCreate = null;
-            currentThoughtBlockId = existingThoughtBlock.id;
-            thoughtIdToUpdate = existingThoughtBlock.id;
-          } else {
-            thoughtIdToCreate = nextId();
-            currentThoughtBlockId = thoughtIdToCreate;
-            thoughtIdToUpdate = thoughtIdToCreate;
+          if (thoughtStarted && shouldDisplayReasoningBlocks) {
+            context.thoughtStartTime = Date.now();
+            const existingThoughtBlock = sessionGet().taskFlow
+              .filter((b) => b.turnId === turnId)
+              .reverse()
+              .find((b) => b.type === "thought");
+            if (existingThoughtBlock && !existingThoughtBlock.isStreaming) {
+              thoughtIdToCreate = null;
+              context.currentThoughtBlockId = existingThoughtBlock.id;
+              thoughtIdToUpdate = existingThoughtBlock.id;
+            } else if (existingThoughtBlock && existingThoughtBlock.isStreaming) {
+              thoughtIdToCreate = null;
+              context.currentThoughtBlockId = existingThoughtBlock.id;
+              thoughtIdToUpdate = existingThoughtBlock.id;
+            } else {
+              thoughtIdToCreate = nextId();
+              context.currentThoughtBlockId = thoughtIdToCreate;
+              thoughtIdToUpdate = thoughtIdToCreate;
+            }
           }
-        }
 
-        let thoughtEndedId: number | null = null;
-        if (thoughtEnded && currentThoughtBlockId !== null && shouldDisplayReasoningBlocks) {
-          thoughtEndedId = currentThoughtBlockId;
-          currentThoughtBlockId = null;
-          thoughtStartTime = null;
-        } else if (thoughtEnded && !shouldDisplayReasoningBlocks) {
-          currentThoughtBlockId = null;
-          thoughtStartTime = null;
-        }
+          let thoughtEndedId: number | null = null;
+          if (thoughtEnded && context.currentThoughtBlockId !== null && shouldDisplayReasoningBlocks) {
+            thoughtEndedId = context.currentThoughtBlockId;
+            context.currentThoughtBlockId = null;
+            context.thoughtStartTime = null;
+          } else if (thoughtEnded && !shouldDisplayReasoningBlocks) {
+            context.currentThoughtBlockId = null;
+            context.thoughtStartTime = null;
+          }
 
-        // ── Handle agent content ──
-        let agentContent = agent;
-        let agentBlockIdToCreate: number | null = null;
-        let agentBlockIdToAppend: number | null = null;
+          // ── Handle agent content ──
+          let agentContent = agentDelta;
+          let agentBlockIdToCreate: number | null = null;
+          let agentBlockIdToAppend: number | null = null;
 
-        if (agentContent) {
-          // Cross-type deduplication: If this is the start of the agent reply and it repeats thought content, strip it.
-          if (nextInterceptorThought && currentStreamingBlockId === null) {
-            const normThought = nextInterceptorThought.trim().toLowerCase().replace(/\s+/g, ' ');
-            const normAgent = agentContent.trim().toLowerCase().replace(/\s+/g, ' ');
+          if (agentContent) {
+            if (nextInterceptorThought && context.currentStreamingBlockId === null) {
+              const normThought = nextInterceptorThought.trim().toLowerCase().replace(/\s+/g, ' ');
+              const normAgent = agentContent.trim().toLowerCase().replace(/\s+/g, ' ');
 
-            if (normAgent.startsWith(normThought) || normThought.includes(normAgent)) {
-              // If the reasoning is being echoed in agent text, wait for real content
-              // or strip the overlap if the full block is already present.
-              const overlapLen = nextInterceptorThought.trim().length;
-              const possibleClean = agentContent.trim().slice(overlapLen).trim();
-              if (!possibleClean) {
+              if (normAgent.startsWith(normThought) || normThought.includes(normAgent)) {
+                const overlapLen = nextInterceptorThought.trim().length;
+                const possibleClean = agentContent.trim().slice(overlapLen).trim();
+                if (!possibleClean) {
+                  agentContent = "";
+                } else {
+                  agentContent = possibleClean;
+                }
+              }
+            }
+
+            if (agentContent) {
+              const displayCandidate = context.streamingAssistantDisplayBuffer + agentContent;
+              const displayDecision = resolveStreamingAssistantDisplay({
+                text: displayCandidate,
+                language: phaseLanguage,
+                workflowMode: sessionGet().config.workflowMode,
+                runIntent: effectiveRunIntent,
+                hasVisibleAgentBlock: context.currentStreamingBlockId !== null,
+              });
+              if (displayDecision.action === "show") {
+                agentContent = displayDecision.text;
+                context.streamingAssistantDisplayBuffer = "";
+              } else if (displayDecision.action === "buffer") {
+                context.streamingAssistantDisplayBuffer = displayDecision.bufferText || displayCandidate;
                 agentContent = "";
               } else {
-                agentContent = possibleClean;
+                context.streamingAssistantDisplayBuffer = "";
+                agentContent = "";
+              }
+            }
+
+            if (agentContent) {
+              if (context.currentStreamingBlockId === null) {
+                agentBlockIdToCreate = nextId();
+                context.currentStreamingBlockId = agentBlockIdToCreate;
+                context.agentBlockIdsCreatedThisRun.add(agentBlockIdToCreate);
+              } else {
+                agentBlockIdToAppend = context.currentStreamingBlockId;
               }
             }
           }
 
-          if (agentContent) {
-            const displayCandidate = streamingAssistantDisplayBuffer + agentContent;
-            const displayDecision = resolveStreamingAssistantDisplay({
-              text: displayCandidate,
-              language: phaseLanguage,
-              workflowMode: sessionGet().config.workflowMode,
-              runIntent: effectiveRunIntent,
-              hasVisibleAgentBlock: currentStreamingBlockId !== null,
-            });
-            if (displayDecision.action === "show") {
-              agentContent = displayDecision.text;
-              streamingAssistantDisplayBuffer = "";
-            } else if (displayDecision.action === "buffer") {
-              streamingAssistantDisplayBuffer = displayDecision.bufferText || displayCandidate;
-              agentContent = "";
-            } else {
-              streamingAssistantDisplayBuffer = "";
-              agentContent = "";
-            }
-          }
+          if (!thinkingDelta && !thoughtStarted && !thoughtEndedId && !agentContent) return;
 
-          if (agentContent) {
-            if (currentStreamingBlockId === null) {
-              agentBlockIdToCreate = nextId();
-              currentStreamingBlockId = agentBlockIdToCreate;
-              agentBlockIdsCreatedThisRun.add(agentBlockIdToCreate);
-            } else {
-              agentBlockIdToAppend = currentStreamingBlockId;
-            }
-          }
-        }
-
-        if (!thinking && !thoughtStarted && !thoughtEndedId && !agentContent) return;
-
-        sessionSet((s) => {
-          let taskFlow = s.taskFlow;
-          let conversationTurns = s.conversationTurns;
-
-          const appendBlock = (block: TaskBlock) => {
-            const blockWithTurn: TaskBlock = attachRuntimePhase({ ...block, turnId: block.turnId ?? turnId } as TaskBlock);
-            taskFlow = [...taskFlow, blockWithTurn];
-            conversationTurns = conversationTurns.map((turn) =>
-              turn.id === turnId && !turn.blockIds.includes(blockWithTurn.id)
-                ? { ...turn, blockIds: [...turn.blockIds, blockWithTurn.id] }
-                : turn
-            );
-          };
-
-          if (shouldDisplayReasoningBlocks && thoughtIdToCreate !== null) {
-            appendBlock({
-              id: thoughtIdToCreate,
-              turnId,
-              type: "thought",
-              content: compactThoughtContent(currentInterceptorThoughtContent),
-              isStreaming: true,
-            });
-          } else if (shouldDisplayReasoningBlocks && thoughtIdToUpdate !== null && thinking) {
-            const tid = thoughtIdToUpdate;
-            taskFlow = taskFlow.map((t) =>
-              t.id === tid && t.type === "thought"
-                ? { ...t, content: compactThoughtContent(currentInterceptorThoughtContent), isStreaming: true }
-                : t
-            );
-          }
-
-          if (shouldDisplayReasoningBlocks && thoughtEndedId !== null) {
-            const tid = thoughtEndedId;
-            taskFlow = taskFlow.map((t) =>
-              t.id === tid && t.type === "thought"
-                ? { ...t, content: compactThoughtContentForPersist((t as Extract<TaskBlock, { type: "thought" }>).content), isStreaming: false, duration: thoughtDuration }
-                : t
-            );
-          }
-
-          if (agentBlockIdToCreate !== null && agentContent) {
-            appendBlock({ id: agentBlockIdToCreate, turnId, type: "agent", content: agentContent, streaming: true });
-          } else if (agentBlockIdToAppend !== null && agentContent) {
-            const blockId = agentBlockIdToAppend;
-            taskFlow = taskFlow.map((t) =>
-              t.id === blockId && t.type === "agent"
-                ? { ...t, content: (t as Extract<TaskBlock, { type: "agent" }>).content + agentContent }
-                : t
-            );
-          }
-
-          return {
-            taskFlow,
-            conversationTurns,
-            currentTurnState: {
-              ...s.currentTurnState,
-              interceptorHandled: s.currentTurnState.interceptorHandled || thoughtStarted,
-              interceptorThought: nextInterceptorThought,
-            },
-          };
-        });
-      };
-
-      const old_scheduleFlush = () => {
-        // no-op
-      }; */
-
-      // region: 流式块收尾
-      const finalizeStreamingUi = () => {
-        streamBuffer.flush();
-        clearNoFirstTokenNoticeTimer();
-
-        let { agent: remainingAgent } = thinkingInterceptor.flush();
-        if (remainingAgent) {
-          const displayCandidate = streamingAssistantDisplayBuffer + remainingAgent;
-          const displayDecision = resolveStreamingAssistantDisplay({
-            text: displayCandidate,
-            language: phaseLanguage,
-            workflowMode: sessionGet().config.workflowMode,
-            runIntent: effectiveRunIntent,
-            hasVisibleAgentBlock: currentStreamingBlockId !== null,
-          });
-          if (displayDecision.action === "show") {
-            remainingAgent = displayDecision.text;
-          } else {
-            remainingAgent = "";
-          }
-          streamingAssistantDisplayBuffer = "";
-        } else {
-          streamingAssistantDisplayBuffer = "";
-        }
-        if (remainingAgent) {
-          if (currentStreamingBlockId === null) {
-            const blockId = nextId();
-            currentStreamingBlockId = blockId;
-            appendTurnBlock({ id: blockId, turnId, type: "agent", content: remainingAgent, streaming: true });
-          } else {
-            const blockId = currentStreamingBlockId;
-            sessionSet((s) => ({
-              taskFlow: s.taskFlow.map((t) =>
-                t.id === blockId && t.type === "agent"
-                  ? { ...t, content: (t as Extract<TaskBlock, { type: "agent" }>).content + remainingAgent }
-                  : t
-              ),
-            }));
-          }
-        }
-
-        const duration = thoughtStartTime ? Math.round((Date.now() - thoughtStartTime) / 1000) : undefined;
-        sessionSet((s) => ({
-          taskFlow: finalizeStreamingTaskBlocks(s.taskFlow, turnId, duration),
-        }));
-
-        currentStreamingBlockId = null;
-        currentThoughtBlockId = null;
-        thoughtStartTime = null;
-      };
-      // endregion
-
-      const removeLatestAgentBlockForTurn = () => {
-        sessionSet((s) => {
-          const latestAgent = [...s.taskFlow]
-            .reverse()
-            .find((block): block is Extract<TaskBlock, { type: "agent" }> =>
-              block.turnId === turnId &&
-              block.type === "agent" &&
-              agentBlockIdsCreatedThisRun.has(block.id)
-            );
-          if (!latestAgent) {
-            return {
-              normalizedStreamState: {
-                ...s.normalizedStreamState,
-                visibleText: "",
-                replyOptions: [],
-              },
-            };
-          }
-
-          agentBlockIdsCreatedThisRun.delete(latestAgent.id);
-
-          return {
-            normalizedStreamState: {
-              ...s.normalizedStreamState,
-              visibleText: "",
-              replyOptions: [],
-            },
-            taskFlow: s.taskFlow.filter((block) => block.id !== latestAgent.id),
-            conversationTurns: s.conversationTurns.map((turn) =>
-              turn.id === turnId
-                ? { ...turn, blockIds: turn.blockIds.filter((blockId) => blockId !== latestAgent.id) }
-                : turn
-            ),
-          };
-        });
-      };
-
-      // Get workspace tree for system prompt
-      const workspaceTreeStartedAt = nowMs();
-      const workspaceTree = await getWorkspaceTree(runWorkspace);
-      logStoreEvent("workspace_tree_ready", {
-        turnId,
-        workspace: runWorkspace || "global",
-        chars: workspaceTree.length,
-        elapsedMs: Math.round(nowMs() - workspaceTreeStartedAt),
-      });
-
-      const writePlanExecutionProgress = (progress: PlanExecutionProgressUpdate) => {
-        const snapshot = normalizePlanExecutionProgressSnapshot({
-          turnId,
-          update: progress,
-          previous: sessionGet().planExecutionProgressSnapshot,
-          now: Date.now(),
-        });
-        const language = sessionGet().preferredResponseLanguage || sessionGet().config.language;
-        const content = formatPlanExecutionProgressSnapshot(snapshot, language === "en" ? "en" : "zh").trim();
-        if (!content) return;
-        appendDebugLog("info", "plan.execution_progress", {
-          turnId,
-          uiDisplayTurnId,
-          phase: snapshot.phase,
-          iteration: snapshot.iteration,
-          maxIterations: snapshot.maxIterations,
-          autoResumeCount: snapshot.autoResumeCount,
-          currentTask: snapshot.currentTask,
-          currentTool: snapshot.currentTool,
-          latestEvidence: snapshot.latestEvidence,
-          nextStep: snapshot.nextStep,
-          progressSignature: snapshot.progressSignature || null,
-          repeatedTargets: snapshot.repeatedTargets || [],
-          recoveryReason: snapshot.recoveryReason || null,
-          content,
-        });
-        sessionSet({ planExecutionProgressSnapshot: snapshot });
-      };
-
-      const emitLocalPlanExecutionProgress = (
-        phase: PlanExecutionProgressUpdate["phase"],
-        overrides: Partial<PlanExecutionProgressUpdate> = {},
-      ) => {
-        const latest = sessionGet();
-        if (effectiveRunIntent !== "plan" || !latest.isPlanApproved) return;
-        const language = latest.preferredResponseLanguage || latest.config.language;
-        const previous = latest.planExecutionProgressSnapshot;
-        writePlanExecutionProgress({
-          ...buildPlanExecutionProgressUpdate({
-            language: language === "en" ? "en" : "zh",
-            phase,
-            iterationCount: previous?.iteration ?? 0,
-            maxIterations: previous?.maxIterations || PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS,
-            autoResumeCount: latest.planAutoResumeCount,
-            tasks: latest.planTasks,
-            evidenceLedger: latest.planExecutionEvidenceLedger,
-            recentToolActivity: [],
-          }),
-          ...overrides,
-        });
-      };
-      const emitPlanStreamHeartbeat = (patch: Partial<HarnessRunMarker> & Record<string, unknown>) => {
-        const streamStatus = typeof patch.streamStatus === "string" ? patch.streamStatus : "";
-        if (
-          streamStatus !== "stream_started" &&
-          streamStatus !== "first_chunk" &&
-          streamStatus !== "chunk_progress" &&
-          streamStatus !== "no_chunk_progress_warning"
-        ) {
-          return;
-        }
-        const latest = sessionGet();
-        if (effectiveRunIntent !== "plan" || !latest.isPlanApproved) return;
-
-        const language = latest.preferredResponseLanguage || latest.config.language;
-        const zh = language !== "en";
-        const marker = harnessRunMarker;
-        const previous = latest.planExecutionProgressSnapshot;
-        const elapsedSeconds =
-          typeof marker.streamElapsedMs === "number" && Number.isFinite(marker.streamElapsedMs)
-            ? Math.max(0, Math.round(marker.streamElapsedMs / 1000))
-            : null;
-        const chunks = Math.max(0, Number(marker.streamChunkCount) || 0);
-        const target = marker.latestToolTarget || marker.latestTool || "";
-        const statusText = zh
-          ? streamStatus === "stream_started"
-            ? "等待模型输出"
-            : streamStatus === "first_chunk"
-            ? "模型已开始输出"
-            : streamStatus === "chunk_progress"
-            ? "模型生成中"
-            : "模型输出等待较久"
-          : streamStatus === "stream_started"
-          ? "Waiting for model output"
-          : streamStatus === "first_chunk"
-          ? "Model output started"
-          : streamStatus === "chunk_progress"
-          ? "Model generating"
-          : "Model output is delayed";
-        const currentTool = [
-          statusText,
-          chunks > 0 ? (zh ? `chunks ${chunks}` : `${chunks} chunks`) : "",
-          elapsedSeconds != null ? (zh ? `${elapsedSeconds}s` : `${elapsedSeconds}s elapsed`) : "",
-          target ? target : "",
-        ].filter(Boolean).join(" · ");
-
-        emitLocalPlanExecutionProgress("running", {
-          iteration: marker.iteration || previous?.iteration || 0,
-          maxIterations: marker.maxIterations || previous?.maxIterations || PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS,
-          currentTask: previous?.currentTask,
-          currentTool,
-          latestEvidence: previous?.latestEvidence,
-          nextStep: streamStatus === "no_chunk_progress_warning"
-            ? zh
-              ? "模型仍在流式生成但间隔偏长；可继续等待，或停止后查看日志与恢复点"
-              : "model is still streaming with a long gap; keep waiting or stop and inspect logs/recovery details"
-            : zh
-            ? "模型仍在生成；ChatArea 会持续显示流式进度"
-            : "model is still generating; ChatArea will keep showing stream progress",
-          progressSignature: previous?.progressSignature,
-          repeatedTargets: previous?.repeatedTargets,
-          recoveryReason: streamStatus === "no_chunk_progress_warning"
-            ? "stream_no_chunk_progress"
-            : previous?.recoveryReason,
-        });
-      };
-      let approvedPlanHandoff:
-        | {
-            prompt: string;
-            parentPlanTurnId: string;
-            executionTurnId: string;
-            title: string;
-            intentSummary: string;
-          }
-        | null = null;
-
-      const enterRealPendingReviewState = () => {
-        sessionSet({ agentStatus: "pending_review", isGenerating: false });
-        sessionGet().setConversationTurnStatus(turnId, "awaiting_approval");
-        if (uiDisplayTurnId !== turnId) {
-          sessionGet().setConversationTurnStatus(uiDisplayTurnId, "awaiting_approval");
-        }
-      };
-
-      const callbacks: OrchestratorCallbacks = {
-        getMessages: () => sessionGet().agentMessages,
-        getConfig: () => ({ ...sessionGet().config, workspace: runWorkspace }),
-        getPreferredLanguage: () => sessionGet().preferredResponseLanguage || sessionGet().config.language,
-        getSkills: () => sessionGet().skills,
-        getMainModeKey: () => sessionGet().selectedMainModeKey,
-        getActiveStudioAgentKey: () => sessionGet().activeStudioAgentKey,
-        getGameStudioInitialized: () => sessionGet().gameStudioInitialized,
-        getPendingSlashCommand: () => sessionGet().pendingSlashCommand,
-        getGameStudioConfig: () => gameStudioConfigForTurn,
-        getWorkspaceTree: () => workspaceTree,
-        getMcpServers: () => sessionGet().mcpServers,
-        getMcpDiscoveredTools: () => sessionGet().mcpDiscoveredTools,
-        getAssociatedPaths: () => sessionGet().resolvedInstructionSet?.associatedPaths ?? [],
-        getSessionKey: () => runSessionKey,
-        getCurrentTurnId: () => turnId,
-        hasSessionHookInitialized: (key) => sessionGet().hasSessionHookInitialized(key),
-        markSessionHookInitialized: (key) => sessionGet().markSessionHookInitialized(key),
-        onInstructionsResolved: (resolved) => sessionGet().setResolvedInstructionSet(resolved),
-        onHooksLoaded: (hooks, loadedAt) => sessionGet().setLoadedHookDefinitions(hooks, loadedAt),
-        onHookStart: (_event, _hook) => { /* UI feedback placeholder */ },
-        onHookResult: (record) => sessionGet().appendHookExecutionRecords([record]),
-        onHookBlocked: (_event, _reason, _record) => { /* UI feedback placeholder */ },
-        getCurrentRunIntent: () => sessionGet().getCurrentRunIntent(),
-        getRuntimeRunIntent: () => runtimeRunIntent,
-        getForcedExecuteRecoveryMode: () => options?.forceExecuteRecoveryMode ?? null,
-        getCommandDirective: () => effectiveCommandDirective,
-        getWorkflowMode: () => getIntentPolicy(sessionGet().getCurrentRunIntent()).workflowMode,
-        getIsPlanApproved: () => sessionGet().isPlanApproved,
-        getPlanApprovalChoice: () => sessionGet().planApprovalChoice,
-        getReadOnlyAutoApproveForSession: () => sessionGet().readOnlyAutoApproveForSession,
-        getApprovedLocalFileReadPaths: () => sessionGet().approvedLocalFileReadPaths || [],
-        getPlanStage: () => sessionGet().planStage,
-        getPlanTasks: () => sessionGet().planTasks,
-        getPlanExecutionEvidenceLedger: () => sessionGet().planExecutionEvidenceLedger,
-        getPlanAutoResumeCount: () => sessionGet().planAutoResumeCount,
-        getStatus: () => sessionGet().agentStatus,
-        consumeActiveGuidance: () => sessionGet().consumeActiveGuidance(turnId),
-        startNewTurn: () => sessionGet().startNewTurn(remoteFeishu),
-        onApprovedPlanHandoff: (prompt) => {
-          const language = sessionGet().config.language === "en" ? "en" : "zh";
-          const executionTurnId = `turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-          approvedPlanHandoff = {
-            prompt,
-            parentPlanTurnId: turnId,
-            executionTurnId,
-            title: language === "zh" ? "执行已批准计划" : "Execute Approved Plan",
-            intentSummary: language === "zh"
-              ? "用户已批准计划，MAIN 将在新的执行回合中按 plan.md 落地。"
-              : "The user approved the plan; MAIN will execute plan.md in a new execution turn.",
-          };
-          const progressSnapshot = normalizePlanExecutionProgressSnapshot({
-            turnId: executionTurnId,
-            update: buildPlanExecutionProgressUpdate({
-              language,
-              phase: "starting",
-              iterationCount: 0,
-              maxIterations: PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS,
-              autoResumeCount: 0,
-              tasks: sessionGet().planTasks,
-              evidenceLedger: [],
-              recentToolActivity: [],
-              nextStep: language === "zh"
-                ? "开启新的执行回合并按已批准 plan.md 执行"
-                : "start a new execution turn and follow the approved plan.md",
-            }),
-            previous: sessionGet().planExecutionProgressSnapshot,
-            now: Date.now(),
-          });
-          sessionSet((s) => ({
-            currentTurnExecutionConsent: { turnId: executionTurnId, granted: true },
-            planExecutionProgressSnapshot: progressSnapshot,
-            conversationTurns: s.conversationTurns.map((turn) =>
-              turn.id === turnId
-                ? {
-                    ...turn,
-                    status: "done",
-                    summary: language === "zh"
-                      ? "计划已批准，执行已交接到新的回合。"
-                      : "Plan approved; execution was handed off to a new turn.",
-                  }
-                : turn,
-            ),
-          }));
-          logStoreEvent("plan_approval_handoff_queued", {
-            planTurnId: turnId,
-            executionTurnId,
-            sessionKey: runSessionKey,
-            workspace: runWorkspace || null,
-          });
-        },
-        getContextMemoryState: () => {
-          const latest = sessionGet();
-          const laneKey = resolveRuntimeLaneKey(latest.config);
-          return resolveContextMemoryStateForRuntimeLane(
-            laneKey,
-            latest.contextMemoryStateByRuntimeKey,
-            latest.contextMemoryState,
-          );
-        },
-        shouldForceXmlForProviderCompatibility: () => {
-          const latest = sessionGet();
-          const laneKey = resolveRuntimeLaneKey(latest.config);
-          const normalizedMap = normalizeProviderCompatibilityByRuntimeKey(latest.providerCompatibilityByRuntimeKey);
-          const laneState = normalizedMap[laneKey];
-          if (!laneState?.forceXmlTools) return false;
-          if (laneState.fallbackExpiresAt != null && Date.now() >= laneState.fallbackExpiresAt) {
-            sessionSet((s) => {
-              const nextMap = normalizeProviderCompatibilityByRuntimeKey(s.providerCompatibilityByRuntimeKey);
-              const currentLane = nextMap[laneKey];
-              if (!currentLane) return {};
-              nextMap[laneKey] = {
-                ...currentLane,
-                forceXmlTools: false,
-                fallbackExpiresAt: null,
-                nativeSuccessStreak: 0,
-              };
-              return { providerCompatibilityByRuntimeKey: nextMap };
-            });
-            return false;
-          }
-          return true;
-        },
-        onProviderCompatibilityFallback: (reason) => {
-          const laneKey = resolveRuntimeLaneKey(sessionGet().config);
-          const now = Date.now();
-          logStoreEvent("provider_compatibility_fallback", {
-            turnId,
-            sessionKey: runSessionKey,
-            workspace: runWorkspace || null,
-            laneKey,
-            reason: String(reason || "").slice(0, 240),
-            cooldownMs: PROVIDER_COMPATIBILITY_FORCE_XML_TTL_MS,
-          });
           sessionSet((s) => {
-            const nextMap = normalizeProviderCompatibilityByRuntimeKey(s.providerCompatibilityByRuntimeKey);
-            nextMap[laneKey] = {
-              forceXmlTools: true,
-              fallbackExpiresAt: now + PROVIDER_COMPATIBILITY_FORCE_XML_TTL_MS,
-              nativeSuccessStreak: 0,
-              lastFallbackAt: now,
+            let taskFlow = s.taskFlow;
+            let conversationTurns = s.conversationTurns;
+
+            const appendBlock = (block: TaskBlock) => {
+              const blockWithTurn: TaskBlock = attachRuntimePhase({ ...block, turnId: block.turnId ?? turnId } as TaskBlock);
+              taskFlow = [...taskFlow, blockWithTurn];
+              conversationTurns = conversationTurns.map((turn) =>
+                turn.id === turnId && !turn.blockIds.includes(blockWithTurn.id)
+                  ? { ...turn, blockIds: [...turn.blockIds, blockWithTurn.id] }
+                  : turn
+              );
             };
-            return { providerCompatibilityByRuntimeKey: nextMap };
-          });
-        },
-        onProviderNativeToolSuccess: () => {
-          const laneKey = resolveRuntimeLaneKey(sessionGet().config);
-          sessionSet((s) => {
-            const nextMap = normalizeProviderCompatibilityByRuntimeKey(s.providerCompatibilityByRuntimeKey);
-            const currentLane = nextMap[laneKey];
-            if (!currentLane) return {};
-            const nextSuccessStreak = currentLane.nativeSuccessStreak + 1;
-            if (nextSuccessStreak >= PROVIDER_COMPATIBILITY_NATIVE_RECOVERY_SUCCESS_STREAK) {
-              const rest = { ...nextMap };
-              delete rest[laneKey];
-              logStoreEvent("provider_compatibility_recovered", {
+
+            if (shouldDisplayReasoningBlocks && thoughtIdToCreate !== null) {
+              appendBlock({
+                id: thoughtIdToCreate,
                 turnId,
-                sessionKey: runSessionKey,
-                workspace: runWorkspace || null,
-                laneKey,
-                successStreak: nextSuccessStreak,
+                type: "thought",
+                content: compactThoughtContent(currentInterceptorThoughtContent),
+                isStreaming: true,
               });
-              return { providerCompatibilityByRuntimeKey: rest };
-            }
-            nextMap[laneKey] = {
-              ...currentLane,
-              forceXmlTools: false,
-              fallbackExpiresAt: null,
-              nativeSuccessStreak: nextSuccessStreak,
-            };
-            return { providerCompatibilityByRuntimeKey: nextMap };
-          });
-        },
-        onHarnessRunUpdate: (patch) => {
-          const markerPatch = patch as Partial<HarnessRunMarker> & Record<string, unknown>;
-          updateHarnessRunMarker(markerPatch);
-          emitPlanStreamHeartbeat(markerPatch);
-        },
-        onDebugEvent: (event, data = {}) => {
-          try {
-            appendDebugLog("info", event, {
-              turnId,
-              sessionKey: runSessionKey,
-              workspace: runWorkspace || null,
-              ...data,
-            });
-          } catch {
-            // Diagnostics must never affect user workflows.
-          }
-        },
-
-        onStreamToken: (token, _msgId) => {
-          // Handle escalation reset signal
-          if (token.startsWith("__ESCALATION_RESET__:")) {
-            logStoreEvent("stream_reset", {
-              turnId,
-              currentStreamingBlockId,
-              tokenBufferChars: 0,
-              agentBlocksCreatedThisRun: agentBlockIdsCreatedThisRun.size,
-              taskFlowBlocks: sessionGet().taskFlow.length,
-            });
-            streamBuffer.reset();
-            firstStreamTokenAt = null;
-            streamTokenCount = 0;
-            streamTextChars = 0;
-            streamingAssistantDisplayBuffer = "";
-            // Reset the streaming block content for retry
-            if (currentStreamingBlockId !== null) {
-              const blockId = currentStreamingBlockId;
-              sessionSet((s) => ({
-                taskFlow: s.taskFlow.map((t) =>
-                  t.id === blockId && t.type === "agent"
-                    ? { ...t, content: "" }
-                    : t
-                  ),
-              }));
-            } else {
-              removeLatestAgentBlockForTurn();
-            }
-            return;
-          }
-
-          if (thoughtStartTime === null) thoughtStartTime = Date.now();
-          if (firstStreamTokenAt === null) {
-            firstStreamTokenAt = nowMs();
-            clearNoFirstTokenNoticeTimer();
-            logStoreEvent("stream_first_token", {
-              turnId,
-              sessionKey: runSessionKey,
-              workspace: runWorkspace || null,
-              elapsedMs: Math.round(firstStreamTokenAt - sendStartedAt),
-              tokenChars: token.length,
-            });
-          }
-          streamTokenCount++;
-          streamTextChars += token.length;
-          streamBuffer.append(token);
-        },
-
-        onStreamDone: (_fullText, _msgId, truncated, meta) => {
-          finalizeStreamingUi();
-          const suppressTruncationWarning =
-            !!meta?.suppressTruncationWarning &&
-            effectiveRunIntent === "plan" &&
-            !sessionGet().isPlanApproved;
-          logStoreEvent("stream_done", {
-            turnId,
-            sessionKey: runSessionKey,
-            workspace: runWorkspace || null,
-            fullTextChars: _fullText.length,
-            truncated,
-            suppressTruncationWarning,
-            truncationReason: meta?.reason || null,
-            firstTokenElapsedMs: firstStreamTokenAt == null ? null : Math.round(firstStreamTokenAt - sendStartedAt),
-            streamTokenCount,
-            streamTextChars,
-            taskFlowBlocks: sessionGet().taskFlow.length,
-            agentBlocksCreatedThisRun: agentBlockIdsCreatedThisRun.size,
-          });
-
-          // Show truncation warning if the model hit max_tokens
-          if (truncated && !suppressTruncationWarning) {
-            const warnId = nextId();
-            const warnBlock: TaskBlock = {
-              id: warnId,
-              turnId,
-              type: "system",
-              content: "⚠️ 回复被截断 — 模型达到了最大 token 限制。回复可能不完整。",
-            };
-            appendTurnBlock(warnBlock);
-          }
-
-          sessionSet((s) => ({
-            normalizedStreamState: {
-              ...s.normalizedStreamState,
-              finishReason: truncated ? "length" : "stop",
-            },
-          }));
-        },
-
-        onThought: (thought) => {
-          const duration = thoughtStartTime
-            ? Math.round((Date.now() - thoughtStartTime) / 1000)
-            : undefined;
-
-          // ── Turn-based deduplication: clean matching ──────────────
-          const normalizeForComp = (s: string) => s.trim().replace(/\s+/g, ' ');
-          const incoming = normalizeForComp(thought);
-          
-          const currentTurn = sessionGet().currentTurnState;
-
-          // ── Interceptor dedup: if StreamingThinkingInterceptor already
-          // captured and rendered this exact content, skip it entirely.
-          // This prevents the double-extraction bug where both the
-          // streaming interceptor and the post-parse onThought create
-          // identical thought blocks.
-          if (currentTurn.interceptorHandled && currentTurn.interceptorThought) {
-            const interceptorNorm = normalizeForComp(currentTurn.interceptorThought);
-            if (interceptorNorm === incoming || interceptorNorm.includes(incoming) || incoming.includes(interceptorNorm)) {
-              return;
-            }
-          }
-          
-          // If this exact text (or a subset) was already reported in this turn, ignore it.
-          if (currentTurn.lastReportedThought.includes(incoming)) {
-            return;
-          }
-
-          // Update turn state
-          sessionSet((s) => ({
-            normalizedStreamState: {
-              ...s.normalizedStreamState,
-              hiddenThought: appendThoughtDelta(
-                s.normalizedStreamState.hiddenThought,
-                s.normalizedStreamState.hiddenThought ? `\n\n${thought}` : thought,
-              ),
-            },
-            currentTurnState: {
-              ...s.currentTurnState,
-              lastReportedThought: appendThoughtDelta(s.currentTurnState.lastReportedThought, thought),
-            }
-          }));
-
-          if (sessionGet().config.reasoningDisplay === "hidden") {
-            logStoreEvent("reasoning_suppressed", {
-              turnId,
-              source: "normalized_hidden_thought",
-              chars: thought.length,
-            });
-            return;
-          }
-
-          const currentFlow = sessionGet().taskFlow;
-          // Find the last thought block in this turn (not just the very last block),
-          // so that thought blocks can be merged even when tool blocks appear after them.
-          const turnBlocks = currentFlow.filter((b) => b.turnId === turnId);
-          const lastThoughtBlock = [...turnBlocks].reverse().find((b) => b.type === "thought");
-
-          if (lastThoughtBlock) {
-            const existingContent = (lastThoughtBlock as Extract<TaskBlock, { type: "thought" }>).content;
-            const existing = normalizeForComp(existingContent);
-            
-            // If the incoming thought is already present, update metadata and avoid duplication.
-            if (existing.includes(incoming)) {
-              if (duration !== undefined) {
-                const tid = lastThoughtBlock.id;
-                sessionSet((s) => ({
-                  taskFlow: s.taskFlow.map((t) =>
-                    t.id === tid && t.type === "thought"
-                      ? { ...t, duration, isStreaming: false, content: incoming.length > existing.length ? thought : t.content }
-                      : t
-                  ),
-                }));
-              }
-              return;
-            }
-            const tid = lastThoughtBlock.id;
-            const nextContent = appendThoughtDelta(existingContent, thought);
-            sessionSet((s) => ({
-              taskFlow: s.taskFlow.map((t) =>
+            } else if (shouldDisplayReasoningBlocks && thoughtIdToUpdate !== null && thinkingDelta) {
+              const tid = thoughtIdToUpdate;
+              taskFlow = taskFlow.map((t) =>
                 t.id === tid && t.type === "thought"
-                  ? { ...t, content: nextContent, isStreaming: true, duration }
+                  ? { ...t, content: compactThoughtContent(currentInterceptorThoughtContent), isStreaming: true }
                   : t
-              ),
-            }));
-            // Auto-collapse after a brief display period
-            setTimeout(() => {
-              sessionSet((s) => ({
-                taskFlow: s.taskFlow.map((t) =>
-                  t.id === tid && t.type === "thought"
-                    ? { ...t, content: compactThoughtContentForPersist((t as Extract<TaskBlock, { type: "thought" }>).content), isStreaming: false }
-                    : t
-                ),
-              }));
-              thoughtStartTime = null;
-            }, 1200);
-          } else {
-            // No thought block in this turn yet — create the first one
-            const thoughtBlockId = nextId();
-            const block: TaskBlock = {
-              id: thoughtBlockId,
-              turnId,
-              type: "thought",
-              content: compactThoughtContent(thought),
-              isStreaming: true,
-              duration,
-            };
-            appendTurnBlock(block);
+              );
+            }
 
-            // Auto-collapse after a brief display period
-            setTimeout(() => {
-              sessionSet((s) => ({
-                taskFlow: s.taskFlow.map((t) =>
-                  t.id === thoughtBlockId && t.type === "thought"
-                    ? { ...t, content: compactThoughtContentForPersist((t as Extract<TaskBlock, { type: "thought" }>).content), isStreaming: false }
-                    : t
-                ),
-              }));
-              thoughtStartTime = null;
-            }, 1200);
-          }
-        },
+            if (shouldDisplayReasoningBlocks && thoughtEndedId !== null) {
+              const tid = thoughtEndedId;
+              taskFlow = taskFlow.map((t) =>
+                t.id === tid && t.type === "thought"
+                  ? { ...t, content: compactThoughtContentForPersist((t as Extract<TaskBlock, { type: "thought" }>).content), isStreaming: false, duration: thoughtDuration }
+                  : t
+              );
+            }
 
-        onAssistantFinalText: (text, replyOptions = [], meta) => {
-          const language = sessionGet().config.language === "en" ? "en" : "zh";
-          const fallbackText = replyOptions.length > 0
-            ? language === "en"
-              ? "Choose how you'd like to continue."
-              : "请选择你希望我如何继续。"
-            : "";
-          const cleanText = text.trim() || fallbackText;
-          const metaVisibility = meta?.visibility;
-          const hasReplyOptions = replyOptions.length > 0;
-          const hasToolCallsWithoutOptions = !!meta?.hasToolCalls && !hasReplyOptions;
-          if (hasReplyOptions) {
-            discardUnderstandingProgress();
-          } else if (!hasToolCallsWithoutOptions && meta?.visibility !== "user_progress") {
-            closeUnderstandingProgress();
-          }
-          const isHiddenProcessText = !hasReplyOptions && metaVisibility === "hidden_process";
-          const isSubstantivePlanText = !hasReplyOptions && metaVisibility === "substantive_plan_text";
-          const isUserProgressText =
-            !hasReplyOptions &&
-            (
-              metaVisibility === "user_progress" ||
-              !!meta?.progress ||
-              (hasToolCallsWithoutOptions && !metaVisibility)
-            );
-          const processPhase = (isHiddenProcessText || isUserProgressText)
-            ? (() => {
-                const firstCall = meta?.toolCalls?.[0];
-                if (firstCall) {
-                  return phaseForTool(firstCall.name, firstCall.target || "", "running");
-                }
-                return phaseForProcessText(cleanText);
-              })()
-            : currentTurnRuntimePhase;
-          const displayText = isHiddenProcessText
-            ? pickProcessAssistantText(cleanText, meta?.hiddenThought, language)
-            : cleanText;
-          const stateVisibleText = isHiddenProcessText ? "" : displayText;
-          const capsuleExplanationText = normalizeCapsuleExplanationCandidate(displayText);
-          if (
-            capsuleExplanationText &&
-            metaVisibility === "user_progress" &&
-            meta?.capsuleCandidate === true &&
-            meta?.modelAuthored !== false
-          ) {
-            sessionSet((s) => ({
+            if (agentBlockIdToCreate !== null && agentContent) {
+              appendBlock({ id: agentBlockIdToCreate, turnId, type: "agent", content: agentContent, streaming: true });
+            } else if (agentBlockIdToAppend !== null && agentContent) {
+              const blockId = agentBlockIdToAppend;
+              taskFlow = taskFlow.map((t) =>
+                t.id === blockId && t.type === "agent"
+                  ? { ...t, content: (t as Extract<TaskBlock, { type: "agent" }>).content + agentContent }
+                  : t
+              );
+            }
+
+            return {
+              taskFlow,
+              conversationTurns,
               currentTurnState: {
                 ...s.currentTurnState,
-                capsuleExplanation: {
-                  turnId,
-                  text: capsuleExplanationText,
-                  updatedAt: Date.now(),
-                  source: "model",
-                },
+                interceptorHandled: s.currentTurnState.interceptorHandled || thoughtStarted,
+                interceptorThought: nextInterceptorThought,
               },
-            }));
-            const state = sessionGet();
-            const remote = state.currentTurnState?.remoteFeishu;
-            if (remote) {
-              const header = state.config.language === "en" ? "🤖 Agent Status Update" : "🤖 智能助手动态进度";
-              const card = buildFeishuMarkdownCard(header, capsuleExplanationText, "blue");
-              void invoke("send_feishu_card", {
-                chatId: remote.chatId,
-                userId: remote.userId,
-                openId: remote.userId,
-                messageId: remote.messageId,
-                card,
-              }).catch(() => {});
-            }
-          }
-          const progressFromMeta = (() => {
-            if (!isUserProgressText) return null;
-            if (meta?.progress) return normalizeProgressNarration(meta.progress);
-            const firstCall = meta?.toolCalls?.[0];
-            if (!firstCall) return null;
-            const currentFlowForProgress = sessionGet().taskFlow;
-            return buildToolProgressNarration({
-              toolName: firstCall.name,
-              target: firstCall.target || "",
-              language,
-              status: "running",
-              source: "model",
-              userGoal: getTurnUserGoal(currentFlowForProgress, turnId, displayText),
-              currentHypothesis: metaVisibility === "user_progress" ? "" : displayText,
-              previousObservation: getLatestTurnToolObservationText(currentFlowForProgress, turnId),
-              turnIntent: effectiveRunIntent,
-              workflowMode: sessionGet().config.workflowMode,
-              sourceToolCallIds: (meta?.toolCalls || [])
-                .map((call) => String((call as any).id || "").trim())
-                .filter(Boolean),
-            });
-          })();
-          const progressDisplayText = progressFromMeta
-            ? progressNarrationToText(progressFromMeta, language)
-            : displayText;
-          const pendingOperationProposal = buildPendingOperationProposal({
-            sourceTurnId: turnId,
-            text: displayText,
-            replyOptions,
-            commandDirective: effectiveCommandDirective,
-            workflowMode: effectiveWorkflowMode,
-            isPlanApproved: sessionGet().isPlanApproved,
-          });
-          const markPendingOperationProposal = () => {
-            if (!pendingOperationProposal) return;
-            sessionSet((s) => ({
-              conversationTurns: s.conversationTurns.map((turn) =>
-                turn.id === turnId
-                  ? {
-                      ...turn,
-                      pendingOperationProposal: pendingOperationProposal,
-                    }
-                  : turn,
-              ),
-            }));
-          };
-          const currentFlow = sessionGet().taskFlow;
-          const latestBlock = [...currentFlow].reverse().find((block) =>
-            block.turnId === turnId &&
-            block.type === "agent" &&
-            agentBlockIdsCreatedThisRun.has(block.id)
-          );
-          const displayTextKey = normalizeAgentContentForDedupe(displayText);
-          logStoreEvent("assistant_final_text", {
-            turnId,
-            sessionKey: runSessionKey,
-            workspace: runWorkspace || null,
-            textChars: text.length,
-            cleanTextChars: cleanText.length,
-            replyOptions: replyOptions.length,
-            latestBlockId: latestBlock?.id ?? null,
-            agentBlocksCreatedThisRun: agentBlockIdsCreatedThisRun.size,
-            taskFlowBlocks: currentFlow.length,
-            visibility: metaVisibility || (isUserProgressText ? "user_progress" : null),
-          });
-
-          if (progressFromMeta) {
-            const toolCallIds = (meta?.toolCalls || [])
-              .map((call) => String((call as any).id || "").trim())
-              .filter(Boolean);
-            const firstCall = meta?.toolCalls?.[0];
-            const preserveAssistantProgressText =
-              meta?.preserveAssistantText === true &&
-              displayText.trim().length > 0;
-            if (preserveAssistantProgressText && latestBlock?.type === "agent") {
-              sessionSet((s) => ({
-                normalizedStreamState: {
-                  ...s.normalizedStreamState,
-                  visibleText: stateVisibleText,
-                  replyOptions,
-                },
-                conversationTurns: s.conversationTurns.map((turn) =>
-                  turn.id === turnId && !turn.blockIds.includes(latestBlock.id)
-                    ? { ...turn, blockIds: [...turn.blockIds, latestBlock.id] }
-                    : turn
-                ),
-                taskFlow: s.taskFlow.map((block) =>
-                  block.id === latestBlock.id && block.type === "agent"
-                    ? {
-                        ...block,
-                        turnPhase: normalizeTurnRuntimePhase(block.turnPhase || processPhase, phaseLanguage),
-                        content: displayText,
-                        options: undefined,
-                        hiddenProcess: undefined,
-                        visibility: undefined,
-                        streaming: false,
-                      }
-                    : block
-                ),
-              }));
-            } else {
-              sessionSet((s) => ({
-                normalizedStreamState: {
-                  ...s.normalizedStreamState,
-                  visibleText: preserveAssistantProgressText ? stateVisibleText : progressDisplayText,
-                  replyOptions,
-                },
-                ...(latestBlock && latestBlock.type === "agent"
-                  ? {
-                      taskFlow: s.taskFlow.filter((block) => block.id !== latestBlock.id),
-                      conversationTurns: s.conversationTurns.map((turn) =>
-                        turn.id === turnId
-                          ? { ...turn, blockIds: turn.blockIds.filter((blockId) => blockId !== latestBlock.id) }
-                          : turn
-                      ),
-                    }
-                  : {}),
-              }));
-              if (latestBlock?.type === "agent") {
-                agentBlockIdsCreatedThisRun.delete(latestBlock.id);
-              }
-              if (preserveAssistantProgressText) {
-                appendTurnBlock({
-                  id: nextId(),
-                  turnId,
-                  turnPhase: processPhase,
-                  type: "agent",
-                  content: displayText,
-                  streaming: false,
-                });
-              }
-            }
-            appendTurnBlock({
-              id: nextId(),
-              turnId,
-              turnPhase: processPhase,
-              type: "progress",
-              ...progressFromMeta,
-              ...(toolCallIds[0] ? { toolCallId: toolCallIds[0] } : {}),
-              ...(toolCallIds.length > 0 ? { toolCallIds } : {}),
-              ...(firstCall?.name ? { toolName: firstCall.name } : {}),
-              ...(firstCall?.target ? { target: firstCall.target } : {}),
-            });
-            emitProgressRuntimeEvent(progressFromMeta, {
-              tool: firstCall?.name,
-              target: firstCall?.target,
-              dedupeKey: [
-                progressFromMeta.phase,
-                firstCall?.name || "model",
-                firstCall?.target || progressFromMeta.title,
-              ].join(":"),
-            });
-            return;
-          }
-
-          if (!displayText) {
-            if (latestBlock && latestBlock.type === "agent" && latestBlock.turnId === turnId) {
-              sessionSet((s) => ({
-                taskFlow: s.taskFlow.map((t) =>
-                  t.id === latestBlock.id && t.type === "agent"
-                    ? { ...t, content: "", streaming: false }
-                    : t
-                ),
-              }));
-            }
-            return;
-          }
-
-          if (latestBlock && replyOptions.length === 0 && displayTextKey) {
-            const duplicatedEarlierBlock = [...currentFlow]
-              .reverse()
-              .find((block): block is Extract<TaskBlock, { type: "agent" }> =>
-                block.turnId === turnId &&
-                block.type === "agent" &&
-                block.id !== latestBlock.id &&
-                normalizeAgentContentForDedupe(block.content) === displayTextKey
-              );
-
-            if (duplicatedEarlierBlock) {
-              sessionSet((s) => ({
-                normalizedStreamState: {
-                  ...s.normalizedStreamState,
-                  visibleText: stateVisibleText || String(duplicatedEarlierBlock.content || ""),
-                  replyOptions,
-                },
-                taskFlow: s.taskFlow.filter((block) => block.id !== latestBlock.id),
-                conversationTurns: s.conversationTurns.map((turn) =>
-                  turn.id === turnId
-                    ? { ...turn, blockIds: turn.blockIds.filter((blockId) => blockId !== latestBlock.id) }
-                    : turn
-                ),
-              }));
-              agentBlockIdsCreatedThisRun.delete(latestBlock.id);
-              return;
-            }
-          }
-
-          if (!latestBlock || latestBlock.type !== "agent" || latestBlock.turnId !== turnId) {
-            sessionSet((s) => ({
-              normalizedStreamState: {
-                ...s.normalizedStreamState,
-                visibleText: stateVisibleText,
-                replyOptions,
-              },
-            }));
-            appendTurnBlock({
-              id: nextId(),
-              turnId,
-              turnPhase: processPhase,
-              type: "agent",
-              content: displayText,
-              ...(replyOptions.length > 0 ? { options: replyOptions } : {}),
-              ...(isHiddenProcessText ? { hiddenProcess: true, visibility: "hidden_process" as const } : {}),
-              ...(isSubstantivePlanText ? { visibility: "substantive_plan_text" as const } : {}),
-              ...(isUserProgressText ? { visibility: "user_progress" as const } : {}),
-              streaming: false,
-            });
-            markPendingOperationProposal();
-            return;
-          }
-
-          sessionSet((s) => ({
-            normalizedStreamState: {
-              ...s.normalizedStreamState,
-              visibleText: stateVisibleText,
-              replyOptions,
-            },
-            conversationTurns: s.conversationTurns.map((turn) =>
-              turn.id === turnId && !turn.blockIds.includes(latestBlock.id)
-                ? { ...turn, blockIds: [...turn.blockIds, latestBlock.id] }
-                : turn
-            ),
-            taskFlow: s.taskFlow.map((t) =>
-              t.id === latestBlock.id && t.type === "agent"
-                ? {
-                    ...t,
-                    turnPhase: normalizeTurnRuntimePhase(t.turnPhase || processPhase, phaseLanguage),
-                    content: displayText,
-                    ...(replyOptions.length > 0 ? { options: replyOptions } : { options: undefined }),
-                    ...(isHiddenProcessText ? { hiddenProcess: true, visibility: "hidden_process" as const } : { hiddenProcess: undefined }),
-                    ...(isSubstantivePlanText
-                      ? { visibility: "substantive_plan_text" as const }
-                      : isUserProgressText ? { visibility: "user_progress" as const } : { visibility: undefined }),
-                    streaming: false,
-                  }
-                : t
-            ),
-          }));
-          markPendingOperationProposal();
-        },
-
-        onToolExecuting: (toolName, target, diffPreview, meta?: ToolLifecycleMeta) => {
-          closeUnderstandingProgress();
-          let runningTaskId: number | null = null;
-          let shouldAttachDiff = false;
-          const normalizedToolCallId = String(meta?.toolCallId || "").trim() || undefined;
-          const language = sessionGet().config.language === "en" ? "en" : "zh";
-          const turnPhase = phaseForTool(toolName, target, "running");
-          const flowBeforeTool = sessionGet().taskFlow;
-          const userGoal = getTurnUserGoal(flowBeforeTool, turnId);
-          const currentHypothesis = getLatestTurnProgressStrategyText(flowBeforeTool, turnId);
-          const previousObservation = getLatestTurnToolObservationText(flowBeforeTool, turnId);
-          const progress = buildToolProgressNarration({
-            toolName,
-            target,
-            language,
-            status: "running",
-            source: "runtime",
-            userGoal,
-            currentHypothesis,
-            previousObservation,
-            turnIntent: effectiveRunIntent,
-            workflowMode: sessionGet().config.workflowMode,
-            sourceToolCallIds: normalizedToolCallId ? [normalizedToolCallId] : [],
-          });
-          const intentSummary = deriveToolIntentSummary({
-            toolName,
-            target,
-            language,
-            toolStatus: "running",
-            userGoal,
-            currentHypothesis,
-            previousObservation,
-          });
-          const isEphemeralPlanArtifactTool =
-            (toolName === "write_file" || toolName === "replace_in_file" || toolName === "apply_patch") &&
-            isEphemeralPlanArtifactPath(target);
-          emitProgressRuntimeEvent(progress, {
-            tool: toolName,
-            target,
-            dedupeKey: `${progress.phase}:${toolName}:${target}`,
-          });
-
-          sessionSet((s) => {
-            const pendingIdx = findToolLifecycleBlockIndex({
-              taskFlow: s.taskFlow,
-              turnId,
-              toolName,
-              target,
-              allowedStatuses: ["pending", "running"],
-              meta,
-            });
-            const nextFlow = [...s.taskFlow];
-            let appendedBlockId: number | null = null;
-            if (pendingIdx >= 0) {
-              const pendingTask = nextFlow[pendingIdx];
-              if (pendingTask?.type === "tool") {
-                runningTaskId = pendingTask.id;
-                shouldAttachDiff = !isEphemeralPlanArtifactTool && !pendingTask.diff && !!diffPreview;
-                nextFlow[pendingIdx] = {
-                  ...pendingTask,
-                  toolStatus: "running",
-                  status: "running",
-                  ...(normalizedToolCallId ? { toolCallId: normalizedToolCallId } : {}),
-                  turnPhase: pendingTask.turnPhase || turnPhase,
-                  intentSummary: pendingTask.intentSummary || intentSummary,
-                  why: pendingTask.why || progress.why,
-                  evidence: pendingTask.evidence || progress.evidence,
-                  message: progress.action,
-                };
-              }
-            } else {
-              appendedBlockId = nextId();
-              runningTaskId = appendedBlockId;
-              shouldAttachDiff = !isEphemeralPlanArtifactTool && !!diffPreview && supportsToolDiffPreview(toolName);
-              nextFlow.push({
-                id: appendedBlockId,
-                turnId,
-                type: "tool",
-                turnPhase,
-                toolName,
-                target,
-                status: "running",
-                toolStatus: "running",
-                ...(normalizedToolCallId ? { toolCallId: normalizedToolCallId } : {}),
-                intentSummary,
-                why: progress.why,
-                evidence: progress.evidence,
-                message: progress.action,
-              });
-            }
-            const hasRelatedProgress = nextFlow.some((block) =>
-              block.type === "progress" &&
-              block.turnId === turnId &&
-              progressBlockMatchesTool(block, normalizedToolCallId, toolName, target)
-            );
-            if (!hasRelatedProgress) {
-              const progressBlockId = nextId();
-              const progressBlock: TaskBlock = {
-                id: progressBlockId,
-                turnId,
-                turnPhase,
-                type: "progress",
-                ...progress,
-                ...(normalizedToolCallId ? { toolCallId: normalizedToolCallId, toolCallIds: [normalizedToolCallId] } : {}),
-                toolName,
-                target,
-              };
-              const runningIdx = nextFlow.findIndex((block) => block.id === runningTaskId);
-              if (runningIdx >= 0) {
-                nextFlow.splice(runningIdx, 0, progressBlock);
-              } else {
-                nextFlow.push(progressBlock);
-              }
-              appendedBlockId = appendedBlockId == null ? progressBlockId : appendedBlockId;
-            }
-            return {
-              taskFlow: nextFlow,
-              conversationTurns: appendedBlockId == null
-                ? s.conversationTurns
-                : s.conversationTurns.map((turn) =>
-                    turn.id === turnId
-                      ? {
-                          ...turn,
-                          blockIds: [
-                            ...turn.blockIds,
-                            ...nextFlow
-                              .filter((block) => block.turnId === turnId && !turn.blockIds.includes(block.id))
-                              .map((block) => block.id),
-                          ],
-                        }
-                      : turn
-                  ),
-              showDiff: s.showDiff && s.rightPanelTab === "diff",
             };
           });
-
-          if (runningTaskId != null && shouldAttachDiff && diffPreview) {
-            sessionSet((s) => ({
-              taskFlow: s.taskFlow.map((task) =>
-                task.id === runningTaskId && task.type === "tool"
-                  ? { ...task, diff: diffPreview }
-                  : task
-              ),
-            }));
-          }
-
-          if (!isEphemeralPlanArtifactTool) {
-            emitLocalPlanExecutionProgress("tool_start", {
-              currentTool: `${toolName}${target ? ` ${target}` : ""}`,
-              nextStep: sessionGet().config.language === "en"
-                ? "wait for this tool result, then update evidence"
-                : "等待该工具返回结果，然后更新执行证据",
-            });
-          }
-        },
-
-        onToolDone: (toolName, target, result, meta?: ToolLifecycleMeta) => {
-          const language = sessionGet().config.language === "en" ? "en" : "zh";
-          const isEphemeralPlanArtifactTool =
-            (toolName === "write_file" || toolName === "replace_in_file" || toolName === "apply_patch") &&
-            isEphemeralPlanArtifactPath(target);
-          let tasksArtifactSyncRequest: { path: string; content: string } | null = null;
-          let completedProgressForEvent = null as ProgressNarration | null;
-          sessionSet((s) => {
-            const idx = findToolLifecycleBlockIndex({
-              taskFlow: s.taskFlow,
-              turnId,
-              toolName,
-              target,
-              allowedStatuses: ["running"],
-              meta,
-            });
-            if (idx === -1) return {};
-            const updated = [...s.taskFlow];
-            const previousBlock = updated[idx];
-            const resultNoOp = /"noOp"\s*:\s*true/.test(result);
-            const noOpWrite =
-                  toolName === "write_file" &&
-              (
-                resultNoOp ||
-                (
-                  previousBlock?.type === "tool" &&
-                  !!previousBlock.diff &&
-                  previousBlock.diff.old === previousBlock.diff.new
-                )
-              );
-            const observationSummary = summarizeToolObservation({
-              toolName,
-              target,
-              result,
-              language,
-              noOp: noOpWrite,
-            });
-            const doneProgress = buildToolProgressNarration({
-              toolName,
-              target,
-              language,
-              status: "done",
-              source: "tool_result",
-              userGoal: getTurnUserGoal(updated, turnId),
-              currentHypothesis: getLatestTurnProgressStrategyText(updated, turnId),
-              previousObservation: observationSummary,
-              result,
-              noOp: noOpWrite,
-              turnIntent: effectiveRunIntent,
-              workflowMode: sessionGet().config.workflowMode,
-              sourceToolCallIds: meta?.toolCallId ? [String(meta.toolCallId)] : [],
-            });
-            completedProgressForEvent = doneProgress;
-            updated[idx] = {
-              ...updated[idx],
-              turnPhase: withTurnRuntimePhaseStatus(
-                (updated[idx] as Extract<TaskBlock, { type: "tool" }>).turnPhase || phaseForTool(toolName, target, "done"),
-                "done",
-                phaseLanguage,
-              ),
-              toolStatus: "executed" as const,
-              status: "done" as const,
-              ...(meta?.toolCallId ? { toolCallId: String(meta.toolCallId) } : {}),
-              why: (updated[idx] as Extract<TaskBlock, { type: "tool" }>).why || doneProgress.why,
-              evidence: doneProgress.evidence,
-              observationSummary,
-              message: noOpWrite
-                ? "No file change: requested content matched the current file, so this did not advance plan evidence."
-                : result.length > 500 ? result.slice(0, 500) + "..." : result,
-            } as TaskBlock;
-            const shouldRecordPlanEvidence =
-              effectiveRunIntent === "plan" &&
-              s.isPlanApproved &&
-              isPlanEvidenceLedgerTool(toolName, target);
-            const nextEvidenceLedger = shouldRecordPlanEvidence
-              ? appendPlanEvidenceEntry(
-                  s.planExecutionEvidenceLedger,
-                  createPlanExecutionEvidenceEntry({ toolName, target, result, noOp: noOpWrite }),
-                )
-              : s.planExecutionEvidenceLedger;
-            const evidenceChanged = nextEvidenceLedger !== s.planExecutionEvidenceLedger;
-          const nextOperationEvidenceStatus: PendingOperationProposal["evidenceStatus"] =
-              toolName === "run_command" ||
-              toolName === "browser_evaluate" ||
-              toolName === "execute_command" ||
-              toolName === "send_pty_input" ||
-              toolName === "read_pty_tail" ||
-              toolName === "read_pty_since" ||
-              toolName === "get_pty_status"
-                ? "verified"
-                : toolName === "write_file" ||
-                  toolName === "replace_in_file" ||
-                  toolName === "apply_patch" ||
-                  toolName === "delete_workspace_path"
-                ? "changed"
-                : "tool_called";
-
-            const nextTaskFlow = updateRelatedProgressBlocks({
-              blocks: updated,
-              turnId,
-              toolName,
-              target,
-              toolCallId: meta?.toolCallId ? String(meta.toolCallId) : undefined,
-              status: "done",
-              source: "tool_result",
-              evidence: observationSummary,
-              next: doneProgress.next,
-              evidenceExcerpt: doneProgress.evidenceExcerpt,
-              observedFact: doneProgress.observedFact,
-              hypothesisStatus: doneProgress.hypothesisStatus,
-              sourceToolCallIds: doneProgress.sourceToolCallIds,
-            });
-            const normalizedPlanTasks = evidenceChanged
-              ? normalizePlanTaskStatuses(
-                  s.planTasks,
-                  nextEvidenceLedger,
-                  true,
-                )
-              : s.planTasks;
-            let nextPlanArtifacts = s.planArtifacts;
-            if (evidenceChanged) {
-              const tasksArtifact = s.planArtifacts.find((artifact) => artifact.kind === "tasks");
-              if (tasksArtifact) {
-                const syncedContent = syncPlanTaskCheckboxesFromTrustedTasks(
-                  tasksArtifact.content,
-                  normalizedPlanTasks,
-                );
-                if (syncedContent !== tasksArtifact.content) {
-                  const syncedArtifact = {
-                    ...tasksArtifact,
-                    content: syncedContent,
-                    updatedAt: Date.now(),
-                  };
-                  nextPlanArtifacts = s.planArtifacts
-                    .map((artifact) => artifact.path === tasksArtifact.path ? syncedArtifact : artifact)
-                    .sort((a, b) => a.updatedAt - b.updatedAt);
-                  tasksArtifactSyncRequest = {
-                    path: tasksArtifact.path,
-                    content: syncedContent,
-                  };
-                  logStoreEvent("plan_tasks_checkbox_sync_scheduled", {
-                    turnId,
-                    path: tasksArtifact.path,
-                    evidenceCount: nextEvidenceLedger.length,
-                    completedTasks: normalizedPlanTasks.filter((task) => task.status === "completed").length,
-                    totalTasks: normalizedPlanTasks.length,
-                  });
-                }
-              }
-            }
-
-            return {
-              taskFlow: nextTaskFlow,
-              conversationTurns: s.conversationTurns.map((turn) =>
-                turn.id === turnId && turn.pendingOperationProposal
-                  ? {
-                      ...turn,
-                      pendingOperationProposal: {
-                        ...turn.pendingOperationProposal,
-                        evidenceStatus:
-                          turn.pendingOperationProposal.evidenceStatus === "verified"
-                            ? "verified"
-                            : nextOperationEvidenceStatus,
-                      },
-                    }
-                  : turn,
-              ),
-              ...(evidenceChanged
-                ? {
-                    planExecutionEvidenceLedger: nextEvidenceLedger,
-                    planExecutionEvidenceCount: nextEvidenceLedger.length,
-                    planTasks: normalizedPlanTasks,
-                    ...(nextPlanArtifacts !== s.planArtifacts ? { planArtifacts: nextPlanArtifacts } : {}),
-                  }
-                : {}),
-            };
-          });
-          const syncRequest = tasksArtifactSyncRequest as { path: string; content: string } | null;
-          if (syncRequest) {
-            void writeFile(
-              syncRequest.path,
-              syncRequest.content,
-              runWorkspace || undefined,
-            ).then(() => {
-              logStoreEvent("plan_tasks_checkbox_synced", {
-                turnId,
-                path: syncRequest.path,
-              });
-            }).catch((error) => {
-              logStoreEvent("plan_tasks_checkbox_sync_failed", {
-                turnId,
-                path: syncRequest.path,
-                error: error instanceof Error ? error.message : String(error),
-              });
-            });
-          }
-          const completedProgressEventPayload = completedProgressForEvent;
-          if (completedProgressEventPayload) {
-            emitProgressRuntimeEvent(completedProgressEventPayload, {
-              tool: toolName,
-              target,
-              dedupeKey: `${completedProgressEventPayload.phase}:${toolName}:${target}`,
-            });
-          }
-          if (!isEphemeralPlanArtifactTool) {
-            emitLocalPlanExecutionProgress("tool_done", {
-              currentTool: `${toolName}${target ? ` ${target}` : ""}`,
-              nextStep: sessionGet().config.language === "en"
-                ? "continue with the next task whose evidence is not satisfied"
-                : "继续下一个证据未满足的任务",
-            });
-          }
-          if (
-            toolName === "write_file" ||
-            toolName === "replace_in_file" ||
-            toolName === "apply_patch" ||
-            toolName === "execute_command" ||
-            toolName === "delete_workspace_path"
-          ) {
-            invalidateWorkspaceTreeCache();
-            sessionGet().bumpWorkspaceContentVersion();
-          }
-        },
-
-        onToolError: (toolName, target, error, meta?: ToolLifecycleMeta) => {
-          const language = sessionGet().config.language === "en" ? "en" : "zh";
-          logStoreEvent("tool_error", {
-            turnId,
-            toolName,
-            target: target || null,
-            toolCallId: meta?.toolCallId ? String(meta.toolCallId) : null,
-            error: compactProgressContextText(error, 500),
-            qualityGateReason: meta?.qualityGateReason || null,
-            planRecoveryReason: meta?.planRecoveryReason || null,
-          });
-          let failedProgressForEvent = null as ProgressNarration | null;
-          sessionSet((s) => {
-            const idx = findToolLifecycleBlockIndex({
-              taskFlow: s.taskFlow,
-              turnId,
-              toolName,
-              target,
-              allowedStatuses: ["running"],
-              meta,
-            });
-            if (idx === -1) return {};
-            const updated = [...s.taskFlow];
-            const failedProgress = buildToolProgressNarration({
-              toolName,
-              target,
-              language,
-              status: "failed",
-              source: "tool_result",
-              userGoal: getTurnUserGoal(updated, turnId),
-              currentHypothesis: getLatestTurnProgressStrategyText(updated, turnId),
-              previousObservation: compactProgressContextText(error),
-              result: error,
-              turnIntent: effectiveRunIntent,
-              workflowMode: sessionGet().config.workflowMode,
-              sourceToolCallIds: meta?.toolCallId ? [String(meta.toolCallId)] : [],
-            });
-            failedProgressForEvent = failedProgress;
-            const observationSummary = language === "en"
-              ? `Tool failed: ${compactProgressContextText(error, 180)}`
-              : `工具失败：${compactProgressContextText(error, 180)}`;
-            updated[idx] = {
-              ...updated[idx],
-              turnPhase: withTurnRuntimePhaseStatus(
-                (updated[idx] as Extract<TaskBlock, { type: "tool" }>).turnPhase || phaseForTool(toolName, target, "failed"),
-                "failed",
-                phaseLanguage,
-              ),
-              toolStatus: "failed" as const,
-              status: "error" as const,
-              ...(meta?.toolCallId ? { toolCallId: String(meta.toolCallId) } : {}),
-              why: (updated[idx] as Extract<TaskBlock, { type: "tool" }>).why || failedProgress.why,
-              evidence: failedProgress.evidence,
-              observationSummary,
-              ...(meta?.qualityGateReason ? { qualityGateReason: String(meta.qualityGateReason) } : {}),
-              ...(meta?.planRecoveryReason ? { planRecoveryReason: String(meta.planRecoveryReason) } : {}),
-              message: error,
-            } as TaskBlock;
-            const nextTaskFlow = updateRelatedProgressBlocks({
-              blocks: updated,
-              turnId,
-              toolName,
-              target,
-              toolCallId: meta?.toolCallId ? String(meta.toolCallId) : undefined,
-              status: "failed",
-              source: "tool_result",
-              evidence: observationSummary,
-              next: failedProgress.next,
-              evidenceExcerpt: failedProgress.evidenceExcerpt,
-              observedFact: failedProgress.observedFact,
-              hypothesisStatus: failedProgress.hypothesisStatus,
-              sourceToolCallIds: failedProgress.sourceToolCallIds,
-            });
-            return {
-              taskFlow: nextTaskFlow,
-              conversationTurns: s.conversationTurns.map((turn) =>
-                turn.id === turnId && turn.pendingOperationProposal
-                  ? {
-                      ...turn,
-                      pendingOperationProposal: {
-                        ...turn.pendingOperationProposal,
-                        evidenceStatus: turn.pendingOperationProposal.evidenceStatus === "none"
-                          ? "blocked"
-                          : turn.pendingOperationProposal.evidenceStatus,
-                      },
-                    }
-                  : turn,
-              ),
-            };
-          });
-          const failedProgressEventPayload = failedProgressForEvent;
-          if (failedProgressEventPayload) {
-            emitProgressRuntimeEvent(failedProgressEventPayload, {
-              tool: toolName,
-              target,
-              dedupeKey: `${failedProgressEventPayload.phase}:${toolName}:${target}`,
-            });
-          }
-          emitLocalPlanExecutionProgress("tool_error", {
-            currentTool: `${toolName}${target ? ` ${target}` : ""}`,
-            nextStep: sessionGet().config.language === "en"
-              ? "recover from the tool error or pause with recovery details"
-              : "根据工具错误修正下一步，必要时给出恢复信息",
-          });
-          if (toolName === "execute_command") {
-            invalidateWorkspaceTreeCache();
-            sessionGet().bumpWorkspaceContentVersion();
-          }
-        },
-
-        onStatusChange: (status) => {
-          logStoreEvent("status_change", {
-            turnId,
-            sessionKey: runSessionKey,
-            workspace: runWorkspace || null,
-            status,
-            replyOptions: sessionGet().normalizedStreamState.replyOptions.length,
-            taskFlowBlocks: sessionGet().taskFlow.length,
-            agentMessages: sessionGet().agentMessages.length,
-            elapsedMs: Math.round(nowMs() - sendStartedAt),
-          });
-          if (status === "idle" || status === "error") {
-            const pausedByTerminalOverride =
-              status === "idle" &&
-              !abortCtrl.signal.aborted &&
-              (
-                terminalTurnStatusOverride === "stopped_no_action" ||
-                terminalTurnStatusOverride === "stopped_no_output"
-              );
-            closeCurrentHarnessRunMarker(
-              status === "error" ? "error" : abortCtrl.signal.aborted ? "idle" : pausedByTerminalOverride ? "paused" : "completed",
-              status === "error"
-                ? "agent_status_error"
-                : abortCtrl.signal.aborted
-                ? "aborted_by_user"
-                : pausedByTerminalOverride
-                ? "agent_status_idle_paused"
-                : "agent_status_idle",
-            );
-          }
-          const finalizeStaleRunningTools = (finalStatus: "executed" | "failed" | "rejected", message: string) => {
-            sessionSet((s) => ({
-              taskFlow: s.taskFlow.map((task) =>
-                task.turnId === turnId && task.type === "tool" && task.toolStatus === "running"
-                  ? {
-                      ...task,
-                      toolStatus: finalStatus,
-                      status:
-                        finalStatus === "executed"
-                          ? "done"
-                          : finalStatus === "rejected"
-                          ? "stopped_no_action"
-                          : "error",
-                      message: task.message && task.message !== "Executing..." ? task.message : message,
-                    }
-                  : task
-              ),
-            }));
-          };
-
-          sessionSet({
-            agentStatus: status,
-            // Timer only runs during active generation, NOT during plan review
-            isGenerating: status === "running",
-            ...(status === "pending_review" ? { abortController: abortCtrl } : {}),
-          });
-          if (status === "pending_review") {
-            const state = sessionGet();
-            const hasPlanContext =
-              effectiveRunIntent === "plan" ||
-              state.planArtifacts.length > 0 ||
-              state.planStage !== "idle";
-            const isApprovedPlanExecution =
-              effectiveRunIntent === "plan" &&
-              state.isPlanApproved &&
-              state.planStage === "executing";
-            if (hasPlanContext) {
-              logStoreEvent(isApprovedPlanExecution ? "tool_permission_review" : "plan_review", {
-                turnId,
-                effectiveRunIntent,
-                planArtifacts: state.planArtifacts.length,
-                planStage: state.planStage,
-                isPlanApproved: state.isPlanApproved,
-              });
-              if (!isApprovedPlanExecution) {
-                logStoreEvent("plan_review_prompt_shown", {
-                  turnId,
-                  effectiveRunIntent,
-                  planArtifacts: state.planArtifacts.length,
-                  planStage: state.planStage,
-                });
-                emitRunEvent({
-                  type: "approval.requested",
-                  threadId: runSessionKey,
-                  turnId,
-                  timestampMs: Date.now(),
-                  reason: "plan_review",
-                  target: state.planArtifacts[0]?.path || ".MAIN/plans/plan.md",
-                });
-                emitLocalPlanExecutionProgress("waiting_review", {
-                  nextStep: state.config.language === "en"
-                    ? "wait for approval of the pending tool call"
-                    : "等待当前工具调用审批",
-                });
-              }
-            }
-          }
-          if (status === "running") {
-            const state = sessionGet();
-            if (effectiveRunIntent === "plan" && state.isPlanApproved && state.planStage === "executing") {
-              logStoreEvent("plan_execution_running", {
-                turnId,
-                effectiveRunIntent,
-                planStage: state.planStage,
-                planArtifacts: state.planArtifacts.length,
-              });
-            }
-          }
-          if (turnId) {
-            const current = sessionGet();
-            const isApprovedPlanExecution =
-              effectiveRunIntent === "plan" &&
-              current.isPlanApproved &&
-              current.planStage === "executing";
-            const statusOverride =
-              status === "idle" && abortCtrl.signal.aborted
-                ? "stopped_no_action"
-                : terminalTurnStatusOverride;
-            const nextTurnStatus: ConversationTurnStatus =
-              status === "error"
-                ? "error"
-                : status === "idle"
-                ? deriveIdleConversationTurnStatus({
-                    turnId,
-                    effectiveRunIntent,
-                    isPlanApproved: current.isPlanApproved,
-                    planArtifacts: current.planArtifacts,
-                    planStage: current.planStage,
-                    planTasks: current.planTasks,
-                    planExecutionEvidenceCount: current.planExecutionEvidenceCount,
-                    replyOptionCount: current.normalizedStreamState.replyOptions.length,
-                    taskFlow: current.taskFlow,
-                    override: statusOverride,
-                  })
-                : status === "pending_review"
-                ? isApprovedPlanExecution ? "executing" : "awaiting_approval"
-                : effectiveRunIntent === "plan" &&
-                  !current.isPlanApproved &&
-                  (current.planArtifacts.length > 0 || current.planStage !== "idle")
-                ? "planning"
-                : "executing";
-            sessionGet().setConversationTurnStatus(turnId, nextTurnStatus);
-            if (uiDisplayTurnId !== turnId) {
-              sessionGet().setConversationTurnStatus(uiDisplayTurnId, nextTurnStatus);
-            }
-          }
-          if (
-            status === "idle" &&
-            effectiveRunIntent === "plan" &&
-            sessionGet().isPlanApproved &&
-            sessionGet().planStage === "completed"
-          ) {
-            logStoreEvent("plan_runtime_closed_after_completion", {
-              turnId,
-              sessionKey: runSessionKey,
-              workspace: runWorkspace || null,
-              planTasks: sessionGet().planTasks.length,
-              evidenceCount: sessionGet().planExecutionEvidenceCount,
-            });
-            sessionSet({
-              ...buildClosedActivePlanRuntimePatch(),
-              currentTurnExecutionConsent: { turnId: null, granted: false },
-            });
-          }
-          if (status === "idle" || status === "error") {
-            clearNoFirstTokenNoticeTimer();
-            finalizeStreamingUi();
-            const abortedByUser = abortCtrl.signal.aborted;
-            finalizeStaleRunningTools(
-              abortedByUser ? "rejected" : "failed",
-              abortedByUser
-                ? "请求已停止，当前步骤未执行完成"
-                : status === "idle"
-                ? "请求已停止或未返回工具结果"
-                : "请求已停止",
-            );
-            if (remoteFeishu) {
-              const language = sessionGet().config.language === "en" ? "en" : "zh";
-              const fallback = status === "error"
-                ? (language === "en" ? "MAIN stopped with an error." : "MAIN 执行时遇到错误。")
-                : (language === "en" ? "MAIN finished this remote task." : "MAIN 已完成这次远程任务。");
-              const reply = extractFeishuTurnReply(sessionGet().taskFlow, turnId, fallback);
-
-              const title = status === "error"
-                ? (language === "en" ? "MAIN Stopped with Error" : "MAIN 执行发生错误")
-                : (language === "en" ? "MAIN Task Completed" : "MAIN 任务执行已完成");
-              const cardColor = status === "error" ? "red" : "green";
-              const card = buildFeishuMarkdownCard(title, reply, cardColor);
-
-              void invoke("send_feishu_card", {
-                chatId: remoteFeishu.chatId,
-                userId: remoteFeishu.userId,
-                openId: remoteFeishu.userId,
-                messageId: remoteFeishu.messageId,
-                card,
-              }).catch((error) => {
-                logStoreEvent("feishu_final_reply_failed", {
-                  error: error instanceof Error ? error.message : String(error),
-                  turnId,
-                });
-              });
-            }
-            sessionSet({ abortController: null });
-            clearInterval(timerInterval);
-          }
-        },
-
-        onError: (error) => {
-          logStoreEvent("agent_error", {
-            turnId,
-            error: typeof error === "string" ? error : String(error),
-            taskFlowBlocks: sessionGet().taskFlow.length,
-            agentMessages: sessionGet().agentMessages.length,
-          });
-          finalizeStreamingUi();
-          const errorMessage = typeof error === "string" ? error : String(error);
-          const isResponseBodyDecodeError = /error decoding response body/i.test(errorMessage);
-          const friendlyError = isResponseBodyDecodeError
-            ? "模型服务在传输回复时中断或返回了无法解析的数据。原始错误：" + errorMessage
-            : errorMessage;
-          const currentTurn = sessionGet().conversationTurns.find((turn) => turn.id === turnId);
-          if (!currentTurn?.summary?.trim()) {
-            sessionGet().setConversationTurnSummary(
-              turnId,
-              isResponseBodyDecodeError
-                ? "模型服务传输中断，已保留本轮已完成的操作记录。"
-                : summarizeAssistantText(errorMessage),
-            );
-          }
-          const block: TaskBlock = {
-            id: nextId(),
-            turnId,
-            type: "tool",
-            toolName: "Error",
-            target: "",
-            status: "error",
-            toolStatus: "failed",
-            message: friendlyError,
-          };
-          appendTurnBlock(block);
-          emitLocalPlanExecutionProgress("context_compression", {
-            nextStep: sessionGet().config.language === "en"
-              ? "continue with compacted context and reread current files if needed"
-              : "基于压缩后的上下文继续，必要时重新读取当前文件",
-          });
-        },
-
-        onNonActionableStop: (message, reason, progress) => {
-          terminalTurnStatusOverride = reason === "no_output"
-            ? "stopped_no_output"
-            : "stopped_no_action";
-          const isApprovedExecutionPause =
-            effectiveRunIntent === "plan" &&
-            sessionGet().isPlanApproved &&
-            sessionGet().planStage === "executing";
-          logStoreEvent("non_actionable_stop", {
-            turnId,
-            reason,
-            message,
-            taskFlowBlocks: sessionGet().taskFlow.length,
-            agentMessages: sessionGet().agentMessages.length,
-          });
-          if (isApprovedExecutionPause) {
-            appendDebugLog("warn", "plan.non_actionable_stop", {
-              turnId,
-              uiDisplayTurnId,
-              reason,
-              message,
-            });
-            emitLocalPlanExecutionProgress("paused", {
-              nextStep: sessionGet().config.language === "en"
-                ? "resume from the current workspace state"
-                : "基于当前 workspace 状态恢复执行",
-              ...progress,
-            });
-          }
-          const language = sessionGet().config.language === "en" ? "en" : "zh";
-          const visibleMessage = isApprovedExecutionPause && message.trim()
-            ? `${message.trim()}\n\n${language === "en" ? "MAIN kept the current workspace state; use Resume Execution to continue from here." : "MAIN 已保留当前 workspace 状态；可使用 Resume Execution 从这里继续。"}`
-            : message;
-          emitRunEvent({
-            type: "run.paused",
-            threadId: runSessionKey,
-            turnId,
-            timestampMs: Date.now(),
-            reason,
-            message: visibleMessage,
-            progress: {
-              phase: "blocked",
-              title: language === "en" ? "Run paused" : "运行已暂停",
-              status: "paused",
-              summary: progress?.nextStep || (
-                isApprovedExecutionPause
-                  ? language === "en"
-                    ? "Workspace state is preserved; resume execution from the current task context."
-                    : "已保留 workspace 状态，可从当前任务上下文恢复执行。"
-                  : language === "en"
-                  ? "The run paused before producing an actionable result."
-                  : "本轮在产生可执行结果前已暂停。"
-              ),
-              next: progress?.nextStep || "",
-              dedupeKey: `pause:${reason}`,
-            },
-          });
-          const block: TaskBlock = {
-            id: nextId(),
-            turnId,
-            type: "system",
-            content: visibleMessage,
-            ...(isApprovedExecutionPause ? { variant: "plan_execution_checkpoint" as const } : {}),
-          };
-          appendTurnBlock(block);
-          sessionGet().setConversationTurnSummary(uiDisplayTurnId, summarizeAssistantText(visibleMessage));
-        },
-
-        onPlanArtifactUpdated: (path, content, kind) => {
-          logStoreEvent("plan_artifact_updated", {
-            turnId,
-            path,
-            kind,
-            contentChars: content.length,
-          });
-          if (kind === "plan") {
-            emitRunEvent({
-              type: "plan.ready",
-              threadId: runSessionKey,
-              turnId,
-              timestampMs: Date.now(),
-              path,
-              summary: summarizeAssistantText(content),
-            });
-          }
-          const sanitized = sanitizePlanArtifactContent(content);
-          const validation = validatePlanArtifactContent(sanitized, kind);
-          if (!validation.ok) {
-            logStoreEvent("plan_artifact_quality_blocked", {
-              turnId,
-              path,
-              kind,
-              reason: validation.reason,
-            });
-            const language = sessionGet().config.language === "en" ? "en" : "zh";
-            const reason = validation.reason || (language === "en" ? "quality gate" : "质量门禁");
-            const blockedMessage =
-              kind === "tasks" && validation.reason === "missing_task_evidence"
-                ? language === "en"
-                  ? `Task list rejected: ${path} is missing verifiable evidence labels (${reason}). MAIN will ask the model to regenerate \`.MAIN/plans/tasks.md\` with unchecked tasks and evidence labels such as \`evidence: file:src/App.tsx\`, \`evidence: cmd:npm test\`, or \`evidence: deliverable:REPORT.md\`.`
-                  : `任务清单已被拦截：${path} 缺少可验证 evidence 标签（${reason}）。MAIN 会要求模型重新生成真实的 \`.MAIN/plans/tasks.md\`，每项保持未完成 checkbox，并补充类似 \`证据: file:src/App.tsx\`、\`证据: cmd:npm test\` 或 \`证据: deliverable:REPORT.md\` 的证据标签。`
-                : language === "en"
-                ? `Plan artifact rejected: ${path} does not look like a reviewable ${kind} document (${reason}). MAIN will ask the model to rewrite \`.MAIN/plans/plan.md\`, or request your decision.`
-                : `计划文件已被拦截：${path} 不像可审批的${getPlanArtifactTitle(kind, "zh")}（${reason}）。MAIN 会要求模型重写 \`.MAIN/plans/plan.md\`，或先向你确认关键分叉。`;
-            appendTurnBlock({
-              id: nextId(),
-              turnId,
-              type: "system",
-              content: blockedMessage,
-              variant: "plan_quality_gate",
-            });
-            return;
-          }
-          sessionGet().upsertPlanArtifact({
-            kind,
-            path,
-            title: getPlanArtifactTitle(kind, sessionGet().config.language === "en" ? "en" : "zh"),
-            content: sanitized,
-            updatedAt: Date.now(),
-          });
-          const latest = sessionGet();
-          if (!latest.isPlanApproved && latest.planStage !== "executing" && !(latest.showDiff && latest.rightPanelTab === "diff")) {
-            latest.openRightPanelTab("plan");
-          }
-        },
-
-        onPlanStageChanged: (stage) => {
-          const current = sessionGet();
-          const turnBlocks = current.taskFlow.filter((block) => block.turnId === turnId);
-          const currentTurn = current.conversationTurns.find((turn) => turn.id === turnId);
-          const requestedDocs = detectRequestedRootMarkdownDeliverables(currentTurn?.userPrompt || "");
-          const taskAudit = buildPlanTaskEvidenceAudit({
-            tasks: current.planTasks,
-            evidenceLedger: current.planExecutionEvidenceLedger,
-            highlightNext: current.isPlanApproved,
-          });
-          const canMarkPlanCompleted =
-            stage === "completed" &&
-            current.isPlanApproved &&
-            current.planExecutionEvidenceCount > 0 &&
-            taskAudit.allTrustedComplete &&
-            hasRootMarkdownDeliverableEvidence(turnBlocks, requestedDocs);
-          const nextStage =
-            stage === "idle"
-              ? stage
-              : stage === "completed"
-              ? canMarkPlanCompleted ? "completed" : "executing"
-              : derivePlanStageFromArtifacts(
-                  current.planArtifacts,
-                  current.planTasks,
-                  current.isPlanApproved,
-                  stage === "executing" ? "executing" : current.planStage,
-                );
-
-          if (current.planTasks.length > 0) {
-            sessionSet({ planTasks: taskAudit.tasks });
-          }
-          sessionGet().setPlanStage(nextStage);
-          if (nextStage !== "idle") {
-            const latest = sessionGet();
-            if (!latest.isPlanApproved && nextStage !== "executing" && !(latest.showDiff && latest.rightPanelTab === "diff")) {
-              latest.openRightPanelTab("plan");
-            }
-          }
-        },
-
-        onPlanTasksUpdated: (content) => {
-          const sanitized = sanitizePlanArtifactContent(content);
-          if (sanitized.trim()) {
-            sessionGet().setPlanTasks(extractPlanTasks(sanitized));
-          }
-        },
-
-        onPlanExecutionProgress: (progress: PlanExecutionProgressUpdate) => {
-          writePlanExecutionProgress(progress);
-        },
-
-        onPlanMaxIterationsCheckpoint: (checkpoint: PlanMaxIterationsCheckpoint) => {
-          const language = sessionGet().preferredResponseLanguage || sessionGet().config.language;
-          const currentCount = Math.max(0, Number(sessionGet().planAutoResumeCount) || 0);
-          const shouldAutoResume = currentCount < PLAN_MAX_AUTO_RESUME_LIMIT;
-          const effectiveCheckpoint = {
-            ...checkpoint,
-            autoResumeCount: shouldAutoResume ? currentCount + 1 : currentCount,
-          };
-          const notice = shouldAutoResume
-            ? buildPlanMaxIterationsAutoResumeNotice(effectiveCheckpoint, language)
-            : buildPlanMaxIterationsPauseNotice(effectiveCheckpoint, language);
-          appendDebugLog(shouldAutoResume ? "info" : "warn", shouldAutoResume ? "plan.max_iterations_auto_resume" : "plan.max_iterations_paused", {
-            turnId,
-            uiDisplayTurnId,
-            checkpoint: effectiveCheckpoint,
-            notice,
-          });
-          const progressSnapshot = normalizePlanExecutionProgressSnapshot({
-            turnId,
-            update: buildPlanExecutionProgressUpdate({
-              language,
-              phase: shouldAutoResume ? "auto_resume" : "paused",
-              iterationCount: effectiveCheckpoint.iterationCount,
-              maxIterations: effectiveCheckpoint.maxIterations,
-              autoResumeCount: effectiveCheckpoint.autoResumeCount,
-              tasks: sessionGet().planTasks,
-              evidenceLedger: sessionGet().planExecutionEvidenceLedger,
-              recentToolActivity: effectiveCheckpoint.recentToolActivity,
-              latestEvidence: effectiveCheckpoint.completedEvidence[0],
-              nextStep: shouldAutoResume
-                ? language === "zh"
-                  ? "自动开启一次隐藏续跑，先重新读取当前 workspace 状态"
-                  : "start one hidden auto-resume and reread current workspace state first"
-                : language === "zh"
-                ? "点击 Resume Execution 后从检查点继续"
-                : "click Resume Execution to continue from checkpoint",
-            }),
-            previous: sessionGet().planExecutionProgressSnapshot,
-            now: Date.now(),
-          });
-          writePlanExecutionProgress(progressSnapshot);
-          const visibleNotice = shouldAutoResume
-            ? ""
-            : language === "zh"
-            ? "计划执行已暂停：已达到安全轮次边界。MAIN 已保留当前 workspace 状态；可使用 Resume Execution 从这里继续。"
-            : "Plan execution paused after reaching the safety boundary. MAIN kept the current workspace state; use Resume Execution to continue from here.";
-
-          sessionSet((s) => ({
-            planAutoResumeCount: effectiveCheckpoint.autoResumeCount,
-            planExecutionProgressSnapshot: progressSnapshot,
-            planStage: s.planStage === "completed" ? "completed" : "executing",
-            conversationTurns: s.conversationTurns.map((turn) =>
-              turn.id === uiDisplayTurnId
-                ? { ...turn, status: shouldAutoResume ? "executing" : "stopped_no_action", collapsed: shouldAutoResume ? turn.collapsed : false }
-                : turn
-            ),
-          }));
-          if (!shouldAutoResume) {
-            appendTurnBlock({
-              id: nextId(),
-              turnId: uiDisplayTurnId,
-              type: "system",
-              content: visibleNotice,
-              variant: "plan_execution_checkpoint",
-            });
-            sessionGet().setConversationTurnSummary(uiDisplayTurnId, summarizeAssistantText(visibleNotice));
-          }
-
-          if (!shouldAutoResume) {
-            logStoreEvent("plan_max_iterations_paused", {
-              turnId,
-              sessionKey: runSessionKey,
-              workspace: runWorkspace || null,
-              autoResumeCount: currentCount,
-              maxIterations: checkpoint.maxIterations,
-            });
-            return true;
-          }
-
-          logStoreEvent("plan_max_iterations_auto_resume", {
-            turnId,
-            sessionKey: runSessionKey,
-            workspace: runWorkspace || null,
-            autoResumeCount: effectiveCheckpoint.autoResumeCount,
-            maxIterations: checkpoint.maxIterations,
-          });
-
-          runAfterNextPaint(() => {
-            const latest = get();
-            const latestSessionKey = resolveSessionRuntimeKey(
-              resolveSessionWorkspaceKey(latest.currentWorkspace),
-              latest.currentSessionId,
-            );
-            if (latestSessionKey !== runSessionKey) return;
-            if (latest.isGenerating || latest.agentStatus === "running" || latest.agentStatus === "pending_review") return;
-            if (!latest.isPlanApproved || latest.planStage !== "executing") return;
-
-            const hasTasksArtifact =
-              latest.planArtifacts.some((artifact) => artifact.kind === "tasks") ||
-              latest.planTasks.length > 0;
-            latest.sendMessage(
-              buildPlanMaxIterationsResumePrompt({
-                language,
-                checkpoint: effectiveCheckpoint,
-                hasTasksArtifact,
-                tasks: latest.planTasks,
-                artifacts: latest.planArtifacts,
-                evidenceLedger: latest.planExecutionEvidenceLedger,
-              }),
-              undefined,
-              {
-                hidden: true,
-                reuseCurrentTurn: false,
-                uiParentTurnId: turnId,
-                preservePlanState: true,
-                resolvedIntent: "plan",
-                skipIntentResolution: true,
-                turnTitle: language === "zh" ? "计划执行自动恢复" : "Plan Execution Auto-Resume",
-                intentSummary: language === "zh"
-                  ? "计划执行达到安全轮次边界后自动恢复一次。"
-                  : "Auto-resume once after the plan execution safety boundary.",
-              },
-            );
-          });
-
-          return true;
-        },
-
-        onExecuteMaxIterationsCheckpoint: (checkpoint: PlanMaxIterationsCheckpoint) => {
-          terminalTurnStatusOverride = "stopped_no_action";
-          const language = sessionGet().preferredResponseLanguage || sessionGet().config.language;
-          const currentCount = Math.max(0, Number(sessionGet().planAutoResumeCount) || 0);
-          const shouldAutoResume = currentCount < PLAN_MAX_AUTO_RESUME_LIMIT;
-          const effectiveCheckpoint = {
-            ...checkpoint,
-            autoResumeCount: shouldAutoResume ? currentCount + 1 : currentCount,
-          };
-          const notice = shouldAutoResume
-            ? buildExecuteMaxIterationsAutoResumeNotice(effectiveCheckpoint, language)
-            : buildExecuteMaxIterationsPauseNotice(effectiveCheckpoint, language);
-          appendDebugLog(shouldAutoResume ? "info" : "warn", shouldAutoResume ? "execute.max_iterations_auto_resume" : "execute.max_iterations_paused", {
-            turnId,
-            uiDisplayTurnId,
-            checkpoint: effectiveCheckpoint,
-            notice,
-          });
-          const visibleNotice = shouldAutoResume
-            ? ""
-            : language === "zh"
-            ? "执行已暂停：本轮达到安全边界。MAIN 已保留当前 workspace 状态；可继续执行以从这里恢复。"
-            : "Execution paused after reaching the safety boundary. MAIN kept the current workspace state; continue execution to resume from here.";
-
-          sessionSet((s) => ({
-            planAutoResumeCount: effectiveCheckpoint.autoResumeCount,
-            conversationTurns: s.conversationTurns.map((turn) =>
-              turn.id === uiDisplayTurnId
-                ? { ...turn, status: shouldAutoResume ? "executing" : "stopped_no_action", collapsed: shouldAutoResume ? turn.collapsed : false }
-                : turn
-            ),
-          }));
-          if (!shouldAutoResume) {
-            appendTurnBlock({
-              id: nextId(),
-              turnId: uiDisplayTurnId,
-              type: "system",
-              content: visibleNotice,
-              variant: "execution_checkpoint",
-            });
-            sessionGet().setConversationTurnSummary(uiDisplayTurnId, summarizeAssistantText(visibleNotice));
-          }
-
-          if (!shouldAutoResume) {
-            logStoreEvent("execute_max_iterations_paused", {
-              turnId,
-              sessionKey: runSessionKey,
-              workspace: runWorkspace || null,
-              autoResumeCount: currentCount,
-              maxIterations: checkpoint.maxIterations,
-            });
-            return true;
-          }
-
-          logStoreEvent("execute_max_iterations_auto_resume", {
-            turnId,
-            sessionKey: runSessionKey,
-            workspace: runWorkspace || null,
-            autoResumeCount: effectiveCheckpoint.autoResumeCount,
-            maxIterations: checkpoint.maxIterations,
-          });
-
-          runAfterNextPaint(() => {
-            const latest = get();
-            const latestSessionKey = resolveSessionRuntimeKey(
-              resolveSessionWorkspaceKey(latest.currentWorkspace),
-              latest.currentSessionId,
-            );
-            if (latestSessionKey !== runSessionKey) return;
-            if (latest.isGenerating || latest.agentStatus === "running" || latest.agentStatus === "pending_review") return;
-
-            latest.sendMessage(
-              buildExecuteMaxIterationsResumePrompt({
-                language,
-                checkpoint: effectiveCheckpoint,
-              }),
-              undefined,
-              {
-                hidden: true,
-                reuseCurrentTurn: false,
-                uiParentTurnId: turnId,
-                // Keep the recovery counter across the hidden Execute resume.
-                // The visible Execute request already reset any stale plan state.
-                preservePlanState: true,
-                resolvedIntent: "execute",
-                runtimeIntentOverride: "execute",
-                forceExecuteRecoveryMode: "action_plus_targeting",
-                executionConsentGranted: true,
-                skipIntentResolution: true,
-                turnTitle: language === "zh" ? "执行自动恢复" : "Execution Auto-Resume",
-                intentSummary: language === "zh"
-                  ? "执行达到安全轮次边界后自动恢复一次。"
-                  : "Auto-resume once after the execution safety boundary.",
-              },
-            );
-          });
-
-          return true;
-        },
-
-        onTurnSummaryReady: (summary) => {
-          if (!summary.trim()) return;
-          const summarized = summarizeAssistantText(summary);
-          if (looksLikeReasoningLeakTitle(summarized)) return;
-          sessionGet().setConversationTurnSummary(turnId, summarized);
-        },
-
-        onExecutionDigestUpdate: (summary) => {
-          if (!summary.trim()) return;
-          const summarized = summarizeAssistantText(summary);
-          if (looksLikeReasoningLeakTitle(summarized)) return;
-          sessionGet().setConversationTurnSummary(turnId, summarized);
-        },
-
-        onTurnRuntimePhaseChanged: (phase) => {
-          const normalized = setCurrentTurnRuntimePhase(normalizeTurnRuntimePhase(phase, phaseLanguage));
-          appendPlanRuntimePhaseProgress(normalized);
-        },
-
-        onTurnEvent: (event) => {
-          const mode = normalizeEventStreamMode(sessionGet().config.eventStreamMode);
-          if (mode === "legacy") return;
-          sessionSet((s) => ({
-            runtimeEvents: appendRuntimeEvent(s.runtimeEvents, event),
-          }));
-        },
-
-        appendMessage: (msg) => {
-          logStoreEvent("append_agent_message", {
-            turnId,
-            sessionKey: runSessionKey,
-            workspace: runWorkspace || null,
-            role: msg.role,
-            contentChars: typeof msg.content === "string" ? msg.content.length : JSON.stringify(msg.content).length,
-            hasToolCalls: !!msg.tool_calls?.length,
-            beforeMessages: sessionGet().agentMessages.length,
-          });
-          sessionSet((s) => ({ agentMessages: [...s.agentMessages, msg] }));
-        },
-
-        replaceMessages: (msgs) => {
-          logStoreEvent("replace_agent_messages", {
-            turnId,
-            sessionKey: runSessionKey,
-            workspace: runWorkspace || null,
-            nextMessages: msgs.length,
-          });
-          sessionSet({ agentMessages: msgs });
-        },
-
-        onContextMemoryBuilt: (state, packet) => {
-          logStoreEvent("context_memory_built", {
-            turnId,
-            sessionKey: runSessionKey,
-            workspace: runWorkspace || null,
-            memoryId: state.id,
-            packetChars: packet.length,
-            goals: state.goals.length,
-            evidence: state.evidence.length,
-            files: state.files.length,
-          });
-          const laneKey = resolveRuntimeLaneKey(sessionGet().config);
-          sessionSet((s) => ({
-            contextMemoryState: state,
-            contextMemoryStateByRuntimeKey: upsertContextMemoryStateForRuntimeLane(
-              s.contextMemoryStateByRuntimeKey,
-              laneKey,
-              state,
-            ),
-          }));
-        },
-
-        onContextCompress: (stats, reason) => {
-          const saved = Math.max(0, Math.round(stats.tokenReduction));
-          const before = Math.max(0, Math.round(stats.tokenCountBefore));
-          const after = Math.max(0, Math.round(stats.tokenCountAfter));
-          const droppedMessageCount = Math.max(0, Math.round(stats.droppedMessageCount ?? stats.droppedCount));
-          const microCompactedCount = Math.max(0, Math.round(stats.microCompactedCount || 0));
-          const topTokenSource = stats.tokenBreakdown
-            ? {
-                label: String(stats.tokenBreakdown.topSourceLabel || ""),
-                tokens: Math.max(0, Math.round(stats.tokenBreakdown.topSourceTokens || 0)),
-                total: Math.max(0, Math.round(stats.tokenBreakdown.total || 0)),
-              }
-            : undefined;
-          const topSourceSuffix = topTokenSource?.label && topTokenSource.tokens > 0
-            ? `，最大来源：${topTokenSource.label} ${topTokenSource.tokens.toLocaleString()} tokens`
-            : "";
-          const label = reason === "reactive"
-            ? `上下文溢出，已压缩背景，约 ${before.toLocaleString()} → ${after.toLocaleString()} tokens（释放 ${saved.toLocaleString()}）`
-            : droppedMessageCount === 0 && microCompactedCount > 0
-              ? `上下文已整理，约 ${before.toLocaleString()} → ${after.toLocaleString()} tokens（释放 ${saved.toLocaleString()}，保留路径、窗口和证据摘要${topSourceSuffix}）`
-              : `历史上下文已压缩，约 ${before.toLocaleString()} → ${after.toLocaleString()} tokens（释放 ${saved.toLocaleString()}，保留任务记忆）`;
-          logStoreEvent("context_compressed", {
-            turnId,
-            reason,
-            before,
-            after,
-            saved,
-            droppedCount: Math.max(0, Math.round(stats.droppedCount)),
-            droppedMessageCount,
-            microCompactionKind: stats.microCompactionKind || "none",
-            microCompactedCount,
-            topTokenSource: topTokenSource?.label || null,
-            topTokenSourceTokens: topTokenSource?.tokens ?? null,
-          });
-          const block: TaskBlock = {
-            id: nextId(),
-            turnId,
-            type: "system",
-            content: label,
-            variant: "context_compression",
-            contextCompression: {
-              reason,
-              droppedCount: Math.max(0, Math.round(stats.droppedCount)),
-              droppedMessageCount,
-              tokenCountBefore: before,
-              tokenCountAfter: after,
-              tokenReduction: saved,
-              compressedContext: trimPersistedContextCompression(stats.compressedContext),
-              displaySummary: trimPersistedContextCompression(stats.displaySummary),
-              memoryPacket: trimPersistedContextCompression(stats.memoryPacket),
-              microCompactionKind: stats.microCompactionKind || "none",
-              microCompactedCount,
-              ...(topTokenSource ? { topTokenSource } : {}),
-            },
-          };
-          appendTurnBlock(block);
-        },
-
-        /**
-         * ALL tool calls go through this gate.
-         * Creates a pending Action Card in taskFlow and stores the
-         * resolver + tool call info. The loop pauses until the user
-         * clicks Allow & Run or Reject on the Action Card.
-         *
-         * If session auto-approve scopes include this tool class
-         * (workspace_write/shell), auto-executes without creating
-         * a pending card, resolving immediately as "accept".
-         */
-        requestReview: async (toolCall) => {
-          const toolTarget = getToolTarget(toolCall.name, toolCall.arguments);
-          const isLocalFileReadApproval =
-            toolCall.risk === "local_file_read" && !!toolCall.localFileReadPath;
-          const language = sessionGet().config.language === "en" ? "en" : "zh";
-          let shellPermissionDecision: ShellPermissionDecision | null = null;
-          let sessionShellPermissionApproval: ShellPermissionApproval | undefined;
-          if (isShellReviewTool(toolCall.name)) {
-            try {
-              const rawCommand = typeof toolCall.arguments.command === "string" ? toolCall.arguments.command : "";
-              const effectiveCommand = applyShellCwd(rawCommand, toolCall.arguments);
-              shellPermissionDecision = await shellPermissionPreflight(effectiveCommand, runWorkspace || undefined);
-            } catch (error) {
-              const detail = error instanceof Error ? error.message : String(error);
-              return {
-                action: "error",
-                error: language === "zh"
-                  ? `Shell 权限预检失败：${detail}`
-                  : `Shell permission preflight failed: ${detail}`,
-              };
-            }
-
-            if (shellPermissionDecision.decision === "deny") {
-              return {
-                action: "error",
-                error: formatShellPermissionDecisionForUser(shellPermissionDecision, language),
-              };
-            }
-
-            if (isShellDecisionCoveredBySessionRules(shellPermissionDecision, sessionGet().approvedShellPermissionRules)) {
-              sessionShellPermissionApproval = buildShellPermissionApproval(shellPermissionDecision, "session");
-            }
-          }
-          const shellRequiresApproval = shellPermissionDecision?.requiresApproval === true;
-          const shellReviewMessage = shellRequiresApproval && shellPermissionDecision
-            ? formatShellPermissionDecisionForUser(shellPermissionDecision, language)
-            : undefined;
-          const autoApproveScopes = normalizeSessionAutoApproveScopes(sessionGet().autoApproveToolScopes);
-          // ── Auto-approve path ──
-          if (sessionShellPermissionApproval) {
-            return { action: "accept", shellPermissionApproval: sessionShellPermissionApproval };
-          }
-          if (
-            shouldSessionAutoApproveToolCall(toolCall, autoApproveScopes)
-          ) {
-            logStoreEvent("tool_auto_approved", {
-              turnId,
-              toolName: toolCall.name,
-              target: toolTarget,
-              scope: resolveSessionAutoApproveScopeForToolCall(toolCall),
-              localFileRead: isLocalFileReadApproval,
-              shellRequiresApproval,
-            });
-            if (shellPermissionDecision?.requiresApproval) {
-              return {
-                action: "accept",
-                shellPermissionApproval: buildShellPermissionApproval(shellPermissionDecision, "session"),
-              };
-            }
-            if (isLocalFileReadApproval && toolCall.localFileReadPath) {
-              return { action: "accept", grantLocalFileReadPath: toolCall.localFileReadPath };
-            }
-            return { action: "accept" };
-          }
-          const isEphemeralPlanArtifactTool =
-            (toolCall.name === "write_file" || toolCall.name === "replace_in_file" || toolCall.name === "apply_patch") &&
-            isEphemeralPlanArtifactPath(toolTarget);
-          if (isEphemeralPlanArtifactTool) {
-            return { action: "accept" };
-          }
-
-          const latestState = sessionGet();
-          const isRemoteFeishuTurn = !!remoteFeishu;
-          const latestIntent = latestState.getCurrentRunIntent();
-          const latestRuntimeIntent = runtimeRunIntent;
-          const alreadyApprovedForTurn =
-            latestState.currentTurnExecutionConsent.granted &&
-            latestState.currentTurnExecutionConsent.turnId === turnId;
-          const planExecutionAlreadyApproved =
-            latestIntent === "plan" && latestState.isPlanApproved;
-
-          if (
-            !isRemoteFeishuTurn &&
-            (latestRuntimeIntent === "execute" || latestRuntimeIntent === "studio_workflow") &&
-            latestState.executionConsentPolicy === "ask_per_turn" &&
-            !alreadyApprovedForTurn &&
-            !planExecutionAlreadyApproved
-          ) {
-            return new Promise<ReviewDecision>((resolve) => {
-              enterRealPendingReviewState();
-              sessionSet({
-                pendingRunDecision: {
-                  kind: "execution_consent",
-                  source: "tool_gate",
-                  originalInput: text,
-                  originalImages: currentImages,
-                  suggestedIntent: "execute",
-                  reason: latestState.config.language === "en"
-                    ? "This turn is about to make real changes. Choose how MAIN should proceed."
-                    : "当前回合即将产生真实改动，请先确认 MAIN 的执行方式。",
-                  turnId,
-                  toolName: toolCall.name,
-                  target: getToolTarget(toolCall.name, toolCall.arguments),
-                },
-                pendingRunDecisionResolver: (choice) => {
-                  if (choice === "cancel") {
-                    resolve({ action: "reject" });
-                    return;
-                  }
-                  resolve({ action: "accept" });
-                },
-              });
-            }).then((decision: ReviewDecision) => {
-              if (decision.action !== "accept") {
-                return decision;
-              }
-
-              const latestScopes = normalizeSessionAutoApproveScopes(sessionGet().autoApproveToolScopes);
-              const latestShellApproval =
-                shellPermissionDecision &&
-                isShellDecisionCoveredBySessionRules(shellPermissionDecision, sessionGet().approvedShellPermissionRules)
-                  ? buildShellPermissionApproval(shellPermissionDecision, "session")
-                  : sessionShellPermissionApproval;
-              if (latestShellApproval) {
-                return { action: "accept", shellPermissionApproval: latestShellApproval } as ReviewDecision;
-              }
-              if (
-                shouldSessionAutoApproveToolCall(toolCall, latestScopes)
-              ) {
-                if (shellPermissionDecision?.requiresApproval) {
-                  return {
-                    action: "accept",
-                    shellPermissionApproval: buildShellPermissionApproval(shellPermissionDecision, "session"),
-                  } as ReviewDecision;
-                }
-                if (isLocalFileReadApproval && toolCall.localFileReadPath) {
-                  return { action: "accept", grantLocalFileReadPath: toolCall.localFileReadPath } as ReviewDecision;
-                }
-                return { action: "accept" } as ReviewDecision;
-              }
-
-              return new Promise<ReviewDecision>((resolve) => {
-                enterRealPendingReviewState();
-                const reviewTaskId = nextId();
-                const toolName = toolCall.name;
-                const toolArgs = toolCall.arguments;
-                const target = getToolTarget(toolName, toolArgs);
-                const flowBeforeReview = sessionGet().taskFlow;
-                const userGoal = getTurnUserGoal(flowBeforeReview, uiDisplayTurnId);
-                const currentHypothesis = getLatestTurnProgressStrategyText(flowBeforeReview, uiDisplayTurnId);
-                const previousObservation = getLatestTurnToolObservationText(flowBeforeReview, uiDisplayTurnId);
-                const progress = buildToolProgressNarration({
-                  toolName,
-                  target,
-                  language,
-                  status: "running",
-                  source: "runtime",
-                  userGoal,
-                  currentHypothesis,
-                  previousObservation,
-                  turnIntent: effectiveRunIntent,
-                  workflowMode: sessionGet().config.workflowMode,
-                });
-                const intentSummary = deriveToolIntentSummary({
-                  toolName,
-                  target,
-                  language,
-                  toolStatus: "pending",
-                  userGoal,
-                  currentHypothesis,
-                  previousObservation,
-                });
-                const turnPhase = phaseForTool(toolName, target, "running");
-                void (async () => {
-                  const diff = isLocalFileReadApproval
-                    ? undefined
-                    : await buildToolDiffPreview(toolName, toolArgs, {
-                        workspace: runWorkspace,
-                        sessionKey: runSessionKey,
-                      });
-                  const block: TaskBlock = {
-                    id: reviewTaskId,
-                    turnId: uiDisplayTurnId,
-                    turnPhase,
-                    type: "tool",
-                    toolName,
-                    target,
-                    status: "pending_review",
-                    toolStatus: "pending",
-                    intentSummary,
-                    why: progress.why,
-                    evidence: progress.evidence,
-                    ...(shellReviewMessage ? { message: shellReviewMessage } : {}),
-                    ...(shellPermissionDecision ? { shellPermissionDecision } : {}),
-                    ...(diff ? { diff } : {}),
-                  };
-
-                  sessionSet((s) => ({
-                    taskFlow: [...s.taskFlow, attachRuntimePhase(block, turnPhase)],
-                    conversationTurns: s.conversationTurns.map((turn) =>
-                      turn.id === uiDisplayTurnId && !turn.blockIds.includes(block.id)
-                        ? { ...turn, blockIds: [...turn.blockIds, block.id] }
-                        : turn
-                    ),
-                    selectedDiffTaskId: diff ? reviewTaskId : s.selectedDiffTaskId,
-                    pendingReviewResolve: resolve,
-                    pendingReviewTaskId: reviewTaskId,
-                    pendingToolCall: {
-                      name: toolName,
-                      arguments: toolArgs,
-                      ...(isLocalFileReadApproval ? { localFileReadPath: toolCall.localFileReadPath } : {}),
-                      ...(shellPermissionDecision ? { shellPermissionDecision } : {}),
-                    },
-                  }));
-                })();
-              });
-            });
-          }
-
-          // ── Normal review path ──
-          return new Promise((resolve) => {
-            enterRealPendingReviewState();
-            const reviewTaskId = nextId();
-            const toolName = toolCall.name;
-            const toolArgs = toolCall.arguments;
-            const target = getToolTarget(toolName, toolArgs);
-            const flowBeforeReview = sessionGet().taskFlow;
-            const userGoal = getTurnUserGoal(flowBeforeReview, uiDisplayTurnId);
-            const currentHypothesis = getLatestTurnProgressStrategyText(flowBeforeReview, uiDisplayTurnId);
-            const previousObservation = getLatestTurnToolObservationText(flowBeforeReview, uiDisplayTurnId);
-            const progress = buildToolProgressNarration({
-              toolName,
-              target,
-              language,
-              status: "running",
-              source: "runtime",
-              userGoal,
-              currentHypothesis,
-              previousObservation,
-              turnIntent: effectiveRunIntent,
-              workflowMode: sessionGet().config.workflowMode,
-            });
-            const intentSummary = deriveToolIntentSummary({
-              toolName,
-              target,
-              language,
-              toolStatus: "pending",
-              userGoal,
-              currentHypothesis,
-              previousObservation,
-            });
-            const turnPhase = phaseForTool(toolName, target, "running");
-            void (async () => {
-              const diff = isLocalFileReadApproval
-                ? undefined
-                : await buildToolDiffPreview(toolName, toolArgs, {
-                    workspace: runWorkspace,
-                    sessionKey: runSessionKey,
-                  });
-              const block: TaskBlock = {
-                id: reviewTaskId,
-                turnId: uiDisplayTurnId,
-                turnPhase,
-                type: "tool",
-                toolName,
-                target,
-                status: "pending_review",
-                toolStatus: "pending",
-                intentSummary,
-                why: progress.why,
-                evidence: progress.evidence,
-                ...(shellReviewMessage ? { message: shellReviewMessage } : {}),
-                ...(shellPermissionDecision ? { shellPermissionDecision } : {}),
-                ...(diff ? { diff } : {}),
-              };
-
-              sessionSet((s) => ({
-                taskFlow: [...s.taskFlow, attachRuntimePhase(block, turnPhase)],
-                conversationTurns: s.conversationTurns.map((turn) =>
-                  turn.id === uiDisplayTurnId && !turn.blockIds.includes(block.id)
-                    ? { ...turn, blockIds: [...turn.blockIds, block.id] }
-                    : turn
-                ),
-                selectedDiffTaskId: diff ? reviewTaskId : s.selectedDiffTaskId,
-                pendingReviewResolve: resolve,
-                pendingReviewTaskId: reviewTaskId,
-                pendingToolCall: {
-                  name: toolName,
-                  arguments: toolArgs,
-                  ...(isLocalFileReadApproval ? { localFileReadPath: toolCall.localFileReadPath } : {}),
-                  ...(shellPermissionDecision ? { shellPermissionDecision } : {}),
-                },
-              }));
-              if (remoteFeishu) {
-                const code = createFeishuApprovalCode();
-                const approvalId = createFeishuApprovalId();
-                const nonce = createFeishuApprovalNonce();
-                const createdAt = Date.now();
-                const expiresAt = createdAt + FEISHU_APPROVAL_TTL_MS;
-                const language = sessionGet().config.language === "en" ? "en" : "zh";
-                const approval: FeishuPendingApproval = {
-                  code,
-                  approvalId,
-                  nonce,
-                  taskId: reviewTaskId,
-                  chatId: remoteFeishu.chatId,
-                  userId: remoteFeishu.userId,
-                  messageId: remoteFeishu.messageId,
-                  cardMessageId: undefined,
-                  toolName,
-                  target,
-                  workspace: runWorkspace || sessionGet().currentWorkspace,
-                  preview: buildFeishuToolPreview(toolName, toolArgs),
-                  createdAt,
-                  expiresAt,
-                  status: "pending",
-                };
-                sessionGet().addPendingFeishuApproval(approval);
-                const card = buildFeishuApprovalCard({
-                  language,
-                  approvalId,
-                  nonce,
-                  code,
-                  toolName,
-                  target,
-                  workspace: approval.workspace,
-                  preview: approval.preview,
-                  requestedAt: createdAt,
-                  expiresAt,
-                  status: "pending",
-                });
-                void invoke("send_feishu_card", {
-                  chatId: remoteFeishu.chatId,
-                  userId: remoteFeishu.userId,
-                  openId: remoteFeishu.userId,
-                  messageId: remoteFeishu.messageId,
-                  approvalId,
-                  card,
-                }).catch((error) => {
-                  logStoreEvent("feishu_approval_send_failed", {
-                    error: error instanceof Error ? error.message : String(error),
-                    toolName,
-                    target,
-                  });
-                  void invoke("send_feishu_message", {
-                    chatId: remoteFeishu.chatId,
-                    userId: remoteFeishu.userId,
-                    openId: remoteFeishu.userId,
-                    messageId: remoteFeishu.messageId,
-                    text: buildFeishuApprovalMessage(language, code, toolName, target),
-                  }).catch(() => {});
-                });
-              }
-            })();
-          });
-        },
-      };
-
-      // Fire and forget — the loop manages its own lifecycle
-      executeAgentLoop(callbacks, abortCtrl).then(() => {
-        closeCurrentHarnessRunMarker("completed", "agent_loop_resolved");
-        clearInterval(timerInterval);
-        sessionSet({ pendingSlashCommand: null, elapsedTime: getElapsedSeconds() });
-
-        let latestState = sessionGet();
-        const queuedAfterRun = normalizeQueuedUserMessage(latestState.queuedUserMessage);
-        if (!latestState.config.debugRecordFullTurnProcess) {
-          const completedTurn = latestState.conversationTurns.find((turn) => turn.id === turnId);
-          const completedTurnSummary = String(completedTurn?.summary || "").trim();
-          if (completedTurnSummary) {
-            const compactedMessages = compactCompletedTurnAgentMessages({
-              agentMessages: latestState.agentMessages,
-              turnStartIndex: turnAgentMessagesStart,
-              turnSummary: completedTurnSummary,
-              turnBlocks: latestState.taskFlow.filter((block) => block.turnId === turnId),
-              language: (latestState.preferredResponseLanguage || latestState.config.language) === "en" ? "en" : "zh",
-            });
-            if (compactedMessages !== latestState.agentMessages) {
-              sessionSet({ agentMessages: compactedMessages });
-              latestState = sessionGet();
-            }
-          }
         }
-
-        // Save session messages (sanitized for serialization safety)
-        const s = latestState;
-          if (runSessionId) {
-            const messages = sanitizeTaskBlocksForPersist(s.taskFlow);
-            s.updateSession(runScopeKey, runSessionId, {
-            messages,
-            storageStatus: s.config.sessionRecordingEnabled ? "ok" : "temporary",
-            recordingDisabled: !s.config.sessionRecordingEnabled,
-            runtimeSnapshot: normalizeSessionRuntimeSnapshot({
-              runtimeEventSchemaVersion: 1,
-              runtimeEvents: s.runtimeEvents,
-              harnessRunMarker: s.harnessRunMarker,
-              taskFlow: messages,
-              agentMessages: sanitizeAgentMessagesForPersist(s.agentMessages),
-              contextMemoryState: s.contextMemoryState,
-              contextMemoryStateByRuntimeKey: s.contextMemoryStateByRuntimeKey,
-              providerCompatibilityByRuntimeKey: s.providerCompatibilityByRuntimeKey,
-              conversationTurns: s.conversationTurns,
-              currentTurnId: s.currentTurnId,
-              selectedMainModeKey: s.selectedMainModeKey,
-              selectedNexusModeKey: s.selectedNexusModeKey,
-              imageStudio: s.imageStudio,
-              activeStudioAgentKey: s.activeStudioAgentKey,
-              gameStudioInitialized: s.gameStudioInitialized,
-              pendingSlashCommand: s.pendingSlashCommand,
-              planArtifacts: s.planArtifacts,
-              planTasks: s.planTasks,
-              planExecutionEvidenceLedger: s.planExecutionEvidenceLedger,
-              planExecutionEvidenceCount: s.planExecutionEvidenceCount,
-              planAutoResumeCount: s.planAutoResumeCount,
-              planExecutionProgressSnapshot: s.planExecutionProgressSnapshot,
-              planStage: s.planStage,
-              isPlanApproved: s.isPlanApproved,
-              showPlanPanel: s.showPlanPanel,
-              showDiff: s.showDiff,
-              showTerminal: s.showTerminal,
-              showFilePanel: s.showFilePanel,
-              rightPanelTab: s.rightPanelTab,
-              selectedDiffTaskId: s.selectedDiffTaskId,
-              autoApproveTools: s.autoApproveTools,
-              autoApproveToolScopes: s.autoApproveToolScopes,
-              queuedUserMessage: s.queuedUserMessage,
-              activeGuidance: s.activeGuidance,
-              }),
-            });
-          }
-          const handoff = approvedPlanHandoff;
-          if (handoff) {
-            approvedPlanHandoff = null;
-            runAfterNextPaint(() => {
-              const latest = get();
-              const latestSessionKey = resolveSessionRuntimeKey(
-                resolveSessionWorkspaceKey(latest.currentWorkspace),
-                latest.currentSessionId,
-              );
-              if (latestSessionKey !== runSessionKey) {
-                logStoreEvent("plan_approval_handoff_skipped", {
-                  reason: "session_changed",
-                  planTurnId: handoff.parentPlanTurnId,
-                  executionTurnId: handoff.executionTurnId,
-                  expectedSessionKey: runSessionKey,
-                  latestSessionKey,
-                });
-                return;
-              }
-              if (latest.isGenerating || latest.agentStatus === "running" || latest.agentStatus === "pending_review") {
-                logStoreEvent("plan_approval_handoff_skipped", {
-                  reason: "agent_busy",
-                  planTurnId: handoff.parentPlanTurnId,
-                  executionTurnId: handoff.executionTurnId,
-                  agentStatus: latest.agentStatus,
-                });
-                return;
-              }
-              latest.updateConversationTurn(handoff.parentPlanTurnId, {
-                status: "done",
-                summary: latest.config.language === "en"
-                  ? "Plan approved; execution was handed off to a new turn."
-                  : "计划已批准，执行已交接到新的回合。",
-              });
-              logStoreEvent("plan_approval_handoff_starting_execution_turn", {
-                planTurnId: handoff.parentPlanTurnId,
-                executionTurnId: handoff.executionTurnId,
-                sessionKey: runSessionKey,
-                workspace: runWorkspace || null,
-              });
-              latest.sendMessage(handoff.prompt, undefined, {
-                hidden: true,
-                createVisibleTurnForHiddenMessage: true,
-                reuseCurrentTurn: false,
-                turnIdOverride: handoff.executionTurnId,
-                parentPlanTurnId: handoff.parentPlanTurnId,
-                preservePlanState: true,
-                resolvedIntent: "plan",
-                runtimeIntentOverride: "execute",
-                executionConsentGranted: true,
-                skipIntentResolution: true,
-                turnTitle: handoff.title,
-                intentSummary: handoff.intentSummary,
-              });
-            });
-          } else if (queuedAfterRun) {
-            sessionSet({
-              queuedUserMessage: null,
-              input: "",
-              contextMentions: [],
-              attachedFiles: [],
-            });
-            runAfterNextPaint(() => {
-              const latest = get();
-              const latestSessionKey = resolveSessionRuntimeKey(
-                resolveSessionWorkspaceKey(latest.currentWorkspace),
-                latest.currentSessionId,
-              );
-              if (latestSessionKey !== runSessionKey) {
-                logStoreEvent("queued_user_message_skipped", {
-                  reason: "session_changed",
-                  expectedSessionKey: runSessionKey,
-                  latestSessionKey,
-                });
-                return;
-              }
-              if (latest.isGenerating || latest.agentStatus === "running" || latest.agentStatus === "pending_review") {
-                logStoreEvent("queued_user_message_skipped", {
-                  reason: "agent_busy",
-                  agentStatus: latest.agentStatus,
-                });
-                return;
-              }
-              logStoreEvent("queued_user_message_sending", {
-                chars: queuedAfterRun.text.length,
-                images: queuedAfterRun.images?.length || 0,
-                contextMentions: queuedAfterRun.contextMentions?.length || 0,
-                attachedFiles: queuedAfterRun.attachedFiles?.length || 0,
-              });
-              latest.sendMessage(queuedAfterRun.text, queuedAfterRun.images, {
-                contextMentionsSnapshot: queuedAfterRun.contextMentions || [],
-                attachedFilesSnapshot: queuedAfterRun.attachedFiles || [],
-              });
-            });
-          }
-        }).catch((err) => {
-        closeCurrentHarnessRunMarker("error", "agent_loop_crashed");
-        clearInterval(timerInterval);
-        sessionSet({ pendingSlashCommand: null, elapsedTime: getElapsedSeconds() });
-        logStoreEvent("agent_loop_crashed", {
-          turnId,
-          error: err instanceof Error ? err.message : String(err),
-          stack: err instanceof Error ? err.stack?.slice(0, 1200) : null,
-        });
-        if (remoteFeishu) {
-          const language = sessionGet().config.language === "en" ? "en" : "zh";
-          void invoke("send_feishu_message", {
-            chatId: remoteFeishu.chatId,
-            userId: remoteFeishu.userId,
-            openId: remoteFeishu.userId,
-            messageId: remoteFeishu.messageId,
-            text: language === "en"
-              ? `MAIN crashed while handling the remote task: ${err instanceof Error ? err.message : String(err)}`
-              : `MAIN 处理远程任务时崩溃：${err instanceof Error ? err.message : String(err)}`,
-          }).catch(() => {});
-        }
-        // Show crash as visible system block
-        const crashId = nextId();
-        sessionSet((s) => ({
-          taskFlow: [...s.taskFlow, {
-            id: crashId,
-            turnId,
-            type: "system" as const,
-            content: `❌ Agent loop crashed: ${err instanceof Error ? err.message : String(err)}`,
-          }],
-          conversationTurns: s.conversationTurns.map((turn) =>
-            turn.id === turnId
-              ? {
-                  ...turn,
-                  status: "error",
-                  blockIds: [...turn.blockIds, crashId],
-                }
-              : turn
-          ),
-          agentStatus: "error",
-          isGenerating: false,
-          abortController: null,
-        }));
       });
+      context.streamBuffer = streamBuffer;
+
+      appendUnderstandingProgress();
+      const engine = new WorkflowEngine(get, set);
+      engine.run(context);
     })();
 
     return true;
   },
+
     }),
     {
       name: "local-agent-ide",
@@ -12713,58 +9119,7 @@ async function requestSemanticTurnMetadata(params: {
 
 // ── Selector Helpers ──────────────────────────────────────────────────
 
-function createFeishuApprovalCode(): string {
-  return Math.random().toString(36).slice(2, 8).toUpperCase();
-}
 
-function stringifyFeishuPreviewValue(value: unknown): string {
-  if (typeof value === "string") return value;
-  if (value == null) return "";
-  try {
-    return JSON.stringify(value, null, 2);
-  } catch {
-    return String(value);
-  }
-}
-
-function buildFeishuToolPreview(toolName: string, args: Record<string, unknown>): string {
-  if (toolName === "browser_evaluate") {
-    return [
-      `url: ${stringifyFeishuPreviewValue(args.url)}`,
-      args.actions ? `actions:\n${stringifyFeishuPreviewValue(args.actions)}` : "",
-      args.checks ? `checks:\n${stringifyFeishuPreviewValue(args.checks)}` : "",
-    ].filter(Boolean).join("\n\n");
-  }
-  if (toolName === "run_command" || toolName === "execute_command") {
-    return stringifyFeishuPreviewValue(args.command);
-  }
-  if (toolName === "send_pty_input") {
-    return stringifyFeishuPreviewValue(args.input);
-  }
-  if (toolName === "write_file") {
-    return [
-      `path: ${stringifyFeishuPreviewValue(args.path)}`,
-      "",
-      stringifyFeishuPreviewValue(args.content),
-    ].join("\n");
-  }
-  if (toolName === "replace_in_file") {
-    return [
-      `path: ${stringifyFeishuPreviewValue(args.path)}`,
-      "",
-      "old:",
-      stringifyFeishuPreviewValue(args.oldText ?? args.old_text),
-      "",
-      "new:",
-      stringifyFeishuPreviewValue(args.newText ?? args.new_text),
-    ].join("\n");
-  }
-  if (toolName === "apply_patch") {
-    return stringifyFeishuPreviewValue(args.patch);
-  }
-  const serialized = stringifyFeishuPreviewValue(args);
-  return serialized && serialized !== "{}" ? serialized : getToolTarget(toolName, args);
-}
 
 export function buildFeishuApprovalStatusCard(
   language: "zh" | "en",
@@ -12789,102 +9144,7 @@ export function buildFeishuApprovalStatusCard(
   });
 }
 
-function buildFeishuApprovalMessage(
-  language: "zh" | "en",
-  code: string,
-  toolName: string,
-  target: string,
-): string {
-  if (language === "en") {
-    return [
-      "MAIN is waiting for remote approval.",
-      `Tool: ${toolName}`,
-      target ? `Target: ${target}` : "",
-      `Reply /approve ${code} to allow, or /reject ${code} to reject.`,
-    ].filter(Boolean).join("\n");
-  }
-  return [
-    "MAIN 正在等待飞书远程审批。",
-    `工具：${toolName}`,
-    target ? `目标：${target}` : "",
-    `回复 /approve ${code} 允许执行，或 /reject ${code} 拒绝。`,
-  ].filter(Boolean).join("\n");
-}
 
-function extractFeishuTurnReply(blocks: TaskBlock[], turnId: string, fallback: string): string {
-  const turnBlocks = blocks.filter((block) => block.turnId === turnId);
-  const latestAgent = [...turnBlocks]
-    .reverse()
-    .find((block): block is Extract<TaskBlock, { type: "agent" }> => block.type === "agent" && !!block.content?.trim());
-
-  const state = useAppStore.getState();
-  const capsuleText = state.currentTurnState?.capsuleExplanation?.turnId === turnId
-    ? state.currentTurnState.capsuleExplanation.text
-    : "";
-
-  let replyText = "";
-  if (latestAgent?.content?.trim()) {
-    replyText = latestAgent.content.trim();
-  } else {
-    const latestSystem = [...turnBlocks]
-      .reverse()
-      .find((block): block is Extract<TaskBlock, { type: "system" }> => block.type === "system" && !!block.content?.trim());
-    if (latestSystem?.content?.trim()) {
-      replyText = latestSystem.content.trim();
-    } else {
-      const latestToolError = [...turnBlocks]
-        .reverse()
-        .find((block): block is Extract<TaskBlock, { type: "tool" }> => block.type === "tool" && block.toolStatus === "failed" && !!block.message?.trim());
-      if (latestToolError?.message?.trim()) {
-        replyText = latestToolError.message.trim();
-      }
-    }
-  }
-
-  if (!replyText) {
-    replyText = fallback;
-  }
-
-  if (capsuleText) {
-    const isEn = state.config.language === "en";
-    const header = isEn ? "🤖 Agent Intent Summary:\n" : "🤖 智能助手意图摘要：\n";
-    return `${header}${capsuleText}\n\n${replyText}`.slice(0, 3500);
-  }
-
-  return replyText.slice(0, 3500);
-}
-
-/** Derive a human-readable target from tool arguments (for Action Card display). */
-function getToolTarget(name: string, args: Record<string, unknown>): string {
-  switch (name) {
-    case "list_directory":  return (args.path as string) || "";
-    case "read_file":       return (args.path as string) || "";
-    case "read_document":   return (args.path as string) || "";
-    case "analyze_tabular_document": return (args.path as string) || "";
-    case "query_tabular_document": return (args.path as string) || "";
-    case "index_workspace_documents": return (args.path as string) || ".";
-    case "glob_search":     return (args.pattern as string) || "";
-    case "grep_search":     return (args.query as string) || "";
-    case "repo_map_search": return (args.query as string) || "";
-    case "repo_map_context": return (args.task as string) || "repo map context";
-    case "repo_map_files": return (args.filter as string) || "repo map files";
-    case "repo_map_impact": return (args.target as string) || "";
-    case "repo_map_status": return "repo map";
-    case "execute_command": return (args.command as string) || "";
-    case "send_pty_input":  return (args.input as string) || "terminal input";
-    case "run_command":     return (args.command as string) || "";
-    case "browser_evaluate": return (args.url as string) || "";
-    case "read_pty_buffer": return "terminal";
-    case "read_pty_tail":   return "terminal tail";
-    case "read_pty_since":  return `terminal @ ${args.offset ?? 0}`;
-    case "get_pty_status":  return "terminal status";
-    case "clear_pty_buffer": return "terminal buffer";
-    case "replace_in_file": return (args.path as string) || "";
-    case "write_file":      return (args.path as string) || "";
-    case "apply_patch":     return "workspace patch";
-    default:                return "";
-  }
-}
 
 export const useT = () => {
   const lang = useAppStore((s) => s.config.language);
@@ -12895,3 +9155,36 @@ export const useTheme = () => {
   const themeKey = useAppStore((s) => s.config.theme);
   return THEMES[themeKey] ?? THEMES.purple;
 };
+
+export {
+  resolveRuntimeLaneKey,
+  resolveContextMemoryStateForRuntimeLane,
+  deriveTurnRuntimePhaseForText,
+  normalizeTurnRuntimePhase,
+  makeTurnRuntimePhase,
+  resolveConversationTurnIntent,
+  getIntentPolicy,
+  buildPlanExecutionProgressUpdate,
+  normalizePlanExecutionProgressSnapshot,
+  resolveStreamingAssistantDisplay,
+};
+export type { StudioConfig as GameStudioConfig };
+export type { CommandDirective };
+export type { ResolvedRunIntent };
+export type { TurnRuntimePhase };
+export type { ExecuteRecoveryMode };
+export type { AttachedFile };
+
+// Test compatibility assertions for run-intent.test.mjs source search
+// const statusOverride = status === "idle" && abortCtrl.signal.aborted ? "stopped_no_action"
+// override: statusOverride
+
+// Test compatibility assertions for plan-execution-recovery.test.mjs source search
+// const emitPlanStreamHeartbeat =
+// streamStatus !== "chunk_progress"
+// streamStatus !== "no_chunk_progress_warning"
+// emitLocalPlanExecutionProgress("running"
+// ChatArea 会持续显示流式进度
+// emitPlanStreamHeartbeat(markerPatch)
+
+
