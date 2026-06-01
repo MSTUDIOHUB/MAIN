@@ -1632,3 +1632,32 @@ test("collectChangeEntries ignores ephemeral plan files but keeps source and bug
   assert.equal(result.entries[1].target, ".MAIN/plans/bugfix.md");
   assert.equal(result.entries[1].isPlanFile, true);
 });
+
+test("collectChangeEntries includes MCP Unity edit diffs", () => {
+  const stats = (oldText, newText) => ({
+    added: Math.max(0, newText.split("\n").length - oldText.split("\n").length),
+    removed: Math.max(0, oldText.split("\n").length - newText.split("\n").length),
+  });
+  const result = collectChangeEntries([
+    {
+      id: 41,
+      type: "tool",
+      toolName: "script_apply_edits",
+      toolStatus: "executed",
+      target: "Assets/Scripts/Managers/GameManager.cs",
+      diff: {
+        old: "void Update() {}\n",
+        new: "void Update() {}\nvoid StartNewGame() {}\n",
+        path: "Assets/Scripts/Managers/GameManager.cs",
+        existed: true,
+        fullFile: true,
+      },
+    },
+  ], stats);
+
+  assert.equal(result.totalExecutedEdits, 1);
+  assert.equal(result.entries.length, 1);
+  assert.equal(result.entries[0].target, "Assets/Scripts/Managers/GameManager.cs");
+  assert.equal(result.entries[0].displayTarget, "GameManager.cs");
+  assert.equal(result.entries[0].taskId, 41);
+});

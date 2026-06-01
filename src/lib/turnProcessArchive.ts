@@ -380,7 +380,7 @@ function toolActionForActivityTitle(block: any, language: ToolPresentationLangua
     if (toolName === "list_directory" || toolName === "get_project_skeleton") return `scanned ${rawTarget}`;
     if (toolName === "analyze_tabular_document" || toolName === "query_tabular_document") return `analyzed ${rawTarget}`;
     if (toolName === "write_file") return `wrote ${rawTarget}`;
-    if (toolName === "replace_in_file" || toolName === "apply_patch") return `edited ${rawTarget}`;
+    if (EDIT_ACTIVITY_TOOL_NAMES.has(toolName)) return `edited ${rawTarget}`;
     if (toolName === "run_command" || toolName === "execute_command") return `ran ${rawTarget}`;
     if (toolName === "browser_evaluate") return `validated ${rawTarget}`;
     return toolName ? `${toolName} ${rawTarget}` : "";
@@ -391,7 +391,7 @@ function toolActionForActivityTitle(block: any, language: ToolPresentationLangua
   if (toolName === "list_directory" || toolName === "get_project_skeleton") return `扫描 ${rawTarget}`;
   if (toolName === "analyze_tabular_document" || toolName === "query_tabular_document") return `分析 ${rawTarget}`;
   if (toolName === "write_file") return `写入 ${rawTarget}`;
-  if (toolName === "replace_in_file" || toolName === "apply_patch") return `编辑 ${rawTarget}`;
+  if (EDIT_ACTIVITY_TOOL_NAMES.has(toolName)) return `编辑 ${rawTarget}`;
   if (toolName === "run_command" || toolName === "execute_command") return `运行 ${rawTarget}`;
   if (toolName === "browser_evaluate") return `验证 ${rawTarget}`;
   return toolName ? `${toolName} ${rawTarget}` : "";
@@ -477,6 +477,17 @@ const GAME_STUDIO_ACTIVITY_TOOL_NAMES = new Set([
   "refresh_unity",
 ]);
 
+const EDIT_ACTIVITY_TOOL_NAMES = new Set([
+  "replace_in_file",
+  "write_file",
+  "apply_patch",
+  "script_apply_edits",
+  "apply_text_edits",
+  "manage_script",
+  "create_script",
+  "delete_script",
+]);
+
 const TERMINAL_READ_TOOL_NAMES = new Set([
   "read_pty_buffer",
   "read_pty_tail",
@@ -497,7 +508,7 @@ function isActivityCachedResult(block: any): boolean {
     block?.resultPreview,
     block?.content,
   ].map((value) => String(value || "")).join("\n");
-  return /FILE_UNCHANGED_STUB|Repeated read-only tool call skipped/i.test(text);
+  return /FILE_UNCHANGED_STUB|READ_FILE_REPEAT_LIMIT|READ_ONLY_REPEAT_LIMIT|Repeated read-only tool call skipped/i.test(text);
 }
 
 function classifyToolActivityKind(toolName: string, status: TurnArchiveStepStatus): ActivityCellKind {
@@ -506,7 +517,7 @@ function classifyToolActivityKind(toolName: string, status: TurnArchiveStepStatu
   }
   if (isExploringToolName(toolName)) return "exploring";
   if (toolName === "browser_evaluate") return "browser";
-  if (toolName === "replace_in_file" || toolName === "write_file" || toolName === "apply_patch") return "edit";
+  if (EDIT_ACTIVITY_TOOL_NAMES.has(toolName)) return "edit";
   if (toolName === "execute_command" || toolName === "run_command" || toolName === "send_pty_input" || TERMINAL_READ_TOOL_NAMES.has(toolName)) {
     return "command";
   }
@@ -643,7 +654,7 @@ function addActivityMetricsFromBlock(metrics: ActivityMetrics, block: any): void
   else if (toolName === "browser_evaluate") metrics.browserValidations += 1;
   else if (TERMINAL_READ_TOOL_NAMES.has(toolName)) metrics.terminalReads += 1;
   else if (toolName === "execute_command" || toolName === "run_command" || toolName === "send_pty_input") metrics.commandsRun += 1;
-  else if (toolName === "write_file" || toolName === "replace_in_file" || toolName === "apply_patch") {
+  else if (EDIT_ACTIVITY_TOOL_NAMES.has(toolName)) {
     const diff = block.diff || {};
     const existed = typeof diff.existed === "boolean" ? diff.existed : String(diff.old || "").length > 0;
     if (toolName === "write_file" && !existed) metrics.filesCreated += 1;

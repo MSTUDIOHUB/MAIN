@@ -71,12 +71,33 @@ export interface McpRoutingTelemetry {
   fallbackReason?: string;
   latencyMs: number;
   estimatedTokenCost?: number;
+  selectedIntent?: McpToolsetIntent;
+  selectedBundle?: string;
+  selectedToolNames?: string[];
+  schemaChars?: number;
 }
 
 export type McpRoutingPriorityMode = "none" | "unity_mcp_first";
 
 export interface UnityMcpRoutingContext {
   preferStructuredScriptEdits?: boolean;
+}
+
+export type McpToolsetIntent =
+  | "general"
+  | "unity_console_diagnostics"
+  | "unity_script_fix"
+  | "unity_scene_object"
+  | "unity_asset_prefab_material"
+  | "unity_build_package"
+  | "unity_editor_action";
+
+export interface McpToolsetBundle {
+  id: string;
+  intent: McpToolsetIntent;
+  requiredTools: string[];
+  preferredTools: string[];
+  maxTools: number;
 }
 
 type SkillLike = {
@@ -712,6 +733,151 @@ function compareUnityPriorityToolNames(
   return left.name.localeCompare(right.name);
 }
 
+const UNITY_TOOLSET_BUNDLES: Record<Exclude<McpToolsetIntent, "general">, McpToolsetBundle> = {
+  unity_console_diagnostics: {
+    id: "unity_console_diagnostics",
+    intent: "unity_console_diagnostics",
+    requiredTools: ["read_console", "set_active_instance"],
+    preferredTools: [
+      "refresh_unity",
+      "get_active_instance",
+      "list_instances",
+      "find_in_file",
+      "get_sha",
+    ],
+    maxTools: 8,
+  },
+  unity_script_fix: {
+    id: "unity_script_fix",
+    intent: "unity_script_fix",
+    requiredTools: ["read_console", "set_active_instance", "script_apply_edits"],
+    preferredTools: [
+      "refresh_unity",
+      "find_in_file",
+      "get_sha",
+      "apply_text_edits",
+      "manage_script",
+      "read_resource",
+      "get_active_instance",
+    ],
+    maxTools: 12,
+  },
+  unity_scene_object: {
+    id: "unity_scene_object",
+    intent: "unity_scene_object",
+    requiredTools: ["set_active_instance"],
+    preferredTools: [
+      "find_gameobjects",
+      "manage_gameobject",
+      "manage_components",
+      "manage_scene",
+      "manage_camera",
+      "refresh_unity",
+      "read_console",
+    ],
+    maxTools: 12,
+  },
+  unity_asset_prefab_material: {
+    id: "unity_asset_prefab_material",
+    intent: "unity_asset_prefab_material",
+    requiredTools: ["set_active_instance"],
+    preferredTools: [
+      "manage_asset",
+      "manage_prefabs",
+      "manage_material",
+      "manage_packages",
+      "refresh_unity",
+      "read_console",
+    ],
+    maxTools: 10,
+  },
+  unity_build_package: {
+    id: "unity_build_package",
+    intent: "unity_build_package",
+    requiredTools: ["read_console", "set_active_instance"],
+    preferredTools: [
+      "manage_build",
+      "manage_packages",
+      "refresh_unity",
+      "get_active_instance",
+    ],
+    maxTools: 10,
+  },
+  unity_editor_action: {
+    id: "unity_editor_action",
+    intent: "unity_editor_action",
+    requiredTools: ["set_active_instance"],
+    preferredTools: [
+      "execute_menu_item",
+      "manage_editor",
+      "refresh_unity",
+      "read_console",
+      "get_active_instance",
+    ],
+    maxTools: 10,
+  },
+};
+
+function inferUnityMcpToolsetIntent(
+  userPrompt: string,
+  context?: UnityMcpRoutingContext,
+): McpToolsetIntent {
+  const prompt = normalizeText(userPrompt);
+  const hasConsoleIntent = containsAny(prompt, UNITY_CONSOLE_TERMS);
+  const hasFixVerb = containsAny(prompt, [
+    "fix",
+    "repair",
+    "patch",
+    "edit",
+    "modify",
+    "refactor",
+    "resolve",
+    "修复",
+    "补丁",
+    "修改",
+    "改",
+    "解决",
+  ]);
+  const hasScriptIntent =
+    context?.preferStructuredScriptEdits === true ||
+    containsAny(prompt, ["script", "c#", "cs", "compiler", "脚本", "代码"]) ||
+    (hasFixVerb && containsAny(prompt, UNITY_SCRIPT_EDIT_TERMS));
+  if (hasConsoleIntent && hasScriptIntent) return "unity_script_fix";
+  if (hasScriptIntent) return "unity_script_fix";
+  if (containsAny(prompt, ["build", "package", "apk", "ipa", "player", "构建", "打包", "发布", "包管理"])) {
+    return "unity_build_package";
+  }
+  if (containsAny(prompt, ["prefab", "asset", "material", "texture", "资源", "预制体", "材质", "贴图"])) {
+    return "unity_asset_prefab_material";
+  }
+  if (containsAny(prompt, ["gameobject", "component", "scene", "camera", "hierarchy", "对象", "组件", "场景", "相机"])) {
+    return "unity_scene_object";
+  }
+  if (containsAny(prompt, ["menu item", "editor", "菜单", "编辑器", "窗口"])) {
+    return "unity_editor_action";
+  }
+  return "unity_console_diagnostics";
+}
+
+function selectToolsByName(tools: MCPTool[], names: string[]): MCPTool[] {
+  const byName = new Map(tools.map((tool) => [tool.name, tool]));
+  const selected: MCPTool[] = [];
+  const seen = new Set<string>();
+  for (const name of names) {
+    const tool = byName.get(name);
+    if (!tool || seen.has(tool.name)) continue;
+    seen.add(tool.name);
+    selected.push(tool);
+  }
+  return selected;
+}
+
+function pushUniqueTool(target: MCPTool[], tool: MCPTool | undefined, seen: Set<string>): void {
+  if (!tool || seen.has(tool.name)) return;
+  seen.add(tool.name);
+  target.push(tool);
+}
+
 function toPositiveInteger(value: unknown): number | null {
   if (typeof value === "number" && Number.isInteger(value) && value > 0) return value;
   if (typeof value === "string" && /^\d+$/.test(value.trim())) {
@@ -784,6 +950,7 @@ export function routeMcpToolsForPrompt(params: {
     selectedTools: MCPTool[],
     pickSource: McpRoutingTelemetry["pickSource"],
     fallbackReason?: string,
+    extra: Partial<McpRoutingTelemetry> = {},
   ) => {
     const serverUrls = new Set(
       selectedTools
@@ -802,6 +969,9 @@ export function routeMcpToolsForPrompt(params: {
         fallbackReason,
         latencyMs,
         estimatedTokenCost: Math.ceil(JSON.stringify(selectedTools).length / 4),
+        selectedToolNames: selectedTools.map((tool) => tool.name),
+        schemaChars: JSON.stringify(selectedTools).length,
+        ...extra,
       },
     };
   };
@@ -831,22 +1001,49 @@ export function routeMcpToolsForPrompt(params: {
       .sort((a, b) => b.score - a.score || compareUnityPriorityToolNames(a.tool, b.tool, params.unityRoutingContext))
       .map((entry) => entry.tool);
 
-    const forcedOrder = (params.forceFirstTools ?? [])
-      .map((name) => candidateTools.find((tool) => tool.name === name))
-      .filter((tool): tool is MCPTool => !!tool);
-    const forcedNameSet = new Set(forcedOrder.map((tool) => tool.name));
-    const prioritized = [
-      ...forcedOrder,
-      ...scoredTools.filter((tool) => !forcedNameSet.has(tool.name)),
-    ];
+    const selectedIntent = inferUnityMcpToolsetIntent(params.userPrompt, params.unityRoutingContext);
+    const bundle = selectedIntent === "general" ? null : UNITY_TOOLSET_BUNDLES[selectedIntent];
+    const forcedNames = Array.from(new Set([
+      ...(params.forceFirstTools ?? []),
+      ...(bundle?.requiredTools ?? []),
+    ]));
+    const forcedOrder = selectToolsByName(candidateTools, forcedNames);
+    const preferredOrder = selectToolsByName(candidateTools, bundle?.preferredTools ?? []);
+    const selected: MCPTool[] = [];
+    const selectedNames = new Set<string>();
+    for (const tool of forcedOrder) pushUniqueTool(selected, tool, selectedNames);
+    for (const tool of preferredOrder) pushUniqueTool(selected, tool, selectedNames);
+
+    const maxByThreshold = Math.max(forcedOrder.length, Math.min(config.threshold, bundle?.maxTools ?? 12, 16));
+    for (const tool of scoredTools) {
+      if (selected.length >= maxByThreshold) break;
+      pushUniqueTool(selected, tool, selectedNames);
+    }
+
+    const prioritized = selected.slice(0, Math.max(forcedOrder.length, maxByThreshold));
     if (prioritized.length > 0) {
-      return finish(prioritized, "heuristic");
+      return finish(prioritized, "heuristic", undefined, {
+        selectedIntent,
+        selectedBundle: bundle?.id ?? "unity_scored",
+      });
     }
 
     if (config.fallbackToFullList) {
-      return finish(enabledTools, "fallback_full_list", "unity_priority_no_candidates");
+      const fallbackTools = scoredTools.slice(0, Math.min(config.threshold, 16));
+      return finish(
+        fallbackTools.length > 0 ? fallbackTools : enabledTools.slice(0, Math.min(config.threshold, 16)),
+        "fallback_full_list",
+        "unity_priority_no_candidates",
+        {
+          selectedIntent,
+          selectedBundle: bundle?.id ?? "unity_scored",
+        },
+      );
     }
-    return finish([], "safe_empty", "unity_priority_no_candidates");
+    return finish([], "safe_empty", "unity_priority_no_candidates", {
+      selectedIntent,
+      selectedBundle: bundle?.id ?? "unity_scored",
+    });
   }
 
   if (enabledTools.length <= config.threshold) return finish(enabledTools, "full_list");

@@ -173,7 +173,11 @@ test("system prompt only adds web-search guidance when web tools are available",
   );
 
   assert.doesNotMatch(withoutWeb, /网络搜索已开启/);
+  assert.doesNotMatch(withoutWeb, /网络搜索日期锚点/);
   assert.match(withWeb, /网络搜索已开启/);
+  assert.match(withWeb, /网络搜索日期锚点/);
+  assert.match(withWeb, /当前本地日期为 \d{4}-\d{2}-\d{2}/);
+  assert.match(withWeb, /不要按模型训练截止日期或旧年份理解/);
   assert.match(withWeb, /来源 URL/);
 });
 

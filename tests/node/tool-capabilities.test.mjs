@@ -357,7 +357,7 @@ test("MCP routing keeps small lists and heuristically selects relevant tools abo
   );
 });
 
-test("Unity MCP-first routing keeps Unity server tools and forces read_console to the front", () => {
+test("Unity MCP-first routing scopes Unity console diagnostics instead of exposing every Unity tool", () => {
   const servers = [
     { name: "unityMCP", type: "http", url: "http://127.0.0.1:8080/mcp" },
     { name: "research", type: "http", url: "http://research.test" },
@@ -385,11 +385,11 @@ test("Unity MCP-first routing keeps Unity server tools and forces read_console t
   });
 
   assert.equal(routed.telemetry.pickSource, "heuristic");
+  assert.equal(routed.telemetry.selectedIntent, "unity_console_diagnostics");
+  assert.equal(routed.telemetry.selectedBundle, "unity_console_diagnostics");
   assert.equal(routed.tools[0]?.name, "read_console");
-  assert.deepEqual(
-    routed.tools.map((item) => item.name).sort(),
-    ["manage_scene", "read_console"],
-  );
+  assert.deepEqual(routed.tools.map((item) => item.name), ["read_console"]);
+  assert.ok(routed.telemetry.selectedToolCount < tools.length);
 });
 
 test("Unity MCP-first routing prefers script_apply_edits over apply_text_edits for script fixes", () => {
@@ -410,16 +410,19 @@ test("Unity MCP-first routing prefers script_apply_edits over apply_text_edits f
     servers,
     toolServerMap,
     userPrompt: "请修复 Unity C# 脚本报错",
-    config: { enabled: true, threshold: 1, routerModel: "", timeoutMs: 800, fallbackToFullList: true, disabledToolKeys: [] },
+    config: { enabled: true, threshold: 4, routerModel: "", timeoutMs: 800, fallbackToFullList: true, disabledToolKeys: [] },
     priorityMode: "unity_mcp_first",
     preferredServerUrls: ["http://127.0.0.1:8080/mcp"],
     unityRoutingContext: { preferStructuredScriptEdits: true },
   });
 
   const orderedNames = routed.tools.map((item) => item.name);
+  assert.equal(routed.telemetry.selectedIntent, "unity_script_fix");
+  assert.equal(routed.telemetry.selectedBundle, "unity_script_fix");
   assert.ok(orderedNames.indexOf("script_apply_edits") >= 0);
   assert.ok(orderedNames.indexOf("apply_text_edits") >= 0);
   assert.ok(orderedNames.indexOf("script_apply_edits") < orderedNames.indexOf("apply_text_edits"));
+  assert.ok(routed.telemetry.selectedToolCount <= 4);
 });
 
 test("Unity apply_text_edits precise patch validator enforces uri, coordinates, and precondition sha", () => {

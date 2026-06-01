@@ -14,6 +14,7 @@ import {
 import { getIntentPolicy, resolveRunIntentFromLegacyWorkflowMode, type CommandDirective, type ResolvedUserIntent } from "./runIntent";
 import { mapLegacyNexusModeToMainMode, type MainModeKey } from "./mainModes";
 import type { PromptLanguageStrategy } from "./toolCapabilities";
+import { buildWebResearchDateContext } from "./webResearchGuard";
 
 export const MAIN_MODE_PROMPTS: Record<MainModeKey, string> = {
   main_mode: [
@@ -349,6 +350,12 @@ export function buildSystemPrompt(
     language: resolvedResponseLanguage,
   });
   const normalizedMainModeKey = mapLegacyNexusModeToMainMode(mainModeKey);
+  const webResearchToolsAvailable =
+    isToolNameAvailable("web_search", availableToolNames) ||
+    isToolNameAvailable("web_fetch", availableToolNames);
+  const webResearchDateContext = webResearchToolsAvailable
+    ? buildWebResearchDateContext(resolvedResponseLanguage)
+    : "";
   const shellToolsAvailable =
     isToolNameAvailable("run_command", availableToolNames) ||
     isToolNameAvailable("execute_command", availableToolNames);
@@ -653,7 +660,8 @@ export function buildSystemPrompt(
     chatInstructions.push("数据分析、文档解读、报表总结属于 MAIN 模式内允许的只读工作，不需要为了继续分析切换到 Plan 模式。");
     chatInstructions.push("不要为了这种只读降级向用户申请批准；如果某个只读工具不兼容，就直接换另一条只读路径继续。");
     chatInstructions.push("只读读取、搜索、查看、查询、分析本身不需要逐步征求用户同意；除非存在业务口径冲突或真实分叉，否则不要问“是否同意我读取下一个文件”。");
-    if (isToolNameAvailable("web_search", availableToolNames) || isToolNameAvailable("web_fetch", availableToolNames)) {
+    if (webResearchToolsAvailable) {
+      chatInstructions.push(webResearchDateContext);
       chatInstructions.push("网络搜索已开启：遇到最新信息、网页/GitHub 链接、外部文档、版本/发布断言或需要验证的实时事实，优先使用 `web_search` / `web_fetch`；最终结论必须带来源 URL。不要把模型记忆伪装成联网结果，也不要在未联网取证时直接否定用户看到的最新版本/发布信息。");
     }
     chatInstructions.push("如果 `analyze_tabular_document`、`query_tabular_document`、`read_document` 中某个只读工具失败，不要停下来征求用户是否允许降级；应在同一轮自动改用其他只读工具继续。");
@@ -711,7 +719,8 @@ export function buildSystemPrompt(
       WORKFLOW_BUILT_IN_TOOL_NAMES,
       availableToolNames,
     ));
-    if (isToolNameAvailable("web_search", availableToolNames) || isToolNameAvailable("web_fetch", availableToolNames)) {
+    if (webResearchToolsAvailable) {
+      tfl.push(webResearchDateContext);
       tfl.push("网络搜索已开启：涉及最新信息、外部网页/文档、GitHub URL、版本/发布断言、第三方 API 文档或必须验证的公开事实时，优先用 `web_search` / `web_fetch` 获取证据；最终结论必须包含来源 URL。不要把模型记忆当作联网结果，也不要在未联网取证时直接否定用户看到的最新版本/发布信息。");
     }
     if (turnIntent === "plan") {

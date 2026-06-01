@@ -11,7 +11,16 @@ export interface ToolDiffPreview {
 }
 
 export function supportsToolDiffPreview(toolName: string): boolean {
-  return toolName === "write_file" || toolName === "replace_in_file" || toolName === "apply_patch";
+  return (
+    toolName === "write_file" ||
+    toolName === "replace_in_file" ||
+    toolName === "apply_patch" ||
+    toolName === "script_apply_edits" ||
+    toolName === "apply_text_edits" ||
+    toolName === "manage_script" ||
+    toolName === "create_script" ||
+    toolName === "delete_script"
+  );
 }
 
 interface ToolDiffPreviewContext {

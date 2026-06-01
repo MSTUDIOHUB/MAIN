@@ -3154,13 +3154,14 @@ export default function ChatArea({
       const text = getAgentVisibleMarkdownText(block);
       const content = String(text || "").trim();
       if (!content) return false;
-      if (isTransparentToolNarrationBlock(block) || shouldSuppressAgentToolEcho(blocks, idx)) return false;
-      return (
+      const isSubstantiveIntermediateText =
         content.length > 300 ||
         isSubstantiveModelFeedback(content) ||
         /(?:^|\n)\s*(?:\d+[.)]|[-*])\s+/.test(content) ||
-        /(?:阶段性|结论|总结|问题|原因|根因|修复|方案|验证|阻塞|risk|issue|root cause|fix|summary|conclusion)/i.test(content)
-      );
+        /(?:阶段性|结论|总结|问题|原因|根因|修复|方案|验证|阻塞|risk|issue|root cause|fix|summary|conclusion)/i.test(content);
+      if (!isSubstantiveIntermediateText) return false;
+      if (shouldSuppressAgentToolEcho(blocks, idx)) return false;
+      return true;
       })
       .map(({ block }) => block.id));
     const hasSubstantiveIntermediateAgentText = substantiveIntermediateAgentBlockIds.size > 0;
@@ -3330,7 +3331,11 @@ export default function ChatArea({
           }
           if (item.block?.type === "tool" && item.block?.toolStatus === "running") return null;
         } else {
-          if (config.enableCapsule !== false && isTransparentToolNarrationBlock(item.block)) return null;
+          if (
+            config.enableCapsule !== false &&
+            isTransparentToolNarrationBlock(item.block) &&
+            !(item.block?.type === "agent" && substantiveIntermediateAgentBlockIds.has(item.block.id))
+          ) return null;
         }
 
         // Hide conversational first-person explanations from message flow if completed/stopped,
@@ -3356,7 +3361,11 @@ export default function ChatArea({
     const renderArchivedBlockItem = (item) => {
       if (item.kind !== "readContextGroup" && item.kind !== "operationCluster" && item.block?.type === "thought") return null;
       if (item.kind === "block") {
-        if (config.enableCapsule !== false && isTransparentToolNarrationBlock(item.block)) return null;
+        if (
+          config.enableCapsule !== false &&
+          isTransparentToolNarrationBlock(item.block) &&
+          !(item.block?.type === "agent" && substantiveIntermediateAgentBlockIds.has(item.block.id))
+        ) return null;
 
         // Hide conversational first-person explanations from message flow if completed/stopped,
         // since they are collapsed in the TurnIntentHistoryCard.

@@ -28,6 +28,8 @@ function loadTranspiledModuleSync(sourcePath) {
 
 const {
   buildRequiredWebResearchQuery,
+  buildWebResearchDateContext,
+  formatWebResearchLocalDate,
   shouldRequireWebResearchForPrompt,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/webResearchGuard.ts"));
 
@@ -55,8 +57,25 @@ test("does not require web research for local workflow commands without web targ
 
 test("builds a targeted official Unreal Engine query", () => {
   assert.match(
-    buildRequiredWebResearchQuery("UE 已经更新到 5.7.x 了吗"),
+    buildRequiredWebResearchQuery("UE 已经更新到 5.7.x 了吗", new Date("2026-06-01T08:00:00")),
     /Unreal Engine latest official release version release notes/i,
+  );
+  assert.match(
+    buildRequiredWebResearchQuery("UE 已经更新到 5.7.x 了吗", new Date("2026-06-01T08:00:00")),
+    /as of 2026-06-01/i,
+  );
+});
+
+test("anchors latest Unity searches to the current local date", () => {
+  const fixedDate = new Date("2026-06-01T08:00:00");
+  assert.equal(formatWebResearchLocalDate(fixedDate), "2026-06-01");
+  assert.match(
+    buildRequiredWebResearchQuery("搜索最新的 Unity 版本", fixedDate),
+    /as of 2026-06-01 Unity latest official release version release notes/i,
+  );
+  assert.match(
+    buildWebResearchDateContext("zh", fixedDate),
+    /当前本地日期为 2026-06-01/,
   );
 });
 
@@ -66,4 +85,5 @@ test("orchestrator gates forced research behind the web search switch", () => {
   assert.match(source, /const shouldInjectRequiredWebResearchCall =\s*\n\s*webSearchEnabled &&/);
   assert.match(source, /availableToolNames\.has\("web_search"\)/);
   assert.match(source, /shouldRequireWebResearchForPrompt\(latestUserPromptText\)/);
+  assert.match(source, /formatWebResearchLocalDate\(\)/);
 });

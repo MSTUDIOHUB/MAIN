@@ -129,7 +129,16 @@ export function registerToolCallForRepeatGuard(
 
 function getToolProgressFamily(name: string, target?: string): RecentTargetToolCall["family"] {
   if (String(target || "").startsWith("shell-write:")) return "edit";
-  if (name === "write_file" || name === "replace_in_file" || name === "apply_patch") return "edit";
+  if (
+    name === "write_file" ||
+    name === "replace_in_file" ||
+    name === "apply_patch" ||
+    name === "script_apply_edits" ||
+    name === "apply_text_edits" ||
+    name === "manage_script" ||
+    name === "create_script" ||
+    name === "delete_script"
+  ) return "edit";
   if (
     name === "run_command" ||
     name === "execute_command" ||

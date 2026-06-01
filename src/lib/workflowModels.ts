@@ -2287,10 +2287,20 @@ export function collectChangeEntries(
   const entries: ChangeEntry[] = [];
   const indexByTarget = new Map<string, number>();
   let totalExecutedEdits = 0;
+  const editToolNames = new Set([
+    "write_file",
+    "replace_in_file",
+    "apply_patch",
+    "script_apply_edits",
+    "apply_text_edits",
+    "manage_script",
+    "create_script",
+    "delete_script",
+  ]);
 
   blocks.forEach((block, order) => {
     if (block.type !== "tool" || block.toolStatus !== "executed" || !block.diff) return;
-    if (block.toolName !== "write_file" && block.toolName !== "replace_in_file" && block.toolName !== "apply_patch") return;
+    if (!editToolNames.has(String(block.toolName || ""))) return;
     if (block.revertStatus === "reverted") return;
 
     const target = String(block.target || block.diff.path || block.toolName || "");

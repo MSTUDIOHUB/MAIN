@@ -168,6 +168,11 @@ const EDIT_OPERATION_TOOL_NAMES = new Set([
   "replace_in_file",
   "write_file",
   "apply_patch",
+  "script_apply_edits",
+  "apply_text_edits",
+  "manage_script",
+  "create_script",
+  "delete_script",
 ]);
 
 const COMMAND_OPERATION_TOOL_NAMES = new Set([
@@ -200,7 +205,7 @@ function isCachedToolBlock(block: ToolUiGroupBlock): boolean {
     block.why,
     block.content,
   ].map((value) => String(value || "")).join("\n");
-  return /FILE_UNCHANGED_STUB|Repeated read-only tool call skipped/i.test(text);
+  return /FILE_UNCHANGED_STUB|READ_FILE_REPEAT_LIMIT|READ_ONLY_REPEAT_LIMIT|Repeated read-only tool call skipped/i.test(text);
 }
 
 function getFullToolTarget(block: ToolUiGroupBlock, language: "zh" | "en"): string {

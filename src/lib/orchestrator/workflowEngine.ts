@@ -195,7 +195,7 @@ export class WorkflowEngine {
     };
 
     const isNoOpToolResult = (text: string) =>
-      /FILE_UNCHANGED_STUB|READ_FILE_REPEAT_LIMIT|empty_change|invalid_patch|identical_content|no changes|no-op|nothing to (?:change|patch|write)|"noOp"\s*:\s*true/i.test(text);
+      /FILE_UNCHANGED_STUB|READ_FILE_REPEAT_LIMIT|READ_ONLY_REPEAT_LIMIT|empty_change|invalid_patch|identical_content|no changes|no-op|nothing to (?:change|patch|write)|"noOp"\s*:\s*true/i.test(text);
 
     const summarizeReviewPatchTarget = (patch: string): string => {
       const text = String(patch || "");
@@ -1121,10 +1121,11 @@ export class WorkflowEngine {
         });
       },
 
-      onToolDone: (toolName: string, target: string, result: string, meta?: { toolCallId?: string }) => {
+      onToolDone: (toolName: string, target: string, result: string, meta?: { toolCallId?: string; diff?: any }) => {
         const lifecycleMeta = normalizeToolLifecycleMeta(meta);
         const executionId = lifecycleMeta.toolCallId || undefined;
         const resultText = String(result || "");
+        const completedDiff = shouldAttachToolDiffPreview(toolName, target, meta?.diff) ? meta?.diff : undefined;
         const noOp = isNoOpToolResult(resultText);
         const observationSummary = summarizeToolObservation({
           toolName,
@@ -1185,6 +1186,7 @@ export class WorkflowEngine {
                 toolStatus: "executed",
                 output: resultText,
                 message: resultText,
+                ...(completedDiff ? { diff: completedDiff } : block.diff ? { diff: block.diff } : {}),
                 intentSummary: block.intentSummary || deriveToolIntentSummary({
                   toolName,
                   target,

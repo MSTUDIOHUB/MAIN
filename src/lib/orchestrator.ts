@@ -51,7 +51,7 @@ import {
   shouldSuppressApprovedPlanExecutionReplyOptions as shouldSuppressApprovedPlanExecutionReplyOptionsState,
   stripReadOnlyPermissionPrompt,
 } from "./replyOptions";
-import { buildToolDiffPreview, type ToolDiffPreview } from "./toolDiff";
+import { buildToolDiffPreview, supportsToolDiffPreview, type ToolDiffPreview } from "./toolDiff";
 import { preflightWorkspaceMutation } from "./workspaceMutationPreflight";
 import { summarizeApplyPatchTarget } from "./applyPatchTool";
 import { syncPlanArtifactAfterToolSuccess } from "./planArtifactSync";
@@ -347,6 +347,7 @@ import {
 } from "./turnIntake";
 import {
   buildRequiredWebResearchQuery,
+  formatWebResearchLocalDate,
   shouldRequireWebResearchForPrompt,
 } from "./webResearchGuard";
 
@@ -391,7 +392,13 @@ const EXECUTION_VERIFICATION_TOOL_NAMES = new Set([
   "get_pty_status",
 ]);
 
-const EDIT_PROGRESS_TOOL_NAMES = new Set(["write_file", "replace_in_file", "apply_patch"]);
+const MCP_EDIT_TOOL_NAMES = new Set(["script_apply_edits", "apply_text_edits", "manage_script", "create_script", "delete_script"]);
+const EDIT_PROGRESS_TOOL_NAMES = new Set([
+  "write_file",
+  "replace_in_file",
+  "apply_patch",
+  ...MCP_EDIT_TOOL_NAMES,
+]);
 const FORCE_CONTEXT_TEXT_CHARS = 60_000;
 const FORCE_CONTEXT_TOOL_RESULT_CHARS = 35_000;
 const FORCE_CONTEXT_TOOL_MESSAGE_COUNT = 12;
@@ -633,7 +640,7 @@ function emitToolPreflightBlocked(
 function isProjectSourceWriteResult(result: ToolExecutionResult): boolean {
   return (
     !result.isError &&
-    PLAN_ARTIFACT_MUTATION_TOOLS.has(result.name) &&
+    EDIT_PROGRESS_TOOL_NAMES.has(result.name) &&
     !!result.target &&
     !isPlanArtifactPath(result.target)
   );
@@ -1248,7 +1255,7 @@ export interface OrchestratorCallbacks {
     toolName: string,
     target: string,
     result: string,
-    meta?: { toolCallId?: string },
+    meta?: { toolCallId?: string; diff?: ToolDiffPreview },
   ) => void;
   onToolError: (
     toolName: string,
@@ -2763,7 +2770,7 @@ export function buildReadFileRepeatLimitBatchPauseNotice(input: {
 function targetProgressOutcomeForToolResult(result?: ToolExecutionResult): TargetProgressOutcome {
   if (!result) return "failed";
   const diagnostic = getToolResultDiagnosticText(result);
-  if (/FILE_UNCHANGED_STUB|READ_FILE_REPEAT_LIMIT|empty_change|invalid_patch|identical_content|no changes|no-op|nothing to (?:change|patch|write)/i.test(diagnostic)) {
+  if (/FILE_UNCHANGED_STUB|READ_FILE_REPEAT_LIMIT|READ_ONLY_REPEAT_LIMIT|empty_change|invalid_patch|identical_content|no changes|no-op|nothing to (?:change|patch|write)/i.test(diagnostic)) {
     return "no_change";
   }
   if (/search_text_mismatch|MUTATION_PREFLIGHT_BLOCKED|patch.*(?:mismatch|failed to apply)|replacement text was not found/i.test(diagnostic)) {
@@ -2782,7 +2789,7 @@ function targetProgressReasonForToolResult(result?: ToolExecutionResult): string
   if (!diagnostic) return "missing_result";
   const reason =
     diagnostic.match(/\b(?:reason|error|status)\s*[:=]\s*([^.;\n]{1,100})/i)?.[1] ||
-    diagnostic.match(/\b(search_text_mismatch|empty_change|invalid_patch|identical_content|MUTATION_PREFLIGHT_BLOCKED|FILE_UNCHANGED_STUB|READ_FILE_REPEAT_LIMIT)\b/i)?.[1] ||
+    diagnostic.match(/\b(search_text_mismatch|empty_change|invalid_patch|identical_content|MUTATION_PREFLIGHT_BLOCKED|FILE_UNCHANGED_STUB|READ_FILE_REPEAT_LIMIT|READ_ONLY_REPEAT_LIMIT)\b/i)?.[1] ||
     diagnostic.slice(0, 120);
   return reason.trim();
 }
@@ -3121,6 +3128,56 @@ function isNoEffectMutationResult(input: {
   return emptyPayload && unchanged;
 }
 
+async function readMutationDiffSnapshot(input: {
+  path: string;
+  workspace: string;
+  sessionKey?: string;
+  allowExternalLocalRead?: boolean;
+}): Promise<{ path: string; content: string; existed: boolean }> {
+  try {
+    const content = await executeTool(
+      "read_file",
+      { path: input.path, __raw: true },
+      input.workspace,
+      input.sessionKey,
+      { allowExternalLocalRead: input.allowExternalLocalRead === true },
+    );
+    return {
+      path: input.path,
+      content: String(content ?? ""),
+      existed: true,
+    };
+  } catch {
+    return {
+      path: input.path,
+      content: "",
+      existed: false,
+    };
+  }
+}
+
+function buildMutationDiffPreviewFromSnapshots(input: {
+  toolName: string;
+  target: string;
+  before: { path: string; content: string; existed: boolean } | null;
+  after: { path: string; content: string; existed: boolean } | null;
+}): ToolDiffPreview | undefined {
+  if (!supportsToolDiffPreview(input.toolName)) return undefined;
+  const path = String(input.after?.path || input.before?.path || input.target || "").trim();
+  if (!path || isEphemeralPlanArtifactPath(path)) return undefined;
+  const oldText = input.before?.content ?? "";
+  const newText = input.after?.content ?? "";
+  const existed = input.before?.existed === true;
+  if (oldText === newText && existed === (input.after?.existed === true)) return undefined;
+  return {
+    old: oldText,
+    new: newText,
+    path,
+    existed,
+    fullFile: true,
+  };
+}
+
 function buildNoEffectMutationMessage(input: {
   language: "zh" | "en";
   toolName: string;
@@ -3170,7 +3227,7 @@ function inferLifecycleStateFromToolResult(result: ToolExecutionResult): ToolLif
   if (result.lifecycleState) return result.lifecycleState;
   if (!result.isError) {
     if (/"noOp"\s*:\s*true/.test(result.content || "")) return "completed";
-    if (result.content.includes(FILE_UNCHANGED_STUB) || /Repeated read-only tool call skipped:|READ_FILE_REPEAT_LIMIT/i.test(result.content)) {
+    if (result.content.includes(FILE_UNCHANGED_STUB) || /Repeated read-only tool call skipped:|READ_FILE_REPEAT_LIMIT|READ_ONLY_REPEAT_LIMIT/i.test(result.content)) {
       return "completed";
     }
     return "completed";
@@ -3193,7 +3250,7 @@ function buildToolResultHistoryContent(result: ToolExecutionResult): string {
   const isNoEffectMutation = /NO_EFFECT_MUTATION/i.test(result.content || "");
   const isCachedReuse =
     result.content.includes(FILE_UNCHANGED_STUB) ||
-    /Repeated read-only tool call skipped:|READ_FILE_REPEAT_LIMIT/i.test(result.content);
+    /Repeated read-only tool call skipped:|READ_FILE_REPEAT_LIMIT|READ_ONLY_REPEAT_LIMIT/i.test(result.content);
   const status: ToolFeedbackStatus =
     lifecycleState === "declined"
       ? "declined"
@@ -3405,11 +3462,23 @@ async function executeToolCallWithLifecycle(
     };
   }
 
+  const mutationVerificationPath = resolveMutationVerificationPath(tc.name, resolvedArgs);
+  const shouldCaptureMutationDiff =
+    !!mutationVerificationPath &&
+    supportsToolDiffPreview(tc.name) &&
+    !isEphemeralPlanArtifactPath(mutationVerificationPath);
+  const mutationBeforeDiffSnapshot = shouldCaptureMutationDiff && mutationVerificationPath
+    ? await readMutationDiffSnapshot({
+        path: mutationVerificationPath,
+        workspace,
+        sessionKey,
+        allowExternalLocalRead: options.allowExternalLocalRead === true,
+      })
+    : null;
   const diffPreview = isEphemeralPlanArtifactMutation(tc.name, resolvedArgs)
     ? undefined
     : await buildToolDiffPreview(tc.name, resolvedArgs, { workspace, sessionKey });
   callbacks.onToolExecuting(tc.name, target, diffPreview, { toolCallId: tc.id });
-  const mutationVerificationPath = resolveMutationVerificationPath(tc.name, resolvedArgs);
   const mutationBeforeMeta = mutationVerificationPath
     ? await readFileMetadataIfAvailable(mutationVerificationPath, workspace)
     : null;
@@ -3422,6 +3491,14 @@ async function executeToolCallWithLifecycle(
     const resultStr = typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult);
     const mutationAfterMeta = mutationVerificationPath
       ? await readFileMetadataIfAvailable(mutationVerificationPath, workspace)
+      : null;
+    const mutationAfterDiffSnapshot = shouldCaptureMutationDiff && mutationVerificationPath
+      ? await readMutationDiffSnapshot({
+          path: mutationVerificationPath,
+          workspace,
+          sessionKey,
+          allowExternalLocalRead: options.allowExternalLocalRead === true,
+        })
       : null;
     if (
       mutationVerificationPath &&
@@ -3574,7 +3651,14 @@ async function executeToolCallWithLifecycle(
       }
     }
 
-    callbacks.onToolDone(tc.name, target, finalDisplayContent, { toolCallId: tc.id });
+    const completedDiffPreview =
+      buildMutationDiffPreviewFromSnapshots({
+        toolName: tc.name,
+        target,
+        before: mutationBeforeDiffSnapshot,
+        after: mutationAfterDiffSnapshot,
+      }) || diffPreview;
+    callbacks.onToolDone(tc.name, target, finalDisplayContent, { toolCallId: tc.id, diff: completedDiffPreview });
     return {
       toolCallId: tc.id,
       name: tc.name,
@@ -4690,10 +4774,17 @@ export async function executeAgentLoop(
   let appliedSystemPromptKey = "";
   const applySystemPromptForRuntime = (runtimeIntent: ResolvedUserIntent, tools: ToolDefinition[]) => {
     const availableToolNameList = tools.map((tool) => tool.function.name);
+    const webResearchPromptDate = (
+      availableToolNameList.includes("web_search") ||
+      availableToolNameList.includes("web_fetch")
+    )
+      ? formatWebResearchLocalDate()
+      : "";
     const systemPromptKey = [
       runtimeIntent,
       workflowMode,
       callbacks.getPreferredLanguage(),
+      webResearchPromptDate,
       callbacks.getGameStudioConfig?.()?.engine ?? "",
       callbacks.getGameStudioConfig?.()?.engineVersion ?? "",
       callbacks.getCommandDirective?.()?.kind ?? "none",
@@ -4779,6 +4870,8 @@ export async function executeAgentLoop(
         compatibilityForcedAtStart,
       ),
       availableTools: availableToolNameList.length,
+      mcpTools: mcpToolNames.length,
+      toolSchemaChars: JSON.stringify(tools).length,
     });
   };
 
@@ -9282,6 +9375,9 @@ export async function executeAgentLoop(
         if (!bypassApprovedPlanPatchRecoveryReadCache && (cached || queuedReadOnlySignatures.has(signature))) {
           const duplicateCount = (readOnlyDuplicateSkipCounts.get(signature) ?? 0) + 1;
           readOnlyDuplicateSkipCounts.set(signature, duplicateCount);
+          const shouldPushReadOnlyRepeatLimit =
+            duplicateCount >= 8 &&
+            (workflowMode === "edit" || workflowMode === "chat" || callbacks.getIsPlanApproved());
           const planBudget = buildPlanExplorationBudget({
             workflowMode,
             isPlanApproved: callbacks.getIsPlanApproved(),
@@ -9306,6 +9402,17 @@ export async function executeAgentLoop(
             });
           }
           const duplicateContent = formatCachedReadOnlyToolResult(tc.name, target, cached, duplicateCount);
+          const repeatLimitGuidance = shouldPushReadOnlyRepeatLimit
+            ? callbacks.getPreferredLanguage() === "zh"
+              ? [
+                  `READ_ONLY_REPEAT_LIMIT: ${tc.name}${target ? ` (${target})` : ""} 已用相同参数重复 ${duplicateCount} 次，本次不会再执行真实工具。`,
+                  "请复用已缓存上下文，转向写入、命令/浏览器验证、不同目标，或给出明确阻塞/结论；不要继续原样调用同一个只读工具。",
+                ].join("\n")
+              : [
+                  `READ_ONLY_REPEAT_LIMIT: ${tc.name}${target ? ` (${target})` : ""} has repeated ${duplicateCount} times with identical arguments, so the real tool was not run again.`,
+                  "Reuse the cached context and move to a write, command/browser validation, a different target, or a concrete blocker/final conclusion. Do not retry the same read-only call.",
+                ].join("\n")
+            : "";
           const closurePrompt = shouldPushPlanReadLimit
             ? `\n\n${buildPlanClosurePromptFromEvidence(callbacks, recentPlanToolActivity, attemptedPlanWriteTargets, latestUserPromptText)}`
             : "";
@@ -9319,7 +9426,12 @@ export async function executeAgentLoop(
                   callbacks.getPreferredLanguage(),
                   callbacks.getPlanStage(),
                 )
+              : repeatLimitGuidance
+              ? `${repeatLimitGuidance}\n\n${duplicateContent}`
               : duplicateContent,
+            displayContent: shouldPushReadOnlyRepeatLimit
+              ? `READ_ONLY_REPEAT_LIMIT: ${target || tc.name}`
+              : undefined,
             isError: false,
           });
           continue;
@@ -9671,6 +9783,17 @@ export async function executeAgentLoop(
       target: firstFailedEvidenceResult?.target ?? null,
       lifecycleState: firstFailedEvidenceLifecycleState,
       evidenceKeys: [...taskTargetingEvidence].slice(-8),
+    });
+    logAgentEvent("post_tool_result_continuation", {
+      stage: "after_evidence_reconcile",
+      iteration,
+      results: allResults.length,
+      successfulResults: allResults.filter((result) => !result.isError).length,
+      editResults: allResults.filter((result) => !result.isError && EDIT_PROGRESS_TOOL_NAMES.has(result.name)).length,
+      verificationResults: allResults.filter((result) => !result.isError && EXECUTION_VERIFICATION_TOOL_NAMES.has(result.name)).length,
+      runtimeIntent,
+      workflowMode,
+      planApproved: callbacks.getIsPlanApproved(),
     });
 
     const successfulReadOnlyExplorationResults = allResults.filter((result) =>
@@ -10093,7 +10216,7 @@ export async function executeAgentLoop(
           for (const activity of recentPlanToolActivity.slice(-8)) {
             const target = String(activity.target || "").trim();
             if (!target) continue;
-            const cachedWeight = /FILE_UNCHANGED_STUB|Repeated read-only tool call skipped|READ_FILE_REPEAT_LIMIT/i.test(activity.detail || "") ? 2 : 1;
+            const cachedWeight = /FILE_UNCHANGED_STUB|Repeated read-only tool call skipped|READ_FILE_REPEAT_LIMIT|READ_ONLY_REPEAT_LIMIT/i.test(activity.detail || "") ? 2 : 1;
             counts.set(target, (counts.get(target) || 0) + cachedWeight);
           }
           return [...counts.entries()]
@@ -10739,6 +10862,18 @@ export async function executeAgentLoop(
       });
     }
 
+    logAgentEvent("post_tool_result_continuation", {
+      stage: "loop_continue",
+      iteration,
+      nextIteration: iteration + 1,
+      pendingExecuteRecovery: !!pendingExecuteRecoveryPrompt,
+      pendingPlanRecovery: !!pendingPlanRuntimeRecoveryPrompt,
+      usedExecuteConvergencePrompt,
+      repeatedEditTargets: Array.from(successfulEditTargetsSinceVerification.entries()).slice(-6),
+      runtimeIntent,
+      workflowMode,
+      planApproved: callbacks.getIsPlanApproved(),
+    });
     // Loop continues — the model sees all tool results and can respond
   }
 

@@ -11,6 +11,36 @@ function compactForSearch(value: string): string {
   return String(value || "").replace(/\s+/g, " ").trim();
 }
 
+export function formatWebResearchLocalDate(date: Date = new Date()): string {
+  const year = date.getFullYear();
+  const month = `${date.getMonth() + 1}`.padStart(2, "0");
+  const day = `${date.getDate()}`.padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+export function getWebResearchTimeZone(): string {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || "local";
+  } catch {
+    return "local";
+  }
+}
+
+export function buildWebResearchDateContext(language: "zh" | "en", date: Date = new Date()): string {
+  const localDate = formatWebResearchLocalDate(date);
+  const year = localDate.slice(0, 4);
+  const timeZone = getWebResearchTimeZone();
+  if (language === "en") {
+    return `Current local date for web research: ${localDate} (${timeZone}). Interpret "today", "current", "latest", and "recent" relative to this date, not the model training cutoff. For latest version/release searches, include ${year} or ${localDate} in the query and verify official sources before concluding.`;
+  }
+  return `网络搜索日期锚点：当前本地日期为 ${localDate}（${timeZone}）。把“今天、当前、最新、最近”都按这个日期理解，不要按模型训练截止日期或旧年份理解。搜索最新版本/发布信息时，优先在 query 中加入 ${year} 或 ${localDate}，并用官方来源核验后再下结论。`;
+}
+
+function buildDateAnchoredQuery(text: string, date: Date = new Date()): string {
+  const localDate = formatWebResearchLocalDate(date);
+  return `as of ${localDate} ${text}`;
+}
+
 export function shouldRequireWebResearchForPrompt(prompt: string): boolean {
   const text = compactForSearch(prompt);
   if (!text) return false;
@@ -25,18 +55,21 @@ export function shouldRequireWebResearchForPrompt(prompt: string): boolean {
   return hasVersionClaim && hasExternalSubject && (hasStrongFreshCue || hasWeakCurrentCue);
 }
 
-export function buildRequiredWebResearchQuery(prompt: string): string {
+export function buildRequiredWebResearchQuery(prompt: string, date: Date = new Date()): string {
   const text = compactForSearch(prompt);
   if (/(?:\bUE\b|unreal(?:\s+engine)?|虚幻(?:引擎)?)/i.test(text)) {
-    return `Unreal Engine latest official release version release notes ${text}`;
+    return buildDateAnchoredQuery(`Unreal Engine latest official release version release notes ${text}`, date);
+  }
+  if (/(?:\bunity\b|Unity|团结引擎)/i.test(text)) {
+    return buildDateAnchoredQuery(`Unity latest official release version release notes ${text}`, date);
   }
   if (/(?:天气|气象|weather)/i.test(text)) {
-    return text;
+    return buildDateAnchoredQuery(text, date);
   }
   if (/(?:github\.com|github)/i.test(text)) {
     return `${text} site:github.com`;
   }
-  return text;
+  return buildDateAnchoredQuery(text, date);
 }
 
 export function buildRequiredWebResearchPrompt(language: "zh" | "en", prompt: string): string {
