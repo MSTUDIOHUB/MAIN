@@ -414,3 +414,23 @@ test("normalization keeps malformed tool protocol out of visible text", () => {
   assert.equal(normalized.visibleText, "我先读取核心编排文件。");
   assert.doesNotMatch(normalized.visibleText, /parameter|max_lines|read_file|orchestrator\.ts/);
 });
+
+test("normalization treats permission questions as text instead of pending tool review", () => {
+  const normalized = normalizeAssistantTurn({
+    content: [
+      "我可以运行一次构建命令来确认现状吗？",
+      "",
+      "<tool_use>",
+      "<tool>run_command</tool>",
+      "<parameter name=\"command\">npm run build</parameter>",
+      "<parameter name=\"cwd\">.</parameter>",
+      "<parameter name=\"description\">验证当前构建状态</parameter>",
+      "</tool_use>",
+    ].join("\n"),
+    toolCalls: [],
+    finishReason: "stop",
+  });
+
+  assert.equal(normalized.toolCalls.length, 0);
+  assert.equal(normalized.visibleText, "我可以运行一次构建命令来确认现状吗？");
+});

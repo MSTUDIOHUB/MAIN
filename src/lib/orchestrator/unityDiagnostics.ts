@@ -38,12 +38,32 @@ export function shouldTriggerUnityMcpFirstIterationFallback(input: {
   replyOptionCount: number;
   unityMcpFirstPhaseActive: boolean;
   unityMcpFirstIterationPending: boolean;
+  unityConsoleDiagnosticsRequested?: boolean;
 }): boolean {
   return (
     input.toolCallCount === 0 &&
     input.replyOptionCount === 0 &&
     input.unityMcpFirstPhaseActive &&
-    input.unityMcpFirstIterationPending
+    input.unityMcpFirstIterationPending &&
+    !input.unityConsoleDiagnosticsRequested
+  );
+}
+
+export function shouldTriggerUnityMcpStrictRetry(input: {
+  toolCallCount: number;
+  replyOptionCount: number;
+  unityMcpFirstPhaseActive: boolean;
+  unityMcpFirstIterationPending: boolean;
+  unityConsoleDiagnosticsRequested: boolean;
+  strictRetryAlreadyIssued?: boolean;
+}): boolean {
+  return (
+    input.toolCallCount === 0 &&
+    input.replyOptionCount === 0 &&
+    input.unityMcpFirstPhaseActive &&
+    input.unityMcpFirstIterationPending &&
+    input.unityConsoleDiagnosticsRequested &&
+    !input.strictRetryAlreadyIssued
   );
 }
 

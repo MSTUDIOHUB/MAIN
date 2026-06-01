@@ -313,14 +313,42 @@ function normalizeNativeToolCalls(result: StreamResult): NormalizedToolCall[] {
     }));
 }
 
-function normalizeTextToolCalls(text: string): NormalizedToolCall[] {
-  const parsed = parseTextForTools(text);
+function normalizeParsedTextToolCalls(parsed: ReturnType<typeof parseTextForTools>): NormalizedToolCall[] {
   return parsed.toolCalls.map((call, index) => ({
     id: call.id?.trim() || `text_call_${index + 1}`,
     name: call.name,
     arguments: JSON.stringify(call.arguments),
     source: "text" as const,
   }));
+}
+
+const REVIEW_GATED_TEXT_TOOL_NAMES = new Set([
+  "write_file",
+  "replace_in_file",
+  "apply_patch",
+  "run_command",
+  "execute_command",
+  "send_pty_input",
+  "browser_evaluate",
+]);
+
+function looksLikeClarifyingOrPermissionQuestion(text: string): boolean {
+  const normalized = String(text || "").replace(/\s+/g, " ").trim();
+  if (!normalized) return false;
+  return (
+    /[?？]\s*$/.test(normalized) ||
+    /(?:是否|要不要|可不可以|可以吗|可以么|需要(?:你|您)?确认|请(?:确认|选择|告诉我)|你(?:希望|想要|要不要)|您(?:希望|想要|要不要))/i.test(normalized) ||
+    /\b(?:do you want|would you like|should i|shall i|please confirm|please choose|tell me whether)\b/i.test(normalized)
+  );
+}
+
+function shouldTreatTextToolCallsAsUserQuestion(
+  visibleText: string,
+  toolCalls: NormalizedToolCall[],
+): boolean {
+  if (!toolCalls.length) return false;
+  if (!looksLikeClarifyingOrPermissionQuestion(visibleText)) return false;
+  return toolCalls.some((call) => REVIEW_GATED_TEXT_TOOL_NAMES.has(call.name));
 }
 
 function isUserOptionsToolName(name: string): boolean {
@@ -397,7 +425,15 @@ export function normalizeAssistantTurn(result: StreamResult): NormalizedStreamSt
   const taggedHiddenThought = extractHiddenThought(initialOptions.cleanText);
   const parsed = parseTextForTools(initialOptions.cleanText || "");
   const nativeToolCalls = normalizeNativeToolCalls(result);
-  const rawToolCalls = nativeToolCalls.length > 0 ? nativeToolCalls : normalizeTextToolCalls(initialOptions.cleanText);
+  const parsedTextToolCalls = normalizeParsedTextToolCalls(parsed);
+  const shouldSuppressTextToolsAsQuestion =
+    nativeToolCalls.length === 0 &&
+    shouldTreatTextToolCallsAsUserQuestion(parsed.cleanText, parsedTextToolCalls);
+  const rawToolCalls = nativeToolCalls.length > 0
+    ? nativeToolCalls
+    : shouldSuppressTextToolsAsQuestion
+    ? []
+    : parsedTextToolCalls;
   const protocolToolOptions = rawToolCalls.flatMap(extractReplyOptionsFromProtocolTool);
   const toolCalls = rawToolCalls.filter((call) => !isUserOptionsToolName(call.name));
   const parsedOptions = extractReplyOptions(parsed.cleanText || "");

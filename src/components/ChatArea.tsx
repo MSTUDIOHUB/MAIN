@@ -59,6 +59,7 @@ import {
   normalizeCapsuleProgressText,
   normalizeTranscriptDedupeText,
 } from "../lib/chat/chatContentPreview";
+import { isSubstantiveModelFeedback } from "../lib/modelFeedbackDedupe";
 import {
   getAgentVisibleMarkdownText,
   getLastAgentSummaryText,
@@ -1537,7 +1538,13 @@ function TurnProcessArchive({
   renderArchivedItem: (item: any) => React.ReactNode;
   onOpenDiff: (taskId: number) => void;
 }) {
-  const [expanded, setExpanded] = useState(false);
+  const hasChangeSummary = !!archive && archive.steps.some((step) =>
+    step.kind === "edit" && collectTurnChangeEntries(step.items).entries.length > 0
+  );
+  const [expanded, setExpanded] = useState(hasChangeSummary);
+  useEffect(() => {
+    if (hasChangeSummary) setExpanded(true);
+  }, [hasChangeSummary]);
   if (archive.totalCount === 0) return null;
 
   const title = language === "zh" ? "本轮过程归档" : "Turn Process Archive";
@@ -1758,11 +1765,16 @@ function TurnArchiveStepCard({
   variant?: "archive" | "live";
 }) {
   const isLive = variant === "live";
-  const [expanded, setExpanded] = useState(!isLive && step.expandedByDefault);
   const { entries, totalExecutedEdits } = collectTurnChangeEntries(step.items);
   const hasChangeSummary = step.kind === "edit" && entries.length > 0;
+  const defaultExpanded = (!isLive && (step.expandedByDefault || hasChangeSummary)) || (isLive && hasChangeSummary);
+  const [expanded, setExpanded] = useState(defaultExpanded);
+  useEffect(() => {
+    if (isLive && hasChangeSummary) setExpanded(true);
+  }, [isLive, hasChangeSummary]);
   const detailItems = buildBlockRenderItems(step.items, false, false, language);
-  const canExpandDetails = hasChangeSummary || detailItems.length > 0;
+  const isLiveRunningWithoutChanges = isLive && step.status === "running" && !hasChangeSummary;
+  const canExpandDetails = !isLiveRunningWithoutChanges && (hasChangeSummary || detailItems.length > 0);
   const toggleText = expanded
     ? isLive
       ? language === "zh" ? "收起操作" : "Hide actions"
@@ -1839,6 +1851,7 @@ function TurnArchiveStepCard({
               language={language}
               onOpenDiff={onOpenDiff}
               embedded
+              defaultExpanded={hasChangeSummary}
               chatFontSize={chatFontSize}
             />
           ) : (
@@ -1867,7 +1880,13 @@ function LiveTurnProcessTimeline({
   renderLiveItem: (item: any) => React.ReactNode;
   onOpenDiff: (taskId: number) => void;
 }) {
-  const [expanded, setExpanded] = useState(false);
+  const hasChangeSummary = !!model && model.steps.some((step) =>
+    step.kind === "edit" && collectTurnChangeEntries(step.items).entries.length > 0
+  );
+  const [expanded, setExpanded] = useState(hasChangeSummary);
+  useEffect(() => {
+    if (hasChangeSummary) setExpanded(true);
+  }, [hasChangeSummary]);
   if (!model || model.totalCount === 0) return null;
   const title = language === "zh" ? "本轮步骤" : "Turn steps";
   const stepCount = model.stepCount;
@@ -3116,6 +3135,25 @@ export default function ChatArea({
     const finalVisibleAgentBlock = finalVisibleAgentIndex >= 0 ? blocks[finalVisibleAgentIndex] : null;
     const isFinishedTurn = isFinishedTurnStatus(turn.status);
     const showReasoningDebug = config.reasoningDisplay !== "hidden";
+    const substantiveIntermediateAgentBlockIds = new Set(blocks
+      .map((block, idx) => ({ block, idx }))
+      .filter(({ block, idx }) => {
+      if (idx === finalVisibleAgentIndex) return false;
+      if (!block || block.type !== "agent" || block.hiddenProcess || block.streaming) return false;
+      if (Array.isArray(block.options) && block.options.length > 0) return false;
+      const text = getAgentVisibleMarkdownText(block);
+      const content = String(text || "").trim();
+      if (!content) return false;
+      if (isTransparentToolNarrationBlock(block) || shouldSuppressAgentToolEcho(blocks, idx)) return false;
+      return (
+        content.length > 300 ||
+        isSubstantiveModelFeedback(content) ||
+        /(?:^|\n)\s*(?:\d+[.)]|[-*])\s+/.test(content) ||
+        /(?:阶段性|结论|总结|问题|原因|根因|修复|方案|验证|阻塞|risk|issue|root cause|fix|summary|conclusion)/i.test(content)
+      );
+      })
+      .map(({ block }) => block.id));
+    const hasSubstantiveIntermediateAgentText = substantiveIntermediateAgentBlockIds.size > 0;
     const hasFoldableProcessBlocks = blocks.some((block) => {
       if (!block || block.type === "user" || block.type === "thought") return false;
       if (block.type === "agent") return block.hiddenProcess === true;
@@ -3134,7 +3172,8 @@ export default function ChatArea({
     const shouldArchiveCompletedProcess =
       shouldRenderCompletedProcessArchive &&
       isFinishedTurn &&
-      finalVisibleAgentIndex >= 0;
+      finalVisibleAgentIndex >= 0 &&
+      !hasSubstantiveIntermediateAgentText;
     const processArchive = shouldArchiveCompletedProcess
       ? buildTurnProcessArchiveModel({
           blocks,
@@ -3194,6 +3233,9 @@ export default function ChatArea({
     const liveProcessTimeline = !shouldArchiveCompletedProcess && shouldRenderLiveProcessTimeline
       ? buildLiveTurnProcessTimelineModel({ blocks, language, includeThoughts: showReasoningDebug })
       : null;
+    const liveProcessHasChangeSummary = !!liveProcessTimeline && liveProcessTimeline.steps.some((step) =>
+      step.kind === "edit" && collectTurnChangeEntries(step.items).entries.length > 0
+    );
     const liveProcessBlockIds = new Set(
       (liveProcessTimeline?.blocks || [])
         .map((block: any) => block?.id)
@@ -3246,7 +3288,9 @@ export default function ChatArea({
         if (block.type === "agent") {
           const hasOptions = block.options && block.options.length > 0;
           const isFinalBlock = idx === finalVisibleAgentIndex;
+          const isSubstantiveIntermediate = substantiveIntermediateAgentBlockIds.has(block.id);
           if (hasOptions || isFinalBlock) return;
+          if (isSubstantiveIntermediate) return;
 
           const text = getAgentVisibleMarkdownText(block);
           const content = String(text || "").trim();
@@ -3267,7 +3311,10 @@ export default function ChatArea({
       if (item.kind === "block") {
         if (isActiveRunningTurn) {
           // Active running turn routes intermediate explanations into the capsule.
-          if (config.enableCapsule !== false) {
+          if (
+            config.enableCapsule !== false &&
+            !(item.block?.type === "agent" && substantiveIntermediateAgentBlockIds.has(item.block.id))
+          ) {
             const isExplanation = shouldSuppressAgentAsExplanation(item.block, item.index, blocks, turnIntent);
             if (isExplanation) return null;
           }
@@ -3279,6 +3326,9 @@ export default function ChatArea({
         // Hide conversational first-person explanations from message flow if completed/stopped,
         // since they are collapsed in the TurnIntentHistoryCard.
         if (config.enableCapsule !== false && isTurnCompletedOrStopped && item.block?.type === "agent" && !isChatIntent) {
+          if (substantiveIntermediateAgentBlockIds.has(item.block.id)) {
+            return renderBlockItem(item);
+          }
           const text = getAgentVisibleMarkdownText(item.block);
           if (isConversationalFirstPersonNarration(text)) {
             const hasOptions = item.block.options && item.block.options.length > 0;
@@ -3301,6 +3351,9 @@ export default function ChatArea({
         // Hide conversational first-person explanations from message flow if completed/stopped,
         // since they are collapsed in the TurnIntentHistoryCard.
         if (config.enableCapsule !== false && isTurnCompletedOrStopped && item.block?.type === "agent" && !isChatIntent) {
+          if (substantiveIntermediateAgentBlockIds.has(item.block.id)) {
+            return renderBlockItem(item);
+          }
           const text = getAgentVisibleMarkdownText(item.block);
           if (isConversationalFirstPersonNarration(text)) {
             const hasOptions = item.block.options && item.block.options.length > 0;
@@ -3532,7 +3585,7 @@ export default function ChatArea({
               language={language}
             />
           ) : null}
-          {isTurnExpanded && shouldShowTurnChanges && !shouldArchiveCompletedProcess && (
+          {isTurnExpanded && shouldShowTurnChanges && !shouldArchiveCompletedProcess && !liveProcessHasChangeSummary && (
             <TurnChangesCard
               entries={turnChangeEntries}
               totalExecutedEdits={totalExecutedEdits}

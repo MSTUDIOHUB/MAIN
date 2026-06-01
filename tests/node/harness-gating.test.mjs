@@ -65,6 +65,8 @@ const {
   isShellFileReadCommand,
   buildLoopDetectionValidationError,
   buildReadBeforeModifyValidationError,
+  summarizeReadFileRepeatLimitBatch,
+  buildReadFileRepeatLimitBatchPauseNotice,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"));
 
 // Mock callbacks for the orchestrator
@@ -215,6 +217,34 @@ test("buildLoopDetectionValidationError returns clear non-error guidance for rep
   assert.equal(doneEvents.length, 1);
   assert.equal(debugEvents[0].event, "agent.tool_preflight_blocked");
   assert.equal(debugEvents[0].data.reason, "read_file_repeat_limit");
+});
+
+test("read_file repeat-limit batches summarize into a pause signal", () => {
+  const results = Array.from({ length: 9 }, (_, index) => ({
+    toolCallId: `call_${index}`,
+    name: "read_file",
+    target: index < 8 ? "Assets/Scripts/Entities/SnakeController.cs" : "Assets/Scripts/Core/GridManager.cs",
+    content: "READ_FILE_REPEAT_LIMIT: duplicate read",
+    isError: false,
+    lifecycleState: "completed",
+  }));
+
+  const summary = summarizeReadFileRepeatLimitBatch(results);
+  assert.deepEqual(summary, {
+    total: 9,
+    target: "Assets/Scripts/Entities/SnakeController.cs",
+    targetCount: 8,
+  });
+
+  assert.match(
+    buildReadFileRepeatLimitBatchPauseNotice({
+      language: "zh",
+      target: summary.target,
+      total: summary.total,
+      targetCount: summary.targetCount,
+    }),
+    /不要原样重试同一个 read_file/,
+  );
 });
 
 test("loop detection ignores repeated reads before the latest user message", () => {

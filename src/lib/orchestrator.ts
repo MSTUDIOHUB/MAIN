@@ -109,6 +109,7 @@ import {
   resolveUnityScriptPathFromArgs,
   shouldRepromptBeforeUnityConsoleFallback,
   shouldTriggerUnityMcpFirstIterationFallback,
+  shouldTriggerUnityMcpStrictRetry,
 } from "./orchestrator/unityDiagnostics";
 import {
   buildPlanAutoScaffoldPrompt,
@@ -140,6 +141,7 @@ export {
 export {
   shouldRepromptBeforeUnityConsoleFallback,
   shouldTriggerUnityMcpFirstIterationFallback,
+  shouldTriggerUnityMcpStrictRetry,
 } from "./orchestrator/unityDiagnostics";
 export {
   buildPlanReadOnlyConvergencePrompt,
@@ -147,6 +149,7 @@ export {
 import {
   initialLifecycleStateForPlanAction,
   planRuntimeToolCall,
+  type SessionAutoApproveScope,
   type ToolLifecycleState,
 } from "./runtimeTools";
 import type { AppConfig, Skill } from "../store/useAppStore";
@@ -1140,6 +1143,7 @@ export interface OrchestratorCallbacks {
   getPlanApprovalChoice: () => string | null;
   getReadOnlyAutoApproveForSession: () => boolean;
   getApprovedLocalFileReadPaths: () => string[];
+  getAutoApproveToolScopes?: () => SessionAutoApproveScope[];
   getPlanStage: () => "idle" | "plan" | "requirements" | "design" | "tasks" | "bugfix" | "ready_to_execute" | "executing" | "completed";
   getPlanTasks: () => PlanTask[];
   getPlanExecutionEvidenceLedger: () => PlanExecutionEvidenceEntry[];
@@ -1340,8 +1344,11 @@ export function resolveModelProtocolProfile(input: {
   let toolProtocol: CloudToolProtocol = configured;
   if (activeProfile === "local") {
     toolProtocol = normalizeLocalToolProtocol(configured === "auto" ? undefined : configured, provider);
+    if (toolProtocol === "auto" && /gemma/.test(model.toLowerCase())) {
+      toolProtocol = "xml";
+    }
     if (input.compatibilityOverride === true) toolProtocol = "xml";
-    if (input.compatibilityOverride === false && toolProtocol === "xml" && providerLower.includes("omlx")) {
+    if (input.compatibilityOverride === false && toolProtocol === "xml" && providerLower.includes("omlx") && configured !== "xml" && !/gemma/.test(model.toLowerCase())) {
       toolProtocol = "auto";
     }
   } else {
@@ -2711,6 +2718,47 @@ function isReadFileRepeatLimitResult(result: ToolExecutionResult): boolean {
   return result.name === "read_file" && /^READ_FILE_REPEAT_LIMIT\b/i.test(result.content || "");
 }
 
+export function summarizeReadFileRepeatLimitBatch(results: ToolExecutionResult[]): {
+  total: number;
+  target: string;
+  targetCount: number;
+} | null {
+  const repeatResults = results.filter(isReadFileRepeatLimitResult);
+  if (repeatResults.length < 8) return null;
+  const targetCounts = new Map<string, number>();
+  for (const result of repeatResults) {
+    const target = String(result.target || "").trim() || "(unknown)";
+    targetCounts.set(target, (targetCounts.get(target) || 0) + 1);
+  }
+  const top = [...targetCounts.entries()].sort((a, b) => b[1] - a[1])[0];
+  if (!top || top[1] < 6) return null;
+  return {
+    total: repeatResults.length,
+    target: top[0],
+    targetCount: top[1],
+  };
+}
+
+export function buildReadFileRepeatLimitBatchPauseNotice(input: {
+  language: "zh" | "en";
+  target: string;
+  total: number;
+  targetCount: number;
+}): string {
+  if (input.language === "en") {
+    return [
+      "Execution paused: the model kept retrying the same blocked read_file call instead of using the cached context.",
+      `Repeated target: ${input.target} (${input.targetCount}/${input.total} blocked reads in this batch).`,
+      "Resume by reusing the existing file context and moving to a patch, validation command, or an explicit blocker. Do not retry the same read_file call.",
+    ].join("\n");
+  }
+  return [
+    "执行已暂停：模型持续重试同一个已拦截的 read_file，而不是复用已读上下文。",
+    `重复目标：${input.target}（本批次 ${input.targetCount}/${input.total} 次读取被拦截）。`,
+    "继续时请复用已有文件上下文，转向 patch、验证命令，或说明明确阻塞；不要原样重试同一个 read_file。",
+  ].join("\n");
+}
+
 function targetProgressOutcomeForToolResult(result?: ToolExecutionResult): TargetProgressOutcome {
   if (!result) return "failed";
   const diagnostic = getToolResultDiagnosticText(result);
@@ -3945,7 +3993,7 @@ async function executeWriteToolWithReview(
   callbacks: OrchestratorCallbacks,
   allTools: ToolDefinition[],
   hooksConfig: Awaited<ReturnType<typeof loadHooksConfig>>,
-  options: Pick<ExecuteToolLifecycleOptions, "turnContext" | "recentPlanToolActivity" | "attemptedPlanWriteTargets"> = {},
+  options: Pick<ExecuteToolLifecycleOptions, "turnContext" | "recentPlanToolActivity" | "attemptedPlanWriteTargets"> & { skipUserReview?: boolean } = {},
 ): Promise<ToolExecutionResult> {
   let toolArgs: Record<string, unknown>;
   try {
@@ -3999,6 +4047,25 @@ async function executeWriteToolWithReview(
       isError: true,
       lifecycleState: "blocked",
     };
+  }
+
+  if (options.skipUserReview) {
+    logAgentEvent("session_auto_review_applied", {
+      tool: tc.name,
+      target,
+    });
+    return await executeToolCallWithLifecycle(
+      tc,
+      workspace,
+      callbacks,
+      allTools,
+      hooksConfig,
+      {
+        turnContext: options.turnContext,
+        recentPlanToolActivity: options.recentPlanToolActivity,
+        attemptedPlanWriteTargets: options.attemptedPlanWriteTargets,
+      },
+    );
   }
 
   let decision: ReviewDecision;
@@ -4473,6 +4540,8 @@ export async function executeAgentLoop(
   let unityMcpFallbackReason: string | null = null;
   let unityMcpFirstIterationPending = unityMcpFirstPhaseActive;
   let unityMcpForceConsoleFirstPending = unityMcpFirstPhaseActive && unityConsoleDiagnosticsRequested;
+  let unityMcpStrictRetryPending = false;
+  let unityMcpStrictRetryIssued = false;
   let unityConsoleMissingFirstToolRepromptIssued = false;
   let unityConsoleFinalVerificationRequired = false;
   let unityConsoleRefreshObservedAfterWrite = false;
@@ -4481,6 +4550,7 @@ export async function executeAgentLoop(
     if (!unityMcpFirstPhaseActive) return;
     unityMcpFirstPhaseActive = false;
     unityMcpForceConsoleFirstPending = false;
+    unityMcpStrictRetryPending = false;
     unityMcpFallbackReason = reason;
     logAgentEvent("unity_mcp_fallback", {
       reason,
@@ -4505,16 +4575,21 @@ export async function executeAgentLoop(
       return filtered;
     }
 
-    const forcedOrder = unityMcpForceConsoleFirstPending
+    const shouldForceConsoleTools = unityMcpForceConsoleFirstPending || unityMcpStrictRetryPending;
+    const forcedOrder = shouldForceConsoleTools
       ? ["read_console", "set_active_instance"]
       : [];
     const forcedTools = forcedOrder
       .map((name) => filtered.find((tool) => tool.function.name === name))
       .filter((tool): tool is ToolDefinition => !!tool);
 
-    if (unityMcpForceConsoleFirstPending && forcedTools.length === 0) {
+    if (shouldForceConsoleTools && !forcedTools.some((tool) => tool.function.name === "read_console")) {
       activateUnityMcpFallback("missing_required_console_tool");
       return filtered;
+    }
+
+    if (unityMcpStrictRetryPending) {
+      return forcedTools;
     }
 
     const forcedSet = new Set(forcedTools.map((tool) => tool.function.name));
@@ -7205,11 +7280,70 @@ export async function executeAgentLoop(
       return;
     }
 
+    if (
+      unityMcpStrictRetryPending &&
+      effectiveToolCalls.length === 0 &&
+      finalReplyOptions.length === 0
+    ) {
+      unityMcpStrictRetryPending = false;
+      activateUnityMcpFallback("strict_retry_no_tool_call");
+      callbacks.onStatusChange("running");
+      callbacks.appendMessage({
+        role: "user",
+        content: callbacks.getPreferredLanguage() === "zh"
+          ? "Unity MCP strict retry 仍没有产生 read_console 工具调用，本轮自动回退到本地诊断路径。请立即使用本地只读工具读取最相关日志并给出报错定位。"
+          : "Unity MCP strict retry still did not produce a read_console tool call, so this turn has auto-fallbacked to local diagnostics. Use local read-only tools now and localize the console error.",
+      });
+      continue;
+    }
+
+    if (forceXmlTools && shouldTriggerUnityMcpStrictRetry({
+      toolCallCount: effectiveToolCalls.length,
+      replyOptionCount: finalReplyOptions.length,
+      unityMcpFirstPhaseActive,
+      unityMcpFirstIterationPending,
+      unityConsoleDiagnosticsRequested,
+      strictRetryAlreadyIssued: unityMcpStrictRetryIssued,
+    })) {
+      unityMcpFirstIterationPending = false;
+      unityMcpStrictRetryPending = true;
+      unityMcpStrictRetryIssued = true;
+      logAgentEvent("unity_mcp_strict_retry", {
+        iteration,
+        reason: "first_iteration_no_tool_call",
+        forceXmlTools,
+        forcedTools: ["read_console", "set_active_instance"],
+      });
+      callbacks.onStatusChange("running");
+      callbacks.appendMessage({
+        role: "user",
+        content: callbacks.getPreferredLanguage() === "zh"
+          ? [
+              "Unity MCP 首轮没有触发工具调用。下一条只能输出一个标准 XML `<tool_use>`，不要解释、不要总结、不要使用本地日志或 run_command。",
+              "首选调用：",
+              "<tool_use>",
+              "<tool>read_console</tool>",
+              "</tool_use>",
+              "如果必须先选择 Unity 实例，先调用 `set_active_instance`；随后必须调用 `read_console`。",
+            ].join("\n")
+          : [
+              "Unity MCP did not produce a tool call in the first iteration. In the next reply, output exactly one standard XML `<tool_use>` block with no explanation, no summary, and no local log/run_command fallback.",
+              "Preferred call:",
+              "<tool_use>",
+              "<tool>read_console</tool>",
+              "</tool_use>",
+              "If an active Unity instance must be selected first, call `set_active_instance`; then you must call `read_console`.",
+            ].join("\n"),
+      });
+      continue;
+    }
+
     if (shouldTriggerUnityMcpFirstIterationFallback({
       toolCallCount: effectiveToolCalls.length,
       replyOptionCount: finalReplyOptions.length,
       unityMcpFirstPhaseActive,
       unityMcpFirstIterationPending,
+      unityConsoleDiagnosticsRequested: unityConsoleDiagnosticsRequested && forceXmlTools,
     })) {
       unityMcpFirstIterationPending = false;
       activateUnityMcpFallback("first_iteration_no_tool_call");
@@ -8631,6 +8765,9 @@ export async function executeAgentLoop(
     if (unityMcpFirstIterationPending) {
       unityMcpFirstIterationPending = false;
     }
+    if (unityMcpStrictRetryPending) {
+      unityMcpStrictRetryPending = false;
+    }
     logAgentEvent("tool_calls_detected", {
       iteration,
       count: effectiveToolCalls.length,
@@ -8664,7 +8801,7 @@ export async function executeAgentLoop(
     const readOnlyCalls: Array<ToolCallToExecute & { allowExternalLocalRead?: boolean }> = [];
     const localFileReadCalls: Array<ToolCallToExecute & { localFileReadPath: string }> = [];
     const specFileCalls: ToolCallToExecute[] = [];
-    const writeCalls: ToolCallToExecute[] = [];
+    const writeCalls: Array<ToolCallToExecute & { skipUserReview?: boolean }> = [];
     const toolArgsByCallId = new Map<string, Record<string, unknown>>();
     const readOnlyCallSignatures = new Map<string, string>();
     const readFileWindowNarrowedNotes = new Map<string, string>();
@@ -8864,6 +9001,7 @@ export async function executeAgentLoop(
         capabilityRegistry: toolCapabilityRegistry,
         toolPermissionPolicy: config.toolPermissionPolicy,
         approvedLocalFileReadPaths,
+        autoApproveToolScopes: callbacks.getAutoApproveToolScopes?.() || [],
         workflowMode,
         runtimeIntent,
         isPlanApproved: callbacks.getIsPlanApproved(),
@@ -8894,6 +9032,10 @@ export async function executeAgentLoop(
       if (planned.action === "local_file_read_review" && planned.localFileReadPath) {
         localFileReadCalls.push({ id: tc.id, name: tc.name, arguments: tc.arguments, localFileReadPath: planned.localFileReadPath });
       } else if (planned.action === "auto_execute") {
+        if (planned.sessionAutoApproved && planned.risk !== "local_file_read") {
+          writeCalls.push({ id: tc.id, name: tc.name, arguments: tc.arguments, skipUserReview: true });
+          continue;
+        }
         let effectiveToolArgs = toolArgs;
         let signature = buildReadOnlyCacheSignature(tc.name, effectiveToolArgs);
         let cached = readOnlyResultCache.get(signature);
@@ -9189,7 +9331,8 @@ export async function executeAgentLoop(
           arguments: JSON.stringify(effectiveToolArgs),
           allowExternalLocalRead:
             !!planned.localFileReadPath &&
-            isLocalFileReadApproved(planned.localFileReadPath, approvedLocalFileReadPaths),
+            (planned.risk === "local_file_read" ||
+              isLocalFileReadApproved(planned.localFileReadPath, approvedLocalFileReadPaths)),
         });
       } else if (planned.action === "spec_file_auto_approved") {
         specFileCalls.push({ id: tc.id, name: tc.name, arguments: tc.arguments });
@@ -9371,6 +9514,7 @@ export async function executeAgentLoop(
           turnContext: turnInputContextSignals,
           recentPlanToolActivity,
           attemptedPlanWriteTargets,
+          skipUserReview: tc.skipUserReview === true,
         },
       );
       allResults.push(result);
@@ -9431,7 +9575,12 @@ export async function executeAgentLoop(
       const readConsoleResult = allResults.find((result) => result.name === "read_console");
       if (!readConsoleResult) {
         const hasSuccessfulReadOnlyActivity = allResults.some(
-          (result) => !result.isError && UNITY_FALLBACK_RECOVERY_READ_ONLY_TOOL_NAMES.has(result.name),
+          (result) =>
+            !result.isError &&
+            (
+              result.name === "set_active_instance" ||
+              UNITY_FALLBACK_RECOVERY_READ_ONLY_TOOL_NAMES.has(result.name)
+            ),
         );
         if (shouldRepromptBeforeUnityConsoleFallback({
           readConsoleCalled: false,
@@ -10031,6 +10180,46 @@ export async function executeAgentLoop(
         createHookContextMessages("PostToolUse", result.additionalContexts)
           .forEach(message => callbacks.appendMessage(message));
       }
+    }
+    const readFileRepeatLimitBatch = workflowMode === "edit" && runtimeIntent === "execute"
+      ? summarizeReadFileRepeatLimitBatch(allResults)
+      : null;
+    if (readFileRepeatLimitBatch) {
+      const language = callbacks.getPreferredLanguage();
+      const pauseNotice = buildReadFileRepeatLimitBatchPauseNotice({
+        language,
+        target: readFileRepeatLimitBatch.target,
+        total: readFileRepeatLimitBatch.total,
+        targetCount: readFileRepeatLimitBatch.targetCount,
+      });
+      logAgentEvent("loop_stop", {
+        reason: "read_file_repeat_limit_batch",
+        iteration,
+        target: readFileRepeatLimitBatch.target,
+        total: readFileRepeatLimitBatch.total,
+        targetCount: readFileRepeatLimitBatch.targetCount,
+      });
+      emitTaskOrchestratorPhase("PAUSED", {
+        reason: "read_file_repeat_limit_batch",
+        iteration,
+        repeatedTargets: [readFileRepeatLimitBatch.target],
+        remainingTask: language === "zh"
+          ? "复用已读文件上下文，改为修改、验证或说明阻塞。"
+          : "reuse cached file context and switch to patching, validation, or a blocker",
+      });
+      callbacks.onNonActionableStop(
+        pauseNotice,
+        "no_action",
+        {
+          repeatedTargets: [readFileRepeatLimitBatch.target],
+          recoveryReason: "read_file_repeat_limit_batch",
+          nextStep: language === "zh"
+            ? "复用缓存内容，转向 patch/验证/阻塞说明"
+            : "reuse cached context and pivot to patch/validation/blocker",
+        },
+      );
+      callbacks.onStatusChange("idle");
+      return;
     }
     if (unityMcpFallbackPrompt) {
       callbacks.appendMessage({

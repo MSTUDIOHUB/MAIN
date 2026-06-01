@@ -466,8 +466,16 @@ test("model protocol profile covers local and cloud providers", () => {
     model: "gemma-4-26b-a4b-it-8bit",
     configuredToolProtocol: "auto",
   });
+  assert.equal(localGemmaProfile.toolProtocol, "xml");
   assert.equal(localGemmaProfile.reasoning, "passive_hidden");
   assert.equal(localGemmaProfile.notes.some((note) => /hidden metadata/.test(note)), true);
+
+  assert.equal(resolveModelProtocolProfile({
+    activeProfile: "local",
+    provider: "OMLX",
+    model: "mlx-qwen",
+    configuredToolProtocol: "xml",
+  }).toolProtocol, "xml");
 
   assert.equal(resolveModelProtocolProfile({
     activeProfile: "cloud",

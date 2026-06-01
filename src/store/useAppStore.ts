@@ -6,6 +6,7 @@ import { persist } from "zustand/middleware";
 import { type AgentMessage, type ReviewDecision, type ContentPart } from "../lib/orchestrator";
 import type { ExecuteRecoveryMode } from "../lib/executeRecoveryTools";
 import { WorkflowEngine, type WorkflowContext } from "../lib/orchestrator/workflowEngine";
+import type { SessionAutoApproveScope } from "../lib/runtimeTools";
 import {
   analyzeTabularDocument,
   cancelImageStudioJob,
@@ -300,8 +301,6 @@ function nowMs() {
 }
 
 
-
-type SessionAutoApproveScope = "workspace_write" | "shell" | "local_file_read" | "browser_control";
 
 const SESSION_AUTO_APPROVE_SCOPE_SET = new Set<SessionAutoApproveScope>(["workspace_write", "shell", "local_file_read", "browser_control"]);
 const DEFAULT_SESSION_AUTO_APPROVE_SCOPES: SessionAutoApproveScope[] = ["workspace_write", "shell", "local_file_read", "browser_control"];
@@ -7066,6 +7065,21 @@ export const useAppStore = create<AppState>()(
       });
       logStoreEvent("send_queued", { reason: "generation_in_progress" });
       return false;
+    }
+
+    if (state.agentStatus === "pending_review" && state.abortController && (options?.executionConsentGranted === true || shouldExecuteOnceFromReplyOption)) {
+      logStoreEvent("send_pending_review_approve_bypass", {
+        textChars: text?.length ?? 0,
+        executionConsentGranted: options?.executionConsentGranted,
+        shouldExecuteOnceFromReplyOption,
+        pendingReviewTaskId: state.pendingReviewTaskId,
+      });
+      if (state.pendingReviewResolve && state.pendingReviewTaskId != null) {
+        get().approvePendingReviewOnce();
+      } else {
+        get().approvePlan(text);
+      }
+      return true;
     }
 
     if (state.agentStatus === "running" || state.agentStatus === "pending_review") {

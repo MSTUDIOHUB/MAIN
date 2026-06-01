@@ -58,12 +58,19 @@ export type RuntimeToolPlanAction =
   | "spec_file_auto_approved"
   | "review_required";
 
+export type SessionAutoApproveScope =
+  | "workspace_write"
+  | "shell"
+  | "local_file_read"
+  | "browser_control";
+
 export interface RuntimeToolPlanResult {
   action: RuntimeToolPlanAction;
   toolArgs: Record<string, unknown>;
   target: string;
   risk?: "local_file_read" | "browser_control";
   localFileReadPath?: string;
+  sessionAutoApproved?: boolean;
   reason?: "pre_approval_source_write" | "pre_approval_tasks" | "missing_tasks_before_source";
 }
 
@@ -74,6 +81,7 @@ export interface PlanRuntimeToolCallInput {
   capabilityRegistry: ToolCapabilityRegistry;
   toolPermissionPolicy: ToolPermissionPolicy;
   approvedLocalFileReadPaths: string[];
+  autoApproveToolScopes?: Iterable<SessionAutoApproveScope> | null;
   workflowMode: "chat" | "edit" | "plan";
   runtimeIntent: ResolvedUserIntent;
   isPlanApproved: boolean;
@@ -82,6 +90,36 @@ export interface PlanRuntimeToolCallInput {
   isPreApprovalPlanDraftWrite: (name: string, args: Record<string, unknown>) => boolean;
   isExecutionPlanArtifactWrite: (name: string, args: Record<string, unknown>) => boolean;
   isTasksPlanWrite: (name: string, args: Record<string, unknown>) => boolean;
+}
+
+function scopeForRisk(risk: ToolRiskLevel): SessionAutoApproveScope | null {
+  switch (risk) {
+    case "workspace_write":
+      return "workspace_write";
+    case "shell":
+      return "shell";
+    case "local_file_read":
+      return "local_file_read";
+    case "browser_control":
+      return "browser_control";
+    default:
+      return null;
+  }
+}
+
+function isAllowedBySessionAutoApprove(
+  risk: ToolRiskLevel,
+  scopes: Iterable<SessionAutoApproveScope> | null | undefined,
+  policy: ToolPermissionPolicy,
+): boolean {
+  if (risk === "destructive") return false;
+  if (policy.disabledRiskLevels.includes(risk)) return false;
+  const scope = scopeForRisk(risk);
+  if (!scope || !scopes) return false;
+  for (const item of scopes) {
+    if (item === scope) return true;
+  }
+  return false;
 }
 
 function parseToolCallArguments(call: RuntimeToolCall, workspace?: string | null): Record<string, unknown> {
@@ -202,13 +240,39 @@ export function planRuntimeToolCall(input: PlanRuntimeToolCallInput): RuntimeToo
   const shouldGateLocalFileRead =
     !!localFileReadPath &&
     !isLocalFileReadApproved(localFileReadPath, input.approvedLocalFileReadPaths);
+  const sessionAutoApproved = isAllowedBySessionAutoApprove(
+    risk,
+    input.autoApproveToolScopes,
+    input.toolPermissionPolicy,
+  );
   if (shouldGateLocalFileRead) {
+    if (sessionAutoApproved) {
+      return {
+        action: "auto_execute",
+        toolArgs,
+        target,
+        risk: "local_file_read",
+        localFileReadPath,
+        sessionAutoApproved: true,
+      };
+    }
     return {
       action: "local_file_read_review",
       toolArgs,
       target,
       risk: "local_file_read",
       localFileReadPath,
+    };
+  }
+
+  if (sessionAutoApproved) {
+    return {
+      action: "auto_execute",
+      toolArgs,
+      target,
+      risk: risk === "browser_control" ? "browser_control" : undefined,
+      localFileReadPath,
+      sessionAutoApproved: true,
     };
   }
 

@@ -44,8 +44,8 @@ test("TopIsland keeps approval buttons visible for a long command with plan task
 
   await expect(page.getByTestId("top-island-tool-review")).toBeVisible();
   await expect(page.getByTestId("top-island-tool-review")).toContainText("拒绝");
-  await expect(page.getByTestId("top-island-tool-review")).toContainText("当前会话全部允许");
-  await expect(page.getByTestId("top-island-tool-review")).toContainText("单次批准");
+  await expect(page.getByTestId("top-island-tool-review")).toContainText("开启自动审查并批准");
+  await expect(page.getByTestId("top-island-tool-review")).toContainText("批准此工具请求");
   await expect(page.getByTestId("top-island-tool-review")).toContainText("printf");
   await expect(page.getByTestId("top-island-plan-progress")).toContainText("任务明细已收起");
   await expect(page.getByTestId("top-island-current-plan-task")).toHaveCount(0);

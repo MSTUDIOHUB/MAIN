@@ -32,9 +32,14 @@ import {
   logStoreEvent
 } from "../../store/useAppStore";
 import { appendDebugLog } from "../debugLog";
-import { type PlanExecutionProgressPhase, type PlanExecutionProgressUpdate, getPlanArtifactTitle, extractPlanTasks } from "../workflowModels";
+import { type PlanExecutionProgressPhase, type PlanExecutionProgressUpdate, getPlanArtifactTitle, extractPlanTasks, isEphemeralPlanArtifactPath } from "../workflowModels";
 import type { HarnessRunMarker } from "../harnessCrashTelemetry";
 import { runAfterNextPaint } from "../uiScheduling";
+import { supportsToolDiffPreview } from "../toolDiff";
+import { findToolLifecycleBlockIndex, type ToolLifecycleMeta } from "../toolLifecycle";
+import { deriveToolIntentSummary } from "../toolPresentation";
+import { buildToolProgressNarration, summarizeToolObservation } from "../progressNarration";
+import { deriveTurnRuntimePhaseForTool, withTurnRuntimePhaseStatus } from "../turnPhase";
 
 export interface WorkflowContext {
   // Constants & Parameters
@@ -144,6 +149,53 @@ export class WorkflowEngine {
         return { taskFlow, conversationTurns };
       });
     };
+
+    const toolDisplayTurnId = context.uiDisplayTurnId || turnId;
+
+    const normalizeToolLifecycleMeta = (meta?: { toolCallId?: string | null }): ToolLifecycleMeta => {
+      const toolCallId = String(meta?.toolCallId || "").trim();
+      return toolCallId ? { toolCallId } : {};
+    };
+
+    const findCurrentToolLifecycleBlockIndex = (
+      taskFlow: any[],
+      toolName: string,
+      target: string,
+      allowedStatuses: string[],
+      meta?: ToolLifecycleMeta,
+    ) => {
+      const turnIds = Array.from(new Set([toolDisplayTurnId, turnId].filter(Boolean)));
+      for (const candidateTurnId of turnIds) {
+        const index = findToolLifecycleBlockIndex({
+          taskFlow,
+          turnId: candidateTurnId,
+          toolName,
+          target,
+          allowedStatuses,
+          meta,
+        });
+        if (index >= 0) return index;
+      }
+
+      const toolCallId = String(meta?.toolCallId || "").trim();
+      if (!toolCallId) return -1;
+      for (let index = taskFlow.length - 1; index >= 0; index -= 1) {
+        const block = taskFlow[index];
+        if (block?.type !== "tool") continue;
+        if (!allowedStatuses.includes(String(block.toolStatus || ""))) continue;
+        if (String(block.toolCallId || block.executionId || "") === toolCallId) return index;
+      }
+      return -1;
+    };
+
+    const shouldAttachToolDiffPreview = (toolName: string, target: string, diffPreview: any) => {
+      if (!diffPreview || !supportsToolDiffPreview(toolName)) return false;
+      const diffPath = String(diffPreview.path || target || "").trim();
+      return !isEphemeralPlanArtifactPath(diffPath);
+    };
+
+    const isNoOpToolResult = (text: string) =>
+      /FILE_UNCHANGED_STUB|READ_FILE_REPEAT_LIMIT|empty_change|invalid_patch|identical_content|no changes|no-op|nothing to (?:change|patch|write)|"noOp"\s*:\s*true/i.test(text);
 
     const clearNoFirstTokenNoticeTimer = () => {
       if (context.noFirstTokenNoticeTimer !== null) {
@@ -295,6 +347,7 @@ export class WorkflowEngine {
       getPlanApprovalChoice: () => sessionGet().planApprovalChoice,
       getReadOnlyAutoApproveForSession: () => sessionGet().readOnlyAutoApproveForSession,
       getApprovedLocalFileReadPaths: () => sessionGet().approvedLocalFileReadPaths || [],
+      getAutoApproveToolScopes: () => sessionGet().autoApproveToolScopes || [],
       getPlanStage: () => sessionGet().planStage,
       getPlanTasks: () => sessionGet().planTasks,
       getPlanExecutionEvidenceLedger: () => sessionGet().planExecutionEvidenceLedger,
@@ -892,8 +945,9 @@ export class WorkflowEngine {
         });
       },
 
-      onToolExecuting: (toolName: string, target: string, _diff?: any, meta?: { toolCallId?: string }) => {
-        const executionId = meta?.toolCallId;
+      onToolExecuting: (toolName: string, target: string, diffPreview?: any, meta?: { toolCallId?: string }) => {
+        const lifecycleMeta = normalizeToolLifecycleMeta(meta);
+        const executionId = lifecycleMeta.toolCallId || undefined;
         logStoreEvent("tool_start", {
           turnId,
           sessionKey: runSessionKey,
@@ -933,25 +987,110 @@ export class WorkflowEngine {
         }
 
         const blockId = sessionGet()._nextTaskId();
-        sessionSet((s: any) => ({
-          agentStatus: s.agentStatus === "pending_review" ? "pending_review" : "running",
-          isGenerating: true,
-        }));
-        appendTurnBlock({
-          id: blockId,
-          turnId,
-          type: "tool",
+        const turnPhase = deriveTurnRuntimePhaseForTool({
           toolName,
           target,
+          language: phaseLanguage,
+          status: "running",
+        });
+        const progress = buildToolProgressNarration({
+          toolName,
+          target,
+          language: phaseLanguage,
+          status: "running",
+          source: "runtime",
+          turnIntent: effectiveRunIntent,
+          workflowMode: sessionGet().config.workflowMode,
+          sourceToolCallIds: executionId ? [executionId] : [],
+        });
+        const diff = shouldAttachToolDiffPreview(toolName, target, diffPreview) ? diffPreview : undefined;
+        const intentSummary = deriveToolIntentSummary({
+          toolName,
+          target,
+          language: phaseLanguage,
           status: "running",
           toolStatus: "running",
-          toolCallId: executionId,
-          executionId,
-        } as any);
+        });
+        emitProgressRuntimeEvent(progress, { dedupeKey: `tool:${executionId || `${toolName}:${target}`}:running` });
+        sessionSet((s: any) => {
+          const existingIndex = findCurrentToolLifecycleBlockIndex(
+            s.taskFlow,
+            toolName,
+            target,
+            ["pending", "running"],
+            lifecycleMeta,
+          );
+          const updateToolBlock = (block: any) => attachRuntimePhase({
+            ...block,
+            turnId: block.turnId || toolDisplayTurnId,
+            type: "tool",
+            toolName,
+            target,
+            status: "running",
+            toolStatus: "running",
+            toolCallId: executionId,
+            executionId,
+            intentSummary,
+            why: progress.why,
+            evidence: progress.evidence,
+            observationSummary: progress.observedFact,
+            turnPhase,
+            ...(diff ? { diff } : {}),
+          } as any, turnPhase);
+
+          if (existingIndex >= 0) {
+            return {
+              agentStatus: s.agentStatus === "pending_review" ? "pending_review" : "running",
+              isGenerating: true,
+              taskFlow: s.taskFlow.map((block: any, index: number) =>
+                index === existingIndex ? updateToolBlock(block) : block
+              ),
+            };
+          }
+
+          const blockWithTurn = updateToolBlock({
+            id: blockId,
+            turnId: toolDisplayTurnId,
+          });
+          return {
+            agentStatus: s.agentStatus === "pending_review" ? "pending_review" : "running",
+            isGenerating: true,
+            taskFlow: [...s.taskFlow, blockWithTurn],
+            conversationTurns: s.conversationTurns.map((turn: any) =>
+              turn.id === turnId && !turn.blockIds.includes(blockId)
+                ? { ...turn, blockIds: [...turn.blockIds, blockId] }
+                : turn
+            ),
+          };
+        });
       },
 
-      onToolDone: (toolName: string, _target: string, result: string, meta?: { toolCallId?: string }) => {
-        const executionId = meta?.toolCallId;
+      onToolDone: (toolName: string, target: string, result: string, meta?: { toolCallId?: string }) => {
+        const lifecycleMeta = normalizeToolLifecycleMeta(meta);
+        const executionId = lifecycleMeta.toolCallId || undefined;
+        const resultText = String(result || "");
+        const noOp = isNoOpToolResult(resultText);
+        const observationSummary = summarizeToolObservation({
+          toolName,
+          target,
+          result: resultText,
+          language: phaseLanguage,
+          noOp,
+        });
+        const progress = buildToolProgressNarration({
+          toolName,
+          target,
+          language: phaseLanguage,
+          status: "done",
+          source: "tool_result",
+          turnIntent: effectiveRunIntent,
+          workflowMode: sessionGet().config.workflowMode,
+          previousObservation: observationSummary,
+          result: resultText,
+          noOp,
+          hypothesisStatus: noOp ? "blocked" : "confirmed",
+          sourceToolCallIds: executionId ? [executionId] : [],
+        });
         logStoreEvent("tool_result", {
           turnId,
           sessionKey: runSessionKey,
@@ -962,23 +1101,74 @@ export class WorkflowEngine {
           isError: false,
         });
 
-        sessionSet((s: any) => ({
-          taskFlow: s.taskFlow.map((block: any) =>
-            block.turnId === turnId && block.type === "tool" && block.executionId === executionId
-              ? {
-                  ...block,
-                  status: "success",
+        sessionSet((s: any) => {
+          const existingIndex = findCurrentToolLifecycleBlockIndex(
+            s.taskFlow,
+            toolName,
+            target,
+            ["pending", "running", "executed"],
+            lifecycleMeta,
+          );
+          if (existingIndex < 0) return {};
+          return {
+            taskFlow: s.taskFlow.map((block: any, index: number) => {
+              if (index !== existingIndex) return block;
+              const completedPhase = withTurnRuntimePhaseStatus(
+                block.turnPhase || deriveTurnRuntimePhaseForTool({
+                  toolName,
+                  target,
+                  language: phaseLanguage,
+                  status: "done",
+                }),
+                "done",
+                phaseLanguage,
+              );
+              return {
+                ...block,
+                status: "done",
+                toolStatus: "executed",
+                output: resultText,
+                message: resultText,
+                intentSummary: block.intentSummary || deriveToolIntentSummary({
+                  toolName,
+                  target,
+                  language: phaseLanguage,
+                  status: "done",
                   toolStatus: "executed",
-                  output: result,
-                  message: result,
-                }
-              : block
-          ),
-        }));
+                }),
+                why: block.why || progress.why,
+                evidence: progress.evidence || block.evidence,
+                observationSummary,
+                turnPhase: completedPhase || block.turnPhase,
+              };
+            }),
+          };
+        });
       },
 
-      onToolError: (toolName: string, _target: string, error: string, meta?: { toolCallId?: string }) => {
-        const executionId = meta?.toolCallId;
+      onToolError: (toolName: string, target: string, error: string, meta?: { toolCallId?: string }) => {
+        const lifecycleMeta = normalizeToolLifecycleMeta(meta);
+        const executionId = lifecycleMeta.toolCallId || undefined;
+        const errorText = String(error || "");
+        const observationSummary = summarizeToolObservation({
+          toolName,
+          target,
+          result: errorText,
+          language: phaseLanguage,
+        });
+        const progress = buildToolProgressNarration({
+          toolName,
+          target,
+          language: phaseLanguage,
+          status: "failed",
+          source: "tool_result",
+          turnIntent: effectiveRunIntent,
+          workflowMode: sessionGet().config.workflowMode,
+          previousObservation: observationSummary,
+          result: errorText,
+          hypothesisStatus: "blocked",
+          sourceToolCallIds: executionId ? [executionId] : [],
+        });
         logStoreEvent("tool_result", {
           turnId,
           sessionKey: runSessionKey,
@@ -989,19 +1179,49 @@ export class WorkflowEngine {
           isError: true,
         });
 
-        sessionSet((s: any) => ({
-          taskFlow: s.taskFlow.map((block: any) =>
-            block.turnId === turnId && block.type === "tool" && block.executionId === executionId
-              ? {
-                  ...block,
-                  status: "error",
+        sessionSet((s: any) => {
+          const existingIndex = findCurrentToolLifecycleBlockIndex(
+            s.taskFlow,
+            toolName,
+            target,
+            ["pending", "running", "failed"],
+            lifecycleMeta,
+          );
+          if (existingIndex < 0) return {};
+          return {
+            taskFlow: s.taskFlow.map((block: any, index: number) => {
+              if (index !== existingIndex) return block;
+              const failedPhase = withTurnRuntimePhaseStatus(
+                block.turnPhase || deriveTurnRuntimePhaseForTool({
+                  toolName,
+                  target,
+                  language: phaseLanguage,
+                  status: "failed",
+                }),
+                "failed",
+                phaseLanguage,
+              );
+              return {
+                ...block,
+                status: "error",
+                toolStatus: "failed",
+                output: errorText,
+                message: errorText,
+                intentSummary: block.intentSummary || deriveToolIntentSummary({
+                  toolName,
+                  target,
+                  language: phaseLanguage,
+                  status: "failed",
                   toolStatus: "failed",
-                  output: error,
-                  message: error,
-                }
-              : block
-          ),
-        }));
+                }),
+                why: block.why || progress.why,
+                evidence: progress.evidence || block.evidence,
+                observationSummary,
+                turnPhase: failedPhase || block.turnPhase,
+              };
+            }),
+          };
+        });
       },
 
       requestReview: (toolCall: any) => {

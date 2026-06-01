@@ -303,6 +303,41 @@ test("approved plan execution can route browser validation tools when runtime ta
   assert.equal(browserRun.target, "http://localhost:5173");
 });
 
+test("session auto review scopes execute non-destructive gated tools without pending review", () => {
+  const writeRun = planRuntimeToolCall(createPlanInput({
+    toolCall: {
+      id: "auto-write",
+      name: "write_file",
+      arguments: JSON.stringify({ path: "src/auto.ts", content: "export {};" }),
+    },
+    availableToolNames: new Set(["read_file", "write_file", "run_command", "browser_evaluate"]),
+    autoApproveToolScopes: ["workspace_write", "shell", "browser_control"],
+  }));
+  assert.equal(writeRun.action, "auto_execute");
+
+  const shellRun = planRuntimeToolCall(createPlanInput({
+    toolCall: {
+      id: "auto-shell",
+      name: "run_command",
+      arguments: JSON.stringify({ command: "git status --short", cwd: ".", description: "检查工作区状态" }),
+    },
+    availableToolNames: new Set(["read_file", "write_file", "run_command", "browser_evaluate"]),
+    autoApproveToolScopes: ["workspace_write", "shell", "browser_control"],
+  }));
+  assert.equal(shellRun.action, "auto_execute");
+
+  const dangerousShell = planRuntimeToolCall(createPlanInput({
+    toolCall: {
+      id: "dangerous-shell",
+      name: "run_command",
+      arguments: JSON.stringify({ command: "git reset --hard HEAD", cwd: ".", description: "危险重置" }),
+    },
+    availableToolNames: new Set(["read_file", "write_file", "run_command", "browser_evaluate"]),
+    autoApproveToolScopes: ["workspace_write", "shell", "browser_control"],
+  }));
+  assert.equal(dangerousShell.action, "review_required");
+});
+
 test("thread event helpers stamp schema, detect terminal events, and keep ring buffer", () => {
   const started = withEventSchema({
     type: "turn.started",

@@ -59,17 +59,45 @@ function loadTranspiledModuleSync(sourcePath) {
 const {
   shouldRepromptBeforeUnityConsoleFallback,
   shouldTriggerUnityMcpFirstIterationFallback,
+  shouldTriggerUnityMcpStrictRetry,
 } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/orchestrator.ts"),
 );
 
-test("unity fallback triggers only when no tool call and no reply options exist", () => {
+test("unity XML console path strict-retries before local fallback", () => {
+  assert.equal(
+    shouldTriggerUnityMcpStrictRetry({
+      toolCallCount: 0,
+      replyOptionCount: 0,
+      unityMcpFirstPhaseActive: true,
+      unityMcpFirstIterationPending: true,
+      unityConsoleDiagnosticsRequested: true,
+      strictRetryAlreadyIssued: false,
+    }),
+    true,
+  );
+
+  assert.equal(
+    shouldTriggerUnityMcpStrictRetry({
+      toolCallCount: 0,
+      replyOptionCount: 0,
+      unityMcpFirstPhaseActive: true,
+      unityMcpFirstIterationPending: true,
+      unityConsoleDiagnosticsRequested: true,
+      strictRetryAlreadyIssued: true,
+    }),
+    false,
+  );
+});
+
+test("unity fallback triggers only when no tool call, no reply options, and no strict console retry exists", () => {
   assert.equal(
     shouldTriggerUnityMcpFirstIterationFallback({
       toolCallCount: 0,
       replyOptionCount: 0,
       unityMcpFirstPhaseActive: true,
       unityMcpFirstIterationPending: true,
+      unityConsoleDiagnosticsRequested: false,
     }),
     true,
   );
@@ -80,6 +108,7 @@ test("unity fallback triggers only when no tool call and no reply options exist"
       replyOptionCount: 2,
       unityMcpFirstPhaseActive: true,
       unityMcpFirstIterationPending: true,
+      unityConsoleDiagnosticsRequested: false,
     }),
     false,
   );
@@ -90,6 +119,18 @@ test("unity fallback triggers only when no tool call and no reply options exist"
       replyOptionCount: 0,
       unityMcpFirstPhaseActive: true,
       unityMcpFirstIterationPending: true,
+      unityConsoleDiagnosticsRequested: false,
+    }),
+    false,
+  );
+
+  assert.equal(
+    shouldTriggerUnityMcpFirstIterationFallback({
+      toolCallCount: 0,
+      replyOptionCount: 0,
+      unityMcpFirstPhaseActive: true,
+      unityMcpFirstIterationPending: true,
+      unityConsoleDiagnosticsRequested: true,
     }),
     false,
   );

@@ -9,6 +9,8 @@ const PLAN_QUICK_REPLY_MATERIALIZE_GEMMA_SCENARIO = "plan-quick-reply-materializ
 const PLAN_QUICK_REPLY_MATERIALIZE_QWEN_SCENARIO = "plan-quick-reply-materialize-qwen";
 const PLAN_RELOAD_RESUME_SCENARIO = "plan-reload-resume";
 const DIFF_RELOAD_SUMMARY_SCENARIO = "diff-reload-summary";
+const LIVE_EDIT_DIFF_STEPS_SCENARIO = "live-edit-diff-steps";
+const STAGE_CONCLUSION_PRESERVED_SCENARIO = "stage-conclusion-preserved";
 const PLAN_REPLACE_REFRESH_SCENARIO = "plan-replace-refresh";
 const AWAITING_CHOICE_SCENARIO = "awaiting-choice";
 const AWAITING_CHOICE_MIXED_OPTIONS_SCENARIO = "awaiting-choice-mixed-options";
@@ -2459,6 +2461,278 @@ function seedDiffReloadSummaryScenario() {
   }
 
   bindBridgeSnapshot(DIFF_RELOAD_SUMMARY_SCENARIO);
+
+  const cleanup = () => {
+    bridge.initialized = false;
+  };
+
+  bridge.cleanup = cleanup;
+  return cleanup;
+}
+
+function seedLiveEditDiffStepsScenario() {
+  const bridge = getBridge();
+  if (!bridge) return undefined;
+
+  bridge.events = [{ type: "boot" }];
+  bridge.savedDocuments = [];
+  bridge.completed = false;
+
+  const workspace = "/tmp/e2e-live-edit-diff-steps";
+  const sessionId = 999013;
+  const now = Date.now();
+  const turnId = "e2e-live-edit-diff-steps-turn";
+  const userBlockId = useAppStore.getState()._nextTaskId();
+  const toolBlockIdA = useAppStore.getState()._nextTaskId();
+  const toolBlockIdB = useAppStore.getState()._nextTaskId();
+  const toolBlockIdC = useAppStore.getState()._nextTaskId();
+
+  incrementSeedCount(LIVE_EDIT_DIFF_STEPS_SCENARIO);
+
+  const taskFlow: any[] = [
+    {
+      id: userBlockId,
+      turnId,
+      type: "user",
+      content: "请继续修复并展示本轮编辑 diff。",
+    },
+    {
+      id: toolBlockIdA,
+      turnId,
+      type: "tool",
+      toolName: "write_file",
+      target: "src/main.ts",
+      status: "done",
+      toolStatus: "executed",
+      message: "Updated src/main.ts",
+      diff: {
+        path: "src/main.ts",
+        old: "export const title = 'old';\n",
+        new: "export const title = 'new';\nexport const enabled = true;\n",
+        existed: true,
+        fullFile: true,
+      },
+    },
+    {
+      id: toolBlockIdB,
+      turnId,
+      type: "tool",
+      toolName: "replace_in_file",
+      target: "src/utils/helper.ts",
+      status: "done",
+      toolStatus: "executed",
+      message: "Updated src/utils/helper.ts",
+      diff: {
+        path: "src/utils/helper.ts",
+        old: "export const helper = () => 'before';\n",
+        new: "export const helper = () => 'after';\n",
+        existed: true,
+        fullFile: true,
+      },
+    },
+    {
+      id: toolBlockIdC,
+      turnId,
+      type: "tool",
+      toolName: "write_file",
+      target: "src/generated.ts",
+      status: "done",
+      toolStatus: "executed",
+      message: "Created src/generated.ts",
+      diff: {
+        path: "src/generated.ts",
+        old: "",
+        new: "export const generated = true;\n",
+        existed: false,
+        fullFile: true,
+      },
+    },
+  ];
+
+  useAppStore.setState((state) => ({
+    ...state,
+    config: {
+      ...state.config,
+      language: "zh",
+      workflowMode: "edit",
+    },
+    currentWorkspace: workspace,
+    sessionsByWorkspace: {
+      [workspace]: [
+        {
+          id: sessionId,
+          title: "E2E Live Edit Diff Steps",
+          date: new Date(now).toISOString(),
+          active: true,
+          messages: [],
+        },
+      ],
+    },
+    currentSessionId: sessionId,
+    taskFlow,
+    conversationTurns: [
+      {
+        id: turnId,
+        userPrompt: "请继续修复并展示本轮编辑 diff。",
+        title: "Live 编辑 diff 步骤",
+        mode: "edit",
+        status: "executing",
+        summary: "正在执行连续编辑。",
+        blockIds: taskFlow.map((block) => block.id),
+        collapsed: false,
+        createdAt: now,
+      },
+    ],
+    currentTurnId: turnId,
+    planArtifacts: [],
+    planTasks: [],
+    planExecutionEvidenceLedger: [],
+    planExecutionEvidenceCount: 0,
+    isPlanApproved: false,
+    showPlanPanel: false,
+    showDiff: false,
+    showTerminal: false,
+    showFilePanel: false,
+    selectedDiffTaskId: null,
+    agentStatus: "running",
+    isGenerating: true,
+    abortController: new AbortController(),
+  }));
+
+  bindBridgeSnapshot(LIVE_EDIT_DIFF_STEPS_SCENARIO);
+  appendBridgeEvent("seeded", { seedCount: readSeedCount(LIVE_EDIT_DIFF_STEPS_SCENARIO) });
+
+  const cleanup = () => {
+    const latest = useAppStore.getState();
+    latest.abortController?.abort();
+    useAppStore.setState({
+      abortController: null,
+      agentStatus: "idle",
+      isGenerating: false,
+    });
+    bridge.initialized = false;
+  };
+
+  bridge.cleanup = cleanup;
+  return cleanup;
+}
+
+function seedStageConclusionPreservedScenario() {
+  const bridge = getBridge();
+  if (!bridge) return undefined;
+
+  bridge.events = [{ type: "boot" }];
+  bridge.savedDocuments = [];
+  bridge.completed = true;
+
+  const workspace = "/tmp/e2e-stage-conclusion";
+  const sessionId = 999014;
+  const now = Date.now();
+  const turnId = "e2e-stage-conclusion-turn";
+  const userBlockId = useAppStore.getState()._nextTaskId();
+  const readBlockId = useAppStore.getState()._nextTaskId();
+  const stageAgentBlockId = useAppStore.getState()._nextTaskId();
+  const editBlockId = useAppStore.getState()._nextTaskId();
+  const finalAgentBlockId = useAppStore.getState()._nextTaskId();
+  const stageText = [
+    "阶段性结论：我已经定位到编译错误的根因。",
+    "",
+    "1. `SnakeData` 缺少 `canvasSize` 和 `pointsPerFood`。",
+    "2. `SnakeController` 仍在使用旧的输入常量和渲染方法。",
+    "",
+    "下一步我会直接修复这些文件并运行验证。",
+  ].join("\n");
+
+  const taskFlow: any[] = [
+    { id: userBlockId, turnId, type: "user", content: "修复 Unity console 里的编译错误。" },
+    {
+      id: readBlockId,
+      turnId,
+      type: "tool",
+      toolName: "read_file",
+      target: "Assets/Scripts/Entities/SnakeController.cs",
+      status: "done",
+      toolStatus: "executed",
+      message: "OK",
+    },
+    {
+      id: stageAgentBlockId,
+      turnId,
+      type: "agent",
+      content: stageText,
+      streaming: false,
+    },
+    {
+      id: editBlockId,
+      turnId,
+      type: "tool",
+      toolName: "replace_in_file",
+      target: "Assets/Scripts/Core/SnakeData.cs",
+      status: "done",
+      toolStatus: "executed",
+      message: "Updated SnakeData.cs",
+      diff: {
+        path: "Assets/Scripts/Core/SnakeData.cs",
+        old: "public int gridSize = 20;\n",
+        new: "public int gridSize = 20;\npublic int canvasSize = 600;\npublic int pointsPerFood = 10;\n",
+        existed: true,
+        fullFile: true,
+      },
+    },
+    {
+      id: finalAgentBlockId,
+      turnId,
+      type: "agent",
+      content: "已完成当前修复并保留阶段性结论。",
+      streaming: false,
+    },
+  ];
+
+  useAppStore.setState((state) => ({
+    ...state,
+    config: {
+      ...state.config,
+      language: "zh",
+      workflowMode: "edit",
+    },
+    currentWorkspace: workspace,
+    sessionsByWorkspace: {
+      [workspace]: [
+        {
+          id: sessionId,
+          title: "E2E Stage Conclusion Preserved",
+          date: new Date(now).toISOString(),
+          active: true,
+          messages: [],
+        },
+      ],
+    },
+    currentSessionId: sessionId,
+    taskFlow,
+    conversationTurns: [
+      {
+        id: turnId,
+        userPrompt: "修复 Unity console 里的编译错误。",
+        title: "阶段性结论保留",
+        mode: "edit",
+        status: "done",
+        summary: "已完成当前修复并保留阶段性结论。",
+        blockIds: taskFlow.map((block) => block.id),
+        collapsed: false,
+        createdAt: now,
+      },
+    ],
+    currentTurnId: turnId,
+    showPlanPanel: false,
+    showDiff: false,
+    showTerminal: false,
+    showFilePanel: false,
+    selectedDiffTaskId: null,
+    agentStatus: "idle",
+    isGenerating: false,
+  }));
+
+  bindBridgeSnapshot(STAGE_CONCLUSION_PRESERVED_SCENARIO);
 
   const cleanup = () => {
     bridge.initialized = false;
@@ -6328,6 +6602,14 @@ export function initializeE2EScenarios(): (() => void) | undefined {
 
   if (scenario === DIFF_RELOAD_SUMMARY_SCENARIO) {
     return seedDiffReloadSummaryScenario();
+  }
+
+  if (scenario === LIVE_EDIT_DIFF_STEPS_SCENARIO) {
+    return seedLiveEditDiffStepsScenario();
+  }
+
+  if (scenario === STAGE_CONCLUSION_PRESERVED_SCENARIO) {
+    return seedStageConclusionPreservedScenario();
   }
 
   if (scenario === PLAN_REPLACE_REFRESH_SCENARIO) {
