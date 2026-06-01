@@ -1260,6 +1260,7 @@ export interface OrchestratorCallbacks {
   // Human-in-the-loop — only for write/execute tools.
   // Read-only tools are auto-executed by the orchestrator.
   requestReview: (toolCall: {
+    toolCallId?: string;
     name: string;
     arguments: Record<string, unknown>;
     risk?: "local_file_read" | "browser_control";
@@ -3728,6 +3729,7 @@ async function executeLocalFileReadToolWithReview(
   let decision: ReviewDecision;
   try {
     decision = await callbacks.requestReview({
+      toolCallId: tc.id,
       name: tc.name,
       arguments: toolArgs,
       risk: "local_file_read",
@@ -4072,6 +4074,7 @@ async function executeWriteToolWithReview(
   try {
     const browserRisk = tc.name === "browser_evaluate" ? "browser_control" : undefined;
     decision = await callbacks.requestReview({
+      toolCallId: tc.id,
       name: tc.name,
       arguments: toolArgs,
       ...(browserRisk ? { risk: browserRisk } : {}),

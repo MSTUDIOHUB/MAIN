@@ -51,6 +51,23 @@ test("TopIsland keeps approval buttons visible for a long command with plan task
   await expect(page.getByTestId("top-island-current-plan-task")).toHaveCount(0);
 });
 
+test("TopIsland renders approval controls from pendingToolCall when the pending tool card is missing", async ({ page }) => {
+  await page.goto("/?e2eScenario=top-island-orphan-pending-review");
+
+  await expect.poll(async () => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().agentStatus ?? null)).toBe("idle");
+  await expect(page.getByTestId("top-island-shell")).toHaveCount(0);
+
+  await page.evaluate(() => (window as any).__CODELY_E2E__?.showOrphanPendingReviewPrompt?.());
+  await expect(page.getByTestId("top-island-tool-review")).toBeVisible();
+  await expect(page.getByTestId("top-island-tool-review")).toContainText("批准此工具请求");
+  await expect(page.getByTestId("top-island-tool-review")).toContainText("SnakeController.cs");
+
+  await page.getByTestId("top-island-tool-approve-once").click();
+  await expect
+    .poll(async () => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().pendingReviewTaskId ?? null))
+    .toBeNull();
+});
+
 const panelModes = ["plan", "diff", "terminal", "closed"] as const;
 
 async function getPanelSnapshot(page: Page) {

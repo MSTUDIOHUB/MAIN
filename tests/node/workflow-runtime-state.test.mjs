@@ -46,6 +46,14 @@ test("tool lifecycle keeps edit diff previews through completion", () => {
   assert.match(source, /withTurnRuntimePhaseStatus/);
 });
 
+test("pending review materializes a visible tool card for TopIsland", () => {
+  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"), "utf8");
+
+  assert.match(source, /status: "pending_review",\s*toolStatus: "pending"/);
+  assert.match(source, /taskFlow: \[\.\.\.s\.taskFlow, pendingBlock\]/);
+  assert.match(source, /pendingReviewTaskId: taskId/);
+});
+
 test("chat rendering keeps substantive intermediate conclusions out of process archive", () => {
   const source = fsSync.readFileSync(path.join(workspaceRoot, "src/components/ChatArea.tsx"), "utf8");
 

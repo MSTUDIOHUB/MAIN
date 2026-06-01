@@ -5868,20 +5868,34 @@ export const useAppStore = create<AppState>()(
   queuedUserMessage: null,
   activeGuidance: null,
   pendingRunDecisionResolver: null,
-  setAutoApproveTools: (v) =>
-    set((s) => {
-      if (!v && s.autoApproveTools && (s.isGenerating || s.agentStatus === "running" || s.agentStatus === "pending_review")) {
-        logStoreEvent("auto_review_disable_blocked", {
-          agentStatus: s.agentStatus,
-          isGenerating: s.isGenerating,
-        });
-        return {};
-      }
-      return {
-        autoApproveTools: v,
-        autoApproveToolScopes: v ? buildSessionAutoApproveScopes(true) : [],
-      };
-    }),
+  setAutoApproveTools: (v) => {
+    const state = get();
+    if (!v && state.autoApproveTools && (state.isGenerating || state.agentStatus === "running")) {
+      logStoreEvent("auto_review_disable_blocked", {
+        agentStatus: state.agentStatus,
+        isGenerating: state.isGenerating,
+      });
+      return;
+    }
+
+    set({
+      autoApproveTools: v,
+      autoApproveToolScopes: v ? buildSessionAutoApproveScopes(true) : [],
+    });
+
+    if (v && state.agentStatus === "pending_review" && state.pendingReviewResolve && state.pendingReviewTaskId != null) {
+      logStoreEvent("auto_review_enabled_pending_review_approved", {
+        taskId: state.pendingReviewTaskId,
+        toolName: state.pendingToolCall?.name || null,
+      });
+      runAfterNextPaint(() => {
+        const latest = get();
+        if (latest.pendingReviewResolve && latest.pendingReviewTaskId === state.pendingReviewTaskId) {
+          latest.allowToolAction(state.pendingReviewTaskId!);
+        }
+      });
+    }
+  },
   setWebSearchEnabled: (v) => set({ webSearchEnabled: v }),
   setWebSearchProvider: (provider) => set({ webSearchProvider: normalizeWebSearchProvider(provider) }),
   setReadOnlyAutoApproveForSession: (v) => set({ readOnlyAutoApproveForSession: v }),

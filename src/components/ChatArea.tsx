@@ -84,6 +84,7 @@ import {
   isCommandLikeToolName,
   shouldGroupPlanExecutionTools,
 } from "../lib/chat/chatToolSummary";
+import { resolveVisiblePendingToolReview } from "../lib/pendingToolReview";
 
 const TURN_STATUS_LABELS: Record<string, string> = {
   planning: "Planning",
@@ -2341,6 +2342,8 @@ export default function ChatArea({
     rejectPlan,
     rejectPlanAndDeleteFiles,
     agentStatus,
+    pendingReviewTaskId,
+    pendingToolCall,
     capsuleExplanationState,
     pendingRunDecision,
     resolvePendingRunDecision,
@@ -2377,6 +2380,8 @@ export default function ChatArea({
     rejectPlan: useAppStore((s) => s.rejectPlan),
     rejectPlanAndDeleteFiles: useAppStore((s) => s.rejectPlanAndDeleteFiles),
     agentStatus: useAppStore((s) => s.agentStatus),
+    pendingReviewTaskId: useAppStore((s) => s.pendingReviewTaskId),
+    pendingToolCall: useAppStore((s) => s.pendingToolCall),
     capsuleExplanationState: useAppStore((s) => s.currentTurnState.capsuleExplanation),
     pendingRunDecision: useAppStore((s) => s.pendingRunDecision),
     resolvePendingRunDecision: useAppStore((s) => s.resolvePendingRunDecision),
@@ -2719,6 +2724,13 @@ export default function ChatArea({
     agentStatus === "running" &&
     !!topIslandTurn &&
     topIslandTurnStatusKey === "executing";
+  const pendingToolReviewForTopIsland = useMemo(() => resolveVisiblePendingToolReview({
+    taskFlow,
+    pendingReviewTaskId,
+    pendingToolCall,
+    currentTurnId: topIslandTurn?.id || currentTurnId,
+    activeDiffTask,
+  }), [activeDiffTask, currentTurnId, pendingReviewTaskId, pendingToolCall, taskFlow, topIslandTurn?.id]);
   const isAwaitingInteractiveChoice =
     (topIslandTurnStatusKey === "awaiting_input" || topIslandTurnStatusKey === "awaiting_approval") &&
     topIslandReplyOptions.length > 0;
@@ -2731,9 +2743,7 @@ export default function ChatArea({
   const topIslandHasChoiceContext =
     topIslandReplyOptions.length > 0 ||
     !!pendingRunDecision ||
-    topIslandTurnStatusKey === "awaiting_input" ||
-    topIslandTurnStatusKey === "awaiting_approval" ||
-    !!activeDiffTask ||
+    !!pendingToolReviewForTopIsland ||
     canApprovePlan;
   const topIslandHasProgressContext =
     planTasks.length > 0 ||
@@ -3803,8 +3813,8 @@ export default function ChatArea({
           isAwaitingChoice={isAwaitingInteractiveChoice}
           replyOptions={topIslandReplyOptions}
           pendingRunDecision={pendingRunDecision}
-          activeDiffTask={activeDiffTask}
-          pendingToolReview={activeDiffTask}
+          activeDiffTask={pendingToolReviewForTopIsland}
+          pendingToolReview={pendingToolReviewForTopIsland}
           canApprovePlan={canApprovePlan}
           autoApproveTools={autoApproveTools}
           onSelectReplyOption={(option) => topIslandTurn && onQuickReply?.(option, topIslandTurn.id)}

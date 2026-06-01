@@ -197,6 +197,62 @@ export class WorkflowEngine {
     const isNoOpToolResult = (text: string) =>
       /FILE_UNCHANGED_STUB|READ_FILE_REPEAT_LIMIT|empty_change|invalid_patch|identical_content|no changes|no-op|nothing to (?:change|patch|write)|"noOp"\s*:\s*true/i.test(text);
 
+    const summarizeReviewPatchTarget = (patch: string): string => {
+      const text = String(patch || "");
+      const targets: string[] = [];
+      const addTarget = (value: string) => {
+        const clean = String(value || "")
+          .replace(/^["']|["']$/g, "")
+          .replace(/^[ab]\//, "")
+          .trim();
+        if (!clean || clean === "/dev/null" || targets.includes(clean)) return;
+        targets.push(clean);
+      };
+
+      for (const line of text.split(/\r?\n/)) {
+        const update = line.match(/^\*\*\* Update File:\s+(.+)$/);
+        const add = line.match(/^\*\*\* Add File:\s+(.+)$/);
+        const del = line.match(/^\*\*\* Delete File:\s+(.+)$/);
+        const unified = line.match(/^\+\+\+\s+(.+)$/);
+        if (update) addTarget(update[1]);
+        else if (add) addTarget(add[1]);
+        else if (del) addTarget(del[1]);
+        else if (unified) addTarget(unified[1]);
+        if (targets.length >= 3) break;
+      }
+
+      if (targets.length === 0) return "";
+      const suffix = targets.length > 1 ? ` +${targets.length - 1}` : "";
+      return `${targets[0]}${suffix}`;
+    };
+
+    const deriveReviewToolTarget = (toolCall: any): string => {
+      const args = toolCall?.arguments && typeof toolCall.arguments === "object" ? toolCall.arguments : {};
+      const name = String(toolCall?.name || "");
+      if (typeof toolCall?.localFileReadPath === "string" && toolCall.localFileReadPath.trim()) {
+        return toolCall.localFileReadPath.trim();
+      }
+      if (name === "apply_patch") {
+        return summarizeReviewPatchTarget(String(args.patch || "")) || "workspace patch";
+      }
+      const candidateKeys = [
+        "path",
+        "command",
+        "url",
+        "query",
+        "pattern",
+        "target",
+        "file",
+        "cwd",
+        "input",
+      ];
+      for (const key of candidateKeys) {
+        const value = args[key];
+        if (typeof value === "string" && value.trim()) return value.trim();
+      }
+      return name || "tool request";
+    };
+
     const clearNoFirstTokenNoticeTimer = () => {
       if (context.noFirstTokenNoticeTimer !== null) {
         clearTimeout(context.noFirstTokenNoticeTimer);
@@ -1225,9 +1281,14 @@ export class WorkflowEngine {
       },
 
       requestReview: (toolCall: any) => {
+        const toolName = String(toolCall?.name || "tool");
+        const reviewTarget = deriveReviewToolTarget(toolCall);
+        const reviewToolCallId = String(toolCall?.toolCallId || toolCall?.id || "").trim();
         logStoreEvent("request_review_started", {
           turnId,
-          toolName: toolCall.name,
+          toolName,
+          target: reviewTarget,
+          toolCallId: reviewToolCallId || null,
         });
 
         return new Promise<any>((resolve) => {
@@ -1236,16 +1297,79 @@ export class WorkflowEngine {
           const taskFlow = sessionGet().taskFlow;
           const toolBlock = [...taskFlow]
             .reverse()
-            .find((block: any) => block.turnId === turnId && block.type === "tool" && block.toolName === toolCall.name && block.toolStatus === "running");
+            .find((block: any) => {
+              if (block.turnId !== turnId && block.turnId !== toolDisplayTurnId) return false;
+              if (block.type !== "tool" || block.toolName !== toolName) return false;
+              if (reviewToolCallId && String(block.toolCallId || block.executionId || "") === reviewToolCallId) return true;
+              return block.toolStatus === "running" && String(block.target || "") === reviewTarget;
+            });
           const taskId = toolBlock ? toolBlock.id : sessionGet()._nextTaskId();
+          const pendingPhase = deriveTurnRuntimePhaseForTool({
+            toolName,
+            target: reviewTarget,
+            language: phaseLanguage,
+            status: "pending",
+          });
+          const progress = buildToolProgressNarration({
+            toolName,
+            target: reviewTarget,
+            language: phaseLanguage,
+            status: "running",
+            source: "runtime",
+            turnIntent: effectiveRunIntent,
+            workflowMode: sessionGet().config.workflowMode,
+            sourceToolCallIds: reviewToolCallId ? [reviewToolCallId] : [],
+          });
+          const pendingMessage = phaseLanguage === "zh"
+            ? "等待用户批准后执行。"
+            : "Waiting for approval before execution.";
 
-          if (toolBlock) {
-            sessionSet((s: any) => ({
-              taskFlow: s.taskFlow.map((block: any) =>
-                block.id === taskId ? { ...block, status: "pending" } : block
+          sessionSet((s: any) => {
+            const updatePendingBlock = (block: any) => attachRuntimePhase({
+              ...block,
+              turnId: block.turnId || toolDisplayTurnId,
+              type: "tool",
+              toolName,
+              target: block.target || reviewTarget,
+              status: "pending_review",
+              toolStatus: "pending",
+              ...(reviewToolCallId ? { toolCallId: reviewToolCallId, executionId: reviewToolCallId } : {}),
+              ...(toolCall?.shellPermissionDecision ? { shellPermissionDecision: toolCall.shellPermissionDecision } : {}),
+              message: block.message || pendingMessage,
+              intentSummary: block.intentSummary || deriveToolIntentSummary({
+                toolName,
+                target: reviewTarget,
+                language: phaseLanguage,
+                status: "running",
+                toolStatus: "pending",
+              }),
+              why: block.why || progress.why,
+              evidence: block.evidence || progress.evidence,
+              observationSummary: block.observationSummary || progress.observedFact,
+              turnPhase: pendingPhase,
+            } as any, pendingPhase);
+
+            if (toolBlock) {
+              return {
+                taskFlow: s.taskFlow.map((block: any) =>
+                  block.id === taskId ? updatePendingBlock(block) : block
+                ),
+              };
+            }
+
+            const pendingBlock = updatePendingBlock({
+              id: taskId,
+              turnId: toolDisplayTurnId,
+            });
+            return {
+              taskFlow: [...s.taskFlow, pendingBlock],
+              conversationTurns: s.conversationTurns.map((turn: any) =>
+                (turn.id === turnId || turn.id === toolDisplayTurnId) && !turn.blockIds.includes(taskId)
+                  ? { ...turn, blockIds: [...turn.blockIds, taskId] }
+                  : turn
               ),
-            }));
-          }
+            };
+          });
 
           sessionSet({
             pendingReviewTaskId: taskId,

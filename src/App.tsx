@@ -63,6 +63,7 @@ import { getPlanArtifactTitle, normalizeConversationDisplayTitle, type ReplyOpti
 import { appendDebugLog } from "./lib/debugLog";
 import { applyAppIconVariant } from "./lib/appIcon";
 import { safeConfirm } from "./lib/safeConfirm";
+import { resolveVisiblePendingToolReview } from "./lib/pendingToolReview";
 import {
   buildFeishuMarkdownCard,
   createFeishuPairedUserFromMessage,
@@ -783,6 +784,8 @@ export default function App() {
   const rightPanelTab = useAppStore((s) => s.rightPanelTab);
   const selectedDiffTaskId = useAppStore((s) => s.selectedDiffTaskId);
   const pendingSlashCommand = useAppStore((s) => s.pendingSlashCommand);
+  const pendingReviewTaskId = useAppStore((s) => s.pendingReviewTaskId);
+  const pendingToolCall = useAppStore((s) => s.pendingToolCall);
   const isStreaming = useAppStore((s) => s.isGenerating);
   const agentStatus = useAppStore((s) => s.agentStatus);
   const runtimeBySessionKey = useAppStore((s) => s.runtimeBySessionKey);
@@ -1369,7 +1372,14 @@ export default function App() {
     updateSession,
   ]);
 
-  const activeDiffTask = taskFlow.find(task => task.type === "tool" && task.status === "pending_review");
+  const activeDiffTask = useMemo(() => {
+    return resolveVisiblePendingToolReview({
+      taskFlow,
+      pendingReviewTaskId,
+      pendingToolCall,
+      currentTurnId,
+    });
+  }, [currentTurnId, pendingReviewTaskId, pendingToolCall, taskFlow]);
 
   const handleAttachFile = async (): Promise<AttachmentPickerResult> => {
     const result: AttachmentPickerResult = { attachments: [], imageDataUrls: [], skipped: [] };

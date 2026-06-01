@@ -59,6 +59,7 @@ const TOP_ISLAND_EXECUTION_PROGRESS_SCENARIO = "top-island-execution-progress";
 const TOP_ISLAND_PLAN_TASK_PROGRESS_SCENARIO = "top-island-plan-task-progress";
 const TOP_ISLAND_STRICT_EVIDENCE_PROGRESS_SCENARIO = "top-island-strict-evidence-progress";
 const TOP_ISLAND_PENDING_TOOL_REVIEW_SCENARIO = "top-island-pending-tool-review";
+const TOP_ISLAND_ORPHAN_PENDING_REVIEW_SCENARIO = "top-island-orphan-pending-review";
 const TOP_ISLAND_PANEL_STABILITY_SCENARIO = "top-island-panel-stability";
 const GAME_STUDIO_TOOL_GROUP_COLLAPSE_SCENARIO = "game-studio-tool-group-collapse";
 const GAME_STUDIO_AWAITING_CHOICE_SCENARIO = "game-studio-awaiting-choice";
@@ -219,6 +220,8 @@ function bindBridgeSnapshot(scenario: string) {
       showTerminal: state.showTerminal,
       rightPanelTab: state.rightPanelTab,
       pendingReviewTaskId: state.pendingReviewTaskId,
+      pendingToolCallName: state.pendingToolCall?.name ?? null,
+      pendingToolCallArguments: state.pendingToolCall?.arguments ?? null,
       savedDocuments: bridge.savedDocuments || [],
       completed: Boolean(bridge.completed),
       currentTurnId: currentTurn?.id ?? null,
@@ -3476,6 +3479,161 @@ function seedTopIslandPendingToolReviewScenario() {
 
   appendBridgeEvent("seeded", { seedCount: readSeedCount(TOP_ISLAND_PENDING_TOOL_REVIEW_SCENARIO) });
   bindBridgeSnapshot(TOP_ISLAND_PENDING_TOOL_REVIEW_SCENARIO);
+
+  const cleanup = () => {
+    useAppStore.setState({
+      pendingReviewResolve: null,
+      pendingReviewTaskId: null,
+      pendingToolCall: null,
+      agentStatus: "idle",
+      isGenerating: false,
+    });
+  };
+
+  return cleanup;
+}
+
+function seedTopIslandOrphanPendingReviewScenario() {
+  const bridge = getBridge();
+  if (!bridge) return undefined;
+
+  bridge.events = [{ type: "boot" }];
+  bridge.savedDocuments = [];
+  bridge.completed = false;
+
+  const workspace = "/tmp/e2e-top-island-orphan-pending-review";
+  const sessionId = 999613;
+  const now = Date.now();
+  const turnId = "e2e-top-island-orphan-pending-review-turn";
+  const userBlockId = useAppStore.getState()._nextTaskId();
+  const pendingReviewTaskId = useAppStore.getState()._nextTaskId();
+  const patch = [
+    "*** Begin Patch",
+    "*** Update File: Assets/Scripts/Entities/SnakeController.cs",
+    "@@",
+    "-old",
+    "+new",
+    "*** End Patch",
+  ].join("\n");
+
+  incrementSeedCount(TOP_ISLAND_ORPHAN_PENDING_REVIEW_SCENARIO);
+
+  useAppStore.setState((state) => ({
+    ...state,
+    config: {
+      ...state.config,
+      language: "zh",
+      workflowMode: "edit",
+    },
+    currentWorkspace: workspace,
+    sessionsByWorkspace: {
+      [workspace]: [
+        {
+          id: sessionId,
+          title: "E2E Orphan Pending Review",
+          date: new Date(now).toISOString(),
+          active: true,
+          messages: [],
+        },
+      ],
+    },
+    currentSessionId: sessionId,
+    taskFlow: [
+      { id: userBlockId, turnId, type: "user", content: "修复 unity console 窗口里的报错。" },
+    ],
+    conversationTurns: [
+      {
+        id: turnId,
+        userPrompt: "修复 unity console 窗口里的报错。",
+        title: "孤立审批状态回归",
+        mode: "edit",
+        intent: "execute",
+        displayIntent: "execute",
+        status: "awaiting_approval",
+        summary: "状态处于待审批，但 taskFlow 里没有 pending 工具卡。",
+        blockIds: [userBlockId],
+        collapsed: false,
+        createdAt: now,
+      },
+    ],
+    currentTurnId: turnId,
+    planArtifacts: [],
+    planTasks: [],
+    planExecutionEvidenceLedger: [],
+    planExecutionEvidenceCount: 0,
+    planStage: "idle",
+    isPlanApproved: false,
+    showPlanPanel: false,
+    showDiff: false,
+    showTerminal: false,
+    showFilePanel: false,
+    rightPanelTab: "plan",
+    agentStatus: "pending_review",
+    isGenerating: false,
+    abortController: null,
+    pendingReviewResolve: (decision: unknown) => appendBridgeEvent("orphan_review_resolved", { decision }),
+    pendingReviewTaskId,
+    pendingToolCall: {
+      name: "apply_patch",
+      arguments: { patch },
+    },
+    selectedDiffTaskId: null,
+    input: "",
+    attachedFiles: [],
+    contextMentions: [],
+  }));
+
+  bridge.showOrphanPendingReviewPrompt = () => {
+    useAppStore.setState((state) => {
+      const hasUserBlock = state.taskFlow.some((block) => block.id === userBlockId);
+      const nextTurns = state.conversationTurns.some((turn) => turn.id === turnId)
+        ? state.conversationTurns.map((turn) =>
+            turn.id === turnId
+              ? { ...turn, status: "awaiting_approval" as const, blockIds: turn.blockIds.includes(userBlockId) ? turn.blockIds : [...turn.blockIds, userBlockId] }
+              : turn
+          )
+        : [
+            ...state.conversationTurns,
+            {
+              id: turnId,
+              userPrompt: "修复 unity console 窗口里的报错。",
+              title: "孤立审批状态回归",
+              mode: "edit" as const,
+              intent: "execute" as const,
+              displayIntent: "execute" as const,
+              status: "awaiting_approval" as const,
+              summary: "状态处于待审批，但 taskFlow 里没有 pending 工具卡。",
+              blockIds: [userBlockId],
+              collapsed: false,
+              createdAt: now,
+            },
+          ];
+      return {
+        ...state,
+        taskFlow: hasUserBlock
+          ? state.taskFlow.filter((block) => !(block.type === "tool" && block.id === pendingReviewTaskId))
+          : [
+              ...state.taskFlow,
+              { id: userBlockId, turnId, type: "user" as const, content: "修复 unity console 窗口里的报错。" },
+            ],
+        conversationTurns: nextTurns,
+        currentTurnId: turnId,
+        agentStatus: "pending_review",
+        isGenerating: false,
+        abortController: null,
+        pendingReviewResolve: (decision: unknown) => appendBridgeEvent("orphan_review_resolved", { decision }),
+        pendingReviewTaskId,
+        pendingToolCall: {
+          name: "apply_patch",
+          arguments: { patch },
+        },
+      };
+    });
+    appendBridgeEvent("orphan_pending_prompt_shown");
+  };
+
+  appendBridgeEvent("seeded", { seedCount: readSeedCount(TOP_ISLAND_ORPHAN_PENDING_REVIEW_SCENARIO) });
+  bindBridgeSnapshot(TOP_ISLAND_ORPHAN_PENDING_REVIEW_SCENARIO);
 
   const cleanup = () => {
     useAppStore.setState({
@@ -6800,6 +6958,10 @@ export function initializeE2EScenarios(): (() => void) | undefined {
 
   if (scenario === TOP_ISLAND_PENDING_TOOL_REVIEW_SCENARIO) {
     return seedTopIslandPendingToolReviewScenario();
+  }
+
+  if (scenario === TOP_ISLAND_ORPHAN_PENDING_REVIEW_SCENARIO) {
+    return seedTopIslandOrphanPendingReviewScenario();
   }
 
   if (scenario === TOP_ISLAND_PANEL_STABILITY_SCENARIO) {
