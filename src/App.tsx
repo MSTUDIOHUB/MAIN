@@ -62,7 +62,7 @@ import { checkForMainUpdate, installMainUpdate, type MainUpdateInfo, type MainUp
 import { getPlanArtifactTitle, normalizeConversationDisplayTitle, type ReplyOption, type RightPanelTab } from "./lib/workflowModels";
 import { appendDebugLog } from "./lib/debugLog";
 import { applyAppIconVariant } from "./lib/appIcon";
-import { safeConfirm } from "./lib/safeConfirm";
+import { safeConfirmAsync } from "./lib/safeConfirm";
 import { resolveVisiblePendingToolReview } from "./lib/pendingToolReview";
 import {
   buildFeishuMarkdownCard,
@@ -3144,7 +3144,7 @@ export default function App() {
           notes || null,
         ].filter(Boolean).join("\n");
 
-    if (!safeConfirm(message, { source: "App", action: "install_main_update" })) return;
+    if (!(await safeConfirmAsync(message, { source: "App", action: "install_main_update" }))) return;
 
     setMainUpdateStatus("downloading");
     setMainUpdateError("");

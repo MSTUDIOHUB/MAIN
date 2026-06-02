@@ -18,7 +18,7 @@ import { GLOBAL_CHAT_KEY, useAppStore, type WorkspaceEntry } from "../store/useA
 import { looksLikeReasoningLeakTitle, normalizeConversationDisplayTitle } from "../lib/workflowModels";
 import { getGitStatus, getGitDiff, gitCommitAll, gitCreateBranch, gitPushCurrentBranch, type GitStatus } from "../lib/ipc";
 import { generateGitCommitMessage } from "../lib/gitCommitMessage";
-import { safeConfirm } from "../lib/safeConfirm";
+import { safeConfirmAsync } from "../lib/safeConfirm";
 
 interface GitMenuState {
   workspacePath: string;
@@ -522,7 +522,7 @@ export default function Sidebar({
     if (
       !activeGitStatus.upstream &&
       activeGitStatus.hasOrigin &&
-      !safeConfirm(gitCopy.noOriginPush, { source: "Sidebar", action: "git_push_without_upstream" })
+      !(await safeConfirmAsync(gitCopy.noOriginPush, { source: "Sidebar", action: "git_push_without_upstream" }))
     ) {
       return;
     }

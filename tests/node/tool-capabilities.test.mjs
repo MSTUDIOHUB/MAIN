@@ -120,6 +120,13 @@ test("MCP classification recognizes browser, search, GitHub write, and database 
     ),
     "external_write",
   );
+  assert.equal(
+    classifyMcpTool(
+      { name: "find_gameobjects", description: "Find GameObjects in the active Unity scene", inputSchema: {} },
+      { name: "Unity", type: "http", url: "http://127.0.0.1:8080/mcp" },
+    ),
+    "external_read",
+  );
 });
 
 test("intent filtering exposes read-only tools for chat and write/shell tools for execute", () => {
@@ -423,6 +430,83 @@ test("Unity MCP-first routing prefers script_apply_edits over apply_text_edits f
   assert.ok(orderedNames.indexOf("apply_text_edits") >= 0);
   assert.ok(orderedNames.indexOf("script_apply_edits") < orderedNames.indexOf("apply_text_edits"));
   assert.ok(routed.telemetry.selectedToolCount <= 4);
+});
+
+test("Game Studio MCP-first routing selects Godot MCP tools for Godot scene and script work", () => {
+  const servers = [
+    { name: "Godot MCP", type: "http", url: "http://127.0.0.1:9001/mcp" },
+    { name: "research", type: "http", url: "http://research.test" },
+  ];
+  const tools = [
+    { name: "godot_list_nodes", description: "List Godot scene nodes", inputSchema: {} },
+    { name: "godot_edit_script", description: "Edit GDScript files in the Godot project", inputSchema: {} },
+    { name: "godot_read_output", description: "Read Godot editor output and errors", inputSchema: {} },
+    { name: "web_search", description: "Search the web", inputSchema: {} },
+  ];
+  const toolServerMap = {
+    godot_list_nodes: "http://127.0.0.1:9001/mcp",
+    godot_edit_script: "http://127.0.0.1:9001/mcp",
+    godot_read_output: "http://127.0.0.1:9001/mcp",
+    web_search: "http://research.test",
+  };
+
+  const routed = routeMcpToolsForPrompt({
+    tools,
+    servers,
+    toolServerMap,
+    userPrompt: "Godot 场景节点点击后没有响应，检查节点和脚本",
+    config: { enabled: true, threshold: 4, routerModel: "", timeoutMs: 800, fallbackToFullList: true, disabledToolKeys: [] },
+    priorityMode: "game_studio_mcp_first",
+    preferredServerUrls: ["http://127.0.0.1:9001/mcp"],
+    gameStudioRoutingContext: { engine: "godot" },
+  });
+
+  const names = routed.tools.map((item) => item.name);
+  assert.equal(routed.telemetry.pickSource, "heuristic");
+  assert.equal(routed.telemetry.selectedIntent, "godot_script_fix");
+  assert.equal(routed.telemetry.selectedBundle, "godot_script_fix");
+  assert.ok(names.includes("godot_edit_script"));
+  assert.ok(names.includes("godot_read_output"));
+  assert.ok(names.includes("godot_list_nodes"));
+  assert.ok(!names.includes("web_search"));
+});
+
+test("Game Studio MCP-first routing selects Unreal MCP tools for Unreal log and actor work", () => {
+  const servers = [
+    { name: "Unreal MCP", type: "http", url: "http://127.0.0.1:9002/mcp" },
+    { name: "research", type: "http", url: "http://research.test" },
+  ];
+  const tools = [
+    { name: "unreal_find_actors", description: "Find Unreal level actors", inputSchema: {} },
+    { name: "unreal_read_output_log", description: "Read Unreal Output Log errors", inputSchema: {} },
+    { name: "unreal_edit_blueprint", description: "Edit Unreal Blueprint graphs", inputSchema: {} },
+    { name: "web_search", description: "Search the web", inputSchema: {} },
+  ];
+  const toolServerMap = {
+    unreal_find_actors: "http://127.0.0.1:9002/mcp",
+    unreal_read_output_log: "http://127.0.0.1:9002/mcp",
+    unreal_edit_blueprint: "http://127.0.0.1:9002/mcp",
+    web_search: "http://research.test",
+  };
+
+  const routed = routeMcpToolsForPrompt({
+    tools,
+    servers,
+    toolServerMap,
+    userPrompt: "UE5 关卡 Actor 行为异常，先看输出日志和关卡 Actor",
+    config: { enabled: true, threshold: 3, routerModel: "", timeoutMs: 800, fallbackToFullList: true, disabledToolKeys: [] },
+    priorityMode: "game_studio_mcp_first",
+    preferredServerUrls: ["http://127.0.0.1:9002/mcp"],
+    gameStudioRoutingContext: { engine: "unreal" },
+  });
+
+  const names = routed.tools.map((item) => item.name);
+  assert.equal(routed.telemetry.pickSource, "heuristic");
+  assert.equal(routed.telemetry.selectedIntent, "unreal_level_actor");
+  assert.equal(routed.telemetry.selectedBundle, "unreal_level_actor");
+  assert.ok(names.includes("unreal_find_actors"));
+  assert.ok(names.includes("unreal_read_output_log"));
+  assert.ok(!names.includes("web_search"));
 });
 
 test("Unity apply_text_edits precise patch validator enforces uri, coordinates, and precondition sha", () => {

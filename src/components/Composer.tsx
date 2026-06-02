@@ -25,7 +25,7 @@ import {
   mergeAttachedFiles,
   normalizeAttachedFile,
 } from "../lib/attachments";
-import { safeConfirm } from "../lib/safeConfirm";
+import { safeConfirmAsync } from "../lib/safeConfirm";
 
 // ── ContextRing SVG Component ──────────────────────────────────────────
 
@@ -338,8 +338,8 @@ export default function Composer({
     ? "Queue this message and send it automatically after the current run stops."
     : "将当前输入排队，当前模型停止后自动发送。";
   const autoReviewTitle = language === "en"
-    ? "Auto Review: approve tool requests in this session, including file changes, commands, local file reads, and browser validation."
-    : "自动审查：本会话内自动批准工具请求，包括文件修改、终端命令、本地文件读取和浏览器验证。";
+    ? "Auto Review: approve non-destructive tool requests in this session, including file changes, commands, local file reads, MCP actions, and browser validation."
+    : "自动审查：本会话内自动批准非破坏性工具请求，包括文件修改、终端命令、本地文件读取、MCP 动作和浏览器验证。";
   const autoReviewLockedTitle = language === "en"
     ? "Auto Review is active for this run and can be changed after the run stops."
     : "自动审查已在本轮执行中启用，执行停止后才能关闭。";
@@ -1228,7 +1228,7 @@ export default function Composer({
   };
 
   const handleRemoveGameStudioWorkspace = async () => {
-    const confirmed = safeConfirm(
+    const confirmed = await safeConfirmAsync(
       language === "en"
         ? "Remove MAIN GAME STUDIO from this workspace? This will delete the Game Studio hidden folders and merged hooks for the current project."
         : "要从当前工作区移除 MAIN GAME STUDIO 吗？这会删除该项目中的 Game Studio 隐藏文件夹和已合并的 hooks。",
@@ -1250,15 +1250,15 @@ export default function Composer({
     }
   };
 
-  const handleToggleAutoReview = useCallback(() => {
+  const handleToggleAutoReview = useCallback(async () => {
     if (!onToggleAutoApprove) return;
     if (autoApproveTools && isStreaming) return;
     const nextValue = !autoApproveTools;
     if (nextValue) {
-      const confirmed = safeConfirm(
+      const confirmed = await safeConfirmAsync(
         language === "en"
-          ? "Turn on Auto Review for this session? MAIN will automatically approve file changes, terminal commands, local file reads, and browser validation while the session is active."
-          : "要为本会话开启自动审查吗？开启后 MAIN 会自动批准文件修改、终端命令、本地文件读取和浏览器验证。",
+          ? "Turn on Auto Review for this session? MAIN will automatically approve non-destructive file changes, terminal commands, local file reads, MCP actions, and browser validation while the session is active."
+          : "要为本会话开启自动审查吗？开启后 MAIN 会自动批准非破坏性文件修改、终端命令、本地文件读取、MCP 动作和浏览器验证。",
         { source: "Composer", action: "toggle_auto_review" },
       );
       if (!confirmed) return;

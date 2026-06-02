@@ -326,6 +326,31 @@ test("session auto review scopes execute non-destructive gated tools without pen
   }));
   assert.equal(shellRun.action, "auto_execute");
 
+  const externalWrite = planRuntimeToolCall(createPlanInput({
+    toolCall: {
+      id: "auto-mcp",
+      name: "manage_camera",
+      arguments: JSON.stringify({ action: "set_follow_target", target: "Main Camera" }),
+    },
+    availableToolNames: new Set(["read_file", "write_file", "run_command", "browser_evaluate", "manage_camera"]),
+    capabilityRegistry: {
+      tools: {
+        manage_camera: {
+          key: "unity:manage_camera",
+          name: "manage_camera",
+          source: "mcp",
+          category: "external",
+          risk: "external_write",
+          enabled: true,
+          autoExecutable: false,
+        },
+      },
+      policy: defaultToolPolicy,
+    },
+    autoApproveToolScopes: ["workspace_write", "shell", "browser_control", "external_write"],
+  }));
+  assert.equal(externalWrite.action, "auto_execute");
+
   const dangerousShell = planRuntimeToolCall(createPlanInput({
     toolCall: {
       id: "dangerous-shell",

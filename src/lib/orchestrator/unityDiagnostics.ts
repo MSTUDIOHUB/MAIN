@@ -7,6 +7,8 @@ interface UnityExecutionContextCallbacks {
   getGameStudioConfig?: () => { engine?: string | null } | null;
 }
 
+export type GameStudioEngineKey = "unity" | "godot" | "unreal";
+
 export const UNITY_FALLBACK_RECOVERY_READ_ONLY_TOOL_NAMES = new Set([
   "list_directory",
   "get_project_skeleton",
@@ -76,7 +78,27 @@ export function shouldRepromptBeforeUnityConsoleFallback(input: {
 }
 
 export function isUnityLikelyServer(server: MCPServer): boolean {
-  return /unity/i.test(`${server.name} ${server.url}`);
+  return isGameEngineLikelyServer(server, "unity");
+}
+
+export function normalizeGameStudioEngineKey(engine?: string | null): GameStudioEngineKey | null {
+  const normalized = String(engine || "").trim().toLowerCase();
+  if (normalized === "unity") return "unity";
+  if (normalized === "godot") return "godot";
+  if (normalized === "unreal") return "unreal";
+  return null;
+}
+
+export function isGameEngineLikelyServer(
+  server: Pick<MCPServer, "name" | "url">,
+  engine?: string | null,
+): boolean {
+  const normalizedEngine = normalizeGameStudioEngineKey(engine);
+  if (!normalizedEngine) return false;
+  const text = `${server.name} ${server.url}`;
+  if (normalizedEngine === "unity") return /unity/i.test(text);
+  if (normalizedEngine === "godot") return /godot/i.test(text);
+  return /\b(unreal|ue4|ue5|ue)\b/i.test(text);
 }
 
 export function extractMcpCallFailureCategory(content: string): string | null {
@@ -88,7 +110,7 @@ export function isUnityExecutionContext(callbacks: UnityExecutionContextCallback
   const commandDirective = callbacks.getCommandDirective?.() ?? null;
   const gameStudioUnityContext =
     callbacks.getMainModeKey() === "game_studio" &&
-    callbacks.getGameStudioConfig?.()?.engine === "unity";
+    normalizeGameStudioEngineKey(callbacks.getGameStudioConfig?.()?.engine) === "unity";
   return isUnityCommandDirective(commandDirective) || gameStudioUnityContext;
 }
 

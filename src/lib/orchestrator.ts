@@ -101,11 +101,12 @@ import {
   annotateUnityEditToolDescriptions,
   buildUnityApplyTextPolicyBlockedMessage,
   extractMcpCallFailureCategory,
+  isGameEngineLikelyServer,
   isUnityCommandDirective,
   isUnityConsoleDiagnosticsDirective,
   isUnityExecutionContext,
-  isUnityLikelyServer,
   isUnityScriptWriteToolCall,
+  normalizeGameStudioEngineKey,
   resolveUnityScriptPathFromArgs,
   shouldRepromptBeforeUnityConsoleFallback,
   shouldTriggerUnityMcpFirstIterationFallback,
@@ -4499,13 +4500,19 @@ export async function executeAgentLoop(
   const repairExecutionRequestInChat = workflowMode === "chat" && looksLikeRepairExecutionRequest(latestUserPromptText);
   const turnInputContextSignals = extractTurnInputContextSignalsFromMessages(initialMessages);
   const commandDirective = callbacks.getCommandDirective?.() ?? null;
-  const gameStudioUnityContext =
-    callbacks.getMainModeKey() === "game_studio" &&
-    callbacks.getGameStudioConfig?.()?.engine === "unity";
+  const gameStudioConfig = callbacks.getGameStudioConfig?.() ?? null;
+  const gameStudioEngine = normalizeGameStudioEngineKey(gameStudioConfig?.engine);
+  const gameStudioEngineContext = callbacks.getMainModeKey() === "game_studio" && gameStudioEngine != null;
+  const gameStudioUnityContext = gameStudioEngineContext && gameStudioEngine === "unity";
   const unityCommandRequested = isUnityCommandDirective(commandDirective) || gameStudioUnityContext;
   const unityConsoleDiagnosticsRequested =
     isUnityConsoleDiagnosticsDirective(commandDirective) ||
     (unityCommandRequested && hasExplicitUnityConsoleDiagnosticCue(latestUserPromptText));
+  const gameStudioScriptEditRequested =
+    (gameStudioEngineContext || unityCommandRequested) &&
+    /fix|repair|patch|edit|modify|refactor|script|code|c#|cs|gdscript|blueprint|cpp|c\+\+|修复|补丁|修改|脚本|代码|蓝图|编译|报错|错误/i.test(
+      latestUserPromptText,
+    );
   const unityScriptEditRequested =
     unityCommandRequested &&
     /fix|repair|patch|edit|modify|refactor|script|code|c#|cs|修复|补丁|修改|脚本|代码|编译|报错|错误/i.test(
@@ -4556,14 +4563,22 @@ export async function executeAgentLoop(
       .map((status) => status.url),
   );
   const connectedMcpServers = enabledMcpServers.filter((server) => connectedMcpServerUrls.has(server.url));
-  const preferredUnityMcpServerUrls = connectedMcpServers
-    .filter((server) => isUnityLikelyServer(server))
-    .map((server) => server.url);
-  const effectivePreferredUnityUrls = preferredUnityMcpServerUrls.length > 0
-    ? preferredUnityMcpServerUrls
+  const mcpPriorityEngine = gameStudioEngine ?? (unityCommandRequested ? "unity" : null);
+  const preferredGameStudioMcpServerUrls = mcpPriorityEngine
+    ? connectedMcpServers
+      .filter((server) => isGameEngineLikelyServer(server, mcpPriorityEngine))
+      .map((server) => server.url)
+    : [];
+  const effectiveGameStudioMcpServerUrls = preferredGameStudioMcpServerUrls.length > 0
+    ? preferredGameStudioMcpServerUrls
     : connectedMcpServers.map((server) => server.url);
-  const unityMcpFirstEligible = unityCommandRequested && effectivePreferredUnityUrls.length > 0;
-  const mcpPriorityMode: McpRoutingPriorityMode = unityMcpFirstEligible ? "unity_mcp_first" : "none";
+  const gameStudioMcpFirstEligible =
+    (gameStudioEngineContext || unityCommandRequested) &&
+    !!mcpPriorityEngine &&
+    effectiveGameStudioMcpServerUrls.length > 0;
+  const effectivePreferredUnityUrls = mcpPriorityEngine === "unity" ? effectiveGameStudioMcpServerUrls : [];
+  const unityMcpFirstEligible = unityCommandRequested && mcpPriorityEngine === "unity" && gameStudioMcpFirstEligible;
+  const mcpPriorityMode: McpRoutingPriorityMode = gameStudioMcpFirstEligible ? "game_studio_mcp_first" : "none";
   const forceFirstMcpTools = unityMcpFirstEligible && unityConsoleDiagnosticsRequested
     ? ["read_console", "set_active_instance"]
     : [];
@@ -4571,6 +4586,9 @@ export async function executeAgentLoop(
   logAgentEvent("mcp_server_status", {
     requestedUnityRouting: unityCommandRequested,
     gameStudioUnityContext,
+    gameStudioEngine,
+    gameStudioEngineContext,
+    requestedGameStudioMcpRouting: gameStudioMcpFirstEligible,
     unityConsoleDiagnosticsRequested,
     statuses: mcpServerStatuses.map((status) => ({
       server: status.serverName,
@@ -4590,10 +4608,14 @@ export async function executeAgentLoop(
     userPrompt: latestUserPromptText,
     config: config.mcpRouting,
     priorityMode: mcpPriorityMode,
-    preferredServerUrls: effectivePreferredUnityUrls,
+    preferredServerUrls: preferredGameStudioMcpServerUrls,
     forceFirstTools: forceFirstMcpTools,
     unityRoutingContext: {
       preferStructuredScriptEdits: unityScriptEditRequested,
+    },
+    gameStudioRoutingContext: {
+      engine: mcpPriorityEngine,
+      preferStructuredScriptEdits: unityScriptEditRequested || gameStudioScriptEditRequested,
     },
   });
   mcpTools = mcpRoutingResult.tools;
@@ -4789,6 +4811,10 @@ export async function executeAgentLoop(
       callbacks.getGameStudioConfig?.()?.engineVersion ?? "",
       callbacks.getCommandDirective?.()?.kind ?? "none",
       callbacks.getCommandDirective?.()?.action ?? "",
+      mcpPriorityEngine ?? "",
+      gameStudioMcpFirstEligible ? "game-studio-mcp-first" : "",
+      unityMcpFirstPhaseActive ? "unity-mcp-first" : "",
+      unityConsoleDiagnosticsRequested ? "unity-console-first" : "",
       config.activeProfile,
       settings.provider || "",
       settings.model || "",
@@ -4822,10 +4848,22 @@ export async function executeAgentLoop(
       availableToolNameList,
       callbacks.getCommandDirective?.() ?? null,
       {
+        gameStudioMcpFirst: !!mcpPriorityEngine && (
+          mcpPriorityEngine === "unity" ? unityMcpFirstPhaseActive : gameStudioMcpFirstEligible
+        ),
         unityMcpFirst: unityMcpFirstPhaseActive,
+        engine: mcpPriorityEngine,
         unityConsoleFirst: unityMcpFirstPhaseActive && unityConsoleDiagnosticsRequested,
         connectedServerNames: mcpServerStatuses
-          .filter((status) => status.status === "connected" && /unity/i.test(`${status.serverName} ${status.url}`))
+          .filter((status) =>
+            status.status === "connected" &&
+            !!mcpPriorityEngine &&
+            (
+              preferredGameStudioMcpServerUrls.length > 0
+                ? isGameEngineLikelyServer({ name: status.serverName, url: status.url }, mcpPriorityEngine)
+                : connectedMcpServerUrls.has(status.url)
+            )
+          )
           .map((status) => status.serverName),
       },
       {

@@ -77,10 +77,16 @@ export interface McpRoutingTelemetry {
   schemaChars?: number;
 }
 
-export type McpRoutingPriorityMode = "none" | "unity_mcp_first";
+export type GameStudioMcpEngine = "unity" | "godot" | "unreal";
+
+export type McpRoutingPriorityMode = "none" | "unity_mcp_first" | "game_studio_mcp_first";
 
 export interface UnityMcpRoutingContext {
   preferStructuredScriptEdits?: boolean;
+}
+
+export interface GameStudioMcpRoutingContext extends UnityMcpRoutingContext {
+  engine?: GameStudioMcpEngine | null;
 }
 
 export type McpToolsetIntent =
@@ -90,7 +96,19 @@ export type McpToolsetIntent =
   | "unity_scene_object"
   | "unity_asset_prefab_material"
   | "unity_build_package"
-  | "unity_editor_action";
+  | "unity_editor_action"
+  | "godot_console_diagnostics"
+  | "godot_script_fix"
+  | "godot_scene_node"
+  | "godot_asset_resource"
+  | "godot_build_export"
+  | "godot_editor_action"
+  | "unreal_output_log_diagnostics"
+  | "unreal_blueprint_or_code_fix"
+  | "unreal_level_actor"
+  | "unreal_asset_material"
+  | "unreal_build_package"
+  | "unreal_editor_action";
 
 export interface McpToolsetBundle {
   id: string;
@@ -141,6 +159,14 @@ const LOCAL_FILE_READ_BUILT_INS = new Set([
   "read_document",
   "analyze_tabular_document",
   "query_tabular_document",
+]);
+
+const EXTERNAL_READ_MCP_TOOL_NAMES = new Set([
+  "find_gameobjects",
+  "get_sha",
+  "read_console",
+  "unity_docs",
+  "unity_reflect",
 ]);
 
 const READ_VERBS = [
@@ -238,6 +264,57 @@ const WEB_RESEARCH_TERMS = [
 const GITHUB_TERMS = ["github", "git hub", "issue", "pull request", " pr ", "repo", "repository"];
 const DATABASE_TERMS = ["sql", "sqlite", "postgres", "postgresql", "mysql", "database", "db", "table"];
 const UNITY_TERMS = ["unity", "gameobject", "prefab", "scene", "asset", "editor"];
+const GODOT_TERMS = [
+  "godot",
+  "gdscript",
+  "gds",
+  "scene",
+  "node",
+  "resource",
+  "project",
+  "editor",
+];
+const UNREAL_TERMS = [
+  "unreal",
+  " ue ",
+  "ue4",
+  "ue5",
+  "blueprint",
+  "actor",
+  "level",
+  "map",
+  "asset",
+  "editor",
+];
+const GAME_ENGINE_COMMON_TERMS = [
+  "scene",
+  "asset",
+  "editor",
+  "script",
+  "code",
+  "build",
+  "package",
+  "export",
+  "log",
+  "console",
+  "diagnostic",
+  "error",
+  "warning",
+  "场景",
+  "资源",
+  "编辑器",
+  "脚本",
+  "代码",
+  "构建",
+  "打包",
+  "导出",
+  "日志",
+  "控制台",
+  "诊断",
+  "报错",
+  "错误",
+  "警告",
+];
 const UNITY_CONSOLE_TERMS = ["console", "error", "warning", "compile", "报错", "错误", "警告", "编译"];
 const UNITY_SCRIPT_EDIT_TERMS = [
   "fix",
@@ -446,7 +523,7 @@ export function classifySkillTool(skillOrTool: SkillLike | ToolDefinition): Tool
 
 export function classifyMcpTool(tool: MCPTool, server?: MCPServer): ToolRiskLevel {
   const text = normalizeText(`${server?.name || ""} ${tool.name} ${tool.description || ""}`);
-  if (tool.name === "read_console") return "external_read";
+  if (EXTERNAL_READ_MCP_TOOL_NAMES.has(tool.name)) return "external_read";
 
   if (containsAny(text, DESTRUCTIVE_TERMS)) return "destructive";
 
@@ -658,6 +735,19 @@ function extractQueryTerms(userPrompt: string): string[] {
     "诊断",
     "符号",
     "引用",
+    "引擎",
+    "场景",
+    "节点",
+    "脚本",
+    "蓝图",
+    "关卡",
+    "资源",
+    "材质",
+    "控制台",
+    "日志",
+    "构建",
+    "打包",
+    "导出",
   ].filter((term) => userPrompt.toLowerCase().includes(term));
   return Array.from(new Set([...latinTerms, ...cjkTerms])).slice(0, 48);
 }
@@ -689,6 +779,12 @@ function scoreMcpToolForPrompt(tool: MCPTool, server: MCPServer | undefined, use
   if (containsAny(prompt, UNITY_TERMS) && containsAny(text, UNITY_TERMS)) {
     score += 12;
   }
+  if (containsAny(prompt, GODOT_TERMS) && containsAny(text, GODOT_TERMS)) {
+    score += 12;
+  }
+  if (containsAny(prompt, UNREAL_TERMS) && containsAny(text, UNREAL_TERMS)) {
+    score += 12;
+  }
   if (containsAny(prompt, UNITY_CONSOLE_TERMS) && containsAny(text, ["read_console", "console"])) {
     score += 64;
   }
@@ -697,6 +793,112 @@ function scoreMcpToolForPrompt(tool: MCPTool, server: MCPServer | undefined, use
     score += 1;
   }
 
+  return score;
+}
+
+function normalizeGameStudioMcpEngine(engine: string | null | undefined): GameStudioMcpEngine | null {
+  const normalized = String(engine || "").trim().toLowerCase();
+  if (normalized === "unity") return "unity";
+  if (normalized === "godot") return "godot";
+  if (normalized === "unreal") return "unreal";
+  return null;
+}
+
+function getGameStudioEngineTerms(engine: GameStudioMcpEngine): string[] {
+  if (engine === "godot") return GODOT_TERMS;
+  if (engine === "unreal") return UNREAL_TERMS;
+  return UNITY_TERMS;
+}
+
+function scoreGameStudioIntentToolPreference(
+  tool: MCPTool,
+  server: MCPServer | undefined,
+  intent: McpToolsetIntent,
+): number {
+  const text = normalizeText(`${server?.name || ""} ${tool.name} ${tool.description || ""}`);
+  if (/(console|output|log|diagnostic|error|warning|read_|get_|list_|inspect|控制台|日志|诊断|错误|警告)/.test(text)) {
+    if (
+      intent === "unity_console_diagnostics" ||
+      intent === "godot_console_diagnostics" ||
+      intent === "unreal_output_log_diagnostics"
+    ) {
+      return 28;
+    }
+  }
+  if (/(script|code|gdscript|c#|cpp|c\+\+|blueprint|apply|edit|patch|脚本|代码|蓝图|修改|修复)/.test(text)) {
+    if (
+      intent === "unity_script_fix" ||
+      intent === "godot_script_fix" ||
+      intent === "unreal_blueprint_or_code_fix"
+    ) {
+      return 24;
+    }
+  }
+  if (/(scene|node|gameobject|component|actor|level|map|hierarchy|camera|场景|节点|对象|组件|关卡)/.test(text)) {
+    if (
+      intent === "unity_scene_object" ||
+      intent === "godot_scene_node" ||
+      intent === "unreal_level_actor"
+    ) {
+      return 22;
+    }
+  }
+  if (/(asset|resource|prefab|material|texture|mesh|animation|资源|预制体|材质|贴图|动画)/.test(text)) {
+    if (
+      intent === "unity_asset_prefab_material" ||
+      intent === "godot_asset_resource" ||
+      intent === "unreal_asset_material"
+    ) {
+      return 18;
+    }
+  }
+  if (/(build|package|export|cook|apk|ipa|shipping|构建|打包|导出|发布)/.test(text)) {
+    if (
+      intent === "unity_build_package" ||
+      intent === "godot_build_export" ||
+      intent === "unreal_build_package"
+    ) {
+      return 18;
+    }
+  }
+  if (/(editor|menu|run|play|simulate|编辑器|菜单|运行|播放)/.test(text)) {
+    if (
+      intent === "unity_editor_action" ||
+      intent === "godot_editor_action" ||
+      intent === "unreal_editor_action"
+    ) {
+      return 16;
+    }
+  }
+  return 0;
+}
+
+function scoreGameStudioMcpToolPreference(
+  tool: MCPTool,
+  server: MCPServer | undefined,
+  userPrompt: string,
+  context?: GameStudioMcpRoutingContext,
+): number {
+  const engine = normalizeGameStudioMcpEngine(context?.engine);
+  if (!engine) return 0;
+  const prompt = normalizeText(userPrompt);
+  const text = normalizeText(`${server?.name || ""} ${tool.name} ${tool.description || ""}`);
+  const engineTerms = getGameStudioEngineTerms(engine);
+  const selectedIntent = inferGameStudioMcpToolsetIntent(userPrompt, context);
+  const bundle = buildGameStudioMcpToolsetBundle(selectedIntent, context);
+  let score = 0;
+
+  if (containsAny(text, engineTerms)) score += 36;
+  if (containsAny(text, GAME_ENGINE_COMMON_TERMS)) score += 6;
+  if (containsAny(prompt, GAME_ENGINE_COMMON_TERMS) && containsAny(text, GAME_ENGINE_COMMON_TERMS)) {
+    score += 10;
+  }
+  if (bundle?.requiredTools.includes(tool.name)) score += 56;
+  if (bundle?.preferredTools.includes(tool.name)) score += 34;
+  score += scoreGameStudioIntentToolPreference(tool, server, selectedIntent);
+  if (engine === "unity") {
+    score += scoreUnityStructuredEditPreference(tool, userPrompt, context);
+  }
   return score;
 }
 
@@ -711,6 +913,38 @@ function scoreUnityStructuredEditPreference(
   if (tool.name === "script_apply_edits") return 48;
   if (tool.name === "apply_text_edits") return -48;
   return 0;
+}
+
+function compareGameStudioPriorityToolNames(
+  left: MCPTool,
+  right: MCPTool,
+  context?: GameStudioMcpRoutingContext,
+): number {
+  const engine = normalizeGameStudioMcpEngine(context?.engine);
+  if (engine === "unity") return compareUnityPriorityToolNames(left, right, context);
+
+  const rank = (tool: MCPTool): number => {
+    const text = normalizeText(`${tool.name} ${tool.description || ""}`);
+    if (/(console|output|log|diagnostic|error|warning|read_|get_|list_|inspect|控制台|日志|诊断|错误|警告)/.test(text)) {
+      return 200;
+    }
+    if (/(scene|node|actor|level|map|hierarchy|asset|resource|blueprint|场景|节点|关卡|资源|蓝图)/.test(text)) {
+      return 170;
+    }
+    if (/(script|code|gdscript|c#|cpp|c\+\+|edit|apply|patch|脚本|代码|修改|修复)/.test(text)) {
+      return 150;
+    }
+    if (/(build|package|export|cook|构建|打包|导出|发布)/.test(text)) {
+      return 120;
+    }
+    if (/(editor|menu|run|play|simulate|编辑器|菜单|运行|播放)/.test(text)) {
+      return 110;
+    }
+    return 100;
+  };
+  const rankDelta = rank(right) - rank(left);
+  if (rankDelta !== 0) return rankDelta;
+  return left.name.localeCompare(right.name);
 }
 
 function compareUnityPriorityToolNames(
@@ -733,7 +967,17 @@ function compareUnityPriorityToolNames(
   return left.name.localeCompare(right.name);
 }
 
-const UNITY_TOOLSET_BUNDLES: Record<Exclude<McpToolsetIntent, "general">, McpToolsetBundle> = {
+type UnityMcpToolsetIntent = Extract<
+  McpToolsetIntent,
+  | "unity_console_diagnostics"
+  | "unity_script_fix"
+  | "unity_scene_object"
+  | "unity_asset_prefab_material"
+  | "unity_build_package"
+  | "unity_editor_action"
+>;
+
+const UNITY_TOOLSET_BUNDLES: Record<UnityMcpToolsetIntent, McpToolsetBundle> = {
   unity_console_diagnostics: {
     id: "unity_console_diagnostics",
     intent: "unity_console_diagnostics",
@@ -859,6 +1103,311 @@ function inferUnityMcpToolsetIntent(
   return "unity_console_diagnostics";
 }
 
+function inferGameStudioMcpToolsetIntent(
+  userPrompt: string,
+  context?: GameStudioMcpRoutingContext,
+): McpToolsetIntent {
+  const engine = normalizeGameStudioMcpEngine(context?.engine);
+  if (engine === "unity") return inferUnityMcpToolsetIntent(userPrompt, context);
+
+  const prompt = normalizeText(userPrompt);
+  const hasConsoleIntent = containsAny(prompt, [
+    ...UNITY_CONSOLE_TERMS,
+    "log",
+    "output",
+    "diagnostic",
+    "crash",
+    "trace",
+    "stack",
+    "日志",
+    "控制台",
+    "输出",
+    "诊断",
+    "崩溃",
+    "堆栈",
+  ]);
+  const hasFixVerb = containsAny(prompt, [
+    "fix",
+    "repair",
+    "patch",
+    "edit",
+    "modify",
+    "refactor",
+    "resolve",
+    "修复",
+    "补丁",
+    "修改",
+    "改",
+    "解决",
+  ]);
+
+  if (engine === "godot") {
+    const hasScriptIntent =
+      containsAny(prompt, ["script", "gdscript", "gds", "c#", "cs", "code", "脚本", "代码"]) ||
+      (hasFixVerb && containsAny(prompt, ["compile", "error", "报错", "错误", "编译"]));
+    if (hasConsoleIntent && hasScriptIntent) return "godot_script_fix";
+    if (hasScriptIntent) return "godot_script_fix";
+    if (containsAny(prompt, ["build", "export", "package", "apk", "ipa", "构建", "导出", "打包", "发布"])) {
+      return "godot_build_export";
+    }
+    if (containsAny(prompt, ["resource", "asset", "material", "texture", "shader", "资源", "材质", "贴图", "着色器"])) {
+      return "godot_asset_resource";
+    }
+    if (containsAny(prompt, ["scene", "node", "camera", "control", "canvas", "场景", "节点", "相机", "控件", "画布"])) {
+      return "godot_scene_node";
+    }
+    if (containsAny(prompt, ["editor", "menu", "run", "play", "编辑器", "菜单", "运行", "播放"])) {
+      return "godot_editor_action";
+    }
+    if (hasConsoleIntent) return "godot_console_diagnostics";
+    return "godot_scene_node";
+  }
+
+  if (engine === "unreal") {
+    const hasScriptIntent =
+      containsAny(prompt, ["blueprint", "c++", "cpp", "script", "code", "蓝图", "脚本", "代码"]) ||
+      (hasFixVerb && containsAny(prompt, ["compile", "error", "报错", "错误", "编译"]));
+    if (hasConsoleIntent && hasScriptIntent) return "unreal_blueprint_or_code_fix";
+    if (hasScriptIntent) return "unreal_blueprint_or_code_fix";
+    if (containsAny(prompt, ["build", "package", "cook", "shipping", "构建", "打包", "烘焙", "发布"])) {
+      return "unreal_build_package";
+    }
+    if (containsAny(prompt, ["asset", "material", "texture", "mesh", "animation", "资源", "材质", "贴图", "网格", "动画"])) {
+      return "unreal_asset_material";
+    }
+    if (containsAny(prompt, ["level", "actor", "map", "pawn", "component", "camera", "关卡", "蓝图", "角色", "组件", "相机"])) {
+      return "unreal_level_actor";
+    }
+    if (containsAny(prompt, ["editor", "menu", "run", "play", "simulate", "编辑器", "菜单", "运行", "播放", "模拟"])) {
+      return "unreal_editor_action";
+    }
+    if (hasConsoleIntent) return "unreal_output_log_diagnostics";
+    return "unreal_level_actor";
+  }
+
+  return "general";
+}
+
+function buildGameStudioMcpToolsetBundle(
+  intent: McpToolsetIntent,
+  context?: GameStudioMcpRoutingContext,
+): McpToolsetBundle | null {
+  const engine = normalizeGameStudioMcpEngine(context?.engine);
+  if (engine === "unity" && intent !== "general" && intent in UNITY_TOOLSET_BUNDLES) {
+    return UNITY_TOOLSET_BUNDLES[intent as UnityMcpToolsetIntent];
+  }
+  if (engine === "godot") {
+    switch (intent) {
+      case "godot_console_diagnostics":
+        return {
+          id: "godot_console_diagnostics",
+          intent,
+          requiredTools: [],
+          preferredTools: [
+            "godot_read_output",
+            "read_output",
+            "read_console",
+            "get_errors",
+            "get_diagnostics",
+            "read_editor_log",
+            "godot_get_errors",
+            "godot_get_diagnostics",
+          ],
+          maxTools: 8,
+        };
+      case "godot_script_fix":
+        return {
+          id: "godot_script_fix",
+          intent,
+          requiredTools: [],
+          preferredTools: [
+            "godot_edit_script",
+            "edit_script",
+            "apply_text_edits",
+            "manage_script",
+            "read_script",
+            "godot_get_script",
+            "godot_apply_patch",
+            "godot_read_output",
+            "read_output",
+            "get_errors",
+          ],
+          maxTools: 12,
+        };
+      case "godot_asset_resource":
+        return {
+          id: "godot_asset_resource",
+          intent,
+          requiredTools: [],
+          preferredTools: [
+            "godot_list_resources",
+            "list_resources",
+            "inspect_resource",
+            "edit_resource",
+            "manage_resource",
+            "manage_asset",
+            "manage_material",
+            "import_asset",
+          ],
+          maxTools: 10,
+        };
+      case "godot_build_export":
+        return {
+          id: "godot_build_export",
+          intent,
+          requiredTools: [],
+          preferredTools: [
+            "godot_export_project",
+            "export_project",
+            "build_project",
+            "run_project",
+            "godot_read_output",
+            "read_output",
+          ],
+          maxTools: 10,
+        };
+      case "godot_editor_action":
+        return {
+          id: "godot_editor_action",
+          intent,
+          requiredTools: [],
+          preferredTools: [
+            "godot_editor_action",
+            "run_project",
+            "play_scene",
+            "reload_project",
+            "execute_editor_command",
+            "godot_read_output",
+            "read_output",
+          ],
+          maxTools: 10,
+        };
+      case "godot_scene_node":
+      default:
+        return {
+          id: "godot_scene_node",
+          intent: "godot_scene_node",
+          requiredTools: [],
+          preferredTools: [
+            "godot_get_scene_tree",
+            "get_scene_tree",
+            "list_nodes",
+            "find_nodes",
+            "inspect_scene",
+            "inspect_node",
+            "manage_node",
+            "edit_node",
+            "manage_scene",
+            "godot_read_output",
+          ],
+          maxTools: 12,
+        };
+    }
+  }
+  if (engine === "unreal") {
+    switch (intent) {
+      case "unreal_output_log_diagnostics":
+        return {
+          id: "unreal_output_log_diagnostics",
+          intent,
+          requiredTools: [],
+          preferredTools: [
+            "unreal_read_output_log",
+            "read_output_log",
+            "read_log",
+            "get_errors",
+            "get_diagnostics",
+            "unreal_get_diagnostics",
+          ],
+          maxTools: 8,
+        };
+      case "unreal_blueprint_or_code_fix":
+        return {
+          id: "unreal_blueprint_or_code_fix",
+          intent,
+          requiredTools: [],
+          preferredTools: [
+            "unreal_read_output_log",
+            "read_output_log",
+            "find_blueprints",
+            "inspect_blueprint",
+            "edit_blueprint",
+            "compile_blueprint",
+            "apply_text_edits",
+            "find_symbols",
+          ],
+          maxTools: 12,
+        };
+      case "unreal_asset_material":
+        return {
+          id: "unreal_asset_material",
+          intent,
+          requiredTools: [],
+          preferredTools: [
+            "list_assets",
+            "find_assets",
+            "inspect_asset",
+            "edit_asset",
+            "manage_asset",
+            "manage_material",
+            "import_asset",
+          ],
+          maxTools: 10,
+        };
+      case "unreal_build_package":
+        return {
+          id: "unreal_build_package",
+          intent,
+          requiredTools: [],
+          preferredTools: [
+            "package_project",
+            "build_project",
+            "cook_content",
+            "run_automation_test",
+            "unreal_read_output_log",
+            "read_output_log",
+          ],
+          maxTools: 10,
+        };
+      case "unreal_editor_action":
+        return {
+          id: "unreal_editor_action",
+          intent,
+          requiredTools: [],
+          preferredTools: [
+            "execute_editor_command",
+            "run_editor_utility",
+            "play_in_editor",
+            "simulate",
+            "unreal_read_output_log",
+            "read_output_log",
+          ],
+          maxTools: 10,
+        };
+      case "unreal_level_actor":
+      default:
+        return {
+          id: "unreal_level_actor",
+          intent: "unreal_level_actor",
+          requiredTools: [],
+          preferredTools: [
+            "unreal_find_actors",
+            "find_actors",
+            "list_actors",
+            "inspect_actor",
+            "edit_actor",
+            "manage_actor",
+            "inspect_level",
+            "manage_level",
+            "unreal_read_output_log",
+          ],
+          maxTools: 12,
+        };
+    }
+  }
+  return null;
+}
+
 function selectToolsByName(tools: MCPTool[], names: string[]): MCPTool[] {
   const byName = new Map(tools.map((tool) => [tool.name, tool]));
   const selected: MCPTool[] = [];
@@ -933,6 +1482,7 @@ export function routeMcpToolsForPrompt(params: {
   preferredServerUrls?: string[];
   forceFirstTools?: string[];
   unityRoutingContext?: UnityMcpRoutingContext;
+  gameStudioRoutingContext?: GameStudioMcpRoutingContext;
 }): { tools: MCPTool[]; telemetry: McpRoutingTelemetry } {
   const startedAt = Date.now();
   const config = normalizeMcpRoutingConfig(params.config);
@@ -978,7 +1528,15 @@ export function routeMcpToolsForPrompt(params: {
 
   if (!config.enabled) return finish(enabledTools, "disabled");
 
-  if (params.priorityMode === "unity_mcp_first") {
+  if (params.priorityMode === "unity_mcp_first" || params.priorityMode === "game_studio_mcp_first") {
+    const gameStudioRoutingContext: GameStudioMcpRoutingContext = {
+      ...(params.unityRoutingContext ?? {}),
+      ...(params.gameStudioRoutingContext ?? {}),
+      engine: params.gameStudioRoutingContext?.engine ?? (
+        params.priorityMode === "unity_mcp_first" ? "unity" : params.gameStudioRoutingContext?.engine
+      ),
+    };
+    const priorityEngine = normalizeGameStudioMcpEngine(gameStudioRoutingContext.engine);
     const preferredServerUrls = new Set(
       (params.preferredServerUrls ?? []).filter((url) => typeof url === "string" && url.trim().length > 0),
     );
@@ -988,21 +1546,23 @@ export function routeMcpToolsForPrompt(params: {
     const candidateTools = scopedTools.length > 0 ? scopedTools : enabledTools;
 
     const serverByUrl = buildServerLookup(params.servers);
-    const scoredTools = candidateTools
+    const scoredEntries = candidateTools
       .map((tool) => {
         const server = serverByUrl[params.toolServerMap[tool.name]];
         return {
           tool,
           score:
             scoreMcpToolForPrompt(tool, server, params.userPrompt) +
-            scoreUnityStructuredEditPreference(tool, params.userPrompt, params.unityRoutingContext),
+            scoreGameStudioMcpToolPreference(tool, server, params.userPrompt, gameStudioRoutingContext),
         };
-      })
-      .sort((a, b) => b.score - a.score || compareUnityPriorityToolNames(a.tool, b.tool, params.unityRoutingContext))
+      });
+    const scoredTools = scoredEntries
+      .filter((entry) => entry.score > 0 || preferredServerUrls.has(params.toolServerMap[entry.tool.name] || ""))
+      .sort((a, b) => b.score - a.score || compareGameStudioPriorityToolNames(a.tool, b.tool, gameStudioRoutingContext))
       .map((entry) => entry.tool);
 
-    const selectedIntent = inferUnityMcpToolsetIntent(params.userPrompt, params.unityRoutingContext);
-    const bundle = selectedIntent === "general" ? null : UNITY_TOOLSET_BUNDLES[selectedIntent];
+    const selectedIntent = inferGameStudioMcpToolsetIntent(params.userPrompt, gameStudioRoutingContext);
+    const bundle = buildGameStudioMcpToolsetBundle(selectedIntent, gameStudioRoutingContext);
     const forcedNames = Array.from(new Set([
       ...(params.forceFirstTools ?? []),
       ...(bundle?.requiredTools ?? []),
@@ -1024,7 +1584,7 @@ export function routeMcpToolsForPrompt(params: {
     if (prioritized.length > 0) {
       return finish(prioritized, "heuristic", undefined, {
         selectedIntent,
-        selectedBundle: bundle?.id ?? "unity_scored",
+        selectedBundle: bundle?.id ?? `${priorityEngine ?? "game_studio"}_scored`,
       });
     }
 
@@ -1033,16 +1593,16 @@ export function routeMcpToolsForPrompt(params: {
       return finish(
         fallbackTools.length > 0 ? fallbackTools : enabledTools.slice(0, Math.min(config.threshold, 16)),
         "fallback_full_list",
-        "unity_priority_no_candidates",
+        `${priorityEngine ?? "game_studio"}_priority_no_candidates`,
         {
           selectedIntent,
-          selectedBundle: bundle?.id ?? "unity_scored",
+          selectedBundle: bundle?.id ?? `${priorityEngine ?? "game_studio"}_scored`,
         },
       );
     }
-    return finish([], "safe_empty", "unity_priority_no_candidates", {
+    return finish([], "safe_empty", `${priorityEngine ?? "game_studio"}_priority_no_candidates`, {
       selectedIntent,
-      selectedBundle: bundle?.id ?? "unity_scored",
+      selectedBundle: bundle?.id ?? `${priorityEngine ?? "game_studio"}_scored`,
     });
   }
 

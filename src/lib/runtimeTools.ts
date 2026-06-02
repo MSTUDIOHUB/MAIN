@@ -62,6 +62,7 @@ export type SessionAutoApproveScope =
   | "workspace_write"
   | "shell"
   | "local_file_read"
+  | "external_write"
   | "browser_control";
 
 export interface RuntimeToolPlanResult {
@@ -100,6 +101,8 @@ function scopeForRisk(risk: ToolRiskLevel): SessionAutoApproveScope | null {
       return "shell";
     case "local_file_read":
       return "local_file_read";
+    case "external_write":
+      return "external_write";
     case "browser_control":
       return "browser_control";
     default:

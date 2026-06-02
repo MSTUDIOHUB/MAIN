@@ -302,8 +302,20 @@ function nowMs() {
 
 
 
-const SESSION_AUTO_APPROVE_SCOPE_SET = new Set<SessionAutoApproveScope>(["workspace_write", "shell", "local_file_read", "browser_control"]);
-const DEFAULT_SESSION_AUTO_APPROVE_SCOPES: SessionAutoApproveScope[] = ["workspace_write", "shell", "local_file_read", "browser_control"];
+const SESSION_AUTO_APPROVE_SCOPE_SET = new Set<SessionAutoApproveScope>([
+  "workspace_write",
+  "shell",
+  "local_file_read",
+  "external_write",
+  "browser_control",
+]);
+const DEFAULT_SESSION_AUTO_APPROVE_SCOPES: SessionAutoApproveScope[] = [
+  "workspace_write",
+  "shell",
+  "local_file_read",
+  "external_write",
+  "browser_control",
+];
 
 function normalizeSessionAutoApproveScopes(value: unknown): SessionAutoApproveScope[] {
   if (!Array.isArray(value)) return [];
@@ -322,6 +334,17 @@ function normalizeSessionAutoApproveScopes(value: unknown): SessionAutoApproveSc
 
 function buildSessionAutoApproveScopes(enabled: boolean): SessionAutoApproveScope[] {
   return enabled ? [...DEFAULT_SESSION_AUTO_APPROVE_SCOPES] : [];
+}
+
+function buildEffectiveSessionAutoApproveScopes(
+  autoApproveTools: boolean | undefined,
+  value: unknown,
+): SessionAutoApproveScope[] {
+  const scopes = normalizeSessionAutoApproveScopes(value);
+  if (autoApproveTools === true) {
+    return normalizeSessionAutoApproveScopes([...DEFAULT_SESSION_AUTO_APPROVE_SCOPES, ...scopes]);
+  }
+  return scopes;
 }
 
 
@@ -1662,12 +1685,10 @@ export function normalizeSessionRuntimeSnapshot(
       (snapshot as Partial<SessionRuntimeSnapshot> & { selectedAgentKey?: string }).selectedNexusModeKey ||
       (snapshot as Partial<SessionRuntimeSnapshot> & { selectedAgentKey?: string }).selectedAgentKey,
   );
-  const normalizedAutoApproveToolScopes = normalizeSessionAutoApproveScopes(snapshot.autoApproveToolScopes);
-  const effectiveAutoApproveToolScopes = normalizedAutoApproveToolScopes.length > 0
-    ? normalizedAutoApproveToolScopes
-    : snapshot.autoApproveTools === true
-    ? buildSessionAutoApproveScopes(true)
-    : [];
+  const effectiveAutoApproveToolScopes = buildEffectiveSessionAutoApproveScopes(
+    snapshot.autoApproveTools === true,
+    snapshot.autoApproveToolScopes,
+  );
   const taskFlow = sanitizeTaskBlocksForPersist(snapshot.taskFlow || []);
   const normalizedContextMemoryState = normalizeContextMemoryState(snapshot.contextMemoryState);
   const queuedUserMessage = normalizeQueuedUserMessage(snapshot.queuedUserMessage);
@@ -1858,11 +1879,10 @@ function createSessionRuntimeFromState(state: Partial<AppState>): SessionRuntime
         ...(normalizedContextMemoryLaneMap[runtimeLaneKey] ? {} : { [runtimeLaneKey]: normalizedContextMemoryState }),
       }
     : normalizedContextMemoryLaneMap;
-  const normalizedAutoApproveToolScopes = (() => {
-    const scopes = normalizeSessionAutoApproveScopes(state.autoApproveToolScopes);
-    if (scopes.length > 0) return scopes;
-    return state.autoApproveTools === true ? buildSessionAutoApproveScopes(true) : [];
-  })();
+  const normalizedAutoApproveToolScopes = buildEffectiveSessionAutoApproveScopes(
+    state.autoApproveTools === true,
+    state.autoApproveToolScopes,
+  );
   return {
     runtimeEventSchemaVersion: 1,
     runtimeEvents: normalizeRuntimeEvents(state.runtimeEvents),
@@ -5980,21 +6000,24 @@ export const useAppStore = create<AppState>()(
     const pendingLocalFileReadPath = normalizeLocalFileReadPath(state.pendingToolCall?.localFileReadPath);
     const pendingShellDecision = state.pendingToolCall?.shellPermissionDecision || null;
     const shellRules = suggestedShellPermissionRules(pendingShellDecision);
-    if (!pendingLocalFileReadPath) {
-      if (shellRules.length > 0) {
-        set((s) => ({
-          approvedShellPermissionRules: [
-            ...s.approvedShellPermissionRules,
-            ...shellRules.filter((rule) => !s.approvedShellPermissionRules.includes(rule)),
-          ],
-        }));
-      } else {
-        set({
-          autoApproveTools: true,
-          autoApproveToolScopes: buildSessionAutoApproveScopes(true),
-        });
-      }
-    }
+    set((s) => ({
+      autoApproveTools: true,
+      autoApproveToolScopes: buildSessionAutoApproveScopes(true),
+      approvedLocalFileReadPaths:
+        pendingLocalFileReadPath && !isLocalFileReadApproved(pendingLocalFileReadPath, s.approvedLocalFileReadPaths)
+          ? [...s.approvedLocalFileReadPaths, pendingLocalFileReadPath]
+          : s.approvedLocalFileReadPaths,
+      approvedShellPermissionRules: [
+        ...s.approvedShellPermissionRules,
+        ...shellRules.filter((rule) => !s.approvedShellPermissionRules.includes(rule)),
+      ],
+    }));
+    logStoreEvent("auto_review_enabled_pending_review_approved", {
+      taskId: state.pendingReviewTaskId,
+      toolName: state.pendingToolCall?.name || null,
+      localFileRead: !!pendingLocalFileReadPath,
+      shellRules: shellRules.length,
+    });
     if (state.pendingReviewTaskId != null) {
       get().allowToolAction(state.pendingReviewTaskId);
     }

@@ -48,7 +48,9 @@ export type GameStudioPromptContext = {
 };
 
 export type McpPriorityPromptContext = {
+  gameStudioMcpFirst?: boolean;
   unityMcpFirst?: boolean;
+  engine?: "unity" | "godot" | "unreal" | string | null;
   unityConsoleFirst?: boolean;
   connectedServerNames?: string[];
 };
@@ -74,6 +76,36 @@ function languageName(language: Lang | undefined, fallback: Lang = "zh"): string
   return (language === "en" ? "en" : language === "zh" ? "zh" : fallback) === "en"
     ? "English"
     : "简体中文";
+}
+
+function normalizePromptEngine(engine?: string | null): "unity" | "godot" | "unreal" | null {
+  const normalized = String(engine || "").trim().toLowerCase();
+  if (normalized === "unity") return "unity";
+  if (normalized === "godot") return "godot";
+  if (normalized === "unreal") return "unreal";
+  return null;
+}
+
+function formatPromptEngineName(engine?: string | null): string {
+  const normalized = normalizePromptEngine(engine);
+  if (normalized === "unity") return "Unity";
+  if (normalized === "godot") return "Godot";
+  if (normalized === "unreal") return "Unreal";
+  return "configured game engine";
+}
+
+function buildGameStudioEngineWorkflowContract(engine?: string | null): string {
+  const normalized = normalizePromptEngine(engine);
+  if (normalized === "unity") {
+    return "Unity workflow contract: Game Studio 负责概念/GDD/架构/Story/Review/QA/Release 和 Unity 专家路由；Unity Editor/场景/资产修改优先走 Unity MCP；改 prefab/scene/YAML 前必须先查引用和当前资产；C# 符号/引用理解优先走 Roslyn 能力；缺少相关工具时要明确说明能力缺口。";
+  }
+  if (normalized === "godot") {
+    return "Godot workflow contract: Game Studio 负责概念/GDD/架构/Story/Review/QA/Release 和 Godot 专家路由；Godot 场景/节点/资源/脚本/导出操作优先走 Godot MCP 或编辑器工具；修改 .tscn/.tres/.gd 前必须先检查当前节点树、资源引用与诊断输出；缺少相关工具时要明确说明能力缺口。";
+  }
+  if (normalized === "unreal") {
+    return "Unreal workflow contract: Game Studio 负责概念/GDD/架构/Story/Review/QA/Release 和 Unreal 专家路由；Unreal 关卡/Actor/资产/蓝图/打包操作优先走 Unreal MCP 或编辑器工具；修改 Blueprint/C++/关卡资产前必须先检查当前对象、引用与 Output Log；缺少相关工具时要明确说明能力缺口。";
+  }
+  return "";
 }
 
 export function buildLanguageContract(input: {
@@ -421,19 +453,35 @@ export function buildSystemPrompt(
     ].filter(Boolean).join("\n"));
   }
 
-  if (mcpPriorityContext?.unityMcpFirst) {
+  const mcpPriorityEngine = normalizePromptEngine(mcpPriorityContext?.engine) ?? (
+    mcpPriorityContext?.unityMcpFirst ? "unity" : null
+  );
+  const mcpPriorityEngineName = formatPromptEngineName(mcpPriorityEngine);
+  if (mcpPriorityContext?.gameStudioMcpFirst || mcpPriorityContext?.unityMcpFirst) {
     parts.push([
       "================================",
-      "[UNITY MCP PRIORITY]",
-      `unityMcpFirst: true`,
-      `unityConsoleFirst: ${mcpPriorityContext.unityConsoleFirst ? "true" : "false"}`,
-      mcpPriorityContext.connectedServerNames?.length
-        ? `connectedUnityMcpServers: ${mcpPriorityContext.connectedServerNames.join(", ")}`
+      "[ENGINE MCP PRIORITY]",
+      `gameStudioMcpFirst: ${mcpPriorityContext.gameStudioMcpFirst ? "true" : "false"}`,
+      mcpPriorityEngine ? `engine: ${mcpPriorityEngine}` : "",
+      mcpPriorityEngine === "unity"
+        ? `unityConsoleFirst: ${mcpPriorityContext.unityConsoleFirst ? "true" : "false"}`
         : "",
-      "For Unity requests in this turn, prioritize Unity MCP tools before local workspace scan tools.",
-      "For Unity C# edits, prefer script_apply_edits. Use apply_text_edits only for precise coordinate patches with precondition SHA.",
-      "Do not start with get_project_skeleton or local log file scanning when Unity MCP is available.",
-      mcpPriorityContext.unityConsoleFirst
+      mcpPriorityContext.connectedServerNames?.length
+        ? `connectedEngineMcpServers: ${mcpPriorityContext.connectedServerNames.join(", ")}`
+        : "",
+      `For ${mcpPriorityEngineName} requests in this turn, prioritize matching engine MCP/editor tools before local workspace scan tools when those tools are listed.`,
+      "Use engine MCP tools for live editor state, scene/level inspection, asset/resource queries, diagnostics, build/export/package operations, and editor actions before falling back to raw files.",
+      mcpPriorityEngine === "unity"
+        ? "For Unity C# edits, prefer script_apply_edits. Use apply_text_edits only for precise coordinate patches with precondition SHA."
+        : "",
+      mcpPriorityEngine === "godot"
+        ? "For Godot work, inspect scene trees, nodes, resources, scripts, and editor output with Godot MCP/editor tools when available before editing .tscn, .tres, or .gd files."
+        : "",
+      mcpPriorityEngine === "unreal"
+        ? "For Unreal work, inspect levels, actors, assets, Blueprints, C++ diagnostics, and Output Log with Unreal MCP/editor tools when available before editing project files."
+        : "",
+      "Do not start with get_project_skeleton or local log file scanning when a relevant engine MCP tool is available for the requested state.",
+      mcpPriorityEngine === "unity" && mcpPriorityContext.unityConsoleFirst
         ? "This request is a Unity console diagnostics task: call read_console first (set_active_instance when required) before any other investigation path."
         : "",
     ].filter(Boolean).join("\n"));
@@ -502,6 +550,7 @@ export function buildSystemPrompt(
     const activeStudioAgent = gameStudioContext?.activeStudioAgentKey ?? "studio_auto";
     const pendingSlashCommand = gameStudioContext?.pendingSlashCommand;
     const studioConfig = gameStudioContext?.studioConfig ?? null;
+    const gameStudioEngineWorkflowContract = buildGameStudioEngineWorkflowContract(studioConfig?.engine);
     parts.push([
       "================================",
       "[MAIN GAME STUDIO]",
@@ -517,9 +566,7 @@ export function buildSystemPrompt(
       "ruleRoot: .MAIN/rules/game-studio",
       "hookConfig: .MAIN/hooks.json",
       "templateLoading: game-studio templates are stored on disk and must be read on demand; they are not auto-injected into every prompt.",
-      studioConfig?.engine === "unity"
-        ? "Unity workflow contract: Game Studio 负责概念/GDD/架构/Story/Review/QA/Release 和 Unity 专家路由；Unity Editor/场景/资产修改优先走 Unity MCP；改 prefab/scene/YAML 前必须先查引用和当前资产；C# 符号/引用理解优先走 Roslyn 能力；缺少相关工具时要明确说明能力缺口。"
-        : "",
+      gameStudioEngineWorkflowContract,
       gameStudioContext?.initialized
         ? "Game Studio Pack 已初始化，可直接读取上述协议与模板。"
         : "Game Studio Pack 尚未初始化；当用户显式开始工作室流程时，应优先引导其初始化或使用 `/start`。",

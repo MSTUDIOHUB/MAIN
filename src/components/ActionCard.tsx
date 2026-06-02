@@ -418,11 +418,9 @@ export default function ActionCard({ blockId, toolName, target, toolStatus, mess
                 className="w-3.5 h-3.5 rounded border-[#3f3f46] bg-[#000000] accent-[var(--accent)] cursor-pointer"
               />
                 <span className="text-[11px] text-[#71717a] group-hover:text-[#a1a1aa] transition-colors">
-                  {toolName === "read_file" || toolName === "read_document" || toolName === "analyze_tabular_document" || toolName === "query_tabular_document"
-                    ? language === "zh" ? "允许后，本会话内不再重复询问这个文件" : "After allowing, this file will stay approved for this session"
-                  : language === "zh"
-                    ? "本会话内自动允许后续写入、命令和浏览器验证（高风险仍逐项审查）"
-                    : "Auto-allow writes, commands, and browser validation in this session (high-risk still reviewed per step)"}
+                  {language === "zh"
+                    ? "开启自动审查并批准当前请求；本会话后续非破坏性工具会自动继续"
+                    : "Turn on Auto Review and approve this request; later non-destructive tools continue automatically"}
                 </span>
               </label>
             </div>

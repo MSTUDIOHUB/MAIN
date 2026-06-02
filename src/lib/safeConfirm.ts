@@ -1,4 +1,6 @@
 import { appendDebugLog } from "./debugLog";
+import { isTauri } from "@tauri-apps/api/core";
+import { confirm as tauriConfirm } from "@tauri-apps/plugin-dialog";
 
 interface SafeConfirmOptions {
   source: string;
@@ -54,4 +56,28 @@ export function safeConfirm(message: string, options: SafeConfirmOptions): boole
     });
     return false;
   }
+}
+
+export async function safeConfirmAsync(message: string, options: SafeConfirmOptions): Promise<boolean> {
+  if (isTauri()) {
+    try {
+      return await tauriConfirm(message, {
+        title: "MAIN",
+        kind: "warning",
+        okLabel: "OK",
+        cancelLabel: "Cancel",
+      });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error || "");
+      appendDebugLog("warn", "ui.confirm", {
+        source: options.source,
+        action: options.action,
+        commandName: options.commandName || extractAclCommandName(errorMessage) || "plugin:dialog|message",
+        error: errorMessage || "confirm_failed",
+      });
+      return false;
+    }
+  }
+
+  return safeConfirm(message, options);
 }

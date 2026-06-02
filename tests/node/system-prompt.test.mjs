@@ -499,6 +499,46 @@ test("game studio prompt exposes protocol paths and sticky specialist context", 
   assert.match(prompt, /Game Studio Pack 已初始化/);
 });
 
+test("game studio prompt gives engine-specific MCP workflow contracts for Godot", () => {
+  const prompt = buildSystemPrompt(
+    [],
+    "/tmp/workspace",
+    "nexus_game_studio",
+    "",
+    [],
+    [],
+    "chat",
+    "zh",
+    null,
+    {
+      initialized: true,
+      activeStudioAgentKey: "godot-specialist",
+      pendingSlashCommand: null,
+      studioConfig: {
+        engine: "godot",
+        engineLanguage: "GDScript",
+        engineVersion: "4.3",
+      },
+    },
+    "respond",
+    "english_core_localized_output",
+    ["read_file", "godot_get_scene_tree"],
+    null,
+    {
+      gameStudioMcpFirst: true,
+      engine: "godot",
+      connectedServerNames: ["Godot MCP"],
+    },
+  );
+
+  assert.match(prompt, /\[ENGINE MCP PRIORITY\]/);
+  assert.match(prompt, /engine: godot/);
+  assert.match(prompt, /connectedEngineMcpServers: Godot MCP/);
+  assert.match(prompt, /prioritize matching engine MCP\/editor tools/);
+  assert.match(prompt, /Godot workflow contract/);
+  assert.match(prompt, /Godot 场景\/节点\/资源\/脚本\/导出操作优先走 Godot MCP/);
+});
+
 test("execute prompt forbids pseudo tool call placeholders", () => {
   const prompt = buildSystemPrompt(
     [],
@@ -574,7 +614,8 @@ test("Unity MCP-first prompt explicitly prioritizes read_console over local scan
     },
   );
 
-  assert.match(prompt, /\[UNITY MCP PRIORITY\]/);
+  assert.match(prompt, /\[ENGINE MCP PRIORITY\]/);
+  assert.match(prompt, /engine: unity/);
   assert.match(prompt, /Do not start with get_project_skeleton or local log file scanning/);
   assert.match(prompt, /call read_console first/);
   assert.match(prompt, /prefer script_apply_edits/i);
