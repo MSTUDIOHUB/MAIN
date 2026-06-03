@@ -17,7 +17,10 @@ export default function ImageGenerationCard({
   const themeMode = useAppStore((s) => s.config.themeMode);
   const isLight = themeMode === "light";
   const imageStudio = useAppStore((s) => s.imageStudio);
-  const isHosted = block.params?.engine === "huggingface_space";
+  const isWebFallback = block.providerKind === "web_fallback" || block.params?.providerKind === "web_fallback";
+  const providerLabel = isWebFallback
+    ? (language === "en" ? "HiDream Web" : "HiDream 网页")
+    : (language === "en" ? "Local Image Service" : "本地图片服务");
 
   const [editablePrompt, setEditablePrompt] = useState(block.prompt || "");
 
@@ -28,7 +31,7 @@ export default function ImageGenerationCard({
   const [cooldownSec, setCooldownSec] = useState(0);
 
   useEffect(() => {
-    if (!isHosted || !imageStudio.cooldownUntil) {
+    if (!isWebFallback || !imageStudio.cooldownUntil) {
       setCooldownSec(0);
       return;
     }
@@ -40,7 +43,7 @@ export default function ImageGenerationCard({
       }
     }, 200);
     return () => clearInterval(interval);
-  }, [isHosted, imageStudio.cooldownUntil]);
+  }, [isWebFallback, imageStudio.cooldownUntil]);
   const copy = useMemo(() => ({
     queued: language === "en" ? "Queued" : "排队中",
     running: language === "en" ? "Generating" : "生成中",
@@ -53,7 +56,7 @@ export default function ImageGenerationCard({
     open: language === "en" ? "Open image" : "打开图片",
     copyPrompt: language === "en" ? "Copy prompt" : "复制提示词",
     regenerate: language === "en" ? "Regenerate" : "重新生成",
-    waiting: language === "en" ? "Waiting for the image engine" : "等待图像引擎返回结果",
+    waiting: language === "en" ? "Waiting for the image provider" : "等待图片 provider 返回结果",
   }), [language]);
 
   useEffect(() => {
@@ -98,7 +101,7 @@ export default function ImageGenerationCard({
           </div>
           <div className="min-w-0">
             <div className="text-[13px] font-semibold" style={titleStyle}>{language === "en" ? "Image Studio" : "图像工作室"}</div>
-            <div className="truncate text-[11px]" style={mutedStyle}>{statusLabel}</div>
+            <div className="truncate text-[11px]" style={mutedStyle}>{providerLabel} · {statusLabel}</div>
           </div>
         </div>
         <div className="flex items-center gap-2 text-[11px]" style={mutedStyle}>
@@ -132,10 +135,14 @@ export default function ImageGenerationCard({
           <div>
             <div className="mb-1 text-[10px] font-semibold uppercase tracking-[0.16em]" style={mutedStyle}>{copy.params}</div>
             <div className="grid grid-cols-2 gap-2 text-[11px]" style={mutedStyle}>
-              <span className="rounded-md border px-2 py-1" style={panelStyle}>{isHosted ? "HF Space" : `${block.params?.width} x ${block.params?.height}`}</span>
+              <span className="rounded-md border px-2 py-1" style={panelStyle}>
+                {block.model || (isWebFallback ? "HiDream Web" : `${block.params?.width} x ${block.params?.height}`)}
+              </span>
               <span className="rounded-md border px-2 py-1" style={panelStyle}>Seed {block.params?.seedMode === "random" ? "Random" : block.params?.seed}</span>
               <span className="rounded-md border px-2 py-1" style={panelStyle}>{block.params?.aspectRatio}</span>
-              <span className="rounded-md border px-2 py-1" style={panelStyle}>{isHosted ? `Refine ${block.params?.promptRefine ? "On" : "Off"}` : `CFG ${block.params?.guidanceScale}`}</span>
+              <span className="rounded-md border px-2 py-1" style={panelStyle}>
+                {isWebFallback ? `Refine ${block.params?.promptRefine ? "On" : "Off"}` : `CFG ${block.params?.guidanceScale}`}
+              </span>
             </div>
           </div>
           {block.error && (

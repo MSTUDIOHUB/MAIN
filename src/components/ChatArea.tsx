@@ -2391,7 +2391,18 @@ export default function ChatArea({
     checkImageStudioEngine: useAppStore((s) => s.checkImageStudioEngine),
   };
   const isImageStudioMode = selectedMainModeKey === "image_studio";
-  const isHuggingFaceImageEngine = imageStudio.config.engine === "huggingface_space";
+  const isWebFallbackImageEngine = imageStudio.config.provider === "web_fallback";
+  const imageStudioLocalFamilyLabel = imageStudio.config.local.serviceFamily === "ollama"
+    ? "Ollama"
+    : imageStudio.config.local.serviceFamily === "omlx"
+    ? "OMLX"
+    : (language === "en" ? "OpenAI-compatible" : "OpenAI 兼容");
+  const imageStudioProviderLabel = isWebFallbackImageEngine
+    ? (language === "en" ? "HiDream Web" : "HiDream 网页")
+    : (language === "en" ? "Local Image Service" : "本地图片服务");
+  const imageStudioProviderDetail = isWebFallbackImageEngine
+    ? (language === "en" ? "Hosted fallback" : "托管 fallback")
+    : `${imageStudioLocalFamilyLabel} · ${imageStudio.status.activeModel || imageStudio.config.local.model || imageStudio.config.local.endpoint}`;
   const isGlobalChat = !currentWorkspace;
   const emptyStatePrompts = language === "zh"
     ? [
@@ -2483,6 +2494,15 @@ export default function ChatArea({
       blocks: blocksByTurnId.byTurnId.get(turn.id) || [],
     }));
   }, [blocksByTurnId, visibleConversationTurns]);
+  const recentImageBlocks = useMemo(
+    () =>
+      taskFlow
+        .filter((block) => block?.type === "imageGeneration")
+        .slice()
+        .reverse()
+        .slice(0, 8),
+    [taskFlow],
+  );
 
   useEffect(() => {
     const nextSessionKey = activeSessionKey ?? null;
@@ -3725,7 +3745,7 @@ export default function ChatArea({
           {isImageStudioMode ? (
             <>
               <span className={`h-1.5 w-1.5 rounded-full ${imageStudio.status.state === "ready" ? "bg-green-500 shadow-[0_0_5px_#22c55e]" : isStreaming ? "bg-amber-400 shadow-[0_0_5px_#fbbf24] animate-pulse" : "bg-zinc-500"}`} />
-              {language === "en" ? "Image Engine" : "图像引擎"}: <span className="max-w-[180px] truncate font-normal text-[#a1a1aa]">{isHuggingFaceImageEngine ? (language === "en" ? "Online" : "在线") : imageStudio.config.endpoint}</span>
+              {language === "en" ? "Image Studio" : "图像工作室"}: <span className="max-w-[200px] truncate font-normal text-[#a1a1aa]">{imageStudioProviderLabel} · {imageStudioProviderDetail}</span>
             </>
           ) : config.activeProfile === "local" ? (
             <>
@@ -3865,8 +3885,8 @@ export default function ChatArea({
                     </div>
                     <div className="mt-1 text-[12px] text-[#a1a1aa]">
                       {language === "en"
-                        ? "Independent image generation workspace. Normal MAIN chats keep using their own local model pipeline."
-                        : "独立的图像生成工作台。普通 MAIN 会话仍然走原来的本地模型与指令执行链路。"}
+                        ? "A dedicated image conversation workspace. Local image services stay primary, and HiDream Web remains available as a lighter browser fallback."
+                        : "一个独立的图像对话工作区。本地图片服务是主路径，HiDream Web 保留为更轻量的网页 fallback。"}
                     </div>
                   </div>
                   <div className="flex flex-wrap gap-2">
@@ -3877,7 +3897,7 @@ export default function ChatArea({
                       className="inline-flex h-8 items-center gap-2 rounded-md border border-[#27272a] bg-[#09090b] px-3 text-[11px] text-[#d4d4d8] transition-colors hover:bg-[#18181b] hover:text-white"
                     >
                       <IconZap className="h-3.5 w-3.5 text-[var(--accent-light)]" />
-                      {language === "en" ? "Check Engine" : "检测引擎"}
+                      {language === "en" ? "Check Provider" : "检测 provider"}
                     </button>
                     <button
                       type="button"
@@ -3894,7 +3914,7 @@ export default function ChatArea({
                 <div className="grid gap-3 md:grid-cols-[minmax(260px,0.8fr)_minmax(300px,1.2fr)]">
                   <div className="rounded-lg border border-[#27272a] bg-[#09090b] p-4">
                     <div className="mb-3 text-[11px] font-semibold uppercase tracking-[0.16em] text-[#71717a]">
-                      {language === "en" ? "Engine" : "引擎状态"}
+                      {language === "en" ? "Provider" : "Provider 状态"}
                     </div>
                     <div className="flex items-center gap-2">
                       <span className={`h-2 w-2 rounded-full ${imageStudio.status.state === "ready" ? "bg-emerald-400" : imageStudio.status.state === "error" ? "bg-red-400" : "bg-zinc-500"}`} />
@@ -3908,11 +3928,21 @@ export default function ChatArea({
                       {imageStudio.status.message}
                     </div>
                     <div className="mt-4 grid grid-cols-2 gap-2 text-[11px] text-[#a1a1aa]">
-                      <span className="rounded-md border border-[#27272a] bg-[#050507] px-2 py-1">{isHuggingFaceImageEngine ? "HF Space" : "HiDream HTTP"}</span>
+                      <span className="rounded-md border border-[#27272a] bg-[#050507] px-2 py-1">{imageStudioProviderLabel}</span>
                       <span className="rounded-md border border-[#27272a] bg-[#050507] px-2 py-1">{imageStudio.config.aspectRatio}</span>
-                      <span className="rounded-md border border-[#27272a] bg-[#050507] px-2 py-1">{isHuggingFaceImageEngine ? `Refine ${imageStudio.config.promptRefine ? "On" : "Off"}` : `${imageStudio.config.steps} steps`}</span>
-                      <span className="rounded-md border border-[#27272a] bg-[#050507] px-2 py-1">{isHuggingFaceImageEngine ? "Hosted" : `CFG ${imageStudio.config.guidanceScale}`}</span>
-                      <span className="truncate rounded-md border border-[#27272a] bg-[#050507] px-2 py-1">{imageStudio.config.endpoint}</span>
+                      <span className="rounded-md border border-[#27272a] bg-[#050507] px-2 py-1">
+                        {isWebFallbackImageEngine
+                          ? `Refine ${imageStudio.config.web.promptRefine ? "On" : "Off"}`
+                          : `${imageStudio.config.steps} steps`}
+                      </span>
+                      <span className="rounded-md border border-[#27272a] bg-[#050507] px-2 py-1">
+                        {isWebFallbackImageEngine
+                          ? "Hosted"
+                          : `CFG ${imageStudio.config.guidanceScale}`}
+                      </span>
+                      <span className="truncate rounded-md border border-[#27272a] bg-[#050507] px-2 py-1">
+                        {isWebFallbackImageEngine ? imageStudio.config.web.endpoint : imageStudio.config.local.endpoint}
+                      </span>
                     </div>
                   </div>
 
@@ -3957,6 +3987,83 @@ export default function ChatArea({
               </div>
             </div>
           )
+        ) : isImageStudioMode ? (
+          <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_280px]">
+            <div className="space-y-5">
+              {onLoadOlderSessionHistory && (
+                <div className="flex justify-center">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (olderHistoryLoading) return;
+                      const el = chatContainerRef.current;
+                      const previousScrollHeight = el?.scrollHeight ?? 0;
+                      const previousScrollTop = el?.scrollTop ?? 0;
+                      setOlderHistoryLoading(true);
+                      Promise.resolve(onLoadOlderSessionHistory()).finally(() => {
+                        window.requestAnimationFrame(() => {
+                          const latestEl = chatContainerRef.current;
+                          if (latestEl && previousScrollHeight > 0) {
+                            latestEl.scrollTop = latestEl.scrollHeight - previousScrollHeight + previousScrollTop;
+                            lastScrollTopRef.current = latestEl.scrollTop;
+                          }
+                          setOlderHistoryLoading(false);
+                        });
+                      });
+                    }}
+                    className="rounded-full border border-[#27272a] bg-[#09090b] px-3 py-1.5 text-[11px] text-[#a1a1aa] transition-colors hover:border-[var(--accent)] hover:text-white disabled:cursor-not-allowed disabled:opacity-50"
+                    disabled={olderHistoryLoading}
+                  >
+                    {olderHistoryLoading
+                      ? (language === "zh" ? "加载中..." : "Loading...")
+                      : (language === "zh" ? "加载更早历史" : "Load Older History")}
+                  </button>
+                </div>
+              )}
+              {groupedTurns.map((entry, index) => renderTurn(entry, index))}
+            </div>
+
+            <aside className="hidden xl:block">
+              <div className="sticky top-5 rounded-xl border border-[#27272a] bg-[#09090b] p-3">
+                <div className="mb-3 flex items-center gap-2 text-[12px] font-semibold text-[#f4f4f5]">
+                  <IconImageIcon className="h-3.5 w-3.5 text-[var(--accent-light)]" />
+                  {language === "en" ? "Recent Results" : "最近结果"}
+                </div>
+                <div className="space-y-3">
+                  {recentImageBlocks.length > 0 ? recentImageBlocks.map((block: any) => {
+                    const imageUrl = block.imageUrl || block.previewUrl || "";
+                    return (
+                      <button
+                        key={String(block.id)}
+                        type="button"
+                        onClick={() => onSendMessage?.(block.prompt || "")}
+                        className="w-full rounded-lg border border-[#27272a] bg-[#050507] p-2 text-left transition-colors hover:border-[var(--accent-subtle-border)] hover:bg-[#131316]"
+                      >
+                        <div className="mb-2 aspect-square overflow-hidden rounded-md border border-[#27272a] bg-[#09090b]">
+                          {imageUrl ? (
+                            <img src={imageUrl} alt={block.prompt || "generated image"} className="h-full w-full object-cover" />
+                          ) : (
+                            <div className="flex h-full items-center justify-center text-[10px] text-[#71717a]">
+                              {block.status === "completed"
+                                ? (language === "en" ? "Saved result" : "已保存结果")
+                                : (language === "en" ? "Generating" : "生成中")}
+                            </div>
+                          )}
+                        </div>
+                        <div className="line-clamp-3 text-[11px] leading-relaxed text-[#d4d4d8]">{block.prompt}</div>
+                      </button>
+                    );
+                  }) : (
+                    <div className="rounded-lg border border-dashed border-[#27272a] px-3 py-4 text-[11px] leading-relaxed text-[#71717a]">
+                      {language === "en"
+                        ? "Your finished images will collect here for quick variants and reruns."
+                        : "完成后的图片会收集到这里，方便快速做变体和重跑。"}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </aside>
+          </div>
         ) : (
           <div className="space-y-5">
             {onLoadOlderSessionHistory && (

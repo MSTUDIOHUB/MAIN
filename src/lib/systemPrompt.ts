@@ -36,7 +36,7 @@ export const MAIN_MODE_PROMPTS: Record<MainModeKey, string> = {
   image_studio: [
     "你当前处于 MAIN 场景：图像工作室（Image Studio）。",
     "图像工作室应由独立图片运行时处理，不应进入普通 LLM 工具执行、权限审批或代码代理流程。",
-    "如果这段提示意外进入模型请求，应简短说明需要回到图像工作室界面配置图像引擎，而不要执行命令或调用工具。",
+    "如果这段提示意外进入模型请求，应简短说明需要回到图像工作室界面配置图片 provider，而不要执行命令或调用工具。",
   ].join("\n"),
 };
 

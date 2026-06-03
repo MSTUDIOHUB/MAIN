@@ -1,142 +1,264 @@
 // @ts-nocheck
 import React, { useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
-import { IconCheck, IconClose, IconCode, IconImageIcon, IconRefresh, IconSettings, IconZap } from "./Icons";
+import {
+  IconCheck,
+  IconClose,
+  IconGlobe,
+  IconImageIcon,
+  IconRefresh,
+  IconZap,
+} from "./Icons";
 import { useAppStore } from "../store/useAppStore";
 import {
-  IMAGE_STUDIO_HF_SPACE_ENDPOINT,
-  IMAGE_STUDIO_HIDREAM_HTTP_ENDPOINT,
-  type ImageStudioEngineKey,
+  IMAGE_STUDIO_LOCAL_DEFAULT_ENDPOINT,
+  IMAGE_STUDIO_WEB_FALLBACK_ENDPOINT,
+  checkImageStudioEngineStatus,
+  getDefaultImageStudioEndpointForServiceFamily,
+  mapLocalModelProviderToImageStudioServiceFamily,
+  normalizeImageStudioConfig,
 } from "../lib/imageStudio";
+
+const settingsSectionRowClass = "grid gap-3 lg:grid-cols-[minmax(190px,300px)_minmax(0,1fr)] lg:items-start lg:gap-8";
+const settingsControlColumnClass = "w-full lg:ml-auto lg:max-w-[620px]";
+const settingsSelectClass = "w-full rounded-md border border-[#27272a] bg-[#000000] p-2.5 text-[14px] text-white outline-none theme-ring transition-all cursor-pointer focus:border-[var(--accent)] focus:ring-1 focus:ring-inset focus:ring-[var(--accent-light)]";
+const settingsInputClass = "w-full rounded-md border border-[#27272a] bg-[#000000] p-2.5 text-[14px] text-white outline-none theme-ring transition-all focus:border-[var(--accent)] focus:ring-1 focus:ring-inset focus:ring-[var(--accent-light)]";
+const settingsSecondaryButtonClass = "rounded-md border border-[#27272a] bg-[#18181b] px-3 py-2 text-[12px] font-bold text-[#e4e4e7] transition-colors hover:border-[#3f3f46] hover:text-white disabled:cursor-wait disabled:opacity-50";
+const settingsAccentButtonClass = "rounded-md border border-[var(--accent-subtle-border)] bg-[var(--accent-subtle)] px-3 py-2 text-[12px] font-bold text-white transition-colors hover:bg-[var(--accent)] disabled:cursor-wait disabled:opacity-50";
+
+function settingsOptionButtonClass(isSelected: boolean, extra = "") {
+  return `${isSelected ? "theme-bg shadow-sm text-white border-transparent" : "border-[#27272a] bg-[#18181b] text-[#a1a1aa] hover:text-white hover:border-[#3f3f46]"} border transition-colors ${extra}`.trim();
+}
 
 export default function ImageStudioSetupModal() {
   const language = useAppStore((s) => s.config.language === "en" ? "en" : "zh");
-  const themeMode = useAppStore((s) => s.config.themeMode);
   const imageStudio = useAppStore((s) => s.imageStudio);
+  const mainLocalConfig = useAppStore((s) => s.config.local);
   const setImageStudioConfig = useAppStore((s) => s.setImageStudioConfig);
+  const setImageStudioStatus = useAppStore((s) => s.setImageStudioStatus);
   const setImageStudioSetupGuideOpen = useAppStore((s) => s.setImageStudioSetupGuideOpen);
-  const checkImageStudioEngine = useAppStore((s) => s.checkImageStudioEngine);
-  const [tab, setTab] = useState<"detect" | "connect" | "manual">("detect");
-  const [endpointDraft, setEndpointDraft] = useState(imageStudio.config.endpoint);
-  const [checking, setChecking] = useState(false);
+
+  const [section, setSection] = useState<"local" | "web">("local");
+  const [localEndpointDraft, setLocalEndpointDraft] = useState(imageStudio.config.local.endpoint);
+  const [localModelDraft, setLocalModelDraft] = useState(imageStudio.config.local.model);
+  const [localServiceFamilyDraft, setLocalServiceFamilyDraft] = useState(imageStudio.config.local.serviceFamily || "omlx");
+  const [webEndpointDraft, setWebEndpointDraft] = useState(imageStudio.config.web.endpoint);
+  const [checkingProvider, setCheckingProvider] = useState<"local_image_service" | "web_fallback" | null>(null);
 
   useEffect(() => {
-    if (imageStudio.setupGuideOpen) {
-      setEndpointDraft(imageStudio.config.endpoint);
-    }
-  }, [imageStudio.config.endpoint, imageStudio.setupGuideOpen]);
+    if (!imageStudio.setupGuideOpen) return;
+    setLocalEndpointDraft(imageStudio.config.local.endpoint);
+    setLocalModelDraft(imageStudio.config.local.model);
+    setLocalServiceFamilyDraft(imageStudio.config.local.serviceFamily || "omlx");
+    setWebEndpointDraft(imageStudio.config.web.endpoint);
+    setSection(imageStudio.config.provider === "web_fallback" ? "web" : "local");
+  }, [
+    imageStudio.config.local.endpoint,
+    imageStudio.config.local.model,
+    imageStudio.config.local.serviceFamily,
+    imageStudio.config.provider,
+    imageStudio.config.web.endpoint,
+    imageStudio.setupGuideOpen,
+  ]);
 
   const copy = useMemo(() => ({
-    title: language === "en" ? "Image Studio Setup" : "图像工作室设置",
+    title: language === "en" ? "Image Studio" : "图像工作室",
     subtitle: language === "en"
-      ? "Connect MAIN to a running local or LAN image engine."
-      : "把 MAIN 连接到正在运行的本机或局域网图像引擎。",
-    detect: language === "en" ? "Auto Detect" : "自动检测",
-    connect: language === "en" ? "Connect Service" : "连接已有服务",
-    manual: language === "en" ? "HiDream Manual" : "手动配置 HiDream",
-    engine: language === "en" ? "Engine" : "引擎",
-    hfEngine: language === "en" ? "Hugging Face Space" : "Hugging Face 在线",
-    hfEngineDesc: language === "en"
-      ? "Default. Uses the hosted HiDream Space, so no CUDA computer is required on your side."
-      : "默认选项。使用 Hugging Face 托管的 HiDream Space，你这边不需要额外 CUDA 电脑。",
-    hostedTitle: language === "en" ? "Online generation is the default" : "默认使用在线生成",
-    hostedBody: language === "en"
-      ? "MAIN sends the prompt, aspect ratio, prompt-refine flag, and seed to the hosted Space, then waits for its SSE result and saves the returned image locally."
-      : "MAIN 会把提示词、比例、Prompt Refine 和 seed 发到托管 Space，然后等待 SSE 结果并把返回图片保存到本地会话目录。",
-    localEngine: language === "en" ? "Local/LAN CUDA service" : "本地/局域网 CUDA 服务",
-    localEngineDesc: language === "en"
-      ? "Advanced. Connect to an app.py service that you run on an NVIDIA/CUDA machine."
-      : "高级选项。连接你在 NVIDIA/CUDA 机器上运行的 app.py 服务。",
+      ? "Local-first image generation with a hosted HiDream Web fallback inside the same studio."
+      : "以本地生图为主，并在同一工作室里保留 HiDream Web 作为托管 fallback。",
+    local: language === "en" ? "Local Image Service" : "本地图片服务",
+    localDesc: language === "en"
+      ? "Use the same endpoint and model-discovery pattern as MAIN local settings, including OMLX and Ollama."
+      : "复用 MAIN 本地模型设置的 endpoint 与模型发现习惯，直接支持 OMLX 和 Ollama 风格识别。",
+    web: language === "en" ? "HiDream Web" : "HiDream 网页",
+    webDesc: language === "en"
+      ? "Keep HiDream Web available as a lighter browser-side route when you want a hosted fallback."
+      : "把 HiDream Web 保留为网页端次级路径，作为可选的托管 fallback。",
+    active: language === "en" ? "Active Provider" : "当前 Provider",
+    providerStatus: language === "en" ? "Provider Status" : "Provider 状态",
+    localProvider: language === "en" ? "Local Provider" : "本地 Provider",
     endpoint: language === "en" ? "Endpoint" : "服务地址",
-    test: language === "en" ? "Test Connection" : "测试连接",
-    testing: language === "en" ? "Checking..." : "检测中...",
+    model: language === "en" ? "Model" : "模型",
+    protocol: language === "en" ? "Protocol" : "协议",
+    protocolValue: "OpenAI Images /v1/images/generations",
+    save: language === "en" ? "Save Settings" : "保存设置",
+    setActive: language === "en" ? "Use For Generation" : "设为当前生成 Provider",
+    check: language === "en" ? "Check Connection" : "检测连接",
+    checking: language === "en" ? "Checking..." : "检测中...",
     close: language === "en" ? "Close" : "关闭",
-    save: language === "en" ? "Save Endpoint" : "保存地址",
-    ready: language === "en" ? "Ready" : "已就绪",
-    missing: language === "en" ? "Not Connected" : "未连接",
-    cudaTitle: language === "en" ? "CUDA Backend Required For V1" : "v1 按 CUDA 后端接入",
-    cudaBody: language === "en"
-      ? "HiDream-O1-Image official scripts currently assert CUDA availability and load the model with CUDA device mapping. Apple Silicon/MPS local inference should be treated as experimental and is not promised as out-of-the-box in this MAIN mode."
-      : "HiDream-O1-Image 官方脚本当前会断言 CUDA 可用，并以 CUDA device map 加载模型。Apple Silicon/MPS 本机推理应视为实验路径，本版图像工作室不承诺开箱即用。",
-    cudaRunTitle: language === "en" ? "Run HiDream on an NVIDIA/CUDA host" : "请在 NVIDIA/CUDA 主机上运行 HiDream",
-    cudaRunBody: language === "en"
-      ? "The Hugging Face model card says inference requires a CUDA-capable GPU. On a Mac without CUDA, the official app.py stops with \"CUDA is required for inference.\""
-      : "Hugging Face 模型页说明推理需要 CUDA-capable GPU。在没有 CUDA 的 Mac 上，官方 app.py 会直接报 “CUDA is required for inference.”。",
-    noInstall: language === "en"
-      ? "MAIN v1 does not auto-download 15GB+ weights or create a PyTorch environment. Start your HiDream/ComfyUI HTTP service first, then connect it here."
-      : "MAIN v1 不自动下载 15GB+ 权重，也不自动创建 PyTorch 环境。请先启动 HiDream/ComfyUI HTTP 服务，再在这里连接。",
-    modelPathRequired: language === "en"
-      ? "HiDream requires --model_path or HIDREAM_MODEL_PATH. Use the complete downloaded Hugging Face checkpoint directory, not the source-code folder unless the weights are inside it."
-      : "HiDream 必须提供 --model_path 或 HIDREAM_MODEL_PATH。这里要填完整下载后的 Hugging Face 模型权重目录，不是源码目录，除非权重确实下载在源码目录里。",
-    hfTitle: language === "en" ? "Download the Dev checkpoint" : "下载 Dev 权重",
-    hfBody: language === "en"
-      ? "The Dev model repo is HiDream-ai/HiDream-O1-Image-Dev. Use that local directory as --model_path and start app.py with --model_type dev."
-      : "Dev 模型 repo 是 HiDream-ai/HiDream-O1-Image-Dev。下载后的本地目录用于 --model_path，并用 --model_type dev 启动 app.py。",
-    lanHint: language === "en"
-      ? "If the CUDA service runs on another machine, keep --host 0.0.0.0 there and set MAIN's endpoint to http://CUDA_HOST_IP:7860."
-      : "如果 CUDA 服务跑在另一台机器上，请在那台机器使用 --host 0.0.0.0，并把 MAIN 的服务地址设为 http://CUDA_HOST_IP:7860。",
-    envTitle: language === "en" ? ".env alternative" : ".env 配置方式",
+    useCurrentLocal: language === "en" ? "Use Current Local Setup" : "使用当前本地模型设置",
+    currentLocalHint: language === "en"
+      ? "Copy provider / endpoint / model from MAIN local settings without binding the two configs together."
+      : "从 MAIN 的本地模型设置复制 provider、endpoint 和 model，但两套配置依然独立保存。",
+    discoveredModels: language === "en" ? "Discovered Models" : "已发现模型",
+    localEmpty: language === "en"
+      ? "No models discovered yet. You can still type a model id manually."
+      : "暂未发现模型，你也可以先手动填写 model id。",
+    promptRefine: language === "en" ? "Prompt Refine" : "提示词润色",
+    webEnabled: language === "en" ? "HiDream Web Availability" : "HiDream Web 可用性",
+    enabled: language === "en" ? "Enabled" : "已启用",
+    disabled: language === "en" ? "Disabled" : "已关闭",
+    localRuntime: language === "en" ? "Local Runtime" : "本地运行时",
+    webRuntime: language === "en" ? "Web Fallback" : "网页 Fallback",
+    localStatusIdle: language === "en"
+      ? "Save or check this section to refresh local model discovery."
+      : "保存或检测这一项后，MAIN 会刷新本地模型发现结果。",
+    webStatusIdle: language === "en"
+      ? "HiDream Web can stay disabled until you explicitly want a hosted generation route."
+      : "HiDream Web 可以保持关闭，等你明确需要网页端托管生图时再开启。",
+    localHint: language === "en"
+      ? "MAIN probes /health plus provider-specific discovery endpoints, then sends generation requests through /v1/images/generations."
+      : "MAIN 会先探测 /health 和 provider 对应的发现接口，再通过 /v1/images/generations 发起生成。",
+    localHintSecondary: language === "en"
+      ? "Loopback and private-network endpoints are allowed. Public-facing local-image endpoints stay blocked by design."
+      : "允许回环地址和私网 endpoint，公网形式的本地生图地址会继续被阻止。",
+    webHint: language === "en"
+      ? "Disabling HiDream Web removes it from generation until you explicitly re-enable or switch back."
+      : "关闭 HiDream Web 后，它会退出当前生图路径，直到你再次开启或重新切换回来。",
+    serviceFamilies: {
+      omlx: language === "en" ? "OMLX (MLX for Mac)" : "OMLX (Mac 本地 MLX)",
+      ollama: "Ollama",
+      openai_compatible: language === "en" ? "OpenAI-compatible" : "OpenAI 兼容接口",
+    },
+    stateLabel: {
+      ready: language === "en" ? "Ready" : "已就绪",
+      missing: language === "en" ? "Needs Setup" : "待设置",
+      error: language === "en" ? "Error" : "错误",
+      unknown: language === "en" ? "Not Checked" : "未检测",
+    },
+    localSectionDetail: language === "en" ? "Primary workflow" : "主工作流",
+    webSectionDetail: language === "en" ? "Secondary route" : "次级路径",
   }), [language]);
 
   if (!imageStudio.setupGuideOpen || typeof document === "undefined") return null;
 
-  const isLight = themeMode === "light";
-  const panelStyle = {
-    backgroundColor: isLight ? "#ffffff" : themeMode === "black" ? "#000000" : "#09090b",
-    color: isLight ? "#18181b" : "#e4e4e7",
-    borderColor: isLight ? "#d4d4d8" : "#27272a",
-  };
-  const mutedStyle = { color: isLight ? "#52525b" : "#a1a1aa" };
-  const inputStyle = {
-    backgroundColor: isLight ? "#f8fafc" : "#050507",
-    borderColor: isLight ? "#d4d4d8" : "#27272a",
-    color: isLight ? "#111827" : "#f4f4f5",
-  };
-  const statusTone = imageStudio.status.state === "ready"
-    ? "border-[rgba(34,197,94,0.28)] bg-[rgba(34,197,94,0.10)] text-[#22c55e]"
+  const activeProviderLabel = imageStudio.config.provider === "web_fallback" ? copy.web : copy.local;
+  const statusKey = imageStudio.status.state || "unknown";
+  const statusToneClass = imageStudio.status.state === "ready"
+    ? "border-[rgba(34,197,94,0.28)] bg-[rgba(34,197,94,0.10)] text-[#86efac]"
     : imageStudio.status.state === "error"
-    ? "border-[rgba(248,113,113,0.3)] bg-[rgba(127,29,29,0.18)] text-[#f87171]"
-    : "border-[#3f3f46] bg-[#18181b] text-[#a1a1aa]";
+      ? "border-[#3f1f1f] bg-[#181111] text-[#fca5a5]"
+      : imageStudio.status.state === "missing"
+        ? "border-[#3f2f1f] bg-[#18110a] text-[#fbbf24]"
+        : "border-[#27272a] bg-[#000000] text-[#a1a1aa]";
+  const localDiscoveredModels = imageStudio.status.providerKind === "local_image_service"
+    ? (Array.isArray(imageStudio.status.discoveredModels) ? imageStudio.status.discoveredModels : [])
+    : [];
+  const sectionStatusMessage = section === "local"
+    ? (imageStudio.status.providerKind === "local_image_service" ? imageStudio.status.message : copy.localStatusIdle)
+    : (imageStudio.status.providerKind === "web_fallback" ? imageStudio.status.message : copy.webStatusIdle);
+  const canAdoptMainLocalSettings = Boolean(mainLocalConfig?.endpoint || mainLocalConfig?.provider || mainLocalConfig?.model);
 
-  const runCheck = async () => {
-    if (checking) return;
-    setChecking(true);
-    setImageStudioConfig({ endpoint: endpointDraft });
-    try {
-      await checkImageStudioEngine();
-    } finally {
-      setChecking(false);
+  const buildLocalPatch = () => ({
+    local: {
+      endpoint: (localEndpointDraft || getDefaultImageStudioEndpointForServiceFamily(localServiceFamilyDraft)).trim() || IMAGE_STUDIO_LOCAL_DEFAULT_ENDPOINT,
+      model: localModelDraft.trim(),
+      protocol: "openai_images",
+      serviceFamily: localServiceFamilyDraft,
+    },
+  });
+
+  const buildWebPatch = (enabled = imageStudio.config.web.enabled) => ({
+    web: {
+      endpoint: (webEndpointDraft || IMAGE_STUDIO_WEB_FALLBACK_ENDPOINT).trim() || IMAGE_STUDIO_WEB_FALLBACK_ENDPOINT,
+      promptRefine: imageStudio.config.web.promptRefine,
+      enabled,
+    },
+  });
+
+  const persistLocalSettings = (activate = false) => {
+    setImageStudioConfig({
+      ...(activate ? { provider: "local_image_service" } : {}),
+      ...buildLocalPatch(),
+    });
+  };
+
+  const persistWebSettings = (options?: { activate?: boolean; enabled?: boolean }) => {
+    const nextEnabled = options?.activate ? true : (options?.enabled ?? imageStudio.config.web.enabled);
+    setImageStudioConfig({
+      ...(options?.activate ? { provider: "web_fallback" } : {}),
+      ...buildWebPatch(nextEnabled),
+    });
+  };
+
+  const buildDraftConfig = (providerKind: "local_image_service" | "web_fallback") =>
+    normalizeImageStudioConfig({
+      ...imageStudio.config,
+      provider: providerKind,
+      ...(providerKind === "local_image_service" ? buildLocalPatch() : buildWebPatch(providerKind === "web_fallback" ? imageStudio.config.web.enabled : undefined)),
+    });
+
+  const applyLocalServiceFamily = (nextFamily: "omlx" | "ollama" | "openai_compatible") => {
+    setLocalServiceFamilyDraft(nextFamily);
+    const suggestedEndpoint = getDefaultImageStudioEndpointForServiceFamily(nextFamily);
+    const normalizedCurrentEndpoint = localEndpointDraft.trim();
+    const currentDefaults = new Set([
+      IMAGE_STUDIO_LOCAL_DEFAULT_ENDPOINT,
+      getDefaultImageStudioEndpointForServiceFamily(localServiceFamilyDraft),
+      "http://127.0.0.1:11434/v1",
+    ]);
+    if (!normalizedCurrentEndpoint || currentDefaults.has(normalizedCurrentEndpoint)) {
+      setLocalEndpointDraft(suggestedEndpoint);
     }
   };
-  const setEngine = (engine: ImageStudioEngineKey) => {
-    const endpoint = engine === "huggingface_space"
-      ? IMAGE_STUDIO_HF_SPACE_ENDPOINT
-      : IMAGE_STUDIO_HIDREAM_HTTP_ENDPOINT;
-    setEndpointDraft(endpoint);
-    setImageStudioConfig({ engine, endpoint });
+
+  const adoptMainLocalSettings = () => {
+    const nextFamily = mapLocalModelProviderToImageStudioServiceFamily(mainLocalConfig?.provider);
+    setSection("local");
+    setLocalServiceFamilyDraft(nextFamily);
+    setLocalEndpointDraft((mainLocalConfig?.endpoint || getDefaultImageStudioEndpointForServiceFamily(nextFamily)).trim());
+    setLocalModelDraft((mainLocalConfig?.model || "").trim());
+  };
+
+  const runCheck = async (providerKind: "local_image_service" | "web_fallback") => {
+    if (checkingProvider) return;
+    setCheckingProvider(providerKind);
+    try {
+      if (providerKind === "local_image_service") {
+        persistLocalSettings(false);
+      } else {
+        persistWebSettings({ activate: false });
+      }
+      const status = await checkImageStudioEngineStatus(buildDraftConfig(providerKind));
+      setImageStudioStatus(status);
+    } finally {
+      setCheckingProvider(null);
+    }
+  };
+
+  const toggleWebEnabled = () => {
+    const nextEnabled = !imageStudio.config.web.enabled;
+    if (!nextEnabled && imageStudio.config.provider === "web_fallback") {
+      setImageStudioConfig({
+        provider: "local_image_service",
+        ...buildWebPatch(false),
+      });
+      return;
+    }
+    persistWebSettings({ enabled: nextEnabled });
   };
 
   return createPortal(
-    <div className="fixed inset-0 z-[120] flex items-center justify-center bg-black/55 px-4 py-6 backdrop-blur-sm">
-      <div className="w-full max-w-3xl flex flex-col max-h-[80vh] overflow-hidden rounded-xl border shadow-2xl" style={panelStyle} role="dialog" aria-modal="true">
-        <div className="flex flex-shrink-0 items-start justify-between gap-4 border-b px-5 py-4" style={{ borderColor: panelStyle.borderColor }}>
+    <div className="fixed inset-0 z-[120] flex items-center justify-center bg-black/80 p-4 backdrop-blur-sm">
+      <div
+        className="flex w-[min(1080px,94vw)] flex-col overflow-hidden rounded-xl border border-[#27272a] bg-[#09090b] shadow-2xl"
+        style={{ height: "min(860px, calc(100vh - 32px))", maxHeight: "calc(100vh - 32px)" }}
+        role="dialog"
+        aria-modal="true"
+      >
+        <div className="flex shrink-0 items-center justify-between border-b border-[#27272a] bg-[#000000] px-5 py-4">
           <div className="min-w-0">
-            <div className="flex items-center gap-2">
-              <div className="flex h-8 w-8 items-center justify-center rounded-md border border-[var(--accent-subtle-border)] bg-[var(--accent-subtle)] text-[var(--accent-light)]">
-                <IconImageIcon className="h-4 w-4" />
-              </div>
-              <div className="text-[15px] font-semibold">{copy.title}</div>
-              <span className={`rounded-full border px-2 py-0.5 text-[10px] ${statusTone}`}>
-                {imageStudio.status.state === "ready" ? copy.ready : copy.missing}
-              </span>
-            </div>
-            <div className="mt-1 text-[12px] leading-relaxed" style={mutedStyle}>{copy.subtitle}</div>
+            <h2 className="flex items-center gap-2 text-base font-bold text-white">
+              <IconImageIcon className="h-5 w-5" />
+              {copy.title}
+            </h2>
+            <p className="mt-1 text-[12px] leading-relaxed text-[#71717a]">{copy.subtitle}</p>
           </div>
           <button
             type="button"
+            data-testid="image-studio-settings-close"
             onClick={() => setImageStudioSetupGuideOpen(false)}
-            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border transition-colors hover:bg-[#18181b]"
-            style={{ borderColor: panelStyle.borderColor }}
+            className="text-[#a1a1aa] transition-colors hover:text-white"
             title={copy.close}
             aria-label={copy.close}
           >
@@ -144,171 +266,326 @@ export default function ImageStudioSetupModal() {
           </button>
         </div>
 
-        <div className="grid gap-0 md:grid-cols-[13rem_1fr] flex-1 overflow-hidden">
-          <div className="border-b p-3 md:border-b-0 md:border-r overflow-y-auto" style={{ borderColor: panelStyle.borderColor }}>
-            {[
-              ["detect", copy.detect, IconRefresh],
-              ["connect", copy.connect, IconSettings],
-              ["manual", copy.manual, IconCode],
-            ].map(([key, label, Icon]) => (
-              <button
-                key={key}
-                type="button"
-                onClick={() => setTab(key)}
-                className="mb-1 flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-[12px] transition-colors"
-                style={{
-                  backgroundColor: tab === key ? "var(--accent-subtle)" : "transparent",
-                  color: tab === key ? (isLight ? "var(--accent-hover)" : "var(--accent-light)") : undefined,
-                }}
-              >
-                <Icon className="h-3.5 w-3.5" />
-                {label}
-              </button>
-            ))}
+        <div className="flex min-h-0 flex-1">
+          <div className="flex w-52 shrink-0 flex-col gap-1 overflow-y-auto border-r border-[#27272a] bg-[#000000] p-2">
+            <button
+              type="button"
+              data-testid="image-studio-settings-tab-local"
+              onClick={() => setSection("local")}
+              className={`rounded-md px-4 py-2.5 text-left text-[13px] font-medium transition-colors ${
+                section === "local" ? "theme-bg shadow-sm text-white" : "text-[#a1a1aa] hover:bg-[#18181b] hover:text-[#e4e4e7]"
+              }`}
+            >
+              <span className="flex items-center gap-2">
+                <IconZap className="h-4 w-4" />
+                {copy.local}
+              </span>
+              <span className="mt-1 block text-[11px] text-[#71717a]">{copy.localSectionDetail}</span>
+            </button>
+            <button
+              type="button"
+              data-testid="image-studio-settings-tab-web"
+              onClick={() => setSection("web")}
+              className={`rounded-md px-4 py-2.5 text-left text-[13px] font-medium transition-colors ${
+                section === "web" ? "theme-bg shadow-sm text-white" : "text-[#a1a1aa] hover:bg-[#18181b] hover:text-[#e4e4e7]"
+              }`}
+            >
+              <span className="flex items-center gap-2">
+                <IconGlobe className="h-4 w-4" />
+                {copy.web}
+              </span>
+              <span className="mt-1 block text-[11px] text-[#71717a]">{copy.webSectionDetail}</span>
+            </button>
           </div>
 
-          <div className="space-y-4 p-5 overflow-y-auto">
-            {tab !== "manual" && (
-              <div className="rounded-lg border p-3" style={{ borderColor: panelStyle.borderColor, backgroundColor: isLight ? "#f8fafc" : "#050507" }}>
-                <div className="mb-2 text-[11px] font-semibold uppercase tracking-[0.14em]" style={mutedStyle}>{copy.engine}</div>
-                <div className="grid gap-2 sm:grid-cols-2">
-                  {[
-                    ["huggingface_space", copy.hfEngine, copy.hfEngineDesc],
-                    ["hidream_http", copy.localEngine, copy.localEngineDesc],
-                  ].map(([engine, label, desc]) => {
-                    const selected = imageStudio.config.engine === engine;
-                    return (
+          <div className="min-h-0 flex-1 overflow-y-auto bg-[#09090b] p-6 pb-8">
+            <div className="space-y-5">
+              <div className="rounded-md border border-[#27272a] bg-[#000000] px-4 py-3">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="text-[13px] font-bold text-[#e4e4e7]">{copy.providerStatus}</div>
+                    <div className="mt-1 text-[12px] leading-relaxed text-[#71717a]">{section === "local" ? copy.localDesc : copy.webDesc}</div>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className={`rounded-full border px-2.5 py-1 text-[11px] font-semibold ${statusToneClass}`}>
+                      {copy.stateLabel[statusKey]}
+                    </span>
+                    <span className="rounded-full border border-[#27272a] px-2.5 py-1 text-[11px] text-[#a1a1aa]">
+                      {copy.active}: {activeProviderLabel}
+                    </span>
+                    {imageStudio.status.activeModel ? (
+                      <span className="rounded-full border border-[#27272a] px-2.5 py-1 text-[11px] text-[#a1a1aa]">
+                        {imageStudio.status.activeModel}
+                      </span>
+                    ) : null}
+                  </div>
+                </div>
+                <div className="mt-3 rounded-md border border-[#27272a] bg-[#09090b] px-3 py-2 text-[12px] leading-relaxed text-[#a1a1aa]">
+                  {sectionStatusMessage}
+                </div>
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    data-testid="image-studio-settings-save"
+                    onClick={() => section === "local" ? persistLocalSettings(false) : persistWebSettings({ activate: false })}
+                    className={settingsSecondaryButtonClass}
+                  >
+                    <span className="inline-flex items-center gap-1.5">
+                      <IconCheck className="h-3.5 w-3.5" />
+                      {copy.save}
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    data-testid="image-studio-settings-check"
+                    onClick={() => void runCheck(section === "local" ? "local_image_service" : "web_fallback")}
+                    disabled={checkingProvider !== null}
+                    className={settingsSecondaryButtonClass}
+                  >
+                    <span className="inline-flex items-center gap-1.5">
+                      <IconRefresh className="h-3.5 w-3.5" />
+                      {checkingProvider ? copy.checking : copy.check}
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    data-testid="image-studio-settings-set-active"
+                    onClick={() => {
+                      if (section === "local") {
+                        persistLocalSettings(true);
+                        return;
+                      }
+                      persistWebSettings({ activate: true, enabled: true });
+                    }}
+                    className={settingsAccentButtonClass}
+                  >
+                    {copy.setActive}
+                  </button>
+                </div>
+              </div>
+
+              {section === "local" ? (
+                <div className="space-y-5">
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-[13px] font-bold uppercase tracking-wider text-[#a1a1aa]">{copy.localRuntime}</h3>
+                    {canAdoptMainLocalSettings && (
                       <button
-                        key={engine}
                         type="button"
-                        onClick={() => setEngine(engine as ImageStudioEngineKey)}
-                        className="rounded-md border p-3 text-left transition-colors"
-                        style={{
-                          borderColor: selected ? "var(--accent)" : panelStyle.borderColor,
-                          backgroundColor: selected ? "var(--accent-subtle)" : (isLight ? "#ffffff" : "#09090b"),
-                          color: selected ? (isLight ? "var(--accent-hover)" : "var(--accent-light)") : undefined,
-                        }}
+                        data-testid="image-studio-adopt-main-local-settings"
+                        onClick={adoptMainLocalSettings}
+                        className={settingsOptionButtonClass(false, "rounded px-2.5 py-1.5 text-[11px] font-bold uppercase tracking-wider")}
+                        title={copy.currentLocalHint}
                       >
-                        <div className="text-[12px] font-semibold">{label}</div>
-                        <div className="mt-1 text-[11px] leading-relaxed" style={selected ? undefined : mutedStyle}>{desc}</div>
+                        {copy.useCurrentLocal}
                       </button>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
+                    )}
+                  </div>
 
-            {tab === "detect" && (
-              <div className="space-y-4">
-                <div className="rounded-lg border p-4" style={{ borderColor: panelStyle.borderColor, backgroundColor: isLight ? "#f8fafc" : "#050507" }}>
-                  <div className="flex items-center gap-2 text-[13px] font-semibold">
-                    <IconZap className="h-4 w-4 text-[var(--accent-light)]" />
-                    {copy.detect}
+                  <div className={settingsSectionRowClass}>
+                    <div>
+                      <label className="block text-[13px] font-bold text-[#e4e4e7]">{copy.localProvider}</label>
+                      <p className="mt-1.5 text-[12px] leading-relaxed text-[#a1a1aa]">{copy.currentLocalHint}</p>
+                    </div>
+                    <div className={settingsControlColumnClass}>
+                      <select
+                        data-testid="image-studio-local-provider-select"
+                        value={localServiceFamilyDraft}
+                        onChange={(event) => applyLocalServiceFamily(event.target.value)}
+                        className={settingsSelectClass}
+                      >
+                        <option value="omlx">{copy.serviceFamilies.omlx}</option>
+                        <option value="ollama">{copy.serviceFamilies.ollama}</option>
+                        <option value="openai_compatible">{copy.serviceFamilies.openai_compatible}</option>
+                      </select>
+                    </div>
                   </div>
-                  <div className="mt-2 text-[12px] leading-relaxed" style={mutedStyle}>
-                    {imageStudio.status.message || copy.noInstall}
-                  </div>
-                  <button
-                    type="button"
-                    onClick={runCheck}
-                    disabled={checking}
-                    className="mt-4 inline-flex h-8 items-center gap-2 rounded-md border border-[var(--accent-subtle-border)] px-3 text-[11px] font-semibold text-[var(--accent-light)] transition-colors hover:bg-[var(--accent-subtle)] disabled:opacity-60"
-                  >
-                    <IconRefresh className="h-3.5 w-3.5" />
-                    {checking ? copy.testing : copy.test}
-                  </button>
-                </div>
-                {imageStudio.config.engine === "huggingface_space" ? (
-                  <div className="rounded-lg border border-[rgba(34,197,94,0.22)] bg-[rgba(34,197,94,0.08)] p-4">
-                    <div className="text-[13px] font-semibold text-[#22c55e]">{copy.hostedTitle}</div>
-                    <div className="mt-2 text-[12px] leading-relaxed" style={mutedStyle}>{copy.hostedBody}</div>
-                  </div>
-                ) : (
-                  <div className="rounded-lg border border-[rgba(245,158,11,0.24)] bg-[rgba(245,158,11,0.08)] p-4">
-                    <div className="text-[13px] font-semibold text-[#f59e0b]">{copy.cudaTitle}</div>
-                    <div className="mt-2 text-[12px] leading-relaxed" style={mutedStyle}>{copy.cudaBody}</div>
-                  </div>
-                )}
-              </div>
-            )}
 
-            {tab === "connect" && (
-              <div className="space-y-4">
-                <label className="block">
-                  <span className="mb-1 block text-[11px] font-semibold uppercase tracking-[0.14em]" style={mutedStyle}>{copy.endpoint}</span>
-                  <input
-                    value={endpointDraft}
-                    onChange={(event) => setEndpointDraft(event.target.value)}
-                    className="h-9 w-full rounded-md border px-3 text-[13px] outline-none focus:border-[var(--accent)]"
-                    style={inputStyle}
-                    spellCheck={false}
-                  />
-                </label>
-                <div className="flex flex-wrap gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setImageStudioConfig({ endpoint: endpointDraft })}
-                    className="inline-flex h-8 items-center gap-2 rounded-md border border-[#27272a] px-3 text-[11px] transition-colors hover:bg-[#18181b]"
-                  >
-                    <IconCheck className="h-3.5 w-3.5" />
-                    {copy.save}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={runCheck}
-                    disabled={checking}
-                    className="inline-flex h-8 items-center gap-2 rounded-md border border-[var(--accent-subtle-border)] px-3 text-[11px] font-semibold text-[var(--accent-light)] transition-colors hover:bg-[var(--accent-subtle)] disabled:opacity-60"
-                  >
-                    <IconRefresh className="h-3.5 w-3.5" />
-                    {checking ? copy.testing : copy.test}
-                  </button>
-                </div>
-                <div className="text-[12px] leading-relaxed" style={mutedStyle}>{copy.noInstall}</div>
-              </div>
-            )}
+                  <div className={`${settingsSectionRowClass} border-t border-[#27272a] pt-5`}>
+                    <div>
+                      <label className="block text-[13px] font-bold text-[#e4e4e7]">{copy.endpoint}</label>
+                    </div>
+                    <div className={settingsControlColumnClass}>
+                      <input
+                        data-testid="image-studio-local-endpoint-input"
+                        value={localEndpointDraft}
+                        onChange={(event) => setLocalEndpointDraft(event.target.value)}
+                        className={`${settingsInputClass} font-mono`}
+                        spellCheck={false}
+                        placeholder={IMAGE_STUDIO_LOCAL_DEFAULT_ENDPOINT}
+                      />
+                    </div>
+                  </div>
 
-            {tab === "manual" && (
-              <div className="space-y-4">
-                <div className="rounded-lg border p-4" style={{ borderColor: panelStyle.borderColor, backgroundColor: isLight ? "#f8fafc" : "#050507" }}>
-                  <div className="text-[13px] font-semibold">{copy.cudaTitle}</div>
-                  <div className="mt-2 text-[12px] leading-relaxed" style={mutedStyle}>{copy.cudaBody}</div>
+                  <div className={`${settingsSectionRowClass} border-t border-[#27272a] pt-5`}>
+                    <div>
+                      <label className="block text-[13px] font-bold text-[#e4e4e7]">{copy.model}</label>
+                    </div>
+                    <div className={settingsControlColumnClass}>
+                      <input
+                        data-testid="image-studio-local-model-input"
+                        value={localModelDraft}
+                        onChange={(event) => setLocalModelDraft(event.target.value)}
+                        className={`${settingsInputClass} font-mono`}
+                        spellCheck={false}
+                        placeholder={language === "en" ? "Optional model id" : "可选 model id"}
+                      />
+                    </div>
+                  </div>
+
+                  <div className={`${settingsSectionRowClass} border-t border-[#27272a] pt-5`}>
+                    <div>
+                      <span className="block text-[13px] font-bold text-[#e4e4e7]">{copy.protocol}</span>
+                    </div>
+                    <div className={settingsControlColumnClass}>
+                      <div className="rounded-md border border-[#27272a] bg-[#000000] px-3 py-2.5 text-[13px] text-[#a1a1aa]">
+                        {copy.protocolValue}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className={`${settingsSectionRowClass} border-t border-[#27272a] pt-5`}>
+                    <div>
+                      <span className="block text-[13px] font-bold text-[#e4e4e7]">{copy.discoveredModels}</span>
+                      <p className="mt-1.5 text-[12px] leading-relaxed text-[#a1a1aa]">{copy.localHint}</p>
+                    </div>
+                    <div className={settingsControlColumnClass}>
+                      {localDiscoveredModels.length > 0 ? (
+                        <div className="flex flex-wrap gap-2">
+                          {localDiscoveredModels.map((modelId) => {
+                            const selected = localModelDraft === modelId;
+                            return (
+                              <button
+                                key={modelId}
+                                type="button"
+                                data-testid="image-studio-discovered-model"
+                                onClick={() => setLocalModelDraft(modelId)}
+                                className={settingsOptionButtonClass(selected, "rounded-full px-3 py-1.5 text-[11px]")}
+                              >
+                                {modelId}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      ) : (
+                        <div className="rounded-md border border-[#27272a] bg-[#000000] px-3 py-2 text-[12px] text-[#71717a]">
+                          {copy.localEmpty}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className={`${settingsSectionRowClass} border-t border-[#27272a] pt-5`}>
+                    <div>
+                      <span className="block text-[13px] font-bold text-[#e4e4e7]">{language === "en" ? "Network Guardrails" : "网络边界"}</span>
+                    </div>
+                    <div className={`${settingsControlColumnClass} rounded-lg border border-[#27272a] bg-[#000000] px-4 py-3`}>
+                      <div className="text-[12px] leading-relaxed text-[#a1a1aa]">{copy.localHintSecondary}</div>
+                    </div>
+                  </div>
                 </div>
-                <div className="rounded-lg border border-[rgba(245,158,11,0.24)] bg-[rgba(245,158,11,0.08)] p-4">
-                  <div className="text-[13px] font-semibold text-[#f59e0b]">{copy.cudaRunTitle}</div>
-                  <div className="mt-2 text-[12px] leading-relaxed" style={mutedStyle}>{copy.cudaRunBody}</div>
+              ) : (
+                <div className="space-y-5">
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-[13px] font-bold uppercase tracking-wider text-[#a1a1aa]">{copy.webRuntime}</h3>
+                  </div>
+
+                  <div className={settingsSectionRowClass}>
+                    <div>
+                      <label className="block text-[13px] font-bold text-[#e4e4e7]">{copy.endpoint}</label>
+                    </div>
+                    <div className={settingsControlColumnClass}>
+                      <input
+                        data-testid="image-studio-web-endpoint-input"
+                        value={webEndpointDraft}
+                        onChange={(event) => setWebEndpointDraft(event.target.value)}
+                        className={`${settingsInputClass} font-mono`}
+                        spellCheck={false}
+                        placeholder={IMAGE_STUDIO_WEB_FALLBACK_ENDPOINT}
+                      />
+                    </div>
+                  </div>
+
+                  <div className={`${settingsSectionRowClass} border-t border-[#27272a] pt-5`}>
+                    <div>
+                      <span className="block text-[13px] font-bold text-[#e4e4e7]">{copy.promptRefine}</span>
+                    </div>
+                    <div className={`${settingsControlColumnClass} flex items-center justify-between rounded-lg border border-[#27272a] bg-[#000000] px-4 py-3`}>
+                      <span className={`min-w-0 text-[12px] font-bold ${imageStudio.config.web.promptRefine ? "theme-text" : "text-[#a1a1aa]"}`}>
+                        {imageStudio.config.web.promptRefine ? copy.enabled : copy.disabled}
+                      </span>
+                      <button
+                        type="button"
+                        role="switch"
+                        aria-checked={imageStudio.config.web.promptRefine}
+                        data-testid="image-studio-web-refine-switch"
+                        aria-label={copy.promptRefine}
+                        onClick={() => setImageStudioConfig({
+                          web: {
+                            ...imageStudio.config.web,
+                            promptRefine: !imageStudio.config.web.promptRefine,
+                          },
+                        })}
+                        className={`relative inline-flex h-6 w-11 items-center rounded-full border p-0.5 transition-all duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-[#000000] ${
+                          imageStudio.config.web.promptRefine
+                            ? "border-transparent shadow-[0_0_12px_var(--accent-subtle)]"
+                            : "border-[#3f3f46] bg-[#18181b]"
+                        }`}
+                        style={imageStudio.config.web.promptRefine ? { backgroundColor: "var(--accent)" } : undefined}
+                      >
+                        <span
+                          className={`block h-5 w-5 rounded-full bg-white shadow-sm transition-transform duration-200 ${
+                            imageStudio.config.web.promptRefine ? "translate-x-5" : "translate-x-0"
+                          }`}
+                        />
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className={`${settingsSectionRowClass} border-t border-[#27272a] pt-5`}>
+                    <div>
+                      <span className="block text-[13px] font-bold text-[#e4e4e7]">{copy.webEnabled}</span>
+                      <p className="mt-1.5 text-[12px] leading-relaxed text-[#a1a1aa]">{copy.webHint}</p>
+                    </div>
+                    <div className={`${settingsControlColumnClass} flex items-center justify-between rounded-lg border border-[#27272a] bg-[#000000] px-4 py-3`}>
+                      <span className={`min-w-0 text-[12px] font-bold ${imageStudio.config.web.enabled ? "theme-text" : "text-[#a1a1aa]"}`}>
+                        {imageStudio.config.web.enabled ? copy.enabled : copy.disabled}
+                      </span>
+                      <button
+                        type="button"
+                        role="switch"
+                        aria-checked={imageStudio.config.web.enabled}
+                        data-testid="image-studio-web-enabled-switch"
+                        aria-label={copy.webEnabled}
+                        onClick={toggleWebEnabled}
+                        className={`relative inline-flex h-6 w-11 items-center rounded-full border p-0.5 transition-all duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-[#000000] ${
+                          imageStudio.config.web.enabled
+                            ? "border-transparent shadow-[0_0_12px_var(--accent-subtle)]"
+                            : "border-[#3f3f46] bg-[#18181b]"
+                        }`}
+                        style={imageStudio.config.web.enabled ? { backgroundColor: "var(--accent)" } : undefined}
+                      >
+                        <span
+                          className={`block h-5 w-5 rounded-full bg-white shadow-sm transition-transform duration-200 ${
+                            imageStudio.config.web.enabled ? "translate-x-5" : "translate-x-0"
+                          }`}
+                        />
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className={`${settingsSectionRowClass} border-t border-[#27272a] pt-5`}>
+                    <div>
+                      <span className="block text-[13px] font-bold text-[#e4e4e7]">{language === "en" ? "Fallback Behavior" : "Fallback 行为"}</span>
+                    </div>
+                    <div className={`${settingsControlColumnClass} rounded-lg border border-[#27272a] bg-[#000000] px-4 py-3`}>
+                      <div className="text-[12px] leading-relaxed text-[#a1a1aa]">
+                        {copy.webStatusIdle}
+                      </div>
+                    </div>
+                  </div>
                 </div>
-                <div className="text-[12px] font-semibold">{copy.hfTitle}</div>
-                <div className="text-[12px] leading-relaxed" style={mutedStyle}>{copy.hfBody}</div>
-                <pre className="overflow-x-auto rounded-lg border p-4 text-[11px] leading-relaxed" style={{ borderColor: panelStyle.borderColor, backgroundColor: isLight ? "#f8fafc" : "#050507", color: isLight ? "#111827" : "#d4d4d8" }}>
-{`huggingface-cli download HiDream-ai/HiDream-O1-Image-Dev \\
-  --local-dir /absolute/path/to/downloaded/HiDream-O1-Image-Dev`}
-                </pre>
-                <pre className="overflow-x-auto rounded-lg border p-4 text-[11px] leading-relaxed" style={{ borderColor: panelStyle.borderColor, backgroundColor: isLight ? "#f8fafc" : "#050507", color: isLight ? "#111827" : "#d4d4d8" }}>
-{`git clone https://github.com/HiDream-ai/HiDream-O1-Image.git
-cd HiDream-O1-Image
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-python app.py \\
-  --model_path /absolute/path/to/downloaded/HiDream-O1-Image-Dev \\
-  --model_type dev \\
-  --host 0.0.0.0 \\
-  --port 7860`}
-                </pre>
-                <div className="rounded-lg border border-[rgba(245,158,11,0.24)] bg-[rgba(245,158,11,0.08)] p-4">
-                  <div className="text-[13px] font-semibold text-[#f59e0b]">{copy.modelPathRequired}</div>
-                  <div className="mt-2 text-[12px] leading-relaxed" style={mutedStyle}>{copy.lanHint}</div>
-                </div>
-                <div className="text-[12px] font-semibold">{copy.envTitle}</div>
-                <pre className="overflow-x-auto rounded-lg border p-4 text-[11px] leading-relaxed" style={{ borderColor: panelStyle.borderColor, backgroundColor: isLight ? "#f8fafc" : "#050507", color: isLight ? "#111827" : "#d4d4d8" }}>
-{`HIDREAM_MODEL_PATH=/absolute/path/to/downloaded/HiDream-O1-Image-Dev
-HIDREAM_MODEL_TYPE=dev
-HIDREAM_HOST=0.0.0.0
-HIDREAM_PORT=7860`}
-                </pre>
-                <div className="text-[12px] leading-relaxed" style={mutedStyle}>{copy.noInstall}</div>
-              </div>
-            )}
+              )}
+            </div>
           </div>
         </div>
       </div>

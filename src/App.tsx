@@ -54,6 +54,11 @@ import { normalizeStudioAgentKey } from "./lib/gameStudioCatalog";
 import { normalizeContextMemoryState } from "./lib/contextMemory";
 import { MAIN_MODE_KEYS, mapLegacyNexusModeToMainMode, mapMainModeToLegacyNexusMode } from "./lib/mainModes";
 import { createDefaultImageStudioRuntime, normalizeImageStudioRuntime } from "./lib/imageStudio";
+import {
+  resolveSessionModeAffinity,
+  type SessionModeAffinity,
+  type SessionModeAffinityLike,
+} from "./lib/imageStudioSessions";
 import { resolveConversationTurnIntent } from "./lib/runIntent";
 import { resolvePlanApprovalQuickReplyAction } from "./lib/planControl";
 import { materializePlanArtifactFromVisibleText } from "./lib/planMaterialization";
@@ -263,6 +268,9 @@ function summarizeUpdateNotes(notes: string, maxLength = 500) {
 
 function buildSessionRuntimeSnapshotFromState(state: any) {
   const taskFlow = sanitizeTaskBlocksForPersist(state.taskFlow || []);
+  const selectedMainModeKey = mapLegacyNexusModeToMainMode(
+    state.selectedMainModeKey || state.selectedNexusModeKey,
+  );
   return {
     runtimeEventSchemaVersion: 1,
     runtimeEvents: state.runtimeEvents || [],
@@ -272,8 +280,9 @@ function buildSessionRuntimeSnapshotFromState(state: any) {
     contextMemoryState: normalizeContextMemoryState(state.contextMemoryState),
     conversationTurns: normalizeInterruptedConversationTurnsForRestore(state.conversationTurns, taskFlow),
     currentTurnId: state.currentTurnId ?? null,
-    selectedMainModeKey: state.selectedMainModeKey,
-    selectedNexusModeKey: state.selectedNexusModeKey,
+    selectedMainModeKey,
+    selectedNexusModeKey: mapMainModeToLegacyNexusMode(selectedMainModeKey),
+    sessionModeAffinity: resolveSessionModeAffinity(state as SessionModeAffinityLike, selectedMainModeKey),
     imageStudio: normalizeImageStudioRuntime(state.imageStudio),
     activeStudioAgentKey: state.activeStudioAgentKey,
     gameStudioInitialized: state.gameStudioInitialized,
@@ -422,6 +431,8 @@ function sortSessionsByRecent(sessions: any[]): any[] {
 function mergeDiskSessionWithLocal(localSession: any, diskSession: any, selectedId: number | null) {
   const diskId = Number(diskSession?.id);
   const active = selectedId != null ? diskId === selectedId : diskSession.active === true;
+  const localAffinity = resolveSessionModeAffinity(localSession as SessionModeAffinityLike, "main_mode");
+  const diskAffinity = resolveSessionModeAffinity(diskSession as SessionModeAffinityLike, localAffinity);
   if (shouldDiscardMissingSession(diskSession) && localSession?.storageStatus !== "temporary") {
     return null;
   }
@@ -432,10 +443,24 @@ function mergeDiskSessionWithLocal(localSession: any, diskSession: any, selected
   ) {
     return {
       ...localSession,
+      sessionModeAffinity: localAffinity,
       active: selectedId != null ? localSession.id === selectedId : localSession.active === true,
     };
   }
-  return { ...diskSession, active };
+  return {
+    ...diskSession,
+    sessionModeAffinity: diskAffinity,
+    runtimeSnapshot: diskSession?.runtimeSnapshot
+      ? {
+          ...diskSession.runtimeSnapshot,
+          sessionModeAffinity: resolveSessionModeAffinity(
+            diskSession.runtimeSnapshot as SessionModeAffinityLike,
+            diskAffinity,
+          ),
+        }
+      : diskSession?.runtimeSnapshot,
+    active,
+  };
 }
 
 function hasArrayItems(value: unknown): boolean {
@@ -506,6 +531,7 @@ function stableRuntimeSignature(value: unknown): string {
     currentTurnId: snapshot.currentTurnId ?? null,
     selectedMainModeKey: snapshot.selectedMainModeKey ?? null,
     selectedNexusModeKey: snapshot.selectedNexusModeKey ?? null,
+    sessionModeAffinity: snapshot.sessionModeAffinity ?? null,
     imageStudio: compactTextSignature(JSON.stringify(snapshot.imageStudio || null)),
     activeStudioAgentKey: snapshot.activeStudioAgentKey ?? null,
     pendingSlashCommand: snapshot.pendingSlashCommand ?? null,
@@ -668,21 +694,20 @@ function mergeSessionPage(
 
 function buildPagedRuntimePatch(entry: SessionTranscriptCacheEntry, fallbackState: any) {
   const restoredTaskFlow = sanitizeTaskBlocksForPersist(entry.taskFlow || []);
+  const selectedMainModeKey = mapLegacyNexusModeToMainMode(
+    entry.runtimeSnapshot?.selectedMainModeKey ||
+      entry.runtimeSnapshot?.selectedNexusModeKey ||
+      entry.runtimeSnapshot?.selectedAgentKey,
+  );
   return {
     taskFlow: restoredTaskFlow,
     agentMessages: sanitizeAgentMessagesForPersist(entry.runtimeSnapshot?.agentMessages || []),
     contextMemoryState: normalizeContextMemoryState(entry.runtimeSnapshot?.contextMemoryState),
-    selectedMainModeKey: mapLegacyNexusModeToMainMode(
-      entry.runtimeSnapshot?.selectedMainModeKey ||
-        entry.runtimeSnapshot?.selectedNexusModeKey ||
-        entry.runtimeSnapshot?.selectedAgentKey,
-    ),
-    selectedNexusModeKey: mapMainModeToLegacyNexusMode(
-      mapLegacyNexusModeToMainMode(
-        entry.runtimeSnapshot?.selectedMainModeKey ||
-          entry.runtimeSnapshot?.selectedNexusModeKey ||
-          entry.runtimeSnapshot?.selectedAgentKey,
-      ),
+    selectedMainModeKey,
+    selectedNexusModeKey: mapMainModeToLegacyNexusMode(selectedMainModeKey),
+    sessionModeAffinity: resolveSessionModeAffinity(
+      entry.runtimeSnapshot as SessionModeAffinityLike,
+      selectedMainModeKey,
     ),
     imageStudio: normalizeImageStudioRuntime(entry.runtimeSnapshot?.imageStudio ?? fallbackState.imageStudio),
     activeStudioAgentKey: normalizeStudioAgentKey(entry.runtimeSnapshot?.activeStudioAgentKey ?? fallbackState.activeStudioAgentKey),
@@ -1243,6 +1268,10 @@ export default function App() {
       currentTurnId,
       selectedMainModeKey,
       selectedNexusModeKey,
+      sessionModeAffinity: resolveSessionModeAffinity(
+        activeSessionRecord as SessionModeAffinityLike,
+        selectedMainModeKey,
+      ),
       activeStudioAgentKey,
       gameStudioInitialized,
       pendingSlashCommand,
@@ -1930,6 +1959,12 @@ export default function App() {
       const snapshot = target.runtimeSnapshot;
       const snapshotTaskFlow = hasArrayItems(snapshot.taskFlow) ? snapshot.taskFlow : target.messages;
       const restoredTaskFlow = sanitizeTaskBlocksForPersist(snapshotTaskFlow || []);
+      const restoredMainMode = mapLegacyNexusModeToMainMode(
+        (snapshot as any).selectedMainModeKey ||
+          (snapshot as any).selectedNexusModeKey ||
+          (snapshot as any).selectedAgentKey ||
+          resolveSessionModeAffinity(target as SessionModeAffinityLike, "main_mode"),
+      );
       const restoredConversationTurns = normalizeInterruptedConversationTurnsForRestore(
         hasArrayItems(snapshot.conversationTurns) ? snapshot.conversationTurns : [],
         restoredTaskFlow,
@@ -1939,18 +1974,8 @@ export default function App() {
         taskFlow: restoredTaskFlow,
         agentMessages: sanitizeAgentMessagesForPersist(snapshot.agentMessages || []),
         contextMemoryState: normalizeContextMemoryState(snapshot.contextMemoryState),
-        selectedMainModeKey: mapLegacyNexusModeToMainMode(
-          (snapshot as any).selectedMainModeKey ||
-            (snapshot as any).selectedNexusModeKey ||
-            (snapshot as any).selectedAgentKey,
-        ),
-        selectedNexusModeKey: mapMainModeToLegacyNexusMode(
-          mapLegacyNexusModeToMainMode(
-            (snapshot as any).selectedMainModeKey ||
-              (snapshot as any).selectedNexusModeKey ||
-              (snapshot as any).selectedAgentKey,
-          ),
-        ),
+        selectedMainModeKey: restoredMainMode,
+        selectedNexusModeKey: mapMainModeToLegacyNexusMode(restoredMainMode),
         activeStudioAgentKey: normalizeStudioAgentKey(snapshot.activeStudioAgentKey ?? useAppStore.getState().activeStudioAgentKey),
         gameStudioInitialized: snapshot.gameStudioInitialized === true || useAppStore.getState().gameStudioInitialized,
         pendingSlashCommand: snapshot.pendingSlashCommand ?? null,
@@ -1999,6 +2024,7 @@ export default function App() {
     if (target?.messages?.length) {
       syncTaskIdCounterFromBlocks(target.messages);
       const turnId = `loaded-${id}-${Date.now()}`;
+      const restoredMainMode = resolveSessionModeAffinity(target as SessionModeAffinityLike, "main_mode");
       const restoredTitle = normalizeConversationDisplayTitle(
         target.title || "",
         48,
@@ -2006,8 +2032,8 @@ export default function App() {
       );
       useAppStore.setState({
         taskFlow: target.messages,
-        selectedMainModeKey: "main_mode",
-        selectedNexusModeKey: "nexus_general",
+        selectedMainModeKey: restoredMainMode,
+        selectedNexusModeKey: mapMainModeToLegacyNexusMode(restoredMainMode),
         activeStudioAgentKey: useAppStore.getState().activeStudioAgentKey,
         gameStudioInitialized: useAppStore.getState().gameStudioInitialized,
         pendingSlashCommand: null,
@@ -2056,10 +2082,11 @@ export default function App() {
       return;
     }
 
+    const restoredMainMode = resolveSessionModeAffinity(target as SessionModeAffinityLike, "main_mode");
     useAppStore.setState({
       taskFlow: [],
-      selectedMainModeKey: "main_mode",
-      selectedNexusModeKey: "nexus_general",
+      selectedMainModeKey: restoredMainMode,
+      selectedNexusModeKey: mapMainModeToLegacyNexusMode(restoredMainMode),
       imageStudio: useAppStore.getState().imageStudio || createDefaultImageStudioRuntime(),
       activeStudioAgentKey: useAppStore.getState().activeStudioAgentKey,
       gameStudioInitialized: useAppStore.getState().gameStudioInitialized,
@@ -2311,6 +2338,7 @@ export default function App() {
       currentTurnId: null,
       selectedMainModeKey: "main_mode",
       selectedNexusModeKey: "nexus_general",
+      sessionModeAffinity: "main_mode",
       activeStudioAgentKey: useAppStore.getState().activeStudioAgentKey,
       gameStudioInitialized: useAppStore.getState().gameStudioInitialized,
       pendingSlashCommand: null,
@@ -2337,6 +2365,7 @@ export default function App() {
       updatedAt: createdAtIso,
       updatedAtMs: createdAt,
       active: true,
+      sessionModeAffinity: "main_mode" as SessionModeAffinity,
       storageStatus: "temporary" as const,
       recordingDisabled: !config.sessionRecordingEnabled,
       messages: [] as TaskBlock[],

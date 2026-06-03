@@ -19,6 +19,7 @@ import {
   readDocument,
   readFile,
   readFileWindow,
+  saveProjectSession,
   writeChatTempFile,
   writeFile,
   type GitDiffEntry,
@@ -240,9 +241,12 @@ import {
   createDefaultImageStudioRuntime,
   createInitialImageProgress,
   getDefaultImageStudioEndpoint,
+  getActiveImageStudioModel,
+  isLocalImageStudioProvider,
   normalizeImageStudioConfig,
   normalizeImageStudioRuntime,
   persistGeneratedImage,
+  runLocalImageStudioGeneration,
   startImageStudioGeneration,
   streamImageStudioGeneration,
   type ImageGenerationBlockPayload,
@@ -251,6 +255,15 @@ import {
   type ImageStudioEngineStatus,
   type ImageStudioRuntime,
 } from "../lib/imageStudio";
+import {
+  buildImageSessionDefaultTitle,
+  buildStandardSessionDefaultTitle,
+  findLatestSessionForAffinity,
+  normalizeSessionModeAffinity,
+  resolveSessionModeAffinity,
+  type SessionModeAffinityLike,
+  type SessionModeAffinity,
+} from "../lib/imageStudioSessions";
 import { runIntentPreflight } from "../lib/intentPreflight";
 import { runAfterNextPaint } from "../lib/uiScheduling";
 import {
@@ -756,6 +769,7 @@ export interface SessionRuntimeSnapshot {
   currentTurnId: string | null;
   selectedMainModeKey: MainModeKey;
   selectedNexusModeKey: NexusModeKey;
+  sessionModeAffinity?: SessionModeAffinity;
   imageStudio?: ImageStudioRuntime;
   activeStudioAgentKey: StudioAgentKey;
   gameStudioInitialized: boolean;
@@ -835,6 +849,7 @@ export interface Session {
   title: string;
   date: string;
   active: boolean;
+  sessionModeAffinity?: SessionModeAffinity;
   titleSource?: "default" | "local_seed" | "semantic" | "manual";
   semanticTitleUpdatedAt?: number;
   titleIntentSignature?: string;
@@ -1129,6 +1144,9 @@ export interface AppState {
   removeMention: (file: string) => void;
   setAttachedFiles: (v: Array<AttachedFile | string>) => void;
   setSelectedMainModeKey: (key: MainModeKey) => void;
+  switchMainModeWithIsolation: (key: MainModeKey) => Promise<void>;
+  createIsolatedImageSession: () => Promise<number | null>;
+  returnFromImageSession: (targetMode?: Exclude<MainModeKey, "image_studio">) => Promise<number | null>;
   setSelectedNexusModeKey: (key: NexusModeKey) => void;
   setActiveStudioAgentKey: (key: StudioAgentKey, options?: { persistToWorkspace?: boolean }) => Promise<void>;
   setGameStudioInitialized: (value: boolean) => void;
@@ -1708,6 +1726,7 @@ export function normalizeSessionRuntimeSnapshot(
     currentTurnId: snapshot.currentTurnId ?? null,
     selectedMainModeKey,
     selectedNexusModeKey: mapMainModeToLegacyNexusMode(selectedMainModeKey),
+    sessionModeAffinity: resolveSessionModeAffinity(snapshot as SessionModeAffinityLike, selectedMainModeKey),
     imageStudio: normalizeImageStudioRuntime(snapshot.imageStudio),
     activeStudioAgentKey: normalizeStudioAgentKey(snapshot.activeStudioAgentKey),
     gameStudioInitialized: snapshot.gameStudioInitialized === true,
@@ -1794,6 +1813,7 @@ const sessionRuntimeKeys = [
   "currentTurnId",
   "selectedMainModeKey",
   "selectedNexusModeKey",
+  "sessionModeAffinity",
   "imageStudio",
   "activeStudioAgentKey",
   "gameStudioInitialized",
@@ -1898,6 +1918,7 @@ function createSessionRuntimeFromState(state: Partial<AppState>): SessionRuntime
     currentTurnId: state.currentTurnId ?? null,
     selectedMainModeKey,
     selectedNexusModeKey: mapMainModeToLegacyNexusMode(selectedMainModeKey),
+    sessionModeAffinity: resolveSessionModeAffinity(state as SessionModeAffinityLike, selectedMainModeKey),
     imageStudio: normalizeImageStudioRuntime(state.imageStudio),
     activeStudioAgentKey: normalizeStudioAgentKey(state.activeStudioAgentKey),
     gameStudioInitialized: state.gameStudioInitialized === true,
@@ -2006,6 +2027,7 @@ function normalizeSessionsByWorkspace(
     const scopeKey = resolveSessionWorkspaceKey(workspace);
     const normalizedSessions = (sessions || []).map((session) => ({
       ...session,
+      sessionModeAffinity: resolveSessionModeAffinity(session as SessionModeAffinityLike, "main_mode"),
       messages: sanitizeTaskBlocksForPersist(session.messages || []),
       runtimeSnapshot: normalizeSessionRuntimeSnapshot(session.runtimeSnapshot),
     }));
@@ -3070,7 +3092,12 @@ export function sanitizeTaskBlocksForPersist(blocks: TaskBlock[]): TaskBlock[] {
           status: b.status,
           prompt: String(b.prompt || ""),
           params: b.params,
+          providerKind: b.providerKind,
+          ...(b.model ? { model: String(b.model) } : {}),
+          ...(b.variantGroupId ? { variantGroupId: String(b.variantGroupId) } : {}),
           progress: b.progress,
+          ...(b.previewUrl ? { previewUrl: String(b.previewUrl) } : {}),
+          ...(b.imageUrl ? { imageUrl: String(b.imageUrl) } : {}),
           ...(b.outputPath ? { outputPath: String(b.outputPath) } : {}),
           ...(b.jobId ? { jobId: String(b.jobId) } : {}),
           ...(b.streamId ? { streamId: String(b.streamId) } : {}),
@@ -3185,6 +3212,125 @@ export function sanitizeTaskBlocksForPersist(blocks: TaskBlock[]): TaskBlock[] {
         return b;
     }
   });
+}
+
+function buildSessionRuntimeSnapshotFromStoreState(state: any): SessionRuntimeSnapshot {
+  const taskFlow = sanitizeTaskBlocksForPersist(state.taskFlow || []);
+  return {
+    runtimeEventSchemaVersion: 1,
+    runtimeEvents: state.runtimeEvents || [],
+    harnessRunMarker: state.harnessRunMarker || null,
+    taskFlow,
+    agentMessages: sanitizeAgentMessagesForPersist(state.agentMessages || []),
+    contextMemoryState: normalizeContextMemoryState(state.contextMemoryState),
+    conversationTurns: normalizeInterruptedConversationTurnsForRestore(state.conversationTurns, taskFlow),
+    currentTurnId: state.currentTurnId ?? null,
+    selectedMainModeKey: state.selectedMainModeKey,
+    selectedNexusModeKey: state.selectedNexusModeKey,
+    sessionModeAffinity: resolveCurrentSessionModeAffinityFromState(state),
+    imageStudio: normalizeImageStudioRuntime(state.imageStudio),
+    activeStudioAgentKey: state.activeStudioAgentKey,
+    gameStudioInitialized: state.gameStudioInitialized,
+    pendingSlashCommand: state.pendingSlashCommand ?? null,
+    planArtifacts: state.planArtifacts || [],
+    planTasks: state.planTasks || [],
+    planExecutionEvidenceLedger: state.planExecutionEvidenceLedger || [],
+    planExecutionEvidenceCount: state.planExecutionEvidenceCount ?? 0,
+    planStage: state.planStage ?? "idle",
+    isPlanApproved: state.isPlanApproved === true,
+    planApprovalChoice: state.planApprovalChoice ?? null,
+    showPlanPanel: state.showPlanPanel === true,
+    showDiff: state.showDiff === true,
+    showTerminal: state.showTerminal === true,
+    showFilePanel: state.showFilePanel === true,
+    rightPanelTab: normalizeStoredRightPanelTab(state.rightPanelTab),
+    selectedDiffTaskId: state.selectedDiffTaskId ?? null,
+    autoApproveTools: state.autoApproveTools === true,
+    autoApproveToolScopes: state.autoApproveToolScopes || [],
+    webSearchEnabled: state.webSearchEnabled === true,
+    webSearchProvider: normalizeWebSearchProvider(state.webSearchProvider),
+    approvedShellPermissionRules: Array.isArray(state.approvedShellPermissionRules)
+      ? state.approvedShellPermissionRules.filter((rule: unknown) => typeof rule === "string")
+      : [],
+    queuedUserMessage: state.queuedUserMessage ?? null,
+    activeGuidance: state.activeGuidance ?? null,
+  };
+}
+
+function resolveCurrentSessionModeAffinityFromState(state: any): SessionModeAffinity {
+  const scopeKey = resolveSessionWorkspaceKey(state.currentWorkspace);
+  const activeSession = (state.sessionsByWorkspace?.[scopeKey] || []).find(
+    (session: Session) => session.id === state.currentSessionId,
+  );
+  return resolveSessionModeAffinity(activeSession || state, state.selectedMainModeKey || "main_mode");
+}
+
+function buildEmptySessionRuntimeSnapshot(state: any, affinity: SessionModeAffinity): SessionRuntimeSnapshot {
+  const selectedMainModeKey = normalizeSessionModeAffinity(affinity, "main_mode");
+  return {
+    ...buildSessionRuntimeSnapshotFromStoreState({
+      ...state,
+      taskFlow: [],
+      agentMessages: [],
+      contextMemoryState: null,
+      conversationTurns: [],
+      currentTurnId: null,
+      selectedMainModeKey,
+      selectedNexusModeKey: mapMainModeToLegacyNexusMode(selectedMainModeKey),
+      imageStudio: state.imageStudio || createDefaultImageStudioRuntime(),
+      pendingSlashCommand: null,
+      planArtifacts: [],
+      planTasks: [],
+      planExecutionEvidenceLedger: [],
+      planExecutionEvidenceCount: 0,
+      planStage: "idle",
+      isPlanApproved: false,
+      planApprovalChoice: null,
+      showPlanPanel: false,
+      showDiff: false,
+      showTerminal: false,
+      showFilePanel: false,
+      rightPanelTab: "plan",
+      selectedDiffTaskId: null,
+      autoApproveTools: false,
+      autoApproveToolScopes: [],
+      webSearchEnabled: false,
+      webSearchProvider: "duckduckgo",
+      approvedShellPermissionRules: [],
+      queuedUserMessage: null,
+      activeGuidance: null,
+    }),
+    sessionModeAffinity: selectedMainModeKey,
+  };
+}
+
+function buildNewSessionRecord(params: {
+  state: any;
+  scopeKey: string;
+  affinity: SessionModeAffinity;
+  language: "zh" | "en";
+  title?: string;
+}): Session {
+  const createdAt = Date.now();
+  const createdAtIso = new Date(createdAt).toISOString();
+  return {
+    id: createdAt,
+    title: params.title || (
+      params.affinity === "image_studio"
+        ? buildImageSessionDefaultTitle(params.language)
+        : buildStandardSessionDefaultTitle(params.language, params.scopeKey, GLOBAL_CHAT_KEY)
+    ),
+    date: createdAtIso,
+    updatedAt: createdAtIso,
+    updatedAtMs: createdAt,
+    active: true,
+    sessionModeAffinity: params.affinity,
+    titleSource: "default",
+    storageStatus: "temporary",
+    recordingDisabled: !params.state.config.sessionRecordingEnabled,
+    messages: [],
+    runtimeSnapshot: buildEmptySessionRuntimeSnapshot(params.state, params.affinity),
+  };
 }
 
 export function finalizeStreamingTaskBlocks(
@@ -4232,22 +4378,303 @@ export const useAppStore = create<AppState>()(
       });
     });
   },
-  setImageStudioConfig: (patch) =>
+  setSelectedMainModeKey: (key) => set((s) => ({
+    selectedMainModeKey: key,
+    selectedNexusModeKey: mapMainModeToLegacyNexusMode(key),
+    lockedComposerIntent: null,
+    rightPanelTab: normalizeStoredRightPanelTab(s.rightPanelTab),
+  })),
+  createIsolatedImageSession: async () => {
+    const state = get();
+    const language = state.config.language === "en" ? "en" : "zh";
+    const scopeKey = resolveSessionWorkspaceKey(state.currentWorkspace);
+    const currentSession = (state.sessionsByWorkspace[scopeKey] || []).find((session) => session.id === state.currentSessionId) || null;
+    const currentAffinity = resolveSessionModeAffinity(
+      (currentSession || state) as SessionModeAffinityLike,
+      state.selectedMainModeKey,
+    );
+    if (currentAffinity === "image_studio" && state.selectedMainModeKey === "image_studio" && state.currentSessionId) {
+      return state.currentSessionId;
+    }
+
+    if (state.currentSessionId && currentSession) {
+      const runtimeSnapshot = buildSessionRuntimeSnapshotFromStoreState(state);
+      const messages = sanitizeTaskBlocksForPersist(state.taskFlow || []);
+      const sessionPatch: Partial<Session> = {
+        active: false,
+        sessionModeAffinity: currentAffinity,
+        updatedAt: new Date().toISOString(),
+        updatedAtMs: Date.now(),
+        messages,
+        runtimeSnapshot,
+      };
+      state.updateSession(scopeKey, state.currentSessionId, sessionPatch);
+      if (state.config.sessionRecordingEnabled && !currentSession.recordingDisabled) {
+        void saveProjectSession(scopeKey, { ...currentSession, ...sessionPatch })
+          .then((saved) => {
+            get().updateSession(scopeKey, currentSession.id, {
+              ...saved,
+              storageStatus: "ok",
+              recordingDisabled: false,
+            });
+          })
+          .catch((error) => {
+            appendDebugLog("warn", "session.storage", {
+              phase: "image_mode_switch_save_failed",
+              scopeKey,
+              sessionId: currentSession.id,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          });
+      }
+    }
+
+    if (scopeKey !== GLOBAL_CHAT_KEY) {
+      state.addWorkspaceEntry(scopeKey);
+    }
+    const imageSession = buildNewSessionRecord({
+      state,
+      scopeKey,
+      affinity: "image_studio",
+      language,
+      title: buildImageSessionDefaultTitle(language),
+    });
+    const imageRuntime = createSessionRuntimeFromState(imageSession.runtimeSnapshot || {});
+
     set((s) => ({
-      imageStudio: {
-        ...s.imageStudio,
-        config: normalizeImageStudioConfig({
-          ...s.imageStudio.config,
-          ...patch,
-          endpoint: patch.engine && !Object.prototype.hasOwnProperty.call(patch, "endpoint")
-            ? getDefaultImageStudioEndpoint(patch.engine)
-            : patch.endpoint ?? s.imageStudio.config.endpoint,
-          defaultSize: patch.defaultSize
-            ? { ...s.imageStudio.config.defaultSize, ...patch.defaultSize }
-            : s.imageStudio.config.defaultSize,
-        }),
+      sessionsByWorkspace: {
+        ...s.sessionsByWorkspace,
+        [scopeKey]: [
+          imageSession,
+          ...(s.sessionsByWorkspace[scopeKey] || []).map((session) => ({
+            ...session,
+            active: false,
+          })),
+        ],
       },
-    })),
+      activeSessionByWorkspace: {
+        ...s.activeSessionByWorkspace,
+        [scopeKey]: imageSession.id,
+      },
+      currentSessionId: imageSession.id,
+      ...getSessionRuntimeUiPatch(imageRuntime, { resetPanels: true }),
+      selectedMainModeKey: "image_studio",
+      selectedNexusModeKey: "nexus_general",
+      lockedComposerIntent: null,
+      pendingRunDecision: null,
+      pendingRunDecisionResolver: null,
+      currentTurnExecutionConsent: { turnId: null, granted: false },
+      autoApproveTools: false,
+      autoApproveToolScopes: [],
+      webSearchEnabled: false,
+      webSearchProvider: "duckduckgo",
+      approvedLocalFileReadPaths: [],
+      approvedShellPermissionRules: [],
+      readOnlyAutoApproveForSession: false,
+      queuedUserMessage: null,
+      activeGuidance: null,
+      isGenerating: false,
+      agentStatus: "idle",
+      abortController: null,
+    }));
+
+    return imageSession.id;
+  },
+  returnFromImageSession: async (targetMode = "main_mode") => {
+    const state = get();
+    const language = state.config.language === "en" ? "en" : "zh";
+    const scopeKey = resolveSessionWorkspaceKey(state.currentWorkspace);
+    const currentSession = (state.sessionsByWorkspace[scopeKey] || []).find((session) => session.id === state.currentSessionId) || null;
+    const currentAffinity = resolveSessionModeAffinity(
+      (currentSession || state) as SessionModeAffinityLike,
+      state.selectedMainModeKey,
+    );
+
+    if (currentAffinity === "image_studio" && state.currentSessionId && currentSession) {
+      const runtimeSnapshot = buildSessionRuntimeSnapshotFromStoreState(state);
+      const messages = sanitizeTaskBlocksForPersist(state.taskFlow || []);
+      const sessionPatch: Partial<Session> = {
+        active: false,
+        sessionModeAffinity: "image_studio",
+        updatedAt: new Date().toISOString(),
+        updatedAtMs: Date.now(),
+        messages,
+        runtimeSnapshot,
+      };
+      state.updateSession(scopeKey, state.currentSessionId, sessionPatch);
+      if (state.config.sessionRecordingEnabled && !currentSession.recordingDisabled) {
+        void saveProjectSession(scopeKey, { ...currentSession, ...sessionPatch })
+          .then((saved) => {
+            get().updateSession(scopeKey, currentSession.id, {
+              ...saved,
+              storageStatus: "ok",
+              recordingDisabled: false,
+            });
+          })
+          .catch((error) => {
+            appendDebugLog("warn", "session.storage", {
+              phase: "image_mode_return_save_failed",
+              scopeKey,
+              sessionId: currentSession.id,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          });
+      }
+    }
+
+    const nextSession = findLatestSessionForAffinity(
+      state.sessionsByWorkspace[scopeKey] || [],
+      targetMode,
+      { excludeSessionId: state.currentSessionId },
+    );
+
+    if (!nextSession) {
+      if (scopeKey !== GLOBAL_CHAT_KEY) {
+        state.addWorkspaceEntry(scopeKey);
+      }
+      const created = buildNewSessionRecord({
+        state,
+        scopeKey,
+        affinity: targetMode,
+        language,
+      });
+      const runtime = createSessionRuntimeFromState(created.runtimeSnapshot || {});
+      set((s) => ({
+        sessionsByWorkspace: {
+          ...s.sessionsByWorkspace,
+          [scopeKey]: [
+            created,
+            ...(s.sessionsByWorkspace[scopeKey] || []).map((session) => ({
+              ...session,
+              active: false,
+            })),
+          ],
+        },
+        activeSessionByWorkspace: {
+          ...s.activeSessionByWorkspace,
+          [scopeKey]: created.id,
+        },
+        currentSessionId: created.id,
+        ...getSessionRuntimeUiPatch(runtime, { resetPanels: true }),
+        selectedMainModeKey: targetMode,
+        selectedNexusModeKey: mapMainModeToLegacyNexusMode(targetMode),
+        lockedComposerIntent: null,
+        pendingRunDecision: null,
+        pendingRunDecisionResolver: null,
+      }));
+      return created.id;
+    }
+
+    const runtime = createSessionRuntimeFromState(nextSession.runtimeSnapshot || {
+      taskFlow: nextSession.messages || [],
+      agentMessages: [],
+      contextMemoryState: null,
+      conversationTurns: [],
+      currentTurnId: null,
+      selectedMainModeKey: targetMode,
+      selectedNexusModeKey: mapMainModeToLegacyNexusMode(targetMode),
+      sessionModeAffinity: targetMode,
+      imageStudio: state.imageStudio,
+      activeStudioAgentKey: state.activeStudioAgentKey,
+      gameStudioInitialized: state.gameStudioInitialized,
+      pendingSlashCommand: null,
+      planArtifacts: [],
+      planTasks: [],
+      planExecutionEvidenceLedger: [],
+      planExecutionEvidenceCount: 0,
+      planStage: "idle",
+      isPlanApproved: false,
+      showPlanPanel: false,
+      showDiff: false,
+      showTerminal: false,
+      showFilePanel: false,
+      rightPanelTab: "plan",
+      selectedDiffTaskId: null,
+    });
+
+    set((s) => ({
+      sessionsByWorkspace: {
+        ...s.sessionsByWorkspace,
+        [scopeKey]: (s.sessionsByWorkspace[scopeKey] || []).map((session) => ({
+          ...session,
+          active: session.id === nextSession.id,
+        })),
+      },
+      activeSessionByWorkspace: {
+        ...s.activeSessionByWorkspace,
+        [scopeKey]: nextSession.id,
+      },
+      currentSessionId: nextSession.id,
+      ...getSessionRuntimeUiPatch(runtime, { resetPanels: true }),
+      selectedMainModeKey: targetMode,
+      selectedNexusModeKey: mapMainModeToLegacyNexusMode(targetMode),
+      lockedComposerIntent: null,
+      pendingRunDecision: null,
+      pendingRunDecisionResolver: null,
+    }));
+
+    return nextSession.id;
+  },
+  switchMainModeWithIsolation: async (key) => {
+    const state = get();
+    const scopeKey = resolveSessionWorkspaceKey(state.currentWorkspace);
+    const currentSession = (state.sessionsByWorkspace[scopeKey] || []).find((session) => session.id === state.currentSessionId) || null;
+    const currentAffinity = resolveSessionModeAffinity(
+      (currentSession || state) as SessionModeAffinityLike,
+      state.selectedMainModeKey,
+    );
+
+    if (key === "image_studio") {
+      await get().createIsolatedImageSession();
+      return;
+    }
+
+    if (currentAffinity === "image_studio") {
+      await get().returnFromImageSession(key);
+      return;
+    }
+
+    get().setSelectedMainModeKey(key);
+  },
+  setImageStudioConfig: (patch) =>
+    set((s) => {
+      const nextConfig = normalizeImageStudioConfig({
+        ...s.imageStudio.config,
+        ...patch,
+        local: patch.local
+          ? {
+              ...s.imageStudio.config.local,
+              ...patch.local,
+              endpoint: patch.provider === "local_image_service" && !patch.local.endpoint
+                ? getDefaultImageStudioEndpoint("local_image_service")
+                : patch.local.endpoint ?? s.imageStudio.config.local.endpoint,
+            }
+          : s.imageStudio.config.local,
+        web: patch.web
+          ? {
+              ...s.imageStudio.config.web,
+              ...patch.web,
+              endpoint: patch.provider === "web_fallback" && !patch.web.endpoint
+                ? getDefaultImageStudioEndpoint("web_fallback")
+                : patch.web.endpoint ?? s.imageStudio.config.web.endpoint,
+            }
+          : s.imageStudio.config.web,
+        defaultSize: patch.defaultSize
+          ? { ...s.imageStudio.config.defaultSize, ...patch.defaultSize }
+          : s.imageStudio.config.defaultSize,
+      });
+      return {
+        imageStudio: {
+          ...s.imageStudio,
+          config: nextConfig,
+          status: {
+            ...s.imageStudio.status,
+            providerKind: nextConfig.provider,
+            activeModel: getActiveImageStudioModel(nextConfig),
+          },
+        },
+      };
+    }),
   setImageStudioStatus: (status) =>
     set((s) => ({
       imageStudio: {
@@ -4259,6 +4686,12 @@ export const useAppStore = create<AppState>()(
             ...s.imageStudio.status.capabilities,
             ...(status.capabilities || {}),
           },
+          discoveredModels: Array.isArray(status.discoveredModels)
+            ? status.discoveredModels
+            : s.imageStudio.status.discoveredModels,
+          activeModel: typeof status.activeModel === "string"
+            ? status.activeModel
+            : s.imageStudio.status.activeModel,
         },
       },
     })),
@@ -4276,7 +4709,6 @@ export const useAppStore = create<AppState>()(
       imageStudio: {
         ...s.imageStudio,
         status,
-        setupGuideOpen: status.state === "ready" ? false : s.imageStudio.setupGuideOpen,
       },
     }));
     return status;
@@ -4287,14 +4719,32 @@ export const useAppStore = create<AppState>()(
     if (get().isGenerating) return false;
 
     const state = get();
-    if (state.imageStudio.config.engine === "huggingface_space") {
+    const isLocalProvider = isLocalImageStudioProvider(state.imageStudio.config);
+    if (!isLocalProvider && state.imageStudio.config.web.enabled === false) {
+      const errMsg = state.config.language === "en"
+        ? "HiDream Web fallback is disabled. Re-enable it in Image Studio settings or switch back to a local provider."
+        : "HiDream 网页 fallback 已关闭，请在图像工作室设置里重新开启，或切回本地 provider。";
+      set((s) => ({
+        imageStudio: {
+          ...s.imageStudio,
+          status: {
+            ...s.imageStudio.status,
+            state: "error",
+            message: errMsg,
+          },
+          setupGuideOpen: true,
+        },
+      }));
+      return false;
+    }
+    if (!isLocalProvider) {
       const now = Date.now();
       const cooldownUntil = state.imageStudio.cooldownUntil || 0;
       if (now < cooldownUntil) {
         const remainingSec = Math.ceil((cooldownUntil - now) / 1000);
         const errMsg = state.config.language === "en"
-          ? `Hugging Face generation is cooling down. Please wait ${remainingSec}s.`
-          : `Hugging Face 在线生成冷却中，请等待 ${remainingSec} 秒。`;
+          ? `Web fallback image generation is cooling down. Please wait ${remainingSec}s.`
+          : `网页 fallback 生图冷却中，请等待 ${remainingSec} 秒。`;
         set((s) => ({
           imageStudio: {
             ...s.imageStudio,
@@ -4318,20 +4768,13 @@ export const useAppStore = create<AppState>()(
       workspaceSessions.some((session) => session.id === ensuredSessionId);
 
     if (!hasValidCurrentSession) {
-      const autoSessionId = Date.now();
-      const autoSessionDate = new Date(autoSessionId).toISOString();
-      const autoSession: Session = {
-        id: autoSessionId,
-        title: language === "en" ? "Image Studio" : "图像工作室",
-        titleSource: "default",
-        date: autoSessionDate,
-        updatedAt: autoSessionDate,
-        updatedAtMs: autoSessionId,
-        active: true,
-        storageStatus: "temporary",
-        recordingDisabled: !state.config.sessionRecordingEnabled,
-        messages: [],
-      };
+      const autoSession = buildNewSessionRecord({
+        state,
+        scopeKey: sessionScopeKey,
+        affinity: "image_studio",
+        language,
+        title: buildImageSessionDefaultTitle(language),
+      });
       set((s) => ({
         sessionsByWorkspace: {
           ...s.sessionsByWorkspace,
@@ -4343,9 +4786,13 @@ export const useAppStore = create<AppState>()(
             })),
           ],
         },
-        currentSessionId: autoSessionId,
+        activeSessionByWorkspace: {
+          ...s.activeSessionByWorkspace,
+          [sessionScopeKey]: autoSession.id,
+        },
+        currentSessionId: autoSession.id,
       }));
-      ensuredSessionId = autoSessionId;
+      ensuredSessionId = autoSession.id;
     }
 
     const runSessionKey = resolveSessionRuntimeKey(sessionScopeKey, ensuredSessionId)!;
@@ -4355,6 +4802,8 @@ export const useAppStore = create<AppState>()(
     const userBlockId = get()._nextTaskId();
     const generationBlockId = get()._nextTaskId();
     const params: ImageGenerationParams = buildImageGenerationParams(state.imageStudio.config);
+    const variantGroupId = `image-variant-${ensuredSessionId}-${issuedAt}`;
+    const activeModel = getActiveImageStudioModel(state.imageStudio.config);
     const turnTitle = normalizeConversationDisplayTitle(
       prompt,
       language === "en" ? 48 : 40,
@@ -4374,6 +4823,9 @@ export const useAppStore = create<AppState>()(
       status: "queued",
       prompt,
       params,
+      providerKind: params.providerKind,
+      ...(activeModel ? { model: activeModel } : {}),
+      variantGroupId,
       progress: createInitialImageProgress(),
     };
 
@@ -4384,47 +4836,11 @@ export const useAppStore = create<AppState>()(
         updatedAt: new Date().toISOString(),
         updatedAtMs: Date.now(),
         active: true,
+        sessionModeAffinity: "image_studio",
         messages: sanitizeTaskBlocksForPersist(latest.taskFlow),
         storageStatus: latest.config.sessionRecordingEnabled ? "ok" : "temporary",
         recordingDisabled: !latest.config.sessionRecordingEnabled,
-        runtimeSnapshot: normalizeSessionRuntimeSnapshot({
-          runtimeEventSchemaVersion: 1,
-          runtimeEvents: latest.runtimeEvents,
-          harnessRunMarker: latest.harnessRunMarker,
-          taskFlow: latest.taskFlow,
-          agentMessages: latest.agentMessages,
-          contextMemoryState: latest.contextMemoryState,
-          contextMemoryStateByRuntimeKey: latest.contextMemoryStateByRuntimeKey,
-          providerCompatibilityByRuntimeKey: latest.providerCompatibilityByRuntimeKey,
-          conversationTurns: latest.conversationTurns,
-          currentTurnId: latest.currentTurnId,
-          selectedMainModeKey: latest.selectedMainModeKey,
-          selectedNexusModeKey: latest.selectedNexusModeKey,
-          imageStudio: latest.imageStudio,
-          activeStudioAgentKey: latest.activeStudioAgentKey,
-          gameStudioInitialized: latest.gameStudioInitialized,
-          pendingSlashCommand: latest.pendingSlashCommand,
-          planArtifacts: latest.planArtifacts,
-          planTasks: latest.planTasks,
-          planExecutionEvidenceLedger: latest.planExecutionEvidenceLedger,
-          planExecutionEvidenceCount: latest.planExecutionEvidenceCount,
-          planAutoResumeCount: latest.planAutoResumeCount,
-          planExecutionProgressSnapshot: latest.planExecutionProgressSnapshot,
-          planStage: latest.planStage,
-          isPlanApproved: latest.isPlanApproved,
-          showPlanPanel: latest.showPlanPanel,
-          showDiff: latest.showDiff,
-          showTerminal: latest.showTerminal,
-          showFilePanel: latest.showFilePanel,
-          rightPanelTab: latest.rightPanelTab,
-          selectedDiffTaskId: latest.selectedDiffTaskId,
-          autoApproveTools: latest.autoApproveTools,
-          autoApproveToolScopes: latest.autoApproveToolScopes,
-          webSearchEnabled: latest.webSearchEnabled,
-          webSearchProvider: latest.webSearchProvider,
-          queuedUserMessage: latest.queuedUserMessage,
-          activeGuidance: latest.activeGuidance,
-        }),
+        runtimeSnapshot: normalizeSessionRuntimeSnapshot(buildSessionRuntimeSnapshotFromStoreState(latest)),
       });
     };
 
@@ -4473,6 +4889,7 @@ export const useAppStore = create<AppState>()(
         updatedAt: issuedAtIso,
         updatedAtMs: issuedAt,
         active: true,
+        sessionModeAffinity: "image_studio",
       });
     }
     persistSession();
@@ -4487,7 +4904,7 @@ export const useAppStore = create<AppState>()(
       }));
     };
     const finishTurn = (status: ConversationTurnStatus, summary: string) => {
-      const isHF = get().imageStudio.config.engine === "huggingface_space";
+      const isWebFallback = !isLocalImageStudioProvider(get().imageStudio.config);
       set((s) => ({
         isGenerating: false,
         abortController: null,
@@ -4496,7 +4913,7 @@ export const useAppStore = create<AppState>()(
           ...s.imageStudio,
           activeJobId: null,
           activeStreamId: null,
-          ...(isHF ? { cooldownUntil: Date.now() + 15000 } : {}),
+          ...(isWebFallback ? { cooldownUntil: Date.now() + 15000 } : {}),
         },
         conversationTurns: s.conversationTurns.map((turn) =>
           turn.id === turnId ? { ...turn, status, summary, elapsedTime: turn.elapsedTime || s.elapsedTime || 0 } : turn
@@ -4593,7 +5010,7 @@ export const useAppStore = create<AppState>()(
             step: 0,
             total: params.steps,
             percent: 2,
-            message: language === "en" ? "Checking image engine" : "正在检查图像引擎",
+            message: language === "en" ? "Checking image provider" : "正在检查图片 provider",
           },
         });
         const status = await checkImageStudioEngineStatus(state.imageStudio.config);
@@ -4606,7 +5023,7 @@ export const useAppStore = create<AppState>()(
         }));
         if (status.state !== "ready") {
           await completeOnce({
-            error: status.message || (language === "en" ? "Image engine is not ready." : "图像引擎未就绪。"),
+            error: status.message || (language === "en" ? "Image provider is not ready." : "图片 provider 未就绪。"),
           });
           return;
         }
@@ -4617,11 +5034,31 @@ export const useAppStore = create<AppState>()(
             step: 0,
             total: params.steps,
             percent: 5,
-            message: state.imageStudio.config.engine === "huggingface_space"
-              ? (language === "en" ? "Submitting to Hugging Face Space" : "正在提交到 Hugging Face Space")
-              : (language === "en" ? "Starting HiDream job" : "正在启动 HiDream 任务"),
+            message: isLocalProvider
+              ? (language === "en" ? "Sending to local image service" : "正在发送到本地图像服务")
+              : (language === "en" ? "Submitting to web fallback provider" : "正在提交到网页 fallback 服务"),
           },
         });
+        if (isLocalProvider) {
+          updateGenerationBlock({
+            progress: {
+              stage: "generating",
+              step: 0,
+              total: params.steps,
+              percent: 20,
+              message: language === "en" ? "Generating with local image service" : "本地图像服务生成中",
+            },
+          });
+          const localResult = await runLocalImageStudioGeneration({
+            prompt,
+            config: state.imageStudio.config,
+            generationParams: params,
+            referenceImages: images,
+          });
+          await completeOnce(localResult);
+          return;
+        }
+
         const started = await startImageStudioGeneration({
           prompt,
           config: state.imageStudio.config,

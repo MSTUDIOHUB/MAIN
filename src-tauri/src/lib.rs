@@ -6904,14 +6904,14 @@ static IMAGE_STUDIO_STREAM_ABORT: std::sync::Mutex<Option<futures_util::future::
 
 fn normalize_image_studio_engine(engine: &str) -> Result<&'static str, String> {
     match engine.trim() {
-        "huggingface_space" => Ok("huggingface_space"),
-        "hidream_http" => Ok("hidream_http"),
-        _ => Err("Unsupported Image Studio engine.".to_string()),
+        "local_image_service" | "hidream_http" => Ok("local_image_service"),
+        "web_fallback" | "huggingface_space" => Ok("web_fallback"),
+        _ => Err("Unsupported Image Studio provider.".to_string()),
     }
 }
 
 fn image_studio_default_capabilities(engine: &str) -> ImageStudioEngineCapabilities {
-    let hosted = engine == "huggingface_space";
+    let hosted = engine == "web_fallback";
     ImageStudioEngineCapabilities {
         text_to_image: true,
         image_to_image: !hosted,
@@ -6993,12 +6993,12 @@ fn validate_image_studio_endpoint_for_engine(engine: &str, endpoint: &str) -> Re
     let host = parsed
         .host_str()
         .ok_or_else(|| "图像工作室 endpoint 缺少主机名".to_string())?;
-    if engine == "huggingface_space" {
+    if engine == "web_fallback" {
         if parsed.scheme() != "https" {
-            return Err("Hugging Face Space endpoint 必须使用 https".to_string());
+            return Err("HiDream Web fallback endpoint 必须使用 https".to_string());
         }
         if !is_allowed_hugging_face_space_host(host) {
-            return Err("Hugging Face Space endpoint 仅允许 HiDream-O1-Image-Dev 官方 Space".to_string());
+            return Err("HiDream Web fallback endpoint 仅允许官方托管 Space".to_string());
         }
     } else if !is_allowed_image_studio_host(host) {
         return Err("图像工作室 endpoint 只允许 localhost、127.0.0.1、::1 或私有局域网 IP".to_string());
@@ -7030,14 +7030,55 @@ async fn check_image_studio_engine(
     endpoint: String,
 ) -> Result<ImageStudioEngineCheckResult, String> {
     let engine_kind = normalize_image_studio_engine(&engine)?;
-    let health_path = if engine_kind == "huggingface_space" { "/config" } else { "/" };
-    let url = build_image_studio_url(engine_kind, &endpoint, health_path)?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .connect_timeout(Duration::from_secs(3))
         .build()
         .map_err(|e| format!("创建图像工作室 HTTP 客户端失败: {e}"))?;
 
+    if engine_kind == "local_image_service" {
+        let health_url = build_image_studio_url(engine_kind, &endpoint, "/health")?;
+        match client.get(health_url.clone()).send().await {
+            Ok(response) if response.status().is_success() => {
+                return Ok(ImageStudioEngineCheckResult {
+                    ready: true,
+                    message: format!("Local image service is reachable at {}.", health_url),
+                    capabilities: image_studio_default_capabilities(engine_kind),
+                });
+            }
+            Ok(_) | Err(_) => {}
+        }
+
+        let models_url = build_image_studio_url(engine_kind, &endpoint, "/v1/models")?;
+        return match client.get(models_url.clone()).send().await {
+            Ok(response) => {
+                let status = response.status();
+                let ready = status.is_success();
+                Ok(ImageStudioEngineCheckResult {
+                    ready,
+                    message: if ready {
+                        format!("Local image service model discovery succeeded at {}.", models_url)
+                    } else {
+                        format!("Local image service returned HTTP {} from /v1/models.", status)
+                    },
+                    capabilities: image_studio_default_capabilities(engine_kind),
+                })
+            }
+            Err(error) => Ok(ImageStudioEngineCheckResult {
+                ready: false,
+                message: if error.is_connect() {
+                    "未连接到本地图片服务，请确认服务已启动并监听在回环或私网地址。".to_string()
+                } else if error.is_timeout() {
+                    "本地图片服务健康检查超时。".to_string()
+                } else {
+                    format!("本地图片服务健康检查失败: {error}")
+                },
+                capabilities: image_studio_default_capabilities(engine_kind),
+            }),
+        };
+    }
+
+    let url = build_image_studio_url(engine_kind, &endpoint, "/config")?;
     match client.get(url.clone()).send().await {
         Ok(response) => {
             let status = response.status();
@@ -7045,13 +7086,9 @@ async fn check_image_studio_engine(
             Ok(ImageStudioEngineCheckResult {
                 ready,
                 message: if ready {
-                    if engine_kind == "huggingface_space" {
-                        "Hugging Face HiDream Space is reachable and ready for hosted generation.".to_string()
-                    } else {
-                        format!("HiDream HTTP service is reachable at {}.", url)
-                    }
+                    "HiDream Web fallback is reachable and ready for hosted generation.".to_string()
                 } else {
-                    format!("Image Studio engine returned HTTP {}.", status)
+                    format!("HiDream Web fallback returned HTTP {}.", status)
                 },
                 capabilities: image_studio_default_capabilities(engine_kind),
             })
@@ -7059,15 +7096,11 @@ async fn check_image_studio_engine(
         Err(error) => Ok(ImageStudioEngineCheckResult {
             ready: false,
             message: if error.is_connect() {
-                if engine_kind == "huggingface_space" {
-                    "无法连接 Hugging Face Space，请检查网络或稍后重试。".to_string()
-                } else {
-                    "未连接到图像引擎，请确认 HiDream/ComfyUI HTTP 服务已启动。".to_string()
-                }
+                "无法连接 HiDream Web，请检查网络或稍后重试。".to_string()
             } else if error.is_timeout() {
-                "图像引擎健康检查超时。".to_string()
+                "HiDream Web 健康检查超时。".to_string()
             } else {
-                format!("图像引擎健康检查失败: {error}")
+                format!("HiDream Web 健康检查失败: {error}")
             },
             capabilities: image_studio_default_capabilities(engine_kind),
         }),
@@ -7084,7 +7117,7 @@ async fn proxy_image_studio_request(
     body: Option<String>,
     stream_id: Option<String>,
 ) -> Result<ImageStudioProxyResponse, String> {
-    let engine_kind = normalize_image_studio_engine(engine.as_deref().unwrap_or("hidream_http"))?;
+    let engine_kind = normalize_image_studio_engine(engine.as_deref().unwrap_or("local_image_service"))?;
     let meth = method.trim().to_ascii_uppercase();
     let url = build_image_studio_url(engine_kind, &endpoint, &path)?;
     let client = reqwest::Client::builder()
@@ -7343,8 +7376,9 @@ fn save_image_studio_output(
 fn validate_image_studio_remote_image_url(image_url: &str) -> Result<url::Url, String> {
     let parsed = url::Url::parse(image_url.trim())
         .map_err(|e| format!("图像输出 URL 无效: {e}"))?;
-    if parsed.scheme() != "https" {
-        return Err("远程图像输出只允许 https URL".to_string());
+    match parsed.scheme() {
+        "http" | "https" => {}
+        _ => return Err("远程图像输出只允许 http/https URL".to_string()),
     }
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err("远程图像输出 URL 不允许包含用户名或密码".to_string());
@@ -7352,11 +7386,17 @@ fn validate_image_studio_remote_image_url(image_url: &str) -> Result<url::Url, S
     let host = parsed
         .host_str()
         .ok_or_else(|| "远程图像输出 URL 缺少主机名".to_string())?;
-    if !is_allowed_hugging_face_space_host(host) {
-        return Err("远程图像输出只允许 HiDream Hugging Face Space 文件 URL".to_string());
+    if is_allowed_hugging_face_space_host(host) {
+        if parsed.scheme() != "https" {
+            return Err("HiDream Web 文件 URL 必须使用 https".to_string());
+        }
+        if !parsed.path().starts_with("/gradio_api/file=") {
+            return Err("HiDream Web 文件 URL 不是受支持的 Gradio 文件地址".to_string());
+        }
+        return Ok(parsed);
     }
-    if !parsed.path().starts_with("/gradio_api/file=") {
-        return Err("远程图像输出 URL 不是受支持的 Gradio 文件地址".to_string());
+    if !is_allowed_image_studio_host(host) {
+        return Err("远程图像输出仅允许 HiDream Web 或回环/私网本地图片服务 URL".to_string());
     }
     Ok(parsed)
 }

@@ -8,41 +8,61 @@ import {
   type ImageStudioStreamDonePayload,
 } from "./ipc";
 
-export type ImageStudioEngineKey = "huggingface_space" | "hidream_http";
+export type ImageStudioProviderKind = "local_image_service" | "web_fallback";
+export type ImageStudioProtocol = "openai_images";
+export type ImageStudioLocalServiceFamily = "openai_compatible" | "ollama" | "omlx";
 export type ImageStudioAspectRatio = "1:1" | "3:4" | "4:3" | "16:9" | "9:16" | "3:2" | "2:3" | "21:9" | "9:21" | "9:7" | "7:9";
 export type ImageStudioSeedMode = "random" | "fixed";
-export type ImageStudioEngineState = "unknown" | "ready" | "missing" | "error";
+export type ImageStudioProviderState = "unknown" | "ready" | "missing" | "error";
 export type ImageGenerationStatus = "queued" | "running" | "completed" | "error" | "canceled";
 
-export interface ImageStudioConfig {
-  engine: ImageStudioEngineKey;
+export interface ImageStudioProviderCapabilities {
+  textToImage: boolean;
+  imageToImage: boolean;
+  progressPreview: boolean;
+  cloudHosted?: boolean;
+  modelDiscovery?: boolean;
+}
+
+export interface LocalImageStudioProviderConfig {
   endpoint: string;
+  model: string;
+  protocol: ImageStudioProtocol;
+  serviceFamily: ImageStudioLocalServiceFamily;
+}
+
+export interface WebFallbackImageStudioProviderConfig {
+  endpoint: string;
+  promptRefine: boolean;
+  enabled: boolean;
+}
+
+export interface ImageStudioRuntimeConfig {
+  provider: ImageStudioProviderKind;
+  local: LocalImageStudioProviderConfig;
+  web: WebFallbackImageStudioProviderConfig;
   defaultSize: { width: number; height: number };
   aspectRatio: ImageStudioAspectRatio;
   steps: number;
   guidanceScale: number;
-  promptRefine: boolean;
   seedMode: ImageStudioSeedMode;
   seed: number;
   outputDirectory: string;
 }
 
-export interface ImageStudioEngineStatus {
-  state: ImageStudioEngineState;
+export interface ImageStudioProviderStatus {
+  providerKind: ImageStudioProviderKind;
+  state: ImageStudioProviderState;
   message: string;
-  capabilities: {
-    textToImage: boolean;
-    imageToImage: boolean;
-    progressPreview: boolean;
-    cudaRequired: boolean;
-    cloudHosted?: boolean;
-  };
+  capabilities: ImageStudioProviderCapabilities;
   checkedAt?: number;
+  discoveredModels?: string[];
+  activeModel?: string;
 }
 
 export interface ImageStudioRuntime {
-  config: ImageStudioConfig;
-  status: ImageStudioEngineStatus;
+  config: ImageStudioRuntimeConfig;
+  status: ImageStudioProviderStatus;
   setupGuideOpen: boolean;
   activeJobId: string | null;
   activeStreamId: string | null;
@@ -50,8 +70,10 @@ export interface ImageStudioRuntime {
 }
 
 export interface ImageGenerationParams {
-  engine: ImageStudioEngineKey;
+  providerKind: ImageStudioProviderKind;
   endpoint: string;
+  model?: string;
+  protocol?: ImageStudioProtocol;
   width: number;
   height: number;
   aspectRatio: ImageStudioAspectRatio;
@@ -75,6 +97,9 @@ export interface ImageGenerationBlockPayload {
   status: ImageGenerationStatus;
   prompt: string;
   params: ImageGenerationParams;
+  providerKind: ImageStudioProviderKind;
+  model?: string;
+  variantGroupId?: string;
   progress: ImageGenerationProgress;
   previewUrl?: string;
   imageUrl?: string;
@@ -84,45 +109,123 @@ export interface ImageGenerationBlockPayload {
   error?: string;
 }
 
-export const IMAGE_STUDIO_HF_SPACE_ENDPOINT = "https://hidream-ai-hidream-o1-image-dev.hf.space";
-export const IMAGE_STUDIO_HF_SPACE_PAGE = "https://huggingface.co/spaces/HiDream-ai/HiDream-O1-Image-Dev";
-export const IMAGE_STUDIO_HIDREAM_HTTP_ENDPOINT = "http://127.0.0.1:7860";
-export const IMAGE_STUDIO_DEFAULT_ENDPOINT = IMAGE_STUDIO_HF_SPACE_ENDPOINT;
+// Compatibility aliases while older call sites migrate.
+export type ImageStudioEngineKey = ImageStudioProviderKind;
+export type ImageStudioEngineState = ImageStudioProviderState;
+export type ImageStudioConfig = ImageStudioRuntimeConfig;
+export type ImageStudioEngineStatus = ImageStudioProviderStatus;
 
-function getDefaultImageStudioCapabilities(engine: ImageStudioEngineKey) {
+export const IMAGE_STUDIO_WEB_FALLBACK_ENDPOINT = "https://hidream-ai-hidream-o1-image-dev.hf.space";
+export const IMAGE_STUDIO_WEB_FALLBACK_PAGE = "https://huggingface.co/spaces/HiDream-ai/HiDream-O1-Image-Dev";
+export const IMAGE_STUDIO_LOCAL_DEFAULT_ENDPOINT = "http://127.0.0.1:8000/v1";
+export const IMAGE_STUDIO_DEFAULT_ENDPOINT = IMAGE_STUDIO_LOCAL_DEFAULT_ENDPOINT;
+
+// Legacy exports kept for persisted migrations and existing imports.
+export const IMAGE_STUDIO_HF_SPACE_ENDPOINT = IMAGE_STUDIO_WEB_FALLBACK_ENDPOINT;
+export const IMAGE_STUDIO_HF_SPACE_PAGE = IMAGE_STUDIO_WEB_FALLBACK_PAGE;
+export const IMAGE_STUDIO_HIDREAM_HTTP_ENDPOINT = IMAGE_STUDIO_LOCAL_DEFAULT_ENDPOINT;
+
+function getDefaultImageStudioCapabilities(providerKind: ImageStudioProviderKind): ImageStudioProviderCapabilities {
+  if (providerKind === "web_fallback") {
+    return {
+      textToImage: true,
+      imageToImage: false,
+      progressPreview: false,
+      cloudHosted: true,
+      modelDiscovery: false,
+    };
+  }
   return {
     textToImage: true,
-    imageToImage: engine === "hidream_http",
-    progressPreview: engine === "hidream_http",
-    cudaRequired: engine === "hidream_http",
-    cloudHosted: engine === "huggingface_space",
+    imageToImage: false,
+    progressPreview: false,
+    cloudHosted: false,
+    modelDiscovery: true,
   };
 }
 
-export function getDefaultImageStudioEndpoint(engine: ImageStudioEngineKey): string {
-  return engine === "hidream_http" ? IMAGE_STUDIO_HIDREAM_HTTP_ENDPOINT : IMAGE_STUDIO_HF_SPACE_ENDPOINT;
+export function getDefaultImageStudioEndpoint(providerKind: ImageStudioProviderKind): string {
+  return providerKind === "web_fallback" ? IMAGE_STUDIO_WEB_FALLBACK_ENDPOINT : IMAGE_STUDIO_LOCAL_DEFAULT_ENDPOINT;
 }
 
-export function createDefaultImageStudioConfig(): ImageStudioConfig {
+export function getDefaultImageStudioEndpointForServiceFamily(
+  serviceFamily: ImageStudioLocalServiceFamily,
+): string {
+  return serviceFamily === "ollama"
+    ? "http://127.0.0.1:11434/v1"
+    : IMAGE_STUDIO_LOCAL_DEFAULT_ENDPOINT;
+}
+
+export function mapLocalModelProviderToImageStudioServiceFamily(
+  provider: unknown,
+): ImageStudioLocalServiceFamily {
+  if (provider === "Ollama" || provider === "ollama") return "ollama";
+  if (provider === "OMLX" || provider === "omlx") return "omlx";
+  return "openai_compatible";
+}
+
+export function isLocalImageStudioProvider(
+  configOrKind: ImageStudioRuntimeConfig | ImageStudioProviderKind | null | undefined,
+): boolean {
+  const kind = typeof configOrKind === "string"
+    ? configOrKind
+    : normalizeImageStudioConfig(configOrKind).provider;
+  return kind === "local_image_service";
+}
+
+export function isWebFallbackImageStudioProvider(
+  configOrKind: ImageStudioRuntimeConfig | ImageStudioProviderKind | null | undefined,
+): boolean {
+  const kind = typeof configOrKind === "string"
+    ? configOrKind
+    : normalizeImageStudioConfig(configOrKind).provider;
+  return kind === "web_fallback";
+}
+
+export function getActiveImageStudioEndpoint(config: ImageStudioRuntimeConfig): string {
+  const normalized = normalizeImageStudioConfig(config);
+  return normalized.provider === "web_fallback"
+    ? normalized.web.endpoint
+    : normalized.local.endpoint;
+}
+
+export function getActiveImageStudioModel(config: ImageStudioRuntimeConfig): string {
+  const normalized = normalizeImageStudioConfig(config);
+  return normalized.provider === "local_image_service" ? normalized.local.model.trim() : "";
+}
+
+export function createDefaultImageStudioConfig(): ImageStudioRuntimeConfig {
   return {
-    engine: "huggingface_space",
-    endpoint: IMAGE_STUDIO_DEFAULT_ENDPOINT,
+    provider: "local_image_service",
+    local: {
+      endpoint: IMAGE_STUDIO_LOCAL_DEFAULT_ENDPOINT,
+      model: "",
+      protocol: "openai_images",
+      serviceFamily: "omlx",
+    },
+    web: {
+      endpoint: IMAGE_STUDIO_WEB_FALLBACK_ENDPOINT,
+      promptRefine: true,
+      enabled: true,
+    },
     defaultSize: { width: 1024, height: 1024 },
     aspectRatio: "1:1",
     steps: 28,
     guidanceScale: 0,
-    promptRefine: true,
     seedMode: "random",
     seed: 32,
     outputDirectory: "",
   };
 }
 
-export function createDefaultImageStudioStatus(): ImageStudioEngineStatus {
+export function createDefaultImageStudioStatus(): ImageStudioProviderStatus {
   return {
+    providerKind: "local_image_service",
     state: "unknown",
-    message: "Image engine has not been checked yet.",
-    capabilities: getDefaultImageStudioCapabilities("huggingface_space"),
+    message: "Local image service has not been checked yet.",
+    capabilities: getDefaultImageStudioCapabilities("local_image_service"),
+    discoveredModels: [],
+    activeModel: "",
   };
 }
 
@@ -137,52 +240,91 @@ export function createDefaultImageStudioRuntime(): ImageStudioRuntime {
   };
 }
 
-export function normalizeImageStudioConfig(input: unknown): ImageStudioConfig {
+export function normalizeImageStudioConfig(input: unknown): ImageStudioRuntimeConfig {
   const fallback = createDefaultImageStudioConfig();
-  const raw = input && typeof input === "object" ? input as Partial<ImageStudioConfig> : {};
-  const engine = raw.engine === "hidream_http" || raw.engine === "huggingface_space" ? raw.engine : fallback.engine;
+  const raw = input && typeof input === "object" ? input as Partial<ImageStudioRuntimeConfig> & Record<string, unknown> : {};
+  const legacyEngine = raw.engine === "hidream_http" || raw.engine === "huggingface_space"
+    ? raw.engine
+    : null;
+  const provider = normalizeProviderKind(raw.provider, legacyEngine);
+  const legacyEndpoint = typeof raw.endpoint === "string" ? raw.endpoint : "";
+  const legacyPromptRefine = raw.promptRefine === false ? false : true;
+  const legacyModel = typeof raw.model === "string" ? raw.model : "";
+  const localRaw = raw.local && typeof raw.local === "object" ? raw.local as Partial<LocalImageStudioProviderConfig> : {};
+  const webRaw = raw.web && typeof raw.web === "object" ? raw.web as Partial<WebFallbackImageStudioProviderConfig> : {};
   const size = raw.defaultSize && typeof raw.defaultSize === "object" ? raw.defaultSize : fallback.defaultSize;
+  const webEnabled = webRaw.enabled !== false;
+
+  const migratedLegacyEndpoint = legacyEndpoint.trim().replace(/\/+$/, "");
+  const localEndpointFromLegacy = legacyEngine === "hidream_http" && migratedLegacyEndpoint
+    ? migratedLegacyEndpoint
+    : fallback.local.endpoint;
+  const webEndpointFromLegacy = legacyEngine === "huggingface_space" && migratedLegacyEndpoint
+    ? migratedLegacyEndpoint
+    : fallback.web.endpoint;
+
   return {
-    engine,
-    endpoint: typeof raw.endpoint === "string" && raw.endpoint.trim()
-      ? raw.endpoint.trim().replace(/\/+$/, "")
-      : getDefaultImageStudioEndpoint(engine),
+    provider: provider === "web_fallback" && !webEnabled ? "local_image_service" : provider,
+    local: {
+      endpoint: normalizeEndpointString(localRaw.endpoint, localEndpointFromLegacy),
+      model: normalizeText(localRaw.model, legacyEngine === "hidream_http" ? legacyModel : fallback.local.model),
+      protocol: localRaw.protocol === "openai_images" ? "openai_images" : fallback.local.protocol,
+      serviceFamily: normalizeLocalImageServiceFamily(localRaw.serviceFamily, fallback.local.serviceFamily),
+    },
+    web: {
+      endpoint: normalizeEndpointString(webRaw.endpoint, webEndpointFromLegacy),
+      promptRefine: typeof webRaw.promptRefine === "boolean" ? webRaw.promptRefine : legacyPromptRefine,
+      enabled: webEnabled,
+    },
     defaultSize: {
-      width: clampNumber(size.width, 512, 2048, fallback.defaultSize.width),
-      height: clampNumber(size.height, 512, 2048, fallback.defaultSize.height),
+      width: clampNumber((size as { width?: unknown }).width, 512, 2048, fallback.defaultSize.width),
+      height: clampNumber((size as { height?: unknown }).height, 512, 2048, fallback.defaultSize.height),
     },
     aspectRatio: normalizeAspectRatio(raw.aspectRatio),
     steps: clampNumber(raw.steps, 1, 80, fallback.steps),
     guidanceScale: clampNumber(raw.guidanceScale, 0, 20, fallback.guidanceScale),
-    promptRefine: raw.promptRefine === false ? false : fallback.promptRefine,
     seedMode: raw.seedMode === "fixed" ? "fixed" : "random",
     seed: clampNumber(raw.seed, 0, 2147483647, fallback.seed),
     outputDirectory: typeof raw.outputDirectory === "string" ? raw.outputDirectory : "",
   };
 }
 
-export function normalizeImageStudioStatus(input: unknown): ImageStudioEngineStatus {
+export function normalizeImageStudioStatus(input: unknown): ImageStudioProviderStatus {
   const fallback = createDefaultImageStudioStatus();
-  const raw = input && typeof input === "object" ? input as Partial<ImageStudioEngineStatus> : {};
+  const raw = input && typeof input === "object" ? input as Partial<ImageStudioProviderStatus> & Record<string, unknown> : {};
+  const legacyProviderKind = raw.providerKind === "local_image_service" || raw.providerKind === "web_fallback"
+    ? raw.providerKind
+    : raw.capabilities && typeof raw.capabilities === "object" && raw.capabilities
+      ? ((((raw.capabilities as unknown as Record<string, unknown>).cloudHosted) === true) ? "web_fallback" : "local_image_service")
+      : fallback.providerKind;
   const state = raw.state === "ready" || raw.state === "missing" || raw.state === "error" || raw.state === "unknown"
     ? raw.state
     : fallback.state;
   return {
+    providerKind: legacyProviderKind,
     state,
     message: typeof raw.message === "string" && raw.message.trim() ? raw.message : fallback.message,
     capabilities: {
-      ...fallback.capabilities,
+      ...getDefaultImageStudioCapabilities(legacyProviderKind),
       ...(raw.capabilities && typeof raw.capabilities === "object" ? raw.capabilities : {}),
     },
     checkedAt: typeof raw.checkedAt === "number" ? raw.checkedAt : undefined,
+    discoveredModels: normalizeStringArray(raw.discoveredModels),
+    activeModel: typeof raw.activeModel === "string" ? raw.activeModel : "",
   };
 }
 
 export function normalizeImageStudioRuntime(input: unknown): ImageStudioRuntime {
   const raw = input && typeof input === "object" ? input as Partial<ImageStudioRuntime> : {};
+  const config = normalizeImageStudioConfig(raw.config);
+  const status = normalizeImageStudioStatus(raw.status);
   return {
-    config: normalizeImageStudioConfig(raw.config),
-    status: normalizeImageStudioStatus(raw.status),
+    config,
+    status: {
+      ...status,
+      providerKind: status.providerKind || config.provider,
+      activeModel: status.activeModel || getActiveImageStudioModel(config),
+    },
     setupGuideOpen: raw.setupGuideOpen === true,
     activeJobId: typeof raw.activeJobId === "string" ? raw.activeJobId : null,
     activeStreamId: typeof raw.activeStreamId === "string" ? raw.activeStreamId : null,
@@ -190,7 +332,7 @@ export function normalizeImageStudioRuntime(input: unknown): ImageStudioRuntime 
   };
 }
 
-export function resolveImageStudioSize(config: ImageStudioConfig): { width: number; height: number } {
+export function resolveImageStudioSize(config: ImageStudioRuntimeConfig): { width: number; height: number } {
   const base = normalizeImageStudioConfig(config);
   switch (base.aspectRatio) {
     case "3:4":
@@ -219,19 +361,22 @@ export function resolveImageStudioSize(config: ImageStudioConfig): { width: numb
   }
 }
 
-export function buildImageGenerationParams(config: ImageStudioConfig): ImageGenerationParams {
+export function buildImageGenerationParams(config: ImageStudioRuntimeConfig): ImageGenerationParams {
   const normalized = normalizeImageStudioConfig(config);
   const size = resolveImageStudioSize(normalized);
   const randomSeed = Math.floor(Math.random() * 2147483647);
+  const model = getActiveImageStudioModel(normalized);
   return {
-    engine: normalized.engine,
-    endpoint: normalized.endpoint,
+    providerKind: normalized.provider,
+    endpoint: getActiveImageStudioEndpoint(normalized),
+    ...(model ? { model } : {}),
+    ...(normalized.provider === "local_image_service" ? { protocol: normalized.local.protocol } : {}),
     width: size.width,
     height: size.height,
     aspectRatio: normalized.aspectRatio,
     steps: normalized.steps,
     guidanceScale: normalized.guidanceScale,
-    promptRefine: normalized.promptRefine,
+    promptRefine: normalized.web.promptRefine,
     seedMode: normalized.seedMode,
     seed: normalized.seedMode === "fixed" ? normalized.seed : randomSeed,
   };
@@ -247,188 +392,183 @@ export function createInitialImageProgress(): ImageGenerationProgress {
   };
 }
 
-export async function checkImageStudioEngineStatus(config: ImageStudioConfig): Promise<ImageStudioEngineStatus> {
-  try {
-    const result = await checkImageStudioEngine(normalizeImageStudioConfig(config));
+export async function discoverLocalImageStudioModels(input: {
+  endpoint: string;
+  serviceFamily?: ImageStudioLocalServiceFamily;
+} | string): Promise<string[]> {
+  const endpoint = typeof input === "string" ? input : input.endpoint;
+  const serviceFamily = typeof input === "string"
+    ? "openai_compatible"
+    : normalizeLocalImageServiceFamily(input.serviceFamily, "openai_compatible");
+  const trimmed = normalizeEndpointString(endpoint, IMAGE_STUDIO_LOCAL_DEFAULT_ENDPOINT);
+  const candidates = serviceFamily === "ollama"
+    ? buildOllamaModelDiscoveryCandidates(trimmed)
+    : buildOpenAiModelDiscoveryCandidates(trimmed);
+
+  for (const candidate of candidates) {
+    const response = await proxyImageStudioRequest({
+      engine: "local_image_service",
+      endpoint: trimmed,
+      path: candidate.path,
+      method: "GET",
+    }).catch(() => null);
+    if (!response?.ok) continue;
+    const payload = parseJsonValue(response.body);
+    const models = serviceFamily === "ollama"
+      ? extractOllamaModelIds(payload)
+      : extractOpenAiModelIds(payload);
+    if (models.length > 0) return models;
+  }
+
+  throw new Error("Local image service model discovery failed.");
+}
+
+export async function checkImageStudioEngineStatus(config: ImageStudioRuntimeConfig): Promise<ImageStudioProviderStatus> {
+  const normalized = normalizeImageStudioConfig(config);
+  const providerKind = normalized.provider;
+  if (providerKind === "web_fallback" && normalized.web.enabled === false) {
     return normalizeImageStudioStatus({
-      state: result.ready ? "ready" : "missing",
-      message: result.message || (result.ready ? "HiDream HTTP service is reachable." : "Image engine is not reachable."),
+      providerKind,
+      state: "missing",
+      message: "HiDream Web fallback is disabled in Image Studio settings.",
+      capabilities: getDefaultImageStudioCapabilities(providerKind),
+      checkedAt: Date.now(),
+      activeModel: getActiveImageStudioModel(normalized),
+    });
+  }
+  try {
+    const result = await checkImageStudioEngine({
+      engine: providerKind,
+      endpoint: getActiveImageStudioEndpoint(normalized),
+    });
+    const models = providerKind === "local_image_service"
+      ? await discoverLocalImageStudioModels({
+          endpoint: normalized.local.endpoint,
+          serviceFamily: normalized.local.serviceFamily,
+        }).catch(() => [])
+      : [];
+    const localDiscoveryReady = providerKind === "local_image_service" && models.length > 0;
+    const ready = localDiscoveryReady || result.ready;
+    return normalizeImageStudioStatus({
+      providerKind,
+      state: ready ? "ready" : "missing",
+      message: localDiscoveryReady && !result.ready
+        ? `Discovered ${models.length} local model${models.length === 1 ? "" : "s"} through ${normalized.local.serviceFamily}.`
+        : result.message || (
+            ready
+              ? providerKind === "local_image_service"
+                ? "Local image service is reachable."
+                : "Web fallback image provider is reachable."
+              : "Image provider is not reachable."
+          ),
       capabilities: {
-        ...getDefaultImageStudioCapabilities(normalizeImageStudioConfig(config).engine),
+        ...getDefaultImageStudioCapabilities(providerKind),
         ...(result.capabilities || {}),
       },
       checkedAt: Date.now(),
+      discoveredModels: models,
+      activeModel: getActiveImageStudioModel(normalized),
     });
   } catch (error) {
-    return {
+    return normalizeImageStudioStatus({
+      providerKind,
       state: "error",
-      message: error instanceof Error ? error.message : String(error || "Image engine check failed."),
-      capabilities: getDefaultImageStudioCapabilities(normalizeImageStudioConfig(config).engine),
+      message: error instanceof Error ? error.message : String(error || "Image provider check failed."),
+      capabilities: getDefaultImageStudioCapabilities(providerKind),
       checkedAt: Date.now(),
-    };
+      activeModel: getActiveImageStudioModel(normalized),
+    });
   }
 }
 
-export async function startHiDreamGeneration(params: {
+export async function runLocalImageStudioGeneration(params: {
   prompt: string;
-  config: ImageStudioConfig;
+  config: ImageStudioRuntimeConfig;
   generationParams: ImageGenerationParams;
   referenceImages?: string[];
-}): Promise<{ jobId: string }> {
+}): Promise<{ imageUrl: string }> {
+  if (params.referenceImages && params.referenceImages.length > 0) {
+    throw new Error("The configured local image service does not expose image-to-image in MAIN v1.");
+  }
+  const normalized = normalizeImageStudioConfig(params.config);
   const body = {
-    mode: "t2i",
     prompt: params.prompt,
+    ...(params.generationParams.model ? { model: params.generationParams.model } : {}),
+    n: 1,
+    response_format: "b64_json",
+    size: `${params.generationParams.width}x${params.generationParams.height}`,
     width: params.generationParams.width,
     height: params.generationParams.height,
     seed: params.generationParams.seed,
-    refs_b64: (params.referenceImages || []).map(extractBase64Payload).filter(Boolean),
+    steps: params.generationParams.steps,
+    guidance_scale: params.generationParams.guidanceScale,
   };
   const response = await proxyImageStudioRequest({
-    engine: params.config.engine,
-    endpoint: params.config.endpoint,
-    path: "/api/generate/start",
+    engine: normalized.provider,
+    endpoint: normalized.local.endpoint,
+    path: "/v1/images/generations",
     method: "POST",
     body: JSON.stringify(body),
   });
   if (!response.ok) {
-    throw new Error(`HiDream start failed with HTTP ${response.status}: ${response.body.slice(0, 240)}`);
+    throw new Error(`Local image generation failed with HTTP ${response.status}: ${response.body.slice(0, 240)}`);
   }
-  const payload = JSON.parse(response.body || "{}");
-  const jobId = String(payload.job_id || payload.jobId || "");
-  if (!jobId) throw new Error("HiDream did not return a job id.");
-  return { jobId };
+  const imageUrl = extractOpenAiImageResult(parseJsonValue(response.body));
+  if (!imageUrl) {
+    throw new Error("The local image service did not return image data.");
+  }
+  return { imageUrl };
 }
 
-export async function startHuggingFaceSpaceGeneration(params: {
+export async function startWebFallbackGeneration(params: {
   prompt: string;
-  config: ImageStudioConfig;
+  config: ImageStudioRuntimeConfig;
   generationParams: ImageGenerationParams;
   referenceImages?: string[];
 }): Promise<{ jobId: string }> {
   if (params.referenceImages && params.referenceImages.length > 0) {
-    throw new Error("The hosted Hugging Face Space supports text-to-image only in this MAIN adapter.");
+    throw new Error("The web fallback provider supports text-to-image only in MAIN v1.");
   }
+  const normalized = normalizeImageStudioConfig(params.config);
   const body = {
     data: [
       params.prompt,
       params.generationParams.aspectRatio,
-      params.generationParams.promptRefine,
+      normalized.web.promptRefine,
       params.generationParams.seedMode === "random" ? -1 : params.generationParams.seed,
     ],
   };
   const response = await proxyImageStudioRequest({
-    engine: params.config.engine,
-    endpoint: params.config.endpoint,
+    engine: "web_fallback",
+    endpoint: normalized.web.endpoint,
     path: "/gradio_api/call/_generate_wrapped",
     method: "POST",
     body: JSON.stringify(body),
   });
   if (!response.ok) {
-    throw new Error(`Hugging Face Space start failed with HTTP ${response.status}: ${response.body.slice(0, 240)}`);
+    throw new Error(`Web fallback start failed with HTTP ${response.status}: ${response.body.slice(0, 240)}`);
   }
-  const payload = JSON.parse(response.body || "{}");
+  const payload = parseJsonValue(response.body) || {};
   const jobId = String(payload.event_id || payload.eventId || payload.job_id || payload.jobId || "");
-  if (!jobId) throw new Error("Hugging Face Space did not return an event id.");
+  if (!jobId) throw new Error("The web fallback provider did not return an event id.");
   return { jobId };
 }
 
 export async function startImageStudioGeneration(params: {
   prompt: string;
-  config: ImageStudioConfig;
+  config: ImageStudioRuntimeConfig;
   generationParams: ImageGenerationParams;
   referenceImages?: string[];
 }): Promise<{ jobId: string }> {
-  return normalizeImageStudioConfig(params.config).engine === "huggingface_space"
-    ? startHuggingFaceSpaceGeneration(params)
-    : startHiDreamGeneration(params);
+  const normalized = normalizeImageStudioConfig(params.config);
+  if (normalized.provider === "local_image_service") {
+    throw new Error("Local image service generation is synchronous; call runLocalImageStudioGeneration instead.");
+  }
+  return startWebFallbackGeneration(params);
 }
 
-export async function streamHiDreamGeneration(params: {
-  config: ImageStudioConfig;
-  jobId: string;
-  streamId: string;
-  onProgress: (event: ImageGenerationProgress & { previewUrl?: string }) => void;
-  onDone: (payload: { imageUrl?: string; error?: string; canceled?: boolean }) => Promise<void> | void;
-}): Promise<() => void> {
-  let closed = false;
-  let deliveredFinalResult = false;
-  let sseBuffer = "";
-  const cleanupFns: Array<() => void> = [];
-
-  const handleSseEvents = (events: string[]) => {
-    for (const event of events) {
-      const data = parseJsonObject(event);
-      if (!data) continue;
-      if (data.type === "progress") {
-        const step = clampNumber(data.step, 0, 9999, 0);
-        const total = clampNumber(data.total, 0, 9999, 0);
-        params.onProgress({
-          stage: "generating",
-          step,
-          total,
-          percent: total > 0 ? Math.round((step / total) * 100) : 0,
-          message: total > 0 ? `Generating ${step}/${total}` : "Generating",
-          ...(typeof data.preview === "string" && data.preview
-            ? { previewUrl: `data:image/jpeg;base64,${data.preview}` }
-            : {}),
-        });
-      } else if (data.type === "done") {
-        deliveredFinalResult = true;
-        void params.onDone({
-          imageUrl: typeof data.image === "string" && data.image ? `data:image/png;base64,${data.image}` : undefined,
-        });
-      } else if (data.type === "error") {
-        deliveredFinalResult = true;
-        void params.onDone({ error: String(data.message || "Image generation failed.") });
-      }
-    }
-  };
-
-  cleanupFns.push(await listenImageStudioStreamChunk((payload) => {
-    if (closed || payload.streamId !== params.streamId) return;
-    const parsed = extractSseEvents(sseBuffer + payload.chunk);
-    sseBuffer = parsed.remainder;
-    handleSseEvents(parsed.events);
-  }));
-
-  cleanupFns.push(await listenImageStudioStreamDone((payload: ImageStudioStreamDonePayload) => {
-    if (closed || payload.streamId !== params.streamId) return;
-    if (sseBuffer.trim()) {
-      const parsed = extractSseEvents(`${sseBuffer}\n\n`);
-      sseBuffer = "";
-      handleSseEvents(parsed.events);
-    }
-    if (payload.status === "cancelled") {
-      deliveredFinalResult = true;
-      void params.onDone({ canceled: true });
-    } else if (payload.status === "error") {
-      deliveredFinalResult = true;
-      void params.onDone({ error: payload.error || "Image stream failed." });
-    } else if (!deliveredFinalResult) {
-      void params.onDone({ error: "Image stream ended before a final image was returned." });
-    }
-  }));
-
-  void proxyImageStudioRequest({
-    engine: params.config.engine,
-    endpoint: params.config.endpoint,
-    path: `/api/generate/stream/${encodeURIComponent(params.jobId)}`,
-    method: "GET",
-    streamId: params.streamId,
-  }).catch((error) => {
-    if (!closed) {
-      void params.onDone({ error: error instanceof Error ? error.message : String(error || "Image stream failed.") });
-    }
-  });
-
-  return () => {
-    closed = true;
-    for (const cleanup of cleanupFns) cleanup();
-  };
-}
-
-export async function streamHuggingFaceSpaceGeneration(params: {
-  config: ImageStudioConfig;
+export async function streamWebFallbackGeneration(params: {
+  config: ImageStudioRuntimeConfig;
   jobId: string;
   streamId: string;
   onProgress: (event: ImageGenerationProgress & { previewUrl?: string }) => void;
@@ -439,6 +579,7 @@ export async function streamHuggingFaceSpaceGeneration(params: {
   let sseBuffer = "";
   const cleanupFns: Array<() => void> = [];
   const startedAt = Date.now();
+  const normalized = normalizeImageStudioConfig(params.config);
 
   const handleSseEvents = (events: string[]) => {
     for (const event of events) {
@@ -463,7 +604,7 @@ export async function streamHuggingFaceSpaceGeneration(params: {
         const record = data as Record<string, any>;
         if (record.error || record.msg) {
           deliveredFinalResult = true;
-          void params.onDone({ error: String(record.error || record.msg || "Hugging Face Space generation failed.") });
+          void params.onDone({ error: String(record.error || record.msg || "Web fallback image generation failed.") });
         }
       }
     }
@@ -488,21 +629,21 @@ export async function streamHuggingFaceSpaceGeneration(params: {
       void params.onDone({ canceled: true });
     } else if (payload.status === "error") {
       deliveredFinalResult = true;
-      void params.onDone({ error: payload.error || "Hugging Face Space stream failed." });
+      void params.onDone({ error: payload.error || "Web fallback image stream failed." });
     } else if (!deliveredFinalResult) {
-      void params.onDone({ error: "Hugging Face Space ended before a final image was returned." });
+      void params.onDone({ error: "Web fallback image stream ended before a final image was returned." });
     }
   }));
 
   void proxyImageStudioRequest({
-    engine: params.config.engine,
-    endpoint: params.config.endpoint,
+    engine: normalized.provider,
+    endpoint: normalized.web.endpoint,
     path: `/gradio_api/call/_generate_wrapped/${encodeURIComponent(params.jobId)}`,
     method: "GET",
     streamId: params.streamId,
   }).catch((error) => {
     if (!closed) {
-      void params.onDone({ error: error instanceof Error ? error.message : String(error || "Hugging Face Space stream failed.") });
+      void params.onDone({ error: error instanceof Error ? error.message : String(error || "Web fallback image stream failed.") });
     }
   });
 
@@ -513,15 +654,17 @@ export async function streamHuggingFaceSpaceGeneration(params: {
 }
 
 export async function streamImageStudioGeneration(params: {
-  config: ImageStudioConfig;
+  config: ImageStudioRuntimeConfig;
   jobId: string;
   streamId: string;
   onProgress: (event: ImageGenerationProgress & { previewUrl?: string }) => void;
   onDone: (payload: { imageUrl?: string; error?: string; canceled?: boolean }) => Promise<void> | void;
 }): Promise<() => void> {
-  return normalizeImageStudioConfig(params.config).engine === "huggingface_space"
-    ? streamHuggingFaceSpaceGeneration(params)
-    : streamHiDreamGeneration(params);
+  const normalized = normalizeImageStudioConfig(params.config);
+  if (normalized.provider === "local_image_service") {
+    throw new Error("Local image service generation does not use streaming jobs in MAIN v1.");
+  }
+  return streamWebFallbackGeneration(params);
 }
 
 export async function persistGeneratedImage(params: {
@@ -540,6 +683,96 @@ export async function persistGeneratedImage(params: {
   return saveImageStudioOutput(params.sessionKey, `${Date.now()}-${safeName}.png`, params.imageUrl);
 }
 
+function normalizeProviderKind(
+  value: unknown,
+  legacyEngine?: "hidream_http" | "huggingface_space" | null,
+): ImageStudioProviderKind {
+  if (value === "local_image_service" || value === "web_fallback") return value;
+  if (legacyEngine === "huggingface_space") return "web_fallback";
+  return "local_image_service";
+}
+
+function normalizeEndpointString(value: unknown, fallback: string): string {
+  const normalized = typeof value === "string" ? value.trim().replace(/\/+$/, "") : "";
+  return normalized || fallback.replace(/\/+$/, "");
+}
+
+function normalizeText(value: unknown, fallback = ""): string {
+  return typeof value === "string" ? value.trim() : fallback;
+}
+
+function normalizeLocalImageServiceFamily(
+  value: unknown,
+  fallback: ImageStudioLocalServiceFamily = "openai_compatible",
+): ImageStudioLocalServiceFamily {
+  return value === "ollama" || value === "omlx" || value === "openai_compatible"
+    ? value
+    : fallback;
+}
+
+function normalizeStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<string>();
+  const next: string[] = [];
+  for (const item of value) {
+    if (typeof item !== "string") continue;
+    const normalized = item.trim();
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    next.push(normalized);
+  }
+  return next;
+}
+
+function extractOpenAiModelIds(payload: unknown): string[] {
+  if (!payload || typeof payload !== "object") return [];
+  const data = (payload as { data?: unknown }).data;
+  if (!Array.isArray(data)) return [];
+  return normalizeStringArray(
+    data
+      .map((item) => item && typeof item === "object" ? (item as { id?: unknown }).id : "")
+      .filter((item): item is string => typeof item === "string"),
+  );
+}
+
+function extractOllamaModelIds(payload: unknown): string[] {
+  if (!payload || typeof payload !== "object") return [];
+  const models = (payload as { models?: unknown }).models;
+  if (!Array.isArray(models)) return [];
+  return normalizeStringArray(
+    models
+      .map((item) => {
+        if (!item || typeof item !== "object") return "";
+        const record = item as Record<string, unknown>;
+        return typeof record.name === "string"
+          ? record.name
+          : typeof record.model === "string"
+          ? record.model
+          : "";
+      })
+      .filter((item): item is string => typeof item === "string"),
+  );
+}
+
+function extractOpenAiImageResult(payload: unknown): string {
+  if (!payload || typeof payload !== "object") return "";
+  const data = (payload as { data?: unknown }).data;
+  if (!Array.isArray(data) || data.length === 0) return "";
+  const first = data[0];
+  if (!first || typeof first !== "object") return "";
+  const record = first as Record<string, unknown>;
+  if (typeof record.b64_json === "string" && record.b64_json.trim()) {
+    return `data:image/png;base64,${record.b64_json.trim()}`;
+  }
+  if (typeof record.url === "string" && record.url.trim()) {
+    return record.url.trim();
+  }
+  if (typeof record.b64 === "string" && record.b64.trim()) {
+    return `data:image/png;base64,${record.b64.trim()}`;
+  }
+  return "";
+}
+
 function clampNumber(value: unknown, min: number, max: number, fallback: number): number {
   const number = typeof value === "number" ? value : Number(value);
   if (!Number.isFinite(number)) return fallback;
@@ -552,13 +785,17 @@ function normalizeAspectRatio(value: unknown): ImageStudioAspectRatio {
     : "1:1";
 }
 
-function extractBase64Payload(dataUrl: string): string {
-  const value = String(dataUrl || "").trim();
-  const commaIndex = value.indexOf(",");
-  if (value.startsWith("data:image/") && commaIndex >= 0) {
-    return value.slice(commaIndex + 1).trim();
-  }
-  return value;
+function buildOpenAiModelDiscoveryCandidates(endpoint: string): Array<{ path: string }> {
+  return endpoint.endsWith("/v1")
+    ? [{ path: "/v1/models" }, { path: "/models" }]
+    : [{ path: "/v1/models" }, { path: "/models" }];
+}
+
+function buildOllamaModelDiscoveryCandidates(endpoint: string): Array<{ path: string }> {
+  const normalized = endpoint.replace(/\/+$/, "");
+  return normalized.endsWith("/v1")
+    ? [{ path: "/api/tags" }, { path: "/api/ps" }, { path: "/v1/models" }]
+    : [{ path: "/api/tags" }, { path: "/api/ps" }, { path: "/v1/models" }];
 }
 
 function extractSseEvents(text: string): { events: string[]; remainder: string } {
@@ -578,11 +815,6 @@ function extractSseEvents(text: string): { events: string[]; remainder: string }
       .filter(Boolean),
     remainder,
   };
-}
-
-function parseJsonObject(value: string): Record<string, any> | null {
-  const parsed = parseJsonValue(value);
-  return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, any> : null;
 }
 
 function parseJsonValue(value: string): any {

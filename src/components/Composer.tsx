@@ -254,12 +254,14 @@ export default function Composer({
   const setImageStudioConfig = useAppStore((s) => s.setImageStudioConfig);
   const setImageStudioSetupGuideOpen = useAppStore((s) => s.setImageStudioSetupGuideOpen);
   const checkImageStudioEngine = useAppStore((s) => s.checkImageStudioEngine);
+  const switchMainModeWithIsolation = useAppStore((s) => s.switchMainModeWithIsolation);
   const webSearchEnabled = useAppStore((s) => s.webSearchEnabled);
   const webSearchProvider = useAppStore((s) => s.webSearchProvider);
   const setWebSearchEnabled = useAppStore((s) => s.setWebSearchEnabled);
   const setWebSearchProvider = useAppStore((s) => s.setWebSearchProvider);
   const [draftInput, setDraftInput] = useState(storeInput);
   const [debouncedInput, setDebouncedInput] = useState(storeInput);
+  const [showImageStudioAdvanced, setShowImageStudioAdvanced] = useState(false);
   const slashCatalog = useMemo(
     () => getGameStudioSlashCatalog(language === "en" ? "en" : "zh"),
     [language],
@@ -313,8 +315,8 @@ export default function Composer({
       ? "Run MAIN GAME STUDIO workflows and specialists, with /plan available for large changes."
       : "运行 MAIN GAME STUDIO 工作流与专业 Agent，并支持用 /plan 进入计划流。",
     image_studio: language === "en"
-      ? "Generate images through an independent HiDream/HTTP engine without entering the LLM agent loop."
-      : "通过独立的 HiDream/HTTP 图像引擎生成图片，不进入大语言模型 Agent 执行链路。",
+      ? "Generate images in a dedicated studio with local-first image runtime and an optional HiDream Web fallback."
+      : "在独立图像工作室里进行本地优先的图片生成，并可按需切到 HiDream Web fallback。",
   };
   const mentionSearchLabel = mentionQuery
     ? (language === "en" ? `Search: ${mentionQuery}` : `搜索：${mentionQuery}`)
@@ -565,15 +567,25 @@ export default function Composer({
     },
   ] as const;
   const imageStudioAspectOptions = ["1:1", "4:3", "3:4", "16:9", "9:16", "3:2", "2:3", "21:9", "9:21", "9:7", "7:9"] as const;
-  const isHuggingFaceImageEngine = imageStudio.config.engine === "huggingface_space";
-  const imageStudioEngineLabel = isHuggingFaceImageEngine
-    ? "Hugging Face Space"
-    : "HiDream HTTP";
+  const isWebFallbackImageEngine = imageStudio.config.provider === "web_fallback";
+  const isLocalImageEngine = imageStudio.config.provider === "local_image_service";
+  const imageStudioSupportsReferenceImages = imageStudio.status.capabilities?.imageToImage === true;
+  const imageStudioLocalFamilyLabel = imageStudio.config.local.serviceFamily === "ollama"
+    ? "Ollama"
+    : imageStudio.config.local.serviceFamily === "omlx"
+    ? "OMLX"
+    : (language === "en" ? "OpenAI-compatible" : "OpenAI 兼容");
+  const imageStudioProviderLabel = isWebFallbackImageEngine
+    ? (language === "en" ? "HiDream Web" : "HiDream 网页")
+    : (language === "en" ? "Local Image Service" : "本地图片服务");
+  const imageStudioProviderDetail = isWebFallbackImageEngine
+    ? (language === "en" ? "Hosted fallback inside Image Studio" : "图像工作室内置托管 fallback")
+    : `${imageStudioLocalFamilyLabel} · ${imageStudio.status.activeModel || imageStudio.config.local.model || imageStudio.config.local.endpoint}`;
 
   const [cooldownSec, setCooldownSec] = useState(0);
 
   useEffect(() => {
-    if (!isImageStudioMode || !isHuggingFaceImageEngine || !imageStudio.cooldownUntil) {
+    if (!isImageStudioMode || !isWebFallbackImageEngine || !imageStudio.cooldownUntil) {
       setCooldownSec(0);
       return;
     }
@@ -585,7 +597,7 @@ export default function Composer({
       }
     }, 200);
     return () => clearInterval(interval);
-  }, [isImageStudioMode, isHuggingFaceImageEngine, imageStudio.cooldownUntil]);
+  }, [isImageStudioMode, isWebFallbackImageEngine, imageStudio.cooldownUntil]);
   const imageStudioStatusLabel = imageStudio.status.state === "ready"
     ? (language === "en" ? "Ready" : "已就绪")
     : imageStudio.status.state === "error"
@@ -670,6 +682,14 @@ export default function Composer({
       submitPendingRef.current = false;
     };
   }, []);
+
+  const showReferenceImagesUnavailableNotice = useCallback(() => {
+    setAttachmentNotice(
+      language === "en"
+        ? "This image provider currently supports prompt-only generation. Reference images are hidden until image-to-image is available."
+        : "当前图片 provider 只支持 prompt 生图，参考图入口会在支持 image-to-image 后再显示。",
+    );
+  }, [language]);
 
   useEffect(() => {
     const previousMode = previousMainModeRef.current;
@@ -935,6 +955,11 @@ export default function Composer({
   const handlePaste = useCallback(async (e: React.ClipboardEvent) => {
     const imageFiles = getImageFilesFromClipboard(e.nativeEvent);
     if (imageFiles.length === 0) return;
+    if (isImageStudioMode && !imageStudioSupportsReferenceImages) {
+      e.preventDefault();
+      showReferenceImagesUnavailableNotice();
+      return;
+    }
 
     // Prevent default paste (image data, not text)
     e.preventDefault();
@@ -946,7 +971,7 @@ export default function Composer({
         console.error("Failed to process pasted image:", err);
       }
     }
-  }, []);
+  }, [imageStudioSupportsReferenceImages, isImageStudioMode, showReferenceImagesUnavailableNotice]);
 
   const buildAttachmentNotice = useCallback((skipped: Array<{ name: string; reason: string }> = []) => {
     if (!skipped.length) return null;
@@ -977,6 +1002,10 @@ export default function Composer({
   }, [attachedFiles, setAttachedFiles]);
 
   const handleAttachButtonClick = useCallback(async () => {
+    if (isImageStudioMode && !imageStudioSupportsReferenceImages) {
+      showReferenceImagesUnavailableNotice();
+      return;
+    }
     if (!onAttachFile) return;
     const result = await onAttachFile();
     if (!result) return;
@@ -994,16 +1023,24 @@ export default function Composer({
     }
 
     setAttachmentNotice(buildAttachmentNotice(result.skipped || []));
-  }, [addAttachmentDescriptors, buildAttachmentNotice, onAttachFile]);
+  }, [
+    addAttachmentDescriptors,
+    buildAttachmentNotice,
+    imageStudioSupportsReferenceImages,
+    isImageStudioMode,
+    onAttachFile,
+    showReferenceImagesUnavailableNotice,
+  ]);
 
   // ── File drag-and-drop handlers ──
   const handleDragOver = useCallback((e: React.DragEvent) => {
     if (e.dataTransfer.types.includes("Files")) {
+      if (isImageStudioMode && !imageStudioSupportsReferenceImages) return;
       e.preventDefault();
       e.stopPropagation();
       setIsDragOver(true);
     }
-  }, []);
+  }, [imageStudioSupportsReferenceImages, isImageStudioMode]);
 
   const handleDragLeave = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -1012,6 +1049,13 @@ export default function Composer({
   }, []);
 
   const handleDrop = useCallback(async (e: React.DragEvent) => {
+    if (isImageStudioMode && !imageStudioSupportsReferenceImages) {
+      e.preventDefault();
+      e.stopPropagation();
+      setIsDragOver(false);
+      showReferenceImagesUnavailableNotice();
+      return;
+    }
     e.preventDefault();
     e.stopPropagation();
     setIsDragOver(false);
@@ -1081,7 +1125,14 @@ export default function Composer({
 
     addAttachmentDescriptors(droppedAttachments);
     setAttachmentNotice(buildAttachmentNotice(skipped));
-  }, [activeSessionKey, addAttachmentDescriptors, buildAttachmentNotice]);
+  }, [
+    activeSessionKey,
+    addAttachmentDescriptors,
+    buildAttachmentNotice,
+    imageStudioSupportsReferenceImages,
+    isImageStudioMode,
+    showReferenceImagesUnavailableNotice,
+  ]);
 
   // ── Insert @ from the @ button click ──
   const handleAtButtonClick = () => {
@@ -1833,7 +1884,7 @@ export default function Composer({
             <div data-testid="image-studio-controls" className="border-b px-3 py-3" style={{ borderColor: isLightTheme ? "#e4e4e7" : "#27272a" }}>
               <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
                 <div className="flex min-w-0 items-center gap-2">
-                  <div className="flex h-7 w-7 items-center justify-center rounded-md border border-[var(--accent-subtle-border)] bg-[var(--accent-subtle)] text-[var(--accent-light)]">
+                  <div className="flex h-8 w-8 items-center justify-center rounded-lg border border-[var(--accent-subtle-border)] bg-[var(--accent-subtle)] text-[var(--accent-light)]">
                     <IconImageIcon className="h-3.5 w-3.5" />
                   </div>
                   <div className="min-w-0">
@@ -1841,9 +1892,7 @@ export default function Composer({
                       {language === "en" ? "Image Studio" : "图像工作室"}
                     </div>
                     <div className="truncate text-[10px]" style={imageStudioMutedStyle}>
-                      {isHuggingFaceImageEngine 
-                        ? (language === "en" ? "Online" : "在线") 
-                        : `${imageStudioEngineLabel} · ${imageStudio.config.endpoint}`}
+                      {imageStudioProviderLabel} · {imageStudioProviderDetail}
                     </div>
                   </div>
                 </div>
@@ -1853,10 +1902,19 @@ export default function Composer({
                     onClick={handleCheckImageStudioEngine}
                     className="inline-flex h-7 items-center gap-1.5 rounded-md border px-2.5 text-[10px] transition-colors hover:bg-[#18181b]"
                     style={{ borderColor: isLightTheme ? "#d4d4d8" : "#27272a", color: isLightTheme ? "#374151" : "#d4d4d8" }}
-                    title={language === "en" ? "Check image engine" : "检测图像引擎"}
+                    title={language === "en" ? "Check image provider" : "检测图片 provider"}
                   >
                     <span className={`h-1.5 w-1.5 rounded-full ${imageStudioStatusDotClass}`} />
                     {imageStudioStatusLabel}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowImageStudioAdvanced((value) => !value)}
+                    className="inline-flex h-7 items-center gap-1.5 rounded-md border px-2.5 text-[10px] transition-colors hover:bg-[#18181b]"
+                    style={{ borderColor: isLightTheme ? "#d4d4d8" : "#27272a", color: isLightTheme ? "#374151" : "#d4d4d8" }}
+                  >
+                    <IconZap className="h-3.5 w-3.5" />
+                    {language === "en" ? (showImageStudioAdvanced ? "Hide Advanced" : "Advanced") : (showImageStudioAdvanced ? "收起高级项" : "高级项")}
                   </button>
                   <button
                     type="button"
@@ -1870,7 +1928,7 @@ export default function Composer({
                 </div>
               </div>
 
-              <div className={`grid gap-3 ${isHuggingFaceImageEngine ? "md:grid-cols-[minmax(240px,1.2fr)_minmax(180px,0.8fr)_minmax(180px,0.8fr)]" : "md:grid-cols-[minmax(180px,1fr)_minmax(220px,1.2fr)_minmax(160px,0.9fr)]"}`}>
+              <div className="grid gap-3 md:grid-cols-[minmax(220px,1.25fr)_minmax(170px,0.75fr)]">
                 <div>
                   <div className="mb-1 text-[10px] font-semibold uppercase tracking-[0.14em]" style={imageStudioMutedStyle}>
                     {language === "en" ? "Aspect" : "比例"}
@@ -1893,55 +1951,6 @@ export default function Composer({
                     ))}
                   </div>
                 </div>
-
-                {isHuggingFaceImageEngine ? (
-                  <div>
-                    <div className="mb-1 text-[10px] font-semibold uppercase tracking-[0.14em]" style={imageStudioMutedStyle}>Prompt Refine</div>
-                    <button
-                      type="button"
-                      onClick={() => setImageStudioConfig({ promptRefine: !imageStudio.config.promptRefine })}
-                      className="h-8 w-full rounded-md border px-2 text-[10px] font-semibold transition-colors"
-                      style={{
-                        borderColor: imageStudio.config.promptRefine ? "var(--accent)" : (isLightTheme ? "#d4d4d8" : "#27272a"),
-                        backgroundColor: imageStudio.config.promptRefine ? "var(--accent-subtle)" : (isLightTheme ? "#f8fafc" : "#050507"),
-                        color: imageStudio.config.promptRefine ? (isLightTheme ? "var(--accent-hover)" : "var(--accent-light)") : (isLightTheme ? "#374151" : "#a1a1aa"),
-                      }}
-                    >
-                      {imageStudio.config.promptRefine ? (language === "en" ? "On" : "开启") : (language === "en" ? "Off" : "关闭")}
-                    </button>
-                  </div>
-                ) : (
-                  <div className="grid grid-cols-2 gap-3">
-                    <label className="min-w-0">
-                      <span className="mb-1 block text-[10px] font-semibold uppercase tracking-[0.14em]" style={imageStudioMutedStyle}>
-                        {language === "en" ? "Steps" : "步数"} · {imageStudio.config.steps}
-                      </span>
-                      <input
-                        type="range"
-                        min="1"
-                        max="80"
-                        step="1"
-                        value={imageStudio.config.steps}
-                        onChange={(event) => setImageStudioConfig({ steps: Number(event.target.value) })}
-                        className="w-full accent-[var(--accent)]"
-                      />
-                    </label>
-                    <label className="min-w-0">
-                      <span className="mb-1 block text-[10px] font-semibold uppercase tracking-[0.14em]" style={imageStudioMutedStyle}>
-                        CFG · {imageStudio.config.guidanceScale}
-                      </span>
-                      <input
-                        type="range"
-                        min="0"
-                        max="20"
-                        step="0.5"
-                        value={imageStudio.config.guidanceScale}
-                        onChange={(event) => setImageStudioConfig({ guidanceScale: Number(event.target.value) })}
-                        className="w-full accent-[var(--accent)]"
-                      />
-                    </label>
-                  </div>
-                )}
 
                 <div>
                   <div className="mb-1 text-[10px] font-semibold uppercase tracking-[0.14em]" style={imageStudioMutedStyle}>Seed</div>
@@ -1971,6 +1980,79 @@ export default function Composer({
                   </div>
                 </div>
               </div>
+
+              <div className="mt-3 flex flex-wrap gap-2 text-[10px]" style={imageStudioMutedStyle}>
+                <span className="rounded-md border px-2 py-1" style={{ borderColor: isLightTheme ? "#d4d4d8" : "#27272a" }}>
+                  {isWebFallbackImageEngine ? "HiDream Web" : (language === "en" ? "Local Service" : "本地服务")}
+                </span>
+                <span className="rounded-md border px-2 py-1" style={{ borderColor: isLightTheme ? "#d4d4d8" : "#27272a" }}>
+                  {imageStudio.status.activeModel || imageStudio.config.local.model || (language === "en" ? "Prompt-first" : "Prompt 优先")}
+                </span>
+                <span className="rounded-md border px-2 py-1" style={{ borderColor: isLightTheme ? "#d4d4d8" : "#27272a" }}>
+                  {imageStudioSupportsReferenceImages
+                    ? (language === "en" ? "Ref images on" : "参考图已开启")
+                    : (language === "en" ? "Prompt only" : "仅文本生图")}
+                </span>
+              </div>
+
+              {showImageStudioAdvanced && (
+                <div className="mt-3 grid gap-3 rounded-xl border p-3 md:grid-cols-2" style={{ borderColor: isLightTheme ? "#d4d4d8" : "#27272a", backgroundColor: isLightTheme ? "#f8fafc" : "#050507" }}>
+                  {isWebFallbackImageEngine ? (
+                    <button
+                      type="button"
+                      onClick={() => setImageStudioConfig({
+                        web: {
+                          ...imageStudio.config.web,
+                          promptRefine: !imageStudio.config.web.promptRefine,
+                        },
+                      })}
+                      className="rounded-lg border px-3 py-3 text-left transition-colors"
+                      style={{
+                        borderColor: imageStudio.config.web.promptRefine ? "var(--accent)" : (isLightTheme ? "#d4d4d8" : "#27272a"),
+                        backgroundColor: imageStudio.config.web.promptRefine ? "var(--accent-subtle)" : "transparent",
+                      }}
+                    >
+                      <div className="text-[11px] font-semibold" style={{ color: isLightTheme ? "#18181b" : "#f4f4f5" }}>HiDream Web</div>
+                      <div className="mt-1 text-[10px]" style={imageStudioMutedStyle}>
+                        {language === "en"
+                          ? `Prompt refine ${imageStudio.config.web.promptRefine ? "enabled" : "disabled"}`
+                          : `提示词润色${imageStudio.config.web.promptRefine ? "已开启" : "已关闭"}`}
+                      </div>
+                    </button>
+                  ) : (
+                    <>
+                      <label className="min-w-0">
+                        <span className="mb-1 block text-[10px] font-semibold uppercase tracking-[0.14em]" style={imageStudioMutedStyle}>
+                          {language === "en" ? "Steps" : "步数"} · {imageStudio.config.steps}
+                        </span>
+                        <input
+                          type="range"
+                          min="1"
+                          max="80"
+                          step="1"
+                          value={imageStudio.config.steps}
+                          onChange={(event) => setImageStudioConfig({ steps: Number(event.target.value) })}
+                          className="w-full accent-[var(--accent)]"
+                        />
+                      </label>
+                      <label className="min-w-0">
+                        <span className="mb-1 block text-[10px] font-semibold uppercase tracking-[0.14em]" style={imageStudioMutedStyle}>
+                          CFG · {imageStudio.config.guidanceScale}
+                        </span>
+                        <input
+                          type="range"
+                          min="0"
+                          max="20"
+                          step="0.5"
+                          value={imageStudio.config.guidanceScale}
+                          onChange={(event) => setImageStudioConfig({ guidanceScale: Number(event.target.value) })}
+                          className="w-full accent-[var(--accent)]"
+                        />
+                      </label>
+                    </>
+                  )}
+                </div>
+              )}
             </div>
           )}
 
@@ -2324,7 +2406,7 @@ export default function Composer({
                 {isImageStudioMode ? (
                   <div className="flex items-center gap-1.5 ml-0.5" title={language === "en" ? "Image Studio bypasses LLM context and tool execution" : "图像工作室不占用 LLM 上下文，也不进入工具执行"}>
                     <IconZap className="h-3.5 w-3.5 text-[var(--accent-light)]" />
-                    <span>{isHuggingFaceImageEngine ? "HF Space" : `${imageStudio.config.steps} steps`}</span>
+                    <span>{isWebFallbackImageEngine ? "HiDream Web" : `${imageStudio.config.steps} steps`}</span>
                   </div>
                 ) : activeProfile === "cloud" ? (
                   <div className="flex items-center gap-1.5 ml-0.5" title={cloudTokenTitle}>
@@ -2367,8 +2449,8 @@ export default function Composer({
                         key={modeKey}
                         data-testid={`main-focus-option-${modeKey}`}
                         onMouseMove={() => setHoveredMainFocusModeKey(modeKey)}
-                        onClick={() => {
-                          setSelectedMainModeKey(modeKey);
+                        onClick={async () => {
+                          await switchMainModeWithIsolation(modeKey);
                           setShowAgentPicker(false);
                           setHoveredMainFocusModeKey(null);
                         }}
@@ -2535,7 +2617,7 @@ export default function Composer({
                   <IconShield className="h-4 w-4" />
                 </button>
               )}
-              {isImageStudioMode && (
+              {isImageStudioMode && imageStudioSupportsReferenceImages && (
                 <button
                   onClick={handleAttachButtonClick}
                   className="panel-tab-icon-button flex h-7 w-7 shrink-0 items-center justify-center rounded-[7px] p-0 transition-all duration-150"
