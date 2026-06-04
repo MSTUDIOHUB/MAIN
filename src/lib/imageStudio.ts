@@ -423,6 +423,56 @@ export async function discoverLocalImageStudioModels(input: {
   throw new Error("Local image service model discovery failed.");
 }
 
+export function isImageModelName(modelName: string): boolean {
+  if (!modelName) return false;
+  const name = modelName.toLowerCase();
+  const imageKeywords = [
+    "flux",
+    "stable-diffusion",
+    "diffusion",
+    "sdxl",
+    "sd15",
+    "sd21",
+    "sd-",
+    "sd3",
+    "sd_",
+    "kolors",
+    "dall-e",
+    "dalle",
+    "midjourney",
+    "playground",
+    "pixart",
+    "auraflow",
+    "hunyuan-dit",
+    "cogview",
+    "janus",
+    "showui"
+  ];
+  const textKeywords = [
+    "qwen",
+    "gemma",
+    "llama",
+    "deepseek",
+    "mistral",
+    "phi",
+    "yi",
+    "chatglm",
+    "internlm",
+    "baichuan",
+    "mixtral",
+    "gemma2",
+    "gemma4"
+  ];
+
+  if (imageKeywords.some(kw => name.includes(kw))) {
+    return true;
+  }
+  if (textKeywords.some(kw => name.includes(kw))) {
+    return false;
+  }
+  return false;
+}
+
 export async function checkImageStudioEngineStatus(config: ImageStudioRuntimeConfig): Promise<ImageStudioProviderStatus> {
   const normalized = normalizeImageStudioConfig(config);
   const providerKind = normalized.provider;
@@ -449,18 +499,27 @@ export async function checkImageStudioEngineStatus(config: ImageStudioRuntimeCon
       : [];
     const localDiscoveryReady = providerKind === "local_image_service" && models.length > 0;
     const ready = localDiscoveryReady || result.ready;
+
+    const activeModel = getActiveImageStudioModel(normalized);
+    let warningSuffix = "";
+    if (providerKind === "local_image_service" && activeModel && !isImageModelName(activeModel)) {
+      warningSuffix = ` (警告: 当前选择的模型 '${activeModel}' 可能是文本模型，非生图模型，请确保您的本地服务支持生图)。`;
+    }
+
+    const baseMessage = localDiscoveryReady && !result.ready
+      ? `Discovered ${models.length} local model${models.length === 1 ? "" : "s"} through ${normalized.local.serviceFamily}.`
+      : result.message || (
+          ready
+            ? providerKind === "local_image_service"
+              ? "Local image service is reachable."
+              : "Web fallback image provider is reachable."
+            : "Image provider is not reachable."
+        );
+
     return normalizeImageStudioStatus({
       providerKind,
       state: ready ? "ready" : "missing",
-      message: localDiscoveryReady && !result.ready
-        ? `Discovered ${models.length} local model${models.length === 1 ? "" : "s"} through ${normalized.local.serviceFamily}.`
-        : result.message || (
-            ready
-              ? providerKind === "local_image_service"
-                ? "Local image service is reachable."
-                : "Web fallback image provider is reachable."
-              : "Image provider is not reachable."
-          ),
+      message: baseMessage + warningSuffix,
       capabilities: {
         ...getDefaultImageStudioCapabilities(providerKind),
         ...(result.capabilities || {}),
@@ -841,4 +900,25 @@ function inferHostedProgressPercent(message: string, seconds: number): number {
   if (normalized.includes("downloading")) return 94;
   if (normalized.includes("generated")) return 100;
   return Math.max(12, Math.min(90, 12 + Math.floor(seconds * 2.6)));
+}
+
+export function isImageGenerationPrompt(text: string): boolean {
+  const trimmed = text.trim();
+  if (trimmed.startsWith("/") && (
+    trimmed.startsWith("/image") || 
+    trimmed.startsWith("/draw") || 
+    trimmed.startsWith("/生图") || 
+    trimmed.startsWith("/画图")
+  )) {
+    return true;
+  }
+  const zhPatterns = [
+    /^(?:画图|生图|生成图片|画一张|画一幅|画个|画一只|画幅|画张)[:：\s]/i,
+    /^(?:请|帮我|帮我画|给我画)?(?:画(?:一个|一只|一幅|一张|个|只|幅|张|起)?|生成(?:一张|一幅|个)?图片)(?!.*(?:怎么|代码|方法|逻辑|步骤|教程|过程))/
+  ];
+  const enPatterns = [
+    /^(?:draw|paint|generate image|create image|generate a picture of|generate an image of|make an image of)[:\s]/i,
+    /^(?:please |could you )?(?:draw|paint|generate|create|make) (?:a |an )?(?:image|picture|painting|photo|drawing) of (?!.*(?:how to|code|tutorial|steps|process|program))/i
+  ];
+  return zhPatterns.some(p => p.test(trimmed)) || enPatterns.some(p => p.test(trimmed));
 }

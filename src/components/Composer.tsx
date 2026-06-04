@@ -12,6 +12,7 @@ import { createWorkspaceFileIndexController } from "../lib/workspaceFileIndex";
 import { getGameStudioSlashCatalog } from "../lib/gameStudioPack";
 import { humanizeSlug } from "../lib/gameStudioCatalog";
 import { getIntentPolicy, getMainIntentShortcuts, getRunIntentCategoryLabel, getRunIntentLabel, parseMainDebugShortcut, parseMainIntentShortcutForMode, resolveComposerIntentSuggestion } from "../lib/runIntent";
+import { isImageModelName } from "../lib/imageStudio";
 import {
   resolveGameStudioOnboardingAction,
   shouldShowGameStudioOnboarding,
@@ -581,6 +582,10 @@ export default function Composer({
   const imageStudioProviderDetail = isWebFallbackImageEngine
     ? (language === "en" ? "Hosted fallback inside Image Studio" : "图像工作室内置托管 fallback")
     : `${imageStudioLocalFamilyLabel} · ${imageStudio.status.activeModel || imageStudio.config.local.model || imageStudio.config.local.endpoint}`;
+
+  const activeModel = imageStudio.status.activeModel || imageStudio.config.local.model || "";
+  const isLocalActiveModelTextLLM = isLocalImageEngine && activeModel !== "" && !isImageModelName(activeModel);
+  const isLocalActiveModelFlux = activeModel.toLowerCase().includes("flux");
 
   const [cooldownSec, setCooldownSec] = useState(0);
 
@@ -1247,9 +1252,15 @@ export default function Composer({
       ? parsed.rest.trimStart()
       : draftInput.replace(/^\s*\/[^\s]*\s*/, "");
     closeSlashMenu();
-    setDraftInput(nextInput);
-    setStoreInput(nextInput, { preserveLockedComposerIntent: true });
-    setLockedComposerIntent(item.intent);
+    if (item.intent === "image_studio") {
+      const finalInput = `${item.command} ${nextInput}`;
+      setDraftInput(finalInput);
+      setStoreInput(finalInput, { preserveLockedComposerIntent: true });
+    } else {
+      setDraftInput(nextInput);
+      setStoreInput(nextInput, { preserveLockedComposerIntent: true });
+      setLockedComposerIntent(item.intent);
+    }
     requestAnimationFrame(() => textareaRef.current?.focus());
   };
 
@@ -1928,6 +1939,14 @@ export default function Composer({
                 </div>
               </div>
 
+              {isLocalActiveModelTextLLM && (
+                <div className="mb-3 rounded-lg border border-[rgba(250,204,21,0.24)] bg-[rgba(250,204,21,0.08)] px-3 py-2 text-[11px] leading-relaxed text-[#facc15]">
+                  {language === "en"
+                    ? "⚠️ The current local model may be a text model instead of an image generation model. Please ensure your service supports image generation."
+                    : "⚠️ 当前本地模型可能是文本模型而非生图模型，请确保您的服务支持生图计算。"}
+                </div>
+              )}
+
               <div className="grid gap-3 md:grid-cols-[minmax(220px,1.25fr)_minmax(170px,0.75fr)]">
                 <div>
                   <div className="mb-1 text-[10px] font-semibold uppercase tracking-[0.14em]" style={imageStudioMutedStyle}>
@@ -2035,20 +2054,22 @@ export default function Composer({
                           className="w-full accent-[var(--accent)]"
                         />
                       </label>
-                      <label className="min-w-0">
-                        <span className="mb-1 block text-[10px] font-semibold uppercase tracking-[0.14em]" style={imageStudioMutedStyle}>
-                          CFG · {imageStudio.config.guidanceScale}
-                        </span>
-                        <input
-                          type="range"
-                          min="0"
-                          max="20"
-                          step="0.5"
-                          value={imageStudio.config.guidanceScale}
-                          onChange={(event) => setImageStudioConfig({ guidanceScale: Number(event.target.value) })}
-                          className="w-full accent-[var(--accent)]"
-                        />
-                      </label>
+                      {!isLocalActiveModelFlux && (
+                        <label className="min-w-0">
+                          <span className="mb-1 block text-[10px] font-semibold uppercase tracking-[0.14em]" style={imageStudioMutedStyle}>
+                            CFG · {imageStudio.config.guidanceScale}
+                          </span>
+                          <input
+                            type="range"
+                            min="0"
+                            max="20"
+                            step="0.5"
+                            value={imageStudio.config.guidanceScale}
+                            onChange={(event) => setImageStudioConfig({ guidanceScale: Number(event.target.value) })}
+                            className="w-full accent-[var(--accent)]"
+                          />
+                        </label>
+                      )}
                     </>
                   )}
                 </div>

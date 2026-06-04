@@ -10,7 +10,8 @@ export type ResolvedUserIntent =
   | "analyze"
   | "summarize"
   | "report"
-  | "studio_workflow";
+  | "studio_workflow"
+  | "image_studio";
 export type ResolvedRunIntent = ResolvedUserIntent;
 export type RunIntentRiskLevel = "low" | "medium" | "high";
 export type RunIntentUiCategory = "workflow_mode" | "output_style" | "discussion" | "studio_workflow";
@@ -265,6 +266,21 @@ const RUN_INTENT_POLICIES: Record<ResolvedUserIntent, RunIntentPolicy> = {
       en: "Bypass the MAIN router and execute through the Game Studio protocol.",
     },
   },
+  image_studio: {
+    intent: "image_studio",
+    workflowMode: "chat",
+    uiCategory: "workflow_mode",
+    toolPolicy: "none",
+    requiresPlanApproval: false,
+    generatesPlanArtifacts: false,
+    allowsSourceWritesBeforePlanApproval: false,
+    label: { zh: "图像生成", en: "Image Studio" },
+    categoryLabel: { zh: "图像工作室", en: "Image Studio" },
+    description: {
+      zh: "在对话中生成图片",
+      en: "Generate an image in the chat",
+    },
+  },
 };
 
 const STRONG_PLAN_PATTERNS = [
@@ -505,6 +521,15 @@ const MAIN_INTENT_SHORTCUTS_ZH: MainIntentShortcutItem[] = [
     aliases: ["summary", "summarize", "摘要", "概括", "归纳"],
     visibleInMenu: true,
   },
+  {
+    intent: "image_studio" as any,
+    command: "/生图",
+    label: "生成图片",
+    description: "通过自然语言描述在当前对话中生成图片",
+    category: "workflow_mode",
+    aliases: ["draw", "image", "画图", "生图"],
+    visibleInMenu: true,
+  },
 ];
 
 const MAIN_INTENT_SHORTCUTS_EN: MainIntentShortcutItem[] = [
@@ -542,6 +567,15 @@ const MAIN_INTENT_SHORTCUTS_EN: MainIntentShortcutItem[] = [
     description: RUN_INTENT_POLICIES.summarize.description.en,
     category: RUN_INTENT_POLICIES.summarize.uiCategory,
     aliases: ["总结", "摘要", "概括", "归纳", "summary"],
+    visibleInMenu: true,
+  },
+  {
+    intent: "image_studio" as any,
+    command: "/draw",
+    label: "Generate Image",
+    description: "Generate an image in the current chat using natural language description.",
+    category: "workflow_mode",
+    aliases: ["draw", "image", "paint"],
     visibleInMenu: true,
   },
 ];
@@ -978,6 +1012,12 @@ function createOption(intent: ResolvedUserIntent, language: "zh" | "en"): Pendin
       en: "Use Game Studio Workflow",
       valueZh: "请按 MAIN GAME STUDIO 的工作流来处理这个需求",
       valueEn: "Handle this through the MAIN GAME STUDIO workflow.",
+    },
+    image_studio: {
+      zh: "生成图片",
+      en: "Generate Image",
+      valueZh: "在当前对话中生成图片",
+      valueEn: "Generate an image in the current chat.",
     },
   };
 

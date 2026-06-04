@@ -243,6 +243,7 @@ import {
   getDefaultImageStudioEndpoint,
   getActiveImageStudioModel,
   isLocalImageStudioProvider,
+  isImageGenerationPrompt,
   normalizeImageStudioConfig,
   normalizeImageStudioRuntime,
   persistGeneratedImage,
@@ -2333,6 +2334,7 @@ const RUN_INTENT_LABELS: Record<ResolvedRunIntent, { zh: string; en: string }> =
   summarize: { zh: "总结", en: "Summarize" },
   report: { zh: "报告", en: "Report" },
   studio_workflow: { zh: "Game Studio 工作流", en: "Game Studio Workflow" },
+  image_studio: { zh: "生成图片", en: "Generate Image" },
 };
 
 const RESOLVED_USER_INTENT_KEYS = new Set<ResolvedUserIntent>([
@@ -2344,6 +2346,7 @@ const RESOLVED_USER_INTENT_KEYS = new Set<ResolvedUserIntent>([
   "summarize",
   "report",
   "studio_workflow",
+  "image_studio",
 ]);
 
 function isResolvedUserIntentChoice(choice: PendingRunDecisionChoice): choice is ResolvedUserIntent {
@@ -4767,13 +4770,16 @@ export const useAppStore = create<AppState>()(
       ensuredSessionId != null &&
       workspaceSessions.some((session) => session.id === ensuredSessionId);
 
+    const currentSessionAffinity = hasValidCurrentSession
+      ? (workspaceSessions.find((session) => session.id === ensuredSessionId)?.sessionModeAffinity || state.selectedMainModeKey)
+      : (state.selectedMainModeKey === "image_studio" ? "image_studio" : "main_mode");
+
     if (!hasValidCurrentSession) {
       const autoSession = buildNewSessionRecord({
         state,
         scopeKey: sessionScopeKey,
-        affinity: "image_studio",
+        affinity: currentSessionAffinity,
         language,
-        title: buildImageSessionDefaultTitle(language),
       });
       set((s) => ({
         sessionsByWorkspace: {
@@ -4836,7 +4842,7 @@ export const useAppStore = create<AppState>()(
         updatedAt: new Date().toISOString(),
         updatedAtMs: Date.now(),
         active: true,
-        sessionModeAffinity: "image_studio",
+        sessionModeAffinity: currentSessionAffinity,
         messages: sanitizeTaskBlocksForPersist(latest.taskFlow),
         storageStatus: latest.config.sessionRecordingEnabled ? "ok" : "temporary",
         recordingDisabled: !latest.config.sessionRecordingEnabled,
@@ -4867,8 +4873,8 @@ export const useAppStore = create<AppState>()(
       input: "",
       contextMentions: [],
       attachedFiles: [],
-      selectedMainModeKey: "image_studio",
-      selectedNexusModeKey: "nexus_general",
+      selectedMainModeKey: s.selectedMainModeKey,
+      selectedNexusModeKey: s.selectedNexusModeKey,
       lockedComposerIntent: null,
       pendingRunDecision: null,
       isGenerating: true,
@@ -4889,7 +4895,7 @@ export const useAppStore = create<AppState>()(
         updatedAt: issuedAtIso,
         updatedAtMs: issuedAt,
         active: true,
-        sessionModeAffinity: "image_studio",
+        sessionModeAffinity: currentSessionAffinity,
       });
     }
     persistSession();
@@ -6685,8 +6691,21 @@ export const useAppStore = create<AppState>()(
       workspace: state.currentWorkspace || null,
       activeProfile: state.config.activeProfile,
     });
-    if (options?.hidden !== true && state.selectedMainModeKey === "image_studio") {
-      return get().runImageStudioGeneration(text, images);
+    const isImagePrompt = options?.hidden !== true && (
+      state.selectedMainModeKey === "image_studio" ||
+      (state.selectedMainModeKey === "main_mode" && isImageGenerationPrompt(text))
+    );
+    if (isImagePrompt) {
+      let cleanText = text;
+      const trimmed = text.trim();
+      if (trimmed.startsWith("/")) {
+        const parts = trimmed.split(/\s+/);
+        const command = parts[0].toLowerCase();
+        if (["/image", "/draw", "/生图", "/画图"].includes(command)) {
+          cleanText = parts.slice(1).join(" ");
+        }
+      }
+      return get().runImageStudioGeneration(cleanText, images);
     }
     const isHidden = options?.hidden === true;
     const createVisibleTurnForHiddenMessage = isHidden && options?.createVisibleTurnForHiddenMessage === true;
