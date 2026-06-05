@@ -962,6 +962,26 @@ export function knowledgeGetExcerpt(
   return invoke<KnowledgeSearchHit | null>("knowledge_get_excerpt", { sourceId, chunkId });
 }
 
+export function knowledgeImportUrl(
+  kbId: string,
+  url: string,
+  recursive: boolean,
+  maxDepth?: number,
+  maxPages?: number,
+): Promise<KnowledgeBase> {
+  return invoke<KnowledgeBase>("knowledge_import_url", {
+    kbId,
+    url,
+    recursive,
+    maxDepth,
+    maxPages,
+  });
+}
+
+export function knowledgeCancelImportUrl(kbId: string): Promise<void> {
+  return invoke<void>("knowledge_cancel_import_url", { kbId });
+}
+
 export function deletePlanFiles(): Promise<void> {
   return invoke<void>("delete_plan_files");
 }

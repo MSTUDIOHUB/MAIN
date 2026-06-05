@@ -797,6 +797,106 @@ fn github_title_from_url(url: &Url) -> String {
         .unwrap_or_default()
 }
 
+pub async fn fetch_page_raw(url: &str) -> Result<WebFetchResponse, String> {
+    let requested_url = validate_http_url(url)?.to_string();
+    let client = build_client()?;
+
+    if let Some(response) = fetch_github_url(&client, &requested_url, 1_000_000).await? {
+        return Ok(response);
+    }
+
+    let (fetched, source) = match fetch_text(&client, &requested_url, MAX_RESPONSE_BYTES).await {
+        Ok(body) => (body, "web"),
+        Err(primary_error) => {
+            let reader_url = jina_reader_url(&requested_url);
+            match fetch_text(&client, &reader_url, MAX_RESPONSE_BYTES).await {
+                Ok(body) => (body, "jina_reader"),
+                Err(reader_error) => {
+                    return Err(format!(
+                        "Direct fetch failed: {primary_error}; Jina Reader fallback failed: {reader_error}"
+                    ));
+                }
+            }
+        }
+    };
+
+    let (title, content) = if looks_like_html(&fetched.content_type, &fetched.text) {
+        (
+            extract_html_title(&fetched.text),
+            html_to_text(&fetched.text),
+        )
+    } else {
+        (
+            if source == "jina_reader" {
+                extract_jina_title(&fetched.text)
+            } else {
+                "".to_string()
+            },
+            normalize_plain_text(&fetched.text),
+        )
+    };
+
+    let char_count = content.chars().count();
+    Ok(WebFetchResponse {
+        url: requested_url,
+        final_url: fetched.final_url,
+        title,
+        content,
+        content_type: fetched.content_type,
+        char_count,
+        truncated: fetched.truncated,
+        source: source.to_string(),
+    })
+}
+
+pub fn extract_links(text: &str, base_url: &Url, prefix: &str) -> Vec<Url> {
+    let html_re = Regex::new(r#"(?is)<a\b[^>]*href=["']([^"']+)["']"#).unwrap();
+    let md_re = Regex::new(r#"\[[^\]]*\]\(([^)]+)\)"#).unwrap();
+    let mut links = Vec::new();
+    
+    let mut process_href = |href: &str| {
+        let href = href.trim();
+        if href.is_empty() || href.starts_with('#') || href.starts_with("javascript:") {
+            return;
+        }
+        if let Ok(mut resolved) = base_url.join(href) {
+            resolved.set_fragment(None);
+            if resolved.as_str().starts_with(prefix) {
+                links.push(resolved);
+            }
+        }
+    };
+
+    for caps in html_re.captures_iter(text) {
+        if let Some(href_match) = caps.get(1) {
+            process_href(href_match.as_str());
+        }
+    }
+
+    for caps in md_re.captures_iter(text) {
+        if let Some(url_match) = caps.get(1) {
+            process_href(url_match.as_str());
+        }
+    }
+
+    links.sort();
+    links.dedup();
+    links
+}
+
+pub fn is_crawlable_url(url: &Url) -> bool {
+    let path = url.path().to_ascii_lowercase();
+    let static_extensions = [
+        ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
+        ".css", ".js",
+        ".zip", ".tar", ".gz", ".rar", ".7z",
+        ".pdf", ".epub",
+        ".mp3", ".wav", ".mp4", ".avi", ".mov",
+        ".woff", ".woff2", ".ttf", ".eot"
+    ];
+    !static_extensions.iter().any(|ext| path.ends_with(ext))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -904,5 +1004,32 @@ mod tests {
     #[test]
     fn baidu_falls_back_through_free_search_sources() {
         assert_eq!(fallback_providers("baidu"), vec!["duckduckgo", "bing"]);
+    }
+
+    #[test]
+    fn extracts_links_html_and_markdown() {
+        let base_url = Url::parse("https://docs.unity3d.com/ScriptReference/index.html").unwrap();
+        let prefix = "https://docs.unity3d.com/ScriptReference/";
+        
+        let text = "
+            HTML link: <a href=\"Transform.html\">Transform</a>
+            Markdown link: [GameObject](GameObject.html)
+            External HTML: <a href=\"https://google.com\">Google</a>
+            External Markdown: [Microsoft](https://microsoft.com)
+            Anchor HTML: <a href=\"#top\">Anchor</a>
+        ";
+        
+        let links = extract_links(text, &base_url, prefix);
+        assert_eq!(links.len(), 2);
+        assert!(links.contains(&Url::parse("https://docs.unity3d.com/ScriptReference/Transform.html").unwrap()));
+        assert!(links.contains(&Url::parse("https://docs.unity3d.com/ScriptReference/GameObject.html").unwrap()));
+    }
+
+    #[test]
+    fn detects_static_crawlable_urls() {
+        assert!(is_crawlable_url(&Url::parse("https://example.com/page.html").unwrap()));
+        assert!(is_crawlable_url(&Url::parse("https://example.com/directory/").unwrap()));
+        assert!(!is_crawlable_url(&Url::parse("https://example.com/logo.PNG").unwrap()));
+        assert!(!is_crawlable_url(&Url::parse("https://example.com/manual.pdf").unwrap()));
     }
 }

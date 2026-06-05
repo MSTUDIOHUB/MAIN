@@ -8976,11 +8976,9 @@ fn index_workspace_documents(
     run_document_reader(&workspace, &payload)
 }
 
-fn knowledge_app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("解析知识库数据目录失败: {error}"))?;
+fn knowledge_app_data_dir(state: &State<'_, WorkspaceState>) -> Result<PathBuf, String> {
+    let workspace = state.get_root()?;
+    let dir = workspace.join(".MAIN");
     fs::create_dir_all(&dir).map_err(|error| format!("创建知识库数据目录失败: {error}"))?;
     Ok(dir)
 }
@@ -9044,18 +9042,18 @@ fn copy_knowledge_source_to_store(
 }
 
 #[tauri::command]
-fn knowledge_list_bases(app: AppHandle) -> Result<Vec<knowledge::KnowledgeBase>, String> {
-    let app_data_dir = knowledge_app_data_dir(&app)?;
+fn knowledge_list_bases(state: State<'_, WorkspaceState>) -> Result<Vec<knowledge::KnowledgeBase>, String> {
+    let app_data_dir = knowledge_app_data_dir(&state)?;
     knowledge::list_knowledge_bases(&app_data_dir)
 }
 
 #[tauri::command]
 fn knowledge_create_base(
-    app: AppHandle,
+    state: State<'_, WorkspaceState>,
     name: String,
     description: Option<String>,
 ) -> Result<knowledge::KnowledgeBase, String> {
-    let app_data_dir = knowledge_app_data_dir(&app)?;
+    let app_data_dir = knowledge_app_data_dir(&state)?;
     let name = name.trim();
     if name.is_empty() {
         return Err("知识库名称不能为空".to_string());
@@ -9065,26 +9063,26 @@ fn knowledge_create_base(
 
 #[tauri::command]
 fn knowledge_set_base_enabled(
-    app: AppHandle,
+    state: State<'_, WorkspaceState>,
     kb_id: String,
     enabled: bool,
 ) -> Result<knowledge::KnowledgeBase, String> {
-    let app_data_dir = knowledge_app_data_dir(&app)?;
+    let app_data_dir = knowledge_app_data_dir(&state)?;
     knowledge::set_knowledge_base_enabled(&app_data_dir, &kb_id, enabled)
 }
 
 #[tauri::command]
-fn knowledge_delete_base(app: AppHandle, kb_id: String) -> Result<(), String> {
-    let app_data_dir = knowledge_app_data_dir(&app)?;
+fn knowledge_delete_base(state: State<'_, WorkspaceState>, kb_id: String) -> Result<(), String> {
+    let app_data_dir = knowledge_app_data_dir(&state)?;
     knowledge::delete_knowledge_base(&app_data_dir, &kb_id)
 }
 
 #[tauri::command]
 fn knowledge_list_sources(
-    app: AppHandle,
+    state: State<'_, WorkspaceState>,
     kb_id: String,
 ) -> Result<Vec<knowledge::KnowledgeSource>, String> {
-    let app_data_dir = knowledge_app_data_dir(&app)?;
+    let app_data_dir = knowledge_app_data_dir(&state)?;
     knowledge::list_sources(&app_data_dir, &kb_id)
 }
 
@@ -9096,7 +9094,7 @@ fn knowledge_import_source(
     path: String,
     workspace: Option<String>,
 ) -> Result<knowledge::KnowledgeImportResult, String> {
-    let app_data_dir = knowledge_app_data_dir(&app)?;
+    let app_data_dir = knowledge_app_data_dir(&state)?;
     let source_path = resolve_knowledge_import_path(&state, &path, workspace)?;
     let storage_path = copy_knowledge_source_to_store(&app_data_dir, &kb_id, &source_path)?;
     let extracted = extract_document_for_knowledge(&storage_path)?;
@@ -9110,12 +9108,225 @@ fn knowledge_import_source(
     )
 }
 
+use std::collections::VecDeque;
+
+static CANCELLED_IMPORTS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn is_import_cancelled(kb_id: &str) -> bool {
+    if let Some(set_mutex) = CANCELLED_IMPORTS.get() {
+        if let Ok(set) = set_mutex.lock() {
+            return set.contains(kb_id);
+        }
+    }
+    false
+}
+
+fn set_import_cancelled(kb_id: &str, cancelled: bool) {
+    let set_mutex = CANCELLED_IMPORTS.get_or_init(|| Mutex::new(HashSet::new()));
+    if let Ok(mut set) = set_mutex.lock() {
+        if cancelled {
+            set.insert(kb_id.to_string());
+        } else {
+            set.remove(kb_id);
+        }
+    }
+}
+
+#[tauri::command]
+fn knowledge_cancel_import_url(kb_id: String) -> Result<(), String> {
+    set_import_cancelled(&kb_id, true);
+    Ok(())
+}
+
+#[tauri::command]
+async fn knowledge_import_url(
+    app: AppHandle,
+    state: State<'_, WorkspaceState>,
+    kb_id: String,
+    url: String,
+    recursive: bool,
+    max_depth: Option<usize>,
+    max_pages: Option<usize>,
+) -> Result<knowledge::KnowledgeBase, String> {
+    let app_data_dir = knowledge_app_data_dir(&state)?;
+    
+    // Clear cancel flag
+    set_import_cancelled(&kb_id, false);
+
+    let mut entry_url = url::Url::parse(&url).map_err(|e| format!("无效的 URL: {e}"))?;
+    
+    // Normalize path trailing slash for directory listings (e.g. without trailing slash)
+    if !entry_url.path().ends_with('/') && !entry_url.path().split('/').last().unwrap_or("").contains('.') {
+        let mut new_path = entry_url.path().to_string();
+        new_path.push('/');
+        entry_url.set_path(&new_path);
+    }
+    
+    // Calculate folder prefix
+    let mut prefix = entry_url.to_string();
+    if let Some(last_slash_idx) = prefix.rfind('/') {
+        prefix.truncate(last_slash_idx + 1);
+    }
+    
+    let depth_limit = if recursive { max_depth.unwrap_or(2).clamp(1, 3) } else { 1 };
+    let page_limit = if recursive { max_pages.unwrap_or(50).clamp(1, 100) } else { 1 };
+
+    let mut queue = VecDeque::new();
+    queue.push_back((entry_url.clone(), 1));
+
+    let mut visited = HashSet::new();
+    let mut queued = HashSet::new();
+    queued.insert(url.clone());
+
+    // Unity ScriptReference TOC Loader Optimization
+    if recursive && entry_url.path().to_ascii_lowercase().contains("/scriptreference") {
+        if let Ok(toc_url) = entry_url.join("docdata/toc.json") {
+            record_debug_log(&app, "info", "knowledge", format!("检测到 Unity ScriptReference，尝试加载 TOC: {}", toc_url));
+            if let Ok(fetched_toc) = web_search::fetch_page_raw(toc_url.as_str()).await {
+                let link_re = Regex::new(r#""link":"([^"]+)""#).unwrap();
+                for caps in link_re.captures_iter(&fetched_toc.content) {
+                    let link = &caps[1];
+                    if link != "null" && link != "toc" {
+                        if let Ok(mut resolved) = entry_url.join(&format!("{}.html", link)) {
+                            resolved.set_fragment(None);
+                            let link_str = resolved.to_string();
+                            if !queued.contains(&link_str) && visited.len() + queue.len() < page_limit {
+                                queued.insert(link_str);
+                                queue.push_back((resolved, 1)); // Queue to crawl at depth 1
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    while let Some((current_url, depth)) = queue.pop_front() {
+        if is_import_cancelled(&kb_id) {
+            record_debug_log(&app, "info", "knowledge", format!("网页导入任务被取消: {}", kb_id));
+            break;
+        }
+
+        let url_str = current_url.to_string();
+        visited.insert(url_str.clone());
+
+        // Emit progress
+        let _ = app.emit(
+            "knowledge-import-progress",
+            json!({
+                "kbId": kb_id,
+                "status": "fetching",
+                "url": url_str,
+                "current": visited.len(),
+                "total": visited.len() + queue.len(),
+            }),
+        );
+
+        match web_search::fetch_page_raw(&url_str).await {
+            Ok(fetched) => {
+                // Determine file name & path
+                let content_bytes = fetched.content.as_bytes();
+                let hash = {
+                    use sha2::{Digest, Sha256};
+                    let digest = Sha256::digest(content_bytes);
+                    digest.iter().take(12).map(|b| format!("{b:02x}")).collect::<String>()
+                };
+                let sanitized_title = knowledge::sanitize_file_name(&fetched.title);
+                let file_name = if sanitized_title.is_empty() {
+                    format!("{hash}.md")
+                } else {
+                    format!("{hash}_{sanitized_title}.md")
+                };
+
+                let target_dir = knowledge::source_storage_dir(&app_data_dir, &kb_id);
+                if let Err(e) = fs::create_dir_all(&target_dir) {
+                    record_debug_log(&app, "error", "knowledge", format!("创建目录失败: {e}"));
+                    continue;
+                }
+                let storage_path = target_dir.join(&file_name);
+                if let Err(e) = fs::write(&storage_path, content_bytes) {
+                    record_debug_log(&app, "error", "knowledge", format!("写入文件失败: {e}"));
+                    continue;
+                }
+
+                // Call index_extracted_source
+                let extracted = json!({
+                    "title": fetched.title,
+                    "documentType": "text",
+                    "content": fetched.content,
+                    "charCount": fetched.char_count,
+                    "truncated": fetched.truncated,
+                    "metadata": {
+                        "sourceUrl": url_str.clone()
+                    }
+                });
+
+                let original_path = PathBuf::from(&url_str);
+                let _ = knowledge::index_extracted_source(
+                    &app_data_dir,
+                    &kb_id,
+                    &original_path,
+                    &storage_path,
+                    &extracted,
+                    true, // force reindex
+                );
+
+                // If recursive, extract links and queue them
+                if recursive && depth < depth_limit && visited.len() + queue.len() < page_limit {
+                    let links = web_search::extract_links(&fetched.content, &current_url, &prefix);
+                    for link in links {
+                        if !web_search::is_crawlable_url(&link) {
+                            continue;
+                        }
+                        let link_str = link.to_string();
+                        if !queued.contains(&link_str) && visited.len() + queue.len() < page_limit {
+                            queued.insert(link_str);
+                            queue.push_back((link, depth + 1));
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                record_debug_log(&app, "warn", "knowledge", format!("抓取网页失败 {}: {}", url_str, err));
+                let _ = app.emit(
+                    "knowledge-import-progress",
+                    json!({
+                        "kbId": kb_id,
+                        "status": "error",
+                        "url": url_str,
+                        "error": err,
+                        "current": visited.len(),
+                        "total": visited.len() + queue.len(),
+                    }),
+                );
+            }
+        }
+    }
+
+    // Emit finished event
+    let _ = app.emit(
+        "knowledge-import-progress",
+        json!({
+            "kbId": kb_id,
+            "status": "done",
+            "current": visited.len(),
+            "total": visited.len(),
+        }),
+    );
+
+    // Return the updated knowledge base
+    knowledge::list_knowledge_bases(&app_data_dir)?
+        .into_iter()
+        .find(|base| base.id == kb_id)
+        .ok_or_else(|| "知识库不存在".to_string())
+}
+
 #[tauri::command]
 fn knowledge_rebuild_base(
-    app: AppHandle,
+    state: State<'_, WorkspaceState>,
     kb_id: String,
 ) -> Result<knowledge::KnowledgeBase, String> {
-    let app_data_dir = knowledge_app_data_dir(&app)?;
+    let app_data_dir = knowledge_app_data_dir(&state)?;
     let sources = knowledge::stored_sources(&app_data_dir, &kb_id)?;
     for stored in sources {
         if !stored.storage_path.exists() {
@@ -9140,12 +9351,12 @@ fn knowledge_rebuild_base(
 
 #[tauri::command]
 fn knowledge_search(
-    app: AppHandle,
+    state: State<'_, WorkspaceState>,
     query: String,
     kb_ids: Option<Vec<String>>,
     limit: Option<usize>,
 ) -> Result<knowledge::KnowledgeSearchResult, String> {
-    let app_data_dir = knowledge_app_data_dir(&app)?;
+    let app_data_dir = knowledge_app_data_dir(&state)?;
     knowledge::search(
         &app_data_dir,
         &query,
@@ -9156,11 +9367,11 @@ fn knowledge_search(
 
 #[tauri::command]
 fn knowledge_get_excerpt(
-    app: AppHandle,
+    state: State<'_, WorkspaceState>,
     source_id: String,
     chunk_id: String,
 ) -> Result<Option<knowledge::KnowledgeSearchHit>, String> {
-    let app_data_dir = knowledge_app_data_dir(&app)?;
+    let app_data_dir = knowledge_app_data_dir(&state)?;
     knowledge::get_excerpt(&app_data_dir, &source_id, &chunk_id)
 }
 
@@ -10052,6 +10263,8 @@ pub fn run() {
             knowledge_delete_base,
             knowledge_list_sources,
             knowledge_import_source,
+            knowledge_import_url,
+            knowledge_cancel_import_url,
             knowledge_rebuild_base,
             knowledge_search,
             knowledge_get_excerpt,
