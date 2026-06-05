@@ -24,9 +24,9 @@ import {
   writeFile,
   type GitDiffEntry,
   type ReadFileWindowResult,
-  type ShellPermissionApproval,
   type ShellPermissionDecision,
 } from "../lib/ipc";
+import { buildShellPermissionApproval, suggestedShellPermissionRules } from "../lib/shellAutoApproval";
 import { invoke } from "@tauri-apps/api/core";
 import { setWorkspaceRoot as setWorkspaceRootIpc } from "../lib/ipc";
 import { appendDebugLog } from "../lib/debugLog";
@@ -387,43 +387,6 @@ function isShellDecisionCoveredBySessionRules(
     activeRules.some((rule) => commandMatchesPermissionRule(segment.command, rule)),
   );
 }
-
-function buildShellPermissionApproval(
-  decision: ShellPermissionDecision,
-  scope: "once" | "session",
-): ShellPermissionApproval {
-  return {
-    command: decision.command,
-    approvedAtMs: Date.now(),
-    scope,
-    rules: suggestedShellPermissionRules(decision),
-    riskLevel: decision.riskLevel || null,
-  };
-}
-
-function suggestedShellPermissionRules(decision: ShellPermissionDecision | null | undefined): string[] {
-  if (!decision) return [];
-  const seen = new Set<string>();
-  const rules: string[] = [];
-  for (const rule of decision.suggestedRules || []) {
-    const cleanRule = String(rule || "").trim();
-    if (!cleanRule || seen.has(cleanRule)) continue;
-    seen.add(cleanRule);
-    rules.push(cleanRule);
-  }
-  for (const segment of decision.segmentDecisions || []) {
-    if (segment.decision !== "ask") continue;
-    const rule = String(segment.suggestedRule || segment.matchedRule || "").trim();
-    if (!rule || seen.has(rule)) continue;
-    seen.add(rule);
-    rules.push(rule);
-  }
-  const fallback = String(decision.suggestedRule || "").trim();
-  if (fallback && !seen.has(fallback)) rules.push(fallback);
-  return rules;
-}
-
-
 
 // ── i18n ────────────────────────────────────────────────────────────
 

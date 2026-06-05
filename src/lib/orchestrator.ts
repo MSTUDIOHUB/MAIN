@@ -36,7 +36,7 @@ import {
   type MCPTool,
   type MCPServerStatusSnapshot,
 } from "./mcpClient";
-import { getFileMetadata } from "./ipc";
+import { getFileMetadata, shellPermissionPreflight } from "./ipc";
 import { ensureVisibleConclusionWithPolicy, isAssistantTurnEmpty, isSyntheticVisibleConclusion, normalizeAssistantTurn } from "./normalizedTurn";
 import { hasStructuredPlanProposal } from "./planProposal";
 import {
@@ -317,7 +317,8 @@ import {
   type AgentLoopIterationLimits,
 } from "./agentLoopSafety";
 import { shouldUseRustProxyForLocalProvider } from "./localProviderRouting";
-import type { ShellPermissionApproval } from "./ipc";
+import type { ShellPermissionApproval, ShellPermissionDecision } from "./ipc";
+import { resolveShellAutoApproval } from "./shellAutoApproval";
 import {
   buildTaskTargetingProfile,
   getTaskTargetingEvidenceKey,
@@ -822,11 +823,74 @@ function isDirectoryOnlyShellSegment(segment: string): boolean {
   return /^(?:cd|pushd|popd)\b/i.test(segment);
 }
 
+function shellSegmentWords(segment: string): string[] {
+  return String(segment || "").match(/"[^"]*"|'[^']*'|\S+/g)?.map((word) =>
+    word.replace(/^(['"])(.*)\1$/, "$2")
+  ) || [];
+}
+
+function catHeadTailSegmentHasFileOperand(command: string, args: string[]): boolean {
+  const normalizedCommand = command.toLowerCase();
+  let skipNextOptionValue = false;
+  for (const arg of args) {
+    if (!arg) continue;
+    if (skipNextOptionValue) {
+      skipNextOptionValue = false;
+      continue;
+    }
+    if (arg === "--") return args.indexOf(arg) < args.length - 1;
+    if (normalizedCommand !== "cat" && /^(?:-n|-c|--lines|--bytes)$/.test(arg)) {
+      skipNextOptionValue = true;
+      continue;
+    }
+    if (normalizedCommand !== "cat" && /^(?:--lines=|--bytes=)/.test(arg)) continue;
+    if (normalizedCommand !== "cat" && /^-\d+$/.test(arg)) continue;
+    if (/^-/.test(arg)) continue;
+    return true;
+  }
+  return false;
+}
+
+function sedSegmentHasFileOperand(args: string[]): boolean {
+  let consumedScript = false;
+  let skipNextScriptArg = false;
+  for (const arg of args) {
+    if (!arg) continue;
+    if (skipNextScriptArg) {
+      skipNextScriptArg = false;
+      consumedScript = true;
+      continue;
+    }
+    if (arg === "--") continue;
+    if (/^(?:-e|-f)$/.test(arg)) {
+      skipNextScriptArg = true;
+      continue;
+    }
+    if (/^(?:-e|-f).+/.test(arg)) {
+      consumedScript = true;
+      continue;
+    }
+    if (/^-/.test(arg)) continue;
+    if (!consumedScript) {
+      consumedScript = true;
+      continue;
+    }
+    return true;
+  }
+  return false;
+}
+
 function isShellFileReadSegment(segment: string): boolean {
   const normalized = normalizeShellReadSegment(segment);
   if (!normalized || isDirectoryOnlyShellSegment(normalized)) return false;
-  return /^(?:cat|head|tail|sed)\b/i.test(normalized) ||
-    /\b(?:cat|head|tail)\s+[^&|>;]+/i.test(normalized);
+  const [command = "", ...args] = shellSegmentWords(normalized);
+  if (/^(?:cat|head|tail)$/i.test(command)) {
+    return catHeadTailSegmentHasFileOperand(command, args);
+  }
+  if (/^sed$/i.test(command)) {
+    return sedSegmentHasFileOperand(args);
+  }
+  return false;
 }
 
 export function isShellFileReadCommand(command: string): boolean {
@@ -1273,6 +1337,7 @@ export interface OrchestratorCallbacks {
     arguments: Record<string, unknown>;
     risk?: "local_file_read" | "browser_control";
     localFileReadPath?: string;
+    shellPermissionDecision?: ShellPermissionDecision;
   }) => Promise<ReviewDecision>;
 }
 
@@ -4136,10 +4201,58 @@ async function executeWriteToolWithReview(
     };
   }
 
+  const shellApprovalResolution = await resolveShellAutoApproval({
+    toolName: tc.name,
+    args: toolArgs,
+    workspace,
+    preflight: shellPermissionPreflight,
+  });
+  if (shellApprovalResolution.error) {
+    logAgentEvent("shell_permission_preflight_failed", {
+      tool: tc.name,
+      target,
+      command: shellApprovalResolution.command,
+      error: shellApprovalResolution.error,
+    });
+  } else if (shellApprovalResolution.decision) {
+    logAgentEvent("shell_permission_preflight", {
+      tool: tc.name,
+      target,
+      command: shellApprovalResolution.command,
+      decision: shellApprovalResolution.decision.decision,
+      requiresApproval: shellApprovalResolution.decision.requiresApproval,
+      riskLevel: shellApprovalResolution.decision.riskLevel || null,
+      suggestedRule: shellApprovalResolution.decision.suggestedRule || null,
+      suggestedRules: shellApprovalResolution.decision.suggestedRules || [],
+    });
+  }
+
+  if (shellApprovalResolution.decision?.decision === "deny") {
+    const deniedRule =
+      shellApprovalResolution.decision.matchedRule ||
+      shellApprovalResolution.decision.segmentDecisions.find((segment) => segment.decision === "deny")?.matchedRule ||
+      "";
+    const message = callbacks.getPreferredLanguage() === "zh"
+      ? `命令被 shell 权限策略拒绝: \`${shellApprovalResolution.decision.command}\`${deniedRule ? ` matches \`${deniedRule}\`` : ""}`
+      : `Shell permission policy denied command: \`${shellApprovalResolution.decision.command}\`${deniedRule ? ` matches \`${deniedRule}\`` : ""}`;
+    callbacks.onToolError(tc.name, target, message, { toolCallId: tc.id });
+    return {
+      toolCallId: tc.id,
+      name: tc.name,
+      target,
+      content: `Error: ${message}`,
+      isError: true,
+      lifecycleState: "blocked",
+    };
+  }
+
   if (options.skipUserReview) {
     logAgentEvent("session_auto_review_applied", {
       tool: tc.name,
       target,
+      shellPermissionCommand: shellApprovalResolution.command,
+      shellPermissionDecision: shellApprovalResolution.decision?.decision || null,
+      shellPermissionApprovalAttached: !!shellApprovalResolution.approval,
     });
     return await executeToolCallWithLifecycle(
       tc,
@@ -4148,6 +4261,7 @@ async function executeWriteToolWithReview(
       allTools,
       hooksConfig,
       {
+        shellPermissionApproval: shellApprovalResolution.approval,
         turnContext: options.turnContext,
         recentPlanToolActivity: options.recentPlanToolActivity,
         attemptedPlanWriteTargets: options.attemptedPlanWriteTargets,
@@ -4163,6 +4277,7 @@ async function executeWriteToolWithReview(
       name: tc.name,
       arguments: toolArgs,
       ...(browserRisk ? { risk: browserRisk } : {}),
+      ...(shellApprovalResolution.decision ? { shellPermissionDecision: shellApprovalResolution.decision } : {}),
     });
   } catch {
     callbacks.onStatusChange("idle");

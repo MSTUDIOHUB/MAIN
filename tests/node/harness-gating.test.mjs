@@ -98,6 +98,9 @@ test("buildShellReadValidationError blocks command starting with cat/head/tail/s
   const errCdSed = buildShellReadValidationError(tcExec, { command: "cd /tmp/project && sed -n '270,310p' src/App.tsx" }, callbacks);
   const errCdCatPipe = buildShellReadValidationError(tcExec, { command: "cd /tmp/project && cat -n src/App.tsx | grep -A 15 rawOrders" }, callbacks);
   const okLs = buildShellReadValidationError(tcRun, { command: "ls -la" }, callbacks);
+  const okCloneTail = buildShellReadValidationError(tcRun, {
+    command: "git clone --depth 1 https://github.com/siddharthvaddem/openscreen.git /tmp/openscreen-repo 2>&1 | tail -5",
+  }, callbacks);
 
   assert.ok(errCat);
   assert.equal(errCat.isError, true);
@@ -108,11 +111,18 @@ test("buildShellReadValidationError blocks command starting with cat/head/tail/s
   assert.ok(errCdSed);
   assert.ok(errCdCatPipe);
   assert.equal(okLs, null);
+  assert.equal(okCloneTail, null);
 });
 
 test("isShellFileReadCommand detects read commands after directory changes", () => {
   assert.equal(isShellFileReadCommand("cd /tmp/project && sed -n '1,20p' src/App.tsx"), true);
   assert.equal(isShellFileReadCommand("FOO=1 command head -n 5 package.json"), true);
+  assert.equal(isShellFileReadCommand("tail -5 package.json"), true);
+  assert.equal(isShellFileReadCommand("cat src/App.tsx | head -5"), true);
+  assert.equal(isShellFileReadCommand("git clone --depth 1 https://github.com/siddharthvaddem/openscreen.git /tmp/openscreen-repo 2>&1 | tail -5"), false);
+  assert.equal(isShellFileReadCommand("curl -s http://localhost:1421 | head -30"), false);
+  assert.equal(isShellFileReadCommand("printf '%s\\n' ok | sed -n '1p'"), false);
+  assert.equal(isShellFileReadCommand("printf '%s\\n' ok | cat"), false);
   assert.equal(isShellFileReadCommand("cd /tmp/project && npm run build"), false);
   assert.equal(isShellFileReadCommand("grep -n \"loadOrders\" src/App.tsx"), false);
 });
