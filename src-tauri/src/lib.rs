@@ -33,6 +33,7 @@ pub mod eval;
 pub mod executor;
 pub mod harness;
 pub mod indexer;
+pub mod knowledge;
 pub mod mcp;
 pub mod memory;
 pub mod planner;
@@ -4333,9 +4334,10 @@ impl TreeNode {
         }
         let part = parts[index];
         let is_last = index == parts.len() - 1;
-        let child = self.children.entry(part.to_string()).or_insert_with(|| {
-            TreeNode::new(part.to_string(), !is_last)
-        });
+        let child = self
+            .children
+            .entry(part.to_string())
+            .or_insert_with(|| TreeNode::new(part.to_string(), !is_last));
         if !is_last {
             child.is_dir = true;
             child.insert_path(parts, index + 1);
@@ -4408,7 +4410,10 @@ fn get_project_skeleton(
                 if line.is_empty() {
                     continue;
                 }
-                let parts: Vec<&str> = line.split(|c| c == '/' || c == '\\').filter(|s| !s.is_empty()).collect();
+                let parts: Vec<&str> = line
+                    .split(|c| c == '/' || c == '\\')
+                    .filter(|s| !s.is_empty())
+                    .collect();
                 if !parts.is_empty() {
                     root.insert_path(&parts, 0);
                 }
@@ -6957,15 +6962,9 @@ fn is_allowed_image_studio_host(host: &str) -> bool {
         return true;
     }
     match normalized.parse::<IpAddr>() {
-        Ok(IpAddr::V4(addr)) => {
-            addr.is_loopback()
-                || addr.is_private()
-                || addr.is_link_local()
-        }
+        Ok(IpAddr::V4(addr)) => addr.is_loopback() || addr.is_private() || addr.is_link_local(),
         Ok(IpAddr::V6(addr)) => {
-            addr.is_loopback()
-                || addr.is_unique_local()
-                || addr.is_unicast_link_local()
+            addr.is_loopback() || addr.is_unique_local() || addr.is_unicast_link_local()
         }
         Err(_) => false,
     }
@@ -6977,7 +6976,10 @@ fn is_allowed_hugging_face_space_host(host: &str) -> bool {
         .eq_ignore_ascii_case("hidream-ai-hidream-o1-image-dev.hf.space")
 }
 
-fn validate_image_studio_endpoint_for_engine(engine: &str, endpoint: &str) -> Result<url::Url, String> {
+fn validate_image_studio_endpoint_for_engine(
+    engine: &str,
+    endpoint: &str,
+) -> Result<url::Url, String> {
     let trimmed = endpoint.trim().trim_end_matches('/');
     if trimmed.is_empty() {
         return Err("图像工作室 endpoint 不能为空".to_string());
@@ -7001,12 +7003,18 @@ fn validate_image_studio_endpoint_for_engine(engine: &str, endpoint: &str) -> Re
             return Err("HiDream Web fallback endpoint 仅允许官方托管 Space".to_string());
         }
     } else if !is_allowed_image_studio_host(host) {
-        return Err("图像工作室 endpoint 只允许 localhost、127.0.0.1、::1 或私有局域网 IP".to_string());
+        return Err(
+            "图像工作室 endpoint 只允许 localhost、127.0.0.1、::1 或私有局域网 IP".to_string(),
+        );
     }
     Ok(parsed)
 }
 
-fn build_image_studio_url(engine: &str, endpoint: &str, request_path: &str) -> Result<url::Url, String> {
+fn build_image_studio_url(
+    engine: &str,
+    endpoint: &str,
+    request_path: &str,
+) -> Result<url::Url, String> {
     let mut base = validate_image_studio_endpoint_for_engine(engine, endpoint)?;
     let path = request_path.trim();
     if !path.starts_with('/') {
@@ -7057,9 +7065,15 @@ async fn check_image_studio_engine(
                 Ok(ImageStudioEngineCheckResult {
                     ready,
                     message: if ready {
-                        format!("Local image service model discovery succeeded at {}.", models_url)
+                        format!(
+                            "Local image service model discovery succeeded at {}.",
+                            models_url
+                        )
                     } else {
-                        format!("Local image service returned HTTP {} from /v1/models.", status)
+                        format!(
+                            "Local image service returned HTTP {} from /v1/models.",
+                            status
+                        )
                     },
                     capabilities: image_studio_default_capabilities(engine_kind),
                 })
@@ -7117,7 +7131,8 @@ async fn proxy_image_studio_request(
     body: Option<String>,
     stream_id: Option<String>,
 ) -> Result<ImageStudioProxyResponse, String> {
-    let engine_kind = normalize_image_studio_engine(engine.as_deref().unwrap_or("local_image_service"))?;
+    let engine_kind =
+        normalize_image_studio_engine(engine.as_deref().unwrap_or("local_image_service"))?;
     let meth = method.trim().to_ascii_uppercase();
     let url = build_image_studio_url(engine_kind, &endpoint, &path)?;
     let client = reqwest::Client::builder()
@@ -7189,8 +7204,8 @@ async fn stream_image_studio_response(
     let (send_abort_handle, send_abort_registration) =
         futures_util::future::AbortHandle::new_pair();
     set_image_studio_abort_handle(Some(send_abort_handle));
-    let response_result = futures_util::future::Abortable::new(req.send(), send_abort_registration)
-        .await;
+    let response_result =
+        futures_util::future::Abortable::new(req.send(), send_abort_registration).await;
     set_image_studio_abort_handle(None);
 
     let response = match response_result {
@@ -7229,7 +7244,8 @@ async fn stream_image_studio_response(
         let (chunk_abort_handle, chunk_abort_registration) =
             futures_util::future::AbortHandle::new_pair();
         set_image_studio_abort_handle(Some(chunk_abort_handle));
-        let next_chunk = futures_util::future::Abortable::new(stream.next(), chunk_abort_registration).await;
+        let next_chunk =
+            futures_util::future::Abortable::new(stream.next(), chunk_abort_registration).await;
         set_image_studio_abort_handle(None);
 
         let item = match next_chunk {
@@ -7374,8 +7390,8 @@ fn save_image_studio_output(
 }
 
 fn validate_image_studio_remote_image_url(image_url: &str) -> Result<url::Url, String> {
-    let parsed = url::Url::parse(image_url.trim())
-        .map_err(|e| format!("图像输出 URL 无效: {e}"))?;
+    let parsed =
+        url::Url::parse(image_url.trim()).map_err(|e| format!("图像输出 URL 无效: {e}"))?;
     match parsed.scheme() {
         "http" | "https" => {}
         _ => return Err("远程图像输出只允许 http/https URL".to_string()),
@@ -7814,7 +7830,10 @@ async fn start_chat_stream(
                         &app,
                         "info",
                         "stream_cancelled_by_watchdog",
-                        format!("phase=after_first_chunk stream_id={} url={}", stream_id, url),
+                        format!(
+                            "phase=after_first_chunk stream_id={} url={}",
+                            stream_id, url
+                        ),
                     );
                     emit_chat_stream_done(
                         &app,
@@ -8016,13 +8035,9 @@ fn extract_typescript_outline(source: &str) -> String {
         r"(?i)^\s*(export\s+(?:default\s+)?)?(class|interface|type|enum|function|const|let|var)\s+([A-Za-z_]\w*)"
     ).unwrap();
 
-    let re_method = Regex::new(
-        r"^\s*(?:[A-Za-z_]\w*\s+)*([A-Za-z_]\w*)\s*\([^)]*\)"
-    ).unwrap();
+    let re_method = Regex::new(r"^\s*(?:[A-Za-z_]\w*\s+)*([A-Za-z_]\w*)\s*\([^)]*\)").unwrap();
 
-    let re_property = Regex::new(
-        r"^\s*(?:[A-Za-z_]\w*\s+)*([A-Za-z_]\w*)\s*(\??:|=)"
-    ).unwrap();
+    let re_property = Regex::new(r"^\s*(?:[A-Za-z_]\w*\s+)*([A-Za-z_]\w*)\s*(\??:|=)").unwrap();
 
     let mut in_block_comment = false;
 
@@ -8054,7 +8069,7 @@ fn extract_typescript_outline(source: &str) -> String {
         if start_depth == 0 || (start_depth == 1 && opens > 0 && closes == 0 && !in_type_body) {
             if let Some(caps) = re_decl.captures(trimmed) {
                 let kind = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-                
+
                 let decl_line = match trimmed.find('{') {
                     Some(idx) => trimmed[..idx].trim().to_string(),
                     None => trimmed.to_string(),
@@ -8074,7 +8089,11 @@ fn extract_typescript_outline(source: &str) -> String {
                 if !trimmed.contains("private ") && !trimmed.contains("internal ") {
                     if let Some(caps) = re_method.captures(trimmed) {
                         let method_name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                        if method_name != "if" && method_name != "for" && method_name != "while" && method_name != "switch" {
+                        if method_name != "if"
+                            && method_name != "for"
+                            && method_name != "while"
+                            && method_name != "switch"
+                        {
                             let sig_line = match trimmed.find('{') {
                                 Some(idx) => trimmed[..idx].trim().to_string(),
                                 None => trimmed.to_string(),
@@ -8118,16 +8137,14 @@ fn extract_rust_outline(source: &str) -> String {
     let mut current_type_kind = String::new();
 
     let re_decl = Regex::new(
-        r"^\s*(pub(?:\([^)]+\))?\s+)?(struct|enum|trait|impl|fn|const|type|macro_rules!)\b"
-    ).unwrap();
+        r"^\s*(pub(?:\([^)]+\))?\s+)?(struct|enum|trait|impl|fn|const|type|macro_rules!)\b",
+    )
+    .unwrap();
 
-    let re_rust_method = Regex::new(
-        r"^\s*(pub(?:\([^)]+\))?\s+)?(async\s+)?fn\s+([A-Za-z_]\w*)"
-    ).unwrap();
+    let re_rust_method =
+        Regex::new(r"^\s*(pub(?:\([^)]+\))?\s+)?(async\s+)?fn\s+([A-Za-z_]\w*)").unwrap();
 
-    let re_rust_field = Regex::new(
-        r"^\s*pub(?:\([^)]+\))?\s+([A-Za-z_]\w*)\s*:"
-    ).unwrap();
+    let re_rust_field = Regex::new(r"^\s*pub(?:\([^)]+\))?\s+([A-Za-z_]\w*)\s*:").unwrap();
 
     let mut in_block_comment = false;
 
@@ -8159,7 +8176,7 @@ fn extract_rust_outline(source: &str) -> String {
         if start_depth == 0 || (start_depth == 1 && opens > 0 && closes == 0 && !in_type_body) {
             if let Some(caps) = re_decl.captures(trimmed) {
                 let kind = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-                
+
                 let decl_line = match trimmed.find('{') {
                     Some(idx) => trimmed[..idx].trim().to_string(),
                     None => trimmed.to_string(),
@@ -8177,7 +8194,10 @@ fn extract_rust_outline(source: &str) -> String {
         if in_type_body && start_depth == type_depth + 1 {
             if current_type_kind == "impl" || current_type_kind == "trait" {
                 if let Some(_) = re_rust_method.captures(trimmed) {
-                    if current_type_kind == "trait" || trimmed.starts_with("pub ") || trimmed.starts_with("pub(") {
+                    if current_type_kind == "trait"
+                        || trimmed.starts_with("pub ")
+                        || trimmed.starts_with("pub(")
+                    {
                         let sig_line = match trimmed.find('{') {
                             Some(idx) => trimmed[..idx].trim().to_string(),
                             None => trimmed.to_string(),
@@ -8259,7 +8279,11 @@ fn extract_go_outline(source: &str) -> String {
 
         if start_depth == 0 || (start_depth == 1 && opens > 0 && closes == 0 && !in_type_body) {
             if let Some(caps) = re_decl.captures(trimmed) {
-                let _name = caps.get(2).or(caps.get(4)).map(|m| m.as_str()).unwrap_or("");
+                let _name = caps
+                    .get(2)
+                    .or(caps.get(4))
+                    .map(|m| m.as_str())
+                    .unwrap_or("");
                 let kind = caps.get(3).map(|m| m.as_str()).unwrap_or("func");
 
                 let decl_line = match trimmed.find('{') {
@@ -8307,7 +8331,11 @@ fn extract_fallback_outline(source: &str) -> String {
 
     for line in source.lines() {
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with('#') || trimmed.starts_with("/*") {
+        if trimmed.is_empty()
+            || trimmed.starts_with("//")
+            || trimmed.starts_with('#')
+            || trimmed.starts_with("/*")
+        {
             continue;
         }
 
@@ -8327,7 +8355,6 @@ fn extract_fallback_outline(source: &str) -> String {
     }
     outline
 }
-
 
 fn extract_csharp_outline(source: &str) -> String {
     let mut outline = String::new();
@@ -8947,6 +8974,194 @@ fn index_workspace_documents(
     });
 
     run_document_reader(&workspace, &payload)
+}
+
+fn knowledge_app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("解析知识库数据目录失败: {error}"))?;
+    fs::create_dir_all(&dir).map_err(|error| format!("创建知识库数据目录失败: {error}"))?;
+    Ok(dir)
+}
+
+fn resolve_knowledge_import_path(
+    state: &State<WorkspaceState>,
+    path: &str,
+    workspace: Option<String>,
+) -> Result<PathBuf, String> {
+    let candidate = PathBuf::from(path);
+    if candidate.is_absolute() {
+        return candidate
+            .canonicalize()
+            .map_err(|error| format!("解析知识库源文件失败 {}: {error}", candidate.display()));
+    }
+    let workspace = resolve_workspace_root(state, workspace)?;
+    resolve_existing_path(path, &workspace)
+}
+
+fn extract_document_for_knowledge(storage_path: &Path) -> Result<Value, String> {
+    let workspace_root = storage_path.parent().unwrap_or_else(|| Path::new("."));
+    let payload = json!({
+        "command": "read_document",
+        "workspaceRoot": workspace_root.to_string_lossy().to_string(),
+        "path": storage_path.to_string_lossy().to_string(),
+        "maxChars": 5_000_000,
+        "maxBlocks": 20_000,
+    });
+    run_document_reader(workspace_root, &payload)
+}
+
+fn copy_knowledge_source_to_store(
+    app_data_dir: &Path,
+    kb_id: &str,
+    source_path: &Path,
+) -> Result<PathBuf, String> {
+    if !source_path.is_file() {
+        return Err("知识库导入目标不是文件".to_string());
+    }
+    let hash = knowledge::file_hash(source_path)?;
+    let file_name = source_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(knowledge::sanitize_file_name)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "source".to_string());
+    let target_dir = knowledge::source_storage_dir(app_data_dir, kb_id);
+    fs::create_dir_all(&target_dir)
+        .map_err(|error| format!("创建知识库源文件目录失败 {}: {error}", target_dir.display()))?;
+    let target_path = target_dir.join(format!("{hash}_{file_name}"));
+    if !target_path.exists() {
+        fs::copy(source_path, &target_path).map_err(|error| {
+            format!(
+                "复制知识库源文件失败 {} -> {}: {error}",
+                source_path.display(),
+                target_path.display()
+            )
+        })?;
+    }
+    Ok(target_path)
+}
+
+#[tauri::command]
+fn knowledge_list_bases(app: AppHandle) -> Result<Vec<knowledge::KnowledgeBase>, String> {
+    let app_data_dir = knowledge_app_data_dir(&app)?;
+    knowledge::list_knowledge_bases(&app_data_dir)
+}
+
+#[tauri::command]
+fn knowledge_create_base(
+    app: AppHandle,
+    name: String,
+    description: Option<String>,
+) -> Result<knowledge::KnowledgeBase, String> {
+    let app_data_dir = knowledge_app_data_dir(&app)?;
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("知识库名称不能为空".to_string());
+    }
+    knowledge::create_knowledge_base(&app_data_dir, name, description.as_deref().unwrap_or(""))
+}
+
+#[tauri::command]
+fn knowledge_set_base_enabled(
+    app: AppHandle,
+    kb_id: String,
+    enabled: bool,
+) -> Result<knowledge::KnowledgeBase, String> {
+    let app_data_dir = knowledge_app_data_dir(&app)?;
+    knowledge::set_knowledge_base_enabled(&app_data_dir, &kb_id, enabled)
+}
+
+#[tauri::command]
+fn knowledge_delete_base(app: AppHandle, kb_id: String) -> Result<(), String> {
+    let app_data_dir = knowledge_app_data_dir(&app)?;
+    knowledge::delete_knowledge_base(&app_data_dir, &kb_id)
+}
+
+#[tauri::command]
+fn knowledge_list_sources(
+    app: AppHandle,
+    kb_id: String,
+) -> Result<Vec<knowledge::KnowledgeSource>, String> {
+    let app_data_dir = knowledge_app_data_dir(&app)?;
+    knowledge::list_sources(&app_data_dir, &kb_id)
+}
+
+#[tauri::command]
+fn knowledge_import_source(
+    app: AppHandle,
+    state: State<WorkspaceState>,
+    kb_id: String,
+    path: String,
+    workspace: Option<String>,
+) -> Result<knowledge::KnowledgeImportResult, String> {
+    let app_data_dir = knowledge_app_data_dir(&app)?;
+    let source_path = resolve_knowledge_import_path(&state, &path, workspace)?;
+    let storage_path = copy_knowledge_source_to_store(&app_data_dir, &kb_id, &source_path)?;
+    let extracted = extract_document_for_knowledge(&storage_path)?;
+    knowledge::index_extracted_source(
+        &app_data_dir,
+        &kb_id,
+        &source_path,
+        &storage_path,
+        &extracted,
+        false,
+    )
+}
+
+#[tauri::command]
+fn knowledge_rebuild_base(
+    app: AppHandle,
+    kb_id: String,
+) -> Result<knowledge::KnowledgeBase, String> {
+    let app_data_dir = knowledge_app_data_dir(&app)?;
+    let sources = knowledge::stored_sources(&app_data_dir, &kb_id)?;
+    for stored in sources {
+        if !stored.storage_path.exists() {
+            continue;
+        }
+        let extracted = extract_document_for_knowledge(&stored.storage_path)?;
+        let original_path = PathBuf::from(&stored.source.original_path);
+        let _ = knowledge::index_extracted_source(
+            &app_data_dir,
+            &kb_id,
+            &original_path,
+            &stored.storage_path,
+            &extracted,
+            true,
+        )?;
+    }
+    knowledge::list_knowledge_bases(&app_data_dir)?
+        .into_iter()
+        .find(|base| base.id == kb_id)
+        .ok_or_else(|| "知识库不存在".to_string())
+}
+
+#[tauri::command]
+fn knowledge_search(
+    app: AppHandle,
+    query: String,
+    kb_ids: Option<Vec<String>>,
+    limit: Option<usize>,
+) -> Result<knowledge::KnowledgeSearchResult, String> {
+    let app_data_dir = knowledge_app_data_dir(&app)?;
+    knowledge::search(
+        &app_data_dir,
+        &query,
+        &kb_ids.unwrap_or_default(),
+        limit.unwrap_or(8),
+    )
+}
+
+#[tauri::command]
+fn knowledge_get_excerpt(
+    app: AppHandle,
+    source_id: String,
+    chunk_id: String,
+) -> Result<Option<knowledge::KnowledgeSearchHit>, String> {
+    let app_data_dir = knowledge_app_data_dir(&app)?;
+    knowledge::get_excerpt(&app_data_dir, &source_id, &chunk_id)
 }
 
 /// Delete a protocol package folder when the skill is removed from the UI.
@@ -9831,6 +10046,15 @@ pub fn run() {
             analyze_tabular_document,
             query_tabular_document,
             index_workspace_documents,
+            knowledge_list_bases,
+            knowledge_create_base,
+            knowledge_set_base_enabled,
+            knowledge_delete_base,
+            knowledge_list_sources,
+            knowledge_import_source,
+            knowledge_rebuild_base,
+            knowledge_search,
+            knowledge_get_excerpt,
             extract_protocol_package,
             delete_protocol_package,
             write_chat_temp_file,
@@ -9870,10 +10094,10 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        compare_file_nodes, is_supported_attachment_path, is_valid_git_branch_name,
-        looks_long_running_shell_command, merge_json_rows_by_id, parse_git_branch_line,
-        parse_git_numstat, parse_git_porcelain_entries, parse_git_porcelain_status,
-        read_session_transcript_with_fallback, delete_plan_files_in_dir, resolve_existing_path,
+        compare_file_nodes, delete_plan_files_in_dir, is_supported_attachment_path,
+        is_valid_git_branch_name, looks_long_running_shell_command, merge_json_rows_by_id,
+        parse_git_branch_line, parse_git_numstat, parse_git_porcelain_entries,
+        parse_git_porcelain_status, read_session_transcript_with_fallback, resolve_existing_path,
         resolve_open_file_external_path, resolve_session_transcript_to_write, resolve_write_path,
         should_hide_list_directory_entry, should_skip_recursive_search_dir, validate_pty_input,
         write_json_atomic, write_jsonl_atomic, FileNode, SessionTranscript,
@@ -9898,14 +10122,26 @@ mod tests {
         let workspace = make_temp_workspace("plan-cleanup");
         let plans_dir = workspace.join(".MAIN").join("plans");
         fs::create_dir_all(&plans_dir).unwrap();
-        for name in ["plan.md", "requirements.md", "design.md", "tasks.md", "bugfix.md"] {
+        for name in [
+            "plan.md",
+            "requirements.md",
+            "design.md",
+            "tasks.md",
+            "bugfix.md",
+        ] {
             fs::write(plans_dir.join(name), "# plan").unwrap();
         }
         fs::write(plans_dir.join("notes.md"), "# keep").unwrap();
 
         delete_plan_files_in_dir(&plans_dir).unwrap();
 
-        for name in ["plan.md", "requirements.md", "design.md", "tasks.md", "bugfix.md"] {
+        for name in [
+            "plan.md",
+            "requirements.md",
+            "design.md",
+            "tasks.md",
+            "bugfix.md",
+        ] {
             assert!(!plans_dir.join(name).exists(), "{name} should be deleted");
         }
         assert!(plans_dir.join("notes.md").exists());

@@ -68,6 +68,14 @@ test("parses local-model single positional argument safely for whitelisted tools
   assert.equal(parsed.cleanText, "");
 });
 
+test("parses local-model knowledge search calls", () => {
+  const parsed = parseTextForTools('knowledge_search("Unity Rigidbody AddForce")');
+  assert.equal(parsed.toolCalls.length, 1);
+  assert.equal(parsed.toolCalls[0].name, "knowledge_search");
+  assert.deepEqual(parsed.toolCalls[0].arguments, { query: "Unity Rigidbody AddForce" });
+  assert.equal(parsed.cleanText, "");
+});
+
 test("parses <tool_code> wrapper into a real tool call and strips wrapper text", () => {
   const parsed = parseTextForTools([
     "先看项目目录。",

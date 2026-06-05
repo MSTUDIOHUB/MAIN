@@ -86,6 +86,8 @@ function tool(name, description = "") {
 
 test("built-in tool risks separate read, write, shell, and destructive operations", () => {
   assert.equal(classifyBuiltInTool("read_file"), "read_only");
+  assert.equal(classifyBuiltInTool("knowledge_search"), "read_only");
+  assert.equal(classifyBuiltInTool("knowledge_get_excerpt"), "read_only");
   assert.equal(classifyBuiltInTool("write_file"), "workspace_write");
   assert.equal(classifyBuiltInTool("apply_patch"), "workspace_write");
   assert.equal(classifyBuiltInTool("repo_map_search"), "read_only");

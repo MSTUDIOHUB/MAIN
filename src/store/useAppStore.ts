@@ -23,6 +23,7 @@ import {
   writeChatTempFile,
   writeFile,
   type GitDiffEntry,
+  type KnowledgeBase,
   type ReadFileWindowResult,
   type ShellPermissionDecision,
 } from "../lib/ipc";
@@ -394,7 +395,7 @@ export const translations = {
   en: {
     workspace: "Workspace", conversations: "Conversations", new: "New",
     chatSpace: "Chat", globalChat: "Chat", noChats: "No chats yet",
-    skills: "Skills", diff: "Diff Viewer", terminal: "Terminal", settings: "Settings",
+    skills: "Skills", knowledge: "Knowledge", diff: "Diff Viewer", terminal: "Terminal", settings: "Settings",
     openProject: "Open Folder", noWorkspace: "No project selected", noConversations: "No conversations yet",
     localSetup: "Local AI Engine", cloudSetup: "Cloud API", general: "General", contextSetup: "Background Compression",
     instruction: "Instruction", reject: "Reject all", accept: "Accept all",
@@ -504,7 +505,7 @@ export const translations = {
   zh: {
     workspace: "工作区", conversations: "历史会话", new: "新建会话",
     chatSpace: "聊天", globalChat: "聊天", noChats: "暂无聊天",
-    skills: "技能与提示词", diff: "变更比对", terminal: "集成终端", settings: "系统设置",
+    skills: "技能与提示词", knowledge: "知识库", diff: "变更比对", terminal: "集成终端", settings: "系统设置",
     openProject: "打开文件夹", noWorkspace: "尚未选择项目", noConversations: "暂无会话记录",
     localSetup: "本地引擎配置", cloudSetup: "云端接口配置", general: "通用设置", contextSetup: "背景压缩",
     instruction: "用户指令", reject: "全部拒绝", accept: "全部接受",
@@ -1177,6 +1178,13 @@ export interface AppState {
   addSkill: (skill: Omit<Skill, "id" | "active" | "isBuiltIn">) => void;
   updateSkill: (id: string, patch: Partial<Omit<Skill, "id" | "isBuiltIn">>) => void;
 
+  // Knowledge bases
+  knowledgeBases: KnowledgeBase[];
+  setKnowledgeBases: (v: KnowledgeBase[]) => void;
+  upsertKnowledgeBase: (base: KnowledgeBase) => void;
+  removeKnowledgeBase: (id: string) => void;
+  getEnabledKnowledgeBaseIds: () => string[];
+
   // Instructions & Hooks
   resolvedInstructionSet: ResolvedInstructionSet | null;
   instructionSources: InstructionSource[];
@@ -1416,6 +1424,7 @@ export function normalizeProviderCompatibilityByRuntimeKey(
 }
 
 const defaultSkills: Skill[] = [];
+const defaultKnowledgeBases: KnowledgeBase[] = [];
 
 const DEFAULT_MCP_SERVERS: MCPServer[] = [
   { name: "unityMCP", type: "http", url: "http://localhost:8080/mcp", enabled: true },
@@ -5335,6 +5344,24 @@ export const useAppStore = create<AppState>()(
       skills: s.skills.map((sk) => (sk.id === id ? { ...sk, ...patch, content: patch.content ? normalizeSkillContent(patch.content) : sk.content } : sk)),
     })),
 
+  knowledgeBases: defaultKnowledgeBases,
+  setKnowledgeBases: (v) => set({ knowledgeBases: Array.isArray(v) ? v : [] }),
+  upsertKnowledgeBase: (base) =>
+    set((s) => {
+      const exists = s.knowledgeBases.some((item) => item.id === base.id);
+      return {
+        knowledgeBases: exists
+          ? s.knowledgeBases.map((item) => (item.id === base.id ? base : item))
+          : [base, ...s.knowledgeBases],
+      };
+    }),
+  removeKnowledgeBase: (id) =>
+    set((s) => ({ knowledgeBases: s.knowledgeBases.filter((item) => item.id !== id) })),
+  getEnabledKnowledgeBaseIds: () =>
+    get().knowledgeBases
+      .filter((base) => base.enabled)
+      .map((base) => base.id),
+
   resolvedInstructionSet: null,
   instructionSources: [],
   loadedHookDefinitions: defaultHookDefinitions,
@@ -5900,6 +5927,7 @@ export const useAppStore = create<AppState>()(
     set({
       config: defaultConfig,
       skills: defaultSkills,
+      knowledgeBases: defaultKnowledgeBases,
       mcpServers: DEFAULT_MCP_SERVERS,
       mcpDiscoveredTools: [],
       mcpToolServerMap: {},

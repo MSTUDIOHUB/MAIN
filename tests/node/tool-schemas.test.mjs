@@ -130,6 +130,19 @@ test("web search schemas expose free external read tools", () => {
   assert.match(webFetch.function.description, /GitHub/);
 });
 
+test("knowledge base schemas expose local RAG search tools", () => {
+  const tools = buildToolDefinitions([]);
+  const knowledgeSearch = tools.find((tool) => tool.function.name === "knowledge_search");
+  const knowledgeExcerpt = tools.find((tool) => tool.function.name === "knowledge_get_excerpt");
+
+  assert.ok(knowledgeSearch);
+  assert.ok(knowledgeExcerpt);
+  assert.deepEqual(knowledgeSearch.function.parameters.required, ["query"]);
+  assert.ok(knowledgeSearch.function.parameters.properties.kb_ids);
+  assert.ok(knowledgeSearch.function.parameters.properties.limit);
+  assert.deepEqual(knowledgeExcerpt.function.parameters.required, ["source_id", "chunk_id"]);
+});
+
 test("pty observation schemas expose wait controls", () => {
   const tools = buildToolDefinitions([]);
   const readSince = tools.find((tool) => tool.function.name === "read_pty_since");

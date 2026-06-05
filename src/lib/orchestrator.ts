@@ -376,6 +376,8 @@ const PLAN_EXPLORATION_READ_ONLY_TOOLS = new Set([
   "analyze_tabular_document",
   "query_tabular_document",
   "index_workspace_documents",
+  "knowledge_search",
+  "knowledge_get_excerpt",
   "get_file_outline",
   "read_pty_buffer",
   "read_pty_tail",
@@ -383,6 +385,7 @@ const PLAN_EXPLORATION_READ_ONLY_TOOLS = new Set([
   "get_pty_status",
 ]);
 const WEB_RESEARCH_TOOL_NAMES = new Set(["web_search", "web_fetch"]);
+const KNOWLEDGE_TOOL_NAMES = new Set(["knowledge_search", "knowledge_get_excerpt"]);
 const EXECUTION_VERIFICATION_TOOL_NAMES = new Set([
   "run_command",
   "browser_evaluate",
@@ -1200,6 +1203,7 @@ export interface OrchestratorCallbacks {
   getMcpDiscoveredTools: () => MCPTool[];
   getWebSearchEnabled?: () => boolean;
   getWebSearchProvider?: () => string;
+  getEnabledKnowledgeBaseIds?: () => string[];
   getAssociatedPaths: () => string[];
   getSessionKey: () => string;
   getCurrentTurnId?: () => string | null;
@@ -1482,6 +1486,8 @@ function getToolTarget(name: string, args: Record<string, unknown>): string {
     case "analyze_tabular_document": return (args.path as string) || "";
     case "query_tabular_document": return (args.path as string) || "";
     case "index_workspace_documents": return (args.path as string) || ".";
+    case "knowledge_search": return (args.query as string) || "knowledge";
+    case "knowledge_get_excerpt": return (args.chunk_id as string) || (args.chunkId as string) || "knowledge excerpt";
     case "glob_search":     return (args.pattern as string) || "";
     case "grep_search":     return (args.query as string) || "";
     case "web_search":      return (args.query as string) || "web search";
@@ -4739,9 +4745,13 @@ export async function executeAgentLoop(
 
   // Build intent-scoped tool definitions: built-ins + active skills + routed MCP tools.
   const webSearchEnabled = callbacks.getWebSearchEnabled?.() === true;
-  const routedToolDefinitions = buildToolDefinitions(skills, mcpTools).filter((tool) =>
-    webSearchEnabled || !WEB_RESEARCH_TOOL_NAMES.has(tool.function.name)
-  );
+  const enabledKnowledgeBaseIds = callbacks.getEnabledKnowledgeBaseIds?.() || [];
+  const knowledgeToolsEnabled = enabledKnowledgeBaseIds.length > 0;
+  const routedToolDefinitions = buildToolDefinitions(skills, mcpTools).filter((tool) => {
+    if (!webSearchEnabled && WEB_RESEARCH_TOOL_NAMES.has(tool.function.name)) return false;
+    if (!knowledgeToolsEnabled && KNOWLEDGE_TOOL_NAMES.has(tool.function.name)) return false;
+    return true;
+  });
   const toolCapabilityRegistry = buildToolCapabilityRegistry({
     toolDefinitions: routedToolDefinitions,
     skills,

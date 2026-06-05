@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+from html.parser import HTMLParser
 import json
 import os
 import sys
@@ -25,9 +26,12 @@ SUPPORTED_EXTENSIONS = {
     ".md",
     ".markdown",
     ".rst",
+    ".html",
+    ".htm",
 }
 
 TEXT_EXTENSIONS = {".txt", ".md", ".markdown", ".rst"}
+HTML_EXTENSIONS = {".html", ".htm"}
 SPREADSHEET_EXTENSIONS = {".xlsx", ".xls", ".csv", ".tsv"}
 SKIP_DIRS = {
     "node_modules",
@@ -69,6 +73,40 @@ def normalize_text(text: str) -> str:
             compacted.append("")
             blank_seen = True
     return "\n".join(compacted).strip()
+
+
+class HtmlTextExtractor(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self._skip_depth = 0
+        self._parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        if tag in {"script", "style", "noscript", "svg"}:
+            self._skip_depth += 1
+            return
+        if tag in {"p", "br", "div", "section", "article", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6"}:
+            self._parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag in {"script", "style", "noscript", "svg"} and self._skip_depth > 0:
+            self._skip_depth -= 1
+            return
+        if tag in {"p", "div", "section", "article", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6"}:
+            self._parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_depth > 0:
+            return
+        text = data.strip()
+        if text:
+            self._parts.append(text)
+            self._parts.append(" ")
+
+    def text(self) -> str:
+        return normalize_text("".join(self._parts))
 
 
 def stringify_value(value: Any) -> str:
@@ -1333,6 +1371,44 @@ def extract_text_document(
     )
 
 
+def extract_html_document(
+    path: Path,
+    workspace_root: Path,
+    max_chars: int,
+    max_blocks: int,
+) -> dict[str, Any]:
+    raw = path.read_text(encoding="utf-8", errors="replace")
+    parser = HtmlTextExtractor()
+    parser.feed(raw)
+    text = parser.text()
+    segments = [normalize_text(segment) for segment in text.split("\n\n")]
+    blocks = []
+    for index, segment in enumerate(segments, start=1):
+        if not segment:
+            continue
+        blocks.append(
+            {
+                "kind": "html-section",
+                "sourceLabel": f"Section {index}",
+                "text": segment,
+            }
+        )
+
+    metadata = {
+        "extension": path.suffix.lower(),
+    }
+    return build_result(
+        path=path,
+        workspace_root=workspace_root,
+        document_type="html",
+        title=path.stem,
+        metadata=metadata,
+        blocks=blocks,
+        max_chars=max_chars,
+        max_blocks=max_blocks,
+    )
+
+
 def extract_document(
     path: Path,
     workspace_root: Path,
@@ -1371,6 +1447,8 @@ def extract_document(
         )
     if suffix in TEXT_EXTENSIONS:
         return extract_text_document(path, workspace_root, max_chars, max_blocks)
+    if suffix in HTML_EXTENSIONS:
+        return extract_html_document(path, workspace_root, max_chars, max_blocks)
     raise RuntimeError(f"Unsupported document type: {suffix or '[no extension]'}")
 
 

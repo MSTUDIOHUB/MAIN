@@ -374,8 +374,8 @@ function toolActionForActivityTitle(block: any, language: ToolPresentationLangua
   const target = compactActivityTargetForTitle(String(block.target || compactTarget(block, language) || ""), toolName);
   const rawTarget = target || (language === "zh" ? "目标" : "target");
   if (language === "en") {
-    if (toolName === "grep_search" || toolName === "glob_search") return `searched ${rawTarget}`;
-    if (toolName === "read_file" || toolName === "read_document") return `read ${rawTarget}`;
+    if (toolName === "grep_search" || toolName === "glob_search" || toolName === "knowledge_search") return `searched ${rawTarget}`;
+    if (toolName === "read_file" || toolName === "read_document" || toolName === "knowledge_get_excerpt") return `read ${rawTarget}`;
     if (toolName === "get_file_outline") return `outlined ${rawTarget}`;
     if (toolName === "list_directory" || toolName === "get_project_skeleton") return `scanned ${rawTarget}`;
     if (toolName === "analyze_tabular_document" || toolName === "query_tabular_document") return `analyzed ${rawTarget}`;
@@ -385,8 +385,8 @@ function toolActionForActivityTitle(block: any, language: ToolPresentationLangua
     if (toolName === "browser_evaluate") return `validated ${rawTarget}`;
     return toolName ? `${toolName} ${rawTarget}` : "";
   }
-  if (toolName === "grep_search" || toolName === "glob_search" || toolName.startsWith("repo_map_")) return `搜索 ${rawTarget}`;
-  if (toolName === "read_file" || toolName === "read_document") return `读取 ${rawTarget}`;
+  if (toolName === "grep_search" || toolName === "glob_search" || toolName === "knowledge_search" || toolName.startsWith("repo_map_")) return `搜索 ${rawTarget}`;
+  if (toolName === "read_file" || toolName === "read_document" || toolName === "knowledge_get_excerpt") return `读取 ${rawTarget}`;
   if (toolName === "get_file_outline") return `查看结构 ${rawTarget}`;
   if (toolName === "list_directory" || toolName === "get_project_skeleton") return `扫描 ${rawTarget}`;
   if (toolName === "analyze_tabular_document" || toolName === "query_tabular_document") return `分析 ${rawTarget}`;
@@ -459,6 +459,8 @@ const EXPLORING_TOOL_NAMES = new Set([
   "repo_map_impact",
   "read_file",
   "read_document",
+  "knowledge_search",
+  "knowledge_get_excerpt",
   "analyze_tabular_document",
   "query_tabular_document",
   "index_workspace_documents",
@@ -646,10 +648,10 @@ function addActivityMetricsFromBlock(metrics: ActivityMetrics, block: any): void
   if (isActivityCachedResult(block)) metrics.cached += 1;
 
   if (toolName === "read_file") metrics.filesRead += 1;
-  else if (toolName === "read_document") metrics.documentsRead += 1;
+  else if (toolName === "read_document" || toolName === "knowledge_get_excerpt") metrics.documentsRead += 1;
   else if (toolName === "get_file_outline") metrics.outlinesRead += 1;
   else if (toolName === "list_directory" || toolName === "get_project_skeleton" || toolName === "index_workspace_documents") metrics.directoriesListed += 1;
-  else if (toolName === "glob_search" || toolName === "grep_search" || toolName.startsWith("repo_map_")) metrics.searches += 1;
+  else if (toolName === "glob_search" || toolName === "grep_search" || toolName === "knowledge_search" || toolName.startsWith("repo_map_")) metrics.searches += 1;
   else if (toolName === "analyze_tabular_document" || toolName === "query_tabular_document") metrics.tablesAnalyzed += 1;
   else if (toolName === "browser_evaluate") metrics.browserValidations += 1;
   else if (TERMINAL_READ_TOOL_NAMES.has(toolName)) metrics.terminalReads += 1;
@@ -747,11 +749,11 @@ function makeUniqueExplorationMetricParts(items: any[], metrics: ActivityMetrics
     if (!isToolBlock(item)) continue;
     const toolName = String(item.toolName || "");
     const target = compactTarget(item, language);
-    if (toolName === "read_file" || toolName === "read_document" || toolName === "get_file_outline" || toolName === "analyze_tabular_document" || toolName === "query_tabular_document") {
+    if (toolName === "read_file" || toolName === "read_document" || toolName === "knowledge_get_excerpt" || toolName === "get_file_outline" || toolName === "analyze_tabular_document" || toolName === "query_tabular_document") {
       if (target) readTargets.add(target);
     } else if (toolName === "list_directory" || toolName === "get_project_skeleton" || toolName === "index_workspace_documents") {
       if (target) directoryTargets.add(target);
-    } else if (toolName === "glob_search" || toolName === "grep_search") {
+    } else if (toolName === "glob_search" || toolName === "grep_search" || toolName === "knowledge_search") {
       searches += 1;
     } else if (TERMINAL_READ_TOOL_NAMES.has(toolName)) {
       terminalReads += 1;

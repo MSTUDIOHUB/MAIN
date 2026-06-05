@@ -132,6 +132,8 @@ const READ_ONLY_BUILT_INS = new Set([
   "analyze_tabular_document",
   "query_tabular_document",
   "index_workspace_documents",
+  "knowledge_search",
+  "knowledge_get_excerpt",
   "glob_search",
   "grep_search",
   "repo_map_status",

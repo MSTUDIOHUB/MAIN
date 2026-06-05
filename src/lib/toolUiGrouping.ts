@@ -143,6 +143,7 @@ const READ_OPERATION_TOOL_NAMES = new Set([
   "repo_map_context",
   "repo_map_impact",
   "index_workspace_documents",
+  "knowledge_get_excerpt",
 ]);
 
 const SEARCH_OPERATION_TOOL_NAMES = new Set([
@@ -150,6 +151,7 @@ const SEARCH_OPERATION_TOOL_NAMES = new Set([
   "grep_search",
   "web_search",
   "repo_map_search",
+  "knowledge_search",
 ]);
 
 const EXPLORE_OPERATION_TOOL_NAMES = new Set([

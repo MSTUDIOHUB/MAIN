@@ -19,6 +19,8 @@ const TOOL_VERB_LABELS: Record<string, { zh: string; en: string }> = {
   analyze_tabular_document: { zh: "分析表格", en: "Analyze table" },
   query_tabular_document: { zh: "查询表格", en: "Query table" },
   index_workspace_documents: { zh: "索引文档", en: "Index documents" },
+  knowledge_search: { zh: "搜索知识库", en: "Search knowledge base" },
+  knowledge_get_excerpt: { zh: "读取知识库摘录", en: "Read knowledge excerpt" },
   replace_in_file: { zh: "修改文件", en: "Edit file" },
   write_file: { zh: "写入文件", en: "Write file" },
   apply_patch: { zh: "应用补丁", en: "Apply patch" },
@@ -49,6 +51,7 @@ const DISCOVERY_TOOLS = new Set([
   "repo_map_files",
   "repo_map_impact",
   "index_workspace_documents",
+  "knowledge_search",
   "find_gameobjects",
 ]);
 
@@ -58,6 +61,7 @@ const INSPECTION_TOOLS = new Set([
   "read_document",
   "analyze_tabular_document",
   "query_tabular_document",
+  "knowledge_get_excerpt",
   "web_fetch",
   "execute_code",
 ]);

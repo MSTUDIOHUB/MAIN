@@ -3,7 +3,7 @@ import type { ChatOperationCluster } from "../toolUiGrouping";
 import type { ChatLanguage } from "../../types/chat";
 
 export const TOOL_SUMMARY_GROUPS = {
-  read: new Set(["get_project_skeleton", "get_file_outline", "read_file", "read_document", "list_directory", "glob_search", "grep_search", "repo_map_status", "repo_map_search", "repo_map_context", "repo_map_files", "repo_map_impact", "index_workspace_documents"]),
+  read: new Set(["get_project_skeleton", "get_file_outline", "read_file", "read_document", "list_directory", "glob_search", "grep_search", "repo_map_status", "repo_map_search", "repo_map_context", "repo_map_files", "repo_map_impact", "index_workspace_documents", "knowledge_search", "knowledge_get_excerpt"]),
   table: new Set(["analyze_tabular_document", "query_tabular_document"]),
   edit: new Set(["replace_in_file", "write_file", "apply_patch"]),
   command: new Set(["execute_command", "send_pty_input", "run_command", "browser_evaluate", "read_pty_buffer", "read_pty_tail", "read_pty_since", "get_pty_status", "clear_pty_buffer"]),
@@ -23,6 +23,8 @@ export const READ_CONTEXT_TOOL_NAMES = new Set([
   "repo_map_files",
   "repo_map_impact",
   "index_workspace_documents",
+  "knowledge_search",
+  "knowledge_get_excerpt",
 ]);
 
 const READ_CONTEXT_TOOL_LABELS: Record<string, { zh: string; en: string }> = {
@@ -39,6 +41,8 @@ const READ_CONTEXT_TOOL_LABELS: Record<string, { zh: string; en: string }> = {
   repo_map_files: { zh: "查看代码图谱文件", en: "Inspect repo-map files" },
   repo_map_impact: { zh: "分析影响范围", en: "Analyze impact" },
   index_workspace_documents: { zh: "索引文档", en: "Index documents" },
+  knowledge_search: { zh: "搜索知识库", en: "Search knowledge" },
+  knowledge_get_excerpt: { zh: "读取摘录", en: "Read excerpt" },
 };
 
 const COMPLETED_TOOL_GROUP_LABELS: Record<string, { zh: string; en: string }> = {

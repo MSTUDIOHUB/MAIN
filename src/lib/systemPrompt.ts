@@ -280,6 +280,8 @@ const READ_ONLY_BUILT_IN_TOOL_NAMES = [
   "analyze_tabular_document",
   "query_tabular_document",
   "index_workspace_documents",
+  "knowledge_search",
+  "knowledge_get_excerpt",
   "glob_search",
   "grep_search",
   "web_search",
@@ -713,6 +715,9 @@ export function buildSystemPrompt(
     }
     chatInstructions.push("如果 `analyze_tabular_document`、`query_tabular_document`、`read_document` 中某个只读工具失败，不要停下来征求用户是否允许降级；应在同一轮自动改用其他只读工具继续。");
     chatInstructions.push("推荐回退顺序：`analyze_tabular_document` 全表概览 → `query_tabular_document` 结构化筛选/聚合 → `read_document` 原始行窗口/分页读取；可按问题类型调整，但必须继续推进。");
+    if (isToolNameAvailable("knowledge_search", availableToolNames)) {
+      chatInstructions.push("知识库已启用：当用户问题可能被已导入资料（例如 Unity/API/PDF 手册）覆盖时，先调用 `knowledge_search` 获取片段和 citation，再基于检索证据回答。回答应保留来源文件/页码或块号；如果没有命中，明确说明当前启用知识库未找到依据，不要凭记忆编造。");
+    }
     chatInstructions.push(tabularChatGroundingInstruction);
     chatInstructions.push("只有在文件不存在、指标定义或业务口径冲突、或所有只读路径都无法支持当前问题时，才向用户解释 blocker。");
     chatInstructions.push("不要先输出“下一步行动计划”“请稍候，我将开始分析”之类的过渡台词后停住。");
@@ -795,6 +800,8 @@ export function buildSystemPrompt(
     addToolDescription("analyze_tabular_document", "- analyze_tabular_document: 对 CSV、TSV、XLSX 等大表格做全表统计分析，返回总行数、列概况、缺失值、数值统计和样本行。处理大型表格时优先用它，而不是盲目把整张表塞进上下文。");
     addToolDescription("query_tabular_document", "- query_tabular_document: 对 CSV、TSV、XLSX 做结构化查询，支持筛选、选列、排序、分页、分组聚合。要回答计数、汇总、Top N、条件过滤等问题时优先用它。");
     addToolDescription("index_workspace_documents", "- index_workspace_documents: 扫描某个目录中的文档文件并生成索引摘要。适合先了解资料库，再决定进一步读取哪些文件。");
+    addToolDescription("knowledge_search", "- knowledge_search: 在 MAIN 全局知识库中检索当前界面已启用的资料库，返回 Top-K 片段和 citation。涉及已导入手册/API/PDF/HTML 资料的问题，先检索再回答；无命中时说明知识库未找到依据。");
+    addToolDescription("knowledge_get_excerpt", "- knowledge_get_excerpt: 根据 knowledge_search 的 source_id/chunk_id 展开已命中的知识库片段；只在需要更多同一 citation 内容时使用。");
     addToolDescription("apply_patch", "- apply_patch: 用补丁真实修改工作区文件。优先使用 Codex 风格 `*** Begin Patch` / `*** End Patch` 与 `*** Update File:`、`*** Add File:`、`*** Delete File:`；也兼容常见 `--- a/file` / `+++ b/file` unified diff。上下文必须来自当前文件内容。");
     addToolDescription("replace_in_file", "- replace_in_file: 精确替换单个文件中的旧文本。只有 search_text 与当前文件完全一致时才会写入；不匹配时只允许定向读取一次当前内容再重试。");
     addToolDescription("write_file", "- write_file: 完整创建或覆盖文件。适合新文件或全文件重写；已有文件同内容写入会被视为无效进展。");

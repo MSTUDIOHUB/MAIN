@@ -384,6 +384,7 @@ export class WorkflowEngine {
       getMcpDiscoveredTools: () => sessionGet().mcpDiscoveredTools,
       getWebSearchEnabled: () => sessionGet().webSearchEnabled === true,
       getWebSearchProvider: () => sessionGet().webSearchProvider || "duckduckgo",
+      getEnabledKnowledgeBaseIds: () => sessionGet().getEnabledKnowledgeBaseIds?.() || [],
       getAssociatedPaths: () => sessionGet().resolvedInstructionSet?.associatedPaths ?? [],
       getSessionKey: () => runSessionKey,
       getCurrentTurnId: () => turnId,

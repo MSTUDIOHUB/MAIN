@@ -166,6 +166,63 @@ export interface EmbeddingRecord {
   vector: number[];
 }
 
+export interface KnowledgeBase {
+  id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  sourceCount: number;
+  indexStatus: string;
+  embeddingProfile: string;
+  createdAtMs: number;
+  updatedAtMs: number;
+}
+
+export interface KnowledgeSource {
+  id: string;
+  kbId: string;
+  title: string;
+  originalPath: string;
+  storagePath: string;
+  ext: string;
+  size: number;
+  hash: string;
+  status: string;
+  metadata: Record<string, unknown> | null;
+  lastIndexedAtMs: number;
+}
+
+export interface KnowledgeCitation {
+  kbId: string;
+  kbName: string;
+  sourceId: string;
+  sourceTitle: string;
+  chunkId: string;
+  page?: number | null;
+  block?: string | null;
+  score: number;
+}
+
+export interface KnowledgeSearchHit {
+  text: string;
+  excerpt: string;
+  citation: KnowledgeCitation;
+}
+
+export interface KnowledgeSearchResult {
+  query: string;
+  searchedKnowledgeBaseIds: string[];
+  hits: KnowledgeSearchHit[];
+  note: string;
+}
+
+export interface KnowledgeImportResult {
+  base: KnowledgeBase;
+  source: KnowledgeSource;
+  chunks: number;
+  deduped: boolean;
+}
+
 export interface SessionMemory {
   buildFlow: BuildFlowStep[];
   packageManager?: string | null;
@@ -856,6 +913,53 @@ export function indexWorkspaceDocuments(
     extensions,
     workspace,
   });
+}
+
+export function knowledgeListBases(): Promise<KnowledgeBase[]> {
+  return invoke<KnowledgeBase[]>("knowledge_list_bases");
+}
+
+export function knowledgeCreateBase(name: string, description?: string): Promise<KnowledgeBase> {
+  return invoke<KnowledgeBase>("knowledge_create_base", { name, description });
+}
+
+export function knowledgeSetBaseEnabled(kbId: string, enabled: boolean): Promise<KnowledgeBase> {
+  return invoke<KnowledgeBase>("knowledge_set_base_enabled", { kbId, enabled });
+}
+
+export function knowledgeDeleteBase(kbId: string): Promise<void> {
+  return invoke<void>("knowledge_delete_base", { kbId });
+}
+
+export function knowledgeListSources(kbId: string): Promise<KnowledgeSource[]> {
+  return invoke<KnowledgeSource[]>("knowledge_list_sources", { kbId });
+}
+
+export function knowledgeImportSource(
+  kbId: string,
+  path: string,
+  workspace?: string,
+): Promise<KnowledgeImportResult> {
+  return invoke<KnowledgeImportResult>("knowledge_import_source", { kbId, path, workspace });
+}
+
+export function knowledgeRebuildBase(kbId: string): Promise<KnowledgeBase> {
+  return invoke<KnowledgeBase>("knowledge_rebuild_base", { kbId });
+}
+
+export function knowledgeSearch(
+  query: string,
+  kbIds?: string[],
+  limit?: number,
+): Promise<KnowledgeSearchResult> {
+  return invoke<KnowledgeSearchResult>("knowledge_search", { query, kbIds, limit });
+}
+
+export function knowledgeGetExcerpt(
+  sourceId: string,
+  chunkId: string,
+): Promise<KnowledgeSearchHit | null> {
+  return invoke<KnowledgeSearchHit | null>("knowledge_get_excerpt", { sourceId, chunkId });
 }
 
 export function deletePlanFiles(): Promise<void> {

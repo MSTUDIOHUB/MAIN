@@ -87,6 +87,7 @@ export function buildPersistedAppState(state: Record<string, any>): Record<strin
   return {
     config: stripLegacyConfigFields(state.config),
     skills: state.skills,
+    knowledgeBases: state.knowledgeBases,
     sessionsByWorkspace: stripSessionsByWorkspaceForLocalPersist(state.sessionsByWorkspace),
     workspaces: state.workspaces,
     activeSessionByWorkspace: state.activeSessionByWorkspace,

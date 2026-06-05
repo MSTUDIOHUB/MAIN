@@ -28,6 +28,8 @@ const TOOL_LABELS: Record<string, { verb: { zh: string; en: string }; icon: Reac
   analyze_tabular_document: { verb: { zh: "分析表格", en: "analyze table" }, icon: IconFile },
   query_tabular_document: { verb: { zh: "查询表格", en: "query table" }, icon: IconFile },
   index_workspace_documents: { verb: { zh: "索引文档", en: "index documents" }, icon: IconFolder },
+  knowledge_search: { verb: { zh: "搜索知识库", en: "search knowledge base" }, icon: IconSearch },
+  knowledge_get_excerpt: { verb: { zh: "读取知识库摘录", en: "read knowledge excerpt" }, icon: IconFile },
   replace_in_file:  { verb: { zh: "修改文件", en: "edit file" }, icon: IconCode },
   write_file:       { verb: { zh: "写入文件", en: "write file" }, icon: IconCode },
   apply_patch:      { verb: { zh: "应用补丁", en: "apply patch" }, icon: IconCode },
@@ -59,6 +61,8 @@ const COMPACT_DONE_TOOLS = new Set([
   "analyze_tabular_document",
   "query_tabular_document",
   "index_workspace_documents",
+  "knowledge_search",
+  "knowledge_get_excerpt",
 ]);
 
 interface ActionCardProps {

@@ -759,7 +759,7 @@ function getActiveTurnActivity(blocks: any[], turnStatus: string, language: "zh"
   if (runningTool) {
     const target = String(runningTool.target || runningTool.toolName || "").split("/").pop() || runningTool.toolName;
     const tableTools = new Set(["analyze_tabular_document", "query_tabular_document"]);
-    const readTools = new Set(["read_file", "read_document", "list_directory", "glob_search", "grep_search", "repo_map_status", "repo_map_search", "repo_map_context", "repo_map_files", "repo_map_impact", "index_workspace_documents", "get_project_skeleton"]);
+    const readTools = new Set(["read_file", "read_document", "list_directory", "glob_search", "grep_search", "repo_map_status", "repo_map_search", "repo_map_context", "repo_map_files", "repo_map_impact", "index_workspace_documents", "knowledge_search", "knowledge_get_excerpt", "get_project_skeleton"]);
     const commandTools = new Set(["execute_command", "run_command", "browser_evaluate", "send_pty_input"]);
     const toolName = String(runningTool.toolName || "");
     const prefix = language === "zh"

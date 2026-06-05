@@ -13,6 +13,8 @@ import {
   globSearch,
   grepSearch,
   indexWorkspaceDocuments,
+  knowledgeGetExcerpt,
+  knowledgeSearch,
   queryTabularDocument,
   readChatTempFile,
   spawnPty,
@@ -66,6 +68,16 @@ function parseOptionalNumber(value: unknown): number | undefined {
 
 function parseOptionalString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+function parseOptionalStringList(value: unknown): string[] | undefined {
+  if (Array.isArray(value)) {
+    const items = value.map((item) => String(item || "").trim()).filter(Boolean);
+    return items.length > 0 ? items : undefined;
+  }
+  if (typeof value !== "string") return undefined;
+  const items = value.split(",").map((item) => item.trim()).filter(Boolean);
+  return items.length > 0 ? items : undefined;
 }
 
 const LOCAL_FILE_READ_TOOLS = new Set([
@@ -497,6 +509,24 @@ export async function executeTool(
         typeof args.extensions === "string" ? args.extensions : undefined,
         workspace,
       );
+    }
+
+    case "knowledge_search": {
+      const query = parseOptionalString(args.query);
+      if (!query) throw new Error("Missing required parameter 'query'.");
+      return await knowledgeSearch(
+        query,
+        parseOptionalStringList(args.kb_ids ?? args.kbIds),
+        parseOptionalNumber(args.limit),
+      );
+    }
+
+    case "knowledge_get_excerpt": {
+      const sourceId = parseOptionalString(args.source_id ?? args.sourceId);
+      const chunkId = parseOptionalString(args.chunk_id ?? args.chunkId);
+      if (!sourceId) throw new Error("Missing required parameter 'source_id'.");
+      if (!chunkId) throw new Error("Missing required parameter 'chunk_id'.");
+      return await knowledgeGetExcerpt(sourceId, chunkId);
     }
 
     case "replace_in_file": {

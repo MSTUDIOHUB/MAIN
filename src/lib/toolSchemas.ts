@@ -338,6 +338,37 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     type: "function",
     function: {
+      name: "knowledge_search",
+      description: "在 MAIN 全局知识库中检索已启用的资料库，返回与问题最相关的片段和 citation（知识库、文件名、页码/块号、chunk id、分数）。涉及 Unity/API 手册等已导入资料时，先用它获取证据，不要把整份文档读入上下文。",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "用户问题或要检索的关键词/概念" },
+          kb_ids: { type: "string", description: "可选，逗号分隔的知识库 ID；默认搜索当前界面启用的知识库" },
+          limit: { type: "number", description: "最多返回多少个片段，默认 8，最多 16" },
+        },
+        required: ["query"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "knowledge_get_excerpt",
+      description: "根据 knowledge_search 返回的 source_id 与 chunk_id 读取某个知识库片段的完整摘录。只在需要展开已命中的 citation 时使用。",
+      parameters: {
+        type: "object",
+        properties: {
+          source_id: { type: "string", description: "knowledge_search citation.sourceId" },
+          chunk_id: { type: "string", description: "knowledge_search citation.chunkId" },
+        },
+        required: ["source_id", "chunk_id"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "replace_in_file",
       description: "局部修改文件。精确替换旧代码块。触发 UI 审查。",
       parameters: {

@@ -14,6 +14,8 @@ const NON_EXECUTION_EVIDENCE_TOOLS = new Set([
   "repo_map_impact",
   "read_file",
   "read_document",
+  "knowledge_search",
+  "knowledge_get_excerpt",
   "analyze_tabular_document",
   "query_tabular_document",
   "index_workspace_documents",
@@ -27,6 +29,8 @@ const NON_EXECUTION_EVIDENCE_TOOLS = new Set([
 const VERIFICATION_EVIDENCE_TOOLS = new Set([
   "read_file",
   "read_document",
+  "knowledge_search",
+  "knowledge_get_excerpt",
   "grep_search",
   "read_pty_buffer",
   "read_pty_tail",

@@ -11,6 +11,7 @@ import FilePanel from "./components/FilePanel";
 import RightPanel from "./components/RightPanel";
 import SettingsModal from "./components/SettingsModal";
 import SkillsModal from "./components/SkillsModal";
+import KnowledgeModal from "./components/KnowledgeModal";
 import ThemeStyles from "./components/ThemeStyles";
 import {
   useAppStore,
@@ -974,6 +975,7 @@ export default function App() {
   const isSettingsOpen = useAppStore((s) => s.isSettingsOpen);
   const settingsTab = useAppStore((s) => s.settingsTab);
   const isSkillsOpen = useAppStore((s) => s.isSkillsOpen);
+  const [isKnowledgeOpen, setIsKnowledgeOpen] = useState(false);
   const isAddingSkill = useAppStore((s) => s.isAddingSkill);
   const showAgentPicker = useAppStore((s) => s.showAgentPicker);
   const setIsSettingsOpen = useAppStore((s) => s.setIsSettingsOpen);
@@ -3486,7 +3488,12 @@ export default function App() {
       style={{ '--accent': currentTheme.accent, '--accent-hover': currentTheme.hover, '--accent-light': currentTheme.light, '--accent-subtle': currentTheme.subtle, '--accent-subtle-border': currentTheme.subtleBorder, '--accent-contrast': currentTheme.contrast } as React.CSSProperties}>
       <ThemeStyles />
       <Sidebar
-        config={{ ...config, onOpenSettings: () => { setSettingsTab('general'); setIsSettingsOpen(true); }, onOpenSkills: () => setIsSkillsOpen(true) }}
+        config={{
+          ...config,
+          onOpenSettings: () => { setSettingsTab('general'); setIsSettingsOpen(true); },
+          onOpenSkills: () => setIsSkillsOpen(true),
+          onOpenKnowledge: () => setIsKnowledgeOpen(true),
+        }}
         t={t}
         currentWorkspace={currentWorkspace}
         selectedWorkspace={sidebarWorkspace}
@@ -3570,6 +3577,7 @@ export default function App() {
       )}
       <SettingsModal isOpen={isSettingsOpen} onClose={() => setIsSettingsOpen(false)} config={config} setConfig={setConfig} t={t} THEMES={THEMES} settingsTab={settingsTab} setSettingsTab={setSettingsTab} mcpServers={mcpServers} setMcpServers={setMcpServers} mcpDiscoveredTools={mcpDiscoveredTools} setMcpDiscoveredTools={setMcpDiscoveredTools} appVersion={appVersion} updateStatus={mainUpdateStatus} availableUpdateVersion={availableMainUpdate?.version || ""} availableUpdateNotes={availableMainUpdate?.notes || ""} updateError={mainUpdateError} updateProgressPercent={mainUpdateProgress?.percent ?? null} lastUpdateCheckedAt={lastMainUpdateCheckedAt} onCheckForUpdate={handleCheckMainUpdate} onInstallUpdate={handleInstallMainUpdate} modelRuntimeLock={modelRuntimeLock} />
       <SkillsModal isOpen={isSkillsOpen} onClose={() => setIsSkillsOpen(false)} t={t} skills={skills} currentWorkspace={currentWorkspace} toggleSkill={toggleSkill} deleteSkill={deleteSkill} addSkill={addSkill} updateSkill={updateSkill} isAddingSkill={isAddingSkill} setIsAddingSkill={setIsAddingSkill} />
+      <KnowledgeModal isOpen={isKnowledgeOpen} onClose={() => setIsKnowledgeOpen(false)} currentWorkspace={currentWorkspace} />
     </div>
   );
 }
