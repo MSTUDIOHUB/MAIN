@@ -82,6 +82,9 @@ test.beforeEach(async ({ page }) => {
       if (cmd === "get_file_metadata") {
         return { path: String(args?.path ?? ""), sizeBytes: 32, modifiedMs: 1 };
       }
+      if (cmd === "get_project_skeleton") {
+        return "README.md\nsrc/\n";
+      }
       if (cmd === "ingest_attachment_file") {
         const sourcePath = String(args?.sourcePath ?? "");
         ingestedAttachments.push({
@@ -99,6 +102,7 @@ test.beforeEach(async ({ page }) => {
         }
         throw new Error(`unsupported attachment: ${sourcePath}`);
       }
+      if (cmd === "get_chat_temp_root") return "/tmp/e2e-chat-temp";
       if (cmd === "glob_search") return [];
       if (cmd === "list_directory") {
         const path = String(args?.path ?? "");
@@ -130,19 +134,21 @@ test.beforeEach(async ({ page }) => {
         const path = String(args?.path ?? "");
         const scenario = new URL(window.location.href).searchParams.get("e2eScenario");
         if (
-          scenario === "local-file-read-approval" &&
+          (scenario === "local-file-read-approval" || scenario === "global-chat-attachment-read") &&
           path === ".MAIN-chat-attachments/outside-main-debug.log" &&
           args?.workspace === "/tmp/e2e-chat-temp"
         ) {
           readFileCalls.push(path);
           return {
             path,
-            content: "LOCAL_FILE_READ_OK: debug log line",
+            content: scenario === "global-chat-attachment-read"
+              ? "GLOBAL_ATTACHMENT_READ_OK: debug log line"
+              : "LOCAL_FILE_READ_OK: debug log line",
             startLine: 1,
             endLine: 1,
             totalLines: 1,
-            totalChars: 34,
-            returnedChars: 34,
+            totalChars: scenario === "global-chat-attachment-read" ? 42 : 34,
+            returnedChars: scenario === "global-chat-attachment-read" ? 42 : 34,
             truncated: false,
           };
         }
@@ -181,12 +187,14 @@ test.beforeEach(async ({ page }) => {
         const path = String(args?.path ?? "");
         const scenario = new URL(window.location.href).searchParams.get("e2eScenario");
         if (
-          scenario === "local-file-read-approval" &&
+          (scenario === "local-file-read-approval" || scenario === "global-chat-attachment-read") &&
           path === ".MAIN-chat-attachments/outside-main-debug.log" &&
           args?.workspace === "/tmp/e2e-chat-temp"
         ) {
           readFileCalls.push(path);
-          return "LOCAL_FILE_READ_OK: debug log line";
+          return scenario === "global-chat-attachment-read"
+            ? "GLOBAL_ATTACHMENT_READ_OK: debug log line"
+            : "LOCAL_FILE_READ_OK: debug log line";
         }
         const planFiles: Record<string, string> = {
           ".MAIN/plans/requirements.md": [
@@ -245,6 +253,14 @@ test.beforeEach(async ({ page }) => {
         const body = String(args?.body ?? "{}");
         const parsed = JSON.parse(body);
         const hasTools = Array.isArray(parsed.tools) && parsed.tools.length > 0;
+        if (body.includes("hidden semantic title generator")) {
+          return JSON.stringify({
+            output_text: JSON.stringify({
+              title: "外部日志读取",
+              summary: "读取外部日志并确认标记",
+            }),
+          });
+        }
         requests.push({ hasTools, body });
 
         if (scenario === "cloud-tool-fallback") {
@@ -622,6 +638,29 @@ test.beforeEach(async ({ page }) => {
               "<tool_use>",
               "<tool>read_file</tool>",
               "<parameter name=\"path\">/tmp/e2e-outside-main-debug.log</parameter>",
+              "</tool_use>",
+            ].join("\n"),
+          });
+        }
+
+        if (scenario === "global-chat-tool-scope") {
+          return JSON.stringify({
+            output_text: "全局聊天未使用项目工具。",
+          });
+        }
+
+        if (scenario === "global-chat-attachment-read") {
+          if (body.includes("GLOBAL_ATTACHMENT_READ_OK")) {
+            return JSON.stringify({
+              output_text: "已读取附件，确认包含 GLOBAL_ATTACHMENT_READ_OK。",
+            });
+          }
+          return JSON.stringify({
+            output_text: [
+              "我会读取这份聊天附件。",
+              "<tool_use>",
+              "<tool>read_file</tool>",
+              "<parameter name=\"path\">.MAIN-chat-attachments/outside-main-debug.log</parameter>",
               "</tool_use>",
             ].join("\n"),
           });
@@ -1204,6 +1243,119 @@ test("pseudo tool call placeholder triggers XML recovery instead of stopping as 
     .toEqual({
       recovered: true,
       readFileCalls: ["README.md"],
+    });
+});
+
+test("global chat without explicit files does not expose workspace tools", async ({ page }) => {
+  await page.goto("/?e2eScenario=global-chat-tool-scope");
+
+  const sent = await page.evaluate(() =>
+    (window as any).__CODELY_E2E__?.sendCloudMessage?.("这是全局聊天，请直接回答一个普通问题。"),
+  );
+  expect(sent).toBe(true);
+
+  await expect(page.getByTestId("chat-scroll-container").getByText("全局聊天未使用项目工具。")).toBeVisible();
+
+  await expect
+    .poll(async () =>
+      page.evaluate(() => {
+        const probe = (window as any).__CLOUD_TOOL_PROTOCOL_TEST__;
+        const requests = probe?.requests || [];
+        const latest = [...requests].reverse()[0];
+        if (!latest) return null;
+        const parsed = JSON.parse(latest.body || "{}");
+        const names = (parsed.tools || []).map((tool: any) => tool?.name || tool?.function?.name).filter(Boolean);
+        const workspaceToolNames = [
+          "get_project_skeleton",
+          "list_directory",
+          "glob_search",
+          "grep_search",
+          "repo_map_status",
+          "repo_map_search",
+          "repo_map_context",
+          "repo_map_files",
+          "repo_map_impact",
+          "get_file_outline",
+          "index_workspace_documents",
+          "write_file",
+          "replace_in_file",
+          "apply_patch",
+          "delete_workspace_path",
+          "run_command",
+          "execute_command",
+          "send_pty_input",
+          "browser_evaluate",
+        ];
+        return {
+          names,
+          leakedWorkspaceTools: names.filter((name: string) => workspaceToolNames.includes(name)),
+          listDirectoryCalls: probe?.listDirectoryCalls || [],
+          bodyHasGlobalBoundary: String(latest.body || "").includes("当前没有绑定工作区"),
+          bodyHasFakeWorkspace: String(latest.body || "").includes("/tmp/e2e-global-chat-tool-scope"),
+        };
+      }),
+    )
+    .toEqual({
+      names: [],
+      leakedWorkspaceTools: [],
+      listDirectoryCalls: [],
+      bodyHasGlobalBoundary: true,
+      bodyHasFakeWorkspace: false,
+    });
+});
+
+test("global chat with an attachment only exposes attachment read tools", async ({ page }) => {
+  await page.goto("/?e2eScenario=global-chat-attachment-read");
+
+  const sent = await page.evaluate(() =>
+    (window as any).__CODELY_E2E__?.sendCloudMessage?.("请读取附件并确认标记。"),
+  );
+  expect(sent).toBe(true);
+
+  await expect(page.getByTestId("chat-scroll-container").getByText("已读取附件，确认包含 GLOBAL_ATTACHMENT_READ_OK。")).toBeVisible();
+
+  await expect
+    .poll(async () =>
+      page.evaluate(() => {
+        const probe = (window as any).__CLOUD_TOOL_PROTOCOL_TEST__;
+        const requests = probe?.requests || [];
+        const firstWithTools = requests.find((request: any) => request.hasTools);
+        if (!firstWithTools) return null;
+        const parsed = JSON.parse(firstWithTools.body || "{}");
+        const names = (parsed.tools || []).map((tool: any) => tool?.name || tool?.function?.name).filter(Boolean);
+        const allowedAttachmentReadTools = [
+          "read_file",
+          "read_document",
+          "analyze_tabular_document",
+          "query_tabular_document",
+        ];
+        return {
+          names: [...names].sort(),
+          onlyAttachmentReadTools:
+            names.length === allowedAttachmentReadTools.length &&
+            names.every((name: string) => allowedAttachmentReadTools.includes(name)),
+          ingestedAttachments: probe?.ingestedAttachments || [],
+          readFileCalls: probe?.readFileCalls || [],
+          listDirectoryCalls: probe?.listDirectoryCalls || [],
+        };
+      }),
+    )
+    .toEqual({
+      names: [
+        "analyze_tabular_document",
+        "query_tabular_document",
+        "read_document",
+        "read_file",
+      ],
+      onlyAttachmentReadTools: true,
+      ingestedAttachments: [
+        {
+          sessionKey: "__MAIN_GLOBAL_CHAT__:999517",
+          sourcePath: "/tmp/e2e-outside-main-debug.log",
+        },
+      ],
+      readFileCalls: [".MAIN-chat-attachments/outside-main-debug.log"],
+      listDirectoryCalls: [],
     });
 });
 

@@ -386,6 +386,16 @@ const PLAN_EXPLORATION_READ_ONLY_TOOLS = new Set([
 ]);
 const WEB_RESEARCH_TOOL_NAMES = new Set(["web_search", "web_fetch"]);
 const KNOWLEDGE_TOOL_NAMES = new Set(["knowledge_search", "knowledge_get_excerpt"]);
+const GLOBAL_CHAT_CONTEXT_READ_TOOL_NAMES = new Set([
+  "read_file",
+  "read_document",
+  "analyze_tabular_document",
+  "query_tabular_document",
+]);
+const GLOBAL_CHAT_ALWAYS_ALLOWED_TOOL_NAMES = new Set([
+  ...WEB_RESEARCH_TOOL_NAMES,
+  ...KNOWLEDGE_TOOL_NAMES,
+]);
 const EXECUTION_VERIFICATION_TOOL_NAMES = new Set([
   "run_command",
   "browser_evaluate",
@@ -446,6 +456,24 @@ function filterPlanRuntimeToolDefinitionsForPhase(input: {
   }));
   if (names.size === input.tools.length) return input.tools;
   return input.tools.filter((tool) => names.has(tool.function.name));
+}
+
+function filterGlobalChatToolDefinitions(input: {
+  tools: ToolDefinition[];
+  workspace: string;
+  userContext: TurnInputContextSignals;
+}): ToolDefinition[] {
+  if (input.workspace.trim()) return input.tools;
+
+  const hasExplicitFileContext =
+    input.userContext.mentionedFilePaths.length > 0 ||
+    input.userContext.attachedFilePaths.length > 0;
+
+  return input.tools.filter((tool) => {
+    const name = tool.function.name;
+    if (GLOBAL_CHAT_ALWAYS_ALLOWED_TOOL_NAMES.has(name)) return true;
+    return hasExplicitFileContext && GLOBAL_CHAT_CONTEXT_READ_TOOL_NAMES.has(name);
+  });
 }
 
 function planUnsupportedToolFeedbackMessage(input: {
@@ -4795,7 +4823,7 @@ export async function executeAgentLoop(
   };
 
   const resolveAllToolsForRuntime = (runtimeIntent: ResolvedUserIntent): ToolDefinition[] => {
-    const filtered = filterToolDefinitionsForIntent(
+    const intentFiltered = filterToolDefinitionsForIntent(
       routedToolDefinitions,
       callbacks.getCurrentRunIntent(),
       toolCapabilityRegistry,
@@ -4804,6 +4832,23 @@ export async function executeAgentLoop(
         planApproved: callbacks.getIsPlanApproved(),
       },
     );
+    const filtered = filterGlobalChatToolDefinitions({
+      tools: intentFiltered,
+      workspace,
+      userContext: turnInputContextSignals,
+    });
+    if (!workspace.trim() && filtered.length !== intentFiltered.length) {
+      logAgentEvent("global_chat_tool_scope_applied", {
+        runtimeIntent,
+        workflowMode,
+        explicitFileContext:
+          turnInputContextSignals.mentionedFilePaths.length +
+          turnInputContextSignals.attachedFilePaths.length,
+        rawTools: intentFiltered.map((tool) => tool.function.name).slice(0, 24),
+        scopedTools: filtered.map((tool) => tool.function.name),
+        removedToolCount: Math.max(0, intentFiltered.length - filtered.length),
+      });
+    }
 
     if (!unityMcpFirstPhaseActive) {
       return filtered;

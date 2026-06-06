@@ -134,14 +134,22 @@ for (const themeMode of ["dark", "light", "black"] as const) {
 
     const workspaceRow = page.getByTestId("sidebar-workspace-row").filter({ hasText: "DataFiles" }).first();
     const chatRow = page.getByTestId("sidebar-global-chat-row");
+    const globalSessionRow = page.getByTestId("session-item-9201");
+    const projectSessionRow = page.getByTestId("session-item-9101");
 
     await expect(workspaceRow).toBeVisible();
     await expect(chatRow).toBeVisible();
+    await expect(globalSessionRow).toBeVisible();
+    await expect(projectSessionRow).toBeVisible();
     await expect(chatRow).toHaveClass(/bg-\[#18181b\]/);
     await expect(chatRow.getByTestId("sidebar-global-chat-icon")).toHaveClass(/theme-text/);
+    await expect(globalSessionRow).toHaveClass(/bg-\[#18181b\]/);
+    await expect(globalSessionRow.locator("svg").first()).toHaveClass(/theme-text/);
     await expect(workspaceRow.getByTestId("sidebar-workspace-icon")).not.toHaveClass(/theme-text/);
 
     const workspaceRowClasses = (await workspaceRow.getAttribute("class"))?.split(/\s+/) ?? [];
+    const projectSessionRowClasses = (await projectSessionRow.getAttribute("class"))?.split(/\s+/) ?? [];
     expect(workspaceRowClasses).not.toContain("bg-[#18181b]");
+    expect(projectSessionRowClasses).not.toContain("bg-[#18181b]");
   });
 }

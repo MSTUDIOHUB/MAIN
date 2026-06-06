@@ -1,0 +1,229 @@
+{
+  "title": "MAIN 用户手册",
+  "description": "面向 main.mstudiohub.com 的 MAIN 中文用户手册导航。",
+  "basePath": "/docs/main-manual",
+  "categories": [
+    {
+      "id": "getting-started",
+      "title": "Getting Started",
+      "sidebarTitle": "开始使用",
+      "order": 10,
+      "items": [
+        {
+          "slug": "overview",
+          "path": "overview.md",
+          "title": "MAIN 概览",
+          "sidebarTitle": "概览",
+          "description": "了解 MAIN 是什么，以及它适合承担哪些工作。"
+        },
+        {
+          "slug": "quickstart",
+          "path": "quickstart.md",
+          "title": "快速开始",
+          "sidebarTitle": "快速开始",
+          "description": "从安装、连接模型到发送第一条任务的最短路径。"
+        },
+        {
+          "slug": "install-and-update",
+          "path": "install-and-update.md",
+          "title": "安装与更新",
+          "sidebarTitle": "安装与更新",
+          "description": "在 macOS 和 Windows 上安装 MAIN，并通过 GitHub Releases 或应用内更新保持最新。"
+        },
+        {
+          "slug": "first-workspace",
+          "path": "first-workspace.md",
+          "title": "第一个工作区",
+          "sidebarTitle": "第一个工作区",
+          "description": "打开项目文件夹，理解工作区、全局聊天和会话的关系。"
+        }
+      ]
+    },
+    {
+      "id": "core-concepts",
+      "title": "Core Concepts",
+      "sidebarTitle": "核心概念",
+      "order": 20,
+      "items": [
+        {
+          "slug": "main-modes",
+          "path": "main-modes.md",
+          "title": "MAIN 场景",
+          "sidebarTitle": "MAIN 场景",
+          "description": "理解通用协作、创意共创、工程实现、研究分析和游戏工作室。"
+        },
+        {
+          "slug": "run-modes",
+          "path": "run-modes.md",
+          "title": "Chat / Plan / Fast",
+          "sidebarTitle": "工作方式",
+          "description": "选择合适的执行节奏，让 MAIN 用正确的方式处理任务。"
+        },
+        {
+          "slug": "agent-loop",
+          "path": "agent-loop.md",
+          "title": "Agent 如何工作",
+          "sidebarTitle": "Agent 循环",
+          "description": "了解 MAIN 如何读取上下文、调用工具、执行命令并整理结果。"
+        },
+        {
+          "slug": "permissions-and-approval",
+          "path": "permissions-and-approval.md",
+          "title": "权限与审批",
+          "sidebarTitle": "权限与审批",
+          "description": "理解 ActionCard、Diff 审查、命令审批和自动批准。"
+        },
+        {
+          "slug": "context-and-memory",
+          "path": "context-and-memory.md",
+          "title": "上下文与记忆",
+          "sidebarTitle": "上下文与记忆",
+          "description": "管理上下文窗口、压缩、会话记录和知识库检索。"
+        }
+      ]
+    },
+    {
+      "id": "use-main",
+      "title": "Use MAIN",
+      "sidebarTitle": "使用 MAIN",
+      "order": 30,
+      "items": [
+        {
+          "slug": "workspaces-and-sessions",
+          "path": "workspaces-and-sessions.md",
+          "title": "工作区与会话",
+          "sidebarTitle": "工作区与会话",
+          "description": "管理多个项目、全局聊天和历史会话。"
+        },
+        {
+          "slug": "coding-workflows",
+          "path": "coding-workflows.md",
+          "title": "代码工作流",
+          "sidebarTitle": "代码工作流",
+          "description": "用 MAIN 修 bug、写功能、重构、运行测试并验证结果。"
+        },
+        {
+          "slug": "plan-mode",
+          "path": "plan-mode.md",
+          "title": "计划模式",
+          "sidebarTitle": "计划模式",
+          "description": "让 MAIN 先产出计划，再经过你批准后执行。"
+        },
+        {
+          "slug": "terminal-and-tools",
+          "path": "terminal-and-tools.md",
+          "title": "终端与工具",
+          "sidebarTitle": "终端与工具",
+          "description": "使用集成终端、文件工具、文档表格分析和浏览器验证。"
+        },
+        {
+          "slug": "git-workflows",
+          "path": "git-workflows.md",
+          "title": "Git 工作流",
+          "sidebarTitle": "Git 工作流",
+          "description": "查看改动、预览 Diff、生成提交信息、commit、push 和创建分支。"
+        },
+        {
+          "slug": "knowledge-base",
+          "path": "knowledge-base.md",
+          "title": "知识库",
+          "sidebarTitle": "知识库",
+          "description": "导入资料并让 MAIN 在需要时按需检索。"
+        },
+        {
+          "slug": "image-studio",
+          "path": "image-studio.md",
+          "title": "图像工作室",
+          "sidebarTitle": "图像工作室",
+          "description": "使用本地图片服务或 HiDream Web fallback 生成图片。"
+        }
+      ]
+    },
+    {
+      "id": "platforms-integrations",
+      "title": "Platforms And Integrations",
+      "sidebarTitle": "平台与集成",
+      "order": 40,
+      "items": [
+        {
+          "slug": "local-models",
+          "path": "local-models.md",
+          "title": "本地模型",
+          "sidebarTitle": "本地模型",
+          "description": "配置 LM Studio、Ollama 和 OMLX。"
+        },
+        {
+          "slug": "cloud-models",
+          "path": "cloud-models.md",
+          "title": "云端模型",
+          "sidebarTitle": "云端模型",
+          "description": "连接 OpenAI Compatible、Anthropic、Gemini 和其他云端网关。"
+        },
+        {
+          "slug": "mcp",
+          "path": "mcp.md",
+          "title": "MCP 服务器",
+          "sidebarTitle": "MCP",
+          "description": "通过 MCP 连接 Unity 等外部工具和引擎。"
+        },
+        {
+          "slug": "skills-and-protocols",
+          "path": "skills-and-protocols.md",
+          "title": "技能与协议包",
+          "sidebarTitle": "技能与协议包",
+          "description": "使用提示词技能、工具型技能和协议包扩展 MAIN。"
+        },
+        {
+          "slug": "feishu-remote-control",
+          "path": "feishu-remote-control.md",
+          "title": "飞书远程控制",
+          "sidebarTitle": "飞书远程控制",
+          "description": "通过飞书机器人发送任务并远程审批。"
+        },
+        {
+          "slug": "game-studio",
+          "path": "game-studio.md",
+          "title": "Game Studio",
+          "sidebarTitle": "Game Studio",
+          "description": "使用游戏工作室、slash 命令、专业 Agent 和模板。"
+        }
+      ]
+    },
+    {
+      "id": "reference",
+      "title": "Reference",
+      "sidebarTitle": "参考",
+      "order": 50,
+      "items": [
+        {
+          "slug": "settings-reference",
+          "path": "settings-reference.md",
+          "title": "设置参考",
+          "sidebarTitle": "设置参考",
+          "description": "对照说明设置页中的每个标签页。"
+        },
+        {
+          "slug": "tools-reference",
+          "path": "tools-reference.md",
+          "title": "工具参考",
+          "sidebarTitle": "工具参考",
+          "description": "了解 MAIN 内置工具、知识库工具、浏览器验证和 MCP 工具。"
+        },
+        {
+          "slug": "troubleshooting",
+          "path": "troubleshooting.md",
+          "title": "故障排查",
+          "sidebarTitle": "故障排查",
+          "description": "排查模型、MCP、知识库、更新和命令执行问题。"
+        },
+        {
+          "slug": "changelog",
+          "path": "changelog.md",
+          "title": "更新日志",
+          "sidebarTitle": "更新日志",
+          "description": "查看 MAIN 公开版本说明归档。"
+        }
+      ]
+    }
+  ]
+}

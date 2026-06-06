@@ -15,7 +15,7 @@ import {
   IconTrash,
 } from "./Icons";
 import { createPortal } from "react-dom";
-import { GLOBAL_CHAT_KEY, useAppStore, type WorkspaceEntry } from "../store/useAppStore";
+import { GLOBAL_CHAT_KEY, resolveSessionWorkspaceKey, useAppStore, type WorkspaceEntry } from "../store/useAppStore";
 import { looksLikeReasoningLeakTitle, normalizeConversationDisplayTitle } from "../lib/workflowModels";
 import { getGitStatus, getGitDiff, gitCommitAll, gitCreateBranch, gitPushCurrentBranch, type GitStatus } from "../lib/ipc";
 import { generateGitCommitMessage } from "../lib/gitCommitMessage";
@@ -194,7 +194,7 @@ export default function Sidebar({
   const [gitMenuCachedTime, setGitMenuCachedTime] = useState<number | null>(null);
   const openGitDiffPreview = useAppStore((s) => s.openGitDiffPreview);
   const workspaceExpansionTarget = currentWorkspace || selectedWorkspace;
-  const activeWorkspace = currentWorkspace;
+  const activeScopeKey = resolveSessionWorkspaceKey(currentWorkspace);
 
   const workspaceEntries = useMemo(() => {
     const seen = new Set<string>();
@@ -587,15 +587,15 @@ export default function Sidebar({
     );
   };
 
-  const renderSession = (workspacePath: string, session: any, activeSessionId: number | null) => {
-    const isActive = activeWorkspace === workspacePath && session.id === activeSessionId;
-    const sessionStatus = sessionStatuses[`${workspacePath}:${session.id}`] || "idle";
+  const renderSession = (scopeKey: string, session: any, activeSessionId: number | null) => {
+    const isActive = activeScopeKey === scopeKey && session.id === activeSessionId;
+    const sessionStatus = sessionStatuses[`${scopeKey}:${session.id}`] || "idle";
     const showSessionStatus = sessionStatus && sessionStatus !== "idle";
     return (
       <div
         key={session.id}
         data-testid={`session-item-${session.id}`}
-        onClick={() => onSelectSession?.(workspacePath, session.id)}
+        onClick={() => onSelectSession?.(scopeKey, session.id)}
         className={`group flex cursor-pointer items-center gap-2.5 rounded-md px-2 py-1.5 transition-colors ${
           isActive ? "bg-[#18181b] text-[#ffffff] shadow-sm" : "text-[#e4e4e7] hover:bg-[#18181b]"
         }`}
@@ -627,7 +627,7 @@ export default function Sidebar({
           data-testid={`session-delete-${session.id}`}
           onClick={(e) => {
             e.stopPropagation();
-            onDeleteSession?.(workspacePath, session.id);
+            onDeleteSession?.(scopeKey, session.id);
           }}
           className="rounded p-1 text-[#71717a] opacity-0 transition-opacity hover:bg-[#27272a] hover:text-[#f48771] group-hover:opacity-100"
           title={config.language === "en" ? "Delete session" : "删除会话"}
@@ -794,7 +794,7 @@ export default function Sidebar({
                   const sessions = sortSessions(sessionsByWorkspace[workspacePath] || []);
                   const workspaceName = workspace.name || getWorkspaceName(workspacePath);
                   const isExpanded = expandedWorkspaces[workspacePath] !== false;
-                  const isActiveWorkspace = activeWorkspace === workspacePath;
+                  const isActiveWorkspace = activeScopeKey === workspacePath;
                   const activeSessionId = isActiveWorkspace
                     ? currentSessionId
                     : activeSessionByWorkspace[workspacePath] ?? null;
@@ -924,7 +924,7 @@ export default function Sidebar({
                     setChatExpanded((value) => (currentWorkspace ? true : !value));
                   }}
                   className={`group flex w-full items-center gap-2 rounded-md px-2 py-2 transition-colors ${
-                    !currentWorkspace ? "bg-[#18181b]" : "hover:bg-[#18181b]"
+                    activeScopeKey === GLOBAL_CHAT_KEY ? "bg-[#18181b]" : "hover:bg-[#18181b]"
                   }`}
                 >
                   {chatExpanded ? (
@@ -934,7 +934,7 @@ export default function Sidebar({
                   )}
                   <IconChat
                     data-testid="sidebar-global-chat-icon"
-                    className={`h-4 w-4 shrink-0 ${!currentWorkspace ? "theme-text" : "text-[#71717a]"}`}
+                    className={`h-4 w-4 shrink-0 ${activeScopeKey === GLOBAL_CHAT_KEY ? "theme-text" : "text-[#71717a]"}`}
                   />
                   <span className="sidebar-label truncate text-[13px] font-medium text-[#e4e4e7]">
                     {chatLabel}
@@ -949,7 +949,11 @@ export default function Sidebar({
                         {t.noChats || "No chats yet"}
                       </div>
                     ) : (
-                      sortedGlobalSessions.map((session) => renderSession(GLOBAL_CHAT_KEY, session, !currentWorkspace ? currentSessionId : null))
+                      sortedGlobalSessions.map((session) => renderSession(
+                        GLOBAL_CHAT_KEY,
+                        session,
+                        activeScopeKey === GLOBAL_CHAT_KEY ? currentSessionId : null,
+                      ))
                     )}
                   </div>
                 )}

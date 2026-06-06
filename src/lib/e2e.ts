@@ -55,6 +55,8 @@ const EXECUTE_MAX_ITERATIONS_CHECKPOINT_SCENARIO = "execute-max-iterations-check
 const ORDINARY_CONTINUE_NEW_TURN_SCENARIO = "ordinary-continue-new-turn";
 const LOCAL_FILE_READ_APPROVAL_SCENARIO = "local-file-read-approval";
 const PROGRESS_NARRATION_TOOL_FLOW_SCENARIO = "progress-narration-tool-flow";
+const GLOBAL_CHAT_TOOL_SCOPE_SCENARIO = "global-chat-tool-scope";
+const GLOBAL_CHAT_ATTACHMENT_READ_SCENARIO = "global-chat-attachment-read";
 const TOP_ISLAND_EXECUTION_PROGRESS_SCENARIO = "top-island-execution-progress";
 const TOP_ISLAND_PLAN_TASK_PROGRESS_SCENARIO = "top-island-plan-task-progress";
 const TOP_ISLAND_STRICT_EVIDENCE_PROGRESS_SCENARIO = "top-island-strict-evidence-progress";
@@ -5648,7 +5650,11 @@ function seedCloudToolProtocolScenario(scenario: string) {
   incrementSeedCount(scenario);
 
   const now = Date.now();
-  const workspace = `/tmp/e2e-${scenario}`;
+  const isGlobalChatScenario =
+    scenario === GLOBAL_CHAT_TOOL_SCOPE_SCENARIO ||
+    scenario === GLOBAL_CHAT_ATTACHMENT_READ_SCENARIO;
+  const workspace = isGlobalChatScenario ? "" : `/tmp/e2e-${scenario}`;
+  const scopeKey = isGlobalChatScenario ? GLOBAL_CHAT_KEY : workspace;
   const ordinaryContinueSeed = scenario === ORDINARY_CONTINUE_NEW_TURN_SCENARIO
     ? (() => {
         const turnId = "e2e-ordinary-continue-previous-turn";
@@ -5726,6 +5732,10 @@ function seedCloudToolProtocolScenario(scenario: string) {
     ? 999514
     : scenario === ORDINARY_CONTINUE_NEW_TURN_SCENARIO
     ? 999515
+    : scenario === GLOBAL_CHAT_TOOL_SCOPE_SCENARIO
+    ? 999516
+    : scenario === GLOBAL_CHAT_ATTACHMENT_READ_SCENARIO
+    ? 999517
     : 999502;
   const server = {
     id: `e2e-${scenario}-server`,
@@ -5767,8 +5777,14 @@ function seedCloudToolProtocolScenario(scenario: string) {
     },
     currentWorkspace: workspace,
     selectedWorkspace: workspace,
+    workspaces: isGlobalChatScenario
+      ? []
+      : [{ path: workspace, name: `E2E ${scenario}`, addedAt: now, lastActiveAt: now }],
+    activeSessionByWorkspace: {
+      [scopeKey]: sessionId,
+    },
     sessionsByWorkspace: {
-      [workspace]: [
+      [scopeKey]: [
         {
           id: sessionId,
           title: scenario === CLOUD_TOOL_FALLBACK_SCENARIO
@@ -5793,6 +5809,10 @@ function seedCloudToolProtocolScenario(scenario: string) {
             ? "E2E Progress Narration Tool Flow"
             : scenario === ORDINARY_CONTINUE_NEW_TURN_SCENARIO
             ? "E2E Ordinary Continue New Turn"
+            : scenario === GLOBAL_CHAT_TOOL_SCOPE_SCENARIO
+            ? "E2E Global Chat Tool Scope"
+            : scenario === GLOBAL_CHAT_ATTACHMENT_READ_SCENARIO
+            ? "E2E Global Chat Attachment Read"
             : scenario === PLAN_OPERATION_APPROVAL_REUSE_SCENARIO
             ? "E2E Plan Operation Approval Reuse"
             : "E2E Reply Options Tool Pause",
@@ -5848,6 +5868,18 @@ function seedCloudToolProtocolScenario(scenario: string) {
   }));
 
   bridge.sendCloudMessage = (text?: string) => {
+    if (scenario === GLOBAL_CHAT_ATTACHMENT_READ_SCENARIO) {
+      return useAppStore.getState().sendMessage(
+        text || "请读取附件并确认是否包含 GLOBAL_ATTACHMENT_READ_OK。",
+        undefined,
+        {
+          resolvedIntent: "respond",
+          skipIntentResolution: true,
+          attachedFilesSnapshot: ["/tmp/e2e-outside-main-debug.log"],
+        },
+      );
+    }
+
     if (scenario === ORDINARY_CONTINUE_NEW_TURN_SCENARIO) {
       return useAppStore.getState().sendMessage(text || "继续");
     }
@@ -5858,6 +5890,17 @@ function seedCloudToolProtocolScenario(scenario: string) {
         undefined,
         {
           resolvedIntent: "plan",
+          skipIntentResolution: true,
+        },
+      );
+    }
+
+    if (scenario === LOCAL_FILE_READ_APPROVAL_SCENARIO) {
+      return useAppStore.getState().sendMessage(
+        text || "请读取外部日志 /tmp/e2e-outside-main-debug.log。",
+        undefined,
+        {
+          resolvedIntent: "analyze",
           skipIntentResolution: true,
         },
       );
@@ -6934,6 +6977,14 @@ export function initializeE2EScenarios(): (() => void) | undefined {
 
   if (scenario === PROGRESS_NARRATION_TOOL_FLOW_SCENARIO) {
     return seedCloudToolProtocolScenario(PROGRESS_NARRATION_TOOL_FLOW_SCENARIO);
+  }
+
+  if (scenario === GLOBAL_CHAT_TOOL_SCOPE_SCENARIO) {
+    return seedCloudToolProtocolScenario(GLOBAL_CHAT_TOOL_SCOPE_SCENARIO);
+  }
+
+  if (scenario === GLOBAL_CHAT_ATTACHMENT_READ_SCENARIO) {
+    return seedCloudToolProtocolScenario(GLOBAL_CHAT_ATTACHMENT_READ_SCENARIO);
   }
 
   if (scenario === PLAN_APPROVAL_EXECUTE_TOOLS_SCENARIO) {

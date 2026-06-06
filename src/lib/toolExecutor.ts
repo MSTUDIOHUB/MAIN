@@ -87,6 +87,40 @@ const LOCAL_FILE_READ_TOOLS = new Set([
   "query_tabular_document",
 ]);
 
+const GLOBAL_CHAT_CONTEXT_READ_TOOLS = new Set([
+  "read_file",
+  "read_document",
+  "analyze_tabular_document",
+  "query_tabular_document",
+]);
+
+const WORKSPACE_REQUIRED_TOOL_NAMES = new Set([
+  "list_directory",
+  "glob_search",
+  "grep_search",
+  "repo_map_status",
+  "repo_map_search",
+  "repo_map_context",
+  "repo_map_files",
+  "repo_map_impact",
+  "get_project_skeleton",
+  "get_file_outline",
+  "index_workspace_documents",
+  "replace_in_file",
+  "write_file",
+  "apply_patch",
+  "delete_workspace_path",
+  "run_command",
+  "browser_evaluate",
+  "execute_command",
+  "send_pty_input",
+  "read_pty_buffer",
+  "read_pty_tail",
+  "read_pty_since",
+  "get_pty_status",
+  "clear_pty_buffer",
+]);
+
 function isAbsoluteLocalPath(value: string): boolean {
   return value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value);
 }
@@ -111,6 +145,30 @@ function parseWindowLineArg(args: Record<string, unknown>, key: string): number 
 
 function shouldUseChatTempStorage(workspace: string, sessionKey?: string): boolean {
   return !workspace.trim() && !!sessionKey;
+}
+
+function isGlobalChatContextReadToolCall(
+  name: string,
+  args: Record<string, unknown>,
+  sessionKey?: string,
+): boolean {
+  if (!GLOBAL_CHAT_CONTEXT_READ_TOOLS.has(name) || !sessionKey) return false;
+  const rawPath = typeof args.path === "string" ? args.path.trim() : "";
+  return !!rawPath && isChatAttachmentPath(rawPath);
+}
+
+function assertWorkspaceAvailableForTool(
+  name: string,
+  args: Record<string, unknown>,
+  workspace: string,
+  sessionKey?: string,
+): void {
+  if (workspace.trim()) return;
+  if (isGlobalChatContextReadToolCall(name, args, sessionKey)) return;
+  if (!WORKSPACE_REQUIRED_TOOL_NAMES.has(name) && !GLOBAL_CHAT_CONTEXT_READ_TOOLS.has(name)) return;
+  throw new Error(
+    `WORKSPACE_REQUIRED_FOR_TOOL: ${name} requires an active workspace. Global Chat can only read explicitly attached chat files; open a project conversation or attach/@ a specific file first.`,
+  );
 }
 
 function isMissingReadFileWindowCommand(error: unknown): boolean {
@@ -215,6 +273,7 @@ export async function executeTool(
   args = prepared.args;
   workspace = prepared.workspace;
   const effectiveSessionKey = prepared.externalLocalReadIngested ? undefined : sessionKey;
+  assertWorkspaceAvailableForTool(name, args, workspace, effectiveSessionKey);
 
   switch (name) {
     // ── Tauri IPC (std::fs on Rust side) ──────────────────────

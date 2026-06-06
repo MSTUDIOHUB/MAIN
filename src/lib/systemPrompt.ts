@@ -396,8 +396,13 @@ export function buildSystemPrompt(
   const filePagingWarning = shellToolsAvailable
     ? "不要用 `run_command`、`cat`、`sed`、`head`、`tail` 作为常规分页读文件手段。"
     : "不要用 shell 命令作为常规分页读文件手段。";
-  parts.push("当前工作区绝对路径为：" + workspace);
-  parts.push("你执行任何文件操作或搜索时，都必须基于此路径。所有相对路径都相对于此根目录解析。");
+  if (workspace.trim()) {
+    parts.push("当前工作区绝对路径为：" + workspace);
+    parts.push("你执行任何文件操作或搜索时，都必须基于此路径。所有相对路径都相对于此根目录解析。");
+  } else {
+    parts.push("当前没有绑定工作区；这是全局聊天。不要把最近打开的项目、历史工作区或后端默认目录当作当前上下文。");
+    parts.push("全局聊天只能基于用户显式提供的文字、图片、附件、@ 文件、知识库或联网结果回答；没有明确附件/@ 文件时，不要读取、扫描或推断本地项目内容。");
+  }
   parts.push("如果用户消息包含 `[turn_intake]`，必须把其中的 `[user_request]`、imageParts、@file、attachment 当成本轮最高优先级上下文：先对齐用户真实意图和已给证据，再决定工具；不要让内部 Plan 提示或模板路径覆盖用户原始目标。");
   parts.push("Codex App 式处理顺序：先读用户指令与图片/附件/@文件，给出一句自然的公开进度说明说明正在确认什么；再用最小必要工具定向验证；拿到证据后立即收束为方案、改动或阻塞点。不要先从根目录骨架或目录扫读开始，除非用户没有给任何可用线索。");
   parts.push("探索必须先收窄目标：如果用户给了路径、文件名、组件名、函数名或报错关键词，优先使用 `grep_search`、`glob_search`、`list_directory` 或小窗口 `read_file` 定向定位；只有没有任何可用线索、确实需要宏观结构时，才调用一次浅层 `get_project_skeleton(depth: 2)`。");
