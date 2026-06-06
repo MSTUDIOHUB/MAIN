@@ -13,6 +13,7 @@ import {
   IconSearch,
   IconSettings,
   IconTrash,
+  IconZap,
 } from "./Icons";
 import { createPortal } from "react-dom";
 import { GLOBAL_CHAT_KEY, resolveSessionWorkspaceKey, useAppStore, type WorkspaceEntry } from "../store/useAppStore";
@@ -344,6 +345,8 @@ export default function Sidebar({
         commitPlaceholder: "Commit message",
         autoCommitPlaceholder: "Leave blank to auto-generate",
         generatingCommit: "Generating...",
+        aiGenerate: "AI Generate",
+        generating: "Generating...",
         branchPlaceholder: "new-branch-name",
         cancel: "Cancel",
         confirm: "Confirm",
@@ -374,6 +377,8 @@ export default function Sidebar({
         commitPlaceholder: "提交信息",
         autoCommitPlaceholder: "留空以自动生成提交信息",
         generatingCommit: "生成中...",
+        aiGenerate: "AI 生成",
+        generating: "生成中...",
         branchPlaceholder: "new-branch-name",
         cancel: "取消",
         confirm: "确认",
@@ -489,8 +494,8 @@ export default function Sidebar({
     }
   };
 
-  const handleGitCommit = async (event: React.FormEvent) => {
-    event.preventDefault();
+  const handleGitCommit = async (event?: React.FormEvent | React.KeyboardEvent) => {
+    if (event) event.preventDefault();
     if (!gitMenu?.workspacePath) return;
     let message = gitCommitMessage.trim();
     if (!message) {
@@ -507,15 +512,42 @@ export default function Sidebar({
         });
         message = generated.message;
         setGitCommitMessage(message);
+      } catch (error) {
+        setGitFeedback({ type: "error", text: getErrorMessage(error) || (config.language === "en" ? "Generation failed." : "生成失败。") });
       } finally {
         setGeneratingCommitMessage(false);
       }
-    }
-    if (!message) {
-      setGitFeedback({ type: "error", text: gitCopy.missingMessage });
       return;
     }
     await runGitAction(() => gitCommitAll(gitMenu.workspacePath, message), `${gitCopy.commitDone} ${message}`);
+  };
+
+  const handleGenerateCommitMessageClick = async () => {
+    if (!gitMenu?.workspacePath) return;
+    setGeneratingCommitMessage(true);
+    setGitFeedback(null);
+    try {
+      const entries = await getGitDiff(gitMenu.workspacePath).catch(() => []);
+      const generated = await generateGitCommitMessage({
+        config,
+        language: config.language === "en" ? "en" : "zh",
+        workspace: gitMenu.workspacePath,
+        status: activeGitStatus,
+        entries,
+      });
+      setGitCommitMessage(generated.message);
+    } catch (error) {
+      setGitFeedback({ type: "error", text: getErrorMessage(error) || (config.language === "en" ? "Generation failed." : "生成失败。") });
+    } finally {
+      setGeneratingCommitMessage(false);
+    }
+  };
+
+  const handleTextareaKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+      event.preventDefault();
+      void handleGitCommit(event);
+    }
   };
 
   const handleGitPush = async () => {
@@ -1104,18 +1136,32 @@ export default function Sidebar({
               </button>
               {gitActionMode === "commit" && (
                 <form onSubmit={handleGitCommit} className="space-y-2 px-2 pb-2">
-                  <input
+                  <textarea
                     autoFocus
                     value={gitCommitMessage}
                     onChange={(event) => setGitCommitMessage(event.target.value)}
-                    className={`h-8 w-full rounded border ${gitMenuThemeClasses.divider} ${gitMenuThemeClasses.inputBg} px-2 text-[12px] ${gitMenuThemeClasses.lineText} outline-none focus:border-[var(--accent)]`}
+                    onKeyDown={handleTextareaKeyDown}
+                    rows={3}
+                    className={`w-full rounded border ${gitMenuThemeClasses.divider} ${gitMenuThemeClasses.inputBg} p-2 text-[12px] ${gitMenuThemeClasses.lineText} outline-none focus:border-[var(--accent)] resize-y min-h-[60px]`}
                     placeholder={gitCopy.autoCommitPlaceholder || gitCopy.commitPlaceholder}
                   />
-                  <div className="flex items-center justify-end gap-2">
-                    <button type="button" onClick={() => setGitActionMode(null)} className={gitMenuInlineButtonClass}>{gitCopy.cancel}</button>
-                    <button disabled={gitActionBusy || generatingCommitMessage} className={`${gitMenuInlineButtonClass} is-active font-semibold`}>
-                      {generatingCommitMessage ? gitCopy.generatingCommit : gitCopy.confirm}
+                  <div className="flex items-center justify-between">
+                    <button
+                      type="button"
+                      disabled={gitOperationsDisabled || generatingCommitMessage}
+                      onClick={handleGenerateCommitMessageClick}
+                      className={`${gitMenuInlineButtonClass} flex items-center gap-1 px-2 py-1`}
+                      title={gitCopy.aiGenerate}
+                    >
+                      <IconZap className={`h-3 w-3 ${generatingCommitMessage ? "animate-pulse" : ""}`} />
+                      <span>{generatingCommitMessage ? gitCopy.generating : gitCopy.aiGenerate}</span>
                     </button>
+                    <div className="flex items-center gap-2">
+                      <button type="button" onClick={() => setGitActionMode(null)} className={gitMenuInlineButtonClass}>{gitCopy.cancel}</button>
+                      <button disabled={gitActionBusy || generatingCommitMessage} className={`${gitMenuInlineButtonClass} is-active font-semibold`}>
+                        {gitCopy.confirm}
+                      </button>
+                    </div>
                   </div>
                 </form>
               )}

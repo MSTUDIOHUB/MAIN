@@ -150,6 +150,43 @@ export function sanitizeGitCommitSubject(raw: string): string | null {
   return trimToLength(subject, COMMIT_SUBJECT_MAX_LENGTH);
 }
 
+export function sanitizeGitCommitMessage(raw: string): string | null {
+  let cleaned = raw.replace(/```[\s\S]*?```/g, (block) => {
+    return block.replace(/```[a-z]*|```/gi, "");
+  });
+
+  cleaned = cleaned.trim();
+  if (cleaned.startsWith("```") && cleaned.endsWith("```")) {
+    cleaned = cleaned.slice(3, -3).trim();
+  }
+
+  const lines = cleaned.split(/\r?\n/);
+  const resultLines: string[] = [];
+  let foundFirstLine = false;
+
+  for (const line of lines) {
+    let trimmed = line.trim();
+    if (!foundFirstLine) {
+      if (!trimmed) continue;
+      if (/^(here is (?:your |the |a |your first )?commit message|commit message|subject|提交信息|git commit)\s*[:：.]?$/i.test(trimmed)) {
+        continue;
+      }
+      trimmed = trimmed
+        .replace(/^(commit message|subject|提交信息)\s*[:：]\s*/i, "")
+        .replace(/^["'“”‘’]+|["'“”‘’]+$/g, "")
+        .trim();
+      if (!trimmed) continue;
+      foundFirstLine = true;
+    }
+    resultLines.push(trimmed);
+  }
+
+  const finalMessage = resultLines.join("\n").trim();
+  if (finalMessage.length < 3) return null;
+  return finalMessage;
+}
+
+
 function appendLimited(lines: string[], next: string, maxChars: number) {
   const current = lines.join("\n").length;
   if (current >= maxChars) return;
@@ -234,11 +271,13 @@ async function requestModelCommitMessage(params: GenerateGitCommitMessageParams)
     {
       role: "system",
       content: [
-        "You generate Git commit subjects.",
-        "Return exactly one commit subject line.",
-        "No markdown, no quotes, no prefixes, no explanations.",
-        `Maximum ${COMMIT_SUBJECT_MAX_LENGTH} characters.`,
-        params.language === "zh" ? "Use concise Chinese." : "Use concise English.",
+        "You generate detailed Git commit messages (a subject and description body) based on the provided git diff.",
+        "Format the output strictly as follows:",
+        "1. The first line must be a concise commit subject line starting with a conventional commit type prefix (e.g., feat: ..., fix: ..., chore: ..., refactor: ..., docs: ..., style: ...). Keep the subject line under 72 characters.",
+        "2. Followed by a blank line.",
+        "3. Followed by a detailed, bulleted list of key changes. For each key change, describe the exact files/components modified, what was adjusted, and the purpose or impact of the change. Make sure the explanation is clear and informative.",
+        "No markdown code blocks, no outer quotes, no prefixes, no explanations outside the commit message. Just return the raw commit message text.",
+        params.language === "zh" ? "Use clear Chinese." : "Use clear English.",
       ].join("\n"),
     },
     {
@@ -307,7 +346,7 @@ async function requestModelCommitMessage(params: GenerateGitCommitMessageParams)
         ? extractGeminiResponseText(payload)
         : extractOpenAiResponseText(payload, cloudApiFormat);
 
-  return sanitizeGitCommitSubject(raw);
+  return sanitizeGitCommitMessage(raw);
 }
 
 export async function generateGitCommitMessage(params: GenerateGitCommitMessageParams): Promise<GeneratedGitCommitMessage> {

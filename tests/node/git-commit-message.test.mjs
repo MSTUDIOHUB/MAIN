@@ -56,6 +56,7 @@ const {
   buildFallbackGitCommitMessage,
   generateGitCommitMessage,
   sanitizeGitCommitSubject,
+  sanitizeGitCommitMessage,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/gitCommitMessage.ts"));
 
 const baseStatus = {
@@ -69,6 +70,29 @@ test("sanitizeGitCommitSubject extracts one clean subject and enforces length", 
   assert.equal(sanitizeGitCommitSubject("\"更新 Git 菜单\""), "更新 Git 菜单");
   assert.equal(sanitizeGitCommitSubject("x"), null);
   assert.equal(sanitizeGitCommitSubject("a".repeat(90))?.length, 72);
+});
+
+test("sanitizeGitCommitMessage preserves multiline structure and filters conversation/fences", () => {
+  const input = `
+\`\`\`git
+feat: add AI git generator
+
+- Add generate button
+- Use textarea instead of input
+\`\`\`
+  `.trim();
+  const expected = "feat: add AI git generator\n\n- Add generate button\n- Use textarea instead of input";
+  assert.equal(sanitizeGitCommitMessage(input), expected);
+
+  // Test with conversational prefix
+  const conversationalInput = `
+Here is your commit message:
+"chore: update dependencies"
+  `.trim();
+  assert.equal(sanitizeGitCommitMessage(conversationalInput), "chore: update dependencies");
+
+  // Test too short
+  assert.equal(sanitizeGitCommitMessage("  "), null);
 });
 
 test("buildFallbackGitCommitMessage covers status groups", () => {

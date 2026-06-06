@@ -275,6 +275,7 @@ test("sidebar Git menu replaces project counts and performs basic Git actions", 
   await page.evaluate(() => (window as any).__GIT_SIDEBAR_TEST__.setDiffMode("normal"));
 
   await menu.getByRole("button", { name: "提交" }).click();
+  await menu.getByRole("button", { name: "AI 生成" }).click();
   await menu.getByRole("button", { name: "确认" }).click();
   await expect(menu).toContainText("已提交全部更改。 test: generated commit");
 
@@ -313,6 +314,7 @@ test("sidebar Git icon stays transparent across themes and empty commit falls ba
   await page.getByTestId("sidebar-git-button").click();
   const menu = page.getByTestId("sidebar-git-menu");
   await menu.getByRole("button", { name: "提交" }).click();
+  await menu.getByRole("button", { name: "确认" }).click();
   await menu.getByRole("button", { name: "确认" }).click();
   await expect(menu).toContainText("已提交全部更改。 更新 Git 菜单");
 
