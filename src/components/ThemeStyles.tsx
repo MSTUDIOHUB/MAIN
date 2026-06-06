@@ -1,8 +1,10 @@
 import { useEffect } from "react";
-import { useAppStore } from "../store/useAppStore";
+import { useAppStore, THEMES } from "../store/useAppStore";
 
 export default function ThemeStyles() {
   const themeMode = useAppStore((s) => s.config.themeMode);
+  const themeName = useAppStore((s) => s.config.theme);
+  const currentTheme = THEMES[themeName] || THEMES.purple;
 
   // Mount data-theme attribute on <html> for CSS overrides
   useEffect(() => {
@@ -11,7 +13,15 @@ export default function ThemeStyles() {
 
   return (
     <style>{`
-      :root { --inline-chip-text: #f5f5f5; }
+      :root {
+        --accent: ${currentTheme.accent};
+        --accent-hover: ${currentTheme.hover};
+        --accent-light: ${currentTheme.light};
+        --accent-subtle: ${currentTheme.subtle};
+        --accent-subtle-border: ${currentTheme.subtleBorder};
+        --accent-contrast: ${currentTheme.contrast};
+        --inline-chip-text: #f5f5f5;
+      }
       html[data-theme="light"] { --inline-chip-text: #09090b; }
       html[data-theme="black"] { --inline-chip-text: #ffffff; }
       .theme-bg { background-color: var(--accent) !important; color: var(--accent-contrast, #ffffff) !important; }

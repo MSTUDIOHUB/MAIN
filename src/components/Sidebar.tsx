@@ -194,6 +194,8 @@ export default function Sidebar({
   const [generatingCommitMessage, setGeneratingCommitMessage] = useState(false);
   const [gitMenuCachedTime, setGitMenuCachedTime] = useState<number | null>(null);
   const openGitDiffPreview = useAppStore((s) => s.openGitDiffPreview);
+  const clearGitDiffPreview = useAppStore((s) => s.clearGitDiffPreview);
+  const setShowDiff = useAppStore((s) => s.setShowDiff);
   const workspaceExpansionTarget = currentWorkspace || selectedWorkspace;
   const activeScopeKey = resolveSessionWorkspaceKey(currentWorkspace);
 
@@ -230,6 +232,15 @@ export default function Sidebar({
       setGitLoading((prev) => ({ ...prev, [workspacePath]: false }));
     }
   }, []);
+
+  const commitTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+
+  useEffect(() => {
+    if (commitTextareaRef.current && gitActionMode === "commit") {
+      commitTextareaRef.current.style.height = 'auto';
+      commitTextareaRef.current.style.height = `${commitTextareaRef.current.scrollHeight + 2}px`;
+    }
+  }, [gitCommitMessage, gitActionMode]);
 
   useEffect(() => {
     if (!workspaceExpansionTarget) return;
@@ -401,9 +412,8 @@ export default function Sidebar({
   const gitMenuActionButtonClass = "git-menu-theme-button flex w-full items-center gap-2 rounded-[7px] border px-2 py-2 text-left text-[13px] transition-all duration-150 disabled:cursor-not-allowed disabled:opacity-40";
   const gitMenuInlineButtonClass = "git-menu-theme-button rounded-[7px] border px-2 py-1 text-[11px] transition-all duration-150 disabled:cursor-not-allowed disabled:opacity-40";
 
-  const buildGitMenuPlacement = (rect: DOMRect, workspacePath: string): GitMenuState => {
+  const buildGitMenuPlacement = useCallback((rect: DOMRect, workspacePath: string): GitMenuState => {
     const menuWidth = 300;
-    const preferredHeight = 520;
     const gap = 8;
     const margin = 12;
     const viewportWidth = typeof window !== "undefined" ? window.innerWidth : 1280;
@@ -413,20 +423,41 @@ export default function Sidebar({
     const left = preferredLeft + menuWidth <= viewportWidth - margin
       ? preferredLeft
       : Math.max(margin, Math.min(viewportWidth - menuWidth - margin, preferredLeft));
-    const availableHeight = Math.max(220, viewportHeight - margin * 2);
-    const menuHeight = Math.min(preferredHeight, availableHeight);
+
+    // Determine `top` based on standard anchor at `rect.top` 
+    // Shift up only if it exceeds the available space.
+    // Ensure the menu has at least 300px available below it to grow.
     const top = Math.min(
       Math.max(margin, rect.top),
-      Math.max(margin, viewportHeight - menuHeight - margin),
+      Math.max(margin, viewportHeight - 300 - margin)
     );
+
+    const maxHeight = viewportHeight - top - margin;
 
     return {
       workspacePath,
       left,
       top,
-      maxHeight: Math.min(menuHeight, viewportHeight - top - margin),
+      maxHeight,
     };
-  };
+  }, []);
+
+  useEffect(() => {
+    if (!gitMenu) return;
+    const trigger = Array.from(document.querySelectorAll("[data-sidebar-git-trigger='true']"))
+      .find(el => el.getAttribute("data-workspace") === gitMenu.workspacePath);
+    if (trigger) {
+      const rect = trigger.getBoundingClientRect();
+      setGitMenu((prev) => {
+        if (!prev) return null;
+        const next = buildGitMenuPlacement(rect, prev.workspacePath);
+        if (next.top === prev.top && next.left === prev.left && next.maxHeight === prev.maxHeight) {
+          return prev;
+        }
+        return next;
+      });
+    }
+  }, [gitActionMode, activeGitStatus, gitMenu?.workspacePath, buildGitMenuPlacement]);
 
   const openGitMenu = (event: React.MouseEvent<HTMLButtonElement>, workspacePath: string) => {
     event.stopPropagation();
@@ -475,8 +506,8 @@ export default function Sidebar({
     });
   }, [config.language, gitMenu, openGitDiff]);
 
-  const runGitAction = async (operation: () => Promise<GitStatus>, successText: string) => {
-    if (!gitMenu?.workspacePath) return;
+  const runGitAction = async (operation: () => Promise<GitStatus>, successText: string): Promise<boolean> => {
+    if (!gitMenu?.workspacePath) return false;
     setGitActionBusy(true);
     setGitFeedback(null);
     try {
@@ -486,9 +517,11 @@ export default function Sidebar({
       setGitActionMode(null);
       setGitCommitMessage("");
       setGitBranchName("");
+      return true;
     } catch (error) {
       setGitFeedback({ type: "error", text: getErrorMessage(error) || gitCopy.refreshFailed });
       void refreshGitStatus(gitMenu.workspacePath, true);
+      return false;
     } finally {
       setGitActionBusy(false);
     }
@@ -519,7 +552,11 @@ export default function Sidebar({
       }
       return;
     }
-    await runGitAction(() => gitCommitAll(gitMenu.workspacePath, message), `${gitCopy.commitDone} ${message}`);
+    const success = await runGitAction(() => gitCommitAll(gitMenu.workspacePath, message), `${gitCopy.commitDone} ${message}`);
+    if (success) {
+      setShowDiff(false);
+      clearGitDiffPreview();
+    }
   };
 
   const handleGenerateCommitMessageClick = async () => {
@@ -559,7 +596,11 @@ export default function Sidebar({
     ) {
       return;
     }
-    await runGitAction(() => gitPushCurrentBranch(gitMenu.workspacePath), gitCopy.pushDone);
+    const success = await runGitAction(() => gitPushCurrentBranch(gitMenu.workspacePath), gitCopy.pushDone);
+    if (success) {
+      setShowDiff(false);
+      clearGitDiffPreview();
+    }
   };
 
   const handleGitCreateBranch = async (event: React.FormEvent) => {
@@ -1025,12 +1066,11 @@ export default function Sidebar({
         <div
           ref={gitMenuRef}
           data-testid="sidebar-git-menu"
-          className={`fixed z-[1000] w-[300px] overflow-hidden rounded-md border ${gitMenuThemeClasses.bg} ${gitMenuThemeClasses.border} ${gitMenuThemeClasses.text}`}
+          className={`fixed z-[1000] w-[300px] overflow-y-auto rounded-md border ${gitMenuThemeClasses.bg} ${gitMenuThemeClasses.border} ${gitMenuThemeClasses.text}`}
           style={{ left: `${gitMenu.left}px`, top: `${gitMenu.top}px`, maxHeight: `${gitMenu.maxHeight}px` }}
           onClick={(event) => event.stopPropagation()}
         >
-          <div className="max-h-full overflow-y-auto">
-            <div className={`border-b ${gitMenuThemeClasses.divider} px-3 py-2`}>
+          <div className={`border-b ${gitMenuThemeClasses.divider} px-3 py-2`}>
               <div className="flex items-center justify-between gap-2">
                 <div className="flex min-w-0 items-center gap-2">
                   <IconGitBranch className="h-4 w-4 shrink-0 theme-text" />
@@ -1137,12 +1177,14 @@ export default function Sidebar({
               {gitActionMode === "commit" && (
                 <form onSubmit={handleGitCommit} className="space-y-2 px-2 pb-2">
                   <textarea
+                    ref={commitTextareaRef}
                     autoFocus
                     value={gitCommitMessage}
                     onChange={(event) => setGitCommitMessage(event.target.value)}
                     onKeyDown={handleTextareaKeyDown}
                     rows={3}
-                    className={`w-full rounded border ${gitMenuThemeClasses.divider} ${gitMenuThemeClasses.inputBg} p-2 text-[12px] ${gitMenuThemeClasses.lineText} outline-none focus:border-[var(--accent)] resize-y min-h-[60px]`}
+                    className={`w-full rounded border ${gitMenuThemeClasses.divider} ${gitMenuThemeClasses.inputBg} p-2 text-[12px] ${gitMenuThemeClasses.lineText} outline-none focus:border-[var(--accent)] resize-none overflow-y-auto transition-all`}
+                    style={{ minHeight: '60px', maxHeight: '250px' }}
                     placeholder={gitCopy.autoCommitPlaceholder || gitCopy.commitPlaceholder}
                   />
                   <div className="flex items-center justify-between">
@@ -1205,8 +1247,7 @@ export default function Sidebar({
               )}
             </div>
           </div>
-        </div>
-      ), document.body)}
+        ), document.body)}
 
       <div
         onMouseDown={onStartResizing}

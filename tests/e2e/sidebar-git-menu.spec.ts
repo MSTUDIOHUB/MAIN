@@ -142,7 +142,18 @@ test.beforeEach(async ({ page }) => {
       if (cmd === "proxy_request") {
         if (proxyMode === "fail") throw new Error("model unavailable");
         return JSON.stringify({
-          choices: [{ message: { content: "test: generated commit" } }],
+          choices: [{
+            message: {
+              content: [
+                "<commit_message>",
+                "feat(sidebar): improve Git sidebar commit generation",
+                "",
+                "- Improve Git menu commit input and post-commit state handling",
+                "- Summarize generated commit messages with stronger quality checks",
+                "</commit_message>",
+              ].join("\n"),
+            },
+          }],
         });
       }
       if (cmd === "get_git_status") {
@@ -277,7 +288,8 @@ test("sidebar Git menu replaces project counts and performs basic Git actions", 
   await menu.getByRole("button", { name: "提交" }).click();
   await menu.getByRole("button", { name: "AI 生成" }).click();
   await menu.getByRole("button", { name: "确认" }).click();
-  await expect(menu).toContainText("已提交全部更改。 test: generated commit");
+  await expect(menu).toContainText("已提交全部更改。 feat(sidebar): improve Git sidebar commit generation");
+  await expect(menu).toContainText("Summarize generated commit messages");
 
   await menu.getByRole("button", { name: "推送" }).click();
   await expect(menu).toContainText("已推送当前分支。");
@@ -289,7 +301,10 @@ test("sidebar Git menu replaces project counts and performs basic Git actions", 
 
   const calls = await page.evaluate(() => (window as any).__GIT_SIDEBAR_TEST__.calls);
   expect(calls.some((call: any) => call.cmd === "proxy_request")).toBe(true);
-  expect(calls.some((call: any) => call.cmd === "git_commit_all" && call.args.message === "test: generated commit")).toBe(true);
+  const commitCall = calls.find((call: any) => call.cmd === "git_commit_all");
+  expect(commitCall?.args.message).toContain("feat(sidebar): improve Git sidebar commit generation");
+  expect(commitCall?.args.message).toContain("Git menu commit input");
+  expect(commitCall?.args.message).toContain("generated commit messages");
   expect(calls.some((call: any) => call.cmd === "git_push_current_branch")).toBe(true);
   expect(calls.some((call: any) => call.cmd === "git_create_branch" && call.args.branch === "feature/sidebar-git")).toBe(true);
 });
@@ -316,8 +331,14 @@ test("sidebar Git icon stays transparent across themes and empty commit falls ba
   await menu.getByRole("button", { name: "提交" }).click();
   await menu.getByRole("button", { name: "确认" }).click();
   await menu.getByRole("button", { name: "确认" }).click();
-  await expect(menu).toContainText("已提交全部更改。 更新 Git 菜单");
+  await expect(menu).toContainText("已提交全部更改。 更新 Git 提交体验");
+  await expect(menu).toContainText("提交信息生成");
 
   const calls = await page.evaluate(() => (window as any).__GIT_SIDEBAR_TEST__.calls);
-  expect(calls.some((call: any) => call.cmd === "git_commit_all" && call.args.message === "更新 Git 菜单")).toBe(true);
+  const commitCall = calls.find((call: any) => call.cmd === "git_commit_all");
+  expect(commitCall?.args.message).toContain("更新 Git 提交体验");
+  expect(commitCall?.args.message).toContain("提交信息生成");
+  expect(commitCall?.args.message).toContain("Git 菜单");
+  expect(commitCall?.args.message).not.toContain("src/");
+  expect(commitCall?.args.message).not.toContain("`");
 });
