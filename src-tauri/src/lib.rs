@@ -47,7 +47,9 @@ const PTY_BUFFER_LIMIT_BYTES: usize = 512 * 1024;
 const GREP_MATCH_LIMIT: usize = 2000;
 const GREP_OUTPUT_LIMIT_BYTES: usize = 512 * 1024;
 const COMMAND_OUTPUT_LIMIT_BYTES: usize = 1024 * 1024;
+#[cfg(not(target_os = "windows"))]
 const LOGIN_SHELL_ENV_TIMEOUT_MS: u64 = 4_000;
+#[cfg(not(target_os = "windows"))]
 const LOGIN_SHELL_ENV_OUTPUT_LIMIT_BYTES: usize = 256 * 1024;
 const DOCUMENT_READER_SCRIPT: &str = include_str!("../Scripts/document_reader.py");
 const HTTP_CONNECT_TIMEOUT_SECS: u64 = 15;
@@ -1716,6 +1718,7 @@ fn default_shell() -> String {
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 fn shell_file_name(shell: &str) -> String {
     Path::new(shell)
         .file_name()
@@ -1748,6 +1751,7 @@ fn configure_login_env_probe(command: &mut ProcessCommand, shell: &str) {
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 fn is_valid_env_key(key: &str) -> bool {
     !key.is_empty()
         && key
@@ -1755,6 +1759,7 @@ fn is_valid_env_key(key: &str) -> bool {
             .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
+#[cfg(not(target_os = "windows"))]
 fn parse_login_shell_env_output(output: &str) -> HashMap<String, String> {
     let mut env = HashMap::new();
 
@@ -5005,6 +5010,7 @@ const OPENAI_OAUTH_PREFERRED_PORT: u16 = 1455;
 const GEMINI_OAUTH_CLIENT_ID: &str =
     "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com";
 const GEMINI_OAUTH_CLIENT_SECRET: &str = "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";
+#[cfg(target_os = "macos")]
 const CLOUD_AUTH_KEYCHAIN_SERVICE: &str = "MAIN Cloud Auth";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -9088,7 +9094,7 @@ fn knowledge_list_sources(
 
 #[tauri::command]
 fn knowledge_import_source(
-    app: AppHandle,
+    _app: AppHandle,
     state: State<WorkspaceState>,
     kb_id: String,
     path: String,
@@ -10083,6 +10089,7 @@ async fn test_feishu_adapter_connection(
 
 // region: App icon
 
+#[cfg(target_os = "macos")]
 fn generate_app_icon_png(variant: &str) -> Vec<u8> {
     if variant == "dark" {
         include_bytes!("../../public/app-icon-dark.png").to_vec()
