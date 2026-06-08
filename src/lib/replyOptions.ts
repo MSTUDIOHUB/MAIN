@@ -665,6 +665,13 @@ export function shouldPauseForReplyOptions(params: {
     option.source === "operation_approval" ||
     option.action === "approve_operation_once"
   );
+  const hasExplicitOrActionablePauseOption = replyOptions.some((option) =>
+    option.source === "explicit_user_options" ||
+    option.source === "readonly_permission" ||
+    option.source === "proposal_follow_up" ||
+    option.source === "operation_approval" ||
+    !!option.action
+  );
   if (finishReason === "length" && !hasLengthSafeOption) return false;
   if (
     workflowMode === "plan" &&
@@ -694,6 +701,7 @@ export function shouldPauseForReplyOptions(params: {
   ) {
     return false;
   }
+  if (workflowMode === "chat" && !forcePause && !hasExplicitOrActionablePauseOption) return false;
   if (forcePause) return true;
   if (toolCallCount > 0 && workflowMode === "edit") return false;
 

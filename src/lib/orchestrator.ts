@@ -8299,7 +8299,21 @@ export async function executeAgentLoop(
         });
       }
       callbacks.appendMessage(buildAssistantHistoryMessage(assistantHistoryText, providerReasoningForHistory));
+      emitTurnEvent({
+        type: "item.completed",
+        threadId: eventThreadId,
+        turnId: eventTurnId,
+        timestampMs: Date.now(),
+        item: {
+          id: assistantMsgId,
+          details: {
+            type: "agent_message",
+            text: assistantHistoryText,
+          },
+        } as MainThreadItem,
+      });
       callbacks.onStatusChange("idle");
+      emitTurnCompletedEvent();
       return;
     }
 

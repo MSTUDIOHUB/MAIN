@@ -34,7 +34,7 @@ import {
 import { appendDebugLog } from "../debugLog";
 import { type PlanExecutionProgressPhase, type PlanExecutionProgressUpdate, getPlanArtifactTitle, extractPlanTasks, isEphemeralPlanArtifactPath, reconcilePlanTaskCompletion } from "../workflowModels";
 import { createPlanExecutionEvidenceEntry, appendPlanEvidenceEntry } from "../planEvidence";
-import type { HarnessRunMarker } from "../harnessCrashTelemetry";
+import { closeHarnessRunMarker, persistHarnessRunMarker, type HarnessRunMarker } from "../harnessCrashTelemetry";
 import { runAfterNextPaint } from "../uiScheduling";
 import { supportsToolDiffPreview } from "../toolDiff";
 import { findToolLifecycleBlockIndex, type ToolLifecycleMeta } from "../toolLifecycle";
@@ -270,17 +270,19 @@ export class WorkflowEngine {
       }
     };
 
-    const closeCurrentHarnessRunMarker = (status: "completed" | "error" | "cancelled", reason: string) => {
+    const closeCurrentHarnessRunMarker = (status: "completed" | "error", reason: string) => {
       const marker = sessionGet().harnessRunMarker;
       if (marker && marker.status === "running") {
-        sessionSet((s: any) => ({
-          harnessRunMarker: {
-            ...s.harnessRunMarker!,
-            status,
-            endedAt: Date.now(),
-            reason,
-          },
-        }));
+        const closedAt = Date.now();
+        const nextMarker: HarnessRunMarker = {
+          ...marker,
+          status,
+          updatedAt: closedAt,
+          closedAt,
+          closeReason: reason,
+        };
+        sessionSet({ harnessRunMarker: nextMarker });
+        closeHarnessRunMarker({ status, closeReason: reason });
       }
     };
 
@@ -362,11 +364,13 @@ export class WorkflowEngine {
     const updateHarnessRunMarker = (patch: Partial<HarnessRunMarker>) => {
       sessionSet((s: any) => {
         if (!s.harnessRunMarker) return {};
+        const nextMarker = {
+          ...s.harnessRunMarker,
+          ...patch,
+        } as HarnessRunMarker;
+        persistHarnessRunMarker(nextMarker);
         return {
-          harnessRunMarker: {
-            ...s.harnessRunMarker,
-            ...patch,
-          } as HarnessRunMarker,
+          harnessRunMarker: nextMarker,
         };
       });
     };
@@ -1426,11 +1430,15 @@ export class WorkflowEngine {
       },
 
       onStatusChange: (status: "idle" | "running" | "pending_review" | "error") => {
-        sessionSet({ agentStatus: status, isGenerating: status === "running" });
+        sessionSet({
+          agentStatus: status,
+          isGenerating: status === "running",
+          ...(status === "idle" || status === "error" ? { abortController: null } : {}),
+        });
       },
 
       onError: (error: string) => {
-        sessionSet({ agentStatus: "error", isGenerating: false });
+        sessionSet({ agentStatus: "error", isGenerating: false, abortController: null });
         appendTurnBlock({
           id: sessionGet()._nextTaskId(),
           turnId,

@@ -9321,7 +9321,7 @@ export const useAppStore = create<AppState>()(
       context.streamBuffer = streamBuffer;
 
       appendUnderstandingProgress();
-      const engine = new WorkflowEngine(get, set);
+      const engine = new WorkflowEngine(sessionGet, sessionSet);
       engine.run(context);
     })();
 
@@ -9389,19 +9389,38 @@ export const useAppStore = create<AppState>()(
             lastUpdatedAt: marker.updatedAt,
           };
           logStoreEvent("unclean_restart_detected", details);
-          useAppStore.setState((s: AppState) => ({
-            harnessRunMarker: marker,
-            runtimeEvents: appendRuntimeEvent(s.runtimeEvents, withEventSchema({
-              type: "harness.telemetry",
-              threadId: marker.sessionKey || resolveSessionRuntimeKey(resolveSessionWorkspaceKey(s.currentWorkspace), s.currentSessionId) || "default",
-              turnId: marker.turnId || undefined,
-              timestampMs: Date.now(),
-              telemetry: {
-                name: "unclean_termination",
-                details,
-              },
-            })),
-          }));
+          const restoredMarker = normalizeHarnessRunMarker({
+            ...marker,
+            status: "error",
+            closedAt: Date.now(),
+            closeReason: "unclean_restart_detected",
+          }) || marker;
+          const applyUncleanRestartTelemetry = () => {
+            try {
+              useAppStore.setState((s: AppState) => ({
+                harnessRunMarker: restoredMarker,
+                runtimeEvents: appendRuntimeEvent(s.runtimeEvents, withEventSchema({
+                  type: "harness.telemetry",
+                  threadId: marker.sessionKey || resolveSessionRuntimeKey(resolveSessionWorkspaceKey(s.currentWorkspace), s.currentSessionId) || "default",
+                  turnId: marker.turnId || undefined,
+                  timestampMs: Date.now(),
+                  telemetry: {
+                    name: "unclean_termination",
+                    details,
+                  },
+                })),
+              }));
+            } catch (stateError) {
+              logStoreEvent("unclean_restart_state_apply_failed", {
+                error: stateError instanceof Error ? stateError.message : String(stateError),
+              });
+            }
+          };
+          if (typeof queueMicrotask === "function") {
+            queueMicrotask(applyUncleanRestartTelemetry);
+          } else {
+            setTimeout(applyUncleanRestartTelemetry, 0);
+          }
           if (marker.workspace) {
             void invoke("record_session_failure", {
               stepId: "unclean_termination",

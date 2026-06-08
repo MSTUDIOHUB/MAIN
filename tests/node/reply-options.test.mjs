@@ -121,6 +121,34 @@ test("shouldPauseForReplyOptions respects forcePause while keeping legacy edit/r
   );
 });
 
+test("shouldPauseForReplyOptions does not hold chat runs for inferred numbered answers", () => {
+  assert.equal(
+    shouldPauseForReplyOptions({
+      replyOptions: [
+        { label: "先了解市场趋势", value: "先了解市场趋势", source: "inferred_enumerated" },
+        { label: "再制定交易纪律", value: "再制定交易纪律", source: "inferred_enumerated" },
+      ],
+      toolCallCount: 0,
+      workflowMode: "chat",
+      finishReason: "stop",
+    }),
+    false,
+  );
+
+  assert.equal(
+    shouldPauseForReplyOptions({
+      replyOptions: [
+        { label: "继续分析日志", value: "继续分析日志", source: "explicit_user_options" },
+        { label: "先到这里", value: "先到这里", source: "explicit_user_options" },
+      ],
+      toolCallCount: 0,
+      workflowMode: "chat",
+      finishReason: "stop",
+    }),
+    true,
+  );
+});
+
 test("serializeAssistantReplyForHistory keeps the visible question and options together", () => {
   const historyText = serializeAssistantReplyForHistory("请确认下一步方向。", [
     { label: "先做数据分析", value: "先做数据分析" },
