@@ -77,6 +77,7 @@ import {
 } from "./orchestrator/fileReadCache";
 import {
   buildExecuteNoActionPauseMessage,
+  buildExecuteXmlTextActionRecoveryPrompt,
   buildLanguageMismatchRecoveryPrompt,
   buildMalformedToolUseRecoveryPrompt,
   buildPseudoToolCallRecoveryPrompt,
@@ -95,6 +96,7 @@ import {
   looksLikePseudoToolCallPlaceholder,
   looksLikeToolUnavailableClaim,
   shouldRecoverLanguageMismatchTurn,
+  shouldRecoverExecuteXmlTextWithoutAction,
   summarizeProtocolFragmentForLog,
 } from "./orchestrator/agentRecovery";
 import {
@@ -131,6 +133,7 @@ import {
 } from "./orchestrator/planOrchestration";
 
 export {
+  buildExecuteXmlTextActionRecoveryPrompt,
   buildPseudoToolCallRecoveryPrompt,
   extractPseudoToolCallName,
   isReasoningDominatedLengthResult,
@@ -139,6 +142,7 @@ export {
   looksLikePseudoToolCallPlaceholder,
   recoverPseudoToolCallFromContext,
   shouldRecoverLanguageMismatchTurn,
+  shouldRecoverExecuteXmlTextWithoutAction,
 } from "./orchestrator/agentRecovery";
 export {
   shouldRepromptBeforeUnityConsoleFallback,
@@ -5298,6 +5302,7 @@ export async function executeAgentLoop(
   let planClosureEvidenceRecoveryIssued = false;
   let usedExecuteCompletionEvidencePrompt = false;
   let usedExecuteReplanningEvidencePrompt = false;
+  let usedExecuteXmlTextActionRecoveryPrompt = false;
   let usedReadOnlyPermissionHardRecoveryPrompt = false;
   let planReadOnlyConvergenceBatches = 0;
   let planReadOnlyConvergenceTools = 0;
@@ -8520,6 +8525,58 @@ export async function executeAgentLoop(
           callbacks.appendMessage({
             role: "user",
             content: buildExecuteReplanningEvidencePrompt(callbacks.getPreferredLanguage(), consecutiveNoToolCount),
+          });
+          continue;
+        }
+
+        const shouldRecoverExecuteXmlText =
+          shouldRecoverExecuteXmlTextWithoutAction({
+            workflowMode,
+            turnIntent,
+            runtimeIntent,
+            forceXmlTools,
+            availableToolCount: availableToolNames.size,
+            toolCallCount: effectiveToolCalls.length,
+            replyOptionCount: finalReplyOptions.length,
+            sawExecuteOperationEvidence,
+            visibleText: visibleAssistantText || userVisibleText,
+          });
+        if (shouldRecoverExecuteXmlText) {
+          callbacks.onStreamToken("__ESCALATION_RESET__:", assistantMsgId);
+          callbacks.onStatusChange("running");
+          consecutiveNoToolCount++;
+          logAgentEvent("execute_xml_text_without_action", {
+            iteration,
+            consecutiveNoToolCount,
+            workflowMode,
+            turnIntent,
+            runtimeIntent,
+            visibleChars: (visibleAssistantText || userVisibleText).length,
+            availableToolCount: availableToolNames.size,
+          });
+
+          if (usedExecuteXmlTextActionRecoveryPrompt || consecutiveNoToolCount >= MAX_NO_ACTION_RETRIES) {
+            logAgentEvent("loop_stop", {
+              reason: "execute_xml_text_without_action",
+              iteration,
+              consecutiveNoToolCount,
+            });
+            callbacks.onNonActionableStop(
+              buildNonActionableStopMessage(callbacks.getPreferredLanguage(), "plain_text_execution"),
+              "no_action",
+            );
+            callbacks.onStatusChange("idle");
+            return;
+          }
+
+          usedExecuteXmlTextActionRecoveryPrompt = true;
+          callbacks.appendMessage({
+            role: "user",
+            content: buildExecuteXmlTextActionRecoveryPrompt({
+              language: callbacks.getPreferredLanguage(),
+              retryCount: consecutiveNoToolCount,
+              availableTools: Array.from(availableToolNames),
+            }),
           });
           continue;
         }

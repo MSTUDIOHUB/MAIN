@@ -285,6 +285,7 @@ function TurnSummaryCard({
   onExpand,
   embedded = false,
   copy,
+  chatFontSize = 13,
 }: {
   turn: ConversationTurn;
   hiddenCount: number;
@@ -298,6 +299,7 @@ function TurnSummaryCard({
     expandHistory: (count: number) => string;
     openPlan: string;
   };
+  chatFontSize?: number;
 }) {
   const cleanTurnSummary = sanitizeAIOutput(turn.summary || "");
   const summaryText = (looksLikeReasoningLeakTitle(cleanTurnSummary) ? "" : cleanTurnSummary) || sanitizeAIOutput(fallbackSummary || "") || copy.collapsedSummary;
@@ -309,8 +311,17 @@ function TurnSummaryCard({
     <div data-testid="turn-summary-card" className={shellClass}>
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0 flex-1">
-          <div className="text-[11px] uppercase tracking-[0.18em] text-[#71717a]">{copy.summary}</div>
-          <div className="mt-1 text-[13px] leading-relaxed text-[#e4e4e7]">{summaryText}</div>
+          <div className="text-[11px] uppercase tracking-[0.18em] text-[#71717a] flex items-center gap-1.5">
+            <IconFileText className="h-3.5 w-3.5 shrink-0" />
+            {copy.summary}
+          </div>
+          <div className="mt-2 text-[13px] leading-relaxed text-[#e4e4e7]">
+            <MarkdownRenderer
+              content={summaryText}
+              baseFontSize={chatFontSize}
+              sourceId={`turn-summary-${turn.id}`}
+            />
+          </div>
           {hiddenCount > 0 && (
             <button
               onClick={onExpand}
@@ -3236,9 +3247,6 @@ export default function ChatArea({
     const planProgressBody = turnProgressSnapshot
       ? formatPlanExecutionProgressSnapshot(turnProgressSnapshot, language)
       : "";
-    const hasInlinePlanProgressBlock = blocks.some(
-      (block) => block.type === "system" && block.variant === "plan_execution_progress",
-    );
     const livePlanProgressBlock =
       isTurnExpanded && isPlanExecutionVisible && turnProgressSnapshot && planProgressBody && !hasInlinePlanProgressBlock
         ? {
@@ -3519,17 +3527,14 @@ export default function ChatArea({
     const collapsedTurnHeaderStyle = !isTurnExpanded
       ? isLightThemeMode
         ? {
-            backgroundColor: "color-mix(in srgb, var(--accent) 12%, #ffffff 88%)",
-            borderBottomColor: "color-mix(in srgb, var(--accent) 28%, #e5e7eb 72%)",
+            borderBottomColor: "#e4e4e7",
           }
         : isBlackThemeMode
         ? {
-            backgroundColor: "color-mix(in srgb, var(--accent) 14%, #000000 86%)",
-            borderBottomColor: "color-mix(in srgb, var(--accent-light) 30%, #202026 70%)",
+            borderBottomColor: "#1f1f23",
           }
         : {
-            backgroundColor: "color-mix(in srgb, var(--accent) 14%, #09090b 86%)",
-            borderBottomColor: "color-mix(in srgb, var(--accent-light) 28%, #27272a 72%)",
+            borderBottomColor: "#1f1f23",
           }
       : undefined;
     const turnTitleClass = isLightThemeMode ? "text-[#111827]" : "text-[#f5f5f5]";
@@ -3610,6 +3615,7 @@ export default function ChatArea({
                 onExpand={() => toggleConversationTurnCollapsed(turn.id)}
                 embedded
                 copy={copy}
+                chatFontSize={resolvedChatFontSize}
               />
             </div>
           )}
@@ -3617,7 +3623,7 @@ export default function ChatArea({
 
         <div className={`${isTurnExpanded ? "mt-4 " : ""}space-y-4`}>
           {isTurnExpanded && userBlock ? renderBlock(userBlock, 0) : null}
-          {livePlanProgressBlock ? (
+          {false && livePlanProgressBlock ? (
             <PlanExecutionSystemNotice
               key={`${turn.id}-live-plan-progress`}
               block={livePlanProgressBlock}

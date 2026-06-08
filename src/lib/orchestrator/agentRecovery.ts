@@ -238,6 +238,71 @@ export function buildPseudoToolCallRecoveryPrompt(language: "zh" | "en", workflo
       ].join("\n");
 }
 
+export function shouldRecoverExecuteXmlTextWithoutAction(input: {
+  workflowMode: WorkflowMode;
+  turnIntent: string;
+  runtimeIntent: string;
+  forceXmlTools: boolean;
+  availableToolCount: number;
+  toolCallCount: number;
+  replyOptionCount: number;
+  sawExecuteOperationEvidence: boolean;
+  visibleText: string;
+}): boolean {
+  const visible = String(input.visibleText || "").replace(/\s+/g, " ").trim();
+  if (!visible) return false;
+  const isExecuteRuntime =
+    input.workflowMode === "edit" ||
+    input.turnIntent === "execute" ||
+    input.runtimeIntent === "execute" ||
+    input.runtimeIntent === "studio_workflow";
+  return (
+    isExecuteRuntime &&
+    input.forceXmlTools &&
+    input.availableToolCount > 0 &&
+    input.toolCallCount === 0 &&
+    input.replyOptionCount === 0 &&
+    !input.sawExecuteOperationEvidence
+  );
+}
+
+export function buildExecuteXmlTextActionRecoveryPrompt(input: {
+  language: "zh" | "en";
+  retryCount: number;
+  availableTools: string[];
+}): string {
+  const toolList = input.availableTools.slice(0, 16).join(", ");
+  if (input.language === "en") {
+    return [
+      "The previous execute reply was plain text, but this local profile uses XML tool calls. Plain text is not executable progress in an execute turn.",
+      toolList ? `Available tools include: ${toolList}.` : "",
+      "Continue with exactly one of these outcomes:",
+      "1. If the task can proceed, output exactly one valid XML `<tool_use>` block and no surrounding prose.",
+      "2. If a real permission, evidence, or product-choice blocker prevents action, output concise Markdown plus `<user_options>` choices and stop.",
+      "Valid XML shape:",
+      "<tool_use>",
+      "<tool>read_file</tool>",
+      "<parameter name=\"path\">workspace-relative path</parameter>",
+      "</tool_use>",
+      input.retryCount > 1 ? "This is a repeated protocol miss. Do not summarize or sign off without tool evidence." : "",
+    ].filter(Boolean).join("\n");
+  }
+
+  return [
+    "上一条 Execute 回复只是普通文本，但当前本地 profile 使用 XML 工具协议。普通文字在执行回合里不会变成真实进展。",
+    toolList ? `可用工具包括：${toolList}。` : "",
+    "下一条只能完成以下其一：",
+    "1. 如果任务还能推进，只输出一个合法 XML `<tool_use>` 块，不要包裹解释或总结。",
+    "2. 如果确实被权限、证据或产品选择阻塞，用简短 Markdown 说明阻塞点，并输出 `<user_options>` 选项后停止。",
+    "合法 XML 形状：",
+    "<tool_use>",
+    "<tool>read_file</tool>",
+    "<parameter name=\"path\">相对 workspace 的路径</parameter>",
+    "</tool_use>",
+    input.retryCount > 1 ? "这已经是重复协议偏离。没有工具证据时不要总结或收尾。" : "",
+  ].filter(Boolean).join("\n");
+}
+
 export function buildToolProtocolDoomLoopStopMessage(language: "zh" | "en", toolName?: string | null): string {
   const tool = toolName ? ` ${toolName}` : "";
   return language === "zh"

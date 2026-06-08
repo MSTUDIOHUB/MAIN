@@ -57,11 +57,13 @@ function loadTranspiledModuleSync(sourcePath) {
 }
 
 const {
+  buildExecuteXmlTextActionRecoveryPrompt,
   buildPseudoToolCallRecoveryPrompt,
   extractPseudoToolCallName,
   looksLikeNonStandardToolCallFormat,
   looksLikePseudoToolCallPlaceholder,
   recoverPseudoToolCallFromContext,
+  shouldRecoverExecuteXmlTextWithoutAction,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"));
 
 test("detects bracketed pseudo tool call placeholders", () => {
@@ -97,6 +99,58 @@ test("pseudo tool recovery prompt requires XML tool_use with parameters", () => 
   assert.match(prompt, /<tool_use>/);
   assert.match(prompt, /<parameter name="path">/);
   assert.match(prompt, /不要再输出 `\[Tool call: \.\.\.\]`、`<tool_code>/);
+});
+
+test("XML execute text recovery catches no-evidence plain text stops", () => {
+  assert.equal(shouldRecoverExecuteXmlTextWithoutAction({
+    workflowMode: "edit",
+    turnIntent: "execute",
+    runtimeIntent: "execute",
+    forceXmlTools: true,
+    availableToolCount: 8,
+    toolCallCount: 0,
+    replyOptionCount: 0,
+    sawExecuteOperationEvidence: false,
+    visibleText: "我会先检查配置文件，然后继续修复。",
+  }), true);
+
+  assert.equal(shouldRecoverExecuteXmlTextWithoutAction({
+    workflowMode: "edit",
+    turnIntent: "execute",
+    runtimeIntent: "execute",
+    forceXmlTools: true,
+    availableToolCount: 8,
+    toolCallCount: 0,
+    replyOptionCount: 0,
+    sawExecuteOperationEvidence: true,
+    visibleText: "验证命令已经通过，修改完成。",
+  }), false);
+
+  assert.equal(shouldRecoverExecuteXmlTextWithoutAction({
+    workflowMode: "edit",
+    turnIntent: "execute",
+    runtimeIntent: "execute",
+    forceXmlTools: false,
+    availableToolCount: 8,
+    toolCallCount: 0,
+    replyOptionCount: 0,
+    sawExecuteOperationEvidence: false,
+    visibleText: "我会先检查配置文件。",
+  }), false);
+});
+
+test("XML execute text recovery prompt forces a canonical tool or user choice", () => {
+  const prompt = buildExecuteXmlTextActionRecoveryPrompt({
+    language: "zh",
+    retryCount: 1,
+    availableTools: ["read_file", "replace_in_file", "run_command"],
+  });
+
+  assert.match(prompt, /XML 工具协议/);
+  assert.match(prompt, /read_file, replace_in_file, run_command/);
+  assert.match(prompt, /<tool_use>/);
+  assert.match(prompt, /<user_options>/);
+  assert.match(prompt, /不要包裹解释或总结/);
 });
 
 test("recovers pseudo read_file into tabular analysis for a unique @ CSV", () => {
