@@ -18,6 +18,7 @@ import {
   streamChatCompletion,
   escalateMaxTokens,
   computeInitialMaxTokens,
+  type OpenAiToolChoice,
   type StreamSettings,
   type StreamResult,
 } from "./streaming";
@@ -749,6 +750,87 @@ function rememberReadBeforeModifyEvidence(
   }
 }
 
+function rebuildReadBeforeModifyEvidenceFromHistory(
+  sessionKey: string,
+  messages: AgentMessage[],
+): void {
+  const evidence = getSessionReadBeforeModifyEvidence(sessionKey);
+  const toolCallMap = new Map<string, { name: string; path: string }>();
+
+  for (const msg of messages) {
+    if (msg.role === "assistant" && Array.isArray(msg.tool_calls)) {
+      for (const tc of msg.tool_calls) {
+        const call = tc as { id?: string; function?: { name?: string; arguments?: string } };
+        if (call.id && call.function?.name && call.function.arguments) {
+          try {
+            const parsed = JSON.parse(call.function.arguments);
+            const name = call.function.name;
+            let path = "";
+            if (typeof parsed.path === "string") {
+              path = parsed.path.trim();
+            } else if (typeof parsed.TargetFile === "string") {
+              path = parsed.TargetFile.trim();
+            }
+            if (path) {
+              toolCallMap.set(call.id, { name, path });
+            }
+          } catch {
+            // Ignore JSON parsing issues
+          }
+        }
+      }
+    }
+  }
+
+  for (const msg of messages) {
+    if (msg.role === "tool" && msg.tool_call_id) {
+      const callInfo = toolCallMap.get(msg.tool_call_id);
+      if (callInfo) {
+        const name = callInfo.name;
+        const path = callInfo.path;
+        const text = getMessageContentText(msg.content);
+        const isError =
+          text.startsWith("Error:") ||
+          text.startsWith("system_error:") ||
+          text.startsWith("TASK_TARGETING_BLOCKED:") ||
+          text.startsWith("PLAN_GROUNDING_TOOL_BLOCKED:") ||
+          text.startsWith("PLAN_DRAFTING_TOOL_BLOCKED:") ||
+          text.startsWith("PLAN_EXPLORE_STRUCTURE_TOOL_BLOCKED:") ||
+          text.startsWith("READ_FILE_NOT_AVAILABLE_IN_RECOVERY:");
+        const isPruned =
+          text.includes("Historical read content") &&
+          text.includes("removed");
+
+        if (!isError || isPruned) {
+          if (name === "read_file" || name === "get_file_outline" || name === "read_document") {
+            evidence.add(`file:${normalizeEvidencePath(path)}`);
+          } else if (name === "list_directory") {
+            evidence.add(`dir:${normalizeEvidencePath(path) || "."}`);
+          } else if (
+            name === "get_project_skeleton" ||
+            name === "glob_search" ||
+            name === "grep_search" ||
+            name.startsWith("repo_map_")
+          ) {
+            evidence.add("workspace:structure");
+            if (name === "grep_search") {
+              const fileMatches = text.matchAll(
+                /(?:^|\n)\s*([^\n:]+?\.(?:ts|tsx|js|jsx|rs|py|go|css|scss|html|json|md|toml|yaml|yml|cs|cpp|c|h|hpp|java|kt|swift|vue|svelte))(?::\d+)?(?::|\s|$)/gi
+              );
+              for (const match of fileMatches) {
+                const filePath = String(match[1] || "").trim();
+                if (filePath && !filePath.includes(" ")) {
+                  evidence.add(`file:${normalizeEvidencePath(filePath)}`);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
 export async function buildReadBeforeModifyValidationError(
   tc: ToolCallToExecute,
   args: Record<string, unknown>,
@@ -760,6 +842,9 @@ export async function buildReadBeforeModifyValidationError(
   if (runtimeIntent !== "execute" && runtimeIntent !== "studio_workflow" && !callbacks.getIsPlanApproved()) {
     return null;
   }
+
+  const messages = callbacks.getMessages();
+  rebuildReadBeforeModifyEvidenceFromHistory(callbacks.getSessionKey(), messages);
 
   const path = typeof args.path === "string" ? args.path : "";
   if (!path || isPlanArtifactPath(path)) return null;
@@ -1768,18 +1853,18 @@ function buildExecuteConvergencePrompt(language: "zh" | "en", iteration: number,
   return language === "zh"
     ? [
         `本轮 Execute 已进行 ${iteration}/${maxIterations} 轮工具循环，接近安全边界。`,
-        "MAIN 会临时收窄工具面：宽泛读取会被收起，只保留写入、命令、浏览器验证和少量定向定位工具。",
+        "MAIN 会临时收窄工具面：宽泛读取和搜索都会被收起，只保留小补丁/写入工具以及有限命令或浏览器验证。",
         "请先根据已有工具结果判断任务是否已经完成：如果完成，直接输出最终总结并停止，不要再调用工具。",
         "如果 read_file 当前不可用，不要继续请求 read_file，也不要改用 cat/sed/head/tail 通过 shell 读取文件。",
-        "如果 grep_search/get_file_outline 已经给出足够定位信息，请直接用 replace_in_file/apply_patch 做最小修改，或运行一次验证命令；否则只调用一个最小必要的定位工具。",
+        "如果 grep_search/get_file_outline 已经给出足够定位信息，请直接用 replace_in_file/apply_patch 做最小修改，或运行一次验证命令；不要再调用新的搜索/泛读工具。",
         "不要重复读取、重复验证或继续改同一个目标而没有新证据。",
       ].join("\n")
     : [
         `This Execute turn has reached ${iteration}/${maxIterations} tool-loop iterations and is approaching the safety boundary.`,
-        "MAIN will temporarily narrow the tool surface: broad reads are withheld, leaving write, command, browser validation, and lightweight targeting tools.",
+        "MAIN will temporarily narrow the tool surface: broad reads and searches are withheld, leaving small patch/write tools plus finite command or browser validation.",
         "First decide from existing tool results whether the task is already complete. If it is complete, output the final summary and stop without more tools.",
         "If read_file is unavailable, do not keep requesting read_file and do not switch to cat/sed/head/tail shell file reads.",
-        "If grep_search/get_file_outline already provide enough location context, directly apply the smallest replace_in_file/apply_patch edit or run one validation command; otherwise call exactly one smallest necessary targeting tool.",
+        "If grep_search/get_file_outline already provide enough location context, directly apply the smallest replace_in_file/apply_patch edit or run one validation command; do not call new search or broad read tools.",
         "Do not repeat reads, repeat validation, or keep editing the same target without new evidence.",
     ].join("\n");
 }
@@ -2453,6 +2538,7 @@ const PLAN_NO_VISIBLE_TOKEN_TIMEOUT_MS = 125_000;
 interface FetchLLMStreamOptions {
   noVisibleTokenTimeoutMs?: number;
   noVisibleTokenTimeoutLabel?: string;
+  toolChoice?: OpenAiToolChoice;
   workflowMode?: string;
   runtimeIntent?: string;
 }
@@ -2713,6 +2799,9 @@ async function fetchLLMStream(
           requestAbortController.signal,
           allTools,
           currentMaxTokens,
+          {
+            toolChoice: options.toolChoice,
+          },
         ).catch((err) => {
           safeReject(err instanceof Error ? err : new Error(getErrorMessage(err, "LLM stream failed")));
         });
@@ -5199,7 +5288,7 @@ export async function executeAgentLoop(
   let planPostConvergenceToolRedirectCount = 0;
   let planRuntimePhase: PlanRuntimePhase = workflowMode === "plan" && !callbacks.getIsPlanApproved()
     ? "explore_structure"
-    : "drafting";
+    : "grounding";
   let planQualityRejectCount = 0;
   let planLastQualityGateReason = "";
   let planLastMissingSections: string[] = [];
@@ -6192,6 +6281,10 @@ export async function executeAgentLoop(
         usedChatFinalSynthesisPrompt = true;
       }
       const streamWatchdogOptions = getPlanStreamWatchdogOptions(llmTools.length) ?? {};
+      const recoveryToolChoice: OpenAiToolChoice | undefined =
+        isExecuteRecoveryEligible && executeRecoveryMode !== "normal" && llmTools.length > 0 && !forceXmlTools
+          ? "required"
+          : undefined;
       logAgentEvent("llm_request_shape", {
         iteration,
         workflowMode,
@@ -6221,6 +6314,7 @@ export async function executeAgentLoop(
         managedMessages: summarizeMessagesForDiagnostics(managedAgentMessages),
         allTools: summarizeToolsForDiagnostics(iterationAllTools),
         llmTools: summarizeToolsForDiagnostics(llmTools),
+        toolChoice: recoveryToolChoice ?? null,
         watchdog: {
           hardTimeoutMs: streamWatchdogOptions.noVisibleTokenTimeoutMs ?? null,
           label: streamWatchdogOptions.noVisibleTokenTimeoutLabel ?? null,
@@ -6242,6 +6336,7 @@ export async function executeAgentLoop(
         maxOutputEscalations,
         {
           ...streamWatchdogOptions,
+          toolChoice: recoveryToolChoice,
           workflowMode,
           runtimeIntent,
         },
@@ -6937,11 +7032,11 @@ export async function executeAgentLoop(
         approvedPlanActionOnlyRecoveryActive = true;
         logAgentEvent("approved_plan_reasoning_recovery_tool_surface", {
           iteration,
-          recoveryToolSurface: "action_plus_targeting_reads",
+          recoveryToolSurface: "approved_plan_action_only",
           allowFileRead: false,
         });
       } else if (workflowMode === "edit" && resolveRuntimeIntent() === "execute") {
-        activateExecuteRecovery("action_plus_targeting", "reasoning_dominated_recovery", {
+        activateExecuteRecovery("mutation_first", "reasoning_dominated_recovery", {
           consecutiveReasoningDominatedCount,
           contentChars: streamResult.content.length,
           reasoningChars: String(streamResult.reasoningContent || "").length,
@@ -10203,7 +10298,7 @@ export async function executeAgentLoop(
       if (executeRecoveryAttempts < 2) {
         const nextMode: Exclude<ExecuteRecoveryMode, "normal"> = allowFileRead
           ? "patch_recovery_read"
-          : "action_plus_targeting";
+          : "mutation_first";
         activateExecuteRecovery(nextMode, executeReadOnlyRecovery.reason, {
           readOnlyActivityCount: executeReadOnlyRecovery.readOnlyActivityCount,
           batchToolChars: executeReadOnlyRecovery.batchToolChars,
@@ -11011,7 +11106,7 @@ export async function executeAgentLoop(
             role: "system",
             content: `[System: ${recoveryMessage}]`,
           });
-          appendExecuteTargetRecoveryPrompt("action_plus_targeting", "target_progress_no_diff_chain");
+          appendExecuteTargetRecoveryPrompt("mutation_first", "target_progress_no_diff_chain");
           recoveredTargetProgressLoop = true;
           break;
         }
@@ -11059,7 +11154,7 @@ export async function executeAgentLoop(
         executeRecoveryMode,
       });
       if (workflowMode === "edit" && runtimeIntent === "execute") {
-        activateExecuteRecovery("action_plus_targeting", "execute_convergence_prompt", {
+        activateExecuteRecovery("mutation_first", "execute_convergence_prompt", {
           maxIterations: effectiveMaxIterations,
           recentToolActivity: recentToolActivity.length,
         });

@@ -590,6 +590,9 @@ export function buildContextMemoryState(
 
     if (isContextMemoryText(text)) {
       const carryover = extractCarryoverFromContextText(text, index, updatedAt);
+      if (carryover.latestUserRequest) {
+        collected.latestUserRequest = carryover.latestUserRequest;
+      }
       collected.goals.push(...(carryover.goals || []));
       collected.constraints.push(...(carryover.constraints || []));
       collected.decisions.push(...(carryover.decisions || []));

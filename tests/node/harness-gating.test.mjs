@@ -346,3 +346,60 @@ test("buildReadBeforeModifyValidationError blocks write_file when file exists an
   assert.ok(okSmall);
   assert.match(okSmall.content, /READ_BEFORE_MODIFY_BLOCKED/);
 });
+
+test("buildReadBeforeModifyValidationError recovers read evidence from message history", async () => {
+  globalThis.mockIpcInvoke = async (cmd, args) => {
+    if (cmd === "get_file_metadata" && args.path === "src/Chart.tsx") {
+      return { path: "src/Chart.tsx", sizeBytes: 1000, modifiedMs: 123456 };
+    }
+    return {};
+  };
+
+  const tc = { id: "call_write", name: "write_file" };
+  const readCall = {
+    id: "call_read_1",
+    function: {
+      name: "read_file",
+      arguments: JSON.stringify({ path: "src/Chart.tsx" }),
+    },
+  };
+
+  // 1. With actual read success content
+  const messagesWithContent = [
+    { role: "assistant", tool_calls: [readCall] },
+    { role: "tool", tool_call_id: "call_read_1", content: "some file content" },
+  ];
+  const callbacksWithContent = createMockCallbacks({
+    messages: messagesWithContent,
+    getSessionKey: () => "mock-session-content",
+  });
+  const resultWithContent = await buildReadBeforeModifyValidationError(tc, { path: "src/Chart.tsx" }, ".", callbacksWithContent);
+  assert.equal(resultWithContent, null); // Allowed
+
+  // 2. With pruned activeMemoryReclamation read stub
+  const messagesPruned = [
+    { role: "assistant", tool_calls: [readCall] },
+    { role: "tool", tool_call_id: "call_read_1", content: "[System: Historical read content of src/Chart.tsx removed; file was successfully mutated in a later turn]" },
+  ];
+  const callbacksPruned = createMockCallbacks({
+    messages: messagesPruned,
+    getSessionKey: () => "mock-session-pruned",
+  });
+  const resultPruned = await buildReadBeforeModifyValidationError(tc, { path: "src/Chart.tsx" }, ".", callbacksPruned);
+  assert.equal(resultPruned, null); // Allowed
+
+  // 3. With failed read
+  const messagesFailed = [
+    { role: "assistant", tool_calls: [readCall] },
+    { role: "tool", tool_call_id: "call_read_1", content: "Error: READ_FILE_NOT_AVAILABLE_IN_RECOVERY" },
+  ];
+  const callbacksFailed = createMockCallbacks({
+    messages: messagesFailed,
+    getSessionKey: () => "mock-session-failed",
+  });
+  const resultFailed = await buildReadBeforeModifyValidationError(tc, { path: "src/Chart.tsx" }, ".", callbacksFailed);
+  assert.ok(resultFailed);
+  assert.match(resultFailed.content, /READ_BEFORE_MODIFY_BLOCKED/);
+});
+
+

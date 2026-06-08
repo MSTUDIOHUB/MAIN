@@ -405,6 +405,72 @@ test("OpenAI-compatible history keeps tool call arguments as JSON strings", asyn
   assert.equal(bodies[0].messages[2].tool_calls[0].function.arguments, "{\"path\":\".\"}");
 });
 
+test("OpenAI-compatible Rust proxy attaches required tool_choice when requested", async () => {
+  const listeners = new Map();
+  const bodies = [];
+  const listenMock = async (eventName, handler) => {
+    listeners.set(eventName, handler);
+    return () => listeners.delete(eventName);
+  };
+  const { streamChatCompletion } = await loadStreamingModule(async (command, args) => {
+    assert.equal(command, "start_chat_stream");
+    bodies.push(JSON.parse(args.body));
+    const streamId = args.streamId;
+    queueMicrotask(() => {
+      listeners.get("chat-stream-chunk")?.({
+        payload: {
+          stream_id: streamId,
+          chunk: `data: ${JSON.stringify({ choices: [{ delta: { content: "ok" }, finish_reason: "stop" }] })}\n\n`,
+        },
+      });
+      listeners.get("chat-stream-done")?.({
+        payload: {
+          stream_id: streamId,
+          status: "success",
+        },
+      });
+    });
+    return undefined;
+  }, listenMock);
+
+  const result = await streamChatCompletion(
+    [{ role: "user", content: "请直接修改文件" }],
+    {
+      baseUrl: "http://127.0.0.1:8000/v1",
+      apiKey: "local",
+      model: "Qwen-local",
+      apiProtocol: "openai",
+      apiFormat: "chat_completions",
+      provider: "OMLX",
+      useRustProxy: true,
+    },
+    {
+      onToken: () => {},
+      onDone: () => {},
+      onError: (error) => { throw error; },
+    },
+    undefined,
+    [{
+      type: "function",
+      function: {
+        name: "apply_patch",
+        description: "Apply a patch",
+        parameters: {
+          type: "object",
+          properties: { patch: { type: "string" } },
+          required: ["patch"],
+        },
+      },
+    }],
+    4096,
+    { toolChoice: "required" },
+  );
+
+  assert.equal(result.content, "ok");
+  assert.equal(bodies[0].tool_choice, "required");
+  assert.equal(bodies[0].tools[0].function.name, "apply_patch");
+});
+
 test("local Rust stream read errors fall back to a non-streaming request", async () => {
   const listeners = new Map();
   const invokeCalls = [];

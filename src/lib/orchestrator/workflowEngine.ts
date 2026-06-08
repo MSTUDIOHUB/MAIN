@@ -32,7 +32,8 @@ import {
   logStoreEvent
 } from "../../store/useAppStore";
 import { appendDebugLog } from "../debugLog";
-import { type PlanExecutionProgressPhase, type PlanExecutionProgressUpdate, getPlanArtifactTitle, extractPlanTasks, isEphemeralPlanArtifactPath } from "../workflowModels";
+import { type PlanExecutionProgressPhase, type PlanExecutionProgressUpdate, getPlanArtifactTitle, extractPlanTasks, isEphemeralPlanArtifactPath, reconcilePlanTaskCompletion } from "../workflowModels";
+import { createPlanExecutionEvidenceEntry, appendPlanEvidenceEntry } from "../planEvidence";
 import type { HarnessRunMarker } from "../harnessCrashTelemetry";
 import { runAfterNextPaint } from "../uiScheduling";
 import { supportsToolDiffPreview } from "../toolDiff";
@@ -40,6 +41,7 @@ import { findToolLifecycleBlockIndex, type ToolLifecycleMeta } from "../toolLife
 import { deriveToolIntentSummary } from "../toolPresentation";
 import { buildToolProgressNarration, summarizeToolObservation } from "../progressNarration";
 import { deriveTurnRuntimePhaseForTool, withTurnRuntimePhaseStatus } from "../turnPhase";
+
 
 export interface WorkflowContext {
   // Constants & Parameters
@@ -997,7 +999,7 @@ export class WorkflowEngine {
             conversationTurns,
             agentStatus: s.agentStatus === "pending_review" ? "pending_review" : "idle",
             isGenerating: false,
-            abortController: null,
+            ...(s.agentStatus === "pending_review" ? {} : { abortController: null }),
           };
         });
       },
@@ -1128,6 +1130,12 @@ export class WorkflowEngine {
         const resultText = String(result || "");
         const completedDiff = shouldAttachToolDiffPreview(toolName, target, meta?.diff) ? meta?.diff : undefined;
         const noOp = isNoOpToolResult(resultText);
+        const entry = createPlanExecutionEvidenceEntry({
+          toolName,
+          target,
+          result: resultText,
+          noOp,
+        });
         const observationSummary = summarizeToolObservation({
           toolName,
           target,
@@ -1168,7 +1176,22 @@ export class WorkflowEngine {
             lifecycleMeta,
           );
           if (existingIndex < 0) return {};
+
+          const nextLedger = appendPlanEvidenceEntry(s.planExecutionEvidenceLedger || [], entry);
+          const nextTasks = reconcilePlanTaskCompletion(
+            s.planTasks || [],
+            s.planTasks || [],
+            nextLedger,
+            {
+              preserveMissing: s.isPlanApproved || s.planStage === "executing" || s.planStage === "completed" || s.planTasks.length > 0,
+              highlightNext: s.isPlanApproved && nextLedger.length > 0,
+            }
+          );
+
           return {
+            planExecutionEvidenceLedger: nextLedger,
+            planExecutionEvidenceCount: nextLedger.length,
+            planTasks: nextTasks,
             taskFlow: s.taskFlow.map((block: any, index: number) => {
               if (index !== existingIndex) return block;
               const completedPhase = withTurnRuntimePhaseStatus(

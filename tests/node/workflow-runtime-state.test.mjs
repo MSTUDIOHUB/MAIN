@@ -62,3 +62,21 @@ test("chat rendering keeps substantive intermediate conclusions out of process a
   assert.match(source, /!hasSubstantiveIntermediateAgentText/);
   assert.match(source, /阶段性\|结论\|总结\|问题\|原因\|根因\|修复\|方案\|验证/);
 });
+
+test("onStreamDone preserves abortController when agentStatus is pending_review", () => {
+  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"), "utf8");
+
+  assert.match(
+    source,
+    /\.\.\.\(s\.agentStatus === "pending_review" \? \{\} : \{ abortController: null \}\)/
+  );
+});
+
+test("onToolDone populates planExecutionEvidenceLedger and reconciles planTasks", () => {
+  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"), "utf8");
+
+  assert.match(source, /createPlanExecutionEvidenceEntry/);
+  assert.match(source, /appendPlanEvidenceEntry/);
+  assert.match(source, /reconcilePlanTaskCompletion/);
+});
+

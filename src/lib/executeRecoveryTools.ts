@@ -1,5 +1,6 @@
 export type ExecuteRecoveryMode =
   | "normal"
+  | "mutation_first"
   | "action_plus_targeting"
   | "patch_recovery_read"
   | "validation_only"
@@ -46,8 +47,20 @@ export const EXECUTE_RECOVERY_VALIDATION_TOOLS = new Set([
   "clear_pty_buffer",
 ]);
 
+export const EXECUTE_RECOVERY_MUTATION_TOOLS = new Set([
+  "apply_patch",
+  "replace_in_file",
+  "write_file",
+]);
+
+export const EXECUTE_RECOVERY_MUTATION_FIRST_TOOLS = new Set([
+  ...EXECUTE_RECOVERY_MUTATION_TOOLS,
+  ...EXECUTE_RECOVERY_VALIDATION_TOOLS,
+]);
+
 export function normalizeExecuteRecoveryMode(value: unknown): ExecuteRecoveryMode {
-  return value === "action_plus_targeting" ||
+  return value === "mutation_first" ||
+    value === "action_plus_targeting" ||
     value === "patch_recovery_read" ||
     value === "validation_only" ||
     value === "action_only" ||
@@ -94,13 +107,18 @@ export function isExecuteRecoveryToolName(
   const mode = normalizeExecuteRecoveryMode(options.mode);
   if (mode === "normal") return true;
   if (mode === "validation_only") return EXECUTE_RECOVERY_VALIDATION_TOOLS.has(name);
+  if (mode === "mutation_first") {
+    return EXECUTE_RECOVERY_MUTATION_FIRST_TOOLS.has(name) ||
+      Boolean(options.allowFileRead && EXECUTE_RECOVERY_PATCH_READ_TOOLS.has(name));
+  }
+  if (mode === "patch_recovery_read") {
+    return EXECUTE_RECOVERY_MUTATION_FIRST_TOOLS.has(name) ||
+      EXECUTE_RECOVERY_PATCH_READ_TOOLS.has(name);
+  }
   if (!readOnlyTools.has(name)) return true;
   if (mode === "action_only") return false;
   if (mode === "action_plus_targeting" && EXECUTE_RECOVERY_TARGETING_TOOLS.has(name)) return true;
-  return Boolean(
-    (mode === "patch_recovery_read" || options.allowFileRead) &&
-    EXECUTE_RECOVERY_PATCH_READ_TOOLS.has(name)
-  );
+  return Boolean(options.allowFileRead && EXECUTE_RECOVERY_PATCH_READ_TOOLS.has(name));
 }
 
 export function describeExecuteRecoveryToolSurface(
@@ -111,6 +129,9 @@ export function describeExecuteRecoveryToolSurface(
   if (normalized === "normal") return "normal";
   if (normalized === "validation_only") return "validation_only";
   if (normalized === "action_only") return "action_only";
+  if (normalized === "mutation_first") {
+    return allowFileRead ? "mutation_first_plus_patch_file_read" : "mutation_first";
+  }
   if (normalized === "patch_recovery_read" || allowFileRead) return "action_plus_patch_file_read";
   return "action_plus_targeting";
 }
@@ -243,6 +264,7 @@ export function buildExecuteRecoveryPrompt(input: {
         : input.allowFileRead
         ? "A targeted `read_file` is available to repair exact-content or patch mismatch problems; after that, patch, run a finite command, use browser validation, or state the exact blocker."
         : "No `read_file` is available in this recovery step. Reuse cached context and take the next concrete action: `apply_patch`/`replace_in_file`/`write_file`, run a finite command, use browser validation, or state the exact blocker. If grep_search already returned a line containing the failing code, treat that line as enough context for a minimal exact replacement.",
+      "For edits, call exactly one small Codex-style patch transaction: prefer `apply_patch`, touch only the minimal file(s), and keep the patch to 1-3 focused hunks. Do not paste source code or full files into chat Markdown.",
       "Do not start a new broad scan, do not reread the same files, do not use cat/sed/head/tail shell file reads as a workaround, and do not output another plan instead of action.",
     ].filter(Boolean).join("\n");
   }
@@ -260,6 +282,7 @@ export function buildExecuteRecoveryPrompt(input: {
       : input.allowFileRead
       ? "现在可使用定向 `read_file` 来修复精确内容或 patch mismatch；随后必须改为写入、运行有限命令、浏览器验证，或说明精确阻塞。"
       : "这个恢复步骤不再开放 `read_file`。请复用已缓存上下文，执行下一个具体动作：`apply_patch` / `replace_in_file` / `write_file`、运行有限命令、浏览器验证，或说明精确阻塞。如果 grep_search 已经返回包含失败代码的行，把该行视为最小精确替换的足够上下文。",
+    "编辑时必须调用一次小型 Codex-style patch 事务：优先 `apply_patch`，只触碰最小必要文件，patch 控制在 1-3 个聚焦 hunk 内。不要把源码或完整文件粘贴到聊天 Markdown。",
     "不要开启新一轮泛读，不要重复读取同一批文件，不要用 cat/sed/head/tail shell 读文件绕行，也不要用新的方案文档替代执行动作。",
   ].filter(Boolean).join("\n");
 }

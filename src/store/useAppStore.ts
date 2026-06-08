@@ -6144,6 +6144,9 @@ export const useAppStore = create<AppState>()(
   approvePlan: (approvalChoice) =>
     (() => {
       const state = get();
+      if (state.isPlanApproved) {
+        return;
+      }
       const normalizedApprovalChoice = normalizePlanApprovalChoice(approvalChoice);
       const language = state.config.language === "en" ? "en" : "zh";
       const executionPlanTasks = ensureApprovedPlanRuntimeTasksForState(state, language);

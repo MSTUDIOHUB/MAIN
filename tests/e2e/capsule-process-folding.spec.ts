@@ -41,3 +41,34 @@ test("capsule progress fallback never shows idle waiting copy", async ({ page })
   expect(capsuleText.trim().length).toBeGreaterThan(0);
   await expect(page.getByTestId("turn-activity-notice")).toHaveCount(0);
 });
+
+test("turn process timeline stays inside its frame in a narrow viewport", async ({ page }) => {
+  await page.setViewportSize({ width: 760, height: 720 });
+  await page.goto("/?e2eScenario=capsule-model-explanation");
+
+  const timeline = page.getByTestId("live-turn-process-timeline");
+  await expect(timeline).toBeVisible();
+  await page.getByTestId("live-turn-process-toggle").click();
+  await expect(page.getByTestId("live-turn-step")).toHaveCount(3);
+
+  const overflowing = await page.evaluate(() => {
+    const selector = [
+      '[data-testid="live-turn-process-timeline"]',
+      '[data-testid="live-turn-process-toggle"]',
+      '[data-testid="live-turn-process-details"]',
+      '[data-testid="live-turn-step"]',
+      '[data-testid="turn-archive-step-toggle"]',
+      '[data-testid="turn-archive-step-details"]',
+    ].join(",");
+    return Array.from(document.querySelectorAll<HTMLElement>(selector))
+      .map((element) => ({
+        testId: element.getAttribute("data-testid"),
+        scrollWidth: element.scrollWidth,
+        clientWidth: element.clientWidth,
+        text: (element.textContent || "").replace(/\s+/g, " ").trim().slice(0, 120),
+      }))
+      .filter((entry) => entry.scrollWidth - entry.clientWidth > 2);
+  });
+
+  expect(overflowing).toEqual([]);
+});

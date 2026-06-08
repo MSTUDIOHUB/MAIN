@@ -96,7 +96,7 @@ const readOnlyTools = new Set([
   "get_pty_status",
 ]);
 
-test("execute recovery tool surface removes broad reads but keeps action and targeting tools", () => {
+test("execute recovery mutation-first surface removes broad reads and search tools", () => {
   const names = [
     "list_directory",
     "glob_search",
@@ -115,12 +115,10 @@ test("execute recovery tool surface removes broad reads but keeps action and tar
     "get_pty_status",
   ];
   const scoped = names.filter((name) => isExecuteRecoveryToolName(name, readOnlyTools, {
-    mode: "action_plus_targeting",
+    mode: "mutation_first",
   }));
 
   assert.deepEqual(scoped, [
-    "grep_search",
-    "get_file_outline",
     "apply_patch",
     "replace_in_file",
     "write_file",
@@ -130,7 +128,16 @@ test("execute recovery tool surface removes broad reads but keeps action and tar
     "send_pty_input",
     "get_pty_status",
   ]);
-  assert.equal(describeExecuteRecoveryToolSurface("action_plus_targeting"), "action_plus_targeting");
+  assert.equal(describeExecuteRecoveryToolSurface("mutation_first"), "mutation_first");
+  assert.equal(describeExecuteRecoveryToolSurface("mutation_first", true), "mutation_first_plus_patch_file_read");
+  assert.equal(isExecuteRecoveryToolName("read_file", readOnlyTools, {
+    mode: "mutation_first",
+    allowFileRead: true,
+  }), true);
+  assert.equal(isExecuteRecoveryToolName("grep_search", readOnlyTools, {
+    mode: "mutation_first",
+    allowFileRead: true,
+  }), false);
 });
 
 test("repeat-edit validation recovery exposes only validation tools and forbids more edits", () => {
@@ -232,12 +239,14 @@ test("read-only budget triggers execute recovery before max iterations", () => {
   const prompt = buildExecuteRecoveryPrompt({
     language: "zh",
     reason: decision.reason,
-    mode: "action_plus_targeting",
+    mode: "mutation_first",
     repeatedTargets: summarizeRepeatedExecuteTargets(recent),
     recentActivity: recent,
   });
   assert.match(prompt, /不再开放 `read_file`/);
   assert.match(prompt, /apply_patch|write_file|replace_in_file/);
+  assert.match(prompt, /小型 Codex-style patch 事务/);
+  assert.match(prompt, /不要把源码或完整文件粘贴到聊天 Markdown/);
 });
 
 test("chat read-only no-progress is eligible for final synthesis before max iterations", () => {
@@ -473,7 +482,8 @@ test("orchestrator wires execute convergence and max-iteration recovery before i
   assert.match(source, /execute_recovery_context_compacted/);
   assert.match(source, /isExecuteRecoveryEligible && contextForceForManagement\?\.shouldForce/);
   assert.match(source, /execute_recovery_context_skipped/);
-  assert.match(source, /activateExecuteRecovery\("action_plus_targeting", "execute_convergence_prompt"/);
+  assert.match(source, /activateExecuteRecovery\("mutation_first", "execute_convergence_prompt"/);
+  assert.match(source, /const recoveryToolChoice:[\s\S]*toolChoice: recoveryToolChoice/);
   assert.match(source, /executeRecoveryAttempts \+= 1/);
   assert.doesNotMatch(source, /executeRecoveryReason !== reason/);
   assert.match(source, /resolveAgentLoopMaxIterations/);
@@ -527,4 +537,3 @@ test("targeting search recovery opens read_file path to see context", () => {
   ];
   assert.equal(shouldAllowExecuteRecoveryFileRead(recent), true);
 });
-

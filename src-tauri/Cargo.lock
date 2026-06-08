@@ -4511,7 +4511,7 @@ dependencies = [
 
 [[package]]
 name = "tauri-app"
-version = "2.2.6"
+version = "2.2.7"
 dependencies = [
  "base64 0.22.1",
  "futures-util",

@@ -1210,7 +1210,7 @@ function ReadContextGroupCard({
         data-testid="read-context-group"
         aria-expanded={expanded}
         onClick={() => setExpanded((value) => !value)}
-        className="flex w-full min-w-0 items-center gap-2 rounded-xl border border-[#1f2937] bg-[#07070a] px-3 py-2 text-left transition-colors hover:border-[#374151] hover:bg-[#09090b]"
+        className="flex w-full min-w-0 flex-wrap items-start gap-2 rounded-xl border border-[#1f2937] bg-[#07070a] px-3 py-2 text-left transition-colors hover:border-[#374151] hover:bg-[#09090b]"
       >
         {expanded ? (
           <IconChevronDown className="h-3.5 w-3.5 shrink-0 text-[#71717a]" />
@@ -1218,14 +1218,14 @@ function ReadContextGroupCard({
           <IconChevronRight className="h-3.5 w-3.5 shrink-0 text-[#71717a]" />
         )}
         <IconCheck className="h-3.5 w-3.5 shrink-0 text-[#10b981]" />
-        <span className="shrink-0 text-[12px] font-medium text-[#d4d4d8]">{title}</span>
+        <span className="min-w-0 max-w-full break-words text-[12px] font-medium text-[#d4d4d8]">{title}</span>
         {previewText && (
           <span className="min-w-0 flex-1 truncate text-[11px] text-[#71717a]">
             · {previewText}{hiddenCount > 0 ? ` +${hiddenCount}` : ""}
           </span>
         )}
         {duplicateText && (
-          <span data-testid="read-context-group-dedupe" className="shrink-0 rounded-full border border-[rgba(96,165,250,0.22)] bg-[rgba(37,99,235,0.08)] px-2 py-0.5 text-[10px] text-[#93c5fd]">
+          <span data-testid="read-context-group-dedupe" className="max-w-full whitespace-normal break-words rounded-full border border-[rgba(96,165,250,0.22)] bg-[rgba(37,99,235,0.08)] px-2 py-0.5 text-[10px] text-[#93c5fd]">
             {duplicateText}
           </span>
         )}
@@ -1330,7 +1330,7 @@ function CompletedToolGroupCard({
         data-testid="completed-tool-group"
         aria-expanded={expanded}
         onClick={() => setExpanded((value) => !value)}
-        className="flex w-full min-w-0 items-center gap-2 rounded-xl border border-[#1f2937] bg-[#07070a] px-3 py-2 text-left transition-colors hover:border-[#374151] hover:bg-[#09090b]"
+        className="flex w-full min-w-0 flex-wrap items-start gap-2 rounded-xl border border-[#1f2937] bg-[#07070a] px-3 py-2 text-left transition-colors hover:border-[#374151] hover:bg-[#09090b]"
       >
         {expanded ? (
           <IconChevronDown className="h-3.5 w-3.5 shrink-0 text-[#71717a]" />
@@ -1338,9 +1338,9 @@ function CompletedToolGroupCard({
           <IconChevronRight className="h-3.5 w-3.5 shrink-0 text-[#71717a]" />
         )}
         <IconCheck className="h-3.5 w-3.5 shrink-0 text-[#10b981]" />
-        <span className="shrink-0 text-[12px] font-medium text-[#d4d4d8]">{title}</span>
+        <span className="min-w-0 max-w-full break-words text-[12px] font-medium text-[#d4d4d8]">{title}</span>
         {typeSummary && (
-          <span data-testid="completed-tool-group-type-summary" className="shrink-0 text-[11px] text-[#94a3b8]">
+          <span data-testid="completed-tool-group-type-summary" className="min-w-0 max-w-full break-words text-[11px] text-[#94a3b8]">
             · {typeSummary}
           </span>
         )}
@@ -1439,14 +1439,14 @@ function ChatOperationClusterBlock({
     <div
       data-testid="chat-operation-cluster"
       data-kind={cluster.kind}
-      className="ml-9 max-w-[calc(100%-2.25rem)] min-w-0"
+      className="ml-9 max-w-[calc(100%-2.25rem)] min-w-0 overflow-hidden"
     >
       <button
         type="button"
         data-testid={buttonLegacyTestId}
         aria-expanded={expanded}
         onClick={() => setExpanded((value) => !value)}
-        className="group flex w-full min-w-0 items-center gap-2 rounded-lg px-1.5 py-1.5 text-left transition-colors hover:bg-[color-mix(in_srgb,var(--accent)_6%,transparent)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-transparent"
+        className="group flex w-full min-w-0 flex-wrap items-start gap-2 rounded-lg px-1.5 py-1.5 text-left transition-colors hover:bg-[color-mix(in_srgb,var(--accent)_6%,transparent)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-transparent"
       >
         {expanded ? (
           <IconChevronDown className="h-3.5 w-3.5 shrink-0 text-[var(--surface-text-muted)]" />
@@ -1454,9 +1454,9 @@ function ChatOperationClusterBlock({
           <IconChevronRight className="h-3.5 w-3.5 shrink-0 text-[var(--surface-text-muted)]" />
         )}
         <IconCheck className={`h-3.5 w-3.5 shrink-0 ${toneClass}`} />
-        <span className="shrink-0 text-[13px] font-semibold text-[var(--surface-text)]">{cluster.title}</span>
+        <span className="min-w-0 max-w-full break-words text-[13px] font-semibold text-[var(--surface-text)]">{cluster.title}</span>
         {cluster.countSummary && (
-          <span data-testid="chat-operation-count-summary" className="shrink-0 text-[12px] text-[var(--surface-text-subtle)]">
+          <span data-testid="chat-operation-count-summary" className="min-w-0 max-w-full break-words text-[12px] text-[var(--surface-text-subtle)]">
             · {language === "zh" ? `已探索 ${cluster.countSummary}` : cluster.countSummary}
           </span>
         )}
@@ -1466,11 +1466,11 @@ function ChatOperationClusterBlock({
           </span>
         )}
         {duplicateText && (
-          <span data-testid="read-context-group-dedupe" className="shrink-0 rounded-full border border-[rgba(96,165,250,0.22)] bg-[rgba(37,99,235,0.08)] px-2 py-0.5 text-[10px] text-[#93c5fd]">
+          <span data-testid="read-context-group-dedupe" className="max-w-full whitespace-normal break-words rounded-full border border-[rgba(96,165,250,0.22)] bg-[rgba(37,99,235,0.08)] px-2 py-0.5 text-[10px] text-[#93c5fd]">
             {duplicateText}
           </span>
         )}
-        <span className="shrink-0 rounded-full border border-[var(--surface-border-soft)] px-2 py-0.5 text-[10px] text-[var(--surface-text-muted)]">
+        <span className="max-w-full whitespace-normal break-words rounded-full border border-[var(--surface-border-soft)] px-2 py-0.5 text-[10px] text-[var(--surface-text-muted)]">
           {toggleText}
         </span>
       </button>
@@ -1478,7 +1478,7 @@ function ChatOperationClusterBlock({
       {expanded && (
         <div
           data-testid="chat-operation-cluster-details"
-          className="ml-6 mt-1.5 space-y-1 border-l border-[var(--surface-border-soft)] pl-3"
+          className="ml-6 mt-1.5 min-w-0 max-w-full space-y-1 overflow-hidden border-l border-[var(--surface-border-soft)] pl-3"
         >
           {detailsLegacyTestId && (
             <div data-testid={detailsLegacyTestId} className="space-y-1">
@@ -1491,13 +1491,13 @@ function ChatOperationClusterBlock({
                 >
                   <IconCheck className={`h-3 w-3 ${getOperationClusterTone(item.kind)}`} />
                   <div className="min-w-0">
-                    <div className="flex min-w-0 items-center gap-2">
+                    <div className="flex min-w-0 flex-wrap items-center gap-2">
                       <span className="shrink-0 font-semibold text-[var(--surface-text)]">{item.label}</span>
                       <span className="min-w-0 truncate font-mono text-[var(--surface-text-subtle)]" title={item.target}>
                         {item.displayTarget}
                       </span>
                       {item.count > 1 && (
-                        <span data-testid="read-context-item-repeat" className="shrink-0 rounded-full border border-[var(--surface-border-soft)] px-1.5 py-0.5 text-[9px] text-[#93c5fd]">
+                        <span data-testid="read-context-item-repeat" className="max-w-full whitespace-normal break-words rounded-full border border-[var(--surface-border-soft)] px-1.5 py-0.5 text-[9px] text-[#93c5fd]">
                           x{item.count}{item.cachedCount ? ` / ${item.cachedCount} cached` : ""}
                         </span>
                       )}
@@ -1557,8 +1557,8 @@ function TurnProcessArchive({
     ? language === "zh" ? "收起过程" : "Collapse"
     : language === "zh" ? "展开过程" : "Expand";
   const containerClassName = expanded
-    ? "turn-process-font-scope ml-9 rounded-xl px-1 py-2 ring-1 ring-inset ring-[color-mix(in_srgb,var(--accent-light)_50%,transparent)] transition-all duration-150"
-    : "turn-process-font-scope ml-9 rounded-xl px-1 py-2 ring-1 ring-inset ring-[color-mix(in_srgb,var(--accent-light)_32%,transparent)] transition-all duration-150 hover:ring-[color-mix(in_srgb,var(--accent-light)_44%,transparent)]";
+    ? "turn-process-font-scope ml-9 max-w-[calc(100%-2.25rem)] min-w-0 overflow-hidden rounded-xl px-1 py-2 ring-1 ring-inset ring-[color-mix(in_srgb,var(--accent-light)_50%,transparent)] transition-all duration-150"
+    : "turn-process-font-scope ml-9 max-w-[calc(100%-2.25rem)] min-w-0 overflow-hidden rounded-xl px-1 py-2 ring-1 ring-inset ring-[color-mix(in_srgb,var(--accent-light)_32%,transparent)] transition-all duration-150 hover:ring-[color-mix(in_srgb,var(--accent-light)_44%,transparent)]";
 
   const thoughtSteps = archive.steps.filter((step) => step.kind === "thinking");
   const timelineSteps = archive.steps.filter((step) => step.kind !== "thinking");
@@ -1570,7 +1570,7 @@ function TurnProcessArchive({
         data-testid="turn-process-archive-toggle"
         aria-expanded={expanded}
         onClick={() => setExpanded((value) => !value)}
-        className="flex w-full min-w-0 items-center justify-between gap-3 rounded-lg px-2 py-1.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-transparent"
+        className="flex w-full min-w-0 flex-wrap items-start justify-between gap-3 rounded-lg px-2 py-1.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-transparent"
       >
         <span className="min-w-0 flex-1">
           <span className="flex min-w-0 flex-wrap items-center gap-2">
@@ -1586,7 +1586,7 @@ function TurnProcessArchive({
             {archive.summaryText || fallbackSummary}{previewText ? ` · ${previewText}` : ""}
           </span>
         </span>
-        <span className="inline-flex shrink-0 items-center gap-1.5 px-1 py-1 text-[10px] text-[var(--surface-text-muted)]">
+        <span className="inline-flex max-w-full items-center gap-1.5 px-1 py-1 text-[10px] text-[var(--surface-text-muted)]">
           {expanded ? <IconChevronDown className="h-3.5 w-3.5" /> : <IconChevronRight className="h-3.5 w-3.5" />}
           {toggleText}
         </span>
@@ -1715,7 +1715,7 @@ function renderCompactMarkdownInline(text: string, keyPrefix: string): React.Rea
       );
     } else if (token.startsWith("`") && token.endsWith("`")) {
       nodes.push(
-        <code key={`${keyPrefix}-code-${index}`} className="rounded border border-[var(--surface-border-soft)] bg-[color-mix(in_srgb,var(--accent)_10%,transparent)] px-1 py-[1px] font-mono text-[0.92em] text-[var(--surface-text)]">
+        <code key={`${keyPrefix}-code-${index}`} className="max-w-full whitespace-normal break-all rounded border border-[var(--surface-border-soft)] bg-[color-mix(in_srgb,var(--accent)_10%,transparent)] px-1 py-[1px] font-mono text-[0.92em] text-[var(--surface-text)]">
           {token.slice(1, -1)}
         </code>,
       );
@@ -1812,7 +1812,7 @@ function TurnArchiveStepCard({
         </span>
       </span>
       {canExpandDetails && (
-        <span className="inline-flex shrink-0 items-center gap-1.5 px-1 py-1 text-[10px] text-[var(--surface-text-muted)] transition-colors group-hover:text-[var(--surface-text)]">
+        <span className="inline-flex max-w-full items-center gap-1.5 px-1 py-1 text-[10px] text-[var(--surface-text-muted)] transition-colors group-hover:text-[var(--surface-text)]">
           {expanded ? <IconChevronDown className="h-3.5 w-3.5" /> : <IconChevronRight className="h-3.5 w-3.5" />}
           {toggleText}
         </span>
@@ -1825,7 +1825,7 @@ function TurnArchiveStepCard({
       data-testid={isLive ? "live-turn-step" : "turn-archive-step"}
       data-kind={step.kind}
       data-status={step.status}
-      className="border-t border-[var(--surface-border-soft)] py-2 first:border-t-0"
+      className="min-w-0 overflow-hidden border-t border-[var(--surface-border-soft)] py-2 first:border-t-0"
     >
       {canExpandDetails ? (
         <button
@@ -1833,18 +1833,18 @@ function TurnArchiveStepCard({
           data-testid="turn-archive-step-toggle"
           aria-expanded={expanded}
           onClick={() => setExpanded((value) => !value)}
-          className="group flex w-full min-w-0 items-start gap-3 rounded-lg px-1 py-1 text-left transition-colors hover:bg-[color-mix(in_srgb,var(--accent)_6%,transparent)]"
+          className="group flex w-full min-w-0 flex-wrap items-start gap-3 rounded-lg px-1 py-1 text-left transition-colors hover:bg-[color-mix(in_srgb,var(--accent)_6%,transparent)]"
         >
           {headerContent}
         </button>
       ) : (
-        <div className="flex w-full min-w-0 items-start gap-3 rounded-lg px-1 py-1 text-left">
+        <div className="flex w-full min-w-0 flex-wrap items-start gap-3 rounded-lg px-1 py-1 text-left">
           {headerContent}
         </div>
       )}
 
       {canExpandDetails && expanded && (
-        <div data-testid="turn-archive-step-details" className="mt-2 space-y-2 pl-8">
+        <div data-testid="turn-archive-step-details" className="mt-2 min-w-0 max-w-full space-y-2 overflow-hidden pl-6 sm:pl-8">
           {hasChangeSummary ? (
             <TurnChangesCard
               entries={entries}
@@ -1899,7 +1899,7 @@ function LiveTurnProcessTimeline({
   return (
     <div
       data-testid="live-turn-process-timeline"
-      className="turn-process-font-scope ml-9 rounded-xl px-1 py-2 ring-1 ring-inset ring-[color-mix(in_srgb,var(--accent-light)_32%,transparent)] transition-all duration-150"
+      className="turn-process-font-scope ml-9 max-w-[calc(100%-2.25rem)] min-w-0 overflow-hidden rounded-xl px-1 py-2 ring-1 ring-inset ring-[color-mix(in_srgb,var(--accent-light)_32%,transparent)] transition-all duration-150"
       style={getTurnProcessFontStyle(chatFontSize)}
     >
       <button
@@ -1907,7 +1907,7 @@ function LiveTurnProcessTimeline({
         data-testid="live-turn-process-toggle"
         aria-expanded={expanded}
         onClick={() => setExpanded((value) => !value)}
-        className="group flex w-full min-w-0 items-start justify-between gap-3 rounded-lg px-2 py-1 text-left transition-colors hover:bg-[color-mix(in_srgb,var(--accent)_6%,transparent)]"
+        className="group flex w-full min-w-0 flex-wrap items-start justify-between gap-3 rounded-lg px-2 py-1 text-left transition-colors hover:bg-[color-mix(in_srgb,var(--accent)_6%,transparent)]"
       >
         <span className="min-w-0 flex-1">
           <span className="flex min-w-0 flex-wrap items-center gap-2">
@@ -1921,13 +1921,13 @@ function LiveTurnProcessTimeline({
           </span>
           <span className="mt-1 block whitespace-pre-wrap break-words text-[12px] leading-5 text-[var(--surface-text-subtle)]">{summary}</span>
         </span>
-        <span className="inline-flex shrink-0 items-center gap-1.5 px-1 py-1 text-[10px] text-[var(--surface-text-muted)] transition-colors group-hover:text-[var(--surface-text)]">
+        <span className="inline-flex max-w-full items-center gap-1.5 px-1 py-1 text-[10px] text-[var(--surface-text-muted)] transition-colors group-hover:text-[var(--surface-text)]">
           {expanded ? <IconChevronDown className="h-3.5 w-3.5" /> : <IconChevronRight className="h-3.5 w-3.5" />}
           {toggleText}
         </span>
       </button>
       {expanded && (
-        <div data-testid="live-turn-process-details" className="space-y-2 px-2 pt-2">
+        <div data-testid="live-turn-process-details" className="min-w-0 max-w-full space-y-2 overflow-hidden px-2 pt-2">
           {model.steps.map((step) => (
             <TurnArchiveStepCard
               key={step.id}

@@ -6,12 +6,16 @@ export function normalizeSyntheticContinuationText(input: unknown): string {
 
 const SYNTHETIC_PREFIX_PATTERNS: RegExp[] = [
   /^\[System:/i,
+  /^EXECUTE_RECOVERY:/i,
   /^PLAN_[A-Z_]+:/i,
   /^Recovery(?:Details)?:/i,
   /^Repeated read-only tool call skipped:/i,
 ];
 
 const SYNTHETIC_STRONG_PATTERNS: RegExp[] = [
+  /^EXECUTE_RECOVERY:/i,
+  /用户已经批准本轮执行，但上一条回复/i,
+  /The user already approved this execution turn, but the previous response/i,
   /不要询问用户指示[^。\n]{0,40}(?:自己做决定并执行|自行决定并执行)/i,
   /Do not ask the user what to do next/i,
   /Now immediately continue using tools/i,
@@ -23,6 +27,11 @@ const SYNTHETIC_STRONG_PATTERNS: RegExp[] = [
 
 const SYNTHETIC_BODY_PATTERNS: RegExp[] = [
   /上一条回复(?:仍然|是空的|把|只有|语言)/i,
+  /用户已经批准本轮执行，但上一条回复/i,
+  /当前 Execute 回合已经耗尽只读预算/i,
+  /恢复工具面[:：]/i,
+  /Recovery tool surface:/i,
+  /The current Execute turn has spent its read-only budget/i,
   /请继续执行你的计划/i,
   /现在请立即用工具继续执行/i,
   /不要只描述接下来要做什么/i,

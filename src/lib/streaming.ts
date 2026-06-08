@@ -98,6 +98,16 @@ export interface StreamSettings {
   useRustProxy?: boolean; // Route through Rust backend to bypass WebView/CORS transport limits.
 }
 
+export type OpenAiToolChoice =
+  | "auto"
+  | "none"
+  | "required"
+  | { type: "function"; function: { name: string } };
+
+export interface StreamRequestOptions {
+  toolChoice?: OpenAiToolChoice;
+}
+
 /** A tool call accumulated from streaming deltas. */
 export interface StreamedToolCall {
   index: number;
@@ -456,6 +466,31 @@ function shouldSendNativeTools(settings: StreamSettings): boolean {
   return normalizeCloudToolProtocol(settings.toolProtocol) !== "xml";
 }
 
+function shouldAttachOpenAiToolChoice(
+  settings: StreamSettings,
+  tools: ToolDefinition[] | undefined,
+  toolChoice: OpenAiToolChoice | undefined,
+  minimalCompatibilityMode = false,
+): boolean {
+  if (!toolChoice || minimalCompatibilityMode) return false;
+  if (!tools || tools.length === 0) return false;
+  return !isOllamaProvider(settings) &&
+    !isAnthropicProvider(settings) &&
+    !isGeminiProvider(settings) &&
+    shouldSendNativeTools(settings);
+}
+
+function applyOpenAiToolChoice(
+  body: Record<string, unknown>,
+  settings: StreamSettings,
+  tools: ToolDefinition[] | undefined,
+  toolChoice: OpenAiToolChoice | undefined,
+  minimalCompatibilityMode = false,
+): void {
+  if (!shouldAttachOpenAiToolChoice(settings, tools, toolChoice, minimalCompatibilityMode)) return;
+  body.tool_choice = toolChoice;
+}
+
 function isTranscriptCompatibilityRequest(messages: ChatMessage[]): boolean {
   return messages.some((message) =>
     typeof message.content === "string"
@@ -692,6 +727,7 @@ async function requestOpenAiNonStreaming(
   signal?: AbortSignal,
   maxTokensOverride?: number,
   tools?: ToolDefinition[],
+  options: StreamRequestOptions = {},
 ): Promise<StreamResult> {
   const { onToken, onDone, onError } = callbacks;
 
@@ -842,21 +878,23 @@ async function requestOpenAiNonStreaming(
         throw lastCompatibilityError ?? new Error("Responses request failed without a compatibility fallback result.");
       }
     } else {
+      const chatBody: Record<string, unknown> = {
+        model: settings.model,
+        messages: messages.map((message) => ({
+          role: message.role === "tool" ? "user" : message.role,
+          content: extractTextContent(message.content),
+        })),
+        stream: false,
+        ...(!minimalCompatibilityMode && tools && tools.length > 0 ? { tools: normalizeToolDefinitions(tools) } : {}),
+        ...(!minimalCompatibilityMode ? { max_tokens: maxTokens } : {}),
+        ...(!minimalCompatibilityMode && settings.sendSamplingParameters === true && settings.temperature != null ? { temperature: settings.temperature } : {}),
+        ...(!minimalCompatibilityMode && settings.sendSamplingParameters === true && settings.topP != null ? { top_p: settings.topP } : {}),
+      };
+      applyOpenAiToolChoice(chatBody, settings, tools, options.toolChoice, minimalCompatibilityMode);
       payload = await postJsonRequest(
         apiUrl,
         headers,
-        {
-          model: settings.model,
-          messages: messages.map((message) => ({
-            role: message.role === "tool" ? "user" : message.role,
-            content: extractTextContent(message.content),
-          })),
-          stream: false,
-          ...(!minimalCompatibilityMode && tools && tools.length > 0 ? { tools: normalizeToolDefinitions(tools) } : {}),
-          ...(!minimalCompatibilityMode ? { max_tokens: maxTokens } : {}),
-          ...(!minimalCompatibilityMode && settings.sendSamplingParameters === true && settings.temperature != null ? { temperature: settings.temperature } : {}),
-          ...(!minimalCompatibilityMode && settings.sendSamplingParameters === true && settings.topP != null ? { top_p: settings.topP } : {}),
-        },
+        chatBody,
         settings,
         signal,
       );
@@ -931,6 +969,7 @@ async function streamViaRustProxy(
   signal?: AbortSignal,
   tools?: ToolDefinition[],
   maxTokensOverride?: number,
+  options: StreamRequestOptions = {},
 ): Promise<StreamResult> {
   const { onToken, onDone, onError } = callbacks;
   const isOllama = isOllamaProvider(settings);
@@ -969,6 +1008,7 @@ async function streamViaRustProxy(
   if (tools && tools.length > 0 && !isOllama && !isAnthropic && !isGemini && shouldSendNativeTools(settings)) {
     body.tools = normalizeToolDefinitions(tools);
   }
+  applyOpenAiToolChoice(body, settings, tools, options.toolChoice);
 
   const apiUrl = geminiRequest?.url ?? buildApiUrl(settings);
   const protocol: CloudApiProtocol = isAnthropic ? "anthropic" : isGemini ? "gemini" : "openai";
@@ -1375,6 +1415,7 @@ async function streamViaRustProxy(
                 signal,
                 maxTokens,
                 tools,
+                options,
               );
               resolveResult?.(fallbackResult);
             } catch (fallbackErr) {
@@ -1481,6 +1522,7 @@ export async function streamChatCompletion(
   signal?: AbortSignal,
   tools?: ToolDefinition[],
   maxTokensOverride?: number,
+  options: StreamRequestOptions = {},
 ): Promise<StreamResult> {
   const isOllama = isOllamaProvider(settings);
   const isAnthropic = isAnthropicProvider(settings);
@@ -1490,7 +1532,7 @@ export async function streamChatCompletion(
     && (isGeminiProvider(settings) || isOpenAiResponsesApi(settings) || isTranscriptCompatibilityRequest(messages));
 
   if (shouldUseNonStreamingOpenAi) {
-    return requestOpenAiNonStreaming(messages, settings, callbacks, signal, maxTokensOverride, tools);
+    return requestOpenAiNonStreaming(messages, settings, callbacks, signal, maxTokensOverride, tools, options);
   }
 
   // Route through Rust proxy for cloud endpoints (bypasses CORS)
@@ -1499,7 +1541,7 @@ export async function streamChatCompletion(
       url: settings.baseUrl,
       model: settings.model,
     });
-    return streamViaRustProxy(messages, settings, callbacks, signal, tools, maxTokensOverride);
+    return streamViaRustProxy(messages, settings, callbacks, signal, tools, maxTokensOverride, options);
   }
 
   const { onToken, onDone, onError } = callbacks;
@@ -1538,6 +1580,7 @@ export async function streamChatCompletion(
   if (tools && tools.length > 0 && !isOllama && !isAnthropic && !isGemini && shouldSendNativeTools(settings)) {
     body.tools = normalizeToolDefinitions(tools);
   }
+  applyOpenAiToolChoice(body, settings, tools, options.toolChoice);
 
   const apiUrl = geminiRequest?.url ?? buildApiUrl(settings);
   const protocol: CloudApiProtocol = isAnthropic ? "anthropic" : isGemini ? "gemini" : "openai";
@@ -1592,6 +1635,7 @@ export async function streamChatCompletion(
         signal,
         tools,
         maxTokensOverride,
+        options,
       );
     }
     const normalizedError = toError(err, "Request failed.");

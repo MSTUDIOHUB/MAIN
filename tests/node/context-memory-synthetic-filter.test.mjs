@@ -83,6 +83,31 @@ test("synthetic continuation prompts are excluded from durable goal/constraint/d
   assert.equal(decisions.includes("tool_use"), false);
 });
 
+test("execute recovery prompts do not replace the original latest user request", () => {
+  const recoveryPrompt = [
+    "EXECUTE_RECOVERY: 当前 Execute 回合已经耗尽只读预算，但还没有产生写入、命令或浏览器验证证据。",
+    "恢复原因：read_only_budget_exhausted。",
+    "恢复工具面：mutation_first。",
+    "不要开启新一轮泛读，不要重复读取同一批文件。",
+  ].join("\n");
+  const approvedRecoveryPrompt = [
+    "用户已经批准本轮执行，但上一条回复又输出了新的方案，没有产生真实工具证据。",
+    "不要重新规划。现在必须开始最小必要的真实工具动作：写入/替换文件、运行命令、调用 Browser/Playwright 验证，或明确暂停说明具体阻塞。",
+  ].join("\n");
+
+  const state = buildContextMemoryState([
+    { role: "user", content: "请增加一个新建功能，点击新建后可以创建新的文档。" },
+    { role: "user", content: recoveryPrompt },
+    { role: "user", content: approvedRecoveryPrompt },
+  ], { now: 100 });
+
+  assert.equal(state.latestUserRequest?.text, "请增加一个新建功能，点击新建后可以创建新的文档。");
+  const goals = state.goals.map((item) => item.text).join("\n");
+  assert.match(goals, /新建功能/);
+  assert.doesNotMatch(goals, /EXECUTE_RECOVERY/);
+  assert.doesNotMatch(goals, /用户已经批准本轮执行/);
+});
+
 test("polluted previous memory entries are cleaned before reuse", () => {
   const previous = {
     version: 1,
@@ -125,6 +150,35 @@ test("polluted previous memory entries are cleaned before reuse", () => {
   assert.ok(decisions.includes("选择先跑回归测试再提交"));
   assert.equal(nextSteps.includes("Now immediately continue using tools"), false);
   assert.ok(nextSteps.includes("下一步：修复回调超时"));
+});
+
+test("context memory carryover preserves real latest request and drops recovery latest request", () => {
+  const previousPacket = [
+    "[System: ContextState",
+    "ContextMemoryState v1 id=ctx-test updatedAt=1",
+    "Latest user request: 请增加一个新建功能，点击新建后可以创建新的文档。",
+    "Goals:",
+    "- 请增加一个新建功能，点击新建后可以创建新的文档。 [m1]",
+    "Use this as compact historical state only; prioritize the latest messages and current workspace evidence.]",
+  ].join("\n");
+  const pollutedPacket = [
+    "[System: ContextState",
+    "ContextMemoryState v1 id=ctx-test updatedAt=2",
+    "Latest user request: EXECUTE_RECOVERY: 当前 Execute 回合已经耗尽只读预算，但还没有产生写入、命令或浏览器验证证据。",
+    "Goals:",
+    "- EXECUTE_RECOVERY: 当前 Execute 回合已经耗尽只读预算。 [m2]",
+    "Use this as compact historical state only; prioritize the latest messages and current workspace evidence.]",
+  ].join("\n");
+
+  const state = buildContextMemoryState([
+    { role: "user", content: previousPacket },
+    { role: "user", content: pollutedPacket },
+  ], { now: 200 });
+
+  assert.equal(state.latestUserRequest?.text, "请增加一个新建功能，点击新建后可以创建新的文档。");
+  const packet = formatContextMemoryPacket(state);
+  assert.match(packet, /Latest user request: 请增加一个新建功能/);
+  assert.doesNotMatch(packet, /Latest user request: EXECUTE_RECOVERY/);
 });
 
 test("context memory carryover does not ingest its own section headers", () => {
