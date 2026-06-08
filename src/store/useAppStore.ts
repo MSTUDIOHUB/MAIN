@@ -1849,14 +1849,8 @@ function pickSessionRuntimePatch(source: Partial<SessionRuntimeState> | Record<s
   return patch;
 }
 
-function omitSessionRuntimePatch(source: Record<string, unknown>) {
-  const patch: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(source)) {
-    if (!(sessionRuntimeKeys as readonly string[]).includes(key)) {
-      patch[key] = value;
-    }
-  }
-  return patch;
+function isSessionRuntimeActive(state: Pick<AppState, "currentWorkspace" | "currentSessionId">, sessionKey: string | null) {
+  return !!sessionKey && resolveSessionRuntimeKey(resolveSessionWorkspaceKey(state.currentWorkspace), state.currentSessionId) === sessionKey;
 }
 
 function createSessionRuntimeFromState(state: Partial<AppState>): SessionRuntimeState {
@@ -5511,6 +5505,10 @@ export const useAppStore = create<AppState>()(
     const normalizedPath = path.trim();
     if (!normalizedPath) {
       set((s) => ({
+        activeSessionByWorkspace: {
+          ...s.activeSessionByWorkspace,
+          [resolveSessionWorkspaceKey(s.currentWorkspace)]: s.currentSessionId,
+        },
         currentWorkspace: "",
         config: { ...s.config, workspace: "" },
         sessionHookCache: [],
@@ -5534,9 +5532,7 @@ export const useAppStore = create<AppState>()(
         updated[normalizedPath] = [];
       }
       const activeSessionByWorkspace = { ...s.activeSessionByWorkspace };
-      if (s.currentWorkspace) {
-        activeSessionByWorkspace[resolveSessionWorkspaceKey(s.currentWorkspace)] = s.currentSessionId;
-      }
+      activeSessionByWorkspace[resolveSessionWorkspaceKey(s.currentWorkspace)] = s.currentSessionId;
       const now = Date.now();
       const nextWorkspaceEntry: WorkspaceEntry = {
         path: normalizedPath,
@@ -6675,12 +6671,34 @@ export const useAppStore = create<AppState>()(
     skipAutoPlanHydration?: boolean;
   }) => {
     const state = get();
+    const sendOriginSessionKey = resolveSessionRuntimeKey(resolveSessionWorkspaceKey(state.currentWorkspace), state.currentSessionId);
+    const applyPreRunSessionPatch = (patch: Partial<AppState> | Record<string, unknown>) => {
+      if (!sendOriginSessionKey || isSessionRuntimeActive(get(), sendOriginSessionKey)) {
+        set(patch as Partial<AppState>);
+        return;
+      }
+      set((s) => {
+        const runtimePatch = pickSessionRuntimePatch(patch);
+        if (Object.keys(runtimePatch).length === 0) return {};
+        const existing = s.runtimeBySessionKey[sendOriginSessionKey] || createSessionRuntimeFromState(state);
+        return {
+          runtimeBySessionKey: {
+            ...s.runtimeBySessionKey,
+            [sendOriginSessionKey]: {
+              ...existing,
+              ...runtimePatch,
+            },
+          },
+        };
+      });
+    };
     const sendStartedAt = nowMs();
     logStoreEvent("send_message_called", {
       textChars: text?.length ?? 0,
       agentStatus: state.agentStatus,
       workspace: state.currentWorkspace || null,
       activeProfile: state.config.activeProfile,
+      targetSessionKey: sendOriginSessionKey,
     });
     const isImagePrompt = options?.hidden !== true && (
       state.selectedMainModeKey === "image_studio" ||
@@ -6919,6 +6937,13 @@ export const useAppStore = create<AppState>()(
           preservePlanState:
             options?.preservePlanState === true || (hasHydratedData && shouldPromoteToExecuting),
         };
+        if (sendOriginSessionKey && !isSessionRuntimeActive(get(), sendOriginSessionKey)) {
+          logStoreEvent("send_async_resume_skipped_inactive_session", {
+            phase: "auto_plan_hydration",
+            sessionKey: sendOriginSessionKey,
+          });
+          return;
+        }
         get().sendMessage(text, images, nextOptions);
       })();
       return true;
@@ -6973,7 +6998,7 @@ export const useAppStore = create<AppState>()(
         workspaceTree: cachedWorkspaceTreeForGameDetection,
       });
       if (gameDevelopmentSignal.shouldSuggest) {
-        set({
+        applyPreRunSessionPatch({
           pendingRunDecision: createGameStudioModeSwitchDecision({
             input: text,
             images,
@@ -7038,6 +7063,16 @@ export const useAppStore = create<AppState>()(
         : resolveRunIntentFromLegacyWorkflowMode(state.config.workflowMode));
     let effectiveIntentSummary = normalizeIntentSummary(options?.intentSummary || "");
     let effectiveCommandDirective: CommandDirective | null = options?.commandDirective ?? null;
+    const shouldForceExecuteForAutoApprove =
+      !isHidden &&
+      state.autoApproveTools === true &&
+      !mainDebugShortcut &&
+      !lockedComposerIntent &&
+      !shouldContinuePlanIntent &&
+      !shouldContinuePreviousTurnIntent &&
+      !shouldReuseExistingTurnIntent &&
+      !options?.skipIntentResolution &&
+      !options?.resolvedIntent;
     const applyDecisionSuppressedFallback = (
       source: "reuse_resolution" | "resolution",
       reason: string,
@@ -7073,6 +7108,22 @@ export const useAppStore = create<AppState>()(
         reason: preferredLanguage === "en"
           ? "The user selected an execution reply option, so this turn resumes with execute runtime tools."
           : "用户选择了执行型回复选项，本轮使用执行运行能力继续。",
+      });
+    }
+
+    if (shouldForceExecuteForAutoApprove) {
+      effectiveRunIntent = currentMainModeKey === "game_studio" ? "studio_workflow" : "execute";
+      effectiveCommandDirective = effectiveCommandDirective || inferCommandDirective(text, effectiveRunIntent, {
+        source: "natural_language",
+        parsedStudioCommand,
+      });
+      effectiveIntentSummary = effectiveIntentSummary || buildRunIntentSummary({
+        input: text,
+        intent: effectiveRunIntent,
+        language: preferredLanguage,
+        reason: preferredLanguage === "en"
+          ? "Auto-approval is enabled, so this turn uses execution semantics instead of natural chat."
+          : "自动审批已开启，本轮按执行语义处理，而不是普通聊天。",
       });
     }
 
@@ -7191,7 +7242,7 @@ export const useAppStore = create<AppState>()(
             riskLevel: reuseResolution.riskLevel,
             reason: reuseResolution.reason,
           }, preferredLanguage);
-          set({
+          applyPreRunSessionPatch({
             pendingRunDecision: {
               kind: "intent_confirmation",
               source: "pre_submit",
@@ -7227,7 +7278,7 @@ export const useAppStore = create<AppState>()(
       }
     }
 
-    if (!isHidden && !mainDebugShortcut && !lockedComposerIntent && !shouldContinuePlanIntent && !shouldContinuePreviousTurnIntent && !shouldReuseExistingTurnIntent && !options?.skipIntentResolution && !options?.resolvedIntent) {
+    if (!isHidden && !mainDebugShortcut && !lockedComposerIntent && !shouldContinuePlanIntent && !shouldContinuePreviousTurnIntent && !shouldReuseExistingTurnIntent && !shouldForceExecuteForAutoApprove && !options?.skipIntentResolution && !options?.resolvedIntent) {
       const resolution: RunIntentResolution = shouldRouteContinuationToPlanResume
         ? {
             intent: "plan" as const,
@@ -7261,7 +7312,7 @@ export const useAppStore = create<AppState>()(
       effectiveCommandDirective = resolution.commandDirective || inferCommandDirective(text, resolution.intent);
 
       if (resolution.controlAction === "approve_plan") {
-        set({
+        applyPreRunSessionPatch({
           input: "",
           contextMentions: [],
           attachedFiles: [],
@@ -7273,7 +7324,7 @@ export const useAppStore = create<AppState>()(
       }
 
       if (resolution.controlAction === "resume_plan_execution") {
-        set({
+        applyPreRunSessionPatch({
           input: "",
           contextMentions: [],
           attachedFiles: [],
@@ -7382,7 +7433,7 @@ export const useAppStore = create<AppState>()(
           );
         } else {
           const pendingCopy = createPendingDecisionCopy(resolution, preferredLanguage);
-          set({
+          applyPreRunSessionPatch({
             pendingRunDecision: {
               kind: "intent_confirmation",
               source: "pre_submit",
@@ -7400,7 +7451,7 @@ export const useAppStore = create<AppState>()(
 
       // 普通消息不应该因为额外的意图 preflight 而阻塞发送热路径。
       // 只有低置信度且真的可能改变流程的请求，才允许在这里等待 preflight。
-      if (shouldUseBlockingIntentPreflight(resolution, currentMainModeKey)) {
+      if (shouldUseBlockingIntentPreflight(resolution, currentMainModeKey, text)) {
         void (async () => {
           const preflight = await runIntentPreflight({
             input: text,
@@ -7443,7 +7494,7 @@ export const useAppStore = create<AppState>()(
               },
               preferredLanguage,
             );
-            set({
+            applyPreRunSessionPatch({
               pendingRunDecision: {
                 kind: "intent_confirmation",
                 source: "preflight",
@@ -7465,6 +7516,63 @@ export const useAppStore = create<AppState>()(
             preflight?.commandDirective ||
             resolution.commandDirective ||
             inferCommandDirective(text, resolvedIntent);
+          const preflightSuggestsOperation =
+            !!preflight &&
+            (
+              resolvedIntent === "execute" ||
+              resolvedIntent === "studio_workflow" ||
+              resolvedCommandDirective.requiresApproval === true ||
+              resolvedCommandDirective.kind === "file_modify" ||
+              resolvedCommandDirective.kind === "shell" ||
+              resolvedCommandDirective.kind === "git" ||
+              resolvedCommandDirective.kind === "unity" ||
+              resolvedCommandDirective.kind === "studio" ||
+              resolvedCommandDirective.kind === "mcp"
+            );
+          const localWasNatural =
+            (resolution.intent === "respond" || resolution.intent === "discuss") &&
+            resolution.riskLevel === "low";
+          const shouldAskForPreflightExecutionDecision =
+            localWasNatural &&
+            preflightSuggestsOperation &&
+            (
+              preflight?.intent !== resolution.intent ||
+              preflight?.requiresApproval === true ||
+              (preflight?.confidence ?? 0) < 0.92
+            );
+
+          if (shouldAskForPreflightExecutionDecision) {
+            const pendingCopy = createPendingDecisionCopy(
+              {
+                suggestedIntent: "execute",
+                decisionOptions: ["execute", "respond", "plan"],
+                riskLevel: preflight?.riskLevel || "medium",
+                reason: preflight?.reason || resolution.reason,
+              },
+              preferredLanguage,
+            );
+            applyPreRunSessionPatch({
+              pendingRunDecision: {
+                kind: "intent_confirmation",
+                source: "preflight",
+                originalInput: text,
+                originalImages: images || [],
+                suggestedIntent: "execute",
+                reason: pendingCopy.reason,
+                title: pendingCopy.title,
+                options: pendingCopy.options,
+              },
+            });
+            return;
+          }
+
+          if (sendOriginSessionKey && !isSessionRuntimeActive(get(), sendOriginSessionKey)) {
+            logStoreEvent("send_async_resume_skipped_inactive_session", {
+              phase: "intent_preflight",
+              sessionKey: sendOriginSessionKey,
+            });
+            return;
+          }
 
           get().sendMessage(text, images, {
             ...(options || {}),
@@ -7514,7 +7622,8 @@ export const useAppStore = create<AppState>()(
         : effectiveRunIntent;
     const shouldGrantExecutionConsentForTurn =
       options?.executionConsentGranted === true ||
-      shouldExecuteOnceFromReplyOption;
+      shouldExecuteOnceFromReplyOption ||
+      state.autoApproveTools === true;
     const initialTurnStatus: ConversationTurnStatus =
       effectiveRunIntent === "plan" && !state.isPlanApproved
         ? "planning"
@@ -7633,6 +7742,10 @@ export const useAppStore = create<AppState>()(
           ],
         },
         currentSessionId: autoSessionId,
+        activeSessionByWorkspace: {
+          ...s.activeSessionByWorkspace,
+          [sessionScopeKey]: autoSessionId,
+        },
         autoApproveTools: s.autoApproveTools,
         autoApproveToolScopes: s.autoApproveToolScopes,
         webSearchEnabled: s.webSearchEnabled,
@@ -7702,9 +7815,7 @@ export const useAppStore = create<AppState>()(
             : patchOrUpdater;
         if (!patch || typeof patch !== "object") return {};
         const runtimePatch = pickSessionRuntimePatch(patch);
-        const globalPatch = active
-          ? patch
-          : omitSessionRuntimePatch(patch as Record<string, unknown>);
+        const globalPatch = active ? patch : {};
         return {
           ...globalPatch,
           runtimeBySessionKey: {

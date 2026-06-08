@@ -301,8 +301,10 @@ const STRONG_EXECUTE_PATTERNS = [
   /^(?:帮我|请|直接|现在)?(?:修复|解决|处理)(?:一下|下)?(?:这个|该|当前)?(?:问题|bug|错误|故障|异常|展示问题|显示问题|逻辑问题|功能问题|页面问题|组件问题)?/i,
   /(?:帮我|请|直接|现在)?(?:修复|解决|改掉).{0,48}(?:问题|bug|错误|故障|异常|展示|显示|逻辑|功能|页面|组件|模块)/i,
   /(?:帮我|请|直接|现在)?(?:修改|改一下|改动|处理一下)(?:这个|该|当前)?(?:功能|逻辑|问题|模块|文件)?/i,
+  /(?:帮我|请|直接|现在)?(?:增加|新增|添加|加入|补上|接入).{0,48}(?:功能|按钮|入口|菜单|组件|页面|文档|文件|字段|选项|交互|回调)/i,
+  /(?:把|将).{0,48}(?:加上|加入|补上|接入|新增|添加).{0,48}(?:功能|按钮|入口|菜单|组件|页面|文档|文件|字段|选项|交互|回调)/i,
   /直接(?:改|做|实现|修|写|上手|处理)/i,
-  /帮我(?:实现|修复|修改|改掉|补上|落地)/i,
+  /帮我(?:实现|修复|修改|改掉|补上|新增|增加|添加|落地)/i,
   /现在就(?:做|改|实现|修复)/i,
   /(?:完成|继续)(?:修改|实现|执行|处理)/i,
   /(?:根据|按照|按).{0,24}(?:design\.md|设计方案|方案).{0,48}(?:完成修改|开始执行|继续执行|执行|实现|落地|修改)/i,
@@ -354,6 +356,13 @@ const STRONG_ANALYZE_PATTERNS = [
   /(?:代码|逻辑|流程|指令|链路|问题).*(?:分析|检查|验证|诊断|审查|评估)/i,
   /(?:分析|检查|验证|诊断|审查|评估).*(?:代码|逻辑|流程|指令|链路|问题)/i,
   /\b(?:analy[sz]e|inspect|review|diagnose|validate|verify|audit|investigate)\b/i,
+];
+
+const AMBIGUOUS_CHAT_EXECUTION_PATTERNS = [
+  /(?:能不能|可以(?:不可以)?|是否可以|要不要|是不是该|需要不需要).{0,48}(?:加|添加|增加|新增|加入|接入|支持|实现|创建|生成|修改|改一下|处理|做一个|弄一个|补上|完善)/i,
+  /(?:想要|希望|需要|应该|最好).{0,48}(?:加|添加|增加|新增|加入|接入|支持|实现|创建|生成|修改|处理|做一个|弄一个|补上|完善)/i,
+  /(?:加|添加|增加|新增|加入|接入|支持|实现|创建|生成|修改|处理|做一个|弄一个|补上|完善).{0,48}(?:功能|按钮|入口|菜单|组件|页面|文件|文档|字段|选项|交互|逻辑|回调|接口|api|API)/i,
+  /\b(?:could|can|should|would you|please)?\s*(?:add|create|implement|support|wire|update|change|modify|build)\b.{0,80}\b(?:feature|button|menu|page|component|file|document|field|option|interaction|callback|api)\b/i,
 ];
 
 const STRONG_REPORT_PATTERNS = [
@@ -822,7 +831,7 @@ export function inferCommandDirective(
     });
   }
 
-  if (/(?:修改|实现|修复|写入|创建|生成|补上|改掉|落地|新增|删除|替换|重构)|\b(?:implement|fix|write|create|generate|update|patch|modify|refactor|delete|replace)\b/i.test(normalizedInput) && (intent === "execute" || intent === "plan")) {
+  if (/(?:修改|实现|修复|写入|创建|生成|补上|改掉|落地|新增|增加|添加|加入|接入|完善|开发|删除|替换|重构)|\b(?:implement|fix|write|create|generate|update|patch|modify|refactor|delete|replace|add)\b/i.test(normalizedInput) && (intent === "execute" || intent === "plan")) {
     return createCommandDirective("file_modify", {
       source,
       action: intent === "plan" ? "plan_file_change" : "workspace_file_change",
@@ -1189,6 +1198,7 @@ export function resolveConversationTurnIntent(
 export function shouldUseBlockingIntentPreflight(
   resolution: RunIntentResolution,
   mainModeKey: MainModeKey,
+  input = "",
 ): boolean {
   if (mainModeKey !== "main_mode") return false;
   if (resolution.bypassMainRouter) return false;
@@ -1200,11 +1210,20 @@ export function shouldUseBlockingIntentPreflight(
   // 普通自然回复已经会由主模型在系统提示里继续判断真实任务类型，
   // 不值得为了一次额外 preflight 阻塞用户点击发送或回车。
   if ((resolution.intent === "respond" || resolution.intent === "discuss") && resolution.riskLevel === "low") {
-    return false;
+    return looksLikeAmbiguousChatExecutionInput(input);
   }
   // endregion
 
   return true;
+}
+
+export function looksLikeAmbiguousChatExecutionInput(input: string): boolean {
+  const normalizedInput = normalizeInput(input);
+  if (!normalizedInput) return false;
+  if (matchesAny(normalizedInput, STRONG_ANALYZE_PATTERNS)) return false;
+  if (matchesAny(normalizedInput, STRONG_SUMMARIZE_PATTERNS)) return false;
+  if (matchesAny(normalizedInput, STRONG_REPORT_PATTERNS)) return false;
+  return matchesAny(normalizedInput, AMBIGUOUS_CHAT_EXECUTION_PATTERNS);
 }
 
 export function isPlanContinuationAction(

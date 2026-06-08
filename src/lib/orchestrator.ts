@@ -10242,7 +10242,7 @@ export async function executeAgentLoop(
             results: allResults,
             recentActivity: recentToolActivity,
             readOnlyTools: PLAN_EXPLORATION_READ_ONLY_TOOLS,
-            sawExecuteOperationEvidence: false,
+            sawExecuteOperationEvidence,
             noProgressBatchRepeatCount,
             minReadOnlyActivities: 16,
             minCachedReadOnlyActivities: 6,

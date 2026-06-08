@@ -1,7 +1,16 @@
 import { expect, test, type Page } from "@playwright/test";
 
-async function seedStaleSelectedWorkspace(page: Page, themeMode: "dark" | "light" | "black") {
-  await page.addInitScript((seedThemeMode) => {
+type SidebarActiveScenario =
+  | "global-active"
+  | "global-switch-gap"
+  | "project-with-background-global-pending";
+
+async function seedStaleSelectedWorkspace(
+  page: Page,
+  themeMode: "dark" | "light" | "black",
+  scenario: SidebarActiveScenario = "global-active",
+) {
+  await page.addInitScript(({ seedThemeMode, seedScenario }) => {
     window.localStorage.clear();
 
     const workspace = "/tmp/e2e-sidebar-stale-selected";
@@ -29,6 +38,52 @@ async function seedStaleSelectedWorkspace(page: Page, themeMode: "dark" | "light
       recordingDisabled: true,
       messages: [],
     };
+    const currentWorkspace = seedScenario === "project-with-background-global-pending" ? workspace : "";
+    const currentSessionId = seedScenario === "global-switch-gap" ? projectSession.id : (
+      seedScenario === "project-with-background-global-pending" ? projectSession.id : globalSession.id
+    );
+    const backgroundGlobalRuntime = {
+      taskFlow: [
+        { id: 10, turnId: "global-pending-turn", type: "user", content: "Global background action" },
+      ],
+      agentMessages: [],
+      contextMemoryState: null,
+      conversationTurns: [{
+        id: "global-pending-turn",
+        userPrompt: "Global background action",
+        title: "Global background action",
+        mode: "plan",
+        status: "awaiting_approval",
+        summary: "",
+        blockIds: [10],
+        collapsed: false,
+        createdAt: 1,
+      }],
+      currentTurnId: "global-pending-turn",
+      selectedMainModeKey: "main_mode",
+      selectedNexusModeKey: "nexus_general",
+      pendingRunDecision: {
+        kind: "intent_confirmation",
+        source: "preflight",
+        originalInput: "Global background action",
+        originalImages: [],
+        suggestedIntent: "execute",
+        reason: "Background global chat needs a decision.",
+        title: "Background global decision",
+        options: [
+          { id: "execute", label: "批准执行", value: "execute" },
+          { id: "respond", label: "只回复", value: "respond" },
+        ],
+      },
+      pendingRunDecisionResolver: null,
+      isGenerating: false,
+      agentStatus: "pending_review",
+      abortController: null,
+      elapsedTime: 0,
+      pendingReviewResolve: null,
+      pendingReviewTaskId: null,
+      pendingToolCall: null,
+    };
 
     window.localStorage.setItem("local-agent-ide", JSON.stringify({
       state: {
@@ -46,9 +101,9 @@ async function seedStaleSelectedWorkspace(page: Page, themeMode: "dark" | "light
             apiKey: "",
           },
         },
-        currentWorkspace: "",
+        currentWorkspace,
         selectedWorkspace: workspace,
-        currentSessionId: globalSession.id,
+        currentSessionId,
         workspaces: [{ path: workspace, name: "DataFiles", addedAt: Date.now() - 2_000, lastActiveAt: Date.now() - 2_000 }],
         activeSessionByWorkspace: { [workspace]: projectSession.id, [globalKey]: globalSession.id },
         sessionsByWorkspace: {
@@ -75,6 +130,13 @@ async function seedStaleSelectedWorkspace(page: Page, themeMode: "dark" | "light
         selectedMainModeKey: "main_mode",
         selectedNexusModeKey: "nexus_general",
         activeStudioAgentKey: "studio_auto",
+        pendingRunDecision: null,
+        pendingRunDecisionResolver: null,
+        agentStatus: "idle",
+        isGenerating: false,
+        runtimeBySessionKey: seedScenario === "project-with-background-global-pending"
+          ? { [`${globalKey}:${globalSession.id}`]: backgroundGlobalRuntime }
+          : {},
       },
       version: 0,
     }));
@@ -124,7 +186,7 @@ async function seedStaleSelectedWorkspace(page: Page, themeMode: "dark" | "light
       if (cmd === "main_update_status") return { status: "idle" };
       return null;
     };
-  }, themeMode);
+  }, { seedThemeMode: themeMode, seedScenario: scenario });
 }
 
 for (const themeMode of ["dark", "light", "black"] as const) {
@@ -153,3 +215,42 @@ for (const themeMode of ["dark", "light", "black"] as const) {
     expect(projectSessionRowClasses).not.toContain("bg-[#18181b]");
   });
 }
+
+test("global chat child remains highlighted during the workspace switch gap", async ({ page }) => {
+  await seedStaleSelectedWorkspace(page, "dark", "global-switch-gap");
+  await page.goto("/");
+
+  const workspaceRow = page.getByTestId("sidebar-workspace-row").filter({ hasText: "DataFiles" }).first();
+  const chatRow = page.getByTestId("sidebar-global-chat-row");
+  const globalSessionRow = page.getByTestId("session-item-9201");
+  const projectSessionRow = page.getByTestId("session-item-9101");
+
+  await expect(chatRow).toHaveClass(/bg-\[#18181b\]/);
+  await expect(globalSessionRow).toHaveClass(/bg-\[#18181b\]/);
+  await expect(globalSessionRow.locator("svg").first()).toHaveClass(/theme-text/);
+  await expect(workspaceRow.getByTestId("sidebar-workspace-icon")).not.toHaveClass(/theme-text/);
+
+  const projectSessionRowClasses = (await projectSessionRow.getAttribute("class"))?.split(/\s+/) ?? [];
+  expect(projectSessionRowClasses).not.toContain("bg-[#18181b]");
+});
+
+test("background global chat pending decision does not surface in the active project", async ({ page }) => {
+  await seedStaleSelectedWorkspace(page, "dark", "project-with-background-global-pending");
+  await page.goto("/");
+
+  const workspaceRow = page.getByTestId("sidebar-workspace-row").filter({ hasText: "DataFiles" }).first();
+  const chatRow = page.getByTestId("sidebar-global-chat-row");
+  const globalSessionRow = page.getByTestId("session-item-9201");
+  const projectSessionRow = page.getByTestId("session-item-9101");
+
+  await expect(workspaceRow).toHaveClass(/bg-\[#18181b\]/);
+  await expect(workspaceRow.getByTestId("sidebar-workspace-icon")).toHaveClass(/theme-text/);
+  await expect(projectSessionRow).toHaveClass(/bg-\[#18181b\]/);
+  await expect(page.getByTestId("top-island-pending-run-decision")).toHaveCount(0);
+  await expect(page.getByTestId("top-island-shell")).toHaveCount(0);
+
+  const chatRowClasses = (await chatRow.getAttribute("class"))?.split(/\s+/) ?? [];
+  const globalSessionRowClasses = (await globalSessionRow.getAttribute("class"))?.split(/\s+/) ?? [];
+  expect(chatRowClasses).not.toContain("bg-[#18181b]");
+  expect(globalSessionRowClasses).not.toContain("bg-[#18181b]");
+});

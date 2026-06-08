@@ -1418,6 +1418,14 @@ export class WorkflowEngine {
 
       onNonActionableStop: (message: string, reason: "no_output" | "no_action" | "missing_tool_loop" | "incomplete_plan", _progress?: Partial<PlanExecutionProgressUpdate>) => {
         logStoreEvent("non_actionable_stop", { message, reason });
+        const stoppedStatus = reason === "no_output" ? "stopped_no_output" : "stopped_no_action";
+        sessionSet((s: any) => ({
+          conversationTurns: s.conversationTurns.map((turn: any) =>
+            turn.id === turnId && turn.status !== "awaiting_approval"
+              ? { ...turn, status: stoppedStatus }
+              : turn
+          ),
+        }));
       },
 
       onPlanArtifactUpdated: (path: string, content: string, kind: "plan" | "requirements" | "design" | "tasks" | "bugfix") => {

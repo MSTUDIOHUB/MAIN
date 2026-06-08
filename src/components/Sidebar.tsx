@@ -209,6 +209,11 @@ export default function Sidebar({
     });
   }, [workspaces]);
   const workspacePathsKey = useMemo(() => workspaceEntries.map((entry) => entry.path).join("\n"), [workspaceEntries]);
+  const activeGlobalSessionId = useMemo(() => {
+    if (activeScopeKey !== GLOBAL_CHAT_KEY) return null;
+    if (globalSessions.some((session) => session.id === currentSessionId)) return currentSessionId;
+    return activeSessionByWorkspace[GLOBAL_CHAT_KEY] ?? null;
+  }, [activeScopeKey, activeSessionByWorkspace, currentSessionId, globalSessions]);
 
   const refreshGitStatus = useCallback(async (workspacePath: string, includeStats = false) => {
     if (!workspacePath) return null;
@@ -1025,7 +1030,7 @@ export default function Sidebar({
                       sortedGlobalSessions.map((session) => renderSession(
                         GLOBAL_CHAT_KEY,
                         session,
-                        activeScopeKey === GLOBAL_CHAT_KEY ? currentSessionId : null,
+                        activeGlobalSessionId,
                       ))
                     )}
                   </div>

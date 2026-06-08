@@ -62,6 +62,7 @@ const {
   getIntentPolicy,
   hasExplicitUnityConsoleDiagnosticCue,
   inferCommandDirective,
+  looksLikeAmbiguousChatExecutionInput,
   looksLikePreviousTurnContinuationInput,
   looksLikeExistingPlanExecutionRequest,
   mapResolvedRunIntentToWorkflowMode,
@@ -121,6 +122,20 @@ test("fix requests with analysis-domain nouns enter execute workflow", () => {
     "执行修复",
     "请修复当前数据分析页面显示问题",
     "找到问题进行修复",
+  ]) {
+    const result = resolveTurnRunIntent(input, createContext());
+    assert.equal(result.intent, "execute", input);
+    assert.equal(result.commandDirective.kind, "file_modify", input);
+    assert.equal(result.commandDirective.requiresApproval, true, input);
+    assert.equal(result.needsDecision, undefined, input);
+  }
+});
+
+test("Chinese feature addition requests enter execute workflow", () => {
+  for (const input of [
+    "目前已经有了“打开”和“保存”功能了，请增加一个新建功能，点击新建后可以创建新的文档。",
+    "请新增一个导出按钮",
+    "帮我添加设置入口",
   ]) {
     const result = resolveTurnRunIntent(input, createContext());
     assert.equal(result.intent, "execute", input);
@@ -483,6 +498,15 @@ test("ordinary low-risk respond requests should not block on preflight", () => {
   assert.equal(shouldUseBlockingIntentPreflight(result, "main_mode"), false);
 });
 
+test("ambiguous chat-versus-execute requests use blocking preflight", () => {
+  const input = "能不能支持一个导出按钮？";
+  const result = resolveTurnRunIntent(input, createContext());
+
+  assert.equal(result.intent, "respond");
+  assert.equal(looksLikeAmbiguousChatExecutionInput(input), true);
+  assert.equal(shouldUseBlockingIntentPreflight(result, "main_mode", input), true);
+});
+
 test("low-confidence non-respond requests can still opt into blocking preflight", () => {
   assert.equal(
     shouldUseBlockingIntentPreflight(
@@ -637,6 +661,31 @@ test("store marks aborted idle turns as resumable before deriving completed_with
 
   assert.match(source, /const statusOverride =\s*status === "idle" && abortCtrl\.signal\.aborted\s*\?\s*"stopped_no_action"/);
   assert.match(source, /override: statusOverride/);
+});
+
+test("workflow engine marks non-actionable stops as resumable turn status", () => {
+  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"), "utf8");
+
+  assert.match(source, /const stoppedStatus = reason === "no_output" \? "stopped_no_output" : "stopped_no_action"/);
+  assert.match(source, /turn\.id === turnId && turn\.status !== "awaiting_approval"[\s\S]*status: stoppedStatus/);
+});
+
+test("store asks before executing when preflight upgrades natural chat to operations", () => {
+  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/store/useAppStore.ts"), "utf8");
+
+  assert.match(source, /const shouldAskForPreflightExecutionDecision =/);
+  assert.match(source, /localWasNatural[\s\S]*preflightSuggestsOperation[\s\S]*pendingRunDecision/);
+  assert.match(source, /decisionOptions: \["execute", "respond", "plan"\]/);
+});
+
+test("store forces auto-approved visible turns into execution semantics", () => {
+  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/store/useAppStore.ts"), "utf8");
+
+  assert.match(source, /const shouldForceExecuteForAutoApprove =/);
+  assert.match(source, /state\.autoApproveTools === true/);
+  assert.match(source, /effectiveRunIntent = currentMainModeKey === "game_studio" \? "studio_workflow" : "execute"/);
+  assert.match(source, /!shouldForceExecuteForAutoApprove && !options\?\.skipIntentResolution/);
+  assert.match(source, /shouldExecuteOnceFromReplyOption \|\|\s*state\.autoApproveTools === true/);
 });
 
 test("continuation does not hijack completed or missing turns", () => {

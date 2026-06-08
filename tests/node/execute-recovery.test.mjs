@@ -277,6 +277,24 @@ test("chat read-only no-progress is eligible for final synthesis before max iter
   assert.match(notice, /直接回答/);
 });
 
+test("chat read-only no-progress ignores batches after execution evidence", () => {
+  const recent = [
+    { name: "read_file", status: "succeeded", target: "src/components/toolbar.js", detail: "READ_FILE_RESULT" },
+    { name: "replace_in_file", status: "succeeded", target: "src/components/toolbar.js", detail: "updated successfully" },
+    { name: "read_file", status: "succeeded", target: "src/components/toolbar.js", detail: "FILE_UNCHANGED_STUB: src/components/toolbar.js" },
+  ];
+  const decision = resolveReadOnlyNoProgressTrigger({
+    results: [{ name: "read_file", target: "src/components/toolbar.js", content: "FILE_UNCHANGED_STUB", isError: false }],
+    recentActivity: recent,
+    readOnlyTools,
+    sawExecuteOperationEvidence: true,
+    noProgressBatchRepeatCount: 1,
+    minCachedReadOnlyActivities: 1,
+  });
+
+  assert.equal(decision.shouldRecover, false);
+});
+
 test("chat final synthesis prompt disables tools only for recovery synthesis", () => {
   const prompt = buildChatFinalSynthesisPrompt({
     language: "zh",
@@ -509,5 +527,4 @@ test("targeting search recovery opens read_file path to see context", () => {
   ];
   assert.equal(shouldAllowExecuteRecoveryFileRead(recent), true);
 });
-
 
