@@ -474,7 +474,7 @@ test("execute recovery context compaction keeps recent complete tool pairs witho
 });
 
 test("orchestrator wires execute convergence and max-iteration recovery before idle completion", () => {
-  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8");
+  const source = (fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8") + "\n" + fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8"));
 
   assert.match(source, /execute_recovery_tool_scope_applied/);
   assert.match(source, /const effectiveExecuteRecoveryFileRead =[\s\S]*executeRecoveryMode === "patch_recovery_read" \|\| allowExecuteRecoveryFileRead/);
@@ -506,7 +506,7 @@ test("orchestrator wires execute convergence and max-iteration recovery before i
 });
 
 test("orchestrator evidence reconcile logs failed tool summaries", () => {
-  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8");
+  const source = (fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8") + "\n" + fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8"));
 
   assert.match(source, /failedEvidenceResults/);
   assert.match(source, /firstFailureReason/);

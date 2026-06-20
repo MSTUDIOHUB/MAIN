@@ -682,7 +682,13 @@ export default function Sidebar({
         {showSessionStatus && (
           <span
             className={`h-1.5 w-1.5 shrink-0 rounded-full ${
-              sessionStatus === "error" ? "bg-[#f87171]" : sessionStatus === "pending_review" ? "bg-[#facc15]" : "bg-[var(--accent)]"
+              sessionStatus === "error"
+                ? "bg-[#f87171]"
+                : sessionStatus === "pending_review"
+                ? "bg-[#facc15]"
+                : sessionStatus === "running"
+                ? "session-status-running"
+                : "bg-[var(--accent)]"
             }`}
             title={sessionStatus}
           />

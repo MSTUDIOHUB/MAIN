@@ -313,10 +313,7 @@ test("cached read-only helpers identify repeated plan targets", () => {
 });
 
 test("approved plan strategy switch continues the agent loop after recovery prompt", () => {
-  const orchestratorSource = fsSync.readFileSync(
-    path.join(workspaceRoot, "src/lib/orchestrator.ts"),
-    "utf8",
-  );
+  const orchestratorSource = (fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8") + "\n" + fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8"));
 
   assert.match(
     orchestratorSource,
@@ -340,10 +337,7 @@ test("approved execution repeated cached reads replay prior content after the fi
     modelContent: "L1: import React from 'react';",
     updatedAt: 1,
   }, 2);
-  const orchestratorSource = fsSync.readFileSync(
-    path.join(workspaceRoot, "src/lib/orchestrator.ts"),
-    "utf8",
-  );
+  const orchestratorSource = (fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8") + "\n" + fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8"));
 
   assert.match(replay, /CACHED_FILE_REPLAY/);
   assert.match(replay, /L1: import React/);
@@ -354,10 +348,7 @@ test("approved execution repeated cached reads replay prior content after the fi
 });
 
 test("approved plan execution starts with the normal execute tool surface", () => {
-  const orchestratorSource = fsSync.readFileSync(
-    path.join(workspaceRoot, "src/lib/orchestrator.ts"),
-    "utf8",
-  );
+  const orchestratorSource = (fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8") + "\n" + fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8"));
 
   assert.match(
     orchestratorSource,
@@ -378,10 +369,7 @@ test("approved plan execution starts with the normal execute tool surface", () =
 });
 
 test("approved plan no-progress recovery keeps targeted reads without broad discovery", () => {
-  const orchestratorSource = fsSync.readFileSync(
-    path.join(workspaceRoot, "src/lib/orchestrator.ts"),
-    "utf8",
-  );
+  const orchestratorSource = (fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8") + "\n" + fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8"));
   const readOnlyTools = new Set([
     "get_project_skeleton",
     "list_directory",
@@ -520,16 +508,13 @@ test("approved plan source edit first surface blocks validation before first wri
   assert.equal(describeApprovedPlanSourceEditFirstToolSurface(false), "source_edit_only");
   assert.equal(describeApprovedPlanSourceEditFirstToolSurface(true), "source_edit_plus_patch_file_read");
 
-  const orchestratorSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8");
+  const orchestratorSource = (fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8") + "\n" + fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8"));
   assert.match(orchestratorSource, /approvedPlanNeedsSourceEditBeforeValidation/);
   assert.match(orchestratorSource, /approved_plan_source_edit_first_tool_scope_applied/);
 });
 
 test("approved plan browser validation repeats are reused or paused without agent error", () => {
-  const orchestratorSource = fsSync.readFileSync(
-    path.join(workspaceRoot, "src/lib/orchestrator.ts"),
-    "utf8",
-  );
+  const orchestratorSource = (fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8") + "\n" + fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8"));
 
   assert.match(orchestratorSource, /approvedPlanBrowserValidationCache/);
   assert.match(orchestratorSource, /approved_plan_browser_validation_reused/);
@@ -541,10 +526,7 @@ test("approved plan browser validation repeats are reused or paused without agen
 });
 
 test("approved plan repeated edits route to validation recovery before pausing", () => {
-  const orchestratorSource = fsSync.readFileSync(
-    path.join(workspaceRoot, "src/lib/orchestrator.ts"),
-    "utf8",
-  );
+  const orchestratorSource = (fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8") + "\n" + fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8"));
 
   assert.match(orchestratorSource, /repeatedEditValidationRecoveryAttempts/);
   assert.match(orchestratorSource, /activateExecuteRecovery\("validation_only",\s*"repeat_edit_target_without_validation"/);
@@ -557,10 +539,7 @@ test("approved plan repeated edits route to validation recovery before pausing",
 });
 
 test("approved plan no-tool prose is preserved unless it is a rejected completion claim", () => {
-  const orchestratorSource = fsSync.readFileSync(
-    path.join(workspaceRoot, "src/lib/orchestrator.ts"),
-    "utf8",
-  );
+  const orchestratorSource = (fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8") + "\n" + fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8"));
 
   assert.match(orchestratorSource, /shouldHideApprovedPlanNoToolText/);
   assert.match(orchestratorSource, /preservedVisibleText:\s*!shouldHideApprovedPlanNoToolText/);
@@ -575,10 +554,7 @@ test("approved plan no-tool prose is preserved unless it is a rejected completio
 });
 
 test("approved plan no-tool checkpoint reports protocol failure and available tools", () => {
-  const orchestratorSource = fsSync.readFileSync(
-    path.join(workspaceRoot, "src/lib/orchestrator.ts"),
-    "utf8",
-  );
+  const orchestratorSource = (fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8") + "\n" + fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8"));
 
   assert.match(orchestratorSource, /formatApprovedPlanNoToolAvailableTools/);
   assert.match(orchestratorSource, /暂停原因不是工具缺失/);

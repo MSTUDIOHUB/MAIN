@@ -80,7 +80,7 @@ test("anchors latest Unity searches to the current local date", () => {
 });
 
 test("orchestrator gates forced research behind the web search switch", () => {
-  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8");
+  const source = (fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8") + "\n" + fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8"));
 
   assert.match(source, /const shouldInjectRequiredWebResearchCall =\s*\n\s*webSearchEnabled &&/);
   assert.match(source, /availableToolNames\.has\("web_search"\)/);

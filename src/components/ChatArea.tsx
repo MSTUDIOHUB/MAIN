@@ -3632,6 +3632,7 @@ export default function ChatArea({
           ) : null}
           {isTurnExpanded && shouldShowTurnChanges && !shouldArchiveCompletedProcess && !liveProcessHasChangeSummary && (
             <TurnChangesCard
+              key="turn-changes-card"
               entries={turnChangeEntries}
               totalExecutedEdits={totalExecutedEdits}
               language={language}
@@ -3643,9 +3644,10 @@ export default function ChatArea({
           {!isTurnExpanded ? (
             null
           ) : (
-            <>
+            <React.Fragment key="turn-details">
               {planShortcutVisible && (
                 <PlanShortcutCard
+                  key="plan-shortcut-card"
                   turn={turn}
                   hasPlanContent={hasPlanContent}
                   canOpenPlan={hasPlanPanelContent && hasPlanContent}
@@ -3654,7 +3656,7 @@ export default function ChatArea({
                 />
               )}
               {shouldArchiveCompletedProcess ? (
-                <>
+                <React.Fragment key="archived-process">
                   {hasProposalCheckpoint && proposalCheckpointBlock && (
                     <>
                       <TurnPhaseDivider key={`${turn.id}-archived-phase-analysis`} label={phaseLabels.analysis} />
@@ -3677,6 +3679,7 @@ export default function ChatArea({
                   )}
                   {processArchive && processArchive.totalCount > 0 && (
                     <TurnProcessArchive
+                      key="turn-process-archive"
                       archive={processArchive}
                       language={language}
                       chatFontSize={resolvedTurnProcessFontSize}
@@ -3694,11 +3697,12 @@ export default function ChatArea({
                     }
                     return renderBlock(finalVisibleAgentBlock, finalVisibleAgentIndex);
                   })()}
-                </>
+                </React.Fragment>
               ) : (
-                <>
+                <React.Fragment key="live-process">
                   {liveProcessTimeline && liveProcessTimeline.totalCount > 0 && (
                     <LiveTurnProcessTimeline
+                      key="live-turn-timeline"
                       model={liveProcessTimeline}
                       language={language}
                       chatFontSize={resolvedTurnProcessFontSize}
@@ -3707,12 +3711,13 @@ export default function ChatArea({
                     />
                   )}
                   {buildBlockRenderItems(blocks, true, enableCompletedToolGrouping, language).map(renderTurnRemainderWithPhases)}
-                </>
+                </React.Fragment>
               )}
-            </>
+            </React.Fragment>
           )}
           {isTurnExpanded && shouldShowTurnActivityNotice && (
             <TurnActivityNotice
+              key="turn-activity-notice"
               activityText={isChatIntent ? undefined : (shouldRouteActivityNoticeToCapsule ? undefined : activeTurnActivity)}
               thoughtSummaryText={bottomThoughtSummary}
               isThinking={isBottomThoughtStreaming}
@@ -3723,6 +3728,7 @@ export default function ChatArea({
           )}
           {isTurnExpanded && intentHistoryExplanations.length > 0 && (
             <TurnIntentHistoryCard
+              key="turn-intent-history-card"
               explanations={intentHistoryExplanations}
               language={language}
               chatFontSize={resolvedTurnProcessFontSize}

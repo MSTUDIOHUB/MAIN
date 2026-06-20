@@ -1142,7 +1142,7 @@ async function streamViaRustProxy(
       byteCount: rustProxyByteCount,
       status: "reasoning_guard",
     });
-    invoke("cancel_chat_stream").catch(() => {});
+    invoke("cancel_chat_stream", { streamId }).catch(() => {});
     const result = buildCurrentOpenAiCompatibleResult();
     onDone(result);
     resolveResult?.(result);
@@ -1182,7 +1182,7 @@ async function streamViaRustProxy(
       status: "no_visible_progress_timeout",
       error: message,
     });
-    invoke("cancel_chat_stream").catch(() => {});
+    invoke("cancel_chat_stream", { streamId }).catch(() => {});
     const error = new Error(message);
     onError(error);
     rejectResult?.(error);
@@ -1257,7 +1257,7 @@ async function streamViaRustProxy(
                 reasoningGarbled = true;
                 reasoningBuffer = "";
                 emitStreamingConsole("streaming", "info", "reasoning_content is all '?' — cancelling stream");
-                invoke("cancel_chat_stream").catch(() => {});
+                invoke("cancel_chat_stream", { streamId }).catch(() => {});
                 const garbledErr = new Error(
                   "模型的思考令牌无法被服务器解码（reasoning_content 全为 '?'），无法产生回复。\n" +
                   "建议：1) 更新 llama.cpp 至最新版本  2) 在服务端启动时加 --reasoning off  3) 更换模型"
@@ -1506,7 +1506,7 @@ async function streamViaRustProxy(
   // Handle abort signal
   if (signal) {
     const onAbort = () => {
-      invoke("cancel_chat_stream").catch(() => {});
+      invoke("cancel_chat_stream", { streamId }).catch(() => {});
     };
     signal.addEventListener("abort", onAbort, { once: true });
   }

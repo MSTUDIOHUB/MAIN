@@ -1,0 +1,266 @@
+import { type OpenAiToolChoice } from "../streaming";
+import type { ContextMemoryState } from "../contextMemory";
+import { type MCPServer, type MCPTool } from "../mcpClient";
+import { type ToolDiffPreview } from "../toolDiff";
+import { type SessionAutoApproveScope, type ToolLifecycleState } from "../runtimeTools";
+import type { AppConfig, Skill } from "../../store/useAppStore";
+import { type PlanArtifactRecoveryAction, type PlanExecutionEvidenceEntry, type PlanExecutionProgressUpdate, type PlanTask, type ReplyOption } from "../workflowModels";
+import type { MainModeKey } from "../mainModes";
+import { type CommandDirective, type ResolvedUserIntent } from "../runIntent";
+import { type ResolvedInstructionSet } from "../instructions";
+import { type HookDefinition, type HookExecutionRecord, type HookEvent } from "../hooks";
+import type { PendingSlashCommand, StudioAgentKey, StudioConfig } from "../gameStudioCatalog";
+import { type PlanMaxIterationsCheckpoint, type PlanToolActivitySummary } from "../planExecutionRecovery";
+import { type ExecuteRecoveryMode } from "../executeRecoveryTools";
+import { type MainThreadEvent } from "../turnEvents";
+import { type PlanMaterializationSource } from "../planMaterialization";
+import { type ProgressNarration } from "../progressNarration";
+import type { ShellPermissionApproval, ShellPermissionDecision } from "../ipc";
+import { type TurnInputContextSignals } from "../turnIntake";
+
+export interface ToolCallInMessage {
+  id: string;
+  type: "function";
+  function: {
+    name: string;
+    arguments: string;
+  };
+}
+
+export interface TextContentPart {
+  type: "text";
+  text: string;
+}
+
+export interface ImageUrlContentPart {
+  type: "image_url";
+  image_url: { url: string };
+}
+
+export interface AgentMessage {
+  role: "system" | "user" | "assistant" | "tool";
+  content: string | ContentPart[];
+  tool_calls?: ToolCallInMessage[];
+  tool_call_id?: string;
+  reasoning_content?: string;
+  reasoning?: string;
+}
+
+export interface OrchestratorCallbacks {
+  // State accessors
+  getMessages: () => AgentMessage[];
+  getConfig: () => AppConfig;
+  getPreferredLanguage: () => "zh" | "en";
+  getSkills: () => Skill[];
+  getMainModeKey: () => MainModeKey;
+  getActiveStudioAgentKey: () => StudioAgentKey;
+  getGameStudioInitialized: () => boolean;
+  getPendingSlashCommand: () => PendingSlashCommand | null;
+  getGameStudioConfig?: () => StudioConfig | null;
+  getWorkspaceTree: () => string;
+  getMcpServers: () => MCPServer[];
+  getMcpDiscoveredTools: () => MCPTool[];
+  getWebSearchEnabled?: () => boolean;
+  getWebSearchProvider?: () => string;
+  getEnabledKnowledgeBaseIds?: () => string[];
+  getAssociatedPaths: () => string[];
+  getSessionKey: () => string;
+  getCurrentTurnId?: () => string | null;
+  hasSessionHookInitialized: (sessionKey: string) => boolean;
+  markSessionHookInitialized: (sessionKey: string) => void;
+  // Planning & Management
+  getCurrentRunIntent: () => ResolvedUserIntent;
+  getRuntimeRunIntent?: () => ResolvedUserIntent;
+  getForcedExecuteRecoveryMode?: () => ExecuteRecoveryMode | null;
+  getCommandDirective?: () => CommandDirective | null;
+  getWorkflowMode: () => "chat" | "edit" | "plan";
+  getIsPlanApproved: () => boolean;
+  getPlanApprovalChoice: () => string | null;
+  getReadOnlyAutoApproveForSession: () => boolean;
+  getApprovedLocalFileReadPaths: () => string[];
+  getAutoApproveToolScopes?: () => SessionAutoApproveScope[];
+  getPlanStage: () => "idle" | "plan" | "requirements" | "design" | "tasks" | "bugfix" | "ready_to_execute" | "executing" | "completed";
+  getPlanTasks: () => PlanTask[];
+  getPlanExecutionEvidenceLedger: () => PlanExecutionEvidenceEntry[];
+  getPlanAutoResumeCount?: () => number;
+  getStatus: () => "idle" | "running" | "pending_review" | "error";
+  consumeActiveGuidance?: () => { id: string; text: string; turnId: string | null } | null;
+  startNewTurn: () => void;
+  getContextMemoryState?: () => ContextMemoryState | null;
+  shouldForceXmlForProviderCompatibility?: () => boolean;
+  onProviderCompatibilityFallback?: (reason: string) => void;
+  onProviderNativeToolSuccess?: () => void;
+  onDebugEvent?: (event: string, data?: Record<string, unknown>) => void;
+
+  // UI updates
+  onStreamToken: (token: string, messageId: string) => void;
+  onStreamDone: (
+    fullText: string,
+    messageId: string,
+    truncated: boolean,
+    meta?: { suppressTruncationWarning?: boolean; reason?: string },
+  ) => void;
+  onThought: (thought: string) => void;
+  onAssistantFinalText: (
+    text: string,
+    replyOptions?: ReplyOption[],
+    meta?: {
+      hasToolCalls?: boolean;
+      hiddenThought?: string;
+      visibility?: "user_progress" | "hidden_process" | "substantive_plan_text";
+      preserveAssistantText?: boolean;
+      capsuleCandidate?: boolean;
+      modelAuthored?: boolean;
+      progress?: ProgressNarration;
+      toolCalls?: Array<{ id?: string; name: string; target: string }>;
+    },
+  ) => void;
+  onStatusChange: (status: "idle" | "running" | "pending_review" | "error") => void;
+  onError: (error: string) => void;
+  onNonActionableStop: (
+    message: string,
+    reason: "no_output" | "no_action" | "missing_tool_loop" | "incomplete_plan",
+    progress?: Partial<PlanExecutionProgressUpdate>,
+  ) => void;
+  onPlanArtifactUpdated: (path: string, content: string, kind: "plan" | "requirements" | "design" | "tasks" | "bugfix") => void;
+  onPlanStageChanged: (stage: "idle" | "plan" | "requirements" | "design" | "tasks" | "bugfix" | "ready_to_execute" | "executing" | "completed") => void;
+  onPlanTasksUpdated: (content: string) => void;
+  onPlanExecutionProgress?: (progress: PlanExecutionProgressUpdate) => void;
+  onApprovedPlanHandoff?: (prompt: string) => void;
+  onPlanMaxIterationsCheckpoint?: (checkpoint: PlanMaxIterationsCheckpoint) => boolean | Promise<boolean>;
+  onExecuteMaxIterationsCheckpoint?: (checkpoint: PlanMaxIterationsCheckpoint) => boolean | Promise<boolean>;
+  onTurnSummaryReady: (summary: string) => void;
+  onExecutionDigestUpdate?: (summary: string) => void;
+  onTurnRuntimePhaseChanged?: (phase: {
+    id: string;
+    kind: "scope" | "context" | "diagnosis" | "implementation" | "validation";
+    title: string;
+    summary?: string;
+    domain?: string;
+    status?: "pending" | "running" | "done" | "failed";
+  }) => void;
+  onTurnEvent?: (event: MainThreadEvent) => void;
+  onHarnessRunUpdate?: (patch: Record<string, unknown>) => void;
+  onInstructionsResolved: (resolved: ResolvedInstructionSet) => void;
+  onHooksLoaded: (hooks: HookDefinition[], loadedAt?: number | null) => void;
+  onHookStart: (event: HookEvent, hook: HookDefinition) => void;
+  onHookResult: (record: HookExecutionRecord) => void;
+  onHookBlocked: (event: HookEvent, reason: string, record?: HookExecutionRecord) => void;
+
+  // Message history management
+  appendMessage: (msg: AgentMessage) => void;
+  replaceMessages: (msgs: AgentMessage[]) => void;
+  onContextMemoryBuilt?: (state: ContextMemoryState, packet: string) => void;
+  onContextCompress: (
+    stats: {
+      droppedCount: number;
+      droppedMessageCount?: number;
+      tokenCountBefore: number;
+      tokenCountAfter: number;
+      tokenReduction: number;
+      compressedContext?: string;
+      displaySummary?: string;
+      memoryPacket?: string;
+      microCompactionKind?: "none" | "tool_results" | "assistant_messages" | "mixed";
+      microCompactedCount?: number;
+      tokenBreakdown?: {
+        topSourceLabel: string;
+        topSourceTokens: number;
+        total: number;
+      };
+    },
+    reason: "proactive" | "reactive" | "execute_recovery",
+  ) => void;
+
+  // Tool execution UI feedback
+  onToolExecuting: (
+    toolName: string,
+    target: string,
+    diff?: ToolDiffPreview,
+    meta?: { toolCallId?: string },
+  ) => void;
+  onToolDone: (
+    toolName: string,
+    target: string,
+    result: string,
+    meta?: { toolCallId?: string; diff?: ToolDiffPreview },
+  ) => void;
+  onToolError: (
+    toolName: string,
+    target: string,
+    error: string,
+    meta?: { toolCallId?: string; qualityGateReason?: string | null; planRecoveryReason?: string | null },
+  ) => void;
+
+  // Human-in-the-loop — only for write/execute tools.
+  // Read-only tools are auto-executed by the orchestrator.
+  requestReview: (toolCall: {
+    toolCallId?: string;
+    name: string;
+    arguments: Record<string, unknown>;
+    risk?: "local_file_read" | "browser_control";
+    localFileReadPath?: string;
+    shellPermissionDecision?: ShellPermissionDecision;
+  }) => Promise<ReviewDecision>;
+}
+
+export interface FetchLLMStreamOptions {
+  noVisibleTokenTimeoutMs?: number;
+  noVisibleTokenTimeoutLabel?: string;
+  toolChoice?: OpenAiToolChoice;
+  workflowMode?: string;
+  runtimeIntent?: string;
+}
+
+export interface ToolCallToExecute {
+  id: string;
+  name: string;
+  arguments: string;
+}
+
+export interface ToolExecutionResult {
+  toolCallId: string;
+  name: string;
+  target: string;
+  content: string; // model-facing result or error message
+  displayContent?: string; // UI-facing result, can differ from model-facing content
+  isError: boolean;
+  lifecycleState?: ToolLifecycleState;
+  additionalContexts?: string[];
+  internalFeedback?: boolean;
+  qualityGateReason?: string;
+  planRecoveryAction?: PlanArtifactRecoveryAction;
+  missingPlanSections?: string[];
+}
+
+export interface PlanMaterializationResultForLoop {
+  ok: boolean;
+  path?: string;
+  kind?: "plan" | "design";
+  content?: string;
+  reason?: string;
+  source?: PlanMaterializationSource;
+  toolResult?: ToolExecutionResult;
+}
+
+export interface CachedReadOnlyToolResult {
+  name: string;
+  target: string;
+  content: string;
+}
+
+export interface ExecuteToolLifecycleOptions {
+  allowExternalLocalRead?: boolean;
+  shellPermissionApproval?: ShellPermissionApproval;
+  turnContext?: TurnInputContextSignals;
+  recentPlanToolActivity?: PlanToolActivitySummary[];
+  attemptedPlanWriteTargets?: string[];
+}
+
+export type ContentPart = TextContentPart | ImageUrlContentPart;
+
+export type ReviewDecision =
+  | { action: "accept"; grantLocalFileReadPath?: string; shellPermissionApproval?: ShellPermissionApproval }
+  | { action: "reject" }
+  | { action: "error"; error: string };
+

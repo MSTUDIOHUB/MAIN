@@ -1,7 +1,7 @@
 {
   "name": "tauri-app",
   "private": true,
-  "version": "2.2.7",
+  "version": "2.2.8",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -56,6 +56,7 @@
     "@types/react-syntax-highlighter": "^15.5.13",
     "@vitejs/plugin-react": "^4.7.0",
     "react-refresh": "^0.18.0",
+    "ts-morph": "^28.0.0",
     "typescript": "~5.8.3",
     "vite": "^7.0.4"
   },

@@ -128,7 +128,7 @@ test("isShellFileReadCommand detects read commands after directory changes", () 
 });
 
 test("orchestrator reports shell-read misuse before shell metadata errors", () => {
-  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8");
+  const source = (fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8") + "\n" + fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8"));
   const shellReadIndex = source.indexOf("const shellReadValidationErrorBeforeContract = buildShellReadValidationError");
   const contractIndex = source.indexOf("const validationError = validateToolExecutionContract");
 
@@ -138,7 +138,7 @@ test("orchestrator reports shell-read misuse before shell metadata errors", () =
 });
 
 test("plan artifact quality gate only validates mutation tools", () => {
-  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8");
+  const source = (fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8") + "\n" + fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8"));
 
   assert.match(
     source,

@@ -77,6 +77,11 @@ extern "C" {
 
 static TOKENIZER: OnceLock<CoreBPE> = OnceLock::new();
 static TERMINAL_ENV_OVERRIDES: OnceLock<HashMap<String, String>> = OnceLock::new();
+static WORKSPACE_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn get_workspace_write_lock() -> &'static Mutex<()> {
+    WORKSPACE_WRITE_LOCK.get_or_init(|| Mutex::new(()))
+}
 
 // region: 调试日志
 
@@ -3012,6 +3017,7 @@ fn git_commit_all(
     workspace: Option<String>,
     message: String,
 ) -> Result<GitStatus, String> {
+    let _lock = get_workspace_write_lock().lock().unwrap();
     let message = message.trim();
     if message.is_empty() {
         return Err("提交信息不能为空".to_string());
@@ -3064,6 +3070,7 @@ fn git_push_current_branch(
     state: State<WorkspaceState>,
     workspace: Option<String>,
 ) -> Result<GitStatus, String> {
+    let _lock = get_workspace_write_lock().lock().unwrap();
     let workspace = resolve_workspace_root(&state, workspace)?;
     let status = get_git_status_for_workspace(&workspace, true)?;
     ensure_git_ready(&status)?;
@@ -3099,6 +3106,7 @@ fn git_create_branch(
     workspace: Option<String>,
     branch: String,
 ) -> Result<GitStatus, String> {
+    let _lock = get_workspace_write_lock().lock().unwrap();
     let branch = branch.trim();
     if !is_valid_git_branch_name(branch) {
         return Err("分支名不合法".to_string());
@@ -3436,6 +3444,7 @@ fn write_file(
     content: String,
     workspace: Option<String>,
 ) -> Result<(), String> {
+    let _lock = get_workspace_write_lock().lock().unwrap();
     let workspace = resolve_workspace_root(&state, workspace)?;
     let real_path = resolve_write_path(&path, &workspace)?;
     if real_path.exists() && real_path.is_dir() {
@@ -4828,6 +4837,7 @@ fn run_command(
     workspace: Option<String>,
     permission_approval: Option<harness::permissions::ShellPermissionApproval>,
 ) -> Result<TerminalCommandOutput, String> {
+    let _lock = get_workspace_write_lock().lock().unwrap();
     let workspace = resolve_workspace_root(&state, workspace)?;
     let timeout = Duration::from_millis(timeout_ms.unwrap_or(60_000).clamp(100, 600_000));
     run_workspace_shell_command(&workspace, command, input, timeout, permission_approval)
@@ -7502,21 +7512,41 @@ fn open_image_studio_output(
 // region: 流式聊天代理 (Cloud SSE Proxy)
 
 /// Global cancellation token for the active chat stream.
-static STREAM_CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static STREAM_ABORT: std::sync::Mutex<Option<futures_util::future::AbortHandle>> =
-    std::sync::Mutex::new(None);
+struct StreamContext {
+    cancel_flag: Arc<std::sync::atomic::AtomicBool>,
+    abort_handle: Option<futures_util::future::AbortHandle>,
+}
 
-fn set_stream_abort_handle(handle: Option<futures_util::future::AbortHandle>) {
-    if let Ok(mut slot) = STREAM_ABORT.lock() {
-        *slot = handle;
+static ACTIVE_STREAMS: OnceLock<Mutex<HashMap<String, StreamContext>>> = OnceLock::new();
+
+fn get_active_streams() -> &'static Mutex<HashMap<String, StreamContext>> {
+    ACTIVE_STREAMS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn set_stream_abort_handle(stream_id: &str, handle: Option<futures_util::future::AbortHandle>) {
+    let mut streams = get_active_streams().lock().unwrap();
+    if let Some(ctx) = streams.get_mut(stream_id) {
+        ctx.abort_handle = handle;
     }
 }
 
-fn abort_active_stream_request() {
-    if let Ok(mut slot) = STREAM_ABORT.lock() {
-        if let Some(handle) = slot.take() {
+fn abort_active_stream_request(stream_id: &str) {
+    let mut streams = get_active_streams().lock().unwrap();
+    if let Some(ctx) = streams.get_mut(stream_id) {
+        if let Some(handle) = ctx.abort_handle.take() {
             handle.abort();
         }
+    }
+}
+
+struct StreamCleanupGuard {
+    stream_id: String,
+}
+
+impl Drop for StreamCleanupGuard {
+    fn drop(&mut self) {
+        let mut streams = get_active_streams().lock().unwrap();
+        streams.remove(&self.stream_id);
     }
 }
 
@@ -7564,8 +7594,15 @@ async fn start_chat_stream(
     } else {
         body
     };
-    STREAM_CANCEL.store(false, std::sync::atomic::Ordering::Relaxed);
-    set_stream_abort_handle(None);
+    let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let mut streams = get_active_streams().lock().unwrap();
+        streams.insert(stream_id.clone(), StreamContext {
+            cancel_flag: cancel_flag.clone(),
+            abort_handle: None,
+        });
+    }
+    let _cleanup_guard = StreamCleanupGuard { stream_id: stream_id.clone() };
     let stream_started_at = Instant::now();
 
     let is_model_request = url.contains("/v1/chat/completions")
@@ -7642,7 +7679,7 @@ async fn start_chat_stream(
 
     let (send_abort_handle, send_abort_registration) =
         futures_util::future::AbortHandle::new_pair();
-    set_stream_abort_handle(Some(send_abort_handle));
+    set_stream_abort_handle(&stream_id, Some(send_abort_handle));
     let response_result = match tokio::time::timeout(
         Duration::from_secs(STREAM_FIRST_RESPONSE_TIMEOUT_SECS),
         futures_util::future::Abortable::new(req_builder.send(), send_abort_registration),
@@ -7650,8 +7687,8 @@ async fn start_chat_stream(
     .await
     {
         Err(_) => {
-            abort_active_stream_request();
-            STREAM_CANCEL.store(true, std::sync::atomic::Ordering::Relaxed);
+            abort_active_stream_request(&stream_id);
+            cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
             record_debug_log(
                 &app,
                 "warn",
@@ -7681,7 +7718,7 @@ async fn start_chat_stream(
             return Ok(());
         }
         Ok(Err(_)) => {
-            set_stream_abort_handle(None);
+            set_stream_abort_handle(&stream_id, None);
             record_debug_log(
                 &app,
                 "info",
@@ -7697,7 +7734,7 @@ async fn start_chat_stream(
             return Ok(());
         }
         Ok(Ok(result)) => {
-            set_stream_abort_handle(None);
+            set_stream_abort_handle(&stream_id, None);
             result
         }
     };
@@ -7747,7 +7784,7 @@ async fn start_chat_stream(
     loop {
         let (chunk_abort_handle, chunk_abort_registration) =
             futures_util::future::AbortHandle::new_pair();
-        set_stream_abort_handle(Some(chunk_abort_handle));
+        set_stream_abort_handle(&stream_id, Some(chunk_abort_handle));
         let next_chunk = if chunk_count == 0 {
             match tokio::time::timeout(
                 Duration::from_secs(STREAM_FIRST_CHUNK_TIMEOUT_SECS),
@@ -7756,9 +7793,9 @@ async fn start_chat_stream(
             .await
             {
                 Err(_) => {
-                    set_stream_abort_handle(None);
-                    abort_active_stream_request();
-                    STREAM_CANCEL.store(true, std::sync::atomic::Ordering::Relaxed);
+                    set_stream_abort_handle(&stream_id, None);
+                    abort_active_stream_request(&stream_id);
+                    cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
                     record_debug_log(
                         &app,
                         "warn",
@@ -7788,7 +7825,7 @@ async fn start_chat_stream(
                     return Ok(());
                 }
                 Ok(Err(_)) => {
-                    set_stream_abort_handle(None);
+                    set_stream_abort_handle(&stream_id, None);
                     record_debug_log(
                         &app,
                         "info",
@@ -7804,7 +7841,7 @@ async fn start_chat_stream(
                     return Ok(());
                 }
                 Ok(Ok(item)) => {
-                    set_stream_abort_handle(None);
+                    set_stream_abort_handle(&stream_id, None);
                     item
                 }
             }
@@ -7816,8 +7853,8 @@ async fn start_chat_stream(
             .await
             {
                 Err(_) => {
-                    abort_active_stream_request();
-                    STREAM_CANCEL.store(true, std::sync::atomic::Ordering::Relaxed);
+                    abort_active_stream_request(&stream_id);
+                    cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
                     record_debug_log(
                         &app,
                         "warn",
@@ -7853,7 +7890,7 @@ async fn start_chat_stream(
                     return Ok(());
                 }
                 Ok(Err(_)) => {
-                    set_stream_abort_handle(None);
+                    set_stream_abort_handle(&stream_id, None);
                     record_debug_log(
                         &app,
                         "info",
@@ -7871,7 +7908,7 @@ async fn start_chat_stream(
                     return Ok(());
                 }
                 Ok(Ok(item)) => {
-                    set_stream_abort_handle(None);
+                    set_stream_abort_handle(&stream_id, None);
                     item
                 }
             }
@@ -7881,7 +7918,7 @@ async fn start_chat_stream(
             break;
         };
 
-        if STREAM_CANCEL.load(std::sync::atomic::Ordering::Relaxed) {
+        if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
             record_debug_log(
                 &app,
                 "info",
@@ -7959,7 +7996,7 @@ async fn start_chat_stream(
         }
     }
 
-    set_stream_abort_handle(None);
+    set_stream_abort_handle(&stream_id, None);
     emit_chat_stream_done(&app, &stream_id, "ok", None);
 
     if is_model_request {
@@ -7983,9 +8020,23 @@ async fn start_chat_stream(
 
 /// Cancel the active chat stream.
 #[tauri::command]
-fn cancel_chat_stream() -> Result<(), String> {
-    STREAM_CANCEL.store(true, std::sync::atomic::Ordering::Relaxed);
-    abort_active_stream_request();
+fn cancel_chat_stream(stream_id: Option<String>) -> Result<(), String> {
+    let mut streams = get_active_streams().lock().unwrap();
+    if let Some(sid) = stream_id {
+        if let Some(ctx) = streams.get_mut(&sid) {
+            ctx.cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(handle) = ctx.abort_handle.take() {
+                handle.abort();
+            }
+        }
+    } else {
+        for ctx in streams.values_mut() {
+            ctx.cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(handle) = ctx.abort_handle.take() {
+                handle.abort();
+            }
+        }
+    }
     Ok(())
 }
 
@@ -9409,6 +9460,7 @@ fn delete_workspace_path(
     path: String,
     workspace: Option<String>,
 ) -> Result<(), String> {
+    let _lock = get_workspace_write_lock().lock().unwrap();
     let workspace = resolve_workspace_root(&state, workspace)?;
     let raw_path = if Path::new(&path).is_absolute() {
         PathBuf::from(&path)

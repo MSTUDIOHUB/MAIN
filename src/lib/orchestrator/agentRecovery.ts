@@ -58,19 +58,28 @@ export function buildExecuteNoActionPauseMessage(input: {
   ].filter(Boolean).join("\n");
 }
 
+export function isReasoningModelName(modelName: string | null | undefined): boolean {
+  if (!modelName) return false;
+  const lower = modelName.toLowerCase();
+  return /deepseek-r1|qwq|reasoning|thinking|o1|o3/i.test(lower);
+}
+
 export function isReasoningDominatedLengthResult(
   result: Pick<StreamResult, "content" | "finishReason" | "reasoningContent" | "toolCalls">,
   isLocal?: boolean,
+  isReasoningModel?: boolean,
 ): boolean {
   if (result.finishReason !== "length") return false;
-  return isReasoningDominatedNoActionResult(result, isLocal);
+  return isReasoningDominatedNoActionResult(result, isLocal, isReasoningModel);
 }
 
 export function isReasoningDominatedNoActionResult(
   result: Pick<StreamResult, "content" | "reasoningContent" | "toolCalls">,
   isLocal?: boolean,
+  isReasoningModel?: boolean,
 ): boolean {
   if (Array.isArray(result.toolCalls) && result.toolCalls.length > 0) return false;
+  if (isReasoningModel) return false;
 
   const reasoningChars = String(result.reasoningContent || "").trim().length;
   const visibleChars = stripReasoningBlocksForEscalation(result.content).length;
@@ -248,6 +257,7 @@ export function shouldRecoverExecuteXmlTextWithoutAction(input: {
   replyOptionCount: number;
   sawExecuteOperationEvidence: boolean;
   visibleText: string;
+  iteration?: number;
 }): boolean {
   const visible = String(input.visibleText || "").replace(/\s+/g, " ").trim();
   if (!visible) return false;
