@@ -749,9 +749,6 @@ export class AgentOrchestrator {
         let planReasoningOnlyRecoveryPasses = 0;
         let planAutoScaffoldPromptIssued = false;
         let planClosureEvidenceRecoveryIssued = false;
-        let usedExecuteCompletionEvidencePrompt = false;
-        let usedExecuteReplanningEvidencePrompt = false;
-        let usedExecuteXmlTextActionRecoveryPrompt = false;
         let usedReadOnlyPermissionHardRecoveryPrompt = false;
         let planReadOnlyConvergenceBatches = 0;
         let planReadOnlyConvergenceTools = 0;
@@ -3927,7 +3924,6 @@ export class AgentOrchestrator {
                 return;
               }
 
-              usedExecuteCompletionEvidencePrompt = true;
               callbacks.appendMessage({
                 role: "user",
                 content: buildExecuteCompletionEvidencePrompt(callbacks.getPreferredLanguage(), consecutiveNoToolCount),
@@ -3967,7 +3963,6 @@ export class AgentOrchestrator {
                 return;
               }
 
-              usedExecuteReplanningEvidencePrompt = true;
               callbacks.appendMessage({
                 role: "user",
                 content: buildExecuteReplanningEvidencePrompt(callbacks.getPreferredLanguage(), consecutiveNoToolCount),
@@ -4015,7 +4010,6 @@ export class AgentOrchestrator {
                 return;
               }
 
-              usedExecuteXmlTextActionRecoveryPrompt = true;
               callbacks.appendMessage({
                 role: "user",
                 content: buildExecuteXmlTextActionRecoveryPrompt({
@@ -4669,10 +4663,7 @@ export class AgentOrchestrator {
         usedPseudoToolCallRecoveryPrompt = false;
         usedMalformedToolUseRecoveryPrompt = false;
         usedLanguageMismatchRecoveryPrompt = false;
-        usedExecuteXmlTextActionRecoveryPrompt = false;
         usedReadOnlyPermissionHardRecoveryPrompt = false;
-        usedExecuteCompletionEvidencePrompt = false;
-        usedExecuteReplanningEvidencePrompt = false;
         if (unityMcpFirstIterationPending) {
           unityMcpFirstIterationPending = false;
         }
