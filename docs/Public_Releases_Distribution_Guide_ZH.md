@@ -120,32 +120,22 @@ npm run release:desktop -- 1.4.2 --dry-run
 
 ### macOS：在 Mac 上打包并上传
 
-先在当前 shell 里放入 Tauri updater 私钥。不要把私钥写进仓库文件：
+最推荐且最方便的方式是将私钥与密码文件放在仓库外的本机目录 `~/.config/main/`：
 
-```bash
-export TAURI_SIGNING_PRIVATE_KEY='<你的 updater 私钥内容>'
-export TAURI_SIGNING_PRIVATE_KEY_PASSWORD='<你的 updater 私钥密码，如果生成 key 时没有设置密码可省略>'
-```
+- **私钥文件**：`~/.config/main/tauri-updater.key`
+- **密码文件**：`~/.config/main/tauri-updater.pwd` （将密码文本写入该文件即可）
 
-更方便的方式是把私钥放在仓库外的本机文件，例如 `~/.config/main/tauri-updater.key`，然后用路径环境变量：
-
-```bash
-export TAURI_SIGNING_PRIVATE_KEY_PATH="$HOME/.config/main/tauri-updater.key"
-export TAURI_SIGNING_PRIVATE_KEY_PASSWORD='<你的 updater 私钥密码，如果生成 key 时没有设置密码可省略>'
-```
-
-或者直接在命令里传：
-
-```bash
-npm run release:mac:upload -- 2.0.2 --signing-key-file "$HOME/.config/main/tauri-updater.key"
-```
-
-如果你的 key 没有密码，只传 `--signing-key-file` 就够了。
-
-然后执行：
+放置后，脚本会自动读取这组密钥和密码，你无需在当前 Shell 导出环境变量，也无需在命令里传递任何 key 或密码参数，只需简单执行：
 
 ```bash
 npm run release:mac:upload -- 2.0.2
+```
+
+或者使用环境变量临时指定：
+
+```bash
+export TAURI_SIGNING_PRIVATE_KEY='<你的 updater 私钥内容>'
+export TAURI_SIGNING_PRIVATE_KEY_PASSWORD='<你的 updater 私钥密码>'
 ```
 
 第一次在本机打 universal 包前，如果缺少 Rust target，脚本会提示执行：

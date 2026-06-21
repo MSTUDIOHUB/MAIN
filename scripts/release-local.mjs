@@ -5,7 +5,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-import { APP_NAME, parseAppVersion, syncReleaseVersions, writeUpdaterManifest } from "./release_tools.mjs";
+import { APP_NAME, parseAppVersion, syncReleaseVersions, writeUpdaterManifest, toWindowsWixVersion } from "./release_tools.mjs";
 
 const DEFAULT_RELEASE_REPO = "MSTUDIOHUB/MAIN-Releases";
 const DEFAULT_UPDATE_REPO = "MSTUDIOHUB/MAIN-UpdateFeed";
@@ -284,7 +284,14 @@ function signingKeyPath(options, rootDir) {
 
 async function loadSigningEnvironment(options, rootDir) {
   const keyFile = signingKeyPath(options, rootDir);
-  const passwordFile = options.signingPasswordFile || process.env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD_PATH || "";
+  let passwordFile = options.signingPasswordFile || process.env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD_PATH || "";
+
+  if (!passwordFile && keyFile) {
+    const defaultPasswordFile = keyFile.replace(/\.key$/, ".pwd");
+    if (await pathExists(defaultPasswordFile)) {
+      passwordFile = defaultPasswordFile;
+    }
+  }
 
   if (!process.env.TAURI_SIGNING_PRIVATE_KEY && keyFile) {
     process.env.TAURI_SIGNING_PRIVATE_KEY = (await fs.readFile(keyFile, "utf8")).replace(/\r\n/g, "\n").trimEnd();
@@ -292,7 +299,7 @@ async function loadSigningEnvironment(options, rootDir) {
 
   if (!process.env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD && passwordFile) {
     const resolvedPasswordFile = resolveLocalPath(rootDir, passwordFile);
-    process.env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD = (await fs.readFile(resolvedPasswordFile, "utf8")).trimEnd();
+    process.env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD = (await fs.readFile(resolvedPasswordFile, "utf8")).trim();
   }
 
   if (process.env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD === undefined) {
@@ -501,6 +508,23 @@ async function signUpdaterArtifact(rootDir, artifactPath) {
   run(process.execPath, [tauriCliPath, "signer", "sign", artifactPath], { cwd: rootDir });
 }
 
+async function verifyMacAppVersion(appPath, expectedVersion) {
+  const infoPlistPath = path.join(appPath, "Contents", "Info.plist");
+  if (!(await pathExists(infoPlistPath))) {
+    fail(`Missing Info.plist in app bundle: ${infoPlistPath}`);
+  }
+
+  const plistVersion = runOutput("/usr/libexec/PlistBuddy", ["-c", "Print :CFBundleShortVersionString", infoPlistPath]).stdout.trim();
+  const bundleVersion = runOutput("/usr/libexec/PlistBuddy", ["-c", "Print :CFBundleVersion", infoPlistPath]).stdout.trim();
+
+  if (plistVersion !== expectedVersion && bundleVersion !== expectedVersion) {
+    fail(
+      `App bundle version mismatch in ${appPath}`,
+      `Expected version: ${expectedVersion}\nFound CFBundleShortVersionString: ${plistVersion}\nFound CFBundleVersion: ${bundleVersion}\nDid you skip the build step without recompiling the new version?`
+    );
+  }
+}
+
 async function buildMacAssets({ rootDir, version, assetsDir, skipBuild }) {
   cleanXattrs(
     [
@@ -537,6 +561,8 @@ async function buildMacAssets({ rootDir, version, assetsDir, skipBuild }) {
     if (!(await pathExists(target.appPath))) {
       fail(`Missing macOS app bundle: ${target.appPath}`);
     }
+
+    await verifyMacAppVersion(target.appPath, version);
 
     await signMacAppIfNeeded(target.appPath);
 
@@ -630,6 +656,34 @@ async function findLatestNsisInstaller(rootDir) {
   return installers[0].filePath;
 }
 
+async function verifyWindowsExeVersion(exePath, expectedVersion) {
+  if (process.platform !== "win32") {
+    return;
+  }
+
+  const result = runOutput(
+    "powershell",
+    [
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-Command",
+      `[System.Diagnostics.FileVersionInfo]::GetVersionInfo(${psQuote(exePath)}).ProductVersion`
+    ],
+    { stdio: "pipe" }
+  );
+
+  const fileVersion = result.stdout.trim();
+  const expectedWixVersion = toWindowsWixVersion(expectedVersion);
+
+  if (fileVersion !== expectedVersion && fileVersion !== expectedWixVersion) {
+    fail(
+      `Windows executable version mismatch in ${exePath}`,
+      `Expected version: ${expectedVersion} (or ${expectedWixVersion})\nFound ProductVersion: ${fileVersion}\nDid you skip the build step without recompiling the new version?`
+    );
+  }
+}
+
 async function buildWindowsAssets({ rootDir, version, assetsDir, skipBuild }) {
   if (!skipBuild) {
     run("rustup", ["target", "add", WINDOWS_X64_TARGET], { cwd: rootDir });
@@ -654,12 +708,14 @@ async function buildWindowsAssets({ rootDir, version, assetsDir, skipBuild }) {
   if (!(await pathExists(portableExe))) {
     fail(`Missing Windows portable exe: ${portableExe}`);
   }
+  await verifyWindowsExeVersion(portableExe, version);
 
   const zipPath = path.join(assetsDir, `${APP_NAME}_${version}_windows_x64.zip`);
   await fs.rm(zipPath, { force: true });
   compressArchive(portableExe, zipPath, rootDir);
 
   const nsisInstaller = await findLatestNsisInstaller(rootDir);
+  await verifyWindowsExeVersion(nsisInstaller, version);
   const updaterPath = path.join(assetsDir, `${APP_NAME}_${version}_updater_windows_x86_64.exe`);
   await fs.copyFile(nsisInstaller, updaterPath);
   await signUpdaterArtifact(rootDir, updaterPath);
