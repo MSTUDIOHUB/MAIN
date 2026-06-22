@@ -1,20 +1,19 @@
-import { memo, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
-import { IconChevronDown, IconChevronUp, IconColumns, IconFileText, IconInfo, IconLock, IconUnlock } from "./Icons";
+import { memo, useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
+import { IconColumns, IconFileText, IconInfo } from "./Icons";
 import type { TurnProgressItem } from "../lib/turnProgress";
 import { buildPlanTaskEvidenceAudit, isPlanTaskAwaitingBrowserValidation, isPlanTaskAwaitingExternalValidation, type PlanExecutionEvidenceEntry, type PlanStage, type PlanTask, type ReplyOption } from "../lib/workflowModels";
 import type { PendingRunDecision, PendingRunDecisionChoice } from "../lib/runIntent";
 import { inferReplyOptionActionFromText } from "../lib/replyOptions";
 import MarkdownRenderer from "./MarkdownRenderer";
 
-// region: TopIsland 属性定义
-interface TopIslandProps {
+// region: ExecutionCapsule 属性定义
+interface ExecutionCapsuleProps {
   title: string;
   status: string;
   statusToneClass: string;
   language: "zh" | "en";
   themeMode: "light" | "dark" | "black";
   chatFontSize?: number;
-  isVisible?: boolean;
   isRunActive?: boolean;
   planTasks: PlanTask[];
   planExecutionEvidenceLedger?: PlanExecutionEvidenceEntry[];
@@ -41,7 +40,6 @@ interface TopIslandProps {
   onApproveDiffSession?: () => void;
   onOpenPlan: () => void;
   onOpenDiff: () => void;
-  onHeightChange?: (height: number) => void;
 }
 // endregion
 
@@ -100,7 +98,7 @@ function getStageLabel(stage: PlanStage, language: "zh" | "en"): string {
   return (language === "zh" ? zh : en)[stage];
 }
 
-function renderFormattedLabel(text: string): React.ReactNode {
+function renderFormattedLabel(text: string): ReactNode {
   if (!text) return "";
   const parts = text.split(/(\*\*[^*]+\*\*|`[^`]+`)/g);
   return parts.map((part, index) => {
@@ -125,14 +123,13 @@ function renderFormattedLabel(text: string): React.ReactNode {
   });
 }
 
-const TopIsland = memo(function TopIsland({
+const ExecutionCapsule = memo(function ExecutionCapsule({
   title,
   status,
   statusToneClass,
   language,
   themeMode,
   chatFontSize = 13,
-  isVisible = true,
   isRunActive = false,
   planTasks,
   planExecutionEvidenceLedger = [],
@@ -159,14 +156,9 @@ const TopIsland = memo(function TopIsland({
   onApproveDiffSession,
   onOpenPlan,
   onOpenDiff,
-  onHeightChange,
-}: TopIslandProps) {
-  const [hovered, setHovered] = useState(false);
-  const [pinnedOpen, setPinnedOpen] = useState(false);
-  const [manualChoiceCollapsedKey, setManualChoiceCollapsedKey] = useState<string | null>(null);
+}: ExecutionCapsuleProps) {
   const [customReplyText, setCustomReplyText] = useState("");
   const [planAdjustmentText, setPlanAdjustmentText] = useState("");
-  const shellRef = useRef<HTMLDivElement | null>(null);
 
   const [activeTabIdx, setActiveTabIdx] = useState(0);
   const [tabSelections, setTabSelections] = useState<Record<string, string[]>>({});
@@ -265,22 +257,13 @@ const TopIsland = memo(function TopIsland({
   const hasRealChoiceOptions = realChoiceOptions.length > 0;
   const hasApprovalActionOptions = approvalActionOptions.length > 0;
 
-  // region: TopIsland 展开时机
+  // region: ExecutionCapsule 展开时机
   const hasReplyOptions = hasRealChoiceOptions || hasApprovalActionOptions;
   const hasPendingRunDecision = !!pendingRunDecision;
   const activeReviewTask = pendingToolReview || activeDiffTask;
   const hasPendingToolReview = !!activeReviewTask;
   const hasActiveDiffPreview = !!activeReviewTask?.diff;
   const hasChoicePromptContent = hasReplyOptions || isAwaitingChoice || hasPendingRunDecision;
-  const choicePromptKey = useMemo(() => {
-    if (!hasChoicePromptContent) return "";
-    return [
-      isAwaitingChoice ? "awaiting" : "ready",
-      pendingRunDecision ? `${pendingRunDecision.kind}:${pendingRunDecision.title || ""}:${pendingRunDecision.reason || ""}` : "",
-      replyOptions.map((option) => `${option.label}:${option.value}:${option.action || "none"}`).join("|"),
-    ].join("::");
-  }, [hasChoicePromptContent, isAwaitingChoice, pendingRunDecision, replyOptions]);
-  const isChoicePromptManuallyCollapsed = !!choicePromptKey && manualChoiceCollapsedKey === choicePromptKey;
   const hasExpandableContent =
     hasReplyOptions ||
     isAwaitingChoice ||
@@ -289,17 +272,7 @@ const TopIsland = memo(function TopIsland({
     canApprovePlan ||
     planTasks.length > 0 ||
     executionSteps.length > 0;
-  const hasNonChoiceExpandableContent = hasPendingToolReview || canApprovePlan || planTasks.length > 0 || executionSteps.length > 0;
-  const choicePromptForcesExpanded = hasChoicePromptContent && !isChoicePromptManuallyCollapsed;
-  const forceExpanded = choicePromptForcesExpanded || hasPendingToolReview || canApprovePlan;
-  const hoverExpandableContent = isChoicePromptManuallyCollapsed ? hasNonChoiceExpandableContent : hasExpandableContent;
   const actionable = hasChoicePromptContent || hasPendingToolReview || canApprovePlan;
-  const isPlanApprovalOnly =
-    canApprovePlan &&
-    !hasReplyOptions &&
-    !isAwaitingChoice &&
-    !hasPendingRunDecision &&
-    !hasPendingToolReview;
   const activeProgressMode = planTasks.length > 0 ? "plan" : progressMode === "execution" ? "execution" : executionSteps.length > 0 ? "execution" : "plan";
   const planTaskAudit = useMemo(
     () => buildPlanTaskEvidenceAudit({ tasks: planTasks, evidenceLedger: planExecutionEvidenceLedger }),
@@ -331,8 +304,7 @@ const TopIsland = memo(function TopIsland({
   }, [activeProgressMode, auditedPlanTasks, executionSteps]);
   const hasTasks = progressItems.length > 0;
   const shouldCompactTasksForReview = hasPendingToolReview && hasTasks;
-  const shouldExpandWidth = forceExpanded || (hoverExpandableContent && (hovered || pinnedOpen));
-  const isExpanded = forceExpanded || (hoverExpandableContent && (hovered || pinnedOpen));
+  const isExpanded = hasExpandableContent;
   // endregion
   const completedCount = progressItems.filter((item) => item.complete).length;
   const progress = progressItems.length > 0 ? Math.round((completedCount / progressItems.length) * 100) : 0;
@@ -423,13 +395,8 @@ const TopIsland = memo(function TopIsland({
   }), [activeProgressMode, completedCount, language, progressItems.length]);
 
   const isBlackTheme = themeMode === "black";
-  const shellClass = themeMode === "light"
-    ? "bg-[rgba(255,255,255,0.72)] border-[rgba(15,23,42,0.1)] shadow-[0_18px_50px_rgba(15,23,42,0.12)]"
-    : isBlackTheme
-    ? "bg-[rgba(3,3,4,0.72)] border-[rgba(255,255,255,0.07)] shadow-[0_22px_70px_rgba(0,0,0,0.42)]"
-    : "bg-[rgba(10,10,16,0.68)] border-[rgba(255,255,255,0.08)] shadow-[0_20px_60px_rgba(0,0,0,0.28)]";
   const activeRunOutline = isRunActive
-    ? "ring-1 ring-[var(--accent)] ring-offset-1 ring-offset-transparent"
+    ? "rounded-2xl ring-1 ring-[var(--accent)] ring-offset-1 ring-offset-transparent"
     : "";
   const primaryText = themeMode === "light" ? "text-[#111827]" : "text-[#f5f5f5]";
   const secondaryText = themeMode === "light" ? "text-[#4b5563]" : "text-[#71717a]";
@@ -450,7 +417,7 @@ const TopIsland = memo(function TopIsland({
     : "border-[color-mix(in_srgb,var(--accent-light)_46%,#202026)] bg-[#09090b] shadow-[inset_3px_0_0_color-mix(in_srgb,var(--accent-light)_72%,transparent)]";
   const normalizedCustomReply = customReplyText.replace(/\s+/g, " ").trim();
   const normalizedPlanAdjustment = planAdjustmentText.replace(/\s+/g, " ").trim();
-  const showChoicePromptContent = !isChoicePromptManuallyCollapsed;
+  const showChoicePromptContent = true;
   const showPendingRunDecision = !!pendingRunDecision && showChoicePromptContent;
   const showAwaitingChoice = isAwaitingChoice && showChoicePromptContent;
   const choiceTextFontSize = Math.max(12, chatFontSize);
@@ -460,9 +427,9 @@ const TopIsland = memo(function TopIsland({
   const customChoiceNumber = hasRealChoiceOptions ? realChoiceOptions.length + 1 : 1;
   const choiceTextStyle = { fontSize: `${choiceTextFontSize}px`, lineHeight: `${choiceTextLineHeight}px` };
   const choiceSectionStyle = { fontSize: `${choiceSectionFontSize}px`, lineHeight: `${choiceSectionLineHeight}px` };
-  const choiceOptionButtonClass = "top-island-choice-option w-full min-w-0 rounded-xl border px-3 py-2.5 text-left transition-all duration-150";
-  const choiceNumberClass = "top-island-choice-number w-7 shrink-0 text-right font-semibold transition-colors duration-150";
-  const approvalOptionButtonClass = "top-island-approval-option w-full rounded-xl border px-3 py-2.5 text-left transition-all duration-150";
+  const choiceOptionButtonClass = "execution-capsule-choice-option w-full min-w-0 rounded-xl border px-3 py-2.5 text-left transition-all duration-150";
+  const choiceNumberClass = "execution-capsule-choice-number w-7 shrink-0 text-right font-semibold transition-colors duration-150";
+  const approvalOptionButtonClass = "execution-capsule-approval-option w-full rounded-xl border px-3 py-2.5 text-left transition-all duration-150";
   const neutralActionButtonClass = themeMode === "light"
     ? "rounded-xl border border-[rgba(15,23,42,0.14)] bg-[rgba(255,255,255,0.72)] text-[#334155] transition-all duration-150 hover:border-[var(--accent)] hover:bg-[var(--accent-subtle)] hover:text-[#111827]"
     : isBlackTheme
@@ -488,52 +455,19 @@ const TopIsland = memo(function TopIsland({
     setPlanAdjustmentText("");
   };
 
-  useEffect(() => {
-    if (!choicePromptKey || (manualChoiceCollapsedKey && manualChoiceCollapsedKey !== choicePromptKey)) {
-      setManualChoiceCollapsedKey(null);
-    }
-  }, [choicePromptKey, manualChoiceCollapsedKey]);
-
-  // region: TopIsland 高度同步
-  useEffect(() => {
-    if (!onHeightChange) return undefined;
-    const node = shellRef.current;
-    if (!node) return undefined;
-
-    const reportHeight = () => {
-      onHeightChange(node.offsetHeight);
-    };
-
-    reportHeight();
-    const observer = new ResizeObserver(reportHeight);
-    observer.observe(node);
-    return () => {
-      observer.disconnect();
-    };
-  }, [onHeightChange]);
-  // endregion
-
   return (
     <div
-      className={`pointer-events-none absolute left-0 right-0 top-[58px] z-30 flex justify-center px-4 transition-all duration-250 ease-out ${
-        isVisible ? "translate-y-0 opacity-100" : "-translate-y-2 opacity-0"
-      }`}
+      data-testid="execution-capsule-shell"
+      data-run-active={isRunActive ? "true" : "false"}
+      className={`execution-capsule-controls w-full min-w-0 [&_button]:pointer-events-auto [&_input]:pointer-events-auto [&_textarea]:pointer-events-auto [&_select]:pointer-events-auto ${activeRunOutline}`}
     >
-      <div
-        ref={shellRef}
-        data-testid="top-island-shell"
-        data-run-active={isRunActive ? "true" : "false"}
-        onMouseEnter={() => setHovered(true)}
-        onMouseLeave={() => setHovered(false)}
-        className={`w-full overflow-hidden rounded-[28px] border backdrop-blur-2xl backdrop-saturate-150 transition-all duration-300 ease-out [&_button]:pointer-events-auto [&_input]:pointer-events-auto [&_textarea]:pointer-events-auto [&_select]:pointer-events-auto ${isVisible && !isPlanApprovalOnly ? "pointer-events-auto" : "pointer-events-none"} ${shouldExpandWidth ? "max-w-4xl" : "max-w-[580px]"} ${shellClass} ${activeRunOutline}`}
-      >
-        <div className="flex items-center justify-between gap-3 px-4 py-3">
-          <div className="min-w-0 flex items-center gap-2">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="min-w-0 flex flex-wrap items-center gap-2">
             <span className="shrink-0 text-[10px] uppercase tracking-[0.18em] text-[#71717a]">{copy.viewing}</span>
             <span className={`truncate text-[13px] font-semibold ${primaryText}`}>{title}</span>
             <span className={`shrink-0 rounded-full border px-2 py-0.5 text-[10px] ${statusToneClass}`}>{status}</span>
             {hasTasks && (
-              <span data-testid={activeProgressMode === "execution" ? "top-island-execution-badge" : "top-island-plan-badge"} className="theme-plan-pill shrink-0 rounded-full border px-2 py-0.5 text-[10px]">
+              <span data-testid={activeProgressMode === "execution" ? "execution-capsule-execution-badge" : "execution-capsule-plan-badge"} className="theme-plan-pill shrink-0 rounded-full border px-2 py-0.5 text-[10px]">
                 {activeProgressMode === "execution" ? copy.steps : copy.tasks} {completedCount}/{progressItems.length}
               </span>
             )}
@@ -560,51 +494,14 @@ const TopIsland = memo(function TopIsland({
             {!isExpanded && actionable && (
               <span className="shrink-0 h-2 w-2 rounded-full bg-[var(--accent)] animate-pulse" />
             )}
-          </div>
-          <div className="flex shrink-0 items-center gap-2">
-            {isChoicePromptManuallyCollapsed && (
-              <button
-                data-testid="top-island-show-options"
-                onClick={() => {
-                  setManualChoiceCollapsedKey(null);
-                  setPinnedOpen(true);
-                }}
-                className="rounded-full border border-[var(--accent-subtle-border)] bg-[var(--accent-subtle)] px-3 py-1 text-[11px] text-[var(--accent-light)] transition-colors hover:border-[var(--accent)] hover:bg-[var(--accent)] hover:text-[var(--accent-contrast)]"
-                title={copy.showOptions}
-              >
-                <span className="inline-flex items-center gap-1.5">
-                  <IconChevronDown className="h-3.5 w-3.5" />
-                  {copy.showOptions}
-                </span>
-              </button>
-            )}
-            <button
-              onClick={() => {
-                if (isChoicePromptManuallyCollapsed) {
-                  setManualChoiceCollapsedKey(null);
-                  setPinnedOpen(true);
-                  return;
-                }
-                setPinnedOpen((value) => !value);
-              }}
-              className="rounded-full border border-[#27272a] bg-[#09090b] p-1 text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#f5f5f5]"
-              title={pinnedOpen ? (language === "zh" ? "解除锁定" : "Unlock") : (language === "zh" ? "锁定展开" : "Pin Open")}
-            >
-              {pinnedOpen ? <IconUnlock className="h-4 w-4" /> : <IconLock className="h-4 w-4" />}
-            </button>
-          </div>
         </div>
+      </div>
 
-        <div
-          className={`grid transition-all duration-250 ease-out ${
-            isExpanded ? "grid-rows-[1fr] opacity-100" : "grid-rows-[0fr] opacity-0"
-          }`}
-        >
-          <div className="overflow-hidden">
-            <div className="border-t border-[rgba(255,255,255,0.06)] px-4 pb-4 pt-3">
+      {isExpanded && (
+        <div className="mt-3 border-t border-[rgba(255,255,255,0.08)] pt-3">
             {showPendingRunDecision && (
               <div>
-                <div data-testid="top-island-pending-run-decision" className={`rounded-2xl border p-3 ${surface}`}>
+                <div data-testid="execution-capsule-pending-run-decision" className={`rounded-2xl border p-3 ${surface}`}>
                   <div className={`font-medium ${primaryText}`} style={choiceTextStyle}>
                     {pendingRunDecision.kind === "execution_consent"
                       ? copy.executionConsentTitle
@@ -644,7 +541,7 @@ const TopIsland = memo(function TopIsland({
                         </span>
                       </button>
                       <button
-                        data-testid="top-island-approve-once"
+                        data-testid="execution-capsule-approve-once"
                         onClick={() => onResolvePendingRunDecision?.("approve_once")}
                         className="theme-plan-primary rounded-lg px-4 py-2 text-[12px] font-semibold"
                         title={copy.executeOnceInfo}
@@ -660,9 +557,9 @@ const TopIsland = memo(function TopIsland({
                             key={`${option.id}-${index}`}
                             className="group flex min-w-0 items-center gap-2"
                           >
-                            <span data-testid={`top-island-intent-option-badge-${index}`} className={choiceNumberClass} style={choiceTextStyle}>{index + 1}.</span>
+                            <span data-testid={`execution-capsule-intent-option-badge-${index}`} className={choiceNumberClass} style={choiceTextStyle}>{index + 1}.</span>
                             <button
-                              data-testid={`top-island-intent-option-${option.id}`}
+                              data-testid={`execution-capsule-intent-option-${option.id}`}
                               onClick={() => onResolvePendingRunDecision?.(option.id)}
                               className={choiceOptionButtonClass}
                               style={choiceTextStyle}
@@ -696,7 +593,7 @@ const TopIsland = memo(function TopIsland({
             )}
 
             {hasTasks && (
-              <div data-testid={activeProgressMode === "execution" ? "top-island-execution-progress" : "top-island-plan-progress"} className={`${showPendingRunDecision ? "mt-3 " : ""}rounded-2xl border p-3 ${surface}`}>
+              <div data-testid={activeProgressMode === "execution" ? "execution-capsule-execution-progress" : "execution-capsule-plan-progress"} className={`${showPendingRunDecision ? "mt-3 " : ""}rounded-2xl border p-3 ${surface}`}>
                 <div className="flex items-center justify-between gap-3">
                   <div className={`text-[12px] font-medium ${primaryText}`}>{copy.taskSummary}</div>
                   <div className="flex items-center gap-2">
@@ -736,7 +633,7 @@ const TopIsland = memo(function TopIsland({
                     return (
                       <div
                         key={`${task.id}-${index}`}
-                        data-testid={isCurrentPlanTask ? "top-island-current-plan-task" : undefined}
+                        data-testid={isCurrentPlanTask ? "execution-capsule-current-plan-task" : undefined}
                         className={`flex items-start gap-3 rounded-xl border px-3 py-2 transition-colors ${
                           isCurrentPlanTask ? currentTaskRowClass : taskRowClass
                         }`}
@@ -782,7 +679,7 @@ const TopIsland = memo(function TopIsland({
             )}
 
             {showAwaitingChoice && (
-              <div data-testid="top-island-awaiting-choice" className={`mt-3 rounded-2xl border p-3 ${surface}`}>
+              <div data-testid="execution-capsule-awaiting-choice" className={`mt-3 rounded-2xl border p-3 ${surface}`}>
                 <div className={`font-medium ${primaryText}`} style={choiceTextStyle}>{copy.chooseToContinue}</div>
                 <div className={`mt-1 ${secondaryText}`} style={choiceTextStyle}>
                   {hasRealChoiceOptions ? copy.choicePrompt : hasApprovalActionOptions ? copy.approvalActionsHint : copy.choiceHint}
@@ -915,9 +812,9 @@ const TopIsland = memo(function TopIsland({
                                 key={`${option.value}-${index}`}
                                 className="group flex min-w-0 items-center gap-2"
                               >
-                                <span data-testid={`top-island-reply-option-badge-${index}`} className={choiceNumberClass} style={choiceTextStyle}>{index + 1}.</span>
+                                <span data-testid={`execution-capsule-reply-option-badge-${index}`} className={choiceNumberClass} style={choiceTextStyle}>{index + 1}.</span>
                                 <button
-                                  data-testid={`top-island-reply-option-${index}`}
+                                  data-testid={`execution-capsule-reply-option-${index}`}
                                   onClick={() => onSelectReplyOption?.(option)}
                                   className={choiceOptionButtonClass}
                                   style={choiceTextStyle}
@@ -938,7 +835,7 @@ const TopIsland = memo(function TopIsland({
                     )}
 
                     {hasApprovalActionOptions && (
-                      <div data-testid="top-island-approval-actions" className={`rounded-xl border p-3 ${surface}`}>
+                      <div data-testid="execution-capsule-approval-actions" className={`rounded-xl border p-3 ${surface}`}>
                         <div className={`font-medium uppercase tracking-[0.14em] ${secondaryText}`} style={choiceSectionStyle}>
                           {copy.approvalActionsTitle}
                         </div>
@@ -947,7 +844,7 @@ const TopIsland = memo(function TopIsland({
                           {approvalActionOptions.map((option, index) => (
                             <button
                               key={`${option.value}-${index}`}
-                              data-testid={`top-island-approval-option-${index}`}
+                              data-testid={`execution-capsule-approval-option-${index}`}
                               onClick={() => onSelectReplyOption?.(option)}
                               className={approvalOptionButtonClass}
                               style={choiceTextStyle}
@@ -964,21 +861,21 @@ const TopIsland = memo(function TopIsland({
                     )}
 
                     {!tabGroups && (
-                      <form onSubmit={submitCustomReply} data-testid="top-island-custom-reply-row" className="group flex min-w-0 items-center gap-2">
-                        <span data-testid="top-island-custom-reply-badge" className={choiceNumberClass} style={choiceTextStyle}>{customChoiceNumber}.</span>
+                      <form onSubmit={submitCustomReply} data-testid="execution-capsule-custom-reply-row" className="group flex min-w-0 items-center gap-2">
+                        <span data-testid="execution-capsule-custom-reply-badge" className={choiceNumberClass} style={choiceTextStyle}>{customChoiceNumber}.</span>
                         <div className="min-w-0 flex-1">
                           <div className="flex min-w-0 items-center gap-2">
                             <input
-                              data-testid="top-island-custom-reply-input"
+                              data-testid="execution-capsule-custom-reply-input"
                               value={customReplyText}
                               onChange={(event) => setCustomReplyText(event.target.value)}
                               placeholder={copy.customChoicePlaceholder}
-                              className="top-island-choice-input min-w-0 flex-1 rounded-xl border px-3 py-2.5 outline-none transition-all"
+                              className="execution-capsule-choice-input min-w-0 flex-1 rounded-xl border px-3 py-2.5 outline-none transition-all"
                               style={choiceTextStyle}
                             />
                             <button
                               type="submit"
-                              data-testid="top-island-custom-reply-submit"
+                              data-testid="execution-capsule-custom-reply-submit"
                               disabled={!normalizedCustomReply || !onSelectReplyOption}
                               className={`theme-plan-primary shrink-0 rounded-xl px-3 py-2.5 text-[12px] font-semibold transition-opacity ${
                                 normalizedCustomReply && onSelectReplyOption ? "opacity-100" : "cursor-not-allowed opacity-40"
@@ -1007,7 +904,7 @@ const TopIsland = memo(function TopIsland({
             {(activeReviewTask || canApprovePlan) && (
               <div className={`mt-3 grid gap-3 ${activeReviewTask && canApprovePlan ? "md:grid-cols-2" : ""}`}>
                 {activeReviewTask && (
-                  <div data-testid="top-island-tool-review" className={`rounded-2xl border p-3 ${surface}`}>
+                  <div data-testid="execution-capsule-tool-review" className={`rounded-2xl border p-3 ${surface}`}>
                     <div className="flex min-w-0 items-start justify-between gap-3">
                       <div className="min-w-0">
                         <div className={`text-[12px] font-medium ${primaryText}`}>{copy.pendingReview}</div>
@@ -1033,7 +930,7 @@ const TopIsland = memo(function TopIsland({
                         {copy.reject}
                       </button>
                       <button
-                        data-testid="top-island-tool-approve-session"
+                        data-testid="execution-capsule-tool-approve-session"
                         onClick={() => onApproveDiffSession?.()}
                         className={`rounded-lg border px-4 py-2 text-[12px] font-medium transition-colors ${
                           autoApproveTools
@@ -1048,7 +945,7 @@ const TopIsland = memo(function TopIsland({
                         </span>
                       </button>
                       <button
-                        data-testid="top-island-tool-approve-once"
+                        data-testid="execution-capsule-tool-approve-once"
                         onClick={() => onApproveDiffOnce?.()}
                         className="theme-plan-primary rounded-lg px-4 py-2 text-[12px] font-semibold"
                         title={copy.executeOnceInfo}
@@ -1083,23 +980,23 @@ const TopIsland = memo(function TopIsland({
                     <div className="mt-3 flex flex-col gap-2 px-1 sm:flex-row sm:items-center sm:justify-end">
                       <form
                         onSubmit={submitPlanAdjustment}
-                        data-testid="top-island-plan-adjust-form"
+                        data-testid="execution-capsule-plan-adjust-form"
                         className="flex w-full min-w-0 flex-1 items-center gap-2 sm:mr-auto"
                       >
                         <div className="min-w-0 flex-1">
                           <input
-                            data-testid="top-island-plan-adjust-input"
+                            data-testid="execution-capsule-plan-adjust-input"
                             value={planAdjustmentText}
                             onChange={(event) => setPlanAdjustmentText(event.target.value)}
                             placeholder={copy.adjustPlanPlaceholder}
-                            className="top-island-choice-input min-w-0 w-full rounded-xl border px-3 py-2 outline-none transition-all"
+                            className="execution-capsule-choice-input min-w-0 w-full rounded-xl border px-3 py-2 outline-none transition-all"
                             style={choiceTextStyle}
                             aria-label={copy.adjustPlan}
                           />
                         </div>
                         <button
                           type="submit"
-                          data-testid="top-island-plan-adjust-submit"
+                          data-testid="execution-capsule-plan-adjust-submit"
                           disabled={!normalizedPlanAdjustment || !onRequestPlanAdjustment}
                           className={`shrink-0 rounded-lg border px-3 py-2 text-[12px] font-medium transition-colors ${
                             normalizedPlanAdjustment && onRequestPlanAdjustment
@@ -1111,7 +1008,7 @@ const TopIsland = memo(function TopIsland({
                         </button>
                       </form>
                       <button
-                        data-testid="top-island-plan-reject-keep"
+                        data-testid="execution-capsule-plan-reject-keep"
                         onClick={onRejectPlan}
                         className="rounded-lg border border-[#3f3f46] bg-[#09090b] px-4 py-2 text-[12px] font-medium text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#f5f5f5]"
                       >
@@ -1119,7 +1016,7 @@ const TopIsland = memo(function TopIsland({
                       </button>
                       {onRejectAndDeletePlan && (
                         <button
-                          data-testid="top-island-plan-reject-delete"
+                          data-testid="execution-capsule-plan-reject-delete"
                           onClick={onRejectAndDeletePlan}
                           className="rounded-lg border border-[rgba(244,63,94,0.35)] bg-[#09090b] px-4 py-2 text-[12px] font-medium text-[#fb7185] transition-colors hover:bg-[rgba(244,63,94,0.12)] hover:text-[#fecdd3]"
                         >
@@ -1127,7 +1024,7 @@ const TopIsland = memo(function TopIsland({
                         </button>
                       )}
                       <button
-                        data-testid="top-island-plan-approve"
+                        data-testid="execution-capsule-plan-approve"
                         onClick={onApprovePlan}
                         className="theme-plan-primary rounded-lg px-4 py-2 text-[12px] font-semibold"
                       >
@@ -1138,33 +1035,10 @@ const TopIsland = memo(function TopIsland({
                 )}
               </div>
             )}
-
-            {hasChoicePromptContent && showChoicePromptContent && (
-              <div className="mt-3 flex justify-center">
-                <button
-                  data-testid="top-island-collapse-options"
-                  onClick={() => {
-                    if (choicePromptKey) setManualChoiceCollapsedKey(choicePromptKey);
-                    setPinnedOpen(false);
-                    setHovered(false);
-                  }}
-                  className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-[11px] transition-colors ${
-                    themeMode === "light"
-                      ? "border-[rgba(15,23,42,0.12)] bg-[rgba(255,255,255,0.55)] text-[#4b5563] hover:bg-white hover:text-[#111827]"
-                      : "border-[#27272a] bg-[#09090b] text-[#a1a1aa] hover:bg-[#18181b] hover:text-[#f5f5f5]"
-                  }`}
-                >
-                  <IconChevronUp className="h-3.5 w-3.5" />
-                  {copy.collapseOptions}
-                </button>
-              </div>
-            )}
-            </div>
-          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 });
 
-export default TopIsland;
+export default ExecutionCapsule;

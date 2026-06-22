@@ -323,6 +323,7 @@ const SESSION_AUTO_APPROVE_SCOPE_SET = new Set<SessionAutoApproveScope>([
   "local_file_read",
   "external_write",
   "browser_control",
+  "mcp_action",
 ]);
 const DEFAULT_SESSION_AUTO_APPROVE_SCOPES: SessionAutoApproveScope[] = [
   "workspace_write",
@@ -330,6 +331,7 @@ const DEFAULT_SESSION_AUTO_APPROVE_SCOPES: SessionAutoApproveScope[] = [
   "local_file_read",
   "external_write",
   "browser_control",
+  "mcp_action",
 ];
 
 function normalizeSessionAutoApproveScopes(value: unknown): SessionAutoApproveScope[] {
@@ -453,8 +455,6 @@ export const translations = {
     hooksEnabled: "Enable lifecycle hooks",
     sessionRecording: "Record project sessions",
     sessionRecordingDesc: "Save full conversations in MAIN app data so project history can be restored without writing chat logs into .MAIN.",
-    enableCapsule: "Enable execution capsule",
-    enableCapsuleDesc: "When enabled, dynamic agent execution status and brief descriptions are displayed in a floating capsule. When disabled, these statuses are permanently displayed directly in the chat message area.",
     refreshRules: "Refresh rules",
     instructionSources: "Resolved instruction sources",
     hookConfig: "Loaded hook definitions",
@@ -563,8 +563,6 @@ export const translations = {
     hooksEnabled: "启用生命周期 Hooks",
     sessionRecording: "记录项目会话",
     sessionRecordingDesc: "将完整对话保存到 MAIN 应用数据目录，方便恢复项目历史，但不会把聊天流水写进 .MAIN。",
-    enableCapsule: "启用执行胶囊 (Capsule)",
-    enableCapsuleDesc: "开启时，智能助手的动态执行进度与简要说明将在浮动胶囊中显示；关闭时，这些执行过程中的状态与说明将永久直接显示在聊天消息区域中。",
     refreshRules: "刷新规则",
     instructionSources: "已解析的指令来源",
     hookConfig: "已加载 Hook 定义",
@@ -880,7 +878,6 @@ export interface AppConfig {
   cloudExperimentalLoginEnabled: boolean;
   imAdapters: ImAdaptersConfig;
   workspace: string;
-  enableCapsule: boolean;
 }
 
 export type AgentStatus = "idle" | "running" | "pending_review" | "error";
@@ -9546,7 +9543,6 @@ export const useAppStore = create<AppState>()(
           toolPermissionPolicy: normalizeToolPermissionPolicy((persistedConfig as any).toolPermissionPolicy),
           mcpRouting: normalizeMcpRoutingConfig((persistedConfig as any).mcpRouting),
           sessionRecordingEnabled: (persistedConfig as any).sessionRecordingEnabled ?? current.config.sessionRecordingEnabled,
-          enableCapsule: (persistedConfig as any).enableCapsule !== false,
           debugRecordFullTurnProcess: (persistedConfig as any).debugRecordFullTurnProcess === true,
           eventStreamMode: normalizeEventStreamMode(
             (persistedConfig as any).eventStreamMode,
@@ -9684,11 +9680,11 @@ async function requestSemanticTurnMetadata(params: {
           "If image/file context is listed, use it to infer the task subject. Do not ignore screenshots, attachments, or @ files.",
           "Ignore usernames, timestamps, transcript prefixes, copied meta text, and reasoning-style wording.",
           "Generate:",
-          "- title: short clean UI title for sidebar / TopIsland, plain text only, no quotes, no markdown, no intent prefix.",
+          "- title: short clean UI title for sidebar / ExecutionCapsule, plain text only, no quotes, no markdown, no intent prefix.",
           "- summary: one concise user-facing summary of the real intent, plain text only.",
           "Keep the output in the user's language.",
           "JSON shape:",
-          "{\"title\":\"修正标题同步逻辑\",\"summary\":\"调整 sidebar 与 TopIsland 的标题与摘要生成逻辑\"}",
+          "{\"title\":\"修正标题同步逻辑\",\"summary\":\"调整 sidebar 与 ExecutionCapsule 的标题与摘要生成逻辑\"}",
         ].join("\n"),
       },
       {

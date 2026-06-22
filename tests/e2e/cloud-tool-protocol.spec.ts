@@ -886,8 +886,8 @@ test("reply options pause before mixed XML tool calls and continue from the sour
   );
   expect(sent).toBe(true);
 
-  await expect(page.getByTestId("top-island-awaiting-choice")).toBeVisible();
-  await expect(page.getByTestId("top-island-reply-option-0")).toContainText("保守方案");
+  await expect(page.getByTestId("execution-capsule-awaiting-choice")).toBeVisible();
+  await expect(page.getByTestId("execution-capsule-reply-option-0")).toContainText("保守方案");
 
   await expect
     .poll(async () =>
@@ -909,7 +909,7 @@ test("reply options pause before mixed XML tool calls and continue from the sour
       readFileCalls: 0,
     });
 
-  await page.getByTestId("top-island-reply-option-0").click();
+  await page.getByTestId("execution-capsule-reply-option-0").click();
   await expect(page.getByText("已按保守方案继续，当前回合保持完整。")).toBeVisible();
 
   await expect
@@ -980,8 +980,8 @@ test("unity first-iteration fallback does not override explicit reply options", 
   );
   expect(sent).toBe(true);
 
-  await expect(page.getByTestId("top-island-awaiting-choice")).toBeVisible();
-  await expect(page.getByTestId("top-island-reply-option-0")).toContainText("继续执行轻量读取路径");
+  await expect(page.getByTestId("execution-capsule-awaiting-choice")).toBeVisible();
+  await expect(page.getByTestId("execution-capsule-reply-option-0")).toContainText("继续执行轻量读取路径");
 
   await expect
     .poll(async () =>
@@ -1082,10 +1082,10 @@ test("execute quick reply switches a respond turn to execute runtime and keeps t
   );
   expect(sent).toBe(true);
 
-  await expect(page.getByTestId("top-island-awaiting-choice")).toBeVisible();
-  await expect(page.getByTestId("top-island-reply-option-0")).toContainText("直接执行部署脚本");
+  await expect(page.getByTestId("execution-capsule-awaiting-choice")).toBeVisible();
+  await expect(page.getByTestId("execution-capsule-reply-option-0")).toContainText("直接执行部署脚本");
 
-  await page.getByTestId("top-island-reply-option-0").click();
+  await page.getByTestId("execution-capsule-reply-option-0").click();
 
   await expect
     .poll(async () =>
@@ -1123,8 +1123,8 @@ test("plain fix request shows operation approval before execute tools", async ({
   );
   expect(sent).toBe(true);
 
-  await expect(page.getByTestId("top-island-pending-run-decision")).toBeVisible();
-  await expect(page.getByTestId("top-island-intent-option-execute")).toContainText("批准执行本轮操作");
+  await expect(page.getByTestId("execution-capsule-pending-run-decision")).toBeVisible();
+  await expect(page.getByTestId("execution-capsule-intent-option-execute")).toContainText("批准执行本轮操作");
 
   await expect
     .poll(async () =>
@@ -1144,7 +1144,7 @@ test("plain fix request shows operation approval before execute tools", async ({
       requestCount: 0,
     });
 
-  await page.getByTestId("top-island-intent-option-execute").click();
+  await page.getByTestId("execution-capsule-intent-option-execute").click();
 
   await expect
     .poll(async () =>
@@ -1182,10 +1182,10 @@ test("game studio execute reply resumes the source turn with studio workflow too
   );
   expect(sent).toBe(true);
 
-  await expect(page.getByTestId("top-island-awaiting-choice")).toBeVisible();
-  await expect(page.getByTestId("top-island-reply-option-0")).toContainText("立即开始重构并完善");
+  await expect(page.getByTestId("execution-capsule-awaiting-choice")).toBeVisible();
+  await expect(page.getByTestId("execution-capsule-reply-option-0")).toContainText("立即开始重构并完善");
 
-  await page.getByTestId("top-island-reply-option-0").click();
+  await page.getByTestId("execution-capsule-reply-option-0").click();
 
   await expect
     .poll(async () =>
@@ -1712,8 +1712,8 @@ test("ordinary execute repeated read-only loops create a recovery pause instead 
 test("approved plan resumes with execute runtime tools while preserving plan turn identity", async ({ page }) => {
   await page.goto("/?e2eScenario=plan-approval-execute-tools");
 
-  await expect(page.getByTestId("top-island-plan-approve")).toBeVisible();
-  await page.getByTestId("top-island-plan-approve").click();
+  await expect(page.getByTestId("execution-capsule-plan-approve")).toBeVisible();
+  await page.getByTestId("execution-capsule-plan-approve").click();
 
   await expect
     .poll(async () =>

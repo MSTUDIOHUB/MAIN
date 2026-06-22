@@ -14,34 +14,34 @@ test("reply options pause the turn and continue within the same turn after selec
 
   await expect(page.getByTestId("plan-stage-badge")).toContainText("待选择");
   await expect(page.getByTestId("reply-option-0")).toHaveCount(0);
-  await expect(page.getByTestId("top-island-awaiting-choice")).toBeVisible();
-  await expect(page.getByTestId("top-island-reply-option-0")).toBeVisible();
-  await expect(page.getByTestId("top-island-collapse-options")).toContainText("收起选项");
+  await expect(page.getByTestId("execution-capsule-awaiting-choice")).toBeVisible();
+  await expect(page.getByTestId("execution-capsule-reply-option-0")).toBeVisible();
+  await expect(page.getByTestId("execution-capsule-collapse-options")).toContainText("收起选项");
 
-  await page.getByTestId("top-island-collapse-options").click();
-  await expect(page.getByTestId("top-island-awaiting-choice")).toHaveCount(0);
-  await expect(page.getByTestId("top-island-show-options")).toContainText("展开选项");
+  await page.getByTestId("execution-capsule-collapse-options").click();
+  await expect(page.getByTestId("execution-capsule-awaiting-choice")).toHaveCount(0);
+  await expect(page.getByTestId("execution-capsule-show-options")).toContainText("展开选项");
 
-  await page.getByTestId("top-island-shell").hover();
-  await expect(page.getByTestId("top-island-awaiting-choice")).toHaveCount(0);
+  await page.getByTestId("execution-capsule-shell").hover();
+  await expect(page.getByTestId("execution-capsule-awaiting-choice")).toHaveCount(0);
 
-  await page.getByTestId("top-island-show-options").click();
-  await expect(page.getByTestId("top-island-awaiting-choice")).toBeVisible();
-  await expect(page.getByTestId("top-island-reply-option-0")).toBeVisible();
-  await expect(page.getByTestId("top-island-reply-option-badge-0")).toHaveText("1.");
-  await expect(page.getByTestId("top-island-reply-option-badge-1")).toHaveText("2.");
-  await expect(page.getByTestId("top-island-custom-reply-badge")).toHaveText("3.");
+  await page.getByTestId("execution-capsule-show-options").click();
+  await expect(page.getByTestId("execution-capsule-awaiting-choice")).toBeVisible();
+  await expect(page.getByTestId("execution-capsule-reply-option-0")).toBeVisible();
+  await expect(page.getByTestId("execution-capsule-reply-option-badge-0")).toHaveText("1.");
+  await expect(page.getByTestId("execution-capsule-reply-option-badge-1")).toHaveText("2.");
+  await expect(page.getByTestId("execution-capsule-custom-reply-badge")).toHaveText("3.");
 
-  const optionBeforeHover = await page.getByTestId("top-island-reply-option-0").evaluate(
+  const optionBeforeHover = await page.getByTestId("execution-capsule-reply-option-0").evaluate(
     (node) => getComputedStyle(node).backgroundColor,
   );
-  await page.getByTestId("top-island-reply-option-0").hover();
-  const optionAfterHover = await page.getByTestId("top-island-reply-option-0").evaluate(
+  await page.getByTestId("execution-capsule-reply-option-0").hover();
+  const optionAfterHover = await page.getByTestId("execution-capsule-reply-option-0").evaluate(
     (node) => getComputedStyle(node).backgroundColor,
   );
   expect(optionAfterHover).not.toBe(optionBeforeHover);
 
-  await page.getByTestId("top-island-reply-option-0").click();
+  await page.getByTestId("execution-capsule-reply-option-0").click();
 
   await expect
     .poll(async () =>
@@ -79,9 +79,9 @@ test("reply options pause the turn and continue within the same turn after selec
 test("custom reply option continues within the same turn", async ({ page }) => {
   await page.goto("/?e2eScenario=awaiting-choice");
 
-  await expect(page.getByTestId("top-island-awaiting-choice")).toBeVisible();
-  await page.getByTestId("top-island-custom-reply-input").fill("我想先补一个轻量方案再继续");
-  await page.getByTestId("top-island-custom-reply-submit").click();
+  await expect(page.getByTestId("execution-capsule-awaiting-choice")).toBeVisible();
+  await page.getByTestId("execution-capsule-custom-reply-input").fill("我想先补一个轻量方案再继续");
+  await page.getByTestId("execution-capsule-custom-reply-submit").click();
 
   await expect
     .poll(async () =>
@@ -101,28 +101,28 @@ test("custom reply option continues within the same turn", async ({ page }) => {
 test("mixed choice options keep execution choices together and split read-only permissions", async ({ page }) => {
   await page.goto("/?e2eScenario=awaiting-choice-mixed-options");
 
-  await expect(page.getByTestId("top-island-awaiting-choice")).toBeVisible();
-  await expect(page.getByTestId("top-island-reply-option-0")).toBeVisible();
-  await expect(page.getByTestId("top-island-reply-option-1")).toBeVisible();
-  await expect(page.getByTestId("top-island-reply-option-2")).toBeVisible();
-  await expect(page.getByTestId("top-island-reply-option-3")).toHaveCount(0);
-  await expect(page.getByTestId("top-island-reply-option-badge-0")).toHaveText("1.");
-  await expect(page.getByTestId("top-island-reply-option-badge-1")).toHaveText("2.");
-  await expect(page.getByTestId("top-island-reply-option-badge-2")).toHaveText("3.");
-  await expect(page.getByTestId("top-island-reply-option-1")).toContainText("我来确认类型，然后执行修复");
-  await expect(page.getByTestId("top-island-custom-reply-badge")).toHaveText("4.");
+  await expect(page.getByTestId("execution-capsule-awaiting-choice")).toBeVisible();
+  await expect(page.getByTestId("execution-capsule-reply-option-0")).toBeVisible();
+  await expect(page.getByTestId("execution-capsule-reply-option-1")).toBeVisible();
+  await expect(page.getByTestId("execution-capsule-reply-option-2")).toBeVisible();
+  await expect(page.getByTestId("execution-capsule-reply-option-3")).toHaveCount(0);
+  await expect(page.getByTestId("execution-capsule-reply-option-badge-0")).toHaveText("1.");
+  await expect(page.getByTestId("execution-capsule-reply-option-badge-1")).toHaveText("2.");
+  await expect(page.getByTestId("execution-capsule-reply-option-badge-2")).toHaveText("3.");
+  await expect(page.getByTestId("execution-capsule-reply-option-1")).toContainText("我来确认类型，然后执行修复");
+  await expect(page.getByTestId("execution-capsule-custom-reply-badge")).toHaveText("4.");
 
-  const approvalSection = page.getByTestId("top-island-approval-actions");
+  const approvalSection = page.getByTestId("execution-capsule-approval-actions");
   await expect(approvalSection).toBeVisible();
   await expect(approvalSection).toContainText("只读授权动作");
-  await expect(page.getByTestId("top-island-approval-option-0")).toContainText("继续当前只读读取");
-  await expect(page.getByTestId("top-island-approval-option-1")).toContainText("当前会话只读步骤全部批准");
+  await expect(page.getByTestId("execution-capsule-approval-option-0")).toContainText("继续当前只读读取");
+  await expect(page.getByTestId("execution-capsule-approval-option-1")).toContainText("当前会话只读步骤全部批准");
 
-  const approvalBeforeHover = await page.getByTestId("top-island-approval-option-0").evaluate(
+  const approvalBeforeHover = await page.getByTestId("execution-capsule-approval-option-0").evaluate(
     (node) => getComputedStyle(node).backgroundColor,
   );
-  await page.getByTestId("top-island-approval-option-0").hover();
-  const approvalAfterHover = await page.getByTestId("top-island-approval-option-0").evaluate(
+  await page.getByTestId("execution-capsule-approval-option-0").hover();
+  const approvalAfterHover = await page.getByTestId("execution-capsule-approval-option-0").evaluate(
     (node) => getComputedStyle(node).backgroundColor,
   );
   expect(approvalAfterHover).not.toBe(approvalBeforeHover);
@@ -134,8 +134,8 @@ test("diagnostic statements are not rendered as awaiting-choice buttons", async 
   await expect(page.getByText("那问题可能出在 Vite 的构建过程中")).toBeVisible();
   await expect(page.getByText("App.css", { exact: true })).toBeVisible();
   await expect(page.getByText(/被自动引入了/)).toBeVisible();
-  await expect(page.getByTestId("top-island-awaiting-choice")).toHaveCount(0);
-  await expect(page.getByTestId("top-island-reply-option-0")).toHaveCount(0);
+  await expect(page.getByTestId("execution-capsule-awaiting-choice")).toHaveCount(0);
+  await expect(page.getByTestId("execution-capsule-reply-option-0")).toHaveCount(0);
 
   expect(await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().currentTurnStatus ?? null))
     .toBe("stopped_no_action");

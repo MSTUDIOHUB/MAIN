@@ -32,7 +32,7 @@ test.beforeEach(async ({ page }) => {
   });
 });
 
-test("TopIsland plan adjustment input can be clicked, focused, and submitted", async ({ page }) => {
+test("ExecutionCapsule plan adjustment input can be clicked, focused, and submitted", async ({ page }) => {
   await page.goto("/?e2eScenario=plan-flow");
 
   await expect(page.locator("body")).not.toContainText("[PROPOSAL START]");
@@ -42,13 +42,13 @@ test("TopIsland plan adjustment input can be clicked, focused, and submitted", a
   await page.getByTestId("plan-save-button").click();
   await expect(page.getByTestId("plan-save-button")).toHaveAttribute("data-save-state", "saved");
 
-  const adjustmentInput = page.getByTestId("top-island-plan-adjust-input");
+  const adjustmentInput = page.getByTestId("execution-capsule-plan-adjust-input");
   await expect(adjustmentInput).toBeVisible();
   await adjustmentInput.click();
   await expect(adjustmentInput).toBeFocused();
   await adjustmentInput.pressSequentially("请把验证步骤写得更具体");
 
-  await page.getByTestId("top-island-plan-adjust-submit").click();
+  await page.getByTestId("execution-capsule-plan-adjust-submit").click();
   await expect
     .poll(async () =>
       page.evaluate(() =>
@@ -96,12 +96,12 @@ test("plan flow supports save then approve and finish", async ({ page }) => {
     )
     .toBe(1);
 
-  await expect(page.getByTestId("top-island-plan-approve")).toBeVisible();
-  await expect(page.getByTestId("top-island-plan-reject-keep")).toContainText("拒绝并保留");
-  await expect(page.getByTestId("top-island-plan-reject-delete")).toContainText("拒绝并删除");
-  await expect(page.getByTestId("top-island-plan-adjust-input")).toBeVisible();
-  await page.getByTestId("top-island-plan-adjust-input").fill("请把验证步骤写得更具体");
-  await page.getByTestId("top-island-plan-adjust-submit").click();
+  await expect(page.getByTestId("execution-capsule-plan-approve")).toBeVisible();
+  await expect(page.getByTestId("execution-capsule-plan-reject-keep")).toContainText("拒绝并保留");
+  await expect(page.getByTestId("execution-capsule-plan-reject-delete")).toContainText("拒绝并删除");
+  await expect(page.getByTestId("execution-capsule-plan-adjust-input")).toBeVisible();
+  await page.getByTestId("execution-capsule-plan-adjust-input").fill("请把验证步骤写得更具体");
+  await page.getByTestId("execution-capsule-plan-adjust-submit").click();
   await expect
     .poll(async () =>
       page.evaluate(() =>
@@ -132,8 +132,8 @@ test("plan flow supports save then approve and finish", async ({ page }) => {
     () => (window as any).__CODELY_E2E__?.getSnapshot?.().taskFlowUserCount ?? 0,
   );
 
-  await expect(page.getByTestId("top-island-plan-approve")).toBeVisible();
-  await page.getByTestId("top-island-plan-approve").click();
+  await expect(page.getByTestId("execution-capsule-plan-approve")).toBeVisible();
+  await page.getByTestId("execution-capsule-plan-approve").click();
 
   await expect
     .poll(async () =>
@@ -207,10 +207,10 @@ test("plan flow supports save then approve and finish", async ({ page }) => {
 test("plan approval quick reply approves instead of re-sending an unapproved plan turn", async ({ page }) => {
   await page.goto("/?e2eScenario=plan-quick-reply-approval");
 
-  await expect(page.getByTestId("top-island-awaiting-choice")).toBeVisible();
-  await expect(page.getByTestId("top-island-reply-option-0")).toContainText("批准执行");
+  await expect(page.getByTestId("execution-capsule-awaiting-choice")).toBeVisible();
+  await expect(page.getByTestId("execution-capsule-reply-option-0")).toContainText("批准执行");
 
-  await page.getByTestId("top-island-reply-option-0").click();
+  await page.getByTestId("execution-capsule-reply-option-0").click();
 
   await expect
     .poll(async () =>
@@ -246,10 +246,10 @@ for (const scenario of ["plan-quick-reply-materialize-gemma", "plan-quick-reply-
   test(`${scenario} materializes visible plan before approval`, async ({ page }) => {
     await page.goto(`/?e2eScenario=${scenario}`);
 
-    await expect(page.getByTestId("top-island-awaiting-choice")).toBeVisible();
-    await expect(page.getByTestId("top-island-reply-option-0")).toContainText("批准执行");
+    await expect(page.getByTestId("execution-capsule-awaiting-choice")).toBeVisible();
+    await expect(page.getByTestId("execution-capsule-reply-option-0")).toContainText("批准执行");
 
-    await page.getByTestId("top-island-reply-option-0").click();
+    await page.getByTestId("execution-capsule-reply-option-0").click();
 
     await expect
       .poll(async () =>

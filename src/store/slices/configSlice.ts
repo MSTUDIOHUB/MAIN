@@ -62,7 +62,6 @@ export const defaultConfig: AppConfig = {
   cloudExperimentalLoginEnabled: false,
   imAdapters: createDefaultImAdaptersConfig(),
   workspace: "",
-  enableCapsule: true,
 };
 
 export function normalizeAppIconVariant(value: unknown): AppConfig["appIconVariant"] {

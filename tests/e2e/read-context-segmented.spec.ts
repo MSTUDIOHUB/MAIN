@@ -118,7 +118,7 @@ test("effective progress stays in ChatArea after plan card and follow-up message
 
   await expect(chat.getByText("我已经生成了可审批计划文件 .MAIN/plans/plan.md，现在停在审批阶段。")).toBeVisible();
   await expect(chat.getByText("后续消息已显示；上一轮有效进展应仍保留在 ChatArea 正文中。")).toBeVisible();
-  await expect(page.getByTestId("top-island")).toHaveCount(0);
+  await expect(page.getByTestId("execution-capsule")).toHaveCount(0);
 
   await readGroup.click();
   const details = chat.getByTestId("read-context-group-details");

@@ -148,7 +148,7 @@ function extractSymbols(text: string): string[] {
 }
 
 function hasUiDesignCue(text: string): boolean {
-  return /(?:UI|界面|页面|组件|面板|仪表盘|看板|卡片|表格视图|样式|视觉|主题|布局|交互|设计|design|layout|style|theme|component|panel|dashboard|TopIsland)/i.test(text);
+  return /(?:UI|界面|页面|组件|面板|仪表盘|看板|卡片|表格视图|样式|视觉|主题|布局|交互|设计|design|layout|style|theme|component|panel|dashboard|ExecutionCapsule)/i.test(text);
 }
 
 function hasExplicitStyleConfirmation(text: string): boolean {

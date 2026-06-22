@@ -184,7 +184,7 @@ export async function runIntentPreflight(params: {
     "Classify the user's next-turn intent for MAIN before execution.",
     "Allowed intents: respond, plan, execute, analyze, summarize, report, studio_workflow. `discuss` is legacy input only; return `respond` for ordinary natural replies.",
     "Only use studio_workflow if the text clearly belongs to MAIN GAME STUDIO.",
-    "Also provide title: a short clean UI title for sidebar / TopIsland. Ignore usernames, timestamps, and transcript noise.",
+    "Also provide title: a short clean UI title for sidebar / ExecutionCapsule. Ignore usernames, timestamps, and transcript noise.",
     "Also provide summary: a short user-facing intent summary of what MAIN is about to do. Do not copy the user's wording verbatim.",
     "Also provide reason: a brief routing reason for the chosen intent.",
     "Also provide riskLevel: low, medium, or high.",
@@ -195,7 +195,7 @@ export async function runIntentPreflight(params: {
     "If the request is ambiguous in a way that materially changes behavior, set needsUserChoice=true and provide a short user-facing question plus 2-3 clear options.",
     "Options must be plain user-facing choices, not reasoning.",
     "The JSON shape must be:",
-    "{\"intent\":\"respond|plan|execute|analyze|summarize|report|studio_workflow\",\"confidence\":0.0,\"riskLevel\":\"low|medium|high\",\"requiresApproval\":false,\"commandDirective\":{\"kind\":\"none|shell|unity|git|file_modify|report|plan_approval|plan_resume|studio|skill|knowledge|mcp\",\"action\":\"status\",\"target\":\"git\",\"source\":\"preflight\",\"requiresWorkspace\":true,\"requiresApproval\":true,\"confidence\":0.0,\"reason\":\"Git status request\"},\"title\":\"修正标题同步逻辑\",\"summary\":\"调整 sidebar 与 TopIsland 的标题同步逻辑\",\"reason\":\"The request asks for a concrete UI change.\",\"needsUserChoice\":false,\"question\":\"\",\"options\":[{\"id\":\"plan\",\"label\":\"先给方案\",\"value\":\"先给我一个方案和计划，再决定是否执行\"}],\"outputFormat\":\"answer|summary|report|plan|analysis|execution\",\"bypassMainRouter\":false,\"needsWorkspaceRead\":false}",
+    "{\"intent\":\"respond|plan|execute|analyze|summarize|report|studio_workflow\",\"confidence\":0.0,\"riskLevel\":\"low|medium|high\",\"requiresApproval\":false,\"commandDirective\":{\"kind\":\"none|shell|unity|git|file_modify|report|plan_approval|plan_resume|studio|skill|knowledge|mcp\",\"action\":\"status\",\"target\":\"git\",\"source\":\"preflight\",\"requiresWorkspace\":true,\"requiresApproval\":true,\"confidence\":0.0,\"reason\":\"Git status request\"},\"title\":\"修正标题同步逻辑\",\"summary\":\"调整 sidebar 与 ExecutionCapsule 的标题同步逻辑\",\"reason\":\"The request asks for a concrete UI change.\",\"needsUserChoice\":false,\"question\":\"\",\"options\":[{\"id\":\"plan\",\"label\":\"先给方案\",\"value\":\"先给我一个方案和计划，再决定是否执行\"}],\"outputFormat\":\"answer|summary|report|plan|analysis|execution\",\"bypassMainRouter\":false,\"needsWorkspaceRead\":false}",
     `Current visible mode: ${params.mainModeKey}`,
     `Preferred user language: ${params.language}`,
   ].join("\n");

@@ -805,18 +805,18 @@ test("runtime plan task derivation ignores status findings and tech-stack bullet
         "",
         "## 当前状态发现",
         "- 项目基于 Tauri + React + TypeScript + Ant Plan + ECharts。",
-        "- TopIsland 当前显示任务 7/8，但实际还在修复 1.1。",
+        "- ExecutionCapsule 当前显示任务 7/8，但实际还在修复 1.1。",
         "",
         "## 执行顺序",
-        "- 修改 src/components/TopIsland.tsx 的任务进度来源。",
+        "- 修改 src/components/ExecutionCapsule.tsx 的任务进度来源。",
       ].join("\n"),
     },
   ], { language: "zh" });
 
   assert.equal(tasks.some((task) => /项目基于/.test(task.text)), false);
-  assert.equal(tasks.some((task) => /TopIsland 当前显示任务/.test(task.text)), false);
+  assert.equal(tasks.some((task) => /ExecutionCapsule 当前显示任务/.test(task.text)), false);
   assert.equal(tasks.length, 1);
-  assert.equal(tasks[0].evidence?.[0]?.value, "src/components/TopIsland.tsx");
+  assert.equal(tasks[0].evidence?.[0]?.value, "src/components/ExecutionCapsule.tsx");
 });
 
 test("runtime plan task derivation skips approved-plan diagnostic read loops", () => {

@@ -57,12 +57,12 @@ const LOCAL_FILE_READ_APPROVAL_SCENARIO = "local-file-read-approval";
 const PROGRESS_NARRATION_TOOL_FLOW_SCENARIO = "progress-narration-tool-flow";
 const GLOBAL_CHAT_TOOL_SCOPE_SCENARIO = "global-chat-tool-scope";
 const GLOBAL_CHAT_ATTACHMENT_READ_SCENARIO = "global-chat-attachment-read";
-const TOP_ISLAND_EXECUTION_PROGRESS_SCENARIO = "top-island-execution-progress";
-const TOP_ISLAND_PLAN_TASK_PROGRESS_SCENARIO = "top-island-plan-task-progress";
-const TOP_ISLAND_STRICT_EVIDENCE_PROGRESS_SCENARIO = "top-island-strict-evidence-progress";
-const TOP_ISLAND_PENDING_TOOL_REVIEW_SCENARIO = "top-island-pending-tool-review";
-const TOP_ISLAND_ORPHAN_PENDING_REVIEW_SCENARIO = "top-island-orphan-pending-review";
-const TOP_ISLAND_PANEL_STABILITY_SCENARIO = "top-island-panel-stability";
+const TOP_ISLAND_EXECUTION_PROGRESS_SCENARIO = "execution-capsule-execution-progress";
+const TOP_ISLAND_PLAN_TASK_PROGRESS_SCENARIO = "execution-capsule-plan-task-progress";
+const TOP_ISLAND_STRICT_EVIDENCE_PROGRESS_SCENARIO = "execution-capsule-strict-evidence-progress";
+const TOP_ISLAND_PENDING_TOOL_REVIEW_SCENARIO = "execution-capsule-pending-tool-review";
+const TOP_ISLAND_ORPHAN_PENDING_REVIEW_SCENARIO = "execution-capsule-orphan-pending-review";
+const TOP_ISLAND_PANEL_STABILITY_SCENARIO = "execution-capsule-panel-stability";
 const GAME_STUDIO_TOOL_GROUP_COLLAPSE_SCENARIO = "game-studio-tool-group-collapse";
 const GAME_STUDIO_AWAITING_CHOICE_SCENARIO = "game-studio-awaiting-choice";
 const CAPSULE_MODEL_EXPLANATION_SCENARIO = "capsule-model-explanation";
@@ -2965,7 +2965,7 @@ function seedPlanReplaceRefreshScenario() {
   return cleanup;
 }
 
-function seedTopIslandExecutionProgressScenario() {
+function seedExecutionCapsuleExecutionProgressScenario() {
   const bridge = getBridge();
   if (!bridge) return undefined;
 
@@ -2973,10 +2973,10 @@ function seedTopIslandExecutionProgressScenario() {
   bridge.savedDocuments = [];
   bridge.completed = false;
 
-  const workspace = "/tmp/e2e-top-island-execution-progress";
+  const workspace = "/tmp/e2e-execution-capsule-execution-progress";
   const sessionId = 999601;
   const now = Date.now();
-  const turnId = "e2e-top-island-execution-progress-turn";
+  const turnId = "e2e-execution-capsule-execution-progress-turn";
   const userBlockId = useAppStore.getState()._nextTaskId();
   const readBlockId = useAppStore.getState()._nextTaskId();
   const editBlockId = useAppStore.getState()._nextTaskId();
@@ -2996,7 +2996,7 @@ function seedTopIslandExecutionProgressScenario() {
       [workspace]: [
         {
           id: sessionId,
-          title: "E2E TopIsland Execution Progress",
+          title: "E2E ExecutionCapsule Execution Progress",
           date: new Date(now).toISOString(),
           active: true,
           messages: [],
@@ -3005,13 +3005,13 @@ function seedTopIslandExecutionProgressScenario() {
     },
     currentSessionId: sessionId,
     taskFlow: [
-      { id: userBlockId, turnId, type: "user", content: "/执行 修改 TopIsland 执行步骤进度。" },
+      { id: userBlockId, turnId, type: "user", content: "/执行 修改 ExecutionCapsule 执行步骤进度。" },
       {
         id: readBlockId,
         turnId,
         type: "tool",
         toolName: "read_file",
-        target: "src/components/TopIsland.tsx",
+        target: "src/components/ExecutionCapsule.tsx",
         status: "done",
         toolStatus: "executed",
         message: "File read.",
@@ -3021,7 +3021,7 @@ function seedTopIslandExecutionProgressScenario() {
         turnId,
         type: "tool",
         toolName: "replace_in_file",
-        target: "src/components/TopIsland.tsx",
+        target: "src/components/ExecutionCapsule.tsx",
         status: "running",
         toolStatus: "running",
         message: "Executing...",
@@ -3040,12 +3040,12 @@ function seedTopIslandExecutionProgressScenario() {
     conversationTurns: [
       {
         id: turnId,
-        userPrompt: "/执行 修改 TopIsland 执行步骤进度。",
+        userPrompt: "/执行 修改 ExecutionCapsule 执行步骤进度。",
         title: "执行步骤进度回归",
         mode: "edit",
         intent: "execute",
         status: "executing",
-        summary: "执行模式下 TopIsland 应展示工具步骤进度。",
+        summary: "执行模式下 ExecutionCapsule 应展示工具步骤进度。",
         blockIds: [userBlockId, readBlockId, editBlockId, commandBlockId],
         collapsed: false,
         createdAt: now,
@@ -3089,7 +3089,7 @@ function seedTopIslandExecutionProgressScenario() {
   return cleanup;
 }
 
-function seedTopIslandPlanTaskProgressScenario() {
+function seedExecutionCapsulePlanTaskProgressScenario() {
   const bridge = getBridge();
   if (!bridge) return undefined;
 
@@ -3097,10 +3097,10 @@ function seedTopIslandPlanTaskProgressScenario() {
   bridge.savedDocuments = [];
   bridge.completed = false;
 
-  const workspace = "/tmp/e2e-top-island-plan-task-progress";
+  const workspace = "/tmp/e2e-execution-capsule-plan-task-progress";
   const sessionId = 999602;
   const now = Date.now();
-  const turnId = "e2e-top-island-plan-task-progress-turn";
+  const turnId = "e2e-execution-capsule-plan-task-progress-turn";
   const userBlockId = useAppStore.getState()._nextTaskId();
   const planTasks = Array.from({ length: 9 }, (_, index) => {
     const taskNumber = index + 1;
@@ -3138,7 +3138,7 @@ function seedTopIslandPlanTaskProgressScenario() {
       [workspace]: [
         {
           id: sessionId,
-          title: "E2E TopIsland Plan Task Progress",
+          title: "E2E ExecutionCapsule Plan Task Progress",
           date: new Date(now).toISOString(),
           active: true,
           messages: [],
@@ -3157,7 +3157,7 @@ function seedTopIslandPlanTaskProgressScenario() {
         mode: "plan",
         intent: "plan",
         status: "executing",
-        summary: "计划执行阶段 TopIsland 应展示完整任务列表。",
+        summary: "计划执行阶段 ExecutionCapsule 应展示完整任务列表。",
         blockIds: [userBlockId],
         collapsed: false,
         createdAt: now,
@@ -3205,7 +3205,7 @@ function seedTopIslandPlanTaskProgressScenario() {
   return cleanup;
 }
 
-function seedTopIslandStrictEvidenceProgressScenario() {
+function seedExecutionCapsuleStrictEvidenceProgressScenario() {
   const bridge = getBridge();
   if (!bridge) return undefined;
 
@@ -3213,10 +3213,10 @@ function seedTopIslandStrictEvidenceProgressScenario() {
   bridge.savedDocuments = [];
   bridge.completed = false;
 
-  const workspace = "/tmp/e2e-top-island-strict-evidence-progress";
+  const workspace = "/tmp/e2e-execution-capsule-strict-evidence-progress";
   const sessionId = 999604;
   const now = Date.now();
-  const turnId = "e2e-top-island-strict-evidence-progress-turn";
+  const turnId = "e2e-execution-capsule-strict-evidence-progress-turn";
   const userBlockId = useAppStore.getState()._nextTaskId();
   const planTasks = Array.from({ length: 8 }, (_, index) => {
     const taskNumber = index + 1;
@@ -3256,7 +3256,7 @@ function seedTopIslandStrictEvidenceProgressScenario() {
       [workspace]: [
         {
           id: sessionId,
-          title: "E2E TopIsland Strict Evidence Progress",
+          title: "E2E ExecutionCapsule Strict Evidence Progress",
           date: new Date(now).toISOString(),
           active: true,
           messages: [],
@@ -3275,7 +3275,7 @@ function seedTopIslandStrictEvidenceProgressScenario() {
         mode: "plan",
         intent: "plan",
         status: "executing",
-        summary: "TopIsland 不应把 claimed completed 当成可信完成。",
+        summary: "ExecutionCapsule 不应把 claimed completed 当成可信完成。",
         blockIds: [userBlockId],
         collapsed: false,
         createdAt: now,
@@ -3323,7 +3323,7 @@ function seedTopIslandStrictEvidenceProgressScenario() {
   return cleanup;
 }
 
-function seedTopIslandPendingToolReviewScenario() {
+function seedExecutionCapsulePendingToolReviewScenario() {
   const bridge = getBridge();
   if (!bridge) return undefined;
 
@@ -3331,10 +3331,10 @@ function seedTopIslandPendingToolReviewScenario() {
   bridge.savedDocuments = [];
   bridge.completed = false;
 
-  const workspace = "/tmp/e2e-top-island-pending-tool-review";
+  const workspace = "/tmp/e2e-execution-capsule-pending-tool-review";
   const sessionId = 999603;
   const now = Date.now();
-  const turnId = "e2e-top-island-pending-tool-review-turn";
+  const turnId = "e2e-execution-capsule-pending-tool-review-turn";
   const userBlockId = useAppStore.getState()._nextTaskId();
   const reviewBlockId = useAppStore.getState()._nextTaskId();
   const longCommand = "printf '\\x89PNG\\r\\n\\x1a\\n\\x00\\x00\\x00\\rIHDR\\x00\\x00\\x00\\x01\\x00\\x00\\x00\\x01\\x08\\x02\\x00\\x00\\x00\\x90wS\\xde\\x00\\x00\\x00\\x0cIDATx\\x9cc\\xf8\\x0f\\x00\\x01\\x01\\x01\\x00\\x18\\xdd\\x8d\\xb4\\x00\\x00\\x00\\x00IEND\\xaeB`\\x82' > src-tauri/icons/icon.png && echo Created valid icon.png";
@@ -3372,7 +3372,7 @@ function seedTopIslandPendingToolReviewScenario() {
       [workspace]: [
         {
           id: sessionId,
-          title: "E2E TopIsland Pending Tool Review",
+          title: "E2E ExecutionCapsule Pending Tool Review",
           date: new Date(now).toISOString(),
           active: true,
           messages: [],
@@ -3424,7 +3424,7 @@ function seedTopIslandPendingToolReviewScenario() {
         mode: "plan",
         intent: "plan",
         status: "awaiting_approval",
-        summary: "TopIsland 应优先展示审批按钮。",
+        summary: "ExecutionCapsule 应优先展示审批按钮。",
         blockIds: [userBlockId, reviewBlockId],
         collapsed: false,
         createdAt: now,
@@ -3495,7 +3495,7 @@ function seedTopIslandPendingToolReviewScenario() {
   return cleanup;
 }
 
-function seedTopIslandOrphanPendingReviewScenario() {
+function seedExecutionCapsuleOrphanPendingReviewScenario() {
   const bridge = getBridge();
   if (!bridge) return undefined;
 
@@ -3503,10 +3503,10 @@ function seedTopIslandOrphanPendingReviewScenario() {
   bridge.savedDocuments = [];
   bridge.completed = false;
 
-  const workspace = "/tmp/e2e-top-island-orphan-pending-review";
+  const workspace = "/tmp/e2e-execution-capsule-orphan-pending-review";
   const sessionId = 999613;
   const now = Date.now();
-  const turnId = "e2e-top-island-orphan-pending-review-turn";
+  const turnId = "e2e-execution-capsule-orphan-pending-review-turn";
   const userBlockId = useAppStore.getState()._nextTaskId();
   const pendingReviewTaskId = useAppStore.getState()._nextTaskId();
   const patch = [
@@ -3650,7 +3650,7 @@ function seedTopIslandOrphanPendingReviewScenario() {
   return cleanup;
 }
 
-function seedTopIslandPanelStabilityScenario() {
+function seedExecutionCapsulePanelStabilityScenario() {
   const bridge = getBridge();
   if (!bridge) return undefined;
 
@@ -3658,28 +3658,28 @@ function seedTopIslandPanelStabilityScenario() {
   bridge.savedDocuments = [];
   bridge.completed = false;
 
-  const workspace = "/tmp/e2e-top-island-panel-stability";
+  const workspace = "/tmp/e2e-execution-capsule-panel-stability";
   const sessionId = 999604;
   const now = Date.now();
-  const turnId = "e2e-top-island-panel-stability-turn";
+  const turnId = "e2e-execution-capsule-panel-stability-turn";
   const userBlockId = useAppStore.getState()._nextTaskId();
   const agentBlockId = useAppStore.getState()._nextTaskId();
   const reviewBlockId = useAppStore.getState()._nextTaskId();
   const planTasks = [
     {
       id: "panel-task-1",
-      text: "T1: 更新 TopIsland 审批状态 — 证据: file:src/components/TopIsland.tsx",
+      text: "T1: 更新 ExecutionCapsule 审批状态 — 证据: file:src/components/ExecutionCapsule.tsx",
       status: "pending" as const,
       claimedStatus: "pending" as const,
-      evidence: [{ kind: "file" as const, value: "src/components/TopIsland.tsx" }],
+      evidence: [{ kind: "file" as const, value: "src/components/ExecutionCapsule.tsx" }],
       evidenceStatus: "missing" as const,
     },
     {
       id: "panel-task-2",
-      text: "T2: 验证右侧面板状态稳定 — 证据: cmd:npx playwright test tests/e2e/top-island-execution-progress.spec.ts",
+      text: "T2: 验证右侧面板状态稳定 — 证据: cmd:npx playwright test tests/e2e/execution-capsule-execution-progress.spec.ts",
       status: "pending" as const,
       claimedStatus: "pending" as const,
-      evidence: [{ kind: "cmd" as const, value: "npx playwright test tests/e2e/top-island-execution-progress.spec.ts" }],
+      evidence: [{ kind: "cmd" as const, value: "npx playwright test tests/e2e/execution-capsule-execution-progress.spec.ts" }],
       evidenceStatus: "missing" as const,
     },
   ];
@@ -3687,7 +3687,7 @@ function seedTopIslandPanelStabilityScenario() {
 
   incrementSeedCount(TOP_ISLAND_PANEL_STABILITY_SCENARIO);
 
-  const baseUserBlock = { id: userBlockId, turnId, type: "user" as const, content: "/计划 修复 TopIsland 审批时右侧面板状态。" };
+  const baseUserBlock = { id: userBlockId, turnId, type: "user" as const, content: "/计划 修复 ExecutionCapsule 审批时右侧面板状态。" };
   const baseAgentBlock = {
     id: agentBlockId,
     turnId,
@@ -3755,7 +3755,7 @@ function seedTopIslandPanelStabilityScenario() {
       [workspace]: [
         {
           id: sessionId,
-          title: "E2E TopIsland Panel Stability",
+          title: "E2E ExecutionCapsule Panel Stability",
           date: new Date(now).toISOString(),
           active: true,
           messages: [],
@@ -3767,8 +3767,8 @@ function seedTopIslandPanelStabilityScenario() {
     conversationTurns: [
       {
         id: turnId,
-        userPrompt: "/计划 修复 TopIsland 审批时右侧面板状态。",
-        title: "TopIsland 面板稳定回归",
+        userPrompt: "/计划 修复 ExecutionCapsule 审批时右侧面板状态。",
+        title: "ExecutionCapsule 面板稳定回归",
         mode: "plan",
         intent: "plan",
         status: "awaiting_approval",
@@ -3784,7 +3784,7 @@ function seedTopIslandPanelStabilityScenario() {
         kind: "design",
         path: ".MAIN/plans/plan.md",
         title: "Design",
-        content: "# TopIsland 面板稳定设计\n\n> 计划高亮应跟随当前主题色。\n\n审批只更新 TopIsland 状态，不改动右侧面板。",
+        content: "# ExecutionCapsule 面板稳定设计\n\n> 计划高亮应跟随当前主题色。\n\n审批只更新 ExecutionCapsule 状态，不改动右侧面板。",
         updatedAt: now,
       },
       {
@@ -6996,27 +6996,27 @@ export function initializeE2EScenarios(): (() => void) | undefined {
   }
 
   if (scenario === TOP_ISLAND_EXECUTION_PROGRESS_SCENARIO) {
-    return seedTopIslandExecutionProgressScenario();
+    return seedExecutionCapsuleExecutionProgressScenario();
   }
 
   if (scenario === TOP_ISLAND_PLAN_TASK_PROGRESS_SCENARIO) {
-    return seedTopIslandPlanTaskProgressScenario();
+    return seedExecutionCapsulePlanTaskProgressScenario();
   }
 
   if (scenario === TOP_ISLAND_STRICT_EVIDENCE_PROGRESS_SCENARIO) {
-    return seedTopIslandStrictEvidenceProgressScenario();
+    return seedExecutionCapsuleStrictEvidenceProgressScenario();
   }
 
   if (scenario === TOP_ISLAND_PENDING_TOOL_REVIEW_SCENARIO) {
-    return seedTopIslandPendingToolReviewScenario();
+    return seedExecutionCapsulePendingToolReviewScenario();
   }
 
   if (scenario === TOP_ISLAND_ORPHAN_PENDING_REVIEW_SCENARIO) {
-    return seedTopIslandOrphanPendingReviewScenario();
+    return seedExecutionCapsuleOrphanPendingReviewScenario();
   }
 
   if (scenario === TOP_ISLAND_PANEL_STABILITY_SCENARIO) {
-    return seedTopIslandPanelStabilityScenario();
+    return seedExecutionCapsulePanelStabilityScenario();
   }
 
   if (scenario === GAME_STUDIO_TOOL_GROUP_COLLAPSE_SCENARIO) {

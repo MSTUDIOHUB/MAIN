@@ -1314,11 +1314,16 @@ export class WorkflowEngine {
         const toolName = String(toolCall?.name || "tool");
         const reviewTarget = deriveReviewToolTarget(toolCall);
         const reviewToolCallId = String(toolCall?.toolCallId || toolCall?.id || "").trim();
+        const autoApproveToolScopes = sessionGet().autoApproveToolScopes || [];
         logStoreEvent("request_review_started", {
           turnId,
           toolName,
           target: reviewTarget,
           toolCallId: reviewToolCallId || null,
+          toolSource: toolCall?.source ?? null,
+          toolRisk: toolCall?.risk ?? null,
+          autoApproveToolScopes,
+          shellPermissionGated: !!toolCall?.shellPermissionDecision,
         });
 
         return new Promise<any>((resolve) => {

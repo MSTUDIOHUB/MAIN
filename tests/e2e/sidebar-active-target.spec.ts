@@ -246,8 +246,8 @@ test("background global chat pending decision does not surface in the active pro
   await expect(workspaceRow).toHaveClass(/bg-\[#18181b\]/);
   await expect(workspaceRow.getByTestId("sidebar-workspace-icon")).toHaveClass(/theme-text/);
   await expect(projectSessionRow).toHaveClass(/bg-\[#18181b\]/);
-  await expect(page.getByTestId("top-island-pending-run-decision")).toHaveCount(0);
-  await expect(page.getByTestId("top-island-shell")).toHaveCount(0);
+  await expect(page.getByTestId("execution-capsule-pending-run-decision")).toHaveCount(0);
+  await expect(page.getByTestId("execution-capsule-shell")).toHaveCount(0);
 
   const chatRowClasses = (await chatRow.getAttribute("class"))?.split(/\s+/) ?? [];
   const globalSessionRowClasses = (await globalSessionRow.getAttribute("class"))?.split(/\s+/) ?? [];

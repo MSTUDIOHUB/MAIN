@@ -69,7 +69,7 @@ const designSkill = {
 
 test("task targeting blocks UI source writes until DESIGN protocol is read or style is confirmed", () => {
   const profile = buildTaskTargetingProfile({
-    userPrompt: "请按照当前 Skill 修改 TopIsland 的 UI 样式。",
+    userPrompt: "请按照当前 Skill 修改 ExecutionCapsule 的 UI 样式。",
     skills: [designSkill],
   });
 
@@ -78,8 +78,8 @@ test("task targeting blocks UI source writes until DESIGN protocol is read or st
   const blocked = shouldBlockToolCallForTargeting({
     profile,
     toolName: "replace_in_file",
-    args: { path: "src/components/TopIsland.tsx" },
-    target: "src/components/TopIsland.tsx",
+    args: { path: "src/components/ExecutionCapsule.tsx" },
+    target: "src/components/ExecutionCapsule.tsx",
     language: "zh",
   });
 
@@ -89,15 +89,15 @@ test("task targeting blocks UI source writes until DESIGN protocol is read or st
   const approvedPlanExecution = shouldBlockToolCallForTargeting({
     profile,
     toolName: "replace_in_file",
-    args: { path: "src/components/TopIsland.tsx" },
-    target: "src/components/TopIsland.tsx",
+    args: { path: "src/components/ExecutionCapsule.tsx" },
+    target: "src/components/ExecutionCapsule.tsx",
     language: "zh",
     allowApprovedPlanDesignWrite: true,
   });
   assert.equal(approvedPlanExecution.blocked, false);
 
   const satisfied = buildTaskTargetingProfile({
-    userPrompt: "请按照当前 Skill 修改 TopIsland 的 UI 样式。",
+    userPrompt: "请按照当前 Skill 修改 ExecutionCapsule 的 UI 样式。",
     skills: [designSkill],
     observedEvidence: ["path:.protocols/awesome-design-md-main/design-md/DESIGN.md"],
   });
@@ -105,8 +105,8 @@ test("task targeting blocks UI source writes until DESIGN protocol is read or st
   assert.equal(shouldBlockToolCallForTargeting({
     profile: satisfied,
     toolName: "replace_in_file",
-    args: { path: "src/components/TopIsland.tsx" },
-    target: "src/components/TopIsland.tsx",
+    args: { path: "src/components/ExecutionCapsule.tsx" },
+    target: "src/components/ExecutionCapsule.tsx",
     language: "zh",
   }).blocked, false);
 });

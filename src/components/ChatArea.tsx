@@ -8,7 +8,7 @@ import ImageGenerationCard from "./ImageGenerationCard";
 import JobListCard from "./JobListCard";
 import MarkdownRenderer from "./MarkdownRenderer";
 import StreamingCursor from "./StreamingCursor";
-import TopIsland from "./TopIsland";
+import ExecutionCapsule from "./ExecutionCapsule";
 import { resolveAutoScrollState } from "../lib/chatScroll";
 import { parseMessageContent } from "../lib/messageParser";
 import { sanitizeAIOutput, sanitizeAssistantDisplayContent, sanitizeVisibleAssistantText } from "../lib/sanitize";
@@ -2434,16 +2434,11 @@ export default function ChatArea({
   const lastScrollTopRef = useRef(0);
   const previousSessionKeyRef = useRef(activeSessionKey ?? null);
   const previousFirstTurnIdRef = useRef<string | null>(null);
-  const historyPeekHideTimerRef = useRef<number | null>(null);
-  const topIslandHideTimerRef = useRef<number | null>(null);
   const [isAutoScroll, setIsAutoScroll] = useState(true);
   const [activeVisibleTurnId, setActiveVisibleTurnId] = useState<string | null>(null);
-  const [showTopIslandDuringHistoryPeek, setShowTopIslandDuringHistoryPeek] = useState(false);
   const [olderHistoryLoading, setOlderHistoryLoading] = useState(false);
-  // region: 浮层显隐状态
+  // region: 输入区上方执行胶囊状态
   const [composerHeight, setComposerHeight] = useState(220);
-  const [shouldRenderTopIsland, setShouldRenderTopIsland] = useState(false);
-  const [isTopIslandVisible, setIsTopIslandVisible] = useState(false);
   const [previewImageItem, setPreviewImageItem] = useState<UserContextItem | null>(null);
   const [persistedExplanation, setPersistedExplanation] = useState("");
   const [chatAreaHeight, setChatAreaHeight] = useState(0);
@@ -2460,14 +2455,6 @@ export default function ChatArea({
     });
     resizeObserver.observe(chatContainerRef.current);
     return () => resizeObserver.disconnect();
-  }, []);
-
-  useEffect(() => {
-    return () => {
-      if (historyPeekHideTimerRef.current !== null) {
-        window.clearTimeout(historyPeekHideTimerRef.current);
-      }
-    };
   }, []);
 
   const blocksByTurnId = useMemo(() => {
@@ -2526,7 +2513,6 @@ export default function ChatArea({
 
     setIsAutoScroll(true);
     setActiveVisibleTurnId(visibleConversationTurns[visibleConversationTurns.length - 1]?.id ?? null);
-    setShowTopIslandDuringHistoryPeek(false);
     const rafId = window.requestAnimationFrame(() => {
       const el = chatContainerRef.current;
       if (!el) return;
@@ -2542,7 +2528,7 @@ export default function ChatArea({
   const pinnedTurn = useMemo(() => {
     return resolvePinnedConversationTurn(visibleConversationTurns, currentTurnId);
   }, [visibleConversationTurns, currentTurnId]);
-  const shouldKeepTopIslandResident =
+  const shouldKeepExecutionCapsuleResident =
     !!pinnedTurn &&
     (
       pinnedTurn.status === "executing" ||
@@ -2550,22 +2536,22 @@ export default function ChatArea({
       pinnedTurn.status === "awaiting_approval" ||
       agentStatus === "pending_review"
     );
-  const topIslandTurn = shouldKeepTopIslandResident ? pinnedTurn : activeTurn;
-  const topIslandTurnEntry = useMemo(() => {
-    if (!topIslandTurn) return null;
-    return groupedTurns.find((entry) => entry.turn?.id === topIslandTurn.id) || null;
-  }, [groupedTurns, topIslandTurn]);
-  const topIslandTurnBlocks = topIslandTurnEntry?.blocks || EMPTY_CHAT_BLOCKS;
+  const capsuleControlTurn = shouldKeepExecutionCapsuleResident ? pinnedTurn : activeTurn;
+  const capsuleControlTurnEntry = useMemo(() => {
+    if (!capsuleControlTurn) return null;
+    return groupedTurns.find((entry) => entry.turn?.id === capsuleControlTurn.id) || null;
+  }, [groupedTurns, capsuleControlTurn]);
+  const capsuleControlTurnBlocks = capsuleControlTurnEntry?.blocks || EMPTY_CHAT_BLOCKS;
   const pinnedPlanTurn = pinnedTurn && isPlanConversationTurn(pinnedTurn)
     ? pinnedTurn
     : null;
-  const topIslandTurnVisibleStatus = useMemo(() => {
-    if (!topIslandTurn) return null;
+  const capsuleControlTurnVisibleStatus = useMemo(() => {
+    if (!capsuleControlTurn) return null;
 
     return deriveVisibleConversationTurnStatus({
-      baseStatus: topIslandTurn.status,
-      turnIntent: resolveConversationTurnIntent(topIslandTurn),
-      isPinnedPlanTurnVisible: !!pinnedPlanTurn && topIslandTurn.id === pinnedPlanTurn.id,
+      baseStatus: capsuleControlTurn.status,
+      turnIntent: resolveConversationTurnIntent(capsuleControlTurn),
+      isPinnedPlanTurnVisible: !!pinnedPlanTurn && capsuleControlTurn.id === pinnedPlanTurn.id,
       isPlanApproved,
       planStage,
       agentStatus,
@@ -2574,17 +2560,17 @@ export default function ChatArea({
         planArtifacts.some((artifact) => artifact.kind === "tasks") ||
         planTasks.length > 0,
     });
-  }, [agentStatus, isPlanApproved, pinnedPlanTurn, planArtifacts, planExecutionEvidenceLedger, planStage, planTasks, topIslandTurn]);
+  }, [agentStatus, isPlanApproved, pinnedPlanTurn, planArtifacts, planExecutionEvidenceLedger, planStage, planTasks, capsuleControlTurn]);
   const shouldShowPinnedPlanTasks =
     !!pinnedPlanTurn &&
     (isPlanApproved || planStage === "executing" || planStage === "completed");
-  const topIslandExecutionSteps = useMemo(() => {
-    if (!topIslandTurn) return [];
-    if (isPlanConversationTurn(topIslandTurn)) return [];
-    return deriveTurnProgressItems(topIslandTurnBlocks, language);
-  }, [language, topIslandTurn, topIslandTurnBlocks]);
+  const capsuleControlExecutionSteps = useMemo(() => {
+    if (!capsuleControlTurn) return [];
+    if (isPlanConversationTurn(capsuleControlTurn)) return [];
+    return deriveTurnProgressItems(capsuleControlTurnBlocks, language);
+  }, [language, capsuleControlTurn, capsuleControlTurnBlocks]);
   const composerPaddingBottom = composerHeight + 32;
-  const capsuleTurn = topIslandTurn || activeTurn;
+  const capsuleTurn = capsuleControlTurn || activeTurn;
   const capsuleTurnBlocks = capsuleTurn
     ? blocksByTurnId.byTurnId.get(capsuleTurn.id) || EMPTY_CHAT_BLOCKS
     : EMPTY_CHAT_BLOCKS;
@@ -2726,21 +2712,21 @@ export default function ChatArea({
       pinnedPlanTurn?.status === "awaiting_approval" ||
       planStage === "ready_to_execute"
     );
-  const topIslandTurnStatusKey = topIslandTurnVisibleStatus || topIslandTurn?.status || null;
-  const topIslandReplyOptions = useMemo(() => {
-    if (topIslandTurnStatusKey !== "awaiting_input" && topIslandTurnStatusKey !== "awaiting_approval") {
+  const capsuleControlTurnStatusKey = capsuleControlTurnVisibleStatus || capsuleControlTurn?.status || null;
+  const capsuleControlReplyOptions = useMemo(() => {
+    if (capsuleControlTurnStatusKey !== "awaiting_input" && capsuleControlTurnStatusKey !== "awaiting_approval") {
       return [];
     }
-    const latestOptionBlock = [...topIslandTurnBlocks].reverse().find((block) =>
+    const latestOptionBlock = [...capsuleControlTurnBlocks].reverse().find((block) =>
       block.type === "agent" &&
       Array.isArray(block.options) &&
       block.options.length > 0,
     );
     return latestOptionBlock?.options || [];
-  }, [topIslandTurnBlocks, topIslandTurnStatusKey]);
-  const topIslandHasPendingProposalCheckpoint = useMemo(() => {
-    if (!topIslandTurn || topIslandTurnStatusKey !== "awaiting_input") return false;
-    return [...topIslandTurnBlocks].reverse().some((block) =>
+  }, [capsuleControlTurnBlocks, capsuleControlTurnStatusKey]);
+  const capsuleControlHasPendingProposalCheckpoint = useMemo(() => {
+    if (!capsuleControlTurn || capsuleControlTurnStatusKey !== "awaiting_input") return false;
+    return [...capsuleControlTurnBlocks].reverse().some((block) =>
       block.type === "agent" &&
       Array.isArray(block.options) &&
       block.options.some((option: ReplyOption) =>
@@ -2750,80 +2736,47 @@ export default function ChatArea({
         option?.source === "operation_approval"
       )
     );
-  }, [topIslandTurn, topIslandTurnBlocks, topIslandTurnStatusKey]);
-  const topIslandIsRunActive =
+  }, [capsuleControlTurn, capsuleControlTurnBlocks, capsuleControlTurnStatusKey]);
+  const capsuleControlIsRunActive =
     agentStatus === "running" &&
-    !!topIslandTurn &&
-    topIslandTurnStatusKey === "executing";
-  const pendingToolReviewForTopIsland = useMemo(() => resolveVisiblePendingToolReview({
+    !!capsuleControlTurn &&
+    capsuleControlTurnStatusKey === "executing";
+  const pendingToolReviewForExecutionCapsule = useMemo(() => resolveVisiblePendingToolReview({
     taskFlow,
     pendingReviewTaskId,
     pendingToolCall,
-    currentTurnId: topIslandTurn?.id || currentTurnId,
+    currentTurnId: capsuleControlTurn?.id || currentTurnId,
     activeDiffTask,
-  }), [activeDiffTask, currentTurnId, pendingReviewTaskId, pendingToolCall, taskFlow, topIslandTurn?.id]);
+  }), [activeDiffTask, currentTurnId, pendingReviewTaskId, pendingToolCall, taskFlow, capsuleControlTurn?.id]);
   const isAwaitingInteractiveChoice =
-    (topIslandTurnStatusKey === "awaiting_input" || topIslandTurnStatusKey === "awaiting_approval") &&
-    topIslandReplyOptions.length > 0;
+    (capsuleControlTurnStatusKey === "awaiting_input" || capsuleControlTurnStatusKey === "awaiting_approval") &&
+    capsuleControlReplyOptions.length > 0;
   const shouldShowRunStatus = isStreaming || isAwaitingInteractiveChoice;
   const runStatusLabel = isStreaming
     ? copy.processingLabel
-    : topIslandHasPendingProposalCheckpoint
+    : capsuleControlHasPendingProposalCheckpoint
     ? language === "zh" ? "待确认方案..." : "Proposal checkpoint..."
     : language === "zh" ? "等待选择..." : "Awaiting choice...";
-  const topIslandHasChoiceContext =
-    topIslandReplyOptions.length > 0 ||
+  const capsuleControlHasChoiceContext =
+    capsuleControlReplyOptions.length > 0 ||
     !!pendingRunDecision ||
-    !!pendingToolReviewForTopIsland ||
+    !!pendingToolReviewForExecutionCapsule ||
     canApprovePlan;
-  const topIslandHasProgressContext =
+  const capsuleControlHasProgressContext =
     planTasks.length > 0 ||
-    topIslandExecutionSteps.length > 0;
-  const shouldShowTopIslandNormally =
-    !!topIslandTurn &&
-    topIslandTurnStatusKey !== "done" &&
-    topIslandTurnStatusKey !== "completed_with_changes" &&
-    (topIslandHasChoiceContext || topIslandHasProgressContext);
-  const shouldShowTopIslandForHistoryPeek =
-    showTopIslandDuringHistoryPeek && shouldShowTopIslandNormally;
-  const shouldShowTopIsland =
-    (!!topIslandTurn || !!pendingRunDecision) &&
+    capsuleControlExecutionSteps.length > 0;
+  const shouldShowExecutionCapsuleNormally =
+    !!capsuleControlTurn &&
+    capsuleControlTurnStatusKey !== "done" &&
+    capsuleControlTurnStatusKey !== "completed_with_changes" &&
+    (capsuleControlHasChoiceContext || capsuleControlHasProgressContext);
+  const shouldShowExecutionCapsule =
+    (!!capsuleControlTurn || !!pendingRunDecision) &&
     (
-      topIslandHasChoiceContext ||
-      (topIslandHasProgressContext && shouldKeepTopIslandResident) ||
-      (isAutoScroll
-        ? shouldShowTopIslandNormally
-        : shouldShowTopIslandForHistoryPeek)
+      capsuleControlHasChoiceContext ||
+      (capsuleControlHasProgressContext && shouldKeepExecutionCapsuleResident) ||
+      shouldShowExecutionCapsuleNormally
     );
-  useEffect(() => {
-    if (topIslandHideTimerRef.current !== null) {
-      window.clearTimeout(topIslandHideTimerRef.current);
-      topIslandHideTimerRef.current = null;
-    }
-
-    if (shouldShowTopIsland) {
-      setShouldRenderTopIsland(true);
-      const rafId = window.requestAnimationFrame(() => {
-        setIsTopIslandVisible(true);
-      });
-      return () => {
-        window.cancelAnimationFrame(rafId);
-      };
-    }
-
-    setIsTopIslandVisible(false);
-    topIslandHideTimerRef.current = window.setTimeout(() => {
-      topIslandHideTimerRef.current = null;
-      setShouldRenderTopIsland(false);
-    }, 240);
-
-    return () => {
-      if (topIslandHideTimerRef.current !== null) {
-        window.clearTimeout(topIslandHideTimerRef.current);
-        topIslandHideTimerRef.current = null;
-      }
-    };
-  }, [shouldShowTopIsland]);
 
   const handleScroll = useCallback(() => {
     const el = chatContainerRef.current;
@@ -2836,23 +2789,6 @@ export default function ChatArea({
       scrollHeight: el.scrollHeight,
       clientHeight: el.clientHeight,
     });
-
-    if (nextAutoScroll) {
-      if (historyPeekHideTimerRef.current !== null) {
-        window.clearTimeout(historyPeekHideTimerRef.current);
-        historyPeekHideTimerRef.current = null;
-      }
-      setShowTopIslandDuringHistoryPeek(false);
-    } else {
-      setShowTopIslandDuringHistoryPeek(true);
-      if (historyPeekHideTimerRef.current !== null) {
-        window.clearTimeout(historyPeekHideTimerRef.current);
-      }
-      historyPeekHideTimerRef.current = window.setTimeout(() => {
-        historyPeekHideTimerRef.current = null;
-        setShowTopIslandDuringHistoryPeek(false);
-      }, 3000);
-    }
 
     setIsAutoScroll((value) => (value === nextAutoScroll ? value : nextAutoScroll));
     lastScrollTopRef.current = currentScrollTop;
@@ -3353,17 +3289,13 @@ export default function ChatArea({
       if (item.kind === "block") {
         if (isActiveRunningTurn) {
           // Active running turn routes intermediate explanations into the capsule.
-          if (
-            config.enableCapsule !== false &&
-            !(item.block?.type === "agent" && substantiveIntermediateAgentBlockIds.has(item.block.id))
-          ) {
+          if (!(item.block?.type === "agent" && substantiveIntermediateAgentBlockIds.has(item.block.id))) {
             const isExplanation = shouldSuppressAgentAsExplanation(item.block, item.index, blocks, turnIntent);
             if (isExplanation) return null;
           }
           if (item.block?.type === "tool" && item.block?.toolStatus === "running") return null;
         } else {
           if (
-            config.enableCapsule !== false &&
             isTransparentToolNarrationBlock(item.block) &&
             !(item.block?.type === "agent" && substantiveIntermediateAgentBlockIds.has(item.block.id))
           ) return null;
@@ -3371,7 +3303,7 @@ export default function ChatArea({
 
         // Hide conversational first-person explanations from message flow if completed/stopped,
         // since they are collapsed in the TurnIntentHistoryCard.
-        if (config.enableCapsule !== false && isTurnCompletedOrStopped && item.block?.type === "agent" && !isChatIntent) {
+        if (isTurnCompletedOrStopped && item.block?.type === "agent" && !isChatIntent) {
           if (substantiveIntermediateAgentBlockIds.has(item.block.id)) {
             return renderBlockItem(item);
           }
@@ -3393,14 +3325,13 @@ export default function ChatArea({
       if (item.kind !== "readContextGroup" && item.kind !== "operationCluster" && item.block?.type === "thought") return null;
       if (item.kind === "block") {
         if (
-          config.enableCapsule !== false &&
           isTransparentToolNarrationBlock(item.block) &&
           !(item.block?.type === "agent" && substantiveIntermediateAgentBlockIds.has(item.block.id))
         ) return null;
 
         // Hide conversational first-person explanations from message flow if completed/stopped,
         // since they are collapsed in the TurnIntentHistoryCard.
-        if (config.enableCapsule !== false && isTurnCompletedOrStopped && item.block?.type === "agent" && !isChatIntent) {
+        if (isTurnCompletedOrStopped && item.block?.type === "agent" && !isChatIntent) {
           if (substantiveIntermediateAgentBlockIds.has(item.block.id)) {
             return renderBlockItem(item);
           }
@@ -3746,6 +3677,62 @@ export default function ChatArea({
     );
   };
 
+  const executionCapsuleControls = shouldShowExecutionCapsule && (capsuleControlTurn || pendingRunDecision) ? (
+    <ExecutionCapsule
+      isRunActive={capsuleControlIsRunActive}
+      title={
+        pendingRunDecision?.kind === "intent_confirmation"
+          ? pendingRunDecision.title || (language === "zh" ? "意图待确认" : "Intent Confirmation")
+          : normalizeConversationDisplayTitle(
+              capsuleControlTurn && !isGenericConversationTitle(capsuleControlTurn.title)
+                ? capsuleControlTurn.title
+                : capsuleControlTurn?.intentSummary || "",
+              language === "en" ? 52 : 42,
+              capsuleControlTurn?.userPrompt
+                ? normalizeConversationDisplayTitle(
+                    capsuleControlTurn.userPrompt,
+                    language === "en" ? 52 : 42,
+                    language === "en" ? "Turn Decision" : "本轮决策",
+                  )
+                : language === "en" ? "Turn Decision" : "本轮决策",
+            )
+      }
+      status={copy.turnStatusLabels[capsuleControlTurnStatusKey || "awaiting_input"] || capsuleControlTurnStatusKey || "Awaiting Choice"}
+      statusToneClass={getTurnStatusTone(capsuleControlTurnStatusKey || "awaiting_input")}
+      language={language}
+      themeMode={config.themeMode}
+      chatFontSize={resolvedChatFontSize}
+      planTasks={shouldShowPinnedPlanTasks ? planTasks : []}
+      planExecutionEvidenceLedger={shouldShowPinnedPlanTasks ? planExecutionEvidenceLedger : []}
+      planStage={pinnedPlanTurn ? planStage : "idle"}
+      executionSteps={shouldShowPinnedPlanTasks ? [] : capsuleControlExecutionSteps}
+      progressMode={shouldShowPinnedPlanTasks ? "plan" : "execution"}
+      isAwaitingChoice={isAwaitingInteractiveChoice}
+      replyOptions={capsuleControlReplyOptions}
+      pendingRunDecision={pendingRunDecision}
+      activeDiffTask={pendingToolReviewForExecutionCapsule}
+      pendingToolReview={pendingToolReviewForExecutionCapsule}
+      canApprovePlan={canApprovePlan}
+      autoApproveTools={autoApproveTools}
+      onSelectReplyOption={(option) => capsuleControlTurn && onQuickReply?.(option, capsuleControlTurn.id)}
+      onRequestPlanAdjustment={(text) => capsuleControlTurn && onQuickReply?.({ label: text, value: text, action: "adjust_plan" }, capsuleControlTurn.id)}
+      onCancelTurn={onStopGeneration}
+      onResolvePendingRunDecision={resolvePendingRunDecision}
+      onDismissPendingRunDecision={dismissPendingRunDecision}
+      onApprovePlan={approvePlan}
+      onRejectPlan={rejectPlan}
+      onRejectAndDeletePlan={planArtifacts.length > 0 ? () => void rejectPlanAndDeleteFiles() : undefined}
+      onRejectDiff={handleRejectInline}
+      onApproveDiffOnce={() => approvePendingReviewOnce()}
+      onApproveDiffSession={() => approvePendingReviewForSession()}
+      onOpenPlan={() => openRightPanelTab("plan")}
+      onOpenDiff={() => openRightPanelTab("diff")}
+    />
+  ) : null;
+  const hasExecutionCapsuleControls = !!executionCapsuleControls;
+  const hasCapsuleFlow = !!persistedExplanation;
+  const shouldShowMainCapsule = hasCapsuleFlow || hasExecutionCapsuleControls;
+
   return (
     <div className="relative flex min-w-0 flex-1 flex-col bg-[#000000]">
       <div className="h-[48px] shrink-0 border-b border-[#27272a] bg-[#000000] px-4 flex items-center justify-between select-none" data-tauri-drag-region>
@@ -3822,60 +3809,6 @@ export default function ChatArea({
           </div>
         </div>
       </div>
-
-      {shouldRenderTopIsland && (topIslandTurn || pendingRunDecision) && (
-        <TopIsland
-          isVisible={isTopIslandVisible}
-          isRunActive={topIslandIsRunActive}
-          title={
-            pendingRunDecision?.kind === "intent_confirmation"
-              ? pendingRunDecision.title || (language === "zh" ? "意图待确认" : "Intent Confirmation")
-              : normalizeConversationDisplayTitle(
-                  topIslandTurn && !isGenericConversationTitle(topIslandTurn.title)
-                    ? topIslandTurn.title
-                    : topIslandTurn?.intentSummary || "",
-                  language === "en" ? 52 : 42,
-                  topIslandTurn?.userPrompt
-                    ? normalizeConversationDisplayTitle(
-                        topIslandTurn.userPrompt,
-                        language === "en" ? 52 : 42,
-                        language === "en" ? "Turn Decision" : "本轮决策",
-                      )
-                    : language === "en" ? "Turn Decision" : "本轮决策",
-                )
-          }
-          status={copy.turnStatusLabels[topIslandTurnStatusKey || "awaiting_input"] || topIslandTurnStatusKey || "Awaiting Choice"}
-          statusToneClass={getTurnStatusTone(topIslandTurnStatusKey || "awaiting_input")}
-          language={language}
-          themeMode={config.themeMode}
-          chatFontSize={resolvedChatFontSize}
-          planTasks={shouldShowPinnedPlanTasks ? planTasks : []}
-          planExecutionEvidenceLedger={shouldShowPinnedPlanTasks ? planExecutionEvidenceLedger : []}
-          planStage={pinnedPlanTurn ? planStage : "idle"}
-          executionSteps={shouldShowPinnedPlanTasks ? [] : topIslandExecutionSteps}
-          progressMode={shouldShowPinnedPlanTasks ? "plan" : "execution"}
-          isAwaitingChoice={isAwaitingInteractiveChoice}
-          replyOptions={topIslandReplyOptions}
-          pendingRunDecision={pendingRunDecision}
-          activeDiffTask={pendingToolReviewForTopIsland}
-          pendingToolReview={pendingToolReviewForTopIsland}
-          canApprovePlan={canApprovePlan}
-          autoApproveTools={autoApproveTools}
-          onSelectReplyOption={(option) => topIslandTurn && onQuickReply?.(option, topIslandTurn.id)}
-          onRequestPlanAdjustment={(text) => topIslandTurn && onQuickReply?.({ label: text, value: text, action: "adjust_plan" }, topIslandTurn.id)}
-          onCancelTurn={onStopGeneration}
-          onResolvePendingRunDecision={resolvePendingRunDecision}
-          onDismissPendingRunDecision={dismissPendingRunDecision}
-          onApprovePlan={approvePlan}
-          onRejectPlan={rejectPlan}
-          onRejectAndDeletePlan={planArtifacts.length > 0 ? () => void rejectPlanAndDeleteFiles() : undefined}
-          onRejectDiff={handleRejectInline}
-          onApproveDiffOnce={() => approvePendingReviewOnce()}
-          onApproveDiffSession={() => approvePendingReviewForSession()}
-          onOpenPlan={() => openRightPanelTab("plan")}
-          onOpenDiff={() => openRightPanelTab("diff")}
-        />
-      )}
 
       <div
         ref={chatContainerRef}
@@ -4117,27 +4050,32 @@ export default function ChatArea({
         <div ref={endOfFlowRef} />
       </div>
 
-      {/* Agent tool explanation capsule */}
-      {config.enableCapsule !== false && persistedExplanation && (
+      {/* Execution capsule */}
+      {shouldShowMainCapsule && (
         <div
           className="absolute left-6 right-6 z-30 pointer-events-none flex transition-all duration-300 ease-out"
           style={{
             bottom: `calc(env(safe-area-inset-bottom, 0px) + 1.5rem + ${composerHeight}px + 12px)`,
-            opacity: persistedExplanation ? 1 : 0,
-            transform: persistedExplanation ? "translateY(0)" : "translateY(8px)",
+            opacity: shouldShowMainCapsule ? 1 : 0,
+            transform: shouldShowMainCapsule ? "translateY(0)" : "translateY(8px)",
             justifyContent: isCapsuleCollapsed ? "flex-start" : "center",
           }}
         >
           {(() => {
-            const isRich = persistedExplanation.includes("#") || persistedExplanation.includes("\n");
+            const isRich = hasCapsuleFlow && (persistedExplanation.includes("#") || persistedExplanation.includes("\n"));
+            const headerLabel = hasCapsuleFlow
+              ? isRich
+                ? (language === "zh" ? "MAIN 的实时心流" : "MAIN's Flow")
+                : renderCompactMarkdownText(persistedExplanation)
+              : "MAIN";
             return (
               <div
                 data-testid="agent-explanation-capsule"
-                className={`agent-explanation-capsule ${isCapsuleCollapsed ? "collapsed-ring cursor-pointer" : "w-full max-w-3xl flex items-center justify-between"} ${!isCapsuleCollapsed && isRich ? "flex-col !items-start !justify-start !rounded-2xl !p-5" : ""}`}
+                className={`agent-explanation-capsule ${isCapsuleCollapsed ? "collapsed-ring cursor-pointer" : "w-full max-w-3xl flex flex-col !items-start !justify-start !rounded-2xl !p-5"}`}
                 style={{
                   fontSize: `${Math.max(11, resolvedChatFontSize - 1)}px`,
                   lineHeight: `${Math.max(16, Math.round((resolvedChatFontSize - 1) * 1.5))}px`,
-                  maxHeight: !isCapsuleCollapsed && chatAreaHeight ? `${chatAreaHeight * 0.4}px` : undefined,
+                  maxHeight: !isCapsuleCollapsed && chatAreaHeight ? `${chatAreaHeight * 0.58}px` : undefined,
                   overflowY: "hidden",
                 }}
                 onClick={isCapsuleCollapsed ? () => setIsCapsuleCollapsed(false) : undefined}
@@ -4149,17 +4087,17 @@ export default function ChatArea({
                   </div>
                 ) : (
                   <div className="agent-explanation-scroll-container">
-                    <div className={`relative z-10 flex w-full ${isRich ? "flex-col items-start gap-3" : "items-center"}`}>
-                      <div className="flex items-center w-full justify-between border-b border-[#27272a]/60 pb-2 mb-1" style={!isRich ? { borderBottom: "none", paddingBottom: 0, marginBottom: 0 } : undefined}>
+                    <div className="relative z-10 flex w-full flex-col items-start gap-3">
+                      <div className="flex items-center w-full justify-between">
                         <div className="flex items-center min-w-0 flex-1">
                           <div className="shrink-0 mr-2.5 flex items-center justify-center h-6 w-6 rounded-full border border-[var(--accent-subtle-border)] bg-[var(--accent-subtle)] shadow-[0_0_6px_var(--accent-subtle)]">
                             <IconLogoM className="h-3.5 w-3.5 theme-text pointer-events-none" />
                           </div>
-                          <span className={`whitespace-pre-wrap break-words min-w-0 block flex-1 ${isRich ? "text-left font-semibold text-[var(--accent-light)]" : "text-left text-white"}`}>
-                            {!isRich ? renderCompactMarkdownText(persistedExplanation) : (language === "zh" ? "MAIN 的实时心流" : "MAIN's Flow")}
+                          <span className={`whitespace-pre-wrap break-words min-w-0 block flex-1 text-left ${isRich ? "font-semibold text-[var(--accent-light)]" : "text-white"}`}>
+                            {headerLabel}
                           </span>
                         </div>
-                        
+
                         <button
                           onClick={(e) => {
                             e.stopPropagation();
@@ -4174,13 +4112,16 @@ export default function ChatArea({
                         </button>
                       </div>
 
-                      {isRich && (
-                        <>
-                          <div className="w-full text-left pr-1">
-                            {renderCompactMarkdownText(persistedExplanation)}
-                          </div>
-                          <div className="h-5 shrink-0 w-full" />
-                        </>
+                      {hasCapsuleFlow && isRich && (
+                        <div className="w-full border-t border-[#27272a]/60 pt-3 text-left pr-1">
+                          {renderCompactMarkdownText(persistedExplanation)}
+                        </div>
+                      )}
+
+                      {hasExecutionCapsuleControls && (
+                        <div className={`w-full ${hasCapsuleFlow ? "border-t border-[#27272a]/60 pt-3" : ""}`}>
+                          {executionCapsuleControls}
+                        </div>
                       )}
                     </div>
                   </div>

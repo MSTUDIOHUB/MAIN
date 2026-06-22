@@ -3274,39 +3274,6 @@ export default function SettingsModal({
                     </button>
                   </div>
                 </div>
-
-                {/* CAPSULE FUNCTION ENABLE/DISABLE */}
-                <div className={`${settingsSectionRowClass} border-t border-[#27272a] pt-5`}>
-                  <div>
-                    <span className="block text-[13px] font-bold text-[#e4e4e7]">{t.enableCapsule}</span>
-                    <span className="mt-1.5 block text-[12px] leading-relaxed text-[#a1a1aa]">{t.enableCapsuleDesc}</span>
-                  </div>
-                  <div className={`${settingsControlColumnClass} flex items-center justify-between rounded-lg border border-[#27272a] bg-[#000000] px-4 py-3`}>
-                    <span className={`min-w-0 text-[12px] font-bold ${config.enableCapsule !== false ? "theme-text" : "text-[#a1a1aa]"}`}>
-                      {config.enableCapsule !== false ? copy.enabled : copy.disabled}
-                    </span>
-                    <button
-                      type="button"
-                      role="switch"
-                      aria-checked={config.enableCapsule !== false}
-                      data-testid="enable-capsule-switch"
-                      aria-label={t.enableCapsule}
-                      onClick={() => setConfig({ ...config, enableCapsule: !(config.enableCapsule !== false) })}
-                      className={`relative inline-flex h-6 w-11 items-center rounded-full border p-0.5 transition-all duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-[#000000] ${
-                        config.enableCapsule !== false
-                          ? "border-transparent shadow-[0_0_12px_var(--accent-subtle)]"
-                          : "border-[#3f3f46] bg-[#18181b]"
-                      }`}
-                      style={config.enableCapsule !== false ? { backgroundColor: "var(--accent)" } : undefined}
-                    >
-                      <span
-                        className={`block h-5 w-5 rounded-full bg-white shadow-sm transition-transform duration-200 ${
-                          config.enableCapsule !== false ? "translate-x-5" : "translate-x-0"
-                        }`}
-                      />
-                    </button>
-                  </div>
-                </div>
               </div>
             )}
 

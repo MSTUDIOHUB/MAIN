@@ -521,8 +521,8 @@ test("extractReplyOptions synthesizes operation approval for executable proposal
   assert.equal(result.replyOptions[2].action, "cancel_operation");
 });
 
-test("TopIsland keeps execute_once branch labels distinct instead of flattening them", () => {
-  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/components/TopIsland.tsx"), "utf8");
+test("ExecutionCapsule keeps execute_once branch labels distinct instead of flattening them", () => {
+  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/components/ExecutionCapsule.tsx"), "utf8");
   assert.match(source, /option\.action === "approve_operation_once"/);
   assert.match(source, /option\.action === "execute_once"/);
   assert.match(source, /return option\.label \|\| option\.value \|\|/);

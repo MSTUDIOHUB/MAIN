@@ -4914,6 +4914,14 @@ export class AgentOrchestrator {
             isExecutionPlanArtifactWrite,
             isTasksPlanWrite,
           });
+          logAgentEvent("tool_permission_plan", {
+            tool: tc.name,
+            source: planned.source,
+            risk: planned.risk,
+            autoApproveToolScopes: callbacks.getAutoApproveToolScopes?.() || [],
+            plannedAction: planned.action,
+            sessionAutoApproved: planned.sessionAutoApproved,
+          });
           const targetState = initialLifecycleStateForPlanAction(planned.action);
           emitTurnEvent({
             type: "item.started",

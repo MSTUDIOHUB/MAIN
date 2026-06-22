@@ -63,13 +63,15 @@ export type SessionAutoApproveScope =
   | "shell"
   | "local_file_read"
   | "external_write"
-  | "browser_control";
+  | "browser_control"
+  | "mcp_action";
 
 export interface RuntimeToolPlanResult {
   action: RuntimeToolPlanAction;
   toolArgs: Record<string, unknown>;
   target: string;
-  risk?: "local_file_read" | "browser_control";
+  source?: RuntimeToolSpec["source"];
+  risk?: ToolRiskLevel;
   localFileReadPath?: string;
   sessionAutoApproved?: boolean;
   reason?: "pre_approval_source_write" | "pre_approval_tasks" | "missing_tasks_before_source";
@@ -110,19 +112,30 @@ function scopeForRisk(risk: ToolRiskLevel): SessionAutoApproveScope | null {
   }
 }
 
-function isAllowedBySessionAutoApprove(
+function sessionAutoApproveScopesInclude(
+  scopes: Iterable<SessionAutoApproveScope> | null | undefined,
+  expected: SessionAutoApproveScope,
+): boolean {
+  if (!scopes) return false;
+  for (const item of scopes) {
+    if (item === expected) return true;
+  }
+  return false;
+}
+
+export function isAllowedBySessionAutoApprove(
   risk: ToolRiskLevel,
+  source: RuntimeToolSpec["source"],
   scopes: Iterable<SessionAutoApproveScope> | null | undefined,
   policy: ToolPermissionPolicy,
 ): boolean {
   if (risk === "destructive") return false;
   if (policy.disabledRiskLevels.includes(risk)) return false;
-  const scope = scopeForRisk(risk);
-  if (!scope || !scopes) return false;
-  for (const item of scopes) {
-    if (item === scope) return true;
+  if (source === "mcp" && sessionAutoApproveScopesInclude(scopes, "mcp_action")) {
+    return true;
   }
-  return false;
+  const scope = scopeForRisk(risk);
+  return !!scope && sessionAutoApproveScopesInclude(scopes, scope);
 }
 
 function parseToolCallArguments(call: RuntimeToolCall, workspace?: string | null): Record<string, unknown> {
@@ -191,6 +204,8 @@ export function initialLifecycleStateForPlanAction(action: RuntimeToolPlanAction
 export function planRuntimeToolCall(input: PlanRuntimeToolCallInput): RuntimeToolPlanResult {
   const toolArgs = parseToolCallArguments(input.toolCall, input.workspace);
   const target = input.getToolTarget(input.toolCall.name, toolArgs);
+  const capability = input.capabilityRegistry.tools[input.toolCall.name];
+  const source = capability?.source ?? "unknown";
   const risk = getToolRiskLevelForCall(
     input.toolCall.name,
     toolArgs,
@@ -200,10 +215,12 @@ export function planRuntimeToolCall(input: PlanRuntimeToolCallInput): RuntimeToo
       approvedLocalFileReadPaths: input.approvedLocalFileReadPaths,
     },
   );
+  const planMetadata = { source, risk };
 
   if (!input.availableToolNames.has(input.toolCall.name)) {
     return {
       action: "blocked_unavailable",
+      ...planMetadata,
       toolArgs,
       target,
     };
@@ -218,6 +235,7 @@ export function planRuntimeToolCall(input: PlanRuntimeToolCallInput): RuntimeToo
     if (input.isExecutionPlanArtifactWrite(input.toolCall.name, toolArgs)) {
       return {
         action: "spec_file_auto_approved",
+        ...planMetadata,
         toolArgs,
         target,
       };
@@ -226,6 +244,7 @@ export function planRuntimeToolCall(input: PlanRuntimeToolCallInput): RuntimeToo
     if (isPlanFileReadBeforeTasks(input.toolCall.name, toolArgs, target)) {
       return {
         action: "auto_execute",
+        ...planMetadata,
         toolArgs,
         target,
       };
@@ -233,6 +252,7 @@ export function planRuntimeToolCall(input: PlanRuntimeToolCallInput): RuntimeToo
 
     return {
       action: "blocked_plan_gate",
+      ...planMetadata,
       toolArgs,
       target,
       reason: "missing_tasks_before_source",
@@ -245,6 +265,7 @@ export function planRuntimeToolCall(input: PlanRuntimeToolCallInput): RuntimeToo
     !isLocalFileReadApproved(localFileReadPath, input.approvedLocalFileReadPaths);
   const sessionAutoApproved = isAllowedBySessionAutoApprove(
     risk,
+    source,
     input.autoApproveToolScopes,
     input.toolPermissionPolicy,
   );
@@ -252,18 +273,18 @@ export function planRuntimeToolCall(input: PlanRuntimeToolCallInput): RuntimeToo
     if (sessionAutoApproved) {
       return {
         action: "auto_execute",
+        ...planMetadata,
         toolArgs,
         target,
-        risk: "local_file_read",
         localFileReadPath,
         sessionAutoApproved: true,
       };
     }
     return {
       action: "local_file_read_review",
+      ...planMetadata,
       toolArgs,
       target,
-      risk: "local_file_read",
       localFileReadPath,
     };
   }
@@ -271,9 +292,9 @@ export function planRuntimeToolCall(input: PlanRuntimeToolCallInput): RuntimeToo
   if (sessionAutoApproved) {
     return {
       action: "auto_execute",
+      ...planMetadata,
       toolArgs,
       target,
-      risk: risk === "browser_control" ? "browser_control" : undefined,
       localFileReadPath,
       sessionAutoApproved: true,
     };
@@ -291,6 +312,7 @@ export function planRuntimeToolCall(input: PlanRuntimeToolCallInput): RuntimeToo
   )) {
     return {
       action: "auto_execute",
+      ...planMetadata,
       toolArgs,
       target,
       localFileReadPath,
@@ -301,6 +323,7 @@ export function planRuntimeToolCall(input: PlanRuntimeToolCallInput): RuntimeToo
     if (!input.isPlanApproved && input.isPreApprovalPlanDraftWrite(input.toolCall.name, toolArgs)) {
       return {
         action: "spec_file_auto_approved",
+        ...planMetadata,
         toolArgs,
         target,
       };
@@ -309,6 +332,7 @@ export function planRuntimeToolCall(input: PlanRuntimeToolCallInput): RuntimeToo
     if (input.isPlanApproved && input.isExecutionPlanArtifactWrite(input.toolCall.name, toolArgs)) {
       return {
         action: "spec_file_auto_approved",
+        ...planMetadata,
         toolArgs,
         target,
       };
@@ -323,6 +347,7 @@ export function planRuntimeToolCall(input: PlanRuntimeToolCallInput): RuntimeToo
 
     return {
       action: "blocked_plan_gate",
+      ...planMetadata,
       toolArgs,
       target,
       reason,
@@ -332,15 +357,16 @@ export function planRuntimeToolCall(input: PlanRuntimeToolCallInput): RuntimeToo
   if (risk === "browser_control") {
     return {
       action: "review_required",
+      ...planMetadata,
       toolArgs,
       target,
-      risk: "browser_control",
       localFileReadPath,
     };
   }
 
   return {
     action: "review_required",
+    ...planMetadata,
     toolArgs,
     target,
     localFileReadPath,

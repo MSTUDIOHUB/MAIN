@@ -276,7 +276,7 @@ test("manageContext builds state-first compressed memory instead of tool transcr
 test("manageContext carries compressed state without nesting earlier transcript summaries", () => {
   const first = manageContext([
     { role: "system", content: "system prompt" },
-    { role: "user", content: "目标：实现 TopIsland 步骤进度，必须只展示当前回合。" },
+    { role: "user", content: "目标：实现 ExecutionCapsule 步骤进度，必须只展示当前回合。" },
     ...Array.from({ length: 12 }, (_, index) => ({
       role: index % 2 === 0 ? "user" : "assistant",
       content: `old-${index} ` + "A".repeat(1000),

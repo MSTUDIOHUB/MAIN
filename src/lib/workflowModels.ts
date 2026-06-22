@@ -457,7 +457,7 @@ const GENERIC_TURN_TITLE_RE = /^(?:新的任务|新任务|new task|turn decision
 
 /**
  * 统一清理标题中的转录元信息、Markdown 噪音和误入的状态前缀，
- * 避免 sidebar / TopIsland 直接展示用户名、时间戳或推理泄漏文本。
+ * 避免 sidebar / ExecutionCapsule 直接展示用户名、时间戳或推理泄漏文本。
  */
 export function normalizeConversationDisplayTitle(
   input: string,
@@ -548,7 +548,7 @@ export function summarizePlanIntent(prompt: string, maxLength = 40, language: "z
 }
 
 /**
- * TopIsland 在贴底自动跟随时应始终代表最新回合；
+ * ExecutionCapsule 在贴底自动跟随时应始终代表最新回合；
  * 只有用户主动滚回历史内容时，才回到按可见回合定位。
  */
 export function resolveActiveConversationTurn(
@@ -565,7 +565,7 @@ export function resolveActiveConversationTurn(
 
 /**
  * 当前执行中的 turn 不应随滚动浏览而漂移；
- * TopIsland 的任务区/审批区应绑定这个稳定上下文。
+ * ExecutionCapsule 的任务区/审批区应绑定这个稳定上下文。
  */
 export function resolvePinnedConversationTurn(
   turns: ConversationTurn[],

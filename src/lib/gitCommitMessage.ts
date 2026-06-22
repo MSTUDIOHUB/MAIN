@@ -102,7 +102,7 @@ function inferCommitTopicFromPaths(entries: GitDiffEntry[], language: Language) 
   const joined = paths.join("\n");
   if (/sidebar/.test(joined) && /git/.test(joined)) return language === "zh" ? "Git 菜单" : "sidebar git menu";
   if (/git/.test(joined) && /diff/.test(joined)) return language === "zh" ? "Git Diff" : "git diff preview";
-  if (/top[-_]?island/.test(joined)) return "TopIsland";
+  if (/top[-_]?island/.test(joined)) return "ExecutionCapsule";
   if (/diff/.test(joined)) return language === "zh" ? "Diff 视图" : "diff view";
   if (/tool|schema|executor/.test(joined)) return language === "zh" ? "工具执行" : "tool execution";
 
