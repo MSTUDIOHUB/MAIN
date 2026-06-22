@@ -1654,7 +1654,9 @@ export async function streamChatCompletion(
       errorBody.includes("context_length_exceeded") ||
       errorBody.includes("context window") ||
       errorBody.includes("maximum context length") ||
-      errorBody.includes("token limit");
+      errorBody.includes("token limit") ||
+      errorBody.includes("prefill memory guard") ||
+      errorBody.includes("context too large");
 
     const httpErr = new Error(
       isContextError

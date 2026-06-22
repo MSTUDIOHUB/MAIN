@@ -660,10 +660,7 @@ export function shouldPauseForReplyOptions(params: {
 
   if (!Array.isArray(replyOptions) || replyOptions.length === 0) return false;
   const hasLengthSafeOption = replyOptions.some((option) =>
-    option.source === "explicit_user_options" ||
-    option.source === "proposal_follow_up" ||
-    option.source === "operation_approval" ||
-    option.action === "approve_operation_once"
+    option.source === "explicit_user_options"
   );
   const hasExplicitOrActionablePauseOption = replyOptions.some((option) =>
     option.source === "explicit_user_options" ||

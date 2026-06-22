@@ -238,6 +238,34 @@ test("system prompt separates display language from resolved response language",
   assert.match(prompt, /需要工具时只输出完整工具调用/);
 });
 
+test("system prompt respects Chinese response language contract even if UI language is English", () => {
+  const prompt = buildSystemPrompt(
+    [],
+    "/tmp/workspace",
+    "main_mode",
+    "",
+    [],
+    [],
+    "plan",
+    "en",
+    null,
+    undefined,
+    undefined,
+    "english_core_localized_output",
+    ["read_file", "write_file"],
+    null,
+    undefined,
+    {
+      displayLanguage: "en",
+      resolvedResponseLanguage: "zh",
+    },
+  );
+
+  assert.match(prompt, /\[LANGUAGE CONTRACT\]/);
+  assert.match(prompt, /displayLanguage: en/);
+  assert.match(prompt, /resolvedResponseLanguage: zh/);
+});
+
 test("English system prompt uses domain-neutral tabular guidance", () => {
   const prompt = buildSystemPrompt(
     [],

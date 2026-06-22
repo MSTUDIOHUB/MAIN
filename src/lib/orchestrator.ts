@@ -2684,7 +2684,7 @@ export async function fetchLLMStream(
       escalationCount < MAX_ESCALATIONS &&
       !skipReasoningDominatedEscalation &&
       allowEscalation &&
-      (!isLocal || hasToolCalls);
+      (!isLocal || hasToolCalls || options.workflowMode === "plan" || options.workflowMode === "edit");
     if (shouldEscalate) {
         const nextMaxTokens = escalateMaxTokens(currentMaxTokens, settings.contextLimit);
       if (nextMaxTokens !== null) {
@@ -4396,7 +4396,6 @@ export function summarizeToolsForDiagnostics(tools: ToolDefinition[]): Record<st
   }
   return {
     count: tools.length,
-    names: tools.map((tool) => tool.function.name).slice(0, 20),
     schemaChars,
     estimatedSchemaTokens: Math.ceil(schemaChars / 4),
   };

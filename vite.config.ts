@@ -35,6 +35,7 @@ export default defineConfig(async () => ({
         "**/.protocols/**",
         "**/tracks/**",
         "**/.codely-cli/**",
+        "**/.MAIN/**",
       ],
     },
   },

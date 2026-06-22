@@ -3247,6 +3247,9 @@ export default function ChatArea({
     const planProgressBody = turnProgressSnapshot
       ? formatPlanExecutionProgressSnapshot(turnProgressSnapshot, language)
       : "";
+    const hasInlinePlanProgressBlock = blocks.some((block) =>
+      block.type === "system" && block.variant === "plan_execution_progress"
+    );
     const livePlanProgressBlock =
       isTurnExpanded && isPlanExecutionVisible && turnProgressSnapshot && planProgressBody && !hasInlinePlanProgressBlock
         ? {

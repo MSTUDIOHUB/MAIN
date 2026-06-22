@@ -1745,7 +1745,6 @@ export class AgentOrchestrator {
             chatFinalSynthesisActive,
             chatFinalSynthesisReason,
             messages: summarizeMessagesForDiagnostics(messagesForLLM),
-            managedMessages: summarizeMessagesForDiagnostics(managedAgentMessages),
             allTools: summarizeToolsForDiagnostics(iterationAllTools),
             llmTools: summarizeToolsForDiagnostics(llmTools),
             toolChoice: recoveryToolChoice ?? null,
@@ -1813,7 +1812,9 @@ export class AgentOrchestrator {
             errMsg.includes("context_length_exceeded") ||
             errMsg.includes("context window") ||
             errMsg.includes("maximum context length") ||
-            errMsg.includes("token limit");
+            errMsg.includes("token limit") ||
+            errMsg.includes("prefill memory guard") ||
+            errMsg.includes("context too large");
           const isCompatibilityError =
             isProviderCompatibilityErrorMessage(errMsg) ||
             shouldTreatCloudGatewayErrorAsCompatibility(

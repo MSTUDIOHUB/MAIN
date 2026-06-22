@@ -358,9 +358,9 @@ export function buildSystemPrompt(
 ): string {
   const parts: string[] = [];
   const displayLanguage = languageContract?.displayLanguage === "en" ? "en" : "zh";
-  const resolvedResponseLanguage = languageContract?.resolvedResponseLanguage === "en"
-    ? "en"
-    : uiLanguage === "en" ? "en" : "zh";
+  const resolvedResponseLanguage = languageContract?.resolvedResponseLanguage
+    ? (languageContract.resolvedResponseLanguage === "en" ? "en" : "zh")
+    : (uiLanguage === "en" ? "en" : "zh");
   const fallbackLanguageName = languageName(displayLanguage);
   const resolvedLanguageName = languageName(resolvedResponseLanguage);
   const turnIntent = turnIntentOverride ?? resolveRunIntentFromLegacyWorkflowMode(workflowMode ?? "chat");

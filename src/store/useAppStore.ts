@@ -1,7 +1,7 @@
 // store/useAppStore.ts
 // Zustand global state for Local Agent IDE
 // All state that was previously scattered as useState in the monolith lives here.
-import { create } from "zustand";
+import { create, type StateCreator } from "zustand";
 import { persist } from "zustand/middleware";
 import { type AgentMessage, type ReviewDecision, type ContentPart } from "../lib/orchestrator";
 import type { ExecuteRecoveryMode } from "../lib/executeRecoveryTools";
@@ -3765,11 +3765,44 @@ function normalizeSkillContent(content: string): string {
     .replace(/<\/?(thought|thinking|reasoning|analysis)>/gi, "");
 }
 
+const sessionSyncMiddleware =
+  (config: StateCreator<AppState, [], []>): StateCreator<AppState, [], []> =>
+  (set, get, api) => {
+    const customSet: typeof set = (patchOrUpdater, replace) => {
+      (set as any)((s: AppState) => {
+        const patch =
+          typeof patchOrUpdater === "function"
+            ? (patchOrUpdater as (state: AppState) => Partial<AppState>)(s)
+            : patchOrUpdater;
+        const nextWorkspace = patch.currentWorkspace !== undefined ? patch.currentWorkspace : s.currentWorkspace;
+        const nextSessionId = patch.currentSessionId !== undefined ? patch.currentSessionId : s.currentSessionId;
+        const sessionKey = resolveSessionRuntimeKey(resolveSessionWorkspaceKey(nextWorkspace), nextSessionId);
+        const runtimePatch = pickSessionRuntimePatch(patch);
+        if (sessionKey && Object.keys(runtimePatch).length > 0) {
+          const existing = s.runtimeBySessionKey[sessionKey] || createSessionRuntimeFromState(s);
+          return {
+            ...patch,
+            runtimeBySessionKey: {
+              ...s.runtimeBySessionKey,
+              [sessionKey]: {
+                ...existing,
+                ...runtimePatch,
+              },
+            },
+          };
+        }
+        return patch;
+      }, replace);
+    };
+    api.setState = customSet;
+    return config(customSet, get, api);
+  };
+
 // ── The Store ─────────────────────────────────────────────────────────
 
 export const useAppStore = create<AppState>()(
   persist(
-    (set, get) => ({
+    sessionSyncMiddleware((set, get) => ({
       // Config Slice
       ...createConfigSlice(set, get),
 
@@ -3999,7 +4032,7 @@ export const useAppStore = create<AppState>()(
     });
   },
   clearGitDiffPreview: () => set({ gitDiffPreview: null }),
-  ensurePlanArtifactsHydratedForWorkspace: async (options = {}) => {
+  ensurePlanArtifactsHydratedForWorkspace: async (options: { openPanel?: boolean; reason?: string; promoteTasksToExecuting?: boolean } = {}) => {
     const state = get();
     const language = state.config.language === "en" ? "en" : "zh";
     const alreadyHasPlanState =
@@ -4449,7 +4482,7 @@ export const useAppStore = create<AppState>()(
 
     return imageSession.id;
   },
-  returnFromImageSession: async (targetMode = "main_mode") => {
+  returnFromImageSession: async (targetMode: Exclude<MainModeKey, "image_studio"> = "main_mode") => {
     const state = get();
     const language = state.config.language === "en" ? "en" : "zh";
     const scopeKey = resolveSessionWorkspaceKey(state.currentWorkspace);
@@ -5470,7 +5503,7 @@ export const useAppStore = create<AppState>()(
       },
     }));
   },
-  restoreRuntimeForSession: (sessionKey: string | null, options = {}) => {
+  restoreRuntimeForSession: (sessionKey: string | null, options: { requireTranscript?: boolean; resetPanels?: boolean } = {}) => {
     if (!sessionKey) return false;
     const runtime = get().runtimeBySessionKey[sessionKey];
     if (!runtime) return false;
@@ -5614,7 +5647,7 @@ export const useAppStore = create<AppState>()(
     });
   },
 
-  removeSession: (workspacePath: string, sessionId: number, options = {}) => {
+  removeSession: (workspacePath: string, sessionId: number, options: { nextSessionId?: number | null } = {}) => {
     set((s) => {
       const wsSessions = s.sessionsByWorkspace[workspacePath];
       if (!wsSessions) return s;
@@ -7774,7 +7807,7 @@ export const useAppStore = create<AppState>()(
         active: true,
       });
     }
-    const backgroundRunningSessions = Object.entries(state.runtimeBySessionKey)
+    const backgroundRunningSessions = (Object.entries(state.runtimeBySessionKey) as [string, SessionRuntimeState][])
       .filter(([sessionKey, runtime]) =>
         sessionKey !== runSessionKey &&
         (runtime.isGenerating || runtime.agentStatus === "running" || runtime.agentStatus === "pending_review")
@@ -9328,7 +9361,7 @@ export const useAppStore = create<AppState>()(
     return true;
   },
 
-    }),
+    })),
     {
       name: "local-agent-ide",
       version: LOCAL_PERSIST_SCHEMA_VERSION,

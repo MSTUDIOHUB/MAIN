@@ -879,3 +879,19 @@ test("convertAssistantClauseToUserChoice converts Gemma pronouns and preserves f
   assert.equal(result.replyOptions[0].value, "我要分析销售额数据");
   assert.equal(result.replyOptions[1].value, "直接执行部署脚本 deploy.sh");
 });
+
+test("shouldPauseForReplyOptions rejects inferred proposal options on length truncation", () => {
+  const replyOptions = [
+    { label: "批准执行本轮操作", value: "我批准执行。", action: "approve_operation_once", source: "proposal_follow_up" },
+    { label: "继续调整方案", value: "请继续调整方案。", action: "adjust_plan", source: "proposal_follow_up" },
+  ];
+  assert.equal(
+    shouldPauseForReplyOptions({
+      replyOptions,
+      toolCallCount: 0,
+      workflowMode: "edit",
+      finishReason: "length",
+    }),
+    false,
+  );
+});
