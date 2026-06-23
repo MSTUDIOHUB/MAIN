@@ -6703,7 +6703,66 @@ export const useAppStore = create<AppState>()(
     remoteFeishu?: FeishuRemoteContext;
     skipAutoPlanHydration?: boolean;
   }) => {
-    const state = get();
+    let state = get();
+    // If agent is waiting in pending_review, and this is NOT an approval action,
+    // we abort the current run loop and start a new turn immediately.
+    const isApprovalBypass = options?.executionConsentGranted === true || (() => {
+      const currentTurn = state.currentTurnId
+        ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId) || null
+        : null;
+      if (!currentTurn) return false;
+      const replyOptions = state.taskFlow.filter((block: any) =>
+        block.turnId === currentTurn.id &&
+        block.type === "agent" &&
+        Array.isArray(block.options) &&
+        block.options.length > 0
+      );
+      const selected = text.trim();
+      const option = selected
+        ? replyOptions
+            .flatMap((block: any) => block.options || [])
+            .find((opt: any) => opt.value === selected || opt.label === selected) || null
+        : null;
+      return option?.action === "execute_once" || option?.action === "approve_operation_once";
+    })();
+
+    if (state.agentStatus === "pending_review" && !isApprovalBypass) {
+      logStoreEvent("send_pending_review_abort_and_new_turn", {
+        textChars: text?.length ?? 0,
+        pendingReviewTaskId: state.pendingReviewTaskId,
+      });
+
+      if (state.abortController) {
+        try {
+          state.abortController.abort();
+        } catch (e) {
+          console.error("Failed to abort controller during pending_review transition:", e);
+        }
+      }
+
+      if (state.pendingReviewResolve) {
+        try {
+          state.pendingReviewResolve({ action: "reject" });
+        } catch (e) {
+          console.error("Failed to resolve pendingReviewResolve during pending_review transition:", e);
+        }
+      }
+
+      set({
+        agentStatus: "idle",
+        isGenerating: false,
+        abortController: null,
+        pendingReviewResolve: null,
+        pendingReviewTaskId: null,
+        pendingToolCall: null,
+      });
+
+      if (state.currentTurnId) {
+        get().setConversationTurnStatus(state.currentTurnId, "stopped_no_action");
+      }
+
+      state = get();
+    }
     const sendOriginSessionKey = resolveSessionRuntimeKey(resolveSessionWorkspaceKey(state.currentWorkspace), state.currentSessionId);
     const applyPreRunSessionPatch = (patch: Partial<AppState> | Record<string, unknown>) => {
       if (!sendOriginSessionKey || isSessionRuntimeActive(get(), sendOriginSessionKey)) {

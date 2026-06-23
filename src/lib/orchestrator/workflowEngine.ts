@@ -1630,14 +1630,13 @@ export class WorkflowEngine {
           });
         });
       } else if (queuedAfterRun) {
-        sessionSet({
-          queuedUserMessage: null,
-          input: "",
-          contextMentions: [],
-          attachedFiles: [],
-        });
+        if (latestState.agentStatus === "pending_review") {
+          // Skip dequeuing if agentStatus is pending_review so the message stays in composer queue bar
+          return false;
+        }
+
         runAfterNextPaint(() => {
-          const latest = sessionGet();
+          let latest = sessionGet();
           const latestSessionKey = resolveSessionRuntimeKey(
             resolveSessionWorkspaceKey(latest.currentWorkspace),
             latest.currentSessionId,
@@ -1650,12 +1649,21 @@ export class WorkflowEngine {
             });
             return;
           }
-          if (latest.isGenerating || latest.agentStatus === "running" || latest.agentStatus === "pending_review") {
+          if (latest.agentStatus === "pending_review") {
             logStoreEvent("queued_user_message_skipped", {
-              reason: "agent_busy",
+              reason: "agent_pending_review",
               agentStatus: latest.agentStatus,
             });
             return;
+          }
+          if (latest.isGenerating || latest.agentStatus === "running") {
+            logStoreEvent("queued_user_message_force_idle", {
+              reason: "stale_running_or_generating",
+              agentStatus: latest.agentStatus,
+              isGenerating: latest.isGenerating,
+            });
+            sessionSet({ agentStatus: "idle", isGenerating: false });
+            latest = sessionGet();
           }
           logStoreEvent("queued_user_message_sending", {
             chars: queuedAfterRun.text.length,
@@ -1663,6 +1671,15 @@ export class WorkflowEngine {
             contextMentions: queuedAfterRun.contextMentions?.length || 0,
             attachedFiles: queuedAfterRun.attachedFiles?.length || 0,
           });
+
+          // Only clear queuedUserMessage when actually sending the message
+          sessionSet({
+            queuedUserMessage: null,
+            input: "",
+            contextMentions: [],
+            attachedFiles: [],
+          });
+
           latest.sendMessage(queuedAfterRun.text, queuedAfterRun.images, {
             contextMentionsSnapshot: queuedAfterRun.contextMentions || [],
             attachedFilesSnapshot: queuedAfterRun.attachedFiles || [],

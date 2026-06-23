@@ -815,13 +815,10 @@ function getActiveTurnActivity(blocks: any[], turnStatus: string, language: "zh"
 }
 
 function TurnActivityNotice({
-  activityText,
   thoughtSummaryText,
   isThinking,
   language,
   chatFontSize,
-  progressItems = [],
-  text,
 }: {
   activityText?: string;
   thoughtSummaryText?: string;
@@ -831,85 +828,27 @@ function TurnActivityNotice({
   progressItems?: RuntimeProgressLedgerItem[];
   text?: string;
 }) {
-  const [expanded, setExpanded] = useState(false);
-  const progressProjection = buildRuntimeProgressProjection(progressItems, language, 4);
-  const latestProgressLogKey = progressProjection.latest
-    ? `${progressProjection.latest.key}:${progressProjection.latest.status}:${progressProjection.latest.repeatCount}:${progressProjection.latest.lastSeenAt}`
-    : "";
-  const lastLoggedProgressKeyRef = useRef("");
-  useEffect(() => {
-    if (!latestProgressLogKey || lastLoggedProgressKeyRef.current === latestProgressLogKey) return;
-    lastLoggedProgressKeyRef.current = latestProgressLogKey;
-    appendDebugLog("info", "ui.progress_projection_updated", {
-      latestKey: progressProjection.latest?.key || "",
-      latestTitle: progressProjection.latest?.title || "",
-      latestStatus: progressProjection.latest?.status || "",
-      recentCount: progressProjection.recent.length,
-      summary: progressProjection.summary,
-    });
-  }, [latestProgressLogKey, progressProjection.latest, progressProjection.recent.length, progressProjection.summary]);
-  const resolvedActivityText = String(progressProjection.activityText || activityText || text || "").trim();
   const resolvedThoughtSummaryText = String(thoughtSummaryText || "").trim();
-  if (!resolvedActivityText && !resolvedThoughtSummaryText) return null;
+  if (!resolvedThoughtSummaryText) return null;
   const thoughtTitle = language === "zh"
     ? isThinking ? "正在整理思路" : "思考摘要"
     : isThinking ? "Thinking" : "Thinking summary";
-  const progressTitle = progressProjection.latest?.status === "paused"
-    ? language === "zh" ? "已暂停" : "Paused"
-    : language === "zh" ? "有效进展" : "Effective Progress";
-  const canExpandProgress = progressProjection.recent.length > 1;
-  const toggleText = expanded
-    ? language === "zh" ? "收起" : "Hide"
-    : language === "zh" ? "最近 4 条" : "Recent 4";
   return (
     <div
       data-testid="turn-activity-notice"
       className="ml-9 rounded-2xl border border-[rgba(96,165,250,0.2)] bg-[rgba(37,99,235,0.08)] px-4 py-3 text-[12px] text-[#bfdbfe]"
     >
-      {resolvedThoughtSummaryText && (
-        <div data-testid="turn-activity-thought-summary" className="max-h-[42vh] overflow-y-auto pr-1" style={{ fontSize: `${chatFontSize}px` }}>
-          <div className="mb-1.5 flex items-center gap-2 font-mono text-[10.5px] text-[#93c5fd]">
-            <span className={`h-1.5 w-1.5 rounded-full ${isThinking ? "bg-amber-400 shadow-[0_0_6px_rgba(251,191,36,0.75)] animate-pulse" : "bg-[#34d399]"}`} />
-            <span>{thoughtTitle}</span>
-          </div>
-          <MarkdownRenderer
-            content={resolvedThoughtSummaryText}
-            baseFontSize={chatFontSize}
-            sourceId="turn-activity-thought-summary"
-          />
+      <div data-testid="turn-activity-thought-summary" className="max-h-[42vh] overflow-y-auto pr-1" style={{ fontSize: `${chatFontSize}px` }}>
+        <div className="mb-1.5 flex items-center gap-2 font-mono text-[10.5px] text-[#93c5fd]">
+          <span className={`h-1.5 w-1.5 rounded-full ${isThinking ? "bg-amber-400 shadow-[0_0_6px_rgba(251,191,36,0.75)] animate-pulse" : "bg-[#34d399]"}`} />
+          <span>{thoughtTitle}</span>
         </div>
-      )}
-      {resolvedActivityText && (
-        <div
-          data-testid="effective-progress-ledger"
-          className={`${resolvedThoughtSummaryText ? "mt-2 border-t border-[rgba(147,197,253,0.14)] pt-2" : ""}`}
-        >
-          <div className="flex min-w-0 items-start gap-2">
-            <span className="mt-1.5 h-2 w-2 shrink-0 rounded-full bg-[#60a5fa] shadow-[0_0_8px_rgba(96,165,250,0.8)] animate-pulse" />
-            <span className="min-w-0 flex-1">
-              <span className="mb-0.5 block font-mono text-[10.5px] uppercase tracking-[0.14em] text-[#93c5fd]">{progressTitle}</span>
-              <span className="block whitespace-pre-wrap break-words text-[12px] leading-5 text-[#bfdbfe]">{resolvedActivityText}</span>
-            </span>
-            {canExpandProgress && (
-              <button
-                type="button"
-                data-testid="effective-progress-ledger-toggle"
-                aria-expanded={expanded}
-                onClick={() => setExpanded((value) => !value)}
-                className="inline-flex shrink-0 items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] text-[#93c5fd] transition-colors hover:bg-[rgba(96,165,250,0.12)]"
-              >
-                {expanded ? <IconChevronDown className="h-3.5 w-3.5" /> : <IconChevronRight className="h-3.5 w-3.5" />}
-                {toggleText}
-              </button>
-            )}
-          </div>
-          {expanded && progressProjection.recent.length > 0 && (
-            <div className="mt-2 border-t border-[rgba(147,197,253,0.14)] pt-2">
-              <EffectiveProgressLedgerDetails items={progressProjection.recent} />
-            </div>
-          )}
-        </div>
-      )}
+        <MarkdownRenderer
+          content={resolvedThoughtSummaryText}
+          baseFontSize={chatFontSize}
+          sourceId="turn-activity-thought-summary"
+        />
+      </div>
     </div>
   );
 }
@@ -2443,6 +2382,33 @@ export default function ChatArea({
   const [persistedExplanation, setPersistedExplanation] = useState("");
   const [chatAreaHeight, setChatAreaHeight] = useState(0);
   const [isCapsuleCollapsed, setIsCapsuleCollapsed] = useState(false);
+  const [showProgressPopover, setShowProgressPopover] = useState(false);
+  const popoverRef = useRef<HTMLDivElement>(null);
+  const mButtonRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    if (!showProgressPopover) return;
+    const handleDocumentClick = (e: MouseEvent) => {
+      const target = e.target as HTMLElement;
+      if (
+        popoverRef.current &&
+        !popoverRef.current.contains(target) &&
+        mButtonRef.current &&
+        !mButtonRef.current.contains(target)
+      ) {
+        setShowProgressPopover(false);
+      }
+    };
+    document.addEventListener("click", handleDocumentClick);
+    return () => {
+      document.removeEventListener("click", handleDocumentClick);
+    };
+  }, [showProgressPopover]);
+
+  useEffect(() => {
+    setShowProgressPopover(false);
+  }, [isCapsuleCollapsed, activeSessionKey]);
+
   const lastTurnIdRef = useRef<string | undefined>(undefined);
   // endregion
 
@@ -2534,7 +2500,9 @@ export default function ChatArea({
       pinnedTurn.status === "executing" ||
       pinnedTurn.status === "awaiting_input" ||
       pinnedTurn.status === "awaiting_approval" ||
-      agentStatus === "pending_review"
+      agentStatus === "pending_review" ||
+      agentStatus === "running" ||
+      isStreaming
     );
   const capsuleControlTurn = shouldKeepExecutionCapsuleResident ? pinnedTurn : activeTurn;
   const capsuleControlTurnEntry = useMemo(() => {
@@ -2583,7 +2551,7 @@ export default function ChatArea({
       capsuleTurn.status === "executing"
     );
   const capsuleProgressLedger = useMemo(() => {
-    if (!capsuleTurn || !capsuleIsRunActive) return [];
+    if (!capsuleTurn) return [];
     return buildRuntimeProgressLedger({
       blocks: capsuleTurnBlocks,
       events: runtimeEvents,
@@ -2591,7 +2559,7 @@ export default function ChatArea({
       language,
       maxItems: 12,
     });
-  }, [capsuleIsRunActive, capsuleTurn, capsuleTurnBlocks, language, runtimeEvents]);
+  }, [capsuleTurn, capsuleTurnBlocks, language, runtimeEvents]);
   const capsuleProgressProjection = useMemo(
     () => buildRuntimeProgressProjection(capsuleProgressLedger, language, 4),
     [capsuleProgressLedger, language],
@@ -3301,19 +3269,13 @@ export default function ChatArea({
           ) return null;
         }
 
-        // Hide conversational first-person explanations from message flow if completed/stopped,
-        // since they are collapsed in the TurnIntentHistoryCard.
+        // Hide only thin/transparent tool narration blocks in completed turns
         if (isTurnCompletedOrStopped && item.block?.type === "agent" && !isChatIntent) {
-          if (substantiveIntermediateAgentBlockIds.has(item.block.id)) {
-            return renderBlockItem(item);
-          }
-          const text = getAgentVisibleMarkdownText(item.block);
-          if (isConversationalFirstPersonNarration(text)) {
-            const hasOptions = item.block.options && item.block.options.length > 0;
-            const isFinalBlock = item.index === finalVisibleAgentIndex;
-            if (!hasOptions && !isFinalBlock) {
-              return null;
-            }
+          if (
+            isTransparentToolNarrationBlock(item.block) &&
+            !(item.block?.type === "agent" && substantiveIntermediateAgentBlockIds.has(item.block.id))
+          ) {
+            return null;
           }
         }
       }
@@ -3329,19 +3291,13 @@ export default function ChatArea({
           !(item.block?.type === "agent" && substantiveIntermediateAgentBlockIds.has(item.block.id))
         ) return null;
 
-        // Hide conversational first-person explanations from message flow if completed/stopped,
-        // since they are collapsed in the TurnIntentHistoryCard.
+        // Hide only thin/transparent tool narration blocks in completed turns
         if (isTurnCompletedOrStopped && item.block?.type === "agent" && !isChatIntent) {
-          if (substantiveIntermediateAgentBlockIds.has(item.block.id)) {
-            return renderBlockItem(item);
-          }
-          const text = getAgentVisibleMarkdownText(item.block);
-          if (isConversationalFirstPersonNarration(text)) {
-            const hasOptions = item.block.options && item.block.options.length > 0;
-            const isFinalBlock = item.index === finalVisibleAgentIndex;
-            if (!hasOptions && !isFinalBlock) {
-              return null;
-            }
+          if (
+            isTransparentToolNarrationBlock(item.block) &&
+            !(item.block?.type === "agent" && substantiveIntermediateAgentBlockIds.has(item.block.id))
+          ) {
+            return null;
           }
         }
       }
@@ -4053,14 +4009,73 @@ export default function ChatArea({
       {/* Execution capsule */}
       {shouldShowMainCapsule && (
         <div
-          className="absolute left-6 right-6 z-30 pointer-events-none flex transition-all duration-300 ease-out"
+          className="absolute left-6 right-6 z-30 pointer-events-none flex flex-col transition-all duration-300 ease-out"
           style={{
             bottom: `calc(env(safe-area-inset-bottom, 0px) + 1.5rem + ${composerHeight}px + 12px)`,
             opacity: shouldShowMainCapsule ? 1 : 0,
             transform: shouldShowMainCapsule ? "translateY(0)" : "translateY(8px)",
-            justifyContent: isCapsuleCollapsed ? "flex-start" : "center",
+            alignItems: isCapsuleCollapsed ? "flex-start" : "center",
           }}
         >
+          {showProgressPopover && !isCapsuleCollapsed && (
+            <div
+              ref={popoverRef}
+              data-testid="effective-progress-popover"
+              className="pointer-events-auto mb-3 w-full max-w-xl rounded-2xl border border-[var(--accent-subtle-border)] bg-[rgba(9,9,11,0.95)] p-4 shadow-[0_12px_40px_rgba(0,0,0,0.85)] backdrop-blur-md text-left"
+              style={{
+                fontSize: `${Math.max(11, resolvedChatFontSize - 1)}px`,
+              }}
+            >
+              <div className="flex items-center justify-between border-b border-[rgba(255,255,255,0.08)] pb-2 mb-2">
+                <span className="font-mono text-[11px] uppercase tracking-[0.14em] text-[var(--accent-light)] font-semibold">
+                  {language === "zh" ? "有效进展" : "Effective Progress"}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setShowProgressPopover(false)}
+                  className="rounded p-1 text-[#71717a] hover:bg-[rgba(255,255,255,0.06)] hover:text-white transition-colors"
+                >
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                </button>
+              </div>
+
+              {capsuleProgressLedger.length === 0 ? (
+                <div className="py-6 text-center text-[#71717a] italic">
+                  {language === "zh" ? "暂无有效进展" : "No effective progress yet"}
+                </div>
+              ) : (
+                <div className="max-h-[220px] overflow-y-auto space-y-2 pr-1">
+                  {capsuleProgressLedger.map((item, index) => (
+                    <div
+                      key={`${item.key}:${index}`}
+                      className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-2.5 rounded-lg px-2 py-1.5 border border-[#202026] bg-[#09090b] text-[11px]"
+                    >
+                      <span className={`mt-1.5 h-2 w-2 rounded-full ${
+                        item.status === "failed" || item.status === "paused"
+                          ? "bg-[#f87171]"
+                          : item.status === "running"
+                          ? "bg-[var(--accent-light)] shadow-[0_0_8px_var(--accent)]"
+                          : "bg-[#10b981]"
+                      }`} />
+                      <span className="min-w-0 flex-1">
+                        <span className="block font-medium text-white truncate">{item.title}</span>
+                        {item.summary && (
+                          <span className="mt-0.5 block text-[#a1a1aa] truncate">{item.summary}</span>
+                        )}
+                      </span>
+                      {(item.repeatCount > 1 || item.cacheHits > 0) && (
+                        <span className="shrink-0 rounded-full border border-[var(--accent-subtle-border)] bg-[var(--accent-subtle)] px-1.5 py-0.5 text-[9px] text-[var(--accent-light)]">
+                          x{item.repeatCount}{item.cacheHits ? ` / ${item.cacheHits} cached` : ""}
+                        </span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
           {(() => {
             const isRich = hasCapsuleFlow && (persistedExplanation.includes("#") || persistedExplanation.includes("\n"));
             const headerLabel = hasCapsuleFlow
@@ -4090,9 +4105,18 @@ export default function ChatArea({
                     <div className="relative z-10 flex w-full flex-col items-start gap-3">
                       <div className="flex items-center w-full justify-between">
                         <div className="flex items-center min-w-0 flex-1">
-                          <div className="shrink-0 mr-2.5 flex items-center justify-center h-6 w-6 rounded-full border border-[var(--accent-subtle-border)] bg-[var(--accent-subtle)] shadow-[0_0_6px_var(--accent-subtle)]">
-                            <IconLogoM className="h-3.5 w-3.5 theme-text pointer-events-none" />
-                          </div>
+                          <button
+                            ref={mButtonRef}
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setShowProgressPopover(!showProgressPopover);
+                            }}
+                            className="shrink-0 mr-2.5 flex items-center justify-center h-6 w-6 rounded-full border border-[var(--accent-subtle-border)] bg-[var(--accent-subtle)] shadow-[0_0_6px_var(--accent-subtle)] group hover:bg-[var(--accent)] hover:border-transparent hover:shadow-[0_0_8px_var(--accent)] hover:scale-105 active:scale-95 transition-all cursor-pointer"
+                            title={language === "zh" ? "查看有效进展" : "View Effective Progress"}
+                          >
+                            <IconLogoM className="h-3.5 w-3.5 text-[var(--accent-light)] group-hover:text-[var(--accent-contrast)] pointer-events-none transition-colors" />
+                          </button>
                           <span className={`whitespace-pre-wrap break-words min-w-0 block flex-1 text-left ${isRich ? "font-semibold text-[var(--accent-light)]" : "text-white"}`}>
                             {headerLabel}
                           </span>

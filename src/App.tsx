@@ -1071,9 +1071,13 @@ export default function App() {
 
   const persistCurrentSessionInBackground = useCallback(() => {
     const state = useAppStore.getState();
-    state.saveCurrentRuntimeToSession();
     if (!state.currentSessionId) return;
     const scopeKey = resolveSessionWorkspaceKey(state.currentWorkspace);
+    const sessionKey = resolveSessionRuntimeKey(scopeKey, state.currentSessionId);
+    if (sessionKey && autosaveSuspendedForSessionRef.current === sessionKey) {
+      return;
+    }
+    state.saveCurrentRuntimeToSession();
     const snapshot = buildStoredSessionSnapshot(
       state,
       scopeKey,
@@ -1089,7 +1093,6 @@ export default function App() {
     if (isPointerOnlyEmptySession) return;
     if (!hasPersistableSessionTranscript(snapshot)) return;
 
-    const sessionKey = resolveSessionRuntimeKey(scopeKey, state.currentSessionId);
     if (sessionKey) {
       const taskFlowSnapshot = sanitizeTaskBlocksForPersist(state.taskFlow || []);
       cacheSessionTranscript(sessionKey, {
@@ -1745,6 +1748,17 @@ export default function App() {
   const restoreSessionState = async (target: any, id: number, scopeKey = activeSessionScope) => {
     const restoreToken = ++sessionRestoreTokenRef.current;
     const expectedSessionKey = resolveSessionRuntimeKey(scopeKey, id);
+    const liveRuntime = expectedSessionKey
+      ? useAppStore.getState().runtimeBySessionKey?.[expectedSessionKey]
+      : null;
+    useAppStore.setState({
+      isGenerating: liveRuntime ? liveRuntime.isGenerating === true : false,
+      agentStatus: liveRuntime ? liveRuntime.agentStatus || "idle" : "idle",
+      abortController: liveRuntime ? liveRuntime.abortController || null : null,
+    });
+    if (!liveRuntime) {
+      resetToEmptyChatView();
+    }
     const isCurrentRestore = () => {
       const state = useAppStore.getState();
       return (
@@ -1776,9 +1790,7 @@ export default function App() {
       finishRestore();
       return;
     }
-    const liveRuntime = liveSessionKey
-      ? useAppStore.getState().runtimeBySessionKey?.[liveSessionKey]
-      : null;
+    // liveRuntime is already resolved at the start of this function
     const shouldUseLiveRuntime =
       !!liveRuntime &&
       (

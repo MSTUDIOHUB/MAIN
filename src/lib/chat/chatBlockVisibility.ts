@@ -109,7 +109,7 @@ export function isTransparentToolNarrationBlock(block: any): boolean {
   return futureToolNarration || isThinToolNarration(text);
 }
 
-export function shouldSuppressAgentAsExplanation(block: any, index: number, blocks: any[], turnIntent: string): boolean {
+export function shouldSuppressAgentAsExplanation(block: any, _index: number, _blocks: any[], turnIntent: string): boolean {
   if (!block || block.type !== "agent" || block.hiddenProcess) return false;
 
   const isToolIntent = turnIntent !== "respond" && turnIntent !== "discuss";
@@ -119,14 +119,8 @@ export function shouldSuppressAgentAsExplanation(block: any, index: number, bloc
   const content = String(text || "").trim();
   if (!content) return true;
 
-  const followedByTool = blocks.slice(index + 1).some(b => b.type === "tool");
-  if (followedByTool) return true;
-
-  const agentBlocks = blocks.filter(b => b.type === "agent");
-  const isFirstAgentBlock = agentBlocks.indexOf(block) === 0;
-  if (isFirstAgentBlock) return true;
-
   if (isThinModelToolNarration(content) || isThinToolNarration(text)) return true;
+  if (isTransparentToolNarrationBlock(block)) return true;
 
   if (block.streaming) {
     const isSubstantive = isSubstantiveModelFeedback(content);
@@ -134,8 +128,6 @@ export function shouldSuppressAgentAsExplanation(block: any, index: number, bloc
       return true;
     }
   }
-
-  if (isTransparentToolNarrationBlock(block)) return true;
 
   return false;
 }
