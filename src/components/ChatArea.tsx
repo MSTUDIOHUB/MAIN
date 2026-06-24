@@ -914,6 +914,9 @@ function ThoughtBlock({
   compact?: boolean;
 }) {
   const rawContent = String(block.content || "").trim();
+  const [isRawOpen, setIsRawOpen] = useState(false);
+  const [renderLimit, setRenderLimit] = useState(20000);
+
   if (!rawContent) return null;
   const computedSummaryText = useMemo(() => {
     const display = deriveThoughtDisplay(rawContent, {
@@ -936,6 +939,11 @@ function ThoughtBlock({
   const wrapperClass = compact
     ? "mt-2 flex w-full min-w-0 items-start justify-start gap-3"
     : "mt-4 flex w-full min-w-0 items-start justify-start gap-3";
+
+  const hasMore = rawContent.length > renderLimit;
+  const displayContent = hasMore
+    ? rawContent.slice(0, renderLimit) + "\n\n...(truncated for performance)..."
+    : rawContent;
 
   return (
     <div data-testid="thought-block" className={wrapperClass}>
@@ -964,6 +972,51 @@ function ThoughtBlock({
           baseFontSize={chatFontSize}
           sourceId={`thought-${block.id ?? "current"}`}
         />
+
+        {/* Accordion for Raw Reasoning */}
+        <div className="mt-3 pt-2 border-t border-[#27272a]/60">
+          <button
+            type="button"
+            onClick={() => setIsRawOpen(prev => !prev)}
+            className="flex items-center gap-1 font-mono text-[10px] text-[#a1a1aa] hover:text-[#e4e4e7] transition-colors"
+          >
+            {isRawOpen ? <IconChevronDown className="h-3.5 w-3.5" /> : <IconChevronRight className="h-3.5 w-3.5" />}
+            <span>
+              {language === "zh"
+                ? `${isRawOpen ? "收起" : "查看"}原始推理 (${formatTokenCount(rawContent.length)} 字符)`
+                : `${isRawOpen ? "Hide" : "Show"} Raw Reasoning (${formatTokenCount(rawContent.length)} chars)`}
+            </span>
+          </button>
+
+          {isRawOpen && (
+            <div 
+              className="mt-2 max-h-[300px] overflow-y-auto rounded-lg border border-[#202023] bg-[#030304] p-2.5 text-[#d4d4d8] scrollbar-thin scrollbar-thumb-zinc-800 scrollbar-track-transparent"
+              style={{ contentVisibility: "auto" }}
+            >
+              <MarkdownRenderer
+                content={displayContent}
+                baseFontSize={chatFontSize - 1}
+                sourceId={`thought-raw-${block.id ?? "current"}`}
+              />
+              {hasMore && (
+                <div className="mt-3 border-t border-[#27272a]/40 pt-2 flex justify-between items-center">
+                  <span className="text-[10px] text-[#71717a]">
+                    {language === "zh" 
+                      ? `已加载 ${renderLimit} / ${rawContent.length} 字符` 
+                      : `Loaded ${renderLimit} / ${rawContent.length} chars`}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setRenderLimit(prev => prev + 50000)}
+                    className="text-[10.5px] text-[#38bdf8] hover:text-[#7dd3fc] font-medium transition-colors"
+                  >
+                    {language === "zh" ? "加载更多..." : "Load more..."}
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -1914,7 +1967,14 @@ function AgentContentBlock({
   language: "zh" | "en";
   chatFontSize: number;
 }) {
-  const rawContent = String(block.content || "");
+  const showReasoningDebug = useAppStore((s) => s.config.reasoningDisplay !== "hidden");
+  const lastFailedAttempt = block.failedAttempts && block.failedAttempts.length > 0
+    ? block.failedAttempts[block.failedAttempts.length - 1]
+    : null;
+  const isEscalating = !!block.isEscalating;
+  const isDisplayingEscalationSnapshot = isEscalating && !String(block.content || "").trim() && lastFailedAttempt;
+
+  const rawContent = String(isDisplayingEscalationSnapshot ? lastFailedAttempt.content : (block.content || ""));
   const displaySourceContent = useMemo(() => sanitizeAssistantDisplayContent(rawContent), [rawContent]);
   const previewLimit = block.streaming ? STREAMING_AGENT_CONTENT_PREVIEW_CHARS : AGENT_CONTENT_PREVIEW_CHARS;
   const isLongContent = displaySourceContent.length > previewLimit;
@@ -1927,6 +1987,7 @@ function AgentContentBlock({
     [block.streaming, displayContent.content],
   );
   const hasVisibleContent =
+    isDisplayingEscalationSnapshot ||
     (block.streaming && streamingText.length > 0) ||
     segments.some((seg) => (seg.type === "text" ? sanitizeVisibleAssistantText(seg.content).length > 0 : true)) ||
     isLongContent;
@@ -2018,31 +2079,51 @@ function AgentContentBlock({
             </button>
           </div>
         )}
-        {block.streaming ? (
-          <div className="whitespace-pre-wrap break-words leading-relaxed text-[#e4e4e7]">
-            {streamingText}
+        {isEscalating && (
+          <div className="mb-3 flex items-center gap-2 rounded-lg border border-[#eab308]/20 bg-[#eab308]/5 px-3 py-2 text-[11.5px] text-[#f59e0b]">
+            <svg className="animate-spin h-3.5 w-3.5 text-current shrink-0" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+            </svg>
+            <span>
+              {block.escalationReason === "escalation"
+                ? (language === "zh" ? `已达单次生成上限，正在进行第 ${(block.failedAttempts?.length || 0) + 1} 次扩容重新生成...` : `Output limit reached, escalating and regenerating (Attempt ${(block.failedAttempts?.length || 0) + 1})...`)
+                : block.escalationReason === "language_mismatch"
+                ? (language === "zh" ? "🔄 检测到输出语言不符，正在自动重试..." : "🔄 Output language mismatch detected, retrying...")
+                : block.escalationReason === "missing_tool"
+                ? (language === "zh" ? "🔄 模型未返回工具指令，正在重新引导重试..." : "🔄 No tool instructions returned, retrying...")
+                : (language === "zh" ? "🔄 正在自动重试并修正输出..." : "🔄 Retrying and correcting output...")
+              }
+            </span>
           </div>
-        ) : (
-          segments.map((seg, segIdx) => {
-            if (seg.type === "thought") {
-              return null;
-            }
-            if (seg.type === "plan") {
-              return <JobListCard key={`${block.id}-plan-${segIdx}`} jobs={seg.jobs} />;
-            }
-            const cleanText = sanitizeVisibleAssistantText(seg.content);
-            if (!cleanText) return null;
-            return (
-              <MarkdownRenderer
-                key={`${block.id}-text-${segIdx}`}
-                content={cleanText}
-                baseFontSize={chatFontSize}
-                sourceId={`agent-${block.id}-${segIdx}`}
-              />
-            );
-          })
         )}
-        {isLongContent && (
+        <div className={isDisplayingEscalationSnapshot ? "opacity-45 select-none pointer-events-none" : ""}>
+          {block.streaming ? (
+            <div className="whitespace-pre-wrap break-words leading-relaxed text-[#e4e4e7]">
+              {streamingText}
+            </div>
+          ) : (
+            segments.map((seg, segIdx) => {
+              if (seg.type === "thought") {
+                return null;
+              }
+              if (seg.type === "plan") {
+                return <JobListCard key={`${block.id}-plan-${segIdx}`} jobs={seg.jobs} />;
+              }
+              const cleanText = sanitizeVisibleAssistantText(seg.content);
+              if (!cleanText) return null;
+              return (
+                <MarkdownRenderer
+                  key={`${block.id}-text-${segIdx}`}
+                  content={cleanText}
+                  baseFontSize={chatFontSize}
+                  sourceId={`agent-${block.id}-${segIdx}`}
+                />
+              );
+            })
+          )}
+        </div>
+        {isLongContent && !isDisplayingEscalationSnapshot && (
           <div className="mt-4 rounded-md border border-[#27272a] bg-[#050507] px-3 py-2 text-[12px] leading-5 text-[#a1a1aa]">
             <div>
               {language === "zh"
@@ -2074,6 +2155,46 @@ function AgentContentBlock({
           </div>
         )}
         {block.streaming && <StreamingCursor />}
+        {showReasoningDebug && block.failedAttempts && block.failedAttempts.length > 0 && (
+          <div className="mt-4 space-y-2 border-t border-[#1f1f23] pt-3">
+            <div className="text-[10px] font-mono text-[#71717a] uppercase tracking-wider">
+              {language === "zh" ? "历史尝试记录" : "Failed Attempts History"} ({block.failedAttempts.length})
+            </div>
+            {block.failedAttempts.map((attempt: any, attIdx: number) => {
+              const attemptTitle = attempt.reason === "escalation"
+                ? (language === "zh" ? `尝试 ${attIdx + 1} (长度超限扩容)` : `Attempt ${attIdx + 1} (Escalated)`)
+                : attempt.reason === "language_mismatch"
+                ? (language === "zh" ? `尝试 ${attIdx + 1} (语言不符纠错)` : `Attempt ${attIdx + 1} (Language Mismatch)`)
+                : attempt.reason === "missing_tool"
+                ? (language === "zh" ? `尝试 ${attIdx + 1} (缺失工具纠错)` : `Attempt ${attIdx + 1} (Missing Tool)`)
+                : (language === "zh" ? `尝试 ${attIdx + 1} (${attempt.reason})` : `Attempt ${attIdx + 1} (${attempt.reason})`);
+              
+              return (
+                <details key={attIdx} className="group rounded-xl border border-[#27272a]/50 bg-[#07070a] px-3 py-2">
+                  <summary className="flex cursor-pointer items-center justify-between font-mono text-[10.5px] text-[#a1a1aa] hover:text-[#e4e4e7]">
+                    <span>{attemptTitle}</span>
+                    <span className="text-[10px] text-[#71717a] group-open:hidden">{language === "zh" ? "展开" : "Expand"}</span>
+                    <span className="text-[10px] text-[#71717a] hidden group-open:inline">{language === "zh" ? "收起" : "Collapse"}</span>
+                  </summary>
+                  <div className="mt-2 text-xs text-[#71717a] leading-relaxed max-h-[300px] overflow-y-auto pr-1 space-y-2">
+                    {attempt.reasoning && (
+                      <div className="rounded border border-[#1f1f23] bg-[#050507] p-2">
+                        <div className="mb-1 font-semibold text-[9.5px] text-amber-500/80 uppercase">{language === "zh" ? "思考过程：" : "Thinking Process:"}</div>
+                        <pre className="whitespace-pre-wrap break-all text-[10.5px] font-mono text-[#a1a1aa] leading-normal">{attempt.reasoning}</pre>
+                      </div>
+                    )}
+                    {attempt.content && (
+                      <div className="rounded border border-[#1f1f23] bg-[#050507] p-2">
+                        <div className="mb-1 font-semibold text-[9.5px] text-blue-400/80 uppercase">{language === "zh" ? "输出文本：" : "Output Content:"}</div>
+                        <pre className="whitespace-pre-wrap break-all text-[11px] font-mono text-[#e4e4e7] leading-normal">{attempt.content}</pre>
+                      </div>
+                    )}
+                  </div>
+                </details>
+              );
+            })}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -2226,6 +2347,8 @@ export default function ChatArea({
   onQuickReply,
 }) {
   const language = config.language === "en" ? "en" : "zh";
+  const isLightThemeMode = config.themeMode === "light";
+  const isBlackThemeMode = config.themeMode === "black";
   const resolvedChatFontSize = Math.min(20, Math.max(10, Number(config.chatFontSize) || 13));
   const resolvedTurnProcessFontSize = resolveTurnProcessFontSize(resolvedChatFontSize);
   const copy = useMemo(() => ({
@@ -4021,19 +4144,31 @@ export default function ChatArea({
             <div
               ref={popoverRef}
               data-testid="effective-progress-popover"
-              className="pointer-events-auto mb-3 w-full max-w-xl rounded-2xl border border-[var(--accent-subtle-border)] bg-[rgba(9,9,11,0.95)] p-4 shadow-[0_12px_40px_rgba(0,0,0,0.85)] backdrop-blur-md text-left"
+              className={`pointer-events-auto mb-3 w-full max-w-xl rounded-2xl border p-4 backdrop-blur-md text-left transition-all duration-200 ${
+                isLightThemeMode
+                  ? "border-[#d4d4d8] bg-white/95 shadow-[0_12px_40px_rgba(0,0,0,0.12)] text-[#18181b]"
+                  : isBlackThemeMode
+                  ? "border-[#202026] bg-[#030304]/95 shadow-[0_12px_40px_rgba(0,0,0,0.95)] text-[#e7e7ea]"
+                  : "border-[var(--accent-subtle-border)] bg-[rgba(9,9,11,0.95)] shadow-[0_12px_40px_rgba(0,0,0,0.85)] text-[#e4e4e7]"
+              }`}
               style={{
                 fontSize: `${Math.max(11, resolvedChatFontSize - 1)}px`,
               }}
             >
-              <div className="flex items-center justify-between border-b border-[rgba(255,255,255,0.08)] pb-2 mb-2">
+              <div className={`flex items-center justify-between border-b pb-2 mb-2 ${
+                isLightThemeMode ? "border-[#e4e4e7]" : "border-[rgba(255,255,255,0.08)]"
+              }`}>
                 <span className="font-mono text-[11px] uppercase tracking-[0.14em] text-[var(--accent-light)] font-semibold">
                   {language === "zh" ? "有效进展" : "Effective Progress"}
                 </span>
                 <button
                   type="button"
                   onClick={() => setShowProgressPopover(false)}
-                  className="rounded p-1 text-[#71717a] hover:bg-[rgba(255,255,255,0.06)] hover:text-white transition-colors"
+                  className={`rounded p-1 transition-colors ${
+                    isLightThemeMode
+                      ? "text-[#71717a] hover:bg-[#f4f4f5] hover:text-[#18181b]"
+                      : "text-[#71717a] hover:bg-[rgba(255,255,255,0.06)] hover:text-white"
+                  }`}
                 >
                   <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
@@ -4050,7 +4185,13 @@ export default function ChatArea({
                   {capsuleProgressLedger.map((item, index) => (
                     <div
                       key={`${item.key}:${index}`}
-                      className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-2.5 rounded-lg px-2 py-1.5 border border-[#202026] bg-[#09090b] text-[11px]"
+                      className={`grid min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-2.5 rounded-lg px-2 py-1.5 border text-[11px] ${
+                        isLightThemeMode
+                          ? "border-[#e4e4e7] bg-[#f8fafc]"
+                          : isBlackThemeMode
+                          ? "border-[#202026] bg-[#030304]"
+                          : "border-[#202026] bg-[#09090b]"
+                      }`}
                     >
                       <span className={`mt-1.5 h-2 w-2 rounded-full ${
                         item.status === "failed" || item.status === "paused"
@@ -4060,9 +4201,13 @@ export default function ChatArea({
                           : "bg-[#10b981]"
                       }`} />
                       <span className="min-w-0 flex-1">
-                        <span className="block font-medium text-white truncate">{item.title}</span>
+                        <span className={`block font-medium truncate ${
+                          isLightThemeMode ? "text-[#18181b]" : "text-white"
+                        }`}>{item.title}</span>
                         {item.summary && (
-                          <span className="mt-0.5 block text-[#a1a1aa] truncate">{item.summary}</span>
+                          <span className={`mt-0.5 block truncate ${
+                            isLightThemeMode ? "text-[#71717a]" : "text-[#a1a1aa]"
+                          }`}>{item.summary}</span>
                         )}
                       </span>
                       {(item.repeatCount > 1 || item.cacheHits > 0) && (
@@ -4112,7 +4257,7 @@ export default function ChatArea({
                               e.stopPropagation();
                               setShowProgressPopover(!showProgressPopover);
                             }}
-                            className="shrink-0 mr-2.5 flex items-center justify-center h-6 w-6 rounded-full border border-[var(--accent-subtle-border)] bg-[var(--accent-subtle)] shadow-[0_0_6px_var(--accent-subtle)] group hover:bg-[var(--accent)] hover:border-transparent hover:shadow-[0_0_8px_var(--accent)] hover:scale-105 active:scale-95 transition-all cursor-pointer"
+                            className="shrink-0 mr-2.5 flex items-center justify-center h-6 w-6 rounded-full border border-[var(--accent-subtle-border)] bg-[var(--accent-subtle)] group hover:bg-[var(--accent)] hover:border-transparent hover:scale-105 active:scale-95 transition-all cursor-pointer"
                             title={language === "zh" ? "查看有效进展" : "View Effective Progress"}
                           >
                             <IconLogoM className="h-3.5 w-3.5 text-[var(--accent-light)] group-hover:text-[var(--accent-contrast)] pointer-events-none transition-colors" />
@@ -4128,7 +4273,7 @@ export default function ChatArea({
                             setIsCapsuleCollapsed(true);
                           }}
                           title={language === "zh" ? "隐藏" : "Hide"}
-                          className="shrink-0 ml-3 flex items-center justify-center p-1.5 rounded-md border border-[var(--accent-subtle-border)] bg-[color-mix(in_srgb,var(--accent)_10%,transparent)] text-[var(--accent-light)] transition-all hover:bg-[var(--accent)] hover:text-white hover:border-transparent active:scale-95 cursor-pointer"
+                          className="shrink-0 ml-3 flex items-center justify-center p-1.5 rounded-md border border-[var(--accent-subtle-border)] bg-[color-mix(in_srgb,var(--accent)_10%,transparent)] text-[var(--accent-light)] transition-all hover:bg-[var(--accent)] hover:text-[#ffffff] hover:border-transparent active:scale-95 cursor-pointer"
                         >
                           <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                             <path strokeLinecap="round" strokeLinejoin="round" d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 01-1.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21" />
@@ -4137,13 +4282,21 @@ export default function ChatArea({
                       </div>
 
                       {hasCapsuleFlow && isRich && (
-                        <div className="w-full border-t border-[#27272a]/60 pt-3 text-left pr-1">
+                        <div className={`w-full border-t pt-3 text-left pr-1 ${
+                          isLightThemeMode ? "border-[#e4e4e7]" : "border-[#27272a]/60"
+                        }`}>
                           {renderCompactMarkdownText(persistedExplanation)}
                         </div>
                       )}
 
                       {hasExecutionCapsuleControls && (
-                        <div className={`w-full ${hasCapsuleFlow ? "border-t border-[#27272a]/60 pt-3" : ""}`}>
+                        <div className={`w-full ${
+                          hasCapsuleFlow
+                            ? isLightThemeMode
+                              ? "border-t border-[#e4e4e7] pt-3"
+                              : "border-t border-[#27272a]/60 pt-3"
+                            : ""
+                        }`}>
                           {executionCapsuleControls}
                         </div>
                       )}

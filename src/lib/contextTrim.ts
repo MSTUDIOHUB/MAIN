@@ -692,17 +692,8 @@ export function trimMessagesToContextDetailed(
     .filter((summary): summary is string => Boolean(summary));
   const rest = originalRest.filter((message) => !isContextCompressionMarker(message));
 
-  if (remaining <= 0) {
-    // Even the system message is too large — return just it
-    const droppedMessages = rest;
-    return {
-      messages: [systemMsg],
-      droppedMessages,
-      removedCount: originalRest.length,
-      markerSummary: buildCompactSummary(droppedMessages, carriedSummaries, { maxItems: 4, maxCharsPerItem: 110 }),
-      displaySummary: buildCompactSummary(droppedMessages, carriedSummaries, { maxItems: 8, maxCharsPerItem: 220 }),
-    };
-  }
+  const lastUserRestIdx = rest.map((m) => m.role).lastIndexOf("user");
+  const mustKeepRestIdx = lastUserRestIdx !== -1 ? lastUserRestIdx : rest.length - 1;
 
   // Build result starting with system message
   const result: TrimMessage[] = [systemMsg];
@@ -727,7 +718,8 @@ export function trimMessagesToContextDetailed(
   for (let i = rest.length - 1; i >= 0; i--) {
     const msg = rest[i];
     const msgTokens = estimateMessageTokens(msg);
-    if (msgTokens > remaining) {
+    const isMustKeep = i >= mustKeepRestIdx;
+    if (!isMustKeep && msgTokens > remaining) {
       // Budget exceeded — but if this is an assistant message with
       // tool_calls, we must also drop any trailing tool results that
       // belong to it (they're now orphaned). Walk backwards and mark.
@@ -770,9 +762,8 @@ export function trimMessagesToContextDetailed(
     : null;
   let markerTokens = compactMarker ? estimateMessageTokens(compactMarker) : 0;
 
-  // Prefer keeping a compact state marker over one more older raw message; the
-  // marker is what lets future turns recover goals, constraints, and evidence.
-  while (compactMarker && markerTokens >= remaining && keptForResult.length > 0) {
+  const mustKeepCount = rest.length - mustKeepRestIdx;
+  while (compactMarker && markerTokens >= remaining && keptForResult.length > mustKeepCount) {
     const removed = keptForResult.shift();
     if (!removed) break;
     remaining += estimateMessageTokens(removed);

@@ -452,7 +452,7 @@ export function normalizeAssistantTurn(result: StreamResult): NormalizedStreamSt
 
   const visibleText = leakedTail.visibleText;
   const hiddenThought = compactReasoningText(
-    [taggedHiddenThought, leakedPrelude.leakedThought, leakedTail.leakedThought].filter(Boolean).join("\n\n").trim(),
+    [result.reasoningContent, taggedHiddenThought, leakedPrelude.leakedThought, leakedTail.leakedThought].filter(Boolean).join("\n\n").trim(),
   );
 
   return {

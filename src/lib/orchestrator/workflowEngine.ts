@@ -573,27 +573,59 @@ export class WorkflowEngine {
       onStreamToken: (token: string, _msgId: string | undefined | null) => {
         // Handle escalation reset signal
         if (token.startsWith("__ESCALATION_RESET__:")) {
+          const resetType = token.slice("__ESCALATION_RESET__:".length) || "unknown";
           logStoreEvent("stream_reset", {
             turnId,
+            resetType,
             currentStreamingBlockId: context.currentStreamingBlockId,
             tokenBufferChars: 0,
             agentBlocksCreatedThisRun: context.agentBlockIdsCreatedThisRun.size,
             taskFlowBlocks: sessionGet().taskFlow.length,
           });
           streamBuffer.reset();
+          if (thinkingInterceptor) {
+            thinkingInterceptor.reset();
+          }
           context.firstStreamTokenAt = null;
           context.streamTokenCount = 0;
           context.streamTextChars = 0;
           context.streamingAssistantDisplayBuffer = "";
+
+          const currentTaskFlow = sessionGet().taskFlow;
+          const agentBlock = currentTaskFlow.find((t: any) => t.id === context.currentStreamingBlockId && t.type === "agent") as any;
+          const thoughtBlock = currentTaskFlow.find((t: any) => t.id === context.currentThoughtBlockId && t.type === "thought") as any;
+
+          const failedAttemptContent = agentBlock ? agentBlock.content : "";
+          const failedAttemptReasoning = thoughtBlock ? thoughtBlock.content : "";
+
           // Reset the streaming block content for retry
           if (context.currentStreamingBlockId !== null) {
             const blockId = context.currentStreamingBlockId;
             sessionSet((s: any) => ({
-              taskFlow: s.taskFlow.map((t: any) =>
-                t.id === blockId && t.type === "agent"
-                  ? { ...t, content: "" }
-                  : t
-                ),
+              taskFlow: s.taskFlow.map((t: any) => {
+                if (t.id === blockId && t.type === "agent") {
+                  const existingAttempts = t.failedAttempts || [];
+                  return {
+                    ...t,
+                    content: "",
+                    isEscalating: true,
+                    escalationReason: resetType,
+                    failedAttempts: [
+                      ...existingAttempts,
+                      {
+                        content: failedAttemptContent,
+                        reasoning: failedAttemptReasoning,
+                        reason: resetType,
+                        timestamp: Date.now(),
+                      }
+                    ]
+                  };
+                }
+                if (t.id === context.currentThoughtBlockId && t.type === "thought") {
+                  return { ...t, content: "" };
+                }
+                return t;
+              }),
             }));
           } else {
             sessionSet((s: any) => {

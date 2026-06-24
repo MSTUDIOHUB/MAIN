@@ -28,7 +28,7 @@ export function clampContextLimitToReported(
   const reportedContextLimit = extractReportedContextWindowLimit(errorMessage);
   return {
     contextLimit: reportedContextLimit == null
-      ? configuredLimit
+      ? Math.min(configuredLimit, 4096)
       : Math.min(configuredLimit, reportedContextLimit),
     reportedContextLimit,
   };

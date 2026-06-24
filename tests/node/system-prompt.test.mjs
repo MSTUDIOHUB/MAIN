@@ -692,3 +692,37 @@ test("execute prompt enforces strict immediate tool execution constraints", () =
   assert.match(prompt, /必须立刻发起真实工具调用/);
   assert.match(prompt, /【绝对禁止只说不做】/);
 });
+
+test("tool protocol card uses web_search XML example when read_file is not available", () => {
+  const card = buildToolProtocolCard({
+    activeProfile: "local",
+    provider: "LM Studio",
+    toolProtocol: "xml",
+    nativeToolsEnabled: false,
+    workflowMode: "chat",
+    availableToolNames: ["web_search", "web_fetch"],
+    language: "zh",
+  });
+
+  assert.match(card, /<tool>web_search<\/tool>/);
+  assert.match(card, /<parameter name="query">/);
+  assert.doesNotMatch(card, /<tool>read_file<\/tool>/);
+});
+
+test("system prompt contains strict steering file creation prohibition rules", () => {
+  const prompt = buildSystemPrompt(
+    [],
+    "/tmp/workspace",
+    "main_mode",
+    "",
+    [],
+    [],
+    "edit",
+    "zh",
+    null,
+  );
+
+  assert.match(prompt, /Steering 发现规则/);
+  assert.match(prompt, /绝对禁止主动创建此目录或任何 steering 规范文件/);
+});
+

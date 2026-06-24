@@ -224,7 +224,7 @@ export function classifyChatError(input: unknown, options?: {
   ) {
     category = "quota";
   } else if (
-    includesAny(msg, ["context_length_exceeded", "maximum context length", "too many tokens", "context window"])
+    includesAny(msg, ["context_length_exceeded", "maximum context length", "too many tokens", "context window", "context length"])
   ) {
     category = "context_length";
   } else if (

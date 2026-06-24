@@ -50,3 +50,18 @@ test("clampContextLimitToReported clamps configured limit above provider window"
   assert.equal(result.contextLimit, 32768);
   assert.equal(result.reportedContextLimit, 32768);
 });
+
+test("clampContextLimitToReported falls back to conservative limit when reported window is unknown", () => {
+  const result = clampContextLimitToReported(102400, "The number of tokens to keep from the initial prompt is greater than the context length.");
+
+  assert.equal(result.contextLimit, 4096);
+  assert.equal(result.reportedContextLimit, null);
+});
+
+test("clampContextLimitToReported handles local empty completion error message", () => {
+  const result = clampContextLimitToReported(81920, "Local model returned an empty completion. Treating as context window limit exceeded to trigger reactive compaction.");
+
+  assert.equal(result.contextLimit, 4096);
+  assert.equal(result.reportedContextLimit, null);
+});
+

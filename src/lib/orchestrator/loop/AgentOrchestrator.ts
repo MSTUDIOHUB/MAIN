@@ -202,7 +202,7 @@ export class AgentOrchestrator {
         providerFamily: modelProtocolProfile.providerFamily,
         activeProfile: config.activeProfile,
         });
-        const snapshotContextLimit = isCloudProfile ? undefined : config.local.contextLimit;
+        let snapshotContextLimit = isCloudProfile ? undefined : config.local.contextLimit;
         const mcpServers = callbacks.getMcpServers();
         const latestUserPrompt = [...initialMessages]
                 .reverse()
@@ -1777,6 +1777,17 @@ export class AgentOrchestrator {
           if (llmTools.length > 0) {
             callbacks.onProviderNativeToolSuccess?.();
           }
+          if (
+            config.activeProfile === "local" &&
+            snapshotContextLimit != null &&
+            isAssistantTurnEmpty(normalizeAssistantTurn(streamResult))
+          ) {
+            const contextErr = new Error(
+              "Local model returned an empty completion. Treating as context window limit exceeded to trigger reactive compaction."
+            );
+            (contextErr as any).isContextError = true;
+            throw contextErr;
+          }
         } catch (err) {
           if ((err as Error).name === "AbortError") {
             callbacks.onStatusChange("idle");
@@ -1834,6 +1845,7 @@ export class AgentOrchestrator {
 
             const { contextLimit: reactiveContextLimit, reportedContextLimit } =
               clampContextLimitToReported(snapshotContextLimit, errMsg);
+            snapshotContextLimit = reactiveContextLimit;
             if (reportedContextLimit != null && reportedContextLimit < snapshotContextLimit) {
               logAgentEvent("context_limit_clamped", {
                 iteration,
@@ -2580,6 +2592,14 @@ export class AgentOrchestrator {
               return;
             }
 
+            const assistantPlaceholder = normalized.hiddenThought
+              ? `<thought>\n${normalized.hiddenThought}\n</thought>`
+              : "...";
+            callbacks.appendMessage({
+              role: "assistant",
+              content: assistantPlaceholder,
+            });
+
             callbacks.appendMessage({
               role: "user",
               content: callbacks.getPreferredLanguage() === "zh"
@@ -2620,6 +2640,14 @@ export class AgentOrchestrator {
           const shouldForcePostWriteVerification =
             workflowMode === "edit" &&
             !!recentSuccessfulProjectWrite;
+
+          const assistantPlaceholder = normalized.hiddenThought
+            ? `<thought>\n${normalized.hiddenThought}\n</thought>`
+            : "...";
+          callbacks.appendMessage({
+            role: "assistant",
+            content: assistantPlaceholder,
+          });
 
           callbacks.appendMessage({
             role: "user",
@@ -5798,13 +5826,13 @@ export class AgentOrchestrator {
                 sawExecuteOperationEvidence,
                 noProgressBatchRepeatCount,
                 minReadOnlyActivities: executeRecoveryMode === "normal"
-                  ? (config.activeProfile === "local" ? 16 : 8)
+                  ? (config.activeProfile === "local" ? 24 : 8)
                   : Infinity,
                 minCachedReadOnlyActivities: executeRecoveryMode === "normal"
-                  ? (config.activeProfile === "local" ? 6 : 3)
+                  ? (config.activeProfile === "local" ? 14 : 3)
                   : Infinity,
-                maxNoProgressReadOnlyRepeats: config.activeProfile === "local" ? 4 : 2,
-                maxReadOnlyToolChars: config.activeProfile === "local" ? 60000 : 30000,
+                maxNoProgressReadOnlyRepeats: config.activeProfile === "local" ? 6 : 2,
+                maxReadOnlyToolChars: config.activeProfile === "local" ? 100000 : 30000,
               })
             : { shouldRecover: false, reason: "", readOnlyActivityCount: 0, batchToolChars: 0 };
         if (executeReadOnlyRecovery.shouldRecover) {

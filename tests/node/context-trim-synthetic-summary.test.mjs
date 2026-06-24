@@ -84,3 +84,21 @@ test("compact summary does not re-inject synthetic continuation constraints", ()
   assert.equal(summary.includes("不要询问用户指示"), false);
   assert.equal(summary.includes("Do not ask the user what to do next"), false);
 });
+
+test("trimMessagesToContextDetailed always retains the latest user message under extreme budget pressure", () => {
+  const messages = [
+    { role: "system", content: "Very large system prompt ".repeat(500) }, // ~2500 tokens
+    { role: "user", content: "First user query" },
+    { role: "assistant", content: "First assistant response" },
+    { role: "user", content: "Latest user query" },
+  ];
+
+  // Set the context limit to 1000 tokens (less than system message tokens)
+  const result = trimMessagesToContextDetailed(messages, 1000, 200);
+
+  // Even though remaining budget is <= 0 after system message, the system message and the latest user query MUST be retained!
+  const roles = result.messages.map(m => m.role);
+  assert.deepEqual(roles, ["system", "user"]);
+  assert.equal(result.messages[0].content.startsWith("Very large system prompt"), true);
+  assert.equal(result.messages[1].content, "Latest user query");
+});

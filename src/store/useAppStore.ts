@@ -980,7 +980,7 @@ export type ProgressTaskBlock = TaskBlockBase & ProgressNarration & {
 export type TaskBlock =
   | (TaskBlockBase & { type: "user"; content: string; images?: string[]; contextItems?: UserContextItem[] })
   | (TaskBlockBase & { type: "tool"; toolName: string; target: string; status: string; toolStatus: "pending" | "executed" | "rejected" | "running" | "failed"; toolCallId?: string; message?: string; diff?: ToolDiffSnapshot; shellPermissionDecision?: ShellPermissionDecision; revertStatus?: DiffRevertStatus; revertMessage?: string; intentSummary?: string; why?: string; evidence?: string; observationSummary?: string; qualityGateReason?: string; planRecoveryReason?: string })
-  | (TaskBlockBase & { type: "agent"; content: string; options?: ReplyOption[]; streaming?: boolean; hiddenProcess?: boolean; visibility?: AssistantTextVisibility; archivedAfterChoice?: boolean; archivedProposal?: boolean; selectedOption?: string })
+  | (TaskBlockBase & { type: "agent"; content: string; options?: ReplyOption[]; streaming?: boolean; hiddenProcess?: boolean; visibility?: AssistantTextVisibility; archivedAfterChoice?: boolean; archivedProposal?: boolean; selectedOption?: string; isEscalating?: boolean; escalationReason?: string; failedAttempts?: Array<{ content: string; reasoning?: string; reason: string; timestamp: number }> })
   | (TaskBlockBase & ImageGenerationBlockPayload)
   | ProgressTaskBlock
   | (TaskBlockBase & { type: "thought"; content: string; isStreaming?: boolean; duration?: number })
@@ -9386,11 +9386,13 @@ export const useAppStore = create<AppState>()(
 
             if (agentBlockIdToCreate !== null && agentContent) {
               appendBlock({ id: agentBlockIdToCreate, turnId, type: "agent", content: agentContent, streaming: true });
-            } else if (agentBlockIdToAppend !== null && agentContent) {
+            }
+
+            if (agentBlockIdToAppend !== null && agentContent) {
               const blockId = agentBlockIdToAppend;
               taskFlow = taskFlow.map((t) =>
                 t.id === blockId && t.type === "agent"
-                  ? { ...t, content: (t as Extract<TaskBlock, { type: "agent" }>).content + agentContent }
+                  ? { ...t, content: (t as Extract<TaskBlock, { type: "agent" }>).content + agentContent, isEscalating: false }
                   : t
               );
             }

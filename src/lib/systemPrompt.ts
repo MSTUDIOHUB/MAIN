@@ -170,6 +170,14 @@ function selectProtocolExampleTool(available: string[]): string {
 }
 
 function buildXmlExample(toolName: string): string[] {
+  if (toolName === "read_file") {
+    return [
+      "<tool_use>",
+      "<tool>read_file</tool>",
+      "<parameter name=\"path\">src/App.tsx</parameter>",
+      "</tool_use>",
+    ];
+  }
   if (toolName === "analyze_tabular_document") {
     return [
       "<tool_use>",
@@ -186,10 +194,47 @@ function buildXmlExample(toolName: string): string[] {
       "</tool_use>",
     ];
   }
+  if (toolName === "web_search") {
+    return [
+      "<tool_use>",
+      "<tool>web_search</tool>",
+      "<parameter name=\"query\">weather in Beijing</parameter>",
+      "</tool_use>",
+    ];
+  }
+  if (toolName === "web_fetch") {
+    return [
+      "<tool_use>",
+      "<tool>web_fetch</tool>",
+      "<parameter name=\"url\">https://example.com</parameter>",
+      "</tool_use>",
+    ];
+  }
+  if (toolName === "knowledge_search") {
+    return [
+      "<tool_use>",
+      "<tool>knowledge_search</tool>",
+      "<parameter name=\"query\">API documentation</parameter>",
+      "</tool_use>",
+    ];
+  }
+
+  // Generic fallback based on TOOL_REQUIRED_ARGUMENTS definition
+  const args = TOOL_REQUIRED_ARGUMENTS[toolName];
+  if (args) {
+    const firstArg = args.split(",")[0].replace(/\?/g, "").trim();
+    if (firstArg) {
+      return [
+        "<tool_use>",
+        `<tool>${toolName}</tool>`,
+        `<parameter name="${firstArg}">value</parameter>`,
+        "</tool_use>",
+      ];
+    }
+  }
   return [
     "<tool_use>",
-    "<tool>read_file</tool>",
-    "<parameter name=\"path\">src/App.tsx</parameter>",
+    `<tool>${toolName}</tool>`,
     "</tool_use>",
   ];
 }
@@ -848,8 +893,8 @@ export function buildSystemPrompt(
     }
     tfl.push("");
     tfl.push("### Steering 发现规则（Steering Discovery）");
-    tfl.push("在开始任何实施或正式方案提交之前，你必须：");
-    tfl.push("1. 使用 `list_directory` 检查 `.MAIN/steering/` 目录是否存在。");
+    tfl.push("在开始任何实施或正式方案提交之前，你应当：");
+    tfl.push("1. 使用 `list_directory` 检查 `.MAIN/steering/` 目录是否存在。如果不存在，直接跳过并开始执行用户任务，**绝对禁止主动创建此目录或任何 steering 规范文件（如 product.md, tech.md 等）**。它们是由用户或项目维护者创建的只读规范，非用户要求时模型不得生成它们。");
     tfl.push("2. 如果存在，优先读取基础文件（product.md、tech.md、structure.md、project_conventions.md）。");
     tfl.push("3. 再根据任务类型选择性读取 fileMatch / auto 领域文件。");
     tfl.push("4. 严格遵守 Steering 文件中的项目级规范；这些规范优先级高于通用建议。");

@@ -434,3 +434,15 @@ test("normalization treats permission questions as text instead of pending tool 
   assert.equal(normalized.toolCalls.length, 0);
   assert.equal(normalized.visibleText, "我可以运行一次构建命令来确认现状吗？");
 });
+
+test("normalization preserves native reasoningContent in hiddenThought", () => {
+  const normalized = normalizeAssistantTurn({
+    content: "我来做些工作。",
+    toolCalls: [],
+    finishReason: "stop",
+    reasoningContent: "让我仔细想想接下来该干嘛...",
+  });
+
+  assert.equal(normalized.visibleText, "我来做些工作。");
+  assert.equal(normalized.hiddenThought, "让我仔细想想接下来该干嘛...");
+});

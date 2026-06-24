@@ -41,6 +41,8 @@ const BARE_TOOL_NAMES = new Set([
   "knowledge_get_excerpt",
   "glob_search",
   "grep_search",
+  "web_search",
+  "web_fetch",
   "repo_map_status",
   "repo_map_search",
   "repo_map_context",
@@ -67,6 +69,8 @@ const TOOL_BODY_ARG_NAMES: Partial<Record<string, string>> = {
   browser_evaluate: "url",
   write_file: "content",
   apply_patch: "patch",
+  web_search: "query",
+  web_fetch: "url",
 };
 
 const TOOL_POSITIONAL_ARG_NAMES: Partial<Record<string, string>> = {
@@ -86,6 +90,8 @@ const TOOL_POSITIONAL_ARG_NAMES: Partial<Record<string, string>> = {
   repo_map_files: "filter",
   repo_map_impact: "target",
   browser_evaluate: "url",
+  web_search: "query",
+  web_fetch: "url",
 };
 
 function extractMatches(text: string, regex: RegExp): string[] {
@@ -483,6 +489,29 @@ function parseLegacyToolTags(text: string): { toolCalls: ParsedToolCall[]; clean
   return { toolCalls, cleanText };
 }
 
+function getPrecedingLineFallback(keep: string[]): string | undefined {
+  for (let idx = keep.length - 1; idx >= 0; idx--) {
+    const line = keep[idx].trim();
+    if (line && !line.startsWith("<") && !line.startsWith("`")) {
+      return line;
+    }
+  }
+  return undefined;
+}
+
+function cleanFallbackQuery(text: string): string {
+  let clean = text.trim();
+  clean = clean.replace(/^(?:我来(?:帮你|您|先)?|让我(?:先)?|正在(?:帮你|您)?|帮(?:你|您)|请)(?:查询|搜索|检索|查找|看下|看看|查一下|搜一下|检索一下|获取|读取|访问|下载)(?:一下)?[:：]?\s*/i, "");
+  clean = clean.replace(/^(?:let me|i will|i'll|i should|i need to|please|searching for|searching|let's|let us)\s+(?:help you\s+)?(?:search|query|find|lookup|check|retrieve|fetch|get|read|visit|download|access)(?: for)?[:：]?\s*/i, "");
+  clean = clean.replace(/[。？！?!.,;；]+$/, "").trim();
+  return clean;
+}
+
+function extractUrl(text: string): string | undefined {
+  const match = text.match(/(https?:\/\/[^\s"'`<>]+)/i);
+  return match ? match[1] : undefined;
+}
+
 function parseBareToolCalls(text: string): { toolCalls: ParsedToolCall[]; cleanText: string } {
   const lines = text.split(/\r?\n/);
   const toolCalls: ParsedToolCall[] = [];
@@ -493,19 +522,44 @@ function parseBareToolCalls(text: string): { toolCalls: ParsedToolCall[]; cleanT
     const rawLine = lines[i];
     const trimmed = rawLine.trim();
 
+    let parsedCall: ParsedToolCall | null = null;
+    let consumed = 1;
+
     if (BARE_TOOL_NAMES.has(trimmed)) {
       const multilineCall = parseMultilineBareToolCall(trimmed, lines, i);
       if (multilineCall) {
-        toolCalls.push(multilineCall.call);
-        i += multilineCall.consumed;
-        continue;
+        parsedCall = multilineCall.call;
+        consumed = multilineCall.consumed;
       }
     }
 
-    const inlineCall = parseInlineToolInvocation(trimmed);
-    if (inlineCall) {
-      toolCalls.push(inlineCall);
-      i += 1;
+    if (!parsedCall) {
+      const inlineCall = parseInlineToolInvocation(trimmed);
+      if (inlineCall) {
+        parsedCall = inlineCall;
+        consumed = 1;
+      }
+    }
+
+    if (parsedCall) {
+      const requiredArg = TOOL_POSITIONAL_ARG_NAMES[parsedCall.name];
+      if (requiredArg && (!parsedCall.arguments || !parsedCall.arguments[requiredArg])) {
+        const fallbackVal = getPrecedingLineFallback(keep);
+        if (fallbackVal) {
+          let finalVal = cleanFallbackQuery(fallbackVal);
+          if (requiredArg === "url") {
+            const url = extractUrl(fallbackVal) || finalVal;
+            finalVal = url;
+          }
+          if (finalVal) {
+            parsedCall.arguments = parsedCall.arguments || {};
+            parsedCall.arguments[requiredArg] = finalVal;
+          }
+        }
+      }
+
+      toolCalls.push(parsedCall);
+      i += consumed;
       continue;
     }
 

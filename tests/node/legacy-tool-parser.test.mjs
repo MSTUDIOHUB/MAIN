@@ -176,3 +176,49 @@ test("parses bare get_project_skeleton as a tool call", () => {
   assert.deepEqual(parsed.toolCalls[0].arguments, {});
   assert.equal(parsed.cleanText, "");
 });
+
+test("parses web_search and web_fetch XML blocks successfully", () => {
+  const parsedSearch = parseTextForTools([
+    "<tool_use>",
+    "<tool>web_search</tool>",
+    "<parameter name=\"query\">weather in Shenyang</parameter>",
+    "</tool_use>",
+  ].join("\n"));
+
+  assert.equal(parsedSearch.toolCalls.length, 1);
+  assert.equal(parsedSearch.toolCalls[0].name, "web_search");
+  assert.deepEqual(parsedSearch.toolCalls[0].arguments, { query: "weather in Shenyang" });
+
+  const parsedFetch = parseTextForTools([
+    "<tool_use>",
+    "<tool>web_fetch</tool>",
+    "<parameter name=\"url\">https://example.com</parameter>",
+    "</tool_use>",
+  ].join("\n"));
+
+  assert.equal(parsedFetch.toolCalls.length, 1);
+  assert.equal(parsedFetch.toolCalls[0].name, "web_fetch");
+  assert.deepEqual(parsedFetch.toolCalls[0].arguments, { url: "https://example.com" });
+});
+
+test("recovers bare web_search and web_fetch using preceding prose line fallbacks", () => {
+  const parsedSearch = parseTextForTools([
+    "我来帮你查询沈阳未来一周的天气情况。",
+    "",
+    "web_search",
+  ].join("\n"));
+
+  assert.equal(parsedSearch.toolCalls.length, 1);
+  assert.equal(parsedSearch.toolCalls[0].name, "web_search");
+  assert.deepEqual(parsedSearch.toolCalls[0].arguments, { query: "沈阳未来一周的天气情况" });
+
+  const parsedFetch = parseTextForTools([
+    "让我获取 https://example.com/api/v1 的内容。",
+    "",
+    "web_fetch",
+  ].join("\n"));
+
+  assert.equal(parsedFetch.toolCalls.length, 1);
+  assert.equal(parsedFetch.toolCalls[0].name, "web_fetch");
+  assert.deepEqual(parsedFetch.toolCalls[0].arguments, { url: "https://example.com/api/v1" });
+});
