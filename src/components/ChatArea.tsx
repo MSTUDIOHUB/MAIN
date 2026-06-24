@@ -12,6 +12,7 @@ import ExecutionCapsule from "./ExecutionCapsule";
 import { resolveAutoScrollState } from "../lib/chatScroll";
 import { parseMessageContent } from "../lib/messageParser";
 import { sanitizeAIOutput, sanitizeAssistantDisplayContent, sanitizeVisibleAssistantText } from "../lib/sanitize";
+import { stripLeakedReasoning } from "../lib/normalizedTurn";
 import {
   deriveThoughtDisplay,
   normalizeThoughtSummaryForCompare,
@@ -1975,7 +1976,7 @@ function AgentContentBlock({
   const isDisplayingEscalationSnapshot = isEscalating && !String(block.content || "").trim() && lastFailedAttempt;
 
   const rawContent = String(isDisplayingEscalationSnapshot ? lastFailedAttempt.content : (block.content || ""));
-  const displaySourceContent = useMemo(() => sanitizeAssistantDisplayContent(rawContent), [rawContent]);
+  const displaySourceContent = useMemo(() => stripLeakedReasoning(sanitizeAssistantDisplayContent(rawContent)), [rawContent]);
   const previewLimit = block.streaming ? STREAMING_AGENT_CONTENT_PREVIEW_CHARS : AGENT_CONTENT_PREVIEW_CHARS;
   const isLongContent = displaySourceContent.length > previewLimit;
   const [showFullLongContent, setShowFullLongContent] = useState(false);
@@ -2415,6 +2416,7 @@ export default function ChatArea({
     rejectPlan,
     rejectPlanAndDeleteFiles,
     agentStatus,
+    normalizedStreamState,
     pendingReviewTaskId,
     pendingToolCall,
     capsuleExplanationState,
@@ -2453,6 +2455,7 @@ export default function ChatArea({
     rejectPlan: useAppStore((s) => s.rejectPlan),
     rejectPlanAndDeleteFiles: useAppStore((s) => s.rejectPlanAndDeleteFiles),
     agentStatus: useAppStore((s) => s.agentStatus),
+    normalizedStreamState: useAppStore((s) => s.normalizedStreamState),
     pendingReviewTaskId: useAppStore((s) => s.pendingReviewTaskId),
     pendingToolCall: useAppStore((s) => s.pendingToolCall),
     capsuleExplanationState: useAppStore((s) => s.currentTurnState.capsuleExplanation),
@@ -2763,8 +2766,8 @@ export default function ChatArea({
     if (explanationInfo.text) return explanationInfo.text;
     const progressText = normalizeCapsuleProgressText(capsuleProgressProjection.activityText);
     if (progressText) return progressText;
-    return normalizeCapsuleProgressText(deriveDynamicFirstPersonText(capsuleTurn, capsuleTurnBlocks, agentStatus, language));
-  }, [capsuleIsRunActive, capsuleTurn, cachedCapsuleExplanation, activeTurnExplanation.text, explanationInfo.text, capsuleProgressProjection.activityText, capsuleTurnBlocks, agentStatus, language]);
+    return normalizeCapsuleProgressText(deriveDynamicFirstPersonText(capsuleTurn, capsuleTurnBlocks, agentStatus, language, normalizedStreamState?.hiddenThought));
+  }, [capsuleIsRunActive, capsuleTurn, cachedCapsuleExplanation, activeTurnExplanation.text, explanationInfo.text, capsuleProgressProjection.activityText, capsuleTurnBlocks, agentStatus, language, normalizedStreamState?.hiddenThought]);
 
   useEffect(() => {
     const turnChanged = capsuleTurn?.id !== lastTurnIdRef.current;

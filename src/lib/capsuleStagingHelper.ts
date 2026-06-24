@@ -91,7 +91,8 @@ export function deriveDynamicFirstPersonText(
   turn: any,
   blocks: any[],
   agentStatus: string,
-  language: "zh" | "en"
+  language: "zh" | "en",
+  hiddenThought?: string
 ): string {
   const isZh = language === "zh";
 
@@ -193,19 +194,36 @@ export function deriveDynamicFirstPersonText(
       : "I am deep in thought, analyzing the codebase to plan the best implementation approach...";
   }
 
+  // 5. 流式 Agent 状态优化 (hasStreamingAgent)：动态显示当前的字符大小与重试轮次
+  const streamingAgent = [...blocks].reverse().find((block) => block.type === "agent" && block.streaming);
+  if (streamingAgent) {
+    const charCount = streamingAgent.content?.length || 0;
+    const iteration = (streamingAgent.failedAttempts?.length || 0) + 1;
+    const formattedChar = charCount > 1000 ? `${(charCount / 1000).toFixed(1)}k` : `${charCount}`;
+    return isZh
+      ? `✍️ 正在为您草拟实施计划 (已生成 ${formattedChar} 字符，当前第 ${iteration} 轮迭代)...`
+      : `✍️ Drafting implementation plan (${formattedChar} chars, iteration ${iteration})...`;
+  }
+
+  // 6. 隐藏推理回退：当模型只输出了推理内容、未产生可见正文或工具调用时，
+  //    从 hiddenThought 中提取一句话作为 Capsule 展示文本。
+  if (hiddenThought && hiddenThought.trim()) {
+    const dynamicExplanation = cleanAndExtractLastThoughtSentence(hiddenThought, language);
+    if (dynamicExplanation) {
+      return dynamicExplanation;
+    }
+    return isZh
+      ? "我正在分析当前任务并准备下一步执行方案..."
+      : "I am analyzing the current task and preparing the next execution steps...";
+  }
+
+  // 7. 静态 planning 阶段提示（作为最后的降级提示，不阻断上述流式输出）
   if (turn?.status === "planning") {
     return isZh
       ? "我正在梳理整体方案结构，准备为您起草一份周密可行的实施计划..."
       : "I am structuring the overall approach, preparing to draft a thorough implementation plan for you...";
   }
 
-  const hasStreamingAgent = blocks.some((block) => block.type === "agent" && block.streaming);
-  if (hasStreamingAgent) {
-    return isZh
-      ? "我正在为您整理详细的执行进展说明与下一步方案分析..."
-      : "I am writing a detailed progress explanation and next steps analysis for you...";
-  }
-
-  // 5. 无明确运行信号时保持静默，避免把 idle 状态误当成模型反馈。
+  // 8. 无明确运行信号时保持静默，避免把 idle 状态误当成模型反馈。
   return "";
 }

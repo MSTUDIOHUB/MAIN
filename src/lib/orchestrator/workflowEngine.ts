@@ -1487,13 +1487,52 @@ export class WorkflowEngine {
       onNonActionableStop: (message: string, reason: "no_output" | "no_action" | "missing_tool_loop" | "incomplete_plan", _progress?: Partial<PlanExecutionProgressUpdate>) => {
         logStoreEvent("non_actionable_stop", { message, reason });
         const stoppedStatus = reason === "no_output" ? "stopped_no_output" : "stopped_no_action";
-        sessionSet((s: any) => ({
-          conversationTurns: s.conversationTurns.map((turn: any) =>
-            turn.id === turnId && turn.status !== "awaiting_approval"
-              ? { ...turn, status: stoppedStatus }
-              : turn
-          ),
-        }));
+        sessionSet((s: any) => {
+          const currentStreamingBlockId = context.currentStreamingBlockId;
+          const currentThoughtBlockId = context.currentThoughtBlockId;
+          let taskFlow = s.taskFlow;
+
+          if (currentStreamingBlockId !== null) {
+            taskFlow = taskFlow.map((t: any) => {
+              if (t.id === currentStreamingBlockId && t.type === "agent") {
+                const existingAttempts = t.failedAttempts || [];
+                const agentContent = t.content || "";
+                
+                // Get corresponding thought/reasoning content if available
+                const thoughtBlock = s.taskFlow.find((tb: any) => tb.id === currentThoughtBlockId && tb.type === "thought");
+                const thoughtContent = thoughtBlock ? thoughtBlock.content : "";
+
+                return {
+                  ...t,
+                  content: `❌ **${message}**`,
+                  streaming: false,
+                  failedAttempts: [
+                    ...existingAttempts,
+                    {
+                      content: agentContent,
+                      reasoning: thoughtContent,
+                      reason: reason,
+                      timestamp: Date.now(),
+                    }
+                  ]
+                };
+              }
+              if (t.id === currentThoughtBlockId && t.type === "thought") {
+                return { ...t, isStreaming: false };
+              }
+              return t;
+            });
+          }
+
+          return {
+            taskFlow,
+            conversationTurns: s.conversationTurns.map((turn: any) =>
+              turn.id === turnId && turn.status !== "awaiting_approval"
+                ? { ...turn, status: stoppedStatus }
+                : turn
+            ),
+          };
+        });
       },
 
       onPlanArtifactUpdated: (path: string, content: string, kind: "plan" | "requirements" | "design" | "tasks" | "bugfix") => {

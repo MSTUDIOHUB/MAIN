@@ -182,6 +182,51 @@ function extractLeakedReasoningTail(
   return { leakedThought: "", visibleText: text };
 }
 
+/**
+ * 剥离泄漏到可见正文中的推理段落。
+ * 复用 LEAKED_REASONING_MARKERS 和 LEAKED_REASONING_TAIL_MARKERS 的模式，
+ * 对 sanitizeAssistantDisplayContent 处理后的文本做二次过滤。
+ */
+export function stripLeakedReasoning(text: string): string {
+  const paragraphs = text
+    .split(/\n{2,}/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+
+  if (paragraphs.length === 0) return text;
+
+  // 剥离前导泄漏推理
+  const leakedPrefix: string[] = [];
+  let firstVisibleIdx = 0;
+  for (let i = 0; i < paragraphs.length; i++) {
+    const paragraph = paragraphs[i];
+    const isReasoning = LEAKED_REASONING_MARKERS.some((pattern) => pattern.test(paragraph));
+    if (!isReasoning) {
+      firstVisibleIdx = i;
+      break;
+    }
+    leakedPrefix.push(paragraph);
+    firstVisibleIdx = i + 1;
+  }
+
+  // 如果全部段落都是推理，直接返回空
+  if (leakedPrefix.length >= paragraphs.length) return "";
+
+  // 剥离尾部泄漏推理（类似 extractLeakedReasoningTail 的逻辑）
+  const remaining = paragraphs.slice(firstVisibleIdx);
+  let tailCutIdx = remaining.length;
+  for (let i = 0; i < remaining.length; i++) {
+    const isTailReasoning = LEAKED_REASONING_TAIL_MARKERS.some((pattern) => pattern.test(remaining[i]));
+    if (i > 0 && isTailReasoning) {
+      tailCutIdx = i;
+      break;
+    }
+  }
+
+  const visible = remaining.slice(0, tailCutIdx);
+  return visible.join("\n\n").trim();
+}
+
 function normalizeParagraphForLoopDetection(text: string): string {
   return text
     .trim()
