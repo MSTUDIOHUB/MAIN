@@ -908,15 +908,20 @@ function compactReadFileToolResultContent(content: string, maxToolResultTokens: 
 export function compactToolResults(
   messages: TrimMessage[],
   maxToolResultTokens: number = 4000,
+  ephemeralItemIds?: Set<string>,
 ): TrimMessage[] {
   return messages.map((msg) => {
     // Only compact tool results (which are always string content)
     if (msg.role !== "tool" || typeof msg.content !== "string") return msg;
 
-    const tokens = estimateTokens(msg.content);
-    if (tokens <= maxToolResultTokens) return msg;
+    // Check if this tool message is marked ephemeral
+    const isEphemeral = msg.tool_call_id && ephemeralItemIds && ephemeralItemIds.has(msg.tool_call_id);
+    const targetLimit = isEphemeral ? Math.min(maxToolResultTokens, 800) : maxToolResultTokens;
 
-    const compactedReadFile = compactReadFileToolResultContent(msg.content, maxToolResultTokens);
+    const tokens = estimateTokens(msg.content);
+    if (tokens <= targetLimit) return msg;
+
+    const compactedReadFile = compactReadFileToolResultContent(msg.content, targetLimit);
     if (compactedReadFile) {
       return {
         ...msg,
@@ -925,13 +930,13 @@ export function compactToolResults(
     }
 
     // Truncate the content
-    const maxChars = maxToolResultTokens * 2.5; // reverse of estimateTokens
+    const maxChars = targetLimit * 2.5; // reverse of estimateTokens
     const truncated = msg.content.slice(0, Math.floor(maxChars));
     const omittedChars = msg.content.length - truncated.length;
 
     return {
       ...msg,
-      content: truncated + `\n\n...[compact: ${omittedChars} chars omitted]`,
+      content: truncated + `\n\n...[compact: ${omittedChars} chars omitted${isEphemeral ? " from ephemeral source" : ""}]`,
     };
   });
 }
@@ -1081,7 +1086,7 @@ export function manageContext(
   maxToolResultTokens: number = 4000,
   maxAssistantTokens: number = 1500,
   forceManage: boolean = false,
-  options: ManageContextOptions = {},
+  options: ManageContextOptions & { ephemeralItemIds?: Set<string> } = {},
 ): ManageContextResult {
   const reclaimedMessages = activeMemoryReclamation(messages);
   const budgets = computeContextBudgets(contextLimit, reservedForOutput);
@@ -1120,7 +1125,7 @@ export function manageContext(
   }
 
   // Step 1: Compact oversized tool results
-  const compacted = compactToolResults(messagesWithMemory, maxToolResultTokens);
+  const compacted = compactToolResults(messagesWithMemory, maxToolResultTokens, options.ephemeralItemIds);
 
   // Step 2: Compact verbose assistant messages
   const assistantCompacted = compactAssistantMessages(compacted, maxAssistantTokens);

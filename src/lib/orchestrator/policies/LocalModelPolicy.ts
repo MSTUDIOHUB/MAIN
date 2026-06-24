@@ -67,4 +67,41 @@ export class LocalModelPolicy implements ExecutionPolicy {
   getMaxNoToolStops(): number {
     return 2; // Strict limit to stop text loops faster
   }
+
+  getReasoningDominatedStopMessage(language: "zh" | "en", reasoningRatio: number): string {
+    const percentage = Math.round(reasoningRatio * 100);
+    if (language === "en") {
+      return [
+        `Plan halted: local reasoning model output is dominated by reasoning (${percentage}% of tokens) with no tool calls.`,
+        "To prevent infinite thinking loops, the execution is paused.",
+        "Next Action: Provide a more explicit instruction, or manually guide the agent to a tool call."
+      ].join("\n");
+    }
+    return [
+      `执行中止：本地模型的输出完全被推理占满（占生成 Token 的 ${percentage}%）且未发起任何工具调用。`,
+      "为了防止推理过程陷入无限思考死循环，系统已自动暂停执行。",
+      "下一步行动建议：给模型输入更具体的指令，或手动引导其进行有效的工具调用。"
+    ].join("\n");
+  }
+
+  getResponseFormatSchema(): Record<string, unknown> {
+    return {
+      type: "object",
+      properties: {
+        thought: { type: "string", description: "Internal monologue planning the actions" },
+        toolCalls: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              name: { type: "string" },
+              arguments: { type: "object" }
+            },
+            required: ["name", "arguments"]
+          }
+        }
+      },
+      required: ["thought", "toolCalls"]
+    };
+  }
 }

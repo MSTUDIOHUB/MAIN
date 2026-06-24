@@ -2,6 +2,12 @@ import { type OpenAiToolChoice, type StreamResult } from "../../streaming";
 import { buildToolDefinitions, skillNameToToolName, type ToolDefinition } from "../../toolSchemas";
 import { compactContextForExecuteRecovery, computeContextBudgets, manageContext } from "../../contextTrim";
 import { clampContextLimitToReported } from "../../contextWindow";
+import { formatContextMemoryPacket } from "../../contextMemory";
+import { createThread, createTurn } from "../state/Thread";
+import { TurnContext } from "../state/TurnContext";
+import { EphemeralPruner } from "../state/EphemeralPruner";
+import { ReasoningStrainer } from "../state/ReasoningStrainer";
+import { PolicyFactory } from "../policies/PolicyFactory";
 import { generateId } from "../../utils";
 import { buildSystemPrompt } from "../../systemPrompt";
 import { discoverAllMcpTools, getMcpToolServerMap, setMcpToolServerMap, type MCPServerStatusSnapshot } from "../../mcpClient";
@@ -1295,6 +1301,16 @@ export class AgentOrchestrator {
           return;
         }
 
+        // Keep a persistent thread container linked to the session
+        if (!(this as any)._thread || (this as any)._thread.threadId !== eventThreadId) {
+          (this as any)._thread = createThread(eventThreadId);
+        }
+        const thread = (this as any)._thread;
+        const turn = createTurn(eventTurnId + `-${iteration}`, callbacks.getMessages());
+        thread.turns.push(turn);
+        const turnContext = new TurnContext(turn);
+        turnContext.startTurn();
+
         // ── Pre-LLM Turn Preparation ──
         callbacks.startNewTurn();
         const runtimeIntent = resolveRuntimeIntent();
@@ -1532,6 +1548,24 @@ export class AgentOrchestrator {
           const contextBudgets = contextBudgetsForManagement;
           const { inputBudget, outputBudget } = contextBudgets;
           const contextForce = contextForceForManagement;
+          // ── Strain reasoning and prune ephemeral tools from prompt messages ──
+          const strainer = new ReasoningStrainer({ language: callbacks.getPreferredLanguage() });
+          const pruner = new EphemeralPruner({ language: callbacks.getPreferredLanguage() });
+          const messagesForPruning = callbacks.getMessages();
+
+          // Purge reasoning content from history first
+          const reasoningPurged = strainer.purgeReasoning(messagesForPruning);
+
+          // Prune ephemeral items
+          const contextMemoryText = callbacks.getContextMemoryState?.() 
+            ? formatContextMemoryPacket(callbacks.getContextMemoryState()) 
+            : "";
+          const prunedMessages = pruner.prune(
+            reasoningPurged,
+            turn.ephemeralItems,
+            contextMemoryText
+          );
+
           const isUnapprovedPlanContext = workflowMode === "plan" && !callbacks.getIsPlanApproved();
           const forcedContextToolBudget = contextForce.shouldForce
             ? callbacks.getIsPlanApproved()
@@ -1547,8 +1581,9 @@ export class AgentOrchestrator {
               ? 700
               : 1000
             : null;
+
           const managedResult = manageContext(
-            callbacks.getMessages(),
+            prunedMessages,
             effectiveContextLimit,
             cloudResponsesCompact ? Math.min(outputBudget, 2048) : outputBudget,
             cloudResponsesCompact
@@ -1758,7 +1793,14 @@ export class AgentOrchestrator {
                 forceXmlTools,
             },
           });
-          streamResult = await fetchLLMStream(
+           // ── Structured Output JSON Schema & Reasoning stops ──
+           const isExecute = runtimeIntent === "execute";
+           const executionPolicy = PolicyFactory.createPolicy(config);
+           const responseSchema = (isExecute && config.activeProfile === "local")
+             ? executionPolicy.getResponseFormatSchema?.()
+             : undefined;
+
+           streamResult = await fetchLLMStream(
             messagesForLLM,
             settings,
             assistantMsgId,
@@ -1772,8 +1814,24 @@ export class AgentOrchestrator {
               toolChoice: recoveryToolChoice,
               workflowMode,
               runtimeIntent,
+              responseFormat: responseSchema,
             },
           );
+
+          // Check if output is reasoning-dominated (>80% tokens) with no tool calls
+          const totalOutputChars = streamResult.content.length + (streamResult.reasoningContent || "").length;
+          if (totalOutputChars > 200 && (!streamResult.toolCalls || streamResult.toolCalls.length === 0)) {
+            const reasoningRatio = (streamResult.reasoningContent || "").length / totalOutputChars;
+            if (reasoningRatio > 0.8) {
+              const stopMessage = executionPolicy.getReasoningDominatedStopMessage?.(
+                callbacks.getPreferredLanguage(),
+                reasoningRatio
+              ) || "Halted: reasoning-dominated output.";
+              callbacks.onNonActionableStop(stopMessage, "no_action");
+              callbacks.onStatusChange("idle");
+              return;
+            }
+          }
           if (llmTools.length > 0) {
             callbacks.onProviderNativeToolSuccess?.();
           }

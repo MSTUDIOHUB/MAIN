@@ -50,4 +50,14 @@ export interface ExecutionPolicy {
    * Defines the maximum allowed consecutive stops without tools.
    */
   getMaxNoToolStops(): number;
+
+  /**
+   * Returns a stop/halt message when the model outputs >80% reasoning content with no tool calls.
+   */
+  getReasoningDominatedStopMessage(language: "zh" | "en", reasoningRatio: number): string;
+
+  /**
+   * Returns a JSON schema or constraint structure for tool execution turns to force structured outputs.
+   */
+  getResponseFormatSchema?(): Record<string, unknown>;
 }

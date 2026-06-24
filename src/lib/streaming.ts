@@ -106,6 +106,7 @@ export type OpenAiToolChoice =
 
 export interface StreamRequestOptions {
   toolChoice?: OpenAiToolChoice;
+  responseFormat?: Record<string, unknown>;
 }
 
 /** A tool call accumulated from streaming deltas. */
@@ -1556,6 +1557,7 @@ export async function streamChatCompletion(
         messages: messages.map((m) => mapMessageForApi(m, true)),
         stream: true,
         options: buildOllamaOptions(settings, maxTokens),
+        ...(options.responseFormat ? { format: options.responseFormat } : {}),
       }
     : isAnthropic
       ? buildAnthropicRequestBody({
@@ -1574,6 +1576,7 @@ export async function streamChatCompletion(
           max_tokens: maxTokens,
           ...(settings.sendSamplingParameters === true && settings.temperature != null ? { temperature: settings.temperature } : {}),
           ...(settings.sendSamplingParameters === true && settings.topP != null ? { top_p: settings.topP } : {}),
+          ...(options.responseFormat ? { response_format: options.responseFormat } : {}),
         };
 
   // Include tools if provided (native function calling) — only for non-Ollama

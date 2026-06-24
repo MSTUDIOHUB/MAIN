@@ -210,6 +210,7 @@ export interface FetchLLMStreamOptions {
   toolChoice?: OpenAiToolChoice;
   workflowMode?: string;
   runtimeIntent?: string;
+  responseFormat?: Record<string, unknown>;
 }
 
 export interface ToolCallToExecute {

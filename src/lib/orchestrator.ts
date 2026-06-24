@@ -2381,6 +2381,7 @@ interface FetchLLMStreamOptions {
   noVisibleTokenTimeoutMs?: number;
   noVisibleTokenTimeoutLabel?: string;
   toolChoice?: OpenAiToolChoice;
+  responseFormat?: Record<string, unknown>;
   workflowMode?: string;
   runtimeIntent?: string;
 }
@@ -2643,6 +2644,7 @@ export async function fetchLLMStream(
           currentMaxTokens,
           {
             toolChoice: options.toolChoice,
+            responseFormat: options.responseFormat,
           },
         ).catch((err) => {
           safeReject(err instanceof Error ? err : new Error(getErrorMessage(err, "LLM stream failed")));
