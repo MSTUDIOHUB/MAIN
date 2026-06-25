@@ -771,15 +771,21 @@ export class AgentOrchestrator {
         let usedPlanClosurePrompt = false;
         let usedPlanReadOnlyConvergencePrompt = false;
         let planPostConvergenceToolRedirectCount = 0;
-        let planRuntimePhase: PlanRuntimePhase = workflowMode === "plan" && !callbacks.getIsPlanApproved()
-                ? "explore_structure"
-                : "grounding";
+        // P1 improvement: use a function-scoped mutable plan phase to avoid TS narrowing.
+        function initialPlanPhase(): PlanRuntimePhase {
+          return workflowMode === "plan" && !callbacks.getIsPlanApproved()
+            ? "explore_structure"
+            : "grounding";
+        }
+        let planRuntimePhase: PlanRuntimePhase = initialPlanPhase();
         let planQualityRejectCount = 0;
         let planLastQualityGateReason = "";
         let planLastMissingSections: string[] = [];
         let planEvidenceRecoveryPasses = 0;
         let planReasoningOnlyRecoveryPasses = 0;
         let planAutoScaffoldPromptIssued = false;
+        // P1 improvement: track how many recovery reads the model has used during drafting.
+        let planDraftingRecoveryReadCount = 0;
         let planClosureEvidenceRecoveryIssued = false;
         let usedReadOnlyPermissionHardRecoveryPrompt = false;
         let planReadOnlyConvergenceBatches = 0;
@@ -1426,11 +1432,19 @@ export class AgentOrchestrator {
             evidenceCount: callbacks.getPlanExecutionEvidenceLedger().length,
           });
         }
+        // P1 improvement: allow one controlled recovery read during drafting
+        // to prevent wasteful drafting→needs_evidence→drafting redirects.
+        const allowDraftingRecoveryRead =
+          workflowMode === "plan" &&
+          !callbacks.getIsPlanApproved() &&
+          planRuntimePhase === "drafting" &&
+          planDraftingRecoveryReadCount < 1;
         const phaseScopedIterationAllTools = filterPlanRuntimeToolDefinitionsForPhase({
           tools: baseIterationAllTools,
           workflowMode,
           isPlanApproved: callbacks.getIsPlanApproved(),
           planRuntimePhase,
+          allowDraftingRecoveryRead,
         });
         const shouldClosePlanToolSurface = shouldClosePlanToolSurfaceAfterReadOnlyConvergence({
           workflowMode,
@@ -3759,6 +3773,34 @@ export class AgentOrchestrator {
             missingSections: planLastMissingSections,
           });
 
+          // P1 improvement: handle drafting-phase suppressed reads gracefully.
+          // If the model is in drafting and wants a read tool we didn't allow,
+          // inject a targeted hint instead of redirecting to needs_evidence.
+          const suppressedToolNames = effectiveToolCalls.map((c) => c.name);
+          const isDraftingReadAttempt =
+            planRuntimePhase === "drafting" &&
+            suppressedToolNames.some((t) =>
+              t === "read_file" || t === "read_document" || t === "get_file_outline"
+            );
+          if (isDraftingReadAttempt && planDraftingRecoveryReadCount < 1) {
+            // The model needs a read during drafting; inject a targeted hint
+            // rather than triggering a wasteful needs_evidence redirect.
+            planDraftingRecoveryReadCount += 1;
+            planReasoningOnlyRecoveryPasses += 1;
+            callbacks.appendMessage({
+              role: "user",
+              content: callbacks.getPreferredLanguage() === "zh"
+                ? `定向恢复读取提示：当前处于 drafting 阶段，请尝试读取缺失的证据文件后直接写入 plan.md。你刚才尝试调用的工具：${suppressedToolNames.join(", ")}。请用最具体的文件路径读取，然后写计划。`
+                : `Controlled recovery read hint: You are in drafting phase. Try reading the missing evidence file then write plan.md directly. Tools you attempted: ${suppressedToolNames.join(", ")}. Use the most specific file path for reading, then produce the plan.`,
+            });
+            logAgentEvent("plan_drafting_recovery_read_injected", {
+              iteration,
+              attemptedTools: suppressedToolNames,
+              planDraftingRecoveryReadCount,
+            });
+            continue;
+          }
+
           const suppressedRecoveryDecision = resolvePlanSuppressedToolRecovery({
             workflowMode,
             isPlanApproved: callbacks.getIsPlanApproved(),
@@ -5694,6 +5736,14 @@ export class AgentOrchestrator {
 
         if (workflowMode === "plan") {
           allResults.forEach(rememberPlanToolActivity);
+          // P1 improvement: track recovery reads during drafting to allow only one.
+          if (
+            !callbacks.getIsPlanApproved() &&
+            planRuntimePhase === "drafting" &&
+            allResults.some((r) => r.name === "read_file" || r.name === "read_document" || r.name === "get_file_outline")
+          ) {
+            planDraftingRecoveryReadCount += 1;
+          }
         }
         if (
           workflowMode === "plan" &&

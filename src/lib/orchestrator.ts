@@ -290,12 +290,14 @@ export function filterPlanRuntimeToolDefinitionsForPhase(input: {
   workflowMode: "chat" | "edit" | "plan";
   isPlanApproved: boolean;
   planRuntimePhase?: PlanRuntimePhase;
+  allowDraftingRecoveryRead?: boolean;
 }): ToolDefinition[] {
   const names = new Set(filterPlanToolNamesForRuntimePhase({
     toolNames: input.tools.map((tool) => tool.function.name),
     workflowMode: input.workflowMode,
     isPlanApproved: input.isPlanApproved,
     planRuntimePhase: input.planRuntimePhase,
+    allowDraftingRecoveryRead: input.allowDraftingRecoveryRead,
   }));
   if (names.size === input.tools.length) return input.tools;
   return input.tools.filter((tool) => names.has(tool.function.name));

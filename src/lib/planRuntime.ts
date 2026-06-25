@@ -60,6 +60,15 @@ const PLAN_DRAFT_WRITE_TOOL_NAMES = new Set([
   "replace_in_file",
 ]);
 
+// Controlled recovery reads allowed during drafting phase (P1 improvement).
+// These are the specific read tools a model may need mid-drafting to confirm
+// implementation details before writing plan.md.
+const PLAN_DRAFTING_RECOVERY_READ_TOOL_NAMES = new Set([
+  "read_file",
+  "read_document",
+  "get_file_outline",
+]);
+
 export function isPlanDraftWriteToolName(name: string): boolean {
   return PLAN_DRAFT_WRITE_TOOL_NAMES.has(String(name || ""));
 }
@@ -69,6 +78,7 @@ export function filterPlanToolNamesForRuntimePhase(input: {
   workflowMode: PlanRuntimeMode;
   isPlanApproved: boolean;
   planRuntimePhase?: PlanRuntimePhase;
+  allowDraftingRecoveryRead?: boolean;
 }): string[] {
   if (input.workflowMode !== "plan" || input.isPlanApproved || !input.planRuntimePhase) {
     return input.toolNames;
@@ -84,6 +94,14 @@ export function filterPlanToolNamesForRuntimePhase(input: {
   }
   if (isPlanRuntimeFinalizationPhase(input.planRuntimePhase)) {
     return input.toolNames.filter(isPlanDraftWriteToolName);
+  }
+  // P1 improvement: drafting with conditional recovery-read allowance.
+  // When allowDraftingRecoveryRead is true and phase is drafting, permit
+  // a small set of targeted read tools so the model can do one controlled
+  // recovery read without triggering a wasteful needs_evidence redirect.
+  if (input.planRuntimePhase === "drafting" && input.allowDraftingRecoveryRead) {
+    const allowed = new Set([...PLAN_DRAFT_WRITE_TOOL_NAMES, ...PLAN_DRAFTING_RECOVERY_READ_TOOL_NAMES]);
+    return input.toolNames.filter((name) => allowed.has(name));
   }
   return input.toolNames;
 }

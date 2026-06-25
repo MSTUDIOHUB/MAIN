@@ -663,6 +663,49 @@ export function buildSystemPrompt(
 
   // ── Turn Intent Instructions ────────────────────────────────────────
 
+  // ── Model capability detection for PLAN mode ────────────────────
+  // Maps capability level to tailored plan instructions.
+  // Level 0/1 = weak/quantized → prefer plain markdown, <proposed_plan> wrapper
+  // Level 2 = decent → structured markdown with headings
+  // Level 3 = strong → full tier-1 structured output
+
+  function buildPlanCapabilityHints(capabilityLevel: number, language: "en" | "zh"): string | null {
+    if (capabilityLevel <= 1) {
+      // Weak / quantized models: simplify to 3 core rules, prefer <proposed_plan>
+      if (language === "en") {
+        return (
+          "PLAN CAPABILITY NOTE (low-tier model): Use simple Markdown with clear headings. " +
+          "You may wrap your plan in <proposed_plan> tags. " +
+          "Include: (1) affected files, (2) step-by-step actions, (3) validation. " +
+          "Keep it short — 10-15 lines is enough. Avoid JSON <plan> blocks; they are error-prone for small models."
+        );
+      }
+      return (
+        "PLAN 能力提示（小模型）：使用简洁 Markdown 带清晰标题即可。 " +
+        "可将计划包裹在 <proposed_plan> 标签中。 " +
+        "必须包含：(1) 影响文件，(2) 逐步操作，(3) 验证方式。 " +
+        "保持简短 — 10-15 行即可。避免 JSON <plan> 块，小模型容易出错。"
+      );
+    }
+    if (capabilityLevel === 2) {
+      // Medium models: structured markdown accepted
+      if (language === "en") {
+        return (
+          "PLAN CAPABILITY NOTE (standard model): You may produce structured Markdown plans with " +
+          "headings and bullet lists. Both [PROPOSAL START]...<plan>{...}</plan>...[PROPOSAL END] " +
+          "and <proposed_plan> wrapped Markdown are accepted. Include all standard sections."
+        );
+      }
+      return (
+        "PLAN 能力提示（标准模型）：可以产出带标题和列表的结构化 Markdown 计划。 " +
+        "支持 [PROPOSAL START]...<plan>{...}</plan>...[PROPOSAL END] 和 <proposed_plan> 包裹格式。 " +
+        "请包含所有标准章节。"
+      );
+    }
+    // Level 3 = strong: no hints needed, full instructions already in Core Rules
+    return null;
+  }
+
   // ── Turn Intent: PLAN (simplified — runtime injects stage-specific rules) ──
   if (turnIntent === "plan") {
     const planLang = instructionLanguage === "en" ? "en" : "zh";
@@ -696,6 +739,15 @@ export function buildSystemPrompt(
       "",
       `All user-visible content (plan.md, responses, options) must use ${resolvedLanguageName}. System instructions above use ${instructionLanguageName} for model comprehension.`,
     ].join("\n"));
+
+    // P1 improvement: inject capability-aware hints into PLAN instructions.
+    const capabilityLevel = toolProtocolProfile?.model
+      ? heuristicDetectCapabilities(toolProtocolProfile.model, resolvedResponseLanguage).capabilityLevel
+      : 2;
+    const capabilityHint = buildPlanCapabilityHints(capabilityLevel, planLang);
+    if (capabilityHint) {
+      parts.push(capabilityHint);
+    }
   } else if (turnIntent === "execute" || turnIntent === "studio_workflow") {
     parts.push([
       "================================",
