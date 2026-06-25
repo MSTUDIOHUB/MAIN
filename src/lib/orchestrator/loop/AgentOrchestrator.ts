@@ -2,13 +2,14 @@ import { type OpenAiToolChoice, type StreamResult } from "../../streaming";
 import { buildToolDefinitions, skillNameToToolName, type ToolDefinition } from "../../toolSchemas";
 import { compactContextForExecuteRecovery, computeContextBudgets, manageContext } from "../../contextTrim";
 import { clampContextLimitToReported } from "../../contextWindow";
-import { formatContextMemoryPacket } from "../../contextMemory";
+
 import { createThread, createTurn } from "../state/Thread";
 import { TurnContext } from "../state/TurnContext";
-import { EphemeralPruner } from "../state/EphemeralPruner";
-import { ReasoningStrainer } from "../state/ReasoningStrainer";
+import { pruneEphemeralItems } from "../state/EphemeralPruner";
+import { strainReasoning } from "../state/ReasoningStrainer";
 import { PolicyFactory } from "../policies/PolicyFactory";
 import { generateId } from "../../utils";
+import { summarizeThought, thoughtSummaryToString } from "../../chat/StreamingThoughtSummarizer";
 import { buildSystemPrompt } from "../../systemPrompt";
 import { discoverAllMcpTools, getMcpToolServerMap, setMcpToolServerMap, type MCPServerStatusSnapshot } from "../../mcpClient";
 import { ensureVisibleConclusionWithPolicy, isAssistantTurnEmpty, isSyntheticVisibleConclusion, normalizeAssistantTurn } from "../../normalizedTurn";
@@ -1549,22 +1550,37 @@ export class AgentOrchestrator {
           const { inputBudget, outputBudget } = contextBudgets;
           const contextForce = contextForceForManagement;
           // ── Strain reasoning and prune ephemeral tools from prompt messages ──
-          const strainer = new ReasoningStrainer({ language: callbacks.getPreferredLanguage() });
-          const pruner = new EphemeralPruner({ language: callbacks.getPreferredLanguage() });
           const messagesForPruning = callbacks.getMessages();
 
-          // Purge reasoning content from history first
-          const reasoningPurged = strainer.purgeReasoning(messagesForPruning);
+          // Step 1: Strain reasoning — purge prior-turn reasoning_content to break thinking loops
+          const strainResult = strainReasoning(messagesForPruning, {
+            currentTurnReasoningThreshold: config.activeProfile === "local" ? 1200 : 2000,
+          });
+          const reasoningStrained = strainResult.messages;
+          if (strainResult.isReasoningDominated) {
+            logAgentEvent("reasoning_dominated_detected", {
+              turnId: eventTurnId,
+              reasoningChars: strainResult.totalPurgedReasoningChars,
+              messagesStrained: strainResult.messagesStrained,
+            });
+          }
 
-          // Prune ephemeral items
-          const contextMemoryText = callbacks.getContextMemoryState?.() 
-            ? formatContextMemoryPacket(callbacks.getContextMemoryState()) 
-            : "";
-          const prunedMessages = pruner.prune(
-            reasoningPurged,
-            turn.ephemeralItems,
-            contextMemoryText
+          // Step 2: Prune ephemeral tool outputs — "burn after reading"
+          const prunedResult = pruneEphemeralItems(
+            reasoningStrained,
+            turnContext,
+            {
+              maxToolChars: config.activeProfile === "local" ? 2000 : 4000,
+              maxReasoningChars: 500,
+              purgeReasoningFromPriorTurns: true,
+            },
           );
+          const prunedMessages = prunedResult.messages;
+
+          // Step 3: Record burned replacements in turn context
+          for (const _rep of turnContext.getBurnedReplacements()) {
+            // Already recorded during pruneEphemeralItems
+          }
 
           const isUnapprovedPlanContext = workflowMode === "plan" && !callbacks.getIsPlanApproved();
           const forcedContextToolBudget = contextForce.shouldForce
@@ -2408,6 +2424,14 @@ export class AgentOrchestrator {
             replayInContext: false,
             display: reasoningPolicy.display,
           });
+        }
+
+        // Summarize provider reasoning for context memory injection at turn end
+        if (providerReasoningForHistory && providerReasoningForHistory.reasoningContent.length > 200) {
+          const thoughtSummary = summarizeThought(providerReasoningForHistory.reasoningContent);
+          const summaryText = thoughtSummaryToString(thoughtSummary);
+          try { turnContext.setSummary(summaryText); } catch {}
+          try { turnContext.accumulateReasoning(providerReasoningForHistory.reasoningContent.length); } catch {}
         }
         if (streamText.length === 0 && streamResult.toolCalls.length === 0) {
           logAgentEvent("llm_empty_response_diagnostic", {
@@ -6183,6 +6207,26 @@ export class AgentOrchestrator {
 
         // Append all tool result messages
         for (const result of allResults) {
+          // Register tool execution with TurnContext for ephemeral tracking
+          try {
+            const resultChars = typeof result.content === "string" ? result.content.length : 0;
+            turnContext.registerToolExecution({
+              toolCallId: result.toolCallId,
+              toolName: result.name,
+              argumentsHash: buildRepeatLoopArgsKey(toolArgsByCallId.get(result.toolCallId) ?? {}),
+              resultLength: resultChars,
+              resultTruncated: resultChars > 2000,
+            });
+            turnContext.addItem({
+              category: "tool",
+              burned: false,
+              scope: "ephemeral",
+              purpose: `${result.name} tool result`,
+              source: { toolName: result.name },
+            });
+          } catch {
+            // TurnContext registration is best-effort
+          }
           const toolHistoryContent = buildToolResultHistoryContentByFormat(result, config.toolFeedbackFormat);
           callbacks.appendMessage({
             role: "tool",

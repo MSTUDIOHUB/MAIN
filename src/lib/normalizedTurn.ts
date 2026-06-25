@@ -16,7 +16,7 @@ export function isSyntheticVisibleConclusion(text: string): boolean {
   return String(text || "").replace(/\s+/g, " ").trim() === SYNTHETIC_VISIBLE_CONCLUSION;
 }
 
-const REASONING_TAG_RE = /<(?:analysis|thought|thinking|reasoning)(?:\s[^>]*)?>([\s\S]*?)<\/(?:analysis|thought|thinking|reasoning)>/gi;
+export const REASONING_TAG_RE = /<(?:analysis|thought|thinking|reasoning)(?:\s[^>]*)?>([\s\S]*?)<\/(?:analysis|thought|thinking|reasoning)>/gi;
 const LEAKED_REASONING_MARKERS = [
   /^thinking\b/i,
   /^thought\b/i,

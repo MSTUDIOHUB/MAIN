@@ -1,54 +1,163 @@
 // src/lib/chat/StreamingThoughtSummarizer.ts
+// Lightweight summarizer that converts long thinking streams into
+// single-line summaries using heuristics (no LLM calls).
+// ────────────────────────────────────────────────────────────────────
 
-export class StreamingThoughtSummarizer {
-  /**
-   * Generates a concise, single-line heuristic summary of a long thinking stream.
-   * Extracts action patterns, decision tokens, or file paths without using an LLM.
-   */
-  static thoughtToSummary(thought: string, maxChars: number = 100, language: "zh" | "en" = "zh"): string {
-    if (!thought || !thought.trim()) {
-      return language === "zh" ? "分析当前任务状态" : "Analyzing current task status";
+import { THINKING_TAG_NAMES } from "./StreamingThinkingInterceptor";
+
+export interface ThoughtSummary {
+  /** Compact one-line summary of the thinking. */
+  summary: string;
+  /** Files mentioned during thinking. */
+  mentionedFiles: string[];
+  /** Actions the model planned or took. */
+  actions: string[];
+  /** Decisions or conclusions reached. */
+  decisions: string[];
+  /** Original thinking character count. */
+  originalLength: number;
+}
+
+/**
+ * Extract file paths from text.
+ */
+function extractFilePaths(text: string): string[] {
+  const paths: string[] = [];
+  const pathRe = /([a-zA-Z0-9_./\-]+(?:\.(ts|tsx|js|jsx|py|rs|go|java|c|cpp|h|hpp|css|html|json|toml|yaml|yml|md|sh|bash|sql|vue|svelte|jsx|graphql)))\b/g;
+  let m: RegExpExecArray | null;
+  while ((m = pathRe.exec(text)) && paths.length < 5) {
+    const p = m[1];
+    if (!p.startsWith("<") && !p.endsWith(">") && p.length > 2 && p.length < 200) {
+      paths.push(p);
     }
-
-    const isZh = language === "zh";
-    const cleaned = thought.replace(/<\/?[a-zA-Z]+>/g, "").trim();
-
-    // 1. Check for file path mentions or actions
-    const fileMatches = cleaned.match(/([\w.-]+\.(?:ts|tsx|js|jsx|css|json|md|py|rs|go|yml|yaml))/i);
-    const hasWrite = /write|edit|modify|patch|update|写入|修改|编辑|更新/i.test(cleaned);
-    const hasRead = /read|view|cat|inspect|读取|查看/i.test(cleaned);
-    const hasCommand = /command|run|shell|execute|命令|执行|运行/i.test(cleaned);
-
-    let summary = "";
-    if (fileMatches) {
-      const fileName = fileMatches[1];
-      if (hasWrite) {
-        summary = isZh 
-          ? `计划修改文件 ${fileName}` 
-          : `Planning to modify ${fileName}`;
-      } else if (hasRead) {
-        summary = isZh 
-          ? `计划读取文件 ${fileName}` 
-          : `Planning to read ${fileName}`;
-      } else {
-        summary = isZh 
-          ? `分析相关文件 ${fileName}` 
-          : `Analyzing file ${fileName}`;
-      }
-    } else if (hasCommand) {
-      summary = isZh 
-        ? "准备执行系统终端命令" 
-        : "Preparing to execute shell command";
-    } else {
-      // Fallback: take the first sentence or first chunk
-      const firstSentence = cleaned.split(/[。!.?\n]/)[0].trim();
-      summary = firstSentence.slice(0, maxChars);
-    }
-
-    if (summary.length > maxChars) {
-      summary = summary.slice(0, maxChars - 3) + "...";
-    }
-
-    return summary || (isZh ? "规划下一步实施步骤" : "Planning next implementation steps");
   }
+  return paths;
+}
+
+/**
+ * Extract action keywords from text.
+ */
+function extractActions(text: string): string[] {
+  const actionPatterns = [
+    /^(read|open|view|inspect)\b.*?(?:file|path|directory|code)/i,
+    /^(write|edit|apply|create|modify|update|delete)\b/i,
+    /^(run|execute|run_command|shell|terminal)\b/i,
+    /^(search|grep|rg|find|explore)\b/i,
+    /^(analyze|check|verify|test|validate|audit)\b/i,
+    /^(decide|conclude|determine|judge)\b/i,
+    /^(plan|outline|design|structure)\b/i,
+  ];
+  const lines = text.split(/\n/).map(l => l.trim()).filter(Boolean);
+  const actions: string[] = [];
+  for (const line of lines) {
+    for (const pat of actionPatterns) {
+      if (pat.test(line) && actions.length < 3) {
+        actions.push(line.slice(0, 140));
+        break;
+      }
+    }
+  }
+  return actions;
+}
+
+/**
+ * Extract decision/conclusion statements.
+ */
+function extractDecisions(text: string): string[] {
+  const decisionPatterns = [
+    /(?:conclude|decide|determine|found|identified|observed|noted|confirmed|verified)\b.*$/i,
+    /(?:should|must|need to|will)\s+(?:do|use|apply|read|write|execute|modify|run)\b.*$/i,
+    /(?:because|therefore|so|thus|hence)\b.*$/i,
+  ];
+  const lines = text.split(/\n/).map(l => l.trim()).filter(Boolean);
+  const decisions: string[] = [];
+  for (const line of lines) {
+    for (const pat of decisionPatterns) {
+      if (pat.test(line) && decisions.length < 2) {
+        decisions.push(line.slice(0, 140));
+        break;
+      }
+    }
+  }
+  return decisions;
+}
+
+/**
+ * Build a compact summary from raw thinking text.
+ */
+export function summarizeThought(thinking: string): ThoughtSummary {
+  const originalLength = thinking.length;
+  const trimmed = thinking.replace(/\s+/g, " ").trim();
+
+  return {
+    summary: buildSummaryString(trimmed),
+    mentionedFiles: extractFilePaths(thinking),
+    actions: extractActions(thinking),
+    decisions: extractDecisions(thinking),
+    originalLength,
+  };
+}
+
+/**
+ * Convert a ThoughtSummary into a single-line string for context injection.
+ */
+export function thoughtSummaryToString(summary: ThoughtSummary): string {
+  const parts: string[] = [];
+  if (summary.decisions.length > 0) {
+    parts.push(`Decision: ${summary.decisions[0]}`);
+  }
+  if (summary.actions.length > 0) {
+    parts.push(`Action: ${summary.actions[0]}`);
+  }
+  if (summary.mentionedFiles.length > 0) {
+    parts.push(`Files: ${summary.mentionedFiles.slice(0, 3).join(", ")}`);
+  }
+  return parts.join(" | ") || `Processed ${summary.originalLength.toLocaleString()} chars of reasoning`;
+}
+
+/**
+ * Build a plain-text summary string for the pruner placeholder.
+ */
+function buildSummaryString(trimmed: string): string {
+  if (trimmed.length <= 200) return trimmed;
+
+  const sentences = trimmed.split(/[.!?]+/).map(s => s.trim()).filter(Boolean);
+  if (sentences.length <= 2) return trimmed.slice(0, 200);
+
+  // Pick the first decision/conclusion and the first action
+  let keySentence = sentences[0];
+  for (const s of sentences) {
+    if (/conclude|decide|determine|found|identify|observe|confirm/i.test(s)) {
+      keySentence = s;
+      break;
+    }
+  }
+  if (keySentence.length > 200) keySentence = keySentence.slice(0, 200);
+  return keySentence;
+}
+
+/**
+ * Check if text is dominated by thinking content.
+ */
+export function isThoughtDominated(text: string): boolean {
+  const lower = text.toLowerCase().trim();
+  const thinkingMarkers = [...THINKING_TAG_NAMES].map(t => `<${t}`).concat([
+    "thinking:",
+    "reasoning:",
+    "thought:",
+    "思考",
+    "internal",
+  ]);
+  const markerCount = thinkingMarkers.filter(m => lower.startsWith(m)).length;
+  if (markerCount > 0) return true;
+
+  // Count lines that look like reasoning
+  const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
+  if (lines.length < 5) return false;
+
+  const reasoningLines = lines.filter(l => {
+    const ll = l.toLowerCase();
+    return /^(thought|thinking|reasoning|analyze|consider|evaluate|examine|reflect)\b/.test(ll);
+  });
+  return reasoningLines.length / lines.length > 0.6;
 }

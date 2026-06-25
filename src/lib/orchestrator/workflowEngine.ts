@@ -670,7 +670,16 @@ export class WorkflowEngine {
         streamBuffer.flush();
         clearNoFirstTokenNoticeTimer();
 
-        let { agent: remainingAgent } = thinkingInterceptor.flush();
+        let { agent: remainingAgent, thoughtEnded } = thinkingInterceptor.flush();
+
+        // Stream end: if thinking content was accumulated, log it for later context memory injection
+        if (thoughtEnded) {
+          const thinkingContent = thinkingInterceptor.getThinkingContent();
+          if (thinkingContent && thinkingContent.length > 100) {
+            // Summary will be injected by the orchestrator after turn completion
+          }
+        }
+
         if (remainingAgent) {
           const displayCandidate = context.streamingAssistantDisplayBuffer + remainingAgent;
           const displayDecision = resolveStreamingAssistantDisplay({

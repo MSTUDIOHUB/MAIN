@@ -1,42 +1,61 @@
-import { StreamingThoughtSummarizer } from "./StreamingThoughtSummarizer";
+// src/lib/chat/StreamingThinkingInterceptor.ts
+// Enhanced with non-tag thinking detection and thought-to-summary callback.
+// ────────────────────────────────────────────────────────────────────
 
 export const THINKING_TAG_NAMES = new Set(["thinking", "thought", "analysis", "reasoning"]);
 
-export class StreamingThinkingInterceptor {
-  private buffer = "";          // raw token accumulation for tag detection
-  private inThinking = false;   // currently inside a thinking tag?
-  private pendingClose = "";    // partial closing tag being accumulated
-  private thinkingContent = ""; // accumulated content inside the thinking tag
-  private onTokenDroppedCallback?: (token: string) => void;
-  private language: "zh" | "en" = "zh";
+/**
+ * Non-tag thinking patterns used by Qwen and similar local models.
+ */
+const NON_TAG_THINKING_PREFIXES = [
+  /^Thinking:/i,
+  /^REASONING:/i,
+  /^THOUGHT:/i,
+  /^思考[：:]\s*/,
+  /^INTERNAL_THINKING:/i,
+  /^\[.*?reasoning.*?\]:\s*/i,
+];
 
-  constructor(options?: { onTokenDropped?: (token: string) => void; language?: "zh" | "en" }) {
-    this.onTokenDroppedCallback = options?.onTokenDropped;
-    this.language = options?.language ?? "zh";
+/**
+ * Detect if text starts with a non-tag thinking pattern.
+ */
+function detectNonTagThinking(text: string): boolean {
+  return NON_TAG_THINKING_PREFIXES.some(pat => pat.test(text));
+}
+
+export class StreamingThinkingInterceptor {
+  private buffer = "";
+  private inThinking = false;
+  private pendingClose = "";
+  private thinkingContent = "";
+  private nonTagThinking = false;
+  private onDroppedToken?: (token: string) => void;
+
+  /**
+   * Register a callback for dropped thinking tokens.
+   * Useful for logging or accumulating a reasoning log.
+   */
+  setDroppedTokenCallback(cb: (token: string) => void): void {
+    this.onDroppedToken = cb;
   }
 
-  /** Feed a new token; returns { agent, thinking, thoughtStarted, thoughtEnded } with the split content. */
-  feed(token: string): { agent: string; thinking: string; thoughtStarted: boolean; thoughtEnded: boolean } {
+  feed(
+    token: string,
+  ): {
+    agent: string;
+    thinking: string;
+    thoughtStarted: boolean;
+    thoughtEnded: boolean;
+  } {
     let agent = "";
     let thinking = "";
     let thoughtStarted = false;
     let thoughtEnded = false;
 
-    // Detect non-tagged thinking start patterns e.g., "Thinking:", "REASONING:", "THOUGHT:", "思考：", "思考"
-    const untaggedPatterns = [
-      /^Thinking:\s*/i,
-      /^REASONING:\s*/i,
-      /^THOUGHT:\s*/i,
-      /^思考：\s*/,
-      /^思考\s*/
-    ];
-
     for (const ch of token) {
       if (this.inThinking) {
-        // ── Inside a thinking block ──
         this.pendingClose += ch;
 
-        // Try to match a complete closing tag
         const closeRe = new RegExp(`^<\\/(${[...THINKING_TAG_NAMES].join("|")})>\\s*$`, "i");
         const m = this.pendingClose.match(closeRe);
         if (m) {
@@ -46,21 +65,40 @@ export class StreamingThinkingInterceptor {
           continue;
         }
 
-        // If it looks like we're encountering a new codeblock or tag and it can't possibly close, flush it
         const couldBeCloseTag = /^<\/[a-zA-Z]*>?\s*$/.test(this.pendingClose);
         if (!couldBeCloseTag || this.pendingClose.length > 30) {
           thinking += this.pendingClose;
           this.thinkingContent += this.pendingClose;
-          if (this.onTokenDroppedCallback) {
-            this.onTokenDroppedCallback(this.pendingClose);
-          }
           this.pendingClose = "";
         }
+      } else if (this.nonTagThinking) {
+        // Inside a non-tag thinking block (e.g., "Thinking: ...")
+        thinking += ch;
+        this.thinkingContent += ch;
+
+        // End non-tag thinking if we detect a code block or substantial content shift
+        if (thinking.includes("```") || ch === "\n" && this.thinkingContent.split("\n").length > 10) {
+          // Check if we've seen actionable output after thinking
+          const recentThinking = this.thinkingContent.slice(-200);
+          if (/(?:apply|write|edit|run|execute|create|modify|use|call)/i.test(recentThinking)) {
+            this.nonTagThinking = false;
+          }
+        }
       } else {
-        // ── Normal mode ──
+        // ── Normal mode — detect opening tags ──────────────────────
         this.buffer += ch;
 
-        // Check if buffer forms a complete opening tag
+        // Check for non-tag thinking prefixes first
+        const fullBuffer = this.buffer;
+        if (fullBuffer.length >= 7 && detectNonTagThinking(fullBuffer.trimEnd())) {
+          this.nonTagThinking = true;
+          this.buffer = "";
+          this.thinkingContent = "";
+          thoughtStarted = true;
+          continue;
+        }
+
+        // Check for XML opening tags
         const openMatch = this.buffer.match(/^(<(?:thinking|thought|analysis|reasoning)(?:\s[^>]*)?>)([\s\S]*)/i);
         if (openMatch) {
           this.inThinking = true;
@@ -70,30 +108,11 @@ export class StreamingThinkingInterceptor {
           if (openMatch[2]) {
             thinking += openMatch[2];
             this.thinkingContent += openMatch[2];
-            if (this.onTokenDroppedCallback) {
-              this.onTokenDroppedCallback(openMatch[2]);
-            }
           }
           continue;
         }
 
-        // Detect non-tagged thinking prefix patterns
-        let matchedUntagged = false;
-        for (const pattern of untaggedPatterns) {
-          if (pattern.test(this.buffer)) {
-            this.inThinking = true;
-            this.buffer = "";
-            this.thinkingContent = "";
-            thoughtStarted = true;
-            matchedUntagged = true;
-            break;
-          }
-        }
-        if (matchedUntagged) {
-          continue;
-        }
-
-        // Flush buffer to agent content
+        // If buffer can't possibly form a tag, flush it as agent content
         if (this.buffer.length > 0) {
           const couldBeTag = /^<[a-zA-Z]*$/.test(this.buffer) ||
                              /^<[a-zA-Z]+\s*$/.test(this.buffer) ||
@@ -106,18 +125,18 @@ export class StreamingThinkingInterceptor {
       }
     }
 
+    // Notify callback about dropped tokens
+    if (this.onDroppedToken && thinking) {
+      this.onDroppedToken(thinking);
+    }
+
     return { agent, thinking, thoughtStarted, thoughtEnded };
   }
 
-  /** Get the accumulated thinking content so far. */
-  getThinkingContent(): string { return this.thinkingContent; }
-
-  /** Convert raw thinking content to compact heuristic summary. */
-  thoughtToSummary(maxChars: number = 100): string {
-    return StreamingThoughtSummarizer.thoughtToSummary(this.thinkingContent, maxChars, this.language);
+  getThinkingContent(): string {
+    return this.thinkingContent;
   }
 
-  /** Flush any remaining buffer (call at stream end). */
   flush(): { agent: string; thinking: string; thoughtEnded: boolean } {
     let agent = "";
     let thinking = "";
@@ -126,13 +145,15 @@ export class StreamingThinkingInterceptor {
     if (this.inThinking) {
       if (this.pendingClose) {
         this.thinkingContent += this.pendingClose;
-        if (this.onTokenDroppedCallback) {
-          this.onTokenDroppedCallback(this.pendingClose);
-        }
         this.pendingClose = "";
       }
       thoughtEnded = true;
       this.inThinking = false;
+    }
+
+    if (this.nonTagThinking) {
+      thoughtEnded = true;
+      this.nonTagThinking = false;
     }
 
     if (this.buffer) {
@@ -143,11 +164,11 @@ export class StreamingThinkingInterceptor {
     return { agent, thinking, thoughtEnded };
   }
 
-  /** Reset state for reuse. */
   reset() {
     this.buffer = "";
     this.inThinking = false;
     this.pendingClose = "";
     this.thinkingContent = "";
+    this.nonTagThinking = false;
   }
 }
