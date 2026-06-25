@@ -150,3 +150,111 @@ export function extractPlanDraftPreview(text: string): string | null {
 export function hasPlanDraftPreview(text: string): boolean {
   return extractPlanDraftPreview(text) !== null;
 }
+
+// ── Tiered Plan Output Support ──────────────────────────────────────
+// Allows models of varying capability to produce usable plan output.
+// Tier 1 = full structured format (strong models)
+// Tier 2 = <proposed_plan> wrapped markdown (medium models)
+// Tier 3 = plain structured markdown (weak/quantized models)
+
+export interface TextPlanProposal {
+  kind: "tier2_proposed_plan" | "tier3_plaintext";
+  markdown: string;
+}
+
+type TieredPlanResult = StructuredPlanProposal | TextPlanProposal;
+
+// Detect the plan output tier from model text
+export function detectPlanTier(text: string): 1 | 2 | 3 | 0 {
+  if (!text.trim()) return 0;
+  const rootText = stripReasoningBlocks(text);
+
+  // Tier 1: [PROPOSAL START] ... <plan>{...}</plan> ... [PROPOSAL END]
+  if (PROPOSAL_START_RE.test(rootText) && PLAN_BLOCK_RE.test(rootText)) {
+    return 1;
+  }
+
+  // Tier 2: <proposed_plan> ... </proposed_plan>
+  if (/<proposed_plan(?:\s[^>]*)?>([\s\S]*?)<\/proposed_plan>/i.test(rootText)) {
+    return 2;
+  }
+
+  // Tier 3: Plain markdown with plan-like structure (headings + structured lines)
+  const headingRe = /^#{1,4}\s+\S+/gm;
+  const bulletRe = /^\s*[-*]\s+\S+/gm;
+  const numberedRe = /^\d+\.\s+\S+/gm;
+  const tableRe = /^\|.+\|/gm;
+  const headingMatches = rootText.match(headingRe);
+  const bulletMatches = rootText.match(bulletRe);
+  const numberedMatches = rootText.match(numberedRe);
+  const tableMatches = rootText.match(tableRe);
+
+  const structuredCount = [headingMatches, bulletMatches, numberedMatches, tableMatches]
+    .filter(Boolean).reduce((sum, arr) => sum + arr!.length, 0);
+
+  if (structuredCount >= 3 && rootText.length >= 120) {
+    return 3;
+  }
+
+  return 0;
+}
+
+// Extract plan from any tier, returning a unified result
+export function extractTieredPlanProposal(text: string): TieredPlanResult | null {
+  if (!text.trim()) return null;
+
+  const rootText = stripReasoningBlocks(text);
+
+  // Tier 1: Full structured format
+  const tier1 = extractStructuredPlanProposal(text);
+  if (tier1) return tier1;
+
+  // Tier 2: <proposed_plan> wrapper
+  const proposedPlanMatch = rootText.match(/<proposed_plan(?:\s[^>]*)?>([\s\S]*?)<\/proposed_plan>/i);
+  if (proposedPlanMatch && proposedPlanMatch[1]) {
+    const content = proposedPlanMatch[1].trim();
+    if (content.length >= 80 && content.split('\n').filter(Boolean).length >= 3) {
+      return { kind: "tier2_proposed_plan", markdown: content };
+    }
+  }
+
+  // Tier 3: Plain structured markdown
+  const stripped = rootText
+    .replace(/<proposed_plan[\s\S]*?<\/proposed_plan>/gi, "")
+    .replace(PROPOSAL_START_RE, "")
+    .replace(PROPOSAL_END_RE, "")
+    .replace(/<plan>[\s\S]*?<\/plan>/gi, "")
+    .trim();
+
+  if (stripped.length >= 120) {
+    const headingRe = /^#{1,4}\s+\S+/gm;
+    const bulletRe = /^\s*[-*]\s+\S+/gm;
+    const numberedRe = /^\d+\.\s+\S+/gm;
+    const tableRe = /^\|.+\|/gm;
+    const structuredCount = [
+      stripped.match(headingRe) || [],
+      stripped.match(bulletRe) || [],
+      stripped.match(numberedRe) || [],
+      stripped.match(tableRe) || [],
+    ].filter(Boolean).reduce((sum, arr) => sum + arr!.length, 0);
+
+    if (structuredCount >= 3) {
+      return { kind: "tier3_plaintext", markdown: stripped };
+    }
+  }
+
+  return null;
+}
+
+export function hasTieredPlanProposal(text: string): boolean {
+  return extractTieredPlanProposal(text) !== null;
+}
+
+// Normalize any tier to a unified format that the runtime can consume
+export function normalizePlanProposal(proposal: TieredPlanResult): StructuredPlanProposal {
+  if ("jobs" in proposal) {
+    return proposal;
+  }
+  // Convert Tier 2/3 to StructuredPlanProposal with empty jobs
+  return { markdown: proposal.markdown, jobs: [] };
+}

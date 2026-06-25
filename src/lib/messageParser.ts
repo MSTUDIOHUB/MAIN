@@ -1,4 +1,4 @@
-import { hasStructuredPlanProposal, parsePlanJobs, type PlanJobItem } from "./planProposal";
+import { hasStructuredPlanProposal, hasTieredPlanProposal, parsePlanJobs, type PlanJobItem } from "./planProposal";
 
 export type MessageSegment =
   | { type: 'text'; content: string }
@@ -13,7 +13,7 @@ export function parseMessageContent(text: string): MessageSegment[] {
   if (!text) return [];
 
   const segments: MessageSegment[] = [];
-  const shouldRenderPlan = hasStructuredPlanProposal(text);
+  const shouldRenderPlan = hasTieredPlanProposal(text) || hasStructuredPlanProposal(text);
 
   // Regex to find all common thinking and plan blocks
   const tagRegex = /<(thought|thinking|analysis|reasoning|plan)>([\s\S]*?)<\/\1>/g;

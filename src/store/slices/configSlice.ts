@@ -43,7 +43,7 @@ export const defaultConfig: AppConfig = {
   themeMode: "dark",
   appIconVariant: "dark",
   workflowMode: "chat",
-  promptLanguageStrategy: "english_core_localized_output",
+  promptLanguageStrategy: "model_aware",
   toolPermissionPolicy: createDefaultToolPermissionPolicy(),
   mcpRouting: createDefaultMcpRoutingConfig(),
   instructionsEnabled: true,

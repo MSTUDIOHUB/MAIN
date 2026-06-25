@@ -3,7 +3,7 @@ import type { ResolvedUserIntent } from "./runIntent";
 import type { ToolDefinition } from "./toolSchemas";
 import { looksDangerousShellCommand } from "./toolExecutionContract";
 
-export type PromptLanguageStrategy = "english_core_localized_output";
+export type PromptLanguageStrategy = "english_core_localized_output" | "model_aware" | "pure_english" | "pure_user_language";
 
 export type ToolRiskLevel =
   | "read_only"

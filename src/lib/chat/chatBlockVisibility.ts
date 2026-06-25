@@ -1,6 +1,6 @@
 import { isThinModelToolNarration, isSubstantiveModelFeedback } from "../modelFeedbackDedupe";
 import { parseMessageContent } from "../messageParser";
-import { hasPlanDraftPreview, hasStructuredPlanProposal } from "../planProposal";
+import { hasPlanDraftPreview, hasTieredPlanProposal } from "../planProposal";
 import { sanitizeAIOutput } from "../sanitize";
 import {
   extractPathishTokens,
@@ -140,7 +140,7 @@ export function hasGeneratedPlanContent(blocks: any[]) {
 
     if (block.type !== "agent") return false;
     const raw = getAgentInspectableContent(block.content);
-    return hasStructuredPlanProposal(raw) || hasPlanDraftPreview(raw);
+    return hasTieredPlanProposal(raw) || hasPlanDraftPreview(raw);
   });
 }
 

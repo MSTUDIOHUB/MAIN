@@ -13,7 +13,8 @@ import { summarizeThought, thoughtSummaryToString } from "../../chat/StreamingTh
 import { buildSystemPrompt } from "../../systemPrompt";
 import { discoverAllMcpTools, getMcpToolServerMap, setMcpToolServerMap, type MCPServerStatusSnapshot } from "../../mcpClient";
 import { ensureVisibleConclusionWithPolicy, isAssistantTurnEmpty, isSyntheticVisibleConclusion, normalizeAssistantTurn } from "../../normalizedTurn";
-import { hasStructuredPlanProposal } from "../../planProposal";
+import { hasTieredPlanProposal } from "../../planProposal";
+import { runModelProbe, createProbeRunner } from "../../modelProbe";
 import { buildReadOnlyPermissionContinuationPrompt, hasExecutableProposalReplyOptions, hasOnlyNonBlockingPlanReplyOptions, hasOnlyReadOnlyPermissionReplyOptions, serializeAssistantReplyForHistory, shouldAutoContinueReadOnlyPermission as shouldAutoContinueReadOnlyPermissionState, shouldPauseForReplyOptions, shouldRouteUnapprovedPlanReplyOptionsToArtifact, shouldSuppressApprovedPlanExecutionReplyOptions as shouldSuppressApprovedPlanExecutionReplyOptionsState, stripReadOnlyPermissionPrompt } from "../../replyOptions";
 import { planReadFileWindowCoverage } from "../../readFileWindow";
 import { FILE_UNCHANGED_STUB, buildFileReadSignature, buildFileUnchangedReplayContent, buildFileUnchangedStub, formatReadFileWindowCoverageStub, formatReadFileWindowNarrowedNote, getReadFileCoverageForPath, getSessionFileReadStates, hashString, pruneFileReadStates } from "../../orchestrator/fileReadCache";
@@ -635,6 +636,30 @@ export class AgentOrchestrator {
                 });
               };
         const initialRuntimeIntent = resolveRuntimeIntent();
+        // ── Model Probe (async, non-blocking) ─────────────────────
+        // Probe the model at turn start to detect instruction language,
+        // quantization state, and capability level. Results are cached
+        // for subsequent turns. If the probe fails or times out,
+        // heuristic fallback is used by detectInstructionLanguage.
+        if (settings.model && settings.provider && settings.baseUrl) {
+          const probeRunner = createProbeRunner(
+            settings.provider,
+            settings.model,
+            settings.baseUrl,
+            settings.apiKey ?? "",
+          );
+          // Fire-and-forget: probe runs in background, caches results
+          setTimeout(() => {
+            runModelProbe(probeRunner, settings.model!, settings.provider!)
+              .then(() => {
+                // Results are already cached inside runModelProbe
+              })
+              .catch(() => {
+                // Probe failed; heuristic will be used
+              });
+          }, 0);
+        }
+
         applySystemPromptForRuntime(initialRuntimeIntent, resolveAllToolsForRuntime(initialRuntimeIntent));
         if (config.hooksEnabled) {
         const sessionKey = callbacks.getSessionKey();
@@ -2937,7 +2962,7 @@ export class AgentOrchestrator {
           suppressExecutableProposalOptionsForToolCalls ||
           suppressApprovedPlanExecutionReplyOptions;
         const sourceVisibleText = normalizedBase.visibleText || normalized.visibleText;
-        const hasStructuredProposal = hasStructuredPlanProposal(streamText);
+        const hasStructuredProposal = hasTieredPlanProposal(streamText);
         const hasReadyPlanArtifacts = currentPlanStageForReview === "ready_to_execute";
         const hasReviewablePlanArtifacts = isReviewablePlanStage(currentPlanStageForReview);
         const rawFinalReplyOptions = compactedProseCodeDump || suppressNonDecisionReplyOptions
