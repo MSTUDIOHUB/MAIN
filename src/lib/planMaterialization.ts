@@ -21,6 +21,8 @@ export interface PlanMaterializationResult {
   content?: string;
   reason?: string;
   source?: PlanMaterializationSource;
+  /** Extracted <user_options> blocks for post-validation routing. */
+  replyOptions?: string[];
 }
 
 interface PlanMaterializationToolActivityLike {
@@ -167,6 +169,63 @@ function detectMaterializationLanguage(input: {
 }): "zh" | "en" {
   if (input.language === "en" || input.language === "zh") return input.language;
   return /[\u4e00-\u9fff]/.test(`${input.content}\n${input.userGoal || ""}`) ? "zh" : "en";
+}
+
+/**
+ * Extract <user_options> reply options from raw text before validation.
+ * Returns the extracted option texts and the content with options removed.
+ * This allows validation to proceed on clean plan content while preserving
+ * reply options for the user even when validation is deferred.
+ */
+function extractReplyOptionsFromContent(rawText: string): {
+  content: string;
+  replyOptions: string[];
+} {
+  const original = String(rawText || "").trim();
+  const options: string[] = [];
+  let content = original;
+
+  // Extract <user_options> ... </user_options> blocks
+  const userOptionsMatch = original.match(/<user_options>[\s\S]*?<\/user_options>/gi);
+  if (userOptionsMatch) {
+    for (const block of userOptionsMatch) {
+      // Extract individual <option> elements
+      const optionMatches = block.match(/<option[^>]*>([\s\S]*?)<\/option>/gi);
+      if (optionMatches) {
+        for (const opt of optionMatches) {
+          const optText = opt.replace(/<option[^>]*>/i, "").replace(/<\/option>/i, "").trim();
+          if (optText) {
+            options.push(optText);
+          }
+        }
+      } else {
+        // Fallback: keep the whole block as an option label
+        const blockText = block.replace(/<user_options[^>]*>/i, "").replace(/<\/user_options>/i, "").trim();
+        if (blockText) {
+          options.push(blockText);
+        }
+      }
+    }
+    // Remove <user_options> blocks from content
+    content = content.replace(/<user_options>[\s\S]*?<\/user_options>/gi, "");
+  }
+
+  // Also extract standalone <option> tags outside of <user_options>
+  const standaloneOptionMatch = content.match(/<option[^>]*>([\s\S]*?)<\/option>/gi);
+  if (standaloneOptionMatch) {
+    for (const opt of standaloneOptionMatch) {
+      const optText = opt.replace(/<option[^>]*>/i, "").replace(/<\/option>/i, "").trim();
+      if (optText && !options.includes(optText)) {
+        options.push(optText);
+      }
+    }
+    content = content.replace(/<option[^>]*>([\s\S]*?)<\/option>/gi, "");
+  }
+
+  // Clean up whitespace
+  content = content.replace(/\n{3,}/g, "\n\n").trim();
+
+  return { content, replyOptions: options };
 }
 
 function stripPlanChoiceMarkup(rawText: string): string {
@@ -1468,8 +1527,17 @@ export function materializePlanArtifactFromVisibleText(input: {
   turnContext?: TurnInputContextLike | null;
   language?: "zh" | "en";
 }): PlanMaterializationResult {
-  const raw = stripPlanChoiceMarkup(String(input.visibleText || "").trim());
-  if (!raw) return { ok: false, reason: "empty" };
+  // Extract reply options BEFORE stripping them, so validation sees clean plan content
+  // but we preserve the options for post-validation routing.
+  // We use extracted.content directly since extractReplyOptionsFromContent already
+  // handles <user_options> removal without corrupting the content.
+  const extracted = extractReplyOptionsFromContent(input.visibleText);
+  // Apply stripPlanChoiceMarkup to handle any remaining protocol markers
+  // but only if there are actual options to extract (to avoid corrupting clean content)
+  const raw = extracted.replyOptions.length > 0
+    ? stripPlanChoiceMarkup(extracted.content)
+    : extracted.content.trim();
+  if (!raw) return { ok: false, reason: "empty", replyOptions: extracted.replyOptions };
   if (PROTOCOL_NOISE_RE.test(raw)) return { ok: false, reason: "protocol_noise" };
   if (TOOL_LOG_NOISE_RE.test(raw)) return { ok: false, reason: "tool_log_noise" };
   if (raw.length < 280) return { ok: false, reason: "too_short" };
@@ -1515,8 +1583,10 @@ export function materializePlanArtifactFromVisibleText(input: {
         content = repaired.content;
         validation = repairedValidation;
       }
+      // If repair didn't fix the issues, fall through to canonicalization
     }
   }
+  // Final validation: if still not ok and canonicalization can help, try it
   if (
     !validation.ok &&
     !/generic_fallback_plan|unsupported_debug_log_advice|weak_path_echo_evidence|import_only_evidence|generic_theme_token_plan|placeholder_validation_plan/i.test(validation.reason || "")
@@ -1550,6 +1620,7 @@ export function materializePlanArtifactFromVisibleText(input: {
     path: ".MAIN/plans/plan.md",
     content,
     source,
+    replyOptions: extracted.replyOptions,
   };
 }
 

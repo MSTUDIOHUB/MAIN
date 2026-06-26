@@ -77,7 +77,7 @@ export function shouldAllowApprovedPlanRecoveryFileRead(
   for (let index = 0; index < recent.length; index += 1) {
     const activity = recent[index];
     if (isPatchMismatchRecoveryActivity(activity)) latestPatchMismatchIndex = index;
-    if (activity.name === "read_file") latestFileReadIndex = index;
+    if (activity.name === "read_file" && activity.status !== "failed") latestFileReadIndex = index;
   }
   return latestPatchMismatchIndex >= 0 && latestPatchMismatchIndex > latestFileReadIndex;
 }

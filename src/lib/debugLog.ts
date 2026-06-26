@@ -179,7 +179,12 @@ function isRoutineDebugEntry(entry: DebugLogEntry): boolean {
     source === "store.replace_agent_messages" ||
     source === "stream_chunk_progress" ||
     source === "harness.chunk_progress" ||
-    source === "store.stream_first_token"
+    source === "store.stream_first_token" ||
+    source === "agent.reasoning_suppressed" ||
+    source === "store.reasoning_suppressed" ||
+    source === "store.stream_reset" ||
+    source === "agent.synthetic_visible_conclusion_suppressed" ||
+    source === "agent.tool_action_narration_injected"
   ) {
     return true;
   }

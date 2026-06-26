@@ -2529,6 +2529,8 @@ export class AgentOrchestrator {
                 reasoningField: streamResult.reasoningField,
               }
             : null;
+        const _contentShort = streamText.length < 10;
+        const _toolCallsFew = streamResult.toolCalls.length < 2;
         logAgentEvent("stream_done", {
           iteration,
           finishReason: streamResult.finishReason || "unknown",
@@ -2538,6 +2540,22 @@ export class AgentOrchestrator {
           elapsedMs: Date.now() - iterationRequestStartedAt,
           emptyResult: streamText.length === 0 && streamResult.toolCalls.length === 0,
         });
+        if (_contentShort && _toolCallsFew) {
+          logAgentEvent("stream_low_content_diagnostic", {
+            iteration,
+            contentChars: streamText.length,
+            contentPreview: streamText.slice(0, 200),
+            toolCallCount: streamResult.toolCalls.length,
+            toolCallNames: streamResult.toolCalls.map((tc) => tc.name).slice(0, 8),
+            finishReason: streamResult.finishReason || "unknown",
+            elapsedMs: Date.now() - iterationRequestStartedAt,
+            provider: settings.provider || "unknown",
+            model: settings.model,
+            reasoningChars: providerReasoningForHistory?.reasoningContent.length ?? 0,
+            messageCount: managedAgentMessages.length,
+            activeProfile: config.activeProfile,
+          });
+        }
         if (providerReasoningForHistory) {
           logAgentEvent("reasoning_suppressed", {
             iteration,
@@ -3865,21 +3883,30 @@ export class AgentOrchestrator {
             suppressedToolNames.some((t) =>
               t === "read_file" || t === "read_document" || t === "get_file_outline"
             );
-          if (isDraftingReadAttempt && planDraftingRecoveryReadCount < 1) {
-            // The model needs a read during drafting; inject a targeted hint
-            // rather than triggering a wasteful needs_evidence redirect.
+          if (isDraftingReadAttempt && planDraftingRecoveryReadCount < 3) {
+            // Allow up to 3 controlled recovery reads during drafting.
+            // Instead of immediately redirecting to needs_evidence (which causes
+            // drafting→needs_evidence→drafting pendulum swings), let the model
+            // read the specific files it needs while nudging it toward writing.
             planDraftingRecoveryReadCount += 1;
             planReasoningOnlyRecoveryPasses += 1;
+            const isUrgent = planDraftingRecoveryReadCount >= 2;
+            const urgencyHint = isUrgent
+              ? (callbacks.getPreferredLanguage() === "zh"
+                ? `【紧急恢复读取 ${planDraftingRecoveryReadCount}/3】drafting 阶段只允许写文件，但你还需要读取：${suppressedToolNames.join(", ")}。请先读取具体文件，然后立即写入 plan.md，不要再尝试其他只读工具。`
+                : `[URGENCY ${planDraftingRecoveryReadCount}/3] You are in drafting phase but need to read: ${suppressedToolNames.join(", ")}. Read the file now, then immediately write plan.md with write_file or replace_in_file. Do not attempt additional read tools after this.`)
+              : (callbacks.getPreferredLanguage() === "zh"
+                ? `定向恢复读取提示：当前处于 drafting 阶段，请尝试读取缺失的证据文件后直接写入 plan.md。你刚才尝试调用的工具：${suppressedToolNames.join(", ")}。请用最具体的文件路径读取，然后写计划。`
+                : `Controlled recovery read hint: You are in drafting phase. Try reading the missing evidence file then write plan.md directly. Tools you attempted: ${suppressedToolNames.join(", ")}. Use the most specific file path for reading, then produce the plan.`);
             callbacks.appendMessage({
               role: "user",
-              content: callbacks.getPreferredLanguage() === "zh"
-                ? `定向恢复读取提示：当前处于 drafting 阶段，请尝试读取缺失的证据文件后直接写入 plan.md。你刚才尝试调用的工具：${suppressedToolNames.join(", ")}。请用最具体的文件路径读取，然后写计划。`
-                : `Controlled recovery read hint: You are in drafting phase. Try reading the missing evidence file then write plan.md directly. Tools you attempted: ${suppressedToolNames.join(", ")}. Use the most specific file path for reading, then produce the plan.`,
+              content: urgencyHint,
             });
             logAgentEvent("plan_drafting_recovery_read_injected", {
               iteration,
               attemptedTools: suppressedToolNames,
               planDraftingRecoveryReadCount,
+              urgency: isUrgent,
             });
             continue;
           }
@@ -3912,22 +3939,24 @@ export class AgentOrchestrator {
             continue;
           }
           if (suppressedRecoveryDecision.action === "pause_blocked") {
-            setPlanRuntimePhase("blocked", planEvidenceReadinessForRedirect.reason, "failed");
-            callbacks.onNonActionableStop(
-              buildPlanEvidenceBlockedPauseMessage({
-                language: callbacks.getPreferredLanguage(),
-                reason: planEvidenceReadinessForRedirect.reason,
-              }),
-              "incomplete_plan",
-              {
-                recoveryReason: "plan_suppressed_tool_evidence_blocked",
-                nextStep: callbacks.getPreferredLanguage() === "zh"
-                  ? "补充一个具体缺失事实或关键选择后继续"
-                  : "provide the concrete missing fact or key decision, then resume",
-              },
-            );
-            callbacks.onStatusChange("idle");
-            return;
+            // Instead of blocking and returning a non-actionable stop,
+            // inject a strong directive that forces the model to write the plan
+            // using only the evidence it has already gathered.
+            planPostConvergenceToolRedirectCount += 1;
+            setPlanRuntimePhase("drafting", "recovery exhausted, write with existing evidence");
+            callbacks.onStatusChange("running");
+            callbacks.appendMessage({
+              role: "user",
+              content: callbacks.getPreferredLanguage() === "zh"
+                ? `【强制写入提示】定向补证和恢复读取已全部使用完毕，证据已充分。请立即停止尝试任何只读工具，直接使用 write_file 或 replace_in_file 创建或更新 .MAIN/plans/plan.md。如果你认为还需要某个具体文件的信息，在计划中将该缺失信息标记为"用户待提供"并写入计划；否则现在就写。`
+                : `[FORCED WRITE] All targeted evidence recovery passes and controlled recovery reads are exhausted — you have sufficient evidence. Immediately stop attempting read tools and use write_file or replace_in_file to create or update .MAIN/plans/plan.md. If you believe a specific file is missing, mark it as "pending user input" within the plan itself; otherwise write the plan now.`,
+            });
+            logAgentEvent("plan_suppressed_tool_forced_write_injected", {
+              iteration,
+              reason: planEvidenceReadinessForRedirect.reason,
+              evidenceReadiness: planEvidenceReadinessForRedirect.status,
+            });
+            continue;
           }
 
           planPostConvergenceToolRedirectCount += 1;
@@ -4307,7 +4336,9 @@ export class AgentOrchestrator {
                   reason: materializedProposal.reason || "",
                   planArtifactSource: materializedProposal.source || "",
                   visibleChars: (sourceVisibleText || streamText).length,
+                  replyOptionsCount: (materializedProposal.replyOptions || []).length,
                 });
+                // Preserve reply options for post-validation routing
                 hasMaterializedStructuredProposal = materializedProposal.ok;
               }
               if (hasMaterializedStructuredProposal) {
@@ -5012,9 +5043,23 @@ export class AgentOrchestrator {
           toolFailureSignatures.set(tc.id, failureSignature);
 
           if ((failedToolCallCounts.get(failureSignature) ?? 0) >= 2) {
+            const failureCount = failedToolCallCounts.get(failureSignature) ?? 0;
+            const argsJson = typeof tc.arguments === "string" ? tc.arguments : "";
+            logAgentEvent("repeated_failure_block_details", {
+              iteration,
+              tool: tc.name,
+              arguments: argsJson,
+              target,
+              toolCallId: tc.id,
+              failureSignature,
+              failureCount,
+              firstSeenIteration: iteration - (failureCount - 1),
+            });
             const message = callbacks.getPreferredLanguage() === "zh"
               ? `REPEATED_FAILURE_BLOCKED: ${tc.name}${target ? ` (${target})` : ""} 已用相同参数连续失败。请先诊断最近错误，改变参数或换一条策略，不要原样重试。`
               : `REPEATED_FAILURE_BLOCKED: ${tc.name}${target ? ` (${target})` : ""} has failed repeatedly with identical arguments. Diagnose the latest error and change arguments or strategy before retrying.`;
+            const _recentActivity = recentPlanToolActivity.slice(-MAX_RECENT_PLAN_TOOL_ACTIVITY);
+            const _evidenceKeys = Array.from(getSessionTaskTargetingEvidence(callbacks.getSessionKey())).slice(0, 20);
             emitToolPreflightBlocked(callbacks, {
               reason: "repeated_failure_blocked",
               tool: tc.name,
@@ -5022,6 +5067,9 @@ export class AgentOrchestrator {
               message,
               toolCallId: tc.id,
               lifecycleState: "blocked",
+              evidenceChain: _recentActivity.length > 0 || _evidenceKeys.length > 0
+                ? { recentToolActivity: JSON.stringify(_recentActivity.slice(-6).map((a) => `${a.name}->${a.target}`)), evidenceKeys: _evidenceKeys }
+                : undefined,
             });
             callbacks.onToolError(tc.name, target, message, { toolCallId: tc.id });
             allResults.push({

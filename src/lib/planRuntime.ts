@@ -53,6 +53,10 @@ const PLAN_TARGETED_EVIDENCE_TOOL_NAMES = new Set([
 
 const PLAN_STRUCTURE_EXPLORATION_TOOL_NAMES = new Set([
   "get_project_skeleton",
+  // Allow read_file during structure exploration so the model can read
+  // specific files discovered by get_project_skeleton. This prevents
+  // the model from getting stuck trying unsupported tools.
+  "read_file",
 ]);
 
 const PLAN_DRAFT_WRITE_TOOL_NAMES = new Set([
@@ -139,7 +143,7 @@ export function shouldRedirectPlanToolsAfterReadOnlyConvergence(input: {
   return input.toolNames.some(isPlanReadOnlyToolName);
 }
 
-export const MAX_PLAN_EVIDENCE_RECOVERY_PASSES = 2;
+export const MAX_PLAN_EVIDENCE_RECOVERY_PASSES = 3;
 
 export function resolvePlanNoActionRecovery(input: {
   workflowMode: PlanRuntimeMode;

@@ -1831,22 +1831,13 @@ function hasMeaningfulPlanSections(content: string, kind: PlanArtifactKind): boo
   return true;
 }
 
-const PLAN_EVIDENCE_REQUIRED_SECTIONS = new Set([
-  "screenshot_attachment_observations",
-  "read_evidence",
-  "confirmed_findings",
-  "summary",
-]);
-
 const PLAN_STRUCTURAL_REQUIRED_SECTIONS = new Set([
   "user_goal",
   "key_changes",
   "public_interfaces",
-  "unverified_hypotheses",
   "execution_steps",
   "affected_files",
   "test_plan",
-  "assumptions_defaults",
   "validation",
 ]);
 
@@ -1875,7 +1866,11 @@ export function classifyPlanArtifactQualityResult(
     ? result.missingSections
     : parseMissingPlanRequiredSections(result.reason);
   const reason = result.reason || "quality_gate";
-  const hasEvidenceGap = missingSections.some((section) => PLAN_EVIDENCE_REQUIRED_SECTIONS.has(section));
+  
+  // Evidence gap: only when the validation reason explicitly mentions evidence problems.
+  // Evidence sections are no longer part of missingRequiredSections in the unified path,
+  // so we only classify as evidence gap for explicit evidence issues.
+  const hasEvidenceGap = /noisy_search_evidence|weak_path_echo_evidence|import_only_evidence/.test(reason);
   const hasOnlyStructuralGaps =
     missingSections.length > 0 &&
     missingSections.every((section) => PLAN_STRUCTURAL_REQUIRED_SECTIONS.has(section));
@@ -1896,8 +1891,8 @@ export function classifyPlanArtifactQualityResult(
       recoveryAction: "rewrite",
       canAutoRepair: missingSections.every((section) =>
         section === "user_goal" ||
-        section === "unverified_hypotheses" ||
-        section === "assumptions_defaults" ||
+        section === "execution_steps" ||
+        section === "affected_files" ||
         section === "validation" ||
         section === "test_plan" ||
         section === "public_interfaces"
@@ -1961,8 +1956,8 @@ export function repairActionablePlanArtifactContent(input: {
   const missingSections = quality.missingSections || [];
   const allowed = new Set([
     "user_goal",
-    "unverified_hypotheses",
-    "assumptions_defaults",
+    "execution_steps",
+    "affected_files",
     "validation",
     "test_plan",
     "public_interfaces"
@@ -1993,20 +1988,20 @@ export function repairActionablePlanArtifactContent(input: {
     repairedSections.push("public_interfaces");
   }
 
-  if (missingSections.includes("unverified_hypotheses")) {
+  if (missingSections.includes("affected_files")) {
     const section = language === "en"
-      ? "## Unverified Hypotheses\n- No additional execution assumption is trusted yet; any new assumption found during implementation must be validated before it becomes a step."
-      : "## 未验证假设\n- 暂无可直接信任的额外执行假设；实施中出现的新推断必须先验证，再转成执行步骤。";
+      ? "## Affected Files\n- No files affected yet; the plan will identify specific targets during implementation."
+      : "## 影响文件\n- 暂不影响具体文件；实施过程中将识别具体目标。";
     repaired = `${repaired}\n\n${section}`.trim();
-    repairedSections.push("unverified_hypotheses");
+    repairedSections.push("affected_files");
   }
 
-  if (missingSections.includes("assumptions_defaults")) {
-    const section = language === "en"
-      ? "## Assumptions / Defaults\n- Default to the smallest implementation that satisfies the user goal; pause for user input if a new blocking product or API choice appears."
-      : "## 假设与默认值\n- 默认实施满足用户目标的最小变更；如果执行中出现新的阻塞性产品或 API 选择，先暂停让用户确认。";
-    repaired = `${repaired}\n\n${section}`.trim();
-    repairedSections.push("assumptions_defaults");
+  if (missingSections.includes("execution_steps")) {
+    const step = language === "en"
+      ? "## Execution Steps\n- 1. Implement the specific change identified by the plan.\n- 2. Validate with targeted tests and verify the fix resolves the user goal."
+      : "## 执行步骤\n- 1. 按计划实施具体变更。\n- 2. 用针对性测试验证，确认变更解决了用户目标。";
+    repaired = `${repaired}\n\n${step}`.trim();
+    repairedSections.push("execution_steps");
   }
 
   if (missingSections.includes("user_goal") && goal) {
@@ -2157,20 +2152,14 @@ export function validateActionablePlanArtifact(
     /(?:\.tsx?|\.jsx?|\.swift|\.py|\.rs|\.go|\.json|\.csv|\.tsv|\.xlsx|\.md|\/[A-Za-z0-9_.-]+|\\[A-Za-z0-9_.-]+)/i.test(raw) ||
     /(?:CSV|TSV|XLSX|字段|列|指标|数据|表格|截图|附件|column|metric|dataset|table|screenshot|attachment)/i.test(raw);
   const hasObservedEvidence = /(?:截图观察|附件观察|已确认事实|已读证据|证据引用|真实发现|Observed|Evidence|Confirmed|Findings)/i.test(raw);
-  const hasExecutionOrder = /(?:执行步骤|实施步骤|修复步骤|落地步骤|Execution Steps|Implementation Steps|Plan of Work|\b1\.\s+)/i.test(raw);
-  const hasValidation = /(?:验证标准|验证方式|验收|测试|构建|Validation|Acceptance|Test|Build)/i.test(raw);
+  const hasExecutionOrder = /(?:执行步骤|实施步骤|修复步骤|落地步骤|关键改动|关键实现改动|Key Changes|Implementation Changes|Execution Steps|Implementation Steps|Plan of Work|\b1\.\s+)/i.test(raw);
+  const hasValidation = /(?:验证标准|验证方式|验收|测试|构建|Validation|Acceptance|Test|Build|测试方案|Test Plan)/i.test(raw);
   const hasConcreteUserGoal =
     (
       /(?:用户目标|目标|User Goal|Goal)/i.test(raw) ||
       hasGoalLikePlanTitle(raw)
     ) &&
     !/(?:最小可用闭环|smallest useful workflow).{0,80}(?:默认|first version)/i.test(raw);
-  const hasScreenshotOrAttachmentObservation = /(?:截图\/附件观察|截图观察|附件观察|无截图|无附件|未提供截图|未提供附件|Screenshot|Attachment|Provided context|No screenshot|No attachment)/i.test(raw);
-  const hasReadEvidence = /(?:已读证据|证据引用|Read Evidence|Evidence References|References)/i.test(raw);
-  const hasRealFindings = /(?:真实发现|已确认事实|当前发现|Confirmed Facts|Findings|Observed Facts)/i.test(raw);
-  const hasUnverifiedHypotheses = /(?:未验证假设|待验证假设|Unverified Hypotheses|Unverified Assumptions)/i.test(raw);
-  const hasAffectedFiles = /(?:影响文件|影响接口|Affected Files|Affected Interfaces|Files\/Interfaces)/i.test(raw);
-  const hasSummary = /(?:^|\n)\s*#{1,6}\s*(?:摘要|Summary)/i.test(raw);
   const hasKeyChanges = /(?:^|\n)\s*#{1,6}\s*(?:关键改动|关键实现改动|实现改动|Key Changes|Implementation Changes)/i.test(raw);
   const hasPublicInterfacesSection =
     /(?:^|\n)\s*#{1,6}\s*(?:公共\s*API\s*\/\s*接口\s*\/\s*类型|公共\s*API|接口|类型|Public APIs?\s*\/\s*Interfaces?\s*\/\s*Types?|Public APIs?|Interfaces?|Types?)/i.test(raw);
@@ -2179,12 +2168,19 @@ export function validateActionablePlanArtifact(
     /(?:公共\s*API|接口|类型|Public APIs?|Interfaces?|Types?).{0,120}(?:新增|修改|变化|保持|不变|added|modified|changed|unchanged|preserved)/i.test(raw) ||
     hasAnyContentUnderSection(raw, /(?:公共\s*API\s*\/\s*接口\s*\/\s*类型|公共\s*API|接口|类型|Public APIs?\s*\/\s*Interfaces?\s*\/\s*Types?|Public APIs?|Interfaces?|Types?)/i);
   const hasTestPlan = /(?:^|\n)\s*#{1,6}\s*(?:测试方案|测试计划|测试场景|验证方案|Test Plan|Testing|Tests?)/i.test(raw);
-  const hasAssumptionsDefaults = /(?:^|\n)\s*#{1,6}\s*(?:假设与默认值|默认假设|假设|默认值|Assumptions(?:\s*\/\s*Defaults)?|Defaults)/i.test(raw);
   const hasConcreteChangeSignal =
     /(?:修改|更新|新增|修复|补齐|调整|接入|生成|实现|重构|保持|不改变|不新增|验证|运行|modify|update|add|fix|adjust|wire|generate|implement|refactor|preserve|unchanged|run|verify)/i.test(raw) &&
     hasTargetOrData;
-  const usesCodexPlanContract =
-    hasSummary || hasKeyChanges || hasPublicInterfacesSection || hasTestPlan || hasAssumptionsDefaults;
+
+  // Unified validation path: single check list for all plans.
+  // If a plan contains a section header, check that section's content.
+  // If a plan does not contain a section header, skip that check (don't reject).
+  // Always-required sections (checked regardless of header presence):
+  const alwaysRequiredSections = [
+    [hasConcreteUserGoal, "user_goal"],
+    [hasExecutionOrder, "execution_steps"],
+    [hasValidation, "validation"],
+  ];
 
   const signalCount = [
     hasTargetOrData,
@@ -2199,27 +2195,26 @@ export function validateActionablePlanArtifact(
     return classifyPlanArtifactQualityResult({ ok: false, reason: "insufficient_actionable_plan_signals" });
   }
 
-  const missingRequiredSections = (usesCodexPlanContract
-    ? ([
-        [hasConcreteUserGoal, "user_goal"],
-        [hasSummary, "summary"],
-        [hasKeyChanges && hasConcreteChangeSignal, "key_changes"],
-        [hasPublicInterfacesSection && hasExplicitPublicInterfaceDisposition, "public_interfaces"],
-        [hasTestPlan && hasValidation, "test_plan"],
-        [hasAssumptionsDefaults, "assumptions_defaults"],
-      ] as Array<[boolean, string]>)
-    : ([
-        [hasConcreteUserGoal, "user_goal"],
-        [hasScreenshotOrAttachmentObservation, "screenshot_attachment_observations"],
-        [hasReadEvidence, "read_evidence"],
-        [hasRealFindings, "confirmed_findings"],
-        [hasUnverifiedHypotheses, "unverified_hypotheses"],
-        [hasExecutionOrder, "execution_steps"],
-        [hasAffectedFiles, "affected_files"],
-        [hasValidation, "validation"],
-      ] as Array<[boolean, string]>))
+  // Unified path: always required sections + Codex Plan Contract sections (only when headers present).
+  // Evidence sections (screenshot, read evidence, confirmed findings, affected files) are NOT required.
+  const hasSummary = /(?:^|\n)\s*#{1,6}\s*(?:摘要|Summary)/i.test(raw);
+  const hasAssumptions =
+    /(?:^|\n)\s*#{1,6}\s*(?:假设与默认值|默认假设|假设|默认值|Assumptions(?:\s*\/\s*Defaults)?|Defaults)/i.test(raw);
+
+  const codexContractSections = [
+    [hasSummary, "summary"],
+    [hasKeyChanges && hasConcreteChangeSignal, "key_changes"],
+    [hasPublicInterfacesSection && hasExplicitPublicInterfaceDisposition, "public_interfaces"],
+    [hasTestPlan && hasValidation, "test_plan"],
+    [hasAssumptions, "assumptions"],
+  ];
+
+  const missingRequiredSections: string[] = [
+    ...alwaysRequiredSections,
+    ...codexContractSections,
+  ]
     .filter(([ok]) => !ok)
-    .map(([, name]) => name);
+    .map(([, name]) => name) as string[];
   if (missingRequiredSections.length > 0) {
     return classifyPlanArtifactQualityResult({
       ok: false,

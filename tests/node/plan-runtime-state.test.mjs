@@ -77,7 +77,7 @@ test("plan runtime phases scope the tool surface", () => {
     workflowMode: "plan",
     isPlanApproved: false,
     planRuntimePhase: "explore_structure",
-  }), ["get_project_skeleton"]);
+  }), ["get_project_skeleton", "read_file"]);
 
   assert.deepEqual(filterPlanToolNamesForRuntimePhase({
     toolNames: allPlanTools,
@@ -179,6 +179,17 @@ test("ready evidence gets one model-authored plan recovery pass instead of fallb
     evidenceReadiness: "ready_for_plan",
     targetedRecoveryPasses: 2,
   }), {
+    action: "targeted_evidence",
+    reason: "ready_evidence_missing_visible_plan",
+  });
+
+  assert.deepEqual(resolvePlanNoActionRecovery({
+    workflowMode: "plan",
+    isPlanApproved: false,
+    reasoningOnly: true,
+    evidenceReadiness: "ready_for_plan",
+    targetedRecoveryPasses: 3,
+  }), {
     action: "pause_blocked",
     reason: "ready_evidence_missing_visible_plan_after_recovery",
   });
@@ -213,6 +224,17 @@ test("insufficient plan evidence allows targeted recovery passes then pauses", (
     reasoningOnly: true,
     evidenceReadiness: "needs_targeted_read",
     targetedRecoveryPasses: 2,
+  }), {
+    action: "targeted_evidence",
+    reason: "needs_targeted_read",
+  });
+
+  assert.deepEqual(resolvePlanNoActionRecovery({
+    workflowMode: "plan",
+    isPlanApproved: false,
+    reasoningOnly: true,
+    evidenceReadiness: "needs_targeted_read",
+    targetedRecoveryPasses: 3,
   }), {
     action: "pause_blocked",
     reason: "needs_targeted_read",

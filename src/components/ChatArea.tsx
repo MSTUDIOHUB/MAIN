@@ -29,8 +29,9 @@ import {
   looksLikeReasoningLeakTitle,
   resolveActiveConversationTurn,
   resolvePinnedConversationTurn,
-  shouldPlanShortcutReplaceTurn,
   summarizePlanIntent,
+  isPlanTaskAwaitingBrowserValidation,
+  isPlanTaskAwaitingExternalValidation,
   type ConversationTurn,
   type ReplyOption,
 } from "../lib/workflowModels";
@@ -199,6 +200,32 @@ function UserContextPillRow({
       })}
     </div>
   );
+}
+
+function getStageLabel(stage: any, language: "zh" | "en"): string {
+  const zh: any = {
+    idle: "待生成",
+    plan: "计划",
+    requirements: "需求",
+    design: "历史计划",
+    tasks: "任务",
+    bugfix: "修复",
+    ready_to_execute: "待执行",
+    executing: "执行中",
+    completed: "已完成",
+  };
+  const en: any = {
+    idle: "Idle",
+    plan: "Plan",
+    requirements: "Requirements",
+    design: "Legacy Plan",
+    tasks: "Tasks",
+    bugfix: "Bugfix",
+    ready_to_execute: "Ready",
+    executing: "Executing",
+    completed: "Completed",
+  };
+  return (language === "zh" ? zh : en)[stage] || String(stage);
 }
 
 function UserImagePreviewModal({
@@ -2375,6 +2402,10 @@ export default function ChatArea({
     generating: language === "zh" ? "生成中" : "Generating",
     modelUnselected: language === "zh" ? "未选择模型" : "No model selected",
     cloudLabel: language === "zh" ? "云端" : "Cloud",
+    taskTracking: language === "zh" ? "任务跟踪" : "Task Tracking",
+    noTasks: language === "zh" ? "暂无任务跟踪" : "No tasks to track",
+    autoValidation: language === "zh" ? "自动验证" : "Auto validation",
+    userValidation: language === "zh" ? "待用户验证" : "User validation",
   }), [language]);
   const activeCloudServer = useMemo(() => {
     const servers = Array.isArray(config.cloudServers) ? config.cloudServers : [];
@@ -2508,8 +2539,11 @@ export default function ChatArea({
   const [chatAreaHeight, setChatAreaHeight] = useState(0);
   const [isCapsuleCollapsed, setIsCapsuleCollapsed] = useState(false);
   const [showProgressPopover, setShowProgressPopover] = useState(false);
+  const [showTasksPopover, setShowTasksPopover] = useState(false);
   const popoverRef = useRef<HTMLDivElement>(null);
   const mButtonRef = useRef<HTMLButtonElement>(null);
+  const tasksPopoverRef = useRef<HTMLDivElement>(null);
+  const tasksButtonRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
     if (!showProgressPopover) return;
@@ -2531,7 +2565,27 @@ export default function ChatArea({
   }, [showProgressPopover]);
 
   useEffect(() => {
+    if (!showTasksPopover) return;
+    const handleDocumentClick = (e: MouseEvent) => {
+      const target = e.target as HTMLElement;
+      if (
+        tasksPopoverRef.current &&
+        !tasksPopoverRef.current.contains(target) &&
+        tasksButtonRef.current &&
+        !tasksButtonRef.current.contains(target)
+      ) {
+        setShowTasksPopover(false);
+      }
+    };
+    document.addEventListener("click", handleDocumentClick);
+    return () => {
+      document.removeEventListener("click", handleDocumentClick);
+    };
+  }, [showTasksPopover]);
+
+  useEffect(() => {
     setShowProgressPopover(false);
+    setShowTasksPopover(false);
   }, [isCapsuleCollapsed, activeSessionKey]);
 
   const lastTurnIdRef = useRef<string | undefined>(undefined);
@@ -2662,6 +2716,42 @@ export default function ChatArea({
     if (isPlanConversationTurn(capsuleControlTurn)) return [];
     return deriveTurnProgressItems(capsuleControlTurnBlocks, language);
   }, [language, capsuleControlTurn, capsuleControlTurnBlocks]);
+  const capsuleProgressMode = shouldShowPinnedPlanTasks ? "plan" : "execution";
+  const capsuleProgressItems = useMemo(() => {
+    if (capsuleProgressMode === "plan") {
+      return planTasks.map((task) => ({
+        id: task.id,
+        text: task.text,
+        complete: task.status === "completed" || task.status === "skipped",
+        status: task.status,
+        validationStatus: task.status === "completed"
+          ? "none"
+          : isPlanTaskAwaitingBrowserValidation(task, planExecutionEvidenceLedger)
+          ? "browser"
+          : isPlanTaskAwaitingExternalValidation(task, planExecutionEvidenceLedger)
+          ? "user"
+          : "none",
+      }));
+    }
+    return (capsuleControlExecutionSteps || []).map((step, idx) => ({
+      id: String(idx),
+      text: step.text,
+      complete: step.complete,
+      status: step.complete ? "completed" : "in_progress",
+      validationStatus: "none" as const,
+    }));
+  }, [capsuleProgressMode, planTasks, planExecutionEvidenceLedger, capsuleControlExecutionSteps]);
+  const capsuleHasTasks = capsuleProgressItems.length > 0;
+  
+  const auditedPlanTasks = useMemo(() => buildPlanTaskEvidenceAudit({ tasks: planTasks, evidenceLedger: planExecutionEvidenceLedger }).tasks, [planTasks, planExecutionEvidenceLedger]);
+  const currentPlanTaskIndex = useMemo(() => {
+    if (capsuleProgressMode !== "plan" || auditedPlanTasks.length === 0) return -1;
+    const firstIncompleteIndex = auditedPlanTasks.findIndex((task) => !(task.evidenceStatus === "satisfied" && task.status === "completed"));
+    return firstIncompleteIndex >= 0 ? firstIncompleteIndex : auditedPlanTasks.length - 1;
+  }, [capsuleProgressMode, auditedPlanTasks]);
+
+  const capsuleCompletedCount = capsuleProgressItems.filter((item) => item.complete).length;
+  const capsuleProgress = capsuleProgressItems.length > 0 ? Math.round((capsuleCompletedCount / capsuleProgressItems.length) * 100) : 0;
   const composerPaddingBottom = composerHeight + 32;
   const capsuleTurn = capsuleControlTurn || activeTurn;
   const capsuleTurnBlocks = capsuleTurn
@@ -3267,8 +3357,6 @@ export default function ChatArea({
       turn.status === "awaiting_approval" ||
       isPlanApproved;
     const hasCompletePlan = hasPlanContent && planTurnFinished;
-    const planShortcutVisible = shouldPlanShortcutReplaceTurn({ isPlanTurn, hasCompletePlan, isPlanExecutionVisible }) ||
-      (isPlanExecutionVisible && hasCompletePlan);
     const finalAgentSummaryText = getLastAgentSummaryText(blocks);
     const planProgressSummary = turnProgressSnapshot
       ? summarizePlanExecutionProgressSnapshot(turnProgressSnapshot, language)
@@ -3660,16 +3748,6 @@ export default function ChatArea({
             null
           ) : (
             <React.Fragment key="turn-details">
-              {planShortcutVisible && (
-                <PlanShortcutCard
-                  key="plan-shortcut-card"
-                  turn={turn}
-                  hasPlanContent={hasPlanContent}
-                  canOpenPlan={hasPlanPanelContent && hasPlanContent}
-                  onOpenPlan={() => openRightPanelTab("plan")}
-                  copy={copy}
-                />
-              )}
               {shouldArchiveCompletedProcess ? (
                 <React.Fragment key="archived-process">
                   {hasProposalCheckpoint && proposalCheckpointBlock && (
@@ -4223,6 +4301,110 @@ export default function ChatArea({
               )}
             </div>
           )}
+          {showTasksPopover && !isCapsuleCollapsed && (
+            <div
+              ref={tasksPopoverRef}
+              data-testid="tasks-progress-popover"
+              className={`pointer-events-auto mb-3 w-full max-w-xl rounded-2xl border p-4 backdrop-blur-md text-left transition-all duration-200 ${
+                isLightThemeMode
+                  ? "border-[#d4d4d8] bg-white/95 shadow-[0_12px_40px_rgba(0,0,0,0.12)] text-[#18181b]"
+                  : isBlackThemeMode
+                  ? "border-[#202026] bg-[#030304]/95 shadow-[0_12px_40px_rgba(0,0,0,0.95)] text-[#e7e7ea]"
+                  : "border-[var(--accent-subtle-border)] bg-[rgba(9,9,11,0.95)] shadow-[0_12px_40px_rgba(0,0,0,0.85)] text-[#e4e4e7]"
+              }`}
+              style={{
+                fontSize: `${Math.max(11, resolvedChatFontSize - 1)}px`,
+              }}
+            >
+              <div className={`flex items-center justify-between border-b pb-2 mb-2 ${
+                isLightThemeMode ? "border-[#e4e4e7]" : "border-[rgba(255,255,255,0.08)]"
+              }`}>
+                <span className="font-mono text-[11px] uppercase tracking-[0.14em] text-[var(--accent-light)] font-semibold">
+                  {copy.taskTracking}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setShowTasksPopover(false)}
+                  className={`rounded p-1 transition-colors ${
+                    isLightThemeMode
+                      ? "text-[#71717a] hover:bg-[#f4f4f5] hover:text-[#18181b]"
+                      : "text-[#71717a] hover:bg-[rgba(255,255,255,0.06)] hover:text-white"
+                  }`}
+                >
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                </button>
+              </div>
+
+              {!capsuleHasTasks ? (
+                <div className="py-6 text-center text-[#71717a] italic">
+                  {copy.noTasks}
+                </div>
+              ) : (
+                <div className="max-h-[220px] overflow-y-auto space-y-2 pr-1">
+                  {(() => {
+                    const taskRowClass = isLightThemeMode
+                      ? "border-[rgba(15,23,42,0.10)] bg-[rgba(255,255,255,0.68)]"
+                      : isBlackThemeMode
+                      ? "border-[#202026] bg-[#030304]"
+                      : "border-[#202026] bg-[#09090b]";
+                    const currentTaskRowClass = isLightThemeMode
+                      ? "border-[color-mix(in_srgb,var(--accent-hover)_48%,rgba(15,23,42,0.12))] bg-[rgba(255,255,255,0.68)] shadow-[inset_3px_0_0_color-mix(in_srgb,var(--accent-hover)_72%,transparent)]"
+                      : isBlackThemeMode
+                      ? "border-[color-mix(in_srgb,var(--accent-light)_46%,#202026)] bg-[#030304] shadow-[inset_3px_0_0_color-mix(in_srgb,var(--accent-light)_72%,transparent)]"
+                      : "border-[color-mix(in_srgb,var(--accent-light)_46%,#202026)] bg-[#09090b] shadow-[inset_3px_0_0_color-mix(in_srgb,var(--accent-light)_72%,transparent)]";
+                    
+                    return capsuleProgressItems.map((task, index) => {
+                      const isCurrentPlanTask = capsuleProgressMode === "plan" && index === currentPlanTaskIndex && !task.complete;
+                      return (
+                        <div
+                          key={`${task.id}-${index}`}
+                          data-testid={isCurrentPlanTask ? "execution-capsule-current-plan-task" : undefined}
+                          className={`flex items-start gap-3 rounded-xl border px-3 py-2 transition-colors ${
+                            isCurrentPlanTask ? currentTaskRowClass : taskRowClass
+                          }`}
+                        >
+                          <span
+                            className={`mt-1 h-3.5 w-3.5 shrink-0 rounded-full border flex items-center justify-center ${
+                              task.complete
+                                ? "border-[#34d399] bg-[#34d399] text-[#050507]"
+                              : task.status === "in_progress"
+                              ? "border-[#60a5fa] bg-[#60a5fa]"
+                              : task.status === "failed"
+                              ? "border-[#f87171] bg-[#f87171]"
+                              : "border-[#3f3f46] bg-transparent"
+                            }`}
+                          >
+                            {task.complete && (
+                              <svg className="h-2 w-2" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                                <path d="M2.5 6L5 8.5L9.5 3.5" />
+                              </svg>
+                            )}
+                          </span>
+                          <div className={`min-w-0 text-[12px] leading-6 ${isLightThemeMode ? "text-[#18181b]" : "text-[#f5f5f5]"}`}>
+                            <div className="flex items-start gap-2">
+                              <span className="mt-[2px] shrink-0 text-[12px] font-medium">{index + 1}.</span>
+                              <div className="min-w-0 flex-1 [&_.markdown-body]:text-[12px] [&_.markdown-body]:leading-6 [&_.markdown-body_p]:mb-0 [&_.markdown-body_p]:text-inherit [&_.markdown-body_strong]:text-inherit [&_.markdown-body_code]:align-baseline">
+                                <MarkdownRenderer content={task.text} baseFontSize={12} />
+                                {capsuleProgressMode === "plan" && task.validationStatus !== "none" && !task.complete && (
+                                  <div className={`mt-1 text-[10px] leading-4 ${
+                                    task.validationStatus === "user" ? "text-[#fbbf24]" : "text-[#93c5fd]"
+                                  }`}>
+                                    {task.validationStatus === "user" ? copy.userValidation : copy.autoValidation}
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    });
+                  })()}
+                </div>
+              )}
+            </div>
+          )}
           {(() => {
             const isRich = hasCapsuleFlow && (persistedExplanation.includes("#") || persistedExplanation.includes("\n"));
             const headerLabel = hasCapsuleFlow
@@ -4258,6 +4440,7 @@ export default function ChatArea({
                             onClick={(e) => {
                               e.stopPropagation();
                               setShowProgressPopover(!showProgressPopover);
+                              setShowTasksPopover(false);
                             }}
                             className="shrink-0 mr-2.5 flex items-center justify-center h-6 w-6 rounded-full border border-[var(--accent-subtle-border)] bg-[var(--accent-subtle)] group hover:bg-[var(--accent)] hover:border-transparent hover:scale-105 active:scale-95 transition-all cursor-pointer"
                             title={language === "zh" ? "查看有效进展" : "View Effective Progress"}
@@ -4268,6 +4451,24 @@ export default function ChatArea({
                             {headerLabel}
                           </span>
                         </div>
+
+                        {capsuleHasTasks && (
+                          <button
+                            ref={tasksButtonRef}
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setShowTasksPopover(!showTasksPopover);
+                              setShowProgressPopover(false);
+                            }}
+                            title={language === "zh" ? "任务跟踪" : "Task Tracking"}
+                            className="shrink-0 ml-3 flex items-center justify-center p-1.5 rounded-md border border-[var(--accent-subtle-border)] bg-[color-mix(in_srgb,var(--accent)_10%,transparent)] text-[var(--accent-light)] transition-all hover:bg-[var(--accent)] hover:text-[#ffffff] hover:border-transparent active:scale-95 cursor-pointer"
+                          >
+                            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
+                            </svg>
+                          </button>
+                        )}
 
                         <button
                           onClick={(e) => {

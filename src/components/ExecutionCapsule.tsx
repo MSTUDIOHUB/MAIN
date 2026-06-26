@@ -159,6 +159,19 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
 }: ExecutionCapsuleProps) {
   const [customReplyText, setCustomReplyText] = useState("");
   const [planAdjustmentText, setPlanAdjustmentText] = useState("");
+  const [isApproving, setIsApproving] = useState(false);
+
+  useEffect(() => {
+    if (planStage === "executing" || isRunActive) {
+      setIsApproving(false);
+    }
+  }, [planStage, isRunActive]);
+
+  const handleApprovePlan = () => {
+    if (isApproving || isRunActive || planStage === "executing") return;
+    setIsApproving(true);
+    onApprovePlan();
+  };
 
   const [activeTabIdx, setActiveTabIdx] = useState(0);
   const [tabSelections, setTabSelections] = useState<Record<string, string[]>>({});
@@ -395,7 +408,7 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
 
   const isBlackTheme = themeMode === "black";
   const activeRunOutline = isRunActive
-    ? "rounded-2xl ring-1 ring-[var(--accent)] ring-offset-1 ring-offset-transparent"
+    ? "rounded-2xl border border-[var(--accent)]"
     : "";
   const primaryText = themeMode === "light" ? "text-[#111827]" : "text-[#f5f5f5]";
   const secondaryText = themeMode === "light" ? "text-[#4b5563]" : "text-[#71717a]";
@@ -462,7 +475,6 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
     >
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="min-w-0 flex flex-wrap items-center gap-2">
-            <span className={`truncate text-[13px] font-semibold ${primaryText}`}>{title}</span>
             <span className={`shrink-0 rounded-full border px-2 py-0.5 text-[10px] ${statusToneClass}`}>{status}</span>
             {hasTasks && (
               <span data-testid={activeProgressMode === "execution" ? "execution-capsule-execution-badge" : "execution-capsule-plan-badge"} className="theme-plan-pill shrink-0 rounded-full border px-2 py-0.5 text-[10px]">
@@ -590,91 +602,7 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
               </div>
             )}
 
-            {hasTasks && (
-              <div data-testid={activeProgressMode === "execution" ? "execution-capsule-execution-progress" : "execution-capsule-plan-progress"} className={`${showPendingRunDecision ? "mt-3 " : ""}rounded-2xl border p-3 ${surface}`}>
-                <div className="flex items-center justify-between gap-3">
-                  <div className={`text-[12px] font-medium ${primaryText}`}>{copy.taskSummary}</div>
-                  <div className="flex items-center gap-2">
-                    <span className={`text-[11px] ${secondaryText}`}>
-                      {activeProgressMode === "execution" ? copy.executionStage : getStageLabel(planStage, language)}
-                    </span>
-                    {activeProgressMode === "plan" && (
-                      <button
-                        onClick={onOpenPlan}
-                        className="theme-plan-button rounded-full border px-3 py-1 text-[11px] transition-colors"
-                      >
-                        <span className="inline-flex items-center gap-1.5">
-                          <IconFileText className="h-3.5 w-3.5" />
-                          {copy.openPlan}
-                        </span>
-                      </button>
-                    )}
-                  </div>
-                </div>
-                <div className="mt-3 h-2 overflow-hidden rounded-full bg-[#18181b]">
-                  <div
-                    className="theme-plan-progress h-full rounded-full transition-all duration-300"
-                    style={{ width: `${progress}%` }}
-                  />
-                </div>
-                {shouldCompactTasksForReview && (
-                  <div className={`mt-2 text-[11px] ${secondaryText}`}>
-                    {language === "zh"
-                      ? "已有待审批工具，任务明细已收起。"
-                      : "Task details are collapsed while a tool review is pending."}
-                  </div>
-                )}
-                {!shouldCompactTasksForReview && (
-                <div className="mt-3 max-h-[220px] space-y-2 overflow-y-auto pr-1">
-                  {visibleTasks.map((task, index) => {
-                    const isCurrentPlanTask = activeProgressMode === "plan" && index === currentPlanTaskIndex && !task.complete;
-                    return (
-                      <div
-                        key={`${task.id}-${index}`}
-                        data-testid={isCurrentPlanTask ? "execution-capsule-current-plan-task" : undefined}
-                        className={`flex items-start gap-3 rounded-xl border px-3 py-2 transition-colors ${
-                          isCurrentPlanTask ? currentTaskRowClass : taskRowClass
-                        }`}
-                      >
-                        <span
-                          className={`mt-1 h-3.5 w-3.5 shrink-0 rounded-full border flex items-center justify-center ${
-                            task.complete
-                              ? "border-[#34d399] bg-[#34d399] text-[#050507]"
-                            : task.status === "in_progress"
-                            ? "border-[#60a5fa] bg-[#60a5fa]"
-                            : task.status === "failed"
-                            ? "border-[#f87171] bg-[#f87171]"
-                            : "border-[#3f3f46] bg-transparent"
-                          }`}
-                        >
-                          {task.complete && (
-                            <svg className="h-2 w-2" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                              <path d="M2.5 6L5 8.5L9.5 3.5" />
-                            </svg>
-                          )}
-                        </span>
-                        <div className={`min-w-0 text-[12px] leading-6 ${primaryText}`}>
-                          <div className="flex items-start gap-2">
-                            <span className="mt-[2px] shrink-0 text-[12px] font-medium">{index + 1}.</span>
-                            <div className="min-w-0 flex-1 [&_.markdown-body]:text-[12px] [&_.markdown-body]:leading-6 [&_.markdown-body_p]:mb-0 [&_.markdown-body_p]:text-inherit [&_.markdown-body_strong]:text-inherit [&_.markdown-body_code]:align-baseline">
-                              <MarkdownRenderer content={task.text} baseFontSize={12} />
-                              {activeProgressMode === "plan" && task.validationStatus !== "none" && !task.complete && (
-                                <div className={`mt-1 text-[10px] leading-4 ${
-                                  task.validationStatus === "user" ? "text-[#fbbf24]" : "text-[#93c5fd]"
-                                }`}>
-                                  {task.validationStatus === "user" ? copy.userValidation : copy.autoValidation}
-                                </div>
-                              )}
-                            </div>
-                          </div>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-                )}
-              </div>
-            )}
+
 
             {showAwaitingChoice && (
               <div data-testid="execution-capsule-awaiting-choice" className={`mt-3 rounded-2xl border p-3 ${surface}`}>
@@ -975,11 +903,11 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
                         : "The current plan is ready. Approving it enables execution tools while keeping write and command steps review-gated."}
                       </div>
                     </div>
-                    <div className="mt-3 flex flex-col gap-2 px-1 sm:flex-row sm:items-center sm:justify-end">
+                    <div className="mt-3 flex flex-wrap items-center justify-end gap-2 px-1">
                       <form
                         onSubmit={submitPlanAdjustment}
                         data-testid="execution-capsule-plan-adjust-form"
-                        className="flex w-full min-w-0 flex-1 items-center gap-2 sm:mr-auto"
+                        className="flex w-full min-w-0 flex-1 items-center gap-2"
                       >
                         <div className="min-w-0 flex-1">
                           <input
@@ -996,7 +924,7 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
                           type="submit"
                           data-testid="execution-capsule-plan-adjust-submit"
                           disabled={!normalizedPlanAdjustment || !onRequestPlanAdjustment}
-                          className={`shrink-0 rounded-lg border px-3 py-2 text-[12px] font-medium transition-colors ${
+                          className={`flex-1 min-w-0 text-center rounded-lg border px-3 py-2 text-[12px] font-medium transition-colors ${
                             normalizedPlanAdjustment && onRequestPlanAdjustment
                               ? "theme-plan-button"
                               : "cursor-not-allowed border-[#3f3f46] bg-[#09090b] text-[#71717a]"
@@ -1008,7 +936,7 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
                       <button
                         data-testid="execution-capsule-plan-reject-keep"
                         onClick={onRejectPlan}
-                        className="rounded-lg border border-[#3f3f46] bg-[#09090b] px-4 py-2 text-[12px] font-medium text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#f5f5f5]"
+                        className="flex-1 min-w-0 text-center rounded-lg border border-[#3f3f46] bg-[#09090b] px-4 py-2 text-[12px] font-medium text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#f5f5f5]"
                       >
                         {copy.rejectAndKeepPlan}
                       </button>
@@ -1016,15 +944,18 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
                         <button
                           data-testid="execution-capsule-plan-reject-delete"
                           onClick={onRejectAndDeletePlan}
-                          className="rounded-lg border border-[rgba(244,63,94,0.35)] bg-[#09090b] px-4 py-2 text-[12px] font-medium text-[#fb7185] transition-colors hover:bg-[rgba(244,63,94,0.12)] hover:text-[#fecdd3]"
+                          className="flex-1 min-w-0 text-center rounded-lg border border-[rgba(244,63,94,0.35)] bg-[#09090b] px-4 py-2 text-[12px] font-medium text-[#fb7185] transition-colors hover:bg-[rgba(244,63,94,0.12)] hover:text-[#fecdd3]"
                         >
                           {copy.rejectAndDeletePlan}
                         </button>
                       )}
                       <button
                         data-testid="execution-capsule-plan-approve"
-                        onClick={onApprovePlan}
-                        className="theme-plan-primary rounded-lg px-4 py-2 text-[12px] font-semibold"
+                        onClick={handleApprovePlan}
+                        disabled={isApproving || isRunActive || planStage === "executing"}
+                        className={`flex-1 min-w-0 text-center theme-plan-primary rounded-lg px-4 py-2 text-[12px] font-semibold ${
+                          (isApproving || isRunActive || planStage === "executing") ? "opacity-50 cursor-not-allowed" : ""
+                        }`}
                       >
                         {copy.approvePlan}
                       </button>

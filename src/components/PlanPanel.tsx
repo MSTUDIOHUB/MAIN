@@ -187,6 +187,19 @@ export default function PlanPanel({
   const copy = COPY[language];
   const [activeArtifactPath, setActiveArtifactPath] = useState<string>(artifacts[artifacts.length - 1]?.path || "");
   const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const [isApproving, setIsApproving] = useState(false);
+
+  useEffect(() => {
+    if (isApproved) {
+      setIsApproving(false);
+    }
+  }, [isApproved]);
+
+  const handleApprove = () => {
+    if (isApproving || isApproved) return;
+    setIsApproving(true);
+    onApprove();
+  };
 
   useEffect(() => {
     if (!artifacts.length) {
@@ -505,8 +518,11 @@ export default function PlanPanel({
                 )}
                 <button
                   data-testid="plan-approve-button"
-                  onClick={onApprove}
-                  className="theme-plan-primary rounded-lg px-4 py-2 text-[12px] font-semibold"
+                  onClick={handleApprove}
+                  disabled={isApproving || isApproved}
+                  className={`theme-plan-primary rounded-lg px-4 py-2 text-[12px] font-semibold ${
+                    (isApproving || isApproved) ? "opacity-50 cursor-not-allowed" : ""
+                  }`}
                 >
                   {copy.approvePlan}
                 </button>

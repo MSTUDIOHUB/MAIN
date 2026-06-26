@@ -582,6 +582,22 @@ export class WorkflowEngine {
             agentBlocksCreatedThisRun: context.agentBlockIdsCreatedThisRun.size,
             taskFlowBlocks: sessionGet().taskFlow.length,
           });
+          
+          // For quality_gate resets: only reset the stream buffer, keep already-displayed content.
+          // This prevents the "content appears then disappears" effect when a plan fails validation.
+          if (resetType === "quality_gate") {
+            // Only reset the streaming buffer, not the displayed content
+            context.streamingAssistantDisplayBuffer = "";
+            context.firstStreamTokenAt = null;
+            context.streamTokenCount = 0;
+            context.streamTextChars = 0;
+            if (thinkingInterceptor) {
+              thinkingInterceptor.reset();
+            }
+            return;
+          }
+          
+          // Standard reset behavior for other reset types (evidence_recovery, unknown, etc.)
           streamBuffer.reset();
           if (thinkingInterceptor) {
             thinkingInterceptor.reset();

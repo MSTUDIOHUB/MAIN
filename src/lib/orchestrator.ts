@@ -501,6 +501,10 @@ export function emitToolPreflightBlocked(
     message: string;
     toolCallId?: string;
     lifecycleState?: ToolLifecycleState;
+    evidenceChain?: {
+      recentToolActivity: string;
+      evidenceKeys: string[];
+    };
   },
 ): void {
   const payload = {
@@ -510,6 +514,7 @@ export function emitToolPreflightBlocked(
     message: compactDiagnosticText(input.message),
     toolCallId: input.toolCallId || null,
     lifecycleState: input.lifecycleState || "blocked",
+    evidenceChain: input.evidenceChain || null,
   };
   logAgentEvent("tool_preflight_blocked", payload);
   callbacks.onDebugEvent?.("agent.tool_preflight_blocked", payload);
@@ -2867,6 +2872,8 @@ interface PlanMaterializationResultForLoop {
   reason?: string;
   source?: PlanMaterializationSource;
   toolResult?: ToolExecutionResult;
+  /** Extracted reply options from <user_options> blocks. */
+  replyOptions?: string[];
 }
 
 async function writeMaterializedPlanArtifact(input: {
@@ -3830,6 +3837,7 @@ export async function autoMaterializePlanArtifactFromVisibleText(input: {
     return {
       ok: false,
       reason: materialized.reason || "quality_gate",
+      replyOptions: materialized.replyOptions,
     };
   }
 

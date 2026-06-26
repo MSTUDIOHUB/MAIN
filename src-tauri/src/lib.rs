@@ -190,7 +190,6 @@ fn record_debug_log(app: &AppHandle, level: &str, source: &str, message: impl As
         source: source.to_string(),
         message: message.as_ref().to_string(),
     };
-    println!("[{}] {}", payload.source, payload.message);
     let _ = append_debug_log_line(app, &payload);
     let _ = app.emit("main-debug-log", payload);
 }

@@ -25,6 +25,10 @@ const UNEXPECTED_SHORT_SCRIPT_RE =
   /[\u0900-\u097F\u0590-\u05FF\u0600-\u06FF\u0E00-\u0E7F\u3040-\u30FF\uAC00-\uD7AF]/;
 
 function shouldGateStreamingText(input: StreamingAssistantDisplayInput): boolean {
+  // Plan mode: gate on protocol fragments and unstable short text only.
+  // Previously: plan mode gated all output, causing short structured plans
+  // to be hidden behind buffering. Now we allow stable markdown content to
+  // show immediately while still filtering out noise and partial output.
   if (input.workflowMode === "plan") return true;
   const intent = String(input.runIntent || "");
   return intent === "execute" || intent === "studio_workflow" || intent === "plan";
@@ -56,6 +60,7 @@ export function resolveStreamingAssistantDisplay(
     return { action: "show", text: sanitized };
   }
 
+  // Protocol fragments are always buffered regardless of gating mode
   if (PARTIAL_PROTOCOL_RE.test(raw) && !hasStableMarkdownShape(sanitized)) {
     return { action: "buffer", text: "", bufferText: raw, reason: "protocol_fragment" };
   }
@@ -68,6 +73,12 @@ export function resolveStreamingAssistantDisplay(
     !LATIN_OR_CJK_RE.test(compact)
   ) {
     return { action: "buffer", text: "", bufferText: raw, reason: "unexpected_short_script" };
+  }
+
+  // Plan mode: show content immediately if it has stable markdown shape or is long enough.
+  // This prevents the "content appears then disappears" effect from unnecessary buffering.
+  if (input.workflowMode === "plan" && (hasStableMarkdownShape(sanitized) || compact.length >= 24)) {
+    return { action: "show", text: sanitized, reason: "plan_mode_stable_content" };
   }
 
   if (
