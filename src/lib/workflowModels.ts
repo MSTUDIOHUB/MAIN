@@ -448,7 +448,6 @@ export interface NormalizedStreamState {
 
 const TITLE_META_PREFIX_RE =
   /^(?:@\S+\s+)?(?:[A-Za-z][\w.-]{0,31}\s*@?\s*[:：-]\s*)?(?:(?:\d{2,4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2})\s+)?\d{1,2}:\d{2}(?::\d{2})?\s*/;
-const TITLE_INTENT_PREFIX_RE = /^(?:当前查看|viewing)\s*/i;
 const TITLE_MODE_PREFIX_RE =
   /^(?:回复|respond|讨论|discuss|计划|plan|直接执行|execute|总结|summarize|报告|report|Game Studio 工作流|Game Studio Workflow)\s*[:：-]\s*/i;
 const TITLE_REASONING_LEAK_RE =
@@ -473,7 +472,6 @@ export function normalizeConversationDisplayTitle(
     .trim();
 
   const stripped = base
-    .replace(TITLE_INTENT_PREFIX_RE, "")
     .replace(TITLE_MODE_PREFIX_RE, "")
     .replace(TITLE_META_PREFIX_RE, "")
     .replace(/^[\"'“”‘’]+|[\"'“”‘’]+$/g, "")

@@ -2356,7 +2356,6 @@ export default function ChatArea({
     planLabel: language === "zh" ? "计划" : "Plan",
     stopLabel: language === "zh" ? "停止" : "Stop",
     processingLabel: language === "zh" ? "处理中..." : "Processing...",
-    currentView: language === "zh" ? "当前查看" : "Viewing",
     turnDetails: language === "zh" ? "回合详情" : "Turn Details",
     openPlan: language === "zh" ? "打开计划" : "Open Plan",
     viewPlan: language === "zh" ? "查看计划" : "View Plan",

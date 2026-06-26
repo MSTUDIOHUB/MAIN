@@ -316,7 +316,6 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
   const visibleTasks = shouldCompactTasksForReview ? [] : progressItems;
 
   const copy = useMemo(() => ({
-    viewing: language === "zh" ? "当前查看" : "Viewing",
     tasks: language === "zh" ? "任务" : "Tasks",
     steps: language === "zh" ? "步骤" : "Steps",
     pendingReview: language === "zh" ? "待审批" : "Pending Review",
@@ -463,7 +462,6 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
     >
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="min-w-0 flex flex-wrap items-center gap-2">
-            <span className="shrink-0 text-[10px] uppercase tracking-[0.18em] text-[#71717a]">{copy.viewing}</span>
             <span className={`truncate text-[13px] font-semibold ${primaryText}`}>{title}</span>
             <span className={`shrink-0 rounded-full border px-2 py-0.5 text-[10px] ${statusToneClass}`}>{status}</span>
             {hasTasks && (

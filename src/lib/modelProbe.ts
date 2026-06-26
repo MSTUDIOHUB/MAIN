@@ -19,6 +19,7 @@ export function analyzeProbeResponse(
   const trimmed = response.trim();
   const result: Partial<ModelCapabilities> = {};
 
+  // Language detection
   if (response.includes("中文") || response.includes("简体中文")) {
     result.responseLanguage = "zh";
     if (probeLanguage === "zh") result.instructionLanguage = "zh";
@@ -27,16 +28,31 @@ export function analyzeProbeResponse(
     if (probeLanguage === "en") result.instructionLanguage = "en";
   }
 
-  // Length compliance as quantization indicator
-  if (probeLanguage === "zh" && trimmed.length > 80) {
-    result.likelyQuantized = true;
-    result.capabilityLevel = (trimmed.length > 300 ? 0 : 1) as 0 | 1;
-  } else if (probeLanguage === "en" && trimmed.length > 50) {
-    result.likelyQuantized = true;
-    result.capabilityLevel = (trimmed.length > 200 ? 0 : 1) as 0 | 1;
-  } else if (trimmed.length <= 5) {
-    result.capabilityLevel = Math.max(result.capabilityLevel ?? 2, 2) as 2 | 3;
+  // Capability detection: model was asked to output ≤3 chars
+  // Clean response (only the target word, minimal or zero extra chars) → strong
+  // Verbose response (explanations, greetings, extra text) → weaker
+  const isClean = (probeLanguage === "zh" && 
+    /^中文[。,.!！\s]*$/i.test(trimmed)) ||
+    (probeLanguage === "en" && 
+    /^english[。,.!!\s]*$/i.test(trimmed));
+
+  if (isClean) {
+    result.capabilityLevel = 3;
     result.likelyQuantized = false;
+  } else if (trimmed.length > 0) {
+    // Some response was given, but not clean — weak compliance
+    // Distinguish between quantized weakness (very short garbled) vs capability (verbose)
+    if (trimmed.length < 4) {
+      result.capabilityLevel = 1;
+      result.likelyQuantized = true;
+    } else {
+      result.capabilityLevel = 2;
+      result.likelyQuantized = false;
+    }
+  } else {
+    // Empty response
+    result.capabilityLevel = 1;
+    result.likelyQuantized = true;
   }
 
   if (!result.instructionLanguage) result.instructionLanguage = probeLanguage;
@@ -122,43 +138,28 @@ export function heuristicDetectCapabilities(
   const lower = model.toLowerCase();
   const isQuantized = /q[2-8]|8bit|6bit|4bit|nf4|awq|gptq|it[2-4]|gguf/i.test(lower);
 
-  if (isQuantized) {
-    return {
-      instructionLanguage: userLang === "en" ? "en" : "zh",
-      responseLanguage: userLang === "en" ? "en" : "zh",
-      capabilityLevel: 1,
-      likelyQuantized: true,
-      cacheKey: key,
-    };
-  }
+  // Detect model architecture size to determine base capability
+  // Strong models: identified by architecture name (GPT-4o, Claude, etc.) AND parameter count
+  const strongModelPattern = /(?:gpt-4o|gpt-4\b[^.0-9]|claude[-_]3\.?5?|gemma[._-]?2[._-]?27b|deepseek-v3|deepseek-r1|glm[-_]4)/i;
+  const strongSizePattern = /(?:qwen[2-9][._-]?[0-9]+[._-]?(?:72b|32b|14b|o[a-z]?)|qwen3(?:\.?[0-9]+)?[._-]?(?:35b|14b|32b|72b)|llama[._-]?3(?:\.1)?[._-]?(?:70b|67b|405b)|yi[._-]?(?:34b|34))/i;
 
-  const enPrimary = /gpt|claude|gemini|llama|mistral|deepseek|yi|internlm|mixtral/i.test(lower);
-  const zhPrimary = /qwen[0-9]|glm|chatglm/i.test(lower);
+  // Clean model name for size detection (remove quantization suffixes)
+  const cleanName = lower.replace(/(?:[-_][0-9]*bit|q[2-8]|nf4|awq|gptq|gguf|it[2-4]|fp[0-9])/g, "");
 
-  if (zhPrimary) {
-    return {
-      instructionLanguage: "zh",
-      responseLanguage: userLang === "en" ? "en" : "zh",
-      capabilityLevel: 3,
-      likelyQuantized: false,
-      cacheKey: key,
-    };
-  }
-  if (enPrimary) {
-    return {
-      instructionLanguage: "en",
-      responseLanguage: userLang === "en" ? "en" : "zh",
-      capabilityLevel: 3,
-      likelyQuantized: false,
-      cacheKey: key,
-    };
+  let baseCapability: number = 2; // default medium
+  if (strongModelPattern.test(cleanName) || strongModelPattern.test(lower)) {
+    baseCapability = 3;
+  } else if (strongSizePattern.test(cleanName) || strongSizePattern.test(lower)) {
+    baseCapability = 3;
+  } else if (/qwen[0-9]|glm[._-]?4|chatglm|llama[._-]?3\.0|llama[._-]?2|mistral[._-]?7b|yi[._-]?34|mixtral[._-]?8x7b|deepseek[-_]v2/i.test(cleanName) || /qwen[0-9]|glm[._-]?4|chatglm|llama[._-]?3\.0|llama[._-]?2|mistral[._-]?7b|yi[._-]?34|mixtral[._-]?8x7b|deepseek[-_]v2/i.test(lower)) {
+    baseCapability = 2;
   }
 
   return {
-    instructionLanguage: userLang === "en" ? "en" : "zh",
+    instructionLanguage: lower.includes("qwen") || lower.includes("glm") || lower.includes("chatglm") ? "zh" : userLang === "en" ? "en" : "zh",
     responseLanguage: userLang === "en" ? "en" : "zh",
-    capabilityLevel: 2,
-    likelyQuantized: false,
+    capabilityLevel: baseCapability as 0 | 1 | 2 | 3,
+    likelyQuantized: isQuantized,
     cacheKey: key,
   };
 }
@@ -194,8 +195,15 @@ export async function makeProbeCall(
   apiKey: string,
   signal?: AbortSignal,
 ): Promise<string> {
-  const isAnthropic = provider.toLowerCase().includes("anthropic") ||
-    provider.toLowerCase().includes("claude");
+  // Defensive check: refuse to probe known cloud providers
+  // (Orchestrator should skip probes for cloud profiles, but guard here too)
+  const providerLower = provider.toLowerCase();
+  if (/^openai|open_router|anthropic|google(?!ai_studio)/.test(providerLower)) {
+    throw new Error(`Probing cloud provider "${provider}" is not supported. Use heuristic fallback instead.`);
+  }
+
+  const isAnthropic = providerLower.includes("anthropic") ||
+    providerLower.includes("claude");
 
   let body: Record<string, unknown>;
   let url: string;

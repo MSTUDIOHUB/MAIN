@@ -1526,20 +1526,37 @@ export class AgentOrchestrator {
           callbacks.onContextMemoryBuilt?.(recoveryManagedResult.memoryState, recoveryManagedResult.memoryPacket);
           managedAgentMessages = recoveryManagedResult.messages as AgentMessage[];
           if (recoveryManagedResult.changed) {
-            callbacks.replaceMessages(managedAgentMessages);
-            callbacks.onContextCompress({
-              droppedCount: recoveryManagedResult.droppedCount,
-              droppedMessageCount: recoveryManagedResult.droppedMessageCount,
-              tokenCountBefore: recoveryManagedResult.tokenCountBefore,
-              tokenCountAfter: recoveryManagedResult.tokenCountAfter,
-              tokenReduction: recoveryManagedResult.tokenReduction,
-              compressedContext: recoveryManagedResult.compressedContext,
-              displaySummary: recoveryManagedResult.displaySummary,
-              memoryPacket: recoveryManagedResult.memoryPacket,
-              microCompactionKind: recoveryManagedResult.microCompactionKind,
-              microCompactedCount: recoveryManagedResult.microCompactedCount,
-              tokenBreakdown: recoveryManagedResult.tokenBreakdownBefore,
-            }, "execute_recovery");
+            try {
+              callbacks.replaceMessages(managedAgentMessages);
+            } catch (replaceErr) {
+              logAgentEvent('replace_messages_error', {
+                iteration,
+                error: (replaceErr as Error).message || String(replaceErr),
+                messagesLength: managedAgentMessages.length,
+                reason: 'execute_recovery_context_trim',
+              });
+            }
+            try {
+              callbacks.onContextCompress({
+                droppedCount: recoveryManagedResult.droppedCount,
+                droppedMessageCount: recoveryManagedResult.droppedMessageCount,
+                tokenCountBefore: recoveryManagedResult.tokenCountBefore,
+                tokenCountAfter: recoveryManagedResult.tokenCountAfter,
+                tokenReduction: recoveryManagedResult.tokenReduction,
+                compressedContext: recoveryManagedResult.compressedContext,
+                displaySummary: recoveryManagedResult.displaySummary,
+                memoryPacket: recoveryManagedResult.memoryPacket,
+                microCompactionKind: recoveryManagedResult.microCompactionKind,
+                microCompactedCount: recoveryManagedResult.microCompactedCount,
+                tokenBreakdown: recoveryManagedResult.tokenBreakdownBefore,
+              }, 'execute_recovery');
+            } catch (compressErr) {
+              logAgentEvent('on_context_compress_error', {
+                iteration,
+                error: (compressErr as Error).message || String(compressErr),
+                reason: 'execute_recovery_context_trim',
+              });
+            }
           }
           executeRecoveryContextAlreadyCompacted = true;
           logAgentEvent("execute_recovery_context_compacted", {
@@ -1675,8 +1692,17 @@ export class AgentOrchestrator {
             packetChars: managedResult.memoryPacket.length,
           });
           managedAgentMessages = managedResult.messages as AgentMessage[];
-          if (managedResult.changed) {
-            callbacks.replaceMessages(managedAgentMessages);
+          try {
+            if (managedResult.changed) {
+              callbacks.replaceMessages(managedAgentMessages);
+            }
+          } catch (replaceErr) {
+            logAgentEvent('replace_messages_error', {
+              iteration,
+              error: (replaceErr as Error).message || String(replaceErr),
+              messagesLength: managedAgentMessages.length,
+              reason: 'proactive_context_trim',
+            });
           }
           const compressionRatio = managedResult.tokenCountBefore > 0
             ? managedResult.tokenReduction / managedResult.tokenCountBefore
@@ -1686,20 +1712,28 @@ export class AgentOrchestrator {
             managedResult.tokenReduction >= 1024 ||
             compressionRatio >= 0.05;
           if (managedResult.changed && shouldAnnounceCompression) {
-            callbacks.onContextCompress({
-              droppedCount: managedResult.droppedCount,
-              droppedMessageCount: managedResult.droppedMessageCount,
-              tokenCountBefore: managedResult.tokenCountBefore,
-              tokenCountAfter: managedResult.tokenCountAfter,
-              tokenReduction: managedResult.tokenReduction,
-              compressedContext: managedResult.compressedContext,
-              displaySummary: managedResult.displaySummary,
-              memoryPacket: managedResult.memoryPacket,
-              microCompactionKind: managedResult.microCompactionKind,
-              microCompactedCount: managedResult.microCompactedCount,
-              tokenBreakdown: managedResult.tokenBreakdownBefore,
-            }, "proactive");
-            emitPlanExecutionProgress("context_compression");
+            try {
+              callbacks.onContextCompress({
+                droppedCount: managedResult.droppedCount,
+                droppedMessageCount: managedResult.droppedMessageCount,
+                tokenCountBefore: managedResult.tokenCountBefore,
+                tokenCountAfter: managedResult.tokenCountAfter,
+                tokenReduction: managedResult.tokenReduction,
+                compressedContext: managedResult.compressedContext,
+                displaySummary: managedResult.displaySummary,
+                memoryPacket: managedResult.memoryPacket,
+                microCompactionKind: managedResult.microCompactionKind,
+                microCompactedCount: managedResult.microCompactedCount,
+                tokenBreakdown: managedResult.tokenBreakdownBefore,
+              }, 'proactive');
+              emitPlanExecutionProgress('context_compression');
+            } catch (compressErr) {
+              logAgentEvent('on_context_compress_error', {
+                iteration,
+                error: (compressErr as Error).message || String(compressErr),
+                reason: 'proactive_context_trim',
+              });
+            }
           }
           logAgentEvent("context_pack_built", {
             messagesBefore: callbacks.getMessages().length,
@@ -1989,24 +2023,39 @@ export class AgentOrchestrator {
             );
             callbacks.onContextMemoryBuilt?.(aggressivelyManagedResult.memoryState, aggressivelyManagedResult.memoryPacket);
             const aggressivelyManaged = aggressivelyManagedResult.messages as AgentMessage[];
-            if (aggressivelyManagedResult.changed) {
+            try {
               callbacks.replaceMessages(aggressivelyManaged);
+            } catch (replaceErr) {
+              logAgentEvent('replace_messages_error', {
+                iteration,
+                error: (replaceErr as Error).message || String(replaceErr),
+                messagesLength: aggressivelyManaged.length,
+                reason: 'reactive_context_trim',
+              });
             }
             if (aggressivelyManagedResult.changed && aggressivelyManagedResult.tokenReduction > 0) {
-              callbacks.onContextCompress({
-                droppedCount: aggressivelyManagedResult.droppedCount,
-                droppedMessageCount: aggressivelyManagedResult.droppedMessageCount,
-                tokenCountBefore: aggressivelyManagedResult.tokenCountBefore,
-                tokenCountAfter: aggressivelyManagedResult.tokenCountAfter,
-                tokenReduction: aggressivelyManagedResult.tokenReduction,
-                compressedContext: aggressivelyManagedResult.compressedContext,
-                displaySummary: aggressivelyManagedResult.displaySummary,
-                memoryPacket: aggressivelyManagedResult.memoryPacket,
-                microCompactionKind: aggressivelyManagedResult.microCompactionKind,
-                microCompactedCount: aggressivelyManagedResult.microCompactedCount,
-                tokenBreakdown: aggressivelyManagedResult.tokenBreakdownBefore,
-              }, "reactive");
-              emitPlanExecutionProgress("context_compression");
+              try {
+                callbacks.onContextCompress({
+                  droppedCount: aggressivelyManagedResult.droppedCount,
+                  droppedMessageCount: aggressivelyManagedResult.droppedMessageCount,
+                  tokenCountBefore: aggressivelyManagedResult.tokenCountBefore,
+                  tokenCountAfter: aggressivelyManagedResult.tokenCountAfter,
+                  tokenReduction: aggressivelyManagedResult.tokenReduction,
+                  compressedContext: aggressivelyManagedResult.compressedContext,
+                  displaySummary: aggressivelyManagedResult.displaySummary,
+                  memoryPacket: aggressivelyManagedResult.memoryPacket,
+                  microCompactionKind: aggressivelyManagedResult.microCompactionKind,
+                  microCompactedCount: aggressivelyManagedResult.microCompactedCount,
+                  tokenBreakdown: aggressivelyManagedResult.tokenBreakdownBefore,
+                }, 'reactive');
+                emitPlanExecutionProgress('context_compression');
+              } catch (compressErr) {
+                logAgentEvent('on_context_compress_error', {
+                  iteration,
+                  error: (compressErr as Error).message || String(compressErr),
+                  reason: 'reactive_context_trim',
+                });
+              }
             }
 
             // Retry once with the compacted context
@@ -2085,21 +2134,38 @@ export class AgentOrchestrator {
               const emergencyManaged = emergencyManagedResult.messages as AgentMessage[];
 
               if (emergencyManagedResult.changed && emergencyManagedResult.tokenReduction > 0) {
-                callbacks.replaceMessages(emergencyManaged);
-                callbacks.onContextCompress({
-                  droppedCount: emergencyManagedResult.droppedCount,
-                  droppedMessageCount: emergencyManagedResult.droppedMessageCount,
-                  tokenCountBefore: emergencyManagedResult.tokenCountBefore,
-                  tokenCountAfter: emergencyManagedResult.tokenCountAfter,
-                  tokenReduction: emergencyManagedResult.tokenReduction,
-                  compressedContext: emergencyManagedResult.compressedContext,
-                  displaySummary: emergencyManagedResult.displaySummary,
-                  memoryPacket: emergencyManagedResult.memoryPacket,
-                  microCompactionKind: emergencyManagedResult.microCompactionKind,
-                  microCompactedCount: emergencyManagedResult.microCompactedCount,
-                  tokenBreakdown: emergencyManagedResult.tokenBreakdownBefore,
-                }, "reactive");
-                emitPlanExecutionProgress("context_compression");
+                try {
+                  callbacks.replaceMessages(emergencyManaged);
+                } catch (replaceErr) {
+                  logAgentEvent('replace_messages_error', {
+                    iteration,
+                    error: (replaceErr as Error).message || String(replaceErr),
+                    messagesLength: emergencyManaged.length,
+                    reason: 'emergency_context_trim',
+                  });
+                }
+                try {
+                  callbacks.onContextCompress({
+                    droppedCount: emergencyManagedResult.droppedCount,
+                    droppedMessageCount: emergencyManagedResult.droppedMessageCount,
+                    tokenCountBefore: emergencyManagedResult.tokenCountBefore,
+                    tokenCountAfter: emergencyManagedResult.tokenCountAfter,
+                    tokenReduction: emergencyManagedResult.tokenReduction,
+                    compressedContext: emergencyManagedResult.compressedContext,
+                    displaySummary: emergencyManagedResult.displaySummary,
+                    memoryPacket: emergencyManagedResult.memoryPacket,
+                    microCompactionKind: emergencyManagedResult.microCompactionKind,
+                    microCompactedCount: emergencyManagedResult.microCompactedCount,
+                    tokenBreakdown: emergencyManagedResult.tokenBreakdownBefore,
+                  }, 'reactive');
+                  emitPlanExecutionProgress('context_compression');
+                } catch (compressErr) {
+                  logAgentEvent('on_context_compress_error', {
+                    iteration,
+                    error: (compressErr as Error).message || String(compressErr),
+                    reason: 'emergency_context_trim',
+                  });
+                }
               }
 
               try {
@@ -2185,24 +2251,41 @@ export class AgentOrchestrator {
             );
             callbacks.onContextMemoryBuilt?.(cloudManagedResult.memoryState, cloudManagedResult.memoryPacket);
             const cloudManagedMessages = cloudManagedResult.messages as AgentMessage[];
-            if (cloudManagedResult.changed) {
-              callbacks.replaceMessages(cloudManagedMessages);
+            try {
+              if (cloudManagedResult.changed) {
+                callbacks.replaceMessages(cloudManagedMessages);
+              }
+            } catch (replaceErr) {
+              logAgentEvent('replace_messages_error', {
+                iteration,
+                error: (replaceErr as Error).message || String(replaceErr),
+                messagesLength: cloudManagedMessages.length,
+                reason: 'cloud_context_retry',
+              });
             }
             if (cloudManagedResult.changed && cloudManagedResult.tokenReduction > 0) {
-              callbacks.onContextCompress({
-                droppedCount: cloudManagedResult.droppedCount,
-                droppedMessageCount: cloudManagedResult.droppedMessageCount,
-                tokenCountBefore: cloudManagedResult.tokenCountBefore,
-                tokenCountAfter: cloudManagedResult.tokenCountAfter,
-                tokenReduction: cloudManagedResult.tokenReduction,
-                compressedContext: cloudManagedResult.compressedContext,
-                displaySummary: cloudManagedResult.displaySummary,
-                memoryPacket: cloudManagedResult.memoryPacket,
-                microCompactionKind: cloudManagedResult.microCompactionKind,
-                microCompactedCount: cloudManagedResult.microCompactedCount,
-                tokenBreakdown: cloudManagedResult.tokenBreakdownBefore,
-              }, "reactive");
-              emitPlanExecutionProgress("context_compression");
+              try {
+                callbacks.onContextCompress({
+                  droppedCount: cloudManagedResult.droppedCount,
+                  droppedMessageCount: cloudManagedResult.droppedMessageCount,
+                  tokenCountBefore: cloudManagedResult.tokenCountBefore,
+                  tokenCountAfter: cloudManagedResult.tokenCountAfter,
+                  tokenReduction: cloudManagedResult.tokenReduction,
+                  compressedContext: cloudManagedResult.compressedContext,
+                  displaySummary: cloudManagedResult.displaySummary,
+                  memoryPacket: cloudManagedResult.memoryPacket,
+                  microCompactionKind: cloudManagedResult.microCompactionKind,
+                  microCompactedCount: cloudManagedResult.microCompactedCount,
+                  tokenBreakdown: cloudManagedResult.tokenBreakdownBefore,
+                }, 'reactive');
+                emitPlanExecutionProgress('context_compression');
+              } catch (compressErr) {
+                logAgentEvent('on_context_compress_error', {
+                  iteration,
+                  error: (compressErr as Error).message || String(compressErr),
+                  reason: 'cloud_context_retry',
+                });
+              }
             }
 
             try {
@@ -2271,7 +2354,7 @@ export class AgentOrchestrator {
               buildCompatibilityRetryMessages(managedAgentMessages),
               workflowMode,
             );
-            callbacks.replaceMessages(compatibilityMessages);
+            try { callbacks.replaceMessages(compatibilityMessages); } catch (replaceErr) { logAgentEvent("replace_messages_error", { iteration, error: (replaceErr as Error).message || String(replaceErr), messagesLength: compatibilityMessages.length, reason: "compatibility_fallback" }); }
             logAgentEvent("native_tool_fallback", {
               iteration,
               nativeToolsAttempted: nativeToolsWereAttempted,
@@ -2332,7 +2415,7 @@ export class AgentOrchestrator {
                   compatibilityMessages,
                   workflowMode,
                 );
-                callbacks.replaceMessages(providerCompatibilityMessages);
+                try { callbacks.replaceMessages(providerCompatibilityMessages); } catch (replaceErr) { logAgentEvent("replace_messages_error", { iteration, error: (replaceErr as Error).message || String(replaceErr), messagesLength: providerCompatibilityMessages.length, reason: "provider_compatibility_retry" }); }
                 try {
                   streamResult = await fetchLLMStream(
                     providerCompatibilityMessages,
@@ -2377,7 +2460,7 @@ export class AgentOrchestrator {
                     managedAgentMessages,
                     workflowMode,
                   );
-                  callbacks.replaceMessages(transcriptMessages);
+                  try { callbacks.replaceMessages(transcriptMessages); } catch (replaceErr) { logAgentEvent("replace_messages_error", { iteration, error: (replaceErr as Error).message || String(replaceErr), messagesLength: transcriptMessages.length, reason: "transcript_retry" }); }
                   try {
                     streamResult = await fetchLLMStream(
                       transcriptMessages,

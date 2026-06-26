@@ -107,6 +107,24 @@ export function detectInstructionLanguage(
   return heuristicDetectCapabilities(model, preferredResponseLanguage).instructionLanguage;
 }
 
+// Resolve capability level: probe cache first, then heuristic fallback.
+function resolveCapabilityLevel(
+  model: string | undefined,
+  provider: string | undefined,
+  preferredResponseLanguage: Lang,
+): number {
+  if (!model) return 2;
+  const lower = model.toLowerCase();
+  // Check probe cache first
+  if (provider) {
+    const cacheKey = `probe:${provider.toLowerCase()}:${lower}`;
+    const cached = getCachedCapabilities(cacheKey);
+    if (cached) return cached.capabilityLevel;
+  }
+  // Fallback to heuristic
+  return heuristicDetectCapabilities(model, preferredResponseLanguage).capabilityLevel;
+}
+
 
 
 function normalizePromptEngine(engine?: string | null): "unity" | "godot" | "unreal" | null {
@@ -722,7 +740,7 @@ export function buildSystemPrompt(
           "1. Explore first: start with \`get_project_skeleton\`, then do targeted reads. Do not re-scan directories.",
           "2. Grounding: use screenshots, attachments, and @ files as primary evidence. State what you observe.",
           "3. Convergence: once evidence is sufficient, write \`.\.MAIN/plans/plan.md\` — include affected files, implementation steps, and validation. Short, decision-complete, directly actionable.",
-          "4. Ask only when truly blocked: use \`<user_options>\` for real branching decisions, not for 'continue reading' prompts.",
+          "4. Ask only at real decision forks: use \`<user_options>\` only when 2+ equally reasonable implementation paths, tech stack choices, or scope/priority trade-offs require user input. Never fake a question when nothing blocks progress.",
           "5. Write plan.md as your final action; do not continue exploring after the plan is complete.",
           "6. Plan artifacts rule: plan.md is mandatory; design.md is optional (evidence ledger); tasks.md belongs to execution only.",
           "7. If write tools are unavailable, output a visible \`<proposed_plan>\` in plain Markdown.",
@@ -731,7 +749,7 @@ export function buildSystemPrompt(
           "1. 先探索：先用 \`get_project_skeleton\` 建立项目地图，再做定向读取；不要重复扫目录。",
           "2. 证据优先：截图、附件、@ 文件是首要证据；先说明观察到的现象。",
           "3. 收敛写计划：证据足够后，用 \`write_file\` 或 \`replace_in_file\` 写入 \`.\.MAIN/plans/plan.md\` — 必须包含影响文件、实施步骤、验证方式；短小、可决策、可直接执行。",
-          "4. 只在真正阻塞时提问：用 \`<user_options>\` 给真实的分支选择，不是'继续读取'。",
+          "4. 只在真正需要用户决策的分叉点才用 \`<user_options>\`：当存在 2 个以上同等合理的实现路径、技术方案选型、或范围/优先级取舍时，必须给出选项让用户选择。不要在不阻塞时假装提问。",
           "5. 计划写完即停止：写入 plan.md 是本轮最后一件事，不要继续探索。",
           "6. 计划文件规则：plan.md 必选；design.md 可选（证据台账）；tasks.md 属于执行阶段。",
           "7. 写入工具不可用时，输出可见的 \`<proposed_plan>\` 纯文本方案。",
@@ -741,9 +759,11 @@ export function buildSystemPrompt(
     ].join("\n"));
 
     // P1 improvement: inject capability-aware hints into PLAN instructions.
-    const capabilityLevel = toolProtocolProfile?.model
-      ? heuristicDetectCapabilities(toolProtocolProfile.model, resolvedResponseLanguage).capabilityLevel
-      : 2;
+    const capabilityLevel = resolveCapabilityLevel(
+      toolProtocolProfile?.model ?? undefined,
+      toolProtocolProfile?.provider ?? undefined,
+      resolvedResponseLanguage,
+    );
     const capabilityHint = buildPlanCapabilityHints(capabilityLevel, planLang);
     if (capabilityHint) {
       parts.push(capabilityHint);

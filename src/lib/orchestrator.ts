@@ -2802,6 +2802,36 @@ export function buildReadFileRepeatLimitBatchPauseNotice(input: {
   ].join("\n");
 }
 
+// Build a patch-mismatch recovery hint. Returns null when there is no mismatch.
+// When apply_patch fails with context mismatch, this tells the model to
+// fall back to read_file + replace_in_file/write_file for precise editing.
+export function buildApplyPatchMismatchHint(
+  result: ToolExecutionResult,
+  language: "en" | "zh",
+): string | null {
+  const diagnostic = getToolResultDiagnosticText(result);
+  const isPatchMismatch = /search_text_mismatch|MUTATION_PREFLIGHT_BLOCKED|patch.*(?:mismatch|failed to apply)|replacement text was not found|context.*not.*found|Patch context/i.test(diagnostic) ||
+    (result.name === "apply_patch" && /invalid_patch|invalid patch/i.test(diagnostic));
+  if (!isPatchMismatch) return null;
+
+  if (language === "zh") {
+    return (
+      "apply_patch 上下文匹配失败。请使用以下策略重试：" +
+      "\n1. 先用 read_file 读取目标文件的最新内容" +
+      "\n2. 改用 replace_in_file 进行精确行替换，或使用 write_file 写入完整文件" +
+      "\n3. 确保 diff 中的 search_text 与文件实际内容完全一致"
+    );
+  }
+  return (
+    "apply_patch context match failed. Use this strategy to retry:" +
+    "\n1. First read_file to get the latest file content" +
+    "\n2. Switch to replace_in_file for precise line replacement, or write_file for full file write" +
+    "\n3. Ensure the diff search_text exactly matches the actual file content"
+  );
+}
+
+
+
 export function targetProgressOutcomeForToolResult(result?: ToolExecutionResult): TargetProgressOutcome {
   if (!result) return "failed";
   const diagnostic = getToolResultDiagnosticText(result);

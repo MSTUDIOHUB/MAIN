@@ -6238,6 +6238,8 @@ export const useAppStore = create<AppState>()(
         planAutoResumeCount: 0,
         planExecutionProgressSnapshot: initialProgressSnapshot,
         ...(executionPlanTasks.length > 0 ? { planTasks: executionPlanTasks } : {}),
+        agentStatus: "running",
+        isGenerating: true,
         planStage: "executing",
         conversationTurns: approvedTurnId
           ? s.conversationTurns.map((turn) =>
@@ -8816,14 +8818,14 @@ export const useAppStore = create<AppState>()(
           ? [
               "Continue the previous PLAN turn. The user is asking to keep going, not to start a new discussion.",
               originalPlanPrompt ? `Original plan request: ${originalPlanPrompt}` : "Original plan request: use the current conversation context.",
-              "Produce real planning progress now. If key choices remain, summarize them briefly and use <user_options>; otherwise create or update `.MAIN/plans/plan.md` with the decision-complete plan. Use requirements/design only as a short staged ledger for complex evidence tracking.",
+              "Produce real planning progress now. If key choices remain, summarize them in 2-3 bullets then use <user_options>; if all decisions are made, write plan.md directly without options. Use requirements/design only as a short staged ledger for complex evidence tracking.",
               "Keep plan.md concise: review-summary style, no tutorial prose, no full code listings, no repeated background.",
               text.trim() ? `Latest user message: ${text.trim()}` : "Latest user message: continue",
             ].join("\n")
           : [
               "请继续上一轮 PLAN 回合。用户是在要求继续推进，不是开启新的普通讨论。",
               originalPlanPrompt ? `上一轮计划请求：${originalPlanPrompt}` : "上一轮计划请求：请依据当前对话上下文继续。",
-              "现在必须产生实际规划进展。如果仍有关键选择需要用户确认，就先简短归纳并用面向用户的口吻给出 <user_options>；否则创建/更新 decision-complete 的 `.MAIN/plans/plan.md`。requirements/design 只作为复杂证据追踪的简短 staged ledger。",
+              "现在必须产生实际规划进展。如有关键决策需确认，先用 2-3 条摘要归纳再给出 <user_options>；如所有决策已完成，则直接写入 plan.md 无需选项。requirements/design 只作为复杂证据追踪的简短 staged ledger。",
               "每个 <option> 必须是用户点击后会发送的完整选择，不要写成“是否……”问题句。",
               "plan.md 要精简成 Codex app 交接计划风格：标题、摘要、关键实现改动、公共 API/接口/类型、测试方案、假设与默认值；不要写教程式长文、完整代码清单或重复背景。",
               text.trim() ? `用户最新消息：${text.trim()}` : "用户最新消息：继续",
