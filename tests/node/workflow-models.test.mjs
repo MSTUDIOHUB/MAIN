@@ -1572,7 +1572,7 @@ test("validateActionablePlanArtifact rejects blocking plan forks without user op
   assert.equal(result.reason, "blocking_plan_decision_without_user_options");
 });
 
-test("validateActionablePlanArtifact allows defaulted plan forks", () => {
+test("validateActionablePlanArtifact rejects user-visible decision forks even with a recommendation", () => {
   const plan = [
     "# CSV Dashboard 修复计划",
     "",
@@ -1590,6 +1590,7 @@ test("validateActionablePlanArtifact allows defaulted plan forks", () => {
     "- 方案 A：只修复 `src/App.tsx` 的导入后刷新调用。",
     "- 方案 B：同时重构 `src/store/dashboardStore.ts` 的状态入口。",
     "- 推荐方案 A：先做最小修复，避免扩大状态管理改动范围。",
+    "- 但这个取舍会影响最终行为与 UI 体验，需要用户确认。",
     "",
     "## 影响文件",
     "- `src/App.tsx`",
@@ -1604,6 +1605,104 @@ test("validateActionablePlanArtifact allows defaulted plan forks", () => {
     "",
     "## 测试方案",
     "- 运行 `npm run build` 并手动导入 CSV 验证指标更新。",
+    "",
+    "## 验证标准",
+    "- CSV 导入后 Dashboard 指标立即显示最新数据。",
+    "",
+    "## 假设与默认值",
+    "- 保持现有 CSV 文件格式不变。",
+  ].join("\n");
+
+  const fork = analyzePlanDecisionFork(plan);
+  const result = validateActionablePlanArtifact(plan);
+
+  assert.equal(fork.classification, "blocking");
+  assert.equal(fork.requiresUserOptions, true);
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "user_visible_decision_fork_without_options");
+});
+
+test("validateActionablePlanArtifact rejects startup UX forks even when plan recommends one option", () => {
+  const plan = [
+    "# 计划：修复双击 .md 文件打开时出现空白窗口的问题",
+    "",
+    "## 用户目标",
+    "检查用户通过系统打开 .md 文件时出现空白窗口和文件窗口的问题，并修复启动逻辑。",
+    "",
+    "## 摘要",
+    "- 已确认 Tauri setup 先创建默认窗口，再处理文件打开参数，导致用户看到额外空白窗口。",
+    "",
+    "## 已读证据",
+    "- `src-tauri/src/main.rs`：setup 中默认创建窗口。",
+    "- `src/main.js`：前端监听 file-open 事件加载文件。",
+    "",
+    "## 关键改动",
+    "- 方案 A：延迟窗口创建（推荐），有文件参数时只创建文件窗口。",
+    "- 方案 B：启动时显示\"开始\"面板，引导用户创建或打开文档。",
+    "- 推荐方案 A：先避免右键打开文件时出现额外窗口。",
+    "",
+    "## 影响文件",
+    "- `src-tauri/src/main.rs`",
+    "- `src/main.js`",
+    "",
+    "## 执行步骤",
+    "1. 根据确认的启动 UX 方案调整窗口创建时序。",
+    "2. 验证右键打开 .md 文件只显示目标文件窗口。",
+    "",
+    "## 公共 API / 接口 / 类型",
+    "- 不新增公共 API；仅调整内部启动路径。",
+    "",
+    "## 测试方案",
+    "- 运行 `npm run build` 并手动通过系统打开 .md 文件验证。",
+    "",
+    "## 验证标准",
+    "- 通过右键菜单打开 .md 文件时，直接显示文件内容，无空白窗口。",
+    "- 直接启动应用时，显示空白编辑器或\"开始\"面板。",
+    "",
+    "## 假设与默认值",
+    "- 保持现有文件读取和保存格式不变。",
+  ].join("\n");
+
+  const fork = analyzePlanDecisionFork(plan);
+  const result = validateActionablePlanArtifact(plan);
+
+  assert.equal(fork.classification, "blocking");
+  assert.equal(fork.requiresUserOptions, true);
+  assert.equal(fork.userVisibleDecision, true);
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "user_visible_decision_fork_without_options");
+});
+
+test("validateActionablePlanArtifact allows defaulted internal implementation forks", () => {
+  const plan = [
+    "# CSV Dashboard 修复计划",
+    "",
+    "## 用户目标",
+    "- 修复 CSV 导入后 Dashboard 指标没有正确更新的问题。",
+    "",
+    "## 摘要",
+    "- 已读取 `src/App.tsx` 和 `src/store/dashboardStore.ts`，确认导入完成后缺少状态刷新闭环。",
+    "",
+    "## 已读证据",
+    "- `src/App.tsx`：CSV 上传入口负责触发导入流程。",
+    "- `src/store/dashboardStore.ts`：Dashboard 指标来自 store 聚合状态。",
+    "",
+    "## 关键改动",
+    "- 方案 A：把刷新调用抽成一个本地 helper。",
+    "- 方案 B：直接在当前回调里补一行刷新。",
+    "- 推荐方案 A：便于后续复用，但两者对用户行为没有差异。",
+    "",
+    "## 影响文件",
+    "- `src/App.tsx`",
+    "",
+    "## 执行步骤",
+    "1. 采用方案 A 进行内部重构。",
+    "",
+    "## 公共 API / 接口 / 类型",
+    "- 默认不新增或修改公共 API、接口或类型。",
+    "",
+    "## 测试方案",
+    "- 运行 `npm run build`。",
     "",
     "## 验证标准",
     "- CSV 导入后 Dashboard 指标立即显示最新数据。",

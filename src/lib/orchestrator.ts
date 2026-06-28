@@ -3684,6 +3684,17 @@ async function executeToolCallWithLifecycle(
           : null;
         const recoveryAction = qualityResult?.recoveryAction || "rewrite";
         const missingSections = qualityResult?.missingSections || [];
+        const decisionFork = kind === "plan" ? analyzePlanDecisionFork(nextContent) : null;
+        if (decisionFork?.requiresUserOptions) {
+          logAgentEvent("plan_decision_fork_requires_user_input", {
+            path,
+            kind,
+            reason: validation.reason || decisionFork.reason || "decision_fork",
+            options: decisionFork.options,
+            recommendedDefault: decisionFork.recommendedDefault || null,
+            userVisibleDecision: decisionFork.userVisibleDecision === true,
+          });
+        }
         logAgentEvent("plan_artifact_quality_rejected", {
           path,
           kind,
@@ -3692,7 +3703,7 @@ async function executeToolCallWithLifecycle(
           recoveryAction,
           missingSections,
           canAutoRepair: qualityResult?.canAutoRepair ?? false,
-          ...(kind === "plan" ? { decisionFork: analyzePlanDecisionFork(nextContent) } : {}),
+          ...(decisionFork ? { decisionFork } : {}),
         });
 
         const shouldUseInternalFeedback =

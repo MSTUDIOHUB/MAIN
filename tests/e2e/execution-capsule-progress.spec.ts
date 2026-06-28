@@ -167,11 +167,22 @@ test("double-clicking plan approval does not create a queued instruction", async
     .poll(async () => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().conversationTurns ?? null))
     .toBe(1);
   await expect
-    .poll(async () => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().currentTurnExecutionConsent?.turnId ?? null))
-    .toBe("e2e-execution-capsule-panel-stability-turn");
+    .poll(async () => page.evaluate(() => {
+      const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+      const executionTurnId = snapshot?.pendingPlanApprovalHandoff?.executionTurnId ?? "";
+      const consentTurnId = snapshot?.currentTurnExecutionConsent?.turnId ?? "";
+      return Boolean(executionTurnId && consentTurnId === executionTurnId);
+    }))
+    .toBe(true);
   await expect
     .poll(async () => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().pendingPlanApprovalHandoff?.planTurnId ?? null))
     .toBe("e2e-execution-capsule-panel-stability-turn");
+  await expect
+    .poll(async () => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().planApprovalExecutionStartedForTurnId ?? null))
+    .toBeNull();
+  await expect
+    .poll(async () => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().executionChildTurns ?? null))
+    .toBe(0);
   await expect(page.getByTestId("composer-queued-message")).toHaveCount(0);
 });
 

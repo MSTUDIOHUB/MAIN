@@ -177,3 +177,29 @@ test("global plan toolbar button is driven by live plan workspace, not historica
   assert.match(storeSource, /logStoreEvent\("planWorkspaceStateChanged"/);
   assert.match(storeSource, /logStoreEvent\("planFilesCleared"/);
 });
+
+test("approved plan execution handoff has one runtime owner and dedupe guard", () => {
+  const storeSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/useAppStore.ts"), "utf8");
+  const workflowEngineSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"), "utf8");
+
+  assert.match(storeSource, /export interface PlanApprovalHandoff/);
+  assert.match(storeSource, /planApprovalExecutionStartedForTurnId/);
+  assert.match(storeSource, /startApprovedPlanExecutionTurnFromHandoff/);
+  assert.match(storeSource, /plan_approval_direct_execution_suppressed/);
+  assert.match(storeSource, /plan_approval_execution_turn_created/);
+  assert.match(storeSource, /source:\s*"store_fallback"/);
+  assert.doesNotMatch(
+    storeSource,
+    /approvePlan:[\s\S]{0,2600}get\(\)\.sendMessage\(/,
+    "approvePlan must register a handoff, not directly append a hidden execution turn",
+  );
+
+  assert.match(workflowEngineSource, /startApprovedPlanExecutionTurnFromHandoff/);
+  assert.match(workflowEngineSource, /source:\s*"active_loop"/);
+  assert.match(workflowEngineSource, /plan_approval_handoff_deduped/);
+  assert.doesNotMatch(
+    workflowEngineSource,
+    /plan_approval_handoff_starting_execution_turn/,
+    "legacy direct-start log should be replaced by the single execution-turn-created event",
+  );
+});

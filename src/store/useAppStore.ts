@@ -736,6 +736,13 @@ export interface ActiveGuidance {
   consumedAt?: number | null;
 }
 
+export interface PlanApprovalHandoff {
+  planTurnId: string;
+  requestedAt: number;
+  executionTurnId?: string;
+  prompt?: string;
+}
+
 export type WebSearchProvider = "duckduckgo" | "bing" | "baidu";
 
 function normalizeWebSearchProvider(value: unknown): WebSearchProvider {
@@ -769,7 +776,8 @@ export interface SessionRuntimeSnapshot {
   planStage: PlanStage;
   isPlanApproved: boolean;
   planApprovalChoice?: string | null;
-  pendingPlanApprovalHandoff?: { planTurnId: string; requestedAt: number } | null;
+  pendingPlanApprovalHandoff?: PlanApprovalHandoff | null;
+  planApprovalExecutionStartedForTurnId?: string | null;
   clearedPlanTurnId?: string | null;
   showPlanPanel: boolean;
   showDiff: boolean;
@@ -809,7 +817,8 @@ export interface SessionRuntimeState extends SessionRuntimeSnapshot {
   queuedUserMessage: QueuedUserMessage | null;
   activeGuidance: ActiveGuidance | null;
   planApprovalChoice: string | null;
-  pendingPlanApprovalHandoff: { planTurnId: string; requestedAt: number } | null;
+  pendingPlanApprovalHandoff: PlanApprovalHandoff | null;
+  planApprovalExecutionStartedForTurnId: string | null;
   clearedPlanTurnId: string | null;
   normalizedStreamState: NormalizedStreamState;
   currentTurnState: AppState["currentTurnState"];
@@ -1277,7 +1286,8 @@ export interface AppState {
   planAutoResumeCount: number;
   planExecutionProgressSnapshot: PlanExecutionProgressSnapshot | null;
   normalizedStreamState: NormalizedStreamState;
-  pendingPlanApprovalHandoff: { planTurnId: string; requestedAt: number } | null;
+  pendingPlanApprovalHandoff: PlanApprovalHandoff | null;
+  planApprovalExecutionStartedForTurnId: string | null;
   clearedPlanTurnId: string | null;
   runtimeEvents: MainThreadEvent[];
   harnessRunMarker: HarnessRunMarker | null;
@@ -1740,6 +1750,10 @@ export function normalizeSessionRuntimeSnapshot(
     isPlanApproved: snapshot.isPlanApproved ?? false,
     planApprovalChoice: normalizePlanApprovalChoice(snapshot.planApprovalChoice),
     pendingPlanApprovalHandoff: null,
+    planApprovalExecutionStartedForTurnId:
+      typeof snapshot.planApprovalExecutionStartedForTurnId === "string"
+        ? snapshot.planApprovalExecutionStartedForTurnId
+        : null,
     clearedPlanTurnId: typeof snapshot.clearedPlanTurnId === "string" ? snapshot.clearedPlanTurnId : null,
     showPlanPanel: snapshot.showPlanPanel ?? false,
     showDiff: snapshot.showDiff ?? false,
@@ -1829,6 +1843,7 @@ const sessionRuntimeKeys = [
   "isPlanApproved",
   "planApprovalChoice",
   "pendingPlanApprovalHandoff",
+  "planApprovalExecutionStartedForTurnId",
   "clearedPlanTurnId",
   "showPlanPanel",
   "showDiff",
@@ -1930,6 +1945,10 @@ function createSessionRuntimeFromState(state: Partial<AppState>): SessionRuntime
     isPlanApproved: state.isPlanApproved === true,
     planApprovalChoice: normalizePlanApprovalChoice(state.planApprovalChoice),
     pendingPlanApprovalHandoff: state.pendingPlanApprovalHandoff || null,
+    planApprovalExecutionStartedForTurnId:
+      typeof state.planApprovalExecutionStartedForTurnId === "string"
+        ? state.planApprovalExecutionStartedForTurnId
+        : null,
     clearedPlanTurnId: typeof state.clearedPlanTurnId === "string" ? state.clearedPlanTurnId : null,
     showPlanPanel: state.showPlanPanel === true,
     showDiff: state.showDiff === true,
@@ -3241,6 +3260,10 @@ function buildSessionRuntimeSnapshotFromStoreState(state: any): SessionRuntimeSn
     isPlanApproved: state.isPlanApproved === true,
     planApprovalChoice: state.planApprovalChoice ?? null,
     pendingPlanApprovalHandoff: null,
+    planApprovalExecutionStartedForTurnId:
+      typeof state.planApprovalExecutionStartedForTurnId === "string"
+        ? state.planApprovalExecutionStartedForTurnId
+        : null,
     clearedPlanTurnId: typeof state.clearedPlanTurnId === "string" ? state.clearedPlanTurnId : null,
     showPlanPanel: state.showPlanPanel === true,
     showDiff: state.showDiff === true,
@@ -3290,6 +3313,7 @@ function buildEmptySessionRuntimeSnapshot(state: any, affinity: SessionModeAffin
       isPlanApproved: false,
       planApprovalChoice: null,
       pendingPlanApprovalHandoff: null,
+      planApprovalExecutionStartedForTurnId: null,
       clearedPlanTurnId: null,
       showPlanPanel: false,
       showDiff: false,
@@ -3592,6 +3616,158 @@ function formatPlanTaskListForPrompt(tasks: PlanTask[], language: "zh" | "en", l
       (language === "zh" ? "无证据标签" : "no evidence label");
     return `${index + 1}. ${task.text} [${evidence}]`;
   }).join("\n");
+}
+
+function buildApprovedPlanExecutionPrompt(input: {
+  state: AppState;
+  language: "zh" | "en";
+  executionPlanTasks: PlanTask[];
+  normalizedApprovalChoice: string | null;
+}): string {
+  const hasTasksArtifact =
+    input.state.planArtifacts.some((artifact) => artifact.kind === "tasks") ||
+    input.executionPlanTasks.length > 0;
+  const hasPersistedTasksArtifact = input.state.planArtifacts.some((artifact) => artifact.kind === "tasks");
+  const derivedRuntimeTasks =
+    input.state.planTasks.length === 0 &&
+    !hasPersistedTasksArtifact &&
+    input.executionPlanTasks.length > 0;
+  const currentPlanTurn = input.state.currentTurnId
+    ? input.state.conversationTurns.find((turn) => turn.id === input.state.currentTurnId)
+    : null;
+  const requestedDocs = detectRequestedRootMarkdownDeliverables(currentPlanTurn?.userPrompt || "");
+  const deliverableHint = requestedDocs.length > 0
+    ? input.language === "en"
+      ? ` The final tasks must include writing ${requestedDocs.map((name) => `project-root \`${name}\``).join(", ")} before completion.`
+      : ` 最终 tasks 必须包含写入${requestedDocs.map((name) => `项目根目录 \`${name}\``).join("、")}，完成前必须真实落盘。`
+    : "";
+  const approvalChoiceHint = buildPlanApprovalChoiceHint(input.normalizedApprovalChoice, input.language);
+  const taskListText = formatPlanTaskListForPrompt(input.executionPlanTasks, input.language);
+  const runtimeTaskNotice = derivedRuntimeTasks
+    ? input.language === "en"
+      ? "\n\nMAIN already derived a runtime task list from the approved plan, so you do not need to create `.MAIN/plans/tasks.md` before the first source write. Use this list as the execution source of truth; persist it to tasks.md only if the work becomes long, needs cross-session audit, or the user explicitly asks for an audit file:\n" + taskListText
+      : "\n\nMAIN 已经从批准后的 design 派生出 runtime 任务清单，因此第一次源码写入前不必先创建 `.MAIN/plans/tasks.md`。请把下面清单作为本轮执行事实来源；只有任务变长、需要跨会话审计或用户明确要求留档时，才持久化到 tasks.md：\n" + taskListText
+    : "";
+
+  if (input.language === "en") {
+    return hasTasksArtifact
+      ? approvalChoiceHint + "The plan is approved. Continue directly from the current task list and execute the remaining items without repeating the plan. Do not read `.MAIN/plans/tasks.md` just to check whether it exists. If a source file has already been read and another read only returns `FILE_UNCHANGED_STUB`, switch to writing/patching, inspect a different target, or pause with the exact blocker instead of rereading. If `.MAIN/plans/tasks.md` is already known to exist, keep it as an audit record: do not delete completed or previous task records, and only check an item off after real evidence exists for its file/command/deliverable/browser validation, or the item is explicitly pending user validation." + deliverableHint + runtimeTaskNotice + "\n\n" + buildPlanCommandExecutionHint(input.executionPlanTasks, "en")
+      : approvalChoiceHint + "The plan is approved. First derive a concise runtime task list from the approved plan.md; generate `.MAIN/plans/tasks.md` only if the work is long, needs cross-session audit, or the user explicitly requested a durable task file. Do not read tasks.md just to check whether it exists. Then execute real work without repeating the plan. Task items should be concise and include lightweight evidence such as `evidence: file:src/app.ts` or `evidence: cmd:npm test` when there is a concrete deliverable." + deliverableHint;
+  }
+
+  return hasTasksArtifact
+    ? approvalChoiceHint + "计划已批准。请直接基于当前任务清单继续执行剩余任务，不要重复计划内容。不要为了确认 `.MAIN/plans/tasks.md` 是否存在而读取它；如果源码文件已经读过，再读只返回 `FILE_UNCHANGED_STUB`，请改为写入/替换、读取不同目标，或明确暂停说明阻塞，不要继续重复读取；如果它已知存在，它是审计记录：不要删除已完成或旧任务记录；只有文件/命令/交付物/浏览器验证的真实证据满足，或该项明确待用户验证后，才能勾选对应任务。" + deliverableHint + runtimeTaskNotice + "\n\n" + buildPlanCommandExecutionHint(input.executionPlanTasks, "zh")
+    : approvalChoiceHint + "计划已批准。请先基于已批准的 plan.md 派生精简 runtime 任务清单；只有任务较长、需要跨会话审计或用户明确要求持久任务文件时，才生成 `.MAIN/plans/tasks.md`。不要为了确认 tasks.md 是否存在而读取它。然后执行真实任务，不要重复计划内容。有明确交付物的任务请保留轻量证据标签，例如 `证据: file:src/app.ts` 或 `证据: cmd:npm test`。" + deliverableHint;
+}
+
+function buildPlanApprovalHandoffDedupLogPayload(input: {
+  state: AppState;
+  reason: string;
+  planTurnId: string | null;
+  executionTurnId?: string | null;
+  currentTurnStatus?: ConversationTurnStatus | null;
+}) {
+  return {
+    reason: input.reason,
+    planTurnId: input.planTurnId,
+    executionTurnId: input.executionTurnId ?? null,
+    currentTurnStatus: input.currentTurnStatus ?? null,
+    agentStatus: input.state.agentStatus,
+    isGenerating: input.state.isGenerating,
+    pendingPlanApprovalHandoff: input.state.pendingPlanApprovalHandoff,
+    planApprovalExecutionStartedForTurnId: input.state.planApprovalExecutionStartedForTurnId,
+    conversationTurns: input.state.conversationTurns.length,
+  };
+}
+
+function findApprovedPlanExecutionChildTurn(state: AppState, planTurnId: string | null) {
+  if (!planTurnId) return null;
+  return state.conversationTurns.find((turn) => turn.parentPlanTurnId === planTurnId) || null;
+}
+
+export function startApprovedPlanExecutionTurnFromHandoff(input: {
+  get: () => AppState;
+  setActiveState: (patch: Partial<AppState>) => void;
+  planTurnId: string;
+  handoff: PlanApprovalHandoff;
+  sessionKey: string | null;
+  source: "active_loop" | "store_fallback";
+}): boolean {
+  const latest = input.get();
+  const currentTurn = latest.conversationTurns.find((turn) => turn.id === input.planTurnId) || null;
+  const existingChildTurn = findApprovedPlanExecutionChildTurn(latest, input.planTurnId);
+  if (latest.planApprovalExecutionStartedForTurnId === input.planTurnId || existingChildTurn) {
+    logStoreEvent("plan_approval_handoff_deduped", buildPlanApprovalHandoffDedupLogPayload({
+      state: latest,
+      reason: latest.planApprovalExecutionStartedForTurnId === input.planTurnId
+        ? "execution_already_started"
+        : "execution_child_turn_exists",
+      planTurnId: input.planTurnId,
+      executionTurnId: existingChildTurn?.id ?? input.handoff.executionTurnId ?? null,
+      currentTurnStatus: currentTurn?.status ?? null,
+    }));
+    return false;
+  }
+
+  const executionTurnId =
+    input.handoff.executionTurnId || `turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const language = latest.config.language === "en" ? "en" : "zh";
+  const prompt = input.handoff.prompt || buildApprovedPlanExecutionPrompt({
+    state: latest,
+    language,
+    executionPlanTasks: latest.planTasks,
+    normalizedApprovalChoice: latest.planApprovalChoice,
+  });
+
+  latest.updateConversationTurn(input.planTurnId, {
+    status: "done",
+    summary: language === "zh"
+      ? "计划已批准，执行已交接到新的回合。"
+      : "Plan approved; execution was handed off to a new turn.",
+  });
+
+  const runtimePatch = {
+    pendingPlanApprovalHandoff: null,
+    planApprovalExecutionStartedForTurnId: input.planTurnId,
+    currentTurnExecutionConsent: { turnId: executionTurnId, granted: true },
+  };
+  if (input.sessionKey) {
+    latest.updateRuntimeForSession?.(input.sessionKey, runtimePatch);
+  }
+  if (!input.sessionKey || isSessionRuntimeActive(latest, input.sessionKey)) {
+    input.setActiveState(runtimePatch);
+  }
+
+  logStoreEvent("plan_approval_execution_turn_created", {
+    source: input.source,
+    planTurnId: input.planTurnId,
+    executionTurnId,
+    currentTurnStatus: currentTurn?.status ?? null,
+    agentStatus: latest.agentStatus,
+    isGenerating: latest.isGenerating,
+    pendingPlanApprovalHandoff: latest.pendingPlanApprovalHandoff,
+    conversationTurns: latest.conversationTurns.length,
+    sessionKey: input.sessionKey,
+    workspace: latest.currentWorkspace || null,
+  });
+
+  latest.sendMessage(prompt, undefined, {
+    hidden: true,
+    createVisibleTurnForHiddenMessage: true,
+    reuseCurrentTurn: false,
+    turnIdOverride: executionTurnId,
+    parentPlanTurnId: input.planTurnId,
+    preservePlanState: true,
+    resolvedIntent: "plan",
+    runtimeIntentOverride: "execute",
+    executionConsentGranted: true,
+    skipIntentResolution: true,
+    turnTitle: language === "zh" ? "执行已批准计划" : "Execute Approved Plan",
+    intentSummary: language === "zh"
+      ? "用户已批准计划，MAIN 将在新的执行回合中按 plan.md 落地。"
+      : "The user approved the plan; MAIN will execute plan.md in a new execution turn.",
+  });
+  return true;
 }
 
 function buildTrustedPlanResumePrompt(input: {
@@ -5975,6 +6151,7 @@ export const useAppStore = create<AppState>()(
         isPlanApproved: false,
         planApprovalChoice: null,
         pendingPlanApprovalHandoff: null,
+        planApprovalExecutionStartedForTurnId: null,
         clearedPlanTurnId: null,
         showPlanPanel: false,
         normalizedStreamState: defaultNormalizedStreamState,
@@ -6052,6 +6229,7 @@ export const useAppStore = create<AppState>()(
       isPlanApproved: false,
       planApprovalChoice: null,
       pendingPlanApprovalHandoff: null,
+      planApprovalExecutionStartedForTurnId: null,
       clearedPlanTurnId: null,
       showPlanPanel: false,
       normalizedStreamState: defaultNormalizedStreamState,
@@ -6064,6 +6242,7 @@ export const useAppStore = create<AppState>()(
   isPlanApproved: false,
   planApprovalChoice: null,
   pendingPlanApprovalHandoff: null,
+  planApprovalExecutionStartedForTurnId: null,
   clearedPlanTurnId: null,
   planArtifacts: [],
   planStage: "idle",
@@ -6177,6 +6356,7 @@ export const useAppStore = create<AppState>()(
         normalizedStreamState: defaultNormalizedStreamState,
         planApprovalChoice: null,
         pendingPlanApprovalHandoff: null,
+        planApprovalExecutionStartedForTurnId: null,
         clearedPlanTurnId: s.currentTurnId || s.conversationTurns.find((turn) => isPlanConversationTurn(turn) && turn.status !== "done" && turn.status !== "completed_with_changes")?.id || null,
         isPlanApproved: false,
         showPlanPanel: false,
@@ -6261,150 +6441,142 @@ export const useAppStore = create<AppState>()(
   approvePlan: (approvalChoice) =>
     (() => {
       const state = get();
-      if (state.isPlanApproved) {
-        return;
-      }
-      const normalizedApprovalChoice = normalizePlanApprovalChoice(approvalChoice);
-      const language = state.config.language === "en" ? "en" : "zh";
-      const executionPlanTasks = ensureApprovedPlanRuntimeTasksForState(state, language);
-      const hasPersistedTasksArtifact = state.planArtifacts.some((artifact) => artifact.kind === "tasks");
-      const derivedRuntimeTasks = state.planTasks.length === 0 && !hasPersistedTasksArtifact && executionPlanTasks.length > 0;
-      const approvalChoicePatch = { planApprovalChoice: normalizedApprovalChoice || null };
       const approvedTurnId = state.currentTurnId;
-      const approvedHandoffSummary = language === "zh"
-        ? "计划已批准，执行已交接到新的回合。"
-        : "Plan approved; execution was handed off to a new turn.";
-      const executionTurnId = `turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      const hasActivePlanLoop =
-        !!approvedTurnId &&
-        (state.agentStatus === "running" || state.agentStatus === "pending_review" || state.isGenerating === true) &&
-        state.abortController !== null;
-      const handoffTurnId = hasActivePlanLoop ? approvedTurnId : executionTurnId;
-      const initialProgressSnapshot = normalizePlanExecutionProgressSnapshot({
-            turnId: handoffTurnId,
-            update: buildPlanExecutionProgressUpdate({
-              language,
-              phase: "starting",
-              iterationCount: 0,
-              maxIterations: PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS,
-              autoResumeCount: 0,
-              tasks: executionPlanTasks,
-              evidenceLedger: [],
-              recentToolActivity: [],
-            }),
-            now: Date.now(),
-          });
-      const executionConsentPatch = {
-        currentTurnExecutionConsent: {
-          turnId: handoffTurnId,
-          granted: true,
-        },
-      };
-
-      if (hasActivePlanLoop) {
-        set({
-          isPlanApproved: true,
-          ...approvalChoicePatch,
-          ...executionConsentPatch,
-          pendingPlanApprovalHandoff: approvedTurnId ? { planTurnId: approvedTurnId, requestedAt: Date.now() } : null,
-          planExecutionEvidenceLedger: [],
-          planExecutionEvidenceCount: 0,
-          planAutoResumeCount: 0,
-          planExecutionProgressSnapshot: initialProgressSnapshot,
-          ...(executionPlanTasks.length > 0 ? { planTasks: executionPlanTasks } : {}),
-          agentStatus: "running",
-          isGenerating: true,
-          planStage: "executing",
-        });
-        if (approvedTurnId) {
-          get().setConversationTurnStatus(approvedTurnId, "executing");
-        }
-        logStoreEvent("plan_approval_waiting_for_active_handoff", {
+      if (state.isPlanApproved) {
+        logStoreEvent("plan_approval_handoff_deduped", {
+          reason: "already_approved",
           planTurnId: approvedTurnId,
           agentStatus: state.agentStatus,
           isGenerating: state.isGenerating,
+          pendingPlanApprovalHandoff: state.pendingPlanApprovalHandoff,
+          planApprovalExecutionStartedForTurnId: state.planApprovalExecutionStartedForTurnId,
+          conversationTurns: state.conversationTurns.length,
         });
         return;
       }
+
+      const normalizedApprovalChoice = normalizePlanApprovalChoice(approvalChoice);
+      const language = state.config.language === "en" ? "en" : "zh";
+      const executionPlanTasks = ensureApprovedPlanRuntimeTasksForState(state, language);
+      const executionTurnId = `turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const currentTurn = approvedTurnId
+        ? state.conversationTurns.find((turn) => turn.id === approvedTurnId)
+        : null;
+      const hasPendingHandoffForTurn =
+        !!approvedTurnId && state.pendingPlanApprovalHandoff?.planTurnId === approvedTurnId;
+      const hasStartedExecutionForTurn =
+        !!approvedTurnId && state.planApprovalExecutionStartedForTurnId === approvedTurnId;
+      const hasExecutionChildTurn =
+        !!approvedTurnId && state.conversationTurns.some((turn) => turn.parentPlanTurnId === approvedTurnId);
+      if (hasPendingHandoffForTurn || hasStartedExecutionForTurn || hasExecutionChildTurn || state.planStage === "executing") {
+        logStoreEvent("plan_approval_handoff_deduped", {
+          reason: hasPendingHandoffForTurn
+            ? "pending_handoff_exists"
+            : hasStartedExecutionForTurn
+            ? "execution_already_started"
+            : hasExecutionChildTurn
+            ? "execution_child_turn_exists"
+            : "plan_stage_executing",
+          planTurnId: approvedTurnId,
+          executionTurnId: hasExecutionChildTurn
+            ? state.conversationTurns.find((turn) => turn.parentPlanTurnId === approvedTurnId)?.id ?? null
+            : null,
+          currentTurnStatus: currentTurn?.status ?? null,
+          agentStatus: state.agentStatus,
+          isGenerating: state.isGenerating,
+          pendingPlanApprovalHandoff: state.pendingPlanApprovalHandoff,
+          planApprovalExecutionStartedForTurnId: state.planApprovalExecutionStartedForTurnId,
+          conversationTurns: state.conversationTurns.length,
+        });
+        return;
+      }
+
+      const executionPrompt = buildApprovedPlanExecutionPrompt({
+        state,
+        language,
+        executionPlanTasks,
+        normalizedApprovalChoice,
+      });
+      const approvalChoicePatch = { planApprovalChoice: normalizedApprovalChoice || null };
+      const pendingHandoffPatch = approvedTurnId
+        ? { planTurnId: approvedTurnId, requestedAt: Date.now(), executionTurnId, prompt: executionPrompt }
+        : null;
+      const initialProgressSnapshot = normalizePlanExecutionProgressSnapshot({
+        turnId: executionTurnId,
+        update: buildPlanExecutionProgressUpdate({
+          language,
+          phase: "starting",
+          iterationCount: 0,
+          maxIterations: PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS,
+          autoResumeCount: 0,
+          tasks: executionPlanTasks,
+          evidenceLedger: [],
+          recentToolActivity: [],
+        }),
+        now: Date.now(),
+      });
+      const activePlanLoop =
+        !!approvedTurnId &&
+        (state.agentStatus === "running" ||
+          state.agentStatus === "pending_review" ||
+          state.isGenerating === true ||
+          currentTurn?.status === "planning" ||
+          currentTurn?.status === "awaiting_approval" ||
+          currentTurn?.status === "awaiting_input") &&
+        state.abortController !== null;
+      const sessionKey = resolveSessionRuntimeKey(resolveSessionWorkspaceKey(state.currentWorkspace), state.currentSessionId);
 
       set((s) => ({
         isPlanApproved: true,
         ...approvalChoicePatch,
-        ...executionConsentPatch,
-        pendingPlanApprovalHandoff: null,
+        currentTurnExecutionConsent: { turnId: executionTurnId, granted: true },
+        pendingPlanApprovalHandoff: pendingHandoffPatch,
         planExecutionEvidenceLedger: [],
         planExecutionEvidenceCount: 0,
         planAutoResumeCount: 0,
         planExecutionProgressSnapshot: initialProgressSnapshot,
         ...(executionPlanTasks.length > 0 ? { planTasks: executionPlanTasks } : {}),
-        agentStatus: "running",
-        isGenerating: true,
+        agentStatus: activePlanLoop ? s.agentStatus : "idle",
+        isGenerating: activePlanLoop ? s.isGenerating : false,
         planStage: "executing",
         conversationTurns: approvedTurnId
           ? s.conversationTurns.map((turn) =>
               turn.id === approvedTurnId
                 ? {
                     ...turn,
-                    status: "done" as const,
-                    summary: approvedHandoffSummary,
+                    status: activePlanLoop ? "executing" as const : "done" as const,
+                    summary: language === "zh"
+                      ? "计划已批准，执行将交接到唯一执行回合。"
+                      : "Plan approved; execution will hand off to a single execution turn.",
                   }
                 : turn,
             )
           : s.conversationTurns,
       }));
 
-      runAfterNextPaint(() => {
-        get().sendMessage(
-          (() => {
-            const hasTasksArtifact =
-              state.planArtifacts.some((artifact) => artifact.kind === "tasks") ||
-              executionPlanTasks.length > 0;
-            const currentPlanTurn = state.currentTurnId
-              ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId)
-              : null;
-            const requestedDocs = detectRequestedRootMarkdownDeliverables(currentPlanTurn?.userPrompt || "");
-            const deliverableHint = requestedDocs.length > 0
-              ? state.config.language === "en"
-                ? ` The final tasks must include writing ${requestedDocs.map((name) => `project-root \`${name}\``).join(", ")} before completion.`
-                : ` 最终 tasks 必须包含写入${requestedDocs.map((name) => `项目根目录 \`${name}\``).join("、")}，完成前必须真实落盘。`
-              : "";
-            const approvalChoiceHint = buildPlanApprovalChoiceHint(normalizedApprovalChoice, language);
-            const taskListText = formatPlanTaskListForPrompt(executionPlanTasks, language);
-            const runtimeTaskNotice = derivedRuntimeTasks
-              ? language === "en"
-                ? "\n\nMAIN already derived a runtime task list from the approved plan, so you do not need to create `.MAIN/plans/tasks.md` before the first source write. Use this list as the execution source of truth; persist it to tasks.md only if the work becomes long, needs cross-session audit, or the user explicitly asks for an audit file:\n" + taskListText
-                : "\n\nMAIN 已经从批准后的 design 派生出 runtime 任务清单，因此第一次源码写入前不必先创建 `.MAIN/plans/tasks.md`。请把下面清单作为本轮执行事实来源；只有任务变长、需要跨会话审计或用户明确要求留档时，才持久化到 tasks.md：\n" + taskListText
-              : "";
-
-            if (language === "en") {
-              return hasTasksArtifact
-              ? approvalChoiceHint + "The plan is approved. Continue directly from the current task list and execute the remaining items without repeating the plan. Do not read `.MAIN/plans/tasks.md` just to check whether it exists. If a source file has already been read and another read only returns `FILE_UNCHANGED_STUB`, switch to writing/patching, inspect a different target, or pause with the exact blocker instead of rereading. If `.MAIN/plans/tasks.md` is already known to exist, keep it as an audit record: do not delete completed or previous task records, and only check an item off after real evidence exists for its file/command/deliverable/browser validation, or the item is explicitly pending user validation." + deliverableHint + runtimeTaskNotice + "\n\n" + buildPlanCommandExecutionHint(executionPlanTasks, "en")
-                : approvalChoiceHint + "The plan is approved. First derive a concise runtime task list from the approved plan.md; generate `.MAIN/plans/tasks.md` only if the work is long, needs cross-session audit, or the user explicitly requested a durable task file. Do not read tasks.md just to check whether it exists. Then execute real work without repeating the plan. Task items should be concise and include lightweight evidence such as `evidence: file:src/app.ts` or `evidence: cmd:npm test` when there is a concrete deliverable." + deliverableHint;
-            }
-
-            return hasTasksArtifact
-              ? approvalChoiceHint + "计划已批准。请直接基于当前任务清单继续执行剩余任务，不要重复计划内容。不要为了确认 `.MAIN/plans/tasks.md` 是否存在而读取它；如果源码文件已经读过，再读只返回 `FILE_UNCHANGED_STUB`，请改为写入/替换、读取不同目标，或明确暂停说明阻塞，不要继续重复读取；如果它已知存在，它是审计记录：不要删除已完成或旧任务记录；只有文件/命令/交付物/浏览器验证的真实证据满足，或该项明确待用户验证后，才能勾选对应任务。" + deliverableHint + runtimeTaskNotice + "\n\n" + buildPlanCommandExecutionHint(executionPlanTasks, "zh")
-              : approvalChoiceHint + "计划已批准。请先基于已批准的 plan.md 派生精简 runtime 任务清单；只有任务较长、需要跨会话审计或用户明确要求持久任务文件时，才生成 `.MAIN/plans/tasks.md`。不要为了确认 tasks.md 是否存在而读取它。然后执行真实任务，不要重复计划内容。有明确交付物的任务请保留轻量证据标签，例如 `证据: file:src/app.ts` 或 `证据: cmd:npm test`。" + deliverableHint;
-          })(),
-          undefined,
-          {
-            hidden: true,
-            createVisibleTurnForHiddenMessage: true,
-            reuseCurrentTurn: false,
-            turnIdOverride: executionTurnId,
-            parentPlanTurnId: approvedTurnId || undefined,
-            preservePlanState: true,
-            resolvedIntent: "plan",
-            runtimeIntentOverride: "execute",
-            executionConsentGranted: true,
-            skipIntentResolution: true,
-            turnTitle: language === "zh" ? "执行已批准计划" : "Execute Approved Plan",
-            intentSummary: language === "zh"
-              ? "用户已批准计划，MAIN 将在新的执行回合中按 plan.md 落地。"
-              : "The user approved the plan; MAIN will execute plan.md in a new execution turn.",
-          },
-        );
+      logStoreEvent("plan_approval_direct_execution_suppressed", {
+        reason: activePlanLoop ? "active_plan_loop_handoff" : "handoff_single_owner",
+        planTurnId: approvedTurnId,
+        executionTurnId,
+        currentTurnStatus: currentTurn?.status ?? null,
+        agentStatus: state.agentStatus,
+        isGenerating: state.isGenerating,
+        pendingPlanApprovalHandoff: state.pendingPlanApprovalHandoff,
+        conversationTurns: state.conversationTurns.length,
       });
+
+      if (!activePlanLoop && approvedTurnId && pendingHandoffPatch) {
+        runAfterNextPaint(() => {
+          startApprovedPlanExecutionTurnFromHandoff({
+            get,
+            setActiveState: (patch) => set(patch),
+            planTurnId: approvedTurnId,
+            handoff: pendingHandoffPatch,
+            sessionKey,
+            source: "store_fallback",
+          });
+        });
+      }
     })(),
   rejectPlan: () => {
     const state = get();
@@ -6413,6 +6585,7 @@ export const useAppStore = create<AppState>()(
       isPlanApproved: false,
       planApprovalChoice: null,
       pendingPlanApprovalHandoff: null,
+      planApprovalExecutionStartedForTurnId: null,
       planExecutionEvidenceLedger: [],
       planExecutionEvidenceCount: 0,
       planAutoResumeCount: 0,
@@ -8679,7 +8852,7 @@ export const useAppStore = create<AppState>()(
       pendingRunDecision: null,
       isGenerating: true,
       config: { ...s.config, workflowMode: effectiveWorkflowMode },
-      ...(preservePlanState ? {} : { isPlanApproved: false, planApprovalChoice: null, pendingPlanApprovalHandoff: null, clearedPlanTurnId: null }),
+      ...(preservePlanState ? {} : { isPlanApproved: false, planApprovalChoice: null, pendingPlanApprovalHandoff: null, planApprovalExecutionStartedForTurnId: null, clearedPlanTurnId: null }),
       ...(preservePlanState ? {} : { planAutoResumeCount: 0, planExecutionProgressSnapshot: null }),
       ...(shouldGrantExecutionConsentForTurn
         ? { currentTurnExecutionConsent: { turnId, granted: true } }

@@ -21,7 +21,9 @@ import {
   compactCompletedTurnAgentMessages,
   normalizeQueuedUserMessage,
   pickProcessAssistantText,
+  startApprovedPlanExecutionTurnFromHandoff,
   type AppState,
+  type PlanApprovalHandoff,
   type TaskBlock,
   type FeishuRemoteContext,
   type GameStudioConfig,
@@ -80,11 +82,10 @@ export interface WorkflowContext {
   thoughtStartTime: number | null;
   streamingAssistantDisplayBuffer: string;
   approvedPlanHandoff: {
-    prompt: string;
-    parentPlanTurnId: string;
-    executionTurnId: string;
-    title: string;
-    intentSummary: string;
+    planTurnId: string;
+    requestedAt: number;
+    executionTurnId?: string;
+    prompt?: string;
   } | null;
   understandingProgressBlockId: number | null;
   understandingProgressClosed: boolean;
@@ -424,6 +425,21 @@ export class WorkflowEngine {
       startNewTurn: () => sessionGet().startNewTurn(remoteFeishu),
       onApprovedPlanHandoff: (prompt: string) => {
         const pendingHandoff = sessionGet().pendingPlanApprovalHandoff;
+        const startedForTurn = sessionGet().planApprovalExecutionStartedForTurnId;
+        const existingChildTurn = sessionGet().conversationTurns.find((turn: any) => turn.parentPlanTurnId === turnId);
+        if (startedForTurn === turnId || existingChildTurn) {
+          logStoreEvent("plan_approval_handoff_deduped", {
+            reason: startedForTurn === turnId ? "execution_already_started" : "execution_child_turn_exists",
+            planTurnId: turnId,
+            executionTurnId: existingChildTurn?.id ?? null,
+            currentTurnStatus: sessionGet().conversationTurns.find((turn: any) => turn.id === turnId)?.status ?? null,
+            agentStatus: sessionGet().agentStatus,
+            isGenerating: sessionGet().isGenerating,
+            pendingPlanApprovalHandoff: pendingHandoff,
+            conversationTurns: sessionGet().conversationTurns.length,
+          });
+          return;
+        }
         if (pendingHandoff && pendingHandoff.planTurnId !== turnId) {
           logStoreEvent("plan_approval_handoff_ignored", {
             reason: "different_pending_plan_turn",
@@ -434,17 +450,19 @@ export class WorkflowEngine {
           });
           return;
         }
-        const language = sessionGet().config.language === "en" ? "en" : "zh";
-        const executionTurnId = `turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-        context.approvedPlanHandoff = {
-          prompt,
-          parentPlanTurnId: turnId,
+        const executionTurnId =
+          pendingHandoff?.executionTurnId ||
+          `turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const handoffRequest: PlanApprovalHandoff = {
+          planTurnId: turnId,
+          requestedAt: pendingHandoff?.requestedAt || Date.now(),
           executionTurnId,
-          title: language === "zh" ? "执行已批准计划" : "Execute Approved Plan",
-          intentSummary: language === "zh"
-            ? "用户已批准计划，MAIN 将在新的执行回合中按 plan.md 落地。"
-            : "The user approved the plan; MAIN will execute plan.md in a new execution turn.",
+          prompt: pendingHandoff?.prompt || prompt,
         };
+        context.approvedPlanHandoff = {
+          ...handoffRequest,
+        };
+        const language = sessionGet().config.language === "en" ? "en" : "zh";
         const progressSnapshot = normalizePlanExecutionProgressSnapshot({
           turnId: executionTurnId,
           update: buildPlanExecutionProgressUpdate({
@@ -465,7 +483,7 @@ export class WorkflowEngine {
         });
         sessionSet((s: any) => ({
           currentTurnExecutionConsent: { turnId: executionTurnId, granted: true },
-          pendingPlanApprovalHandoff: null,
+          pendingPlanApprovalHandoff: handoffRequest,
           planExecutionProgressSnapshot: progressSnapshot,
           conversationTurns: s.conversationTurns.map((turn: any) =>
             turn.id === turnId
@@ -482,6 +500,11 @@ export class WorkflowEngine {
         logStoreEvent("plan_approval_handoff_queued", {
           planTurnId: turnId,
           executionTurnId,
+          currentTurnStatus: sessionGet().conversationTurns.find((turn: any) => turn.id === turnId)?.status ?? null,
+          agentStatus: sessionGet().agentStatus,
+          isGenerating: sessionGet().isGenerating,
+          pendingPlanApprovalHandoff: pendingHandoff,
+          conversationTurns: sessionGet().conversationTurns.length,
           sessionKey: runSessionKey,
           workspace: runWorkspace || null,
         });
@@ -1753,7 +1776,7 @@ export class WorkflowEngine {
             latest.updateRuntimeForSession?.(runSessionKey, { pendingPlanApprovalHandoff: null });
             logStoreEvent("plan_approval_handoff_skipped", {
               reason: "session_changed",
-              planTurnId: handoff.parentPlanTurnId,
+              planTurnId: handoff.planTurnId,
               executionTurnId: handoff.executionTurnId,
               expectedSessionKey: runSessionKey,
               latestSessionKey,
@@ -1761,41 +1784,24 @@ export class WorkflowEngine {
             return;
           }
           if (latest.isGenerating || latest.agentStatus === "running" || latest.agentStatus === "pending_review") {
-            latest.updateRuntimeForSession?.(runSessionKey, { pendingPlanApprovalHandoff: null });
             logStoreEvent("plan_approval_handoff_skipped", {
               reason: "agent_busy",
-              planTurnId: handoff.parentPlanTurnId,
+              planTurnId: handoff.planTurnId,
               executionTurnId: handoff.executionTurnId,
               agentStatus: latest.agentStatus,
+              isGenerating: latest.isGenerating,
+              pendingPlanApprovalHandoff: latest.pendingPlanApprovalHandoff,
+              conversationTurns: latest.conversationTurns.length,
             });
             return;
           }
-          latest.updateConversationTurn(handoff.parentPlanTurnId, {
-            status: "done",
-            summary: latest.config.language === "en"
-              ? "Plan approved; execution was handed off to a new turn."
-              : "计划已批准，执行已交接到新的回合。",
-          });
-          latest.updateRuntimeForSession?.(runSessionKey, { pendingPlanApprovalHandoff: null });
-          logStoreEvent("plan_approval_handoff_starting_execution_turn", {
-            planTurnId: handoff.parentPlanTurnId,
-            executionTurnId: handoff.executionTurnId,
+          startApprovedPlanExecutionTurnFromHandoff({
+            get: sessionGet,
+            setActiveState: (patch) => sessionSet(patch as any),
+            planTurnId: handoff.planTurnId,
+            handoff,
             sessionKey: runSessionKey,
-            workspace: runWorkspace || null,
-          });
-          latest.sendMessage(handoff.prompt, undefined, {
-            hidden: true,
-            createVisibleTurnForHiddenMessage: true,
-            reuseCurrentTurn: false,
-            turnIdOverride: handoff.executionTurnId,
-            parentPlanTurnId: handoff.parentPlanTurnId,
-            preservePlanState: true,
-            resolvedIntent: "plan",
-            runtimeIntentOverride: "execute",
-            executionConsentGranted: true,
-            skipIntentResolution: true,
-            turnTitle: handoff.title,
-            intentSummary: handoff.intentSummary,
+            source: "active_loop",
           });
         });
       } else if (queuedAfterRun) {

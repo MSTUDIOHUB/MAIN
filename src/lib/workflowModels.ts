@@ -2107,6 +2107,7 @@ export interface PlanDecisionForkAnalysis {
   options: string[];
   recommendedDefault?: string;
   reason?: string;
+  userVisibleDecision?: boolean;
 }
 
 function extractPlanDecisionForkOptions(content: string): string[] {
@@ -2129,6 +2130,29 @@ function extractPlanDecisionForkOptions(content: string): string[] {
   return options.slice(0, 4);
 }
 
+function extractPlanDecisionForkContext(content: string): string {
+  const relevantLines = String(content || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) =>
+      /(?:方案|选项|路径)\s*[A-CＡ-Ｃ1-3一二三]\s*[：:、.)-]/i.test(line) ||
+      /(?:Option|Approach|Path|Plan)\s*[A-C1-3]\s*[：:.)-]/i.test(line) ||
+      /(?:推荐|建议|默认|优先采用|我会采用|本计划采用|默认选择|取舍|选择|确认|决定|Recommended|Recommend|Default|Chosen path|This plan uses|trade[- ]off|choose|decision)/i.test(line)
+    );
+  return relevantLines.join("\n");
+}
+
+function hasInternalImplementationDecisionCue(text: string): boolean {
+  return /(?:内部实现|实现细节|代码组织|命名|helper|重构方式|抽成|内联|本地函数|私有函数|refactor only|internal implementation|implementation detail|code organization|naming only|helper|inline|private helper)/i.test(text);
+}
+
+function hasUserVisibleDecisionCue(text: string): boolean {
+  const normalized = String(text || "");
+  const userVisibleCue =
+    /(?:体验|界面|UI|UX|窗口|面板|空白|开始|默认打开|启动|菜单|按钮|可见|交互|行为|范围|功能|API|接口|数据|兼容|权限|持久化|迁移|UX|UI|window|panel|blank|start|startup|visible|button|menu|behavior|interaction|scope|feature|API|interface|data|compatibility|permission|persist|migration)/i;
+  return userVisibleCue.test(normalized) && !hasInternalImplementationDecisionCue(normalized);
+}
+
 export function analyzePlanDecisionFork(content: string): PlanDecisionForkAnalysis {
   const raw = String(content || "");
   const options = extractPlanDecisionForkOptions(raw);
@@ -2138,19 +2162,48 @@ export function analyzePlanDecisionFork(content: string): PlanDecisionForkAnalys
   const hasExplicitUserOptions = /<user_options\b[\s\S]*?<\/user_options>/i.test(raw);
   const hasDefaultSelection =
     /(?:推荐|建议|默认|优先采用|我会采用|本计划采用|默认选择|Recommended|Recommend|Default|Chosen path|This plan uses).{0,40}(?:方案|选项|路径|Option|Approach|Path)\s*[A-CＡ-Ｃ1-3一二三]/i.test(raw);
+  const forkContext = extractPlanDecisionForkContext(raw);
+  const hasUserVisibleDecision = hasUserVisibleDecisionCue(`${options.join("\n")}\n${forkContext}`);
   const hasBlockingCue =
     /(?:需要|需|请|等待|必须).{0,32}(?:选择|确认|决定|取舍|拍板)/i.test(raw) ||
     /(?:选择|确认|决定).{0,24}(?:方案|选项|路径|优先级|[A-CＡ-Ｃ1-3一二三])/i.test(raw) ||
     /二选一|三选一|取舍|优先级|which option|choose|decision required|trade[- ]off|needs? confirmation/i.test(raw);
 
-  if (hasDefaultSelection || hasExplicitUserOptions) {
+  if (hasExplicitUserOptions) {
     return {
       hasFork: true,
       classification: "defaultable",
       requiresUserOptions: false,
       options,
       recommendedDefault: hasDefaultSelection ? options[0] : undefined,
-      reason: hasExplicitUserOptions ? "explicit_user_options" : "default_selection_present",
+      reason: "explicit_user_options",
+      userVisibleDecision: hasUserVisibleDecision,
+    };
+  }
+
+  if (hasUserVisibleDecision) {
+    return {
+      hasFork: true,
+      classification: "blocking",
+      requiresUserOptions: true,
+      options,
+      recommendedDefault: hasDefaultSelection ? options[0] : undefined,
+      reason: hasDefaultSelection
+        ? "user_visible_decision_with_recommendation_without_user_options"
+        : "user_visible_decision_without_user_options",
+      userVisibleDecision: true,
+    };
+  }
+
+  if (hasDefaultSelection) {
+    return {
+      hasFork: true,
+      classification: "defaultable",
+      requiresUserOptions: false,
+      options,
+      recommendedDefault: options[0],
+      reason: "default_selection_present",
+      userVisibleDecision: false,
     };
   }
 
@@ -2161,6 +2214,7 @@ export function analyzePlanDecisionFork(content: string): PlanDecisionForkAnalys
       requiresUserOptions: true,
       options,
       reason: "blocking_decision_without_user_options",
+      userVisibleDecision: hasUserVisibleDecision,
     };
   }
 
@@ -2170,6 +2224,7 @@ export function analyzePlanDecisionFork(content: string): PlanDecisionForkAnalys
     requiresUserOptions: false,
     options,
     reason: "fork_without_blocking_cue",
+    userVisibleDecision: false,
   };
 }
 
@@ -2287,7 +2342,13 @@ export function validateActionablePlanArtifact(
   }
   const decisionFork = analyzePlanDecisionFork(raw);
   if (decisionFork.requiresUserOptions) {
-    return classifyPlanArtifactQualityResult({ ok: false, reason: "blocking_plan_decision_without_user_options" });
+    return classifyPlanArtifactQualityResult({
+      ok: false,
+      reason: decisionFork.reason === "user_visible_decision_with_recommendation_without_user_options" ||
+        decisionFork.reason === "user_visible_decision_without_user_options"
+        ? "user_visible_decision_fork_without_options"
+        : "blocking_plan_decision_without_user_options",
+    });
   }
 
   const hasTargetOrData =
