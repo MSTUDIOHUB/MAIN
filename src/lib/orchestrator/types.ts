@@ -84,6 +84,7 @@ export interface OrchestratorCallbacks {
   // Planning & Management
   getCurrentRunIntent: () => ResolvedUserIntent;
   getRuntimeRunIntent?: () => ResolvedUserIntent;
+  getExecutionConsentGranted?: () => boolean;
   getForcedExecuteRecoveryMode?: () => ExecuteRecoveryMode | null;
   getCommandDirective?: () => CommandDirective | null;
   getWorkflowMode: () => "chat" | "edit" | "plan";

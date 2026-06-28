@@ -174,6 +174,8 @@ test("execute max-iteration notices describe a recoverable boundary instead of f
   assert.match(autoNotice, /恢复点/);
   assert.match(pauseNotice, /不是工具权限或模式切换失败/);
   assert.match(pauseNotice, /Resume Execution/);
+  assert.match(pauseNotice, /复用已读上下文/);
+  assert.match(pauseNotice, /重复只读/);
   assert.match(prompt, /如果任务已经完成，直接输出最终总结/);
 });
 

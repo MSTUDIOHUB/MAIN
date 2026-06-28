@@ -521,6 +521,11 @@ export function emitToolPreflightBlocked(
 }
 
 export function isProjectSourceWriteResult(result: ToolExecutionResult): boolean {
+  if (
+    /"noOp"\s*:\s*true|NO_EFFECT_MUTATION|FILE_UNCHANGED_STUB|READ_FILE_REPEAT_LIMIT|READ_ONLY_REPEAT_LIMIT|no-op|nothing to (?:change|patch|write)|already matched requested content/i.test(result.content || "")
+  ) {
+    return false;
+  }
   return (
     !result.isError &&
     EDIT_PROGRESS_TOOL_NAMES.has(result.name) &&
@@ -1174,6 +1179,7 @@ export interface OrchestratorCallbacks {
   // Planning & Management
   getCurrentRunIntent: () => ResolvedUserIntent;
   getRuntimeRunIntent?: () => ResolvedUserIntent;
+  getExecutionConsentGranted?: () => boolean;
   getForcedExecuteRecoveryMode?: () => ExecuteRecoveryMode | null;
   getCommandDirective?: () => CommandDirective | null;
   getWorkflowMode: () => "chat" | "edit" | "plan";

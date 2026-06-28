@@ -58,6 +58,92 @@ function redactSecrets(text: string): string {
     .replace(/((?:authorization|api[-_]?key|x-api-key|token|password|secret)\s*[:=]\s*)[^\s,;]+/gi, "$1[REDACTED]");
 }
 
+function stableDebugHash(value: string): string {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+function compactDebugString(value: string, maxChars = 900): string {
+  const normalized = redactSecrets(value)
+    .replace(/\[MAIN_TOOL_FEEDBACK_V1\]\{[^\n]*\}/g, "[tool-feedback-envelope]")
+    .replace(/READ_FILE_RESULT[\s\S]{300,}/gi, "READ_FILE_RESULT...[digest-truncated]")
+    .replace(/<tool_use>[\s\S]*?<\/tool_use>/gi, "<tool_use>...[tool-call-template]</tool_use>")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (normalized.length <= maxChars) return normalized;
+  return `${normalized.slice(0, maxChars).trim()}...<chars:${normalized.length};hash:${stableDebugHash(normalized)}>`;
+}
+
+function summarizeStringArray(values: unknown[], maxItems = 12): string[] {
+  return values
+    .filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+    .slice(0, maxItems)
+    .map((item) => compactDebugString(item, 180));
+}
+
+function summarizeMessageArray(messages: unknown[]): Record<string, unknown> {
+  const roles: Record<string, number> = {};
+  let textChars = 0;
+  let hiddenReasoningChars = 0;
+  let toolCallMessages = 0;
+  let toolResultMessages = 0;
+  const largest: Array<{ index: number; role: string; chars: number; hash: string }> = [];
+
+  messages.forEach((item, index) => {
+    const message = item as any;
+    const role = String(message?.role || "unknown");
+    roles[role] = (roles[role] || 0) + 1;
+    const content = typeof message?.content === "string" ? message.content : stringifyArg(message?.content ?? "");
+    const chars = content.length;
+    textChars += chars;
+    if (typeof message?.reasoning === "string") hiddenReasoningChars += message.reasoning.length;
+    if (typeof message?.reasoning_content === "string") hiddenReasoningChars += message.reasoning_content.length;
+    if (Array.isArray(message?.tool_calls) && message.tool_calls.length > 0) toolCallMessages += 1;
+    if (role === "tool") toolResultMessages += 1;
+    largest.push({ index, role, chars, hash: stableDebugHash(content) });
+  });
+
+  largest.sort((left, right) => right.chars - left.chars);
+  return {
+    count: messages.length,
+    roles,
+    textChars,
+    estimatedTokens: Math.ceil(textChars / 4),
+    hiddenReasoningChars,
+    toolCallMessages,
+    toolResultMessages,
+    largestMessages: largest.slice(0, 5),
+  };
+}
+
+function summarizeToolResultLike(value: Record<string, unknown>): Record<string, unknown> | null {
+  const name = typeof value.name === "string" ? value.name : typeof value.toolName === "string" ? value.toolName : "";
+  const target = typeof value.target === "string" ? value.target : "";
+  const content = typeof value.content === "string"
+    ? value.content
+    : typeof value.result === "string"
+    ? value.result
+    : typeof value.output === "string"
+    ? value.output
+    : "";
+  if (!name && !target && !content) return null;
+  const feedbackStatus = content.match(/\[MAIN_TOOL_FEEDBACK_V1\]\{[^}]*"status"\s*:\s*"([^"]+)"/)?.[1] || null;
+  return {
+    ...(name ? { name } : {}),
+    ...(target ? { target: compactDebugString(target, 180) } : {}),
+    ...(typeof value.isError === "boolean" ? { isError: value.isError } : {}),
+    ...(typeof value.lifecycleState === "string" ? { lifecycleState: value.lifecycleState } : {}),
+    ...(feedbackStatus ? { feedbackStatus } : {}),
+    contentChars: content.length,
+    contentHash: content ? stableDebugHash(content) : null,
+    preview: compactDebugString(content, 360),
+  };
+}
+
 function stringifyArg(arg: unknown): string {
   if (arg instanceof Error) {
     return arg.stack || arg.message;
@@ -86,10 +172,98 @@ function stringifyArg(arg: unknown): string {
   }
 }
 
+function summarizeDebugArray(value: unknown[], depth: number): unknown {
+  if (value.length === 0) return [];
+  const summarizeItem = (item: unknown) => compactDebugValue(item, depth + 1);
+  if (value.length <= 8) return value.map(summarizeItem);
+  return {
+    count: value.length,
+    head: value.slice(0, 4).map(summarizeItem),
+    tail: value.slice(-2).map(summarizeItem),
+  };
+}
+
+function compactDebugValue(value: unknown, depth = 0): unknown {
+  if (value instanceof Error) {
+    return compactDebugString(value.stack || value.message, 1200);
+  }
+  if (typeof value === "string") {
+    return compactDebugString(value, depth === 0 ? 1600 : 900);
+  }
+  if (value == null || typeof value === "number" || typeof value === "boolean") {
+    return value;
+  }
+  if (depth >= 4) {
+    return `[Object depth-limit hash:${stableDebugHash(stringifyArg(value))}]`;
+  }
+  if (Array.isArray(value)) {
+    return summarizeDebugArray(value, depth);
+  }
+  if (typeof value !== "object") {
+    return String(value);
+  }
+
+  const valueRecord = value as Record<string, unknown>;
+  const toolResultSummary = summarizeToolResultLike(valueRecord);
+  if (toolResultSummary && depth > 0 && ("content" in valueRecord || "result" in valueRecord || "output" in valueRecord)) {
+    return toolResultSummary;
+  }
+
+  const compacted: Record<string, unknown> = {};
+  for (const [key, nested] of Object.entries(valueRecord)) {
+    if (/authorization|api[-_]?key|x-api-key|token|password|secret/i.test(key)) {
+      compacted[key] = "[REDACTED]";
+      continue;
+    }
+    if (/^(?:messages|agentMessages|preparedMessages|conversation|history|transcript)$/i.test(key) && Array.isArray(nested)) {
+      compacted[key] = summarizeMessageArray(nested);
+      continue;
+    }
+    if (/^(?:tools|llmTools|allTools|toolDefinitions)$/i.test(key) && Array.isArray(nested)) {
+      compacted[key] = {
+        count: nested.length,
+        names: nested
+          .map((item) => String((item as any)?.function?.name || (item as any)?.name || ""))
+          .filter(Boolean)
+          .slice(0, 24),
+      };
+      continue;
+    }
+    if (/^(?:availableTools|availableToolNames|toolNames|requestedTools|suppressedToolNames)$/i.test(key) && Array.isArray(nested)) {
+      compacted[key] = {
+        count: nested.length,
+        names: summarizeStringArray(nested, 32),
+      };
+      continue;
+    }
+    if (/^(?:toolResults|allResults|results|recentToolActivity)$/i.test(key) && Array.isArray(nested)) {
+      compacted[key] = {
+        count: nested.length,
+        items: nested.slice(-12).map((item) =>
+          item && typeof item === "object"
+            ? summarizeToolResultLike(item as Record<string, unknown>) ?? compactDebugValue(item, depth + 1)
+            : compactDebugValue(item, depth + 1)
+        ),
+      };
+      continue;
+    }
+    if (/prompt|systemPrompt|content|body|output|stdout|stderr|reasoning|hiddenThought|message/i.test(key) && typeof nested === "string") {
+      compacted[key] = compactDebugString(
+        nested,
+        /prompt|systemPrompt|body|reasoning|hiddenThought/i.test(key) ? 700 : 1000,
+      );
+      continue;
+    }
+    compacted[key] = compactDebugValue(nested, depth + 1);
+  }
+  return compacted;
+}
+
 function normalizeMessage(input: unknown): string {
-  const text = Array.isArray(input)
-    ? input.map(stringifyArg).join(" ")
-    : stringifyArg(input);
+  const compacted = compactDebugValue(input);
+  const text = Array.isArray(compacted)
+    ? compacted.map(stringifyArg).join(" ")
+    : stringifyArg(compacted);
   const redacted = redactSecrets(text);
   return redacted.length > 8_000 ? `${redacted.slice(0, 8_000)}...<truncated>` : redacted;
 }

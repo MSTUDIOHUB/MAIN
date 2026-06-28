@@ -100,3 +100,59 @@ test("agent loop returns structured non-completed outcomes for stops and approve
   assert.match(source, /approved_plan_completion_guard/);
   assert.match(source, /buildPlanTaskEvidenceAudit/);
 });
+
+test("approved plan no-tool guard uses execution checkpoint helper and no-action outcome", () => {
+  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8");
+  const workflowEngine = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"), "utf8");
+
+  assert.match(source, /shouldHandleApprovedPlanExecutionNoTool/);
+  assert.match(source, /approved_plan_no_tool_route/);
+  assert.match(source, /plan_execution_no_tool_reprompt/);
+  assert.match(source, /approved_plan_completion_guard_no_evidence/);
+  assert.match(source, /return \{ status: "stopped_no_action", reason: "approved_plan_completion_guard" \}/);
+  assert.match(workflowEngine, /progress\?\.recoveryReason === "approved_plan_completion_guard_no_evidence"[\s\S]*?"stopped_no_action"/);
+  assert.match(workflowEngine, /const stopBlock = \{/);
+  assert.match(workflowEngine, /type: "system"/);
+  assert.match(workflowEngine, /content: message/);
+  assert.match(workflowEngine, /variant: "execution_checkpoint"/);
+});
+
+test("agent loop blocks execute completion without execution evidence", () => {
+  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8");
+  const orchestrator = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8");
+  const workflowEngine = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"), "utf8");
+
+  assert.match(source, /completionEvidenceRequired === "execution_evidence"/);
+  assert.match(source, /!orchestrator\.hasExecuteOperationEvidence\(\)/);
+  assert.match(source, /execute_completion_outcome_without_evidence/);
+  assert.match(source, /reason: "execution_evidence_required"/);
+  assert.match(source, /parseToolFeedbackEnvelope/);
+  assert.match(source, /feedbackStatus === "no_op"/);
+  assert.match(source, /feedbackStatus === "no_effect_mutation"/);
+  assert.match(source, /already matched requested content/);
+  assert.match(source, /commandResultLooksSuccessful/);
+  assert.match(source, /browserResultLooksSuccessful/);
+  assert.match(orchestrator, /export function isProjectSourceWriteResult/);
+  assert.match(orchestrator, /"noOp"\\s\*:\\s\*true\|NO_EFFECT_MUTATION/);
+  assert.match(workflowEngine, /getExecutionConsentGranted/);
+  assert.match(workflowEngine, /currentTurnExecutionConsent/);
+});
+
+test("debug log compacts repeated prompt and tool payloads instead of storing raw blobs", () => {
+  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/debugLog.ts"), "utf8");
+
+  assert.match(source, /function compactDebugString/);
+  assert.match(source, /stableDebugHash/);
+  assert.match(source, /function summarizeMessageArray/);
+  assert.match(source, /hiddenReasoningChars/);
+  assert.match(source, /largestMessages/);
+  assert.match(source, /function summarizeToolResultLike/);
+  assert.match(source, /feedbackStatus/);
+  assert.match(source, /contentHash/);
+  assert.match(source, /READ_FILE_RESULT\[\\s\\S\]\{300,\}/);
+  assert.match(source, /messages\|agentMessages\|preparedMessages/);
+  assert.match(source, /names: nested/);
+  assert.match(source, /<chars:\$\{normalized\.length\};hash:/);
+  assert.match(source, /const compacted = compactDebugValue\(input\)/);
+  assert.match(source, /redacted\.length > 8_000/);
+});

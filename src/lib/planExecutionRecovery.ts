@@ -628,7 +628,7 @@ export function buildExecuteMaxIterationsPauseNotice(
       "- blockers:",
       ...(blockerLines.length ? blockerLines : ["- 命中执行安全轮次上限"]),
       "",
-      "下一步：点击或发送 Resume Execution / 继续执行，MAIN 会开启新的恢复上下文，复用检查点并收窄只读工具，只执行最小必要的后续动作。",
+      "下一步：点击或发送 Resume Execution / 继续执行。请复用已读上下文，不要重复只读检查；MAIN 会开启新的恢复上下文，复用检查点并收窄只读工具，只执行最小必要的写入、命令验证、浏览器验证或明确阻塞说明。",
     ].filter(Boolean).join("\n");
   }
 
@@ -645,7 +645,7 @@ export function buildExecuteMaxIterationsPauseNotice(
     "- blockers:",
     ...(blockerLines.length ? blockerLines : ["- Hit the execution iteration safety limit"]),
     "",
-    "Next: click or send Resume Execution so MAIN starts a fresh recovery context, reuses the checkpoint, narrows read-only tools, and runs only the minimum necessary next action.",
+    "Next: click or send Resume Execution. Reuse read context instead of repeating read-only checks; MAIN will start a fresh recovery context, reuse the checkpoint, narrow read-only tools, and run only the minimum necessary write, command validation, browser validation, or concrete blocker report.",
   ].filter(Boolean).join("\n");
 }
 

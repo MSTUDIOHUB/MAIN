@@ -403,6 +403,10 @@ export class WorkflowEngine {
       onHookBlocked: (_event: any, _reason: any, _record: any) => { /* UI feedback placeholder */ },
       getCurrentRunIntent: () => sessionGet().getCurrentRunIntent(),
       getRuntimeRunIntent: () => runtimeRunIntent,
+      getExecutionConsentGranted: () => {
+        const consent = sessionGet().currentTurnExecutionConsent;
+        return consent?.granted === true && (!consent.turnId || consent.turnId === turnId);
+      },
       getForcedExecuteRecoveryMode: () => options?.forceExecuteRecoveryMode ?? null,
       getCommandDirective: () => effectiveCommandDirective,
       getWorkflowMode: () => getIntentPolicy(sessionGet().getCurrentRunIntent()).workflowMode,
@@ -1521,10 +1525,20 @@ export class WorkflowEngine {
         });
       },
 
-      onNonActionableStop: (message: string, reason: "no_output" | "no_action" | "missing_tool_loop" | "incomplete_plan", _progress?: Partial<PlanExecutionProgressUpdate>) => {
-        logStoreEvent("non_actionable_stop", { message, reason });
+      onNonActionableStop: (message: string, reason: "no_output" | "no_action" | "missing_tool_loop" | "incomplete_plan", progress?: Partial<PlanExecutionProgressUpdate>) => {
+        logStoreEvent("non_actionable_stop", {
+          reason,
+          recoveryReason: progress?.recoveryReason || null,
+          phase: progress?.phase || null,
+          nextStep: progress?.nextStep || null,
+          repeatedTargets: progress?.repeatedTargets || [],
+          messageChars: message.length,
+          messagePreview: message.replace(/\s+/g, " ").slice(0, 260),
+        });
         const stoppedStatus = reason === "no_output"
           ? "stopped_no_output"
+          : progress?.recoveryReason === "approved_plan_completion_guard_no_evidence"
+          ? "stopped_no_action"
           : reason === "incomplete_plan"
           ? "paused"
           : "stopped_no_action";
@@ -1538,7 +1552,7 @@ export class WorkflowEngine {
               if (t.id === currentStreamingBlockId && t.type === "agent") {
                 const existingAttempts = t.failedAttempts || [];
                 const agentContent = t.content || "";
-                
+
                 // Get corresponding thought/reasoning content if available
                 const thoughtBlock = s.taskFlow.find((tb: any) => tb.id === currentThoughtBlockId && tb.type === "thought");
                 const thoughtContent = thoughtBlock ? thoughtBlock.content : "";
@@ -1564,12 +1578,29 @@ export class WorkflowEngine {
               return t;
             });
           }
+          const stopBlock = {
+            id: sessionGet()._nextTaskId(),
+            turnId,
+            type: "system",
+            content: message,
+            variant: "execution_checkpoint",
+          } as TaskBlock;
+          taskFlow = [...taskFlow, stopBlock];
 
           return {
             taskFlow,
             conversationTurns: s.conversationTurns.map((turn: any) =>
               turn.id === turnId && turn.status !== "awaiting_approval"
-                ? { ...turn, status: stoppedStatus }
+                ? {
+                    ...turn,
+                    status: stoppedStatus,
+                    blockIds: Array.from(new Set([
+                      ...turn.blockIds,
+                      ...taskFlow
+                        .filter((block: any) => block.turnId === turnId)
+                        .map((block: any) => block.id),
+                    ])),
+                  }
                 : turn
             ),
           };

@@ -16,6 +16,12 @@ export type ResolvedRunIntent = ResolvedUserIntent;
 export type RunIntentRiskLevel = "low" | "medium" | "high";
 export type RunIntentUiCategory = "workflow_mode" | "output_style" | "discussion" | "studio_workflow";
 export type RunIntentToolPolicy = "none" | "read_only" | "write" | "plan_gated" | "studio_workflow";
+export type EffectiveTurnApprovalState = "not_required" | "needs_approval" | "approved";
+export type EffectiveTurnCompletionEvidence =
+  | "none"
+  | "answer"
+  | "plan_artifact"
+  | "execution_evidence";
 export type PendingRunDecisionKind = "intent_confirmation" | "execution_consent" | "mode_switch";
 export type PendingRunDecisionSource = "pre_submit" | "preflight" | "model" | "tool_gate";
 export type PendingRunDecisionChoice =
@@ -143,6 +149,16 @@ export interface RunIntentPolicy {
   label: { zh: string; en: string };
   categoryLabel: { zh: string; en: string };
   description: { zh: string; en: string };
+}
+
+export interface EffectiveTurnContract {
+  conversationIntent: ResolvedUserIntent;
+  runtimeIntent: ResolvedUserIntent;
+  approvalState: EffectiveTurnApprovalState;
+  allowedToolRisks: RunIntentToolPolicy;
+  mutationExpected: boolean;
+  validationExpected: boolean;
+  completionEvidenceRequired: EffectiveTurnCompletionEvidence;
 }
 
 const RUN_INTENT_POLICIES: Record<ResolvedUserIntent, RunIntentPolicy> = {
@@ -298,6 +314,7 @@ const STRONG_PLAN_PATTERNS = [
 const STRONG_EXECUTE_PATTERNS = [
   /^(?:执行|开始执行|继续执行)(?:修复|修改|处理|实现|改动|改造|重构|完善|部署|发布)/i,
   /(?:找到|定位|找出|排查|诊断|分析|检查).{0,40}(?:问题|bug|错误|异常|故障|原因|root cause).{0,80}(?:修复|解决|修改|改掉|处理)/i,
+  /(?:找到|定位|找出|排查|诊断|分析|检查).{0,40}(?:问题|bug|错误|异常|故障|原因|root cause).{0,80}(?:并|并且|然后|后|来|并进行)?.{0,16}(?:解决|搞定|处理掉|修好|修掉)/i,
   /^(?:帮我|请|直接|现在)?(?:修复|解决|处理)(?:一下|下)?(?:这个|该|当前)?(?:问题|bug|错误|故障|异常|展示问题|显示问题|逻辑问题|功能问题|页面问题|组件问题)?/i,
   /(?:帮我|请|直接|现在)?(?:修复|解决|改掉).{0,48}(?:问题|bug|错误|故障|异常|展示|显示|逻辑|功能|页面|组件|模块)/i,
   /(?:帮我|请|直接|现在)?(?:修改|改一下|改动|处理一下)(?:这个|该|当前)?(?:功能|逻辑|问题|模块|文件)?/i,
@@ -652,6 +669,71 @@ function createCommandDirective(
   };
 }
 
+export function buildEffectiveTurnContract(input: {
+  conversationIntent: ResolvedUserIntent;
+  runtimeIntent?: ResolvedUserIntent | null;
+  commandDirective?: CommandDirective | null;
+  planApproved?: boolean;
+  executionConsentGranted?: boolean;
+}): EffectiveTurnContract {
+  const conversationIntent = input.conversationIntent;
+  const runtimeIntent =
+    input.runtimeIntent ??
+    (conversationIntent === "plan" && input.planApproved ? "execute" : conversationIntent);
+  const runtimePolicy = getIntentPolicy(runtimeIntent);
+  const directiveKind = input.commandDirective?.kind ?? "none";
+  const operationDirective =
+    directiveKind === "file_modify" ||
+    directiveKind === "shell" ||
+    directiveKind === "git" ||
+    directiveKind === "unity" ||
+    directiveKind === "studio" ||
+    directiveKind === "mcp" ||
+    directiveKind === "plan_resume" ||
+    directiveKind === "plan_approval";
+  const mutationExpected =
+    runtimeIntent === "execute" ||
+    runtimeIntent === "studio_workflow" ||
+    (conversationIntent === "plan" && input.planApproved === true) ||
+    directiveKind === "file_modify" ||
+    directiveKind === "shell" ||
+    directiveKind === "git" ||
+    directiveKind === "studio";
+  const validationExpected =
+    mutationExpected ||
+    directiveKind === "unity" ||
+    directiveKind === "mcp";
+  const needsApproval =
+    input.executionConsentGranted !== true &&
+    (input.commandDirective?.requiresApproval === true || mutationExpected || operationDirective) &&
+    !(conversationIntent === "plan" && input.planApproved === true) &&
+    directiveKind !== "plan_approval" &&
+    directiveKind !== "plan_resume";
+  const approvalState: EffectiveTurnApprovalState =
+    input.executionConsentGranted === true || input.planApproved === true
+      ? "approved"
+      : needsApproval
+      ? "needs_approval"
+      : "not_required";
+  const completionEvidenceRequired: EffectiveTurnCompletionEvidence =
+    mutationExpected
+      ? "execution_evidence"
+      : conversationIntent === "plan"
+      ? "plan_artifact"
+      : runtimePolicy.toolPolicy === "read_only"
+      ? "answer"
+      : "none";
+  return {
+    conversationIntent,
+    runtimeIntent,
+    approvalState,
+    allowedToolRisks: runtimePolicy.toolPolicy,
+    mutationExpected,
+    validationExpected,
+    completionEvidenceRequired,
+  };
+}
+
 export function normalizeCommandDirective(
   value: unknown,
   fallback?: CommandDirective | null,
@@ -831,7 +913,7 @@ export function inferCommandDirective(
     });
   }
 
-  if (/(?:修改|实现|修复|写入|创建|生成|补上|改掉|落地|新增|增加|添加|加入|接入|完善|开发|删除|替换|重构)|\b(?:implement|fix|write|create|generate|update|patch|modify|refactor|delete|replace|add)\b/i.test(normalizedInput) && (intent === "execute" || intent === "plan")) {
+  if (/(?:修改|实现|修复|解决|处理|写入|创建|生成|补上|改掉|落地|新增|增加|添加|加入|接入|完善|开发|删除|替换|重构)|\b(?:implement|fix|repair|resolve|write|create|generate|update|patch|modify|refactor|delete|replace|add)\b/i.test(normalizedInput) && (intent === "execute" || intent === "plan")) {
     return createCommandDirective("file_modify", {
       source,
       action: intent === "plan" ? "plan_file_change" : "workspace_file_change",

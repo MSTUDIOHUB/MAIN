@@ -24,7 +24,7 @@ import { buildPlanAutoScaffoldPrompt, buildPlanEvidenceRecoveryBlockedPrompt, bu
 import { initialLifecycleStateForPlanAction, planRuntimeToolCall } from "../../runtimeTools";
 import type { AppConfig } from "../../../store/useAppStore";
 import { buildPlanTaskEvidenceAudit, hasBrowserValidationCapability, isPlanTaskTrustedComplete, looksLikeSubstantivePlanAssistantText, type PlanExecutionProgressPhase, type PlanExecutionProgressUpdate, type PlanRuntimePhase } from "../../workflowModels";
-import { hasExplicitUnityConsoleDiagnosticCue, type ResolvedUserIntent } from "../../runIntent";
+import { buildEffectiveTurnContract, hasExplicitUnityConsoleDiagnosticCue, type EffectiveTurnContract, type ResolvedUserIntent } from "../../runIntent";
 import { loadResolvedInstructions } from "../../instructions";
 import { loadHooksConfig } from "../../hooks";
 import { buildRepeatLoopArgsKey, buildRepeatLoopSignature, formatRepeatLoopFatalMessage, formatRepeatLoopRecoveryMessage, formatTargetProgressLoopRecoveryMessage, getShellMutationTargetForLoopGuard, isReadOnlyShellInspectionToolCall, registerTargetProgressEventForLoopGuard, registerToolCallForRepeatGuard } from "../../repetitionGuard";
@@ -37,10 +37,12 @@ import { buildMissingToolCallContinuationPrompt, resolveMissingToolCallRepromptK
 import { buildPlanExecutionProgressUpdate, buildExecuteMaxIterationsPauseNotice, buildPlanNoProgressLoopPauseNotice, buildPlanProgressSignatureFromToolActivity, buildPlanMaxIterationsCheckpoint, buildPlanMaxIterationsPauseNotice, isCachedReadOnlyPlanActivity, summarizeRepeatedPlanTargetsFromToolActivity, type PlanToolActivitySummary } from "../../planExecutionRecovery";
 import { describeApprovedPlanRecoveryToolSurface, describeApprovedPlanSourceEditFirstToolSurface, isApprovedPlanCachedReadOnlyNoProgressBatch, shouldBypassApprovedPlanReadCacheForPatchRecovery, shouldAllowApprovedPlanRecoveryFileRead } from "../../approvedPlanRecoveryTools";
 import { buildExecuteNoProgressLoopPauseNotice, buildExecuteRecoveryPrompt, buildExecuteValidationRecoveryPrompt, describeExecuteRecoveryToolSurface, isExecuteRecoveryToolName, normalizeExecuteRecoveryMode, resolveExecuteReadOnlyRecoveryTrigger, resolveReadOnlyNoProgressTrigger, shouldAllowExecuteRecoveryFileRead, summarizeRepeatedExecuteTargets, type ExecuteRecoveryMode } from "../../executeRecoveryTools";
-import { buildPlanExecutionNoToolRecoveryPrompt } from "../../planExecutionNoTool";
+import { buildPlanExecutionNoToolRecoveryPrompt, shouldHandleApprovedPlanExecutionNoTool } from "../../planExecutionNoTool";
 import { buildExecutionDigest } from "../../executionDigest";
 import { withEventSchema, type MainThreadEventInput, type MainThreadItem } from "../../turnEvents";
 import { composeReviewablePlanFromEvidence, summarizePlanEvidenceDetail } from "../../planMaterialization";
+import { parseToolFeedbackEnvelope } from "../../toolFeedbackEnvelope";
+import { browserResultLooksSuccessful, commandResultLooksSuccessful } from "../../planEvidence";
 import { progressNarrationToText } from "../../progressNarration";
 import { buildChatFinalSynthesisPrompt, buildEmptyModelResponsePauseNotice, buildMaxStepsFinalTextPrompt, buildMaxStepsToolCallIgnoredNotice, resolveAgentLoopMaxIterations, shouldTriggerChatFinalSynthesis, shouldUseMaxStepsFinalTextOnly, type AgentLoopIterationLimits } from "../../agentLoopSafety";
 import { buildTaskTargetingProfile, getTaskTargetingEvidenceKey, shouldBlockToolCallForTargeting, type TaskOrchestratorPhase } from "../../taskTargeting";
@@ -52,6 +54,17 @@ import { deriveStreamSettings, resolveEffectiveToolProtocol, shouldUseXmlToolPro
 import { AgentMessage, ToolExecutionResult, FetchLLMStreamOptions, CachedReadOnlyToolResult, ToolCallToExecute, ToolCallInMessage, OrchestratorCallbacks, type AgentLoopOutcome } from "../types";
 
 export class AgentOrchestrator {
+    private sawExecutionEvidence = false;
+    private latestTurnContract: EffectiveTurnContract | null = null;
+
+    hasExecuteOperationEvidence(): boolean {
+        return this.sawExecutionEvidence;
+    }
+
+    getLatestTurnContract(): EffectiveTurnContract | null {
+        return this.latestTurnContract;
+    }
+
     async prepareTurn() {
         // TODO: Extract Phase 4 setup logic here in future iterations
         // Requires AgentTurnContext to pass 117+ variables
@@ -66,6 +79,8 @@ export class AgentOrchestrator {
     }
 
     async execute(callbacks: OrchestratorCallbacks, abortController: AbortController) {
+        this.sawExecutionEvidence = false;
+        this.latestTurnContract = null;
         const config = callbacks.getConfig();
         const isCloudProfile = config.activeProfile === "cloud";
         const skills = callbacks.getSkills();
@@ -519,6 +534,16 @@ export class AgentOrchestrator {
         let appliedSystemPromptKey = "";
         const applySystemPromptForRuntime = (runtimeIntent: ResolvedUserIntent, tools: ToolDefinition[]) => {
                 const availableToolNameList = tools.map((tool) => tool.function.name);
+                const effectiveTurnContract = buildEffectiveTurnContract({
+                  conversationIntent: callbacks.getCurrentRunIntent(),
+                  runtimeIntent,
+                  commandDirective: callbacks.getCommandDirective?.() ?? null,
+                  planApproved: callbacks.getIsPlanApproved(),
+                  executionConsentGranted:
+                    callbacks.getExecutionConsentGranted?.() === true ||
+                    callbacks.getIsPlanApproved(),
+                });
+                this.latestTurnContract = effectiveTurnContract;
                 const webResearchPromptDate = (
                   availableToolNameList.includes("web_search") ||
                   availableToolNameList.includes("web_fetch")
@@ -534,6 +559,9 @@ export class AgentOrchestrator {
                   callbacks.getGameStudioConfig?.()?.engineVersion ?? "",
                   callbacks.getCommandDirective?.()?.kind ?? "none",
                   callbacks.getCommandDirective?.()?.action ?? "",
+                  effectiveTurnContract.approvalState,
+                  effectiveTurnContract.mutationExpected ? "mutation" : "no-mutation",
+                  effectiveTurnContract.completionEvidenceRequired,
                   mcpPriorityEngine ?? "",
                   gameStudioMcpFirstEligible ? "game-studio-mcp-first" : "",
                   unityMcpFirstPhaseActive ? "unity-mcp-first" : "",
@@ -606,6 +634,7 @@ export class AgentOrchestrator {
                     ),
                     modelProtocolNotes: modelProtocolProfile.notes,
                   },
+                  effectiveTurnContract,
                 );
                 const currentMessages = callbacks.getMessages();
                 if (currentMessages.length === 0) {
@@ -633,6 +662,7 @@ export class AgentOrchestrator {
                   availableTools: availableToolNameList.length,
                   mcpTools: mcpToolNames.length,
                   toolSchemaChars: JSON.stringify(tools).length,
+                  effectiveTurnContract,
                 });
               };
         const initialRuntimeIntent = resolveRuntimeIntent();
@@ -793,6 +823,31 @@ export class AgentOrchestrator {
         const attemptedPlanWriteTargets: string[] = [];
         let recentSuccessfulProjectWrite: { name: string; target: string } | null = null;
         let sawExecuteOperationEvidence = false;
+        const markExecuteOperationEvidence = () => {
+          sawExecuteOperationEvidence = true;
+          this.sawExecutionEvidence = true;
+        };
+        const toolResultCountsAsExecutionEvidence = (result: ToolExecutionResult, args: Record<string, unknown>): boolean => {
+          if (result.isError) return false;
+          const envelope = parseToolFeedbackEnvelope(result.content || "");
+          const feedbackStatus = envelope?.envelope.status || "";
+          if (feedbackStatus === "no_op" || feedbackStatus === "no_effect_mutation" || feedbackStatus === "cached") {
+            return false;
+          }
+          if (/"noOp"\s*:\s*true|NO_EFFECT_MUTATION|FILE_UNCHANGED_STUB|READ_FILE_REPEAT_LIMIT|READ_ONLY_REPEAT_LIMIT|no-op|nothing to (?:change|patch|write)|already matched requested content/i.test(result.content || "")) {
+            return false;
+          }
+          if (isSuccessfulPlanArtifactWriteResult(result) || isExecutionPlanArtifactWrite(result.name, args) || isTasksPlanWrite(result.name, args)) {
+            return false;
+          }
+          if (result.name === "run_command" && !commandResultLooksSuccessful(result.name, result.content || "")) {
+            return false;
+          }
+          if (result.name === "browser_evaluate" && !browserResultLooksSuccessful(result.content || "")) {
+            return false;
+          }
+          return !PLAN_EXPLORATION_READ_ONLY_TOOLS.has(result.name);
+        };
         let recoveringFromEmptyAssistantReplyAfterWrite = false;
         let lastAssistantTextForCheckpoint = "";
         const recentPlanToolActivity: PlanToolActivitySummary[] = [];
@@ -3061,7 +3116,6 @@ export class AgentOrchestrator {
           hasExecutableProposalReplyOptions(normalized.replyOptions);
         const currentPlanStageForReview = callbacks.getPlanStage();
         const isApprovedPlanExecutionTurn =
-          workflowMode === "plan" &&
           callbacks.getIsPlanApproved() &&
           currentPlanStageForReview === "executing";
         const suppressApprovedPlanExecutionReplyOptions =
@@ -3452,8 +3506,8 @@ export class AgentOrchestrator {
         }
 
         const approvedPlanAuditForNoTool =
-          workflowMode === "plan" &&
           callbacks.getIsPlanApproved() &&
+          currentPlanStageForReview === "executing" &&
           effectiveToolCalls.length === 0
             ? buildPlanTaskEvidenceAudit({
                 tasks: callbacks.getPlanTasks(),
@@ -3462,18 +3516,28 @@ export class AgentOrchestrator {
               })
             : null;
         const approvedPlanMissingTasksForNoTool =
-          workflowMode === "plan" &&
           callbacks.getIsPlanApproved() &&
+          currentPlanStageForReview === "executing" &&
           effectiveToolCalls.length === 0 &&
           approvedPlanAuditForNoTool?.totalCount === 0;
         const hasRemainingApprovedPlanTasksForNoTool =
-          workflowMode === "plan" &&
           callbacks.getIsPlanApproved() &&
+          currentPlanStageForReview === "executing" &&
           effectiveToolCalls.length === 0 &&
           !!approvedPlanAuditForNoTool &&
           (!approvedPlanAuditForNoTool.allTrustedComplete || approvedPlanAuditForNoTool.pendingExternalValidation);
+        const shouldHandleApprovedPlanNoTool =
+          shouldHandleApprovedPlanExecutionNoTool({
+            workflowMode,
+            isPlanApproved: callbacks.getIsPlanApproved(),
+            planStage: currentPlanStageForReview,
+            toolCallCount: effectiveToolCalls.length,
+            audit: approvedPlanAuditForNoTool,
+          });
         const shouldSuppressApprovedPlanNoToolText =
-          approvedPlanMissingTasksForNoTool || hasRemainingApprovedPlanTasksForNoTool;
+          shouldHandleApprovedPlanNoTool ||
+          approvedPlanMissingTasksForNoTool ||
+          hasRemainingApprovedPlanTasksForNoTool;
         const rejectedCompletionClaim =
           shouldSuppressApprovedPlanNoToolText && looksLikePlanCompletionClaim(userVisibleText);
         const shouldHideApprovedPlanNoToolText =
@@ -3491,6 +3555,24 @@ export class AgentOrchestrator {
             remaining: approvedPlanAuditForNoTool?.remainingTasks.length ?? 0,
             visibleChars: userVisibleText.length,
             preservedVisibleText: !shouldHideApprovedPlanNoToolText,
+          });
+        }
+        if (
+          callbacks.getIsPlanApproved() &&
+          currentPlanStageForReview === "executing" &&
+          effectiveToolCalls.length === 0
+        ) {
+          logAgentEvent("approved_plan_no_tool_route", {
+            iteration,
+            planStage: currentPlanStageForReview,
+            handledByExecutionCheckpoint: shouldHandleApprovedPlanNoTool,
+            missingTasksArtifact: approvedPlanMissingTasksForNoTool,
+            remainingTasks: approvedPlanAuditForNoTool?.remainingTasks.length ?? 0,
+            pendingUserValidation: approvedPlanAuditForNoTool?.pendingUserValidationTasks.length ?? 0,
+            pendingExternalValidation: approvedPlanAuditForNoTool?.pendingExternalValidation ?? false,
+            allTrustedComplete: approvedPlanAuditForNoTool?.allTrustedComplete ?? false,
+            acceptedCompletion: approvedPlanAuditForNoTool?.acceptedCompletion ?? false,
+            visibleChars: userVisibleText.length,
           });
         }
 
@@ -4122,6 +4204,9 @@ export class AgentOrchestrator {
             auditCompleted: approvedPlanAuditForNoTool?.completedCount ?? 0,
             auditTotal: approvedPlanAuditForNoTool?.totalCount ?? 0,
             remaining: approvedPlanAuditForNoTool?.remainingTasks.length ?? 0,
+            pendingUserValidation: approvedPlanAuditForNoTool?.pendingUserValidationTasks.length ?? 0,
+            pendingExternalValidation: approvedPlanAuditForNoTool?.pendingExternalValidation ?? false,
+            route: "approved_plan_execution_no_tool",
           });
           approvedPlanActionOnlyRecoveryActive = true;
           approvedPlanNoToolRecoveryFileReadActive = true;
@@ -4155,7 +4240,14 @@ export class AgentOrchestrator {
                 rejectedCompletionClaim,
                 Array.from(availableToolNames),
               ),
-              "incomplete_plan",
+              "no_action",
+              {
+                phase: "paused",
+                recoveryReason: "plan_execution_no_tool_checkpoint",
+                nextStep: language === "zh"
+                  ? "复用已读计划和任务上下文，转向写入、命令验证、浏览器验证或明确阻塞"
+                  : "reuse the approved plan/task context and pivot to write, command validation, browser validation, or a concrete blocker",
+              },
             );
             callbacks.onStatusChange("idle");
             return;
@@ -5800,10 +5892,10 @@ export class AgentOrchestrator {
 
         for (const result of allResults) {
           if (result.isError) continue;
-          if (!PLAN_EXPLORATION_READ_ONLY_TOOLS.has(result.name)) {
-            sawExecuteOperationEvidence = true;
-          }
           const resultArgs = toolArgsByCallId.get(result.toolCallId) ?? {};
+          if (toolResultCountsAsExecutionEvidence(result, resultArgs)) {
+            markExecuteOperationEvidence();
+          }
           const targetingEvidenceKey = getTaskTargetingEvidenceKey(result.name, resultArgs, result.target);
           if (targetingEvidenceKey) {
             taskTargetingEvidence.add(targetingEvidenceKey);
@@ -5826,12 +5918,12 @@ export class AgentOrchestrator {
               name: result.name,
               target: result.target,
             };
-            sawExecuteOperationEvidence = true;
+            markExecuteOperationEvidence();
             recoveringFromEmptyAssistantReplyAfterWrite = false;
             continue;
           }
           if (EXECUTION_VERIFICATION_TOOL_NAMES.has(result.name)) {
-            sawExecuteOperationEvidence = true;
+            markExecuteOperationEvidence();
             recentSuccessfulProjectWrite = null;
             recoveringFromEmptyAssistantReplyAfterWrite = false;
           }
@@ -7176,6 +7268,7 @@ export async function executeAgentLoop(callbacks: OrchestratorCallbacks, abortCo
         onNonActionableStop: (message, reason, progress) => {
             const status: AgentLoopOutcome["status"] =
                 reason === "no_output" ? "stopped_no_output" :
+                progress?.recoveryReason === "approved_plan_completion_guard_no_evidence" ? "stopped_no_action" :
                 reason === "incomplete_plan" ? "paused" :
                 "stopped_no_action";
             setOutcome({ status, reason });
@@ -7204,7 +7297,7 @@ export async function executeAgentLoop(callbacks: OrchestratorCallbacks, abortCo
             evidenceLedger: callbacks.getPlanExecutionEvidenceLedger(),
             highlightNext: true,
         });
-        if (audit.totalCount === 0 || !audit.allTrustedComplete || audit.pendingExternalValidation || audit.pendingUserValidationTasks.length > 0) {
+        if (audit.totalCount === 0 || !audit.allTrustedComplete || audit.pendingExternalValidation || audit.pendingUserValidationTasks.length > 0 || !orchestrator.hasExecuteOperationEvidence()) {
             const language = callbacks.getPreferredLanguage();
             const remainingText = formatPlanAuditRemainingTasks(
                 audit,
@@ -7213,12 +7306,15 @@ export async function executeAgentLoop(callbacks: OrchestratorCallbacks, abortCo
                     ? "- 已批准 Plan 尚未产生可审计的运行时任务证据。"
                     : "- The approved Plan has not produced auditable runtime task evidence yet.",
             );
-            logAgentEvent("plan_completion_guard_outcome_paused", {
+            logAgentEvent("plan_completion_guard_outcome_no_evidence", {
                 completed: audit.completedCount,
                 total: audit.totalCount,
                 remaining: audit.remainingTasks.length,
                 pendingExternalValidation: audit.pendingExternalValidation,
                 pendingUserValidation: audit.pendingUserValidationTasks.length,
+                acceptedCompletion: audit.acceptedCompletion,
+                allTrustedComplete: audit.allTrustedComplete,
+                sawExecutionEvidence: orchestrator.hasExecuteOperationEvidence(),
             });
             callbacks.onNonActionableStop(
                 buildApprovedPlanNoToolPauseMessage(
@@ -7229,10 +7325,64 @@ export async function executeAgentLoop(callbacks: OrchestratorCallbacks, abortCo
                     false,
                 ),
                 "incomplete_plan",
+                {
+                    phase: "paused",
+                    recoveryReason: "approved_plan_completion_guard_no_evidence",
+                    nextStep: language === "zh"
+                        ? "批准计划尚缺真实执行证据；恢复后必须写入、运行命令、做浏览器验证，或明确外部验证边界。"
+                        : "The approved plan still lacks real execution evidence; resume by writing, running commands, browser-validating, or stating the external validation boundary.",
+                },
             );
             callbacks.onStatusChange("idle");
-            return { status: "paused", reason: "approved_plan_completion_guard" };
+            return { status: "stopped_no_action", reason: "approved_plan_completion_guard" };
         }
+    }
+
+    const finalRuntimeIntent =
+        callbacks.getRuntimeRunIntent?.() ??
+        (callbacks.getCurrentRunIntent() === "plan" && callbacks.getIsPlanApproved()
+            ? "execute"
+            : callbacks.getCurrentRunIntent());
+    const finalTurnContract = orchestrator.getLatestTurnContract() ?? buildEffectiveTurnContract({
+        conversationIntent: callbacks.getCurrentRunIntent(),
+        runtimeIntent: finalRuntimeIntent,
+        commandDirective: callbacks.getCommandDirective?.() ?? null,
+        planApproved: callbacks.getIsPlanApproved(),
+        executionConsentGranted:
+            callbacks.getExecutionConsentGranted?.() === true ||
+            callbacks.getIsPlanApproved(),
+    });
+    const approvedPlanAlreadyAudited =
+        callbacks.getWorkflowMode() === "plan" &&
+        callbacks.getIsPlanApproved();
+    if (
+        outcome.status === "completed" &&
+        finalTurnContract.completionEvidenceRequired === "execution_evidence" &&
+        !approvedPlanAlreadyAudited &&
+        !orchestrator.hasExecuteOperationEvidence()
+    ) {
+        const language = callbacks.getPreferredLanguage();
+        logAgentEvent("execute_completion_outcome_without_evidence", {
+            conversationIntent: finalTurnContract.conversationIntent,
+            runtimeIntent: finalTurnContract.runtimeIntent,
+            approvalState: finalTurnContract.approvalState,
+            mutationExpected: finalTurnContract.mutationExpected,
+            evidenceRequired: finalTurnContract.completionEvidenceRequired,
+        });
+        callbacks.onNonActionableStop(
+            language === "zh"
+                ? "执行已暂停：本轮需要真实执行证据，但没有检测到源码/文件写入、成功命令、浏览器验证或明确外部验证边界。如果前面只是重复只读检查，请复用已读上下文，恢复后直接调用可用写入/验证工具，或说明具体阻塞。"
+                : "Execution paused: this turn required execution evidence, but no source/file write, successful command, browser validation, or explicit external validation boundary was detected. If the prior steps were read-only, reuse read context and resume by calling the available write/validation tools, or state the concrete blocker.",
+            "no_action",
+            {
+                phase: "paused",
+                nextStep: language === "zh"
+                    ? "复用已读上下文，恢复后必须产生真实写入/验证证据，或明确阻塞。"
+                    : "Reuse read context and resume with real write/validation evidence, or a concrete blocker.",
+            },
+        );
+        callbacks.onStatusChange("idle");
+        return { status: "stopped_no_action", reason: "execution_evidence_required" };
     }
 
     return outcome;

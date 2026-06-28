@@ -315,6 +315,56 @@ test("tool protocol card gives compact XML instructions for local text tools", (
   assert.doesNotMatch(card, /run_command\(command/);
 });
 
+test("tool protocol card with no tools does not emit XML examples", () => {
+  const card = buildToolProtocolCard({
+    activeProfile: "local",
+    provider: "OMLX",
+    toolProtocol: "xml",
+    nativeToolsEnabled: false,
+    workflowMode: "plan",
+    availableToolNames: [],
+    language: "zh",
+  });
+
+  assert.match(card, /availableTools: none/);
+  assert.doesNotMatch(card, /<tool_use>/);
+  assert.doesNotMatch(card, /<tool>read_file<\/tool>/);
+  assert.match(card, /不要输出 XML 工具块/);
+});
+
+test("workflow prompt with no tools does not show executable XML templates", () => {
+  const prompt = buildSystemPrompt(
+    [],
+    "/tmp/workspace",
+    "main_mode",
+    "",
+    [],
+    [],
+    "plan",
+    "zh",
+    null,
+    undefined,
+    "plan",
+    "english_core_localized_output",
+    [],
+    null,
+    undefined,
+    {
+      displayLanguage: "zh",
+      resolvedResponseLanguage: "zh",
+    },
+  );
+
+  assert.match(prompt, /availableTools: none/);
+  assert.match(prompt, /本轮没有暴露可调用工具/);
+  assert.match(prompt, /没有计划写入工具时 plan\.md 不强制/);
+  assert.match(prompt, /不要声称已经写入计划文件/);
+  assert.doesNotMatch(prompt, /<tool_use>/);
+  assert.doesNotMatch(prompt, /<tool>read_file<\/tool>/);
+  assert.doesNotMatch(prompt, /plan\.md 必选/);
+  assert.doesNotMatch(prompt, /先用 `get_project_skeleton`/);
+});
+
 test("English tabular XML example avoids domain-specific sample names", () => {
   const card = buildToolProtocolCard({
     activeProfile: "local",
@@ -388,6 +438,35 @@ test("system prompt lists only intent-filtered tools when available names are pr
   assert.doesNotMatch(prompt, /execute_command/);
 });
 
+test("execute prompt does not instruct unavailable apply_patch", () => {
+  const prompt = buildSystemPrompt(
+    [],
+    "/tmp/workspace",
+    "main_mode",
+    "",
+    [],
+    [],
+    "edit",
+    "zh",
+    null,
+    undefined,
+    "execute",
+    "english_core_localized_output",
+    ["read_file", "write_file", "replace_in_file"],
+    { kind: "file_modify", requiresApproval: true },
+    undefined,
+    {
+      displayLanguage: "zh",
+      resolvedResponseLanguage: "zh",
+    },
+  );
+
+  assert.match(prompt, /\[TURN INTENT: EXECUTE\]/);
+  assert.match(prompt, /可用写入工具：`replace_in_file`、`write_file`|可用写入工具：`write_file`、`replace_in_file`/);
+  assert.doesNotMatch(prompt, /apply_patch/);
+  assert.doesNotMatch(prompt, /\[TURN INTENT: PLAN\]/);
+});
+
 test("data analyst plan prompt uses interactive planning and analysis semantics", () => {
   const prompt = buildSystemPrompt(
     [],
@@ -424,8 +503,8 @@ test("plan prompt prefers pre-approval plan.md writes for complex planning", () 
   );
 
   assert.match(prompt, /正式审批首选写入 `\.MAIN\/plans\/plan\.md`/);
-  assert.match(prompt, /证据足够后用 `write_file` 或 `replace_in_file` 创建\/更新 `\.MAIN\/plans\/plan\.md`|再写 `\.\.MAIN\/plans\/plan\.md`/);
-  assert.match(prompt, /唯一允许的写操作是|the only allowed write is/);
+  assert.match(prompt, /证据足够后用 `write_file`、`replace_in_file` 写 `\.MAIN\/plans\/plan\.md`|收集只读证据后，用本轮可用计划写入工具/);
+  assert.doesNotMatch(prompt, /\.\.MAIN\/plans\/plan\.md|\.\\\.MAIN\/plans\/plan\.md/);
   assert.doesNotMatch(prompt, /MAIN runtime 会物化为 `\.MAIN\/plans\/plan\.md`/);
 });
 
@@ -466,7 +545,7 @@ test("respond prompt no longer tells the user to switch Chat or Fast or Plan", (
   assert.match(prompt, /\[TURN INTENT: RESPOND\]/);
   assert.match(prompt, /批准执行本轮操作/);
   assert.match(prompt, /action="approve_operation_once"/);
-  assert.match(prompt, /未获批准时不要调用 replace_in_file、write_file、execute_command/);
+  assert.match(prompt, /未获批准时不要调用本轮写入或执行工具/);
   assert.match(prompt, /运行时已经把本轮升级到 execute 能力/);
   assert.match(prompt, /如果不确定用户到底是要继续讨论\/调整方案，还是要进入真实执行/);
   assert.doesNotMatch(prompt, /不要调用 replace_in_file、write_file、execute_command 等写入或执行工具。/);
@@ -665,7 +744,7 @@ test("execute prompt enforces strict immediate tool execution constraints", () =
 
   assert.match(prompt, /【必须立即行动，禁止在正文输出纯文字规划或步骤描述】/);
   assert.match(prompt, /绝对禁止输出类似“我接下来的计划是：”/);
-  assert.match(prompt, /必须立刻发起真实工具调用/);
+  assert.match(prompt, /必须立刻发起本轮真实暴露的工具调用/);
   assert.match(prompt, /【绝对禁止只说不做】/);
 });
 
@@ -701,4 +780,3 @@ test("system prompt contains strict steering file creation prohibition rules", (
   assert.match(prompt, /Steering 发现规则/);
   assert.match(prompt, /绝对禁止主动创建此目录或任何 steering 规范文件/);
 });
-

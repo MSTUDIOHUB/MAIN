@@ -11,7 +11,14 @@ import {
   getApplicableProtocolPackagesForWorkspace,
   getProtocolPackageEntryPath,
 } from "./protocolPackages";
-import { getIntentPolicy, resolveRunIntentFromLegacyWorkflowMode, type CommandDirective, type ResolvedUserIntent } from "./runIntent";
+import {
+  buildEffectiveTurnContract,
+  getIntentPolicy,
+  resolveRunIntentFromLegacyWorkflowMode,
+  type CommandDirective,
+  type EffectiveTurnContract,
+  type ResolvedUserIntent,
+} from "./runIntent";
 import { mapLegacyNexusModeToMainMode, type MainModeKey } from "./mainModes";
 import type { PromptLanguageStrategy } from "./toolCapabilities";
 import { buildWebResearchDateContext } from "./webResearchGuard";
@@ -212,13 +219,15 @@ function compactToolSignature(name: string): string {
 }
 
 function selectProtocolExampleTool(available: string[]): string {
+  if (available.length === 0) return "";
   if (available.includes("read_file")) return "read_file";
   if (available.includes("analyze_tabular_document")) return "analyze_tabular_document";
   if (available.includes("get_project_skeleton")) return "get_project_skeleton";
-  return available[0] || "read_file";
+  return available[0] || "";
 }
 
 function buildXmlExample(toolName: string): string[] {
+  if (!toolName) return [];
   if (toolName === "read_file") {
     return [
       "<tool_use>",
@@ -341,6 +350,19 @@ export function buildToolProtocolCard(profile: ToolProtocolCardProfile): string 
     ].join("\n");
   }
 
+  if (available.length === 0) {
+    return [
+      "================================",
+      "[TOOL PROTOCOL CARD]",
+      `profile: ${provider}; protocol: xml-text`,
+      "availableTools: none",
+      language === "zh"
+        ? "本轮没有暴露可调用工具。不要输出 XML 工具块、伪工具调用或 `[Tool call: ...]`；请用用户可见 Markdown 简短说明当前缺少工具能力、等待批准或给出可执行阻塞点。"
+        : "No callable tools are exposed this turn. Do not output XML tool blocks, pseudo tool calls, or `[Tool call: ...]`; respond in user-visible Markdown with the exact missing capability, pending approval, or actionable blocker.",
+      ...modelNormalizationSection,
+    ].join("\n");
+  }
+
   return [
     "================================",
     "[TOOL PROTOCOL CARD]",
@@ -404,13 +426,20 @@ const WORKFLOW_BUILT_IN_TOOL_NAMES = [
 ];
 
 function filterAvailableToolNames(names: string[], availableToolNames?: string[]): string[] {
-  if (!availableToolNames || availableToolNames.length === 0) return names;
+  if (!availableToolNames) return names;
+  if (availableToolNames.length === 0) return [];
   const available = new Set(availableToolNames);
   return names.filter((name) => available.has(name));
 }
 
 function isToolNameAvailable(name: string, availableToolNames?: string[]): boolean {
-  return !availableToolNames || availableToolNames.length === 0 || availableToolNames.includes(name);
+  return !availableToolNames || availableToolNames.includes(name);
+}
+
+function formatAvailableToolNamesOrFallback(names: string[], fallback: string): string {
+  return names.length > 0
+    ? names.map((name) => `\`${name}\``).join("、")
+    : fallback;
 }
 
 function formatToolNameList(
@@ -449,6 +478,7 @@ export function buildSystemPrompt(
   mcpPriorityContext?: McpPriorityPromptContext,
   languageContract?: LanguageContract,
   toolProtocolProfile?: Omit<ToolProtocolCardProfile, "availableToolNames" | "workflowMode" | "language">,
+  effectiveTurnContract?: EffectiveTurnContract,
 ): string {
   const parts: string[] = [];
   const displayLanguage = languageContract?.displayLanguage === "en" ? "en" : "zh";
@@ -467,6 +497,11 @@ export function buildSystemPrompt(
   const instructionLanguageName = languageName(instructionLanguage);
   const turnIntent = turnIntentOverride ?? resolveRunIntentFromLegacyWorkflowMode(workflowMode ?? "chat");
   const turnIntentPolicy = getIntentPolicy(turnIntent);
+  const turnContract = effectiveTurnContract ?? buildEffectiveTurnContract({
+    conversationIntent: turnIntent,
+    runtimeIntent: turnIntent,
+    commandDirective,
+  });
   const userOptionInstruction = resolvedResponseLanguage === "en"
     ? "4. `<option>` is sent back as the user's next message: if the option asks you to continue investigating, confirming, reading, analyzing, or executing, write it as a user instruction (for example, \"Please confirm whether the imported result reached the target state\" or \"Continue analyzing the tabular parsing path\"), not as model self-talk such as \"I will check\" or \"I will analyze\". Use \"I will...\" only when the option truly means the user will do something later."
     : "4. `<option>` 是用户点击后发回给你的消息：如果选项是让你继续调查、确认、读取、分析或执行，必须写成用户指令口吻（如“请确认导入结果是否写入目标状态”“继续分析表格解析逻辑”），不要写成模型自述的“我来确认/我来检查/我来分析”。只有当确实表示用户自己稍后去确认时，才可以使用“我来……”。";
@@ -492,6 +527,37 @@ export function buildSystemPrompt(
   const shellToolsAvailable =
     isToolNameAvailable("run_command", availableToolNames) ||
     isToolNameAvailable("execute_command", availableToolNames);
+  const callableToolsAvailable = !availableToolNames || availableToolNames.length > 0;
+  const browserToolsAvailable = isToolNameAvailable("browser_evaluate", availableToolNames);
+  const exposedReadToolNames = [
+    "grep_search",
+    "repo_map_search",
+    "repo_map_context",
+    "glob_search",
+    "list_directory",
+    "read_file",
+  ].filter((name) => isToolNameAvailable(name, availableToolNames));
+  const exposedWriteToolNames = [
+    "apply_patch",
+    "replace_in_file",
+    "write_file",
+  ].filter((name) => isToolNameAvailable(name, availableToolNames));
+  const exposedPlanWriteToolNames = [
+    "write_file",
+    "replace_in_file",
+  ].filter((name) => isToolNameAvailable(name, availableToolNames));
+  const readToolText = formatAvailableToolNamesOrFallback(
+    exposedReadToolNames,
+    "当前没有暴露读取/搜索工具",
+  );
+  const writeToolText = formatAvailableToolNamesOrFallback(
+    exposedWriteToolNames,
+    "当前没有暴露写入工具",
+  );
+  const planWriteToolText = formatAvailableToolNamesOrFallback(
+    exposedPlanWriteToolNames,
+    "当前没有暴露计划写入工具",
+  );
   const filePagingWarning = shellToolsAvailable
     ? "不要用 `run_command`、`cat`、`sed`、`head`、`tail` 作为常规分页读文件手段。"
     : "不要用 shell 命令作为常规分页读文件手段。";
@@ -503,8 +569,11 @@ export function buildSystemPrompt(
     parts.push("全局聊天只能基于用户显式提供的文字、图片、附件、@ 文件、知识库或联网结果回答；没有明确附件/@ 文件时，不要读取、扫描或推断本地项目内容。");
   }
   parts.push("如果用户消息包含 `[turn_intake]`，必须把其中的 `[user_request]`、imageParts、@file、attachment 当成本轮最高优先级上下文：先对齐用户真实意图和已给证据，再决定工具；不要让内部 Plan 提示或模板路径覆盖用户原始目标。");
+  parts.push("项目结构探索只建立地图，不替代这些上下文观察；如果用户给了截图、附件、@ 文件、日志片段或明确路径，先围绕这些材料收窄证据。");
   parts.push("Codex App 式处理顺序：先读用户指令与图片/附件/@文件，给出一句自然的公开进度说明说明正在确认什么；再用最小必要工具定向验证；拿到证据后立即收束为方案、改动或阻塞点。不要先从根目录骨架或目录扫读开始，除非用户没有给任何可用线索。");
-  parts.push("探索必须先收窄目标：如果用户给了路径、文件名、组件名、函数名或报错关键词，优先使用 `grep_search`、`glob_search`、`list_directory` 或小窗口 `read_file` 定向定位；只有没有任何可用线索、确实需要宏观结构时，才调用一次浅层 `get_project_skeleton(depth: 2)`。");
+  parts.push(exposedReadToolNames.length > 0
+    ? `探索必须先收窄目标：如果用户给了路径、文件名、组件名、函数名或报错关键词，优先使用本轮可用读取/搜索工具（${readToolText}）定向定位；只有没有任何可用线索、且 \`get_project_skeleton\` 本轮可用时，才调用一次浅层 \`get_project_skeleton(depth: 2)\`。`
+    : "探索必须先收窄目标：如果用户给了路径、文件名、组件名、函数名或报错关键词，但本轮没有暴露读取/搜索工具，不要伪造工具调用；用用户可见 Markdown 说明缺少读取能力或等待批准。");
   parts.push("当 `list_directory`、`glob_search` 或其他工具返回文件/目录路径时，后续工具调用必须优先复用返回的完整相对路径，不要自行裁掉父目录。");
   parts.push("`read_file` 返回的是源码/文本内容窗口；如果结果包含 `truncated: true`、`returnedLines` 或 `nextStartLine`，说明这不是完整文件。需要更多内容时继续调用 `read_file` 并传 `start_line` / `end_line` / `max_lines`，" + filePagingWarning);
   parts.push("遇到 TypeScript、测试、构建或 lint 报错行号时，优先读取报错行附近的小窗口，例如 `read_file(path, start_line, max_lines)`；不要先全量读取大型源文件。");
@@ -518,6 +587,7 @@ export function buildSystemPrompt(
     "================================",
     "[CORE TOOL PROTOCOL]",
     `Prompt language strategy: ${promptLanguageStrategy}.`,
+    `Effective turn contract: conversationIntent=${turnContract.conversationIntent}; runtimeIntent=${turnContract.runtimeIntent}; approvalState=${turnContract.approvalState}; mutationExpected=${turnContract.mutationExpected ? "true" : "false"}; validationExpected=${turnContract.validationExpected ? "true" : "false"}; completionEvidenceRequired=${turnContract.completionEvidenceRequired}.`,
     "Tool availability is intent-scoped. Only call tools that are actually exposed in this turn's tool list.",
     "MAIN may attach second-level command metadata for this turn; use it to choose the concrete tool family, but keep the top-level intent boundary intact.",
     "Native tool calls may be emitted directly; the UI will display tool progress, approvals, diffs, terminal output, and failures.",
@@ -525,15 +595,23 @@ export function buildSystemPrompt(
     "Read-before-modify is mandatory: before changing an existing file, Unity asset, scene, prefab, or generated reference target, inspect the relevant current file/asset/context first.",
     "If the same tool call fails repeatedly with identical arguments, stop retrying it verbatim; diagnose the latest error and change the parameters, tool, or strategy.",
     "For complex work with three or more concrete steps, maintain a visible checklist; when the plan workflow is active, MAIN may provide a runtime task list and `.MAIN/plans/tasks.md` is only required for long-running, cross-session, or audit-file work. Keep only one item in progress at a time.",
-    "Prefer delta modifications: do not rewrite entire files with write_file if a file already exists and is large. You must use replace_in_file or apply_patch to supply precise, targeted diff edits instead.",
+    exposedWriteToolNames.length > 0
+      ? (exposedWriteToolNames.some((name) => name === "apply_patch" || name === "replace_in_file")
+          ? `Prefer delta modifications with the write tools actually exposed this turn (${writeToolText}). Do not rewrite entire large existing files with \`write_file\` when a targeted edit tool is listed.`
+          : `Only full-file write tools are exposed this turn (${writeToolText}). Do not claim targeted patch capability; read the current file first and use full-file writes only when safe and necessary.`)
+      : "No write tool is exposed this turn. Do not claim a source edit is complete; explain the missing write capability, pending approval, or concrete blocker.",
     shellToolsAvailable
-      ? "Bypassing read tools via shell command reads (e.g., calling cat, grep, head, tail, sed in run_command or execute_command) is strictly forbidden. Use the read_file tool with precise line window parameters instead."
-      : "Bypassing read tools via shell command reads is strictly forbidden. Use the read_file tool with precise line window parameters instead.",
+      ? (exposedReadToolNames.length > 0
+          ? `Bypassing read tools via shell command reads (e.g., calling cat, grep, head, tail, sed in run_command or execute_command) is strictly forbidden. Use the exposed read/search tools instead (${readToolText}).`
+          : "Bypassing read tools via shell command reads is strictly forbidden. No read/search tool is exposed, so explain the missing read capability instead of using shell as a file pager.")
+      : (exposedReadToolNames.length > 0
+          ? `Bypassing read tools via shell command reads is strictly forbidden. Use the exposed read/search tools instead (${readToolText}).`
+          : "No read/search tool is exposed this turn; do not invent file-read tool calls."),
     "",
     "[SAFETY AND PERMISSION BOUNDARY]",
     "Read-only and external-read tools may be used without asking for step-by-step consent.",
     "Workspace writes, shell execution, browser control, external writes, and destructive operations are approval-gated by the runtime.",
-    "Plan turns follow the opencode-style file workflow: before approval, the only allowed write is a plan artifact under `.MAIN/plans/`, normally `.MAIN/plans/plan.md`. Source edits and final deliverables wait for plan approval.",
+    "Plan turns follow the opencode-style file workflow: before approval, the only allowed write is `.MAIN/plans/plan.md` or an optional evidence ledger under `.MAIN/plans/`. Source edits and final deliverables wait for plan approval.",
     "If a needed write, command, Git, deployment, browser-control, external-write, or deliverable-generation tool is absent because of the current intent, continue with available safe tools or explain the blocker and ask for operation approval with `<user_options>`.",
     "",
     "[LOCALIZED USER OUTPUT]",
@@ -731,27 +809,47 @@ export function buildSystemPrompt(
       "================================",
       "[TURN INTENT: PLAN]",
       planLang === "en"
-        ? `You are in PLAN mode this turn. Goal: collect read-only evidence, then write a reviewable plan to \`.MAIN/plans/plan.md\`. Approval-gated: no source edits, no tasks.md, no deliverables before user approval. The only write allowed pre-approval is \`write_file\` or \`replace_in_file\` on plan artifacts under \`.\.MAIN/plans/\`.`
-        : `本轮处于 PLAN 模式。目标：收集只读证据后，用 \`write_file\` 或 \`replace_in_file\` 写入可审批计划 \`.\.MAIN/plans/plan.md\`。批准前禁止修改源码、生成 tasks.md 或输出交付物；唯一允许的写操作是写入 \`.\.MAIN/plans/\` 下的计划文件。`,
+        ? (exposedPlanWriteToolNames.length > 0
+            ? `You are in PLAN mode this turn. Goal: collect read-only evidence, then write a reviewable plan to \`.MAIN/plans/plan.md\` with the exposed plan write tools (${planWriteToolText}). Approval-gated: no source edits, no tasks.md, no deliverables before user approval.`
+            : "You are in PLAN mode this turn. Goal: collect read-only evidence and produce a visible reviewable plan. No plan write tool is exposed, so do not emit fake tool calls; use `<proposed_plan>` Markdown and wait for approval.")
+        : (exposedPlanWriteToolNames.length > 0
+            ? `本轮处于 PLAN 模式。目标：收集只读证据后，用本轮可用计划写入工具（${planWriteToolText}）写入可审批计划 \`.MAIN/plans/plan.md\`。批准前禁止修改源码、生成 tasks.md 或输出交付物。`
+            : "本轮处于 PLAN 模式。目标：收集只读证据并输出可审批方案；本轮没有暴露计划写入工具，不要伪造工具调用，改用 `<proposed_plan>` Markdown 并等待批准。"),
       "",
       "## Core Rules",
       planLang === "en"
         ? [
-          "1. Explore first: start with \`get_project_skeleton\`, then do targeted reads. Do not re-scan directories.",
+          exposedReadToolNames.length > 0
+            ? `1. Explore first with the exposed read/search tools (${readToolText}). Use \`get_project_skeleton\` only when it is exposed and no narrower clue exists; do not re-scan directories.`
+            : "1. No read/search tool is exposed. Do not fake exploration; base the plan on provided user evidence and state any missing evidence explicitly.",
           "2. Grounding: use screenshots, attachments, and @ files as primary evidence. State what you observe.",
-          "3. Convergence: once evidence is sufficient, write \`.\.MAIN/plans/plan.md\` — include affected files, implementation steps, and validation. Short, decision-complete, directly actionable.",
+          exposedPlanWriteToolNames.length > 0
+            ? `3. Convergence: once evidence is sufficient, write \`.MAIN/plans/plan.md\` with ${planWriteToolText} — include affected files, implementation steps, and validation. Short, decision-complete, directly actionable.`
+            : "3. Convergence: once evidence is sufficient, output `<proposed_plan>` Markdown — include affected files, implementation steps, and validation. Short, decision-complete, directly actionable.",
           "4. Ask only at real decision forks: use \`<user_options>\` only when 2+ equally reasonable implementation paths, tech stack choices, or scope/priority trade-offs require user input. Never fake a question when nothing blocks progress.",
-          "5. Write plan.md as your final action; do not continue exploring after the plan is complete.",
-          "6. Plan artifacts rule: plan.md is mandatory; design.md is optional (evidence ledger); tasks.md belongs to execution only.",
-          "7. If write tools are unavailable, output a visible \`<proposed_plan>\` in plain Markdown.",
+          exposedPlanWriteToolNames.length > 0
+            ? "5. Write plan.md as your final action; do not continue exploring after the plan is complete."
+            : "5. Output the visible proposed plan as your final action; do not claim a plan file was written.",
+          exposedPlanWriteToolNames.length > 0
+            ? "6. Plan artifacts rule: plan.md is mandatory when plan write tools are exposed; design.md is optional (evidence ledger); tasks.md belongs to execution only."
+            : "6. Plan artifacts rule: plan.md is not mandatory when no plan write tool is exposed; tasks.md still belongs to execution only.",
+          "7. If plan write tools are unavailable, output a visible \`<proposed_plan>\` in plain Markdown.",
         ].join("\n")
         : [
-          "1. 先探索：先用 \`get_project_skeleton\` 建立项目地图，再做定向读取；不要重复扫目录。",
+          exposedReadToolNames.length > 0
+            ? `1. 先探索：使用本轮可用读取/搜索工具（${readToolText}）定向定位；只有 \`get_project_skeleton\` 已暴露且无线索时才使用，不要重复扫目录。`
+            : "1. 本轮没有读取/搜索工具。不要伪造探索；基于用户已提供证据制定方案，并明确缺失证据。",
           "2. 证据优先：截图、附件、@ 文件是首要证据；先说明观察到的现象。",
-          "3. 收敛写计划：证据足够后，用 \`write_file\` 或 \`replace_in_file\` 写入 \`.\.MAIN/plans/plan.md\` — 必须包含影响文件、实施步骤、验证方式；短小、可决策、可直接执行。",
+          exposedPlanWriteToolNames.length > 0
+            ? `3. 收敛写计划：证据足够后，用 ${planWriteToolText} 写入 \`.MAIN/plans/plan.md\` — 必须包含影响文件、实施步骤、验证方式；短小、可决策、可直接执行。`
+            : "3. 收敛出方案：证据足够后，输出 `<proposed_plan>` Markdown — 必须包含影响文件、实施步骤、验证方式；短小、可决策、可直接执行。",
           "4. 只在真正需要用户决策的分叉点才用 \`<user_options>\`：当存在 2 个以上同等合理的实现路径、技术方案选型、或范围/优先级取舍时，必须给出选项让用户选择。不要在不阻塞时假装提问。",
-          "5. 计划写完即停止：写入 plan.md 是本轮最后一件事，不要继续探索。",
-          "6. 计划文件规则：plan.md 必选；design.md 可选（证据台账）；tasks.md 属于执行阶段。",
+          exposedPlanWriteToolNames.length > 0
+            ? "5. 计划写完即停止：写入 plan.md 是本轮最后一件事，不要继续探索。"
+            : "5. 输出可见 proposed plan 后即停止；不要声称已经写入计划文件。",
+          exposedPlanWriteToolNames.length > 0
+            ? "6. 计划文件规则：有计划写入工具时 plan.md 必选；design.md 可选（证据台账）；tasks.md 属于执行阶段。"
+            : "6. 计划文件规则：没有计划写入工具时 plan.md 不强制；tasks.md 仍属于执行阶段。",
           "7. 写入工具不可用时，输出可见的 \`<proposed_plan>\` 纯文本方案。",
         ].join("\n"),
       "",
@@ -780,7 +878,9 @@ export function buildSystemPrompt(
         : "直接完成实现、修复、修改、落地与验证，不要强制回到计划流。",
       "【必须立即行动，禁止在正文输出纯文字规划或步骤描述】",
       "1. 绝对禁止输出类似“我接下来的计划是：”、“第一步、第二步”、“我需要先确认……”等纯文字排查或修改步骤。禁止输出长篇排查思路或分析文字。",
-      "2. 必须立刻发起真实工具调用（如 grep_search、read_file、list_directory、write_file、apply_patch、replace_in_file 等）。如果你需要了解项目结构、查找报错或寻找问题，请【立刻发起工具调用】去检索，绝对不要用中文或英文纯文本来告诉用户你要去检查什么。",
+      exposedReadToolNames.length > 0 || exposedWriteToolNames.length > 0
+        ? `2. 必须立刻发起本轮真实暴露的工具调用。可用读取/搜索工具：${readToolText}；可用写入工具：${writeToolText}。如果你需要了解项目结构、查找报错或寻找问题，请立刻调用可用读取/搜索工具；如果需要修改，请立刻调用可用写入工具。绝对不要用中文或英文纯文本来替代工具动作。`
+        : "2. 本轮没有暴露可调用工具。不要伪造工具调用，也不要声称已经完成修改；必须用用户可见 Markdown 说明缺少执行工具、等待批准或给出具体阻塞点。",
       "3. 违反本条规定（即只输出排查/修改步骤说明而不发起工具调用）会导致系统判定你“空转”从而强制中断并暂停你的运行（Run Paused）。",
       "如果任务中途暴露出真正的高风险分叉或关键前提冲突，应暂停并用 `<user_options>` 给出 2-3 个明确选项，而不是偷偷改走计划协议。",
       "不要再提示用户切换旧的前台模式；这些已经不是用户需要手动选择的开关。",
@@ -860,7 +960,12 @@ export function buildSystemPrompt(
       READ_ONLY_BUILT_IN_TOOL_NAMES,
       availableToolNames,
     ));
-    chatInstructions.push("未获批准时不要调用 replace_in_file、write_file、execute_command 等写入或执行工具；一旦本轮已获用户批准或运行时明确处于 execute 能力，按当前暴露工具和审批结果执行。");
+    chatInstructions.push(exposedWriteToolNames.length > 0 || shellToolsAvailable
+      ? `未获批准时不要调用本轮写入或执行工具（${[
+          ...exposedWriteToolNames,
+          ...(shellToolsAvailable ? ["run_command/execute_command"] : []),
+        ].join("、")}）；一旦本轮已获用户批准或运行时明确处于 execute 能力，按当前暴露工具和审批结果执行。`
+      : "未获批准时不要伪造写入或执行工具调用；一旦本轮已获用户批准或运行时明确处于 execute 能力，也只能按当前真实暴露的工具面执行。");
     parts.push(chatInstructions.join("\n"));
   } else {
     const tfl: string[] = [];
@@ -883,36 +988,45 @@ export function buildSystemPrompt(
       "browser_evaluate",
     ]);
     tfl.push("## 工具调用格式");
-    tfl.push("优先使用 native tool calling；如果当前模型只支持文本工具协议，则使用 XML 格式调用工具：");
-    tfl.push("");
-    tfl.push("需要工具时只输出完整工具调用，不要先写“我将读取/Let me check/I need to...”这类过程句：");
-    tfl.push("如果当前实际使用 native tool calling，可以用 1-3 句普通 Markdown 写公开进度说明；如果使用 XML 工具协议，工具块前后必须纯净，运行时会注入可见进度说明。");
-    tfl.push("<tool_use>");
-    tfl.push("<tool>工具名称</tool>");
-    tfl.push(String.raw`<parameter name="参数名">参数值</parameter>`);
-    tfl.push("</tool_use>");
-    tfl.push("禁止输出 `[Tool call: ...]`、`Tool call: read_file`、`<tool_code>...</tool_code>`、`我要调用工具` 这类占位文本；这些不是可执行工具调用，会被视为协议错误。需要工具时必须输出完整 `<tool_use>`，并补齐必填参数。");
-    tfl.push("");
+    if (callableToolsAvailable) {
+      tfl.push("优先使用 native tool calling；如果当前模型只支持文本工具协议，则使用 XML 格式调用工具：");
+      tfl.push("");
+      tfl.push("需要工具时只输出完整工具调用，不要先写“我将读取/Let me check/I need to...”这类过程句：");
+      tfl.push("如果当前实际使用 native tool calling，可以用 1-3 句普通 Markdown 写公开进度说明；如果使用 XML 工具协议，工具块前后必须纯净，运行时会注入可见进度说明。");
+      tfl.push("<tool_use>");
+      tfl.push("<tool>工具名称</tool>");
+      tfl.push(String.raw`<parameter name="参数名">参数值</parameter>`);
+      tfl.push("</tool_use>");
+      tfl.push("禁止输出 `[Tool call: ...]`、`Tool call: read_file`、`<tool_code>...</tool_code>`、`我要调用工具` 这类占位文本；这些不是可执行工具调用，会被视为协议错误。需要工具时必须输出完整 `<tool_use>`，并补齐必填参数。");
+      tfl.push("");
+    } else {
+      tfl.push("本轮没有暴露可调用工具。不要输出 XML 工具模板、伪工具调用、占位工具名或 `[Tool call: ...]`；必须用用户可见 Markdown 说明缺少工具能力、等待批准或具体阻塞点。");
+      tfl.push("");
+    }
     tfl.push(`重要：需要用户看到的分析、总结、方案必须以普通 Markdown 输出，并使用 ${resolvedLanguageName}；不要放进 XML 分析标签或 hidden reasoning。`);
     tfl.push("");
-    tfl.push("可用的工具：" + formatToolNameList(
+    tfl.push("可用的工具：" + (callableToolsAvailable ? formatToolNameList(
       customToolNames,
       mcpToolNames,
       WORKFLOW_BUILT_IN_TOOL_NAMES,
       availableToolNames,
-    ));
+    ) : "none"));
     if (webResearchToolsAvailable) {
       tfl.push(webResearchDateContext);
       tfl.push("网络搜索已开启：涉及最新信息、外部网页/文档、GitHub URL、版本/发布断言、第三方 API 文档或必须验证的公开事实时，优先用 `web_search` / `web_fetch` 获取证据；最终结论必须包含来源 URL。不要把模型记忆当作联网结果，也不要在未联网取证时直接否定用户看到的最新版本/发布信息。");
     }
     if (turnIntent === "plan") {
       if (instructionLanguage === "en") {
-        tfl.push("Plan turn: gather read-only evidence, then write `.MAIN/plans/plan.md`. Only write plan.md/design.md before approval; no source edits or tasks.md.");
+        tfl.push(exposedPlanWriteToolNames.length > 0
+          ? "Plan turn: gather read-only evidence, then write `.MAIN/plans/plan.md`. Only write plan.md/design.md before approval; no source edits or tasks.md."
+          : "Plan turn: gather evidence from the provided context and output a visible `<proposed_plan>`. No plan write tool is exposed, so do not claim plan.md/design.md was written.");
       } else {
-        tfl.push("规划回合：先收集只读证据，再写 \`.\.MAIN/plans/plan.md\`。批准前只允许写 plan.md/design.md，不修改源码或生成 tasks.md。");
+        tfl.push(exposedPlanWriteToolNames.length > 0
+          ? "规划回合：先收集只读证据，再写 `.MAIN/plans/plan.md`。批准前只允许写 plan.md/可选证据台账，不修改源码或生成 tasks.md。"
+          : "规划回合：基于已提供上下文收集证据并输出可见 `<proposed_plan>`。本轮没有计划写入工具，不要声称已经写入 plan.md/design.md。");
       }
-      tfl.push("当用户要求实现、修复、生成文件或修改项目时，写入工具可用：优先用 `apply_patch`，也可用 `write_file` 或 `replace_in_file`；不要声称当前环境没有写入能力。所有文件访问都以当前工作区为根目录。目录检查优先用 `repo_map_search` / `repo_map_context`、`grep_search`、`glob_search`、`list_directory` 定向定位；只有无线索时才用一次浅层 `get_project_skeleton(depth: 2)`。");
-      tfl.push("实现/生成类任务禁止在聊天区输出完整项目代码或大段 Markdown 代码清单；必须把代码通过 `apply_patch` / `write_file` / `replace_in_file` 落到真实文件。多文件任务每轮优先只写/改 1-3 个文件，先建立最小可运行骨架，再逐步补齐。");
+      tfl.push("如果用户最终目标是实现、修复、生成文件或修改项目，本回合仍只产出可审批计划；源码写入、命令执行和最终交付物必须等计划批准后的执行 runtime。不要声称环境没有写入能力，也不要在批准前修改源码。");
+      tfl.push("实现/生成类任务禁止在聊天区输出完整项目代码或大段 Markdown 代码清单；计划只描述要改什么、为何改、如何验证。批准后再通过当前执行工具面落地真实文件。");
     }
     tfl.push("");
     tfl.push("### 工具说明：");
@@ -957,20 +1071,36 @@ export function buildSystemPrompt(
     if (turnIntent === "plan") {
       const tflLang = instructionLanguage === "en" ? "en" : "zh";
       if (tflLang === "en") {
-        tfl.push("Plan turn — read-only evidence gathering first, then write `.MAIN/plans/plan.md` with `write_file`/`replace_in_file`. No source edits, no tasks.md before approval.");
+        tfl.push(exposedPlanWriteToolNames.length > 0
+          ? `Plan turn — read-only evidence gathering first, then write \`.MAIN/plans/plan.md\` with ${planWriteToolText}. No source edits, no tasks.md before approval.`
+          : "Plan turn — read-only evidence gathering first, then output a visible `<proposed_plan>` because no plan write tool is exposed. No source edits, no tasks.md before approval.");
         tfl.push("Use \`<user_options>\` only for real branching decisions, not for generic 'continue reading' prompts.");
         tfl.push("If plan isn't ready, give 2-4 clear options; don't force a full plan.md.");
-        tfl.push("When plan is mature, write plan.md; fall back to \`<proposed_plan>\` only if write tools are unavailable.");
-        tfl.push("Plan artifacts: plan.md is mandatory, design.md optional (evidence ledger), tasks.md is execution-only.");
-        tfl.push("Keep plan.md concise: title, summary, key changes, API/interface impact, test plan, assumptions. No tutorial text, no full code dumps.");
+        tfl.push(exposedPlanWriteToolNames.length > 0
+          ? "When plan is mature, write plan.md; fall back to \`<proposed_plan>\` only if write tools are unavailable."
+          : "When plan is mature, output `<proposed_plan>` Markdown and stop; do not claim a file write.");
+        tfl.push(exposedPlanWriteToolNames.length > 0
+          ? "Plan artifacts: plan.md is mandatory when plan write tools are exposed, design.md optional (evidence ledger), tasks.md is execution-only."
+          : "Plan artifacts: plan.md is not mandatory when no plan write tool is exposed; tasks.md is execution-only.");
+        tfl.push(exposedPlanWriteToolNames.length > 0
+          ? "Keep plan.md concise: title, summary, key changes, API/interface impact, test plan, assumptions. No tutorial text, no full code dumps."
+          : "Keep the visible plan concise: title, summary, key changes, API/interface impact, test plan, assumptions. No tutorial text, no full code dumps.");
         tfl.push(tabularWorkflowPlanInstruction);
       } else {
-        tfl.push("规划回合：先只读探索，证据足够后写 \`.\.MAIN/plans/plan.md\`（write_file/replace_in_file）。批准前不修改源码、不生成 tasks.md。");
+        tfl.push(exposedPlanWriteToolNames.length > 0
+          ? `规划回合：先只读探索，证据足够后用 ${planWriteToolText} 写 \`.MAIN/plans/plan.md\`。批准前不修改源码、不生成 tasks.md。`
+          : "规划回合：先只读探索，证据足够后输出可见 `<proposed_plan>`；本轮没有计划写入工具时不要伪造工具调用。批准前不修改源码、不生成 tasks.md。");
         tfl.push("真正分叉才用 \`<user_options>\`，不给'继续读取'类泛化选项。");
         tfl.push("方案未收敛时给 2-4 个明确选择，不要强行写完整 plan.md。");
-        tfl.push("方案成熟时写入 plan.md；写入工具不可用才降级为 \`<proposed_plan>\`。");
-        tfl.push("计划文件：plan.md 必选，design.md 可选（证据台账），tasks.md 属执行阶段。");
-        tfl.push("plan.md 精简：标题、摘要、关键改动、API/接口影响、测试方案、假设。不写教程、不输出完整代码。");
+        tfl.push(exposedPlanWriteToolNames.length > 0
+          ? "方案成熟时写入 plan.md；写入工具不可用才降级为 \`<proposed_plan>\`。"
+          : "方案成熟时输出 `<proposed_plan>` Markdown 并停止；不要声称已经写入计划文件。");
+        tfl.push(exposedPlanWriteToolNames.length > 0
+          ? "计划文件：有计划写入工具时 plan.md 必选，design.md 可选（证据台账），tasks.md 属执行阶段。"
+          : "计划文件：没有计划写入工具时 plan.md 不强制，tasks.md 属执行阶段。");
+        tfl.push(exposedPlanWriteToolNames.length > 0
+          ? "plan.md 精简：标题、摘要、关键改动、API/接口影响、测试方案、假设。不写教程、不输出完整代码。"
+          : "可见方案保持精简：标题、摘要、关键改动、API/接口影响、测试方案、假设。不写教程、不输出完整代码。");
         tfl.push(tabularWorkflowPlanInstruction);
       }
     } else {
@@ -978,9 +1108,18 @@ export function buildSystemPrompt(
       tfl.push("1. Atomic 任务直接实现，不要为了完成小改动而强行转去计划流。");
       tfl.push("2. 如果当前是在延续一个已批准的计划，则优先遵循当前 runtime 任务清单；不要为了确认 `.MAIN/plans/tasks.md` 是否存在而主动读取它；如果它已知存在，完成后再同步更新对应 checkbox 状态。");
       tfl.push("3. 只有在用户明确要求保存方案、当前回合本来就是计划落盘，或你正在继续一个已批准计划时，才写入 `.MAIN/plans/*.md`。");
-      tfl.push("4. 凡是需要 shell 的步骤，必须真实执行：一次性命令用 `run_command` 并检查 exitCode/stdout/stderr；长驻或交互式命令用 `execute_command`，随后调用 `read_pty_since`、`read_pty_tail` 或 `get_pty_status` 验证结果。需要页面渲染、UI、DOM 或 console 验证时，优先用 `browser_evaluate` 打开真实本地页面并执行断言，不能用 curl/grep/cat 替代。命令调用必须带 `description` 和工作区相对 `cwd`（根目录用 `.`）；需要等待长任务输出时传 `wait_ms`，不要另跑 sleep。");
-      tfl.push("5. 当用户要求 Git 提交、推送或“提交并推送”时，不要因为 PTY 未启动而声称无法执行；Git 是有限命令，优先用 `run_command` 依次检查 `git status`，必要时查看 `git diff --stat` / `git diff`，再按用户要求执行 `git add ...`、`git commit -m ...`、`git push`。如果没有变更、没有 remote、认证失败、upstream 未设置或 push 被拒绝，必须把 stdout/stderr/exitCode 如实反馈给用户并停止猜测。");
-      tfl.push("6. 【绝对禁止只说不做】任何以自然语言输出的“排查说明”、“寻找方案”、“我想先确认”等内容，若无实际工具调用配合，都是违规行为。如果你需要检查，立刻调用 grep_search、read_file 等只读工具；如果你需要修改，立刻调用 apply_patch 或其他写入工具。必须通过当前或下一条消息的工具调用发出你的动作，不得用纯文本解释代替工具执行。");
+      tfl.push(shellToolsAvailable || browserToolsAvailable
+        ? `4. 凡是需要命令或浏览器验证的步骤，必须使用本轮实际暴露的执行工具完成：${[
+            shellToolsAvailable ? "`run_command`/`execute_command` 及 PTY 读取工具" : "",
+            browserToolsAvailable ? "`browser_evaluate`" : "",
+          ].filter(Boolean).join("、")}。工具调用必须带必要参数，并基于 stdout/stderr/exitCode、PTY 输出或 DOM/console 断言总结结果。`
+        : "4. 本轮未暴露命令或浏览器验证工具；不要声称已经运行测试、构建、Git、浏览器或 DOM 验证。需要这些能力时，明确暂停并说明缺少的工具/审批。");
+      tfl.push(shellToolsAvailable
+        ? "5. 当用户要求 Git 提交、推送或“提交并推送”时，不要因为 PTY 未启动而声称无法执行；Git 是有限命令，优先用 `run_command` 依次检查 `git status`，必要时查看 `git diff --stat` / `git diff`，再按用户要求执行 `git add ...`、`git commit -m ...`、`git push`。如果没有变更、没有 remote、认证失败、upstream 未设置或 push 被拒绝，必须把 stdout/stderr/exitCode 如实反馈给用户并停止猜测。"
+        : "5. 当用户要求 Git 提交、推送或部署但本轮未暴露命令工具时，不要假装完成；说明缺少命令执行能力或等待批准。");
+      tfl.push(exposedReadToolNames.length > 0 || exposedWriteToolNames.length > 0
+        ? `6. 【绝对禁止只说不做】任何以自然语言输出的“排查说明”、“寻找方案”、“我想先确认”等内容，若无实际工具调用配合，都是违规行为。如果你需要检查，立刻调用本轮可用读取/搜索工具（${readToolText}）；如果你需要修改，立刻调用本轮可用写入工具（${writeToolText}）。必须通过当前或下一条消息的工具调用发出你的动作，不得用纯文本解释代替工具执行。`
+        : "6. 【绝对禁止假执行】本轮没有读写工具时，不要用纯文本声称已经排查或修改。必须说明缺少工具能力、等待批准或具体阻塞点。");
     }
     tfl.push("");
     tfl.push("### Steering 发现规则（Steering Discovery）");

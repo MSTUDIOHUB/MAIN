@@ -59,6 +59,7 @@ function loadTranspiledModuleSync(sourcePath) {
 
 const {
   getMainIntentShortcuts,
+  buildEffectiveTurnContract,
   getIntentPolicy,
   hasExplicitUnityConsoleDiagnosticCue,
   inferCommandDirective,
@@ -122,6 +123,7 @@ test("fix requests with analysis-domain nouns enter execute workflow", () => {
     "执行修复",
     "请修复当前数据分析页面显示问题",
     "找到问题进行修复",
+    "请仔细查看调试日志，找到问题的根本原因并解决",
   ]) {
     const result = resolveTurnRunIntent(input, createContext());
     assert.equal(result.intent, "execute", input);
@@ -129,6 +131,49 @@ test("fix requests with analysis-domain nouns enter execute workflow", () => {
     assert.equal(result.commandDirective.requiresApproval, true, input);
     assert.equal(result.needsDecision, undefined, input);
   }
+});
+
+test("Chinese find-and-fix requests build an execution evidence contract", () => {
+  const result = resolveTurnRunIntent("请查看两个回合的调试日志，找到问题并解决", createContext());
+  assert.equal(result.intent, "execute");
+  assert.equal(result.commandDirective.kind, "file_modify");
+  assert.equal(result.commandDirective.requiresApproval, true);
+
+  const contract = buildEffectiveTurnContract({
+    conversationIntent: result.intent,
+    runtimeIntent: result.intent,
+    commandDirective: result.commandDirective,
+    executionConsentGranted: false,
+  });
+
+  assert.equal(contract.runtimeIntent, "execute");
+  assert.equal(contract.approvalState, "needs_approval");
+  assert.equal(contract.allowedToolRisks, "write");
+  assert.equal(contract.mutationExpected, true);
+  assert.equal(contract.validationExpected, true);
+  assert.equal(contract.completionEvidenceRequired, "execution_evidence");
+});
+
+test("approved plan conversation becomes execute runtime for completion evidence", () => {
+  const contract = buildEffectiveTurnContract({
+    conversationIntent: "plan",
+    runtimeIntent: "execute",
+    commandDirective: {
+      kind: "plan_resume",
+      source: "natural_language",
+      requiresApproval: true,
+    },
+    planApproved: true,
+    executionConsentGranted: true,
+  });
+
+  assert.equal(contract.conversationIntent, "plan");
+  assert.equal(contract.runtimeIntent, "execute");
+  assert.equal(contract.approvalState, "approved");
+  assert.equal(contract.allowedToolRisks, "write");
+  assert.equal(contract.mutationExpected, true);
+  assert.equal(contract.validationExpected, true);
+  assert.equal(contract.completionEvidenceRequired, "execution_evidence");
 });
 
 test("Chinese feature addition requests enter execute workflow", () => {

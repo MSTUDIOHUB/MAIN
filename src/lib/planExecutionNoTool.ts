@@ -5,13 +5,26 @@ export function shouldHandleApprovedPlanExecutionNoTool(input: {
   isPlanApproved: boolean;
   planStage: string;
   toolCallCount: number;
-  audit?: Pick<PlanTaskEvidenceAudit, "totalCount" | "acceptedCompletion" | "allTrustedComplete" | "pendingExternalValidation"> | null;
+  audit?: Pick<
+    PlanTaskEvidenceAudit,
+    | "totalCount"
+    | "acceptedCompletion"
+    | "allTrustedComplete"
+    | "pendingExternalValidation"
+    | "pendingUserValidationTasks"
+    | "remainingTasks"
+  > | null;
 }): boolean {
-  if (input.workflowMode !== "plan" || !input.isPlanApproved) return false;
+  if (!input.isPlanApproved) return false;
   if (input.planStage !== "executing") return false;
   if (input.toolCallCount > 0) return false;
   if (!input.audit) return false;
-  return input.audit.totalCount === 0 || !input.audit.allTrustedComplete;
+  return input.audit.totalCount === 0 ||
+    !input.audit.acceptedCompletion ||
+    !input.audit.allTrustedComplete ||
+    input.audit.pendingExternalValidation ||
+    (input.audit.pendingUserValidationTasks?.length ?? 0) > 0 ||
+    (input.audit.remainingTasks?.length ?? 0) > 0;
 }
 
 export function buildPlanExecutionNoToolRecoveryPrompt(input: {

@@ -7568,6 +7568,43 @@ export const useAppStore = create<AppState>()(
         }
       }
 
+      const locallyRequiresExecutionApproval =
+        resolution.requiresApproval === true ||
+        effectiveCommandDirective?.requiresApproval === true ||
+        effectiveCommandDirective?.kind === "file_modify" ||
+        effectiveCommandDirective?.kind === "shell" ||
+        effectiveCommandDirective?.kind === "git" ||
+        effectiveCommandDirective?.kind === "unity" ||
+        effectiveCommandDirective?.kind === "studio" ||
+        effectiveCommandDirective?.kind === "mcp";
+      if (
+        (resolution.intent === "execute" || resolution.intent === "studio_workflow") &&
+        locallyRequiresExecutionApproval
+      ) {
+        const pendingCopy = createPendingDecisionCopy(
+          {
+            suggestedIntent: "execute",
+            decisionOptions: ["execute", "respond"],
+            riskLevel: resolution.riskLevel,
+            reason: resolution.reason,
+          },
+          preferredLanguage,
+        );
+        applyPreRunSessionPatch({
+          pendingRunDecision: {
+            kind: "intent_confirmation",
+            source: "pre_submit",
+            originalInput: text,
+            originalImages: images || [],
+            suggestedIntent: "execute",
+            reason: pendingCopy.reason,
+            title: pendingCopy.title,
+            options: pendingCopy.options,
+          },
+        });
+        return true;
+      }
+
       // 普通消息不应该因为额外的意图 preflight 而阻塞发送热路径。
       // 只有低置信度且真的可能改变流程的请求，才允许在这里等待 preflight。
       if (shouldUseBlockingIntentPreflight(resolution, currentMainModeKey, text)) {
