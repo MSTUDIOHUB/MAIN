@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import MarkdownRenderer from "./MarkdownRenderer";
 import { IconCheck, IconSave } from "./Icons";
 import { buildPlanTaskEvidenceAudit, extractPlanTasks, isPlanConversationTurn, isPlanTaskAwaitingBrowserValidation, isPlanTaskAwaitingExternalValidation, isPlanTaskTrustedComplete, type ConversationTurn, type PlanArtifact, type PlanExecutionEvidenceEntry, type PlanStage, type PlanTask } from "../lib/workflowModels";
@@ -188,15 +188,18 @@ export default function PlanPanel({
   const [activeArtifactPath, setActiveArtifactPath] = useState<string>(artifacts[artifacts.length - 1]?.path || "");
   const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [isApproving, setIsApproving] = useState(false);
+  const approvingRef = useRef(false);
 
   useEffect(() => {
-    if (isApproved) {
+    if (isApproved || stage === "executing" || stage === "completed") {
+      approvingRef.current = false;
       setIsApproving(false);
     }
-  }, [isApproved]);
+  }, [isApproved, stage]);
 
   const handleApprove = () => {
-    if (isApproving || isApproved) return;
+    if (approvingRef.current || isApproving || isApproved) return;
+    approvingRef.current = true;
     setIsApproving(true);
     onApprove();
   };
@@ -229,7 +232,7 @@ export default function PlanPanel({
   const doneCount = taskAudit.completedCount;
   const progressPct = taskAudit.totalCount > 0 ? Math.round((doneCount / taskAudit.totalCount) * 100) : 0;
   const activeTurn = [...turns].reverse().find((turn) => isPlanConversationTurn(turn)) || turns[turns.length - 1];
-  const showTaskProgress = !hideIslandOwnedSections && (isApproved || stage === "executing" || stage === "completed") && auditedTasks.length > 0;
+  const showTaskProgress = (isApproved || stage === "executing" || stage === "completed") && auditedTasks.length > 0;
   const stageLabel = isAwaitingApproval
     ? copy.pendingApproval
     : isAwaitingInput
@@ -348,7 +351,11 @@ export default function PlanPanel({
             </div>
             <div className="mt-3 space-y-2">
               {auditedTasks.map((task) => (
-                <div key={task.id} className="flex items-start gap-2 rounded-lg border border-[#18181b] bg-[#09090b] px-3 py-2">
+                <div
+                  key={task.id}
+                  data-testid="plan-task-row"
+                  className="flex items-start gap-2 rounded-lg border border-[#18181b] bg-[#09090b] px-3 py-2"
+                >
                   <span
                     className={`mt-[2px] h-4 w-4 shrink-0 rounded-full border flex items-center justify-center ${
                       isPlanTaskTrustedComplete(task)
@@ -377,9 +384,6 @@ export default function PlanPanel({
                           </span>
                         )}
                       </div>
-                    )}
-                    {task.blockedReason && task.evidenceStatus !== "satisfied" && (
-                      <div className="mt-1 text-[10px] leading-4 text-[#fbbf24]">{task.blockedReason}</div>
                     )}
                   </div>
                   <div data-testid="plan-task-status" className="text-[10px] text-[#71717a] whitespace-nowrap">

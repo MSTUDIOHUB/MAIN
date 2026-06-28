@@ -391,12 +391,13 @@ export type ConversationTurnStatus =
   | "awaiting_input"
   | "executing"
   | "completed_with_changes"
+  | "paused"
   | "stopped_no_action"
   | "stopped_no_output"
   | "done"
   | "error";
 
-export type VisibleConversationTurnStatus = ConversationTurnStatus | "paused";
+export type VisibleConversationTurnStatus = ConversationTurnStatus;
 
 export interface ConversationTurn {
   id: string;
@@ -678,10 +679,20 @@ export function planStageFromArtifactKind(kind: PlanArtifactKind): PlanStage {
 
 const SHELL_COMMAND_START_RE = /^(?:pnpm|npm|npx|yarn|bun|cargo|rustup|pip3?|python3?|uv|go|dotnet|git|brew|mkdir|cp|mv|rm|touch|chmod|tauri|vite|node|deno|composer|php|ruby|rails|make|cmake|xcodebuild)\b/i;
 const SHELL_COMMAND_FRAGMENT_RE = /\b(?:pnpm|npm|npx|yarn|bun|cargo|rustup|pip3?|python3?|uv|go|dotnet|git|brew|mkdir|cp|mv|rm|touch|chmod|tauri|vite|node|deno|composer|php|ruby|rails|make|cmake|xcodebuild)\b[^\n`"'，。；;)]*/gi;
+const SHELL_COMMAND_CODE_IDENTIFIER_RE = /^(?:tauri|vite|node|deno|composer|php|ruby|rails|make|cmake|xcodebuild)::|^[A-Za-z_$][\w$]*(?:::|[.[(])/;
+const SHELL_COMMAND_REQUIRED_OPERAND_RE = /^(?:tauri|vite|node|deno|composer|php|ruby|rails|make|cmake|xcodebuild)$/i;
 
 function pushShellCommand(target: string[], candidate: string) {
-  const normalized = candidate.replace(/\s+/g, " ").trim();
+  const normalized = candidate
+    .replace(/^[`'"]+|[`'"]+$/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
   if (!normalized || !SHELL_COMMAND_START_RE.test(normalized)) return;
+  const head = normalized.match(/^([A-Za-z][\w.-]*)\b/)?.[1] || "";
+  if (head && head !== head.toLowerCase()) return;
+  if (/^[A-Za-z][\w.-]*\//.test(normalized)) return;
+  if (SHELL_COMMAND_CODE_IDENTIFIER_RE.test(normalized)) return;
+  if (SHELL_COMMAND_REQUIRED_OPERAND_RE.test(normalized)) return;
   if (!target.includes(normalized)) {
     target.push(normalized);
   }
@@ -1139,6 +1150,25 @@ function evidenceMatchesRecord(
   }
 
   return false;
+}
+
+export function findFirstPlanTaskEvidenceRecord(
+  task: Pick<PlanTask, "text" | "commands" | "evidence">,
+  evidenceLedger: PlanExecutionEvidenceEntry[] = [],
+): { record: PlanExecutionEvidenceEntry; ledgerIndex: number } | null {
+  const evidence = task.evidence && task.evidence.length > 0
+    ? task.evidence
+    : inferPlanTaskEvidence(task.text, task.commands || []);
+  if (evidence.length === 0 || evidenceLedger.length === 0) return null;
+
+  for (let ledgerIndex = 0; ledgerIndex < evidenceLedger.length; ledgerIndex += 1) {
+    const record = evidenceLedger[ledgerIndex];
+    if (evidence.some((item) => evidenceMatchesRecord(item, record))) {
+      return { record, ledgerIndex };
+    }
+  }
+
+  return null;
 }
 
 function resolvePlanTaskEvidenceStatus(
@@ -1731,12 +1761,21 @@ export function deriveRuntimePlanTasksFromArtifacts(
     if (tasks.length >= maxTasks) return tasks;
   }
 
+  const existingCommandEvidence = new Set(
+    tasks
+      .flatMap((task) => task.evidence || [])
+      .filter((item) => item.kind === "cmd")
+      .map((item) => normalizeCommandEvidenceValue(item.value)),
+  );
   for (const command of extractShellCommandsFromText(runtimeRelevantContent).slice(0, Math.max(1, maxTasks - tasks.length))) {
+    const normalizedCommand = normalizeCommandEvidenceValue(command);
+    if (existingCommandEvidence.has(normalizedCommand)) continue;
     pushTask(makeRuntimeTaskFromEvidenceText(
       language === "en" ? `Run verification command \`${command}\`` : `运行验证命令 \`${command}\``,
       { kind: "cmd", value: command, inferred: true },
       language,
     ));
+    if (normalizedCommand) existingCommandEvidence.add(normalizedCommand);
     if (tasks.length >= maxTasks) return tasks;
   }
 

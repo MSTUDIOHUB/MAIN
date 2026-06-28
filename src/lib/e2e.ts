@@ -233,6 +233,8 @@ function bindBridgeSnapshot(scenario: string) {
       currentTurnDisplayIntent: currentTurn?.displayIntent ?? currentTurn?.intent ?? null,
       currentTurnParentPlanTurnId: currentTurn?.parentPlanTurnId ?? null,
       conversationTurns: state.conversationTurns.length,
+      currentTurnExecutionConsent: state.currentTurnExecutionConsent,
+      pendingPlanApprovalHandoff: state.pendingPlanApprovalHandoff,
       visibleConversationTurns,
       taskFlowUserCount: state.taskFlow.filter((block) => block.type === "user").length,
       agentTexts: agentBlocks.map((block) => block.content),
@@ -3349,14 +3351,18 @@ function seedExecutionCapsulePendingToolReviewScenario() {
       evidenceStatus: taskNumber <= 8 ? "satisfied" as const : "missing" as const,
     };
   });
-  const evidenceLedger = planTasks.slice(0, 8).map((task, index) => ({
-    id: `review-evidence-${index + 1}`,
-    kind: "cmd" as const,
-    value: `npm run check-${index + 1}`,
-    target: task.text,
-    sourceTool: "run_command",
-    createdAt: now + index,
-  }));
+  const completedEvidenceTaskOrder = [3, 1, 2, 4, 5, 6, 7, 8];
+  const evidenceLedger = completedEvidenceTaskOrder.map((taskNumber, index) => {
+    const task = planTasks[taskNumber - 1];
+    return {
+      id: `review-evidence-${taskNumber}`,
+      kind: "cmd" as const,
+      value: `npm run check-${taskNumber}`,
+      target: task.text,
+      sourceTool: "run_command",
+      createdAt: now + index,
+    };
+  });
 
   incrementSeedCount(TOP_ISLAND_PENDING_TOOL_REVIEW_SCENARIO);
 
@@ -3837,8 +3843,8 @@ function seedExecutionCapsulePanelStabilityScenario() {
         isPlanApproved: false,
         planStage: "ready_to_execute",
         agentStatus: "pending_review",
-        isGenerating: false,
-        abortController: null,
+        isGenerating: true,
+        abortController: new AbortController(),
         pendingReviewResolve: null,
         pendingReviewTaskId: null,
         pendingToolCall: null,

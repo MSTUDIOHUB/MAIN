@@ -946,7 +946,7 @@ export function buildLoopDetectionValidationError(
     if (msg.role === "assistant" && Array.isArray(msg.tool_calls)) {
       for (const call of msg.tool_calls) {
         const c = call as { id?: string; function?: { name?: string; arguments?: string } };
-        if (c.function?.name === "write_file" || c.function?.name === "replace_in_file" || c.function?.name === "read_file") {
+        if (c.function?.name === "write_file" || c.function?.name === "replace_in_file" || c.function?.name === "apply_patch" || c.function?.name === "read_file") {
           if (c.id === tc.id) continue;
           try {
             const parsed = JSON.parse(c.function.arguments || "{}");
@@ -971,13 +971,13 @@ export function buildLoopDetectionValidationError(
   if (repetitions >= 5) {
     const target = getToolTarget(tc.name, args);
     if (tc.name === "read_file") {
-      const successfulMutations = samePathCalls
-        .filter((call) => (call.name === "write_file" || call.name === "replace_in_file") && call.successful);
-      const latestSuccessfulMutation = successfulMutations[successfulMutations.length - 1];
-      const readsAfterLatestMutation = latestSuccessfulMutation
-        ? samePathCalls.filter((call) => call.name === "read_file" && call.order > latestSuccessfulMutation.order).length
+      const mutations = samePathCalls
+        .filter((call) => call.name === "write_file" || call.name === "replace_in_file" || call.name === "apply_patch");
+      const latestMutation = mutations[mutations.length - 1];
+      const readsAfterLatestMutation = latestMutation
+        ? samePathCalls.filter((call) => call.name === "read_file" && call.order > latestMutation.order).length
         : Number.POSITIVE_INFINITY;
-      if (latestSuccessfulMutation && readsAfterLatestMutation === 0) return null;
+      if (latestMutation && readsAfterLatestMutation === 0) return null;
 
       const language = callbacks.getPreferredLanguage();
       const message = language === "zh"

@@ -105,7 +105,7 @@ export function isTransparentToolNarrationBlock(block: any): boolean {
   const normalized = String(text || "").replace(/\s+/g, "");
   if (/完成|已读取|已搜索|已执行|readcomplete|searchcomplete|commandcomplete/i.test(normalized)) return false;
   const futureToolNarration =
-    /^(?:我(?:会|将|先|现在|正在|继续)|让我|接下来|现在|继续|正在).{0,60}(?:读取|查看|搜索|调查|执行|运行|调用|验证|整理)/.test(normalized);
+    /(?:^|[。,，；;！!？?：:])(?:我(?:会|将|先|现在|正在|继续)|让我|接下来|现在|继续|正在).{0,60}(?:读取|查看|检查|搜索|调查|执行|运行|调用|验证|整理)/.test(normalized);
   return futureToolNarration || isThinToolNarration(text);
 }
 

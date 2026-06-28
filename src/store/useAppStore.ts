@@ -746,6 +746,7 @@ export interface SessionRuntimeSnapshot {
   planStage: PlanStage;
   isPlanApproved: boolean;
   planApprovalChoice?: string | null;
+  pendingPlanApprovalHandoff?: { planTurnId: string; requestedAt: number } | null;
   showPlanPanel: boolean;
   showDiff: boolean;
   showTerminal: boolean;
@@ -784,6 +785,7 @@ export interface SessionRuntimeState extends SessionRuntimeSnapshot {
   queuedUserMessage: QueuedUserMessage | null;
   activeGuidance: ActiveGuidance | null;
   planApprovalChoice: string | null;
+  pendingPlanApprovalHandoff: { planTurnId: string; requestedAt: number } | null;
   normalizedStreamState: NormalizedStreamState;
   currentTurnState: AppState["currentTurnState"];
   isGenerating: boolean;
@@ -1250,6 +1252,7 @@ export interface AppState {
   planAutoResumeCount: number;
   planExecutionProgressSnapshot: PlanExecutionProgressSnapshot | null;
   normalizedStreamState: NormalizedStreamState;
+  pendingPlanApprovalHandoff: { planTurnId: string; requestedAt: number } | null;
   runtimeEvents: MainThreadEvent[];
   harnessRunMarker: HarnessRunMarker | null;
   setWorkflowMode: (mode: "chat" | "edit" | "plan") => void;
@@ -1710,6 +1713,7 @@ export function normalizeSessionRuntimeSnapshot(
     planStage: snapshot.planStage ?? "idle",
     isPlanApproved: snapshot.isPlanApproved ?? false,
     planApprovalChoice: normalizePlanApprovalChoice(snapshot.planApprovalChoice),
+    pendingPlanApprovalHandoff: null,
     showPlanPanel: snapshot.showPlanPanel ?? false,
     showDiff: snapshot.showDiff ?? false,
     showTerminal: snapshot.showTerminal ?? false,
@@ -1797,6 +1801,7 @@ const sessionRuntimeKeys = [
   "planStage",
   "isPlanApproved",
   "planApprovalChoice",
+  "pendingPlanApprovalHandoff",
   "showPlanPanel",
   "showDiff",
   "showTerminal",
@@ -1896,6 +1901,7 @@ function createSessionRuntimeFromState(state: Partial<AppState>): SessionRuntime
     planStage: state.planStage ?? "idle",
     isPlanApproved: state.isPlanApproved === true,
     planApprovalChoice: normalizePlanApprovalChoice(state.planApprovalChoice),
+    pendingPlanApprovalHandoff: state.pendingPlanApprovalHandoff || null,
     showPlanPanel: state.showPlanPanel === true,
     showDiff: state.showDiff === true,
     showTerminal: state.showTerminal === true,
@@ -3205,6 +3211,7 @@ function buildSessionRuntimeSnapshotFromStoreState(state: any): SessionRuntimeSn
     planStage: state.planStage ?? "idle",
     isPlanApproved: state.isPlanApproved === true,
     planApprovalChoice: state.planApprovalChoice ?? null,
+    pendingPlanApprovalHandoff: null,
     showPlanPanel: state.showPlanPanel === true,
     showDiff: state.showDiff === true,
     showTerminal: state.showTerminal === true,
@@ -3252,6 +3259,7 @@ function buildEmptySessionRuntimeSnapshot(state: any, affinity: SessionModeAffin
       planStage: "idle",
       isPlanApproved: false,
       planApprovalChoice: null,
+      pendingPlanApprovalHandoff: null,
       showPlanPanel: false,
       showDiff: false,
       showTerminal: false,
@@ -5934,6 +5942,7 @@ export const useAppStore = create<AppState>()(
         planExecutionProgressSnapshot: null,
         planStage: "idle",
         planApprovalChoice: null,
+        pendingPlanApprovalHandoff: null,
         normalizedStreamState: defaultNormalizedStreamState,
         resolvedInstructionSet: null,
         instructionSources: [],
@@ -6007,6 +6016,7 @@ export const useAppStore = create<AppState>()(
       planExecutionProgressSnapshot: null,
       planStage: "idle",
       planApprovalChoice: null,
+      pendingPlanApprovalHandoff: null,
       normalizedStreamState: defaultNormalizedStreamState,
       harnessRunMarker: null,
     });
@@ -6016,6 +6026,7 @@ export const useAppStore = create<AppState>()(
 
   isPlanApproved: false,
   planApprovalChoice: null,
+  pendingPlanApprovalHandoff: null,
   planArtifacts: [],
   planStage: "idle",
   planTasks: [],
@@ -6123,6 +6134,7 @@ export const useAppStore = create<AppState>()(
       planExecutionProgressSnapshot: null,
       normalizedStreamState: defaultNormalizedStreamState,
       planApprovalChoice: null,
+      pendingPlanApprovalHandoff: null,
       showPlanPanel: false,
     }),
   deletePersistedPlanFiles: async () => {
@@ -6139,7 +6151,7 @@ export const useAppStore = create<AppState>()(
     } finally {
       invalidateWorkspaceTreeCache();
       get().clearPlanArtifacts();
-      set({ isPlanApproved: false, planApprovalChoice: null, planExecutionEvidenceLedger: [], planExecutionEvidenceCount: 0, planAutoResumeCount: 0, planExecutionProgressSnapshot: null });
+      set({ isPlanApproved: false, planApprovalChoice: null, pendingPlanApprovalHandoff: null, planExecutionEvidenceLedger: [], planExecutionEvidenceCount: 0, planAutoResumeCount: 0, planExecutionProgressSnapshot: null });
       get().bumpWorkspaceContentVersion();
     }
   },
@@ -6188,8 +6200,13 @@ export const useAppStore = create<AppState>()(
         ? "计划已批准，执行已交接到新的回合。"
         : "Plan approved; execution was handed off to a new turn.";
       const executionTurnId = `turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const hasActivePlanLoop =
+        !!approvedTurnId &&
+        (state.agentStatus === "running" || state.agentStatus === "pending_review" || state.isGenerating === true) &&
+        state.abortController !== null;
+      const handoffTurnId = hasActivePlanLoop ? approvedTurnId : executionTurnId;
       const initialProgressSnapshot = normalizePlanExecutionProgressSnapshot({
-            turnId: executionTurnId,
+            turnId: handoffTurnId,
             update: buildPlanExecutionProgressUpdate({
               language,
               phase: "starting",
@@ -6204,16 +6221,17 @@ export const useAppStore = create<AppState>()(
           });
       const executionConsentPatch = {
         currentTurnExecutionConsent: {
-          turnId: executionTurnId,
+          turnId: handoffTurnId,
           granted: true,
         },
       };
 
-      if (state.agentStatus === "pending_review" && state.abortController) {
+      if (hasActivePlanLoop) {
         set({
           isPlanApproved: true,
           ...approvalChoicePatch,
           ...executionConsentPatch,
+          pendingPlanApprovalHandoff: approvedTurnId ? { planTurnId: approvedTurnId, requestedAt: Date.now() } : null,
           planExecutionEvidenceLedger: [],
           planExecutionEvidenceCount: 0,
           planAutoResumeCount: 0,
@@ -6226,6 +6244,11 @@ export const useAppStore = create<AppState>()(
         if (approvedTurnId) {
           get().setConversationTurnStatus(approvedTurnId, "executing");
         }
+        logStoreEvent("plan_approval_waiting_for_active_handoff", {
+          planTurnId: approvedTurnId,
+          agentStatus: state.agentStatus,
+          isGenerating: state.isGenerating,
+        });
         return;
       }
 
@@ -6233,6 +6256,7 @@ export const useAppStore = create<AppState>()(
         isPlanApproved: true,
         ...approvalChoicePatch,
         ...executionConsentPatch,
+        pendingPlanApprovalHandoff: null,
         planExecutionEvidenceLedger: [],
         planExecutionEvidenceCount: 0,
         planAutoResumeCount: 0,
@@ -6313,6 +6337,7 @@ export const useAppStore = create<AppState>()(
     set({
       isPlanApproved: false,
       planApprovalChoice: null,
+      pendingPlanApprovalHandoff: null,
       planExecutionEvidenceLedger: [],
       planExecutionEvidenceCount: 0,
       planAutoResumeCount: 0,
@@ -7728,6 +7753,7 @@ export const useAppStore = create<AppState>()(
       set({
         isPlanApproved: false,
         planApprovalChoice: null,
+        pendingPlanApprovalHandoff: null,
         planExecutionEvidenceLedger: [],
         planExecutionEvidenceCount: 0,
         planAutoResumeCount: 0,
@@ -7745,13 +7771,24 @@ export const useAppStore = create<AppState>()(
       return false;
     }
 
-    if (state.isGenerating) {
+    const allowHiddenExecutionWhileBusy =
+      options?.hidden === true &&
+      options?.executionConsentGranted === true &&
+      state.agentStatus === "running";
+
+    if (state.isGenerating && !allowHiddenExecutionWhileBusy) {
       get().queueUserMessage(text, images, {
         contextMentions: mentionSnapshot,
         attachedFiles: attachedFilesSnapshot.map((file) => normalizeAttachedFile(file)),
       });
       logStoreEvent("send_queued", { reason: "generation_in_progress" });
       return false;
+    } else if (state.isGenerating && allowHiddenExecutionWhileBusy) {
+      logStoreEvent("send_busy_hidden_execution_allowed", {
+        reason: "generation_in_progress",
+        runtimeIntentOverride: options?.runtimeIntentOverride ?? null,
+        turnIdOverride: options?.turnIdOverride ?? null,
+      });
     }
 
     if (state.agentStatus === "pending_review" && state.abortController && (options?.executionConsentGranted === true || shouldExecuteOnceFromReplyOption)) {
@@ -7774,7 +7811,7 @@ export const useAppStore = create<AppState>()(
       // If agentStatus is stuck at "running" but there's no abortController,
       // the previous stream must have failed silently. Reset to idle so
       // the user isn't permanently blocked from sending messages.
-      if ((state.agentStatus === "running" || state.agentStatus === "pending_review") && !state.abortController) {
+      if (!allowHiddenExecutionWhileBusy && (state.agentStatus === "running" || state.agentStatus === "pending_review") && !state.abortController) {
         logStoreEvent("send_stuck_state_reset", {
           previousStatus: state.agentStatus,
         });
@@ -7787,7 +7824,7 @@ export const useAppStore = create<AppState>()(
         }
         // Re-check after state reset
         if (!text.trim() && (!images || images.length === 0) && !hasSupplementalInput) return false;
-      } else {
+      } else if (!allowHiddenExecutionWhileBusy) {
         get().queueUserMessage(text, images, {
           contextMentions: mentionSnapshot,
           attachedFiles: attachedFilesSnapshot.map((file) => normalizeAttachedFile(file)),
@@ -7797,6 +7834,12 @@ export const useAppStore = create<AppState>()(
           agentStatus: state.agentStatus,
         });
         return false;
+      } else {
+        logStoreEvent("send_busy_hidden_execution_allowed", {
+          reason: "agent_running",
+          runtimeIntentOverride: options?.runtimeIntentOverride ?? null,
+          turnIdOverride: options?.turnIdOverride ?? null,
+        });
       }
     }
     const sessionScopeKey = resolveSessionWorkspaceKey(state.currentWorkspace);
@@ -8522,7 +8565,7 @@ export const useAppStore = create<AppState>()(
       pendingRunDecision: null,
       isGenerating: true,
       config: { ...s.config, workflowMode: effectiveWorkflowMode },
-      ...(preservePlanState ? {} : { isPlanApproved: false, planApprovalChoice: null }),
+      ...(preservePlanState ? {} : { isPlanApproved: false, planApprovalChoice: null, pendingPlanApprovalHandoff: null }),
       ...(preservePlanState ? {} : { planAutoResumeCount: 0, planExecutionProgressSnapshot: null }),
       ...(shouldGrantExecutionConsentForTurn
         ? { currentTurnExecutionConsent: { turnId, granted: true } }
@@ -9670,6 +9713,7 @@ export const useAppStore = create<AppState>()(
           : null,
         planStage: hasHydratedCurrentSession ? persistedState.planStage ?? "idle" : "idle",
         isPlanApproved: hasHydratedCurrentSession ? persistedState.isPlanApproved === true : false,
+        pendingPlanApprovalHandoff: null,
         showPlanPanel: hasHydratedCurrentSession ? persistedState.showPlanPanel === true : false,
         showDiff: hasHydratedCurrentSession ? persistedState.showDiff === true : false,
         showTerminal: hasHydratedCurrentSession ? persistedState.showTerminal === true : false,

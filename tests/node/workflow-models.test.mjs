@@ -845,6 +845,36 @@ test("runtime plan task derivation skips approved-plan diagnostic read loops", (
   assert.equal(tasks.some((task) => task.evidence?.some((item) => item.value === "src/store/dashboardStore.ts")), false);
 });
 
+test("runtime plan task derivation does not turn code identifiers into shell command tasks", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([
+    {
+      kind: "plan",
+      path: ".MAIN/plans/plan.md",
+      title: "Plan",
+      updatedAt: 1,
+      content: [
+        "# Plan",
+        "",
+        "## Public APIs / Interfaces / Types",
+        "- `tauri::command]`",
+        "- `tauri::Window, path: String`",
+        "- `tauri::Builder::default(`",
+        "- `tauri::generate_handler![`",
+        "- `tauri::webview::WebviewWindowBuilder::new(`",
+        "- `tauri::WebviewUrl::App(`",
+        "",
+        "## 执行步骤",
+        "- 修改 src-tauri/src/main.rs，修复 Tauri window path 处理。",
+        "- 运行 `cargo check` 验证 Rust 编译。",
+      ].join("\n"),
+    },
+  ], { language: "zh" });
+
+  const commandTasks = tasks.filter((task) => task.evidence?.some((item) => item.kind === "cmd"));
+  assert.deepEqual(commandTasks.map((task) => task.commands?.[0]), ["cargo check"]);
+  assert.equal(tasks.some((task) => /tauri::/.test(task.text)), false);
+});
+
 test("runtime task inference treats source mutations with render wording as file evidence", () => {
   const parsed = extractPlanTasks(
     "- [ ] Store 安全更新：在 `dashboardStore` 中增加数据写入前的校验逻辑，防止非法数据进入状态池导致后续渲染崩溃。",

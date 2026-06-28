@@ -9,24 +9,11 @@ test.beforeEach(async ({ page }) => {
   });
 });
 
-test("top bar processing timer appears and increments while streaming", async ({ page }) => {
+test("running turn header appears while streaming", async ({ page }) => {
   await page.goto("/?e2eScenario=streaming-timer");
 
-  await expect(page.getByText("处理中... 0m0s")).toBeVisible();
-
-  await expect
-    .poll(async () =>
-      page.locator("div").filter({ hasText: /^处理中\.\.\. \d+m\d+s$/ }).first().textContent(),
-    )
-    .toContain("处理中...");
-
-  await expect
-    .poll(async () => {
-      const text = await page.locator("div").filter({ hasText: /^处理中\.\.\. \d+m\d+s$/ }).first().textContent();
-      const match = String(text || "").match(/(\d+)m(\d+)s/);
-      return match ? Number(match[1]) * 60 + Number(match[2]) : 0;
-    }, { timeout: 2500 })
-    .toBeGreaterThanOrEqual(1);
+  await expect(page.getByRole("button", { name: /执行中 .*计时器回归流/ })).toBeVisible();
+  await expect(page.getByTestId("composer-stop-button")).toBeVisible();
 });
 
 test("composer queues and guides additional input while a run is active", async ({ page }) => {
@@ -71,7 +58,8 @@ test("chat history remains scrollable during rapid streaming updates", async ({ 
   await page.goto("/?e2eScenario=streaming-responsiveness");
 
   const scroller = page.getByTestId("chat-scroll-container");
-  await expect(page.getByText("处理中... 0m0s")).toBeVisible();
+  await expect(page.getByRole("button", { name: /执行中 .*流式滚动回归/ })).toBeVisible();
+  await expect(page.getByTestId("composer-stop-button")).toBeVisible();
 
   await scroller.evaluate((el) => {
     el.scrollTop = el.scrollHeight;
@@ -84,14 +72,6 @@ test("chat history remains scrollable during rapid streaming updates", async ({ 
   await expect
     .poll(async () => scroller.evaluate((el) => el.scrollTop), { timeout: 2500 })
     .toBeLessThan(bottom - 100);
-
-  await expect
-    .poll(async () => {
-      const text = await page.locator("div").filter({ hasText: /^处理中\.\.\. \d+m\d+s$/ }).first().textContent();
-      const match = String(text || "").match(/(\d+)m(\d+)s/);
-      return match ? Number(match[1]) * 60 + Number(match[2]) : 0;
-    }, { timeout: 2500 })
-    .toBeGreaterThanOrEqual(1);
 
   await expect
     .poll(async () => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().tickCount ?? 0))

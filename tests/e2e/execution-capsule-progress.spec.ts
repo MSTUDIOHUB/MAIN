@@ -17,26 +17,26 @@ test("ExecutionCapsule does not invent execution step progress from plain tool a
   await expect(page.getByTestId("execution-capsule-execution-progress")).toHaveCount(0);
 });
 
-test("ExecutionCapsule shows the full approved plan task list during execution", async ({ page }) => {
+test("pure plan execution progress stays in the PlanPanel instead of the chat capsule", async ({ page }) => {
   await page.goto("/?e2eScenario=execution-capsule-plan-task-progress");
 
-  await expect(page.getByTestId("execution-capsule-plan-badge")).toContainText("任务 8/9");
-  await page.getByTestId("execution-capsule-shell").hover();
-  await expect(page.getByTestId("execution-capsule-plan-progress")).toContainText("共 9 个任务，已完成 8 个");
-  await expect(page.getByTestId("execution-capsule-plan-progress")).toContainText("T1: 更新");
-  await expect(page.getByTestId("execution-capsule-plan-progress")).toContainText("T8: 更新");
-  await expect(page.getByTestId("execution-capsule-plan-progress")).toContainText("T9: 更新");
-  await expect(page.getByTestId("execution-capsule-current-plan-task")).toContainText("T9: 更新");
-  await expect(page.getByTestId("execution-capsule-current-plan-task")).not.toContainText("当前");
+  await expect(page.getByTestId("execution-capsule-shell")).toHaveCount(0);
+  await expect(page.getByTestId("execution-capsule-plan-badge")).toHaveCount(0);
+  await expect(page.getByTestId("plan-task-progress")).toContainText("8/9");
+  await expect(page.getByTestId("plan-task-progress")).toContainText("T1: 更新");
+  await expect(page.getByTestId("plan-task-progress")).toContainText("T8: 更新");
+  await expect(page.getByTestId("plan-task-progress")).toContainText("T9: 更新");
 });
 
-test("ExecutionCapsule counts only trusted evidence, not claimed completed checkboxes", async ({ page }) => {
+test("PlanPanel counts only trusted evidence, not claimed completed checkboxes", async ({ page }) => {
   await page.goto("/?e2eScenario=execution-capsule-strict-evidence-progress");
 
-  await expect(page.getByTestId("execution-capsule-plan-badge")).toContainText("任务 1/8");
-  await page.getByTestId("execution-capsule-shell").hover();
-  await expect(page.getByTestId("execution-capsule-plan-progress")).toContainText("共 8 个任务，已完成 1 个");
-  await expect(page.getByTestId("execution-capsule-current-plan-task")).toContainText("1.1 修复 useTrendData 回退逻辑");
+  await expect(page.getByTestId("execution-capsule-shell")).toHaveCount(0);
+  await expect(page.getByTestId("execution-capsule-plan-badge")).toHaveCount(0);
+  await expect(page.getByTestId("plan-task-progress")).toContainText("1/8");
+  await expect(page.getByTestId("plan-task-progress")).toContainText("1.1 修复 useTrendData 回退逻辑");
+  await expect(page.getByTestId("plan-task-status").nth(1)).toContainText("待验证");
+  await expect(page.getByTestId("plan-task-progress")).not.toContainText("缺少真实执行证据");
 });
 
 test("ExecutionCapsule keeps approval buttons visible for a long command with plan tasks", async ({ page }) => {
@@ -47,8 +47,43 @@ test("ExecutionCapsule keeps approval buttons visible for a long command with pl
   await expect(page.getByTestId("execution-capsule-tool-review")).toContainText("开启自动审查并批准");
   await expect(page.getByTestId("execution-capsule-tool-review")).toContainText("批准此工具请求");
   await expect(page.getByTestId("execution-capsule-tool-review")).toContainText("printf");
-  await expect(page.getByTestId("execution-capsule-plan-progress")).toContainText("任务明细已收起");
+  await expect(page.getByTestId("execution-capsule-plan-badge")).toContainText("任务 8/12");
+  await expect(page.getByTestId("execution-capsule-plan-progress")).toHaveCount(0);
   await expect(page.getByTestId("execution-capsule-current-plan-task")).toHaveCount(0);
+});
+
+test("task tracking popover follows execution evidence order with ring-only current highlight", async ({ page }) => {
+  await page.goto("/?e2eScenario=execution-capsule-pending-tool-review");
+
+  await expect(page.getByTestId("execution-capsule-tool-review")).toBeVisible();
+  await page.getByTitle("任务跟踪").click();
+  await expect(page.getByTestId("tasks-progress-popover")).toBeVisible();
+
+  const taskIds = await page.locator("[data-testid='tasks-progress-popover'] [data-task-id]").evaluateAll((rows) =>
+    rows.map((row) => row.getAttribute("data-task-id"))
+  );
+  expect(taskIds.slice(0, 4)).toEqual([
+    "review-plan-task-3",
+    "review-plan-task-1",
+    "review-plan-task-2",
+    "review-plan-task-4",
+  ]);
+
+  const currentTask = page.getByTestId("execution-capsule-current-plan-task");
+  await expect(currentTask).toHaveAttribute("data-task-id", "review-plan-task-9");
+  const styles = await currentTask.evaluate((element) => {
+    const computed = getComputedStyle(element);
+    return {
+      className: element.className,
+      backgroundColor: computed.backgroundColor,
+      borderLeftColor: computed.borderLeftColor,
+    };
+  });
+
+  expect(styles.className).toContain("ring-2");
+  expect(styles.className).toContain("ring-[color-mix(in_srgb,var(--accent)_72%,transparent)]");
+  expect(styles.className).not.toContain("shadow-[inset_3px_0_0");
+  expect(styles.borderLeftColor).not.toBe("rgb(5, 150, 105)");
 });
 
 test("ExecutionCapsule renders approval controls from pendingToolCall when the pending tool card is missing", async ({ page }) => {
@@ -114,11 +149,37 @@ for (const mode of panelModes) {
   });
 }
 
-test("ExecutionCapsule run-active ring follows only the real running execution state", async ({ page }) => {
+test("double-clicking plan approval does not create a queued instruction", async ({ page }) => {
+  await page.goto("/?e2eScenario=execution-capsule-panel-stability");
+  await page.evaluate(() => (window as any).__CODELY_E2E__?.resetPlanApprovalPrompt?.());
+
+  const approve = page.getByTestId("execution-capsule-plan-approve");
+  await expect(approve).toBeVisible();
+  await approve.dblclick();
+
+  await expect
+    .poll(async () => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().isPlanApproved ?? false))
+    .toBe(true);
+  await expect
+    .poll(async () => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().queuedUserMessage?.text ?? null))
+    .toBeNull();
+  await expect
+    .poll(async () => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().conversationTurns ?? null))
+    .toBe(1);
+  await expect
+    .poll(async () => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().currentTurnExecutionConsent?.turnId ?? null))
+    .toBe("e2e-execution-capsule-panel-stability-turn");
+  await expect
+    .poll(async () => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().pendingPlanApprovalHandoff?.planTurnId ?? null))
+    .toBe("e2e-execution-capsule-panel-stability-turn");
+  await expect(page.getByTestId("composer-queued-message")).toHaveCount(0);
+});
+
+test("ExecutionCapsule appears for pending review but not pure running progress", async ({ page }) => {
   await page.goto("/?e2eScenario=execution-capsule-panel-stability");
 
   await page.evaluate(() => (window as any).__CODELY_E2E__?.setRunState?.("running"));
-  await expect(page.getByTestId("execution-capsule-shell")).toHaveAttribute("data-run-active", "true");
+  await expect(page.getByTestId("execution-capsule-shell")).toHaveCount(0);
 
   await page.evaluate(() => (window as any).__CODELY_E2E__?.setRunState?.("pending_review"));
   await expect(page.getByTestId("execution-capsule-shell")).toHaveAttribute("data-run-active", "false");

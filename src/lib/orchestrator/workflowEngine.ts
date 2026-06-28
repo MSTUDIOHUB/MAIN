@@ -1,4 +1,4 @@
-import { executeAgentLoop, type OrchestratorCallbacks } from "../orchestrator";
+import { executeAgentLoop, type AgentLoopOutcome, type OrchestratorCallbacks } from "../orchestrator";
 import { invoke } from "@tauri-apps/api/core";
 import { 
   appendThoughtDelta, 
@@ -270,7 +270,7 @@ export class WorkflowEngine {
       }
     };
 
-    const closeCurrentHarnessRunMarker = (status: "completed" | "error", reason: string) => {
+    const closeCurrentHarnessRunMarker = (status: "completed" | "paused" | "error", reason: string) => {
       const marker = sessionGet().harnessRunMarker;
       if (marker && marker.status === "running") {
         const closedAt = Date.now();
@@ -305,7 +305,7 @@ export class WorkflowEngine {
       }));
     };
 
-    const emitLocalPlanExecutionProgress = (phase: "starting" | "running" | "completed" | "error", update: any) => {
+    const emitLocalPlanExecutionProgress = (phase: "starting" | "running" | "completed" | "paused" | "error", update: any) => {
       const progressSnapshot = normalizePlanExecutionProgressSnapshot({
         turnId,
         update: buildPlanExecutionProgressUpdate({
@@ -419,6 +419,17 @@ export class WorkflowEngine {
       consumeActiveGuidance: () => sessionGet().consumeActiveGuidance(turnId),
       startNewTurn: () => sessionGet().startNewTurn(remoteFeishu),
       onApprovedPlanHandoff: (prompt: string) => {
+        const pendingHandoff = sessionGet().pendingPlanApprovalHandoff;
+        if (pendingHandoff && pendingHandoff.planTurnId !== turnId) {
+          logStoreEvent("plan_approval_handoff_ignored", {
+            reason: "different_pending_plan_turn",
+            planTurnId: turnId,
+            pendingPlanTurnId: pendingHandoff.planTurnId,
+            sessionKey: runSessionKey,
+            workspace: runWorkspace || null,
+          });
+          return;
+        }
         const language = sessionGet().config.language === "en" ? "en" : "zh";
         const executionTurnId = `turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
         context.approvedPlanHandoff = {
@@ -450,6 +461,7 @@ export class WorkflowEngine {
         });
         sessionSet((s: any) => ({
           currentTurnExecutionConsent: { turnId: executionTurnId, granted: true },
+          pendingPlanApprovalHandoff: null,
           planExecutionProgressSnapshot: progressSnapshot,
           conversationTurns: s.conversationTurns.map((turn: any) =>
             turn.id === turnId
@@ -1511,7 +1523,11 @@ export class WorkflowEngine {
 
       onNonActionableStop: (message: string, reason: "no_output" | "no_action" | "missing_tool_loop" | "incomplete_plan", _progress?: Partial<PlanExecutionProgressUpdate>) => {
         logStoreEvent("non_actionable_stop", { message, reason });
-        const stoppedStatus = reason === "no_output" ? "stopped_no_output" : "stopped_no_action";
+        const stoppedStatus = reason === "no_output"
+          ? "stopped_no_output"
+          : reason === "incomplete_plan"
+          ? "paused"
+          : "stopped_no_action";
         sessionSet((s: any) => {
           const currentStreamingBlockId = context.currentStreamingBlockId;
           const currentThoughtBlockId = context.currentThoughtBlockId;
@@ -1599,8 +1615,31 @@ export class WorkflowEngine {
       },
     };
 
-    return executeAgentLoop(callbacks, abortCtrl).then(() => {
-      closeCurrentHarnessRunMarker("completed", "agent_loop_resolved");
+    const closeHarnessForAgentLoopOutcome = (outcome: AgentLoopOutcome) => {
+      switch (outcome.status) {
+        case "completed":
+          closeCurrentHarnessRunMarker("completed", outcome.reason || "agent_loop_completed");
+          break;
+        case "paused":
+          closeCurrentHarnessRunMarker("paused", outcome.reason || "agent_loop_paused");
+          break;
+        case "stopped_no_output":
+          closeCurrentHarnessRunMarker("paused", outcome.reason || "agent_loop_no_output");
+          break;
+        case "stopped_no_action":
+          closeCurrentHarnessRunMarker("paused", outcome.reason || "agent_loop_no_action");
+          break;
+        case "aborted":
+          closeCurrentHarnessRunMarker("paused", outcome.reason || "agent_loop_aborted");
+          break;
+        case "error":
+          closeCurrentHarnessRunMarker("error", outcome.reason || "agent_loop_error");
+          break;
+      }
+    };
+
+    return executeAgentLoop(callbacks, abortCtrl).then((loopOutcome) => {
+      closeHarnessForAgentLoopOutcome(loopOutcome);
       clearInterval(timerInterval);
       sessionSet({ pendingSlashCommand: null, elapsedTime: getElapsedSeconds() });
 
@@ -1680,6 +1719,7 @@ export class WorkflowEngine {
             latest.currentSessionId,
           );
           if (latestSessionKey !== runSessionKey) {
+            latest.updateRuntimeForSession?.(runSessionKey, { pendingPlanApprovalHandoff: null });
             logStoreEvent("plan_approval_handoff_skipped", {
               reason: "session_changed",
               planTurnId: handoff.parentPlanTurnId,
@@ -1690,6 +1730,7 @@ export class WorkflowEngine {
             return;
           }
           if (latest.isGenerating || latest.agentStatus === "running" || latest.agentStatus === "pending_review") {
+            latest.updateRuntimeForSession?.(runSessionKey, { pendingPlanApprovalHandoff: null });
             logStoreEvent("plan_approval_handoff_skipped", {
               reason: "agent_busy",
               planTurnId: handoff.parentPlanTurnId,
@@ -1704,6 +1745,7 @@ export class WorkflowEngine {
               ? "Plan approved; execution was handed off to a new turn."
               : "计划已批准，执行已交接到新的回合。",
           });
+          latest.updateRuntimeForSession?.(runSessionKey, { pendingPlanApprovalHandoff: null });
           logStoreEvent("plan_approval_handoff_starting_execution_turn", {
             planTurnId: handoff.parentPlanTurnId,
             executionTurnId: handoff.executionTurnId,

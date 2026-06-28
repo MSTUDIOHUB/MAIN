@@ -80,3 +80,23 @@ test("onToolDone populates planExecutionEvidenceLedger and reconciles planTasks"
   assert.match(source, /reconcilePlanTaskCompletion/);
 });
 
+test("workflow engine closes harness from structured agent loop outcome", () => {
+  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"), "utf8");
+
+  assert.match(source, /type AgentLoopOutcome/);
+  assert.match(source, /const closeHarnessForAgentLoopOutcome = \(outcome: AgentLoopOutcome\) =>/);
+  assert.match(source, /case "completed":[\s\S]*agent_loop_completed/);
+  assert.match(source, /case "paused":[\s\S]*closeCurrentHarnessRunMarker\("paused"/);
+  assert.match(source, /case "stopped_no_action":[\s\S]*agent_loop_no_action/);
+  assert.doesNotMatch(source, /closeCurrentHarnessRunMarker\("completed", "agent_loop_resolved"\)/);
+});
+
+test("agent loop returns structured non-completed outcomes for stops and approved-plan guard", () => {
+  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8");
+
+  assert.match(source, /Promise<AgentLoopOutcome>/);
+  assert.match(source, /onNonActionableStop: \(message, reason, progress\) =>/);
+  assert.match(source, /reason === "incomplete_plan" \? "paused"/);
+  assert.match(source, /approved_plan_completion_guard/);
+  assert.match(source, /buildPlanTaskEvidenceAudit/);
+});

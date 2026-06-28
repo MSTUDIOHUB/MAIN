@@ -49,7 +49,7 @@ import { buildPlanEvidenceBlockedPauseMessage, buildPlanTargetedEvidenceRecovery
 import { extractPrimaryUserRequestText, extractTurnInputContextSignalsFromMessages } from "../../turnIntake";
 import { buildRequiredWebResearchQuery, formatWebResearchLocalDate, shouldRequireWebResearchForPrompt } from "../../webResearchGuard";
 import { deriveStreamSettings, resolveEffectiveToolProtocol, shouldUseXmlToolProtocol, resolveModelProtocolProfile, compactDiagnosticText, getOriginalUserPromptForPlanFallback, logAgentEvent, looksLikeRepairExecutionRequest, WEB_RESEARCH_TOOL_NAMES, KNOWLEDGE_TOOL_NAMES, filterGlobalChatToolDefinitions, getSessionTaskTargetingEvidence, runLifecycleHooks, createHookContextMessages, shouldUsePlanNoVisibleTokenWatchdog, PLAN_NO_VISIBLE_TOKEN_TIMEOUT_MS, truncateForLog, MAX_RECENT_PLAN_TOOL_ACTIVITY, EDIT_PROGRESS_TOOL_NAMES, EXECUTION_VERIFICATION_TOOL_NAMES, isReviewablePlanStage, buildPlanReviewReadyMessage, buildApprovedPlanContinuationPrompt, collectPlanClosureMaterializationInput, shouldAttemptPlanClosureGuard, isStreamWatchdogTimeoutMessage, buildApprovedPlanNoProgressStrategySwitchPrompt, PLAN_EXPLORATION_READ_ONLY_TOOLS, approvedPlanNeedsSourceEditBeforeValidation, isApprovedPlanSourceEditFirstTool, isApprovedPlanRecoveryTool, filterPlanRuntimeToolDefinitionsForPhase, hasPlanUserContextObservation, computeManagedContextLimit, computeContextForceReason, prepareMessagesForToolProtocol, summarizeMessagesForDiagnostics, summarizeToolsForDiagnostics, fetchLLMStream, shouldTreatCloudGatewayErrorAsCompatibility, buildNonActionableStopMessage, normalizeToolCallToExecute, buildAssistantHistoryMessage, shouldCompactProseCodeDump, buildProseCodeDumpNotice, summarizeReplyOptionsForLog, looksLikePlanCompletionClaim, isPreApprovalPlanDraftWrite, parseToolCallArguments, buildToolActionNarration, getToolTarget, MAX_NO_ACTION_RETRIES, buildReadOnlyPermissionHardRecoveryPrompt, formatPlanAuditRemainingTasks, resolveApprovedPlanValidationBoundary, buildApprovedPlanValidationPendingMessage, MAX_APPROVED_PLAN_NO_PROGRESS_RECOVERY_ATTEMPTS, buildApprovedPlanNoToolPauseMessage, buildBrowserValidationContinuationPrompt, buildPlanCommandExecutionHint, looksLikeOperationCompletionClaim, buildExecuteCompletionEvidencePrompt, looksLikeExecutionReplanningText, buildExecuteReplanningEvidencePrompt, autoMaterializePlanArtifactFromVisibleText, buildPlanRecoveryPrompt, CONCISE_PLAN_ARTIFACT_HINT_ZH, CONCISE_PLAN_ARTIFACT_HINT_EN, isPlanArtifactPath, buildHiddenThoughtOnlyContinuationPrompt, emitToolPreflightBlocked, planUnsupportedToolFeedbackMessage, buildReadOnlyCacheSignature, readFileMetadataIfAvailable, buildPlanExplorationBudget, PLAN_REPEAT_READ_LIMIT, buildPlanClosurePromptFromEvidence, appendPlanRepeatReadLimitGuidance, formatCachedReadOnlyToolResult, buildPlanGateBlockedResult, truncateToolContent, executeReadOnlyToolsConcurrently, isReadFileRepeatLimitResult, executeLocalFileReadToolWithReview, executeWriteToolWithReview, isProjectSourceWriteResult, inferLifecycleStateFromToolResult, targetProgressReasonForToolResult, isSuccessfulPlanArtifactWriteResult, shouldDeferNoProgressStopToPlanReadOnlyConvergence, buildNoProgressBatchSignature, MAX_NO_PROGRESS_LOOP_REPEATS, buildToolResultHistoryContentByFormat, summarizeReadFileRepeatLimitBatch, buildReadFileRepeatLimitBatchPauseNotice, targetProgressOutcomeForToolResult, PLAN_EXECUTE_CONVERGENCE_PROMPT_RATIO, EXECUTE_CONVERGENCE_PROMPT_RATIO, buildExecuteConvergencePrompt, isExecutionPlanArtifactWrite, isTasksPlanWrite } from "../../orchestrator";
-import { AgentMessage, ToolExecutionResult, FetchLLMStreamOptions, CachedReadOnlyToolResult, ToolCallToExecute, ToolCallInMessage, OrchestratorCallbacks } from "../types";
+import { AgentMessage, ToolExecutionResult, FetchLLMStreamOptions, CachedReadOnlyToolResult, ToolCallToExecute, ToolCallInMessage, OrchestratorCallbacks, type AgentLoopOutcome } from "../types";
 
 export class AgentOrchestrator {
     async prepareTurn() {
@@ -4884,6 +4884,35 @@ export class AgentOrchestrator {
             }
 
             if (workflowMode === "plan" && callbacks.getIsPlanApproved()) {
+              const finalPlanAudit = buildPlanTaskEvidenceAudit({
+                tasks: callbacks.getPlanTasks(),
+                evidenceLedger: callbacks.getPlanExecutionEvidenceLedger(),
+                highlightNext: true,
+              });
+              if (finalPlanAudit.totalCount === 0 || !finalPlanAudit.allTrustedComplete || finalPlanAudit.pendingExternalValidation) {
+                logAgentEvent("plan_completion_guard_reprompt", {
+                  iteration,
+                  completed: finalPlanAudit.completedCount,
+                  total: finalPlanAudit.totalCount,
+                  remaining: finalPlanAudit.remainingTasks.length,
+                  pendingExternalValidation: finalPlanAudit.pendingExternalValidation,
+                  pendingUserValidation: finalPlanAudit.pendingUserValidationTasks.length,
+                });
+                callbacks.onStatusChange("running");
+                callbacks.appendMessage({
+                  role: "user",
+                  content: callbacks.getPreferredLanguage() === "zh"
+                    ? [
+                        "MAIN 的完成闸门没有通过：当前已批准 Plan 不能仅凭模型正文或单次工具结果结束。",
+                        "请继续真实执行并产生文件/命令/验证证据；如果只剩浏览器/Tauri/用户验证且自动工具不可用，请暂停并说明待用户验证。",
+                      ].join("\n")
+                    : [
+                        "MAIN's completion gate did not pass: the approved Plan cannot end from assistant prose or a single tool result alone.",
+                        "Continue with real execution evidence from files, commands, or validation. If only browser/Tauri/user validation remains and automation is unavailable, pause and report pending user validation.",
+                      ].join("\n"),
+                });
+                continue;
+              }
               emitTaskOrchestratorPhase("DONE", {
                 reason: "plan_evidence_complete",
                 iteration,
@@ -7134,7 +7163,77 @@ export class AgentOrchestrator {
     }
 }
 
-export async function executeAgentLoop(callbacks: OrchestratorCallbacks, abortController: AbortController): Promise<void> {
+export async function executeAgentLoop(callbacks: OrchestratorCallbacks, abortController: AbortController): Promise<AgentLoopOutcome> {
     const orchestrator = new AgentOrchestrator();
-    return orchestrator.execute(callbacks, abortController);
+    let outcome: AgentLoopOutcome = { status: "completed", reason: "agent_loop_completed" };
+    const setOutcome = (next: AgentLoopOutcome) => {
+        if (outcome.status === "error") return;
+        if (outcome.status === "aborted" && next.status !== "error") return;
+        outcome = next;
+    };
+    const wrappedCallbacks: OrchestratorCallbacks = {
+        ...callbacks,
+        onNonActionableStop: (message, reason, progress) => {
+            const status: AgentLoopOutcome["status"] =
+                reason === "no_output" ? "stopped_no_output" :
+                reason === "incomplete_plan" ? "paused" :
+                "stopped_no_action";
+            setOutcome({ status, reason });
+            callbacks.onNonActionableStop(message, reason, progress);
+        },
+        onError: (error) => {
+            setOutcome({ status: "error", reason: "agent_loop_error" });
+            callbacks.onError(error);
+        },
+    };
+
+    try {
+        await orchestrator.execute(wrappedCallbacks, abortController);
+    } catch (error) {
+        setOutcome({ status: "error", reason: "agent_loop_error" });
+        throw error;
+    }
+
+    if (abortController.signal.aborted) {
+        return { status: "aborted", reason: "agent_loop_aborted" };
+    }
+
+    if (outcome.status === "completed" && callbacks.getWorkflowMode() === "plan" && callbacks.getIsPlanApproved()) {
+        const audit = buildPlanTaskEvidenceAudit({
+            tasks: callbacks.getPlanTasks(),
+            evidenceLedger: callbacks.getPlanExecutionEvidenceLedger(),
+            highlightNext: true,
+        });
+        if (audit.totalCount === 0 || !audit.allTrustedComplete || audit.pendingExternalValidation || audit.pendingUserValidationTasks.length > 0) {
+            const language = callbacks.getPreferredLanguage();
+            const remainingText = formatPlanAuditRemainingTasks(
+                audit,
+                language,
+                language === "zh"
+                    ? "- 已批准 Plan 尚未产生可审计的运行时任务证据。"
+                    : "- The approved Plan has not produced auditable runtime task evidence yet.",
+            );
+            logAgentEvent("plan_completion_guard_outcome_paused", {
+                completed: audit.completedCount,
+                total: audit.totalCount,
+                remaining: audit.remainingTasks.length,
+                pendingExternalValidation: audit.pendingExternalValidation,
+                pendingUserValidation: audit.pendingUserValidationTasks.length,
+            });
+            callbacks.onNonActionableStop(
+                buildApprovedPlanNoToolPauseMessage(
+                    language,
+                    remainingText,
+                    1,
+                    audit,
+                    false,
+                ),
+                "incomplete_plan",
+            );
+            callbacks.onStatusChange("idle");
+            return { status: "paused", reason: "approved_plan_completion_guard" };
+        }
+    }
+
+    return outcome;
 }

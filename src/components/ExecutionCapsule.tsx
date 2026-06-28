@@ -1,10 +1,9 @@
-import { memo, useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
-import { IconColumns, IconFileText, IconInfo } from "./Icons";
+import { memo, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { IconColumns, IconInfo } from "./Icons";
 import type { TurnProgressItem } from "../lib/turnProgress";
 import { buildPlanTaskEvidenceAudit, isPlanTaskAwaitingBrowserValidation, isPlanTaskAwaitingExternalValidation, type PlanExecutionEvidenceEntry, type PlanStage, type PlanTask, type ReplyOption } from "../lib/workflowModels";
 import type { PendingRunDecision, PendingRunDecisionChoice } from "../lib/runIntent";
 import { inferReplyOptionActionFromText } from "../lib/replyOptions";
-import MarkdownRenderer from "./MarkdownRenderer";
 
 // region: ExecutionCapsule 属性定义
 interface ExecutionCapsuleProps {
@@ -38,7 +37,6 @@ interface ExecutionCapsuleProps {
   onRejectDiff?: (id: number) => void;
   onApproveDiffOnce?: () => void;
   onApproveDiffSession?: () => void;
-  onOpenPlan: () => void;
   onOpenDiff: () => void;
 }
 // endregion
@@ -72,32 +70,6 @@ function getDisplayReplyOptionLabel(option: ReplyOption, language: "zh" | "en"):
   return option.label || option.value || "";
 }
 
-function getStageLabel(stage: PlanStage, language: "zh" | "en"): string {
-  const zh: Record<PlanStage, string> = {
-    idle: "待生成",
-    plan: "计划",
-    requirements: "需求",
-    design: "历史计划",
-    tasks: "任务",
-    bugfix: "修复",
-    ready_to_execute: "待执行",
-    executing: "执行中",
-    completed: "已完成",
-  };
-  const en: Record<PlanStage, string> = {
-    idle: "Idle",
-    plan: "Plan",
-    requirements: "Requirements",
-    design: "Legacy Plan",
-    tasks: "Tasks",
-    bugfix: "Bugfix",
-    ready_to_execute: "Ready",
-    executing: "Executing",
-    completed: "Completed",
-  };
-  return (language === "zh" ? zh : en)[stage];
-}
-
 function renderFormattedLabel(text: string): ReactNode {
   if (!text) return "";
   const parts = text.split(/(\*\*[^*]+\*\*|`[^`]+`)/g);
@@ -124,7 +96,6 @@ function renderFormattedLabel(text: string): ReactNode {
 }
 
 const ExecutionCapsule = memo(function ExecutionCapsule({
-  title,
   status,
   statusToneClass,
   language,
@@ -154,21 +125,23 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
   onRejectDiff,
   onApproveDiffOnce,
   onApproveDiffSession,
-  onOpenPlan,
   onOpenDiff,
 }: ExecutionCapsuleProps) {
   const [customReplyText, setCustomReplyText] = useState("");
   const [planAdjustmentText, setPlanAdjustmentText] = useState("");
   const [isApproving, setIsApproving] = useState(false);
+  const approvingRef = useRef(false);
 
   useEffect(() => {
     if (planStage === "executing" || isRunActive) {
+      approvingRef.current = false;
       setIsApproving(false);
     }
   }, [planStage, isRunActive]);
 
   const handleApprovePlan = () => {
-    if (isApproving || isRunActive || planStage === "executing") return;
+    if (approvingRef.current || isApproving || isRunActive || planStage === "executing") return;
+    approvingRef.current = true;
     setIsApproving(true);
     onApprovePlan();
   };
@@ -316,17 +289,9 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
     }));
   }, [activeProgressMode, auditedPlanTasks, executionSteps]);
   const hasTasks = progressItems.length > 0;
-  const shouldCompactTasksForReview = hasPendingToolReview && hasTasks;
   const isExpanded = hasExpandableContent;
   // endregion
   const completedCount = progressItems.filter((item) => item.complete).length;
-  const progress = progressItems.length > 0 ? Math.round((completedCount / progressItems.length) * 100) : 0;
-  const currentPlanTaskIndex = useMemo(() => {
-    if (activeProgressMode !== "plan" || auditedPlanTasks.length === 0) return -1;
-    const firstIncompleteIndex = auditedPlanTasks.findIndex((task) => !(task.evidenceStatus === "satisfied" && task.status === "completed"));
-    return firstIncompleteIndex >= 0 ? firstIncompleteIndex : auditedPlanTasks.length - 1;
-  }, [activeProgressMode, auditedPlanTasks]);
-  const visibleTasks = shouldCompactTasksForReview ? [] : progressItems;
 
   const copy = useMemo(() => ({
     tasks: language === "zh" ? "任务" : "Tasks",
@@ -417,16 +382,6 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
     : isBlackTheme
     ? "bg-[rgba(255,255,255,0.025)] border-[#17171c]"
     : "bg-[rgba(255,255,255,0.04)] border-[#1f1f23]";
-  const taskRowClass = themeMode === "light"
-    ? "border-[rgba(15,23,42,0.10)] bg-[rgba(255,255,255,0.68)]"
-    : isBlackTheme
-    ? "border-[#202026] bg-[#030304]"
-    : "border-[#202026] bg-[#09090b]";
-  const currentTaskRowClass = themeMode === "light"
-    ? "border-[color-mix(in_srgb,var(--accent-hover)_48%,rgba(15,23,42,0.12))] bg-[rgba(255,255,255,0.68)] shadow-[inset_3px_0_0_color-mix(in_srgb,var(--accent-hover)_72%,transparent)]"
-    : isBlackTheme
-    ? "border-[color-mix(in_srgb,var(--accent-light)_46%,#202026)] bg-[#030304] shadow-[inset_3px_0_0_color-mix(in_srgb,var(--accent-light)_72%,transparent)]"
-    : "border-[color-mix(in_srgb,var(--accent-light)_46%,#202026)] bg-[#09090b] shadow-[inset_3px_0_0_color-mix(in_srgb,var(--accent-light)_72%,transparent)]";
   const normalizedCustomReply = customReplyText.replace(/\s+/g, " ").trim();
   const normalizedPlanAdjustment = planAdjustmentText.replace(/\s+/g, " ").trim();
   const showChoicePromptContent = true;

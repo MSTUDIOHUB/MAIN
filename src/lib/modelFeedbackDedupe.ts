@@ -41,7 +41,7 @@ export function isThinModelToolNarration(text: string): boolean {
   const normalized = raw.replace(/\s+/g, "");
   if (!normalized || normalized.length > 280) return false;
   const futureToolNarration =
-    /^(?:我(?:会|將|将|先|现在|正在|继续)|让我|接下来|现在|继续|正在).{0,56}(?:读取|查看|搜索|调查|执行|运行|调用|写入|修改|验证|整理|完成)/.test(normalized) ||
+    /(?:^|[。,，；;！!？?：:])(?:我(?:会|將|将|先|现在|正在|继续)|让我|接下来|现在|继续|正在).{0,56}(?:读取|查看|检查|搜索|调查|执行|运行|调用|写入|修改|验证|整理|完成)/.test(normalized) ||
     /(?:continuingto|i(?:'|’)llread|iwillread|iread|readcomplete|searchcomplete|runningcommand)/i.test(normalized);
   if (futureToolNarration) return true;
   if (isSubstantiveModelFeedback(raw)) return false;

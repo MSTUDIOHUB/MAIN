@@ -666,7 +666,7 @@ test("store marks aborted idle turns as resumable before deriving completed_with
 test("workflow engine marks non-actionable stops as resumable turn status", () => {
   const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"), "utf8");
 
-  assert.match(source, /const stoppedStatus = reason === "no_output" \? "stopped_no_output" : "stopped_no_action"/);
+  assert.match(source, /const stoppedStatus = reason === "no_output"[\s\S]*\? "stopped_no_output"[\s\S]*: reason === "incomplete_plan"[\s\S]*\? "paused"[\s\S]*: "stopped_no_action"/);
   assert.match(source, /turn\.id === turnId && turn\.status !== "awaiting_approval"[\s\S]*status: stoppedStatus/);
 });
 

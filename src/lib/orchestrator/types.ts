@@ -46,6 +46,19 @@ export interface AgentMessage {
   reasoning?: string;
 }
 
+export type AgentLoopOutcomeStatus =
+  | "completed"
+  | "paused"
+  | "stopped_no_action"
+  | "stopped_no_output"
+  | "aborted"
+  | "error";
+
+export interface AgentLoopOutcome {
+  status: AgentLoopOutcomeStatus;
+  reason: string;
+}
+
 export interface OrchestratorCallbacks {
   // State accessors
   getMessages: () => AgentMessage[];
@@ -264,4 +277,3 @@ export type ReviewDecision =
   | { action: "accept"; grantLocalFileReadPath?: string; shellPermissionApproval?: ShellPermissionApproval }
   | { action: "reject" }
   | { action: "error"; error: string };
-

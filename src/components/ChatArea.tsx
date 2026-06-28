@@ -22,6 +22,7 @@ import { useAppStore } from "../store/useAppStore";
 import {
   buildPlanTaskEvidenceAudit,
   deriveVisibleConversationTurnStatus,
+  findFirstPlanTaskEvidenceRecord,
   isGenericConversationTitle,
   isEphemeralPlanArtifactPath,
   normalizeConversationDisplayTitle,
@@ -2717,21 +2718,45 @@ export default function ChatArea({
     return deriveTurnProgressItems(capsuleControlTurnBlocks, language);
   }, [language, capsuleControlTurn, capsuleControlTurnBlocks]);
   const capsuleProgressMode = shouldShowPinnedPlanTasks ? "plan" : "execution";
+  const auditedPlanTasks = useMemo(() => buildPlanTaskEvidenceAudit({ tasks: planTasks, evidenceLedger: planExecutionEvidenceLedger }).tasks, [planTasks, planExecutionEvidenceLedger]);
   const capsuleProgressItems = useMemo(() => {
     if (capsuleProgressMode === "plan") {
-      return planTasks.map((task) => ({
-        id: task.id,
-        text: task.text,
-        complete: task.status === "completed" || task.status === "skipped",
-        status: task.status,
-        validationStatus: task.status === "completed"
-          ? "none"
-          : isPlanTaskAwaitingBrowserValidation(task, planExecutionEvidenceLedger)
-          ? "browser"
-          : isPlanTaskAwaitingExternalValidation(task, planExecutionEvidenceLedger)
-          ? "user"
-          : "none",
-      }));
+      return auditedPlanTasks
+        .map((task, originalIndex) => {
+          const evidenceMatch = findFirstPlanTaskEvidenceRecord(task, planExecutionEvidenceLedger);
+          return {
+            id: task.id,
+            text: task.text,
+            complete: task.status === "completed" || task.status === "skipped",
+            status: task.status,
+            validationStatus: task.status === "completed"
+              ? "none"
+              : isPlanTaskAwaitingBrowserValidation(task, planExecutionEvidenceLedger)
+              ? "browser"
+              : isPlanTaskAwaitingExternalValidation(task, planExecutionEvidenceLedger)
+              ? "user"
+              : "none",
+            originalIndex,
+            executionLedgerIndex: evidenceMatch?.ledgerIndex ?? null,
+            executionCreatedAt: evidenceMatch?.record?.createdAt ?? null,
+          };
+        })
+        .sort((a, b) => {
+          const aHasEvidence = typeof a.executionLedgerIndex === "number";
+          const bHasEvidence = typeof b.executionLedgerIndex === "number";
+          if (aHasEvidence && bHasEvidence) {
+            if (a.executionLedgerIndex !== b.executionLedgerIndex) {
+              return a.executionLedgerIndex - b.executionLedgerIndex;
+            }
+            const aCreatedAt = Number(a.executionCreatedAt) || 0;
+            const bCreatedAt = Number(b.executionCreatedAt) || 0;
+            if (aCreatedAt !== bCreatedAt) return aCreatedAt - bCreatedAt;
+            return a.originalIndex - b.originalIndex;
+          }
+          if (aHasEvidence !== bHasEvidence) return aHasEvidence ? -1 : 1;
+          return a.originalIndex - b.originalIndex;
+        })
+        .map(({ originalIndex, executionLedgerIndex, executionCreatedAt, ...task }) => task);
     }
     return (capsuleControlExecutionSteps || []).map((step, idx) => ({
       id: String(idx),
@@ -2740,14 +2765,13 @@ export default function ChatArea({
       status: step.complete ? "completed" : "in_progress",
       validationStatus: "none" as const,
     }));
-  }, [capsuleProgressMode, planTasks, planExecutionEvidenceLedger, capsuleControlExecutionSteps]);
+  }, [capsuleProgressMode, auditedPlanTasks, planExecutionEvidenceLedger, capsuleControlExecutionSteps]);
   const capsuleHasTasks = capsuleProgressItems.length > 0;
   
-  const auditedPlanTasks = useMemo(() => buildPlanTaskEvidenceAudit({ tasks: planTasks, evidenceLedger: planExecutionEvidenceLedger }).tasks, [planTasks, planExecutionEvidenceLedger]);
-  const currentPlanTaskIndex = useMemo(() => {
-    if (capsuleProgressMode !== "plan" || auditedPlanTasks.length === 0) return -1;
-    const firstIncompleteIndex = auditedPlanTasks.findIndex((task) => !(task.evidenceStatus === "satisfied" && task.status === "completed"));
-    return firstIncompleteIndex >= 0 ? firstIncompleteIndex : auditedPlanTasks.length - 1;
+  const currentPlanTaskId = useMemo(() => {
+    if (capsuleProgressMode !== "plan" || auditedPlanTasks.length === 0) return null;
+    const firstIncompleteTask = auditedPlanTasks.find((task) => !(task.evidenceStatus === "satisfied" && task.status === "completed"));
+    return (firstIncompleteTask || auditedPlanTasks[auditedPlanTasks.length - 1])?.id || null;
   }, [capsuleProgressMode, auditedPlanTasks]);
 
   const capsuleCompletedCount = capsuleProgressItems.filter((item) => item.complete).length;
@@ -2945,19 +2969,15 @@ export default function ChatArea({
     !!pendingRunDecision ||
     !!pendingToolReviewForExecutionCapsule ||
     canApprovePlan;
-  const capsuleControlHasProgressContext =
-    planTasks.length > 0 ||
-    capsuleControlExecutionSteps.length > 0;
   const shouldShowExecutionCapsuleNormally =
     !!capsuleControlTurn &&
     capsuleControlTurnStatusKey !== "done" &&
     capsuleControlTurnStatusKey !== "completed_with_changes" &&
-    (capsuleControlHasChoiceContext || capsuleControlHasProgressContext);
+    capsuleControlHasChoiceContext;
   const shouldShowExecutionCapsule =
     (!!capsuleControlTurn || !!pendingRunDecision) &&
     (
       capsuleControlHasChoiceContext ||
-      (capsuleControlHasProgressContext && shouldKeepExecutionCapsuleResident) ||
       shouldShowExecutionCapsuleNormally
     );
 
@@ -3301,6 +3321,7 @@ export default function ChatArea({
       if (idx === finalVisibleAgentIndex) return false;
       if (!block || block.type !== "agent" || block.hiddenProcess || block.streaming) return false;
       if (Array.isArray(block.options) && block.options.length > 0) return false;
+      if (isTransparentToolNarrationBlock(block)) return false;
       const text = getAgentVisibleMarkdownText(block);
       const content = String(text || "").trim();
       if (!content) return false;
@@ -3884,7 +3905,6 @@ export default function ChatArea({
       onRejectDiff={handleRejectInline}
       onApproveDiffOnce={() => approvePendingReviewOnce()}
       onApproveDiffSession={() => approvePendingReviewForSession()}
-      onOpenPlan={() => openRightPanelTab("plan")}
       onOpenDiff={() => openRightPanelTab("diff")}
     />
   ) : null;
@@ -4349,17 +4369,14 @@ export default function ChatArea({
                       : isBlackThemeMode
                       ? "border-[#202026] bg-[#030304]"
                       : "border-[#202026] bg-[#09090b]";
-                    const currentTaskRowClass = isLightThemeMode
-                      ? "border-[color-mix(in_srgb,var(--accent-hover)_48%,rgba(15,23,42,0.12))] bg-[rgba(255,255,255,0.68)] shadow-[inset_3px_0_0_color-mix(in_srgb,var(--accent-hover)_72%,transparent)]"
-                      : isBlackThemeMode
-                      ? "border-[color-mix(in_srgb,var(--accent-light)_46%,#202026)] bg-[#030304] shadow-[inset_3px_0_0_color-mix(in_srgb,var(--accent-light)_72%,transparent)]"
-                      : "border-[color-mix(in_srgb,var(--accent-light)_46%,#202026)] bg-[#09090b] shadow-[inset_3px_0_0_color-mix(in_srgb,var(--accent-light)_72%,transparent)]";
+                    const currentTaskRowClass = `${taskRowClass} ring-2 ring-inset ring-[color-mix(in_srgb,var(--accent)_72%,transparent)]`;
                     
                     return capsuleProgressItems.map((task, index) => {
-                      const isCurrentPlanTask = capsuleProgressMode === "plan" && index === currentPlanTaskIndex && !task.complete;
+                      const isCurrentPlanTask = capsuleProgressMode === "plan" && task.id === currentPlanTaskId && !task.complete;
                       return (
                         <div
                           key={`${task.id}-${index}`}
+                          data-task-id={task.id}
                           data-testid={isCurrentPlanTask ? "execution-capsule-current-plan-task" : undefined}
                           className={`flex items-start gap-3 rounded-xl border px-3 py-2 transition-colors ${
                             isCurrentPlanTask ? currentTaskRowClass : taskRowClass
