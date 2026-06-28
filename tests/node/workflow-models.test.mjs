@@ -85,6 +85,7 @@ function loadTranspiledModuleSync(sourcePath) {
 
 const {
   buildPlanTaskEvidenceAudit,
+  analyzePlanDecisionFork,
   collectChangeEntries,
   detectExplicitLanguageOverride,
   detectResponseLanguageMismatch,
@@ -92,6 +93,7 @@ const {
   deriveVisibleConversationTurnStatus,
   extractPlanTasks,
   findDroppedPlanTasks,
+  hasLivePlanWorkspace,
   hasBrowserValidationCapability,
   isPlanTaskAwaitingBrowserValidation,
   isPlanTaskAwaitingExternalValidation,
@@ -147,6 +149,14 @@ test("response language policy normalizes unknown values to follow-input mode", 
   assert.equal(normalizeResponseLanguagePolicy("follow_input_language"), "follow_input_language");
   assert.equal(normalizeResponseLanguagePolicy("unknown"), "follow_input_language");
   assert.equal(normalizeResponseLanguagePolicy(null), "follow_input_language");
+});
+
+test("hasLivePlanWorkspace ignores historical turn content and tracks live artifacts, tasks, stage, or preview", () => {
+  assert.equal(hasLivePlanWorkspace({ planArtifacts: [], planTasks: [], planStage: "idle" }), false);
+  assert.equal(hasLivePlanWorkspace({ planArtifacts: [{ path: ".MAIN/plans/plan.md" }], planTasks: [], planStage: "idle" }), true);
+  assert.equal(hasLivePlanWorkspace({ planArtifacts: [], planTasks: [{ id: "1" }], planStage: "idle" }), true);
+  assert.equal(hasLivePlanWorkspace({ planArtifacts: [], planTasks: [], planStage: "ready_to_execute" }), true);
+  assert.equal(hasLivePlanWorkspace({ planArtifacts: [], planTasks: [], planStage: "idle", fallbackPlanPreview: "# Plan" }), true);
 });
 
 test("explicit language override detects English and Chinese directives", () => {
@@ -1511,6 +1521,103 @@ test("validateActionablePlanArtifact rejects import-only weak plan from debug lo
   const result = validateActionablePlanArtifact(bad);
   assert.equal(result.ok, false);
   assert.match(result.reason || "", /import_only_evidence|generic_theme_token_plan|placeholder_validation_plan/);
+});
+
+test("validateActionablePlanArtifact rejects blocking plan forks without user options", () => {
+  const plan = [
+    "# CSV Dashboard 修复计划",
+    "",
+    "## 用户目标",
+    "- 修复 CSV 导入后 Dashboard 指标没有正确更新的问题。",
+    "",
+    "## 摘要",
+    "- 已读取 `src/App.tsx` 和 `src/store/dashboardStore.ts`，确认导入完成后缺少状态刷新闭环。",
+    "",
+    "## 已读证据",
+    "- `src/App.tsx`：CSV 上传入口负责触发导入流程。",
+    "- `src/store/dashboardStore.ts`：Dashboard 指标来自 store 聚合状态。",
+    "",
+    "## 关键改动",
+    "- 方案 A：只修复 `src/App.tsx` 的导入后刷新调用。",
+    "- 方案 B：同时重构 `src/store/dashboardStore.ts` 的状态入口。",
+    "- 需要用户选择方案 A 或方案 B 后再执行。",
+    "",
+    "## 影响文件",
+    "- `src/App.tsx`",
+    "- `src/store/dashboardStore.ts`",
+    "",
+    "## 执行步骤",
+    "1. 根据用户选择的方案更新导入链路。",
+    "2. 补充针对 Dashboard 指标刷新的回归测试。",
+    "",
+    "## 公共 API / 接口 / 类型",
+    "- 无公共 API、接口或类型变化。",
+    "",
+    "## 测试方案",
+    "- 运行 `npm run build` 并手动导入 CSV 验证指标更新。",
+    "",
+    "## 验证标准",
+    "- CSV 导入后 Dashboard 指标立即显示最新数据。",
+    "",
+    "## 假设与默认值",
+    "- 保持现有 CSV 文件格式不变。",
+  ].join("\n");
+
+  const fork = analyzePlanDecisionFork(plan);
+  const result = validateActionablePlanArtifact(plan);
+
+  assert.equal(fork.classification, "blocking");
+  assert.equal(fork.requiresUserOptions, true);
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "blocking_plan_decision_without_user_options");
+});
+
+test("validateActionablePlanArtifact allows defaulted plan forks", () => {
+  const plan = [
+    "# CSV Dashboard 修复计划",
+    "",
+    "## 用户目标",
+    "- 修复 CSV 导入后 Dashboard 指标没有正确更新的问题。",
+    "",
+    "## 摘要",
+    "- 已读取 `src/App.tsx` 和 `src/store/dashboardStore.ts`，确认导入完成后缺少状态刷新闭环。",
+    "",
+    "## 已读证据",
+    "- `src/App.tsx`：CSV 上传入口负责触发导入流程。",
+    "- `src/store/dashboardStore.ts`：Dashboard 指标来自 store 聚合状态。",
+    "",
+    "## 关键改动",
+    "- 方案 A：只修复 `src/App.tsx` 的导入后刷新调用。",
+    "- 方案 B：同时重构 `src/store/dashboardStore.ts` 的状态入口。",
+    "- 推荐方案 A：先做最小修复，避免扩大状态管理改动范围。",
+    "",
+    "## 影响文件",
+    "- `src/App.tsx`",
+    "- `src/store/dashboardStore.ts`",
+    "",
+    "## 执行步骤",
+    "1. 采用方案 A 更新导入链路。",
+    "2. 补充针对 Dashboard 指标刷新的回归测试。",
+    "",
+    "## 公共 API / 接口 / 类型",
+    "- 无公共 API、接口或类型变化。",
+    "",
+    "## 测试方案",
+    "- 运行 `npm run build` 并手动导入 CSV 验证指标更新。",
+    "",
+    "## 验证标准",
+    "- CSV 导入后 Dashboard 指标立即显示最新数据。",
+    "",
+    "## 假设与默认值",
+    "- 保持现有 CSV 文件格式不变。",
+  ].join("\n");
+
+  const fork = analyzePlanDecisionFork(plan);
+  const result = validateActionablePlanArtifact(plan);
+
+  assert.equal(fork.classification, "defaultable");
+  assert.equal(fork.requiresUserOptions, false);
+  assert.equal(result.ok, true);
 });
 
 test("validateActionablePlanArtifact rejects empty goals and approved-goal filler", () => {

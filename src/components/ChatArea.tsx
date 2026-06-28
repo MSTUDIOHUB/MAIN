@@ -23,6 +23,7 @@ import {
   buildPlanTaskEvidenceAudit,
   deriveVisibleConversationTurnStatus,
   findFirstPlanTaskEvidenceRecord,
+  hasLivePlanWorkspace,
   isGenericConversationTitle,
   isEphemeralPlanArtifactPath,
   normalizeConversationDisplayTitle,
@@ -88,6 +89,7 @@ import {
   shouldGroupPlanExecutionTools,
 } from "../lib/chat/chatToolSummary";
 import { resolveVisiblePendingToolReview } from "../lib/pendingToolReview";
+import { extractPlanDraftPreview, extractStructuredPlanProposal } from "../lib/planProposal";
 
 const TURN_STATUS_LABELS: Record<string, string> = {
   planning: "Planning",
@@ -2440,6 +2442,7 @@ export default function ChatArea({
     planExecutionEvidenceLedger,
     isPlanApproved,
     planStage,
+    clearedPlanTurnId,
     planExecutionProgressSnapshot,
     approvePlan,
     approvePendingReviewOnce,
@@ -2479,6 +2482,7 @@ export default function ChatArea({
     planExecutionEvidenceLedger: useAppStore((s) => s.planExecutionEvidenceLedger),
     isPlanApproved: useAppStore((s) => s.isPlanApproved),
     planStage: useAppStore((s) => s.planStage),
+    clearedPlanTurnId: useAppStore((s) => s.clearedPlanTurnId),
     planExecutionProgressSnapshot: useAppStore((s) => s.planExecutionProgressSnapshot),
     approvePlan: useAppStore((s) => s.approvePlan),
     approvePendingReviewOnce: useAppStore((s) => s.approvePendingReviewOnce),
@@ -2693,6 +2697,21 @@ export default function ChatArea({
   const pinnedPlanTurn = pinnedTurn && isPlanConversationTurn(pinnedTurn)
     ? pinnedTurn
     : null;
+  const activePlanFallbackPreview = useMemo(() => {
+    if (!pinnedPlanTurn) return "";
+    if (clearedPlanTurnId && pinnedPlanTurn.id === clearedPlanTurnId) return "";
+    const entry = groupedTurns.find((item) => item.turn?.id === pinnedPlanTurn.id);
+    if (!entry) return "";
+    for (const block of entry.blocks) {
+      if (block.type !== "agent") continue;
+      const content = String(block.content || "");
+      const proposal = extractStructuredPlanProposal(content);
+      if (proposal) return proposal.markdown;
+      const draft = extractPlanDraftPreview(content);
+      if (draft) return draft;
+    }
+    return "";
+  }, [clearedPlanTurnId, groupedTurns, pinnedPlanTurn?.id]);
   const capsuleControlTurnVisibleStatus = useMemo(() => {
     if (!capsuleControlTurn) return null;
 
@@ -2902,18 +2921,16 @@ export default function ChatArea({
     }
   }, [capsuleActivityText, capsuleIsRunActive, capsuleTurn]);
 
-  const hasPlanPanelContent = useMemo(() => {
-    if (planArtifacts.length > 0) return true;
-
-    return groupedTurns.some((entry) => {
-      if (!entry.turn || !isPlanConversationTurn(entry.turn)) return false;
-      return hasGeneratedPlanContent(entry.blocks);
-    });
-  }, [groupedTurns, planArtifacts]);
+  const hasLivePlanWorkspaceContent = useMemo(() => hasLivePlanWorkspace({
+    planArtifacts,
+    planTasks,
+    planStage,
+    fallbackPlanPreview: activePlanFallbackPreview,
+  }), [activePlanFallbackPreview, planArtifacts, planStage, planTasks]);
   const canApprovePlan =
     !!pinnedPlanTurn &&
     !isPlanApproved &&
-    hasPlanPanelContent &&
+    hasLivePlanWorkspaceContent &&
     (
       agentStatus === "pending_review" ||
       pinnedPlanTurn?.status === "awaiting_approval" ||
@@ -3735,7 +3752,7 @@ export default function ChatArea({
                 turn={turn}
                 hiddenCount={(turn.status === "done" || turn.status === "completed_with_changes") ? collapsedProcessCount : hiddenCount}
                 fallbackSummary={planProgressSummary || finalAgentSummaryText || effectiveProgressSummary || toolExecutionSummary}
-                onOpenPlan={isPlanTurn && hasPlanPanelContent && hasPlanContent ? () => openRightPanelTab("plan") : undefined}
+                onOpenPlan={isPlanTurn && hasPlanContent ? () => openRightPanelTab("plan") : undefined}
                 onExpand={() => toggleConversationTurnCollapsed(turn.id)}
                 embedded
                 copy={copy}
@@ -3945,8 +3962,9 @@ export default function ChatArea({
 
 
 
-          {hasPlanPanelContent && (
+          {hasLivePlanWorkspaceContent && (
             <button
+              data-testid="top-plan-panel-button"
               onClick={() => togglePanelTab("plan")}
               className={`flex h-7 shrink-0 items-center justify-center gap-1.5 whitespace-nowrap rounded-[6px] border border-[#27272a] bg-[#09090b] px-3 text-[10px] font-medium transition-colors ${showPlanPanel && rightPanelTab === "plan" ? "theme-subtle-bg" : "text-[#d4d4d8] hover:bg-[#18181b] hover:text-white"}`}
               title={copy.planLabel}

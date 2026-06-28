@@ -94,6 +94,7 @@ import {
   isPlanTaskAwaitingExternalValidation,
   isEphemeralPlanArtifactPath,
   isPlanTaskTrustedComplete,
+  analyzePlanDecisionFork,
   repairActionablePlanArtifactContent,
   validateActionablePlanArtifact,
   validatePlanArtifactContent,
@@ -3691,6 +3692,7 @@ async function executeToolCallWithLifecycle(
           recoveryAction,
           missingSections,
           canAutoRepair: qualityResult?.canAutoRepair ?? false,
+          ...(kind === "plan" ? { decisionFork: analyzePlanDecisionFork(nextContent) } : {}),
         });
 
         const shouldUseInternalFeedback =
@@ -3840,6 +3842,11 @@ export async function autoMaterializePlanArtifactFromVisibleText(input: {
   });
 
   if (!materialized.ok || !materialized.path || !materialized.content || !materialized.kind) {
+    logAgentEvent("plan_visible_materialization_rejected", {
+      reason: materialized.reason || "quality_gate",
+      replyOptions: materialized.replyOptions?.length || 0,
+      decisionFork: materialized.decisionFork || null,
+    });
     return {
       ok: false,
       reason: materialized.reason || "quality_gate",

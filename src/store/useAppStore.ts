@@ -73,6 +73,7 @@ import {
   getPlanArtifactTitle,
   collectChangeEntries,
   isGenericConversationTitle,
+  isPlanConversationTurn,
   looksLikeReasoningLeakTitle,
   normalizeResponseLanguagePolicy,
   normalizeConversationDisplayTitle,
@@ -313,6 +314,28 @@ export function logStoreEvent(event: string, data: Record<string, unknown> = {})
 
 function nowMs() {
   return typeof performance !== "undefined" ? performance.now() : Date.now();
+}
+
+function summarizePlanWorkspaceStateForLog(state: Pick<AppState,
+  "planArtifacts" |
+  "planTasks" |
+  "planStage" |
+  "showPlanPanel" |
+  "rightPanelTab" |
+  "isPlanApproved"
+>) {
+  const artifactCount = Array.isArray(state.planArtifacts) ? state.planArtifacts.length : 0;
+  const taskCount = Array.isArray(state.planTasks) ? state.planTasks.length : 0;
+  const stage = state.planStage || "idle";
+  return {
+    artifactCount,
+    taskCount,
+    stage,
+    approved: state.isPlanApproved === true,
+    panelVisible: state.showPlanPanel === true,
+    rightPanelTab: state.rightPanelTab,
+    buttonVisible: artifactCount > 0 || taskCount > 0 || stage !== "idle",
+  };
 }
 
 
@@ -747,6 +770,7 @@ export interface SessionRuntimeSnapshot {
   isPlanApproved: boolean;
   planApprovalChoice?: string | null;
   pendingPlanApprovalHandoff?: { planTurnId: string; requestedAt: number } | null;
+  clearedPlanTurnId?: string | null;
   showPlanPanel: boolean;
   showDiff: boolean;
   showTerminal: boolean;
@@ -786,6 +810,7 @@ export interface SessionRuntimeState extends SessionRuntimeSnapshot {
   activeGuidance: ActiveGuidance | null;
   planApprovalChoice: string | null;
   pendingPlanApprovalHandoff: { planTurnId: string; requestedAt: number } | null;
+  clearedPlanTurnId: string | null;
   normalizedStreamState: NormalizedStreamState;
   currentTurnState: AppState["currentTurnState"];
   isGenerating: boolean;
@@ -1253,6 +1278,7 @@ export interface AppState {
   planExecutionProgressSnapshot: PlanExecutionProgressSnapshot | null;
   normalizedStreamState: NormalizedStreamState;
   pendingPlanApprovalHandoff: { planTurnId: string; requestedAt: number } | null;
+  clearedPlanTurnId: string | null;
   runtimeEvents: MainThreadEvent[];
   harnessRunMarker: HarnessRunMarker | null;
   setWorkflowMode: (mode: "chat" | "edit" | "plan") => void;
@@ -1714,6 +1740,7 @@ export function normalizeSessionRuntimeSnapshot(
     isPlanApproved: snapshot.isPlanApproved ?? false,
     planApprovalChoice: normalizePlanApprovalChoice(snapshot.planApprovalChoice),
     pendingPlanApprovalHandoff: null,
+    clearedPlanTurnId: typeof snapshot.clearedPlanTurnId === "string" ? snapshot.clearedPlanTurnId : null,
     showPlanPanel: snapshot.showPlanPanel ?? false,
     showDiff: snapshot.showDiff ?? false,
     showTerminal: snapshot.showTerminal ?? false,
@@ -1802,6 +1829,7 @@ const sessionRuntimeKeys = [
   "isPlanApproved",
   "planApprovalChoice",
   "pendingPlanApprovalHandoff",
+  "clearedPlanTurnId",
   "showPlanPanel",
   "showDiff",
   "showTerminal",
@@ -1902,6 +1930,7 @@ function createSessionRuntimeFromState(state: Partial<AppState>): SessionRuntime
     isPlanApproved: state.isPlanApproved === true,
     planApprovalChoice: normalizePlanApprovalChoice(state.planApprovalChoice),
     pendingPlanApprovalHandoff: state.pendingPlanApprovalHandoff || null,
+    clearedPlanTurnId: typeof state.clearedPlanTurnId === "string" ? state.clearedPlanTurnId : null,
     showPlanPanel: state.showPlanPanel === true,
     showDiff: state.showDiff === true,
     showTerminal: state.showTerminal === true,
@@ -3212,6 +3241,7 @@ function buildSessionRuntimeSnapshotFromStoreState(state: any): SessionRuntimeSn
     isPlanApproved: state.isPlanApproved === true,
     planApprovalChoice: state.planApprovalChoice ?? null,
     pendingPlanApprovalHandoff: null,
+    clearedPlanTurnId: typeof state.clearedPlanTurnId === "string" ? state.clearedPlanTurnId : null,
     showPlanPanel: state.showPlanPanel === true,
     showDiff: state.showDiff === true,
     showTerminal: state.showTerminal === true,
@@ -3260,6 +3290,7 @@ function buildEmptySessionRuntimeSnapshot(state: any, affinity: SessionModeAffin
       isPlanApproved: false,
       planApprovalChoice: null,
       pendingPlanApprovalHandoff: null,
+      clearedPlanTurnId: null,
       showPlanPanel: false,
       showDiff: false,
       showTerminal: false,
@@ -5941,8 +5972,11 @@ export const useAppStore = create<AppState>()(
         planAutoResumeCount: 0,
         planExecutionProgressSnapshot: null,
         planStage: "idle",
+        isPlanApproved: false,
         planApprovalChoice: null,
         pendingPlanApprovalHandoff: null,
+        clearedPlanTurnId: null,
+        showPlanPanel: false,
         normalizedStreamState: defaultNormalizedStreamState,
         resolvedInstructionSet: null,
         instructionSources: [],
@@ -6015,8 +6049,11 @@ export const useAppStore = create<AppState>()(
       planAutoResumeCount: 0,
       planExecutionProgressSnapshot: null,
       planStage: "idle",
+      isPlanApproved: false,
       planApprovalChoice: null,
       pendingPlanApprovalHandoff: null,
+      clearedPlanTurnId: null,
+      showPlanPanel: false,
       normalizedStreamState: defaultNormalizedStreamState,
       harnessRunMarker: null,
     });
@@ -6027,6 +6064,7 @@ export const useAppStore = create<AppState>()(
   isPlanApproved: false,
   planApprovalChoice: null,
   pendingPlanApprovalHandoff: null,
+  clearedPlanTurnId: null,
   planArtifacts: [],
   planStage: "idle",
   planTasks: [],
@@ -6115,6 +6153,7 @@ export const useAppStore = create<AppState>()(
         planArtifacts: nextArtifacts.sort((a, b) => a.updatedAt - b.updatedAt),
         planStage: nextStage,
         planTasks: normalizedTasks,
+        clearedPlanTurnId: null,
         ...(shouldAutoOpenPlanPanel
           ? {
               showPlanPanel: true,
@@ -6124,24 +6163,53 @@ export const useAppStore = create<AppState>()(
       };
     }),
   clearPlanArtifacts: () =>
-    set({
-      planArtifacts: [],
-      planStage: "idle",
-      planTasks: [],
-      planExecutionEvidenceLedger: [],
-      planExecutionEvidenceCount: 0,
-      planAutoResumeCount: 0,
-      planExecutionProgressSnapshot: null,
-      normalizedStreamState: defaultNormalizedStreamState,
-      planApprovalChoice: null,
-      pendingPlanApprovalHandoff: null,
-      showPlanPanel: false,
+    set((s) => {
+      const before = summarizePlanWorkspaceStateForLog(s);
+      const nextRightPanelTab = s.rightPanelTab === "plan" ? "terminal" as const : s.rightPanelTab;
+      const patch = {
+        planArtifacts: [],
+        planStage: "idle" as const,
+        planTasks: [],
+        planExecutionEvidenceLedger: [],
+        planExecutionEvidenceCount: 0,
+        planAutoResumeCount: 0,
+        planExecutionProgressSnapshot: null,
+        normalizedStreamState: defaultNormalizedStreamState,
+        planApprovalChoice: null,
+        pendingPlanApprovalHandoff: null,
+        clearedPlanTurnId: s.currentTurnId || s.conversationTurns.find((turn) => isPlanConversationTurn(turn) && turn.status !== "done" && turn.status !== "completed_with_changes")?.id || null,
+        isPlanApproved: false,
+        showPlanPanel: false,
+        rightPanelTab: nextRightPanelTab,
+      };
+      const sessionKey = resolveSessionRuntimeKey(resolveSessionWorkspaceKey(s.currentWorkspace), s.currentSessionId);
+      const runtimeBySessionKey = sessionKey
+        ? {
+            ...s.runtimeBySessionKey,
+            [sessionKey]: {
+              ...(s.runtimeBySessionKey[sessionKey] || createSessionRuntimeFromState(s)),
+              ...patch,
+            },
+          }
+        : s.runtimeBySessionKey;
+      logStoreEvent("planWorkspaceStateChanged", {
+        reason: "clearPlanArtifacts",
+        before,
+        after: summarizePlanWorkspaceStateForLog({ ...s, ...patch }),
+        sessionKey,
+      });
+      return {
+        ...patch,
+        runtimeBySessionKey,
+      };
     }),
   deletePersistedPlanFiles: async () => {
     const state = get();
     const sessionKey = !state.currentWorkspace.trim()
       ? resolveGlobalChatSessionKey(state.currentSessionId)
       : null;
+    const runtimeSessionKey = resolveSessionRuntimeKey(resolveSessionWorkspaceKey(state.currentWorkspace), state.currentSessionId);
+    const before = summarizePlanWorkspaceStateForLog(state);
     try {
       if (sessionKey) {
         await deleteChatTempPath(sessionKey, ".MAIN/plans");
@@ -6151,8 +6219,15 @@ export const useAppStore = create<AppState>()(
     } finally {
       invalidateWorkspaceTreeCache();
       get().clearPlanArtifacts();
-      set({ isPlanApproved: false, planApprovalChoice: null, pendingPlanApprovalHandoff: null, planExecutionEvidenceLedger: [], planExecutionEvidenceCount: 0, planAutoResumeCount: 0, planExecutionProgressSnapshot: null });
       get().bumpWorkspaceContentVersion();
+      logStoreEvent("planFilesCleared", {
+        path: ".MAIN/plans",
+        workspace: state.currentWorkspace || null,
+        chatTempSessionKey: sessionKey,
+        runtimeSessionKey,
+        before,
+        after: summarizePlanWorkspaceStateForLog(get()),
+      });
     }
   },
   deleteBrowserValidationArtifacts: async () => {
@@ -7799,6 +7874,7 @@ export const useAppStore = create<AppState>()(
         planArtifacts: [],
         planTasks: [],
         planStage: "idle" as const,
+        clearedPlanTurnId: null,
         currentTurnExecutionConsent: { turnId: null, granted: false },
       });
     }
@@ -8087,6 +8163,7 @@ export const useAppStore = create<AppState>()(
             s.planStage,
           ),
           planTasks: normalizedTasks,
+          clearedPlanTurnId: null,
           showPlanPanel: true,
           rightPanelTab: s.showDiff && s.rightPanelTab === "diff" ? "diff" : "plan",
         };
@@ -8602,7 +8679,7 @@ export const useAppStore = create<AppState>()(
       pendingRunDecision: null,
       isGenerating: true,
       config: { ...s.config, workflowMode: effectiveWorkflowMode },
-      ...(preservePlanState ? {} : { isPlanApproved: false, planApprovalChoice: null, pendingPlanApprovalHandoff: null }),
+      ...(preservePlanState ? {} : { isPlanApproved: false, planApprovalChoice: null, pendingPlanApprovalHandoff: null, clearedPlanTurnId: null }),
       ...(preservePlanState ? {} : { planAutoResumeCount: 0, planExecutionProgressSnapshot: null }),
       ...(shouldGrantExecutionConsentForTurn
         ? { currentTurnExecutionConsent: { turnId, granted: true } }

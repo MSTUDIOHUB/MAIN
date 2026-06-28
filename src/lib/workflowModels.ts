@@ -207,6 +207,20 @@ export type PlanStage =
   | "executing"
   | "completed";
 
+export function hasLivePlanWorkspace(input: {
+  planArtifacts?: unknown[] | null;
+  planTasks?: unknown[] | null;
+  planStage?: PlanStage | string | null;
+  fallbackPlanPreview?: string | null;
+}): boolean {
+  return (
+    (Array.isArray(input.planArtifacts) ? input.planArtifacts.length : 0) > 0 ||
+    (Array.isArray(input.planTasks) ? input.planTasks.length : 0) > 0 ||
+    String(input.planStage || "idle") !== "idle" ||
+    String(input.fallbackPlanPreview || "").trim().length > 0
+  );
+}
+
 export type PlanTaskStatus = "pending" | "in_progress" | "completed";
 export type PlanTaskEvidenceKind =
   | "file"
@@ -1934,6 +1948,7 @@ export function classifyPlanArtifactQualityResult(
         section === "affected_files" ||
         section === "validation" ||
         section === "test_plan" ||
+        section === "key_changes" ||
         section === "public_interfaces"
       ),
     };
@@ -1999,6 +2014,7 @@ export function repairActionablePlanArtifactContent(input: {
     "affected_files",
     "validation",
     "test_plan",
+    "key_changes",
     "public_interfaces"
   ]);
   if (!missingSections.every((section) => allowed.has(section))) {
@@ -2009,6 +2025,14 @@ export function repairActionablePlanArtifactContent(input: {
   const goal = String(input.userGoal || "").replace(/\s+/g, " ").trim();
   let repaired = String(input.content || "").trim();
   const repairedSections: string[] = [];
+
+  if (missingSections.includes("key_changes")) {
+    const section = language === "en"
+      ? "## Key Changes\n- Implement the smallest targeted change described by the affected files and execution steps, preserving existing behavior outside that scope."
+      : "## 关键改动\n- 按影响文件和执行步骤实施最小必要改动，保持范围外现有行为不变。";
+    repaired = insertPlanSectionAfterTitle(repaired, section);
+    repairedSections.push("key_changes");
+  }
 
   if (missingSections.includes("validation") || missingSections.includes("test_plan")) {
     const isTestPlan = missingSections.includes("test_plan");
@@ -2072,6 +2096,81 @@ export function looksLikeSubstantivePlanAssistantText(text: string): boolean {
   if (/^#{1,6}\s+\S/m.test(raw)) return true;
   if (/^\s*\|.+\|\s*$/m.test(raw) && /\|\s*-{2,}/.test(raw)) return true;
   return /(?:截图观察|附件观察|已读证据|证据引用|已确认事实|真实发现|未验证假设|阻塞问题|执行步骤|影响文件|验证标准|用户目标|Screenshot observations|Read evidence|Confirmed facts|Unverified hypotheses|Execution steps|Affected files|Validation)/i.test(raw);
+}
+
+export type PlanDecisionForkClassification = "none" | "blocking" | "defaultable";
+
+export interface PlanDecisionForkAnalysis {
+  hasFork: boolean;
+  classification: PlanDecisionForkClassification;
+  requiresUserOptions: boolean;
+  options: string[];
+  recommendedDefault?: string;
+  reason?: string;
+}
+
+function extractPlanDecisionForkOptions(content: string): string[] {
+  const options: string[] = [];
+  const patterns = [
+    /(?:^|\n)\s*(?:#{1,6}\s*)?(?:[-*]\s*)?(?:方案|选项|路径)\s*([A-CＡ-Ｃ1-3一二三])\s*[：:、.)-]\s*([^\n]{4,180})/gi,
+    /(?:^|\n)\s*(?:#{1,6}\s*)?(?:[-*]\s*)?(?:Option|Approach|Path|Plan)\s*([A-C1-3])\s*[：:.)-]\s*([^\n]{4,180})/gi,
+  ];
+  for (const pattern of patterns) {
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(content)) !== null) {
+      const label = String(match[1] || "").trim();
+      const body = String(match[2] || "").replace(/\s+/g, " ").trim();
+      const option = `${label ? `${label}: ` : ""}${body}`.trim();
+      if (option && !options.some((existing) => existing.toLowerCase() === option.toLowerCase())) {
+        options.push(option);
+      }
+    }
+  }
+  return options.slice(0, 4);
+}
+
+export function analyzePlanDecisionFork(content: string): PlanDecisionForkAnalysis {
+  const raw = String(content || "");
+  const options = extractPlanDecisionForkOptions(raw);
+  if (options.length < 2) {
+    return { hasFork: false, classification: "none", requiresUserOptions: false, options: [] };
+  }
+  const hasExplicitUserOptions = /<user_options\b[\s\S]*?<\/user_options>/i.test(raw);
+  const hasDefaultSelection =
+    /(?:推荐|建议|默认|优先采用|我会采用|本计划采用|默认选择|Recommended|Recommend|Default|Chosen path|This plan uses).{0,40}(?:方案|选项|路径|Option|Approach|Path)\s*[A-CＡ-Ｃ1-3一二三]/i.test(raw);
+  const hasBlockingCue =
+    /(?:需要|需|请|等待|必须).{0,32}(?:选择|确认|决定|取舍|拍板)/i.test(raw) ||
+    /(?:选择|确认|决定).{0,24}(?:方案|选项|路径|优先级|[A-CＡ-Ｃ1-3一二三])/i.test(raw) ||
+    /二选一|三选一|取舍|优先级|which option|choose|decision required|trade[- ]off|needs? confirmation/i.test(raw);
+
+  if (hasDefaultSelection || hasExplicitUserOptions) {
+    return {
+      hasFork: true,
+      classification: "defaultable",
+      requiresUserOptions: false,
+      options,
+      recommendedDefault: hasDefaultSelection ? options[0] : undefined,
+      reason: hasExplicitUserOptions ? "explicit_user_options" : "default_selection_present",
+    };
+  }
+
+  if (hasBlockingCue) {
+    return {
+      hasFork: true,
+      classification: "blocking",
+      requiresUserOptions: true,
+      options,
+      reason: "blocking_decision_without_user_options",
+    };
+  }
+
+  return {
+    hasFork: true,
+    classification: "defaultable",
+    requiresUserOptions: false,
+    options,
+    reason: "fork_without_blocking_cue",
+  };
 }
 
 export function validatePlanArtifactContent(
@@ -2185,6 +2284,10 @@ export function validateActionablePlanArtifact(
   }
   if (planEvidenceSectionsContainInternalPlanArtifacts(raw)) {
     return classifyPlanArtifactQualityResult({ ok: false, reason: "internal_plan_artifact_evidence" });
+  }
+  const decisionFork = analyzePlanDecisionFork(raw);
+  if (decisionFork.requiresUserOptions) {
+    return classifyPlanArtifactQualityResult({ ok: false, reason: "blocking_plan_decision_without_user_options" });
   }
 
   const hasTargetOrData =

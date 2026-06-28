@@ -273,3 +273,56 @@ test("missing public_interfaces and test_plan sections can be auto-repaired", ()
   assert.match(repaired.content, /## 公共 API \/ 接口 \/ 类型/);
   assert.match(repaired.content, /## 测试方案/);
 });
+
+test("missing key_changes section can be auto-repaired when the plan has concrete targets", () => {
+  const plan = [
+    "# CSV Dashboard 修复计划",
+    "",
+    "## 用户目标",
+    "- 修复 CSV 导入后 Dashboard 指标没有正确更新的问题",
+    "",
+    "## 已读证据",
+    "- read_file src/App.tsx；发现入口逻辑缺少刷新调用",
+    "- read_file src/store/dashboardStore.ts；确认 store 状态管理正确",
+    "",
+    "## 摘要",
+    "- 修复 DragUpload 组件在 CSV 导入完成后没有触发 Dashboard 数据刷新的问题",
+    "",
+    "## 影响文件",
+    "- src/App.tsx",
+    "- src/components/FileUploader/DragUpload.tsx",
+    "",
+    "## 执行步骤",
+    "1. 更新 src/App.tsx 的导入完成回调。",
+    "2. 更新 src/components/FileUploader/DragUpload.tsx 添加刷新回调。",
+    "",
+    "## 公共 API / 接口 / 类型",
+    "- 无公共 API、接口或类型变化；仅调整内部回调连接。",
+    "",
+    "## 测试方案",
+    "- 运行导入链路相关测试，并手动导入 CSV 验证 Dashboard 指标更新。",
+    "",
+    "## 验证标准",
+    "- CSV 导入后 Dashboard 指标立即显示最新数据。",
+    "",
+    "## 假设与默认值",
+    "- 默认保持现有 CSV 解析逻辑不变，仅补充刷新调用",
+  ].join("\n");
+
+  const initial = validateActionablePlanArtifact(plan);
+  assert.equal(initial.ok, false);
+  assert.equal(initial.recoveryAction, "rewrite");
+  assert.equal(initial.canAutoRepair, true);
+  assert.ok(initial.missingSections.includes("key_changes"));
+
+  const repaired = repairActionablePlanArtifactContent({
+    content: plan,
+    userGoal: "修复 CSV 导入后 Dashboard 指标没有正确更新的问题",
+    quality: initial,
+    language: "zh",
+  });
+
+  assert.ok(repaired.repairedSections.includes("key_changes"));
+  assert.equal(validateActionablePlanArtifact(repaired.content).ok, true);
+  assert.match(repaired.content, /## 关键改动/);
+});

@@ -393,6 +393,7 @@ export default function WorkspaceTreePanel({
           {copy.refresh}
         </button>
         <button
+          data-testid="workspace-clear-plan-files-button"
           onClick={() => void deletePersistedPlanFiles()}
           className="rounded-md border border-[#27272a] bg-[#000000] px-2.5 py-1 text-[11px] text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#e4e4e7]"
         >

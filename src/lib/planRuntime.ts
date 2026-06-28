@@ -96,9 +96,6 @@ export function filterPlanToolNamesForRuntimePhase(input: {
   if (isPlanRuntimeReadOnlyPhase(input.planRuntimePhase)) {
     return input.toolNames.filter(isPlanReadOnlyToolName);
   }
-  if (isPlanRuntimeFinalizationPhase(input.planRuntimePhase)) {
-    return input.toolNames.filter(isPlanDraftWriteToolName);
-  }
   // P1 improvement: drafting with conditional recovery-read allowance.
   // When allowDraftingRecoveryRead is true and phase is drafting, permit
   // a small set of targeted read tools so the model can do one controlled
@@ -106,6 +103,9 @@ export function filterPlanToolNamesForRuntimePhase(input: {
   if (input.planRuntimePhase === "drafting" && input.allowDraftingRecoveryRead) {
     const allowed = new Set([...PLAN_DRAFT_WRITE_TOOL_NAMES, ...PLAN_DRAFTING_RECOVERY_READ_TOOL_NAMES]);
     return input.toolNames.filter((name) => allowed.has(name));
+  }
+  if (isPlanRuntimeFinalizationPhase(input.planRuntimePhase)) {
+    return input.toolNames.filter(isPlanDraftWriteToolName);
   }
   return input.toolNames;
 }
@@ -144,6 +144,7 @@ export function shouldRedirectPlanToolsAfterReadOnlyConvergence(input: {
 }
 
 export const MAX_PLAN_EVIDENCE_RECOVERY_PASSES = 3;
+export const MAX_PLAN_REASONING_ONLY_READY_RECOVERY_PASSES = 1;
 
 export function resolvePlanNoActionRecovery(input: {
   workflowMode: PlanRuntimeMode;
@@ -155,7 +156,10 @@ export function resolvePlanNoActionRecovery(input: {
   if (input.workflowMode !== "plan" || input.isPlanApproved || !input.reasoningOnly) {
     return { action: "ignore", reason: "not_unapproved_plan_reasoning_only" };
   }
-  if (input.targetedRecoveryPasses < MAX_PLAN_EVIDENCE_RECOVERY_PASSES) {
+  const maxRecoveryPasses = hasReadyPlanEvidence(input.evidenceReadiness)
+    ? MAX_PLAN_REASONING_ONLY_READY_RECOVERY_PASSES
+    : MAX_PLAN_EVIDENCE_RECOVERY_PASSES;
+  if (input.targetedRecoveryPasses < maxRecoveryPasses) {
     return {
       action: "targeted_evidence",
       reason: hasReadyPlanEvidence(input.evidenceReadiness)

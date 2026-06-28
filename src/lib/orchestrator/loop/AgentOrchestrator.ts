@@ -3956,30 +3956,23 @@ export class AgentOrchestrator {
             missingSections: planLastMissingSections,
           });
 
-          // P1 improvement: handle drafting-phase suppressed reads gracefully.
-          // If the model is in drafting and wants a read tool we didn't allow,
-          // inject a targeted hint instead of redirecting to needs_evidence.
           const suppressedToolNames = effectiveToolCalls.map((c) => c.name);
           const isDraftingReadAttempt =
             planRuntimePhase === "drafting" &&
             suppressedToolNames.some((t) =>
               t === "read_file" || t === "read_document" || t === "get_file_outline"
             );
-          if (isDraftingReadAttempt && planDraftingRecoveryReadCount < 3) {
-            // Allow up to 3 controlled recovery reads during drafting.
-            // Instead of immediately redirecting to needs_evidence (which causes
-            // drafting→needs_evidence→drafting pendulum swings), let the model
-            // read the specific files it needs while nudging it toward writing.
+          if (isDraftingReadAttempt && planDraftingRecoveryReadCount < 1) {
             planDraftingRecoveryReadCount += 1;
             planReasoningOnlyRecoveryPasses += 1;
-            const isUrgent = planDraftingRecoveryReadCount >= 2;
-            const urgencyHint = isUrgent
+            const readToolsAvailable = ["read_file", "read_document", "get_file_outline"].some((name) => availableToolNames.has(name));
+            const urgencyHint = readToolsAvailable
               ? (callbacks.getPreferredLanguage() === "zh"
-                ? `【紧急恢复读取 ${planDraftingRecoveryReadCount}/3】drafting 阶段只允许写文件，但你还需要读取：${suppressedToolNames.join(", ")}。请先读取具体文件，然后立即写入 plan.md，不要再尝试其他只读工具。`
-                : `[URGENCY ${planDraftingRecoveryReadCount}/3] You are in drafting phase but need to read: ${suppressedToolNames.join(", ")}. Read the file now, then immediately write plan.md with write_file or replace_in_file. Do not attempt additional read tools after this.`)
+                ? `PLAN_DRAFTING_RECOVERY_READ: 这是唯一一次 drafting 补读机会。请只读取刚才缺失的最具体文件，然后立即用 write_file 或 replace_in_file 写入 .MAIN/plans/plan.md。不要继续探索。尝试的读工具：${suppressedToolNames.join(", ")}。`
+                : `PLAN_DRAFTING_RECOVERY_READ: This is the only drafting recovery read. Read only the most specific missing file, then immediately write .MAIN/plans/plan.md with write_file or replace_in_file. Do not continue exploring. Attempted read tools: ${suppressedToolNames.join(", ")}.`)
               : (callbacks.getPreferredLanguage() === "zh"
-                ? `定向恢复读取提示：当前处于 drafting 阶段，请尝试读取缺失的证据文件后直接写入 plan.md。你刚才尝试调用的工具：${suppressedToolNames.join(", ")}。请用最具体的文件路径读取，然后写计划。`
-                : `Controlled recovery read hint: You are in drafting phase. Try reading the missing evidence file then write plan.md directly. Tools you attempted: ${suppressedToolNames.join(", ")}. Use the most specific file path for reading, then produce the plan.`);
+                ? `PLAN_DRAFTING_WRITE_NOW: 当前 drafting 工具面没有读取工具。不要再尝试读取；请基于已有证据立即用 write_file 或 replace_in_file 写入 .MAIN/plans/plan.md。若确有阻塞性取舍，请输出 <user_options> 后停止。`
+                : `PLAN_DRAFTING_WRITE_NOW: No read tools are available in the current drafting tool surface. Do not attempt more reads; write .MAIN/plans/plan.md now with write_file or replace_in_file from existing evidence. If a blocking decision remains, output <user_options> and stop.`);
             callbacks.appendMessage({
               role: "user",
               content: urgencyHint,
@@ -3988,7 +3981,8 @@ export class AgentOrchestrator {
               iteration,
               attemptedTools: suppressedToolNames,
               planDraftingRecoveryReadCount,
-              urgency: isUrgent,
+              readToolsAvailable,
+              maxRecoveryReads: 1,
             });
             continue;
           }

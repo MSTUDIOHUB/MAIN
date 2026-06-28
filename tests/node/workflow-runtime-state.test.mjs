@@ -156,3 +156,24 @@ test("debug log compacts repeated prompt and tool payloads instead of storing ra
   assert.match(source, /const compacted = compactDebugValue\(input\)/);
   assert.match(source, /redacted\.length > 8_000/);
 });
+
+test("global plan toolbar button is driven by live plan workspace, not historical plan turns", () => {
+  const chatAreaSource = fsSync.readFileSync(path.join(workspaceRoot, "src/components/ChatArea.tsx"), "utf8");
+  const storeSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/useAppStore.ts"), "utf8");
+
+  assert.match(chatAreaSource, /hasLivePlanWorkspace/);
+  assert.match(chatAreaSource, /const activePlanFallbackPreview = useMemo/);
+  assert.match(chatAreaSource, /extractStructuredPlanProposal/);
+  assert.match(chatAreaSource, /extractPlanDraftPreview/);
+  assert.match(chatAreaSource, /const hasLivePlanWorkspaceContent = useMemo\(\(\) => hasLivePlanWorkspace/);
+  assert.match(chatAreaSource, /fallbackPlanPreview:\s*activePlanFallbackPreview/);
+  assert.match(chatAreaSource, /\{hasLivePlanWorkspaceContent && \(/);
+  assert.doesNotMatch(chatAreaSource, /const hasPlanPanelContent = useMemo/);
+  assert.doesNotMatch(chatAreaSource, /groupedTurns\.some\(\(entry\)[\s\S]{0,220}hasGeneratedPlanContent\(entry\.blocks\)[\s\S]{0,220}\{hasPlanPanelContent && \(/);
+
+  assert.match(storeSource, /clearPlanArtifacts:\s*\(\) =>\s*set\(\(s\) =>/);
+  assert.match(storeSource, /rightPanelTab:\s*nextRightPanelTab/);
+  assert.match(storeSource, /s\.rightPanelTab === "plan" \? "terminal"/);
+  assert.match(storeSource, /logStoreEvent\("planWorkspaceStateChanged"/);
+  assert.match(storeSource, /logStoreEvent\("planFilesCleared"/);
+});

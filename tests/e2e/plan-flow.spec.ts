@@ -27,6 +27,12 @@ test.beforeEach(async ({ page }) => {
         throw new Error(`ENOENT: ${path}`);
       }
       if (cmd === "get_file_metadata") return { path: String(args?.path ?? ""), sizeBytes: 1, modifiedMs: 1 };
+      if (cmd === "delete_plan_files") {
+        for (const key of Object.keys(files)) {
+          if (key.startsWith(".MAIN/plans/")) delete files[key];
+        }
+        return null;
+      }
       return null;
     };
   });
@@ -202,6 +208,40 @@ test("plan flow supports save then approve and finish", async ({ page }) => {
       page.evaluate(() => Boolean((window as any).__CODELY_E2E__?.completed)),
     )
     .toBe(true);
+});
+
+test("clearing plan files from file panel removes the global plan toolbar button", async ({ page }) => {
+  await page.goto("/?e2eScenario=plan-flow");
+
+  await expect(page.getByTestId("top-plan-panel-button")).toBeVisible();
+  await expect(page.getByText("计划工作区").first()).toBeVisible();
+
+  await page.getByLabel("文件").click();
+  await expect(page.getByTestId("workspace-clear-plan-files-button")).toBeVisible();
+  await page.getByTestId("workspace-clear-plan-files-button").click();
+
+  await expect(page.getByTestId("top-plan-panel-button")).toHaveCount(0);
+  await expect(page.getByText("计划工作区")).toHaveCount(0);
+  await expect
+    .poll(async () =>
+      page.evaluate(() => {
+        const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+        return {
+          artifacts: snapshot?.planArtifactPaths?.length ?? -1,
+          tasks: snapshot?.planTasks?.length ?? -1,
+          stage: snapshot?.planStage ?? null,
+          showPlanPanel: snapshot?.showPlanPanel ?? null,
+          rightPanelTab: snapshot?.rightPanelTab ?? null,
+        };
+      }),
+    )
+    .toEqual({
+      artifacts: 0,
+      tasks: 0,
+      stage: "idle",
+      showPlanPanel: false,
+      rightPanelTab: "terminal",
+    });
 });
 
 test("plan approval quick reply approves instead of re-sending an unapproved plan turn", async ({ page }) => {

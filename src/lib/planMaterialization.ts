@@ -1,9 +1,11 @@
 import { sanitizePlanArtifactContent, stripUserOptionsProtocol } from "./sanitize";
 import { parseToolFeedbackEnvelope } from "./toolFeedbackEnvelope";
 import {
+  analyzePlanDecisionFork,
   repairActionablePlanArtifactContent,
   validateActionablePlanArtifact,
   validatePlanArtifactContent,
+  type PlanDecisionForkAnalysis,
   type PlanStage,
 } from "./workflowModels";
 import { extractPrimaryUserRequestText, normalizeTurnInputContextSignals, type TurnInputContextLike } from "./turnIntake";
@@ -23,6 +25,7 @@ export interface PlanMaterializationResult {
   source?: PlanMaterializationSource;
   /** Extracted <user_options> blocks for post-validation routing. */
   replyOptions?: string[];
+  decisionFork?: PlanDecisionForkAnalysis;
 }
 
 interface PlanMaterializationToolActivityLike {
@@ -1569,6 +1572,7 @@ export function materializePlanArtifactFromVisibleText(input: {
   let content = normalizePlanContent(raw);
   let source: PlanMaterializationSource = input.sourceHint || "visible_plan";
   if (countPlanShapeSignals(content) < 5) return { ok: false, reason: "not_structured" };
+  const decisionFork = analyzePlanDecisionFork(content);
 
   let validation = validateActionablePlanArtifact(content);
   if (!validation.ok && validation.canAutoRepair) {
@@ -1612,7 +1616,7 @@ export function materializePlanArtifactFromVisibleText(input: {
       }
     }
   }
-  if (!validation.ok) return { ok: false, reason: validation.reason || "quality_gate" };
+  if (!validation.ok) return { ok: false, reason: validation.reason || "quality_gate", decisionFork };
 
   return {
     ok: true,
@@ -1621,6 +1625,7 @@ export function materializePlanArtifactFromVisibleText(input: {
     content,
     source,
     replyOptions: extracted.replyOptions,
+    decisionFork,
   };
 }
 
