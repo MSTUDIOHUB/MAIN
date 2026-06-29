@@ -948,6 +948,7 @@ export class WorkflowEngine {
 
       onAssistantFinalText: (text: any, replyOptions: any[] = [], meta: any) => {
         const hasToolCalls = meta?.hasToolCalls === true;
+        const awaitingInput = meta?.awaitingInput === true && replyOptions.length > 0;
         const language = sessionGet().config.language === "en" ? "en" : "zh";
         const fallbackText = replyOptions.length > 0
           ? language === "en"
@@ -986,8 +987,12 @@ export class WorkflowEngine {
           }).catch(() => {});
         }
 
+        if (awaitingInput && context.understandingProgressBlockId != null) {
+          context.understandingProgressClosed = true;
+        }
+
         // Complete understanding progress
-        if (!context.understandingProgressClosed && context.understandingProgressBlockId != null) {
+        if (!awaitingInput && !context.understandingProgressClosed && context.understandingProgressBlockId != null) {
           context.understandingProgressClosed = true;
           const progress = {
             phase: "understanding" as const,
@@ -1027,18 +1032,41 @@ export class WorkflowEngine {
           // and the next model iteration.
           if (context.currentStreamingBlockId !== null) {
             const blockId = context.currentStreamingBlockId;
-            taskFlow = taskFlow.map((t: any) =>
-              t.id === blockId && t.type === "agent"
-                ? { ...t, content: visibleText, streaming: false, options: replyOptions }
-                : t
-            );
+            const streamingBlock = taskFlow.find((t: any) => t.id === blockId && t.type === "agent") as any;
+            if (streamingBlock?.archivedAfterChoice) {
+              const replacementBlockId = s._nextTaskId();
+              const replacementBlock = attachRuntimePhase({
+                id: replacementBlockId,
+                turnId,
+                type: "agent",
+                content: visibleText,
+                streaming: false,
+                options: replyOptions,
+              } as TaskBlock);
+              taskFlow = [...taskFlow, replacementBlock];
+              conversationTurns = conversationTurns.map((turn: any) =>
+                turn.id === turnId && !turn.blockIds.includes(replacementBlockId)
+                  ? { ...turn, blockIds: [...turn.blockIds, replacementBlockId] }
+                  : turn
+              );
+            } else {
+              taskFlow = taskFlow.map((t: any) =>
+                t.id === blockId && t.type === "agent"
+                  ? { ...t, content: visibleText, streaming: false, options: replyOptions }
+                  : t
+              );
+            }
             if (hasToolCalls) {
               nextStreamingBlockId = null;
             }
           } else {
             const existingAgentBlock = [...taskFlow]
               .reverse()
-              .find((block) => block.turnId === turnId && block.type === "agent");
+              .find((block) =>
+                block.turnId === turnId &&
+                block.type === "agent" &&
+                !block.archivedAfterChoice
+              );
 
             if (existingAgentBlock) {
               const blockId = existingAgentBlock.id;
@@ -1067,11 +1095,30 @@ export class WorkflowEngine {
             }
           }
 
+          if (awaitingInput && context.understandingProgressBlockId != null) {
+            const progressBlockId = context.understandingProgressBlockId;
+            taskFlow = taskFlow.filter((block: any) =>
+              !(block.id === progressBlockId && block.type === "progress")
+            );
+            conversationTurns = conversationTurns.map((turn: any) =>
+              turn.id === turnId && Array.isArray(turn.blockIds) && turn.blockIds.includes(progressBlockId)
+                ? { ...turn, blockIds: turn.blockIds.filter((id: number) => id !== progressBlockId) }
+                : turn
+            );
+            context.understandingProgressBlockId = null;
+          }
+
           context.currentStreamingBlockId = nextStreamingBlockId;
 
           conversationTurns = conversationTurns.map((turn: any) =>
             turn.id === turnId
-              ? hasToolCalls
+              ? awaitingInput
+                ? {
+                    ...turn,
+                    status: "awaiting_input",
+                    summary: normalizedFinal || turn.summary,
+                  }
+                : hasToolCalls
                 ? {
                     ...turn,
                     status: turn.status === "awaiting_approval" ? turn.status : "executing",
@@ -1084,6 +1131,16 @@ export class WorkflowEngine {
                   }
               : turn
           );
+
+          if (awaitingInput) {
+            return {
+              taskFlow,
+              conversationTurns,
+              agentStatus: "idle",
+              isGenerating: false,
+              abortController: null,
+            };
+          }
 
           if (hasToolCalls) {
             return {

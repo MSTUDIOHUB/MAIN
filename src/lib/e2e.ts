@@ -51,6 +51,7 @@ const MALFORMED_TOOL_USE_PLAN_SCENARIO = "malformed-tool-use-plan";
 const PLAN_CLOSURE_GUARD_EMPTY_SCENARIO = "plan-closure-guard-empty";
 const EXISTING_PLAN_FOLDER_EXECUTE_SCENARIO = "existing-plan-folder-execute";
 const APPROVED_PLAN_EXECUTION_NO_TOOL_SCENARIO = "approved-plan-execution-no-tool";
+const APPROVED_PLAN_EXECUTION_REPLAY_SCENARIO = "approved-plan-execution-replay";
 const EXECUTE_MAX_ITERATIONS_CHECKPOINT_SCENARIO = "execute-max-iterations-checkpoint";
 const ORDINARY_CONTINUE_NEW_TURN_SCENARIO = "ordinary-continue-new-turn";
 const LOCAL_FILE_READ_APPROVAL_SCENARIO = "local-file-read-approval";
@@ -5740,6 +5741,8 @@ function seedCloudToolProtocolScenario(scenario: string) {
     ? 999510
     : scenario === APPROVED_PLAN_EXECUTION_NO_TOOL_SCENARIO
     ? 999513
+    : scenario === APPROVED_PLAN_EXECUTION_REPLAY_SCENARIO
+    ? 999518
     : scenario === PROGRESS_NARRATION_TOOL_FLOW_SCENARIO
     ? 999514
     : scenario === ORDINARY_CONTINUE_NEW_TURN_SCENARIO
@@ -5775,6 +5778,7 @@ function seedCloudToolProtocolScenario(scenario: string) {
       workflowMode:
         scenario === MALFORMED_TOOL_USE_PLAN_SCENARIO ||
         scenario === APPROVED_PLAN_EXECUTION_NO_TOOL_SCENARIO ||
+        scenario === APPROVED_PLAN_EXECUTION_REPLAY_SCENARIO ||
         scenario === PLAN_OPERATION_APPROVAL_REUSE_SCENARIO
           ? "plan"
           : "chat",
@@ -5817,6 +5821,8 @@ function seedCloudToolProtocolScenario(scenario: string) {
             ? "E2E Malformed Tool Use Plan"
             : scenario === APPROVED_PLAN_EXECUTION_NO_TOOL_SCENARIO
             ? "E2E Approved Plan No Tool"
+            : scenario === APPROVED_PLAN_EXECUTION_REPLAY_SCENARIO
+            ? "E2E Approved Plan Execution Replay"
             : scenario === PROGRESS_NARRATION_TOOL_FLOW_SCENARIO
             ? "E2E Progress Narration Tool Flow"
             : scenario === ORDINARY_CONTINUE_NEW_TURN_SCENARIO
@@ -5865,7 +5871,7 @@ function seedCloudToolProtocolScenario(scenario: string) {
     showTerminal: false,
     showFilePanel: false,
     selectedDiffTaskId: null,
-    ...(scenario === APPROVED_PLAN_EXECUTION_NO_TOOL_SCENARIO
+    ...(scenario === APPROVED_PLAN_EXECUTION_NO_TOOL_SCENARIO || scenario === APPROVED_PLAN_EXECUTION_REPLAY_SCENARIO
       ? {
           planArtifacts: [],
           planTasks: [],
@@ -5918,7 +5924,11 @@ function seedCloudToolProtocolScenario(scenario: string) {
       );
     }
 
-    if (scenario === EXISTING_PLAN_FOLDER_EXECUTE_SCENARIO || scenario === APPROVED_PLAN_EXECUTION_NO_TOOL_SCENARIO) {
+    if (
+      scenario === EXISTING_PLAN_FOLDER_EXECUTE_SCENARIO ||
+      scenario === APPROVED_PLAN_EXECUTION_NO_TOOL_SCENARIO ||
+      scenario === APPROVED_PLAN_EXECUTION_REPLAY_SCENARIO
+    ) {
       return useAppStore.getState().sendMessage(
         text || "根据.MAIN/plans文件夹的内容，完成执行方案和任务的内容。",
       );
@@ -6063,6 +6073,14 @@ function seedCloudToolProtocolScenario(scenario: string) {
         content: typeof block.content === "string" ? block.content.slice(0, 120) : "",
       })),
       agentTexts: agentBlocks.map((block) => block.content),
+      agentBlockDebug: agentBlocks.map((block) => ({
+        id: block.id,
+        turnId: block.turnId,
+        hasOptions: Array.isArray(block.options) && block.options.length > 0,
+        optionLabels: Array.isArray(block.options) ? block.options.map((option: any) => option.label) : [],
+        archivedAfterChoice: block.archivedAfterChoice === true,
+        selectedOption: block.selectedOption || null,
+      })),
       optionBlockCount: optionBlocks.length,
       optionLabels: optionBlocks.flatMap((block) => (block.options || []).map((option: any) => option.label)),
       progressBlockCount: progressBlocks.length,
@@ -6973,6 +6991,10 @@ export function initializeE2EScenarios(): (() => void) | undefined {
 
   if (scenario === APPROVED_PLAN_EXECUTION_NO_TOOL_SCENARIO) {
     return seedCloudToolProtocolScenario(APPROVED_PLAN_EXECUTION_NO_TOOL_SCENARIO);
+  }
+
+  if (scenario === APPROVED_PLAN_EXECUTION_REPLAY_SCENARIO) {
+    return seedCloudToolProtocolScenario(APPROVED_PLAN_EXECUTION_REPLAY_SCENARIO);
   }
 
   if (scenario === EXECUTE_MAX_ITERATIONS_CHECKPOINT_SCENARIO) {

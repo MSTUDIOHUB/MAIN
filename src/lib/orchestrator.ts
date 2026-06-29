@@ -1223,6 +1223,7 @@ export interface OrchestratorCallbacks {
       modelAuthored?: boolean;
       progress?: ProgressNarration;
       toolCalls?: Array<{ id?: string; name: string; target: string }>;
+      awaitingInput?: boolean;
     },
   ) => void;
   onStatusChange: (status: "idle" | "running" | "pending_review" | "error") => void;

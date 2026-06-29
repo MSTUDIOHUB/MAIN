@@ -11,16 +11,56 @@ test.beforeEach(async ({ page }) => {
     const callbacks = new Map<number, unknown>();
     let fallbackNoToolRequests = 0;
     let pseudoToolRecoveryRequests = 0;
+    let approvedPlanReplayRequests = 0;
     const requests: Array<{ hasTools: boolean; body: string }> = [];
     const readFileCalls: string[] = [];
+    const writeFileCalls: string[] = [];
+    const runCommandCalls: string[] = [];
     const listDirectoryCalls: string[] = [];
     const queryTabularCalls: Array<{ path: string; selectColumns?: unknown; limit?: unknown }> = [];
     const ingestedAttachments: Array<{ sessionKey: string; sourcePath: string }> = [];
     let localPlanClosureRequests = 0;
+    const memoryFiles = new Map<string, { content: string; modifiedMs: number }>();
+    const getMemoryFile = (path: string) => memoryFiles.get(String(path || "").replace(/\\/g, "/").replace(/^\.\//, ""));
+    const setMemoryFile = (path: string, content: string) => {
+      memoryFiles.set(String(path || "").replace(/\\/g, "/").replace(/^\.\//, ""), {
+        content,
+        modifiedMs: Date.now(),
+      });
+    };
+    setMemoryFile("src/main.js", [
+      "import { initEditor } from './components/editor.js';",
+      "",
+      "const root = document.getElementById('app');",
+      "",
+      "export function boot() {",
+      "  root.innerHTML = '<div class=\"editor-shell\"></div>';",
+      "  initEditor(root.querySelector('.editor-shell'));",
+      "}",
+      "",
+      "boot();",
+      "",
+    ].join("\n"));
+    setMemoryFile("src/components/editor.js", [
+      "export function initEditor(container) {",
+      "  container.innerHTML = '<textarea aria-label=\"Markdown editor\"></textarea>';",
+      "}",
+      "",
+    ].join("\n"));
+    setMemoryFile("src-tauri/src/main.rs", [
+      "fn main() {",
+      "    tauri::Builder::default()",
+      "        .run(tauri::generate_context!())",
+      "        .expect(\"error while running tauri application\");",
+      "}",
+      "",
+    ].join("\n"));
 
     (window as any).__CLOUD_TOOL_PROTOCOL_TEST__ = {
       requests,
       readFileCalls,
+      writeFileCalls,
+      runCommandCalls,
       listDirectoryCalls,
       queryTabularCalls,
       ingestedAttachments,
@@ -80,7 +120,10 @@ test.beforeEach(async ({ page }) => {
       if (cmd === "save_project_session") return args?.session ?? {};
       if (cmd === "load_project_session") return {};
       if (cmd === "get_file_metadata") {
-        return { path: String(args?.path ?? ""), sizeBytes: 32, modifiedMs: 1 };
+        const path = String(args?.path ?? "");
+        const file = getMemoryFile(path);
+        if (file) return { path, sizeBytes: file.content.length, modifiedMs: file.modifiedMs };
+        return { path, sizeBytes: 32, modifiedMs: 1 };
       }
       if (cmd === "get_project_skeleton") {
         return "README.md\nsrc/\n";
@@ -133,6 +176,24 @@ test.beforeEach(async ({ page }) => {
       if (cmd === "read_file_window") {
         const path = String(args?.path ?? "");
         const scenario = new URL(window.location.href).searchParams.get("e2eScenario");
+        const memoryFile = getMemoryFile(path);
+        if (scenario === "approved-plan-execution-replay" && memoryFile) {
+          readFileCalls.push(path);
+          const lines = memoryFile.content.split("\n");
+          const startLine = Math.max(1, Number(args?.startLine ?? 1) || 1);
+          const endLine = Math.min(lines.length, Number(args?.endLine ?? lines.length) || lines.length);
+          const selected = lines.slice(startLine - 1, endLine).join("\n");
+          return {
+            path,
+            content: selected,
+            startLine,
+            endLine,
+            totalLines: lines.length,
+            totalChars: memoryFile.content.length,
+            returnedChars: selected.length,
+            truncated: false,
+          };
+        }
         if (
           (scenario === "local-file-read-approval" || scenario === "global-chat-attachment-read") &&
           path === ".MAIN-chat-attachments/outside-main-debug.log" &&
@@ -202,37 +263,65 @@ test.beforeEach(async ({ page }) => {
             "",
             "## 需求",
             "",
-            "用户要求根据 `.MAIN/plans` 执行时，MAIN 必须恢复计划执行语义，同时暴露执行工具并保留逐项审查。",
+            scenario === "approved-plan-execution-replay"
+              ? "批准后的计划必须真实修改 MD Viewer 的源码并验证，不能只重复读取文件或口头完成。"
+              : "用户要求根据 `.MAIN/plans` 执行时，MAIN 必须恢复计划执行语义，同时暴露执行工具并保留逐项审查。",
             "",
             "## 验收",
             "",
-            "- PlanPanel 显示任务。",
-            "- runtime 工具包含 shell/write。",
+            ...(scenario === "approved-plan-execution-replay"
+              ? [
+                  "- src/main.js 中出现启动面板标记。",
+                  "- 执行 `npm run test:workflow-assets`。",
+                ]
+              : [
+                  "- PlanPanel 显示任务。",
+                  "- runtime 工具包含 shell/write。",
+                ]),
           ].join("\n"),
           ".MAIN/plans/design.md": [
             "# Design",
             "",
             "## 方案",
             "",
-            "在发送前 hydrate `.MAIN/plans`，conversation intent 保持 plan，runtime intent 使用 execute。",
+            scenario === "approved-plan-execution-replay"
+              ? "修改 `src/main.js` 的启动 UI，添加空白编辑器的开始面板，然后运行验证命令。"
+              : "在发送前 hydrate `.MAIN/plans`，conversation intent 保持 plan，runtime intent 使用 execute。",
             "",
             "## 验证",
             "",
-            "- 下一轮模型请求包含 run_command。",
-            "- 工具调用进入 ActionCard 审查。",
+            ...(scenario === "approved-plan-execution-replay"
+              ? [
+                  "- `src/main.js` 必须有真实文件 diff。",
+                  "- `npm run test:workflow-assets` 成功。",
+                ]
+              : [
+                  "- 下一轮模型请求包含 run_command。",
+                  "- 工具调用进入 ActionCard 审查。",
+                ]),
           ].join("\n"),
           ".MAIN/plans/tasks.md": [
             "# Tasks",
             "",
-            "- [ ] 运行计划执行验证命令 `npm run test:workflow-assets` — 证据: cmd:npm run test:workflow-assets",
+            scenario === "approved-plan-execution-replay"
+              ? "- [ ] 修改 `src/main.js` 添加启动面板 — 证据: file:src/main.js"
+              : "- [ ] 运行计划执行验证命令 `npm run test:workflow-assets` — 证据: cmd:npm run test:workflow-assets",
+            ...(scenario === "approved-plan-execution-replay"
+              ? ["- [ ] 运行 `npm run test:workflow-assets` — 证据: cmd:npm run test:workflow-assets"]
+              : []),
           ].join("\n"),
         };
         if (
-          (scenario === "existing-plan-folder-execute" || scenario === "approved-plan-execution-no-tool") &&
+          (scenario === "existing-plan-folder-execute" || scenario === "approved-plan-execution-no-tool" || scenario === "approved-plan-execution-replay") &&
           Object.prototype.hasOwnProperty.call(planFiles, path)
         ) {
           readFileCalls.push(path);
           return planFiles[path];
+        }
+        const memoryFile = getMemoryFile(path);
+        if (scenario === "approved-plan-execution-replay" && memoryFile) {
+          readFileCalls.push(path);
+          return memoryFile.content;
         }
         if (
           scenario === "game-studio-execute-reply-runtime" &&
@@ -246,6 +335,27 @@ test.beforeEach(async ({ page }) => {
         }
         readFileCalls.push(path);
         return "# README\n\nfallback-ok\n";
+      }
+
+      if (cmd === "write_file") {
+        const path = String(args?.path ?? "");
+        const content = String(args?.content ?? "");
+        writeFileCalls.push(path);
+        setMemoryFile(path, content);
+        return null;
+      }
+
+      if (cmd === "run_command") {
+        const command = String(args?.command ?? "");
+        runCommandCalls.push(command);
+        return {
+          command,
+          exitCode: 0,
+          stdout: "workflow asset tests passed",
+          stderr: "",
+          durationMs: 12,
+          timedOut: false,
+        };
       }
 
       if (cmd === "proxy_request") {
@@ -576,6 +686,42 @@ test.beforeEach(async ({ page }) => {
         if (scenario === "approved-plan-execution-no-tool") {
           return JSON.stringify({
             output_text: "继续执行下一步。",
+          });
+        }
+
+        if (scenario === "approved-plan-execution-replay") {
+          approvedPlanReplayRequests += 1;
+          const step = approvedPlanReplayRequests;
+          if (step === 1) {
+            return JSON.stringify({
+              output_text: [
+                "我先读取需要修改的启动入口。",
+                "<tool_use>",
+                "<tool>read_file</tool>",
+                "<parameter name=\"path\">src/main.js</parameter>",
+                "</tool_use>",
+              ].join("\n"),
+            });
+          }
+          if (step === 2) {
+            return JSON.stringify({
+              output_text: [
+                "我会尝试打补丁。",
+                "<tool_use>",
+                "<tool>apply_patch</tool>",
+                "<parameter name=\"patch\">*** Begin Patch\n*** Update File: src/main.js\n@@\n-  root.innerHTML = '&lt;div class=\"missing-old-shell\"&gt;&lt;/div&gt;';\n+  root.innerHTML = '&lt;div class=\"start-panel\" data-e2e=\"approved-plan-execution-replay-marker\"&gt;&lt;/div&gt;';\n*** End Patch</parameter>",
+                "</tool_use>",
+              ].join("\n"),
+            });
+          }
+          return JSON.stringify({
+            output_text: [
+              "我需要再次查看同一个文件。",
+              "<tool_use>",
+              "<tool>read_file</tool>",
+              "<parameter name=\"path\">src/main.js</parameter>",
+              "</tool_use>",
+            ].join("\n"),
           });
         }
 
@@ -1203,8 +1349,10 @@ test("game studio execute reply resumes the source turn with studio workflow too
           hasRead: names.includes("read_file"),
           hasWrite: names.includes("write_file") && names.includes("replace_in_file"),
           currentTurnIntent: snapshot?.currentTurnIntent,
+          optionBlockCount: snapshot?.optionBlockCount,
           turns: snapshot?.conversationTurns,
           archivedOptionCount: snapshot?.archivedOptionCount,
+          selectedOptions: snapshot?.selectedOptions,
           readFileCalls: probe?.readFileCalls || [],
         };
       }),
@@ -1213,8 +1361,10 @@ test("game studio execute reply resumes the source turn with studio workflow too
       hasRead: true,
       hasWrite: true,
       currentTurnIntent: "studio_workflow",
+      optionBlockCount: 0,
       turns: 1,
       archivedOptionCount: 1,
+      selectedOptions: ["立即开始重构并完善"],
       readFileCalls: ["Assets/Scripts/Entities/SnakeController.cs"],
     });
 });
@@ -1607,6 +1757,67 @@ test("approved plan execution no-tool replies use execution checkpoint path", as
       hasExecutionReprompt: true,
       stoppedGeneric: false,
       hasCheckpoint: true,
+    });
+});
+
+test("approved plan execution replay pauses repeated source reads instead of completing or erroring", async ({ page }) => {
+  test.setTimeout(45_000);
+  await page.goto("/?e2eScenario=approved-plan-execution-replay");
+
+  const sent = await page.evaluate(() =>
+    (window as any).__CODELY_E2E__?.sendCloudMessage?.("根据.MAIN/plans文件夹的内容，继续执行任务。"),
+  );
+  expect(sent).toBe(true);
+
+  await expect
+    .poll(async () =>
+      page.evaluate(() => {
+        const probe = (window as any).__CLOUD_TOOL_PROTOCOL_TEST__;
+        const requests = probe?.requests || [];
+        const firstWithTools = requests.find((request: any) => request.hasTools);
+        const firstToolNames = firstWithTools
+          ? (JSON.parse(firstWithTools.body || "{}").tools || [])
+              .map((tool: any) => tool?.name || tool?.function?.name)
+              .filter(Boolean)
+          : [];
+        const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+        const logs = JSON.parse(window.localStorage.getItem("main.debugLog.v1") || "[]");
+        const hasLog = (needle: string) => logs.some((entry: { source?: string; message?: string }) =>
+          String(entry.source || "").includes(needle) ||
+          String(entry.message || "").includes(needle),
+        );
+        const systemTexts = snapshot?.systemTexts || [];
+        return {
+          agentStatus: snapshot?.agentStatus,
+          planStage: snapshot?.planStage,
+          currentTurnStatus: snapshot?.currentTurnStatus,
+          isPlanApproved: snapshot?.isPlanApproved,
+          firstHasReadFile: firstToolNames.includes("read_file"),
+          firstHasPatch: firstToolNames.includes("apply_patch") || firstToolNames.includes("replace_in_file"),
+          readMainCount: (probe?.readFileCalls || []).filter((path: string) => path === "src/main.js").length,
+          sawPatchAttempt: (snapshot?.toolNames || []).includes("apply_patch") ||
+            hasLog("workspace_mutation_preflight_blocked"),
+          hasRepeatReadPause: hasLog("approved_plan_read_file_repeat_limit") ||
+            hasLog("approved_plan_repeated_read_file") ||
+            systemTexts.some((text: string) => /重复读取保护|READ_FILE_REPEAT_LIMIT|repeat-read guard|read_file/.test(text)),
+          hasAgentLoopError: hasLog("agent_loop_error"),
+          completed: snapshot?.planStage === "completed" || snapshot?.currentTurnStatus === "completed_with_changes",
+        };
+      }),
+      { timeout: 35_000 },
+    )
+    .toEqual({
+      agentStatus: "idle",
+      planStage: "executing",
+      currentTurnStatus: "stopped_no_action",
+      isPlanApproved: true,
+      firstHasReadFile: true,
+      firstHasPatch: true,
+      readMainCount: 3,
+      sawPatchAttempt: true,
+      hasRepeatReadPause: true,
+      hasAgentLoopError: false,
+      completed: false,
     });
 });
 

@@ -513,6 +513,9 @@ test("approved plan source edit first surface blocks validation before first wri
   const orchestratorSource = (fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8") + "\n" + fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8"));
   assert.match(orchestratorSource, /approvedPlanNeedsSourceEditBeforeValidation/);
   assert.match(orchestratorSource, /approved_plan_source_edit_first_tool_scope_applied/);
+  assert.match(orchestratorSource, /approvedPlanInitialSourceReadAllowed/);
+  assert.match(orchestratorSource, /recentPlanToolActivity\.length === 0/);
+  assert.match(orchestratorSource, /initialSourceReadAllowed:\s*approvedPlanInitialSourceReadAllowed/);
 });
 
 test("approved plan browser validation repeats are reused or paused without agent error", () => {
@@ -525,6 +528,24 @@ test("approved plan browser validation repeats are reused or paused without agen
     orchestratorSource,
     /tc\.name === "browser_evaluate"[\s\S]{0,600}callbacks\.onStatusChange\("error"\)/,
   );
+});
+
+test("approved plan repeat-read guard pauses before max-iteration error", () => {
+  const orchestratorSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8");
+
+  assert.match(orchestratorSource, /approvedPlanReadFileRepeatLimit/);
+  assert.match(orchestratorSource, /approved_plan_read_file_repeat_limit/);
+  assert.match(orchestratorSource, /shouldPushApprovedPlanReadLimit/);
+  assert.match(orchestratorSource, /READ_FILE_REPEAT_LIMIT: \$\{target \|\| fileReadState\.path\}/);
+  assert.match(orchestratorSource, /approved_plan_repeated_read_file/);
+  assert.match(orchestratorSource, /callbacks\.onNonActionableStop\([\s\S]*?recoveryReason:\s*"approved_plan_read_file_repeat_limit"/);
+  assert.match(orchestratorSource, /callbacks\.onNonActionableStop\([\s\S]*?recoveryReason:\s*"approved_plan_repeated_read_file"/);
+  assert.match(
+    orchestratorSource,
+    /const approvedPlanReadFileRepeatLimit = workflowMode === "plan" &&[\s\S]*callbacks\.getIsPlanApproved\(\) &&[\s\S]*runtimeIntent === "execute" &&[\s\S]*allResults\.some\(isReadFileRepeatLimitResult\)/,
+  );
+  assert.match(orchestratorSource, /reason: "approved_plan_read_file_repeat_limit"/);
+  assert.match(orchestratorSource, /const readFileRepeatLimitBatch = workflowMode === "edit"\s*\? summarizeReadFileRepeatLimitBatch\(allResults\)/);
 });
 
 test("approved plan repeated edits route to validation recovery before pausing", () => {

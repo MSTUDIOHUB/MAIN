@@ -1422,9 +1422,6 @@ export class AgentOrchestrator {
         const rawIterationAllTools = finalTextOnlyStep || chatFinalSynthesisActive
           ? []
           : resolveAllToolsForRuntime(runtimeIntent);
-        const allowApprovedPlanRecoveryFileRead =
-          approvedPlanNoToolRecoveryFileReadActive ||
-          shouldAllowApprovedPlanRecoveryFileRead(recentPlanToolActivity);
         const isExecuteRecoveryEligible =
           (workflowMode === "edit" || (workflowMode === "plan" && callbacks.getIsPlanApproved())) &&
           runtimeIntent === "execute" &&
@@ -1463,6 +1460,15 @@ export class AgentOrchestrator {
             callbacks.getPlanTasks(),
             callbacks.getPlanExecutionEvidenceLedger(),
           );
+        const approvedPlanInitialSourceReadAllowed =
+          approvedPlanSourceEditFirstActive &&
+          runtimeIntent === "execute" &&
+          recentPlanToolActivity.length === 0 &&
+          callbacks.getPlanExecutionEvidenceLedger().length === 0;
+        const allowApprovedPlanRecoveryFileRead =
+          approvedPlanInitialSourceReadAllowed ||
+          approvedPlanNoToolRecoveryFileReadActive ||
+          shouldAllowApprovedPlanRecoveryFileRead(recentPlanToolActivity);
         const baseIterationAllTools =
           approvedPlanSourceEditFirstActive
             ? recoveryIterationAllTools.filter((tool) => isApprovedPlanSourceEditFirstTool(tool, {
@@ -1479,6 +1485,7 @@ export class AgentOrchestrator {
           logAgentEvent("approved_plan_source_edit_first_tool_scope_applied", {
             iteration,
             allowFileRead: allowApprovedPlanRecoveryFileRead,
+            initialSourceReadAllowed: approvedPlanInitialSourceReadAllowed,
             recoveryToolSurface: describeApprovedPlanSourceEditFirstToolSurface(allowApprovedPlanRecoveryFileRead),
             rawTools: recoveryIterationAllTools.map((tool) => tool.function.name).slice(0, 24),
             scopedTools: baseIterationAllTools.map((tool) => tool.function.name),
@@ -3762,6 +3769,21 @@ export class AgentOrchestrator {
           continue;
         }
 
+        const hasExecutablePlanProposalOptions =
+          workflowMode === "plan" &&
+          !callbacks.getIsPlanApproved() &&
+          hasExecutableProposalReplyOptions(rawFinalReplyOptions);
+        const shouldPauseForUserChoice = shouldPauseForReplyOptions({
+          replyOptions: finalReplyOptions,
+          toolCallCount: effectiveToolCalls.length,
+          workflowMode,
+          hasStructuredProposal,
+          hasReadyPlanArtifacts,
+          isPlanApproved: callbacks.getIsPlanApproved(),
+          forcePause: normalized.hasExplicitUserChoiceRequest,
+          finishReason: normalized.finishReason,
+        });
+
         if (!shouldHideApprovedPlanNoToolText) {
           callbacks.onTurnSummaryReady(visibleAssistantText);
         }
@@ -3792,6 +3814,7 @@ export class AgentOrchestrator {
             progress: shouldRenderToolProgress
               ? toolActionNarration || undefined
               : undefined,
+            awaitingInput: shouldPauseForUserChoice,
             hiddenThought: normalized.hiddenThought,
             toolCalls: progressEligibleToolCalls.map((call) => {
               const args = parseToolCallArguments(call, workspace);
@@ -3859,20 +3882,6 @@ export class AgentOrchestrator {
           sawPlanModeToolActivity = true;
         }
 
-        const hasExecutablePlanProposalOptions =
-          workflowMode === "plan" &&
-          !callbacks.getIsPlanApproved() &&
-          hasExecutableProposalReplyOptions(rawFinalReplyOptions);
-        const shouldPauseForUserChoice = shouldPauseForReplyOptions({
-          replyOptions: finalReplyOptions,
-          toolCallCount: effectiveToolCalls.length,
-          workflowMode,
-          hasStructuredProposal,
-          hasReadyPlanArtifacts,
-          isPlanApproved: callbacks.getIsPlanApproved(),
-          forcePause: normalized.hasExplicitUserChoiceRequest,
-          finishReason: normalized.finishReason,
-        });
         const assistantHistoryText = serializeAssistantReplyForHistory(historyAssistantText, finalReplyOptions);
         const hasMeaningfulVisibleText = visibleAssistantText.trim().length > 0;
         const wasTruncated = normalized.finishReason === "length";
@@ -5477,7 +5486,33 @@ export class AgentOrchestrator {
                   tc.name === "read_file" &&
                   duplicateCount >= 2 &&
                   !shouldPushPlanReadLimit;
-                const baseStub = replayApprovedExecutionRead
+                const shouldPushApprovedPlanReadLimit =
+                  replayApprovedExecutionRead &&
+                  duplicateCount >= 3;
+                const approvedPlanReadLimitMessage = shouldPushApprovedPlanReadLimit
+                  ? callbacks.getPreferredLanguage() === "zh"
+                    ? [
+                        `READ_FILE_REPEAT_LIMIT: ${target || fileReadState.path} 已在已批准计划执行中重复读取，本次不再重新读取。`,
+                        "请复用上方缓存内容，改为 apply_patch/replace_in_file/write_file、运行验证，或说明明确阻塞。",
+                      ].join("\n")
+                    : [
+                        `READ_FILE_REPEAT_LIMIT: ${target || fileReadState.path} was reread repeatedly during approved plan execution, so this read was not re-run.`,
+                        "Reuse the cached context and switch to apply_patch/replace_in_file/write_file, validation, or a concrete blocker.",
+                      ].join("\n")
+                  : "";
+                if (shouldPushApprovedPlanReadLimit) {
+                  emitToolPreflightBlocked(callbacks, {
+                    reason: "read_file_repeat_limit",
+                    tool: tc.name,
+                    target: target || fileReadState.path,
+                    message: approvedPlanReadLimitMessage,
+                    toolCallId: tc.id,
+                    lifecycleState: "completed",
+                  });
+                }
+                const baseStub = shouldPushApprovedPlanReadLimit
+                  ? approvedPlanReadLimitMessage
+                  : replayApprovedExecutionRead
                   ? buildFileUnchangedReplayContent(fileReadState, duplicateCount)
                   : buildFileUnchangedStub(fileReadState);
                 const closurePrompt = shouldPushPlanReadLimit
@@ -5495,7 +5530,9 @@ export class AgentOrchestrator {
                   name: tc.name,
                   target,
                   content,
-                  displayContent: `${FILE_UNCHANGED_STUB}: ${target || fileReadState.path}`,
+                  displayContent: shouldPushApprovedPlanReadLimit
+                    ? `READ_FILE_REPEAT_LIMIT: ${target || fileReadState.path}`
+                    : `${FILE_UNCHANGED_STUB}: ${target || fileReadState.path}`,
                   isError: false,
                 });
                 continue;
@@ -6577,7 +6614,60 @@ export class AgentOrchestrator {
               .forEach(message => callbacks.appendMessage(message));
           }
         }
-        const readFileRepeatLimitBatch = workflowMode === "edit" && runtimeIntent === "execute"
+        const approvedPlanReadFileRepeatLimit = workflowMode === "plan" &&
+          callbacks.getIsPlanApproved() &&
+          runtimeIntent === "execute" &&
+          allResults.some(isReadFileRepeatLimitResult);
+        if (approvedPlanReadFileRepeatLimit) {
+          const language = callbacks.getPreferredLanguage();
+          const repeatResults = allResults.filter(isReadFileRepeatLimitResult);
+          const repeatedTargets = summarizeRepeatedPlanTargetsFromToolActivity(recentPlanToolActivity)
+            .concat(repeatResults.map((result) => result.target).filter(Boolean))
+            .filter((target, index, all) => target && all.indexOf(target) === index)
+            .slice(0, 4);
+          const progressSignature = buildPlanProgressSignatureFromToolActivity(recentPlanToolActivity);
+          const notice = language === "zh"
+            ? [
+                "计划执行已暂停：模型再次请求了已被重复读取保护拦截的 read_file。",
+                repeatedTargets.length ? `重复目标：${repeatedTargets.join("、")}` : "",
+                "MAIN 已保留当前缓存文件内容和工具结果；继续时应复用这些上下文，改为精确 patch/replace、运行验证命令、浏览器验证，或说明真实阻塞。",
+              ].filter(Boolean).join("\n")
+            : [
+                "Plan execution paused: the model asked for a read_file call that the repeat-read guard already blocked.",
+                repeatedTargets.length ? `Repeated targets: ${repeatedTargets.join(", ")}` : "",
+                "MAIN kept the cached file content and tool results; on resume, reuse that context and switch to a precise patch/replace, command validation, browser validation, or a concrete blocker.",
+              ].filter(Boolean).join("\n");
+          logAgentEvent("loop_stop", {
+            reason: "approved_plan_read_file_repeat_limit",
+            iteration,
+            repeatedTargets,
+            progressSignature: truncateForLog(progressSignature, 220),
+            repeatResults: repeatResults.length,
+          });
+          emitTaskOrchestratorPhase("PAUSED", {
+            reason: "approved_plan_read_file_repeat_limit",
+            iteration,
+            repeatedTargets,
+            remainingTask: language === "zh"
+              ? "复用已读文件上下文，改为源码修改、命令/浏览器验证或明确阻塞。"
+              : "reuse cached file context and switch to source edits, command/browser validation, or a concrete blocker",
+          });
+          callbacks.onNonActionableStop(
+            notice,
+            "no_action",
+            {
+              progressSignature,
+              repeatedTargets,
+              recoveryReason: "approved_plan_read_file_repeat_limit",
+              nextStep: language === "zh"
+                ? "复用缓存内容，转向 patch/replace、验证或阻塞说明"
+                : "reuse cached context and pivot to patch/replace, validation, or blocker",
+            },
+          );
+          callbacks.onStatusChange("idle");
+          return;
+        }
+        const readFileRepeatLimitBatch = workflowMode === "edit"
           ? summarizeReadFileRepeatLimitBatch(allResults)
           : null;
         if (readFileRepeatLimitBatch) {
@@ -6966,11 +7056,51 @@ export class AgentOrchestrator {
             return;
           }
 
-          const fatalMessage = formatRepeatLoopFatalMessage(tc.name, target, repeatCheck.threshold);
           const remainingTask = callbacks.getPlanTasks().find((task) => !isPlanTaskTrustedComplete(task));
           const defaultSuggestedNextTask = callbacks.getPreferredLanguage() === "zh"
             ? "先复用已成功结果，再继续下一个文件或不同目标"
             : "reuse successful results already in context, then continue with the next file or a different target";
+          if (callbacks.getIsPlanApproved() && runtimeIntent === "execute" && tc.name === "read_file") {
+            const language = callbacks.getPreferredLanguage();
+            const repeatedTargets = target ? [target] : summarizeRepeatedPlanTargetsFromToolActivity(recentPlanToolActivity);
+            const progressSignature = buildPlanProgressSignatureFromToolActivity(recentPlanToolActivity);
+            const notice = language === "zh"
+              ? [
+                  "计划执行已暂停：模型重复读取同一个源码目标，没有产生新的执行证据。",
+                  `重复目标：${repeatedTargets.join("、") || "未定位到单一目标"}`,
+                  `下一步建议：${remainingTask?.text || defaultSuggestedNextTask}`,
+                  "MAIN 已保留最近读取内容；继续时请复用缓存上下文，改为精确 patch/replace/write、运行验证，或说明真实阻塞。",
+                ].join("\n")
+              : [
+                  "Plan execution paused: the model repeatedly read the same source target without producing new execution evidence.",
+                  `Repeated target: ${repeatedTargets.join(", ") || "no single target identified"}`,
+                  `Suggested next step: ${remainingTask?.text || defaultSuggestedNextTask}`,
+                  "MAIN kept the latest file content; on resume, reuse cached context and switch to a precise patch/replace/write, validation, or a concrete blocker.",
+                ].join("\n");
+            logAgentEvent("loop_stop", {
+              reason: "approved_plan_repeated_read_file",
+              iteration,
+              target,
+              progressSignature: truncateForLog(progressSignature, 220),
+              repeatedTargets,
+            });
+            callbacks.onNonActionableStop(
+              notice,
+              "no_action",
+              {
+                progressSignature,
+                repeatedTargets,
+                recoveryReason: "approved_plan_repeated_read_file",
+                nextStep: language === "zh"
+                  ? "复用缓存源码内容，改为 patch/replace/write、验证或明确阻塞"
+                  : "reuse cached source context and pivot to patch/replace/write, validation, or blocker",
+              },
+            );
+            callbacks.onStatusChange("idle");
+            return;
+          }
+
+          const fatalMessage = formatRepeatLoopFatalMessage(tc.name, target, repeatCheck.threshold);
           const recentEvidence = callbacks.getPlanExecutionEvidenceLedger().slice(-5);
           const recentEvidenceText = recentEvidence.length > 0
             ? recentEvidence.map((entry) => `${entry.kind}:${entry.target || entry.value} via ${entry.sourceTool}`).join(" | ")
@@ -7167,22 +7297,27 @@ export class AgentOrchestrator {
           remainingTasks: checkpoint.remainingTasks.length,
           recentToolActivity: checkpoint.recentToolActivity.length,
         });
-        emitPlanExecutionProgress(
-          checkpoint.autoResumeCount < 1 ? "checkpoint" : "paused",
-          {
-            nextStep: checkpoint.autoResumeCount < 1
-              ? callbacks.getPreferredLanguage() === "zh"
-                ? "保存检查点并自动开启一次隐藏续跑"
-                : "save checkpoint and start one hidden auto-resume"
-              : callbacks.getPreferredLanguage() === "zh"
-              ? "点击 Resume Execution 后从检查点继续"
-              : "click Resume Execution to continue from checkpoint",
-          },
-        );
+        emitPlanExecutionProgress("paused", {
+          nextStep: callbacks.getPreferredLanguage() === "zh"
+            ? "点击 Resume Execution 后从检查点继续"
+            : "click Resume Execution to continue from checkpoint",
+        });
         callbacks.onStatusChange("idle");
         const handled = await callbacks.onPlanMaxIterationsCheckpoint?.(checkpoint);
         if (handled) return;
-        callbacks.onError(buildPlanMaxIterationsPauseNotice(checkpoint, callbacks.getPreferredLanguage()));
+        callbacks.onNonActionableStop(
+          buildPlanMaxIterationsPauseNotice(checkpoint, callbacks.getPreferredLanguage()),
+          "incomplete_plan",
+          {
+            phase: "paused",
+            recoveryReason: "plan_max_iterations_checkpoint",
+            repeatedTargets: summarizeRepeatedPlanTargetsFromToolActivity(recentPlanToolActivity),
+            progressSignature: buildPlanProgressSignatureFromToolActivity(recentPlanToolActivity),
+            nextStep: callbacks.getPreferredLanguage() === "zh"
+              ? "点击 Resume Execution 后复用检查点，先核查当前 workspace，再继续未满足证据的任务"
+              : "click Resume Execution to reuse the checkpoint, inspect current workspace, and continue evidence-unsatisfied tasks",
+          },
+        );
         return;
         }
 

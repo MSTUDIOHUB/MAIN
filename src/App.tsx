@@ -105,8 +105,22 @@ function getLatestVisibleAgentTextForTurn(taskFlow: TaskBlock[], turnId?: string
 function archiveReplyOptionsForTurn(taskFlow: TaskBlock[], turnId: string | undefined, selectedOption?: string): TaskBlock[] {
   if (!turnId) return taskFlow;
   const selected = String(selectedOption || "").trim();
-  return taskFlow.map((block) =>
+  const hasTurnOptionBlocks = taskFlow.some((block) =>
     block.turnId === turnId &&
+    block.type === "agent" &&
+    Array.isArray(block.options) &&
+    block.options.length > 0
+  );
+  const matchesSelectedOption = (block: TaskBlock) =>
+    selected.length > 0 &&
+    block.type === "agent" &&
+    Array.isArray(block.options) &&
+    block.options.some((option: any) =>
+      String(option?.value || "").trim() === selected ||
+      String(option?.label || "").trim() === selected
+    );
+  return taskFlow.map((block) =>
+    (block.turnId === turnId || (!hasTurnOptionBlocks && matchesSelectedOption(block))) &&
     block.type === "agent" &&
     Array.isArray(block.options) &&
     block.options.length > 0
@@ -1648,6 +1662,8 @@ export default function App() {
           reuseCurrentTurn: true,
           preservePlanState: sourceIntent === "plan",
           resolvedIntent: shouldExecuteFromQuickReply ? executeQuickReplyIntent : sourceIntent,
+          replyOptionSourceTurnId: sourceTurnId,
+          selectedReplyOptionText: text,
           ...(shouldExecuteFromQuickReply
             ? {
                 runtimeIntentOverride: executeQuickReplyIntent,
@@ -1662,6 +1678,8 @@ export default function App() {
           runtimeIntentOverride: executeQuickReplyIntent,
           executionConsentGranted: true,
           skipIntentResolution: true,
+          replyOptionSourceTurnId: sourceTurnId,
+          selectedReplyOptionText: text,
         }
       : undefined;
 
@@ -1674,6 +1692,9 @@ export default function App() {
       input: "",
       contextMentions: [],
       attachedFiles: [],
+      ...(shouldReuseSourceTurn
+        ? { taskFlow: archiveReplyOptionsForTurn(state.taskFlow, sourceTurnId, text) }
+        : {}),
       ...(optionAction === "allow_readonly_session" ? { readOnlyAutoApproveForSession: true } : {}),
       ...(optionAction === "adjust_plan"
         ? {
@@ -1707,6 +1728,44 @@ export default function App() {
         ? { currentTurnExecutionConsent: { turnId: sourceTurnId, granted: true } }
         : {}),
     });
+
+    if (shouldReuseSourceTurn) {
+      const latest = useAppStore.getState();
+      const scopeKey = resolveSessionWorkspaceKey(latest.currentWorkspace);
+      const sessionKey = resolveSessionRuntimeKey(scopeKey, latest.currentSessionId);
+      const countOptions = (blocks: TaskBlock[] | undefined) =>
+        Array.isArray(blocks)
+          ? blocks.filter((block) =>
+              block.turnId === sourceTurnId &&
+              block.type === "agent" &&
+              Array.isArray(block.options) &&
+              block.options.length > 0
+            ).length
+          : 0;
+      const runtimeBefore = sessionKey ? latest.runtimeBySessionKey?.[sessionKey] : null;
+      appendDebugLog("info", "ui.quickReply_archive_runtime_probe", {
+        sourceTurnId,
+        sessionKey,
+        topLevelOptions: countOptions(latest.taskFlow),
+        runtimeOptions: countOptions(runtimeBefore?.taskFlow),
+        runtimeFound: !!runtimeBefore,
+      });
+      if (sessionKey && latest.runtimeBySessionKey?.[sessionKey]) {
+        useAppStore.setState((s) => {
+          const runtime = s.runtimeBySessionKey[sessionKey];
+          if (!runtime) return {};
+          return {
+            runtimeBySessionKey: {
+              ...s.runtimeBySessionKey,
+              [sessionKey]: {
+                ...runtime,
+                taskFlow: archiveReplyOptionsForTurn(runtime.taskFlow, sourceTurnId, text),
+              },
+            },
+          };
+        });
+      }
+    }
 
     runAfterNextPaint(() => {
       useAppStore.getState().sendMessage(text, undefined, sendOptions);

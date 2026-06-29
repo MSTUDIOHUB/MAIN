@@ -117,6 +117,29 @@ test("approved plan no-tool guard uses execution checkpoint helper and no-action
   assert.match(workflowEngine, /variant: "execution_checkpoint"/);
 });
 
+test("approved plan max-iteration boundary pauses instead of surfacing agent error", () => {
+  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8");
+  const checkpointIndex = source.indexOf("logAgentEvent(\"max_iterations_checkpoint\"");
+  const branch = source.slice(checkpointIndex, checkpointIndex + 2200);
+
+  assert.notEqual(checkpointIndex, -1);
+  assert.match(branch, /emitPlanExecutionProgress\("paused"/);
+  assert.match(branch, /callbacks\.onNonActionableStop\(/);
+  assert.match(branch, /recoveryReason:\s*"plan_max_iterations_checkpoint"/);
+  assert.match(branch, /"incomplete_plan"/);
+  assert.doesNotMatch(branch, /callbacks\.onError\(buildPlanMaxIterationsPauseNotice/);
+});
+
+test("explicit reply options mark assistant text as awaiting input even when tool calls coexist", () => {
+  const workflowEngine = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"), "utf8");
+  const orchestratorSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8");
+
+  assert.match(orchestratorSource, /awaitingInput:\s*shouldPauseForUserChoice/);
+  assert.match(workflowEngine, /const awaitingInput = meta\?\.awaitingInput === true && replyOptions\.length > 0/);
+  assert.match(workflowEngine, /status:\s*"awaiting_input"/);
+  assert.match(workflowEngine, /agentStatus:\s*"idle"[\s\S]*?isGenerating:\s*false/);
+});
+
 test("agent loop blocks execute completion without execution evidence", () => {
   const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8");
   const orchestrator = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8");

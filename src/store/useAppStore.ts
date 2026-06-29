@@ -1919,7 +1919,7 @@ function createSessionRuntimeFromState(state: Partial<AppState>): SessionRuntime
     runtimeEventSchemaVersion: 1,
     runtimeEvents: normalizeRuntimeEvents(state.runtimeEvents),
     harnessRunMarker: normalizeHarnessRunMarker(state.harnessRunMarker),
-    taskFlow: Array.isArray(state.taskFlow) ? state.taskFlow : [],
+    taskFlow: Array.isArray(state.taskFlow) ? archiveConsumedReplyOptionsFromTaskFlow(state.taskFlow) : [],
     agentMessages: Array.isArray(state.agentMessages) ? state.agentMessages : [],
     contextMemoryState: normalizedContextMemoryState,
     contextMemoryStateByRuntimeKey,
@@ -2016,9 +2016,13 @@ function getSessionRuntimeUiPatch(
   runtime: SessionRuntimeState,
   options: { resetPanels?: boolean; requireTranscript?: boolean } = {},
 ): Partial<AppState> {
+  const normalizedRuntime = {
+    ...runtime,
+    taskFlow: archiveConsumedReplyOptionsFromTaskFlow(runtime.taskFlow || []),
+  };
   return options.resetPanels
-    ? { ...runtime, ...getClosedSessionPanelPatch() }
-    : { ...runtime };
+    ? { ...normalizedRuntime, ...getClosedSessionPanelPatch() }
+    : { ...normalizedRuntime };
 }
 
 function hasSessionRuntimeTranscript(runtime: Partial<SessionRuntimeState> | null | undefined): boolean {
@@ -2752,6 +2756,129 @@ function hasOperationApprovalReplyOption(replyOptions: ReplyOption[]): boolean {
     option.source === "proposal_follow_up" ||
     option.source === "operation_approval"
   );
+}
+
+function replyOptionMatchesSelectedText(replyOptions: ReplyOption[], selectedChoiceText: string): boolean {
+  const selected = selectedChoiceText.trim();
+  if (!selected) return false;
+  return replyOptions.some((option) =>
+    String(option.value || "").trim() === selected ||
+    String(option.label || "").trim() === selected
+  );
+}
+
+function archiveReplyOptionBlocksForChoice(
+  taskFlow: TaskBlock[],
+  turnId: string | undefined,
+  selectedChoiceText: string,
+): {
+  taskFlow: TaskBlock[];
+  archivedCount: number;
+  exactTurnOptionBlocks: number;
+  selectedFallbackBlocks: number;
+  matchMode: "turn" | "selected_fallback" | "none";
+} {
+  const exactTurnOptionBlocks = turnId
+    ? taskFlow.filter((block) =>
+        block.turnId === turnId &&
+        block.type === "agent" &&
+        Array.isArray(block.options) &&
+        block.options.length > 0
+      ).length
+    : 0;
+  const useSelectedFallback = exactTurnOptionBlocks === 0 && selectedChoiceText.trim().length > 0;
+  let archivedCount = 0;
+  let selectedFallbackBlocks = 0;
+  const nextTaskFlow = taskFlow.map((block) => {
+    if (
+      block.type !== "agent" ||
+      !Array.isArray(block.options) ||
+      block.options.length === 0
+    ) {
+      return block;
+    }
+    const matchesTurn = !!turnId && block.turnId === turnId;
+    const matchesFallback =
+      useSelectedFallback && replyOptionMatchesSelectedText(block.options, selectedChoiceText);
+    if (!matchesTurn && !matchesFallback) return block;
+    archivedCount += 1;
+    if (matchesFallback && !matchesTurn) selectedFallbackBlocks += 1;
+    return {
+      ...block,
+      options: undefined,
+      archivedAfterChoice: true,
+      ...(hasOperationApprovalReplyOption(block.options) ? { archivedProposal: true } : {}),
+      ...(selectedChoiceText.trim() ? { selectedOption: selectedChoiceText.trim() } : {}),
+    };
+  });
+
+  return {
+    taskFlow: nextTaskFlow,
+    archivedCount,
+    exactTurnOptionBlocks,
+    selectedFallbackBlocks,
+    matchMode: archivedCount > 0
+      ? exactTurnOptionBlocks > 0
+        ? "turn"
+        : "selected_fallback"
+      : "none",
+  };
+}
+
+function archiveConsumedReplyOptionsFromTaskFlow(taskFlow: TaskBlock[]): TaskBlock[] {
+  let changed = false;
+  const selectedUsersByTurn = new Map<string, Array<Extract<TaskBlock, { type: "user" }>>>();
+  taskFlow.forEach((block) => {
+    if (block.type !== "user" || !block.turnId) return;
+    const existing = selectedUsersByTurn.get(block.turnId) || [];
+    existing.push(block);
+    selectedUsersByTurn.set(block.turnId, existing);
+  });
+  const nextTaskFlow = taskFlow.map((block, index) => {
+    if (
+      block.type !== "agent" ||
+      !Array.isArray(block.options) ||
+      block.options.length === 0
+    ) {
+      return block;
+    }
+    const turnUsers = block.turnId ? selectedUsersByTurn.get(block.turnId) || [] : [];
+    const selectedUserBlock =
+      (
+        taskFlow
+          .slice(index + 1)
+          .find((candidate) =>
+            candidate.turnId === block.turnId &&
+            candidate.type === "user" &&
+            replyOptionMatchesSelectedText(block.options!, String(candidate.content || ""))
+          ) as Extract<TaskBlock, { type: "user" }> | undefined
+      ) ||
+      turnUsers.find((candidate) =>
+        replyOptionMatchesSelectedText(block.options!, String(candidate.content || ""))
+      );
+    if (!selectedUserBlock) return block;
+    changed = true;
+    const selected = String(selectedUserBlock.content || "").trim();
+    return {
+      ...block,
+      options: undefined,
+      archivedAfterChoice: true,
+      ...(hasOperationApprovalReplyOption(block.options) ? { archivedProposal: true } : {}),
+      ...(selected ? { selectedOption: selected } : {}),
+    };
+  });
+  return changed ? nextTaskFlow : taskFlow;
+}
+
+function normalizeTaskFlowPatchForConsumedReplyOptions<T extends Record<string, unknown> | Partial<AppState>>(
+  patch: T,
+): T {
+  if (!Array.isArray((patch as any).taskFlow)) return patch;
+  const taskFlow = (patch as any).taskFlow as TaskBlock[];
+  const normalizedTaskFlow = archiveConsumedReplyOptionsFromTaskFlow(taskFlow);
+  return normalizedTaskFlow === taskFlow
+    ? patch
+    : ({ ...patch, taskFlow: normalizedTaskFlow } as T);
 }
 
 
@@ -6977,6 +7104,8 @@ export const useAppStore = create<AppState>()(
     attachedFilesSnapshot?: Array<AttachedFile | string>;
     remoteFeishu?: FeishuRemoteContext;
     skipAutoPlanHydration?: boolean;
+    replyOptionSourceTurnId?: string;
+    selectedReplyOptionText?: string;
   }) => {
     let state = get();
     // If agent is waiting in pending_review, and this is NOT an approval action,
@@ -8237,8 +8366,9 @@ export const useAppStore = create<AppState>()(
             ? patchOrUpdater(baseState)
             : patchOrUpdater;
         if (!patch || typeof patch !== "object") return {};
-        const runtimePatch = pickSessionRuntimePatch(patch);
-        const globalPatch = active ? patch : {};
+        const normalizedPatch = normalizeTaskFlowPatchForConsumedReplyOptions(patch);
+        const runtimePatch = pickSessionRuntimePatch(normalizedPatch);
+        const globalPatch = active ? normalizedPatch : {};
         return {
           ...globalPatch,
           runtimeBySessionKey: {
@@ -8689,23 +8819,30 @@ export const useAppStore = create<AppState>()(
     }
 
     // 1. Push user message to visible taskFlow
+    const explicitReplyOptionSourceTurnId = !isHidden ? options?.replyOptionSourceTurnId : undefined;
+    const replyOptionArchiveTurnId = explicitReplyOptionSourceTurnId || (reuseCurrentTurn && currentTurnHasReplyOptions ? turnId : undefined);
     const shouldArchiveChoiceFeedback =
-      reuseCurrentTurn &&
       !isHidden &&
-      currentTurn?.status === "awaiting_input";
-    const selectedChoiceText = shouldArchiveChoiceFeedback ? text.trim() : "";
+      !!replyOptionArchiveTurnId;
+    const selectedChoiceText = shouldArchiveChoiceFeedback
+      ? String(options?.selectedReplyOptionText || text || "").trim()
+      : "";
     if (shouldArchiveChoiceFeedback) {
+      const archiveProbe = archiveReplyOptionBlocksForChoice(
+        sessionGet().taskFlow,
+        replyOptionArchiveTurnId,
+        selectedChoiceText,
+      );
       logStoreEvent("reply_options_archived", {
         turnId,
+        sourceTurnId: replyOptionArchiveTurnId ?? null,
         sessionKey: runSessionKey,
         workspace: runWorkspace || null,
         selectedChoiceChars: selectedChoiceText.length,
-        optionBlocks: sessionGet().taskFlow.filter((block) =>
-          block.turnId === turnId &&
-          block.type === "agent" &&
-          Array.isArray(block.options) &&
-          block.options.length > 0
-        ).length,
+        optionBlocks: archiveProbe.exactTurnOptionBlocks,
+        archivedOptionBlocks: archiveProbe.archivedCount,
+        selectedFallbackBlocks: archiveProbe.selectedFallbackBlocks,
+        matchMode: archiveProbe.matchMode,
       });
     }
     const userBlock: TaskBlock | null = isHidden
@@ -8722,20 +8859,11 @@ export const useAppStore = create<AppState>()(
       ...(userBlock
         ? (() => {
             const archivedTaskFlow = shouldArchiveChoiceFeedback
-              ? s.taskFlow.map((block) =>
-                  block.turnId === turnId &&
-                  block.type === "agent" &&
-                  Array.isArray(block.options) &&
-                  block.options.length > 0
-                    ? {
-                        ...block,
-                        options: undefined,
-                        archivedAfterChoice: true,
-                        ...(hasOperationApprovalReplyOption(block.options) ? { archivedProposal: true } : {}),
-                        ...(selectedChoiceText ? { selectedOption: selectedChoiceText } : {}),
-                      }
-                    : block,
-                )
+              ? archiveReplyOptionBlocksForChoice(
+                  s.taskFlow,
+                  replyOptionArchiveTurnId,
+                  selectedChoiceText,
+                ).taskFlow
               : s.taskFlow;
 
             return {
@@ -8776,23 +8904,14 @@ export const useAppStore = create<AppState>()(
                   ],
             };
         })()
-	        : reuseCurrentTurn
-	        ? {
-	            taskFlow: shouldArchiveChoiceFeedback
-	              ? s.taskFlow.map((block) =>
-                  block.turnId === turnId &&
-                  block.type === "agent" &&
-                  Array.isArray(block.options) &&
-                  block.options.length > 0
-                    ? {
-                        ...block,
-                        options: undefined,
-                        archivedAfterChoice: true,
-                        ...(hasOperationApprovalReplyOption(block.options) ? { archivedProposal: true } : {}),
-                        ...(selectedChoiceText ? { selectedOption: selectedChoiceText } : {}),
-                      }
-                    : block,
-                )
+        : reuseCurrentTurn
+        ? {
+            taskFlow: shouldArchiveChoiceFeedback
+              ? archiveReplyOptionBlocksForChoice(
+                  s.taskFlow,
+                  replyOptionArchiveTurnId,
+                  selectedChoiceText,
+                ).taskFlow
               : s.taskFlow,
             conversationTurns: s.conversationTurns.map((turn) =>
               turn.id === turnId
@@ -8806,10 +8925,10 @@ export const useAppStore = create<AppState>()(
                     pendingOperationProposal: applyOperationProposalChoice(turn.pendingOperationProposal, operationProposalChoiceAction),
                     mode: effectiveWorkflowMode,
                   }
-	                : turn
-		            ),
-		          }
-		        : {
+                : turn
+            ),
+          }
+        : {
 		            conversationTurns: [
 		              ...markParentPlanTurnDoneForExecution(autoCollapsePreviousTurnForNewTurn(s.conversationTurns).map((turn) =>
                     uiParentTurnId && turn.id === uiParentTurnId
