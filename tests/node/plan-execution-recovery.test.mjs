@@ -546,6 +546,9 @@ test("approved plan repeat-read guard pauses before max-iteration error", () => 
   );
   assert.match(orchestratorSource, /reason: "approved_plan_read_file_repeat_limit"/);
   assert.match(orchestratorSource, /const readFileRepeatLimitBatch = workflowMode === "edit"\s*\? summarizeReadFileRepeatLimitBatch\(allResults\)/);
+  assert.match(orchestratorSource, /activateExecuteRecovery\("mutation_first",\s*"read_file_repeat_limit_batch"/);
+  assert.match(orchestratorSource, /read_file_repeat_limit_recovery/);
+  assert.match(orchestratorSource, /pendingExecuteRecoveryPrompt = buildExecuteRecoveryPrompt\({[\s\S]*?reason: "read_file_repeat_limit_batch"/);
 });
 
 test("approved plan repeated edits route to validation recovery before pausing", () => {

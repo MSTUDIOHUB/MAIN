@@ -6266,12 +6266,12 @@ export class AgentOrchestrator {
                 sawExecuteOperationEvidence,
                 noProgressBatchRepeatCount,
                 minReadOnlyActivities: executeRecoveryMode === "normal"
-                  ? (config.activeProfile === "local" ? 24 : 8)
+                  ? (config.activeProfile === "local" ? 10 : 8)
                   : Infinity,
                 minCachedReadOnlyActivities: executeRecoveryMode === "normal"
-                  ? (config.activeProfile === "local" ? 14 : 3)
+                  ? (config.activeProfile === "local" ? 8 : 3)
                   : Infinity,
-                maxNoProgressReadOnlyRepeats: config.activeProfile === "local" ? 6 : 2,
+                maxNoProgressReadOnlyRepeats: config.activeProfile === "local" ? 4 : 2,
                 maxReadOnlyToolChars: config.activeProfile === "local" ? 100000 : 30000,
               })
             : { shouldRecover: false, reason: "", readOnlyActivityCount: 0, batchToolChars: 0 };
@@ -6672,40 +6672,72 @@ export class AgentOrchestrator {
           : null;
         if (readFileRepeatLimitBatch) {
           const language = callbacks.getPreferredLanguage();
-          const pauseNotice = buildReadFileRepeatLimitBatchPauseNotice({
-            language,
-            target: readFileRepeatLimitBatch.target,
-            total: readFileRepeatLimitBatch.total,
-            targetCount: readFileRepeatLimitBatch.targetCount,
-          });
-          logAgentEvent("loop_stop", {
-            reason: "read_file_repeat_limit_batch",
-            iteration,
-            target: readFileRepeatLimitBatch.target,
-            total: readFileRepeatLimitBatch.total,
-            targetCount: readFileRepeatLimitBatch.targetCount,
-          });
-          emitTaskOrchestratorPhase("PAUSED", {
-            reason: "read_file_repeat_limit_batch",
-            iteration,
-            repeatedTargets: [readFileRepeatLimitBatch.target],
-            remainingTask: language === "zh"
-              ? "复用已读文件上下文，改为修改、验证或说明阻塞。"
-              : "reuse cached file context and switch to patching, validation, or a blocker",
-          });
-          callbacks.onNonActionableStop(
-            pauseNotice,
-            "no_action",
-            {
-              repeatedTargets: [readFileRepeatLimitBatch.target],
-              recoveryReason: "read_file_repeat_limit_batch",
-              nextStep: language === "zh"
-                ? "复用缓存内容，转向 patch/验证/阻塞说明"
-                : "reuse cached context and pivot to patch/validation/blocker",
-            },
-          );
-          callbacks.onStatusChange("idle");
-          return;
+          const repeatedTargets = [readFileRepeatLimitBatch.target].filter(Boolean);
+          if (runtimeIntent === "execute" && executeRecoveryAttempts < 2) {
+            activateExecuteRecovery("mutation_first", "read_file_repeat_limit_batch", {
+              target: readFileRepeatLimitBatch.target,
+              total: readFileRepeatLimitBatch.total,
+              targetCount: readFileRepeatLimitBatch.targetCount,
+              repeatedTargets,
+            });
+            logAgentEvent("read_file_repeat_limit_recovery", {
+              iteration,
+              target: readFileRepeatLimitBatch.target,
+              total: readFileRepeatLimitBatch.total,
+              targetCount: readFileRepeatLimitBatch.targetCount,
+              executeRecoveryAttempts,
+            });
+            emitTaskOrchestratorPhase("EXECUTE_RECOVERY", {
+              reason: "read_file_repeat_limit_batch",
+              iteration,
+              repeatedTargets,
+              remainingTask: language === "zh"
+                ? "复用已读文件上下文，下一轮禁用重复读取并转向修改、命令/浏览器验证或明确阻塞。"
+                : "reuse cached file context; next step disables repeated reads and pivots to patching, command/browser validation, or a blocker",
+            });
+            pendingExecuteRecoveryPrompt = buildExecuteRecoveryPrompt({
+              language,
+              reason: "read_file_repeat_limit_batch",
+              mode: "mutation_first",
+              repeatedTargets,
+              recentActivity: recentToolActivity,
+            });
+          } else {
+            const pauseNotice = buildReadFileRepeatLimitBatchPauseNotice({
+              language,
+              target: readFileRepeatLimitBatch.target,
+              total: readFileRepeatLimitBatch.total,
+              targetCount: readFileRepeatLimitBatch.targetCount,
+            });
+            logAgentEvent("loop_stop", {
+              reason: "read_file_repeat_limit_batch",
+              iteration,
+              target: readFileRepeatLimitBatch.target,
+              total: readFileRepeatLimitBatch.total,
+              targetCount: readFileRepeatLimitBatch.targetCount,
+            });
+            emitTaskOrchestratorPhase("PAUSED", {
+              reason: "read_file_repeat_limit_batch",
+              iteration,
+              repeatedTargets,
+              remainingTask: language === "zh"
+                ? "复用已读文件上下文，改为修改、验证或说明阻塞。"
+                : "reuse cached file context and switch to patching, validation, or a blocker",
+            });
+            callbacks.onNonActionableStop(
+              pauseNotice,
+              "no_action",
+              {
+                repeatedTargets,
+                recoveryReason: "read_file_repeat_limit_batch",
+                nextStep: language === "zh"
+                  ? "复用缓存内容，转向 patch/验证/阻塞说明"
+                  : "reuse cached context and pivot to patch/validation/blocker",
+              },
+            );
+            callbacks.onStatusChange("idle");
+            return;
+          }
         }
         if (unityMcpFallbackPrompt) {
           callbacks.appendMessage({

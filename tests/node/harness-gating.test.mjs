@@ -63,6 +63,7 @@ function loadTranspiledModuleSync(sourcePath) {
 const {
   buildShellReadValidationError,
   isShellFileReadCommand,
+  buildNoProgressBatchSignature,
   buildLoopDetectionValidationError,
   buildReadBeforeModifyValidationError,
   summarizeReadFileRepeatLimitBatch,
@@ -257,6 +258,21 @@ test("read_file repeat-limit batches summarize into a pause signal", () => {
   );
 });
 
+test("run_command batches do not create no-progress signatures", () => {
+  const signature = buildNoProgressBatchSignature([
+    {
+      toolCallId: "call_run",
+      name: "run_command",
+      target: "npm run build",
+      content: JSON.stringify({ exitCode: 0, stdout: "built" }),
+      isError: false,
+      lifecycleState: "completed",
+    },
+  ]);
+
+  assert.equal(signature, "");
+});
+
 test("loop detection ignores repeated reads before the latest user message", () => {
   const readCall = (id) => ({
     id,
@@ -401,5 +417,4 @@ test("buildReadBeforeModifyValidationError recovers read evidence from message h
   assert.ok(resultFailed);
   assert.match(resultFailed.content, /READ_BEFORE_MODIFY_BLOCKED/);
 });
-
 

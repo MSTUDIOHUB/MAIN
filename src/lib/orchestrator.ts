@@ -1492,6 +1492,7 @@ export const PLAN_EXECUTE_CONVERGENCE_PROMPT_RATIO = 0.24;
 export const MAX_NO_PROGRESS_LOOP_REPEATS = 5;
 export const MAX_APPROVED_PLAN_NO_PROGRESS_RECOVERY_ATTEMPTS = 2;
 const NO_PROGRESS_EXCLUDED_TOOLS = new Set([
+  "run_command",
   "execute_command",
   "send_pty_input",
   "browser_evaluate",

@@ -19,6 +19,7 @@ export type TaskOrchestratorPhase =
   | "PLAN_MATERIALIZE"
   | "APPROVAL"
   | "EXECUTE_STEP"
+  | "EXECUTE_RECOVERY"
   | "EVIDENCE_RECONCILE"
   | "VERIFY"
   | "DONE"

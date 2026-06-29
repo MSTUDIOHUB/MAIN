@@ -249,6 +249,29 @@ test("read-only budget triggers execute recovery before max iterations", () => {
   assert.match(prompt, /不要把源码或完整文件粘贴到聊天 Markdown/);
 });
 
+test("local cached-read loop recovers before no-progress pause boundary", () => {
+  const recent = Array.from({ length: 8 }, (_value, index) => ({
+    name: "read_file",
+    status: "succeeded",
+    target: "src-tauri/src/main.rs",
+    detail: index === 0 ? "READ_FILE_RESULT" : "FILE_UNCHANGED_STUB: src-tauri/src/main.rs",
+  }));
+  const decision = resolveExecuteReadOnlyRecoveryTrigger({
+    results: [{ name: "read_file", target: "src-tauri/src/main.rs", content: "FILE_UNCHANGED_STUB", isError: false }],
+    recentActivity: recent,
+    readOnlyTools,
+    sawExecuteOperationEvidence: false,
+    noProgressBatchRepeatCount: 4,
+    minReadOnlyActivities: 10,
+    minCachedReadOnlyActivities: 8,
+    maxNoProgressReadOnlyRepeats: 4,
+  });
+
+  assert.equal(decision.shouldRecover, true);
+  assert.equal(decision.reason, "read_only_no_progress");
+  assert.deepEqual(summarizeRepeatedExecuteTargets(recent), ["src-tauri/src/main.rs"]);
+});
+
 test("chat read-only no-progress is eligible for final synthesis before max iterations", () => {
   const recent = [
     { name: "read_file", status: "succeeded", target: "src/App.tsx", detail: "READ_FILE_RESULT" },
