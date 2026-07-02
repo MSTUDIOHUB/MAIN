@@ -22,7 +22,10 @@ const INTERNAL_PROCESS_OPTION_RE = /(?:切换(?:到)?(?:执行|讨论|计划)模
 const PLAN_SUMMARY_HEADING_RE = /(?:方案总结|需求规格|设计方案|关键设计决策|设计决策|方案正文|计划摘要|方案摘要|requirements?|design|proposal|plan summary|design decisions?)/i;
 const PLAN_SUMMARY_ITEM_RE = /^(?:\*\*)?(?:技术栈|核心玩法|交互控制|交付物|架构|游戏循环|渲染|碰撞检测|执行顺序|关键设计决策|需求规格|设计方案|文件|模块|验证方式|测试方案|范围|目标|验收标准)(?:\*\*)?\s*[:：]/i;
 const DIAGNOSTIC_STATEMENT_OPTION_RE = /(?:问题可能|可能(?:是|在|出在)|看起来|似乎|应该是|原因(?:可能)?|被(?:自动)?(?:引入|加载|调用|覆盖)|已经(?:存在|完成|失败)|没有(?:被|正确)|is likely|likely due to|probably|seems? like|appears? to|was automatically|has been|is already)/i;
-const ACTIONABLE_OPTION_RE = /(?:^方案\s*[A-Z0-9一二三四五六七八九十]|^option\s*[A-Z0-9]|先|直接|继续|开始|执行|运行|批准|确认|选择|使用|改用|采用|切换|修复|修改|实现|重构|完善|生成|创建|删除|保留|跳过|我来|请|proceed|continue|start|run|execute|approve|confirm|choose|use|switch|fix|modify|implement|refactor|create|delete|skip)/i;
+const ACTIONABLE_OPTION_RE = /(?:^方案\s*[A-Z0-9一二三四五六七八九十]|^option\s*[A-Z0-9]|先|直接|继续|开始|执行|运行|批准|确认|选择|使用|改用|采用|切换|修复|修改|实现|重构|完善|生成|创建|删除|保留|跳过|我来|我要|请|proceed|continue|start|run|execute|approve|confirm|choose|use|switch|fix|modify|implement|refactor|create|delete|skip)/i;
+const DECISION_VALUE_OPTION_RE = /(?:[？?]$|是否|应该|需要基于|基于|字段|金额|状态为|差值|计算|\bfield\b|\bvalue\b|\bamount\b|\bcalculate\b)/i;
+const LABELED_REPORT_STATEMENT_RE = /^(?:\*\*)?(.{2,80}?)(?:\*\*)?\s*[:：]\s*(.+)$/;
+const USER_ACTION_START_RE = /^(?:请|先|直接|继续|开始|执行|运行|批准|确认|选择|使用|改用|采用|切换|修复|修改|实现|重构|完善|生成|创建|删除|保留|跳过|我要|我来|proceed|continue|start|run|execute|approve|confirm|choose|use|switch|fix|modify|implement|refactor|create|delete|skip)/i;
 const OPERATION_APPROVAL_REPLY_RE = /(?:批准|允许|同意).{0,16}(?:执行|操作|修改|修复|运行|写入)|(?:approve|allow).{0,24}(?:operation|execution|changes?|write|run)/i;
 const EXECUTABLE_PROPOSAL_CUE_RE = /(?:修复方案|实现方案|执行方案|改造方案|重构方案|落地方案|方案建议|建议方案|方案如下|执行步骤|实施步骤|下一步(?:可以|建议)?(?:执行|修复|修改|实现|落地)|是否(?:现在|立刻|开始|按上述方案)?(?:执行|修复|修改|实现|落地)|是否需要(?:我|MAIN)?(?:开始|继续)?(?:执行|修复|修改|实现)|要不要(?:开始|按方案)?(?:执行|修复|修改|实现)|proposed fix|fix plan|implementation plan|execution plan|proposal|next steps?.{0,24}(?:implement|execute|apply|fix|patch)|do you want me to.{0,24}(?:start|implement|execute|apply|fix|patch)|should I.{0,24}(?:start|implement|execute|apply|fix|patch)|ready to execute)/i;
 const OPERATION_CUE_RE = /(?:写入|修改|改动|更改|删除|创建|生成(?:文件|交付物)?|执行命令|运行命令|运行测试|部署|发布|提交|推送|Git|修复|实现|重构|落地|write|modify|edit|delete|create|generate|run command|execute command|run tests?|deploy|publish|commit|push|git|fix|implement|refactor|patch|ship)/i;
@@ -170,6 +173,21 @@ function looksLikeDiagnosticStatementOption(text: string): boolean {
   return DIAGNOSTIC_STATEMENT_OPTION_RE.test(normalized);
 }
 
+function looksLikeLabeledReportStatementOption(text: string): boolean {
+  const normalized = normalizeOptionText(text);
+  const match = normalized.match(LABELED_REPORT_STATEMENT_RE);
+  if (!match) return false;
+  const label = normalizeOptionText(match[1] || "").replace(/\*\*/g, "");
+  const body = normalizeOptionText(match[2] || "");
+  if (!label || !body) return false;
+  if (/^方案\s*[A-Z0-9一二三四五六七八九十]|^option\s*[A-Z0-9]/i.test(label)) return false;
+  if (USER_ACTION_START_RE.test(body)) return false;
+  return (
+    DIAGNOSTIC_STATEMENT_OPTION_RE.test(body) ||
+    /(?:这是一条|调试发现|审查发现|报告|诊断|当前问题|不是|负责|配置|状态|链路|命中判断|仍需要|需要继续|already|current issue|diagnostic|finding|report)/i.test(body)
+  );
+}
+
 function looksLikeActionableReplyOption(text: string, source?: ReplyOption["source"]): boolean {
   const normalized = normalizeOptionText(text);
   if (!normalized) return false;
@@ -180,7 +198,13 @@ function looksLikeActionableReplyOption(text: string, source?: ReplyOption["sour
       return false;
     }
     if (looksLikeDiagnosticStatementOption(normalized)) return false;
-    return true;
+    if (looksLikeLabeledReportStatementOption(normalized)) return false;
+    if (looksLikeExecuteReplyOption(normalized)) return true;
+    return (
+      ACTIONABLE_OPTION_RE.test(normalized) ||
+      DECISION_VALUE_OPTION_RE.test(normalized) ||
+      /^方案\s*[A-Z0-9一二三四五六七八九十][\s:：-]/i.test(normalized)
+    );
   }
   if (looksLikeExecuteReplyOption(normalized)) return true;
   if (looksLikeDiagnosticStatementOption(normalized)) return false;

@@ -2767,6 +2767,15 @@ function replyOptionMatchesSelectedText(replyOptions: ReplyOption[], selectedCho
   );
 }
 
+function findReplyOptionMatchingSelectedText(replyOptions: ReplyOption[], selectedChoiceText: string): ReplyOption | null {
+  const selected = selectedChoiceText.trim();
+  if (!selected) return null;
+  return replyOptions.find((option) =>
+    String(option.value || "").trim() === selected ||
+    String(option.label || "").trim() === selected
+  ) || null;
+}
+
 function archiveReplyOptionBlocksForChoice(
   taskFlow: TaskBlock[],
   turnId: string | undefined,
@@ -7283,11 +7292,18 @@ export const useAppStore = create<AppState>()(
     const previousTurnContinuationIntent = previousTurnContinuationTarget
       ? resolveConversationTurnIntent(previousTurnContinuationTarget)
       : null;
+    const selectedAwaitingChoice = text.trim();
+    const selectedAwaitingReplyOption = selectedAwaitingChoice
+      ? currentTurnReplyOptionBlocks
+          .flatMap((block) => block.options || [])
+          .find((option) => findReplyOptionMatchingSelectedText([option], selectedAwaitingChoice)) || null
+      : null;
     const shouldAutoResumeChoiceTurn =
       !isHidden &&
       options?.reuseCurrentTurn !== true &&
       !!currentTurn &&
-      (currentTurn.status === "awaiting_input" || currentTurnHasReplyOptions);
+      currentTurnHasReplyOptions &&
+      !!selectedAwaitingReplyOption;
     const shouldExplicitlyReuseCurrentTurn = options?.reuseCurrentTurn === true;
     const reusableTurnId = state.currentTurnId;
     const reuseCurrentTurn =
@@ -7298,18 +7314,6 @@ export const useAppStore = create<AppState>()(
       reuseCurrentTurn &&
       !!currentTurn &&
       (currentTurn.status === "awaiting_input" || currentTurnHasReplyOptions);
-    const awaitingChoiceBlocks = shouldReuseExistingTurnIntent
-      ? currentTurnReplyOptionBlocks
-      : [];
-    const selectedAwaitingChoice = text.trim();
-    const selectedAwaitingReplyOption = selectedAwaitingChoice
-      ? awaitingChoiceBlocks
-          .flatMap((block) => block.options || [])
-          .find((option) =>
-            option.value === selectedAwaitingChoice ||
-            option.label === selectedAwaitingChoice
-          ) || null
-      : null;
     const shouldExecuteOnceFromReplyOption =
       selectedAwaitingReplyOption?.action === "execute_once" ||
       selectedAwaitingReplyOption?.action === "approve_operation_once";
@@ -7554,7 +7558,7 @@ export const useAppStore = create<AppState>()(
       lockedComposerIntent ||
       (shouldContinuePlanIntent ? "plan" : null) ||
       (shouldContinuePreviousTurnIntent && previousTurnContinuationIntent ? previousTurnContinuationIntent : null) ||
-      ((preservePlanState || shouldReuseExistingTurnIntent)
+      (shouldReuseExistingTurnIntent
         ? currentTurnIntent
         : resolveRunIntentFromLegacyWorkflowMode(state.config.workflowMode));
     let effectiveIntentSummary = normalizeIntentSummary(options?.intentSummary || "");
@@ -8820,7 +8824,8 @@ export const useAppStore = create<AppState>()(
 
     // 1. Push user message to visible taskFlow
     const explicitReplyOptionSourceTurnId = !isHidden ? options?.replyOptionSourceTurnId : undefined;
-    const replyOptionArchiveTurnId = explicitReplyOptionSourceTurnId || (reuseCurrentTurn && currentTurnHasReplyOptions ? turnId : undefined);
+    const replyOptionArchiveTurnId = explicitReplyOptionSourceTurnId ||
+      ((shouldExplicitlyReuseCurrentTurn || shouldAutoResumeChoiceTurn) && currentTurnHasReplyOptions ? turnId : undefined);
     const shouldArchiveChoiceFeedback =
       !isHidden &&
       !!replyOptionArchiveTurnId;

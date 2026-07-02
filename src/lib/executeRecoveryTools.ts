@@ -58,6 +58,8 @@ export const EXECUTE_RECOVERY_MUTATION_FIRST_TOOLS = new Set([
   ...EXECUTE_RECOVERY_VALIDATION_TOOLS,
 ]);
 
+const READ_ONLY_NO_PROGRESS_DETAIL_RE = /FILE_UNCHANGED_STUB|CACHED_FILE_REPLAY|Repeated read-only tool call skipped|READ_FILE_REPEAT_LIMIT|READ_ONLY_REPEAT_LIMIT|already called with identical arguments|already been read with the same range|already covered by unchanged earlier read_file results|Covered read windows already in context|READ_FILE_WINDOW_NARROWED|overlapping unchanged lines already in context/i;
+
 export function normalizeExecuteRecoveryMode(value: unknown): ExecuteRecoveryMode {
   return value === "mutation_first" ||
     value === "action_plus_targeting" ||
@@ -145,6 +147,39 @@ export function countRecentReadOnlyActivities(
     .length;
 }
 
+export function isReadOnlyNoProgressDetail(value: string | undefined): boolean {
+  return READ_ONLY_NO_PROGRESS_DETAIL_RE.test(String(value || ""));
+}
+
+export function countRecentCachedReadOnlyActivities(
+  recentActivity: ExecuteRecoveryActivityLike[],
+  readOnlyTools: Set<string>,
+): number {
+  return recentActivity
+    .filter((activity) =>
+      activity.status === "succeeded" &&
+      readOnlyTools.has(String(activity.name || "")) &&
+      isReadOnlyNoProgressDetail(activity.detail)
+    )
+    .length;
+}
+
+export function getMaxRepeatedReadOnlyTargetScore(
+  recentActivity: ExecuteRecoveryActivityLike[],
+  readOnlyTools: Set<string>,
+): number {
+  const counts = new Map<string, number>();
+  for (const activity of recentActivity) {
+    if (activity.status !== "succeeded") continue;
+    if (!readOnlyTools.has(String(activity.name || ""))) continue;
+    const target = String(activity.target || "").trim();
+    if (!target) continue;
+    const cachedWeight = isReadOnlyNoProgressDetail(activity.detail) ? 2 : 1;
+    counts.set(target, (counts.get(target) || 0) + cachedWeight);
+  }
+  return Math.max(0, ...counts.values());
+}
+
 export function summarizeRepeatedExecuteTargets(
   recentActivity: ExecuteRecoveryActivityLike[],
   maxTargets = 4,
@@ -153,7 +188,7 @@ export function summarizeRepeatedExecuteTargets(
   for (const activity of recentActivity) {
     const target = String(activity.target || "").trim();
     if (!target) continue;
-    const cachedWeight = /FILE_UNCHANGED_STUB|Repeated read-only tool call skipped|READ_FILE_REPEAT_LIMIT/i.test(activity.detail || "") ? 2 : 1;
+    const cachedWeight = isReadOnlyNoProgressDetail(activity.detail) ? 2 : 1;
     counts.set(target, (counts.get(target) || 0) + cachedWeight);
   }
   return [...counts.entries()]
@@ -187,43 +222,60 @@ export function resolveReadOnlyNoProgressTrigger(input: {
   currentBatchToolChars?: number;
   minReadOnlyActivities?: number;
   minCachedReadOnlyActivities?: number;
+  minRepeatedReadOnlyTargetScore?: number;
   maxNoProgressReadOnlyRepeats?: number;
   maxReadOnlyToolChars?: number;
-}): { shouldRecover: boolean; reason: string; readOnlyActivityCount: number; batchToolChars: number } {
+}): { shouldRecover: boolean; reason: string; readOnlyActivityCount: number; batchToolChars: number; cachedReadOnlyActivityCount: number; repeatedReadOnlyTargetScore: number } {
   const readOnlyActivityCount = countRecentReadOnlyActivities(input.recentActivity, input.readOnlyTools);
+  const cachedReadOnlyActivityCount = countRecentCachedReadOnlyActivities(input.recentActivity, input.readOnlyTools);
+  const repeatedReadOnlyTargetScore = getMaxRepeatedReadOnlyTargetScore(input.recentActivity, input.readOnlyTools);
   const batchToolChars = input.currentBatchToolChars ?? countExecuteBatchToolContentChars(input.results);
   if (input.sawExecuteOperationEvidence) {
-    return { shouldRecover: false, reason: "", readOnlyActivityCount, batchToolChars };
+    return { shouldRecover: false, reason: "", readOnlyActivityCount, batchToolChars, cachedReadOnlyActivityCount, repeatedReadOnlyTargetScore };
   }
   if (!isExecuteReadOnlyOnlyBatch(input.results, input.readOnlyTools)) {
-    return { shouldRecover: false, reason: "", readOnlyActivityCount, batchToolChars };
+    return { shouldRecover: false, reason: "", readOnlyActivityCount, batchToolChars, cachedReadOnlyActivityCount, repeatedReadOnlyTargetScore };
   }
 
   const repeatLimit = input.maxNoProgressReadOnlyRepeats ?? 2;
   if ((input.noProgressBatchRepeatCount ?? 0) >= repeatLimit) {
-    return { shouldRecover: true, reason: "read_only_no_progress", readOnlyActivityCount, batchToolChars };
+    return { shouldRecover: true, reason: "read_only_no_progress", readOnlyActivityCount, batchToolChars, cachedReadOnlyActivityCount, repeatedReadOnlyTargetScore };
+  }
+
+  const repeatedTargetLimit = input.minRepeatedReadOnlyTargetScore ?? 6;
+  if (repeatedReadOnlyTargetScore >= repeatedTargetLimit) {
+    return { shouldRecover: true, reason: "target_repeated_read_only", readOnlyActivityCount, batchToolChars, cachedReadOnlyActivityCount, repeatedReadOnlyTargetScore };
   }
 
   const readLimit = input.minReadOnlyActivities ?? 8;
   if (readOnlyActivityCount >= readLimit) {
-    return { shouldRecover: true, reason: "read_only_budget_exhausted", readOnlyActivityCount, batchToolChars };
+    return { shouldRecover: true, reason: "read_only_budget_exhausted", readOnlyActivityCount, batchToolChars, cachedReadOnlyActivityCount, repeatedReadOnlyTargetScore };
   }
 
   const charLimit = input.maxReadOnlyToolChars ?? 30_000;
   if (batchToolChars >= charLimit) {
-    return { shouldRecover: true, reason: "read_only_tool_chars_exhausted", readOnlyActivityCount, batchToolChars };
+    return { shouldRecover: true, reason: "read_only_tool_chars_exhausted", readOnlyActivityCount, batchToolChars, cachedReadOnlyActivityCount, repeatedReadOnlyTargetScore };
   }
 
   const visibleResults = input.results.filter((result) => !result.internalFeedback && !result.isError);
   const allSuccessfulReadsAreCached = visibleResults.length > 0 && visibleResults.every((result) =>
-    /FILE_UNCHANGED_STUB|Repeated read-only tool call skipped|READ_FILE_REPEAT_LIMIT/i.test(String(result.displayContent || result.content || ""))
+    isReadOnlyNoProgressDetail(String(result.displayContent || result.content || ""))
+  );
+  const currentBatchHasCachedReadOnly = visibleResults.some((result) =>
+    isReadOnlyNoProgressDetail(String(result.displayContent || result.content || ""))
   );
   const cachedReadLimit = input.minCachedReadOnlyActivities ?? 0;
-  if (allSuccessfulReadsAreCached && readOnlyActivityCount >= cachedReadLimit) {
-    return { shouldRecover: true, reason: "repeated_cached_read", readOnlyActivityCount, batchToolChars };
+  if (
+    allSuccessfulReadsAreCached &&
+    readOnlyActivityCount >= cachedReadLimit
+  ) {
+    return { shouldRecover: true, reason: "repeated_cached_read", readOnlyActivityCount, batchToolChars, cachedReadOnlyActivityCount, repeatedReadOnlyTargetScore };
+  }
+  if (currentBatchHasCachedReadOnly && cachedReadOnlyActivityCount >= cachedReadLimit) {
+    return { shouldRecover: true, reason: "repeated_cached_read", readOnlyActivityCount, batchToolChars, cachedReadOnlyActivityCount, repeatedReadOnlyTargetScore };
   }
 
-  return { shouldRecover: false, reason: "", readOnlyActivityCount, batchToolChars };
+  return { shouldRecover: false, reason: "", readOnlyActivityCount, batchToolChars, cachedReadOnlyActivityCount, repeatedReadOnlyTargetScore };
 }
 
 export function resolveExecuteReadOnlyRecoveryTrigger(input: Parameters<typeof resolveReadOnlyNoProgressTrigger>[0]) {

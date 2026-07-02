@@ -554,6 +554,51 @@ test("execute recovery does not trigger on a single cached read when minCachedRe
   assert.equal(decision.shouldRecover, false);
 });
 
+test("execute recovery detects cached reads across changing batch signatures", () => {
+  const recent = [
+    { name: "read_file", status: "succeeded", target: "src/App.tsx", detail: "FILE_UNCHANGED_STUB: src/App.tsx" },
+    { name: "read_file", status: "succeeded", target: "src/lib/router.ts", detail: "READ_ONLY_REPEAT_LIMIT: duplicate read" },
+    { name: "read_file", status: "succeeded", target: "src/store/useAppStore.ts", detail: "CACHED_FILE_REPLAY: unchanged file replay" },
+  ];
+  const decision = resolveExecuteReadOnlyRecoveryTrigger({
+    results: [{ name: "read_file", target: "src/store/useAppStore.ts", content: "CACHED_FILE_REPLAY: unchanged file replay", isError: false }],
+    recentActivity: recent,
+    readOnlyTools,
+    sawExecuteOperationEvidence: false,
+    noProgressBatchRepeatCount: 1,
+    minReadOnlyActivities: 99,
+    minCachedReadOnlyActivities: 3,
+    minRepeatedReadOnlyTargetScore: 99,
+  });
+
+  assert.equal(decision.shouldRecover, true);
+  assert.equal(decision.reason, "repeated_cached_read");
+  assert.equal(decision.cachedReadOnlyActivityCount, 3);
+});
+
+test("execute recovery treats covered-window reads on the same target as no progress", () => {
+  const recent = [
+    { name: "read_file", status: "succeeded", target: "src/lib/orchestrator/loop/AgentOrchestrator.ts", detail: "READ_FILE_RESULT lines 1-120" },
+    { name: "read_file", status: "succeeded", target: "src/lib/orchestrator/loop/AgentOrchestrator.ts", detail: "READ_FILE_WINDOW_NARROWED: overlapping unchanged lines already in context" },
+    { name: "read_file", status: "succeeded", target: "src/lib/orchestrator/loop/AgentOrchestrator.ts", detail: "FILE_UNCHANGED_STUB: requested window is already covered by unchanged earlier read_file results" },
+    { name: "read_file", status: "succeeded", target: "src/lib/orchestrator/loop/AgentOrchestrator.ts", detail: "READ_FILE_RESULT lines 300-340" },
+  ];
+  const decision = resolveExecuteReadOnlyRecoveryTrigger({
+    results: [{ name: "read_file", target: "src/lib/orchestrator/loop/AgentOrchestrator.ts", content: "READ_FILE_RESULT lines 300-340", isError: false }],
+    recentActivity: recent,
+    readOnlyTools,
+    sawExecuteOperationEvidence: false,
+    noProgressBatchRepeatCount: 1,
+    minReadOnlyActivities: 99,
+    minCachedReadOnlyActivities: 99,
+    minRepeatedReadOnlyTargetScore: 6,
+  });
+
+  assert.equal(decision.shouldRecover, true);
+  assert.equal(decision.reason, "target_repeated_read_only");
+  assert.equal(decision.repeatedReadOnlyTargetScore >= 6, true);
+});
+
 test("targeting search recovery opens read_file path to see context", () => {
   const recent = [
     { name: "grep_search", status: "succeeded", target: "Order", detail: "Order" },

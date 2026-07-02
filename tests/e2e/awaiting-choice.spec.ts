@@ -98,6 +98,37 @@ test("custom reply option continues within the same turn", async ({ page }) => {
   await expect(page.getByText(/已按你的选择继续/)).toBeVisible();
 });
 
+test("ordinary composer command creates a new turn instead of consuming stale reply options", async ({ page }) => {
+  await page.goto("/?e2eScenario=awaiting-choice");
+
+  await expect(page.getByTestId("execution-capsule-awaiting-choice")).toBeVisible();
+
+  const command = "首先执行P0的重构，如果有任何不确定的方向请向我提问。";
+  await page.getByTestId("composer-textarea").fill(command);
+  await page.getByTestId("composer-send-button").click();
+
+  await expect
+    .poll(async () =>
+      page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().conversationTurns ?? -1),
+    )
+    .toBe(2);
+
+  await expect
+    .poll(async () =>
+      page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().visibleConversationTurns ?? []),
+    )
+    .toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "e2e-awaiting-choice-turn", status: "awaiting_input" }),
+      expect.objectContaining({ displayIntent: "execute" }),
+    ]));
+
+  await expect
+    .poll(async () =>
+      page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().selectedOptions ?? []),
+    )
+    .toEqual([]);
+});
+
 test("mixed choice options keep execution choices together and split read-only permissions", async ({ page }) => {
   await page.goto("/?e2eScenario=awaiting-choice-mixed-options");
 

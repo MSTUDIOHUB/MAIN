@@ -283,6 +283,20 @@ test("extractReplyOptions ignores plan summary bullets after proposal headings",
   assert.equal(result.replyOptions.length, 0);
 });
 
+test("extractReplyOptions does not infer choices from review report bullet lists", () => {
+  const result = extractReplyOptions(`
+请选择你想先查看的审查重点：
+
+1. **碰撞检测在 TargetController 中**：目标控制器已经负责命中判断，当前问题不是缺少按钮选择。
+2. **武器粘住后跟随旋转**：这是一条调试发现，不是用户可执行分支。
+3. **武器之间无碰撞**：物理层配置看起来已经存在，需要继续验证。
+4. **番茄被击中后**：状态更新链路可能仍需要代码审查。
+  `);
+
+  assert.equal(result.replyOptions.length, 0);
+  assert.match(result.cleanText, /碰撞检测在 TargetController 中/);
+});
+
 test("extractReplyOptions filters internal plan artifact creation pseudo choices", () => {
   const explicitPathResult = extractReplyOptions(`
 选择下一步：

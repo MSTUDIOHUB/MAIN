@@ -326,6 +326,7 @@ export class AgentOrchestrator {
           toolCount: status.toolCount,
           category: status.category,
           httpStatus: status.httpStatus,
+          cached: status.cached === true,
         })),
         });
         const mcpRoutingResult = routeMcpToolsForPrompt({
@@ -7426,6 +7427,15 @@ export async function executeAgentLoop(callbacks: OrchestratorCallbacks, abortCo
     };
     const wrappedCallbacks: OrchestratorCallbacks = {
         ...callbacks,
+        onAssistantFinalText: (text, replyOptions = [], meta) => {
+            if (meta?.awaitingInput === true && replyOptions.length > 0) {
+                setOutcome({ status: "paused", reason: "awaiting_user_choice" });
+                logAgentEvent("agent_loop_awaiting_user_choice", {
+                    replyOptions: replyOptions.length,
+                });
+            }
+            callbacks.onAssistantFinalText(text, replyOptions, meta);
+        },
         onNonActionableStop: (message, reason, progress) => {
             const status: AgentLoopOutcome["status"] =
                 reason === "no_output" ? "stopped_no_output" :

@@ -87,6 +87,14 @@ export interface MCPServerStatusSnapshot {
   category?: MCPDiagnosticCategory;
   message?: string;
   httpStatus?: number;
+  cached?: boolean;
+}
+
+export interface DiscoverAllMcpToolsOptions {
+  forceRefresh?: boolean;
+  useFailureBackoff?: boolean;
+  failureBackoffMs?: number;
+  nowMs?: number;
 }
 
 class MCPRequestError extends Error {
@@ -120,6 +128,12 @@ class MCPRequestError extends Error {
 let rpcIdCounter = 0;
 let invokePromise: Promise<InvokeFn | null> | null = null;
 const mcpSessions = new Map<string, McpSessionState>();
+const MCP_DISCOVERY_FAILURE_BACKOFF_MS = 60_000;
+const MCP_DISCOVERY_FAILURE_BACKOFF_CATEGORIES = new Set<MCPDiagnosticCategory>([
+  "unreachable",
+  "invalid_response",
+]);
+const mcpDiscoveryFailureCache = new Map<string, { snapshot: MCPServerStatusSnapshot; expiresAt: number }>();
 
 let toolServerMap: Record<string, string> = {};
 
@@ -137,6 +151,58 @@ export function isMcpTool(name: string): boolean {
 
 export function getMcpServerUrl(toolName: string): string | undefined {
   return toolServerMap[toolName];
+}
+
+export function __setMcpInvokeForTests(invoke: InvokeFn | null): void {
+  invokePromise = Promise.resolve(invoke);
+}
+
+export function __clearMcpDiscoveryFailureCacheForTests(): void {
+  mcpDiscoveryFailureCache.clear();
+  mcpSessions.clear();
+  rpcIdCounter = 0;
+}
+
+function getMcpDiscoveryFailureCacheKey(server: MCPServer): string {
+  return `${server.name}\u0000${server.url}`;
+}
+
+function cloneMcpStatusSnapshot(snapshot: MCPServerStatusSnapshot, cached: boolean): MCPServerStatusSnapshot {
+  return { ...snapshot, cached };
+}
+
+function getCachedMcpDiscoveryFailure(
+  server: MCPServer,
+  options: DiscoverAllMcpToolsOptions,
+): MCPServerStatusSnapshot | null {
+  if (options.forceRefresh === true || options.useFailureBackoff === false) return null;
+  const key = getMcpDiscoveryFailureCacheKey(server);
+  const entry = mcpDiscoveryFailureCache.get(key);
+  const now = options.nowMs ?? Date.now();
+  if (!entry || entry.expiresAt <= now) {
+    if (entry) mcpDiscoveryFailureCache.delete(key);
+    return null;
+  }
+  return cloneMcpStatusSnapshot(entry.snapshot, true);
+}
+
+function rememberMcpDiscoveryFailure(
+  server: MCPServer,
+  snapshot: MCPServerStatusSnapshot,
+  options: DiscoverAllMcpToolsOptions,
+): void {
+  if (options.useFailureBackoff === false) return;
+  const key = getMcpDiscoveryFailureCacheKey(server);
+  if (!snapshot.category || !MCP_DISCOVERY_FAILURE_BACKOFF_CATEGORIES.has(snapshot.category)) {
+    mcpDiscoveryFailureCache.delete(key);
+    return;
+  }
+  const ttl = Math.max(0, options.failureBackoffMs ?? MCP_DISCOVERY_FAILURE_BACKOFF_MS);
+  if (ttl <= 0) return;
+  mcpDiscoveryFailureCache.set(key, {
+    snapshot: cloneMcpStatusSnapshot(snapshot, false),
+    expiresAt: (options.nowMs ?? Date.now()) + ttl,
+  });
 }
 
 function getSession(url: string): McpSessionState {
@@ -502,6 +568,7 @@ export async function testMcpServer(server: MCPServer): Promise<MCPServerTestRes
 
 export async function discoverAllMcpTools(
   servers: MCPServer[],
+  options: DiscoverAllMcpToolsOptions = {},
 ): Promise<{
   tools: MCPTool[];
   toolServerMap: Record<string, string>;
@@ -516,6 +583,7 @@ export async function discoverAllMcpTools(
   const results = await Promise.allSettled(
     httpServers.map(async (server) => {
       if (server.enabled === false) {
+        mcpDiscoveryFailureCache.delete(getMcpDiscoveryFailureCacheKey(server));
         statusSnapshots.push({
           serverName: server.name,
           url: server.url,
@@ -527,8 +595,14 @@ export async function discoverAllMcpTools(
         });
         return;
       }
+      const cachedFailure = getCachedMcpDiscoveryFailure(server, options);
+      if (cachedFailure) {
+        statusSnapshots.push(cachedFailure);
+        return;
+      }
       try {
         const tools = await discoverMcpTools(server);
+        mcpDiscoveryFailureCache.delete(getMcpDiscoveryFailureCacheKey(server));
         for (const tool of tools) {
           allTools.push(tool);
           map[tool.name] = server.url;
@@ -546,7 +620,7 @@ export async function discoverAllMcpTools(
         });
       } catch (err) {
         const diagnostic = toMcpDiagnostic(err);
-        statusSnapshots.push({
+        const failureSnapshot: MCPServerStatusSnapshot = {
           serverName: server.name,
           url: server.url,
           enabled: true,
@@ -555,7 +629,9 @@ export async function discoverAllMcpTools(
           category: diagnostic.category,
           message: diagnostic.message,
           httpStatus: diagnostic.status,
-        });
+        };
+        statusSnapshots.push(failureSnapshot);
+        rememberMcpDiscoveryFailure(server, failureSnapshot, options);
         console.warn(`[MCP] Failed to discover tools from ${server.name} (${server.url}): ${diagnostic.message}`);
         console.warn("[MCP] Discovery diagnostics", {
           server: server.name,

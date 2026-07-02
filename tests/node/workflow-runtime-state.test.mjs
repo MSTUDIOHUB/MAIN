@@ -135,6 +135,9 @@ test("explicit reply options mark assistant text as awaiting input even when too
   const orchestratorSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8");
 
   assert.match(orchestratorSource, /awaitingInput:\s*shouldPauseForUserChoice/);
+  assert.match(orchestratorSource, /onAssistantFinalText: \(text, replyOptions = \[\], meta\) =>/);
+  assert.match(orchestratorSource, /status: "paused", reason: "awaiting_user_choice"/);
+  assert.match(orchestratorSource, /agent_loop_awaiting_user_choice/);
   assert.match(workflowEngine, /const awaitingInput = meta\?\.awaitingInput === true && replyOptions\.length > 0/);
   assert.match(workflowEngine, /status:\s*"awaiting_input"/);
   assert.match(workflowEngine, /agentStatus:\s*"idle"[\s\S]*?isGenerating:\s*false/);
@@ -159,6 +162,36 @@ test("agent loop blocks execute completion without execution evidence", () => {
   assert.match(orchestrator, /"noOp"\\s\*:\\s\*true\|NO_EFFECT_MUTATION/);
   assert.match(workflowEngine, /getExecutionConsentGranted/);
   assert.match(workflowEngine, /currentTurnExecutionConsent/);
+});
+
+test("ordinary composer sends only reuse awaiting-choice turns on exact option match", () => {
+  const storeSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/useAppStore.ts"), "utf8");
+
+  assert.match(storeSource, /function findReplyOptionMatchingSelectedText/);
+  assert.match(
+    storeSource,
+    /const selectedAwaitingReplyOption = selectedAwaitingChoice[\s\S]*?findReplyOptionMatchingSelectedText/,
+  );
+  assert.match(
+    storeSource,
+    /const shouldAutoResumeChoiceTurn =[\s\S]*?currentTurnHasReplyOptions &&[\s\S]*?!!selectedAwaitingReplyOption;/,
+  );
+  assert.doesNotMatch(
+    storeSource,
+    /const shouldAutoResumeChoiceTurn =[\s\S]{0,260}\(currentTurn\.status === "awaiting_input" \|\| currentTurnHasReplyOptions\)/,
+  );
+  assert.match(
+    storeSource,
+    /\(shouldExplicitlyReuseCurrentTurn \|\| shouldAutoResumeChoiceTurn\) && currentTurnHasReplyOptions \? turnId : undefined/,
+  );
+  assert.match(
+    storeSource,
+    /\(shouldReuseExistingTurnIntent\s*\? currentTurnIntent\s*:\s*resolveRunIntentFromLegacyWorkflowMode/,
+  );
+  assert.doesNotMatch(
+    storeSource,
+    /\(\(preservePlanState \|\| shouldReuseExistingTurnIntent\)[\s\S]{0,120}\? currentTurnIntent/,
+  );
 });
 
 test("debug log compacts repeated prompt and tool payloads instead of storing raw blobs", () => {

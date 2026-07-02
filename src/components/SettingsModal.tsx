@@ -697,7 +697,7 @@ function McpServerPanel({
     setIsDiscovering(true);
     setDiscoverMsg(null);
     try {
-      const { tools, toolServerMap } = await discoverAllMcpTools(mcpServers);
+      const { tools, toolServerMap } = await discoverAllMcpTools(mcpServers, { forceRefresh: true });
       setMcpDiscoveredTools(tools, toolServerMap);
       setMcpToolServerMap(toolServerMap);
       if (tools.length > 0) {
