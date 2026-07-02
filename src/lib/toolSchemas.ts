@@ -683,7 +683,8 @@ export function mcpToToolDefinition(tool: MCPTool): ToolDefinition | null {
 }
 
 /**
- * Build the merged tool definitions array: built-in tools + active skill tools + MCP tools.
+ * Build the merged tool definitions array: MCP tools (first) + built-in tools + active skill tools.
+ * Placing MCP tools first ensures LLM tool callers prioritize MCP capabilities when active.
  */
 export function buildToolDefinitions(skills: Skill[], mcpTools?: MCPTool[]): ToolDefinition[] {
   const skillTools = skills
@@ -695,5 +696,5 @@ export function buildToolDefinitions(skills: Skill[], mcpTools?: MCPTool[]): Too
     .map(mcpToToolDefinition)
     .filter((td): td is ToolDefinition => td !== null);
 
-  return normalizeToolDefinitions([...TOOL_DEFINITIONS, ...skillTools, ...mcpToolDefs]);
+  return normalizeToolDefinitions([...mcpToolDefs, ...TOOL_DEFINITIONS, ...skillTools]);
 }

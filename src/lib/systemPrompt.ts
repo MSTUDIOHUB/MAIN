@@ -641,19 +641,24 @@ export function buildSystemPrompt(
     mcpPriorityContext?.unityMcpFirst ? "unity" : null
   );
   const mcpPriorityEngineName = formatPromptEngineName(mcpPriorityEngine);
-  if (mcpPriorityContext?.gameStudioMcpFirst || mcpPriorityContext?.unityMcpFirst) {
+  const hasConnectedMcpServers = (mcpPriorityContext?.connectedServerNames?.length ?? 0) > 0;
+  if (mcpPriorityContext?.gameStudioMcpFirst || mcpPriorityContext?.unityMcpFirst || hasConnectedMcpServers) {
     parts.push([
       "================================",
-      "[ENGINE MCP PRIORITY]",
-      `gameStudioMcpFirst: ${mcpPriorityContext.gameStudioMcpFirst ? "true" : "false"}`,
+      "[MCP TOOL PRIORITY & FALLBACK POLICY]",
+      `gameStudioMcpFirst: ${mcpPriorityContext?.gameStudioMcpFirst ? "true" : "false"}`,
       mcpPriorityEngine ? `engine: ${mcpPriorityEngine}` : "",
       mcpPriorityEngine === "unity"
-        ? `unityConsoleFirst: ${mcpPriorityContext.unityConsoleFirst ? "true" : "false"}`
+        ? `unityConsoleFirst: ${mcpPriorityContext?.unityConsoleFirst ? "true" : "false"}`
         : "",
-      mcpPriorityContext.connectedServerNames?.length
-        ? `connectedEngineMcpServers: ${mcpPriorityContext.connectedServerNames.join(", ")}`
+      hasConnectedMcpServers
+        ? `connectedMcpServers: ${mcpPriorityContext?.connectedServerNames?.join(", ")}`
         : "",
-      `For ${mcpPriorityEngineName} requests in this turn, prioritize matching engine MCP/editor tools before local workspace scan tools when those tools are listed.`,
+      "【MCP 优先原则】：当前已开启并连通 MCP 服务。对于所有属于 MCP 范围或可使用 MCP 解决的指令，你必须优先判断并使用 MCP 提供的工具，而不是直接使用通用本地文件扫描或 shell 脚本。",
+      "【平滑降级与防死循环】：如果 MCP 工具调用提示连接故障或未开启，自动平滑切回 MAIN 原生工具；如果 MCP 工具返回参数缺失或错误，禁止以相同非法参数重复重试，请诊断问题或切换降级策略。",
+      mcpPriorityEngine
+        ? `For ${mcpPriorityEngineName} requests in this turn, prioritize matching engine MCP/editor tools before local workspace scan tools when those tools are listed.`
+        : "",
       "Use engine MCP tools for live editor state, scene/level inspection, asset/resource queries, diagnostics, build/export/package operations, and editor actions before falling back to raw files.",
       mcpPriorityEngine === "unity"
         ? "For Unity C# edits, prefer script_apply_edits. Use apply_text_edits only for precise coordinate patches with precondition SHA."
@@ -665,7 +670,7 @@ export function buildSystemPrompt(
         ? "For Unreal work, inspect levels, actors, assets, Blueprints, C++ diagnostics, and Output Log with Unreal MCP/editor tools when available before editing project files."
         : "",
       "Do not start with get_project_skeleton or local log file scanning when a relevant engine MCP tool is available for the requested state.",
-      mcpPriorityEngine === "unity" && mcpPriorityContext.unityConsoleFirst
+      mcpPriorityEngine === "unity" && mcpPriorityContext?.unityConsoleFirst
         ? "This request is a Unity console diagnostics task: call read_console first (set_active_instance when required) before any other investigation path."
         : "",
     ].filter(Boolean).join("\n"));

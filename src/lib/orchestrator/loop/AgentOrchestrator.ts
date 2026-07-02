@@ -607,15 +607,7 @@ export class AgentOrchestrator {
                     engine: mcpPriorityEngine,
                     unityConsoleFirst: unityMcpFirstPhaseActive && unityConsoleDiagnosticsRequested,
                     connectedServerNames: mcpServerStatuses
-                      .filter((status) =>
-                        status.status === "connected" &&
-                        !!mcpPriorityEngine &&
-                        (
-                          preferredGameStudioMcpServerUrls.length > 0
-                            ? isGameEngineLikelyServer({ name: status.serverName, url: status.url }, mcpPriorityEngine)
-                            : connectedMcpServerUrls.has(status.url)
-                        )
-                      )
+                      .filter((status) => status.status === "connected")
                       .map((status) => status.serverName),
                   },
                   {
