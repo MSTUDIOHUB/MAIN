@@ -734,6 +734,8 @@ export class AgentOrchestrator {
 
         callbacks.onStatusChange("running");
         let iteration = 0;
+        // Cross-iteration read_file loop detection
+        const crossIterationFileReads = new Map<string, number>();
         let consecutiveNoToolCount = 0;
         let consecutiveEmptyResponseCount = 0;
         let emptyResponseCountThisTurn = 0;
@@ -3878,6 +3880,14 @@ export class AgentOrchestrator {
         const assistantHistoryText = serializeAssistantReplyForHistory(historyAssistantText, finalReplyOptions);
         const hasMeaningfulVisibleText = visibleAssistantText.trim().length > 0;
         const wasTruncated = normalized.finishReason === "length";
+        // P0: Append truncation diagnostic so model knows context is near limit
+        if (wasTruncated && normalized.replyOptions.length === 0 && effectiveToolCalls.length === 0) {
+          const diagMsg = callbacks.getPreferredLanguage() === "zh"
+            ? `[System: 上一条回复因长度被截断。上下文可能已接近上限。请基于已有上下文直接行动，不要输出长段落或重复读取文件。如果已掌握足够信息，直接执行写入、验证或给出最终结论。]`
+            : `[System: Response was truncated due to length. Context is likely near the limit. Act on what you already know — do not output long prose or re-read files. If you have enough information, execute writes, run validation, or give the final conclusion now.]`;
+          callbacks.appendMessage({ role: "system", content: diagMsg });
+        }
+
         const hiddenThoughtOnlyNoToolStop =
           effectiveToolCalls.length === 0 &&
           finalReplyOptions.length === 0 &&
@@ -6732,7 +6742,66 @@ export class AgentOrchestrator {
             return;
           }
         }
-        if (unityMcpFallbackPrompt) {
+        // ── Cross-iteration read_file loop detection ─────────────────────
+        // Detects when the model reads the same file ≥ 3 times across
+        // separate iterations (each iteration is an independent LLM call).
+        // This catches the "read_file loop" that slips past batch-level
+        // repetition guards because each batch starts with count=1.
+        // Also handles blocked/suppressed read_file calls during execute
+        // recovery — these also indicate the model is stuck trying to read.
+        if (runtimeIntent === "execute") {
+          let blockedReadFileDetected = false;
+          for (const result of allResults) {
+            if (result.name === "read_file") {
+              const target = result.target;
+              if (target) {
+                // Successful read: track cross-iteration count
+                if (!result.isError) {
+                  crossIterationFileReads.set(target, (crossIterationFileReads.get(target) || 0) + 1);
+                  const count = crossIterationFileReads.get(target)!;
+                  if (count >= 3) {
+                    const language = callbacks.getPreferredLanguage();
+                    activateExecuteRecovery("mutation_first", "cross_iteration_file_read_loop", {
+                      target,
+                      crossIterationReads: count,
+                    });
+                    callbacks.appendMessage({
+                      role: "system",
+                      content: language === "zh"
+                        ? `[System: 检测到跨迭代重复读取同一文件（${target}，已连续读取${count}次）。文件内容已在上下文中，请勿再次读取。请基于已有上下文直接执行写入、验证命令、浏览器操作，或说明真实阻塞。不要输出长段落回复。]`
+                        : `[System: Cross-iteration read_file loop detected for ${target} (read ${count} times across iterations). File content is already in context — do not re-read. Act directly with write/verify/run commands, browser actions, or state the real blocker. Do not output long prose.]`,
+                    });
+                    logAgentEvent("cross_iteration_file_read_loop", {
+                      iteration,
+                      target,
+                      crossIterationReads: count,
+                    });
+                  }
+                }
+                // Blocked/suppressed read: also counts toward loop detection
+                // and triggers immediate recovery prompt
+                else if (executeRecoveryMode !== "normal" || (crossIterationFileReads.get(target) ?? 0) >= 2) {
+                  blockedReadFileDetected = true;
+                }
+              }
+            }
+          }
+          // Inject recovery prompt when read_file is blocked during execute recovery
+          if (blockedReadFileDetected) {
+            const language = callbacks.getPreferredLanguage();
+            const usedTools = allResults.map((r) => r.name).filter(Boolean).join(", ");
+            const recoveryPrompt = language === "zh"
+              ? `[System: read_file 在当前恢复模式不可用。你已尝试多次读取，工具已显示此操作被阻止。请立即使用可用工具执行实际动作：replace_in_file、write_file、apply_patch 修改代码，或 execute_command 运行验证。不要再次尝试 read_file。]`
+              : `[System: read_file is not available in the current recovery mode. You have attempted to read multiple times and the tool has blocked this action. Immediately act with available tools: use replace_in_file, write_file, apply_patch to edit code, or execute_command to run validation. Do not attempt read_file again.]`;
+            callbacks.appendMessage({ role: "user", content: recoveryPrompt });
+            logAgentEvent("blocked_read_file_recovery_prompt_injected", {
+              iteration,
+              usedTools,
+              executeRecoveryMode,
+            });
+          }
+        }
+                if (unityMcpFallbackPrompt) {
           callbacks.appendMessage({
             role: "user",
             content: unityMcpFallbackPrompt,

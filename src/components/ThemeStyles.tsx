@@ -26,6 +26,7 @@ export default function ThemeStyles() {
       html[data-theme="black"] { --inline-chip-text: #ffffff; }
       .theme-bg { background-color: var(--accent) !important; color: var(--accent-contrast, #ffffff) !important; }
       .theme-bg-hover:hover { background-color: var(--accent-hover) !important; color: var(--accent-contrast, #ffffff) !important; }
+      html[data-theme="light"] .theme-bg, html[data-theme="light"] .theme-bg *, html[data-theme="light"] .theme-bg-hover:hover { color: var(--accent-contrast, #ffffff) !important; }
       .theme-text { color: var(--accent-light) !important; }
       .theme-border { border-color: var(--accent) !important; }
       .theme-subtle-bg { background-color: var(--accent-subtle) !important; color: var(--accent-light) !important; }

@@ -18,6 +18,7 @@ import {
   streamChatCompletion,
   escalateMaxTokens,
   computeInitialMaxTokens,
+  isLocalProfile,
   type OpenAiToolChoice,
   type StreamSettings,
   type StreamResult,
@@ -2556,7 +2557,17 @@ export async function fetchLLMStream(
   options: FetchLLMStreamOptions = {},
 ): Promise<StreamResult> {
   let fullText = "";
-  let currentMaxTokens = maxTokensOverride ?? computeInitialMaxTokens(settings.contextLimit);
+  // P1: Constrain local model output length to prevent hallucinated long outputs
+  const isLocal = isLocalProfile(settings);
+  let currentMaxTokens: number;
+  if (maxTokensOverride !== undefined) {
+    currentMaxTokens = maxTokensOverride;
+  } else if (isLocal) {
+    // Local models: start at 2048 instead of 4096 to prevent 36K+ hallucinated outputs
+    currentMaxTokens = Math.min(2048, computeInitialMaxTokens(settings.contextLimit));
+  } else {
+    currentMaxTokens = computeInitialMaxTokens(settings.contextLimit);
+  }
   let transientRetryCount = 0;
 
   // Max output tokens escalation loop (from claude-code-haha)
@@ -2687,13 +2698,7 @@ export async function fetchLLMStream(
       throw err;
     }
 
-    // Check if the response was truncated and we can escalate
-    const isLocal = settings.provider === "Ollama" || settings.provider === "LM Studio" || settings.provider === "OMLX" ||
-      String(settings.baseUrl || "").toLowerCase().includes("localhost") ||
-      String(settings.baseUrl || "").toLowerCase().includes("127.0.0.1") ||
-      String(settings.baseUrl || "").toLowerCase().includes("::1") ||
-      String(settings.baseUrl || "").toLowerCase().includes("ollama") ||
-      String(settings.baseUrl || "").toLowerCase().includes(":11434");
+    // isLocal already computed above via isLocalProfile(settings)
     const skipReasoningDominatedEscalation = isReasoningDominatedLengthResult(result, isLocal);
     const isChat = options.workflowMode === "chat" || options.runtimeIntent === "respond";
     const allowEscalation = !(isChat && currentMaxTokens >= 4096);
@@ -2707,7 +2712,17 @@ export async function fetchLLMStream(
         const nextMaxTokens = escalateMaxTokens(currentMaxTokens, settings.contextLimit);
       if (nextMaxTokens !== null) {
         escalationCount++;
-        currentMaxTokens = nextMaxTokens;
+        // P1: Cap local model escalation at 4096 to prevent 36K+ hallucinated outputs
+        if (isLocal && nextMaxTokens > 4096) {
+          logAgentEvent("local_model_escalation_capped", {
+            requested: nextMaxTokens,
+            cappedTo: 4096,
+            escalationCount,
+          });
+          currentMaxTokens = 4096;
+        } else {
+          currentMaxTokens = nextMaxTokens;
+        }
         logAgentEvent("max_output_escalated", {
           currentMaxTokens,
           attempt: escalationCount,

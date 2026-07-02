@@ -497,8 +497,8 @@ html[data-theme="light"] #root {
 [data-theme="light"] .text-\[\#a6a6ad\] { color: #52525b !important; }
 [data-theme="light"] .text-\[\#ff5c5c\] { color: #dc2626 !important; }
 [data-theme="light"] .text-\[\#ff6464\] { color: #dc2626 !important; }
-[data-theme="light"] .text-\[\#d1fae5\] { color: #065f46 !important; }
-[data-theme="light"] .text-\[\#c4c4cc\] { color: #52525b !important; }
+[data-theme="light"] .bg-\[\#18110a\] { background-color: #fef3c7 !important; }
+[data-theme="light"] .border-\[\#3f2f1f\] { border-color: #fde68a !important; }
 
 /* ── Hover Text Colors ── */
 [data-theme="light"] .hover\:text-\[\#ffffff\]:hover { color: #000000 !important; }
@@ -506,6 +506,15 @@ html[data-theme="light"] #root {
 [data-theme="light"] .hover\:text-\[\#a1a1aa\]:hover { color: #3f3f46 !important; }
 [data-theme="light"] .text-white { color: #000000 !important; }
 [data-theme="light"] .hover\:text-white:hover { color: #000000 !important; }
+
+/* ── Ensure Theme Accent Buttons & Primary Elements retain crisp white text in Light mode ── */
+[data-theme="light"] .theme-bg,
+[data-theme="light"] .theme-bg-hover:hover,
+[data-theme="light"] .theme-bg *,
+[data-theme="light"] button.theme-bg,
+[data-theme="light"] .theme-plan-primary {
+  color: var(--accent-contrast, #ffffff) !important;
+}
 
 /* ── Specific mode backgrounds ── */
 [data-theme="light"] .bg-\[\#0f2e0f\]\/60 { background-color: #dcfce7 !important; }

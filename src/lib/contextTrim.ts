@@ -231,8 +231,8 @@ export function computeContextBudgets(
     contextLimit,
     outputBudget,
     inputBudget,
-    proactiveTriggerBudget: Math.floor(inputBudget * 0.92),
-    proactiveTargetBudget: Math.floor(inputBudget * 0.8),
+    proactiveTriggerBudget: Math.floor(inputBudget * 0.85),
+    proactiveTargetBudget: Math.floor(inputBudget * 0.75),
   };
 }
 
