@@ -859,6 +859,7 @@ export class AgentOrchestrator {
                   : "normal";
         let executeRecoveryReason = executeRecoveryMode === "normal" ? "" : "forced_execute_recovery";
         let executeRecoveryAttempts = executeRecoveryMode === "normal" ? 0 : 1;
+        let consecutiveBlockedReadFileInRecoveryCount = 0;
         const activateExecuteRecovery = (
                 mode: Exclude<ExecuteRecoveryMode, "normal">,
                 reason: string,
@@ -6788,17 +6789,36 @@ export class AgentOrchestrator {
           }
           // Inject recovery prompt when read_file is blocked during execute recovery
           if (blockedReadFileDetected) {
-            const language = callbacks.getPreferredLanguage();
-            const usedTools = allResults.map((r) => r.name).filter(Boolean).join(", ");
-            const recoveryPrompt = language === "zh"
-              ? `[System: read_file 在当前恢复模式不可用。你已尝试多次读取，工具已显示此操作被阻止。请立即使用可用工具执行实际动作：replace_in_file、write_file、apply_patch 修改代码，或 execute_command 运行验证。不要再次尝试 read_file。]`
-              : `[System: read_file is not available in the current recovery mode. You have attempted to read multiple times and the tool has blocked this action. Immediately act with available tools: use replace_in_file, write_file, apply_patch to edit code, or execute_command to run validation. Do not attempt read_file again.]`;
-            callbacks.appendMessage({ role: "user", content: recoveryPrompt });
-            logAgentEvent("blocked_read_file_recovery_prompt_injected", {
-              iteration,
-              usedTools,
-              executeRecoveryMode,
-            });
+            consecutiveBlockedReadFileInRecoveryCount += 1;
+            if (consecutiveBlockedReadFileInRecoveryCount >= 2) {
+              executeRecoveryMode = "normal";
+              executeRecoveryReason = "";
+              consecutiveBlockedReadFileInRecoveryCount = 0;
+              logAgentEvent("execute_recovery_reset_after_blocked_reads", {
+                iteration,
+                executeRecoveryMode,
+              });
+              callbacks.appendMessage({
+                role: "system",
+                content: callbacks.getPreferredLanguage() === "zh"
+                  ? "[System: 已解除文件读取恢复模式限制。请切至变动修改或运行验证命令，避免重复读取同一文件。]"
+                  : "[System: Read-only recovery restriction lifted. Avoid re-reading identical files; pivot to editing or validation.]",
+              });
+            } else {
+              const language = callbacks.getPreferredLanguage();
+              const usedTools = allResults.map((r) => r.name).filter(Boolean).join(", ");
+              const recoveryPrompt = language === "zh"
+                ? `[System: read_file 在当前恢复模式不可用。你已尝试多次读取，工具已显示此操作被阻止。请立即使用可用工具执行实际动作：replace_in_file、write_file、apply_patch 修改代码，或 execute_command 运行验证。不要再次尝试 read_file。]`
+                : `[System: read_file is not available in the current recovery mode. You have attempted to read multiple times and the tool has blocked this action. Immediately act with available tools: use replace_in_file, write_file, apply_patch to edit code, or execute_command to run validation. Do not attempt read_file again.]`;
+              callbacks.appendMessage({ role: "user", content: recoveryPrompt });
+              logAgentEvent("blocked_read_file_recovery_prompt_injected", {
+                iteration,
+                usedTools,
+                executeRecoveryMode,
+              });
+            }
+          } else {
+            consecutiveBlockedReadFileInRecoveryCount = 0;
           }
         }
                 if (unityMcpFallbackPrompt) {
@@ -7082,8 +7102,9 @@ export class AgentOrchestrator {
               repeatCheck.threshold,
               availableToolNames,
             );
-            if (!readOnlyShellInspection) {
-              repeatGuardRecoveredSignatures.add(repeatCheck.signature);
+            repeatGuardRecoveredSignatures.add(repeatCheck.signature);
+            if (readOnlyShellInspection) {
+              failedToolCallCounts.set(repeatCheck.signature, 3);
             }
             recentToolCalls.length = 0;
             callbacks.onToolError(tc.name, target, recoveryMessage, { toolCallId: tc.id });

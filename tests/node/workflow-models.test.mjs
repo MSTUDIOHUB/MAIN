@@ -1769,8 +1769,28 @@ test("validatePlanArtifactContent accepts real requirements and plan artifacts",
     "- 检查示例场景是否可以进入战斗流程。",
   ].join("\n");
 
+  const planWithCodeBlock = [
+    "# 执行计划",
+    "## 摘要",
+    "重构 C# 战斗系统架构。",
+    "## 关键改动",
+    "```csharp",
+    "using System;",
+    "namespace Battle.Core {",
+    "    public class BattleUnit {}",
+    "}",
+    "```",
+    "## 公共 API / 接口 / 类型",
+    "提供 BattleUnit 公共数据结构。",
+    "## 测试方案",
+    "- 运行单元测试。",
+    "## 假设与默认值",
+    "- 遵循 Unity 命名规范。",
+  ].join("\n");
+
   assert.equal(validatePlanArtifactContent(requirements, "requirements").ok, true);
   assert.equal(validatePlanArtifactContent(design, "design").ok, true);
+  assert.equal(validatePlanArtifactContent(planWithCodeBlock, "plan").ok, true);
 });
 
 test("validatePlanArtifactContent requires inferable task evidence", () => {

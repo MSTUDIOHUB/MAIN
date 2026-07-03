@@ -2249,8 +2249,14 @@ export function validatePlanArtifactContent(
     return { ok: true };
   }
 
+  // Strip markdown code blocks before validating noise patterns so code snippets inside markdown don't trigger raw_source_code
+  const textWithoutCodeBlocks = raw
+    .replace(/```[\s\S]*?```/g, "")
+    .replace(/`[^`]+`/g, "");
+
   for (const entry of PLAN_ARTIFACT_NOISE_PATTERNS) {
-    if (entry.pattern.test(raw)) {
+    const textToTest = entry.reason === "raw_source_code" ? textWithoutCodeBlocks : raw;
+    if (entry.pattern.test(textToTest)) {
       return { ok: false, reason: entry.reason };
     }
   }

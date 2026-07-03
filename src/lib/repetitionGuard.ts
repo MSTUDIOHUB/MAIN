@@ -98,7 +98,8 @@ export function registerToolCallForRepeatGuard(
   args: Record<string, unknown>,
   readOnly: boolean,
 ): RepeatLoopCheck {
-  const threshold = readOnly ? 6 : 3;
+  const isShellInspection = isReadOnlyShellInspectionToolCall(name, args);
+  const threshold = isShellInspection ? 3 : readOnly ? 4 : 3;
   const argsKey = buildRepeatLoopArgsKey(args);
 
   history.push({ name, argsKey });
@@ -288,6 +289,10 @@ export function formatRepeatLoopRecoveryMessage(
   availableToolNames?: Iterable<string> | null,
 ): string {
   const suffix = target ? ` (target: "${target}")` : "";
+  const isShell = name === "run_command" || name === "execute_command";
+  if (isShell) {
+    return `REPEATED_COMMAND_BLOCKED: Shell command "${target || name}" was called with identical arguments ${threshold}+ times. Output is already present in context above. Do not re-run this command. Reuse existing output to patch files, execute a different validation, or state your final conclusion.`;
+  }
   const available = availableToolNames ? new Set(Array.from(availableToolNames)) : null;
   const candidates = ["grep_search", "get_file_outline", "get_project_skeleton", "glob_search", "read_file"];
   const suggestions = candidates.filter((toolName) => !available || available.has(toolName));

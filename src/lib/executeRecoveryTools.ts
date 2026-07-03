@@ -82,20 +82,30 @@ export function shouldAllowExecuteRecoveryFileRead(
   const recent = recentActivity.slice(-6);
   let latestPatchMismatchIndex = -1;
   let latestFileReadIndex = -1;
-  let latestTargetingIndex = -1;
+  let consecutiveSameFileReads = 0;
+  let lastTarget = "";
+
   for (let index = 0; index < recent.length; index += 1) {
     const activity = recent[index];
     if (isExecutePatchMismatchRecoveryActivity(activity)) latestPatchMismatchIndex = index;
-    if (activity.name === "read_file") latestFileReadIndex = index;
-    if (activity.name === "grep_search" || activity.name === "get_file_outline") latestTargetingIndex = index;
+    if (activity.name === "read_file") {
+      latestFileReadIndex = index;
+      if (activity.target && activity.target === lastTarget) {
+        consecutiveSameFileReads += 1;
+      } else {
+        lastTarget = activity.target || "";
+        consecutiveSameFileReads = 1;
+      }
+    }
   }
-  if (latestPatchMismatchIndex >= 0 && latestPatchMismatchIndex > latestFileReadIndex) {
-    return true;
+
+  if (latestPatchMismatchIndex >= 0 && latestFileReadIndex > latestPatchMismatchIndex) {
+    return false;
   }
-  if (latestTargetingIndex >= 0 && latestTargetingIndex > latestFileReadIndex) {
-    return true;
+  if (consecutiveSameFileReads >= 5) {
+    return false;
   }
-  return false;
+  return true;
 }
 
 export function isExecuteRecoveryToolName(
@@ -247,7 +257,7 @@ export function resolveReadOnlyNoProgressTrigger(input: {
     return { shouldRecover: true, reason: "target_repeated_read_only", readOnlyActivityCount, batchToolChars, cachedReadOnlyActivityCount, repeatedReadOnlyTargetScore };
   }
 
-  const readLimit = input.minReadOnlyActivities ?? 8;
+  const readLimit = input.minReadOnlyActivities ?? 32;
   if (readOnlyActivityCount >= readLimit) {
     return { shouldRecover: true, reason: "read_only_budget_exhausted", readOnlyActivityCount, batchToolChars, cachedReadOnlyActivityCount, repeatedReadOnlyTargetScore };
   }
