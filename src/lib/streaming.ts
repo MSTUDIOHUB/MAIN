@@ -195,7 +195,7 @@ const MAX_TOKENS_LADDER = [4096, 8192, 16384, 32768, 65536];
  */
 export function computeInitialMaxTokens(contextLimit?: number): number {
   if (!contextLimit) return 4096;
-  return computeContextBudgets(contextLimit).outputBudget;
+  return Math.max(4096, computeContextBudgets(contextLimit).outputBudget);
 }
 
 function computeMaxTokensCeiling(contextLimit?: number): number {

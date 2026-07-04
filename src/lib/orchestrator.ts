@@ -721,8 +721,10 @@ export async function buildReadBeforeModifyValidationError(
     existingFile = !!metadata;
   }
 
-  // 1. Write File Size-Gate Check
-  if (tc.name === "write_file" && metadata && metadata.sizeBytes > 8192) {
+  // 1. Write File Size-Gate Check (Dynamic threshold scaling with context limit, min 48KB)
+  const contextLimit = callbacks.getSnapshotContextLimit?.() || 32768;
+  const dynamicMaxWriteSizeBytes = Math.max(48 * 1024, Math.floor(contextLimit * 1.5 * 1024));
+  if (tc.name === "write_file" && metadata && metadata.sizeBytes > dynamicMaxWriteSizeBytes) {
     const language = callbacks.getPreferredLanguage();
     const message = language === "zh"
       ? `WRITE_FILE_GATE_BLOCKED: 文件 ${path} 已存在且体量较大 (大小: ${(metadata.sizeBytes / 1024).toFixed(1)}KB)。为节省关键上下文 Token 预算，禁止全量 write_file 重写现有大文件。你必须改用 replace_in_file 或 apply_patch 提交精确的局部 diff 修改。`

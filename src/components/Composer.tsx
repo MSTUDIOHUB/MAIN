@@ -64,13 +64,28 @@ function ContextRing({ percentage, themeMode }: { percentage: number; themeMode:
 
 function estimateAgentMessagesTokens(messages: AgentMessage[]): number {
   let total = 0;
-  for (const msg of messages) {
+  const len = messages.length;
+  for (let i = 0; i < len; i++) {
+    const msg = messages[i];
+    const isRecent = i >= len - 4; // Keep recent 4 messages verbatim
     if (typeof msg.content === "string") {
-      total += estimateTokens(msg.content);
+      // Tool outputs and long messages in older transcript are micro-compacted by context management
+      if (!isRecent && (msg.role === "tool" || msg.content.includes("FILE_UNCHANGED_STUB") || msg.content.length > 2000)) {
+        total += Math.min(estimateTokens(msg.content), 200);
+      } else {
+        total += estimateTokens(msg.content);
+      }
     } else if (Array.isArray(msg.content)) {
       for (const part of msg.content as ContentPart[]) {
-        if (part.type === "text") total += estimateTokens(part.text);
-        else if (part.type === "image_url") total += 1000;
+        if (part.type === "text") {
+          if (!isRecent && part.text.length > 2000) {
+            total += Math.min(estimateTokens(part.text), 200);
+          } else {
+            total += estimateTokens(part.text);
+          }
+        } else if (part.type === "image_url") {
+          total += 1000;
+        }
       }
     }
     if (msg.tool_calls) total += estimateTokens(JSON.stringify(msg.tool_calls));
@@ -729,7 +744,8 @@ export default function Composer({
     return historyTokens + inputTokens + imageTokens;
   }, [agentMessages, debouncedInput, pendingImages]);
 
-  const usagePercent = contextLimit > 0 ? (currentTokens / contextLimit) * 100 : 0;
+  const rawUsagePercent = contextLimit > 0 ? (currentTokens / contextLimit) * 100 : 0;
+  const usagePercent = Math.min(100, Math.round(rawUsagePercent * 10) / 10);
   const cloudTokenLabel = language === "en" ? `~${currentTokens} tok` : `~${currentTokens} tokens`;
   const cloudTokenTitle = language === "en"
     ? "Cloud mode does not use the local context compression limit"

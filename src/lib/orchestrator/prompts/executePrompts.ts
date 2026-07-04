@@ -85,14 +85,14 @@ export function buildExecuteCompletionEvidencePrompt(language: "zh" | "en", retr
 export function buildExecuteReplanningEvidencePrompt(language: "zh" | "en", retryCount: number): string {
   if (language === "en") {
     return [
-      "The user already approved execution for this turn, but the previous reply produced another plan instead of real tool evidence.",
-      "Do not re-plan. Start the smallest necessary real tool action now: write/patch files, run a command, use Browser/Playwright validation, or pause with the exact blocker.",
+      "The user already approved execution for this turn, but the previous reply produced another plan or explanation instead of real tool evidence.",
+      "Do not re-plan or output explanatory text. Start the smallest necessary real tool action now by issuing a tool call directly: `replace_in_file`, `apply_patch`, or `write_file`.",
       retryCount > 1 ? "This is a repeated failure. Stop with a concrete blocker if no real action is possible." : "",
     ].filter(Boolean).join("\n");
   }
   return [
-    "用户已经批准本轮执行，但上一条回复又输出了新的方案，没有产生真实工具证据。",
-    "不要重新规划。现在必须开始最小必要的真实工具动作：写入/替换文件、运行命令、调用 Browser/Playwright 验证，或明确暂停说明具体阻塞。",
+    "用户已经批准本轮执行，但上一条回复又输出了新的方案或解释文本，没有产生真实工具证据。",
+    "不要重新规划，请勿在聊天框中继续输出解释文本。现在必须直接发起工具调用（Tool Call）：使用 `replace_in_file`、`apply_patch` 或 `write_file` 修改工作区文件、运行命令或进行验证。",
     retryCount > 1 ? "这已经是重复失败。如果无法真实执行，请直接给出具体阻塞，不要继续输出方案。" : "",
   ].filter(Boolean).join("\n");
 }

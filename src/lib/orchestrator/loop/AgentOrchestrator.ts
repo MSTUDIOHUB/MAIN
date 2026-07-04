@@ -6760,7 +6760,7 @@ export class AgentOrchestrator {
                 if (!result.isError) {
                   crossIterationFileReads.set(target, (crossIterationFileReads.get(target) || 0) + 1);
                   const count = crossIterationFileReads.get(target)!;
-                  if (count >= 3) {
+                  if (count >= 5) {
                     const language = callbacks.getPreferredLanguage();
                     activateExecuteRecovery("mutation_first", "cross_iteration_file_read_loop", {
                       target,

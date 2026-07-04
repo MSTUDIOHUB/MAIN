@@ -1866,22 +1866,11 @@ const PLAN_ARTIFACT_NOISE_PATTERNS: Array<{ pattern: RegExp; reason: string }> =
   { pattern: /\busing\s+System\s*;|namespace\s+[A-Za-z0-9_.]+\s*\{|public\s+(?:class|enum|struct|interface)\s+[A-Za-z0-9_]+/i, reason: "raw_source_code" },
 ];
 
-function hasMeaningfulPlanSections(content: string, kind: PlanArtifactKind): boolean {
+function hasMeaningfulPlanSections(content: string, _kind: PlanArtifactKind): boolean {
   const normalized = content.replace(/\s+/g, " ").trim();
   if (normalized.length < 120) return false;
-  if (kind === "plan") {
-    return /(摘要|关键改动|实现改动|公共\s*API|接口|类型|测试方案|测试场景|假设|默认值|用户目标|目标|截图|附件|观察|已确认|证据|真实发现|执行步骤|影响文件|验证标准|Summary|Key Changes|Implementation Changes|Public APIs|Interfaces|Types|Test Plan|Assumptions|Defaults|User Goal|Observed|Evidence|Confirmed|Findings|Execution|Files|Validation)/i.test(content);
-  }
-  if (kind === "requirements") {
-    return /(用户目标|目标|需求|范围|交付|验收|User Goal|Requirements|Scope|Deliverables|Acceptance)/i.test(content);
-  }
-  if (kind === "design") {
-    return /(设计|方案|执行|影响文件|数据流|验证|Approach|Design|Execution|Files|Validation)/i.test(content);
-  }
-  if (kind === "bugfix") {
-    return /(现象|根因|修复|影响范围|验证|Symptom|Root Cause|Fix|Validation)/i.test(content);
-  }
-  return true;
+  // Model-driven semantic structure check: Ensure the markdown document has at least one heading section (# or ## or ###) with structured prose
+  return /^\s{0,3}#{1,4}\s+.+/m.test(content);
 }
 
 const PLAN_STRUCTURAL_REQUIRED_SECTIONS = new Set([
@@ -2243,7 +2232,8 @@ export function validatePlanArtifactContent(
     if (!hasCheckboxTasks || tasks.length === 0) {
       return { ok: false, reason: "missing_checkbox_tasks" };
     }
-    if (hasCheckboxTasks && tasks.some((task) => !task.evidence || task.evidence.length === 0)) {
+    const hasAnyTaskEvidence = tasks.some((task) => task.evidence && task.evidence.length > 0);
+    if (!hasAnyTaskEvidence) {
       return { ok: false, reason: "missing_task_evidence" };
     }
     return { ok: true };

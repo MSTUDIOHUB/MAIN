@@ -510,9 +510,12 @@ export function buildPlanRecoveryPromptFromContext(input: {
       "- Screenshot/attachment observations, read evidence, and confirmed facts belong in the concise Summary only when real; do not inflate them into empty audit sections.",
       "- Every implementation change must point to concrete files, interfaces, data flow, commands, validation, or an explicit default. If public APIs/interfaces/types do not change, say that explicitly.",
       "- Do not include console.log/debug-log suggestions, generalized CSS/store guesses, or probability claims as execution steps unless a cited evidence line supports them; otherwise place them under unverified hypotheses.",
+      "- If the user asks for analysis, explanation, or advice without explicitly requesting a file, respond directly in the ChatArea with Markdown text. Do NOT write any files to disk to prevent workspace pollution.",
+      "- If the user explicitly requests saving a document/report, write the Markdown document directly to `docs/<filename>.md` with `write_file`.",
+      "- If user intent is ambiguous, answer in ChatArea and ask proactively with `<user_options>` (options: ChatArea answer only, save as docs/ file, or create code refactoring plan).",
       "- Non-blocking MVP tradeoffs must be written with explicit defaults as assumptions or follow-up enhancements. If a choice blocks execution, ask with `<user_options>` before approval and stop.",
       "- If the plan direction is unclear, ask the user with `<user_options>` and stop. Do not invent a final plan.",
-      "- If the direction is clear, write a concise `.MAIN/plans/plan.md` for approval. Do not generate `tasks.md` or edit source files before approval.",
+      "- If the direction is clear and requires code changes, write a concise `.MAIN/plans/plan.md` for approval. Do not generate `tasks.md` or edit source files before approval.",
     ].filter(Boolean).join("\n");
   }
 
@@ -528,6 +531,9 @@ export function buildPlanRecoveryPromptFromContext(input: {
     "- 截图/附件观察、已读证据和已确认事实只在确有内容时放进精简摘要，不要撑成空洞审计章节。",
     "- 每个关键实现改动必须指向具体文件、接口、数据流、命令、验证方式或明确默认假设；如果公共 API/接口/类型不变，必须显式写明。",
     "- 没有证据支撑时，不要把 console.log/调试日志建议、泛化 CSS/Store 猜测或概率判断写成执行步骤；只能放入未验证假设。",
+    "- 若用户未明确要求生成磁盘文件，默认仅在 ChatArea 中回答 Markdown 分析，切勿擅自写磁盘文件污染用户 Git 工作区。",
+    "- 若用户明确要求保存报告文件，直接用 `write_file` 保存至工作区 `docs/<文件名>.md`。",
+    "- 若意图模糊未明确，在 ChatArea 解答同时使用 `<user_options>` 提问（包含：仅 ChatArea 查看 / 保存为 docs 文件 / 生成代码重构计划）。",
     "- 非阻塞 MVP 取舍必须写成带默认值的默认假设或后续增强；真正阻塞执行的选择必须在批准前用 `<user_options>` 提问并停止。",
     "- 如果设计方向不明确，使用 `<user_options>` 让用户选择并立刻停止；不要编造最终方案。",
     "- 如果方向已经明确，直接写入精简 `.MAIN/plans/plan.md` 等待审批。批准前不要生成 `tasks.md`，不要修改源码。",

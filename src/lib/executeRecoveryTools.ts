@@ -79,22 +79,19 @@ export function isExecutePatchMismatchRecoveryActivity(activity: ExecuteRecovery
 export function shouldAllowExecuteRecoveryFileRead(
   recentActivity: ExecuteRecoveryActivityLike[],
 ): boolean {
-  const recent = recentActivity.slice(-6);
+  const recent = recentActivity.slice(-16);
   let latestPatchMismatchIndex = -1;
   let latestFileReadIndex = -1;
-  let consecutiveSameFileReads = 0;
-  let lastTarget = "";
+  const targetReadCounts = new Map<string, number>();
 
   for (let index = 0; index < recent.length; index += 1) {
     const activity = recent[index];
     if (isExecutePatchMismatchRecoveryActivity(activity)) latestPatchMismatchIndex = index;
     if (activity.name === "read_file") {
       latestFileReadIndex = index;
-      if (activity.target && activity.target === lastTarget) {
-        consecutiveSameFileReads += 1;
-      } else {
-        lastTarget = activity.target || "";
-        consecutiveSameFileReads = 1;
+      const target = activity.target || "";
+      if (target) {
+        targetReadCounts.set(target, (targetReadCounts.get(target) || 0) + 1);
       }
     }
   }
@@ -102,8 +99,11 @@ export function shouldAllowExecuteRecoveryFileRead(
   if (latestPatchMismatchIndex >= 0 && latestFileReadIndex > latestPatchMismatchIndex) {
     return false;
   }
-  if (consecutiveSameFileReads >= 5) {
-    return false;
+
+  for (const count of targetReadCounts.values()) {
+    if (count >= 3) {
+      return false;
+    }
   }
   return true;
 }

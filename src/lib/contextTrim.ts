@@ -225,7 +225,7 @@ export function computeContextBudgets(
   outputBudgetOverride?: number,
 ): ContextBudgets {
   const outputBudget = outputBudgetOverride
-    ?? Math.min(4096, Math.max(1024, Math.floor(contextLimit * 0.2)));
+    ?? Math.min(8192, Math.max(4096, Math.floor(contextLimit * 0.2)));
   const inputBudget = Math.max(0, contextLimit - outputBudget);
   return {
     contextLimit,
@@ -910,9 +910,15 @@ export function compactToolResults(
   maxToolResultTokens: number = 4000,
   ephemeralItemIds?: Set<string>,
 ): TrimMessage[] {
-  return messages.map((msg) => {
+  const totalMsgs = messages.length;
+  return messages.map((msg, index) => {
     // Only compact tool results (which are always string content)
     if (msg.role !== "tool" || typeof msg.content !== "string") return msg;
+
+    // Do NOT compact recent tool outputs (retained in recent conversation window)
+    // to preserve exact file contents for code edits and prevent LLM re-read loops
+    const isRecentTool = index >= totalMsgs - 8;
+    if (isRecentTool) return msg;
 
     // Check if this tool message is marked ephemeral
     const isEphemeral = msg.tool_call_id && ephemeralItemIds && ephemeralItemIds.has(msg.tool_call_id);
