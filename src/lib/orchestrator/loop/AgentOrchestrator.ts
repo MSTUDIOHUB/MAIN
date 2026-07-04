@@ -33,7 +33,7 @@ import { buildCompatibilityRetryMessages, buildTranscriptCompatibilityRetryMessa
 import { resolveReasoningPolicy } from "../../cloudProtocol";
 import { getErrorMessage } from "../../errorUtils";
 import { isCloudGatewayTimeoutMessage, isRetryableCloudErrorMessage } from "../../cloudRetry";
-import { buildMissingToolCallContinuationPrompt, resolveMissingToolCallRepromptKind } from "../../missingToolCallReprompt";
+import { buildMissingToolCallContinuationPrompt, resolveMissingToolCallRepromptKind, type MissingToolCallRepromptKind } from "../../missingToolCallReprompt";
 import { buildPlanExecutionProgressUpdate, buildExecuteMaxIterationsPauseNotice, buildPlanNoProgressLoopPauseNotice, buildPlanProgressSignatureFromToolActivity, buildPlanMaxIterationsCheckpoint, buildPlanMaxIterationsPauseNotice, isCachedReadOnlyPlanActivity, summarizeRepeatedPlanTargetsFromToolActivity, type PlanToolActivitySummary } from "../../planExecutionRecovery";
 import { describeApprovedPlanRecoveryToolSurface, describeApprovedPlanSourceEditFirstToolSurface, isApprovedPlanCachedReadOnlyNoProgressBatch, shouldBypassApprovedPlanReadCacheForPatchRecovery, shouldAllowApprovedPlanRecoveryFileRead } from "../../approvedPlanRecoveryTools";
 import { buildExecuteNoProgressLoopPauseNotice, buildExecuteRecoveryPrompt, buildExecuteValidationRecoveryPrompt, describeExecuteRecoveryToolSurface, isExecuteRecoveryToolName, normalizeExecuteRecoveryMode, resolveExecuteReadOnlyRecoveryTrigger, resolveReadOnlyNoProgressTrigger, shouldAllowExecuteRecoveryFileRead, summarizeRepeatedExecuteTargets, type ExecuteRecoveryMode } from "../../executeRecoveryTools";
@@ -4747,9 +4747,14 @@ export class AgentOrchestrator {
                         recoveringFromEmptyAssistantReply: recoveringFromEmptyAssistantReplyAfterWrite,
                       },
                 });
+            const isTruncatedReasoningNoTool = normalized.finishReason === "length" && normalized.toolCalls.length === 0;
+            const effectiveMissingToolKind: MissingToolCallRepromptKind = isTruncatedReasoningNoTool
+              ? "truncated_reasoning_bridge"
+              : missingToolCallRepromptKind;
+
             const shouldRepromptForMissingToolCall =
               (!hasMeaningfulVisibleText && workflowMode !== "chat") ||
-              missingToolCallRepromptKind !== "none" ||
+              effectiveMissingToolKind !== "none" ||
               hiddenThoughtOnlyNoToolStop;
 
             if (shouldRepromptForMissingToolCall) {
@@ -4762,7 +4767,7 @@ export class AgentOrchestrator {
                 iteration,
                 kind: hiddenThoughtOnlyNoToolStop
                   ? "hidden_thought_only"
-                  : missingToolCallRepromptKind === "none" ? "generic" : missingToolCallRepromptKind,
+                  : effectiveMissingToolKind,
                 consecutiveNoToolCount,
                 visibleChars: normalized.visibleText.length,
                 preservedVisibleText: hasMeaningfulVisibleText,
@@ -4805,7 +4810,7 @@ export class AgentOrchestrator {
                   consecutiveNoToolCount,
                   kind: hiddenThoughtOnlyNoToolStop
                     ? "hidden_thought_only"
-                    : missingToolCallRepromptKind === "none" ? "generic" : missingToolCallRepromptKind,
+                    : effectiveMissingToolKind,
                 });
                 callbacks.onNonActionableStop(
                   buildNonActionableStopMessage(
@@ -4823,7 +4828,7 @@ export class AgentOrchestrator {
                 content: hiddenThoughtOnlyNoToolStop
                   ? buildHiddenThoughtOnlyContinuationPrompt(callbacks.getPreferredLanguage(), consecutiveNoToolCount)
                   : buildMissingToolCallContinuationPrompt(
-                      missingToolCallRepromptKind === "none" ? "generic" : missingToolCallRepromptKind,
+                      effectiveMissingToolKind === "none" ? "generic" : effectiveMissingToolKind,
                       callbacks.getPreferredLanguage(),
                       consecutiveNoToolCount,
                     ),

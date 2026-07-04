@@ -1,7 +1,7 @@
 import type { MainModeKey } from "./mainModes";
 
 export type WorkflowModeLike = "chat" | "edit" | "plan";
-export type MissingToolCallRepromptKind = "none" | "generic" | "read_only" | "post_write_verify";
+export type MissingToolCallRepromptKind = "none" | "generic" | "read_only" | "post_write_verify" | "truncated_reasoning_bridge";
 
 export interface MissingToolCallRecentWriteContext {
   lastSuccessfulToolName?: string | null;
@@ -175,6 +175,14 @@ export function buildMissingToolCallContinuationPrompt(
   language: "zh" | "en",
   attempt = 1,
 ): string {
+  if (kind === "truncated_reasoning_bridge") {
+    return language === "zh"
+      ? "[REASONING_CONTINUATION_BRIDGE] 你上一轮的输出因思考/正文较长达到最大 Token 限制被截断。\n" +
+          "你已经完成了绝大部分思维推演，【请勿重新从头分析】。请在 1-2 句内直接给出结论，并【立即输出工具调用 JSON/XML】。"
+      : "[REASONING_CONTINUATION_BRIDGE] Your previous output reached the maximum token limit during reasoning/prose.\n" +
+          "You have completed your core analysis — DO NOT restart your reasoning from scratch. Summarize in 1-2 sentences and emit the required tool call (JSON/XML) immediately.";
+  }
+
   if (kind === "post_write_verify" && attempt >= 2) {
     return language === "zh"
       ? "上一条回复仍然只是说明接下来要怎么验证，没有真正执行工具。下一条回复必须严格满足：\n" +

@@ -54,7 +54,7 @@ export function buildRepeatLoopSignature(name: string, argsKey: string): string 
 }
 
 const READ_ONLY_SHELL_TOOL_NAMES = new Set(["run_command", "execute_command"]);
-const READ_ONLY_SHELL_COMMAND_RE = /^(?:pwd|ls(?:\s|$)|find\s+|cat\s+|sed\s+-n\b|grep\b|rg\b|head\b|tail\b|wc\b|git\s+(?:status|diff|show|log|branch)\b)/i;
+const READ_ONLY_SHELL_COMMAND_RE = /^(?:pwd|ls(?:\s|$)|find\s+|cat\s+|awk\b|sed\s+-n\b|grep\b|rg\b|head\b|tail\b|wc\b|cut\b|sort\b|uniq\b|diff\b|stat\b|file\b|strings\b|git\s+(?:status|diff|show|log|branch)\b)/i;
 const UNSAFE_SHELL_INSPECTION_RE = /(?:^|\s)(?:sudo|rm|mv|cp|chmod|chown|touch|mkdir|rmdir|git\s+(?:add|commit|checkout|switch|reset|clean|push|pull|merge|rebase)|npm|pnpm|yarn|bun|cargo|python|python3|node|sh|bash|zsh)\b/i;
 
 function getShellCommandArgument(args: Record<string, unknown>): string {
