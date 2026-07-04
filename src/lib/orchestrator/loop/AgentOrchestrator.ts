@@ -6836,9 +6836,18 @@ export class AgentOrchestrator {
           if (result.isError || result.internalFeedback || !isEditProgressResult(result)) continue;
           const targetKey = normalizeLoopGuardTarget(result.target);
           if (!targetKey) continue;
+
+          // When editing a different file, clear edit counters for other targets
+          // so cross-file refactoring (editing file A -> file B -> file A again) is never blocked.
+          for (const key of Array.from(successfulEditTargetsSinceVerification.keys())) {
+            if (key !== targetKey) {
+              successfulEditTargetsSinceVerification.delete(key);
+            }
+          }
+
           const count = (successfulEditTargetsSinceVerification.get(targetKey) || 0) + 1;
           successfulEditTargetsSinceVerification.set(targetKey, count);
-          if (count < 3) continue;
+          if (count < 5) continue;
 
           const displayTarget = String(result.target || targetKey).replace(/^shell-write:/, "");
           const language = callbacks.getPreferredLanguage();

@@ -5,7 +5,7 @@
       "dmg"
     ],
     "macOS": {
-      "bundleVersion": "2.3.0",
+      "bundleVersion": "2.3.1",
       "minimumSystemVersion": "11.0",
       "hardenedRuntime": true
     }

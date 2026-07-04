@@ -693,7 +693,7 @@ export async function buildReadBeforeModifyValidationError(
   workspace: string,
   callbacks: OrchestratorCallbacks,
 ): Promise<ToolExecutionResult | null> {
-  if (!READ_BEFORE_MODIFY_WRITE_TOOLS.has(tc.name)) return null;
+  if (!READ_BEFORE_MODIFY_WRITE_TOOLS.has(tc.name) && tc.name !== "read_file") return null;
   const runtimeIntent = callbacks.getRuntimeRunIntent?.() ?? callbacks.getCurrentRunIntent();
   if (runtimeIntent !== "execute" && runtimeIntent !== "studio_workflow" && !callbacks.getIsPlanApproved()) {
     return null;
@@ -716,14 +716,44 @@ export async function buildReadBeforeModifyValidationError(
 
   let existingFile = tc.name === "replace_in_file";
   let metadata: { path: string; sizeBytes: number; modifiedMs: number } | null = null;
-  if (tc.name === "write_file") {
+  if (tc.name === "write_file" || tc.name === "read_file") {
     metadata = await readFileMetadataIfAvailable(path, workspace);
     existingFile = !!metadata;
   }
 
-  // 1. Write File Size-Gate Check (Dynamic threshold scaling with context limit, min 48KB)
-  const contextLimit = callbacks.getSnapshotContextLimit?.() || 32768;
+  const config = callbacks.getConfig?.();
+  const contextLimit = callbacks.getSnapshotContextLimit?.() || config?.local?.contextLimit || 32768;
   const dynamicMaxWriteSizeBytes = Math.max(48 * 1024, Math.floor(contextLimit * 1.5 * 1024));
+
+  // 1. Read File Size-Gate Check for unwindowed reads of large files
+  if (tc.name === "read_file" && metadata && metadata.sizeBytes > dynamicMaxWriteSizeBytes && !args.start_line && !args.end_line && !args.max_lines) {
+    const language = callbacks.getPreferredLanguage();
+    const message = language === "zh"
+      ? `READ_FILE_GATE_BLOCKED: 文件 ${path} 已存在且体量较庞大 (大小: ${(metadata.sizeBytes / 1024).toFixed(1)}KB)。为节省关键 Token 预算，已禁止无窗口全量读取。你必须指定 start_line/end_line/max_lines 分页读取，或改用 grep_search / get_file_outline 进行精准检索。`
+      : `READ_FILE_GATE_BLOCKED: The file ${path} exists and is very large (${(metadata.sizeBytes / 1024).toFixed(1)}KB). To conserve context budget, unwindowed full read is blocked. You MUST specify start_line/end_line/max_lines to page, or use grep_search / get_file_outline for targeted exploration.`;
+    callbacks.onToolExecuting(tc.name, target, undefined, { toolCallId: tc.id });
+    emitToolPreflightBlocked(callbacks, {
+      reason: "read_file_gate_blocked",
+      tool: tc.name,
+      target,
+      message,
+      toolCallId: tc.id,
+      lifecycleState: "blocked",
+    });
+    callbacks.onToolError(tc.name, target, message, { toolCallId: tc.id });
+    return {
+      toolCallId: tc.id,
+      name: tc.name,
+      target,
+      content: `Error: ${message}`,
+      isError: true,
+      lifecycleState: "blocked",
+    };
+  }
+
+  if (tc.name === "read_file") return null;
+
+  // 2. Write File Size-Gate Check (Dynamic threshold scaling with context limit, min 48KB)
   if (tc.name === "write_file" && metadata && metadata.sizeBytes > dynamicMaxWriteSizeBytes) {
     const language = callbacks.getPreferredLanguage();
     const message = language === "zh"
@@ -1178,6 +1208,7 @@ export interface OrchestratorCallbacks {
   getAssociatedPaths: () => string[];
   getSessionKey: () => string;
   getCurrentTurnId?: () => string | null;
+  getSnapshotContextLimit?: () => number;
   hasSessionHookInitialized: (sessionKey: string) => boolean;
   markSessionHookInitialized: (sessionKey: string) => void;
   // Planning & Management

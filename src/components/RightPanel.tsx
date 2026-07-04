@@ -625,7 +625,22 @@ function buildReviewRows(oldText: string, newText: string, contextSize = 3): Rev
   return rows;
 }
 
-function DiffReviewPanel({ taskFlow, activeDiffTask, gitDiffEntries = [], gitDiffSourceLabel, language }: { taskFlow: TaskBlock[]; activeDiffTask?: ToolDiffBlock | null; gitDiffEntries?: GitDiffEntry[]; gitDiffSourceLabel?: string; language: "zh" | "en" }) {
+function DiffReviewPanel({
+  taskFlow,
+  activeDiffTask,
+  gitDiffEntries = [],
+  gitDiffSourceLabel,
+  language,
+  themeMode = "dark",
+}: {
+  taskFlow: TaskBlock[];
+  activeDiffTask?: ToolDiffBlock | null;
+  gitDiffEntries?: GitDiffEntry[];
+  gitDiffSourceLabel?: string;
+  language: "zh" | "en";
+  themeMode?: "light" | "dark" | "black";
+}) {
+  const isLightTheme = themeMode === "light";
   const files = useMemo(() => collectReviewFileDiffs(taskFlow, activeDiffTask, gitDiffEntries), [activeDiffTask, gitDiffEntries, taskFlow]);
   const revertDiffGroups = useAppStore((s) => s.revertDiffGroups);
   const [collapsedFiles, setCollapsedFiles] = useState<Set<string>>(() => new Set());
@@ -687,22 +702,36 @@ function DiffReviewPanel({ taskFlow, activeDiffTask, gitDiffEntries = [], gitDif
 
   if (files.length === 0) {
     return (
-      <div data-testid="diff-panel" className="flex h-full items-center justify-center bg-[#101010] px-6 text-center text-[13px] text-[#8f8f98]">
+      <div data-testid="diff-panel" className={`flex h-full items-center justify-center px-6 text-center text-[13px] ${
+        isLightTheme ? "bg-[#ffffff] text-[#71717a]" : "bg-[#101010] text-[#8f8f98]"
+      }`}>
         {language === "zh" ? "当前会话暂无可查看的文件修改。" : "No file changes are available in this session."}
       </div>
     );
   }
 
   return (
-    <div data-testid="diff-panel" className="flex h-full flex-col bg-[#101010] text-[#d4d4d8]">
-      <div data-testid="diff-panel-title" className="flex shrink-0 items-center justify-between border-b border-[#252525] px-4 py-3">
+    <div data-testid="diff-panel" className={`flex h-full flex-col ${
+      isLightTheme ? "bg-[#ffffff] text-[#18181b]" : "bg-[#101010] text-[#d4d4d8]"
+    }`}>
+      <div data-testid="diff-panel-title" className={`flex shrink-0 items-center justify-between border-b px-4 py-3 ${
+        isLightTheme ? "border-[#e4e4e7]" : "border-[#252525]"
+      }`}>
         <div className="min-w-0 flex items-center gap-2">
-          <span className="text-[18px] font-bold text-[#f4f4f5]">{gitDiffEntries.length > 0 ? "Git" : language === "zh" ? "未暂存" : "Changes"}</span>
-          <span className="rounded-full bg-[#2b2b2d] px-2.5 py-1 text-[12px] font-bold text-[#d4d4d8]">{files.length}</span>
-          <span className="truncate font-mono text-[12px] text-[#34d399]">+{totals.added}</span>
-          <span className="font-mono text-[12px] text-[#ff5c5c]">-{totals.removed}</span>
+          <span className={`text-[18px] font-bold ${isLightTheme ? "text-[#18181b]" : "text-[#f4f4f5]"}`}>
+            {gitDiffEntries.length > 0 ? "Git" : language === "zh" ? "未暂存" : "Changes"}
+          </span>
+          <span className={`rounded-full px-2.5 py-1 text-[12px] font-bold ${
+            isLightTheme ? "bg-[#e4e4e7] text-[#3f3f46]" : "bg-[#2b2b2d] text-[#d4d4d8]"
+          }`}>
+            {files.length}
+          </span>
+          <span className={`truncate font-mono text-[12px] ${isLightTheme ? "text-[#16a34a]" : "text-[#34d399]"}`}>+{totals.added}</span>
+          <span className={`font-mono text-[12px] ${isLightTheme ? "text-[#dc2626]" : "text-[#ff5c5c]"}`}>-{totals.removed}</span>
           {activeDiffTarget && (
-            <span className="truncate font-mono text-[12px] text-[#a1a1aa]" title={activeDiffTarget}>{activeDiffTarget}</span>
+            <span className={`truncate font-mono text-[12px] ${isLightTheme ? "text-[#71717a]" : "text-[#a1a1aa]"}`} title={activeDiffTarget}>
+              {activeDiffTarget}
+            </span>
           )}
         </div>
         <div className="flex shrink-0 items-center gap-2">
@@ -712,7 +741,11 @@ function DiffReviewPanel({ taskFlow, activeDiffTask, gitDiffEntries = [], gitDif
               data-testid="diff-revert-all"
               disabled={hasRevertingFile}
               onClick={() => void handleRevertFiles(revertableFiles)}
-              className="flex items-center gap-1.5 rounded-md border border-[#7f1d1d]/40 bg-[#1a0b0d] px-2.5 py-1 text-[11px] font-semibold text-[#fca5a5] transition-colors hover:border-[#ef4444]/45 hover:bg-[#2a1013] disabled:cursor-not-allowed disabled:opacity-50"
+              className={`flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-[11px] font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
+                isLightTheme
+                  ? "border-[#fca5a5] bg-[#fef2f2] text-[#991b1b] hover:bg-[#fee2e2] hover:border-[#f87171]"
+                  : "border-[#7f1d1d]/40 bg-[#1a0b0d] text-[#fca5a5] hover:border-[#ef4444]/45 hover:bg-[#2a1013]"
+              }`}
             >
               <IconRefresh className="h-3.5 w-3.5" />
               {language === "zh" ? "撤销全部" : "Revert all"}
@@ -721,7 +754,11 @@ function DiffReviewPanel({ taskFlow, activeDiffTask, gitDiffEntries = [], gitDif
           <button
             type="button"
             onClick={toggleAll}
-            className="rounded-md border border-[#2f2f32] bg-[#181818] px-2.5 py-1 text-[11px] text-[#a1a1aa] transition-colors hover:bg-[#242428] hover:text-[#f4f4f5]"
+            className={`rounded-md border px-2.5 py-1 text-[11px] transition-colors ${
+              isLightTheme
+                ? "border-[#e4e4e7] bg-[#f4f4f5] text-[#52525b] hover:bg-[#e4e4e7] hover:text-[#18181b]"
+                : "border-[#2f2f32] bg-[#181818] text-[#a1a1aa] hover:bg-[#242428] hover:text-[#f4f4f5]"
+            }`}
           >
             {allCollapsed ? (language === "zh" ? "展开全部" : "Expand all") : (language === "zh" ? "折叠全部" : "Collapse all")}
           </button>
@@ -743,8 +780,10 @@ function DiffReviewPanel({ taskFlow, activeDiffTask, gitDiffEntries = [], gitDif
               ? language === "zh" ? "撤销中" : "Reverting"
               : "";
           return (
-            <section key={file.key} className="border-b border-[#202020]">
-              <div className="flex items-center justify-between gap-3 bg-[#101010] px-4 py-3 transition-colors hover:bg-[#181818]">
+            <section key={file.key} className={`border-b ${isLightTheme ? "border-[#e4e4e7]" : "border-[#202020]"}`}>
+              <div className={`flex items-center justify-between gap-3 px-4 py-3 transition-colors ${
+                isLightTheme ? "bg-[#ffffff] hover:bg-[#f4f4f5]" : "bg-[#101010] hover:bg-[#181818]"
+              }`}>
                 <button
                   type="button"
                   onClick={() => setCollapsedFiles((prev) => {
@@ -755,10 +794,20 @@ function DiffReviewPanel({ taskFlow, activeDiffTask, gitDiffEntries = [], gitDif
                   })}
                   className="flex min-w-0 flex-1 items-center gap-2 text-left"
                 >
-                  {collapsed ? <IconChevronRight className="h-4 w-4 text-[#a1a1aa]" /> : <IconChevronUp className="h-4 w-4 text-[#a1a1aa]" />}
-                  <span className="truncate font-mono text-[14px] font-bold text-[#f4f4f5]">{file.displayPath}</span>
+                  {collapsed ? (
+                    <IconChevronRight className={`h-4 w-4 ${isLightTheme ? "text-[#71717a]" : "text-[#a1a1aa]"}`} />
+                  ) : (
+                    <IconChevronUp className={`h-4 w-4 ${isLightTheme ? "text-[#71717a]" : "text-[#a1a1aa]"}`} />
+                  )}
+                  <span className={`truncate font-mono text-[14px] font-bold ${isLightTheme ? "text-[#18181b]" : "text-[#f4f4f5]"}`}>
+                    {file.displayPath}
+                  </span>
                   {file.isGitPreview && (
-                    <span className="rounded-full border border-[#2f2f32] px-1.5 py-0.5 text-[10px] text-[#a1a1aa]">Git</span>
+                    <span className={`rounded-full border px-1.5 py-0.5 text-[10px] ${
+                      isLightTheme ? "border-[#e4e4e7] text-[#71717a]" : "border-[#2f2f32] text-[#a1a1aa]"
+                    }`}>
+                      Git
+                    </span>
                   )}
                 </button>
                 <div className="flex shrink-0 items-center gap-2">
@@ -767,7 +816,11 @@ function DiffReviewPanel({ taskFlow, activeDiffTask, gitDiffEntries = [], gitDif
                       data-testid="diff-revert-status"
                       className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold ${
                         file.revertStatus === "failed"
-                          ? "border-[#7f1d1d]/60 bg-[#2a1013] text-[#fca5a5]"
+                          ? isLightTheme
+                            ? "border-[#fca5a5] bg-[#fef2f2] text-[#991b1b]"
+                            : "border-[#7f1d1d]/60 bg-[#2a1013] text-[#fca5a5]"
+                          : isLightTheme
+                          ? "border-[#86efac] bg-[#f0fdf4] text-[#166534]"
                           : "border-[#14532d]/60 bg-[#0d1f16] text-[#86efac]"
                       }`}
                     >
@@ -775,9 +828,9 @@ function DiffReviewPanel({ taskFlow, activeDiffTask, gitDiffEntries = [], gitDif
                     </span>
                   )}
                   <span className="font-mono text-[14px] font-bold">
-                    <span className="text-[#34d399]">+{file.added}</span>
-                    <span className="mx-1 text-[#52525b]"> </span>
-                    <span className="text-[#ff5c5c]">-{file.removed}</span>
+                    <span className={isLightTheme ? "text-[#16a34a]" : "text-[#34d399]"}>+{file.added}</span>
+                    <span className={`mx-1 ${isLightTheme ? "text-[#a1a1aa]" : "text-[#52525b]"}`}> </span>
+                    <span className={isLightTheme ? "text-[#dc2626]" : "text-[#ff5c5c]"}>-{file.removed}</span>
                   </span>
                   {showRevertButton && (
                     <button
@@ -786,7 +839,11 @@ function DiffReviewPanel({ taskFlow, activeDiffTask, gitDiffEntries = [], gitDif
                       data-diff-path={file.path}
                       disabled={isReverting || file.revertStatus === "reverted"}
                       onClick={() => void handleRevertFiles([file])}
-                      className="flex items-center gap-1.5 rounded-md border border-[#7f1d1d]/40 bg-[#1a0b0d] px-2.5 py-1 text-[11px] font-semibold text-[#fca5a5] transition-colors hover:border-[#ef4444]/45 hover:bg-[#2a1013] disabled:cursor-not-allowed disabled:opacity-50"
+                      className={`flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-[11px] font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
+                        isLightTheme
+                          ? "border-[#fca5a5] bg-[#fef2f2] text-[#991b1b] hover:bg-[#fee2e2] hover:border-[#f87171]"
+                          : "border-[#7f1d1d]/40 bg-[#1a0b0d] text-[#fca5a5] hover:border-[#ef4444]/45 hover:bg-[#2a1013]"
+                      }`}
                       title={file.hasPendingReview
                         ? language === "zh" ? "拒绝这次待审批修改" : "Reject this pending change"
                         : language === "zh" ? "撤销这个文件的修改" : "Revert this file change"}
@@ -802,22 +859,32 @@ function DiffReviewPanel({ taskFlow, activeDiffTask, gitDiffEntries = [], gitDif
                 </div>
               </div>
               {file.revertStatus === "failed" && file.revertMessage && (
-                <div className="border-t border-[#2a1416] bg-[#18090b] px-4 py-2 text-[12px] text-[#fca5a5]">
+                <div className={`border-t px-4 py-2 text-[12px] ${
+                  isLightTheme ? "border-[#fca5a5] bg-[#fef2f2] text-[#991b1b]" : "border-[#2a1416] bg-[#18090b] text-[#fca5a5]"
+                }`}>
                   {file.revertMessage}
                 </div>
               )}
 
               {!collapsed && (
                 file.isBinaryLike ? (
-                  <div className="flex h-20 items-center justify-center border-t border-[#252525] bg-[#242424] text-[13px] font-semibold text-[#a1a1aa]">
+                  <div className={`flex h-20 items-center justify-center border-t text-[13px] font-semibold ${
+                    isLightTheme ? "border-[#e4e4e7] bg-[#f4f4f5] text-[#71717a]" : "border-[#252525] bg-[#242424] text-[#a1a1aa]"
+                  }`}>
                     {language === "zh" ? "无内容" : "No content"}
                   </div>
                 ) : (
-                  <div className="overflow-x-auto bg-[#121212] font-mono text-[13px] leading-[22px]" style={{ fontFamily: CODE_FONT_FAMILY }}>
+                  <div className={`overflow-x-auto font-mono text-[13px] leading-[22px] ${
+                    isLightTheme ? "bg-[#ffffff]" : "bg-[#121212]"
+                  }`} style={{ fontFamily: CODE_FONT_FAMILY }}>
                     {rows.map((row) => (
                       row.kind === "fold" ? (
-                        <div key={row.id} className="flex min-w-max border-y border-[#20242a] bg-[#1b1f26] text-[#a1a1aa]">
-                          <div className="flex w-[72px] shrink-0 items-center justify-center border-r border-[#252a31] text-[#a1a1aa]">
+                        <div key={row.id} className={`flex min-w-max border-y ${
+                          isLightTheme ? "border-[#e2e8f0] bg-[#f8fafc] text-[#64748b]" : "border-[#20242a] bg-[#1b1f26] text-[#a1a1aa]"
+                        }`}>
+                          <div className={`flex w-[72px] shrink-0 items-center justify-center border-r ${
+                            isLightTheme ? "border-[#e2e8f0] text-[#64748b]" : "border-[#252a31] text-[#a1a1aa]"
+                          }`}>
                             <IconChevronDown className="h-3.5 w-3.5" />
                           </div>
                           <div className="px-4 py-1.5 text-[13px] font-semibold">
@@ -829,16 +896,46 @@ function DiffReviewPanel({ taskFlow, activeDiffTask, gitDiffEntries = [], gitDif
                           key={row.id}
                           className={`flex min-w-max ${
                             row.type === "added"
-                              ? "bg-[#173522] text-[#86d9a3]"
+                              ? isLightTheme
+                                ? "bg-[#e6f4ea] text-[#137333]"
+                                : "bg-[#173522] text-[#86d9a3]"
                               : row.type === "removed"
-                              ? "bg-[#3a1d1f] text-[#ff6464]"
+                              ? isLightTheme
+                                ? "bg-[#fce8e6] text-[#c5221f]"
+                                : "bg-[#3a1d1f] text-[#ff6464]"
+                              : isLightTheme
+                              ? "text-[#3c4043]"
                               : "text-[#a6a6ad]"
                           }`}
                         >
-                          <div className={`w-[48px] shrink-0 select-none border-r border-[#252525] pr-2 text-right ${row.type === "added" ? "text-[#34d399]" : row.type === "removed" ? "text-[#ff4d4d]" : "text-[#8f8f98]"}`}>
+                          <div className={`w-[48px] shrink-0 select-none border-r pr-2 text-right ${
+                            row.type === "added"
+                              ? isLightTheme
+                                ? "border-[#ceebd6] text-[#137333]"
+                                : "border-[#252525] text-[#34d399]"
+                              : row.type === "removed"
+                              ? isLightTheme
+                                ? "border-[#fad2cf] text-[#c5221f]"
+                                : "border-[#252525] text-[#ff4d4d]"
+                              : isLightTheme
+                              ? "border-[#f1f3f4] text-[#9aa0a6]"
+                              : "border-[#252525] text-[#8f8f98]"
+                          }`}>
                             {row.type === "added" ? row.newLine : row.oldLine}
                           </div>
-                          <div className={`w-[24px] shrink-0 select-none text-center ${row.type === "added" ? "text-[#34d399]" : row.type === "removed" ? "text-[#ff4d4d]" : "text-[#52525b]"}`}>
+                          <div className={`w-[24px] shrink-0 select-none text-center ${
+                            row.type === "added"
+                              ? isLightTheme
+                                ? "text-[#137333]"
+                                : "text-[#34d399]"
+                              : row.type === "removed"
+                              ? isLightTheme
+                                ? "text-[#c5221f]"
+                                : "text-[#ff4d4d]"
+                              : isLightTheme
+                              ? "text-[#bdc1c6]"
+                              : "text-[#52525b]"
+                          }`}>
                             {row.type === "added" ? "+" : row.type === "removed" ? "-" : ""}
                           </div>
                           <pre className="m-0 flex-1 whitespace-pre px-2 text-inherit">{row.text || " "}</pre>
@@ -1098,31 +1195,55 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
   const terminalSessionKey = resolveSessionRuntimeKey(resolveSessionWorkspaceKey(currentWorkspace), currentSessionId) || undefined;
   const isBlackTheme = config.themeMode === "black";
 
+  const isLightTheme = config.themeMode === "light";
+
   if (!isVisible) return null;
 
   const HeaderIcon = panelMeta.icon;
 
   return (
     <>
-      <div className="w-1 cursor-col-resize hover:bg-[#3f3f46] active:bg-[#555] z-20 transition-colors" onMouseDown={startResizing} />
+      <div className={`w-1 cursor-col-resize z-20 transition-colors ${
+        isLightTheme ? "hover:bg-[#d4d4d8] active:bg-[#a1a1aa]" : "hover:bg-[#3f3f46] active:bg-[#555]"
+      }`} onMouseDown={startResizing} />
       <div
-        className={`flex min-w-0 flex-col shrink-0 border-l border-[#27272a] z-10 ${
-          isBlackTheme ? "bg-[rgba(0,0,0,0.96)]" : "bg-[#000000]"
+        className={`flex min-w-0 flex-col shrink-0 border-l z-10 ${
+          isLightTheme
+            ? "border-[#e4e4e7] bg-[#ffffff] text-[#18181b]"
+            : isBlackTheme
+            ? "border-[#27272a] bg-[rgba(0,0,0,0.96)] text-[#d4d4d8]"
+            : "border-[#27272a] bg-[#000000] text-[#d4d4d8]"
         }`}
         style={{ width: `${rightPanelWidth}px`, display: window.innerWidth < 1220 ? "none" : "flex" }}
       >
-        <div className={`min-h-[56px] shrink-0 border-b border-[#27272a] px-3 py-2 flex items-center justify-between gap-3 ${
-          isBlackTheme ? "bg-[#050506]" : "bg-[#09090b]"
+        <div className={`min-h-[56px] shrink-0 border-b px-3 py-2 flex items-center justify-between gap-3 ${
+          isLightTheme
+            ? "border-[#e4e4e7] bg-[#fafafa]"
+            : isBlackTheme
+            ? "border-[#27272a] bg-[#050506]"
+            : "border-[#27272a] bg-[#09090b]"
         }`}>
           <div className="min-w-0 flex items-center gap-3">
-            <div className="flex h-8 w-8 items-center justify-center rounded-lg border border-[#27272a] bg-[#050505] text-[#e4e4e7]">
+            <div className={`flex h-8 w-8 items-center justify-center rounded-lg border ${
+              isLightTheme
+                ? "border-[#e4e4e7] bg-[#ffffff] text-[#18181b]"
+                : "border-[#27272a] bg-[#050505] text-[#e4e4e7]"
+            }`}>
               <HeaderIcon className="h-4 w-4" />
             </div>
             <div className="min-w-0">
               <div className="flex items-center gap-2">
-                <div className="truncate text-[12px] font-semibold text-[#e4e4e7]">{panelMeta.title}</div>
+                <div className={`truncate text-[12px] font-semibold ${
+                  isLightTheme ? "text-[#18181b]" : "text-[#e4e4e7]"
+                }`}>{panelMeta.title}</div>
                 {rightPanelTab === "plan" && (
-                  <span className={`shrink-0 whitespace-nowrap rounded-full border px-2 py-0.5 text-[10px] ${(isAwaitingApproval || isAwaitingInput) ? "border-[rgba(251,191,36,0.25)] bg-[rgba(251,191,36,0.12)] text-[#fbbf24]" : "border-[#27272a] bg-[#050505] text-[#a1a1aa]"}`}>
+                  <span className={`shrink-0 whitespace-nowrap rounded-full border px-2 py-0.5 text-[10px] ${
+                    (isAwaitingApproval || isAwaitingInput)
+                      ? "border-[rgba(251,191,36,0.25)] bg-[rgba(251,191,36,0.12)] text-[#fbbf24]"
+                      : isLightTheme
+                      ? "border-[#e4e4e7] bg-[#ffffff] text-[#71717a]"
+                      : "border-[#27272a] bg-[#050505] text-[#a1a1aa]"
+                  }`}>
                     {isAwaitingApproval
                       ? language === "zh" ? "待审批" : "Awaiting Approval"
                       : isAwaitingInput
@@ -1139,7 +1260,9 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
             </div>
           </div>
 
-          <button onClick={closeRightPanel} className="text-[#a1a1aa] hover:text-white transition-colors p-1">
+          <button onClick={closeRightPanel} className={`p-1 transition-colors ${
+            isLightTheme ? "text-[#71717a] hover:text-[#18181b]" : "text-[#a1a1aa] hover:text-white"
+          }`}>
             <IconClose className="w-4 h-4" />
           </button>
         </div>
@@ -1182,6 +1305,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
               gitDiffEntries={gitDiffPreview?.entries || []}
               gitDiffSourceLabel={gitDiffPreview?.sourceLabel}
               language={language}
+              themeMode={config.themeMode}
             />
           )}
 

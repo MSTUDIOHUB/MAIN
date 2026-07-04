@@ -8,7 +8,7 @@ export interface AgentLoopIterationLimits {
 
 export const DEFAULT_AGENT_LOOP_ITERATION_LIMITS = {
   chatRespond: 25,
-  editExecute: 25,
+  editExecute: 50,
   planDraft: 25,
   planExecution: 50,
   default: 25,

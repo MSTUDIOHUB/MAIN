@@ -2969,117 +2969,71 @@ export default function SettingsModal({
       <div className="flex items-start justify-between mb-3">
         <div>
           <div className="flex items-center gap-2 mb-1">
-            <span style={{ color: pressure.main }} className="text-[14px]">⚡</span>
+            <span className="text-[14px] text-[#34d399]">⚡</span>
             <label className="text-[13px] font-bold text-[#e4e4e7]">{t.contextLimit}</label>
           </div>
-          <p className="text-[11px] text-[#a1a1aa] leading-relaxed max-w-[420px]">{t.contextLimitDesc}</p>
+          <p className="text-[11px] text-[#a1a1aa] leading-relaxed max-w-[460px]">{t.contextLimitDesc}</p>
         </div>
         <div className="text-right">
-          <span className="block text-[11px] font-bold text-[#a1a1aa] mb-0.5">{compressionLabel}</span>
-          <span className="font-mono text-[22px] font-bold" style={{ color: pressure.main }}>
-            {Math.round(contextRatio * 100)}%
+          <span className="inline-flex items-center gap-1.5 rounded-full border border-[#166534] bg-[#052e16] px-2.5 py-1 text-[11px] font-bold text-[#86efac]">
+            <span className="h-1.5 w-1.5 rounded-full bg-[#34d399] animate-pulse" />
+            {language === "zh" ? "全动态自动护航" : "Auto Managed"}
           </span>
-          <p className="text-[10px] text-[#71717a]">{compressionHint}</p>
         </div>
       </div>
 
-      {/* Gradient slider */}
-      <div className="relative mb-2">
-        <input
-          type="range" min={contextMin} max={contextMax} step="4096"
-          value={displayedContextLimit}
-          onChange={(e) => setConfig({ ...config, local: { ...config.local, contextLimit: parseInt(e.target.value) } })}
-          className="w-full cursor-pointer vram-gradient-slider"
-          style={{ '--slider-pct': `${contextRatio * 100}%` } as React.CSSProperties}
-        />
-      </div>
-
-      {/* Zone labels */}
-      <div className="flex justify-between text-[10px] font-bold uppercase tracking-wider mb-4">
-        <span style={{ color: contextRatio < 0.3 ? '#60a5fa' : '#3f3f46' }}>{copy.zoneLow}</span>
-        <span style={{ color: contextRatio >= 0.3 && contextRatio < 0.7 ? '#a78bfa' : '#3f3f46' }}>{copy.zoneBalanced}</span>
-        <span style={{ color: contextRatio >= 0.7 ? '#f97316' : '#3f3f46' }}>{copy.zoneLong}</span>
-      </div>
-
-      {/* Stats panel */}
-      <div className="bg-[#000000] border border-[#27272a] rounded-lg p-4 shadow-inner">
-        <div className="flex items-center justify-between gap-4">
-          {/* Left: Max Tokens */}
-          <div className="flex-1">
-            <p className="text-[10px] text-[#71717a] uppercase tracking-wider mb-1">{copy.contextTriggerThreshold}</p>
-            <div className="flex items-center gap-2">
-              <span className="font-mono text-[16px] font-bold text-[#86d9a3]">
-                ~ {displayedContextLimit.toLocaleString()}
-              </span>
-              {tokenReduction > 0 && (
-                <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-[#0f2e0f] text-[#86d9a3] border border-[#1a3e1a]">
-                  -{tokenReduction}%
-                </span>
-              )}
+      {/* Auto-Managed Info Card */}
+      <div className="bg-[#09090b] border border-[#27272a] rounded-xl p-5 space-y-4 shadow-inner">
+        <div className="flex items-center justify-between border-b border-[#18181b] pb-3">
+          <div>
+            <span className="text-[10px] uppercase font-bold tracking-wider text-[#71717a]">
+              {language === "zh" ? "当前模型最大 Context Window" : "Detected Model Context Window"}
+            </span>
+            <div className="font-mono text-[18px] font-bold text-[#f4f4f5] mt-0.5">
+              ~ {displayedContextLimit.toLocaleString()} Tokens
             </div>
           </div>
-
-          {/* Divider */}
-          <div className="w-px h-10 bg-[#27272a]" />
-
-          {/* Right: Est. VRAM */}
-          <div className="flex-1">
-            <p className="text-[10px] text-[#71717a] uppercase tracking-wider mb-1">{copy.estimatedContextVram}</p>
-            <div className="flex items-center gap-2.5">
-              <span className="font-mono text-[16px] font-bold" style={{ color: pressure.main }}>
-                {vramInfo.text}
-              </span>
-              <div className="flex-1 max-w-[80px] h-2 bg-[#18181b] rounded-full overflow-hidden border border-[#27272a]">
-                <div
-                  className="h-full rounded-full transition-all duration-300"
-                  style={{
-                    width: `${vramRatio * 100}%`,
-                    background: `linear-gradient(90deg, ${pressure.main}, ${pressure.main}88)`,
-                  }}
-                />
-              </div>
+          <div className="text-right">
+            <span className="text-[10px] uppercase font-bold tracking-wider text-[#71717a]">
+              {language === "zh" ? "状态" : "Status"}
+            </span>
+            <div className="text-[12px] font-semibold text-[#34d399]">
+              {language === "zh" ? "无需手动配置" : "Zero Config Active"}
             </div>
-            <p className="mt-1 text-[10px] text-[#71717a]">
-              {copy.currentLimit(contextMax.toLocaleString())}
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3 pt-1">
+          <div className="rounded-lg border border-[#27272a] bg-[#121215] p-3">
+            <div className="flex items-center gap-1.5 text-[12px] font-bold text-[#34d399] mb-1">
+              <span>🛡️</span>
+              <span>{language === "zh" ? "动态文件门控" : "File Read Gate"}</span>
+            </div>
+            <p className="text-[11px] text-[#a1a1aa] leading-snug">
+              {language === "zh" ? "根据剩余 Token 动态分页大文件，拦截撑爆上下文的巨型读取。" : "Automatically windows large reads exceeding 70% of available budget."}
+            </p>
+          </div>
+
+          <div className="rounded-lg border border-[#27272a] bg-[#121215] p-3">
+            <div className="flex items-center gap-1.5 text-[12px] font-bold text-[#60a5fa] mb-1">
+              <span>⚡</span>
+              <span>{language === "zh" ? "80% 渐进微压缩" : "Micro Compaction @80%"}</span>
+            </div>
+            <p className="text-[11px] text-[#a1a1aa] leading-snug">
+              {language === "zh" ? "输入达到 80% 预算时自动精简工具日志与重复回显。" : "Strips redundant tool logs automatically as budget reaches 80%."}
+            </p>
+          </div>
+
+          <div className="rounded-lg border border-[#27272a] bg-[#121215] p-3">
+            <div className="flex items-center gap-1.5 text-[12px] font-bold text-[#a78bfa] mb-1">
+              <span>🧠</span>
+              <span>{language === "zh" ? "90% 状态记忆快照" : "ContextState @90%"}</span>
+            </div>
+            <p className="text-[11px] text-[#a1a1aa] leading-snug">
+              {language === "zh" ? "输入达到 90% 时提取结构化计划记忆，保障对话永中断。" : "Archives structured task state so long turns never lose key context."}
             </p>
           </div>
         </div>
-
-        {/* Device memory bar */}
-        {systemMemory && (
-          <div className="mt-3 pt-3 border-t border-[#18181b] flex items-center gap-2.5">
-            <span className="text-[10px] text-[#3f3f46]">🖥</span>
-            <div className="flex-1">
-              <div className="flex items-center justify-between mb-1">
-                <span className="text-[10px] text-[#71717a]">{copy.deviceMemory}</span>
-                <span className="text-[10px] font-mono text-[#a1a1aa]">
-                  {systemMemory.available_gb} / {systemMemory.total_gb} GB {copy.available}
-                </span>
-              </div>
-              <div className="h-1.5 bg-[#18181b] rounded-full overflow-hidden border border-[#27272a]">
-                <div
-                  className="h-full rounded-full transition-all duration-500"
-                  style={{
-                    width: `${(1 - systemMemory.available_gb / systemMemory.total_gb) * 100}%`,
-                    background: `linear-gradient(90deg, #22c55e 0%, ${pressure.main} 100%)`,
-                  }}
-                />
-            </div>
-            <p className="mt-1 text-[10px] text-[#71717a]">
-              {copy.maxBar(maxVramInfo.text, !!safeKvCacheGb)}
-            </p>
-          </div>
-        </div>
-        )}
-      </div>
-
-      <p className="text-[11px] text-[#71717a] italic">{t.vramNote}</p>
-
-      {/* Tip */}
-      <div className="p-3 bg-[#000000] border border-[#27272a] rounded-md">
-        <p className="text-[11px] text-[#71717a] leading-relaxed">
-          <span className="text-[#a1a1aa]">{copy.tipLabel}</span>：{copy.contextTip}
-        </p>
       </div>
     </div>
   );
