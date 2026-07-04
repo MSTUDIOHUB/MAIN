@@ -3869,7 +3869,9 @@ export class AgentOrchestrator {
           callbacks.onStatusChange("running");
           callbacks.appendMessage({
             role: "user",
-            content: buildReadOnlyPermissionContinuationPrompt(callbacks.getPreferredLanguage()),
+            content: buildReadOnlyPermissionContinuationPrompt(callbacks.getPreferredLanguage(), {
+              allowFileRead: availableToolNames.has("read_file"),
+            }),
           });
           continue;
         }

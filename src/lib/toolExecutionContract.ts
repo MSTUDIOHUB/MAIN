@@ -8,15 +8,13 @@ function normalizeRelativeCwd(value: string): string {
   return value.replace(/\\/g, "/").replace(/\/+/g, "/").trim();
 }
 
-export function getShellToolCwd(args: Record<string, unknown>): string | null {
-  const raw = asNonEmptyString(args.cwd) ?? asNonEmptyString(args.workdir);
-  return raw ? normalizeRelativeCwd(raw) : null;
+export function getShellToolCwd(args: Record<string, unknown>): string {
+  const raw = asNonEmptyString(args.cwd) ?? asNonEmptyString(args.workdir) ?? asNonEmptyString(args.Cwd);
+  return raw ? normalizeRelativeCwd(raw) : ".";
 }
 
 export function validateShellToolCwd(cwd: string | null): string | null {
-  if (!cwd) {
-    return "Shell tool calls must include `cwd` (or `workdir`). Use `.` for the workspace root.";
-  }
+  if (!cwd) return null;
 
   if (cwd.startsWith("/") || /^[A-Za-z]:\//.test(cwd)) {
     return "Shell tool `cwd` must be workspace-relative. Use `.` for the workspace root or a relative subdirectory.";
@@ -32,10 +30,6 @@ export function validateShellToolCwd(cwd: string | null): string | null {
 
 export function validateShellToolContract(name: string, args: Record<string, unknown>): string | null {
   if (!SHELL_EXECUTION_TOOLS.has(name)) return null;
-
-  if (!asNonEmptyString(args.description)) {
-    return `Tool '${name}' is missing required execution metadata: description. Provide a concise user-facing reason for the command.`;
-  }
 
   const cwdError = validateShellToolCwd(getShellToolCwd(args));
   if (cwdError) {

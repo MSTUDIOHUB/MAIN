@@ -592,7 +592,13 @@ export function stripReadOnlyPermissionPrompt(text: string): string {
   return original.trim();
 }
 
-export function buildReadOnlyPermissionContinuationPrompt(language: "zh" | "en"): string {
+export function buildReadOnlyPermissionContinuationPrompt(language: "zh" | "en", options?: { allowFileRead?: boolean }): string {
+  const allowFileRead = options?.allowFileRead !== false;
+  if (!allowFileRead) {
+    return language === "zh"
+      ? "用户已允许本会话内后续步骤。当前处于恢复聚焦模式，宽泛读取工具已收起，重点开放了代码修改 (replace_in_file, write_file, apply_patch) 与命令/验证工具。不要再请求 read_file 或询问许可，请基于已有上下文直接调用修改工具或验证工具继续。"
+      : "The user has allowed execution steps for this session. Broad read tools are currently restricted in recovery mode; modification tools (replace_in_file, write_file, apply_patch) and command/validation tools are active. Do not request read_file or ask for permission again; use available modification or validation tools directly.";
+  }
   return language === "zh"
     ? "用户已允许本会话内后续只读读取、搜索、查看、查询和分析步骤。不要再询问是否同意，也不要输出过渡台词；请立即调用合适的只读工具继续当前任务，例如 `read_file`、`get_file_outline`、`grep_search`、`glob_search`、`read_document`、`analyze_tabular_document` 或 `query_tabular_document`。"
     : "The user has allowed read-only reading, searching, inspecting, querying, and analysis steps for this session. Do not ask for permission again or output process filler; immediately call the appropriate read-only tool such as `read_file`, `get_file_outline`, `grep_search`, `glob_search`, `read_document`, `analyze_tabular_document`, or `query_tabular_document`.";

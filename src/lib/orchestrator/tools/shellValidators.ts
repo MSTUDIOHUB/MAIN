@@ -21,6 +21,20 @@ function shellSegmentWords(segment: string): string[] {
   ) || [];
 }
 
+function isLogFileOperand(arg: string): boolean {
+  const lower = String(arg || "").toLowerCase();
+  return (
+    lower.endsWith(".log") ||
+    lower.endsWith(".out") ||
+    lower.endsWith(".err") ||
+    lower.includes("/logs/") ||
+    lower.includes("/log/") ||
+    lower.includes("editor.log") ||
+    lower.includes("build.log") ||
+    lower.includes("main-debug.log")
+  );
+}
+
 function catHeadTailSegmentHasFileOperand(command: string, args: string[]): boolean {
   const normalizedCommand = command.toLowerCase();
   let skipNextOptionValue = false;
@@ -38,6 +52,7 @@ function catHeadTailSegmentHasFileOperand(command: string, args: string[]): bool
     if (normalizedCommand !== "cat" && /^(?:--lines=|--bytes=)/.test(arg)) continue;
     if (normalizedCommand !== "cat" && /^-\d+$/.test(arg)) continue;
     if (/^-/.test(arg)) continue;
+    if (isLogFileOperand(arg)) continue;
     return true;
   }
   return false;
@@ -67,6 +82,7 @@ function sedSegmentHasFileOperand(args: string[]): boolean {
       consumedScript = true;
       continue;
     }
+    if (isLogFileOperand(arg)) continue;
     return true;
   }
   return false;
