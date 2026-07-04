@@ -3162,6 +3162,31 @@ export function formatCachedReadOnlyToolResult(
   ].filter(Boolean).join("\n");
 }
 
+export function buildGenericObservationContinuationPrompt(
+  language: "zh" | "en",
+  toolName: string,
+  target: string,
+  duplicateCount: number,
+): string {
+  const targetDesc = target ? ` (${target})` : "";
+  if (language === "zh") {
+    return [
+      `[OBSERVATION_CHECKPOINT] 检查/诊断工具 ${toolName}${targetDesc} 在本轮已重复调用 ${duplicateCount} 次。`,
+      "通用流程确认与阶段指引：",
+      "1. 【现象与证据确认】：复用上面已返回的诊断/日志/文件内容，在正文中简要确认关键报错堆栈、行号或修改点。",
+      "2. 【进入实施/验证】：如果证据已足够，请直接调用代码修改工具 (replace_in_file / apply_patch / write_file) 实施修补或运行验证命令；不要原样重复刷读取。",
+      "3. 【阻塞明确】：如因缺少其他信息无法继续，请在回复中说明具体阻塞或使用 <user_options> 请用户确认。",
+    ].join("\n");
+  }
+  return [
+    `[OBSERVATION_CHECKPOINT] Inspection/diagnostic tool ${toolName}${targetDesc} has been invoked ${duplicateCount} times in this turn.`,
+    "Workflow Validation Protocol:",
+    "1. [Evidence Confirmation]: Synthesize the retrieved error log, file content, or DOM state in prose to confirm line numbers or root cause.",
+    "2. [Phase Advancement]: If evidence is sufficient, proceed directly to code modification (replace_in_file / apply_patch / write_file) or verification commands; do not re-run identical reads.",
+    "3. [Blocker Escalation]: If information is incomplete and unretrievable, explain the concrete blocker or offer <user_options>.",
+  ].join("\n");
+}
+
 export function appendPlanRepeatReadLimitGuidance(
   content: string,
   language: "zh" | "en",
