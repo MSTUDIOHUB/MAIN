@@ -745,10 +745,14 @@ export class AgentOrchestrator {
         let chatFinalSynthesisReason = "";
         let usedChatFinalSynthesisPrompt = false;
         let currentMaxTokens: number | undefined;
-        const getMaxOutputEscalations = () =>
-                workflowMode === "plan" && !callbacks.getIsPlanApproved()
+        const getMaxOutputEscalations = () => {
+                // Disable output escalation during recovery mode to prevent
+                // 60-120s wasted reasoning dumps that get truncated anyway.
+                if (executeRecoveryMode !== "normal") return 0;
+                return workflowMode === "plan" && !callbacks.getIsPlanApproved()
                   ? 0
                   : 2;
+        };
         let loggedLocalPlanNoVisibleTokenNoticeOnly = false;
         const getPlanStreamWatchdogOptions = (nativeToolCount: number): FetchLLMStreamOptions | undefined => {
                 const watchdogEnabled = shouldUsePlanNoVisibleTokenWatchdog({
@@ -860,6 +864,7 @@ export class AgentOrchestrator {
         let executeRecoveryReason = executeRecoveryMode === "normal" ? "" : "forced_execute_recovery";
         let executeRecoveryAttempts = executeRecoveryMode === "normal" ? 0 : 1;
         let consecutiveBlockedReadFileInRecoveryCount = 0;
+        let recoveryIterationCount = 0;  // Tracks actual iterations elapsed since entering recovery
         const activateExecuteRecovery = (
                 mode: Exclude<ExecuteRecoveryMode, "normal">,
                 reason: string,
@@ -897,17 +902,24 @@ export class AgentOrchestrator {
                   ...context,
                 });
               };
-        const clearExecuteRecovery = (reason: string) => {
+        const clearExecuteRecovery = (reason: string, resetTarget?: string) => {
                 if (executeRecoveryMode === "normal") return;
                 logAgentEvent("execute_recovery_cleared", {
                   iteration,
                   previousMode: executeRecoveryMode,
                   executeRecoveryAttempts,
                   reason,
+                  resetTarget: resetTarget || null,
                 });
                 executeRecoveryMode = "normal";
                 executeRecoveryReason = "";
                 executeRecoveryAttempts = 0;
+                recoveryIterationCount = 0;
+                // Reset cross-iteration read counts for the affected target to
+                // prevent the same target from immediately re-triggering recovery.
+                if (resetTarget && crossIterationFileReads.has(resetTarget)) {
+                  crossIterationFileReads.delete(resetTarget);
+                }
               };
         const rememberToolActivity = (targetList: PlanToolActivitySummary[], result: ToolExecutionResult) => {
                 if (result.internalFeedback) return;
@@ -1418,6 +1430,32 @@ export class AgentOrchestrator {
         const rawIterationAllTools = finalTextOnlyStep || chatFinalSynthesisActive
           ? []
           : resolveAllToolsForRuntime(runtimeIntent);
+        // ── Max recovery iteration guard ─────────────────────────────────
+        // If recovery mode has persisted for 6+ iterations without producing
+        // a successful mutation, it's likely deadlocked (e.g., can't read
+        // file content to produce correct patches). Auto-exit recovery and
+        // give the model full tools back with guidance.
+        const MAX_RECOVERY_ITERATIONS = 6;
+        if (executeRecoveryMode !== "normal") {
+          recoveryIterationCount += 1;
+        }
+        if (executeRecoveryMode !== "normal" && recoveryIterationCount >= MAX_RECOVERY_ITERATIONS) {
+          const language = callbacks.getPreferredLanguage();
+          logAgentEvent("execute_recovery_max_iterations_reached", {
+            iteration,
+            executeRecoveryMode,
+            executeRecoveryAttempts,
+            recoveryIterationCount,
+            MAX_RECOVERY_ITERATIONS,
+          });
+          clearExecuteRecovery("max_recovery_iterations_reached");
+          callbacks.appendMessage({
+            role: "system",
+            content: language === "zh"
+              ? `[System: 恢复模式已持续 ${MAX_RECOVERY_ITERATIONS} 次迭代未取得进展。已自动退出恢复模式，所有工具已恢复可用。请重新读取目标文件（使用 start_line/max_lines 限定范围），然后执行修改。如果确实无法完成，请向用户说明原因。]`
+              : `[System: Recovery mode has persisted for ${MAX_RECOVERY_ITERATIONS} iterations without progress. Exiting recovery — all tools are now available. Re-read the target file (with start_line/max_lines), then make your edit. If genuinely blocked, explain why to the user.]`,
+          });
+        }
         const isExecuteRecoveryEligible =
           (workflowMode === "edit" || (workflowMode === "plan" && callbacks.getIsPlanApproved())) &&
           runtimeIntent === "execute" &&
@@ -1614,6 +1652,44 @@ export class AgentOrchestrator {
                 error: (compressErr as Error).message || String(compressErr),
                 reason: 'execute_recovery_context_trim',
               });
+            }
+          }
+
+          // ── Adaptive File Read (Context Preservation) ──────────────────────
+          // If context was compacted during recovery, the model might lose the
+          // file content it needs to produce a correct patch. If we have the
+          // target file in the read cache, inject a truncated version of it as
+          // a system message so the model isn't completely blind.
+          if (executeRecoveryMode !== "normal" && recentToolActivity.length > 0) {
+            const lastActivity = recentToolActivity[recentToolActivity.length - 1];
+            if (lastActivity && lastActivity.target && lastActivity.status === "failed") {
+              const targetPath = lastActivity.target.trim().replace(/^['"]|['"]$/g, '');
+              let matchedState;
+              for (const state of fileReadStates.values()) {
+                if (targetPath.includes(state.path) || state.path.includes(targetPath)) {
+                  matchedState = state;
+                  break;
+                }
+              }
+              if (matchedState && matchedState.modelContent) {
+                // Extract first 150 lines to give the model a fighting chance
+                const lines = matchedState.modelContent.split('\n');
+                const truncatedContent = lines.slice(0, 150).join('\n');
+                const isTruncated = lines.length > 150;
+                const language = callbacks.getPreferredLanguage();
+                const adaptiveMessage = language === "zh"
+                  ? `[System: 恢复模式自适应上下文保留] 这是你最近尝试修改但失败的文件 (${matchedState.path}) 的缓存内容${isTruncated ? '（前 150 行）' : ''}：\n\n${truncatedContent}\n\n[请基于此内容重新生成正确的修改操作]`
+                  : `[System: Recovery Mode Adaptive Context] Here is the cached content of the file you recently failed to edit (${matchedState.path})${isTruncated ? ' (first 150 lines)' : ''}:\n\n${truncatedContent}\n\n[Please base your corrected edit on this content]`;
+                managedAgentMessages = [
+                  ...managedAgentMessages,
+                  { role: "system", content: adaptiveMessage } as AgentMessage
+                ];
+                logAgentEvent("execute_recovery_adaptive_context_injected", {
+                  iteration,
+                  target: matchedState.path,
+                  lines: Math.min(lines.length, 150),
+                });
+              }
             }
           }
           executeRecoveryContextAlreadyCompacted = true;
@@ -6107,7 +6183,12 @@ export class AgentOrchestrator {
           approvedPlanNoProgressRecoveryAttempts = 0;
         }
         if (workflowMode === "edit" && nonReadOnlySuccessfulResultCount > 0) {
-          clearExecuteRecovery("action_evidence_observed");
+          // Pass the first successful result's target to reset its cross-iteration
+          // read counter, preventing the same file from immediately re-triggering recovery.
+          const firstSuccessTarget = allResults.find(
+            (r) => !r.isError && !r.internalFeedback && !PLAN_EXPLORATION_READ_ONLY_TOOLS.has(r.name)
+          )?.target;
+          clearExecuteRecovery("action_evidence_observed", firstSuccessTarget || undefined);
         }
         const hasPlanDecisionOutput =
           hasStructuredProposal ||
@@ -6764,7 +6845,14 @@ export class AgentOrchestrator {
                 if (!result.isError) {
                   crossIterationFileReads.set(target, (crossIterationFileReads.get(target) || 0) + 1);
                   const count = crossIterationFileReads.get(target)!;
-                  if (count >= 5) {
+                  // Dynamic threshold based on context window size:
+                  // Small local models (≤16K) get caught earlier (3),
+                  // medium models (16K-64K) at 4, large models (>64K) at 5.
+                  const effectiveContextLimit = snapshotContextLimit ?? 128000;
+                  const crossReadThreshold = effectiveContextLimit <= 16384 ? 3
+                    : effectiveContextLimit <= 65536 ? 4
+                    : 5;
+                  if (count >= crossReadThreshold) {
                     const language = callbacks.getPreferredLanguage();
                     activateExecuteRecovery("mutation_first", "cross_iteration_file_read_loop", {
                       target,

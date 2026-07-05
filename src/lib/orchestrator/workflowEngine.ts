@@ -755,9 +755,39 @@ export class WorkflowEngine {
         }
         if (remainingAgent) {
           if (context.currentStreamingBlockId === null) {
-            const blockId = sessionGet()._nextTaskId();
-            context.currentStreamingBlockId = blockId;
-            appendTurnBlock({ id: blockId, turnId, type: "agent", content: remainingAgent, streaming: true });
+            // ── Duplicate agent block deduplication ──────────────────────
+            // When the model outputs the same visible text across consecutive
+            // iterations (e.g., repeated "I need to read file X" preambles),
+            // replace the last agent block instead of appending a duplicate.
+            const currentTaskFlow = sessionGet().taskFlow;
+            const lastAgentBlock = [...currentTaskFlow]
+              .reverse()
+              .find((t: any) => t.turnId === turnId && t.type === "agent" && !t.streaming) as any;
+            const trimmedNew = remainingAgent.trim();
+            const trimmedLast = lastAgentBlock ? String(lastAgentBlock.content || "").trim() : "";
+            const isDuplicate = trimmedLast.length > 0 && trimmedNew.length > 0 && (
+              trimmedNew === trimmedLast ||
+              // Near-duplicate: same first 80% of content (handles minor suffix differences)
+              (trimmedNew.length >= 20 && trimmedLast.length >= 20 &&
+                trimmedNew.slice(0, Math.floor(trimmedNew.length * 0.8)) ===
+                trimmedLast.slice(0, Math.floor(trimmedLast.length * 0.8)))
+            );
+            if (isDuplicate && lastAgentBlock) {
+              // Replace the existing block content instead of creating a new one
+              const existingId = lastAgentBlock.id;
+              sessionSet((s: AppState) => ({
+                taskFlow: s.taskFlow.map((t: TaskBlock) =>
+                  t.id === existingId && t.type === "agent"
+                    ? { ...t, content: remainingAgent }
+                    : t
+                ),
+              }));
+              context.currentStreamingBlockId = existingId;
+            } else {
+              const blockId = sessionGet()._nextTaskId();
+              context.currentStreamingBlockId = blockId;
+              appendTurnBlock({ id: blockId, turnId, type: "agent", content: remainingAgent, streaming: true });
+            }
           } else {
             const blockId = context.currentStreamingBlockId;
             sessionSet((s: AppState) => ({

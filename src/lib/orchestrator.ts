@@ -920,8 +920,8 @@ export function buildShellReadValidationError(
   if (isShellRead) {
     const language = callbacks.getPreferredLanguage();
     const message = language === "zh"
-      ? `SHELL_READ_FORBIDDEN: 禁止通过终端命令 (${command}) 直接读取文件内容以防止上下文过载。read_file 可用时请使用 read_file + start_line/max_lines；恢复模式未开放 read_file 时，请使用 grep_search/get_file_outline 或基于已有缓存直接 patch/验证/最终说明，不要改用 cat/sed/head/tail 绕行。`
-      : `SHELL_READ_FORBIDDEN: Reading files via terminal commands (${command}) is disabled to prevent context overload. Use read_file with start_line/max_lines when available; if recovery mode has not exposed read_file, use grep_search/get_file_outline or proceed from cached context to patching, validation, or the final answer instead of cat/sed/head/tail.`;
+      ? `SHELL_READ_FORBIDDEN: 禁止通过终端命令 (${command}) 直接读取文件内容——这会占用 LLM 上下文窗口的 token 容量（与系统内存无关）。read_file 可用时请使用 read_file + start_line/max_lines；恢复模式未开放 read_file 时，请使用 grep_search/get_file_outline 或基于已有缓存直接 patch/验证/最终说明，不要改用 cat/sed/head/tail 绕行。`
+      : `SHELL_READ_FORBIDDEN: Reading files via terminal commands (${command}) is disabled — this would consume LLM context window token capacity (unrelated to system memory). Use read_file with start_line/max_lines when available; if recovery mode has not exposed read_file, use grep_search/get_file_outline or proceed from cached context to patching, validation, or the final answer instead of cat/sed/head/tail.`;
     const target = getToolTarget(tc.name, args);
     callbacks.onToolExecuting(tc.name, target, undefined, { toolCallId: tc.id });
     emitToolPreflightBlocked(callbacks, {
