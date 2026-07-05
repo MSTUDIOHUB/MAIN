@@ -2058,11 +2058,13 @@ export class AgentOrchestrator {
             },
           );
 
-          // Check if output is reasoning-dominated (>80% tokens) with no tool calls
+          // Check if output is reasoning-dominated (>80% tokens) with no tool calls.
+          // Truncated responses (finishReason === "length") proceed to truncated_reasoning_bridge instead of halting immediately.
           const totalOutputChars = streamResult.content.length + (streamResult.reasoningContent || "").length;
-          if (totalOutputChars > 200 && (!streamResult.toolCalls || streamResult.toolCalls.length === 0)) {
+          const isLengthTruncated = streamResult.finishReason === "length";
+          if (!isLengthTruncated && totalOutputChars > 200 && (!streamResult.toolCalls || streamResult.toolCalls.length === 0)) {
             const reasoningRatio = (streamResult.reasoningContent || "").length / totalOutputChars;
-            if (reasoningRatio > 0.8) {
+            if (reasoningRatio > 0.8 && consecutiveNoToolCount >= (config.activeProfile === "local" ? 4 : MAX_NO_ACTION_RETRIES)) {
               const stopMessage = executionPolicy.getReasoningDominatedStopMessage?.(
                 callbacks.getPreferredLanguage(),
                 reasoningRatio
@@ -2072,6 +2074,7 @@ export class AgentOrchestrator {
               return;
             }
           }
+
           if (llmTools.length > 0) {
             callbacks.onProviderNativeToolSuccess?.();
           }

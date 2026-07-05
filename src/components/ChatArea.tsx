@@ -1053,56 +1053,7 @@ function ThoughtBlock({
   );
 }
 
-function TurnIntentHistoryCard({
-  explanations,
-  language,
-  chatFontSize,
-}: {
-  explanations: string[];
-  language: "zh" | "en";
-  chatFontSize: number;
-}) {
-  const [expanded, setExpanded] = useState(false);
-  if (explanations.length === 0) return null;
 
-  const title = language === "zh" ? "行动意图历史" : "Action Intent History";
-  const count = explanations.length;
-
-  return (
-    <div 
-      className="ml-9 mt-2 rounded-xl border border-[var(--surface-border-soft)] bg-[color-mix(in_srgb,var(--surface-1)_60%,transparent)] px-3 py-2 transition-all"
-      style={{ fontSize: `${chatFontSize}px` }}
-    >
-      <button
-        type="button"
-        onClick={() => setExpanded((prev) => !prev)}
-        className="group flex w-full items-center justify-between text-[11px] text-[var(--surface-text-muted)] hover:text-[var(--surface-text)]"
-      >
-        <span className="flex items-center gap-2 font-medium">
-          <IconFileText className="h-3.5 w-3.5 text-[var(--accent-light)]" />
-          <span>{title}</span>
-          <span className="text-[10px] opacity-75 font-normal">
-            {language === "zh" ? `${count} 条记录` : `${count} record${count > 1 ? "s" : ""}`}
-          </span>
-        </span>
-        <span className="inline-flex items-center gap-1.5 text-[10px] text-[var(--surface-text-muted)] group-hover:text-[var(--surface-text)]">
-          {expanded ? <IconChevronDown className="h-3.5 w-3.5" /> : <IconChevronRight className="h-3.5 w-3.5" />}
-          {expanded ? (language === "zh" ? "收起" : "Hide") : (language === "zh" ? "展开" : "Expand")}
-        </span>
-      </button>
-
-      {expanded && (
-        <div className="mt-2.5 space-y-2 border-t border-[var(--surface-border-soft)] pt-2 pl-5 text-[12px] leading-5 text-[var(--surface-text-subtle)]">
-          {explanations.map((exp, idx) => (
-            <div key={idx} className="relative before:absolute before:-left-3.5 before:top-2 before:h-1.5 before:w-1.5 before:rounded-full before:bg-[var(--accent-light)]/60">
-              {renderCompactMarkdownText(exp)}
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
 
 function TurnPhaseDivider({ label }: { label: string }) {
   return (
@@ -3476,32 +3427,6 @@ export default function ChatArea({
       turn.status === "awaiting_approval" ||
       turn.status === "awaiting_input";
 
-    const intentHistoryExplanations = (() => {
-      if (!isTurnCompletedOrStopped || isChatIntent) return [];
-
-      const list: string[] = [];
-      const seen = new Set<string>();
-      blocks.forEach((block, idx) => {
-        if (block.type === "agent") {
-          const hasOptions = block.options && block.options.length > 0;
-          const isFinalBlock = idx === finalVisibleAgentIndex;
-          const isSubstantiveIntermediate = substantiveIntermediateAgentBlockIds.has(block.id);
-          if (hasOptions || isFinalBlock) return;
-          if (isSubstantiveIntermediate) return;
-
-          const text = getAgentVisibleMarkdownText(block);
-          const content = String(text || "").trim();
-          if (content && isConversationalFirstPersonNarration(content)) {
-            const normalized = normalizeTranscriptDedupeText(content);
-            if (!seen.has(normalized)) {
-              seen.add(normalized);
-              list.push(content);
-            }
-          }
-        }
-      });
-      return list;
-    })();
 
     const renderTurnBlockItem = (item) => {
       if (item.kind !== "readContextGroup" && item.kind !== "operationCluster" && item.block?.type === "thought") return null;
@@ -3857,14 +3782,7 @@ export default function ChatArea({
               progressItems={effectiveProgressLedger}
             />
           )}
-          {isTurnExpanded && intentHistoryExplanations.length > 0 && (
-            <TurnIntentHistoryCard
-              key="turn-intent-history-card"
-              explanations={intentHistoryExplanations}
-              language={language}
-              chatFontSize={resolvedTurnProcessFontSize}
-            />
-          )}
+
         </div>
         <div
           className="mt-4 h-px w-full rounded-full"
@@ -4012,7 +3930,7 @@ export default function ChatArea({
         onScroll={handleScroll}
         data-testid="chat-scroll-container"
         className="flex-1 overflow-y-auto px-5 pt-5 transition-[padding-bottom] duration-250 ease-out"
-        style={{ paddingBottom: `${composerPaddingBottom}px` }}
+        style={{ paddingBottom: `max(50vh, ${composerPaddingBottom}px)` }}
       >
 
         {groupedTurns.length === 0 ? (

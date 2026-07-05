@@ -2590,14 +2590,11 @@ export async function fetchLLMStream(
   options: FetchLLMStreamOptions = {},
 ): Promise<StreamResult> {
   let fullText = "";
-  // P1: Constrain local model output length to prevent hallucinated long outputs
+  // P1: Constrain local model output length while allowing reasoning models adequate room
   const isLocal = isLocalProfile(settings);
   let currentMaxTokens: number;
   if (maxTokensOverride !== undefined) {
     currentMaxTokens = maxTokensOverride;
-  } else if (isLocal) {
-    // Local models: start at 2048 instead of 4096 to prevent 36K+ hallucinated outputs
-    currentMaxTokens = Math.min(2048, computeInitialMaxTokens(settings.contextLimit));
   } else {
     currentMaxTokens = computeInitialMaxTokens(settings.contextLimit);
   }
@@ -2755,44 +2752,35 @@ export async function fetchLLMStream(
       throw err;
     }
 
-    // isLocal already computed above via isLocalProfile(settings)
-    const skipReasoningDominatedEscalation = isReasoningDominatedLengthResult(result, isLocal);
-    const isChat = options.workflowMode === "chat" || options.runtimeIntent === "respond";
-    const allowEscalation = !(isChat && currentMaxTokens >= 4096);
-    const hasToolCalls = Array.isArray(result.toolCalls) && result.toolCalls.length > 0;
+    // Escalation limits: Local ceiling is 8192; Cloud ceiling is 32768
+    const effectiveCap = isLocal ? 8192 : 32768;
     const shouldEscalate = result.finishReason === "length" &&
       escalationCount < MAX_ESCALATIONS &&
-      !skipReasoningDominatedEscalation &&
-      allowEscalation &&
-      (!isLocal || hasToolCalls || options.workflowMode === "plan" || options.workflowMode === "edit");
+      currentMaxTokens < effectiveCap;
+
     if (shouldEscalate) {
-        const nextMaxTokens = escalateMaxTokens(currentMaxTokens, settings.contextLimit);
-      if (nextMaxTokens !== null) {
-        escalationCount++;
-        // P1: Cap local model escalation at 4096 to prevent 36K+ hallucinated outputs
-        if (isLocal && nextMaxTokens > 4096) {
-          logAgentEvent("local_model_escalation_capped", {
-            requested: nextMaxTokens,
-            cappedTo: 4096,
-            escalationCount,
+      const nextMaxTokens = escalateMaxTokens(currentMaxTokens, settings.contextLimit);
+      if (nextMaxTokens !== null && nextMaxTokens > currentMaxTokens) {
+        const targetMaxTokens = Math.min(nextMaxTokens, effectiveCap);
+        if (targetMaxTokens > currentMaxTokens) {
+          escalationCount++;
+          logAgentEvent("max_output_escalated", {
+            previousMaxTokens: currentMaxTokens,
+            currentMaxTokens: targetMaxTokens,
+            attempt: escalationCount,
+            isLocal,
           });
-          currentMaxTokens = 4096;
-        } else {
-          currentMaxTokens = nextMaxTokens;
+          currentMaxTokens = targetMaxTokens;
+
+          // Reset stream buffer to accumulate clean output with expanded max_tokens
+          callbacks.onStreamToken("__ESCALATION_RESET__:", messageId);
+          continue;
         }
-        logAgentEvent("max_output_escalated", {
-          currentMaxTokens,
-          attempt: escalationCount,
-        });
-
-        // Clear the previous streaming content for this message
-        // by resetting — the caller's onStreamToken will accumulate fresh content
-        callbacks.onStreamToken("__ESCALATION_RESET__:", messageId);
-
-        continue; // Retry with higher max_tokens
       }
     }
-    if (result.finishReason === "length" && skipReasoningDominatedEscalation && escalationCount < MAX_ESCALATIONS) {
+
+    const isReasoningDominated = isReasoningDominatedLengthResult(result, isLocal);
+    if (result.finishReason === "length" && isReasoningDominated && escalationCount < MAX_ESCALATIONS) {
       logAgentEvent("max_output_escalation_skipped", {
         reason: "reasoning_dominated_length",
         contentChars: result.content.length,
@@ -2803,10 +2791,11 @@ export async function fetchLLMStream(
 
     const truncated = result.finishReason === "length";
     callbacks.onStreamDone(fullText, messageId, truncated, {
-      suppressTruncationWarning: skipReasoningDominatedEscalation,
-      reason: skipReasoningDominatedEscalation ? "reasoning_dominated_length" : "",
+      suppressTruncationWarning: isReasoningDominated,
+      reason: isReasoningDominated ? "reasoning_dominated_length" : "",
     });
     return result;
+
   }
 }
 
