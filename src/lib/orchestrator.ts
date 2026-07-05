@@ -2712,6 +2712,30 @@ export async function fetchLLMStream(
       });
     } catch (err) {
       const retryMessage = getErrorMessage(err, "LLM stream failed");
+      
+      const isOomError = isLocal && (
+        retryMessage.toLowerCase().includes("oom") ||
+        retryMessage.toLowerCase().includes("out of memory") ||
+        retryMessage.toLowerCase().includes("memory allocation") ||
+        retryMessage.toLowerCase().includes("connection reset") ||
+        retryMessage.toLowerCase().includes("socket hang up")
+      );
+
+      if (isOomError && settings.contextLimit && settings.contextLimit > 4096) {
+        const newLimit = Math.max(4096, Math.floor(settings.contextLimit / 2));
+        logAgentEvent("local_oom_fallback", {
+          originalLimit: settings.contextLimit,
+          newLimit,
+          error: retryMessage,
+        });
+        settings.contextLimit = newLimit;
+        currentMaxTokens = Math.min(currentMaxTokens, computeInitialMaxTokens(newLimit));
+        callbacks.onStreamToken("__ESCALATION_RESET__:", messageId);
+        // Give the local engine (Ollama/MLX) a moment to release its failed memory allocation
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+        continue;
+      }
+
       if (
         !signal.aborted &&
         transientRetryCount < MAX_TRANSIENT_RETRIES &&

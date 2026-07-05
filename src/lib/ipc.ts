@@ -623,6 +623,17 @@ export interface WebFetchResponse {
 
 // region: 文件与搜索命令
 
+export interface SystemMemoryInfo {
+  total_gb: number;
+  available_gb: number;
+  total_bytes: number;
+  available_bytes: number;
+}
+
+export function getSystemMemory(): Promise<SystemMemoryInfo> {
+  return invoke("get_system_memory");
+}
+
 export function readFile(path: string, workspace?: string): Promise<string> {
   return invoke<string>("read_file", { path, workspace });
 }

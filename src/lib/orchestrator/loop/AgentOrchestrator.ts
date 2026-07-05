@@ -86,6 +86,23 @@ export class AgentOrchestrator {
         const skills = callbacks.getSkills();
         const initialMessages = callbacks.getMessages();
         const settings = deriveStreamSettings(config);
+        
+        if (!isCloudProfile && settings.contextLimit) {
+            try {
+                const { computeDynamicLocalContextLimit } = await import("../../modelDiscovery");
+                settings.contextLimit = await computeDynamicLocalContextLimit(
+                    settings.provider || "",
+                    settings.baseUrl || "http://127.0.0.1:11434",
+                    settings.model || "",
+                    settings.contextLimit
+                );
+                if (config.local) {
+                    config.local.contextLimit = settings.contextLimit;
+                }
+            } catch (e) {
+                console.warn("Failed to dynamically compute local context limit", e);
+            }
+        }
         const effectiveToolProtocol = resolveEffectiveToolProtocol(config, settings);
         const compatibilityForcedAtStart = callbacks.shouldForceXmlForProviderCompatibility?.();
         const nativeToolsEnabled = !shouldUseXmlToolProtocol(
