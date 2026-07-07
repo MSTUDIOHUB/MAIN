@@ -11,7 +11,8 @@ export type ResolvedUserIntent =
   | "summarize"
   | "report"
   | "studio_workflow"
-  | "image_studio";
+  | "image_studio"
+  | "goal";
 export type ResolvedRunIntent = ResolvedUserIntent;
 export type RunIntentRiskLevel = "low" | "medium" | "high";
 export type RunIntentUiCategory = "workflow_mode" | "output_style" | "discussion" | "studio_workflow";
@@ -297,6 +298,21 @@ const RUN_INTENT_POLICIES: Record<ResolvedUserIntent, RunIntentPolicy> = {
       en: "Generate an image in the chat",
     },
   },
+  goal: {
+    intent: "goal",
+    workflowMode: "edit",
+    uiCategory: "workflow_mode",
+    toolPolicy: "write",
+    requiresPlanApproval: false,
+    generatesPlanArtifacts: false,
+    allowsSourceWritesBeforePlanApproval: true,
+    label: { zh: "目标", en: "Goal" },
+    categoryLabel: { zh: "流程模式", en: "Workflow Mode" },
+    description: {
+      zh: "设定一个长期目标，Agent 自主循环执行直到完成或达到预算上限。",
+      en: "Set a long-term goal. The agent iterates autonomously until the objective is met or the budget is exhausted.",
+    },
+  },
 };
 
 const STRONG_PLAN_PATTERNS = [
@@ -556,6 +572,15 @@ const MAIN_INTENT_SHORTCUTS_ZH: MainIntentShortcutItem[] = [
     aliases: ["draw", "image", "画图", "生图"],
     visibleInMenu: true,
   },
+  {
+    intent: "goal" as MainIntentShortcut,
+    command: "/目标",
+    label: "目标",
+    description: "设定长期目标，Agent 自主循环执行直到完成或预算耗尽。",
+    category: "workflow_mode",
+    aliases: ["goal", "长任务", "自主执行", "autonomous"],
+    visibleInMenu: true,
+  },
 ];
 
 const MAIN_INTENT_SHORTCUTS_EN: MainIntentShortcutItem[] = [
@@ -602,6 +627,15 @@ const MAIN_INTENT_SHORTCUTS_EN: MainIntentShortcutItem[] = [
     description: "Generate an image in the current chat using natural language description.",
     category: "workflow_mode",
     aliases: ["draw", "image", "paint"],
+    visibleInMenu: true,
+  },
+  {
+    intent: "goal" as MainIntentShortcut,
+    command: "/goal",
+    label: "Goal",
+    description: "Set a long-term goal. The agent iterates autonomously until done or budget is exhausted.",
+    category: "workflow_mode",
+    aliases: ["目标", "长任务", "autonomous"],
     visibleInMenu: true,
   },
 ];
@@ -1109,6 +1143,12 @@ function createOption(intent: ResolvedUserIntent, language: "zh" | "en"): Pendin
       en: "Generate Image",
       valueZh: "在当前对话中生成图片",
       valueEn: "Generate an image in the current chat.",
+    },
+    goal: {
+      zh: "设定目标（自主执行）",
+      en: "Set Goal (Autonomous)",
+      valueZh: "设定一个长期目标，Agent 将自主循环执行直到完成或预算耗尽",
+      valueEn: "Set a long-term goal. The agent will iterate autonomously until the objective is met or the budget runs out.",
     },
   };
 

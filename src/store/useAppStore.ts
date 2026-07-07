@@ -2356,6 +2356,7 @@ const RUN_INTENT_LABELS: Record<ResolvedRunIntent, { zh: string; en: string }> =
   report: { zh: "报告", en: "Report" },
   studio_workflow: { zh: "Game Studio 工作流", en: "Game Studio Workflow" },
   image_studio: { zh: "生成图片", en: "Generate Image" },
+  goal: { zh: "目标", en: "Goal" },
 };
 
 const RESOLVED_USER_INTENT_KEYS = new Set<ResolvedUserIntent>([
@@ -2368,6 +2369,7 @@ const RESOLVED_USER_INTENT_KEYS = new Set<ResolvedUserIntent>([
   "report",
   "studio_workflow",
   "image_studio",
+  "goal",
 ]);
 
 function isResolvedUserIntentChoice(choice: PendingRunDecisionChoice): choice is ResolvedUserIntent {

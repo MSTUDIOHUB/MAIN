@@ -3,6 +3,7 @@ export interface AgentLoopIterationLimits {
   editExecute?: number;
   planDraft?: number;
   planExecution?: number;
+  goalIteration?: number;
   default?: number;
 }
 
@@ -11,6 +12,7 @@ export const DEFAULT_AGENT_LOOP_ITERATION_LIMITS = {
   editExecute: 50,
   planDraft: 25,
   planExecution: 50,
+  goalIteration: 150,
   default: 25,
 } as const;
 
@@ -23,11 +25,14 @@ function positiveInt(value: unknown, fallback: number): number {
 
 export function resolveAgentLoopMaxIterations(input: {
   workflowMode: "chat" | "edit" | "plan";
-  runtimeIntent: "respond" | "execute" | string;
+  runtimeIntent: "respond" | "execute" | "goal" | string;
   isPlanApproved: boolean;
   limits?: AgentLoopIterationLimits | null;
 }): number {
   const limits = input.limits || {};
+  if (input.runtimeIntent === "goal") {
+    return positiveInt(limits.goalIteration, DEFAULT_AGENT_LOOP_ITERATION_LIMITS.goalIteration);
+  }
   if (input.workflowMode === "plan" && input.isPlanApproved) {
     return positiveInt(limits.planExecution, DEFAULT_AGENT_LOOP_ITERATION_LIMITS.planExecution);
   }
