@@ -57,8 +57,11 @@ export function normalizePendingDecisionInputKey(input: string): string {
     .toLowerCase();
 }
 
-export function normalizeStoredRightPanelTab(value: unknown): "diff" | "terminal" | "plan" {
-  return value === "diff" || value === "terminal" ? value : "plan";
+export function normalizeStoredRightPanelTab(value: unknown): "diff" | "terminal" | "plan" | "goal" {
+  if (value === "diff" || value === "terminal" || value === "plan" || value === "goal") {
+    return value;
+  }
+  return "plan";
 }
 
 export const createWorkspaceSlice = (set: any, get: any) => ({

@@ -633,9 +633,9 @@ const MAIN_INTENT_SHORTCUTS_EN: MainIntentShortcutItem[] = [
     intent: "goal" as MainIntentShortcut,
     command: "/goal",
     label: "Goal",
-    description: "Set a long-term goal. The agent iterates autonomously until done or budget is exhausted.",
+    description: "Set a long-term goal, letting the Agent execute autonomously until completion or budget exhaustion.",
     category: "workflow_mode",
-    aliases: ["目标", "长任务", "autonomous"],
+    aliases: ["goal", "autonomous", "long task"],
     visibleInMenu: true,
   },
 ];

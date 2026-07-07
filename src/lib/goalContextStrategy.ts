@@ -9,6 +9,7 @@ import type { GoalCheckpoint, GoalDefinition } from "./goalState";
 import type { VerificationResult } from "./goalVerification";
 import { buildCheckpointContextForLLM } from "./goalPersistence";
 import { buildVerificationSummary } from "./goalVerification";
+import { GOAL_DIR_NAME, GOAL_PROGRESS_FILE } from "./goalPersistence";
 
 export interface GoalIterationContextInput {
   /** Current goal definition */
@@ -129,7 +130,7 @@ function buildIterationInstructions(
       "- 每轮只做一个明确的小任务，不要试图一次性完成所有工作",
       "- 每次修改文件后必须运行验证命令",
       "- 遇到阻塞时记录具体阻塞原因并尝试替代方案",
-      "- 完成本轮任务后，更新 `.MAIN/goals/progress.md`",
+      `- 完成本轮任务后，更新 \`.MAIN/${GOAL_DIR_NAME}/${GOAL_PROGRESS_FILE}\``,
       `- 如果目标已完全达成，在回复末尾明确声明 "GOAL_COMPLETED"`,
       `- 如果遇到无法解决的阻塞，声明 "GOAL_BLOCKED: <原因>"`,
       "",
@@ -160,7 +161,7 @@ function buildIterationInstructions(
     "- Do one small, clear task per iteration. Do not try to finish everything at once.",
     "- Run verification commands after every file change.",
     "- When blocked, record the specific blocker and try an alternative approach.",
-    "- After completing this iteration's task, update `.MAIN/goals/progress.md`.",
+    `- After completing this iteration's task, update \`.MAIN/${GOAL_DIR_NAME}/${GOAL_PROGRESS_FILE}\`.`,
     '- If the goal is fully met, end your response with "GOAL_COMPLETED".',
     '- If encountering an unresolvable blocker, state "GOAL_BLOCKED: <reason>".',
     "",

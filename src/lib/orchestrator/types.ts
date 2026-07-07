@@ -106,6 +106,14 @@ export interface OrchestratorCallbacks {
   onProviderNativeToolSuccess?: () => void;
   onDebugEvent?: (event: string, data?: Record<string, unknown>) => void;
 
+  // Goal Mode Support
+  onGoalProgressUpdate?: (progress: import("../goalState").GoalProgress, goal: import("../goalState").GoalDefinition) => void;
+  onGoalIterationStart?: (iteration: import("../goalState").GoalIteration) => void;
+  onGoalIterationEnd?: (iteration: import("../goalState").GoalIteration) => void;
+  onGoalCheckpointSaved?: (checkpoint: import("../goalState").GoalCheckpoint) => void;
+  onGoalUserConfirmNeeded?: (message: string) => Promise<boolean>;
+  onGoalOutcome?: (outcome: import("../goalState").GoalLoopOutcome) => void;
+
   // UI updates
   onStreamToken: (token: string, messageId: string) => void;
   onStreamDone: (

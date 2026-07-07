@@ -872,6 +872,18 @@ export function buildSystemPrompt(
     if (capabilityHint) {
       parts.push(capabilityHint);
     }
+  } else if (turnIntent === "goal") {
+    parts.push([
+      "================================",
+      "[TURN INTENT: GOAL (AUTONOMOUS EXECUTION)]",
+      "你当前这一轮的真实意图是：GOAL（自主闭环执行）。",
+      "在这个模式下，你需要像高级自动 Agent 一样工作，利用提供的目标（Objective）和上下文，独立地循环执行 Plan -> Execute -> Observe -> Re-plan 直到任务完成或达到迭代上限。",
+      "【必须立即行动并产出结果】",
+      "1. 绝不能只输出纯文本的计划而不调用任何工具。每一次迭代你必须调用工具来实际执行动作、验证结果、收集反馈或更新上下文。",
+      "2. 保持任务进度紧凑，不要向用户请求许可，除非遇到致命错误、歧义或需要人类环境测试。当本轮执行遭遇问题时，先自行诊断和重试。",
+      "3. 每个循环应尽可能完成一个具体的子任务，最后必须有一句话总结你在此轮迭代中完成了什么，这将被记录在执行摘要中。",
+      "4. 当你认为整体目标已经成功达成时，不需要输出冗长文字，只需明确给出达成结论及相关验证证据，等待系统流转。",
+    ].join("\n"));
   } else if (turnIntent === "execute" || turnIntent === "studio_workflow") {
     parts.push([
       "================================",

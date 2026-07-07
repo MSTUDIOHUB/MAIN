@@ -3055,6 +3055,7 @@ export default function SettingsModal({
             <button data-testid="settings-tab-local" onClick={() => setSettingsTab('local')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'local' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.localSetup}</button>
             <button data-testid="settings-tab-cloud" onClick={() => setSettingsTab('cloud')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'cloud' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.cloudSetup}</button>
             <button data-testid="settings-tab-context" onClick={() => setSettingsTab('context')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'context' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.contextSetup}</button>
+            <button data-testid="settings-tab-goal" onClick={() => setSettingsTab('goal')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'goal' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{language === "zh" ? "目标模式" : "Goal Mode"}</button>
             <button data-testid="settings-tab-mcp" onClick={() => setSettingsTab('mcp')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'mcp' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{copy.mcpServerTitle}</button>
             <button data-testid="settings-tab-im" onClick={() => setSettingsTab('im')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'im' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.imAdapters}</button>
             <button data-testid="settings-tab-data" onClick={() => setSettingsTab('data')} className={`text-left px-4 py-2.5 text-[13px] font-medium rounded-md transition-colors ${settingsTab === 'data' ? 'theme-bg shadow-sm' : 'text-[#a1a1aa] hover:text-[#e4e4e7] hover:bg-[#18181b]'}`}>{t.dataManagement}</button>
@@ -3478,6 +3479,36 @@ export default function SettingsModal({
 
             {/* CONTEXT / COMPRESSION SETTINGS */}
             {settingsTab === 'context' && contextTabContent}
+            
+            {settingsTab === 'goal' && (
+              <div className="space-y-8 animate-fade-in">
+                <div className="space-y-2">
+                  <h3 className="text-sm font-semibold theme-text">{language === "zh" ? "目标模式 (Goal Mode)" : "Goal Mode"}</h3>
+                  <p className="text-xs text-[#a1a1aa] max-w-2xl">
+                    {language === "zh" 
+                      ? "设置代理的长时间运行目标与迭代相关限制。"
+                      : "Configure limits and behavior for long-running autonomous goals."}
+                  </p>
+                </div>
+                
+                <div className={settingsSectionRowClass}>
+                  <div className="space-y-1 mt-1">
+                    <label className="text-sm font-medium theme-text">{language === "zh" ? "最大允许迭代次数" : "Max Iterations"}</label>
+                    <p className="text-xs text-[#a1a1aa]">{language === "zh" ? "为防止陷入死循环，每次目标的最高迭代次数" : "Maximum autonomous loops before pausing."}</p>
+                  </div>
+                  <div className={settingsControlColumnClass}>
+                    <input
+                      type="number"
+                      min={1}
+                      max={100}
+                      value={config.goalMaxIterations ?? 15}
+                      onChange={(e) => setConfig({ goalMaxIterations: parseInt(e.target.value) || 15 })}
+                      className={`${settingsOptionBaseClass} w-full rounded-md px-3 py-2 text-sm max-w-[120px]`}
+                    />
+                  </div>
+                </div>
+              </div>
+            )}
 
             {/* MCP SERVER SETTINGS */}
             {settingsTab === 'mcp' && <McpServerPanel

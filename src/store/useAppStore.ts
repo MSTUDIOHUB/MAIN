@@ -217,6 +217,8 @@ import {
   resolvePlanStateHydrationReason,
   shouldPromoteHydratedPlanToExecuting,
 } from "../lib/planStateHydration";
+import type { GoalDefinition, GoalProgress, GoalStatus } from "../lib/goalState";
+import type { GoalBudget } from "../lib/goalBudget";
 import { PLAN_ARTIFACT_PATHS, hydratePlanArtifactsFromReader } from "../lib/planArtifactHydration";
 import { mapLegacyNexusModeToMainMode, mapMainModeToLegacyNexusMode, type MainModeKey } from "../lib/mainModes";
 import {
@@ -795,6 +797,12 @@ export interface SessionRuntimeSnapshot {
   approvedShellPermissionRules?: string[];
   queuedUserMessage?: QueuedUserMessage | null;
   activeGuidance?: ActiveGuidance | null;
+  
+  // Goal Mode State
+  activeGoal?: GoalDefinition | null;
+  goalProgress?: GoalProgress | null;
+  goalStatus?: GoalStatus;
+  goalIterationBudget?: number;
 }
 
 export interface SessionRuntimeState extends SessionRuntimeSnapshot {
@@ -914,6 +922,7 @@ export interface AppConfig {
   cloudExperimentalLoginEnabled: boolean;
   imAdapters: ImAdaptersConfig;
   workspace: string;
+  goalMaxIterations?: number;
 }
 
 export type AgentStatus = "idle" | "running" | "pending_review" | "error";
@@ -1305,6 +1314,17 @@ export interface AppState {
   rejectPlanAndDeleteFiles: () => Promise<void>;
   showWorkflowMenu: boolean;
   setShowWorkflowMenu: (v: boolean) => void;
+
+  // Goal Mode
+  activeGoal: GoalDefinition | null;
+  goalProgress: GoalProgress | null;
+  goalStatus: GoalStatus;
+  goalIterationBudget: number;
+  startGoal: (objective: string, options?: Partial<GoalBudget> & { sessionKey?: string }) => void;
+  pauseGoal: () => void;
+  resumeGoal: () => void;
+  clearGoal: () => void;
+  updateGoalProgress: (progress: GoalProgress) => void;
 
   // Elapsed time tracking
   elapsedTime: number;
@@ -6742,6 +6762,52 @@ export const useAppStore = create<AppState>()(
   },
   showWorkflowMenu: false,
   setShowWorkflowMenu: (v) => set({ showWorkflowMenu: v }),
+
+  // ── Goal Mode ───────────────────────────────────────────────────────
+  activeGoal: null,
+  goalProgress: null,
+  goalStatus: "paused",
+  goalIterationBudget: 200,
+  startGoal: (objective, options) => {
+    const { createGoalDefinition } = require("../lib/goalState");
+    const newGoal = createGoalDefinition({
+      objective,
+      iterationBudget: options?.maxIterations ?? 200,
+      tokenBudget: options?.maxTokens,
+      maxDurationMs: options?.maxDurationMs,
+      sessionKey: options?.sessionKey,
+    });
+    set({
+      activeGoal: newGoal,
+      goalStatus: "active",
+      goalIterationBudget: newGoal.iterationBudget,
+      goalProgress: null, // Reset progress for new goal
+      rightPanelTab: "goal",
+      showPlanPanel: true,
+    });
+  },
+  pauseGoal: () => {
+    const { activeGoal } = get();
+    if (!activeGoal) return;
+    set({ goalStatus: "paused" });
+  },
+  resumeGoal: () => {
+    const { activeGoal, goalStatus } = get();
+    if (!activeGoal) return;
+    if (goalStatus === "paused") {
+      set({ goalStatus: "active" });
+    }
+  },
+  clearGoal: () => {
+    set({
+      activeGoal: null,
+      goalProgress: null,
+      goalStatus: "paused",
+    });
+  },
+  updateGoalProgress: (progress) => {
+    set({ goalProgress: progress });
+  },
 
   // ── Agent Orchestrator ──────────────────────────────────────────────
 

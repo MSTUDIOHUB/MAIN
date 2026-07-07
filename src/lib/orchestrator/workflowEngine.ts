@@ -1,4 +1,5 @@
 import { executeAgentLoop, type AgentLoopOutcome, type OrchestratorCallbacks } from "../orchestrator";
+import { executeGoalLoop, type GoalEngineCallbacks } from "../goalEngine";
 import { invoke } from "@tauri-apps/api/core";
 import { 
   appendThoughtDelta, 
@@ -423,6 +424,18 @@ export class WorkflowEngine {
       getStatus: () => sessionGet().agentStatus,
       consumeActiveGuidance: () => sessionGet().consumeActiveGuidance(turnId),
       startNewTurn: () => sessionGet().startNewTurn(remoteFeishu),
+      onGoalProgressUpdate: (progress, _goal) => sessionGet().updateGoalProgress(progress),
+      onGoalIterationStart: (_iter) => {}, // Optionally add detailed store updates later
+      onGoalIterationEnd: (_iter) => {},
+      onGoalCheckpointSaved: (_ckpt) => {},
+      onGoalUserConfirmNeeded: async (_msg) => true,
+      onGoalOutcome: (outcome) => {
+        if (outcome.status === "completed") {
+          sessionGet().clearGoal(); // Optionally show success
+        } else if (outcome.status === "failed") {
+          sessionGet().pauseGoal();
+        }
+      },
       onApprovedPlanHandoff: (prompt: string) => {
         const pendingHandoff = sessionGet().pendingPlanApprovalHandoff;
         const startedForTurn = sessionGet().planApprovalExecutionStartedForTurnId;
@@ -1779,7 +1792,74 @@ export class WorkflowEngine {
       }
     };
 
-    return executeAgentLoop(callbacks, abortCtrl).then((loopOutcome) => {
+    const executeLoopStrategy = (): Promise<AgentLoopOutcome> => {
+      if (context.runtimeRunIntent === "goal") {
+        const activeGoal = sessionGet().activeGoal;
+        if (!activeGoal) {
+          return Promise.resolve({ status: "error", reason: "no_active_goal" });
+        }
+        
+        const goalCallbacks: GoalEngineCallbacks = {
+          getPreferredLanguage: callbacks.getPreferredLanguage,
+          getWorkspacePath: () => resolveSessionWorkspaceKey(sessionGet().currentWorkspace) || "",
+          runAgentIteration: async (iterInput) => {
+            const iterCallbacks = {
+              ...callbacks,
+              getMessages: () => {
+                return [
+                  { role: "system", content: iterInput.goalSystemContext },
+                  ...callbacks.getMessages()
+                ] as import("../orchestrator").AgentMessage[];
+              }
+            };
+            const outcome = await executeAgentLoop(iterCallbacks, abortCtrl);
+            return {
+              assistantText: "Iteration completed", // In a real scenario we'd extract the actual text from state
+              toolCalls: [],
+              tokensUsed: 0,
+              completed: outcome.status === "completed",
+              error: outcome.status === "error" ? outcome.reason : undefined
+            };
+          },
+          writeFile: async (path, content) => {
+            const { writeFile } = await import("../ipc");
+            await writeFile(path, content);
+          },
+          readFile: async (path) => {
+            try {
+              const { readFile } = await import("../ipc");
+              return await readFile(path);
+            } catch {
+              return null;
+            }
+          },
+          isAborted: () => abortCtrl.signal.aborted,
+          onGoalProgressUpdate: (progress, goal) => callbacks.onGoalProgressUpdate?.(progress, goal),
+          onGoalIterationStart: (iter) => callbacks.onGoalIterationStart?.(iter),
+          onGoalIterationEnd: (iter) => callbacks.onGoalIterationEnd?.(iter),
+          onGoalCheckpointSaved: (ckpt) => callbacks.onGoalCheckpointSaved?.(ckpt),
+          onGoalUserConfirmNeeded: async (_msg) => false,
+          onGoalOutcome: (outcome) => callbacks.onGoalOutcome?.(outcome),
+          onDebugEvent: callbacks.onDebugEvent,
+        };
+
+        return executeGoalLoop({
+          goal: activeGoal,
+          callbacks: goalCallbacks,
+          budgetOverrides: {
+            maxIterations: sessionGet().config.goalMaxIterations
+          },
+          existingProgress: sessionGet().goalProgress,
+        }).then(goalOutcome => ({
+          status: goalOutcome.status === "completed" ? "completed" : goalOutcome.status === "failed" ? "error" : "paused",
+          reason: goalOutcome.status
+        }));
+      }
+
+      return executeAgentLoop(callbacks, abortCtrl);
+    };
+
+    return executeLoopStrategy().then((loopOutcome) => {
       closeHarnessForAgentLoopOutcome(loopOutcome);
       clearInterval(timerInterval);
       sessionSet({ pendingSlashCommand: null, elapsedTime: getElapsedSeconds() });

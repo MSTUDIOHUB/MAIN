@@ -11,7 +11,7 @@ import {
 
 // region: 共享类型
 
-export type RightPanelTab = "plan" | "diff" | "terminal";
+export type RightPanelTab = "plan" | "diff" | "terminal" | "goal";
 
 export type ResponseLanguagePolicy =
   | "follow_input_language"
