@@ -2922,24 +2922,21 @@ export default function ChatArea({
     if (capsuleControlTurnStatusKey !== "awaiting_input" && capsuleControlTurnStatusKey !== "awaiting_approval") {
       return [];
     }
-    const latestOptionBlock = [...capsuleControlTurnBlocks].reverse().find((block) =>
-      block.type === "agent" &&
-      Array.isArray(block.options) &&
-      block.options.length > 0,
-    );
-    return latestOptionBlock?.options || [];
+    const lastAgentBlock = [...capsuleControlTurnBlocks].reverse().find((block) => block.type === "agent");
+    if (!lastAgentBlock || !Array.isArray(lastAgentBlock.options) || lastAgentBlock.options.length === 0) {
+      return [];
+    }
+    return lastAgentBlock.options;
   }, [capsuleControlTurnBlocks, capsuleControlTurnStatusKey]);
   const capsuleControlHasPendingProposalCheckpoint = useMemo(() => {
     if (!capsuleControlTurn || capsuleControlTurnStatusKey !== "awaiting_input") return false;
-    return [...capsuleControlTurnBlocks].reverse().some((block) =>
-      block.type === "agent" &&
-      Array.isArray(block.options) &&
-      block.options.some((option: ReplyOption) =>
-        option?.action === "approve_operation_once" ||
-        option?.action === "execute_once" ||
-        option?.source === "proposal_follow_up" ||
-        option?.source === "operation_approval"
-      )
+    const lastAgentBlock = [...capsuleControlTurnBlocks].reverse().find((block) => block.type === "agent");
+    if (!lastAgentBlock || !Array.isArray(lastAgentBlock.options)) return false;
+    return lastAgentBlock.options.some((option: ReplyOption) =>
+      option?.action === "approve_operation_once" ||
+      option?.action === "execute_once" ||
+      option?.source === "proposal_follow_up" ||
+      option?.source === "operation_approval"
     );
   }, [capsuleControlTurn, capsuleControlTurnBlocks, capsuleControlTurnStatusKey]);
   const capsuleControlIsRunActive =

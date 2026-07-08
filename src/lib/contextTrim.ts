@@ -135,7 +135,7 @@ function estimateMessageTokens(msg: TrimMessage): number {
 }
 
 export function estimateMessagesTokens(messages: TrimMessage[]): number {
-  return messages.reduce((total, msg) => total + estimateMessageTokens(msg), 0);
+  return messages.filter(Boolean).reduce((total, msg) => total + estimateMessageTokens(msg), 0);
 }
 
 const TOKEN_SOURCE_LABELS: Record<ContextTokenSource, string> = {
@@ -177,7 +177,8 @@ export function computeContextTokenBreakdown(messages: TrimMessage[]): ContextTo
     thoughtUi: 0,
   };
 
-  for (const message of messages) {
+  const validMessages = messages.filter(Boolean);
+  for (const message of validMessages) {
     const { text, image } = estimateTextAndImageTokens(message.content);
     const overhead = 10;
     breakdown.multimodal += image;
@@ -980,11 +981,12 @@ export function compactAssistantMessages(
  * Locate and replace obsolete read results with lightweight stubs once a file has been successfully mutated.
  */
 export function activeMemoryReclamation(messages: TrimMessage[]): TrimMessage[] {
+  const validMessages = messages.filter(Boolean);
   const toolCallMap = new Map<string, { name: string; path: string }>();
   const successfulMutations = new Set<string>();
 
   // 1. Build a map of tool call IDs to tool name and target path.
-  for (const msg of messages) {
+  for (const msg of validMessages) {
     if (msg.role === "assistant" && Array.isArray(msg.tool_calls)) {
       for (const tc of msg.tool_calls) {
         const call = tc as { id?: string; function?: { name?: string; arguments?: string } };
@@ -1010,7 +1012,7 @@ export function activeMemoryReclamation(messages: TrimMessage[]): TrimMessage[] 
   }
 
   // 2. Identify successfully mutated paths.
-  for (const msg of messages) {
+  for (const msg of validMessages) {
     if (msg.role === "tool" && msg.tool_call_id && typeof msg.content === "string") {
       const callInfo = toolCallMap.get(msg.tool_call_id);
       if (callInfo && (callInfo.name === "write_file" || callInfo.name === "replace_in_file")) {
@@ -1023,11 +1025,11 @@ export function activeMemoryReclamation(messages: TrimMessage[]): TrimMessage[] 
   }
 
   if (successfulMutations.size === 0) {
-    return messages;
+    return validMessages;
   }
 
   // 3. Prune historical tool read contents for successfully mutated paths.
-  return messages.map((msg) => {
+  return validMessages.map((msg) => {
     if (msg.role === "tool" && msg.tool_call_id && typeof msg.content === "string") {
       const callInfo = toolCallMap.get(msg.tool_call_id);
       if (callInfo && callInfo.name === "read_file" && callInfo.path && successfulMutations.has(callInfo.path)) {
@@ -1085,26 +1087,27 @@ export function compactSystemMessages(
   messages: TrimMessage[],
   maxTotalSystemChars: number = 24000,
 ): SystemCompactionResult {
-  if (messages.length === 0) return { messages, systemCharsBefore: 0, systemCharsAfter: 0, systemDropped: 0 };
+  const validMessages = messages.filter(Boolean);
+  if (validMessages.length === 0) return { messages: validMessages, systemCharsBefore: 0, systemCharsAfter: 0, systemDropped: 0 };
 
-  const systemCharsBefore = messages.reduce((sum, msg) => {
+  const systemCharsBefore = validMessages.reduce((sum, msg) => {
     if (msg.role !== "system") return sum;
     return sum + (typeof msg.content === "string" ? msg.content.length : 0);
   }, 0);
 
   // Always keep the first system message (main prompt)
-  const mainSystem = messages[0].role === "system" ? [messages[0]] : [];
+  const mainSystem = validMessages[0].role === "system" ? [validMessages[0]] : [];
   const hookSystemMessages: TrimMessage[] = [];
 
-  for (let i = 1; i < messages.length; i += 1) {
-    const msg = messages[i];
+  for (let i = 1; i < validMessages.length; i += 1) {
+    const msg = validMessages[i];
     if (msg.role === "system") {
       hookSystemMessages.push(msg);
     }
   }
 
   if (hookSystemMessages.length === 0) {
-    return { messages, systemCharsBefore, systemCharsAfter: systemCharsBefore, systemDropped: 0 };
+    return { messages: validMessages, systemCharsBefore, systemCharsAfter: systemCharsBefore, systemDropped: 0 };
   }
 
   // Group by [HookContext:XXX] prefix
@@ -1139,7 +1142,7 @@ export function compactSystemMessages(
     const keepCount = Math.max(1, Math.floor(maxTotalSystemChars / perGroupBudget));
     const kept = compactedSystemMessages.slice(0, keepCount);
     const dropped = compactedSystemMessages.length - kept.length;
-    const resultMessages = [...mainSystem, ...kept, ...messages.filter((m) => m.role !== "system")];
+    const resultMessages = [...mainSystem, ...kept, ...validMessages.filter((m) => m.role !== "system")];
     const systemCharsAfter = resultMessages.reduce((s, m) => {
       if (m.role !== "system") return s;
       return s + (typeof m.content === "string" ? m.content.length : 0);
@@ -1150,7 +1153,7 @@ export function compactSystemMessages(
   // All groups fit — rebuild message list preserving non-system messages
   const resultMessages: TrimMessage[] = [];
   let sysIdx = 0;
-  for (const msg of messages) {
+  for (const msg of validMessages) {
     if (msg.role === "system" && msg === mainSystem[0]) {
       resultMessages.push(msg);
     } else if (msg.role === "system") {
@@ -1220,7 +1223,8 @@ export function manageContext(
   forceManage: boolean = false,
   options: ManageContextOptions & { ephemeralItemIds?: Set<string> } = {},
 ): ManageContextResult {
-  const reclaimedMessages = activeMemoryReclamation(messages);
+  const validMessages = messages.filter(Boolean);
+  const reclaimedMessages = activeMemoryReclamation(validMessages);
 
   // Pre-compact excessive system messages (hook context injectors) before memory injection
   const systemCompacted = compactSystemMessages(reclaimedMessages);
@@ -1238,7 +1242,7 @@ export function manageContext(
   const shouldManage = forceManage || tokenCountBefore > budgets.proactiveTriggerBudget;
 
   if (!shouldManage) {
-    const changed = !messagesEqual(messages, messagesWithMemory);
+    const changed = !messagesEqual(validMessages, messagesWithMemory);
     return {
       messages: messagesWithMemory,
       droppedCount: 0,
@@ -1308,7 +1312,7 @@ export function manageContext(
     messages: trimmed,
     droppedCount: actualDropped,
     droppedMessageCount: actualDropped,
-    changed: !messagesEqual(messages, trimmed),
+    changed: !messagesEqual(validMessages, trimmed),
     tokenCountBefore,
     tokenCountAfter,
     tokenReduction: Math.max(0, tokenCountBefore - tokenCountAfter),
