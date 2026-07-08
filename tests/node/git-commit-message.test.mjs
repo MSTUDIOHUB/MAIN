@@ -265,9 +265,8 @@ test("generateGitCommitMessage prefers detailed model output and rejects thin ou
     ].join("\n"),
     source: "model",
   });
-  assert.match(JSON.stringify(requestBody), /Per-file change summaries/);
-  assert.match(JSON.stringify(requestBody), /Added\/changed line highlights/);
-  assert.match(JSON.stringify(requestBody), /src\/components\/Sidebar\.tsx/);
+  assert.match(JSON.stringify(requestBody), /Detailed diff of changes/);
+  assert.match(JSON.stringify(requestBody), /File: src\/components\/Sidebar\.tsx/);
 
   const thinModel = await generateGitCommitMessage({
     config,

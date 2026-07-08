@@ -16,6 +16,7 @@ import {
   type ProtocolChatMessage,
 } from "./cloudProtocol";
 import type { GitDiffEntry, GitStatus } from "./ipc";
+import { buildLineDiff } from "./diff";
 
 type Language = "zh" | "en";
 
@@ -67,9 +68,7 @@ export interface GeneratedGitCommitMessage {
 }
 
 const MAX_DIFF_FILES = 30;
-const MAX_DIFF_CHARS = 60_000;
-const MAX_DIFF_HIGHLIGHT_LINES = 5;
-const MAX_DIFF_HIGHLIGHT_CHARS = 180;
+
 const MAX_FALLBACK_FILES = 8;
 const MAX_FALLBACK_GROUPS = 4;
 const COMMIT_SUBJECT_MAX_LENGTH = 72;
@@ -82,10 +81,6 @@ function trimToLength(value: string, maxLength: number) {
 function titleCaseWord(value: string) {
   if (!value) return value;
   return `${value[0].toUpperCase()}${value.slice(1)}`;
-}
-
-function compactWhitespace(value: string) {
-  return value.replace(/\s+/g, " ").trim();
 }
 
 function splitPathTokens(path: string): string[] {
@@ -234,107 +229,129 @@ function inferCommitTopic(entries: GitDiffEntry[], language: Language) {
   return inferCommitTopicFromPaths(entries, language);
 }
 
-function statusLabel(status: string, language: Language) {
-  const normalized = status.toUpperCase();
-  if (language === "zh") {
-    if (normalized === "A" || normalized === "U") return "新增";
-    if (normalized === "D") return "删除";
-    if (normalized === "R") return "重命名";
-    return "修改";
+function buildUnifiedDiff(entry: GitDiffEntry, contextSize = 3): string {
+  if (entry.binary) {
+    return `### [Binary] ${entry.path}\n`;
   }
-  if (normalized === "A" || normalized === "U") return "add";
-  if (normalized === "D") return "remove";
-  if (normalized === "R") return "rename";
-  return "modify";
-}
 
-function splitTextLines(value: string) {
-  if (!value) return [];
-  return value.replace(/\r\n/g, "\n").split("\n");
-}
+  const pathHeader = `### File: ${entry.path}\n`;
 
-function countTextLines(value: string) {
-  if (!value) return 0;
-  return splitTextLines(value).length;
-}
-
-function normalizeHighlightLine(value: string) {
-  return compactWhitespace(value).replace(/^[-+]\s*/, "");
-}
-
-function isUsefulHighlightLine(value: string) {
-  const normalized = normalizeHighlightLine(value);
-  if (normalized.length < 4) return false;
-  if (/^[{}()[\];,.:'"`=\-\s]+$/.test(normalized)) return false;
-  if (/^(import|export)\s+type\s+/i.test(normalized)) return false;
-  return true;
-}
-
-function countNormalizedLines(lines: string[]) {
-  const counts = new Map<string, number>();
-  for (const line of lines) {
-    const normalized = normalizeHighlightLine(line);
-    if (!isUsefulHighlightLine(normalized)) continue;
-    counts.set(normalized, (counts.get(normalized) || 0) + 1);
+  if (entry.status === "A" || entry.status === "U") {
+    const lines = entry.new ? entry.new.split(/\r?\n/) : [];
+    const limit = 40;
+    const truncated = lines.length > limit;
+    const linesToShow = lines.slice(0, limit);
+    let diffText = pathHeader + `Status: Added / Untracked\n`;
+    diffText += `--- /dev/null\n+++ b/${entry.path}\n@@ -0,0 +1,${linesToShow.length} @@\n`;
+    diffText += linesToShow.map((line) => `+${line}`).join("\n");
+    if (truncated) {
+      diffText += `\n... (truncated ${lines.length - limit} lines)`;
+    }
+    return diffText + "\n";
   }
-  return counts;
-}
 
-function collectLineHighlights(lines: string[], comparisonCounts: Map<string, number>) {
-  const remaining = new Map(comparisonCounts);
-  const seen = new Set<string>();
-  const highlights: string[] = [];
+  if (entry.status === "D") {
+    const lines = entry.old ? entry.old.split(/\r?\n/) : [];
+    const limit = 10;
+    const truncated = lines.length > limit;
+    const linesToShow = lines.slice(0, limit);
+    let diffText = pathHeader + `Status: Deleted\n`;
+    diffText += `--- a/${entry.path}\n+++ /dev/null\n@@ -1,${linesToShow.length} +0,0 @@\n`;
+    diffText += linesToShow.map((line) => `-${line}`).join("\n");
+    if (truncated) {
+      diffText += `\n... (truncated ${lines.length - limit} lines)`;
+    }
+    return diffText + "\n";
+  }
 
-  for (const line of lines) {
-    const normalized = normalizeHighlightLine(line);
-    if (!isUsefulHighlightLine(normalized)) continue;
+  const diffLines = buildLineDiff(entry.old || "", entry.new || "");
+  const hunks: string[] = [];
+  const n = diffLines.length;
+  let i = 0;
 
-    const matchingCount = remaining.get(normalized) || 0;
-    if (matchingCount > 0) {
-      remaining.set(normalized, matchingCount - 1);
-      continue;
+  let currentOldLine = 1;
+  let currentNewLine = 1;
+
+  while (i < n) {
+    while (i < n && diffLines[i].type === "unchanged") {
+      currentOldLine++;
+      currentNewLine++;
+      i++;
+    }
+    if (i >= n) break;
+
+    const hunkStart = Math.max(0, i - contextSize);
+
+    let hunkOldStart = currentOldLine;
+    let hunkNewStart = currentNewLine;
+    for (let k = i - 1; k >= hunkStart; k--) {
+      hunkOldStart--;
+      hunkNewStart--;
     }
 
-    const compacted = trimToLength(normalized.replace(/`/g, "'"), MAX_DIFF_HIGHLIGHT_CHARS);
-    const key = compacted.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    highlights.push(compacted);
-    if (highlights.length >= MAX_DIFF_HIGHLIGHT_LINES) break;
+    let lastChangeIndex = i;
+    let scan = i;
+    while (scan < n) {
+      if (diffLines[scan].type !== "unchanged") {
+        lastChangeIndex = scan;
+      } else if (scan - lastChangeIndex >= 2 * contextSize) {
+        break;
+      }
+      scan++;
+    }
+
+    const hunkEnd = Math.min(n, lastChangeIndex + contextSize + 1);
+
+    let oldLength = 0;
+    let newLength = 0;
+    for (let k = hunkStart; k < hunkEnd; k++) {
+      const type = diffLines[k].type;
+      if (type === "unchanged") {
+        oldLength++;
+        newLength++;
+      } else if (type === "removed") {
+        oldLength++;
+      } else if (type === "added") {
+        newLength++;
+      }
+    }
+
+    let hunkText = `@@ -${hunkOldStart},${oldLength} +${hunkNewStart},${newLength} @@\n`;
+    for (let k = hunkStart; k < hunkEnd; k++) {
+      const line = diffLines[k];
+      if (line.type === "added") {
+        hunkText += `+${line.text}\n`;
+      } else if (line.type === "removed") {
+        hunkText += `-${line.text}\n`;
+      } else {
+        hunkText += ` ${line.text}\n`;
+      }
+    }
+    hunks.push(hunkText.trimEnd());
+
+    for (let k = i; k < hunkEnd; k++) {
+      const type = diffLines[k].type;
+      if (type === "unchanged") {
+        currentOldLine++;
+        currentNewLine++;
+      } else if (type === "removed") {
+        currentOldLine++;
+      } else if (type === "added") {
+        currentNewLine++;
+      }
+    }
+
+    i = hunkEnd;
   }
 
-  return highlights;
-}
+  if (hunks.length === 0) {
+    return pathHeader + `Status: Modified (No content changes)\n`;
+  }
 
-function extractEntryHighlights(entry: GitDiffEntry) {
-  const oldLines = splitTextLines(entry.old || "");
-  const newLines = splitTextLines(entry.new || "");
-  const oldCounts = countNormalizedLines(oldLines);
-  const newCounts = countNormalizedLines(newLines);
-  return {
-    oldLineCount: countTextLines(entry.old || ""),
-    newLineCount: countTextLines(entry.new || ""),
-    added: collectLineHighlights(newLines, oldCounts),
-    removed: collectLineHighlights(oldLines, newCounts),
-  };
-}
-
-function formatPromptHighlights(lines: string[]) {
-  return lines.length > 0 ? lines.map((line) => `  + ${line}`).join("\n") : "  (none detected from text excerpt)";
-}
-
-function buildEntryPromptSummary(entry: GitDiffEntry) {
-  const highlights = extractEntryHighlights(entry);
-  const label = entry.binary ? "binary" : entry.fullFile ? "full-file text" : "partial text";
-  return [
-    `### ${entry.status} ${entry.path}`,
-    `Status: ${statusLabel(entry.status, "en")} (${label})`,
-    `Lines: old ${highlights.oldLineCount}, new ${highlights.newLineCount}`,
-    "Added/changed line highlights:",
-    formatPromptHighlights(highlights.added),
-    "Removed/replaced line highlights:",
-    highlights.removed.length > 0 ? highlights.removed.map((line) => `  - ${line}`).join("\n") : "  (none detected from text excerpt)",
-  ].join("\n");
+  let result = pathHeader + `Status: Modified\n`;
+  result += `--- a/${entry.path}\n+++ b/${entry.path}\n`;
+  result += hunks.join("\n") + "\n";
+  return result;
 }
 
 function summarizeFallbackGroup(group: CommitChangeGroup, language: Language) {
@@ -538,15 +555,12 @@ function isDetailedEnoughGitCommitMessage(message: string, entries: GitDiffEntry
 }
 
 
-function appendLimited(lines: string[], next: string, maxChars: number) {
-  const current = lines.join("\n").length;
-  if (current >= maxChars) return;
-  const remaining = maxChars - current;
-  lines.push(next.length <= remaining ? next : next.slice(0, remaining));
-}
+function buildDiffChunks(entries: GitDiffEntry[], status?: GitStatus | null, chunkSize: number = 30_000): string[] {
+  const chunks: string[] = [];
+  let currentChunk: string[] = [];
+  let currentLength = 0;
 
-function buildDiffPromptContext(entries: GitDiffEntry[], status?: GitStatus | null) {
-  const lines: string[] = [
+  const header = [
     `Files changed: ${status?.changedFiles ?? entries.length}`,
     `Insertions: ${status?.insertions ?? 0}`,
     `Deletions: ${status?.deletions ?? 0}`,
@@ -555,23 +569,33 @@ function buildDiffPromptContext(entries: GitDiffEntry[], status?: GitStatus | nu
   ];
 
   for (const entry of entries.slice(0, MAX_DIFF_FILES)) {
-    lines.push(`- ${entry.status} ${entry.path}${entry.binary ? " (binary)" : ""}`);
+    header.push(`- ${entry.status} ${entry.path}${entry.binary ? " (binary)" : ""}`);
   }
+  header.push("", "Detailed diff of changes:");
 
-  lines.push("", "Per-file change summaries:");
+  const headerText = header.join("\n") + "\n";
+  currentChunk.push(headerText);
+  currentLength += headerText.length;
+
   for (const entry of entries.slice(0, MAX_DIFF_FILES)) {
-    appendLimited(lines, buildEntryPromptSummary(entry), MAX_DIFF_CHARS);
+    const diffText = buildUnifiedDiff(entry);
+    const lines = diffText.split("\n");
+    for (const line of lines) {
+      if (currentLength + line.length + 1 > chunkSize && currentChunk.length > 1) {
+        chunks.push(currentChunk.join("\n"));
+        currentChunk = [headerText];
+        currentLength = headerText.length;
+      }
+      currentChunk.push(line);
+      currentLength += line.length + 1;
+    }
   }
 
-  lines.push("", "Raw file excerpts for context:");
-  for (const entry of entries.slice(0, MAX_DIFF_FILES)) {
-    if (entry.binary) continue;
-    const oldText = (entry.old || "").slice(0, 1600);
-    const newText = (entry.new || "").slice(0, 2400);
-    appendLimited(lines, [`### ${entry.status} ${entry.path}`, "--- old", oldText, "--- new", newText].join("\n"), MAX_DIFF_CHARS);
+  if (currentChunk.length > 1) {
+    chunks.push(currentChunk.join("\n"));
   }
 
-  return lines.join("\n").slice(0, MAX_DIFF_CHARS);
+  return chunks.length > 0 ? chunks : [headerText];
 }
 
 async function defaultRequestJson(request: {
@@ -609,7 +633,7 @@ async function defaultRequestJson(request: {
   }
 }
 
-async function requestModelCommitMessage(params: GenerateGitCommitMessageParams): Promise<string | null> {
+export async function invokeModelWithMessages(params: GenerateGitCommitMessageParams, messages: ProtocolChatMessage[]): Promise<string | null> {
   const isCloud = params.config.activeProfile === "cloud";
   const activeConfig = isCloud ? params.config.cloud : params.config.local;
   const endpoint = String(activeConfig?.endpoint || "").trim();
@@ -623,6 +647,75 @@ async function requestModelCommitMessage(params: GenerateGitCommitMessageParams)
     : undefined;
   if ((!endpoint && cloudAuthMode !== "gemini_google_oauth") || !model) return null;
 
+  const cloudProtocol = normalizeCloudProtocol(isCloud ? params.config.cloud?.protocol : "openai");
+  const cloudApiFormat = resolveEffectiveCloudApiFormat({
+    protocol: isCloud ? params.config.cloud?.protocol : "openai",
+    apiFormat: isCloud ? params.config.cloud?.apiFormat : "chat_completions",
+    authMode: cloudAuthMode,
+  });
+  const isAnthropicCloud = isCloud && cloudProtocol === "anthropic";
+  const isGeminiCloud = isCloud && cloudProtocol === "gemini";
+  const cloudTokenRef = cloudExperimentalLoginEnabled ? params.config.cloud?.auth?.tokenRef : undefined;
+  let url = "";
+  let body: Record<string, unknown> = {};
+  let headers: Record<string, string> = {};
+
+  if (!isCloud && provider === "Ollama") {
+    url = `${endpoint.replace(/\/v1\/?$/i, "")}/api/chat`;
+    body = { model, messages, stream: false, options: { temperature: 0.1, top_p: 0.8 } };
+    headers = { "Content-Type": "application/json" };
+  } else if (isAnthropicCloud) {
+    url = buildCloudMessagesApiUrl(endpoint, "anthropic");
+    body = buildAnthropicRequestBody({ messages, model, maxTokens: 800, stream: false });
+    headers = buildCloudHeaders("anthropic", params.config.cloud?.apiKey || "", true, params.config.cloud?.customHeaders, cloudAuthMode);
+  } else if (isGeminiCloud) {
+    const request = buildGeminiRequestForAuthMode(endpoint, { messages, model, maxTokens: 800 }, cloudAuthMode);
+    url = request.url;
+    body = request.body;
+    headers = buildCloudHeaders("gemini", params.config.cloud?.apiKey || "", true, params.config.cloud?.customHeaders, cloudAuthMode);
+  } else {
+    url = buildCloudMessagesApiUrl(endpoint, "openai", cloudApiFormat);
+    body = cloudApiFormat === "responses"
+      ? {
+          model,
+          ...(extractOpenAiResponsesInstructions(messages) ? { instructions: extractOpenAiResponsesInstructions(messages) } : {}),
+          input: buildOpenAiResponsesInputCandidates(messages)[0].input,
+          ...buildOpenAiResponsesRequestExtras({
+            disableResponseStorage: params.config.cloud?.disableResponseStorage,
+            reasoningEffort: "none",
+          }),
+          ...(cloudAuthMode === "openai_chatgpt_oauth" ? { user_prompt_id: "main-commit-message" } : {}),
+        }
+      : { model, messages, stream: false, max_tokens: 800 };
+    headers = buildCloudHeaders("openai", isCloud ? params.config.cloud?.apiKey || "" : params.config.local?.apiKey || "", true, isCloud ? params.config.cloud?.customHeaders : undefined, cloudAuthMode);
+  }
+
+  const requestJson = params.requestJson || defaultRequestJson;
+  let timerId: any;
+  const timeout = new Promise<never>((_, reject) => {
+    timerId = globalThis.setTimeout(() => reject(new Error("Commit message generation timed out")), 60_000);
+  });
+  try {
+    const payload = await Promise.race([
+      requestJson({ url, method: "POST", headers, body, isCloud, authMode: cloudAuthMode, tokenRef: cloudTokenRef }),
+      timeout,
+    ]);
+
+    const raw = !isCloud && provider === "Ollama"
+      ? String((payload as { message?: { content?: unknown } })?.message?.content || "")
+      : isAnthropicCloud
+        ? extractAnthropicResponseText(payload)
+        : isGeminiCloud
+          ? extractGeminiResponseText(payload)
+          : extractOpenAiResponseText(payload, cloudApiFormat);
+
+    return raw;
+  } finally {
+    globalThis.clearTimeout(timerId);
+  }
+}
+
+async function requestModelCommitMessage(params: GenerateGitCommitMessageParams, diffContext: string): Promise<string | null> {
   const messages: ProtocolChatMessage[] = [
     {
       role: "system",
@@ -696,85 +789,91 @@ async function requestModelCommitMessage(params: GenerateGitCommitMessageParams)
     },
     {
       role: "user",
-      content: buildDiffPromptContext(params.entries, params.status),
+      content: diffContext,
     },
   ];
 
-  const cloudProtocol = normalizeCloudProtocol(isCloud ? params.config.cloud?.protocol : "openai");
-  const cloudApiFormat = resolveEffectiveCloudApiFormat({
-    protocol: isCloud ? params.config.cloud?.protocol : "openai",
-    apiFormat: isCloud ? params.config.cloud?.apiFormat : "chat_completions",
-    authMode: cloudAuthMode,
-  });
-  const isAnthropicCloud = isCloud && cloudProtocol === "anthropic";
-  const isGeminiCloud = isCloud && cloudProtocol === "gemini";
-  const cloudTokenRef = cloudExperimentalLoginEnabled ? params.config.cloud?.auth?.tokenRef : undefined;
-  let url = "";
-  let body: Record<string, unknown> = {};
-  let headers: Record<string, string> = {};
-
-  if (!isCloud && provider === "Ollama") {
-    url = `${endpoint.replace(/\/v1\/?$/i, "")}/api/chat`;
-    body = { model, messages, stream: false, options: { temperature: 0.1, top_p: 0.8 } };
-    headers = { "Content-Type": "application/json" };
-  } else if (isAnthropicCloud) {
-    url = buildCloudMessagesApiUrl(endpoint, "anthropic");
-    body = buildAnthropicRequestBody({ messages, model, maxTokens: 800, stream: false });
-    headers = buildCloudHeaders("anthropic", params.config.cloud?.apiKey || "", true, params.config.cloud?.customHeaders, cloudAuthMode);
-  } else if (isGeminiCloud) {
-    const request = buildGeminiRequestForAuthMode(endpoint, { messages, model, maxTokens: 800 }, cloudAuthMode);
-    url = request.url;
-    body = request.body;
-    headers = buildCloudHeaders("gemini", params.config.cloud?.apiKey || "", true, params.config.cloud?.customHeaders, cloudAuthMode);
-  } else {
-    url = buildCloudMessagesApiUrl(endpoint, "openai", cloudApiFormat);
-    body = cloudApiFormat === "responses"
-      ? {
-          model,
-          ...(extractOpenAiResponsesInstructions(messages) ? { instructions: extractOpenAiResponsesInstructions(messages) } : {}),
-          input: buildOpenAiResponsesInputCandidates(messages)[0].input,
-          ...buildOpenAiResponsesRequestExtras({
-            disableResponseStorage: params.config.cloud?.disableResponseStorage,
-            reasoningEffort: "none",
-          }),
-          ...(cloudAuthMode === "openai_chatgpt_oauth" ? { user_prompt_id: "main-commit-message" } : {}),
-        }
-      : { model, messages, stream: false, max_tokens: 800 };
-    headers = buildCloudHeaders("openai", isCloud ? params.config.cloud?.apiKey || "" : params.config.local?.apiKey || "", true, isCloud ? params.config.cloud?.customHeaders : undefined, cloudAuthMode);
-  }
-
-  const requestJson = params.requestJson || defaultRequestJson;
-  let timerId: any;
-  const timeout = new Promise<never>((_, reject) => {
-    timerId = globalThis.setTimeout(() => reject(new Error("Commit message generation timed out")), 30_000);
-  });
-  try {
-    const payload = await Promise.race([
-      requestJson({ url, method: "POST", headers, body, isCloud, authMode: cloudAuthMode, tokenRef: cloudTokenRef }),
-      timeout,
-    ]);
-
-    const raw = !isCloud && provider === "Ollama"
-      ? String((payload as { message?: { content?: unknown } })?.message?.content || "")
-      : isAnthropicCloud
-        ? extractAnthropicResponseText(payload)
-        : isGeminiCloud
-          ? extractGeminiResponseText(payload)
-          : extractOpenAiResponseText(payload, cloudApiFormat);
-
-    return sanitizeGitCommitMessage(raw);
-  } finally {
-    globalThis.clearTimeout(timerId);
-  }
+  const raw = await invokeModelWithMessages(params, messages);
+  if (!raw) return null;
+  return sanitizeGitCommitMessage(raw);
 }
+
+async function requestModelChunkSummary(params: GenerateGitCommitMessageParams, chunkText: string): Promise<string | null> {
+  const messages: ProtocolChatMessage[] = [
+    {
+      role: "system",
+      content: [
+        "You are an expert developer. Summarize the changes in the provided git diff chunk.",
+        "Output ONLY a plain-text summary of the changes. Do NOT use markdown. Do NOT use headers. Be concise and focus on the 'what' and 'why'."
+      ].join("\n"),
+    },
+    {
+      role: "user",
+      content: chunkText,
+    },
+  ];
+  const raw = await invokeModelWithMessages(params, messages);
+  return raw ? raw.trim() : null;
+}
+
+async function requestModelFinalCommitMessage(params: GenerateGitCommitMessageParams, combinedSummary: string): Promise<string | null> {
+  const messages: ProtocolChatMessage[] = [
+    {
+      role: "system",
+      content: [
+        "You are an expert developer. Generate a clean, concise, yet detailed Git commit message (a subject and description body) based on the provided summaries of changes.",
+        "Your output MUST be wrapped inside <commit_message> and </commit_message> tags.",
+        "Do NOT include any introductory text, explanations, or thinking process. Go straight to the <commit_message> tag.",
+        "",
+        "Format of the commit message inside the tags:",
+        "<subject line starting with conventional commit type (feat/fix/chore/refactor/docs/style/test/perf/ci/build/revert), under 72 characters>",
+        "",
+        "<2-4 short plain-text summary bullets, grouped by change theme>",
+        "",
+        "CRITICAL RULES:",
+        "- Do not return a subject-only message. Include a blank line and 2-4 body bullets.",
+        "- Summarize by theme, feature, workflow, or component. Do not list every changed file.",
+        "- Do NOT wrap the commit message in markdown code blocks (no ```). Only use the <commit_message> tags.",
+        "- Do NOT include markdown headers, tables, numbering (like '1.', '2.', '3.'), explanations, conversational preambles, or postscripts. Return ONLY the xml-wrapped commit message.",
+        "- Do NOT explain your process or mention 'Analyze User Input'. Just output the commit message directly.",
+        params.language === "zh"
+          ? "- Use clear, professional Chinese. Keep descriptions concise."
+          : "- Use clear, professional English. Keep descriptions concise."
+      ].join("\n"),
+    },
+    {
+      role: "user",
+      content: "Combined diff summaries:\n\n" + combinedSummary,
+    },
+  ];
+
+  const raw = await invokeModelWithMessages(params, messages);
+  if (!raw) return null;
+  return sanitizeGitCommitMessage(raw);
+}
+
 
 export async function generateGitCommitMessage(params: GenerateGitCommitMessageParams): Promise<GeneratedGitCommitMessage> {
   try {
-    const modelMessage = await requestModelCommitMessage(params);
-    if (modelMessage && isDetailedEnoughGitCommitMessage(modelMessage, params.entries, params.status)) {
-      return { message: modelMessage, source: "model" };
+    const chunks = buildDiffChunks(params.entries, params.status);
+    let finalModelMessage: string | null = null;
+    
+    if (chunks.length === 1) {
+      finalModelMessage = await requestModelCommitMessage(params, chunks[0]);
+    } else {
+      const chunkPromises = chunks.map(chunk => requestModelChunkSummary(params, chunk));
+      const chunkSummaries = await Promise.all(chunkPromises);
+      const validSummaries = chunkSummaries.filter(Boolean);
+      if (validSummaries.length > 0) {
+        finalModelMessage = await requestModelFinalCommitMessage(params, validSummaries.join("\n\n"));
+      }
     }
-  } catch {
+
+    if (finalModelMessage && isDetailedEnoughGitCommitMessage(finalModelMessage, params.entries, params.status)) {
+      return { message: finalModelMessage, source: "model" };
+    }
+  } catch (e) {
+    console.error("Failed model git commit generation", e);
     // Fall through to deterministic local generation.
   }
 

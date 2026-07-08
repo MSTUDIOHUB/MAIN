@@ -187,7 +187,7 @@ function isReasoningTagStart(lowerText: string, index: number, tag: string): boo
 export function stripReasoningBlocks(text: string): string {
   if (!text) return "";
 
-  const tags = ["analysis", "thinking", "thought", "reasoning"];
+  const tags = ["analysis", "thinking", "thought", "reasoning", "think"];
   const lower = text.toLowerCase();
   let result = "";
   let i = 0;

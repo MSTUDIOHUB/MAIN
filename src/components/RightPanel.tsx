@@ -14,7 +14,6 @@ import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import { save } from "@tauri-apps/plugin-dialog";
 import PlanPanel from "./PlanPanel";
-import GoalPanel from "./GoalPanel";
 import { buildLineDiff, getDiffStats } from "../lib/diff";
 import { getE2EResumeExecutionHandler, getE2ESavePlanDocumentHandler } from "../lib/e2e";
 import { extractPlanDraftPreview, extractStructuredPlanProposal, hasPlanDraftPreview, hasStructuredPlanProposal } from "../lib/planProposal";
@@ -1185,14 +1184,6 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
         description: language === "zh" ? "这里会同步显示当前线程中的终端输出。" : "Terminal output for the current thread appears here.",
       };
     }
-    if (rightPanelTab === "goal") {
-      const activeGoal = useAppStore.getState().activeGoal;
-      return {
-        icon: IconFileText,
-        title: language === "zh" ? "目标进度" : "Goal Progress",
-        description: activeGoal?.objective || (language === "zh" ? "查看目标模式执行状态和迭代记录。" : "View Goal Mode execution status and iteration log."),
-      };
-    }
     return {
       icon: IconFileText,
       title: language === "zh" ? "计划工作区" : "Plan Workspace",
@@ -1329,19 +1320,6 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
                 />
               </div>
             </div>
-          )}
-
-          {rightPanelTab === "goal" && useAppStore.getState().activeGoal && (
-            <GoalPanel
-              goal={useAppStore((s) => s.activeGoal)!}
-              progress={useAppStore((s) => s.goalProgress)}
-              status={useAppStore((s) => s.goalStatus)}
-              language={language}
-              themeMode={config.themeMode}
-              onPause={() => useAppStore.getState().pauseGoal()}
-              onResume={() => useAppStore.getState().resumeGoal()}
-              onStop={() => useAppStore.getState().clearGoal()}
-            />
           )}
         </div>
       </div>

@@ -231,7 +231,7 @@ export function computeContextBudgets(
     contextLimit,
     outputBudget,
     inputBudget,
-    proactiveTriggerBudget: Math.floor(inputBudget * 0.85),
+    proactiveTriggerBudget: Math.floor(inputBudget * 0.75),
     proactiveTargetBudget: Math.floor(inputBudget * 0.75),
   };
 }
@@ -1043,6 +1043,132 @@ export function activeMemoryReclamation(messages: TrimMessage[]): TrimMessage[] 
   });
 }
 
+// ── System Message Compaction ──────────────────────────────────────────
+// Prevents hook context messages (SessionStart, UserPromptSubmit, PostToolUse)
+// from bloating the system role to 86k+ chars.
+
+/** Compact a group of system messages sharing the same [HookContext:XXX] prefix. */
+function compactSystemGroup(_prefix: string, messages: TrimMessage[]): TrimMessage {
+  const parts: string[] = [];
+  for (const msg of messages) {
+    const content = typeof msg.content === "string" ? msg.content : "";
+    // Strip the [HookContext:XXX] prefix to get the raw content
+    const raw = content.replace(/^\[HookContext:\S+\]\s*/, "");
+    if (raw) parts.push(raw);
+  }
+  const eventName = messages.length > 0
+    ? (typeof messages[0].content === "string" ? messages[0].content.replace(/^\[HookContext:(\S+?)\]\s*/, "") : "")
+    : "Unknown";
+  return {
+    role: "system",
+    content: `[HookContext:${eventName}] ${parts.join("\n---\n")}`,
+  };
+}
+
+export interface SystemCompactionResult {
+  messages: TrimMessage[];
+  systemCharsBefore: number;
+  systemCharsAfter: number;
+  systemDropped: number;
+}
+
+/**
+ * Compact excessive `role: "system"` messages (typically hook context injectors).
+ * - Always preserves the first system message (main prompt) at index 0.
+ * - Groups remaining system messages by their `[HookContext:XXX]` event name.
+ * - Each group is collapsed into a single message, truncated to a per-group budget.
+ * - If total system chars still exceed the budget, drops oldest groups first.
+ *
+ * Default maxTotalSystemChars: 24000 characters.
+ */
+export function compactSystemMessages(
+  messages: TrimMessage[],
+  maxTotalSystemChars: number = 24000,
+): SystemCompactionResult {
+  if (messages.length === 0) return { messages, systemCharsBefore: 0, systemCharsAfter: 0, systemDropped: 0 };
+
+  const systemCharsBefore = messages.reduce((sum, msg) => {
+    if (msg.role !== "system") return sum;
+    return sum + (typeof msg.content === "string" ? msg.content.length : 0);
+  }, 0);
+
+  // Always keep the first system message (main prompt)
+  const mainSystem = messages[0].role === "system" ? [messages[0]] : [];
+  const hookSystemMessages: TrimMessage[] = [];
+
+  for (let i = 1; i < messages.length; i += 1) {
+    const msg = messages[i];
+    if (msg.role === "system") {
+      hookSystemMessages.push(msg);
+    }
+  }
+
+  if (hookSystemMessages.length === 0) {
+    return { messages, systemCharsBefore, systemCharsAfter: systemCharsBefore, systemDropped: 0 };
+  }
+
+  // Group by [HookContext:XXX] prefix
+  const groups = new Map<string, TrimMessage[]>();
+  for (const msg of hookSystemMessages) {
+    const content = typeof msg.content === "string" ? msg.content : "";
+    const match = content.match(/^\[HookContext:(\S+?)\]\s*/);
+    const key = match ? match[1] : "Unknown";
+    const existing = groups.get(key) || [];
+    existing.push(msg);
+    groups.set(key, existing);
+  }
+
+  // Build compacted messages
+  const compactedSystemMessages: TrimMessage[] = [];
+  const perGroupBudget = Math.floor(maxTotalSystemChars / groups.size);
+
+  for (const [, groupMsgs] of groups) {
+    const compacted = compactSystemGroup("", groupMsgs);
+    // Truncate content to per-group budget
+    if (typeof compacted.content === "string" && compacted.content.length > perGroupBudget) {
+      compacted.content = compacted.content.slice(0, perGroupBudget) + "... [truncated]";
+    }
+    compactedSystemMessages.push(compacted);
+  }
+
+  // If total system chars still exceed budget, drop oldest groups first
+  let totalSysChars = mainSystem.reduce((s, m) => s + (typeof m.content === "string" ? m.content.length : 0), 0)
+    + compactedSystemMessages.reduce((s, m) => s + (typeof m.content === "string" ? m.content.length : 0), 0);
+
+  if (totalSysChars > maxTotalSystemChars) {
+    const keepCount = Math.max(1, Math.floor(maxTotalSystemChars / perGroupBudget));
+    const kept = compactedSystemMessages.slice(0, keepCount);
+    const dropped = compactedSystemMessages.length - kept.length;
+    const resultMessages = [...mainSystem, ...kept, ...messages.filter((m) => m.role !== "system")];
+    const systemCharsAfter = resultMessages.reduce((s, m) => {
+      if (m.role !== "system") return s;
+      return s + (typeof m.content === "string" ? m.content.length : 0);
+    }, 0);
+    return { messages: resultMessages, systemCharsBefore, systemCharsAfter, systemDropped: dropped };
+  }
+
+  // All groups fit — rebuild message list preserving non-system messages
+  const resultMessages: TrimMessage[] = [];
+  let sysIdx = 0;
+  for (const msg of messages) {
+    if (msg.role === "system" && msg === mainSystem[0]) {
+      resultMessages.push(msg);
+    } else if (msg.role === "system") {
+      resultMessages.push(compactedSystemMessages[sysIdx++]);
+    } else {
+      resultMessages.push(msg);
+    }
+  }
+
+  const systemCharsAfter = resultMessages.reduce((s, m) => {
+    if (m.role !== "system") return s;
+    return s + (typeof m.content === "string" ? m.content.length : 0);
+  }, 0);
+
+  return { messages: resultMessages, systemCharsBefore, systemCharsAfter, systemDropped: 0 };
+}
+
+
 export interface ManageContextResult {
   messages: TrimMessage[];
   droppedCount: number;
@@ -1095,14 +1221,18 @@ export function manageContext(
   options: ManageContextOptions & { ephemeralItemIds?: Set<string> } = {},
 ): ManageContextResult {
   const reclaimedMessages = activeMemoryReclamation(messages);
+
+  // Pre-compact excessive system messages (hook context injectors) before memory injection
+  const systemCompacted = compactSystemMessages(reclaimedMessages);
+  const preMemoryMessages = systemCompacted.messages;
   const budgets = computeContextBudgets(contextLimit, reservedForOutput);
-  const memoryState = buildContextMemoryState(reclaimedMessages, {
+  const memoryState = buildContextMemoryState(preMemoryMessages, {
     previous: options.previousMemoryState,
     turnId: options.turnId,
     now: options.now,
   });
   const memoryPacket = formatContextMemoryPacket(memoryState);
-  const messagesWithMemory = injectContextMemoryMessage(reclaimedMessages, memoryState) as TrimMessage[];
+  const messagesWithMemory = injectContextMemoryMessage(preMemoryMessages, memoryState) as TrimMessage[];
   const tokenCountBefore = estimateMessagesTokens(messagesWithMemory);
   const tokenBreakdownBefore = computeContextTokenBreakdown(messagesWithMemory);
   const shouldManage = forceManage || tokenCountBefore > budgets.proactiveTriggerBudget;

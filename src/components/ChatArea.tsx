@@ -9,6 +9,7 @@ import JobListCard from "./JobListCard";
 import MarkdownRenderer from "./MarkdownRenderer";
 import StreamingCursor from "./StreamingCursor";
 import ExecutionCapsule from "./ExecutionCapsule";
+import GoalPanel from "./GoalPanel";
 import { resolveAutoScrollState } from "../lib/chatScroll";
 import { parseMessageContent } from "../lib/messageParser";
 import { sanitizeAIOutput, sanitizeAssistantDisplayContent, sanitizeVisibleAssistantText } from "../lib/sanitize";
@@ -2411,6 +2412,9 @@ export default function ChatArea({
     imageStudio,
     setImageStudioSetupGuideOpen,
     checkImageStudioEngine,
+    activeGoal,
+    goalProgress,
+    goalStatus,
   } = {
     showDiff: useAppStore((s) => s.showDiff),
     showPlanPanel: useAppStore((s) => s.showPlanPanel),
@@ -2451,6 +2455,9 @@ export default function ChatArea({
     imageStudio: useAppStore((s) => s.imageStudio),
     setImageStudioSetupGuideOpen: useAppStore((s) => s.setImageStudioSetupGuideOpen),
     checkImageStudioEngine: useAppStore((s) => s.checkImageStudioEngine),
+    activeGoal: useAppStore((s) => s.activeGoal),
+    goalProgress: useAppStore((s) => s.goalProgress),
+    goalStatus: useAppStore((s) => s.goalStatus),
   };
   const isImageStudioMode = selectedMainModeKey === "image_studio";
   const isWebFallbackImageEngine = imageStudio.config.provider === "web_fallback";
@@ -2496,10 +2503,32 @@ export default function ChatArea({
   const [isCapsuleCollapsed, setIsCapsuleCollapsed] = useState(false);
   const [showProgressPopover, setShowProgressPopover] = useState(false);
   const [showTasksPopover, setShowTasksPopover] = useState(false);
+  const [showGoalPopover, setShowGoalPopover] = useState(false);
   const popoverRef = useRef<HTMLDivElement>(null);
   const mButtonRef = useRef<HTMLButtonElement>(null);
   const tasksPopoverRef = useRef<HTMLDivElement>(null);
   const tasksButtonRef = useRef<HTMLButtonElement>(null);
+  const goalPopoverRef = useRef<HTMLDivElement>(null);
+  const goalButtonRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    if (!showGoalPopover) return;
+    const handleDocumentClick = (e: MouseEvent) => {
+      const target = e.target as HTMLElement;
+      if (
+        goalPopoverRef.current &&
+        !goalPopoverRef.current.contains(target) &&
+        goalButtonRef.current &&
+        !goalButtonRef.current.contains(target)
+      ) {
+        setShowGoalPopover(false);
+      }
+    };
+    document.addEventListener("click", handleDocumentClick);
+    return () => {
+      document.removeEventListener("click", handleDocumentClick);
+    };
+  }, [showGoalPopover]);
 
   useEffect(() => {
     if (!showProgressPopover) return;
@@ -2542,6 +2571,7 @@ export default function ChatArea({
   useEffect(() => {
     setShowProgressPopover(false);
     setShowTasksPopover(false);
+    setShowGoalPopover(false);
   }, [isCapsuleCollapsed, activeSessionKey]);
 
   const lastTurnIdRef = useRef<string | undefined>(undefined);
@@ -4358,6 +4388,30 @@ export default function ChatArea({
               )}
             </div>
           )}
+          {showGoalPopover && !isCapsuleCollapsed && activeGoal && (
+            <div
+              ref={goalPopoverRef}
+              data-testid="goal-progress-popover"
+              className={`pointer-events-auto mb-3 w-full max-w-xl rounded-2xl border backdrop-blur-md text-left transition-all duration-200 overflow-hidden ${
+                isLightThemeMode
+                  ? "border-[#d4d4d8] bg-white/95 shadow-[0_12px_40px_rgba(0,0,0,0.12)] text-[#18181b]"
+                  : isBlackThemeMode
+                  ? "border-[#202026] bg-[#030304]/95 shadow-[0_12px_40px_rgba(0,0,0,0.95)] text-[#e7e7ea]"
+                  : "border-[var(--accent-subtle-border)] bg-[rgba(9,9,11,0.95)] shadow-[0_12px_40px_rgba(0,0,0,0.85)] text-[#e4e4e7]"
+              }`}
+            >
+              <GoalPanel
+                goal={activeGoal}
+                progress={goalProgress}
+                status={goalStatus}
+                language={language}
+                themeMode={config.themeMode}
+                onPause={() => useAppStore.getState().pauseGoal()}
+                onResume={() => useAppStore.getState().resumeGoal()}
+                onStop={() => useAppStore.getState().clearGoal()}
+              />
+            </div>
+          )}
           {(() => {
             const isRich = hasCapsuleFlow && (persistedExplanation.includes("#") || persistedExplanation.includes("\n"));
             const headerLabel = hasCapsuleFlow
@@ -4420,6 +4474,23 @@ export default function ChatArea({
                             <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
                               <path strokeLinecap="round" strokeLinejoin="round" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
                             </svg>
+                          </button>
+                        )}
+                        
+                        {activeGoal && (
+                          <button
+                            ref={goalButtonRef}
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setShowGoalPopover(!showGoalPopover);
+                              setShowTasksPopover(false);
+                              setShowProgressPopover(false);
+                            }}
+                            title={language === "zh" ? "目标进度" : "Goal Progress"}
+                            className="shrink-0 ml-3 flex items-center justify-center p-1.5 rounded-md border border-[var(--accent-subtle-border)] bg-[color-mix(in_srgb,var(--accent)_10%,transparent)] text-[var(--accent-light)] transition-all hover:bg-[var(--accent)] hover:text-[#ffffff] hover:border-transparent active:scale-95 cursor-pointer"
+                          >
+                            <IconFileText className="w-3.5 h-3.5" />
                           </button>
                         )}
 

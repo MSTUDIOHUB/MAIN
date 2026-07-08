@@ -52,9 +52,36 @@ import { formatReadFileWindowForModel, formatReadFileWindowPayloadForModel } fro
 import { applyWorkspacePatch, summarizeApplyPatchTarget } from "./applyPatchTool";
 import { repoMapContext, repoMapFiles, repoMapImpact, repoMapSearch, repoMapStatus } from "./repoMapTools";
 
-/** Delay helper for waiting on PTY output after a command. */
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Sanitizes raw PTY output by stripping ANSI escape sequences and
+ * resolving carriage returns (\r) to avoid progress bar string inflation.
+ */
+function sanitizePtyOutput(rawText: string): string {
+  if (!rawText) return rawText;
+  
+  // 1. Strip ANSI escape sequences
+  const noAnsi = rawText.replace(/[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g, "");
+
+  // 2. Collapse carriage returns (\r)
+  const lines = noAnsi.split('\n');
+  const collapsedLines = lines.map(line => {
+    if (!line.includes('\r')) return line;
+    const parts = line.split('\r');
+    return parts[parts.length - 1];
+  });
+  
+  return collapsedLines.join('\n');
+}
+
+function sanitizePtyResult<T extends { text?: string }>(result: T): T {
+  if (result && typeof result.text === "string") {
+    return { ...result, text: sanitizePtyOutput(result.text) };
+  }
+  return result;
 }
 
 function parseOptionalNumber(value: unknown): number | undefined {
@@ -463,7 +490,7 @@ export async function executeTool(
 
       return JSON.stringify({
         command,
-        output: output.text,
+        output: sanitizePtyOutput(output.text),
         startOffset: output.startOffset,
         endOffset: output.endOffset,
         truncated: output.truncated,
@@ -472,17 +499,17 @@ export async function executeTool(
     }
 
     case "read_pty_buffer":
-      return await readPtyBuffer(parseOptionalNumber(args.max_chars), sessionKey);
+      return sanitizePtyOutput(await readPtyBuffer(parseOptionalNumber(args.max_chars), sessionKey));
 
     case "read_pty_tail":
       await sleep(Math.min(Math.max(parseOptionalNumber(args.wait_ms) ?? 0, 0), 30_000));
-      return await readPtyTail(parseOptionalNumber(args.max_chars), sessionKey);
+      return sanitizePtyResult(await readPtyTail(parseOptionalNumber(args.max_chars), sessionKey));
 
     case "read_pty_since": {
       const offset = parseOptionalNumber(args.offset);
       if (offset === undefined) throw new Error("Missing required parameter 'offset'.");
       await sleep(Math.min(Math.max(parseOptionalNumber(args.wait_ms) ?? 0, 0), 30_000));
-      return await readPtySince(offset, parseOptionalNumber(args.max_chars), sessionKey);
+      return sanitizePtyResult(await readPtySince(offset, parseOptionalNumber(args.max_chars), sessionKey));
     }
 
     case "get_pty_status":
@@ -598,7 +625,7 @@ export async function executeTool(
         ? await readChatTempFile(sessionKey!, replacePath)
         : await readFile(replacePath, workspace);
       if (!original.includes(searchText)) {
-        throw new Error("search_text 与文件内容不一致，未执行写入。");
+        throw new Error("search_text mismatch. The file content has likely changed. Please use the read_file tool or grep_search to view the current file content before attempting to edit again.");
       }
       const updated = original.replace(searchText, replaceText);
       if (updated === original) {

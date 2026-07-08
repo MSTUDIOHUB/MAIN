@@ -38,6 +38,7 @@ import { appendDebugLog } from "../debugLog";
 import { type PlanExecutionProgressPhase, type PlanExecutionProgressUpdate, getPlanArtifactTitle, extractPlanTasks, isEphemeralPlanArtifactPath, reconcilePlanTaskCompletion } from "../workflowModels";
 import { createPlanExecutionEvidenceEntry, appendPlanEvidenceEntry } from "../planEvidence";
 import { closeHarnessRunMarker, persistHarnessRunMarker, type HarnessRunMarker } from "../harnessCrashTelemetry";
+import { generateId } from "../utils";
 import { runAfterNextPaint } from "../uiScheduling";
 import { supportsToolDiffPreview } from "../toolDiff";
 import { findToolLifecycleBlockIndex, type ToolLifecycleMeta } from "../toolLifecycle";
@@ -423,6 +424,17 @@ export class WorkflowEngine {
       getPlanAutoResumeCount: () => sessionGet().planAutoResumeCount,
       getStatus: () => sessionGet().agentStatus,
       consumeActiveGuidance: () => sessionGet().consumeActiveGuidance(turnId),
+      onGuidanceInjected: (text: string) => {
+        sessionSet((s: any) => {
+          const blockWithTurn = {
+            id: generateId(),
+            type: "user",
+            turnId,
+            content: text,
+          };
+          return { taskFlow: [...s.taskFlow, blockWithTurn] };
+        });
+      },
       startNewTurn: () => sessionGet().startNewTurn(remoteFeishu),
       onGoalProgressUpdate: (progress, _goal) => sessionGet().updateGoalProgress(progress),
       onGoalIterationStart: (_iter) => {}, // Optionally add detailed store updates later
@@ -1812,11 +1824,38 @@ export class WorkflowEngine {
                 ] as import("../orchestrator").AgentMessage[];
               }
             };
+            const startTaskFlowLength = sessionGet().taskFlow.length;
+            const startAgentMessagesLength = sessionGet().agentMessages.length;
             const outcome = await executeAgentLoop(iterCallbacks, abortCtrl);
+            
+            const newFlow = sessionGet().taskFlow.slice(startTaskFlowLength);
+            let assistantText = "";
+            const toolCalls: { name: string; target?: string; arguments?: Record<string, unknown> }[] = [];
+
+            for (const block of newFlow) {
+               if (block.type === "agent" && block.content) {
+                 assistantText += block.content + "\n";
+               }
+            }
+            
+            const newMessages = sessionGet().agentMessages.slice(startAgentMessagesLength);
+            for (const msg of newMessages) {
+              if (msg.role === "assistant" && msg.tool_calls) {
+                for (const tc of msg.tool_calls) {
+                  let args = {};
+                  try { args = JSON.parse(tc.function.arguments); } catch (e) {}
+                  toolCalls.push({
+                    name: tc.function.name,
+                    arguments: args,
+                  });
+                }
+              }
+            }
+
             return {
-              assistantText: "Iteration completed", // In a real scenario we'd extract the actual text from state
-              toolCalls: [],
-              tokensUsed: 0,
+              assistantText: assistantText.trim() || (outcome.status === "error" ? outcome.reason : "Iteration completed without textual response"),
+              toolCalls,
+              tokensUsed: context.streamTokenCount || 0,
               completed: outcome.status === "completed",
               error: outcome.status === "error" ? outcome.reason : undefined
             };
@@ -1846,9 +1885,6 @@ export class WorkflowEngine {
         return executeGoalLoop({
           goal: activeGoal,
           callbacks: goalCallbacks,
-          budgetOverrides: {
-            maxIterations: sessionGet().config.goalMaxIterations
-          },
           existingProgress: sessionGet().goalProgress,
         }).then(goalOutcome => ({
           status: goalOutcome.status === "completed" ? "completed" : goalOutcome.status === "failed" ? "error" : "paused",

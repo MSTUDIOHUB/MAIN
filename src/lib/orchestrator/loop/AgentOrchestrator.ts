@@ -50,7 +50,7 @@ import { assessPlanEvidenceReadiness, shouldTriggerPlanReadOnlyConvergence } fro
 import { buildPlanEvidenceBlockedPauseMessage, buildPlanTargetedEvidenceRecoveryPrompt, isPlanDraftWriteToolName, resolvePlanNoActionRecovery, resolvePlanSuppressedToolRecovery, shouldClosePlanToolSurfaceAfterReadOnlyConvergence, shouldRedirectPlanToolsAfterReadOnlyConvergence, MAX_PLAN_EVIDENCE_RECOVERY_PASSES } from "../../planRuntime";
 import { extractPrimaryUserRequestText, extractTurnInputContextSignalsFromMessages } from "../../turnIntake";
 import { buildRequiredWebResearchQuery, formatWebResearchLocalDate, shouldRequireWebResearchForPrompt } from "../../webResearchGuard";
-import { deriveStreamSettings, resolveEffectiveToolProtocol, shouldUseXmlToolProtocol, resolveModelProtocolProfile, compactDiagnosticText, getOriginalUserPromptForPlanFallback, logAgentEvent, looksLikeRepairExecutionRequest, WEB_RESEARCH_TOOL_NAMES, KNOWLEDGE_TOOL_NAMES, filterGlobalChatToolDefinitions, getSessionTaskTargetingEvidence, runLifecycleHooks, createHookContextMessages, shouldUsePlanNoVisibleTokenWatchdog, PLAN_NO_VISIBLE_TOKEN_TIMEOUT_MS, truncateForLog, MAX_RECENT_PLAN_TOOL_ACTIVITY, EDIT_PROGRESS_TOOL_NAMES, EXECUTION_VERIFICATION_TOOL_NAMES, isReviewablePlanStage, buildPlanReviewReadyMessage, buildApprovedPlanContinuationPrompt, collectPlanClosureMaterializationInput, shouldAttemptPlanClosureGuard, isStreamWatchdogTimeoutMessage, buildApprovedPlanNoProgressStrategySwitchPrompt, PLAN_EXPLORATION_READ_ONLY_TOOLS, approvedPlanNeedsSourceEditBeforeValidation, isApprovedPlanSourceEditFirstTool, isApprovedPlanRecoveryTool, filterPlanRuntimeToolDefinitionsForPhase, hasPlanUserContextObservation, computeManagedContextLimit, computeContextForceReason, prepareMessagesForToolProtocol, summarizeMessagesForDiagnostics, summarizeToolsForDiagnostics, fetchLLMStream, shouldTreatCloudGatewayErrorAsCompatibility, buildNonActionableStopMessage, normalizeToolCallToExecute, buildAssistantHistoryMessage, shouldCompactProseCodeDump, buildProseCodeDumpNotice, summarizeReplyOptionsForLog, looksLikePlanCompletionClaim, isPreApprovalPlanDraftWrite, parseToolCallArguments, buildToolActionNarration, getToolTarget, MAX_NO_ACTION_RETRIES, buildReadOnlyPermissionHardRecoveryPrompt, formatPlanAuditRemainingTasks, resolveApprovedPlanValidationBoundary, buildApprovedPlanValidationPendingMessage, MAX_APPROVED_PLAN_NO_PROGRESS_RECOVERY_ATTEMPTS, buildApprovedPlanNoToolPauseMessage, buildBrowserValidationContinuationPrompt, buildPlanCommandExecutionHint, looksLikeOperationCompletionClaim, buildExecuteCompletionEvidencePrompt, looksLikeExecutionReplanningText, buildExecuteReplanningEvidencePrompt, autoMaterializePlanArtifactFromVisibleText, buildPlanRecoveryPrompt, CONCISE_PLAN_ARTIFACT_HINT_ZH, CONCISE_PLAN_ARTIFACT_HINT_EN, isPlanArtifactPath, buildHiddenThoughtOnlyContinuationPrompt, emitToolPreflightBlocked, planUnsupportedToolFeedbackMessage, buildReadOnlyCacheSignature, readFileMetadataIfAvailable, buildPlanExplorationBudget, PLAN_REPEAT_READ_LIMIT, buildPlanClosurePromptFromEvidence, appendPlanRepeatReadLimitGuidance, formatCachedReadOnlyToolResult, buildGenericObservationContinuationPrompt, buildPlanGateBlockedResult, truncateToolContent, executeReadOnlyToolsConcurrently, isReadFileRepeatLimitResult, executeLocalFileReadToolWithReview, executeWriteToolWithReview, isProjectSourceWriteResult, inferLifecycleStateFromToolResult, targetProgressReasonForToolResult, isSuccessfulPlanArtifactWriteResult, shouldDeferNoProgressStopToPlanReadOnlyConvergence, buildNoProgressBatchSignature, MAX_NO_PROGRESS_LOOP_REPEATS, buildToolResultHistoryContentByFormat, summarizeReadFileRepeatLimitBatch, buildReadFileRepeatLimitBatchPauseNotice, targetProgressOutcomeForToolResult, PLAN_EXECUTE_CONVERGENCE_PROMPT_RATIO, EXECUTE_CONVERGENCE_PROMPT_RATIO, buildExecuteConvergencePrompt, isExecutionPlanArtifactWrite, isTasksPlanWrite } from "../../orchestrator";
+import { deriveStreamSettings, resolveEffectiveToolProtocol, shouldUseXmlToolProtocol, resolveModelProtocolProfile, compactDiagnosticText, getOriginalUserPromptForPlanFallback, logAgentEvent, looksLikeRepairExecutionRequest, WEB_RESEARCH_TOOL_NAMES, KNOWLEDGE_TOOL_NAMES, filterGlobalChatToolDefinitions, getSessionTaskTargetingEvidence, runLifecycleHooks, createHookContextMessages, shouldUsePlanNoVisibleTokenWatchdog, PLAN_NO_VISIBLE_TOKEN_TIMEOUT_MS, truncateForLog, MAX_RECENT_PLAN_TOOL_ACTIVITY, EDIT_PROGRESS_TOOL_NAMES, EXECUTION_VERIFICATION_TOOL_NAMES, isReviewablePlanStage, buildPlanReviewReadyMessage, buildApprovedPlanContinuationPrompt, collectPlanClosureMaterializationInput, shouldAttemptPlanClosureGuard, isStreamWatchdogTimeoutMessage, buildApprovedPlanNoProgressStrategySwitchPrompt, PLAN_EXPLORATION_READ_ONLY_TOOLS, approvedPlanNeedsSourceEditBeforeValidation, isApprovedPlanSourceEditFirstTool, isApprovedPlanRecoveryTool, filterPlanRuntimeToolDefinitionsForPhase, hasPlanUserContextObservation, computeManagedContextLimit, computeContextForceReason, prepareMessagesForToolProtocol, summarizeMessagesForDiagnostics, summarizeToolsForDiagnostics, fetchLLMStream, shouldTreatCloudGatewayErrorAsCompatibility, buildNonActionableStopMessage, normalizeToolCallToExecute, buildAssistantHistoryMessage, shouldCompactProseCodeDump, buildProseCodeDumpNotice, summarizeReplyOptionsForLog, looksLikePlanCompletionClaim, isPreApprovalPlanDraftWrite, parseToolCallArguments, buildToolActionNarration, getToolTarget, MAX_NO_ACTION_RETRIES, buildReadOnlyPermissionHardRecoveryPrompt, formatPlanAuditRemainingTasks, resolveApprovedPlanValidationBoundary, buildApprovedPlanValidationPendingMessage, MAX_APPROVED_PLAN_NO_PROGRESS_RECOVERY_ATTEMPTS, buildApprovedPlanNoToolPauseMessage, buildBrowserValidationContinuationPrompt, buildPlanCommandExecutionHint, looksLikeOperationCompletionClaim, buildExecuteCompletionEvidencePrompt, looksLikeExecutionReplanningText, buildExecuteReplanningEvidencePrompt, autoMaterializePlanArtifactFromVisibleText, buildPlanRecoveryPrompt, CONCISE_PLAN_ARTIFACT_HINT_ZH, CONCISE_PLAN_ARTIFACT_HINT_EN, isPlanArtifactPath, buildHiddenThoughtOnlyContinuationPrompt, emitToolPreflightBlocked, planUnsupportedToolFeedbackMessage, buildReadOnlyCacheSignature, readFileMetadataIfAvailable, buildPlanExplorationBudget, PLAN_REPEAT_READ_LIMIT, MAX_CONSECUTIVE_READ_ONLY_ITERATIONS, isReadFileOnlyPattern, isContentInActiveMessages, buildPlanClosurePromptFromEvidence, appendPlanRepeatReadLimitGuidance, formatCachedReadOnlyToolResult, buildGenericObservationContinuationPrompt, buildPlanGateBlockedResult, truncateToolContent, executeReadOnlyToolsConcurrently, isReadFileRepeatLimitResult, executeLocalFileReadToolWithReview, executeWriteToolWithReview, isProjectSourceWriteResult, inferLifecycleStateFromToolResult, targetProgressReasonForToolResult, isSuccessfulPlanArtifactWriteResult, shouldDeferNoProgressStopToPlanReadOnlyConvergence, buildNoProgressBatchSignature, MAX_NO_PROGRESS_LOOP_REPEATS, buildToolResultHistoryContentByFormat, summarizeReadFileRepeatLimitBatch, buildReadFileRepeatLimitBatchPauseNotice, targetProgressOutcomeForToolResult, PLAN_EXECUTE_CONVERGENCE_PROMPT_RATIO, EXECUTE_CONVERGENCE_PROMPT_RATIO, buildExecuteConvergencePrompt, isExecutionPlanArtifactWrite, isTasksPlanWrite } from "../../orchestrator";
 import { AgentMessage, ToolExecutionResult, FetchLLMStreamOptions, CachedReadOnlyToolResult, ToolCallToExecute, ToolCallInMessage, OrchestratorCallbacks, type AgentLoopOutcome } from "../types";
 
 export class AgentOrchestrator {
@@ -871,6 +871,7 @@ export class AgentOrchestrator {
         const successfulEditTargetsSinceVerification = new Map<string, number>();
         let lastNoProgressBatchSignature = "";
         let noProgressBatchRepeatCount = 0;
+        let consecutiveReadFileOnlyCacheHits = 0;
         let approvedPlanNoProgressRecoveryAttempts = 0;
         let approvedPlanActionOnlyRecoveryActive = false;
         let approvedPlanNoToolRecoveryFileReadActive = false;
@@ -5524,7 +5525,7 @@ export class AgentOrchestrator {
               });
             }
 
-            if (fileReadState && !bypassApprovedPlanPatchRecoveryReadCache) {
+            if (fileReadState && !bypassApprovedPlanPatchRecoveryReadCache && isContentInActiveMessages(fileReadState.modelContent, managedAgentMessages)) {
               const metadata = fileReadMetadata ?? await readFileMetadataIfAvailable(fileReadState.path, workspace);
               const unchanged =
                 metadata != null &&
@@ -5658,7 +5659,7 @@ export class AgentOrchestrator {
                 metadata: fileReadMetadata,
                 currentSignature: fileReadSignature,
               });
-              if (coverage.fullFileState) {
+              if (coverage.fullFileState && isContentInActiveMessages(coverage.fullFileState.modelContent, managedAgentMessages)) {
                 const duplicateCount = (readOnlyDuplicateSkipCounts.get(coverage.fullFileState.signature) ?? 0) + 1;
                 readOnlyDuplicateSkipCounts.set(coverage.fullFileState.signature, duplicateCount);
                 const content = buildFileUnchangedStub(coverage.fullFileState);
@@ -5689,7 +5690,11 @@ export class AgentOrchestrator {
                   ...coverage.ranges.map((range) => range.endLine),
                 );
                 const resolvedCoveragePlan = planReadFileWindowCoverage(effectiveToolArgs, totalLines, coverage.ranges);
-                if (resolvedCoveragePlan.fullyCovered) {
+                const targetPath = (fileReadMetadata?.path ?? toolArgs.path).toLowerCase();
+                const areRangesActive = [...fileReadStates.values()]
+                  .filter(state => state.path.toLowerCase() === targetPath)
+                  .every(state => isContentInActiveMessages(state.modelContent, managedAgentMessages));
+                if (resolvedCoveragePlan.fullyCovered && areRangesActive) {
                   const duplicateCount = (readOnlyDuplicateSkipCounts.get(fileReadSignature || signature) ?? 0) + 1;
                   readOnlyDuplicateSkipCounts.set(fileReadSignature || signature, duplicateCount);
                   const content = formatReadFileWindowCoverageStub(fileReadMetadata.path, resolvedCoveragePlan);
@@ -6366,6 +6371,24 @@ export class AgentOrchestrator {
           noProgressBatchRepeatCount = 0;
         }
 
+        if (isReadFileOnlyPattern(allResults)) {
+          consecutiveReadFileOnlyCacheHits += 1;
+        } else {
+          consecutiveReadFileOnlyCacheHits = 0;
+        }
+
+        const isReadFileOnlyLoop = consecutiveReadFileOnlyCacheHits >= MAX_CONSECUTIVE_READ_ONLY_ITERATIONS;
+        if (isReadFileOnlyLoop && executeRecoveryMode === "normal" && workflowMode === "edit" && (runtimeIntent === "execute" || runtimeIntent === "goal")) {
+          const language = callbacks.getPreferredLanguage();
+          const repeatedTargets = summarizeRepeatedExecuteTargets(recentToolActivity.slice(-12));
+          activateExecuteRecovery("mutation_first", "read_file_only_loop", {
+            repeatedTargets,
+          });
+          pendingExecuteRecoveryPrompt = language === "zh"
+            ? `## 警告：只读循环检测器触发\n你当前已连续 ${consecutiveReadFileOnlyCacheHits} 轮重复读取同一批文件（命中缓存）。\n**下一条回复必须满足以下要求：**\n1. 立即停止重复调用 \`read_file\`。\n2. 必须执行具有修改性质的动作：调用 \`apply_patch\` / \`write_file\` 修改代码，或使用 \`run_command\` 重新运行打包/编译命令来获取最新反馈。\n3. 如果遇到阻碍，请直接向用户说明具体阻塞原因。`
+            : `## WARNING: Read-Only Loop Detector Triggered\nYou have consecutively read the same cached files for ${consecutiveReadFileOnlyCacheHits} iterations without taking action.\n**Your next reply MUST fulfill the following requirements:**\n1. Stop calling \`read_file\` repeatedly.\n2. You MUST perform a mutation or verification: call \`apply_patch\` / \`write_file\` to edit code, or use \`run_command\` to run build/compile commands to get fresh output.\n3. If blocked, state the concrete reason directly to the user.`;
+        }
+
         const executeReadOnlyRecovery =
           workflowMode === "edit" && runtimeIntent === "execute"
             ? resolveExecuteReadOnlyRecoveryTrigger({
@@ -6378,9 +6401,9 @@ export class AgentOrchestrator {
                   ? (config.activeProfile === "local" ? 10 : 8)
                   : Infinity,
                 minCachedReadOnlyActivities: executeRecoveryMode === "normal"
-                  ? (config.activeProfile === "local" ? 8 : 3)
+                  ? (config.activeProfile === "local" ? 4 : 3)
                   : Infinity,
-                maxNoProgressReadOnlyRepeats: config.activeProfile === "local" ? 4 : 2,
+                maxNoProgressReadOnlyRepeats: config.activeProfile === "local" ? 3 : 2,
                 maxReadOnlyToolChars: config.activeProfile === "local" ? 100000 : 30000,
               })
             : { shouldRecover: false, reason: "", readOnlyActivityCount: 0, batchToolChars: 0 };

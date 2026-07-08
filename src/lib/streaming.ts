@@ -127,7 +127,7 @@ export interface StreamResult {
 }
 
 const REASONING_ONLY_STREAM_GUARD_CHAR_LIMIT = 12_000;
-const STREAM_NO_VISIBLE_PROGRESS_TIMEOUT_MS = 180_000;
+const STREAM_NO_VISIBLE_PROGRESS_TIMEOUT_MS = 120_000;
 
 export function isLocalProfile(settings: StreamSettings): boolean {
   if (settings.provider === "Ollama" || settings.provider === "LM Studio" || settings.provider === "OMLX") return true;
@@ -202,7 +202,7 @@ function computeMaxTokensCeiling(contextLimit?: number): number {
   if (!contextLimit) return 65536;
   return Math.max(
     computeInitialMaxTokens(contextLimit),
-    Math.min(16384, Math.floor(contextLimit * 0.35)),
+    Math.min(32768, Math.floor(contextLimit * 0.35)),
   );
 }
 
@@ -1040,7 +1040,7 @@ async function streamViaRustProxy(
   let lastChunkAt = streamStartedAt;
   let lastProgressLifecycleAt = 0;
   let lastNoProgressWarningAt = 0;
-  const STREAM_PROGRESS_LIFECYCLE_INTERVAL_MS = 15_000;
+  const STREAM_PROGRESS_LIFECYCLE_INTERVAL_MS = 5_000;
   const STREAM_NO_PROGRESS_WARNING_MS = 45_000;
   callbacks.onLifecycle?.({
     phase: "stream_started",

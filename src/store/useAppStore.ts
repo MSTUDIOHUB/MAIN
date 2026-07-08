@@ -217,6 +217,7 @@ import {
   resolvePlanStateHydrationReason,
   shouldPromoteHydratedPlanToExecuting,
 } from "../lib/planStateHydration";
+import { createGoalDefinition } from "../lib/goalState";
 import type { GoalDefinition, GoalProgress, GoalStatus } from "../lib/goalState";
 import type { GoalBudget } from "../lib/goalBudget";
 import { PLAN_ARTIFACT_PATHS, hydratePlanArtifactsFromReader } from "../lib/planArtifactHydration";
@@ -922,7 +923,6 @@ export interface AppConfig {
   cloudExperimentalLoginEnabled: boolean;
   imAdapters: ImAdaptersConfig;
   workspace: string;
-  goalMaxIterations?: number;
 }
 
 export type AgentStatus = "idle" | "running" | "pending_review" | "error";
@@ -1793,6 +1793,10 @@ export function normalizeSessionRuntimeSnapshot(
       : [],
     queuedUserMessage,
     activeGuidance,
+    activeGoal: snapshot.activeGoal ?? null,
+    goalProgress: snapshot.goalProgress ?? null,
+    goalStatus: snapshot.goalStatus ?? "paused",
+    goalIterationBudget: snapshot.goalIterationBudget ?? 200,
   };
 }
 
@@ -1902,6 +1906,10 @@ const sessionRuntimeKeys = [
   "fileViewerWindow",
   "fileViewerError",
   "fileViewerLoading",
+  "activeGoal",
+  "goalProgress",
+  "goalStatus",
+  "goalIterationBudget",
 ] as const;
 
 function pickSessionRuntimePatch(source: Partial<SessionRuntimeState> | Record<string, unknown>) {
@@ -2013,6 +2021,10 @@ function createSessionRuntimeFromState(state: Partial<AppState>): SessionRuntime
     fileViewerWindow: state.fileViewerWindow || null,
     fileViewerError: state.fileViewerError || "",
     fileViewerLoading: state.fileViewerLoading === true,
+    activeGoal: state.activeGoal ?? null,
+    goalProgress: state.goalProgress ?? null,
+    goalStatus: state.goalStatus ?? "paused",
+    goalIterationBudget: state.goalIterationBudget ?? 200,
   };
 }
 
@@ -6769,7 +6781,6 @@ export const useAppStore = create<AppState>()(
   goalStatus: "paused",
   goalIterationBudget: 200,
   startGoal: (objective, options) => {
-    const { createGoalDefinition } = require("../lib/goalState");
     const newGoal = createGoalDefinition({
       objective,
       iterationBudget: options?.maxIterations ?? 200,
@@ -6782,8 +6793,6 @@ export const useAppStore = create<AppState>()(
       goalStatus: "active",
       goalIterationBudget: newGoal.iterationBudget,
       goalProgress: null, // Reset progress for new goal
-      rightPanelTab: "goal",
-      showPlanPanel: true,
     });
   },
   pauseGoal: () => {
@@ -9576,6 +9585,11 @@ export const useAppStore = create<AppState>()(
       // 5. Create AbortController and launch the loop
       const abortCtrl = new AbortController();
       sessionSet({ abortController: abortCtrl });
+      
+      if (effectiveRunIntent === "goal") {
+        sessionGet().startGoal(userContent, { sessionKey: runSessionKey });
+      }
+
       let harnessRunMarker: HarnessRunMarker = persistHarnessRunMarker({
         schemaVersion: 1,
         instanceId: getCurrentHarnessInstanceId(),

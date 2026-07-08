@@ -99,6 +99,7 @@ export interface OrchestratorCallbacks {
   getPlanAutoResumeCount?: () => number;
   getStatus: () => "idle" | "running" | "pending_review" | "error";
   consumeActiveGuidance?: () => { id: string; text: string; turnId: string | null } | null;
+  onGuidanceInjected?: (text: string) => void;
   startNewTurn: () => void;
   getContextMemoryState?: () => ContextMemoryState | null;
   shouldForceXmlForProviderCompatibility?: () => boolean;

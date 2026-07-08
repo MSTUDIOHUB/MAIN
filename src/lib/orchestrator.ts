@@ -25,7 +25,7 @@ import {
 } from "./streaming";
 import { type ToolDefinition } from "./toolSchemas";
 import { executeTool } from "./toolExecutor";
-import { estimateMessagesTokens, estimateTokens } from "./contextTrim";
+import { computeContextTokenBreakdown, estimateMessagesTokens, estimateTokens, manageContext, type TrimMessage } from "./contextTrim";
 import type { ContextMemoryState } from "./contextMemory";
 import { generateId } from "./utils";
 import {
@@ -204,6 +204,7 @@ const PRE_APPROVAL_PLAN_FILE_NAMES = new Set(["plan.md", "design.md"]);
 const EXECUTION_PLAN_FILE_NAMES = new Set(["requirements.md", "plan.md", "tasks.md"]);
 const PLAN_ARTIFACT_MUTATION_TOOLS = new Set(["write_file", "replace_in_file", "apply_patch"]);
 export const PLAN_REPEAT_READ_LIMIT = 3;
+export const EXECUTION_REPEAT_READ_LIMIT = 8;
 export const PLAN_EXPLORATION_READ_ONLY_TOOLS = new Set([
   "get_project_skeleton",
   "list_directory",
@@ -1229,6 +1230,7 @@ export interface OrchestratorCallbacks {
   getPlanAutoResumeCount?: () => number;
   getStatus: () => "idle" | "running" | "pending_review" | "error";
   consumeActiveGuidance?: () => { id: string; text: string; turnId: string | null } | null;
+  onGuidanceInjected?: (text: string) => void;
   startNewTurn: () => void;
   getContextMemoryState?: () => ContextMemoryState | null;
   shouldForceXmlForProviderCompatibility?: () => boolean;
@@ -1533,6 +1535,22 @@ export const EXECUTE_CONVERGENCE_PROMPT_RATIO = 0.72;
 export const PLAN_EXECUTE_CONVERGENCE_PROMPT_RATIO = 0.24;
 export const MAX_NO_PROGRESS_LOOP_REPEATS = 5;
 export const MAX_APPROVED_PLAN_NO_PROGRESS_RECOVERY_ATTEMPTS = 2;
+export const MAX_CONSECUTIVE_READ_FILE_CALLS = 3;
+export const MAX_CONSECUTIVE_READ_ONLY_ITERATIONS = 3;
+
+export function isReadFileOnlyPattern(results: ToolExecutionResult[]): boolean {
+  if (results.length === 0) return false;
+  return results.every(res => 
+    res.name === "read_file" && 
+    !res.isError && 
+    (res.content.includes("FILE_UNCHANGED_STUB") || res.content.includes("READ_FILE_REPEAT_LIMIT"))
+  );
+}
+
+export function isContentInActiveMessages(modelContent: string, messages: AgentMessage[]): boolean {
+  if (!modelContent || !modelContent.trim()) return false;
+  return messages.some(msg => typeof msg.content === "string" && msg.content.includes(modelContent));
+}
 const NO_PROGRESS_EXCLUDED_TOOLS = new Set([
   "run_command",
   "execute_command",
@@ -2613,6 +2631,9 @@ export async function fetchLLMStream(
   const MAX_TRANSIENT_RETRIES = 2;
   let escalationCount = 0;
 
+  // Track consecutive stream cancellations for aggressive context compaction
+  let consecutiveCancelCount = 0;
+
   while (true) {
     fullText = "";
     let result: StreamResult;
@@ -2757,14 +2778,72 @@ export async function fetchLLMStream(
         await new Promise((resolve) => setTimeout(resolve, 350 * transientRetryCount));
         continue;
       }
+
+      // ── Consecutive cancellation tracking (Fix 4) ─────────────────────
+      const isAbort = !signal.aborted && (
+        (err as Error).name === "AbortError" ||
+        retryMessage.toLowerCase().includes("abort") ||
+        retryMessage.toLowerCase().includes("cancel")
+      );
+
+      if (isAbort) {
+        consecutiveCancelCount++;
+        logAgentEvent("stream_cancellation_detected", {
+          consecutiveCount: consecutiveCancelCount,
+          cancelDuration: options.noVisibleTokenTimeoutMs ?? 0,
+        });
+
+        // After 2+ consecutive cancellations, aggressively compact context
+        if (consecutiveCancelCount >= 2 && settings.contextLimit && messages.length > 0) {
+          const aggressiveLimit = Math.max(8192, Math.floor(settings.contextLimit * 0.6));
+          const compactedResult = manageContext(
+            messages as TrimMessage[],
+            aggressiveLimit,
+            Math.max(2048, Math.floor(aggressiveLimit * 0.15)),
+            2000,
+            1000,
+            true,
+          );
+          if (compactedResult.changed) {
+            // Reassign messages to compacted version for the next retry
+            messages = compactedResult.messages as AgentMessage[];
+            currentMaxTokens = Math.min(currentMaxTokens, computeInitialMaxTokens(aggressiveLimit));
+            logAgentEvent("aggressive_context_compaction", {
+              reason: "consecutive_stream_cancellations",
+              cancelCount: consecutiveCancelCount,
+              tokenReduction: compactedResult.tokenReduction,
+              targetLimit: aggressiveLimit,
+            });
+            callbacks.onStreamToken("__ESCALATION_RESET__:", messageId);
+            // Retry once with compacted context
+            continue;
+          }
+        }
+      } else {
+        consecutiveCancelCount = 0;
+      }
+
       throw err;
     }
 
-    // Escalation limits: Local ceiling is 8192; Cloud ceiling is 32768
-    const effectiveCap = isLocal ? 8192 : 32768;
-    const shouldEscalate = result.finishReason === "length" &&
+    // Reset consecutive cancellation counter on successful stream completion
+    consecutiveCancelCount = 0;
+
+    // Escalation limits: Local ceiling is 32768; Cloud ceiling is 32768
+    const effectiveCap = 32768;
+
+    // Calculate context pressure to decide whether escalation makes sense
+    const tokenBreakdown = computeContextTokenBreakdown(messages as import("./contextTrim").TrimMessage[]);
+    const contextPressure = tokenBreakdown.total > 0 ? tokenBreakdown.system / tokenBreakdown.total : 0;
+    // Escalation rules: only skip, never auto-degrade
+    // - If context pressure > 0.85, skip escalation (keep current maxTokens)
+    // - Skip entirely when maxTokensOverride is set (already precisely configured)
+    const shouldEscalate =
+      result.finishReason === "length" &&
       escalationCount < MAX_ESCALATIONS &&
-      currentMaxTokens < effectiveCap;
+      currentMaxTokens < effectiveCap &&
+      contextPressure <= 0.85 &&
+      maxTokensOverride === undefined;
 
     if (shouldEscalate) {
       const nextMaxTokens = escalateMaxTokens(currentMaxTokens, settings.contextLimit);
@@ -2777,6 +2856,7 @@ export async function fetchLLMStream(
             currentMaxTokens: targetMaxTokens,
             attempt: escalationCount,
             isLocal,
+            contextPressure: Number(contextPressure.toFixed(3)),
           });
           currentMaxTokens = targetMaxTokens;
 
@@ -2785,6 +2865,40 @@ export async function fetchLLMStream(
           continue;
         }
       }
+    }
+
+    // When context pressure > 0.92 and response is truncated, consider mild degradation
+    if (
+      result.finishReason === "length" &&
+      contextPressure > 0.92 &&
+      currentMaxTokens > 4096 &&
+      maxTokensOverride === undefined
+    ) {
+      const degradedTokens = Math.max(4096, currentMaxTokens - 4096);
+      if (degradedTokens < currentMaxTokens) {
+        logAgentEvent("max_output_degraded", {
+          previousMaxTokens: currentMaxTokens,
+          currentMaxTokens: degradedTokens,
+          reason: "extreme_context_pressure",
+          contextPressure: Number(contextPressure.toFixed(3)),
+        });
+        currentMaxTokens = degradedTokens;
+        callbacks.onStreamToken("__ESCALATION_RESET__:", messageId);
+        continue;
+      }
+    }
+
+    // Log when escalation was skipped due to context pressure
+    if (
+      result.finishReason === "length" &&
+      contextPressure > 0.85 &&
+      escalationCount < MAX_ESCALATIONS
+    ) {
+      logAgentEvent("max_output_escalation_skipped", {
+        reason: "context_pressure_too_high",
+        contextPressure: Number(contextPressure.toFixed(3)),
+        currentMaxTokens,
+      });
     }
 
     const isReasoningDominated = isReasoningDominatedLengthResult(result, isLocal);
@@ -3659,11 +3773,20 @@ async function executeToolCallWithLifecycle(
     : null;
 
   try {
-    const rawResult = await executeTool(tc.name, resolvedArgs, workspace, sessionKey, {
+    let rawResult = await executeTool(tc.name, resolvedArgs, workspace, sessionKey, {
       allowExternalLocalRead: options.allowExternalLocalRead === true,
       shellPermissionApproval: options.shellPermissionApproval,
     });
-    const resultStr = typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult);
+    let resultStr = typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult);
+
+    // Auto Map-Reduce for large files during read_file
+    if (tc.name === "read_file" && resultStr.includes("truncated: true") && !resolvedArgs.start_line) {
+      const { summarizeLargeFile } = await import("./summarizeLargeFile");
+      const summary = await summarizeLargeFile(resolvedArgs.path as string, workspace, sessionKey, callbacks.getConfig());
+      resultStr = summary;
+      rawResult = summary;
+    }
+
     const mutationAfterMeta = mutationVerificationPath
       ? await readFileMetadataIfAvailable(mutationVerificationPath, workspace)
       : null;
