@@ -171,14 +171,20 @@ test("ordinary composer sends only reuse awaiting-choice turns on exact option m
   const storeSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/useAppStore.ts"), "utf8");
   const turnSubmissionSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/submit/turnSubmission.ts"), "utf8");
   const submitRuntimeFacadeSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitRuntimeFacade.ts"), "utf8");
+  const submitSessionRuntimeControllerSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitSessionRuntimeController.ts"), "utf8");
   const submitPreflightExecutorSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitPreflightExecutor.ts"), "utf8");
   const submitPlanHydrationSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitPlanHydration.ts"), "utf8");
   const submitPlanExecutionResumeSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitPlanExecutionResume.ts"), "utf8");
   const submitPendingReviewTransitionSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitPendingReviewTransition.ts"), "utf8");
+  const submitPlanStateResetSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitPlanStateReset.ts"), "utf8");
+  const submitSendGateEffectsSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitSendGateEffects.ts"), "utf8");
+  const submitIntentRoutingSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitIntentRouting.ts"), "utf8");
+  const submitAsyncWorkflowRunSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitAsyncWorkflowRun.ts"), "utf8");
   const submitAttachmentContextSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitAttachmentContext.ts"), "utf8");
   const submitPromptContextSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitPromptContext.ts"), "utf8");
   const submitApprovedPlanExecutionSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitApprovedPlanExecution.ts"), "utf8");
   const submitSessionBootstrapSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitSessionBootstrap.ts"), "utf8");
+  const submitTurnDraftSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitTurnDraft.ts"), "utf8");
   const submitVisibleTurnSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitVisibleTurn.ts"), "utf8");
   const submitRunLeaseSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitRunLease.ts"), "utf8");
   const submitTitleEffectsSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitTitleEffects.ts"), "utf8");
@@ -191,7 +197,9 @@ test("ordinary composer sends only reuse awaiting-choice turns on exact option m
   const gameStudioLocalSlashSubmissionSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/gameStudioLocalSlashSubmission.ts"), "utf8");
 
   assert.match(turnSubmissionSource, /export function findReplyOptionMatchingSelectedText/);
+  assert.match(turnSubmissionSource, /export function buildSubmitInputEnvelope/);
   assert.match(turnSubmissionSource, /export function buildSubmitPipelineDecision/);
+  assert.match(turnSubmissionSource, /export function buildSubmitIntentConfirmationPendingDecision/);
   assert.match(turnSubmissionSource, /export function resolveSubmitTurnReuseDecision/);
   assert.match(turnSubmissionSource, /export function resolveSubmitEffectiveIntentDecision/);
   assert.match(turnSubmissionSource, /export function resolveSubmitRuntimeDecision/);
@@ -208,9 +216,15 @@ test("ordinary composer sends only reuse awaiting-choice turns on exact option m
   assert.match(turnSubmissionSource, /export function buildSubmitVisibleTurnPatch/);
   assert.match(turnSubmissionSource, /export function resolveSubmitSemanticMetadataDecision/);
   assert.match(turnSubmissionSource, /export function buildSubmitHarnessRunMarkerDraft/);
+  assert.match(submitRuntimeFacadeSource, /export function createSubmitPreRunSessionPatcher/);
   assert.match(submitRuntimeFacadeSource, /export function createSubmitSessionRuntimeFacade/);
   assert.match(submitRuntimeFacadeSource, /export function startSubmitElapsedTimer/);
+  assert.match(submitSessionRuntimeControllerSource, /export function createSubmitSessionRuntimeController/);
+  assert.match(submitSessionRuntimeControllerSource, /plan_artifact_rejected_by_quality_gate/);
+  assert.match(submitSessionRuntimeControllerSource, /setConversationTurnStatus: sessionSetConversationTurnStatus/);
   assert.match(submitPreflightExecutorSource, /export async function executeSubmitBlockingPreflight/);
+  assert.match(submitPreflightExecutorSource, /export function startSubmitBlockingPreflightEffect/);
+  assert.match(submitPreflightExecutorSource, /applyPreRunSessionPatch\(\{ pendingRunDecision \}\)/);
   assert.match(submitPlanHydrationSource, /export async function runSubmitPlanHydrationEffect/);
   assert.match(submitPlanHydrationSource, /export function startSubmitPlanHydrationEffect/);
   assert.match(submitPlanHydrationSource, /shouldPromoteHydratedPlanToExecuting/);
@@ -223,6 +237,24 @@ test("ordinary composer sends only reuse awaiting-choice turns on exact option m
   assert.match(submitPendingReviewTransitionSource, /resolvePendingReviewSubmissionDecision/);
   assert.match(submitPendingReviewTransitionSource, /send_pending_review_abort_and_new_turn/);
   assert.match(submitPendingReviewTransitionSource, /stopped_no_action/);
+  assert.match(submitPlanStateResetSource, /export function applySubmitPlanStateReset/);
+  assert.match(submitPlanStateResetSource, /planExecutionEvidenceLedger: \[\]/);
+  assert.match(submitPlanStateResetSource, /currentTurnExecutionConsent: \{ turnId: null, granted: false \}/);
+  assert.match(submitSendGateEffectsSource, /export function applySubmitSendGateEffects/);
+  assert.match(submitSendGateEffectsSource, /resolveSubmitSendGateDecision/);
+  assert.match(submitSendGateEffectsSource, /send_busy_hidden_execution_allowed/);
+  assert.match(submitSendGateEffectsSource, /send_stuck_state_reset/);
+  assert.match(submitIntentRoutingSource, /export function resolveAndApplySubmitIntentRouting/);
+  assert.match(submitIntentRoutingSource, /resolveSubmitEffectiveIntentDecision/);
+  assert.match(submitIntentRoutingSource, /resolveSubmitExecutionApprovalDecision/);
+  assert.match(submitIntentRoutingSource, /buildSubmitBlockingPreflightEffect/);
+  assert.match(submitIntentRoutingSource, /intent_decision_suppressed_for_same_input/);
+  assert.match(submitAsyncWorkflowRunSource, /export async function runSubmitAsyncWorkflowRun/);
+  assert.match(submitAsyncWorkflowRunSource, /await \(phaseRunners\.buildAttachmentContext \|\| buildSubmitAttachmentContext\)/);
+  assert.match(submitAsyncWorkflowRunSource, /\(phaseRunners\.buildPromptContext \|\| buildSubmitPromptContext\)/);
+  assert.match(submitAsyncWorkflowRunSource, /await \(phaseRunners\.runGameStudioPreparation \|\| runSubmitGameStudioPreparation\)/);
+  assert.match(submitAsyncWorkflowRunSource, /\(phaseRunners\.startRunLease \|\| startSubmitRunLease\)/);
+  assert.match(submitAsyncWorkflowRunSource, /void \(phaseRunners\.runWorkflowEngine \|\| runSubmitWorkflowEngine\)/);
   assert.match(submitAttachmentContextSource, /export async function buildSubmitAttachmentContext/);
   assert.match(submitAttachmentContextSource, /export async function prepareAttachedFileForRead/);
   assert.match(submitAttachmentContextSource, /\[attached_tabular_file\]/);
@@ -238,6 +270,9 @@ test("ordinary composer sends only reuse awaiting-choice turns on exact option m
   assert.match(submitSessionBootstrapSource, /export function applySubmitSessionBootstrap/);
   assert.match(submitSessionBootstrapSource, /buildSubmitSessionBootstrapDecision/);
   assert.match(submitSessionBootstrapSource, /buildSubmitSessionBootstrapPatch/);
+  assert.match(submitTurnDraftSource, /export function prepareSubmitTurnDraft/);
+  assert.match(submitTurnDraftSource, /buildUserContextItems/);
+  assert.match(submitTurnDraftSource, /resolveSubmitTurnTitleDecision/);
   assert.match(submitVisibleTurnSource, /export function applySubmitVisibleTurn/);
   assert.match(submitVisibleTurnSource, /buildSubmitVisibleTurnPatch/);
   assert.match(submitVisibleTurnSource, /buildSubmitRunStatePatch/);
@@ -276,45 +311,72 @@ test("ordinary composer sends only reuse awaiting-choice turns on exact option m
     /const shouldAutoResumeChoiceTurn =[\s\S]{0,260}\(currentTurn\.status === "awaiting_input" \|\| currentTurnHasReplyOptions\)/,
   );
   assert.match(storeSource, /const submitPipelineDecision = buildSubmitPipelineDecision/);
+  assert.match(storeSource, /const intentRouting = resolveAndApplySubmitIntentRouting/);
+  assert.doesNotMatch(storeSource, /buildSubmitIntentConfirmationPendingDecision\(\{/);
+  assert.doesNotMatch(storeSource, /createPendingDecisionCopy/);
   assert.match(storeSource, /const pendingReviewTransition = applySubmitPendingReviewTransition/);
   assert.doesNotMatch(storeSource, /send_pending_review_abort_and_new_turn/);
+  assert.match(storeSource, /const applyPreRunSessionPatch = createSubmitPreRunSessionPatcher<AppState, SessionRuntimeState>/);
+  assert.doesNotMatch(
+    storeSource,
+    /const applyPreRunSessionPatch = \(patch:[\s\S]{0,600}runtimeBySessionKey/,
+  );
+  assert.match(storeSource, /applySubmitPlanStateReset\(\{/);
+  assert.doesNotMatch(
+    storeSource,
+    /if \(runtimeDecision\.shouldResetPlanState\)[\s\S]{0,500}planExecutionEvidenceLedger/,
+  );
+  assert.match(storeSource, /const sendGateEffect = applySubmitSendGateEffects/);
+  assert.doesNotMatch(storeSource, /const sendGateDecision = resolveSubmitSendGateDecision/);
+  assert.doesNotMatch(storeSource, /send_stuck_state_reset/);
   assert.match(storeSource, /startSubmitPlanHydrationEffect\(\{/);
   assert.match(storeSource, /runSubmitPlanExecutionResumeEffect\(\{/);
   assert.doesNotMatch(storeSource, /const shouldPromoteToExecuting = shouldPromoteHydratedPlanToExecuting/);
   assert.doesNotMatch(storeSource, /function buildTrustedPlanResumePrompt/);
   assert.doesNotMatch(storeSource, /existing_plan_hydrated_for_execution/);
-  assert.match(storeSource, /const attachmentContext = await buildSubmitAttachmentContext/);
+  assert.match(storeSource, /void startSubmitAsyncWorkflowRun\(\{/);
+  assert.doesNotMatch(storeSource, /const attachmentContext = await buildSubmitAttachmentContext/);
   assert.doesNotMatch(storeSource, /\[attached_tabular_file\]/);
   assert.doesNotMatch(storeSource, /prepareAttachedFileForRead/);
-  assert.match(storeSource, /userContent = buildSubmitPromptContext\(\{/);
+  assert.doesNotMatch(storeSource, /userContent = buildSubmitPromptContext\(\{/);
   assert.doesNotMatch(storeSource, /Continue the previous PLAN turn/);
   assert.doesNotMatch(storeSource, /The user approved real operations/);
   assert.match(storeSource, /buildApprovedPlanExecutionPrompt\(\{/);
   assert.match(storeSource, /ensureApprovedPlanRuntimeTasksForState\(state, language\)/);
   assert.doesNotMatch(storeSource, /The plan is approved\. Continue directly/);
   assert.doesNotMatch(storeSource, /function buildPlanCommandExecutionHint/);
-  assert.match(storeSource, /const initialIntentDecision = resolveSubmitEffectiveIntentDecision/);
+  assert.match(storeSource, /const inputEnvelope = buildSubmitInputEnvelope\(\{/);
+  assert.doesNotMatch(storeSource, /const preParsedStudioCommand =/);
+  assert.doesNotMatch(storeSource, /const initialIntentDecision = resolveSubmitEffectiveIntentDecision/);
   assert.match(storeSource, /const runtimeDecision = resolveSubmitRuntimeDecision/);
-  assert.match(storeSource, /const sendGateDecision = resolveSubmitSendGateDecision/);
   assert.match(storeSource, /const sessionBootstrapDecision = applySubmitSessionBootstrap/);
-  assert.match(storeSource, /const titleDecision = resolveSubmitTurnTitleDecision/);
+  assert.match(storeSource, /const turnDraft = prepareSubmitTurnDraft\(\{/);
+  assert.doesNotMatch(storeSource, /const titleDecision = resolveSubmitTurnTitleDecision/);
+  assert.doesNotMatch(storeSource, /buildUserContextItems\(\{/);
   assert.match(storeSource, /const localSlashBridge = createGameStudioLocalSlashBridge/);
   assert.doesNotMatch(storeSource, /buildSubmitLocalStudioTurnPatch/);
   assert.match(storeSource, /const visibleTurnSubmission = applySubmitVisibleTurn/);
   assert.doesNotMatch(storeSource, /buildSubmitRunStatePatch/);
   assert.doesNotMatch(storeSource, /buildSubmitVisibleTurnPatch/);
-  assert.match(storeSource, /const blockingPreflightEffect = buildSubmitBlockingPreflightEffect/);
-  assert.match(storeSource, /await executeSubmitBlockingPreflight/);
+  assert.match(storeSource, /void startSubmitBlockingPreflightEffect\(\{/);
+  assert.doesNotMatch(storeSource, /const blockingPreflightEffect = buildSubmitBlockingPreflightEffect/);
+  assert.doesNotMatch(storeSource, /await executeSubmitBlockingPreflight/);
   assert.match(storeSource, /const semanticMetadataDecision = resolveSubmitSemanticMetadataDecision/);
   assert.match(storeSource, /startSubmitSemanticMetadataEffect/);
-  assert.match(storeSource, /const runLease = startSubmitRunLease/);
-  assert.match(storeSource, /const context = createSubmitWorkflowContext/);
-  assert.match(storeSource, /startSubmitStreamingUi\(\{/);
-  assert.match(storeSource, /void runSubmitWorkflowEngine\(\{/);
+  assert.doesNotMatch(storeSource, /const runLease = startSubmitRunLease/);
+  assert.doesNotMatch(storeSource, /const context = createSubmitWorkflowContext/);
+  assert.doesNotMatch(storeSource, /startSubmitStreamingUi\(\{/);
+  assert.doesNotMatch(storeSource, /void runSubmitWorkflowEngine\(\{/);
+  assert.match(submitAsyncWorkflowRunSource, /const runLease = \(phaseRunners\.startRunLease \|\| startSubmitRunLease\)/);
+  assert.match(submitAsyncWorkflowRunSource, /const context = \(phaseRunners\.createWorkflowContext \|\| createSubmitWorkflowContext\)/);
+  assert.match(submitAsyncWorkflowRunSource, /\(phaseRunners\.startStreamingUi \|\| startSubmitStreamingUi\)\(\{/);
+  assert.match(submitAsyncWorkflowRunSource, /void \(phaseRunners\.runWorkflowEngine \|\| runSubmitWorkflowEngine\)/);
   assert.doesNotMatch(storeSource, /new WorkflowEngine/);
-  assert.match(storeSource, /createSubmitSessionRuntimeFacade<AppState, SessionRuntimeState>/);
+  assert.match(storeSource, /createSubmitSessionRuntimeController<AppState, SessionRuntimeState>/);
+  assert.doesNotMatch(storeSource, /const sessionSetConversationTurnStatus/);
   assert.match(storeSource, /const elapsedTimer = startSubmitElapsedTimer/);
-  assert.match(storeSource, /const gameStudioPreparation = await runSubmitGameStudioPreparation/);
+  assert.doesNotMatch(storeSource, /const gameStudioPreparation = await runSubmitGameStudioPreparation/);
+  assert.match(submitAsyncWorkflowRunSource, /const gameStudioPreparation = await \(phaseRunners\.runGameStudioPreparation \|\| runSubmitGameStudioPreparation\)/);
   assert.doesNotMatch(storeSource, /content: gameStudioPreparation\.errorMessage/);
   assert.doesNotMatch(storeSource, /gameStudioPreparation\.shouldInvalidateWorkspaceTree/);
   assert.match(storeSource, /const localSlashSubmission = startGameStudioLocalSlashSubmission/);
@@ -378,6 +440,10 @@ test("approved plan execution handoff has one runtime owner and dedupe guard", (
   const storeSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/useAppStore.ts"), "utf8");
   const sessionTypesSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/sessionTypes.ts"), "utf8");
   const workflowEngineSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"), "utf8");
+  const approvePlanMethod = storeSource.slice(
+    storeSource.indexOf("approvePlan: (approvalChoice) =>"),
+    storeSource.indexOf("rejectPlan: () =>", storeSource.indexOf("approvePlan: (approvalChoice) =>")),
+  );
 
   assert.match(sessionTypesSource, /export interface PlanApprovalHandoff/);
   assert.match(storeSource, /PlanApprovalHandoff/);
@@ -387,8 +453,8 @@ test("approved plan execution handoff has one runtime owner and dedupe guard", (
   assert.match(storeSource, /plan_approval_execution_turn_created/);
   assert.match(storeSource, /source:\s*"store_fallback"/);
   assert.doesNotMatch(
-    storeSource,
-    /approvePlan:[\s\S]{0,2600}get\(\)\.sendMessage\(/,
+    approvePlanMethod,
+    /get\(\)\.sendMessage\(/,
     "approvePlan must register a handoff, not directly append a hidden execution turn",
   );
 

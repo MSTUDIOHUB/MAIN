@@ -131,7 +131,6 @@ import {
 } from "../lib/turnIntake";
 import { getFilePreviewStrategy } from "../lib/filePreviewStrategy";
 import {
-  buildUserContextItems,
   sanitizeUserContextItemsForPersist,
 } from "../lib/userContextItems";
 import {
@@ -154,7 +153,6 @@ import {
   getDefaultStudioAgentForEngine,
   parseSetupEngineArgs,
   normalizeStudioAgentKey,
-  parseGameStudioSlashCommand,
   type StudioWorkflowCommandSlug,
   type NexusModeKey,
   type PendingSlashCommand,
@@ -162,12 +160,9 @@ import {
   type StudioConfig,
 } from "../lib/gameStudioCatalog";
 import {
-  createPendingDecisionCopy,
   getIntentPolicy,
-  inferCommandDirective,
   resolveConversationTurnIntent,
   resolveRunIntentFromLegacyWorkflowMode,
-  resolveTurnRunIntent,
   type ExecutionConsentPolicy,
   type CommandDirective,
   type MainIntentShortcut,
@@ -175,24 +170,19 @@ import {
   type PendingRunDecisionChoice,
   type ResolvedUserIntent,
   type ResolvedRunIntent,
-  type RunIntentResolution,
 } from "../lib/runIntent";
 import {
   archiveConsumedReplyOptionsFromTaskFlow,
+  buildSubmitInputEnvelope,
   buildLocalTurnTitle,
   buildMainDebugPrompt,
   buildRunIntentSummary,
-  buildSubmitBlockingPreflightEffect,
   buildSubmitPipelineDecision,
   isResolvedUserIntentChoice,
   normalizeIntentSummary,
   normalizeTaskFlowPatchForConsumedReplyOptions,
-  resolveSubmitEffectiveIntentDecision,
-  resolveSubmitExecutionApprovalDecision,
   resolveSubmitRuntimeDecision,
   resolveSubmitSemanticMetadataDecision,
-  resolveSubmitSendGateDecision,
-  resolveSubmitTurnTitleDecision,
 } from "../lib/submit/turnSubmission";
 import { createGoalDefinition } from "../lib/goalState";
 import type { GoalDefinition, GoalProgress, GoalStatus } from "../lib/goalState";
@@ -216,28 +206,27 @@ import {
   normalizeStoredRightPanelTab,
 } from "./slices/workspaceSlice";
 import {
-  createSubmitSessionRuntimeFacade,
+  createSubmitPreRunSessionPatcher,
   startSubmitElapsedTimer,
 } from "./submitRuntimeFacade";
-import { runSubmitGameStudioPreparation } from "./submitGameStudioPreparation";
-import { executeSubmitBlockingPreflight } from "./submitPreflightExecutor";
+import { createSubmitSessionRuntimeController } from "./submitSessionRuntimeController";
+import { startSubmitBlockingPreflightEffect } from "./submitPreflightExecutor";
 import { startGameStudioLocalSlashSubmission } from "./gameStudioLocalSlashSubmission";
 import {
   applySubmitSeedSessionTitle,
   startSubmitSemanticMetadataEffect,
 } from "./submitTitleEffects";
-import { startSubmitRunLease } from "./submitRunLease";
-import { createSubmitWorkflowContext } from "./submitWorkflowContext";
-import { startSubmitStreamingUi } from "./submitStreamingUi";
-import { runSubmitWorkflowEngine } from "./submitWorkflowEngineRunner";
 import { applySubmitSessionBootstrap } from "./submitSessionBootstrap";
 import { createGameStudioLocalSlashBridge } from "./gameStudioLocalSlashBridge";
 import { applySubmitVisibleTurn } from "./submitVisibleTurn";
+import { prepareSubmitTurnDraft } from "./submitTurnDraft";
 import { startSubmitPlanHydrationEffect } from "./submitPlanHydration";
 import { runSubmitPlanExecutionResumeEffect } from "./submitPlanExecutionResume";
 import { applySubmitPendingReviewTransition } from "./submitPendingReviewTransition";
-import { buildSubmitAttachmentContext } from "./submitAttachmentContext";
-import { buildSubmitPromptContext } from "./submitPromptContext";
+import { applySubmitPlanStateReset } from "./submitPlanStateReset";
+import { applySubmitSendGateEffects } from "./submitSendGateEffects";
+import { resolveAndApplySubmitIntentRouting } from "./submitIntentRouting";
+import { startSubmitAsyncWorkflowRun } from "./submitAsyncWorkflowRun";
 import {
   buildApprovedPlanExecutionPrompt,
   ensureApprovedPlanRuntimeTasksForState,
@@ -5852,26 +5841,14 @@ export const useAppStore = create<AppState>()(
       state = pendingReviewTransition.state;
     }
     const sendOriginSessionKey = resolveSessionRuntimeKey(resolveSessionWorkspaceKey(state.currentWorkspace), state.currentSessionId);
-    const applyPreRunSessionPatch = (patch: Partial<AppState> | Record<string, unknown>) => {
-      if (!sendOriginSessionKey || isSessionRuntimeActive(get(), sendOriginSessionKey)) {
-        set(patch as Partial<AppState>);
-        return;
-      }
-      set((s) => {
-        const runtimePatch = pickSessionRuntimePatch(patch);
-        if (Object.keys(runtimePatch).length === 0) return {};
-        const existing = s.runtimeBySessionKey[sendOriginSessionKey] || createSessionRuntimeFromState(state);
-        return {
-          runtimeBySessionKey: {
-            ...s.runtimeBySessionKey,
-            [sendOriginSessionKey]: {
-              ...existing,
-              ...runtimePatch,
-            },
-          },
-        };
-      });
-    };
+    const applyPreRunSessionPatch = createSubmitPreRunSessionPatcher<AppState, SessionRuntimeState>({
+      originSessionKey: sendOriginSessionKey,
+      originSnapshot: state,
+      get,
+      set,
+      createRuntimeFromState: createSessionRuntimeFromState,
+      pickRuntimePatch: pickSessionRuntimePatch,
+    });
     const sendStartedAt = nowMs();
     logStoreEvent("send_message_called", {
       textChars: text?.length ?? 0,
@@ -5896,50 +5873,30 @@ export const useAppStore = create<AppState>()(
       }
       return get().runImageStudioGeneration(cleanText, images);
     }
-    const isHidden = options?.hidden === true;
-    const createVisibleTurnForHiddenMessage = isHidden && options?.createVisibleTurnForHiddenMessage === true;
-    const parentPlanTurnId =
-      options?.parentPlanTurnId && state.conversationTurns.some((turn) => turn.id === options.parentPlanTurnId)
-        ? options.parentPlanTurnId
-        : null;
-    const requestedUiParentTurnId = options?.uiParentTurnId || null;
-    const uiParentTurnId = requestedUiParentTurnId && state.conversationTurns.some((turn) => turn.id === requestedUiParentTurnId)
-      ? requestedUiParentTurnId
-      : null;
-    const mentionSnapshot = options?.contextMentionsSnapshot ?? state.contextMentions;
-    const attachedFilesSnapshot = options?.attachedFilesSnapshot ?? state.attachedFiles;
-    const remoteFeishu = options?.remoteFeishu || (
-      state.feishuLinkedSessionId === state.currentSessionId && state.feishuLinkedContext
-        ? state.feishuLinkedContext
-        : undefined
-    );
-    const hasSupplementalInput = mentionSnapshot.length > 0 || attachedFilesSnapshot.length > 0;
-    const currentMainModeKey = state.selectedMainModeKey;
-    const preParsedStudioCommand = currentMainModeKey === "game_studio"
-      ? parseGameStudioSlashCommand(text)
-      : null;
-    const preParsedStudioWorkflowArgs = preParsedStudioCommand?.type === "workflow"
-      ? preParsedStudioCommand.args
-      : "";
-    const languageResolutionInput =
-      preParsedStudioCommand?.type === "workflow"
-        ? (preParsedStudioWorkflowArgs || text)
-        : text;
-    const preferredLanguage = isHidden
-      ? state.preferredResponseLanguage
-      : resolveTurnResponseLanguage({
-          text: languageResolutionInput,
-          policy: state.config.responseLanguagePolicy,
-          systemLanguage: state.config.language === "en" ? "en" : "zh",
-          fallbackLanguage: state.config.language === "en" ? "en" : "zh",
-        });
-    const cachedWorkspaceTreeForGameDetection =
-      state.currentWorkspace &&
-      workspaceTreeCacheKey === state.currentWorkspace &&
-      workspaceTreeCacheVersion === state.workspaceContentVersion
-        ? workspaceTreeCache
-        : "";
-    if (!cachedWorkspaceTreeForGameDetection && state.currentWorkspace.trim()) {
+    const inputEnvelope = buildSubmitInputEnvelope({
+      text,
+      options,
+      state,
+      cache: {
+        workspaceTreeCacheKey,
+        workspaceTreeCacheVersion,
+        workspaceTreeCache,
+      },
+    });
+    const {
+      isHidden,
+      createVisibleTurnForHiddenMessage,
+      parentPlanTurnId,
+      uiParentTurnId,
+      mentionSnapshot,
+      attachedFilesSnapshot,
+      remoteFeishu,
+      hasSupplementalInput,
+      currentMainModeKey,
+      preferredLanguage,
+      cachedWorkspaceTreeForGameDetection,
+    } = inputEnvelope;
+    if (inputEnvelope.shouldWarmWorkspaceTreeCache) {
       void getWorkspaceTree(state.currentWorkspace);
     }
     const submitPipelineDecision = buildSubmitPipelineDecision({
@@ -6038,18 +5995,6 @@ export const useAppStore = create<AppState>()(
     if (!text.trim() && !hasSupplementalInput && !images?.length) {
       return false;
     }
-    const normalizedPendingDecisionInputKey = normalizePendingDecisionInputKey(text);
-    const shouldSuppressSameInputDecision =
-      !isHidden &&
-      normalizedPendingDecisionInputKey.length > 0 &&
-      state.dismissedPendingDecisionInputKey === normalizedPendingDecisionInputKey;
-    let decisionSuppressionConsumed = false;
-    const consumeDecisionSuppression = () => {
-      if (!shouldSuppressSameInputDecision || decisionSuppressionConsumed) return false;
-      decisionSuppressionConsumed = true;
-      set({ dismissedPendingDecisionInputKey: null });
-      return true;
-    };
     logStoreEvent("send_start", {
       textChars: text.length,
       isHidden,
@@ -6078,9 +6023,11 @@ export const useAppStore = create<AppState>()(
     });
     const isLocalStudioCommand =
       parsedStudioCommand?.type === "agent" || parsedStudioCommand?.type === "auto";
-    const initialIntentDecision = resolveSubmitEffectiveIntentDecision({
+
+    const intentRouting = resolveAndApplySubmitIntentRouting({
       text,
       preferredLanguage: preferredLanguage === "en" ? "en" : "zh",
+      images,
       options,
       currentMainModeKey,
       parsedStudioCommand,
@@ -6092,178 +6039,34 @@ export const useAppStore = create<AppState>()(
       lockedComposerIntent,
       currentTurn,
       currentTurnIntent,
+      hasPlanArtifacts,
       shouldContinuePlanIntent,
       shouldContinuePreviousTurnIntent,
       previousTurnContinuationTarget,
       previousTurnContinuationIntent,
       shouldReuseExistingTurnIntent,
       shouldExecuteOnceFromReplyOption,
+      shouldRouteContinuationToPlanResume,
+      planExecutionResumeContinuationTarget,
+      planStage: state.planStage,
+      isPlanApproved: state.isPlanApproved,
+      currentTurnId: state.currentTurnId,
+      isLocalFastStudioCommand,
       unitySetupEngineSelected: parsedSetupEngineCommand?.engine === "unity",
-    });
-    let effectiveRunIntent = initialIntentDecision.effectiveRunIntent;
-    let effectiveIntentSummary = initialIntentDecision.effectiveIntentSummary;
-    let effectiveCommandDirective = initialIntentDecision.effectiveCommandDirective;
-    const shouldForceExecuteForAutoApprove = initialIntentDecision.shouldForceExecuteForAutoApprove;
-    const applyDecisionSuppressedFallback = (
-      source: "reuse_resolution" | "resolution",
-      reason: string,
-    ) => {
-      effectiveRunIntent = "respond";
-      effectiveIntentSummary = buildRunIntentSummary({
-        input: text,
-        intent: "respond",
-        language: preferredLanguage,
-        reason,
-      });
-      effectiveCommandDirective = inferCommandDirective(text, "respond", {
-        source: source === "reuse_resolution" ? "continuation" : "natural_language",
-      });
-      logStoreEvent("intent_decision_suppressed_for_same_input", {
-        source,
-        inputChars: text.trim().length,
-      });
-    };
-
-    const shouldReevaluateReuseTurnIntent =
-      !isHidden &&
-      shouldReuseExistingTurnIntent &&
-      !mainDebugShortcut &&
-      !lockedComposerIntent &&
-      !shouldContinuePlanIntent &&
-      !shouldContinuePreviousTurnIntent &&
-      !options?.skipIntentResolution &&
-      !options?.resolvedIntent;
-
-    if (shouldReevaluateReuseTurnIntent) {
-      const reuseResolution = resolveTurnRunIntent(text, {
-        language: preferredLanguage,
-        mainModeKey: currentMainModeKey,
-        parsedStudioCommand,
-        hasPlanArtifacts,
-        planStage: state.planStage,
-        isPlanApproved: state.isPlanApproved,
-        previousTurnIntent: currentTurnIntent,
-      });
-      const reuseLooksLikeExecutionIntent =
-        shouldExecuteOnceFromReplyOption ||
-        reuseResolution.intent === "execute" ||
-        reuseResolution.intent === "studio_workflow" ||
-        reuseResolution.commandDirective?.kind === "file_modify" ||
-        reuseResolution.commandDirective?.kind === "shell" ||
-        reuseResolution.commandDirective?.kind === "git" ||
-        reuseResolution.commandDirective?.kind === "unity";
-      const shouldRequestPlanDecision =
-        reuseResolution.needsDecision === true ||
-        (reuseLooksLikeExecutionIntent &&
-          (reuseResolution.riskLevel === "high" || reuseResolution.intent === "plan"));
-
-      if (shouldRequestPlanDecision) {
-        if (consumeDecisionSuppression()) {
-          applyDecisionSuppressedFallback(
-            "reuse_resolution",
-            preferredLanguage === "en"
-              ? "You ignored the same intent decision for this draft, so this turn continues as a natural reply without showing the popup again."
-              : "你刚刚忽略了同一草稿的意图确认，本轮先按自然回复继续，不再重复弹窗。",
-          );
-        } else {
-          const pendingCopy = createPendingDecisionCopy({
-            suggestedIntent: "plan",
-            decisionOptions: ["plan", "respond", "execute"],
-            riskLevel: reuseResolution.riskLevel,
-            reason: reuseResolution.reason,
-          }, preferredLanguage);
-          applyPreRunSessionPatch({
-            pendingRunDecision: {
-              kind: "intent_confirmation",
-              source: "pre_submit",
-              originalInput: text,
-              originalImages: images || [],
-              suggestedIntent: "plan",
-              reason: pendingCopy.reason,
-              title: pendingCopy.title,
-              options: pendingCopy.options,
-            },
-          });
-          return true;
-        }
-      }
-
-      if (
-        reuseLooksLikeExecutionIntent &&
-        (reuseResolution.intent === "execute" || reuseResolution.intent === "studio_workflow")
-      ) {
-        effectiveRunIntent = reuseResolution.intent;
-        effectiveCommandDirective =
-          reuseResolution.commandDirective ||
-          effectiveCommandDirective ||
-          inferCommandDirective(text, reuseResolution.intent, { source: "continuation" });
-        effectiveIntentSummary = buildRunIntentSummary({
-          input: text,
-          intent: reuseResolution.intent,
-          language: preferredLanguage,
-          reason: preferredLanguage === "en"
-            ? "The user selected a fix/implement continuation option, so this reused turn is auto-upgraded to execution."
-            : "用户在复用回合中选择了修复/实现型选项，本轮自动升级为执行模式。",
-        });
-      }
-    }
-
-    if (!isHidden && !mainDebugShortcut && !lockedComposerIntent && !shouldContinuePlanIntent && !shouldContinuePreviousTurnIntent && !shouldReuseExistingTurnIntent && !shouldForceExecuteForAutoApprove && !options?.skipIntentResolution && !options?.resolvedIntent) {
-      const resolution: RunIntentResolution = shouldRouteContinuationToPlanResume
-        ? {
-            intent: "plan" as const,
-            reason: preferredLanguage === "en"
-              ? "Continuation input is attached to an approved/executing or recently misrouted plan context, so MAIN resumes plan execution instead of ordinary chat."
-              : "短继续指令关联到已批准/执行中计划或上一轮误路由的计划上下文，因此恢复计划执行而不是普通聊天续跑。",
-            confidence: 0.95,
-            bypassMainRouter: false,
-            riskLevel: "low" as const,
-            controlAction: "resume_plan_execution" as const,
-            commandDirective: inferCommandDirective(text, "plan", {
-              source: "continuation",
-              controlAction: "resume_plan_execution",
-            }),
-          }
-        : resolveTurnRunIntent(text, {
-            language: preferredLanguage,
-            mainModeKey: currentMainModeKey,
-            parsedStudioCommand,
-            hasPlanArtifacts,
-            planStage: state.planStage,
-            isPlanApproved: state.isPlanApproved,
-            previousTurnIntent: currentTurnIntent,
-          });
-      effectiveIntentSummary = buildRunIntentSummary({
-        input: text,
-        intent: resolution.intent,
-        language: preferredLanguage,
-        reason: resolution.reason,
-      });
-      effectiveCommandDirective = resolution.commandDirective || inferCommandDirective(text, resolution.intent);
-
-      if (resolution.controlAction === "approve_plan") {
-        applyPreRunSessionPatch({
-          input: "",
-          contextMentions: [],
-          attachedFiles: [],
-          lockedComposerIntent: null,
-          pendingRunDecision: null,
-        });
-        get().approvePlan();
-        return true;
-      }
-
-      if (resolution.controlAction === "resume_plan_execution") {
+      dismissedPendingDecisionInputKey: state.dismissedPendingDecisionInputKey,
+      currentConfig: get().config,
+      sendOriginSessionKey,
+      setState: set,
+      applyPreRunSessionPatch,
+      approvePlan: () => get().approvePlan(),
+      startPlanExecutionResume: (resumeRequest) => {
         void runSubmitPlanExecutionResumeEffect({
-          text,
-          images,
-          preferredLanguage,
-          shouldRouteContinuationToPlanResume,
-          uiParentTurnId: planExecutionResumeContinuationTarget?.id || state.currentTurnId || undefined,
-          commandDirective: resolution.commandDirective || inferCommandDirective(text, "plan", {
-            source: "continuation",
-            controlAction: "resume_plan_execution",
-          }),
+          text: resumeRequest.text,
+          images: resumeRequest.images,
+          preferredLanguage: resumeRequest.preferredLanguage,
+          shouldRouteContinuationToPlanResume: resumeRequest.shouldRouteContinuationToPlanResume,
+          uiParentTurnId: resumeRequest.uiParentTurnId,
+          commandDirective: resumeRequest.commandDirective,
           getState: get,
           setState: set,
           applyPreRunSessionPatch,
@@ -6274,107 +6077,30 @@ export const useAppStore = create<AppState>()(
           },
           logStoreEvent,
         });
-        return true;
-      }
-
-      if (resolution.needsDecision) {
-        if (consumeDecisionSuppression()) {
-          applyDecisionSuppressedFallback(
-            "resolution",
-            preferredLanguage === "en"
-              ? "You ignored the same intent decision for this draft, so this turn continues as a natural reply without showing the popup again."
-              : "你刚刚忽略了同一草稿的意图确认，本轮先按自然回复继续，不再重复弹窗。",
-          );
-        } else {
-          const pendingCopy = createPendingDecisionCopy(resolution, preferredLanguage);
-          applyPreRunSessionPatch({
-            pendingRunDecision: {
-              kind: "intent_confirmation",
-              source: "pre_submit",
-              originalInput: text,
-              originalImages: images || [],
-              suggestedIntent: resolution.suggestedIntent || "plan",
-              reason: pendingCopy.reason,
-              title: pendingCopy.title,
-              options: pendingCopy.options,
-            },
-          });
-          return true;
-        }
-      }
-
-      const executionApprovalDecision = resolveSubmitExecutionApprovalDecision({
-        text,
-        images,
-        preferredLanguage,
-        resolution,
-        effectiveCommandDirective,
-        isLocalFastStudioCommand,
-      });
-      if (executionApprovalDecision.pendingRunDecision) {
-        applyPreRunSessionPatch({
-          pendingRunDecision: executionApprovalDecision.pendingRunDecision,
+      },
+      startBlockingPreflight: (blockingPreflightEffect) => {
+        void startSubmitBlockingPreflightEffect({
+          effect: blockingPreflightEffect,
+          runIntentPreflight,
+          getState: get,
+          isSessionRuntimeActive,
+          applyPreRunSessionPatch,
+          resumeSubmission: (nextText, nextImages, nextOptions) => {
+            get().sendMessage(nextText, nextImages, nextOptions);
+          },
+          logStoreEvent,
         });
-        return true;
-      }
-
-      // 普通消息不应该因为额外的意图 preflight 而阻塞发送热路径。
-      // 只有低置信度且真的可能改变流程的请求，才允许在这里等待 preflight。
-      const blockingPreflightEffect = buildSubmitBlockingPreflightEffect({
-        resolution,
-        currentMainModeKey,
-        text,
-        images,
-        options,
-        preferredLanguage,
-        currentConfig: get().config,
-        sendOriginSessionKey,
-      });
-      if (blockingPreflightEffect) {
-        void (async () => {
-          await executeSubmitBlockingPreflight({
-            effect: blockingPreflightEffect,
-            runIntentPreflight,
-            getLatestSnapshot: (effect) => {
-              const latestState = get();
-              return {
-                input: latestState.input,
-                selectedMainModeKey: latestState.selectedMainModeKey,
-                lockedComposerIntent: latestState.lockedComposerIntent,
-                isOriginSessionActive: effect.sendOriginSessionKey
-                  ? isSessionRuntimeActive(latestState, effect.sendOriginSessionKey)
-                  : true,
-              };
-            },
-            applyPendingRunDecision: (pendingRunDecision) => {
-              applyPreRunSessionPatch({ pendingRunDecision });
-            },
-            resumeSubmission: (nextText, nextImages, nextOptions) => {
-              get().sendMessage(nextText, nextImages, nextOptions);
-            },
-            logStoreEvent,
-          });
-        })();
-        return true;
-      }
-
-      effectiveRunIntent = resolution.intent;
+      },
+      logStoreEvent,
+    });
+    if (intentRouting.handled) {
+      return intentRouting.returnValue;
     }
-
-    if (!effectiveCommandDirective) {
-      effectiveCommandDirective = inferCommandDirective(text, effectiveRunIntent, {
-        source: mainIntentShortcut ? "main_shortcut" : parsedStudioCommand?.type === "workflow" ? "studio_slash" : "natural_language",
-        parsedStudioCommand,
-      });
-    }
-
-    if (!effectiveIntentSummary) {
-      effectiveIntentSummary = buildRunIntentSummary({
-        input: text,
-        intent: effectiveRunIntent,
-        language: preferredLanguage,
-      });
-    }
+    const {
+      effectiveRunIntent,
+      effectiveIntentSummary,
+      effectiveCommandDirective,
+    } = intentRouting;
 
     const runtimeDecision = resolveSubmitRuntimeDecision({
       effectiveRunIntent,
@@ -6393,91 +6119,43 @@ export const useAppStore = create<AppState>()(
     const shouldGrantExecutionConsentForTurn = runtimeDecision.shouldGrantExecutionConsentForTurn;
     const initialTurnStatus = runtimeDecision.initialTurnStatus;
 
-    // Reset plan approval state at the start of each new request
-    if (runtimeDecision.shouldResetPlanState) {
-      set({
-        isPlanApproved: false,
-        planApprovalChoice: null,
-        pendingPlanApprovalHandoff: null,
-        planExecutionEvidenceLedger: [],
-        planExecutionEvidenceCount: 0,
-        planAutoResumeCount: 0,
-        planExecutionProgressSnapshot: null,
-        normalizedStreamState: defaultNormalizedStreamState,
-        planArtifacts: [],
-        planTasks: [],
-        planStage: "idle" as const,
-        clearedPlanTurnId: null,
-        currentTurnExecutionConsent: { turnId: null, granted: false },
-      });
-    }
-
-    const sendGateDecision = resolveSubmitSendGateDecision({
-      text,
-      imagesLength: images?.length ?? 0,
-      hasSupplementalInput,
-      isHidden,
-      executionConsentGranted: options?.executionConsentGranted,
-      shouldExecuteOnceFromReplyOption,
-      isGenerating: state.isGenerating,
-      agentStatus: state.agentStatus,
-      hasAbortController: !!state.abortController,
-      hasCurrentTurn: !!state.currentTurnId,
+    applySubmitPlanStateReset({
+      shouldResetPlanState: runtimeDecision.shouldResetPlanState,
+      defaultNormalizedStreamState,
+      setState: set,
     });
 
-    for (const reason of sendGateDecision.allowedBusyReasons) {
-      logStoreEvent("send_busy_hidden_execution_allowed", {
-        reason,
-        runtimeIntentOverride: options?.runtimeIntentOverride ?? null,
-        turnIdOverride: options?.turnIdOverride ?? null,
-      });
-    }
-
-    if (sendGateDecision.action.kind === "block_empty") {
-      logStoreEvent("send_blocked", { reason: sendGateDecision.action.reason });
-      return false;
-    }
-
-    if (sendGateDecision.action.kind === "queue") {
-      get().queueUserMessage(text, images, {
-        contextMentions: mentionSnapshot,
-        attachedFiles: attachedFilesSnapshot.map((file) => normalizeAttachedFile(file)),
-      });
-      logStoreEvent("send_queued", {
-        reason: sendGateDecision.action.reason,
-        ...(sendGateDecision.action.agentStatus
-          ? { agentStatus: sendGateDecision.action.agentStatus }
-          : {}),
-      });
-      return false;
-    }
-
-    if (sendGateDecision.action.kind === "approve_pending_review") {
-      logStoreEvent("send_pending_review_approve_bypass", {
-        textChars: text?.length ?? 0,
+    const sendGateEffect = applySubmitSendGateEffects({
+      text,
+      images,
+      hasSupplementalInput,
+      isHidden,
+      shouldExecuteOnceFromReplyOption,
+      state,
+      options: {
         executionConsentGranted: options?.executionConsentGranted,
-        shouldExecuteOnceFromReplyOption,
-        pendingReviewTaskId: state.pendingReviewTaskId,
-      });
-      if (state.pendingReviewResolve && state.pendingReviewTaskId != null) {
+        runtimeIntentOverride: options?.runtimeIntentOverride,
+        turnIdOverride: options?.turnIdOverride,
+      },
+      mentionSnapshot,
+      attachedFilesSnapshot,
+      queueUserMessage: (queuedText, queuedImages, queuedOptions) => {
+        get().queueUserMessage(queuedText, queuedImages, queuedOptions);
+      },
+      approvePendingReviewOnce: () => {
         get().approvePendingReviewOnce();
-      } else {
-        get().approvePlan(text);
-      }
-      return true;
-    }
-
-    if (sendGateDecision.action.kind === "reset_stuck_state") {
-      logStoreEvent("send_stuck_state_reset", {
-        previousStatus: sendGateDecision.action.previousStatus,
-      });
-      set({ agentStatus: "idle", isGenerating: false });
-      if (state.currentTurnId && sendGateDecision.action.turnStatus) {
-        get().setConversationTurnStatus(
-          state.currentTurnId,
-          sendGateDecision.action.turnStatus,
-        );
-      }
+      },
+      approvePlan: (approvalChoice) => {
+        get().approvePlan(approvalChoice);
+      },
+      setState: set,
+      setConversationTurnStatus: (turnId, status) => {
+        get().setConversationTurnStatus(turnId, status);
+      },
+      logStoreEvent,
+    });
+    if (!sendGateEffect.shouldContinue) {
+      return sendGateEffect.returnValue ?? false;
     }
     const sessionBootstrapDecision = applySubmitSessionBootstrap({
       state,
@@ -6516,7 +6194,7 @@ export const useAppStore = create<AppState>()(
       backgroundRunningCount: backgroundRunningSessions.length,
       backgroundRunningSessions: backgroundRunningSessions.slice(0, 8),
     });
-    const sessionRuntimeFacade = createSubmitSessionRuntimeFacade<AppState, SessionRuntimeState>({
+    const { sessionGet, sessionSet } = createSubmitSessionRuntimeController<AppState, SessionRuntimeState>({
       get,
       set,
       runSessionKey,
@@ -6524,183 +6202,38 @@ export const useAppStore = create<AppState>()(
       pickRuntimePatch: pickSessionRuntimePatch,
       normalizePatch: (patch) =>
         normalizeTaskFlowPatchForConsumedReplyOptions(patch as Record<string, unknown>),
-      decorateScopedState: (scoped) => ({
-        ...scoped,
-        setConversationTurnStatus: sessionSetConversationTurnStatus,
-        updateConversationTurn: sessionUpdateConversationTurn,
-        setConversationTurnSummary: sessionSetConversationTurnSummary,
-        setPlanStage: (stage: PlanStage) => sessionSet({ planStage: stage }),
-        setPlanTasks: sessionSetPlanTasks,
-        upsertPlanArtifact: sessionUpsertPlanArtifact,
-        setNormalizedStreamState: (streamState: NormalizedStreamState) => sessionSet({ normalizedStreamState: streamState }),
-        openRightPanelTab: sessionOpenRightPanelTab,
-        setRightPanelTab: sessionOpenRightPanelTab,
-        ensurePlanArtifactsHydratedForWorkspace: sessionOpenPlanWorkspacePanel,
-        openPlanWorkspacePanel: sessionOpenPlanWorkspacePanel,
-        closeRightPanel: () => sessionSet({ showPlanPanel: false, showDiff: false, showTerminal: false }),
-        startNewTurn: (remoteFeishu) =>
-          sessionSet({
-            currentTurnState: {
-              ...createDefaultCurrentTurnState(),
-              turnId: Date.now().toString(),
-              ...(remoteFeishu ? { remoteFeishu } : {}),
-            },
-          }),
-        getCurrentRunIntent: () => {
-          const current = scoped.currentTurnId
-            ? scoped.conversationTurns.find((turn) => turn.id === scoped.currentTurnId) || null
-            : null;
-          return current
-            ? resolveConversationTurnIntent(current)
-            : resolveRunIntentFromLegacyWorkflowMode(scoped.config.workflowMode);
-        },
-      }),
+      derivePlanStageFromArtifacts,
+      createDefaultCurrentTurnState,
+      logStoreEvent,
     });
-    sessionRuntimeFacade.seedSessionRuntime();
-    const sessionSet = sessionRuntimeFacade.sessionSet;
-    const sessionSetConversationTurnStatus = (targetTurnId: string, status: ConversationTurnStatus) =>
-      sessionSet((s) => ({
-        conversationTurns: s.conversationTurns.map((turn) =>
-          turn.id === targetTurnId
-            ? {
-                ...turn,
-                status,
-                collapsed:
-                  status === "awaiting_approval" || status === "awaiting_input" || status === "error"
-                    ? false
-                    : turn.collapsed,
-                elapsedTime: turn.elapsedTime || s.elapsedTime || 0,
-              }
-            : turn,
-        ),
-      }));
-    const sessionUpdateConversationTurn = (targetTurnId: string, patch: Partial<ConversationTurn>) =>
-      sessionSet((s) => ({
-        conversationTurns: s.conversationTurns.map((turn) =>
-          turn.id === targetTurnId ? { ...turn, ...patch } : turn
-        ),
-      }));
-    const sessionSetConversationTurnSummary = (targetTurnId: string, summary: string) =>
-      sessionUpdateConversationTurn(targetTurnId, { summary });
-    const sessionSetPlanTasks = (tasks: PlanTask[]) =>
-      sessionSet((s) => ({
-        planTasks: reconcilePlanTaskCompletion(
-          s.planTasks,
-          tasks,
-          s.planExecutionEvidenceLedger,
-          {
-            preserveMissing: s.isPlanApproved || s.planStage === "executing" || s.planStage === "completed" || s.planTasks.length > 0,
-            highlightNext: s.isPlanApproved && s.planExecutionEvidenceLedger.length > 0,
-          },
-        ),
-      }));
-    const sessionUpsertPlanArtifact = (artifact: PlanArtifact) =>
-      sessionSet((s) => {
-        const sanitizedContent = sanitizePlanArtifactContent(artifact.content);
-        const validation = validatePlanArtifactContent(sanitizedContent, artifact.kind);
-        if (!validation.ok) {
-          logStoreEvent("plan_artifact_rejected_by_quality_gate", {
-            path: artifact.path,
-            kind: artifact.kind,
-            reason: validation.reason,
-            contentChars: sanitizedContent.length,
-          });
-          return {};
-        }
 
-        const nextArtifacts = [...s.planArtifacts];
-        const existingIndex = nextArtifacts.findIndex((item) => item.path === artifact.path);
-        if (existingIndex >= 0) {
-          nextArtifacts[existingIndex] = { ...artifact, content: sanitizedContent };
-        } else {
-          nextArtifacts.push({ ...artifact, content: sanitizedContent });
-        }
-
-        const parsedTasks = artifact.kind === "tasks" || artifact.kind === "bugfix"
-          ? extractPlanTasks(sanitizedContent)
-          : s.planTasks;
-        const preserveTaskHistory =
-          s.isPlanApproved ||
-          s.planStage === "executing" ||
-          s.planStage === "completed" ||
-          s.planTasks.length > 0;
-        const normalizedTasks = artifact.kind === "tasks" || artifact.kind === "bugfix"
-          ? reconcilePlanTaskCompletion(s.planTasks, parsedTasks, s.planExecutionEvidenceLedger, {
-              preserveMissing: preserveTaskHistory,
-              highlightNext: s.isPlanApproved && s.planExecutionEvidenceLedger.length > 0,
-            })
-          : normalizeApprovedPlanTaskStatuses(
-              s.planTasks,
-              s.planExecutionEvidenceLedger,
-              s.isPlanApproved && s.planExecutionEvidenceLedger.length > 0,
-            );
-        return {
-          planArtifacts: nextArtifacts.sort((a, b) => a.updatedAt - b.updatedAt),
-          planStage: derivePlanStageFromArtifacts(
-            nextArtifacts,
-            normalizedTasks,
-            s.isPlanApproved,
-            s.planStage,
-          ),
-          planTasks: normalizedTasks,
-          clearedPlanTurnId: null,
-          showPlanPanel: true,
-          rightPanelTab: s.showDiff && s.rightPanelTab === "diff" ? "diff" : "plan",
-        };
-      });
-    const sessionOpenRightPanelTab = (tab: RightPanelTab) =>
-      sessionSet({
-        rightPanelTab: tab,
-        showPlanPanel: tab === "plan",
-        showDiff: tab === "diff",
-        showTerminal: tab === "terminal",
-      });
-    const sessionOpenPlanWorkspacePanel = async () => {
-      sessionOpenRightPanelTab("plan");
-      const live = get();
-      const runtime = live.runtimeBySessionKey[runSessionKey] || createSessionRuntimeFromState(live);
-      return runtime.planArtifacts.length > 0 || runtime.planTasks.length > 0 || runtime.planStage !== "idle";
-    };
-    const sessionGet = sessionRuntimeFacade.sessionGet;
-
-    const nextId = sessionGet()._nextTaskId;
-    const turnId = reuseCurrentTurn
-      ? reusableTurnId!
-      : options?.turnIdOverride || `turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const uiDisplayTurnId = uiParentTurnId || turnId;
-    const currentImages = images || [];
-    const turnInputContextSignals = normalizeTurnInputContextSignals({
-      imageParts: currentImages.length,
-      mentionedFilePaths: mentionSnapshot,
-      attachedFilePaths: attachedFilesSnapshot.map((file) => {
-        const attachment = normalizeAttachedFile(file);
-        return attachment.sourcePath || attachment.path;
-      }),
-    });
-    const userContextItems = buildUserContextItems({
-      contextMentions: mentionSnapshot,
-      attachedFiles: attachedFilesSnapshot,
-      images: currentImages,
-      workspace: runWorkspace,
-      language: preferredLanguage === "en" ? "en" : "zh",
-    });
-    const existingTurn = reuseCurrentTurn
-      ? state.conversationTurns.find((turn) => turn.id === turnId) || null
-      : null;
-    const refreshedState = sessionGet();
-    const activeSession = ensuredSessionId
-      ? (refreshedState.sessionsByWorkspace[sessionScopeKey] || []).find((session) => session.id === ensuredSessionId)
-      : null;
-    const titleDecision = resolveSubmitTurnTitleDecision({
+    const turnDraft = prepareSubmitTurnDraft({
+      sessionGet,
+      conversationTurns: state.conversationTurns,
       text,
-      effectiveRunIntent,
+      images,
+      mentionSnapshot,
+      attachedFilesSnapshot,
+      runWorkspace,
       preferredLanguage,
+      effectiveRunIntent,
       isMainDebugShortcut: !!mainDebugShortcut,
-      contextSignals: turnInputContextSignals,
-      existingTurnTitle: existingTurn?.title,
+      reuseCurrentTurn,
+      reusableTurnId,
+      turnIdOverride: options?.turnIdOverride,
+      uiParentTurnId,
+      ensuredSessionId,
+      sessionScopeKey,
       optionTurnTitle: options?.turnTitle,
-      activeSession,
     });
+    const nextId = turnDraft.nextTaskId;
+    const turnId = turnDraft.turnId;
+    const uiDisplayTurnId = turnDraft.uiDisplayTurnId;
+    const currentImages = turnDraft.currentImages;
+    const turnInputContextSignals = turnDraft.turnInputContextSignals;
+    const userContextItems = turnDraft.userContextItems;
+    const existingTurn = turnDraft.existingTurn;
+    const titleDecision = turnDraft.titleDecision;
     const {
       turnTitle,
       titleIntentSignature,
@@ -6847,195 +6380,73 @@ export const useAppStore = create<AppState>()(
       sessionGet,
       sessionSet,
     });
-    const { timerInterval, getElapsedSeconds } = elapsedTimer;
 
-    // 3. Build context from @-mentions and attached files
-    // Read actual file contents for attached files (from old App.tsx)
-    (async () => {
-      let userContent = text;
-      let activeStudioAgentKey = sessionGet().activeStudioAgentKey;
-      let gameStudioInitialized = sessionGet().gameStudioInitialized;
-      let gameStudioConfigForTurn: StudioConfig | null = null;
-      const attachmentContext = await buildSubmitAttachmentContext({
-        text,
-        mentions: mentionSnapshot,
-        files: attachedFilesSnapshot,
-        runSessionKey,
-        runWorkspace,
-        preferredLanguage,
-        markUserContextItemFailed,
-        ingestAttachmentFile,
-        readFile,
-        readDocument,
-        analyzeTabularDocument,
-      });
-      userContent = attachmentContext.userContent;
-      const previousTurnLastToolSummary =
-        shouldContinuePreviousTurnIntent && previousTurnContinuationTarget
-          ? getLastTurnToolSummary(previousTurnContinuationTarget.id, sessionGet().taskFlow)
-          : "";
-      const previousTurnLastAssistantSummary =
-        shouldContinuePreviousTurnIntent && previousTurnContinuationTarget
-          ? getLastVisibleTurnAgentSummary(previousTurnContinuationTarget.id, sessionGet().taskFlow)
-          : "";
-      const approvedProposal =
-        shouldExecuteOnceFromReplyOption
-          ? existingTurn?.pendingOperationProposal ||
-            currentTurn?.pendingOperationProposal ||
-            previousTurnContinuationTarget?.pendingOperationProposal
-          : undefined;
-      const latestAssistantSummary =
-        shouldExecuteOnceFromReplyOption
-          ? getLastVisibleTurnAgentSummary(turnId, sessionGet().taskFlow)
-          : "";
-      userContent = buildSubmitPromptContext({
-        userContent,
-        text,
-        preferredLanguage: preferredLanguage === "en" ? "en" : "zh",
-        effectiveRunIntent,
-        effectiveWorkflowMode,
-        preservePlanState,
-        isPlanApproved: sessionGet().isPlanApproved,
-        shouldContinuePlanIntent,
-        shouldContinuePreviousTurnIntent,
-        shouldExecuteOnceFromReplyOption,
-        currentTurnUserPrompt: currentTurn?.userPrompt,
-        previousTurnContinuationTarget,
-        previousTurnLastToolSummary,
-        previousTurnLastAssistantSummary,
-        approvedProposal,
-        latestAssistantSummary,
-        selectedChoiceText,
-        turnInputContextSignals,
-      }).userContent;
-
-      const gameStudioPreparation = await runSubmitGameStudioPreparation({
-        turnId,
-        currentMainModeKey,
-        text,
-        userContent,
-        parsedSetupEngineCommand,
-        parsedStudioCommand,
-        activeStudioAgentKey,
-        gameStudioInitialized,
-        cachedWorkspaceTreeForGameDetection,
-        preferredLanguage,
-        runtimeService: gameStudioRuntimeService,
-        logWarning: (event, data) => appendDebugLog("warn", event, data),
-        nextTaskId: nextId,
-        sessionGet,
-        sessionSet,
-        disposeElapsedTimer: elapsedTimer.dispose,
-        invalidateWorkspaceTreeCache,
-      });
-      userContent = gameStudioPreparation.userContent;
-      activeStudioAgentKey = gameStudioPreparation.activeStudioAgentKey;
-      gameStudioInitialized = gameStudioPreparation.gameStudioInitialized;
-      gameStudioConfigForTurn = gameStudioPreparation.gameStudioConfigForTurn;
-      if (!gameStudioPreparation.ok) {
-        return;
-      }
-
-      // Clear mentions and attached files after reading
-      sessionSet({ contextMentions: [], attachedFiles: [] });
-
-      const runLease = startSubmitRunLease({
-        userContent,
-        currentImages,
-        runSessionKey,
-        runWorkspace,
-        runSessionId,
-        turnId,
-        effectiveRunIntent,
-        runtimeRunIntent,
-        getRuntimeSnapshot: () => ({
-          agentMessagesLength: sessionGet().agentMessages.length,
-          planStage: sessionGet().planStage,
-          isPlanApproved: sessionGet().isPlanApproved,
-        }),
-        appendAgentMessage: (message) => {
-          sessionSet((s) => ({ agentMessages: [...s.agentMessages, message] }));
-        },
-        createAbortController: () => new AbortController(),
-        setAbortController: (abortController) => {
-          sessionSet({ abortController });
-        },
-        startGoal: (objective, goalOptions) => {
-          sessionGet().startGoal(objective, goalOptions);
-        },
-        getCurrentHarnessInstanceId,
-        persistHarnessRunMarker,
-        setHarnessRunMarker: (harnessRunMarker) => {
-          sessionSet({ harnessRunMarker });
-        },
-      });
-      const turnAgentMessagesStart = runLease.turnAgentMessagesStart;
-      const abortCtrl = runLease.abortController;
-
-      const phaseLanguage = preferredLanguage === "en" ? "en" : "zh";
-
-      // Get workspace tree for system prompt
-      const workspaceTreeStartedAt = nowMs();
-      const workspaceTree = await getWorkspaceTree(runWorkspace);
-      logStoreEvent("workspace_tree_ready", {
-        turnId,
-        workspace: runWorkspace || "global",
-        chars: workspaceTree.length,
-        elapsedMs: Math.round(nowMs() - workspaceTreeStartedAt),
-      });
-
-      const context = createSubmitWorkflowContext({
-        turnId,
-        uiDisplayTurnId,
-        runWorkspace,
-        runSessionKey,
-        runSessionId,
-        runScopeKey,
-        phaseLanguage,
-        effectiveRunIntent,
-        runtimeRunIntent,
-        effectiveCommandDirective,
-        options,
-        attachedFilesSnapshot,
-        mentionSnapshot,
-        remoteFeishu,
-        workspaceTree,
-        gameStudioConfigForTurn,
-        abortCtrl,
-        timerInterval,
-        sendStartedAt,
-        turnAgentMessagesStart,
-        getElapsedSeconds,
-        PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS,
-        PROVIDER_COMPATIBILITY_FORCE_XML_TTL_MS,
-        PROVIDER_COMPATIBILITY_NATIVE_RECOVERY_SUCCESS_STREAK,
-      });
-
-      startSubmitStreamingUi({
-        context,
-        sessionGet,
-        sessionSet,
-        nextTaskId: nextId,
-        currentImageCount: currentImages.length,
-        contextSignals: turnInputContextSignals,
-        effectiveIntentSummary,
-        isHidden,
-        createVisibleTurnForHiddenMessage,
-      });
-      void runSubmitWorkflowEngine({
-        get: sessionGet,
-        set: sessionSet,
-        context,
-        sanitizeTaskBlocksForPersist,
-        sanitizeAgentMessagesForPersist,
-        normalizeSessionRuntimeSnapshot,
-        normalizeProviderCompatibilityByRuntimeKey,
-        compactCompletedTurnAgentMessages,
-        normalizeQueuedUserMessage,
-        startApprovedPlanExecutionTurnFromHandoff,
-        logStoreEvent,
-      });
-    })();
+    void startSubmitAsyncWorkflowRun({
+      text,
+      turnId,
+      uiDisplayTurnId,
+      currentImages,
+      mentionSnapshot,
+      attachedFilesSnapshot,
+      runSessionKey,
+      runWorkspace,
+      runSessionId,
+      runScopeKey,
+      currentMainModeKey,
+      parsedSetupEngineCommand,
+      parsedStudioCommand,
+      cachedWorkspaceTreeForGameDetection,
+      preferredLanguage: preferredLanguage === "en" ? "en" : "zh",
+      effectiveRunIntent,
+      runtimeRunIntent,
+      effectiveWorkflowMode,
+      effectiveCommandDirective,
+      effectiveIntentSummary,
+      preservePlanState,
+      shouldContinuePlanIntent,
+      shouldContinuePreviousTurnIntent,
+      shouldExecuteOnceFromReplyOption,
+      currentTurn,
+      previousTurnContinuationTarget,
+      existingTurn,
+      selectedChoiceText,
+      turnInputContextSignals,
+      remoteFeishu,
+      options,
+      isHidden,
+      createVisibleTurnForHiddenMessage,
+      nextTaskId: nextId,
+      sessionGet,
+      sessionSet,
+      elapsedTimer,
+      markUserContextItemFailed,
+      ingestAttachmentFile,
+      readFile,
+      readDocument,
+      analyzeTabularDocument,
+      runtimeService: gameStudioRuntimeService,
+      logWarning: (event, data) => appendDebugLog("warn", event, data),
+      invalidateWorkspaceTreeCache,
+      createAbortController: () => new AbortController(),
+      getCurrentHarnessInstanceId,
+      persistHarnessRunMarker,
+      getWorkspaceTree,
+      nowMs,
+      sendStartedAt,
+      getLastTurnToolSummary,
+      getLastVisibleTurnAgentSummary,
+      PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS,
+      PROVIDER_COMPATIBILITY_FORCE_XML_TTL_MS,
+      PROVIDER_COMPATIBILITY_NATIVE_RECOVERY_SUCCESS_STREAK,
+      sanitizeTaskBlocksForPersist,
+      sanitizeAgentMessagesForPersist,
+      normalizeSessionRuntimeSnapshot,
+      normalizeProviderCompatibilityByRuntimeKey,
+      compactCompletedTurnAgentMessages,
+      normalizeQueuedUserMessage,
+      startApprovedPlanExecutionTurnFromHandoff,
+      logStoreEvent,
+    });
 
     return true;
   },

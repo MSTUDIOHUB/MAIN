@@ -15,6 +15,14 @@ export interface SubmitPreflightLatestSnapshot {
   isOriginSessionActive: boolean;
 }
 
+export interface SubmitBlockingPreflightStarterState {
+  input: string;
+  selectedMainModeKey: MainModeKey;
+  lockedComposerIntent?: MainIntentShortcut | null;
+  currentWorkspace?: string | null;
+  currentSessionId?: number | null;
+}
+
 export interface SubmitBlockingPreflightExecutorInput<
   TConfig extends object,
   TOptions extends SubmitPipelineOptions = SubmitPipelineOptions,
@@ -78,4 +86,53 @@ export async function executeSubmitBlockingPreflight<
 
   input.resumeSubmission(action.text, action.images, action.options);
   return action;
+}
+
+export interface StartSubmitBlockingPreflightEffectInput<
+  TState extends SubmitBlockingPreflightStarterState,
+  TConfig extends object,
+  TOptions extends SubmitPipelineOptions = SubmitPipelineOptions,
+> {
+  effect: SubmitBlockingPreflightEffect<TConfig, TOptions>;
+  runIntentPreflight: (
+    request: SubmitBlockingPreflightEffect<TConfig, TOptions>["request"],
+  ) => Promise<IntentPreflightResult | null>;
+  getState: () => TState;
+  isSessionRuntimeActive: (state: TState, sessionKey: string) => boolean;
+  applyPreRunSessionPatch: (patch: { pendingRunDecision: PendingRunDecision }) => void;
+  resumeSubmission: (
+    text: string,
+    images: string[] | undefined,
+    options: TOptions & SubmitPreflightResumeOptions,
+  ) => void;
+  logStoreEvent: (event: string, data: Record<string, unknown>) => void;
+}
+
+export function startSubmitBlockingPreflightEffect<
+  TState extends SubmitBlockingPreflightStarterState,
+  TConfig extends object,
+  TOptions extends SubmitPipelineOptions = SubmitPipelineOptions,
+>(
+  input: StartSubmitBlockingPreflightEffectInput<TState, TConfig, TOptions>,
+): Promise<SubmitPreflightEffectAction<TOptions>> {
+  return executeSubmitBlockingPreflight({
+    effect: input.effect,
+    runIntentPreflight: input.runIntentPreflight,
+    getLatestSnapshot: (effect) => {
+      const latestState = input.getState();
+      return {
+        input: latestState.input,
+        selectedMainModeKey: latestState.selectedMainModeKey,
+        lockedComposerIntent: latestState.lockedComposerIntent,
+        isOriginSessionActive: effect.sendOriginSessionKey
+          ? input.isSessionRuntimeActive(latestState, effect.sendOriginSessionKey)
+          : true,
+      };
+    },
+    applyPendingRunDecision: (pendingRunDecision) => {
+      input.applyPreRunSessionPatch({ pendingRunDecision });
+    },
+    resumeSubmission: input.resumeSubmission,
+    logStoreEvent: input.logStoreEvent,
+  });
 }

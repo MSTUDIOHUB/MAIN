@@ -1,4 +1,6 @@
 import type { TaskBlock } from "../taskTypes";
+import type { AttachedFile } from "../attachments";
+import type { FeishuRemoteContext } from "../remoteContextTypes";
 import {
   resolveSessionRuntimeKey,
   resolveSessionWorkspaceKey,
@@ -38,6 +40,7 @@ import {
   type MainIntentShortcut,
   type PendingRunDecision,
   type PendingRunDecisionChoice,
+  type PendingRunDecisionOption,
   type ResolvedRunIntent,
   type ResolvedUserIntent,
   type RunIntentResolution,
@@ -49,7 +52,9 @@ import {
 import {
   isGenericConversationTitle,
   normalizeConversationDisplayTitle,
+  resolveTurnResponseLanguage,
   summarizeUserPrompt,
+  type ResponseLanguagePolicy,
 } from "../workflowModels";
 import type {
   ConversationTurn,
@@ -88,6 +93,116 @@ const RESOLVED_USER_INTENT_KEYS = new Set<ResolvedUserIntent>([
 
 export function isResolvedUserIntentChoice(choice: PendingRunDecisionChoice): choice is ResolvedUserIntent {
   return RESOLVED_USER_INTENT_KEYS.has(choice as ResolvedUserIntent);
+}
+
+export function buildSubmitInputEnvelope(params: {
+  text: string;
+  options?: SubmitInputEnvelopeOptions;
+  state: SubmitInputEnvelopeState;
+  cache: SubmitInputEnvelopeCache;
+}): SubmitInputEnvelope {
+  const { text, state } = params;
+  const options = params.options || {};
+  const isHidden = options.hidden === true;
+  const createVisibleTurnForHiddenMessage =
+    isHidden && options.createVisibleTurnForHiddenMessage === true;
+  const hasTurn = (turnId: string | undefined): turnId is string =>
+    !!turnId && state.conversationTurns.some((turn) => turn.id === turnId);
+  const parentPlanTurnId = hasTurn(options.parentPlanTurnId)
+    ? options.parentPlanTurnId
+    : null;
+  const requestedUiParentTurnId = options.uiParentTurnId || null;
+  const uiParentTurnId = hasTurn(options.uiParentTurnId)
+    ? options.uiParentTurnId
+    : null;
+  const mentionSnapshot = options.contextMentionsSnapshot ?? state.contextMentions;
+  const attachedFilesSnapshot = options.attachedFilesSnapshot ?? state.attachedFiles;
+  const remoteFeishu = options.remoteFeishu || (
+    state.feishuLinkedSessionId === state.currentSessionId && state.feishuLinkedContext
+      ? state.feishuLinkedContext
+      : undefined
+  );
+  const currentMainModeKey = state.selectedMainModeKey;
+  const preParsedStudioCommand = currentMainModeKey === "game_studio"
+    ? parseGameStudioSlashCommand(text)
+    : null;
+  const preParsedStudioWorkflowArgs = preParsedStudioCommand?.type === "workflow"
+    ? preParsedStudioCommand.args
+    : "";
+  const languageResolutionInput =
+    preParsedStudioCommand?.type === "workflow"
+      ? (preParsedStudioWorkflowArgs || text)
+      : text;
+  const systemLanguage = state.config.language === "en" ? "en" : "zh";
+  const preferredLanguage = isHidden
+    ? state.preferredResponseLanguage
+    : resolveTurnResponseLanguage({
+        text: languageResolutionInput,
+        policy: state.config.responseLanguagePolicy,
+        systemLanguage,
+        fallbackLanguage: systemLanguage,
+      });
+  const cachedWorkspaceTreeForGameDetection =
+    state.currentWorkspace &&
+    params.cache.workspaceTreeCacheKey === state.currentWorkspace &&
+    params.cache.workspaceTreeCacheVersion === state.workspaceContentVersion
+      ? params.cache.workspaceTreeCache
+      : "";
+
+  return {
+    isHidden,
+    createVisibleTurnForHiddenMessage,
+    parentPlanTurnId,
+    requestedUiParentTurnId,
+    uiParentTurnId,
+    mentionSnapshot,
+    attachedFilesSnapshot,
+    remoteFeishu,
+    hasSupplementalInput: mentionSnapshot.length > 0 || attachedFilesSnapshot.length > 0,
+    currentMainModeKey,
+    preParsedStudioCommand,
+    preParsedStudioWorkflowArgs,
+    languageResolutionInput,
+    preferredLanguage,
+    cachedWorkspaceTreeForGameDetection,
+    shouldWarmWorkspaceTreeCache:
+      !cachedWorkspaceTreeForGameDetection && !!state.currentWorkspace?.trim(),
+  };
+}
+
+export function buildSubmitIntentConfirmationPendingDecision(params: {
+  text: string;
+  images?: string[];
+  preferredLanguage: "zh" | "en";
+  source?: PendingRunDecision["source"];
+  decision: Pick<RunIntentResolution, "riskLevel" | "reason"> &
+    Partial<Pick<RunIntentResolution, "suggestedIntent" | "decisionOptions">>;
+  suggestedIntentFallback?: ResolvedUserIntent;
+  titleOverride?: string;
+  reasonOverride?: string;
+  optionsOverride?: PendingRunDecisionOption[];
+}): PendingRunDecision {
+  const suggestedIntent =
+    params.decision.suggestedIntent ?? params.suggestedIntentFallback ?? "plan";
+  const pendingCopy = createPendingDecisionCopy(
+    {
+      suggestedIntent,
+      decisionOptions: params.decision.decisionOptions,
+      riskLevel: params.decision.riskLevel,
+      reason: params.decision.reason,
+    },
+    params.preferredLanguage,
+  );
+  return {
+    kind: "intent_confirmation",
+    source: params.source ?? "pre_submit",
+    originalInput: params.text,
+    originalImages: params.images || [],
+    suggestedIntent,
+    reason: params.reasonOverride ?? pendingCopy.reason,
+    title: params.titleOverride ?? pendingCopy.title,
+    options: params.optionsOverride?.length ? params.optionsOverride : pendingCopy.options,
+  };
 }
 
 export function normalizeIntentSummary(summary: string): string {
@@ -177,6 +292,58 @@ export interface SubmitPipelineInput {
     language: "zh" | "en";
     signal: GameDevelopmentIntentSignal;
   }) => PendingRunDecision;
+}
+
+export interface SubmitInputEnvelopeOptions {
+  hidden?: boolean;
+  createVisibleTurnForHiddenMessage?: boolean;
+  parentPlanTurnId?: string;
+  uiParentTurnId?: string;
+  contextMentionsSnapshot?: string[];
+  attachedFilesSnapshot?: Array<AttachedFile | string>;
+  remoteFeishu?: FeishuRemoteContext;
+}
+
+export interface SubmitInputEnvelopeState {
+  selectedMainModeKey: MainModeKey;
+  conversationTurns: Array<Pick<ConversationTurn, "id">>;
+  contextMentions: string[];
+  attachedFiles: Array<AttachedFile | string>;
+  currentWorkspace?: string | null;
+  currentSessionId?: number | null;
+  feishuLinkedSessionId?: number | null;
+  feishuLinkedContext?: FeishuRemoteContext | null;
+  preferredResponseLanguage: "zh" | "en";
+  workspaceContentVersion: number;
+  config: {
+    language: string;
+    responseLanguagePolicy: ResponseLanguagePolicy;
+  };
+}
+
+export interface SubmitInputEnvelopeCache {
+  workspaceTreeCacheKey: string;
+  workspaceTreeCacheVersion: number;
+  workspaceTreeCache: string;
+}
+
+export interface SubmitInputEnvelope {
+  isHidden: boolean;
+  createVisibleTurnForHiddenMessage: boolean;
+  parentPlanTurnId: string | null;
+  requestedUiParentTurnId: string | null;
+  uiParentTurnId: string | null;
+  mentionSnapshot: string[];
+  attachedFilesSnapshot: Array<AttachedFile | string>;
+  remoteFeishu?: FeishuRemoteContext;
+  hasSupplementalInput: boolean;
+  currentMainModeKey: MainModeKey;
+  preParsedStudioCommand: PendingSlashCommand | null;
+  preParsedStudioWorkflowArgs: string;
+  languageResolutionInput: string;
+  preferredLanguage: "zh" | "en";
+  cachedWorkspaceTreeForGameDetection: string;
+  shouldWarmWorkspaceTreeCache: boolean;
 }
 
 export interface SubmitPendingReviewDecision {
@@ -806,27 +973,19 @@ export function resolveSubmitExecutionApprovalDecision(params: {
     locallyRequiresExecutionApproval &&
     !isLocalFastStudioCommand
   ) {
-    const pendingCopy = createPendingDecisionCopy(
-      {
-        suggestedIntent: "execute",
-        decisionOptions: ["execute", "respond"],
-        riskLevel: resolution.riskLevel,
-        reason: resolution.reason,
-      },
-      preferredLanguage,
-    );
     return {
       locallyRequiresExecutionApproval,
-      pendingRunDecision: {
-        kind: "intent_confirmation",
-        source: "pre_submit",
-        originalInput: text,
-        originalImages: images || [],
-        suggestedIntent: "execute",
-        reason: pendingCopy.reason,
-        title: pendingCopy.title,
-        options: pendingCopy.options,
-      },
+      pendingRunDecision: buildSubmitIntentConfirmationPendingDecision({
+        text,
+        images,
+        preferredLanguage,
+        decision: {
+          suggestedIntent: "execute",
+          decisionOptions: ["execute", "respond"],
+          riskLevel: resolution.riskLevel,
+          reason: resolution.reason,
+        },
+      }),
     };
   }
 
@@ -1225,29 +1384,26 @@ export function resolveSubmitPreflightResultDecision(params: {
     );
 
   if (preflight?.needsUserChoice) {
-    const fallbackCopy = createPendingDecisionCopy(
-      {
-        suggestedIntent: preflight.intent,
-        decisionOptions: preflight.options
-          ?.map((option) => option.id)
-          .filter(isResolvedUserIntentChoice),
-        riskLevel: resolution.riskLevel,
-        reason: resolution.reason,
-      },
-      preferredLanguage,
-    );
+    const decisionOptions = preflight.options
+      ?.map((option) => option.id)
+      .filter(isResolvedUserIntentChoice);
     return {
       kind: "ask_user_choice",
-      pendingRunDecision: {
-        kind: "intent_confirmation",
+      pendingRunDecision: buildSubmitIntentConfirmationPendingDecision({
+        text,
+        images,
         source: "preflight",
-        originalInput: text,
-        originalImages: images || [],
-        suggestedIntent: preflight.intent,
-        reason: resolution.reason,
-        title: preflight.question || fallbackCopy.title,
-        options: preflight.options?.length ? preflight.options : fallbackCopy.options,
-      },
+        preferredLanguage,
+        decision: {
+          suggestedIntent: preflight.intent,
+          decisionOptions,
+          riskLevel: resolution.riskLevel,
+          reason: resolution.reason,
+        },
+        titleOverride: preflight.question,
+        reasonOverride: resolution.reason,
+        optionsOverride: preflight.options,
+      }),
       resolvedIntent,
       commandDirective,
       turnTitle: preflight.title,
@@ -1275,27 +1431,20 @@ export function resolveSubmitPreflightResultDecision(params: {
     );
 
   if (shouldAskForPreflightExecutionDecision) {
-    const pendingCopy = createPendingDecisionCopy(
-      {
-        suggestedIntent: "execute",
-        decisionOptions: ["execute", "respond", "plan"],
-        riskLevel: preflight?.riskLevel || "medium",
-        reason: preflight?.reason || resolution.reason,
-      },
-      preferredLanguage,
-    );
     return {
       kind: "ask_execution_confirmation",
-      pendingRunDecision: {
-        kind: "intent_confirmation",
+      pendingRunDecision: buildSubmitIntentConfirmationPendingDecision({
+        text,
+        images,
         source: "preflight",
-        originalInput: text,
-        originalImages: images || [],
-        suggestedIntent: "execute",
-        reason: pendingCopy.reason,
-        title: pendingCopy.title,
-        options: pendingCopy.options,
-      },
+        preferredLanguage,
+        decision: {
+          suggestedIntent: "execute",
+          decisionOptions: ["execute", "respond", "plan"],
+          riskLevel: preflight?.riskLevel || "medium",
+          reason: preflight?.reason || resolution.reason,
+        },
+      }),
       resolvedIntent,
       commandDirective,
       turnTitle: preflight?.title,

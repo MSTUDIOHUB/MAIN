@@ -37,6 +37,56 @@ export interface SubmitSessionRuntimeFacade<
   sessionGet: () => TState;
 }
 
+export interface SubmitPreRunSessionPatcherInput<
+  TState extends SubmitSessionRuntimeFacadeState<TRuntime>,
+  TRuntime extends object,
+> {
+  originSessionKey: string | null;
+  originSnapshot: TState;
+  get: () => TState;
+  set: (patchOrUpdater: Partial<TState> | ((state: TState) => Partial<TState>)) => void;
+  createRuntimeFromState: (state: Partial<TState>) => TRuntime;
+  pickRuntimePatch: (source: SubmitSessionPatch<TState>) => Partial<TRuntime>;
+}
+
+export function createSubmitPreRunSessionPatcher<
+  TState extends SubmitSessionRuntimeFacadeState<TRuntime>,
+  TRuntime extends object,
+>(
+  params: SubmitPreRunSessionPatcherInput<TState, TRuntime>,
+): (patch: SubmitSessionPatch<TState>) => void {
+  const isOriginSessionActive = (state: TState): boolean =>
+    !!params.originSessionKey &&
+    resolveSessionRuntimeKey(
+      resolveSessionWorkspaceKey(state.currentWorkspace),
+      state.currentSessionId,
+    ) === params.originSessionKey;
+
+  return (patch) => {
+    if (!params.originSessionKey || isOriginSessionActive(params.get())) {
+      params.set(patch as Partial<TState>);
+      return;
+    }
+
+    params.set((state) => {
+      const runtimePatch = params.pickRuntimePatch(patch);
+      if (Object.keys(runtimePatch).length === 0) return {} as Partial<TState>;
+      const existing =
+        state.runtimeBySessionKey[params.originSessionKey!] ||
+        params.createRuntimeFromState(params.originSnapshot);
+      return {
+        runtimeBySessionKey: {
+          ...state.runtimeBySessionKey,
+          [params.originSessionKey!]: {
+            ...existing,
+            ...runtimePatch,
+          },
+        },
+      } as Partial<TState>;
+    });
+  };
+}
+
 export function createSubmitSessionRuntimeFacade<
   TState extends SubmitSessionRuntimeFacadeState<TRuntime>,
   TRuntime extends object,

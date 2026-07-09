@@ -1,0 +1,106 @@
+import type { AttachedFile } from "../lib/attachments";
+import { normalizeAttachedFile } from "../lib/attachments";
+import {
+  resolveSubmitTurnTitleDecision,
+  type SubmitTurnTitleDecision,
+} from "../lib/submit/turnSubmission";
+import type { TaskBlock } from "../lib/taskTypes";
+import {
+  normalizeTurnInputContextSignals,
+  type TurnInputContextSignals,
+} from "../lib/turnIntake";
+import { buildUserContextItems } from "../lib/userContextItems";
+import type { ResolvedRunIntent } from "../lib/runIntent";
+import type { ConversationTurn } from "../lib/workflowModels";
+import type { SessionTitleSeedState } from "../lib/intentTitlePolicy";
+
+export interface SubmitTurnDraftSessionState {
+  _nextTaskId: () => number;
+  sessionsByWorkspace: Record<string, Array<SessionTitleSeedState & { id: number }>>;
+}
+
+export interface PrepareSubmitTurnDraftInput {
+  sessionGet: () => SubmitTurnDraftSessionState;
+  conversationTurns: ConversationTurn[];
+  text: string;
+  images?: string[];
+  mentionSnapshot: string[];
+  attachedFilesSnapshot: Array<AttachedFile | string>;
+  runWorkspace?: string | null;
+  preferredLanguage: "zh" | "en";
+  effectiveRunIntent: ResolvedRunIntent;
+  isMainDebugShortcut: boolean;
+  optionTurnTitle?: string | null;
+  reuseCurrentTurn: boolean;
+  reusableTurnId?: string | null;
+  turnIdOverride?: string;
+  uiParentTurnId?: string | null;
+  ensuredSessionId?: number | null;
+  sessionScopeKey: string;
+  createTurnId?: () => string;
+}
+
+export interface SubmitTurnDraft {
+  nextTaskId: () => number;
+  turnId: string;
+  uiDisplayTurnId: string;
+  currentImages: string[];
+  turnInputContextSignals: TurnInputContextSignals;
+  userContextItems: Extract<TaskBlock, { type: "user" }>["contextItems"];
+  existingTurn: ConversationTurn | null;
+  activeSession: SessionTitleSeedState | null;
+  titleDecision: SubmitTurnTitleDecision;
+}
+
+export function prepareSubmitTurnDraft(input: PrepareSubmitTurnDraftInput): SubmitTurnDraft {
+  const sessionState = input.sessionGet();
+  const nextTaskId = sessionState._nextTaskId;
+  const turnId = input.reuseCurrentTurn
+    ? input.reusableTurnId!
+    : input.turnIdOverride || input.createTurnId?.() || `turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const uiDisplayTurnId = input.uiParentTurnId || turnId;
+  const currentImages = input.images || [];
+  const turnInputContextSignals = normalizeTurnInputContextSignals({
+    imageParts: currentImages.length,
+    mentionedFilePaths: input.mentionSnapshot,
+    attachedFilePaths: input.attachedFilesSnapshot.map((file) => {
+      const attachment = normalizeAttachedFile(file);
+      return attachment.sourcePath || attachment.path;
+    }),
+  });
+  const userContextItems = buildUserContextItems({
+    contextMentions: input.mentionSnapshot,
+    attachedFiles: input.attachedFilesSnapshot,
+    images: currentImages,
+    workspace: input.runWorkspace,
+    language: input.preferredLanguage,
+  });
+  const existingTurn = input.reuseCurrentTurn
+    ? input.conversationTurns.find((turn) => turn.id === turnId) || null
+    : null;
+  const activeSession = input.ensuredSessionId
+    ? (sessionState.sessionsByWorkspace[input.sessionScopeKey] || []).find((session) => session.id === input.ensuredSessionId) || null
+    : null;
+  const titleDecision = resolveSubmitTurnTitleDecision({
+    text: input.text,
+    effectiveRunIntent: input.effectiveRunIntent,
+    preferredLanguage: input.preferredLanguage,
+    isMainDebugShortcut: input.isMainDebugShortcut,
+    contextSignals: turnInputContextSignals,
+    existingTurnTitle: existingTurn?.title,
+    optionTurnTitle: input.optionTurnTitle,
+    activeSession,
+  });
+
+  return {
+    nextTaskId,
+    turnId,
+    uiDisplayTurnId,
+    currentImages,
+    turnInputContextSignals,
+    userContextItems,
+    existingTurn,
+    activeSession,
+    titleDecision,
+  };
+}

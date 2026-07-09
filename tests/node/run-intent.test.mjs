@@ -722,11 +722,14 @@ test("workflow engine marks non-actionable stops as resumable turn status", () =
 
 test("store asks before executing when preflight upgrades natural chat to operations", () => {
   const source = fsSync.readFileSync(path.join(workspaceRoot, "src/store/useAppStore.ts"), "utf8");
+  const submitIntentRoutingSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitIntentRouting.ts"), "utf8");
   const turnSubmissionSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/submit/turnSubmission.ts"), "utf8");
   const preflightExecutorSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitPreflightExecutor.ts"), "utf8");
 
-  assert.match(source, /const blockingPreflightEffect = buildSubmitBlockingPreflightEffect/);
-  assert.match(source, /await executeSubmitBlockingPreflight/);
+  assert.match(source, /startBlockingPreflight: \(blockingPreflightEffect\) =>/);
+  assert.match(submitIntentRoutingSource, /const blockingPreflightEffect = buildSubmitBlockingPreflightEffect/);
+  assert.match(source, /void startSubmitBlockingPreflightEffect\(\{/);
+  assert.match(preflightExecutorSource, /return executeSubmitBlockingPreflight\(\{/);
   assert.match(preflightExecutorSource, /const action = resolveSubmitPreflightEffectAction/);
   assert.match(preflightExecutorSource, /action\.kind === "set_pending_decision"/);
   assert.match(turnSubmissionSource, /const preflightDecision = resolveSubmitPreflightResultDecision/);
@@ -739,15 +742,17 @@ test("store asks before executing when preflight upgrades natural chat to operat
 
 test("store forces auto-approved visible turns into execution semantics", () => {
   const source = fsSync.readFileSync(path.join(workspaceRoot, "src/store/useAppStore.ts"), "utf8");
+  const submitIntentRoutingSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitIntentRouting.ts"), "utf8");
   const turnSubmissionSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/submit/turnSubmission.ts"), "utf8");
 
-  assert.match(source, /const initialIntentDecision = resolveSubmitEffectiveIntentDecision/);
+  assert.match(source, /const intentRouting = resolveAndApplySubmitIntentRouting/);
+  assert.match(submitIntentRoutingSource, /const initialIntentDecision = resolveSubmitEffectiveIntentDecision/);
   assert.match(source, /autoApproveTools: state\.autoApproveTools/);
-  assert.match(source, /const shouldForceExecuteForAutoApprove = initialIntentDecision\.shouldForceExecuteForAutoApprove/);
+  assert.match(submitIntentRoutingSource, /const shouldForceExecuteForAutoApprove =\s*initialIntentDecision\.shouldForceExecuteForAutoApprove/);
   assert.match(turnSubmissionSource, /const shouldForceExecuteForAutoApprove =/);
   assert.match(turnSubmissionSource, /autoApproveTools === true/);
   assert.match(turnSubmissionSource, /effectiveRunIntent = currentMainModeKey === "game_studio" \? "studio_workflow" : "execute"/);
-  assert.match(source, /!shouldForceExecuteForAutoApprove && !options\?\.skipIntentResolution/);
+  assert.match(submitIntentRoutingSource, /!shouldForceExecuteForAutoApprove &&\s*!input\.options\?\.skipIntentResolution/);
   assert.match(source, /const runtimeDecision = resolveSubmitRuntimeDecision/);
   assert.match(source, /shouldExecuteOnceFromReplyOption,\s*preservePlanState,/);
   assert.match(source, /autoApproveTools: state\.autoApproveTools/);

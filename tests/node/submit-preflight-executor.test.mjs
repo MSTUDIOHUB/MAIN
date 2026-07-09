@@ -49,7 +49,10 @@ function loadTranspiledModuleSync(sourcePath) {
   return module.exports;
 }
 
-const { executeSubmitBlockingPreflight } = loadTranspiledModuleSync(
+const {
+  executeSubmitBlockingPreflight,
+  startSubmitBlockingPreflightEffect,
+} = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/store/submitPreflightExecutor.ts"),
 );
 
@@ -223,4 +226,96 @@ test("submit blocking preflight executor resumes active submissions with preflig
   assert.equal(result.resumes[0].options.turnTitle, "修复标题同步");
   assert.equal(result.pendingDecisions.length, 0);
   assert.equal(result.events.length, 0);
+});
+
+test("submit blocking preflight starter derives origin activity from latest state", async () => {
+  const effect = createEffect({
+    resolution: baseResolution({
+      intent: "execute",
+      riskLevel: "medium",
+      commandDirective: commandDirective({ kind: "file_modify", source: "natural_language" }),
+    }),
+    sendOriginSessionKey: "workspace-a:42",
+  });
+  const events = [];
+  const resumes = [];
+  const action = await startSubmitBlockingPreflightEffect({
+    effect,
+    async runIntentPreflight() {
+      return {
+        intent: "execute",
+        confidence: 0.96,
+        requiresApproval: false,
+        commandDirective: commandDirective({ kind: "file_modify", source: "preflight" }),
+      };
+    },
+    getState() {
+      return {
+        input: effect.originalText,
+        selectedMainModeKey: "main_mode",
+        lockedComposerIntent: null,
+        currentWorkspace: "/tmp/ui",
+        currentSessionId: 7,
+      };
+    },
+    isSessionRuntimeActive(state, sessionKey) {
+      assert.equal(state.currentWorkspace, "/tmp/ui");
+      assert.equal(sessionKey, "workspace-a:42");
+      return false;
+    },
+    applyPreRunSessionPatch() {
+      assert.fail("inactive resume should not set a pending decision");
+    },
+    resumeSubmission(text, images, options) {
+      resumes.push({ text, images, options });
+    },
+    logStoreEvent(event, data) {
+      events.push({ event, data });
+    },
+  });
+
+  assert.equal(action.kind, "skip_inactive_session");
+  assert.deepEqual(resumes, []);
+  assert.equal(events[0].event, "send_async_resume_skipped_inactive_session");
+  assert.equal(events[0].data.sessionKey, "workspace-a:42");
+});
+
+test("submit blocking preflight starter applies pending decisions through pre-run patcher", async () => {
+  const effect = createEffect();
+  const patches = [];
+  const action = await startSubmitBlockingPreflightEffect({
+    effect,
+    async runIntentPreflight() {
+      return {
+        intent: "plan",
+        confidence: 0.58,
+        needsUserChoice: true,
+        question: "要先规划吗？",
+        options: [{ id: "plan", label: "先规划", value: "请先制定计划" }],
+        commandDirective: commandDirective({ source: "preflight" }),
+      };
+    },
+    getState() {
+      return {
+        input: effect.originalText,
+        selectedMainModeKey: "main_mode",
+        lockedComposerIntent: null,
+      };
+    },
+    isSessionRuntimeActive() {
+      return true;
+    },
+    applyPreRunSessionPatch(patch) {
+      patches.push(patch);
+    },
+    resumeSubmission() {
+      assert.fail("pending decision should not resume submission");
+    },
+    logStoreEvent() {},
+  });
+
+  assert.equal(action.kind, "set_pending_decision");
+  assert.equal(patches.length, 1);
+  assert.equal(patches[0].pendingRunDecision.source, "preflight");
+  assert.equal(patches[0].pendingRunDecision.title, "要先规划吗？");
 });

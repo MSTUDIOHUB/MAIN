@@ -52,6 +52,8 @@ function loadTranspiledModuleSync(sourcePath) {
 const {
   buildSubmitBlockingPreflightEffect,
   buildSubmitHarnessRunMarkerDraft,
+  buildSubmitInputEnvelope,
+  buildSubmitIntentConfirmationPendingDecision,
   buildSubmitPipelineDecision,
   buildSubmitPreflightResumeOptions,
   buildSubmitSessionBootstrapDecision,
@@ -134,6 +136,35 @@ function baseEffectiveIntentInput(overrides = {}) {
   };
 }
 
+function baseEnvelopeState(overrides = {}) {
+  return {
+    selectedMainModeKey: "main_mode",
+    conversationTurns: [{ id: "turn-parent" }],
+    contextMentions: ["src/App.tsx"],
+    attachedFiles: ["/tmp/notes.md"],
+    currentWorkspace: "/tmp/main-project",
+    currentSessionId: 7,
+    feishuLinkedSessionId: null,
+    feishuLinkedContext: null,
+    preferredResponseLanguage: "zh",
+    workspaceContentVersion: 3,
+    config: {
+      language: "zh",
+      responseLanguagePolicy: "follow_input_language",
+    },
+    ...overrides,
+  };
+}
+
+function baseEnvelopeCache(overrides = {}) {
+  return {
+    workspaceTreeCacheKey: "/tmp/main-project",
+    workspaceTreeCacheVersion: 3,
+    workspaceTreeCache: "[D] src",
+    ...overrides,
+  };
+}
+
 function baseResolution(overrides = {}) {
   return {
     intent: "respond",
@@ -149,6 +180,80 @@ function baseResolution(overrides = {}) {
     ...overrides,
   };
 }
+
+test("submit input envelope resolves snapshots parents and cached workspace tree", () => {
+  const envelope = buildSubmitInputEnvelope({
+    text: "继续",
+    options: {
+      parentPlanTurnId: "turn-parent",
+      uiParentTurnId: "missing-turn",
+      contextMentionsSnapshot: ["src/store/useAppStore.ts"],
+      attachedFilesSnapshot: ["/tmp/custom.md"],
+    },
+    state: baseEnvelopeState(),
+    cache: baseEnvelopeCache(),
+  });
+
+  assert.equal(envelope.isHidden, false);
+  assert.equal(envelope.parentPlanTurnId, "turn-parent");
+  assert.equal(envelope.uiParentTurnId, null);
+  assert.deepEqual(envelope.mentionSnapshot, ["src/store/useAppStore.ts"]);
+  assert.deepEqual(envelope.attachedFilesSnapshot, ["/tmp/custom.md"]);
+  assert.equal(envelope.hasSupplementalInput, true);
+  assert.equal(envelope.cachedWorkspaceTreeForGameDetection, "[D] src");
+  assert.equal(envelope.shouldWarmWorkspaceTreeCache, false);
+});
+
+test("submit input envelope uses workflow slash args for language detection", () => {
+  const envelope = buildSubmitInputEnvelope({
+    text: "/start fix camera shake",
+    state: baseEnvelopeState({
+      selectedMainModeKey: "game_studio",
+      config: {
+        language: "zh",
+        responseLanguagePolicy: "follow_input_language",
+      },
+    }),
+    cache: baseEnvelopeCache({
+      workspaceTreeCacheVersion: 2,
+      workspaceTreeCache: "[D] stale",
+    }),
+  });
+
+  assert.equal(envelope.preParsedStudioCommand.type, "workflow");
+  assert.equal(envelope.preParsedStudioWorkflowArgs, "fix camera shake");
+  assert.equal(envelope.languageResolutionInput, "fix camera shake");
+  assert.equal(envelope.preferredLanguage, "en");
+  assert.equal(envelope.cachedWorkspaceTreeForGameDetection, "");
+  assert.equal(envelope.shouldWarmWorkspaceTreeCache, true);
+});
+
+test("submit input envelope preserves hidden language and linked Feishu context", () => {
+  const linkedContext = {
+    adapter: "feishu",
+    chatId: "chat-1",
+    userId: "user-1",
+    userName: "Ada",
+  };
+  const envelope = buildSubmitInputEnvelope({
+    text: "please answer in English",
+    options: {
+      hidden: true,
+      createVisibleTurnForHiddenMessage: true,
+    },
+    state: baseEnvelopeState({
+      preferredResponseLanguage: "zh",
+      feishuLinkedSessionId: 7,
+      feishuLinkedContext: linkedContext,
+    }),
+    cache: baseEnvelopeCache(),
+  });
+
+  assert.equal(envelope.isHidden, true);
+  assert.equal(envelope.createVisibleTurnForHiddenMessage, true);
+  assert.equal(envelope.preferredLanguage, "zh");
+  assert.deepEqual(envelope.remoteFeishu, linkedContext);
+});
 
 test("submit pipeline reuses awaiting-choice turns only on exact reply option match", () => {
   const currentTurn = turn();
@@ -360,6 +465,52 @@ test("runtime decision keeps plan state for local Game Studio commands", () => {
   assert.equal(decision.runtimeRunIntent, "studio_workflow");
   assert.equal(decision.shouldGrantExecutionConsentForTurn, true);
   assert.equal(decision.shouldResetPlanState, false);
+});
+
+test("intent confirmation builder creates pre-submit plan confirmation choices", () => {
+  const decision = buildSubmitIntentConfirmationPendingDecision({
+    text: "继续重构",
+    images: ["image-a"],
+    preferredLanguage: "zh",
+    decision: {
+      suggestedIntent: "plan",
+      decisionOptions: ["plan", "respond", "execute"],
+      riskLevel: "high",
+      reason: "needs planning",
+    },
+  });
+
+  assert.equal(decision.kind, "intent_confirmation");
+  assert.equal(decision.source, "pre_submit");
+  assert.equal(decision.originalInput, "继续重构");
+  assert.deepEqual(decision.originalImages, ["image-a"]);
+  assert.equal(decision.suggestedIntent, "plan");
+  assert.equal(decision.reason, "needs planning");
+  assert.deepEqual(decision.options.map((option) => option.id), [
+    "plan",
+    "respond",
+    "execute",
+  ]);
+});
+
+test("intent confirmation builder falls back to plan when resolution has no suggested intent", () => {
+  const decision = buildSubmitIntentConfirmationPendingDecision({
+    text: "这个需求范围有点大",
+    preferredLanguage: "en",
+    decision: {
+      riskLevel: "medium",
+      reason: "ambiguous scope",
+    },
+    suggestedIntentFallback: "plan",
+  });
+
+  assert.equal(decision.suggestedIntent, "plan");
+  assert.equal(decision.reason, "ambiguous scope");
+  assert.deepEqual(decision.options.map((option) => option.id), [
+    "execute",
+    "respond",
+    "plan",
+  ]);
 });
 
 test("send gate blocks empty input before busy state checks", () => {
